@@ -29,10 +29,12 @@ from loom_tools.shepherd.phases.base import (
     INSTANT_EXIT_MAX_ATTEMPT_SECONDS,
     INSTANT_EXIT_MAX_RETRIES,
     INSTANT_EXIT_MIN_OUTPUT_CHARS,
+    INSTANT_EXIT_RETRY_STRATEGIES,
     MCP_FAILURE_BACKOFF_SECONDS,
     MCP_FAILURE_MAX_RETRIES,
     MCP_FAILURE_MIN_OUTPUT_CHARS,
     _AUTH_FAILURE_SENTINEL,
+    _classify_instant_exit,
     _is_auth_failure,
     _is_instant_exit,
     _is_mcp_failure,
@@ -14241,3 +14243,342 @@ class TestRunPhaseWithRetryAuthFailure:
 
         assert exit_code == 9
         assert call_count == 1
+
+
+class TestClassifyInstantExit:
+    """Test _classify_instant_exit root cause classification.
+
+    The classifier parses the worker log for known error patterns and
+    returns a cause string used to select a retry strategy.  See issue #2518.
+    """
+
+    def test_missing_log_returns_unknown(self, tmp_path: Path) -> None:
+        """Missing log file should return 'unknown'."""
+        assert _classify_instant_exit(tmp_path / "nonexistent.log") == "unknown"
+
+    def test_empty_log_returns_unknown(self, tmp_path: Path) -> None:
+        """Empty log file should return 'unknown'."""
+        log = tmp_path / "worker.log"
+        log.write_text("")
+        assert _classify_instant_exit(log) == "unknown"
+
+    def test_auth_timeout_detected(self, tmp_path: Path) -> None:
+        """Log with 'Authentication check timed out' should return 'auth_timeout'."""
+        log = tmp_path / "worker.log"
+        log.write_text(
+            "Starting session...\n"
+            "Authentication check timed out (attempt 1/3), retrying in 4s...\n"
+            "Authentication check timed out after 3 attempts\n"
+        )
+        assert _classify_instant_exit(log) == "auth_timeout"
+
+    def test_auth_lock_contention_detected(self, tmp_path: Path) -> None:
+        """Log with 'Auth cache lock held' should return 'auth_lock_contention'."""
+        log = tmp_path / "worker.log"
+        log.write_text(
+            "Starting session...\n"
+            "Auth cache lock held by another process, waiting up to 60s...\n"
+            "Auth cache still stale after 60s wait, proceeding with direct check\n"
+        )
+        assert _classify_instant_exit(log) == "auth_lock_contention"
+
+    def test_api_unreachable_detected(self, tmp_path: Path) -> None:
+        """Log with 'API endpoint' + 'unreachable' should return 'api_unreachable'."""
+        log = tmp_path / "worker.log"
+        log.write_text(
+            "Checking connectivity...\n"
+            "API endpoint https://api.anthropic.com is unreachable\n"
+        )
+        assert _classify_instant_exit(log) == "api_unreachable"
+
+    def test_api_unreachable_requires_both_keywords(self, tmp_path: Path) -> None:
+        """Only 'API endpoint' without 'unreachable' should return 'unknown'."""
+        log = tmp_path / "worker.log"
+        log.write_text("API endpoint returned 500\n")
+        assert _classify_instant_exit(log) == "unknown"
+
+    def test_generic_error_returns_unknown(self, tmp_path: Path) -> None:
+        """Log with unrecognized error patterns should return 'unknown'."""
+        log = tmp_path / "worker.log"
+        log.write_text("Some random error occurred\nSession terminated\n")
+        assert _classify_instant_exit(log) == "unknown"
+
+    def test_ansi_codes_stripped(self, tmp_path: Path) -> None:
+        """ANSI escape codes in the log should be stripped before matching."""
+        log = tmp_path / "worker.log"
+        log.write_text(
+            "\033[31mAuthentication check timed out\033[0m after 3 attempts\n"
+        )
+        assert _classify_instant_exit(log) == "auth_timeout"
+
+    def test_auth_timeout_takes_priority_over_lock_contention(
+        self, tmp_path: Path
+    ) -> None:
+        """When both patterns present, auth_timeout matches first."""
+        log = tmp_path / "worker.log"
+        log.write_text(
+            "Auth cache lock held by another process, waiting up to 60s...\n"
+            "Authentication check timed out after 3 attempts\n"
+        )
+        # auth_timeout is checked first, so it should win
+        assert _classify_instant_exit(log) == "auth_timeout"
+
+
+class TestInstantExitRetryStrategies:
+    """Test INSTANT_EXIT_RETRY_STRATEGIES constant values."""
+
+    def test_auth_timeout_has_zero_retries(self) -> None:
+        max_retries, backoff = INSTANT_EXIT_RETRY_STRATEGIES["auth_timeout"]
+        assert max_retries == 0
+        assert backoff == []
+
+    def test_auth_lock_contention_has_one_retry(self) -> None:
+        max_retries, backoff = INSTANT_EXIT_RETRY_STRATEGIES["auth_lock_contention"]
+        assert max_retries == 1
+        assert backoff == [60]
+
+    def test_api_unreachable_has_one_retry(self) -> None:
+        max_retries, backoff = INSTANT_EXIT_RETRY_STRATEGIES["api_unreachable"]
+        assert max_retries == 1
+        assert backoff == [30]
+
+    def test_unknown_matches_original_constants(self) -> None:
+        max_retries, backoff = INSTANT_EXIT_RETRY_STRATEGIES["unknown"]
+        assert max_retries == INSTANT_EXIT_MAX_RETRIES
+        assert backoff == list(INSTANT_EXIT_BACKOFF_SECONDS)
+
+
+class TestRunPhaseWithRetryInstantExitClassification:
+    """Test cause-specific retry behavior in run_phase_with_retry.
+
+    When an instant-exit (exit code 6) is detected, the retry loop
+    classifies the root cause and uses cause-specific retry strategies.
+    See issue #2518.
+    """
+
+    @pytest.fixture
+    def mock_context(self, tmp_path: Path) -> MagicMock:
+        """Create a mock ShepherdContext with a real repo_root for log files."""
+        ctx = MagicMock(spec=ShepherdContext)
+        ctx.config = ShepherdConfig(issue=42, task_id="test-123")
+        ctx.repo_root = tmp_path
+        ctx.scripts_dir = tmp_path / ".loom" / "scripts"
+        ctx.progress_dir = tmp_path / ".loom" / "progress"
+        ctx.pr_number = None
+        ctx.report_milestone = MagicMock()
+        return ctx
+
+    def test_auth_timeout_fails_fast_no_retries(
+        self, mock_context: MagicMock
+    ) -> None:
+        """auth_timeout cause should return 6 immediately with zero retries."""
+        call_count = 0
+
+        def mock_run_worker(*args, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            return 6
+
+        with (
+            patch(
+                "loom_tools.shepherd.phases.base.run_worker_phase",
+                side_effect=mock_run_worker,
+            ),
+            patch(
+                "loom_tools.shepherd.phases.base._classify_instant_exit",
+                return_value="auth_timeout",
+            ),
+            patch("time.sleep"),
+        ):
+            exit_code = run_phase_with_retry(
+                mock_context,
+                role="builder",
+                name="builder-issue-42",
+                timeout=600,
+                max_retries=2,
+                phase="builder",
+            )
+
+        assert exit_code == 6
+        assert call_count == 1  # No retries
+
+    def test_auth_lock_contention_retries_once_with_60s_backoff(
+        self, mock_context: MagicMock
+    ) -> None:
+        """auth_lock_contention should retry once with 60s backoff."""
+        call_count = 0
+
+        def mock_run_worker(*args, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            return 6 if call_count == 1 else 0
+
+        with (
+            patch(
+                "loom_tools.shepherd.phases.base.run_worker_phase",
+                side_effect=mock_run_worker,
+            ),
+            patch(
+                "loom_tools.shepherd.phases.base._classify_instant_exit",
+                return_value="auth_lock_contention",
+            ),
+            patch("time.sleep") as mock_sleep,
+        ):
+            exit_code = run_phase_with_retry(
+                mock_context,
+                role="builder",
+                name="builder-issue-42",
+                timeout=600,
+                max_retries=2,
+                phase="builder",
+            )
+
+        assert exit_code == 0
+        assert call_count == 2
+        mock_sleep.assert_called_once_with(60)
+
+    def test_auth_lock_contention_exhausts_single_retry(
+        self, mock_context: MagicMock
+    ) -> None:
+        """auth_lock_contention should fail after 1 retry (2 total attempts)."""
+        call_count = 0
+
+        def mock_run_worker(*args, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            return 6
+
+        with (
+            patch(
+                "loom_tools.shepherd.phases.base.run_worker_phase",
+                side_effect=mock_run_worker,
+            ),
+            patch(
+                "loom_tools.shepherd.phases.base._classify_instant_exit",
+                return_value="auth_lock_contention",
+            ),
+            patch("time.sleep"),
+        ):
+            exit_code = run_phase_with_retry(
+                mock_context,
+                role="builder",
+                name="builder-issue-42",
+                timeout=600,
+                max_retries=2,
+                phase="builder",
+            )
+
+        assert exit_code == 6
+        # 1 initial + 1 retry = 2 total
+        assert call_count == 2
+
+    def test_api_unreachable_retries_once_with_30s_backoff(
+        self, mock_context: MagicMock
+    ) -> None:
+        """api_unreachable should retry once with 30s backoff."""
+        call_count = 0
+
+        def mock_run_worker(*args, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            return 6 if call_count == 1 else 0
+
+        with (
+            patch(
+                "loom_tools.shepherd.phases.base.run_worker_phase",
+                side_effect=mock_run_worker,
+            ),
+            patch(
+                "loom_tools.shepherd.phases.base._classify_instant_exit",
+                return_value="api_unreachable",
+            ),
+            patch("time.sleep") as mock_sleep,
+        ):
+            exit_code = run_phase_with_retry(
+                mock_context,
+                role="builder",
+                name="builder-issue-42",
+                timeout=600,
+                max_retries=2,
+                phase="builder",
+            )
+
+        assert exit_code == 0
+        assert call_count == 2
+        mock_sleep.assert_called_once_with(30)
+
+    def test_unknown_cause_uses_default_retries(
+        self, mock_context: MagicMock
+    ) -> None:
+        """unknown cause should use original 3-retry / 2s-4s-8s strategy."""
+        call_count = 0
+
+        def mock_run_worker(*args, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            return 6
+
+        with (
+            patch(
+                "loom_tools.shepherd.phases.base.run_worker_phase",
+                side_effect=mock_run_worker,
+            ),
+            patch(
+                "loom_tools.shepherd.phases.base._classify_instant_exit",
+                return_value="unknown",
+            ),
+            patch("time.sleep") as mock_sleep,
+        ):
+            exit_code = run_phase_with_retry(
+                mock_context,
+                role="builder",
+                name="builder-issue-42",
+                timeout=600,
+                max_retries=2,
+                phase="builder",
+            )
+
+        assert exit_code == 6
+        # 1 initial + 3 retries = 4 total (same as INSTANT_EXIT_MAX_RETRIES)
+        assert call_count == 1 + INSTANT_EXIT_MAX_RETRIES
+        sleep_values = [call.args[0] for call in mock_sleep.call_args_list]
+        assert sleep_values == list(INSTANT_EXIT_BACKOFF_SECONDS)
+
+    def test_milestone_includes_cause_in_message(
+        self, mock_context: MagicMock
+    ) -> None:
+        """Milestones should include the classified cause."""
+        call_count = 0
+
+        def mock_run_worker(*args, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            return 6 if call_count == 1 else 0
+
+        with (
+            patch(
+                "loom_tools.shepherd.phases.base.run_worker_phase",
+                side_effect=mock_run_worker,
+            ),
+            patch(
+                "loom_tools.shepherd.phases.base._classify_instant_exit",
+                return_value="auth_lock_contention",
+            ),
+            patch("time.sleep"),
+        ):
+            run_phase_with_retry(
+                mock_context,
+                role="builder",
+                name="builder-issue-42",
+                timeout=600,
+                max_retries=2,
+                phase="builder",
+            )
+
+        milestone_calls = mock_context.report_milestone.call_args_list
+        # error milestone should mention the cause
+        error_call = milestone_calls[0]
+        assert "auth_lock_contention" in error_call.kwargs["error"]
+        # heartbeat milestone should mention the cause
+        heartbeat_call = milestone_calls[1]
+        assert "auth_lock_contention" in heartbeat_call.kwargs["action"]

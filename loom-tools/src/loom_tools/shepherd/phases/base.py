@@ -49,6 +49,16 @@ INSTANT_EXIT_BACKOFF_SECONDS = [2, 4, 8]
 # avoid burning 9+ minutes on futile attempts.  See issue #2519.
 INSTANT_EXIT_MAX_ATTEMPT_SECONDS = 90
 
+# Cause-specific retry strategies for instant-exit classification.
+# Maps root cause → (max_retries, backoff_seconds).
+# See issue #2518.
+INSTANT_EXIT_RETRY_STRATEGIES: dict[str, tuple[int, list[int]]] = {
+    "auth_timeout": (0, []),
+    "auth_lock_contention": (1, [60]),
+    "api_unreachable": (1, [30]),
+    "unknown": (INSTANT_EXIT_MAX_RETRIES, list(INSTANT_EXIT_BACKOFF_SECONDS)),
+}
+
 # How often (in seconds) to extend the file-based claim during worker polling.
 # The claim TTL is 2 hours; extending every 30 minutes provides ample margin.
 _CLAIM_EXTEND_INTERVAL = 1800
@@ -711,6 +721,39 @@ def _is_auth_failure(log_path: Path) -> bool:
     return False
 
 
+def _classify_instant_exit(log_path: Path) -> str:
+    """Classify the root cause of an instant-exit from the worker log.
+
+    After detecting an instant-exit, the log often contains specific error
+    patterns that indicate the problem will persist for much longer — or won't
+    resolve by retrying at all.  This function parses the log for known
+    patterns and returns a cause string used to select a retry strategy
+    from ``INSTANT_EXIT_RETRY_STRATEGIES``.
+
+    Args:
+        log_path: Path to the worker session log file.
+
+    Returns:
+        A cause string: ``"auth_timeout"``, ``"auth_lock_contention"``,
+        ``"api_unreachable"``, or ``"unknown"`` (generic transient failure).
+    """
+    if not log_path.is_file():
+        return "unknown"
+
+    try:
+        content = strip_ansi(log_path.read_text())
+    except OSError:
+        return "unknown"
+
+    if "Authentication check timed out" in content:
+        return "auth_timeout"
+    if "Auth cache lock held" in content:
+        return "auth_lock_contention"
+    if "API endpoint" in content and "unreachable" in content:
+        return "api_unreachable"
+    return "unknown"
+
+
 def run_worker_phase(
     ctx: ShepherdContext,
     *,
@@ -1000,8 +1043,9 @@ def run_phase_with_retry(
     """Run a phase with automatic retry on stuck, instant-exit, or MCP failure.
 
     On exit code 4 (stuck), retries up to max_retries times.
-    On exit code 6 (instant exit), retries up to INSTANT_EXIT_MAX_RETRIES
-    times with exponential backoff.
+    On exit code 6 (instant exit), classifies the root cause from the
+    worker log and uses a cause-specific retry strategy from
+    ``INSTANT_EXIT_RETRY_STRATEGIES``.  See issue #2518.
     On exit code 7 (MCP failure), retries up to MCP_FAILURE_MAX_RETRIES
     times with longer backoff (MCP failures are often systemic).
     On exit code 8 (planning stall), returns immediately (not retryable).
@@ -1114,9 +1158,26 @@ def run_phase_with_retry(
 
         # --- Instant-exit handling (exit code 6) ---
         if exit_code == 6:
+            # Classify root cause from the worker log and select a
+            # cause-specific retry strategy.  See issue #2518.
+            paths = LoomPaths(ctx.repo_root)
+            log_path = paths.worker_log_file(role, ctx.config.issue)
+            cause = _classify_instant_exit(log_path)
+            cause_max_retries, cause_backoff = INSTANT_EXIT_RETRY_STRATEGIES.get(
+                cause, INSTANT_EXIT_RETRY_STRATEGIES["unknown"]
+            )
+
+            # Fail fast for causes that won't resolve with retries
+            # (e.g., auth_timeout — 0 retries).
+            if cause_max_retries == 0:
+                log_warning(
+                    f"Instant-exit for {role} classified as '{cause}': "
+                    f"not retryable, failing fast"
+                )
+                return 6
+
             # If the attempt took a long time, the failure is likely an
-            # infrastructure issue (auth timeouts, lock contention) rather
-            # than a transient blip — retrying won't help.  See issue #2519.
+            # infrastructure issue — retrying won't help.  See issue #2519.
             if attempt_elapsed > INSTANT_EXIT_MAX_ATTEMPT_SECONDS:
                 log_warning(
                     f"Instant-exit attempt for {role} took {attempt_elapsed:.0f}s "
@@ -1126,33 +1187,32 @@ def run_phase_with_retry(
                 return 6
 
             instant_exit_retries += 1
-            if instant_exit_retries > INSTANT_EXIT_MAX_RETRIES:
-                paths = LoomPaths(ctx.repo_root)
-                log_path = paths.worker_log_file(role, ctx.config.issue)
+            if instant_exit_retries > cause_max_retries:
                 errors = extract_log_errors(log_path)
-                cause = f": {errors[-1]}" if errors else ""
+                detail = f": {errors[-1]}" if errors else ""
                 log_warning(
-                    f"Instant-exit persisted for {role} after "
-                    f"{INSTANT_EXIT_MAX_RETRIES} retries{cause}"
+                    f"Instant-exit ({cause}) persisted for {role} after "
+                    f"{cause_max_retries} retries{detail}"
                 )
                 return 6  # Caller should treat as failure
 
-            # Exponential backoff before retry
+            # Use cause-specific backoff schedule
             backoff_idx = min(
-                instant_exit_retries - 1, len(INSTANT_EXIT_BACKOFF_SECONDS) - 1
+                instant_exit_retries - 1, max(0, len(cause_backoff) - 1)
             )
-            backoff = INSTANT_EXIT_BACKOFF_SECONDS[backoff_idx]
+            backoff = cause_backoff[backoff_idx]
 
             ctx.report_milestone(
                 "error",
-                error=f"instant-exit detected for {role}",
+                error=f"instant-exit detected for {role} (cause: {cause})",
                 will_retry=True,
             )
             ctx.report_milestone(
                 "heartbeat",
                 action=(
                     f"retrying instant-exit {role} "
-                    f"(attempt {instant_exit_retries}/{INSTANT_EXIT_MAX_RETRIES}, "
+                    f"(cause: {cause}, "
+                    f"attempt {instant_exit_retries}/{cause_max_retries}, "
                     f"backoff {backoff}s)"
                 ),
             )
