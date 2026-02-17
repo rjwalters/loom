@@ -751,6 +751,117 @@ class TestBuilderPhase:
         assert result.status == PhaseStatus.FAILED
         assert "exited with code 7" in result.message
 
+    def test_instant_exit_recovers_from_worktree_with_commits(
+        self, mock_context: MagicMock
+    ) -> None:
+        """Exit code 6 with commits ahead should attempt worktree recovery.
+
+        When the builder CLI instant-exits but a previous builder left commits
+        in the worktree, the shepherd should try direct completion to push and
+        create a PR.  See issue #2507.
+        """
+        mock_context.check_shutdown.return_value = False
+        mock_context.pr_number = None
+        wt_mock = MagicMock()
+        wt_mock.is_dir.return_value = True
+        wt_mock.__bool__ = lambda self: True
+        mock_context.worktree_path = wt_mock
+
+        builder = BuilderPhase()
+        fake_diag_initial = {
+            "summary": (
+                "worktree exists (branch=feature/issue-42, commits_ahead=2, "
+                "uncommitted=none); remote branch missing; no PR"
+            ),
+            "worktree_exists": True,
+            "has_uncommitted_changes": False,
+            "commits_ahead": 2,
+            "remote_branch_exists": False,
+            "pr_number": None,
+            "pr_has_review_label": False,
+        }
+        fake_diag_after = {
+            "worktree_exists": True,
+            "pr_number": 150,
+        }
+
+        with (
+            patch(
+                "loom_tools.shepherd.phases.builder.get_pr_for_issue",
+                return_value=None,
+            ),
+            patch("loom_tools.shepherd.phases.builder.transition_issue_labels"),
+            patch(
+                "loom_tools.shepherd.phases.builder.run_phase_with_retry",
+                return_value=6,
+            ),
+            patch.object(
+                builder,
+                "_gather_diagnostics",
+                side_effect=[fake_diag_initial, fake_diag_after],
+            ),
+            patch.object(builder, "_create_worktree_marker"),
+            patch.object(builder, "_direct_completion", return_value=True),
+        ):
+            result = builder.run(mock_context)
+
+        assert result.status == PhaseStatus.SUCCESS
+        assert "recovered from exit code 6" in result.message
+        assert result.data.get("pr_number") == 150
+        assert result.data.get("recovered_from_worktree") is True
+
+    def test_instant_exit_stale_worktree_cleaned_up(
+        self, mock_context: MagicMock
+    ) -> None:
+        """Exit code 6 with stale worktree should clean it up before failing.
+
+        When the builder CLI instant-exits and the worktree is clean (no commits,
+        no changes), the shepherd should clean up the orphaned worktree.
+        See issue #2507.
+        """
+        mock_context.check_shutdown.return_value = False
+        wt_mock = MagicMock()
+        wt_mock.is_dir.return_value = True
+        wt_mock.__bool__ = lambda self: True
+        mock_context.worktree_path = wt_mock
+
+        builder = BuilderPhase()
+        fake_diag = {
+            "summary": (
+                "worktree exists (branch=feature/issue-42, commits_ahead=0, "
+                "uncommitted=none); remote branch missing; no PR"
+            ),
+            "worktree_exists": True,
+            "has_uncommitted_changes": False,
+            "commits_ahead": 0,
+            "remote_branch_exists": False,
+            "pr_number": None,
+            "pr_has_review_label": False,
+        }
+
+        with (
+            patch(
+                "loom_tools.shepherd.phases.builder.get_pr_for_issue",
+                return_value=None,
+            ),
+            patch("loom_tools.shepherd.phases.builder.transition_issue_labels"),
+            patch(
+                "loom_tools.shepherd.phases.builder.run_phase_with_retry",
+                return_value=6,
+            ),
+            patch.object(builder, "_gather_diagnostics", return_value=fake_diag),
+            patch.object(builder, "_create_worktree_marker"),
+            patch.object(
+                builder, "_is_stale_worktree", side_effect=[False, True]
+            ),
+            patch.object(builder, "_cleanup_stale_worktree") as mock_cleanup,
+        ):
+            result = builder.run(mock_context)
+
+        assert result.status == PhaseStatus.FAILED
+        assert "exited with code 6" in result.message
+        mock_cleanup.assert_called_once()
+
     def test_stuck_builder_includes_log_path(self, mock_context: MagicMock) -> None:
         """Builder stuck (exit 4) should include log file path in data."""
         mock_context.check_shutdown.return_value = False
@@ -8001,6 +8112,161 @@ class TestBuilderHasIncompleteWork:
             "pr_has_review_label": False,
         }
         assert builder._has_incomplete_work(diag) is False
+
+
+class TestBuilderRecoverFromExistingWorktree:
+    """Test _recover_from_existing_worktree for exit code 6/7 recovery (issue #2507)."""
+
+    def test_no_incomplete_work_returns_none(self) -> None:
+        """When worktree has no incomplete work, recovery is not possible."""
+        builder = BuilderPhase()
+        ctx = MagicMock(spec=ShepherdContext)
+        ctx.config = ShepherdConfig(issue=42)
+        diag = {
+            "worktree_exists": True,
+            "has_uncommitted_changes": False,
+            "commits_ahead": 0,
+            "remote_branch_exists": False,
+            "pr_number": None,
+            "pr_has_review_label": False,
+        }
+        result = builder._recover_from_existing_worktree(ctx, diag, exit_code=6)
+        assert result is None
+
+    def test_direct_completion_succeeds_with_pr(self) -> None:
+        """When direct completion succeeds and creates a PR, return SUCCESS."""
+        builder = BuilderPhase()
+        ctx = MagicMock(spec=ShepherdContext)
+        ctx.config = ShepherdConfig(issue=42)
+        diag_before = {
+            "worktree_exists": True,
+            "has_uncommitted_changes": False,
+            "commits_ahead": 2,
+            "remote_branch_exists": True,
+            "pr_number": None,
+            "pr_has_review_label": False,
+        }
+        diag_after = {
+            "worktree_exists": True,
+            "pr_number": 100,
+        }
+        with (
+            patch.object(builder, "_direct_completion", return_value=True),
+            patch.object(builder, "_gather_diagnostics", return_value=diag_after),
+        ):
+            result = builder._recover_from_existing_worktree(
+                ctx, diag_before, exit_code=6
+            )
+        assert result is not None
+        assert result.status == PhaseStatus.SUCCESS
+        assert "recovered from exit code 6" in result.message
+        assert result.data["recovered_from_worktree"] is True
+        assert result.data["pr_number"] == 100
+        assert ctx.pr_number == 100
+
+    def test_direct_completion_fails_completion_phase_succeeds(self) -> None:
+        """When direct completion fails but completion phase succeeds."""
+        builder = BuilderPhase()
+        ctx = MagicMock(spec=ShepherdContext)
+        ctx.config = ShepherdConfig(issue=42)
+        diag_before = {
+            "worktree_exists": True,
+            "has_uncommitted_changes": True,
+            "commits_ahead": 1,
+            "remote_branch_exists": False,
+            "pr_number": None,
+            "pr_has_review_label": False,
+            "checkpoint_stage": "implementing",
+        }
+        diag_after = {
+            "worktree_exists": True,
+            "pr_number": 200,
+        }
+        with (
+            patch.object(builder, "_direct_completion", return_value=False),
+            patch.object(builder, "_run_completion_phase", return_value=0),
+            patch.object(builder, "_gather_diagnostics", return_value=diag_after),
+        ):
+            result = builder._recover_from_existing_worktree(
+                ctx, diag_before, exit_code=7
+            )
+        assert result is not None
+        assert result.status == PhaseStatus.SUCCESS
+        assert "completion phase recovered from exit code 7" in result.message
+        assert result.data["pr_number"] == 200
+
+    def test_both_recovery_paths_fail_returns_none(self) -> None:
+        """When both direct completion and completion phase fail, return None."""
+        builder = BuilderPhase()
+        ctx = MagicMock(spec=ShepherdContext)
+        ctx.config = ShepherdConfig(issue=42)
+        diag = {
+            "worktree_exists": True,
+            "has_uncommitted_changes": False,
+            "commits_ahead": 3,
+            "remote_branch_exists": False,
+            "pr_number": None,
+            "pr_has_review_label": False,
+        }
+        with (
+            patch.object(builder, "_direct_completion", return_value=False),
+            patch.object(builder, "_run_completion_phase", return_value=6),
+        ):
+            result = builder._recover_from_existing_worktree(ctx, diag, exit_code=6)
+        assert result is None
+
+    def test_direct_completion_succeeds_but_no_pr_returns_none(self) -> None:
+        """When direct completion succeeds but diagnostics show no PR, return None."""
+        builder = BuilderPhase()
+        ctx = MagicMock(spec=ShepherdContext)
+        ctx.config = ShepherdConfig(issue=42)
+        diag = {
+            "worktree_exists": True,
+            "has_uncommitted_changes": False,
+            "commits_ahead": 2,
+            "remote_branch_exists": False,
+            "pr_number": None,
+            "pr_has_review_label": False,
+        }
+        diag_after = {
+            "worktree_exists": True,
+            "pr_number": None,
+        }
+        with (
+            patch.object(builder, "_direct_completion", return_value=True),
+            patch.object(builder, "_gather_diagnostics", return_value=diag_after),
+            patch.object(builder, "_run_completion_phase", return_value=6),
+        ):
+            result = builder._recover_from_existing_worktree(ctx, diag, exit_code=6)
+        assert result is None
+
+    def test_works_with_mcp_failure_exit_code(self) -> None:
+        """Recovery should work the same for exit code 7 (MCP failure)."""
+        builder = BuilderPhase()
+        ctx = MagicMock(spec=ShepherdContext)
+        ctx.config = ShepherdConfig(issue=42)
+        diag_before = {
+            "worktree_exists": True,
+            "has_uncommitted_changes": False,
+            "commits_ahead": 1,
+            "remote_branch_exists": True,
+            "pr_number": None,
+            "pr_has_review_label": False,
+        }
+        diag_after = {
+            "worktree_exists": True,
+            "pr_number": 300,
+        }
+        with (
+            patch.object(builder, "_direct_completion", return_value=True),
+            patch.object(builder, "_gather_diagnostics", return_value=diag_after),
+        ):
+            result = builder._recover_from_existing_worktree(
+                ctx, diag_before, exit_code=7
+            )
+        assert result is not None
+        assert result.status == PhaseStatus.SUCCESS
+        assert "recovered from exit code 7" in result.message
 
 
 class TestBuilderIsNoChangesNeeded:
