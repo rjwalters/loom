@@ -62,6 +62,14 @@ WORKSPACE="${LOOM_WORKSPACE:-$(pwd 2>/dev/null || echo "$HOME")}"
 # Whether --dangerously-skip-permissions was passed (detected in main())
 SKIP_PERMISSIONS_MODE=false
 
+# Global state for signal-handler log flush (issue #2586).
+# When tmux kill-session sends SIGHUP, the wrapper needs to append any
+# tee-captured output to the log file before dying.  These globals are set
+# in run_with_retry() and read by the _flush_output_on_signal() handler.
+_FLUSH_TEMP_OUTPUT=""       # Path to tee-captured temp output file
+_FLUSH_LOG_FILE=""          # Path to the agent log file
+_FLUSH_PRE_LOG_LINES=0     # Log file line count before CLI started
+
 # Retry state file for external observability (see issue #2296).
 # When TERMINAL_ID is set, the wrapper writes its retry/backoff state to this
 # file so agent-wait-bg.sh and the shepherd can distinguish "wrapper retrying"
@@ -83,6 +91,42 @@ log_warn() {
 
 log_error() {
     echo "[$(date -u '+%Y-%m-%dT%H:%M:%SZ')] [ERROR] $*" >&2
+}
+
+# Flush tee-captured output to the log file on signal (issue #2586).
+# Called via trap when tmux kill-session sends SIGHUP/SIGTERM.  Without
+# this, the fallback append logic (lines after the CLI invocation) never
+# executes because the process is killed before reaching it.
+#
+# Uses the same dedup threshold as the normal append path: only append if
+# pipe-pane captured less than half the expected output.
+_flush_output_on_signal() {
+    # Only flush if we have the required state
+    if [[ -z "$_FLUSH_TEMP_OUTPUT" ]] || [[ ! -s "$_FLUSH_TEMP_OUTPUT" ]]; then
+        return
+    fi
+    if [[ -z "$_FLUSH_LOG_FILE" ]]; then
+        return
+    fi
+
+    if [[ -f "$_FLUSH_LOG_FILE" ]]; then
+        local _post_lines
+        _post_lines=$(wc -l < "$_FLUSH_LOG_FILE" 2>/dev/null || echo "0")
+        local _growth=$(( _post_lines - _FLUSH_PRE_LOG_LINES ))
+        local _temp_lines
+        _temp_lines=$(wc -l < "$_FLUSH_TEMP_OUTPUT" 2>/dev/null || echo "0")
+        # Same 50% threshold as the normal code path (issue #2569)
+        if [[ $_growth -lt $(( _temp_lines / 2 )) ]]; then
+            cat "$_FLUSH_TEMP_OUTPUT" >> "$_FLUSH_LOG_FILE" 2>/dev/null || true
+        fi
+    else
+        # Log file doesn't exist yet - create it with the captured output
+        cat "$_FLUSH_TEMP_OUTPUT" > "$_FLUSH_LOG_FILE" 2>/dev/null || true
+    fi
+
+    # Clean up temp file
+    rm -f "$_FLUSH_TEMP_OUTPUT" 2>/dev/null || true
+    _FLUSH_TEMP_OUTPUT=""
 }
 
 # Write retry state to a JSON file for external observability (issue #2296).
