@@ -231,11 +231,10 @@ def report_milestone(
             return True
 
         # All other events require an existing progress file.
+        # The file may have been deleted by a concurrent shepherd cleaning
+        # up stale progress for the same issue — use warning, not error.
         if not progress_file.is_file():
-            log_error(f"No progress file found for task {task_id}")
-            log_error(
-                f"Run 'report-milestone.sh started --task-id {task_id} --issue N' first"
-            )
+            log_warning(f"No progress file found for task {task_id} (may have been cleaned up by another shepherd)")
             return False
 
         raw = read_json_file(progress_file)
