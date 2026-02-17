@@ -11167,6 +11167,105 @@ class TestBuilderSessionQualityGate:
         assert builder._is_no_changes_needed(diag) is False
 
 
+class TestBuilderMcpFailureMarkerDetection:
+    """Test _is_no_changes_needed rejects sessions with MCP/plugin failure markers.
+
+    When the builder session output contains MCP server or plugin failure
+    patterns but no tool calls, thinking spinners can inflate the output
+    past the MCP_FAILURE_MIN_OUTPUT_CHARS threshold, causing the base
+    _is_mcp_failure() to miss it.  The 'no changes needed' classifier
+    must reject these sessions independently.  See issue #2464.
+    """
+
+    def test_mcp_failure_markers_block_no_changes_needed(self) -> None:
+        """Session with MCP failure markers should NOT be 'no changes needed'."""
+        builder = BuilderPhase()
+        diag = {
+            "worktree_exists": True,
+            "has_uncommitted_changes": False,
+            "commits_ahead": 0,
+            "remote_branch_exists": False,
+            "pr_number": None,
+            "main_branch_dirty": False,
+            "log_has_implementation_activity": False,
+            "log_cli_output_length": 1000,
+            "log_has_mcp_failure_markers": True,
+        }
+        assert builder._is_no_changes_needed(diag) is False
+
+    def test_plugin_failure_markers_block_no_changes_needed(self) -> None:
+        """Session with plugin failure markers should NOT be 'no changes needed'."""
+        builder = BuilderPhase()
+        diag = {
+            "worktree_exists": True,
+            "has_uncommitted_changes": False,
+            "commits_ahead": 0,
+            "remote_branch_exists": False,
+            "pr_number": None,
+            "main_branch_dirty": False,
+            "log_has_implementation_activity": False,
+            "log_cli_output_length": 1000,
+            "log_has_mcp_failure_markers": True,
+        }
+        assert builder._is_no_changes_needed(diag) is False
+
+    def test_no_mcp_markers_allows_no_changes_needed(self) -> None:
+        """Session without MCP failure markers can be 'no changes needed'."""
+        builder = BuilderPhase()
+        diag = {
+            "worktree_exists": True,
+            "has_uncommitted_changes": False,
+            "commits_ahead": 0,
+            "remote_branch_exists": False,
+            "pr_number": None,
+            "main_branch_dirty": False,
+            "log_has_implementation_activity": False,
+            "log_cli_output_length": 1000,
+            "log_has_mcp_failure_markers": False,
+        }
+        assert builder._is_no_changes_needed(diag) is True
+
+    def test_missing_mcp_markers_key_defaults_safe(self) -> None:
+        """Missing log_has_mcp_failure_markers key defaults to False (no block)."""
+        builder = BuilderPhase()
+        diag = {
+            "worktree_exists": True,
+            "has_uncommitted_changes": False,
+            "commits_ahead": 0,
+            "remote_branch_exists": False,
+            "pr_number": None,
+            "main_branch_dirty": False,
+            "log_has_implementation_activity": False,
+            "log_cli_output_length": 1000,
+            # log_has_mcp_failure_markers not present — backwards compat
+        }
+        assert builder._is_no_changes_needed(diag) is True
+
+
+class TestMcpFailureMarkerRegex:
+    """Test _MCP_FAILURE_MARKER_RE matches expected patterns."""
+
+    def test_matches_mcp_server_failed(self) -> None:
+        from loom_tools.shepherd.phases.builder import _MCP_FAILURE_MARKER_RE
+
+        assert _MCP_FAILURE_MARKER_RE.search("1 MCP server failed")
+
+    def test_matches_plugins_failed_to_install(self) -> None:
+        from loom_tools.shepherd.phases.builder import _MCP_FAILURE_MARKER_RE
+
+        assert _MCP_FAILURE_MARKER_RE.search("2 plugins failed to install")
+
+    def test_matches_plugin_singular(self) -> None:
+        from loom_tools.shepherd.phases.builder import _MCP_FAILURE_MARKER_RE
+
+        assert _MCP_FAILURE_MARKER_RE.search("1 plugin failed to install")
+
+    def test_no_match_on_clean_output(self) -> None:
+        from loom_tools.shepherd.phases.builder import _MCP_FAILURE_MARKER_RE
+
+        assert not _MCP_FAILURE_MARKER_RE.search("Build completed successfully")
+
+
 class TestImplementationToolRegex:
     """Test _IMPLEMENTATION_TOOL_RE matches expected patterns."""
 

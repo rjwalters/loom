@@ -33,6 +33,7 @@ from loom_tools.shepherd.labels import (
     transition_issue_labels,
 )
 from loom_tools.shepherd.phases.base import (
+    MCP_FAILURE_PATTERNS,
     PhaseResult,
     PhaseStatus,
     _get_cli_output,
@@ -86,6 +87,19 @@ _SUBSTANTIVE_OUTPUT_MIN_CHARS = 2000
 # Set lower than _SUBSTANTIVE_OUTPUT_MIN_CHARS because analysis (Read/Grep)
 # produces less output than implementation (Edit/Write).
 _MIN_ANALYSIS_OUTPUT_CHARS = 500
+
+# Patterns that indicate MCP server or plugin failures in the CLI output.
+# Unlike _is_mcp_failure() in base.py which gates on output volume (allowing
+# sessions with substantial output to pass), these markers are checked
+# unconditionally in _is_no_changes_needed() because thinking spinners can
+# inflate output volume without any real tool calls.  See issue #2464.
+_MCP_FAILURE_MARKER_PATTERNS = [
+    *MCP_FAILURE_PATTERNS,
+    r"plugins?\s+failed\s+to\s+install",
+]
+_MCP_FAILURE_MARKER_RE = re.compile(
+    "|".join(_MCP_FAILURE_MARKER_PATTERNS), re.IGNORECASE
+)
 
 # File extensions mapped to language categories for scoped test verification
 _LANGUAGE_EXTENSIONS: dict[str, str] = {
@@ -2552,14 +2566,23 @@ class BuilderPhase:
                     len(cli_output.strip()) >= _SUBSTANTIVE_OUTPUT_MIN_CHARS
                     and _IMPLEMENTATION_TOOL_RE.search(cli_output)
                 )
+                # Check for MCP/plugin failure markers regardless of output
+                # volume.  Thinking spinners can inflate output past the
+                # MCP_FAILURE_MIN_OUTPUT_CHARS threshold without any real
+                # tool calls, causing _is_mcp_failure() to miss it.
+                diag["log_has_mcp_failure_markers"] = bool(
+                    _MCP_FAILURE_MARKER_RE.search(cli_output)
+                )
             except OSError:
                 diag["log_tail"] = []
                 diag["log_cli_output_length"] = 0
                 diag["log_has_implementation_activity"] = False
+                diag["log_has_mcp_failure_markers"] = False
         else:
             diag["log_tail"] = []
             diag["log_cli_output_length"] = 0
             diag["log_has_implementation_activity"] = False
+            diag["log_has_mcp_failure_markers"] = False
 
         # -- Worktree state --------------------------------------------------
         wt = ctx.worktree_path
@@ -2967,6 +2990,19 @@ class BuilderPhase:
                 f"Builder session too short to conclude 'no changes needed' "
                 f"({cli_output_len} chars of output, minimum "
                 f"{_MIN_ANALYSIS_OUTPUT_CHARS}) — treating as builder failure"
+            )
+            return False
+
+        # MCP/plugin failure markers in the CLI output indicate the builder
+        # session was broken by infrastructure issues, not a legitimate
+        # analysis.  Thinking spinners can inflate output past the volume
+        # threshold used by _is_mcp_failure() in base.py, so we check
+        # markers unconditionally here.  See issue #2464.
+        if diag.get("log_has_mcp_failure_markers", False):
+            log_warning(
+                "Builder log shows MCP/plugin failure markers but no git "
+                "artifacts — treating as builder failure, not 'no changes "
+                "needed'"
             )
             return False
 
