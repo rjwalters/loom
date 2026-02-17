@@ -14,6 +14,7 @@ from loom_tools.shepherd.context import ShepherdContext
 from loom_tools.shepherd.phases.base import PhaseStatus
 from loom_tools.shepherd.phases.reflection import (
     HIGH_RETRY_THRESHOLD,
+    HIGH_TEST_FIX_THRESHOLD,
     REFLECTION_ISSUE_LABEL,
     TITLE_PREFIX,
     UPSTREAM_REPO,
@@ -104,6 +105,7 @@ class TestReflectionPhaseAnalysis:
 
     def test_detects_excessive_judge_retries(self, clean_summary: RunSummary) -> None:
         clean_summary.judge_retries = HIGH_RETRY_THRESHOLD
+        clean_summary.exit_code = 1  # retries only flagged on failed runs
         phase = ReflectionPhase(run_summary=clean_summary)
         findings = phase._analyze_run(clean_summary)
         retry_findings = [f for f in findings if f.category == "excessive_retries"]
@@ -114,6 +116,7 @@ class TestReflectionPhaseAnalysis:
         self, clean_summary: RunSummary
     ) -> None:
         clean_summary.doctor_attempts = HIGH_RETRY_THRESHOLD
+        clean_summary.exit_code = 1  # retries only flagged on failed runs
         phase = ReflectionPhase(run_summary=clean_summary)
         findings = phase._analyze_run(clean_summary)
         retry_findings = [f for f in findings if f.category == "excessive_retries"]
@@ -123,12 +126,50 @@ class TestReflectionPhaseAnalysis:
     def test_detects_excessive_test_fix_attempts(
         self, clean_summary: RunSummary
     ) -> None:
-        clean_summary.test_fix_attempts = HIGH_RETRY_THRESHOLD
+        clean_summary.test_fix_attempts = HIGH_TEST_FIX_THRESHOLD
+        clean_summary.exit_code = 1  # retries only flagged on failed runs
         phase = ReflectionPhase(run_summary=clean_summary)
         findings = phase._analyze_run(clean_summary)
         retry_findings = [f for f in findings if f.category == "excessive_retries"]
         assert len(retry_findings) == 1
         assert "test-fix" in retry_findings[0].title.lower()
+
+    def test_retries_skipped_when_run_succeeded(
+        self, clean_summary: RunSummary
+    ) -> None:
+        """Retries that self-heal (exit_code == 0) are not actionable."""
+        clean_summary.judge_retries = HIGH_RETRY_THRESHOLD + 1
+        clean_summary.doctor_attempts = HIGH_RETRY_THRESHOLD + 1
+        clean_summary.test_fix_attempts = HIGH_TEST_FIX_THRESHOLD + 1
+        clean_summary.exit_code = 0  # run succeeded
+        phase = ReflectionPhase(run_summary=clean_summary)
+        findings = phase._analyze_run(clean_summary)
+        retry_findings = [f for f in findings if f.category == "excessive_retries"]
+        assert len(retry_findings) == 0
+
+    def test_test_fix_at_old_threshold_no_finding(
+        self, clean_summary: RunSummary
+    ) -> None:
+        """Test-fix loop of 2 is routine and should not produce a finding."""
+        clean_summary.test_fix_attempts = 2
+        clean_summary.exit_code = 1
+        phase = ReflectionPhase(run_summary=clean_summary)
+        findings = phase._analyze_run(clean_summary)
+        retry_findings = [f for f in findings if f.category == "excessive_retries"]
+        assert len(retry_findings) == 0
+
+    def test_retry_finding_includes_error_context(
+        self, clean_summary: RunSummary
+    ) -> None:
+        """Retry findings include error context extracted from logs."""
+        clean_summary.judge_retries = HIGH_RETRY_THRESHOLD
+        clean_summary.exit_code = 1
+        clean_summary.log_content = "Error: review submission timed out\n"
+        phase = ReflectionPhase(run_summary=clean_summary)
+        findings = phase._analyze_run(clean_summary)
+        retry_findings = [f for f in findings if f.category == "excessive_retries"]
+        assert len(retry_findings) == 1
+        assert "Error: review submission timed out" in retry_findings[0].details
 
     def test_builder_failure_with_diagnostics(self, clean_summary: RunSummary) -> None:
         """builder_failure finding includes extracted error context."""
