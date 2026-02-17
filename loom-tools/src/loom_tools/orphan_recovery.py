@@ -28,7 +28,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from loom_tools.claim import has_valid_claim
-from loom_tools.common.github import gh_issue_list, gh_run
+from loom_tools.common.github import get_repo_nwo, gh_issue_list, gh_run
 from loom_tools.common.logging import log_error, log_info, log_success, log_warning
 from loom_tools.common.repo import find_repo_root
 from loom_tools.common.state import (
@@ -46,6 +46,13 @@ from loom_tools.models.progress import ShepherdProgress
 # This is intentionally higher than stuck_detection's 120s because
 # orphan recovery is post-crash cleanup, not real-time monitoring.
 DEFAULT_HEARTBEAT_STALE_THRESHOLD = 300
+
+# Grace period for recently-applied loom:building labels (10 minutes).
+# Issues with loom:building added less than this many seconds ago are
+# assumed to be actively worked on and skipped by orphan recovery.
+# This protects manual /shepherd runs and newly-claimed issues from
+# being incorrectly recovered before claims or heartbeats are established.
+DEFAULT_LABEL_GRACE_PERIOD = 600
 
 # Task ID format: exactly 7 lowercase hex characters
 TASK_ID_PATTERN = re.compile(r"^[a-f0-9]{7}$")
@@ -136,6 +143,17 @@ def _get_heartbeat_stale_threshold() -> int:
     return DEFAULT_HEARTBEAT_STALE_THRESHOLD
 
 
+def _get_label_grace_period() -> int:
+    """Get label grace period from env var or default."""
+    env_val = os.environ.get("LOOM_LABEL_GRACE_PERIOD")
+    if env_val is not None:
+        try:
+            return int(env_val)
+        except ValueError:
+            pass
+    return DEFAULT_LABEL_GRACE_PERIOD
+
+
 def _is_valid_task_id(task_id: str) -> bool:
     """Check if a task ID matches the expected 7-char hex format."""
     return bool(TASK_ID_PATTERN.fullmatch(task_id))
@@ -157,6 +175,43 @@ def _check_task_exists(task_id: str, output_file: str | None) -> bool:
                 return True
 
     return False
+
+
+def _get_building_label_age(issue: int) -> int | None:
+    """Return seconds since the ``loom:building`` label was applied to *issue*.
+
+    Queries the GitHub API for issue timeline events to find the most recent
+    ``labeled`` event for ``loom:building``.  Returns ``None`` if the label
+    event cannot be determined (API failure, no events, etc.).
+    """
+    nwo = get_repo_nwo()
+    if not nwo:
+        return None
+
+    try:
+        result = gh_run(
+            [
+                "api",
+                f"repos/{nwo}/issues/{issue}/events",
+                "--jq",
+                '[.[] | select(.event == "labeled" and .label.name == "loom:building")] | last | .created_at',
+            ],
+            check=False,
+        )
+    except Exception:
+        return None
+
+    if result.returncode != 0:
+        return None
+
+    timestamp = result.stdout.strip().strip('"')
+    if not timestamp or timestamp == "null":
+        return None
+
+    try:
+        return elapsed_seconds(timestamp)
+    except (ValueError, OverflowError):
+        return None
 
 
 def check_daemon_state_tasks(
@@ -227,6 +282,7 @@ def check_untracked_building(
     *,
     repo_root: pathlib.Path | None = None,
     heartbeat_threshold: int = DEFAULT_HEARTBEAT_STALE_THRESHOLD,
+    label_grace_period: int = DEFAULT_LABEL_GRACE_PERIOD,
     verbose: bool = False,
 ) -> None:
     """Phase 2: Find loom:building issues without active shepherds.
@@ -263,6 +319,21 @@ def check_untracked_building(
             if verbose:
                 log_info(f"  OK: tracked in daemon-state")
             continue
+
+        # Label-age grace period: skip issues where loom:building was
+        # applied recently.  This protects manual /shepherd runs and
+        # newly-claimed issues from premature orphan recovery before
+        # claims or heartbeats are established.
+        if label_grace_period > 0:
+            label_age = _get_building_label_age(issue_num)
+            if label_age is not None and label_age < label_grace_period:
+                if verbose:
+                    log_info(
+                        f"  SKIPPED: #{issue_num} label loom:building "
+                        f"applied {label_age}s ago (grace period: "
+                        f"{label_grace_period}s)"
+                    )
+                continue
 
         # Not tracked in daemon-state; check progress files
         has_fresh_progress = False
@@ -587,6 +658,7 @@ def recover_issue(
     *,
     repo_root: pathlib.Path | None = None,
     heartbeat_threshold: int = DEFAULT_HEARTBEAT_STALE_THRESHOLD,
+    label_grace_period: int = DEFAULT_LABEL_GRACE_PERIOD,
 ) -> None:
     """Recovery action: Reset issue labels from loom:building to loom:issue.
 
@@ -595,7 +667,22 @@ def recover_issue(
 
     Additionally, re-reads progress files from disk before acting.  A fresh
     heartbeat that appeared after the initial scan will abort recovery.
+
+    A label-age grace period provides defense-in-depth: if the
+    ``loom:building`` label was applied recently (within *label_grace_period*
+    seconds), recovery is skipped regardless of claim or heartbeat state.
     """
+    # Defense-in-depth: skip recovery if the label was recently applied.
+    if label_grace_period > 0:
+        label_age = _get_building_label_age(issue)
+        if label_age is not None and label_age < label_grace_period:
+            log_warning(
+                f"Skipping recovery for issue #{issue}: "
+                f"loom:building label applied {label_age}s ago "
+                f"(grace period: {label_grace_period}s)"
+            )
+            return
+
     if repo_root is not None and has_valid_claim(repo_root, issue):
         log_warning(
             f"Skipping recovery for issue #{issue}: valid file-based claim exists"
@@ -739,6 +826,7 @@ def run_orphan_recovery(
     """
     result = OrphanRecoveryResult(recover_mode=recover)
     heartbeat_threshold = _get_heartbeat_stale_threshold()
+    label_grace_period = _get_label_grace_period()
 
     daemon_state = read_daemon_state(repo_root)
     progress_files = read_progress_files(repo_root)
@@ -753,6 +841,7 @@ def run_orphan_recovery(
         result,
         repo_root=repo_root,
         heartbeat_threshold=heartbeat_threshold,
+        label_grace_period=label_grace_period,
         verbose=verbose,
     )
 
@@ -875,6 +964,7 @@ Recovery actions:
 
 Environment variables:
     LOOM_HEARTBEAT_STALE_THRESHOLD  Seconds before heartbeat is stale (default: 300)
+    LOOM_LABEL_GRACE_PERIOD         Seconds to skip recently-labeled issues (default: 600)
 """,
     )
 
