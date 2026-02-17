@@ -3432,7 +3432,7 @@ class BuilderPhase:
                         "--head",
                         branch,
                         "--title",
-                        f"Issue #{ctx.config.issue}",
+                        ctx.issue_title or f"Issue #{ctx.config.issue}",
                         "--label",
                         "loom:review-requested",
                         "--body",
@@ -3525,7 +3525,7 @@ class BuilderPhase:
         if "create_pr" in steps:
             if attempt >= 2:
                 instructions.append(
-                    f"- Run: gh pr create --title 'Issue #{ctx.config.issue}' "
+                    f"- Run: gh pr create --title {shlex.quote(ctx.issue_title or f'Issue #{ctx.config.issue}')} "
                     f"--label loom:review-requested "
                     f"--body 'Closes #{ctx.config.issue}'"
                 )

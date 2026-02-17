@@ -1858,6 +1858,7 @@ class TestMarkBuilderNoPr:
         ctx = MagicMock()
         ctx.config.issue = 42
         ctx.repo_root = "/fake/repo"
+        ctx.issue_title = "fix: broken widget"
 
         with patch("loom_tools.common.systematic_failure.record_blocked_reason"), \
              patch("loom_tools.common.systematic_failure.detect_systematic_failure"):
@@ -1872,6 +1873,8 @@ class TestMarkBuilderNoPr:
         assert "No PR was created" in cmd[body_idx]
         # Verify diagnostic info is in the comment
         assert "Diagnostics" in cmd[body_idx]
+        # Verify issue title is used in recovery commands
+        assert "fix: broken widget" in cmd[body_idx]
         assert "Worktree exists | yes" in cmd[body_idx]
         assert "Suggested Recovery" in cmd[body_idx]
 
@@ -2167,6 +2170,62 @@ class TestFormatDiagnosticsForComment:
         assert "- `M src/a.py`" in output
         assert "- `?? src/b.py`" in output
         assert "- `D src/c.py`" in output
+
+    def test_uses_issue_title_in_recovery_commands(self) -> None:
+        """Should use issue title instead of 'Issue #N' in gh pr create."""
+        diagnostics = {
+            "worktree_exists": True,
+            "worktree_path": "/path/to/.loom/worktrees/issue-42",
+            "uncommitted_files": [],
+            "uncommitted_count": 0,
+            "commits_ahead_of_main": 1,
+            "remote_branch_exists": True,
+            "current_branch": "feature/issue-42",
+            "suggested_recovery": "create PR manually",
+        }
+
+        output = _format_diagnostics_for_comment(diagnostics, 42, "fix: broken widget")
+
+        assert "fix: broken widget" in output
+        assert "Issue #42" not in output
+
+    def test_falls_back_to_issue_number_when_no_title(self) -> None:
+        """Should fall back to 'Issue #N' when issue_title is empty."""
+        diagnostics = {
+            "worktree_exists": True,
+            "worktree_path": "/path/to/.loom/worktrees/issue-42",
+            "uncommitted_files": [],
+            "uncommitted_count": 0,
+            "commits_ahead_of_main": 1,
+            "remote_branch_exists": True,
+            "current_branch": "feature/issue-42",
+            "suggested_recovery": "create PR manually",
+        }
+
+        output = _format_diagnostics_for_comment(diagnostics, 42)
+
+        assert "Issue #42" in output
+
+    def test_escapes_special_characters_in_title(self) -> None:
+        """Should shell-escape special characters in issue titles."""
+        diagnostics = {
+            "worktree_exists": True,
+            "worktree_path": "/path/to/.loom/worktrees/issue-42",
+            "uncommitted_files": [],
+            "uncommitted_count": 0,
+            "commits_ahead_of_main": 1,
+            "remote_branch_exists": True,
+            "current_branch": "feature/issue-42",
+            "suggested_recovery": "create PR manually",
+        }
+
+        output = _format_diagnostics_for_comment(
+            diagnostics, 42, "fix: handle `backtick` and 'quote'"
+        )
+
+        # shlex.quote wraps the title in single quotes and escapes internal quotes
+        assert "gh pr create --title" in output
+        assert "backtick" in output
 
 
 class TestBuilderNoPrPrecondition:
