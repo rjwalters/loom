@@ -492,6 +492,48 @@ class TestRecoverShepherd:
         assert "reset_shepherd" in actions
         assert "reset_issue_label" in actions
 
+    def test_label_grace_period_forwarded_to_recover_issue(
+        self, tmp_path: pathlib.Path
+    ) -> None:
+        """recover_shepherd should forward label_grace_period to recover_issue."""
+        loom_dir = tmp_path / ".loom"
+        loom_dir.mkdir()
+
+        daemon_state = {
+            "running": True,
+            "shepherds": {
+                "shepherd-1": {
+                    "status": "working",
+                    "issue": 42,
+                    "task_id": "abc1234",
+                },
+            },
+        }
+        (loom_dir / "daemon-state.json").write_text(json.dumps(daemon_state))
+
+        result = OrphanRecoveryResult(recover_mode=True)
+
+        with patch(
+            "loom_tools.orphan_recovery.recover_issue"
+        ) as mock_recover_issue:
+            recover_shepherd(
+                tmp_path,
+                "shepherd-1",
+                42,
+                "abc1234",
+                "stale_task_id",
+                result,
+                label_grace_period=0,
+            )
+
+        mock_recover_issue.assert_called_once_with(
+            42,
+            "stale_task_id",
+            result,
+            repo_root=tmp_path,
+            label_grace_period=0,
+        )
+
     def test_reset_shepherd_no_issue(self, tmp_path: pathlib.Path) -> None:
         loom_dir = tmp_path / ".loom"
         loom_dir.mkdir()
@@ -614,6 +656,48 @@ class TestRecoverProgressFile:
         assert "mark_progress_errored" in actions
         assert "reset_issue_label" in actions
 
+    def test_label_grace_period_forwarded_to_recover_issue(
+        self, tmp_path: pathlib.Path
+    ) -> None:
+        """recover_progress_file should forward label_grace_period to recover_issue."""
+        loom_dir = tmp_path / ".loom"
+        progress_dir = loom_dir / "progress"
+        progress_dir.mkdir(parents=True)
+
+        progress_data = {
+            "task_id": "abc1234",
+            "issue": 42,
+            "status": "working",
+            "last_heartbeat": "2026-01-01T00:00:00Z",
+            "milestones": [],
+        }
+        progress_path = progress_dir / "shepherd-abc1234.json"
+        progress_path.write_text(json.dumps(progress_data))
+
+        progress = ShepherdProgress(
+            task_id="abc1234",
+            issue=42,
+            status="working",
+            last_heartbeat="2026-01-01T00:00:00Z",
+        )
+
+        result = OrphanRecoveryResult(recover_mode=True)
+
+        with patch(
+            "loom_tools.orphan_recovery.recover_issue"
+        ) as mock_recover_issue:
+            recover_progress_file(
+                tmp_path, progress, result, label_grace_period=0
+            )
+
+        mock_recover_issue.assert_called_once_with(
+            42,
+            "stale_heartbeat",
+            result,
+            repo_root=tmp_path,
+            label_grace_period=0,
+        )
+
     def test_missing_progress_file(self, tmp_path: pathlib.Path) -> None:
         loom_dir = tmp_path / ".loom"
         loom_dir.mkdir()
@@ -670,6 +754,57 @@ class TestRunOrphanRecovery:
 
         assert result.total_orphaned == 1
         assert result.total_recovered >= 1
+
+    def test_label_grace_period_env_forwarded_to_all_recover_sites(
+        self, tmp_path: pathlib.Path
+    ) -> None:
+        """LOOM_LABEL_GRACE_PERIOD env override should reach all recover_issue call sites."""
+        loom_dir = tmp_path / ".loom"
+        loom_dir.mkdir()
+        progress_dir = loom_dir / "progress"
+        progress_dir.mkdir()
+
+        # Set up daemon state with a stale task (Phase 1 orphan)
+        daemon_state = {
+            "running": True,
+            "shepherds": {
+                "shepherd-1": {
+                    "status": "working",
+                    "issue": 42,
+                    "task_id": "INVALID",
+                },
+            },
+        }
+        (loom_dir / "daemon-state.json").write_text(json.dumps(daemon_state))
+
+        # Set up a stale progress file (Phase 3 orphan)
+        old_time = datetime.now(timezone.utc) - timedelta(seconds=600)
+        stale_hb = old_time.strftime("%Y-%m-%dT%H:%M:%SZ")
+        progress_data = {
+            "task_id": "def5678",
+            "issue": 99,
+            "status": "working",
+            "last_heartbeat": stale_hb,
+            "milestones": [],
+        }
+        (progress_dir / "shepherd-def5678.json").write_text(
+            json.dumps(progress_data)
+        )
+
+        with patch.dict("os.environ", {"LOOM_LABEL_GRACE_PERIOD": "0"}), patch(
+            "loom_tools.orphan_recovery.gh_issue_list", return_value=[]
+        ), patch(
+            "loom_tools.orphan_recovery.recover_issue"
+        ) as mock_recover_issue, patch(
+            "loom_tools.orphan_recovery.write_json_file"
+        ):
+            result = run_orphan_recovery(tmp_path, recover=True)
+
+        # recover_issue should have been called with label_grace_period=0
+        # for both Phase 1 (via recover_shepherd) and Phase 3 (via recover_progress_file)
+        assert mock_recover_issue.call_count == 2
+        for call in mock_recover_issue.call_args_list:
+            assert call.kwargs.get("label_grace_period") == 0
 
     def test_no_orphans(self, tmp_path: pathlib.Path) -> None:
         loom_dir = tmp_path / ".loom"
