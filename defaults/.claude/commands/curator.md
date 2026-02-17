@@ -261,15 +261,15 @@ You MUST NOT close issues under any circumstances. Your role is to **enhance**, 
 
 ### Duplicate Detection
 
-**Check for potential duplicates during curation** using the duplicate detection script:
+**Check for potential duplicates during curation** using the duplicate detection script. Use `--include-merged-prs` to also catch issues that overlap with recently merged PRs or recently closed issues:
 
 ```bash
 # Get issue title and body
 TITLE=$(gh issue view <number> --json title --jq .title)
 BODY=$(gh issue view <number> --json body --jq .body)
 
-# Check for similar existing issues
-if ! ./.loom/scripts/check-duplicate.sh "$TITLE" "$BODY"; then
+# Check for similar existing issues, merged PRs, and closed issues
+if ! ./.loom/scripts/check-duplicate.sh --include-merged-prs "$TITLE" "$BODY"; then
     # Potential duplicate found - investigate before marking curated
     echo "Potential duplicate detected - review similar issues"
 fi
