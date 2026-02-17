@@ -209,7 +209,7 @@ class TestDetectWorktreeEscape:
                 side_effect=[
                     # git status --porcelain (worktree) - clean
                     _make_run_result(stdout=""),
-                    # git log --oneline main..HEAD (worktree) - no commits
+                    # git log --oneline origin/main..HEAD (worktree) - no commits
                     _make_run_result(stdout=""),
                 ],
             ),
@@ -239,7 +239,7 @@ class TestDetectWorktreeEscape:
                 side_effect=[
                     # git status --porcelain (worktree) - clean
                     _make_run_result(stdout=""),
-                    # git log --oneline main..HEAD (worktree) - has commits
+                    # git log --oneline origin/main..HEAD (worktree) - has commits
                     _make_run_result(stdout="abc1234 feat: implement feature\n"),
                 ],
             ),

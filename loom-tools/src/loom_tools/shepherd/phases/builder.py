@@ -588,8 +588,11 @@ class BuilderPhase:
                         },
                     )
 
-            # Clean up stale worktree to avoid leaving orphans
-            if exit_code in (6, 7) and diag.get("worktree_exists"):
+            # Clean up stale worktree to avoid leaving orphans (issue #2685).
+            # Previously only cleaned up for exit codes 6/7 (MCP/low-output),
+            # but any non-zero exit can leave a stale worktree that blocks
+            # the next shepherd attempt.
+            if diag.get("worktree_exists"):
                 if self._is_stale_worktree(ctx.worktree_path):
                     self._cleanup_stale_worktree(ctx)
 
@@ -2934,7 +2937,7 @@ class BuilderPhase:
                 wt_status.returncode == 0 and wt_status.stdout.strip()
             )
             log_res = subprocess.run(
-                ["git", "-C", str(wt), "log", "--oneline", "main..HEAD"],
+                ["git", "-C", str(wt), "log", "--oneline", "origin/main..HEAD"],
                 capture_output=True, text=True, check=False,
             )
             commits_ahead = (
@@ -3019,7 +3022,7 @@ class BuilderPhase:
             return None
 
         log_res = subprocess.run(
-            ["git", "-C", str(wt), "log", "--format=%s", "main..HEAD"],
+            ["git", "-C", str(wt), "log", "--format=%s", "origin/main..HEAD"],
             capture_output=True, text=True, check=False,
         )
         if log_res.returncode != 0 or not log_res.stdout.strip():
@@ -4116,12 +4119,45 @@ class BuilderPhase:
         and recreating the worktree, we reset it to origin/main and let the
         builder continue fresh.
 
+        If the branch name doesn't match the expected convention
+        (feature/issue-{N}), the worktree is removed entirely so
+        worktree.sh can recreate it with the correct branch name
+        (issue #2685).
+
         This approach:
         1. Preserves the worktree directory structure
         2. Ensures the branch is in sync with main
         3. Is faster than remove + recreate
         """
         if not ctx.worktree_path or not ctx.worktree_path.is_dir():
+            return
+
+        # Check for branch naming mismatch (issue #2685).
+        # If the stale worktree has the wrong branch name, reset-in-place
+        # would preserve the mismatch.  Remove entirely so worktree.sh
+        # recreates with the correct branch name.
+        expected_branch = f"feature/issue-{ctx.config.issue}"
+        branch_result = subprocess.run(
+            [
+                "git", "-C", str(ctx.worktree_path),
+                "rev-parse", "--abbrev-ref", "HEAD",
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        actual_branch = (
+            branch_result.stdout.strip()
+            if branch_result.returncode == 0
+            else ""
+        )
+        if actual_branch and actual_branch != expected_branch:
+            log_warning(
+                f"Stale worktree branch mismatch: expected "
+                f"{expected_branch}, got {actual_branch} — removing "
+                f"worktree for clean recreation"
+            )
+            self._remove_stale_worktree(ctx)
             return
 
         # Fetch latest from origin to ensure we have current main
