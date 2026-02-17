@@ -414,12 +414,61 @@ class TestValidateBuilder:
 
     @patch("loom_tools.validate_phase._find_pr_for_issue")
     @patch("loom_tools.validate_phase._run_gh")
-    def test_issue_closed(self, mock_gh: MagicMock, mock_find: MagicMock, tmp_path: Path):
+    def test_issue_closed_with_pr(self, mock_gh: MagicMock, mock_find: MagicMock, tmp_path: Path):
+        """Issue closed + PR exists = legitimate completion."""
         repo = _make_repo(tmp_path)
         mock_gh.return_value = _completed(stdout="CLOSED\n")
+        mock_find.return_value = (100, "branch_name")
         result = validate_builder(42, repo)
         assert result.status == ValidationStatus.SATISFIED
         assert "closed" in result.message.lower()
+        assert "PR #100" in result.message
+
+    @patch("loom_tools.validate_phase._find_pr_for_issue")
+    @patch("loom_tools.validate_phase._run_gh")
+    def test_issue_closed_with_merged_pr(self, mock_gh: MagicMock, mock_find: MagicMock, tmp_path: Path):
+        """Issue closed + merged PR exists = legitimate completion."""
+        repo = _make_repo(tmp_path)
+        mock_gh.side_effect = [
+            _completed(stdout="CLOSED\n"),  # issue state
+            _completed(stdout="55\n"),       # merged PR search
+        ]
+        mock_find.return_value = None  # no open PR
+        result = validate_builder(42, repo)
+        assert result.status == ValidationStatus.SATISFIED
+        assert "merged PR #55" in result.message
+
+    @patch("loom_tools.validate_phase._mark_phase_failed")
+    @patch("loom_tools.validate_phase._find_pr_for_issue")
+    @patch("loom_tools.validate_phase._run_gh")
+    def test_issue_closed_without_pr_fails(self, mock_gh: MagicMock, mock_find: MagicMock, mock_phase_failed: MagicMock, tmp_path: Path):
+        """Issue closed + no PR = builder abandoned issue."""
+        repo = _make_repo(tmp_path)
+        mock_gh.side_effect = [
+            _completed(stdout="CLOSED\n"),  # issue state
+            _completed(stdout="\n"),         # merged PR search returns nothing
+        ]
+        mock_find.return_value = None  # no open PR
+        result = validate_builder(42, repo)
+        assert result.status == ValidationStatus.FAILED
+        assert "abandoned" in result.message.lower()
+        mock_phase_failed.assert_called_once()
+        call_kwargs = mock_phase_failed.call_args[1]
+        assert call_kwargs.get("failure_label") == "loom:failed:builder"
+
+    @patch("loom_tools.validate_phase._find_pr_for_issue")
+    @patch("loom_tools.validate_phase._run_gh")
+    def test_issue_closed_without_pr_check_only(self, mock_gh: MagicMock, mock_find: MagicMock, tmp_path: Path):
+        """In check-only mode, closed issue without PR still fails but no side effects."""
+        repo = _make_repo(tmp_path)
+        mock_gh.side_effect = [
+            _completed(stdout="CLOSED\n"),  # issue state
+            _completed(stdout="\n"),         # merged PR search returns nothing
+        ]
+        mock_find.return_value = None
+        result = validate_builder(42, repo, check_only=True)
+        assert result.status == ValidationStatus.FAILED
+        assert "abandoned" in result.message.lower()
 
     @patch("loom_tools.validate_phase._find_pr_for_issue")
     @patch("loom_tools.validate_phase._mark_phase_failed")

@@ -575,9 +575,38 @@ def validate_builder(
         repo_root,
     )
     if r.returncode == 0 and r.stdout.strip() == "CLOSED":
+        # Verify a PR actually exists — closing without a PR means the builder
+        # abandoned the issue rather than completing it legitimately.
+        pr = _find_pr_for_issue(issue, repo_root, pr_number)
+        if pr is not None:
+            return ValidationResult(
+                "builder", issue, ValidationStatus.SATISFIED,
+                f"Issue #{issue} is closed with associated PR #{pr[0]}",
+            )
+        # Also check for merged PRs (closed PRs won't show in open search)
+        r2 = _run_gh(
+            ["pr", "list", "--head", f"feature/issue-{issue}",
+             "--state", "merged", "--json", "number", "--jq", ".[0].number"],
+            repo_root,
+        )
+        merged_pr = _parse_pr_number(r2.stdout)
+        if merged_pr is not None:
+            return ValidationResult(
+                "builder", issue, ValidationStatus.SATISFIED,
+                f"Issue #{issue} is closed with merged PR #{merged_pr}",
+            )
+        # No PR found — builder closed the issue without implementing anything
+        if not check_only:
+            _mark_phase_failed(
+                issue, "builder",
+                "Issue was closed without an associated PR. "
+                "Builder may have abandoned the issue instead of implementing it.",
+                repo_root,
+                failure_label="loom:failed:builder",
+            )
         return ValidationResult(
-            "builder", issue, ValidationStatus.SATISFIED,
-            f"Issue #{issue} is closed (resolved without PR)",
+            "builder", issue, ValidationStatus.FAILED,
+            f"Issue #{issue} was closed without a PR — builder abandoned issue",
         )
 
     # Find existing PR
