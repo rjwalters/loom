@@ -421,7 +421,7 @@ _auth_cache_write() {
     local now
     now=$(date +%s)
 
-    python3 -c "
+    printf '%s' "${output}" | python3 -c "
 import json, sys
 data = {
     'time': ${now},
@@ -430,7 +430,7 @@ data = {
 }
 with open('${cache_file}', 'w') as f:
     json.dump(data, f)
-" <<< "${output}" 2>/dev/null || true
+" 2>/dev/null || true
 }
 
 # Pre-flight check: verify authentication status
