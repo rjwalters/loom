@@ -25,6 +25,8 @@
 #   LOOM_TERMINAL_ID       - Terminal ID for stop signal (optional)
 #   LOOM_WORKSPACE         - Workspace path for stop signal (optional)
 #   LOOM_AUTH_CACHE_TTL    - Auth cache TTL in seconds (default: 120)
+#   LOOM_AUTH_CACHE_STALE_LOCK_THRESHOLD - Stale lock cleanup threshold in seconds (default: 90)
+#   LOOM_AUTH_CACHE_LOCK_WAIT - Max time to wait for lock holder in seconds (default: 60)
 
 set -euo pipefail
 
@@ -42,6 +44,9 @@ API_ERROR_IDLE_TIMEOUT="${LOOM_API_ERROR_IDLE_TIMEOUT:-60}"
 # Short-TTL file cache to prevent concurrent `claude auth status` calls
 # from overwhelming the auth endpoint when multiple agents start simultaneously
 AUTH_CACHE_TTL="${LOOM_AUTH_CACHE_TTL:-120}"  # seconds
+# Max time a single auth check cycle can take: 15s timeout × 3 retries + backoff (2+5+10) ≈ 62s
+AUTH_CACHE_STALE_LOCK_THRESHOLD="${LOOM_AUTH_CACHE_STALE_LOCK_THRESHOLD:-90}"  # seconds
+AUTH_CACHE_LOCK_WAIT="${LOOM_AUTH_CACHE_LOCK_WAIT:-60}"  # seconds
 
 # Startup health monitor configuration
 # How long (seconds) to watch early output for MCP/plugin failures
@@ -321,6 +326,13 @@ check_cli_available() {
 # endpoint when multiple agents start simultaneously (thundering-herd protection).
 # Cache is user-scoped and short-lived; any failure falls through to a direct call.
 
+# Return a random integer in [1, max] using $RANDOM (portable bash).
+# Used to add jitter and desynchronize concurrent agents.
+_auth_jitter() {
+    local max="${1:-5}"
+    echo $(( (RANDOM % max) + 1 ))
+}
+
 _auth_cache_file() {
     echo "/tmp/claude-auth-cache-$(id -u).json"
 }
@@ -331,7 +343,7 @@ _auth_lock_dir() {
 
 # Acquire the cache lock (non-blocking).
 # Returns 0 if acquired, 1 if another process holds it.
-# Cleans up stale locks older than 30s first.
+# Cleans up stale locks older than AUTH_CACHE_STALE_LOCK_THRESHOLD first.
 _auth_cache_lock() {
     local lock_dir
     lock_dir=$(_auth_lock_dir)
@@ -344,8 +356,8 @@ _auth_cache_lock() {
         else
             lock_age=$(( $(date +%s) - $(stat -c '%Y' "${lock_dir}" 2>/dev/null || echo "0") ))
         fi
-        if [[ "${lock_age}" -gt 30 ]]; then
-            log_info "Removing stale auth cache lock (age: ${lock_age}s)"
+        if [[ "${lock_age}" -gt "${AUTH_CACHE_STALE_LOCK_THRESHOLD}" ]]; then
+            log_info "Removing stale auth cache lock (age: ${lock_age}s, threshold: ${AUTH_CACHE_STALE_LOCK_THRESHOLD}s)"
             rmdir "${lock_dir}" 2>/dev/null || true
         fi
     fi
@@ -443,23 +455,26 @@ check_auth_status() {
     if _auth_cache_lock; then
         lock_acquired=true
     else
-        # Another process is refreshing — wait briefly then re-read cache
-        log_info "Auth cache lock held by another process, waiting..."
+        # Another process is refreshing — wait for it to finish, polling cache
+        log_info "Auth cache lock held by another process, waiting up to ${AUTH_CACHE_LOCK_WAIT}s..."
         local wait_elapsed=0
-        while [[ "${wait_elapsed}" -lt 5 ]]; do
-            sleep 1
-            wait_elapsed=$((wait_elapsed + 1))
+        while [[ "${wait_elapsed}" -lt "${AUTH_CACHE_LOCK_WAIT}" ]]; do
+            sleep 2
+            wait_elapsed=$((wait_elapsed + 2))
             if cached_output=$(_auth_cache_read); then
                 local logged_in
                 logged_in=$(echo "${cached_output}" | python3 -c "import json,sys; print(json.load(sys.stdin).get('loggedIn', False))" 2>/dev/null || echo "")
                 if [[ "${logged_in}" == "True" ]]; then
-                    log_info "Authentication check passed (cached, after wait)"
+                    log_info "Authentication check passed (cached, after ${wait_elapsed}s wait)"
                     return 0
                 fi
             fi
         done
-        # Still stale — fall through to direct check without lock
-        log_info "Auth cache still stale after wait, proceeding with direct check"
+        # Still stale — fall through to direct check with jitter to desynchronize
+        local jitter
+        jitter=$(_auth_jitter 5)
+        log_info "Auth cache still stale after ${AUTH_CACHE_LOCK_WAIT}s wait, proceeding with direct check (jitter: ${jitter}s)"
+        sleep "${jitter}"
     fi
 
     # --- Step 3: Existing retry logic (with cache write on success) ---
@@ -468,6 +483,12 @@ check_auth_status() {
 
     for (( attempt=1; attempt<=max_retries; attempt++ )); do
         auth_exit_code=0
+
+        # Refresh lock mtime so other processes don't consider it stale
+        # while we're still actively retrying
+        if [[ "${lock_acquired}" == "true" ]]; then
+            touch "$(_auth_lock_dir)" 2>/dev/null || true
+        fi
 
         # Unset CLAUDECODE to avoid nested-session guard when running inside
         # a Claude Code session (e.g., during testing or shepherd-spawned builds).
@@ -479,7 +500,10 @@ check_auth_status() {
         if [[ "${auth_exit_code}" -eq 124 ]]; then
             if (( attempt < max_retries )); then
                 local backoff=${backoff_seconds[$((attempt - 1))]}
-                log_info "Authentication check timed out (attempt ${attempt}/${max_retries}), retrying in ${backoff}s..."
+                local jitter
+                jitter=$(_auth_jitter 3)
+                backoff=$((backoff + jitter))
+                log_info "Authentication check timed out (attempt ${attempt}/${max_retries}), retrying in ${backoff}s (includes ${jitter}s jitter)..."
                 sleep "${backoff}"
                 continue
             fi
