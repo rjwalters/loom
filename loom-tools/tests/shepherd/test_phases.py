@@ -200,6 +200,68 @@ class TestCuratorPhase:
         skip, reason = curator.should_skip(mock_context)
         assert skip is False
 
+    def test_exit_code_6_instant_exit_returns_skipped(
+        self, mock_context: MagicMock
+    ) -> None:
+        """Exit code 6 (instant-exit) should return SKIPPED, not SUCCESS."""
+        mock_context.check_shutdown.return_value = False
+        with patch(
+            "loom_tools.shepherd.phases.curator.run_phase_with_retry", return_value=6
+        ):
+            curator = CuratorPhase()
+            result = curator.run(mock_context)
+
+        assert result.status == PhaseStatus.SKIPPED
+        assert "instant-exit" in result.message
+        assert "failed to start" in result.message
+
+    def test_exit_code_7_mcp_failure_returns_skipped(
+        self, mock_context: MagicMock
+    ) -> None:
+        """Exit code 7 (MCP failure) should return SKIPPED, not SUCCESS."""
+        mock_context.check_shutdown.return_value = False
+        with patch(
+            "loom_tools.shepherd.phases.curator.run_phase_with_retry", return_value=7
+        ):
+            curator = CuratorPhase()
+            result = curator.run(mock_context)
+
+        assert result.status == PhaseStatus.SKIPPED
+        assert "MCP server failure" in result.message
+        assert "failed to start" in result.message
+
+    def test_exit_code_9_auth_failure_returns_skipped(
+        self, mock_context: MagicMock
+    ) -> None:
+        """Exit code 9 (auth failure) should return SKIPPED, not SUCCESS."""
+        mock_context.check_shutdown.return_value = False
+        with patch(
+            "loom_tools.shepherd.phases.curator.run_phase_with_retry", return_value=9
+        ):
+            curator = CuratorPhase()
+            result = curator.run(mock_context)
+
+        assert result.status == PhaseStatus.SKIPPED
+        assert "auth pre-flight" in result.message
+        assert "failed to start" in result.message
+
+    def test_exit_code_0_returns_success(self, mock_context: MagicMock) -> None:
+        """Exit code 0 should return SUCCESS (curator completed normally)."""
+        mock_context.check_shutdown.return_value = False
+        with (
+            patch(
+                "loom_tools.shepherd.phases.curator.run_phase_with_retry",
+                return_value=0,
+            ),
+            patch.object(CuratorPhase, "validate", return_value=True),
+            patch("loom_tools.shepherd.phases.curator.remove_issue_label"),
+        ):
+            curator = CuratorPhase()
+            result = curator.run(mock_context)
+
+        assert result.status == PhaseStatus.SUCCESS
+        assert "curator phase complete" in result.message
+
 
 class TestApprovalPhase:
     """Test ApprovalPhase."""
