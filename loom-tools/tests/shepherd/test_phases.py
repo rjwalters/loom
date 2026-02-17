@@ -34,6 +34,7 @@ from loom_tools.shepherd.phases.base import (
     _is_instant_exit,
     _is_mcp_failure,
     _print_heartbeat,
+    _strip_spinner_noise,
     _read_heartbeats,
     run_phase_with_retry,
     run_worker_phase,
@@ -11702,6 +11703,87 @@ class TestIsMcpFailure:
         )
         assert len(real_work) >= MCP_FAILURE_MIN_OUTPUT_CHARS
         assert _is_mcp_failure(log) is False
+
+    def test_garbled_spinner_output_not_counted_as_productive(
+        self, tmp_path: Path
+    ) -> None:
+        """Garbled spinner text should be stripped before volume check.
+
+        This is the core scenario from issue #2465: the CLI produces garbled
+        spinner animation fragments and "(thinking)" lines that exceed
+        MCP_FAILURE_MIN_OUTPUT_CHARS, masking a real MCP failure.
+        """
+        log = tmp_path / "session.log"
+        # Simulate garbled spinner output from the issue report
+        garbled = (
+            "✶T✻i✽n✶Tk✻ie✽nr✻ki✶en✳rg✢in·g✢…\n" * 10
+            + "Tinkering…\n" * 10
+            + "(thinking)\n" * 20
+        )
+        assert len(garbled) >= MCP_FAILURE_MIN_OUTPUT_CHARS
+        log.write_text(
+            "# CLAUDE_CLI_START\n"
+            "bypasspermissionson · 1 MCP server failed · /mcp\n"
+            + garbled
+        )
+        assert _is_mcp_failure(log) is True
+
+    def test_spinner_noise_with_real_work_not_flagged(
+        self, tmp_path: Path
+    ) -> None:
+        """Session with spinner noise AND real work should NOT be flagged."""
+        log = tmp_path / "session.log"
+        real_work = "Reading file /src/main.py\nEditing /src/main.py\n" * 30
+        log.write_text(
+            "# CLAUDE_CLI_START\n"
+            "1 MCP server failed\n"
+            + "Tinkering…\n" * 5
+            + "(thinking)\n" * 5
+            + real_work
+        )
+        assert _is_mcp_failure(log) is False
+
+
+class TestStripSpinnerNoise:
+    """Test _strip_spinner_noise helper function."""
+
+    def test_strips_thinking_lines(self) -> None:
+        text = "real output\n(thinking)\nmore output\n(thinking)\n"
+        result = _strip_spinner_noise(text)
+        assert "(thinking)" not in result
+        assert "real output" in result
+        assert "more output" in result
+
+    def test_strips_spinner_phrases(self) -> None:
+        text = "real output\nTinkering…\nThinking...\nProcessing…\nmore output\n"
+        result = _strip_spinner_noise(text)
+        assert "Tinkering" not in result
+        assert "Thinking" not in result
+        assert "Processing" not in result
+        assert "real output" in result
+        assert "more output" in result
+
+    def test_strips_garbled_spinner_chars(self) -> None:
+        garbled = "✶T✻i✽n✶Tk✻ie✽nr✻ki✶en✳rg✢in·g✢…"
+        text = f"real output\n{garbled}\nmore output\n"
+        result = _strip_spinner_noise(text)
+        assert garbled not in result
+        assert "real output" in result
+
+    def test_preserves_normal_output(self) -> None:
+        text = "Reading file /src/main.py\nEditing line 42\nRunning tests...\n"
+        result = _strip_spinner_noise(text)
+        assert result.strip() == text.strip()
+
+    def test_preserves_blank_lines(self) -> None:
+        text = "line1\n\nline2\n"
+        result = _strip_spinner_noise(text)
+        assert "\n\n" in result
+
+    def test_all_spinner_noise_returns_minimal(self) -> None:
+        text = "(thinking)\n" * 20 + "Tinkering…\n" * 10
+        result = _strip_spinner_noise(text)
+        assert len(result.strip()) == 0
 
 
 class TestRunWorkerPhaseMcpFailure:
