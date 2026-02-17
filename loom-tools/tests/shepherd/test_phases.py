@@ -25,8 +25,9 @@ from loom_tools.shepherd.phases import (
     PhaseStatus,
 )
 from loom_tools.shepherd.phases.base import (
+    GHOST_RETRY_STRATEGIES,
+    GHOST_SESSION_BACKOFF_SECONDS,
     GHOST_SESSION_MAX_RETRIES,
-    GHOST_SESSION_RETRY_DELAY_SECONDS,
     LOW_OUTPUT_BACKOFF_SECONDS,
     LOW_OUTPUT_MAX_ATTEMPT_SECONDS,
     LOW_OUTPUT_MAX_RETRIES,
@@ -36,6 +37,7 @@ from loom_tools.shepherd.phases.base import (
     MCP_FAILURE_MAX_RETRIES,
     MCP_FAILURE_MIN_OUTPUT_CHARS,
     _AUTH_FAILURE_SENTINEL,
+    _classify_ghost_cause,
     _classify_low_output_cause,
     _is_auth_failure,
     _is_ghost_session,
@@ -15795,6 +15797,10 @@ class TestRunPhaseWithRetryGhostSession:
                 "loom_tools.shepherd.phases.base.run_worker_phase",
                 side_effect=mock_run_worker,
             ),
+            patch(
+                "loom_tools.shepherd.phases.base._classify_ghost_cause",
+                return_value="unknown",
+            ),
             patch("time.sleep") as mock_sleep,
         ):
             exit_code = run_phase_with_retry(
@@ -15808,7 +15814,8 @@ class TestRunPhaseWithRetryGhostSession:
 
         assert exit_code == 0
         assert call_count == 2
-        mock_sleep.assert_called_once_with(GHOST_SESSION_RETRY_DELAY_SECONDS)
+        # Escalating backoff: first retry uses GHOST_SESSION_BACKOFF_SECONDS[0]
+        mock_sleep.assert_called_once_with(GHOST_SESSION_BACKOFF_SECONDS[0])
 
     def test_exhausts_ghost_retries_returns_code_10(
         self, mock_context: MagicMock
@@ -15818,6 +15825,10 @@ class TestRunPhaseWithRetryGhostSession:
             patch(
                 "loom_tools.shepherd.phases.base.run_worker_phase",
                 return_value=10,
+            ),
+            patch(
+                "loom_tools.shepherd.phases.base._classify_ghost_cause",
+                return_value="unknown",
             ),
             patch("time.sleep"),
         ):
@@ -15835,7 +15846,7 @@ class TestRunPhaseWithRetryGhostSession:
     def test_ghost_retry_count_matches_constant(
         self, mock_context: MagicMock
     ) -> None:
-        """Should retry exactly GHOST_SESSION_MAX_RETRIES times."""
+        """Should retry exactly GHOST_SESSION_MAX_RETRIES times for unknown cause."""
         call_count = 0
 
         def count_calls(*args, **kwargs):
@@ -15847,6 +15858,10 @@ class TestRunPhaseWithRetryGhostSession:
             patch(
                 "loom_tools.shepherd.phases.base.run_worker_phase",
                 side_effect=count_calls,
+            ),
+            patch(
+                "loom_tools.shepherd.phases.base._classify_ghost_cause",
+                return_value="unknown",
             ),
             patch("time.sleep"),
         ):
@@ -15878,6 +15893,10 @@ class TestRunPhaseWithRetryGhostSession:
                 "loom_tools.shepherd.phases.base.run_worker_phase",
                 side_effect=mock_run_worker,
             ),
+            patch(
+                "loom_tools.shepherd.phases.base._classify_ghost_cause",
+                return_value="unknown",
+            ),
             patch("time.sleep"),
         ):
             run_phase_with_retry(
@@ -15891,13 +15910,15 @@ class TestRunPhaseWithRetryGhostSession:
 
         milestone_calls = mock_context.report_milestone.call_args_list
         assert len(milestone_calls) == 2
-        # First call: error with will_retry
+        # First call: error with will_retry and cause info
         assert milestone_calls[0].args[0] == "error"
         assert "ghost session" in milestone_calls[0].kwargs["error"]
+        assert "unknown" in milestone_calls[0].kwargs["error"]
         assert milestone_calls[0].kwargs["will_retry"] is True
-        # Second call: heartbeat with ghost retry info
+        # Second call: heartbeat with ghost retry info and cause
         assert milestone_calls[1].args[0] == "heartbeat"
         assert "ghost session" in milestone_calls[1].kwargs["action"]
+        assert "unknown" in milestone_calls[1].kwargs["action"]
 
     def test_ghost_and_low_output_have_separate_counters(
         self, mock_context: MagicMock
@@ -15919,6 +15940,10 @@ class TestRunPhaseWithRetryGhostSession:
             patch(
                 "loom_tools.shepherd.phases.base.run_worker_phase",
                 side_effect=mock_run_worker,
+            ),
+            patch(
+                "loom_tools.shepherd.phases.base._classify_ghost_cause",
+                return_value="unknown",
             ),
             patch("time.sleep"),
         ):
@@ -15954,6 +15979,10 @@ class TestRunPhaseWithRetryGhostSession:
             patch(
                 "loom_tools.shepherd.phases.base.run_worker_phase",
                 side_effect=mock_run_worker,
+            ),
+            patch(
+                "loom_tools.shepherd.phases.base._classify_ghost_cause",
+                return_value="unknown",
             ),
             patch("time.sleep"),
         ):
@@ -15995,6 +16024,10 @@ class TestRunPhaseWithRetryGhostSession:
                 "loom_tools.shepherd.phases.base.run_worker_phase",
                 side_effect=mock_run_worker,
             ),
+            patch(
+                "loom_tools.shepherd.phases.base._classify_ghost_cause",
+                return_value="unknown",
+            ),
             patch("time.sleep"),
         ):
             exit_code = run_phase_with_retry(
@@ -16029,6 +16062,10 @@ class TestRunPhaseWithRetryGhostSession:
             patch(
                 "loom_tools.shepherd.phases.base.run_worker_phase",
                 side_effect=mock_run_worker,
+            ),
+            patch(
+                "loom_tools.shepherd.phases.base._classify_ghost_cause",
+                return_value="unknown",
             ),
             patch("time.sleep"),
         ):
