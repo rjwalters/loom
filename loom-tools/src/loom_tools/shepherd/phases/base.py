@@ -814,3 +814,10 @@ def run_phase_with_retry(
             "heartbeat",
             action=f"retrying stuck {role} (attempt {stuck_retries})",
         )
+
+        # Allow cleanup (tmux session teardown, MCP port release) to
+        # complete before spawning the retry.  Without this delay, the
+        # new wrapper's pre-flight checks race against the previous
+        # session's resource cleanup and can hang or fail silently.
+        # See issue #2472.
+        time.sleep(5)

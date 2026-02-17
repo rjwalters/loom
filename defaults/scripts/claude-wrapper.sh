@@ -206,8 +206,9 @@ check_mcp_server() {
     fi
 
     # Extract the MCP server entry point from .mcp.json
+    # Use timeout to prevent hanging on resource-contended systems (see issue #2472).
     local mcp_entry
-    mcp_entry=$(python3 -c "
+    mcp_entry=$(timeout 10 python3 -c "
 import json, sys
 with open('${mcp_config}') as f:
     cfg = json.load(f)
@@ -319,8 +320,16 @@ check_auth_status() {
 
     # Unset CLAUDECODE to avoid nested-session guard when running inside
     # a Claude Code session (e.g., during testing or shepherd-spawned builds).
-    auth_output=$(CLAUDECODE='' claude auth status --json 2>&1) || auth_exit_code=$?
+    # Use timeout to prevent hanging after a long first attempt leaves
+    # auth in a bad state (see issue #2472).
+    auth_output=$(timeout 15 bash -c 'CLAUDECODE="" claude auth status --json 2>&1') || auth_exit_code=$?
     auth_exit_code="${auth_exit_code:-0}"
+
+    # timeout exits with 124 when the command times out
+    if [[ "${auth_exit_code}" -eq 124 ]]; then
+        log_error "Authentication check timed out after 15s"
+        return 1
+    fi
 
     if [[ "${auth_exit_code}" -ne 0 ]]; then
         log_error "Authentication check command failed (exit ${auth_exit_code})"
