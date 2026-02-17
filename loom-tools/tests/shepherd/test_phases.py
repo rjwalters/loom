@@ -2044,29 +2044,48 @@ class TestBuilderScopedTestVerification:
         assert "pnpm typecheck" in cmd_names
         assert "pnpm test:unit" in cmd_names
 
-    def test_get_scoped_test_commands_config_runs_all(self, tmp_path: Path) -> None:
-        """Config changes should run full test suite."""
+    def test_get_scoped_test_commands_config_decomposes_pipeline(
+        self, tmp_path: Path
+    ) -> None:
+        """Config changes should decompose &&-chained pipeline into steps."""
         builder = BuilderPhase()
         pkg = {"scripts": {"check:ci:lite": "pnpm lint && pnpm test"}}
         (tmp_path / "package.json").write_text(json.dumps(pkg))
 
         commands = builder._get_scoped_test_commands(tmp_path, {"config"})
 
-        # Should fall back to full test detection
+        # Should decompose into individual pipeline steps
+        assert len(commands) == 2
+        assert commands[0][1] == "pnpm lint"
+        assert commands[1][1] == "pnpm test"
+
+    def test_get_scoped_test_commands_config_single_command(
+        self, tmp_path: Path
+    ) -> None:
+        """Config changes with single command should not decompose."""
+        builder = BuilderPhase()
+        pkg = {"scripts": {"check:ci:lite": "pnpm test"}}
+        (tmp_path / "package.json").write_text(json.dumps(pkg))
+
+        commands = builder._get_scoped_test_commands(tmp_path, {"config"})
+
         assert len(commands) == 1
         assert commands[0][1] == "pnpm check:ci:lite"
 
-    def test_get_scoped_test_commands_other_runs_all(self, tmp_path: Path) -> None:
-        """Unknown file types should run full test suite."""
+    def test_get_scoped_test_commands_other_decomposes_pipeline(
+        self, tmp_path: Path
+    ) -> None:
+        """Unknown file types should decompose &&-chained pipeline into steps."""
         builder = BuilderPhase()
         pkg = {"scripts": {"check:ci:lite": "pnpm lint && pnpm test"}}
         (tmp_path / "package.json").write_text(json.dumps(pkg))
 
         commands = builder._get_scoped_test_commands(tmp_path, {"other"})
 
-        # Should fall back to full test detection
-        assert len(commands) == 1
-        assert commands[0][1] == "pnpm check:ci:lite"
+        # Should decompose into individual pipeline steps
+        assert len(commands) == 2
+        assert commands[0][1] == "pnpm lint"
+        assert commands[1][1] == "pnpm test"
 
     def test_get_scoped_test_commands_no_matching_runners(
         self, tmp_path: Path
@@ -2260,10 +2279,10 @@ class TestBuilderScopedTestVerification:
         call_args = mock_run.call_args
         assert call_args[0][2] == "pytest"  # display_name
 
-    def test_scoped_verification_falls_back_on_config_changes(
+    def test_scoped_verification_decomposes_on_config_changes(
         self, mock_context: MagicMock, tmp_path: Path
     ) -> None:
-        """Config changes should fall back to full test suite."""
+        """Config changes should decompose pipeline into individual steps."""
         builder = BuilderPhase()
         mock_context.worktree_path = tmp_path
         mock_context.report_milestone = MagicMock()
@@ -2284,16 +2303,16 @@ class TestBuilderScopedTestVerification:
         ):
             result = builder._run_test_verification(mock_context)
 
-        # Should run full test suite
+        # Should decompose pipeline into individual steps
         assert result is None
-        mock_run.assert_called_once()
-        call_args = mock_run.call_args
-        assert call_args[0][2] == "pnpm check:ci:lite"
+        assert mock_run.call_count == 2
+        assert mock_run.call_args_list[0][0][2] == "pnpm lint"
+        assert mock_run.call_args_list[1][0][2] == "pnpm test"
 
-    def test_scoped_verification_falls_back_when_no_changed_files(
+    def test_scoped_verification_decomposes_when_no_changed_files(
         self, mock_context: MagicMock, tmp_path: Path
     ) -> None:
-        """Should fall back to full suite when no changed files detected."""
+        """Should decompose pipeline in fallback when no changed files detected."""
         builder = BuilderPhase()
         mock_context.worktree_path = tmp_path
         mock_context.report_milestone = MagicMock()
@@ -2309,19 +2328,99 @@ class TestBuilderScopedTestVerification:
                 return_value=[],
             ),
             patch.object(
-                builder, "_run_baseline_tests", return_value=None
-            ),
-            patch(
-                "subprocess.run",
-                return_value=MagicMock(
-                    returncode=0, stdout="All tests passed", stderr=""
-                ),
-            ),
+                builder, "_run_single_test_with_baseline", return_value=None
+            ) as mock_run,
         ):
             result = builder._run_test_verification(mock_context)
 
-        # Should pass (full test suite ran and passed)
+        # Should decompose pipeline and run each step individually
         assert result is None
+        assert mock_run.call_count == 2
+        assert mock_run.call_args_list[0][0][2] == "pnpm lint"
+        assert mock_run.call_args_list[1][0][2] == "pnpm test"
+
+
+class TestBuilderDecomposePipelineScript:
+    """Tests for _decompose_pipeline_script() method."""
+
+    def test_decompose_simple_pipeline(self, tmp_path: Path) -> None:
+        """Should split &&-chained pipeline into individual commands."""
+        builder = BuilderPhase()
+        pkg = {"scripts": {"check:ci:lite": "pnpm lint && cargo test && pnpm test:python"}}
+        (tmp_path / "package.json").write_text(json.dumps(pkg))
+
+        result = builder._decompose_pipeline_script(tmp_path, "check:ci:lite")
+
+        assert result is not None
+        assert len(result) == 3
+        assert result[0] == (["pnpm", "lint"], "pnpm lint")
+        assert result[1] == (["cargo", "test"], "cargo test")
+        assert result[2] == (["pnpm", "test:python"], "pnpm test:python")
+
+    def test_decompose_pipeline_with_flags(self, tmp_path: Path) -> None:
+        """Should preserve command flags when decomposing."""
+        builder = BuilderPhase()
+        pkg = {
+            "scripts": {
+                "check:ci:lite": (
+                    "pnpm lint && cargo clippy --workspace --all-targets "
+                    "&& cargo test --workspace --no-fail-fast"
+                )
+            }
+        }
+        (tmp_path / "package.json").write_text(json.dumps(pkg))
+
+        result = builder._decompose_pipeline_script(tmp_path, "check:ci:lite")
+
+        assert result is not None
+        assert len(result) == 3
+        assert result[0] == (["pnpm", "lint"], "pnpm lint")
+        assert result[1][0] == ["cargo", "clippy", "--workspace", "--all-targets"]
+        assert result[2][0] == ["cargo", "test", "--workspace", "--no-fail-fast"]
+
+    def test_decompose_single_command_returns_none(self, tmp_path: Path) -> None:
+        """Single command (no &&) should return None."""
+        builder = BuilderPhase()
+        pkg = {"scripts": {"test": "cargo test"}}
+        (tmp_path / "package.json").write_text(json.dumps(pkg))
+
+        result = builder._decompose_pipeline_script(tmp_path, "test")
+        assert result is None
+
+    def test_decompose_missing_script_returns_none(self, tmp_path: Path) -> None:
+        """Missing script name should return None."""
+        builder = BuilderPhase()
+        pkg = {"scripts": {"test": "cargo test"}}
+        (tmp_path / "package.json").write_text(json.dumps(pkg))
+
+        result = builder._decompose_pipeline_script(tmp_path, "check:ci:lite")
+        assert result is None
+
+    def test_decompose_no_package_json_returns_none(self, tmp_path: Path) -> None:
+        """No package.json should return None."""
+        builder = BuilderPhase()
+
+        result = builder._decompose_pipeline_script(tmp_path, "check:ci:lite")
+        assert result is None
+
+    def test_decompose_with_dash_d_flag(self, tmp_path: Path) -> None:
+        """Should handle -- separator in commands."""
+        builder = BuilderPhase()
+        pkg = {
+            "scripts": {
+                "check:ci:lite": (
+                    "cargo clippy -- -D warnings && cargo test -- --nocapture"
+                )
+            }
+        }
+        (tmp_path / "package.json").write_text(json.dumps(pkg))
+
+        result = builder._decompose_pipeline_script(tmp_path, "check:ci:lite")
+
+        assert result is not None
+        assert len(result) == 2
+        assert result[0][0] == ["cargo", "clippy", "--", "-D", "warnings"]
+        assert result[1][0] == ["cargo", "test", "--", "--nocapture"]
 
 
 class TestBuilderRunTestFailureIntegration:
