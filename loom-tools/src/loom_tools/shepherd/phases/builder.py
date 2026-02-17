@@ -3156,36 +3156,10 @@ class BuilderPhase:
 
         for step in steps:
             if step == "stage_and_commit":
-                result = subprocess.run(
-                    ["git", "add", "-A"],
-                    cwd=ctx.worktree_path,
-                    capture_output=True,
-                    text=True,
-                    check=False,
-                )
-                if result.returncode != 0:
-                    log_warning(
-                        f"Direct completion: git add failed: "
-                        f"{result.stderr.strip()[:200]}"
-                    )
+                if not self._stage_and_commit(ctx):
+                    log_warning("Direct completion: stage_and_commit failed")
                     return False
-                result = subprocess.run(
-                    [
-                        "git", "commit", "-m",
-                        f"fix: implement changes for issue #{ctx.config.issue}",
-                    ],
-                    cwd=ctx.worktree_path,
-                    capture_output=True,
-                    text=True,
-                    check=False,
-                )
-                if result.returncode != 0:
-                    log_warning(
-                        f"Direct completion: git commit failed: "
-                        f"{result.stderr.strip()[:200]}"
-                    )
-                    return False
-                log_success("Direct completion: changes staged and committed")
+                log_success("Direct completion: changes committed")
 
             elif step == "push_branch":
                 if not self._push_branch(ctx):
@@ -3638,6 +3612,80 @@ class BuilderPhase:
         (e.g. after the doctor applies test fixes).
         """
         return self._push_branch(ctx)
+
+    def _stage_and_commit(self, ctx: ShepherdContext) -> bool:
+        """Stage meaningful changes and create a commit in the worktree.
+
+        Stages all non-artifact files (respects .gitignore) and commits with
+        a descriptive message.  Returns True if a commit was created.
+        """
+        if not ctx.worktree_path or not ctx.worktree_path.is_dir():
+            return False
+
+        # Get current status
+        status_result = subprocess.run(
+            ["git", "-C", str(ctx.worktree_path), "status", "--porcelain"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if status_result.returncode != 0 or not status_result.stdout.strip():
+            log_warning("Direct completion: no changes to commit")
+            return False
+
+        # Split without stripping the full output — the leading status
+        # chars (e.g. " M") are significant in porcelain format.
+        porcelain_lines = [
+            line for line in status_result.stdout.splitlines() if line
+        ]
+        meaningful, _ = self._filter_build_artifacts(porcelain_lines)
+        if not meaningful:
+            log_warning(
+                "Direct completion: only build artifacts uncommitted, "
+                "nothing meaningful to commit"
+            )
+            return False
+
+        # Extract file paths from porcelain lines (format: "XY filename")
+        files_to_stage = []
+        for line in meaningful:
+            path = line[3:].strip().strip('"') if len(line) > 3 else line.strip()
+            if path:
+                files_to_stage.append(path)
+
+        if not files_to_stage:
+            return False
+
+        # Stage the files
+        stage_result = subprocess.run(
+            ["git", "-C", str(ctx.worktree_path), "add", "--"] + files_to_stage,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if stage_result.returncode != 0:
+            log_warning(
+                f"Direct completion: git add failed: "
+                f"{(stage_result.stderr or '').strip()[:200]}"
+            )
+            return False
+
+        # Commit
+        commit_msg = f"feat: implement changes for issue #{ctx.config.issue}"
+        commit_result = subprocess.run(
+            ["git", "-C", str(ctx.worktree_path), "commit", "-m", commit_msg],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if commit_result.returncode != 0:
+            log_warning(
+                f"Direct completion: git commit failed: "
+                f"{(commit_result.stderr or '').strip()[:200]}"
+            )
+            return False
+
+        return True
 
     def _push_branch(self, ctx: ShepherdContext) -> bool:
         """Push the current branch to remote.
