@@ -59,6 +59,9 @@ TERMINAL_ID="${LOOM_TERMINAL_ID:-}"
 # Note: WORKSPACE may fail if CWD is invalid at startup - recover_cwd handles this
 WORKSPACE="${LOOM_WORKSPACE:-$(pwd 2>/dev/null || echo "$HOME")}"
 
+# Whether --dangerously-skip-permissions was passed (detected in main())
+SKIP_PERMISSIONS_MODE=false
+
 # Retry state file for external observability (see issue #2296).
 # When TERMINAL_ID is set, the wrapper writes its retry/backoff state to this
 # file so agent-wait-bg.sh and the shepherd can distinguish "wrapper retrying"
@@ -955,7 +958,9 @@ run_preflight_checks() {
 
     check_api_reachable  # Non-fatal, just logs
 
-    if ! check_auth_status; then
+    if [[ "${SKIP_PERMISSIONS_MODE}" == "true" ]]; then
+        log_info "Skipping auth pre-flight check (--dangerously-skip-permissions mode)"
+    elif ! check_auth_status; then
         log_error "Authentication pre-flight check failed"
         return 1
     fi
@@ -978,6 +983,14 @@ main() {
     log_info "Arguments: $*"
     log_info "Workspace: ${WORKSPACE}"
     [[ -n "${TERMINAL_ID}" ]] && log_info "Terminal ID: ${TERMINAL_ID}"
+
+    # Detect --dangerously-skip-permissions flag (automated agent mode)
+    for arg in "$@"; do
+        if [[ "$arg" == "--dangerously-skip-permissions" ]]; then
+            SKIP_PERMISSIONS_MODE=true
+            break
+        fi
+    done
 
     # Run pre-flight checks
     if ! run_preflight_checks; then
