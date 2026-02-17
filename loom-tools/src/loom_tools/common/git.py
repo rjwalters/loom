@@ -311,6 +311,117 @@ def get_commit_count(
     return 0
 
 
+def is_branch_behind(
+    base: str = "origin/main",
+    cwd: pathlib.Path | str | None = None,
+) -> bool:
+    """Check if HEAD is behind a remote ref.
+
+    Runs ``git fetch`` first to ensure the local tracking ref is current,
+    then counts commits in ``HEAD..base``.
+
+    Parameters
+    ----------
+    base:
+        The remote ref to compare against (default ``origin/main``).
+    cwd:
+        Working directory for the git command.
+
+    Returns
+    -------
+    bool
+        True if HEAD is behind *base* (i.e. base has commits not in HEAD).
+    """
+    try:
+        # Fetch latest state of the remote ref
+        remote, _, refspec = base.partition("/")
+        if refspec:
+            run_git(["fetch", remote, refspec], cwd=cwd, check=False)
+
+        result = run_git(
+            ["rev-list", "--count", f"HEAD..{base}"],
+            cwd=cwd,
+            check=False,
+        )
+        if result.returncode == 0:
+            return int(result.stdout.strip()) > 0
+    except Exception:
+        pass
+    return False
+
+
+def attempt_rebase(
+    base: str = "origin/main",
+    cwd: pathlib.Path | str | None = None,
+) -> tuple[bool, str]:
+    """Attempt to rebase the current branch onto a remote ref.
+
+    On failure the rebase is aborted so the worktree is left clean.
+
+    Parameters
+    ----------
+    base:
+        The remote ref to rebase onto (default ``origin/main``).
+    cwd:
+        Working directory for the git command.
+
+    Returns
+    -------
+    tuple of (success, detail)
+        ``(True, "")`` on success.
+        ``(False, description)`` on conflict — *description* lists the
+        conflicting files.
+    """
+    try:
+        result = run_git(["rebase", base], cwd=cwd, check=False)
+        if result.returncode == 0:
+            return True, ""
+
+        # Rebase failed — collect conflict info before aborting
+        conflict_result = run_git(
+            ["diff", "--name-only", "--diff-filter=U"],
+            cwd=cwd,
+            check=False,
+        )
+        conflicting = conflict_result.stdout.strip() if conflict_result.returncode == 0 else ""
+
+        # Abort the failed rebase
+        run_git(["rebase", "--abort"], cwd=cwd, check=False)
+
+        detail = f"Conflicting files:\n{conflicting}" if conflicting else "Rebase failed (unknown conflicts)"
+        return False, detail
+    except Exception as exc:
+        # Safety: abort any in-progress rebase
+        run_git(["rebase", "--abort"], cwd=cwd, check=False)
+        return False, f"Rebase error: {exc}"
+
+
+def force_push_branch(
+    cwd: pathlib.Path | str | None = None,
+) -> bool:
+    """Force-push the current branch using ``--force-with-lease``.
+
+    Parameters
+    ----------
+    cwd:
+        Working directory for the git command.
+
+    Returns
+    -------
+    bool
+        True if push succeeded, False otherwise.
+    """
+    try:
+        result = run_git(
+            ["push", "--force-with-lease"],
+            cwd=cwd,
+            check=False,
+        )
+        return result.returncode == 0
+    except Exception:
+        return False
+
+
 def get_commits_ahead_behind(
     base: str = "origin/main",
     cwd: pathlib.Path | str | None = None,

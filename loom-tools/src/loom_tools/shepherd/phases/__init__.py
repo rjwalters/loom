@@ -13,6 +13,7 @@ from loom_tools.shepherd.phases.doctor import DoctorPhase
 from loom_tools.shepherd.phases.judge import JudgePhase
 from loom_tools.shepherd.phases.merge import MergePhase
 from loom_tools.shepherd.phases.preflight import PreflightPhase
+from loom_tools.shepherd.phases.rebase import RebasePhase
 from loom_tools.shepherd.phases.reflection import ReflectionPhase
 
 __all__ = [
@@ -27,5 +28,6 @@ __all__ = [
     "JudgePhase",
     "MergePhase",
     "PreflightPhase",
+    "RebasePhase",
     "ReflectionPhase",
 ]

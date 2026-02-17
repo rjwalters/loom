@@ -32,6 +32,7 @@ from loom_tools.shepherd.phases import (
     MergePhase,
     PhaseStatus,
     PreflightPhase,
+    RebasePhase,
     ReflectionPhase,
 )
 from loom_tools.shepherd.phases.reflection import RunSummary
@@ -1092,6 +1093,40 @@ def orchestrate(ctx: ShepherdContext) -> int:
         if ctx.config.stop_after == "pr":
             _print_phase_header("STOPPING: Reached --to pr")
             return ShepherdExitCode.SUCCESS
+
+        # ─── PHASE 5.5: Rebase (if needed) ────────────────────────────────
+        _print_phase_header("PHASE 5.5: REBASE")
+        phase_start = time.time()
+        rebase = RebasePhase()
+        result = rebase.run(ctx)
+        elapsed = int(time.time() - phase_start)
+
+        if result.is_shutdown:
+            raise ShutdownSignal(result.message)
+
+        if result.status == PhaseStatus.FAILED:
+            log_error(result.message)
+            _run_reflection(
+                ctx,
+                exit_code=ShepherdExitCode.NEEDS_INTERVENTION,
+                duration=int(time.time() - start_time),
+                phase_durations=phase_durations,
+                completed_phases=completed_phases,
+                judge_retries=judge_retries,
+                doctor_attempts=doctor_attempts,
+                test_fix_attempts=test_fix_attempts,
+                warnings=run_warnings,
+            )
+            return ShepherdExitCode.NEEDS_INTERVENTION
+
+        if result.status == PhaseStatus.SKIPPED:
+            completed_phases.append("Rebase (up to date)")
+        else:
+            phase_durations["Rebase"] = elapsed
+            completed_phases.append("Rebase (rebased on main)")
+            ctx.report_milestone(
+                "phase_completed", phase="rebase", duration_seconds=elapsed, status="rebased"
+            )
 
         # ─── PHASE 6: Merge Gate ──────────────────────────────────────────
         _print_phase_header("PHASE 6: MERGE GATE")
