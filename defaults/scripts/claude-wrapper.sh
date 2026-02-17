@@ -941,12 +941,22 @@ run_with_retry() {
         # Record log file line count before CLI runs so we can detect whether
         # pipe-pane captured the output (avoids duplicate appends).  Issue #2569.
         local _pre_log_lines=0
+        local _log_file=""
         if [[ "$_has_slash_cmd" == "true" && -n "${TERMINAL_ID:-}" ]]; then
-            local _log_file="${WORKSPACE}/.loom/logs/loom-${TERMINAL_ID}.log"
+            _log_file="${WORKSPACE}/.loom/logs/loom-${TERMINAL_ID}.log"
             if [[ -f "$_log_file" ]]; then
                 _pre_log_lines=$(wc -l < "$_log_file")
             fi
         fi
+
+        # Wire up the signal handler for log flush on kill (issue #2586).
+        # When tmux kill-session sends SIGHUP/SIGTERM, the normal fallback
+        # append code (after the CLI invocation) never executes.  The signal
+        # handler ensures captured output is flushed to the log file.
+        _FLUSH_TEMP_OUTPUT="${temp_output}"
+        _FLUSH_LOG_FILE="${_log_file}"
+        _FLUSH_PRE_LOG_LINES="${_pre_log_lines}"
+        trap _flush_output_on_signal SIGHUP SIGTERM
 
         if [[ "$_has_slash_cmd" == "true" ]]; then
             # Slash command prompt detected - use --print for reliable execution
@@ -967,6 +977,14 @@ run_with_retry() {
         stop_output_monitor "${monitor_pid_file}"
         stop_output_monitor "${startup_monitor_pid_file}"
 
+        # CLI exited normally — clear signal handler globals and restore
+        # the default trap so the fallback append below handles flushing
+        # instead of the signal handler (avoids double-flushing).
+        _FLUSH_TEMP_OUTPUT=""
+        _FLUSH_LOG_FILE=""
+        _FLUSH_PRE_LOG_LINES=0
+        trap clear_retry_state EXIT
+
         output=$(cat "${temp_output}")
 
         # In --print mode, pipe-pane may not flush before session exit.
@@ -976,8 +994,7 @@ run_with_retry() {
         # Only append if pipe-pane did NOT already capture sufficient output
         # (detected by comparing log line counts before/after CLI).  Issue #2569.
         if [[ "$_has_slash_cmd" == "true" && -n "${TERMINAL_ID:-}" ]]; then
-            local _log_file="${WORKSPACE}/.loom/logs/loom-${TERMINAL_ID}.log"
-            if [[ -f "$_log_file" && -s "${temp_output}" ]]; then
+            if [[ -n "$_log_file" && -f "$_log_file" && -s "${temp_output}" ]]; then
                 local _post_log_lines
                 _post_log_lines=$(wc -l < "$_log_file")
                 local _log_growth=$(( _post_log_lines - _pre_log_lines ))
