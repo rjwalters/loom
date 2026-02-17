@@ -286,6 +286,7 @@ Safety Features:
   ✓ Non-interactive (safe for AI agents)
   ✓ Reuses existing branches automatically
   ✓ Symlinks node_modules from main (avoids pnpm install)
+  ✓ Symlinks .mcp.json from main (MCP config visible in worktrees)
   ✓ Runs project-specific hooks after creation
   ✓ Stashes/restores local changes during pull
 
@@ -734,6 +735,28 @@ if git worktree add "${CREATE_ARGS[@]}"; then
         else
             if [[ "$JSON_OUTPUT" != "true" ]]; then
                 print_warning "Could not symlink node_modules (will install on first build)"
+            fi
+        fi
+    fi
+
+    # Symlink .mcp.json from main workspace if available
+    # .mcp.json is gitignored so it's invisible from worktree git roots,
+    # which prevents Claude Code from discovering MCP server config
+    MAIN_MCP_JSON="$MAIN_WORKSPACE_DIR/.mcp.json"
+    WORKTREE_MCP_JSON="$ABS_WORKTREE_PATH/.mcp.json"
+
+    if [[ -f "$MAIN_MCP_JSON" && ! -e "$WORKTREE_MCP_JSON" ]]; then
+        if [[ "$JSON_OUTPUT" != "true" ]]; then
+            print_info "Symlinking .mcp.json from main workspace..."
+        fi
+
+        if ln -s "$MAIN_MCP_JSON" "$WORKTREE_MCP_JSON" 2>/dev/null; then
+            if [[ "$JSON_OUTPUT" != "true" ]]; then
+                print_success ".mcp.json symlinked"
+            fi
+        else
+            if [[ "$JSON_OUTPUT" != "true" ]]; then
+                print_warning "Could not symlink .mcp.json"
             fi
         fi
     fi
