@@ -1854,8 +1854,11 @@ class BuilderPhase:
 
         log_info(f"Running baseline tests on main: {display_name}")
 
+        # Snapshot dirty state before running tests so we can clean up artifacts
+        pre_dirty = self._get_dirty_files(ctx.repo_root)
+
         try:
-            return subprocess.run(
+            result = subprocess.run(
                 baseline_cmd,
                 cwd=ctx.repo_root,
                 text=True,
@@ -1865,10 +1868,98 @@ class BuilderPhase:
             )
         except subprocess.TimeoutExpired:
             log_warning("Baseline test run timed out, skipping comparison")
+            self._cleanup_new_artifacts(ctx.repo_root, pre_dirty)
             return None
         except OSError as e:
             log_warning(f"Could not run baseline tests: {e}")
             return None
+
+        self._cleanup_new_artifacts(ctx.repo_root, pre_dirty)
+        return result
+
+    @staticmethod
+    def _get_dirty_files(repo_root: Path) -> set[str]:
+        """Return the set of dirty file paths in a git working tree."""
+        try:
+            result = subprocess.run(
+                ["git", "status", "--porcelain"],
+                cwd=repo_root,
+                text=True,
+                capture_output=True,
+                timeout=30,
+                check=False,
+            )
+            if result.returncode != 0:
+                return set()
+            entries = set()
+            for line in result.stdout.splitlines():
+                if len(line) > 3:
+                    entries.add(line[3:].strip())
+            return entries
+        except (subprocess.TimeoutExpired, OSError):
+            return set()
+
+    @staticmethod
+    def _cleanup_new_artifacts(repo_root: Path, pre_dirty: set[str]) -> None:
+        """Remove files dirtied by baseline test run that weren't dirty before."""
+        try:
+            result = subprocess.run(
+                ["git", "status", "--porcelain"],
+                cwd=repo_root,
+                text=True,
+                capture_output=True,
+                timeout=30,
+                check=False,
+            )
+            if result.returncode != 0:
+                return
+        except (subprocess.TimeoutExpired, OSError):
+            return
+
+        new_entries: list[tuple[str, str]] = []  # (status, path)
+        for line in result.stdout.splitlines():
+            if len(line) > 3:
+                path = line[3:].strip()
+                if path not in pre_dirty:
+                    status = line[:2].strip()
+                    new_entries.append((status, path))
+
+        if not new_entries:
+            return
+
+        # Restore tracked files that were modified
+        tracked = [p for s, p in new_entries if s != "??"]
+        if tracked:
+            try:
+                subprocess.run(
+                    ["git", "checkout", "--"] + tracked,
+                    cwd=repo_root,
+                    capture_output=True,
+                    timeout=30,
+                    check=False,
+                )
+            except (subprocess.TimeoutExpired, OSError):
+                pass
+
+        # Remove untracked files
+        untracked = [p for s, p in new_entries if s == "??"]
+        if untracked:
+            try:
+                subprocess.run(
+                    ["git", "clean", "-f", "--"] + untracked,
+                    cwd=repo_root,
+                    capture_output=True,
+                    timeout=30,
+                    check=False,
+                )
+            except (subprocess.TimeoutExpired, OSError):
+                pass
+
+        cleaned = len(tracked) + len(untracked)
+        if cleaned:
+            log_info(
+                f"Cleaned {cleaned} artifact(s) from main after baseline test run"
+            )
 
     def _run_single_test_with_baseline(
         self,
