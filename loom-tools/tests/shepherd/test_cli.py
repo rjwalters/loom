@@ -359,7 +359,9 @@ class TestMain:
         with patch("loom_tools.shepherd.cli.orchestrate", return_value=0), \
              patch("loom_tools.shepherd.cli.ShepherdContext"), \
              patch("loom_tools.shepherd.cli.find_repo_root", return_value=Path("/fake/repo")), \
-             patch("loom_tools.shepherd.cli._auto_navigate_out_of_worktree"):
+             patch("loom_tools.shepherd.cli._auto_navigate_out_of_worktree"), \
+             patch("loom_tools.claim.claim_issue", return_value=0), \
+             patch("loom_tools.claim.release_claim"):
             result = main(["42"])
             assert isinstance(result, int)
 
@@ -368,7 +370,9 @@ class TestMain:
         with patch("loom_tools.shepherd.cli.orchestrate", return_value=1), \
              patch("loom_tools.shepherd.cli.ShepherdContext"), \
              patch("loom_tools.shepherd.cli.find_repo_root", return_value=Path("/fake/repo")), \
-             patch("loom_tools.shepherd.cli._auto_navigate_out_of_worktree"):
+             patch("loom_tools.shepherd.cli._auto_navigate_out_of_worktree"), \
+             patch("loom_tools.claim.claim_issue", return_value=0), \
+             patch("loom_tools.claim.release_claim"):
             result = main(["42"])
             assert result == 1
 
@@ -386,7 +390,9 @@ class TestMain:
         with patch("loom_tools.shepherd.cli.orchestrate", return_value=0), \
              patch("loom_tools.shepherd.cli.ShepherdContext", side_effect=track_context), \
              patch("loom_tools.shepherd.cli.find_repo_root", return_value=Path("/fake/repo")), \
-             patch("loom_tools.shepherd.cli._auto_navigate_out_of_worktree", side_effect=track_navigate):
+             patch("loom_tools.shepherd.cli._auto_navigate_out_of_worktree", side_effect=track_navigate), \
+             patch("loom_tools.claim.claim_issue", return_value=0), \
+             patch("loom_tools.claim.release_claim"):
             main(["42"])
 
         # Navigate must be called before context is created
@@ -406,7 +412,9 @@ class TestMain:
              patch("loom_tools.shepherd.cli.ShepherdContext"), \
              patch("loom_tools.shepherd.cli.find_repo_root", return_value=Path("/fake/repo")), \
              patch("loom_tools.shepherd.cli._auto_navigate_out_of_worktree"), \
-             patch("loom_tools.shepherd.cli.get_uncommitted_files", return_value=["M file.py"]):
+             patch("loom_tools.shepherd.cli.get_uncommitted_files", return_value=["M file.py"]), \
+             patch("loom_tools.claim.claim_issue", return_value=0), \
+             patch("loom_tools.claim.release_claim"):
             result = main(["42", "--allow-dirty-main"])
             assert result == 0
 
@@ -416,7 +424,9 @@ class TestMain:
              patch("loom_tools.shepherd.cli.ShepherdContext"), \
              patch("loom_tools.shepherd.cli.find_repo_root", return_value=Path("/fake/repo")), \
              patch("loom_tools.shepherd.cli._auto_navigate_out_of_worktree"), \
-             patch("loom_tools.shepherd.cli.get_uncommitted_files", return_value=[]):
+             patch("loom_tools.shepherd.cli.get_uncommitted_files", return_value=[]), \
+             patch("loom_tools.claim.claim_issue", return_value=0), \
+             patch("loom_tools.claim.release_claim"):
             result = main(["42"])
             assert result == 0
 
@@ -541,6 +551,7 @@ class TestPhaseTiming:
     """Test per-phase timing in orchestrate()."""
 
     @patch("loom_tools.shepherd.cli.MergePhase")
+    @patch("loom_tools.shepherd.cli.RebasePhase")
     @patch("loom_tools.shepherd.cli.JudgePhase")
     @patch("loom_tools.shepherd.cli.BuilderPhase")
     @patch("loom_tools.shepherd.cli.ApprovalPhase")
@@ -553,12 +564,14 @@ class TestPhaseTiming:
         MockApproval: MagicMock,
         MockBuilder: MagicMock,
         MockJudge: MagicMock,
+        MockRebase: MagicMock,
         MockMerge: MagicMock,
     ) -> None:
         """Phase durations dict should be populated after orchestration."""
         # Simulate time progression: each phase takes a known duration
         # time.time() calls: start_time, curator_start, curator_end, approval_start, approval_end,
-        #   builder_start, builder_end, judge_start, judge_end, merge_start, merge_end, duration_calc
+        #   builder_start, builder_end, judge_start, judge_end,
+        #   rebase_start, rebase_end, merge_start, merge_end, duration_calc
         mock_time.time = MagicMock(side_effect=[
             0,     # start_time
             0,     # curator phase_start
@@ -569,6 +582,8 @@ class TestPhaseTiming:
             115,   # builder elapsed (100s)
             115,   # judge phase_start
             165,   # judge elapsed (50s)
+            165,   # rebase phase_start
+            165,   # rebase elapsed (0s, skipped)
             165,   # merge phase_start
             170,   # merge elapsed (5s)
             170,   # duration calc
@@ -594,6 +609,11 @@ class TestPhaseTiming:
         judge_inst.should_skip.return_value = (False, "")
         judge_inst.run.return_value = _success_result("judge", approved=True)
 
+        # Rebase: skipped (up to date)
+        MockRebase.return_value.run.return_value = PhaseResult(
+            status=PhaseStatus.SKIPPED, message="up to date", phase_name="rebase"
+        )
+
         # Merge: merged
         MockMerge.return_value.run.return_value = _success_result("merge", merged=True)
 
@@ -616,6 +636,7 @@ class TestPhaseTiming:
         assert phases_reported["merge"] == 5
 
     @patch("loom_tools.shepherd.cli.MergePhase")
+    @patch("loom_tools.shepherd.cli.RebasePhase")
     @patch("loom_tools.shepherd.cli.JudgePhase")
     @patch("loom_tools.shepherd.cli.BuilderPhase")
     @patch("loom_tools.shepherd.cli.ApprovalPhase")
@@ -628,6 +649,7 @@ class TestPhaseTiming:
         MockApproval: MagicMock,
         MockBuilder: MagicMock,
         MockJudge: MagicMock,
+        MockRebase: MagicMock,
         MockMerge: MagicMock,
         capsys: pytest.CaptureFixture[str],
     ) -> None:
@@ -642,6 +664,8 @@ class TestPhaseTiming:
             400,   # builder elapsed (350s)
             400,   # judge phase_start
             550,   # judge elapsed (150s)
+            550,   # rebase phase_start
+            550,   # rebase elapsed (0s, skipped)
             550,   # merge phase_start
             600,   # merge elapsed (50s)
             600,   # duration calc
@@ -663,6 +687,9 @@ class TestPhaseTiming:
         judge_inst.should_skip.return_value = (False, "")
         judge_inst.run.return_value = _success_result("judge", approved=True)
 
+        MockRebase.return_value.run.return_value = PhaseResult(
+            status=PhaseStatus.SKIPPED, message="up to date", phase_name="rebase"
+        )
         MockMerge.return_value.run.return_value = _success_result("merge", merged=True)
 
         result = orchestrate(ctx)
@@ -675,6 +702,7 @@ class TestPhaseTiming:
         assert "Merge: 50s" in captured.err
 
     @patch("loom_tools.shepherd.cli.MergePhase")
+    @patch("loom_tools.shepherd.cli.RebasePhase")
     @patch("loom_tools.shepherd.cli.DoctorPhase")
     @patch("loom_tools.shepherd.cli.JudgePhase")
     @patch("loom_tools.shepherd.cli.BuilderPhase")
@@ -689,10 +717,11 @@ class TestPhaseTiming:
         MockBuilder: MagicMock,
         MockJudge: MagicMock,
         MockDoctor: MagicMock,
+        MockRebase: MagicMock,
         MockMerge: MagicMock,
     ) -> None:
         """Judge/Doctor retry loop should accumulate timing per attempt."""
-        # Flow: curator(skip) -> approval -> builder(skip) -> judge1(changes) -> doctor1 -> judge2(approved) -> merge
+        # Flow: curator(skip) -> approval -> builder(skip) -> judge1(changes) -> doctor1 -> judge2(approved) -> rebase -> merge
         mock_time.time = MagicMock(side_effect=[
             0,     # start_time
             0,     # approval phase_start
@@ -706,10 +735,13 @@ class TestPhaseTiming:
             # Judge attempt 2
             220,   # judge phase_start
             300,   # judge elapsed (80s)
+            # Rebase
+            300,   # rebase phase_start
+            303,   # rebase elapsed (3s)
             # Merge
-            300,   # merge phase_start
-            310,   # merge elapsed (10s)
-            310,   # duration calc
+            303,   # merge phase_start
+            313,   # merge elapsed (10s)
+            313,   # duration calc
         ])
 
         ctx = _make_ctx(start_from=Phase.BUILDER)
@@ -734,7 +766,12 @@ class TestPhaseTiming:
         # Doctor: applies fixes
         MockDoctor.return_value.run.return_value = _success_result("doctor")
 
+        # Rebase: skipped
+
         # Merge: success
+        MockRebase.return_value.run.return_value = PhaseResult(
+            status=PhaseStatus.SKIPPED, message="up to date", phase_name="rebase"
+        )
         MockMerge.return_value.run.return_value = _success_result("merge", merged=True)
 
         result = orchestrate(ctx)
@@ -758,6 +795,7 @@ class TestPhaseTiming:
         assert doctor_milestones[0].kwargs["duration_seconds"] == 95
 
     @patch("loom_tools.shepherd.cli.MergePhase")
+    @patch("loom_tools.shepherd.cli.RebasePhase")
     @patch("loom_tools.shepherd.cli.JudgePhase")
     @patch("loom_tools.shepherd.cli.BuilderPhase")
     @patch("loom_tools.shepherd.cli.ApprovalPhase")
@@ -770,6 +808,7 @@ class TestPhaseTiming:
         MockApproval: MagicMock,
         MockBuilder: MagicMock,
         MockJudge: MagicMock,
+        MockRebase: MagicMock,
         MockMerge: MagicMock,
         capsys: pytest.CaptureFixture[str],
     ) -> None:
@@ -781,6 +820,8 @@ class TestPhaseTiming:
             2,     # approval elapsed (2s)
             2,     # judge phase_start
             52,    # judge elapsed (50s)
+            52,   # rebase phase_start
+            52,   # rebase elapsed (0s, skipped)
             52,    # merge phase_start
             60,    # merge elapsed (8s)
             60,    # duration calc
@@ -803,6 +844,9 @@ class TestPhaseTiming:
         judge_inst.should_skip.return_value = (False, "")
         judge_inst.run.return_value = _success_result("judge", approved=True)
 
+        MockRebase.return_value.run.return_value = PhaseResult(
+            status=PhaseStatus.SKIPPED, message="up to date", phase_name="rebase"
+        )
         MockMerge.return_value.run.return_value = _success_result("merge", merged=True)
 
         result = orchestrate(ctx)
@@ -817,6 +861,7 @@ class TestPhaseTiming:
         assert "Merge: 8s" in captured.err
 
     @patch("loom_tools.shepherd.cli.MergePhase")
+    @patch("loom_tools.shepherd.cli.RebasePhase")
     @patch("loom_tools.shepherd.cli.JudgePhase")
     @patch("loom_tools.shepherd.cli.BuilderPhase")
     @patch("loom_tools.shepherd.cli.ApprovalPhase")
@@ -829,6 +874,7 @@ class TestPhaseTiming:
         MockApproval: MagicMock,
         MockBuilder: MagicMock,
         MockJudge: MagicMock,
+        MockRebase: MagicMock,
         MockMerge: MagicMock,
         capsys: pytest.CaptureFixture[str],
     ) -> None:
@@ -843,6 +889,8 @@ class TestPhaseTiming:
             200,   # builder elapsed (170s)
             200,   # judge phase_start
             300,   # judge elapsed (100s)
+            300,   # rebase phase_start
+            300,   # rebase elapsed (0s, skipped)
             300,   # merge phase_start
             305,   # merge elapsed (5s)
             305,   # duration calc
@@ -864,6 +912,9 @@ class TestPhaseTiming:
         judge_inst.should_skip.return_value = (False, "")
         judge_inst.run.return_value = _success_result("judge", approved=True)
 
+        MockRebase.return_value.run.return_value = PhaseResult(
+            status=PhaseStatus.SKIPPED, message="up to date", phase_name="rebase"
+        )
         MockMerge.return_value.run.return_value = _success_result("merge", merged=True)
 
         result = orchestrate(ctx)
@@ -881,6 +932,7 @@ class TestDoctorSkippedHeader:
     """Test Doctor phase skipped header when Judge approves first try (issue #1767)."""
 
     @patch("loom_tools.shepherd.cli.MergePhase")
+    @patch("loom_tools.shepherd.cli.RebasePhase")
     @patch("loom_tools.shepherd.cli.JudgePhase")
     @patch("loom_tools.shepherd.cli.BuilderPhase")
     @patch("loom_tools.shepherd.cli.ApprovalPhase")
@@ -893,6 +945,7 @@ class TestDoctorSkippedHeader:
         MockApproval: MagicMock,
         MockBuilder: MagicMock,
         MockJudge: MagicMock,
+        MockRebase: MagicMock,
         MockMerge: MagicMock,
         capsys: pytest.CaptureFixture[str],
     ) -> None:
@@ -907,6 +960,8 @@ class TestDoctorSkippedHeader:
             100,   # builder elapsed
             100,   # judge phase_start
             150,   # judge elapsed
+            150,   # rebase phase_start
+            150,   # rebase elapsed (0s, skipped)
             150,   # merge phase_start
             160,   # merge elapsed
             160,   # duration calc
@@ -929,6 +984,9 @@ class TestDoctorSkippedHeader:
         judge_inst.should_skip.return_value = (False, "")
         judge_inst.run.return_value = _success_result("judge", approved=True)
 
+        MockRebase.return_value.run.return_value = PhaseResult(
+            status=PhaseStatus.SKIPPED, message="up to date", phase_name="rebase"
+        )
         MockMerge.return_value.run.return_value = _success_result("merge", merged=True)
 
         result = orchestrate(ctx)
@@ -938,6 +996,7 @@ class TestDoctorSkippedHeader:
         assert "PHASE 5: DOCTOR (skipped - no changes requested)" in captured.err
 
     @patch("loom_tools.shepherd.cli.MergePhase")
+    @patch("loom_tools.shepherd.cli.RebasePhase")
     @patch("loom_tools.shepherd.cli.DoctorPhase")
     @patch("loom_tools.shepherd.cli.JudgePhase")
     @patch("loom_tools.shepherd.cli.BuilderPhase")
@@ -952,6 +1011,7 @@ class TestDoctorSkippedHeader:
         MockBuilder: MagicMock,
         MockJudge: MagicMock,
         MockDoctor: MagicMock,
+        MockRebase: MagicMock,
         MockMerge: MagicMock,
         capsys: pytest.CaptureFixture[str],
     ) -> None:
@@ -966,6 +1026,8 @@ class TestDoctorSkippedHeader:
             100,   # doctor elapsed
             100,   # judge attempt 2 phase_start
             150,   # judge attempt 2 elapsed
+            150,   # rebase phase_start
+            150,   # rebase elapsed (0s, skipped)
             150,   # merge phase_start
             160,   # merge elapsed
             160,   # duration calc
@@ -990,6 +1052,9 @@ class TestDoctorSkippedHeader:
         ]
 
         MockDoctor.return_value.run.return_value = _success_result("doctor")
+        MockRebase.return_value.run.return_value = PhaseResult(
+            status=PhaseStatus.SKIPPED, message="up to date", phase_name="rebase"
+        )
         MockMerge.return_value.run.return_value = _success_result("merge", merged=True)
 
         result = orchestrate(ctx)
@@ -1001,6 +1066,7 @@ class TestDoctorSkippedHeader:
         assert "PHASE 5: DOCTOR (skipped" not in captured.err
 
     @patch("loom_tools.shepherd.cli.MergePhase")
+    @patch("loom_tools.shepherd.cli.RebasePhase")
     @patch("loom_tools.shepherd.cli.JudgePhase")
     @patch("loom_tools.shepherd.cli.BuilderPhase")
     @patch("loom_tools.shepherd.cli.ApprovalPhase")
@@ -1013,6 +1079,7 @@ class TestDoctorSkippedHeader:
         MockApproval: MagicMock,
         MockBuilder: MagicMock,
         MockJudge: MagicMock,
+        MockRebase: MagicMock,
         MockMerge: MagicMock,
         capsys: pytest.CaptureFixture[str],
     ) -> None:
@@ -1021,6 +1088,8 @@ class TestDoctorSkippedHeader:
             0,     # start_time
             0,     # approval phase_start
             5,     # approval elapsed
+            5,   # rebase phase_start
+            5,   # rebase elapsed (0s, skipped)
             5,     # merge phase_start
             10,    # merge elapsed
             10,    # duration calc
@@ -1040,6 +1109,9 @@ class TestDoctorSkippedHeader:
         judge_inst = MockJudge.return_value
         judge_inst.should_skip.return_value = (True, "skipped via --from")
 
+        MockRebase.return_value.run.return_value = PhaseResult(
+            status=PhaseStatus.SKIPPED, message="up to date", phase_name="rebase"
+        )
         MockMerge.return_value.run.return_value = _success_result("merge", merged=True)
 
         result = orchestrate(ctx)
@@ -1120,6 +1192,7 @@ class TestJudgePhaseHeader:
     """Test judge phase header shows correct attempt count (issue #2008)."""
 
     @patch("loom_tools.shepherd.cli.MergePhase")
+    @patch("loom_tools.shepherd.cli.RebasePhase")
     @patch("loom_tools.shepherd.cli.JudgePhase")
     @patch("loom_tools.shepherd.cli.BuilderPhase")
     @patch("loom_tools.shepherd.cli.ApprovalPhase")
@@ -1132,6 +1205,7 @@ class TestJudgePhaseHeader:
         MockApproval: MagicMock,
         MockBuilder: MagicMock,
         MockJudge: MagicMock,
+        MockRebase: MagicMock,
         MockMerge: MagicMock,
         capsys: pytest.CaptureFixture[str],
     ) -> None:
@@ -1154,6 +1228,8 @@ class TestJudgePhaseHeader:
             10,    # judge phase_start
             20,    # judge elapsed
             # Merge
+            20,   # rebase phase_start
+            20,   # rebase elapsed (0s, skipped)
             20,    # merge phase_start
             25,    # merge elapsed
             25,    # duration calc
@@ -1175,6 +1251,9 @@ class TestJudgePhaseHeader:
             _success_result("judge", approved=True),
         ]
 
+        MockRebase.return_value.run.return_value = PhaseResult(
+            status=PhaseStatus.SKIPPED, message="up to date", phase_name="rebase"
+        )
         MockMerge.return_value.run.return_value = _success_result("merge", merged=True)
 
         result = orchestrate(ctx)
@@ -1190,6 +1269,7 @@ class TestJudgeRetry:
     """Test judge retry logic when judge phase fails (issue #1909)."""
 
     @patch("loom_tools.shepherd.cli.MergePhase")
+    @patch("loom_tools.shepherd.cli.RebasePhase")
     @patch("loom_tools.shepherd.cli.JudgePhase")
     @patch("loom_tools.shepherd.cli.BuilderPhase")
     @patch("loom_tools.shepherd.cli.ApprovalPhase")
@@ -1202,6 +1282,7 @@ class TestJudgeRetry:
         MockApproval: MagicMock,
         MockBuilder: MagicMock,
         MockJudge: MagicMock,
+        MockRebase: MagicMock,
         MockMerge: MagicMock,
     ) -> None:
         """Judge FAILED on first call, SUCCESS with approved on second — should complete."""
@@ -1216,6 +1297,8 @@ class TestJudgeRetry:
             10,    # judge phase_start
             20,    # judge elapsed
             # Merge
+            20,   # rebase phase_start
+            20,   # rebase elapsed (0s, skipped)
             20,    # merge phase_start
             25,    # merge elapsed
             25,    # duration calc
@@ -1239,6 +1322,9 @@ class TestJudgeRetry:
             _success_result("judge", approved=True),
         ]
 
+        MockRebase.return_value.run.return_value = PhaseResult(
+            status=PhaseStatus.SKIPPED, message="up to date", phase_name="rebase"
+        )
         MockMerge.return_value.run.return_value = _success_result("merge", merged=True)
 
         result = orchestrate(ctx)
@@ -1306,6 +1392,7 @@ class TestJudgeRetry:
         mock_mark_exhausted.assert_called_once_with(ctx, 1)
 
     @patch("loom_tools.shepherd.cli.MergePhase")
+    @patch("loom_tools.shepherd.cli.RebasePhase")
     @patch("loom_tools.shepherd.cli.JudgePhase")
     @patch("loom_tools.shepherd.cli.BuilderPhase")
     @patch("loom_tools.shepherd.cli.ApprovalPhase")
@@ -1318,6 +1405,7 @@ class TestJudgeRetry:
         MockApproval: MagicMock,
         MockBuilder: MagicMock,
         MockJudge: MagicMock,
+        MockRebase: MagicMock,
         MockMerge: MagicMock,
     ) -> None:
         """Approved outcome on first try should work identically to before."""
@@ -1327,6 +1415,8 @@ class TestJudgeRetry:
             5,     # approval elapsed
             5,     # judge phase_start
             15,    # judge elapsed
+            15,   # rebase phase_start
+            15,   # rebase elapsed (0s, skipped)
             15,    # merge phase_start
             20,    # merge elapsed
             20,    # duration calc
@@ -1344,6 +1434,9 @@ class TestJudgeRetry:
         judge_inst.should_skip.return_value = (False, "")
         judge_inst.run.return_value = _success_result("judge", approved=True)
 
+        MockRebase.return_value.run.return_value = PhaseResult(
+            status=PhaseStatus.SKIPPED, message="up to date", phase_name="rebase"
+        )
         MockMerge.return_value.run.return_value = _success_result("merge", merged=True)
 
         result = orchestrate(ctx)
@@ -1357,6 +1450,7 @@ class TestJudgeRetry:
         assert len(retry_calls) == 0
 
     @patch("loom_tools.shepherd.cli.MergePhase")
+    @patch("loom_tools.shepherd.cli.RebasePhase")
     @patch("loom_tools.shepherd.cli.DoctorPhase")
     @patch("loom_tools.shepherd.cli.JudgePhase")
     @patch("loom_tools.shepherd.cli.BuilderPhase")
@@ -1371,6 +1465,7 @@ class TestJudgeRetry:
         MockBuilder: MagicMock,
         MockJudge: MagicMock,
         MockDoctor: MagicMock,
+        MockRebase: MagicMock,
         MockMerge: MagicMock,
     ) -> None:
         """Changes-requested -> doctor -> approved flow should work as before."""
@@ -1388,6 +1483,8 @@ class TestJudgeRetry:
             25,    # judge phase_start
             35,    # judge elapsed
             # Merge
+            35,   # rebase phase_start
+            35,   # rebase elapsed (0s, skipped)
             35,    # merge phase_start
             40,    # merge elapsed
             40,    # duration calc
@@ -1409,6 +1506,9 @@ class TestJudgeRetry:
         ]
 
         MockDoctor.return_value.run.return_value = _success_result("doctor")
+        MockRebase.return_value.run.return_value = PhaseResult(
+            status=PhaseStatus.SKIPPED, message="up to date", phase_name="rebase"
+        )
         MockMerge.return_value.run.return_value = _success_result("merge", merged=True)
 
         result = orchestrate(ctx)
@@ -1429,6 +1529,7 @@ class TestJudgeRetry:
         assert len(doctor_calls) == 1
 
     @patch("loom_tools.shepherd.cli.MergePhase")
+    @patch("loom_tools.shepherd.cli.RebasePhase")
     @patch("loom_tools.shepherd.cli.JudgePhase")
     @patch("loom_tools.shepherd.cli.BuilderPhase")
     @patch("loom_tools.shepherd.cli.ApprovalPhase")
@@ -1441,6 +1542,7 @@ class TestJudgeRetry:
         MockApproval: MagicMock,
         MockBuilder: MagicMock,
         MockJudge: MagicMock,
+        MockRebase: MagicMock,
         MockMerge: MagicMock,
     ) -> None:
         """Judge retry milestone should include attempt count and reason."""
@@ -1455,6 +1557,8 @@ class TestJudgeRetry:
             10,    # judge phase_start
             20,    # judge elapsed
             # Merge
+            20,   # rebase phase_start
+            20,   # rebase elapsed (0s, skipped)
             20,    # merge phase_start
             25,    # merge elapsed
             25,    # duration calc
@@ -1475,6 +1579,9 @@ class TestJudgeRetry:
             _success_result("judge", approved=True),
         ]
 
+        MockRebase.return_value.run.return_value = PhaseResult(
+            status=PhaseStatus.SKIPPED, message="up to date", phase_name="rebase"
+        )
         MockMerge.return_value.run.return_value = _success_result("merge", merged=True)
 
         result = orchestrate(ctx)
@@ -1491,6 +1598,7 @@ class TestJudgeRetry:
         assert "validation failed" in retry_calls[0].kwargs["reason"]
 
     @patch("loom_tools.shepherd.cli.MergePhase")
+    @patch("loom_tools.shepherd.cli.RebasePhase")
     @patch("loom_tools.shepherd.cli.DoctorPhase")
     @patch("loom_tools.shepherd.cli.JudgePhase")
     @patch("loom_tools.shepherd.cli.BuilderPhase")
@@ -1505,6 +1613,7 @@ class TestJudgeRetry:
         MockBuilder: MagicMock,
         MockJudge: MagicMock,
         MockDoctor: MagicMock,
+        MockRebase: MagicMock,
         MockMerge: MagicMock,
     ) -> None:
         """Unexpected judge result with loom:changes-requested label should enter doctor loop.
@@ -1528,6 +1637,8 @@ class TestJudgeRetry:
             20,    # judge phase_start
             30,    # judge elapsed
             # Merge
+            30,   # rebase phase_start
+            30,   # rebase elapsed (0s, skipped)
             30,    # merge phase_start
             35,    # merge elapsed
             35,    # duration calc
@@ -1556,6 +1667,9 @@ class TestJudgeRetry:
         ctx.has_pr_label.side_effect = label_side_effect
 
         MockDoctor.return_value.run.return_value = _success_result("doctor")
+        MockRebase.return_value.run.return_value = PhaseResult(
+            status=PhaseStatus.SKIPPED, message="up to date", phase_name="rebase"
+        )
         MockMerge.return_value.run.return_value = _success_result("merge", merged=True)
 
         result = orchestrate(ctx)
@@ -2099,6 +2213,7 @@ class TestBuilderNoPrPrecondition:
         assert "no PR was created" in captured.err
 
     @patch("loom_tools.shepherd.cli.MergePhase")
+    @patch("loom_tools.shepherd.cli.RebasePhase")
     @patch("loom_tools.shepherd.cli.JudgePhase")
     @patch("loom_tools.shepherd.cli.BuilderPhase")
     @patch("loom_tools.shepherd.cli.ApprovalPhase")
@@ -2111,6 +2226,7 @@ class TestBuilderNoPrPrecondition:
         MockApproval: MagicMock,
         MockBuilder: MagicMock,
         MockJudge: MagicMock,
+        MockRebase: MagicMock,
         MockMerge: MagicMock,
     ) -> None:
         """When PR exists, Judge phase should proceed normally."""
@@ -2122,9 +2238,11 @@ class TestBuilderNoPrPrecondition:
             100,   # builder elapsed
             100,   # judge phase_start
             150,   # judge elapsed
-            150,   # merge phase_start
-            160,   # merge elapsed
-            160,   # duration calc
+            150,   # rebase phase_start
+            153,   # rebase elapsed
+            153,   # merge phase_start
+            163,   # merge elapsed
+            163,   # duration calc
         ])
 
         ctx = _make_ctx(start_from=Phase.BUILDER)
@@ -2141,6 +2259,9 @@ class TestBuilderNoPrPrecondition:
         judge_inst.should_skip.return_value = (False, "")
         judge_inst.run.return_value = _success_result("judge", approved=True)
 
+        MockRebase.return_value.run.return_value = PhaseResult(
+            status=PhaseStatus.SKIPPED, message="up to date", phase_name="rebase"
+        )
         MockMerge.return_value.run.return_value = _success_result("merge", merged=True)
 
         result = orchestrate(ctx)
@@ -2202,6 +2323,7 @@ class TestDoctorTestFixLoop:
 
     @patch("loom_tools.shepherd.cli._mark_builder_test_failure")
     @patch("loom_tools.shepherd.cli.MergePhase")
+    @patch("loom_tools.shepherd.cli.RebasePhase")
     @patch("loom_tools.shepherd.cli.JudgePhase")
     @patch("loom_tools.shepherd.cli.DoctorPhase")
     @patch("loom_tools.shepherd.cli.BuilderPhase")
@@ -2216,6 +2338,7 @@ class TestDoctorTestFixLoop:
         MockBuilder: MagicMock,
         MockDoctor: MagicMock,
         MockJudge: MagicMock,
+        MockRebase: MagicMock,
         MockMerge: MagicMock,
         mock_mark_failure: MagicMock,
     ) -> None:
@@ -2238,10 +2361,13 @@ class TestDoctorTestFixLoop:
             # Judge
             220,   # judge phase_start
             270,   # judge elapsed
+            # Rebase
+            270,   # rebase phase_start
+            273,   # rebase elapsed
             # Merge
-            270,   # merge phase_start
-            280,   # merge elapsed
-            280,   # duration calc
+            273,   # merge phase_start
+            283,   # merge elapsed
+            283,   # duration calc
         ])
 
         ctx = _make_ctx(start_from=Phase.BUILDER)
@@ -2276,6 +2402,9 @@ class TestDoctorTestFixLoop:
         judge_inst.run.return_value = _success_result("judge", approved=True)
 
         # Merge
+        MockRebase.return_value.run.return_value = PhaseResult(
+            status=PhaseStatus.SKIPPED, message="up to date", phase_name="rebase"
+        )
         MockMerge.return_value.run.return_value = _success_result("merge", merged=True)
 
         result = orchestrate(ctx)
@@ -2290,6 +2419,7 @@ class TestDoctorTestFixLoop:
 
     @patch("loom_tools.shepherd.cli._mark_builder_test_failure")
     @patch("loom_tools.shepherd.cli.MergePhase")
+    @patch("loom_tools.shepherd.cli.RebasePhase")
     @patch("loom_tools.shepherd.cli.JudgePhase")
     @patch("loom_tools.shepherd.cli.DoctorPhase")
     @patch("loom_tools.shepherd.cli.BuilderPhase")
@@ -2304,6 +2434,7 @@ class TestDoctorTestFixLoop:
         MockBuilder: MagicMock,
         MockDoctor: MagicMock,
         MockJudge: MagicMock,
+        MockRebase: MagicMock,
         MockMerge: MagicMock,
         mock_mark_failure: MagicMock,
     ) -> None:
@@ -2324,6 +2455,8 @@ class TestDoctorTestFixLoop:
             160,   # judge phase_start
             210,   # judge elapsed
             # Merge
+            210,   # rebase phase_start
+            210,   # rebase elapsed (0s, skipped)
             210,   # merge phase_start
             220,   # merge elapsed
             220,   # duration calc
@@ -2362,6 +2495,9 @@ class TestDoctorTestFixLoop:
         judge_inst.run.return_value = _success_result("judge", approved=True)
 
         # Merge
+        MockRebase.return_value.run.return_value = PhaseResult(
+            status=PhaseStatus.SKIPPED, message="up to date", phase_name="rebase"
+        )
         MockMerge.return_value.run.return_value = _success_result("merge", merged=True)
 
         result = orchestrate(ctx)
@@ -2686,6 +2822,7 @@ class TestDoctorRegressionGuard:
 
     @patch("loom_tools.shepherd.cli._mark_builder_test_failure")
     @patch("loom_tools.shepherd.cli.MergePhase")
+    @patch("loom_tools.shepherd.cli.RebasePhase")
     @patch("loom_tools.shepherd.cli.JudgePhase")
     @patch("loom_tools.shepherd.cli.DoctorPhase")
     @patch("loom_tools.shepherd.cli.BuilderPhase")
@@ -2700,6 +2837,7 @@ class TestDoctorRegressionGuard:
         MockBuilder: MagicMock,
         MockDoctor: MagicMock,
         MockJudge: MagicMock,
+        MockRebase: MagicMock,
         MockMerge: MagicMock,
         mock_mark_failure: MagicMock,
     ) -> None:
@@ -2722,6 +2860,9 @@ class TestDoctorRegressionGuard:
             # Judge
             170,   # judge phase_start
             220,   # judge elapsed
+            # Rebase
+            220,   # rebase phase_start
+            220,   # rebase elapsed (0s, skipped)
             # Merge
             220,   # merge phase_start
             230,   # merge elapsed
@@ -2761,6 +2902,9 @@ class TestDoctorRegressionGuard:
         judge_inst.run.return_value = _success_result("judge", approved=True)
 
         # Merge
+        MockRebase.return_value.run.return_value = PhaseResult(
+            status=PhaseStatus.SKIPPED, message="up to date", phase_name="rebase"
+        )
         MockMerge.return_value.run.return_value = _success_result("merge", merged=True)
 
         result = orchestrate(ctx)
@@ -2776,6 +2920,7 @@ class TestPostDoctorPush:
 
     @patch("loom_tools.shepherd.cli._mark_builder_test_failure")
     @patch("loom_tools.shepherd.cli.MergePhase")
+    @patch("loom_tools.shepherd.cli.RebasePhase")
     @patch("loom_tools.shepherd.cli.JudgePhase")
     @patch("loom_tools.shepherd.cli.DoctorPhase")
     @patch("loom_tools.shepherd.cli.BuilderPhase")
@@ -2790,6 +2935,7 @@ class TestPostDoctorPush:
         MockBuilder: MagicMock,
         MockDoctor: MagicMock,
         MockJudge: MagicMock,
+        MockRebase: MagicMock,
         MockMerge: MagicMock,
         mock_mark_failure: MagicMock,
     ) -> None:
@@ -2808,6 +2954,8 @@ class TestPostDoctorPush:
             220,   # completion elapsed
             220,   # judge phase_start
             270,   # judge elapsed
+            270,   # rebase phase_start
+            270,   # rebase elapsed (0s, skipped)
             270,   # merge phase_start
             280,   # merge elapsed
             280,   # duration calc
@@ -2842,6 +2990,9 @@ class TestPostDoctorPush:
         judge_inst.should_skip.return_value = (False, "")
         judge_inst.run.return_value = _success_result("judge", approved=True)
 
+        MockRebase.return_value.run.return_value = PhaseResult(
+            status=PhaseStatus.SKIPPED, message="up to date", phase_name="rebase"
+        )
         MockMerge.return_value.run.return_value = _success_result("merge", merged=True)
 
         result = orchestrate(ctx)
@@ -2925,6 +3076,7 @@ class TestPostDoctorPush:
 
     @patch("loom_tools.shepherd.cli._mark_builder_test_failure")
     @patch("loom_tools.shepherd.cli.MergePhase")
+    @patch("loom_tools.shepherd.cli.RebasePhase")
     @patch("loom_tools.shepherd.cli.JudgePhase")
     @patch("loom_tools.shepherd.cli.DoctorPhase")
     @patch("loom_tools.shepherd.cli.BuilderPhase")
@@ -2939,6 +3091,7 @@ class TestPostDoctorPush:
         MockBuilder: MagicMock,
         MockDoctor: MagicMock,
         MockJudge: MagicMock,
+        MockRebase: MagicMock,
         MockMerge: MagicMock,
         mock_mark_failure: MagicMock,
     ) -> None:
@@ -2957,6 +3110,8 @@ class TestPostDoctorPush:
             220,   # completion elapsed
             220,   # judge phase_start
             270,   # judge elapsed
+            270,   # rebase phase_start
+            270,   # rebase elapsed (0s, skipped)
             270,   # merge phase_start
             280,   # merge elapsed
             280,   # duration calc
@@ -2992,6 +3147,9 @@ class TestPostDoctorPush:
         judge_inst.should_skip.return_value = (False, "")
         judge_inst.run.return_value = _success_result("judge", approved=True)
 
+        MockRebase.return_value.run.return_value = PhaseResult(
+            status=PhaseStatus.SKIPPED, message="up to date", phase_name="rebase"
+        )
         MockMerge.return_value.run.return_value = _success_result("merge", merged=True)
 
         result = orchestrate(ctx)
@@ -3164,7 +3322,9 @@ class TestMainCleanupIntegration:
              patch("loom_tools.shepherd.cli.ShepherdContext") as MockCtx, \
              patch("loom_tools.shepherd.cli.find_repo_root", return_value=Path("/fake/repo")), \
              patch("loom_tools.shepherd.cli._auto_navigate_out_of_worktree"), \
-             patch("loom_tools.shepherd.cli._cleanup_labels_on_failure") as mock_cleanup:
+             patch("loom_tools.shepherd.cli._cleanup_labels_on_failure") as mock_cleanup, \
+             patch("loom_tools.claim.claim_issue", return_value=0), \
+             patch("loom_tools.claim.release_claim"):
             ctx = MockCtx.return_value
             result = main(["42"])
             assert result == ShepherdExitCode.BUILDER_FAILED
@@ -3176,7 +3336,9 @@ class TestMainCleanupIntegration:
              patch("loom_tools.shepherd.cli.ShepherdContext"), \
              patch("loom_tools.shepherd.cli.find_repo_root", return_value=Path("/fake/repo")), \
              patch("loom_tools.shepherd.cli._auto_navigate_out_of_worktree"), \
-             patch("loom_tools.shepherd.cli._cleanup_labels_on_failure") as mock_cleanup:
+             patch("loom_tools.shepherd.cli._cleanup_labels_on_failure") as mock_cleanup, \
+             patch("loom_tools.claim.claim_issue", return_value=0), \
+             patch("loom_tools.claim.release_claim"):
             result = main(["42"])
             assert result == ShepherdExitCode.SUCCESS
             mock_cleanup.assert_not_called()
@@ -3187,8 +3349,109 @@ class TestMainCleanupIntegration:
              patch("loom_tools.shepherd.cli.ShepherdContext") as MockCtx, \
              patch("loom_tools.shepherd.cli.find_repo_root", return_value=Path("/fake/repo")), \
              patch("loom_tools.shepherd.cli._auto_navigate_out_of_worktree"), \
-             patch("loom_tools.shepherd.cli._cleanup_labels_on_failure") as mock_cleanup:
+             patch("loom_tools.shepherd.cli._cleanup_labels_on_failure") as mock_cleanup, \
+             patch("loom_tools.claim.claim_issue", return_value=0), \
+             patch("loom_tools.claim.release_claim"):
             ctx = MockCtx.return_value
             with pytest.raises(RuntimeError, match="MCP crash"):
                 main(["42"])
             mock_cleanup.assert_called_once_with(ctx, ShepherdExitCode.NEEDS_INTERVENTION)
+
+
+class TestRebasePhaseIntegration:
+    """Test that the rebase phase is called at the right position in orchestration."""
+
+    @patch("loom_tools.shepherd.cli.MergePhase")
+    @patch("loom_tools.shepherd.cli.RebasePhase")
+    @patch("loom_tools.shepherd.cli.JudgePhase")
+    @patch("loom_tools.shepherd.cli.BuilderPhase")
+    @patch("loom_tools.shepherd.cli.ApprovalPhase")
+    @patch("loom_tools.shepherd.cli.CuratorPhase")
+    def test_rebase_runs_between_judge_and_merge(
+        self,
+        MockCurator: MagicMock,
+        MockApproval: MagicMock,
+        MockBuilder: MagicMock,
+        MockJudge: MagicMock,
+        MockRebase: MagicMock,
+        MockMerge: MagicMock,
+    ) -> None:
+        """Rebase phase should run after Judge approval and before Merge."""
+        call_order: list[str] = []
+
+        ctx = _make_ctx()
+
+        curator_inst = MockCurator.return_value
+        curator_inst.should_skip.return_value = (False, "")
+        curator_inst.run.side_effect = lambda c: (call_order.append("curator") or _success_result("curator"))
+
+        MockApproval.return_value.run.side_effect = lambda c: (call_order.append("approval") or _success_result("approval"))
+
+        builder_inst = MockBuilder.return_value
+        builder_inst.should_skip.return_value = (False, "")
+        builder_inst.run.side_effect = lambda c: (call_order.append("builder") or _success_result("builder"))
+
+        judge_inst = MockJudge.return_value
+        judge_inst.should_skip.return_value = (False, "")
+        judge_inst.run.side_effect = lambda c: (call_order.append("judge") or _success_result("judge", approved=True))
+
+        MockRebase.return_value.run.side_effect = lambda c: (
+            call_order.append("rebase")
+            or PhaseResult(status=PhaseStatus.SKIPPED, message="up to date", phase_name="rebase")
+        )
+
+        MockMerge.return_value.run.side_effect = lambda c: (call_order.append("merge") or _success_result("merge", merged=True))
+
+        result = orchestrate(ctx)
+        assert result == 0
+
+        # Verify rebase runs after judge and before merge
+        assert "rebase" in call_order
+        rebase_idx = call_order.index("rebase")
+        judge_idx = call_order.index("judge")
+        merge_idx = call_order.index("merge")
+        assert judge_idx < rebase_idx < merge_idx
+
+    @patch("loom_tools.shepherd.cli.MergePhase")
+    @patch("loom_tools.shepherd.cli.RebasePhase")
+    @patch("loom_tools.shepherd.cli.JudgePhase")
+    @patch("loom_tools.shepherd.cli.BuilderPhase")
+    @patch("loom_tools.shepherd.cli.ApprovalPhase")
+    @patch("loom_tools.shepherd.cli.CuratorPhase")
+    def test_rebase_failure_returns_needs_intervention(
+        self,
+        MockCurator: MagicMock,
+        MockApproval: MagicMock,
+        MockBuilder: MagicMock,
+        MockJudge: MagicMock,
+        MockRebase: MagicMock,
+        MockMerge: MagicMock,
+    ) -> None:
+        """When rebase fails, orchestration should return NEEDS_INTERVENTION."""
+        ctx = _make_ctx()
+
+        curator_inst = MockCurator.return_value
+        curator_inst.should_skip.return_value = (False, "")
+        curator_inst.run.return_value = _success_result("curator")
+
+        MockApproval.return_value.run.return_value = _success_result("approval")
+
+        builder_inst = MockBuilder.return_value
+        builder_inst.should_skip.return_value = (False, "")
+        builder_inst.run.return_value = _success_result("builder")
+
+        judge_inst = MockJudge.return_value
+        judge_inst.should_skip.return_value = (False, "")
+        judge_inst.run.return_value = _success_result("judge", approved=True)
+
+        MockRebase.return_value.run.return_value = PhaseResult(
+            status=PhaseStatus.FAILED,
+            message="rebase onto origin/main failed: conflicts",
+            phase_name="rebase",
+            data={"reason": "merge_conflict"},
+        )
+
+        result = orchestrate(ctx)
+        assert result == ShepherdExitCode.NEEDS_INTERVENTION
+        # Merge should NOT be called
+        MockMerge.return_value.run.assert_not_called()
