@@ -104,6 +104,7 @@ _BUILD_ARTIFACT_PATTERNS: list[str] = [
     "target/",
     ".loom-checkpoint",
     ".loom-in-use",
+    ".loom-interrupted-context.json",
     "pnpm-lock.yaml",
     ".venv",
 ]
@@ -2671,8 +2672,14 @@ class BuilderPhase:
             # No checkpoint → builder never started, not incomplete
             return False
 
-        # Remote branch exists but no PR — just needs PR creation
-        if diag.get("remote_branch_exists") and diag.get("pr_number") is None:
+        # Remote branch exists but no PR — only incomplete if there are
+        # commits to PR.  A remote branch with 0 commits ahead of main
+        # (e.g. branch pushed during worktree setup) has nothing to PR.
+        if (
+            diag.get("remote_branch_exists")
+            and diag.get("pr_number") is None
+            and commits_ahead > 0
+        ):
             return True
 
         # PR exists but missing the review label
@@ -2738,7 +2745,19 @@ class BuilderPhase:
             steps.append("push_branch")
 
         if diag.get("pr_number") is None:
-            if diag.get("remote_branch_exists") or "push_branch" in steps:
+            # Only create PR if there are (or will be) commits ahead of main.
+            # "push_branch" in steps means commits exist or will exist after
+            # stage_and_commit.  remote_branch_exists alone is not enough —
+            # the branch may have 0 commits ahead (e.g. pushed during worktree
+            # setup), and creating a PR with an empty diff is useless.
+            has_or_will_have_commits = (
+                "push_branch" in steps
+                or (
+                    diag.get("remote_branch_exists")
+                    and diag.get("commits_ahead", 0) > 0
+                )
+            )
+            if has_or_will_have_commits:
                 steps.append("create_pr")
         elif not diag.get("pr_has_review_label", False):
             steps.append("add_review_label")
@@ -2759,6 +2778,17 @@ class BuilderPhase:
         # Only handle purely mechanical steps directly
         mechanical_steps = {"push_branch", "add_review_label", "create_pr"}
         if not steps or not set(steps).issubset(mechanical_steps):
+            return False
+
+        # Safety guard: refuse to create a PR when there are 0 commits
+        # ahead of main.  A PR with an empty diff is useless and creates
+        # cleanup work.  This guards against edge cases where
+        # _diagnose_remaining_steps logic is bypassed.
+        if "create_pr" in steps and diag.get("commits_ahead", 0) == 0:
+            log_warning(
+                f"Direct completion: refusing to create PR for issue "
+                f"#{ctx.config.issue} with 0 commits ahead of main"
+            )
             return False
 
         log_info(

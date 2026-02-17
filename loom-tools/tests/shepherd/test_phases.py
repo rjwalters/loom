@@ -7162,8 +7162,21 @@ class TestBuilderDiagnoseRemainingSteps:
         steps = builder._diagnose_remaining_steps(diag, 42)
         assert steps == ["push_branch", "create_pr"]
 
-    def test_remote_exists_no_pr_needs_pr_only(self) -> None:
-        """Remote branch exists but no PR should need PR creation only."""
+    def test_remote_exists_no_pr_with_commits_needs_pr_only(self) -> None:
+        """Remote branch with commits but no PR should need PR creation only."""
+        builder = BuilderPhase()
+        diag = {
+            "has_uncommitted_changes": False,
+            "commits_ahead": 2,
+            "remote_branch_exists": True,
+            "pr_number": None,
+            "pr_has_review_label": False,
+        }
+        steps = builder._diagnose_remaining_steps(diag, 42)
+        assert steps == ["create_pr"]
+
+    def test_remote_exists_no_pr_zero_commits_no_steps(self) -> None:
+        """Remote branch with 0 commits and no PR should need no steps."""
         builder = BuilderPhase()
         diag = {
             "has_uncommitted_changes": False,
@@ -7173,7 +7186,7 @@ class TestBuilderDiagnoseRemainingSteps:
             "pr_has_review_label": False,
         }
         steps = builder._diagnose_remaining_steps(diag, 42)
-        assert steps == ["create_pr"]
+        assert steps == []
 
     def test_pr_exists_missing_label(self) -> None:
         """PR exists but missing label should need label only."""
@@ -7262,8 +7275,21 @@ class TestBuilderHasIncompleteWork:
         }
         assert builder._has_incomplete_work(diag) is True
 
-    def test_remote_exists_no_pr_returns_true(self) -> None:
-        """Remote branch pushed but no PR should be incomplete."""
+    def test_remote_exists_no_pr_with_commits_returns_true(self) -> None:
+        """Remote branch pushed with commits but no PR should be incomplete."""
+        builder = BuilderPhase()
+        diag = {
+            "worktree_exists": True,
+            "has_uncommitted_changes": False,
+            "commits_ahead": 2,
+            "remote_branch_exists": True,
+            "pr_number": None,
+            "pr_has_review_label": False,
+        }
+        assert builder._has_incomplete_work(diag) is True
+
+    def test_remote_exists_no_pr_zero_commits_returns_false(self) -> None:
+        """Remote branch with 0 commits and no PR is not incomplete work."""
         builder = BuilderPhase()
         diag = {
             "worktree_exists": True,
@@ -7273,7 +7299,7 @@ class TestBuilderHasIncompleteWork:
             "pr_number": None,
             "pr_has_review_label": False,
         }
-        assert builder._has_incomplete_work(diag) is True
+        assert builder._has_incomplete_work(diag) is False
 
     def test_pr_missing_label_returns_true(self) -> None:
         """PR exists but missing loom:review-requested should be incomplete."""
@@ -7667,13 +7693,13 @@ class TestBuilderDirectCompletion:
         result = builder._direct_completion(mock_context, diag)
         assert result is False
 
-    def test_create_pr_only(self, mock_context: MagicMock) -> None:
-        """Should create PR directly when remote exists but no PR."""
+    def test_create_pr_only_with_commits(self, mock_context: MagicMock) -> None:
+        """Should create PR directly when remote exists with commits but no PR."""
         builder = BuilderPhase()
         mock_context.repo_root = Path("/fake/repo")
         diag = {
             "has_uncommitted_changes": False,
-            "commits_ahead": 0,
+            "commits_ahead": 2,
             "remote_branch_exists": True,
             "pr_number": None,
             "pr_has_review_label": False,
@@ -7698,13 +7724,28 @@ class TestBuilderDirectCompletion:
         assert "--body" in call_args
         assert "Closes #42" in call_args
 
+    def test_create_pr_zero_commits_returns_false(self, mock_context: MagicMock) -> None:
+        """Should refuse to create PR when remote exists but 0 commits ahead."""
+        builder = BuilderPhase()
+        mock_context.repo_root = Path("/fake/repo")
+        diag = {
+            "has_uncommitted_changes": False,
+            "commits_ahead": 0,
+            "remote_branch_exists": True,
+            "pr_number": None,
+            "pr_has_review_label": False,
+            "branch": "feature/issue-42",
+        }
+        result = builder._direct_completion(mock_context, diag)
+        assert result is False
+
     def test_create_pr_failure_returns_false(self, mock_context: MagicMock) -> None:
         """Should return False when gh pr create fails."""
         builder = BuilderPhase()
         mock_context.repo_root = Path("/fake/repo")
         diag = {
             "has_uncommitted_changes": False,
-            "commits_ahead": 0,
+            "commits_ahead": 3,
             "remote_branch_exists": True,
             "pr_number": None,
             "pr_has_review_label": False,
@@ -7730,7 +7771,7 @@ class TestBuilderDirectCompletion:
         mock_context.config = ShepherdConfig(issue=99)
         diag = {
             "has_uncommitted_changes": False,
-            "commits_ahead": 0,
+            "commits_ahead": 1,
             "remote_branch_exists": True,
             "pr_number": None,
             "pr_has_review_label": False,
@@ -7755,7 +7796,7 @@ class TestBuilderDirectCompletion:
         mock_context.config = ShepherdConfig(issue=55)
         diag = {
             "has_uncommitted_changes": False,
-            "commits_ahead": 0,
+            "commits_ahead": 1,
             "remote_branch_exists": True,
             "pr_number": None,
             "pr_has_review_label": False,
