@@ -15,6 +15,7 @@ from loom_tools.shepherd.cli import (
     _auto_navigate_out_of_worktree,
     _check_main_repo_clean,
     _cleanup_labels_on_failure,
+    _cleanup_pr_labels_on_failure,
     _is_loom_runtime,
     _create_config,
     _format_diagnostics_for_comment,
@@ -3226,6 +3227,134 @@ class TestPostDoctorPush:
         mock_mark_failure.assert_not_called()
 
 
+class TestCleanupPrLabelsOnFailure:
+    """Test _cleanup_pr_labels_on_failure helper."""
+
+    def _make_cleanup_ctx(
+        self,
+        pr_number: int | None = None,
+        pr_labels: set[str] | None = None,
+    ) -> MagicMock:
+        """Create a mock ShepherdContext for PR cleanup tests."""
+        ctx = MagicMock()
+        ctx.config.issue = 42
+        ctx.pr_number = pr_number
+        ctx.repo_root = Path("/fake/repo")
+        ctx.label_cache = MagicMock()
+        if pr_labels is not None:
+            ctx.label_cache.get_pr_labels.return_value = pr_labels
+        return ctx
+
+    @patch("loom_tools.shepherd.cli.transition_labels")
+    @patch("loom_tools.shepherd.cli.get_pr_for_issue", return_value=None)
+    def test_no_cleanup_when_no_pr(
+        self, mock_get_pr: MagicMock, mock_transition: MagicMock
+    ) -> None:
+        """Should do nothing when no PR exists for the issue."""
+        ctx = self._make_cleanup_ctx(pr_number=None)
+        _cleanup_pr_labels_on_failure(ctx)
+        mock_transition.assert_not_called()
+
+    @patch("loom_tools.shepherd.cli.transition_labels")
+    def test_removes_workflow_labels_from_pr(
+        self, mock_transition: MagicMock
+    ) -> None:
+        """Should remove stale workflow labels from the PR."""
+        ctx = self._make_cleanup_ctx(
+            pr_number=100,
+            pr_labels={
+                "loom:review-requested",
+                "loom:treating",
+                "loom:merge-conflict",
+            },
+        )
+        _cleanup_pr_labels_on_failure(ctx)
+
+        mock_transition.assert_called_once_with(
+            "pr",
+            100,
+            remove=["loom:review-requested", "loom:treating"],
+            repo_root=Path("/fake/repo"),
+        )
+
+    @patch("loom_tools.shepherd.cli.transition_labels")
+    def test_removes_all_workflow_labels(
+        self, mock_transition: MagicMock
+    ) -> None:
+        """Should remove all four workflow labels when all are present."""
+        ctx = self._make_cleanup_ctx(
+            pr_number=100,
+            pr_labels={
+                "loom:review-requested",
+                "loom:changes-requested",
+                "loom:treating",
+                "loom:reviewing",
+            },
+        )
+        _cleanup_pr_labels_on_failure(ctx)
+
+        mock_transition.assert_called_once_with(
+            "pr",
+            100,
+            remove=[
+                "loom:changes-requested",
+                "loom:review-requested",
+                "loom:reviewing",
+                "loom:treating",
+            ],
+            repo_root=Path("/fake/repo"),
+        )
+
+    @patch("loom_tools.shepherd.cli.transition_labels")
+    def test_keeps_factual_labels(
+        self, mock_transition: MagicMock
+    ) -> None:
+        """Should keep factual status labels like loom:merge-conflict."""
+        ctx = self._make_cleanup_ctx(
+            pr_number=100,
+            pr_labels={"loom:merge-conflict", "loom:ci-failure", "loom:pr"},
+        )
+        _cleanup_pr_labels_on_failure(ctx)
+
+        # No workflow labels to remove
+        mock_transition.assert_not_called()
+
+    @patch("loom_tools.shepherd.cli.transition_labels")
+    @patch("loom_tools.shepherd.cli.get_pr_for_issue", return_value=200)
+    def test_looks_up_pr_when_not_in_context(
+        self, mock_get_pr: MagicMock, mock_transition: MagicMock
+    ) -> None:
+        """Should look up PR from issue when ctx.pr_number is None."""
+        ctx = self._make_cleanup_ctx(
+            pr_number=None,
+            pr_labels={"loom:reviewing"},
+        )
+        # get_pr_for_issue returns 200, so we need to set up labels for PR 200
+        ctx.label_cache.get_pr_labels.return_value = {"loom:reviewing"}
+
+        _cleanup_pr_labels_on_failure(ctx)
+
+        mock_get_pr.assert_called_once_with(42, repo_root=Path("/fake/repo"))
+        mock_transition.assert_called_once_with(
+            "pr",
+            200,
+            remove=["loom:reviewing"],
+            repo_root=Path("/fake/repo"),
+        )
+
+    @patch("loom_tools.shepherd.cli.transition_labels")
+    def test_survives_api_failure(
+        self, mock_transition: MagicMock
+    ) -> None:
+        """Should not raise when GitHub API fails."""
+        ctx = self._make_cleanup_ctx(pr_number=100)
+        ctx.label_cache.get_pr_labels.side_effect = RuntimeError("API down")
+
+        # Should not raise
+        _cleanup_pr_labels_on_failure(ctx)
+        mock_transition.assert_not_called()
+
+
 class TestCleanupLabelsOnFailure:
     """Test _cleanup_labels_on_failure defense-in-depth handler."""
 
@@ -3236,6 +3365,7 @@ class TestCleanupLabelsOnFailure:
         """Create a mock ShepherdContext for cleanup tests."""
         ctx = MagicMock()
         ctx.config.issue = 42
+        ctx.pr_number = None
         ctx.repo_root = Path("/fake/repo")
         ctx.label_cache = MagicMock()
         if issue_labels is not None:
@@ -3254,9 +3384,10 @@ class TestCleanupLabelsOnFailure:
         _cleanup_labels_on_failure(ctx, ShepherdExitCode.SKIPPED)
         ctx.label_cache.get_issue_labels.assert_not_called()
 
+    @patch("loom_tools.shepherd.cli._cleanup_pr_labels_on_failure")
     @patch("loom_tools.shepherd.cli.transition_issue_labels")
     def test_reverts_building_to_issue_on_failure(
-        self, mock_transition: MagicMock
+        self, mock_transition: MagicMock, mock_pr_cleanup: MagicMock
     ) -> None:
         """Should revert loom:building → loom:issue when no failure label exists."""
         ctx = self._make_cleanup_ctx(
@@ -3270,10 +3401,12 @@ class TestCleanupLabelsOnFailure:
             remove=["loom:building"],
             repo_root=Path("/fake/repo"),
         )
+        mock_pr_cleanup.assert_called_once_with(ctx)
 
+    @patch("loom_tools.shepherd.cli._cleanup_pr_labels_on_failure")
     @patch("loom_tools.shepherd.cli.transition_issue_labels")
     def test_reverts_building_on_shutdown(
-        self, mock_transition: MagicMock
+        self, mock_transition: MagicMock, mock_pr_cleanup: MagicMock
     ) -> None:
         """Should revert loom:building → loom:issue on shutdown signal."""
         ctx = self._make_cleanup_ctx(
@@ -3288,9 +3421,10 @@ class TestCleanupLabelsOnFailure:
             repo_root=Path("/fake/repo"),
         )
 
+    @patch("loom_tools.shepherd.cli._cleanup_pr_labels_on_failure")
     @patch("loom_tools.shepherd.cli.transition_issue_labels")
     def test_no_revert_when_failure_label_present(
-        self, mock_transition: MagicMock
+        self, mock_transition: MagicMock, mock_pr_cleanup: MagicMock
     ) -> None:
         """Should not revert to loom:issue when a loom:failed:* label exists."""
         ctx = self._make_cleanup_ctx(
@@ -3301,9 +3435,10 @@ class TestCleanupLabelsOnFailure:
         # No transition needed - _mark_* already handled it
         mock_transition.assert_not_called()
 
+    @patch("loom_tools.shepherd.cli._cleanup_pr_labels_on_failure")
     @patch("loom_tools.shepherd.cli.transition_issue_labels")
     def test_removes_contradictory_labels_alongside_failure_label(
-        self, mock_transition: MagicMock
+        self, mock_transition: MagicMock, mock_pr_cleanup: MagicMock
     ) -> None:
         """Should remove loom:building when it coexists with a failure label."""
         ctx = self._make_cleanup_ctx(
@@ -3317,9 +3452,10 @@ class TestCleanupLabelsOnFailure:
             repo_root=Path("/fake/repo"),
         )
 
+    @patch("loom_tools.shepherd.cli._cleanup_pr_labels_on_failure")
     @patch("loom_tools.shepherd.cli.transition_issue_labels")
     def test_removes_multiple_contradictory_labels(
-        self, mock_transition: MagicMock
+        self, mock_transition: MagicMock, mock_pr_cleanup: MagicMock
     ) -> None:
         """Should remove both loom:building and loom:blocked if alongside failure label."""
         ctx = self._make_cleanup_ctx(
@@ -3338,9 +3474,10 @@ class TestCleanupLabelsOnFailure:
             repo_root=Path("/fake/repo"),
         )
 
+    @patch("loom_tools.shepherd.cli._cleanup_pr_labels_on_failure")
     @patch("loom_tools.shepherd.cli.transition_issue_labels")
     def test_no_action_when_no_building_label(
-        self, mock_transition: MagicMock
+        self, mock_transition: MagicMock, mock_pr_cleanup: MagicMock
     ) -> None:
         """Should do nothing when issue doesn't have loom:building."""
         ctx = self._make_cleanup_ctx(
@@ -3350,9 +3487,10 @@ class TestCleanupLabelsOnFailure:
 
         mock_transition.assert_not_called()
 
+    @patch("loom_tools.shepherd.cli._cleanup_pr_labels_on_failure")
     @patch("loom_tools.shepherd.cli.transition_issue_labels")
     def test_survives_api_failure(
-        self, mock_transition: MagicMock
+        self, mock_transition: MagicMock, mock_pr_cleanup: MagicMock
     ) -> None:
         """Should not raise when GitHub API is unreachable."""
         ctx = self._make_cleanup_ctx()
@@ -3363,9 +3501,10 @@ class TestCleanupLabelsOnFailure:
 
         mock_transition.assert_not_called()
 
+    @patch("loom_tools.shepherd.cli._cleanup_pr_labels_on_failure")
     @patch("loom_tools.shepherd.cli.transition_issue_labels")
     def test_survives_transition_failure(
-        self, mock_transition: MagicMock
+        self, mock_transition: MagicMock, mock_pr_cleanup: MagicMock
     ) -> None:
         """Should not raise when label transition fails."""
         ctx = self._make_cleanup_ctx(
@@ -3375,6 +3514,51 @@ class TestCleanupLabelsOnFailure:
 
         # Should not raise
         _cleanup_labels_on_failure(ctx, ShepherdExitCode.BUILDER_FAILED)
+
+    @patch("loom_tools.shepherd.cli._cleanup_pr_labels_on_failure")
+    @patch("loom_tools.shepherd.cli.transition_issue_labels")
+    def test_pr_cleanup_called_on_failure(
+        self, mock_transition: MagicMock, mock_pr_cleanup: MagicMock
+    ) -> None:
+        """Should call PR label cleanup on any failure."""
+        ctx = self._make_cleanup_ctx(
+            issue_labels={"loom:building", "loom:curated"}
+        )
+        _cleanup_labels_on_failure(ctx, ShepherdExitCode.BUILDER_FAILED)
+
+        mock_pr_cleanup.assert_called_once_with(ctx)
+
+    @patch("loom_tools.shepherd.cli._cleanup_pr_labels_on_failure")
+    @patch("loom_tools.shepherd.cli.transition_issue_labels")
+    def test_pr_cleanup_not_called_on_success(
+        self, mock_transition: MagicMock, mock_pr_cleanup: MagicMock
+    ) -> None:
+        """Should not call PR label cleanup on success."""
+        ctx = self._make_cleanup_ctx()
+        _cleanup_labels_on_failure(ctx, ShepherdExitCode.SUCCESS)
+
+        mock_pr_cleanup.assert_not_called()
+
+    @patch("loom_tools.shepherd.cli._cleanup_pr_labels_on_failure")
+    @patch("loom_tools.shepherd.cli.transition_issue_labels")
+    def test_survives_pr_cleanup_failure(
+        self, mock_transition: MagicMock, mock_pr_cleanup: MagicMock
+    ) -> None:
+        """Should continue with issue cleanup even if PR cleanup raises."""
+        ctx = self._make_cleanup_ctx(
+            issue_labels={"loom:building", "loom:curated"}
+        )
+        mock_pr_cleanup.side_effect = RuntimeError("PR cleanup failed")
+
+        # Should not raise, and should still clean up issue labels
+        _cleanup_labels_on_failure(ctx, ShepherdExitCode.BUILDER_FAILED)
+
+        mock_transition.assert_called_once_with(
+            42,
+            add=["loom:issue"],
+            remove=["loom:building"],
+            repo_root=Path("/fake/repo"),
+        )
 
 
 class TestMainCleanupIntegration:
