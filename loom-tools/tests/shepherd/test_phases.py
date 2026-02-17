@@ -9952,11 +9952,18 @@ class TestBuilderStageAndCommit:
         """Should stage meaningful files and create a commit."""
         builder = BuilderPhase()
         mock_context.worktree_path = tmp_path
+        mock_context.repo_root = tmp_path
         mock_context.config = ShepherdConfig(issue=42)
 
-        with patch(
-            "loom_tools.shepherd.phases.builder.subprocess.run"
-        ) as mock_run:
+        with (
+            patch(
+                "loom_tools.shepherd.phases.builder.subprocess.run"
+            ) as mock_run,
+            patch(
+                "loom_tools.shepherd.phases.builder.derive_commit_message",
+                return_value="fix: builder recovery creates generic commit messages",
+            ),
+        ):
             # First call: git status --porcelain
             status_result = MagicMock(
                 returncode=0, stdout=" M src/main.py\n M src/utils.py\n"
@@ -9976,11 +9983,11 @@ class TestBuilderStageAndCommit:
         assert add_args[:4] == ["git", "-C", str(tmp_path), "add"]
         assert "src/main.py" in add_args
         assert "src/utils.py" in add_args
-        # Verify commit message references the issue
+        # Verify commit was called with the derived message
         commit_call = mock_run.call_args_list[2]
         commit_args = commit_call[0][0]
         assert "commit" in commit_args
-        assert any("issue #42" in arg for arg in commit_args)
+        assert any("generic commit messages" in arg for arg in commit_args)
 
     def test_no_worktree_returns_false(self, mock_context: MagicMock) -> None:
         """Should return False when worktree path is not set."""
@@ -10045,11 +10052,18 @@ class TestBuilderStageAndCommit:
         """Should return False when git commit fails."""
         builder = BuilderPhase()
         mock_context.worktree_path = tmp_path
+        mock_context.repo_root = tmp_path
         mock_context.config = ShepherdConfig(issue=42)
 
-        with patch(
-            "loom_tools.shepherd.phases.builder.subprocess.run"
-        ) as mock_run:
+        with (
+            patch(
+                "loom_tools.shepherd.phases.builder.subprocess.run"
+            ) as mock_run,
+            patch(
+                "loom_tools.shepherd.phases.builder.derive_commit_message",
+                return_value="feat: some message",
+            ),
+        ):
             status_result = MagicMock(returncode=0, stdout=" M src/main.py\n")
             add_result = MagicMock(returncode=0, stderr="")
             commit_result = MagicMock(returncode=1, stderr="nothing to commit")

@@ -461,6 +461,62 @@ def force_push_branch(
         return False
 
 
+def derive_commit_message(
+    issue: int,
+    worktree: pathlib.Path | str,
+    repo_root: pathlib.Path | str | None = None,
+    staged_files: list[str] | None = None,
+) -> str:
+    """Derive a meaningful commit message for recovery commits.
+
+    Attempts to use the issue title to generate a conventional commit message
+    via :meth:`NamingConventions.pr_title`.  Falls back to a file-based
+    summary, then to a generic message.
+
+    Parameters
+    ----------
+    issue:
+        The GitHub issue number.
+    worktree:
+        Path to the worktree (used as cwd for ``gh`` if *repo_root* is None).
+    repo_root:
+        Repository root for running ``gh`` commands.
+    staged_files:
+        Optional list of file paths being committed (used for the fallback
+        message when the issue title is unavailable).
+    """
+    from loom_tools.common.paths import NamingConventions
+
+    try:
+        result = subprocess.run(
+            [
+                "gh", "issue", "view", str(issue),
+                "--json", "title", "--jq", ".title",
+            ],
+            cwd=repo_root or worktree,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=15,
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            return NamingConventions.pr_title(result.stdout.strip(), issue)
+    except Exception:
+        pass
+
+    if staged_files:
+        names = [pathlib.PurePosixPath(f).name for f in staged_files[:5]]
+        if len(staged_files) <= 3:
+            files_desc = ", ".join(names)
+        else:
+            files_desc = (
+                f"{', '.join(names[:3])} and {len(staged_files) - 3} more"
+            )
+        return f"feat: update {files_desc} for issue #{issue}"
+
+    return f"feat: implement changes for issue #{issue}"
+
+
 def get_commits_ahead_behind(
     base: str = "origin/main",
     cwd: pathlib.Path | str | None = None,
