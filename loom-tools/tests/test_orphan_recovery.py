@@ -18,6 +18,7 @@ from loom_tools.orphan_recovery import (
     OrphanRecoveryResult,
     RecoveryEntry,
     _check_task_exists,
+    _cleanup_stale_worktree,
     _get_heartbeat_stale_threshold,
     _is_valid_task_id,
     check_daemon_state_tasks,
@@ -847,6 +848,285 @@ class TestMainCli:
         ):
             exit_code = main(["--recover"])
         assert exit_code == 0
+
+
+class TestCleanupStaleWorktree:
+    """Tests for _cleanup_stale_worktree function."""
+
+    def test_no_worktree_returns_false(self, tmp_path: pathlib.Path) -> None:
+        result = _cleanup_stale_worktree(tmp_path, 42)
+        assert result is False
+
+    def test_stale_worktree_cleaned_up(self, tmp_path: pathlib.Path) -> None:
+        """Worktree with 0 commits ahead and no changes should be cleaned."""
+        result = OrphanRecoveryResult(recover_mode=True)
+
+        with patch("loom_tools.orphan_recovery.subprocess.run") as mock_run:
+            # Simulate: worktree exists, 0 commits ahead, no changes, branch name
+            worktree_path = tmp_path / ".loom" / "worktrees" / "issue-42"
+            worktree_path.mkdir(parents=True)
+
+            def side_effect(cmd, **kwargs):
+                from unittest.mock import MagicMock
+
+                m = MagicMock()
+                m.returncode = 0
+                if "log" in cmd:
+                    m.stdout = ""  # No commits ahead
+                elif "status" in cmd:
+                    m.stdout = ""  # No changes
+                elif "rev-parse" in cmd:
+                    m.stdout = "feature/issue-42\n"
+                elif "worktree" in cmd:
+                    m.stdout = ""
+                else:
+                    m.stdout = ""
+                return m
+
+            mock_run.side_effect = side_effect
+            cleaned = _cleanup_stale_worktree(tmp_path, 42)
+
+        assert cleaned is True
+
+    def test_worktree_with_commits_not_cleaned(self, tmp_path: pathlib.Path) -> None:
+        """Worktree with commits ahead of main should NOT be cleaned."""
+        with patch("loom_tools.orphan_recovery.subprocess.run") as mock_run:
+            worktree_path = tmp_path / ".loom" / "worktrees" / "issue-42"
+            worktree_path.mkdir(parents=True)
+
+            def side_effect(cmd, **kwargs):
+                from unittest.mock import MagicMock
+
+                m = MagicMock()
+                m.returncode = 0
+                if "log" in cmd:
+                    m.stdout = "abc1234 some commit\n"  # Has commits ahead
+                else:
+                    m.stdout = ""
+                return m
+
+            mock_run.side_effect = side_effect
+            cleaned = _cleanup_stale_worktree(tmp_path, 42)
+
+        assert cleaned is False
+
+    def test_worktree_with_meaningful_changes_not_cleaned(
+        self, tmp_path: pathlib.Path
+    ) -> None:
+        """Worktree with uncommitted source changes should NOT be cleaned."""
+        with patch("loom_tools.orphan_recovery.subprocess.run") as mock_run:
+            worktree_path = tmp_path / ".loom" / "worktrees" / "issue-42"
+            worktree_path.mkdir(parents=True)
+
+            def side_effect(cmd, **kwargs):
+                from unittest.mock import MagicMock
+
+                m = MagicMock()
+                m.returncode = 0
+                if "log" in cmd:
+                    m.stdout = ""  # No commits
+                elif "status" in cmd:
+                    m.stdout = " M src/main.py\n"  # Meaningful change
+                else:
+                    m.stdout = ""
+                return m
+
+            mock_run.side_effect = side_effect
+            cleaned = _cleanup_stale_worktree(tmp_path, 42)
+
+        assert cleaned is False
+
+    def test_worktree_with_only_build_artifacts_cleaned(
+        self, tmp_path: pathlib.Path
+    ) -> None:
+        """Worktree with only build artifact changes should be cleaned."""
+        with patch("loom_tools.orphan_recovery.subprocess.run") as mock_run:
+            worktree_path = tmp_path / ".loom" / "worktrees" / "issue-42"
+            worktree_path.mkdir(parents=True)
+
+            def side_effect(cmd, **kwargs):
+                from unittest.mock import MagicMock
+
+                m = MagicMock()
+                m.returncode = 0
+                if "log" in cmd:
+                    m.stdout = ""  # No commits
+                elif "status" in cmd:
+                    m.stdout = "?? node_modules/foo\n M Cargo.lock\n"
+                elif "rev-parse" in cmd:
+                    m.stdout = "feature/issue-42\n"
+                elif "worktree" in cmd:
+                    m.stdout = ""
+                else:
+                    m.stdout = ""
+                return m
+
+            mock_run.side_effect = side_effect
+            cleaned = _cleanup_stale_worktree(tmp_path, 42)
+
+        assert cleaned is True
+
+    def test_git_log_failure_returns_false(self, tmp_path: pathlib.Path) -> None:
+        """If git log fails, we can't determine status so don't clean."""
+        with patch("loom_tools.orphan_recovery.subprocess.run") as mock_run:
+            worktree_path = tmp_path / ".loom" / "worktrees" / "issue-42"
+            worktree_path.mkdir(parents=True)
+
+            def side_effect(cmd, **kwargs):
+                from unittest.mock import MagicMock
+
+                m = MagicMock()
+                if "log" in cmd:
+                    m.returncode = 128  # git error
+                    m.stdout = ""
+                else:
+                    m.returncode = 0
+                    m.stdout = ""
+                return m
+
+            mock_run.side_effect = side_effect
+            cleaned = _cleanup_stale_worktree(tmp_path, 42)
+
+        assert cleaned is False
+
+
+class TestRecoverIssueClaimsAndWorktree:
+    """Tests for claim-check and worktree-cleanup behavior in recover_issue."""
+
+    def test_recover_skipped_with_valid_claim(self, tmp_path: pathlib.Path) -> None:
+        """recover_issue should skip when a valid file claim exists."""
+        result = OrphanRecoveryResult(recover_mode=True)
+
+        with patch("loom_tools.orphan_recovery.has_valid_claim", return_value=True):
+            recover_issue(42, "test_reason", result, repo_root=tmp_path)
+
+        assert result.total_recovered == 0
+
+    def test_recover_proceeds_without_claim(self) -> None:
+        """recover_issue should proceed when no valid claim exists."""
+        result = OrphanRecoveryResult(recover_mode=True)
+
+        with patch(
+            "loom_tools.orphan_recovery.has_valid_claim", return_value=False
+        ), patch("loom_tools.orphan_recovery.gh_run") as mock_gh:
+            recover_issue(42, "test_reason", result, repo_root=pathlib.Path("/fake"))
+
+        assert mock_gh.call_count == 2  # label edit + comment
+        assert result.total_recovered == 1
+        assert result.recovered[0].action == "reset_issue_label"
+
+    def test_recover_cleans_stale_worktree(self, tmp_path: pathlib.Path) -> None:
+        """recover_issue should clean stale worktree and add recovery entry."""
+        result = OrphanRecoveryResult(recover_mode=True)
+
+        with patch(
+            "loom_tools.orphan_recovery.has_valid_claim", return_value=False
+        ), patch(
+            "loom_tools.orphan_recovery._cleanup_stale_worktree", return_value=True
+        ) as mock_cleanup, patch(
+            "loom_tools.orphan_recovery.gh_run"
+        ):
+            recover_issue(42, "test_reason", result, repo_root=tmp_path)
+
+        mock_cleanup.assert_called_once_with(tmp_path, 42)
+        # Should have cleanup_stale_worktree + reset_issue_label
+        actions = {r.action for r in result.recovered}
+        assert "cleanup_stale_worktree" in actions
+        assert "reset_issue_label" in actions
+
+    def test_recover_no_repo_root_skips_claim_and_worktree(self) -> None:
+        """When repo_root is None, skip claim check and worktree cleanup."""
+        result = OrphanRecoveryResult(recover_mode=True)
+
+        with patch("loom_tools.orphan_recovery.gh_run") as mock_gh:
+            recover_issue(42, "test_reason", result)
+
+        assert mock_gh.call_count == 2
+        assert result.total_recovered == 1
+        # No cleanup_stale_worktree entry
+        actions = {r.action for r in result.recovered}
+        assert "cleanup_stale_worktree" not in actions
+
+    def test_recover_comment_includes_worktree_cleanup(
+        self, tmp_path: pathlib.Path
+    ) -> None:
+        """When worktree is cleaned, the comment should mention it."""
+        result = OrphanRecoveryResult(recover_mode=True)
+
+        with patch(
+            "loom_tools.orphan_recovery.has_valid_claim", return_value=False
+        ), patch(
+            "loom_tools.orphan_recovery._cleanup_stale_worktree", return_value=True
+        ), patch(
+            "loom_tools.orphan_recovery.gh_run"
+        ) as mock_gh:
+            recover_issue(42, "test_reason", result, repo_root=tmp_path)
+
+        # The second gh_run call is the comment
+        comment_call = mock_gh.call_args_list[1]
+        comment_body = comment_call[0][0][-1]  # last arg is the body
+        assert "stale worktree" in comment_body.lower()
+
+
+class TestCheckUntrackedBuildingClaims:
+    """Tests for claim-check behavior in check_untracked_building."""
+
+    def test_untracked_with_valid_claim_skipped(self) -> None:
+        """Issue with valid file claim should not be flagged as orphaned."""
+        daemon_state = DaemonState()
+        building_issues = [
+            {"number": 42, "title": "Test issue", "labels": [], "state": "OPEN"}
+        ]
+        result = OrphanRecoveryResult()
+
+        with patch(
+            "loom_tools.orphan_recovery.gh_issue_list",
+            return_value=building_issues,
+        ), patch(
+            "loom_tools.orphan_recovery.has_valid_claim", return_value=True
+        ):
+            check_untracked_building(
+                daemon_state, [], result, repo_root=pathlib.Path("/fake")
+            )
+
+        assert result.total_orphaned == 0
+
+    def test_untracked_without_claim_still_orphaned(self) -> None:
+        """Issue without valid claim should still be flagged as orphaned."""
+        daemon_state = DaemonState()
+        building_issues = [
+            {"number": 42, "title": "Test issue", "labels": [], "state": "OPEN"}
+        ]
+        result = OrphanRecoveryResult()
+
+        with patch(
+            "loom_tools.orphan_recovery.gh_issue_list",
+            return_value=building_issues,
+        ), patch(
+            "loom_tools.orphan_recovery.has_valid_claim", return_value=False
+        ):
+            check_untracked_building(
+                daemon_state, [], result, repo_root=pathlib.Path("/fake")
+            )
+
+        assert result.total_orphaned == 1
+        assert result.orphaned[0].type == "untracked_building"
+
+    def test_untracked_no_repo_root_still_orphaned(self) -> None:
+        """Without repo_root, claim check is skipped and issue is orphaned."""
+        daemon_state = DaemonState()
+        building_issues = [
+            {"number": 42, "title": "Test issue", "labels": [], "state": "OPEN"}
+        ]
+        result = OrphanRecoveryResult()
+
+        with patch(
+            "loom_tools.orphan_recovery.gh_issue_list",
+            return_value=building_issues,
+        ):
+            check_untracked_building(daemon_state, [], result)
+
+        assert result.total_orphaned == 1
 
 
 class TestExitCodes:
