@@ -227,7 +227,7 @@ class TestMonitorConfig:
         assert config.pr_number is None
         assert config.idle_timeout == 60
         assert config.contract_interval == 90
-        assert config.min_idle_elapsed == 10
+        assert config.min_session_age == 10
         assert config.heartbeat_interval == 60
 
     def test_from_args_minimal(self) -> None:
@@ -248,7 +248,7 @@ class TestMonitorConfig:
             pr_number=100,
             idle_timeout=30,
             contract_interval=60,
-            min_idle_elapsed=5,
+            min_session_age=5,
         )
         assert config.name == "builder-issue-42"
         assert config.timeout == 1800
@@ -260,4 +260,4 @@ class TestMonitorConfig:
         assert config.pr_number == 100
         assert config.idle_timeout == 30
         assert config.contract_interval == 60
-        assert config.min_idle_elapsed == 5
+        assert config.min_session_age == 5

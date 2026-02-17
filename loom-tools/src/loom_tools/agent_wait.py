@@ -34,7 +34,7 @@ from loom_tools.common.tmux_session import (
 # Defaults matching agent-wait.sh
 DEFAULT_TIMEOUT = 3600
 DEFAULT_POLL_INTERVAL = 5
-DEFAULT_MIN_IDLE_ELAPSED = 10
+DEFAULT_MIN_SESSION_AGE = 10
 
 # Consecutive idle observations required before declaring completion
 IDLE_PROMPT_CONFIRM_COUNT = 2
@@ -47,7 +47,7 @@ class WaitConfig:
     name: str
     timeout: int = DEFAULT_TIMEOUT
     poll_interval: int = DEFAULT_POLL_INTERVAL
-    min_idle_elapsed: int = DEFAULT_MIN_IDLE_ELAPSED
+    min_session_age: int = DEFAULT_MIN_SESSION_AGE
     json_output: bool = False
 
 
@@ -313,11 +313,11 @@ def wait_for_agent(config: WaitConfig) -> WaitResult:
             # Even with --timeout 0, check the tmux session's age to avoid
             # false positives on freshly created/restarted sessions (issue #1792).
             session_age = get_session_age(session_name)
-            if session_age >= 0 and session_age < config.min_idle_elapsed:
+            if session_age >= 0 and session_age < config.min_session_age:
                 if not config.json_output:
                     log_info(
                         f"Session '{session_name}' is only {session_age}s old "
-                        f"(< {config.min_idle_elapsed}s) - skipping idle check"
+                        f"(< {config.min_session_age}s) - skipping idle check"
                     )
                 # Fall through to timeout check below
             elif check_idle_prompt(session_name):
@@ -332,7 +332,7 @@ def wait_for_agent(config: WaitConfig) -> WaitResult:
                     reason="idle_prompt",
                     elapsed=elapsed,
                 )
-        elif elapsed >= config.min_idle_elapsed:
+        elif elapsed >= config.min_session_age:
             if check_idle_prompt(session_name):
                 idle_prompt_count += 1
                 if idle_prompt_count >= IDLE_PROMPT_CONFIRM_COUNT:
@@ -386,10 +386,12 @@ def main() -> None:
         help=f"Time between checks (default: {DEFAULT_POLL_INTERVAL})",
     )
     parser.add_argument(
-        "--min-idle-elapsed",
+        "--min-session-age",
+        "--min-idle-elapsed",  # deprecated alias
         type=int,
-        default=DEFAULT_MIN_IDLE_ELAPSED,
-        help=f"Minimum seconds before idle prompt detection (default: {DEFAULT_MIN_IDLE_ELAPSED})",
+        default=DEFAULT_MIN_SESSION_AGE,
+        dest="min_session_age",
+        help=f"Minimum session age (seconds) before idle prompt detection activates (default: {DEFAULT_MIN_SESSION_AGE})",
     )
     parser.add_argument("--json", action="store_true", help="Output result as JSON")
 
@@ -399,7 +401,7 @@ def main() -> None:
         name=args.name,
         timeout=args.timeout,
         poll_interval=args.poll_interval,
-        min_idle_elapsed=args.min_idle_elapsed,
+        min_session_age=args.min_session_age,
         json_output=args.json,
     )
 

@@ -10,7 +10,7 @@ from unittest import mock
 import pytest
 
 from loom_tools.agent_wait import (
-    DEFAULT_MIN_IDLE_ELAPSED,
+    DEFAULT_MIN_SESSION_AGE,
     DEFAULT_POLL_INTERVAL,
     DEFAULT_TIMEOUT,
     IDLE_PROMPT_CONFIRM_COUNT,
@@ -35,7 +35,7 @@ class TestWaitConfig:
         assert config.name == "test-agent"
         assert config.timeout == DEFAULT_TIMEOUT
         assert config.poll_interval == DEFAULT_POLL_INTERVAL
-        assert config.min_idle_elapsed == DEFAULT_MIN_IDLE_ELAPSED
+        assert config.min_session_age == DEFAULT_MIN_SESSION_AGE
         assert config.json_output is False
 
     def test_custom_values(self) -> None:
@@ -43,13 +43,13 @@ class TestWaitConfig:
             name="builder-42",
             timeout=1800,
             poll_interval=10,
-            min_idle_elapsed=20,
+            min_session_age=20,
             json_output=True,
         )
         assert config.name == "builder-42"
         assert config.timeout == 1800
         assert config.poll_interval == 10
-        assert config.min_idle_elapsed == 20
+        assert config.min_session_age == 20
         assert config.json_output is True
 
 
@@ -411,7 +411,7 @@ class TestWaitForAgent:
         self, temp_repo: pathlib.Path
     ) -> None:
         """Non-blocking mode (timeout=0) with young session should skip idle check."""
-        config = WaitConfig(name="test-agent", timeout=0, min_idle_elapsed=10)
+        config = WaitConfig(name="test-agent", timeout=0, min_session_age=10)
 
         with mock.patch("loom_tools.agent_wait.find_repo_root", return_value=temp_repo):
             with mock.patch("loom_tools.agent_wait.session_exists", return_value=True):
@@ -424,7 +424,7 @@ class TestWaitForAgent:
                         with mock.patch(
                             "loom_tools.agent_wait.claude_is_running", return_value=True
                         ):
-                            # Session is only 2s old, below min_idle_elapsed=10
+                            # Session is only 2s old, below min_session_age=10
                             with mock.patch(
                                 "loom_tools.agent_wait.get_session_age", return_value=2
                             ):
@@ -441,7 +441,7 @@ class TestWaitForAgent:
         self, temp_repo: pathlib.Path
     ) -> None:
         """Non-blocking mode (timeout=0) with old enough session detects idle."""
-        config = WaitConfig(name="test-agent", timeout=0, min_idle_elapsed=10)
+        config = WaitConfig(name="test-agent", timeout=0, min_session_age=10)
 
         with mock.patch("loom_tools.agent_wait.find_repo_root", return_value=temp_repo):
             with mock.patch("loom_tools.agent_wait.session_exists", return_value=True):
@@ -478,7 +478,7 @@ class TestConstants:
         """Verify defaults match agent-wait.sh constants."""
         assert DEFAULT_TIMEOUT == 3600
         assert DEFAULT_POLL_INTERVAL == 5
-        assert DEFAULT_MIN_IDLE_ELAPSED == 10
+        assert DEFAULT_MIN_SESSION_AGE == 10
         assert IDLE_PROMPT_CONFIRM_COUNT == 2
 
     def test_processing_indicators_match(self) -> None:

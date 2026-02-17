@@ -936,10 +936,12 @@ def main() -> None:
         help="Seconds between proactive phase contract checks (default: 90)",
     )
     parser.add_argument(
-        "--min-idle-elapsed",
+        "--min-session-age",
+        "--min-idle-elapsed",  # deprecated alias
         type=int,
         default=10,
-        help="Override idle prompt detection threshold (default: 10)",
+        dest="min_session_age",
+        help="Minimum session age (seconds) before idle prompt detection activates (default: 10)",
     )
     parser.add_argument("--json", action="store_true", help="Output result as JSON")
 
@@ -956,7 +958,7 @@ def main() -> None:
         pr_number=args.pr,
         idle_timeout=args.idle_timeout,
         contract_interval=args.contract_interval,
-        min_idle_elapsed=args.min_idle_elapsed,
+        min_session_age=args.min_session_age,
     )
 
     result = asyncio.run(monitor_agent(config))
