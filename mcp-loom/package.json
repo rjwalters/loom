@@ -7,17 +7,18 @@
     "mcp-loom": "./dist/index.js"
   },
   "scripts": {
-    "build": "tsc",
-    "watch": "tsc --watch"
+    "build": "tsc --noEmit && rm -rf dist && node esbuild.config.js",
+    "build:bundle": "rm -rf dist && node esbuild.config.js",
+    "typecheck": "tsc --noEmit",
+    "watch": "tsc --watch --noEmit"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.26.0",
-    "fast-glob": "^3.3.2",
-    "ignore": "^6.0.2",
     "strip-ansi": "^7.1.2"
   },
   "devDependencies": {
     "@types/node": "^22.18.10",
+    "esbuild": "^0.27.3",
     "typescript": "^5.9.3"
   }
 }
