@@ -184,7 +184,8 @@ ${YELLOW}OPTIONS:${NC}
     --task-id <id>             Shepherd task ID for heartbeat emission during long waits
     --phase <phase>            Phase name (curator, builder, judge, doctor) for contract checking
     --max-idle <seconds>       Max seconds without progress before kill+retry (sets critical threshold and action=retry)
-    --min-idle-elapsed <secs>  Override idle prompt detection threshold for agent-wait.sh (default: 10)
+    --min-session-age <secs>   Minimum session age before idle prompt detection activates (default: 10)
+    --min-idle-elapsed <secs>  Deprecated alias for --min-session-age
     --worktree <path>          Worktree path for builder phase recovery and file-change detection
     --pr <N>                   PR number for judge/doctor phase validation
     --grace-period <seconds>   Deprecated (no-op). Agent is terminated immediately on completion detection.
@@ -851,7 +852,7 @@ main() {
     local phase=""
     local worktree=""
     local pr_number=""
-    local min_idle_elapsed=""
+    local min_session_age=""
     local json_output=false
 
     if [[ $# -lt 1 ]]; then
@@ -901,8 +902,13 @@ main() {
                 STUCK_ACTION="retry"
                 shift 2
                 ;;
+            --min-session-age)
+                min_session_age="$2"
+                shift 2
+                ;;
             --min-idle-elapsed)
-                min_idle_elapsed="$2"
+                # Deprecated alias for --min-session-age
+                min_session_age="$2"
                 shift 2
                 ;;
             --worktree)
@@ -955,8 +961,8 @@ main() {
     local wait_output
     wait_output=$(mktemp "${TMPDIR:-/tmp}/agent-wait-output.XXXXXX")
     local wait_cmd=("${SCRIPT_DIR}/agent-wait.sh" "$name" --timeout "$timeout" --poll-interval "$poll_interval" --json)
-    if [[ -n "$min_idle_elapsed" ]]; then
-        wait_cmd+=(--min-idle-elapsed "$min_idle_elapsed")
+    if [[ -n "$min_session_age" ]]; then
+        wait_cmd+=(--min-session-age "$min_session_age")
     fi
     "${wait_cmd[@]}" > "$wait_output" &
     local wait_pid=$!

@@ -6872,7 +6872,7 @@ class TestRunWorkerPhaseClaudeCodeEnv:
 
 
 class TestRunWorkerPhaseIdleThreshold:
-    """Test run_worker_phase min-idle-elapsed threshold configuration."""
+    """Test run_worker_phase min-session-age threshold configuration."""
 
     @pytest.fixture
     def mock_context(self, tmp_path: Path) -> MagicMock:
@@ -6934,11 +6934,11 @@ class TestRunWorkerPhaseIdleThreshold:
             )
 
         if expected_threshold:
-            assert "--min-idle-elapsed" in captured_wait_cmd
-            idx = captured_wait_cmd.index("--min-idle-elapsed")
+            assert "--min-session-age" in captured_wait_cmd
+            idx = captured_wait_cmd.index("--min-session-age")
             assert captured_wait_cmd[idx + 1] == expected_threshold
         else:
-            assert "--min-idle-elapsed" not in captured_wait_cmd
+            assert "--min-session-age" not in captured_wait_cmd
 
 
 class TestReadHeartbeats:

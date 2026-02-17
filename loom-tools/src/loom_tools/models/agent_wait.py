@@ -155,7 +155,7 @@ class MonitorConfig:
     pr_number: int | None = None
     idle_timeout: int = 60
     contract_interval: int = 90
-    min_idle_elapsed: int = 10
+    min_session_age: int = 10
     heartbeat_interval: int = 60
     stuck_config: StuckConfig = field(default_factory=StuckConfig)
 
@@ -172,7 +172,7 @@ class MonitorConfig:
         pr_number: int | None = None,
         idle_timeout: int = 60,
         contract_interval: int = 90,
-        min_idle_elapsed: int = 10,
+        min_session_age: int = 10,
     ) -> MonitorConfig:
         """Create config from CLI arguments."""
         return cls(
@@ -186,6 +186,6 @@ class MonitorConfig:
             pr_number=pr_number,
             idle_timeout=idle_timeout,
             contract_interval=contract_interval,
-            min_idle_elapsed=min_idle_elapsed,
+            min_session_age=min_session_age,
             stuck_config=StuckConfig.from_env(),
         )
