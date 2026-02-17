@@ -200,6 +200,75 @@ class TestCuratorPhase:
         skip, reason = curator.should_skip(mock_context)
         assert skip is False
 
+    @patch("loom_tools.shepherd.phases.curator.run_phase_with_retry", return_value=6)
+    def test_exit_code_6_returns_failed(
+        self, mock_retry: MagicMock, mock_context: MagicMock
+    ) -> None:
+        """Exit code 6 (instant-exit) should return FAILED, not fall through to validate."""
+        mock_context.check_shutdown.return_value = False
+        curator = CuratorPhase()
+        result = curator.run(mock_context)
+        assert result.status == PhaseStatus.FAILED
+        assert "instant-exit" in result.message
+
+    @patch("loom_tools.shepherd.phases.curator.run_phase_with_retry", return_value=7)
+    def test_exit_code_7_returns_failed(
+        self, mock_retry: MagicMock, mock_context: MagicMock
+    ) -> None:
+        """Exit code 7 (MCP failure) should return FAILED, not fall through to validate."""
+        mock_context.check_shutdown.return_value = False
+        curator = CuratorPhase()
+        result = curator.run(mock_context)
+        assert result.status == PhaseStatus.FAILED
+        assert "MCP failure" in result.message
+
+    @patch("loom_tools.shepherd.phases.curator.run_phase_with_retry", return_value=8)
+    def test_exit_code_8_returns_failed(
+        self, mock_retry: MagicMock, mock_context: MagicMock
+    ) -> None:
+        """Exit code 8 (planning stall) should return FAILED."""
+        mock_context.check_shutdown.return_value = False
+        curator = CuratorPhase()
+        result = curator.run(mock_context)
+        assert result.status == PhaseStatus.FAILED
+        assert "planning stall" in result.message
+
+    @patch("loom_tools.shepherd.phases.curator.run_phase_with_retry", return_value=9)
+    def test_exit_code_9_returns_failed(
+        self, mock_retry: MagicMock, mock_context: MagicMock
+    ) -> None:
+        """Exit code 9 (auth pre-flight failure) should return FAILED."""
+        mock_context.check_shutdown.return_value = False
+        curator = CuratorPhase()
+        result = curator.run(mock_context)
+        assert result.status == PhaseStatus.FAILED
+        assert "auth pre-flight" in result.message
+
+    @patch("loom_tools.shepherd.phases.curator.run_phase_with_retry", return_value=6)
+    def test_exit_code_6_does_not_call_validate(
+        self, mock_retry: MagicMock, mock_context: MagicMock
+    ) -> None:
+        """Exit code 6 must NOT fall through to validate (regression test for #2520)."""
+        mock_context.check_shutdown.return_value = False
+        curator = CuratorPhase()
+        with patch.object(curator, "validate") as mock_validate:
+            result = curator.run(mock_context)
+            mock_validate.assert_not_called()
+        assert result.status == PhaseStatus.FAILED
+
+    @patch("loom_tools.shepherd.phases.curator.remove_issue_label")
+    @patch("loom_tools.shepherd.phases.curator.run_phase_with_retry", return_value=0)
+    def test_exit_code_0_still_validates(
+        self, mock_retry: MagicMock, mock_remove: MagicMock, mock_context: MagicMock
+    ) -> None:
+        """Exit code 0 should still fall through to validate (happy path preserved)."""
+        mock_context.check_shutdown.return_value = False
+        curator = CuratorPhase()
+        with patch.object(curator, "validate", return_value=True) as mock_validate:
+            result = curator.run(mock_context)
+            mock_validate.assert_called_once_with(mock_context)
+        assert result.status == PhaseStatus.SUCCESS
+
 
 class TestApprovalPhase:
     """Test ApprovalPhase."""

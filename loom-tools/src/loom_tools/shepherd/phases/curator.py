@@ -61,6 +61,18 @@ class CuratorPhase(BasePhase):
             # Curator stuck - not critical, can proceed
             return self.skipped("curator stuck after retry - skipping curation")
 
+        if exit_code == 6:
+            return self.failed("curator instant-exit after retries exhausted")
+
+        if exit_code == 7:
+            return self.failed("curator MCP failure after retries exhausted")
+
+        if exit_code == 8:
+            return self.failed("curator planning stall (not retryable)")
+
+        if exit_code == 9:
+            return self.failed("curator auth pre-flight failed (not retryable)")
+
         # Validate phase
         if not self.validate(ctx):
             return self.failed("curator phase validation failed")
