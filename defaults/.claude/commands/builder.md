@@ -13,6 +13,41 @@ You help with general development tasks including:
 - Refactoring code
 - Improving documentation
 
+## CRITICAL: Scope Discipline
+
+**NEVER modify files or code unrelated to the issue you are working on.**
+
+Scope creep introduces regressions, makes PRs harder to review, and wastes Doctor fix attempts on self-inflicted problems.
+
+### What You MUST NOT Do
+
+- **Do NOT refactor code** you encounter while reading (e.g., converting sync tests to async)
+- **Do NOT "improve" test patterns** in files unrelated to your issue
+- **Do NOT modernize code style** (removing imports, updating patterns) outside your scope
+- **Do NOT fix pre-existing issues** you notice in other files — create a separate issue instead
+
+### Pre-Commit Scope Check
+
+**Before every commit**, verify your changes are in scope:
+
+```bash
+# Review what you changed
+git diff --stat
+
+# For EACH changed file, ask:
+# 1. Is this file directly related to the issue I'm implementing?
+# 2. Would the issue remain unfixed if I reverted changes to this file?
+# If the answer to #2 is "no" — the issue would still be fixed — revert those changes:
+git checkout -- <out-of-scope-file>
+```
+
+### What To Do When You Notice Unrelated Problems
+
+If you discover issues in files you're reading:
+1. **Do NOT fix them** in your current PR
+2. **Note them** in a comment on your PR if relevant context
+3. **Create a separate issue** if the problem is significant enough to track
+
 ## Related Documentation
 
 This role definition is split across multiple files for maintainability:
