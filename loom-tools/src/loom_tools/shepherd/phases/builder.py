@@ -3431,6 +3431,28 @@ class BuilderPhase:
                     "branch",
                     NamingConventions.branch_name(ctx.config.issue),
                 )
+                # Guard against stale diagnostics: re-check if a PR already
+                # exists for this branch before creating a new one.
+                check_result = subprocess.run(
+                    [
+                        "gh", "pr", "list",
+                        "--head", branch,
+                        "--state", "open",
+                        "--json", "number",
+                        "--jq", ".[0].number // empty",
+                    ],
+                    cwd=ctx.repo_root,
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+                existing_pr = check_result.stdout.strip()
+                if existing_pr:
+                    log_info(
+                        f"Direct completion: PR #{existing_pr} already exists "
+                        f"for branch {branch}, skipping creation"
+                    )
+                    continue
                 result = subprocess.run(
                     [
                         "gh",
@@ -3530,15 +3552,21 @@ class BuilderPhase:
             )
 
         if "create_pr" in steps:
+            branch = diag.get("branch", f"feature/issue-{ctx.config.issue}")
+            instructions.append(
+                f"- First check if a PR already exists: "
+                f"gh pr list --head {branch} --state open"
+            )
             if attempt >= 2:
                 instructions.append(
-                    f"- Run: gh pr create --title {shlex.quote(ctx.issue_title or f'Issue #{ctx.config.issue}')} "
+                    f"- Only if no PR exists, run: gh pr create "
+                    f"--title {shlex.quote(ctx.issue_title or f'Issue #{ctx.config.issue}')} "
                     f"--label loom:review-requested "
                     f"--body 'Closes #{ctx.config.issue}'"
                 )
             else:
                 instructions.append(
-                    f"- Create PR with loom:review-requested label "
+                    f"- Only if no PR exists, create PR with loom:review-requested label "
                     f"using 'Closes #{ctx.config.issue}' in body"
                 )
 
