@@ -232,7 +232,7 @@ Please review PR #43
 If everything looks good, the Judge will:
 
 ```bash
-gh pr review 43 --approve --body "LGTM!
+gh pr comment 43 --body "LGTM!
 
 ✅ Code follows project conventions
 ✅ Tests pass
@@ -240,6 +240,8 @@ gh pr review 43 --approve --body "LGTM!
 
 gh pr edit 43 --remove-label "loom:review-requested" --add-label "loom:pr"
 ```
+
+> **Note**: Loom uses `gh pr comment` instead of `gh pr review --approve` because GitHub's API prevents self-review when the same account creates and reviews PRs. The `loom:pr` label is the coordination mechanism for approval.
 
 **Label transition:**
 ```

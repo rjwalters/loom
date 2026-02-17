@@ -177,8 +177,10 @@ gh pr create --label "loom:review-requested"
 
 1. Find PR: `gh pr list --label="loom:review-requested"`
 2. Review: `gh pr checkout 123`
-3. Approve: `gh pr review 123 --approve && gh pr edit 123 --remove-label "loom:review-requested" --add-label "loom:pr"`
-4. Or request changes: `gh pr review 123 --request-changes --body "Feedback"`
+3. Approve: `gh pr comment 123 --body "LGTM! Approved." && gh pr edit 123 --remove-label "loom:review-requested" --add-label "loom:pr"`
+4. Or request changes: `gh pr comment 123 --body "Changes needed: ..." && gh pr edit 123 --remove-label "loom:review-requested" --add-label "loom:changes-requested"`
+
+**Note**: Use `gh pr comment` instead of `gh pr review --approve` — GitHub's API prevents self-review, and Loom agents often create and review the same PR. Labels are the coordination mechanism.
 
 ### Curator Workflow
 

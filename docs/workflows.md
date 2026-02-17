@@ -152,12 +152,12 @@ gh pr list --label="loom:review-requested"
 gh pr checkout 50
 pnpm check:all
 
-# Approve (green → blue)
-gh pr review 50 --approve
+# Approve (green → blue) — use comment + label, not gh pr review (self-review restriction)
+gh pr comment 50 --body "LGTM! Approved."
 gh pr edit 50 --remove-label "loom:review-requested" --add-label "loom:pr"
 
 # Request changes (green → amber)
-gh pr review 50 --request-changes
+gh pr comment 50 --body "Changes needed: ..."
 gh pr edit 50 --remove-label "loom:review-requested" --add-label "loom:changes-requested"
 ```
 
