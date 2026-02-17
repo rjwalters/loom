@@ -15,12 +15,15 @@ from loom_tools.models.progress import ShepherdProgress
 from loom_tools.claim import claim_issue, has_valid_claim
 from loom_tools.orphan_recovery import (
     DEFAULT_HEARTBEAT_STALE_THRESHOLD,
+    DEFAULT_LABEL_GRACE_PERIOD,
     OrphanEntry,
     OrphanRecoveryResult,
     RecoveryEntry,
     _check_task_exists,
     _cleanup_stale_worktree,
+    _get_building_label_age,
     _get_heartbeat_stale_threshold,
+    _get_label_grace_period,
     _has_fresh_progress,
     _is_valid_task_id,
     check_daemon_state_tasks,
@@ -518,7 +521,9 @@ class TestRecoverIssue:
     def test_label_swap(self) -> None:
         result = OrphanRecoveryResult(recover_mode=True)
 
-        with patch("loom_tools.orphan_recovery.gh_run") as mock_gh:
+        with patch(
+            "loom_tools.orphan_recovery._get_building_label_age", return_value=None
+        ), patch("loom_tools.orphan_recovery.gh_run") as mock_gh:
             recover_issue(42, "test_reason", result)
 
         # Should have called gh_run twice: once for label edit, once for comment
@@ -559,7 +564,9 @@ class TestRecoverIssue:
 
         result = OrphanRecoveryResult(recover_mode=True)
 
-        with patch("loom_tools.orphan_recovery.gh_run") as mock_gh:
+        with patch(
+            "loom_tools.orphan_recovery._get_building_label_age", return_value=None
+        ), patch("loom_tools.orphan_recovery.gh_run") as mock_gh:
             recover_issue(42, "test_reason", result, repo_root=tmp_path)
 
         # gh_run should never be called — recovery is skipped
@@ -1069,6 +1076,8 @@ class TestRecoverIssueClaimsAndWorktree:
         result = OrphanRecoveryResult(recover_mode=True)
 
         with patch(
+            "loom_tools.orphan_recovery._get_building_label_age", return_value=None
+        ), patch(
             "loom_tools.orphan_recovery.has_valid_claim", return_value=False
         ), patch("loom_tools.orphan_recovery.gh_run") as mock_gh:
             recover_issue(42, "test_reason", result, repo_root=pathlib.Path("/fake"))
@@ -1100,7 +1109,9 @@ class TestRecoverIssueClaimsAndWorktree:
         """When repo_root is None, skip claim check and worktree cleanup."""
         result = OrphanRecoveryResult(recover_mode=True)
 
-        with patch("loom_tools.orphan_recovery.gh_run") as mock_gh:
+        with patch(
+            "loom_tools.orphan_recovery._get_building_label_age", return_value=None
+        ), patch("loom_tools.orphan_recovery.gh_run") as mock_gh:
             recover_issue(42, "test_reason", result)
 
         assert mock_gh.call_count == 2
@@ -1116,6 +1127,8 @@ class TestRecoverIssueClaimsAndWorktree:
         result = OrphanRecoveryResult(recover_mode=True)
 
         with patch(
+            "loom_tools.orphan_recovery._get_building_label_age", return_value=None
+        ), patch(
             "loom_tools.orphan_recovery.has_valid_claim", return_value=False
         ), patch(
             "loom_tools.orphan_recovery._cleanup_stale_worktree", return_value=True
@@ -1303,7 +1316,9 @@ class TestRecoverIssueProgressRecheck:
 
         result = OrphanRecoveryResult(recover_mode=True)
 
-        with patch("loom_tools.orphan_recovery.gh_run") as mock_gh:
+        with patch(
+            "loom_tools.orphan_recovery._get_building_label_age", return_value=None
+        ), patch("loom_tools.orphan_recovery.gh_run") as mock_gh:
             recover_issue(42, "no_daemon_entry", result, repo_root=tmp_path)
 
         # gh_run should NOT be called — recovery is skipped
@@ -1439,3 +1454,320 @@ class TestExitCodes:
             return_value=[],
         ):
             assert main([]) == 2
+
+
+class TestLabelGracePeriod:
+    """Tests for the label-age grace period in orphan recovery."""
+
+    def test_default_grace_period(self) -> None:
+        assert DEFAULT_LABEL_GRACE_PERIOD == 600
+
+    def test_get_label_grace_period_default(self) -> None:
+        with patch.dict("os.environ", {}, clear=True):
+            assert _get_label_grace_period() == DEFAULT_LABEL_GRACE_PERIOD
+
+    def test_get_label_grace_period_env_override(self) -> None:
+        with patch.dict("os.environ", {"LOOM_LABEL_GRACE_PERIOD": "900"}):
+            assert _get_label_grace_period() == 900
+
+    def test_get_label_grace_period_invalid_env(self) -> None:
+        with patch.dict("os.environ", {"LOOM_LABEL_GRACE_PERIOD": "invalid"}):
+            assert _get_label_grace_period() == DEFAULT_LABEL_GRACE_PERIOD
+
+
+class TestGetBuildingLabelAge:
+    """Tests for _get_building_label_age helper."""
+
+    def test_returns_age_for_recent_label(self) -> None:
+        """Should return age in seconds when API returns a valid timestamp."""
+        recent_ts = now_utc().strftime("%Y-%m-%dT%H:%M:%SZ")
+        mock_result = type("R", (), {"returncode": 0, "stdout": f'"{recent_ts}"\n'})()
+
+        with patch(
+            "loom_tools.orphan_recovery.get_repo_nwo", return_value="owner/repo"
+        ), patch(
+            "loom_tools.orphan_recovery.gh_run", return_value=mock_result
+        ):
+            age = _get_building_label_age(42)
+
+        assert age is not None
+        assert age < 10  # Should be very recent
+
+    def test_returns_large_age_for_old_label(self) -> None:
+        """Should return large age for label applied long ago."""
+        old_time = datetime.now(timezone.utc) - timedelta(hours=1)
+        old_ts = old_time.strftime("%Y-%m-%dT%H:%M:%SZ")
+        mock_result = type("R", (), {"returncode": 0, "stdout": f'"{old_ts}"\n'})()
+
+        with patch(
+            "loom_tools.orphan_recovery.get_repo_nwo", return_value="owner/repo"
+        ), patch(
+            "loom_tools.orphan_recovery.gh_run", return_value=mock_result
+        ):
+            age = _get_building_label_age(42)
+
+        assert age is not None
+        assert age >= 3500  # ~1 hour
+
+    def test_returns_none_on_api_failure(self) -> None:
+        """Should return None when the gh command fails."""
+        mock_result = type("R", (), {"returncode": 1, "stdout": ""})()
+
+        with patch(
+            "loom_tools.orphan_recovery.get_repo_nwo", return_value="owner/repo"
+        ), patch(
+            "loom_tools.orphan_recovery.gh_run", return_value=mock_result
+        ):
+            assert _get_building_label_age(42) is None
+
+    def test_returns_none_on_no_nwo(self) -> None:
+        """Should return None when repo NWO cannot be determined."""
+        with patch(
+            "loom_tools.orphan_recovery.get_repo_nwo", return_value=None
+        ):
+            assert _get_building_label_age(42) is None
+
+    def test_returns_none_on_null_response(self) -> None:
+        """Should return None when jq returns null (no label events)."""
+        mock_result = type("R", (), {"returncode": 0, "stdout": "null\n"})()
+
+        with patch(
+            "loom_tools.orphan_recovery.get_repo_nwo", return_value="owner/repo"
+        ), patch(
+            "loom_tools.orphan_recovery.gh_run", return_value=mock_result
+        ):
+            assert _get_building_label_age(42) is None
+
+    def test_returns_none_on_empty_response(self) -> None:
+        """Should return None when API returns empty string."""
+        mock_result = type("R", (), {"returncode": 0, "stdout": "\n"})()
+
+        with patch(
+            "loom_tools.orphan_recovery.get_repo_nwo", return_value="owner/repo"
+        ), patch(
+            "loom_tools.orphan_recovery.gh_run", return_value=mock_result
+        ):
+            assert _get_building_label_age(42) is None
+
+    def test_returns_none_on_exception(self) -> None:
+        """Should return None when gh_run raises an exception."""
+        with patch(
+            "loom_tools.orphan_recovery.get_repo_nwo", return_value="owner/repo"
+        ), patch(
+            "loom_tools.orphan_recovery.gh_run", side_effect=Exception("network error")
+        ):
+            assert _get_building_label_age(42) is None
+
+
+class TestCheckUntrackedBuildingGracePeriod:
+    """Tests for label-age grace period in check_untracked_building."""
+
+    def test_recently_labeled_issue_skipped(self) -> None:
+        """Issue with loom:building applied < grace period ago should be skipped."""
+        daemon_state = DaemonState()
+        building_issues = [
+            {"number": 42, "title": "Test issue", "labels": [], "state": "OPEN"}
+        ]
+        result = OrphanRecoveryResult()
+
+        with patch(
+            "loom_tools.orphan_recovery.gh_issue_list",
+            return_value=building_issues,
+        ), patch(
+            "loom_tools.orphan_recovery._get_building_label_age",
+            return_value=120,  # 2 minutes ago
+        ):
+            check_untracked_building(
+                daemon_state, [], result, label_grace_period=600
+            )
+
+        assert result.total_orphaned == 0
+
+    def test_old_labeled_issue_not_skipped(self) -> None:
+        """Issue with loom:building applied > grace period ago should NOT be skipped."""
+        daemon_state = DaemonState()
+        building_issues = [
+            {"number": 42, "title": "Test issue", "labels": [], "state": "OPEN"}
+        ]
+        result = OrphanRecoveryResult()
+
+        with patch(
+            "loom_tools.orphan_recovery.gh_issue_list",
+            return_value=building_issues,
+        ), patch(
+            "loom_tools.orphan_recovery._get_building_label_age",
+            return_value=700,  # 11+ minutes ago
+        ):
+            check_untracked_building(
+                daemon_state, [], result, label_grace_period=600
+            )
+
+        assert result.total_orphaned == 1
+        assert result.orphaned[0].type == "untracked_building"
+
+    def test_api_failure_falls_through(self) -> None:
+        """If label age cannot be determined, fall through to other checks."""
+        daemon_state = DaemonState()
+        building_issues = [
+            {"number": 42, "title": "Test issue", "labels": [], "state": "OPEN"}
+        ]
+        result = OrphanRecoveryResult()
+
+        with patch(
+            "loom_tools.orphan_recovery.gh_issue_list",
+            return_value=building_issues,
+        ), patch(
+            "loom_tools.orphan_recovery._get_building_label_age",
+            return_value=None,  # API failure
+        ):
+            check_untracked_building(
+                daemon_state, [], result, label_grace_period=600
+            )
+
+        # Should still be detected as orphaned (no other protections)
+        assert result.total_orphaned == 1
+
+    def test_grace_period_zero_disables_check(self) -> None:
+        """Setting grace period to 0 should disable the check entirely."""
+        daemon_state = DaemonState()
+        building_issues = [
+            {"number": 42, "title": "Test issue", "labels": [], "state": "OPEN"}
+        ]
+        result = OrphanRecoveryResult()
+
+        with patch(
+            "loom_tools.orphan_recovery.gh_issue_list",
+            return_value=building_issues,
+        ), patch(
+            "loom_tools.orphan_recovery._get_building_label_age",
+        ) as mock_age:
+            check_untracked_building(
+                daemon_state, [], result, label_grace_period=0
+            )
+
+        # _get_building_label_age should never be called when grace period is 0
+        mock_age.assert_not_called()
+        assert result.total_orphaned == 1
+
+    def test_grace_period_with_fresh_progress_still_protected(self) -> None:
+        """Even if grace period doesn't protect, fresh progress still does."""
+        daemon_state = DaemonState()
+        building_issues = [
+            {"number": 42, "title": "Test issue", "labels": [], "state": "OPEN"}
+        ]
+        fresh_hb = now_utc().strftime("%Y-%m-%dT%H:%M:%SZ")
+        progress = [
+            ShepherdProgress(
+                task_id="abc1234",
+                issue=42,
+                status="working",
+                last_heartbeat=fresh_hb,
+            )
+        ]
+        result = OrphanRecoveryResult()
+
+        with patch(
+            "loom_tools.orphan_recovery.gh_issue_list",
+            return_value=building_issues,
+        ), patch(
+            "loom_tools.orphan_recovery._get_building_label_age",
+            return_value=700,  # Past grace period
+        ):
+            check_untracked_building(
+                daemon_state, progress, result, label_grace_period=600
+            )
+
+        # Fresh progress should still protect it
+        assert result.total_orphaned == 0
+
+
+class TestRecoverIssueGracePeriod:
+    """Tests for label-age grace period in recover_issue."""
+
+    def test_recently_labeled_issue_not_recovered(self) -> None:
+        """recover_issue should skip when label was recently applied."""
+        result = OrphanRecoveryResult(recover_mode=True)
+
+        with patch(
+            "loom_tools.orphan_recovery._get_building_label_age",
+            return_value=120,  # 2 minutes ago
+        ), patch(
+            "loom_tools.orphan_recovery.gh_run",
+        ) as mock_gh:
+            recover_issue(
+                42, "test_reason", result, label_grace_period=600
+            )
+
+        mock_gh.assert_not_called()
+        assert result.total_recovered == 0
+
+    def test_old_labeled_issue_recovered(self) -> None:
+        """recover_issue should proceed when label is old enough."""
+        result = OrphanRecoveryResult(recover_mode=True)
+
+        with patch(
+            "loom_tools.orphan_recovery._get_building_label_age",
+            return_value=700,  # Past grace period
+        ), patch(
+            "loom_tools.orphan_recovery.gh_run",
+        ):
+            recover_issue(
+                42, "test_reason", result, label_grace_period=600
+            )
+
+        assert result.total_recovered == 1
+        assert result.recovered[0].action == "reset_issue_label"
+
+    def test_api_failure_allows_recovery(self) -> None:
+        """If label age cannot be determined, recovery should proceed."""
+        result = OrphanRecoveryResult(recover_mode=True)
+
+        with patch(
+            "loom_tools.orphan_recovery._get_building_label_age",
+            return_value=None,  # API failure
+        ), patch(
+            "loom_tools.orphan_recovery.gh_run",
+        ):
+            recover_issue(
+                42, "test_reason", result, label_grace_period=600
+            )
+
+        assert result.total_recovered == 1
+
+    def test_grace_period_zero_disables_check(self) -> None:
+        """Setting grace period to 0 disables the label age check."""
+        result = OrphanRecoveryResult(recover_mode=True)
+
+        with patch(
+            "loom_tools.orphan_recovery._get_building_label_age",
+        ) as mock_age, patch(
+            "loom_tools.orphan_recovery.gh_run",
+        ):
+            recover_issue(
+                42, "test_reason", result, label_grace_period=0
+            )
+
+        mock_age.assert_not_called()
+        assert result.total_recovered == 1
+
+    def test_claim_still_protects_when_label_is_old(self) -> None:
+        """Valid claim should still protect even if label is past grace period."""
+        result = OrphanRecoveryResult(recover_mode=True)
+
+        with patch(
+            "loom_tools.orphan_recovery._get_building_label_age",
+            return_value=700,  # Past grace period
+        ), patch(
+            "loom_tools.orphan_recovery.has_valid_claim",
+            return_value=True,
+        ), patch(
+            "loom_tools.orphan_recovery.gh_run",
+        ) as mock_gh:
+            recover_issue(
+                42, "test_reason", result,
+                repo_root=pathlib.Path("/fake"),
+                label_grace_period=600,
+            )
+
+        mock_gh.assert_not_called()
+        assert result.total_recovered == 0
