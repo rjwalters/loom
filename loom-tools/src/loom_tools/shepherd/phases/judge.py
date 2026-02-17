@@ -25,6 +25,23 @@ from loom_tools.shepherd.phases.base import (
 VALIDATION_MAX_RETRIES = 3
 VALIDATION_RETRY_DELAY_SECONDS = 2
 
+# Maximum number of times to retry the judge phase when a zero-work
+# session is detected (judge ran but produced no review output).
+# Zero-work sessions are NOT infrastructure failures and should not
+# trigger the infrastructure bypass — they are retried instead.
+# See issue #2679.
+ZERO_WORK_MAX_RETRIES = 1
+
+# Failure modes that indicate a zero-work session.  These are modes
+# where the judge ran (or attempted to run) but produced no review
+# work — no comments, no label changes, no meaningful output.
+ZERO_WORK_FAILURE_MODES = frozenset({
+    "agent_never_ran",
+    "agent_started_no_work",
+    "agent_started_no_meaningful_output",
+    "stale_log_from_previous_run",
+})
+
 # Minimum threshold (in characters) for meaningful agent output.
 # If the log file contains fewer non-ANSI characters than this after
 # stripping escape sequences, the agent likely didn't produce any
@@ -272,31 +289,25 @@ class JudgePhase:
                 )
             else:
                 # Gather diagnostics BEFORE marking failed, so we can
-                # attempt infrastructure bypass for zero-work sessions
-                # that exited cleanly (issue #2636).
+                # detect zero-work sessions and retry (issue #2679).
                 diag = self._gather_diagnostics(ctx, phase_start_time)
 
-                # Check if this looks like an infrastructure failure
-                # (ghost-like session that exited code 0 but did no work).
-                # The exit-code-based ghost/low-output detection in base.py
-                # is deliberately guarded by `wait_exit != 0` (issue #2540),
-                # so the bypass must be attempted here in the validation
-                # failure path.  Only trigger when session_duration_seconds
-                # is present (log exists and is current) AND shows a
-                # near-instant session.
-                duration = diag.get("session_duration_seconds")
+                # Check if this is a zero-work session (judge ran but
+                # produced no review output).  Zero-work sessions are
+                # NOT infrastructure failures — they should be retried,
+                # not bypassed (issue #2679).  Previously this path used
+                # _try_infrastructure_bypass which auto-approved PRs
+                # without any code review.
                 if (
                     ctx.config.is_force_mode
-                    and duration is not None
-                    and duration <= 1
+                    and self._is_zero_work_session(diag)
                 ):
-                    bypass_result = self._try_infrastructure_bypass(
-                        ctx,
-                        failure_reason="validation failed with zero-work session "
-                        "(0s duration, clean exit, no comments/labels)",
-                    )
-                    if bypass_result is not None:
-                        return bypass_result
+                    retry_result = self._retry_judge_for_zero_work(ctx, diag)
+                    if retry_result is not None:
+                        return retry_result
+                    # Retry also failed — fall through to mark blocked.
+                    # Do NOT use infrastructure bypass: this is a judge
+                    # failure, not an infrastructure issue.
 
                 # All internal recovery paths exhausted.  Do NOT post a
                 # failure comment here — the CLI-level retry loop may
@@ -609,6 +620,152 @@ class JudgePhase:
                 "bypass_reason": failure_reason,
             },
         )
+
+    def _is_zero_work_session(self, diag: dict[str, Any]) -> bool:
+        """Check if diagnostics indicate a zero-work judge session.
+
+        A zero-work session is one where the judge ran (or attempted to run)
+        but produced no review output — no comments, no label changes, no
+        meaningful review activity.  This is distinct from infrastructure
+        failures (MCP connectivity, label API errors) where external systems
+        prevented the judge from working.
+
+        See issue #2679 for the motivation: zero-work sessions were
+        incorrectly treated as infrastructure failures and bypassed,
+        allowing PRs to merge without any code review.
+
+        Returns:
+            True if the session produced no review work.
+        """
+        failure_mode = diag.get("failure_mode", "unknown")
+        if failure_mode in ZERO_WORK_FAILURE_MODES:
+            return True
+
+        # Near-instant sessions (0-1s) that produced no comments are also
+        # zero-work, regardless of how _gather_diagnostics classified them.
+        duration = diag.get("session_duration_seconds")
+        if duration is not None and duration <= 1:
+            if not diag.get("has_approval_comment") and not diag.get(
+                "has_rejection_comment"
+            ):
+                return True
+
+        return False
+
+    def _retry_judge_for_zero_work(
+        self, ctx: ShepherdContext, original_diag: dict[str, Any]
+    ) -> PhaseResult | None:
+        """Retry the judge phase once after a zero-work session (issue #2679).
+
+        When the judge runs but produces no review output, this is likely
+        a transient agent issue (not an infrastructure failure).  Re-run the
+        full judge pipeline (worker + validation) once before giving up.
+
+        Args:
+            ctx: Shepherd context.
+            original_diag: Diagnostics from the failed first attempt.
+
+        Returns:
+            PhaseResult on success (judge produced a review decision),
+            or None if the retry also failed.
+        """
+        assert ctx.pr_number is not None
+
+        failure_mode = original_diag.get("failure_mode", "unknown")
+        duration = original_diag.get("session_duration_seconds", "N/A")
+
+        log_warning(
+            f"[judge] Zero-work session detected "
+            f"(failure mode: {failure_mode}, duration: {duration}s). "
+            f"Retrying judge phase — this is NOT an infrastructure issue (issue #2679)."
+        )
+
+        ctx.report_milestone(
+            "judge_retry",
+            attempt=1,
+            max_retries=ZERO_WORK_MAX_RETRIES,
+            reason=f"zero-work session ({failure_mode})",
+        )
+
+        # Re-run the judge worker
+        phase_start_time = time.time()
+        exit_code = run_phase_with_retry(
+            ctx,
+            role="judge",
+            name=f"judge-issue-{ctx.config.issue}-zw-retry",
+            timeout=ctx.config.judge_timeout,
+            max_retries=ctx.config.stuck_max_retries,
+            phase="judge",
+            pr_number=ctx.pr_number,
+            args=str(ctx.pr_number),
+        )
+
+        if exit_code != 0:
+            log_warning(
+                f"[judge] Zero-work retry exited with code {exit_code}"
+            )
+            return None
+
+        # Validate the retry's output
+        ctx.label_cache.invalidate_pr(ctx.pr_number)
+        validated = False
+        for attempt in range(VALIDATION_MAX_RETRIES):
+            if self.validate(ctx, check_only=True):
+                validated = True
+                break
+            if attempt < VALIDATION_MAX_RETRIES - 1:
+                time.sleep(VALIDATION_RETRY_DELAY_SECONDS)
+                ctx.label_cache.invalidate_pr(ctx.pr_number)
+
+        if not validated:
+            # Check if fallback can recover
+            if self._try_fallback_approval(ctx):
+                return PhaseResult(
+                    status=PhaseStatus.SUCCESS,
+                    message=(
+                        f"[force-mode] Fallback approval applied to PR #{ctx.pr_number} "
+                        "(after zero-work retry)"
+                    ),
+                    phase_name="judge",
+                    data={"approved": True, "fallback_used": True, "zero_work_retried": True},
+                )
+            if self._try_fallback_changes_requested(ctx):
+                return PhaseResult(
+                    status=PhaseStatus.SUCCESS,
+                    message=(
+                        f"[force-mode] Fallback detected changes requested on PR #{ctx.pr_number} "
+                        "(after zero-work retry)"
+                    ),
+                    phase_name="judge",
+                    data={"changes_requested": True, "fallback_used": True, "zero_work_retried": True},
+                )
+
+            log_warning(
+                "[judge] Zero-work session persists after retry. "
+                "This is a judge failure, NOT an infrastructure issue — "
+                "marking blocked (issue #2679)."
+            )
+            return None
+
+        # Retry succeeded — check result labels
+        ctx.label_cache.invalidate_pr(ctx.pr_number)
+        if ctx.has_pr_label("loom:pr"):
+            return PhaseResult(
+                status=PhaseStatus.SUCCESS,
+                message=f"PR #{ctx.pr_number} approved by Judge (after zero-work retry)",
+                phase_name="judge",
+                data={"approved": True, "zero_work_retried": True},
+            )
+
+        if ctx.has_pr_label("loom:changes-requested"):
+            return PhaseResult(
+                status=PhaseStatus.SUCCESS,
+                message=f"Judge requested changes on PR #{ctx.pr_number} (after zero-work retry)",
+                phase_name="judge",
+                data={"changes_requested": True, "zero_work_retried": True},
+            )
+
+        return None
 
     def _has_approval_comment(self, ctx: ShepherdContext) -> bool:
         """Check PR comments for approval signals.
