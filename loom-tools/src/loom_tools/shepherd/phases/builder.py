@@ -1217,8 +1217,6 @@ class BuilderPhase:
         (caller should fall back to running the full pytest suite).
         """
         test_files: list[str] = []
-        root_str = str(python_root)
-        worktree_str = str(worktree)
 
         for filepath in changed_files:
             if not filepath.endswith(".py") and not filepath.endswith(".pyi"):
