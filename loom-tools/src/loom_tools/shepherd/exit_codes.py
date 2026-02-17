@@ -27,6 +27,7 @@ class ShepherdExitCode(IntEnum):
     | 6         | No changes needed             | Mark blocked, await human review  |
     | 7         | Transient API error           | Requeue issue, retry after backoff|
     | 9         | Systemic failure (auth/API)   | Requeue issue, do NOT retry       |
+    | 12        | Worktree escape (transient)   | Requeue issue, retry normally     |
 
     Using IntEnum allows these to be used directly as exit codes:
         return ShepherdExitCode.SUCCESS
@@ -75,6 +76,12 @@ class ShepherdExitCode(IntEnum):
     # See issue #2521.
     SYSTEMIC_FAILURE = 9
 
+    # Builder escaped its worktree and modified main instead.
+    # Transient issue — not indicative of a problem with the issue itself.
+    # Should not contribute to cross-issue systematic failure escalation.
+    # See issue #2752.
+    WORKTREE_ESCAPE = 12
+
 
 # Convenience mapping for code interpretation
 EXIT_CODE_DESCRIPTIONS = {
@@ -88,6 +95,7 @@ EXIT_CODE_DESCRIPTIONS = {
     ShepherdExitCode.TRANSIENT_ERROR: "Transient API error - safe to retry after backoff",
     ShepherdExitCode.BUDGET_EXHAUSTED: "Budget exhausted - issue may need decomposition",
     ShepherdExitCode.SYSTEMIC_FAILURE: "Systemic failure (auth/API) - do not retry immediately",
+    ShepherdExitCode.WORKTREE_ESCAPE: "Worktree escape - builder modified main instead of worktree",
 }
 
 

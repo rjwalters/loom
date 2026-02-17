@@ -51,6 +51,10 @@ class TestShepherdExitCode:
         """TRANSIENT_ERROR should be 7."""
         assert ShepherdExitCode.TRANSIENT_ERROR == 7
 
+    def test_worktree_escape_is_twelve(self) -> None:
+        """WORKTREE_ESCAPE should be 12."""
+        assert ShepherdExitCode.WORKTREE_ESCAPE == 12
+
     def test_can_use_as_int(self) -> None:
         """Exit codes should be usable as integers."""
         assert int(ShepherdExitCode.SUCCESS) == 0
@@ -111,6 +115,11 @@ class TestDescribeExitCode:
         """Should describe TRANSIENT_ERROR exit code."""
         desc = describe_exit_code(7)
         assert "transient" in desc.lower() or "retry" in desc.lower()
+
+    def test_describes_worktree_escape(self) -> None:
+        """Should describe WORKTREE_ESCAPE exit code."""
+        desc = describe_exit_code(12)
+        assert "worktree" in desc.lower() or "escape" in desc.lower()
 
     def test_unknown_code_returns_message(self) -> None:
         """Should return message for unknown exit codes."""

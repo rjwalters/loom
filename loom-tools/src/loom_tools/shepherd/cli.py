@@ -815,13 +815,14 @@ def orchestrate(ctx: ShepherdContext) -> int:
             if result.status in (PhaseStatus.FAILED, PhaseStatus.STUCK):
                 if not result.data.get("test_failure"):
                     log_error(result.message)
-                    # Auth/systemic failures get a distinct exit code so the
-                    # daemon knows not to retry immediately.  See issue #2521.
-                    exit_code = (
-                        ShepherdExitCode.SYSTEMIC_FAILURE
-                        if result.data.get("auth_failure")
-                        else ShepherdExitCode.BUILDER_FAILED
-                    )
+                    # Classify non-test failures with distinct exit codes so the
+                    # daemon can make smarter retry/escalate decisions.
+                    if result.data.get("worktree_escape"):
+                        exit_code = ShepherdExitCode.WORKTREE_ESCAPE
+                    elif result.data.get("auth_failure"):
+                        exit_code = ShepherdExitCode.SYSTEMIC_FAILURE
+                    else:
+                        exit_code = ShepherdExitCode.BUILDER_FAILED
                     return exit_code
                 # Test failure after exhausting retries is handled above
 
@@ -2046,6 +2047,9 @@ def _record_fallback_failure(ctx: ShepherdContext, exit_code: int) -> None:
     if exit_code == ShepherdExitCode.SYSTEMIC_FAILURE:
         error_class = "auth_infrastructure_failure"
         details = "Builder failed due to auth/API infrastructure issue (fallback cleanup)"
+    elif exit_code == ShepherdExitCode.WORKTREE_ESCAPE:
+        error_class = "builder_worktree_escape"
+        details = "Builder escaped worktree and modified main instead (fallback cleanup)"
     else:
         error_class = "builder_unknown_failure"
         details = f"Builder failed without specific handler (exit code {exit_code}, fallback cleanup)"
