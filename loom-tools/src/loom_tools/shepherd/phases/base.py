@@ -11,6 +11,7 @@ from enum import Enum
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol
 
+from loom_tools.claim import extend_claim
 from loom_tools.common.logging import log_warning, strip_ansi
 from loom_tools.common.paths import LoomPaths
 from loom_tools.common.state import read_json_file
@@ -34,6 +35,10 @@ _CLI_START_SENTINEL = "# CLAUDE_CLI_START"
 # Maximum retries for instant-exit detection, with exponential backoff.
 INSTANT_EXIT_MAX_RETRIES = 3
 INSTANT_EXIT_BACKOFF_SECONDS = [2, 4, 8]
+
+# How often (in seconds) to extend the file-based claim during worker polling.
+# The claim TTL is 2 hours; extending every 30 minutes provides ample margin.
+_CLAIM_EXTEND_INTERVAL = 1800
 
 # MCP failure detection patterns (case-insensitive).
 # These patterns appear in Claude CLI output when the MCP server fails
@@ -304,8 +309,9 @@ def _get_cli_output(stripped: str) -> str:
     when retrying).  Lines starting with ``# `` are always excluded as log
     headers.
 
-    If no sentinel is found, falls back to the previous behaviour of
-    considering all non-header lines.
+    If no sentinel is found the session is considered an instant exit
+    (the wrapper always writes the sentinel before invoking Claude, so
+    its absence means Claude never started).  See issue #2405.
 
     Args:
         stripped: ANSI-stripped log file content.
@@ -402,6 +408,13 @@ def _is_instant_exit(log_path: Path) -> bool:
     try:
         content = log_path.read_text()
         stripped = strip_ansi(content)
+
+        # If the sentinel is absent, Claude never started — treat as instant
+        # exit regardless of how much wrapper pre-flight output exists.
+        # See issue #2405.
+        if _CLI_START_SENTINEL not in stripped:
+            return True
+
         # Exclude log header lines and wrapper pre-flight output (everything
         # before the last ``# CLAUDE_CLI_START`` sentinel) so that only
         # actual Claude CLI output counts.  See issues #2135, #2381, #2401.
@@ -543,6 +556,8 @@ def run_worker_phase(
     # Poll progress file for heartbeat updates while waiting
     progress_file = ctx.progress_dir / f"shepherd-{ctx.config.task_id}.json"
     seen_heartbeats = 0
+    last_claim_extend = time.monotonic()
+    agent_id = f"shepherd-{ctx.config.task_id}"
 
     while wait_proc.poll() is None:
         heartbeats = _read_heartbeats(progress_file, phase=phase)
@@ -551,6 +566,14 @@ def run_worker_phase(
             if action:
                 _print_heartbeat(action)
         seen_heartbeats = len(heartbeats)
+
+        # Extend file-based claim periodically to prevent TTL expiry
+        # during long worker phases.  See issue #2405.
+        elapsed = time.monotonic() - last_claim_extend
+        if elapsed >= _CLAIM_EXTEND_INTERVAL:
+            extend_claim(ctx.repo_root, ctx.config.issue, agent_id)
+            last_claim_extend = time.monotonic()
+
         time.sleep(_HEARTBEAT_POLL_INTERVAL)
 
     # Check for any final heartbeats written before process exit
