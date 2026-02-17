@@ -155,7 +155,16 @@ class JudgePhase:
             )
 
         if exit_code == 6:
-            # Instant-exit: CLI sessions exited in <5s with no output after retries
+            # Instant-exit: CLI sessions exited in <5s with no output after retries.
+            # In force mode, try infrastructure bypass before marking blocked
+            # (issue #2402): if CI is green and PR is mergeable, auto-approve.
+            if ctx.config.is_force_mode:
+                bypass_result = self._try_infrastructure_bypass(
+                    ctx, failure_reason="instant-exit (CLI sessions exited with no output)"
+                )
+                if bypass_result is not None:
+                    return bypass_result
+
             self._mark_issue_blocked(
                 ctx, "judge_instant_exit", "agent instant-exit after retry"
             )
@@ -167,7 +176,16 @@ class JudgePhase:
             )
 
         if exit_code == 7:
-            # MCP server failure: Claude CLI exited because MCP server failed to init
+            # MCP server failure: Claude CLI exited because MCP server failed to init.
+            # In force mode, try infrastructure bypass before marking blocked
+            # (issue #2402): if CI is green and PR is mergeable, auto-approve.
+            if ctx.config.is_force_mode:
+                bypass_result = self._try_infrastructure_bypass(
+                    ctx, failure_reason="MCP server failure (MCP failed to initialize)"
+                )
+                if bypass_result is not None:
+                    return bypass_result
+
             self._mark_issue_blocked(
                 ctx, "judge_mcp_failure", "MCP server failure after retry"
             )
@@ -409,6 +427,103 @@ class JudgePhase:
 
         ctx.label_cache.invalidate_pr(ctx.pr_number)
         return True
+
+    def _try_infrastructure_bypass(
+        self, ctx: ShepherdContext, *, failure_reason: str
+    ) -> PhaseResult | None:
+        """Attempt infrastructure bypass in force mode (issue #2402).
+
+        When the judge phase fails due to infrastructure issues (instant-exit,
+        MCP failure) rather than code quality concerns, auto-approve the PR if:
+        - CI checks are all passing
+        - PR is in a mergeable state
+
+        This is a last-resort fallback for force-mode: the judge never ran at
+        all, so there are no comments to detect.  The only signals available
+        are CI and merge status.
+
+        Posts an audit trail comment clearly indicating this was NOT a code
+        review but an infrastructure bypass.
+
+        Args:
+            ctx: Shepherd context.
+            failure_reason: Human-readable description of the infrastructure
+                failure (for the audit trail comment).
+
+        Returns:
+            PhaseResult with SUCCESS if bypass was applied, None otherwise.
+        """
+        assert ctx.pr_number is not None
+
+        log_warning(
+            f"[force-mode] Judge infrastructure failure for PR #{ctx.pr_number}, "
+            "attempting infrastructure bypass (issue #2402)"
+        )
+
+        checks_ok = self._pr_checks_passing(ctx)
+        if not checks_ok:
+            log_info(
+                "[force-mode] Infrastructure bypass denied: "
+                "PR checks not passing or not mergeable"
+            )
+            return None
+
+        # Post audit trail comment before applying label
+        comment_body = (
+            "\u26a0\ufe0f **Auto-approved (infrastructure bypass)**\n\n"
+            f"The judge phase failed due to infrastructure issues: {failure_reason}.\n"
+            "Auto-approving because:\n"
+            "- \u2705 CI checks pass\n"
+            "- \u2705 Merge state is clean\n\n"
+            "This PR was **NOT** code-reviewed. "
+            "Consider manual review if the changes are significant.\n\n"
+            "<!-- loom:infrastructure-bypass -->"
+        )
+
+        subprocess.run(
+            ["gh", "pr", "comment", str(ctx.pr_number), "--body", comment_body],
+            cwd=ctx.repo_root,
+            capture_output=True,
+            check=False,
+        )
+
+        # Apply loom:pr label
+        result = subprocess.run(
+            [
+                "gh", "pr", "edit", str(ctx.pr_number),
+                "--add-label", "loom:pr",
+            ],
+            cwd=ctx.repo_root,
+            capture_output=True,
+            check=False,
+        )
+        if result.returncode != 0:
+            log_warning(
+                "[force-mode] Infrastructure bypass: "
+                "failed to apply loom:pr label"
+            )
+            return None
+
+        ctx.label_cache.invalidate_pr(ctx.pr_number)
+
+        log_warning(
+            f"[force-mode] Infrastructure bypass applied to PR #{ctx.pr_number} "
+            f"(reason: {failure_reason})"
+        )
+
+        return PhaseResult(
+            status=PhaseStatus.SUCCESS,
+            message=(
+                f"[force-mode] Infrastructure bypass: PR #{ctx.pr_number} "
+                f"auto-approved (judge failed: {failure_reason})"
+            ),
+            phase_name="judge",
+            data={
+                "approved": True,
+                "infrastructure_bypass": True,
+                "bypass_reason": failure_reason,
+            },
+        )
 
     def _has_approval_comment(self, ctx: ShepherdContext) -> bool:
         """Check PR comments for approval signals.

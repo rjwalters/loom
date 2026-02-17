@@ -4509,14 +4509,13 @@ class TestJudgePhase:
         # Validation should NOT be called — exit code 6 short-circuits
         mock_validate.assert_not_called()
 
-    def test_exit_code_6_in_force_mode_skips_fallback(
+    def test_exit_code_6_in_force_mode_tries_infrastructure_bypass(
         self, mock_context: MagicMock
     ) -> None:
-        """Exit code 6 in force mode should still mark blocked, not attempt fallback.
+        """Exit code 6 in force mode should attempt infrastructure bypass.
 
-        Instant-exit means no comments exist, so fallback detection would be
-        pointless. The handler should return immediately.
-        See issue #2139.
+        When bypass fails (checks not passing), falls back to marking blocked.
+        See issues #2139, #2402.
         """
         mock_context.pr_number = 100
         mock_context.check_shutdown.return_value = False
@@ -4528,6 +4527,9 @@ class TestJudgePhase:
                 "loom_tools.shepherd.phases.judge.run_phase_with_retry", return_value=6
             ),
             patch.object(judge, "_mark_issue_blocked") as mock_blocked,
+            patch.object(
+                judge, "_try_infrastructure_bypass", return_value=None
+            ) as mock_bypass,
             patch.object(judge, "_try_fallback_approval") as mock_fallback,
         ):
             result = judge.run(mock_context)
@@ -4535,7 +4537,9 @@ class TestJudgePhase:
         assert result.status == PhaseStatus.FAILED
         assert result.data == {"instant_exit": True}
         mock_blocked.assert_called_once()
-        # Fallback should NOT be attempted for instant-exit
+        # Infrastructure bypass should be attempted
+        mock_bypass.assert_called_once()
+        # Comment-based fallback should NOT be attempted (judge never ran)
         mock_fallback.assert_not_called()
 
 
@@ -5820,6 +5824,118 @@ class TestJudgeFallbackChangesRequested:
         assert result.data.get("changes_requested") is True
         assert result.data.get("fallback_used") is True
         assert "[force-mode] Fallback detected changes requested" in result.message
+
+
+class TestJudgeInfrastructureBypass:
+    """Test force-mode infrastructure bypass (issue #2402)."""
+
+    def _make_force_context(self, mock_context: MagicMock) -> MagicMock:
+        mock_context.config = ShepherdConfig(issue=42, mode=ExecutionMode.FORCE_MERGE)
+        mock_context.pr_number = 100
+        mock_context.check_shutdown.return_value = False
+        mock_context.repo_root = Path("/fake/repo")
+        return mock_context
+
+    def test_bypass_succeeds_exit_code_6(self, mock_context: MagicMock) -> None:
+        """Exit code 6 in force mode: bypass succeeds when CI passes."""
+        ctx = self._make_force_context(mock_context)
+        judge = JudgePhase()
+        with (
+            patch("loom_tools.shepherd.phases.judge.run_phase_with_retry", return_value=6),
+            patch.object(judge, "_pr_checks_passing", return_value=True),
+            patch("loom_tools.shepherd.phases.judge.subprocess.run", return_value=MagicMock(returncode=0)) as mock_sub,
+        ):
+            result = judge.run(ctx)
+        assert result.status == PhaseStatus.SUCCESS
+        assert result.data.get("approved") is True
+        assert result.data.get("infrastructure_bypass") is True
+        assert mock_sub.call_count == 2  # comment + label
+
+    def test_bypass_succeeds_exit_code_7(self, mock_context: MagicMock) -> None:
+        """Exit code 7 (MCP failure) in force mode: bypass succeeds when CI passes."""
+        ctx = self._make_force_context(mock_context)
+        judge = JudgePhase()
+        with (
+            patch("loom_tools.shepherd.phases.judge.run_phase_with_retry", return_value=7),
+            patch.object(judge, "_pr_checks_passing", return_value=True),
+            patch("loom_tools.shepherd.phases.judge.subprocess.run", return_value=MagicMock(returncode=0)),
+        ):
+            result = judge.run(ctx)
+        assert result.status == PhaseStatus.SUCCESS
+        assert result.data.get("infrastructure_bypass") is True
+        assert "MCP" in result.data.get("bypass_reason", "")
+
+    def test_bypass_denied_ci_fails(self, mock_context: MagicMock) -> None:
+        """Bypass denied when CI checks fail — falls back to marking blocked."""
+        ctx = self._make_force_context(mock_context)
+        judge = JudgePhase()
+        with (
+            patch("loom_tools.shepherd.phases.judge.run_phase_with_retry", return_value=6),
+            patch.object(judge, "_pr_checks_passing", return_value=False),
+            patch.object(judge, "_mark_issue_blocked") as mock_blocked,
+        ):
+            result = judge.run(ctx)
+        assert result.status == PhaseStatus.FAILED
+        assert result.data == {"instant_exit": True}
+        mock_blocked.assert_called_once()
+
+    def test_bypass_denied_label_apply_fails(self, mock_context: MagicMock) -> None:
+        """Bypass denied when gh pr edit fails — falls back to marking blocked."""
+        ctx = self._make_force_context(mock_context)
+        calls = []
+
+        def sub_side_effect(*a, **kw):
+            calls.append(1)
+            return MagicMock(returncode=0 if len(calls) == 1 else 1)
+
+        judge = JudgePhase()
+        with (
+            patch("loom_tools.shepherd.phases.judge.run_phase_with_retry", return_value=6),
+            patch.object(judge, "_pr_checks_passing", return_value=True),
+            patch("loom_tools.shepherd.phases.judge.subprocess.run", side_effect=sub_side_effect),
+            patch.object(judge, "_mark_issue_blocked") as mock_blocked,
+        ):
+            result = judge.run(ctx)
+        assert result.status == PhaseStatus.FAILED
+        mock_blocked.assert_called_once()
+
+    def test_bypass_not_attempted_default_mode(self, mock_context: MagicMock) -> None:
+        """Bypass not attempted outside force mode."""
+        mock_context.pr_number = 100
+        mock_context.check_shutdown.return_value = False
+        judge = JudgePhase()
+        with (
+            patch("loom_tools.shepherd.phases.judge.run_phase_with_retry", return_value=6),
+            patch.object(judge, "_mark_issue_blocked") as mock_blocked,
+            patch.object(judge, "_try_infrastructure_bypass") as mock_bypass,
+        ):
+            result = judge.run(mock_context)
+        assert result.status == PhaseStatus.FAILED
+        mock_blocked.assert_called_once()
+        mock_bypass.assert_not_called()
+
+    def test_bypass_audit_trail_comment(self, mock_context: MagicMock) -> None:
+        """Audit trail comment contains bypass marker and failure reason."""
+        ctx = self._make_force_context(mock_context)
+        judge = JudgePhase()
+        captured = {}
+
+        def capture_sub(*a, **kw):
+            cmd = a[0] if a else kw.get("args", [])
+            if "comment" in cmd:
+                captured["body"] = cmd[cmd.index("--body") + 1]
+            return MagicMock(returncode=0)
+
+        with (
+            patch("loom_tools.shepherd.phases.judge.run_phase_with_retry", return_value=6),
+            patch.object(judge, "_pr_checks_passing", return_value=True),
+            patch("loom_tools.shepherd.phases.judge.subprocess.run", side_effect=capture_sub),
+        ):
+            result = judge.run(ctx)
+        assert result.status == PhaseStatus.SUCCESS
+        assert "loom:infrastructure-bypass" in captured["body"]
+        assert "NOT" in captured["body"]
+        assert "instant-exit" in captured["body"]
 
 
 class TestMergePhase:
@@ -7459,6 +7575,7 @@ class TestBuilderIsNoChangesNeeded:
             "commits_ahead": 0,
             "remote_branch_exists": False,
             "pr_number": None,
+            "log_cli_output_length": 1000,
         }
         assert builder._is_no_changes_needed(diag) is True
 
@@ -7511,11 +7628,12 @@ class TestBuilderIsNoChangesNeeded:
         assert builder._is_no_changes_needed(diag) is False
 
     def test_handles_missing_keys_gracefully(self) -> None:
-        """Should handle missing keys by treating them as falsy."""
+        """Missing keys should not crash; missing output defaults to degraded."""
         builder = BuilderPhase()
-        # Only worktree_exists is provided, all others should default
+        # Only worktree_exists is provided, all others should default.
+        # Missing log_cli_output_length defaults to 0 → degraded session → False
         diag = {"worktree_exists": True}
-        assert builder._is_no_changes_needed(diag) is True
+        assert builder._is_no_changes_needed(diag) is False
 
 
 class TestBuilderStaleWorktreeRecovery:
