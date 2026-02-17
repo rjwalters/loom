@@ -80,29 +80,7 @@
   description: Enhanced by Curator, awaiting human approval
   color: "10B981"  # emerald-500
 
-# Phase Failure Labels (explicit failure states for debugging)
-- name: loom:failed:builder
-  description: Builder phase failed - no PR created
-  color: "DC2626"  # red-600
-
-- name: loom:failed:builder-tests
-  description: Builder test verification failed - branch pushed, no PR
-  color: "F97316"  # orange-500
-
-- name: loom:failed:judge
-  description: Judge phase failed - no review outcome
-  color: "DC2626"  # red-600
-
-- name: loom:failed:doctor
-  description: Doctor phase failed - could not address feedback
-  color: "DC2626"  # red-600
-
 # Status Labels
-# DEPRECATED: loom:needs-fix - use loom:failed:builder-tests instead
-- name: loom:needs-fix
-  description: "[DEPRECATED] Use loom:failed:builder-tests. Builder test verification failed."
-  color: "F97316"  # orange-500 - action needed but work is partially done
-
 - name: loom:blocked
   description: Implementation blocked, needs help or clarification
   color: "EF4444"  # red-500

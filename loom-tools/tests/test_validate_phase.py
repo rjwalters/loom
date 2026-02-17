@@ -459,7 +459,7 @@ class TestValidateBuilder:
         assert "reopen" in reopen_call[0][0]
         mock_phase_failed.assert_called_once()
         call_kwargs = mock_phase_failed.call_args[1]
-        assert call_kwargs.get("failure_label") == "loom:failed:builder"
+        assert call_kwargs.get("failure_label") == "loom:blocked"
 
     @patch("loom_tools.validate_phase._find_pr_for_issue")
     @patch("loom_tools.validate_phase._run_gh")
@@ -487,7 +487,7 @@ class TestValidateBuilder:
         mock_phase_failed.assert_called_once()
         # Verify failure_label is passed
         call_kwargs = mock_phase_failed.call_args[1]
-        assert call_kwargs.get("failure_label") == "loom:failed:builder"
+        assert call_kwargs.get("failure_label") == "loom:blocked"
 
     @patch("loom_tools.validate_phase._find_pr_for_issue")
     @patch("loom_tools.validate_phase._run_gh")
@@ -836,7 +836,7 @@ class TestValidateJudge:
         mock_phase_failed.assert_called_once()
         # Verify failure_label is passed
         call_kwargs = mock_phase_failed.call_args[1]
-        assert call_kwargs.get("failure_label") == "loom:failed:judge"
+        assert call_kwargs.get("failure_label") == "loom:blocked"
 
     @patch("loom_tools.validate_phase._run_gh")
     def test_neither_label_check_only(self, mock_gh: MagicMock, tmp_path: Path):
@@ -905,7 +905,7 @@ class TestValidateDoctor:
         mock_phase_failed.assert_called_once()
         # Verify failure_label is passed
         call_kwargs = mock_phase_failed.call_args[1]
-        assert call_kwargs.get("failure_label") == "loom:failed:doctor"
+        assert call_kwargs.get("failure_label") == "loom:blocked"
 
     @patch("loom_tools.validate_phase._run_gh")
     def test_missing_label_check_only(self, mock_gh: MagicMock, tmp_path: Path):

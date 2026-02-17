@@ -6,7 +6,7 @@ with both a programmatic API and a CLI (``loom-validate-phase``).
 Phase contract validators check that the expected artifacts exist after a
 shepherd phase completes (e.g. the builder created a PR with the correct
 label). When a contract is not satisfied, the validator marks the issue with
-an appropriate failure label (e.g., ``loom:failed:builder``) and provides
+the ``loom:blocked`` label and provides
 diagnostic information for manual intervention.
 
 Note: Auto-recovery was removed in favor of explicit failure visibility.
@@ -280,7 +280,7 @@ def _mark_phase_failed(
         reason: Human-readable failure reason
         repo_root: Repository root path
         diagnostics: Optional diagnostic markdown to append
-        failure_label: Specific failure label to apply (e.g., "loom:failed:builder")
+        failure_label: Specific failure label to apply (e.g., "loom:blocked")
                       If None, uses "loom:blocked" as fallback
         quiet: If True, skip label changes and diagnostic comment.
                Used during intermediate recovery attempts to avoid noisy
@@ -673,7 +673,7 @@ def validate_builder(
                 "Builder may have abandoned the issue instead of implementing it. "
                 "Issue has been automatically reopened.",
                 repo_root,
-                failure_label="loom:failed:builder",
+                failure_label="loom:blocked",
                 quiet=quiet,
             )
         return ValidationResult(
@@ -749,7 +749,7 @@ def validate_builder(
             f"Builder did not create a PR. Searched for: branch 'feature/issue-{issue}' "
             f"and 'Closes/Fixes/Resolves #{issue}' in PR body. No worktree available.",
             repo_root,
-            failure_label="loom:failed:builder",
+            failure_label="loom:blocked",
             quiet=quiet,
         )
         return ValidationResult("builder", issue, ValidationStatus.FAILED, msg)
@@ -761,7 +761,7 @@ def validate_builder(
             issue, "builder",
             "Builder did not create a PR and worktree path does not exist.",
             repo_root, diag.to_markdown(),
-            failure_label="loom:failed:builder",
+            failure_label="loom:blocked",
             quiet=quiet,
         )
         return ValidationResult(
@@ -779,7 +779,7 @@ def validate_builder(
             issue, "builder",
             "Builder did not create a PR and worktree is not a valid git directory.",
             repo_root,
-            failure_label="loom:failed:builder",
+            failure_label="loom:blocked",
             quiet=quiet,
         )
         return ValidationResult(
@@ -800,7 +800,7 @@ def validate_builder(
                 issue, "builder",
                 "Builder did not create a PR. Worktree had no uncommitted or unpushed changes.",
                 repo_root, diag.to_markdown(),
-                failure_label="loom:failed:builder",
+                failure_label="loom:blocked",
                 quiet=quiet,
             )
             return ValidationResult(
@@ -822,7 +822,7 @@ def validate_builder(
                 "Builder did not produce substantive changes. "
                 "Only marker/infrastructure files were found in the worktree.",
                 repo_root, diag.to_markdown(),
-                failure_label="loom:failed:builder",
+                failure_label="loom:blocked",
                 quiet=quiet,
             )
             return ValidationResult(
@@ -855,7 +855,7 @@ def validate_builder(
                     issue, "builder",
                     f"Recovery failed: git add failed: {r.stderr.strip()[:200]}",
                     repo_root, diag.to_markdown(),
-                    failure_label="loom:failed:builder",
+                    failure_label="loom:blocked",
                     quiet=quiet,
                 )
                 return ValidationResult(
@@ -874,7 +874,7 @@ def validate_builder(
                     issue, "builder",
                     f"Recovery failed: git commit failed: {r.stderr.strip()[:200]}",
                     repo_root, diag.to_markdown(),
-                    failure_label="loom:failed:builder",
+                    failure_label="loom:blocked",
                     quiet=quiet,
                 )
                 return ValidationResult(
@@ -893,7 +893,7 @@ def validate_builder(
             issue, "builder",
             f"Recovery failed: git push failed: {r.stderr.strip()[:200]}",
             repo_root, diag.to_markdown(),
-            failure_label="loom:failed:builder",
+            failure_label="loom:blocked",
             quiet=quiet,
         )
         return ValidationResult(
@@ -928,7 +928,7 @@ def validate_builder(
             issue, "builder",
             f"Recovery failed: gh pr create failed: {r.stderr.strip()[:200]}",
             repo_root, diag.to_markdown(),
-            failure_label="loom:failed:builder",
+            failure_label="loom:blocked",
             quiet=quiet,
         )
         return ValidationResult(
@@ -1012,7 +1012,7 @@ def validate_judge(
             issue, "judge",
             f"Judge phase did not produce a review decision on PR #{pr_number}.",
             repo_root,
-            failure_label="loom:failed:judge",
+            failure_label="loom:blocked",
             quiet=quiet,
         )
 
@@ -1055,7 +1055,7 @@ def validate_doctor(
             issue, "doctor",
             f"Doctor phase did not apply loom:review-requested to PR #{pr_number}.",
             repo_root,
-            failure_label="loom:failed:doctor",
+            failure_label="loom:blocked",
             quiet=quiet,
         )
 

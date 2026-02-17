@@ -311,7 +311,7 @@ class JudgePhase:
                     "judge",
                     f"Judge phase did not produce a review decision on PR #{ctx.pr_number}.",
                     ctx.repo_root,
-                    failure_label="loom:failed:judge",
+                    failure_label="loom:blocked",
                     quiet=True,
                 )
                 # Add context about loom:review-requested state (issue #1998)
