@@ -34,6 +34,9 @@ from loom_tools.shepherd.labels import (
     transition_issue_labels,
 )
 from loom_tools.shepherd.phases.base import (
+    DEGRADED_CRYSTALLIZING_THRESHOLD,
+    DEGRADED_SCAN_TAIL_LINES,
+    DEGRADED_SESSION_PATTERNS,
     MCP_FAILURE_PATTERNS,
     PhaseResult,
     PhaseStatus,
@@ -483,6 +486,30 @@ class BuilderPhase:
                 phase_name="builder",
                 data={
                     "auth_failure": True,
+                    "exit_code": exit_code,
+                    "log_file": str(self._get_log_path(ctx)),
+                },
+            )
+
+        if exit_code == 11:
+            # Degraded session: builder ran under rate limits and entered a
+            # Crystallizing loop, producing no useful work.  Not retryable —
+            # the rate limit won't resolve until it resets.  See issue #2631.
+            log_warning(
+                f"Degraded session for issue #{ctx.config.issue}: "
+                f"builder was rate-limited and entered Crystallizing loop"
+            )
+            self._cleanup_stale_worktree(ctx)
+            return PhaseResult(
+                status=PhaseStatus.FAILED,
+                message=(
+                    "builder session degraded: rate limit warnings and "
+                    "Crystallizing loop detected (not retryable until "
+                    "rate limit resets)"
+                ),
+                phase_name="builder",
+                data={
+                    "degraded_session": True,
                     "exit_code": exit_code,
                     "log_file": str(self._get_log_path(ctx)),
                 },
@@ -3055,16 +3082,38 @@ class BuilderPhase:
                 diag["log_has_mcp_failure_markers"] = bool(
                     _MCP_FAILURE_MARKER_RE.search(cli_output)
                 )
+                # Check for degradation patterns (rate limits + Crystallizing).
+                # See issue #2631.
+                cli_lines = cli_output.splitlines()
+                tail = cli_lines[-DEGRADED_SCAN_TAIL_LINES:]
+                diag["log_has_rate_limit_warning"] = bool(
+                    DEGRADED_SESSION_PATTERNS[0].search(cli_output)
+                )
+                diag["log_crystallizing_count"] = sum(
+                    1 for line in tail
+                    if DEGRADED_SESSION_PATTERNS[1].search(line)
+                )
+                diag["log_has_degradation_patterns"] = (
+                    diag["log_has_rate_limit_warning"]
+                    and diag["log_crystallizing_count"]
+                    >= DEGRADED_CRYSTALLIZING_THRESHOLD
+                )
             except OSError:
                 diag["log_tail"] = []
                 diag["log_cli_output_length"] = 0
                 diag["log_has_implementation_activity"] = False
                 diag["log_has_mcp_failure_markers"] = False
+                diag["log_has_rate_limit_warning"] = False
+                diag["log_crystallizing_count"] = 0
+                diag["log_has_degradation_patterns"] = False
         else:
             diag["log_tail"] = []
             diag["log_cli_output_length"] = 0
             diag["log_has_implementation_activity"] = False
             diag["log_has_mcp_failure_markers"] = False
+            diag["log_has_rate_limit_warning"] = False
+            diag["log_crystallizing_count"] = 0
+            diag["log_has_degradation_patterns"] = False
 
         # -- Low-output cause classification (set by run_phase_with_retry) ---
         # Surfaced here so the diagnostic summary is self-contained
