@@ -715,6 +715,7 @@ EXPECTED_FILES=(
   ".loom/config.json"
   ".loom/roles"
   ".loom/scripts/worktree.sh"
+  ".loom/scripts/lib/loom-tools.sh"
   ".loom/hooks/guard-destructive.sh"
   "CLAUDE.md"
   ".github/labels.yml"
