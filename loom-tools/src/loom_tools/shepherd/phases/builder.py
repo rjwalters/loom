@@ -2420,10 +2420,21 @@ class BuilderPhase:
                                 ctx, primary_output
                             )
 
-                log_warning(
-                    f"Baseline also fails but worktree introduces "
-                    f"{len(new_errors)} new error(s)"
-                )
+                # Prefer structured failure count for clearer messaging.
+                # _compare_test_results returned False (structured
+                # comparison failed), but one side may still parse.
+                worktree_fc = self._parse_failure_count(worktree_output)
+                if worktree_fc is not None:
+                    log_warning(
+                        f"Baseline also fails but worktree has "
+                        f"{worktree_fc} test failure(s) "
+                        f"({len(new_errors)} error-indicator lines in diff)"
+                    )
+                else:
+                    log_warning(
+                        f"Baseline also fails but worktree introduces "
+                        f"{len(new_errors)} new error-indicator line(s)"
+                    )
 
         # Tests failed with new errors (or no baseline available)
         summary = self._parse_test_summary(primary_output)

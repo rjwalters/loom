@@ -571,7 +571,7 @@ def orchestrate(ctx: ShepherdContext) -> int:
                     # Doctor made things worse — abort immediately
                     log_error(
                         f"Doctor introduced regressions "
-                        f"({prev_error_count} → {current_error_count} new errors), "
+                        f"({prev_error_count} → {current_error_count} test failure(s)), "
                         f"aborting test-fix loop"
                     )
                     phase_durations["Builder"] = builder_total_elapsed
