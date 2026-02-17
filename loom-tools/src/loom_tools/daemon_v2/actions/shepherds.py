@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import pathlib
 import subprocess
 from typing import TYPE_CHECKING, Any
 
@@ -11,6 +12,7 @@ from loom_tools.agent_spawn import (
     session_exists,
     spawn_agent,
 )
+from loom_tools.claim import claim_issue, release_claim
 from loom_tools.common.github import gh_run
 from loom_tools.common.issue_failures import record_failure
 from loom_tools.common.logging import log_error, log_info, log_success, log_warning
@@ -132,9 +134,21 @@ def _spawn_single_shepherd(
 
     timestamp = now_utc().strftime("%Y-%m-%dT%H:%M:%SZ")
 
-    # Claim the issue
+    # Acquire file-based lock BEFORE label swap to prevent concurrent shepherds.
+    # This is the primary mutual exclusion mechanism (atomic mkdir).
+    # TTL of 2 hours covers even long-running shepherd sessions.
+    lock_result = claim_issue(ctx.repo_root, issue_num, agent_id=shepherd_name, ttl=7200)
+    if lock_result != 0:
+        log_warning(
+            f"Issue #{issue_num} already has an active claim, skipping"
+        )
+        return False
+
+    # Claim the issue via label swap
     if not _claim_issue(issue_num):
         log_error(f"Failed to claim issue #{issue_num}")
+        # Release the file lock since label swap failed
+        release_claim(ctx.repo_root, issue_num, shepherd_name)
         return False
 
     log_info(f"Claimed issue #{issue_num} for {shepherd_name}")
@@ -172,8 +186,9 @@ def _spawn_single_shepherd(
 
     if result.status == "error":
         log_error(f"Failed to spawn {shepherd_name}: {result.error}")
-        # Unclaim the issue
+        # Unclaim the issue (label + file lock)
         _unclaim_issue(issue_num)
+        release_claim(ctx.repo_root, issue_num, shepherd_name)
         return False
 
     # Update daemon state
@@ -395,6 +410,10 @@ def force_reclaim_stale_shepherds(ctx: DaemonContext) -> int:
         entry.startup_warning_at = None
 
         log_info(f"STALL-L2: Reset {name} to idle")
+
+        # Release file-based claim lock
+        if issue is not None:
+            release_claim(ctx.repo_root, issue)
 
         # Revert issue label
         if issue is not None:

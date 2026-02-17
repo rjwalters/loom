@@ -1896,6 +1896,19 @@ def main(argv: list[str] | None = None) -> int:
     if not _check_main_repo_clean(repo_root, args.allow_dirty_main):
         return ShepherdExitCode.NEEDS_INTERVENTION
 
+    # Acquire file-based claim to prevent concurrent shepherds on the same issue.
+    # Uses atomic mkdir for mutual exclusion. TTL of 2 hours covers long runs.
+    from loom_tools.claim import claim_issue, release_claim
+
+    agent_id = f"shepherd-{config.task_id}"
+    claim_result = claim_issue(repo_root, config.issue, agent_id=agent_id, ttl=7200)
+    if claim_result != 0:
+        log_error(
+            f"Cannot start shepherd for issue #{config.issue}: "
+            f"another shepherd already holds the claim"
+        )
+        return ShepherdExitCode.NEEDS_INTERVENTION
+
     ctx = ShepherdContext(config=config)
 
     # Print header
@@ -1913,6 +1926,8 @@ def main(argv: list[str] | None = None) -> int:
         if exit_code not in (ShepherdExitCode.SUCCESS, ShepherdExitCode.SKIPPED):
             _cleanup_labels_on_failure(ctx, exit_code)
         _remove_worktree_marker(ctx)
+        # Always release the file-based claim on exit
+        release_claim(repo_root, config.issue, agent_id)
 
 
 if __name__ == "__main__":
