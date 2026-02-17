@@ -106,6 +106,30 @@ GHOST_RETRY_STRATEGIES: dict[str, tuple[int, list[int]]] = {
     "unknown": (GHOST_SESSION_MAX_RETRIES, list(GHOST_SESSION_BACKOFF_SECONDS)),
 }
 
+# Degraded session detection patterns.
+# These appear in Claude CLI output when the session is running under
+# rate limits or has entered a non-productive loop (e.g., "Crystallizing..."
+# repeated).  A degraded session produces no useful work and should be
+# aborted early rather than waiting for the full timeout.  See issue #2631.
+DEGRADED_SESSION_PATTERNS = [
+    # Rate limit warnings embedded in Claude CLI output
+    re.compile(r"You've used \d+% of your weekly limit", re.IGNORECASE),
+    # Crystallizing loop — Claude's extended thinking under resource pressure
+    re.compile(r"Crystallizing", re.IGNORECASE),
+]
+
+# Minimum number of "Crystallizing" occurrences in the last N lines
+# to classify a session as degraded (a single occurrence during normal
+# thinking is not concerning).
+DEGRADED_CRYSTALLIZING_THRESHOLD = 5
+
+# Minimum lines of log tail to scan for degraded session patterns.
+DEGRADED_SCAN_TAIL_LINES = 100
+
+# How often (in seconds) to scan the log for degradation during polling.
+# Must be a multiple of _HEARTBEAT_POLL_INTERVAL for alignment.
+_DEGRADED_SCAN_INTERVAL = 30
+
 # Systemic failure patterns detected in session logs.
 # These indicate infrastructure-level failures (auth timeout, API outage)
 # that will NOT resolve with retries.  When detected after a low-output
@@ -800,6 +824,101 @@ def _is_ghost_session(log_path: Path) -> bool:
         return False
 
 
+def _is_degraded_session(log_path: Path) -> bool:
+    """Check if a session log indicates a degraded session (rate limits, Crystallizing loops).
+
+    A degraded session is one where the builder ran but produced no useful work
+    because it was resource-constrained.  This manifests as:
+    - Rate limit warnings ("You've used 87% of your weekly limit")
+    - Repeated "Crystallizing..." output (Claude's extended thinking under pressure)
+
+    Degraded sessions are distinct from low-output sessions (which never started)
+    and stuck sessions (which started but stopped making progress).  A degraded
+    session actively produces output but the output is non-productive.
+
+    Detection requires BOTH:
+    1. A rate limit warning in the log, AND
+    2. Excessive "Crystallizing" repetitions (>= DEGRADED_CRYSTALLIZING_THRESHOLD)
+
+    This two-signal approach prevents false positives: a single rate limit warning
+    during an otherwise productive session is harmless, and brief "Crystallizing"
+    during normal thinking is expected.  The combination indicates the session has
+    entered a non-recoverable degraded state.  See issue #2631.
+
+    Args:
+        log_path: Path to the worker session log file.
+
+    Returns:
+        True if the session shows signs of degradation.
+    """
+    if not log_path.is_file():
+        return False
+
+    try:
+        content = log_path.read_text()
+        stripped = strip_ansi(content)
+        cli_output = _get_cli_output(stripped)
+        if not cli_output:
+            return False
+
+        # Signal 1: Rate limit warning present
+        has_rate_limit = bool(DEGRADED_SESSION_PATTERNS[0].search(cli_output))
+        if not has_rate_limit:
+            return False
+
+        # Signal 2: Excessive Crystallizing repetitions
+        lines = cli_output.splitlines()
+        tail = lines[-DEGRADED_SCAN_TAIL_LINES:]
+        crystallizing_count = sum(
+            1 for line in tail if DEGRADED_SESSION_PATTERNS[1].search(line)
+        )
+        return crystallizing_count >= DEGRADED_CRYSTALLIZING_THRESHOLD
+
+    except OSError:
+        return False
+
+
+def _scan_log_for_degradation(log_path: Path) -> bool:
+    """Quick scan of a live log file for degradation patterns.
+
+    This is a lighter-weight version of ``_is_degraded_session()`` designed
+    for in-flight polling during ``run_worker_phase()``.  It reads only the
+    tail of the file to minimize I/O overhead.
+
+    Returns True if the log shows both rate limit warnings and excessive
+    "Crystallizing" repetitions.  See issue #2631.
+    """
+    if not log_path.is_file():
+        return False
+
+    try:
+        # Read only the tail to minimize I/O during polling
+        with open(log_path, "rb") as f:
+            f.seek(0, 2)
+            file_size = f.tell()
+            # Read last ~10KB (enough for DEGRADED_SCAN_TAIL_LINES of output)
+            start_pos = max(0, file_size - 10_000)
+            f.seek(start_pos)
+            content = f.read().decode("utf-8", errors="replace")
+
+        stripped = strip_ansi(content)
+        lines = stripped.splitlines()
+        tail = lines[-DEGRADED_SCAN_TAIL_LINES:]
+        text = "\n".join(tail)
+
+        has_rate_limit = bool(DEGRADED_SESSION_PATTERNS[0].search(text))
+        if not has_rate_limit:
+            return False
+
+        crystallizing_count = sum(
+            1 for line in tail if DEGRADED_SESSION_PATTERNS[1].search(line)
+        )
+        return crystallizing_count >= DEGRADED_CRYSTALLIZING_THRESHOLD
+
+    except OSError:
+        return False
+
+
 def _classify_low_output_cause(log_path: Path) -> str:
     """Classify the root cause of a low-output session from the worker log.
 
@@ -933,6 +1052,7 @@ def run_worker_phase(
         - 8: Planning stall detected (stuck in planning checkpoint)
         - 9: Auth pre-flight failure (not retryable, see issue #2508)
         - 10: Ghost session detected (instant exit, no work — see issue #2604)
+        - 11: Degraded session detected (rate limits + Crystallizing loop, see issue #2631)
         - Other: Error
     """
     scripts_dir = ctx.scripts_dir
@@ -1054,6 +1174,11 @@ def run_worker_phase(
     # If it stays there beyond planning_timeout, terminate the worker.
     _planning_first_seen: float | None = None
 
+    # Degraded session detection state (issue #2631).
+    # Periodically scan the log for rate limit + Crystallizing patterns
+    # and abort early rather than waiting for the full timeout.
+    _last_degraded_scan: float = time.monotonic()
+
     while wait_proc.poll() is None:
         heartbeats = _read_heartbeats(progress_file, phase=phase)
         for hb in heartbeats[seen_heartbeats:]:
@@ -1098,6 +1223,35 @@ def run_worker_phase(
             else:
                 # Checkpoint advanced past planning (or doesn't exist yet)
                 _planning_first_seen = None
+
+        # In-flight degraded session detection (issue #2631).
+        # Periodically scan the log for rate limit + Crystallizing patterns.
+        # Abort early to avoid wasting the entire builder time budget on a
+        # session that will never produce useful output.
+        degraded_elapsed = time.monotonic() - _last_degraded_scan
+        if degraded_elapsed >= _DEGRADED_SCAN_INTERVAL:
+            _last_degraded_scan = time.monotonic()
+            degraded_log_path = LoomPaths(ctx.repo_root).worker_log_file(
+                role, ctx.config.issue
+            )
+            if _scan_log_for_degradation(degraded_log_path):
+                log_warning(
+                    f"Degraded session detected: {role} session '{name}' "
+                    f"shows rate limit warnings and Crystallizing loop, "
+                    f"terminating early (log: {degraded_log_path})"
+                )
+                wait_proc.terminate()
+                wait_proc.wait(timeout=30)
+                destroy_script = scripts_dir / "agent-destroy.sh"
+                if destroy_script.is_file():
+                    subprocess.run(
+                        [str(destroy_script), name, "--force"],
+                        cwd=ctx.repo_root,
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                        check=False,
+                    )
+                return 11  # Degraded session
 
         time.sleep(_HEARTBEAT_POLL_INTERVAL)
 
@@ -1161,6 +1315,20 @@ def run_worker_phase(
         )
         return 10
 
+    # Check for degraded session (exit code 11) — rate limits + Crystallizing.
+    # Degraded sessions produce output but it's non-productive garbage.
+    # This is NOT retryable: the underlying resource constraint (rate limits)
+    # will persist until the limit resets.  Check before MCP/low-output
+    # because degraded sessions may have substantial output volume.
+    # See issue #2631.
+    if _is_degraded_session(log_path):
+        log_warning(
+            f"Degraded session detected for {role} session '{name}': "
+            f"rate limit warnings and Crystallizing loop "
+            f"(exit code {wait_exit}, log: {log_path})"
+        )
+        return 11
+
     # Check for MCP failure (exit code 7) — more specific than low-output,
     # with different retry/backoff strategy.  See issues #2135, #2279.
     if wait_exit != 0 and _is_mcp_failure(log_path):
@@ -1206,6 +1374,8 @@ def run_phase_with_retry(
     times with longer backoff (MCP failures are often systemic).
     On exit code 8 (planning stall), returns immediately (not retryable).
     On exit code 9 (auth failure), returns immediately (not retryable).
+    On exit code 11 (degraded session), returns immediately (not retryable;
+    rate limits won't resolve with retries).  See issue #2631.
     On exit code 10 (ghost session), classifies the root cause from the
     worker log and uses a cause-specific retry strategy from
     ``GHOST_RETRY_STRATEGIES``.  Retries on a **separate** budget that does
@@ -1221,7 +1391,8 @@ def run_phase_with_retry(
         Exit code: 0=success, 3=shutdown, 4=stuck after retries,
                    6=low-output after retries, 7=MCP failure after retries,
                    8=planning stall, 9=auth failure,
-                   10=ghost session after retries, other=error
+                   10=ghost session after retries,
+                   11=degraded session, other=error
     """
     stuck_retries = 0
     low_output_retries = 0
@@ -1256,6 +1427,14 @@ def run_phase_with_retry(
         # attempt with zero chance of success.  See issue #2508.
         if exit_code == 9:
             return 9
+
+        # --- Degraded session (exit code 11) ---
+        # Not retryable: the builder session was degraded by rate limits
+        # and entered a Crystallizing loop.  The underlying rate limit
+        # won't resolve with retries — the daemon should back off or
+        # pick a different issue.  See issue #2631.
+        if exit_code == 11:
+            return 11
 
         # --- Pre-retry approval check (judge phase only) ---
         # If the judge already completed its work (applied loom:pr or
