@@ -10088,6 +10088,38 @@ class TestBuilderDirectCompletion:
         create_args = mock_run.call_args_list[2][0][0]
         assert create_args[:3] == ["gh", "pr", "create"]
 
+    def test_refuses_when_worktree_on_main(self, mock_context: MagicMock) -> None:
+        """Should refuse direct completion when worktree is on main.  See #2744."""
+        builder = BuilderPhase()
+        mock_context.repo_root = Path("/fake/repo")
+        mock_context.config = ShepherdConfig(issue=42)
+        diag = {
+            "has_uncommitted_changes": True,
+            "commits_ahead": 0,
+            "remote_branch_exists": False,
+            "pr_number": None,
+            "pr_has_review_label": False,
+            "branch": "main",
+        }
+        result = builder._direct_completion(mock_context, diag)
+        assert result is False
+
+    def test_refuses_when_worktree_on_master(self, mock_context: MagicMock) -> None:
+        """Should refuse direct completion when worktree is on master.  See #2744."""
+        builder = BuilderPhase()
+        mock_context.repo_root = Path("/fake/repo")
+        mock_context.config = ShepherdConfig(issue=42)
+        diag = {
+            "has_uncommitted_changes": True,
+            "commits_ahead": 0,
+            "remote_branch_exists": False,
+            "pr_number": None,
+            "pr_has_review_label": False,
+            "branch": "master",
+        }
+        result = builder._direct_completion(mock_context, diag)
+        assert result is False
+
     def test_create_pr_zero_commits_returns_false(self, mock_context: MagicMock) -> None:
         """Should refuse to create PR when remote exists but 0 commits ahead."""
         builder = BuilderPhase()
@@ -10132,7 +10164,11 @@ class TestBuilderDirectCompletion:
     def test_create_pr_uses_branch_from_diagnostics(
         self, mock_context: MagicMock
     ) -> None:
-        """Should use the branch name from diagnostics, not a hardcoded one."""
+        """Should always use NamingConventions.branch_name(), ignoring diag branch.
+
+        Even when diagnostics report a custom branch, completion should use
+        the canonical feature branch name.  See issue #2744.
+        """
         builder = BuilderPhase()
         mock_context.repo_root = Path("/fake/repo")
         mock_context.config = ShepherdConfig(issue=99)
@@ -10156,11 +10192,11 @@ class TestBuilderDirectCompletion:
             ]
             builder._direct_completion(mock_context, diag)
 
-        # Both the check and create calls should use the custom branch
+        # Both the check and create calls should use the canonical branch
         check_args = mock_run.call_args_list[0][0][0]
-        assert "custom/my-branch" in check_args
+        assert "feature/issue-99" in check_args
         create_args = mock_run.call_args_list[2][0][0]
-        assert "custom/my-branch" in create_args
+        assert "feature/issue-99" in create_args
 
     def test_create_pr_fallback_branch_name(
         self, mock_context: MagicMock
@@ -10740,6 +10776,36 @@ class TestBuilderCompletionPhaseTargetedInstructions:
 
         call_kwargs = mock_run.call_args[1]
         assert "PR #150 exists but is missing loom:review-requested label" in call_kwargs["args"]
+
+    def test_uses_naming_conventions_branch_even_when_diag_says_main(
+        self, mock_context: MagicMock
+    ) -> None:
+        """Should use NamingConventions.branch_name() even when diag reports main.
+
+        Prevents completion phase from instructing push to main.  See #2744.
+        """
+        builder = BuilderPhase()
+        mock_context.config = ShepherdConfig(issue=42)
+        mock_context.worktree_path = Path("/fake/worktree")
+
+        diag = {
+            "has_uncommitted_changes": True,
+            "uncommitted_file_count": 2,
+            "commits_ahead": 0,
+            "remote_branch_exists": False,
+            "pr_number": None,
+            "pr_has_review_label": False,
+            "branch": "main",
+        }
+
+        with patch(
+            "loom_tools.shepherd.phases.base.run_phase_with_retry", return_value=0
+        ) as mock_run:
+            builder._run_completion_phase(mock_context, diag, attempt=1)
+
+        call_kwargs = mock_run.call_args[1]
+        assert "feature/issue-42" in call_kwargs["args"]
+        assert "git push -u origin main" not in call_kwargs["args"]
 
 
 class TestBuilderDiagnosticsUncommittedFileCount:
