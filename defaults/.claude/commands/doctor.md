@@ -35,12 +35,20 @@ If arguments contain `--test-fix <issue>` (e.g., `--test-fix 123` or `--test-fix
    ```
    The context file (`.loom-test-failure-context.json`) contains:
    - `test_command`: The test command that was run
-   - `test_output_tail`: Last 10 lines of test output showing what failed
+   - `test_output_tail`: Last 50 lines of test output showing what failed
    - `test_summary`: Parsed test summary (e.g., "3 failed, 12 passed")
    - `changed_files`: Files the builder modified (your scope)
    - `failure_message`: Human-readable failure description
 
-5. **CRITICAL RULES for test fix mode:**
+5. **Run the failing test to see full output** — the context file's `test_output_tail` may not include the full traceback. Re-run the test to see everything:
+   ```bash
+   # Run the exact test command from the context to see full output
+   <test_command from context>
+   ```
+
+6. **Diagnose using the patterns below** — identify which failure pattern applies and follow the corresponding fix strategy.
+
+7. **CRITICAL RULES for test fix mode:**
    - Fix ONLY the specific test failures described in the context
    - Do NOT make changes to files outside the `changed_files` list unless a test failure directly requires it
    - Do NOT make opportunistic improvements, refactoring, or unrelated fixes
@@ -48,7 +56,95 @@ If arguments contain `--test-fix <issue>` (e.g., `--test-fix 123` or `--test-fix
    - If failures are pre-existing and unrelated to the builder's changes, document this and exit
    - Run the test command from the context to verify your fix works
 
-6. After fixing, commit and proceed normally
+8. After fixing, commit and proceed normally
+
+### Test Failure Diagnostic Patterns
+
+When diagnosing test failures in test-fix mode, identify which pattern applies and follow the corresponding strategy. **Start with pattern recognition, not guesswork.**
+
+#### Pattern 1: Assertion Value Mismatch (Most Common)
+
+**How to recognize** — pytest output shows expected vs actual values:
+```
+AssertionError: expected call not found.
+Expected: func(arg1, param='old_value')
+Actual: func(arg1, param='new_value')
+```
+Or:
+```
+E       assert 'old_value' == 'new_value'
+E         - new_value
+E         + old_value
+```
+Or `assert_called_once_with` / `assert_called_with` / `assert_any_call` showing different parameter values.
+
+**Fix strategy:**
+1. Find the test file and line number from the traceback
+2. Read the failing test assertion
+3. Read the **implementation** (the production code) to confirm what value it actually produces
+4. **Update the test** to match the implementation — the builder changed the implementation intentionally, so the test expectation is stale
+5. Verify the fix: re-run the test command
+
+**Example:**
+```python
+# Test says (STALE):
+mock_func.assert_called_once_with(failure_label="loom:failed:judge", quiet=True)
+
+# Implementation now passes:
+mock_func(failure_label="loom:blocked", quiet=True)
+
+# Fix: Update test to match implementation
+mock_func.assert_called_once_with(failure_label="loom:blocked", quiet=True)
+```
+
+**Key principle:** When the builder changed implementation behavior and the test asserts old behavior, the test is wrong — not the implementation. Update the test assertion.
+
+#### Pattern 2: Missing Import or Attribute
+
+**How to recognize:**
+```
+ImportError: cannot import name 'OldName' from 'module'
+AttributeError: module 'X' has no attribute 'Y'
+NameError: name 'X' is not defined
+```
+
+**Fix strategy:**
+1. Check if the builder renamed/moved the symbol
+2. Update the import or reference in the test to use the new name/location
+
+#### Pattern 3: Mock Setup Mismatch
+
+**How to recognize:**
+```
+AttributeError: <MagicMock ...> does not have the attribute 'new_method'
+TypeError: func() got an unexpected keyword argument 'new_param'
+```
+
+**Fix strategy:**
+1. The builder added/changed a method or parameter in the implementation
+2. Update mock setup (e.g., add `spec=`, update `return_value`, add new mock attributes)
+
+#### Pattern 4: Structural Change (New/Removed Fields)
+
+**How to recognize:**
+```
+KeyError: 'new_field'
+TypeError: __init__() got an unexpected keyword argument 'new_field'
+ValidationError: field required
+```
+
+**Fix strategy:**
+1. Check what fields/parameters the builder added or removed
+2. Update test data fixtures, factory functions, or constructor calls to match
+
+#### General Diagnostic Checklist
+
+If none of the patterns above match clearly:
+1. **Read the full traceback** — identify the exact file and line
+2. **Read the test code** at that line
+3. **Read the implementation code** the test is exercising
+4. **Compare**: What does the test expect? What does the implementation do?
+5. **Fix the gap** — align the test with the implementation
 
 ### Standard PR Fix Mode
 
