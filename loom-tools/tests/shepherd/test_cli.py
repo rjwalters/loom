@@ -539,8 +539,9 @@ def _make_ctx(
     ctx.issue_title = "Test issue"
     ctx.pr_number = 100
     ctx.report_milestone = MagicMock(return_value=True)
-    # Default has_pr_label to False so label-detection code paths
+    # Default label checks to False so label-detection code paths
     # don't interfere with tests that don't explicitly test them.
+    ctx.has_issue_label.return_value = False
     ctx.has_pr_label.return_value = False
     return ctx
 
@@ -929,6 +930,118 @@ class TestPhaseTiming:
         assert "(170s)" in captured.err  # Builder
         assert "(100s)" in captured.err  # Judge
         assert "(5s)" in captured.err    # Merge
+
+
+class TestPostCuratorBlockedCheck:
+    """Test that shepherd aborts when curator flags issue as blocked (issue #2603)."""
+
+    @patch("loom_tools.shepherd.cli.ApprovalPhase")
+    @patch("loom_tools.shepherd.cli.CuratorPhase")
+    @patch("loom_tools.shepherd.cli.time")
+    def test_aborts_when_curator_adds_blocked_label(
+        self,
+        mock_time: MagicMock,
+        MockCurator: MagicMock,
+        MockApproval: MagicMock,
+    ) -> None:
+        """Should abort pipeline when curator adds loom:blocked during this run."""
+        mock_time.time = MagicMock(side_effect=[0, 0, 10, 10])
+
+        ctx = _make_ctx()
+        # Simulate curator running successfully
+        curator_inst = MockCurator.return_value
+        curator_inst.should_skip.return_value = (False, "")
+        curator_inst.run.return_value = _success_result("curator")
+
+        # After curator, label cache refresh shows loom:blocked
+        ctx.has_issue_label.side_effect = lambda label: label == "loom:blocked"
+
+        result = orchestrate(ctx)
+        assert result == ShepherdExitCode.NO_CHANGES_NEEDED
+
+        # Approval phase should never have been instantiated/run
+        MockApproval.return_value.run.assert_not_called()
+
+        # Should report blocked milestone
+        blocked_calls = [
+            c for c in ctx.report_milestone.call_args_list
+            if c[0][0] == "blocked" and c.kwargs.get("reason") == "curator_blocked"
+        ]
+        assert len(blocked_calls) == 1
+
+    @patch("loom_tools.shepherd.cli.MergePhase")
+    @patch("loom_tools.shepherd.cli.RebasePhase")
+    @patch("loom_tools.shepherd.cli.JudgePhase")
+    @patch("loom_tools.shepherd.cli.BuilderPhase")
+    @patch("loom_tools.shepherd.cli.ApprovalPhase")
+    @patch("loom_tools.shepherd.cli.CuratorPhase")
+    @patch("loom_tools.shepherd.cli.time")
+    def test_proceeds_when_no_blocked_label(
+        self,
+        mock_time: MagicMock,
+        MockCurator: MagicMock,
+        MockApproval: MagicMock,
+        MockBuilder: MagicMock,
+        MockJudge: MagicMock,
+        MockRebase: MagicMock,
+        MockMerge: MagicMock,
+    ) -> None:
+        """Should proceed normally when curator does not add loom:blocked."""
+        mock_time.time = MagicMock(side_effect=[
+            0, 0, 10, 10, 15, 15, 115, 115, 165, 165, 165, 165, 170, 170,
+        ])
+
+        ctx = _make_ctx()
+        ctx.has_issue_label.return_value = False
+
+        curator_inst = MockCurator.return_value
+        curator_inst.should_skip.return_value = (False, "")
+        curator_inst.run.return_value = _success_result("curator")
+
+        MockApproval.return_value.run.return_value = _success_result("approval")
+
+        builder_inst = MockBuilder.return_value
+        builder_inst.should_skip.return_value = (False, "")
+        builder_inst.run.return_value = _success_result("builder")
+
+        judge_inst = MockJudge.return_value
+        judge_inst.should_skip.return_value = (False, "")
+        judge_inst.run.return_value = _success_result("judge", approved=True)
+
+        MockRebase.return_value.run.return_value = PhaseResult(
+            status=PhaseStatus.SKIPPED, message="up to date", phase_name="rebase"
+        )
+        MockMerge.return_value.run.return_value = _success_result("merge", merged=True)
+
+        result = orchestrate(ctx)
+        assert result == ShepherdExitCode.SUCCESS
+
+        # Approval phase should have been called
+        MockApproval.return_value.run.assert_called_once()
+
+    @patch("loom_tools.shepherd.cli.ApprovalPhase")
+    @patch("loom_tools.shepherd.cli.CuratorPhase")
+    @patch("loom_tools.shepherd.cli.time")
+    def test_aborts_even_in_merge_mode(
+        self,
+        mock_time: MagicMock,
+        MockCurator: MagicMock,
+        MockApproval: MagicMock,
+    ) -> None:
+        """Merge mode should NOT override a fresh loom:blocked from the current curator."""
+        mock_time.time = MagicMock(side_effect=[0, 0, 10, 10])
+
+        ctx = _make_ctx(mode=ExecutionMode.FORCE_MERGE)
+        curator_inst = MockCurator.return_value
+        curator_inst.should_skip.return_value = (False, "")
+        curator_inst.run.return_value = _success_result("curator")
+
+        # Curator added loom:blocked during this run
+        ctx.has_issue_label.side_effect = lambda label: label == "loom:blocked"
+
+        result = orchestrate(ctx)
+        assert result == ShepherdExitCode.NO_CHANGES_NEEDED
+        MockApproval.return_value.run.assert_not_called()
 
 
 class TestDoctorSkippedHeader:
