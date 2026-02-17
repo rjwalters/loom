@@ -8599,6 +8599,105 @@ class TestBuilderIsNoChangesNeeded:
         assert builder._is_no_changes_needed(diag) is False
 
 
+class TestBuilderIsNoChangesNeededCommittedMarkerFallback:
+    """Test _is_no_changes_needed fallback when builder commits the marker file.
+
+    Issue #2605: if the builder accidentally commits .no-changes-needed,
+    commits_ahead > 0 would block detection.  The fallback checks whether
+    the *only* committed file is the marker itself and still returns True.
+    """
+
+    def test_only_marker_committed_with_marker_on_disk_returns_true(self) -> None:
+        """Marker committed as only file + marker on disk = no changes needed."""
+        builder = BuilderPhase()
+        diag = {
+            "worktree_exists": True,
+            "has_uncommitted_changes": False,
+            "commits_ahead": 1,
+            "committed_files": [".no-changes-needed"],
+            "remote_branch_exists": False,
+            "pr_number": None,
+            "log_cli_output_length": 1000,
+            "no_changes_marker_exists": True,
+        }
+        assert builder._is_no_changes_needed(diag) is True
+
+    def test_marker_plus_real_code_committed_returns_false(self) -> None:
+        """Marker committed alongside real code changes = real work done."""
+        builder = BuilderPhase()
+        diag = {
+            "worktree_exists": True,
+            "has_uncommitted_changes": False,
+            "commits_ahead": 1,
+            "committed_files": [".no-changes-needed", "src/main.py"],
+            "remote_branch_exists": False,
+            "pr_number": None,
+            "log_cli_output_length": 1000,
+            "no_changes_marker_exists": True,
+        }
+        assert builder._is_no_changes_needed(diag) is False
+
+    def test_only_marker_committed_but_no_marker_on_disk_returns_false(self) -> None:
+        """Marker committed but somehow removed from disk = no positive signal."""
+        builder = BuilderPhase()
+        diag = {
+            "worktree_exists": True,
+            "has_uncommitted_changes": False,
+            "commits_ahead": 1,
+            "committed_files": [".no-changes-needed"],
+            "remote_branch_exists": False,
+            "pr_number": None,
+            "log_cli_output_length": 1000,
+            "no_changes_marker_exists": False,
+        }
+        assert builder._is_no_changes_needed(diag) is False
+
+    def test_only_marker_committed_with_remote_branch_returns_false(self) -> None:
+        """Marker committed + remote branch pushed = too far along for fallback."""
+        builder = BuilderPhase()
+        diag = {
+            "worktree_exists": True,
+            "has_uncommitted_changes": False,
+            "commits_ahead": 1,
+            "committed_files": [".no-changes-needed"],
+            "remote_branch_exists": True,
+            "pr_number": None,
+            "log_cli_output_length": 1000,
+            "no_changes_marker_exists": True,
+        }
+        assert builder._is_no_changes_needed(diag) is False
+
+    def test_only_marker_committed_insufficient_output_returns_false(self) -> None:
+        """Marker committed but session too short = builder failure, not deliberate."""
+        builder = BuilderPhase()
+        diag = {
+            "worktree_exists": True,
+            "has_uncommitted_changes": False,
+            "commits_ahead": 1,
+            "committed_files": [".no-changes-needed"],
+            "remote_branch_exists": False,
+            "pr_number": None,
+            "log_cli_output_length": 50,
+            "no_changes_marker_exists": True,
+        }
+        assert builder._is_no_changes_needed(diag) is False
+
+    def test_real_code_committed_without_marker_returns_false(self) -> None:
+        """Real code committed without marker = normal work (no fallback)."""
+        builder = BuilderPhase()
+        diag = {
+            "worktree_exists": True,
+            "has_uncommitted_changes": False,
+            "commits_ahead": 2,
+            "committed_files": ["src/main.py", "tests/test_main.py"],
+            "remote_branch_exists": False,
+            "pr_number": None,
+            "log_cli_output_length": 1000,
+            "no_changes_marker_exists": False,
+        }
+        assert builder._is_no_changes_needed(diag) is False
+
+
 class TestBuilderStaleWorktreeRecovery:
     """Test stale worktree detection and recovery (issue #1995)."""
 
