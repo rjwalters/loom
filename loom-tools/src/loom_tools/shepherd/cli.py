@@ -1915,9 +1915,13 @@ def _cleanup_pr_labels_on_failure(ctx: ShepherdContext) -> None:
     """Best-effort cleanup of stale workflow labels on the associated PR.
 
     When shepherd fails, PR labels from in-progress workflow states can be
-    left behind (e.g., loom:treating, loom:reviewing, loom:review-requested,
-    loom:changes-requested). These are workflow state labels that become
-    contradictory once the shepherd is no longer driving the lifecycle.
+    left behind (e.g., loom:treating, loom:reviewing, loom:changes-requested).
+    These are workflow state labels that become contradictory once the shepherd
+    is no longer driving the lifecycle.
+
+    Special case: loom:review-requested is preserved when the judge never
+    produced an outcome (no loom:pr or loom:changes-requested on the PR).
+    This keeps the PR visible for retry instead of leaving it with zero labels.
 
     Factual status labels (loom:merge-conflict, loom:ci-failure) are kept
     since they reflect actual PR state regardless of shepherd status.
@@ -1947,7 +1951,16 @@ def _cleanup_pr_labels_on_failure(ctx: ShepherdContext) -> None:
     except Exception:
         return
 
-    stale_labels = PR_WORKFLOW_LABELS & pr_labels
+    # If the judge never produced an outcome (no loom:pr or loom:changes-requested),
+    # preserve loom:review-requested so the PR remains visible for retry.
+    judge_produced_outcome = bool(
+        {"loom:pr", "loom:changes-requested"} & pr_labels
+    )
+    labels_to_remove = PR_WORKFLOW_LABELS.copy()
+    if not judge_produced_outcome:
+        labels_to_remove.discard("loom:review-requested")
+
+    stale_labels = labels_to_remove & pr_labels
     if not stale_labels:
         return
 
