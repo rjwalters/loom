@@ -8081,7 +8081,7 @@ class TestBuilderStaleWorktreeRecovery:
             mock_remove.assert_called_once_with(ctx)
 
     def test_remove_stale_worktree_cleans_up(self, tmp_path: Path) -> None:
-        """Remove stale worktree removes both worktree and branch."""
+        """Remove stale worktree removes worktree, local branch, and remote branch."""
         builder = BuilderPhase()
 
         # Create real mock context with real Path
@@ -8094,24 +8094,28 @@ class TestBuilderStaleWorktreeRecovery:
         with patch(
             "loom_tools.shepherd.phases.builder.subprocess.run"
         ) as mock_run:
-            # First call gets branch name, second removes worktree, third deletes branch
             mock_run.side_effect = [
                 MagicMock(returncode=0, stdout="feature/issue-42\n"),  # rev-parse
                 MagicMock(returncode=0),  # worktree remove
-                MagicMock(returncode=0),  # branch delete
+                MagicMock(returncode=0),  # local branch delete
+                MagicMock(returncode=0),  # remote branch delete
             ]
 
             builder._remove_stale_worktree(ctx)
 
-            assert mock_run.call_count == 3
+            assert mock_run.call_count == 4
             # Check worktree remove was called
             worktree_call = mock_run.call_args_list[1]
             assert "worktree" in worktree_call[0][0]
             assert "remove" in worktree_call[0][0]
-            # Check branch delete was called
+            # Check local branch delete was called
             branch_call = mock_run.call_args_list[2]
             assert "branch" in branch_call[0][0]
             assert "-D" in branch_call[0][0]
+            # Check remote branch delete was called (issue #2415)
+            remote_call = mock_run.call_args_list[3]
+            assert "push" in remote_call[0][0]
+            assert "--delete" in remote_call[0][0]
 
 
 class TestBuilderDirectCompletion:

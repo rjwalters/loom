@@ -346,13 +346,18 @@ class ShepherdContext:
             )
 
     def _check_stale_branch(self, issue: int) -> None:
-        """Check for existing remote branch and log a warning if found.
+        """Check for existing remote branch and clean up or warn.
 
         A stale remote branch ``feature/issue-N`` may indicate a previous
-        attempt that left artifacts behind.  We warn but always proceed
-        so orchestration is not blocked.
+        attempt that left artifacts behind.
 
-        Branches that back an open PR are not considered stale.
+        In force/merge mode (``--merge``), stale branches are automatically
+        cleaned up: any open PRs on the branch are closed and the remote
+        branch is deleted so the builder can start fresh (issue #2415).
+
+        In default mode we warn but always proceed so orchestration is
+        not blocked.  Branches that back an open PR are not considered
+        stale unless in force mode.
         """
         logger = logging.getLogger(__name__)
         branch_name = NamingConventions.branch_name(issue)
@@ -365,7 +370,8 @@ class ShepherdContext:
                 check=False,
             )
             if result.returncode == 0 and result.stdout.strip():
-                # Check if this branch has an open PR — if so, it's not stale
+                # Check if this branch has an open PR
+                open_prs: list[dict[str, Any]] = []
                 try:
                     open_prs = gh_list(
                         "pr",
@@ -374,7 +380,7 @@ class ShepherdContext:
                         fields=["number"],
                         limit=1,
                     )
-                    if open_prs:
+                    if open_prs and not self.config.is_force_mode:
                         logger.debug(
                             "Branch %s has open PR #%s — not stale",
                             branch_name,
@@ -387,15 +393,98 @@ class ShepherdContext:
                         "Could not check open PRs for branch %s", branch_name
                     )
 
-                msg = (
-                    f"Stale branch {branch_name} exists on remote. "
-                    "Previous attempt may have left artifacts."
-                )
-                logger.warning(msg)
-                self.warnings.append(msg)
+                if self.config.is_force_mode:
+                    self._cleanup_stale_remote_branch(
+                        branch_name, open_prs, logger
+                    )
+                else:
+                    msg = (
+                        f"Stale branch {branch_name} exists on remote. "
+                        "Previous attempt may have left artifacts."
+                    )
+                    logger.warning(msg)
+                    self.warnings.append(msg)
         except OSError:
             # git not available or other OS error — skip the check
             pass
+
+    def _cleanup_stale_remote_branch(
+        self,
+        branch_name: str,
+        open_prs: list[dict[str, Any]],
+        logger: logging.Logger,
+    ) -> None:
+        """Clean up a stale remote branch and its associated PRs.
+
+        Called in force/merge mode to ensure the builder starts fresh.
+
+        1. Closes any open PRs on the branch
+        2. Deletes the remote branch
+        3. Removes the local branch and worktree if present
+        """
+        issue = self.config.issue
+
+        # Close stale open PRs
+        for pr in open_prs:
+            pr_num = pr.get("number")
+            if pr_num is not None:
+                try:
+                    subprocess.run(
+                        [
+                            "gh", "pr", "close", str(pr_num),
+                            "--comment",
+                            f"Closing stale PR from previous attempt. "
+                            f"Shepherd re-running issue #{issue} in merge mode.",
+                        ],
+                        cwd=self.repo_root,
+                        capture_output=True,
+                        check=False,
+                    )
+                    logger.info(
+                        "Closed stale PR #%s for branch %s", pr_num, branch_name
+                    )
+                except OSError:
+                    logger.debug("Failed to close PR #%s", pr_num)
+
+        # Delete remote branch
+        del_result = subprocess.run(
+            ["git", "push", "origin", "--delete", branch_name],
+            cwd=self.repo_root,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if del_result.returncode == 0:
+            logger.info("Deleted stale remote branch %s", branch_name)
+        else:
+            logger.warning(
+                "Failed to delete remote branch %s: %s",
+                branch_name,
+                del_result.stderr.strip(),
+            )
+
+        # Remove local branch if it exists
+        subprocess.run(
+            ["git", "branch", "-D", branch_name],
+            cwd=self.repo_root,
+            capture_output=True,
+            check=False,
+        )
+
+        # Remove local worktree if it exists
+        worktree_path = LoomPaths(self.repo_root).worktree_path(issue)
+        if worktree_path.is_dir():
+            subprocess.run(
+                ["git", "worktree", "remove", str(worktree_path), "--force"],
+                cwd=self.repo_root,
+                capture_output=True,
+                check=False,
+            )
+            logger.info("Removed stale worktree %s", worktree_path)
+
+        logger.info(
+            "Cleaned up stale artifacts for issue #%d (merge mode)", issue
+        )
 
     def has_issue_label(self, label: str) -> bool:
         """Check if the issue has a specific label."""
