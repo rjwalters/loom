@@ -2860,6 +2860,157 @@ class TestBuilderBaselineTests:
 
         assert result is None
 
+    def test_run_baseline_cleans_new_artifacts(
+        self, mock_context: MagicMock
+    ) -> None:
+        """Should clean up files dirtied by baseline test run."""
+        builder = BuilderPhase()
+        mock_context.repo_root = MagicMock()
+        mock_context.repo_root.is_dir.return_value = True
+
+        completed = subprocess.CompletedProcess(
+            args=[], returncode=0, stdout="ok\n", stderr=""
+        )
+
+        # Simulate: before test run, one file is dirty; after, two are dirty
+        status_before = " M existing-dirty.txt\n"
+        status_after = " M existing-dirty.txt\n?? build-artifact.js\n"
+
+        run_calls: list[list[str]] = []
+
+        def mock_run(cmd: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+            run_calls.append(cmd)
+            if cmd[:2] == ["git", "status"]:
+                # First call is pre-snapshot, second is post-snapshot
+                status_calls = [c for c in run_calls if c[:2] == ["git", "status"]]
+                if len(status_calls) == 1:
+                    return subprocess.CompletedProcess(
+                        args=cmd, returncode=0, stdout=status_before, stderr=""
+                    )
+                return subprocess.CompletedProcess(
+                    args=cmd, returncode=0, stdout=status_after, stderr=""
+                )
+            if cmd[:2] == ["git", "clean"]:
+                return subprocess.CompletedProcess(
+                    args=cmd, returncode=0, stdout="", stderr=""
+                )
+            # The actual test command
+            return completed
+
+        with (
+            patch.object(
+                builder,
+                "_detect_test_command",
+                return_value=(["pnpm", "test"], "pnpm test"),
+            ),
+            patch(
+                "loom_tools.shepherd.phases.builder.subprocess.run",
+                side_effect=mock_run,
+            ),
+        ):
+            result = builder._run_baseline_tests(
+                mock_context, ["pnpm", "test"], "pnpm test"
+            )
+
+        assert result is not None
+        assert result.returncode == 0
+
+        # Verify git clean was called for the new untracked file
+        clean_calls = [c for c in run_calls if c[:2] == ["git", "clean"]]
+        assert len(clean_calls) == 1
+        assert "build-artifact.js" in clean_calls[0]
+
+    def test_run_baseline_cleans_on_timeout(
+        self, mock_context: MagicMock
+    ) -> None:
+        """Should clean up artifacts even when baseline times out."""
+        builder = BuilderPhase()
+        mock_context.repo_root = MagicMock()
+        mock_context.repo_root.is_dir.return_value = True
+
+        status_before = ""
+        status_after = "?? build-output.js\n"
+        call_count = {"status": 0, "test_called": False}
+
+        def mock_run(cmd: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+            if cmd[:2] == ["git", "status"]:
+                call_count["status"] += 1
+                stdout = status_before if call_count["status"] == 1 else status_after
+                return subprocess.CompletedProcess(
+                    args=cmd, returncode=0, stdout=stdout, stderr=""
+                )
+            if cmd[:2] == ["git", "clean"]:
+                return subprocess.CompletedProcess(
+                    args=cmd, returncode=0, stdout="", stderr=""
+                )
+            # Test command raises timeout
+            call_count["test_called"] = True
+            raise subprocess.TimeoutExpired(cmd="pnpm test", timeout=300)
+
+        with (
+            patch.object(
+                builder,
+                "_detect_test_command",
+                return_value=(["pnpm", "test"], "pnpm test"),
+            ),
+            patch(
+                "loom_tools.shepherd.phases.builder.subprocess.run",
+                side_effect=mock_run,
+            ),
+        ):
+            result = builder._run_baseline_tests(
+                mock_context, ["pnpm", "test"], "pnpm test"
+            )
+
+        assert result is None
+        assert call_count["test_called"]
+        # Cleanup should still have run (2 status calls = pre + post)
+        assert call_count["status"] == 2
+
+    def test_run_baseline_no_cleanup_when_no_new_artifacts(
+        self, mock_context: MagicMock
+    ) -> None:
+        """Should not run git checkout/clean when no new artifacts appear."""
+        builder = BuilderPhase()
+        mock_context.repo_root = MagicMock()
+        mock_context.repo_root.is_dir.return_value = True
+
+        completed = subprocess.CompletedProcess(
+            args=[], returncode=0, stdout="ok\n", stderr=""
+        )
+
+        # Same dirty state before and after — no new artifacts
+        status = " M already-dirty.txt\n"
+        run_calls: list[list[str]] = []
+
+        def mock_run(cmd: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+            run_calls.append(cmd)
+            if cmd[:2] == ["git", "status"]:
+                return subprocess.CompletedProcess(
+                    args=cmd, returncode=0, stdout=status, stderr=""
+                )
+            return completed
+
+        with (
+            patch.object(
+                builder,
+                "_detect_test_command",
+                return_value=(["pnpm", "test"], "pnpm test"),
+            ),
+            patch(
+                "loom_tools.shepherd.phases.builder.subprocess.run",
+                side_effect=mock_run,
+            ),
+        ):
+            result = builder._run_baseline_tests(
+                mock_context, ["pnpm", "test"], "pnpm test"
+            )
+
+        assert result is not None
+        # No checkout or clean calls should have been made
+        clean_calls = [c for c in run_calls if c[0] == "git" and c[1] in ("checkout", "clean")]
+        assert len(clean_calls) == 0
+
 
 class TestBuilderExtractErrorLines:
     """Test builder phase error line extraction."""
