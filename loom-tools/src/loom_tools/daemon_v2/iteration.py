@@ -6,6 +6,7 @@ import subprocess
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
+from loom_tools.claim import release_claim
 from loom_tools.common.logging import log_error, log_info, log_success, log_warning
 from loom_tools.common.state import read_daemon_state, write_json_file
 from loom_tools.common.time_utils import now_utc
@@ -434,9 +435,10 @@ def _escalate_level_3(ctx: DaemonContext) -> None:
             kill_stuck_session(name)
             killed += 1
 
-        # Revert issue label
+        # Revert issue label and release file-based claim
         issue = entry.issue
         if issue is not None:
+            release_claim(ctx.repo_root, issue)
             try:
                 _unclaim_issue(issue)
                 log_info(f"STALL-L3: Reverted issue #{issue} labels")

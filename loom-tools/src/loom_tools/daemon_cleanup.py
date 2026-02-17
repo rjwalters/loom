@@ -559,6 +559,13 @@ def handle_shepherd_complete(
     progress_dir = repo_root / ".loom" / "progress"
     cleanup_progress_file(progress_dir, issue_number, dry_run=dry_run)
 
+    # Defensive claim release (belt-and-suspenders for OOM/SIGKILL cases
+    # where the daemon couldn't release the claim itself)
+    if not dry_run:
+        from loom_tools.claim import release_claim
+
+        release_claim(repo_root, issue_number)
+
     if not dry_run:
         update_cleanup_timestamp(state_path, "shepherd-complete")
 
@@ -575,6 +582,15 @@ def handle_daemon_startup(
     log_info("Daemon Startup Cleanup")
 
     state_path = repo_root / ".loom" / "daemon-state.json"
+
+    # 0. Clean up expired file-based claims from previous session
+    log_info("Cleaning up expired claims...")
+    if not dry_run:
+        from loom_tools.claim import cleanup_claims
+
+        cleanup_claims(repo_root)
+    else:
+        log_info("[DRY-RUN] Would clean up expired claims")
 
     # 1. Orphaned shepherd recovery (critical, run first)
     log_info("Checking for orphaned shepherds from previous session...")
@@ -739,6 +755,12 @@ def _revert_shepherd_labels(
                 f"(loom:building → loom:issue) for {name}"
             )
         else:
+            # Release file-based claim alongside label revert
+            from loom_tools.claim import release_claim
+
+            repo_root = state_path.parent.parent
+            release_claim(repo_root, issue_num)
+
             try:
                 gh_run([
                     "issue", "edit", str(issue_num),

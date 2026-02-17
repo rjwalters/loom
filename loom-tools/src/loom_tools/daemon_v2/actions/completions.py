@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import TYPE_CHECKING, Any
 
+from loom_tools.claim import release_claim
 from loom_tools.common.github import gh_run
 from loom_tools.common.issue_failures import (
     ERROR_CLASS_BLOCK_THRESHOLDS,
@@ -245,6 +246,7 @@ def _handle_shepherd_completion(
         # Record non-transient failure in persistent log
         if completion.issue is not None:
             _record_persistent_failure(ctx, completion)
+            release_claim(ctx.repo_root, completion.issue)
 
 
 def _handle_transient_error_retry(
@@ -289,6 +291,9 @@ def _handle_transient_error_retry(
 
     # Re-queue the issue: swap loom:building back to loom:issue
     _requeue_issue(completion.issue, retry_entry.retry_count, timestamp)
+
+    # Release file-based claim so another shepherd can pick it up
+    release_claim(ctx.repo_root, completion.issue)
 
 
 def _requeue_issue(
