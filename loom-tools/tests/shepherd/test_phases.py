@@ -11256,7 +11256,7 @@ class TestRunWorkerPhaseInstantExit:
         return ctx
 
     def test_instant_exit_returns_code_6(self, mock_context: MagicMock) -> None:
-        """When agent completes in <5s with no output, return exit code 6."""
+        """When agent exits non-zero in <5s with no output, return exit code 6."""
 
         def mock_spawn(cmd, **kwargs):
             result = MagicMock()
@@ -11265,8 +11265,8 @@ class TestRunWorkerPhaseInstantExit:
 
         def mock_popen(cmd, **kwargs):
             proc = MagicMock()
-            proc.poll.return_value = 0
-            proc.returncode = 0
+            proc.poll.return_value = 1
+            proc.returncode = 1
             return proc
 
         with (
@@ -13722,7 +13722,7 @@ class TestRunWorkerPhaseMcpFailure:
         return ctx
 
     def test_mcp_failure_returns_code_7(self, mock_context: MagicMock) -> None:
-        """When MCP failure detected in log, return exit code 7."""
+        """When non-zero exit with MCP failure detected in log, return exit code 7."""
 
         def mock_spawn(cmd, **kwargs):
             result = MagicMock()
@@ -13731,8 +13731,8 @@ class TestRunWorkerPhaseMcpFailure:
 
         def mock_popen(cmd, **kwargs):
             proc = MagicMock()
-            proc.poll.return_value = 0
-            proc.returncode = 0
+            proc.poll.return_value = 1
+            proc.returncode = 1
             return proc
 
         with (
@@ -13769,8 +13769,8 @@ class TestRunWorkerPhaseMcpFailure:
 
         def mock_popen(cmd, **kwargs):
             proc = MagicMock()
-            proc.poll.return_value = 0
-            proc.returncode = 0
+            proc.poll.return_value = 1
+            proc.returncode = 1
             return proc
 
         with (
@@ -14196,6 +14196,92 @@ class TestRunWorkerPhaseAuthFailure:
             patch(
                 "loom_tools.shepherd.phases.base._is_mcp_failure",
                 return_value=False,
+            ),
+            patch(
+                "loom_tools.shepherd.phases.base._is_instant_exit",
+                return_value=False,
+            ),
+        ):
+            exit_code = run_worker_phase(
+                mock_context,
+                role="builder",
+                name="builder-issue-42",
+                timeout=600,
+                phase="builder",
+            )
+
+        assert exit_code == 0
+
+    def test_exit_0_not_overridden_by_instant_exit_pattern(
+        self, mock_context: MagicMock
+    ) -> None:
+        """Exit 0 should never be overridden by instant-exit log pattern (issue #2545)."""
+
+        def mock_spawn(cmd, **kwargs):
+            result = MagicMock()
+            result.returncode = 0
+            return result
+
+        def mock_popen(cmd, **kwargs):
+            proc = MagicMock()
+            proc.poll.return_value = 0
+            proc.returncode = 0
+            return proc
+
+        with (
+            patch("subprocess.run", side_effect=mock_spawn),
+            patch("subprocess.Popen", side_effect=mock_popen),
+            patch("time.sleep"),
+            patch(
+                "loom_tools.shepherd.phases.base._is_auth_failure",
+                return_value=False,
+            ),
+            patch(
+                "loom_tools.shepherd.phases.base._is_mcp_failure",
+                return_value=False,
+            ),
+            patch(
+                "loom_tools.shepherd.phases.base._is_instant_exit",
+                return_value=True,
+            ),
+        ):
+            exit_code = run_worker_phase(
+                mock_context,
+                role="builder",
+                name="builder-issue-42",
+                timeout=600,
+                phase="builder",
+            )
+
+        assert exit_code == 0
+
+    def test_exit_0_not_overridden_by_mcp_failure_pattern(
+        self, mock_context: MagicMock
+    ) -> None:
+        """Exit 0 should never be overridden by MCP failure log pattern (issue #2545)."""
+
+        def mock_spawn(cmd, **kwargs):
+            result = MagicMock()
+            result.returncode = 0
+            return result
+
+        def mock_popen(cmd, **kwargs):
+            proc = MagicMock()
+            proc.poll.return_value = 0
+            proc.returncode = 0
+            return proc
+
+        with (
+            patch("subprocess.run", side_effect=mock_spawn),
+            patch("subprocess.Popen", side_effect=mock_popen),
+            patch("time.sleep"),
+            patch(
+                "loom_tools.shepherd.phases.base._is_auth_failure",
+                return_value=False,
+            ),
+            patch(
+                "loom_tools.shepherd.phases.base._is_mcp_failure",
+                return_value=True,
             ),
             patch(
                 "loom_tools.shepherd.phases.base._is_instant_exit",
