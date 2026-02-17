@@ -21,6 +21,7 @@ import json
 import re
 import subprocess
 import sys
+import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import Enum
@@ -690,6 +691,24 @@ def validate_builder(
 
     # Find existing PR
     pr = _find_pr_for_issue(issue, repo_root, pr_number)
+
+    # Checkpoint-aware retry: if no PR found but the builder checkpoint
+    # indicates one was just created, GitHub API eventual consistency may
+    # not have propagated it yet.  Wait briefly and retry once (#2710).
+    if pr is None and worktree:
+        wt_path = Path(worktree)
+        if wt_path.is_dir():
+            from loom_tools.checkpoints import read_checkpoint
+
+            checkpoint = read_checkpoint(wt_path)
+            if checkpoint and checkpoint.stage == "pr_created":
+                log_warning(
+                    f"No PR found for issue #{issue} but checkpoint indicates "
+                    f"pr_created — retrying after 2s for API propagation"
+                )
+                time.sleep(2)
+                pr = _find_pr_for_issue(issue, repo_root, pr_number)
+
     pr_found_by = pr[1] if pr else None
     pr_num = pr[0] if pr else None
 

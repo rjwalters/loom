@@ -502,6 +502,70 @@ class TestValidateBuilder:
         result = validate_builder(42, repo, pr_number=55, check_only=True)
         assert result.status == ValidationStatus.SATISFIED
 
+    @patch("loom_tools.validate_phase.time.sleep")
+    @patch("loom_tools.validate_phase._find_pr_for_issue")
+    @patch("loom_tools.validate_phase._run_gh")
+    def test_checkpoint_pr_created_retries_on_missing_pr(
+        self, mock_gh: MagicMock, mock_find: MagicMock, mock_sleep: MagicMock, tmp_path: Path,
+    ):
+        """When checkpoint says pr_created but PR isn't visible yet, retry after delay (#2710)."""
+        repo = _make_repo(tmp_path)
+        wt = tmp_path / "worktree"
+        wt.mkdir()
+        # Write a pr_created checkpoint
+        checkpoint_data = {"stage": "pr_created", "timestamp": "2026-01-01T00:00:00Z", "issue": 42}
+        (wt / ".loom-checkpoint").write_text(json.dumps(checkpoint_data))
+
+        # First call: no PR found; second call (after retry): PR found
+        mock_find.side_effect = [None, (200, "branch_name")]
+        mock_gh.side_effect = [
+            _completed(stdout="OPEN\n"),           # issue state
+            _completed(stdout="loom:review-requested\n"),  # PR labels
+        ]
+        result = validate_builder(42, repo, worktree=str(wt), check_only=True)
+        assert result.status == ValidationStatus.SATISFIED
+        assert mock_find.call_count == 2
+        mock_sleep.assert_called_once_with(2)
+
+    @patch("loom_tools.validate_phase.time.sleep")
+    @patch("loom_tools.validate_phase._find_pr_for_issue")
+    @patch("loom_tools.validate_phase._run_gh")
+    def test_no_checkpoint_no_retry(
+        self, mock_gh: MagicMock, mock_find: MagicMock, mock_sleep: MagicMock, tmp_path: Path,
+    ):
+        """Without a pr_created checkpoint, no retry is attempted."""
+        repo = _make_repo(tmp_path)
+        wt = tmp_path / "worktree"
+        wt.mkdir()
+        # No checkpoint file
+
+        mock_find.return_value = None
+        mock_gh.return_value = _completed(stdout="OPEN\n")
+        result = validate_builder(42, repo, worktree=str(wt), check_only=True)
+        assert result.status == ValidationStatus.FAILED
+        assert mock_find.call_count == 1
+        mock_sleep.assert_not_called()
+
+    @patch("loom_tools.validate_phase.time.sleep")
+    @patch("loom_tools.validate_phase._find_pr_for_issue")
+    @patch("loom_tools.validate_phase._run_gh")
+    def test_checkpoint_implementing_no_retry(
+        self, mock_gh: MagicMock, mock_find: MagicMock, mock_sleep: MagicMock, tmp_path: Path,
+    ):
+        """Checkpoint at 'implementing' stage should NOT trigger retry."""
+        repo = _make_repo(tmp_path)
+        wt = tmp_path / "worktree"
+        wt.mkdir()
+        checkpoint_data = {"stage": "implementing", "timestamp": "2026-01-01T00:00:00Z", "issue": 42}
+        (wt / ".loom-checkpoint").write_text(json.dumps(checkpoint_data))
+
+        mock_find.return_value = None
+        mock_gh.return_value = _completed(stdout="OPEN\n")
+        result = validate_builder(42, repo, worktree=str(wt), check_only=True)
+        assert result.status == ValidationStatus.FAILED
+        assert mock_find.call_count == 1
+        mock_sleep.assert_not_called()
+
 
 # ---------------------------------------------------------------------------
 # _warn_generic_pr_title
