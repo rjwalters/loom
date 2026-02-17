@@ -35,6 +35,7 @@ from loom_tools.shepherd.labels import (
 from loom_tools.shepherd.phases.base import (
     PhaseResult,
     PhaseStatus,
+    _get_cli_output,
     run_phase_with_retry,
 )
 
@@ -62,6 +63,22 @@ _TEST_CMD_PREFIXES = [
     "pnpm test",
     "npm test",
 ]
+
+# Patterns in CLI output that indicate the builder was actively implementing
+# (not just reading/analyzing). If a builder session contains these patterns
+# but produced no git artifacts, it likely crashed/timed out rather than
+# concluding "no changes needed."
+_IMPLEMENTATION_TOOL_PATTERNS = [
+    r"⠋|⠙|⠹|⠸|⠼|⠴|⠦|⠧|⠇|⠏",  # Claude Code spinner chars (tool execution)
+    r"✓ Edit\b",  # Successful Edit tool call
+    r"✓ Write\b",  # Successful Write tool call
+    r"Wrote to ",  # Write tool output
+]
+_IMPLEMENTATION_TOOL_RE = re.compile("|".join(_IMPLEMENTATION_TOOL_PATTERNS))
+
+# Minimum CLI output length (chars) to consider a session "substantive."
+# Below this, even with tool patterns, the session may not have done real work.
+_SUBSTANTIVE_OUTPUT_MIN_CHARS = 2000
 
 # File extensions mapped to language categories for scoped test verification
 _LANGUAGE_EXTENSIONS: dict[str, str] = {
@@ -2395,12 +2412,30 @@ class BuilderPhase:
         diag["log_exists"] = log_path.is_file()
         if log_path.is_file():
             try:
-                lines = log_path.read_text().splitlines()
+                log_content = log_path.read_text()
+                lines = log_content.splitlines()
                 diag["log_tail"] = lines[-20:] if len(lines) > 20 else lines
+
+                # Analyze CLI output for implementation activity.
+                # This distinguishes a builder that crashed mid-work from one
+                # that legitimately concluded "no changes needed."
+                from loom_tools.common.logging import strip_ansi
+
+                stripped = strip_ansi(log_content)
+                cli_output = _get_cli_output(stripped)
+                diag["log_cli_output_length"] = len(cli_output.strip())
+                diag["log_has_implementation_activity"] = bool(
+                    len(cli_output.strip()) >= _SUBSTANTIVE_OUTPUT_MIN_CHARS
+                    and _IMPLEMENTATION_TOOL_RE.search(cli_output)
+                )
             except OSError:
                 diag["log_tail"] = []
+                diag["log_cli_output_length"] = 0
+                diag["log_has_implementation_activity"] = False
         else:
             diag["log_tail"] = []
+            diag["log_cli_output_length"] = 0
+            diag["log_has_implementation_activity"] = False
 
         # -- Worktree state --------------------------------------------------
         wt = ctx.worktree_path
@@ -2749,10 +2784,16 @@ class BuilderPhase:
         - No remote branch exists (nothing pushed)
         - No PR exists (nothing created)
         - Main branch is clean (no worktree escape detected)
+        - Builder log does NOT show implementation activity (Edit/Write calls)
 
         This pattern indicates the builder analyzed the issue and determined
         that no changes are required - the reported problem either doesn't
         exist or is already resolved on main.
+
+        If the builder log shows substantive implementation activity (Edit/Write
+        tool calls with significant output), the builder was actively working
+        but crashed or timed out before committing.  This is a builder failure,
+        not a "no changes needed" determination.  See issue #2425.
 
         If main has uncommitted changes, the builder may have escaped the
         worktree and modified files on main instead.  This is NOT a "no
@@ -2775,8 +2816,23 @@ class BuilderPhase:
             or diag.get("pr_number") is not None
         )
 
-        # No work detected = no changes needed
-        return not has_any_work
+        if has_any_work:
+            return False
+
+        # No git artifacts — but check the builder log for signs of
+        # implementation activity.  A builder that made Edit/Write tool calls
+        # with substantial output was actively implementing, not concluding
+        # "no changes needed."  It likely crashed or timed out before
+        # committing.  Treat this as a builder failure instead.
+        if diag.get("log_has_implementation_activity", False):
+            log_warning(
+                "Builder log shows implementation activity (Edit/Write tool "
+                "calls) but no git artifacts — treating as builder failure, "
+                "not 'no changes needed'"
+            )
+            return False
+
+        return True
 
     def _diagnose_remaining_steps(self, diag: dict[str, Any], issue: int) -> list[str]:
         """Determine exactly which steps remain to complete the workflow.
