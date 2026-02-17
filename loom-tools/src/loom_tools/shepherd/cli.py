@@ -179,6 +179,13 @@ EXAMPLES:
         help="Skip builder phase and use specified PR number directly",
     )
 
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="Resume from prior work (existing branch/checkpoint). "
+        "Passed automatically by daemon when prior work is detected.",
+    )
+
     # Deprecated flags
     parser.add_argument(
         "--wait",
@@ -347,6 +354,7 @@ def _create_config(args: argparse.Namespace) -> ShepherdConfig:
         no_reflect=args.no_reflect,
         skip_builder=skip_builder,
         pr_number_override=pr_number_override,
+        resume=args.resume,
     )
 
     if args.task_id:

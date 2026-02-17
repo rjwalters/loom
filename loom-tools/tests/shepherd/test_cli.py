@@ -114,6 +114,16 @@ class TestParseArgs:
         with pytest.raises(SystemExit):
             _parse_args(["42", "--pr", "abc"])
 
+    def test_parses_resume(self) -> None:
+        """Should parse --resume flag."""
+        args = _parse_args(["42", "--resume"])
+        assert args.resume is True
+
+    def test_resume_default_false(self) -> None:
+        """--resume should default to False."""
+        args = _parse_args(["42"])
+        assert args.resume is False
+
 
 class TestCreateConfig:
     """Test config creation from args."""
@@ -198,6 +208,18 @@ class TestCreateConfig:
         config = _create_config(args)
         assert config.skip_builder is False
         assert config.pr_number_override is None
+
+    def test_resume_sets_config(self) -> None:
+        """--resume should set resume=True in config."""
+        args = _parse_args(["42", "--resume"])
+        config = _create_config(args)
+        assert config.resume is True
+
+    def test_resume_default(self) -> None:
+        """Default config should have resume=False."""
+        args = _parse_args(["42"])
+        config = _create_config(args)
+        assert config.resume is False
 
 
 class TestAutoNavigateOutOfWorktree:

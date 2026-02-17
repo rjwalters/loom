@@ -199,6 +199,9 @@ class ShepherdConfig:
     skip_builder: bool = False
     pr_number_override: int | None = None
 
+    # Resume from prior work (existing branch/checkpoint)
+    resume: bool = False
+
     @property
     def is_force_mode(self) -> bool:
         """True if running in force mode (auto-approve, auto-merge)."""
