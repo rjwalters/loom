@@ -27,7 +27,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Any
 
-from loom_tools.common.git import parse_porcelain_path
+from loom_tools.common.git import derive_commit_message, parse_porcelain_path
 from loom_tools.common.logging import log_warning, strip_ansi
 from loom_tools.common.paths import LoomPaths
 from loom_tools.common.state import find_progress_for_issue
@@ -874,7 +874,9 @@ def validate_builder(
                     "Recovery failed: could not stage changes.",
                 )
 
-            commit_msg = f"feat: implement changes for issue #{issue}"
+            commit_msg = derive_commit_message(
+                issue, worktree, repo_root, staged_files=files_to_stage,
+            )
             r = subprocess.run(
                 ["git", "-C", worktree, "commit", "-m", commit_msg],
                 capture_output=True, text=True, check=False,

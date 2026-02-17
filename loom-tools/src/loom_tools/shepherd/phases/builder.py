@@ -18,7 +18,11 @@ from loom_tools.checkpoints import (
     read_checkpoint,
     write_checkpoint,
 )
-from loom_tools.common.git import get_changed_files, parse_porcelain_path
+from loom_tools.common.git import (
+    derive_commit_message,
+    get_changed_files,
+    parse_porcelain_path,
+)
 from loom_tools.common.logging import log_error, log_info, log_success, log_warning
 from loom_tools.common.paths import LoomPaths, NamingConventions
 from loom_tools.common.state import parse_command_output, read_json_file
@@ -4356,8 +4360,13 @@ class BuilderPhase:
             )
             return False
 
-        # Commit
-        commit_msg = f"feat: implement changes for issue #{ctx.config.issue}"
+        # Commit — derive a meaningful message from the issue title
+        commit_msg = derive_commit_message(
+            ctx.config.issue,
+            str(ctx.worktree_path),
+            str(ctx.repo_root),
+            staged_files=files_to_stage,
+        )
         commit_result = subprocess.run(
             ["git", "-C", str(ctx.worktree_path), "commit", "-m", commit_msg],
             capture_output=True,
