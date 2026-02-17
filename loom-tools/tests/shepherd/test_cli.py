@@ -3560,6 +3560,47 @@ class TestCleanupLabelsOnFailure:
             repo_root=Path("/fake/repo"),
         )
 
+    @patch("loom_tools.shepherd.cli._cleanup_pr_labels_on_failure")
+    @patch("loom_tools.shepherd.cli.transition_issue_labels")
+    @patch("loom_tools.shepherd.phases.rebase._is_pr_merged", return_value=True)
+    def test_no_revert_when_pr_already_merged(
+        self,
+        mock_merged: MagicMock,
+        mock_transition: MagicMock,
+        mock_pr_cleanup: MagicMock,
+    ) -> None:
+        """Should NOT revert loom:building when the PR is already merged (#2515)."""
+        ctx = self._make_cleanup_ctx(
+            issue_labels={"loom:building", "loom:curated"}
+        )
+        ctx.pr_number = 200
+        _cleanup_labels_on_failure(ctx, ShepherdExitCode.NEEDS_INTERVENTION)
+
+        mock_merged.assert_called_once_with(200, Path("/fake/repo"))
+        mock_transition.assert_not_called()
+
+    @patch("loom_tools.shepherd.cli._cleanup_pr_labels_on_failure")
+    @patch("loom_tools.shepherd.cli.transition_issue_labels")
+    @patch("loom_tools.shepherd.cli.get_pr_for_issue", return_value=300)
+    @patch("loom_tools.shepherd.phases.rebase._is_pr_merged", return_value=True)
+    def test_no_revert_when_merged_pr_found_by_issue(
+        self,
+        mock_merged: MagicMock,
+        mock_get_pr: MagicMock,
+        mock_transition: MagicMock,
+        mock_pr_cleanup: MagicMock,
+    ) -> None:
+        """Should find merged PR by issue number when ctx.pr_number is None (#2515)."""
+        ctx = self._make_cleanup_ctx(
+            issue_labels={"loom:building", "loom:curated"}
+        )
+        ctx.pr_number = None
+        _cleanup_labels_on_failure(ctx, ShepherdExitCode.NEEDS_INTERVENTION)
+
+        mock_get_pr.assert_called_once_with(42, state="merged", repo_root=Path("/fake/repo"))
+        mock_merged.assert_called_once_with(300, Path("/fake/repo"))
+        mock_transition.assert_not_called()
+
 
 class TestMainCleanupIntegration:
     """Test that main() calls _cleanup_labels_on_failure on failure."""

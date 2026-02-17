@@ -1995,6 +1995,25 @@ def _cleanup_labels_on_failure(ctx: ShepherdContext, exit_code: int) -> None:
                 pass
         return
 
+    # Check if the PR for this issue is already merged.  If so, the work
+    # is complete and we must NOT revert labels — doing so would re-queue
+    # an already-finished issue.  (See #2515.)
+    try:
+        from loom_tools.shepherd.phases.rebase import _is_pr_merged
+
+        pr_to_check = ctx.pr_number
+        if pr_to_check is None:
+            # Try to find a merged PR by issue number
+            pr_to_check = get_pr_for_issue(issue, state="merged", repo_root=ctx.repo_root)
+        if pr_to_check is not None and _is_pr_merged(pr_to_check, ctx.repo_root):
+            log_info(
+                f"Label cleanup: PR #{pr_to_check} is already merged "
+                f"— not reverting issue #{issue} labels"
+            )
+            return
+    except Exception:
+        pass
+
     # No failure label was set - revert loom:building to loom:issue
     # so the issue returns to the ready pool for retry
     if "loom:building" in current_labels:
