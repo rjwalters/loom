@@ -13585,15 +13585,12 @@ class TestMcpFailureMarkerRegex:
 
         assert _MCP_FAILURE_MARKER_RE.search("1 MCP server failed")
 
-    def test_matches_plugins_failed_to_install(self) -> None:
+    def test_no_match_on_plugin_failure(self) -> None:
+        """Plugin failures are cosmetic, not MCP failures.  See issue #2662."""
         from loom_tools.shepherd.phases.builder import _MCP_FAILURE_MARKER_RE
 
-        assert _MCP_FAILURE_MARKER_RE.search("2 plugins failed to install")
-
-    def test_matches_plugin_singular(self) -> None:
-        from loom_tools.shepherd.phases.builder import _MCP_FAILURE_MARKER_RE
-
-        assert _MCP_FAILURE_MARKER_RE.search("1 plugin failed to install")
+        assert not _MCP_FAILURE_MARKER_RE.search("2 plugins failed to install")
+        assert not _MCP_FAILURE_MARKER_RE.search("1 plugin failed to install")
 
     def test_no_match_on_clean_output(self) -> None:
         from loom_tools.shepherd.phases.builder import _MCP_FAILURE_MARKER_RE
