@@ -4,13 +4,14 @@ from __future__ import annotations
 
 import json
 import logging
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
 
 from loom_tools.shepherd.config import ExecutionMode, ShepherdConfig
-from loom_tools.shepherd.context import ShepherdContext
+from loom_tools.shepherd.context import ShepherdContext, _HEARTBEAT_FRESH_THRESHOLD
 from loom_tools.shepherd.errors import IssueBlockedError, IssueClosedError, IssueIsEpicError
 
 
@@ -117,6 +118,87 @@ class TestCleanupStaleProgressForIssue:
         finally:
             # Restore permissions for cleanup
             progress_dir.chmod(0o755)
+
+
+class TestCleanupHeartbeatFreshness:
+    """Tests for heartbeat freshness check in _cleanup_stale_progress_for_issue()."""
+
+    def test_fresh_heartbeat_preserves_file(self, tmp_path: Path) -> None:
+        """Progress file with a fresh heartbeat is NOT removed."""
+        progress_dir = tmp_path / ".loom" / "progress"
+        progress_dir.mkdir(parents=True)
+        fresh_ts = (datetime.now(timezone.utc) - timedelta(seconds=60)).isoformat()
+        _write_progress(
+            progress_dir,
+            "shepherd-live123.json",
+            {"issue": 42, "task_id": "live123", "last_heartbeat": fresh_ts},
+        )
+
+        _make_context(tmp_path, issue=42, task_id="new5678")
+
+        assert (progress_dir / "shepherd-live123.json").exists()
+
+    def test_stale_heartbeat_removes_file(self, tmp_path: Path) -> None:
+        """Progress file with a stale heartbeat IS removed."""
+        progress_dir = tmp_path / ".loom" / "progress"
+        progress_dir.mkdir(parents=True)
+        stale_ts = (
+            datetime.now(timezone.utc) - timedelta(seconds=_HEARTBEAT_FRESH_THRESHOLD + 60)
+        ).isoformat()
+        _write_progress(
+            progress_dir,
+            "shepherd-dead123.json",
+            {"issue": 42, "task_id": "dead123", "last_heartbeat": stale_ts},
+        )
+
+        _make_context(tmp_path, issue=42, task_id="new5678")
+
+        assert not (progress_dir / "shepherd-dead123.json").exists()
+
+    def test_no_heartbeat_removes_file(self, tmp_path: Path) -> None:
+        """Progress file with no last_heartbeat field is removed (backward compat)."""
+        progress_dir = tmp_path / ".loom" / "progress"
+        progress_dir.mkdir(parents=True)
+        _write_progress(
+            progress_dir,
+            "shepherd-old123.json",
+            {"issue": 42, "task_id": "old123"},
+        )
+
+        _make_context(tmp_path, issue=42, task_id="new5678")
+
+        assert not (progress_dir / "shepherd-old123.json").exists()
+
+    def test_unparseable_heartbeat_removes_file(self, tmp_path: Path) -> None:
+        """Progress file with an invalid heartbeat timestamp is treated as stale."""
+        progress_dir = tmp_path / ".loom" / "progress"
+        progress_dir.mkdir(parents=True)
+        _write_progress(
+            progress_dir,
+            "shepherd-bad123.json",
+            {"issue": 42, "task_id": "bad123", "last_heartbeat": "not-a-timestamp"},
+        )
+
+        _make_context(tmp_path, issue=42, task_id="new5678")
+
+        assert not (progress_dir / "shepherd-bad123.json").exists()
+
+    def test_fresh_heartbeat_logs_skip_message(self, tmp_path: Path, caplog) -> None:
+        """Skipping a file with a fresh heartbeat logs an info message."""
+        progress_dir = tmp_path / ".loom" / "progress"
+        progress_dir.mkdir(parents=True)
+        fresh_ts = (datetime.now(timezone.utc) - timedelta(seconds=30)).isoformat()
+        _write_progress(
+            progress_dir,
+            "shepherd-live456.json",
+            {"issue": 42, "task_id": "live456", "last_heartbeat": fresh_ts},
+        )
+
+        with caplog.at_level(logging.INFO):
+            _make_context(tmp_path, issue=42, task_id="new5678")
+
+        assert "Skipping progress file" in caplog.text
+        assert "heartbeat is fresh" in caplog.text
 
 
 class TestReportMilestone:
