@@ -617,6 +617,27 @@ For detailed PR creation and quality requirements, see **builder-pr.md**.
 - Never touch PR labels after creation
 - Run `pnpm check:ci` before creating PR
 
+### MANDATORY: Derive Titles From Your Diff, Not the Issue
+
+**Before committing or creating a PR**, you MUST review your actual code changes and derive titles from them:
+
+```bash
+# Step 1: Review what you actually changed
+git diff --stat
+git diff   # Read the actual changes
+
+# Step 2: Write a commit message that describes the CODE CHANGE
+#   Ask: "What does this diff do?" — NOT "What issue is this for?"
+#
+#   WRONG: "feat: implement changes for issue #2678"
+#   WRONG: "Builder generates generic commit/PR titles despite explicit anti-patterns"
+#   RIGHT: "docs: add mandatory diff-review step before commit/PR creation"
+
+# Step 3: Use the same approach for the PR title
+```
+
+**The PR title and commit message MUST describe what the code change does, not reference the issue.** See builder-pr.md for the full rules, anti-patterns, and examples.
+
 ## Working Style
 
 - **Start**: `gh issue list --label="loom:issue"` to find work (pick oldest first for fair FIFO queue)

@@ -698,6 +698,10 @@ def validate_builder(
         if pr_found_by == "branch_name" and not check_only:
             _ensure_pr_body_references_issue(pr_num, issue, repo_root, task_id)
 
+        # Validate PR title is not generic (anti-pattern detection)
+        if not check_only:
+            _warn_generic_pr_title(pr_num, issue, repo_root, task_id)
+
         # Check for loom:review-requested label
         r = _run_gh(
             ["pr", "view", str(pr_num), "--json", "labels", "--jq", ".labels[].name"],
@@ -1148,6 +1152,55 @@ def _ensure_pr_body_references_issue(
             "heartbeat", task_id, repo_root,
             action=f"recovery: added 'Closes #{issue}' to PR #{pr} body",
         )
+
+
+# Generic PR title patterns that indicate the builder didn't derive a
+# meaningful title from its diff.  Each regex is matched case-insensitively.
+_GENERIC_TITLE_PATTERNS: list[re.Pattern[str]] = [
+    re.compile(r"implement\s+changes?\s+for\s+issue", re.IGNORECASE),
+    re.compile(r"address\s+issue\s+#?\d+", re.IGNORECASE),
+    re.compile(r"implement\s+feature\s+from\s+issue", re.IGNORECASE),
+    re.compile(r"^issue\s+#?\d+\s*$", re.IGNORECASE),
+]
+
+
+def _warn_generic_pr_title(
+    pr: int,
+    issue: int,
+    repo_root: Path,
+    task_id: str | None,
+) -> None:
+    """Log a warning if the PR title matches a known generic anti-pattern.
+
+    This is a *warning* (logged via milestone), not a hard failure, because
+    the builder already created the PR and blocking validation here would
+    disrupt the shepherd pipeline.  The warning surfaces in logs and
+    milestones so the issue can be tracked and the builder role docs
+    improved.
+    """
+    r = _run_gh(
+        ["pr", "view", str(pr), "--json", "title", "--jq", ".title"],
+        repo_root,
+    )
+    if r.returncode != 0:
+        return
+
+    title = r.stdout.strip()
+    if not title:
+        return
+
+    for pattern in _GENERIC_TITLE_PATTERNS:
+        if pattern.search(title):
+            _report_milestone(
+                "heartbeat",
+                task_id,
+                repo_root,
+                action=(
+                    f"warning: PR #{pr} has generic title matching "
+                    f"anti-pattern /{pattern.pattern}/: {title!r}"
+                ),
+            )
+            return
 
 
 # ---------------------------------------------------------------------------

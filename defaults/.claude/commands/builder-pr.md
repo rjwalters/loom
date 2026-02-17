@@ -415,6 +415,37 @@ Before creating a PR, verify your title:
 
 ---
 
+## Commit Messages: Same Rules as PR Titles
+
+Commit messages follow the **exact same rules** as PR titles above. Since this repo uses squash merge, the PR title becomes the final commit on main — but individual commit messages still matter for worktree history and debugging.
+
+### How to Write Commit Messages
+
+```bash
+# Step 1: Review your diff BEFORE writing the commit message
+git diff --stat
+git diff
+
+# Step 2: Describe what the code change does
+git commit -m "fix: validate PR title format in shepherd phase validator"
+
+# NOT: git commit -m "feat: implement changes for issue #2678"
+# NOT: git commit -m "fix: address issue #2557"
+```
+
+### Commit Message Anti-Patterns
+
+These patterns are **WRONG** — the shepherd will reject PRs with titles matching them:
+
+| Anti-Pattern | Why It's Wrong |
+|-------------|---------------|
+| `feat: implement changes for issue #N` | Describes the issue, not the code change |
+| `fix: address issue #N` | Says nothing about what was fixed |
+| `feat: implement feature from issue #N` | Generic — could be any feature |
+| `<copy of issue title>` | Issue titles describe problems; commits describe solutions |
+
+---
+
 ## Creating Pull Requests: Label and Auto-Close Requirements
 
 > **CRITICAL**: PRs MUST include `Closes #N` (or `Fixes #N` / `Resolves #N`) in the body.
