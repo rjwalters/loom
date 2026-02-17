@@ -11149,14 +11149,14 @@ class TestIsLowOutputSession:
         assert _is_low_output_session(tmp_path / "nonexistent.log") is False
 
     def test_no_output_returns_true(self, tmp_path: Path) -> None:
-        """Log with only ANSI escape sequences is an low output."""
+        """Log with only ANSI escape sequences is a low output."""
         log = tmp_path / "session.log"
         # Write only ANSI escape sequences (no meaningful content)
         log.write_text("\x1b[?2026l\x1b[0m\n")
         assert _is_low_output_session(log) is True
 
     def test_meaningful_output_returns_false(self, tmp_path: Path) -> None:
-        """Log with meaningful content after sentinel is NOT an low output."""
+        """Log with meaningful content after sentinel is NOT a low output."""
         log = tmp_path / "session.log"
         # Write sentinel + enough meaningful content to exceed threshold
         log.write_text(
@@ -11166,13 +11166,13 @@ class TestIsLowOutputSession:
         assert _is_low_output_session(log) is False
 
     def test_header_only_returns_true(self, tmp_path: Path) -> None:
-        """Log with only header lines is an low output."""
+        """Log with only header lines is a low output."""
         log = tmp_path / "session.log"
         log.write_text("# Loom Agent Log\n# Session: test\n")
         assert _is_low_output_session(log) is True
 
     def test_empty_log_returns_true(self, tmp_path: Path) -> None:
-        """Completely empty log is an low output."""
+        """Completely empty log is a low output."""
         log = tmp_path / "session.log"
         log.write_text("")
         assert _is_low_output_session(log) is True
@@ -11184,7 +11184,7 @@ class TestIsLowOutputSession:
 
         When the claude-wrapper writes pre-flight messages that exceed the
         100-char threshold but the CLI itself produces no output, the session
-        should still be detected as an low output.
+        should still be detected as a low output.
         """
         log = tmp_path / "session.log"
         log.write_text(
@@ -11203,7 +11203,7 @@ class TestIsLowOutputSession:
     def test_wrapper_preflight_with_sentinel_and_real_output(
         self, tmp_path: Path
     ) -> None:
-        """Real CLI output after sentinel should NOT be an low output."""
+        """Real CLI output after sentinel should NOT be a low output."""
         log = tmp_path / "session.log"
         log.write_text(
             "[2026-02-16 21:22:21] [INFO] Claude wrapper starting\n"
@@ -11369,7 +11369,7 @@ class TestRunWorkerPhaseLowOutput:
 
         When a degraded CLI session exits with a non-zero code (e.g., 2 for
         API error) but produced no meaningful output, it's functionally the
-        same as an low-output and should be classified as code 6.
+        same as a low-output and should be classified as code 6.
         See issue #2446.
         """
 
@@ -14637,7 +14637,7 @@ class TestLowOutputRetryStrategies:
 class TestRunPhaseWithRetryLowOutputClassification:
     """Test cause-specific retry behavior in run_phase_with_retry.
 
-    When an low-output (exit code 6) is detected, the retry loop
+    When a low-output (exit code 6) is detected, the retry loop
     classifies the root cause and uses cause-specific retry strategies.
     See issue #2518.
     """
