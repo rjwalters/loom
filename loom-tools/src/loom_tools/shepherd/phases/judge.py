@@ -757,6 +757,9 @@ class JudgePhase:
 
         return True
 
+    # Regex to match rotated timestamp suffixes like .20260217-095910
+    _ROTATED_LOG_RE = re.compile(r"\.\d{8}-\d{6}$")
+
     def _get_log_path(self, ctx: ShepherdContext) -> Path:
         """Return the most recent judge worker log file path.
 
@@ -767,11 +770,14 @@ class JudgePhase:
         """
         log_dir = LoomPaths(ctx.repo_root).logs_dir
         base = f"loom-judge-issue-{ctx.config.issue}"
-        # Match base name and any attempt suffixes, excluding rotated
-        # timestamp logs (e.g., .20260217-095910.log)
+        # Match exact base name, optionally followed by attempt suffix (-aN).
+        # Two globs avoid overmatching on longer issue numbers (e.g., issue-420).
+        # Exclude rotated timestamp logs (e.g., .20260217-095910.log).
+        raw = list(log_dir.glob(f"{base}.log")) + list(
+            log_dir.glob(f"{base}-a*.log")
+        )
         candidates = [
-            p for p in log_dir.glob(f"{base}*.log")
-            if not any(c.isdigit() and len(c) > 4 for c in p.stem.split(".")[-1:])
+            p for p in raw if not self._ROTATED_LOG_RE.search(p.stem)
         ]
         if candidates:
             # Return the most recently modified log
