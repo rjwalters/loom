@@ -8932,7 +8932,7 @@ class TestBuilderDirectCompletion:
         assert "feature/issue-42" in call_args
         assert "--title" in call_args
         title_idx = call_args.index("--title")
-        assert call_args[title_idx + 1] == "Fix something for issue #42"
+        assert call_args[title_idx + 1] == "feat: fix something for issue #42"
         assert "--label" in call_args
         assert "loom:review-requested" in call_args
         assert "--body" in call_args

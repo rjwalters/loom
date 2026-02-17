@@ -148,3 +148,43 @@ class TestNamingConventions:
         """Test that class constants are correctly defined."""
         assert NamingConventions.BRANCH_PREFIX == "feature/issue-"
         assert NamingConventions.WORKTREE_PREFIX == "issue-"
+
+    # --- pr_title tests ---
+
+    def test_pr_title_already_has_prefix(self) -> None:
+        """Titles that already start with a conventional commit prefix are kept."""
+        assert NamingConventions.pr_title("fix: resolve crash on startup") == "fix: resolve crash on startup"
+        assert NamingConventions.pr_title("feat: add dark mode toggle") == "feat: add dark mode toggle"
+        assert NamingConventions.pr_title("refactor: simplify auth flow") == "refactor: simplify auth flow"
+        assert NamingConventions.pr_title("docs: update README") == "docs: update README"
+        assert NamingConventions.pr_title("test: add unit tests for parser") == "test: add unit tests for parser"
+        assert NamingConventions.pr_title("chore: bump dependencies") == "chore: bump dependencies"
+        assert NamingConventions.pr_title("perf: cache database queries") == "perf: cache database queries"
+
+    def test_pr_title_prefix_case_normalised(self) -> None:
+        """Prefix casing is normalised to lowercase."""
+        assert NamingConventions.pr_title("Fix: resolve crash") == "fix: resolve crash"
+        assert NamingConventions.pr_title("FEAT: add feature") == "feat: add feature"
+        assert NamingConventions.pr_title("Refactor: clean up code") == "refactor: clean up code"
+
+    def test_pr_title_no_prefix_gets_feat(self) -> None:
+        """Titles without a prefix get 'feat:' prepended."""
+        assert NamingConventions.pr_title("Add dark mode toggle") == "feat: add dark mode toggle"
+        assert NamingConventions.pr_title("Builder should generate descriptive PR titles") == "feat: builder should generate descriptive PR titles"
+
+    def test_pr_title_empty_with_issue_number(self) -> None:
+        """Empty titles fall back to issue number."""
+        assert NamingConventions.pr_title("", 42) == "feat: implement changes for issue #42"
+        assert NamingConventions.pr_title("  ", 42) == "feat: implement changes for issue #42"
+
+    def test_pr_title_empty_without_issue_number(self) -> None:
+        """Empty titles without issue number produce generic title."""
+        assert NamingConventions.pr_title("") == "feat: implement changes"
+        assert NamingConventions.pr_title(None) == "feat: implement changes"  # type: ignore[arg-type]
+
+    def test_pr_title_never_returns_issue_n(self) -> None:
+        """Verify we never produce the old 'Issue #N' format."""
+        result = NamingConventions.pr_title("", 42)
+        assert not result.startswith("Issue #")
+        result2 = NamingConventions.pr_title("Some title", 42)
+        assert not result2.startswith("Issue #")

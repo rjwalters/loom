@@ -337,6 +337,70 @@ Local verification:
 
 ---
 
+## PR Titles: Conventional Commit Style Required
+
+**CRITICAL:** PR titles MUST be descriptive and use conventional commit prefixes. Never use generic titles like "Issue #N".
+
+### Format
+
+```
+<type>: <short description of the change>
+```
+
+### Allowed Prefixes
+
+| Prefix | When to Use |
+|--------|------------|
+| `fix:` | Bug fixes |
+| `feat:` | New features or capabilities |
+| `refactor:` | Code restructuring without behavior change |
+| `docs:` | Documentation-only changes |
+| `test:` | Adding or updating tests |
+| `chore:` | Build, config, or tooling changes |
+| `perf:` | Performance improvements |
+
+### How to Derive the Title
+
+1. Read the issue title and your actual changes
+2. Pick the appropriate prefix based on what the change **does** (not what the issue asks)
+3. Write a concise description (under 70 characters total) that summarizes the change
+
+### Examples
+
+**WRONG:**
+```
+Issue #2557
+```
+
+**WRONG (raw issue title copied as PR title):**
+```
+Builder should generate descriptive PR titles instead of generic 'Issue #N'
+```
+
+**CORRECT:**
+```
+fix: require conventional commit PR titles in builder role
+feat: add workspace snapshot caching
+refactor: rename instant-exit to low-output terminology
+docs: update troubleshooting guide for worktree cleanup
+```
+
+### Why This Matters
+
+- `gh pr list`, `git log --oneline`, and release notes become readable at a glance
+- Aligns with the existing commit style in this repository
+- Enables automated changelog generation
+
+### PR Title Checklist
+
+Before creating a PR, verify your title:
+- [ ] Starts with a conventional commit prefix (`fix:`, `feat:`, etc.)
+- [ ] Describes what the PR **does**, not what issue it addresses
+- [ ] Is under 70 characters
+- [ ] Does NOT contain "Issue #N" or the raw issue number as the title
+
+---
+
 ## Creating Pull Requests: Label and Auto-Close Requirements
 
 > **CRITICAL**: PRs MUST include `Closes #N` (or `Fixes #N` / `Resolves #N`) in the body.
@@ -430,19 +494,21 @@ GitHub's auto-close feature only works with specific keywords at the start of a 
 
 When creating a PR, verify:
 
-1. **Acceptance criteria verified** - Each criterion from issue explicitly checked (see "Acceptance Criteria Verification" above)
-2. PR description uses "Closes #X" syntax (not "Issue #X" or "Addresses #X")
-3. Issue number is correct
-4. PR has `loom:review-requested` label
-5. All CI checks pass (`pnpm check:ci` locally)
-6. PR description includes verification table for each criterion
-7. Tests added/updated as needed
+1. **PR title uses conventional commit format** - e.g., `fix: descriptive summary` (see "PR Titles" above)
+2. **Acceptance criteria verified** - Each criterion from issue explicitly checked (see "Acceptance Criteria Verification" above)
+3. PR description uses "Closes #X" syntax (not "Issue #X" or "Addresses #X")
+4. Issue number is correct
+5. PR has `loom:review-requested` label
+6. All CI checks pass (`pnpm check:ci` locally)
+7. PR description includes verification table for each criterion
+8. Tests added/updated as needed
 
 ### Creating the PR
 
 ```bash
 # CORRECT way to create PR
-gh pr create --label "loom:review-requested" --body "$(cat <<'EOF'
+# Title MUST use conventional commit format: "fix:", "feat:", "refactor:", etc.
+gh pr create --title "fix: descriptive summary of the change" --label "loom:review-requested" --body "$(cat <<'EOF'
 ## Summary
 Brief description of what this PR does and why.
 

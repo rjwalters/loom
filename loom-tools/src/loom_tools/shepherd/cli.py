@@ -11,6 +11,7 @@ from pathlib import Path
 
 from loom_tools.common.git import get_uncommitted_files
 from loom_tools.common.logging import log_error, log_info, log_success, log_warning
+from loom_tools.common.paths import NamingConventions
 from loom_tools.common.repo import find_repo_root
 from loom_tools.shepherd.config import ExecutionMode, Phase, QualityGates, ShepherdConfig
 from loom_tools.shepherd.context import ShepherdContext
@@ -1361,7 +1362,7 @@ def _mark_builder_test_failure(ctx: ShepherdContext) -> None:
             f"# Fix the failing tests\n"
             f"git add . && git commit -m 'Fix failing tests'\n"
             f"git push\n"
-            f"gh pr create --title {shlex.quote(ctx.issue_title or f'Issue #{ctx.config.issue}')} --label loom:review-requested --body 'Closes #{ctx.config.issue}'\n"
+            f"gh pr create --title {shlex.quote(NamingConventions.pr_title(ctx.issue_title, ctx.config.issue))} --label loom:review-requested --body 'Closes #{ctx.config.issue}'\n"
             f"gh issue edit {ctx.config.issue} --remove-label loom:failed:builder-tests\n"
             f"```\n\n"
             f"**Option B: Reset and retry**\n"
@@ -1681,7 +1682,7 @@ def _format_diagnostics_for_comment(
             lines.append('git commit -m "Complete implementation"')
         if not remote_exists or commits_ahead > 0 or uncommitted_count > 0:
             lines.append(f"git push -u origin feature/issue-{issue}")
-        title = issue_title or f"Issue #{issue}"
+        title = NamingConventions.pr_title(issue_title, issue)
         lines.append(f'gh pr create --title {shlex.quote(title)} --label "loom:review-requested" --body "Closes #{issue}"')
         lines.append(f"gh issue edit {issue} --remove-label loom:failed:builder")
         lines.append("```")
