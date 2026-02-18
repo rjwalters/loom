@@ -16060,10 +16060,15 @@ class TestRunWorkerPhaseAuthFailure:
 
         assert exit_code == 0
 
-    def test_exit_0_not_overridden_by_mcp_failure_pattern(
+    def test_exit_0_with_mcp_failure_returns_code_7(
         self, mock_context: MagicMock
     ) -> None:
-        """Exit 0 should never be overridden by MCP failure log pattern (issue #2545)."""
+        """Exit 0 with MCP failure markers should return code 7 (issue #2767).
+
+        The Claude CLI can exit 0 when the MCP server fails mid-session.
+        Since _is_mcp_failure() already gates on low output volume, this
+        correctly detects the failure without misclassifying productive sessions.
+        """
 
         def mock_spawn(cmd, **kwargs):
             result = MagicMock()
@@ -16101,7 +16106,7 @@ class TestRunWorkerPhaseAuthFailure:
                 phase="builder",
             )
 
-        assert exit_code == 0
+        assert exit_code == 7
 
     def test_auth_failure_takes_priority_over_low_output(
         self, mock_context: MagicMock

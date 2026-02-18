@@ -1438,7 +1438,14 @@ def run_worker_phase(
 
     # Check for MCP failure (exit code 7) — more specific than low-output,
     # with different retry/backoff strategy.  See issues #2135, #2279.
-    if wait_exit != 0 and _is_mcp_failure(log_path):
+    #
+    # Unlike auth/ghost/low-output, MCP failure is checked regardless of exit
+    # code.  The Claude CLI can exit 0 when the MCP server fails mid-session:
+    # it starts, receives the prompt, can't use MCP tools, produces nothing,
+    # and exits "cleanly."  The _is_mcp_failure() function already gates on
+    # low output volume, so productive sessions aren't misclassified.
+    # See issue #2767.
+    if _is_mcp_failure(log_path):
         errors = extract_log_errors(log_path)
         cause = f": {errors[-1]}" if errors else ""
         log_warning(
