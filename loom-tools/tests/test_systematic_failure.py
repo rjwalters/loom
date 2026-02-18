@@ -245,6 +245,58 @@ class TestDetectSystematicFailure:
         state = _read_state(repo)
         assert "systematic_failure" not in state
 
+    def test_infra_failures_not_counted(self, repo: pathlib.Path) -> None:
+        """3 consecutive infrastructure failures should NOT trigger detection."""
+        _write_state(
+            repo,
+            {
+                "recent_failures": [
+                    {"error_class": "mcp_infrastructure_failure"},
+                    {"error_class": "mcp_infrastructure_failure"},
+                    {"error_class": "mcp_infrastructure_failure"},
+                ]
+            },
+        )
+        result = detect_systematic_failure(repo)
+        assert result is None
+
+    def test_infra_mixed_with_issue_failures(self, repo: pathlib.Path) -> None:
+        """Infra failures interspersed with issue failures don't inflate the count."""
+        _write_state(
+            repo,
+            {
+                "recent_failures": [
+                    {"error_class": "builder_stuck"},
+                    {"error_class": "mcp_infrastructure_failure"},
+                    {"error_class": "builder_stuck"},
+                    {"error_class": "auth_infrastructure_failure"},
+                    {"error_class": "builder_stuck"},
+                ]
+            },
+        )
+        result = detect_systematic_failure(repo)
+        assert result is not None
+        assert result.pattern == "builder_stuck"
+        assert result.count == 3
+
+    def test_only_non_infra_exceeds_threshold(self, repo: pathlib.Path) -> None:
+        """Only non-infra failures that exceed the threshold trigger detection."""
+        _write_state(
+            repo,
+            {
+                "recent_failures": [
+                    {"error_class": "mcp_infrastructure_failure"},
+                    {"error_class": "mcp_infrastructure_failure"},
+                    {"error_class": "builder_stuck"},
+                    {"error_class": "judge_stuck"},
+                    {"error_class": "builder_stuck"},
+                ]
+            },
+        )
+        # Only 3 non-infra: [builder_stuck, judge_stuck, builder_stuck] — mixed classes
+        result = detect_systematic_failure(repo)
+        assert result is None
+
     def test_custom_threshold(
         self, repo: pathlib.Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:

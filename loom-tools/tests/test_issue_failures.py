@@ -9,6 +9,7 @@ import pytest
 
 from loom_tools.common.issue_failures import (
     BACKOFF_BASE,
+    INFRASTRUCTURE_ERROR_CLASSES,
     MAX_FAILURES_BEFORE_BLOCK,
     IssueFailureEntry,
     IssueFailureLog,
@@ -68,6 +69,25 @@ class TestIssueFailureEntry:
 
     def test_should_auto_block_true(self) -> None:
         entry = IssueFailureEntry(total_failures=MAX_FAILURES_BEFORE_BLOCK)
+        assert entry.should_auto_block is True
+
+    def test_infrastructure_error_never_auto_blocks(self) -> None:
+        """Infrastructure failures should never trigger auto-block, regardless of count."""
+        for error_class in INFRASTRUCTURE_ERROR_CLASSES:
+            entry = IssueFailureEntry(
+                total_failures=MAX_FAILURES_BEFORE_BLOCK + 10,
+                error_class=error_class,
+            )
+            assert entry.should_auto_block is False, (
+                f"{error_class} should not auto-block"
+            )
+
+    def test_non_infrastructure_error_still_auto_blocks(self) -> None:
+        """Non-infrastructure failures still auto-block at threshold."""
+        entry = IssueFailureEntry(
+            total_failures=MAX_FAILURES_BEFORE_BLOCK,
+            error_class="builder_stuck",
+        )
         assert entry.should_auto_block is True
 
     def test_round_trip(self) -> None:
@@ -251,6 +271,15 @@ class TestMergeIntoDaemonState:
         retries: dict = {}
         result = merge_into_daemon_state(repo, retries)
         assert result["42"]["retry_exhausted"] is True
+
+    def test_merge_does_not_set_retry_exhausted_for_infra(self, repo: pathlib.Path) -> None:
+        for _ in range(MAX_FAILURES_BEFORE_BLOCK):
+            record_failure(repo, 42, error_class="mcp_infrastructure_failure")
+
+        retries: dict = {}
+        result = merge_into_daemon_state(repo, retries)
+        assert result["42"]["retry_count"] == MAX_FAILURES_BEFORE_BLOCK
+        assert "retry_exhausted" not in result["42"] or result["42"].get("retry_exhausted") is not True
 
     def test_merge_no_failures(self, repo: pathlib.Path) -> None:
         retries = {"42": {"retry_count": 1}}
