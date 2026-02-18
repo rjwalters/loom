@@ -136,6 +136,8 @@ Agents coordinate through GitHub labels. See `.github/labels.yml` for full defin
 
 **Epic Lifecycle**: `loom:epic` → Champion creates phased `loom:architect` + `loom:epic-phase` issues.
 
+> **Note on label cleanup**: Loom intentionally does **not** remove labels from closed issues or merged PRs (e.g., `loom:pr` remains on merged PRs). Labels on closed/merged items are harmless — all agents filter by open state — and skipping post-close label removal saves gh API calls. Do not implement label cleanup on merge/close (see issue #2838).
+
 ## Git Worktree Workflow
 
 Loom uses git worktrees to isolate agent work.
