@@ -1843,21 +1843,6 @@ def run_worker_phase(
         )
         return 11
 
-    # Check for thinking stall (exit code 14) — output with zero tool calls.
-    # The session produced thinking/spinner output but never invoked a tool,
-    # indicating extended thinking under resource pressure.  Not retryable:
-    # the same conditions will produce the same result.  Check after degraded
-    # (which is more specific) and before MCP/low-output.  See issue #2784.
-    if _is_thinking_stall_session(log_path):
-        if postmortem is not None:
-            log_warning(f"Post-mortem: {postmortem['summary']}")
-        log_warning(
-            f"Thinking stall detected for {role} session '{actual_name}': "
-            f"output produced but zero tool calls "
-            f"(exit code {wait_exit}, log: {log_path})"
-        )
-        return 14
-
     # Check for MCP failure (exit code 7) — more specific than low-output,
     # with different retry/backoff strategy.  See issues #2135, #2279.
     #
@@ -1866,7 +1851,14 @@ def run_worker_phase(
     # it starts, receives the prompt, can't use MCP tools, produces nothing,
     # and exits "cleanly."  The _is_mcp_failure() function already gates on
     # low output volume, so productive sessions aren't misclassified.
-    # See issue #2767.
+    #
+    # IMPORTANT: Check MCP failure BEFORE thinking stall.  MCP failure
+    # sessions show the CLI startup UI (>100 chars, no tool calls) which
+    # matches the thinking stall pattern.  Thinking stall is not retryable
+    # (exit 14) but MCP failure is (exit 7).  Since _is_mcp_failure() gates
+    # on low output volume, productive sessions that genuinely stall in
+    # extended thinking won't be misclassified as MCP failures — they have
+    # too much output to pass the MCP volume gate.  See issues #2767, #2804.
     if _is_mcp_failure(log_path):
         # Gather postmortem lazily for exit-0 MCP failures (postmortem is
         # only pre-gathered for non-zero exits above).  See issue #2766.
@@ -1884,6 +1876,24 @@ def run_worker_phase(
         )
         log_warning(f"Post-mortem: {postmortem['summary']}")
         return 7
+
+    # Check for thinking stall (exit code 14) — output with zero tool calls.
+    # The session produced thinking/spinner output but never invoked a tool,
+    # indicating extended thinking under resource pressure.  Not retryable:
+    # the same conditions will produce the same result.  Check after degraded
+    # (which is more specific) and after MCP failure (which is retryable and
+    # would otherwise be misclassified as thinking stall).
+    # See issues #2784, #2804.
+    if _is_thinking_stall_session(log_path):
+        if postmortem is not None:
+            log_warning(f"Post-mortem: {postmortem['summary']}")
+        log_warning(
+            f"Thinking stall detected for {role} session '{actual_name}': "
+            f"output produced but zero tool calls "
+            f"(exit code {wait_exit}, log: {log_path})"
+        )
+        return 14
+
     if wait_exit != 0 and _is_low_output_session(log_path):
         assert postmortem is not None
         log_warning(
