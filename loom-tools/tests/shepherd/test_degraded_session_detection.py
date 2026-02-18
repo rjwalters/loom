@@ -1,9 +1,16 @@
-"""Tests for degraded session detection (issue #2631).
+"""Tests for degraded session detection (issues #2631, #2781).
 
-Tests the detection of builder sessions running under rate limits that enter
-a non-productive Crystallizing loop.  Detection requires BOTH:
-1. A rate limit warning ("You've used X% of your weekly limit")
-2. Excessive "Crystallizing..." repetitions (>= threshold)
+Tests the detection of builder sessions degraded by rate limits.  Two detection
+paths:
+
+Path A — "Stop and wait for limit to reset" modal (standalone, issue #2781):
+  The CLI shows an interactive rate limit prompt that blocks forever in
+  automated sessions.  This is a definitive rate limit signal.
+
+Path B — Rate limit warning + Crystallizing loop (issue #2631):
+  Requires BOTH:
+  1. A rate limit warning ("You've used X% of your weekly limit")
+  2. Excessive "Crystallizing..." repetitions (>= threshold)
 """
 
 from __future__ import annotations
@@ -19,6 +26,7 @@ from loom_tools.shepherd.context import ShepherdContext
 from loom_tools.shepherd.phases.base import (
     DEGRADED_CRYSTALLIZING_THRESHOLD,
     DEGRADED_SCAN_TAIL_LINES,
+    DEGRADED_STOP_AND_WAIT_PATTERN,
     _is_degraded_session,
     _scan_log_for_degradation,
 )
@@ -124,6 +132,43 @@ class TestIsDegradedSession:
             _write_log(tmp_log, _make_degraded_log(rate_limit_pct=pct))
             assert _is_degraded_session(tmp_log) is True, f"Failed for {pct}%"
 
+    # --- "Stop and wait" modal detection (issue #2781) ---
+
+    def test_degraded_with_stop_and_wait_modal(self, tmp_log: Path) -> None:
+        """'Stop and wait for limit to reset' modal → degraded (standalone)."""
+        content = (
+            "What do you want to do?\n"
+            "❯ 1. Stop and wait for limit to reset\n"
+            "Enter to confirm · Esc to cancel\n"
+        )
+        _write_log(tmp_log, content)
+        assert _is_degraded_session(tmp_log) is True
+
+    def test_degraded_with_stop_and_wait_no_spaces(self, tmp_log: Path) -> None:
+        """ANSI-stripped 'Stopandwaitforlimittoreset' → degraded."""
+        content = (
+            "Whatdoyouwanttodo?\n"
+            "❯1.Stopandwaitforlimittoreset\n"
+            "Entertoconfirm·Esctocancel\n"
+        )
+        _write_log(tmp_log, content)
+        assert _is_degraded_session(tmp_log) is True
+
+    def test_stop_and_wait_without_crystallizing(self, tmp_log: Path) -> None:
+        """'Stop and wait' modal needs no Crystallizing to detect."""
+        content = (
+            "Some normal output\n"
+            "❯ 1. Stop and wait for limit to reset\n"
+        )
+        _write_log(tmp_log, content)
+        assert _is_degraded_session(tmp_log) is True
+
+    def test_stop_and_wait_without_rate_limit_warning(self, tmp_log: Path) -> None:
+        """'Stop and wait' needs no percentage-based rate limit warning."""
+        content = "Stop and wait for limit to reset\n"
+        _write_log(tmp_log, content)
+        assert _is_degraded_session(tmp_log) is True
+
 
 # ---------------------------------------------------------------------------
 # _scan_log_for_degradation tests (in-flight polling variant)
@@ -152,6 +197,23 @@ class TestScanLogForDegradation:
     def test_handles_missing_file(self, tmp_log: Path) -> None:
         """Missing file returns False without error."""
         assert _scan_log_for_degradation(tmp_log) is False
+
+    def test_detects_stop_and_wait_modal(self, tmp_log: Path) -> None:
+        """Detects 'Stop and wait' rate limit modal during polling."""
+        content = (
+            "Working on feature...\n"
+            "What do you want to do?\n"
+            "❯ 1. Stop and wait for limit to reset\n"
+            "Enter to confirm · Esc to cancel\n"
+        )
+        _write_log(tmp_log, content)
+        assert _scan_log_for_degradation(tmp_log) is True
+
+    def test_detects_stop_and_wait_no_spaces(self, tmp_log: Path) -> None:
+        """Detects ANSI-stripped 'Stopandwaitforlimittoreset' during polling."""
+        content = "❯1.Stopandwaitforlimittoreset\n"
+        _write_log(tmp_log, content)
+        assert _scan_log_for_degradation(tmp_log) is True
 
 
 # ---------------------------------------------------------------------------
@@ -214,4 +276,3 @@ class TestBuilderDegradedSessionHandling:
         assert result.data.get("degraded_session") is True
         assert result.data.get("exit_code") == 11
         assert "rate limit" in result.message.lower()
-        assert "crystallizing" in result.message.lower()

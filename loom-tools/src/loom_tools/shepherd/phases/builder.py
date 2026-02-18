@@ -498,20 +498,19 @@ class BuilderPhase:
             )
 
         if exit_code == 11:
-            # Degraded session: builder ran under rate limits and entered a
-            # Crystallizing loop, producing no useful work.  Not retryable —
-            # the rate limit won't resolve until it resets.  See issue #2631.
+            # Degraded session: builder hit rate limits (Crystallizing loop
+            # or "Stop and wait" modal).  Not retryable — the rate limit
+            # won't resolve until it resets.  See issues #2631, #2781.
             log_warning(
                 f"Degraded session for issue #{ctx.config.issue}: "
-                f"builder was rate-limited and entered Crystallizing loop"
+                f"builder was rate-limited"
             )
             self._cleanup_stale_worktree(ctx)
             return PhaseResult(
                 status=PhaseStatus.FAILED,
                 message=(
-                    "builder session degraded: rate limit warnings and "
-                    "Crystallizing loop detected (not retryable until "
-                    "rate limit resets)"
+                    "builder session degraded: rate limit detected "
+                    "(not retryable until rate limit resets)"
                 ),
                 phase_name="builder",
                 data={
