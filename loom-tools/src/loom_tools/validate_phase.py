@@ -988,12 +988,15 @@ def validate_builder(
     # Detect whether the builder was rate-limited (affects PR messaging)
     rate_limited = _is_rate_limited_builder_exit(issue, repo_root)
 
-    # Fetch issue title for the PR title
+    # Fetch issue title and generate a conventional PR title
+    from loom_tools.common.paths import NamingConventions
+
     r_title = _run_gh(
         ["issue", "view", str(issue), "--json", "title", "--jq", ".title"],
         repo_root,
     )
-    pr_title = r_title.stdout.strip() if r_title.returncode == 0 and r_title.stdout.strip() else f"Issue #{issue}"
+    raw_title = r_title.stdout.strip() if r_title.returncode == 0 and r_title.stdout.strip() else None
+    pr_title = NamingConventions.pr_title(raw_title, issue)
 
     pr_body = _build_recovery_pr_body(issue, worktree, rate_limited=rate_limited)
 
