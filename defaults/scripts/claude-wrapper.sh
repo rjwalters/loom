@@ -807,6 +807,20 @@ start_output_monitor() {
                     break
                 fi
 
+                # Check for 100% weekly usage limit banner (see issue #2859).
+                # "You've used 100% of your weekly limit · resets ..." normalizes
+                # to "Youveused100ofyourweeklylimit...".  Unlike the plan-limit
+                # prompt, this does NOT show an interactive modal — the CLI just
+                # keeps spinning indefinitely.  Kill immediately and write the
+                # RATE_LIMIT_ABORT sentinel so the shepherd classifies this as
+                # non-retryable (same as the plan-limit case).
+                if echo "${normalized}" | grep -qi "Youveused100ofyourweeklylimit" 2>/dev/null; then
+                    log_warn "Output monitor: Claude weekly usage limit exhausted (100%) — killing claude"
+                    echo "# RATE_LIMIT_ABORT" >&2
+                    pkill -INT -P $$ -f "claude" 2>/dev/null || true
+                    break
+                fi
+
                 local found_error=false
                 for pattern in "500 Internal Server Error" "Rate limit exceeded" \
                     "overloaded" "temporarily unavailable" "503 Service" \
@@ -905,6 +919,13 @@ start_startup_monitor() {
             head_normalized=$(echo "${head_content}" | LC_ALL=C tr -cd '[:alnum:]')
             if echo "${head_normalized}" | grep -qi "Stopandwaitforlimittoreset" 2>/dev/null; then
                 log_warn "Startup monitor: CLI usage/plan limit prompt detected — killing claude"
+                echo "# RATE_LIMIT_ABORT" >&2
+                pkill -INT -P $$ -f "claude" 2>/dev/null || true
+                break
+            fi
+            # Check for 100% weekly usage limit in early output (see issue #2859).
+            if echo "${head_normalized}" | grep -qi "Youveused100ofyourweeklylimit" 2>/dev/null; then
+                log_warn "Startup monitor: Claude weekly usage limit exhausted (100%) — killing claude"
                 echo "# RATE_LIMIT_ABORT" >&2
                 pkill -INT -P $$ -f "claude" 2>/dev/null || true
                 break
