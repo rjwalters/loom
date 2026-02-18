@@ -2216,6 +2216,21 @@ def _record_fallback_failure(ctx: ShepherdContext, exit_code: int) -> None:
             pass  # Best-effort — fall through to unknown_failure
 
     try:
+        # Skip systematic failure recording if a PR already exists for this
+        # issue — the builder succeeded at its core task; only the post-
+        # completion teardown failed (e.g. thinking stall).  Counting this
+        # against the issue would cause false-positive loom:blocked
+        # escalations.  See issue #2854.
+        from loom_tools.shepherd.labels import get_pr_for_issue
+
+        existing_pr = get_pr_for_issue(ctx.config.issue, repo_root=ctx.repo_root)
+        if existing_pr is not None:
+            log_info(
+                f"Skipping systematic failure counter: PR #{existing_pr} already "
+                f"exists for issue #{ctx.config.issue} (builder succeeded)"
+            )
+            return
+
         record_blocked_reason(
             ctx.repo_root,
             ctx.config.issue,
