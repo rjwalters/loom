@@ -875,7 +875,7 @@ start_startup_monitor() {
     local monitor_pid_file="$2"
 
     (
-        local check_interval=5
+        local check_interval=2
         local elapsed=0
 
         while [[ "${elapsed}" -lt "${STARTUP_MONITOR_WINDOW}" ]]; do
@@ -920,25 +920,24 @@ start_startup_monitor() {
             done
 
             if [[ "${found_failure}" == "true" ]]; then
-                log_warn "Startup monitor: detected '${matched_pattern}' in early output"
+                log_info "Startup monitor: detected '${matched_pattern}' in early output"
 
-                # Poll every 2s within the grace period for the loom MCP
-                # to connect.  MCP init typically takes ~5s so a single-shot
-                # check was prone to race conditions (see issue #2660).
+                # Poll for loom MCP connection within the grace period.
+                # Check BEFORE sleeping so that if the MCP connected before
+                # the failure was noticed (common case — MCP init ~1-3s,
+                # first output check at ~2s) we skip the delay entirely.
+                # See issue #2660 for why single-shot was insufficient.
+                # See issue #2763 for check_interval reduction (5s → 2s).
                 # If all project MCPs connected, the session is allowed to
                 # continue (global plugin failures won't self-resolve).
                 # Otherwise, we kill the session to avoid a degraded state
                 # where injected commands are not processed (see #2652).
-                log_warn "Startup monitor: polling for loom MCP connection (up to ${STARTUP_GRACE_PERIOD}s)"
                 local poll_interval=2
                 local grace_elapsed=0
                 local loom_connected=false
                 local debug_log="${CLAUDE_CONFIG_DIR:-}/debug/latest"
 
                 while [[ "${grace_elapsed}" -lt "${STARTUP_GRACE_PERIOD}" ]]; do
-                    sleep "${poll_interval}"
-                    grace_elapsed=$((grace_elapsed + poll_interval))
-
                     # Session ended on its own — nothing to kill
                     if [[ ! -f "${output_file}" ]]; then
                         loom_connected=true  # not a failure, just exited
@@ -951,6 +950,10 @@ start_startup_monitor() {
                         loom_connected=true
                         break
                     fi
+
+                    # Sleep AFTER checking so the first iteration is instant
+                    sleep "${poll_interval}"
+                    grace_elapsed=$((grace_elapsed + poll_interval))
                 done
 
                 if [[ "${loom_connected}" == "true" ]]; then
@@ -979,7 +982,7 @@ start_startup_monitor() {
                     fi
 
                     if [[ "${all_project_ok}" == "true" ]]; then
-                        log_warn "Startup monitor: all project MCP servers connected — only global plugin/MCP failures detected, allowing session to continue"
+                        log_info "Startup monitor: only global plugin/MCP failures detected, project MCPs OK — continuing"
                         break
                     else
                         log_warn "Startup monitor: project MCP failure detected — killing session for clean restart (see issue #2652)"

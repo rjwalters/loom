@@ -96,10 +96,15 @@ export PYTHONUNBUFFERED=1
 
 if [[ -n "$LOOM_TOOLS" ]] && [[ -x "$LOOM_TOOLS/.venv/bin/loom-shepherd" ]]; then
     # Use venv from loom-tools directory
-    exec "$LOOM_TOOLS/.venv/bin/loom-shepherd" "${args[@]}"
+    # Note: intentionally NOT using exec. exec replaces the shell process,
+    # which causes output to be invisible in some CLI tool contexts (e.g.,
+    # Claude Code Bash tool) because the tool loses its output capture handle
+    # on the replaced process. Running as a child preserves output capture
+    # while set -e ensures exit code propagation.
+    "$LOOM_TOOLS/.venv/bin/loom-shepherd" "${args[@]}"
 elif command -v loom-shepherd &>/dev/null; then
-    # System-installed
-    exec loom-shepherd "${args[@]}"
+    # System-installed (same rationale as above — no exec)
+    loom-shepherd "${args[@]}"
 else
     echo "[ERROR] Python shepherd not available." >&2
     echo "" >&2

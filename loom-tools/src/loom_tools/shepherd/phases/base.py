@@ -98,6 +98,12 @@ MCP_FAILURE_MIN_OUTPUT_CHARS = 500
 MCP_FAILURE_MAX_RETRIES = 3
 MCP_FAILURE_BACKOFF_SECONDS = [5, 15, 30]
 
+# Startup monitor resolution marker.  When this substring appears in a session
+# log, the wrapper's startup monitor confirmed that all *project* MCP servers
+# (from .mcp.json) connected successfully — any "MCP server failed" text is
+# status-bar noise from global plugins, not a real failure.  See issue #2782.
+_STARTUP_MONITOR_MCP_RESOLUTION = "all project MCP servers connected"
+
 # Ghost session detection and retry settings.
 # A "ghost session" is one that exits almost immediately (0s duration)
 # with no meaningful output — the CLI spawned but never did any work.
@@ -130,6 +136,15 @@ DEGRADED_SESSION_PATTERNS = [
     re.compile(r"Crystallizing", re.IGNORECASE),
 ]
 
+# "Stop and wait for limit to reset" — the Claude CLI's interactive rate
+# limit modal.  In automated sessions this blocks forever (no user to press
+# Enter).  This is a definitive rate limit signal that classifies as degraded
+# independently of Crystallizing patterns.  The \s* allows for ANSI-stripped
+# output where spaces may be missing.  See issue #2781.
+DEGRADED_STOP_AND_WAIT_PATTERN = re.compile(
+    r"Stop\s*and\s*wait\s*for\s*limit\s*to\s*reset", re.IGNORECASE
+)
+
 # Minimum number of "Crystallizing" occurrences in the last N lines
 # to classify a session as degraded (a single occurrence during normal
 # thinking is not concerning).
@@ -141,6 +156,26 @@ DEGRADED_SCAN_TAIL_LINES = 100
 # How often (in seconds) to scan the log for degradation during polling.
 # Must be a multiple of _HEARTBEAT_POLL_INTERVAL for alignment.
 _DEGRADED_SCAN_INTERVAL = 30
+
+# Thinking stall detection (issue #2784).
+# When Claude CLI is rate-limited but not fully blocked, it can enter extended
+# thinking mode — producing "Moseying…", "(thinking)", "(thought for Ns)"
+# output for minutes without ever making a tool call.  The existing degraded
+# session detector requires both rate limit warnings AND Crystallizing loops,
+# but this pattern shows neither.  We detect it by checking for output that
+# contains only spinner/thinking noise with zero tool call markers (⏺) after
+# a configurable timeout.
+#
+# Minimum wall-clock seconds before checking for thinking stall.  Sessions
+# need time to start up, load MCP servers, and begin — checking too early
+# would produce false positives.  3 minutes is a reasonable floor: real
+# sessions make their first tool call within 30-60 seconds.
+THINKING_STALL_TIMEOUT = 180
+
+# The Unicode character Claude CLI emits at the start of each tool call.
+# Presence of this character in CLI output indicates the session made at
+# least one tool call and is making progress.
+_TOOL_CALL_MARKER = "⏺"
 
 # Wall-clock duration threshold (in seconds) for ghost detection.
 # Ghost detection is content-first: sessions with no meaningful output
@@ -696,6 +731,12 @@ def _is_mcp_failure(log_path: Path) -> bool:
         if _MCP_PREFLIGHT_SENTINEL in stripped:
             return True
 
+        # If the startup monitor confirmed all project MCP servers are
+        # healthy, any "MCP server failed" text is status-bar noise from
+        # global plugins — not a real failure.  See issue #2782.
+        if _STARTUP_MONITOR_MCP_RESOLUTION in stripped:
+            return False
+
         # If the session produced substantial CLI output beyond headers,
         # wrapper pre-flight, spinner noise, and UI chrome, it was
         # productive — MCP text is just status bar noise.
@@ -904,25 +945,19 @@ def _is_ghost_session(
 
 
 def _is_degraded_session(log_path: Path) -> bool:
-    """Check if a session log indicates a degraded session (rate limits, Crystallizing loops).
+    """Check if a session log indicates a degraded session due to rate limits.
 
     A degraded session is one where the builder ran but produced no useful work
-    because it was resource-constrained.  This manifests as:
-    - Rate limit warnings ("You've used 87% of your weekly limit")
-    - Repeated "Crystallizing..." output (Claude's extended thinking under pressure)
+    because it was resource-constrained.  This manifests as either:
 
-    Degraded sessions are distinct from low-output sessions (which never started)
-    and stuck sessions (which started but stopped making progress).  A degraded
-    session actively produces output but the output is non-productive.
+    Path A — "Stop and wait" modal (standalone, see issue #2781):
+      The CLI shows an interactive rate limit prompt that blocks forever in
+      automated sessions.  This is a definitive rate limit signal.
 
-    Detection requires BOTH:
-    1. A rate limit warning in the log, AND
-    2. Excessive "Crystallizing" repetitions (>= DEGRADED_CRYSTALLIZING_THRESHOLD)
-
-    This two-signal approach prevents false positives: a single rate limit warning
-    during an otherwise productive session is harmless, and brief "Crystallizing"
-    during normal thinking is expected.  The combination indicates the session has
-    entered a non-recoverable degraded state.  See issue #2631.
+    Path B — Rate limit warning + Crystallizing loop (see issue #2631):
+      Rate limit warnings ("You've used 87% of your weekly limit") combined
+      with repeated "Crystallizing..." output.  Requires BOTH signals to
+      prevent false positives.
 
     Args:
         log_path: Path to the worker session log file.
@@ -940,12 +975,21 @@ def _is_degraded_session(log_path: Path) -> bool:
         if not cli_output:
             return False
 
-        # Signal 1: Rate limit warning present
+        # Path A: "Stop and wait for limit to reset" modal (definitive,
+        # standalone).  The CLI is blocked waiting for user input that will
+        # never come in an automated session.  See issue #2781.
+        if DEGRADED_STOP_AND_WAIT_PATTERN.search(cli_output):
+            return True
+
+        # Path B: Rate limit warning + Crystallizing (two-signal detection).
+        # A single rate limit warning during an otherwise productive session
+        # is harmless, and brief "Crystallizing" during normal thinking is
+        # expected.  The combination indicates a non-recoverable degraded
+        # state.  See issue #2631.
         has_rate_limit = bool(DEGRADED_SESSION_PATTERNS[0].search(cli_output))
         if not has_rate_limit:
             return False
 
-        # Signal 2: Excessive Crystallizing repetitions
         lines = cli_output.splitlines()
         tail = lines[-DEGRADED_SCAN_TAIL_LINES:]
         crystallizing_count = sum(
@@ -964,8 +1008,9 @@ def _scan_log_for_degradation(log_path: Path) -> bool:
     for in-flight polling during ``run_worker_phase()``.  It reads only the
     tail of the file to minimize I/O overhead.
 
-    Returns True if the log shows both rate limit warnings and excessive
-    "Crystallizing" repetitions.  See issue #2631.
+    Returns True if the log shows the "Stop and wait" rate limit modal
+    (standalone) or both rate limit warnings and excessive "Crystallizing"
+    repetitions.  See issues #2631, #2781.
     """
     if not log_path.is_file():
         return False
@@ -985,6 +1030,11 @@ def _scan_log_for_degradation(log_path: Path) -> bool:
         tail = lines[-DEGRADED_SCAN_TAIL_LINES:]
         text = "\n".join(tail)
 
+        # Path A: "Stop and wait" modal (standalone).  See issue #2781.
+        if DEGRADED_STOP_AND_WAIT_PATTERN.search(text):
+            return True
+
+        # Path B: Rate limit warning + Crystallizing.  See issue #2631.
         has_rate_limit = bool(DEGRADED_SESSION_PATTERNS[0].search(text))
         if not has_rate_limit:
             return False
@@ -993,6 +1043,97 @@ def _scan_log_for_degradation(log_path: Path) -> bool:
             1 for line in tail if DEGRADED_SESSION_PATTERNS[1].search(line)
         )
         return crystallizing_count >= DEGRADED_CRYSTALLIZING_THRESHOLD
+
+    except OSError:
+        return False
+
+
+def _is_thinking_stall_session(log_path: Path) -> bool:
+    """Check if a session log shows extended thinking without any tool calls.
+
+    Detection criteria:
+    1. The CLI start sentinel is present (Claude CLI actually started)
+    2. CLI output contains spinner/thinking content (not empty)
+    3. Zero tool call markers (⏺) appear in the entire CLI output
+
+    This catches sessions where Claude enters extended thinking mode
+    (producing "Moseying…", "(thinking)", "(thought for Ns)" output)
+    without ever making a tool call.  Unlike ``_is_degraded_session()``,
+    this does NOT require rate limit warnings — it fires purely on the
+    absence of tool calls in a session that produced thinking output.
+
+    See issue #2784.
+    """
+    if not log_path.is_file():
+        return False
+
+    try:
+        content = log_path.read_text()
+        stripped = strip_ansi(content)
+        cli_output = _get_cli_output(stripped)
+        if not cli_output:
+            return False
+
+        # If there are tool call markers, this is a productive session
+        if _TOOL_CALL_MARKER in cli_output:
+            return False
+
+        # Need SOME output to distinguish from ghost/low-output sessions.
+        # Check the raw cli_output (before stripping) for spinner content.
+        if len(cli_output.strip()) < LOW_OUTPUT_MIN_CHARS:
+            return False
+
+        # Session has output but zero tool calls — thinking stall
+        return True
+
+    except OSError:
+        return False
+
+
+def _scan_log_for_thinking_stall(log_path: Path) -> bool:
+    """Quick scan of a live log file for thinking stall patterns.
+
+    Lighter-weight version of ``_is_thinking_stall_session()`` designed
+    for in-flight polling during ``run_worker_phase()``.  Reads only the
+    tail of the file to minimize I/O overhead.
+
+    Returns True if the log contains spinner/thinking output but zero
+    tool call markers (⏺).  See issue #2784.
+    """
+    if not log_path.is_file():
+        return False
+
+    try:
+        with open(log_path, "rb") as f:
+            f.seek(0, 2)
+            file_size = f.tell()
+            # Read entire file (up to 50KB) to check for any tool calls
+            # anywhere in the session.  Unlike degraded detection (which
+            # only needs the tail), we must scan ALL output because a
+            # single ⏺ anywhere means the session is making progress.
+            #
+            # Note: if a session makes one tool call early and then
+            # produces >50KB of thinking output, the marker could be
+            # missed and this would incorrectly return True.  At the
+            # 3-minute check (THINKING_STALL_TIMEOUT) this is unlikely;
+            # the post-mortem version (_is_thinking_stall_session) reads
+            # the full file and does not have this limitation.
+            read_size = min(file_size, 50_000)
+            f.seek(max(0, file_size - read_size))
+            content = f.read().decode("utf-8", errors="replace")
+
+        stripped = strip_ansi(content)
+
+        # Check for tool call markers anywhere in output
+        if _TOOL_CALL_MARKER in stripped:
+            return False
+
+        # Must have some content (not just whitespace)
+        if len(stripped.strip()) < LOW_OUTPUT_MIN_CHARS:
+            return False
+
+        # Has output but zero tool calls — potential thinking stall
+        return True
 
     except OSError:
         return False
@@ -1310,7 +1451,8 @@ def run_worker_phase(
         - 8: Planning stall detected (stuck in planning checkpoint)
         - 9: Auth pre-flight failure (not retryable, see issue #2508)
         - 10: Ghost session detected (instant exit, no work — see issue #2604)
-        - 11: Degraded session detected (rate limits + Crystallizing loop, see issue #2631)
+        - 11: Degraded session detected (rate limits, see issues #2631, #2781)
+        - 14: Thinking stall detected (output with zero tool calls, see issue #2784)
         - Other: Error
     """
     # Use unique session name per retry attempt to prevent tmux state
@@ -1450,10 +1592,15 @@ def run_worker_phase(
     # If it stays there beyond planning_timeout, terminate the worker.
     _planning_first_seen: float | None = None
 
-    # Degraded session detection state (issue #2631).
-    # Periodically scan the log for rate limit + Crystallizing patterns
-    # and abort early rather than waiting for the full timeout.
+    # Degraded session detection state (issues #2631, #2781).
+    # Periodically scan the log for rate limit patterns and abort early
+    # rather than waiting for the full timeout.
     _last_degraded_scan: float = time.monotonic()
+
+    # Thinking stall detection state (issue #2784).
+    # Track wall-clock start time so we can check for thinking-only sessions
+    # (output with zero tool calls) after THINKING_STALL_TIMEOUT.
+    _thinking_stall_checked: bool = False
 
     while wait_proc.poll() is None:
         heartbeats = _read_heartbeats(progress_file, phase=phase)
@@ -1500,10 +1647,11 @@ def run_worker_phase(
                 # Checkpoint advanced past planning (or doesn't exist yet)
                 _planning_first_seen = None
 
-        # In-flight degraded session detection (issue #2631).
-        # Periodically scan the log for rate limit + Crystallizing patterns.
-        # Abort early to avoid wasting the entire builder time budget on a
-        # session that will never produce useful output.
+        # In-flight degraded session detection (issues #2631, #2781).
+        # Periodically scan the log for rate limit patterns (Crystallizing
+        # loop or "Stop and wait" modal).  Abort early to avoid wasting the
+        # entire builder time budget on a session that will never produce
+        # useful output.
         degraded_elapsed = time.monotonic() - _last_degraded_scan
         if degraded_elapsed >= _DEGRADED_SCAN_INTERVAL:
             _last_degraded_scan = time.monotonic()
@@ -1511,7 +1659,7 @@ def run_worker_phase(
             if _scan_log_for_degradation(degraded_log_path):
                 log_warning(
                     f"Degraded session detected: {role} session '{actual_name}' "
-                    f"shows rate limit warnings and Crystallizing loop, "
+                    f"shows rate limit indicators, "
                     f"terminating early (log: {degraded_log_path})"
                 )
                 wait_proc.terminate()
@@ -1526,6 +1674,37 @@ def run_worker_phase(
                         check=False,
                     )
                 return 11  # Degraded session
+
+        # In-flight thinking stall detection (issue #2784).
+        # After THINKING_STALL_TIMEOUT seconds, check whether the session
+        # has produced any tool calls.  Sessions stuck in extended thinking
+        # emit spinner/thinking output but never invoke a tool — they will
+        # not recover and should be terminated early.
+        if (
+            not _thinking_stall_checked
+            and time.monotonic() - phase_start >= THINKING_STALL_TIMEOUT
+        ):
+            _thinking_stall_checked = True
+            thinking_log_path = _session_log_path(ctx.repo_root, actual_name)
+            if _scan_log_for_thinking_stall(thinking_log_path):
+                elapsed_s = int(time.monotonic() - phase_start)
+                log_warning(
+                    f"Thinking stall detected: {role} session '{actual_name}' "
+                    f"has produced output for {elapsed_s}s with zero tool calls, "
+                    f"terminating early (log: {thinking_log_path})"
+                )
+                wait_proc.terminate()
+                wait_proc.wait(timeout=30)
+                destroy_script = scripts_dir / "agent-destroy.sh"
+                if destroy_script.is_file():
+                    subprocess.run(
+                        [str(destroy_script), actual_name, "--force"],
+                        cwd=ctx.repo_root,
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                        check=False,
+                    )
+                return 14  # Thinking stall
 
         time.sleep(_HEARTBEAT_POLL_INTERVAL)
 
@@ -1645,21 +1824,37 @@ def run_worker_phase(
         log_warning(f"Post-mortem: {postmortem['summary']}")
         return 10
 
-    # Check for degraded session (exit code 11) — rate limits + Crystallizing.
-    # Degraded sessions produce output but it's non-productive garbage.
+    # Check for degraded session (exit code 11) — rate limit indicators.
+    # Degraded sessions produce output but it's non-productive garbage,
+    # or block forever on a rate limit modal prompt.
     # This is NOT retryable: the underlying resource constraint (rate limits)
     # will persist until the limit resets.  Check before MCP/low-output
     # because degraded sessions may have substantial output volume.
-    # See issue #2631.
+    # See issues #2631, #2781.
     if _is_degraded_session(log_path):
         if postmortem is not None:
             log_warning(f"Post-mortem: {postmortem['summary']}")
         log_warning(
             f"Degraded session detected for {role} session '{actual_name}': "
-            f"rate limit warnings and Crystallizing loop "
+            f"rate limit indicators detected "
             f"(exit code {wait_exit}, log: {log_path})"
         )
         return 11
+
+    # Check for thinking stall (exit code 14) — output with zero tool calls.
+    # The session produced thinking/spinner output but never invoked a tool,
+    # indicating extended thinking under resource pressure.  Not retryable:
+    # the same conditions will produce the same result.  Check after degraded
+    # (which is more specific) and before MCP/low-output.  See issue #2784.
+    if _is_thinking_stall_session(log_path):
+        if postmortem is not None:
+            log_warning(f"Post-mortem: {postmortem['summary']}")
+        log_warning(
+            f"Thinking stall detected for {role} session '{actual_name}': "
+            f"output produced but zero tool calls "
+            f"(exit code {wait_exit}, log: {log_path})"
+        )
+        return 14
 
     # Check for MCP failure (exit code 7) — more specific than low-output,
     # with different retry/backoff strategy.  See issues #2135, #2279.
@@ -1724,6 +1919,8 @@ def run_phase_with_retry(
     On exit code 9 (auth failure), returns immediately (not retryable).
     On exit code 11 (degraded session), returns immediately (not retryable;
     rate limits won't resolve with retries).  See issue #2631.
+    On exit code 14 (thinking stall), returns immediately (not retryable;
+    extended thinking without tool calls won't self-resolve).  See issue #2784.
     On exit code 10 (ghost session), classifies the root cause from the
     worker log and uses a cause-specific retry strategy from
     ``GHOST_RETRY_STRATEGIES``.  Retries on a **separate** budget that does
@@ -1740,7 +1937,7 @@ def run_phase_with_retry(
                    6=low-output after retries, 7=MCP failure after retries,
                    8=planning stall, 9=auth failure,
                    10=ghost session after retries,
-                   11=degraded session, other=error
+                   11=degraded session, 14=thinking stall, other=error
     """
     stuck_retries = 0
     low_output_retries = 0
@@ -1784,9 +1981,9 @@ def run_phase_with_retry(
 
         # --- Degraded session (exit code 11) ---
         # Not retryable: the builder session was degraded by rate limits
-        # and entered a Crystallizing loop.  The underlying rate limit
-        # won't resolve with retries — the daemon should back off or
-        # pick a different issue.  See issue #2631.
+        # (Crystallizing loop or "Stop and wait" modal).  The underlying
+        # rate limit won't resolve with retries — the daemon should back
+        # off or pick a different issue.  See issues #2631, #2781.
         if exit_code == 11:
             return 11
 
@@ -1796,6 +1993,13 @@ def run_phase_with_retry(
         # or the user re-authenticates with a different plan.
         if exit_code == 13:
             return 13
+
+        # --- Thinking stall (exit code 14) ---
+        # Not retryable: the session entered extended thinking without
+        # making any tool calls.  The same conditions will produce the
+        # same result on retry.  See issue #2784.
+        if exit_code == 14:
+            return 14
 
         # --- Pre-retry approval check (judge phase only) ---
         # If the judge already completed its work (applied loom:pr or

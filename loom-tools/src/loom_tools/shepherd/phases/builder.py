@@ -44,6 +44,7 @@ from loom_tools.shepherd.phases.base import (
     MCP_FAILURE_PATTERNS,
     PhaseResult,
     PhaseStatus,
+    _STARTUP_MONITOR_MCP_RESOLUTION,
     _get_cli_output,
     extract_log_errors,
     run_phase_with_retry,
@@ -497,20 +498,19 @@ class BuilderPhase:
             )
 
         if exit_code == 11:
-            # Degraded session: builder ran under rate limits and entered a
-            # Crystallizing loop, producing no useful work.  Not retryable —
-            # the rate limit won't resolve until it resets.  See issue #2631.
+            # Degraded session: builder hit rate limits (Crystallizing loop
+            # or "Stop and wait" modal).  Not retryable — the rate limit
+            # won't resolve until it resets.  See issues #2631, #2781.
             log_warning(
                 f"Degraded session for issue #{ctx.config.issue}: "
-                f"builder was rate-limited and entered Crystallizing loop"
+                f"builder was rate-limited"
             )
             self._cleanup_stale_worktree(ctx)
             return PhaseResult(
                 status=PhaseStatus.FAILED,
                 message=(
-                    "builder session degraded: rate limit warnings and "
-                    "Crystallizing loop detected (not retryable until "
-                    "rate limit resets)"
+                    "builder session degraded: rate limit detected "
+                    "(not retryable until rate limit resets)"
                 ),
                 phase_name="builder",
                 data={
@@ -538,6 +538,29 @@ class BuilderPhase:
                 phase_name="builder",
                 data={
                     "rate_limit_abort": True,
+                    "exit_code": exit_code,
+                    "log_file": str(self._get_log_path(ctx)),
+                },
+            )
+
+        if exit_code == 14:
+            # Thinking stall: builder produced output (spinner/thinking)
+            # but never made a tool call.  Not retryable — the same
+            # conditions will produce the same result.  See issue #2784.
+            log_warning(
+                f"Thinking stall for issue #{ctx.config.issue}: "
+                f"builder produced thinking output but zero tool calls"
+            )
+            self._cleanup_stale_worktree(ctx)
+            return PhaseResult(
+                status=PhaseStatus.FAILED,
+                message=(
+                    "builder thinking stall: extended thinking output "
+                    "with zero tool calls detected (not retryable)"
+                ),
+                phase_name="builder",
+                data={
+                    "thinking_stall": True,
                     "exit_code": exit_code,
                     "log_file": str(self._get_log_path(ctx)),
                 },
@@ -3279,9 +3302,15 @@ class BuilderPhase:
                 # volume.  Thinking spinners can inflate output past the
                 # MCP_FAILURE_MIN_OUTPUT_CHARS threshold without any real
                 # tool calls, causing _is_mcp_failure() to miss it.
-                diag["log_has_mcp_failure_markers"] = bool(
+                # However, suppress when the startup monitor confirmed all
+                # project MCP servers are healthy — markers are just status
+                # bar noise from global plugins.  See issues #2464, #2782.
+                has_mcp_markers = bool(
                     _MCP_FAILURE_MARKER_RE.search(cli_output)
                 )
+                if has_mcp_markers and _STARTUP_MONITOR_MCP_RESOLUTION in stripped:
+                    has_mcp_markers = False
+                diag["log_has_mcp_failure_markers"] = has_mcp_markers
                 # Check for degradation patterns (rate limits + Crystallizing).
                 # See issue #2631.
                 cli_lines = cli_output.splitlines()
