@@ -2054,6 +2054,27 @@ def _record_fallback_failure(ctx: ShepherdContext, exit_code: int) -> None:
         error_class = "builder_unknown_failure"
         details = f"Builder failed without specific handler (exit code {exit_code}, fallback cleanup)"
 
+        # Check builder log for MCP failure markers before accepting the
+        # generic unknown_failure class.  MCP failures are infrastructure
+        # issues (server init, resource contention) that should not count
+        # against the issue itself.  See issue #2768.
+        try:
+            import re
+
+            from loom_tools.common.paths import LoomPaths
+            from loom_tools.shepherd.phases.base import MCP_FAILURE_PATTERNS
+
+            log_path = LoomPaths(ctx.repo_root).builder_log_file(ctx.config.issue)
+            if log_path.is_file():
+                content = log_path.read_text()
+                for pattern in MCP_FAILURE_PATTERNS:
+                    if re.search(pattern, content, re.IGNORECASE):
+                        error_class = "mcp_infrastructure_failure"
+                        details = f"Builder failed due to MCP server failure (exit code {exit_code}, fallback cleanup)"
+                        break
+        except Exception:
+            pass  # Best-effort — fall through to unknown_failure
+
     try:
         record_blocked_reason(
             ctx.repo_root,
