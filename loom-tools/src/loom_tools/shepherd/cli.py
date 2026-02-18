@@ -10,6 +10,7 @@ import sys
 import time
 from pathlib import Path
 
+from loom_tools.common.config import env_int
 from loom_tools.common.git import (
     attempt_rebase,
     get_uncommitted_files,
@@ -19,6 +20,7 @@ from loom_tools.common.git import (
 from loom_tools.common.logging import log_error, log_info, log_success, log_warning
 from loom_tools.common.paths import LoomPaths, NamingConventions
 from loom_tools.common.repo import find_repo_root
+from loom_tools.common.state import read_daemon_state
 from loom_tools.shepherd.config import ExecutionMode, Phase, QualityGates, ShepherdConfig
 from loom_tools.shepherd.context import ShepherdContext
 from loom_tools.shepherd.errors import (
@@ -52,6 +54,34 @@ def _print_phase_header(title: str) -> None:
     print(f"\033[0;36m{'═' * width}\033[0m", file=sys.stderr, flush=True)
     print(f"\033[0;36m  {title}\033[0m", file=sys.stderr, flush=True)
     print(f"\033[0;36m{'═' * width}\033[0m", file=sys.stderr, flush=True)
+
+
+def _get_prior_failure_info(
+    repo_root: Path, issue: int
+) -> tuple[int, int, str | None]:
+    """Get prior failure count for an issue from daemon state.
+
+    Reads ``recent_failures`` from ``daemon-state.json`` and filters for the
+    given issue number.
+
+    Args:
+        repo_root: Repository root path.
+        issue: Issue number to check.
+
+    Returns:
+        Tuple of (failure_count, threshold, last_error_class).
+        ``last_error_class`` is ``None`` when there are no prior failures.
+    """
+    threshold = env_int("LOOM_SYSTEMATIC_FAILURE_THRESHOLD", default=3)
+    try:
+        state = read_daemon_state(repo_root)
+    except Exception:
+        return 0, threshold, None
+
+    issue_failures = [f for f in state.recent_failures if f.issue == issue]
+    count = len(issue_failures)
+    last_error = issue_failures[-1].error_class if issue_failures else None
+    return count, threshold, last_error
 
 
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -410,6 +440,24 @@ def orchestrate(ctx: ShepherdContext) -> int:
         log_info(f"Task ID: {ctx.config.task_id}")
         log_info(f"Repository: {ctx.repo_root}")
         log_info(f"Title: {ctx.issue_title}")
+
+        # Log prior failure count for observability
+        fail_count, fail_threshold, last_err = _get_prior_failure_info(
+            ctx.repo_root, ctx.config.issue
+        )
+        if fail_count > 0:
+            remaining = max(0, fail_threshold - fail_count)
+            log_info(
+                f"Prior failures for issue #{ctx.config.issue}: "
+                f"{fail_count}/{fail_threshold} (last: {last_err})"
+            )
+            log_info(f"Remaining retry budget: {remaining}")
+        else:
+            log_info(
+                f"Prior failures for issue #{ctx.config.issue}: "
+                f"0/{fail_threshold} (clean slate)"
+            )
+
         print(file=sys.stderr)
 
         # Report started milestone
