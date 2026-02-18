@@ -1134,31 +1134,33 @@ Classify the changed files to determine which scoped test strategies to apply:
 
 #### Python Repositories
 
+**Important**: Always use `python3`, never bare `python` — `python` is not in PATH on macOS or most modern Linux systems.
+
 **Preferred: Use `pytest-testmon` when available**
 
 ```bash
 # Check if pytest-testmon is available
-if python -m pytest --co --testmon 2>/dev/null; then
+if python3 -m pytest --co --testmon 2>/dev/null; then
     # Check if .testmondata exists and is reasonably current
     if [ -f .testmondata ]; then
         TESTMON_AGE=$(( $(date +%s) - $(stat -f %m .testmondata 2>/dev/null || stat -c %Y .testmondata 2>/dev/null) ))
         if [ "$TESTMON_AGE" -lt 86400 ]; then
             echo "Using pytest-testmon for scoped test execution"
-            python -m pytest --testmon -x -q
+            python3 -m pytest --testmon -x -q
             SCOPED_STRATEGY="pytest-testmon"
         else
             echo "Testmon data is stale (>24h) — falling back to full pytest"
-            python -m pytest -x -q
+            python3 -m pytest -x -q
             SCOPED_STRATEGY="full-pytest (stale testmon data)"
         fi
     else
         echo "No .testmondata found — running full pytest (consider installing pytest-testmon)"
-        python -m pytest -x -q
+        python3 -m pytest -x -q
         SCOPED_STRATEGY="full-pytest (no testmon data)"
     fi
 else
     echo "pytest-testmon not available — running full pytest"
-    python -m pytest -x -q
+    python3 -m pytest -x -q
     SCOPED_STRATEGY="full-pytest (testmon not installed)"
 fi
 ```
@@ -1237,7 +1239,7 @@ Run the full test suite when:
 # Generic fallback — use whatever the project's standard check command is
 pnpm check:ci 2>/dev/null || \
     npm test 2>/dev/null || \
-    python -m pytest 2>/dev/null || \
+    python3 -m pytest 2>/dev/null || \
     cargo test 2>/dev/null || \
     make test 2>/dev/null
 SCOPED_STRATEGY="full-suite (fallback)"
