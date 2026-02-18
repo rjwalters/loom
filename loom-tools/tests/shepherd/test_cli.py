@@ -4342,12 +4342,14 @@ class TestRecordFallbackFailure:
             details="Builder failed without specific handler (exit code 1, fallback cleanup)",
         )
 
+    @patch("loom_tools.shepherd.cli.get_pr_for_issue", return_value=None)
     @patch("loom_tools.common.systematic_failure.detect_systematic_failure")
     @patch("loom_tools.common.systematic_failure.record_blocked_reason")
     def test_survives_record_failure(
         self,
         mock_record: MagicMock,
         mock_detect: MagicMock,
+        mock_get_pr: MagicMock,
     ) -> None:
         """Should not raise when record_blocked_reason fails."""
         mock_record.side_effect = RuntimeError("disk full")
@@ -4403,6 +4405,7 @@ class TestRecordFallbackFailure:
         assert "builder_unknown_failure" in comment_body
         assert "3" in comment_body
 
+    @patch("loom_tools.shepherd.cli.get_pr_for_issue", return_value=None)
     @patch("loom_tools.shepherd.cli.transition_issue_labels")
     @patch("loom_tools.common.systematic_failure.detect_systematic_failure", return_value=None)
     @patch("loom_tools.common.systematic_failure.record_blocked_reason")
@@ -4411,6 +4414,7 @@ class TestRecordFallbackFailure:
         mock_record: MagicMock,
         mock_detect: MagicMock,
         mock_transition: MagicMock,
+        mock_get_pr: MagicMock,
     ) -> None:
         """Should NOT escalate when detect_systematic_failure returns None."""
         ctx = MagicMock()
@@ -4421,6 +4425,26 @@ class TestRecordFallbackFailure:
 
         # Should NOT transition labels
         mock_transition.assert_not_called()
+
+    @patch("loom_tools.shepherd.cli.get_pr_for_issue", return_value=456)
+    @patch("loom_tools.common.systematic_failure.detect_systematic_failure", return_value=None)
+    @patch("loom_tools.common.systematic_failure.record_blocked_reason")
+    def test_skips_failure_counter_when_pr_exists(
+        self,
+        mock_record: MagicMock,
+        mock_detect: MagicMock,
+        mock_get_pr: MagicMock,
+    ) -> None:
+        """Should skip failure counter when builder already created a PR (issue #2854)."""
+        ctx = MagicMock()
+        ctx.config.issue = 42
+        ctx.repo_root = Path("/fake/repo")
+
+        _record_fallback_failure(ctx, ShepherdExitCode.BUILDER_FAILED)
+
+        # PR exists — should NOT record failure or check systematic failures
+        mock_record.assert_not_called()
+        mock_detect.assert_not_called()
 
 
 class TestCleanupFallbackIntegration:
