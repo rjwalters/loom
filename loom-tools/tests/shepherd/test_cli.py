@@ -363,6 +363,7 @@ class TestMain:
              patch("loom_tools.shepherd.cli.ShepherdContext"), \
              patch("loom_tools.shepherd.cli.find_repo_root", return_value=Path("/fake/repo")), \
              patch("loom_tools.shepherd.cli._auto_navigate_out_of_worktree"), \
+             patch("loom_tools.common.github.gh_issue_view", return_value={"state": "OPEN"}), \
              patch("loom_tools.claim.claim_issue", return_value=0), \
              patch("loom_tools.claim.release_claim"):
             result = main(["42"])
@@ -374,6 +375,7 @@ class TestMain:
              patch("loom_tools.shepherd.cli.ShepherdContext"), \
              patch("loom_tools.shepherd.cli.find_repo_root", return_value=Path("/fake/repo")), \
              patch("loom_tools.shepherd.cli._auto_navigate_out_of_worktree"), \
+             patch("loom_tools.common.github.gh_issue_view", return_value={"state": "OPEN"}), \
              patch("loom_tools.claim.claim_issue", return_value=0), \
              patch("loom_tools.claim.release_claim"):
             result = main(["42"])
@@ -394,6 +396,7 @@ class TestMain:
              patch("loom_tools.shepherd.cli.ShepherdContext", side_effect=track_context), \
              patch("loom_tools.shepherd.cli.find_repo_root", return_value=Path("/fake/repo")), \
              patch("loom_tools.shepherd.cli._auto_navigate_out_of_worktree", side_effect=track_navigate), \
+             patch("loom_tools.common.github.gh_issue_view", return_value={"state": "OPEN"}), \
              patch("loom_tools.claim.claim_issue", return_value=0), \
              patch("loom_tools.claim.release_claim"):
             main(["42"])
@@ -416,6 +419,7 @@ class TestMain:
              patch("loom_tools.shepherd.cli.find_repo_root", return_value=Path("/fake/repo")), \
              patch("loom_tools.shepherd.cli._auto_navigate_out_of_worktree"), \
              patch("loom_tools.shepherd.cli.get_uncommitted_files", return_value=["M file.py"]), \
+             patch("loom_tools.common.github.gh_issue_view", return_value={"state": "OPEN"}), \
              patch("loom_tools.claim.claim_issue", return_value=0), \
              patch("loom_tools.claim.release_claim"):
             result = main(["42", "--allow-dirty-main"])
@@ -428,10 +432,23 @@ class TestMain:
              patch("loom_tools.shepherd.cli.find_repo_root", return_value=Path("/fake/repo")), \
              patch("loom_tools.shepherd.cli._auto_navigate_out_of_worktree"), \
              patch("loom_tools.shepherd.cli.get_uncommitted_files", return_value=[]), \
+             patch("loom_tools.common.github.gh_issue_view", return_value={"state": "OPEN"}), \
              patch("loom_tools.claim.claim_issue", return_value=0), \
              patch("loom_tools.claim.release_claim"):
             result = main(["42"])
             assert result == 0
+
+    def test_closed_issue_skips_without_claiming(self) -> None:
+        """main should return SKIPPED and not call claim_issue when issue is already closed."""
+        mock_claim = MagicMock(return_value=0)
+        with patch("loom_tools.shepherd.cli.find_repo_root", return_value=Path("/fake/repo")), \
+             patch("loom_tools.shepherd.cli._auto_navigate_out_of_worktree"), \
+             patch("loom_tools.common.github.gh_issue_view", return_value={"state": "CLOSED"}), \
+             patch("loom_tools.claim.claim_issue", mock_claim), \
+             patch("loom_tools.claim.release_claim"):
+            result = main(["42"])
+            assert result == ShepherdExitCode.SKIPPED
+            mock_claim.assert_not_called()
 
 
 class TestIsLoomRuntime:
@@ -3954,6 +3971,7 @@ class TestMainCleanupIntegration:
              patch("loom_tools.shepherd.cli.find_repo_root", return_value=Path("/fake/repo")), \
              patch("loom_tools.shepherd.cli._auto_navigate_out_of_worktree"), \
              patch("loom_tools.shepherd.cli._cleanup_labels_on_failure") as mock_cleanup, \
+             patch("loom_tools.common.github.gh_issue_view", return_value={"state": "OPEN"}), \
              patch("loom_tools.claim.claim_issue", return_value=0), \
              patch("loom_tools.claim.release_claim"):
             ctx = MockCtx.return_value
@@ -3968,6 +3986,7 @@ class TestMainCleanupIntegration:
              patch("loom_tools.shepherd.cli.find_repo_root", return_value=Path("/fake/repo")), \
              patch("loom_tools.shepherd.cli._auto_navigate_out_of_worktree"), \
              patch("loom_tools.shepherd.cli._cleanup_labels_on_failure") as mock_cleanup, \
+             patch("loom_tools.common.github.gh_issue_view", return_value={"state": "OPEN"}), \
              patch("loom_tools.claim.claim_issue", return_value=0), \
              patch("loom_tools.claim.release_claim"):
             result = main(["42"])
@@ -3981,6 +4000,7 @@ class TestMainCleanupIntegration:
              patch("loom_tools.shepherd.cli.find_repo_root", return_value=Path("/fake/repo")), \
              patch("loom_tools.shepherd.cli._auto_navigate_out_of_worktree"), \
              patch("loom_tools.shepherd.cli._cleanup_labels_on_failure") as mock_cleanup, \
+             patch("loom_tools.common.github.gh_issue_view", return_value={"state": "OPEN"}), \
              patch("loom_tools.claim.claim_issue", return_value=0), \
              patch("loom_tools.claim.release_claim"):
             ctx = MockCtx.return_value
