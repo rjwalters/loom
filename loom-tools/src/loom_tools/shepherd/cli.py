@@ -2149,14 +2149,23 @@ def _record_fallback_failure(ctx: ShepherdContext, exit_code: int) -> None:
 
 def main(argv: list[str] | None = None) -> int:
     """Main entry point for loom-shepherd CLI."""
-    # Force line-buffered stderr so all output is visible immediately even when
+    # Route shepherd output through stdout to eliminate Bash tool duplication.
+    # Claude Code's Bash tool captures output via two mechanisms: PTY (which
+    # includes stderr) and explicit stderr capture.  Both are shown in the
+    # error block when the exit code is non-zero, making every stderr line
+    # appear twice.  Routing through stdout is captured by the PTY only,
+    # appearing once.  Since shepherd produces only human-readable progress
+    # (no machine-readable data on stdout), this is safe.  See issue #2840.
+    sys.stderr = sys.stdout  # type: ignore[assignment]
+
+    # Force line-buffered stdout so all output is visible immediately even when
     # invoked non-interactively (e.g., from the Claude Code Bash tool or piped
-    # contexts). Without this, Python may block-buffer stderr when it's not a
-    # tty, causing output to be lost if the process crashes before flushing.
+    # contexts). Without this, Python may block-buffer when it's not a tty,
+    # causing output to be lost if the process crashes before flushing.
     # The wrapper script also sets PYTHONUNBUFFERED=1 as a belt-and-suspenders
     # measure, but this handles the case where the CLI is invoked directly.
     try:
-        sys.stderr.reconfigure(line_buffering=True)  # type: ignore[union-attr]
+        sys.stdout.reconfigure(line_buffering=True)  # type: ignore[union-attr]
     except (AttributeError, io.UnsupportedOperation):
         pass  # Some environments don't support reconfigure; flush=True handles it
 
