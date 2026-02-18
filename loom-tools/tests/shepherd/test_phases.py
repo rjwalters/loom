@@ -15181,6 +15181,45 @@ class TestIsMcpFailure:
         )
         assert _is_mcp_failure(log) is True
 
+    def test_startup_monitor_resolution_suppresses_mcp_failure(
+        self, tmp_path: Path
+    ) -> None:
+        """When startup monitor confirms project MCPs healthy, suppress MCP markers.
+
+        The startup monitor writes "all project MCP servers connected" when it
+        verifies that only global plugin failures are present.  MCP failure
+        patterns in these logs are status-bar noise, not real failures.
+        See issue #2782.
+        """
+        log = tmp_path / "session.log"
+        log.write_text(
+            "[WARN] Startup monitor: detected 'MCP server failed' in early output\n"
+            "[WARN] Startup monitor: polling for loom MCP connection (up to 20s)\n"
+            "[WARN] Startup monitor: all project MCP servers connected"
+            " — only global plugin/MCP failures detected,"
+            " allowing session to continue\n"
+            "# CLAUDE_CLI_START\n"
+            "bypasspermissionson · 1 MCP server failed · /mcp\n"
+        )
+        assert _is_mcp_failure(log) is False
+
+    def test_startup_monitor_resolution_does_not_suppress_preflight_sentinel(
+        self, tmp_path: Path
+    ) -> None:
+        """Pre-flight sentinel still triggers even if startup monitor resolution present.
+
+        The MCP_PREFLIGHT_FAILED sentinel is checked before the startup monitor
+        resolution — it represents a definitive pre-flight failure.
+        """
+        log = tmp_path / "session.log"
+        log.write_text(
+            "[WARN] Startup monitor: all project MCP servers connected"
+            " — only global plugin/MCP failures detected,"
+            " allowing session to continue\n"
+            "# MCP_PREFLIGHT_FAILED\n"
+        )
+        assert _is_mcp_failure(log) is True
+
 
 class TestStripSpinnerNoise:
     """Test _strip_spinner_noise helper function."""
