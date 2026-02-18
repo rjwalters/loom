@@ -168,6 +168,13 @@ class ShepherdConfig:
     test_verify_timeout: int = field(
         default_factory=lambda: env_int("LOOM_TEST_VERIFY_TIMEOUT", 600)
     )
+    # Thinking stall detection timeout for the builder phase (seconds).
+    # Builder tasks — especially those reading multiple files and designing
+    # integrations — can legitimately require longer thinking windows than
+    # judge/curator tasks.  See issue #2853.
+    builder_thinking_stall_timeout: int = field(
+        default_factory=lambda: env_int("LOOM_BUILDER_THINKING_STALL_TIMEOUT", 360)
+    )
 
     # Retry limits
     doctor_max_retries: int = field(

@@ -1544,6 +1544,7 @@ def run_worker_phase(
     args: str | None = None,
     planning_timeout: int = 0,
     attempt: int = 0,
+    thinking_stall_timeout: int = THINKING_STALL_TIMEOUT,
 ) -> int:
     """Run a phase worker and wait for completion.
 
@@ -1566,6 +1567,11 @@ def run_worker_phase(
         attempt: Retry attempt number (0-based).  When > 0, a suffix is
             appended to the session name to prevent tmux state pollution
             from rapid create/destroy cycles.  See issue #2639.
+        thinking_stall_timeout: Wall-clock seconds before checking for a
+            thinking stall (output with zero tool calls).  Defaults to
+            ``THINKING_STALL_TIMEOUT`` (180s).  Builder phases use a longer
+            value because complex implementation tasks legitimately require
+            extended reasoning windows.  See issue #2853.
 
     Returns:
         Exit code from agent-wait-bg.sh (or synthetic):
@@ -1813,13 +1819,16 @@ def run_worker_phase(
                 return 11  # Degraded session
 
         # In-flight thinking stall detection (issue #2784).
-        # After THINKING_STALL_TIMEOUT seconds, check whether the session
+        # After thinking_stall_timeout seconds, check whether the session
         # has produced any tool calls.  Sessions stuck in extended thinking
         # emit spinner/thinking output but never invoke a tool — they will
         # not recover and should be terminated early.
+        # The timeout is phase-specific: builder sessions use a longer
+        # window (see issue #2853) to avoid killing complex implementation
+        # tasks that legitimately require extended reasoning.
         if (
             not _thinking_stall_checked
-            and time.monotonic() - phase_start >= THINKING_STALL_TIMEOUT
+            and time.monotonic() - phase_start >= thinking_stall_timeout
         ):
             _thinking_stall_checked = True
             thinking_log_path = _session_log_path(ctx.repo_root, actual_name)
