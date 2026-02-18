@@ -1807,7 +1807,7 @@ def run_worker_phase(
             f"output produced but zero tool calls "
             f"(exit code {wait_exit}, log: {log_path})"
         )
-        return 12
+        return 14
 
     # Check for MCP failure (exit code 7) — more specific than low-output,
     # with different retry/backoff strategy.  See issues #2135, #2279.
@@ -1940,7 +1940,7 @@ def run_phase_with_retry(
         if exit_code == 11:
             return 11
 
-        # --- Thinking stall (exit code 12) ---
+        # --- Thinking stall (exit code 14) ---
         # Not retryable: the session entered extended thinking without
         # making any tool calls.  The same conditions will produce the
         # same result on retry.  See issue #2784.
