@@ -483,3 +483,53 @@ class TestMain:
         input_text = "frame1\rframe2\rframe3\nframe1\rframe2\rframe3\n"
         output = self._run_main(input_text)
         assert output == "frame3\n  [repeated 1 more time]\n"
+
+    def test_spinner_lines_suppressed(self) -> None:
+        """TUI spinner chars are filtered out in real-time stream mode."""
+        output = self._run_main("\u2736\n\u273b\n\u273d\nreal content\n")
+        assert output == "real content\n"
+
+    def test_animation_words_suppressed(self) -> None:
+        """TUI animation words are filtered out in real-time stream mode."""
+        output = self._run_main("Nucleating\u2026\nPollinating\u2026\nreal content\n")
+        assert output == "real content\n"
+
+    def test_thinking_indicators_suppressed(self) -> None:
+        """Thinking indicators are filtered out in real-time stream mode."""
+        output = self._run_main("(thinking)\n(thought for 2s)\nreal content\n")
+        assert output == "real content\n"
+
+    def test_separator_lines_suppressed(self) -> None:
+        """Separator lines are filtered out in real-time stream mode."""
+        output = self._run_main("\u2500" * 40 + "\nreal content\n")
+        assert output == "real content\n"
+
+    def test_permission_banner_suppressed(self) -> None:
+        """Permission banners are filtered out in real-time stream mode."""
+        output = self._run_main(
+            "\u23f5\u23f5 bypass permissions on (shift+tab to cycle)\nreal content\n"
+        )
+        assert output == "real content\n"
+
+    def test_leading_spinner_stripped_from_content(self) -> None:
+        """Leading spinner chars are stripped from real content in stream mode."""
+        output = self._run_main("\u2736 real content here\n")
+        assert "real content here" in output
+
+    def test_noise_and_content_mixed(self) -> None:
+        """End-to-end: noise interspersed with real content is filtered."""
+        input_text = (
+            "\u2736\n"
+            "Nucleating\u2026\n"
+            "(thinking)\n"
+            "[OK] Checkpoint saved\n"
+            "\u2500" * 40 + "\n"
+            "Pollinating\u2026\n"
+            "git commit -m 'fix'\n"
+        )
+        output = self._run_main(input_text)
+        assert "[OK] Checkpoint saved" in output
+        assert "git commit -m 'fix'" in output
+        assert "Nucleating" not in output
+        assert "Pollinating" not in output
+        assert "(thinking)" not in output

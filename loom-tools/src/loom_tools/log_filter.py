@@ -253,6 +253,43 @@ def clean_file(input_path: str) -> str:
 # ---------------------------------------------------------------------------
 
 
+def _is_tui_noise_realtime(line: str) -> bool:
+    """TUI noise check safe for real-time streaming (pipe-pane filter).
+
+    Applies all ``is_tui_noise()`` checks except the short-fragment debris
+    heuristic is only triggered when the line starts with a spinner character.
+    This prevents false-positive suppression of legitimate short content lines
+    (e.g. single-word test output, short variable names) in a real-time
+    stream where we cannot use file-level context.
+
+    See issue #2798.
+    """
+    if _ANIMATION_RE.match(line):
+        return True
+    if _SEPARATOR_RE.match(line):
+        return True
+    if _PERMISSION_RE.search(line):
+        return True
+    if _PROMPT_RE.match(line):
+        return True
+    if _BANNER_RE.match(line):
+        return True
+    if _BANNER_INFO_RE.match(line):
+        return True
+    if _THINKING_RE.match(line):
+        return True
+    if _ESC_INTERRUPT_RE.search(line):
+        return True
+    if _CTRL_B_RE.match(line):
+        return True
+    # Only apply spinner debris check when the line has a spinner-char prefix.
+    # Without a spinner prefix, short text (e.g. "OK", "yes") could be real
+    # content, so we do not suppress it.
+    if line and line[0] in SPINNERS:
+        return _is_spinner_debris(line)
+    return False
+
+
 def main() -> None:
     """Read stdin line by line, clean, deduplicate, and write to stdout."""
     prev_line: str | None = None
@@ -265,6 +302,19 @@ def main() -> None:
 
             cleaned = clean_line(raw)
             if cleaned is None:
+                continue
+
+            # Filter TUI noise (spinner chars, animation words, banners, etc.)
+            # Uses the realtime-safe variant that avoids false-positives on
+            # short content lines without spinner prefixes.  See issue #2798.
+            if _is_tui_noise_realtime(cleaned):
+                continue
+
+            # Strip leading spinner characters from surviving lines so that
+            # subsequent deduplication treats spinner-prefixed and plain lines
+            # as the same content (e.g. "✶ Fixing…" and "✻ Fixing…" collapse).
+            cleaned = _strip_leading_spinners(cleaned)
+            if not cleaned.strip():
                 continue
 
             # Collapse consecutive duplicate lines
