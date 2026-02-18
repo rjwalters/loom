@@ -225,6 +225,82 @@ def clear_systematic_failure(repo_root: Path) -> None:
     write_json_file(state_file, data)
 
 
+def clear_failures_for_issue(repo_root: Path, issue: int) -> int:
+    """Clear failure history for a specific issue from daemon state.
+
+    Removes entries for *issue* from ``recent_failures`` and resets the
+    ``blocked_issue_retries`` entry for this issue.  After clearing, the
+    ``systematic_failure`` field is re-evaluated: if the cleared entries were
+    the ones triggering systematic failure detection, the systematic failure
+    state is cleared too.
+
+    This is called at shepherd startup in force mode so that a retried issue
+    gets a full failure window instead of inheriting stale failures from
+    prior runs.
+
+    Args:
+        repo_root: Repository root path.
+        issue: Issue number whose failures should be cleared.
+
+    Returns:
+        The number of failure entries removed from ``recent_failures``.
+    """
+    paths = LoomPaths(Path(repo_root))
+    state_file = paths.daemon_state_file
+
+    if not state_file.is_file():
+        return 0
+
+    data = read_json_file(state_file)
+    if not isinstance(data, dict):
+        return 0
+
+    # Filter recent_failures to remove entries for this issue
+    failures: list[dict] = data.get("recent_failures", [])
+    original_count = len(failures)
+    data["recent_failures"] = [f for f in failures if f.get("issue") != issue]
+    cleared_count = original_count - len(data["recent_failures"])
+
+    # Reset blocked_issue_retries for this issue
+    retries: dict = data.get("blocked_issue_retries", {})
+    issue_key = str(issue)
+    if issue_key in retries:
+        retries[issue_key] = {
+            "retry_count": 0,
+            "retry_exhausted": False,
+            "last_retry_at": None,
+        }
+
+    # Re-evaluate systematic_failure state after clearing
+    # Use the same detection logic but inline to avoid a second file read/write
+    threshold = _get_threshold()
+    remaining = data["recent_failures"]
+    non_infra = [
+        f for f in remaining
+        if f.get("error_class", "unknown") not in INFRASTRUCTURE_ERROR_CLASSES
+    ]
+
+    if len(non_infra) < threshold:
+        data["systematic_failure"] = {}
+    else:
+        last_n = non_infra[-threshold:]
+        classes = {f.get("error_class", "unknown") for f in last_n}
+        if len(classes) != 1:
+            data["systematic_failure"] = {}
+        # else: systematic failure still valid from remaining failures — leave it
+
+    write_json_file(state_file, data)
+
+    if cleared_count > 0:
+        logger.info(
+            "Cleared %d failure entries for issue #%d from recent_failures",
+            cleared_count,
+            issue,
+        )
+
+    return cleared_count
+
+
 def probe_started(repo_root: Path) -> int:
     """Increment probe count and extend cooldown with exponential backoff.
 

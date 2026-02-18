@@ -8,6 +8,7 @@ import pathlib
 import pytest
 
 from loom_tools.common.systematic_failure import (
+    clear_failures_for_issue,
     clear_systematic_failure,
     detect_systematic_failure,
     probe_started,
@@ -380,6 +381,146 @@ class TestProbeStarted:
         (tmp_path / ".loom").mkdir()
         count = probe_started(tmp_path)
         assert count == 0
+
+
+# ── clear_failures_for_issue ─────────────────────────────────────
+
+
+class TestClearFailuresForIssue:
+    def test_removes_only_target_issue(self, repo: pathlib.Path) -> None:
+        """Only entries for the specified issue are removed."""
+        _write_state(
+            repo,
+            {
+                "recent_failures": [
+                    {"issue": 10, "error_class": "builder_stuck", "phase": "builder", "timestamp": "t1"},
+                    {"issue": 42, "error_class": "builder_stuck", "phase": "builder", "timestamp": "t2"},
+                    {"issue": 10, "error_class": "judge_stuck", "phase": "judge", "timestamp": "t3"},
+                    {"issue": 42, "error_class": "merge_failed", "phase": "merge", "timestamp": "t4"},
+                ],
+            },
+        )
+        cleared = clear_failures_for_issue(repo, 42)
+        assert cleared == 2
+
+        state = _read_state(repo)
+        assert len(state["recent_failures"]) == 2
+        assert all(f["issue"] == 10 for f in state["recent_failures"])
+
+    def test_resets_blocked_issue_retries(self, repo: pathlib.Path) -> None:
+        """blocked_issue_retries entry for the issue is reset."""
+        _write_state(
+            repo,
+            {
+                "blocked_issue_retries": {
+                    "42": {
+                        "retry_count": 2,
+                        "retry_exhausted": True,
+                        "last_retry_at": "2026-01-01T00:00:00Z",
+                        "error_class": "builder_stuck",
+                        "last_blocked_at": "2026-01-02T00:00:00Z",
+                    },
+                    "10": {
+                        "retry_count": 1,
+                        "retry_exhausted": False,
+                    },
+                },
+                "recent_failures": [
+                    {"issue": 42, "error_class": "builder_stuck", "phase": "builder", "timestamp": "t"},
+                ],
+            },
+        )
+        clear_failures_for_issue(repo, 42)
+        state = _read_state(repo)
+
+        # Issue 42 is reset
+        entry_42 = state["blocked_issue_retries"]["42"]
+        assert entry_42["retry_count"] == 0
+        assert entry_42["retry_exhausted"] is False
+
+        # Issue 10 is untouched
+        entry_10 = state["blocked_issue_retries"]["10"]
+        assert entry_10["retry_count"] == 1
+
+    def test_leaves_other_issues_intact(self, repo: pathlib.Path) -> None:
+        """Failures for other issues are preserved."""
+        _write_state(
+            repo,
+            {
+                "recent_failures": [
+                    {"issue": 10, "error_class": "builder_stuck", "phase": "builder", "timestamp": "t1"},
+                    {"issue": 20, "error_class": "judge_stuck", "phase": "judge", "timestamp": "t2"},
+                    {"issue": 30, "error_class": "merge_failed", "phase": "merge", "timestamp": "t3"},
+                ],
+            },
+        )
+        cleared = clear_failures_for_issue(repo, 99)
+        assert cleared == 0
+
+        state = _read_state(repo)
+        assert len(state["recent_failures"]) == 3
+
+    def test_clears_systematic_failure_when_cause_removed(self, repo: pathlib.Path) -> None:
+        """Systematic failure is cleared if the removed entries were the cause."""
+        _write_state(
+            repo,
+            {
+                "recent_failures": [
+                    {"issue": 42, "error_class": "builder_stuck", "phase": "builder", "timestamp": "t1"},
+                    {"issue": 42, "error_class": "builder_stuck", "phase": "builder", "timestamp": "t2"},
+                    {"issue": 42, "error_class": "builder_stuck", "phase": "builder", "timestamp": "t3"},
+                ],
+                "systematic_failure": {
+                    "active": True,
+                    "pattern": "builder_stuck",
+                    "count": 3,
+                },
+            },
+        )
+        clear_failures_for_issue(repo, 42)
+        state = _read_state(repo)
+
+        assert state["systematic_failure"] == {}
+        assert state["recent_failures"] == []
+
+    def test_preserves_systematic_failure_from_other_issues(self, repo: pathlib.Path) -> None:
+        """Systematic failure stays if remaining failures still trigger it."""
+        _write_state(
+            repo,
+            {
+                "recent_failures": [
+                    {"issue": 42, "error_class": "builder_stuck", "phase": "builder", "timestamp": "t0"},
+                    {"issue": 10, "error_class": "builder_stuck", "phase": "builder", "timestamp": "t1"},
+                    {"issue": 20, "error_class": "builder_stuck", "phase": "builder", "timestamp": "t2"},
+                    {"issue": 30, "error_class": "builder_stuck", "phase": "builder", "timestamp": "t3"},
+                ],
+                "systematic_failure": {
+                    "active": True,
+                    "pattern": "builder_stuck",
+                    "count": 3,
+                },
+            },
+        )
+        clear_failures_for_issue(repo, 42)
+        state = _read_state(repo)
+
+        # 3 failures remain for other issues, all same class => systematic failure preserved
+        assert len(state["recent_failures"]) == 3
+        sf = state["systematic_failure"]
+        assert sf.get("active") is True
+
+    def test_no_prior_failures_is_noop(self, repo: pathlib.Path) -> None:
+        """No failures for the issue means no changes, no errors."""
+        _write_state(repo, {"recent_failures": [], "blocked_issue_retries": {}})
+        cleared = clear_failures_for_issue(repo, 42)
+        assert cleared == 0
+
+    def test_no_state_file_returns_zero(self, tmp_path: pathlib.Path) -> None:
+        """Missing daemon-state.json returns 0, no errors."""
+        (tmp_path / ".git").mkdir()
+        (tmp_path / ".loom").mkdir()
+        cleared = clear_failures_for_issue(tmp_path, 42)
+        assert cleared == 0
 
 
 # ── Integration: record + detect ─────────────────────────────────
