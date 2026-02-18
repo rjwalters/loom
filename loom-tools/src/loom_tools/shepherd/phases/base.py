@@ -76,6 +76,13 @@ LOW_OUTPUT_RETRY_STRATEGIES: dict[str, tuple[int, list[int]]] = {
 # The claim TTL is 2 hours; extending every 30 minutes provides ample margin.
 _CLAIM_EXTEND_INTERVAL = 1800
 
+# How often (in seconds) to write a shepherd heartbeat milestone during worker
+# polling.  The orphan recovery stale threshold is 300s (5 min); writing every
+# 60s provides a 5× margin.  This prevents active manual shepherds (which have
+# no daemon-state entry) from being incorrectly classified as orphaned during
+# long-running phases like judge.  See issue #2810.
+_SHEPHERD_HEARTBEAT_INTERVAL = 60
+
 # MCP failure detection patterns (case-insensitive).
 # These patterns appear in Claude CLI output when the MCP server fails
 # to initialize, causing an immediate exit with no useful work done.
@@ -1624,6 +1631,7 @@ def run_worker_phase(
     progress_file = ctx.progress_dir / f"shepherd-{ctx.config.task_id}.json"
     seen_heartbeats = 0
     last_claim_extend = time.monotonic()
+    last_shepherd_heartbeat = time.monotonic()
     agent_id = f"shepherd-{ctx.config.task_id}"
 
     # Planning stall detection state (issue #2443).
@@ -1655,6 +1663,15 @@ def run_worker_phase(
         if claim_elapsed >= _CLAIM_EXTEND_INTERVAL:
             extend_claim(ctx.repo_root, ctx.config.issue, agent_id)
             last_claim_extend = time.monotonic()
+
+        # Write periodic shepherd heartbeat to keep progress file fresh.
+        # The orphan recovery stale threshold is 300s; without this, manual
+        # shepherds (no daemon-state entry) get false-positive orphan recovery
+        # during long phases like judge.  See issue #2810.
+        heartbeat_elapsed = time.monotonic() - last_shepherd_heartbeat
+        if heartbeat_elapsed >= _SHEPHERD_HEARTBEAT_INTERVAL:
+            ctx.report_milestone("heartbeat", action=f"waiting for {phase}")
+            last_shepherd_heartbeat = time.monotonic()
 
         # Check for planning stall
         if planning_timeout > 0 and worktree is not None:
