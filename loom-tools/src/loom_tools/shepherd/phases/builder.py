@@ -3613,6 +3613,11 @@ class BuilderPhase:
             parts.append(last_error)
         if diag["low_output_cause"]:
             parts.append(f"low_output_cause={diag['low_output_cause']}")
+        # Surface post-mortem analysis in the summary so operators can
+        # distinguish rate limits, auth failures, and MCP crashes from
+        # the validation error message alone.  See issue #2801.
+        if diag.get("postmortem") and diag["postmortem"].get("summary"):
+            parts.append(f"postmortem: {diag['postmortem']['summary']}")
         if diag["worktree_exists"]:
             if diag["has_uncommitted_changes"]:
                 uncommitted_note = f"{diag['uncommitted_file_count']} files"
