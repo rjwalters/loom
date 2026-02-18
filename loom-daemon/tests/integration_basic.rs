@@ -91,6 +91,7 @@ async fn test_create_terminal() {
 /// Test 2.2: Create terminal with working directory
 #[tokio::test]
 #[serial]
+#[allow(clippy::panic)]
 async fn test_create_terminal_with_working_dir() {
     setup();
 
