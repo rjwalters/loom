@@ -4230,6 +4230,65 @@ class TestRecordFallbackFailure:
         )
         mock_detect.assert_called_once_with(Path("/fake/repo"))
 
+    @patch("loom_tools.common.systematic_failure.detect_systematic_failure", return_value=None)
+    @patch("loom_tools.common.systematic_failure.record_blocked_reason")
+    def test_records_mcp_failure_class(
+        self,
+        mock_record: MagicMock,
+        mock_detect: MagicMock,
+        tmp_path: Path,
+    ) -> None:
+        """Should record mcp_infrastructure_failure when builder log has MCP markers (issue #2768)."""
+        # Create a fake builder log with MCP failure markers
+        logs_dir = tmp_path / ".loom" / "logs"
+        logs_dir.mkdir(parents=True)
+        log_file = logs_dir / "loom-builder-issue-42.log"
+        log_file.write_text("Starting session...\nMCP server failed to initialize\nExiting.")
+
+        ctx = MagicMock()
+        ctx.config.issue = 42
+        ctx.repo_root = tmp_path
+
+        _record_fallback_failure(ctx, ShepherdExitCode.BUILDER_FAILED)
+
+        mock_record.assert_called_once_with(
+            tmp_path,
+            42,
+            error_class="mcp_infrastructure_failure",
+            phase="builder",
+            details="Builder failed due to MCP server failure (exit code 1, fallback cleanup)",
+        )
+        mock_detect.assert_called_once_with(tmp_path)
+
+    @patch("loom_tools.common.systematic_failure.detect_systematic_failure", return_value=None)
+    @patch("loom_tools.common.systematic_failure.record_blocked_reason")
+    def test_records_unknown_when_no_mcp_markers(
+        self,
+        mock_record: MagicMock,
+        mock_detect: MagicMock,
+        tmp_path: Path,
+    ) -> None:
+        """Should record builder_unknown_failure when log exists but has no MCP markers."""
+        # Create a builder log without MCP markers
+        logs_dir = tmp_path / ".loom" / "logs"
+        logs_dir.mkdir(parents=True)
+        log_file = logs_dir / "loom-builder-issue-42.log"
+        log_file.write_text("Starting session...\nSome random error\nExiting.")
+
+        ctx = MagicMock()
+        ctx.config.issue = 42
+        ctx.repo_root = tmp_path
+
+        _record_fallback_failure(ctx, ShepherdExitCode.BUILDER_FAILED)
+
+        mock_record.assert_called_once_with(
+            tmp_path,
+            42,
+            error_class="builder_unknown_failure",
+            phase="builder",
+            details="Builder failed without specific handler (exit code 1, fallback cleanup)",
+        )
+
     @patch("loom_tools.common.systematic_failure.detect_systematic_failure")
     @patch("loom_tools.common.systematic_failure.record_blocked_reason")
     def test_survives_record_failure(
