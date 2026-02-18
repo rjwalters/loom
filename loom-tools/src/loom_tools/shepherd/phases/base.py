@@ -92,6 +92,12 @@ MCP_FAILURE_MIN_OUTPUT_CHARS = 500
 MCP_FAILURE_MAX_RETRIES = 3
 MCP_FAILURE_BACKOFF_SECONDS = [5, 15, 30]
 
+# Startup monitor resolution marker.  When this substring appears in a session
+# log, the wrapper's startup monitor confirmed that all *project* MCP servers
+# (from .mcp.json) connected successfully — any "MCP server failed" text is
+# status-bar noise from global plugins, not a real failure.  See issue #2782.
+_STARTUP_MONITOR_MCP_RESOLUTION = "all project MCP servers connected"
+
 # Ghost session detection and retry settings.
 # A "ghost session" is one that exits almost immediately (0s duration)
 # with no meaningful output — the CLI spawned but never did any work.
@@ -689,6 +695,12 @@ def _is_mcp_failure(log_path: Path) -> bool:
         # sentinel is definitive.  See issue #2706.
         if _MCP_PREFLIGHT_SENTINEL in stripped:
             return True
+
+        # If the startup monitor confirmed all project MCP servers are
+        # healthy, any "MCP server failed" text is status-bar noise from
+        # global plugins — not a real failure.  See issue #2782.
+        if _STARTUP_MONITOR_MCP_RESOLUTION in stripped:
+            return False
 
         # If the session produced substantial CLI output beyond headers,
         # wrapper pre-flight, spinner noise, and UI chrome, it was

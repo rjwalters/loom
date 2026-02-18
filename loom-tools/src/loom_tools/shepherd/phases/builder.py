@@ -44,6 +44,7 @@ from loom_tools.shepherd.phases.base import (
     MCP_FAILURE_PATTERNS,
     PhaseResult,
     PhaseStatus,
+    _STARTUP_MONITOR_MCP_RESOLUTION,
     _get_cli_output,
     extract_log_errors,
     run_phase_with_retry,
@@ -3256,9 +3257,15 @@ class BuilderPhase:
                 # volume.  Thinking spinners can inflate output past the
                 # MCP_FAILURE_MIN_OUTPUT_CHARS threshold without any real
                 # tool calls, causing _is_mcp_failure() to miss it.
-                diag["log_has_mcp_failure_markers"] = bool(
+                # However, suppress when the startup monitor confirmed all
+                # project MCP servers are healthy — markers are just status
+                # bar noise from global plugins.  See issues #2464, #2782.
+                has_mcp_markers = bool(
                     _MCP_FAILURE_MARKER_RE.search(cli_output)
                 )
+                if has_mcp_markers and _STARTUP_MONITOR_MCP_RESOLUTION in stripped:
+                    has_mcp_markers = False
+                diag["log_has_mcp_failure_markers"] = has_mcp_markers
                 # Check for degradation patterns (rate limits + Crystallizing).
                 # See issue #2631.
                 cli_lines = cli_output.splitlines()
