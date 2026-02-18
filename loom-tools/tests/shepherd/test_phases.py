@@ -3032,6 +3032,211 @@ class TestBuilderTestFailureContext:
             builder._preserve_on_test_failure(ctx, test_result)
 
 
+class TestBuilderCommitPriorUncommittedWork:
+    """Test BuilderPhase._commit_prior_uncommitted_work for pre-retry cleanup."""
+
+    def test_commits_prior_uncommitted_changes(
+        self, tmp_path: Path, mock_context: MagicMock
+    ) -> None:
+        """Should commit meaningful uncommitted changes as a checkpoint."""
+        builder = BuilderPhase()
+        worktree = tmp_path / "worktree"
+        worktree.mkdir()
+        mock_context.worktree_path = worktree
+        mock_context.config.issue = 42
+
+        calls: list[tuple[str, ...]] = []
+
+        def fake_run(cmd, **kwargs):
+            cmd_str = " ".join(str(c) for c in cmd)
+            calls.append(tuple(str(c) for c in cmd))
+            result = subprocess.CompletedProcess(
+                args=cmd, returncode=0, stdout="", stderr=""
+            )
+            if "status --porcelain" in cmd_str:
+                result.stdout = "M  src/file.py\n"
+            return result
+
+        with patch(
+            "loom_tools.shepherd.phases.builder.subprocess.run",
+            side_effect=fake_run,
+        ):
+            result = builder._commit_prior_uncommitted_work(mock_context)
+
+        assert result is True
+        cmd_strs = [" ".join(c) for c in calls]
+        assert any("add -A" in c for c in cmd_strs), "Should stage all changes"
+        assert any("commit -m" in c for c in cmd_strs), "Should create commit"
+        # Commit message should contain checkpoint marker
+        commit_calls = [c for c in cmd_strs if "commit -m" in c]
+        assert commit_calls, "Expected a commit call"
+        assert any("prior-run-checkpoint" in " ".join(c) for c in calls if "commit" in " ".join(c))
+
+    def test_no_changes_returns_false(
+        self, tmp_path: Path, mock_context: MagicMock
+    ) -> None:
+        """Should return False when there are no uncommitted changes."""
+        builder = BuilderPhase()
+        worktree = tmp_path / "worktree"
+        worktree.mkdir()
+        mock_context.worktree_path = worktree
+        mock_context.config.issue = 42
+
+        def fake_run(cmd, **kwargs):
+            cmd_str = " ".join(str(c) for c in cmd)
+            result = subprocess.CompletedProcess(
+                args=cmd, returncode=0, stdout="", stderr=""
+            )
+            if "status --porcelain" in cmd_str:
+                result.stdout = ""  # No changes
+            return result
+
+        with patch(
+            "loom_tools.shepherd.phases.builder.subprocess.run",
+            side_effect=fake_run,
+        ):
+            result = builder._commit_prior_uncommitted_work(mock_context)
+
+        assert result is False
+
+    def test_no_worktree_returns_false(self, mock_context: MagicMock) -> None:
+        """Should return False when worktree path is None."""
+        builder = BuilderPhase()
+        mock_context.worktree_path = None
+
+        result = builder._commit_prior_uncommitted_work(mock_context)
+        assert result is False
+
+    def test_artifacts_only_skips_commit(
+        self, tmp_path: Path, mock_context: MagicMock
+    ) -> None:
+        """Should return False when only build artifact files are uncommitted."""
+        builder = BuilderPhase()
+        worktree = tmp_path / "worktree"
+        worktree.mkdir()
+        mock_context.worktree_path = worktree
+        mock_context.config.issue = 42
+
+        calls: list[str] = []
+
+        def fake_run(cmd, **kwargs):
+            cmd_str = " ".join(str(c) for c in cmd)
+            calls.append(cmd_str)
+            result = subprocess.CompletedProcess(
+                args=cmd, returncode=0, stdout="", stderr=""
+            )
+            if "status --porcelain" in cmd_str:
+                result.stdout = "M  Cargo.lock\n"  # Only an artifact
+            return result
+
+        with patch(
+            "loom_tools.shepherd.phases.builder.subprocess.run",
+            side_effect=fake_run,
+        ):
+            result = builder._commit_prior_uncommitted_work(mock_context)
+
+        assert result is False
+        assert not any("add -A" in c for c in calls), "Should not stage artifacts"
+        assert not any("commit -m" in c for c in calls), "Should not create commit"
+
+    def test_stage_failure_returns_false(
+        self, tmp_path: Path, mock_context: MagicMock
+    ) -> None:
+        """Should return False when git add fails."""
+        builder = BuilderPhase()
+        worktree = tmp_path / "worktree"
+        worktree.mkdir()
+        mock_context.worktree_path = worktree
+        mock_context.config.issue = 42
+
+        def fake_run(cmd, **kwargs):
+            cmd_str = " ".join(str(c) for c in cmd)
+            if "status --porcelain" in cmd_str:
+                return subprocess.CompletedProcess(
+                    args=cmd, returncode=0, stdout="M  file.py\n", stderr=""
+                )
+            if "add" in cmd_str and "-A" in cmd_str:
+                return subprocess.CompletedProcess(
+                    args=cmd, returncode=1, stdout="", stderr="error staging"
+                )
+            return subprocess.CompletedProcess(
+                args=cmd, returncode=0, stdout="", stderr=""
+            )
+
+        with patch(
+            "loom_tools.shepherd.phases.builder.subprocess.run",
+            side_effect=fake_run,
+        ):
+            result = builder._commit_prior_uncommitted_work(mock_context)
+
+        assert result is False
+
+    def test_does_not_change_labels(
+        self, tmp_path: Path, mock_context: MagicMock
+    ) -> None:
+        """Should not change issue labels (unlike _commit_interrupted_work)."""
+        builder = BuilderPhase()
+        worktree = tmp_path / "worktree"
+        worktree.mkdir()
+        mock_context.worktree_path = worktree
+        mock_context.config.issue = 42
+
+        def fake_run(cmd, **kwargs):
+            cmd_str = " ".join(str(c) for c in cmd)
+            result = subprocess.CompletedProcess(
+                args=cmd, returncode=0, stdout="", stderr=""
+            )
+            if "status --porcelain" in cmd_str:
+                result.stdout = "M  file.py\n"
+            return result
+
+        with (
+            patch(
+                "loom_tools.shepherd.phases.builder.subprocess.run",
+                side_effect=fake_run,
+            ),
+            patch(
+                "loom_tools.shepherd.phases.builder.transition_issue_labels"
+            ) as mock_transition,
+        ):
+            builder._commit_prior_uncommitted_work(mock_context)
+
+        mock_transition.assert_not_called()
+
+    def test_does_not_push_to_remote(
+        self, tmp_path: Path, mock_context: MagicMock
+    ) -> None:
+        """Should not push to remote (unlike _commit_interrupted_work)."""
+        builder = BuilderPhase()
+        worktree = tmp_path / "worktree"
+        worktree.mkdir()
+        mock_context.worktree_path = worktree
+        mock_context.config.issue = 42
+
+        calls: list[str] = []
+
+        def fake_run(cmd, **kwargs):
+            cmd_str = " ".join(str(c) for c in cmd)
+            calls.append(cmd_str)
+            result = subprocess.CompletedProcess(
+                args=cmd, returncode=0, stdout="", stderr=""
+            )
+            if "status --porcelain" in cmd_str:
+                result.stdout = "M  file.py\n"
+            return result
+
+        with patch(
+            "loom_tools.shepherd.phases.builder.subprocess.run",
+            side_effect=fake_run,
+        ):
+            builder._commit_prior_uncommitted_work(mock_context)
+
+        # Use split() to check "push" as a standalone token — avoids false
+        # positives from the test function name appearing in the tmp_path
+        # (e.g. "/tmp/pytest-.../test_does_not_push_to_remote0/worktree").
+        assert not any("push" in c.split() for c in calls), "Should not push to remote"
+
+
 class TestBuilderCommitInterruptedWork:
     """Test BuilderPhase._commit_interrupted_work for preserving work on interruption."""
 

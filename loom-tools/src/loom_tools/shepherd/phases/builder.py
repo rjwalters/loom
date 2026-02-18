@@ -352,6 +352,12 @@ class BuilderPhase:
                     "(no commits, no uncommitted changes) - cleaning up"
                 )
                 self._reset_stale_worktree(ctx)
+            else:
+                # Worktree exists but is not stale — it may have uncommitted
+                # changes from a prior failed builder session (issue #2849).
+                # Commit them as a checkpoint so the new builder starts with a
+                # clean working tree and can see the prior work in git history.
+                self._commit_prior_uncommitted_work(ctx)
 
         # Create worktree
         if ctx.worktree_path and not ctx.worktree_path.is_dir():
@@ -4878,6 +4884,96 @@ class BuilderPhase:
             check=False,
         )
         return bool(result.returncode == 0 and result.stdout.strip())
+
+    def _commit_prior_uncommitted_work(self, ctx: ShepherdContext) -> bool:
+        """Commit uncommitted changes left by a prior builder before a new retry.
+
+        When the shepherd re-runs the builder phase (e.g. after removing
+        loom:blocked with -m), the existing worktree may contain uncommitted
+        changes from the previous failed builder session.  Committing them
+        as a named checkpoint before spawning the new builder ensures:
+
+        1. The new builder starts with a clean working tree.
+        2. Prior work is preserved in git history (not lost).
+        3. The new builder can see what was already attempted.
+
+        Unlike _commit_interrupted_work, this method does NOT:
+        - Push the branch to remote
+        - Change issue labels
+        - Add GitHub issue comments
+
+        Returns True if a checkpoint commit was created, False otherwise.
+        """
+        if not ctx.worktree_path or not ctx.worktree_path.is_dir():
+            return False
+
+        # Check for meaningful uncommitted changes (filter build artifacts)
+        status_result = subprocess.run(
+            ["git", "-C", str(ctx.worktree_path), "status", "--porcelain"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if status_result.returncode != 0 or not status_result.stdout.strip():
+            return False
+
+        porcelain_lines = [
+            line for line in status_result.stdout.splitlines() if line
+        ]
+        meaningful, _ = self._filter_build_artifacts(porcelain_lines)
+        if not meaningful:
+            log_info(
+                "Skipping prior-run checkpoint: only build artifact files "
+                "are uncommitted (no meaningful changes)"
+            )
+            return False
+
+        log_warning(
+            f"[builder] Worktree has uncommitted changes from a prior run — "
+            f"committing as checkpoint before new builder session"
+        )
+
+        # Stage all changes
+        stage_result = subprocess.run(
+            ["git", "-C", str(ctx.worktree_path), "add", "-A"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if stage_result.returncode != 0:
+            log_warning(
+                f"Failed to stage prior-run changes: "
+                f"{(stage_result.stderr or stage_result.stdout or '').strip()[:200]}"
+            )
+            return False
+
+        # Create checkpoint commit
+        commit_msg = (
+            f"[prior-run-checkpoint] stale work from previous builder attempt\n\n"
+            f"Issue: #{ctx.config.issue}\n\n"
+            f"This commit contains uncommitted work left by a prior builder\n"
+            f"session that failed or was interrupted before completion.\n"
+            f"The new builder session will start from a clean working tree\n"
+            f"and can reference this commit for context."
+        )
+        commit_result = subprocess.run(
+            ["git", "-C", str(ctx.worktree_path), "commit", "-m", commit_msg],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if commit_result.returncode != 0:
+            log_warning(
+                f"Failed to create prior-run checkpoint commit: "
+                f"{(commit_result.stderr or commit_result.stdout or '').strip()[:200]}"
+            )
+            return False
+
+        log_info(
+            f"Created prior-run checkpoint commit in {ctx.worktree_path} "
+            f"— new builder will start with a clean working tree"
+        )
+        return True
 
     def _commit_interrupted_work(self, ctx: ShepherdContext, reason: str) -> bool:
         """Commit and push uncommitted work when builder is interrupted.
