@@ -55,6 +55,10 @@ class TestShepherdExitCode:
         """WORKTREE_ESCAPE should be 12."""
         assert ShepherdExitCode.WORKTREE_ESCAPE == 12
 
+    def test_rate_limit_abort_is_thirteen(self) -> None:
+        """RATE_LIMIT_ABORT should be 13."""
+        assert ShepherdExitCode.RATE_LIMIT_ABORT == 13
+
     def test_can_use_as_int(self) -> None:
         """Exit codes should be usable as integers."""
         assert int(ShepherdExitCode.SUCCESS) == 0
@@ -120,6 +124,11 @@ class TestDescribeExitCode:
         """Should describe WORKTREE_ESCAPE exit code."""
         desc = describe_exit_code(12)
         assert "worktree" in desc.lower() or "escape" in desc.lower()
+
+    def test_describes_rate_limit_abort(self) -> None:
+        """Should describe RATE_LIMIT_ABORT exit code."""
+        desc = describe_exit_code(13)
+        assert "rate limit" in desc.lower() or "not retryable" in desc.lower()
 
     def test_unknown_code_returns_message(self) -> None:
         """Should return message for unknown exit codes."""

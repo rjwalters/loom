@@ -28,6 +28,7 @@ class ShepherdExitCode(IntEnum):
     | 7         | Transient API error           | Requeue issue, retry after backoff|
     | 9         | Systemic failure (auth/API)   | Requeue issue, do NOT retry       |
     | 12        | Worktree escape (transient)   | Requeue issue, retry normally     |
+    | 13        | Rate limit abort (not retry)  | Requeue issue, do NOT retry       |
 
     Using IntEnum allows these to be used directly as exit codes:
         return ShepherdExitCode.SUCCESS
@@ -82,6 +83,12 @@ class ShepherdExitCode(IntEnum):
     # See issue #2752.
     WORKTREE_ESCAPE = 12
 
+    # CLI hit a usage/plan limit and showed an interactive prompt that
+    # nobody can answer in headless mode.  The wrapper detected the prompt,
+    # killed the CLI, and wrote a sentinel.  NOT retryable — the limit
+    # won't resolve until it resets or the user re-authenticates.
+    RATE_LIMIT_ABORT = 13
+
 
 # Convenience mapping for code interpretation
 EXIT_CODE_DESCRIPTIONS = {
@@ -96,6 +103,7 @@ EXIT_CODE_DESCRIPTIONS = {
     ShepherdExitCode.BUDGET_EXHAUSTED: "Budget exhausted - issue may need decomposition",
     ShepherdExitCode.SYSTEMIC_FAILURE: "Systemic failure (auth/API) - do not retry immediately",
     ShepherdExitCode.WORKTREE_ESCAPE: "Worktree escape - builder modified main instead of worktree",
+    ShepherdExitCode.RATE_LIMIT_ABORT: "Rate limit abort - CLI hit usage/plan limit (not retryable)",
 }
 
 

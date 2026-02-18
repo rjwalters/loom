@@ -77,6 +77,7 @@ EXIT CODES:
     5  SKIPPED            - Issue already complete (no action needed)
     6  NO_CHANGES_NEEDED  - No changes determined, issue marked blocked
     9  SYSTEMIC_FAILURE   - Auth/API failure, do not retry immediately
+   13  RATE_LIMIT_ABORT   - CLI hit usage/plan limit, do not retry
 
 NOTE:
     Force mode does NOT skip the Judge phase. Code review always runs because
@@ -433,6 +434,8 @@ def orchestrate(ctx: ShepherdContext) -> int:
                 log_error(result.message)
                 if result.data.get("auth_failure"):
                     return ShepherdExitCode.SYSTEMIC_FAILURE
+                elif result.data.get("rate_limit_abort"):
+                    return ShepherdExitCode.RATE_LIMIT_ABORT
                 return ShepherdExitCode.BUILDER_FAILED
 
             if result.status == PhaseStatus.SKIPPED:
@@ -821,6 +824,8 @@ def orchestrate(ctx: ShepherdContext) -> int:
                         exit_code = ShepherdExitCode.WORKTREE_ESCAPE
                     elif result.data.get("auth_failure"):
                         exit_code = ShepherdExitCode.SYSTEMIC_FAILURE
+                    elif result.data.get("rate_limit_abort"):
+                        exit_code = ShepherdExitCode.RATE_LIMIT_ABORT
                     else:
                         exit_code = ShepherdExitCode.BUILDER_FAILED
                     return exit_code
@@ -1995,6 +2000,13 @@ def _post_fallback_failure_comment(ctx: ShepherdContext, exit_code: int) -> None
             "This is an **infrastructure failure**, not an issue with the code. "
             "Check authentication tokens and API availability before retrying."
         )
+    elif exit_code == ShepherdExitCode.RATE_LIMIT_ABORT:
+        failure_type = "rate limit abort (usage/plan limit)"
+        advice = (
+            "The CLI hit a **usage or plan limit** and showed an interactive prompt "
+            "that cannot be answered in headless mode. Wait for the limit to reset "
+            "or re-authenticate with a different plan before retrying."
+        )
     else:
         failure_type = "unexpected failure"
         advice = (
@@ -2050,6 +2062,9 @@ def _record_fallback_failure(ctx: ShepherdContext, exit_code: int) -> None:
     elif exit_code == ShepherdExitCode.WORKTREE_ESCAPE:
         error_class = "builder_worktree_escape"
         details = "Builder escaped worktree and modified main instead (fallback cleanup)"
+    elif exit_code == ShepherdExitCode.RATE_LIMIT_ABORT:
+        error_class = "rate_limit_abort"
+        details = "CLI hit usage/plan limit — interactive prompt in headless mode (fallback cleanup)"
     else:
         error_class = "builder_unknown_failure"
         # Include post-mortem diagnostics if available (issue #2766).

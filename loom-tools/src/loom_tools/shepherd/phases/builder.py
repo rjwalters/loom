@@ -520,6 +520,29 @@ class BuilderPhase:
                 },
             )
 
+        if exit_code == 13:
+            # Rate limit abort: CLI hit a usage/plan limit and showed an
+            # interactive prompt.  Not retryable — the limit won't resolve
+            # until it resets or the user re-authenticates.
+            log_warning(
+                f"Rate limit abort for issue #{ctx.config.issue}: "
+                f"CLI hit usage/plan limit (not retryable)"
+            )
+            self._cleanup_stale_worktree(ctx)
+            return PhaseResult(
+                status=PhaseStatus.FAILED,
+                message=(
+                    "CLI hit usage/plan limit — interactive prompt detected "
+                    "in headless mode (not retryable until limit resets)"
+                ),
+                phase_name="builder",
+                data={
+                    "rate_limit_abort": True,
+                    "exit_code": exit_code,
+                    "log_file": str(self._get_log_path(ctx)),
+                },
+            )
+
         if exit_code not in (0, 3, 4):
             # Unexpected non-zero exit from builder subprocess
             diag = self._gather_diagnostics(ctx)
