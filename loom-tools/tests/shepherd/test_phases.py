@@ -38,6 +38,7 @@ from loom_tools.shepherd.phases.base import (
     MCP_FAILURE_BACKOFF_SECONDS,
     MCP_FAILURE_MAX_RETRIES,
     MCP_FAILURE_MIN_OUTPUT_CHARS,
+    THINKING_STALL_MIN_DURATION_SECONDS,
     _AUTH_FAILURE_SENTINEL,
     _RATE_LIMIT_SENTINEL,
     _classify_ghost_cause,
@@ -47,6 +48,7 @@ from loom_tools.shepherd.phases.base import (
     _is_rate_limit_abort,
     _is_low_output_session,
     _is_mcp_failure,
+    _is_thinking_stall_session,
     _print_heartbeat,
     _strip_spinner_noise,
     _strip_ui_chrome,
@@ -15517,6 +15519,72 @@ class TestIsMcpFailureExtendedThinking:
             + real_work
         )
         assert _is_mcp_failure(log) is False
+
+
+class TestIsThinkingStallSession:
+    """Tests for _is_thinking_stall_session with the elapsed_seconds gate.
+
+    See issue #2833: post-mortem thinking stall detection lacked a minimum
+    duration guard, causing short-lived infrastructure failures to be
+    misclassified as (non-retryable) thinking stalls.
+    """
+
+    def _make_stall_log(self, tmp_path: Path) -> Path:
+        """Write a log that looks like a genuine thinking stall."""
+        log = tmp_path / "session.log"
+        # Enough content (>100 chars), zero tool call markers
+        thinking_output = "(thinking)\n" * 30 + "Moseying…\n" * 20
+        log.write_text("# CLAUDE_CLI_START\n" + thinking_output)
+        return log
+
+    def test_no_elapsed_classifies_as_stall(self, tmp_path: Path) -> None:
+        """Without elapsed_seconds, any output-with-no-tools session is a stall."""
+        log = self._make_stall_log(tmp_path)
+        assert _is_thinking_stall_session(log) is True
+
+    def test_long_session_classifies_as_stall(self, tmp_path: Path) -> None:
+        """Session longer than threshold is correctly classified as thinking stall."""
+        log = self._make_stall_log(tmp_path)
+        long_elapsed = THINKING_STALL_MIN_DURATION_SECONDS + 60.0
+        assert _is_thinking_stall_session(log, elapsed_seconds=long_elapsed) is True
+
+    def test_short_session_not_classified_as_stall(self, tmp_path: Path) -> None:
+        """Session shorter than threshold is NOT classified as thinking stall.
+
+        Short sessions (e.g. ~10s) that show the Claude startup UI but exit
+        immediately are almost certainly infrastructure failures (MCP errors,
+        auth issues), not genuine extended-thinking stalls.  See issue #2833.
+        """
+        log = self._make_stall_log(tmp_path)
+        short_elapsed = THINKING_STALL_MIN_DURATION_SECONDS - 1.0
+        assert _is_thinking_stall_session(log, elapsed_seconds=short_elapsed) is False
+
+    def test_exactly_at_threshold_classifies_as_stall(self, tmp_path: Path) -> None:
+        """Session exactly at the threshold boundary should be classified as stall."""
+        log = self._make_stall_log(tmp_path)
+        assert (
+            _is_thinking_stall_session(
+                log, elapsed_seconds=THINKING_STALL_MIN_DURATION_SECONDS
+            )
+            is True
+        )
+
+    def test_zero_elapsed_not_classified_as_stall(self, tmp_path: Path) -> None:
+        """Zero-second sessions should never be classified as thinking stalls."""
+        log = self._make_stall_log(tmp_path)
+        assert _is_thinking_stall_session(log, elapsed_seconds=0.0) is False
+
+    def test_session_with_tool_calls_not_a_stall(self, tmp_path: Path) -> None:
+        """Session with tool calls is never a stall regardless of duration."""
+        log = tmp_path / "session.log"
+        log.write_text(
+            "# CLAUDE_CLI_START\n"
+            + "(thinking)\n" * 30
+            + "⏺ Reading file\n"
+            + "some output\n" * 20
+        )
+        long_elapsed = THINKING_STALL_MIN_DURATION_SECONDS + 60.0
+        assert _is_thinking_stall_session(log, elapsed_seconds=long_elapsed) is False
 
 
 class TestStripUiChrome:

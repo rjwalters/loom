@@ -197,6 +197,17 @@ _TOOL_CALL_MARKER = "⏺"
 # classified as low-output (exit code 6) instead of ghost (exit code 10).
 GHOST_SESSION_WALL_CLOCK_THRESHOLD = 30.0
 
+# Minimum wall-clock duration (in seconds) for post-mortem thinking stall
+# classification.  A genuine thinking stall requires the model to reason for
+# an extended period without invoking any tools.  Sessions shorter than this
+# threshold almost certainly represent infrastructure failures (MCP errors,
+# auth issues, etc.) that caused the CLI to display its startup screen and
+# exit immediately — not model behaviour.  The in-flight check
+# (_scan_log_for_thinking_stall) already gates on THINKING_STALL_TIMEOUT
+# (180s); this constant provides an equivalent floor for the post-mortem
+# version (_is_thinking_stall_session).  See issue #2833.
+THINKING_STALL_MIN_DURATION_SECONDS = 30.0
+
 # Maximum raw log file size (in bytes) for the size-based ghost detection
 # fallback.  Sessions with a small raw log AND short wall-clock duration
 # are almost certainly infrastructure failures (MCP-startup kill, spawn
@@ -1094,13 +1105,17 @@ def _scan_log_for_degradation(log_path: Path) -> bool:
         return False
 
 
-def _is_thinking_stall_session(log_path: Path) -> bool:
+def _is_thinking_stall_session(
+    log_path: Path, *, elapsed_seconds: float | None = None
+) -> bool:
     """Check if a session log shows extended thinking without any tool calls.
 
     Detection criteria:
     1. The CLI start sentinel is present (Claude CLI actually started)
     2. CLI output contains spinner/thinking content (not empty)
     3. Zero tool call markers (⏺) appear in the entire CLI output
+    4. Wall-clock elapsed time is ≥ ``THINKING_STALL_MIN_DURATION_SECONDS``
+       (when ``elapsed_seconds`` is provided)
 
     This catches sessions where Claude enters extended thinking mode
     (producing "Moseying…", "(thinking)", "(thought for Ns)" output)
@@ -1108,9 +1123,29 @@ def _is_thinking_stall_session(log_path: Path) -> bool:
     this does NOT require rate limit warnings — it fires purely on the
     absence of tool calls in a session that produced thinking output.
 
+    Args:
+        log_path: Path to the worker session log file.
+        elapsed_seconds: Wall-clock elapsed time (in seconds) from the
+            caller.  When provided, sessions shorter than
+            ``THINKING_STALL_MIN_DURATION_SECONDS`` are not classified as
+            thinking stalls — they are almost certainly infrastructure
+            failures (MCP errors, auth issues) that caused the CLI to
+            display its startup screen and exit immediately, not genuine
+            model behaviour.  See issue #2833.
+
     See issue #2784.
     """
     if not log_path.is_file():
+        return False
+
+    # Short sessions cannot be genuine thinking stalls.  The model needs
+    # time to enter extended thinking mode; a sub-threshold session is far
+    # more likely an infrastructure failure that produced startup-screen
+    # output and exited immediately.  See issue #2833.
+    if (
+        elapsed_seconds is not None
+        and elapsed_seconds < THINKING_STALL_MIN_DURATION_SECONDS
+    ):
         return False
 
     try:
@@ -1938,7 +1973,7 @@ def run_worker_phase(
     # (which is more specific) and after MCP failure (which is retryable and
     # would otherwise be misclassified as thinking stall).
     # See issues #2784, #2804.
-    if _is_thinking_stall_session(log_path):
+    if _is_thinking_stall_session(log_path, elapsed_seconds=elapsed):
         if postmortem is not None:
             log_warning(f"Post-mortem: {postmortem['summary']}")
         log_warning(
