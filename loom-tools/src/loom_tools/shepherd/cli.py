@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import io
 import os
 import shlex
 import sys
@@ -47,10 +48,10 @@ from loom_tools.shepherd.phases.base import PhaseResult
 def _print_phase_header(title: str) -> None:
     """Print a phase header with formatting to stderr for consistent ordering."""
     width = 67
-    print(file=sys.stderr)
-    print(f"\033[0;36m{'═' * width}\033[0m", file=sys.stderr)
-    print(f"\033[0;36m  {title}\033[0m", file=sys.stderr)
-    print(f"\033[0;36m{'═' * width}\033[0m", file=sys.stderr)
+    print(file=sys.stderr, flush=True)
+    print(f"\033[0;36m{'═' * width}\033[0m", file=sys.stderr, flush=True)
+    print(f"\033[0;36m  {title}\033[0m", file=sys.stderr, flush=True)
+    print(f"\033[0;36m{'═' * width}\033[0m", file=sys.stderr, flush=True)
 
 
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -2148,6 +2149,17 @@ def _record_fallback_failure(ctx: ShepherdContext, exit_code: int) -> None:
 
 def main(argv: list[str] | None = None) -> int:
     """Main entry point for loom-shepherd CLI."""
+    # Force line-buffered stderr so all output is visible immediately even when
+    # invoked non-interactively (e.g., from the Claude Code Bash tool or piped
+    # contexts). Without this, Python may block-buffer stderr when it's not a
+    # tty, causing output to be lost if the process crashes before flushing.
+    # The wrapper script also sets PYTHONUNBUFFERED=1 as a belt-and-suspenders
+    # measure, but this handles the case where the CLI is invoked directly.
+    try:
+        sys.stderr.reconfigure(line_buffering=True)  # type: ignore[union-attr]
+    except (AttributeError, io.UnsupportedOperation):
+        pass  # Some environments don't support reconfigure; flush=True handles it
+
     args = _parse_args(argv)
     config = _create_config(args)
 

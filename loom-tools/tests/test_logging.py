@@ -2,7 +2,44 @@
 
 from __future__ import annotations
 
+import subprocess
+import sys
+
 from loom_tools.common.logging import strip_ansi
+
+
+# ---------------------------------------------------------------------------
+# Tests for non-interactive output visibility (issue #2797)
+# ---------------------------------------------------------------------------
+
+
+def test_log_output_visible_non_interactively() -> None:
+    """Log functions write to stderr immediately even when not a tty.
+
+    This validates the fix for #2797: shepherd CLI output was lost when invoked
+    non-interactively (e.g., from Claude Code Bash tool or piped contexts)
+    because Python buffered stderr. The fix adds flush=True to _emit() so output
+    reaches callers immediately without relying on PYTHONUNBUFFERED=1.
+    """
+    script = (
+        "from loom_tools.common.logging import log_info, log_warning, log_error, log_success\n"
+        "log_info('test info')\n"
+        "log_warning('test warning')\n"
+        "log_error('test error')\n"
+        "log_success('test success')\n"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        capture_output=True,
+        text=True,
+        # Deliberately do NOT set PYTHONUNBUFFERED to test that flush=True works
+        env={"PATH": "/usr/bin:/bin"},
+    )
+    stderr = result.stderr
+    assert "[INFO] test info" in stderr, f"log_info output missing from stderr: {stderr!r}"
+    assert "[WARN] test warning" in stderr, f"log_warning output missing from stderr: {stderr!r}"
+    assert "[ERROR] test error" in stderr, f"log_error output missing from stderr: {stderr!r}"
+    assert "[OK] test success" in stderr, f"log_success output missing from stderr: {stderr!r}"
 
 
 # ---------------------------------------------------------------------------

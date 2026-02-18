@@ -56,7 +56,7 @@ def _emit(color: str, label: str, message: str) -> None:
         line = f"{color}{ts} [{label}]{_RESET} {message}"
     else:
         line = f"{ts} [{label}] {message}"
-    print(line, file=sys.stderr)
+    print(line, file=sys.stderr, flush=True)
 
 
 def log_info(message: str) -> None:
