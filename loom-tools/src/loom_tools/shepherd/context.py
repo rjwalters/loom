@@ -6,6 +6,7 @@ import logging
 import os
 import subprocess
 import tempfile
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -68,7 +69,41 @@ class ShepherdContext:
         # Set worktree path based on issue number
         self._paths = LoomPaths(self.repo_root)
         self.worktree_path = self._paths.worktree_path(self.config.issue)
+        self._cleanup_old_progress_files()
         self._cleanup_stale_progress_for_issue()
+
+    def _cleanup_old_progress_files(self) -> None:
+        """Remove progress files older than 24 hours.
+
+        Manual ``/shepherd`` runs leave orphaned progress files because the
+        daemon cleanup (which runs on ``daemon-startup`` and ``periodic``
+        events) never fires.  This lightweight check deletes files whose
+        *modification time* is more than 24 hours old, regardless of which
+        issue they belong to.  It runs on every shepherd startup so that
+        stale files are eventually cleaned up even without a daemon.
+        """
+        logger = logging.getLogger(__name__)
+        progress_dir = self._paths.progress_dir
+        if not progress_dir.is_dir():
+            return
+
+        stale_threshold = 24 * 3600  # 24 hours in seconds
+        deleted = 0
+        now = time.time()
+        for progress_file in progress_dir.glob("shepherd-*.json"):
+            try:
+                age = now - progress_file.stat().st_mtime
+                if age >= stale_threshold:
+                    progress_file.unlink(missing_ok=True)
+                    deleted += 1
+            except OSError:
+                pass
+
+        if deleted:
+            logger.info(
+                "Cleaned up %d stale progress file(s) older than 24h",
+                deleted,
+            )
 
     def _cleanup_stale_progress_for_issue(self) -> None:
         """Remove stale progress files for this issue.
