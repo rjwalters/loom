@@ -47,6 +47,16 @@ ERROR_CLASS_BLOCK_THRESHOLDS: dict[str, int] = {
     "budget_exhausted": 2,
 }
 
+# Infrastructure error classes that should NOT count toward auto-blocking.
+# These represent environment/platform failures (MCP server down, auth timeout),
+# not problems with the issue itself.  Blocking an issue for infrastructure
+# failures is counterproductive — the issue would succeed once infrastructure
+# recovers.  See issue #2772.
+INFRASTRUCTURE_ERROR_CLASSES: frozenset[str] = frozenset({
+    "auth_infrastructure_failure",
+    "mcp_infrastructure_failure",
+})
+
 # Backoff schedule: attempt -> iterations to skip
 # 1st failure: 0, 2nd: 2, 3rd: 4, 4th: 8, 5th: auto-block
 BACKOFF_BASE = 2
@@ -125,6 +135,8 @@ class IssueFailureEntry:
 
     @property
     def should_auto_block(self) -> bool:
+        if self.error_class in INFRASTRUCTURE_ERROR_CLASSES:
+            return False
         return self.total_failures >= self.block_threshold
 
 

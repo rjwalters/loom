@@ -12,7 +12,10 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from loom_tools.common.config import env_int
-from loom_tools.common.issue_failures import record_failure as _record_persistent_failure
+from loom_tools.common.issue_failures import (
+    INFRASTRUCTURE_ERROR_CLASSES,
+    record_failure as _record_persistent_failure,
+)
 from loom_tools.common.paths import LoomPaths
 from loom_tools.common.state import read_json_file, write_json_file
 from loom_tools.models.daemon_state import SystematicFailure
@@ -145,14 +148,23 @@ def detect_systematic_failure(
     cooldown = _get_cooldown()
 
     failures_raw: list[dict] = data.get("recent_failures", [])
-    if len(failures_raw) < threshold:
+
+    # Filter out infrastructure failures — they indicate environment issues
+    # (MCP server down, auth timeout), not issue-specific problems, and should
+    # not trigger systematic failure escalation.  See issue #2772.
+    non_infra = [
+        f for f in failures_raw
+        if f.get("error_class", "unknown") not in INFRASTRUCTURE_ERROR_CLASSES
+    ]
+
+    if len(non_infra) < threshold:
         if update:
             data["systematic_failure"] = {}
             write_json_file(state_file, data)
         return None
 
-    # Check the last N failures for the same error class
-    last_n = failures_raw[-threshold:]
+    # Check the last N non-infrastructure failures for the same error class
+    last_n = non_infra[-threshold:]
     classes = {f.get("error_class", "unknown") for f in last_n}
 
     if len(classes) != 1:
