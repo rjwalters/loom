@@ -94,9 +94,11 @@ MCP_FAILURE_MIN_OUTPUT_CHARS = 500
 
 # Maximum retries for MCP failure detection, with longer backoff.
 # MCP failures are often systemic (stale build, resource contention)
-# so we use longer backoff than low-output.
+# so we use longer backoff than low-output.  The MCP server can take
+# up to 20s to become ready after a restart, so the initial backoff
+# must be at least that long to avoid wasting attempts.  See issue #2799.
 MCP_FAILURE_MAX_RETRIES = 3
-MCP_FAILURE_BACKOFF_SECONDS = [5, 15, 30]
+MCP_FAILURE_BACKOFF_SECONDS = [20, 30, 60]
 
 # Startup monitor resolution marker.  When this substring appears in a session
 # log, the wrapper's startup monitor confirmed that all *project* MCP servers
@@ -118,7 +120,7 @@ GHOST_SESSION_BACKOFF_SECONDS = [10, 30, 60]
 # Similar to LOW_OUTPUT_RETRY_STRATEGIES.  See issue #2644.
 GHOST_RETRY_STRATEGIES: dict[str, tuple[int, list[int]]] = {
     "auth_failure": (0, []),           # Auth issues won't resolve with retries
-    "mcp_init_failure": (3, [10, 30, 60]),  # MCP failures need retries; startup monitor now kills degraded sessions (issue #2652)
+    "mcp_init_failure": (3, [20, 30, 60]),  # MCP server needs ~20s to be ready; see issue #2799
     "api_unreachable": (1, [30]),      # API blip might be transient
     "wrapper_crash": (0, []),          # Script errors won't self-heal
     "unknown": (GHOST_SESSION_MAX_RETRIES, list(GHOST_SESSION_BACKOFF_SECONDS)),

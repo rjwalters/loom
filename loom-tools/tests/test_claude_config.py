@@ -8,6 +8,7 @@ import pytest
 
 from loom_tools.common.claude_config import (
     _SHARED_CONFIG_FILES,
+    _copy_settings_without_plugins,
     _ensure_onboarding_complete,
     _keychain_service_name,
     _resolve_state_file,
@@ -58,13 +59,23 @@ class TestSetupAgentConfigDir:
 
         config_dir = setup_agent_config_dir("test-agent", mock_repo)
 
-        # Check that symlinks were created for files that exist in ~/.claude/
-        for filename in ["settings.json", "config.json"]:
-            src = home_claude / filename
-            dst = config_dir / filename
-            if src.exists():
-                assert dst.is_symlink(), f"{filename} should be a symlink"
-                assert dst.resolve() == src.resolve()
+        # config.json should be symlinked
+        src = home_claude / "config.json"
+        dst = config_dir / "config.json"
+        if src.exists():
+            assert dst.is_symlink(), "config.json should be a symlink"
+            assert dst.resolve() == src.resolve()
+
+        # settings.json should be a COPY (not symlink) with enabledPlugins stripped
+        settings_src = home_claude / "settings.json"
+        settings_dst = config_dir / "settings.json"
+        if settings_src.exists():
+            import json
+
+            assert settings_dst.exists(), "settings.json should exist"
+            assert not settings_dst.is_symlink(), "settings.json should NOT be a symlink"
+            data = json.loads(settings_dst.read_text())
+            assert "enabledPlugins" not in data, "enabledPlugins should be stripped"
 
     def test_idempotent(self, mock_repo: pathlib.Path) -> None:
         """Calling setup twice should not fail or duplicate anything."""
@@ -87,6 +98,10 @@ class TestSetupAgentConfigDir:
     def test_claude_json_not_in_shared_config_files(self) -> None:
         """State file .claude.json is handled separately, not in shared list."""
         assert ".claude.json" not in _SHARED_CONFIG_FILES
+
+    def test_settings_json_not_in_shared_config_files(self) -> None:
+        """settings.json is copied (not symlinked) to strip enabledPlugins."""
+        assert "settings.json" not in _SHARED_CONFIG_FILES
 
     def test_mcp_json_not_in_shared_config_files(self) -> None:
         """MCP configs are project-scoped, not user-global — must not be symlinked."""
@@ -295,6 +310,70 @@ class TestEnsureOnboardingComplete:
         assert state.is_symlink()  # symlink preserved
         data = json.loads(state.read_text())
         assert data["theme"] == "light"
+
+
+class TestCopySettingsWithoutPlugins:
+    """Tests for _copy_settings_without_plugins."""
+
+    def test_strips_enabled_plugins(self, tmp_path: pathlib.Path) -> None:
+        import json
+
+        src = tmp_path / "settings.json"
+        src.write_text(json.dumps({
+            "enabledPlugins": {"rust-analyzer-lsp@official": True},
+            "model": "sonnet",
+            "alwaysThinkingEnabled": True,
+        }))
+        dst = tmp_path / "out-settings.json"
+        assert _copy_settings_without_plugins(src, dst) is True
+        data = json.loads(dst.read_text())
+        assert "enabledPlugins" not in data
+        assert data["model"] == "sonnet"
+        assert data["alwaysThinkingEnabled"] is True
+
+    def test_preserves_all_other_keys(self, tmp_path: pathlib.Path) -> None:
+        import json
+
+        src = tmp_path / "settings.json"
+        src.write_text(json.dumps({
+            "enabledPlugins": {"swift-lsp@official": True},
+            "model": "opus",
+            "skipDangerousModePermissionPrompt": True,
+            "customSetting": 42,
+        }))
+        dst = tmp_path / "out.json"
+        _copy_settings_without_plugins(src, dst)
+        data = json.loads(dst.read_text())
+        assert data["model"] == "opus"
+        assert data["skipDangerousModePermissionPrompt"] is True
+        assert data["customSetting"] == 42
+
+    def test_no_plugins_key_still_copies(self, tmp_path: pathlib.Path) -> None:
+        import json
+
+        src = tmp_path / "settings.json"
+        src.write_text(json.dumps({"model": "haiku"}))
+        dst = tmp_path / "out.json"
+        assert _copy_settings_without_plugins(src, dst) is True
+        data = json.loads(dst.read_text())
+        assert data == {"model": "haiku"}
+
+    def test_missing_src_returns_false(self, tmp_path: pathlib.Path) -> None:
+        dst = tmp_path / "out.json"
+        assert _copy_settings_without_plugins(tmp_path / "nope.json", dst) is False
+        assert not dst.exists()
+
+    def test_corrupt_json_returns_false(self, tmp_path: pathlib.Path) -> None:
+        src = tmp_path / "settings.json"
+        src.write_text("not json{{{")
+        dst = tmp_path / "out.json"
+        assert _copy_settings_without_plugins(src, dst) is False
+
+    def test_non_object_json_returns_false(self, tmp_path: pathlib.Path) -> None:
+        src = tmp_path / "settings.json"
+        src.write_text("[1, 2, 3]")
+        dst = tmp_path / "out.json"
+        assert _copy_settings_without_plugins(src, dst) is False
 
 
 class TestResolveStateFile:
