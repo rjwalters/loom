@@ -6117,6 +6117,54 @@ class TestJudgeDiagnostics:
         assert diag["log_tail"] == []
         assert "log file empty" in diag["summary"]
 
+    def test_detects_git_failure_in_log(
+        self, mock_context: MagicMock, tmp_path: Path
+    ) -> None:
+        """Diagnostics should detect 'failed to run git: exit status 128' in log (issue #2828)."""
+        ctx = self._make_context(mock_context)
+        ctx.repo_root = tmp_path
+
+        log_dir = tmp_path / ".loom" / "logs"
+        log_dir.mkdir(parents=True)
+        log_file = log_dir / "loom-judge-issue-42.log"
+        log_file.write_text(
+            "Starting judge...\nVibing\n   failed to run git: exit status 128\nVibing (thought for 3s)\nApproved."
+        )
+
+        judge = JudgePhase()
+
+        with patch(
+            "loom_tools.shepherd.phases.judge.subprocess.run",
+            return_value=MagicMock(returncode=1, stdout=""),
+        ):
+            diag = judge._gather_diagnostics(ctx)
+
+        assert diag["git_failure_detected"] is True
+        assert "WARNING: git failure detected" in diag["summary"]
+
+    def test_no_git_failure_when_log_clean(
+        self, mock_context: MagicMock, tmp_path: Path
+    ) -> None:
+        """Diagnostics should not flag git failure when log has no git errors (issue #2828)."""
+        ctx = self._make_context(mock_context)
+        ctx.repo_root = tmp_path
+
+        log_dir = tmp_path / ".loom" / "logs"
+        log_dir.mkdir(parents=True)
+        log_file = log_dir / "loom-judge-issue-42.log"
+        log_file.write_text("Starting judge...\nReviewing PR...\nApproved.")
+
+        judge = JudgePhase()
+
+        with patch(
+            "loom_tools.shepherd.phases.judge.subprocess.run",
+            return_value=MagicMock(returncode=1, stdout=""),
+        ):
+            diag = judge._gather_diagnostics(ctx)
+
+        assert diag["git_failure_detected"] is False
+        assert "git failure" not in diag["summary"]
+
     def test_includes_pr_state_in_diagnostics(
         self, mock_context: MagicMock, tmp_path: Path
     ) -> None:
