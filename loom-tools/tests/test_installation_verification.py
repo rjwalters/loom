@@ -153,7 +153,7 @@ class TestWrapperScriptRouting:
     def test_shepherd_wrapper_routes_to_python(
         self, defaults_dir: pathlib.Path, repo_root: pathlib.Path
     ) -> None:
-        """loom-shepherd.sh should exec the Python loom-shepherd command."""
+        """loom-shepherd.sh should invoke the Python loom-shepherd command."""
         script = defaults_dir / "scripts" / "loom-shepherd.sh"
         assert script.exists(), "loom-shepherd.sh not found in defaults/scripts/"
 
@@ -162,9 +162,10 @@ class TestWrapperScriptRouting:
         assert ".venv/bin/loom-shepherd" in content, (
             "loom-shepherd.sh doesn't check for venv Python binary"
         )
-        # Should exec the binary
-        assert 'exec "$LOOM_TOOLS/.venv/bin/loom-shepherd"' in content, (
-            "loom-shepherd.sh doesn't exec the venv binary"
+        # Should invoke the binary (without exec — exec breaks output capture
+        # in CLI tool contexts like Claude Code Bash tool)
+        assert '"$LOOM_TOOLS/.venv/bin/loom-shepherd" "${args[@]}"' in content, (
+            "loom-shepherd.sh doesn't invoke the venv binary"
         )
         # Should also check PATH fallback
         assert "command -v loom-shepherd" in content, (
