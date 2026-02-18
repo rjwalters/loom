@@ -705,7 +705,12 @@ git diff   # Read the actual changes
 #
 #   WRONG: "feat: implement changes for issue #2678"
 #   WRONG: "Builder generates generic commit/PR titles despite explicit anti-patterns"
+#   WRONG: "feat: bug: MCP status bar noise..." (double prefix — copied issue title prefix)
 #   RIGHT: "docs: add mandatory diff-review step before commit/PR creation"
+#
+#   NOTE: If the issue title starts with a prefix like "bug:", "feat:", etc.,
+#   do NOT copy it verbatim. Strip the issue prefix and derive your own from the diff.
+#   "bug:" → use "fix:" in the PR title. See builder-pr.md for the full mapping.
 
 # Step 3: Use the same approach for the PR title
 ```
