@@ -28,6 +28,8 @@ from loom_tools.shepherd.phases.base import (
     GHOST_RETRY_STRATEGIES,
     GHOST_SESSION_BACKOFF_SECONDS,
     GHOST_SESSION_MAX_RETRIES,
+    GHOST_SESSION_WALL_CLOCK_THRESHOLD,
+    GHOST_SMALL_LOG_THRESHOLD_BYTES,
     LOW_OUTPUT_BACKOFF_SECONDS,
     LOW_OUTPUT_MAX_ATTEMPT_SECONDS,
     LOW_OUTPUT_MAX_RETRIES,
@@ -2576,6 +2578,9 @@ class TestBuilderRunTestFailureIntegration:
             ),
             patch.object(builder, "_preserve_on_test_failure") as mock_preserve,
             patch.object(builder, "_cleanup_on_failure") as mock_cleanup,
+            # validate returns False: PR does not yet exist, so fast-path skips
+            # test verification must run (issue #2803).
+            patch.object(builder, "validate", return_value=False),
             patch(
                 "loom_tools.shepherd.phases.builder.run_phase_with_retry",
                 return_value=0,
@@ -2629,6 +2634,49 @@ class TestBuilderRunTestFailureIntegration:
 
         assert result.status == PhaseStatus.SUCCESS
         # Test verification should NOT have been called
+        mock_test_verify.assert_not_called()
+
+    def test_run_skips_test_verification_when_pr_already_exists(
+        self, mock_context: MagicMock
+    ) -> None:
+        """run() should skip test verification when PR with loom:review-requested exists.
+
+        When the builder worker exits and the PR already has loom:review-requested,
+        the shepherd should skip test verification and proceed directly to the judge
+        phase. This eliminates ~7 minutes of dead time between builder and judge.
+        See issue #2803.
+        """
+        builder = BuilderPhase()
+        mock_context.config.issue = 42
+        mock_context.repo_root = Path("/fake/repo")
+        mock_context.check_shutdown.return_value = False
+        mock_context.has_issue_label.return_value = False
+        worktree_mock = MagicMock()
+        worktree_mock.is_dir.return_value = True
+        mock_context.worktree_path = worktree_mock
+
+        with (
+            patch.object(builder, "_is_rate_limited", return_value=False),
+            patch.object(builder, "_run_quality_validation", return_value=None),
+            patch.object(builder, "_create_worktree_marker"),
+            patch.object(builder, "_run_test_verification") as mock_test_verify,
+            # validate returns True: PR with loom:review-requested already exists
+            patch.object(builder, "validate", return_value=True),
+            patch(
+                "loom_tools.shepherd.phases.builder.run_phase_with_retry",
+                return_value=0,
+            ),
+            patch("loom_tools.shepherd.phases.builder.transition_issue_labels"),
+            # Return None first (no existing PR check), then 123 (PR found)
+            patch(
+                "loom_tools.shepherd.phases.builder.get_pr_for_issue",
+                side_effect=[None, 123],
+            ),
+        ):
+            result = builder.run(mock_context)
+
+        assert result.status == PhaseStatus.SUCCESS
+        # Test verification should NOT have been called (PR already exists)
         mock_test_verify.assert_not_called()
 
 
@@ -16982,12 +17030,19 @@ class TestIsGhostSession:
         assert _is_ghost_session(log, wall_clock_duration=7.0) is True
 
     def test_meaningful_output_long_duration_not_ghost(self, tmp_path: Path) -> None:
-        """Session with meaningful output is NOT a ghost regardless of duration."""
+        """Large log with meaningful output is NOT a ghost regardless of duration.
+
+        A session that produced substantial content (log > 5 KB) did real work
+        and should not be classified as a ghost even with a short wall-clock
+        duration.  The size-based fallback (issue #2800) only fires for tiny
+        logs, so this test uses a log file that exceeds the threshold.
+        """
         log = tmp_path / "session.log"
-        log.write_text(
-            "# CLAUDE_CLI_START\n"
-            + "x" * (LOW_OUTPUT_MIN_CHARS + 1)
-        )
+        # Use enough content to exceed both LOW_OUTPUT_MIN_CHARS AND
+        # GHOST_SMALL_LOG_THRESHOLD_BYTES so neither check fires.
+        content = "x" * GHOST_SMALL_LOG_THRESHOLD_BYTES
+        log.write_text("# CLAUDE_CLI_START\n" + content)
+        assert log.stat().st_size >= GHOST_SMALL_LOG_THRESHOLD_BYTES
         assert _is_ghost_session(log, wall_clock_duration=2.0) is False
 
     def test_sentinel_present_no_cli_output_zero_duration(self, tmp_path: Path) -> None:
@@ -17019,6 +17074,115 @@ class TestIsGhostSession:
             "───────────────────\n"
         )
         assert _is_ghost_session(log) is True
+
+    # --- Size-based fallback detection (issue #2800) ---
+
+    def test_small_log_short_duration_is_ghost_even_with_content(
+        self, tmp_path: Path
+    ) -> None:
+        """Small raw log + short wall-clock → ghost even if cleaned content ≥ 100 chars.
+
+        MCP-failure sessions killed by the startup monitor contain only
+        wrapper preflight + the CLI banner (~2.7 KB).  After ANSI-stripping,
+        some banner lines survive the UI-chrome filter and push the cleaned
+        char count over 100.  The size-based fallback classifies them as
+        ghost sessions so they use the separate ghost_retries budget.
+        See issue #2800.
+        """
+        log = tmp_path / "session.log"
+        # Build a log that:
+        # 1. Has a CLI start sentinel (so _get_cli_output returns something)
+        # 2. Has enough content after cleaning to exceed LOW_OUTPUT_MIN_CHARS
+        # 3. Has a raw file size < GHOST_SMALL_LOG_THRESHOLD_BYTES
+        # Simulate partial banner content that isn't fully stripped (e.g.,
+        # text not matched by any _UI_CHROME_LINE_PATTERNS regex).
+        cli_content = "x" * (LOW_OUTPUT_MIN_CHARS + 50)  # > 100 cleaned chars
+        log_text = f"# CLAUDE_CLI_START\n{cli_content}\n"
+        assert len(log_text) < GHOST_SMALL_LOG_THRESHOLD_BYTES, (
+            "Test setup error: log is too large to test size-based detection"
+        )
+        log.write_text(log_text)
+
+        # Small log + short wall-clock → ghost (size-based fallback fires)
+        assert _is_ghost_session(log, wall_clock_duration=15.0) is True
+
+    def test_small_log_long_duration_not_ghost(self, tmp_path: Path) -> None:
+        """Small raw log but long wall-clock duration → NOT a ghost.
+
+        Even a tiny log should not be classified as a ghost if the session
+        ran for longer than GHOST_SESSION_WALL_CLOCK_THRESHOLD.  A session
+        that ran for 45s, even if it produced little output, should use the
+        low-output retry path rather than the ghost path.
+        """
+        log = tmp_path / "session.log"
+        cli_content = "x" * (LOW_OUTPUT_MIN_CHARS + 50)
+        log.write_text(f"# CLAUDE_CLI_START\n{cli_content}\n")
+
+        # Small log BUT long wall-clock → not a ghost
+        assert _is_ghost_session(log, wall_clock_duration=45.0) is False
+
+    def test_large_log_short_duration_not_ghost(self, tmp_path: Path) -> None:
+        """Large raw log + short wall-clock → NOT a ghost (real work happened).
+
+        A session that produced a large log did real work, even if it exited
+        quickly.  The size-based fallback must not misclassify these.
+        """
+        log = tmp_path / "session.log"
+        # Build a log that exceeds GHOST_SMALL_LOG_THRESHOLD_BYTES
+        padding = "x" * GHOST_SMALL_LOG_THRESHOLD_BYTES
+        log.write_text(f"# CLAUDE_CLI_START\n{padding}\n")
+        assert log.stat().st_size >= GHOST_SMALL_LOG_THRESHOLD_BYTES
+
+        # Large log → not a ghost regardless of duration
+        assert _is_ghost_session(log, wall_clock_duration=5.0) is False
+
+    def test_small_log_short_duration_mcp_failure_is_ghost(
+        self, tmp_path: Path
+    ) -> None:
+        """MCP-failure session with small log + short duration IS a ghost.
+
+        The canonical case from issue #2800: the startup monitor kills Claude
+        after detecting 'MCP server failed'.  The log has wrapper preflight
+        + CLI banner + the MCP error text, totalling ~2.7 KB.  After cleaning,
+        the MCP error text (> 100 chars) makes the session look non-ghost,
+        but the size-based fallback correctly classifies it as ghost.
+        """
+        log = tmp_path / "session.log"
+        # Simulate a 2.7KB log: wrapper preflight (excluded) + CLI start +
+        # banner lines that survive stripping + MCP error text
+        mcp_error = (
+            "MCP server failed: Unable to connect to server 'loom'\n"
+            "PluginToolManager: Failed to load 3 tools from MCP server\n"
+            "Session initialization incomplete - tools unavailable\n"
+        )
+        # This content exceeds LOW_OUTPUT_MIN_CHARS after cleaning
+        assert len(mcp_error) > LOW_OUTPUT_MIN_CHARS
+        log_text = f"# CLAUDE_CLI_START\n{mcp_error}"
+        assert len(log_text) < GHOST_SMALL_LOG_THRESHOLD_BYTES
+        log.write_text(log_text)
+
+        # Small MCP-failure log + short duration → ghost (size-based fallback)
+        assert _is_ghost_session(log, wall_clock_duration=18.0) is True
+
+    def test_size_based_fallback_requires_wall_clock_duration(
+        self, tmp_path: Path
+    ) -> None:
+        """Size-based fallback only fires when wall_clock_duration is provided.
+
+        Without wall_clock_duration, the function falls back to file timestamp
+        heuristics, which cannot trigger the size-based path.  This ensures
+        the new check doesn't change behavior for callers that don't pass
+        wall_clock_duration.
+        """
+        log = tmp_path / "session.log"
+        cli_content = "x" * (LOW_OUTPUT_MIN_CHARS + 50)
+        log.write_text(f"# CLAUDE_CLI_START\n{cli_content}\n")
+
+        # Without wall_clock_duration, meaningful content → not a ghost
+        # (falls through to timestamp heuristic, which sees ~0s duration
+        # for a freshly-created file — but that path only fires if cleaned
+        # content is < LOW_OUTPUT_MIN_CHARS, which it isn't here)
+        assert _is_ghost_session(log) is False
 
 
 class TestRunWorkerPhaseGhostSession:

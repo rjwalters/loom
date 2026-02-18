@@ -190,6 +190,19 @@ _TOOL_CALL_MARKER = "⏺"
 # classified as low-output (exit code 6) instead of ghost (exit code 10).
 GHOST_SESSION_WALL_CLOCK_THRESHOLD = 30.0
 
+# Maximum raw log file size (in bytes) for the size-based ghost detection
+# fallback.  Sessions with a small raw log AND short wall-clock duration
+# are almost certainly infrastructure failures (MCP-startup kill, spawn
+# race, API blip) even when their cleaned output appears "substantial"
+# due to the Claude CLI banner or wrapper pre-flight boilerplate.
+# The canonical example: wrapper kills Claude after detecting "MCP server
+# failed" in the first 50 lines — log contains only preflight + banner
+# (~2.7KB) but may have ≥100 chars of cleaned CLI output because not all
+# banner lines are filtered.  5KB provides a generous margin above the
+# observed 2.7KB while staying well below any session that did real work.
+# See issue #2800.
+GHOST_SMALL_LOG_THRESHOLD_BYTES = 5 * 1024  # 5 KB
+
 # Systemic failure patterns detected in session logs.
 # These indicate infrastructure-level failures (auth timeout, API outage)
 # that will NOT resolve with retries.  When detected after a low-output
@@ -888,12 +901,25 @@ def _is_ghost_session(
     signal to distinguish ghost sessions (infrastructure failures) from
     long-running stuck sessions.  See issue #2659.
 
-    1. If the log contains meaningful CLI output → **not a ghost**.
+    1. If the log contains meaningful CLI output → **not a ghost** …unless
+       the raw log is tiny (< GHOST_SMALL_LOG_THRESHOLD_BYTES) *and* the
+       session was very short (≤ GHOST_SESSION_WALL_CLOCK_THRESHOLD). See
+       item 3 below.
     2. If no meaningful output, check duration:
        - Wall-clock ≤ GHOST_SESSION_WALL_CLOCK_THRESHOLD (30s) → ghost.
        - File-timestamp fallback ≤ same threshold → ghost.
        - Duration exceeds threshold → not a ghost (classified as
          low-output via exit code 6 instead).
+    3. **Size-based fallback** (issue #2800): even when cleaned content
+       appears "substantial" (≥ 100 chars), a session whose *raw* log is
+       < 5 KB *and* ran for < 30s is almost certainly an infrastructure
+       failure.  The canonical case is the startup monitor killing Claude
+       after detecting "MCP server failed" in the first 50 lines — the log
+       contains only wrapper preflight + the Claude CLI banner (~2.7 KB),
+       but after ANSI-stripping, some banner lines survive the UI-chrome
+       filter and push the cleaned char count over 100.  Treating these
+       as ghost sessions (exit code 10) routes them to the separate
+       ``ghost_retries`` budget instead of failing immediately.
 
     The wide 30s threshold accommodates MCP initialization delays that
     can push ghost sessions to 7s+ of wall-clock time while producing
@@ -926,7 +952,18 @@ def _is_ghost_session(
         cli_output = _get_cli_output(stripped)
         cleaned = _strip_ui_chrome(_strip_spinner_noise(cli_output))
         if len(cleaned.strip()) >= LOW_OUTPUT_MIN_CHARS:
-            # Meaningful output present — not a ghost regardless of duration.
+            # The cleaned output looks substantial, but if the raw log is
+            # tiny AND the session was very short, the "content" is just
+            # banner/preflight boilerplate that survived stripping — not
+            # real work.  Classify as ghost so it uses the separate
+            # ghost_retries budget instead of failing immediately.
+            # See issue #2800.
+            if wall_clock_duration is not None and (
+                len(content) < GHOST_SMALL_LOG_THRESHOLD_BYTES
+                and wall_clock_duration <= GHOST_SESSION_WALL_CLOCK_THRESHOLD
+            ):
+                return True
+            # Meaningful output in a non-tiny log — not a ghost.
             return False
 
         # No meaningful output.  Use duration as a secondary signal to
