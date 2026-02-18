@@ -37,10 +37,12 @@ from loom_tools.shepherd.phases.base import (
     MCP_FAILURE_MAX_RETRIES,
     MCP_FAILURE_MIN_OUTPUT_CHARS,
     _AUTH_FAILURE_SENTINEL,
+    _RATE_LIMIT_SENTINEL,
     _classify_ghost_cause,
     _classify_low_output_cause,
     _is_auth_failure,
     _is_ghost_session,
+    _is_rate_limit_abort,
     _is_low_output_session,
     _is_mcp_failure,
     _print_heartbeat,
@@ -15961,6 +15963,55 @@ class TestIsAuthFailure:
             "[INFO] API endpoint available\n"
         )
         assert _is_auth_failure(log) is False
+
+
+# ── Rate limit abort tests ──────────────────────────────────────────── #
+
+
+class TestIsRateLimitAbort:
+    """Test _is_rate_limit_abort() detection function."""
+
+    def test_no_file(self, tmp_path: Path) -> None:
+        """Missing log file should not be classified as rate limit abort."""
+        assert _is_rate_limit_abort(tmp_path / "nonexistent.log") is False
+
+    def test_empty_file(self, tmp_path: Path) -> None:
+        """Empty log file should not be classified as rate limit abort."""
+        log = tmp_path / "test.log"
+        log.write_text("")
+        assert _is_rate_limit_abort(log) is False
+
+    def test_normal_log(self, tmp_path: Path) -> None:
+        """Normal session log should not be classified as rate limit abort."""
+        log = tmp_path / "test.log"
+        log.write_text(
+            "# Loom Agent Log\n"
+            "[INFO] Pre-flight checks passed\n"
+            "# CLAUDE_CLI_START\n"
+            "Some output here\n"
+        )
+        assert _is_rate_limit_abort(log) is False
+
+    def test_rate_limit_sentinel_detected(self, tmp_path: Path) -> None:
+        """Log with RATE_LIMIT_ABORT sentinel should be detected."""
+        log = tmp_path / "test.log"
+        log.write_text(
+            "# Loom Agent Log\n"
+            "[INFO] Running pre-flight checks...\n"
+            "# CLAUDE_CLI_START\n"
+            "[WARN] Output monitor: CLI usage/plan limit prompt detected\n"
+            "# RATE_LIMIT_ABORT\n"
+        )
+        assert _is_rate_limit_abort(log) is True
+
+    def test_rate_limit_sentinel_with_ansi(self, tmp_path: Path) -> None:
+        """Rate limit sentinel should be detected even with ANSI codes."""
+        log = tmp_path / "test.log"
+        log.write_text(
+            "\033[0;33m[WARN] Limit prompt detected\033[0m\n"
+            "# RATE_LIMIT_ABORT\n"
+        )
+        assert _is_rate_limit_abort(log) is True
 
 
 class TestRunWorkerPhaseAuthFailure:

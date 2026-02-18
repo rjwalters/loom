@@ -696,6 +696,12 @@ is_transient_error() {
     local output="$1"
     local exit_code="${2:-1}"
 
+    # Rate limit abort is NOT transient — the CLI hit a usage/plan limit
+    # and showed an interactive prompt.  Retrying will hit the same limit.
+    if echo "${output}" | grep -q "RATE_LIMIT_ABORT"; then
+        return 1
+    fi
+
     # Known transient error patterns
     local patterns=(
         "No messages returned"
@@ -786,6 +792,19 @@ start_output_monitor() {
                 local tail_content
                 tail_content=$(tail -c 2000 "${output_file}" 2>/dev/null || echo "")
 
+                # Check for CLI usage/plan limit prompt (interactive prompt
+                # that blocks headless sessions).  Normalize text by stripping
+                # non-alphanumeric chars to handle TUI garbling, then match
+                # the distinctive prompt text.
+                local normalized
+                normalized=$(echo "${tail_content}" | tr -cd '[:alnum:]')
+                if echo "${normalized}" | grep -qi "Stopandwaitforlimittoreset" 2>/dev/null; then
+                    log_warn "Output monitor: CLI usage/plan limit prompt detected — killing claude"
+                    echo "# RATE_LIMIT_ABORT" >&2
+                    pkill -INT -P $$ -f "claude" 2>/dev/null || true
+                    break
+                fi
+
                 local found_error=false
                 for pattern in "500 Internal Server Error" "Rate limit exceeded" \
                     "overloaded" "temporarily unavailable" "503 Service" \
@@ -874,6 +893,17 @@ start_startup_monitor() {
 
             if [[ -z "${head_content}" ]]; then
                 continue
+            fi
+
+            # Check for CLI usage/plan limit prompt in early output.
+            # The limit prompt often appears within seconds of startup.
+            local head_normalized
+            head_normalized=$(echo "${head_content}" | tr -cd '[:alnum:]')
+            if echo "${head_normalized}" | grep -qi "Stopandwaitforlimittoreset" 2>/dev/null; then
+                log_warn "Startup monitor: CLI usage/plan limit prompt detected — killing claude"
+                echo "# RATE_LIMIT_ABORT" >&2
+                pkill -INT -P $$ -f "claude" 2>/dev/null || true
+                break
             fi
 
             local found_failure=false

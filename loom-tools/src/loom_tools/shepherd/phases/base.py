@@ -45,6 +45,12 @@ _AUTH_FAILURE_SENTINEL = "# AUTH_PREFLIGHT_FAILED"
 # See issue #2706.
 _MCP_PREFLIGHT_SENTINEL = "# MCP_PREFLIGHT_FAILED"
 
+# Sentinel written by claude-wrapper.sh when the CLI hits a usage/plan limit
+# and shows an interactive prompt that nobody can answer in headless mode.
+# The wrapper detects the prompt, kills the CLI, and writes this sentinel.
+# NOT retryable — the limit won't resolve until it resets.
+_RATE_LIMIT_SENTINEL = "# RATE_LIMIT_ABORT"
+
 # Maximum retries for low-output detection, with exponential backoff.
 LOW_OUTPUT_MAX_RETRIES = 3
 LOW_OUTPUT_BACKOFF_SECONDS = [2, 4, 8]
@@ -834,6 +840,34 @@ def _is_auth_failure(log_path: Path) -> bool:
         pass
 
     return False
+
+
+def _is_rate_limit_abort(log_path: Path) -> bool:
+    """Check if a session log indicates a CLI usage/plan limit abort.
+
+    The CLI shows an interactive prompt ("Stop and wait for limit to reset")
+    when hitting a usage or plan limit.  In headless mode nobody can answer
+    this prompt, so the wrapper detects it, kills the CLI, and writes the
+    ``# RATE_LIMIT_ABORT`` sentinel to stderr.
+
+    This is NOT retryable — the limit won't resolve until it resets or
+    the user re-authenticates with a different plan.
+
+    Args:
+        log_path: Path to the worker session log file.
+
+    Returns:
+        True if the log contains the rate limit abort sentinel.
+    """
+    if not log_path.is_file():
+        return False
+
+    try:
+        content = log_path.read_text()
+        stripped = strip_ansi(content)
+        return _RATE_LIMIT_SENTINEL in stripped
+    except OSError:
+        return False
 
 
 def _is_ghost_session(
@@ -1763,6 +1797,17 @@ def run_worker_phase(
         log_warning(f"Post-mortem: {postmortem['summary']}")
         return 9
 
+    # Check for rate limit abort (exit code 13) — CLI hit a usage/plan
+    # limit and showed an interactive prompt.  NOT retryable.  Must be
+    # checked before ghost session because rate limit aborts produce
+    # minimal output + short duration → would be misclassified as ghost.
+    if wait_exit != 0 and _is_rate_limit_abort(log_path):
+        log_warning(
+            f"Rate limit abort detected for {role} session '{actual_name}': "
+            f"CLI hit usage/plan limit (not retryable, log: {log_path})"
+        )
+        return 13
+
     # Check for ghost session (exit code 10) — no meaningful work produced.
     # Content-first detection: sessions with only spinner/boilerplate output
     # and duration ≤ 30s are infrastructure failures retried on a separate
@@ -1941,6 +1986,13 @@ def run_phase_with_retry(
         # off or pick a different issue.  See issues #2631, #2781.
         if exit_code == 11:
             return 11
+
+        # --- Rate limit abort (exit code 13) ---
+        # Not retryable: the CLI hit a usage/plan limit and showed an
+        # interactive prompt.  The limit won't resolve until it resets
+        # or the user re-authenticates with a different plan.
+        if exit_code == 13:
+            return 13
 
         # --- Thinking stall (exit code 14) ---
         # Not retryable: the session entered extended thinking without
