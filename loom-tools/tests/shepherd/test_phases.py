@@ -15735,6 +15735,54 @@ class TestRunWorkerPhaseMcpFailure:
         # _is_low_output_session should NOT be called when MCP failure is detected
         mock_low_output.assert_not_called()
 
+    def test_mcp_failure_checked_before_thinking_stall(
+        self, mock_context: MagicMock
+    ) -> None:
+        """MCP failure (retryable, exit 7) should take priority over thinking stall.
+
+        An MCP failure session shows the CLI startup UI (>100 chars, no tool calls)
+        which matches the thinking stall pattern.  Since thinking stall is not
+        retryable (exit 14) but MCP failure is (exit 7), MCP failure must be
+        checked first.  See issue #2804.
+        """
+
+        def mock_spawn(cmd, **kwargs):
+            result = MagicMock()
+            result.returncode = 0
+            return result
+
+        def mock_popen(cmd, **kwargs):
+            proc = MagicMock()
+            proc.poll.return_value = 0
+            proc.returncode = 0
+            return proc
+
+        with (
+            patch("subprocess.run", side_effect=mock_spawn),
+            patch("subprocess.Popen", side_effect=mock_popen),
+            patch("time.sleep"),
+            patch(
+                "loom_tools.shepherd.phases.base._is_mcp_failure", return_value=True
+            ) as mock_mcp,
+            patch(
+                "loom_tools.shepherd.phases.base._is_thinking_stall_session",
+                return_value=True,
+            ) as mock_stall,
+        ):
+            exit_code = run_worker_phase(
+                mock_context,
+                role="builder",
+                name="builder-issue-42",
+                timeout=600,
+                phase="builder",
+            )
+
+        # MCP failure (7) takes priority over thinking stall (14)
+        assert exit_code == 7
+        mock_mcp.assert_called_once()
+        # _is_thinking_stall_session should NOT be called when MCP failure is detected
+        mock_stall.assert_not_called()
+
 
 class TestRunPhaseWithRetryMcpFailure:
     """Test that run_phase_with_retry retries on MCP failure (code 7)."""
