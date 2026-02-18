@@ -1040,12 +1040,7 @@ def _is_thinking_stall_session(log_path: Path) -> bool:
         if not cli_output:
             return False
 
-        # Must have some non-trivial content (not just whitespace)
-        cleaned = _strip_ui_chrome(_strip_spinner_noise(cli_output))
-        non_ws = cleaned.strip()
-
-        # If there's substantial non-spinner content AND tool calls,
-        # this is a productive session
+        # If there are tool call markers, this is a productive session
         if _TOOL_CALL_MARKER in cli_output:
             return False
 
@@ -1794,7 +1789,7 @@ def run_worker_phase(
         )
         return 11
 
-    # Check for thinking stall (exit code 12) — output with zero tool calls.
+    # Check for thinking stall (exit code 14) — output with zero tool calls.
     # The session produced thinking/spinner output but never invoked a tool,
     # indicating extended thinking under resource pressure.  Not retryable:
     # the same conditions will produce the same result.  Check after degraded
