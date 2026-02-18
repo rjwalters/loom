@@ -2536,6 +2536,9 @@ class TestBuilderRunTestFailureIntegration:
             ),
             patch.object(builder, "_preserve_on_test_failure") as mock_preserve,
             patch.object(builder, "_cleanup_on_failure") as mock_cleanup,
+            # validate returns False: PR does not yet exist, so the fast-path
+            # (issue #2803) must NOT skip test verification — tests must run.
+            patch.object(builder, "validate", return_value=False),
             patch(
                 "loom_tools.shepherd.phases.builder.run_phase_with_retry",
                 return_value=0,
@@ -2589,6 +2592,53 @@ class TestBuilderRunTestFailureIntegration:
 
         assert result.status == PhaseStatus.SUCCESS
         # Test verification should NOT have been called
+        mock_test_verify.assert_not_called()
+
+    def test_run_skips_test_verification_when_pr_already_exists(
+        self, mock_context: MagicMock
+    ) -> None:
+        """run() should skip test verification when PR with loom:review-requested exists.
+
+        When the builder worker exits and the PR already has loom:review-requested,
+        the shepherd should detect this via validate() and skip test verification,
+        proceeding directly to the judge phase.  This eliminates ~7 minutes of dead
+        time between builder and judge.  See issue #2803.
+        """
+        builder = BuilderPhase()
+        mock_context.config.issue = 42
+        mock_context.repo_root = Path("/fake/repo")
+        mock_context.check_shutdown.return_value = False
+        mock_context.has_issue_label.return_value = False
+        worktree_mock = MagicMock()
+        worktree_mock.is_dir.return_value = True
+        mock_context.worktree_path = worktree_mock
+
+        with (
+            patch.object(builder, "_is_rate_limited", return_value=False),
+            patch.object(builder, "_run_quality_validation", return_value=None),
+            patch.object(builder, "_create_worktree_marker"),
+            patch.object(builder, "_run_test_verification") as mock_test_verify,
+            # validate returns True: PR with loom:review-requested already exists.
+            # The fast-path check (issue #2803) should skip test verification.
+            patch.object(builder, "validate", return_value=True),
+            patch(
+                "loom_tools.shepherd.phases.builder.run_phase_with_retry",
+                return_value=0,
+            ),
+            patch("loom_tools.shepherd.phases.builder.transition_issue_labels"),
+            # First call: no existing PR (builder hasn't run yet).
+            # Second call: PR 123 found (returned by validate's internal check).
+            patch(
+                "loom_tools.shepherd.phases.builder.get_pr_for_issue",
+                side_effect=[None, 123],
+            ),
+        ):
+            # NOTE: skip_test_verification is NOT passed (default False).
+            # The fast-path should detect the PR via validate() at line 745.
+            result = builder.run(mock_context)
+
+        assert result.status == PhaseStatus.SUCCESS
+        # Test verification must NOT have been called — fast-path skipped it.
         mock_test_verify.assert_not_called()
 
 
