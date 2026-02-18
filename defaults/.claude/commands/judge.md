@@ -116,8 +116,13 @@ When the user explicitly instructs you to evaluate a specific PR by number:
 gh pr edit 599 --add-label "loom:reviewing"
 gh pr comment 599 --body "Starting evaluation of this PR per user request"
 
-# Check out and evaluate
-gh pr checkout 599
+# Check out and evaluate (worktree-aware — see Worktree-Aware Code Access)
+ISSUE_NUM=$(gh pr view 599 --json headRefName --jq '.headRefName' | sed 's/feature\/issue-//')
+if [ -d ".loom/worktrees/issue-${ISSUE_NUM}" ]; then
+    cd ".loom/worktrees/issue-${ISSUE_NUM}"
+else
+    gh pr checkout 599
+fi
 # ... run tests, evaluate code ...
 
 # Complete normally with approval or changes requested (chain with &&)
@@ -150,7 +155,7 @@ gh pr comment 599 --body "LGTM! Code quality is excellent." && \
    fi
    ```
 4. **Understand context**: Read PR description and linked issues
-5. **Check out code**: `gh pr checkout <number>` to get the branch locally
+5. **Check out code**: Use existing worktree or `gh pr checkout` (see Worktree-Aware Code Access below)
 6. **Rebase check**: Verify PR is up-to-date with main (see Rebase Check section below)
 7. **Run quality checks**: Tests, lints, type checks, build (use Scoped Test Execution — see section below)
 7b. **Execute test plan**: Parse PR description for "## Test Plan" section.
@@ -228,8 +233,13 @@ else
   if [ -n "$UNLABELED_PR" ]; then
     echo "Evaluating unlabeled PR #$UNLABELED_PR (fallback mode)"
 
-    # Check out and evaluate the PR
-    gh pr checkout $UNLABELED_PR
+    # Check out and evaluate the PR (worktree-aware)
+    ISSUE_NUM=$(gh pr view $UNLABELED_PR --json headRefName --jq '.headRefName' | sed 's/feature\/issue-//')
+    if [ -d ".loom/worktrees/issue-${ISSUE_NUM}" ]; then
+        cd ".loom/worktrees/issue-${ISSUE_NUM}"
+    else
+        gh pr checkout $UNLABELED_PR
+    fi
     # ... run checks, evaluate code ...
 
     # Provide feedback but DO NOT add workflow labels
@@ -252,6 +262,44 @@ fi
 - Provides proactive code evaluation on external contributor PRs
 - Catches issues before they accumulate
 - Respects external PRs by not adding workflow labels
+
+## Worktree-Aware Code Access
+
+**CRITICAL: When a shepherd runs the judge phase for an issue it also built, the builder worktree at `.loom/worktrees/issue-N` still exists. Running `gh pr checkout` will fail because the branch is already checked out in that worktree.**
+
+### Before Running `gh pr checkout`
+
+Always check for an existing worktree first:
+
+```bash
+# Extract issue number from PR (via branch name or body)
+ISSUE_NUM=$(gh pr view <number> --json headRefName --jq '.headRefName' | sed 's/feature\/issue-//')
+
+# Check if builder worktree exists
+if [ -d ".loom/worktrees/issue-${ISSUE_NUM}" ]; then
+    echo "Builder worktree exists - using it directly"
+    cd ".loom/worktrees/issue-${ISSUE_NUM}"
+else
+    gh pr checkout <number>
+fi
+```
+
+### Why This Matters
+
+When the shepherd orchestrates an issue through Builder → Judge, the builder worktree persists. The branch `feature/issue-N` is already checked out there, so `gh pr checkout` fails with:
+
+```
+fatal: 'feature/issue-N' is already used by worktree at '.../issue-N'
+```
+
+Using the existing worktree directly is faster and avoids this error entirely.
+
+### Worktree Scope
+
+This check applies everywhere the judge would run `gh pr checkout`:
+- **Step 5** of the evaluation process (primary code access)
+- **Rebase workflows** (DIRTY/BEHIND merge states)
+- **Trivial fix workflows** (when fixing minor issues directly)
 
 ## Rebase Check (BEFORE Evaluation)
 
@@ -285,8 +333,13 @@ MERGE_STATE=$(gh pr view $PR_NUMBER --json mergeStateStatus --jq '.mergeStateSta
 if [ "$MERGE_STATE" = "DIRTY" ]; then
     echo "PR has merge conflicts - attempting automated rebase"
 
-    # Checkout PR branch
-    gh pr checkout $PR_NUMBER
+    # Checkout PR branch (worktree-aware — see Worktree-Aware Code Access)
+    ISSUE_NUM=$(gh pr view $PR_NUMBER --json headRefName --jq '.headRefName' | sed 's/feature\/issue-//')
+    if [ -d ".loom/worktrees/issue-${ISSUE_NUM}" ]; then
+        cd ".loom/worktrees/issue-${ISSUE_NUM}"
+    else
+        gh pr checkout $PR_NUMBER
+    fi
 
     # Verify we're on the correct branch (not detached HEAD)
     CURRENT_BRANCH=$(git symbolic-ref --short HEAD 2>/dev/null || echo "DETACHED")
@@ -863,10 +916,16 @@ This reduces unnecessary round-trips where a one-line fix creates a full change 
 
 ### How to Fix Trivial Issues
 
-**Step 1: Check out the PR branch**
+**Step 1: Check out the PR branch (worktree-aware)**
 
 ```bash
-gh pr checkout <number>
+# Use existing worktree if available (see Worktree-Aware Code Access)
+ISSUE_NUM=$(gh pr view <number> --json headRefName --jq '.headRefName' | sed 's/feature\/issue-//')
+if [ -d ".loom/worktrees/issue-${ISSUE_NUM}" ]; then
+    cd ".loom/worktrees/issue-${ISSUE_NUM}"
+else
+    gh pr checkout <number>
+fi
 ```
 
 **Step 2: Make the fix**
@@ -907,8 +966,13 @@ EOF
 ### Example Workflow
 
 ```bash
-# 1. Check out PR
-gh pr checkout 42
+# 1. Check out PR (worktree-aware)
+ISSUE_NUM=$(gh pr view 42 --json headRefName --jq '.headRefName' | sed 's/feature\/issue-//')
+if [ -d ".loom/worktrees/issue-${ISSUE_NUM}" ]; then
+    cd ".loom/worktrees/issue-${ISSUE_NUM}"
+else
+    gh pr checkout 42
+fi
 
 # 2. Find and fix the trivial issue
 # (e.g., remove unused import on line 3 of src/utils.py)
