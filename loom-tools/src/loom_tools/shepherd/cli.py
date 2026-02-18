@@ -2255,10 +2255,10 @@ def _record_fallback_failure(ctx: ShepherdContext, exit_code: int) -> None:
                 [
                     "gh", "issue", "comment", str(ctx.config.issue),
                     "--body",
-                    f"**Systematic failure detected** — this issue has failed "
-                    f"**{sf.count}** consecutive times with the same error "
-                    f"pattern (`{sf.pattern}`). It has been moved to "
-                    f"`loom:blocked` to prevent further automated attempts.\n\n"
+                    f"**Systematic failure detected** — the builder has hit "
+                    f"the same error pattern (`{sf.pattern}`) **{sf.count}** "
+                    f"times in a row across recent issues. This issue was "
+                    f"blocked as a precaution.\n\n"
                     f"### Recovery\n\n"
                     f"Investigate the failure pattern and either fix the "
                     f"underlying issue or add more guidance to the issue "
