@@ -174,11 +174,35 @@ If none of the patterns above match clearly:
 
 ### Standard PR Fix Mode
 
-If a number is provided without `--test-fix` (e.g., `/doctor 123`):
+If a number is provided without `--test-fix` (e.g., `/doctor 123` or `/doctor 123 --context /path/to/context.json`):
 1. Treat that number as the target **PR** to fix
 2. **Skip** the "Finding Work" section entirely
 3. Claim the PR: `gh pr edit <number> --add-label "loom:treating"`
-4. Proceed directly to fixing that PR
+4. **Read the context file first** if `--context <path>` is provided (see below)
+5. Proceed directly to fixing that PR
+
+**Structured judge feedback context** (when `--context <path>` is provided):
+
+When invoked by the Shepherd after a judge rejection, a context file is written to help you understand exactly what the judge found wrong. **Read it before reading PR comments** — it provides a concise, structured view of the judge's feedback:
+
+```bash
+cat <path>
+```
+
+The context file (`.loom-judge-feedback.json`) contains:
+- `pr_number`: The PR being fixed
+- `issue`: The issue number
+- `context_type`: Always `"judge_feedback"` for this mode
+- `judge_comments`: List of the judge's most recent comments, each with:
+  - `body`: The full comment text (look for specific file paths, line numbers, and what to change)
+  - `author`: Who wrote the comment
+  - `created_at`: When the comment was posted
+
+**How to use the context:**
+1. Read `judge_comments` to understand what the judge requested
+2. Identify specific files and lines mentioned in the feedback
+3. Make the targeted fix before doing anything else
+4. Use `gh pr view <pr> --comments` for additional context if the structured feedback is insufficient
 
 If no argument is provided, use the normal "Finding Work" workflow below.
 
