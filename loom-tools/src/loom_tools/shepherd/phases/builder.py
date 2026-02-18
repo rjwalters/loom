@@ -2591,7 +2591,40 @@ class BuilderPhase:
                     f"Baseline also fails but worktree introduces "
                     f"new test failures (higher failure count) for {display_name}"
                 )
-            # Fall through to return failure
+                # Fall through to return failure
+            else:
+                # structured is False — parsing failed, use line-based fallback
+                # (mirrors the fallback in _run_test_verification for full-suite tests)
+                baseline_errors = set(
+                    self._extract_error_lines(baseline_output)
+                )
+                worktree_errors = set(
+                    self._extract_error_lines(worktree_output)
+                )
+                new_errors = worktree_errors - baseline_errors
+
+                if not new_errors:
+                    # No new error lines — pre-existing failures
+                    if (
+                        result.returncode == baseline_result.returncode
+                        or len(worktree_errors) <= len(baseline_errors)
+                    ):
+                        summary = self._parse_test_summary(worktree_output)
+                        msg = (
+                            f"pre-existing on main ({summary})"
+                            if summary
+                            else "pre-existing on main"
+                        )
+                        log_warning(
+                            f"Tests failed but all failures are pre-existing "
+                            f"(line-based fallback): {msg}"
+                        )
+                        ctx.report_milestone(
+                            "heartbeat",
+                            action=f"tests have pre-existing failures ({elapsed}s)",
+                        )
+                        return None
+                # Fall through to return failure
 
         # Tests failed with new errors
         summary = self._parse_test_summary(output)

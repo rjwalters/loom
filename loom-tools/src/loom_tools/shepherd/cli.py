@@ -615,6 +615,7 @@ def orchestrate(ctx: ShepherdContext) -> int:
                 # Check if failing tests are in files the builder didn't modify.
                 # If so, try rebasing onto latest main first — the fix may
                 # already exist upstream, avoiding a wasted Doctor attempt.
+                _preexisting = False
                 if test_fix_attempts == 1:  # Only on first attempt
                     failing_test_files = set(result.data.get("failing_test_files", []))
                     changed_files = set(result.data.get("changed_files", []))
@@ -670,23 +671,80 @@ def orchestrate(ctx: ShepherdContext) -> int:
                                     )
                                     break
                                 else:
-                                    # Tests still fail — continue to Doctor
+                                    # Tests still fail after rebase — since
+                                    # failures are in unmodified files and
+                                    # branch is now at parity with main,
+                                    # these are pre-existing failures.
                                     log_warning(
-                                        f"Tests still fail after rebase "
-                                        f"({test_elapsed}s)"
+                                        f"Tests still fail after rebase in "
+                                        f"unmodified files ({test_elapsed}s), "
+                                        f"treating as pre-existing"
+                                    )
+                                    ctx.report_milestone(
+                                        "heartbeat",
+                                        action="pre-existing test failures (post-rebase)",
+                                    )
+                                    completed_phases.append(
+                                        "Pre-existing test failures (post-rebase)"
                                     )
                                     result = test_result
                                     elapsed = test_elapsed
+                                    _preexisting = True
                             else:
                                 log_warning(
                                     f"Rebase failed ({detail}), "
                                     f"proceeding to Doctor"
                                 )
                         else:
-                            log_info(
-                                "Branch is up-to-date with main, "
-                                "proceeding to Doctor"
+                            # Branch is already up-to-date with main and
+                            # failures are in files the builder didn't modify.
+                            # These are pre-existing failures on main.
+                            log_warning(
+                                "Branch is up-to-date with main and failing "
+                                "tests are in unmodified files, treating as "
+                                "pre-existing"
                             )
+                            ctx.report_milestone(
+                                "heartbeat",
+                                action="pre-existing test failures (branch up-to-date)",
+                            )
+                            completed_phases.append(
+                                "Pre-existing test failures (branch up-to-date)"
+                            )
+                            _preexisting = True
+
+                # Skip Doctor when pre-existing failures detected in
+                # unmodified files (issue #2809)
+                if _preexisting:
+                    _print_phase_header(
+                        "PHASE 3d: COMPLETION VALIDATION (pre-existing failures)"
+                    )
+                    completion_start = time.time()
+                    completion_result = builder.validate_and_complete(ctx)
+                    completion_elapsed = int(time.time() - completion_start)
+                    builder_total_elapsed += completion_elapsed
+
+                    if completion_result.is_shutdown:
+                        raise ShutdownSignal(completion_result.message)
+
+                    if completion_result.status == PhaseStatus.FAILED:
+                        log_error(completion_result.message)
+                        _mark_builder_no_pr(ctx)
+                        return 1
+
+                    result = PhaseResult(
+                        status=PhaseStatus.SUCCESS,
+                        message="builder complete (pre-existing test failures)",
+                        phase_name="builder",
+                        data={
+                            "preexisting_failures": True,
+                            "pr_number": completion_result.data.get("pr_number"),
+                        },
+                    )
+                    log_success(
+                        f"Completion validation passed ({completion_elapsed}s)"
+                    )
+                    break
 
                 # Route to Doctor for test fix
                 log_warning(

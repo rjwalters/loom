@@ -4623,7 +4623,7 @@ class TestRebaseBeforeDoctor:
     @patch("loom_tools.shepherd.cli.ApprovalPhase")
     @patch("loom_tools.shepherd.cli.CuratorPhase")
     @patch("loom_tools.shepherd.cli.time")
-    def test_rebase_succeeds_but_tests_still_fail_routes_to_doctor(
+    def test_rebase_succeeds_but_tests_still_fail_treats_as_preexisting(
         self,
         mock_time: MagicMock,
         MockCurator: MagicMock,
@@ -4637,7 +4637,8 @@ class TestRebaseBeforeDoctor:
         mock_attempt_rebase: MagicMock,
         mock_is_behind: MagicMock,
     ) -> None:
-        """When rebase succeeds but tests still fail, Doctor is invoked."""
+        """When rebase succeeds but tests still fail in unmodified files,
+        treat as pre-existing and skip Doctor (issue #2809)."""
         mock_time.time = MagicMock(side_effect=[
             0,     # start_time
             0,     # approval phase_start
@@ -4647,25 +4648,19 @@ class TestRebaseBeforeDoctor:
             # Rebase + re-test (still fails)
             100,   # test_start
             110,   # test elapsed
-            # Doctor test-fix
-            110,   # doctor phase_start
-            200,   # doctor elapsed
-            # Test re-verification after doctor
-            200,   # test_start
-            210,   # test elapsed
-            # Completion validation
-            210,   # completion_start
-            220,   # completion elapsed
+            # Completion validation (pre-existing path)
+            110,   # completion_start
+            200,   # completion elapsed
             # Judge
-            220,   # judge phase_start
-            270,   # judge elapsed
+            200,   # judge phase_start
+            210,   # judge elapsed
             # Rebase
-            270,   # rebase phase_start
-            273,   # rebase elapsed
+            210,   # rebase phase_start
+            213,   # rebase elapsed
             # Merge
-            273,   # merge phase_start
-            283,   # merge elapsed
-            283,   # duration calc
+            213,   # merge phase_start
+            223,   # merge elapsed
+            223,   # duration calc
         ])
 
         ctx = _make_ctx(start_from=Phase.BUILDER)
@@ -4705,12 +4700,7 @@ class TestRebaseBeforeDoctor:
             phase_name="builder",
             data={"test_failure": True, "test_output_tail": "still failing"},
         )
-        # First call: after rebase. Second call: after doctor.
-        builder_inst.run_test_verification_only.side_effect = [post_rebase_fail, None]
-
-        # Doctor succeeds
-        doctor_inst = MockDoctor.return_value
-        doctor_inst.run_test_fix.return_value = _success_result("doctor")
+        builder_inst.run_test_verification_only.return_value = post_rebase_fail
 
         builder_inst.validate_and_complete.return_value = _success_result(
             "builder", committed=True, pr_created=True
@@ -4728,10 +4718,13 @@ class TestRebaseBeforeDoctor:
         result = orchestrate(ctx)
         assert result == ShepherdExitCode.SUCCESS
 
-        # Doctor WAS called
-        doctor_inst.run_test_fix.assert_called_once()
+        # Doctor was NOT called — pre-existing failures skip Doctor
+        doctor_inst = MockDoctor.return_value
+        doctor_inst.run_test_fix.assert_not_called()
         # Rebase was attempted
         mock_attempt_rebase.assert_called_once()
+        # Completion validation was called
+        builder_inst.validate_and_complete.assert_called_once()
 
     @patch("loom_tools.shepherd.cli.is_branch_behind")
     @patch("loom_tools.shepherd.cli.attempt_rebase")
@@ -4849,7 +4842,7 @@ class TestRebaseBeforeDoctor:
     @patch("loom_tools.shepherd.cli.ApprovalPhase")
     @patch("loom_tools.shepherd.cli.CuratorPhase")
     @patch("loom_tools.shepherd.cli.time")
-    def test_rebase_only_on_first_attempt(
+    def test_branch_up_to_date_unmodified_files_treats_as_preexisting(
         self,
         mock_time: MagicMock,
         MockCurator: MagicMock,
@@ -4863,8 +4856,8 @@ class TestRebaseBeforeDoctor:
         mock_attempt_rebase: MagicMock,
         mock_is_behind: MagicMock,
     ) -> None:
-        """Rebase check only fires on first test-fix attempt, not subsequent ones."""
-        # Allow enough time ticks for 2 doctor iterations + eventual failure
+        """When branch is up-to-date with main and failing tests are in
+        unmodified files, treat as pre-existing and skip Doctor (issue #2809)."""
         mock_time.time = MagicMock(side_effect=list(range(100)))
 
         ctx = _make_ctx(start_from=Phase.BUILDER)
@@ -4896,16 +4889,28 @@ class TestRebaseBeforeDoctor:
         # Branch is up-to-date, so rebase is skipped on first attempt
         mock_is_behind.return_value = False
 
-        # Doctor tries but tests keep failing
-        doctor_inst = MockDoctor.return_value
-        doctor_inst.run_test_fix.return_value = _success_result("doctor")
-        builder_inst.run_test_verification_only.return_value = test_fail
-        builder_inst.push_branch.return_value = True
+        builder_inst.validate_and_complete.return_value = _success_result(
+            "builder", committed=True, pr_created=True
+        )
+
+        judge_inst = MockJudge.return_value
+        judge_inst.should_skip.return_value = (False, "")
+        judge_inst.run.return_value = _success_result("judge", approved=True)
+
+        MockRebase.return_value.run.return_value = PhaseResult(
+            status=PhaseStatus.SKIPPED, message="up to date", phase_name="rebase"
+        )
+        MockMerge.return_value.run.return_value = _success_result("merge", merged=True)
 
         result = orchestrate(ctx)
-        assert result == ShepherdExitCode.PR_TESTS_FAILED
+        assert result == ShepherdExitCode.SUCCESS
 
         # is_branch_behind was only checked once (first attempt)
         mock_is_behind.assert_called_once()
         # attempt_rebase was never called (branch was up-to-date)
         mock_attempt_rebase.assert_not_called()
+        # Doctor was NOT called — pre-existing failures skip Doctor
+        doctor_inst = MockDoctor.return_value
+        doctor_inst.run_test_fix.assert_not_called()
+        # Completion validation was called
+        builder_inst.validate_and_complete.assert_called_once()
