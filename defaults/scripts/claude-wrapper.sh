@@ -123,11 +123,11 @@ _pipe_pane_captured_content() {
     local _pp_temp="$1" _pp_log="$2" _pp_growth="$3"
     [[ $_pp_growth -le 0 ]] && return 1
     local _pp_log_norm
-    _pp_log_norm=$(tail -n "$_pp_growth" "$_pp_log" 2>/dev/null | tr -cd '[:alnum:]' | head -c 5000)
+    _pp_log_norm=$(tail -n "$_pp_growth" "$_pp_log" 2>/dev/null | LC_ALL=C tr -cd '[:alnum:]' | head -c 5000)
     [[ ${#_pp_log_norm} -lt 10 ]] && return 1
     local _pp_probe
     while IFS= read -r _pp_probe; do
-        _pp_probe=$(tr -cd '[:alnum:]' <<< "$_pp_probe")
+        _pp_probe=$(LC_ALL=C tr -cd '[:alnum:]' <<< "$_pp_probe")
         [[ ${#_pp_probe} -lt 12 ]] && continue
         [[ "$_pp_log_norm" == *"$_pp_probe"* ]] && return 0
     done < <(grep -v '^[[:space:]]*$' "$_pp_temp" 2>/dev/null | grep -v '^#' | tail -20 | head -5)
@@ -797,7 +797,7 @@ start_output_monitor() {
                 # non-alphanumeric chars to handle TUI garbling, then match
                 # the distinctive prompt text.
                 local normalized
-                normalized=$(echo "${tail_content}" | tr -cd '[:alnum:]')
+                normalized=$(echo "${tail_content}" | LC_ALL=C tr -cd '[:alnum:]')
                 if echo "${normalized}" | grep -qi "Stopandwaitforlimittoreset" 2>/dev/null; then
                     log_warn "Output monitor: CLI usage/plan limit prompt detected — killing claude"
                     echo "# RATE_LIMIT_ABORT" >&2
@@ -898,7 +898,7 @@ start_startup_monitor() {
             # Check for CLI usage/plan limit prompt in early output.
             # The limit prompt often appears within seconds of startup.
             local head_normalized
-            head_normalized=$(echo "${head_content}" | tr -cd '[:alnum:]')
+            head_normalized=$(echo "${head_content}" | LC_ALL=C tr -cd '[:alnum:]')
             if echo "${head_normalized}" | grep -qi "Stopandwaitforlimittoreset" 2>/dev/null; then
                 log_warn "Startup monitor: CLI usage/plan limit prompt detected — killing claude"
                 echo "# RATE_LIMIT_ABORT" >&2
