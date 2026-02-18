@@ -1077,6 +1077,13 @@ def _scan_log_for_thinking_stall(log_path: Path) -> bool:
             # anywhere in the session.  Unlike degraded detection (which
             # only needs the tail), we must scan ALL output because a
             # single ⏺ anywhere means the session is making progress.
+            #
+            # Note: if a session makes one tool call early and then
+            # produces >50KB of thinking output, the marker could be
+            # missed and this would incorrectly return True.  At the
+            # 3-minute check (THINKING_STALL_TIMEOUT) this is unlikely;
+            # the post-mortem version (_is_thinking_stall_session) reads
+            # the full file and does not have this limitation.
             read_size = min(file_size, 50_000)
             f.seek(max(0, file_size - read_size))
             content = f.read().decode("utf-8", errors="replace")
