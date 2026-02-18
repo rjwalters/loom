@@ -6,6 +6,7 @@ import logging
 import os
 import subprocess
 import tempfile
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -88,8 +89,6 @@ class ShepherdContext:
 
         stale_threshold = 24 * 3600  # 24 hours in seconds
         deleted = 0
-        import time
-
         now = time.time()
         for progress_file in progress_dir.glob("shepherd-*.json"):
             try:
