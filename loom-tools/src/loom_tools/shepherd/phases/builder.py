@@ -552,8 +552,10 @@ class BuilderPhase:
 
         if exit_code == 14:
             # Thinking stall: builder produced output (spinner/thinking)
-            # but never made a tool call.  Not retryable — the same
-            # conditions will produce the same result.  See issue #2784.
+            # but never made a tool call.  Retry logic is handled upstream
+            # in run_phase_with_retry() (THINKING_STALL_MAX_RETRIES).  If
+            # we reach this point, the retry budget is exhausted.
+            # See issues #2784, #2823.
             log_path = self._get_log_path(ctx)
             thinking_snippet = _extract_thinking_snippet(log_path)
             snippet_suffix = (
@@ -571,7 +573,7 @@ class BuilderPhase:
                 status=PhaseStatus.FAILED,
                 message=(
                     "builder thinking stall: extended thinking output "
-                    "with zero tool calls detected (not retryable)"
+                    "with zero tool calls detected (retry budget exhausted)"
                 ),
                 phase_name="builder",
                 data={
