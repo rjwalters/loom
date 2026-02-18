@@ -387,6 +387,75 @@ class TestRevertEscapedMainFiles:
         assert len(calls) == 2
 
 
+class TestCleanupPostSuccessMainLeak:
+    """Test _cleanup_post_success_main_leak for issue #2802.
+
+    Verifies that when the builder successfully creates a PR but also leaks
+    uncommitted changes to main, those changes are detected and reverted.
+    """
+
+    def test_no_leak_is_noop(self, mock_context: MagicMock) -> None:
+        """No action taken when main is clean after successful build."""
+        builder = BuilderPhase()
+        builder._main_dirty_baseline = set()
+
+        with patch.object(
+            builder, "_get_new_main_dirty_files", return_value=[]
+        ) as mock_get, patch.object(
+            builder, "_revert_escaped_main_files"
+        ) as mock_revert:
+            builder._cleanup_post_success_main_leak(mock_context)
+
+        mock_get.assert_called_once()
+        mock_revert.assert_not_called()
+
+    def test_leak_triggers_revert(self, mock_context: MagicMock) -> None:
+        """Leaked files on main are reverted even after successful PR creation."""
+        builder = BuilderPhase()
+        builder._main_dirty_baseline = set()
+
+        leaked = ["?? src/rate_limit_abort.py", " M src/base.py"]
+        with patch.object(
+            builder, "_get_new_main_dirty_files", return_value=leaked
+        ), patch.object(
+            builder, "_revert_escaped_main_files"
+        ) as mock_revert:
+            builder._cleanup_post_success_main_leak(mock_context)
+
+        mock_revert.assert_called_once_with(mock_context)
+
+    def test_leak_logs_warning_with_file_count(
+        self, mock_context: MagicMock, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """Warning log includes the number of leaked files."""
+        builder = BuilderPhase()
+        builder._main_dirty_baseline = set()
+
+        leaked = ["?? file1.py", "?? file2.py", " M file3.py"]
+        with patch.object(
+            builder, "_get_new_main_dirty_files", return_value=leaked
+        ), patch.object(builder, "_revert_escaped_main_files"):
+            builder._cleanup_post_success_main_leak(mock_context)
+
+        stderr = capsys.readouterr().err
+        assert "3" in stderr, f"Expected file count in warning, got: {stderr!r}"
+
+    def test_leak_logs_issue_number(
+        self, mock_context: MagicMock, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """Warning log includes the issue number."""
+        builder = BuilderPhase()
+        builder._main_dirty_baseline = set()
+
+        with patch.object(
+            builder, "_get_new_main_dirty_files", return_value=["?? leaked.py"]
+        ), patch.object(builder, "_revert_escaped_main_files"):
+            builder._cleanup_post_success_main_leak(mock_context)
+
+        stderr = capsys.readouterr().err
+        assert "#42" in stderr, f"Expected issue number in warning, got: {stderr!r}"
+
+
 class TestEscapeRetryConfig:
     """Test escape_max_retries configuration (issue #2751)."""
 
