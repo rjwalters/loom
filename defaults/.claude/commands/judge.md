@@ -1099,8 +1099,14 @@ When running quality checks (step 7), use **scoped test execution** to run only 
 ### Step 1: Detect Changed Files
 
 ```bash
-# Get list of files changed in the PR relative to main
-CHANGED_FILES=$(git diff --name-only origin/main...HEAD)
+# Use gh API to list changed files — avoids local git dependency and
+# exit-128 errors when the branch is checked out in a worktree or when
+# concurrent builder operations hold a git lock. (issue #2828)
+CHANGED_FILES=$(gh pr diff $PR_NUMBER --name-only 2>/dev/null)
+if [ -z "$CHANGED_FILES" ]; then
+    echo "Warning: Could not detect changed files via gh pr diff — running full test suite"
+    # Fall through to full suite
+fi
 echo "$CHANGED_FILES"
 ```
 

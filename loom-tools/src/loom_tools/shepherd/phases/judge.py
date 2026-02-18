@@ -1024,6 +1024,7 @@ class JudgePhase:
         # but produce only terminal escape sequences like "\x1b[?2026l"
         diag["has_meaningful_output"] = self._has_meaningful_output(log_path)
         diag["log_is_stale"] = False
+        diag["git_failure_detected"] = False
         if log_path.is_file():
             try:
                 lines = log_path.read_text().splitlines()
@@ -1048,6 +1049,22 @@ class JudgePhase:
                 else:
                     # Only report session duration for current-session logs
                     diag["session_duration_seconds"] = int(mtime - ctime)
+                # Detect silent git failures (issue #2828).
+                # "failed to run git: exit status 128" appears in the log when
+                # git fails (e.g., branch already checked out in a worktree, or
+                # git lock contention from concurrent builder operations).  The
+                # judge may recover silently, producing an incomplete review.
+                git_failure_pattern = re.compile(
+                    r"failed to run git|exit status 128", re.IGNORECASE
+                )
+                if any(git_failure_pattern.search(line) for line in lines):
+                    diag["git_failure_detected"] = True
+                    log_warning(
+                        "Git failure detected in judge log (exit status 128). "
+                        "The judge may have performed an incomplete review. "
+                        "Consider using 'gh pr diff' instead of local git commands "
+                        "to avoid worktree conflicts. (issue #2828)"
+                    )
             except OSError:
                 diag["log_tail"] = []
         else:
@@ -1154,6 +1171,10 @@ class JudgePhase:
             parts.append("log file empty")
         else:
             parts.append(f"log file not found ({diag['log_file']})")
+
+        # Git failure warning (issue #2828)
+        if diag.get("git_failure_detected"):
+            parts.append("WARNING: git failure detected (exit status 128) — review may be incomplete")
 
         # Session duration (if available; omitted for stale logs)
         if "session_duration_seconds" in diag:
