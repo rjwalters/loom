@@ -520,6 +520,29 @@ class BuilderPhase:
                 },
             )
 
+        if exit_code == 14:
+            # Thinking stall: builder produced output (spinner/thinking)
+            # but never made a tool call.  Not retryable — the same
+            # conditions will produce the same result.  See issue #2784.
+            log_warning(
+                f"Thinking stall for issue #{ctx.config.issue}: "
+                f"builder produced thinking output but zero tool calls"
+            )
+            self._cleanup_stale_worktree(ctx)
+            return PhaseResult(
+                status=PhaseStatus.FAILED,
+                message=(
+                    "builder thinking stall: extended thinking output "
+                    "with zero tool calls detected (not retryable)"
+                ),
+                phase_name="builder",
+                data={
+                    "thinking_stall": True,
+                    "exit_code": exit_code,
+                    "log_file": str(self._get_log_path(ctx)),
+                },
+            )
+
         if exit_code not in (0, 3, 4):
             # Unexpected non-zero exit from builder subprocess
             diag = self._gather_diagnostics(ctx)
