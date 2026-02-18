@@ -856,7 +856,7 @@ start_startup_monitor() {
     local monitor_pid_file="$2"
 
     (
-        local check_interval=5
+        local check_interval=2
         local elapsed=0
 
         while [[ "${elapsed}" -lt "${STARTUP_MONITOR_WINDOW}" ]]; do
@@ -895,8 +895,9 @@ start_startup_monitor() {
                 # Poll for loom MCP connection within the grace period.
                 # Check BEFORE sleeping so that if the MCP connected before
                 # the failure was noticed (common case — MCP init ~1-3s,
-                # first output check at ~5s) we skip the delay entirely.
+                # first output check at ~2s) we skip the delay entirely.
                 # See issue #2660 for why single-shot was insufficient.
+                # See issue #2763 for check_interval reduction (5s → 2s).
                 # If all project MCPs connected, the session is allowed to
                 # continue (global plugin failures won't self-resolve).
                 # Otherwise, we kill the session to avoid a degraded state
