@@ -873,6 +873,14 @@ class BuilderPhase:
 
         ctx.pr_number = pr
 
+        # Post-success leak check: builder may have worked correctly in the
+        # worktree (commits + PR created) but *also* modified files on main
+        # as a side effect. The classic escape detection only fires when the
+        # worktree is empty; this check handles the "partial escape" where
+        # the builder produced valid worktree work AND leaked to main.
+        # (Issue #2802 — builder scope creep leaks uncommitted work to main.)
+        self._cleanup_post_success_main_leak(ctx)
+
         # Report PR created
         ctx.report_milestone("pr_created", pr_number=pr)
 
@@ -3222,6 +3230,35 @@ class BuilderPhase:
                     check=False,
                 )
             log_info(f"Removed {len(untracked_files)} escaped untracked file(s) on main")
+
+    def _cleanup_post_success_main_leak(self, ctx: ShepherdContext) -> None:
+        """Check for and clean up main branch dirt introduced after a successful build.
+
+        The early ``_detect_worktree_escape`` check only fires when the
+        worktree is completely empty (0 commits, no uncommitted changes).
+        This method handles the complementary "partial escape" scenario
+        where the builder produced real worktree work (PR was created) but
+        *also* modified files on the main branch as a side effect.
+
+        When found, the leaked files are reverted/removed and a warning is
+        logged.  The builder phase still returns SUCCESS because the worktree
+        work is valid; the cleanup prevents the leaked files from blocking a
+        subsequent ``git pull``.  (Issue #2802.)
+        """
+        new_dirty = self._get_new_main_dirty_files(ctx)
+        if not new_dirty:
+            return
+
+        file_preview = new_dirty[:5]
+        log_warning(
+            f"Builder leaked {len(new_dirty)} file(s) to main branch for issue "
+            f"#{ctx.config.issue} despite successful PR creation — "
+            f"reverting: {file_preview}"
+        )
+        self._revert_escaped_main_files(ctx)
+        log_info(
+            f"Post-success main leak cleanup complete for issue #{ctx.config.issue}"
+        )
 
     def _detect_wrong_issue(
         self, ctx: ShepherdContext
