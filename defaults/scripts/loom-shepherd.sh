@@ -83,6 +83,11 @@ if [[ -n "$unmerged" ]]; then
     exit 1
 fi
 
+# Disable Python output buffering so stderr reaches callers immediately.
+# Without this, output is lost when invoked non-interactively (e.g., Claude Code
+# Bash tool, Task agents) because Python buffers stderr and may not flush before exit.
+export PYTHONUNBUFFERED=1
+
 # Try Python implementation first
 # Priority order:
 #   1. Virtual environment in loom-tools (from source or recorded path)
