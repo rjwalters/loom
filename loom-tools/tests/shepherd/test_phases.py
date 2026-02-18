@@ -1183,6 +1183,7 @@ class TestBuilderDiagnostics:
         mock_context.config = ShepherdConfig(issue=42)
         mock_context.repo_root = tmp_path
         mock_context.last_low_output_cause = None
+        mock_context.last_postmortem = None
 
         builder = BuilderPhase()
 
@@ -1205,7 +1206,7 @@ class TestBuilderDiagnostics:
             diag = builder._gather_diagnostics(mock_context)
 
         summary = diag["summary"]
-        # Should have 5 semicolon-separated sections
+        # Should have 5 semicolon-separated sections (no postmortem when last_postmortem is None)
         parts = summary.split("; ")
         assert len(parts) == 5
         assert "worktree" in parts[0]
@@ -1214,6 +1215,45 @@ class TestBuilderDiagnostics:
         assert "labels=" in parts[3]
         assert "log=" in parts[4]
         assert diag["low_output_cause"] is None
+
+    def test_diagnostics_summary_includes_postmortem(
+        self, mock_context: MagicMock, tmp_path: Path
+    ) -> None:
+        """Postmortem summary should appear in diagnostic summary when present."""
+        mock_context.worktree_path = tmp_path / "nonexistent"
+        mock_context.config = ShepherdConfig(issue=42)
+        mock_context.repo_root = tmp_path
+        mock_context.last_low_output_cause = None
+        mock_context.last_postmortem = {
+            "summary": "CLI started but produced zero output; log duration: 5s; exit(wait=0)",
+            "cli_started": True,
+            "has_rate_limit": False,
+        }
+
+        builder = BuilderPhase()
+
+        def fake_run(cmd, **kwargs):
+            cmd_str = " ".join(str(c) for c in cmd)
+            if "gh" in cmd_str:
+                return subprocess.CompletedProcess(
+                    args=cmd,
+                    returncode=0,
+                    stdout="loom:building, loom:curated",
+                    stderr="",
+                )
+            return subprocess.CompletedProcess(
+                args=cmd, returncode=1, stdout="", stderr=""
+            )
+
+        with patch(
+            "loom_tools.shepherd.phases.builder.subprocess.run", side_effect=fake_run
+        ):
+            diag = builder._gather_diagnostics(mock_context)
+
+        summary = diag["summary"]
+        assert "postmortem:" in summary
+        assert "CLI started but produced zero output" in summary
+        assert "log duration: 5s" in summary
 
 
 class TestBuilderQualityValidation:
