@@ -38,6 +38,8 @@ from loom_tools.shepherd.phases.base import (
     MCP_FAILURE_BACKOFF_SECONDS,
     MCP_FAILURE_MAX_RETRIES,
     MCP_FAILURE_MIN_OUTPUT_CHARS,
+    THINKING_STALL_BACKOFF_SECONDS,
+    THINKING_STALL_MAX_RETRIES,
     THINKING_STALL_MIN_DURATION_SECONDS,
     _AUTH_FAILURE_SENTINEL,
     _RATE_LIMIT_SENTINEL,
@@ -18198,6 +18200,117 @@ class TestRunPhaseWithRetryGhostCauseSpecific:
         assert backoff == [20, 30, 60]
         sleep_calls = [c.args[0] for c in mock_sleep.call_args_list]
         assert sleep_calls == backoff
+
+
+class TestRunPhaseWithRetryThinkingStall:
+    """Test that run_phase_with_retry retries once on thinking stall (exit 14)."""
+
+    @pytest.fixture
+    def mock_context(self) -> MagicMock:
+        """Create a mock ShepherdContext."""
+        ctx = MagicMock(spec=ShepherdContext)
+        ctx.config = ShepherdConfig(
+            issue=42, task_id="test-123", stuck_max_retries=2
+        )
+        ctx.repo_root = Path("/fake/repo")
+        ctx.scripts_dir = Path("/fake/repo/.loom/scripts")
+        ctx.progress_dir = Path("/tmp/progress")
+        ctx.label_cache = MagicMock()
+        ctx.pr_number = None
+        return ctx
+
+    def test_thinking_stall_retries_once(self, mock_context: MagicMock) -> None:
+        """A single thinking stall should retry and succeed on the second attempt."""
+        call_count = 0
+
+        def mock_run_worker(*args, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            return 14 if call_count == 1 else 0
+
+        with (
+            patch(
+                "loom_tools.shepherd.phases.base.run_worker_phase",
+                side_effect=mock_run_worker,
+            ),
+            patch("time.sleep") as mock_sleep,
+        ):
+            exit_code = run_phase_with_retry(
+                mock_context,
+                role="builder",
+                name="builder-issue-42",
+                timeout=600,
+                max_retries=2,
+                phase="builder",
+            )
+
+        assert exit_code == 0
+        assert call_count == 2
+        mock_sleep.assert_called_once_with(THINKING_STALL_BACKOFF_SECONDS[0])
+
+    def test_thinking_stall_non_retryable_on_second_consecutive(
+        self, mock_context: MagicMock
+    ) -> None:
+        """Two consecutive thinking stalls exhaust the budget and return 14."""
+        with (
+            patch(
+                "loom_tools.shepherd.phases.base.run_worker_phase",
+                return_value=14,
+            ),
+            patch("time.sleep"),
+        ):
+            exit_code = run_phase_with_retry(
+                mock_context,
+                role="builder",
+                name="builder-issue-42",
+                timeout=600,
+                max_retries=2,
+                phase="builder",
+            )
+
+        assert exit_code == 14
+
+    def test_thinking_stall_counter_independent_of_ghost(
+        self, mock_context: MagicMock
+    ) -> None:
+        """Ghost retry budget and thinking stall budget are independent."""
+        call_count = 0
+
+        def mock_run_worker(*args, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                return 10  # ghost session
+            if call_count == 2:
+                return 14  # thinking stall
+            return 0  # success
+
+        with (
+            patch(
+                "loom_tools.shepherd.phases.base.run_worker_phase",
+                side_effect=mock_run_worker,
+            ),
+            patch("time.sleep"),
+            patch(
+                "loom_tools.shepherd.phases.base._classify_ghost_cause",
+                return_value="unknown",
+            ),
+            patch(
+                "loom_tools.shepherd.phases.base.extract_log_errors",
+                return_value=[],
+            ),
+        ):
+            exit_code = run_phase_with_retry(
+                mock_context,
+                role="builder",
+                name="builder-issue-42",
+                timeout=600,
+                max_retries=2,
+                phase="builder",
+            )
+
+        assert exit_code == 0
+        assert call_count == 3
 
 
 class TestExtractTestFilePaths:

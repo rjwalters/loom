@@ -107,6 +107,12 @@ MCP_FAILURE_MIN_OUTPUT_CHARS = 500
 MCP_FAILURE_MAX_RETRIES = 3
 MCP_FAILURE_BACKOFF_SECONDS = [20, 30, 60]
 
+# Thinking stall retry budget.  One retry is cheap relative to the cost
+# of blocking an issue and requiring human intervention.  Two consecutive
+# stalls are more likely to indicate a systematic issue.  See issue #2823.
+THINKING_STALL_MAX_RETRIES = 1
+THINKING_STALL_BACKOFF_SECONDS = [30]
+
 # Startup monitor resolution marker.  When this substring appears in a session
 # log, the wrapper's startup monitor confirmed that all *project* MCP servers
 # (from .mcp.json) connected successfully — any "MCP server failed" text is
@@ -2090,6 +2096,7 @@ def run_phase_with_retry(
     low_output_retries = 0
     mcp_failure_retries = 0
     ghost_retries = 0
+    thinking_stall_retries = 0
     attempt = 0  # Total attempt counter for unique session names (issue #2639)
 
     while True:
@@ -2142,10 +2149,20 @@ def run_phase_with_retry(
             return 13
 
         # --- Thinking stall (exit code 14) ---
-        # Not retryable: the session entered extended thinking without
-        # making any tool calls.  The same conditions will produce the
-        # same result on retry.  See issue #2784.
+        # Allow one retry before treating as non-retryable.  Thinking stalls
+        # can be transient (MCP server state at session startup, one-time model
+        # behavior).  Two consecutive stalls indicate a systematic issue.
+        # See issues #2784, #2823.
         if exit_code == 14:
+            if thinking_stall_retries < THINKING_STALL_MAX_RETRIES:
+                backoff = THINKING_STALL_BACKOFF_SECONDS[thinking_stall_retries]
+                thinking_stall_retries += 1
+                log_warning(
+                    f"Thinking stall for attempt {attempt - 1} — retrying "
+                    f"in {backoff}s (retry {thinking_stall_retries}/{THINKING_STALL_MAX_RETRIES})"
+                )
+                time.sleep(backoff)
+                continue
             return 14
 
         # --- Pre-retry approval check (judge phase only) ---
