@@ -1185,6 +1185,46 @@ def _scan_log_for_thinking_stall(log_path: Path) -> bool:
         return False
 
 
+# Maximum number of characters extracted from a thinking stall log for
+# inclusion in diagnostic messages.  Large enough to be useful, small enough
+# to avoid flooding the shepherd log.
+_THINKING_SNIPPET_MAX_CHARS = 500
+
+
+def _extract_thinking_snippet(log_path: Path, max_chars: int = _THINKING_SNIPPET_MAX_CHARS) -> str:
+    """Extract a diagnostic snippet from a thinking-stall builder log.
+
+    Reads the builder log, strips ANSI codes, and returns the tail of
+    the CLI output (up to *max_chars* characters).  Even though the
+    log typically contains only spinner animations during a thinking stall,
+    the tail gives shepherds and human operators a concrete view of the
+    session state and distinguishes true thinking stalls from early crashes.
+
+    Args:
+        log_path: Path to the builder session log file.
+        max_chars: Maximum number of characters to return.
+
+    Returns:
+        A stripped string of the last ``max_chars`` characters of CLI output,
+        or an empty string if the log is unavailable or empty.
+    """
+    if not log_path.is_file():
+        return ""
+
+    try:
+        content = log_path.read_text()
+        stripped = strip_ansi(content)
+        cli_output = _get_cli_output(stripped)
+        if not cli_output:
+            return ""
+
+        tail = cli_output.strip()[-max_chars:]
+        return tail.strip()
+
+    except OSError:
+        return ""
+
+
 def _classify_low_output_cause(log_path: Path) -> str:
     """Classify the root cause of a low-output session from the worker log.
 
@@ -1744,10 +1784,16 @@ def run_worker_phase(
             thinking_log_path = _session_log_path(ctx.repo_root, actual_name)
             if _scan_log_for_thinking_stall(thinking_log_path):
                 elapsed_s = int(time.monotonic() - phase_start)
+                thinking_snippet = _extract_thinking_snippet(thinking_log_path)
+                snippet_suffix = (
+                    f"\nBuilder thinking tail:\n{thinking_snippet}"
+                    if thinking_snippet
+                    else ""
+                )
                 log_warning(
                     f"Thinking stall detected: {role} session '{actual_name}' "
                     f"has produced output for {elapsed_s}s with zero tool calls, "
-                    f"terminating early (log: {thinking_log_path})"
+                    f"terminating early (log: {thinking_log_path}){snippet_suffix}"
                 )
                 wait_proc.terminate()
                 wait_proc.wait(timeout=30)

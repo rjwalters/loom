@@ -45,6 +45,7 @@ from loom_tools.shepherd.phases.base import (
     PhaseResult,
     PhaseStatus,
     _STARTUP_MONITOR_MCP_RESOLUTION,
+    _extract_thinking_snippet,
     _get_cli_output,
     extract_log_errors,
     run_phase_with_retry,
@@ -547,9 +548,17 @@ class BuilderPhase:
             # Thinking stall: builder produced output (spinner/thinking)
             # but never made a tool call.  Not retryable — the same
             # conditions will produce the same result.  See issue #2784.
+            log_path = self._get_log_path(ctx)
+            thinking_snippet = _extract_thinking_snippet(log_path)
+            snippet_suffix = (
+                f"\nBuilder thinking tail:\n{thinking_snippet}"
+                if thinking_snippet
+                else ""
+            )
             log_warning(
                 f"Thinking stall for issue #{ctx.config.issue}: "
                 f"builder produced thinking output but zero tool calls"
+                f"{snippet_suffix}"
             )
             self._cleanup_stale_worktree(ctx)
             return PhaseResult(
@@ -562,7 +571,8 @@ class BuilderPhase:
                 data={
                     "thinking_stall": True,
                     "exit_code": exit_code,
-                    "log_file": str(self._get_log_path(ctx)),
+                    "log_file": str(log_path),
+                    "thinking_snippet": thinking_snippet,
                 },
             )
 
