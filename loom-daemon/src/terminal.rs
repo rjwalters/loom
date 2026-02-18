@@ -20,7 +20,9 @@ mod claude_config {
     /// Must match the Python `_SHARED_CONFIG_FILES` list.
     /// NOTE: .claude.json is NOT here — it lives at ~/.claude.json (home root),
     /// not inside ~/.claude/. It's handled separately via `resolve_state_file()`.
-    const SHARED_CONFIG_FILES: &[&str] = &["settings.json", "config.json"];
+    /// NOTE: settings.json is intentionally excluded — it is copied and filtered
+    /// to strip `enabledPlugins` (global MCP plugins cause ghost sessions, #2799).
+    const SHARED_CONFIG_FILES: &[&str] = &["config.json"];
 
     /// Shared directories to symlink from ~/.claude/ (read-only caches).
     /// Must match the Python `_SHARED_CONFIG_DIRS` list.
@@ -210,6 +212,49 @@ mod claude_config {
         }
     }
 
+    /// Copy `settings.json` stripping the `enabledPlugins` key.
+    ///
+    /// Global MCP plugins (e.g. rust-analyzer-lsp, swift-lsp) load from the
+    /// `enabledPlugins` field in `~/.claude/settings.json`.  In headless agent
+    /// sessions these plugins fail to initialise and can prevent Claude CLI
+    /// from processing its input prompt, producing ghost sessions that waste
+    /// minutes of retry time.  See issue #2799.
+    fn copy_settings_without_plugins(src: &Path, dst: &Path) -> bool {
+        let content = match fs::read_to_string(src) {
+            Ok(c) => c,
+            Err(e) => {
+                log::debug!("Could not read {}: {e} — skipping settings copy", src.display());
+                return false;
+            }
+        };
+
+        let mut data: serde_json::Value = match serde_json::from_str(&content) {
+            Ok(v) => v,
+            Err(e) => {
+                log::debug!("settings.json is not valid JSON: {e} — skipping");
+                return false;
+            }
+        };
+
+        if let Some(obj) = data.as_object_mut() {
+            obj.remove("enabledPlugins");
+        } else {
+            log::debug!("settings.json is not a JSON object — skipping");
+            return false;
+        }
+
+        match fs::write(dst, serde_json::to_string_pretty(&data).unwrap_or_default()) {
+            Ok(()) => {
+                log::debug!("Copied settings.json to {} (enabledPlugins stripped)", dst.display());
+                true
+            }
+            Err(e) => {
+                log::debug!("Failed to write filtered settings.json to {}: {e}", dst.display());
+                false
+            }
+        }
+    }
+
     pub fn setup_agent_config_dir(agent_name: &str, repo_root: &Path) -> Option<PathBuf> {
         let config_dir = repo_root
             .join(".loom")
@@ -235,6 +280,17 @@ mod claude_config {
                 if let Err(e) = std::os::unix::fs::symlink(&src, &dst) {
                     log::debug!("Failed to symlink {}: {e}", dst.display());
                 }
+            }
+        }
+
+        // Copy settings.json with enabledPlugins stripped (issue #2799).
+        // Global plugins (rust-analyzer-lsp, swift-lsp, etc.) fail in headless
+        // mode and cause ghost sessions.  All other settings are preserved.
+        let settings_dst = config_dir.join("settings.json");
+        if !settings_dst.exists() {
+            let settings_src = home_claude.join("settings.json");
+            if settings_src.exists() {
+                copy_settings_without_plugins(&settings_src, &settings_dst);
             }
         }
 
@@ -551,7 +607,7 @@ mod claude_config {
         }
 
         #[test]
-        fn test_setup_does_not_overwrite_existing_symlinks() {
+        fn test_setup_does_not_overwrite_existing_files() {
             let tmp = tempfile::tempdir().unwrap();
             let repo_root = tmp.path();
             fs::create_dir_all(repo_root.join(".loom")).unwrap();
@@ -559,9 +615,9 @@ mod claude_config {
             // First setup
             let config_dir = setup_agent_config_dir("terminal-6", repo_root).unwrap();
 
-            // Create a custom file at one of the symlink destinations
+            // Create a custom file at one of the destinations
             let custom_file = config_dir.join("settings.json");
-            // Remove any existing symlink first
+            // Remove any existing file first
             let _ = fs::remove_file(&custom_file);
             fs::write(&custom_file, "custom").unwrap();
 
@@ -569,6 +625,59 @@ mod claude_config {
             setup_agent_config_dir("terminal-6", repo_root);
             let contents = fs::read_to_string(&custom_file).unwrap();
             assert_eq!(contents, "custom");
+        }
+
+        #[test]
+        fn test_copy_settings_strips_enabled_plugins() {
+            let tmp = tempfile::tempdir().unwrap();
+            let src = tmp.path().join("settings.json");
+            fs::write(
+                &src,
+                r#"{"enabledPlugins":{"rust-analyzer-lsp@official":true},"model":"sonnet","alwaysThinkingEnabled":true}"#,
+            )
+            .unwrap();
+
+            let dst = tmp.path().join("out.json");
+            assert!(copy_settings_without_plugins(&src, &dst));
+
+            let data: serde_json::Value =
+                serde_json::from_str(&fs::read_to_string(&dst).unwrap()).unwrap();
+            assert!(data.get("enabledPlugins").is_none(), "enabledPlugins should be stripped");
+            assert_eq!(data["model"], "sonnet");
+            assert_eq!(data["alwaysThinkingEnabled"], true);
+        }
+
+        #[test]
+        fn test_copy_settings_preserves_all_other_keys() {
+            let tmp = tempfile::tempdir().unwrap();
+            let src = tmp.path().join("settings.json");
+            fs::write(&src, r#"{"model":"opus","customSetting":42}"#).unwrap();
+
+            let dst = tmp.path().join("out.json");
+            assert!(copy_settings_without_plugins(&src, &dst));
+
+            let data: serde_json::Value =
+                serde_json::from_str(&fs::read_to_string(&dst).unwrap()).unwrap();
+            assert_eq!(data["model"], "opus");
+            assert_eq!(data["customSetting"], 42);
+        }
+
+        #[test]
+        fn test_copy_settings_missing_src_returns_false() {
+            let tmp = tempfile::tempdir().unwrap();
+            let dst = tmp.path().join("out.json");
+            assert!(!copy_settings_without_plugins(&tmp.path().join("nope.json"), &dst));
+            assert!(!dst.exists());
+        }
+
+        #[test]
+        fn test_copy_settings_corrupt_json_returns_false() {
+            let tmp = tempfile::tempdir().unwrap();
+            let src = tmp.path().join("settings.json");
+            fs::write(&src, "not json{{{").unwrap();
+
+            let dst = tmp.path().join("out.json");
+            assert!(!copy_settings_without_plugins(&src, &dst));
         }
     }
 }

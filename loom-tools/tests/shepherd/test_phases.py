@@ -17505,7 +17505,7 @@ class TestRunPhaseWithRetryGhostCauseSpecific:
             )
 
         _, backoff = GHOST_RETRY_STRATEGIES["mcp_init_failure"]
-        assert backoff == [10, 30, 60]
+        assert backoff == [20, 30, 60]
         sleep_calls = [c.args[0] for c in mock_sleep.call_args_list]
         assert sleep_calls == backoff
 

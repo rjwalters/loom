@@ -26,8 +26,12 @@ log = logging.getLogger(__name__)
 # project-scoped configs that Claude Code discovers from the working
 # directory / git root.  Symlinking them from ~/.claude/ shadows the
 # correct project-level config and causes MCP initialization failures.
+#
+# Note: settings.json is intentionally excluded from symlinks — it is
+# copied and filtered instead to strip ``enabledPlugins`` (global MCP
+# plugins).  Global plugins like rust-analyzer-lsp and swift-lsp fail
+# in headless mode and cause ghost sessions.  See issue #2799.
 _SHARED_CONFIG_FILES = [
-    "settings.json",
     "config.json",
 ]
 
@@ -48,6 +52,53 @@ _MUTABLE_DIRS = [
     "shell-snapshots",
     "tmp",
 ]
+
+
+def _copy_settings_without_plugins(src: Path, dst: Path) -> bool:
+    """Copy settings.json stripping the ``enabledPlugins`` key.
+
+    Global MCP plugins (e.g. ``rust-analyzer-lsp``, ``swift-lsp``) load from
+    the ``enabledPlugins`` field in ``~/.claude/settings.json``.  In headless
+    agent sessions these plugins fail to initialise and can prevent Claude CLI
+    from processing its input prompt, producing ghost sessions that waste
+    minutes of retry time.
+
+    This function copies *all other* settings (model, theme, permissions, etc.)
+    so agent behaviour remains consistent with the user's configuration.
+
+    Args:
+        src: Path to the source settings.json (usually ``~/.claude/settings.json``).
+        dst: Path to the destination (inside the agent config dir).
+
+    Returns:
+        True if the file was copied, False on any error or if *src* is missing.
+    """
+    import json
+
+    if not src.is_file():
+        return False
+
+    try:
+        data = json.loads(src.read_text())
+    except (json.JSONDecodeError, OSError):
+        log.debug("Could not read %s — skipping settings copy", src)
+        return False
+
+    if not isinstance(data, dict):
+        log.debug("settings.json is not a JSON object — skipping")
+        return False
+
+    # Strip the key that triggers global plugin loading.
+    data.pop("enabledPlugins", None)
+
+    try:
+        dst.write_text(json.dumps(data, indent=2) + "\n")
+    except OSError as exc:
+        log.debug("Failed to write filtered settings.json to %s: %s", dst, exc)
+        return False
+
+    log.debug("Copied settings.json to %s (enabledPlugins stripped)", dst)
+    return True
 
 
 def _ensure_onboarding_complete(state_path: Path) -> None:
@@ -236,6 +287,13 @@ def setup_agent_config_dir(agent_name: str, repo_root: Path) -> Path:
         dst = config_dir / filename
         if src.exists() and not dst.exists():
             dst.symlink_to(src)
+
+    # Copy settings.json with enabledPlugins stripped (issue #2799).
+    # Global plugins (rust-analyzer-lsp, swift-lsp, etc.) fail in headless
+    # mode and cause ghost sessions.  All other settings are preserved.
+    settings_dst = config_dir / "settings.json"
+    if not settings_dst.exists():
+        _copy_settings_without_plugins(home_claude / "settings.json", settings_dst)
 
     # Symlink Claude Code state file (onboarding completion, theme, etc.).
     # The state file lives at ~/.claude.json (or ~/.claude/.config.json),
