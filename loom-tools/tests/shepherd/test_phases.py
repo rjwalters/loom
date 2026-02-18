@@ -10065,14 +10065,18 @@ class TestBuilderDirectCompletion:
 
         with (
             patch.object(builder, "_push_branch", return_value=True),
+            patch.object(
+                builder,
+                "_build_direct_completion_pr_body",
+                return_value="Closes #42\n\n## Changes\n```\nfile.py | 2 +-\n```\n\n## Test plan\n- [ ] Verify",
+            ),
             patch(
                 "loom_tools.shepherd.phases.builder.subprocess.run"
             ) as mock_run,
         ):
-            # gh pr list, git diff --stat, gh pr create
+            # gh pr list, gh pr create
             mock_run.side_effect = [
                 MagicMock(returncode=0, stdout="", stderr=""),
-                MagicMock(returncode=0, stdout="file.py | 2 +-\n", stderr=""),
                 MagicMock(returncode=0, stderr=""),
             ]
             result = builder._direct_completion(mock_context, diag)
@@ -10081,11 +10085,8 @@ class TestBuilderDirectCompletion:
         # Verify gh pr list check was called first
         check_args = mock_run.call_args_list[0][0][0]
         assert check_args[:3] == ["gh", "pr", "list"]
-        # Verify git diff --stat was called
-        diff_args = mock_run.call_args_list[1][0][0]
-        assert diff_args[:3] == ["git", "diff", "--stat"]
         # Verify gh pr create was called with structured body
-        call_args = mock_run.call_args_list[2][0][0]
+        call_args = mock_run.call_args_list[1][0][0]
         assert call_args[:3] == ["gh", "pr", "create"]
         assert "--head" in call_args
         assert "feature/issue-42" in call_args
@@ -10094,7 +10095,6 @@ class TestBuilderDirectCompletion:
         assert "--body" in call_args
         body_idx = call_args.index("--body")
         body = call_args[body_idx + 1]
-        assert "## Summary" in body
         assert "## Changes" in body
         assert "Closes #42" in body
 
@@ -10142,13 +10142,17 @@ class TestBuilderDirectCompletion:
         with (
             patch.object(builder, "_stage_and_commit", return_value=True),
             patch.object(builder, "_push_branch", return_value=True),
+            patch.object(
+                builder,
+                "_build_direct_completion_pr_body",
+                return_value="Closes #42\n\n## Test plan\n- [ ] Verify",
+            ),
             patch(
                 "loom_tools.shepherd.phases.builder.subprocess.run"
             ) as mock_run,
         ):
-            # gh pr list, git diff --stat, gh pr create
+            # gh pr list, gh pr create
             mock_run.side_effect = [
-                MagicMock(returncode=0, stdout="", stderr=""),
                 MagicMock(returncode=0, stdout="", stderr=""),
                 MagicMock(returncode=0, stderr=""),
             ]
@@ -10198,23 +10202,26 @@ class TestBuilderDirectCompletion:
             "branch": "feature/issue-42",
         }
 
-        with patch(
-            "loom_tools.shepherd.phases.builder.subprocess.run"
-        ) as mock_run:
-            # gh pr list, git diff --stat, gh pr create
+        with (
+            patch.object(
+                builder,
+                "_build_direct_completion_pr_body",
+                return_value="Closes #42\n\n## Changes\n```\nbuilder.py | 10 ++++\n```\n\n## Test plan\n- [ ] Verify",
+            ),
+            patch(
+                "loom_tools.shepherd.phases.builder.subprocess.run"
+            ) as mock_run,
+        ):
+            # gh pr list, gh pr create
             mock_run.side_effect = [
                 MagicMock(returncode=0, stdout="", stderr=""),
-                MagicMock(returncode=0, stdout="builder.py | 10 ++++\n", stderr=""),
                 MagicMock(returncode=0, stderr=""),
             ]
             result = builder._direct_completion(mock_context, diag)
 
         assert result is True
-        # git diff --stat call
-        diff_args = mock_run.call_args_list[1][0][0]
-        assert diff_args[:3] == ["git", "diff", "--stat"]
         # gh pr create call
-        call_args = mock_run.call_args_list[2][0][0]
+        call_args = mock_run.call_args_list[1][0][0]
         assert call_args[:3] == ["gh", "pr", "create"]
         assert "--head" in call_args
         assert "feature/issue-42" in call_args
@@ -10226,7 +10233,6 @@ class TestBuilderDirectCompletion:
         assert "--body" in call_args
         body_idx = call_args.index("--body")
         body = call_args[body_idx + 1]
-        assert "## Summary" in body
         assert "## Changes" in body
         assert "builder.py | 10 ++++" in body
         assert "Closes #42" in body
@@ -10278,20 +10284,26 @@ class TestBuilderDirectCompletion:
             "branch": "feature/issue-42",
         }
 
-        with patch(
-            "loom_tools.shepherd.phases.builder.subprocess.run"
-        ) as mock_run:
-            # gh pr list fails, git diff --stat, gh pr create
+        with (
+            patch.object(
+                builder,
+                "_build_direct_completion_pr_body",
+                return_value="Closes #42\n\n## Test plan\n- [ ] Verify",
+            ),
+            patch(
+                "loom_tools.shepherd.phases.builder.subprocess.run"
+            ) as mock_run,
+        ):
+            # gh pr list fails, gh pr create
             mock_run.side_effect = [
                 MagicMock(returncode=1, stdout="", stderr="network error"),
-                MagicMock(returncode=0, stdout="", stderr=""),
                 MagicMock(returncode=0, stderr=""),
             ]
             result = builder._direct_completion(mock_context, diag)
 
         assert result is True
-        assert mock_run.call_count == 3
-        create_args = mock_run.call_args_list[2][0][0]
+        assert mock_run.call_count == 2
+        create_args = mock_run.call_args_list[1][0][0]
         assert create_args[:3] == ["gh", "pr", "create"]
 
     def test_refuses_when_worktree_on_main(self, mock_context: MagicMock) -> None:
@@ -10354,12 +10366,18 @@ class TestBuilderDirectCompletion:
             "branch": "feature/issue-42",
         }
 
-        with patch(
-            "loom_tools.shepherd.phases.builder.subprocess.run"
-        ) as mock_run:
-            # gh pr list, git diff --stat, gh pr create (fails)
+        with (
+            patch.object(
+                builder,
+                "_build_direct_completion_pr_body",
+                return_value="Closes #42\n\n## Test plan\n- [ ] Verify",
+            ),
+            patch(
+                "loom_tools.shepherd.phases.builder.subprocess.run"
+            ) as mock_run,
+        ):
+            # gh pr list, gh pr create (fails)
             mock_run.side_effect = [
-                MagicMock(returncode=0, stdout="", stderr=""),
                 MagicMock(returncode=0, stdout="", stderr=""),
                 MagicMock(returncode=1, stderr="GraphQL: error"),
             ]
@@ -10387,12 +10405,18 @@ class TestBuilderDirectCompletion:
             "branch": "custom/my-branch",
         }
 
-        with patch(
-            "loom_tools.shepherd.phases.builder.subprocess.run"
-        ) as mock_run:
-            # gh pr list, git diff --stat, gh pr create
+        with (
+            patch.object(
+                builder,
+                "_build_direct_completion_pr_body",
+                return_value="Closes #99",
+            ),
+            patch(
+                "loom_tools.shepherd.phases.builder.subprocess.run"
+            ) as mock_run,
+        ):
+            # gh pr list, gh pr create
             mock_run.side_effect = [
-                MagicMock(returncode=0, stdout="", stderr=""),
                 MagicMock(returncode=0, stdout="", stderr=""),
                 MagicMock(returncode=0, stderr=""),
             ]
@@ -10401,7 +10425,7 @@ class TestBuilderDirectCompletion:
         # Both the check and create calls should use the canonical branch
         check_args = mock_run.call_args_list[0][0][0]
         assert "feature/issue-99" in check_args
-        create_args = mock_run.call_args_list[2][0][0]
+        create_args = mock_run.call_args_list[1][0][0]
         assert "feature/issue-99" in create_args
 
     def test_create_pr_fallback_branch_name(
@@ -10420,18 +10444,24 @@ class TestBuilderDirectCompletion:
             # No "branch" key — should fallback
         }
 
-        with patch(
-            "loom_tools.shepherd.phases.builder.subprocess.run"
-        ) as mock_run:
-            # gh pr list, git diff --stat, gh pr create
+        with (
+            patch.object(
+                builder,
+                "_build_direct_completion_pr_body",
+                return_value="Closes #55",
+            ),
+            patch(
+                "loom_tools.shepherd.phases.builder.subprocess.run"
+            ) as mock_run,
+        ):
+            # gh pr list, gh pr create
             mock_run.side_effect = [
-                MagicMock(returncode=0, stdout="", stderr=""),
                 MagicMock(returncode=0, stdout="", stderr=""),
                 MagicMock(returncode=0, stderr=""),
             ]
             builder._direct_completion(mock_context, diag)
 
-        create_args = mock_run.call_args_list[2][0][0]
+        create_args = mock_run.call_args_list[1][0][0]
         assert "feature/issue-55" in create_args
 
     def test_stage_and_commit_failure_returns_false(
@@ -10476,13 +10506,17 @@ class TestBuilderDirectCompletion:
         with (
             patch.object(builder, "_stage_and_commit", return_value=True),
             patch.object(builder, "_push_branch", return_value=True),
+            patch.object(
+                builder,
+                "_build_direct_completion_pr_body",
+                return_value="Closes #42\n\n## Test plan\n- [ ] Verify",
+            ),
             patch(
                 "loom_tools.shepherd.phases.builder.subprocess.run"
             ) as mock_run,
         ):
-            # gh pr list, git diff --stat, gh pr create
+            # gh pr list, gh pr create
             mock_run.side_effect = [
-                MagicMock(returncode=0, stdout="", stderr=""),
                 MagicMock(returncode=0, stdout="", stderr=""),
                 MagicMock(returncode=0, stderr=""),
             ]
@@ -10523,6 +10557,64 @@ class TestBuilderDirectCompletion:
         checkpoint = read_checkpoint(worktree)
         assert checkpoint is not None
         assert checkpoint.stage == "pushed"
+
+
+class TestBuildDirectCompletionPrBody:
+    """Test _build_direct_completion_pr_body for recovery PR bodies."""
+
+    def test_includes_closing_reference_and_recovery_note(
+        self, mock_context: MagicMock
+    ) -> None:
+        """Body should include Closes #N and recovery note."""
+        builder = BuilderPhase()
+        mock_context.worktree_path = Path("/fake/worktree")
+        mock_context.repo_root = Path("/fake/repo")
+        mock_context.config = ShepherdConfig(issue=42)
+
+        with patch(
+            "loom_tools.shepherd.phases.builder.subprocess.run"
+        ) as mock_run:
+            # git diff --stat, git log --oneline
+            mock_run.side_effect = [
+                MagicMock(returncode=0, stdout="file.py | 2 +-\n", stderr=""),
+                MagicMock(
+                    returncode=0,
+                    stdout="abc1234 feat: add feature\n",
+                    stderr="",
+                ),
+            ]
+            body = builder._build_direct_completion_pr_body(mock_context)
+
+        assert "Closes #42" in body
+        assert "direct completion" in body
+        assert "## Changes" in body
+        assert "file.py | 2 +-" in body
+        assert "## Commits" in body
+        assert "abc1234 feat: add feature" in body
+        assert "## Test plan" in body
+
+    def test_no_diff_stats_omits_changes_section(
+        self, mock_context: MagicMock
+    ) -> None:
+        """When diff stat is empty, Changes section should be omitted."""
+        builder = BuilderPhase()
+        mock_context.worktree_path = Path("/fake/worktree")
+        mock_context.repo_root = Path("/fake/repo")
+        mock_context.config = ShepherdConfig(issue=42)
+
+        with patch(
+            "loom_tools.shepherd.phases.builder.subprocess.run"
+        ) as mock_run:
+            mock_run.side_effect = [
+                MagicMock(returncode=0, stdout="", stderr=""),
+                MagicMock(returncode=0, stdout="", stderr=""),
+            ]
+            body = builder._build_direct_completion_pr_body(mock_context)
+
+        assert "Closes #42" in body
+        assert "## Changes" not in body
+        assert "## Commits" not in body
+        assert "## Test plan" in body
 
 
 class TestBuilderStageAndCommit:

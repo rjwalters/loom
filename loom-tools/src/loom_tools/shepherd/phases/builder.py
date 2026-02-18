@@ -758,6 +758,14 @@ class BuilderPhase:
             # when only mechanical steps (push, create_pr, add label) remain.
             if self._direct_completion(ctx, diag):
                 log_success("Direct completion succeeded")
+                ctx.report_milestone(
+                    "heartbeat",
+                    action=(
+                        f"direct completion: finished builder's git workflow "
+                        f"for issue #{ctx.config.issue} "
+                        f"(steps={self._diagnose_remaining_steps(diag, ctx.config.issue)})"
+                    ),
+                )
                 continue  # Re-validate
 
             if completion_attempts >= max_completion_attempts:
@@ -4031,25 +4039,7 @@ class BuilderPhase:
                         f"for branch {branch}, skipping creation"
                     )
                     continue
-                # Build structured PR body with Summary and Changes
-                diff_stat_result = subprocess.run(
-                    ["git", "diff", "--stat", "origin/main...HEAD"],
-                    cwd=ctx.worktree_path or ctx.repo_root,
-                    capture_output=True,
-                    text=True,
-                    check=False,
-                )
-                diff_stat = diff_stat_result.stdout.strip()
-                pr_body_parts = [
-                    "## Summary",
-                    ctx.issue_title or f"Issue #{ctx.config.issue}",
-                    "",
-                    "## Changes",
-                    f"```\n{diff_stat}\n```" if diff_stat else "_No file changes detected._",
-                    "",
-                    f"Closes #{ctx.config.issue}",
-                ]
-                pr_body = "\n".join(pr_body_parts)
+                pr_body = self._build_direct_completion_pr_body(ctx)
                 result = subprocess.run(
                     [
                         "gh",
@@ -4110,6 +4100,63 @@ class BuilderPhase:
                 log_success(f"Direct completion: added loom:review-requested to PR #{pr_num}")
 
         return True
+
+    def _build_direct_completion_pr_body(
+        self, ctx: ShepherdContext
+    ) -> str:
+        """Build a descriptive PR body for direct-completion PRs.
+
+        Gathers diff stats and commit log from the worktree to provide
+        reviewers with context, since the builder did not create the PR
+        itself.  Matches the quality of validate_phase.py's recovery PR
+        body.  See issue #2775.
+        """
+        wt = str(ctx.worktree_path or ctx.repo_root)
+        lines: list[str] = []
+
+        lines.append(f"Closes #{ctx.config.issue}")
+        lines.append("")
+        lines.append(
+            "> **Note:** Builder completed changes but exited before "
+            "creating a PR. PR created via direct completion."
+        )
+        lines.append("")
+
+        # Diff stats (committed changes vs default branch)
+        diff_stat_result = subprocess.run(
+            ["git", "-C", wt, "diff", "--stat", "origin/main...HEAD"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        diff_stat = diff_stat_result.stdout.strip()
+        if diff_stat:
+            lines.append("## Changes")
+            lines.append("")
+            lines.append(f"```\n{diff_stat}\n```")
+            lines.append("")
+
+        # Commit log
+        log_result = subprocess.run(
+            ["git", "-C", wt, "log", "--oneline", "origin/main..HEAD"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if log_result.returncode == 0 and log_result.stdout.strip():
+            commits = log_result.stdout.strip().splitlines()
+            lines.append("## Commits")
+            lines.append("")
+            for commit in commits:
+                lines.append(f"- `{commit}`")
+            lines.append("")
+
+        lines.append("## Test plan")
+        lines.append("")
+        lines.append("- [ ] Verify changes match issue requirements")
+        lines.append("- [ ] Confirm tests pass")
+
+        return "\n".join(lines)
 
     def _run_completion_phase(
         self,
