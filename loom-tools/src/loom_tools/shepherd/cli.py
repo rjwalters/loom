@@ -2190,6 +2190,15 @@ def main(argv: list[str] | None = None) -> int:
     if not _check_main_repo_clean(repo_root, args.allow_dirty_main):
         return ShepherdExitCode.NEEDS_INTERVENTION
 
+    # Pre-claim check: skip orchestration if the issue is already closed.
+    # This avoids the unnecessary claim/release cycle for closed issues.
+    from loom_tools.common.github import gh_issue_view
+
+    meta = gh_issue_view(config.issue, fields=["state"], cwd=repo_root)
+    if meta and meta.get("state", "").upper() != "OPEN":
+        log_info(f"Issue #{config.issue} is already {meta['state']} - no orchestration needed")
+        return ShepherdExitCode.SKIPPED
+
     # Acquire file-based claim to prevent concurrent shepherds on the same issue.
     # Uses atomic mkdir for mutual exclusion. TTL of 2 hours covers long runs.
     from loom_tools.claim import claim_issue, release_claim
