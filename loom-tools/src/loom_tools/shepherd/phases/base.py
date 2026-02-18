@@ -130,6 +130,15 @@ DEGRADED_SESSION_PATTERNS = [
     re.compile(r"Crystallizing", re.IGNORECASE),
 ]
 
+# "Stop and wait for limit to reset" — the Claude CLI's interactive rate
+# limit modal.  In automated sessions this blocks forever (no user to press
+# Enter).  This is a definitive rate limit signal that classifies as degraded
+# independently of Crystallizing patterns.  The \s* allows for ANSI-stripped
+# output where spaces may be missing.  See issue #2781.
+DEGRADED_STOP_AND_WAIT_PATTERN = re.compile(
+    r"Stop\s*and\s*wait\s*for\s*limit\s*to\s*reset", re.IGNORECASE
+)
+
 # Minimum number of "Crystallizing" occurrences in the last N lines
 # to classify a session as degraded (a single occurrence during normal
 # thinking is not concerning).
@@ -882,25 +891,19 @@ def _is_ghost_session(
 
 
 def _is_degraded_session(log_path: Path) -> bool:
-    """Check if a session log indicates a degraded session (rate limits, Crystallizing loops).
+    """Check if a session log indicates a degraded session due to rate limits.
 
     A degraded session is one where the builder ran but produced no useful work
-    because it was resource-constrained.  This manifests as:
-    - Rate limit warnings ("You've used 87% of your weekly limit")
-    - Repeated "Crystallizing..." output (Claude's extended thinking under pressure)
+    because it was resource-constrained.  This manifests as either:
 
-    Degraded sessions are distinct from low-output sessions (which never started)
-    and stuck sessions (which started but stopped making progress).  A degraded
-    session actively produces output but the output is non-productive.
+    Path A — "Stop and wait" modal (standalone, see issue #2781):
+      The CLI shows an interactive rate limit prompt that blocks forever in
+      automated sessions.  This is a definitive rate limit signal.
 
-    Detection requires BOTH:
-    1. A rate limit warning in the log, AND
-    2. Excessive "Crystallizing" repetitions (>= DEGRADED_CRYSTALLIZING_THRESHOLD)
-
-    This two-signal approach prevents false positives: a single rate limit warning
-    during an otherwise productive session is harmless, and brief "Crystallizing"
-    during normal thinking is expected.  The combination indicates the session has
-    entered a non-recoverable degraded state.  See issue #2631.
+    Path B — Rate limit warning + Crystallizing loop (see issue #2631):
+      Rate limit warnings ("You've used 87% of your weekly limit") combined
+      with repeated "Crystallizing..." output.  Requires BOTH signals to
+      prevent false positives.
 
     Args:
         log_path: Path to the worker session log file.
@@ -918,12 +921,21 @@ def _is_degraded_session(log_path: Path) -> bool:
         if not cli_output:
             return False
 
-        # Signal 1: Rate limit warning present
+        # Path A: "Stop and wait for limit to reset" modal (definitive,
+        # standalone).  The CLI is blocked waiting for user input that will
+        # never come in an automated session.  See issue #2781.
+        if DEGRADED_STOP_AND_WAIT_PATTERN.search(cli_output):
+            return True
+
+        # Path B: Rate limit warning + Crystallizing (two-signal detection).
+        # A single rate limit warning during an otherwise productive session
+        # is harmless, and brief "Crystallizing" during normal thinking is
+        # expected.  The combination indicates a non-recoverable degraded
+        # state.  See issue #2631.
         has_rate_limit = bool(DEGRADED_SESSION_PATTERNS[0].search(cli_output))
         if not has_rate_limit:
             return False
 
-        # Signal 2: Excessive Crystallizing repetitions
         lines = cli_output.splitlines()
         tail = lines[-DEGRADED_SCAN_TAIL_LINES:]
         crystallizing_count = sum(
@@ -942,8 +954,9 @@ def _scan_log_for_degradation(log_path: Path) -> bool:
     for in-flight polling during ``run_worker_phase()``.  It reads only the
     tail of the file to minimize I/O overhead.
 
-    Returns True if the log shows both rate limit warnings and excessive
-    "Crystallizing" repetitions.  See issue #2631.
+    Returns True if the log shows the "Stop and wait" rate limit modal
+    (standalone) or both rate limit warnings and excessive "Crystallizing"
+    repetitions.  See issues #2631, #2781.
     """
     if not log_path.is_file():
         return False
@@ -963,6 +976,11 @@ def _scan_log_for_degradation(log_path: Path) -> bool:
         tail = lines[-DEGRADED_SCAN_TAIL_LINES:]
         text = "\n".join(tail)
 
+        # Path A: "Stop and wait" modal (standalone).  See issue #2781.
+        if DEGRADED_STOP_AND_WAIT_PATTERN.search(text):
+            return True
+
+        # Path B: Rate limit warning + Crystallizing.  See issue #2631.
         has_rate_limit = bool(DEGRADED_SESSION_PATTERNS[0].search(text))
         if not has_rate_limit:
             return False
@@ -1288,7 +1306,7 @@ def run_worker_phase(
         - 8: Planning stall detected (stuck in planning checkpoint)
         - 9: Auth pre-flight failure (not retryable, see issue #2508)
         - 10: Ghost session detected (instant exit, no work — see issue #2604)
-        - 11: Degraded session detected (rate limits + Crystallizing loop, see issue #2631)
+        - 11: Degraded session detected (rate limits, see issues #2631, #2781)
         - Other: Error
     """
     # Use unique session name per retry attempt to prevent tmux state
@@ -1428,9 +1446,9 @@ def run_worker_phase(
     # If it stays there beyond planning_timeout, terminate the worker.
     _planning_first_seen: float | None = None
 
-    # Degraded session detection state (issue #2631).
-    # Periodically scan the log for rate limit + Crystallizing patterns
-    # and abort early rather than waiting for the full timeout.
+    # Degraded session detection state (issues #2631, #2781).
+    # Periodically scan the log for rate limit patterns and abort early
+    # rather than waiting for the full timeout.
     _last_degraded_scan: float = time.monotonic()
 
     while wait_proc.poll() is None:
@@ -1478,10 +1496,11 @@ def run_worker_phase(
                 # Checkpoint advanced past planning (or doesn't exist yet)
                 _planning_first_seen = None
 
-        # In-flight degraded session detection (issue #2631).
-        # Periodically scan the log for rate limit + Crystallizing patterns.
-        # Abort early to avoid wasting the entire builder time budget on a
-        # session that will never produce useful output.
+        # In-flight degraded session detection (issues #2631, #2781).
+        # Periodically scan the log for rate limit patterns (Crystallizing
+        # loop or "Stop and wait" modal).  Abort early to avoid wasting the
+        # entire builder time budget on a session that will never produce
+        # useful output.
         degraded_elapsed = time.monotonic() - _last_degraded_scan
         if degraded_elapsed >= _DEGRADED_SCAN_INTERVAL:
             _last_degraded_scan = time.monotonic()
@@ -1489,7 +1508,7 @@ def run_worker_phase(
             if _scan_log_for_degradation(degraded_log_path):
                 log_warning(
                     f"Degraded session detected: {role} session '{actual_name}' "
-                    f"shows rate limit warnings and Crystallizing loop, "
+                    f"shows rate limit indicators, "
                     f"terminating early (log: {degraded_log_path})"
                 )
                 wait_proc.terminate()
@@ -1612,18 +1631,19 @@ def run_worker_phase(
         log_warning(f"Post-mortem: {postmortem['summary']}")
         return 10
 
-    # Check for degraded session (exit code 11) — rate limits + Crystallizing.
-    # Degraded sessions produce output but it's non-productive garbage.
+    # Check for degraded session (exit code 11) — rate limit indicators.
+    # Degraded sessions produce output but it's non-productive garbage,
+    # or block forever on a rate limit modal prompt.
     # This is NOT retryable: the underlying resource constraint (rate limits)
     # will persist until the limit resets.  Check before MCP/low-output
     # because degraded sessions may have substantial output volume.
-    # See issue #2631.
+    # See issues #2631, #2781.
     if _is_degraded_session(log_path):
         if postmortem is not None:
             log_warning(f"Post-mortem: {postmortem['summary']}")
         log_warning(
             f"Degraded session detected for {role} session '{actual_name}': "
-            f"rate limit warnings and Crystallizing loop "
+            f"rate limit indicators detected "
             f"(exit code {wait_exit}, log: {log_path})"
         )
         return 11
@@ -1751,9 +1771,9 @@ def run_phase_with_retry(
 
         # --- Degraded session (exit code 11) ---
         # Not retryable: the builder session was degraded by rate limits
-        # and entered a Crystallizing loop.  The underlying rate limit
-        # won't resolve with retries — the daemon should back off or
-        # pick a different issue.  See issue #2631.
+        # (Crystallizing loop or "Stop and wait" modal).  The underlying
+        # rate limit won't resolve with retries — the daemon should back
+        # off or pick a different issue.  See issues #2631, #2781.
         if exit_code == 11:
             return 11
 
