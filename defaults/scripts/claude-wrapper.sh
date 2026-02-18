@@ -773,11 +773,13 @@ start_output_monitor() {
     local monitor_pid_file="$2"
 
     (
+        trap 'exit 0' TERM INT
         local last_size=0
         local error_detected_at=0
 
         while true; do
-            sleep 5
+            sleep 5 &
+            wait $! || exit 0
 
             # Exit if output file is gone (session ended)
             if [[ ! -f "${output_file}" ]]; then
@@ -875,11 +877,13 @@ start_startup_monitor() {
     local monitor_pid_file="$2"
 
     (
+        trap 'exit 0' TERM INT
         local check_interval=2
         local elapsed=0
 
         while [[ "${elapsed}" -lt "${STARTUP_MONITOR_WINDOW}" ]]; do
-            sleep "${check_interval}"
+            sleep "${check_interval}" &
+            wait $! || exit 0
             elapsed=$((elapsed + check_interval))
 
             # Exit if output file is gone (session ended)
@@ -952,7 +956,8 @@ start_startup_monitor() {
                     fi
 
                     # Sleep AFTER checking so the first iteration is instant
-                    sleep "${poll_interval}"
+                    sleep "${poll_interval}" &
+                    wait $! || exit 0
                     grace_elapsed=$((grace_elapsed + poll_interval))
                 done
 
