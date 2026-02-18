@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import io
+import tempfile
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
-from loom_tools.log_filter import clean_line, main
+from loom_tools.log_filter import clean_file, clean_line, is_tui_noise, main
 
 
 # ---------------------------------------------------------------------------
@@ -167,12 +169,238 @@ class TestCleanLine:
 
 
 # ---------------------------------------------------------------------------
+# TestIsTuiNoise — unit tests for is_tui_noise()
+# ---------------------------------------------------------------------------
+
+
+class TestIsTuiNoise:
+    """Unit tests for Claude Code TUI noise detection."""
+
+    # -- Spinner characters --
+
+    def test_pure_spinner_line(self) -> None:
+        assert is_tui_noise("\u2736") is True  # ✶
+
+    def test_multiple_spinners(self) -> None:
+        assert is_tui_noise("\u2736\u273b\u273d") is True  # ✶✻✽
+
+    def test_spinner_with_short_fragment(self) -> None:
+        """Spinner char + short fragment = redraw debris."""
+        assert is_tui_noise("\u2736ca") is True
+
+    # -- Animation words --
+
+    def test_animation_word_with_ellipsis(self) -> None:
+        assert is_tui_noise("Nucleating\u2026") is True
+
+    def test_animation_word_plain(self) -> None:
+        assert is_tui_noise("Pollinating") is True
+
+    def test_animation_word_with_timing(self) -> None:
+        assert is_tui_noise("Synthesizing\u2026 (2s)") is True
+
+    def test_spinner_plus_animation(self) -> None:
+        assert is_tui_noise("\u2736 Nucleating\u2026") is True
+
+    # -- Thinking indicators --
+
+    def test_thinking_simple(self) -> None:
+        assert is_tui_noise("(thinking)") is True
+
+    def test_thought_for_seconds(self) -> None:
+        assert is_tui_noise("(thought for 2s)") is True
+
+    def test_token_count_with_thinking(self) -> None:
+        assert is_tui_noise("(30s \u00b7 \u2193 760 tokens \u00b7 thinking)") is True
+
+    def test_token_count_without_thinking(self) -> None:
+        assert is_tui_noise("(5s \u00b7 \u2191 1.2k tokens)") is True
+
+    # -- Separator lines --
+
+    def test_thin_separator(self) -> None:
+        assert is_tui_noise("\u2500" * 20) is True  # ─
+
+    def test_thick_separator(self) -> None:
+        assert is_tui_noise("\u2501" * 20) is True  # ━
+
+    def test_short_separator_not_noise(self) -> None:
+        """Fewer than 4 separator chars with surrounding text is not a separator."""
+        assert is_tui_noise("a \u2500\u2500\u2500 b") is False
+
+    # -- Permission banners --
+
+    def test_permission_banner(self) -> None:
+        assert is_tui_noise("\u23f5\u23f5 bypass permissions on (shift+tab to cycle)") is True
+
+    # -- Prompt lines --
+
+    def test_empty_prompt(self) -> None:
+        assert is_tui_noise("\u276f") is True  # ❯
+
+    def test_prompt_with_suggestion(self) -> None:
+        assert is_tui_noise('\u276f Try "help"') is True
+
+    # -- Banner characters --
+
+    def test_banner_block_chars(self) -> None:
+        assert is_tui_noise("  \u2590\u259b\u259c\u258c\u259d\u2588  ") is True
+
+    def test_banner_with_product_name(self) -> None:
+        assert is_tui_noise("  \u2590\u2588 Claude Code") is True
+
+    # -- Status hints --
+
+    def test_esc_interrupt_hint(self) -> None:
+        assert is_tui_noise("some text \u00b7 esc to interrupt") is True
+
+    def test_ctrl_b_hint(self) -> None:
+        assert is_tui_noise("ctrl+b ctrl+b to exit") is True
+
+    # -- Short fragment debris --
+
+    def test_single_char_debris(self) -> None:
+        assert is_tui_noise("u") is True
+
+    def test_two_char_debris(self) -> None:
+        assert is_tui_noise("ca") is True
+
+    def test_five_char_debris(self) -> None:
+        assert is_tui_noise("eain\u2193") is True
+
+    def test_comment_line_preserved(self) -> None:
+        """Lines starting with # are not debris."""
+        assert is_tui_noise("# log") is False
+
+    def test_three_digit_number_preserved(self) -> None:
+        """3+ digit numbers from test output are preserved."""
+        assert is_tui_noise("364") is False
+
+    def test_single_digit_is_debris(self) -> None:
+        assert is_tui_noise("3") is True
+
+    # -- Real content not flagged --
+
+    def test_real_log_line(self) -> None:
+        assert is_tui_noise("[OK] Checkpoint saved: stage=planning") is False
+
+    def test_real_command(self) -> None:
+        assert is_tui_noise("git commit -m 'fix: resolve issue'") is False
+
+    def test_real_error(self) -> None:
+        assert is_tui_noise("Error: File not found: /tmp/foo") is False
+
+    def test_long_text_not_debris(self) -> None:
+        assert is_tui_noise("This is a real line of output") is False
+
+
+# ---------------------------------------------------------------------------
+# TestCleanFile — integration tests for clean_file()
+# ---------------------------------------------------------------------------
+
+
+class TestCleanFile:
+    """Integration tests for the file post-processing pipeline."""
+
+    @staticmethod
+    def _clean(content: str) -> str:
+        """Write content to a temp file, clean it, return result."""
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".log", delete=False) as f:
+            f.write(content)
+            f.flush()
+            path = f.name
+        try:
+            return clean_file(path)
+        finally:
+            Path(path).unlink(missing_ok=True)
+
+    def test_plain_text_passthrough(self) -> None:
+        result = self._clean("[OK] Checkpoint saved\ngit commit -m 'fix'\n")
+        assert result == "[OK] Checkpoint saved\ngit commit -m 'fix'\n"
+
+    def test_ansi_stripped(self) -> None:
+        """ANSI sequences are stripped before pattern matching."""
+        result = self._clean("\x1b[32m\u2736 Nucleating\u2026\x1b[0m\n")
+        assert result == ""
+
+    def test_ansi_on_real_content(self) -> None:
+        """ANSI on real content is stripped, content preserved."""
+        result = self._clean("\x1b[31mError: something failed\x1b[0m\n")
+        assert result == "Error: something failed\n"
+
+    def test_spinner_lines_removed(self) -> None:
+        result = self._clean("\u2736\n\u273b\n\u273d\nreal content\n")
+        assert result == "real content\n"
+
+    def test_animation_lines_removed(self) -> None:
+        result = self._clean("Nucleating\u2026\nPollinating\u2026\nreal content\n")
+        assert result == "real content\n"
+
+    def test_thinking_lines_removed(self) -> None:
+        result = self._clean("(thinking)\n(thought for 2s)\nreal content\n")
+        assert result == "real content\n"
+
+    def test_separator_lines_removed(self) -> None:
+        content = "\u2500" * 40 + "\nreal content\n"
+        result = self._clean(content)
+        assert result == "real content\n"
+
+    def test_blank_run_collapsing(self) -> None:
+        """Multiple blank/noise lines collapse to a single separator."""
+        content = "line one\n\n\n\nline two\n"
+        result = self._clean(content)
+        assert result == "line one\n\nline two\n"
+
+    def test_leading_spinner_stripped_from_content(self) -> None:
+        """Leading spinner chars are stripped from real content lines."""
+        result = self._clean("\u2736 [OK] Checkpoint saved\n")
+        assert result == " [OK] Checkpoint saved\n"
+
+    def test_mixed_noise_and_content(self) -> None:
+        """End-to-end: noise interspersed with real content."""
+        content = (
+            "\u2736\n"
+            "Nucleating\u2026\n"
+            "(thinking)\n"
+            "[OK] Checkpoint saved: stage=planning\n"
+            "\u2500" * 40 + "\n"
+            "\n"
+            "Pollinating\u2026\n"
+            "git commit -m 'fix: resolve issue'\n"
+        )
+        result = self._clean(content)
+        lines = result.strip().split("\n")
+        assert "[OK] Checkpoint saved: stage=planning" in lines[0]
+        assert "git commit -m 'fix: resolve issue'" in lines[-1]
+
+    def test_empty_file(self) -> None:
+        result = self._clean("")
+        assert result == ""
+
+    def test_permission_banner_removed(self) -> None:
+        content = "\u23f5\u23f5 bypass permissions on (shift+tab to cycle)\nreal content here\n"
+        result = self._clean(content)
+        assert result == "real content here\n"
+
+    def test_prompt_lines_removed(self) -> None:
+        content = "\u276f\nreal content\n"
+        result = self._clean(content)
+        assert result == "real content\n"
+
+    def test_real_log_with_embedded_ansi(self) -> None:
+        """Regression: ANSI-wrapped spinner should be detected after stripping."""
+        content = "\x1b[32m\u2736\x1b[0m Nucleating\u2026\n"
+        result = self._clean(content)
+        assert result == ""
+
+
+# ---------------------------------------------------------------------------
 # TestMain — integration tests for main()
 # ---------------------------------------------------------------------------
 
 
 class TestMain:
-    """Integration tests for the stdin→stdout main() pipeline."""
+    """Integration tests for the stdin->stdout main() pipeline."""
 
     @staticmethod
     def _run_main(input_text: str) -> str:
