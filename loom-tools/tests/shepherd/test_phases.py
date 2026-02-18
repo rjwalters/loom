@@ -43,6 +43,7 @@ from loom_tools.shepherd.phases.base import (
     _RATE_LIMIT_SENTINEL,
     _classify_ghost_cause,
     _classify_low_output_cause,
+    _extract_thinking_snippet,
     _is_auth_failure,
     _is_ghost_session,
     _is_rate_limit_abort,
@@ -1057,6 +1058,118 @@ class TestBuilderPhase:
         assert "stall" in result.message.lower()
         assert result.data.get("planning_stall") is True
         assert result.data.get("planning_timeout") == 600
+
+    def test_thinking_stall_returns_failed_with_snippet(
+        self, mock_context: MagicMock, tmp_path: Path
+    ) -> None:
+        """Builder exit code 14 should return FAILED with thinking_snippet in data.
+
+        When the builder session hits a thinking stall (extended thinking with
+        zero tool calls), the shepherd should capture the tail of the builder
+        log and include it in the PhaseResult data for diagnostic purposes.
+        See issue #2855.
+        """
+        mock_context.check_shutdown.return_value = False
+        mock_context.config.planning_timeout = 600
+        mock_context.repo_root = tmp_path
+        wt_mock = MagicMock()
+        wt_mock.is_dir.return_value = True
+        wt_mock.__bool__ = lambda self: True
+        mock_context.worktree_path = wt_mock
+
+        # Create a builder log with simulated thinking output
+        log_dir = tmp_path / ".loom" / "logs"
+        log_dir.mkdir(parents=True)
+        log_file = log_dir / "loom-builder-issue-42.log"
+        thinking_content = (
+            "# CLAUDE_CLI_START\n"
+            + "Embellishing…\n" * 30
+            + "Moseying…\n" * 20
+        )
+        log_file.write_text(thinking_content)
+
+        builder = BuilderPhase()
+
+        with (
+            patch(
+                "loom_tools.shepherd.phases.builder.get_pr_for_issue", return_value=None
+            ),
+            patch("loom_tools.shepherd.phases.builder.transition_issue_labels"),
+            patch(
+                "loom_tools.shepherd.phases.builder.run_phase_with_retry",
+                return_value=14,
+            ),
+            patch.object(builder, "_cleanup_stale_worktree"),
+            patch.object(builder, "_create_worktree_marker"),
+        ):
+            result = builder.run(mock_context)
+
+        assert result.status == PhaseStatus.FAILED
+        assert "thinking stall" in result.message
+        assert result.data.get("thinking_stall") is True
+        assert "thinking_snippet" in result.data
+        # Snippet should contain the tail of the thinking output
+        snippet = result.data["thinking_snippet"]
+        assert isinstance(snippet, str)
+        assert len(snippet) > 0
+        assert "Moseying" in snippet
+
+
+class TestExtractThinkingSnippet:
+    """Unit tests for _extract_thinking_snippet helper."""
+
+    def test_returns_empty_for_missing_file(self, tmp_path: Path) -> None:
+        """Should return empty string when log file does not exist."""
+        result = _extract_thinking_snippet(tmp_path / "nonexistent.log")
+        assert result == ""
+
+    def test_returns_empty_for_no_sentinel(self, tmp_path: Path) -> None:
+        """Should return empty string when log has no CLI start sentinel."""
+        log_file = tmp_path / "test.log"
+        log_file.write_text("some output\nbut no sentinel\n")
+        result = _extract_thinking_snippet(log_file)
+        assert result == ""
+
+    def test_extracts_tail_from_thinking_output(self, tmp_path: Path) -> None:
+        """Should extract tail of CLI output after the sentinel."""
+        log_file = tmp_path / "test.log"
+        log_file.write_text(
+            "# log header\n"
+            "# CLAUDE_CLI_START\n"
+            + "Embellishing…\n" * 50
+            + "Moseying…\n" * 10
+        )
+        result = _extract_thinking_snippet(log_file, max_chars=200)
+        assert isinstance(result, str)
+        assert len(result) <= 200
+        assert "Moseying" in result
+
+    def test_respects_max_chars(self, tmp_path: Path) -> None:
+        """Should not return more than max_chars characters."""
+        log_file = tmp_path / "test.log"
+        long_content = "# CLAUDE_CLI_START\n" + "X" * 2000 + "\n"
+        log_file.write_text(long_content)
+        result = _extract_thinking_snippet(log_file, max_chars=100)
+        assert len(result) <= 100
+
+    def test_strips_ansi_codes(self, tmp_path: Path) -> None:
+        """Should strip ANSI escape codes from log content."""
+        log_file = tmp_path / "test.log"
+        # Write content with ANSI colour codes
+        log_file.write_text(
+            "# CLAUDE_CLI_START\n"
+            "\x1b[32mEmbellishing…\x1b[0m\n" * 10
+        )
+        result = _extract_thinking_snippet(log_file)
+        assert "\x1b" not in result
+        assert "Embellishing" in result
+
+    def test_returns_empty_for_empty_cli_output(self, tmp_path: Path) -> None:
+        """Should return empty string when there is no CLI output after sentinel."""
+        log_file = tmp_path / "test.log"
+        log_file.write_text("# CLAUDE_CLI_START\n# only header lines\n")
+        result = _extract_thinking_snippet(log_file)
+        assert result == ""
 
 
 class TestBuilderDiagnostics:
