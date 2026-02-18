@@ -259,7 +259,9 @@ def _is_loom_runtime(porcelain_line: str) -> bool:
     return path.startswith(".loom/") or path.startswith(".loom-")
 
 
-def _check_main_repo_clean(repo_root: Path, allow_dirty: bool) -> bool:
+def _check_main_repo_clean(
+    repo_root: Path, allow_dirty: bool, allow_dirty_reason: str = "--allow-dirty-main specified"
+) -> bool:
     """Check if main repository has uncommitted changes and warn.
 
     When running from a worktree, test results can differ between:
@@ -273,6 +275,7 @@ def _check_main_repo_clean(repo_root: Path, allow_dirty: bool) -> bool:
     Args:
         repo_root: The resolved repository root path
         allow_dirty: If True, only warn but don't block
+        allow_dirty_reason: Human-readable explanation of why dirty main is allowed
 
     Returns:
         True if clean or allowed to proceed, False if dirty and should block
@@ -295,7 +298,7 @@ def _check_main_repo_clean(repo_root: Path, allow_dirty: bool) -> bool:
     print(file=sys.stderr)
 
     if allow_dirty:
-        log_warning("Proceeding anyway (--allow-dirty-main specified)")
+        log_warning(f"Proceeding anyway ({allow_dirty_reason})")
         print(file=sys.stderr)
         return True
 
@@ -2311,13 +2314,17 @@ def main(argv: list[str] | None = None) -> int:
     # --force / --merge implies --allow-dirty-main: the user wants fully
     # autonomous operation and the builder works in an isolated worktree,
     # so uncommitted main changes shouldn't block.
+    dirty_implied_by_force = args.force and not args.allow_dirty_main
     if args.force:
         args.allow_dirty_main = True
 
     # Pre-flight check: warn if main repo has uncommitted changes.
     # This prevents confusion when tests pass in main but fail in worktrees
     # (or vice versa) due to uncommitted local changes.
-    if not _check_main_repo_clean(repo_root, args.allow_dirty_main):
+    allow_dirty_reason = (
+        "implied by --merge" if dirty_implied_by_force else "--allow-dirty-main specified"
+    )
+    if not _check_main_repo_clean(repo_root, args.allow_dirty_main, allow_dirty_reason):
         return ShepherdExitCode.NEEDS_INTERVENTION
 
     # Pre-claim check: skip orchestration if the issue is already closed.
