@@ -1,9 +1,10 @@
-"""Tests for builder worktree escape and wrong-issue detection (issue #2630).
+"""Tests for builder worktree escape and wrong-issue detection (issues #2630, #2751).
 
 Tests the early detection of:
 1. Builder escaping worktree and modifying main instead
 2. Builder commits referencing a different issue number
 3. Pre-flight worktree anchor verification
+4. Escape retry with main cleanup (issue #2751)
 """
 
 from __future__ import annotations
@@ -303,3 +304,113 @@ class TestDetectWorktreeEscape:
 
         assert result is not None
         assert "3 new dirty file(s)" in result.message
+
+
+class TestRevertEscapedMainFiles:
+    """Test _revert_escaped_main_files cleanup (issue #2751)."""
+
+    def test_no_dirty_files_is_noop(self, mock_context: MagicMock) -> None:
+        """No git commands run when there are no dirty files."""
+        builder = BuilderPhase()
+        builder._main_dirty_baseline = set()
+
+        with patch.object(
+            builder, "_get_new_main_dirty_files", return_value=[]
+        ) as mock_get, patch(
+            "loom_tools.shepherd.phases.builder.subprocess.run",
+        ) as mock_run:
+            builder._revert_escaped_main_files(mock_context)
+
+        mock_get.assert_called_once()
+        mock_run.assert_not_called()
+
+    def test_reverts_tracked_files(self, mock_context: MagicMock) -> None:
+        """Tracked dirty files are reverted with git checkout."""
+        builder = BuilderPhase()
+        builder._main_dirty_baseline = set()
+
+        with patch.object(
+            builder,
+            "_get_new_main_dirty_files",
+            return_value=[" M src/changed.py", "M  src/staged.py"],
+        ), patch(
+            "loom_tools.shepherd.phases.builder.subprocess.run",
+        ) as mock_run:
+            builder._revert_escaped_main_files(mock_context)
+
+        # Should call git checkout for tracked files
+        calls = mock_run.call_args_list
+        assert len(calls) == 1
+        cmd = calls[0][0][0]
+        assert cmd[:4] == ["git", "-C", str(mock_context.repo_root), "checkout"]
+        assert "--" in cmd
+
+    def test_removes_untracked_files(self, mock_context: MagicMock) -> None:
+        """Untracked files are removed with git clean."""
+        builder = BuilderPhase()
+        builder._main_dirty_baseline = set()
+
+        with patch.object(
+            builder,
+            "_get_new_main_dirty_files",
+            return_value=["?? new_file.py", "?? another.py"],
+        ), patch(
+            "loom_tools.shepherd.phases.builder.subprocess.run",
+        ) as mock_run:
+            builder._revert_escaped_main_files(mock_context)
+
+        # Should call git clean for each untracked file
+        calls = mock_run.call_args_list
+        assert len(calls) == 2
+        for call in calls:
+            cmd = call[0][0]
+            assert "clean" in cmd
+
+    def test_handles_mixed_tracked_and_untracked(
+        self, mock_context: MagicMock
+    ) -> None:
+        """Mixed tracked and untracked files are handled separately."""
+        builder = BuilderPhase()
+        builder._main_dirty_baseline = set()
+
+        with patch.object(
+            builder,
+            "_get_new_main_dirty_files",
+            return_value=[" M tracked.py", "?? untracked.py"],
+        ), patch(
+            "loom_tools.shepherd.phases.builder.subprocess.run",
+        ) as mock_run:
+            builder._revert_escaped_main_files(mock_context)
+
+        # 1 checkout call + 1 clean call
+        calls = mock_run.call_args_list
+        assert len(calls) == 2
+
+
+class TestEscapeRetryConfig:
+    """Test escape_max_retries configuration (issue #2751)."""
+
+    def test_default_escape_max_retries(self) -> None:
+        """Default escape_max_retries is 1."""
+        config = ShepherdConfig(issue=42)
+        assert config.escape_max_retries == 1
+
+    def test_env_override_escape_max_retries(self) -> None:
+        """escape_max_retries respects LOOM_ESCAPE_MAX_RETRIES env var."""
+        import os
+
+        old = os.environ.get("LOOM_ESCAPE_MAX_RETRIES")
+        try:
+            os.environ["LOOM_ESCAPE_MAX_RETRIES"] = "3"
+            config = ShepherdConfig(issue=42)
+            assert config.escape_max_retries == 3
+        finally:
+            if old is None:
+                os.environ.pop("LOOM_ESCAPE_MAX_RETRIES", None)
+            else:
+                os.environ["LOOM_ESCAPE_MAX_RETRIES"] = old
+
+    def test_zero_disables_escape_retry(self) -> None:
+        """Setting escape_max_retries=0 disables escape retry."""
+        config = ShepherdConfig(issue=42, escape_max_retries=0)
+        assert config.escape_max_retries == 0
