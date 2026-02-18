@@ -1825,17 +1825,30 @@ def run_worker_phase(
             thinking_log_path = _session_log_path(ctx.repo_root, actual_name)
             if _scan_log_for_thinking_stall(thinking_log_path):
                 elapsed_s = int(time.monotonic() - phase_start)
-                thinking_snippet = _extract_thinking_snippet(thinking_log_path)
-                snippet_suffix = (
-                    f"\nBuilder thinking tail:\n{thinking_snippet}"
-                    if thinking_snippet
-                    else ""
-                )
-                log_warning(
-                    f"Thinking stall detected: {role} session '{actual_name}' "
-                    f"has produced output for {elapsed_s}s with zero tool calls, "
-                    f"terminating early (log: {thinking_log_path}){snippet_suffix}"
-                )
+                # Safety net: if the stall was caused by the weekly rate limit,
+                # the output monitor writes # RATE_LIMIT_ABORT before killing.
+                # Re-classify as rate limit abort (13) so the shepherd treats it
+                # as non-retryable infrastructure failure, not a thinking stall.
+                # See issue #2859.
+                is_rate_limit = _is_rate_limit_abort(thinking_log_path)
+                if is_rate_limit:
+                    log_warning(
+                        f"Rate limit abort detected during thinking stall for "
+                        f"{role} session '{actual_name}': weekly usage limit "
+                        f"exhausted (log: {thinking_log_path})"
+                    )
+                else:
+                    thinking_snippet = _extract_thinking_snippet(thinking_log_path)
+                    snippet_suffix = (
+                        f"\nBuilder thinking tail:\n{thinking_snippet}"
+                        if thinking_snippet
+                        else ""
+                    )
+                    log_warning(
+                        f"Thinking stall detected: {role} session '{actual_name}' "
+                        f"has produced output for {elapsed_s}s with zero tool calls, "
+                        f"terminating early (log: {thinking_log_path}){snippet_suffix}"
+                    )
                 wait_proc.terminate()
                 wait_proc.wait(timeout=30)
                 destroy_script = scripts_dir / "agent-destroy.sh"
@@ -1847,7 +1860,7 @@ def run_worker_phase(
                         stderr=subprocess.DEVNULL,
                         check=False,
                     )
-                return 14  # Thinking stall
+                return 13 if is_rate_limit else 14  # Rate limit abort or thinking stall
 
         time.sleep(_HEARTBEAT_POLL_INTERVAL)
 

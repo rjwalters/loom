@@ -18312,6 +18312,43 @@ class TestRunPhaseWithRetryThinkingStall:
         assert exit_code == 0
         assert call_count == 3
 
+    def test_rate_limit_abort_during_thinking_stall_not_retried(
+        self, mock_context: MagicMock
+    ) -> None:
+        """Thinking stall reclassified as rate limit abort (13) must not be retried.
+
+        When the weekly usage limit is exhausted, the output monitor detects
+        the banner and writes # RATE_LIMIT_ABORT.  The in-flight thinking stall
+        detector then re-classifies the exit as 13 (rate limit) instead of 14
+        (thinking stall).  Unlike exit 14, exit 13 is non-retryable — the limit
+        won't reset until the next week.  See issue #2859.
+        """
+        call_count = 0
+
+        def mock_run_worker(*args, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            return 13  # Rate limit abort (reclassified from thinking stall)
+
+        with (
+            patch(
+                "loom_tools.shepherd.phases.base.run_worker_phase",
+                side_effect=mock_run_worker,
+            ),
+            patch("time.sleep"),
+        ):
+            exit_code = run_phase_with_retry(
+                mock_context,
+                role="builder",
+                name="builder-issue-42",
+                timeout=600,
+                max_retries=2,
+                phase="builder",
+            )
+
+        assert exit_code == 13
+        assert call_count == 1  # No retries — rate limit abort is non-retryable
+
 
 class TestExtractTestFilePaths:
     """Test BuilderPhase._extract_test_file_paths."""
