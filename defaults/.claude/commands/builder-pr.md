@@ -392,6 +392,12 @@ Issue #2557
 Builder should generate descriptive PR titles instead of generic 'Issue #N'
 ```
 
+**WRONG (double prefix — issue title's own prefix copied and another prefix prepended):**
+```
+feat: bug: MCP status bar noise misclassifies builder failures as MCP failures
+fix: feat: add workspace snapshot caching for daemon state
+```
+
 **CORRECT (describes what the code change actually does):**
 ```
 fix: standardize timestamp format to ISO 8601 UTC across log scripts
@@ -400,6 +406,26 @@ refactor: rename instant-exit to low-output terminology
 docs: update troubleshooting guide for worktree cleanup
 fix: prevent duplicate label transitions in shepherd phase validator
 ```
+
+### Issue Title Prefix Mapping
+
+Issue titles sometimes use non-standard prefixes (like `bug:`) that are **not** valid conventional commit types. If you're tempted to use an issue title as inspiration for your PR title, be aware that you must strip and remap the issue prefix — never copy it verbatim.
+
+| Issue Title Prefix | Correct PR Prefix | Notes |
+|-------------------|-------------------|-------|
+| `bug:` | `fix:` | `bug:` is not a conventional commit type |
+| `feature:` | `feat:` | Abbreviate to `feat:` |
+| `feat:` | `feat:` | Already valid — but still rewrite the description |
+| `fix:` | `fix:` | Already valid — but still rewrite the description |
+| `docs:` | `docs:` | Already valid — but still rewrite the description |
+| `chore:` | `chore:` | Already valid — but still rewrite the description |
+
+**CRITICAL**: Never prepend a new prefix to a title that already has one. `feat: bug: MCP status bar...` is malformed. Instead:
+1. Strip the issue title prefix entirely
+2. Map to the correct conventional commit type using the table above
+3. Rewrite the summary to describe what your **code change does**, not what the issue says
+
+Remember: even if an issue title has a valid prefix, the PR title should describe your diff — not copy the issue title.
 
 ### Why This Matters
 
@@ -415,6 +441,7 @@ Before creating a PR, verify your title:
 - [ ] Describes what the PR **does**, not what issue it addresses
 - [ ] Does NOT contain generic phrases like "implement changes for", "address issue", or "implement feature from"
 - [ ] Does NOT reference an issue number in the title (issue references go in the PR body)
+- [ ] Does NOT contain double prefixes (e.g., `feat: bug:`, `fix: feat:`) — strip any prefix from the issue title before composing your own
 - [ ] Is under 70 characters
 - [ ] A reader can understand the change from the title alone without looking at the diff
 
