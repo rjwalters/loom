@@ -4182,12 +4182,14 @@ class TestPostFallbackFailureComment:
 class TestRecordFallbackFailure:
     """Test _record_fallback_failure helper (issue #2525)."""
 
+    @patch("loom_tools.shepherd.cli.get_pr_for_issue", return_value=None)
     @patch("loom_tools.common.systematic_failure.detect_systematic_failure", return_value=None)
     @patch("loom_tools.common.systematic_failure.record_blocked_reason")
     def test_records_auth_failure_class(
         self,
         mock_record: MagicMock,
         mock_detect: MagicMock,
+        mock_get_pr: MagicMock,
     ) -> None:
         """Should record auth_infrastructure_failure for systemic exit code."""
         ctx = MagicMock()
@@ -4205,12 +4207,14 @@ class TestRecordFallbackFailure:
         )
         mock_detect.assert_called_once_with(Path("/fake/repo"))
 
+    @patch("loom_tools.shepherd.cli.get_pr_for_issue", return_value=None)
     @patch("loom_tools.common.systematic_failure.detect_systematic_failure", return_value=None)
     @patch("loom_tools.common.systematic_failure.record_blocked_reason")
     def test_records_unknown_failure_class(
         self,
         mock_record: MagicMock,
         mock_detect: MagicMock,
+        mock_get_pr: MagicMock,
     ) -> None:
         """Should record builder_unknown_failure for non-systemic exit codes."""
         ctx = MagicMock()
@@ -4229,12 +4233,14 @@ class TestRecordFallbackFailure:
         )
         mock_detect.assert_called_once_with(Path("/fake/repo"))
 
+    @patch("loom_tools.shepherd.cli.get_pr_for_issue", return_value=None)
     @patch("loom_tools.common.systematic_failure.detect_systematic_failure", return_value=None)
     @patch("loom_tools.common.systematic_failure.record_blocked_reason")
     def test_unknown_failure_includes_postmortem(
         self,
         mock_record: MagicMock,
         mock_detect: MagicMock,
+        mock_get_pr: MagicMock,
     ) -> None:
         """Should include post-mortem summary in unknown failure details (issue #2766)."""
         ctx = MagicMock()
@@ -4251,12 +4257,14 @@ class TestRecordFallbackFailure:
         assert "post-mortem:" in details
         assert "CLI started but produced zero output" in details
 
+    @patch("loom_tools.shepherd.cli.get_pr_for_issue", return_value=None)
     @patch("loom_tools.common.systematic_failure.detect_systematic_failure", return_value=None)
     @patch("loom_tools.common.systematic_failure.record_blocked_reason")
     def test_records_worktree_escape_class(
         self,
         mock_record: MagicMock,
         mock_detect: MagicMock,
+        mock_get_pr: MagicMock,
     ) -> None:
         """Should record builder_worktree_escape for worktree escape exit code."""
         ctx = MagicMock()
@@ -4351,6 +4359,7 @@ class TestRecordFallbackFailure:
         # Should not raise
         _record_fallback_failure(ctx, ShepherdExitCode.BUILDER_FAILED)
 
+    @patch("loom_tools.shepherd.cli.get_pr_for_issue", return_value=None)
     @patch("subprocess.run")
     @patch("loom_tools.shepherd.cli.transition_issue_labels")
     @patch("loom_tools.common.systematic_failure.detect_systematic_failure")
@@ -4361,6 +4370,7 @@ class TestRecordFallbackFailure:
         mock_detect: MagicMock,
         mock_transition: MagicMock,
         mock_subprocess: MagicMock,
+        mock_get_pr: MagicMock,
     ) -> None:
         """Should escalate to loom:blocked when systematic failure detected (issue #2707)."""
         from loom_tools.models.daemon_state import SystematicFailure
