@@ -1071,6 +1071,165 @@ def _classify_ghost_cause(log_path: Path) -> str:
     return "unknown"
 
 
+def gather_zero_output_postmortem(
+    log_path: Path,
+    *,
+    wall_clock_seconds: float | None = None,
+    wait_exit_code: int | None = None,
+    sidecar_exit_code: int | None = None,
+) -> dict[str, Any]:
+    """Gather post-mortem diagnostics for a zero-output CLI session.
+
+    When a CLI session produces zero meaningful output, this function
+    collects all available diagnostic signals into a structured dict
+    for logging and failure classification.  This enables faster root-cause
+    analysis compared to manually inspecting log files.
+
+    Diagnostics gathered:
+    - Whether the CLI started (``CLAUDE_CLI_START`` sentinel presence)
+    - Pre-flight failure sentinels (auth, MCP)
+    - Wrapper and wait exit codes
+    - CLI lifetime estimate (time between first and last log timestamps)
+    - Rate limit indicators in the log
+    - Log errors (``[ERROR]`` lines)
+    - CLI output volume (chars after stripping UI chrome and spinners)
+    - Log tail (last 15 lines for context)
+
+    All operations are best-effort; OSError and parse failures are caught
+    and recorded as ``"unavailable"`` in the relevant field.
+
+    See issue #2766.
+
+    Args:
+        log_path: Path to the worker session log file.
+        wall_clock_seconds: Wall-clock elapsed time (seconds) from the
+            caller, if available.
+        wait_exit_code: Exit code from agent-wait-bg.sh.
+        sidecar_exit_code: Exit code from the wrapper sidecar file,
+            if it differed from ``wait_exit_code``.
+
+    Returns:
+        Dict with diagnostic fields.  Always includes a ``"summary"``
+        key with a human-readable one-line summary.
+    """
+    diag: dict[str, Any] = {}
+
+    # -- Exit codes --
+    diag["wait_exit_code"] = wait_exit_code
+    diag["sidecar_exit_code"] = sidecar_exit_code
+
+    # -- Wall-clock duration --
+    diag["wall_clock_seconds"] = (
+        round(wall_clock_seconds, 1) if wall_clock_seconds is not None else None
+    )
+
+    if not log_path.is_file():
+        diag["log_exists"] = False
+        diag["summary"] = (
+            f"no log file at {log_path} "
+            f"(wait_exit={wait_exit_code}, wall={wall_clock_seconds}s)"
+        )
+        return diag
+
+    diag["log_exists"] = True
+
+    try:
+        content = log_path.read_text()
+    except OSError as exc:
+        diag["log_read_error"] = str(exc)
+        diag["summary"] = f"failed to read log: {exc}"
+        return diag
+
+    stripped = strip_ansi(content)
+
+    # -- Sentinel detection --
+    diag["cli_started"] = _CLI_START_SENTINEL in stripped
+    diag["auth_preflight_failed"] = _AUTH_FAILURE_SENTINEL in stripped
+    diag["mcp_preflight_failed"] = _MCP_PREFLIGHT_SENTINEL in stripped
+
+    # -- CLI output analysis --
+    cli_output = _get_cli_output(stripped)
+    cleaned = _strip_ui_chrome(_strip_spinner_noise(cli_output))
+    diag["cli_output_chars"] = len(cli_output.strip())
+    diag["cli_output_chars_cleaned"] = len(cleaned.strip())
+
+    # -- CLI lifetime estimate from log timestamps --
+    # Parse timestamps like [2026-02-18T07:08:04Z] to estimate how long
+    # the CLI process ran.
+    _TS_RE = re.compile(r"\[(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z)\]")
+    timestamps = _TS_RE.findall(stripped)
+    if len(timestamps) >= 2:
+        try:
+            from datetime import datetime, timezone
+
+            first = datetime.fromisoformat(timestamps[0].replace("Z", "+00:00"))
+            last = datetime.fromisoformat(timestamps[-1].replace("Z", "+00:00"))
+            log_duration = (last - first).total_seconds()
+            diag["log_duration_seconds"] = log_duration
+            diag["cli_crashed_on_startup"] = log_duration < 5.0
+        except (ValueError, TypeError):
+            diag["log_duration_seconds"] = None
+            diag["cli_crashed_on_startup"] = None
+    else:
+        diag["log_duration_seconds"] = None
+        diag["cli_crashed_on_startup"] = None
+
+    # -- Rate limit indicators --
+    rate_limit_patterns = [
+        re.compile(r"You've used \d+% of your weekly limit", re.IGNORECASE),
+        re.compile(r"Stop and wait for limit to reset", re.IGNORECASE),
+        re.compile(r"rate limit", re.IGNORECASE),
+        re.compile(r"429", re.IGNORECASE),
+    ]
+    rate_limit_hits = [
+        p.pattern for p in rate_limit_patterns if p.search(cli_output)
+    ]
+    diag["rate_limit_indicators"] = rate_limit_hits
+    diag["has_rate_limit"] = bool(rate_limit_hits)
+
+    # -- Log errors --
+    diag["log_errors"] = extract_log_errors(log_path)
+
+    # -- Log tail --
+    lines = content.splitlines()
+    diag["log_tail"] = lines[-15:] if len(lines) > 15 else lines
+
+    # -- Human-readable summary --
+    parts: list[str] = []
+    if not diag["cli_started"]:
+        parts.append("CLI never started (no CLAUDE_CLI_START sentinel)")
+    elif diag["cli_output_chars_cleaned"] == 0:
+        parts.append("CLI started but produced zero output")
+    else:
+        parts.append(f"CLI output: {diag['cli_output_chars_cleaned']} chars (cleaned)")
+
+    if diag["auth_preflight_failed"]:
+        parts.append("auth pre-flight FAILED")
+    if diag["mcp_preflight_failed"]:
+        parts.append("MCP pre-flight FAILED")
+    if diag["has_rate_limit"]:
+        parts.append("rate limit detected")
+
+    if diag["log_duration_seconds"] is not None:
+        parts.append(f"log duration: {diag['log_duration_seconds']:.0f}s")
+    if wall_clock_seconds is not None:
+        parts.append(f"wall: {wall_clock_seconds:.0f}s")
+
+    exit_info = []
+    if wait_exit_code is not None:
+        exit_info.append(f"wait={wait_exit_code}")
+    if sidecar_exit_code is not None:
+        exit_info.append(f"sidecar={sidecar_exit_code}")
+    if exit_info:
+        parts.append(f"exit({', '.join(exit_info)})")
+
+    if diag["log_errors"]:
+        parts.append(f"last error: {diag['log_errors'][-1]}")
+
+    diag["summary"] = "; ".join(parts)
+    return diag
+
+
 def run_worker_phase(
     ctx: ShepherdContext,
     *,
@@ -1350,6 +1509,7 @@ def run_worker_phase(
     # wrapper's actual exit code is lost.  The sidecar file preserves it
     # so failure classifiers below can fire correctly.  See issue #2737.
     exit_code_file = ctx.repo_root / ".loom" / "exit-codes" / f"{actual_name}.exit"
+    sidecar_exit: int | None = None
     try:
         if exit_code_file.exists():
             sidecar_exit = int(exit_code_file.read_text().strip())
@@ -1393,16 +1553,35 @@ def run_worker_phase(
     # an attempt suffix for retry isolation).  See issue #2639.
     log_path = _session_log_path(ctx.repo_root, actual_name)
 
+    # Gather post-mortem diagnostics once for all zero-output failure paths.
+    # This is cheap (single file read + pattern matching) and provides
+    # structured diagnostic data for logging and failure classification.
+    # Only gathered on non-zero exits to avoid overhead on success.
+    # See issue #2766.
+    postmortem: dict[str, Any] | None = None
+    if wait_exit != 0:
+        postmortem = gather_zero_output_postmortem(
+            log_path,
+            wall_clock_seconds=elapsed,
+            wait_exit_code=wait_exit,
+            sidecar_exit_code=sidecar_exit,
+        )
+        # Stash on context so callers (builder._gather_diagnostics,
+        # cli._record_fallback_failure) can access it.  See issue #2766.
+        ctx.last_postmortem = postmortem
+
     # Check for auth pre-flight failure first (exit code 9).  Auth failures
     # are NOT transient when a parent Claude session holds the config lock,
     # so retrying is futile.  See issue #2508.
     # Only reclassify non-zero exits — a successful process (exit 0) should
     # never be overridden by log pattern matching.  See issue #2540.
     if wait_exit != 0 and _is_auth_failure(log_path):
+        assert postmortem is not None
         log_warning(
             f"Auth pre-flight failure for {role} session '{actual_name}': "
             f"authentication check failed (not retryable, log: {log_path})"
         )
+        log_warning(f"Post-mortem: {postmortem['summary']}")
         return 9
 
     # Check for ghost session (exit code 10) — no meaningful work produced.
@@ -1411,15 +1590,14 @@ def run_worker_phase(
     # budget.  Check before MCP/low-output to avoid consuming their retry
     # budgets.  See issues #2604, #2644, #2659.
     if wait_exit != 0 and _is_ghost_session(log_path, wall_clock_duration=elapsed):
-        errors = extract_log_errors(log_path)
+        assert postmortem is not None
         cause = _classify_ghost_cause(log_path)
-        detail = f": {errors[-1]}" if errors else ""
         log_warning(
             f"Ghost session detected for {role} session '{actual_name}' "
-            f"(cause: {cause}{detail}, "
-            f"{elapsed:.1f}s wall-clock, "
+            f"(cause: {cause}, {elapsed:.1f}s wall-clock, "
             f"exit code {wait_exit}, log: {log_path})"
         )
+        log_warning(f"Post-mortem: {postmortem['summary']}")
         return 10
 
     # Check for degraded session (exit code 11) — rate limits + Crystallizing.
@@ -1429,6 +1607,8 @@ def run_worker_phase(
     # because degraded sessions may have substantial output volume.
     # See issue #2631.
     if _is_degraded_session(log_path):
+        if postmortem is not None:
+            log_warning(f"Post-mortem: {postmortem['summary']}")
         log_warning(
             f"Degraded session detected for {role} session '{actual_name}': "
             f"rate limit warnings and Crystallizing loop "
@@ -1446,20 +1626,29 @@ def run_worker_phase(
     # low output volume, so productive sessions aren't misclassified.
     # See issue #2767.
     if _is_mcp_failure(log_path):
-        errors = extract_log_errors(log_path)
-        cause = f": {errors[-1]}" if errors else ""
+        # Gather postmortem lazily for exit-0 MCP failures (postmortem is
+        # only pre-gathered for non-zero exits above).  See issue #2766.
+        if postmortem is None:
+            postmortem = gather_zero_output_postmortem(
+                log_path,
+                wall_clock_seconds=elapsed,
+                wait_exit_code=wait_exit,
+                sidecar_exit_code=sidecar_exit,
+            )
+            ctx.last_postmortem = postmortem
         log_warning(
-            f"MCP server failure detected for {role} session '{actual_name}'{cause} "
+            f"MCP server failure detected for {role} session '{actual_name}' "
             f"(exit code {wait_exit}, log: {log_path})"
         )
+        log_warning(f"Post-mortem: {postmortem['summary']}")
         return 7
     if wait_exit != 0 and _is_low_output_session(log_path):
-        errors = extract_log_errors(log_path)
-        cause = f": {errors[-1]}" if errors else ""
+        assert postmortem is not None
         log_warning(
-            f"Low output detected for {role} session '{actual_name}'{cause} "
+            f"Low output detected for {role} session '{actual_name}' "
             f"(exit code {wait_exit}, log: {log_path})"
         )
+        log_warning(f"Post-mortem: {postmortem['summary']}")
         return 6
 
     return wait_exit

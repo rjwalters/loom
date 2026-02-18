@@ -3297,6 +3297,12 @@ class BuilderPhase:
         # without having to cross-reference the retry log.  See issue #2562.
         diag["low_output_cause"] = ctx.last_low_output_cause
 
+        # -- Post-mortem diagnostics (set by run_worker_phase on failure) ---
+        # Provides structured zero-output analysis (exit codes, CLI lifetime,
+        # rate limit detection, sentinel status).  See issue #2766.
+        if ctx.last_postmortem is not None:
+            diag["postmortem"] = ctx.last_postmortem
+
         # -- Worktree state --------------------------------------------------
         wt = ctx.worktree_path
         diag["worktree_exists"] = bool(wt and wt.is_dir())

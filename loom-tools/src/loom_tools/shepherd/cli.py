@@ -2052,7 +2052,14 @@ def _record_fallback_failure(ctx: ShepherdContext, exit_code: int) -> None:
         details = "Builder escaped worktree and modified main instead (fallback cleanup)"
     else:
         error_class = "builder_unknown_failure"
-        details = f"Builder failed without specific handler (exit code {exit_code}, fallback cleanup)"
+        # Include post-mortem diagnostics if available (issue #2766).
+        postmortem_summary = ""
+        if ctx.last_postmortem is not None:
+            postmortem_summary = f" | post-mortem: {ctx.last_postmortem.get('summary', 'n/a')}"
+        details = (
+            f"Builder failed without specific handler "
+            f"(exit code {exit_code}, fallback cleanup){postmortem_summary}"
+        )
 
         # Check builder log for MCP failure markers before accepting the
         # generic unknown_failure class.  MCP failures are infrastructure

@@ -57,6 +57,10 @@ class ShepherdContext:
     # Low-output cause classification (set by run_phase_with_retry)
     last_low_output_cause: str | None = field(default=None, init=False)
 
+    # Post-mortem diagnostics for the last zero-output session
+    # (set by run_worker_phase on non-zero exit).  See issue #2766.
+    last_postmortem: dict[str, Any] | None = field(default=None, init=False)
+
     # Preflight baseline status (set by orchestrator after preflight phase).
     # "healthy" means baseline tests pass and builder can skip re-running them.
     preflight_baseline_status: str | None = field(default=None, init=False)

@@ -4195,6 +4195,7 @@ class TestRecordFallbackFailure:
         ctx = MagicMock()
         ctx.config.issue = 42
         ctx.repo_root = Path("/fake/repo")
+        ctx.last_postmortem = None
 
         _record_fallback_failure(ctx, ShepherdExitCode.BUILDER_FAILED)
 
@@ -4206,6 +4207,28 @@ class TestRecordFallbackFailure:
             details="Builder failed without specific handler (exit code 1, fallback cleanup)",
         )
         mock_detect.assert_called_once_with(Path("/fake/repo"))
+
+    @patch("loom_tools.common.systematic_failure.detect_systematic_failure", return_value=None)
+    @patch("loom_tools.common.systematic_failure.record_blocked_reason")
+    def test_unknown_failure_includes_postmortem(
+        self,
+        mock_record: MagicMock,
+        mock_detect: MagicMock,
+    ) -> None:
+        """Should include post-mortem summary in unknown failure details (issue #2766)."""
+        ctx = MagicMock()
+        ctx.config.issue = 42
+        ctx.repo_root = Path("/fake/repo")
+        ctx.last_postmortem = {
+            "summary": "CLI started but produced zero output; wall: 5s; exit(wait=1)",
+        }
+
+        _record_fallback_failure(ctx, ShepherdExitCode.BUILDER_FAILED)
+
+        call_args = mock_record.call_args
+        details = call_args.kwargs.get("details", call_args[1].get("details", ""))
+        assert "post-mortem:" in details
+        assert "CLI started but produced zero output" in details
 
     @patch("loom_tools.common.systematic_failure.detect_systematic_failure", return_value=None)
     @patch("loom_tools.common.systematic_failure.record_blocked_reason")
@@ -4278,6 +4301,7 @@ class TestRecordFallbackFailure:
         ctx = MagicMock()
         ctx.config.issue = 42
         ctx.repo_root = tmp_path
+        ctx.last_postmortem = None
 
         _record_fallback_failure(ctx, ShepherdExitCode.BUILDER_FAILED)
 
