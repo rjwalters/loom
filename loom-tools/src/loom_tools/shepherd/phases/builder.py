@@ -735,6 +735,20 @@ class BuilderPhase:
             # Retries exhausted, still escaping
             return escape
 
+        # Fast path: when the builder already completed its full git workflow
+        # (PR with loom:review-requested exists), skip test verification to
+        # eliminate dead time between builder and judge phases.  The builder
+        # is expected to run tests before creating the PR; running them again
+        # here adds ~7 minutes of overhead without providing new signal.
+        # If tests are broken, the Judge phase will catch them during review.
+        # See issue #2803.
+        if not skip_test_verification and self.validate(ctx, quiet=True):
+            log_info(
+                "PR with loom:review-requested already exists — "
+                "skipping test verification for fast builder-to-judge handoff"
+            )
+            skip_test_verification = True
+
         # Run test verification in worktree (unless explicitly skipped)
         if skip_test_verification:
             log_info("Skipping test verification (pre-existing failures already handled)")
