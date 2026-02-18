@@ -415,6 +415,17 @@ def orchestrate(ctx: ShepherdContext) -> int:
         # Report started milestone
         ctx.report_milestone("started", issue=ctx.config.issue, mode=ctx.config.mode.value)
 
+        # ─── Force mode: clear prior failures for this issue ─────────────
+        if ctx.config.is_force_mode:
+            from loom_tools.common.systematic_failure import clear_failures_for_issue
+
+            cleared = clear_failures_for_issue(ctx.repo_root, ctx.config.issue)
+            if cleared > 0:
+                log_info(
+                    f"Force mode: cleared {cleared} prior failure(s) for issue "
+                    f"#{ctx.config.issue} — full retry window restored"
+                )
+
         # ─── PHASE 1: Curator ─────────────────────────────────────────────
         curator = CuratorPhase()
         skip, reason = curator.should_skip(ctx)
