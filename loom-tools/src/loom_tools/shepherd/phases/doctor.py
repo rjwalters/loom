@@ -135,6 +135,16 @@ class DoctorPhase:
         # Capture commit count before doctor runs (for progress detection)
         commits_before = self._get_commit_count(ctx)
 
+        # Write judge feedback context file so the doctor has structured
+        # information about what the judge found wrong.  This mirrors the
+        # run_test_fix() pattern where test failure context is written to a
+        # JSON file and passed via --context.  See issue #2807.
+        context_file = self._write_judge_feedback_context(ctx)
+        if context_file:
+            args = f"{ctx.pr_number} --context {context_file}"
+        else:
+            args = str(ctx.pr_number)
+
         # Run doctor worker with retry
         exit_code = run_phase_with_retry(
             ctx,
@@ -145,7 +155,7 @@ class DoctorPhase:
             phase="doctor",
             worktree=ctx.worktree_path,
             pr_number=ctx.pr_number,
-            args=str(ctx.pr_number),
+            args=args,
         )
 
         if exit_code == 3:
@@ -765,6 +775,74 @@ class DoctorPhase:
             phase_name="doctor",
             data=diagnostics.to_dict(),
         )
+
+    def _write_judge_feedback_context(
+        self, ctx: ShepherdContext
+    ) -> Path | None:
+        """Write judge feedback context to a JSON file for Doctor to read.
+
+        Fetches the judge's most recent PR comments and writes them to a
+        context file in the worktree.  The doctor agent reads this file to
+        understand exactly what the judge found wrong, reducing the chance
+        of the doctor missing or misinterpreting the feedback.
+
+        This mirrors the _write_test_failure_context() pattern used by
+        run_test_fix().  See issue #2807.
+
+        Returns the path to the context file, or None if writing failed.
+        """
+        import json
+
+        if not ctx.worktree_path or ctx.pr_number is None:
+            return None
+
+        # Fetch the most recent judge comments from the PR.
+        # We fetch the last 10 comments to catch all recent feedback.
+        result = subprocess.run(
+            [
+                "gh",
+                "pr",
+                "view",
+                str(ctx.pr_number),
+                "--json",
+                "comments",
+                "--jq",
+                ".comments[-10:] | map({body: .body, author: .author.login, created_at: .createdAt})",
+            ],
+            cwd=ctx.repo_root,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+        if result.returncode != 0 or not result.stdout.strip():
+            log_warning(
+                f"[doctor] Could not fetch PR #{ctx.pr_number} comments for context file"
+            )
+            return None
+
+        try:
+            comments = json.loads(result.stdout)
+        except (json.JSONDecodeError, ValueError) as e:
+            log_warning(f"[doctor] Failed to parse PR comments: {e}")
+            return None
+
+        if not comments:
+            return None
+
+        context_file = ctx.worktree_path / ".loom-judge-feedback.json"
+        context_data = {
+            "pr_number": ctx.pr_number,
+            "issue": ctx.config.issue,
+            "context_type": "judge_feedback",
+            "judge_comments": comments,
+        }
+
+        try:
+            context_file.write_text(json.dumps(context_data, indent=2) + "\n")
+            return context_file
+        except OSError:
+            return None
 
     def _write_test_failure_context(
         self, ctx: ShepherdContext, test_failure_data: dict[str, Any]
