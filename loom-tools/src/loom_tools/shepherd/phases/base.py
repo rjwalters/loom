@@ -1160,6 +1160,14 @@ def run_worker_phase(
     if worktree:
         spawn_cmd.extend(["--worktree", str(worktree)])
 
+    # Remove any stale sidecar exit code file from a previous run to avoid
+    # reading outdated state after this session completes.  See issue #2737.
+    exit_code_file = ctx.repo_root / ".loom" / "exit-codes" / f"{actual_name}.exit"
+    try:
+        exit_code_file.unlink(missing_ok=True)
+    except OSError:
+        pass
+
     # Spawn the worker
     # Redirect to DEVNULL to suppress output - agent logs are captured to
     # .loom/logs/<session>.log for debugging purposes
@@ -1336,6 +1344,25 @@ def run_worker_phase(
             _print_heartbeat(action)
 
     wait_exit = wait_proc.returncode
+
+    # Check for sidecar exit code file written by claude-wrapper.sh.
+    # When agent-wait returns 0 (shell idle, no claude process), the
+    # wrapper's actual exit code is lost.  The sidecar file preserves it
+    # so failure classifiers below can fire correctly.  See issue #2737.
+    exit_code_file = ctx.repo_root / ".loom" / "exit-codes" / f"{actual_name}.exit"
+    try:
+        if exit_code_file.exists():
+            sidecar_exit = int(exit_code_file.read_text().strip())
+            if sidecar_exit != 0 and wait_exit == 0:
+                log_warning(
+                    f"Sidecar exit code {sidecar_exit} overrides agent-wait "
+                    f"exit 0 for {role} session '{actual_name}' "
+                    f"(wrapper exited non-zero but agent-wait missed it)"
+                )
+                wait_exit = sidecar_exit
+            exit_code_file.unlink(missing_ok=True)
+    except (ValueError, OSError) as exc:
+        log_warning(f"Failed to read sidecar exit file {exit_code_file}: {exc}")
 
     # Clean up the worker session
     destroy_script = scripts_dir / "agent-destroy.sh"

@@ -7904,6 +7904,212 @@ class TestRunWorkerPhaseMissingScripts:
         assert exit_code == 0
 
 
+class TestRunWorkerPhaseSidecarExitCode:
+    """Test sidecar exit code file mechanism (issue #2737).
+
+    When agent-wait returns 0 (shell idle), the wrapper's actual exit code
+    is lost.  The sidecar file (.loom/exit-codes/<name>.exit) preserves it.
+    """
+
+    def test_sidecar_overrides_zero_exit(self, tmp_path: Path) -> None:
+        """When sidecar says non-zero but agent-wait says 0, use sidecar."""
+        ctx = MagicMock(spec=ShepherdContext)
+        ctx.config = ShepherdConfig(issue=42, task_id="test-123")
+        ctx.repo_root = tmp_path
+        scripts_dir = tmp_path / ".loom" / "scripts"
+        scripts_dir.mkdir(parents=True)
+        (scripts_dir / "agent-spawn.sh").touch()
+        (scripts_dir / "agent-wait-bg.sh").touch()
+        (scripts_dir / "agent-destroy.sh").touch()
+        ctx.scripts_dir = scripts_dir
+        ctx.progress_dir = tmp_path / ".loom" / "progress"
+
+        # Create a log file so classifiers have something to check
+        logs_dir = tmp_path / ".loom" / "logs"
+        logs_dir.mkdir(parents=True)
+        log_file = logs_dir / "loom-builder-issue-42.log"
+        log_file.write_text("# Loom Agent Log\n# SHORT SESSION\n")
+
+        exit_codes_dir = tmp_path / ".loom" / "exit-codes"
+
+        def mock_spawn(cmd, **kwargs):
+            result = MagicMock()
+            result.returncode = 0
+            return result
+
+        def mock_popen(cmd, **kwargs):
+            # Simulate wrapper writing sidecar during execution (after
+            # the pre-spawn cleanup has already run).
+            exit_codes_dir.mkdir(parents=True, exist_ok=True)
+            (exit_codes_dir / "builder-issue-42.exit").write_text("1\n")
+
+            proc = MagicMock()
+            proc.poll.return_value = 0  # agent-wait returns 0
+            proc.returncode = 0
+            return proc
+
+        with (
+            patch("subprocess.run", side_effect=mock_spawn),
+            patch("subprocess.Popen", side_effect=mock_popen),
+            patch("time.sleep"),
+        ):
+            exit_code = run_worker_phase(
+                ctx,
+                role="builder",
+                name="builder-issue-42",
+                timeout=600,
+                phase="builder",
+            )
+
+        # Sidecar exit 1 should override agent-wait exit 0, and the
+        # failure classifiers should fire (low-output or ghost).
+        assert exit_code != 0
+        # Sidecar file should be cleaned up
+        assert not (exit_codes_dir / "builder-issue-42.exit").exists()
+
+    def test_sidecar_zero_does_not_override(self, tmp_path: Path) -> None:
+        """When sidecar says 0 and agent-wait says 0, exit remains 0."""
+        ctx = MagicMock(spec=ShepherdContext)
+        ctx.config = ShepherdConfig(issue=42, task_id="test-123")
+        ctx.repo_root = tmp_path
+        scripts_dir = tmp_path / ".loom" / "scripts"
+        scripts_dir.mkdir(parents=True)
+        (scripts_dir / "agent-spawn.sh").touch()
+        (scripts_dir / "agent-wait-bg.sh").touch()
+        ctx.scripts_dir = scripts_dir
+        ctx.progress_dir = tmp_path / ".loom" / "progress"
+
+        exit_codes_dir = tmp_path / ".loom" / "exit-codes"
+
+        def mock_spawn(cmd, **kwargs):
+            result = MagicMock()
+            result.returncode = 0
+            return result
+
+        def mock_popen(cmd, **kwargs):
+            # Simulate wrapper writing sidecar with exit 0 (success)
+            exit_codes_dir.mkdir(parents=True, exist_ok=True)
+            (exit_codes_dir / "builder-issue-42.exit").write_text("0\n")
+
+            proc = MagicMock()
+            proc.poll.return_value = 0
+            proc.returncode = 0
+            return proc
+
+        with (
+            patch("subprocess.run", side_effect=mock_spawn),
+            patch("subprocess.Popen", side_effect=mock_popen),
+            patch("time.sleep"),
+            patch(
+                "loom_tools.shepherd.phases.base._is_low_output_session",
+                return_value=False,
+            ),
+        ):
+            exit_code = run_worker_phase(
+                ctx,
+                role="builder",
+                name="builder-issue-42",
+                timeout=600,
+                phase="builder",
+            )
+
+        assert exit_code == 0
+        # Sidecar file should be cleaned up
+        assert not (exit_codes_dir / "builder-issue-42.exit").exists()
+
+    def test_no_sidecar_file_is_fine(self, tmp_path: Path) -> None:
+        """When no sidecar file exists, behavior is unchanged."""
+        ctx = MagicMock(spec=ShepherdContext)
+        ctx.config = ShepherdConfig(issue=42, task_id="test-123")
+        ctx.repo_root = tmp_path
+        scripts_dir = tmp_path / ".loom" / "scripts"
+        scripts_dir.mkdir(parents=True)
+        (scripts_dir / "agent-spawn.sh").touch()
+        (scripts_dir / "agent-wait-bg.sh").touch()
+        ctx.scripts_dir = scripts_dir
+        ctx.progress_dir = tmp_path / ".loom" / "progress"
+
+        def mock_spawn(cmd, **kwargs):
+            result = MagicMock()
+            result.returncode = 0
+            return result
+
+        def mock_popen(cmd, **kwargs):
+            proc = MagicMock()
+            proc.poll.return_value = 0
+            proc.returncode = 0
+            return proc
+
+        with (
+            patch("subprocess.run", side_effect=mock_spawn),
+            patch("subprocess.Popen", side_effect=mock_popen),
+            patch("time.sleep"),
+            patch(
+                "loom_tools.shepherd.phases.base._is_low_output_session",
+                return_value=False,
+            ),
+        ):
+            exit_code = run_worker_phase(
+                ctx,
+                role="builder",
+                name="builder-issue-42",
+                timeout=600,
+                phase="builder",
+            )
+
+        assert exit_code == 0
+
+    def test_stale_sidecar_cleaned_before_spawn(self, tmp_path: Path) -> None:
+        """Stale sidecar file from previous run is removed before spawn."""
+        ctx = MagicMock(spec=ShepherdContext)
+        ctx.config = ShepherdConfig(issue=42, task_id="test-123")
+        ctx.repo_root = tmp_path
+        scripts_dir = tmp_path / ".loom" / "scripts"
+        scripts_dir.mkdir(parents=True)
+        (scripts_dir / "agent-spawn.sh").touch()
+        (scripts_dir / "agent-wait-bg.sh").touch()
+        ctx.scripts_dir = scripts_dir
+        ctx.progress_dir = tmp_path / ".loom" / "progress"
+
+        # Pre-existing sidecar from a previous run
+        exit_codes_dir = tmp_path / ".loom" / "exit-codes"
+        exit_codes_dir.mkdir(parents=True)
+        stale_file = exit_codes_dir / "builder-issue-42.exit"
+        stale_file.write_text("1\n")
+
+        def mock_spawn(cmd, **kwargs):
+            # By the time spawn runs, the stale file should be gone
+            assert not stale_file.exists(), "Stale sidecar should be removed before spawn"
+            result = MagicMock()
+            result.returncode = 0
+            return result
+
+        def mock_popen(cmd, **kwargs):
+            proc = MagicMock()
+            proc.poll.return_value = 0
+            proc.returncode = 0
+            return proc
+
+        with (
+            patch("subprocess.run", side_effect=mock_spawn),
+            patch("subprocess.Popen", side_effect=mock_popen),
+            patch("time.sleep"),
+            patch(
+                "loom_tools.shepherd.phases.base._is_low_output_session",
+                return_value=False,
+            ),
+        ):
+            exit_code = run_worker_phase(
+                ctx,
+                role="builder",
+                name="builder-issue-42",
+                timeout=600,
+                phase="builder",
+            )
+
+        assert exit_code == 0
+
+
 class TestRunWorkerPhaseClaudeCodeEnv:
     """Test run_worker_phase strips CLAUDECODE from environment (issue #2240)."""
 

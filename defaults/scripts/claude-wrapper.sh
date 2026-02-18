@@ -81,6 +81,26 @@ if [[ -n "${TERMINAL_ID}" ]]; then
     RETRY_STATE_FILE="${RETRY_STATE_DIR}/${TERMINAL_ID}.json"
 fi
 
+# Sidecar exit code file for shepherd visibility (issue #2737).
+# When agent-wait returns 0 (shell idle, no claude process), the wrapper's
+# actual exit code is lost.  This file preserves it so run_worker_phase()
+# can detect failures that agent-wait missed.
+_EXIT_CODE_SIDECAR=""
+if [[ -n "${TERMINAL_ID}" ]]; then
+    _EXIT_CODE_SIDECAR="${WORKSPACE}/.loom/exit-codes/${TERMINAL_ID}.exit"
+fi
+
+# Write the wrapper's exit code to the sidecar file.  Called on every exit
+# path (normal, pre-flight failure, signal kill) so the shepherd always has
+# the real exit code regardless of how the tmux session ended.
+_write_exit_sidecar() {
+    local code="${1:-1}"
+    if [[ -n "${_EXIT_CODE_SIDECAR}" ]]; then
+        mkdir -p "$(dirname "${_EXIT_CODE_SIDECAR}")" 2>/dev/null || true
+        echo "${code}" > "${_EXIT_CODE_SIDECAR}" 2>/dev/null || true
+    fi
+}
+
 # Logging helpers
 log_info() {
     echo "[$(date -u '+%Y-%m-%dT%H:%M:%SZ')] [INFO] $*" >&2
@@ -167,6 +187,10 @@ _flush_output_on_signal() {
     # Clean up temp file
     rm -f "$_FLUSH_TEMP_OUTPUT" 2>/dev/null || true
     _FLUSH_TEMP_OUTPUT=""
+
+    # Write sidecar exit code (1 = killed by signal) so the shepherd
+    # detects this wasn't a clean exit.  See issue #2737.
+    _write_exit_sidecar 1
 }
 
 # Write retry state to a JSON file for external observability (issue #2296).
@@ -1273,12 +1297,14 @@ main() {
 
     # Run pre-flight checks
     if ! run_preflight_checks; then
+        _write_exit_sidecar 1
         exit 1
     fi
 
     # Check for stop signal before starting
     if check_stop_signal; then
         log_info "Stop signal already present - exiting without starting"
+        _write_exit_sidecar 0
         exit 0
     fi
 
@@ -1287,6 +1313,7 @@ main() {
     run_with_retry "$@"
     exit_code=$?
 
+    _write_exit_sidecar "${exit_code}"
     log_info "Claude wrapper exiting with code ${exit_code}"
     exit "${exit_code}"
 }

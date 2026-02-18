@@ -60,6 +60,7 @@ Thumbs.db
 .loom/status/
 .loom/progress/
 .loom/retry-state/
+.loom/exit-codes/
 .loom/diagnostics/
 .loom/guide-docs-state.json
 .loom/metrics_state.json
