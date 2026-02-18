@@ -21,6 +21,8 @@ from loom_tools.validate_phase import (
     main,
     _parse_args,
     _gather_builder_diagnostics,
+    _build_recovery_pr_body,
+    _is_rate_limited_builder_exit,
     VALID_PHASES,
 )
 
@@ -1032,6 +1034,156 @@ class TestBuilderRecoveryFromUncommittedChanges:
 
         assert result.status == ValidationStatus.FAILED
         assert "marker files" in result.message.lower()
+
+
+# ---------------------------------------------------------------------------
+# Rate-limited builder exit detection (issue #2774)
+# ---------------------------------------------------------------------------
+
+
+class TestRateLimitedBuilderExit:
+    """Tests for rate-limit detection and differentiated recovery PR messaging."""
+
+    def test_detects_rate_limit_pattern_in_log(self, tmp_path: Path):
+        """_is_rate_limited_builder_exit returns True when log contains /rate-limit-options."""
+        repo = _make_repo(tmp_path)
+        logs_dir = tmp_path / ".loom" / "logs"
+        logs_dir.mkdir(parents=True)
+        log_file = logs_dir / "loom-builder-issue-42.log"
+        log_file.write_text(
+            "Some output...\n"
+            "❯ /rate-limit-options\n"
+            "What do you want to do?\n"
+            "❯ 1. Stop and wait for limit to reset\n"
+        )
+        assert _is_rate_limited_builder_exit(42, repo) is True
+
+    def test_no_rate_limit_pattern_returns_false(self, tmp_path: Path):
+        """_is_rate_limited_builder_exit returns False when log has normal output."""
+        repo = _make_repo(tmp_path)
+        logs_dir = tmp_path / ".loom" / "logs"
+        logs_dir.mkdir(parents=True)
+        log_file = logs_dir / "loom-builder-issue-42.log"
+        log_file.write_text("Normal builder output.\nAll tests passed.\n")
+        assert _is_rate_limited_builder_exit(42, repo) is False
+
+    def test_no_log_file_returns_false(self, tmp_path: Path):
+        """_is_rate_limited_builder_exit returns False when no log exists."""
+        repo = _make_repo(tmp_path)
+        assert _is_rate_limited_builder_exit(42, repo) is False
+
+    def test_no_logs_dir_returns_false(self, tmp_path: Path):
+        """_is_rate_limited_builder_exit returns False when logs dir missing."""
+        repo = _make_repo(tmp_path)
+        # Don't create .loom/logs
+        assert _is_rate_limited_builder_exit(42, repo) is False
+
+    def test_uses_most_recent_log_with_retry_suffix(self, tmp_path: Path):
+        """When multiple logs exist (retries), checks the most recent one."""
+        repo = _make_repo(tmp_path)
+        logs_dir = tmp_path / ".loom" / "logs"
+        logs_dir.mkdir(parents=True)
+
+        # Older log without rate limit
+        old_log = logs_dir / "loom-builder-issue-42.log"
+        old_log.write_text("Normal output.\n")
+
+        # Newer retry log with rate limit
+        import time
+        time.sleep(0.05)  # ensure different mtime
+        new_log = logs_dir / "loom-builder-issue-42-a1.log"
+        new_log.write_text("Output...\n/rate-limit-options\n")
+
+        assert _is_rate_limited_builder_exit(42, repo) is True
+
+    @patch("loom_tools.validate_phase.subprocess.run")
+    def test_recovery_pr_body_rate_limited(self, mock_run: MagicMock):
+        """Rate-limited recovery PR body uses less cautionary messaging."""
+        mock_run.return_value = _completed(stdout="")
+
+        body = _build_recovery_pr_body(42, "/tmp/wt", rate_limited=True)
+
+        assert "rate-limited after completing work" in body
+        assert "examine the diff carefully" not in body
+        assert "Confirm tests pass" in body
+
+    @patch("loom_tools.validate_phase.subprocess.run")
+    def test_recovery_pr_body_not_rate_limited(self, mock_run: MagicMock):
+        """Non-rate-limited recovery PR body uses cautionary messaging."""
+        mock_run.return_value = _completed(stdout="")
+
+        body = _build_recovery_pr_body(42, "/tmp/wt", rate_limited=False)
+
+        assert "examine the diff carefully" in body
+        assert "rate-limited" not in body
+        assert "Review diff carefully" in body
+
+    @patch("loom_tools.validate_phase._log_recovery_event")
+    @patch("loom_tools.validate_phase._report_milestone")
+    @patch("loom_tools.validate_phase.subprocess.run")
+    @patch("loom_tools.validate_phase._find_pr_for_issue")
+    @patch("loom_tools.validate_phase._run_gh")
+    def test_recovery_detects_rate_limit_and_adjusts_messaging(
+        self, mock_gh: MagicMock, mock_find: MagicMock, mock_run: MagicMock,
+        mock_milestone: MagicMock, mock_log_recovery: MagicMock, tmp_path: Path,
+    ):
+        """Recovery flow detects rate-limited exit and passes flag through."""
+        repo = _make_repo(tmp_path)
+        wt = tmp_path / ".loom" / "worktrees" / "issue-42"
+        wt.mkdir(parents=True)
+        (wt / ".git").mkdir()
+
+        # Create builder log with rate-limit pattern
+        logs_dir = tmp_path / ".loom" / "logs"
+        logs_dir.mkdir(parents=True)
+        (logs_dir / "loom-builder-issue-42.log").write_text(
+            "Working...\n/rate-limit-options\n"
+        )
+
+        mock_gh.side_effect = [
+            _completed(stdout="OPEN\n"),
+            _completed(stdout="Fix widget\n"),
+        ]
+        mock_find.return_value = None
+
+        def side_effect_fn(*args, **kwargs):
+            cmd = args[0] if args else kwargs.get("args", [])
+            cmd_str = " ".join(str(c) for c in cmd)
+            if "status" in cmd and "--porcelain" in cmd:
+                return _completed(stdout=" M src/file.py\n")
+            if "git" in cmd_str and "add" in cmd:
+                return _completed()
+            if "git" in cmd_str and "commit" in cmd:
+                return _completed()
+            if "git" in cmd_str and "push" in cmd:
+                return _completed()
+            if "gh" in cmd_str and "pr" in cmd and "create" in cmd:
+                return _completed(stdout="https://github.com/org/repo/pull/99\n")
+            return _completed()
+
+        mock_run.side_effect = side_effect_fn
+
+        result = validate_builder(42, repo, worktree=str(wt))
+
+        assert result.status == ValidationStatus.RECOVERED
+        assert "rate-limited" in result.message
+
+        # Verify the PR body passed to gh pr create contains rate-limited messaging
+        pr_create_calls = [
+            call for call in mock_run.call_args_list
+            if any("pr" in str(a) for a in call[0][0]) and any("create" in str(a) for a in call[0][0])
+        ]
+        assert len(pr_create_calls) == 1
+        pr_body_arg = pr_create_calls[0][0][0]  # get the args list
+        body_idx = pr_body_arg.index("--body") + 1
+        pr_body = pr_body_arg[body_idx]
+        assert "rate-limited after completing work" in pr_body
+
+        # Verify recovery event logged with rate_limited reason
+        mock_log_recovery.assert_called_once()
+        call_kwargs = mock_log_recovery.call_args[1]
+        assert call_kwargs.get("builder_exit_reason") == "rate_limited"
+        assert call_kwargs.get("reason") == "rate_limited" if "reason" in call_kwargs else mock_log_recovery.call_args[0][2] == "rate_limited"
 
 
 # ---------------------------------------------------------------------------

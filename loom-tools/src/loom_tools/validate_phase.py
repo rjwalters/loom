@@ -159,18 +159,20 @@ def _log_recovery_event(
     worktree_had_changes: bool = False,
     commits_recovered: int = 0,
     pr_number: int | None = None,
+    builder_exit_reason: str | None = None,
 ) -> None:
     """Log a recovery event to .loom/metrics/recovery-events.json.
 
     Args:
         issue: Issue number being recovered.
         recovery_type: Type of recovery performed (commit_and_pr, pr_only, add_label).
-        reason: Reason for recovery (validation_failed, timeout, stuck, etc.).
+        reason: Reason for recovery (validation_failed, timeout, stuck, rate_limited, etc.).
         repo_root: Repository root path.
         elapsed_seconds: Time elapsed since builder started (if known).
         worktree_had_changes: Whether worktree had uncommitted changes.
         commits_recovered: Number of commits recovered/pushed.
         pr_number: PR number if one was created or updated.
+        builder_exit_reason: Why the builder exited (e.g. "rate_limited"), if known.
     """
     paths = LoomPaths(repo_root)
     metrics_dir = paths.metrics_dir
@@ -180,7 +182,7 @@ def _log_recovery_event(
     metrics_dir.mkdir(parents=True, exist_ok=True)
 
     # Build event record
-    event = {
+    event: dict[str, Any] = {
         "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "issue": issue,
         "recovery_type": recovery_type,
@@ -190,6 +192,8 @@ def _log_recovery_event(
         "commits_recovered": commits_recovered,
         "pr_number": pr_number,
     }
+    if builder_exit_reason:
+        event["builder_exit_reason"] = builder_exit_reason
 
     # Append to existing events or create new file
     events: list[dict[str, Any]] = []
@@ -213,19 +217,59 @@ def _log_recovery_event(
         log_warning(f"Failed to write recovery event to {recovery_file}")
 
 
-def _build_recovery_pr_body(issue: int, worktree: str) -> str:
+def _is_rate_limited_builder_exit(issue: int, repo_root: Path) -> bool:
+    """Check if the builder exited due to Claude CLI rate limiting.
+
+    When the Claude CLI hits an Anthropic API rate limit mid-session, it
+    prompts the user with ``/rate-limit-options``.  If the builder chose to
+    stop, the session log will contain this prompt.  This is distinct from
+    GitHub API rate limits (handled elsewhere) and degraded sessions (rate
+    limits + Crystallizing loops).
+
+    Returns True if the most recent builder log for the given issue contains
+    the rate-limit prompt pattern.
+    """
+    logs_dir = repo_root / ".loom" / "logs"
+    if not logs_dir.is_dir():
+        return False
+
+    # Find builder logs for this issue (may include retry suffixes like -a1, -a2)
+    pattern = f"loom-builder-issue-{issue}*.log"
+    log_files = sorted(logs_dir.glob(pattern), key=lambda p: p.stat().st_mtime)
+    if not log_files:
+        return False
+
+    # Check the most recent log
+    log_path = log_files[-1]
+    try:
+        content = log_path.read_text(errors="replace")
+        return "/rate-limit-options" in content
+    except OSError:
+        return False
+
+
+def _build_recovery_pr_body(issue: int, worktree: str, *, rate_limited: bool = False) -> str:
     """Build a descriptive PR body for recovery-created PRs.
 
     Gathers diff stats from git to provide reviewers with context about what
     changed, since the builder did not create the PR itself.
+
+    Args:
+        rate_limited: If True, the builder was rate-limited after completing
+            work.  Uses less cautionary messaging since the work itself is
+            complete — only the PR creation step was interrupted.
     """
     lines: list[str] = []
 
     lines.append(f"Closes #{issue}")
     lines.append("")
-    lines.append("> **Note:** This PR was created automatically via the builder "
-                 "recovery path. The builder produced changes but exited before "
-                 "creating a PR. Reviewers should examine the diff carefully.")
+    if rate_limited:
+        lines.append("> **Note:** Builder was rate-limited after completing work. "
+                     "PR created via recovery path.")
+    else:
+        lines.append("> **Note:** This PR was created automatically via the builder "
+                     "recovery path. The builder produced changes but exited before "
+                     "creating a PR. Reviewers should examine the diff carefully.")
     lines.append("")
 
     # Look up the default branch dynamically
@@ -263,9 +307,13 @@ def _build_recovery_pr_body(issue: int, worktree: str) -> str:
 
     lines.append("## Test plan")
     lines.append("")
-    lines.append("- [ ] Review diff carefully (recovery-created PR)")
-    lines.append("- [ ] Verify changes match issue requirements")
-    lines.append("- [ ] Run tests locally if needed")
+    if rate_limited:
+        lines.append("- [ ] Verify changes match issue requirements")
+        lines.append("- [ ] Confirm tests pass (builder completed tests before rate limit)")
+    else:
+        lines.append("- [ ] Review diff carefully (recovery-created PR)")
+        lines.append("- [ ] Verify changes match issue requirements")
+        lines.append("- [ ] Run tests locally if needed")
 
     return "\n".join(lines)
 
@@ -937,6 +985,9 @@ def validate_builder(
         )
 
     # Step 3: Create PR
+    # Detect whether the builder was rate-limited (affects PR messaging)
+    rate_limited = _is_rate_limited_builder_exit(issue, repo_root)
+
     # Fetch issue title for the PR title
     r_title = _run_gh(
         ["issue", "view", str(issue), "--json", "title", "--jq", ".title"],
@@ -944,7 +995,7 @@ def validate_builder(
     )
     pr_title = r_title.stdout.strip() if r_title.returncode == 0 and r_title.stdout.strip() else f"Issue #{issue}"
 
-    pr_body = _build_recovery_pr_body(issue, worktree)
+    pr_body = _build_recovery_pr_body(issue, worktree, rate_limited=rate_limited)
 
     r = subprocess.run(
         [
@@ -975,21 +1026,24 @@ def validate_builder(
     pr_url = r.stdout.strip()
     recovered_pr = _parse_pr_number(pr_url.split("/")[-1] if "/" in pr_url else pr_url)
 
+    recovery_reason = "rate_limited" if rate_limited else "validation_failed"
     _report_milestone(
         "heartbeat", task_id, repo_root,
-        action=f"recovery: created PR from uncommitted worktree changes for issue #{issue}",
+        action=f"recovery: created PR from {'rate-limited' if rate_limited else 'uncommitted'} worktree changes for issue #{issue}",
     )
     _log_recovery_event(
         issue=issue,
         recovery_type="commit_and_pr",
-        reason="validation_failed",
+        reason=recovery_reason,
         repo_root=repo_root,
         worktree_had_changes=bool(status_output),
         pr_number=recovered_pr,
+        builder_exit_reason="rate_limited" if rate_limited else None,
     )
     return ValidationResult(
         "builder", issue, ValidationStatus.RECOVERED,
-        f"Recovered: staged, committed, pushed, and created PR from worktree changes",
+        f"Recovered: staged, committed, pushed, and created PR from worktree changes"
+        f"{' (builder was rate-limited)' if rate_limited else ''}",
         "commit_and_pr",
     )
 
