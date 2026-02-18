@@ -606,13 +606,87 @@ class BuilderPhase:
                 data={"exit_code": exit_code, "diagnostics": diag},
             )
 
-        # Early worktree escape detection (issue #2630):
+        # Early worktree escape detection with retry (issues #2630, #2751):
         # Check for dirty main immediately after builder exits — before
         # entering the validation/completion loop.  When the builder
         # escapes the worktree and modifies main instead, completion
         # retries are futile (they operate on the empty worktree).
+        #
+        # Worktree escape is a transient failure (Claude Code resolving
+        # paths to the main repo root instead of the worktree), so a
+        # single retry with cleanup usually succeeds.
         escape = self._detect_worktree_escape(ctx)
+        escape_retries = 0
+        while escape is not None and escape_retries < ctx.config.escape_max_retries:
+            escape_retries += 1
+            log_warning(
+                f"Worktree escape detected for issue #{ctx.config.issue}, "
+                f"reverting main and retrying "
+                f"(attempt {escape_retries}/{ctx.config.escape_max_retries})"
+            )
+            ctx.report_milestone(
+                "error",
+                error=f"worktree escape detected for issue #{ctx.config.issue}",
+                will_retry=True,
+            )
+
+            # 1. Revert dirty files the builder left on main
+            self._revert_escaped_main_files(ctx)
+
+            # 2. Reset the stale worktree to a clean state
+            self._reset_stale_worktree(ctx)
+
+            # 3. Re-snapshot baseline before retry
+            self._main_dirty_baseline = self._snapshot_main_dirty(ctx)
+
+            # 4. Re-run the builder
+            exit_code = run_phase_with_retry(
+                ctx,
+                role="builder",
+                name=f"builder-issue-{ctx.config.issue}",
+                timeout=ctx.config.builder_timeout,
+                max_retries=ctx.config.stuck_max_retries,
+                phase="builder",
+                worktree=ctx.worktree_path,
+                args=str(ctx.config.issue),
+                planning_timeout=ctx.config.planning_timeout,
+            )
+
+            # Handle fatal exit codes from retry (shutdown, stuck, etc.)
+            if exit_code == 3:
+                transition_issue_labels(
+                    ctx.config.issue,
+                    add=["loom:issue"],
+                    remove=["loom:building"],
+                    repo_root=ctx.repo_root,
+                )
+                ctx.label_cache.invalidate_issue(ctx.config.issue)
+                return PhaseResult(
+                    status=PhaseStatus.SHUTDOWN,
+                    message="shutdown signal detected during builder escape retry",
+                    phase_name="builder",
+                )
+
+            if exit_code != 0:
+                diag = self._gather_diagnostics(ctx)
+                if diag.get("worktree_exists"):
+                    if self._is_stale_worktree(ctx.worktree_path):
+                        self._cleanup_stale_worktree(ctx)
+                return PhaseResult(
+                    status=PhaseStatus.FAILED,
+                    message=(
+                        f"builder subprocess exited with code {exit_code} "
+                        f"during escape retry: {diag['summary']}"
+                    ),
+                    phase_name="builder",
+                    data={"exit_code": exit_code, "diagnostics": diag},
+                )
+
+            # 5. Re-check for escape after retry
+            escape = self._detect_worktree_escape(ctx)
+
         if escape is not None:
+            # Retries exhausted, still escaping
             return escape
 
         # Run test verification in worktree (unless explicitly skipped)
@@ -3050,6 +3124,50 @@ class BuilderPhase:
         if self._main_dirty_baseline is not None:
             return [f for f in current if f not in self._main_dirty_baseline]
         return current
+
+    def _revert_escaped_main_files(self, ctx: ShepherdContext) -> None:
+        """Revert dirty files on main that were introduced by a worktree escape.
+
+        Runs ``git checkout -- <file>`` for each new dirty file identified by
+        ``_get_new_main_dirty_files()``.  Untracked files (``??`` status) are
+        removed with ``git clean -f``.
+
+        This is safe because the dirty files are NEW (not in the pre-builder
+        baseline), meaning the builder created them by mistake on main.
+        """
+        new_dirty = self._get_new_main_dirty_files(ctx)
+        if not new_dirty:
+            return
+
+        tracked_files: list[str] = []
+        untracked_files: list[str] = []
+        for line in new_dirty:
+            # porcelain format: XY <path> or XY <path> -> <path>
+            path = parse_porcelain_path(line)
+            if not path:
+                continue
+            if line.startswith("??"):
+                untracked_files.append(path)
+            else:
+                tracked_files.append(path)
+
+        if tracked_files:
+            subprocess.run(
+                ["git", "-C", str(ctx.repo_root), "checkout", "--"] + tracked_files,
+                capture_output=True,
+                check=False,
+            )
+            log_info(f"Reverted {len(tracked_files)} escaped tracked file(s) on main")
+
+        if untracked_files:
+            # Use git clean with explicit paths to remove only escaped files
+            for f in untracked_files:
+                subprocess.run(
+                    ["git", "-C", str(ctx.repo_root), "clean", "-f", "--", f],
+                    capture_output=True,
+                    check=False,
+                )
+            log_info(f"Removed {len(untracked_files)} escaped untracked file(s) on main")
 
     def _detect_wrong_issue(
         self, ctx: ShepherdContext
