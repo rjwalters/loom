@@ -508,6 +508,31 @@ class BuilderPhase:
             # Degraded session: builder hit rate limits (Crystallizing loop
             # or "Stop and wait" modal).  Not retryable — the rate limit
             # won't resolve until it resets.  See issues #2631, #2781.
+            # Check for an existing PR first — the builder may have completed
+            # its work before hitting the rate limit.  See issue #2851.
+            diag = self._gather_diagnostics(ctx)
+            if diag.get("pr_number") is not None:
+                pr = diag["pr_number"]
+                log_warning(
+                    f"Builder exited with degraded session (code 11) but "
+                    f"PR #{pr} exists — treating as success"
+                )
+                ctx.pr_number = pr
+                ctx.report_milestone("pr_created", pr_number=pr)
+                return PhaseResult(
+                    status=PhaseStatus.SUCCESS,
+                    message=(
+                        f"builder phase complete - PR #{pr} created "
+                        f"(recovered from degraded session exit code 11)"
+                    ),
+                    phase_name="builder",
+                    data={
+                        "pr_number": pr,
+                        "exit_code": exit_code,
+                        "recovered_from_checkpoint": True,
+                        "degraded_session": True,
+                    },
+                )
             log_warning(
                 f"Degraded session for issue #{ctx.config.issue}: "
                 f"builder was rate-limited"
@@ -531,6 +556,31 @@ class BuilderPhase:
             # Rate limit abort: CLI hit a usage/plan limit and showed an
             # interactive prompt.  Not retryable — the limit won't resolve
             # until it resets or the user re-authenticates.
+            # Check for an existing PR first — the builder may have completed
+            # its work before hitting the plan limit.  See issue #2851.
+            diag = self._gather_diagnostics(ctx)
+            if diag.get("pr_number") is not None:
+                pr = diag["pr_number"]
+                log_warning(
+                    f"Builder exited with rate limit abort (code 13) but "
+                    f"PR #{pr} exists — treating as success"
+                )
+                ctx.pr_number = pr
+                ctx.report_milestone("pr_created", pr_number=pr)
+                return PhaseResult(
+                    status=PhaseStatus.SUCCESS,
+                    message=(
+                        f"builder phase complete - PR #{pr} created "
+                        f"(recovered from rate limit abort exit code 13)"
+                    ),
+                    phase_name="builder",
+                    data={
+                        "pr_number": pr,
+                        "exit_code": exit_code,
+                        "recovered_from_checkpoint": True,
+                        "rate_limit_abort": True,
+                    },
+                )
             log_warning(
                 f"Rate limit abort for issue #{ctx.config.issue}: "
                 f"CLI hit usage/plan limit (not retryable)"
@@ -556,6 +606,31 @@ class BuilderPhase:
             # in run_phase_with_retry() (THINKING_STALL_MAX_RETRIES).  If
             # we reach this point, the retry budget is exhausted.
             # See issues #2784, #2823.
+            # Check for an existing PR first — the builder may have completed
+            # its work before entering the stall.  See issue #2851.
+            diag = self._gather_diagnostics(ctx)
+            if diag.get("pr_number") is not None:
+                pr = diag["pr_number"]
+                log_warning(
+                    f"Builder exited with thinking stall (code 14) but "
+                    f"PR #{pr} exists — treating as success"
+                )
+                ctx.pr_number = pr
+                ctx.report_milestone("pr_created", pr_number=pr)
+                return PhaseResult(
+                    status=PhaseStatus.SUCCESS,
+                    message=(
+                        f"builder phase complete - PR #{pr} created "
+                        f"(recovered from thinking stall exit code 14)"
+                    ),
+                    phase_name="builder",
+                    data={
+                        "pr_number": pr,
+                        "exit_code": exit_code,
+                        "recovered_from_checkpoint": True,
+                        "thinking_stall": True,
+                    },
+                )
             log_path = self._get_log_path(ctx)
             thinking_snippet = _extract_thinking_snippet(log_path)
             snippet_suffix = (
