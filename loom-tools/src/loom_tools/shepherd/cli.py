@@ -17,7 +17,7 @@ from loom_tools.common.git import (
     parse_porcelain_path,
 )
 from loom_tools.common.logging import log_error, log_info, log_success, log_warning
-from loom_tools.common.paths import NamingConventions
+from loom_tools.common.paths import LoomPaths, NamingConventions
 from loom_tools.common.repo import find_repo_root
 from loom_tools.shepherd.config import ExecutionMode, Phase, QualityGates, ShepherdConfig
 from loom_tools.shepherd.context import ShepherdContext
@@ -2213,6 +2213,13 @@ def main(argv: list[str] | None = None) -> int:
         _remove_worktree_marker(ctx)
         # Always release the file-based claim on exit
         release_claim(repo_root, config.issue, agent_id)
+        # Delete our own progress file.  The daemon handles this via
+        # handle_shepherd_complete(), but manual /shepherd runs never
+        # trigger that path, so files accumulate indefinitely.
+        try:
+            LoomPaths(repo_root).progress_file(config.task_id).unlink(missing_ok=True)
+        except OSError:
+            pass
 
 
 if __name__ == "__main__":
