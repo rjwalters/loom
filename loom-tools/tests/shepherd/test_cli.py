@@ -16,6 +16,7 @@ from loom_tools.shepherd.cli import (
     _check_main_repo_clean,
     _cleanup_labels_on_failure,
     _cleanup_pr_labels_on_failure,
+    _get_prior_failure_info,
     _is_loom_runtime,
     _create_config,
     _format_diagnostics_for_comment,
@@ -4914,3 +4915,89 @@ class TestRebaseBeforeDoctor:
         doctor_inst.run_test_fix.assert_not_called()
         # Completion validation was called
         builder_inst.validate_and_complete.assert_called_once()
+
+
+
+class TestGetPriorFailureInfo:
+    """Tests for _get_prior_failure_info (issue #2824)."""
+
+    def test_no_state_file(self, tmp_path: Path) -> None:
+        """Should return zero count when daemon-state.json doesn't exist."""
+        count, threshold, last_err = _get_prior_failure_info(tmp_path, 42)
+        assert count == 0
+        assert threshold == 3
+        assert last_err is None
+
+    def test_no_recent_failures(self, tmp_path: Path) -> None:
+        """Should return zero count when recent_failures is empty."""
+        import json
+
+        loom_dir = tmp_path / ".loom"
+        loom_dir.mkdir()
+        (loom_dir / "daemon-state.json").write_text(json.dumps({"recent_failures": []}))
+
+        count, threshold, last_err = _get_prior_failure_info(tmp_path, 42)
+        assert count == 0
+        assert threshold == 3
+        assert last_err is None
+
+    def test_counts_issue_specific_failures(self, tmp_path: Path) -> None:
+        """Should count only failures for the specified issue."""
+        import json
+
+        loom_dir = tmp_path / ".loom"
+        loom_dir.mkdir()
+        (loom_dir / "daemon-state.json").write_text(json.dumps({
+            "recent_failures": [
+                {"issue": 42, "error_class": "builder_unknown_failure", "phase": "builder", "timestamp": "2026-01-01T00:00:00Z"},
+                {"issue": 99, "error_class": "builder_test_failure", "phase": "builder", "timestamp": "2026-01-01T00:01:00Z"},
+                {"issue": 42, "error_class": "builder_test_failure", "phase": "builder", "timestamp": "2026-01-01T00:02:00Z"},
+            ],
+        }))
+
+        count, threshold, last_err = _get_prior_failure_info(tmp_path, 42)
+        assert count == 2
+        assert threshold == 3
+        assert last_err == "builder_test_failure"
+
+    def test_returns_last_error_class(self, tmp_path: Path) -> None:
+        """Should return the most recent error class for the issue."""
+        import json
+
+        loom_dir = tmp_path / ".loom"
+        loom_dir.mkdir()
+        (loom_dir / "daemon-state.json").write_text(json.dumps({
+            "recent_failures": [
+                {"issue": 42, "error_class": "builder_unknown_failure", "phase": "builder", "timestamp": "2026-01-01T00:00:00Z"},
+            ],
+        }))
+
+        count, threshold, last_err = _get_prior_failure_info(tmp_path, 42)
+        assert count == 1
+        assert last_err == "builder_unknown_failure"
+
+    def test_no_failures_for_issue(self, tmp_path: Path) -> None:
+        """Should return zero when no failures match the issue."""
+        import json
+
+        loom_dir = tmp_path / ".loom"
+        loom_dir.mkdir()
+        (loom_dir / "daemon-state.json").write_text(json.dumps({
+            "recent_failures": [
+                {"issue": 99, "error_class": "builder_test_failure", "phase": "builder", "timestamp": "2026-01-01T00:00:00Z"},
+            ],
+        }))
+
+        count, threshold, last_err = _get_prior_failure_info(tmp_path, 42)
+        assert count == 0
+        assert last_err is None
+
+    def test_handles_corrupt_state_file(self, tmp_path: Path) -> None:
+        """Should return zero count when state file is corrupt."""
+        loom_dir = tmp_path / ".loom"
+        loom_dir.mkdir()
+        (loom_dir / "daemon-state.json").write_text("not valid json")
+
+        count, threshold, last_err = _get_prior_failure_info(tmp_path, 42)
+        assert count == 0
+        assert last_err is None
