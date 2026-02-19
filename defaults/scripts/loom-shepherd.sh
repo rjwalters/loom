@@ -113,14 +113,22 @@ if [[ -n "$LOOM_TOOLS" ]] && [[ -x "$LOOM_TOOLS/.venv/bin/loom-shepherd" ]]; the
     # while set -e ensures exit code propagation.
     #
     # Output is teed to the log file (2>&1 merges stderr→stdout first so
-    # both streams land in the log). The || true suppresses set -e so we
-    # can capture the real exit code via PIPESTATUS.
-    "$LOOM_TOOLS/.venv/bin/loom-shepherd" "${args[@]}" 2>&1 | tee -a "$SHEPHERD_LOG" || true
-    exit "${PIPESTATUS[0]}"
+    # both streams land in the log). We disable set -e temporarily so the
+    # pipeline failure doesn't abort the script before we can capture
+    # PIPESTATUS[0]. Using || true would overwrite PIPESTATUS, so we use
+    # set +e/set -e instead.
+    set +e
+    "$LOOM_TOOLS/.venv/bin/loom-shepherd" "${args[@]}" 2>&1 | tee -a "$SHEPHERD_LOG"
+    _exit="${PIPESTATUS[0]}"
+    set -e
+    exit "$_exit"
 elif command -v loom-shepherd &>/dev/null; then
     # System-installed (same rationale as above — no exec)
-    loom-shepherd "${args[@]}" 2>&1 | tee -a "$SHEPHERD_LOG" || true
-    exit "${PIPESTATUS[0]}"
+    set +e
+    loom-shepherd "${args[@]}" 2>&1 | tee -a "$SHEPHERD_LOG"
+    _exit="${PIPESTATUS[0]}"
+    set -e
+    exit "$_exit"
 else
     echo "[ERROR] Python shepherd not available." >&2
     echo "" >&2
