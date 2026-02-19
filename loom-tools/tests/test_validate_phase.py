@@ -1118,6 +1118,66 @@ class TestRateLimitedBuilderExit:
         assert "rate-limited" not in body
         assert "Review diff carefully" in body
 
+    def test_recovery_pr_body_uses_pr_body_file_with_closes(self, tmp_path: Path):
+        """When .loom/pr-body.md exists and contains Closes #N, return it as-is."""
+        loom_dir = tmp_path / ".loom"
+        loom_dir.mkdir()
+        pr_body_content = "## Summary\nFix the widget.\n\nCloses #42"
+        (loom_dir / "pr-body.md").write_text(pr_body_content)
+
+        body = _build_recovery_pr_body(42, str(tmp_path))
+
+        assert body == pr_body_content
+        assert "Closes #42" in body
+        # Should not include the fallback recovery note
+        assert "examine the diff carefully" not in body
+
+    def test_recovery_pr_body_uses_pr_body_file_appends_closes_when_missing(
+        self, tmp_path: Path
+    ):
+        """When .loom/pr-body.md lacks Closes #N, it is appended."""
+        loom_dir = tmp_path / ".loom"
+        loom_dir.mkdir()
+        (loom_dir / "pr-body.md").write_text("## Summary\nFix the widget.")
+
+        body = _build_recovery_pr_body(42, str(tmp_path))
+
+        assert "Closes #42" in body
+        assert body.endswith("\n\nCloses #42")
+        assert "examine the diff carefully" not in body
+
+    @patch("loom_tools.validate_phase.subprocess.run")
+    def test_recovery_pr_body_no_file_uses_fallback_diff_stats(
+        self, mock_run: MagicMock, tmp_path: Path
+    ):
+        """When .loom/pr-body.md does not exist, fall back to diff-stats body."""
+        loom_dir = tmp_path / ".loom"
+        loom_dir.mkdir()
+        # No pr-body.md created
+        mock_run.return_value = _completed(stdout="src/foo.py | 5 ++---\n")
+
+        body = _build_recovery_pr_body(42, str(tmp_path))
+
+        assert "Closes #42" in body
+        assert "examine the diff carefully" in body
+        assert "src/foo.py | 5 ++---" in body
+
+    @patch("loom_tools.validate_phase.subprocess.run")
+    def test_recovery_pr_body_rate_limited_no_file_uses_rate_limited_fallback(
+        self, mock_run: MagicMock, tmp_path: Path
+    ):
+        """When rate_limited=True and no pr-body.md, use rate-limited fallback messaging."""
+        loom_dir = tmp_path / ".loom"
+        loom_dir.mkdir()
+        # No pr-body.md created
+        mock_run.return_value = _completed(stdout="")
+
+        body = _build_recovery_pr_body(42, str(tmp_path), rate_limited=True)
+
+        assert "Closes #42" in body
+        assert "rate-limited after completing work" in body
+        assert "examine the diff carefully" not in body
+
     @patch("loom_tools.validate_phase._log_recovery_event")
     @patch("loom_tools.validate_phase._report_milestone")
     @patch("loom_tools.validate_phase.subprocess.run")
