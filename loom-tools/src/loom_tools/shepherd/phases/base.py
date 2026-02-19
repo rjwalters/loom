@@ -14,6 +14,7 @@ from typing import TYPE_CHECKING, Any, Protocol
 
 from loom_tools.checkpoints import read_checkpoint
 from loom_tools.claim import extend_claim
+from loom_tools.common.github import gh_issue_comment
 from loom_tools.common.logging import log_warning, strip_ansi
 from loom_tools.common.state import read_json_file
 
@@ -107,11 +108,24 @@ MCP_FAILURE_MIN_OUTPUT_CHARS = 500
 MCP_FAILURE_MAX_RETRIES = 3
 MCP_FAILURE_BACKOFF_SECONDS = [20, 30, 60]
 
-# Thinking stall retry budget.  One retry is cheap relative to the cost
-# of blocking an issue and requiring human intervention.  Two consecutive
-# stalls are more likely to indicate a systematic issue.  See issue #2823.
-THINKING_STALL_MAX_RETRIES = 1
-THINKING_STALL_BACKOFF_SECONDS = [30]
+# Thinking stall retry budget.  Two retries give three total attempts: the
+# first can be a transient model/MCP state issue; the second uses a tool-use
+# hint to break the extended-thinking-without-action pattern; if all three
+# stall the issue is likely systematically problematic (content too large,
+# auth expired, etc.) and requires human intervention.  See issues #2823,
+# #2894.
+THINKING_STALL_MAX_RETRIES = 2
+THINKING_STALL_BACKOFF_SECONDS = [30, 60]
+
+# Hint injected into the worker args on thinking stall retries.  Appended
+# after the primary args (e.g. issue number) so the agent sees it as part
+# of the command input.  Nudges the agent to start with a tool call instead
+# of entering extended thinking mode.  See issue #2894.
+THINKING_STALL_RETRY_HINT = (
+    "\n\nIMPORTANT: Start by immediately using a tool (e.g., read the "
+    "issue with gh issue view) rather than planning in your head first. "
+    "This session was restarted after a thinking stall."
+)
 
 # Startup monitor resolution marker.  When this substring appears in a session
 # log, the wrapper's startup monitor confirmed that all *project* MCP servers
@@ -2096,6 +2110,41 @@ def run_worker_phase(
     return wait_exit
 
 
+def _post_thinking_stall_escalation_comment(
+    ctx: "ShepherdContext",
+    *,
+    total_attempts: int,
+) -> None:
+    """Post a GitHub comment explaining a thinking stall budget exhaustion.
+
+    Called when all THINKING_STALL_MAX_RETRIES retries are consumed.
+    Posts a diagnostic comment on the issue so operators can investigate
+    without consulting logs.  Silently skips posting if the issue number
+    is unavailable or the comment fails (this is best-effort).
+    See issue #2894.
+    """
+    issue = ctx.config.issue
+    if not issue:
+        return
+
+    comment = (
+        "**Shepherd: Thinking stall retry budget exhausted**\n\n"
+        f"The builder session entered extended thinking mode without making "
+        f"any tool calls, and all {total_attempts} attempt(s) were exhausted.\n\n"
+        "**Things to check:**\n"
+        "- **Authentication**: run `claude auth status` to verify credentials "
+        "are not expired (expired auth can appear as a thinking stall because "
+        "the interactive welcome TUI produces thinking-style output).\n"
+        "- **Issue content length**: very long issues or issues that reference "
+        "many files can overwhelm the model's planning capacity — consider "
+        "splitting the issue into smaller pieces.\n"
+        "- **Claude Code version**: run `claude --version` to check for "
+        "updates that may address stall behavior.\n\n"
+        "<!-- loom:shepherd-note -->"
+    )
+    gh_issue_comment(issue, comment, cwd=ctx.repo_root)
+
+
 def run_phase_with_retry(
     ctx: ShepherdContext,
     *,
@@ -2122,8 +2171,11 @@ def run_phase_with_retry(
     On exit code 9 (auth failure), returns immediately (not retryable).
     On exit code 11 (degraded session), returns immediately (not retryable;
     rate limits won't resolve with retries).  See issue #2631.
-    On exit code 14 (thinking stall), returns immediately (not retryable;
-    extended thinking without tool calls won't self-resolve).  See issue #2784.
+    On exit code 14 (thinking stall), retries up to THINKING_STALL_MAX_RETRIES
+    times with escalating backoff.  The first retry appends a tool-use hint
+    to the worker args to break the extended-thinking-without-action pattern.
+    When the budget is exhausted a diagnostic GitHub comment is posted on the
+    issue.  See issues #2784, #2823, #2894.
     On exit code 10 (ghost session), classifies the root cause from the
     worker log and uses a cause-specific retry strategy from
     ``GHOST_RETRY_STRATEGIES``.  Retries on a **separate** budget that does
@@ -2158,6 +2210,14 @@ def run_phase_with_retry(
     attempt = 0  # Total attempt counter for unique session names (issue #2639)
 
     while True:
+        # Build effective args: on thinking stall retries, append a hint to
+        # nudge the agent towards immediate tool use rather than extended
+        # thinking.  The hint is appended after the primary args (e.g. issue
+        # number) so it is visible to the Claude session.  See issue #2894.
+        effective_args = args
+        if thinking_stall_retries > 0:
+            effective_args = f"{args}{THINKING_STALL_RETRY_HINT}" if args else THINKING_STALL_RETRY_HINT
+
         attempt_start = time.monotonic()
         exit_code = run_worker_phase(
             ctx,
@@ -2167,7 +2227,7 @@ def run_phase_with_retry(
             phase=phase,
             worktree=worktree,
             pr_number=pr_number,
-            args=args,
+            args=effective_args,
             planning_timeout=planning_timeout,
             attempt=attempt,
             thinking_stall_timeout=thinking_stall_timeout,
@@ -2208,10 +2268,12 @@ def run_phase_with_retry(
             return 13
 
         # --- Thinking stall (exit code 14) ---
-        # Allow one retry before treating as non-retryable.  Thinking stalls
-        # can be transient (MCP server state at session startup, one-time model
-        # behavior).  Two consecutive stalls indicate a systematic issue.
-        # See issues #2784, #2823.
+        # Allow up to THINKING_STALL_MAX_RETRIES retries before treating as
+        # non-retryable.  Thinking stalls can be transient (MCP server state
+        # at session startup, one-time model behavior); the first retry uses
+        # a tool-use hint to break the extended-thinking-without-action
+        # pattern.  Three consecutive stalls indicate a systematic issue.
+        # See issues #2784, #2823, #2894.
         if exit_code == 14:
             if thinking_stall_retries < THINKING_STALL_MAX_RETRIES:
                 backoff = THINKING_STALL_BACKOFF_SECONDS[thinking_stall_retries]
@@ -2228,12 +2290,17 @@ def run_phase_with_retry(
             # output without tool calls) rather than an explicit auth failure.
             # The auth pre-flight is skipped for shepherd subprocesses to avoid
             # config-lock deadlock, so expired auth goes undetected until here.
-            # See issue #2893.
+            # Post a GitHub comment so operators can diagnose the failure without
+            # consulting logs.  See issues #2893, #2894.
+            total_attempts = thinking_stall_retries + 1
             log_warning(
                 f"Thinking stall retry budget exhausted after "
-                f"{thinking_stall_retries + 1} consecutive stall(s). "
+                f"{total_attempts} consecutive stall(s). "
                 f"If authentication recently expired, this may be masking an "
                 f"auth failure — run 'claude auth status' to verify."
+            )
+            _post_thinking_stall_escalation_comment(
+                ctx, total_attempts=total_attempts
             )
             return 14
 
