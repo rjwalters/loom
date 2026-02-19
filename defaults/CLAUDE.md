@@ -43,6 +43,8 @@ Additional options for `install-loom.sh`:
 
 **Never use `gh pr merge`** — Always use `./.loom/scripts/merge-pr.sh <PR_NUMBER>` instead. The `gh pr merge` command attempts a local checkout which fails in worktrees. The merge script uses the GitHub API directly. A PreToolUse hook enforces this.
 
+**`--permission-mode bypassPermissions` silently disables PreToolUse hooks** — If you invoke Claude Code with `--permission-mode bypassPermissions`, ALL PreToolUse hooks (including `guard-destructive.sh`) are skipped entirely and will not fire. Loom agents use `--dangerously-skip-permissions` instead, which runs Claude in non-interactive mode while still firing hooks. If you have a shell alias like `alias claude="claude --permission-mode bypassPermissions"`, your interactive sessions will have no hook protection. Use `--dangerously-skip-permissions` for automation that requires hooks to run.
+
 ## Three-Layer Architecture
 
 Loom uses a three-layer orchestration architecture for scalable automation:

@@ -2,6 +2,48 @@
 
 ## Common Issues
 
+### Hooks not firing (`guard-destructive.sh` not blocking commands)
+
+**Symptom**: Commands that should be blocked or confirmed by `guard-destructive.sh` (e.g., `git reset --hard`, `gh issue close`) are executing without any prompt or denial.
+
+**Root cause**: Claude Code's `--permission-mode bypassPermissions` flag skips ALL PreToolUse hooks entirely. If Claude Code is invoked with this flag, hooks never run — not even safety hooks like `guard-destructive.sh`.
+
+**How to diagnose**:
+```bash
+# Check if you have a shell alias that sets bypassPermissions
+alias claude 2>/dev/null || echo "no alias"
+
+# Check if Loom scripts are using the correct flag
+grep -r 'permission-mode' .loom/scripts/ .loom/roles/ 2>/dev/null
+```
+
+**The two flags behave differently**:
+
+| Flag | Hooks fire? | Use case |
+|------|-------------|----------|
+| `--dangerously-skip-permissions` | ✅ YES | Loom automation (agents use this) |
+| `--permission-mode bypassPermissions` | ❌ NO | Fully bypasses all permission checks AND hooks |
+
+**Fix**: If you have a shell alias using `--permission-mode bypassPermissions`, change it to use `--dangerously-skip-permissions` instead:
+
+```bash
+# WRONG - hooks silently disabled:
+alias claude="claude --permission-mode bypassPermissions"
+
+# CORRECT - hooks still fire:
+alias claude="claude --dangerously-skip-permissions"
+```
+
+Note: `--dangerously-skip-permissions` still skips interactive permission prompts (so agents can run non-interactively), but hooks are executed. This is the intended mode for Loom agents.
+
+**Verify the fix**: After updating your alias, restart your shell and confirm hooks fire by checking the hook error log:
+```bash
+# Hook invocations log errors here:
+cat .loom/logs/hook-errors.log
+```
+
+If the log is absent or empty and hooks aren't blocking, confirm Claude Code is invoked with `--dangerously-skip-permissions` (not `bypassPermissions`).
+
 ### Cleaning Up Stale Worktrees and Branches
 
 Use the `loom-clean` command to restore your repository to a clean state:
