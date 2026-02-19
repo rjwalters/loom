@@ -2081,6 +2081,7 @@ def run_phase_with_retry(
     pr_number: int | None = None,
     args: str | None = None,
     planning_timeout: int = 0,
+    thinking_stall_timeout: int = THINKING_STALL_TIMEOUT,
 ) -> int:
     """Run a phase with automatic retry on stuck, low-output, or MCP failure.
 
@@ -2106,6 +2107,14 @@ def run_phase_with_retry(
     LOW_OUTPUT_MAX_ATTEMPT_SECONDS, retries are skipped entirely
     because the failure is likely an infrastructure issue rather than
     a transient blip.  See issue #2519.
+
+    Args:
+        thinking_stall_timeout: Wall-clock seconds before checking for a
+            thinking stall (output with zero tool calls).  Defaults to
+            ``THINKING_STALL_TIMEOUT`` (180s).  Builder phases pass
+            ``ctx.config.builder_thinking_stall_timeout`` (360s) to avoid
+            killing complex implementation tasks that legitimately require
+            extended reasoning windows.  See issue #2853.
 
     Returns:
         Exit code: 0=success, 3=shutdown, 4=stuck after retries,
@@ -2134,6 +2143,7 @@ def run_phase_with_retry(
             args=args,
             planning_timeout=planning_timeout,
             attempt=attempt,
+            thinking_stall_timeout=thinking_stall_timeout,
         )
         # Compute the actual session name used for this attempt (must
         # match the logic in run_worker_phase for log file lookups).
