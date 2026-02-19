@@ -251,3 +251,19 @@ class TestShepherdConfig:
         """Worktree marker file should have default value."""
         config = ShepherdConfig(issue=42)
         assert config.worktree_marker_file == ".loom-in-use"
+
+    def test_builder_thinking_stall_timeout_default(self) -> None:
+        """builder_thinking_stall_timeout should default to 360."""
+        config = ShepherdConfig(issue=42)
+        assert config.builder_thinking_stall_timeout == 360
+
+    def test_builder_thinking_stall_timeout_env_override(self) -> None:
+        """LOOM_BUILDER_THINKING_STALL_TIMEOUT env var should override default."""
+        with patch.dict(os.environ, {"LOOM_BUILDER_THINKING_STALL_TIMEOUT": "600"}):
+            config = ShepherdConfig(issue=42)
+            assert config.builder_thinking_stall_timeout == 600
+
+    def test_builder_thinking_stall_timeout_explicit(self) -> None:
+        """builder_thinking_stall_timeout can be explicitly set."""
+        config = ShepherdConfig(issue=42, builder_thinking_stall_timeout=120)
+        assert config.builder_thinking_stall_timeout == 120
