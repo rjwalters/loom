@@ -504,6 +504,25 @@ class TestCheckMainRepoClean:
             result = _check_main_repo_clean(Path("/fake/repo"), allow_dirty=True)
             assert result is True
 
+    def test_warn_message_uses_default_reason(self) -> None:
+        """Default reason should say '--allow-dirty-main specified'."""
+        with patch("loom_tools.shepherd.cli.get_uncommitted_files", return_value=["M file.py"]), \
+             patch("loom_tools.shepherd.cli.log_warning") as mock_warn:
+            _check_main_repo_clean(Path("/fake/repo"), allow_dirty=True)
+            messages = [call[0][0] for call in mock_warn.call_args_list]
+            assert any("--allow-dirty-main specified" in msg for msg in messages)
+
+    def test_warn_message_uses_custom_reason(self) -> None:
+        """Custom reason should appear in the warning message (issue #2827)."""
+        with patch("loom_tools.shepherd.cli.get_uncommitted_files", return_value=["M file.py"]), \
+             patch("loom_tools.shepherd.cli.log_warning") as mock_warn:
+            _check_main_repo_clean(
+                Path("/fake/repo"), allow_dirty=True, allow_dirty_reason="implied by --merge"
+            )
+            messages = [call[0][0] for call in mock_warn.call_args_list]
+            assert any("implied by --merge" in msg for msg in messages)
+            assert not any("--allow-dirty-main specified" in msg for msg in messages)
+
     def test_logs_warning_with_file_list(self) -> None:
         """Should log warning with list of changed files."""
         with patch("loom_tools.shepherd.cli.get_uncommitted_files", return_value=["M file.py", "?? new.txt"]), \
