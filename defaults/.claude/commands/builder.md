@@ -284,6 +284,29 @@ Before writing any code, confirm ALL of these:
 
 **If any of these fail, STOP and fix the setup before proceeding.**
 
+### Working with gh CLI from a Worktree
+
+**You do NOT need to `cd` to the main repo to use `gh` or `.loom/scripts/` commands.**
+
+These all work from within your worktree:
+- `gh issue view <N>` — no cd needed
+- `gh pr list` — no cd needed
+- `./.loom/scripts/checkpoint.sh write ...` — no cd needed
+
+❌ **WRONG** (causes worktree escape):
+```bash
+cd /Users/rwalters/GitHub/loom && gh issue view 123
+cd {{workspace}} && gh pr list
+```
+
+✅ **CORRECT** (stay in worktree):
+```bash
+gh issue view 123   # Works from worktree
+./.loom/scripts/checkpoint.sh write --stage planning --issue 123
+```
+
+**A PreToolUse hook blocks `cd` commands to the main repo from worktrees.**
+
 ## Progress Checkpoints
 
 **CRITICAL: Write checkpoints at every stage to enable recovery.** Without checkpoints, the shepherd cannot reliably distinguish "builder made real progress but crashed" from "builder never started meaningful work." While the shepherd can now detect some cases of uncommitted work via log analysis and file counts, checkpoints remain the primary and most reliable signal for recovery. Always write them — skipping checkpoints risks your completed work being retried from scratch instead of recovered.

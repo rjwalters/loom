@@ -333,6 +333,34 @@ if [[ -n "$WORKTREE_PATH" ]]; then
 fi
 
 # =============================================================================
+# LOOM: Block cd to main repo paths from worktrees (prevents worktree escapes)
+#
+# When a builder CDs to the main repo (outside their worktree), subsequent
+# file operations land in the main repo, causing "worktree escape" failures
+# (e.g., WORK_LOG.md dirtied on main). The Edit/Write hook can't catch this
+# because the modification happens via Bash, not via Edit/Write tools.
+# See issue #2893.
+# =============================================================================
+
+WORKTREE_PATH="${LOOM_WORKTREE_PATH:-}"
+if [[ -n "$WORKTREE_PATH" ]] && [[ -n "$REPO_ROOT" ]]; then
+    # Extract first absolute cd target (handles: "cd /x", "cmd && cd /x", etc.)
+    CD_ABS=$(echo "$COMMAND" | \
+        grep -oE '(^|[[:space:];|&]+)cd[[:space:]]+/[^[:space:];&|"'"'"']+' | \
+        head -1 | sed 's/.*cd[[:space:]]*//')
+    if [[ -n "$CD_ABS" ]]; then
+        CD_NORM="${CD_ABS%/}"
+        REPO_NORM="${REPO_ROOT%/}"
+        WT_NORM="${WORKTREE_PATH%/}"
+        # Block if under main repo but outside worktree
+        if [[ "$CD_NORM" = "$REPO_NORM" ]] || \
+           ([[ "$CD_NORM/" = "$REPO_NORM/"* ]] && [[ "$CD_NORM/" != "$WT_NORM/"* ]]); then
+            deny "BLOCKED: Do not 'cd' to main repo paths ('$CD_ABS') from a worktree. All 'gh', 'git', and '.loom/scripts/' commands work from within your worktree ('$WORKTREE_PATH'). There is no need to navigate to the main repository."
+        fi
+    fi
+fi
+
+# =============================================================================
 # ALLOW - Everything else passes through
 # =============================================================================
 
