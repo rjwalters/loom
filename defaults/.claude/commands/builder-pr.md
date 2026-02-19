@@ -88,6 +88,52 @@ This review happens BEFORE creating your worktree:
 4. Create worktree
 5. Implement (using patterns learned from review)
 
+## Write PR Body Before Running Tests
+
+**CRITICAL**: Before running the test suite, write your PR description to `.loom/pr-body.md`.
+
+This ensures a high-quality PR description is preserved even if context runs out during testing. The shepherd uses this file when creating the PR automatically.
+
+### Why This Matters
+
+The builder commonly exhausts its context window during test verification. When this happens, the shepherd creates the PR automatically — but it can only generate a boilerplate description unless you've pre-written the body.
+
+### How to Write the PR Body
+
+After implementing your changes (but BEFORE running tests):
+
+```bash
+cat > .loom/pr-body.md << 'EOF'
+## Summary
+[1-2 sentences describing what this PR does and why]
+
+## Changes
+- [Key change 1 - what you changed and why]
+- [Key change 2]
+- [Key change 3]
+
+## Acceptance Criteria Verification
+
+| Criterion | Status | Verification |
+|-----------|--------|--------------|
+| [Criterion from issue] | ✅ | [How you verified it] |
+
+## Test Plan
+- [ ] [Test 1]
+- [ ] [Test 2]
+
+Closes #N
+EOF
+```
+
+Replace `#N` with the actual issue number. Write this BEFORE running `pnpm check:ci` or any test suite.
+
+### When to Update It
+
+If you discover additional changes during testing, update `.loom/pr-body.md` to reflect them before committing.
+
+---
+
 ## Test Output: Truncate for Token Efficiency
 
 **IMPORTANT**: When running tests, truncate verbose output to conserve tokens in long-running sessions.
