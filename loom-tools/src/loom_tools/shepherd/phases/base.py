@@ -1231,23 +1231,57 @@ def _scan_log_for_thinking_stall(log_path: Path) -> bool:
 # to avoid flooding the shepherd log.
 _THINKING_SNIPPET_MAX_CHARS = 500
 
+# Minimum number of printable ASCII characters a line must contain to be
+# included in a thinking snippet.  Lines below this threshold are spinner
+# animation artifacts (single characters, multibyte fragments) that provide
+# no diagnostic value.
+_SNIPPET_MIN_ASCII_CHARS = 3
+
+
+def _filter_spinner_artifacts(text: str) -> str:
+    """Filter spinner animation artifacts from ANSI-stripped log content.
+
+    After ANSI stripping, spinner characters (Unicode block characters, arrows,
+    combining characters) remain as fragmented non-ASCII bytes that provide no
+    diagnostic value.  This function removes lines that consist primarily of
+    such artifacts by requiring at least ``_SNIPPET_MIN_ASCII_CHARS`` printable
+    ASCII characters per line.
+
+    Preserved: lines like ``"thought for 3s)"`` and ``"↓ N.Nk tokens · thinking"``
+    Excluded: garbled fragments like ``"mbé↑"``, ``"aé7"``, ``"mi"``, ``"bn"``
+
+    Args:
+        text: ANSI-stripped log content, potentially containing spinner artifacts.
+
+    Returns:
+        Text with artifact-only lines removed, joined by newlines.
+    """
+    result = []
+    for line in text.splitlines():
+        ascii_count = sum(1 for c in line if 32 <= ord(c) <= 126)
+        if ascii_count >= _SNIPPET_MIN_ASCII_CHARS:
+            result.append(line)
+    return "\n".join(result)
+
 
 def _extract_thinking_snippet(log_path: Path, max_chars: int = _THINKING_SNIPPET_MAX_CHARS) -> str:
     """Extract a diagnostic snippet from a thinking-stall builder log.
 
-    Reads the builder log, strips ANSI codes, and returns the tail of
-    the CLI output (up to *max_chars* characters).  Even though the
-    log typically contains only spinner animations during a thinking stall,
-    the tail gives shepherds and human operators a concrete view of the
-    session state and distinguishes true thinking stalls from early crashes.
+    Reads the builder log, strips ANSI codes, filters spinner animation
+    artifacts, and returns the tail of the CLI output (up to *max_chars*
+    characters).  Even though the log typically contains only spinner
+    animations during a thinking stall, the tail gives shepherds and human
+    operators a concrete view of the session state and distinguishes true
+    thinking stalls from early crashes.
 
     Args:
         log_path: Path to the builder session log file.
         max_chars: Maximum number of characters to return.
 
     Returns:
-        A stripped string of the last ``max_chars`` characters of CLI output,
-        or an empty string if the log is unavailable or empty.
+        A stripped string of the last ``max_chars`` characters of CLI output
+        with spinner artifacts removed, or an empty string if the log is
+        unavailable or empty.
     """
     if not log_path.is_file():
         return ""
@@ -1259,7 +1293,8 @@ def _extract_thinking_snippet(log_path: Path, max_chars: int = _THINKING_SNIPPET
         if not cli_output:
             return ""
 
-        tail = cli_output.strip()[-max_chars:]
+        filtered = _filter_spinner_artifacts(cli_output)
+        tail = filtered.strip()[-max_chars:]
         return tail.strip()
 
     except OSError:
