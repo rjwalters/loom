@@ -2222,6 +2222,19 @@ def run_phase_with_retry(
                 )
                 time.sleep(backoff)
                 continue
+            # Retry budget exhausted.  Multiple consecutive thinking stalls can
+            # indicate expired authentication: when auth is expired, the builder
+            # subprocess shows the interactive welcome TUI (producing thinking
+            # output without tool calls) rather than an explicit auth failure.
+            # The auth pre-flight is skipped for shepherd subprocesses to avoid
+            # config-lock deadlock, so expired auth goes undetected until here.
+            # See issue #2893.
+            log_warning(
+                f"Thinking stall retry budget exhausted after "
+                f"{thinking_stall_retries + 1} consecutive stall(s). "
+                f"If authentication recently expired, this may be masking an "
+                f"auth failure — run 'claude auth status' to verify."
+            )
             return 14
 
         # --- Pre-retry approval check (judge phase only) ---
