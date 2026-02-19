@@ -18787,16 +18787,24 @@ class TestRunPhaseWithRetryThinkingStall:
         assert call_count == 2
         mock_sleep.assert_called_once_with(THINKING_STALL_BACKOFF_SECONDS[0])
 
-    def test_thinking_stall_non_retryable_on_second_consecutive(
+    def test_thinking_stall_non_retryable_on_third_consecutive(
         self, mock_context: MagicMock
     ) -> None:
-        """Two consecutive thinking stalls exhaust the budget and return 14."""
+        """Three consecutive thinking stalls exhaust the budget and return 14.
+
+        With THINKING_STALL_MAX_RETRIES=2 the budget allows 2 retries (3
+        total attempts) before giving up.  Exhaustion also posts an escalation
+        comment — mock that call to avoid a real gh subprocess.
+        """
         with (
             patch(
                 "loom_tools.shepherd.phases.base.run_worker_phase",
                 return_value=14,
             ),
             patch("time.sleep"),
+            patch(
+                "loom_tools.shepherd.phases.base._post_thinking_stall_escalation_comment"
+            ) as mock_comment,
         ):
             exit_code = run_phase_with_retry(
                 mock_context,
@@ -18808,6 +18816,7 @@ class TestRunPhaseWithRetryThinkingStall:
             )
 
         assert exit_code == 14
+        mock_comment.assert_called_once_with(mock_context, total_attempts=3)
 
     def test_thinking_stall_counter_independent_of_ghost(
         self, mock_context: MagicMock
