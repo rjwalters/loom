@@ -765,7 +765,10 @@ class BuilderPhase:
                 status=PhaseStatus.FAILED,
                 message=(
                     "builder thinking stall: extended thinking output "
-                    "with zero tool calls detected (retry budget exhausted)"
+                    "with zero tool calls detected (retry budget exhausted). "
+                    "Note: expired authentication can appear as a thinking stall "
+                    "because the auth pre-flight is skipped for shepherd subprocesses "
+                    "— verify with: claude auth status"
                 ),
                 phase_name="builder",
                 data={
