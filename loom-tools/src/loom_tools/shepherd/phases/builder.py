@@ -33,6 +33,7 @@ from loom_tools.shepherd.issue_quality import (
     Severity,
     validate_issue_quality_with_gates,
 )
+from loom_tools.common.github import gh_pr_view
 from loom_tools.shepherd.labels import (
     get_pr_for_issue,
     transition_issue_labels,
@@ -52,6 +53,36 @@ from loom_tools.shepherd.phases.base import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _is_pr_open(pr: int, repo_root: Path | None = None) -> bool:
+    """Verify that a PR is actually in OPEN state.
+
+    ``get_pr_for_issue()`` uses ``--state open`` filtering, but GitHub's API
+    has an eventual-consistency window of a few seconds.  When
+    ``_check_stale_branch`` closes a PR right before the builder-skip check
+    runs, the PR may still appear open in a ``gh pr list`` query.
+
+    This function does a direct ``gh pr view`` lookup to confirm the PR's
+    current state before the builder is skipped.  If the lookup fails for any
+    reason we default to ``True`` (assume open) so as not to block normal
+    operation.
+
+    Args:
+        pr: PR number to check.
+        repo_root: Working directory for the gh command.
+
+    Returns:
+        True if the PR is OPEN, False if it is CLOSED or MERGED.
+    """
+    try:
+        meta = gh_pr_view(pr, fields=["state"], cwd=repo_root)
+        if meta is None:
+            return True  # Can't confirm state — assume open to avoid false negatives
+        return meta.get("state", "OPEN").upper() == "OPEN"
+    except Exception:
+        return True  # Fail open
+
 
 # Pre-implementation reproducibility check settings
 _REPRODUCIBILITY_RUNS = 3  # Number of times to run each test for flakiness
@@ -236,6 +267,17 @@ class BuilderPhase:
         # Check for existing PR
         pr = get_pr_for_issue(ctx.config.issue, repo_root=ctx.repo_root)
         if pr is not None:
+            # Verify the PR is actually open — GitHub's API has an
+            # eventual-consistency window where a just-closed PR may still
+            # appear in `--state open` list queries (issue #2908).
+            if not _is_pr_open(pr, repo_root=ctx.repo_root):
+                logger.info(
+                    "PR #%s for issue #%s is not open (closed/merged) — "
+                    "falling through to builder",
+                    pr,
+                    ctx.config.issue,
+                )
+                return False, ""
             ctx.pr_number = pr
             return True, f"PR #{pr} already exists"
 
@@ -273,27 +315,39 @@ class BuilderPhase:
         # Check for existing PR
         pr = get_pr_for_issue(ctx.config.issue, repo_root=ctx.repo_root)
         if pr is not None:
-            ctx.pr_number = pr
-            # Report milestone
-            ctx.report_milestone("pr_created", pr_number=pr)
-            # Ensure issue has loom:building label (atomic transition)
-            if not ctx.has_issue_label("loom:building"):
-                transition_issue_labels(
+            # Verify the PR is actually open — GitHub's API has an
+            # eventual-consistency window where a just-closed PR may still
+            # appear in `--state open` list queries (issue #2908).
+            if not _is_pr_open(pr, repo_root=ctx.repo_root):
+                logger.info(
+                    "PR #%s for issue #%s is not open (closed/merged) — "
+                    "falling through to builder",
+                    pr,
                     ctx.config.issue,
-                    add=["loom:building"],
-                    remove=["loom:issue"],
-                    repo_root=ctx.repo_root,
                 )
-                ctx.label_cache.invalidate_issue(ctx.config.issue)
-            # Create marker if worktree exists
-            if ctx.worktree_path and ctx.worktree_path.is_dir():
-                self._create_worktree_marker(ctx)
-            return PhaseResult(
-                status=PhaseStatus.SKIPPED,
-                message=f"PR #{pr} already exists",
-                phase_name="builder",
-                data={"pr_number": pr},
-            )
+                pr = None
+            else:
+                ctx.pr_number = pr
+                # Report milestone
+                ctx.report_milestone("pr_created", pr_number=pr)
+                # Ensure issue has loom:building label (atomic transition)
+                if not ctx.has_issue_label("loom:building"):
+                    transition_issue_labels(
+                        ctx.config.issue,
+                        add=["loom:building"],
+                        remove=["loom:issue"],
+                        repo_root=ctx.repo_root,
+                    )
+                    ctx.label_cache.invalidate_issue(ctx.config.issue)
+                # Create marker if worktree exists
+                if ctx.worktree_path and ctx.worktree_path.is_dir():
+                    self._create_worktree_marker(ctx)
+                return PhaseResult(
+                    status=PhaseStatus.SKIPPED,
+                    message=f"PR #{pr} already exists",
+                    phase_name="builder",
+                    data={"pr_number": pr},
+                )
 
         # Check for shutdown
         if ctx.check_shutdown():
