@@ -18573,3 +18573,148 @@ class TestExtractTestFilePaths:
     def test_empty_input(self) -> None:
         result = BuilderPhase._extract_test_file_paths(set())
         assert result == set()
+
+
+class TestBuilderThinkingStallTimeoutThreading:
+    """Test that builder_thinking_stall_timeout is threaded through to run_phase_with_retry."""
+
+    @pytest.fixture(autouse=True)
+    def _no_usage_api(self):
+        """Prevent real keychain/API calls from _is_rate_limited."""
+        with patch(
+            "loom_tools.common.usage._read_keychain_token", return_value=None
+        ):
+            yield
+
+    def test_passes_thinking_stall_timeout_at_primary_call_site(
+        self, mock_context: MagicMock
+    ) -> None:
+        """BuilderPhase.run() passes builder_thinking_stall_timeout at the primary call site.
+
+        Verifies builder.py:430 passes ctx.config.builder_thinking_stall_timeout
+        to run_phase_with_retry. See issue #2903.
+        """
+        mock_context.check_shutdown.return_value = False
+        mock_context.config.builder_thinking_stall_timeout = 500
+        wt_mock = MagicMock()
+        wt_mock.is_dir.return_value = True
+        wt_mock.__bool__ = lambda self: True
+        mock_context.worktree_path = wt_mock
+
+        builder = BuilderPhase()
+
+        with (
+            patch(
+                "loom_tools.shepherd.phases.builder.get_pr_for_issue",
+                return_value=None,
+            ),
+            patch("loom_tools.shepherd.phases.builder.transition_issue_labels"),
+            patch(
+                "loom_tools.shepherd.phases.builder.run_phase_with_retry",
+                return_value=4,  # stuck — causes early return
+            ) as mock_run_phase,
+            patch.object(builder, "_create_worktree_marker"),
+            patch.object(builder, "_mark_issue_blocked"),
+        ):
+            builder.run(mock_context)
+
+        mock_run_phase.assert_called_once()
+        call_kwargs = mock_run_phase.call_args[1]
+        assert call_kwargs["thinking_stall_timeout"] == 500
+
+    def test_passes_thinking_stall_timeout_at_escape_retry_call_site(
+        self, mock_context: MagicMock
+    ) -> None:
+        """BuilderPhase.run() passes builder_thinking_stall_timeout at the escape retry call site.
+
+        Verifies builder.py:793 also passes ctx.config.builder_thinking_stall_timeout
+        to run_phase_with_retry when retrying after a worktree escape. See issue #2903.
+        """
+        mock_context.check_shutdown.return_value = False
+        mock_context.config.builder_thinking_stall_timeout = 500
+        mock_context.config.escape_max_retries = 1
+        wt_mock = MagicMock()
+        wt_mock.is_dir.return_value = True
+        wt_mock.__bool__ = lambda self: True
+        mock_context.worktree_path = wt_mock
+
+        builder = BuilderPhase()
+        escape_result = PhaseResult(
+            status=PhaseStatus.FAILED, message="escape", phase_name="builder"
+        )
+
+        with (
+            patch(
+                "loom_tools.shepherd.phases.builder.get_pr_for_issue",
+                return_value=None,
+            ),
+            patch("loom_tools.shepherd.phases.builder.transition_issue_labels"),
+            patch(
+                "loom_tools.shepherd.phases.builder.run_phase_with_retry",
+                return_value=0,
+            ) as mock_run_phase,
+            patch.object(builder, "_create_worktree_marker"),
+            patch.object(
+                builder,
+                "_detect_worktree_escape",
+                side_effect=[escape_result, None],
+            ),
+            patch.object(builder, "_revert_escaped_main_files"),
+            patch.object(builder, "_reset_stale_worktree"),
+            patch.object(builder, "_snapshot_main_dirty", return_value=set()),
+            patch.object(builder, "validate", return_value=False),
+            patch.object(builder, "_cleanup_stale_worktree"),
+            patch.object(
+                builder, "_gather_diagnostics", return_value={"summary": "ok"}
+            ),
+        ):
+            builder.run(mock_context)
+
+        # Both call sites — primary (line ~430) and escape retry (line ~793) — must
+        # forward the config timeout.
+        assert mock_run_phase.call_count == 2
+        for call in mock_run_phase.call_args_list:
+            assert call[1]["thinking_stall_timeout"] == 500
+
+
+class TestRunPhaseWithRetryThinkingStallTimeoutThreading:
+    """Test that run_phase_with_retry threads thinking_stall_timeout to run_worker_phase."""
+
+    @pytest.fixture
+    def mock_context(self) -> MagicMock:
+        """Create a mock ShepherdContext."""
+        ctx = MagicMock(spec=ShepherdContext)
+        ctx.config = ShepherdConfig(issue=42, task_id="test-123", stuck_max_retries=2)
+        ctx.repo_root = Path("/fake/repo")
+        ctx.scripts_dir = Path("/fake/repo/.loom/scripts")
+        ctx.progress_dir = Path("/tmp/progress")
+        ctx.label_cache = MagicMock()
+        ctx.pr_number = None
+        return ctx
+
+    def test_passes_thinking_stall_timeout_to_run_worker_phase(
+        self, mock_context: MagicMock
+    ) -> None:
+        """run_phase_with_retry passes thinking_stall_timeout through to run_worker_phase.
+
+        Verifies base.py:2138 forwards the timeout parameter so that the stall
+        detection logic in run_worker_phase receives the caller-specified value.
+        See issue #2903.
+        """
+        with patch(
+            "loom_tools.shepherd.phases.base.run_worker_phase",
+            return_value=0,
+        ) as mock_run_worker:
+            run_phase_with_retry(
+                mock_context,
+                role="builder",
+                name="builder-issue-42",
+                timeout=600,
+                max_retries=2,
+                phase="builder",
+                thinking_stall_timeout=720,
+            )
+
+        mock_run_worker.assert_called_once()
+        call_kwargs = mock_run_worker.call_args[1]
+        assert call_kwargs["thinking_stall_timeout"] == 720
