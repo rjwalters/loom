@@ -21,6 +21,9 @@ class ShepherdEntry:
     last_completed: str | None = None
     execution_mode: str | None = None
     startup_warning_at: str | None = None
+    # PID of the subprocess when spawned directly by the standalone daemon
+    # (not via tmux). Populated for execution_mode="subprocess" entries.
+    pid: int | None = None
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> ShepherdEntry:
@@ -38,6 +41,7 @@ class ShepherdEntry:
             last_completed=data.get("last_completed"),
             execution_mode=data.get("execution_mode"),
             startup_warning_at=data.get("startup_warning_at"),
+            pid=data.get("pid"),
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -45,7 +49,7 @@ class ShepherdEntry:
         for k in (
             "issue", "task_id", "output_file", "started", "last_phase",
             "pr_number", "idle_since", "idle_reason", "last_issue",
-            "last_completed", "execution_mode", "startup_warning_at",
+            "last_completed", "execution_mode", "startup_warning_at", "pid",
         ):
             v = getattr(self, k)
             if v is not None:
@@ -297,6 +301,13 @@ class DaemonState:
     force_mode: bool = False
     execution_mode: str = "direct"
     daemon_session_id: str | None = None
+    # PID of the daemon process itself. Populated at startup so the /loom
+    # skill and external tools can verify the daemon is alive without
+    # parsing the PID file separately.
+    daemon_pid: int | None = None
+    # Number of pending signal files in .loom/signals/ at the last poll.
+    # Updated by the daemon after each CommandPoller.poll() call.
+    signal_queue_depth: int = 0
     shepherds: dict[str, ShepherdEntry] = field(default_factory=dict)
     support_roles: dict[str, SupportRoleEntry] = field(default_factory=dict)
     pipeline_state: PipelineState = field(default_factory=PipelineState)
@@ -352,6 +363,8 @@ class DaemonState:
             force_mode=data.get("force_mode", False),
             execution_mode=data.get("execution_mode", "direct"),
             daemon_session_id=data.get("daemon_session_id"),
+            daemon_pid=data.get("daemon_pid"),
+            signal_queue_depth=data.get("signal_queue_depth", 0),
             shepherds=shepherds,
             support_roles=support_roles,
             pipeline_state=pipeline,
@@ -373,6 +386,7 @@ class DaemonState:
             "iteration": self.iteration,
             "force_mode": self.force_mode,
             "execution_mode": self.execution_mode,
+            "signal_queue_depth": self.signal_queue_depth,
             "shepherds": {k: v.to_dict() for k, v in self.shepherds.items()},
             "support_roles": {k: v.to_dict() for k, v in self.support_roles.items()},
             "pipeline_state": self.pipeline_state.to_dict(),
@@ -391,7 +405,7 @@ class DaemonState:
         }
         for k in (
             "started_at", "last_poll", "daemon_session_id",
-            "last_architect_trigger", "last_hermit_trigger",
+            "daemon_pid", "last_architect_trigger", "last_hermit_trigger",
         ):
             v = getattr(self, k)
             if v is not None:

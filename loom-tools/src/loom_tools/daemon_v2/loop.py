@@ -15,6 +15,7 @@ from loom_tools.common.issue_failures import load_failure_log, merge_into_daemon
 from loom_tools.common.logging import log_error, log_info, log_success, log_warning
 from loom_tools.common.state import read_json_file, write_json_file
 from loom_tools.common.time_utils import now_utc
+from loom_tools.daemon_v2.command_poller import CommandPoller
 from loom_tools.daemon_v2.config import DaemonConfig
 from loom_tools.daemon_v2.context import DaemonContext
 from loom_tools.daemon_v2.exit_codes import DaemonExitCode
@@ -78,12 +79,16 @@ def run(ctx: DaemonContext) -> int:
         cleanup_config = load_config()
         handle_daemon_startup(ctx.repo_root, cleanup_config)
 
-        # 10. Compute deadline for timeout
+        # 10. Initialize CommandPoller for signal-based IPC with /loom skill
+        command_poller = CommandPoller(ctx.repo_root)
+        log_info(f"CommandPoller initialized: signals_dir={ctx.signals_dir}")
+
+        # 11. Compute deadline for timeout
         deadline: float | None = None
         if ctx.config.timeout_min > 0:
             deadline = time.time() + ctx.config.timeout_min * 60
 
-        # 11. Main loop
+        # 12. Main loop
         while ctx.running:
             ctx.iteration += 1
 
@@ -104,6 +109,15 @@ def run(ctx: DaemonContext) -> int:
             if check_session_conflict(ctx):
                 log_warning("Yielding to other daemon instance. Exiting.")
                 break
+
+            # Poll and process IPC commands from /loom skill BEFORE iteration.
+            # The /loom skill writes spawn_shepherd/stop/etc. signals here.
+            commands = command_poller.poll()
+            if commands:
+                log_info(f"Iteration {ctx.iteration}: Processing {len(commands)} signal command(s)")
+                _process_commands(ctx, commands)
+                # Update signal_queue_depth in state file after processing
+                _update_signal_queue_depth(ctx, command_poller.queue_depth())
 
             # Run iteration
             log_info(f"Iteration {ctx.iteration}: Starting...")
@@ -126,9 +140,11 @@ def run(ctx: DaemonContext) -> int:
                 log_info("SHUTDOWN_SIGNAL detected after iteration")
                 break
 
-            # Sleep before next iteration
+            # Responsive sleep: wake every 2s to process IPC commands and check
+            # for stop signals. This keeps the daemon responsive to /loom signals
+            # without requiring the full poll_interval to elapse.
             log_info(f"Sleeping {ctx.config.poll_interval}s until next iteration...")
-            time.sleep(ctx.config.poll_interval)
+            _responsive_sleep(ctx, command_poller, ctx.config.poll_interval)
 
         # 11. Run shutdown cleanup
         log_info("Running shutdown cleanup...")
@@ -143,6 +159,282 @@ def run(ctx: DaemonContext) -> int:
 
     finally:
         cleanup_on_exit(ctx)
+
+
+def _responsive_sleep(
+    ctx: DaemonContext,
+    command_poller: CommandPoller,
+    total_seconds: int,
+    tick: int = 2,
+) -> None:
+    """Sleep for total_seconds but wake every tick seconds to process IPC.
+
+    During each tick we:
+    - Check for stop signal (exit early if found)
+    - Poll CommandPoller for new signal commands
+    - Keep the daemon responsive without busy-waiting
+    """
+    elapsed = 0
+    while elapsed < total_seconds and ctx.running:
+        time.sleep(min(tick, total_seconds - elapsed))
+        elapsed += tick
+
+        if check_stop_signal(ctx):
+            log_info("SHUTDOWN_SIGNAL detected during sleep")
+            ctx.running = False
+            break
+
+        # Process any IPC commands that arrived during the sleep tick
+        commands = command_poller.poll()
+        if commands:
+            log_info(f"Sleep-tick: processing {len(commands)} signal command(s)")
+            _process_commands(ctx, commands)
+            _update_signal_queue_depth(ctx, command_poller.queue_depth())
+
+
+def _process_commands(ctx: DaemonContext, commands: list[dict]) -> None:
+    """Process IPC command signals from the /loom Claude Code skill.
+
+    Commands are JSON dicts consumed from .loom/signals/ by CommandPoller.
+    Each command has an "action" field that determines handling.
+
+    Supported actions:
+    - spawn_shepherd: Request daemon to spawn a shepherd for an issue.
+      The daemon's normal iteration loop also spawns shepherds autonomously;
+      this allows the /loom skill to trigger spawning explicitly.
+    - stop: Request graceful daemon shutdown (same effect as stop-daemon file).
+    - pause_shepherd: Pause a specific shepherd by shepherd_id.
+    - resume_shepherd: Resume a paused shepherd by shepherd_id.
+    - set_max_shepherds: Adjust the maximum concurrent shepherd count.
+    """
+    for cmd in commands:
+        action = cmd.get("action", "")
+
+        if action == "spawn_shepherd":
+            issue = cmd.get("issue")
+            mode = cmd.get("mode", "default")
+            flags = cmd.get("flags", [])
+            if issue is None:
+                log_warning("spawn_shepherd command missing 'issue' field, skipping")
+                continue
+            log_info(f"Signal: spawn_shepherd issue=#{issue} mode={mode} flags={flags}")
+            _spawn_shepherd_from_signal(ctx, issue, mode, flags)
+
+        elif action == "stop":
+            log_info("Signal: stop — initiating graceful daemon shutdown")
+            ctx.running = False
+
+        elif action == "pause_shepherd":
+            shepherd_id = cmd.get("shepherd_id")
+            if shepherd_id:
+                log_info(f"Signal: pause_shepherd shepherd_id={shepherd_id}")
+                _pause_shepherd(ctx, shepherd_id)
+            else:
+                log_warning("pause_shepherd command missing 'shepherd_id', skipping")
+
+        elif action == "resume_shepherd":
+            shepherd_id = cmd.get("shepherd_id")
+            if shepherd_id:
+                log_info(f"Signal: resume_shepherd shepherd_id={shepherd_id}")
+                _resume_shepherd(ctx, shepherd_id)
+            else:
+                log_warning("resume_shepherd command missing 'shepherd_id', skipping")
+
+        elif action == "set_max_shepherds":
+            count = cmd.get("count")
+            if isinstance(count, int) and count > 0:
+                log_info(f"Signal: set_max_shepherds count={count}")
+                ctx.config.max_shepherds = count
+            else:
+                log_warning(f"set_max_shepherds invalid count={count!r}, skipping")
+
+        else:
+            log_warning(f"Signal: unknown action={action!r}, skipping")
+
+
+def _spawn_shepherd_from_signal(
+    ctx: DaemonContext,
+    issue: int,
+    mode: str,
+    flags: list[str],
+) -> None:
+    """Spawn a shepherd for an issue in response to a spawn_shepherd signal.
+
+    Spawns loom-shepherd.sh as a direct subprocess of the daemon process.
+    This makes the shepherd (and its worker claude sessions) children of the
+    daemon rather than descendants of any Claude Code session.
+
+    The daemon is the natural parent:
+        init/launchd → loom-daemon → loom-shepherd.sh → claude /builder
+
+    State tracking: on success, writes a ShepherdEntry with execution_mode
+    "subprocess" and the process PID to daemon-state.json.
+    """
+    import hashlib
+
+    from loom_tools.models.daemon_state import ShepherdEntry
+
+    shepherd_script = ctx.repo_root / ".loom" / "scripts" / "loom-shepherd.sh"
+    if not shepherd_script.exists():
+        log_error(f"Signal spawn: loom-shepherd.sh not found at {shepherd_script}")
+        return
+
+    # Find or allocate a shepherd slot
+    if ctx.state is None:
+        log_warning("Signal spawn: no daemon state loaded, cannot track shepherd")
+        return
+
+    shepherd_name = _find_idle_shepherd_slot(ctx)
+    if shepherd_name is None:
+        log_warning(f"Signal spawn: no idle shepherd slot available for issue #{issue}")
+        return
+
+    # Build command arguments
+    args = [str(issue)]
+    if mode == "force":
+        args.append("--merge")
+    args.extend(flags)
+
+    # Log file for this subprocess shepherd
+    log_dir = ctx.repo_root / ".loom" / "logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    timestamp = now_utc().strftime("%Y-%m-%dT%H:%M:%SZ")
+    task_id = hashlib.sha256(
+        f"{shepherd_name}-{issue}-{time.time()}".encode()
+    ).hexdigest()[:7]
+    log_file_path = log_dir / f"loom-shepherd-signal-issue-{issue}-{task_id}.log"
+
+    try:
+        with open(log_file_path, "w") as log_file:
+            proc = subprocess.Popen(
+                [str(shepherd_script)] + args,
+                cwd=ctx.repo_root,
+                stdout=log_file,
+                stderr=subprocess.STDOUT,
+                # No stdin — detached from any terminal
+                stdin=subprocess.DEVNULL,
+            )
+
+        entry = ShepherdEntry(
+            status="working",
+            issue=issue,
+            task_id=task_id,
+            output_file=str(log_file_path),
+            started=timestamp,
+            last_phase="started",
+            execution_mode="subprocess",
+            pid=proc.pid,
+        )
+        ctx.state.shepherds[shepherd_name] = entry
+
+        # Persist state update
+        _write_state(ctx)
+        log_success(
+            f"Signal spawn: {shepherd_name} (PID {proc.pid}) started for issue #{issue}"
+        )
+
+    except OSError as exc:
+        log_error(f"Signal spawn: failed to start shepherd for issue #{issue}: {exc}")
+
+
+def _find_idle_shepherd_slot(ctx: DaemonContext) -> str | None:
+    """Find an idle shepherd slot name, or allocate a new one if under capacity."""
+    from loom_tools.models.daemon_state import ShepherdEntry
+
+    if ctx.state is None:
+        return None
+
+    for name, entry in ctx.state.shepherds.items():
+        if entry.status == "idle":
+            return name
+
+    current_count = len(ctx.state.shepherds)
+    if current_count < ctx.config.max_shepherds:
+        new_name = f"shepherd-{current_count + 1}"
+        ctx.state.shepherds[new_name] = ShepherdEntry(status="idle")
+        return new_name
+
+    return None
+
+
+def _pause_shepherd(ctx: DaemonContext, shepherd_id: str) -> None:
+    """Pause a shepherd by writing a stop file to its worktree."""
+    if ctx.state is None:
+        return
+    entry = ctx.state.shepherds.get(shepherd_id)
+    if entry is None:
+        log_warning(f"pause_shepherd: no shepherd named {shepherd_id!r}")
+        return
+    if entry.status != "working":
+        log_warning(f"pause_shepherd: {shepherd_id} is not working (status={entry.status!r})")
+        return
+
+    # Write a stop-shepherd signal file for the shepherd's worktree
+    if entry.issue is not None:
+        stop_file = (
+            ctx.repo_root / ".loom" / "worktrees" / f"issue-{entry.issue}" / ".stop-shepherd"
+        )
+        try:
+            stop_file.parent.mkdir(parents=True, exist_ok=True)
+            stop_file.touch()
+            entry.status = "paused"
+            log_info(f"pause_shepherd: wrote {stop_file}")
+        except OSError as exc:
+            log_warning(f"pause_shepherd: could not write stop file: {exc}")
+    else:
+        log_warning(f"pause_shepherd: {shepherd_id} has no issue assigned")
+
+
+def _resume_shepherd(ctx: DaemonContext, shepherd_id: str) -> None:
+    """Resume a paused shepherd by removing its stop file."""
+    if ctx.state is None:
+        return
+    entry = ctx.state.shepherds.get(shepherd_id)
+    if entry is None:
+        log_warning(f"resume_shepherd: no shepherd named {shepherd_id!r}")
+        return
+    if entry.status != "paused":
+        log_warning(f"resume_shepherd: {shepherd_id} is not paused (status={entry.status!r})")
+        return
+
+    if entry.issue is not None:
+        stop_file = (
+            ctx.repo_root / ".loom" / "worktrees" / f"issue-{entry.issue}" / ".stop-shepherd"
+        )
+        try:
+            stop_file.unlink(missing_ok=True)
+            entry.status = "working"
+            log_info(f"resume_shepherd: removed {stop_file}")
+        except OSError as exc:
+            log_warning(f"resume_shepherd: could not remove stop file: {exc}")
+    else:
+        log_warning(f"resume_shepherd: {shepherd_id} has no issue assigned")
+
+
+def _write_state(ctx: DaemonContext) -> None:
+    """Write current daemon state to disk (best-effort)."""
+    if ctx.state is None:
+        return
+    try:
+        data = read_json_file(ctx.state_file) if ctx.state_file.exists() else {}
+        if not isinstance(data, dict):
+            data = {}
+        data["shepherds"] = {k: v.to_dict() for k, v in ctx.state.shepherds.items()}
+        write_json_file(ctx.state_file, data)
+    except Exception as exc:
+        log_warning(f"_write_state: failed to persist state: {exc}")
+
+
+def _update_signal_queue_depth(ctx: DaemonContext, depth: int) -> None:
+    """Update signal_queue_depth in daemon-state.json."""
+    try:
+        data = read_json_file(ctx.state_file) if ctx.state_file.exists() else {}
+        if not isinstance(data, dict):
+            return
+        data["signal_queue_depth"] = depth
+        write_json_file(ctx.state_file, data)
+    except Exception as exc:
+        log_warning(f"_update_signal_queue_depth: {exc}")
 
 
 def _run_preflight_checks(ctx: DaemonContext) -> list[str]:
@@ -308,6 +600,8 @@ def _init_state_file(ctx: DaemonContext) -> None:
                 data["running"] = True
                 data["iteration"] = 0
                 data["daemon_session_id"] = ctx.session_id
+                data["daemon_pid"] = os.getpid()
+                data["signal_queue_depth"] = 0
                 data["execution_mode"] = "direct"
                 data["timeout_at"] = timeout_at
                 # Merge persistent failure history into existing state
@@ -326,6 +620,8 @@ def _init_state_file(ctx: DaemonContext) -> None:
         "force_mode": ctx.config.force_mode,
         "execution_mode": "direct",
         "daemon_session_id": ctx.session_id,
+        "daemon_pid": os.getpid(),
+        "signal_queue_depth": 0,
         "timeout_at": timeout_at,
         "shepherds": {},
         "support_roles": {},
