@@ -62,10 +62,19 @@ if [[ "$HAS_ADMIN" != "true" ]]; then
 fi
 
 # Ruleset payload
+# bypass_actors: actor_id 5 = RepositoryRole/admin — allows repo admins to push
+# directly to main without a PR (e.g. for hotfixes or initial setup).
 RULESET_PAYLOAD='{
   "name": "'"$RULESET_NAME"'",
   "target": "branch",
   "enforcement": "active",
+  "bypass_actors": [
+    {
+      "actor_id": 5,
+      "actor_type": "RepositoryRole",
+      "bypass_mode": "always"
+    }
+  ],
   "conditions": {
     "ref_name": {
       "include": ["~DEFAULT_BRANCH"],
@@ -112,8 +121,10 @@ if echo "$RULESET_PAYLOAD" | gh api --method "$API_METHOD" "$API_URL" --input - 
   echo "  - Require linear history (squash merges only)"
   echo "  - Require pull requests (0 approvals required)"
   echo "  - Dismiss stale reviews on new commits"
+  echo "  - Admin bypass: repository admins can push directly without a PR"
   echo ""
   echo "Note: 0 approvals required supports solo development and Loom's label-based review system."
+  echo "Note: Admin bypass allows repo owners to push hotfixes directly to main when needed."
   echo ""
   info "To modify: GitHub Settings > Rules > Rulesets"
   exit 0
