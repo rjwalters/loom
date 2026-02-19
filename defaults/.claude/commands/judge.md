@@ -1142,31 +1142,42 @@ Classify the changed files to determine which scoped test strategies to apply:
 
 **Important**: Always use `python3`, never bare `python` — `python` is not in PATH on macOS or most modern Linux systems.
 
+**CRITICAL: Use `./.loom/scripts/run-tests.sh` instead of bare `python3 -m pytest` in worktrees**
+
+Loom installs `loom-tools` as an editable package from the main repo root. When you `cd` into an
+issue worktree (`.loom/worktrees/issue-N`) and run `python3 -m pytest`, Python imports from the
+*main branch's* source — not the worktree's code. This produces false test failures for any PR
+that modifies `loom-tools`. (Observed in PR #2818 review.)
+
+`./.loom/scripts/run-tests.sh` detects the worktree automatically and sets
+`PYTHONPATH=<worktree>/loom-tools/src` before invoking pytest, ensuring tests import the
+worktree's version. Use it everywhere you would otherwise call `python3 -m pytest`.
+
 **Preferred: Use `pytest-testmon` when available**
 
 ```bash
-# Check if pytest-testmon is available
-if python3 -m pytest --co --testmon 2>/dev/null; then
+# Use run-tests.sh wrapper — sets PYTHONPATH automatically when inside a worktree
+if ./.loom/scripts/run-tests.sh --co --testmon 2>/dev/null; then
     # Check if .testmondata exists and is reasonably current
     if [ -f .testmondata ]; then
         TESTMON_AGE=$(( $(date +%s) - $(stat -f %m .testmondata 2>/dev/null || stat -c %Y .testmondata 2>/dev/null) ))
         if [ "$TESTMON_AGE" -lt 86400 ]; then
             echo "Using pytest-testmon for scoped test execution"
-            python3 -m pytest --testmon -x -q
+            ./.loom/scripts/run-tests.sh --testmon -x -q
             SCOPED_STRATEGY="pytest-testmon"
         else
             echo "Testmon data is stale (>24h) — falling back to full pytest"
-            python3 -m pytest -x -q
+            ./.loom/scripts/run-tests.sh -x -q
             SCOPED_STRATEGY="full-pytest (stale testmon data)"
         fi
     else
         echo "No .testmondata found — running full pytest (consider installing pytest-testmon)"
-        python3 -m pytest -x -q
+        ./.loom/scripts/run-tests.sh -x -q
         SCOPED_STRATEGY="full-pytest (no testmon data)"
     fi
 else
     echo "pytest-testmon not available — running full pytest"
-    python3 -m pytest -x -q
+    ./.loom/scripts/run-tests.sh -x -q
     SCOPED_STRATEGY="full-pytest (testmon not installed)"
 fi
 ```
@@ -1245,7 +1256,7 @@ Run the full test suite when:
 # Generic fallback — use whatever the project's standard check command is
 pnpm check:ci 2>/dev/null || \
     npm test 2>/dev/null || \
-    python3 -m pytest 2>/dev/null || \
+    ./.loom/scripts/run-tests.sh 2>/dev/null || \
     cargo test 2>/dev/null || \
     make test 2>/dev/null
 SCOPED_STRATEGY="full-suite (fallback)"
