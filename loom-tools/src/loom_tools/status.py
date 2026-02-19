@@ -561,6 +561,123 @@ def output_json(snapshot: dict[str, Any]) -> str:
     return json.dumps(snapshot, indent=2)
 
 
+def render_agents_table(
+    daemon_state: DaemonState,
+    repo_root: pathlib.Path,
+    *,
+    _now: datetime | None = None,
+) -> None:
+    """Render a rich table of all active agents directly to stdout."""
+    from rich.console import Console
+    from rich.table import Table
+    import rich.box
+
+    console = Console()
+    table = Table(box=rich.box.SIMPLE_HEAVY, show_header=True, header_style="bold")
+    table.add_column("Agent", style="bold")
+    table.add_column("Status")
+    table.add_column("Issue")
+    table.add_column("Phase")
+    table.add_column("Runtime")
+    table.add_column("Last Heartbeat")
+
+    for sid in sorted(daemon_state.shepherds):
+        entry = daemon_state.shepherds[sid]
+        status = entry.status or "idle"
+
+        if status == "working":
+            status_markup = f"[green]{status}[/green]"
+        elif status == "errored":
+            status_markup = f"[red]{status}[/red]"
+        elif status == "paused":
+            status_markup = f"[yellow]{status}[/yellow]"
+        else:
+            status_markup = f"[dim]{status}[/dim]"
+
+        issue_str = f"#{entry.issue}" if entry.issue is not None else "-"
+        phase_str = entry.last_phase or "-"
+
+        if entry.issue is not None and entry.started:
+            runtime_str = format_uptime(entry.started, _now=_now)
+        else:
+            runtime_str = "-"
+
+        if entry.output_file:
+            idle_secs = _get_file_idle_seconds(entry.output_file)
+            if idle_secs >= 0:
+                heartbeat_str = f"{format_seconds(idle_secs)} ago"
+            else:
+                heartbeat_str = "-"
+        elif entry.idle_reason:
+            reason_map = {
+                "no_ready_issues": "no ready issues",
+                "at_capacity": "at capacity",
+                "completed_issue": "awaiting next",
+                "rate_limited": "rate limited",
+                "shutdown_signal": "shutdown",
+                "needs_human_input": "needs human input",
+            }
+            heartbeat_str = reason_map.get(entry.idle_reason, entry.idle_reason)
+        else:
+            heartbeat_str = "-"
+
+        table.add_row(sid, status_markup, issue_str, phase_str, runtime_str, heartbeat_str)
+
+    for role in ("architect", "hermit", "guide", "champion", "doctor", "auditor"):
+        entry = daemon_state.support_roles.get(role)
+        role_display = role.capitalize()
+
+        if entry is None:
+            table.add_row(role_display, "[dim]idle[/dim]", "-", "-", "-", "-")
+            continue
+
+        status = entry.status or "idle"
+        if status == "running":
+            status_markup = f"[green]{status}[/green]"
+        elif status == "errored":
+            status_markup = f"[red]{status}[/red]"
+        else:
+            status_markup = f"[dim]{status}[/dim]"
+
+        runtime_str = format_uptime(entry.started, _now=_now) if (entry.started and status == "running") else "-"
+        heartbeat_str = time_ago(entry.last_completed, _now=_now) if entry.last_completed else "-"
+
+        table.add_row(role_display, status_markup, "-", "-", runtime_str, heartbeat_str)
+
+    console.print(table)
+
+
+def output_fast(
+    daemon_state: DaemonState,
+    repo_root: pathlib.Path,
+    *,
+    _now: datetime | None = None,
+) -> None:
+    """Print a fast agent status table (no gh queries)."""
+    from rich.console import Console
+
+    console = Console()
+    stop_file = repo_root / ".loom" / "stop-daemon"
+
+    if stop_file.exists():
+        daemon_status = "[yellow]Stopping[/yellow]"
+    elif daemon_state.running:
+        daemon_status = "[green]Running[/green]"
+    else:
+        daemon_status = "[red]Stopped[/red]"
+
+    uptime = format_uptime(daemon_state.started_at, _now=_now) if daemon_state.running else "n/a"
+    pid_str = str(daemon_state.daemon_pid) if daemon_state.daemon_pid else "unknown"
+
+    console.print(f"Daemon: {daemon_status}  |  Uptime: {uptime}  |  PID: {pid_str}")
+    console.print()
+
+    if daemon_state.shepherds or daemon_state.support_roles:
+        render_agents_table(daemon_state, repo_root, _now=_now)
+    else:
+        console.print("[dim]No agent state available[/dim]")
+
+
 # ---------------------------------------------------------------------------
 # File idle time helper
 # ---------------------------------------------------------------------------
@@ -587,6 +704,7 @@ loom-status - Loom System Status (Read-Only)
 
 USAGE:
     loom-status              Display full system status
+    loom-status --fast       Display agent table (no gh queries, fast)
     loom-status --json       Output status as JSON
     loom-status --help       Show this help message
 
@@ -635,16 +753,29 @@ def main(argv: Sequence[str] | None = None) -> None:
     args = list(argv if argv is not None else sys.argv[1:])
 
     json_mode = False
+    fast_mode = False
     for arg in args:
         if arg in ("--help", "-h"):
             print(_HELP_TEXT, end="")
             sys.exit(0)
         elif arg == "--json":
             json_mode = True
+        elif arg == "--fast":
+            fast_mode = True
         else:
             print(f"Error: Unknown option '{arg}'", file=sys.stderr)
             print("Run 'loom-status --help' for usage", file=sys.stderr)
             sys.exit(1)
+
+    if fast_mode and json_mode:
+        print("Error: --fast and --json are mutually exclusive", file=sys.stderr)
+        sys.exit(1)
+
+    if fast_mode:
+        repo_root = find_repo_root()
+        daemon_state = read_daemon_state(repo_root)
+        output_fast(daemon_state, repo_root)
+        return
 
     # Build snapshot (includes parallel gh queries)
     snapshot = build_snapshot()

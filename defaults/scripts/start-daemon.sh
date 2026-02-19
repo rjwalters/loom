@@ -62,6 +62,10 @@ if "$STATUS_ONLY"; then
     if [[ -f "$PIDFILE" ]]; then
         PID="$(cat "$PIDFILE")"
         if kill -0 "$PID" 2>/dev/null; then
+            if command -v loom-status >/dev/null 2>&1; then
+                loom-status --fast
+                exit 0
+            fi
             echo "Daemon running (PID $PID)"
             exit 0
         else
@@ -70,6 +74,10 @@ if "$STATUS_ONLY"; then
             exit 1
         fi
     else
+        if command -v loom-status >/dev/null 2>&1; then
+            loom-status --fast
+            exit 1
+        fi
         echo "Daemon not running"
         exit 1
     fi
