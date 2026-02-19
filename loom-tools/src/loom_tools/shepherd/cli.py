@@ -286,8 +286,6 @@ def _find_source_issues_for_dirty_files(
         for entry in sorted(worktrees_dir.iterdir()):
             if not entry.is_dir():
                 continue
-            from loom_tools.common.paths import NamingConventions
-
             issue_num = NamingConventions.issue_from_worktree(entry.name)
             if issue_num is None:
                 continue
