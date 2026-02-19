@@ -433,6 +433,32 @@ class BuilderPhase:
                 recovery = self._recover_from_existing_worktree(ctx, diag, exit_code=0)
                 if recovery is not None:
                     return recovery
+
+                # recovery returned None — determine why before returning FAILED.
+                # Case: workflow already complete (PR created + review label added).
+                # This happens when the shepherd crashes after the builder finishes
+                # but before advancing to the judge phase.  On restart, the builder
+                # phase runs again, detects prior commits, but recovery has nothing
+                # to do because the workflow is already done.  Return SUCCESS so the
+                # shepherd advances to the judge phase instead of cycling.
+                if diag.get("pr_number") is not None and diag.get(
+                    "pr_has_review_label", False
+                ):
+                    ctx.pr_number = diag["pr_number"]
+                    return PhaseResult(
+                        status=PhaseStatus.SUCCESS,
+                        message=(
+                            f"builder phase complete - PR #{diag['pr_number']} "
+                            f"already exists with review label "
+                            f"(prior checkpoint detected)"
+                        ),
+                        phase_name="builder",
+                        data={
+                            "pr_number": diag["pr_number"],
+                            "recovered_from_checkpoint": True,
+                        },
+                    )
+
                 log_warning(
                     f"Prior checkpoint recovery failed for issue #{ctx.config.issue} "
                     f"— recovery could not complete push/PR workflow"
