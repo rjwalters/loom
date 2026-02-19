@@ -143,6 +143,37 @@ gh pr comment 599 --body "LGTM! Code quality is excellent." && \
 
 ## Evaluation Process
 
+### Pre-Iteration Environment Check
+
+**CRITICAL: Verify `gh` is functional before searching for work.**
+
+MCP server failures can silently corrupt the tool execution environment, causing `gh` commands to return empty output even when PRs exist. Without this check, a corrupted environment causes the judge to falsely report "no work available" and exit — leaving real PRs unreviewed.
+
+Run this as **step 0** before any `gh pr list` commands:
+
+```bash
+# Verify gh is functional — detects MCP server failure / corrupted environment
+REPO_NAME=$(gh repo view --json name --jq '.name' 2>/dev/null)
+if [ -z "$REPO_NAME" ]; then
+    echo "CRITICAL: gh commands appear non-functional (empty output from gh repo view)"
+    echo "This may indicate a corrupted tool environment (e.g., MCP server failure)"
+    echo "Do NOT conclude 'no work available' — the environment itself may be broken"
+    echo "Exiting — the interval runner will trigger a fresh session"
+    exit 1
+fi
+```
+
+**When the check fails:**
+- Do NOT treat this as "no work available"
+- Do NOT update any labels
+- Exit immediately — the session must be restarted
+- The interval runner will trigger a fresh session on the next interval
+
+**Recognizing MCP failure symptoms:**
+- Bash tool shows `(No output)` for commands that should have output
+- Status bar shows `N MCP server failed · /mcp`
+- Multiple sequential `gh` commands all return empty
+
 ### Primary Queue (Priority)
 
 1. **Find work**: `gh pr list --label="loom:review-requested" --state=open`
@@ -194,18 +225,28 @@ gh pr list --state=open --json number,title,labels \
 ```
 Judge starts iteration
     ↓
-Search for loom:review-requested PRs
+Pre-Iteration Environment Check (gh repo view)
     ↓
-    ├─→ Found? → Evaluate as normal (add loom:pr or loom:changes-requested)
+    ├─→ FAILED (empty output)? → Exit with error — do NOT claim "no work"
     │
-    └─→ None found
+    └─→ Passed
             ↓
-        Search for unlabeled open PRs
+        Search for loom:review-requested PRs
             ↓
-            ├─→ Found? → Evaluate but leave labels unchanged
-            │              (external/manual PR, no workflow labels)
+            ├─→ gh returns empty string (not "0")? → Re-run environment check
+            │     ├─→ Environment check FAILED? → Exit with error
+            │     └─→ Environment check passed? → Treat as 0 PRs, continue
             │
-            └─→ None found → No work available, exit iteration
+            ├─→ Found? → Evaluate as normal (add loom:pr or loom:changes-requested)
+            │
+            └─→ None found (0 results)
+                    ↓
+                Search for unlabeled open PRs
+                    ↓
+                    ├─→ Found? → Evaluate but leave labels unchanged
+                    │              (external/manual PR, no workflow labels)
+                    │
+                    └─→ None found → No work available, exit iteration
 ```
 
 **IMPORTANT: Fallback mode behavior**:
@@ -217,7 +258,22 @@ Search for loom:review-requested PRs
 **Example fallback workflow**:
 ```bash
 # 1. Check primary queue
-LABELED_PRS=$(gh pr list --label="loom:review-requested" --json number --jq 'length')
+LABELED_PRS=$(gh pr list --label="loom:review-requested" --json number --jq 'length' 2>/dev/null)
+
+# Guard: empty string means the gh command itself failed (not "0 PRs found")
+# This is a key indicator of MCP server failure or corrupted tool environment
+if [ -z "$LABELED_PRS" ]; then
+    echo "CRITICAL: gh pr list returned empty string (not '0') — possible MCP server failure"
+    echo "Running environment health check..."
+    REPO_NAME=$(gh repo view --json name --jq '.name' 2>/dev/null)
+    if [ -z "$REPO_NAME" ]; then
+        echo "Environment check FAILED — gh commands are non-functional"
+        echo "Exiting without claiming 'no work' — interval runner will restart this session"
+        exit 1
+    fi
+    # gh is working but the label query returned empty — treat as 0
+    LABELED_PRS=0
+fi
 
 if [ "$LABELED_PRS" -gt 0 ]; then
   echo "Found $LABELED_PRS PRs with loom:review-requested"
