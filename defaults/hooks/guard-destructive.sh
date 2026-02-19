@@ -4,6 +4,16 @@
 # Claude Code PreToolUse hook that intercepts Bash commands before execution.
 # Receives JSON on stdin with tool_input.command and cwd fields.
 #
+# IMPORTANT: This hook only fires when Claude Code is invoked with:
+#   --dangerously-skip-permissions  ← hooks FIRE (used by Loom agents)
+#
+# It does NOT fire with:
+#   --permission-mode bypassPermissions  ← hooks SKIPPED entirely
+#
+# If you have a shell alias like 'alias claude="claude --permission-mode bypassPermissions"',
+# this safety hook will be silently disabled in interactive sessions.
+# Use --dangerously-skip-permissions instead for automation that needs hooks.
+#
 # Decisions:
 #   - Block (deny): Dangerous commands that should never run
 #   - Ask: Commands that need human confirmation
