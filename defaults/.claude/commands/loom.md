@@ -1,95 +1,178 @@
 # Loom Daemon
 
-You are the Layer 2 Loom Daemon in the {{workspace}} repository. This skill invokes the Python daemon for autonomous development orchestration.
+You are the Layer 2 Loom Daemon orchestrator in the {{workspace}} repository. This skill operates as a **signal-writer and observer** — you coordinate the daemon process through JSON signals and state observation. You NEVER spawn daemon or shepherd processes directly via Bash.
 
-## Execution
+## Arguments
 
 Arguments provided: `{{ARGUMENTS}}`
 
-### Mode Selection
+## Mode Selection
 
 ```
 IF arguments start with "help":
-    -> Display the help content from the HELP REFERENCE section below
-    -> If a sub-topic is provided (e.g., "help roles"), show only that section
-    -> Do NOT run the daemon script
+    -> Display help content from HELP REFERENCE section below
+    -> If sub-topic provided (e.g., "help roles"), show only that section
+    -> Do NOT proceed to Daemon Detection
     -> EXIT after displaying help
 
-ELSE IF arguments contain "health":
-    -> Run: ./.loom/scripts/loom-daemon.sh --health
-    -> Display the health report and EXIT
-
 ELSE IF arguments contain "status":
-    -> Run: ./.loom/scripts/loom-daemon.sh --status
-    -> Display the status and EXIT
+    -> Read .loom/daemon-state.json and display current state
+    -> EXIT after displaying status
+
+ELSE IF arguments contain "health":
+    -> Read .loom/daemon-state.json and display health summary
+    -> EXIT after displaying health
+
+ELSE IF arguments contain "stop":
+    -> Write stop signal to .loom/signals/
+    -> EXIT
 
 ELSE:
-    -> Run the Python daemon with provided arguments
-    -> The daemon runs continuously until stopped
+    -> Proceed to Daemon Detection below
 ```
 
-### Running the Daemon
+## Daemon Detection
 
-Execute the following command:
+Before observing, check whether the daemon is running:
 
 ```bash
-./.loom/scripts/loom-daemon.sh {{ARGUMENTS}}
+cat .loom/daemon-loop.pid 2>/dev/null
 ```
 
-The daemon will:
-1. Run pre-flight checks (gh, claude, tmux availability)
-2. Rotate previous daemon state
-3. Initialize state and metrics files
-4. Run startup cleanup (orphan recovery, stale artifacts)
-5. Enter the main loop:
-   - Capture system snapshot
-   - Check for completed shepherds
-   - Spawn shepherds for ready issues
-   - Spawn support roles (interval and demand-based)
-   - Auto-promote proposals (in force mode)
-   - Sleep until next iteration
-6. Run shutdown cleanup on exit
+If the PID file exists, verify the process is alive:
 
-### Commands Quick Reference
+```bash
+PID=$(cat .loom/daemon-loop.pid 2>/dev/null)
+kill -0 "$PID" 2>/dev/null && echo "RUNNING" || echo "STALE"
+```
+
+### If Daemon is NOT Running
+
+Display this message and EXIT:
+
+```
+The Loom daemon is not running.
+
+Start it from a terminal OUTSIDE Claude Code:
+
+  ./.loom/scripts/start-daemon.sh                     # Normal mode
+  ./.loom/scripts/start-daemon.sh --merge             # Force/merge mode (auto-promote, auto-merge)
+  ./.loom/scripts/start-daemon.sh --timeout-min 120   # Auto-stop after 2 hours
+
+Then run /loom again to begin observing and orchestrating.
+
+Why run outside Claude Code?
+  Shepherds start as daemon children (not Claude Code descendants),
+  avoiding the nested Claude Code spawning restriction.
+```
+
+### If Daemon IS Running
+
+Proceed to the Observer Loop below.
+
+## Observer Loop
+
+When the daemon is running, you are an intelligent observer and signal-writer.
+
+**Each iteration:**
+
+1. **Read current state** using the Read tool:
+   - `.loom/daemon-state.json` — shepherd status, pipeline counts, warnings
+   - `.loom/daemon.log` — recent daemon activity
+
+2. **Assess pipeline** using read-only gh commands:
+   ```bash
+   gh issue list --label="loom:issue" --state=open --json number,title --limit=20
+   gh issue list --label="loom:building" --state=open --json number,title --limit=20
+   gh pr list --label="loom:review-requested" --json number,title --limit=20
+   ```
+
+3. **Signal the daemon** by writing JSON command files to `.loom/signals/`:
+   ```bash
+   SIGNAL=".loom/signals/cmd-$(date +%Y%m%d-%H%M%S)-$(openssl rand -hex 4).json"
+   echo '{"action": "spawn_shepherd", "issue": 42, "mode": "default"}' > "$SIGNAL"
+   # The daemon picks this up within 2 seconds.
+   ```
+
+4. **Wait and observe**: Use the Read tool or MCP tools to monitor state.
+
+5. **Repeat** at appropriate intervals.
+
+### Signal Protocol
+
+Write JSON files named `cmd-{YYYYMMDD-HHMMSS}-{random}.json` to `.loom/signals/`:
+
+| Action | Payload | Description |
+|--------|---------|-------------|
+| `spawn_shepherd` | `{"action": "spawn_shepherd", "issue": N, "mode": "default\|force"}` | Start shepherd for issue N |
+| `stop` | `{"action": "stop"}` | Graceful daemon shutdown |
+| `set_max_shepherds` | `{"action": "set_max_shepherds", "count": N}` | Adjust shepherd pool size |
+| `pause_shepherd` | `{"action": "pause_shepherd", "shepherd_id": "shepherd-1"}` | Pause a shepherd slot |
+| `resume_shepherd` | `{"action": "resume_shepherd", "shepherd_id": "shepherd-1"}` | Resume a paused shepherd slot |
+
+**Force/merge mode**: Use `"mode": "force"` in `spawn_shepherd` to enable auto-promote + auto-merge behavior.
+
+### Orchestration Logic
+
+**Normal autonomous operation:**
+1. Count `loom:issue` issues available for work
+2. Check active shepherds in `daemon-state.json`
+3. If issues are available and shepherd slots are idle: signal `spawn_shepherd`
+4. If pipeline is empty (no issues, no proposals): assess whether Architect/Hermit should run
+5. Monitor for blocked issues, stuck shepherds, or unmerged approved PRs
+6. Sleep 60–120 seconds, then repeat
+
+**Force/merge mode** (`/loom --merge` or `/loom --force`):
+- Same as normal, but pass `"mode": "force"` in all `spawn_shepherd` signals
+- This instructs shepherds to auto-promote curated issues and auto-merge approved PRs
+
+### Observing with MCP Tools
+
+Use MCP tools to monitor live state:
+
+```
+mcp__loom__get_heartbeat          # Check if Loom app is active
+mcp__loom__list_terminals         # List running terminal sessions
+mcp__loom__get_ui_state           # Full engine + terminal status
+```
+
+Use the Read tool for file-based state:
+```
+Read: .loom/daemon-state.json     # Shepherd assignments, pipeline state, warnings
+Read: .loom/daemon.log            # Daemon process log
+Glob: .loom/signals/*.json        # Count pending signals in queue
+```
+
+## Commands Quick Reference
 
 | Command | Description |
 |---------|-------------|
-| `/loom` | Start daemon in normal mode |
-| `/loom --merge` | Start in force mode (auto-promote, auto-merge) |
+| `/loom` | Check daemon, start observing/orchestrating |
+| `/loom --merge` | Same, but signal shepherds with force mode |
 | `/loom --force` | Alias for --merge |
-| `/loom -t 180` | Run for 3 hours then gracefully stop |
-| `/loom --timeout-min 60 --merge` | Merge mode for 1 hour |
-| `/loom --debug` | Start with debug logging |
-| `/loom status` | Check if daemon is running |
-| `/loom health` | Show daemon health status |
+| `/loom status` | Read and display daemon-state.json |
+| `/loom health` | Display daemon health summary |
+| `/loom stop` | Signal daemon to stop gracefully |
 | `/loom help` | Show comprehensive help guide |
 | `/loom help <topic>` | Show help for a specific topic |
 
-### Graceful Shutdown
+## Stopping the Daemon
 
-To stop the daemon gracefully:
+**Via IPC signal** (preferred, daemon processes within 2 seconds):
+```bash
+echo '{"action": "stop"}' > ".loom/signals/cmd-$(date +%Y%m%d-%H%M%S)-stop.json"
+```
+
+**Via stop file** (classic approach):
 ```bash
 touch .loom/stop-daemon
 ```
 
-The daemon checks this file between iterations and exits cleanly.
-
-### Environment Variables
-
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `LOOM_POLL_INTERVAL` | 120 | Seconds between iterations |
-| `LOOM_MAX_SHEPHERDS` | 3 | Maximum concurrent shepherds |
-| `LOOM_ISSUE_THRESHOLD` | 3 | Trigger work generation when issues < this |
-| `LOOM_ARCHITECT_COOLDOWN` | 1800 | Seconds between architect triggers |
-| `LOOM_HERMIT_COOLDOWN` | 1800 | Seconds between hermit triggers |
-
-## Run Now
-
-Execute this command and report when complete:
-
+**Via stop script** (from a shell outside Claude Code):
 ```bash
-./.loom/scripts/loom-daemon.sh {{ARGUMENTS}}
+./.loom/scripts/stop-daemon.sh           # Graceful
+./.loom/scripts/stop-daemon.sh --force   # Immediate SIGTERM
+./.loom/scripts/stop-daemon.sh --wait    # Graceful + wait for exit
 ```
 
 ---
@@ -139,11 +222,11 @@ Loom orchestrates AI-powered development using GitHub issues, labels, and git wo
 **Try it now - Autonomous Mode (daemon manages everything):**
 
 ```bash
-# Start the daemon - it spawns shepherds, triggers work generation, and auto-merges
-/loom --merge
+# Step 1: Start the daemon from a terminal OUTSIDE Claude Code
+./.loom/scripts/start-daemon.sh --merge
 
-# Or start conservatively (human approves merges)
-/loom
+# Step 2: In Claude Code, observe and orchestrate
+/loom --merge
 
 # Check daemon health anytime
 /loom health
@@ -174,7 +257,7 @@ Loom has three layers of roles:
 
 | Command | Role | What it does |
 |---------|------|-------------|
-| `/loom` | Daemon | Runs continuously. Monitors pipeline, spawns shepherds, triggers work generation. |
+| `/loom` | Daemon | Observes daemon state, writes signals to coordinate shepherds and work generation. |
 
 **Layer 1 - Issue Orchestration:**
 
@@ -206,15 +289,24 @@ Loom has three layers of roles:
 
 **Daemon commands:**
 ```
-/loom                          Start daemon in normal mode
-/loom --merge                  Start in merge mode (auto-promote, auto-merge)
-/loom -t 180                   Run for 3 hours then stop
-/loom --timeout-min 60 --merge Merge mode with 1-hour timeout
-/loom --debug                  Start with debug logging
-/loom status                   Check if daemon is running
-/loom health                   Show daemon health report
+/loom                          Check daemon, start observing/orchestrating
+/loom --merge                  Observe in merge mode (signals use force mode)
+/loom status                   Read and display daemon-state.json
+/loom health                   Show daemon health summary
+/loom stop                     Signal daemon to stop gracefully
 /loom help                     Show this help guide
 /loom help <topic>             Show help for a specific topic
+```
+
+**Starting the daemon (run OUTSIDE Claude Code):**
+```
+./.loom/scripts/start-daemon.sh                   Start in normal mode
+./.loom/scripts/start-daemon.sh --merge           Start in force/merge mode
+./.loom/scripts/start-daemon.sh -t 180            Run for 3 hours then stop
+./.loom/scripts/start-daemon.sh --status          Check if daemon is running
+./.loom/scripts/stop-daemon.sh                    Stop gracefully
+./.loom/scripts/stop-daemon.sh --force            Stop immediately (SIGTERM)
+./.loom/scripts/stop-daemon.sh --wait             Stop and wait for exit
 ```
 
 **Shepherd commands:**
@@ -289,25 +381,47 @@ Agents coordinate exclusively through GitHub labels. Here is how an issue flows 
 
 **Daemon Mode**
 
-The daemon (`/loom`) is the Layer 2 orchestrator that runs continuously and manages the entire development pipeline.
+The daemon is the Layer 2 orchestrator that runs continuously as a standalone background process. It spawns shepherds as direct subprocesses, so shepherds are children of the daemon — not descendants of any Claude Code session.
 
-**Starting the daemon:**
-```bash
-/loom                  # Normal mode - human approves merges
-/loom --merge          # Merge mode - auto-promote and auto-merge
-/loom -t 120 --merge   # Merge mode, stop after 2 hours
+**Architecture:**
+```
+init/launchd → loom-daemon → loom-shepherd.sh → claude /builder
 ```
 
+This avoids nested Claude Code spawning restrictions.
+
+**Starting the daemon (from a shell outside Claude Code):**
+```bash
+./.loom/scripts/start-daemon.sh                   # Normal mode
+./.loom/scripts/start-daemon.sh --merge           # Auto-promote + auto-merge
+./.loom/scripts/start-daemon.sh -t 120 --merge    # Merge mode, stop after 2 hours
+```
+
+**Observing from Claude Code (`/loom`):**
+```
+/loom                  Check daemon, observe state, write signals
+/loom --merge          Same, but signal shepherds with force mode
+/loom status           Read daemon-state.json and display
+```
+
+**Signal queue** (`.loom/signals/`):
+- `/loom` writes JSON command files here
+- The daemon polls and processes them within 2 seconds
+- Commands: `spawn_shepherd`, `stop`, `set_max_shepherds`, `pause_shepherd`, `resume_shepherd`
+
 **What the daemon does each iteration:**
-1. Captures system snapshot (issues, PRs, labels)
-2. Checks for completed shepherds
-3. Spawns new shepherds for ready `loom:issue` issues
-4. Triggers Architect/Hermit when backlog is low
-5. Sleeps until next iteration (default: 120 seconds)
+1. Polls `.loom/signals/` for IPC commands from `/loom`
+2. Captures system snapshot (issues, PRs, labels)
+3. Checks for completed shepherds
+4. Spawns new shepherds for ready `loom:issue` issues
+5. Triggers Architect/Hermit when backlog is low
+6. Sleeps until next iteration (default: 120 seconds, checks signals every 2 seconds)
 
 **Stopping the daemon:**
 ```bash
-touch .loom/stop-daemon    # Graceful shutdown (finishes current work)
+touch .loom/stop-daemon                          # Via file signal
+./.loom/scripts/stop-daemon.sh                  # Via convenience script
+./.loom/scripts/stop-daemon.sh --force          # Immediate SIGTERM
 ```
 
 **Configuration (environment variables):**
@@ -439,21 +553,23 @@ gh label sync --file .github/labels.yml
 loom-clean --force
 ```
 
-**Daemon won't start (dual instance):**
+**Daemon won't start (stale PID):**
 ```bash
-rm -f .loom/daemon-state.json    # Clear stale state
-/loom                             # Restart
+rm -f .loom/daemon-loop.pid
+./.loom/scripts/start-daemon.sh
 ```
 
 **Stop daemon gracefully:**
 ```bash
 touch .loom/stop-daemon
+# or
+./.loom/scripts/stop-daemon.sh
 ```
 
-**Check daemon health:**
+**Check daemon status:**
 ```bash
-/loom health
 /loom status
+./.loom/scripts/start-daemon.sh --status
 ```
 
 **Merge PRs from worktrees (never use `gh pr merge`):**

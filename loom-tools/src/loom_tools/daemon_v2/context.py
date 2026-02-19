@@ -39,6 +39,7 @@ class DaemonContext:
     _metrics_file: pathlib.Path | None = field(default=None, repr=False)
     _stop_signal: pathlib.Path | None = field(default=None, repr=False)
     _pid_file: pathlib.Path | None = field(default=None, repr=False)
+    _signals_dir: pathlib.Path | None = field(default=None, repr=False)
 
     @property
     def log_file(self) -> pathlib.Path:
@@ -69,6 +70,13 @@ class DaemonContext:
         if self._pid_file is None:
             self._pid_file = self.repo_root / ".loom" / "daemon-loop.pid"
         return self._pid_file
+
+    @property
+    def signals_dir(self) -> pathlib.Path:
+        """Directory where /loom writes JSON command files for the daemon."""
+        if self._signals_dir is None:
+            self._signals_dir = self.repo_root / ".loom" / "signals"
+        return self._signals_dir
 
     def get_recommended_actions(self) -> list[str]:
         """Get recommended actions from the current snapshot."""
