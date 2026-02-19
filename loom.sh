@@ -3,6 +3,7 @@
 #
 # Usage:
 #   ./loom.sh               # Start in normal mode
+#   ./loom.sh --start       # Same as above (explicit start)
 #   ./loom.sh --merge       # Force/merge mode (auto-promote + auto-merge)
 #   ./loom.sh --status      # Check if daemon is running
 #   ./loom.sh --stop        # Send graceful shutdown signal
@@ -23,4 +24,10 @@ if [[ ! -x "$START_DAEMON" ]]; then
     exit 1
 fi
 
-exec "$START_DAEMON" "$@"
+# --start is the default behavior; strip it before forwarding to start-daemon.sh
+ARGS=()
+for arg in "$@"; do
+    [[ "$arg" == "--start" ]] || ARGS+=("$arg")
+done
+
+exec "$START_DAEMON" "${ARGS[@]+"${ARGS[@]}"}"
