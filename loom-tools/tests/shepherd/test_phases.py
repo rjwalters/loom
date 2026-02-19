@@ -1116,6 +1116,192 @@ class TestBuilderPhase:
         assert len(snippet) > 0
         assert "Moseying" in snippet
 
+    def test_thinking_stall_with_pr_succeeds(self, mock_context: MagicMock) -> None:
+        """Builder exit code 14 with PR existing should return SUCCESS.
+
+        When the builder hits a thinking stall (exit 14) but a PR already exists
+        for the issue, the shepherd should treat the builder phase as successful
+        and proceed to judge.  The worktree must NOT be cleaned up.
+        See issue #2851.
+        """
+        mock_context.check_shutdown.return_value = False
+        mock_context.config.planning_timeout = 600
+        mock_context.pr_number = None
+        wt_mock = MagicMock()
+        wt_mock.is_dir.return_value = True
+        wt_mock.__bool__ = lambda self: True
+        mock_context.worktree_path = wt_mock
+
+        builder = BuilderPhase()
+        fake_diag = {
+            "summary": "worktree exists; PR #300 (with loom:review-requested)",
+            "pr_number": 300,
+        }
+
+        with (
+            patch(
+                "loom_tools.shepherd.phases.builder.get_pr_for_issue", return_value=None
+            ),
+            patch("loom_tools.shepherd.phases.builder.transition_issue_labels"),
+            patch(
+                "loom_tools.shepherd.phases.builder.run_phase_with_retry",
+                return_value=14,
+            ),
+            patch.object(
+                builder, "_gather_diagnostics", return_value=fake_diag
+            ),
+            patch.object(builder, "_cleanup_stale_worktree") as mock_cleanup,
+            patch.object(builder, "_create_worktree_marker"),
+        ):
+            result = builder.run(mock_context)
+
+        assert result.status == PhaseStatus.SUCCESS
+        assert "PR #300" in result.message
+        assert "thinking stall" in result.message
+        assert result.data.get("pr_number") == 300
+        assert result.data.get("thinking_stall") is True
+        assert result.data.get("recovered_from_checkpoint") is True
+        assert mock_context.pr_number == 300
+        # Worktree must NOT be cleaned up when recovering a successful PR
+        mock_cleanup.assert_not_called()
+
+    def test_thinking_stall_without_pr_fails(self, mock_context: MagicMock) -> None:
+        """Builder exit code 14 without PR should still return FAILED.
+
+        When the builder hits a thinking stall and no PR exists, behavior is
+        unchanged from before — non-retryable failure.  See issue #2851.
+        """
+        mock_context.check_shutdown.return_value = False
+        mock_context.config.planning_timeout = 600
+        mock_context.repo_root = MagicMock()
+        wt_mock = MagicMock()
+        wt_mock.is_dir.return_value = True
+        wt_mock.__bool__ = lambda self: True
+        mock_context.worktree_path = wt_mock
+
+        builder = BuilderPhase()
+        fake_diag = {
+            "summary": "worktree exists; no PR",
+            "pr_number": None,
+        }
+
+        with (
+            patch(
+                "loom_tools.shepherd.phases.builder.get_pr_for_issue", return_value=None
+            ),
+            patch("loom_tools.shepherd.phases.builder.transition_issue_labels"),
+            patch(
+                "loom_tools.shepherd.phases.builder.run_phase_with_retry",
+                return_value=14,
+            ),
+            patch.object(
+                builder, "_gather_diagnostics", return_value=fake_diag
+            ),
+            patch.object(builder, "_cleanup_stale_worktree"),
+            patch.object(builder, "_create_worktree_marker"),
+            patch.object(builder, "_get_log_path", return_value=MagicMock()),
+            patch(
+                "loom_tools.shepherd.phases.builder._extract_thinking_snippet",
+                return_value="",
+            ),
+        ):
+            result = builder.run(mock_context)
+
+        assert result.status == PhaseStatus.FAILED
+        assert result.data.get("thinking_stall") is True
+
+    def test_degraded_session_with_pr_succeeds(self, mock_context: MagicMock) -> None:
+        """Builder exit code 11 with PR existing should return SUCCESS.
+
+        When the builder hits a degraded session (exit 11) but a PR already
+        exists, the shepherd should treat the builder phase as successful.
+        See issue #2851.
+        """
+        mock_context.check_shutdown.return_value = False
+        mock_context.config.planning_timeout = 600
+        mock_context.pr_number = None
+        wt_mock = MagicMock()
+        wt_mock.is_dir.return_value = True
+        wt_mock.__bool__ = lambda self: True
+        mock_context.worktree_path = wt_mock
+
+        builder = BuilderPhase()
+        fake_diag = {
+            "summary": "worktree exists; PR #301 (with loom:review-requested)",
+            "pr_number": 301,
+        }
+
+        with (
+            patch(
+                "loom_tools.shepherd.phases.builder.get_pr_for_issue", return_value=None
+            ),
+            patch("loom_tools.shepherd.phases.builder.transition_issue_labels"),
+            patch(
+                "loom_tools.shepherd.phases.builder.run_phase_with_retry",
+                return_value=11,
+            ),
+            patch.object(
+                builder, "_gather_diagnostics", return_value=fake_diag
+            ),
+            patch.object(builder, "_cleanup_stale_worktree") as mock_cleanup,
+            patch.object(builder, "_create_worktree_marker"),
+        ):
+            result = builder.run(mock_context)
+
+        assert result.status == PhaseStatus.SUCCESS
+        assert "PR #301" in result.message
+        assert result.data.get("pr_number") == 301
+        assert result.data.get("degraded_session") is True
+        assert result.data.get("recovered_from_checkpoint") is True
+        assert mock_context.pr_number == 301
+        mock_cleanup.assert_not_called()
+
+    def test_rate_limit_abort_with_pr_succeeds(self, mock_context: MagicMock) -> None:
+        """Builder exit code 13 with PR existing should return SUCCESS.
+
+        When the builder hits a rate limit abort (exit 13) but a PR already
+        exists, the shepherd should treat the builder phase as successful.
+        See issue #2851.
+        """
+        mock_context.check_shutdown.return_value = False
+        mock_context.config.planning_timeout = 600
+        mock_context.pr_number = None
+        wt_mock = MagicMock()
+        wt_mock.is_dir.return_value = True
+        wt_mock.__bool__ = lambda self: True
+        mock_context.worktree_path = wt_mock
+
+        builder = BuilderPhase()
+        fake_diag = {
+            "summary": "worktree exists; PR #302 (with loom:review-requested)",
+            "pr_number": 302,
+        }
+
+        with (
+            patch(
+                "loom_tools.shepherd.phases.builder.get_pr_for_issue", return_value=None
+            ),
+            patch("loom_tools.shepherd.phases.builder.transition_issue_labels"),
+            patch(
+                "loom_tools.shepherd.phases.builder.run_phase_with_retry",
+                return_value=13,
+            ),
+            patch.object(
+                builder, "_gather_diagnostics", return_value=fake_diag
+            ),
+            patch.object(builder, "_cleanup_stale_worktree") as mock_cleanup,
+            patch.object(builder, "_create_worktree_marker"),
+        ):
+            result = builder.run(mock_context)
+
+        assert result.status == PhaseStatus.SUCCESS
+        assert "PR #302" in result.message
+        assert result.data.get("pr_number") == 302
+        assert result.data.get("rate_limit_abort") is True
+        assert result.data.get("recovered_from_checkpoint") is True
+        assert mock_context.pr_number == 302
+        mock_cleanup.assert_not_called()
+
 
 class TestExtractThinkingSnippet:
     """Unit tests for _extract_thinking_snippet helper."""
