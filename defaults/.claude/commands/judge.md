@@ -1537,6 +1537,19 @@ After completing your iteration (evaluating a PR and updating labels), execute:
 
 ## Completion
 
-**Work completion is detected automatically.**
+**After completing an evaluation, stop or continue based on how you were invoked:**
 
-When you complete your task (PR evaluated and labeled with `loom:pr` or `loom:changes-requested`), the orchestration layer detects this and terminates the session automatically. No explicit exit command is needed.
+### Manual invocation (via `/judge` or `/judge <number>`)
+
+After completing **one** PR evaluation (PR labeled `loom:pr` or `loom:changes-requested`):
+- **Stop immediately** — do not search for additional PRs
+- Report a brief summary of what was evaluated and the outcome
+- The user can run `/judge` again if they want to evaluate another PR
+
+If no work was found (no PRs with `loom:review-requested`), report that and stop.
+
+### Autonomous mode (configured with targetInterval)
+
+After completing an evaluation, execute `/clear` to reset context (see Context Clearing above). The orchestration layer will trigger the next iteration automatically via the intervalPrompt.
+
+If no work is available, execute `/clear` and wait for the next trigger.
