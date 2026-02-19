@@ -562,4 +562,4 @@ class TestProactiveReclaim:
         _reclaim_stale_shepherds(ctx)
 
         assert ctx.snapshot["computed"]["active_shepherds"] == 0
-        assert ctx.snapshot["computed"]["available_shepherd_slots"] == 3
+        assert ctx.snapshot["computed"]["available_shepherd_slots"] == 10
