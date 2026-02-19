@@ -1187,6 +1187,109 @@ class TestRateLimitedBuilderExit:
 
 
 # ---------------------------------------------------------------------------
+# _build_recovery_pr_body: pre-written .loom/pr-body.md path (issue #2929)
+# ---------------------------------------------------------------------------
+
+
+class TestBuildRecoveryPrBodyPreWritten:
+    """Tests for _build_recovery_pr_body when .loom/pr-body.md exists."""
+
+    def test_uses_pre_written_body_when_file_exists(self, tmp_path: Path):
+        """When .loom/pr-body.md exists, its content is used instead of boilerplate."""
+        worktree = tmp_path / "worktree"
+        worktree.mkdir()
+        loom_dir = worktree / ".loom"
+        loom_dir.mkdir()
+        pr_body_file = loom_dir / "pr-body.md"
+        pr_body_file.write_text(
+            "## Summary\nThis PR fixes the widget.\n\n## Changes\n- Fix bug\n\nCloses #42"
+        )
+
+        body = _build_recovery_pr_body(42, str(worktree))
+
+        assert "## Summary" in body
+        assert "This PR fixes the widget." in body
+        assert "## Changes" in body
+        assert "Fix bug" in body
+        assert "Closes #42" in body
+        # Should NOT contain boilerplate recovery note
+        assert "recovery path" not in body
+        assert "examine the diff carefully" not in body
+
+    def test_appends_closes_when_missing_from_pre_written_body(self, tmp_path: Path):
+        """When .loom/pr-body.md exists but lacks Closes #N, it is appended."""
+        worktree = tmp_path / "worktree"
+        worktree.mkdir()
+        loom_dir = worktree / ".loom"
+        loom_dir.mkdir()
+        pr_body_file = loom_dir / "pr-body.md"
+        pr_body_file.write_text(
+            "## Summary\nThis PR fixes the widget.\n\n## Changes\n- Fix bug"
+        )
+
+        body = _build_recovery_pr_body(42, str(worktree))
+
+        assert "Closes #42" in body
+        assert "## Summary" in body
+
+    def test_does_not_append_closes_when_already_present(self, tmp_path: Path):
+        """When .loom/pr-body.md already has Closes #N, it is not duplicated."""
+        worktree = tmp_path / "worktree"
+        worktree.mkdir()
+        loom_dir = worktree / ".loom"
+        loom_dir.mkdir()
+        pr_body_file = loom_dir / "pr-body.md"
+        pr_body_file.write_text("## Summary\nFix stuff.\n\nCloses #42")
+
+        body = _build_recovery_pr_body(42, str(worktree))
+
+        assert body.count("Closes #42") == 1
+
+    def test_accepts_fixes_keyword_as_close_reference(self, tmp_path: Path):
+        """Fixes #N in pre-written body is treated as a valid closing reference."""
+        worktree = tmp_path / "worktree"
+        worktree.mkdir()
+        loom_dir = worktree / ".loom"
+        loom_dir.mkdir()
+        pr_body_file = loom_dir / "pr-body.md"
+        pr_body_file.write_text("## Summary\nFix stuff.\n\nFixes #42")
+
+        body = _build_recovery_pr_body(42, str(worktree))
+
+        # Should not append another Closes #42 since Fixes #42 is present
+        assert "Closes #42" not in body
+        assert "Fixes #42" in body
+
+    def test_accepts_resolves_keyword_as_close_reference(self, tmp_path: Path):
+        """Resolves #N in pre-written body is treated as a valid closing reference."""
+        worktree = tmp_path / "worktree"
+        worktree.mkdir()
+        loom_dir = worktree / ".loom"
+        loom_dir.mkdir()
+        pr_body_file = loom_dir / "pr-body.md"
+        pr_body_file.write_text("## Summary\nFix stuff.\n\nResolves #42")
+
+        body = _build_recovery_pr_body(42, str(worktree))
+
+        assert "Closes #42" not in body
+        assert "Resolves #42" in body
+
+    @patch("loom_tools.validate_phase.subprocess.run")
+    def test_falls_back_to_boilerplate_when_no_file(self, mock_run: MagicMock, tmp_path: Path):
+        """When .loom/pr-body.md does not exist, falls back to boilerplate generation."""
+        worktree = tmp_path / "worktree"
+        worktree.mkdir()
+        # No .loom/pr-body.md file
+        mock_run.return_value = _completed(stdout="")
+
+        body = _build_recovery_pr_body(42, str(worktree))
+
+        # Should contain the boilerplate recovery note
+        assert "recovery path" in body
+        assert "Closes #42" in body
+
+
+# ---------------------------------------------------------------------------
 # quiet mode (issue #2609)
 # ---------------------------------------------------------------------------
 

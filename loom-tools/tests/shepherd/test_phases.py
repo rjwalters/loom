@@ -11266,6 +11266,70 @@ class TestBuildDirectCompletionPrBody:
         assert "## Commits" not in body
         assert "## Test plan" in body
 
+    def test_uses_pre_written_body_when_file_exists(
+        self, mock_context: MagicMock, tmp_path: Path
+    ) -> None:
+        """When .loom/pr-body.md exists in worktree, its content is used."""
+        builder = BuilderPhase()
+        worktree = tmp_path / "worktree"
+        worktree.mkdir()
+        loom_dir = worktree / ".loom"
+        loom_dir.mkdir()
+        pr_body_file = loom_dir / "pr-body.md"
+        pr_body_file.write_text(
+            "## Summary\nThis PR fixes the widget.\n\n## Changes\n- Fix bug\n\nCloses #42"
+        )
+        mock_context.worktree_path = worktree
+        mock_context.config = ShepherdConfig(issue=42)
+
+        body = builder._build_direct_completion_pr_body(mock_context)
+
+        assert "## Summary" in body
+        assert "This PR fixes the widget." in body
+        assert "Fix bug" in body
+        assert "Closes #42" in body
+        # Should NOT contain boilerplate direct-completion note
+        assert "direct completion" not in body
+
+    def test_appends_closes_when_missing_from_pre_written_body(
+        self, mock_context: MagicMock, tmp_path: Path
+    ) -> None:
+        """When .loom/pr-body.md lacks Closes #N, it is appended."""
+        builder = BuilderPhase()
+        worktree = tmp_path / "worktree"
+        worktree.mkdir()
+        loom_dir = worktree / ".loom"
+        loom_dir.mkdir()
+        pr_body_file = loom_dir / "pr-body.md"
+        pr_body_file.write_text(
+            "## Summary\nThis PR fixes the widget.\n\n## Changes\n- Fix bug"
+        )
+        mock_context.worktree_path = worktree
+        mock_context.config = ShepherdConfig(issue=42)
+
+        body = builder._build_direct_completion_pr_body(mock_context)
+
+        assert "Closes #42" in body
+        assert "## Summary" in body
+
+    def test_does_not_append_closes_when_already_present(
+        self, mock_context: MagicMock, tmp_path: Path
+    ) -> None:
+        """When .loom/pr-body.md already has Closes #N, it is not duplicated."""
+        builder = BuilderPhase()
+        worktree = tmp_path / "worktree"
+        worktree.mkdir()
+        loom_dir = worktree / ".loom"
+        loom_dir.mkdir()
+        pr_body_file = loom_dir / "pr-body.md"
+        pr_body_file.write_text("## Summary\nFix stuff.\n\nCloses #42")
+        mock_context.worktree_path = worktree
+        mock_context.config = ShepherdConfig(issue=42)
+
+        body = builder._build_direct_completion_pr_body(mock_context)
+
+        assert body.count("Closes #42") == 1
+
 
 class TestBuilderStageAndCommit:
     """Test _stage_and_commit for direct mechanical staging and committing."""
