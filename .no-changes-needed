@@ -1,0 +1,1 @@
+Tests for the pr-body.md happy path in _build_direct_completion_pr_body (builder.py) and _build_recovery_pr_body (validate_phase.py) were already implemented and merged in PR #2966 (commit 4810f21). All 6 tests in TestBuildDirectCompletionPrBody and 6 tests in TestRateLimitedBuilderExit covering the recovery pr body pass. No additional changes are needed.
