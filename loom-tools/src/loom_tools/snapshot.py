@@ -93,7 +93,7 @@ class SnapshotConfig:
 
         return cls(
             issue_threshold=_int("LOOM_ISSUE_THRESHOLD", 3),
-            max_shepherds=_int("LOOM_MAX_SHEPHERDS", 3),
+            max_shepherds=_int("LOOM_MAX_SHEPHERDS", 10),
             max_proposals=_int("LOOM_MAX_PROPOSALS", 5),
             architect_cooldown=_int("LOOM_ARCHITECT_COOLDOWN", 1800),
             hermit_cooldown=_int("LOOM_HERMIT_COOLDOWN", 1800),
@@ -1754,7 +1754,7 @@ DESCRIPTION:
 
 ENVIRONMENT VARIABLES:
     LOOM_ISSUE_THRESHOLD     Threshold for work generation (default: 3)
-    LOOM_MAX_SHEPHERDS       Maximum concurrent shepherds (default: 3)
+    LOOM_MAX_SHEPHERDS       Maximum concurrent shepherds (default: 10)
     LOOM_MAX_PROPOSALS       Maximum pending proposals (default: 5)
     LOOM_ARCHITECT_COOLDOWN  Architect trigger cooldown in seconds (default: 1800)
     LOOM_HERMIT_COOLDOWN     Hermit trigger cooldown in seconds (default: 1800)

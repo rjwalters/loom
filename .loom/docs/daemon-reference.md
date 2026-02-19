@@ -8,7 +8,7 @@ Detailed configuration and state management for the Loom daemon (Layer 2).
 |-----------|---------|-------------|
 | `ISSUE_THRESHOLD` | 3 | Trigger Architect/Hermit when `loom:issue` count below this |
 | `MAX_PROPOSALS` | 5 | Maximum pending proposal issues |
-| `MAX_SHEPHERDS` | 3 | Maximum concurrent shepherd processes |
+| `MAX_SHEPHERDS` | 10 | Maximum concurrent shepherd processes |
 | `ISSUES_PER_SHEPHERD` | 2 | Scale factor: target = ready_issues / ISSUES_PER_SHEPHERD |
 | `POLL_INTERVAL` | 60 | Seconds between daemon loop iterations |
 | `ISSUE_STRATEGY` | fifo | Issue selection strategy (see below) |

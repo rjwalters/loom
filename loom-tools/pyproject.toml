@@ -8,6 +8,9 @@ version = "0.1.0"
 description = "Shared Python utilities for Loom orchestration scripts"
 requires-python = ">=3.10"
 license = "MIT"
+dependencies = [
+    "rich>=13.0",
+]
 
 [project.scripts]
 loom-shepherd = "loom_tools.shepherd.cli:main"

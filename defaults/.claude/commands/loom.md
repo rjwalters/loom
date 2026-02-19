@@ -429,7 +429,7 @@ touch .loom/stop-daemon                          # Via file signal
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `LOOM_POLL_INTERVAL` | 120 | Seconds between iterations |
-| `LOOM_MAX_SHEPHERDS` | 3 | Max concurrent shepherds |
+| `LOOM_MAX_SHEPHERDS` | 10 | Max concurrent shepherds |
 | `LOOM_ISSUE_THRESHOLD` | 3 | Trigger work generation below this count |
 | `LOOM_ARCHITECT_COOLDOWN` | 1800 | Seconds between architect triggers |
 | `LOOM_HERMIT_COOLDOWN` | 1800 | Seconds between hermit triggers |

@@ -129,7 +129,7 @@ def main(argv: Sequence[str] | None = None) -> int:
 Environment Variables:
     LOOM_TIMEOUT_MIN            Stop daemon after N minutes (default: 0 = no timeout)
     LOOM_POLL_INTERVAL          Seconds between iterations (default: 120)
-    LOOM_MAX_SHEPHERDS          Maximum concurrent shepherds (default: 3)
+    LOOM_MAX_SHEPHERDS          Maximum concurrent shepherds (default: 10)
     LOOM_ISSUE_THRESHOLD        Trigger work generation when issues < this (default: 3)
     LOOM_ARCHITECT_COOLDOWN     Seconds between architect triggers (default: 1800)
     LOOM_HERMIT_COOLDOWN        Seconds between hermit triggers (default: 1800)
