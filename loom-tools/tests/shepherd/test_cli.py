@@ -4110,7 +4110,7 @@ class TestRebasePhaseIntegration:
 
 
 class TestPostFallbackFailureComment:
-    """Test _post_fallback_failure_comment helper (issue #2525)."""
+    """Test _post_fallback_failure_comment helper (issue #2525, #2839)."""
 
     @patch("subprocess.run")
     def test_posts_comment_with_exit_code(self, mock_run: MagicMock) -> None:
@@ -4118,6 +4118,7 @@ class TestPostFallbackFailureComment:
         ctx = MagicMock()
         ctx.config.issue = 42
         ctx.repo_root = Path("/fake/repo")
+        ctx.abandonment_info = None  # Exercise generic (exit-code-based) path
 
         _post_fallback_failure_comment(ctx, ShepherdExitCode.BUILDER_FAILED)
 
@@ -4126,7 +4127,7 @@ class TestPostFallbackFailureComment:
         assert cmd[:3] == ["gh", "issue", "comment"]
         body_idx = cmd.index("--body") + 1
         body = cmd[body_idx]
-        assert "Shepherd fallback cleanup" in body
+        assert "Shepherd abandoned issue" in body
         assert "1" in body  # exit code
         assert "Builder failed" in body
 
@@ -4138,6 +4139,7 @@ class TestPostFallbackFailureComment:
         ctx = MagicMock()
         ctx.config.issue = 42
         ctx.repo_root = Path("/fake/repo")
+        ctx.abandonment_info = None  # Exercise generic (exit-code-based) path
 
         _post_fallback_failure_comment(ctx, ShepherdExitCode.SYSTEMIC_FAILURE)
 
@@ -4156,6 +4158,7 @@ class TestPostFallbackFailureComment:
         ctx = MagicMock()
         ctx.config.issue = 42
         ctx.repo_root = Path("/fake/repo")
+        ctx.abandonment_info = None  # Exercise generic (exit-code-based) path
 
         _post_fallback_failure_comment(ctx, ShepherdExitCode.NEEDS_INTERVENTION)
 
@@ -4174,9 +4177,153 @@ class TestPostFallbackFailureComment:
         ctx = MagicMock()
         ctx.config.issue = 42
         ctx.repo_root = Path("/fake/repo")
+        ctx.abandonment_info = None
 
         # Should not raise
         _post_fallback_failure_comment(ctx, ShepherdExitCode.BUILDER_FAILED)
+
+    @patch("subprocess.run")
+    def test_abandonment_info_thinking_stall(self, mock_run: MagicMock) -> None:
+        """When abandonment_info has thinking_stall, posts detailed comment."""
+        ctx = MagicMock()
+        ctx.config.issue = 42
+        ctx.config.task_id = "abc1234"
+        ctx.repo_root = Path("/fake/repo")
+        ctx.abandonment_info = {
+            "phase": "builder",
+            "exit_code": 14,
+            "failure_data": {
+                "thinking_stall": True,
+                "log_file": "/fake/.loom/logs/loom-builder-issue-42.log",
+            },
+            "message": "builder thinking stall: extended thinking output with zero tool calls",
+            "task_id": "abc1234",
+        }
+
+        _post_fallback_failure_comment(ctx, ShepherdExitCode.BUILDER_FAILED)
+
+        mock_run.assert_called_once()
+        cmd = mock_run.call_args[0][0]
+        body_idx = cmd.index("--body") + 1
+        body = cmd[body_idx]
+        assert "Shepherd abandoned issue" in body
+        assert "abc1234" in body
+        assert "builder" in body
+        assert "thinking stall" in body
+        assert "retry budget exhausted" in body
+        assert "loom-builder-issue-42.log" in body
+        assert "safe to retry" in body
+
+    @patch("subprocess.run")
+    def test_abandonment_info_planning_stall(self, mock_run: MagicMock) -> None:
+        """When abandonment_info has planning_stall, posts detailed comment."""
+        ctx = MagicMock()
+        ctx.config.issue = 42
+        ctx.config.task_id = "def5678"
+        ctx.repo_root = Path("/fake/repo")
+        ctx.abandonment_info = {
+            "phase": "builder",
+            "exit_code": 8,
+            "failure_data": {
+                "planning_stall": True,
+                "planning_timeout": 300,
+                "log_file": "/fake/.loom/logs/loom-builder-issue-42.log",
+            },
+            "message": "builder stalled in planning checkpoint",
+            "task_id": "def5678",
+        }
+
+        _post_fallback_failure_comment(ctx, ShepherdExitCode.BUILDER_FAILED)
+
+        mock_run.assert_called_once()
+        cmd = mock_run.call_args[0][0]
+        body_idx = cmd.index("--body") + 1
+        body = cmd[body_idx]
+        assert "Shepherd abandoned issue" in body
+        assert "planning stall" in body
+        assert "300" in body
+        assert "safe to retry" in body
+
+    @patch("subprocess.run")
+    def test_abandonment_info_auth_failure(self, mock_run: MagicMock) -> None:
+        """When abandonment_info has auth_failure, posts non-retryable comment."""
+        ctx = MagicMock()
+        ctx.config.issue = 42
+        ctx.config.task_id = "ghi9012"
+        ctx.repo_root = Path("/fake/repo")
+        ctx.abandonment_info = {
+            "phase": "builder",
+            "exit_code": 9,
+            "failure_data": {
+                "auth_failure": True,
+                "log_file": "/fake/.loom/logs/loom-builder-issue-42.log",
+            },
+            "message": "builder auth pre-flight failed",
+            "task_id": "ghi9012",
+        }
+
+        _post_fallback_failure_comment(ctx, ShepherdExitCode.SYSTEMIC_FAILURE)
+
+        mock_run.assert_called_once()
+        cmd = mock_run.call_args[0][0]
+        body_idx = cmd.index("--body") + 1
+        body = cmd[body_idx]
+        assert "Shepherd abandoned issue" in body
+        assert "auth pre-flight failure" in body
+        assert "infrastructure failure" in body
+
+    @patch("subprocess.run")
+    def test_abandonment_info_rate_limit_abort(self, mock_run: MagicMock) -> None:
+        """When abandonment_info has rate_limit_abort, posts rate-limit comment."""
+        ctx = MagicMock()
+        ctx.config.issue = 42
+        ctx.config.task_id = "jkl3456"
+        ctx.repo_root = Path("/fake/repo")
+        ctx.abandonment_info = {
+            "phase": "builder",
+            "exit_code": 13,
+            "failure_data": {
+                "rate_limit_abort": True,
+                "log_file": "/fake/.loom/logs/loom-builder-issue-42.log",
+            },
+            "message": "CLI hit usage/plan limit",
+            "task_id": "jkl3456",
+        }
+
+        _post_fallback_failure_comment(ctx, ShepherdExitCode.RATE_LIMIT_ABORT)
+
+        mock_run.assert_called_once()
+        cmd = mock_run.call_args[0][0]
+        body_idx = cmd.index("--body") + 1
+        body = cmd[body_idx]
+        assert "Shepherd abandoned issue" in body
+        assert "rate limit abort" in body
+        assert "usage/plan limit" in body
+
+    @patch("subprocess.run")
+    def test_abandonment_info_generic_failure(self, mock_run: MagicMock) -> None:
+        """When abandonment_info has no specific flag, uses message as failure mode."""
+        ctx = MagicMock()
+        ctx.config.issue = 42
+        ctx.config.task_id = "mno7890"
+        ctx.repo_root = Path("/fake/repo")
+        ctx.abandonment_info = {
+            "phase": "builder",
+            "exit_code": 1,
+            "failure_data": {},
+            "message": "unexpected builder exit",
+            "task_id": "mno7890",
+        }
+
+        _post_fallback_failure_comment(ctx, ShepherdExitCode.BUILDER_FAILED)
+
+        mock_run.assert_called_once()
+        cmd = mock_run.call_args[0][0]
+        body_idx = cmd.index("--body") + 1
+        body = cmd[body_idx]
+        assert "Shepherd abandoned issue" in body
+        assert "unexpected builder exit" in body
+        assert "safe to retry" in body
 
 
 class TestRecordFallbackFailure:

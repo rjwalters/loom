@@ -946,6 +946,15 @@ def orchestrate(ctx: ShepherdContext) -> int:
                         exit_code = ShepherdExitCode.RATE_LIMIT_ABORT
                     else:
                         exit_code = ShepherdExitCode.BUILDER_FAILED
+                    # Record abandonment details so _post_fallback_failure_comment
+                    # can generate a specific GitHub comment.  See issue #2839.
+                    ctx.abandonment_info = {
+                        "phase": result.phase_name or "builder",
+                        "exit_code": int(exit_code),
+                        "failure_data": dict(result.data),
+                        "message": result.message,
+                        "task_id": ctx.config.task_id,
+                    }
                     return exit_code
                 # Test failure after exhausting retries is handled above
 
@@ -2103,43 +2112,137 @@ def _post_fallback_failure_comment(ctx: ShepherdContext, exit_code: int) -> None
     was returned to the ready pool and distinguish infrastructure failures
     (auth/API) from implementation failures.
 
+    When ctx.abandonment_info is set (by the orchestrator for specific failure
+    modes), generates a detailed comment with the failure mode, task ID, and
+    log file path.  Otherwise falls back to a generic message.  See issue #2839.
+
     Best-effort — never raises.
     """
+    import datetime
     import subprocess
 
+    from loom_tools.common.paths import LoomPaths
     from loom_tools.shepherd.exit_codes import describe_exit_code
 
     issue = ctx.config.issue
+    task_id = ctx.config.task_id or "unknown"
+    today = datetime.date.today().isoformat()
 
-    # Distinguish infrastructure failures from implementation failures
-    if exit_code == ShepherdExitCode.SYSTEMIC_FAILURE:
-        failure_type = "infrastructure failure (auth/API)"
-        advice = (
-            "This is an **infrastructure failure**, not an issue with the code. "
-            "Check authentication tokens and API availability before retrying."
-        )
-    elif exit_code == ShepherdExitCode.RATE_LIMIT_ABORT:
-        failure_type = "rate limit abort (usage/plan limit)"
-        advice = (
-            "The CLI hit a **usage or plan limit** and showed an interactive prompt "
-            "that cannot be answered in headless mode. Wait for the limit to reset "
-            "or re-authenticate with a different plan before retrying."
+    # Use specific abandonment info recorded by the orchestrator for known
+    # non-retryable failure modes (thinking stall, planning stall, etc.)
+    if ctx.abandonment_info is not None:
+        info = ctx.abandonment_info
+        phase = info.get("phase", "builder")
+        failure_data = info.get("failure_data", {})
+        message = info.get("message", "")
+
+        # Derive human-readable failure mode and advice from failure_data flags
+        if failure_data.get("thinking_stall"):
+            failure_mode = (
+                "thinking stall — extended thinking output with zero tool calls "
+                "(retry budget exhausted)"
+            )
+            safe_to_retry = True
+            advice = (
+                "The issue has been returned to `loom:issue` and is safe to retry. "
+                "If this recurs, the issue may need more specific implementation guidance."
+            )
+        elif failure_data.get("planning_stall"):
+            timeout = failure_data.get("planning_timeout", "unknown")
+            failure_mode = (
+                f"planning stall — agent did not progress past planning "
+                f"within {timeout}s"
+            )
+            safe_to_retry = True
+            advice = (
+                "The issue has been returned to `loom:issue` and is safe to retry. "
+                "Consider adding more specific implementation guidance to help "
+                "the agent make progress."
+            )
+        elif failure_data.get("degraded_session"):
+            failure_mode = (
+                "degraded session — rate limits detected during execution "
+                "(Crystallizing loop or Stop-and-wait modal)"
+            )
+            safe_to_retry = True
+            advice = (
+                "The issue has been returned to `loom:issue`. "
+                "Retry after the rate limit resets (usually a few minutes)."
+            )
+        elif failure_data.get("auth_failure"):
+            failure_mode = (
+                "auth pre-flight failure — authentication check timed out "
+                "(parent session may hold config lock)"
+            )
+            safe_to_retry = False
+            advice = (
+                "This is an **infrastructure failure**, not an issue with the code. "
+                "Check authentication tokens and API availability before retrying."
+            )
+        elif failure_data.get("rate_limit_abort"):
+            failure_mode = (
+                "rate limit abort — CLI hit usage/plan limit "
+                "(interactive prompt in headless mode)"
+            )
+            safe_to_retry = False
+            advice = (
+                "Wait for the usage or plan limit to reset, or re-authenticate "
+                "with a different plan before retrying."
+            )
+        else:
+            # Generic builder failure (MCP failure, low-output, etc.)
+            failure_mode = message or "unexpected failure"
+            safe_to_retry = True
+            advice = (
+                "The issue has been returned to `loom:issue` and is safe to retry. "
+                "If this issue fails repeatedly, it may need manual investigation "
+                "or more detailed implementation guidance."
+            )
+
+        log_path = failure_data.get("log_file")
+        if log_path is None:
+            try:
+                log_path = str(LoomPaths(ctx.repo_root).builder_log_file(issue))
+            except Exception:
+                log_path = None
+        log_line = f"\nLog: `{log_path}`" if log_path else ""
+
+        comment_body = (
+            f"**Shepherd abandoned issue** (task `{task_id}`, {today})\n\n"
+            f"Phase **{phase}** failed: {failure_mode}."
+            f"{log_line}\n\n"
+            f"{advice}"
         )
     else:
-        failure_type = "unexpected failure"
-        advice = (
-            "If this issue fails repeatedly, it may need manual investigation "
-            "or more detailed implementation guidance."
-        )
+        # No specific abandonment info — use exit-code-based messages
+        if exit_code == ShepherdExitCode.SYSTEMIC_FAILURE:
+            failure_type = "infrastructure failure (auth/API)"
+            advice = (
+                "This is an **infrastructure failure**, not an issue with the code. "
+                "Check authentication tokens and API availability before retrying."
+            )
+        elif exit_code == ShepherdExitCode.RATE_LIMIT_ABORT:
+            failure_type = "rate limit abort (usage/plan limit)"
+            advice = (
+                "The CLI hit a **usage or plan limit** and showed an interactive prompt "
+                "that cannot be answered in headless mode. Wait for the limit to reset "
+                "or re-authenticate with a different plan before retrying."
+            )
+        else:
+            failure_type = "unexpected failure"
+            advice = (
+                "If this issue fails repeatedly, it may need manual investigation "
+                "or more detailed implementation guidance."
+            )
 
-    comment_body = (
-        f"**Shepherd fallback cleanup**: The builder phase did not produce a PR "
-        f"and no specific failure handler ran. The issue has been returned to the "
-        f"ready pool.\n\n"
-        f"**Exit code**: {exit_code} ({describe_exit_code(exit_code)})\n"
-        f"**Failure type**: {failure_type}\n\n"
-        f"{advice}"
-    )
+        comment_body = (
+            f"**Shepherd abandoned issue** (task `{task_id}`, {today})\n\n"
+            f"The builder phase did not produce a PR. "
+            f"The issue has been returned to the ready pool.\n\n"
+            f"**Exit code**: {exit_code} ({describe_exit_code(exit_code)})\n"
+            f"**Failure type**: {failure_type}\n\n"
+            f"{advice}"
+        )
 
     try:
         subprocess.run(
