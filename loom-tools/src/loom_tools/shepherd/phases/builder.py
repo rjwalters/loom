@@ -999,21 +999,6 @@ class BuilderPhase:
 
             # Check if this is incomplete work that could be completed
             if not self._has_incomplete_work(diag):
-                # Check if workflow is already complete (PR exists with review label).
-                # This handles API propagation delays where validate() returns False
-                # because _find_pr_for_issue() sees no PR yet, but _gather_diagnostics()
-                # finds the PR via a separate API call made moments later.
-                if (
-                    diag.get("pr_number") is not None
-                    and diag.get("pr_has_review_label", False)
-                ):
-                    log_info(
-                        f"PR #{diag['pr_number']} exists with loom:review-requested — "
-                        "validate() returned False due to API propagation delay; "
-                        "treating as success"
-                    )
-                    break  # Post-loop code confirms PR and returns SUCCESS
-
                 # Check if this is the "no changes needed" pattern
                 if self._is_no_changes_needed(diag):
                     log_info(
