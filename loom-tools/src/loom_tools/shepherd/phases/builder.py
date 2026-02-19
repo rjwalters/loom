@@ -5191,6 +5191,23 @@ class BuilderPhase:
         if not ctx.worktree_path or not ctx.worktree_path.is_dir():
             return False
 
+        # Guard: never commit checkpoint to main — only to the feature branch
+        expected_branch = NamingConventions.branch_name(ctx.config.issue)
+        branch_res = subprocess.run(
+            ["git", "-C", str(ctx.worktree_path), "rev-parse", "--abbrev-ref", "HEAD"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        actual_branch = branch_res.stdout.strip() if branch_res.returncode == 0 else None
+        if actual_branch != expected_branch:
+            log_warning(
+                f"[builder] Refusing prior-run checkpoint commit: worktree is on "
+                f"'{actual_branch}', expected '{expected_branch}'. "
+                f"Checkpoint commits must never land on main."
+            )
+            return False
+
         # Check for meaningful uncommitted changes (filter build artifacts)
         status_result = subprocess.run(
             ["git", "-C", str(ctx.worktree_path), "status", "--porcelain"],
@@ -5277,6 +5294,23 @@ class BuilderPhase:
             True if work was successfully committed and pushed, False otherwise.
         """
         if not ctx.worktree_path or not ctx.worktree_path.is_dir():
+            return False
+
+        # Guard: never commit WIP to main — only to the feature branch
+        expected_branch = NamingConventions.branch_name(ctx.config.issue)
+        branch_res = subprocess.run(
+            ["git", "-C", str(ctx.worktree_path), "rev-parse", "--abbrev-ref", "HEAD"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        actual_branch = branch_res.stdout.strip() if branch_res.returncode == 0 else None
+        if actual_branch != expected_branch:
+            log_warning(
+                f"[builder] Refusing interrupted-work commit: worktree is on "
+                f"'{actual_branch}', expected '{expected_branch}'. "
+                f"Checkpoint commits must never land on main."
+            )
             return False
 
         if not self._has_uncommitted_changes(ctx):
