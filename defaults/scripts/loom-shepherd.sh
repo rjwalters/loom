@@ -88,6 +88,16 @@ fi
 # Bash tool, Task agents) because Python buffers stderr and may not flush before exit.
 export PYTHONUNBUFFERED=1
 
+# Set up log file for reliable output capture.
+# Shepherd output is teed to this file to ensure it's always accessible, even
+# when invoked with 2>&1 redirect in contexts where the capture buffer may be
+# dropped (e.g., Claude Code Bash tool for long-running processes). The log path
+# is printed immediately so it's visible even if subsequent output is invisible.
+LOG_DIR="$REPO_ROOT/.loom/logs"
+mkdir -p "$LOG_DIR"
+SHEPHERD_LOG="$LOG_DIR/loom-shepherd-issue-${1:-unknown}.log"
+printf '[INFO] Shepherd log: %s\n' "$SHEPHERD_LOG" >&2
+
 # Try Python implementation first
 # Priority order:
 #   1. Virtual environment in loom-tools (from source or recorded path)
@@ -101,10 +111,16 @@ if [[ -n "$LOOM_TOOLS" ]] && [[ -x "$LOOM_TOOLS/.venv/bin/loom-shepherd" ]]; the
     # Claude Code Bash tool) because the tool loses its output capture handle
     # on the replaced process. Running as a child preserves output capture
     # while set -e ensures exit code propagation.
-    "$LOOM_TOOLS/.venv/bin/loom-shepherd" "${args[@]}"
+    #
+    # Output is teed to the log file (2>&1 merges stderr→stdout first so
+    # both streams land in the log). The || true suppresses set -e so we
+    # can capture the real exit code via PIPESTATUS.
+    "$LOOM_TOOLS/.venv/bin/loom-shepherd" "${args[@]}" 2>&1 | tee -a "$SHEPHERD_LOG" || true
+    exit "${PIPESTATUS[0]}"
 elif command -v loom-shepherd &>/dev/null; then
     # System-installed (same rationale as above — no exec)
-    loom-shepherd "${args[@]}"
+    loom-shepherd "${args[@]}" 2>&1 | tee -a "$SHEPHERD_LOG" || true
+    exit "${PIPESTATUS[0]}"
 else
     echo "[ERROR] Python shepherd not available." >&2
     echo "" >&2
