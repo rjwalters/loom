@@ -16,6 +16,7 @@ from loom_tools.shepherd.cli import (
     _check_main_repo_clean,
     _cleanup_labels_on_failure,
     _cleanup_pr_labels_on_failure,
+    _find_source_issues_for_dirty_files,
     _get_prior_failure_info,
     _is_loom_runtime,
     _create_config,
@@ -554,6 +555,78 @@ class TestCheckMainRepoClean:
              patch("loom_tools.shepherd.cli.log_warning"):
             result = _check_main_repo_clean(Path("/fake/repo"), allow_dirty=False)
             assert result is False
+
+    def test_suggests_recovery_when_source_issues_found(self) -> None:
+        """Should print recovery commands when dirty files map to worktrees (issue #2837)."""
+        with patch("loom_tools.shepherd.cli.get_uncommitted_files", return_value=["M src/foo.py"]), \
+             patch("loom_tools.shepherd.cli._find_source_issues_for_dirty_files", return_value={42: ["src/foo.py"]}), \
+             patch("loom_tools.shepherd.cli.log_warning") as mock_warn:
+            _check_main_repo_clean(Path("/fake/repo"), allow_dirty=True)
+            messages = [call[0][0] for call in mock_warn.call_args_list]
+            # Should mention the issue number
+            assert any("#42" in msg for msg in messages)
+            # Should suggest at least one recovery command
+            assert any("git stash" in msg or "git checkout" in msg for msg in messages)
+
+    def test_no_recovery_suggestion_when_no_worktree_match(self) -> None:
+        """Should not print recovery commands when no worktrees match (issue #2837)."""
+        with patch("loom_tools.shepherd.cli.get_uncommitted_files", return_value=["M src/foo.py"]), \
+             patch("loom_tools.shepherd.cli._find_source_issues_for_dirty_files", return_value={}), \
+             patch("loom_tools.shepherd.cli.log_warning") as mock_warn:
+            _check_main_repo_clean(Path("/fake/repo"), allow_dirty=True)
+            messages = [call[0][0] for call in mock_warn.call_args_list]
+            assert not any("git stash" in msg for msg in messages)
+
+
+class TestFindSourceIssuesForDirtyFiles:
+    """Tests for _find_source_issues_for_dirty_files (issue #2837)."""
+
+    def test_returns_empty_when_worktrees_dir_missing(self, tmp_path: Path) -> None:
+        """Should return empty dict when .loom/worktrees does not exist."""
+        result = _find_source_issues_for_dirty_files(tmp_path, ["src/foo.py"])
+        assert result == {}
+
+    def test_returns_empty_when_no_files_match(self, tmp_path: Path) -> None:
+        """Should return empty dict when dirty files don't exist in any worktree."""
+        worktrees = tmp_path / ".loom" / "worktrees" / "issue-42"
+        worktrees.mkdir(parents=True)
+        result = _find_source_issues_for_dirty_files(tmp_path, ["src/foo.py"])
+        assert result == {}
+
+    def test_returns_match_when_file_exists_in_worktree(self, tmp_path: Path) -> None:
+        """Should return issue->files mapping when a dirty file exists in worktree."""
+        worktree = tmp_path / ".loom" / "worktrees" / "issue-42"
+        (worktree / "src").mkdir(parents=True)
+        (worktree / "src" / "foo.py").write_text("# content")
+        result = _find_source_issues_for_dirty_files(tmp_path, ["src/foo.py"])
+        assert result == {42: ["src/foo.py"]}
+
+    def test_matches_multiple_files_and_issues(self, tmp_path: Path) -> None:
+        """Should return all matching files across multiple worktrees."""
+        for issue in (10, 20):
+            wt = tmp_path / ".loom" / "worktrees" / f"issue-{issue}"
+            (wt / "pkg").mkdir(parents=True)
+            (wt / "pkg" / "mod.py").write_text("")
+        result = _find_source_issues_for_dirty_files(tmp_path, ["pkg/mod.py", "other.py"])
+        assert set(result.keys()) == {10, 20}
+        assert result[10] == ["pkg/mod.py"]
+        assert result[20] == ["pkg/mod.py"]
+
+    def test_skips_non_issue_directories(self, tmp_path: Path) -> None:
+        """Should ignore worktree directories that don't match issue-N naming."""
+        terminal = tmp_path / ".loom" / "worktrees" / "terminal-1"
+        (terminal / "src").mkdir(parents=True)
+        (terminal / "src" / "foo.py").write_text("")
+        result = _find_source_issues_for_dirty_files(tmp_path, ["src/foo.py"])
+        assert result == {}
+
+    def test_handles_oserror_gracefully(self, tmp_path: Path) -> None:
+        """Should return empty dict (not raise) on OSError."""
+        worktrees = tmp_path / ".loom" / "worktrees"
+        worktrees.mkdir(parents=True)
+        with patch("pathlib.Path.iterdir", side_effect=OSError("permission denied")):
+            result = _find_source_issues_for_dirty_files(tmp_path, ["src/foo.py"])
+        assert result == {}
 
 
 def _make_ctx(
