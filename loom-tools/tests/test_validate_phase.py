@@ -1187,6 +1187,70 @@ class TestRateLimitedBuilderExit:
 
 
 # ---------------------------------------------------------------------------
+# _build_recovery_pr_body: pre-written PR body (.loom/pr-body.md)
+# ---------------------------------------------------------------------------
+
+
+class TestBuildRecoveryPrBodyPreWritten:
+    """Tests for _build_recovery_pr_body reading .loom/pr-body.md."""
+
+    def test_recovery_pr_body_uses_pre_written_body_when_exists(self, tmp_path: Path):
+        """When .loom/pr-body.md exists, its content is used as the PR body."""
+        wt = tmp_path / "worktree"
+        pr_body_dir = wt / ".loom"
+        pr_body_dir.mkdir(parents=True)
+        pr_body_file = pr_body_dir / "pr-body.md"
+        pre_written = "## Summary\n\nThis PR fixes the widget.\n\nCloses #42"
+        pr_body_file.write_text(pre_written)
+
+        body = _build_recovery_pr_body(42, str(wt))
+
+        assert body == pre_written
+
+    def test_recovery_pr_body_appends_closes_if_missing(self, tmp_path: Path):
+        """When .loom/pr-body.md exists but lacks Closes #N, it is appended."""
+        wt = tmp_path / "worktree"
+        pr_body_dir = wt / ".loom"
+        pr_body_dir.mkdir(parents=True)
+        pr_body_file = pr_body_dir / "pr-body.md"
+        pre_written = "## Summary\n\nThis PR adds a feature."
+        pr_body_file.write_text(pre_written)
+
+        body = _build_recovery_pr_body(42, str(wt))
+
+        assert "Closes #42" in body
+        assert "## Summary" in body
+        assert "This PR adds a feature." in body
+
+    def test_recovery_pr_body_keeps_closes_if_present(self, tmp_path: Path):
+        """When .loom/pr-body.md already has Closes #N, it is not duplicated."""
+        wt = tmp_path / "worktree"
+        pr_body_dir = wt / ".loom"
+        pr_body_dir.mkdir(parents=True)
+        pr_body_file = pr_body_dir / "pr-body.md"
+        pre_written = "## Summary\n\nFix the bug.\n\nCloses #42"
+        pr_body_file.write_text(pre_written)
+
+        body = _build_recovery_pr_body(42, str(wt))
+
+        assert body.count("Closes #42") == 1
+
+    @patch("loom_tools.validate_phase.subprocess.run")
+    def test_recovery_pr_body_falls_back_when_no_file(self, mock_run: MagicMock, tmp_path: Path):
+        """When .loom/pr-body.md does not exist, fallback diff-stats body is generated."""
+        wt = tmp_path / "worktree"
+        wt.mkdir(parents=True)
+        # No .loom/pr-body.md created
+        mock_run.return_value = _completed(stdout="")
+
+        body = _build_recovery_pr_body(42, str(wt))
+
+        assert "Closes #42" in body
+        # Fallback body contains recovery note, not pre-written content
+        assert "recovery path" in body or "rate-limited" in body or "automatically" in body
+
+
+# ---------------------------------------------------------------------------
 # quiet mode (issue #2609)
 # ---------------------------------------------------------------------------
 
