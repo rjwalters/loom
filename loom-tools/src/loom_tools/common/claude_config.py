@@ -149,6 +149,22 @@ def _ensure_onboarding_complete(state_path: Path) -> None:
             if merged.get(key) is not default_value:
                 merged[key] = default_value
 
+    # If state_path is a valid symlink, write directly to the symlink target
+    # rather than destroying the symlink and creating a standalone file.
+    # Destroying the symlink severs the connection to the global ~/.claude.json,
+    # causing subsequent agent sessions to lose the full user state (project
+    # history, settings, etc.) and run with only the minimal fields written here.
+    # Writing to the target preserves the symlink, fixes the global state file
+    # in place, and ensures all future agent sessions inherit the correct fields.
+    # See issue #2835.
+    if state_path.is_symlink():
+        target = state_path.resolve()
+        if target.exists():
+            target.write_text(json.dumps(merged))
+            log.debug("Updated symlink target .claude.json with onboarding-complete state")
+            return
+        # Dangling symlink — fall through to unlink and recreate below.
+
     # Remove whatever is there (dangling symlink, corrupt file, etc.)
     # so we can write a standalone file.
     try:

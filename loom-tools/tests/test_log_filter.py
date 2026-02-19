@@ -7,7 +7,13 @@ import tempfile
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
-from loom_tools.log_filter import clean_file, clean_line, is_tui_noise, main
+from loom_tools.log_filter import (
+    SPINNERS,
+    clean_file,
+    clean_line,
+    is_tui_noise,
+    main,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -533,3 +539,145 @@ class TestMain:
         assert "Nucleating" not in output
         assert "Pollinating" not in output
         assert "(thinking)" not in output
+
+
+# ---------------------------------------------------------------------------
+# TestToolCallMarker — regression tests for ⏺ (U+23FA) preservation
+# Issue #2835: ⏺ was incorrectly included in SPINNERS, causing tool call
+# lines to be stripped and thinking stall detection to false-positive.
+# ---------------------------------------------------------------------------
+
+
+class TestToolCallMarker:
+    """⏺ (U+23FA BLACK CIRCLE FOR RECORD) must NEVER be treated as a spinner.
+
+    Claude Code uses ⏺ as the tool call marker.  Loom's thinking stall
+    detector counts occurrences of ⏺ in captured logs to determine whether
+    the agent made any tool calls.  If ⏺ is in SPINNERS (and thus stripped by
+    _strip_leading_spinners), the detector sees zero markers and incorrectly
+    classifies the session as a thinking stall — even when the agent was
+    actively making tool calls.  See issue #2835.
+    """
+
+    _TOOL_CALL_MARKER = "\u23fa"  # ⏺
+
+    def test_tool_call_marker_not_in_spinners(self) -> None:
+        """⏺ (U+23FA) must not be a member of the SPINNERS set."""
+        assert self._TOOL_CALL_MARKER not in SPINNERS, (
+            "⏺ (U+23FA) is in SPINNERS — this will cause thinking stall "
+            "false positives because tool call lines will be stripped. "
+            "See issue #2835."
+        )
+
+    def test_other_spinners_still_present(self) -> None:
+        """The legitimate TUI spinner characters must remain in SPINNERS."""
+        for ch in "\u2736\u273b\u273d\u2733\u2722\u00b7":
+            assert ch in SPINNERS, f"Spinner char {ch!r} unexpectedly removed from SPINNERS"
+
+    def test_tool_call_line_not_noise(self) -> None:
+        """A line starting with ⏺ is a tool call and must not be flagged as TUI noise."""
+        tool_call_line = "\u23fa Read(file_path: /foo/bar.py)"
+        assert is_tui_noise(tool_call_line) is False, (
+            "Tool call line starting with ⏺ was classified as TUI noise"
+        )
+
+    def test_tool_call_line_with_args_not_noise(self) -> None:
+        """A typical tool call line (⏺ + tool name + args) must not be noise.
+
+        Real tool calls always include text after ⏺, e.g.:
+          ⏺ Read(file_path: /repo/src/foo.py)
+          ⏺ Bash(command: git status)
+        These are substantially longer than the short-fragment threshold and
+        must survive the TUI noise filter intact.
+        """
+        # Real tool call lines have spaces and are > 5 chars, so debris check passes
+        assert is_tui_noise("\u23fa Read(file_path: /repo/src/foo.py)") is False
+        assert is_tui_noise("\u23fa Bash(command: git status)") is False
+        assert is_tui_noise("\u23fa Update Todos") is False
+
+    def test_clean_file_preserves_tool_call_lines(self) -> None:
+        """clean_file must keep lines containing ⏺ intact (issue #2835 regression)."""
+        content = (
+            "Nucleating\u2026\n"
+            "\u23fa Read(file_path: /repo/src/foo.py)\n"
+            "(thinking)\n"
+            "\u23fa Bash(command: pytest tests/)\n"
+            "git commit -m 'fix'\n"
+        )
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".log", delete=False) as f:
+            f.write(content)
+            path = f.name
+        try:
+            result = clean_file(path)
+        finally:
+            Path(path).unlink(missing_ok=True)
+
+        assert "\u23fa Read(file_path: /repo/src/foo.py)" in result, (
+            "Tool call line with ⏺ was stripped by clean_file"
+        )
+        assert "\u23fa Bash(command: pytest tests/)" in result, (
+            "Tool call line with ⏺ was stripped by clean_file"
+        )
+        assert "Nucleating" not in result
+        assert "(thinking)" not in result
+
+    def test_main_preserves_tool_call_lines(self) -> None:
+        """main() (real-time pipe filter) must not strip ⏺-prefixed lines."""
+        input_text = (
+            "Nucleating\u2026\n"
+            "\u23fa Read(file_path: /src/foo.py)\n"
+            "(thinking)\n"
+            "\u23fa Bash(command: git status)\n"
+            "real output here\n"
+        )
+        stdin = io.StringIO(input_text)
+        stdout = io.StringIO()
+        with patch("sys.stdin", stdin), patch("sys.stdout", stdout):
+            main()
+        output = stdout.getvalue()
+
+        assert "\u23fa Read(file_path: /src/foo.py)" in output, (
+            "Tool call line with ⏺ was stripped by main() pipe filter"
+        )
+        assert "\u23fa Bash(command: git status)" in output, (
+            "Tool call line with ⏺ was stripped by main() pipe filter"
+        )
+        assert "Nucleating" not in output
+        assert "(thinking)" not in output
+
+    def test_v2140_animation_words_filtered(self) -> None:
+        """Animation words added in Claude Code v2.1.40+ must be filtered."""
+        new_words = [
+            "Frosting\u2026",
+            "Befuddling\u2026",
+            "Moseying\u2026",
+            "Sashaying\u2026",
+            "Waltzing\u2026",
+            "Lollygagging\u2026",
+            "Gallivanting\u2026",
+        ]
+        for word in new_words:
+            assert is_tui_noise(word) is True, (
+                f"v2.1.40+ animation word {word!r} not detected as TUI noise"
+            )
+
+    def test_v2140_animation_words_filtered_in_stream(self) -> None:
+        """New animation words are suppressed by the real-time pipe filter."""
+        input_text = (
+            "Frosting\u2026\n"
+            "Befuddling\u2026\n"
+            "\u23fa Read(file_path: /src/foo.py)\n"
+            "Lollygagging\u2026\n"
+            "real output\n"
+        )
+        stdin = io.StringIO(input_text)
+        stdout = io.StringIO()
+        with patch("sys.stdin", stdin), patch("sys.stdout", stdout):
+            main()
+        output = stdout.getvalue()
+
+        assert "Frosting" not in output
+        assert "Befuddling" not in output
+        assert "Lollygagging" not in output
+        assert "\u23fa Read(file_path: /src/foo.py)" in output
+        assert "real output" in output

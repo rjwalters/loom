@@ -37,10 +37,17 @@ _CONTROL_CHARS = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
 # Claude Code TUI noise patterns (used in deep/file cleaning mode)
 # ---------------------------------------------------------------------------
 
-# Spinner characters used by the Claude Code TUI
-SPINNERS = set("\u2736\u273b\u273d\u2733\u2722\u23fa\u00b7")  # ✶✻✽✳✢⏺·
+# Spinner characters used by the Claude Code TUI thinking animation.
+# NOTE: ⏺ (U+23FA) is intentionally excluded — it is the tool call marker
+# used by _is_thinking_stall_session() to detect productive sessions.
+# Stripping ⏺ would cause false-positive thinking stall detection.
+# See issue #2835.
+SPINNERS = set("\u2736\u273b\u273d\u2733\u2722\u00b7")  # ✶✻✽✳✢·
 
-# Animation words displayed during thinking/processing
+# Animation words displayed during thinking/processing.
+# Covers multiple Claude Code versions — newer versions (v2.1.40+) use
+# words like "Frosting", "Befuddling", "Moseying", etc. that were not
+# present in older versions.  See issue #2835.
 ANIMATION_WORDS = {
     "Nucleating", "Pollinating", "Shimmying", "Transmuting",
     "Crunching", "Pondering", "Germinating", "Synthesizing",
@@ -53,12 +60,21 @@ ANIMATION_WORDS = {
     "Interpolating", "Meditating", "Originating", "Philosophizing",
     "Reflecting", "Simulating", "Triangulating", "Unbundling",
     "Visualizing", "Crunched",
+    # Newer animation words observed in Claude Code v2.1.40+ (issue #2835)
+    "Befuddling", "Frosting", "Moseying", "Sashaying", "Waltzing",
+    "Ambling", "Beguiling", "Brooding", "Bumbling", "Dawdling",
+    "Dithering", "Floundering", "Fretting", "Fumbling", "Gallivanting",
+    "Humming", "Idling", "Lollygagging", "Meandering", "Milling",
+    "Mulling", "Noodling", "Perambulating", "Perusing", "Pondering",
+    "Pottering", "Puttering", "Rambling", "Ruminating", "Sifting",
+    "Stewing", "Tinkering", "Toiling", "Wandering", "Whirring",
 }
 
-# Build animation regex: optional spinner + animation word + optional ellipsis/timing
+# Build animation regex: optional spinner + animation word + optional ellipsis/timing.
+# ⏺ is excluded from the spinner prefix class — see SPINNERS note above.
 _anim_pattern = "|".join(re.escape(w) for w in sorted(ANIMATION_WORDS))
 _ANIMATION_RE = re.compile(
-    "^[✶✻✽✳✢⏺·\\s]*("
+    "^[✶✻✽✳✢·\\s]*("
     + _anim_pattern
     + ")…?"
     "(\\s*\\(.*\\))?\\s*$"
