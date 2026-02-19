@@ -58,7 +58,7 @@ See [WORKFLOWS.md](docs/workflows.md) for complete label documentation.
 ## Features
 
 **Autonomous Orchestration**
-- Shell-based shepherd orchestration for deterministic, reliable execution
+- Signal-based shepherd IPC for deterministic, reliable execution
 - Stuck agent detection with automatic kill-and-retry recovery
 - Rate limit resilience with exponential backoff
 - Activity-based completion detection
@@ -71,7 +71,7 @@ See [WORKFLOWS.md](docs/workflows.md) for complete label documentation.
 
 **Developer Experience**
 - Git worktree isolation per issue
-- Simplified CLI: `/shepherd 42` or `/shepherd --force 42`
+- Simple CLI: `/shepherd 42` monitors a single issue end-to-end via the daemon
 - MCP integration for programmatic control (19 tools)
 - Graceful shutdown: `touch .loom/stop-daemon`
 
@@ -123,10 +123,26 @@ your-repo/
 
 The daemon monitors your pipeline, spawns shepherds for ready issues, and triggers support roles (architect, hermit, auditor) on schedule.
 
-### Manual Mode
+### Single-Issue Mode
+
+To orchestrate one issue end-to-end, start the daemon first, then use `/shepherd`:
 
 ```bash
-/shepherd 42       # Orchestrate single issue through full lifecycle
+# In a terminal outside Claude Code
+./.loom/scripts/start-daemon.sh
+
+# Then in Claude Code
+/shepherd 42         # Orchestrate issue through full lifecycle
+/shepherd 42 --merge # Same, but auto-merge after Judge approves
+```
+
+`/shepherd` writes a signal to the daemon and then monitors progress — it requires the daemon to be running.
+
+### Individual Agent Commands
+
+Run worker agents directly (no daemon required):
+
+```bash
 /builder 42        # Implement issue 42
 /judge 123         # Review PR #123
 /curator 42        # Enhance issue with technical details
@@ -168,7 +184,7 @@ gh pr create --label "loom:review-requested"
 | Role | Purpose | Mode |
 |------|---------|------|
 | `/loom` | System orchestration, work generation | Continuous daemon |
-| `/shepherd` | Issue lifecycle orchestration | Per-issue |
+| `/shepherd` | Issue lifecycle orchestration (requires daemon) | Per-issue |
 | `/builder` | Implement features and fixes | Manual |
 | `/judge` | Review pull requests | Autonomous |
 | `/curator` | Enhance and organize issues | Autonomous |

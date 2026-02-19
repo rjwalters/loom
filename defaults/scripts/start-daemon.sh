@@ -149,7 +149,7 @@ echo "  Mode: ${ARGS[*]:-normal}"
 } >> "$LOGFILE" 2>/dev/null || true
 
 # shellcheck disable=SC2086
-nohup $LOOM_DAEMON_CMD "${ARGS[@]}" \
+nohup $LOOM_DAEMON_CMD "${ARGS[@]+"${ARGS[@]}"}" \
     >> "$LOGFILE" 2>&1 &
 DAEMON_PID=$!
 

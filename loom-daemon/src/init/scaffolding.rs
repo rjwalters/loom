@@ -233,6 +233,26 @@ pub fn setup_repository_scaffolding(
             .map_err(|e| format!("Failed to copy package.json: {e}"))?;
     }
 
+    // Install loom.sh convenience wrapper at repo root (always update from defaults)
+    // This is a thin wrapper around .loom/scripts/start-daemon.sh that lets
+    // users run `./loom.sh` from the repo root instead of the full script path.
+    let loom_sh_src = defaults_path.join("loom.sh");
+    let loom_sh_dst = workspace_path.join("loom.sh");
+    if loom_sh_src.exists() {
+        fs::copy(&loom_sh_src, &loom_sh_dst).map_err(|e| format!("Failed to copy loom.sh: {e}"))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = fs::metadata(&loom_sh_dst)
+                .map_err(|e| format!("Failed to read loom.sh metadata: {e}"))?
+                .permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(&loom_sh_dst, perms)
+                .map_err(|e| format!("Failed to make loom.sh executable: {e}"))?;
+        }
+        report.updated.push("loom.sh".to_string());
+    }
+
     Ok(())
 }
 

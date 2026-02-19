@@ -72,6 +72,13 @@ install_hooks_and_cli() {
     chmod +x "$target/.loom/bin/loom"
     success "Installed .loom/bin/loom CLI"
   fi
+
+  # Install loom.sh convenience wrapper at repo root
+  if [[ -f "$loom_root/defaults/loom.sh" ]]; then
+    cp "$loom_root/defaults/loom.sh" "$target/loom.sh"
+    chmod +x "$target/loom.sh"
+    success "Installed loom.sh"
+  fi
 }
 
 # Verify critical installation files exist
