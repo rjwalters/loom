@@ -311,6 +311,51 @@ class TestEnsureOnboardingComplete:
         data = json.loads(state.read_text())
         assert data["theme"] == "light"
 
+    def test_symlink_target_updated_not_destroyed_when_theme_null(
+        self, tmp_path: pathlib.Path
+    ) -> None:
+        """When symlink points to a valid target with theme=null, write to
+        target directly — do NOT destroy the symlink.  See issue #2835.
+
+        Previously _ensure_onboarding_complete would unlink() the symlink
+        and write a standalone file, severing the connection to the global
+        ~/.claude.json.  This caused agent sessions to run with minimal
+        state (only the 4 required fields) instead of the full user config,
+        resulting in degraded sessions (missing project history, settings,
+        keychain state, etc.).
+        """
+        import json
+
+        # Simulate ~/.claude.json that has theme=null (json null maps to None)
+        global_state = tmp_path / "home-claude.json"
+        global_state.write_text(json.dumps({
+            "hasCompletedOnboarding": True,
+            "theme": None,  # null — the bug trigger
+            "effortCalloutDismissed": True,
+            "opusProMigrationComplete": True,
+            "projects": {"some/path": {"lastCost": 0.5}},
+            "userPref": "preserved",
+        }))
+
+        state = tmp_path / ".claude.json"
+        state.symlink_to(global_state)
+
+        _ensure_onboarding_complete(state)
+
+        # Symlink must be preserved — not replaced with a standalone file
+        assert state.is_symlink(), (
+            "symlink was destroyed; _ensure_onboarding_complete should write "
+            "to the symlink target, not replace the symlink with a new file"
+        )
+
+        # Target must have theme set
+        data = json.loads(state.read_text())
+        assert data["theme"] == "dark"
+
+        # Full content must be preserved (not just the 4 required fields)
+        assert data["userPref"] == "preserved"
+        assert "projects" in data
+
 
 class TestCopySettingsWithoutPlugins:
     """Tests for _copy_settings_without_plugins."""

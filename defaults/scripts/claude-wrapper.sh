@@ -960,7 +960,17 @@ start_startup_monitor() {
                 local poll_interval=2
                 local grace_elapsed=0
                 local loom_connected=false
-                local debug_log="${CLAUDE_CONFIG_DIR:-}/debug/latest"
+                # Claude Code writes debug logs to ~/.claude/debug/latest regardless
+                # of CLAUDE_CONFIG_DIR.  The per-agent config dir never has a debug/
+                # subdirectory populated by Claude Code itself.  Check the global
+                # debug log as the authoritative source.  See issue #2835.
+                local global_debug_log="${HOME}/.claude/debug/latest"
+                local agent_debug_log="${CLAUDE_CONFIG_DIR:-}/debug/latest"
+                local debug_log="${global_debug_log}"
+                # Prefer per-agent dir if it has a populated debug log (future-proof).
+                if [[ -L "${agent_debug_log}" || -f "${agent_debug_log}" ]]; then
+                    debug_log="${agent_debug_log}"
+                fi
 
                 while [[ "${grace_elapsed}" -lt "${STARTUP_GRACE_PERIOD}" ]]; do
                     # Session ended on its own — nothing to kill
@@ -969,7 +979,12 @@ start_startup_monitor() {
                         break
                     fi
 
-                    # Check if the critical "loom" MCP server connected
+                    # Check if the critical "loom" MCP server connected.
+                    # Re-evaluate debug_log each iteration: the symlink may update
+                    # as new debug sessions start.
+                    if [[ -L "${global_debug_log}" || -f "${global_debug_log}" ]]; then
+                        debug_log="${global_debug_log}"
+                    fi
                     if [[ -L "${debug_log}" || -f "${debug_log}" ]] && \
                        grep -q 'MCP server "loom": Successfully connected' "${debug_log}" 2>/dev/null; then
                         loom_connected=true
