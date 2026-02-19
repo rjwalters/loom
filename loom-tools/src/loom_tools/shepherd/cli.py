@@ -2484,7 +2484,7 @@ def main(argv: list[str] | None = None) -> int:
     # This prevents confusion when tests pass in main but fail in worktrees
     # (or vice versa) due to uncommitted local changes.
     allow_dirty_reason = (
-        "implied by --merge" if dirty_implied_by_force else "--allow-dirty-main specified"
+        "implied by --force/--merge" if dirty_implied_by_force else "--allow-dirty-main specified"
     )
     if not _check_main_repo_clean(repo_root, args.allow_dirty_main, allow_dirty_reason):
         return ShepherdExitCode.NEEDS_INTERVENTION
