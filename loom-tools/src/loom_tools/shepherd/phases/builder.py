@@ -466,6 +466,68 @@ class BuilderPhase:
                     f"{ctx.worktree_path} (branch={ctx.worktree_path.name})"
                 )
 
+        # Checkpoint resume: if the worktree already has commits ahead of main
+        # from a prior run, skip the builder invocation and proceed directly
+        # to push/PR creation.  This avoids rebuilding from scratch when prior
+        # work is already in place.  See issue #2923.
+        if ctx.worktree_path and ctx.worktree_path.is_dir():
+            prior_commits = self._count_commits_ahead_of_main(ctx.worktree_path)
+            if prior_commits > 0:
+                log_info(
+                    f"Prior work found ({prior_commits} commit(s) since main). "
+                    f"Resuming from checkpoint — skipping builder invocation."
+                )
+                ctx.report_milestone(
+                    "checkpoint_loaded",
+                    stage="committed",
+                    recovery_path=str(ctx.worktree_path),
+                    skip_stages=["builder"],
+                )
+                diag = self._gather_diagnostics(ctx)
+                recovery = self._recover_from_existing_worktree(ctx, diag, exit_code=0)
+                if recovery is not None:
+                    return recovery
+
+                # recovery returned None — determine why before returning FAILED.
+                # Case: workflow already complete (PR created + review label added).
+                # This happens when the shepherd crashes after the builder finishes
+                # but before advancing to the judge phase.  On restart, the builder
+                # phase runs again, detects prior commits, but recovery has nothing
+                # to do because the workflow is already done.  Return SUCCESS so the
+                # shepherd advances to the judge phase instead of cycling.
+                if diag.get("pr_number") is not None and diag.get(
+                    "pr_has_review_label", False
+                ):
+                    ctx.pr_number = diag["pr_number"]
+                    return PhaseResult(
+                        status=PhaseStatus.SUCCESS,
+                        message=(
+                            f"builder phase complete - PR #{diag['pr_number']} "
+                            f"already exists with review label "
+                            f"(prior checkpoint detected)"
+                        ),
+                        phase_name="builder",
+                        data={
+                            "pr_number": diag["pr_number"],
+                            "recovered_from_checkpoint": True,
+                        },
+                    )
+
+                log_warning(
+                    f"Prior checkpoint recovery failed for issue #{ctx.config.issue} "
+                    f"— recovery could not complete push/PR workflow"
+                )
+                return PhaseResult(
+                    status=PhaseStatus.FAILED,
+                    message=(
+                        f"prior checkpoint recovery failed: worktree has "
+                        f"{prior_commits} commit(s) ahead of main but "
+                        f"could not complete push/PR workflow"
+                    ),
+                    phase_name="builder",
+                    data={"prior_commits": prior_commits},
+                )
+
         # Snapshot main's dirty state before spawning the builder so we can
         # distinguish pre-existing dirt from actual worktree escapes later.
         self._main_dirty_baseline = self._snapshot_main_dirty(ctx)
@@ -4650,6 +4712,23 @@ class BuilderPhase:
             return True
 
         return False
+
+    def _count_commits_ahead_of_main(self, worktree_path: Path) -> int:
+        """Count commits in the worktree branch that are ahead of origin/main.
+
+        Returns the number of commits on the current branch not present on
+        origin/main (i.e., local work since the branch point).  Returns 0
+        on any error or when the branch is at parity with main.
+
+        Used for checkpoint resume detection (issue #2923).
+        """
+        result = subprocess.run(
+            ["git", "-C", str(worktree_path), "log", "--oneline", "origin/main..HEAD"],
+            capture_output=True, text=True, check=False,
+        )
+        if result.returncode != 0 or not result.stdout.strip():
+            return 0
+        return len([line for line in result.stdout.splitlines() if line])
 
     def _is_stale_worktree(self, worktree_path: Path) -> bool:
         """Check if an existing worktree is stale (abandoned without commits).

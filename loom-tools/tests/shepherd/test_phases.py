@@ -1329,6 +1329,238 @@ class TestBuilderPhase:
         mock_cleanup.assert_not_called()
 
 
+class TestBuilderCountCommitsAheadOfMain:
+    """Unit tests for BuilderPhase._count_commits_ahead_of_main."""
+
+    def test_returns_0_on_git_failure(self, tmp_path: Path) -> None:
+        """Should return 0 when the git command fails."""
+        builder = BuilderPhase()
+
+        with patch(
+            "loom_tools.shepherd.phases.builder.subprocess.run",
+            return_value=subprocess.CompletedProcess(
+                args=[], returncode=1, stdout="", stderr="fatal: not a git repo"
+            ),
+        ):
+            count = builder._count_commits_ahead_of_main(tmp_path)
+
+        assert count == 0
+
+    def test_returns_0_on_empty_stdout(self, tmp_path: Path) -> None:
+        """Should return 0 when git succeeds but stdout is empty (no commits ahead)."""
+        builder = BuilderPhase()
+
+        with patch(
+            "loom_tools.shepherd.phases.builder.subprocess.run",
+            return_value=subprocess.CompletedProcess(
+                args=[], returncode=0, stdout="", stderr=""
+            ),
+        ):
+            count = builder._count_commits_ahead_of_main(tmp_path)
+
+        assert count == 0
+
+    def test_returns_correct_count(self, tmp_path: Path) -> None:
+        """Should return the number of non-empty lines from git log output."""
+        builder = BuilderPhase()
+        git_output = "abc1234 fix: address issue\ndef5678 feat: implement feature\n9abcdef chore: add tests\n"
+
+        with patch(
+            "loom_tools.shepherd.phases.builder.subprocess.run",
+            return_value=subprocess.CompletedProcess(
+                args=[], returncode=0, stdout=git_output, stderr=""
+            ),
+        ):
+            count = builder._count_commits_ahead_of_main(tmp_path)
+
+        assert count == 3
+
+
+class TestBuilderCheckpointResume:
+    """Tests for the checkpoint resume path in BuilderPhase.run().
+
+    When a worktree already has commits ahead of main from a prior run,
+    the builder phase skips re-invoking the builder and instead attempts
+    to complete the push/PR workflow directly.  See issue #2923.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _no_usage_api(self):
+        """Prevent real keychain/API calls from _is_rate_limited."""
+        with patch(
+            "loom_tools.common.usage._read_keychain_token", return_value=None
+        ):
+            yield
+
+    def test_checkpoint_resume_fires_and_succeeds(
+        self, mock_context: MagicMock
+    ) -> None:
+        """Checkpoint resume path fires when prior commits exist and recovery succeeds."""
+        mock_context.check_shutdown.return_value = False
+        mock_context.pr_number = None
+        wt_mock = MagicMock()
+        wt_mock.is_dir.return_value = True
+        wt_mock.__bool__ = lambda self: True
+        mock_context.worktree_path = wt_mock
+
+        builder = BuilderPhase()
+        expected_result = PhaseResult(
+            status=PhaseStatus.SUCCESS,
+            message="builder phase complete - PR #77 created (recovered from exit code 0)",
+            phase_name="builder",
+            data={"pr_number": 77, "recovered_from_worktree": True},
+        )
+
+        with (
+            patch(
+                "loom_tools.shepherd.phases.builder.get_pr_for_issue",
+                return_value=None,
+            ),
+            patch("loom_tools.shepherd.phases.builder.transition_issue_labels"),
+            patch.object(builder, "_create_worktree_marker"),
+            patch.object(
+                builder, "_count_commits_ahead_of_main", return_value=3
+            ),
+            patch.object(builder, "_gather_diagnostics", return_value={}),
+            patch.object(
+                builder,
+                "_recover_from_existing_worktree",
+                return_value=expected_result,
+            ),
+        ):
+            result = builder.run(mock_context)
+
+        assert result.status == PhaseStatus.SUCCESS
+        assert result.data.get("pr_number") == 77
+
+    def test_fresh_worktree_falls_through_to_builder(
+        self, mock_context: MagicMock
+    ) -> None:
+        """When no prior commits exist, the builder is invoked normally."""
+        mock_context.check_shutdown.return_value = False
+        mock_context.pr_number = None
+        wt_mock = MagicMock()
+        wt_mock.is_dir.return_value = True
+        wt_mock.__bool__ = lambda self: True
+        mock_context.worktree_path = wt_mock
+
+        builder = BuilderPhase()
+
+        with (
+            # First call (run() checks for existing PR) → None (proceed to build)
+            # Second call (post-validation PR lookup) → 99 (success)
+            patch(
+                "loom_tools.shepherd.phases.builder.get_pr_for_issue",
+                side_effect=[None, 99],
+            ) as mock_get_pr,
+            patch("loom_tools.shepherd.phases.builder.transition_issue_labels"),
+            patch.object(builder, "_create_worktree_marker"),
+            patch.object(
+                builder, "_count_commits_ahead_of_main", return_value=0
+            ),
+            patch(
+                "loom_tools.shepherd.phases.builder.run_phase_with_retry",
+                return_value=0,
+            ) as mock_run,
+            patch.object(builder, "validate", return_value=True),
+            patch.object(builder, "_detect_worktree_escape", return_value=None),
+        ):
+            result = builder.run(mock_context)
+
+        # Builder was invoked (run_phase_with_retry was called)
+        mock_run.assert_called_once()
+        assert result.status == PhaseStatus.SUCCESS
+        assert mock_context.pr_number == 99
+
+    def test_checkpoint_resume_workflow_complete_returns_success(
+        self, mock_context: MagicMock
+    ) -> None:
+        """When recovery returns None but PR+review label exists, return SUCCESS.
+
+        Scenario: shepherd crashed after builder completed (PR created + review
+        label added) but before advancing to the judge phase.  On restart,
+        builder detects prior commits but _recover_from_existing_worktree
+        returns None (nothing to do — work is already done).  The phase must
+        return SUCCESS so the shepherd advances to judge, not cycle on retries.
+        """
+        mock_context.check_shutdown.return_value = False
+        mock_context.pr_number = None
+        wt_mock = MagicMock()
+        wt_mock.is_dir.return_value = True
+        wt_mock.__bool__ = lambda self: True
+        mock_context.worktree_path = wt_mock
+
+        builder = BuilderPhase()
+        fake_diag = {
+            "summary": "PR #88 (with loom:review-requested); checkpoint=pr_created",
+            "pr_number": 88,
+            "pr_has_review_label": True,
+        }
+
+        with (
+            patch(
+                "loom_tools.shepherd.phases.builder.get_pr_for_issue",
+                return_value=None,
+            ),
+            patch("loom_tools.shepherd.phases.builder.transition_issue_labels"),
+            patch.object(builder, "_create_worktree_marker"),
+            patch.object(
+                builder, "_count_commits_ahead_of_main", return_value=2
+            ),
+            patch.object(builder, "_gather_diagnostics", return_value=fake_diag),
+            patch.object(
+                builder, "_recover_from_existing_worktree", return_value=None
+            ),
+        ):
+            result = builder.run(mock_context)
+
+        assert result.status == PhaseStatus.SUCCESS
+        assert "PR #88" in result.message
+        assert "prior checkpoint detected" in result.message
+        assert result.data.get("pr_number") == 88
+        assert result.data.get("recovered_from_checkpoint") is True
+        assert mock_context.pr_number == 88
+
+    def test_checkpoint_resume_workflow_incomplete_returns_failed(
+        self, mock_context: MagicMock
+    ) -> None:
+        """When recovery returns None and workflow is not complete, return FAILED."""
+        mock_context.check_shutdown.return_value = False
+        mock_context.pr_number = None
+        wt_mock = MagicMock()
+        wt_mock.is_dir.return_value = True
+        wt_mock.__bool__ = lambda self: True
+        mock_context.worktree_path = wt_mock
+
+        builder = BuilderPhase()
+        fake_diag = {
+            "summary": "worktree exists; 2 commits ahead; no PR",
+            "pr_number": None,
+            "pr_has_review_label": False,
+        }
+
+        with (
+            patch(
+                "loom_tools.shepherd.phases.builder.get_pr_for_issue",
+                return_value=None,
+            ),
+            patch("loom_tools.shepherd.phases.builder.transition_issue_labels"),
+            patch.object(builder, "_create_worktree_marker"),
+            patch.object(
+                builder, "_count_commits_ahead_of_main", return_value=2
+            ),
+            patch.object(builder, "_gather_diagnostics", return_value=fake_diag),
+            patch.object(
+                builder, "_recover_from_existing_worktree", return_value=None
+            ),
+        ):
+            result = builder.run(mock_context)
+
+        assert result.status == PhaseStatus.FAILED
+        assert "prior checkpoint recovery failed" in result.message
+        assert result.data.get("prior_commits") == 2
+
+
 class TestExtractThinkingSnippet:
     """Unit tests for _extract_thinking_snippet helper."""
 
