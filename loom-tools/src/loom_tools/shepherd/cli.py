@@ -259,6 +259,49 @@ def _is_loom_runtime(porcelain_line: str) -> bool:
     return path.startswith(".loom/") or path.startswith(".loom-")
 
 
+def _find_source_issues_for_dirty_files(
+    repo_root: Path, dirty_filenames: list[str]
+) -> dict[int, list[str]]:
+    """Cross-reference dirty files against active issue worktrees.
+
+    Scans ``.loom/worktrees/issue-*/`` to find which worktrees contain
+    the same files as the ones found dirty in the main repo.  This helps
+    identify which issue's builder work may have leaked into main.
+
+    Args:
+        repo_root: The resolved repository root path.
+        dirty_filenames: Relative file paths from the main repo (as returned
+            by ``parse_porcelain_path``).
+
+    Returns:
+        A mapping of issue_number -> list of matching file paths.  Only
+        issues with at least one matching file are included.
+    """
+    worktrees_dir = repo_root / ".loom" / "worktrees"
+    if not worktrees_dir.is_dir():
+        return {}
+
+    matches: dict[int, list[str]] = {}
+    try:
+        for entry in sorted(worktrees_dir.iterdir()):
+            if not entry.is_dir():
+                continue
+            issue_num = NamingConventions.issue_from_worktree(entry.name)
+            if issue_num is None:
+                continue
+            # Check which dirty files also exist in this worktree
+            found: list[str] = []
+            for rel_path in dirty_filenames:
+                candidate = entry / rel_path
+                if candidate.exists():
+                    found.append(rel_path)
+            if found:
+                matches[issue_num] = found
+    except OSError:
+        pass
+    return matches
+
+
 def _check_main_repo_clean(
     repo_root: Path, allow_dirty: bool, allow_dirty_reason: str = "--allow-dirty-main specified"
 ) -> bool:
@@ -270,7 +313,9 @@ def _check_main_repo_clean(
 
     This check warns users about this potential source of confusion.
     Files under ``.loom/`` are filtered out since they are runtime artifacts,
-    not source code.
+    not source code.  When dirty files are detected the function also
+    cross-references them against active issue worktrees and prints a
+    suggested recovery path when likely source issues are found.
 
     Args:
         repo_root: The resolved repository root path
@@ -296,6 +341,20 @@ def _check_main_repo_clean(
     if len(uncommitted) > 10:
         print(f"  ... and {len(uncommitted) - 10} more", file=sys.stderr)
     print(file=sys.stderr)
+
+    # Cross-reference dirty files against active issue worktrees to suggest
+    # which issue the leaked changes likely belong to.
+    dirty_filenames = [parse_porcelain_path(line) for line in uncommitted]
+    source_issues = _find_source_issues_for_dirty_files(repo_root, dirty_filenames)
+    if source_issues:
+        issue_list = ", ".join(f"#{n}" for n in sorted(source_issues))
+        log_warning(
+            f"These changes may be orphaned builder work for issue(s): {issue_list}\n"
+            "  To preserve them before proceeding, run one of:\n"
+            "    git stash push -u -m 'orphaned-builder-work'\n"
+            "    git checkout -b orphaned-builder-work && git add -A && git commit -m 'wip: preserve orphaned builder work'"
+        )
+        print(file=sys.stderr)
 
     if allow_dirty:
         log_warning(f"Proceeding anyway ({allow_dirty_reason})")
