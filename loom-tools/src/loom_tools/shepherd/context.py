@@ -61,6 +61,11 @@ class ShepherdContext:
     # (set by run_worker_phase on non-zero exit).  See issue #2766.
     last_postmortem: dict[str, Any] | None = field(default=None, init=False)
 
+    # Abandonment details for non-retryable failures (set by orchestrator when
+    # a specific failure mode is detected).  Used by _post_fallback_failure_comment
+    # to generate a more informative GitHub comment.  See issue #2839.
+    abandonment_info: dict[str, Any] | None = field(default=None, init=False)
+
     # Preflight baseline status (set by orchestrator after preflight phase).
     # "healthy" means baseline tests pass and builder can skip re-running them.
     preflight_baseline_status: str | None = field(default=None, init=False)
