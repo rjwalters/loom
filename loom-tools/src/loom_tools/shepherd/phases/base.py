@@ -1544,6 +1544,7 @@ def run_worker_phase(
     args: str | None = None,
     planning_timeout: int = 0,
     attempt: int = 0,
+    thinking_stall_timeout: int = THINKING_STALL_TIMEOUT,
 ) -> int:
     """Run a phase worker and wait for completion.
 
@@ -1813,13 +1814,13 @@ def run_worker_phase(
                 return 11  # Degraded session
 
         # In-flight thinking stall detection (issue #2784).
-        # After THINKING_STALL_TIMEOUT seconds, check whether the session
+        # After thinking_stall_timeout seconds, check whether the session
         # has produced any tool calls.  Sessions stuck in extended thinking
         # emit spinner/thinking output but never invoke a tool — they will
         # not recover and should be terminated early.
         if (
             not _thinking_stall_checked
-            and time.monotonic() - phase_start >= THINKING_STALL_TIMEOUT
+            and time.monotonic() - phase_start >= thinking_stall_timeout
         ):
             _thinking_stall_checked = True
             thinking_log_path = _session_log_path(ctx.repo_root, actual_name)
@@ -2072,6 +2073,7 @@ def run_phase_with_retry(
     pr_number: int | None = None,
     args: str | None = None,
     planning_timeout: int = 0,
+    thinking_stall_timeout: int = THINKING_STALL_TIMEOUT,
 ) -> int:
     """Run a phase with automatic retry on stuck, low-output, or MCP failure.
 
@@ -2097,6 +2099,14 @@ def run_phase_with_retry(
     LOW_OUTPUT_MAX_ATTEMPT_SECONDS, retries are skipped entirely
     because the failure is likely an infrastructure issue rather than
     a transient blip.  See issue #2519.
+
+    Args:
+        thinking_stall_timeout: Seconds to wait before checking for thinking
+            stalls.  Defaults to ``THINKING_STALL_TIMEOUT`` (180s).  Builder
+            phases should pass a larger value (e.g. 360s) because complex
+            multi-file implementation tasks can legitimately require more
+            than 180 seconds of reasoning before the first tool call.
+            See issue #2853.
 
     Returns:
         Exit code: 0=success, 3=shutdown, 4=stuck after retries,
@@ -2125,6 +2135,7 @@ def run_phase_with_retry(
             args=args,
             planning_timeout=planning_timeout,
             attempt=attempt,
+            thinking_stall_timeout=thinking_stall_timeout,
         )
         # Compute the actual session name used for this attempt (must
         # match the logic in run_worker_phase for log file lookups).

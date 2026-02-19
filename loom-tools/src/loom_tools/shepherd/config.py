@@ -189,6 +189,14 @@ class ShepherdConfig:
         default_factory=lambda: env_int("LOOM_ESCAPE_MAX_RETRIES", 1)
     )
 
+    # Thinking stall timeouts (seconds) - configurable per phase
+    # Builder tasks require longer thinking windows than judge/curator tasks
+    # because they involve reading multiple files and designing implementations.
+    # See issue #2853.
+    builder_thinking_stall_timeout: int = field(
+        default_factory=lambda: env_int("LOOM_BUILDER_THINKING_STALL_TIMEOUT", 360)
+    )
+
     # Rate limiting
     rate_limit_threshold: int = field(
         default_factory=lambda: env_int("LOOM_RATE_LIMIT_THRESHOLD", 99)
