@@ -106,9 +106,9 @@ Write JSON files named `cmd-{YYYYMMDD-HHMMSS}-{random}.json` to `.loom/signals/`
 |--------|---------|-------------|
 | `spawn_shepherd` | `{"action": "spawn_shepherd", "issue": N, "mode": "default\|force"}` | Start shepherd for issue N |
 | `stop` | `{"action": "stop"}` | Graceful daemon shutdown |
-| `set_max_shepherds` | `{"action": "set_max_shepherds", "value": N}` | Adjust shepherd pool size |
-| `pause_shepherd` | `{"action": "pause_shepherd", "slot": "shepherd-1"}` | Pause a shepherd slot |
-| `resume_shepherd` | `{"action": "resume_shepherd", "slot": "shepherd-1"}` | Resume a paused shepherd slot |
+| `set_max_shepherds` | `{"action": "set_max_shepherds", "count": N}` | Adjust shepherd pool size |
+| `pause_shepherd` | `{"action": "pause_shepherd", "shepherd_id": "shepherd-1"}` | Pause a shepherd slot |
+| `resume_shepherd` | `{"action": "resume_shepherd", "shepherd_id": "shepherd-1"}` | Resume a paused shepherd slot |
 
 **Force/merge mode**: Use `"mode": "force"` in `spawn_shepherd` to enable auto-promote + auto-merge behavior.
 
