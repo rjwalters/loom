@@ -427,6 +427,7 @@ class BuilderPhase:
             worktree=ctx.worktree_path,
             args=str(ctx.config.issue),
             planning_timeout=ctx.config.planning_timeout,
+            thinking_stall_timeout=ctx.config.builder_thinking_stall_timeout,
         )
 
         if exit_code == 3:
@@ -714,6 +715,7 @@ class BuilderPhase:
                 worktree=ctx.worktree_path,
                 args=str(ctx.config.issue),
                 planning_timeout=ctx.config.planning_timeout,
+                thinking_stall_timeout=ctx.config.builder_thinking_stall_timeout,
             )
 
             # Handle fatal exit codes from retry (shutdown, stuck, etc.)
