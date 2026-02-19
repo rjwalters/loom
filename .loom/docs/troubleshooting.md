@@ -79,6 +79,32 @@ which claude
 # Install if missing (see Claude Code documentation)
 ```
 
+### Shepherd output invisible when invoked with `2>&1`
+
+When `loom-shepherd.sh` is run with `2>&1` redirection (e.g., from Claude Code's Bash tool for long-running processes), output may be silently dropped. This is because the Bash tool's capture buffer can be exhausted by a long-running child process when both stdout and stderr are forced through the same pipe.
+
+**Workaround** — use a file redirect:
+
+```bash
+# Redirect to file, then cat the result
+./.loom/scripts/loom-shepherd.sh 123 -m > /tmp/shepherd-123.log 2>&1
+cat /tmp/shepherd-123.log
+```
+
+**Built-in log file** — the shepherd wrapper automatically tees all output to `.loom/logs/loom-shepherd-issue-N.log`. The log path is printed on the very first line:
+
+```
+[INFO] Shepherd log: /path/to/.loom/logs/loom-shepherd-issue-123.log
+```
+
+If output is invisible in your terminal, check this log file:
+
+```bash
+cat .loom/logs/loom-shepherd-issue-123.log
+# or follow in real time:
+tail -f .loom/logs/loom-shepherd-issue-123.log
+```
+
 ### API Error: 400 due to tool use concurrency issues
 
 This error occurs when Claude Code's parallel tool execution causes malformed API message structures. See the dedicated guide: [Tool Use Concurrency Errors](./tool-use-concurrency-errors.md)
