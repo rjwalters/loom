@@ -1,0 +1,17 @@
+All test coverage requested in this issue was already added to main via PR #2959 (which closed duplicate issue #2932).
+
+The following tests exist and pass:
+
+_build_direct_completion_pr_body (test_phases.py::TestBuildDirectCompletionPrBody):
+- test_pr_body_file_with_closes_returned_unchanged — file with Closes #N returns unchanged
+- test_pr_body_file_without_closes_appends_closes — missing Closes #N gets appended  
+- test_pr_body_file_missing_uses_fallback — missing file falls back to diff-stats
+- test_none_worktree_path_uses_fallback — None worktree_path skips file check
+
+_build_recovery_pr_body (test_validate_phase.py::TestRateLimitedBuilderExit):
+- test_recovery_pr_body_uses_pr_body_file_with_closes — file with Closes #N returns unchanged
+- test_recovery_pr_body_uses_pr_body_file_appends_closes_when_missing — appends closes when missing
+- test_recovery_pr_body_no_file_uses_fallback_diff_stats — missing file falls back to diff-stats
+- test_recovery_pr_body_rate_limited_no_file_uses_rate_limited_fallback — rate-limited path
+
+This issue is a duplicate of #2932.
