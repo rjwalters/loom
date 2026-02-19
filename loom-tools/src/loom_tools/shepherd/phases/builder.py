@@ -4265,12 +4265,35 @@ class BuilderPhase:
     ) -> str:
         """Build a descriptive PR body for direct-completion PRs.
 
-        Gathers diff stats and commit log from the worktree to provide
-        reviewers with context, since the builder did not create the PR
-        itself.  Matches the quality of validate_phase.py's recovery PR
-        body.  See issue #2775.
+        Checks for a pre-written PR body at .loom/pr-body.md in the worktree
+        (written by the builder before running tests, while context is fresh).
+        Falls back to generating a body from diff stats and commit log.
+
+        Matches the quality of validate_phase.py's recovery PR body.
+        See issues #2775, #2811.
         """
         wt = str(ctx.worktree_path or ctx.repo_root)
+
+        # Check for pre-written PR body from builder (written before tests,
+        # while the builder still has full context about the changes).
+        # This produces richer PR descriptions than the fallback below.
+        if ctx.worktree_path:
+            pr_body_path = ctx.worktree_path / ".loom" / "pr-body.md"
+            if pr_body_path.is_file():
+                pr_body = pr_body_path.read_text().strip()
+                close_keywords = (
+                    f"Closes #{ctx.config.issue}",
+                    f"Fixes #{ctx.config.issue}",
+                    f"Resolves #{ctx.config.issue}",
+                )
+                if not any(kw in pr_body for kw in close_keywords):
+                    pr_body += f"\n\nCloses #{ctx.config.issue}"
+                log_info(
+                    f"Using pre-written PR body from .loom/pr-body.md "
+                    f"for issue #{ctx.config.issue}"
+                )
+                return pr_body
+
         lines: list[str] = []
 
         lines.append(f"Closes #{ctx.config.issue}")

@@ -251,14 +251,30 @@ def _is_rate_limited_builder_exit(issue: int, repo_root: Path) -> bool:
 def _build_recovery_pr_body(issue: int, worktree: str, *, rate_limited: bool = False) -> str:
     """Build a descriptive PR body for recovery-created PRs.
 
-    Gathers diff stats from git to provide reviewers with context about what
-    changed, since the builder did not create the PR itself.
+    Checks for a pre-written PR body at .loom/pr-body.md in the worktree
+    (written by the builder before running tests, while context is fresh).
+    Falls back to generating a body from diff stats.
 
     Args:
         rate_limited: If True, the builder was rate-limited after completing
             work.  Uses less cautionary messaging since the work itself is
             complete — only the PR creation step was interrupted.
     """
+    # Check for pre-written PR body from builder (written before tests,
+    # while the builder still has full context about the changes).
+    # This produces richer PR descriptions than the fallback below.
+    pr_body_path = Path(worktree) / ".loom" / "pr-body.md"
+    if pr_body_path.is_file():
+        pr_body = pr_body_path.read_text().strip()
+        close_keywords = (
+            f"Closes #{issue}",
+            f"Fixes #{issue}",
+            f"Resolves #{issue}",
+        )
+        if not any(kw in pr_body for kw in close_keywords):
+            pr_body += f"\n\nCloses #{issue}"
+        return pr_body
+
     lines: list[str] = []
 
     lines.append(f"Closes #{issue}")
