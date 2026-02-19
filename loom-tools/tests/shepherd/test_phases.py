@@ -11266,6 +11266,101 @@ class TestBuildDirectCompletionPrBody:
         assert "## Commits" not in body
         assert "## Test plan" in body
 
+    def test_pr_body_file_with_closes_returned_unchanged(
+        self, mock_context: MagicMock, tmp_path: Path
+    ) -> None:
+        """When .loom/pr-body.md already contains Closes #N, return it as-is."""
+        builder = BuilderPhase()
+        loom_dir = tmp_path / ".loom"
+        loom_dir.mkdir()
+        pr_body_file = loom_dir / "pr-body.md"
+        pr_body_content = "## Summary\nFix the widget.\n\nCloses #42"
+        pr_body_file.write_text(pr_body_content)
+        mock_context.worktree_path = tmp_path
+        mock_context.repo_root = Path("/fake/repo")
+        mock_context.config = ShepherdConfig(issue=42)
+
+        with patch(
+            "loom_tools.shepherd.phases.builder.subprocess.run"
+        ) as mock_run:
+            body = builder._build_direct_completion_pr_body(mock_context)
+
+        # subprocess should NOT be called (pre-written body takes precedence)
+        mock_run.assert_not_called()
+        assert body == pr_body_content
+        assert "Closes #42" in body
+        assert "## Summary" in body
+
+    def test_pr_body_file_without_closes_appends_closes(
+        self, mock_context: MagicMock, tmp_path: Path
+    ) -> None:
+        """When .loom/pr-body.md lacks Closes #N, it is appended."""
+        builder = BuilderPhase()
+        loom_dir = tmp_path / ".loom"
+        loom_dir.mkdir()
+        pr_body_file = loom_dir / "pr-body.md"
+        pr_body_file.write_text("## Summary\nFix the widget.")
+        mock_context.worktree_path = tmp_path
+        mock_context.repo_root = Path("/fake/repo")
+        mock_context.config = ShepherdConfig(issue=42)
+
+        with patch(
+            "loom_tools.shepherd.phases.builder.subprocess.run"
+        ) as mock_run:
+            body = builder._build_direct_completion_pr_body(mock_context)
+
+        mock_run.assert_not_called()
+        assert "Closes #42" in body
+        assert body.endswith("\n\nCloses #42")
+
+    def test_pr_body_file_missing_uses_fallback(
+        self, mock_context: MagicMock, tmp_path: Path
+    ) -> None:
+        """When .loom/pr-body.md does not exist, fall back to diff-stats body."""
+        builder = BuilderPhase()
+        loom_dir = tmp_path / ".loom"
+        loom_dir.mkdir()
+        # No pr-body.md created
+        mock_context.worktree_path = tmp_path
+        mock_context.repo_root = Path("/fake/repo")
+        mock_context.config = ShepherdConfig(issue=42)
+
+        with patch(
+            "loom_tools.shepherd.phases.builder.subprocess.run"
+        ) as mock_run:
+            mock_run.side_effect = [
+                MagicMock(returncode=0, stdout="file.py | 3 +-\n", stderr=""),
+                MagicMock(returncode=0, stdout="abc1234 feat: add x\n", stderr=""),
+            ]
+            body = builder._build_direct_completion_pr_body(mock_context)
+
+        # subprocess should have been called for fallback
+        assert mock_run.call_count == 2
+        assert "Closes #42" in body
+        assert "direct completion" in body
+
+    def test_none_worktree_path_uses_fallback(
+        self, mock_context: MagicMock
+    ) -> None:
+        """When ctx.worktree_path is None, skip file check and use fallback."""
+        builder = BuilderPhase()
+        mock_context.worktree_path = None
+        mock_context.repo_root = Path("/fake/repo")
+        mock_context.config = ShepherdConfig(issue=42)
+
+        with patch(
+            "loom_tools.shepherd.phases.builder.subprocess.run"
+        ) as mock_run:
+            mock_run.side_effect = [
+                MagicMock(returncode=0, stdout="src/foo.py | 1 +\n", stderr=""),
+                MagicMock(returncode=0, stdout="deadbee fix: something\n", stderr=""),
+            ]
+            body = builder._build_direct_completion_pr_body(mock_context)
+
+        # subprocess fallback should run
+        assert mock_run.call_count == 2
+        assert "Closes #42" in body
+
 
 class TestBuilderStageAndCommit:
     """Test _stage_and_commit for direct mechanical staging and committing."""
