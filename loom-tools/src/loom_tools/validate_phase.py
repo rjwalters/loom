@@ -29,7 +29,7 @@ from pathlib import Path
 from typing import Any
 
 from loom_tools.common.git import derive_commit_message, parse_porcelain_path
-from loom_tools.common.logging import log_warning, strip_ansi
+from loom_tools.common.logging import log_info, log_warning, strip_ansi
 from loom_tools.common.paths import LoomPaths
 from loom_tools.common.state import find_progress_for_issue
 
@@ -273,6 +273,10 @@ def _build_recovery_pr_body(issue: int, worktree: str, *, rate_limited: bool = F
         )
         if not any(kw in pr_body for kw in close_keywords):
             pr_body += f"\n\nCloses #{issue}"
+        log_info(
+            f"Using pre-written PR body from .loom/pr-body.md "
+            f"for issue #{issue}"
+        )
         return pr_body
 
     lines: list[str] = []
