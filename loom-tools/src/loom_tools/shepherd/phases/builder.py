@@ -1002,6 +1002,30 @@ class BuilderPhase:
 
             # Check if this is incomplete work that could be completed
             if not self._has_incomplete_work(diag):
+                # Check if workflow is already complete (PR with correct label).
+                # This catches the API propagation race where validate_phase()
+                # returns False (PR not yet visible) but _gather_diagnostics()
+                # finds it moments later after the API propagates.
+                # See issue #2961.
+                if diag.get("pr_number") is not None and diag.get(
+                    "pr_has_review_label", False
+                ):
+                    pr = diag["pr_number"]
+                    ctx.pr_number = pr
+                    ctx.report_milestone("pr_created", pr_number=pr)
+                    return PhaseResult(
+                        status=PhaseStatus.SUCCESS,
+                        message=(
+                            f"builder phase complete - PR #{pr} exists with "
+                            f"loom:review-requested (API propagation delay resolved)"
+                        ),
+                        phase_name="builder",
+                        data={
+                            "pr_number": pr,
+                            "api_propagation_race": True,
+                        },
+                    )
+
                 # Check if this is the "no changes needed" pattern
                 if self._is_no_changes_needed(diag):
                     log_info(
