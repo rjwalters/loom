@@ -6,6 +6,142 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 <!-- Maintained automatically by the Guide triage agent. Manual edits are fine but may be overwritten. -->
 
+### 2026-02-19
+
+- **PR #2962**: refactor: shepherd skill becomes signal-writer + observer
+- **PR #2960**: fix: filter spinner artifacts from thinking stall diagnostic snippets
+- **PR #2959**: test: add unit tests for pr-body.md pre-written body paths in builder and validate_phase
+- **PR #2957**: feat: add tests for builder_thinking_stall_timeout config and parameter threading
+- **PR #2956**: feat: add CommandPoller IPC and signal-writer /loom skill
+- **PR #2953**: feat: detect prior committed checkpoint and skip builder invocation
+- **PR #2948**: fix: verify PR state before skipping builder to guard against GitHub API eventual consistency
+- **PR #2941**: fix: tee shepherd output to log file for reliable capture with 2>&1 redirect
+- **PR #2938**: fix: update dirty-main warning to show --force/--merge instead of just --merge
+- **PR #2934**: fix: stop /judge after one PR when invoked manually
+- **PR #2904**: fix: recover builder phase when PR exists after thinking stall (exit 11/13/14)
+- **PR #2903**: feat: increase builder thinking stall timeout to 360s for complex tasks
+- **PR #2902**: fix: prevent false-positive thinking stall detection and symlink destruction
+- **PR #2899**: fix: clarify systematic failure comment reflects global detection not per-issue count
+- **PR #2891**: feat: shepherd comments on GitHub issue when abandoning due to non-retryable failure
+- **PR #2889**: fix: use pre-written PR body from builder to avoid boilerplate descriptions
+- **PR #2888**: feat: add recovery guidance to dirty-main warning
+- **Issue #2892** (closed): bug: builder 100% thinking-stall rate on issue #2811
+- **Issue #2927** (closed): friction: shepherd output invisible when captured via Claude Code Bash tool
+- **Issue #2923** (closed): friction: shepherd should detect prior committed checkpoint and offer resume
+- **Issue #2950** (closed): refactor: shepherd skill becomes signal-writer + observer
+- **Issue #2951** (closed): refactor: extract standalone loom daemon process
+- **Issue #2908** (closed): bug: builder-skip check accepts closed PRs after stale branch cleanup
+- **Issue #2925** (closed): friction: shepherd stdout/stderr invisible when invoked via shell 2>&1 redirect
+- **Issue #2931** (closed): Add unit tests for pre-written PR body (.loom/pr-body.md) reading
+- **Issue #2929** (closed): Add unit tests for .loom/pr-body.md pre-written body logic
+- **Issue #2922** (closed): bug: thinking stall snippet contains garbled/corrupted characters
+- **Issue #2932** (closed): Add unit tests for pr-body.md pre-written body paths
+- **Issue #2933** (closed): Add tests for builder_thinking_stall_timeout config and parameter threading
+- **Issue #2913** (closed): enhancement: detect near-limit API usage warnings (95-99%)
+- **Issue #2901** (closed): shepherd: --force alias shows 'implied by --merge' in dirty-main warning
+- **Issue #2837** (closed): Dirty-main warning gives no recovery guidance for orphaned builder work
+- **Issue #2851** (closed): shepherd: thinking stall (exit 14) should recover if PR already exists
+- **Issue #2853** (closed): Builder thinking stall threshold (180s) too aggressive for complex tasks
+- **Issue #2835** (closed): bug: MCP pre-flight smoke test passes but in-session MCP fails at runtime
+- **Issue #2858** (closed): systematic failure comment incorrectly says 'this issue' failed N times
+- **Issue #2839** (closed): feat: shepherd should comment on GitHub issue when abandoning
+- **Issue #2811** (closed): bug: builder never creates its own PR (100% recovery rate)
+- **Issue #2898** (closed): loom-shepherd wrapper produces no output when invoked via Claude Code Bash tool
+
+### 2026-02-18
+
+- **PR #2900**: fix: distinguish --allow-dirty-main specified vs implied by --merge in warning
+- **PR #2871**: fix: skip systematic failure counter when PR already exists for issue
+- **PR #2881**: fix: detect 100% weekly rate limit and classify as rate_limit_abort
+- **PR #2875**: fix: retry thinking stalls once before classifying as permanent failure
+- **PR #2879**: fix: use python3 instead of bare python in judge pytest commands
+- **PR #2877**: fix: surface git exit-128 failures in judge diagnostics and use gh pr diff
+- **PR #2876**: feat: surface builder thinking content in thinking stall errors
+- **PR #2872**: fix: checkpoint stale worktree before builder retry
+- **PR #2880**: feat: thinking stall post-mortem detection lacks minimum duration gate
+- **PR #2867**: feat: log prior failure count at shepherd start for observability
+- **PR #2864**: fix: suppress 'Killed: 9 sleep' messages from output monitor cleanup
+- **PR #2869**: feat: clear issue-specific failures at force-mode shepherd startup
+- **PR #2868**: fix: skip Doctor for pre-existing test failures in unmodified files
+- **PR #2865**: fix: add pre-claim closed-issue check in shepherd main()
+- **PR #2863**: docs: add worktree-aware checkout to judge prompt
+- **PR #2862**: fix: route shepherd output through stdout to eliminate Bash tool duplication
+- **PR #2861**: feat: skip test verification when builder PR already has loom:review-requested
+- **PR #2857**: fix: delete own progress file on shepherd exit
+- **PR #2847**: fix: write periodic shepherd heartbeats during worker polling
+- **PR #2846**: feat: pass structured judge feedback context to doctor phase
+- **PR #2845**: fix: set LC_ALL=C on tr invocations that process TUI output
+- **PR #2843**: docs: note intentional policy of not removing labels on merge/close
+- **PR #2825**: fix: classify small-log short-duration sessions as ghost
+- **PR #2820**: fix: ensure shepherd logging is visible when invoked non-interactively
+- **PR #2819**: fix: check MCP failure before thinking stall to prevent non-retryable misclassification
+- **PR #2821**: fix: apply TUI noise filtering in real-time pipe-pane stream mode
+- **PR #2818**: feat: builder zero-output failures should surface post-mortem in validation error message
+- **PR #2817**: feat: builder scope creep: uncommitted work leaks to main worktree
+- **PR #2816**: docs: add double-prefix anti-pattern and issue title prefix mapping to builder guides
+- **PR #2815**: fix: strip global MCP plugins from agent config to prevent ghost sessions
+- **PR #2792**: fix: improve recovery PR quality when builder exits without completing git workflow
+- **PR #2787**: feat: add RATE_LIMIT_ABORT exit code for CLI usage limits
+- **PR #2795**: feat: detect extended thinking without tool calls as degraded session
+- **PR #2788**: fix: eliminate polling delay and reduce log noise in startup monitor
+- **PR #2789**: feat: MCP status bar noise misclassifies builder failures as MCP failures
+- **PR #2780**: feat: add post-mortem diagnostics for zero-output CLI sessions
+- **PR #2786**: fix: distinguish rate-limited builder exit from unknown recovery path
+- **PR #2770**: fix: shepherd stderr output lost when invoked non-interactively
+- **PR #2760**: feat: add /epic skill for interactive epic creation
+- **PR #2761**: fix: preserve builder exit code via sidecar file when agent-wait returns 0
+- **PR #2759**: docs: add comprehensive /loom help command with sub-topic navigation
+- **PR #2758**: feat: retry builder once on worktree escape with main cleanup
+- **PR #2755**: fix: add diagnostic logging and MCP_PREFLIGHT_FAILED sentinel to wrapper pre-flight
+- **PR #2754**: docs: add test failure diagnostic patterns to Doctor role instructions
+- **PR #2753**: feat: add WORKTREE_ESCAPE exit code to prevent cross-issue escalation
+- **PR #2750**: fix: detect and remove wrong-issue Closes keywords in PR body validation
+- **PR #2747**: docs: add scope discipline sections to builder and doctor roles
+- **PR #2749**: fix: completion phase uses canonical branch name, not diag branch
+- **PR #2748**: fix: wrapper exits with code 7 instead of 1 when MCP failures exhaust retries
+- **PR #2745**: feat: rebase onto main before Doctor when failing tests are in unmodified files
+- **PR #2740**: fix: remove shepherd reflection phase entirely
+- **PR #2741**: fix: skip baseline tests in builder validation when builder produced zero artifacts
+- **PR #2739**: fix: increase stuck_max_retries default from 1 to 2
+- **PR #2726**: fix: startup monitor tolerates global plugin failures when project MCPs connected
+- **Issue #2827** (closed): Shepherd warning shows 'allow-dirty-main specified' when implied by --merge
+- **Issue #2854** (closed): shepherd: systematic failure counter increments even when builder created a PR
+- **Issue #2859** (closed): bug: builder does not detect or report Claude weekly rate limit exhaustion
+- **Issue #2823** (closed): bug: thinking stall classified as non-retryable, blocks on first occurrence
+- **Issue #2832** (closed): bug: judge uses 'python' instead of 'python3'
+- **Issue #2828** (closed): bug: judge encounters git exit status 128 during PR review
+- **Issue #2855** (closed): Surface builder thinking content in thinking stall error message
+- **Issue #2849** (closed): Builder: clean or checkpoint worktree before retry
+- **Issue #2833** (closed): bug: thinking stall post-mortem detection lacks minimum duration gate
+- **Issue #2824** (closed): feat: log prior failure count at shepherd start for observability
+- **Issue #2834** (closed): bug: output monitor 'Killed: 9 sleep 5' printed to agent logs
+- **Issue #2822** (closed): bug: force/merge mode shepherd doesn't reset prior failure count
+- **Issue #2809** (closed): bug: pre-existing test failures on main cause unnecessary Doctor intervention
+- **Issue #2830** (closed): Shepherd claims issue before checking if it is already closed
+- **Issue #2829** (closed): bug: judge fails gh pr checkout when builder worktree still exists
+- **Issue #2840** (closed): bug: loom-shepherd.sh output appears duplicated when stderr is redirected
+- **Issue #2813** (closed): bug: stale shepherd progress files never cleaned up for manual runs
+- **Issue #2810** (closed): Orphan recovery script interferes with active shepherd sessions
+- **Issue #2848** (closed): Builder: recover uncommitted work from worktree when thinking stall occurs
+- **Issue #2831** (closed): Shepherd fallback comment reports 'unexpected failure' for known failure types
+- **Issue #2812** (closed): Add max-doctor-cycles limit before automatic builder restart
+- **Issue #2856** (closed): merge mode (-m) should clear systematic failure state for the target issue
+- **Issue #2852** (closed): Merge mode (-m) override should reset systematic failure counter
+- **Issue #2860** (closed): thinking stall should allow 1 retry before marking as non-retryable failure
+- **Issue #2850** (closed): Retry builder thinking stall at least once before classifying as failure
+- **Issue #2826** (closed): Builder thinking stall should retry once before failing
+- **Issue #2838** (closed): bug: merge-pr.sh does not remove loom:pr label after successful merge
+- **Issue #2814** (closed): friction: MCP global plugin failures add ~5-8s latency per shepherd phase
+- **Issue #2794** (closed): bug: shepherd output invisible when invoked from Claude Code Bash tool
+- **Issue #2791** (closed): bug: rate limit 'Stop and wait' interstitial not detected as degraded session
+- **Issue #2790** (closed): Investigate MCP server startup failure adding ~5s latency per agent phase
+- **Issue #2785** (closed): fix: agent logs are ~90% terminal rendering noise
+- **Issue #2778** (closed): Systematic failure detector should exempt infrastructure failures
+- **Issue #2779** (closed): Fallback handler classifies MCP failures as builder_unknown_failure
+- **Issue #2777** (closed): MCP failure detection gated on non-zero exit code misses CLI-exits-0 case
+- **Issue #2771** (closed): Clean up stale shepherd progress files from manual runs
+- **Issue #2769** (closed): Clippy warnings on main branch
+
 ### 2026-02-15
 
 - **PR #2293**: feat: wire run_warnings and add failure-path reflection coverage
