@@ -461,17 +461,43 @@ class TestBuilderPhase:
             yield
 
     def test_should_skip_when_pr_exists(self, mock_context: MagicMock) -> None:
-        """Builder should be skipped when PR already exists."""
+        """Builder should be skipped when PR already exists and is open."""
         builder = BuilderPhase()
 
-        with patch(
-            "loom_tools.shepherd.phases.builder.get_pr_for_issue", return_value=100
+        with (
+            patch(
+                "loom_tools.shepherd.phases.builder.get_pr_for_issue", return_value=100
+            ),
+            patch(
+                "loom_tools.shepherd.phases.builder._is_pr_open", return_value=True
+            ),
         ):
             skip, reason = builder.should_skip(mock_context)
 
         assert skip is True
         assert "PR #100" in reason
         assert mock_context.pr_number == 100
+
+    def test_should_not_skip_when_pr_is_closed(self, mock_context: MagicMock) -> None:
+        """Builder should fall through when the detected PR is closed (issue #2908).
+
+        GitHub's API has an eventual-consistency window where a just-closed PR
+        may still appear in ``--state open`` list queries.  The builder-skip
+        path must verify the PR state directly before skipping.
+        """
+        builder = BuilderPhase()
+
+        with (
+            patch(
+                "loom_tools.shepherd.phases.builder.get_pr_for_issue", return_value=100
+            ),
+            patch(
+                "loom_tools.shepherd.phases.builder._is_pr_open", return_value=False
+            ),
+        ):
+            skip, reason = builder.should_skip(mock_context)
+
+        assert skip is False
 
     def test_should_not_skip_when_no_pr(self, mock_context: MagicMock) -> None:
         """Builder should not be skipped when no PR exists."""
