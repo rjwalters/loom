@@ -760,7 +760,18 @@ class BuilderPhase:
                 f"builder produced thinking output but zero tool calls"
                 f"{snippet_suffix}"
             )
-            self._cleanup_stale_worktree(ctx)
+            # Before aborting, checkpoint any uncommitted work left in the
+            # worktree so the next shepherd invocation can resume from it
+            # rather than starting from scratch.  See issue #2926.
+            checkpointed = self._commit_prior_uncommitted_work(ctx)
+            if checkpointed:
+                log_info(
+                    f"Thinking stall checkpoint saved for issue "
+                    f"#{ctx.config.issue} — next run will resume from "
+                    f"prior-run-checkpoint commit"
+                )
+            else:
+                self._cleanup_stale_worktree(ctx)
             return PhaseResult(
                 status=PhaseStatus.FAILED,
                 message=(
@@ -776,6 +787,7 @@ class BuilderPhase:
                     "exit_code": exit_code,
                     "log_file": str(log_path),
                     "thinking_snippet": thinking_snippet,
+                    "checkpointed": checkpointed,
                 },
             )
 
