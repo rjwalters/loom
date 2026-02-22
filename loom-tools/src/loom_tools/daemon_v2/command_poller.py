@@ -38,7 +38,9 @@ Available actions:
 from __future__ import annotations
 
 import json
+import os
 import pathlib
+import time
 from typing import Any
 
 
@@ -93,6 +95,26 @@ class CommandPoller:
                 commands.append(data)
 
         return commands
+
+    def requeue(self, command: dict[str, Any]) -> bool:
+        """Write a command back to the signals directory for later processing.
+
+        Used when a command cannot be processed immediately (e.g. daemon
+        state not yet loaded during startup). The re-queued file is named
+        with the current timestamp so it sorts after any freshly-written
+        commands and is picked up on the next poll().
+
+        Returns True if the command was successfully re-queued.
+        """
+        try:
+            ts = int(time.time() * 1000)
+            rand = os.urandom(4).hex()
+            filename = f"cmd-{ts}-{rand}-requeued.json"
+            signal_file = self.signals_dir / filename
+            signal_file.write_text(json.dumps(command))
+            return True
+        except OSError:
+            return False
 
     def queue_depth(self) -> int:
         """Return the number of pending signal files without consuming them."""

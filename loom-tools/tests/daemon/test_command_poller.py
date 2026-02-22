@@ -211,3 +211,60 @@ class TestNoConcurrentDoubleConsume:
         assert all_seqs == list(range(10)), (
             f"Expected seqs 0..9, got {all_seqs}"
         )
+
+
+class TestRequeue:
+    """Tests for CommandPoller.requeue()."""
+
+    def test_requeue_returns_true_on_success(self, poller: CommandPoller) -> None:
+        cmd = {"action": "spawn_shepherd", "issue": 42, "mode": "default", "flags": []}
+        result = poller.requeue(cmd)
+        assert result is True
+
+    def test_requeued_command_appears_in_next_poll(self, poller: CommandPoller) -> None:
+        cmd = {"action": "spawn_shepherd", "issue": 42, "mode": "default", "flags": []}
+        poller.requeue(cmd)
+        result = poller.poll()
+        assert len(result) == 1
+        assert result[0] == cmd
+
+    def test_requeued_command_is_consumed_on_poll(self, poller: CommandPoller) -> None:
+        cmd = {"action": "spawn_shepherd", "issue": 42, "mode": "default", "flags": []}
+        poller.requeue(cmd)
+        poller.poll()
+        assert poller.poll() == []
+
+    def test_requeue_increments_queue_depth(self, poller: CommandPoller) -> None:
+        assert poller.queue_depth() == 0
+        poller.requeue({"action": "spawn_shepherd", "issue": 1})
+        assert poller.queue_depth() == 1
+        poller.requeue({"action": "spawn_shepherd", "issue": 2})
+        assert poller.queue_depth() == 2
+
+    def test_requeue_preserves_all_fields(self, poller: CommandPoller) -> None:
+        cmd = {
+            "action": "spawn_shepherd",
+            "issue": 99,
+            "mode": "force",
+            "flags": ["--resume"],
+        }
+        poller.requeue(cmd)
+        result = poller.poll()
+        assert len(result) == 1
+        assert result[0]["action"] == "spawn_shepherd"
+        assert result[0]["issue"] == 99
+        assert result[0]["mode"] == "force"
+        assert result[0]["flags"] == ["--resume"]
+
+    def test_requeue_files_have_json_extension(self, poller: CommandPoller) -> None:
+        poller.requeue({"action": "spawn_shepherd", "issue": 5})
+        files = list(poller.signals_dir.glob("*.json"))
+        assert len(files) == 1
+
+    def test_multiple_requeues_all_consumed(self, poller: CommandPoller) -> None:
+        for i in range(5):
+            poller.requeue({"action": "spawn_shepherd", "issue": i})
+        result = poller.poll()
+        assert len(result) == 5
+        issues = sorted(r["issue"] for r in result)
+        assert issues == [0, 1, 2, 3, 4]
