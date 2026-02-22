@@ -4556,6 +4556,60 @@ class TestRecordFallbackFailure:
     @patch("loom_tools.shepherd.cli.get_pr_for_issue", return_value=None)
     @patch("loom_tools.common.systematic_failure.detect_systematic_failure", return_value=None)
     @patch("loom_tools.common.systematic_failure.record_blocked_reason")
+    def test_records_thinking_stall_class(
+        self,
+        mock_record: MagicMock,
+        mock_detect: MagicMock,
+        mock_get_pr: MagicMock,
+    ) -> None:
+        """Should record builder_thinking_stall when abandonment_info has thinking_stall flag (issue #2921)."""
+        ctx = MagicMock()
+        ctx.config.issue = 42
+        ctx.repo_root = Path("/fake/repo")
+        ctx.abandonment_info = {
+            "phase": "builder",
+            "failure_data": {"thinking_stall": True, "exit_code": 1},
+            "message": "builder thinking stall: extended thinking output with zero tool calls detected",
+        }
+
+        _record_fallback_failure(ctx, ShepherdExitCode.BUILDER_FAILED)
+
+        mock_record.assert_called_once_with(
+            Path("/fake/repo"),
+            42,
+            error_class="builder_thinking_stall",
+            phase="builder",
+            details=(
+                "Builder thinking stall retry budget exhausted — extended thinking "
+                "output with zero tool calls detected (fallback cleanup)"
+            ),
+        )
+        mock_detect.assert_called_once_with(Path("/fake/repo"))
+
+    @patch("loom_tools.shepherd.cli.get_pr_for_issue", return_value=None)
+    @patch("loom_tools.common.systematic_failure.detect_systematic_failure", return_value=None)
+    @patch("loom_tools.common.systematic_failure.record_blocked_reason")
+    def test_thinking_stall_without_abandonment_info_falls_through_to_unknown(
+        self,
+        mock_record: MagicMock,
+        mock_detect: MagicMock,
+        mock_get_pr: MagicMock,
+    ) -> None:
+        """Should fall through to builder_unknown_failure when no abandonment_info set."""
+        ctx = MagicMock()
+        ctx.config.issue = 42
+        ctx.repo_root = Path("/fake/repo")
+        ctx.abandonment_info = None
+        ctx.last_postmortem = None
+
+        _record_fallback_failure(ctx, ShepherdExitCode.BUILDER_FAILED)
+
+        call_args = mock_record.call_args
+        assert call_args.kwargs.get("error_class") == "builder_unknown_failure"
+
+    @patch("loom_tools.shepherd.cli.get_pr_for_issue", return_value=None)
+    @patch("loom_tools.common.systematic_failure.detect_systematic_failure", return_value=None)
+    @patch("loom_tools.common.systematic_failure.record_blocked_reason")
     def test_records_unknown_failure_class(
         self,
         mock_record: MagicMock,
@@ -4567,6 +4621,7 @@ class TestRecordFallbackFailure:
         ctx.config.issue = 42
         ctx.repo_root = Path("/fake/repo")
         ctx.last_postmortem = None
+        ctx.abandonment_info = None
 
         _record_fallback_failure(ctx, ShepherdExitCode.BUILDER_FAILED)
 
@@ -4592,6 +4647,7 @@ class TestRecordFallbackFailure:
         ctx = MagicMock()
         ctx.config.issue = 42
         ctx.repo_root = Path("/fake/repo")
+        ctx.abandonment_info = None
         ctx.last_postmortem = {
             "summary": "CLI started but produced zero output; wall: 5s; exit(wait=1)",
         }
@@ -4646,6 +4702,7 @@ class TestRecordFallbackFailure:
         ctx = MagicMock()
         ctx.config.issue = 42
         ctx.repo_root = tmp_path
+        ctx.abandonment_info = None
 
         _record_fallback_failure(ctx, ShepherdExitCode.BUILDER_FAILED)
 
@@ -4676,6 +4733,7 @@ class TestRecordFallbackFailure:
         ctx = MagicMock()
         ctx.config.issue = 42
         ctx.repo_root = tmp_path
+        ctx.abandonment_info = None
         ctx.last_postmortem = None
 
         _record_fallback_failure(ctx, ShepherdExitCode.BUILDER_FAILED)
