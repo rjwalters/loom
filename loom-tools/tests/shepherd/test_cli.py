@@ -4685,6 +4685,106 @@ class TestRecordFallbackFailure:
         mock_record.assert_not_called()
         mock_detect.assert_not_called()
 
+    @patch("loom_tools.shepherd.cli.get_pr_for_issue", return_value=None)
+    @patch("loom_tools.common.systematic_failure.detect_systematic_failure", return_value=None)
+    @patch("loom_tools.common.systematic_failure.record_blocked_reason")
+    def test_records_worktree_conflict_class(
+        self,
+        mock_record: MagicMock,
+        mock_detect: MagicMock,
+        mock_get_pr: MagicMock,
+    ) -> None:
+        """Should record worktree_conflict (not auth_infrastructure_failure) when
+        abandonment_info identifies the failure as a branch-in-use conflict.
+        See issue #2918."""
+        ctx = MagicMock()
+        ctx.config.issue = 42
+        ctx.repo_root = Path("/fake/repo")
+        ctx.abandonment_info = {
+            "phase": "builder",
+            "exit_code": 9,
+            "failure_data": {
+                "worktree_conflict": True,
+                "error_detail": (
+                    "fatal: 'feature/issue-42' is already used by worktree at "
+                    "'/Users/user/GitHub/loom'"
+                ),
+            },
+            "message": "failed to create worktree",
+            "task_id": "abc123",
+        }
+
+        _record_fallback_failure(ctx, ShepherdExitCode.SYSTEMIC_FAILURE)
+
+        mock_record.assert_called_once()
+        call_args = mock_record.call_args
+        assert call_args.args[0] == Path("/fake/repo")
+        assert call_args.args[1] == 42
+        assert call_args.kwargs["error_class"] == "worktree_conflict"
+        assert call_args.kwargs["phase"] == "builder"
+        assert "already checked out in another worktree" in call_args.kwargs["details"]
+        # Error detail should be included in the details
+        assert "feature/issue-42" in call_args.kwargs["details"]
+        mock_detect.assert_called_once_with(Path("/fake/repo"))
+
+    @patch("loom_tools.shepherd.cli.get_pr_for_issue", return_value=None)
+    @patch("loom_tools.common.systematic_failure.detect_systematic_failure", return_value=None)
+    @patch("loom_tools.common.systematic_failure.record_blocked_reason")
+    def test_worktree_conflict_without_error_detail(
+        self,
+        mock_record: MagicMock,
+        mock_detect: MagicMock,
+        mock_get_pr: MagicMock,
+    ) -> None:
+        """worktree_conflict error class is recorded even without error_detail."""
+        ctx = MagicMock()
+        ctx.config.issue = 55
+        ctx.repo_root = Path("/fake/repo")
+        ctx.abandonment_info = {
+            "phase": "builder",
+            "exit_code": 9,
+            "failure_data": {
+                "worktree_conflict": True,
+                # No error_detail key
+            },
+            "message": "failed to create worktree",
+            "task_id": "xyz789",
+        }
+
+        _record_fallback_failure(ctx, ShepherdExitCode.SYSTEMIC_FAILURE)
+
+        call_args = mock_record.call_args
+        assert call_args.kwargs["error_class"] == "worktree_conflict"
+        # Details should not contain the error_detail suffix
+        assert "—" not in call_args.kwargs["details"]
+
+    @patch("loom_tools.shepherd.cli.get_pr_for_issue", return_value=None)
+    @patch("loom_tools.common.systematic_failure.detect_systematic_failure", return_value=None)
+    @patch("loom_tools.common.systematic_failure.record_blocked_reason")
+    def test_systemic_failure_without_worktree_conflict_stays_auth(
+        self,
+        mock_record: MagicMock,
+        mock_detect: MagicMock,
+        mock_get_pr: MagicMock,
+    ) -> None:
+        """SYSTEMIC_FAILURE without worktree_conflict flag stays auth_infrastructure_failure."""
+        ctx = MagicMock()
+        ctx.config.issue = 42
+        ctx.repo_root = Path("/fake/repo")
+        # Set abandonment_info without worktree_conflict
+        ctx.abandonment_info = {
+            "phase": "builder",
+            "exit_code": 9,
+            "failure_data": {"auth_failure": True},
+            "message": "auth timed out",
+            "task_id": "abc123",
+        }
+
+        _record_fallback_failure(ctx, ShepherdExitCode.SYSTEMIC_FAILURE)
+
+        call_args = mock_record.call_args
+        assert call_args.kwargs["error_class"] == "auth_infrastructure_failure"
+
 
 class TestCleanupFallbackIntegration:
     """Test that _cleanup_labels_on_failure calls the new fallback helpers (issue #2525)."""

@@ -261,6 +261,41 @@ class TestDetectSystematicFailure:
         result = detect_systematic_failure(repo)
         assert result is None
 
+    def test_worktree_conflict_not_counted(self, repo: pathlib.Path) -> None:
+        """Consecutive worktree_conflict failures should NOT trigger systematic failure
+        detection, because they are infrastructure failures (git state), not issue
+        defects.  See issue #2918."""
+        _write_state(
+            repo,
+            {
+                "recent_failures": [
+                    {"error_class": "worktree_conflict"},
+                    {"error_class": "worktree_conflict"},
+                    {"error_class": "worktree_conflict"},
+                ]
+            },
+        )
+        result = detect_systematic_failure(repo)
+        assert result is None
+
+    def test_worktree_conflict_mixed_with_other_failures(self, repo: pathlib.Path) -> None:
+        """worktree_conflict failures are filtered out and don't inflate the count
+        for non-infrastructure failures.  See issue #2918."""
+        _write_state(
+            repo,
+            {
+                "recent_failures": [
+                    {"error_class": "builder_stuck"},
+                    {"error_class": "worktree_conflict"},
+                    {"error_class": "builder_stuck"},
+                    {"error_class": "worktree_conflict"},
+                    # Only 2 non-infra failures — below threshold of 3
+                ]
+            },
+        )
+        result = detect_systematic_failure(repo)
+        assert result is None
+
     def test_infra_mixed_with_issue_failures(self, repo: pathlib.Path) -> None:
         """Infra failures interspersed with issue failures don't inflate the count."""
         _write_state(

@@ -1006,6 +1006,13 @@ def orchestrate(ctx: ShepherdContext) -> int:
                         exit_code = ShepherdExitCode.SYSTEMIC_FAILURE
                     elif result.data.get("rate_limit_abort"):
                         exit_code = ShepherdExitCode.RATE_LIMIT_ABORT
+                    elif result.data.get("worktree_conflict"):
+                        # Branch already checked out in another worktree —
+                        # infrastructure failure, not an issue with the code.
+                        # Use SYSTEMIC_FAILURE so _record_fallback_failure maps
+                        # it to an infrastructure error class excluded from the
+                        # systematic failure counter.  See issue #2918.
+                        exit_code = ShepherdExitCode.SYSTEMIC_FAILURE
                     else:
                         exit_code = ShepherdExitCode.BUILDER_FAILED
                     # Record abandonment details so _post_fallback_failure_comment
@@ -2231,6 +2238,21 @@ def _post_fallback_failure_comment(ctx: ShepherdContext, exit_code: int) -> None
                 "The issue has been returned to `loom:issue`. "
                 "Retry after the rate limit resets (usually a few minutes)."
             )
+        elif failure_data.get("worktree_conflict"):
+            error_detail = failure_data.get("error_detail", "")
+            failure_mode = (
+                "worktree branch conflict — the feature branch is already "
+                "checked out in another worktree (infrastructure failure, "
+                "not a defect in the issue)"
+            )
+            safe_to_retry = True
+            detail_line = f"\n\nGit error: `{error_detail}`" if error_detail else ""
+            advice = (
+                "The issue has been returned to `loom:issue` and is safe to retry. "
+                "To resolve: run `loom-clean --force` or `git worktree prune` "
+                "to remove the stale worktree, then retry the issue."
+                f"{detail_line}"
+            )
         elif failure_data.get("auth_failure"):
             failure_mode = (
                 "auth pre-flight failure — authentication check timed out "
@@ -2340,8 +2362,25 @@ def _record_fallback_failure(ctx: ShepherdContext, exit_code: int) -> None:
 
     # Classify the failure based on exit code
     if exit_code == ShepherdExitCode.SYSTEMIC_FAILURE:
-        error_class = "auth_infrastructure_failure"
-        details = "Builder failed due to auth/API infrastructure issue (fallback cleanup)"
+        # Check if this SYSTEMIC_FAILURE was actually a worktree branch conflict
+        # (branch already checked out in another worktree).  abandonment_info is
+        # set by the orchestrator before returning the exit code.  See #2918.
+        # Explicitly check isinstance(dict) to avoid false-positive from MagicMock
+        # in tests where abandonment_info is not set.
+        _ainfo = ctx.abandonment_info
+        _abandonment_data = _ainfo.get("failure_data", {}) if isinstance(_ainfo, dict) else {}
+        if _abandonment_data.get("worktree_conflict"):
+            error_class = "worktree_conflict"
+            error_detail = _abandonment_data.get("error_detail", "")
+            details = (
+                f"Worktree creation failed: branch already checked out in another "
+                f"worktree (infrastructure failure, not an issue defect)"
+            )
+            if error_detail:
+                details = f"{details} — {error_detail}"
+        else:
+            error_class = "auth_infrastructure_failure"
+            details = "Builder failed due to auth/API infrastructure issue (fallback cleanup)"
     elif exit_code == ShepherdExitCode.WORKTREE_ESCAPE:
         error_class = "builder_worktree_escape"
         details = "Builder escaped worktree and modified main instead (fallback cleanup)"
