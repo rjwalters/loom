@@ -2338,7 +2338,7 @@ def _record_fallback_failure(ctx: ShepherdContext, exit_code: int) -> None:
         record_blocked_reason,
     )
 
-    # Classify the failure based on exit code
+    # Classify the failure based on exit code and abandonment_info flags.
     if exit_code == ShepherdExitCode.SYSTEMIC_FAILURE:
         error_class = "auth_infrastructure_failure"
         details = "Builder failed due to auth/API infrastructure issue (fallback cleanup)"
@@ -2348,6 +2348,20 @@ def _record_fallback_failure(ctx: ShepherdContext, exit_code: int) -> None:
     elif exit_code == ShepherdExitCode.RATE_LIMIT_ABORT:
         error_class = "rate_limit_abort"
         details = "CLI hit usage/plan limit — interactive prompt in headless mode (fallback cleanup)"
+    elif (
+        ctx.abandonment_info is not None
+        and ctx.abandonment_info.get("failure_data", {}).get("thinking_stall")
+    ):
+        # Thinking stall exhaustion: builder produced thinking output but zero
+        # tool calls across all retries.  Classified separately from generic
+        # unknown failures so operators can distinguish it in diagnostics and
+        # recovery guidance can be tailored (e.g. "increase
+        # LOOM_BUILDER_THINKING_STALL_TIMEOUT").  See issue #2921.
+        error_class = "builder_thinking_stall"
+        details = (
+            "Builder thinking stall retry budget exhausted — extended thinking "
+            "output with zero tool calls detected (fallback cleanup)"
+        )
     else:
         error_class = "builder_unknown_failure"
         # Include post-mortem diagnostics if available (issue #2766).
