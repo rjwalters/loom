@@ -20,8 +20,10 @@ from loom_tools.status import (
     format_seconds,
     format_uptime,
     main,
+    output_fast,
     output_formatted,
     output_json,
+    render_agents_table,
     render_daemon_status,
     render_layer3_actions,
     render_pipeline_status,
@@ -677,3 +679,216 @@ class TestGracefulDegradation:
         assert "LOOM SYSTEM STATUS" in result
         assert "Stopped" in result
         assert "No daemon state available" in result
+
+
+# ---------------------------------------------------------------------------
+# TestFastMode: render_agents_table and output_fast
+# ---------------------------------------------------------------------------
+
+
+class TestFastMode:
+    def test_output_fast_running_daemon(self, tmp_path, capsys):
+        """Verifies Running status, PID, and shepherd entries appear in output."""
+        ds = DaemonState(
+            running=True,
+            started_at="2026-01-30T16:00:00Z",
+            daemon_pid=12345,
+            shepherds={
+                "shepherd-1": ShepherdEntry(
+                    status="working",
+                    issue=42,
+                    started="2026-01-30T17:00:00Z",
+                    last_phase="builder",
+                ),
+            },
+        )
+        (tmp_path / ".loom").mkdir(parents=True, exist_ok=True)
+        output_fast(ds, tmp_path, _now=NOW)
+        out = capsys.readouterr().out
+        assert "Running" in out
+        assert "12345" in out
+        assert "shepherd-1" in out
+
+    def test_output_fast_stopped_daemon(self, tmp_path, capsys):
+        """Verifies Stopped status appears when daemon is not running."""
+        ds = DaemonState(running=False)
+        (tmp_path / ".loom").mkdir(parents=True, exist_ok=True)
+        output_fast(ds, tmp_path, _now=NOW)
+        out = capsys.readouterr().out
+        assert "Stopped" in out
+
+    def test_output_fast_stopping_daemon(self, tmp_path, capsys):
+        """Verifies Stopping status appears when .loom/stop-daemon file exists."""
+        loom_dir = tmp_path / ".loom"
+        loom_dir.mkdir(parents=True, exist_ok=True)
+        (loom_dir / "stop-daemon").touch()
+        ds = DaemonState(running=True, started_at="2026-01-30T16:00:00Z")
+        output_fast(ds, tmp_path, _now=NOW)
+        out = capsys.readouterr().out
+        assert "Stopping" in out
+
+    def test_output_fast_no_agents(self, tmp_path, capsys):
+        """Verifies 'No agent state available' message when shepherds and support_roles are empty."""
+        ds = DaemonState(running=True, started_at="2026-01-30T16:00:00Z")
+        (tmp_path / ".loom").mkdir(parents=True, exist_ok=True)
+        output_fast(ds, tmp_path, _now=NOW)
+        out = capsys.readouterr().out
+        assert "No agent state available" in out
+
+    def test_render_agents_table_working_shepherd(self, tmp_path, capsys):
+        """Verifies working shepherd row shows correct status, issue number, phase, and runtime."""
+        ds = DaemonState(
+            shepherds={
+                "shepherd-1": ShepherdEntry(
+                    status="working",
+                    issue=42,
+                    started="2026-01-30T17:00:00Z",
+                    last_phase="builder",
+                ),
+            },
+        )
+        render_agents_table(ds, tmp_path, _now=NOW)
+        out = capsys.readouterr().out
+        assert "shepherd-1" in out
+        assert "working" in out
+        assert "#42" in out
+        assert "builder" in out
+        # Runtime: 1 hour from 17:00 to 18:00
+        assert "1h 0m" in out
+
+    def test_render_agents_table_idle_shepherd(self, tmp_path, capsys):
+        """Verifies idle shepherd row shows idle status and idle reason."""
+        ds = DaemonState(
+            shepherds={
+                "shepherd-1": ShepherdEntry(
+                    status="idle",
+                    idle_reason="no_ready_issues",
+                ),
+            },
+        )
+        render_agents_table(ds, tmp_path, _now=NOW)
+        out = capsys.readouterr().out
+        assert "shepherd-1" in out
+        assert "idle" in out
+        assert "no ready issues" in out
+
+    def test_render_agents_table_errored_shepherd(self, tmp_path, capsys):
+        """Verifies errored status renders distinctly from idle/working."""
+        ds = DaemonState(
+            shepherds={
+                "shepherd-1": ShepherdEntry(status="errored"),
+            },
+        )
+        render_agents_table(ds, tmp_path, _now=NOW)
+        out = capsys.readouterr().out
+        assert "shepherd-1" in out
+        assert "errored" in out
+
+    def test_render_agents_table_paused_shepherd(self, tmp_path, capsys):
+        """Verifies paused status renders distinctly."""
+        ds = DaemonState(
+            shepherds={
+                "shepherd-1": ShepherdEntry(status="paused"),
+            },
+        )
+        render_agents_table(ds, tmp_path, _now=NOW)
+        out = capsys.readouterr().out
+        assert "shepherd-1" in out
+        assert "paused" in out
+
+    def test_render_agents_table_support_roles(self, tmp_path, capsys):
+        """Verifies support role rows appear with correct status."""
+        ds = DaemonState(
+            shepherds={},
+            support_roles={
+                "architect": SupportRoleEntry(status="running", task_id="abc1234"),
+                "hermit": SupportRoleEntry(status="idle"),
+                "guide": SupportRoleEntry(status="idle"),
+                "champion": SupportRoleEntry(status="idle"),
+                "doctor": SupportRoleEntry(status="idle"),
+                "auditor": SupportRoleEntry(status="idle"),
+            },
+        )
+        render_agents_table(ds, tmp_path, _now=NOW)
+        out = capsys.readouterr().out
+        assert "Architect" in out
+        assert "running" in out
+        assert "Hermit" in out
+        assert "Guide" in out
+        assert "Champion" in out
+        assert "Doctor" in out
+        assert "Auditor" in out
+
+    def test_render_agents_table_missing_support_role(self, tmp_path, capsys):
+        """Verifies roles absent from daemon_state.support_roles show as idle (entry is None branch)."""
+        # Only provide some roles; the others are absent (entry is None)
+        ds = DaemonState(
+            shepherds={},
+            support_roles={
+                "architect": SupportRoleEntry(status="running"),
+                # hermit, guide, champion, doctor, auditor are absent
+            },
+        )
+        render_agents_table(ds, tmp_path, _now=NOW)
+        out = capsys.readouterr().out
+        # Absent roles should appear as idle
+        assert "Hermit" in out
+        assert "Guide" in out
+        assert "Champion" in out
+        assert "Doctor" in out
+        assert "Auditor" in out
+        assert "idle" in out
+
+    def test_render_agents_table_output_file_heartbeat(self, tmp_path, capsys):
+        """Verifies output_file mtime is used for heartbeat display."""
+        output_file = tmp_path / "shepherd.output"
+        output_file.write_text("some output")
+        ds = DaemonState(
+            shepherds={
+                "shepherd-1": ShepherdEntry(
+                    status="working",
+                    issue=10,
+                    started="2026-01-30T17:00:00Z",
+                    output_file=str(output_file),
+                ),
+            },
+        )
+        render_agents_table(ds, tmp_path, _now=NOW)
+        out = capsys.readouterr().out
+        # The heartbeat column should show "ago" (seconds/minutes since mtime)
+        assert "ago" in out
+
+    def test_main_fast_mode(self, tmp_path, monkeypatch, capsys):
+        """Calls main(["--fast"]) with patched dependencies; verifies no gh subprocess calls."""
+        import subprocess
+
+        ds = DaemonState(running=True, started_at="2026-01-30T16:00:00Z", daemon_pid=9999)
+        monkeypatch.setattr("loom_tools.status.find_repo_root", lambda: tmp_path)
+        monkeypatch.setattr("loom_tools.status.read_daemon_state", lambda root: ds)
+
+        # Patch subprocess.run to detect any gh calls
+        original_run = subprocess.run
+        gh_calls: list[list[str]] = []
+
+        def patched_run(cmd, *args, **kwargs):
+            if isinstance(cmd, (list, tuple)) and cmd and "gh" in str(cmd[0]):
+                gh_calls.append(list(cmd))
+            return original_run(cmd, *args, **kwargs)
+
+        monkeypatch.setattr(subprocess, "run", patched_run)
+
+        (tmp_path / ".loom").mkdir(parents=True, exist_ok=True)
+        main(["--fast"])
+        out = capsys.readouterr().out
+        # Should show daemon status without needing gh
+        assert "Running" in out or "Stopping" in out or "Stopped" in out
+        # No gh subprocess calls should have been made
+        assert gh_calls == [], f"Unexpected gh calls: {gh_calls}"
+
+    def test_main_fast_and_json_mutually_exclusive(self, capsys):
+        """Verifies --fast and --json together produce SystemExit(1) and stderr message."""
+        with pytest.raises(SystemExit) as exc_info:
+            main(["--fast", "--json"])
+        assert exc_info.value.code == 1
+        captured = capsys.readouterr()
+        assert "mutually exclusive" in captured.err
