@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import pathlib
+import shutil
 
 import pytest
 
@@ -585,7 +586,6 @@ class TestValidateAgentConfigDir:
 
         # Remove a mutable directory
         config_dir = mock_repo / ".loom" / "claude-config" / "test-agent"
-        import shutil
         shutil.rmtree(config_dir / "tmp")
 
         assert validate_agent_config_dir("test-agent", mock_repo) is False
