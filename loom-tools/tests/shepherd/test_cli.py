@@ -4500,6 +4500,38 @@ class TestPostFallbackFailureComment:
         assert "usage/plan limit" in body
 
     @patch("subprocess.run")
+    def test_abandonment_info_api_rate_limited(self, mock_run: MagicMock) -> None:
+        """When abandonment_info has api_rate_limited, posts pre-check rate-limit comment.
+
+        Covers the path where _is_rate_limited() fires before builder startup
+        (issue #2906).  The PhaseResult now carries data={"api_rate_limited": True}
+        which propagates into abandonment_info["failure_data"].
+        """
+        ctx = MagicMock()
+        ctx.config.issue = 42
+        ctx.config.task_id = "pqr1234"
+        ctx.repo_root = Path("/fake/repo")
+        ctx.abandonment_info = {
+            "phase": "builder",
+            "exit_code": 1,
+            "failure_data": {
+                "api_rate_limited": True,
+            },
+            "message": "API rate limit exceeded (threshold: 99%)",
+            "task_id": "pqr1234",
+        }
+
+        _post_fallback_failure_comment(ctx, ShepherdExitCode.BUILDER_FAILED)
+
+        mock_run.assert_called_once()
+        cmd = mock_run.call_args[0][0]
+        body_idx = cmd.index("--body") + 1
+        body = cmd[body_idx]
+        assert "Shepherd abandoned issue" in body
+        assert "API rate limit pre-check" in body
+        assert "Retry after the rate limit resets" in body
+
+    @patch("subprocess.run")
     def test_abandonment_info_generic_failure(self, mock_run: MagicMock) -> None:
         """When abandonment_info has no specific flag, uses message as failure mode."""
         ctx = MagicMock()

@@ -1329,6 +1329,34 @@ class TestBuilderPhase:
         assert mock_context.pr_number == 302
         mock_cleanup.assert_not_called()
 
+    def test_rate_limit_precheck_sets_api_rate_limited_flag(
+        self, mock_context: MagicMock
+    ) -> None:
+        """Pre-flight rate-limit check returns data with api_rate_limited=True.
+
+        When _is_rate_limited() fires before builder startup, the returned
+        PhaseResult must carry data={"api_rate_limited": True} so that the
+        orchestrator's abandonment_info records a recognisable flag and
+        _post_fallback_failure_comment generates a specific comment instead of
+        the generic "unexpected failure" fallback.  See issue #2906.
+        """
+        mock_context.check_shutdown.return_value = False
+        mock_context.config.rate_limit_threshold = 99
+
+        builder = BuilderPhase()
+
+        with (
+            patch(
+                "loom_tools.shepherd.phases.builder.get_pr_for_issue", return_value=None
+            ),
+            patch.object(builder, "_is_rate_limited", return_value=True),
+        ):
+            result = builder.run(mock_context)
+
+        assert result.status == PhaseStatus.FAILED
+        assert result.data.get("api_rate_limited") is True
+        assert "rate limit" in result.message.lower()
+
 
 class TestBuilderCountCommitsAheadOfMain:
     """Unit tests for BuilderPhase._count_commits_ahead_of_main."""
