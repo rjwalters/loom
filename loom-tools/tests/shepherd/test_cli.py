@@ -7,7 +7,7 @@ import sys
 import time
 from io import StringIO
 from pathlib import Path
-from unittest.mock import MagicMock, call, patch
+from unittest.mock import ANY, MagicMock, call, patch
 
 import pytest
 
@@ -2220,6 +2220,7 @@ class TestMarkJudgeExhausted:
             error_class="judge_exhausted",
             phase="judge",
             details="judge failed after 2 retry attempt(s)",
+            force_mode=ANY,
         )
 
     @patch("subprocess.run")
@@ -2312,6 +2313,7 @@ class TestMarkBuilderNoPr:
             error_class="builder_no_pr",
             phase="builder",
             details="Builder phase completed but no PR was created",
+            force_mode=ANY,
         )
 
     @patch("loom_tools.shepherd.cli._gather_no_pr_diagnostics")
@@ -4582,6 +4584,7 @@ class TestRecordFallbackFailure:
             error_class="auth_infrastructure_failure",
             phase="builder",
             details="Builder failed due to auth/API infrastructure issue (fallback cleanup)",
+            force_mode=ANY,
         )
         mock_detect.assert_called_once_with(Path("/fake/repo"))
 
@@ -4663,6 +4666,7 @@ class TestRecordFallbackFailure:
             error_class="builder_unknown_failure",
             phase="builder",
             details="Builder failed without specific handler (exit code 1, fallback cleanup)",
+            force_mode=ANY,
         )
         mock_detect.assert_called_once_with(Path("/fake/repo"))
 
@@ -4713,6 +4717,7 @@ class TestRecordFallbackFailure:
             error_class="builder_worktree_escape",
             phase="builder",
             details="Builder escaped worktree and modified main instead (fallback cleanup)",
+            force_mode=ANY,
         )
         mock_detect.assert_called_once_with(Path("/fake/repo"))
 
@@ -4744,6 +4749,7 @@ class TestRecordFallbackFailure:
             error_class="mcp_infrastructure_failure",
             phase="builder",
             details="Builder failed due to MCP server failure (exit code 1, fallback cleanup)",
+            force_mode=ANY,
         )
         mock_detect.assert_called_once_with(tmp_path)
 
@@ -4776,6 +4782,7 @@ class TestRecordFallbackFailure:
             error_class="builder_unknown_failure",
             phase="builder",
             details="Builder failed without specific handler (exit code 1, fallback cleanup)",
+            force_mode=ANY,
         )
 
     @patch("loom_tools.shepherd.cli.get_pr_for_issue", return_value=None)

@@ -46,6 +46,7 @@ def record_blocked_reason(
     error_class: str = "unknown",
     phase: str = "",
     details: str = "",
+    force_mode: bool = False,
 ) -> None:
     """Record structured failure metadata when an issue becomes blocked.
 
@@ -53,12 +54,19 @@ def record_blocked_reason(
     in ``daemon-state.json``.  This is the Python equivalent of
     ``record-blocked-reason.sh``.
 
+    When ``force_mode=True``, the failure is tagged so that systematic
+    failure detection ignores it.  Force-mode runs represent deliberate
+    user retries of known-failing issues; they should not count against
+    the systematic failure budget.  See issue #2897.
+
     Args:
         repo_root: Repository root path.
         issue: Issue number being blocked.
         error_class: Classification of the error.
         phase: Shepherd phase where the error occurred.
         details: Human-readable description of the failure.
+        force_mode: If True, tag the failure so it is excluded from
+            systematic failure detection.
     """
     paths = LoomPaths(repo_root)
     state_file = paths.daemon_state_file
@@ -85,16 +93,19 @@ def record_blocked_reason(
     existing["last_blocked_details"] = details
     retries[issue_key] = existing
 
-    # Append to recent_failures sliding window
+    # Append to recent_failures sliding window.
+    # Force-mode failures are tagged so detect_systematic_failure can
+    # exclude them from the consecutive-failure count.
     failures: list[dict] = data.setdefault("recent_failures", [])
-    failures.append(
-        {
-            "issue": issue,
-            "error_class": error_class,
-            "phase": phase,
-            "timestamp": now,
-        }
-    )
+    entry: dict = {
+        "issue": issue,
+        "error_class": error_class,
+        "phase": phase,
+        "timestamp": now,
+    }
+    if force_mode:
+        entry["force_mode"] = True
+    failures.append(entry)
     # Keep only last N failures
     data["recent_failures"] = failures[-_MAX_RECENT_FAILURES:]
 
@@ -111,6 +122,14 @@ def record_blocked_reason(
         )
     except Exception:
         logger.warning("Failed to write to persistent failure log for issue #%d", issue)
+
+    if force_mode:
+        logger.info(
+            "Recorded force-mode failure for issue #%d (class=%s) — "
+            "excluded from systematic failure detection",
+            issue,
+            error_class,
+        )
 
 
 def detect_systematic_failure(
@@ -152,9 +171,14 @@ def detect_systematic_failure(
     # Filter out infrastructure failures — they indicate environment issues
     # (MCP server down, auth timeout), not issue-specific problems, and should
     # not trigger systematic failure escalation.  See issue #2772.
+    #
+    # Also filter out force-mode failures — these represent deliberate user
+    # retries of known-failing issues and should not count against the
+    # systematic failure budget.  See issue #2897.
     non_infra = [
         f for f in failures_raw
         if f.get("error_class", "unknown") not in INFRASTRUCTURE_ERROR_CLASSES
+        and not f.get("force_mode", False)
     ]
 
     if len(non_infra) < threshold:
@@ -278,6 +302,7 @@ def clear_failures_for_issue(repo_root: Path, issue: int) -> int:
     non_infra = [
         f for f in remaining
         if f.get("error_class", "unknown") not in INFRASTRUCTURE_ERROR_CLASSES
+        and not f.get("force_mode", False)
     ]
 
     if len(non_infra) < threshold:
