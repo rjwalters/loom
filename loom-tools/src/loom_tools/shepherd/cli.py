@@ -2404,40 +2404,61 @@ def _record_fallback_failure(ctx: ShepherdContext, exit_code: int) -> None:
         sf = detect_systematic_failure(ctx.repo_root)
 
         # Escalate: when systematic failure is detected, block the issue
-        # to prevent further automated pickup (see issue #2707)
+        # to prevent further automated pickup (see issue #2707).
+        #
+        # Guard: only escalate the *current* issue if it has accumulated enough
+        # failures on its own.  The systematic failure counter is cross-issue
+        # (it looks at the global recent_failures window), so a fresh issue
+        # could be blocked because *other* issues hit the same error class.
+        # Per-issue escalation only fires when this issue's own failure count
+        # reaches the threshold — preventing false-positive blocking.
+        # See issue #2919.
         if sf is not None:
-            transition_issue_labels(
-                ctx.config.issue,
-                add=["loom:blocked"],
-                remove=["loom:issue"],
-                repo_root=ctx.repo_root,
+            per_issue_count, threshold, _ = _get_prior_failure_info(
+                ctx.repo_root, ctx.config.issue
             )
-            log_warning(
-                f"Systematic failure escalation: issue #{ctx.config.issue} "
-                f"moved to loom:blocked (pattern={sf.pattern}, count={sf.count})"
-            )
-            subprocess.run(
-                [
-                    "gh", "issue", "comment", str(ctx.config.issue),
-                    "--body",
-                    f"**Systematic failure detected** — the builder has hit "
-                    f"the same error pattern (`{sf.pattern}`) **{sf.count}** "
-                    f"times in a row across recent issues. This issue was "
-                    f"blocked as a precaution.\n\n"
-                    f"### Recovery\n\n"
-                    f"Investigate the failure pattern and either fix the "
-                    f"underlying issue or add more guidance to the issue "
-                    f"description, then remove the `loom:blocked` label to "
-                    f"re-enable automated processing.\n\n"
-                    f"```bash\n"
-                    f"gh issue edit {ctx.config.issue} --remove-label "
-                    f"loom:blocked --add-label loom:issue\n"
-                    f"```",
-                ],
-                cwd=ctx.repo_root,
-                capture_output=True,
-                check=False,
-            )
+            if per_issue_count < threshold:
+                log_warning(
+                    f"Systematic failure active (pattern={sf.pattern}, "
+                    f"global count={sf.count}) but issue #{ctx.config.issue} "
+                    f"only has {per_issue_count}/{threshold} per-issue failures "
+                    f"— skipping escalation to loom:blocked"
+                )
+            else:
+                transition_issue_labels(
+                    ctx.config.issue,
+                    add=["loom:blocked"],
+                    remove=["loom:issue"],
+                    repo_root=ctx.repo_root,
+                )
+                log_warning(
+                    f"Systematic failure escalation: issue #{ctx.config.issue} "
+                    f"moved to loom:blocked (pattern={sf.pattern}, count={sf.count}, "
+                    f"per-issue={per_issue_count}/{threshold})"
+                )
+                subprocess.run(
+                    [
+                        "gh", "issue", "comment", str(ctx.config.issue),
+                        "--body",
+                        f"**Systematic failure detected** — the builder has hit "
+                        f"the same error pattern (`{sf.pattern}`) **{sf.count}** "
+                        f"times in a row across recent issues, and this issue "
+                        f"itself has reached {per_issue_count}/{threshold} failures "
+                        f"with the same pattern. Blocked as a precaution.\n\n"
+                        f"### Recovery\n\n"
+                        f"Investigate the failure pattern and either fix the "
+                        f"underlying issue or add more guidance to the issue "
+                        f"description, then remove the `loom:blocked` label to "
+                        f"re-enable automated processing.\n\n"
+                        f"```bash\n"
+                        f"gh issue edit {ctx.config.issue} --remove-label "
+                        f"loom:blocked --add-label loom:issue\n"
+                        f"```",
+                    ],
+                    cwd=ctx.repo_root,
+                    capture_output=True,
+                    check=False,
+                )
     except Exception:
         pass
 
