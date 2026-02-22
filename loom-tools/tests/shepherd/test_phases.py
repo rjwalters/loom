@@ -41,6 +41,7 @@ from loom_tools.shepherd.phases.base import (
     THINKING_STALL_BACKOFF_SECONDS,
     THINKING_STALL_MAX_RETRIES,
     THINKING_STALL_MIN_DURATION_SECONDS,
+    THINKING_STALL_RETRY_HINT,
     _AUTH_FAILURE_SENTINEL,
     _RATE_LIMIT_SENTINEL,
     _classify_ghost_cause,
@@ -18896,6 +18897,126 @@ class TestRunPhaseWithRetryThinkingStall:
 
         assert exit_code == 13
         assert call_count == 1  # No retries — rate limit abort is non-retryable
+
+    def test_thinking_stall_retry_hint_injected_on_retry(
+        self, mock_context: MagicMock
+    ) -> None:
+        """THINKING_STALL_RETRY_HINT is appended to args on thinking stall retries.
+
+        The first attempt uses the original args.  On retry (thinking_stall_retries > 0)
+        the hint is appended so the agent sees an explicit instruction to start with a
+        tool call rather than entering extended thinking mode again.  See issue #2894.
+        """
+        captured_args: list[str | None] = []
+
+        def mock_run_worker(*args, **kwargs):
+            captured_args.append(kwargs.get("args"))
+            call_number = len(captured_args)
+            return 14 if call_number == 1 else 0
+
+        with (
+            patch(
+                "loom_tools.shepherd.phases.base.run_worker_phase",
+                side_effect=mock_run_worker,
+            ),
+            patch("time.sleep"),
+        ):
+            exit_code = run_phase_with_retry(
+                mock_context,
+                role="builder",
+                name="builder-issue-42",
+                timeout=600,
+                max_retries=2,
+                phase="builder",
+                args="42",
+            )
+
+        assert exit_code == 0
+        assert len(captured_args) == 2
+        # First attempt uses original args without hint
+        assert captured_args[0] == "42"
+        # Retry appends the hint
+        assert captured_args[1] == f"42{THINKING_STALL_RETRY_HINT}"
+
+    def test_thinking_stall_retry_hint_injected_with_no_args(
+        self, mock_context: MagicMock
+    ) -> None:
+        """THINKING_STALL_RETRY_HINT is used alone when args=None on thinking stall retry.
+
+        When no args are passed to run_phase_with_retry and a thinking stall occurs,
+        the retry should pass the hint as the sole effective_args value rather than
+        attempting to concatenate with None.  See issue #2894.
+        """
+        captured_args: list[str | None] = []
+
+        def mock_run_worker(*args, **kwargs):
+            captured_args.append(kwargs.get("args"))
+            call_number = len(captured_args)
+            return 14 if call_number == 1 else 0
+
+        with (
+            patch(
+                "loom_tools.shepherd.phases.base.run_worker_phase",
+                side_effect=mock_run_worker,
+            ),
+            patch("time.sleep"),
+        ):
+            exit_code = run_phase_with_retry(
+                mock_context,
+                role="builder",
+                name="builder-issue-42",
+                timeout=600,
+                max_retries=2,
+                phase="builder",
+                args=None,
+            )
+
+        assert exit_code == 0
+        assert len(captured_args) == 2
+        # First attempt: no args
+        assert captured_args[0] is None
+        # Retry: hint alone (not "None<hint>")
+        assert captured_args[1] == THINKING_STALL_RETRY_HINT
+
+    def test_thinking_stall_second_retry_uses_longer_backoff(
+        self, mock_context: MagicMock
+    ) -> None:
+        """Two consecutive thinking stalls use escalating backoff before the third attempt.
+
+        The first stall triggers a 30s backoff; the second stall triggers a 60s backoff.
+        This verifies the full THINKING_STALL_BACKOFF_SECONDS schedule with two retries.
+        See issue #2920.
+        """
+        call_count = 0
+
+        def mock_run_worker(*args, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            # Stall on first two attempts, succeed on third
+            return 14 if call_count <= 2 else 0
+
+        with (
+            patch(
+                "loom_tools.shepherd.phases.base.run_worker_phase",
+                side_effect=mock_run_worker,
+            ),
+            patch("time.sleep") as mock_sleep,
+        ):
+            exit_code = run_phase_with_retry(
+                mock_context,
+                role="builder",
+                name="builder-issue-42",
+                timeout=600,
+                max_retries=2,
+                phase="builder",
+            )
+
+        assert exit_code == 0
+        assert call_count == 3
+        # First stall → 30s backoff; second stall → 60s backoff
+        assert mock_sleep.call_count == 2
+        sleep_calls = [c.args[0] for c in mock_sleep.call_args_list]
+        assert sleep_calls == list(THINKING_STALL_BACKOFF_SECONDS)
 
 
 class TestExtractTestFilePaths:
