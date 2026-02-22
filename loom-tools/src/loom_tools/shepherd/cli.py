@@ -16,6 +16,7 @@ from loom_tools.common.git import (
     get_uncommitted_files,
     is_branch_behind,
     parse_porcelain_path,
+    run_git,
 )
 from loom_tools.common.logging import log_error, log_info, log_success, log_warning
 from loom_tools.common.paths import LoomPaths, NamingConventions
@@ -259,14 +260,48 @@ def _is_loom_runtime(porcelain_line: str) -> bool:
     return path.startswith(".loom/") or path.startswith(".loom-")
 
 
+def _worktree_has_diff_for_file(worktree_path: Path, rel_path: str) -> bool:
+    """Check whether a worktree has actually modified a file relative to origin/main.
+
+    Runs ``git diff origin/main -- <rel_path>`` inside the worktree and returns
+    ``True`` only when the output is non-empty, meaning the worktree made real
+    modifications to that file.  File *existence* is intentionally not used
+    because every worktree (being a clone of the same repository) will contain
+    most source files regardless of whether that worktree modified them.
+
+    Args:
+        worktree_path: Absolute path to the worktree directory.
+        rel_path: Repository-relative file path to check.
+
+    Returns:
+        ``True`` if the file was modified in this worktree relative to
+        ``origin/main``; ``False`` otherwise (including on any error).
+    """
+    try:
+        result = run_git(
+            ["diff", "origin/main", "--", rel_path],
+            cwd=worktree_path,
+            check=False,
+        )
+        return bool(result.returncode == 0 and result.stdout.strip())
+    except Exception:
+        return False
+
+
 def _find_source_issues_for_dirty_files(
     repo_root: Path, dirty_filenames: list[str]
 ) -> dict[int, list[str]]:
     """Cross-reference dirty files against active issue worktrees.
 
-    Scans ``.loom/worktrees/issue-*/`` to find which worktrees contain
-    the same files as the ones found dirty in the main repo.  This helps
-    identify which issue's builder work may have leaked into main.
+    Scans ``.loom/worktrees/issue-*/`` to find which worktrees have *actually
+    modified* the same files as the ones found dirty in the main repo.  This
+    helps identify which issue's builder work may have leaked into main.
+
+    The check uses ``git diff origin/main -- <rel_path>`` inside each worktree
+    rather than file existence, because every worktree (being a clone of the
+    same repository) contains most source files regardless of whether that
+    worktree modified them.  Only worktrees with non-empty diff output are
+    included in the result.
 
     Args:
         repo_root: The resolved repository root path.
@@ -275,7 +310,8 @@ def _find_source_issues_for_dirty_files(
 
     Returns:
         A mapping of issue_number -> list of matching file paths.  Only
-        issues with at least one matching file are included.
+        issues with at least one file that the worktree modified relative to
+        ``origin/main`` are included.
     """
     worktrees_dir = repo_root / ".loom" / "worktrees"
     if not worktrees_dir.is_dir():
@@ -289,11 +325,11 @@ def _find_source_issues_for_dirty_files(
             issue_num = NamingConventions.issue_from_worktree(entry.name)
             if issue_num is None:
                 continue
-            # Check which dirty files also exist in this worktree
+            # Check which dirty files were actually modified in this worktree
+            # relative to origin/main (not just whether the file exists there).
             found: list[str] = []
             for rel_path in dirty_filenames:
-                candidate = entry / rel_path
-                if candidate.exists():
+                if _worktree_has_diff_for_file(entry, rel_path):
                     found.append(rel_path)
             if found:
                 matches[issue_num] = found

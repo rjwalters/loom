@@ -28,6 +28,7 @@ from loom_tools.shepherd.cli import (
     _parse_args,
     _post_fallback_failure_comment,
     _record_fallback_failure,
+    _worktree_has_diff_for_file,
     main,
     orchestrate,
 )
@@ -578,36 +579,127 @@ class TestCheckMainRepoClean:
             assert not any("git stash" in msg for msg in messages)
 
 
+class TestWorktreeHasDiffForFile:
+    """Unit tests for _worktree_has_diff_for_file (issue #2895)."""
+
+    def test_returns_true_when_git_diff_has_output(self, tmp_path: Path) -> None:
+        """Should return True when git diff produces non-empty output."""
+        mock_result = MagicMock()
+        mock_result.returncode = 0
+        mock_result.stdout = "diff --git a/src/foo.py b/src/foo.py\n+added line\n"
+        with patch("loom_tools.shepherd.cli.run_git", return_value=mock_result) as mock_run_git:
+            result = _worktree_has_diff_for_file(tmp_path, "src/foo.py")
+        assert result is True
+        mock_run_git.assert_called_once_with(
+            ["diff", "origin/main", "--", "src/foo.py"],
+            cwd=tmp_path,
+            check=False,
+        )
+
+    def test_returns_false_when_git_diff_is_empty(self, tmp_path: Path) -> None:
+        """Should return False when git diff produces empty output (no modification)."""
+        mock_result = MagicMock()
+        mock_result.returncode = 0
+        mock_result.stdout = ""
+        with patch("loom_tools.shepherd.cli.run_git", return_value=mock_result):
+            result = _worktree_has_diff_for_file(tmp_path, "src/foo.py")
+        assert result is False
+
+    def test_returns_false_when_git_diff_whitespace_only(self, tmp_path: Path) -> None:
+        """Should return False when git diff output is only whitespace."""
+        mock_result = MagicMock()
+        mock_result.returncode = 0
+        mock_result.stdout = "   \n  \n"
+        with patch("loom_tools.shepherd.cli.run_git", return_value=mock_result):
+            result = _worktree_has_diff_for_file(tmp_path, "src/foo.py")
+        assert result is False
+
+    def test_returns_false_when_git_returns_nonzero(self, tmp_path: Path) -> None:
+        """Should return False when git exits with non-zero status."""
+        mock_result = MagicMock()
+        mock_result.returncode = 1
+        mock_result.stdout = "some output"
+        with patch("loom_tools.shepherd.cli.run_git", return_value=mock_result):
+            result = _worktree_has_diff_for_file(tmp_path, "src/foo.py")
+        assert result is False
+
+    def test_returns_false_on_exception(self, tmp_path: Path) -> None:
+        """Should return False (not raise) when run_git raises an exception."""
+        with patch("loom_tools.shepherd.cli.run_git", side_effect=OSError("no git")):
+            result = _worktree_has_diff_for_file(tmp_path, "src/foo.py")
+        assert result is False
+
+
 class TestFindSourceIssuesForDirtyFiles:
-    """Tests for _find_source_issues_for_dirty_files (issue #2837)."""
+    """Tests for _find_source_issues_for_dirty_files (issue #2837, #2895)."""
 
     def test_returns_empty_when_worktrees_dir_missing(self, tmp_path: Path) -> None:
         """Should return empty dict when .loom/worktrees does not exist."""
         result = _find_source_issues_for_dirty_files(tmp_path, ["src/foo.py"])
         assert result == {}
 
-    def test_returns_empty_when_no_files_match(self, tmp_path: Path) -> None:
-        """Should return empty dict when dirty files don't exist in any worktree."""
-        worktrees = tmp_path / ".loom" / "worktrees" / "issue-42"
-        worktrees.mkdir(parents=True)
-        result = _find_source_issues_for_dirty_files(tmp_path, ["src/foo.py"])
+    def test_returns_empty_when_no_worktree_modified_dirty_files(self, tmp_path: Path) -> None:
+        """Should return empty dict when no worktree modified the dirty files.
+
+        Even if the files exist in the worktree (they always do since worktrees
+        clone the same repo), the function must use git diff to confirm actual
+        modifications — not file existence.
+        """
+        worktree = tmp_path / ".loom" / "worktrees" / "issue-42"
+        worktree.mkdir(parents=True)
+        with patch(
+            "loom_tools.shepherd.cli._worktree_has_diff_for_file", return_value=False
+        ):
+            result = _find_source_issues_for_dirty_files(tmp_path, ["src/foo.py"])
         assert result == {}
 
-    def test_returns_match_when_file_exists_in_worktree(self, tmp_path: Path) -> None:
-        """Should return issue->files mapping when a dirty file exists in worktree."""
+    def test_returns_match_when_worktree_has_diff_for_file(self, tmp_path: Path) -> None:
+        """Should return issue->files mapping when worktree git diff is non-empty."""
         worktree = tmp_path / ".loom" / "worktrees" / "issue-42"
-        (worktree / "src").mkdir(parents=True)
-        (worktree / "src" / "foo.py").write_text("# content")
-        result = _find_source_issues_for_dirty_files(tmp_path, ["src/foo.py"])
+        worktree.mkdir(parents=True)
+        with patch(
+            "loom_tools.shepherd.cli._worktree_has_diff_for_file", return_value=True
+        ):
+            result = _find_source_issues_for_dirty_files(tmp_path, ["src/foo.py"])
         assert result == {42: ["src/foo.py"]}
 
-    def test_matches_multiple_files_and_issues(self, tmp_path: Path) -> None:
-        """Should return all matching files across multiple worktrees."""
+    def test_only_issue_with_diff_is_returned(self, tmp_path: Path) -> None:
+        """Should only return the worktree that actually modified the dirty files.
+
+        This is the core regression: previously any worktree containing the file
+        (i.e. all of them) was reported.  Now only the one with a non-empty
+        git diff is reported.
+        """
+        for issue in (10, 20, 30):
+            wt = tmp_path / ".loom" / "worktrees" / f"issue-{issue}"
+            wt.mkdir(parents=True)
+
+        # Only issue-20 has actually modified src/foo.py
+        def has_diff(worktree_path: Path, rel_path: str) -> bool:
+            return worktree_path.name == "issue-20" and rel_path == "src/foo.py"
+
+        with patch(
+            "loom_tools.shepherd.cli._worktree_has_diff_for_file", side_effect=has_diff
+        ):
+            result = _find_source_issues_for_dirty_files(tmp_path, ["src/foo.py"])
+        assert result == {20: ["src/foo.py"]}
+
+    def test_matches_multiple_files_across_multiple_issues(self, tmp_path: Path) -> None:
+        """Should aggregate matching files per issue across multiple worktrees."""
         for issue in (10, 20):
             wt = tmp_path / ".loom" / "worktrees" / f"issue-{issue}"
-            (wt / "pkg").mkdir(parents=True)
-            (wt / "pkg" / "mod.py").write_text("")
-        result = _find_source_issues_for_dirty_files(tmp_path, ["pkg/mod.py", "other.py"])
+            wt.mkdir(parents=True)
+
+        # Both worktrees modified pkg/mod.py, neither modified other.py
+        def has_diff(worktree_path: Path, rel_path: str) -> bool:
+            return rel_path == "pkg/mod.py"
+
+        with patch(
+            "loom_tools.shepherd.cli._worktree_has_diff_for_file", side_effect=has_diff
+        ):
+            result = _find_source_issues_for_dirty_files(
+                tmp_path, ["pkg/mod.py", "other.py"]
+            )
         assert set(result.keys()) == {10, 20}
         assert result[10] == ["pkg/mod.py"]
         assert result[20] == ["pkg/mod.py"]
@@ -615,9 +707,11 @@ class TestFindSourceIssuesForDirtyFiles:
     def test_skips_non_issue_directories(self, tmp_path: Path) -> None:
         """Should ignore worktree directories that don't match issue-N naming."""
         terminal = tmp_path / ".loom" / "worktrees" / "terminal-1"
-        (terminal / "src").mkdir(parents=True)
-        (terminal / "src" / "foo.py").write_text("")
-        result = _find_source_issues_for_dirty_files(tmp_path, ["src/foo.py"])
+        terminal.mkdir(parents=True)
+        with patch(
+            "loom_tools.shepherd.cli._worktree_has_diff_for_file", return_value=True
+        ):
+            result = _find_source_issues_for_dirty_files(tmp_path, ["src/foo.py"])
         assert result == {}
 
     def test_handles_oserror_gracefully(self, tmp_path: Path) -> None:
@@ -626,6 +720,19 @@ class TestFindSourceIssuesForDirtyFiles:
         worktrees.mkdir(parents=True)
         with patch("pathlib.Path.iterdir", side_effect=OSError("permission denied")):
             result = _find_source_issues_for_dirty_files(tmp_path, ["src/foo.py"])
+        assert result == {}
+
+    def test_no_changes_in_main_yields_empty_result(self, tmp_path: Path) -> None:
+        """When changes were made directly in main (not via worktree), list should be empty."""
+        for issue in (1, 2, 3):
+            wt = tmp_path / ".loom" / "worktrees" / f"issue-{issue}"
+            wt.mkdir(parents=True)
+
+        # No worktree has a diff for the dirty file
+        with patch(
+            "loom_tools.shepherd.cli._worktree_has_diff_for_file", return_value=False
+        ):
+            result = _find_source_issues_for_dirty_files(tmp_path, ["context.py"])
         assert result == {}
 
 
