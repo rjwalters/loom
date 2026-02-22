@@ -119,6 +119,11 @@ def run(ctx: DaemonContext) -> int:
                 # Update signal_queue_depth in state file after processing
                 _update_signal_queue_depth(ctx, command_poller.queue_depth())
 
+            # Retry any pending spawn signals that were queued when all slots were full.
+            # Runs before each iteration so reclaimed slots are immediately reused.
+            if ctx.pending_spawns:
+                _retry_pending_spawns(ctx)
+
             # Run iteration
             log_info(f"Iteration {ctx.iteration}: Starting...")
             start_time = time.time()
@@ -190,6 +195,12 @@ def _responsive_sleep(
             log_info(f"Sleep-tick: processing {len(commands)} signal command(s)")
             _process_commands(ctx, commands, command_poller)
             _update_signal_queue_depth(ctx, command_poller.queue_depth())
+
+        # Retry pending spawns that were queued when all slots were full.
+        # Doing this during sleep ticks means a freed slot triggers a spawn
+        # within 2s rather than waiting for the next full iteration.
+        if ctx.pending_spawns:
+            _retry_pending_spawns(ctx)
 
 
 def _process_commands(
@@ -279,12 +290,9 @@ def _spawn_shepherd_from_signal(
 
     from loom_tools.models.daemon_state import ShepherdEntry
 
-    shepherd_script = ctx.repo_root / ".loom" / "scripts" / "loom-shepherd.sh"
-    if not shepherd_script.exists():
-        log_error(f"Signal spawn: loom-shepherd.sh not found at {shepherd_script}")
-        return
-
-    # Find or allocate a shepherd slot
+    # Check slot availability FIRST so we can queue for retry even when the
+    # shepherd script is missing (it will be present when the slot eventually
+    # opens in a healthy deployment, and the error will surface then).
     if ctx.state is None:
         # Daemon state not yet loaded (e.g. first iteration hasn't run).
         # Re-queue the signal so it is retried on the next sleep-tick poll
@@ -304,7 +312,20 @@ def _spawn_shepherd_from_signal(
 
     shepherd_name = _find_idle_shepherd_slot(ctx)
     if shepherd_name is None:
-        log_warning(f"Signal spawn: no idle shepherd slot available for issue #{issue}")
+        # No slot available — enqueue for retry on the next iteration or
+        # sleep-tick rather than silently dropping the signal.
+        pending = {"issue": issue, "mode": mode, "flags": flags}
+        if pending not in ctx.pending_spawns:
+            ctx.pending_spawns.append(pending)
+            log_warning(
+                f"Signal spawn: no idle shepherd slot available for issue #{issue} "
+                f"— queued for retry (pending={len(ctx.pending_spawns)})"
+            )
+        return
+
+    shepherd_script = ctx.repo_root / ".loom" / "scripts" / "loom-shepherd.sh"
+    if not shepherd_script.exists():
+        log_error(f"Signal spawn: loom-shepherd.sh not found at {shepherd_script}")
         return
 
     # Build command arguments
@@ -373,6 +394,46 @@ def _find_idle_shepherd_slot(ctx: DaemonContext) -> str | None:
         return new_name
 
     return None
+
+
+def _retry_pending_spawns(ctx: DaemonContext) -> None:
+    """Attempt to spawn shepherds from the pending queue.
+
+    Called at the start of each iteration and during responsive-sleep ticks.
+    Drains ``ctx.pending_spawns`` by attempting to fulfil each queued spawn
+    signal.  Entries that still cannot be fulfilled (slots still full) remain
+    in the queue for the next retry.
+
+    Algorithm:
+    1. Snapshot and clear the pending list (so _spawn_shepherd_from_signal
+       can re-queue items to ctx.pending_spawns without interfering).
+    2. For each snapshot item, attempt the spawn.
+       - Success: item is consumed.
+       - Failure (slot gone again): _spawn_shepherd_from_signal re-queues
+         the item into ctx.pending_spawns automatically.
+    3. Any items added to ctx.pending_spawns by step 2 are already there;
+       no further merging is needed.
+    """
+    if not ctx.pending_spawns:
+        return
+
+    # Take a snapshot and clear, so re-queuing by _spawn_shepherd_from_signal
+    # goes into a clean list.
+    to_retry = ctx.pending_spawns[:]
+    ctx.pending_spawns = []
+
+    log_info(f"Retrying {len(to_retry)} pending spawn(s)...")
+    for pending in to_retry:
+        issue = pending["issue"]
+        mode = pending["mode"]
+        flags = pending["flags"]
+        _spawn_shepherd_from_signal(ctx, issue, mode, flags)
+
+    if ctx.pending_spawns:
+        log_info(
+            f"Pending spawn queue: {len(ctx.pending_spawns)} spawn(s) still "
+            f"waiting for an idle shepherd slot"
+        )
 
 
 def _pause_shepherd(ctx: DaemonContext, shepherd_id: str) -> None:

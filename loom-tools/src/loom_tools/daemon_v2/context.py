@@ -33,6 +33,12 @@ class DaemonContext:
     snapshot: dict[str, Any] | None = None
     state: DaemonState | None = None
 
+    # Pending spawn queue: spawn_shepherd signals that could not be fulfilled
+    # immediately (no idle slot available) are held here and retried each
+    # iteration until a slot opens or the issue is cancelled.
+    # Each entry is a dict: {"issue": int, "mode": str, "flags": list[str]}
+    pending_spawns: list[dict] = field(default_factory=list)
+
     # File paths (computed from repo_root)
     _log_file: pathlib.Path | None = field(default=None, repr=False)
     _state_file: pathlib.Path | None = field(default=None, repr=False)
