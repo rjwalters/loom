@@ -276,6 +276,66 @@ def _clone_keychain_credentials(config_dir: Path) -> bool:
     return True
 
 
+def validate_agent_config_dir(agent_name: str, repo_root: Path) -> bool:
+    """Validate that an agent's config directory is in a healthy state.
+
+    Checks that the config directory exists and its key components are intact:
+    - ``.claude.json`` is a valid symlink (pointing to an existing target)
+      or a valid plain file — but NOT a broken/dangling symlink.
+    - All mutable directories exist (projects, todos, debug, tmp, etc.).
+
+    This is used before each retry attempt to detect corrupted state that
+    ``setup_agent_config_dir()`` would silently preserve because it is
+    idempotent and skips existing files.  See issue #2909.
+
+    Args:
+        agent_name: The agent name (e.g., "builder-1", "shepherd-2").
+        repo_root: Repository root path.
+
+    Returns:
+        True if the config directory exists and appears healthy.
+        False if the directory is missing, incomplete, or in an invalid state.
+    """
+    paths = LoomPaths(repo_root)
+    config_dir = paths.agent_claude_config_dir(agent_name)
+
+    if not config_dir.is_dir():
+        return False  # Directory doesn't exist yet — not an error, just missing
+
+    # Check .claude.json state:
+    # - If it's a symlink, the target must exist (not dangling).
+    # - If it's a plain file, it must exist and be readable.
+    # - If it doesn't exist at all, the config dir is incomplete.
+    state_dst = config_dir / ".claude.json"
+    if state_dst.is_symlink():
+        # Symlink present — validate target is reachable (not dangling).
+        if not state_dst.exists():
+            log.debug(
+                "Agent config dir validation failed for %s: "
+                ".claude.json is a dangling symlink (target missing)",
+                agent_name,
+            )
+            return False
+    elif not state_dst.exists():
+        log.debug(
+            "Agent config dir validation failed for %s: .claude.json is missing",
+            agent_name,
+        )
+        return False
+
+    # All mutable directories must exist.
+    for dirname in _MUTABLE_DIRS:
+        if not (config_dir / dirname).is_dir():
+            log.debug(
+                "Agent config dir validation failed for %s: mutable dir '%s' is missing",
+                agent_name,
+                dirname,
+            )
+            return False
+
+    return True
+
+
 def setup_agent_config_dir(agent_name: str, repo_root: Path) -> Path:
     """Create an isolated CLAUDE_CONFIG_DIR for an agent.
 

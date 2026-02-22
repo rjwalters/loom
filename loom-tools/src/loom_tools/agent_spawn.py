@@ -33,7 +33,11 @@ import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
-from loom_tools.common.claude_config import setup_agent_config_dir
+from loom_tools.common.claude_config import (
+    cleanup_agent_config_dir,
+    setup_agent_config_dir,
+    validate_agent_config_dir,
+)
 from loom_tools.common.logging import log_error, log_info, log_success, log_warning
 from loom_tools.common.repo import find_repo_root
 
@@ -603,7 +607,20 @@ def spawn_agent(
             "LOOM_SHEPHERD_TASK_ID", shepherd_task_id,
         )
 
-    # Create per-agent CLAUDE_CONFIG_DIR for session isolation
+    # Create per-agent CLAUDE_CONFIG_DIR for session isolation.
+    # Before calling setup (which is idempotent and skips existing files),
+    # validate the existing config dir is in a healthy state.  If it is
+    # corrupted (e.g. .claude.json became a dangling symlink or a missing
+    # mutable directory), remove and recreate it so the agent starts clean.
+    # Without this check, a corrupted config dir silently persists across all
+    # retry attempts, causing 11+ consecutive failures.  See issue #2909.
+    if not validate_agent_config_dir(name, repo_root):
+        removed = cleanup_agent_config_dir(name, repo_root)
+        if removed:
+            log_warning(
+                f"Agent config dir for '{name}' failed validation — "
+                "reinitializing before spawn"
+            )
     config_dir = setup_agent_config_dir(name, repo_root)
     _tmux("set-environment", "-t", session_name, "CLAUDE_CONFIG_DIR", str(config_dir))
     _tmux("set-environment", "-t", session_name, "TMPDIR", str(config_dir / "tmp"))
