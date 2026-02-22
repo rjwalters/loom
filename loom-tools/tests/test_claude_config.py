@@ -15,6 +15,7 @@ from loom_tools.common.claude_config import (
     cleanup_agent_config_dir,
     cleanup_all_agent_config_dirs,
     setup_agent_config_dir,
+    validate_agent_config_dir,
 )
 
 
@@ -483,6 +484,167 @@ class TestCleanupAgentConfigDir:
 
     def test_returns_false_for_nonexistent(self, mock_repo: pathlib.Path) -> None:
         assert cleanup_agent_config_dir("nonexistent", mock_repo) is False
+
+
+class TestValidateAgentConfigDir:
+    """Tests for validate_agent_config_dir.
+
+    These tests verify that validate_agent_config_dir correctly identifies
+    both healthy and corrupted config directories so that agent_spawn.py
+    can reinitialize corrupted dirs before each retry attempt.  See issue #2909.
+    """
+
+    def test_returns_false_for_nonexistent_dir(self, mock_repo: pathlib.Path) -> None:
+        """A directory that has never been created is not valid (but not corrupted)."""
+        assert validate_agent_config_dir("nonexistent-agent", mock_repo) is False
+
+    def test_returns_true_for_healthy_dir(
+        self, mock_repo: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A freshly set-up config dir must pass validation."""
+        fake_home = mock_repo / "fake-home"
+        fake_home.mkdir()
+        (fake_home / ".claude").mkdir()
+        state_file = fake_home / ".claude.json"
+        state_file.write_text(
+            '{"hasCompletedOnboarding":true,"theme":"dark",'
+            '"effortCalloutDismissed":true,"opusProMigrationComplete":true}'
+        )
+        monkeypatch.setattr(pathlib.Path, "home", staticmethod(lambda: fake_home))
+
+        setup_agent_config_dir("healthy-agent", mock_repo)
+        assert validate_agent_config_dir("healthy-agent", mock_repo) is True
+
+    def test_returns_false_when_claude_json_is_dangling_symlink(
+        self, mock_repo: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Dangling .claude.json symlink indicates a corrupted config dir.
+
+        This is the primary corruption pattern from issue #2909: the first
+        builder attempt had a valid symlink, but the target was removed or
+        the symlink was replaced and the target disappeared.
+        """
+        fake_home = mock_repo / "fake-home"
+        fake_home.mkdir()
+        (fake_home / ".claude").mkdir()
+        state_file = fake_home / ".claude.json"
+        state_file.write_text(
+            '{"hasCompletedOnboarding":true,"theme":"dark",'
+            '"effortCalloutDismissed":true,"opusProMigrationComplete":true}'
+        )
+        monkeypatch.setattr(pathlib.Path, "home", staticmethod(lambda: fake_home))
+
+        setup_agent_config_dir("test-agent", mock_repo)
+
+        # Simulate the state-file target disappearing (dangling symlink)
+        config_dir = mock_repo / ".loom" / "claude-config" / "test-agent"
+        state_dst = config_dir / ".claude.json"
+        # Remove and replace with a dangling symlink
+        state_dst.unlink()
+        state_dst.symlink_to(mock_repo / "nonexistent-target.json")
+
+        assert validate_agent_config_dir("test-agent", mock_repo) is False
+
+    def test_returns_false_when_claude_json_is_missing(
+        self, mock_repo: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Missing .claude.json (deleted after setup) fails validation."""
+        fake_home = mock_repo / "fake-home"
+        fake_home.mkdir()
+        (fake_home / ".claude").mkdir()
+        state_file = fake_home / ".claude.json"
+        state_file.write_text(
+            '{"hasCompletedOnboarding":true,"theme":"dark",'
+            '"effortCalloutDismissed":true,"opusProMigrationComplete":true}'
+        )
+        monkeypatch.setattr(pathlib.Path, "home", staticmethod(lambda: fake_home))
+
+        setup_agent_config_dir("test-agent", mock_repo)
+
+        config_dir = mock_repo / ".loom" / "claude-config" / "test-agent"
+        state_dst = config_dir / ".claude.json"
+        state_dst.unlink()
+
+        assert validate_agent_config_dir("test-agent", mock_repo) is False
+
+    def test_returns_false_when_mutable_dir_missing(
+        self, mock_repo: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Missing mutable directory (e.g., 'tmp') fails validation."""
+        fake_home = mock_repo / "fake-home"
+        fake_home.mkdir()
+        (fake_home / ".claude").mkdir()
+        state_file = fake_home / ".claude.json"
+        state_file.write_text(
+            '{"hasCompletedOnboarding":true,"theme":"dark",'
+            '"effortCalloutDismissed":true,"opusProMigrationComplete":true}'
+        )
+        monkeypatch.setattr(pathlib.Path, "home", staticmethod(lambda: fake_home))
+
+        setup_agent_config_dir("test-agent", mock_repo)
+
+        # Remove a mutable directory
+        config_dir = mock_repo / ".loom" / "claude-config" / "test-agent"
+        import shutil
+        shutil.rmtree(config_dir / "tmp")
+
+        assert validate_agent_config_dir("test-agent", mock_repo) is False
+
+    def test_returns_true_when_claude_json_is_plain_file(
+        self, mock_repo: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A plain file .claude.json (no symlink) is valid — the fallback case."""
+        fake_home = mock_repo / "fake-home"
+        fake_home.mkdir()
+        (fake_home / ".claude").mkdir()
+        # No state file exists — setup writes a fallback plain file
+        monkeypatch.setattr(pathlib.Path, "home", staticmethod(lambda: fake_home))
+
+        setup_agent_config_dir("test-agent", mock_repo)
+
+        config_dir = mock_repo / ".loom" / "claude-config" / "test-agent"
+        state_dst = config_dir / ".claude.json"
+        # Verify it's a plain file (not a symlink) in this case
+        assert not state_dst.is_symlink()
+        assert state_dst.exists()
+
+        assert validate_agent_config_dir("test-agent", mock_repo) is True
+
+    def test_reinitialize_removes_and_recreates_corrupted_dir(
+        self, mock_repo: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """After validation failure, cleanup+setup produces a healthy dir.
+
+        This tests the full recovery flow used by agent_spawn.py:
+        validate → fail → cleanup → setup → validate → pass
+        """
+        fake_home = mock_repo / "fake-home"
+        fake_home.mkdir()
+        (fake_home / ".claude").mkdir()
+        state_file = fake_home / ".claude.json"
+        state_file.write_text(
+            '{"hasCompletedOnboarding":true,"theme":"dark",'
+            '"effortCalloutDismissed":true,"opusProMigrationComplete":true}'
+        )
+        monkeypatch.setattr(pathlib.Path, "home", staticmethod(lambda: fake_home))
+
+        setup_agent_config_dir("test-agent", mock_repo)
+
+        # Corrupt: replace .claude.json symlink with a dangling symlink
+        config_dir = mock_repo / ".loom" / "claude-config" / "test-agent"
+        state_dst = config_dir / ".claude.json"
+        state_dst.unlink()
+        state_dst.symlink_to(mock_repo / "nonexistent-target.json")
+
+        # Validation must fail
+        assert validate_agent_config_dir("test-agent", mock_repo) is False
+
+        # Recovery: cleanup + setup
+        cleanup_agent_config_dir("test-agent", mock_repo)
+        setup_agent_config_dir("test-agent", mock_repo)
+
+        # Validation must now pass
+        assert validate_agent_config_dir("test-agent", mock_repo) is True
 
 
 class TestCleanupAllAgentConfigDirs:
