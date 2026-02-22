@@ -2210,9 +2210,92 @@ def _cleanup_labels_on_failure(ctx: ShepherdContext, exit_code: int) -> None:
         # returns to the ready pool with no record of what went wrong.
         _post_fallback_failure_comment(ctx, exit_code)
 
+        # Surface the classified error in the progress milestone so operators
+        # can see the failure class without parsing log files.  See #2912.
+        try:
+            if exit_code == ShepherdExitCode.SYSTEMIC_FAILURE:
+                _fallback_error_class = "auth_infrastructure_failure"
+            elif exit_code == ShepherdExitCode.WORKTREE_ESCAPE:
+                _fallback_error_class = "builder_worktree_escape"
+            elif exit_code == ShepherdExitCode.RATE_LIMIT_ABORT:
+                _fallback_error_class = "rate_limit_abort"
+            else:
+                _fallback_error_class, _ = _classify_exit1_failure_from_log(
+                    ctx.repo_root, ctx.config.issue, exit_code
+                )
+            ctx.report_milestone("error", error=_fallback_error_class, will_retry=False)
+        except Exception:
+            pass
+
         # Track repeated fallback failures via the systematic failure detector
         # so escalation happens after N consecutive recycling events.
         _record_fallback_failure(ctx, exit_code)
+
+
+def _classify_exit1_failure_from_log(
+    repo_root: "Path",
+    issue: int,
+    exit_code: int,
+    postmortem_summary: str = "",
+) -> "tuple[str, str]":
+    """Inspect the builder session log and return (error_class, details).
+
+    Called when the exit code does not map to a known failure class.  Scans
+    the log file for specific patterns — in priority order — so that the
+    most actionable class is returned rather than the generic
+    ``builder_unknown_failure``.  Priority:
+
+    1. Rate limit abort (``# RATE_LIMIT_ABORT`` sentinel or "session limit")
+    2. Auth failure (``# AUTH_PREFLIGHT_FAILED`` sentinel or known patterns)
+    3. MCP infrastructure failure ("MCP server failed" patterns)
+    4. ``builder_unknown_failure`` (fallback)
+
+    Best-effort — always returns a valid tuple, never raises.
+    See issue #2912.
+    """
+    import re
+
+    from loom_tools.common.paths import LoomPaths
+    from loom_tools.shepherd.phases.base import (
+        MCP_FAILURE_PATTERNS,
+        _is_auth_failure,
+        _is_rate_limit_abort,
+    )
+
+    try:
+        log_path = LoomPaths(repo_root).builder_log_file(issue)
+        if log_path.is_file():
+            # Priority 1: rate limit abort — non-retryable, must check first
+            if _is_rate_limit_abort(log_path):
+                return (
+                    "rate_limit_abort",
+                    f"Builder hit API usage/plan limit (exit code {exit_code}, fallback cleanup)",
+                )
+
+            # Priority 2: auth failure — non-retryable infrastructure issue
+            if _is_auth_failure(log_path):
+                return (
+                    "auth_infrastructure_failure",
+                    f"Builder failed due to auth/API infrastructure issue (exit code {exit_code}, fallback cleanup)",
+                )
+
+            # Priority 3: MCP infrastructure failure — retryable
+            content = log_path.read_text()
+            for pattern in MCP_FAILURE_PATTERNS:
+                if re.search(pattern, content, re.IGNORECASE):
+                    return (
+                        "mcp_infrastructure_failure",
+                        f"Builder failed due to MCP server failure (exit code {exit_code}, fallback cleanup)",
+                    )
+    except Exception:
+        pass  # Best-effort — fall through to unknown_failure
+
+    # Fallback: no pattern matched
+    pm = f" | post-mortem: {postmortem_summary}" if postmortem_summary else ""
+    return (
+        "builder_unknown_failure",
+        f"Builder failed without specific handler (exit code {exit_code}, fallback cleanup){pm}",
+    )
 
 
 def _post_fallback_failure_comment(ctx: ShepherdContext, exit_code: int) -> None:
@@ -2349,7 +2432,8 @@ def _post_fallback_failure_comment(ctx: ShepherdContext, exit_code: int) -> None
             f"{advice}"
         )
     else:
-        # No specific abandonment info — use exit-code-based messages
+        # No specific abandonment info — use exit-code-based messages,
+        # augmented with log-based classification for generic exit codes.
         if exit_code == ShepherdExitCode.SYSTEMIC_FAILURE:
             failure_type = "infrastructure failure (auth/API)"
             advice = (
@@ -2364,11 +2448,36 @@ def _post_fallback_failure_comment(ctx: ShepherdContext, exit_code: int) -> None
                 "or re-authenticate with a different plan before retrying."
             )
         else:
-            failure_type = "unexpected failure"
-            advice = (
-                "If this issue fails repeatedly, it may need manual investigation "
-                "or more detailed implementation guidance."
+            # Inspect the builder log for specific failure patterns so the
+            # comment includes actionable information rather than just
+            # "unexpected failure".  See issue #2912.
+            error_class, _ = _classify_exit1_failure_from_log(
+                ctx.repo_root, issue, exit_code
             )
+            if error_class == "rate_limit_abort":
+                failure_type = "rate limit abort detected in log (usage/plan limit)"
+                advice = (
+                    "Wait for the usage or plan limit to reset, or re-authenticate "
+                    "with a different plan before retrying."
+                )
+            elif error_class == "auth_infrastructure_failure":
+                failure_type = "auth failure detected in log (infrastructure issue)"
+                advice = (
+                    "This is an **infrastructure failure**, not an issue with the code. "
+                    "Check authentication tokens and API availability before retrying."
+                )
+            elif error_class == "mcp_infrastructure_failure":
+                failure_type = "MCP server failure detected in log (infrastructure issue)"
+                advice = (
+                    "This is an **infrastructure failure** (MCP server failed to initialize). "
+                    "The issue has been returned to `loom:issue` and is safe to retry."
+                )
+            else:
+                failure_type = f"unexpected failure (error class: {error_class})"
+                advice = (
+                    "If this issue fails repeatedly, it may need manual investigation "
+                    "or more detailed implementation guidance."
+                )
 
         comment_body = (
             f"**Shepherd abandoned issue** (task `{task_id}`, {today})\n\n"
@@ -2411,7 +2520,8 @@ def _record_fallback_failure(ctx: ShepherdContext, exit_code: int) -> None:
         record_blocked_reason,
     )
 
-    # Classify the failure based on exit code and abandonment_info flags.
+    # Classify the failure based on exit code, then refine with log
+    # inspection for generic exit codes.  See issue #2912.
     if exit_code == ShepherdExitCode.SYSTEMIC_FAILURE:
         # Check if this SYSTEMIC_FAILURE was actually a worktree branch conflict
         # (branch already checked out in another worktree).  abandonment_info is
@@ -2453,36 +2563,22 @@ def _record_fallback_failure(ctx: ShepherdContext, exit_code: int) -> None:
             "output with zero tool calls detected (fallback cleanup)"
         )
     else:
-        error_class = "builder_unknown_failure"
         # Include post-mortem diagnostics if available (issue #2766).
         postmortem_summary = ""
         if ctx.last_postmortem is not None:
-            postmortem_summary = f" | post-mortem: {ctx.last_postmortem.get('summary', 'n/a')}"
-        details = (
-            f"Builder failed without specific handler "
-            f"(exit code {exit_code}, fallback cleanup){postmortem_summary}"
+            postmortem_summary = ctx.last_postmortem.get("summary", "n/a")
+
+        # Inspect the builder log for specific patterns (rate limit, auth,
+        # MCP) before accepting the generic unknown_failure class.  This
+        # gives the systematic failure detector more granular signal and
+        # lets operators distinguish infrastructure problems from
+        # issue-level failures.  See issues #2768, #2912.
+        error_class, details = _classify_exit1_failure_from_log(
+            ctx.repo_root,
+            ctx.config.issue,
+            exit_code,
+            postmortem_summary=postmortem_summary,
         )
-
-        # Check builder log for MCP failure markers before accepting the
-        # generic unknown_failure class.  MCP failures are infrastructure
-        # issues (server init, resource contention) that should not count
-        # against the issue itself.  See issue #2768.
-        try:
-            import re
-
-            from loom_tools.common.paths import LoomPaths
-            from loom_tools.shepherd.phases.base import MCP_FAILURE_PATTERNS
-
-            log_path = LoomPaths(ctx.repo_root).builder_log_file(ctx.config.issue)
-            if log_path.is_file():
-                content = log_path.read_text()
-                for pattern in MCP_FAILURE_PATTERNS:
-                    if re.search(pattern, content, re.IGNORECASE):
-                        error_class = "mcp_infrastructure_failure"
-                        details = f"Builder failed due to MCP server failure (exit code {exit_code}, fallback cleanup)"
-                        break
-        except Exception:
-            pass  # Best-effort — fall through to unknown_failure
 
     try:
         # Skip systematic failure recording if a PR already exists for this

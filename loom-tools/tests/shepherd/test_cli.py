@@ -14,6 +14,7 @@ import pytest
 from loom_tools.shepherd.cli import (
     _auto_navigate_out_of_worktree,
     _check_main_repo_clean,
+    _classify_exit1_failure_from_log,
     _cleanup_labels_on_failure,
     _cleanup_pr_labels_on_failure,
     _find_source_issues_for_dirty_files,
@@ -5170,6 +5171,351 @@ class TestCleanupFallbackIntegration:
 
         mock_comment.assert_called_once_with(ctx, ShepherdExitCode.SYSTEMIC_FAILURE)
         mock_record.assert_called_once_with(ctx, ShepherdExitCode.SYSTEMIC_FAILURE)
+
+
+class TestClassifyExit1FailureFromLog:
+    """Tests for _classify_exit1_failure_from_log (issue #2912)."""
+
+    def test_returns_rate_limit_abort_when_sentinel_present(self, tmp_path: Path) -> None:
+        """Should return rate_limit_abort when RATE_LIMIT_ABORT sentinel is in log."""
+        logs_dir = tmp_path / ".loom" / "logs"
+        logs_dir.mkdir(parents=True)
+        log_file = logs_dir / "loom-builder-issue-42.log"
+        log_file.write_text("Starting session...\n# RATE_LIMIT_ABORT\nExiting.")
+
+        error_class, details = _classify_exit1_failure_from_log(tmp_path, 42, 1)
+
+        assert error_class == "rate_limit_abort"
+        assert "usage/plan limit" in details
+        assert "exit code 1" in details
+
+    def test_returns_auth_failure_when_sentinel_present(self, tmp_path: Path) -> None:
+        """Should return auth_infrastructure_failure when AUTH_PREFLIGHT_FAILED sentinel is in log."""
+        logs_dir = tmp_path / ".loom" / "logs"
+        logs_dir.mkdir(parents=True)
+        log_file = logs_dir / "loom-builder-issue-42.log"
+        log_file.write_text("Starting session...\n# AUTH_PREFLIGHT_FAILED\nExiting.")
+
+        error_class, details = _classify_exit1_failure_from_log(tmp_path, 42, 1)
+
+        assert error_class == "auth_infrastructure_failure"
+        assert "auth" in details.lower()
+        assert "exit code 1" in details
+
+    def test_returns_mcp_failure_when_mcp_pattern_present(self, tmp_path: Path) -> None:
+        """Should return mcp_infrastructure_failure when MCP failure pattern is in log."""
+        logs_dir = tmp_path / ".loom" / "logs"
+        logs_dir.mkdir(parents=True)
+        log_file = logs_dir / "loom-builder-issue-42.log"
+        log_file.write_text("Starting session...\nMCP server failed to initialize\nExiting.")
+
+        error_class, details = _classify_exit1_failure_from_log(tmp_path, 42, 1)
+
+        assert error_class == "mcp_infrastructure_failure"
+        assert "MCP" in details
+        assert "exit code 1" in details
+
+    def test_returns_unknown_failure_when_no_pattern_matches(self, tmp_path: Path) -> None:
+        """Should return builder_unknown_failure when no pattern matches."""
+        logs_dir = tmp_path / ".loom" / "logs"
+        logs_dir.mkdir(parents=True)
+        log_file = logs_dir / "loom-builder-issue-42.log"
+        log_file.write_text("Starting session...\nSome unknown error\nExiting.")
+
+        error_class, details = _classify_exit1_failure_from_log(tmp_path, 42, 1)
+
+        assert error_class == "builder_unknown_failure"
+        assert "exit code 1" in details
+
+    def test_returns_unknown_failure_when_log_missing(self, tmp_path: Path) -> None:
+        """Should return builder_unknown_failure when log file does not exist."""
+        error_class, details = _classify_exit1_failure_from_log(tmp_path, 42, 1)
+
+        assert error_class == "builder_unknown_failure"
+        assert "exit code 1" in details
+
+    def test_includes_postmortem_in_unknown_failure(self, tmp_path: Path) -> None:
+        """Should include postmortem summary in unknown_failure details."""
+        error_class, details = _classify_exit1_failure_from_log(
+            tmp_path, 42, 1, postmortem_summary="CLI crashed on startup"
+        )
+
+        assert error_class == "builder_unknown_failure"
+        assert "post-mortem: CLI crashed on startup" in details
+
+    def test_rate_limit_takes_priority_over_auth(self, tmp_path: Path) -> None:
+        """Rate limit sentinel should take priority over auth sentinel."""
+        logs_dir = tmp_path / ".loom" / "logs"
+        logs_dir.mkdir(parents=True)
+        log_file = logs_dir / "loom-builder-issue-42.log"
+        # Both sentinels present — rate limit wins
+        log_file.write_text(
+            "# AUTH_PREFLIGHT_FAILED\nSome output\n# RATE_LIMIT_ABORT\n"
+        )
+
+        error_class, details = _classify_exit1_failure_from_log(tmp_path, 42, 1)
+
+        assert error_class == "rate_limit_abort"
+
+    def test_auth_takes_priority_over_mcp(self, tmp_path: Path) -> None:
+        """Auth sentinel should take priority over MCP patterns."""
+        logs_dir = tmp_path / ".loom" / "logs"
+        logs_dir.mkdir(parents=True)
+        log_file = logs_dir / "loom-builder-issue-42.log"
+        # Both auth sentinel and MCP pattern present — auth wins
+        log_file.write_text(
+            "# AUTH_PREFLIGHT_FAILED\nMCP server failed to initialize\n"
+        )
+
+        error_class, details = _classify_exit1_failure_from_log(tmp_path, 42, 1)
+
+        assert error_class == "auth_infrastructure_failure"
+
+    def test_survives_io_error(self, tmp_path: Path) -> None:
+        """Should return builder_unknown_failure on I/O errors (best-effort)."""
+        # Point at a non-existent deeply nested path to trigger I/O errors
+        error_class, details = _classify_exit1_failure_from_log(
+            tmp_path / "does" / "not" / "exist", 42, 1
+        )
+
+        assert error_class == "builder_unknown_failure"
+
+
+class TestRecordFallbackFailureLogClassification:
+    """Tests for log-based classification in _record_fallback_failure (issue #2912)."""
+
+    @patch("loom_tools.common.systematic_failure.detect_systematic_failure", return_value=None)
+    @patch("loom_tools.common.systematic_failure.record_blocked_reason")
+    def test_records_rate_limit_from_log(
+        self,
+        mock_record: MagicMock,
+        mock_detect: MagicMock,
+        tmp_path: Path,
+    ) -> None:
+        """Should classify as rate_limit_abort when RATE_LIMIT_ABORT sentinel is in builder log."""
+        logs_dir = tmp_path / ".loom" / "logs"
+        logs_dir.mkdir(parents=True)
+        log_file = logs_dir / "loom-builder-issue-42.log"
+        log_file.write_text("Starting...\n# RATE_LIMIT_ABORT\nExiting.")
+
+        ctx = MagicMock()
+        ctx.config.issue = 42
+        ctx.repo_root = tmp_path
+        ctx.last_postmortem = None
+
+        _record_fallback_failure(ctx, ShepherdExitCode.BUILDER_FAILED)
+
+        mock_record.assert_called_once_with(
+            tmp_path,
+            42,
+            error_class="rate_limit_abort",
+            phase="builder",
+            details=mock_record.call_args.kwargs["details"],
+        )
+        assert "rate_limit_abort" == mock_record.call_args.kwargs["error_class"]
+
+    @patch("loom_tools.common.systematic_failure.detect_systematic_failure", return_value=None)
+    @patch("loom_tools.common.systematic_failure.record_blocked_reason")
+    def test_records_auth_failure_from_log(
+        self,
+        mock_record: MagicMock,
+        mock_detect: MagicMock,
+        tmp_path: Path,
+    ) -> None:
+        """Should classify as auth_infrastructure_failure when AUTH_PREFLIGHT_FAILED is in builder log."""
+        logs_dir = tmp_path / ".loom" / "logs"
+        logs_dir.mkdir(parents=True)
+        log_file = logs_dir / "loom-builder-issue-42.log"
+        log_file.write_text("Starting...\n# AUTH_PREFLIGHT_FAILED\nExiting.")
+
+        ctx = MagicMock()
+        ctx.config.issue = 42
+        ctx.repo_root = tmp_path
+        ctx.last_postmortem = None
+
+        _record_fallback_failure(ctx, ShepherdExitCode.BUILDER_FAILED)
+
+        assert "auth_infrastructure_failure" == mock_record.call_args.kwargs["error_class"]
+
+
+class TestPostFallbackFailureCommentLogClassification:
+    """Tests for log-based comment generation in _post_fallback_failure_comment (issue #2912)."""
+
+    def test_mcp_failure_gives_infrastructure_advice(self, tmp_path: Path) -> None:
+        """Should give MCP infrastructure advice when MCP pattern detected in log."""
+        import subprocess
+
+        logs_dir = tmp_path / ".loom" / "logs"
+        logs_dir.mkdir(parents=True)
+        log_file = logs_dir / "loom-builder-issue-42.log"
+        log_file.write_text("Starting...\nMCP server failed to initialize\nExiting.")
+
+        ctx = MagicMock()
+        ctx.config.issue = 42
+        ctx.config.task_id = "abc123"
+        ctx.repo_root = tmp_path
+        ctx.abandonment_info = None
+
+        with patch("subprocess.run") as mock_subprocess:
+            _post_fallback_failure_comment(ctx, ShepherdExitCode.BUILDER_FAILED)
+
+        mock_subprocess.assert_called_once()
+        cmd_list = mock_subprocess.call_args[0][0]
+        body = cmd_list[cmd_list.index("--body") + 1]
+        assert "MCP" in body
+        assert "infrastructure" in body.lower()
+
+    def test_rate_limit_from_log_gives_rate_limit_advice(self, tmp_path: Path) -> None:
+        """Should give rate limit advice when RATE_LIMIT_ABORT detected in log."""
+        logs_dir = tmp_path / ".loom" / "logs"
+        logs_dir.mkdir(parents=True)
+        log_file = logs_dir / "loom-builder-issue-42.log"
+        log_file.write_text("Starting...\n# RATE_LIMIT_ABORT\nExiting.")
+
+        ctx = MagicMock()
+        ctx.config.issue = 42
+        ctx.config.task_id = "abc123"
+        ctx.repo_root = tmp_path
+        ctx.abandonment_info = None
+
+        with patch("subprocess.run") as mock_subprocess:
+            _post_fallback_failure_comment(ctx, ShepherdExitCode.BUILDER_FAILED)
+
+        mock_subprocess.assert_called_once()
+        cmd_list = mock_subprocess.call_args[0][0]
+        body = cmd_list[cmd_list.index("--body") + 1]
+        assert "rate limit" in body.lower()
+
+    def test_auth_failure_from_log_gives_infrastructure_advice(self, tmp_path: Path) -> None:
+        """Should give auth infrastructure advice when AUTH_PREFLIGHT_FAILED detected in log."""
+        logs_dir = tmp_path / ".loom" / "logs"
+        logs_dir.mkdir(parents=True)
+        log_file = logs_dir / "loom-builder-issue-42.log"
+        log_file.write_text("Starting...\n# AUTH_PREFLIGHT_FAILED\nExiting.")
+
+        ctx = MagicMock()
+        ctx.config.issue = 42
+        ctx.config.task_id = "abc123"
+        ctx.repo_root = tmp_path
+        ctx.abandonment_info = None
+
+        with patch("subprocess.run") as mock_subprocess:
+            _post_fallback_failure_comment(ctx, ShepherdExitCode.BUILDER_FAILED)
+
+        mock_subprocess.assert_called_once()
+        cmd_list = mock_subprocess.call_args[0][0]
+        body = cmd_list[cmd_list.index("--body") + 1]
+        assert "infrastructure" in body.lower()
+        assert "auth" in body.lower()
+
+
+class TestCleanupLabelsOnFailureMilestone:
+    """Tests for error milestone in _cleanup_labels_on_failure (issue #2912)."""
+
+    def _make_cleanup_ctx(
+        self,
+        issue_labels: set[str] | None = None,
+        repo_root: Path | None = None,
+    ) -> MagicMock:
+        ctx = MagicMock()
+        ctx.config.issue = 42
+        ctx.config.task_id = None
+        ctx.pr_number = None
+        ctx.repo_root = repo_root or Path("/fake/repo")
+        ctx.label_cache = MagicMock()
+        ctx.abandonment_info = None
+        if issue_labels is not None:
+            ctx.label_cache.get_issue_labels.return_value = issue_labels
+        return ctx
+
+    @patch("loom_tools.shepherd.cli._record_fallback_failure")
+    @patch("loom_tools.shepherd.cli._post_fallback_failure_comment")
+    @patch("loom_tools.shepherd.cli._cleanup_pr_labels_on_failure")
+    @patch("loom_tools.shepherd.cli.transition_issue_labels")
+    def test_reports_error_milestone_on_building_revert(
+        self,
+        mock_transition: MagicMock,
+        mock_pr_cleanup: MagicMock,
+        mock_comment: MagicMock,
+        mock_record: MagicMock,
+    ) -> None:
+        """Should call report_milestone('error', ...) when reverting loom:building to loom:issue."""
+        ctx = self._make_cleanup_ctx(issue_labels={"loom:building"})
+
+        _cleanup_labels_on_failure(ctx, ShepherdExitCode.BUILDER_FAILED)
+
+        ctx.report_milestone.assert_any_call(
+            "error",
+            error="builder_unknown_failure",
+            will_retry=False,
+        )
+
+    @patch("loom_tools.shepherd.cli._record_fallback_failure")
+    @patch("loom_tools.shepherd.cli._post_fallback_failure_comment")
+    @patch("loom_tools.shepherd.cli._cleanup_pr_labels_on_failure")
+    @patch("loom_tools.shepherd.cli.transition_issue_labels")
+    def test_reports_auth_infrastructure_failure_milestone_for_systemic(
+        self,
+        mock_transition: MagicMock,
+        mock_pr_cleanup: MagicMock,
+        mock_comment: MagicMock,
+        mock_record: MagicMock,
+    ) -> None:
+        """Should call report_milestone with auth_infrastructure_failure for systemic exit code."""
+        ctx = self._make_cleanup_ctx(issue_labels={"loom:building"})
+
+        _cleanup_labels_on_failure(ctx, ShepherdExitCode.SYSTEMIC_FAILURE)
+
+        ctx.report_milestone.assert_any_call(
+            "error",
+            error="auth_infrastructure_failure",
+            will_retry=False,
+        )
+
+    @patch("loom_tools.shepherd.cli._record_fallback_failure")
+    @patch("loom_tools.shepherd.cli._post_fallback_failure_comment")
+    @patch("loom_tools.shepherd.cli._cleanup_pr_labels_on_failure")
+    @patch("loom_tools.shepherd.cli.transition_issue_labels")
+    def test_reports_rate_limit_milestone_for_rate_limit_exit_code(
+        self,
+        mock_transition: MagicMock,
+        mock_pr_cleanup: MagicMock,
+        mock_comment: MagicMock,
+        mock_record: MagicMock,
+    ) -> None:
+        """Should call report_milestone with rate_limit_abort for RATE_LIMIT_ABORT exit code."""
+        ctx = self._make_cleanup_ctx(issue_labels={"loom:building"})
+
+        _cleanup_labels_on_failure(ctx, ShepherdExitCode.RATE_LIMIT_ABORT)
+
+        ctx.report_milestone.assert_any_call(
+            "error",
+            error="rate_limit_abort",
+            will_retry=False,
+        )
+
+    @patch("loom_tools.shepherd.cli._record_fallback_failure")
+    @patch("loom_tools.shepherd.cli._post_fallback_failure_comment")
+    @patch("loom_tools.shepherd.cli._cleanup_pr_labels_on_failure")
+    @patch("loom_tools.shepherd.cli.transition_issue_labels")
+    def test_no_milestone_when_no_building_label(
+        self,
+        mock_transition: MagicMock,
+        mock_pr_cleanup: MagicMock,
+        mock_comment: MagicMock,
+        mock_record: MagicMock,
+    ) -> None:
+        """Should NOT call report_milestone when loom:building is not present."""
+        ctx = self._make_cleanup_ctx(issue_labels={"loom:blocked"})
+
+        _cleanup_labels_on_failure(ctx, ShepherdExitCode.BUILDER_FAILED)
+
+        # report_milestone("error", ...) should NOT have been called
+        error_calls = [
+            c for c in ctx.report_milestone.call_args_list
+            if c[0] and c[0][0] == "error"
+        ]
+        assert len(error_calls) == 0
 
 
 class TestRebaseBeforeDoctor:
