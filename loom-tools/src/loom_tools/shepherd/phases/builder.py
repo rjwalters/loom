@@ -3357,12 +3357,50 @@ class BuilderPhase:
         return paths.builder_log_file(ctx.config.issue)
 
     @staticmethod
+    def _get_repo_root_branch(ctx: ShepherdContext) -> str | None:
+        """Return the current branch name at repo_root, or None on failure."""
+        result = subprocess.run(
+            ["git", "-C", str(ctx.repo_root), "rev-parse", "--abbrev-ref", "HEAD"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            return result.stdout.strip()
+        return None
+
+    @staticmethod
+    def _get_default_branch(ctx: ShepherdContext) -> str:
+        """Return the default branch name (e.g. 'main') for the repo."""
+        result = subprocess.run(
+            ["git", "-C", str(ctx.repo_root), "symbolic-ref", "refs/remotes/origin/HEAD"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            return result.stdout.strip().replace("refs/remotes/origin/", "")
+        return "main"
+
+    @staticmethod
     def _snapshot_main_dirty(ctx: ShepherdContext) -> set[str]:
         """Snapshot main's dirty files (git status --porcelain lines).
 
         Called before the builder spawns so that _gather_diagnostics can
         distinguish pre-existing dirt from new files added by a worktree escape.
+
+        Returns an empty set when the repo root is not on the default branch —
+        dirty files on a non-main branch are not evidence of a builder worktree
+        escape and should never trigger the escape-detection logic.
         """
+        # Only snapshot when the repo root is actually on the default branch.
+        # If the shepherd is running on a feature/maintenance branch, staged
+        # changes on that branch must not be mistaken for a worktree escape.
+        current_branch = BuilderPhase._get_repo_root_branch(ctx)
+        default_branch = BuilderPhase._get_default_branch(ctx)
+        if current_branch is not None and current_branch != default_branch:
+            return set()
+
         result = subprocess.run(
             ["git", "-C", str(ctx.repo_root), "status", "--porcelain"],
             capture_output=True,
@@ -3471,7 +3509,17 @@ class BuilderPhase:
         return None
 
     def _get_new_main_dirty_files(self, ctx: ShepherdContext) -> list[str]:
-        """Return list of NEW dirty files on main since baseline snapshot."""
+        """Return list of NEW dirty files on main since baseline snapshot.
+
+        Returns an empty list when the repo root is not on the default branch.
+        Dirty files on non-main branches (e.g. guide maintenance branches) are
+        not evidence of a builder worktree escape — see issue #2971.
+        """
+        current_branch = self._get_repo_root_branch(ctx)
+        default_branch = self._get_default_branch(ctx)
+        if current_branch is not None and current_branch != default_branch:
+            return []
+
         main_status = subprocess.run(
             ["git", "-C", str(ctx.repo_root), "status", "--porcelain"],
             capture_output=True, text=True, check=False,
@@ -3865,17 +3913,29 @@ class BuilderPhase:
         # Check if the builder accidentally modified files on main instead
         # of in the worktree.  Only flag files that are NEW since the builder
         # started — pre-existing dirty files are not evidence of escape.
-        main_status = subprocess.run(
-            ["git", "-C", str(ctx.repo_root), "status", "--porcelain"],
-            capture_output=True,
-            text=True,
-            check=False,
+        #
+        # Skip entirely when the repo root is not on the default branch.
+        # Dirty files on a non-main branch (e.g. a guide maintenance branch)
+        # are completely unrelated to the builder and must not be flagged as
+        # a worktree escape.  See issue #2971.
+        _repo_root_branch = self._get_repo_root_branch(ctx)
+        _default_branch = self._get_default_branch(ctx)
+        _on_default_branch = (
+            _repo_root_branch is None or _repo_root_branch == _default_branch
         )
+
         main_dirty_files: list[str] = []
-        if main_status.returncode == 0 and main_status.stdout.strip():
-            main_dirty_files = [
-                line for line in main_status.stdout.splitlines() if line
-            ]
+        if _on_default_branch:
+            main_status = subprocess.run(
+                ["git", "-C", str(ctx.repo_root), "status", "--porcelain"],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            if main_status.returncode == 0 and main_status.stdout.strip():
+                main_dirty_files = [
+                    line for line in main_status.stdout.splitlines() if line
+                ]
 
         # Filter out pre-existing dirty files using the baseline snapshot
         if self._main_dirty_baseline is not None:
