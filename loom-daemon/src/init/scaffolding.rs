@@ -14,6 +14,13 @@ use super::InitReport;
 pub const LOOM_SECTION_START: &str = "<!-- BEGIN LOOM ORCHESTRATION -->";
 pub const LOOM_SECTION_END: &str = "<!-- END LOOM ORCHESTRATION -->";
 
+/// The short pointer injected into root CLAUDE.md (between section markers).
+///
+/// The full Loom guide is written to `.loom/CLAUDE.md` in the target repo.
+/// Claude Code auto-discovers `.loom/CLAUDE.md` when agents work in
+/// `.loom/worktrees/issue-N/` via ancestor directory traversal.
+pub const LOOM_ROOT_POINTER: &str = "This repository uses [Loom](https://github.com/rjwalters/loom) for AI-powered development orchestration. See `.loom/CLAUDE.md` for the full guide (roles, labels, worktrees, configuration).";
+
 /// Wrap Loom content in section markers
 pub fn wrap_loom_content(content: &str) -> String {
     format!("{}\n{}\n{}", LOOM_SECTION_START, content.trim(), LOOM_SECTION_END)
@@ -29,11 +36,13 @@ pub fn wrap_loom_content(content: &str) -> String {
 ///   - `{{REPO_OWNER}}`, `{{REPO_NAME}}`: Repository info from git remote
 ///   - `{{LOOM_VERSION}}`, `{{LOOM_COMMIT}}`, `{{INSTALL_DATE}}`: Loom installation metadata
 ///
-/// **CLAUDE.md Preservation**:
-/// - If existing CLAUDE.md has Loom section markers, only the marked section is replaced
-/// - If existing CLAUDE.md has no markers, Loom section is appended at the end
-/// - Loom content is wrapped in `<!-- BEGIN LOOM ORCHESTRATION -->` markers
-/// - All existing content is preserved exactly as-is
+/// **CLAUDE.md Handling**:
+/// - Full Loom guide is written to `<workspace>/.loom/CLAUDE.md` (with template substitution)
+/// - Only a short pointer is injected into root `CLAUDE.md` (between Loom section markers)
+/// - If existing root CLAUDE.md has Loom section markers, only the marked section is replaced
+/// - If existing root CLAUDE.md has no markers, Loom pointer is appended at the end
+/// - All existing root CLAUDE.md content is preserved exactly as-is
+/// - Claude Code auto-discovers `.loom/CLAUDE.md` in `.loom/worktrees/issue-N/` via ancestor dirs
 ///
 /// Custom files (files in workspace that don't exist in defaults) are always preserved.
 #[allow(clippy::too_many_lines)]
@@ -77,22 +86,20 @@ pub fn setup_repository_scaffolding(
             Ok(())
         };
 
-    // Copy target-repo-specific CLAUDE.md from defaults/.loom/
-    // (NOT defaults/CLAUDE.md which is for Loom repo itself)
-    // This file contains template variables that need to be substituted
+    // Handle Loom CLAUDE.md content:
     //
-    // CLAUDE.md Preservation Logic:
-    // - If existing CLAUDE.md has section markers, replace only the marked section
-    // - If existing CLAUDE.md has no markers, append Loom section at the end
-    // - Loom content is wrapped in section markers for future updates
-    // - All existing content is preserved exactly as-is
+    // 1. Write full Loom guide to `<workspace>/.loom/CLAUDE.md` (template substituted)
+    //    - Claude Code discovers this automatically when agents work in worktrees
+    //    - Always written on install/reinstall (overwrite on reinstall to get latest content)
+    //
+    // 2. Inject short pointer into root `CLAUDE.md` (between Loom section markers)
+    //    - Keeps root CLAUDE.md minimal — saves context budget for non-Loom sessions
+    //    - If existing root has markers, only the marked section is replaced
+    //    - If existing root has no markers, pointer is appended at the end
     let claude_md_src = defaults_path.join(".loom").join("CLAUDE.md");
-    let claude_md_dst = workspace_path.join("CLAUDE.md");
 
     if claude_md_src.exists() {
-        let existed = claude_md_dst.exists();
-
-        // Read the new Loom template content
+        // Read the Loom template content
         let loom_content = fs::read_to_string(&claude_md_src)
             .map_err(|e| format!("Failed to read CLAUDE.md template: {e}"))?;
 
@@ -104,8 +111,30 @@ pub fn setup_repository_scaffolding(
             &loom_metadata,
         );
 
-        // Wrap Loom content in section markers
-        let wrapped_loom = wrap_loom_content(&loom_substituted);
+        // --- Step 1: Write full guide to .loom/CLAUDE.md ---
+        let loom_dir = workspace_path.join(".loom");
+        // .loom/ should already exist (created earlier in initialize_workspace),
+        // but create it if it doesn't to be safe.
+        if !loom_dir.exists() {
+            fs::create_dir_all(&loom_dir)
+                .map_err(|e| format!("Failed to create .loom directory: {e}"))?;
+        }
+        let loom_claude_md_dst = loom_dir.join("CLAUDE.md");
+        let loom_claude_md_existed = loom_claude_md_dst.exists();
+        fs::write(&loom_claude_md_dst, &loom_substituted)
+            .map_err(|e| format!("Failed to write .loom/CLAUDE.md: {e}"))?;
+        if loom_claude_md_existed {
+            report.updated.push(".loom/CLAUDE.md".to_string());
+        } else {
+            report.added.push(".loom/CLAUDE.md".to_string());
+        }
+
+        // --- Step 2: Inject short pointer into root CLAUDE.md ---
+        let claude_md_dst = workspace_path.join("CLAUDE.md");
+        let existed = claude_md_dst.exists();
+
+        // The pointer is a single-line description wrapped in section markers
+        let wrapped_pointer = wrap_loom_content(LOOM_ROOT_POINTER);
 
         let final_content = if existed {
             // Read existing content
@@ -114,7 +143,7 @@ pub fn setup_repository_scaffolding(
 
             // Check if existing file already has Loom section markers
             if existing_content.contains(LOOM_SECTION_START) {
-                // Replace just the Loom section, preserve everything else
+                // Replace just the Loom section with the pointer, preserve everything else
                 if let (Some(start_idx), Some(end_idx)) = (
                     existing_content.find(LOOM_SECTION_START),
                     existing_content.find(LOOM_SECTION_END),
@@ -127,37 +156,36 @@ pub fn setup_repository_scaffolding(
                         ""
                     };
 
-                    format!("{}{}{}", before.trim_end(), wrapped_loom, after)
+                    format!("{}{}{}", before.trim_end(), wrapped_pointer, after)
                 } else {
-                    // Malformed markers - append at end
-                    format!("{}\n\n{}", existing_content.trim(), wrapped_loom)
+                    // Malformed markers - append pointer at end
+                    format!("{}\n\n{}", existing_content.trim(), wrapped_pointer)
                 }
             } else {
-                // No markers exist - append Loom section at end
-                format!("{}\n\n{}", existing_content.trim(), wrapped_loom)
+                // No markers exist - append Loom pointer at end
+                format!("{}\n\n{}", existing_content.trim(), wrapped_pointer)
             }
         } else {
-            // New file - just use wrapped Loom content
-            wrapped_loom
+            // New file - just use wrapped pointer
+            wrapped_pointer
         };
 
-        // Only write if we're creating new or updating
-        if !existed {
-            fs::write(&claude_md_dst, &final_content)
-                .map_err(|e| format!("Failed to write CLAUDE.md: {e}"))?;
-            report.added.push("CLAUDE.md".to_string());
-        } else if force || final_content != fs::read_to_string(&claude_md_dst).unwrap_or_default() {
-            // Check if content actually changed to avoid unnecessary writes
+        // Only write if we're creating new or content changed
+        if existed {
             let current = fs::read_to_string(&claude_md_dst).unwrap_or_default();
             if final_content != current {
                 fs::write(&claude_md_dst, &final_content)
                     .map_err(|e| format!("Failed to write CLAUDE.md: {e}"))?;
-                if existed && !report.preserved.contains(&"CLAUDE.md".to_string()) {
+                if !report.preserved.contains(&"CLAUDE.md".to_string()) {
                     report.updated.push("CLAUDE.md".to_string());
                 }
             } else if !report.preserved.contains(&"CLAUDE.md".to_string()) {
                 report.preserved.push("CLAUDE.md".to_string());
             }
+        } else {
+            fs::write(&claude_md_dst, &final_content)
+                .map_err(|e| format!("Failed to write CLAUDE.md: {e}"))?;
+            report.added.push("CLAUDE.md".to_string());
         }
     }
 
@@ -468,6 +496,77 @@ mod tests {
         assert!(!content.contains("loom-workspace"));
     }
 
+    /// Helper to create a standard test setup with a CLAUDE.md template in defaults
+    fn setup_test_with_claude_template(
+        temp_dir: &TempDir,
+        template_content: &str,
+    ) -> (std::path::PathBuf, std::path::PathBuf) {
+        let workspace = temp_dir.path().to_path_buf();
+        let defaults = temp_dir.path().join("defaults");
+
+        // Setup git repo
+        fs::create_dir(workspace.join(".git")).unwrap();
+
+        // Create defaults with CLAUDE.md template
+        fs::create_dir_all(defaults.join(".loom")).unwrap();
+        fs::write(defaults.join(".loom").join("CLAUDE.md"), template_content).unwrap();
+
+        (workspace, defaults)
+    }
+
+    #[test]
+    fn test_loom_claude_md_written_to_loom_dir() {
+        // Verifies full content goes to .loom/CLAUDE.md on fresh install
+        let temp_dir = TempDir::new().unwrap();
+        let (workspace, defaults) = setup_test_with_claude_template(
+            &temp_dir,
+            "# Loom Orchestration - Repository Guide\n\nFull guide content here.",
+        );
+
+        // Pre-create .loom/ dir (as initialize_workspace normally does)
+        fs::create_dir_all(workspace.join(".loom")).unwrap();
+
+        // Run setup
+        let mut report = InitReport::default();
+        setup_repository_scaffolding(&workspace, &defaults, false, &mut report).unwrap();
+
+        // Verify .loom/CLAUDE.md was created with full guide content
+        assert!(workspace.join(".loom").join("CLAUDE.md").exists());
+        let loom_claude_content =
+            fs::read_to_string(workspace.join(".loom").join("CLAUDE.md")).unwrap();
+        assert!(loom_claude_content.contains("Loom Orchestration - Repository Guide"));
+        assert!(loom_claude_content.contains("Full guide content here"));
+        assert!(report.added.contains(&".loom/CLAUDE.md".to_string()));
+    }
+
+    #[test]
+    fn test_root_claude_md_contains_only_pointer() {
+        // Verifies root CLAUDE.md has short pointer, not full guide, on fresh install
+        let temp_dir = TempDir::new().unwrap();
+        let (workspace, defaults) = setup_test_with_claude_template(
+            &temp_dir,
+            "# Loom Orchestration - Repository Guide\n\nFull guide content here.",
+        );
+
+        fs::create_dir_all(workspace.join(".loom")).unwrap();
+
+        // No existing root CLAUDE.md
+        assert!(!workspace.join("CLAUDE.md").exists());
+
+        let mut report = InitReport::default();
+        setup_repository_scaffolding(&workspace, &defaults, false, &mut report).unwrap();
+
+        // Verify root CLAUDE.md has only the pointer, not the full guide
+        assert!(workspace.join("CLAUDE.md").exists());
+        let root_content = fs::read_to_string(workspace.join("CLAUDE.md")).unwrap();
+        assert!(root_content.contains(LOOM_SECTION_START));
+        assert!(root_content.contains(LOOM_SECTION_END));
+        assert!(root_content.contains(LOOM_ROOT_POINTER));
+        // Full guide content must NOT be in root CLAUDE.md
+        assert!(!root_content.contains("Full guide content here"));
+        assert!(report.added.contains(&"CLAUDE.md".to_string()));
+    }
+
     #[test]
     fn test_claude_md_preservation_new_install() {
         let temp_dir = TempDir::new().unwrap();
@@ -485,20 +584,30 @@ mod tests {
         )
         .unwrap();
 
-        // No existing CLAUDE.md in workspace
+        // Pre-create .loom/ dir
+        fs::create_dir_all(workspace.join(".loom")).unwrap();
+
+        // No existing root CLAUDE.md in workspace
         assert!(!workspace.join("CLAUDE.md").exists());
 
         // Run setup
         let mut report = InitReport::default();
         setup_repository_scaffolding(workspace, &defaults, false, &mut report).unwrap();
 
-        // Verify CLAUDE.md was created with section markers
+        // Verify root CLAUDE.md was created with section markers and short pointer only
         assert!(workspace.join("CLAUDE.md").exists());
         let content = fs::read_to_string(workspace.join("CLAUDE.md")).unwrap();
         assert!(content.contains(LOOM_SECTION_START));
         assert!(content.contains(LOOM_SECTION_END));
-        assert!(content.contains("Loom Orchestration"));
+        assert!(content.contains(LOOM_ROOT_POINTER));
+        // Full content must be absent from root
+        assert!(!content.contains("Loom content here"));
         assert!(report.added.contains(&"CLAUDE.md".to_string()));
+
+        // Verify .loom/CLAUDE.md was created with full content
+        assert!(workspace.join(".loom").join("CLAUDE.md").exists());
+        let loom_content = fs::read_to_string(workspace.join(".loom").join("CLAUDE.md")).unwrap();
+        assert!(loom_content.contains("Loom content here"));
     }
 
     #[test]
@@ -518,6 +627,8 @@ mod tests {
         )
         .unwrap();
 
+        fs::create_dir_all(workspace.join(".loom")).unwrap();
+
         // Create existing CLAUDE.md with project-specific content (no markers)
         fs::write(
             workspace.join("CLAUDE.md"),
@@ -531,17 +642,19 @@ Run `cargo run` to start.",
         )
         .unwrap();
 
-        // Run setup - Loom section should be appended at end
+        // Run setup - Loom pointer should be appended at end
         let mut report = InitReport::default();
         setup_repository_scaffolding(workspace, &defaults, false, &mut report).unwrap();
 
-        // Verify existing content was preserved and Loom section appended
+        // Verify existing content was preserved and Loom pointer appended
         let content = fs::read_to_string(workspace.join("CLAUDE.md")).unwrap();
         assert!(content.contains("My Awesome Project"));
         assert!(content.contains("amazing things with Rust"));
         assert!(content.contains(LOOM_SECTION_START));
         assert!(content.contains(LOOM_SECTION_END));
-        assert!(content.contains("Loom Orchestration"));
+        assert!(content.contains(LOOM_ROOT_POINTER));
+        // Full Loom guide must NOT be in root
+        assert!(!content.contains("New Loom content"));
 
         // Project content should come BEFORE Loom section (appended at end)
         let project_pos = content.find("My Awesome Project").unwrap();
@@ -568,6 +681,8 @@ Run `cargo run` to start.",
             "# Loom Orchestration - Repository Guide\n\nLoom content here.",
         )
         .unwrap();
+
+        fs::create_dir_all(workspace.join(".loom")).unwrap();
 
         // Create existing CLAUDE.md WITHOUT markers (e.g., from previous install or manual creation)
         fs::write(
@@ -597,10 +712,12 @@ WARNING: Never run `lake build` inside Docker - causes memory corruption.
         assert!(content.contains("Docker Build Safety"));
         assert!(content.contains("Custom Agents"));
 
-        // Verify Loom section was appended at end with markers
+        // Verify Loom pointer was appended at end with markers
         assert!(content.contains(LOOM_SECTION_START));
         assert!(content.contains(LOOM_SECTION_END));
-        assert!(content.contains("Loom Orchestration"));
+        assert!(content.contains(LOOM_ROOT_POINTER));
+        // Full guide must NOT be in root
+        assert!(!content.contains("Loom content here"));
 
         // Verify order: project content comes BEFORE Loom section
         let project_pos = content.find("Lean Genius Project").unwrap();
@@ -620,7 +737,7 @@ WARNING: Never run `lake build` inside Docker - causes memory corruption.
         // Setup git repo
         fs::create_dir(workspace.join(".git")).unwrap();
 
-        // Create defaults with NEW CLAUDE.md template
+        // Create defaults with CLAUDE.md template (simulating upgrade)
         fs::create_dir_all(defaults.join(".loom")).unwrap();
         fs::write(
             defaults.join(".loom").join("CLAUDE.md"),
@@ -628,7 +745,10 @@ WARNING: Never run `lake build` inside Docker - causes memory corruption.
         )
         .unwrap();
 
-        // Create existing CLAUDE.md with markers (previous install)
+        fs::create_dir_all(workspace.join(".loom")).unwrap();
+
+        // Create existing CLAUDE.md with markers (previous install had full guide in root)
+        // This simulates upgrading from old install where full guide was in root CLAUDE.md
         let existing = format!(
             "# My Project\n\nProject docs here.\n\n{LOOM_SECTION_START}\n# Loom Orchestration - Repository Guide\n\nOld Loom content v1.0.\n{LOOM_SECTION_END}"
         );
@@ -638,12 +758,16 @@ WARNING: Never run `lake build` inside Docker - causes memory corruption.
         let mut report = InitReport::default();
         setup_repository_scaffolding(workspace, &defaults, true, &mut report).unwrap();
 
-        // Verify project content was preserved, Loom section was updated
+        // Verify project content was preserved, Loom section was replaced with short pointer
         let content = fs::read_to_string(workspace.join("CLAUDE.md")).unwrap();
         assert!(content.contains("My Project"));
         assert!(content.contains("Project docs here"));
-        assert!(content.contains("UPDATED Loom content v2.0"));
+        // Old full guide content must be gone from root
         assert!(!content.contains("Old Loom content v1.0"));
+        // Updated full guide must also NOT be in root
+        assert!(!content.contains("UPDATED Loom content v2.0"));
+        // Root should now have the short pointer
+        assert!(content.contains(LOOM_ROOT_POINTER));
 
         // Should only have ONE set of markers
         assert_eq!(
@@ -656,6 +780,43 @@ WARNING: Never run `lake build` inside Docker - causes memory corruption.
             1,
             "Should have exactly one end marker"
         );
+
+        // Updated full guide content must be in .loom/CLAUDE.md
+        let loom_content = fs::read_to_string(workspace.join(".loom").join("CLAUDE.md")).unwrap();
+        assert!(loom_content.contains("UPDATED Loom content v2.0"));
+    }
+
+    #[test]
+    fn test_loom_claude_md_updated_on_reinstall() {
+        // Verifies .loom/CLAUDE.md is overwritten on reinstall with new template content
+        let temp_dir = TempDir::new().unwrap();
+        let workspace = temp_dir.path();
+        let defaults = temp_dir.path().join("defaults");
+
+        fs::create_dir(workspace.join(".git")).unwrap();
+        fs::create_dir_all(defaults.join(".loom")).unwrap();
+        fs::write(
+            defaults.join(".loom").join("CLAUDE.md"),
+            "# Loom Orchestration\n\nUpdated content v2.",
+        )
+        .unwrap();
+
+        // Pre-existing .loom/CLAUDE.md from previous install
+        fs::create_dir_all(workspace.join(".loom")).unwrap();
+        fs::write(
+            workspace.join(".loom").join("CLAUDE.md"),
+            "# Loom Orchestration\n\nOld content v1.",
+        )
+        .unwrap();
+
+        let mut report = InitReport::default();
+        setup_repository_scaffolding(workspace, &defaults, false, &mut report).unwrap();
+
+        // Verify .loom/CLAUDE.md was updated with new content
+        let loom_content = fs::read_to_string(workspace.join(".loom").join("CLAUDE.md")).unwrap();
+        assert!(loom_content.contains("Updated content v2"));
+        assert!(!loom_content.contains("Old content v1"));
+        assert!(report.updated.contains(&".loom/CLAUDE.md".to_string()));
     }
 
     #[test]

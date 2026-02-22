@@ -782,6 +782,13 @@ if [[ -f "$WORKTREE_ABS/CLAUDE.md" ]]; then
   fi
 fi
 
+# Handle .loom/CLAUDE.md - remove the full Loom guide written by install
+if [[ -f "$WORKTREE_ABS/.loom/CLAUDE.md" ]]; then
+  rm -f "$WORKTREE_ABS/.loom/CLAUDE.md"
+  REMOVED_LIST+=(".loom/CLAUDE.md")
+  success ".loom/CLAUDE.md removed"
+fi
+
 # Handle .gitignore - remove Loom-specific patterns
 if [[ -f "$WORKTREE_ABS/.gitignore" ]]; then
   info "Removing Loom patterns from .gitignore..."
