@@ -474,9 +474,16 @@ def get_pr_for_issue(
 
     Tries in order:
     1. Branch name: feature/issue-{issue}
-    2. Body search: "Closes #{issue}"
+    2. Body search: "Closes #{issue}" (open/all states only — see note below)
     3. Body search: "Fixes #{issue}"
     4. Body search: "Resolves #{issue}"
+
+    Note: Body search is skipped when state="merged". GitHub's search engine
+    indexes cross-repo references in PR bodies (e.g. dependabot changelogs
+    contain "tauri-apps/plugins-workspace/issues/2858" which GitHub indexes
+    as "#2858"), causing false positives. For merged PRs, Loom always creates
+    the feature/issue-{issue} branch, so the branch-based lookup is sufficient
+    and deterministic.
 
     Returns PR number if found, None otherwise.
     """
@@ -508,7 +515,14 @@ def get_pr_for_issue(
         except ValueError:
             pass
 
-    # Methods 2-4: Search body for linking keywords (has indexing lag)
+    # Methods 2-4: Search body for linking keywords (has indexing lag).
+    # Skip for merged PRs: body search produces false positives from
+    # cross-repo references in dependabot changelogs and similar PR bodies.
+    # For merged PRs, branch-based lookup (above) is sufficient because Loom
+    # always uses the feature/issue-{issue} branch naming convention.
+    if state == "merged":
+        return None
+
     for pattern in [f"Closes #{issue}", f"Fixes #{issue}", f"Resolves #{issue}"]:
         output = _run(
             [

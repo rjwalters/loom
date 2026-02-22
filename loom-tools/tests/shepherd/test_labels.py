@@ -7,6 +7,7 @@ from unittest.mock import patch
 
 from loom_tools.shepherd.labels import (
     LabelCache,
+    get_pr_for_issue,
     transition_labels,
     transition_issue_labels,
     transition_pr_labels,
@@ -355,3 +356,130 @@ class TestAtomicLabelTransitions:
 
             mock_run.assert_called_once()
             assert mock_run.call_args[1]["cwd"] == repo_root
+
+
+class TestGetPrForIssue:
+    """Tests for get_pr_for_issue false-positive prevention."""
+
+    def _make_run(self, branch_result: str, body_result: str):
+        """Return a mock gh_run side_effect that simulates branch and body searches."""
+
+        def _side_effect(args, check=True, cwd=None):
+            mock = type("MockResult", (), {})()
+            mock.returncode = 0
+            # Branch-based lookup uses --head flag
+            if "--head" in args:
+                mock.stdout = branch_result + "\n"
+            else:
+                mock.stdout = body_result + "\n"
+            return mock
+
+        return _side_effect
+
+    def test_merged_state_skips_body_search_when_branch_found(self) -> None:
+        """For state='merged', branch lookup succeeds and body search is never called."""
+        call_args_list = []
+
+        def _side_effect(args, check=True, cwd=None):
+            call_args_list.append(args)
+            mock = type("MockResult", (), {})()
+            mock.returncode = 0
+            # Branch lookup returns a PR number
+            mock.stdout = "848\n"
+            return mock
+
+        with patch("loom_tools.shepherd.labels.gh_run", side_effect=_side_effect):
+            result = get_pr_for_issue(2858, state="merged")
+
+        assert result == 848
+        # Only one call (branch lookup) — no body search calls
+        assert len(call_args_list) == 1
+        assert "--head" in call_args_list[0]
+
+    def test_merged_state_skips_body_search_when_branch_not_found(self) -> None:
+        """For state='merged', body search is skipped even when branch lookup returns nothing.
+
+        This is the core fix for issue #2915: a dependabot PR with a cross-repo
+        reference to issue #2858 would previously be returned as a false positive.
+        """
+        call_args_list = []
+
+        def _side_effect(args, check=True, cwd=None):
+            call_args_list.append(args)
+            mock = type("MockResult", (), {})()
+            mock.returncode = 0
+            # Branch lookup finds nothing; body search would find 848 (dependabot false positive)
+            if "--head" in args:
+                mock.stdout = "\n"
+            else:
+                mock.stdout = "848\n"
+            return mock
+
+        with patch("loom_tools.shepherd.labels.gh_run", side_effect=_side_effect):
+            result = get_pr_for_issue(2858, state="merged")
+
+        # Must return None, not 848 (the false positive)
+        assert result is None
+        # Only one call (branch lookup) — body search never called for merged state
+        assert len(call_args_list) == 1
+        assert "--head" in call_args_list[0]
+
+    def test_open_state_still_uses_body_search(self) -> None:
+        """For state='open', body search is used as a fallback when branch lookup fails."""
+        call_args_list = []
+
+        def _side_effect(args, check=True, cwd=None):
+            call_args_list.append(args)
+            mock = type("MockResult", (), {})()
+            mock.returncode = 0
+            if "--head" in args:
+                mock.stdout = "\n"  # Branch lookup finds nothing
+            else:
+                mock.stdout = "123\n"  # Body search finds PR 123
+            return mock
+
+        with patch("loom_tools.shepherd.labels.gh_run", side_effect=_side_effect):
+            result = get_pr_for_issue(42, state="open")
+
+        assert result == 123
+        # Should have called branch lookup + at least one body search
+        assert len(call_args_list) >= 2
+        assert "--head" in call_args_list[0]
+        # Second call is body search (no --head flag)
+        assert "--head" not in call_args_list[1]
+
+    def test_branch_lookup_takes_precedence_over_body_search(self) -> None:
+        """Branch-based lookup result is returned before body search is attempted."""
+        call_args_list = []
+
+        def _side_effect(args, check=True, cwd=None):
+            call_args_list.append(args)
+            mock = type("MockResult", (), {})()
+            mock.returncode = 0
+            if "--head" in args:
+                mock.stdout = "999\n"  # Branch lookup succeeds
+            else:
+                mock.stdout = "888\n"  # Body search would return different PR
+            return mock
+
+        with patch("loom_tools.shepherd.labels.gh_run", side_effect=_side_effect):
+            result = get_pr_for_issue(42, state="open")
+
+        # Branch result (999) takes precedence over body search result (888)
+        assert result == 999
+        # Only one call made (branch lookup)
+        assert len(call_args_list) == 1
+
+    def test_returns_none_when_no_pr_found(self) -> None:
+        """Returns None when all search methods find nothing."""
+
+        def _side_effect(args, check=True, cwd=None):
+            mock = type("MockResult", (), {})()
+            mock.returncode = 0
+            mock.stdout = "\n"
+            return mock
+
+        with patch("loom_tools.shepherd.labels.gh_run", side_effect=_side_effect):
+            result = get_pr_for_issue(42, state="open")
+
+        assert result is None
