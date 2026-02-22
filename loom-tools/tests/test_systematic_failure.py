@@ -523,6 +523,133 @@ class TestClearFailuresForIssue:
         assert cleared == 0
 
 
+# ── force_mode exemption ─────────────────────────────────────────
+
+
+class TestForceModeExemption:
+    """Force-mode failures are excluded from systematic failure detection.
+
+    Running ``/shepherd N -m`` multiple times while debugging an issue
+    should not exhaust the systematic failure budget.  See issue #2897.
+    """
+
+    def test_force_mode_failures_not_counted(self, repo: pathlib.Path) -> None:
+        """Three consecutive force-mode failures do not trigger detection."""
+        for _ in range(3):
+            record_blocked_reason(
+                repo, 42, error_class="builder_stuck", phase="builder", force_mode=True
+            )
+
+        result = detect_systematic_failure(repo)
+        assert result is None, (
+            "Force-mode failures should not count toward systematic failure detection"
+        )
+
+    def test_force_mode_flag_stored_in_recent_failures(self, repo: pathlib.Path) -> None:
+        """Force-mode flag is persisted in the recent_failures entry."""
+        record_blocked_reason(
+            repo, 42, error_class="builder_stuck", phase="builder", force_mode=True
+        )
+        state = _read_state(repo)
+        entry = state["recent_failures"][-1]
+        assert entry.get("force_mode") is True
+
+    def test_non_force_failures_still_detected(self, repo: pathlib.Path) -> None:
+        """Normal (non-force) failures still trigger detection at threshold."""
+        for _ in range(3):
+            record_blocked_reason(
+                repo, 42, error_class="builder_stuck", phase="builder", force_mode=False
+            )
+
+        result = detect_systematic_failure(repo)
+        assert result is not None
+        assert result.pattern == "builder_stuck"
+
+    def test_mixed_force_and_normal_failures(self, repo: pathlib.Path) -> None:
+        """Only non-force failures count toward the threshold.
+
+        Two force-mode runs + two normal runs should not trigger detection
+        (threshold is 3 non-force consecutive failures).
+        """
+        record_blocked_reason(
+            repo, 42, error_class="builder_stuck", phase="builder", force_mode=True
+        )
+        record_blocked_reason(
+            repo, 42, error_class="builder_stuck", phase="builder", force_mode=True
+        )
+        record_blocked_reason(
+            repo, 42, error_class="builder_stuck", phase="builder", force_mode=False
+        )
+        record_blocked_reason(
+            repo, 42, error_class="builder_stuck", phase="builder", force_mode=False
+        )
+
+        # Only 2 non-force failures — below threshold of 3
+        result = detect_systematic_failure(repo)
+        assert result is None
+
+    def test_force_mode_followed_by_enough_normal_failures(
+        self, repo: pathlib.Path
+    ) -> None:
+        """Force-mode runs do not grant indefinite immunity.
+
+        After force-mode debugging, if normal failures accumulate up to the
+        threshold the issue still gets blocked.
+        """
+        # Two force-mode debug runs (should not count)
+        record_blocked_reason(
+            repo, 42, error_class="builder_stuck", phase="builder", force_mode=True
+        )
+        record_blocked_reason(
+            repo, 42, error_class="builder_stuck", phase="builder", force_mode=True
+        )
+        # Three normal failures — should trigger detection
+        for _ in range(3):
+            record_blocked_reason(
+                repo, 42, error_class="builder_stuck", phase="builder", force_mode=False
+            )
+
+        result = detect_systematic_failure(repo)
+        assert result is not None
+        assert result.pattern == "builder_stuck"
+
+    def test_clear_failures_preserves_force_mode_exclusion(
+        self, repo: pathlib.Path
+    ) -> None:
+        """After clearing issue failures, force-mode entries from other issues
+        remain excluded from detection."""
+        # Force-mode failure from issue 42 (will be cleared)
+        record_blocked_reason(
+            repo, 42, error_class="builder_stuck", phase="builder", force_mode=True
+        )
+        # Force-mode failure from issue 10 (will remain)
+        record_blocked_reason(
+            repo, 10, error_class="builder_stuck", phase="builder", force_mode=True
+        )
+        # Normal failure from issue 20 (will remain)
+        record_blocked_reason(
+            repo, 20, error_class="builder_stuck", phase="builder", force_mode=False
+        )
+
+        # Clear issue 42's failures
+        from loom_tools.common.systematic_failure import clear_failures_for_issue
+        clear_failures_for_issue(repo, 42)
+
+        # Only 1 non-force failure remains (issue 20) — below threshold
+        result = detect_systematic_failure(repo)
+        assert result is None
+
+    def test_default_force_mode_is_false(self, repo: pathlib.Path) -> None:
+        """record_blocked_reason without force_mode= defaults to False."""
+        record_blocked_reason(
+            repo, 42, error_class="builder_stuck", phase="builder"
+        )
+        state = _read_state(repo)
+        entry = state["recent_failures"][-1]
+        # force_mode key should be absent (not stored when False to save space)
+        assert entry.get("force_mode", False) is False
+
+
 # ── Integration: record + detect ─────────────────────────────────
 
 

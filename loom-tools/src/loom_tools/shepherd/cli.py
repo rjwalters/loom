@@ -1454,6 +1454,7 @@ def _mark_builder_test_failure(ctx: ShepherdContext) -> None:
         error_class="builder_test_failure",
         phase="builder",
         details="Builder test verification failed",
+        force_mode=ctx.config.is_force_mode,
     )
     detect_systematic_failure(ctx.repo_root)
 
@@ -1534,6 +1535,7 @@ def _mark_doctor_exhausted(
         error_class=error_class,
         phase="doctor",
         details=details,
+        force_mode=ctx.config.is_force_mode,
     )
     detect_systematic_failure(ctx.repo_root)
 
@@ -1620,6 +1622,7 @@ def _mark_judge_exhausted(ctx: ShepherdContext, retries: int) -> None:
         error_class="judge_exhausted",
         phase="judge",
         details=f"judge failed after {retries} retry attempt(s)",
+        force_mode=ctx.config.is_force_mode,
     )
     detect_systematic_failure(ctx.repo_root)
 
@@ -1842,6 +1845,7 @@ def _mark_builder_no_pr(ctx: ShepherdContext) -> None:
         error_class="builder_no_pr",
         phase="builder",
         details="Builder phase completed but no PR was created",
+        force_mode=ctx.config.is_force_mode,
     )
     detect_systematic_failure(ctx.repo_root)
 
@@ -1994,6 +1998,7 @@ def _mark_baseline_blocked(ctx: ShepherdContext, result: "PhaseResult") -> None:
         error_class="baseline_failing",
         phase="preflight",
         details=result.message,
+        force_mode=ctx.config.is_force_mode,
     )
     detect_systematic_failure(ctx.repo_root)
 
@@ -2400,6 +2405,7 @@ def _record_fallback_failure(ctx: ShepherdContext, exit_code: int) -> None:
             error_class=error_class,
             phase="builder",
             details=details,
+            force_mode=ctx.config.is_force_mode,
         )
         sf = detect_systematic_failure(ctx.repo_root)
 
