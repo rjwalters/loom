@@ -971,6 +971,15 @@ start_startup_monitor() {
                 if [[ -L "${agent_debug_log}" || -f "${agent_debug_log}" ]]; then
                     debug_log="${agent_debug_log}"
                 fi
+                # Record when we started monitoring (epoch seconds).  Used below to
+                # reject debug log hits from previous sessions: ~/.claude/debug/latest
+                # is a symlink that may still point to the prior session's log while
+                # the new (failing) session hasn't written its own log yet.  Accepting
+                # a stale "Successfully connected" line causes the monitor to
+                # incorrectly conclude "global-plugin-only failure, proceed" when
+                # loom actually failed at runtime.  See issue #2911.
+                local monitor_start_time
+                monitor_start_time=$(date +%s)
 
                 while [[ "${grace_elapsed}" -lt "${STARTUP_GRACE_PERIOD}" ]]; do
                     # Session ended on its own — nothing to kill
@@ -985,10 +994,49 @@ start_startup_monitor() {
                     if [[ -L "${global_debug_log}" || -f "${global_debug_log}" ]]; then
                         debug_log="${global_debug_log}"
                     fi
-                    if [[ -L "${debug_log}" || -f "${debug_log}" ]] && \
-                       grep -q 'MCP server "loom": Successfully connected' "${debug_log}" 2>/dev/null; then
-                        loom_connected=true
-                        break
+                    if [[ -L "${debug_log}" || -f "${debug_log}" ]]; then
+                        # Resolve the symlink to the actual file so we can check its mtime.
+                        local resolved_debug_log
+                        resolved_debug_log=$(readlink -f "${debug_log}" 2>/dev/null || echo "${debug_log}")
+
+                        # Guard against stale logs: only trust a debug log that was
+                        # created/modified at or after this monitoring session started.
+                        # This prevents misclassifying "global-plugin-only" when the
+                        # symlink still points to the previous session's successful log.
+                        # See issue #2911.
+                        local debug_log_mtime=0
+                        if [[ -f "${resolved_debug_log}" ]]; then
+                            if [[ "$(uname)" == "Darwin" ]]; then
+                                debug_log_mtime=$(stat -f '%m' "${resolved_debug_log}" 2>/dev/null || echo "0")
+                            else
+                                debug_log_mtime=$(stat -c '%Y' "${resolved_debug_log}" 2>/dev/null || echo "0")
+                            fi
+                        fi
+                        local debug_log_is_fresh=false
+                        if [[ "${debug_log_mtime}" -ge "${monitor_start_time}" ]]; then
+                            debug_log_is_fresh=true
+                        fi
+
+                        if [[ "${debug_log_is_fresh}" == "true" ]]; then
+                            # Fast-path: if loom is explicitly listed as failed in the
+                            # current session's debug log, kill immediately without waiting
+                            # for the full grace period.  See issue #2911.
+                            if grep -q 'MCP server "loom".*[Cc]onnection failed\|MCP server "loom".*[Ff]ailed to connect' \
+                               "${resolved_debug_log}" 2>/dev/null; then
+                                log_warn "Startup monitor: debug log confirms loom MCP failed to connect — killing session immediately"
+                                pkill -INT -P $$ -f "claude" 2>/dev/null || true
+                                break 2  # Break out of both while loops
+                            fi
+
+                            if grep -q 'MCP server "loom": Successfully connected' \
+                               "${resolved_debug_log}" 2>/dev/null; then
+                                loom_connected=true
+                                break
+                            fi
+                        fi
+                        # Debug log is stale (from a previous session) — do not trust
+                        # "Successfully connected" hits; keep polling until the new
+                        # session writes its own log or the grace period expires.
                     fi
 
                     # Sleep AFTER checking so the first iteration is instant
@@ -1006,11 +1054,14 @@ start_startup_monitor() {
                     # See issue #2721.
                     local all_project_ok=true
                     local mcp_json="${WORKSPACE}/.mcp.json"
+                    # Resolve the debug log path once more for the project-MCP check.
+                    local resolved_debug_log_final
+                    resolved_debug_log_final=$(readlink -f "${debug_log}" 2>/dev/null || echo "${debug_log}")
                     if [[ -f "${mcp_json}" ]] && command -v jq &>/dev/null; then
                         local server_names
                         server_names=$(jq -r '.mcpServers // {} | keys[]' "${mcp_json}" 2>/dev/null)
                         for srv in ${server_names}; do
-                            if ! grep -q "MCP server \"${srv}\": Successfully connected" "${debug_log}" 2>/dev/null; then
+                            if ! grep -q "MCP server \"${srv}\": Successfully connected" "${resolved_debug_log_final}" 2>/dev/null; then
                                 all_project_ok=false
                                 log_warn "Startup monitor: project MCP server '${srv}' did not connect"
                                 break
