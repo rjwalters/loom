@@ -49,7 +49,7 @@ while [[ $# -gt 0 ]]; do
         --status)        STATUS_ONLY=true;;
         --stop)          STOP_ONLY=true;;
         --help|-h)
-            sed -n '/^# Usage:/,/^[^#]/p' "$0" | head -n -1 | sed 's/^# \?//'
+            sed -n '/^# Usage:/,/^[^#]/p' "$0" | sed '$d' | sed 's/^# \?//'
             exit 0
             ;;
         *)               ARGS+=("$1");;

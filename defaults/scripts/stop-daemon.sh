@@ -34,7 +34,7 @@ while [[ $# -gt 0 ]]; do
             ;;
         --force)  FORCE=true;;
         --help|-h)
-            sed -n '/^# Usage:/,/^[^#]/p' "$0" | head -n -1 | sed 's/^# \?//'
+            sed -n '/^# Usage:/,/^[^#]/p' "$0" | sed '$d' | sed 's/^# \?//'
             exit 0
             ;;
         *)  echo "Unknown option: $1" >&2; exit 1;;
