@@ -406,6 +406,12 @@ class ShepherdContext:
         cleaned up: any open PRs on the branch are closed and the remote
         branch is deleted so the builder can start fresh (issue #2415).
 
+        Exception: if the open PR already has ``loom:review-requested`` or
+        ``loom:pr`` label, the builder already succeeded and the PR is
+        legitimately awaiting judge review.  In that case cleanup is skipped
+        so that ``BuilderPhase.should_skip()`` can detect the existing PR and
+        route directly to the judge phase (issue #2907).
+
         In default mode we warn but always proceed so orchestration is
         not blocked.  Branches that back an open PR are not considered
         stale unless in force mode.
@@ -428,7 +434,7 @@ class ShepherdContext:
                         "pr",
                         head=branch_name,
                         state="open",
-                        fields=["number"],
+                        fields=["number", "labels"],
                         limit=1,
                     )
                     if open_prs and not self.config.is_force_mode:
@@ -445,6 +451,31 @@ class ShepherdContext:
                     )
 
                 if self.config.is_force_mode:
+                    # If the builder already succeeded (PR is awaiting judge
+                    # review), don't destroy its work.  In force mode the
+                    # intent of "start fresh" only applies when a previous
+                    # build *failed*; when the PR already has
+                    # ``loom:review-requested`` or ``loom:pr`` the builder
+                    # produced a valid outcome and we should proceed directly
+                    # to the judge phase instead of re-running the builder
+                    # from scratch (see issue #2907).
+                    if open_prs:
+                        raw_labels = open_prs[0].get("labels", [])
+                        pr_labels = {
+                            lbl.get("name", "") if isinstance(lbl, dict) else str(lbl)
+                            for lbl in raw_labels
+                        }
+                        ready_labels = {"loom:review-requested", "loom:pr"}
+                        if pr_labels & ready_labels:
+                            pr_num = open_prs[0].get("number", "?")
+                            logger.info(
+                                "Force mode: PR #%s for branch %s has label(s) %s "
+                                "— builder already succeeded, skipping cleanup",
+                                pr_num,
+                                branch_name,
+                                pr_labels & ready_labels,
+                            )
+                            return
                     self._cleanup_stale_remote_branch(
                         branch_name, open_prs, logger
                     )
