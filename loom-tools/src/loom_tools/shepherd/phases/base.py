@@ -2282,6 +2282,16 @@ def run_phase_with_retry(
                     f"Thinking stall for attempt {attempt - 1} — retrying "
                     f"in {backoff}s (retry {thinking_stall_retries}/{THINKING_STALL_MAX_RETRIES})"
                 )
+                # Clear the stale checkpoint so the retry builder starts fresh
+                # from planning rather than inheriting the stalled session's
+                # planning stage.  Without this, the retry reads the existing
+                # `.loom-checkpoint` (written by the stalled attempt), skips
+                # re-initialisation, finds nothing meaningful to do, and exits
+                # immediately with code 0 — consuming a failure budget slot
+                # without doing any real work.  See issue #2914.
+                if worktree is not None:
+                    checkpoint_file = worktree / ".loom-checkpoint"
+                    checkpoint_file.unlink(missing_ok=True)
                 time.sleep(backoff)
                 continue
             # Retry budget exhausted.  Multiple consecutive thinking stalls can
