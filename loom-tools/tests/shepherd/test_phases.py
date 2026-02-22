@@ -1818,6 +1818,102 @@ class TestBuilderDiagnostics:
         assert "CLI started but produced zero output" in summary
         assert "log duration: 5s" in summary
 
+    def test_diagnostics_pr_found_via_keyword_when_branch_name_misses(
+        self, mock_context: MagicMock, tmp_path: Path
+    ) -> None:
+        """Should fall back to keyword search when branch-name PR lookup returns empty.
+
+        This is the issue #2972 scenario: a prior shepherd created a PR and the
+        branch was deleted (closing the PR), then the branch was re-pushed.  The
+        branch-name lookup returns empty (PR may now be re-associated or there is
+        a different open PR referencing the issue via body keyword).  The keyword
+        fallback catches the PR so that _has_incomplete_work correctly identifies
+        the workflow as already complete.
+        """
+        mock_context.worktree_path = None
+        mock_context.config = ShepherdConfig(issue=42)
+        mock_context.repo_root = tmp_path
+        mock_context.last_low_output_cause = None
+        mock_context.last_postmortem = None
+
+        builder = BuilderPhase()
+
+        def fake_run(cmd, **kwargs):
+            cmd_str = " ".join(str(c) for c in cmd)
+            # PR lookup by branch name: returns empty (no open PR found by head)
+            if "pr" in cmd_str and "list" in cmd_str and "--head" in cmd_str:
+                return subprocess.CompletedProcess(
+                    args=cmd, returncode=0, stdout="", stderr=""
+                )
+            # PR lookup by "Closes" keyword: finds PR #999 with loom:review-requested
+            if "pr" in cmd_str and "list" in cmd_str and "Closes #42" in cmd_str:
+                pr_json = (
+                    '{"number": 999, "labels": [{"name": "loom:review-requested"}]}'
+                )
+                return subprocess.CompletedProcess(
+                    args=cmd, returncode=0, stdout=pr_json, stderr=""
+                )
+            # All other gh calls and git calls succeed with empty output
+            return subprocess.CompletedProcess(
+                args=cmd, returncode=0, stdout="", stderr=""
+            )
+
+        with patch(
+            "loom_tools.shepherd.phases.builder.subprocess.run", side_effect=fake_run
+        ):
+            diag = builder._gather_diagnostics(mock_context)
+
+        # Keyword fallback should have populated pr_number and pr_has_review_label
+        assert diag["pr_number"] == 999, (
+            "Expected pr_number=999 via keyword fallback, got "
+            f"pr_number={diag.get('pr_number')}"
+        )
+        assert diag["pr_has_review_label"] is True
+
+    def test_diagnostics_pr_branch_name_takes_precedence_over_keyword(
+        self, mock_context: MagicMock, tmp_path: Path
+    ) -> None:
+        """Branch-name PR lookup should short-circuit before keyword search."""
+        mock_context.worktree_path = None
+        mock_context.config = ShepherdConfig(issue=42)
+        mock_context.repo_root = tmp_path
+        mock_context.last_low_output_cause = None
+        mock_context.last_postmortem = None
+
+        builder = BuilderPhase()
+        branch_lookup_called = []
+        keyword_lookup_called = []
+
+        def fake_run(cmd, **kwargs):
+            cmd_str = " ".join(str(c) for c in cmd)
+            if "pr" in cmd_str and "list" in cmd_str and "--head" in cmd_str:
+                branch_lookup_called.append(True)
+                # Return a PR found by branch name
+                pr_json = '{"number": 123, "labels": []}'
+                return subprocess.CompletedProcess(
+                    args=cmd, returncode=0, stdout=pr_json, stderr=""
+                )
+            if "pr" in cmd_str and "list" in cmd_str and "--search" in cmd_str:
+                keyword_lookup_called.append(True)
+                return subprocess.CompletedProcess(
+                    args=cmd, returncode=0, stdout="", stderr=""
+                )
+            return subprocess.CompletedProcess(
+                args=cmd, returncode=0, stdout="", stderr=""
+            )
+
+        with patch(
+            "loom_tools.shepherd.phases.builder.subprocess.run", side_effect=fake_run
+        ):
+            diag = builder._gather_diagnostics(mock_context)
+
+        assert diag["pr_number"] == 123
+        assert len(branch_lookup_called) == 1
+        # Keyword search should NOT be called when branch-name lookup succeeds
+        assert len(keyword_lookup_called) == 0, (
+            "Keyword search should be skipped when branch-name lookup finds a PR"
+        )
+
 
 class TestBuilderQualityValidation:
     """Test pre-flight quality validation in BuilderPhase."""
@@ -10982,10 +11078,14 @@ class TestBuilderDirectCompletion:
                 "loom_tools.shepherd.phases.builder.subprocess.run"
             ) as mock_run,
         ):
-            # gh pr list, gh pr create
+            # branch-name check (empty), 3 keyword checks (empty), gh pr create
+            empty = MagicMock(returncode=0, stdout="", stderr="")
             mock_run.side_effect = [
-                MagicMock(returncode=0, stdout="", stderr=""),
-                MagicMock(returncode=0, stderr=""),
+                empty,  # gh pr list --head (no existing PR)
+                empty,  # gh pr list --search "Closes #42"
+                empty,  # gh pr list --search "Fixes #42"
+                empty,  # gh pr list --search "Resolves #42"
+                MagicMock(returncode=0, stderr=""),  # gh pr create
             ]
             result = builder._direct_completion(mock_context, diag)
 
@@ -10994,7 +11094,7 @@ class TestBuilderDirectCompletion:
         check_args = mock_run.call_args_list[0][0][0]
         assert check_args[:3] == ["gh", "pr", "list"]
         # Verify gh pr create was called with structured body
-        call_args = mock_run.call_args_list[1][0][0]
+        call_args = mock_run.call_args_list[4][0][0]
         assert call_args[:3] == ["gh", "pr", "create"]
         assert "--head" in call_args
         assert "feature/issue-42" in call_args
@@ -11059,10 +11159,14 @@ class TestBuilderDirectCompletion:
                 "loom_tools.shepherd.phases.builder.subprocess.run"
             ) as mock_run,
         ):
-            # gh pr list, gh pr create
+            # branch-name check (empty), 3 keyword checks (empty), gh pr create
+            empty = MagicMock(returncode=0, stdout="", stderr="")
             mock_run.side_effect = [
-                MagicMock(returncode=0, stdout="", stderr=""),
-                MagicMock(returncode=0, stderr=""),
+                empty,  # gh pr list --head (no existing PR)
+                empty,  # gh pr list --search "Closes #42"
+                empty,  # gh pr list --search "Fixes #42"
+                empty,  # gh pr list --search "Resolves #42"
+                MagicMock(returncode=0, stderr=""),  # gh pr create
             ]
             result = builder._direct_completion(mock_context, diag)
 
@@ -11120,16 +11224,20 @@ class TestBuilderDirectCompletion:
                 "loom_tools.shepherd.phases.builder.subprocess.run"
             ) as mock_run,
         ):
-            # gh pr list, gh pr create
+            # branch-name check (empty), 3 keyword checks (empty), gh pr create
+            empty = MagicMock(returncode=0, stdout="", stderr="")
             mock_run.side_effect = [
-                MagicMock(returncode=0, stdout="", stderr=""),
-                MagicMock(returncode=0, stderr=""),
+                empty,  # gh pr list --head (no existing PR)
+                empty,  # gh pr list --search "Closes #42"
+                empty,  # gh pr list --search "Fixes #42"
+                empty,  # gh pr list --search "Resolves #42"
+                MagicMock(returncode=0, stderr=""),  # gh pr create
             ]
             result = builder._direct_completion(mock_context, diag)
 
         assert result is True
         # gh pr create call
-        call_args = mock_run.call_args_list[1][0][0]
+        call_args = mock_run.call_args_list[4][0][0]
         assert call_args[:3] == ["gh", "pr", "create"]
         assert "--head" in call_args
         assert "feature/issue-42" in call_args
@@ -11202,17 +11310,104 @@ class TestBuilderDirectCompletion:
                 "loom_tools.shepherd.phases.builder.subprocess.run"
             ) as mock_run,
         ):
-            # gh pr list fails, gh pr create
+            # branch-name check (fails), 3 keyword checks (empty), gh pr create
+            empty = MagicMock(returncode=0, stdout="", stderr="")
             mock_run.side_effect = [
-                MagicMock(returncode=1, stdout="", stderr="network error"),
-                MagicMock(returncode=0, stderr=""),
+                MagicMock(returncode=1, stdout="", stderr="network error"),  # branch-name check fails
+                empty,  # gh pr list --search "Closes #42"
+                empty,  # gh pr list --search "Fixes #42"
+                empty,  # gh pr list --search "Resolves #42"
+                MagicMock(returncode=0, stderr=""),  # gh pr create
             ]
             result = builder._direct_completion(mock_context, diag)
 
         assert result is True
-        assert mock_run.call_count == 2
-        create_args = mock_run.call_args_list[1][0][0]
+        assert mock_run.call_count == 5
+        create_args = mock_run.call_args_list[4][0][0]
         assert create_args[:3] == ["gh", "pr", "create"]
+
+    def test_create_pr_skips_when_pr_found_via_keyword_search(
+        self, mock_context: MagicMock
+    ) -> None:
+        """Should skip PR creation when a PR is found via body-keyword search.
+
+        This tests the issue #2972 scenario: when the branch-name check finds no
+        open PR (e.g. PR was closed due to branch deletion and reopened on a new
+        push), the keyword search catches PRs that reference the issue in their
+        body with 'Closes #N' / 'Fixes #N' / 'Resolves #N'.
+        """
+        builder = BuilderPhase()
+        mock_context.repo_root = Path("/fake/repo")
+        mock_context.config = ShepherdConfig(issue=42)
+        diag = {
+            "has_uncommitted_changes": False,
+            "commits_ahead": 2,
+            "remote_branch_exists": True,
+            "pr_number": None,
+            "pr_has_review_label": False,
+            "branch": "feature/issue-42",
+        }
+
+        with patch(
+            "loom_tools.shepherd.phases.builder.subprocess.run"
+        ) as mock_run:
+            # branch-name check: no PR found; keyword "Closes" search: PR found
+            mock_run.side_effect = [
+                MagicMock(returncode=0, stdout="", stderr=""),   # --head check: empty
+                MagicMock(returncode=0, stdout="888\n", stderr=""),  # Closes keyword: PR 888
+            ]
+            result = builder._direct_completion(mock_context, diag)
+
+        assert result is True
+        # Two calls: branch-name check, then "Closes" keyword check (short-circuits)
+        assert mock_run.call_count == 2
+        # First call: branch-name lookup
+        first_args = mock_run.call_args_list[0][0][0]
+        assert first_args[:3] == ["gh", "pr", "list"]
+        assert "--head" in first_args
+        # Second call: keyword search
+        second_args = mock_run.call_args_list[1][0][0]
+        assert second_args[:3] == ["gh", "pr", "list"]
+        assert "--search" in second_args
+        assert "Closes #42" in second_args
+        # gh pr create must NOT have been called
+        for call in mock_run.call_args_list:
+            assert call[0][0][:3] != ["gh", "pr", "create"], (
+                "gh pr create should not be called when a PR already exists"
+            )
+
+    def test_create_pr_skips_on_fixes_keyword_match(
+        self, mock_context: MagicMock
+    ) -> None:
+        """Should skip PR creation when a PR is found via 'Fixes #N' keyword."""
+        builder = BuilderPhase()
+        mock_context.repo_root = Path("/fake/repo")
+        mock_context.config = ShepherdConfig(issue=42)
+        diag = {
+            "has_uncommitted_changes": False,
+            "commits_ahead": 1,
+            "remote_branch_exists": True,
+            "pr_number": None,
+            "pr_has_review_label": False,
+            "branch": "feature/issue-42",
+        }
+
+        with patch(
+            "loom_tools.shepherd.phases.builder.subprocess.run"
+        ) as mock_run:
+            # branch-name and "Closes" both empty; "Fixes" finds the PR
+            mock_run.side_effect = [
+                MagicMock(returncode=0, stdout="", stderr=""),   # --head check: empty
+                MagicMock(returncode=0, stdout="", stderr=""),   # Closes keyword: empty
+                MagicMock(returncode=0, stdout="777\n", stderr=""),  # Fixes keyword: PR 777
+            ]
+            result = builder._direct_completion(mock_context, diag)
+
+        assert result is True
+        assert mock_run.call_count == 3
+        # gh pr create must NOT have been called
+        for call in mock_run.call_args_list:
+            assert call[0][0][:3] != ["gh", "pr", "create"]
 
     def test_refuses_when_worktree_on_main(self, mock_context: MagicMock) -> None:
         """Should refuse direct completion when worktree is on main.  See #2744."""
@@ -11284,10 +11479,14 @@ class TestBuilderDirectCompletion:
                 "loom_tools.shepherd.phases.builder.subprocess.run"
             ) as mock_run,
         ):
-            # gh pr list, gh pr create (fails)
+            # branch-name check (empty), 3 keyword checks (empty), gh pr create (fails)
+            empty = MagicMock(returncode=0, stdout="", stderr="")
             mock_run.side_effect = [
-                MagicMock(returncode=0, stdout="", stderr=""),
-                MagicMock(returncode=1, stderr="GraphQL: error"),
+                empty,  # gh pr list --head (no existing PR)
+                empty,  # gh pr list --search "Closes #42"
+                empty,  # gh pr list --search "Fixes #42"
+                empty,  # gh pr list --search "Resolves #42"
+                MagicMock(returncode=1, stderr="GraphQL: error"),  # gh pr create (fails)
             ]
             result = builder._direct_completion(mock_context, diag)
 
@@ -11323,17 +11522,21 @@ class TestBuilderDirectCompletion:
                 "loom_tools.shepherd.phases.builder.subprocess.run"
             ) as mock_run,
         ):
-            # gh pr list, gh pr create
+            # branch-name check (empty), 3 keyword checks (empty), gh pr create
+            empty = MagicMock(returncode=0, stdout="", stderr="")
             mock_run.side_effect = [
-                MagicMock(returncode=0, stdout="", stderr=""),
-                MagicMock(returncode=0, stderr=""),
+                empty,  # gh pr list --head (no existing PR)
+                empty,  # gh pr list --search "Closes #99"
+                empty,  # gh pr list --search "Fixes #99"
+                empty,  # gh pr list --search "Resolves #99"
+                MagicMock(returncode=0, stderr=""),  # gh pr create
             ]
             builder._direct_completion(mock_context, diag)
 
-        # Both the check and create calls should use the canonical branch
+        # The branch-name check and create calls should use the canonical branch
         check_args = mock_run.call_args_list[0][0][0]
         assert "feature/issue-99" in check_args
-        create_args = mock_run.call_args_list[1][0][0]
+        create_args = mock_run.call_args_list[4][0][0]
         assert "feature/issue-99" in create_args
 
     def test_create_pr_fallback_branch_name(
@@ -11362,14 +11565,18 @@ class TestBuilderDirectCompletion:
                 "loom_tools.shepherd.phases.builder.subprocess.run"
             ) as mock_run,
         ):
-            # gh pr list, gh pr create
+            # branch-name check (empty), 3 keyword checks (empty), gh pr create
+            empty = MagicMock(returncode=0, stdout="", stderr="")
             mock_run.side_effect = [
-                MagicMock(returncode=0, stdout="", stderr=""),
-                MagicMock(returncode=0, stderr=""),
+                empty,  # gh pr list --head (no existing PR)
+                empty,  # gh pr list --search "Closes #55"
+                empty,  # gh pr list --search "Fixes #55"
+                empty,  # gh pr list --search "Resolves #55"
+                MagicMock(returncode=0, stderr=""),  # gh pr create
             ]
             builder._direct_completion(mock_context, diag)
 
-        create_args = mock_run.call_args_list[1][0][0]
+        create_args = mock_run.call_args_list[4][0][0]
         assert "feature/issue-55" in create_args
 
     def test_stage_and_commit_failure_returns_false(
@@ -11423,10 +11630,14 @@ class TestBuilderDirectCompletion:
                 "loom_tools.shepherd.phases.builder.subprocess.run"
             ) as mock_run,
         ):
-            # gh pr list, gh pr create
+            # branch-name check (empty), 3 keyword checks (empty), gh pr create
+            empty = MagicMock(returncode=0, stdout="", stderr="")
             mock_run.side_effect = [
-                MagicMock(returncode=0, stdout="", stderr=""),
-                MagicMock(returncode=0, stderr=""),
+                empty,  # gh pr list --head (no existing PR)
+                empty,  # gh pr list --search "Closes #42"
+                empty,  # gh pr list --search "Fixes #42"
+                empty,  # gh pr list --search "Resolves #42"
+                MagicMock(returncode=0, stderr=""),  # gh pr create
             ]
             result = builder._direct_completion(mock_context, diag)
 

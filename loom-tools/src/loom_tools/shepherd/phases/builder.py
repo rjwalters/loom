@@ -3824,6 +3824,53 @@ class BuilderPhase:
             except (json.JSONDecodeError, TypeError):
                 pass
 
+        # If the branch-name search found no open PR, fall back to searching
+        # by body keyword.  This catches PRs created with a non-standard branch
+        # name or when a GitHub API race left the branch-name index stale.
+        # Mirrors the multi-method lookup in validate_builder._find_pr_for_issue.
+        # See issue #2972.
+        if diag["pr_number"] is None:
+            for keyword in ("Closes", "Fixes", "Resolves"):
+                kw_res = subprocess.run(
+                    [
+                        "gh",
+                        "pr",
+                        "list",
+                        "--search",
+                        f"{keyword} #{ctx.config.issue}",
+                        "--state",
+                        "open",
+                        "--json",
+                        "number,labels",
+                        "--jq",
+                        ".[0] // empty",
+                    ],
+                    cwd=ctx.repo_root,
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+                if kw_res.returncode == 0 and kw_res.stdout.strip():
+                    try:
+                        pr_data = json.loads(kw_res.stdout.strip())
+                        pr_num = pr_data.get("number")
+                        if pr_num is not None:
+                            diag["pr_number"] = pr_num
+                            pr_labels = [
+                                lbl.get("name", "")
+                                for lbl in pr_data.get("labels", [])
+                            ]
+                            diag["pr_has_review_label"] = (
+                                "loom:review-requested" in pr_labels
+                            )
+                            log_info(
+                                f"PR #{pr_num} found via '{keyword} #{ctx.config.issue}' "
+                                f"keyword search (branch-name search returned empty)"
+                            )
+                            break
+                    except (json.JSONDecodeError, TypeError):
+                        pass
+
         # -- Issue labels ----------------------------------------------------
         label_res = subprocess.run(
             [
@@ -4410,6 +4457,7 @@ class BuilderPhase:
                 branch = NamingConventions.branch_name(ctx.config.issue)
                 # Guard against stale diagnostics: re-check if a PR already
                 # exists for this branch before creating a new one.
+                # Method 1: search by head branch name.
                 check_result = subprocess.run(
                     [
                         "gh", "pr", "list",
@@ -4429,6 +4477,36 @@ class BuilderPhase:
                         f"Direct completion: PR #{existing_pr} already exists "
                         f"for branch {branch}, skipping creation"
                     )
+                    continue
+                # Method 2: fall back to body-keyword search in case branch-name
+                # lookup misses PRs (e.g. when the branch was deleted and recreated,
+                # causing GitHub to close then re-associate the PR under a different
+                # index key).  Mirrors the multi-method lookup used by validate_builder.
+                # See issue #2972.
+                for keyword in ("Closes", "Fixes", "Resolves"):
+                    kw_check = subprocess.run(
+                        [
+                            "gh", "pr", "list",
+                            "--search", f"{keyword} #{ctx.config.issue}",
+                            "--state", "open",
+                            "--json", "number",
+                            "--jq", ".[0].number // empty",
+                        ],
+                        cwd=ctx.repo_root,
+                        capture_output=True,
+                        text=True,
+                        check=False,
+                    )
+                    kw_existing = kw_check.stdout.strip()
+                    if kw_existing:
+                        log_info(
+                            f"Direct completion: PR #{kw_existing} already exists "
+                            f"(found via '{keyword} #{ctx.config.issue}' keyword), "
+                            f"skipping creation"
+                        )
+                        existing_pr = kw_existing
+                        break
+                if existing_pr:
                     continue
                 pr_body = self._build_direct_completion_pr_body(ctx)
                 result = subprocess.run(
