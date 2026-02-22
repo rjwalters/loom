@@ -48,13 +48,14 @@ ERROR_CLASS_BLOCK_THRESHOLDS: dict[str, int] = {
 }
 
 # Infrastructure error classes that should NOT count toward auto-blocking.
-# These represent environment/platform failures (MCP server down, auth timeout),
-# not problems with the issue itself.  Blocking an issue for infrastructure
-# failures is counterproductive — the issue would succeed once infrastructure
-# recovers.  See issue #2772.
+# These represent environment/platform failures (MCP server down, auth timeout,
+# worktree branch conflicts), not problems with the issue itself.  Blocking an
+# issue for infrastructure failures is counterproductive — the issue would
+# succeed once infrastructure recovers.  See issue #2772, #2918.
 INFRASTRUCTURE_ERROR_CLASSES: frozenset[str] = frozenset({
     "auth_infrastructure_failure",
     "mcp_infrastructure_failure",
+    "worktree_conflict",
 })
 
 # Backoff schedule: attempt -> iterations to skip

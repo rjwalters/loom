@@ -436,11 +436,20 @@ class BuilderPhase:
                 msg = "failed to create worktree"
                 if detail:
                     msg = f"{msg}: {detail}"
+                # Detect worktree branch conflicts: when the branch is already
+                # checked out in another worktree git raises a "already used by
+                # worktree" fatal error.  This is an infrastructure failure
+                # (git state, not issue quality) and must NOT count toward the
+                # systematic failure counter.  See issue #2918.
+                is_conflict = "already used by worktree" in detail
                 return PhaseResult(
                     status=PhaseStatus.FAILED,
                     message=msg,
                     phase_name="builder",
-                    data={"error_detail": detail},
+                    data={
+                        "error_detail": detail,
+                        "worktree_conflict": is_conflict,
+                    },
                 )
 
         # Create marker to prevent premature cleanup
