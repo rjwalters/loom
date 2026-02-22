@@ -16050,14 +16050,20 @@ class TestBuilderGatherDiagnosticsMainBranch:
             result = subprocess.CompletedProcess(
                 args=cmd, returncode=0, stdout="", stderr=""
             )
-            if "rev-parse" in cmd_str:
-                result.stdout = "feature/issue-42\n"
+            if "symbolic-ref" in cmd_str:
+                # Default branch detection — always return main
+                result.stdout = "refs/remotes/origin/main\n"
+            elif "rev-parse" in cmd_str and "--abbrev-ref" in cmd_str:
+                # Return "main" for repo root branch check, "feature/issue-42" for worktree
+                if str(wt_dir) in cmd_str:
+                    result.stdout = "feature/issue-42\n"
+                else:
+                    result.stdout = "main\n"
             elif "log" in cmd_str and "main..HEAD" in cmd_str:
                 result.stdout = ""
             elif "status --porcelain" in cmd_str:
                 # Check if this is the main branch check (uses repo_root)
                 # or worktree check (uses wt_dir)
-                cwd = kwargs.get("cwd")
                 if "-C" in cmd and str(tmp_path) in cmd_str and str(wt_dir) not in cmd_str:
                     # Main branch is dirty
                     result.stdout = " M src/lib.rs\n M src/parser.rs\n"
@@ -16099,8 +16105,13 @@ class TestBuilderGatherDiagnosticsMainBranch:
             result = subprocess.CompletedProcess(
                 args=cmd, returncode=0, stdout="", stderr=""
             )
-            if "rev-parse" in cmd_str:
-                result.stdout = "feature/issue-42\n"
+            if "symbolic-ref" in cmd_str:
+                result.stdout = "refs/remotes/origin/main\n"
+            elif "rev-parse" in cmd_str and "--abbrev-ref" in cmd_str:
+                if str(wt_dir) in cmd_str:
+                    result.stdout = "feature/issue-42\n"
+                else:
+                    result.stdout = "main\n"
             elif "log" in cmd_str and "main..HEAD" in cmd_str:
                 result.stdout = ""
             elif "status --porcelain" in cmd_str:
@@ -16140,8 +16151,13 @@ class TestBuilderGatherDiagnosticsMainBranch:
             result = subprocess.CompletedProcess(
                 args=cmd, returncode=0, stdout="", stderr=""
             )
-            if "rev-parse" in cmd_str:
-                result.stdout = "feature/issue-42\n"
+            if "symbolic-ref" in cmd_str:
+                result.stdout = "refs/remotes/origin/main\n"
+            elif "rev-parse" in cmd_str and "--abbrev-ref" in cmd_str:
+                if str(wt_dir) in cmd_str:
+                    result.stdout = "feature/issue-42\n"
+                else:
+                    result.stdout = "main\n"
             elif "log" in cmd_str and "main..HEAD" in cmd_str:
                 result.stdout = ""
             elif "status --porcelain" in cmd_str:
@@ -16188,8 +16204,15 @@ class TestBuilderMainDirtyBaseline:
             result = subprocess.CompletedProcess(
                 args=cmd, returncode=0, stdout="", stderr=""
             )
-            if "rev-parse" in cmd_str:
-                result.stdout = "feature/issue-42\n"
+            if "symbolic-ref" in cmd_str:
+                # Default branch detection — always return main
+                result.stdout = "refs/remotes/origin/main\n"
+            elif "rev-parse" in cmd_str and "--abbrev-ref" in cmd_str:
+                # Return "main" for repo root branch check, "feature/issue-42" for worktree
+                if str(wt_dir) in cmd_str:
+                    result.stdout = "feature/issue-42\n"
+                else:
+                    result.stdout = "main\n"
             elif "log" in cmd_str and "main..HEAD" in cmd_str:
                 result.stdout = ""
             elif "status --porcelain" in cmd_str:
@@ -16236,8 +16259,15 @@ class TestBuilderMainDirtyBaseline:
             result = subprocess.CompletedProcess(
                 args=cmd, returncode=0, stdout="", stderr=""
             )
-            if "rev-parse" in cmd_str:
-                result.stdout = "feature/issue-42\n"
+            if "symbolic-ref" in cmd_str:
+                # Default branch detection — always return main
+                result.stdout = "refs/remotes/origin/main\n"
+            elif "rev-parse" in cmd_str and "--abbrev-ref" in cmd_str:
+                # Return "main" for repo root branch check, "feature/issue-42" for worktree
+                if str(wt_dir) in cmd_str:
+                    result.stdout = "feature/issue-42\n"
+                else:
+                    result.stdout = "main\n"
             elif "log" in cmd_str and "main..HEAD" in cmd_str:
                 result.stdout = ""
             elif "status --porcelain" in cmd_str:
@@ -16283,8 +16313,15 @@ class TestBuilderMainDirtyBaseline:
             result = subprocess.CompletedProcess(
                 args=cmd, returncode=0, stdout="", stderr=""
             )
-            if "rev-parse" in cmd_str:
-                result.stdout = "feature/issue-42\n"
+            if "symbolic-ref" in cmd_str:
+                # Default branch detection — always return main
+                result.stdout = "refs/remotes/origin/main\n"
+            elif "rev-parse" in cmd_str and "--abbrev-ref" in cmd_str:
+                # Return "main" for repo root branch check, "feature/issue-42" for worktree
+                if str(wt_dir) in cmd_str:
+                    result.stdout = "feature/issue-42\n"
+                else:
+                    result.stdout = "main\n"
             elif "log" in cmd_str and "main..HEAD" in cmd_str:
                 result.stdout = ""
             elif "status --porcelain" in cmd_str:
@@ -16340,6 +16377,181 @@ class TestBuilderMainDirtyBaseline:
             baseline = builder._snapshot_main_dirty(mock_context)
 
         assert baseline == set()
+
+
+class TestBuilderNonMainBranchDirty:
+    """Test that worktree-escape detection is suppressed on non-main branches.
+
+    When the shepherd runs on a branch other than the default (e.g. a guide
+    maintenance branch like docs/guide-update), any staged or modified files
+    on that branch must NOT be treated as a builder worktree escape.
+    See issue #2971.
+    """
+
+    def test_non_main_branch_dirty_not_flagged(
+        self, mock_context: MagicMock, tmp_path: Path
+    ) -> None:
+        """Dirty files on a non-main repo-root branch should not set main_branch_dirty."""
+        wt_dir = tmp_path / "worktree"
+        wt_dir.mkdir()
+        mock_context.worktree_path = wt_dir
+        mock_context.config = ShepherdConfig(issue=42)
+        mock_context.repo_root = tmp_path
+
+        log_dir = tmp_path / ".loom" / "logs"
+        log_dir.mkdir(parents=True)
+
+        builder = BuilderPhase()
+
+        def fake_run(cmd, **kwargs):
+            cmd_str = " ".join(str(c) for c in cmd)
+            result = subprocess.CompletedProcess(
+                args=cmd, returncode=0, stdout="", stderr=""
+            )
+            if "symbolic-ref" in cmd_str:
+                # Default branch is main
+                result.stdout = "refs/remotes/origin/main\n"
+            elif "rev-parse" in cmd_str and "--abbrev-ref" in cmd_str:
+                if str(wt_dir) in cmd_str:
+                    result.stdout = "feature/issue-42\n"
+                else:
+                    # Repo root is on a non-main branch (guide maintenance)
+                    result.stdout = "docs/guide-update-20260219\n"
+            elif "log" in cmd_str and "main..HEAD" in cmd_str:
+                result.stdout = ""
+            elif "status --porcelain" in cmd_str:
+                if "-C" in cmd and str(tmp_path) in cmd_str and str(wt_dir) not in cmd_str:
+                    # Non-main branch has staged changes (guide's own changes)
+                    result.stdout = " M WORK_LOG.md\n M WORK_PLAN.md\n"
+                else:
+                    result.stdout = ""
+            elif "ls-remote" in cmd_str:
+                result.stdout = ""
+            elif "gh" in cmd_str:
+                result.stdout = "loom:building"
+            return result
+
+        with patch(
+            "loom_tools.shepherd.phases.builder.subprocess.run", side_effect=fake_run
+        ):
+            diag = builder._gather_diagnostics(mock_context)
+
+        assert diag["main_branch_dirty"] is False
+        assert diag["main_dirty_file_count"] == 0
+        assert diag["main_dirty_files"] == []
+        assert "WARNING" not in diag["summary"]
+
+    def test_non_main_branch_snapshot_returns_empty(
+        self, mock_context: MagicMock, tmp_path: Path
+    ) -> None:
+        """_snapshot_main_dirty should return empty set when repo root is not on main."""
+        mock_context.repo_root = tmp_path
+
+        builder = BuilderPhase()
+
+        def fake_run(cmd, **kwargs):
+            cmd_str = " ".join(str(c) for c in cmd)
+            result = subprocess.CompletedProcess(
+                args=cmd, returncode=0, stdout="", stderr=""
+            )
+            if "symbolic-ref" in cmd_str:
+                result.stdout = "refs/remotes/origin/main\n"
+            elif "rev-parse" in cmd_str and "--abbrev-ref" in cmd_str:
+                # Repo root is on a non-main branch
+                result.stdout = "docs/guide-update-20260219\n"
+            elif "status --porcelain" in cmd_str:
+                # Would return dirty files, but should be suppressed
+                result.stdout = " M WORK_LOG.md\n M WORK_PLAN.md\n"
+            return result
+
+        with patch(
+            "loom_tools.shepherd.phases.builder.subprocess.run", side_effect=fake_run
+        ):
+            baseline = builder._snapshot_main_dirty(mock_context)
+
+        # Snapshot should be empty — non-main dirty files must not be captured
+        assert baseline == set()
+
+    def test_non_main_branch_get_new_dirty_returns_empty(
+        self, mock_context: MagicMock, tmp_path: Path
+    ) -> None:
+        """_get_new_main_dirty_files should return [] when repo root is not on main."""
+        mock_context.repo_root = tmp_path
+
+        builder = BuilderPhase()
+
+        def fake_run(cmd, **kwargs):
+            cmd_str = " ".join(str(c) for c in cmd)
+            result = subprocess.CompletedProcess(
+                args=cmd, returncode=0, stdout="", stderr=""
+            )
+            if "symbolic-ref" in cmd_str:
+                result.stdout = "refs/remotes/origin/main\n"
+            elif "rev-parse" in cmd_str and "--abbrev-ref" in cmd_str:
+                # Repo root is on a non-main branch
+                result.stdout = "docs/guide-update-20260219\n"
+            elif "status --porcelain" in cmd_str:
+                # Would return dirty files, but should be suppressed
+                result.stdout = " M WORK_LOG.md\n M WORK_PLAN.md\n"
+            return result
+
+        with patch(
+            "loom_tools.shepherd.phases.builder.subprocess.run", side_effect=fake_run
+        ):
+            new_dirty = builder._get_new_main_dirty_files(mock_context)
+
+        assert new_dirty == []
+
+    def test_main_branch_dirty_still_detected(
+        self, mock_context: MagicMock, tmp_path: Path
+    ) -> None:
+        """Dirty files on the main branch should still be detected as worktree escape."""
+        wt_dir = tmp_path / "worktree"
+        wt_dir.mkdir()
+        mock_context.worktree_path = wt_dir
+        mock_context.config = ShepherdConfig(issue=42)
+        mock_context.repo_root = tmp_path
+
+        log_dir = tmp_path / ".loom" / "logs"
+        log_dir.mkdir(parents=True)
+
+        builder = BuilderPhase()
+
+        def fake_run(cmd, **kwargs):
+            cmd_str = " ".join(str(c) for c in cmd)
+            result = subprocess.CompletedProcess(
+                args=cmd, returncode=0, stdout="", stderr=""
+            )
+            if "symbolic-ref" in cmd_str:
+                result.stdout = "refs/remotes/origin/main\n"
+            elif "rev-parse" in cmd_str and "--abbrev-ref" in cmd_str:
+                if str(wt_dir) in cmd_str:
+                    result.stdout = "feature/issue-42\n"
+                else:
+                    # Repo root IS on main
+                    result.stdout = "main\n"
+            elif "log" in cmd_str and "main..HEAD" in cmd_str:
+                result.stdout = ""
+            elif "status --porcelain" in cmd_str:
+                if "-C" in cmd and str(tmp_path) in cmd_str and str(wt_dir) not in cmd_str:
+                    # Main branch has dirty files (builder escaped worktree)
+                    result.stdout = " M src/lib.rs\n?? new_file.py\n"
+                else:
+                    result.stdout = ""
+            elif "ls-remote" in cmd_str:
+                result.stdout = ""
+            elif "gh" in cmd_str:
+                result.stdout = "loom:building"
+            return result
+
+        with patch(
+            "loom_tools.shepherd.phases.builder.subprocess.run", side_effect=fake_run
+        ):
+            diag = builder._gather_diagnostics(mock_context)
+
+        assert diag["main_branch_dirty"] is True
+        assert diag["main_dirty_file_count"] == 2
+        assert "WARNING: main branch dirty" in diag["summary"]
 
 
 class TestBuilderGatherDiagnosticsNoChangesMarker:
