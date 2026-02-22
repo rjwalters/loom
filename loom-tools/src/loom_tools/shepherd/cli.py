@@ -2251,6 +2251,16 @@ def _post_fallback_failure_comment(ctx: ShepherdContext, exit_code: int) -> None
                 "Wait for the usage or plan limit to reset, or re-authenticate "
                 "with a different plan before retrying."
             )
+        elif failure_data.get("api_rate_limited"):
+            failure_mode = (
+                "API rate limit pre-check — usage exceeded configured threshold "
+                "before builder was started"
+            )
+            safe_to_retry = True
+            advice = (
+                "The issue has been returned to `loom:issue`. "
+                "Retry after the rate limit resets (usually a few minutes)."
+            )
         else:
             # Generic builder failure (MCP failure, low-output, etc.)
             failure_mode = message or "unexpected failure"

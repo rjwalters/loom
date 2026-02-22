@@ -363,6 +363,7 @@ class BuilderPhase:
                 status=PhaseStatus.FAILED,
                 message=f"API rate limit exceeded (threshold: {ctx.config.rate_limit_threshold}%)",
                 phase_name="builder",
+                data={"api_rate_limited": True},
             )
 
         # Report phase entry
