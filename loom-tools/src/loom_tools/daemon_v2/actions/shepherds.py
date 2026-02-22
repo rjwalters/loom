@@ -348,10 +348,32 @@ def force_reclaim_stale_shepherds(ctx: DaemonContext) -> int:
 
         is_stale = False
 
-        # Check 1: tmux session dead
+        # Compute spawn age once — used by both Check 1 and Check 3.
+        spawn_age_seconds: int | None = None
+        if entry.started:
+            try:
+                started_dt = parse_iso_timestamp(entry.started)
+                spawn_age_seconds = int((now_utc() - started_dt).total_seconds())
+            except (ValueError, OSError):
+                pass
+
+        # Check 1: tmux session dead — but only after the startup grace period.
+        # A shepherd spawned fewer than startup_grace_period seconds ago may not
+        # have created its tmux session yet (the session is created asynchronously).
+        # Killing such a shepherd produces a false "shepherd_failure" and can cause
+        # two PRs to be opened for the same issue (race condition in issue #2969).
         if not session_exists(name):
-            log_warning(f"STALL-L2: {name} has no tmux session")
-            is_stale = True
+            if (
+                spawn_age_seconds is not None
+                and spawn_age_seconds < ctx.config.startup_grace_period
+            ):
+                log_info(
+                    f"STALL-L2: {name} has no tmux session but was spawned only "
+                    f"{spawn_age_seconds}s ago (grace={ctx.config.startup_grace_period}s) — skipping"
+                )
+            else:
+                log_warning(f"STALL-L2: {name} has no tmux session")
+                is_stale = True
         else:
             # Check if claude is actually running
             session_name = f"loom-{name}"

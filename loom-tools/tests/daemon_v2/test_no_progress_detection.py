@@ -563,3 +563,152 @@ class TestProactiveReclaim:
 
         assert ctx.snapshot["computed"]["active_shepherds"] == 0
         assert ctx.snapshot["computed"]["available_shepherd_slots"] == 10
+
+
+# -----------------------------------------------------------------------
+# Startup grace period for tmux-session-missing check (issue #2969)
+# -----------------------------------------------------------------------
+
+
+class TestTmuxSessionGracePeriod:
+    """Tests for the startup grace period in Check 1 (tmux-session-missing).
+
+    Before this fix, STALL-L2 would immediately kill a shepherd whose tmux
+    session had not yet been created.  Since the session is created
+    asynchronously, a shepherd spawned only a few seconds before the next
+    daemon poll had no tmux session and was incorrectly declared stale —
+    producing a false shepherd_failure and potentially two PRs for the same
+    issue.
+
+    The fix: do NOT mark a shepherd stale for missing tmux session if it was
+    spawned within the last startup_grace_period seconds.
+    """
+
+    @patch("loom_tools.daemon_v2.actions.shepherds.session_exists", return_value=False)
+    def test_no_tmux_session_within_grace_period_not_stale(
+        self, mock_session, tmp_path: pathlib.Path
+    ) -> None:
+        """Shepherd with no tmux session spawned within grace period is NOT stale."""
+        ctx = _make_ctx(
+            repo_root=tmp_path,
+            shepherds={
+                "shepherd-3": {
+                    "status": "working",
+                    "issue": 2928,
+                    "task_id": "abc1234",
+                    "started": _ts(23),  # 23s after spawn — well within 120s grace
+                },
+            },
+        )
+
+        reclaimed = force_reclaim_stale_shepherds(ctx)
+
+        assert reclaimed == 0
+        assert ctx.state.shepherds["shepherd-3"].status == "working"
+
+    @patch("loom_tools.daemon_v2.actions.shepherds.kill_stuck_session")
+    @patch("loom_tools.daemon_v2.actions.shepherds._unclaim_issue")
+    @patch("loom_tools.daemon_v2.actions.shepherds.capture_tmux_output", return_value="")
+    @patch("loom_tools.daemon_v2.actions.shepherds.session_exists", return_value=False)
+    def test_no_tmux_session_past_grace_period_is_stale(
+        self, mock_session, mock_capture, mock_unclaim, mock_kill, tmp_path: pathlib.Path
+    ) -> None:
+        """Shepherd with no tmux session past grace period IS stale and gets reclaimed."""
+        ctx = _make_ctx(
+            repo_root=tmp_path,
+            shepherds={
+                "shepherd-1": {
+                    "status": "working",
+                    "issue": 42,
+                    "task_id": "abc1234",
+                    "started": _ts(130),  # 130s — past the 120s grace period
+                },
+            },
+        )
+
+        reclaimed = force_reclaim_stale_shepherds(ctx)
+
+        assert reclaimed == 1
+        assert ctx.state.shepherds["shepherd-1"].status == "idle"
+        assert ctx.state.shepherds["shepherd-1"].idle_reason == "stall_recovery"
+
+    @patch("loom_tools.daemon_v2.actions.shepherds.session_exists", return_value=False)
+    def test_no_tmux_session_at_exactly_grace_boundary_not_stale(
+        self, mock_session, tmp_path: pathlib.Path
+    ) -> None:
+        """Shepherd at exactly startup_grace_period - 1 seconds is NOT stale."""
+        ctx = _make_ctx(
+            repo_root=tmp_path,
+            shepherds={
+                "shepherd-1": {
+                    "status": "working",
+                    "issue": 42,
+                    "task_id": "abc1234",
+                    "started": _ts(119),  # 119s — one second before grace expires
+                },
+            },
+        )
+
+        reclaimed = force_reclaim_stale_shepherds(ctx)
+
+        assert reclaimed == 0
+        assert ctx.state.shepherds["shepherd-1"].status == "working"
+
+    @patch("loom_tools.daemon_v2.actions.shepherds.session_exists", return_value=False)
+    def test_no_tmux_session_no_started_timestamp_is_stale(
+        self, mock_session, tmp_path: pathlib.Path
+    ) -> None:
+        """Without a started timestamp we cannot compute spawn_age, so treat as stale."""
+        ctx = _make_ctx(
+            repo_root=tmp_path,
+            shepherds={
+                "shepherd-1": {
+                    "status": "working",
+                    "issue": 42,
+                    "task_id": "abc1234",
+                    # no "started" field — spawn_age_seconds will be None
+                },
+            },
+        )
+
+        with patch("loom_tools.daemon_v2.actions.shepherds._unclaim_issue"):
+            with patch("loom_tools.daemon_v2.actions.shepherds.capture_tmux_output", return_value=""):
+                reclaimed = force_reclaim_stale_shepherds(ctx)
+
+        assert reclaimed == 1
+        assert ctx.state.shepherds["shepherd-1"].status == "idle"
+
+    @patch("loom_tools.daemon_v2.actions.shepherds.session_exists", return_value=False)
+    def test_custom_grace_period_respected(
+        self, mock_session, tmp_path: pathlib.Path
+    ) -> None:
+        """Custom startup_grace_period configuration is respected."""
+        from loom_tools.daemon_v2.config import DaemonConfig
+        from loom_tools.daemon_v2.context import DaemonContext
+        from loom_tools.models.daemon_state import DaemonState
+
+        config = DaemonConfig(startup_grace_period=60)  # shorter grace: 60s
+        ctx = DaemonContext(config=config, repo_root=tmp_path)
+        ctx.snapshot = {
+            "computed": {
+                "health_status": "healthy",
+                "health_warnings": [],
+                "total_ready": 0,
+                "active_shepherds": 1,
+                "available_shepherd_slots": 2,
+            },
+            "shepherds": {"progress": []},
+        }
+        state = DaemonState()
+        state.shepherds["shepherd-1"] = ShepherdEntry(
+            status="working",
+            issue=42,
+            task_id="abc1234",
+            started=_ts(50),  # 50s — within the custom 60s grace
+        )
+        ctx.state = state
+
+        reclaimed = force_reclaim_stale_shepherds(ctx)
+
+        assert reclaimed == 0
+        assert ctx.state.shepherds["shepherd-1"].status == "working"
