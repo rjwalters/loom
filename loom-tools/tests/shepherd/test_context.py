@@ -874,3 +874,141 @@ class TestStaleBranchCleanup:
         push_calls = [c for c in calls if "push" in c and "--delete" in c]
         assert len(pr_close_calls) == 1
         assert len(push_calls) == 1
+
+    def test_force_mode_skips_cleanup_when_pr_has_review_requested(
+        self, tmp_path: Path
+    ) -> None:
+        """In force mode, PRs with loom:review-requested are NOT cleaned up (builder succeeded)."""
+        config = ShepherdConfig(
+            issue=42, task_id="abc1234", mode=ExecutionMode.FORCE_MERGE
+        )
+        (tmp_path / ".loom" / "progress").mkdir(parents=True, exist_ok=True)
+        (tmp_path / ".loom" / "worktrees").mkdir(parents=True, exist_ok=True)
+        ctx = ShepherdContext(config=config, repo_root=tmp_path)
+
+        calls: list[list[str]] = []
+
+        def mock_run(cmd, **kwargs):
+            calls.append(cmd)
+            result = MagicMock()
+            result.returncode = 0
+            result.stdout = "abc123\trefs/heads/feature/issue-42\n" if "ls-remote" in cmd else ""
+            result.stderr = ""
+            return result
+
+        pr_with_review_label = [
+            {"number": 99, "labels": [{"name": "loom:review-requested"}]}
+        ]
+
+        with patch("loom_tools.shepherd.context.subprocess.run", side_effect=mock_run), \
+             patch("loom_tools.shepherd.context.gh_list", return_value=pr_with_review_label):
+            ctx._check_stale_branch(42)
+
+        # Should NOT have closed the PR or deleted the branch
+        pr_close_calls = [c for c in calls if "gh" in c and "close" in c]
+        push_calls = [c for c in calls if "push" in c and "--delete" in c]
+        assert len(pr_close_calls) == 0
+        assert len(push_calls) == 0
+        # No warning either — this is the happy path
+        assert len(ctx.warnings) == 0
+
+    def test_force_mode_skips_cleanup_when_pr_has_loom_pr_label(
+        self, tmp_path: Path
+    ) -> None:
+        """In force mode, PRs with loom:pr label are NOT cleaned up (judge already approved)."""
+        config = ShepherdConfig(
+            issue=42, task_id="abc1234", mode=ExecutionMode.FORCE_MERGE
+        )
+        (tmp_path / ".loom" / "progress").mkdir(parents=True, exist_ok=True)
+        (tmp_path / ".loom" / "worktrees").mkdir(parents=True, exist_ok=True)
+        ctx = ShepherdContext(config=config, repo_root=tmp_path)
+
+        calls: list[list[str]] = []
+
+        def mock_run(cmd, **kwargs):
+            calls.append(cmd)
+            result = MagicMock()
+            result.returncode = 0
+            result.stdout = "abc123\trefs/heads/feature/issue-42\n" if "ls-remote" in cmd else ""
+            result.stderr = ""
+            return result
+
+        pr_with_loom_pr_label = [
+            {"number": 100, "labels": [{"name": "loom:pr"}, {"name": "loom:building"}]}
+        ]
+
+        with patch("loom_tools.shepherd.context.subprocess.run", side_effect=mock_run), \
+             patch("loom_tools.shepherd.context.gh_list", return_value=pr_with_loom_pr_label):
+            ctx._check_stale_branch(42)
+
+        # Should NOT have closed the PR or deleted the branch
+        pr_close_calls = [c for c in calls if "gh" in c and "close" in c]
+        push_calls = [c for c in calls if "push" in c and "--delete" in c]
+        assert len(pr_close_calls) == 0
+        assert len(push_calls) == 0
+
+    def test_force_mode_cleans_up_pr_without_ready_labels(
+        self, tmp_path: Path
+    ) -> None:
+        """In force mode, PRs without loom:review-requested or loom:pr ARE cleaned up."""
+        config = ShepherdConfig(
+            issue=42, task_id="abc1234", mode=ExecutionMode.FORCE_MERGE
+        )
+        (tmp_path / ".loom" / "progress").mkdir(parents=True, exist_ok=True)
+        (tmp_path / ".loom" / "worktrees").mkdir(parents=True, exist_ok=True)
+        ctx = ShepherdContext(config=config, repo_root=tmp_path)
+
+        calls: list[list[str]] = []
+
+        def mock_run(cmd, **kwargs):
+            calls.append(cmd)
+            result = MagicMock()
+            result.returncode = 0
+            result.stdout = "abc123\trefs/heads/feature/issue-42\n" if "ls-remote" in cmd else ""
+            result.stderr = ""
+            return result
+
+        # PR exists but only has loom:building (builder did NOT succeed)
+        pr_without_ready_labels = [
+            {"number": 77, "labels": [{"name": "loom:building"}]}
+        ]
+
+        with patch("loom_tools.shepherd.context.subprocess.run", side_effect=mock_run), \
+             patch("loom_tools.shepherd.context.gh_list", return_value=pr_without_ready_labels):
+            ctx._check_stale_branch(42)
+
+        # Should have closed the PR AND deleted the branch
+        pr_close_calls = [c for c in calls if "gh" in c and "close" in c]
+        push_calls = [c for c in calls if "push" in c and "--delete" in c]
+        assert len(pr_close_calls) == 1
+        assert len(push_calls) == 1
+
+    def test_force_mode_skips_cleanup_logs_info_message(
+        self, tmp_path: Path, caplog
+    ) -> None:
+        """In force mode, skipping cleanup due to ready label logs an info message."""
+        config = ShepherdConfig(
+            issue=42, task_id="abc1234", mode=ExecutionMode.FORCE_MERGE
+        )
+        (tmp_path / ".loom" / "progress").mkdir(parents=True, exist_ok=True)
+        (tmp_path / ".loom" / "worktrees").mkdir(parents=True, exist_ok=True)
+        ctx = ShepherdContext(config=config, repo_root=tmp_path)
+
+        def mock_run(cmd, **kwargs):
+            result = MagicMock()
+            result.returncode = 0
+            result.stdout = "abc123\trefs/heads/feature/issue-42\n" if "ls-remote" in cmd else ""
+            result.stderr = ""
+            return result
+
+        pr_with_review_label = [
+            {"number": 55, "labels": [{"name": "loom:review-requested"}]}
+        ]
+
+        with patch("loom_tools.shepherd.context.subprocess.run", side_effect=mock_run), \
+             patch("loom_tools.shepherd.context.gh_list", return_value=pr_with_review_label):
+            with caplog.at_level(logging.INFO):
+                ctx._check_stale_branch(42)
+
+        assert "builder already succeeded" in caplog.text
+        assert "skipping cleanup" in caplog.text
