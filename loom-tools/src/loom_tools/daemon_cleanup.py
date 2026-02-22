@@ -21,6 +21,7 @@ import os
 import pathlib
 import subprocess
 import sys
+import threading
 import time
 from dataclasses import dataclass
 from typing import Any
@@ -193,29 +194,47 @@ def _run_orphan_recovery(
     *,
     recover: bool = False,
     verbose: bool = False,
+    run_background: bool = False,
 ) -> None:
-    """Delegate to the Python orphan recovery module."""
-    try:
-        from loom_tools.orphan_recovery import run_orphan_recovery
+    """Delegate to the Python orphan recovery module.
 
-        run_orphan_recovery(repo_root, recover=recover, verbose=verbose)
-    except ImportError:
-        # Fall back to the shell script
-        script = repo_root / "scripts" / "recover-orphaned-shepherds.sh"
-        if not script.exists():
-            script = repo_root / ".loom" / "scripts" / "recover-orphaned-shepherds.sh"
-        if script.exists() and os.access(script, os.X_OK):
-            cmd: list[str] = [str(script)]
-            if recover:
-                cmd.append("--recover")
-            if verbose:
-                cmd.append("--verbose")
-            try:
-                subprocess.run(cmd, capture_output=True, timeout=60, cwd=repo_root)
-            except Exception:
-                log_warning("Orphaned shepherd recovery failed")
-        else:
-            log_warning("Orphan recovery not available")
+    When ``run_background=True``, the recovery runs in a daemon thread so the
+    caller returns immediately.  This avoids blocking daemon startup when there
+    are many orphans (each requiring a GitHub API round-trip).  The thread is
+    marked as a daemon thread so it will not prevent process exit if the daemon
+    shuts down before recovery finishes.
+    """
+    def _do_recovery() -> None:
+        try:
+            from loom_tools.orphan_recovery import run_orphan_recovery
+
+            run_orphan_recovery(repo_root, recover=recover, verbose=verbose)
+        except ImportError:
+            # Fall back to the shell script
+            script = repo_root / "scripts" / "recover-orphaned-shepherds.sh"
+            if not script.exists():
+                script = repo_root / ".loom" / "scripts" / "recover-orphaned-shepherds.sh"
+            if script.exists() and os.access(script, os.X_OK):
+                cmd: list[str] = [str(script)]
+                if recover:
+                    cmd.append("--recover")
+                if verbose:
+                    cmd.append("--verbose")
+                try:
+                    subprocess.run(cmd, capture_output=True, timeout=60, cwd=repo_root)
+                except Exception:
+                    log_warning("Orphaned shepherd recovery failed")
+            else:
+                log_warning("Orphan recovery not available")
+        except Exception as exc:
+            log_warning(f"Background orphan recovery failed: {exc}")
+
+    if run_background:
+        thread = threading.Thread(target=_do_recovery, name="orphan-recovery", daemon=True)
+        thread.start()
+        log_info("Orphan recovery started in background (daemon will not wait for it)")
+    else:
+        _do_recovery()
 
 
 # ---------------------------------------------------------------------------
@@ -592,9 +611,19 @@ def handle_daemon_startup(
     else:
         log_info("[DRY-RUN] Would clean up expired claims")
 
-    # 1. Orphaned shepherd recovery (critical, run first)
+    # 1. Orphaned shepherd recovery — run in background to avoid blocking startup.
+    #    With many orphans (e.g. 60+), sequential GitHub API calls previously
+    #    delayed iteration 1 by 2-3 minutes.  Running in a daemon thread lets
+    #    the daemon process signals and start iterations immediately while
+    #    recovery proceeds concurrently (see issue #2973).
+    #    In dry-run mode we run synchronously so callers can inspect the result.
     log_info("Checking for orphaned shepherds from previous session...")
-    _run_orphan_recovery(repo_root, recover=not dry_run, verbose=True)
+    _run_orphan_recovery(
+        repo_root,
+        recover=not dry_run,
+        verbose=True,
+        run_background=not dry_run,
+    )
 
     # 2. Archive orphaned task outputs
     if config.archive_logs:

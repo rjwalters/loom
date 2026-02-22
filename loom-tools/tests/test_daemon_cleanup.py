@@ -4,12 +4,16 @@ from __future__ import annotations
 
 import json
 import pathlib
+import threading
+import time
 from unittest import mock
 
 from loom_tools.daemon_cleanup import (
     _revert_shepherd_labels,
+    _run_orphan_recovery,
     _terminate_active_sessions,
     handle_daemon_shutdown,
+    handle_daemon_startup,
     load_config,
 )
 
@@ -446,3 +450,207 @@ class TestHandleDaemonShutdownLabelRevert:
         assert final_state["running"] is False
         assert final_state["shepherds"]["shepherd-1"]["status"] == "idle"
         assert final_state["shepherds"]["shepherd-1"]["issue"] is None
+
+
+class TestRunOrphanRecoveryBackground:
+    """Tests for _run_orphan_recovery background execution mode (issue #2973)."""
+
+    def test_run_background_false_runs_synchronously(self, tmp_path: pathlib.Path) -> None:
+        """With run_background=False, recovery runs in the calling thread (synchronous)."""
+        called_in_thread: list[str] = []
+
+        def fake_recovery(repo_root, *, recover, verbose):
+            called_in_thread.append(threading.current_thread().name)
+
+        with mock.patch(
+            "loom_tools.orphan_recovery.run_orphan_recovery",
+            side_effect=fake_recovery,
+        ):
+            _run_orphan_recovery(tmp_path, recover=True, verbose=False, run_background=False)
+
+        assert len(called_in_thread) == 1
+        # Synchronous: called in the main thread (not a background thread)
+        assert called_in_thread[0] == threading.current_thread().name
+
+    def test_run_background_true_returns_immediately(self, tmp_path: pathlib.Path) -> None:
+        """With run_background=True, _run_orphan_recovery returns before recovery finishes."""
+        recovery_started = threading.Event()
+        recovery_can_finish = threading.Event()
+
+        def slow_recovery(repo_root, *, recover, verbose):
+            recovery_started.set()
+            # Block until the test allows completion
+            recovery_can_finish.wait(timeout=5.0)
+
+        with mock.patch(
+            "loom_tools.orphan_recovery.run_orphan_recovery",
+            side_effect=slow_recovery,
+        ):
+            start = time.monotonic()
+            _run_orphan_recovery(tmp_path, recover=True, verbose=False, run_background=True)
+            elapsed = time.monotonic() - start
+
+        # The call should return quickly (well before recovery has a chance to finish)
+        assert elapsed < 1.0, f"Expected immediate return but took {elapsed:.2f}s"
+
+        # Recovery should have started in the background
+        assert recovery_started.wait(timeout=2.0), "Background recovery never started"
+
+        # Allow the background thread to finish cleanly
+        recovery_can_finish.set()
+
+    def test_run_background_true_runs_in_separate_thread(self, tmp_path: pathlib.Path) -> None:
+        """With run_background=True, recovery runs in a thread named 'orphan-recovery'."""
+        background_thread_names: list[str] = []
+        recovery_done = threading.Event()
+
+        def capture_thread(repo_root, *, recover, verbose):
+            background_thread_names.append(threading.current_thread().name)
+            recovery_done.set()
+
+        with mock.patch(
+            "loom_tools.orphan_recovery.run_orphan_recovery",
+            side_effect=capture_thread,
+        ):
+            _run_orphan_recovery(tmp_path, recover=True, verbose=False, run_background=True)
+
+        assert recovery_done.wait(timeout=3.0), "Background recovery did not complete"
+        assert len(background_thread_names) == 1
+        assert background_thread_names[0] == "orphan-recovery"
+
+    def test_run_background_thread_is_daemon(self, tmp_path: pathlib.Path) -> None:
+        """The background thread must be a daemon thread so it does not block process exit."""
+        thread_is_daemon: list[bool] = []
+        recovery_done = threading.Event()
+
+        def capture_daemon_status(repo_root, *, recover, verbose):
+            thread_is_daemon.append(threading.current_thread().daemon)
+            recovery_done.set()
+
+        with mock.patch(
+            "loom_tools.orphan_recovery.run_orphan_recovery",
+            side_effect=capture_daemon_status,
+        ):
+            _run_orphan_recovery(tmp_path, recover=True, verbose=False, run_background=True)
+
+        assert recovery_done.wait(timeout=3.0), "Background recovery did not complete"
+        assert thread_is_daemon == [True], "Background orphan recovery thread must be a daemon thread"
+
+    def test_background_exception_does_not_propagate(self, tmp_path: pathlib.Path) -> None:
+        """Exceptions in the background thread are caught and logged (not propagated)."""
+        recovery_done = threading.Event()
+
+        def failing_recovery(repo_root, *, recover, verbose):
+            recovery_done.set()
+            raise RuntimeError("Recovery failed!")
+
+        with mock.patch(
+            "loom_tools.orphan_recovery.run_orphan_recovery",
+            side_effect=failing_recovery,
+        ), mock.patch("loom_tools.daemon_cleanup.log_warning") as m_warn:
+            _run_orphan_recovery(tmp_path, recover=True, verbose=False, run_background=True)
+
+        assert recovery_done.wait(timeout=3.0), "Background thread never ran"
+        # Wait a moment for the exception handler to run after recovery_done is set
+        time.sleep(0.1)
+        # Warning should have been logged
+        assert m_warn.called, "Expected log_warning to be called for background exception"
+
+    def test_dry_run_startup_runs_synchronously(self, tmp_path: pathlib.Path) -> None:
+        """handle_daemon_startup with dry_run=True runs orphan recovery synchronously.
+
+        Dry-run mode must be synchronous so callers can observe side effects
+        without a race condition.
+        """
+        called_in_thread: list[str] = []
+
+        def fake_recovery(repo_root, *, recover, verbose):
+            called_in_thread.append(threading.current_thread().name)
+
+        loom_dir = tmp_path / ".loom"
+        loom_dir.mkdir()
+
+        config = load_config()
+
+        with mock.patch("loom_tools.daemon_cleanup._run_archive_logs"), \
+             mock.patch("loom_tools.daemon_cleanup._run_loom_clean"), \
+             mock.patch("loom_tools.daemon_cleanup.cleanup_stale_progress_files"), \
+             mock.patch("loom_tools.orphan_recovery.run_orphan_recovery", side_effect=fake_recovery):
+            handle_daemon_startup(tmp_path, config, dry_run=True)
+
+        assert len(called_in_thread) == 1
+        # Must have run in the main thread, not a background thread
+        assert called_in_thread[0] == threading.current_thread().name
+
+    def test_normal_startup_runs_recovery_in_background(self, tmp_path: pathlib.Path) -> None:
+        """handle_daemon_startup without dry_run runs orphan recovery in a background thread."""
+        background_thread_names: list[str] = []
+        recovery_done = threading.Event()
+
+        def fake_recovery(repo_root, *, recover, verbose):
+            background_thread_names.append(threading.current_thread().name)
+            recovery_done.set()
+
+        loom_dir = tmp_path / ".loom"
+        loom_dir.mkdir()
+
+        config = load_config()
+
+        with mock.patch("loom_tools.daemon_cleanup._run_archive_logs"), \
+             mock.patch("loom_tools.daemon_cleanup._run_loom_clean"), \
+             mock.patch("loom_tools.daemon_cleanup.cleanup_stale_progress_files"), \
+             mock.patch("loom_tools.claim.cleanup_claims"), \
+             mock.patch("loom_tools.orphan_recovery.run_orphan_recovery", side_effect=fake_recovery):
+            handle_daemon_startup(tmp_path, config)
+
+        # Wait for background recovery to complete
+        assert recovery_done.wait(timeout=3.0), "Background orphan recovery never ran"
+
+        assert len(background_thread_names) == 1
+        # Must have run in the background thread, not the main thread
+        assert background_thread_names[0] != threading.current_thread().name
+        assert background_thread_names[0] == "orphan-recovery"
+
+    def test_startup_proceeds_without_waiting_for_recovery(self, tmp_path: pathlib.Path) -> None:
+        """handle_daemon_startup returns before background orphan recovery completes.
+
+        This is the key correctness property: the daemon must not block on orphan
+        recovery when starting up with many orphaned issues.
+        """
+        recovery_started = threading.Event()
+        recovery_can_finish = threading.Event()
+        startup_returned = threading.Event()
+
+        def slow_recovery(repo_root, *, recover, verbose):
+            recovery_started.set()
+            recovery_can_finish.wait(timeout=5.0)
+
+        loom_dir = tmp_path / ".loom"
+        loom_dir.mkdir()
+
+        config = load_config()
+
+        def run_startup():
+            with mock.patch("loom_tools.daemon_cleanup._run_archive_logs"), \
+                 mock.patch("loom_tools.daemon_cleanup._run_loom_clean"), \
+                 mock.patch("loom_tools.daemon_cleanup.cleanup_stale_progress_files"), \
+                 mock.patch("loom_tools.claim.cleanup_claims"), \
+                 mock.patch(
+                     "loom_tools.orphan_recovery.run_orphan_recovery",
+                     side_effect=slow_recovery,
+                 ):
+                handle_daemon_startup(tmp_path, config)
+            startup_returned.set()
+
+        startup_thread = threading.Thread(target=run_startup)
+        startup_thread.start()
+
+        # handle_daemon_startup should return BEFORE recovery finishes
+        assert startup_returned.wait(timeout=3.0), "handle_daemon_startup blocked on recovery"
+
+        # But recovery should still be running in the background
+        assert recovery_started.is_set(), "Recovery never started in background"
+
+        # Now let recovery finish
+        recovery_can_finish.set()
+        startup_thread.join(timeout=3.0)
