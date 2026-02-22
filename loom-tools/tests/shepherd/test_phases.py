@@ -3788,6 +3788,7 @@ class TestBuilderCommitPriorUncommittedWork:
         worktree = tmp_path / "worktree"
         worktree.mkdir()
         mock_context.worktree_path = worktree
+        mock_context.repo_root = tmp_path  # worktree != repo_root
         mock_context.config.issue = 42
 
         calls: list[tuple[str, ...]] = []
@@ -3818,6 +3819,84 @@ class TestBuilderCommitPriorUncommittedWork:
         commit_calls = [c for c in cmd_strs if "commit -m" in c]
         assert commit_calls, "Expected a commit call"
         assert any("prior-run-checkpoint" in " ".join(c) for c in calls if "commit" in " ".join(c))
+
+    def test_refuses_commit_when_worktree_path_equals_repo_root(
+        self, tmp_path: Path, mock_context: MagicMock
+    ) -> None:
+        """Should refuse to commit when worktree_path equals repo_root.
+
+        This guards against the scenario where ctx.worktree_path was incorrectly
+        set to the main repo root, which would cause checkpoint commits to land
+        on the main branch (see issue #2896).
+        """
+        builder = BuilderPhase()
+        # Make worktree_path equal to repo_root — the bad scenario
+        mock_context.worktree_path = tmp_path
+        mock_context.repo_root = tmp_path
+        mock_context.config.issue = 42
+
+        calls: list[str] = []
+
+        def fake_run(cmd, **kwargs):
+            calls.append(" ".join(str(c) for c in cmd))
+            return subprocess.CompletedProcess(
+                args=cmd, returncode=0, stdout="M  file.py\n", stderr=""
+            )
+
+        with patch(
+            "loom_tools.shepherd.phases.builder.subprocess.run",
+            side_effect=fake_run,
+        ):
+            result = builder._commit_prior_uncommitted_work(mock_context)
+
+        assert result is False, "Must refuse when worktree_path == repo_root"
+        # Must not have called any git commands
+        assert not any("add" in c or "commit" in c for c in calls), (
+            "Must not stage or commit when worktree_path == repo_root"
+        )
+
+    def test_refuses_commit_when_branch_is_main(
+        self, tmp_path: Path, mock_context: MagicMock
+    ) -> None:
+        """Should refuse to commit when the worktree is checked out on 'main'.
+
+        This guards against checkpoint commits landing on the default branch when
+        the worktree's branch was reset or incorrectly configured (see issue #2896).
+        """
+        builder = BuilderPhase()
+        worktree = tmp_path / "worktree"
+        worktree.mkdir()
+        mock_context.worktree_path = worktree
+        mock_context.repo_root = tmp_path  # worktree != repo_root
+        mock_context.config.issue = 42
+
+        calls: list[str] = []
+
+        def fake_run(cmd, **kwargs):
+            cmd_str = " ".join(str(c) for c in cmd)
+            calls.append(cmd_str)
+            result = subprocess.CompletedProcess(
+                args=cmd, returncode=0, stdout="", stderr=""
+            )
+            if "rev-parse --abbrev-ref HEAD" in cmd_str:
+                result.stdout = "main"  # Worktree checked out on main
+            elif "status --porcelain" in cmd_str:
+                result.stdout = "M  src/file.py\n"
+            return result
+
+        with patch(
+            "loom_tools.shepherd.phases.builder.subprocess.run",
+            side_effect=fake_run,
+        ):
+            result = builder._commit_prior_uncommitted_work(mock_context)
+
+        assert result is False, "Must refuse when worktree branch is 'main'"
+        assert not any("add -A" in c for c in calls), (
+            "Must not stage changes when worktree is on 'main'"
+        )
+        assert not any("commit -m" in c for c in calls), (
+            "Must not commit when worktree is on 'main'"
+        )
 
     def test_no_changes_returns_false(
         self, tmp_path: Path, mock_context: MagicMock
