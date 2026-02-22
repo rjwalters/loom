@@ -115,7 +115,7 @@ def run(ctx: DaemonContext) -> int:
             commands = command_poller.poll()
             if commands:
                 log_info(f"Iteration {ctx.iteration}: Processing {len(commands)} signal command(s)")
-                _process_commands(ctx, commands)
+                _process_commands(ctx, commands, command_poller)
                 # Update signal_queue_depth in state file after processing
                 _update_signal_queue_depth(ctx, command_poller.queue_depth())
 
@@ -188,11 +188,15 @@ def _responsive_sleep(
         commands = command_poller.poll()
         if commands:
             log_info(f"Sleep-tick: processing {len(commands)} signal command(s)")
-            _process_commands(ctx, commands)
+            _process_commands(ctx, commands, command_poller)
             _update_signal_queue_depth(ctx, command_poller.queue_depth())
 
 
-def _process_commands(ctx: DaemonContext, commands: list[dict]) -> None:
+def _process_commands(
+    ctx: DaemonContext,
+    commands: list[dict],
+    command_poller: CommandPoller | None = None,
+) -> None:
     """Process IPC command signals from the /loom Claude Code skill.
 
     Commands are JSON dicts consumed from .loom/signals/ by CommandPoller.
@@ -218,7 +222,7 @@ def _process_commands(ctx: DaemonContext, commands: list[dict]) -> None:
                 log_warning("spawn_shepherd command missing 'issue' field, skipping")
                 continue
             log_info(f"Signal: spawn_shepherd issue=#{issue} mode={mode} flags={flags}")
-            _spawn_shepherd_from_signal(ctx, issue, mode, flags)
+            _spawn_shepherd_from_signal(ctx, issue, mode, flags, command_poller)
 
         elif action == "stop":
             log_info("Signal: stop — initiating graceful daemon shutdown")
@@ -257,6 +261,7 @@ def _spawn_shepherd_from_signal(
     issue: int,
     mode: str,
     flags: list[str],
+    command_poller: CommandPoller | None = None,
 ) -> None:
     """Spawn a shepherd for an issue in response to a spawn_shepherd signal.
 
@@ -281,7 +286,20 @@ def _spawn_shepherd_from_signal(
 
     # Find or allocate a shepherd slot
     if ctx.state is None:
-        log_warning("Signal spawn: no daemon state loaded, cannot track shepherd")
+        # Daemon state not yet loaded (e.g. first iteration hasn't run).
+        # Re-queue the signal so it is retried on the next sleep-tick poll
+        # rather than being silently dropped.
+        cmd = {"action": "spawn_shepherd", "issue": issue, "mode": mode, "flags": flags}
+        if command_poller is not None and command_poller.requeue(cmd):
+            log_warning(
+                f"Signal spawn: no daemon state loaded, re-queued spawn_shepherd "
+                f"for issue #{issue}"
+            )
+        else:
+            log_warning(
+                f"Signal spawn: no daemon state loaded and re-queue failed, "
+                f"spawn_shepherd for issue #{issue} dropped"
+            )
         return
 
     shepherd_name = _find_idle_shepherd_slot(ctx)
