@@ -905,6 +905,35 @@ def validate_builder(
                 "No PR found and no changes in worktree.",
             )
 
+    # Guard: only .no-changes-needed committed (no uncommitted changes)?
+    # Mirrors builder.py's `only_marker_committed` detection.
+    # When status_output is empty but we reach here, there ARE unpushed commits
+    # (we didn't early-return above).  Check if those commits only add the
+    # no-changes-needed marker file (".no-changes-needed" — see builder.py).
+    if not status_output:
+        r = subprocess.run(
+            ["git", "-C", worktree, "diff", "--name-only", "@{upstream}..HEAD"],
+            capture_output=True, text=True, check=False,
+        )
+        committed_files = (
+            [f.strip() for f in r.stdout.splitlines() if f.strip()]
+            if r.returncode == 0 else []
+        )
+        if committed_files == [".no-changes-needed"]:
+            diag = _gather_builder_diagnostics(issue, worktree, repo_root)
+            _mark_phase_failed(
+                issue, "builder",
+                "Builder committed only the .no-changes-needed marker — "
+                "treating as 'no changes needed', skipping recovery PR.",
+                repo_root, diag.to_markdown(),
+                failure_label="loom:blocked",
+                quiet=quiet,
+            )
+            return ValidationResult(
+                "builder", issue, ValidationStatus.FAILED,
+                "No substantive changes to recover (only .no-changes-needed committed).",
+            )
+
     # Guard: only marker files?
     if status_output:
         substantive = [

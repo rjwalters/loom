@@ -1035,6 +1035,67 @@ class TestBuilderRecoveryFromUncommittedChanges:
         assert result.status == ValidationStatus.FAILED
         assert "marker files" in result.message.lower()
 
+    @patch("loom_tools.validate_phase.subprocess.run")
+    @patch("loom_tools.validate_phase._find_pr_for_issue")
+    @patch("loom_tools.validate_phase._run_gh")
+    def test_committed_no_changes_needed_marker_skips_recovery_pr(
+        self, mock_gh: MagicMock, mock_find: MagicMock, mock_run: MagicMock, tmp_path: Path,
+    ):
+        """Verify that a committed .no-changes-needed marker (no uncommitted changes)
+        does not trigger a recovery PR.
+
+        This tests the parallel case to test_only_marker_files_still_fails:
+        the builder committed .no-changes-needed and exited cleanly, leaving
+        the worktree with no uncommitted changes but one unpushed commit.
+        validate_builder should detect this and return FAILED without creating a PR.
+        """
+        repo = _make_repo(tmp_path)
+        wt = self._make_worktree(tmp_path)
+
+        mock_gh.return_value = _completed(stdout="OPEN\n")
+        mock_find.return_value = None
+
+        def side_effect_fn(*args, **kwargs):
+            cmd = args[0] if args else kwargs.get("args", [])
+            cmd_str = " ".join(str(c) for c in cmd)
+            # git status --porcelain: empty (nothing uncommitted)
+            if "status" in cmd and "--porcelain" in cmd:
+                return _completed(stdout="")
+            # git log @{upstream}..HEAD: non-empty (one unpushed commit)
+            if "log" in cmd and "--oneline" in cmd:
+                return _completed(stdout="abc1234 Builder: committed no-changes-needed\n")
+            # git diff --name-only @{upstream}..HEAD: only .no-changes-needed
+            if "diff" in cmd and "--name-only" in cmd:
+                return _completed(stdout=".no-changes-needed\n")
+            # For _mark_phase_failed and _gather_builder_diagnostics
+            if "rev-parse" in cmd_str:
+                return _completed(stdout="feature/issue-42\n")
+            if "rev-list" in cmd_str:
+                return _completed(stdout="0\n")
+            if "ls-remote" in cmd_str:
+                return _completed(stdout="")
+            if "pr" in cmd_str and "list" in cmd_str:
+                return _completed(stdout="")
+            if "issue" in cmd_str and "view" in cmd_str:
+                return _completed(stdout="loom:building\n")
+            return _completed()
+
+        mock_run.side_effect = side_effect_fn
+
+        result = validate_builder(42, repo, worktree=str(wt))
+
+        assert result.status == ValidationStatus.FAILED
+        assert "no-changes-needed" in result.message.lower() or "no substantive changes" in result.message.lower()
+        # Verify no gh pr create call was made
+        for call in mock_run.call_args_list:
+            cmd = call.args[0] if call.args else call.kwargs.get("args", [])
+            # Only check actual subprocess.run calls (list args), not _run_gh calls
+            if not isinstance(cmd, list):
+                continue
+            assert not (len(cmd) >= 4 and cmd[0] == "gh" and cmd[1] == "pr" and cmd[2] == "create"), (
+                f"gh pr create should not have been called, but got: {cmd}"
+            )
+
 
 # ---------------------------------------------------------------------------
 # Rate-limited builder exit detection (issue #2774)
