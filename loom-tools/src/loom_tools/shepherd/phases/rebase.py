@@ -82,6 +82,15 @@ class RebasePhase(BasePhase):
             return self.shutdown("shutdown signal detected")
 
         if ctx.worktree_path is None or not ctx.worktree_path.is_dir():
+            if ctx.pr_number and _is_pr_mergeable(ctx.pr_number, str(ctx.repo_root)):
+                log_info(
+                    f"No worktree available but PR #{ctx.pr_number} is CLEAN on GitHub"
+                    f" — skipping rebase"
+                )
+                return self.success(
+                    "no worktree available but PR is mergeable on GitHub",
+                    {"reason": "github_mergeable_fallback"},
+                )
             return self.failed(
                 "no worktree path available for rebase",
                 {"reason": "no_worktree"},

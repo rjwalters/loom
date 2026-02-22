@@ -132,11 +132,15 @@ class TestRebasePhase:
         assert "comment" in call_args[0][0][2]
 
     def test_no_worktree_fails_gracefully(self, mock_context: MagicMock) -> None:
-        """When no worktree path is available, should FAIL gracefully."""
+        """When no worktree path is available and PR is not CLEAN, should FAIL gracefully."""
         mock_context.worktree_path = None
         phase = RebasePhase()
 
-        result = phase.run(mock_context)
+        with patch(
+            "loom_tools.shepherd.phases.rebase._is_pr_mergeable",
+            return_value=False,
+        ):
+            result = phase.run(mock_context)
 
         assert result.status == PhaseStatus.FAILED
         assert "no worktree" in result.message
@@ -145,14 +149,69 @@ class TestRebasePhase:
     def test_nonexistent_worktree_fails_gracefully(
         self, mock_context: MagicMock
     ) -> None:
-        """When worktree path doesn't exist on disk, should FAIL gracefully."""
+        """When worktree path doesn't exist on disk and PR is not CLEAN, should FAIL gracefully."""
         mock_context.worktree_path = Path("/nonexistent/path")
         phase = RebasePhase()
 
-        result = phase.run(mock_context)
+        with patch(
+            "loom_tools.shepherd.phases.rebase._is_pr_mergeable",
+            return_value=False,
+        ):
+            result = phase.run(mock_context)
 
         assert result.status == PhaseStatus.FAILED
         assert "no worktree" in result.message
+
+    def test_no_worktree_but_pr_is_clean_on_github_succeeds(
+        self, mock_context: MagicMock
+    ) -> None:
+        """When no worktree is available but GitHub says PR is CLEAN, should SUCCESS."""
+        mock_context.worktree_path = None
+        phase = RebasePhase()
+
+        with patch(
+            "loom_tools.shepherd.phases.rebase._is_pr_mergeable",
+            return_value=True,
+        ):
+            result = phase.run(mock_context)
+
+        assert result.status == PhaseStatus.SUCCESS
+        assert "mergeable on GitHub" in result.message
+        assert result.data.get("reason") == "github_mergeable_fallback"
+
+    def test_nonexistent_worktree_but_pr_is_clean_on_github_succeeds(
+        self, mock_context: MagicMock
+    ) -> None:
+        """When worktree dir is missing but GitHub says PR is CLEAN, should SUCCESS."""
+        mock_context.worktree_path = Path("/nonexistent/path")
+        phase = RebasePhase()
+
+        with patch(
+            "loom_tools.shepherd.phases.rebase._is_pr_mergeable",
+            return_value=True,
+        ):
+            result = phase.run(mock_context)
+
+        assert result.status == PhaseStatus.SUCCESS
+        assert "mergeable on GitHub" in result.message
+        assert result.data.get("reason") == "github_mergeable_fallback"
+
+    def test_no_worktree_no_pr_number_fails_without_github_check(
+        self, mock_context: MagicMock
+    ) -> None:
+        """When no worktree and no PR number, should FAIL without calling _is_pr_mergeable."""
+        mock_context.worktree_path = None
+        mock_context.pr_number = None
+        phase = RebasePhase()
+
+        with patch(
+            "loom_tools.shepherd.phases.rebase._is_pr_mergeable",
+        ) as mock_mergeable:
+            result = phase.run(mock_context)
+
+        assert result.status == PhaseStatus.FAILED
+        assert result.data.get("reason") == "no_worktree"
+        mock_mergeable.assert_not_called()
 
     def test_shutdown_signal(self, mock_context: MagicMock) -> None:
         """When shutdown is signaled, should return SHUTDOWN."""
