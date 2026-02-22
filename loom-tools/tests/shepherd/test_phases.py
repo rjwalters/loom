@@ -1561,6 +1561,67 @@ class TestBuilderCheckpointResume:
         assert "prior checkpoint recovery failed" in result.message
         assert result.data.get("prior_commits") == 2
 
+    def test_validation_loop_returns_success_on_api_propagation_race(
+        self, mock_context: MagicMock
+    ) -> None:
+        """Validation loop returns SUCCESS when PR exists with review label despite
+        validate() returning False (API propagation race).
+
+        When the builder exits with code 0 but validate_phase() returns False
+        (PR not yet visible due to GitHub API eventual consistency), and
+        _gather_diagnostics() finds a PR with loom:review-requested moments
+        later, the validation loop should detect the api_propagation_race
+        and return PhaseResult(status=SUCCESS, data={"api_propagation_race": True}).
+        See issue #2961.
+        """
+        mock_context.check_shutdown.return_value = False
+        mock_context.config.planning_timeout = 600
+        mock_context.pr_number = None
+        wt_mock = MagicMock()
+        wt_mock.is_dir.return_value = True
+        wt_mock.__bool__ = lambda self: True
+        mock_context.worktree_path = wt_mock
+
+        builder = BuilderPhase()
+        race_diag = {
+            "summary": "PR #999 (with loom:review-requested)",
+            "pr_number": 999,
+            "pr_has_review_label": True,
+        }
+
+        with (
+            patch(
+                "loom_tools.shepherd.phases.builder.get_pr_for_issue",
+                return_value=None,
+            ),
+            patch("loom_tools.shepherd.phases.builder.transition_issue_labels"),
+            patch(
+                "loom_tools.shepherd.phases.builder.run_phase_with_retry",
+                return_value=0,
+            ),
+            patch.object(builder, "_create_worktree_marker"),
+            patch.object(
+                builder, "_snapshot_main_dirty", return_value=set()
+            ),
+            patch.object(builder, "_detect_worktree_escape", return_value=None),
+            patch.object(builder, "_run_quality_validation", return_value=None),
+            patch.object(builder, "_run_reproducibility_check", return_value=None),
+            patch.object(builder, "_is_stale_worktree", return_value=False),
+            patch.object(builder, "_count_commits_ahead_of_main", return_value=0),
+            patch.object(builder, "_is_rate_limited", return_value=False),
+            patch.object(builder, "validate", return_value=False),
+            patch.object(builder, "_run_test_verification", return_value=None),
+            patch.object(builder, "_gather_diagnostics", return_value=race_diag),
+            patch.object(builder, "_has_incomplete_work", return_value=False),
+        ):
+            result = builder.run(mock_context)
+
+        assert result.status == PhaseStatus.SUCCESS
+        assert "PR #999" in result.message
+        assert result.data.get("api_propagation_race") is True
+        assert result.data.get("pr_number") == 999
+        assert mock_context.pr_number == 999
+
 
 class TestExtractThinkingSnippet:
     """Unit tests for _extract_thinking_snippet helper."""
