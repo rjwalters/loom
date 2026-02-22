@@ -3612,7 +3612,9 @@ class TestBuilderCommitPriorUncommittedWork:
             result = subprocess.CompletedProcess(
                 args=cmd, returncode=0, stdout="", stderr=""
             )
-            if "status --porcelain" in cmd_str:
+            if "rev-parse" in cmd_str and "abbrev-ref" in cmd_str:
+                result.stdout = "feature/issue-42\n"
+            elif "status --porcelain" in cmd_str:
                 result.stdout = "M  src/file.py\n"
             return result
 
@@ -3795,6 +3797,73 @@ class TestBuilderCommitPriorUncommittedWork:
         # (e.g. "/tmp/pytest-.../test_does_not_push_to_remote0/worktree").
         assert not any("push" in c.split() for c in calls), "Should not push to remote"
 
+    def test_wrong_branch_returns_false(
+        self, tmp_path: Path, mock_context: MagicMock
+    ) -> None:
+        """Should return False without committing when worktree is on wrong branch."""
+        builder = BuilderPhase()
+        worktree = tmp_path / "worktree"
+        worktree.mkdir()
+        mock_context.worktree_path = worktree
+        mock_context.config.issue = 42
+
+        calls: list[str] = []
+
+        def fake_run(cmd, **kwargs):
+            cmd_str = " ".join(str(c) for c in cmd)
+            calls.append(cmd_str)
+            result = subprocess.CompletedProcess(
+                args=cmd, returncode=0, stdout="", stderr=""
+            )
+            if "rev-parse" in cmd_str and "abbrev-ref" in cmd_str:
+                result.stdout = "main\n"  # Wrong branch
+            elif "status --porcelain" in cmd_str:
+                result.stdout = "M  src/file.py\n"
+            return result
+
+        with patch(
+            "loom_tools.shepherd.phases.builder.subprocess.run",
+            side_effect=fake_run,
+        ):
+            result = builder._commit_prior_uncommitted_work(mock_context)
+
+        assert result is False
+        assert not any("add -A" in c for c in calls), "Should not stage changes on wrong branch"
+        assert not any("commit -m" in c for c in calls), "Should not commit on wrong branch"
+
+    def test_rev_parse_failure_returns_false(
+        self, tmp_path: Path, mock_context: MagicMock
+    ) -> None:
+        """Should return False when git rev-parse exits with non-zero returncode."""
+        builder = BuilderPhase()
+        worktree = tmp_path / "worktree"
+        worktree.mkdir()
+        mock_context.worktree_path = worktree
+        mock_context.config.issue = 42
+
+        calls: list[str] = []
+
+        def fake_run(cmd, **kwargs):
+            cmd_str = " ".join(str(c) for c in cmd)
+            calls.append(cmd_str)
+            if "rev-parse" in cmd_str and "abbrev-ref" in cmd_str:
+                return subprocess.CompletedProcess(
+                    args=cmd, returncode=128, stdout="", stderr="fatal: not a git repository"
+                )
+            return subprocess.CompletedProcess(
+                args=cmd, returncode=0, stdout="M  src/file.py\n", stderr=""
+            )
+
+        with patch(
+            "loom_tools.shepherd.phases.builder.subprocess.run",
+            side_effect=fake_run,
+        ):
+            result = builder._commit_prior_uncommitted_work(mock_context)
+
+        assert result is False
+        assert not any("add -A" in c for c in calls), "Should not stage changes when rev-parse fails"
+        assert not any("commit -m" in c for c in calls), "Should not commit when rev-parse fails"
+
 
 class TestBuilderCommitInterruptedWork:
     """Test BuilderPhase._commit_interrupted_work for preserving work on interruption."""
@@ -3820,7 +3889,9 @@ class TestBuilderCommitInterruptedWork:
             result = subprocess.CompletedProcess(
                 args=cmd, returncode=0, stdout="", stderr=""
             )
-            if "status --porcelain" in cmd_str:
+            if "rev-parse" in cmd_str and "abbrev-ref" in cmd_str:
+                result.stdout = "feature/issue-42\n"
+            elif "status --porcelain" in cmd_str:
                 result.stdout = "M  file.py\n"  # Has changes
             return result
 
@@ -3908,7 +3979,9 @@ class TestBuilderCommitInterruptedWork:
             result = subprocess.CompletedProcess(
                 args=cmd, returncode=0, stdout="", stderr=""
             )
-            if "status --porcelain" in cmd_str:
+            if "rev-parse" in cmd_str and "abbrev-ref" in cmd_str:
+                result.stdout = "feature/issue-42\n"
+            elif "status --porcelain" in cmd_str:
                 result.stdout = "M  file.py\n"
             return result
 
@@ -3997,6 +4070,73 @@ class TestBuilderCommitInterruptedWork:
         # Should NOT have called git add or git commit
         assert not any("add -A" in c for c in calls), "Should not stage artifacts"
         assert not any("commit -m" in c for c in calls), "Should not create commit"
+
+    def test_commit_interrupted_wrong_branch_returns_false(
+        self, tmp_path: Path, mock_context: MagicMock
+    ) -> None:
+        """Should return False without committing when worktree is on wrong branch."""
+        builder = BuilderPhase()
+        worktree = tmp_path / "worktree"
+        worktree.mkdir()
+        mock_context.worktree_path = worktree
+        mock_context.config.issue = 42
+
+        calls: list[str] = []
+
+        def fake_run(cmd, **kwargs):
+            cmd_str = " ".join(str(c) for c in cmd)
+            calls.append(cmd_str)
+            result = subprocess.CompletedProcess(
+                args=cmd, returncode=0, stdout="", stderr=""
+            )
+            if "rev-parse" in cmd_str and "abbrev-ref" in cmd_str:
+                result.stdout = "main\n"  # Wrong branch
+            elif "status --porcelain" in cmd_str:
+                result.stdout = "M  src/file.py\n"
+            return result
+
+        with patch(
+            "loom_tools.shepherd.phases.builder.subprocess.run",
+            side_effect=fake_run,
+        ):
+            result = builder._commit_interrupted_work(mock_context, "builder exited with code 1")
+
+        assert result is False
+        assert not any("add -A" in c for c in calls), "Should not stage changes on wrong branch"
+        assert not any("commit -m" in c for c in calls), "Should not commit on wrong branch"
+
+    def test_commit_interrupted_rev_parse_failure_returns_false(
+        self, tmp_path: Path, mock_context: MagicMock
+    ) -> None:
+        """Should return False when git rev-parse exits with non-zero returncode."""
+        builder = BuilderPhase()
+        worktree = tmp_path / "worktree"
+        worktree.mkdir()
+        mock_context.worktree_path = worktree
+        mock_context.config.issue = 42
+
+        calls: list[str] = []
+
+        def fake_run(cmd, **kwargs):
+            cmd_str = " ".join(str(c) for c in cmd)
+            calls.append(cmd_str)
+            if "rev-parse" in cmd_str and "abbrev-ref" in cmd_str:
+                return subprocess.CompletedProcess(
+                    args=cmd, returncode=128, stdout="", stderr="fatal: not a git repository"
+                )
+            return subprocess.CompletedProcess(
+                args=cmd, returncode=0, stdout="M  src/file.py\n", stderr=""
+            )
+
+        with patch(
+            "loom_tools.shepherd.phases.builder.subprocess.run",
+            side_effect=fake_run,
+        ):
+            result = builder._commit_interrupted_work(mock_context, "builder exited with code 1")
+
+        assert result is False
+        assert not any("add -A" in c for c in calls), "Should not stage changes when rev-parse fails"
+        assert not any("commit -m" in c for c in calls), "Should not commit when rev-parse fails"
 
 
 class TestBuilderHasUncommittedChanges:
