@@ -24,8 +24,12 @@ import pathlib
 
 import pytest
 
+import subprocess
+from unittest.mock import MagicMock, patch
+
 from loom_tools.worktree import (
     WorktreeResult,
+    _handle_feature_branch_in_main_worktree,
     main,
 )
 
@@ -193,3 +197,173 @@ class TestDocumentedBehaviorDifferences:
         and avoids needing to checkout or update the local main branch.
         """
         pass
+
+    def test_feature_branch_in_main_worktree_recovery(self) -> None:
+        """Document: worktree creation detects and recovers from feature branch in main worktree.
+
+        When git worktree add fails with "is already used by worktree at <main-path>",
+        the helper detects whether the conflict is in the main worktree and
+        auto-switches it to main (if clean) before retrying.
+
+        This fixes the failure observed in shepherd runs where a previous builder
+        left feature/issue-N checked out in the main workspace.
+        See issue #2924.
+        """
+        from loom_tools.worktree import _handle_feature_branch_in_main_worktree
+
+        assert callable(_handle_feature_branch_in_main_worktree)
+
+
+class TestHandleFeatureBranchInMainWorktree:
+    """Tests for the feature-branch-in-main-worktree detection and recovery helper."""
+
+    def test_non_matching_error_returns_not_handled(self) -> None:
+        """Unrelated git errors are not handled by this function."""
+        handled, retry = _handle_feature_branch_in_main_worktree(
+            "fatal: some other git error",
+            "feature/issue-42",
+            42,
+        )
+        assert not handled
+        assert not retry
+
+    def test_empty_error_returns_not_handled(self) -> None:
+        """Empty error output is not handled."""
+        handled, retry = _handle_feature_branch_in_main_worktree(
+            "",
+            "feature/issue-42",
+            42,
+        )
+        assert not handled
+        assert not retry
+
+    def test_matching_error_with_no_parseable_path_returns_handled(
+        self,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """Error with unparseable path is handled (message printed) but no retry."""
+        # Error message that matches but path extraction fails
+        error = "fatal: 'feature/issue-42' is already used by worktree at"
+        handled, retry = _handle_feature_branch_in_main_worktree(
+            error,
+            "feature/issue-42",
+            42,
+        )
+        assert handled
+        assert not retry
+        captured = capsys.readouterr()
+        # Should print guidance about git worktree list
+        assert "git worktree list" in captured.out or "git worktree list" in captured.err
+
+    def test_matching_error_conflict_not_main_workspace(
+        self,
+        tmp_path: pathlib.Path,
+        capsys: pytest.CaptureFixture[str],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Error where conflict is NOT in the main workspace gets handled with guidance."""
+        conflict_path = tmp_path / "some-other-worktree"
+        conflict_path.mkdir()
+
+        # Simulate a path that doesn't match the main workspace
+        error = (
+            f"fatal: 'feature/issue-42' is already used by worktree at '{conflict_path}'"
+        )
+
+        # Mock _get_main_workspace to return a different path
+        main_path = tmp_path / "main-workspace"
+        main_path.mkdir()
+        with patch("loom_tools.worktree._get_main_workspace", return_value=main_path):
+            handled, retry = _handle_feature_branch_in_main_worktree(
+                error,
+                "feature/issue-42",
+                42,
+            )
+
+        assert handled
+        assert not retry
+        captured = capsys.readouterr()
+        # Should print guidance showing the conflict path
+        combined = captured.out + captured.err
+        assert str(conflict_path) in combined
+
+    def test_matching_error_main_workspace_with_uncommitted_changes(
+        self,
+        tmp_path: pathlib.Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """When main workspace has uncommitted changes, handled=True retry=False."""
+        main_path = tmp_path / "main-workspace"
+        main_path.mkdir()
+        conflict_path = main_path  # conflict IS the main workspace
+
+        error = (
+            f"fatal: 'feature/issue-42' is already used by worktree at '{conflict_path}'"
+        )
+
+        def mock_run_git(
+            args: list[str],
+            cwd: pathlib.Path | str | None = None,
+            check: bool = True,
+        ) -> subprocess.CompletedProcess[str]:
+            if args == ["status", "--porcelain"]:
+                result: subprocess.CompletedProcess[str] = MagicMock()
+                result.returncode = 0
+                result.stdout = "M some_file.py\n"
+                return result
+            # Fallback
+            result = MagicMock()
+            result.returncode = 0
+            result.stdout = ""
+            return result
+
+        with patch("loom_tools.worktree._get_main_workspace", return_value=main_path):
+            with patch("loom_tools.worktree._run_git", side_effect=mock_run_git):
+                handled, retry = _handle_feature_branch_in_main_worktree(
+                    error,
+                    "feature/issue-42",
+                    42,
+                )
+
+        assert handled
+        assert not retry
+        captured = capsys.readouterr()
+        combined = captured.out + captured.err
+        # Should mention uncommitted changes
+        assert "uncommitted" in combined.lower() or "stash" in combined.lower()
+
+    def test_matching_error_main_workspace_clean_auto_recovers(
+        self,
+        tmp_path: pathlib.Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """When main workspace is clean, auto-switch to main and signal retry."""
+        main_path = tmp_path / "main-workspace"
+        main_path.mkdir()
+        conflict_path = main_path
+
+        error = (
+            f"fatal: 'feature/issue-42' is already used by worktree at '{conflict_path}'"
+        )
+
+        def mock_run_git(
+            args: list[str],
+            cwd: pathlib.Path | str | None = None,
+            check: bool = True,
+        ) -> subprocess.CompletedProcess[str]:
+            result: MagicMock = MagicMock(spec=subprocess.CompletedProcess)
+            result.returncode = 0
+            result.stdout = ""
+            result.stderr = ""
+            return result  # type: ignore[return-value]
+
+        with patch("loom_tools.worktree._get_main_workspace", return_value=main_path):
+            with patch("loom_tools.worktree._run_git", side_effect=mock_run_git):
+                handled, retry = _handle_feature_branch_in_main_worktree(
+                    error,
+                    "feature/issue-42",
+                    42,
+                )
+
+        assert handled
+        assert retry  # Should signal caller to retry worktree creation

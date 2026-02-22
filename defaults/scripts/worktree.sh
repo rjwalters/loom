@@ -371,7 +371,152 @@ if [[ "$JSON_OUTPUT" != "true" ]]; then
     echo ""
 fi
 
-if git worktree add "${CREATE_ARGS[@]}"; then
+# Helper: attempt recovery when feature branch is checked out in the main worktree.
+# This happens when a previous builder manually checked out feature/issue-N in the
+# main workspace and left it there.  Git refuses to create a new worktree for that
+# branch: "fatal: 'feature/issue-N' is already used by worktree at '<main-path>'"
+#
+# Recovery strategy:
+#   1. Detect the "already used by worktree at" pattern in stderr
+#   2. Confirm the conflicting worktree is the main workspace (not a feature worktree)
+#   3. If main workspace is clean: auto-switch it back to main and retry
+#   4. If main workspace has uncommitted changes: emit an actionable error message
+_handle_feature_branch_in_main_worktree() {
+    local error_output="$1"
+    local branch="$2"
+
+    # Only act on the specific "already used by worktree at" error
+    if ! echo "$error_output" | grep -q "is already used by worktree at"; then
+        return 1  # Not this error — caller should fail normally
+    fi
+
+    # Extract the conflicting worktree path from the error message
+    # Example: "fatal: 'feature/issue-2853' is already used by worktree at '/Users/rwalters/GitHub/loom'"
+    local conflict_path
+    conflict_path=$(echo "$error_output" | grep -o "is already used by worktree at '[^']*'" | sed "s/is already used by worktree at '//;s/'$//")
+
+    if [[ -z "$conflict_path" ]]; then
+        # Could not parse path — emit a generic actionable message (human-readable only)
+        if [[ "$JSON_OUTPUT" != "true" ]]; then
+            print_error "Cannot create worktree: branch '$branch' is already checked out in another worktree."
+            echo ""
+            echo "  The branch is in use elsewhere. To free it, find the worktree with:"
+            echo "    git worktree list"
+            echo "  Then switch that worktree to main:"
+            echo "    cd <worktree-path> && git checkout main"
+        fi
+        return 0  # Handled (with human-readable message), no retry possible
+    fi
+
+    # Determine the main workspace path
+    local main_workspace
+    main_workspace=$(git rev-parse --git-common-dir 2>/dev/null)
+    main_workspace=$(dirname "$main_workspace" 2>/dev/null)
+
+    # Resolve both paths to absolute for comparison
+    local abs_conflict abs_main
+    abs_conflict=$(cd "$conflict_path" 2>/dev/null && pwd) || abs_conflict="$conflict_path"
+    abs_main=$(cd "$main_workspace" 2>/dev/null && pwd) || abs_main="$main_workspace"
+
+    if [[ "$abs_conflict" != "$abs_main" ]]; then
+        # Conflicting worktree is not the main workspace — it's a different issue worktree.
+        # This is unusual but can happen. Emit actionable guidance without auto-recovery.
+        if [[ "$JSON_OUTPUT" != "true" ]]; then
+            print_error "Cannot create worktree for branch '$branch':"
+            echo "  Branch is already checked out at: $conflict_path"
+            echo ""
+            echo "  To fix:"
+            echo "    cd $conflict_path && git checkout main"
+        fi
+        return 0  # Handled (with error message), no retry
+    fi
+
+    # The conflict is in the main workspace. Check for uncommitted changes.
+    local uncommitted
+    uncommitted=$(git -C "$abs_conflict" status --porcelain 2>/dev/null)
+
+    if [[ -n "$uncommitted" ]]; then
+        # Main workspace has uncommitted changes — cannot auto-recover safely
+        if [[ "$JSON_OUTPUT" != "true" ]]; then
+            print_error "Cannot create worktree for issue #$ISSUE_NUMBER: branch '$branch'"
+            echo "  is already checked out at '$abs_conflict' (main worktree)."
+            echo ""
+            echo "  The main worktree has uncommitted changes — cannot auto-switch."
+            echo "  To fix manually:"
+            echo "    cd $abs_conflict"
+            echo "    git stash  # or commit your changes"
+            echo "    git checkout main"
+            echo "  Then rerun: ./.loom/scripts/worktree.sh $ISSUE_NUMBER"
+        fi
+        return 0  # Handled (with error message), no retry
+    fi
+
+    # Main workspace is clean — auto-switch to main and signal caller to retry
+    if [[ "$JSON_OUTPUT" != "true" ]]; then
+        print_warning "Branch '$branch' is checked out in the main worktree."
+        print_info "Main worktree is clean — auto-switching to main branch..."
+    fi
+
+    if git -C "$abs_conflict" checkout main 2>/dev/null; then
+        if [[ "$JSON_OUTPUT" != "true" ]]; then
+            print_success "Main worktree switched to main branch"
+        fi
+        return 2  # Signal: auto-recovered, caller should retry
+    else
+        if [[ "$JSON_OUTPUT" != "true" ]]; then
+            print_error "Failed to switch main worktree to main branch."
+            echo "  To fix manually:"
+            echo "    cd $abs_conflict && git checkout main"
+            echo "  Then rerun: ./.loom/scripts/worktree.sh $ISSUE_NUMBER"
+        fi
+        return 0  # Handled (with error message), no retry
+    fi
+}
+
+_try_worktree_add() {
+    # Capture stderr separately so we can inspect it on failure while still
+    # showing stdout (git progress messages like "Preparing worktree...") to user.
+    local stderr_file
+    stderr_file=$(mktemp /tmp/loom-worktree-stderr-$$-XXXXXX)
+
+    git worktree add "${CREATE_ARGS[@]}" 2>"$stderr_file"
+    local exit_code=$?
+
+    if [[ $exit_code -eq 0 ]]; then
+        rm -f "$stderr_file"
+        return 0
+    fi
+
+    local worktree_error
+    worktree_error=$(cat "$stderr_file")
+    rm -f "$stderr_file"
+
+    # Attempt recovery for the "feature branch in main worktree" case.
+    # Wrap in a subshell result capture to safely handle non-zero returns
+    # without triggering set -e (we use exit code 2 as a retry signal).
+    local recovery_code=0
+    _handle_feature_branch_in_main_worktree "$worktree_error" "$BRANCH_NAME" && recovery_code=0 || recovery_code=$?
+
+    if [[ $recovery_code -eq 2 ]]; then
+        # Auto-recovered: retry worktree creation once
+        if [[ "$JSON_OUTPUT" != "true" ]]; then
+            print_info "Retrying worktree creation..."
+        fi
+        git worktree add "${CREATE_ARGS[@]}"
+        return $?
+    fi
+
+    if [[ $recovery_code -eq 1 ]]; then
+        # _handle_feature_branch_in_main_worktree returned 1 (not this error type)
+        # Print the original git error since nothing else has
+        echo "$worktree_error" >&2
+    fi
+    # recovery_code == 0 means error was handled and message already printed
+    return 1
+}
+
+
+if _try_worktree_add; then
     # Get absolute path to worktree
     ABS_WORKTREE_PATH=$(cd "$WORKTREE_PATH" && pwd)
 
@@ -520,8 +665,7 @@ if git worktree add "${CREATE_ARGS[@]}"; then
 else
     if [[ "$JSON_OUTPUT" == "true" ]]; then
         echo '{"success": false, "error": "Failed to create worktree"}'
-    else
-        print_error "Failed to create worktree"
     fi
+    # Human-readable error already printed by _try_worktree_add / _handle_feature_branch_in_main_worktree
     exit 1
 fi

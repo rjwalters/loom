@@ -324,6 +324,118 @@ def check_worktree() -> int:
         return 1
 
 
+def _handle_feature_branch_in_main_worktree(
+    error_output: str,
+    branch_name: str,
+    issue_number: int,
+    json_output: bool = False,
+) -> tuple[bool, bool]:
+    """Detect and recover when a feature branch is checked out in the main worktree.
+
+    This condition arises when a previous builder manually checked out
+    ``feature/issue-N`` in the main workspace and left it there.  Git
+    refuses to create a new worktree for that branch with the error:
+    ``fatal: 'feature/issue-N' is already used by worktree at '<path>'``
+
+    Recovery strategy:
+    1. Detect the "already used by worktree at" pattern in stderr.
+    2. Confirm the conflicting worktree is the main workspace.
+    3. If main workspace is clean: auto-switch to ``main`` and return
+       ``(handled=True, retry=True)`` so the caller can retry.
+    4. If main workspace has uncommitted changes: emit an actionable
+       error and return ``(handled=True, retry=False)``.
+
+    Returns:
+        A (handled, retry) tuple:
+        - ``(False, False)`` — not this error, caller should propagate normally.
+        - ``(True, False)``  — this error, handled with message, no retry.
+        - ``(True, True)``   — this error, auto-recovered, caller should retry.
+    """
+    if "is already used by worktree at" not in error_output:
+        return False, False
+
+    # Extract the conflicting worktree path from the error message.
+    # Example: "fatal: 'feature/issue-2853' is already used by worktree at '/path'"
+    import re
+
+    match = re.search(r"is already used by worktree at '([^']+)'", error_output)
+    if not match:
+        # Could not parse path — emit actionable guidance and fail.
+        if not json_output:
+            log_error(
+                f"Cannot create worktree: branch '{branch_name}' is already "
+                "checked out in another worktree."
+            )
+            print()
+            print("  The branch is in use elsewhere. To free it, find the worktree with:")
+            print("    git worktree list")
+            print("  Then switch that worktree to main:")
+            print("    cd <worktree-path> && git checkout main")
+        return True, False
+
+    conflict_path = pathlib.Path(match.group(1)).resolve()
+
+    # Determine the main workspace path for comparison.
+    main_workspace = _get_main_workspace()
+    if main_workspace is None:
+        # Cannot determine main workspace — fall back to generic failure.
+        return False, False
+
+    abs_main = main_workspace.resolve()
+
+    if conflict_path != abs_main:
+        # Conflicting worktree is not the main workspace — it's another issue
+        # worktree.  Emit actionable guidance without auto-recovery.
+        if not json_output:
+            log_error(f"Cannot create worktree for branch '{branch_name}':")
+            print(f"  Branch is already checked out at: {conflict_path}")
+            print()
+            print("  To fix:")
+            print(f"    cd {conflict_path} && git checkout main")
+        return True, False
+
+    # The conflict is in the main workspace.  Check for uncommitted changes.
+    status_result = _run_git(["status", "--porcelain"], cwd=abs_main, check=False)
+    uncommitted = status_result.stdout.strip() if status_result.returncode == 0 else ""
+
+    if uncommitted:
+        # Main workspace has uncommitted changes — cannot auto-recover safely.
+        if not json_output:
+            log_error(
+                f"Cannot create worktree for issue #{issue_number}: "
+                f"branch '{branch_name}'"
+            )
+            print(
+                f"  is already checked out at '{abs_main}' (main worktree)."
+            )
+            print()
+            print("  The main worktree has uncommitted changes — cannot auto-switch.")
+            print("  To fix manually:")
+            print(f"    cd {abs_main}")
+            print("    git stash  # or commit your changes")
+            print("    git checkout main")
+            print(f"  Then rerun: ./.loom/scripts/worktree.sh {issue_number}")
+        return True, False
+
+    # Main workspace is clean — auto-switch to main.
+    if not json_output:
+        log_warning(f"Branch '{branch_name}' is checked out in the main worktree.")
+        log_info("Main worktree is clean — auto-switching to main branch...")
+
+    checkout_result = _run_git(["checkout", "main"], cwd=abs_main, check=False)
+    if checkout_result.returncode == 0:
+        if not json_output:
+            log_success("Main worktree switched to main branch")
+        return True, True  # Auto-recovered: retry worktree creation
+    else:
+        if not json_output:
+            log_error("Failed to switch main worktree to main branch.")
+            print("  To fix manually:")
+            print(f"    cd {abs_main} && git checkout main")
+            print(f"  Then rerun: ./.loom/scripts/worktree.sh {issue_number}")
+        return True, False
+
+
 def create_worktree(
     issue_number: int,
     custom_branch: str | None = None,
@@ -462,7 +574,32 @@ def create_worktree(
 
     result = _run_git(["worktree", "add"] + create_args, check=False)
     if result.returncode != 0:
-        return WorktreeResult(success=False, error="Failed to create worktree")
+        error_output = (result.stderr or result.stdout or "").strip()
+        handled, should_retry = _handle_feature_branch_in_main_worktree(
+            error_output, branch_name, issue_number, json_output
+        )
+
+        if should_retry:
+            # Auto-recovered (main worktree switched to main): retry once.
+            if not json_output:
+                log_info("Retrying worktree creation...")
+            result = _run_git(["worktree", "add"] + create_args, check=False)
+            if result.returncode != 0:
+                error_detail = (result.stderr or result.stdout or "").strip()
+                return WorktreeResult(
+                    success=False,
+                    error=f"Failed to create worktree after auto-recovery: {error_detail}",
+                )
+        elif handled:
+            # Error was handled with a message above — return clean failure.
+            return WorktreeResult(success=False, error="Failed to create worktree")
+        else:
+            # Unrecognised error — propagate git's message.
+            return WorktreeResult(
+                success=False,
+                error=f"Failed to create worktree: {error_output}" if error_output
+                else "Failed to create worktree",
+            )
 
     # Get absolute path
     abs_worktree_path = worktree_path.resolve()
