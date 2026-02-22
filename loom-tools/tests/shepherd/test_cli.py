@@ -4603,12 +4603,14 @@ class TestRecordFallbackFailure:
     @patch("loom_tools.shepherd.cli.get_pr_for_issue", return_value=None)
     @patch("subprocess.run")
     @patch("loom_tools.shepherd.cli.transition_issue_labels")
+    @patch("loom_tools.shepherd.cli._get_prior_failure_info", return_value=(3, 3, "builder_unknown_failure"))
     @patch("loom_tools.common.systematic_failure.detect_systematic_failure")
     @patch("loom_tools.common.systematic_failure.record_blocked_reason")
     def test_escalates_on_systematic_failure(
         self,
         mock_record: MagicMock,
         mock_detect: MagicMock,
+        mock_prior_info: MagicMock,
         mock_transition: MagicMock,
         mock_subprocess: MagicMock,
         mock_get_pr: MagicMock,
@@ -4643,6 +4645,89 @@ class TestRecordFallbackFailure:
         assert "Systematic failure detected" in comment_body
         assert "builder_unknown_failure" in comment_body
         assert "3" in comment_body
+
+    @patch("loom_tools.shepherd.cli.get_pr_for_issue", return_value=None)
+    @patch("subprocess.run")
+    @patch("loom_tools.shepherd.cli.transition_issue_labels")
+    @patch("loom_tools.shepherd.cli._get_prior_failure_info", return_value=(1, 3, "builder_unknown_failure"))
+    @patch("loom_tools.common.systematic_failure.detect_systematic_failure")
+    @patch("loom_tools.common.systematic_failure.record_blocked_reason")
+    def test_no_escalation_when_systematic_failure_but_low_per_issue_count(
+        self,
+        mock_record: MagicMock,
+        mock_detect: MagicMock,
+        mock_prior_info: MagicMock,
+        mock_transition: MagicMock,
+        mock_subprocess: MagicMock,
+        mock_get_pr: MagicMock,
+    ) -> None:
+        """Should NOT escalate when systematic failure is cross-issue but per-issue count is low.
+
+        This is the bug described in issue #2919: an issue with only 1 prior failure
+        should not be blocked just because other unrelated issues accumulated the same
+        error class in the global recent_failures window.
+        """
+        from loom_tools.models.daemon_state import SystematicFailure
+
+        # Systematic failure is detected globally (3 cross-issue failures of same class)
+        mock_detect.return_value = SystematicFailure(
+            active=True, pattern="builder_unknown_failure", count=3,
+        )
+        # But this issue has only 1 failure of its own (well below threshold of 3)
+
+        ctx = MagicMock()
+        ctx.config.issue = 42
+        ctx.repo_root = Path("/fake/repo")
+
+        _record_fallback_failure(ctx, ShepherdExitCode.BUILDER_FAILED)
+
+        # Should NOT transition labels — issue has not exhausted its own retry budget
+        mock_transition.assert_not_called()
+        # Should NOT post escalation comment
+        mock_subprocess.assert_not_called()
+
+    @patch("loom_tools.shepherd.cli.get_pr_for_issue", return_value=None)
+    @patch("subprocess.run")
+    @patch("loom_tools.shepherd.cli.transition_issue_labels")
+    @patch("loom_tools.shepherd.cli._get_prior_failure_info", return_value=(3, 3, "builder_unknown_failure"))
+    @patch("loom_tools.common.systematic_failure.detect_systematic_failure")
+    @patch("loom_tools.common.systematic_failure.record_blocked_reason")
+    def test_escalates_when_per_issue_count_meets_threshold(
+        self,
+        mock_record: MagicMock,
+        mock_detect: MagicMock,
+        mock_prior_info: MagicMock,
+        mock_transition: MagicMock,
+        mock_subprocess: MagicMock,
+        mock_get_pr: MagicMock,
+    ) -> None:
+        """Should escalate when per-issue failure count reaches the threshold.
+
+        When this issue has accumulated at least `threshold` failures of the same
+        error class, it should be blocked even if only its own failures (not just
+        cross-issue failures) drive the pattern.
+        """
+        from loom_tools.models.daemon_state import SystematicFailure
+
+        mock_detect.return_value = SystematicFailure(
+            active=True, pattern="builder_unknown_failure", count=3,
+        )
+        # Per-issue count equals threshold — escalation should fire
+
+        ctx = MagicMock()
+        ctx.config.issue = 42
+        ctx.repo_root = Path("/fake/repo")
+
+        _record_fallback_failure(ctx, ShepherdExitCode.BUILDER_FAILED)
+
+        # Should transition labels since this issue itself has hit the threshold
+        mock_transition.assert_called_once_with(
+            42,
+            add=["loom:blocked"],
+            remove=["loom:issue"],
+            repo_root=Path("/fake/repo"),
+        )
+        mock_subprocess.assert_called_once()
 
     @patch("loom_tools.shepherd.cli.get_pr_for_issue", return_value=None)
     @patch("loom_tools.shepherd.cli.transition_issue_labels")
