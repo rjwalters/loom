@@ -11,6 +11,7 @@ import sys
 import time
 from typing import Any
 
+from loom_tools.common.github import gh_issue_view
 from loom_tools.common.issue_failures import load_failure_log, merge_into_daemon_state
 from loom_tools.common.logging import log_error, log_info, log_success, log_warning
 from loom_tools.common.state import read_json_file, write_json_file
@@ -308,6 +309,19 @@ def _spawn_shepherd_from_signal(
                 f"Signal spawn: no daemon state loaded and re-queue failed, "
                 f"spawn_shepherd for issue #{issue} dropped"
             )
+        return
+
+    # Reject signal early if the target issue is closed — retrying won't help.
+    issue_data = gh_issue_view(issue, ["state"], cwd=ctx.repo_root)
+    if issue_data is None:
+        log_warning(
+            f"Signal spawn: issue #{issue} not found — cannot spawn shepherd"
+        )
+        return
+    if issue_data.get("state", "").upper() != "OPEN":
+        log_warning(
+            f"Signal spawn: issue #{issue} is closed — reopen it to shepherd"
+        )
         return
 
     shepherd_name = _find_idle_shepherd_slot(ctx)

@@ -12,6 +12,7 @@ from unittest import mock
 
 import pytest
 
+import loom_tools.daemon_v2.loop as loop_module
 from loom_tools.daemon_v2.config import DaemonConfig
 from loom_tools.daemon_v2.context import DaemonContext
 from loom_tools.daemon_v2.loop import (
@@ -21,6 +22,19 @@ from loom_tools.daemon_v2.loop import (
     _spawn_shepherd_from_signal,
 )
 from loom_tools.models.daemon_state import DaemonState, ShepherdEntry
+
+
+# ---------------------------------------------------------------------------
+# Module-level fixture: default all issues to OPEN so existing tests don't
+# make real gh CLI calls.  Tests that need a closed/missing issue use their
+# own @mock.patch which overrides this fixture for that specific test.
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture(autouse=True)
+def _default_gh_issue_view_open(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Patch gh_issue_view to return an open issue for all tests in this module."""
+    monkeypatch.setattr(loop_module, "gh_issue_view", lambda *a, **k: {"state": "OPEN"})
 
 
 # ---------------------------------------------------------------------------
@@ -242,6 +256,69 @@ class TestProcessCommandsQueuing:
         commands = [{"action": "spawn_shepherd", "mode": "default"}]
         _process_commands(ctx, commands)
 
+        assert ctx.pending_spawns == []
+
+
+# ---------------------------------------------------------------------------
+# Tests: closed issue detection
+# ---------------------------------------------------------------------------
+
+
+class TestSpawnShepherdFromSignalClosedIssue:
+    """_spawn_shepherd_from_signal should reject closed issues."""
+
+    @mock.patch("loom_tools.daemon_v2.loop.gh_issue_view")
+    def test_closed_issue_is_rejected(
+        self, mock_gh_view: mock.MagicMock, tmp_path: pathlib.Path
+    ) -> None:
+        """A closed issue must not be spawned and must not be queued."""
+        mock_gh_view.return_value = {"state": "CLOSED"}
+        ctx = _make_ctx(tmp_path)
+        # Add an idle slot so a slot check is not the cause of rejection
+        ctx.state.shepherds["shepherd-1"] = ShepherdEntry(status="idle")
+
+        _spawn_shepherd_from_signal(ctx, issue=42, mode="default", flags=[])
+
+        # Nothing queued, nothing spawned
+        assert ctx.pending_spawns == []
+
+    @mock.patch("loom_tools.daemon_v2.loop.gh_issue_view")
+    def test_not_found_issue_is_rejected(
+        self, mock_gh_view: mock.MagicMock, tmp_path: pathlib.Path
+    ) -> None:
+        """A non-existent issue must not be spawned and must not be queued."""
+        mock_gh_view.return_value = None
+        ctx = _make_ctx(tmp_path)
+        ctx.state.shepherds["shepherd-1"] = ShepherdEntry(status="idle")
+
+        _spawn_shepherd_from_signal(ctx, issue=99, mode="default", flags=[])
+
+        assert ctx.pending_spawns == []
+
+    @mock.patch("loom_tools.daemon_v2.loop.subprocess.Popen")
+    @mock.patch("loom_tools.daemon_v2.loop.gh_issue_view")
+    def test_open_issue_proceeds_to_spawn(
+        self,
+        mock_gh_view: mock.MagicMock,
+        mock_popen: mock.MagicMock,
+        tmp_path: pathlib.Path,
+    ) -> None:
+        """An open issue with an available slot should proceed to spawn."""
+        mock_gh_view.return_value = {"state": "OPEN"}
+        ctx = _make_ctx(tmp_path)
+        ctx.state.shepherds["shepherd-1"] = ShepherdEntry(status="idle")
+
+        shepherd_script = tmp_path / ".loom" / "scripts" / "loom-shepherd.sh"
+        shepherd_script.parent.mkdir(parents=True, exist_ok=True)
+        shepherd_script.touch()
+
+        proc_mock = mock.MagicMock()
+        proc_mock.pid = 12345
+        mock_popen.return_value = proc_mock
+
+        _spawn_shepherd_from_signal(ctx, issue=42, mode="default", flags=[])
+
+        assert mock_popen.called
         assert ctx.pending_spawns == []
 
 
