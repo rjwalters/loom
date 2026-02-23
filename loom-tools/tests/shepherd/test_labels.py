@@ -362,16 +362,6 @@ class TestAtomicLabelTransitions:
 class TestGetPrForIssue:
     """Tests for get_pr_for_issue using closingIssuesReferences validation."""
 
-    def _make_result(self, returncode: int = 0, stdout: str = "") -> object:
-        """Create a mock subprocess result."""
-        result = object.__new__(object)
-        result.__class__ = type(
-            "Result",
-            (),
-            {"returncode": returncode, "stdout": stdout},
-        )
-        return result
-
     def _mock_run(self, outputs: list[tuple[int, str]]):  # type: ignore[return]
         """Return a mock that yields (returncode, stdout) pairs in sequence."""
         from unittest.mock import MagicMock
