@@ -18,6 +18,7 @@ from __future__ import annotations
 import argparse
 import json
 import pathlib
+import re
 import subprocess
 import sys
 from dataclasses import dataclass
@@ -356,8 +357,6 @@ def _handle_feature_branch_in_main_worktree(
 
     # Extract the conflicting worktree path from the error message.
     # Example: "fatal: 'feature/issue-2853' is already used by worktree at '/path'"
-    import re
-
     match = re.search(r"is already used by worktree at '([^']+)'", error_output)
     if not match:
         # Could not parse path — emit actionable guidance and fail.
