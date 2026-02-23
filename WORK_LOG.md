@@ -6,6 +6,62 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 <!-- Maintained automatically by the Guide triage agent. Manual edits are fine but may be overwritten. -->
 
+### 2026-02-23
+
+- **PR #3028**: build(deps): bump the all-dependencies group with 3 updates
+- **PR #3027**: build(deps-dev): bump the dev-dependencies group with 4 updates
+- **PR #3021**: fix: skip worktree-escape dirty check when repo root is not on default branch
+- **PR #3020**: fix: time-bound debug log checks in startup monitor to prevent stale-session misclassification
+- **PR #3019**: fix: exempt force-mode failures from systematic failure detection
+- **PR #3018**: fix: classify worktree branch-conflict as infrastructure failure
+- **PR #3017**: fix: validate and reinitialize corrupted agent config dir before each spawn
+- **PR #3016**: fix: detect and auto-recover when feature branch is checked out in main worktree
+- **PR #3015**: fix: classify builder failures by log inspection before falling through to unknown
+- **PR #3014**: fix: tag rate-limit pre-check PhaseResult with api_rate_limited flag
+- **PR #3013**: fix: validate get_pr_for_issue body search via closingIssuesReferences
+- **PR #3012**: fix: add repo_root and main-branch guards to _commit_prior_uncommitted_work
+- **PR #3011**: fix: classify thinking stall exhaustion as builder_thinking_stall error class
+- **PR #3010**: perf: run orphan recovery in background thread during daemon startup
+- **PR #3008**: fix: skip body search in get_pr_for_issue when state='merged'
+- **PR #3007**: fix: queue spawn_shepherd signals when all shepherd slots are full
+- **PR #3006**: fix: re-queue spawn_shepherd signals dropped during daemon startup
+- **PR #3005**: fix: use git diff origin/main instead of file existence in dirty-main recovery
+- **PR #3004**: fix: exempt newly-spawned shepherds from tmux-session-missing stall check
+- **PR #3003**: fix: scope systematic failure escalation to per-issue failure count
+- **PR #3001**: fix: skip stale branch cleanup in force mode when PR awaiting review
+- **PR #3000**: feat: write full Loom guide to .loom/CLAUDE.md, inject short pointer into root CLAUDE.md
+- **PR #2999**: fix: clear stale checkpoint before thinking stall retry
+- **PR #2998**: fix: fall back to GitHub mergeable check when rebase phase has no worktree
+- **PR #2997**: test: add unit test for api_propagation_race in builder validation loop
+- **PR #2996**: test: fix rev-parse mock handling and add branch guard tests for builder commit methods
+- **PR #2995**: fix: skip recovery PR when builder commits only .no-changes-needed marker
+- **PR #2994**: test: add TestFastMode class covering render_agents_table and output_fast
+- **PR #2993**: fix: replace head -n -1 with sed $d in daemon script --help handlers
+- **Issue #2971** (closed): bug: false 'builder escaped worktree' warning when working branch has staged changes
+- **Issue #2973** (closed): perf: orphan recovery at daemon startup is sequential and slow — blocks signal processing for minutes
+- **Issue #2970** (closed): bug: spawn signal silently dropped when all shepherd slots full — should persist and retry
+- **Issue #2968** (closed): bug: spawn_shepherd signal dropped during daemon startup (no daemon state loaded)
+- **Issue #2969** (closed): bug: STALL-L2 race condition kills shepherds that just started (23s lifetime)
+- **Issue #2992** (closed): Install Loom context into .loom/CLAUDE.md instead of appending to root
+- **Issue #2991** (closed): Add tests for branch guard in _commit_prior_uncommitted_work and _commit_interrupted_work
+- **Issue #2990** (closed): Add unit tests for loom-status --fast mode (render_agents_table, output_fast)
+- **Issue #2989** (closed): validate_phase creates recovery PR when builder only commits .no-changes-needed marker
+- **Issue #2987** (closed): Add unit test for API propagation race fix in builder validation loop
+- **Issue #2972** (closed): bug: duplicate PRs created when shepherd fails validation after builder succeeds
+
+### 2026-02-22
+
+- **PR #3022**: fix: add keyword-search fallback to prevent duplicate PRs in direct completion
+- **PR #2985**: feat: add tests for pr-body.md happy path in builder and validate_phase
+- **PR #2984**: feat: bug: thinking-stall retry budget (1 retry) too small for systematic stalls — no escalation path
+- **PR #2983**: docs(judge): add MCP failure detection and environment health check
+- **PR #2982**: docs: document --permission-mode bypassPermissions silently disabling hooks
+- **PR #2980**: fix: block cd-to-main-repo worktree escapes in guard-destructive hook
+- **PR #2979**: fix: return SUCCESS when PR with loom:review-requested exists during validation loop
+- **PR #2975**: feat: add --fast mode to loom-status for rich agent table display
+- **PR #2988**: feat: bug: builder checkpoint commits land on local main branch
+- **Issue #2963** (closed): Bug: --help flag fails on macOS in start-daemon.sh and stop-daemon.sh (head -n -1 not supported by BSD head)
+- **Issue #2990** (closed): Add unit tests for loom-status --fast mode (render_agents_table, output_fast)
 ### 2026-02-19
 
 - **PR #2962**: refactor: shepherd skill becomes signal-writer + observer
