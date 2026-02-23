@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from unittest.mock import patch
 
@@ -359,127 +360,213 @@ class TestAtomicLabelTransitions:
 
 
 class TestGetPrForIssue:
-    """Tests for get_pr_for_issue false-positive prevention."""
+    """Tests for get_pr_for_issue using closingIssuesReferences validation."""
 
-    def _make_run(self, branch_result: str, body_result: str):
-        """Return a mock gh_run side_effect that simulates branch and body searches."""
+    def _make_result(self, returncode: int = 0, stdout: str = "") -> object:
+        """Create a mock subprocess result."""
+        result = object.__new__(object)
+        result.__class__ = type(
+            "Result",
+            (),
+            {"returncode": returncode, "stdout": stdout},
+        )
+        return result
 
-        def _side_effect(args, check=True, cwd=None):
-            mock = type("MockResult", (), {})()
-            mock.returncode = 0
-            # Branch-based lookup uses --head flag
-            if "--head" in args:
-                mock.stdout = branch_result + "\n"
-            else:
-                mock.stdout = body_result + "\n"
-            return mock
+    def _mock_run(self, outputs: list[tuple[int, str]]):  # type: ignore[return]
+        """Return a mock that yields (returncode, stdout) pairs in sequence."""
+        from unittest.mock import MagicMock
+        mock = MagicMock()
+        results = []
+        for returncode, stdout in outputs:
+            r = MagicMock()
+            r.returncode = returncode
+            r.stdout = stdout
+            results.append(r)
+        mock.side_effect = results
+        return mock
 
-        return _side_effect
+    def test_branch_lookup_returns_pr_number(self) -> None:
+        """Method 1 (branch-based) returns PR number on match."""
+        with patch("loom_tools.shepherd.labels.gh_run") as mock_run:
+            mock_run.return_value.returncode = 0
+            mock_run.return_value.stdout = "42"
+            result = get_pr_for_issue(100, state="open")
+        assert result == 42
 
-    def test_merged_state_skips_body_search_when_branch_found(self) -> None:
-        """For state='merged', branch lookup succeeds and body search is never called."""
-        call_args_list = []
+    def test_branch_lookup_null_falls_through_to_body_search(self) -> None:
+        """When branch lookup returns null, falls through to body search."""
+        closing_refs = [{"number": 100}]
+        body_search_output = json.dumps([
+            {"number": 99, "closingIssuesReferences": closing_refs}
+        ])
+        mock = self._mock_run([
+            (0, "null"),           # Method 1: branch lookup → null
+            (0, body_search_output),  # Method 2: "Closes #100" → match
+        ])
+        with patch("loom_tools.shepherd.labels.gh_run", mock):
+            result = get_pr_for_issue(100, state="open")
+        assert result == 99
 
-        def _side_effect(args, check=True, cwd=None):
-            call_args_list.append(args)
-            mock = type("MockResult", (), {})()
-            mock.returncode = 0
-            # Branch lookup returns a PR number
-            mock.stdout = "848\n"
-            return mock
-
-        with patch("loom_tools.shepherd.labels.gh_run", side_effect=_side_effect):
-            result = get_pr_for_issue(2858, state="merged")
-
-        assert result == 848
-        # Only one call (branch lookup) — no body search calls
-        assert len(call_args_list) == 1
-        assert "--head" in call_args_list[0]
-
-    def test_merged_state_skips_body_search_when_branch_not_found(self) -> None:
-        """For state='merged', body search is skipped even when branch lookup returns nothing.
-
-        This is the core fix for issue #2915: a dependabot PR with a cross-repo
-        reference to issue #2858 would previously be returned as a false positive.
-        """
-        call_args_list = []
-
-        def _side_effect(args, check=True, cwd=None):
-            call_args_list.append(args)
-            mock = type("MockResult", (), {})()
-            mock.returncode = 0
-            # Branch lookup finds nothing; body search would find 848 (dependabot false positive)
-            if "--head" in args:
-                mock.stdout = "\n"
-            else:
-                mock.stdout = "848\n"
-            return mock
-
-        with patch("loom_tools.shepherd.labels.gh_run", side_effect=_side_effect):
-            result = get_pr_for_issue(2858, state="merged")
-
-        # Must return None, not 848 (the false positive)
+    def test_body_search_validates_closing_refs(self) -> None:
+        """Body search result must appear in closingIssuesReferences to be accepted."""
+        # PR 848 has "Closes" in body but closingIssuesReferences references issue 2839
+        # on a different repo — not matching our issue 100.
+        false_positive_output = json.dumps([
+            {
+                "number": 848,
+                "closingIssuesReferences": [
+                    {"number": 2839}  # different issue — false positive
+                ],
+            }
+        ])
+        mock = self._mock_run([
+            (0, "null"),               # Method 1: branch lookup → null
+            (0, false_positive_output),  # Method 2: "Closes #100" → false positive
+            (0, "[]"),                 # Method 3: "Fixes #100" → empty
+            (0, "[]"),                 # Method 4: "Resolves #100" → empty
+        ])
+        with patch("loom_tools.shepherd.labels.gh_run", mock):
+            result = get_pr_for_issue(100, state="merged")
         assert result is None
-        # Only one call (branch lookup) — body search never called for merged state
-        assert len(call_args_list) == 1
-        assert "--head" in call_args_list[0]
 
-    def test_open_state_still_uses_body_search(self) -> None:
-        """For state='open', body search is used as a fallback when branch lookup fails."""
-        call_args_list = []
+    def test_body_search_accepts_correct_closing_ref(self) -> None:
+        """Body search accepts PR when closingIssuesReferences contains the target issue."""
+        closing_refs = [{"number": 100}]
+        output = json.dumps([
+            {"number": 55, "closingIssuesReferences": closing_refs}
+        ])
+        mock = self._mock_run([
+            (0, "null"),   # Method 1: branch lookup → null
+            (0, output),   # Method 2: "Closes #100" → valid match
+        ])
+        with patch("loom_tools.shepherd.labels.gh_run", mock):
+            result = get_pr_for_issue(100, state="open")
+        assert result == 55
 
-        def _side_effect(args, check=True, cwd=None):
-            call_args_list.append(args)
-            mock = type("MockResult", (), {})()
-            mock.returncode = 0
-            if "--head" in args:
-                mock.stdout = "\n"  # Branch lookup finds nothing
-            else:
-                mock.stdout = "123\n"  # Body search finds PR 123
-            return mock
+    def test_fixes_pattern_validated_by_closing_refs(self) -> None:
+        """'Fixes' pattern also validated via closingIssuesReferences."""
+        closes_output = json.dumps([])
+        fixes_output = json.dumps([
+            {"number": 77, "closingIssuesReferences": [{"number": 200}]}
+        ])
+        mock = self._mock_run([
+            (0, "null"),        # Method 1: branch lookup → null
+            (0, closes_output), # Method 2: "Closes #200" → empty
+            (0, fixes_output),  # Method 3: "Fixes #200" → valid match
+        ])
+        with patch("loom_tools.shepherd.labels.gh_run", mock):
+            result = get_pr_for_issue(200, state="open")
+        assert result == 77
 
-        with patch("loom_tools.shepherd.labels.gh_run", side_effect=_side_effect):
-            result = get_pr_for_issue(42, state="open")
-
-        assert result == 123
-        # Should have called branch lookup + at least one body search
-        assert len(call_args_list) >= 2
-        assert "--head" in call_args_list[0]
-        # Second call is body search (no --head flag)
-        assert "--head" not in call_args_list[1]
-
-    def test_branch_lookup_takes_precedence_over_body_search(self) -> None:
-        """Branch-based lookup result is returned before body search is attempted."""
-        call_args_list = []
-
-        def _side_effect(args, check=True, cwd=None):
-            call_args_list.append(args)
-            mock = type("MockResult", (), {})()
-            mock.returncode = 0
-            if "--head" in args:
-                mock.stdout = "999\n"  # Branch lookup succeeds
-            else:
-                mock.stdout = "888\n"  # Body search would return different PR
-            return mock
-
-        with patch("loom_tools.shepherd.labels.gh_run", side_effect=_side_effect):
-            result = get_pr_for_issue(42, state="open")
-
-        # Branch result (999) takes precedence over body search result (888)
-        assert result == 999
-        # Only one call made (branch lookup)
-        assert len(call_args_list) == 1
+    def test_resolves_pattern_validated_by_closing_refs(self) -> None:
+        """'Resolves' pattern also validated via closingIssuesReferences."""
+        resolves_output = json.dumps([
+            {"number": 88, "closingIssuesReferences": [{"number": 300}]}
+        ])
+        mock = self._mock_run([
+            (0, "null"),     # Method 1: branch lookup → null
+            (0, "[]"),       # Method 2: "Closes #300" → empty
+            (0, "[]"),       # Method 3: "Fixes #300" → empty
+            (0, resolves_output),  # Method 4: "Resolves #300" → valid match
+        ])
+        with patch("loom_tools.shepherd.labels.gh_run", mock):
+            result = get_pr_for_issue(300, state="open")
+        assert result == 88
 
     def test_returns_none_when_no_pr_found(self) -> None:
-        """Returns None when all search methods find nothing."""
-
-        def _side_effect(args, check=True, cwd=None):
-            mock = type("MockResult", (), {})()
-            mock.returncode = 0
-            mock.stdout = "\n"
-            return mock
-
-        with patch("loom_tools.shepherd.labels.gh_run", side_effect=_side_effect):
-            result = get_pr_for_issue(42, state="open")
-
+        """Returns None when no method finds a matching PR."""
+        mock = self._mock_run([
+            (0, "null"),  # Method 1: branch lookup → null
+            (0, "[]"),    # Method 2: "Closes" → empty
+            (0, "[]"),    # Method 3: "Fixes" → empty
+            (0, "[]"),    # Method 4: "Resolves" → empty
+        ])
+        with patch("loom_tools.shepherd.labels.gh_run", mock):
+            result = get_pr_for_issue(999, state="open")
         assert result is None
+
+    def test_multiple_candidates_first_valid_wins(self) -> None:
+        """When multiple PRs match a search, first one with correct closing ref wins."""
+        output = json.dumps([
+            {"number": 10, "closingIssuesReferences": [{"number": 999}]},  # wrong issue
+            {"number": 20, "closingIssuesReferences": [{"number": 42}]},   # correct
+            {"number": 30, "closingIssuesReferences": [{"number": 42}]},   # also correct
+        ])
+        mock = self._mock_run([
+            (0, "null"),   # Method 1: branch lookup → null
+            (0, output),   # Method 2: "Closes #42" → multiple candidates
+        ])
+        with patch("loom_tools.shepherd.labels.gh_run", mock):
+            result = get_pr_for_issue(42, state="open")
+        assert result == 20  # first valid candidate
+
+    def test_invalid_json_from_body_search_skipped(self) -> None:
+        """Invalid JSON from body search is skipped gracefully."""
+        mock = self._mock_run([
+            (0, "null"),           # Method 1: branch lookup → null
+            (0, "not valid json"), # Method 2: invalid JSON
+            (0, "[]"),             # Method 3: empty
+            (0, "[]"),             # Method 4: empty
+        ])
+        with patch("loom_tools.shepherd.labels.gh_run", mock):
+            result = get_pr_for_issue(42, state="open")
+        assert result is None
+
+    def test_gh_command_failure_skips_that_method(self) -> None:
+        """gh command failure (non-zero exit) is skipped gracefully."""
+        mock = self._mock_run([
+            (1, ""),    # Method 1: branch lookup fails
+            (1, ""),    # Method 2: command fails
+            (1, ""),    # Method 3: command fails
+            (1, ""),    # Method 4: command fails
+        ])
+        with patch("loom_tools.shepherd.labels.gh_run", mock):
+            result = get_pr_for_issue(42, state="open")
+        assert result is None
+
+    def test_empty_closing_refs_list_not_accepted(self) -> None:
+        """PR with empty closingIssuesReferences is not accepted as a match."""
+        output = json.dumps([
+            {"number": 55, "closingIssuesReferences": []}  # no closing refs
+        ])
+        mock = self._mock_run([
+            (0, "null"),   # Method 1: branch lookup → null
+            (0, output),   # Method 2: candidate with empty closingIssuesReferences
+            (0, "[]"),     # Method 3: empty
+            (0, "[]"),     # Method 4: empty
+        ])
+        with patch("loom_tools.shepherd.labels.gh_run", mock):
+            result = get_pr_for_issue(42, state="open")
+        assert result is None
+
+    def test_passes_state_to_gh_command(self) -> None:
+        """The state parameter is forwarded to gh pr list commands."""
+        mock = self._mock_run([
+            (0, "null"),  # Method 1: branch lookup → null
+            (0, "[]"),    # Method 2: empty
+            (0, "[]"),    # Method 3: empty
+            (0, "[]"),    # Method 4: empty
+        ])
+        with patch("loom_tools.shepherd.labels.gh_run", mock):
+            get_pr_for_issue(42, state="merged")
+
+        # Check that "merged" appears in the call args
+        calls = mock.call_args_list
+        for call in calls:
+            args_list = call[0][0]
+            assert "merged" in args_list
+
+    def test_passes_repo_root_to_gh_run(self) -> None:
+        """repo_root is forwarded as cwd to gh_run."""
+        repo_root = Path("/some/repo")
+        mock = self._mock_run([
+            (0, "null"),  # Method 1: branch lookup → null
+            (0, "[]"),    # Method 2: empty
+            (0, "[]"),    # Method 3: empty
+            (0, "[]"),    # Method 4: empty
+        ])
+        with patch("loom_tools.shepherd.labels.gh_run", mock):
+            get_pr_for_issue(42, repo_root=repo_root)
+
+        for call in mock.call_args_list:
+            assert call[1].get("cwd") == repo_root

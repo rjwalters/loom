@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from typing import Literal
 
@@ -474,16 +475,14 @@ def get_pr_for_issue(
 
     Tries in order:
     1. Branch name: feature/issue-{issue}
-    2. Body search: "Closes #{issue}" (open/all states only — see note below)
-    3. Body search: "Fixes #{issue}"
-    4. Body search: "Resolves #{issue}"
+    2. Body search validated by closingIssuesReferences: "Closes #{issue}"
+    3. Body search validated by closingIssuesReferences: "Fixes #{issue}"
+    4. Body search validated by closingIssuesReferences: "Resolves #{issue}"
 
-    Note: Body search is skipped when state="merged". GitHub's search engine
-    indexes cross-repo references in PR bodies (e.g. dependabot changelogs
-    contain "tauri-apps/plugins-workspace/issues/2858" which GitHub indexes
-    as "#2858"), causing false positives. For merged PRs, Loom always creates
-    the feature/issue-{issue} branch, so the branch-based lookup is sufficient
-    and deterministic.
+    Methods 2-4 use GitHub's ``closingIssuesReferences`` field to confirm the
+    PR genuinely auto-closes this repo's issue, preventing false positives from
+    cross-repo references in PR bodies (e.g. Dependabot changelogs that contain
+    both "Fixes" headings and upstream issue numbers).
 
     Returns PR number if found, None otherwise.
     """
@@ -515,14 +514,8 @@ def get_pr_for_issue(
         except ValueError:
             pass
 
-    # Methods 2-4: Search body for linking keywords (has indexing lag).
-    # Skip for merged PRs: body search produces false positives from
-    # cross-repo references in dependabot changelogs and similar PR bodies.
-    # For merged PRs, branch-based lookup (above) is sufficient because Loom
-    # always uses the feature/issue-{issue} branch naming convention.
-    if state == "merged":
-        return None
-
+    # Methods 2-4: Search body for linking keywords, then validate via
+    # closingIssuesReferences to avoid false positives from cross-repo refs.
     for pattern in [f"Closes #{issue}", f"Fixes #{issue}", f"Resolves #{issue}"]:
         output = _run(
             [
@@ -533,15 +526,25 @@ def get_pr_for_issue(
                 "--state",
                 state,
                 "--json",
-                "number",
-                "--jq",
-                ".[0].number",
+                "number,closingIssuesReferences",
             ]
         )
-        if output and output != "null":
-            try:
-                return int(output)
-            except ValueError:
-                pass
+        if not output:
+            continue
+        try:
+            candidates = json.loads(output)
+        except (json.JSONDecodeError, ValueError):
+            continue
+        if not isinstance(candidates, list):
+            continue
+        for pr in candidates:
+            pr_number = pr.get("number")
+            if not isinstance(pr_number, int):
+                continue
+            closing_refs = pr.get("closingIssuesReferences", [])
+            if isinstance(closing_refs, list) and any(
+                ref.get("number") == issue for ref in closing_refs
+            ):
+                return pr_number
 
     return None
