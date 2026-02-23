@@ -19749,6 +19749,129 @@ class TestRunPhaseWithRetryThinkingStall:
         sleep_calls = [c.args[0] for c in mock_sleep.call_args_list]
         assert sleep_calls == list(THINKING_STALL_BACKOFF_SECONDS)
 
+    def test_thinking_stall_clears_checkpoint_before_retry(
+        self, mock_context: MagicMock, tmp_path: Path
+    ) -> None:
+        """A thinking stall retry should delete the worktree checkpoint file.
+
+        The stalled builder writes `.loom-checkpoint` at stage=planning before
+        it stalls.  Without cleanup, the retry builder reads the stale checkpoint,
+        concludes planning is already in progress, skips re-initialisation, finds
+        nothing meaningful to do, and exits with code 0 — consuming a failure
+        budget slot.  The fix deletes the checkpoint before sleeping so the retry
+        builder starts fresh.  See issue #2914.
+        """
+        worktree = tmp_path / "worktree"
+        worktree.mkdir()
+        checkpoint_file = worktree / ".loom-checkpoint"
+        checkpoint_file.write_text('{"stage": "planning"}')
+
+        call_count = 0
+
+        def mock_run_worker(*args, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            return 14 if call_count == 1 else 0
+
+        with (
+            patch(
+                "loom_tools.shepherd.phases.base.run_worker_phase",
+                side_effect=mock_run_worker,
+            ),
+            patch("time.sleep"),
+        ):
+            exit_code = run_phase_with_retry(
+                mock_context,
+                role="builder",
+                name="builder-issue-42",
+                timeout=600,
+                max_retries=2,
+                phase="builder",
+                worktree=worktree,
+            )
+
+        assert exit_code == 0
+        assert call_count == 2
+        # Checkpoint must be removed before the retry was spawned
+        assert not checkpoint_file.exists(), (
+            ".loom-checkpoint was not deleted before the thinking stall retry"
+        )
+
+    def test_thinking_stall_no_worktree_does_not_error(
+        self, mock_context: MagicMock
+    ) -> None:
+        """A thinking stall retry with no worktree should not raise an error.
+
+        When worktree=None (e.g., judge/curator phases), the checkpoint cleanup
+        is skipped gracefully.  See issue #2914.
+        """
+        call_count = 0
+
+        def mock_run_worker(*args, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            return 14 if call_count == 1 else 0
+
+        with (
+            patch(
+                "loom_tools.shepherd.phases.base.run_worker_phase",
+                side_effect=mock_run_worker,
+            ),
+            patch("time.sleep"),
+        ):
+            exit_code = run_phase_with_retry(
+                mock_context,
+                role="judge",
+                name="judge-issue-42",
+                timeout=600,
+                max_retries=2,
+                phase="judge",
+                worktree=None,
+            )
+
+        assert exit_code == 0
+        assert call_count == 2
+
+    def test_thinking_stall_missing_checkpoint_does_not_error(
+        self, mock_context: MagicMock, tmp_path: Path
+    ) -> None:
+        """A thinking stall retry when no checkpoint file exists should not raise.
+
+        If the stalled builder never wrote a checkpoint (e.g., it stalled before
+        starting planning), unlink(missing_ok=True) should silently succeed.
+        See issue #2914.
+        """
+        worktree = tmp_path / "worktree"
+        worktree.mkdir()
+        # No checkpoint file created — worktree is empty
+
+        call_count = 0
+
+        def mock_run_worker(*args, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            return 14 if call_count == 1 else 0
+
+        with (
+            patch(
+                "loom_tools.shepherd.phases.base.run_worker_phase",
+                side_effect=mock_run_worker,
+            ),
+            patch("time.sleep"),
+        ):
+            exit_code = run_phase_with_retry(
+                mock_context,
+                role="builder",
+                name="builder-issue-42",
+                timeout=600,
+                max_retries=2,
+                phase="builder",
+                worktree=worktree,
+            )
+
+        assert exit_code == 0
+        assert call_count == 2
+
 
 class TestExtractTestFilePaths:
     """Test BuilderPhase._extract_test_file_paths."""
