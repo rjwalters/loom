@@ -5339,7 +5339,22 @@ class BuilderPhase:
         if not ctx.worktree_path or not ctx.worktree_path.is_dir():
             return False
 
-        # Guard: never commit checkpoint to main — only to the feature branch
+        # Guard 1: never commit checkpoint when worktree_path is the repo root.
+        # This catches the scenario where ctx.worktree_path was incorrectly set
+        # to the main repo root instead of .loom/worktrees/issue-N, which would
+        # result in checkpoint commits landing directly on the main branch.
+        if ctx.worktree_path == ctx.repo_root:
+            log_warning(
+                f"[builder] Refusing prior-run checkpoint commit: worktree_path "
+                f"'{ctx.worktree_path}' equals repo_root — checkpoint commits "
+                f"must never be made in the main repository root."
+            )
+            return False
+
+        # Guard 2: never commit checkpoint to main or the default branch.
+        # Check the actual checked-out branch and refuse if it is 'main' or
+        # another protected branch name.  A separate check also validates that
+        # the branch matches the expected feature branch for this issue.
         expected_branch = NamingConventions.branch_name(ctx.config.issue)
         branch_res = subprocess.run(
             ["git", "-C", str(ctx.worktree_path), "rev-parse", "--abbrev-ref", "HEAD"],
@@ -5348,6 +5363,19 @@ class BuilderPhase:
             check=False,
         )
         actual_branch = branch_res.stdout.strip() if branch_res.returncode == 0 else None
+
+        # Refuse if the checked-out branch is 'main' or another protected branch.
+        # This is an explicit guard separate from the expected-branch check below
+        # so that the log message is unambiguous about what went wrong.
+        _PROTECTED_BRANCHES = {"main", "master", "develop", "trunk"}
+        if actual_branch in _PROTECTED_BRANCHES:
+            log_warning(
+                f"[builder] Refusing prior-run checkpoint commit: worktree at "
+                f"'{ctx.worktree_path}' is on protected branch '{actual_branch}'. "
+                f"Checkpoint commits must never land on a main/default branch."
+            )
+            return False
+
         if actual_branch != expected_branch:
             log_warning(
                 f"[builder] Refusing prior-run checkpoint commit: worktree is on "
