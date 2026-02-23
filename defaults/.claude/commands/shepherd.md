@@ -66,9 +66,32 @@ Why run outside Claude Code?
 Before writing a new signal, check whether this issue is already being shepherded.
 Read `.loom/daemon-state.json` and look for a shepherd slot with `issue == <N>` and `status == "working"`.
 
-If found, skip to Step 4 (monitor the existing shepherd using its `task_id`).
+If found, skip to Step 5 (monitor the existing shepherd using its `task_id`).
 
-### Step 3: Write Spawn Signal
+### Step 3: Verify Issue is Open
+
+Before writing the spawn signal, check that the issue is still open:
+
+```bash
+gh issue view <N> --json state --jq '.state'
+```
+
+**If the issue is CLOSED**, display this message and EXIT:
+
+```
+Issue #<N> is closed.
+
+The shepherd cannot be spawned for a closed issue.
+To proceed, reopen the issue first:
+
+  gh issue reopen <N>
+
+Then run /shepherd <N> again.
+```
+
+**If the issue is OPEN**, proceed to Step 4.
+
+### Step 4: Write Spawn Signal
 
 Use the **Write tool** (not Bash) to create a signal file at:
 
@@ -109,13 +132,13 @@ Example for `/shepherd 123 --to curated`:
 
 The daemon polls `.loom/signals/` every 2 seconds and processes commands atomically.
 
-### Step 4: Confirm Daemon Pickup
+### Step 5: Confirm Daemon Pickup
 
 After writing the signal, read `.loom/daemon-state.json` every ~5 seconds until a shepherd slot shows `issue == <N>` with a `task_id`. This confirms the daemon received and processed the signal.
 
 **If no pickup after 30 seconds**: Check whether the signal file still exists in `.loom/signals/` — if present, the daemon hasn't processed it yet (may be busy or stopped). Report to the user and suggest checking daemon status with `.loom/scripts/start-daemon.sh --status`.
 
-### Step 5: Monitor Progress
+### Step 6: Monitor Progress
 
 Once the `task_id` is known, read `.loom/progress/shepherd-{task_id}.json` every 10–15 seconds. Report milestone events to the user as they arrive:
 
@@ -133,7 +156,7 @@ Once the `task_id` is known, read `.loom/progress/shepherd-{task_id}.json` every
 
 You can also use `mcp__loom__get_terminal_output` with the shepherd's terminal ID (from `daemon-state.json`) to show live output on request.
 
-### Step 6: Stuck Detection and Intervention
+### Step 7: Stuck Detection and Intervention
 
 If `heartbeat_age_seconds > 120` in the progress file (or `heartbeat_stale: true`):
 
@@ -141,7 +164,7 @@ If `heartbeat_age_seconds > 120` in the progress file (or `heartbeat_stale: true
 2. Use `mcp__loom__send_terminal_input` to send a gentle nudge to the worker terminal
 3. Wait 30s — if still no heartbeat, escalate to the user for manual intervention
 
-### Step 7: Report Outcome
+### Step 8: Report Outcome
 
 When the progress file shows `status: completed` or `status: error`, summarize the result:
 
