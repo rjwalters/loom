@@ -4619,6 +4619,7 @@ class TestRecordFallbackFailure:
                 "Builder thinking stall retry budget exhausted — extended thinking "
                 "output with zero tool calls detected (fallback cleanup)"
             ),
+            force_mode=ctx.config.is_force_mode,
         )
         mock_detect.assert_called_once_with(Path("/fake/repo"))
 
@@ -5302,6 +5303,7 @@ class TestRecordFallbackFailureLogClassification:
         ctx.config.issue = 42
         ctx.repo_root = tmp_path
         ctx.last_postmortem = None
+        ctx.abandonment_info = None
 
         _record_fallback_failure(ctx, ShepherdExitCode.BUILDER_FAILED)
 
@@ -5311,6 +5313,7 @@ class TestRecordFallbackFailureLogClassification:
             error_class="rate_limit_abort",
             phase="builder",
             details=mock_record.call_args.kwargs["details"],
+            force_mode=ctx.config.is_force_mode,
         )
         assert "rate_limit_abort" == mock_record.call_args.kwargs["error_class"]
 
@@ -5332,6 +5335,7 @@ class TestRecordFallbackFailureLogClassification:
         ctx.config.issue = 42
         ctx.repo_root = tmp_path
         ctx.last_postmortem = None
+        ctx.abandonment_info = None
 
         _record_fallback_failure(ctx, ShepherdExitCode.BUILDER_FAILED)
 
