@@ -259,7 +259,6 @@ class TestHandleFeatureBranchInMainWorktree:
         self,
         tmp_path: pathlib.Path,
         capsys: pytest.CaptureFixture[str],
-        monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         """Error where conflict is NOT in the main workspace gets handled with guidance."""
         conflict_path = tmp_path / "some-other-worktree"
