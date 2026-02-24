@@ -30,6 +30,7 @@ from loom_tools.daemon_v2.signals import (
     write_pid_file,
 )
 from loom_tools.daemon_cleanup import handle_daemon_shutdown, handle_daemon_startup, load_config
+from loom_tools.daemon_v2.actions.shepherds import spawn_shepherds
 
 
 def run(ctx: DaemonContext) -> int:
@@ -178,6 +179,7 @@ def _responsive_sleep(
     During each tick we:
     - Check for stop signal (exit early if found)
     - Poll CommandPoller for new signal commands
+    - Run fast-path shepherd assignment when idle slots + cached ready issues exist
     - Keep the daemon responsive without busy-waiting
     """
     elapsed = 0
@@ -202,6 +204,12 @@ def _responsive_sleep(
         # within 2s rather than waiting for the next full iteration.
         if ctx.pending_spawns:
             _retry_pending_spawns(ctx)
+
+        # Fast-path assignment: if idle shepherd slots exist and the cached
+        # snapshot shows ready issues, spawn immediately without waiting for
+        # the next full iteration. This eliminates poll_interval latency when
+        # a shepherd completes and ready issues are already queued.
+        _fast_path_assign(ctx)
 
 
 def _process_commands(
@@ -448,6 +456,49 @@ def _retry_pending_spawns(ctx: DaemonContext) -> None:
             f"Pending spawn queue: {len(ctx.pending_spawns)} spawn(s) still "
             f"waiting for an idle shepherd slot"
         )
+
+
+def _fast_path_assign(ctx: DaemonContext) -> None:
+    """Fast-path shepherd assignment during sleep ticks.
+
+    When a shepherd completes its issue, the slot becomes idle but the next
+    full iteration (with snapshot rebuild) won't run until poll_interval
+    elapses. This function checks whether idle slots exist AND the cached
+    snapshot still shows ready issues, and if so spawns immediately.
+
+    Uses the cached snapshot from the most recent full iteration — no GitHub
+    API call is needed. The snapshot may be slightly stale (up to poll_interval
+    seconds old) but this is acceptable: if a ready issue was present at last
+    snapshot time and an idle slot is now available, spawning is safe.
+
+    Called during every sleep tick so a completed shepherd is reassigned within
+    tick seconds (default 2s) rather than waiting up to poll_interval seconds.
+    """
+    if ctx.state is None or ctx.snapshot is None:
+        return
+
+    # Check for idle shepherd slots directly from state (no API call needed)
+    has_idle_slot = any(e.status == "idle" for e in ctx.state.shepherds.values())
+    if not has_idle_slot:
+        # Also check if we have room to create a new shepherd slot
+        has_idle_slot = len(ctx.state.shepherds) < ctx.config.max_shepherds
+
+    if not has_idle_slot:
+        return
+
+    # Check cached snapshot for ready issues (no API call needed)
+    ready_issues = ctx.get_ready_issues()
+    if not ready_issues:
+        return
+
+    # Idle slot + ready issues in cached snapshot: spawn immediately
+    spawned = spawn_shepherds(ctx)
+    if spawned > 0:
+        log_success(
+            f"Fast-path assignment: spawned {spawned} shepherd(s) "
+            f"without waiting for next full iteration"
+        )
+        _write_state(ctx)
 
 
 def _pause_shepherd(ctx: DaemonContext, shepherd_id: str) -> None:

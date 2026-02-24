@@ -14,7 +14,7 @@ class TestDaemonConfig:
     def test_default_values(self):
         """Test that defaults are sensible."""
         config = DaemonConfig()
-        assert config.poll_interval == 120
+        assert config.poll_interval == 30
         assert config.max_shepherds == 10
         assert config.issue_threshold == 3
         assert config.force_mode is False
@@ -24,7 +24,7 @@ class TestDaemonConfig:
         """Test loading from environment with defaults."""
         with patch.dict(os.environ, {}, clear=True):
             config = DaemonConfig.from_env()
-            assert config.poll_interval == 120
+            assert config.poll_interval == 30
             assert config.max_shepherds == 10
 
     def test_from_env_with_overrides(self):

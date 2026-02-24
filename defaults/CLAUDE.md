@@ -615,7 +615,7 @@ The Loom daemon uses these configuration parameters:
 | `MAX_PROPOSALS` | 5 | Maximum pending proposal issues |
 | `MAX_SHEPHERDS` | 10 | Maximum concurrent shepherd processes |
 | `ISSUES_PER_SHEPHERD` | 2 | Scale factor: target = ready_issues / ISSUES_PER_SHEPHERD |
-| `POLL_INTERVAL` | 60 | Seconds between daemon loop iterations |
+| `POLL_INTERVAL` | 30 | Seconds between full daemon loop iterations |
 | `ISSUE_STRATEGY` | fifo | Issue selection strategy (see below) |
 | `SHELL_SHEPHERDS` | false | Use shell-based shepherds instead of LLM-based |
 
