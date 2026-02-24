@@ -59,9 +59,10 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 - **PR #2980**: fix: block cd-to-main-repo worktree escapes in guard-destructive hook
 - **PR #2979**: fix: return SUCCESS when PR with loom:review-requested exists during validation loop
 - **PR #2975**: feat: add --fast mode to loom-status for rich agent table display
+- **PR #3002**: test: add coverage for thinking-stall retry hint injection and escalating backoff
 - **PR #2988**: feat: bug: builder checkpoint commits land on local main branch
 - **Issue #2963** (closed): Bug: --help flag fails on macOS in start-daemon.sh and stop-daemon.sh (head -n -1 not supported by BSD head)
-- **Issue #2990** (closed): Add unit tests for loom-status --fast mode (render_agents_table, output_fast)
+
 ### 2026-02-19
 
 - **PR #2962**: refactor: shepherd skill becomes signal-writer + observer
