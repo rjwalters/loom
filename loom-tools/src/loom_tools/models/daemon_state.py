@@ -234,6 +234,9 @@ class BlockedIssueRetry:
     last_blocked_at: str | None = None
     last_blocked_phase: str = ""
     last_blocked_details: str = ""
+    # Set to True after the issue has been added to needs_human_input once,
+    # to prevent duplicate escalation comments on subsequent iterations.
+    escalated_to_human: bool = False
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> BlockedIssueRetry:
@@ -245,6 +248,7 @@ class BlockedIssueRetry:
             last_blocked_at=data.get("last_blocked_at"),
             last_blocked_phase=data.get("last_blocked_phase", ""),
             last_blocked_details=data.get("last_blocked_details", ""),
+            escalated_to_human=data.get("escalated_to_human", False),
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -259,6 +263,8 @@ class BlockedIssueRetry:
             d["last_retry_at"] = self.last_retry_at
         if self.last_blocked_at is not None:
             d["last_blocked_at"] = self.last_blocked_at
+        if self.escalated_to_human:
+            d["escalated_to_human"] = True
         return d
 
 

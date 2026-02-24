@@ -13,6 +13,94 @@ if TYPE_CHECKING:
     from loom_tools.daemon_v2.context import DaemonContext
 
 
+def escalate_blocked_issues(
+    escalation_needed: list[dict[str, Any]],
+    ctx: "DaemonContext",
+) -> int:
+    """Escalate retry-exhausted blocked issues to the human input queue.
+
+    For each issue in *escalation_needed*:
+    1. Add an entry to ``daemon_state.needs_human_input``
+    2. Add a GitHub comment explaining that the issue needs human review
+    3. Mark ``escalated_to_human = True`` in ``blocked_issue_retries`` to
+       prevent duplicate escalations on subsequent iterations
+
+    Returns the number of issues successfully escalated.
+    """
+    if not escalation_needed:
+        return 0
+
+    escalated = 0
+    timestamp = now_utc().strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    for item in escalation_needed:
+        issue_num = item.get("number")
+        if issue_num is None:
+            continue
+
+        error_class = item.get("error_class", "unknown")
+        retry_count = item.get("retry_count", 0)
+        reason = item.get("reason", f"Retry budget exhausted for {error_class}")
+
+        # Add to needs_human_input in daemon state
+        if ctx.state is not None:
+            human_entry: dict[str, Any] = {
+                "type": "exhausted_retry",
+                "issue": issue_num,
+                "error_class": error_class,
+                "retry_count": retry_count,
+                "reason": reason,
+                "escalated_at": timestamp,
+            }
+            # Deduplicate: only add if not already present
+            already_present = any(
+                e.get("type") == "exhausted_retry" and e.get("issue") == issue_num
+                for e in ctx.state.needs_human_input
+            )
+            if not already_present:
+                ctx.state.needs_human_input.append(human_entry)
+
+            # Mark escalated in blocked_issue_retries to prevent re-escalation
+            issue_key = str(issue_num)
+            retry_entry = ctx.state.blocked_issue_retries.get(issue_key)
+            if retry_entry is None:
+                retry_entry = BlockedIssueRetry()
+                ctx.state.blocked_issue_retries[issue_key] = retry_entry
+            retry_entry.escalated_to_human = True
+
+        # Add GitHub comment
+        comment = (
+            f"**Blocked Issue: Human Review Required**\n\n"
+            f"This issue has exceeded its automatic retry budget and needs human attention.\n\n"
+            f"**Error class**: `{error_class}`\n"
+            f"**Retry attempts**: {retry_count}\n"
+            f"**Reason**: {reason}\n\n"
+            f"Please review this issue and either:\n"
+            f"- Fix the underlying problem and remove the `loom:blocked` label to re-queue it, or\n"
+            f"- Close the issue if it is no longer valid\n\n"
+            f"---\n"
+            f"*Escalated by daemon retry manager at {timestamp}*"
+        )
+        try:
+            gh_run(
+                ["issue", "comment", str(issue_num), "--body", comment],
+                check=False,
+            )
+        except Exception:
+            log_warning(f"Failed to add escalation comment on issue #{issue_num}")
+
+        log_info(
+            f"Escalated blocked issue #{issue_num} to human input queue "
+            f"(error_class={error_class}, retry_count={retry_count})"
+        )
+        escalated += 1
+
+    if escalated > 0:
+        log_info(f"Escalated {escalated} retry-exhausted issue(s) to human input queue")
+
+    return escalated
+
+
 def retry_blocked_issues(
     retryable_issues: list[dict[str, Any]],
     ctx: DaemonContext,

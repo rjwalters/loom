@@ -40,6 +40,7 @@ loom-checkpoint = "loom_tools.checkpoints:main"
 loom-daemon = "loom_tools.daemon_v2.cli:main"
 loom-test-failure-analysis = "loom_tools.test_failure_analysis:main"
 loom-usage = "loom_tools.common.usage:main"
+loom-backlog = "loom_tools.backlog:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
