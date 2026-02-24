@@ -120,7 +120,7 @@ Write JSON files named `cmd-{YYYYMMDD-HHMMSS}-{random}.json` to `.loom/signals/`
 3. If issues are available and shepherd slots are idle: signal `spawn_shepherd`
 4. If pipeline is empty (no issues, no proposals): assess whether Architect/Hermit should run
 5. Monitor for blocked issues, stuck shepherds, or unmerged approved PRs
-6. Sleep 60–120 seconds, then repeat
+6. Sleep 30 seconds (checks signals and ready-issue assignment every 2 seconds), then repeat
 
 **Force/merge mode** (`/loom --merge` or `/loom --force`):
 - Same as normal, but pass `"mode": "force"` in all `spawn_shepherd` signals
@@ -415,7 +415,7 @@ This avoids nested Claude Code spawning restrictions.
 3. Checks for completed shepherds
 4. Spawns new shepherds for ready `loom:issue` issues
 5. Triggers Architect/Hermit when backlog is low
-6. Sleeps until next iteration (default: 120 seconds, checks signals every 2 seconds)
+6. Sleeps until next iteration (default: 30 seconds, checks signals and assigns ready issues every 2 seconds)
 
 **Stopping the daemon:**
 ```bash
@@ -428,7 +428,7 @@ touch .loom/stop-daemon                          # Via file signal
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `LOOM_POLL_INTERVAL` | 120 | Seconds between iterations |
+| `LOOM_POLL_INTERVAL` | 30 | Seconds between full iterations |
 | `LOOM_MAX_SHEPHERDS` | 10 | Max concurrent shepherds |
 | `LOOM_ISSUE_THRESHOLD` | 3 | Trigger work generation below this count |
 | `LOOM_ARCHITECT_COOLDOWN` | 1800 | Seconds between architect triggers |

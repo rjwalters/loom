@@ -9,7 +9,7 @@ from loom_tools.common.config import env_bool, env_int
 
 
 # Configuration defaults (same as existing daemon.py and snapshot.py)
-DEFAULT_POLL_INTERVAL = 120  # seconds
+DEFAULT_POLL_INTERVAL = 30  # seconds
 DEFAULT_ITERATION_TIMEOUT = 300  # seconds
 DEFAULT_MAX_SHEPHERDS = 10
 DEFAULT_ISSUE_THRESHOLD = 3
