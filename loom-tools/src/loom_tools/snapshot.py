@@ -43,6 +43,60 @@ from loom_tools.models.daemon_state import DaemonState, SupportRoleEntry
 from loom_tools.shepherd.labels import LABEL_EXCLUSION_GROUPS
 
 # ---------------------------------------------------------------------------
+# Tiered retry policy by error class
+# ---------------------------------------------------------------------------
+
+@dataclass
+class RetryPolicy:
+    """Per-error-class retry configuration."""
+
+    # Fixed cooldown in seconds between retry attempts (no exponential backoff)
+    cooldown: int
+    # Maximum number of retry attempts before escalating
+    max_retries: int
+    # Whether to add to needs_human_input when retry budget is exhausted
+    escalate: bool
+
+
+# Tiered retry policies per error class.
+# Transient errors: short cooldown, more retries, no escalation.
+# Structural errors: longer cooldown, fewer retries, then escalate.
+_ERROR_CLASS_POLICIES: dict[str, RetryPolicy] = {
+    # Transient: short cooldown, auto-retry (no human escalation)
+    "mcp_infrastructure_failure": RetryPolicy(cooldown=1800, max_retries=5, escalate=False),
+    "shepherd_failure": RetryPolicy(cooldown=1800, max_retries=5, escalate=False),
+    # Medium: 2h cooldown, max 3 retries, then escalate
+    "builder_unknown_failure": RetryPolicy(cooldown=7200, max_retries=3, escalate=True),
+    "builder_no_pr": RetryPolicy(cooldown=7200, max_retries=3, escalate=True),
+    # Structural: 6h cooldown, max 2 retries, then escalate
+    "builder_test_failure": RetryPolicy(cooldown=21600, max_retries=2, escalate=True),
+    "judge_exhausted": RetryPolicy(cooldown=21600, max_retries=2, escalate=True),
+    # Doctor failures: immediate human escalation, no auto-retry
+    "doctor_exhausted": RetryPolicy(cooldown=0, max_retries=0, escalate=True),
+    "doctor_no_progress": RetryPolicy(cooldown=0, max_retries=0, escalate=True),
+}
+
+
+def get_retry_policy(error_class: str, cfg: "SnapshotConfig | None" = None) -> RetryPolicy:
+    """Return the retry policy for *error_class*.
+
+    Known error classes use fixed per-class policies.
+    Unknown classes fall back to the global config defaults (with exponential
+    backoff driven by ``cfg``), or a built-in safe default when cfg is None.
+    """
+    if error_class in _ERROR_CLASS_POLICIES:
+        return _ERROR_CLASS_POLICIES[error_class]
+    # Default for unknown error classes
+    if cfg is not None:
+        return RetryPolicy(
+            cooldown=cfg.retry_cooldown,
+            max_retries=cfg.max_retry_count,
+            escalate=True,
+        )
+    return RetryPolicy(cooldown=1800, max_retries=3, escalate=True)
+
+
+# ---------------------------------------------------------------------------
 # Configuration (18 env vars, same defaults as shell version)
 # ---------------------------------------------------------------------------
 
@@ -778,6 +832,9 @@ class PipelineHealth:
     retryable_count: int = 0
     permanent_blocked_count: int = 0
     retryable_issues: list[dict[str, Any]] = field(default_factory=list)
+    # Issues that have exhausted their retry budget and need human review.
+    # Each entry: {number, error_class, retry_count, reason}
+    escalation_needed: list[dict[str, Any]] = field(default_factory=list)
 
 
 def compute_pipeline_health(
@@ -791,10 +848,18 @@ def compute_pipeline_health(
     cfg: SnapshotConfig,
     now: datetime,
 ) -> PipelineHealth:
-    """Classify pipeline health and identify retryable blocked issues."""
+    """Classify pipeline health and identify retryable blocked issues.
+
+    Uses per-error-class retry policies (see ``get_retry_policy``) to determine
+    cooldown and max retries for each blocked issue, instead of a single global
+    policy.  Issues that exhaust their per-class retry budget and whose class
+    has ``escalate=True`` are returned in ``escalation_needed`` so the daemon
+    can add them to ``needs_human_input``.
+    """
     retryable_count = 0
     permanent_count = 0
     retryable_issues: list[dict[str, Any]] = []
+    escalation_needed: list[dict[str, Any]] = []
 
     for item in blocked_issues:
         blocked_num = item.get("number")
@@ -804,21 +869,42 @@ def compute_pipeline_health(
         issue_key = str(blocked_num)
         retry_info = daemon_state.blocked_issue_retries.get(issue_key)
 
-        if retry_info and (retry_info.retry_exhausted or retry_info.retry_count >= cfg.max_retry_count):
+        error_class = retry_info.error_class if retry_info else "unknown"
+        policy = get_retry_policy(error_class, cfg)
+        retry_count = retry_info.retry_count if retry_info else 0
+
+        # Check if retry budget is exhausted for this error class
+        if retry_info and (retry_info.retry_exhausted or retry_count >= policy.max_retries):
             permanent_count += 1
+            # Identify issues that need human escalation (only once per issue)
+            if policy.escalate and not retry_info.escalated_to_human:
+                escalation_needed.append({
+                    "number": blocked_num,
+                    "error_class": error_class,
+                    "retry_count": retry_count,
+                    "reason": (
+                        f"Exceeded {policy.max_retries} retries for {error_class}"
+                        if policy.max_retries > 0
+                        else f"Error class {error_class} requires immediate human review"
+                    ),
+                })
             continue
 
-        # Check cooldown
-        retry_count = retry_info.retry_count if retry_info else 0
+        # Check per-class cooldown
         last_retry = retry_info.last_retry_at if retry_info else None
         cooldown_elapsed = True
 
-        if last_retry:
+        if last_retry and policy.cooldown > 0:
             try:
                 elapsed = _elapsed(last_retry, now)
-                effective_cooldown = cfg.retry_cooldown * (cfg.retry_backoff_multiplier ** retry_count)
-                if effective_cooldown > cfg.retry_max_cooldown:
-                    effective_cooldown = cfg.retry_max_cooldown
+                # Known error classes use fixed cooldown; unknown classes use
+                # exponential backoff with the global config multiplier.
+                if error_class in _ERROR_CLASS_POLICIES:
+                    effective_cooldown = policy.cooldown
+                else:
+                    effective_cooldown = policy.cooldown * (cfg.retry_backoff_multiplier ** retry_count)
+                    if effective_cooldown > cfg.retry_max_cooldown:
+                        effective_cooldown = cfg.retry_max_cooldown
                 if elapsed < effective_cooldown:
                     cooldown_elapsed = False
             except (ValueError, OSError):
@@ -850,6 +936,7 @@ def compute_pipeline_health(
         retryable_count=retryable_count,
         permanent_blocked_count=permanent_count,
         retryable_issues=retryable_issues,
+        escalation_needed=escalation_needed,
     )
 
 

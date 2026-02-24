@@ -13,7 +13,10 @@ from loom_tools.common.time_utils import now_utc
 from loom_tools.models.daemon_state import SystematicFailure
 from loom_tools.daemon_v2.actions.completions import check_completions, handle_completion
 from loom_tools.daemon_v2.actions.proposals import promote_proposals
-from loom_tools.daemon_v2.actions.retry_blocked import retry_blocked_issues
+from loom_tools.daemon_v2.actions.retry_blocked import (
+    escalate_blocked_issues,
+    retry_blocked_issues,
+)
 from loom_tools.daemon_v2.actions.spinning import escalate_spinning_issues
 from loom_tools.agent_spawn import kill_stuck_session, session_exists
 from loom_tools.daemon_v2.actions.shepherds import (
@@ -144,6 +147,11 @@ def run_iteration(ctx: DaemonContext) -> IterationResult:
         if retryable_data:
             retry_blocked_issues(retryable_data, ctx)
 
+    # Escalate retry-exhausted blocked issues to the human input queue
+    escalation_data = ctx.snapshot.get("pipeline_health", {}).get("escalation_needed", [])
+    if escalation_data:
+        escalate_blocked_issues(escalation_data, ctx)
+
     # Escalate spinning issues (PRs stuck in review cycles)
     if "escalate_spinning_issues" in actions:
         spinning_data = ctx.snapshot.get("prs", {}).get("spinning", [])
@@ -152,9 +160,25 @@ def run_iteration(ctx: DaemonContext) -> IterationResult:
 
     # 7. Update human-input-needed blockers in daemon state
     if ctx.state is not None and ctx.snapshot is not None:
-        ctx.state.needs_human_input = (
+        # Start with snapshot-computed blockers (curated issues, proposals, etc.)
+        ctx.state.needs_human_input = list(
             ctx.snapshot.get("computed", {}).get("needs_human_input", [])
         )
+        # Merge in exhausted-retry issues that were escalated in prior iterations
+        for issue_key, retry_entry in ctx.state.blocked_issue_retries.items():
+            if retry_entry.escalated_to_human:
+                already_present = any(
+                    e.get("type") == "exhausted_retry"
+                    and str(e.get("issue")) == issue_key
+                    for e in ctx.state.needs_human_input
+                )
+                if not already_present:
+                    ctx.state.needs_human_input.append({
+                        "type": "exhausted_retry",
+                        "issue": int(issue_key),
+                        "error_class": retry_entry.error_class,
+                        "retry_count": retry_entry.retry_count,
+                    })
 
     # 8. Stall escalation
     _update_stall_counter(ctx, result)

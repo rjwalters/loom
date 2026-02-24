@@ -38,6 +38,7 @@ from loom_tools.snapshot import (
     detect_orphaned_shepherds,
     detect_spinning_prs,
     detect_tmux_pool,
+    get_retry_policy,
     main,
     run_preflight_checks,
     sort_issues_by_strategy,
@@ -1053,6 +1054,182 @@ class TestPipelineHealth:
             ready_count=0, building_count=0, blocked_count=1, total_in_flight=0,
             blocked_issues=blocked, daemon_state=ds, cfg=_cfg(), now=NOW,
         )
+        assert result.retryable_count == 1
+
+
+class TestPipelineHealthTieredPolicy:
+    """Tests for per-error-class retry policies in compute_pipeline_health."""
+
+    def test_builder_test_failure_uses_6h_cooldown(self) -> None:
+        """builder_test_failure has 6h (21600s) fixed cooldown."""
+        ds = DaemonState(blocked_issue_retries={
+            "100": BlockedIssueRetry(
+                retry_count=1,
+                error_class="builder_test_failure",
+                last_retry_at="2026-01-30T11:59:59Z",  # 21601s before NOW
+            ),
+        })
+        blocked = [{"number": 100}]
+        result = compute_pipeline_health(
+            ready_count=0, building_count=0, blocked_count=1, total_in_flight=0,
+            blocked_issues=blocked, daemon_state=ds, cfg=_cfg(), now=NOW,
+        )
+        # 21601s elapsed > 21600s cooldown → retryable
+        assert result.retryable_count == 1
+        assert result.retryable_issues[0]["number"] == 100
+
+    def test_builder_test_failure_in_cooldown_not_retryable(self) -> None:
+        """builder_test_failure with only 3600s elapsed is still in 21600s cooldown."""
+        ds = DaemonState(blocked_issue_retries={
+            "100": BlockedIssueRetry(
+                retry_count=1,
+                error_class="builder_test_failure",
+                last_retry_at="2026-01-30T17:00:00Z",  # 3600s before NOW
+            ),
+        })
+        blocked = [{"number": 100}]
+        result = compute_pipeline_health(
+            ready_count=0, building_count=0, blocked_count=1, total_in_flight=0,
+            blocked_issues=blocked, daemon_state=ds, cfg=_cfg(), now=NOW,
+        )
+        assert result.retryable_count == 0
+
+    def test_builder_test_failure_max_2_retries(self) -> None:
+        """builder_test_failure is exhausted after 2 retries."""
+        ds = DaemonState(blocked_issue_retries={
+            "100": BlockedIssueRetry(
+                retry_count=2,
+                error_class="builder_test_failure",
+            ),
+        })
+        blocked = [{"number": 100}]
+        result = compute_pipeline_health(
+            ready_count=0, building_count=0, blocked_count=1, total_in_flight=0,
+            blocked_issues=blocked, daemon_state=ds, cfg=_cfg(), now=NOW,
+        )
+        assert result.retryable_count == 0
+        assert result.permanent_blocked_count == 1
+
+    def test_builder_test_failure_exhausted_triggers_escalation(self) -> None:
+        """Exhausted builder_test_failure appears in escalation_needed."""
+        ds = DaemonState(blocked_issue_retries={
+            "100": BlockedIssueRetry(
+                retry_count=2,
+                error_class="builder_test_failure",
+                escalated_to_human=False,
+            ),
+        })
+        blocked = [{"number": 100}]
+        result = compute_pipeline_health(
+            ready_count=0, building_count=0, blocked_count=1, total_in_flight=0,
+            blocked_issues=blocked, daemon_state=ds, cfg=_cfg(), now=NOW,
+        )
+        assert len(result.escalation_needed) == 1
+        assert result.escalation_needed[0]["number"] == 100
+        assert result.escalation_needed[0]["error_class"] == "builder_test_failure"
+
+    def test_already_escalated_not_in_escalation_needed(self) -> None:
+        """Issues already escalated_to_human=True are not re-escalated."""
+        ds = DaemonState(blocked_issue_retries={
+            "100": BlockedIssueRetry(
+                retry_count=2,
+                error_class="builder_test_failure",
+                escalated_to_human=True,
+            ),
+        })
+        blocked = [{"number": 100}]
+        result = compute_pipeline_health(
+            ready_count=0, building_count=0, blocked_count=1, total_in_flight=0,
+            blocked_issues=blocked, daemon_state=ds, cfg=_cfg(), now=NOW,
+        )
+        assert len(result.escalation_needed) == 0
+
+    def test_mcp_failure_uses_30min_cooldown(self) -> None:
+        """mcp_infrastructure_failure has 30min (1800s) fixed cooldown."""
+        ds = DaemonState(blocked_issue_retries={
+            "200": BlockedIssueRetry(
+                retry_count=1,
+                error_class="mcp_infrastructure_failure",
+                last_retry_at="2026-01-30T17:29:59Z",  # 1801s before NOW
+            ),
+        })
+        blocked = [{"number": 200}]
+        result = compute_pipeline_health(
+            ready_count=0, building_count=0, blocked_count=1, total_in_flight=0,
+            blocked_issues=blocked, daemon_state=ds, cfg=_cfg(), now=NOW,
+        )
+        assert result.retryable_count == 1
+
+    def test_mcp_failure_no_escalation_when_exhausted(self) -> None:
+        """mcp_infrastructure_failure does not escalate (transient error class)."""
+        ds = DaemonState(blocked_issue_retries={
+            "200": BlockedIssueRetry(
+                retry_count=5,
+                error_class="mcp_infrastructure_failure",
+            ),
+        })
+        blocked = [{"number": 200}]
+        result = compute_pipeline_health(
+            ready_count=0, building_count=0, blocked_count=1, total_in_flight=0,
+            blocked_issues=blocked, daemon_state=ds, cfg=_cfg(), now=NOW,
+        )
+        assert result.permanent_blocked_count == 1
+        # No escalation for transient error classes
+        assert len(result.escalation_needed) == 0
+
+    def test_doctor_exhausted_immediate_escalation(self) -> None:
+        """doctor_exhausted has max_retries=0 → immediate escalation with 0 retries."""
+        ds = DaemonState(blocked_issue_retries={
+            "300": BlockedIssueRetry(
+                retry_count=0,
+                error_class="doctor_exhausted",
+                escalated_to_human=False,
+            ),
+        })
+        blocked = [{"number": 300}]
+        result = compute_pipeline_health(
+            ready_count=0, building_count=0, blocked_count=1, total_in_flight=0,
+            blocked_issues=blocked, daemon_state=ds, cfg=_cfg(), now=NOW,
+        )
+        assert result.retryable_count == 0
+        assert result.permanent_blocked_count == 1
+        assert len(result.escalation_needed) == 1
+        assert result.escalation_needed[0]["number"] == 300
+        assert result.escalation_needed[0]["error_class"] == "doctor_exhausted"
+
+    def test_unknown_error_class_uses_global_config(self) -> None:
+        """Unknown error class falls back to global config (backoff still applies)."""
+        ds = DaemonState(blocked_issue_retries={
+            "400": BlockedIssueRetry(
+                retry_count=1,
+                error_class="some_unknown_class",
+                last_retry_at="2026-01-30T16:59:59Z",  # 3601s before NOW
+            ),
+        })
+        blocked = [{"number": 400}]
+        cfg = _cfg(max_retry_count=3, retry_cooldown=1800, retry_backoff_multiplier=2)
+        result = compute_pipeline_health(
+            ready_count=0, building_count=0, blocked_count=1, total_in_flight=0,
+            blocked_issues=blocked, daemon_state=ds, cfg=cfg, now=NOW,
+        )
+        # For unknown class: effective_cooldown = 1800 * 2^1 = 3600s; elapsed = 3601s → retryable
+        assert result.retryable_count == 1
+
+    def test_mcp_failure_fixed_cooldown_no_backoff(self) -> None:
+        """Known error classes use fixed cooldown, NOT exponential backoff."""
+        ds = DaemonState(blocked_issue_retries={
+            "200": BlockedIssueRetry(
+                retry_count=3,  # Would be 1800 * 2^3 = 14400s with backoff
+                error_class="mcp_infrastructure_failure",
+                last_retry_at="2026-01-30T17:29:59Z",  # 1801s before NOW
+            ),
+        })
+        blocked = [{"number": 200}]
+        result = compute_pipeline_health(
+            ready_count=0, building_count=0, blocked_count=1, total_in_flight=0,
+            blocked_issues=blocked, daemon_state=ds, cfg=_cfg(), now=NOW,
+        )
+        # Fixed 1800s cooldown, elapsed 1801s → retryable (no exponential backoff)
         assert result.retryable_count == 1
 
 

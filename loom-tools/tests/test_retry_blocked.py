@@ -8,6 +8,7 @@ from unittest import mock
 import pytest
 
 from loom_tools.daemon_v2.actions.retry_blocked import (
+    escalate_blocked_issues,
     retry_blocked_issues,
     _retry_single_issue,
     _update_retry_state,
@@ -371,6 +372,103 @@ class TestIterationDispatch:
 
         # retry_blocked_issues should NOT have been called
         mock_retry.assert_not_called()
+
+
+class TestEscalateBlockedIssues:
+    """Tests for escalate_blocked_issues action handler."""
+
+    def test_empty_list_returns_zero(self, tmp_path: pathlib.Path) -> None:
+        ctx = _make_ctx(tmp_path)
+        assert escalate_blocked_issues([], ctx) == 0
+
+    @mock.patch("loom_tools.daemon_v2.actions.retry_blocked.gh_run")
+    def test_escalates_single_issue(
+        self, mock_gh: mock.MagicMock, tmp_path: pathlib.Path
+    ) -> None:
+        ctx = _make_ctx(tmp_path, blocked_retries={
+            "42": BlockedIssueRetry(
+                retry_count=2,
+                error_class="builder_test_failure",
+                escalated_to_human=False,
+            ),
+        })
+        mock_gh.return_value = mock.MagicMock(returncode=0)
+
+        escalation = [{"number": 42, "error_class": "builder_test_failure", "retry_count": 2, "reason": "Exceeded 2 retries"}]
+        result = escalate_blocked_issues(escalation, ctx)
+
+        assert result == 1
+        # Verify comment was posted
+        call_args = mock_gh.call_args[0][0]
+        assert "comment" in call_args
+        assert "42" in call_args
+
+    @mock.patch("loom_tools.daemon_v2.actions.retry_blocked.gh_run")
+    def test_marks_escalated_in_state(
+        self, mock_gh: mock.MagicMock, tmp_path: pathlib.Path
+    ) -> None:
+        ctx = _make_ctx(tmp_path, blocked_retries={
+            "42": BlockedIssueRetry(
+                retry_count=2,
+                error_class="builder_test_failure",
+                escalated_to_human=False,
+            ),
+        })
+        mock_gh.return_value = mock.MagicMock(returncode=0)
+
+        escalation = [{"number": 42, "error_class": "builder_test_failure", "retry_count": 2, "reason": "test"}]
+        escalate_blocked_issues(escalation, ctx)
+
+        entry = ctx.state.blocked_issue_retries["42"]
+        assert entry.escalated_to_human is True
+
+    @mock.patch("loom_tools.daemon_v2.actions.retry_blocked.gh_run")
+    def test_adds_to_needs_human_input(
+        self, mock_gh: mock.MagicMock, tmp_path: pathlib.Path
+    ) -> None:
+        ctx = _make_ctx(tmp_path)
+        mock_gh.return_value = mock.MagicMock(returncode=0)
+
+        escalation = [{"number": 55, "error_class": "doctor_exhausted", "retry_count": 0, "reason": "immediate"}]
+        escalate_blocked_issues(escalation, ctx)
+
+        human_items = ctx.state.needs_human_input
+        assert len(human_items) == 1
+        assert human_items[0]["type"] == "exhausted_retry"
+        assert human_items[0]["issue"] == 55
+        assert human_items[0]["error_class"] == "doctor_exhausted"
+
+    @mock.patch("loom_tools.daemon_v2.actions.retry_blocked.gh_run")
+    def test_no_duplicate_human_input_entry(
+        self, mock_gh: mock.MagicMock, tmp_path: pathlib.Path
+    ) -> None:
+        """Calling escalate twice for the same issue only adds one entry."""
+        ctx = _make_ctx(tmp_path)
+        ctx.state.needs_human_input = [
+            {"type": "exhausted_retry", "issue": 42, "error_class": "builder_test_failure", "retry_count": 2}
+        ]
+        mock_gh.return_value = mock.MagicMock(returncode=0)
+
+        escalation = [{"number": 42, "error_class": "builder_test_failure", "retry_count": 2, "reason": "test"}]
+        escalate_blocked_issues(escalation, ctx)
+
+        # Still only one entry
+        assert len(ctx.state.needs_human_input) == 1
+
+    @mock.patch("loom_tools.daemon_v2.actions.retry_blocked.gh_run")
+    def test_comment_failure_still_escalates(
+        self, mock_gh: mock.MagicMock, tmp_path: pathlib.Path
+    ) -> None:
+        """Comment failure does not prevent escalation in daemon state."""
+        mock_gh.side_effect = Exception("API error")
+        ctx = _make_ctx(tmp_path)
+
+        escalation = [{"number": 42, "error_class": "builder_test_failure", "retry_count": 2, "reason": "test"}]
+        result = escalate_blocked_issues(escalation, ctx)
+
+        # Still counted as escalated (state was updated)
+        assert result == 1
+        assert ctx.state.blocked_issue_retries["42"].escalated_to_human is True
 
 
 class TestRecordBlockedReasonPreservesRetryCount:
