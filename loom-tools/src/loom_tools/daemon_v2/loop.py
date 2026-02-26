@@ -367,12 +367,6 @@ def _spawn_shepherd_from_signal(
         log_error(f"Signal spawn: loom-shepherd.sh not found at {shepherd_script}")
         return
 
-    # Build command arguments
-    args = [str(issue)]
-    if mode == "force":
-        args.append("--merge")
-    args.extend(flags)
-
     # Log file for this subprocess shepherd
     log_dir = ctx.repo_root / ".loom" / "logs"
     log_dir.mkdir(parents=True, exist_ok=True)
@@ -381,6 +375,13 @@ def _spawn_shepherd_from_signal(
         f"{shepherd_name}-{issue}-{time.time()}".encode()
     ).hexdigest()[:7]
     log_file_path = log_dir / f"loom-shepherd-signal-issue-{issue}-{task_id}.log"
+
+    # Build command arguments (task_id must be computed first)
+    args = [str(issue)]
+    if mode == "force":
+        args.append("--merge")
+    args.extend(["--task-id", task_id])
+    args.extend(flags)
 
     try:
         with open(log_file_path, "w") as log_file:
