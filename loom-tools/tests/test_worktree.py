@@ -115,16 +115,13 @@ class TestCLI:
         captured = capsys.readouterr()
         assert "does not exist" in captured.err.lower() or "error" in captured.err.lower()
 
-    def test_cli_check_not_in_worktree(self, tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
-        # Create a simple git repo
-        (tmp_path / ".git").mkdir()
-        monkeypatch.chdir(tmp_path)
-
-        result = main(["--check"])
+    def test_cli_check_not_in_worktree(self, capsys: pytest.CaptureFixture[str]) -> None:
+        """--check reports 'not in a worktree' when _is_in_worktree returns False."""
+        with patch("loom_tools.worktree._is_in_worktree", return_value=False):
+            result = main(["--check"])
         captured = capsys.readouterr()
-
-        # Should indicate not in a worktree
-        assert result == 1 or "not" in captured.out.lower()
+        assert result == 1
+        assert "not" in captured.out.lower()
 
 
 class TestDocumentedBehaviorDifferences:
