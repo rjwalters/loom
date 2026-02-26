@@ -78,21 +78,9 @@ mod claude_config {
         let account = std::env::var("USER").unwrap_or_else(|_| "claude-code-user".to_string());
         let target_service = keychain_service_name(config_dir);
 
-        // Check if target already has a credential
-        let check = std::process::Command::new("security")
-            .args([
-                "find-generic-password",
-                "-a",
-                &account,
-                "-s",
-                &target_service,
-            ])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status();
-        if check.is_ok_and(|s| s.success()) {
-            return; // Already exists
-        }
+        // Always re-clone so an expired token in the hashed entry gets refreshed.
+        // The write command uses -U (update-or-insert) so this is safe to run on
+        // every agent startup.
 
         // Read the default credential
         let read = std::process::Command::new("security")

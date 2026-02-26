@@ -238,14 +238,9 @@ def _clone_keychain_credentials(config_dir: Path) -> bool:
     account = getpass.getuser()
     target_service = _keychain_service_name(config_dir)
 
-    # Check if the target already has a credential
-    check = subprocess.run(
-        ["security", "find-generic-password", "-a", account, "-s", target_service],
-        capture_output=True,
-        text=True,
-    )
-    if check.returncode == 0:
-        return False  # Already exists
+    # Always re-clone so an expired token in the hashed entry gets refreshed.
+    # The write command uses -U (update-or-insert) so this is safe to run on
+    # every agent startup.
 
     # Read the default credential
     read = subprocess.run(
