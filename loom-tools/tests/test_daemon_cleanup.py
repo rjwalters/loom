@@ -12,6 +12,7 @@ from loom_tools.daemon_cleanup import (
     _revert_shepherd_labels,
     _run_orphan_recovery,
     _terminate_active_sessions,
+    cleanup_stale_signal_files,
     handle_daemon_shutdown,
     handle_daemon_startup,
     load_config,
@@ -654,3 +655,128 @@ class TestRunOrphanRecoveryBackground:
         # Now let recovery finish
         recovery_can_finish.set()
         startup_thread.join(timeout=3.0)
+
+
+class TestCleanupStaleSignalFiles:
+    """Tests for cleanup_stale_signal_files()."""
+
+    def _write_signal(self, signals_dir: pathlib.Path, name: str, payload: dict | None = None) -> pathlib.Path:
+        signals_dir.mkdir(parents=True, exist_ok=True)
+        path = signals_dir / name
+        path.write_text(json.dumps(payload or {"action": "spawn_shepherd", "issue": 1}))
+        return path
+
+    def _backdate(self, path: pathlib.Path, hours: float) -> None:
+        import os
+        old_time = time.time() - hours * 3600
+        os.utime(path, (old_time, old_time))
+
+    def test_returns_zero_when_no_signals_dir(self, tmp_path: pathlib.Path) -> None:
+        count = cleanup_stale_signal_files(tmp_path, stale_hours=1)
+        assert count == 0
+
+    def test_returns_zero_on_empty_signals_dir(self, tmp_path: pathlib.Path) -> None:
+        (tmp_path / ".loom" / "signals").mkdir(parents=True)
+        count = cleanup_stale_signal_files(tmp_path, stale_hours=1)
+        assert count == 0
+
+    def test_fresh_signals_not_deleted(self, tmp_path: pathlib.Path) -> None:
+        signals_dir = tmp_path / ".loom" / "signals"
+        sig = self._write_signal(signals_dir, "cmd-001.json")
+        count = cleanup_stale_signal_files(tmp_path, stale_hours=1)
+        assert count == 0
+        assert sig.exists()
+
+    def test_stale_signal_deleted(self, tmp_path: pathlib.Path) -> None:
+        signals_dir = tmp_path / ".loom" / "signals"
+        sig = self._write_signal(signals_dir, "cmd-001.json")
+        self._backdate(sig, hours=2)  # 2h old, exceeds 1h threshold
+        count = cleanup_stale_signal_files(tmp_path, stale_hours=1)
+        assert count == 1
+        assert not sig.exists()
+
+    def test_multiple_stale_signals_all_deleted(self, tmp_path: pathlib.Path) -> None:
+        signals_dir = tmp_path / ".loom" / "signals"
+        stale = []
+        for i in range(3):
+            sig = self._write_signal(signals_dir, f"cmd-{i:03d}.json")
+            self._backdate(sig, hours=5)
+            stale.append(sig)
+        count = cleanup_stale_signal_files(tmp_path, stale_hours=1)
+        assert count == 3
+        for sig in stale:
+            assert not sig.exists()
+
+    def test_mixed_fresh_and_stale(self, tmp_path: pathlib.Path) -> None:
+        signals_dir = tmp_path / ".loom" / "signals"
+        fresh = self._write_signal(signals_dir, "cmd-fresh.json")
+        stale = self._write_signal(signals_dir, "cmd-stale.json")
+        self._backdate(stale, hours=2)
+        count = cleanup_stale_signal_files(tmp_path, stale_hours=1)
+        assert count == 1
+        assert fresh.exists()
+        assert not stale.exists()
+
+    def test_dry_run_does_not_delete(self, tmp_path: pathlib.Path) -> None:
+        signals_dir = tmp_path / ".loom" / "signals"
+        sig = self._write_signal(signals_dir, "cmd-001.json")
+        self._backdate(sig, hours=5)
+        count = cleanup_stale_signal_files(tmp_path, stale_hours=1, dry_run=True)
+        assert count == 1
+        assert sig.exists()
+
+    def test_dry_run_returns_count_of_would_be_deleted(self, tmp_path: pathlib.Path) -> None:
+        signals_dir = tmp_path / ".loom" / "signals"
+        for i in range(4):
+            sig = self._write_signal(signals_dir, f"cmd-{i:03d}.json")
+            self._backdate(sig, hours=3)
+        count = cleanup_stale_signal_files(tmp_path, stale_hours=1, dry_run=True)
+        assert count == 4
+
+    def test_only_json_files_considered(self, tmp_path: pathlib.Path) -> None:
+        signals_dir = tmp_path / ".loom" / "signals"
+        signals_dir.mkdir(parents=True)
+        txt_file = signals_dir / "old-file.txt"
+        txt_file.write_text("not a signal")
+        import os
+        old_time = time.time() - 7200
+        os.utime(txt_file, (old_time, old_time))
+        count = cleanup_stale_signal_files(tmp_path, stale_hours=1)
+        assert count == 0
+        assert txt_file.exists()
+
+
+class TestHandleDaemonStartupCleanupSignals:
+    """Tests that handle_daemon_startup invokes cleanup_stale_signal_files."""
+
+    def test_startup_calls_cleanup_stale_signal_files(self, tmp_path: pathlib.Path) -> None:
+        loom_dir = tmp_path / ".loom"
+        loom_dir.mkdir()
+        config = load_config()
+
+        with mock.patch("loom_tools.daemon_cleanup._run_archive_logs"), \
+             mock.patch("loom_tools.daemon_cleanup._run_loom_clean"), \
+             mock.patch("loom_tools.daemon_cleanup.cleanup_stale_progress_files"), \
+             mock.patch("loom_tools.daemon_cleanup.cleanup_stale_signal_files") as mock_cleanup, \
+             mock.patch("loom_tools.daemon_cleanup._run_orphan_recovery"):
+            handle_daemon_startup(tmp_path, config, dry_run=True)
+
+        mock_cleanup.assert_called_once()
+        call_args = mock_cleanup.call_args
+        assert call_args.args[0] == tmp_path
+        assert call_args.args[1] == config.signal_stale_hours
+
+    def test_startup_dry_run_passes_dry_run_to_cleanup(self, tmp_path: pathlib.Path) -> None:
+        loom_dir = tmp_path / ".loom"
+        loom_dir.mkdir()
+        config = load_config()
+
+        with mock.patch("loom_tools.daemon_cleanup._run_archive_logs"), \
+             mock.patch("loom_tools.daemon_cleanup._run_loom_clean"), \
+             mock.patch("loom_tools.daemon_cleanup.cleanup_stale_progress_files"), \
+             mock.patch("loom_tools.daemon_cleanup.cleanup_stale_signal_files") as mock_cleanup, \
+             mock.patch("loom_tools.daemon_cleanup._run_orphan_recovery"):
+            handle_daemon_startup(tmp_path, config, dry_run=True)
+
+        mock_cleanup.assert_called_once()
+        assert mock_cleanup.call_args.kwargs.get("dry_run") is True
