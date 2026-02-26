@@ -518,6 +518,9 @@ def _fast_path_assign(ctx: DaemonContext) -> None:
         return
 
     # Idle slot + ready issues in cached snapshot: spawn immediately
+    # Only when auto_build is enabled (same gate as the full iteration path)
+    if not ctx.config.auto_build:
+        return
     spawned = spawn_shepherds(ctx)
     if spawned > 0:
         log_success(
@@ -604,6 +607,7 @@ def _update_orchestration_active(ctx: DaemonContext) -> None:
             data = {}
         data["orchestration_active"] = ctx.orchestration_active
         data["force_mode"] = ctx.config.force_mode
+        data["auto_build"] = ctx.config.auto_build
         write_json_file(ctx.state_file, data)
     except Exception as exc:
         log_warning(f"_update_orchestration_active: {exc}")
@@ -780,6 +784,7 @@ def _init_state_file(ctx: DaemonContext) -> None:
             data = read_json_file(ctx.state_file)
             if isinstance(data, dict):
                 data["force_mode"] = ctx.config.force_mode
+                data["auto_build"] = ctx.config.auto_build
                 data["orchestration_active"] = False
                 data["started_at"] = timestamp
                 data["running"] = True
@@ -804,6 +809,7 @@ def _init_state_file(ctx: DaemonContext) -> None:
         "iteration": 0,
         "orchestration_active": False,
         "force_mode": ctx.config.force_mode,
+        "auto_build": ctx.config.auto_build,
         "execution_mode": "direct",
         "daemon_session_id": ctx.session_id,
         "daemon_pid": os.getpid(),
@@ -927,7 +933,11 @@ def _print_header(ctx: DaemonContext) -> None:
     log_info(f"  Started: {timestamp}")
     log_info(f"  PID: {os.getpid()}")
     log_info(f"  Session ID: {ctx.session_id}")
-    log_info(f"  Mode: {ctx.config.mode_display()} (standby — run /loom to activate)")
+    if ctx.config.auto_build:
+        mode_note = "shepherds will auto-spawn from loom:issue queue"
+    else:
+        mode_note = "shepherds disabled — use --auto-build to enable"
+    log_info(f"  Mode: {ctx.config.mode_display()} ({mode_note})")
     log_info(f"  Poll interval: {ctx.config.poll_interval}s")
     log_info(f"  Max shepherds: {ctx.config.max_shepherds}")
     if ctx.config.timeout_min > 0:

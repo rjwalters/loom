@@ -14,11 +14,20 @@
 #   ./.loom/scripts/start-daemon.sh [OPTIONS]
 #
 # Options:
+#   --auto-build, -a    Enable automatic shepherd spawning from loom:issue queue
 #   --timeout-min N     Stop daemon after N minutes (0 = no timeout)
 #   --debug, -d         Enable debug logging
 #   --status            Print daemon status and exit
 #   --stop              Write stop signal and exit
 #   --help, -h          Show this help
+#
+# Modes:
+#   (no flags)          Support-only: judge, champion, doctor, auditor, curator,
+#                       guide run autonomously. Shepherds NOT auto-spawned.
+#                       Use /shepherd <N> to shepherd specific issues manually.
+#   --auto-build        Also auto-spawn shepherds from loom:issue queue.
+#                       Equivalent to current default behavior before this change.
+#                       Use /loom --merge in Claude Code for force mode on top.
 #
 # After starting, the /loom Claude Code skill detects the running daemon
 # via .loom/daemon-loop.pid and operates as a signal-writer + observer.
@@ -173,3 +182,7 @@ echo ""
 echo "Start /loom in Claude Code to begin orchestration:"
 echo "  /loom"
 echo "  /loom --merge   # force mode: auto-promote + auto-merge"
+echo ""
+echo "To enable automatic shepherd spawning, restart with --auto-build:"
+echo "  $SCRIPT_DIR/stop-daemon.sh"
+echo "  $SCRIPT_DIR/start-daemon.sh --auto-build"

@@ -124,8 +124,8 @@ def run_iteration(ctx: DaemonContext) -> IterationResult:
     if "promote_proposals" in actions and ctx.config.force_mode:
         result.proposals_promoted = promote_proposals(ctx)
 
-    # Spawn shepherds
-    if "spawn_shepherds" in actions:
+    # Spawn shepherds (only when auto_build is enabled)
+    if "spawn_shepherds" in actions and ctx.config.auto_build:
         result.shepherds_spawned = spawn_shepherds(ctx)
 
     # Spawn support roles (handles all interval and demand triggers)
