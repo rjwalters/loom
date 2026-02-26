@@ -73,8 +73,8 @@ Launch the Loom desktop application for automated orchestration:
 ### 3. Daemon Mode (Layer 2)
 
 ```bash
-./.loom/scripts/start-daemon.sh              # support roles only (new default)
-./.loom/scripts/start-daemon.sh --auto-build # also auto-spawn shepherds from queue
+./.loom/scripts/daemon.sh start              # support roles only (default)
+./.loom/scripts/daemon.sh start --auto-build # also auto-spawn shepherds from queue
 ```
 
 ```bash
@@ -88,7 +88,7 @@ Launch the Loom desktop application for automated orchestration:
 
 **Merge Mode** enables: auto-promotion of proposals, auto-merge after Judge approval, audit trail with `[force-mode]` markers, safety guardrails still apply. Merge mode does **not** skip the Judge phase (code review always runs due to GitHub's self-review API restriction). Merge mode implies `--auto-build`.
 
-**Graceful shutdown**: `touch .loom/stop-daemon`
+**Graceful shutdown**: `./.loom/scripts/daemon.sh stop` (or `touch .loom/stop-daemon`)
 
 ## Agent Roles
 

@@ -49,7 +49,7 @@ The Loom daemon is not running.
 
 Start it from a terminal OUTSIDE Claude Code:
 
-  ./.loom/scripts/start-daemon.sh                     # Normal mode
+  ./.loom/scripts/daemon.sh start                      # Normal mode
 
 Then run /shepherd <issue> again.
 To use merge mode, pass --merge when running /shepherd (e.g. /shepherd 123 --merge).
@@ -136,7 +136,7 @@ The daemon polls `.loom/signals/` every 2 seconds and processes commands atomica
 
 After writing the signal, read `.loom/daemon-state.json` every ~5 seconds until a shepherd slot shows `issue == <N>` with a `task_id`. This confirms the daemon received and processed the signal.
 
-**If no pickup after 30 seconds**: Check whether the signal file still exists in `.loom/signals/` — if present, the daemon hasn't processed it yet (may be busy or stopped). Report to the user and suggest checking daemon status with `.loom/scripts/start-daemon.sh --status`.
+**If no pickup after 30 seconds**: Check whether the signal file still exists in `.loom/signals/` — if present, the daemon hasn't processed it yet (may be busy or stopped). Report to the user and suggest checking daemon status with `.loom/scripts/daemon.sh status`.
 
 ### Step 6: Monitor Progress
 
@@ -176,7 +176,7 @@ When the progress file shows `status: completed` or `status: error`, summarize t
 
 For detailed orchestration workflow, phase definitions, and troubleshooting:
 - **Lifecycle details**: `.claude/commands/shepherd-lifecycle.md`
-- **Daemon startup**: `.loom/scripts/start-daemon.sh --help`
-- **Daemon status**: `.loom/scripts/start-daemon.sh --status`
+- **Daemon startup**: `.loom/scripts/daemon.sh --help`
+- **Daemon status**: `.loom/scripts/daemon.sh status`
 - **Signal protocol**: `loom-tools/src/loom_tools/daemon_v2/command_poller.py`
 - **Python shepherd**: `loom-tools/src/loom_tools/shepherd/`

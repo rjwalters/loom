@@ -55,9 +55,9 @@ The Loom daemon is not running.
 
 Start it from a terminal OUTSIDE Claude Code:
 
-  ./.loom/scripts/start-daemon.sh                     # Support-only mode (default)
-  ./.loom/scripts/start-daemon.sh --auto-build        # Also auto-spawn shepherds
-  ./.loom/scripts/start-daemon.sh --timeout-min 120   # Auto-stop after 2 hours
+  ./.loom/scripts/daemon.sh start                      # Support-only mode (default)
+  ./.loom/scripts/daemon.sh start --auto-build         # Also auto-spawn shepherds
+  ./.loom/scripts/daemon.sh start --timeout-min 120    # Auto-stop after 2 hours
 
 Then run /loom again to begin observing and orchestrating.
 
@@ -201,9 +201,8 @@ touch .loom/stop-daemon
 
 **Via stop script** (from a shell outside Claude Code):
 ```bash
-./.loom/scripts/stop-daemon.sh           # Graceful
-./.loom/scripts/stop-daemon.sh --force   # Immediate SIGTERM
-./.loom/scripts/stop-daemon.sh --wait    # Graceful + wait for exit
+./.loom/scripts/daemon.sh stop            # Graceful (waits for exit)
+./.loom/scripts/daemon.sh stop --force   # Immediate SIGTERM
 ```
 
 ---
@@ -254,7 +253,7 @@ Loom orchestrates AI-powered development using GitHub issues, labels, and git wo
 
 ```bash
 # Step 1: Start the daemon from a terminal OUTSIDE Claude Code
-./.loom/scripts/start-daemon.sh
+./.loom/scripts/daemon.sh start
 
 # Step 2: In Claude Code, observe and orchestrate
 /loom --merge
@@ -331,13 +330,14 @@ Loom has three layers of roles:
 
 **Starting the daemon (run OUTSIDE Claude Code):**
 ```
-./.loom/scripts/start-daemon.sh                   Start daemon (support-only)
-./.loom/scripts/start-daemon.sh --auto-build      Also auto-spawn shepherds
-./.loom/scripts/start-daemon.sh -t 180            Run for 3 hours then stop
-./.loom/scripts/start-daemon.sh --status          Check if daemon is running
-./.loom/scripts/stop-daemon.sh                    Stop gracefully
-./.loom/scripts/stop-daemon.sh --force            Stop immediately (SIGTERM)
-./.loom/scripts/stop-daemon.sh --wait             Stop and wait for exit
+./.loom/scripts/daemon.sh start                   Start daemon (support-only)
+./.loom/scripts/daemon.sh start --auto-build      Also auto-spawn shepherds
+./.loom/scripts/daemon.sh start -t 180            Run for 3 hours then stop
+./.loom/scripts/daemon.sh status                  Check if daemon is running
+./.loom/scripts/daemon.sh stop                    Stop gracefully (waits for exit)
+./.loom/scripts/daemon.sh stop --force            Stop immediately (SIGTERM)
+./.loom/scripts/daemon.sh restart                 Stop + start
+./.loom/scripts/daemon.sh restart --auto-build    Restart with auto-build
 ```
 
 **Shepherd commands:**
@@ -423,8 +423,8 @@ This avoids nested Claude Code spawning restrictions.
 
 **Starting the daemon (from a shell outside Claude Code):**
 ```bash
-./.loom/scripts/start-daemon.sh                   # Start daemon
-./.loom/scripts/start-daemon.sh -t 120            # Start daemon, stop after 2 hours
+./.loom/scripts/daemon.sh start                    # Start daemon
+./.loom/scripts/daemon.sh start -t 120             # Start daemon, stop after 2 hours
 ```
 
 **Observing from Claude Code (`/loom`):**
@@ -449,9 +449,9 @@ This avoids nested Claude Code spawning restrictions.
 
 **Stopping the daemon:**
 ```bash
-touch .loom/stop-daemon                          # Via file signal
-./.loom/scripts/stop-daemon.sh                  # Via convenience script
-./.loom/scripts/stop-daemon.sh --force          # Immediate SIGTERM
+./.loom/scripts/daemon.sh stop                   # Graceful (waits for exit)
+./.loom/scripts/daemon.sh stop --force           # Immediate SIGTERM
+touch .loom/stop-daemon                          # Via file signal (equivalent)
 ```
 
 **Configuration (environment variables):**
@@ -586,20 +586,18 @@ loom-clean --force
 **Daemon won't start (stale PID):**
 ```bash
 rm -f .loom/daemon-loop.pid
-./.loom/scripts/start-daemon.sh
+./.loom/scripts/daemon.sh start
 ```
 
 **Stop daemon gracefully:**
 ```bash
-touch .loom/stop-daemon
-# or
-./.loom/scripts/stop-daemon.sh
+./.loom/scripts/daemon.sh stop
 ```
 
 **Check daemon status:**
 ```bash
 /loom status
-./.loom/scripts/start-daemon.sh --status
+./.loom/scripts/daemon.sh status
 ```
 
 **Merge PRs from worktrees (never use `gh pr merge`):**

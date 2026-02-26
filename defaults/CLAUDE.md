@@ -193,10 +193,10 @@ Run the Loom daemon for fully autonomous system orchestration.
 
 ```bash
 # Start daemon in support-only mode (default — no auto-shepherd-spawning)
-./.loom/scripts/start-daemon.sh
+./.loom/scripts/daemon.sh start
 
 # Start daemon with auto-build enabled (also spawns shepherds from queue)
-./.loom/scripts/start-daemon.sh --auto-build
+./.loom/scripts/daemon.sh start --auto-build
 
 # Activate orchestration from Claude Code (daemon must already be running)
 /loom
@@ -247,7 +247,10 @@ Shepherd-2 (issue #456):
 
 **Graceful shutdown**:
 ```bash
-# Signal the daemon to stop
+# Stop the daemon
+./.loom/scripts/daemon.sh stop
+
+# Or via file signal (equivalent)
 touch .loom/stop-daemon
 
 # Daemon will:
