@@ -980,6 +980,10 @@ start_startup_monitor() {
                 # loom actually failed at runtime.  See issue #2911.
                 local monitor_start_time
                 monitor_start_time=$(date +%s)
+                # Track whether the debug log was ever fresh (vs always stale/
+                # concurrent).  Used below to distinguish "loom confirmed absent"
+                # from "loom status unknown due to stale log".  See issue #3031.
+                local debug_log_ever_fresh=false
 
                 while [[ "${grace_elapsed}" -lt "${STARTUP_GRACE_PERIOD}" ]]; do
                     # Session ended on its own — nothing to kill
@@ -1018,6 +1022,7 @@ start_startup_monitor() {
                         fi
 
                         if [[ "${debug_log_is_fresh}" == "true" ]]; then
+                            debug_log_ever_fresh=true
                             # Fast-path: if loom is explicitly listed as failed in the
                             # current session's debug log, kill immediately without waiting
                             # for the full grace period.  See issue #2911.
@@ -1080,7 +1085,35 @@ start_startup_monitor() {
                         log_warn "Startup monitor: project MCP failure detected — killing session for clean restart (see issue #2652)"
                     fi
                 else
-                    log_warn "Startup monitor: loom MCP not connected after ${STARTUP_GRACE_PERIOD}s — killing degraded session"
+                    # Build informative kill message: identify which MCP(s) actually
+                    # failed rather than always blaming loom.  See issue #3031.
+                    local _mcp_fail_lines="" _failed_mcps="" _fail_detail=""
+                    if [[ -n "${resolved_debug_log:-}" ]] && [[ -f "${resolved_debug_log}" ]]; then
+                        _mcp_fail_lines=$(grep -E 'MCP server "[^"]+".*([Cc]onnection [Ff]ailed|[Ff]ailed to connect)' \
+                            "${resolved_debug_log}" 2>/dev/null || true)
+                        if [[ -n "${_mcp_fail_lines}" ]]; then
+                            _failed_mcps=$(printf '%s\n' "${_mcp_fail_lines}" | \
+                                grep -oE 'MCP server "[^"]+"' | grep -oE '"[^"]+"' | \
+                                tr -d '"' | grep -v '^loom$' | sort -u | head -3 | \
+                                tr '\n' ',' | sed 's/,$//')
+                            _fail_detail=$(printf '%s\n' "${_mcp_fail_lines}" | head -1 | \
+                                grep -oE 'Cannot find module[^;|]*|ENOENT[^;|]*|spawn ENOENT[^;|]*' | \
+                                head -1 | sed 's/[[:space:]]*$//' | cut -c1-80 || true)
+                        fi
+                    fi
+                    if [[ "${debug_log_ever_fresh}" == "false" ]]; then
+                        if [[ -n "${_failed_mcps}" ]]; then
+                            log_warn "Startup monitor: loom MCP not confirmed (debug log stale/concurrent); '${_failed_mcps}' also failed — killing degraded session"
+                        else
+                            log_warn "Startup monitor: loom MCP not confirmed after ${STARTUP_GRACE_PERIOD}s (debug log stale/concurrent) — killing degraded session"
+                        fi
+                    elif [[ -n "${_failed_mcps}" ]]; then
+                        local _detail_suffix=""
+                        [[ -n "${_fail_detail}" ]] && _detail_suffix=" — ${_fail_detail}"
+                        log_warn "Startup monitor: '${_failed_mcps}' MCP failed${_detail_suffix} — loom not confirmed — killing degraded session"
+                    else
+                        log_warn "Startup monitor: loom MCP not connected after ${STARTUP_GRACE_PERIOD}s — killing degraded session"
+                    fi
                 fi
                 pkill -INT -P $$ -f "claude" 2>/dev/null || true
                 break
