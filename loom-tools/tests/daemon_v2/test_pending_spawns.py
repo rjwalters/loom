@@ -323,6 +323,70 @@ class TestSpawnShepherdFromSignalClosedIssue:
 
 
 # ---------------------------------------------------------------------------
+# Tests: standby-mode spawn (ctx.state is None at call time)
+# ---------------------------------------------------------------------------
+
+
+class TestSpawnShepherdFromSignalStandbyMode:
+    """_spawn_shepherd_from_signal should load state on-demand in standby mode."""
+
+    @mock.patch("loom_tools.daemon_v2.loop.subprocess.Popen")
+    @mock.patch("loom_tools.daemon_v2.loop.read_daemon_state")
+    def test_spawns_when_state_none_but_file_exists(
+        self,
+        mock_read_state: mock.MagicMock,
+        mock_popen: mock.MagicMock,
+        tmp_path: pathlib.Path,
+    ) -> None:
+        """When ctx.state is None but daemon-state.json exists, load it and spawn."""
+        # read_daemon_state returns a valid DaemonState with no shepherds
+        mock_read_state.return_value = DaemonState()
+
+        ctx = _make_ctx(tmp_path)
+        ctx.state = None  # simulate standby mode
+
+        shepherd_script = tmp_path / ".loom" / "scripts" / "loom-shepherd.sh"
+        shepherd_script.parent.mkdir(parents=True, exist_ok=True)
+        shepherd_script.touch()
+
+        proc_mock = mock.MagicMock()
+        proc_mock.pid = 12345
+        mock_popen.return_value = proc_mock
+
+        _spawn_shepherd_from_signal(ctx, issue=42, mode="default", flags=[])
+
+        # State should have been populated
+        assert ctx.state is not None
+        # Shepherd should have been spawned, not re-queued
+        assert mock_popen.called
+        assert ctx.pending_spawns == []
+
+    @mock.patch("loom_tools.daemon_v2.loop.read_daemon_state")
+    def test_requeues_when_state_none_and_file_unreadable(
+        self,
+        mock_read_state: mock.MagicMock,
+        tmp_path: pathlib.Path,
+    ) -> None:
+        """When ctx.state is None and reading state raises, signal is re-queued."""
+        mock_read_state.side_effect = OSError("daemon-state.json not found")
+
+        ctx = _make_ctx(tmp_path)
+        ctx.state = None  # simulate standby mode
+
+        mock_poller = mock.MagicMock()
+        mock_poller.requeue.return_value = True
+
+        _spawn_shepherd_from_signal(ctx, issue=42, mode="default", flags=[], command_poller=mock_poller)
+
+        # Signal should be re-queued via command_poller.requeue
+        assert mock_poller.requeue.call_count == 1
+        requeued_cmd = mock_poller.requeue.call_args[0][0]
+        assert requeued_cmd == {"action": "spawn_shepherd", "issue": 42, "mode": "default", "flags": []}
+        # ctx.state should remain None
+        assert ctx.state is None
+
+
+# ---------------------------------------------------------------------------
 # Tests: DaemonContext.pending_spawns field
 # ---------------------------------------------------------------------------
 
