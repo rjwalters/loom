@@ -20,19 +20,27 @@ Signal payload format::
 
 Available actions:
 
-+-------------------+---------------------------------------+
-| Action            | Payload fields                        |
-+===================+=======================================+
-| spawn_shepherd    | issue (int), mode (str), flags (list) |
-+-------------------+---------------------------------------+
-| stop              | (none)                                |
-+-------------------+---------------------------------------+
-| pause_shepherd    | shepherd_id (str)                     |
-+-------------------+---------------------------------------+
-| resume_shepherd   | shepherd_id (str)                     |
-+-------------------+---------------------------------------+
-| set_max_shepherds | count (int)                           |
-+-------------------+---------------------------------------+
++----------------------+---------------------------------------+
+| Action               | Payload fields                        |
++======================+=======================================+
+| start_orchestration  | mode (str: "default"|"force")         |
++----------------------+---------------------------------------+
+| spawn_shepherd       | issue (int), mode (str), flags (list) |
++----------------------+---------------------------------------+
+| stop                 | (none)                                |
++----------------------+---------------------------------------+
+| pause_shepherd       | shepherd_id (str)                     |
++----------------------+---------------------------------------+
+| resume_shepherd      | shepherd_id (str)                     |
++----------------------+---------------------------------------+
+| set_max_shepherds    | count (int)                           |
++----------------------+---------------------------------------+
+
+Note: ``start_orchestration`` must be sent by the /loom skill before the
+daemon will run its autonomous iteration loop. Until received, the daemon
+processes signals (including ``spawn_shepherd``) but does not auto-spawn
+work from the GitHub snapshot. This allows ``/shepherd <N>`` to work
+without activating full loom orchestration.
 """
 
 from __future__ import annotations

@@ -126,21 +126,27 @@ def run(ctx: DaemonContext) -> int:
             if ctx.pending_spawns:
                 _retry_pending_spawns(ctx)
 
-            # Run iteration
-            log_info(f"Iteration {ctx.iteration}: Starting...")
-            start_time = time.time()
-            result = run_iteration(ctx)
-            duration = int(time.time() - start_time)
+            # Run iteration (only when orchestration is active — activated by /loom)
+            if ctx.orchestration_active:
+                log_info(f"Iteration {ctx.iteration}: Starting...")
+                start_time = time.time()
+                result = run_iteration(ctx)
+                duration = int(time.time() - start_time)
 
-            # Log result
-            log_info(f"Iteration {ctx.iteration}: {result.summary} ({duration}s)")
+                # Log result
+                log_info(f"Iteration {ctx.iteration}: {result.summary} ({duration}s)")
 
-            # Update metrics
-            _update_metrics(ctx, result.status, duration, result.summary)
+                # Update metrics
+                _update_metrics(ctx, result.status, duration, result.summary)
 
-            # Check for shutdown in result
-            if result.status == "shutdown" or "SHUTDOWN" in result.summary:
-                break
+                # Check for shutdown in result
+                if result.status == "shutdown" or "SHUTDOWN" in result.summary:
+                    break
+            else:
+                log_info(
+                    f"Iteration {ctx.iteration}: Standby — "
+                    "waiting for /loom to activate orchestration"
+                )
 
             # Check stop signal again before sleeping
             if check_stop_signal(ctx):
@@ -271,6 +277,17 @@ def _process_commands(
                 ctx.config.max_shepherds = count
             else:
                 log_warning(f"set_max_shepherds invalid count={count!r}, skipping")
+
+        elif action == "start_orchestration":
+            mode = cmd.get("mode", "default")
+            if mode == "force":
+                ctx.config.force_mode = True
+            ctx.orchestration_active = True
+            log_success(
+                f"Signal: start_orchestration mode={mode} — "
+                "orchestration activated"
+            )
+            _update_orchestration_active(ctx)
 
         else:
             log_warning(f"Signal: unknown action={action!r}, skipping")
@@ -564,9 +581,23 @@ def _write_state(ctx: DaemonContext) -> None:
         if not isinstance(data, dict):
             data = {}
         data["shepherds"] = {k: v.to_dict() for k, v in ctx.state.shepherds.items()}
+        data["orchestration_active"] = ctx.orchestration_active
         write_json_file(ctx.state_file, data)
     except Exception as exc:
         log_warning(f"_write_state: failed to persist state: {exc}")
+
+
+def _update_orchestration_active(ctx: DaemonContext) -> None:
+    """Persist orchestration_active flag to daemon-state.json (best-effort)."""
+    try:
+        data = read_json_file(ctx.state_file) if ctx.state_file.exists() else {}
+        if not isinstance(data, dict):
+            data = {}
+        data["orchestration_active"] = ctx.orchestration_active
+        data["force_mode"] = ctx.config.force_mode
+        write_json_file(ctx.state_file, data)
+    except Exception as exc:
+        log_warning(f"_update_orchestration_active: {exc}")
 
 
 def _update_signal_queue_depth(ctx: DaemonContext, depth: int) -> None:
@@ -740,6 +771,7 @@ def _init_state_file(ctx: DaemonContext) -> None:
             data = read_json_file(ctx.state_file)
             if isinstance(data, dict):
                 data["force_mode"] = ctx.config.force_mode
+                data["orchestration_active"] = False
                 data["started_at"] = timestamp
                 data["running"] = True
                 data["iteration"] = 0
@@ -761,6 +793,7 @@ def _init_state_file(ctx: DaemonContext) -> None:
         "last_poll": None,
         "running": True,
         "iteration": 0,
+        "orchestration_active": False,
         "force_mode": ctx.config.force_mode,
         "execution_mode": "direct",
         "daemon_session_id": ctx.session_id,
@@ -885,7 +918,7 @@ def _print_header(ctx: DaemonContext) -> None:
     log_info(f"  Started: {timestamp}")
     log_info(f"  PID: {os.getpid()}")
     log_info(f"  Session ID: {ctx.session_id}")
-    log_info(f"  Mode: {ctx.config.mode_display()}")
+    log_info(f"  Mode: {ctx.config.mode_display()} (standby — run /loom to activate)")
     log_info(f"  Poll interval: {ctx.config.poll_interval}s")
     log_info(f"  Max shepherds: {ctx.config.max_shepherds}")
     if ctx.config.timeout_min > 0:

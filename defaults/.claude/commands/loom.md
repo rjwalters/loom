@@ -68,7 +68,37 @@ Why run outside Claude Code?
 
 ### If Daemon IS Running
 
-Proceed to the Observer Loop below.
+Read `.loom/daemon-state.json` and check `orchestration_active`.
+
+**If `orchestration_active` is `false` (standby mode)**:
+
+The daemon is waiting for an explicit signal to begin autonomous work. Send a `start_orchestration` signal:
+
+```
+Mode mapping:
+  /loom           → mode: "default"
+  /loom --merge   → mode: "force"
+  /loom --force   → mode: "force"
+```
+
+Write the signal file using the Write tool (not Bash):
+
+```
+.loom/signals/cmd-{YYYYMMDD-HHMMSS}-{random4hex}.json
+```
+
+Payload:
+```json
+{"action": "start_orchestration", "mode": "<default|force>"}
+```
+
+Inform the user: `→ Activating orchestration (mode=<mode>)...`
+
+Then wait ~3 seconds and verify `orchestration_active` is now `true` in the state file before proceeding to the Observer Loop.
+
+**If `orchestration_active` is `true`**:
+
+Proceed directly to the Observer Loop below.
 
 ## Observer Loop
 
@@ -104,6 +134,7 @@ Write JSON files named `cmd-{YYYYMMDD-HHMMSS}-{random}.json` to `.loom/signals/`
 
 | Action | Payload | Description |
 |--------|---------|-------------|
+| `start_orchestration` | `{"action": "start_orchestration", "mode": "default\|force"}` | Activate autonomous orchestration loop |
 | `spawn_shepherd` | `{"action": "spawn_shepherd", "issue": N, "mode": "default\|force"}` | Start shepherd for issue N |
 | `stop` | `{"action": "stop"}` | Graceful daemon shutdown |
 | `set_max_shepherds` | `{"action": "set_max_shepherds", "count": N}` | Adjust shepherd pool size |

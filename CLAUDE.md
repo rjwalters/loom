@@ -73,7 +73,7 @@ Launch the Loom desktop application for automated orchestration:
 ### 3. Daemon Mode (Layer 2)
 
 ```bash
-/loom           # Start daemon (runs continuously)
+/loom           # Activate daemon orchestration (daemon must be started first)
 /loom --merge   # Aggressive autonomous development
 ```
 

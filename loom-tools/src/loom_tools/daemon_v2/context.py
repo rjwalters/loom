@@ -33,6 +33,11 @@ class DaemonContext:
     snapshot: dict[str, Any] | None = None
     state: DaemonState | None = None
 
+    # When False (default on startup), the daemon processes signals and pending
+    # spawns but does not run run_iteration() (no auto-spawning from snapshot).
+    # Set to True by a start_orchestration signal from the /loom skill.
+    orchestration_active: bool = False
+
     # Pending spawn queue: spawn_shepherd signals that could not be fulfilled
     # immediately (no idle slot available) are held here and retried each
     # iteration until a slot opens or the issue is cancelled.
