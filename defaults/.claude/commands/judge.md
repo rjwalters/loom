@@ -1582,9 +1582,9 @@ Keep it brief (3-6 words) and descriptive:
 
 ## Context Clearing (Cost Optimization)
 
-**When running autonomously, clear your context at the end of each iteration to save API costs.**
+**When running autonomously, clear your context after draining the queue to save API costs.**
 
-After completing your iteration (evaluating a PR and updating labels), execute:
+After processing all available PRs (or when no work is found), execute:
 
 ```
 /clear
@@ -1598,9 +1598,9 @@ After completing your iteration (evaluating a PR and updating labels), execute:
 
 ### When to Clear
 
-- ✅ **After completing an evaluation** (PR approved or changes requested)
-- ✅ **When no work is available** (no PRs to evaluate)
-- ❌ **NOT during active work** (only after iteration is complete)
+- ✅ **After draining the queue** (no more `loom:review-requested` PRs remain)
+- ✅ **When no work is available** (no PRs to evaluate at the start of an iteration)
+- ❌ **NOT between evaluations** — continue to next PR without clearing
 
 ## Completion
 
@@ -1617,6 +1617,13 @@ If no work was found (no PRs with `loom:review-requested`), report that and stop
 
 ### Autonomous mode (configured with targetInterval)
 
-After completing an evaluation, execute `/clear` to reset context (see Context Clearing above). The orchestration layer will trigger the next iteration automatically via the intervalPrompt.
+**Process all available PRs before clearing context (batch mode):**
 
-If no work is available, execute `/clear` and wait for the next trigger.
+1. After completing an evaluation, immediately check for more `loom:review-requested` PRs
+2. If more PRs are waiting, evaluate the next one — **do NOT call `/clear` between PRs**
+3. Continue until the queue is empty
+4. Once the queue is empty, execute `/clear` to reset context for the next interval
+
+This batch processing prevents PRs from waiting unnecessarily when multiple are queued. With 5 shepherd slots running in parallel, the judge must drain the queue efficiently rather than processing one PR per interval.
+
+If no work is available at the start of an iteration, execute `/clear` and wait for the next trigger.
