@@ -274,7 +274,8 @@ _ISSUE_FIELDS = ["number", "title", "labels", "createdAt"]
 # Labels that indicate an issue has been processed or claimed — used to identify
 # issues that still need curator attention.
 _CURATED_SKIP_LABELS = frozenset({
-    "loom:curated", "loom:curating", "loom:issue", "loom:building", "external",
+    "loom:curated", "loom:curating", "loom:issue", "loom:building", "loom:blocked",
+    "external",
 })
 _PR_FIELDS = ["number", "title", "labels", "headRefName"]
 
