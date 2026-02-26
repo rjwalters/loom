@@ -23,6 +23,7 @@ SUPPORT_ROLES = {
     "judge": "judge",
     "architect": "architect",
     "hermit": "hermit",
+    "curator": "curator",
 }
 
 
@@ -167,6 +168,10 @@ def spawn_roles_from_actions(ctx: DaemonContext) -> int:
 
     if "trigger_hermit" in actions:
         if spawn_support_role(ctx, "hermit"):
+            spawned += 1
+
+    if "trigger_curator" in actions:
+        if spawn_support_role(ctx, "curator"):
             spawned += 1
 
     return spawned
