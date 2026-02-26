@@ -45,6 +45,7 @@ MAX_ARCHIVED_SESSIONS_DEFAULT = 10
 PROGRESS_STALE_HOURS_DEFAULT = 24
 STARTUP_CLEANUP_MAX_FILES_DEFAULT = 20
 STARTUP_CLEANUP_TIMEOUT_DEFAULT = 30  # seconds
+SIGNAL_STALE_HOURS_DEFAULT = 1  # discard unprocessed signals after 1 hour
 
 
 @dataclass
@@ -59,6 +60,7 @@ class CleanupConfig:
     progress_stale_hours: int
     startup_cleanup_max_files: int
     startup_cleanup_timeout: int  # seconds
+    signal_stale_hours: int
 
 
 def load_config() -> CleanupConfig:
@@ -79,6 +81,9 @@ def load_config() -> CleanupConfig:
         ),
         startup_cleanup_timeout=env_int(
             "LOOM_STARTUP_CLEANUP_TIMEOUT", STARTUP_CLEANUP_TIMEOUT_DEFAULT
+        ),
+        signal_stale_hours=env_int(
+            "LOOM_SIGNAL_STALE_HOURS", SIGNAL_STALE_HOURS_DEFAULT
         ),
     )
 
@@ -496,6 +501,61 @@ def cleanup_stale_progress_files(
         log_info(f"Progress file cleanup: {deleted_count} deleted in {elapsed:.1f}s")
 
 
+def cleanup_stale_signal_files(
+    repo_root: pathlib.Path,
+    stale_hours: int,
+    *,
+    dry_run: bool = False,
+) -> int:
+    """Delete signal files in ``.loom/signals/`` that are older than *stale_hours*.
+
+    Returns the number of files deleted (or that would be deleted in dry-run).
+
+    Signal files that were never consumed because the daemon was stopped or
+    crashed will accumulate indefinitely otherwise.  Files younger than
+    *stale_hours* are left intact so that fresh signals written just before a
+    restart are still processed normally.
+    """
+    signals_dir = repo_root / ".loom" / "signals"
+    if not signals_dir.is_dir():
+        return 0
+
+    threshold = stale_hours * 3600
+    now = time.time()
+    deleted = 0
+
+    for signal_file in sorted(signals_dir.glob("*.json")):
+        try:
+            age = now - signal_file.stat().st_mtime
+        except OSError:
+            continue
+
+        if age <= threshold:
+            continue
+
+        age_hours = age / 3600
+        if dry_run:
+            log_info(
+                f"[DRY-RUN] Would discard stale signal: {signal_file.name} "
+                f"({age_hours:.1f}h old)"
+            )
+        else:
+            try:
+                signal_file.unlink(missing_ok=True)
+                log_warning(
+                    f"Discarded stale signal: {signal_file.name} ({age_hours:.1f}h old)"
+                )
+            except OSError as exc:
+                log_warning(f"Failed to delete stale signal {signal_file.name}: {exc}")
+                continue
+        deleted += 1
+
+    if deleted:
+        log_info(f"Signal file cleanup: {deleted} stale file(s) discarded")
+
+    return deleted
+
+
 # ---------------------------------------------------------------------------
 # Event handlers
 # ---------------------------------------------------------------------------
@@ -670,6 +730,12 @@ def handle_daemon_startup(
         max_files=config.startup_cleanup_max_files,
         timeout_seconds=config.startup_cleanup_timeout,
     )
+
+    # 7. Discard stale unprocessed signal files from previous session
+    log_info(
+        f"Discarding stale signal files (older than {config.signal_stale_hours}h)..."
+    )
+    cleanup_stale_signal_files(repo_root, config.signal_stale_hours, dry_run=dry_run)
 
     if not dry_run:
         update_cleanup_timestamp(state_path, "daemon-startup")

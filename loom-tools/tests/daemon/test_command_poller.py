@@ -7,6 +7,7 @@ import pathlib
 import tempfile
 import threading
 import time
+from datetime import datetime, timezone, timedelta
 
 import pytest
 
@@ -38,6 +39,22 @@ class TestCommandPollerInit:
         deep = tmp_path / "a" / "b" / "c"
         poller = CommandPoller(deep)
         assert poller.signals_dir.is_dir()
+
+    def test_default_max_age_seconds(self, workspace: pathlib.Path) -> None:
+        poller = CommandPoller(workspace)
+        assert poller.max_age_seconds > 0
+
+    def test_custom_max_age_seconds(self, workspace: pathlib.Path) -> None:
+        poller = CommandPoller(workspace, max_age_seconds=7200)
+        assert poller.max_age_seconds == 7200
+
+    def test_zero_max_age_disables_filtering(self, workspace: pathlib.Path) -> None:
+        poller = CommandPoller(workspace, max_age_seconds=0)
+        assert poller.max_age_seconds == 0
+
+    def test_none_max_age_disables_filtering(self, workspace: pathlib.Path) -> None:
+        poller = CommandPoller(workspace, max_age_seconds=None)
+        assert poller.max_age_seconds == 0
 
 
 class TestPollEmpty:
@@ -268,3 +285,148 @@ class TestRequeue:
         assert len(result) == 5
         issues = sorted(r["issue"] for r in result)
         assert issues == [0, 1, 2, 3, 4]
+
+
+class TestStaleSignalHandling:
+    """Tests for stale signal detection and discarding in CommandPoller."""
+
+    def _write_signal(
+        self,
+        signals_dir: pathlib.Path,
+        name: str,
+        payload: dict,
+    ) -> pathlib.Path:
+        path = signals_dir / name
+        path.write_text(json.dumps(payload))
+        return path
+
+    def _backdate_file(self, path: pathlib.Path, age_seconds: float) -> None:
+        """Set a file's mtime to be age_seconds in the past."""
+        old_time = time.time() - age_seconds
+        import os
+        os.utime(path, (old_time, old_time))
+
+    # --- _is_expired via payload TTL ---
+
+    def test_fresh_payload_ttl_not_expired(self, workspace: pathlib.Path) -> None:
+        poller = CommandPoller(workspace)
+        now = datetime.now(timezone.utc)
+        sig_file = self._write_signal(
+            poller.signals_dir, "cmd-001.json",
+            {"action": "spawn_shepherd", "issue": 1,
+             "created_at": now.isoformat(), "ttl_seconds": 3600},
+        )
+        assert not poller._is_expired(sig_file, json.loads(sig_file.read_text()))
+
+    def test_expired_payload_ttl_is_expired(self, workspace: pathlib.Path) -> None:
+        poller = CommandPoller(workspace)
+        old_time = datetime.now(timezone.utc) - timedelta(hours=2)
+        sig_file = self._write_signal(
+            poller.signals_dir, "cmd-001.json",
+            {"action": "spawn_shepherd", "issue": 1,
+             "created_at": old_time.isoformat(), "ttl_seconds": 3600},
+        )
+        assert poller._is_expired(sig_file, json.loads(sig_file.read_text()))
+
+    def test_just_expired_payload_ttl(self, workspace: pathlib.Path) -> None:
+        poller = CommandPoller(workspace)
+        old_time = datetime.now(timezone.utc) - timedelta(seconds=3601)
+        sig_file = self._write_signal(
+            poller.signals_dir, "cmd-001.json",
+            {"action": "spawn_shepherd", "issue": 1,
+             "created_at": old_time.isoformat(), "ttl_seconds": 3600},
+        )
+        assert poller._is_expired(sig_file, json.loads(sig_file.read_text()))
+
+    def test_malformed_created_at_falls_through_to_mtime(self, workspace: pathlib.Path) -> None:
+        poller = CommandPoller(workspace, max_age_seconds=60)
+        sig_file = self._write_signal(
+            poller.signals_dir, "cmd-001.json",
+            {"action": "spawn_shepherd", "created_at": "not-a-date", "ttl_seconds": 10},
+        )
+        self._backdate_file(sig_file, 120)  # 2 minutes old, exceeds 60s limit
+        assert poller._is_expired(sig_file, json.loads(sig_file.read_text()))
+
+    # --- _is_expired via file mtime fallback ---
+
+    def test_fresh_mtime_not_expired(self, workspace: pathlib.Path) -> None:
+        poller = CommandPoller(workspace, max_age_seconds=3600)
+        sig_file = self._write_signal(
+            poller.signals_dir, "cmd-001.json", {"action": "noop"},
+        )
+        # File is brand-new; should not be considered stale
+        assert not poller._is_expired(sig_file, {"action": "noop"})
+
+    def test_old_mtime_expired(self, workspace: pathlib.Path) -> None:
+        poller = CommandPoller(workspace, max_age_seconds=60)
+        sig_file = self._write_signal(
+            poller.signals_dir, "cmd-001.json", {"action": "noop"},
+        )
+        self._backdate_file(sig_file, 120)  # 2 minutes old, exceeds 60s limit
+        assert poller._is_expired(sig_file, {"action": "noop"})
+
+    def test_disabled_mtime_check_never_expires(self, workspace: pathlib.Path) -> None:
+        poller = CommandPoller(workspace, max_age_seconds=0)
+        sig_file = self._write_signal(
+            poller.signals_dir, "cmd-001.json", {"action": "noop"},
+        )
+        self._backdate_file(sig_file, 999999)  # Very old file
+        assert not poller._is_expired(sig_file, {"action": "noop"})
+
+    # --- poll() discards stale signals ---
+
+    def test_poll_discards_stale_signal_by_mtime(self, workspace: pathlib.Path) -> None:
+        poller = CommandPoller(workspace, max_age_seconds=60)
+        sig = self._write_signal(
+            poller.signals_dir, "cmd-001.json", {"action": "spawn_shepherd", "issue": 42},
+        )
+        self._backdate_file(sig, 7200)  # 2 hours old
+        result = poller.poll()
+        assert result == []
+
+    def test_poll_deletes_stale_file(self, workspace: pathlib.Path) -> None:
+        poller = CommandPoller(workspace, max_age_seconds=60)
+        sig = self._write_signal(
+            poller.signals_dir, "cmd-001.json", {"action": "spawn_shepherd", "issue": 42},
+        )
+        self._backdate_file(sig, 7200)
+        poller.poll()
+        assert not sig.exists()
+
+    def test_poll_discards_stale_payload_ttl(self, workspace: pathlib.Path) -> None:
+        poller = CommandPoller(workspace)
+        old_time = datetime.now(timezone.utc) - timedelta(hours=2)
+        self._write_signal(
+            poller.signals_dir, "cmd-001.json",
+            {"action": "spawn_shepherd", "issue": 1,
+             "created_at": old_time.isoformat(), "ttl_seconds": 3600},
+        )
+        result = poller.poll()
+        assert result == []
+
+    def test_poll_keeps_fresh_signals_alongside_stale(self, workspace: pathlib.Path) -> None:
+        poller = CommandPoller(workspace, max_age_seconds=60)
+        stale = self._write_signal(
+            poller.signals_dir, "cmd-001.json", {"action": "spawn_shepherd", "issue": 1},
+        )
+        self._backdate_file(stale, 7200)
+        self._write_signal(
+            poller.signals_dir, "cmd-002.json", {"action": "spawn_shepherd", "issue": 2},
+        )
+        result = poller.poll()
+        assert len(result) == 1
+        assert result[0]["issue"] == 2
+
+    def test_poll_payload_ttl_takes_precedence_over_mtime(self, workspace: pathlib.Path) -> None:
+        """Payload TTL overrides mtime: fresh payload TTL wins even on old file."""
+        poller = CommandPoller(workspace, max_age_seconds=60)
+        now = datetime.now(timezone.utc)
+        sig = self._write_signal(
+            poller.signals_dir, "cmd-001.json",
+            {"action": "spawn_shepherd", "issue": 5,
+             "created_at": now.isoformat(), "ttl_seconds": 3600},
+        )
+        self._backdate_file(sig, 7200)  # File is old, but payload TTL is fresh
+        result = poller.poll()
+        assert len(result) == 1
+        assert result[0]["issue"] == 5
