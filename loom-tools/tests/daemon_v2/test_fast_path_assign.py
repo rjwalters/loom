@@ -27,9 +27,10 @@ def _make_ctx(
     tmp_path: pathlib.Path,
     *,
     max_shepherds: int = 3,
+    auto_build: bool = True,
 ) -> DaemonContext:
     """Return a DaemonContext with minimal state for unit tests."""
-    config = DaemonConfig(max_shepherds=max_shepherds)
+    config = DaemonConfig(max_shepherds=max_shepherds, auto_build=auto_build)
     ctx = DaemonContext(config=config, repo_root=tmp_path)
     ctx.state = DaemonState()
     return ctx
@@ -169,3 +170,33 @@ class TestFastPathAssignTriggers:
             with mock.patch("loom_tools.daemon_v2.loop._write_state") as mock_write:
                 _fast_path_assign(ctx)
                 mock_write.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Tests: auto_build gate
+# ---------------------------------------------------------------------------
+
+
+class TestFastPathAutoBuiltGate:
+    """_fast_path_assign must not spawn when auto_build=False."""
+
+    def test_noop_when_auto_build_false(self, tmp_path: pathlib.Path) -> None:
+        """auto_build=False prevents fast-path shepherd spawning."""
+        ctx = _make_ctx(tmp_path, auto_build=False)
+        ctx.state.shepherds["shepherd-1"] = ShepherdEntry(status="idle")
+        ctx.snapshot = _snapshot_with_ready_issues([42])
+
+        with mock.patch("loom_tools.daemon_v2.loop.spawn_shepherds") as mock_spawn:
+            _fast_path_assign(ctx)
+            mock_spawn.assert_not_called()
+
+    def test_spawns_when_auto_build_true(self, tmp_path: pathlib.Path) -> None:
+        """auto_build=True allows fast-path shepherd spawning."""
+        ctx = _make_ctx(tmp_path, auto_build=True)
+        ctx.state.shepherds["shepherd-1"] = ShepherdEntry(status="idle")
+        ctx.snapshot = _snapshot_with_ready_issues([42])
+
+        with mock.patch("loom_tools.daemon_v2.loop.spawn_shepherds", return_value=1) as mock_spawn:
+            with mock.patch("loom_tools.daemon_v2.loop._write_state"):
+                _fast_path_assign(ctx)
+                mock_spawn.assert_called_once_with(ctx)

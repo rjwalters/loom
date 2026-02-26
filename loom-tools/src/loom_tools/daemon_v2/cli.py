@@ -33,10 +33,12 @@ def show_status(repo_root) -> int:
                     session_id = data.get("daemon_session_id", "unknown")
                     iteration = data.get("iteration", 0)
                     force_mode = data.get("force_mode", False)
+                    auto_build = data.get("auto_build", False)
                     timeout_at = data.get("timeout_at")
                     print(f"  Session ID: {session_id}")
                     print(f"  Iteration: {iteration}")
                     print(f"  Force mode: {force_mode}")
+                    print(f"  Auto-build: {auto_build}")
                     if timeout_at:
                         print(f"  Timeout at: {timeout_at}")
             return 0
@@ -131,6 +133,7 @@ Environment Variables:
     LOOM_POLL_INTERVAL          Seconds between iterations (default: 120)
     LOOM_MAX_SHEPHERDS          Maximum concurrent shepherds (default: 10)
     LOOM_ISSUE_THRESHOLD        Trigger work generation when issues < this (default: 3)
+    LOOM_AUTO_BUILD             Enable shepherd auto-spawning (default: false)
     LOOM_ARCHITECT_COOLDOWN     Seconds between architect triggers (default: 1800)
     LOOM_HERMIT_COOLDOWN        Seconds between hermit triggers (default: 1800)
     LOOM_GUIDE_INTERVAL         Guide respawn interval (default: 900)
@@ -143,8 +146,9 @@ To stop the daemon gracefully:
     touch .loom/stop-daemon
 
 Examples:
-    loom-daemon                 # Start daemon in normal mode
-    loom-daemon --force         # Start in force mode (auto-promote, auto-merge)
+    loom-daemon                 # Start in support-only mode (no auto-spawn)
+    loom-daemon --auto-build    # Auto-spawn shepherds from loom:issue queue
+    loom-daemon --force         # Force mode (auto-promote, auto-merge, auto-build)
     loom-daemon -t 180          # Run for 3 hours then gracefully stop
     loom-daemon --merge -t 60   # Merge mode for 1 hour
     loom-daemon --status        # Check if daemon is running
@@ -153,9 +157,14 @@ Examples:
     )
 
     parser.add_argument(
+        "--auto-build", "-a",
+        action="store_true",
+        help="Enable automatic shepherd spawning from loom:issue queue",
+    )
+    parser.add_argument(
         "--force", "-f",
         action="store_true",
-        help="Enable force mode for aggressive autonomous development",
+        help="Enable force mode for aggressive autonomous development (implies --auto-build)",
     )
     parser.add_argument(
         "--merge", "-m",
@@ -202,10 +211,12 @@ Examples:
     if args.health:
         return show_health(repo_root)
 
-    # Create config (--merge is alias for --force)
+    # Create config (--merge is alias for --force; --force/--merge imply --auto-build)
     force_mode = args.force or args.merge
+    auto_build = getattr(args, "auto_build", False)
     config = DaemonConfig.from_env(
         force_mode=force_mode,
+        auto_build=auto_build,
         debug_mode=args.debug,
         timeout_min=args.timeout_min,
     )

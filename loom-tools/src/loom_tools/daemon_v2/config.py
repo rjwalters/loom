@@ -40,6 +40,7 @@ class DaemonConfig:
     poll_interval: int = DEFAULT_POLL_INTERVAL
     iteration_timeout: int = DEFAULT_ITERATION_TIMEOUT
     force_mode: bool = False
+    auto_build: bool = False
     debug_mode: bool = False
     timeout_min: int = 0  # 0 = no timeout
 
@@ -77,6 +78,7 @@ class DaemonConfig:
         cls,
         *,
         force_mode: bool = False,
+        auto_build: bool = False,
         debug_mode: bool = False,
         timeout_min: int = 0,
     ) -> DaemonConfig:
@@ -84,13 +86,18 @@ class DaemonConfig:
 
         Args:
             force_mode: Enable force mode (auto-promote, auto-merge)
+            auto_build: Enable automatic shepherd spawning from loom:issue queue
             debug_mode: Enable debug logging
             timeout_min: Stop daemon after N minutes (0 = no timeout)
         """
+        resolved_force = force_mode or env_bool("LOOM_FORCE_MODE", False)
+        # --merge/--force implies --auto-build; also check LOOM_AUTO_BUILD env var
+        resolved_auto_build = auto_build or resolved_force or env_bool("LOOM_AUTO_BUILD", False)
         return cls(
             poll_interval=env_int("LOOM_POLL_INTERVAL", DEFAULT_POLL_INTERVAL),
             iteration_timeout=env_int("LOOM_ITERATION_TIMEOUT", DEFAULT_ITERATION_TIMEOUT),
-            force_mode=force_mode or env_bool("LOOM_FORCE_MODE", False),
+            force_mode=resolved_force,
+            auto_build=resolved_auto_build,
             debug_mode=debug_mode or env_bool("LOOM_DEBUG_MODE", False),
             timeout_min=timeout_min or env_int("LOOM_TIMEOUT_MIN", 0),
             max_shepherds=env_int("LOOM_MAX_SHEPHERDS", DEFAULT_MAX_SHEPHERDS),
@@ -120,10 +127,11 @@ class DaemonConfig:
 
     def mode_display(self) -> str:
         """Return a display string for the current mode."""
-        if self.force_mode and self.debug_mode:
-            return "Force + Debug"
-        elif self.force_mode:
-            return "Force"
-        elif self.debug_mode:
-            return "Debug"
-        return "Normal"
+        parts = []
+        if self.force_mode:
+            parts.append("Force")
+        elif self.auto_build:
+            parts.append("Auto-build")
+        if self.debug_mode:
+            parts.append("Debug")
+        return " + ".join(parts) if parts else "Support-only"

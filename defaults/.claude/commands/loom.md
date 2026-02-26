@@ -55,7 +55,8 @@ The Loom daemon is not running.
 
 Start it from a terminal OUTSIDE Claude Code:
 
-  ./.loom/scripts/start-daemon.sh                     # Normal mode
+  ./.loom/scripts/start-daemon.sh                     # Support-only mode (default)
+  ./.loom/scripts/start-daemon.sh --auto-build        # Also auto-spawn shepherds
   ./.loom/scripts/start-daemon.sh --timeout-min 120   # Auto-stop after 2 hours
 
 Then run /loom again to begin observing and orchestrating.
@@ -330,7 +331,8 @@ Loom has three layers of roles:
 
 **Starting the daemon (run OUTSIDE Claude Code):**
 ```
-./.loom/scripts/start-daemon.sh                   Start daemon
+./.loom/scripts/start-daemon.sh                   Start daemon (support-only)
+./.loom/scripts/start-daemon.sh --auto-build      Also auto-spawn shepherds
 ./.loom/scripts/start-daemon.sh -t 180            Run for 3 hours then stop
 ./.loom/scripts/start-daemon.sh --status          Check if daemon is running
 ./.loom/scripts/stop-daemon.sh                    Stop gracefully
