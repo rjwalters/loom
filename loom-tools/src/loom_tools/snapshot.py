@@ -114,6 +114,7 @@ class SnapshotConfig:
     doctor_interval: int = 300
     auditor_interval: int = 600
     judge_interval: int = 300
+    curator_interval: int = 300
     issue_strategy: str = "fifo"
     heartbeat_stale_threshold: int = 120
     tmux_socket: str = "loom"
@@ -156,6 +157,7 @@ class SnapshotConfig:
             doctor_interval=_int("LOOM_DOCTOR_INTERVAL", 300),
             auditor_interval=_int("LOOM_AUDITOR_INTERVAL", 600),
             judge_interval=_int("LOOM_JUDGE_INTERVAL", 300),
+            curator_interval=_int("LOOM_CURATOR_INTERVAL", 300),
             issue_strategy=os.environ.get("LOOM_ISSUE_STRATEGY", "fifo"),
             heartbeat_stale_threshold=_int("LOOM_HEARTBEAT_STALE_THRESHOLD", 120),
             tmux_socket=os.environ.get("LOOM_TMUX_SOCKET", "loom"),
@@ -191,7 +193,7 @@ class SnapshotConfig:
 # Support role state
 # ---------------------------------------------------------------------------
 
-_SUPPORT_ROLES = ("guide", "champion", "doctor", "auditor", "judge", "architect", "hermit")
+_SUPPORT_ROLES = ("guide", "champion", "doctor", "auditor", "judge", "architect", "hermit", "curator")
 
 # Roles that can have demand-based triggers
 _DEMAND_ROLES = frozenset({"champion", "doctor", "judge"})
@@ -218,6 +220,7 @@ def _role_interval(role: str, cfg: SnapshotConfig) -> int:
         "judge": cfg.judge_interval,
         "architect": cfg.architect_cooldown,
         "hermit": cfg.hermit_cooldown,
+        "curator": cfg.curator_interval,
     }.get(role, 0)
 
 
@@ -267,6 +270,12 @@ def compute_support_role_state(
 # ---------------------------------------------------------------------------
 
 _ISSUE_FIELDS = ["number", "title", "labels", "createdAt"]
+
+# Labels that indicate an issue has been processed or claimed — used to identify
+# issues that still need curator attention.
+_CURATED_SKIP_LABELS = frozenset({
+    "loom:curated", "loom:curating", "loom:issue", "loom:building", "external",
+})
 _PR_FIELDS = ["number", "title", "labels", "headRefName"]
 
 
@@ -275,13 +284,13 @@ def collect_pipeline_data(
     *,
     ci_health_check_enabled: bool = True,
 ) -> dict[str, list[dict[str, Any]]]:
-    """Run 9 parallel ``gh`` queries and return raw pipeline data.
+    """Run 10 parallel ``gh`` queries and return raw pipeline data.
 
     Returns a dict with keys:
         ready_issues, building_issues, blocked_issues,
         architect_proposals, hermit_proposals, curated_issues,
         review_requested, changes_requested, ready_to_merge,
-        usage, ci_status
+        uncurated_issues, usage, ci_status
     """
     issue_field_str = ",".join(_ISSUE_FIELDS)
     pr_field_str = ",".join(_PR_FIELDS)
@@ -305,6 +314,8 @@ def collect_pipeline_data(
         ["pr", "list", "--label", "loom:changes-requested", "--state", "open", "--json", pr_field_str],
         # 8: ready-to-merge PRs
         ["pr", "list", "--label", "loom:pr", "--state", "open", "--json", pr_field_str],
+        # 9: all open issues (for uncurated count — issues needing curator attention)
+        ["issue", "list", "--state", "open", "--json", "number,labels", "--limit", "100"],
     ]
 
     results = gh_parallel_queries(queries, max_workers=8)
@@ -314,6 +325,13 @@ def collect_pipeline_data(
     curated_filtered = [
         item for item in curated_raw
         if not _has_label(item, "loom:building") and not _has_label(item, "loom:issue")
+    ]
+
+    # Compute uncurated issues: open issues without any of the skip labels
+    all_open_issues = results[9]
+    uncurated_issues = [
+        item for item in all_open_issues
+        if not any(lbl["name"] in _CURATED_SKIP_LABELS for lbl in item.get("labels", []))
     ]
 
     # Run usage check separately (it's a script, not a gh query)
@@ -334,6 +352,7 @@ def collect_pipeline_data(
         "review_requested": results[6],
         "changes_requested": results[7],
         "ready_to_merge": results[8],
+        "uncurated_issues": uncurated_issues,
         "usage": usage,
         "ci_status": ci_status,
     }
@@ -1050,6 +1069,7 @@ def compute_recommended_actions(
     orphaned_prs: list[OrphanedPR] | None = None,
     spinning_prs: list[SpinningPR] | None = None,
     curated_count: int = 0,
+    uncurated_count: int = 0,
 ) -> tuple[list[str], dict[str, Any]]:
     """Compute recommended actions and demand flags.
 
@@ -1152,6 +1172,10 @@ def compute_recommended_actions(
     judge_state = support_roles.get("judge", SupportRoleState())
     if judge_state.needs_trigger and not demand["judge_demand"]:
         actions.append("trigger_judge")
+
+    curator_state = support_roles.get("curator", SupportRoleState())
+    if curator_state.needs_trigger and uncurated_count > 0:
+        actions.append("trigger_curator")
 
     # Recover orphans
     if orphaned_count > 0:
@@ -1525,6 +1549,7 @@ def build_snapshot(
     review_requested = pipeline["review_requested"]
     changes_requested = pipeline["changes_requested"]
     ready_to_merge = pipeline["ready_to_merge"]
+    uncurated_issues = pipeline.get("uncurated_issues", [])
     usage = pipeline.get("usage", {"error": "no data"})
     ci_status = pipeline.get("ci_status", {"status": "unknown", "message": "CI health check not available"})
 
@@ -1538,6 +1563,7 @@ def build_snapshot(
     architect_count = len(architect_proposals)
     hermit_count = len(hermit_proposals)
     curated_count = len(curated_issues)
+    uncurated_count = len(uncurated_issues)
     review_count = len(review_requested)
     changes_count = len(changes_requested)
     merge_count = len(ready_to_merge)
@@ -1633,6 +1659,7 @@ def build_snapshot(
         orphaned_prs=orphaned_prs,
         spinning_prs=spinning_prs,
         curated_count=curated_count,
+        uncurated_count=uncurated_count,
     )
 
     # 16. Promotable proposals
@@ -1747,6 +1774,7 @@ def build_snapshot(
             "total_ready": ready_count,
             "total_building": building_count,
             "total_blocked": blocked_count,
+            "total_uncurated": uncurated_count,
             "total_proposals": total_proposals,
             "total_in_flight": total_in_flight,
             "active_shepherds": active_shepherds,

@@ -484,6 +484,7 @@ Archived sessions include a `session_summary` field with final statistics:
 | terminal-champion | champion.md | Auto-merge (always running) |
 | terminal-doctor | doctor.md | PR conflict resolution (always running) |
 | terminal-auditor | auditor.md | Main branch validation (always running) |
+| terminal-curator | curator.md | Issue enrichment background role (always running) |
 
 ### Custom Roles
 

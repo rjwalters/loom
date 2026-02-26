@@ -265,7 +265,7 @@ class TestSupportRoleState:
     def test_all_seven_roles_present(self) -> None:
         ds = self._make_daemon_state()
         result = compute_support_role_state(ds, _cfg(), _now=NOW)
-        assert set(result.keys()) == {"guide", "champion", "doctor", "auditor", "judge", "architect", "hermit"}
+        assert set(result.keys()) == {"guide", "champion", "doctor", "auditor", "judge", "architect", "hermit", "curator"}
 
 
 # ---------------------------------------------------------------------------
@@ -688,6 +688,27 @@ class TestRecommendedActions:
         kw["hermit_count"] = 0
         actions, _ = compute_recommended_actions(**kw)
         assert "trigger_hermit" in actions
+
+    def test_trigger_curator(self) -> None:
+        kw = self._base_kwargs()
+        kw["support_roles"]["curator"] = SupportRoleState(needs_trigger=True)
+        kw["uncurated_count"] = 3
+        actions, _ = compute_recommended_actions(**kw)
+        assert "trigger_curator" in actions
+
+    def test_no_trigger_curator_when_running(self) -> None:
+        kw = self._base_kwargs()
+        kw["support_roles"]["curator"] = SupportRoleState(status="running", needs_trigger=False)
+        kw["uncurated_count"] = 3
+        actions, _ = compute_recommended_actions(**kw)
+        assert "trigger_curator" not in actions
+
+    def test_no_trigger_curator_without_uncurated_issues(self) -> None:
+        kw = self._base_kwargs()
+        kw["support_roles"]["curator"] = SupportRoleState(needs_trigger=True)
+        kw["uncurated_count"] = 0
+        actions, _ = compute_recommended_actions(**kw)
+        assert "trigger_curator" not in actions
 
     def test_check_stuck(self) -> None:
         kw = self._base_kwargs()
@@ -1441,6 +1462,7 @@ class TestBuildSnapshot:
             "review_requested": [{"number": 20, "title": "PR 20", "labels": [], "headRefName": "feature/20"}],
             "changes_requested": [],
             "ready_to_merge": [{"number": 30, "title": "PR 30", "labels": [], "headRefName": "feature/30"}],
+            "uncurated_issues": [],
             "usage": {"session_percent": 50, "total_cost": 10.0},
         }
 
@@ -1516,7 +1538,7 @@ class TestBuildSnapshot:
             _tmux_pool=TmuxPool(),
         )
         sr = snapshot["support_roles"]
-        assert set(sr.keys()) == {"guide", "champion", "doctor", "auditor", "judge", "architect", "hermit"}
+        assert set(sr.keys()) == {"guide", "champion", "doctor", "auditor", "judge", "architect", "hermit", "curator"}
         # Demand roles have demand_trigger field
         assert "demand_trigger" in sr["champion"]
         assert "demand_trigger" in sr["doctor"]
@@ -1717,6 +1739,7 @@ class TestBuildSnapshotPreflight:
             "review_requested": [],
             "changes_requested": [],
             "ready_to_merge": [],
+            "uncurated_issues": [],
             "usage": {"session_percent": 50},
         }
 
@@ -1895,7 +1918,7 @@ class TestRecommendedActionsSpinning:
             "needs_work_generation": False,
             "architect_cooldown_ok": False,
             "hermit_cooldown_ok": False,
-            "support_roles": {r: SupportRoleState() for r in ("guide", "champion", "doctor", "auditor", "judge", "architect", "hermit")},
+            "support_roles": {r: SupportRoleState() for r in ("guide", "champion", "doctor", "auditor", "judge", "architect", "hermit", "curator")},
             "orphaned_count": 0,
             "invalid_task_id_count": 0,
         }
@@ -1952,7 +1975,7 @@ class TestNeedsHumanInputActions:
             "architect_cooldown_ok": False,
             "hermit_cooldown_ok": False,
             "support_roles": {r: SupportRoleState() for r in
-                              ("guide", "champion", "doctor", "auditor", "judge", "architect", "hermit")},
+                              ("guide", "champion", "doctor", "auditor", "judge", "architect", "hermit", "curator")},
             "orphaned_count": 0,
             "invalid_task_id_count": 0,
             "curated_count": 0,
@@ -2125,6 +2148,7 @@ class TestBuildSnapshotNeedsHumanInput:
             "review_requested": [],
             "changes_requested": [],
             "ready_to_merge": [],
+            "uncurated_issues": [],
             "usage": {"session_percent": 50},
         }
 

@@ -21,6 +21,7 @@ DEFAULT_CHAMPION_INTERVAL = 600  # seconds
 DEFAULT_DOCTOR_INTERVAL = 300  # seconds
 DEFAULT_AUDITOR_INTERVAL = 600  # seconds
 DEFAULT_JUDGE_INTERVAL = 300  # seconds
+DEFAULT_CURATOR_INTERVAL = 300  # seconds
 DEFAULT_STARTUP_GRACE_PERIOD = 120  # seconds before early warning
 DEFAULT_NO_PROGRESS_GRACE_PERIOD = 300  # seconds before hard reclaim
 DEFAULT_STALL_DIAGNOSTIC_THRESHOLD = 3  # consecutive stalled iterations
@@ -60,6 +61,7 @@ class DaemonConfig:
     doctor_interval: int = DEFAULT_DOCTOR_INTERVAL
     auditor_interval: int = DEFAULT_AUDITOR_INTERVAL
     judge_interval: int = DEFAULT_JUDGE_INTERVAL
+    curator_interval: int = DEFAULT_CURATOR_INTERVAL
 
     # Shepherd startup detection thresholds
     startup_grace_period: int = DEFAULT_STARTUP_GRACE_PERIOD
@@ -104,6 +106,7 @@ class DaemonConfig:
             doctor_interval=env_int("LOOM_DOCTOR_INTERVAL", DEFAULT_DOCTOR_INTERVAL),
             auditor_interval=env_int("LOOM_AUDITOR_INTERVAL", DEFAULT_AUDITOR_INTERVAL),
             judge_interval=env_int("LOOM_JUDGE_INTERVAL", DEFAULT_JUDGE_INTERVAL),
+            curator_interval=env_int("LOOM_CURATOR_INTERVAL", DEFAULT_CURATOR_INTERVAL),
             stall_diagnostic_threshold=env_int(
                 "LOOM_STALL_DIAGNOSTIC_THRESHOLD", DEFAULT_STALL_DIAGNOSTIC_THRESHOLD
             ),
