@@ -14,10 +14,14 @@ from loom_tools.agent_spawn import (
 )
 from loom_tools.claim import claim_issue, release_claim
 from loom_tools.common.github import gh_run
-from loom_tools.common.issue_failures import record_failure
+from loom_tools.common.issue_failures import (
+    INFRASTRUCTURE_ERROR_CLASSES,
+    get_failure_entry,
+    record_failure,
+)
 from loom_tools.common.logging import log_error, log_info, log_success, log_warning
 from loom_tools.common.time_utils import now_utc, parse_iso_timestamp
-from loom_tools.models.daemon_state import ShepherdEntry
+from loom_tools.models.daemon_state import ShepherdEntry, Warning
 
 if TYPE_CHECKING:
     from loom_tools.daemon_v2.context import DaemonContext
@@ -397,9 +401,25 @@ def force_reclaim_stale_shepherds(ctx: DaemonContext) -> int:
             continue
 
         issue = entry.issue
+        phase = entry.last_phase or "unknown"  # Capture before reset
 
         # Determine error class for this stale shepherd
         error_class = "budget_exhausted" if is_budget_exhausted else "shepherd_failure"
+
+        # Try to get more specific error class from persistent failure log.
+        # Shepherd processes may have recorded infrastructure errors (e.g.
+        # mcp_infrastructure_failure) before stalling; surface that class in
+        # the warning instead of the generic "shepherd_failure" bucket.
+        actual_error_class = error_class
+        if issue is not None:
+            try:
+                existing_failure = get_failure_entry(ctx.repo_root, issue)
+                if existing_failure is not None and existing_failure.error_class not in (
+                    "unknown", "", "budget_exhausted", "shepherd_failure"
+                ):
+                    actual_error_class = existing_failure.error_class
+            except Exception:
+                pass
 
         # Preserve WIP before killing (especially important for budget exhaustion)
         if issue is not None and is_budget_exhausted:
@@ -413,7 +433,6 @@ def force_reclaim_stale_shepherds(ctx: DaemonContext) -> int:
 
         # Record failure in persistent log
         if issue is not None:
-            phase = entry.last_phase or "unknown"
             record_failure(
                 ctx.repo_root,
                 issue,
@@ -435,6 +454,36 @@ def force_reclaim_stale_shepherds(ctx: DaemonContext) -> int:
         entry.startup_warning_at = None
 
         log_info(f"STALL-L2: Reset {name} to idle")
+
+        # Add a structured warning so the user knows what happened and how to recover.
+        # Generated for all stall_recovery events; type reflects the error class.
+        if issue is not None and ctx.state is not None:
+            warning_type = (
+                "shepherd_infrastructure_failure"
+                if actual_error_class in INFRASTRUCTURE_ERROR_CLASSES
+                else "shepherd_stall_recovery"
+            )
+            ctx.state.warnings.append(Warning(
+                time=timestamp,
+                type=warning_type,
+                severity="warning",
+                message=(
+                    f"Shepherd for issue #{issue} exhausted retries due to {actual_error_class}. "
+                    f"Fix the underlying issue, then re-run: /shepherd {issue} -m"
+                ),
+                context={
+                    "issue": issue,
+                    "shepherd": name,
+                    "error_class": actual_error_class,
+                    "phase": phase,
+                    "requires_role": "shepherd",
+                },
+                acknowledged=False,
+            ))
+            log_info(
+                f"STALL-L2: Added stall recovery warning for issue #{issue} "
+                f"(class={actual_error_class})"
+            )
 
         # Release file-based claim lock
         if issue is not None:
