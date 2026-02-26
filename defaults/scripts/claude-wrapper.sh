@@ -376,6 +376,73 @@ for name, srv in servers.items():
     return $?
 }
 
+# Check global MCP configurations from ~/.claude.json for missing binaries.
+# This is a warning-only pre-flight check — missing global MCPs cause agent
+# sessions to fail with "1 MCP server failed" before any useful work is done.
+# We log clear warnings but never abort: global MCPs are outside Loom's
+# control and the binary may simply need to be rebuilt.
+check_global_mcp_configs() {
+    local global_config="${HOME}/.claude.json"
+    if [[ ! -f "${global_config}" ]]; then
+        return 0  # No global config — nothing to validate
+    fi
+
+    # Parse mcpServers from ~/.claude.json.
+    # Output one line per server: "name|command|args0"
+    # Falls through silently on malformed JSON or missing python3.
+    local server_info
+    server_info=$(python3 - "${global_config}" 2>/dev/null <<'PYEOF'
+import json, sys
+try:
+    with open(sys.argv[1]) as f:
+        cfg = json.load(f)
+    for name, srv in cfg.get('mcpServers', {}).items():
+        command = srv.get('command', '')
+        args = srv.get('args', [])
+        args0 = args[0] if args else ''
+        print(f"{name}|{command}|{args0}")
+except Exception:
+    pass
+PYEOF
+)
+
+    if [[ -z "${server_info}" ]]; then
+        return 0
+    fi
+
+    local warned=false
+    while IFS='|' read -r server_name cmd args0; do
+        [[ -z "${server_name}" ]] && continue
+
+        # Check command: absolute path must exist on disk; otherwise must be in PATH.
+        if [[ -n "${cmd}" ]]; then
+            if [[ "${cmd}" == /* ]]; then
+                if [[ ! -f "${cmd}" ]]; then
+                    log_warn "⚠ Global MCP '${server_name}': command not found at ${cmd} — agent sessions will fail"
+                    warned=true
+                fi
+            elif ! command -v "${cmd}" &>/dev/null; then
+                log_warn "⚠ Global MCP '${server_name}': command '${cmd}' not found in PATH — agent sessions will fail"
+                warned=true
+            fi
+        fi
+
+        # Check args[0] if it looks like an absolute file path.
+        if [[ -n "${args0}" && "${args0}" == /* ]]; then
+            if [[ ! -f "${args0}" ]]; then
+                log_warn "⚠ Global MCP '${server_name}': binary not found at ${args0} — agent sessions will fail"
+                warned=true
+            fi
+        fi
+    done <<< "${server_info}"
+
+    if [[ "${warned}" == "true" ]]; then
+        log_warn "Fix missing MCP binaries or remove entries from ~/.claude.json to prevent agent session failures"
+    fi
+
+    return 0  # Always succeed — this is a warning-only check
+}
+
 # Attempt to rebuild the MCP server and re-verify
 _try_mcp_rebuild() {
     local mcp_entry="$1"
@@ -1430,6 +1497,10 @@ run_preflight_checks() {
         return 1
     fi
     log_info "MCP server pre-flight check passed"
+
+    # Warn about missing global MCP binaries from ~/.claude.json (issue #3033).
+    # This is non-fatal: warnings are logged but pre-flight always succeeds.
+    check_global_mcp_configs
 
     log_info "All pre-flight checks passed"
     return 0
