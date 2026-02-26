@@ -14,8 +14,6 @@
 #   ./.loom/scripts/start-daemon.sh [OPTIONS]
 #
 # Options:
-#   --force, -f         Enable force mode (auto-promote proposals, auto-merge)
-#   --merge, -m         Alias for --force
 #   --timeout-min N     Stop daemon after N minutes (0 = no timeout)
 #   --debug, -d         Enable debug logging
 #   --status            Print daemon status and exit
@@ -48,6 +46,11 @@ while [[ $# -gt 0 ]]; do
     case "$1" in
         --status)        STATUS_ONLY=true;;
         --stop)          STOP_ONLY=true;;
+        --force|-f|--merge|-m)
+            echo "ERROR: --merge/--force is not a daemon startup flag." >&2
+            echo "Start the daemon normally, then use /loom --merge in Claude Code." >&2
+            exit 1
+            ;;
         --help|-h)
             sed -n '/^# Usage:/,/^[^#]/p' "$0" | sed '$d' | sed 's/^# \?//'
             exit 0

@@ -50,9 +50,9 @@ The Loom daemon is not running.
 Start it from a terminal OUTSIDE Claude Code:
 
   ./.loom/scripts/start-daemon.sh                     # Normal mode
-  ./.loom/scripts/start-daemon.sh --merge             # Force/merge mode
 
 Then run /shepherd <issue> again.
+To use merge mode, pass --merge when running /shepherd (e.g. /shepherd 123 --merge).
 
 Why run outside Claude Code?
   Shepherd and worker sessions start as daemon children (not Claude Code

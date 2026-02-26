@@ -56,7 +56,6 @@ The Loom daemon is not running.
 Start it from a terminal OUTSIDE Claude Code:
 
   ./.loom/scripts/start-daemon.sh                     # Normal mode
-  ./.loom/scripts/start-daemon.sh --merge             # Force/merge mode (auto-promote, auto-merge)
   ./.loom/scripts/start-daemon.sh --timeout-min 120   # Auto-stop after 2 hours
 
 Then run /loom again to begin observing and orchestrating.
@@ -254,7 +253,7 @@ Loom orchestrates AI-powered development using GitHub issues, labels, and git wo
 
 ```bash
 # Step 1: Start the daemon from a terminal OUTSIDE Claude Code
-./.loom/scripts/start-daemon.sh --merge
+./.loom/scripts/start-daemon.sh
 
 # Step 2: In Claude Code, observe and orchestrate
 /loom --merge
@@ -331,8 +330,7 @@ Loom has three layers of roles:
 
 **Starting the daemon (run OUTSIDE Claude Code):**
 ```
-./.loom/scripts/start-daemon.sh                   Start in normal mode
-./.loom/scripts/start-daemon.sh --merge           Start in force/merge mode
+./.loom/scripts/start-daemon.sh                   Start daemon
 ./.loom/scripts/start-daemon.sh -t 180            Run for 3 hours then stop
 ./.loom/scripts/start-daemon.sh --status          Check if daemon is running
 ./.loom/scripts/stop-daemon.sh                    Stop gracefully
@@ -423,9 +421,8 @@ This avoids nested Claude Code spawning restrictions.
 
 **Starting the daemon (from a shell outside Claude Code):**
 ```bash
-./.loom/scripts/start-daemon.sh                   # Normal mode
-./.loom/scripts/start-daemon.sh --merge           # Auto-promote + auto-merge
-./.loom/scripts/start-daemon.sh -t 120 --merge    # Merge mode, stop after 2 hours
+./.loom/scripts/start-daemon.sh                   # Start daemon
+./.loom/scripts/start-daemon.sh -t 120            # Start daemon, stop after 2 hours
 ```
 
 **Observing from Claude Code (`/loom`):**
