@@ -1,6 +1,6 @@
 {
   "name": "loom",
-  "version": "0.2.3",
+  "version": "0.3.0",
   "description": "A multi-terminal desktop application for macOS that orchestrates AI-powered development workers using git worktrees and GitHub as the coordination layer.",
   "type": "module",
   "scripts": {
