@@ -27,6 +27,7 @@ from loom_tools.snapshot import (
     SupportRoleState,
     SystematicFailureState,
     TmuxPool,
+    _CURATED_SKIP_LABELS,
     build_snapshot,
     compute_health,
     compute_pipeline_health,
@@ -2170,3 +2171,39 @@ class TestBuildSnapshotNeedsHumanInput:
         assert len(blockers) >= 1
         types = {b["type"] for b in blockers}
         assert "approval_needed" in types or "proposal_review" in types
+
+
+# ---------------------------------------------------------------------------
+# _CURATED_SKIP_LABELS
+# ---------------------------------------------------------------------------
+
+
+class TestCuratedSkipLabels:
+    """Verify the _CURATED_SKIP_LABELS frozenset used for uncurated filtering."""
+
+    def test_blocked_label_is_in_skip_set(self) -> None:
+        assert "loom:blocked" in _CURATED_SKIP_LABELS
+
+    def test_all_expected_labels_present(self) -> None:
+        expected = {
+            "loom:curated",
+            "loom:curating",
+            "loom:issue",
+            "loom:building",
+            "loom:blocked",
+            "external",
+        }
+        assert _CURATED_SKIP_LABELS == expected
+
+    def test_blocked_issue_excluded_from_uncurated(self) -> None:
+        """An issue with only loom:blocked should not appear in uncurated list."""
+        issues = [
+            {"number": 1, "labels": [{"name": "loom:blocked"}]},
+            {"number": 2, "labels": []},  # truly uncurated
+            {"number": 3, "labels": [{"name": "loom:building"}]},
+        ]
+        uncurated = [
+            item for item in issues
+            if not any(lbl["name"] in _CURATED_SKIP_LABELS for lbl in item.get("labels", []))
+        ]
+        assert [i["number"] for i in uncurated] == [2]
