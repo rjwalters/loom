@@ -1,0 +1,17 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 800 400" width="800" height="400">
+<rect width="800" height="400" fill="white"/>
+<defs><linearGradient id="areaGrad" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#4A90D9" stop-opacity="0.3"/><stop offset="100%" stop-color="#4A90D9" stop-opacity="0.05"/></linearGradient></defs>
+<line x1="80" y1="323.2" x2="760" y2="323.2" stroke="#E5E5E5" stroke-width="1"/>
+<text x="72" y="327.2" text-anchor="end" font-family="system-ui, sans-serif" font-size="12" fill="#666">205k</text>
+<line x1="80" y1="250.7" x2="760" y2="250.7" stroke="#E5E5E5" stroke-width="1"/>
+<text x="72" y="254.7" text-anchor="end" font-family="system-ui, sans-serif" font-size="12" fill="#666">206k</text>
+<line x1="80" y1="178.2" x2="760" y2="178.2" stroke="#E5E5E5" stroke-width="1"/>
+<text x="72" y="182.2" text-anchor="end" font-family="system-ui, sans-serif" font-size="12" fill="#666">207k</text>
+<line x1="80" y1="105.7" x2="760" y2="105.7" stroke="#E5E5E5" stroke-width="1"/>
+<text x="72" y="109.7" text-anchor="end" font-family="system-ui, sans-serif" font-size="12" fill="#666">208k</text>
+<text x="80.0" y="360" text-anchor="middle" font-family="system-ui, sans-serif" font-size="12" fill="#666">Feb 2026</text>
+<path d="M80.0,190.0" fill="none" stroke="#4A90D9" stroke-width="2.5" stroke-linejoin="round" stroke-linecap="round"/>
+<circle cx="80.0" cy="190.0" r="3.5" fill="white" stroke="#4A90D9" stroke-width="2"/>
+<text x="80" y="24" font-family="system-ui, sans-serif" font-size="16" font-weight="600" fill="#333">Lines of Code</text>
+<line x1="80" y1="40" x2="80" y2="340" stroke="#CCC" stroke-width="1"/><line x1="80" y1="340" x2="760" y2="340" stroke="#CCC" stroke-width="1"/>
+</svg>
