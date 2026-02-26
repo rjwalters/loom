@@ -14,7 +14,7 @@ from typing import Any
 from loom_tools.common.github import gh_issue_view
 from loom_tools.common.issue_failures import load_failure_log, merge_into_daemon_state
 from loom_tools.common.logging import log_error, log_info, log_success, log_warning
-from loom_tools.common.state import read_json_file, write_json_file
+from loom_tools.common.state import read_daemon_state, read_json_file, write_json_file
 from loom_tools.common.time_utils import now_utc
 from loom_tools.daemon_v2.command_poller import CommandPoller
 from loom_tools.daemon_v2.config import DaemonConfig
@@ -320,21 +320,29 @@ def _spawn_shepherd_from_signal(
     # shepherd script is missing (it will be present when the slot eventually
     # opens in a healthy deployment, and the error will surface then).
     if ctx.state is None:
-        # Daemon state not yet loaded (e.g. first iteration hasn't run).
-        # Re-queue the signal so it is retried on the next sleep-tick poll
-        # rather than being silently dropped.
-        cmd = {"action": "spawn_shepherd", "issue": issue, "mode": mode, "flags": flags}
-        if command_poller is not None and command_poller.requeue(cmd):
-            log_warning(
-                f"Signal spawn: no daemon state loaded, re-queued spawn_shepherd "
-                f"for issue #{issue}"
+        # Daemon state not yet loaded (standby mode — orchestration not yet
+        # activated via /loom).  Load it eagerly from disk so the shepherd can
+        # be spawned immediately instead of looping forever.
+        try:
+            ctx.state = read_daemon_state(ctx.repo_root)
+            log_info(
+                f"Signal spawn: loaded daemon state on-demand for issue #{issue}"
             )
-        else:
+        except Exception as exc:
             log_warning(
-                f"Signal spawn: no daemon state loaded and re-queue failed, "
-                f"spawn_shepherd for issue #{issue} dropped"
+                f"Signal spawn: failed to load daemon state ({exc}), re-queuing"
             )
-        return
+            cmd = {"action": "spawn_shepherd", "issue": issue, "mode": mode, "flags": flags}
+            if command_poller is not None and command_poller.requeue(cmd):
+                log_warning(
+                    f"Signal spawn: re-queued spawn_shepherd for issue #{issue}"
+                )
+            else:
+                log_warning(
+                    f"Signal spawn: re-queue failed, spawn_shepherd for issue "
+                    f"#{issue} dropped"
+                )
+            return
 
     # Reject signal early if the target issue is closed — retrying won't help.
     issue_data = gh_issue_view(issue, ["state"], cwd=ctx.repo_root)
