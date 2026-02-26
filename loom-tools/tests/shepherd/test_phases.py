@@ -11663,7 +11663,7 @@ class TestBuilderDirectCompletion:
             # branch-name check: no PR found; keyword "Closes" search: PR found
             mock_run.side_effect = [
                 MagicMock(returncode=0, stdout="", stderr=""),   # --head check: empty
-                MagicMock(returncode=0, stdout="888\n", stderr=""),  # Closes keyword: PR 888
+                MagicMock(returncode=0, stdout='{"number": 888, "labels": []}\n', stderr=""),  # Closes keyword: PR 888
             ]
             result = builder._direct_completion(mock_context, diag)
 
@@ -11708,7 +11708,7 @@ class TestBuilderDirectCompletion:
             mock_run.side_effect = [
                 MagicMock(returncode=0, stdout="", stderr=""),   # --head check: empty
                 MagicMock(returncode=0, stdout="", stderr=""),   # Closes keyword: empty
-                MagicMock(returncode=0, stdout="777\n", stderr=""),  # Fixes keyword: PR 777
+                MagicMock(returncode=0, stdout='{"number": 777, "labels": []}\n', stderr=""),  # Fixes keyword: PR 777
             ]
             result = builder._direct_completion(mock_context, diag)
 

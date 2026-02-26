@@ -84,6 +84,56 @@ def _is_pr_open(pr: int, repo_root: Path | None = None) -> bool:
         return True  # Fail open
 
 
+def _find_open_pr_by_keyword_search(
+    issue: int,
+    repo_root: Path,
+) -> tuple[int, list[str], str] | None:
+    """Search for an open PR by body keywords (Closes/Fixes/Resolves #N).
+
+    Iterates over the three standard closing keywords and returns the first
+    matching open PR.  Used as a fallback when branch-name lookup returns no
+    results (e.g. after a branch deletion/recreation causes a GitHub index race,
+    see issue #2972).
+
+    Args:
+        issue: Issue number to search for.
+        repo_root: Repository root for the gh command.
+
+    Returns:
+        ``(pr_number, labels, keyword)`` for the first matching PR, where
+        *labels* is a list of label name strings and *keyword* is the matching
+        closing keyword (``"Closes"``, ``"Fixes"``, or ``"Resolves"``).
+        Returns ``None`` if no open PR is found.
+    """
+    for keyword in ("Closes", "Fixes", "Resolves"):
+        result = subprocess.run(
+            [
+                "gh", "pr", "list",
+                "--search", f"{keyword} #{issue}",
+                "--state", "open",
+                "--json", "number,labels",
+                "--jq", ".[0] // empty",
+            ],
+            cwd=repo_root,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            try:
+                pr_data = json.loads(result.stdout.strip())
+                pr_num = pr_data.get("number")
+                if pr_num is not None:
+                    labels = [
+                        lbl.get("name", "")
+                        for lbl in pr_data.get("labels", [])
+                    ]
+                    return (pr_num, labels, keyword)
+            except (json.JSONDecodeError, TypeError):
+                pass
+    return None
+
+
 # Pre-implementation reproducibility check settings
 _REPRODUCIBILITY_RUNS = 3  # Number of times to run each test for flakiness
 _REPRODUCIBILITY_TIMEOUT = 120  # seconds per run
@@ -3888,46 +3938,15 @@ class BuilderPhase:
         # Mirrors the multi-method lookup in validate_builder._find_pr_for_issue.
         # See issue #2972.
         if diag["pr_number"] is None:
-            for keyword in ("Closes", "Fixes", "Resolves"):
-                kw_res = subprocess.run(
-                    [
-                        "gh",
-                        "pr",
-                        "list",
-                        "--search",
-                        f"{keyword} #{ctx.config.issue}",
-                        "--state",
-                        "open",
-                        "--json",
-                        "number,labels",
-                        "--jq",
-                        ".[0] // empty",
-                    ],
-                    cwd=ctx.repo_root,
-                    capture_output=True,
-                    text=True,
-                    check=False,
+            found = _find_open_pr_by_keyword_search(ctx.config.issue, ctx.repo_root)
+            if found is not None:
+                pr_num, pr_labels, keyword = found
+                diag["pr_number"] = pr_num
+                diag["pr_has_review_label"] = "loom:review-requested" in pr_labels
+                log_info(
+                    f"PR #{pr_num} found via '{keyword} #{ctx.config.issue}' "
+                    f"keyword search (branch-name search returned empty)"
                 )
-                if kw_res.returncode == 0 and kw_res.stdout.strip():
-                    try:
-                        pr_data = json.loads(kw_res.stdout.strip())
-                        pr_num = pr_data.get("number")
-                        if pr_num is not None:
-                            diag["pr_number"] = pr_num
-                            pr_labels = [
-                                lbl.get("name", "")
-                                for lbl in pr_data.get("labels", [])
-                            ]
-                            diag["pr_has_review_label"] = (
-                                "loom:review-requested" in pr_labels
-                            )
-                            log_info(
-                                f"PR #{pr_num} found via '{keyword} #{ctx.config.issue}' "
-                                f"keyword search (branch-name search returned empty)"
-                            )
-                            break
-                    except (json.JSONDecodeError, TypeError):
-                        pass
 
         # -- Issue labels ----------------------------------------------------
         label_res = subprocess.run(
@@ -4553,29 +4572,15 @@ class BuilderPhase:
                 # causing GitHub to close then re-associate the PR under a different
                 # index key).  Mirrors the multi-method lookup used by validate_builder.
                 # See issue #2972.
-                for keyword in ("Closes", "Fixes", "Resolves"):
-                    kw_check = subprocess.run(
-                        [
-                            "gh", "pr", "list",
-                            "--search", f"{keyword} #{ctx.config.issue}",
-                            "--state", "open",
-                            "--json", "number",
-                            "--jq", ".[0].number // empty",
-                        ],
-                        cwd=ctx.repo_root,
-                        capture_output=True,
-                        text=True,
-                        check=False,
+                kw_found = _find_open_pr_by_keyword_search(ctx.config.issue, ctx.repo_root)
+                if kw_found is not None:
+                    kw_pr_num, _, kw_keyword = kw_found
+                    log_info(
+                        f"Direct completion: PR #{kw_pr_num} already exists "
+                        f"(found via '{kw_keyword} #{ctx.config.issue}' keyword), "
+                        f"skipping creation"
                     )
-                    kw_existing = kw_check.stdout.strip()
-                    if kw_existing:
-                        log_info(
-                            f"Direct completion: PR #{kw_existing} already exists "
-                            f"(found via '{keyword} #{ctx.config.issue}' keyword), "
-                            f"skipping creation"
-                        )
-                        existing_pr = kw_existing
-                        break
+                    existing_pr = str(kw_pr_num)
                 if existing_pr:
                     continue
                 pr_body = self._build_direct_completion_pr_body(ctx)
