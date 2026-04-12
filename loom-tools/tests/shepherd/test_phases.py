@@ -8863,16 +8863,17 @@ class TestMergePhase:
         assert result.status == PhaseStatus.SUCCESS
         assert result.data.get("merged") is True
         mock_context.run_script.assert_called_once_with(
-            "merge-pr.sh", ["100"], check=True
+            "merge-pr.sh", ["100", "--no-cleanup-worktree"], check=True
         )
 
-    def test_merge_does_not_pass_cleanup_worktree(
+    def test_merge_passes_no_cleanup_worktree(
         self, mock_context: MagicMock
     ) -> None:
-        """Merge phase must NOT pass --cleanup-worktree to merge-pr.sh.
+        """Merge phase MUST pass --no-cleanup-worktree to merge-pr.sh.
 
-        Worktree cleanup during merge is unsafe because other terminals may
-        have their CWD inside the worktree. Deferred cleanup via loom-clean
+        Worktree cleanup during merge is now the default in merge-pr.sh,
+        but is unsafe for the shepherd because other terminals may have
+        their CWD inside the worktree. Deferred cleanup via loom-clean
         handles this safely through worktree_safety.py checks.
         See: https://github.com/rjwalters/loom/issues/2243
         """
@@ -8886,7 +8887,7 @@ class TestMergePhase:
 
         args = mock_context.run_script.call_args
         script_args = args[0][1]  # Second positional arg is the args list
-        assert "--cleanup-worktree" not in script_args
+        assert "--no-cleanup-worktree" in script_args
 
     def test_returns_failure_when_no_pr(self, mock_context: MagicMock) -> None:
         """Should return failure when no PR number."""

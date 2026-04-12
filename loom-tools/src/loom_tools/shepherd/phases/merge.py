@@ -38,7 +38,7 @@ class MergePhase:
             try:
                 ctx.run_script(
                     "merge-pr.sh",
-                    [str(ctx.pr_number)],
+                    [str(ctx.pr_number), "--no-cleanup-worktree"],
                     check=True,
                 )
                 return PhaseResult(
