@@ -822,9 +822,11 @@ The daemon state file provides comprehensive information for debugging, crash re
 
 ### Model Selection Strategy
 
-Loom uses different AI models optimized for each role's task complexity. Model preferences are defined in each role's JSON metadata file via the `suggestedModel` field.
+Loom subagents inherit the model of the parent conversation. Agent definitions do not specify a `model:` field in their frontmatter, so the model used depends on how the parent session was launched. This avoids per-model quota bucket exhaustion where a hardcoded model assignment causes rate limit failures even when other model quotas are available.
 
-**Model assignments by role**:
+Model preferences for the Tauri App (terminal configuration) are defined in each role's JSON metadata file via the `suggestedModel` field. These are used by the Loom desktop application when launching terminals, not by Claude Code subagent routing.
+
+**Suggested models by role** (for Tauri App terminal configuration):
 
 | Role | Model | Rationale |
 |------|-------|-----------|
