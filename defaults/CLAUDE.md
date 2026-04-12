@@ -228,6 +228,17 @@ When running with `--merge`, the daemon enables aggressive autonomous developmen
 
 **Merge mode does NOT skip code review.** The Judge phase always runs, even in merge mode. This is because GitHub's API prevents self-approval of PRs (`gh pr review --approve` fails when the same user created the PR). Loom's label-based review system (`loom:review-requested` -> `loom:pr`) works around this restriction and functions identically in both normal and merge modes. Merge mode's value is auto-promotion and auto-merge, not review bypass.
 
+**Batch Orchestration Pattern**:
+
+In normal mode, the issue lifecycle requires a human gate: Curator adds `loom:curated`, then a human promotes to `loom:issue` before a Builder can claim it. This ensures human oversight of what gets built.
+
+In batch/high-throughput sessions (e.g., processing a large backlog), this human gate becomes a bottleneck. The `--merge` flag solves this by having the Champion role automatically promote `loom:curated` issues to `loom:issue`, replacing the human approval step with Champion's automated quality evaluation (8 criteria including scope, clarity, and feasibility). There is no need for a separate `loom:approved` label -- `--merge` mode makes the existing `loom:curated` -> `loom:issue` transition automatic.
+
+```
+Normal mode:   Curator → loom:curated → [human promotes] → loom:issue → Builder
+Merge mode:    Curator → loom:curated → [Champion auto-promotes] → loom:issue → Builder
+```
+
 **Example daemon workflow**:
 ```
 Daemon Loop:

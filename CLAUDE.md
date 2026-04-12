@@ -88,6 +88,8 @@ Launch the Loom desktop application for automated orchestration:
 
 **Merge Mode** enables: auto-promotion of proposals, auto-merge after Judge approval, audit trail with `[force-mode]` markers, safety guardrails still apply. Merge mode does **not** skip the Judge phase (code review always runs due to GitHub's self-review API restriction). Merge mode implies `--auto-build`.
 
+**Batch Orchestration Pattern**: In normal mode, the `loom:curated` -> `loom:issue` transition requires a human to promote the issue (the human approval gate). In batch/high-throughput sessions, use `--merge` mode to have Champion auto-promote `loom:curated` issues to `loom:issue`, replacing the manual gate with Champion's automated quality evaluation. No separate `loom:approved` label is needed -- `--merge` makes the existing lifecycle fully automatic.
+
 **Graceful shutdown**: `./.loom/scripts/daemon.sh stop` (or `touch .loom/stop-daemon`)
 
 ## Agent Roles
