@@ -232,7 +232,7 @@ When running with `--merge`, the daemon enables aggressive autonomous developmen
 
 In normal mode, the issue lifecycle requires a human gate: Curator adds `loom:curated`, then a human promotes to `loom:issue` before a Builder can claim it. This ensures human oversight of what gets built.
 
-In batch/high-throughput sessions (e.g., processing a large backlog), this human gate becomes a bottleneck. The `--merge` flag solves this by having the Champion role automatically promote `loom:curated` issues to `loom:issue`, replacing the human approval step with Champion's automated quality evaluation (8 criteria including scope, clarity, and feasibility). There is no need for a separate `loom:approved` label -- `--merge` mode makes the existing `loom:curated` -> `loom:issue` transition automatic.
+In batch/high-throughput sessions (e.g., processing a large backlog), this human gate becomes a bottleneck. The `--merge` flag solves this by having the Champion role automatically promote `loom:curated` issues to `loom:issue`, replacing the human approval step with Champion's simplified force-mode quality check (problem statement, at least one acceptance criterion, no `loom:blocked`). There is no need for a separate `loom:approved` label -- `--merge` mode makes the existing `loom:curated` -> `loom:issue` transition automatic.
 
 ```
 Normal mode:   Curator → loom:curated → [human promotes] → loom:issue → Builder

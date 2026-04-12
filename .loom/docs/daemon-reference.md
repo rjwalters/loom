@@ -122,7 +122,7 @@ Merge mode:    Curator → loom:curated → [Champion auto-promotes] → loom:is
 ```
 
 When `--merge` is active:
-1. **Champion auto-promotes** all `loom:curated` issues to `loom:issue` using its 8-criterion quality evaluation (scope, clarity, feasibility, etc.) as a substitute for human review
+1. **Champion auto-promotes** all `loom:curated` issues to `loom:issue` using a simplified quality check (problem statement, at least one acceptance criterion, no `loom:blocked`) as a substitute for human review
 2. **Shepherds skip Gate 1** (the human approval check), proceeding directly from curation to building
 3. **Shepherds auto-merge** PRs after Judge approval (skip the manual merge gate)
 4. All auto-promoted items are marked with `[force-mode]` in their audit trail for traceability
