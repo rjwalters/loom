@@ -110,6 +110,42 @@ LOOM_ISSUE_STRATEGY=lifo /loom
 LOOM_ISSUE_STRATEGY=priority /loom
 ```
 
+## Batch Orchestration (Merge Mode)
+
+In the default issue lifecycle, a human must manually promote `loom:curated` issues to `loom:issue` before Builders can claim them. This human gate ensures oversight but becomes a bottleneck during high-throughput batch sessions.
+
+**Merge mode** (`--merge`) solves this by automating the approval gate:
+
+```
+Normal mode:   Curator → loom:curated → [human promotes] → loom:issue → Builder claims
+Merge mode:    Curator → loom:curated → [Champion auto-promotes] → loom:issue → Builder claims
+```
+
+When `--merge` is active:
+1. **Champion auto-promotes** all `loom:curated` issues to `loom:issue` using a simplified quality check (problem statement, at least one acceptance criterion, no `loom:blocked`) as a substitute for human review
+2. **Shepherds skip Gate 1** (the human approval check), proceeding directly from curation to building
+3. **Shepherds auto-merge** PRs after Judge approval (skip the manual merge gate)
+4. All auto-promoted items are marked with `[force-mode]` in their audit trail for traceability
+
+**Why no `loom:approved` label?** The `loom:issue` label already means "approved for work" (see `.github/labels.yml`). In normal mode, a human adds it; in merge mode, Champion adds it. The same label serves both cases, keeping the state machine simple. Adding a separate `loom:approved` label would require updating every agent that currently checks for `loom:issue` and would complicate the already-working workflow with no functional benefit.
+
+**Starting a batch session:**
+
+```bash
+# Start daemon with merge mode (implies --auto-build)
+./.loom/scripts/daemon.sh start --auto-build
+/loom --merge
+
+# Or combine in one step
+LOOM_FORCE_MODE=true ./.loom/scripts/daemon.sh start --auto-build
+```
+
+**Safety guarantees in merge mode:**
+- Judge review is never skipped (GitHub API prevents self-review, so label-based review always runs)
+- `loom:blocked` issues are respected (not auto-promoted)
+- Force-push and other destructive operations remain blocked
+- All actions are auditable via `[force-mode]` markers
+
 ## Daemon State File
 
 The daemon state file (`.loom/daemon-state.json`) provides comprehensive information for debugging, crash recovery, and system observability.
