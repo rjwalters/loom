@@ -66,8 +66,20 @@ else
     GH="gh"
 fi
 
-# Auto-detect owner/repo from git remote
-REPO_NWO="$($GH repo view --json nameWithOwner --jq '.nameWithOwner' 2>/dev/null)" || \
+# Auto-detect owner/repo with fallback for worktree contexts
+# Primary: gh repo view (uses GitHub API, most reliable when authenticated)
+# Fallback: parse git remote URL (local operation, works when gh fails in worktrees)
+detect_repo_nwo() {
+  local nwo
+  # Try gh repo view first (works in most cases)
+  nwo="$($GH repo view --json nameWithOwner --jq '.nameWithOwner' 2>/dev/null)" && [[ -n "$nwo" ]] && echo "$nwo" && return 0
+  # Fallback: parse origin remote URL from the main repo root
+  # Handles both HTTPS (https://github.com/owner/repo.git) and SSH (git@github.com:owner/repo.git)
+  nwo="$(cd "$REPO_ROOT" && git remote get-url origin 2>/dev/null | sed -E 's|\.git$||; s|.*[:/]([^/]+/[^/]+)$|\1|')" && [[ -n "$nwo" ]] && echo "$nwo" && return 0
+  return 1
+}
+
+REPO_NWO="$(detect_repo_nwo)" || \
   error "Could not determine repository. Is 'gh' authenticated?"
 
 # Parse arguments
