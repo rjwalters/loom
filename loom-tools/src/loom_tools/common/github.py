@@ -155,9 +155,24 @@ def _is_rate_limited(result: subprocess.CompletedProcess[str]) -> bool:
 
 
 def _gh_cmd() -> str:
-    """Return ``gh-cached`` if available, otherwise ``gh``."""
+    """Return ``gh-cached`` if available and functional, otherwise ``gh``.
+
+    Beyond checking PATH availability, we probe with ``--version`` to catch
+    broken Python runtimes (e.g. unaccepted Xcode license, missing interpreter).
+    The probe is lightweight -- ``gh-cached --version`` delegates to
+    ``gh --version`` with no API calls and no cache interaction.
+    """
     if shutil.which("gh-cached"):
-        return "gh-cached"
+        try:
+            subprocess.run(
+                ["gh-cached", "--version"],
+                capture_output=True,
+                timeout=5,
+                check=True,
+            )
+            return "gh-cached"
+        except (subprocess.SubprocessError, OSError):
+            pass
     return "gh"
 
 

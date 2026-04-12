@@ -57,8 +57,10 @@ REPO_ROOT="$(find_main_repo_root)" || \
   error "Not in a git repository"
 
 # Use gh-cached for read-only queries to reduce API calls (see issue #1609)
+# Verify the Python interpreter works too — a broken runtime (e.g. unaccepted
+# Xcode license) would make every subsequent gh call fail with a misleading error.
 GH_CACHED="$REPO_ROOT/.loom/scripts/gh-cached"
-if [[ -x "$GH_CACHED" ]]; then
+if [[ -x "$GH_CACHED" ]] && "$GH_CACHED" --version &>/dev/null; then
     GH="$GH_CACHED"
 else
     GH="gh"

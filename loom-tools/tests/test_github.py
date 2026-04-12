@@ -11,6 +11,7 @@ import pytest
 
 from loom_tools.common.github import (
     ApiMode,
+    _gh_cmd,
     _is_rate_limited,
     _normalize_rest_entity,
     _normalize_rest_labels,
@@ -768,3 +769,59 @@ class TestGhPrListWrapper:
         mock_list.assert_called_once_with(
             "pr", labels=["ready"], state="open", fields=["url"]
         )
+
+
+# ---------------------------------------------------------------------------
+# _gh_cmd (runtime verification of gh-cached)
+# ---------------------------------------------------------------------------
+
+
+class TestGhCmd:
+    """Tests for _gh_cmd runtime verification of gh-cached."""
+
+    def test_returns_gh_cached_when_available_and_functional(self) -> None:
+        """gh-cached is used when found on PATH and --version succeeds."""
+        with mock.patch("loom_tools.common.github.shutil.which", return_value="/usr/local/bin/gh-cached"):
+            with mock.patch("loom_tools.common.github.subprocess.run") as mock_run:
+                mock_run.return_value = mock.Mock(returncode=0)
+                assert _gh_cmd() == "gh-cached"
+
+                # Verify --version probe was called
+                mock_run.assert_called_once_with(
+                    ["gh-cached", "--version"],
+                    capture_output=True,
+                    timeout=5,
+                    check=True,
+                )
+
+    def test_falls_back_to_gh_when_version_fails(self) -> None:
+        """Falls back to gh when gh-cached --version returns non-zero."""
+        with mock.patch("loom_tools.common.github.shutil.which", return_value="/usr/local/bin/gh-cached"):
+            with mock.patch(
+                "loom_tools.common.github.subprocess.run",
+                side_effect=subprocess.CalledProcessError(1, "gh-cached"),
+            ):
+                assert _gh_cmd() == "gh"
+
+    def test_falls_back_to_gh_when_version_times_out(self) -> None:
+        """Falls back to gh when gh-cached --version times out."""
+        with mock.patch("loom_tools.common.github.shutil.which", return_value="/usr/local/bin/gh-cached"):
+            with mock.patch(
+                "loom_tools.common.github.subprocess.run",
+                side_effect=subprocess.TimeoutExpired("gh-cached", 5),
+            ):
+                assert _gh_cmd() == "gh"
+
+    def test_falls_back_to_gh_when_os_error(self) -> None:
+        """Falls back to gh when gh-cached triggers an OSError (broken interpreter)."""
+        with mock.patch("loom_tools.common.github.shutil.which", return_value="/usr/local/bin/gh-cached"):
+            with mock.patch(
+                "loom_tools.common.github.subprocess.run",
+                side_effect=OSError("No such file or directory"),
+            ):
+                assert _gh_cmd() == "gh"
+
+    def test_falls_back_to_gh_when_not_on_path(self) -> None:
+        """Falls back to gh when gh-cached is not found on PATH."""
+        with mock.patch("loom_tools.common.github.shutil.which", return_value=None):
+            assert _gh_cmd() == "gh"
