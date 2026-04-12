@@ -1,7 +1,8 @@
 """Tests for the auto_build gate in daemon iteration.
 
-When auto_build=False (the new default), spawn_shepherds must NOT be called
-even when the snapshot recommends it and shepherd slots are available.
+When auto_build=False (explicit opt-out via --no-auto-build), spawn_shepherds
+must NOT be called even when the snapshot recommends it and shepherd slots are
+available.
 """
 
 from __future__ import annotations

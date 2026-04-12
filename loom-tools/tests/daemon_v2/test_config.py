@@ -18,7 +18,7 @@ class TestDaemonConfig:
         assert config.max_shepherds == 10
         assert config.issue_threshold == 3
         assert config.force_mode is False
-        assert config.auto_build is False
+        assert config.auto_build is True
         assert config.debug_mode is False
 
     def test_from_env_defaults(self):
@@ -65,11 +65,30 @@ class TestDaemonConfig:
             config = DaemonConfig.from_env()
             assert config.auto_build is True
 
-    def test_from_env_auto_build_false_by_default(self):
-        """Test auto_build is False by default (no env var)."""
+    def test_from_env_auto_build_true_by_default(self):
+        """Test auto_build is True by default (no env var)."""
         with patch.dict(os.environ, {}, clear=True):
             config = DaemonConfig.from_env()
+            assert config.auto_build is True
+
+    def test_no_auto_build_flag(self):
+        """Test --no-auto-build disables auto_build."""
+        with patch.dict(os.environ, {}, clear=True):
+            config = DaemonConfig.from_env(no_auto_build=True)
             assert config.auto_build is False
+
+    def test_no_auto_build_env_var_false(self):
+        """Test LOOM_AUTO_BUILD=false disables auto_build."""
+        with patch.dict(os.environ, {"LOOM_AUTO_BUILD": "false"}, clear=True):
+            config = DaemonConfig.from_env()
+            assert config.auto_build is False
+
+    def test_force_mode_overrides_no_auto_build(self):
+        """Test that force_mode=True overrides no_auto_build."""
+        with patch.dict(os.environ, {}, clear=True):
+            config = DaemonConfig.from_env(force_mode=True, no_auto_build=True)
+            assert config.force_mode is True
+            assert config.auto_build is True
 
     def test_force_mode_implies_auto_build(self):
         """Test that force_mode=True implies auto_build=True."""
@@ -84,13 +103,18 @@ class TestDaemonConfig:
             assert config.force_mode is True
             assert config.auto_build is True
 
-    def test_mode_display_support_only(self):
-        """Test mode display for default mode (no auto_build, no force)."""
+    def test_mode_display_default_is_auto_build(self):
+        """Test mode display for default mode is Auto-build."""
         config = DaemonConfig()
+        assert config.mode_display() == "Auto-build"
+
+    def test_mode_display_support_only(self):
+        """Test mode display for explicit support-only mode (auto_build=False)."""
+        config = DaemonConfig(auto_build=False)
         assert config.mode_display() == "Support-only"
 
     def test_mode_display_auto_build(self):
-        """Test mode display for auto-build mode."""
+        """Test mode display for explicit auto-build mode."""
         config = DaemonConfig(auto_build=True)
         assert config.mode_display() == "Auto-build"
 
@@ -100,8 +124,13 @@ class TestDaemonConfig:
         assert config.mode_display() == "Force"
 
     def test_mode_display_debug(self):
-        """Test mode display for debug mode."""
+        """Test mode display for debug mode (with default auto_build=True)."""
         config = DaemonConfig(debug_mode=True)
+        assert config.mode_display() == "Auto-build + Debug"
+
+    def test_mode_display_debug_support_only(self):
+        """Test mode display for debug + support-only mode."""
+        config = DaemonConfig(auto_build=False, debug_mode=True)
         assert config.mode_display() == "Debug"
 
     def test_mode_display_force_debug(self):
