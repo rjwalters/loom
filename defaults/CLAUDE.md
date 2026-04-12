@@ -1009,7 +1009,7 @@ Use `merge-pr.sh` instead of `gh pr merge` to avoid worktree checkout errors:
 ./.loom/scripts/merge-pr.sh <PR_NUMBER>
 ```
 
-This merges via the GitHub API (no local checkout), deletes the remote branch, and optionally cleans up the local worktree with `--cleanup-worktree`. All Loom roles (Shepherd, Champion) use this script automatically.
+This merges via the GitHub API (no local checkout), deletes the remote branch, and cleans up the local worktree by default. Pass `--no-cleanup-worktree` to skip worktree cleanup (e.g., when other terminals may have their CWD inside the worktree). All Loom roles (Shepherd, Champion) use this script automatically.
 
 ---
 
