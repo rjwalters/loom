@@ -104,10 +104,25 @@ def _find_repo_root(start: Path | None = None) -> Path:
 
 
 def _gh_cmd(repo_root: Path) -> str:
-    """Return ``gh-cached`` when available, else plain ``gh``."""
+    """Return ``gh-cached`` when available and functional, else plain ``gh``.
+
+    Beyond checking the executable bit, we probe with ``--version`` to catch
+    broken Python runtimes (e.g. unaccepted Xcode license, missing interpreter).
+    The probe is lightweight -- ``gh-cached --version`` delegates to
+    ``gh --version`` with no API calls and no cache interaction.
+    """
     cached = repo_root / ".loom" / "scripts" / "gh-cached"
     if cached.is_file() and cached.stat().st_mode & 0o111:
-        return str(cached)
+        try:
+            subprocess.run(
+                [str(cached), "--version"],
+                capture_output=True,
+                timeout=5,
+                check=True,
+            )
+            return str(cached)
+        except (subprocess.SubprocessError, OSError):
+            pass
     return "gh"
 
 

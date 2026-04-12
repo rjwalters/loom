@@ -22,6 +22,7 @@ from loom_tools.validate_phase import (
     _parse_args,
     _gather_builder_diagnostics,
     _build_recovery_pr_body,
+    _gh_cmd,
     _is_rate_limited_builder_exit,
     VALID_PHASES,
 )
@@ -1687,3 +1688,94 @@ class TestCLI:
         with pytest.raises(SystemExit) as exc:
             main(["curator", "42"])
         assert exc.value.code == 0  # recovered counts as success
+
+
+# ---------------------------------------------------------------------------
+# _gh_cmd (runtime verification of gh-cached)
+# ---------------------------------------------------------------------------
+
+
+class TestGhCmdValidatePhase:
+    """Tests for _gh_cmd runtime verification of gh-cached in validate_phase."""
+
+    def test_returns_gh_cached_when_available_and_functional(self, tmp_path: Path) -> None:
+        """gh-cached is used when the file is executable and --version succeeds."""
+        scripts_dir = tmp_path / ".loom" / "scripts"
+        scripts_dir.mkdir(parents=True)
+        cached = scripts_dir / "gh-cached"
+        cached.write_text("#!/bin/sh\ngh \"$@\"")
+        cached.chmod(0o755)
+
+        with patch("loom_tools.validate_phase.subprocess.run") as mock_run:
+            mock_run.return_value = MagicMock(returncode=0)
+            result = _gh_cmd(tmp_path)
+
+        assert result == str(cached)
+        mock_run.assert_called_once_with(
+            [str(cached), "--version"],
+            capture_output=True,
+            timeout=5,
+            check=True,
+        )
+
+    def test_falls_back_to_gh_when_version_fails(self, tmp_path: Path) -> None:
+        """Falls back to gh when gh-cached --version returns non-zero."""
+        scripts_dir = tmp_path / ".loom" / "scripts"
+        scripts_dir.mkdir(parents=True)
+        cached = scripts_dir / "gh-cached"
+        cached.write_text("#!/bin/sh\nexit 1")
+        cached.chmod(0o755)
+
+        with patch(
+            "loom_tools.validate_phase.subprocess.run",
+            side_effect=subprocess.CalledProcessError(1, str(cached)),
+        ):
+            result = _gh_cmd(tmp_path)
+
+        assert result == "gh"
+
+    def test_falls_back_to_gh_when_version_times_out(self, tmp_path: Path) -> None:
+        """Falls back to gh when gh-cached --version times out."""
+        scripts_dir = tmp_path / ".loom" / "scripts"
+        scripts_dir.mkdir(parents=True)
+        cached = scripts_dir / "gh-cached"
+        cached.write_text("#!/bin/sh\nsleep 999")
+        cached.chmod(0o755)
+
+        with patch(
+            "loom_tools.validate_phase.subprocess.run",
+            side_effect=subprocess.TimeoutExpired(str(cached), 5),
+        ):
+            result = _gh_cmd(tmp_path)
+
+        assert result == "gh"
+
+    def test_falls_back_to_gh_when_os_error(self, tmp_path: Path) -> None:
+        """Falls back to gh on OSError (e.g., broken Python interpreter)."""
+        scripts_dir = tmp_path / ".loom" / "scripts"
+        scripts_dir.mkdir(parents=True)
+        cached = scripts_dir / "gh-cached"
+        cached.write_text("#!/bin/sh\nexit 0")
+        cached.chmod(0o755)
+
+        with patch(
+            "loom_tools.validate_phase.subprocess.run",
+            side_effect=OSError("No such file or directory"),
+        ):
+            result = _gh_cmd(tmp_path)
+
+        assert result == "gh"
+
+    def test_falls_back_to_gh_when_file_missing(self, tmp_path: Path) -> None:
+        """Falls back to gh when gh-cached does not exist."""
+        assert _gh_cmd(tmp_path) == "gh"
+
+    def test_falls_back_to_gh_when_not_executable(self, tmp_path: Path) -> None:
+        """Falls back to gh when gh-cached exists but is not executable."""
+        scripts_dir = tmp_path / ".loom" / "scripts"
+        scripts_dir.mkdir(parents=True)
+        cached = scripts_dir / "gh-cached"
+        cached.write_text("#!/bin/sh\ngh \"$@\"")
+        cached.chmod(0o644)  # Not executable
+
+        assert _gh_cmd(tmp_path) == "gh"
