@@ -277,8 +277,26 @@ mod claude_config {
         let settings_dst = config_dir.join("settings.json");
         if !settings_dst.exists() {
             let settings_src = home_claude.join("settings.json");
-            if settings_src.exists() {
-                copy_settings_without_plugins(&settings_src, &settings_dst);
+            let copied = if settings_src.exists() {
+                copy_settings_without_plugins(&settings_src, &settings_dst)
+            } else {
+                false
+            };
+            if !copied && !settings_dst.exists() {
+                // The copy failed or source was missing.  Write a minimal
+                // fallback so Claude Code never falls back to the global
+                // ~/.claude/settings.json which may contain enabledPlugins.
+                // See issue #3065.
+                if settings_src.is_file() {
+                    log::warn!(
+                        "Failed to copy settings.json from {} — writing minimal \
+                         fallback to prevent enabledPlugins leak",
+                        settings_src.display()
+                    );
+                }
+                if let Err(e) = fs::write(&settings_dst, "{}\n") {
+                    log::warn!("Failed to write fallback settings.json: {e}");
+                }
             }
         }
 
@@ -666,6 +684,33 @@ mod claude_config {
 
             let dst = tmp.path().join("out.json");
             assert!(!copy_settings_without_plugins(&src, &dst));
+        }
+
+        #[test]
+        fn test_setup_creates_fallback_settings_when_source_missing() {
+            // When ~/.claude/settings.json doesn't exist, a minimal fallback
+            // should still be written to prevent Claude Code from falling back
+            // to the global settings file with enabledPlugins (#3065).
+            let tmp = tempfile::tempdir().unwrap();
+            let repo_root = tmp.path();
+            fs::create_dir_all(repo_root.join(".loom")).unwrap();
+
+            let result = setup_agent_config_dir("terminal-fallback-settings", repo_root);
+            assert!(result.is_some());
+            let config_dir = result.unwrap();
+
+            let settings = config_dir.join("settings.json");
+            assert!(
+                settings.exists(),
+                "Fallback settings.json should be created even when source is missing"
+            );
+
+            let data: serde_json::Value =
+                serde_json::from_str(&fs::read_to_string(&settings).unwrap()).unwrap();
+            assert!(
+                data.get("enabledPlugins").is_none(),
+                "enabledPlugins must not be present in fallback"
+            );
         }
     }
 }

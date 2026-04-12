@@ -318,6 +318,17 @@ def validate_agent_config_dir(agent_name: str, repo_root: Path) -> bool:
         )
         return False
 
+    # settings.json must exist — without it, Claude Code falls back to the
+    # global ~/.claude/settings.json which may contain enabledPlugins,
+    # causing ghost sessions (issue #3065).
+    settings_file = config_dir / "settings.json"
+    if not settings_file.is_file():
+        log.debug(
+            "Agent config dir validation failed for %s: settings.json is missing",
+            agent_name,
+        )
+        return False
+
     # All mutable directories must exist.
     for dirname in _MUTABLE_DIRS:
         if not (config_dir / dirname).is_dir():
@@ -364,7 +375,19 @@ def setup_agent_config_dir(agent_name: str, repo_root: Path) -> Path:
     # mode and cause ghost sessions.  All other settings are preserved.
     settings_dst = config_dir / "settings.json"
     if not settings_dst.exists():
-        _copy_settings_without_plugins(home_claude / "settings.json", settings_dst)
+        copied = _copy_settings_without_plugins(home_claude / "settings.json", settings_dst)
+        if not copied and not settings_dst.exists():
+            # The copy failed or source was missing.  Write a minimal
+            # fallback so Claude Code never falls back to the global
+            # ~/.claude/settings.json which may contain enabledPlugins.
+            # See issue #3065.
+            if (home_claude / "settings.json").is_file():
+                log.warning(
+                    "Failed to copy settings.json from %s — writing minimal "
+                    "fallback to prevent enabledPlugins leak",
+                    home_claude / "settings.json",
+                )
+            settings_dst.write_text("{}\n")
 
     # Symlink Claude Code state file (onboarding completion, theme, etc.).
     # The state file lives at ~/.claude.json (or ~/.claude/.config.json),

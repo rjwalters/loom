@@ -156,6 +156,49 @@ class TestSetupAgentConfigDir:
         assert dst.is_symlink(), ".claude.json should be symlinked"
         assert dst.resolve() == preferred.resolve()
 
+    def test_settings_json_fallback_when_source_missing(
+        self, mock_repo: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """When ~/.claude/settings.json doesn't exist, a minimal fallback
+        settings.json is written to prevent Claude Code from falling back
+        to the global settings file with enabledPlugins (#3065)."""
+        import json
+
+        fake_home = mock_repo / "fake-home"
+        fake_home.mkdir()
+        (fake_home / ".claude").mkdir()
+        # No settings.json in fake home
+        monkeypatch.setattr(pathlib.Path, "home", staticmethod(lambda: fake_home))
+
+        config_dir = setup_agent_config_dir("test-agent", mock_repo)
+        settings_dst = config_dir / "settings.json"
+        assert settings_dst.exists(), "Fallback settings.json should be created"
+        assert not settings_dst.is_symlink(), "settings.json should NOT be a symlink"
+        data = json.loads(settings_dst.read_text())
+        assert "enabledPlugins" not in data
+        assert data == {}
+
+    def test_settings_json_fallback_when_copy_fails(
+        self, mock_repo: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """When _copy_settings_without_plugins fails (corrupt source), a minimal
+        fallback settings.json is written (#3065)."""
+        import json
+
+        fake_home = mock_repo / "fake-home"
+        fake_home.mkdir()
+        (fake_home / ".claude").mkdir()
+        # Write corrupt settings.json
+        (fake_home / ".claude" / "settings.json").write_text("not valid json{{{")
+        monkeypatch.setattr(pathlib.Path, "home", staticmethod(lambda: fake_home))
+
+        config_dir = setup_agent_config_dir("test-agent", mock_repo)
+        settings_dst = config_dir / "settings.json"
+        assert settings_dst.exists(), "Fallback settings.json should be created"
+        data = json.loads(settings_dst.read_text())
+        assert "enabledPlugins" not in data
+        assert data == {}
+
     def test_missing_state_file_writes_fallback(
         self, mock_repo: pathlib.Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -645,6 +688,32 @@ class TestValidateAgentConfigDir:
 
         # Validation must now pass
         assert validate_agent_config_dir("test-agent", mock_repo) is True
+
+
+    def test_returns_false_when_settings_json_missing(
+        self, mock_repo: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Missing settings.json means Claude Code could fall back to
+        global settings with enabledPlugins, causing ghost sessions (#3065)."""
+        fake_home = mock_repo / "fake-home"
+        fake_home.mkdir()
+        (fake_home / ".claude").mkdir()
+        state_file = fake_home / ".claude.json"
+        state_file.write_text(
+            '{"hasCompletedOnboarding":true,"theme":"dark",'
+            '"effortCalloutDismissed":true,"opusProMigrationComplete":true}'
+        )
+        monkeypatch.setattr(pathlib.Path, "home", staticmethod(lambda: fake_home))
+
+        setup_agent_config_dir("test-agent", mock_repo)
+
+        # Remove settings.json to simulate incomplete setup
+        config_dir = mock_repo / ".loom" / "claude-config" / "test-agent"
+        settings = config_dir / "settings.json"
+        if settings.exists():
+            settings.unlink()
+
+        assert validate_agent_config_dir("test-agent", mock_repo) is False
 
 
 class TestCleanupAllAgentConfigDirs:
