@@ -133,7 +133,7 @@ Environment Variables:
     LOOM_POLL_INTERVAL          Seconds between iterations (default: 120)
     LOOM_MAX_SHEPHERDS          Maximum concurrent shepherds (default: 10)
     LOOM_ISSUE_THRESHOLD        Trigger work generation when issues < this (default: 3)
-    LOOM_AUTO_BUILD             Enable shepherd auto-spawning (default: false)
+    LOOM_AUTO_BUILD             Enable shepherd auto-spawning (default: true)
     LOOM_ARCHITECT_COOLDOWN     Seconds between architect triggers (default: 1800)
     LOOM_HERMIT_COOLDOWN        Seconds between hermit triggers (default: 1800)
     LOOM_GUIDE_INTERVAL         Guide respawn interval (default: 900)
@@ -146,8 +146,8 @@ To stop the daemon gracefully:
     touch .loom/stop-daemon
 
 Examples:
-    loom-daemon                 # Start in support-only mode (no auto-spawn)
-    loom-daemon --auto-build    # Auto-spawn shepherds from loom:issue queue
+    loom-daemon                 # Start with auto-build (default)
+    loom-daemon --no-auto-build # Support-only mode (no auto-spawn)
     loom-daemon --force         # Force mode (auto-promote, auto-merge, auto-build)
     loom-daemon -t 180          # Run for 3 hours then gracefully stop
     loom-daemon --merge -t 60   # Merge mode for 1 hour
@@ -159,7 +159,12 @@ Examples:
     parser.add_argument(
         "--auto-build", "-a",
         action="store_true",
-        help="Enable automatic shepherd spawning from loom:issue queue",
+        help="Enable automatic shepherd spawning (default behavior, kept for backward compatibility)",
+    )
+    parser.add_argument(
+        "--no-auto-build",
+        action="store_true",
+        help="Disable automatic shepherd spawning (support-only mode)",
     )
     parser.add_argument(
         "--force", "-f",
@@ -214,9 +219,11 @@ Examples:
     # Create config (--merge is alias for --force; --force/--merge imply --auto-build)
     force_mode = args.force or args.merge
     auto_build = getattr(args, "auto_build", False)
+    no_auto_build = getattr(args, "no_auto_build", False)
     config = DaemonConfig.from_env(
         force_mode=force_mode,
         auto_build=auto_build,
+        no_auto_build=no_auto_build,
         debug_mode=args.debug,
         timeout_min=args.timeout_min,
     )

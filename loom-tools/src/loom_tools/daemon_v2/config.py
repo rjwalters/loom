@@ -40,7 +40,7 @@ class DaemonConfig:
     poll_interval: int = DEFAULT_POLL_INTERVAL
     iteration_timeout: int = DEFAULT_ITERATION_TIMEOUT
     force_mode: bool = False
-    auto_build: bool = False
+    auto_build: bool = True
     debug_mode: bool = False
     timeout_min: int = 0  # 0 = no timeout
 
@@ -79,6 +79,7 @@ class DaemonConfig:
         *,
         force_mode: bool = False,
         auto_build: bool = False,
+        no_auto_build: bool = False,
         debug_mode: bool = False,
         timeout_min: int = 0,
     ) -> DaemonConfig:
@@ -86,13 +87,19 @@ class DaemonConfig:
 
         Args:
             force_mode: Enable force mode (auto-promote, auto-merge)
-            auto_build: Enable automatic shepherd spawning from loom:issue queue
+            auto_build: Enable automatic shepherd spawning (kept for backward compat, now default)
+            no_auto_build: Explicitly disable automatic shepherd spawning
             debug_mode: Enable debug logging
             timeout_min: Stop daemon after N minutes (0 = no timeout)
         """
         resolved_force = force_mode or env_bool("LOOM_FORCE_MODE", False)
-        # --merge/--force implies --auto-build; also check LOOM_AUTO_BUILD env var
-        resolved_auto_build = auto_build or resolved_force or env_bool("LOOM_AUTO_BUILD", False)
+        # Auto-build is ON by default. Disabled only by explicit --no-auto-build flag
+        # or LOOM_AUTO_BUILD=false env var. --force/--merge always implies auto-build.
+        if no_auto_build and not resolved_force:
+            resolved_auto_build = False
+        else:
+            env_auto_build = env_bool("LOOM_AUTO_BUILD", True)
+            resolved_auto_build = env_auto_build or auto_build or resolved_force
         return cls(
             poll_interval=env_int("LOOM_POLL_INTERVAL", DEFAULT_POLL_INTERVAL),
             iteration_timeout=env_int("LOOM_ITERATION_TIMEOUT", DEFAULT_ITERATION_TIMEOUT),

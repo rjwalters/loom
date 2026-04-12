@@ -192,11 +192,11 @@ Launch the Loom desktop application for automated orchestration with visual term
 Run the Loom daemon for fully autonomous system orchestration.
 
 ```bash
-# Start daemon in support-only mode (default — no auto-shepherd-spawning)
+# Start daemon with auto-build (default — auto-spawns shepherds from queue)
 ./.loom/scripts/daemon.sh start
 
-# Start daemon with auto-build enabled (also spawns shepherds from queue)
-./.loom/scripts/daemon.sh start --auto-build
+# Start daemon in support-only mode (no auto-shepherd-spawning)
+./.loom/scripts/daemon.sh start --no-auto-build
 
 # Activate orchestration from Claude Code (daemon must already be running)
 /loom
@@ -204,14 +204,14 @@ Run the Loom daemon for fully autonomous system orchestration.
 # Start with merge mode for aggressive autonomous development
 /loom --merge
 
-# In support-only mode, the daemon will:
+# By default, the daemon will:
 # 1. Monitor system state every 60 seconds
 # 2. Trigger Architect/Hermit when backlog is low
 # 3. Ensure Guide, Champion, Doctor, Auditor, Judge, Curator keep running
-# 4. NOT auto-spawn shepherds (use /shepherd <N> for specific issues)
+# 4. Auto-spawn shepherds for ready loom:issue issues
 
-# With --auto-build, also:
-# 3. Spawn shepherds for ready issues automatically
+# With --no-auto-build, shepherds are NOT auto-spawned
+# (use /shepherd <N> to shepherd specific issues manually)
 ```
 
 **Dual Daemon Prevention**: `/loom` uses session ID tracking to prevent multiple daemon instances from running simultaneously. If a second daemon is started, it will detect the conflict and refuse to start. The `daemon_session_id` field in `daemon-state.json` (format: `timestamp-PID`) enables each daemon to verify it still owns the state file before writing updates. This prevents state corruption when Claude Code sessions are auto-continued.
