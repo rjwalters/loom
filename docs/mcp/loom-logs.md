@@ -5,7 +5,7 @@ Log tools for accessing Loom's various log files including daemon logs, Tauri ap
 ## Server Information
 
 - **Name**: `loom` (unified server)
-- **Version**: `0.3.0`
+- **Version**: `0.4.0`
 - **Package**: `mcp-loom`
 - **Source**: `mcp-loom/src/tools/logs.ts`
 

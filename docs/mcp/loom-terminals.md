@@ -5,7 +5,7 @@ Terminal tools for interacting with Loom terminal sessions via the daemon IPC in
 ## Server Information
 
 - **Name**: `loom` (unified server)
-- **Version**: `0.3.0`
+- **Version**: `0.4.0`
 - **Package**: `mcp-loom`
 - **Source**: `mcp-loom/src/tools/terminals.ts`
 

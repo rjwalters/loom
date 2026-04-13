@@ -5,7 +5,7 @@ UI tools for interacting with the Loom application's UI layer, console logs, and
 ## Server Information
 
 - **Name**: `loom` (unified server)
-- **Version**: `0.3.0`
+- **Version**: `0.4.0`
 - **Package**: `mcp-loom`
 - **Source**: `mcp-loom/src/tools/ui.ts`
 
