@@ -12,7 +12,7 @@ import time
 from typing import Any
 
 from loom_tools.common.github import gh_issue_view
-from loom_tools.common.issue_failures import load_failure_log, merge_into_daemon_state
+from loom_tools.common.issue_failures import load_failure_log, merge_into_daemon_state, reset_failures
 from loom_tools.common.logging import log_error, log_info, log_success, log_warning
 from loom_tools.common.state import read_daemon_state, read_json_file, write_json_file
 from loom_tools.common.time_utils import now_utc
@@ -288,6 +288,9 @@ def _process_commands(
                 "orchestration activated"
             )
             _update_orchestration_active(ctx)
+
+        elif action == "reset_failures":
+            _handle_reset_failures(ctx, cmd)
 
         else:
             log_warning(f"Signal: unknown action={action!r}, skipping")
@@ -582,6 +585,65 @@ def _resume_shepherd(ctx: DaemonContext, shepherd_id: str) -> None:
             log_warning(f"resume_shepherd: could not remove stop file: {exc}")
     else:
         log_warning(f"resume_shepherd: {shepherd_id} has no issue assigned")
+
+
+def _handle_reset_failures(ctx: DaemonContext, cmd: dict) -> None:
+    """Handle a reset_failures signal command.
+
+    Clears all three failure tracking locations (issue-failures.json,
+    blocked_issue_retries, recent_failures) for a specific issue or
+    all issues.
+
+    Signal payload:
+        {"action": "reset_failures", "issue": 42}    # reset one issue
+        {"action": "reset_failures", "all": true}     # reset all issues
+    """
+    issue = cmd.get("issue")
+    reset_all = cmd.get("all", False)
+
+    if issue is not None:
+        cleared = reset_failures(ctx.repo_root, issue=int(issue))
+        # Also update in-memory daemon state if loaded
+        if ctx.state is not None:
+            issue_key = str(issue)
+            ctx.state.blocked_issue_retries.pop(issue_key, None)
+            ctx.state.recent_failures = [
+                f for f in ctx.state.recent_failures
+                if f.issue != int(issue)
+            ]
+            ctx.state.needs_human_input = [
+                h for h in ctx.state.needs_human_input
+                if not (
+                    h.get("type") == "exhausted_retry"
+                    and h.get("issue") == int(issue)
+                )
+            ]
+        log_success(
+            f"Signal: reset_failures issue=#{issue} — "
+            f"cleared {cleared} persistent entry(ies)"
+        )
+    elif reset_all:
+        cleared = reset_failures(ctx.repo_root, issue=None)
+        # Also update in-memory daemon state if loaded
+        if ctx.state is not None:
+            ctx.state.blocked_issue_retries.clear()
+            ctx.state.recent_failures.clear()
+            ctx.state.systematic_failure.active = False
+            ctx.state.systematic_failure.pattern = ""
+            ctx.state.systematic_failure.count = 0
+            ctx.state.systematic_failure.probe_count = 0
+            ctx.state.needs_human_input = [
+                h for h in ctx.state.needs_human_input
+                if h.get("type") != "exhausted_retry"
+            ]
+        log_success(
+            f"Signal: reset_failures all=true — "
+            f"cleared {cleared} persistent entry(ies)"
+        )
+    else:
+        log_warning(
+            "Signal: reset_failures requires 'issue' (int) or 'all' (true), skipping"
+        )
 
 
 def _write_state(ctx: DaemonContext) -> None:
