@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import time
 from typing import TYPE_CHECKING
 
 from loom_tools.agent_spawn import (
@@ -17,6 +18,11 @@ from loom_tools.models.daemon_state import SupportRoleEntry
 
 if TYPE_CHECKING:
     from loom_tools.daemon_v2.context import DaemonContext
+
+# Delay between consecutive support role spawns (seconds).
+# Prevents auth cache lock contention when multiple roles start simultaneously.
+# See issue #3109.
+SPAWN_STAGGER_DELAY = 3
 
 
 # Support roles and their corresponding slash commands
@@ -117,67 +123,71 @@ def _get_first_targeted_pr(ctx: DaemonContext, key: str) -> int | None:
 def spawn_roles_from_actions(ctx: DaemonContext) -> int:
     """Spawn support roles based on recommended actions from snapshot.
 
+    Staggers spawns by SPAWN_STAGGER_DELAY seconds between consecutive
+    successful spawns to prevent auth cache lock contention.  See issue #3109.
+
     Returns the number of roles spawned.
     """
     actions = ctx.get_recommended_actions()
     spawned = 0
 
+    def _spawn_with_stagger(role: str, **kwargs: object) -> bool:
+        """Spawn a role and stagger if this is not the first spawn."""
+        nonlocal spawned
+        if spawned > 0:
+            log_info(
+                f"Staggering {role} spawn by {SPAWN_STAGGER_DELAY}s "
+                f"to avoid auth cache contention"
+            )
+            time.sleep(SPAWN_STAGGER_DELAY)
+        if spawn_support_role(ctx, role, **kwargs):  # type: ignore[arg-type]
+            spawned += 1
+            return True
+        return False
+
     # Demand-based triggers (higher priority)
     # Targeted dispatch takes precedence: if orphaned PRs exist, the
     # snapshot generates ``spawn_*_targeted`` instead of ``spawn_*_demand``.
     if "spawn_champion_demand" in actions:
-        if spawn_support_role(ctx, "champion", demand=True):
-            spawned += 1
+        _spawn_with_stagger("champion", demand=True)
 
     if "spawn_doctor_targeted" in actions:
         pr = _get_first_targeted_pr(ctx, "doctor_targeted_prs")
-        if spawn_support_role(ctx, "doctor", demand=True, target_pr=pr):
-            spawned += 1
+        _spawn_with_stagger("doctor", demand=True, target_pr=pr)
     elif "spawn_doctor_demand" in actions:
-        if spawn_support_role(ctx, "doctor", demand=True):
-            spawned += 1
+        _spawn_with_stagger("doctor", demand=True)
 
     if "spawn_judge_targeted" in actions:
         pr = _get_first_targeted_pr(ctx, "judge_targeted_prs")
-        if spawn_support_role(ctx, "judge", demand=True, target_pr=pr):
-            spawned += 1
+        _spawn_with_stagger("judge", demand=True, target_pr=pr)
     elif "spawn_judge_demand" in actions:
-        if spawn_support_role(ctx, "judge", demand=True):
-            spawned += 1
+        _spawn_with_stagger("judge", demand=True)
 
     # Interval-based triggers
     if "trigger_guide" in actions:
-        if spawn_support_role(ctx, "guide"):
-            spawned += 1
+        _spawn_with_stagger("guide")
 
     if "trigger_champion" in actions and "spawn_champion_demand" not in actions:
-        if spawn_support_role(ctx, "champion"):
-            spawned += 1
+        _spawn_with_stagger("champion")
 
     if "trigger_doctor" in actions and "spawn_doctor_demand" not in actions and "spawn_doctor_targeted" not in actions:
-        if spawn_support_role(ctx, "doctor"):
-            spawned += 1
+        _spawn_with_stagger("doctor")
 
     if "trigger_auditor" in actions:
-        if spawn_support_role(ctx, "auditor"):
-            spawned += 1
+        _spawn_with_stagger("auditor")
 
     if "trigger_judge" in actions and "spawn_judge_demand" not in actions and "spawn_judge_targeted" not in actions:
-        if spawn_support_role(ctx, "judge"):
-            spawned += 1
+        _spawn_with_stagger("judge")
 
     # Work generation roles
     if "trigger_architect" in actions:
-        if spawn_support_role(ctx, "architect"):
-            spawned += 1
+        _spawn_with_stagger("architect")
 
     if "trigger_hermit" in actions:
-        if spawn_support_role(ctx, "hermit"):
-            spawned += 1
+        _spawn_with_stagger("hermit")
 
     if "trigger_curator" in actions:
-        if spawn_support_role(ctx, "curator"):
-            spawned += 1
+        _spawn_with_stagger("curator")
 
     return spawned
 

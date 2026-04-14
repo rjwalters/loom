@@ -82,16 +82,24 @@ def run(ctx: DaemonContext) -> int:
         # 9. Print startup header
         _print_header(ctx)
 
-        # 10. Initialize CommandPoller for signal-based IPC with /loom skill
+        # 10. Pre-warm the auth cache (issue #3109)
+        # Run a single `claude auth status` before spawning any agents so the
+        # shared file cache at /tmp/claude-auth-cache-*.json is populated.
+        # Without this, the first batch of spawned agents (shepherds + support
+        # roles) all contend on the auth cache lock simultaneously, each waiting
+        # up to 60s and wasting 90-120s per agent.
+        _prewarm_auth_cache(ctx)
+
+        # 11. Initialize CommandPoller for signal-based IPC with /loom skill
         command_poller = CommandPoller(ctx.repo_root)
         log_info(f"CommandPoller initialized: signals_dir={ctx.signals_dir}")
 
-        # 11. Compute deadline for timeout
+        # 12. Compute deadline for timeout
         deadline: float | None = None
         if ctx.config.timeout_min > 0:
             deadline = time.time() + ctx.config.timeout_min * 60
 
-        # 12. Main loop
+        # 13. Main loop
         consecutive_errors = 0
         MAX_CONSECUTIVE_ERRORS = 10  # Crash only after this many in a row
 
@@ -184,7 +192,7 @@ def run(ctx: DaemonContext) -> int:
             log_info(f"Sleeping {ctx.config.poll_interval}s until next iteration...")
             _responsive_sleep(ctx, command_poller, ctx.config.poll_interval)
 
-        # 11. Run shutdown cleanup
+        # 14. Run shutdown cleanup
         log_info("Running shutdown cleanup...")
         handle_daemon_shutdown(ctx.repo_root, cleanup_config)
 
@@ -1024,6 +1032,56 @@ def _update_metrics(ctx: DaemonContext, status: str, duration: int, summary: str
         data["average_iteration_seconds"] = sum(durations) // len(durations)
 
     write_json_file(ctx.metrics_file, data)
+
+
+def _prewarm_auth_cache(ctx: DaemonContext) -> None:
+    """Pre-warm the shared auth cache before spawning any agents.
+
+    Runs a single ``claude auth status --json`` call and writes the result to
+    the shared cache file at ``/tmp/claude-auth-cache-<uid>.json``.  This
+    ensures that all subsequently-spawned agents (shepherds and support roles)
+    find a fresh cache entry and skip the lock-contention path entirely.
+
+    Without pre-warming, the first N agents spawned after daemon start all try
+    to acquire the same file lock simultaneously, leading to cascading delays
+    of 60-120s per agent.  See issue #3109.
+
+    This is best-effort: if the auth check fails, agents will fall back to
+    their normal per-agent auth check (just with potential contention).
+    """
+    log_info("Pre-warming auth cache...")
+    try:
+        result = subprocess.run(
+            ["claude", "auth", "status", "--json"],
+            capture_output=True,
+            text=True,
+            timeout=15,
+            env={**os.environ, "CLAUDECODE": ""},  # Unset to avoid nested guard
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            # Write the cache file in the same format claude-wrapper.sh expects
+            import json as _json
+
+            uid = os.getuid()
+            cache_file = f"/tmp/claude-auth-cache-{uid}.json"
+            now = int(time.time())
+            cache_data = {
+                "time": now,
+                "exit_code": 0,
+                "output": result.stdout.strip(),
+            }
+            with open(cache_file, "w") as f:
+                _json.dump(cache_data, f)
+            log_success("Auth cache pre-warmed successfully")
+        else:
+            log_warning(
+                f"Auth cache pre-warm: claude auth status returned "
+                f"exit code {result.returncode}"
+            )
+    except subprocess.TimeoutExpired:
+        log_warning("Auth cache pre-warm: timed out after 15s (non-fatal)")
+    except Exception as e:
+        log_warning(f"Auth cache pre-warm failed (non-fatal): {e}")
 
 
 def _print_header(ctx: DaemonContext) -> None:
