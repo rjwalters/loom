@@ -32,7 +32,7 @@ pub fn wrap_loom_content(content: &str) -> String {
 /// - Fresh install: Copies all files from defaults
 /// - Reinstall without force (merge mode): Adds new files, preserves ALL existing files
 /// - Reinstall with force (force-merge mode): Updates default files, preserves custom files
-/// - Template variables: Substitutes variables in CLAUDE.md and workflow files
+/// - Template variables: Substitutes variables in CLAUDE.md
 ///   - `{{REPO_OWNER}}`, `{{REPO_NAME}}`: Repository info from git remote
 ///   - `{{LOOM_VERSION}}`, `{{LOOM_COMMIT}}`, `{{INSTALL_DATE}}`: Loom installation metadata
 ///
@@ -227,26 +227,9 @@ pub fn setup_repository_scaffolding(
         report,
     )?;
 
-    // Process workflow files with template variable substitution
-    let workflow_file = workspace_path
-        .join(".github")
-        .join("workflows")
-        .join("label-external-issues.yml");
-
-    if workflow_file.exists() {
-        let content = fs::read_to_string(&workflow_file)
-            .map_err(|e| format!("Failed to read workflow file: {e}"))?;
-
-        let substituted = substitute_template_variables(
-            &content,
-            repo_owner.as_deref(),
-            repo_name.as_deref(),
-            &loom_metadata,
-        );
-
-        fs::write(&workflow_file, substituted)
-            .map_err(|e| format!("Failed to write workflow file: {e}"))?;
-    }
+    // Note: The label-external-issues.yml workflow is no longer installed by default.
+    // It generated spammy "No jobs were run" emails in single-contributor repos.
+    // The workflow is available in defaults/optional/github-workflows/ for manual installation.
 
     // Note: scripts/ is now copied earlier in initialize_workspace()
     // to .loom/scripts/ along with other .loom-specific files
