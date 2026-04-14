@@ -21,6 +21,7 @@ Detailed configuration and state management for the Loom daemon (Layer 2).
 | `DOCTOR_INTERVAL` | 300 | Seconds between Doctor role re-triggers (5 min) |
 | `AUDITOR_INTERVAL` | 600 | Seconds between Auditor role re-triggers (10 min) |
 | `JUDGE_INTERVAL` | 300 | Seconds between Judge role re-triggers (5 min) |
+| `SPAWN_STAGGER` | 3 | Seconds between shepherd spawns to avoid auth cache contention |
 
 ## Work Generation
 
