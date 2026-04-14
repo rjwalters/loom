@@ -338,10 +338,14 @@ def collect_pipeline_data(
     # Run usage check separately (it's a script, not a gh query)
     usage = _collect_usage(repo_root)
 
-    # Run CI health check if enabled
+    # Run CI health check if enabled and CI workflows exist
     ci_status: dict[str, Any] = {"status": "unknown", "message": "CI health check disabled"}
     if ci_health_check_enabled:
-        ci_status = gh_get_default_branch_ci_status()
+        workflows_dir = repo_root / ".github" / "workflows"
+        if workflows_dir.is_dir() and any(workflows_dir.iterdir()):
+            ci_status = gh_get_default_branch_ci_status()
+        else:
+            ci_status = {"status": "no_ci", "message": "No CI workflows configured (.github/workflows/ not found)"}
 
     return {
         "ready_issues": results[0],
@@ -1421,6 +1425,7 @@ def compute_health(
         })
 
     # ci_failing - CI is broken on the default branch
+    # Skip when status is "no_ci" (no workflows configured) to avoid false warnings
     if ci_status and ci_status.get("status") == "failing":
         failed_runs = ci_status.get("failed_runs", [])
         warnings.append({
@@ -1891,7 +1896,7 @@ ENVIRONMENT VARIABLES:
     LOOM_SYSTEMATIC_FAILURE_THRESHOLD  Consecutive failures to suppress (default: 3)
     LOOM_SYSTEMATIC_FAILURE_COOLDOWN   Seconds before first probe attempt (default: 1800)
     LOOM_SYSTEMATIC_FAILURE_MAX_PROBES Maximum probe attempts (default: 3)
-    LOOM_CI_HEALTH_CHECK               Enable CI status monitoring (default: true)
+    LOOM_CI_HEALTH_CHECK               Enable CI status monitoring (default: true, auto-disabled when no .github/workflows/ found)
 """
 
 

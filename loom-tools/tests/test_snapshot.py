@@ -29,6 +29,7 @@ from loom_tools.snapshot import (
     TmuxPool,
     _CURATED_SKIP_LABELS,
     build_snapshot,
+    collect_pipeline_data,
     compute_health,
     compute_pipeline_health,
     compute_recommended_actions,
@@ -1256,6 +1257,66 @@ class TestPipelineHealthTieredPolicy:
 
 
 # ---------------------------------------------------------------------------
+# CI auto-detection in collect_pipeline_data
+# ---------------------------------------------------------------------------
+
+
+class TestCollectPipelineDataCiAutoDetect:
+    """Tests for CI auto-detection in collect_pipeline_data."""
+
+    def test_no_workflows_dir_returns_no_ci(self, tmp_path: pathlib.Path) -> None:
+        """When .github/workflows/ doesn't exist, ci_status should be no_ci."""
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        # No .github/workflows/ directory at all
+        with mock.patch("loom_tools.snapshot.gh_parallel_queries") as mock_queries, \
+             mock.patch("loom_tools.snapshot._collect_usage", return_value={}):
+            mock_queries.return_value = [[] for _ in range(10)]
+            result = collect_pipeline_data(repo, ci_health_check_enabled=True)
+        assert result["ci_status"]["status"] == "no_ci"
+        assert "not found" in result["ci_status"]["message"]
+
+    def test_empty_workflows_dir_returns_no_ci(self, tmp_path: pathlib.Path) -> None:
+        """When .github/workflows/ exists but is empty, ci_status should be no_ci."""
+        repo = tmp_path / "repo"
+        (repo / ".github" / "workflows").mkdir(parents=True)
+        with mock.patch("loom_tools.snapshot.gh_parallel_queries") as mock_queries, \
+             mock.patch("loom_tools.snapshot._collect_usage", return_value={}):
+            mock_queries.return_value = [[] for _ in range(10)]
+            result = collect_pipeline_data(repo, ci_health_check_enabled=True)
+        assert result["ci_status"]["status"] == "no_ci"
+
+    def test_workflows_present_calls_gh(self, tmp_path: pathlib.Path) -> None:
+        """When .github/workflows/ has files, gh_get_default_branch_ci_status is called."""
+        repo = tmp_path / "repo"
+        wf_dir = repo / ".github" / "workflows"
+        wf_dir.mkdir(parents=True)
+        (wf_dir / "ci.yml").write_text("name: CI\n")
+        with mock.patch("loom_tools.snapshot.gh_parallel_queries") as mock_queries, \
+             mock.patch("loom_tools.snapshot._collect_usage", return_value={}), \
+             mock.patch("loom_tools.snapshot.gh_get_default_branch_ci_status") as mock_ci:
+            mock_queries.return_value = [[] for _ in range(10)]
+            mock_ci.return_value = {"status": "passing", "failed_runs": [], "total_runs": 1, "message": "CI passing"}
+            result = collect_pipeline_data(repo, ci_health_check_enabled=True)
+        mock_ci.assert_called_once()
+        assert result["ci_status"]["status"] == "passing"
+
+    def test_ci_disabled_skips_detection(self, tmp_path: pathlib.Path) -> None:
+        """When ci_health_check_enabled=False, skip detection entirely."""
+        repo = tmp_path / "repo"
+        wf_dir = repo / ".github" / "workflows"
+        wf_dir.mkdir(parents=True)
+        (wf_dir / "ci.yml").write_text("name: CI\n")
+        with mock.patch("loom_tools.snapshot.gh_parallel_queries") as mock_queries, \
+             mock.patch("loom_tools.snapshot._collect_usage", return_value={}), \
+             mock.patch("loom_tools.snapshot.gh_get_default_branch_ci_status") as mock_ci:
+            mock_queries.return_value = [[] for _ in range(10)]
+            result = collect_pipeline_data(repo, ci_health_check_enabled=False)
+        mock_ci.assert_not_called()
+        assert result["ci_status"]["status"] == "unknown"
+
+
+# ---------------------------------------------------------------------------
 # Health warnings
 # ---------------------------------------------------------------------------
 
@@ -1393,6 +1454,29 @@ class TestHealth:
         )
         assert status == "healthy"
         assert not any(w["code"] == "ci_failing" for w in warnings)
+
+    def test_ci_no_ci_status_healthy(self) -> None:
+        """no_ci status (no workflows configured) does not generate a warning."""
+        status, warnings = compute_health(
+            ready_count=1, building_count=0, blocked_count=0,
+            total_proposals=0, stale_heartbeat_count=0, orphaned_count=0,
+            usage_healthy=True, session_percent=50.0,
+            ci_status={"status": "no_ci", "message": "No CI workflows configured"},
+        )
+        assert status == "healthy"
+        assert not any(w["code"] == "ci_failing" for w in warnings)
+
+    def test_ci_no_ci_does_not_degrade_health(self) -> None:
+        """Repos without CI should stay healthy, not degraded."""
+        status, warnings = compute_health(
+            ready_count=0, building_count=0, blocked_count=0,
+            total_proposals=0, stale_heartbeat_count=0, orphaned_count=0,
+            usage_healthy=True, session_percent=50.0,
+            ci_status={"status": "no_ci", "message": "No CI workflows configured"},
+        )
+        # The only warning should be no_work_available (info), not ci_failing
+        ci_warns = [w for w in warnings if w["code"] == "ci_failing"]
+        assert len(ci_warns) == 0
 
 
 # ---------------------------------------------------------------------------
