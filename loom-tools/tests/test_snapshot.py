@@ -2207,3 +2207,146 @@ class TestCuratedSkipLabels:
             if not any(lbl["name"] in _CURATED_SKIP_LABELS for lbl in item.get("labels", []))
         ]
         assert [i["number"] for i in uncurated] == [2]
+
+
+# ---------------------------------------------------------------------------
+# Merge-conflicted approved PRs (issue #3104)
+# ---------------------------------------------------------------------------
+
+
+class TestDetectOrphanedPRs:
+    """Tests for detect_orphaned_prs including merge-conflicted approved PRs."""
+
+    def test_review_requested_orphaned(self) -> None:
+        """Review-requested PRs without a shepherd are orphaned (needs judge)."""
+        ds = DaemonState()
+        orphaned = detect_orphaned_prs(ds, [{"number": 10}], [])
+        assert len(orphaned) == 1
+        assert orphaned[0].pr_number == 10
+        assert orphaned[0].needed_role == "judge"
+
+    def test_changes_requested_orphaned(self) -> None:
+        """Changes-requested PRs without a shepherd are orphaned (needs doctor)."""
+        ds = DaemonState()
+        orphaned = detect_orphaned_prs(ds, [], [{"number": 20}])
+        assert len(orphaned) == 1
+        assert orphaned[0].pr_number == 20
+        assert orphaned[0].needed_role == "doctor"
+
+    def test_merge_conflicted_approved_pr_orphaned(self) -> None:
+        """Approved PRs with merge conflicts are orphaned (needs doctor)."""
+        ds = DaemonState()
+        merge_conflicted = [
+            {"number": 36, "labels": [{"name": "loom:pr"}, {"name": "loom:merge-conflict"}]}
+        ]
+        orphaned = detect_orphaned_prs(ds, [], [], merge_conflicted)
+        assert len(orphaned) == 1
+        assert orphaned[0].pr_number == 36
+        assert orphaned[0].needed_role == "doctor"
+
+    def test_merge_conflicted_tracked_by_shepherd_not_orphaned(self) -> None:
+        """Approved PRs with merge conflicts tracked by a shepherd are not orphaned."""
+        ds = DaemonState(shepherds={
+            "s-1": ShepherdEntry(status="working", pr_number=36),
+        })
+        merge_conflicted = [
+            {"number": 36, "labels": [{"name": "loom:pr"}, {"name": "loom:merge-conflict"}]}
+        ]
+        orphaned = detect_orphaned_prs(ds, [], [], merge_conflicted)
+        assert len(orphaned) == 0
+
+    def test_merge_conflicted_none_parameter(self) -> None:
+        """When merge_conflicted is None, no error occurs."""
+        ds = DaemonState()
+        orphaned = detect_orphaned_prs(ds, [], [], None)
+        assert len(orphaned) == 0
+
+    def test_merge_conflicted_default_parameter(self) -> None:
+        """When merge_conflicted is not passed, no error occurs (backward compat)."""
+        ds = DaemonState()
+        orphaned = detect_orphaned_prs(ds, [], [])
+        assert len(orphaned) == 0
+
+    def test_mixed_orphans_sorted_by_pr_number(self) -> None:
+        """Orphans from all three sources are sorted by PR number ascending."""
+        ds = DaemonState()
+        review_req = [{"number": 50}]
+        changes_req = [{"number": 30}]
+        merge_conf = [{"number": 10}]
+        orphaned = detect_orphaned_prs(ds, review_req, changes_req, merge_conf)
+        assert len(orphaned) == 3
+        assert [o.pr_number for o in orphaned] == [10, 30, 50]
+        assert orphaned[0].needed_role == "doctor"   # merge-conflict
+        assert orphaned[1].needed_role == "doctor"   # changes-requested
+        assert orphaned[2].needed_role == "judge"    # review-requested
+
+
+class TestMergeConflictDoctorDemand:
+    """Tests for doctor demand triggered by merge-conflicted approved PRs."""
+
+    def _base_kwargs(self) -> dict:
+        return {
+            "ready_count": 0,
+            "building_count": 0,
+            "blocked_count": 0,
+            "total_proposals": 0,
+            "architect_count": 0,
+            "hermit_count": 0,
+            "review_count": 0,
+            "changes_count": 0,
+            "merge_count": 0,
+            "available_shepherd_slots": 3,
+            "needs_work_generation": False,
+            "architect_cooldown_ok": True,
+            "hermit_cooldown_ok": True,
+            "support_roles": {r: SupportRoleState() for r in
+                              ("guide", "champion", "doctor", "auditor", "judge", "architect", "hermit", "curator")},
+            "orphaned_count": 0,
+            "invalid_task_id_count": 0,
+        }
+
+    def test_merge_conflicts_trigger_doctor_demand(self) -> None:
+        """merge_conflict_count > 0 should trigger spawn_doctor_demand."""
+        kw = self._base_kwargs()
+        kw["merge_conflict_count"] = 1
+        actions, demand = compute_recommended_actions(**kw)
+        assert "spawn_doctor_demand" in actions
+        assert demand["doctor_demand"] is True
+
+    def test_merge_conflicts_with_targeted_orphan(self) -> None:
+        """Merge-conflict orphan should trigger spawn_doctor_targeted."""
+        kw = self._base_kwargs()
+        kw["merge_conflict_count"] = 1
+        kw["orphaned_prs"] = [OrphanedPR(pr_number=36, needed_role="doctor")]
+        actions, demand = compute_recommended_actions(**kw)
+        assert "spawn_doctor_targeted" in actions
+        assert demand["doctor_targeted_prs"] == [36]
+        assert demand["doctor_demand"] is True
+
+    def test_no_merge_conflicts_no_extra_doctor_demand(self) -> None:
+        """When changes_count=0 and merge_conflict_count=0, no doctor demand."""
+        kw = self._base_kwargs()
+        actions, demand = compute_recommended_actions(**kw)
+        assert "spawn_doctor_demand" not in actions
+        assert "spawn_doctor_targeted" not in actions
+        assert demand["doctor_demand"] is False
+
+    def test_both_changes_and_merge_conflicts(self) -> None:
+        """Both changes_count and merge_conflict_count trigger doctor demand."""
+        kw = self._base_kwargs()
+        kw["changes_count"] = 1
+        kw["merge_conflict_count"] = 1
+        actions, demand = compute_recommended_actions(**kw)
+        assert "spawn_doctor_demand" in actions
+        assert demand["doctor_demand"] is True
+
+    def test_merge_conflicts_skip_when_doctor_running(self) -> None:
+        """Doctor demand should not fire if doctor is already running."""
+        kw = self._base_kwargs()
+        kw["merge_conflict_count"] = 1
+        doctor_state = SupportRoleState()
+        doctor_state.status = "running"
+        kw["support_roles"]["doctor"] = doctor_state
+        actions, demand = compute_recommended_actions(**kw)
+        assert "spawn_doctor_demand" not in actions
+        assert "spawn_doctor_targeted" not in actions
