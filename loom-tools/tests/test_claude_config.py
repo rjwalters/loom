@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import pathlib
 import shutil
+from unittest import mock
 
 import pytest
 
@@ -529,6 +530,48 @@ class TestCleanupAgentConfigDir:
     def test_returns_false_for_nonexistent(self, mock_repo: pathlib.Path) -> None:
         assert cleanup_agent_config_dir("nonexistent", mock_repo) is False
 
+    def test_tolerates_file_vanishing_during_rmtree(
+        self, mock_repo: pathlib.Path
+    ) -> None:
+        """Cleanup must not crash when a file (e.g. .claude.json.lock)
+        vanishes between rmtree listing the directory and unlinking the
+        entry.  This is the race condition from issue #3097.
+        """
+        import sys
+
+        setup_agent_config_dir("test-agent", mock_repo)
+        config_dir = mock_repo / ".loom" / "claude-config" / "test-agent"
+
+        # Create a fake lock file that Claude Code would leave behind
+        lock_file = config_dir / ".claude.json.lock"
+        lock_file.write_text("")
+
+        # Patch shutil.rmtree to simulate the race: the first call raises
+        # FileNotFoundError for the lock file (as if it vanished mid-removal),
+        # then the retry with ignore_errors succeeds.
+        original_rmtree = shutil.rmtree
+
+        def flaky_rmtree(path, *, onerror=None, onexc=None, ignore_errors=False, **kwargs):
+            if ignore_errors:
+                # Second (belt-and-suspenders) call — let it proceed normally
+                return original_rmtree(path, ignore_errors=True)
+            # First call — simulate a file vanishing mid-walk
+            exc = FileNotFoundError(
+                2, "No such file or directory", str(lock_file)
+            )
+            if sys.version_info >= (3, 12) and onexc is not None:
+                onexc(None, str(lock_file), exc)
+                return original_rmtree(path, ignore_errors=True)
+            elif onerror is not None:
+                onerror(None, str(lock_file), (FileNotFoundError, exc, None))
+                return original_rmtree(path, ignore_errors=True)
+            return original_rmtree(path)
+
+        with mock.patch("loom_tools.common.claude_config.shutil.rmtree", side_effect=flaky_rmtree):
+            result = cleanup_agent_config_dir("test-agent", mock_repo)
+
+        assert result is True
+
 
 class TestValidateAgentConfigDir:
     """Tests for validate_agent_config_dir.
@@ -738,3 +781,18 @@ class TestCleanupAllAgentConfigDirs:
     ) -> None:
         # Base dir doesn't exist yet
         assert cleanup_all_agent_config_dirs(mock_repo) == 0
+
+    def test_tolerates_file_vanishing_during_rmtree(
+        self, mock_repo: pathlib.Path
+    ) -> None:
+        """Same race condition as issue #3097 but for bulk cleanup."""
+        setup_agent_config_dir("agent-1", mock_repo)
+        config_dir = mock_repo / ".loom" / "claude-config" / "agent-1"
+        (config_dir / ".claude.json.lock").write_text("")
+
+        # The real _rmtree_with_retry handles the error via onerror callback,
+        # so we just verify that cleanup_all does not raise when lock files
+        # are present and can potentially vanish.
+        count = cleanup_all_agent_config_dirs(mock_repo)
+        assert count == 1
+        assert not config_dir.exists()

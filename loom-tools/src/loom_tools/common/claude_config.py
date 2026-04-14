@@ -424,6 +424,46 @@ def setup_agent_config_dir(agent_name: str, repo_root: Path) -> Path:
     return config_dir
 
 
+def _rmtree_with_retry(path: Path) -> None:
+    """Remove a directory tree, tolerating files vanishing mid-removal.
+
+    Claude Code creates ephemeral lock files (e.g. ``.claude.json.lock``)
+    that may be cleaned up by a dying session between the time
+    ``shutil.rmtree`` lists the directory and when it tries to unlink
+    each entry.  This causes a ``FileNotFoundError`` that crashes the
+    daemon.  See issue #3097.
+
+    Strategy: first attempt uses ``shutil.rmtree`` with an ``onexc``
+    (Python 3.12+) or ``onerror`` callback that ignores
+    ``FileNotFoundError``.  If the directory still exists after that
+    (very unlikely edge case), a second attempt with
+    ``ignore_errors=True`` ensures we never raise.
+    """
+    import sys
+
+    def _onexc(func, fpath, exc):  # noqa: ARG001 — shutil callback signature
+        """Ignore FileNotFoundError; re-raise anything else (onexc API)."""
+        if isinstance(exc, FileNotFoundError):
+            return
+        raise exc
+
+    def _onerror(func, fpath, exc_info):  # noqa: ARG001 — shutil callback signature
+        """Ignore FileNotFoundError; re-raise anything else (onerror API)."""
+        if isinstance(exc_info[1], FileNotFoundError):
+            return
+        raise exc_info[1]
+
+    if sys.version_info >= (3, 12):
+        shutil.rmtree(path, onexc=_onexc)
+    else:
+        shutil.rmtree(path, onerror=_onerror)
+
+    # Belt-and-suspenders: if something else went wrong and the dir
+    # survived, do a final sweep that silences all errors.
+    if path.is_dir():
+        shutil.rmtree(path, ignore_errors=True)
+
+
 def cleanup_agent_config_dir(agent_name: str, repo_root: Path) -> bool:
     """Remove one agent's config directory.
 
@@ -437,7 +477,7 @@ def cleanup_agent_config_dir(agent_name: str, repo_root: Path) -> bool:
     paths = LoomPaths(repo_root)
     config_dir = paths.agent_claude_config_dir(agent_name)
     if config_dir.is_dir():
-        shutil.rmtree(config_dir)
+        _rmtree_with_retry(config_dir)
         return True
     return False
 
@@ -458,6 +498,6 @@ def cleanup_all_agent_config_dirs(repo_root: Path) -> int:
     count = 0
     for child in base_dir.iterdir():
         if child.is_dir():
-            shutil.rmtree(child)
+            _rmtree_with_retry(child)
             count += 1
     return count
