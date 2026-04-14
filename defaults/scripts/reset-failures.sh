@@ -208,7 +208,7 @@ reset_all() {
     # 1. Clear issue-failures.json
     if [[ -f "$ISSUE_FAILURES" ]]; then
         cleared=$(jq '.entries | length' "$ISSUE_FAILURES" 2>/dev/null || echo "0")
-        echo '{"entries": {}, "updated_at": "'$(date -u +%Y-%m-%dT%H:%M:%SZ)'"}' > "$ISSUE_FAILURES"
+        echo '{"entries": {}, "updated_at": "'"$(date -u +%Y-%m-%dT%H:%M:%SZ)"'"}' > "$ISSUE_FAILURES"
     fi
 
     # 2. Clear daemon-state.json failure fields
@@ -291,7 +291,7 @@ fi
 
 if [[ "$ALL_MODE" == "true" ]]; then
     if [[ "$SIGNAL_MODE" == "true" ]]; then
-        send_signal '{"action": "reset_failures", "all": true, "created_at": "'$(date -u +%Y-%m-%dT%H:%M:%SZ)'"}'
+        send_signal '{"action": "reset_failures", "all": true, "created_at": "'"$(date -u +%Y-%m-%dT%H:%M:%SZ)"'"}'
     else
         reset_all
     fi
@@ -300,7 +300,7 @@ fi
 
 if [[ -n "$ISSUE_NUM" ]]; then
     if [[ "$SIGNAL_MODE" == "true" ]]; then
-        send_signal '{"action": "reset_failures", "issue": '"$ISSUE_NUM"', "created_at": "'$(date -u +%Y-%m-%dT%H:%M:%SZ)'"}'
+        send_signal '{"action": "reset_failures", "issue": '"$ISSUE_NUM"', "created_at": "'"$(date -u +%Y-%m-%dT%H:%M:%SZ)"'"}'
     else
         reset_issue "$ISSUE_NUM"
     fi
