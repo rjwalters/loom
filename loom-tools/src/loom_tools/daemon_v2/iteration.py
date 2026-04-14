@@ -11,7 +11,11 @@ from loom_tools.common.logging import log_error, log_info, log_success, log_warn
 from loom_tools.common.state import read_daemon_state, write_json_file
 from loom_tools.common.time_utils import now_utc
 from loom_tools.models.daemon_state import SystematicFailure
-from loom_tools.daemon_v2.actions.completions import check_completions, handle_completion
+from loom_tools.daemon_v2.actions.completions import (
+    CompletionEntry,
+    check_completions,
+    handle_completion,
+)
 from loom_tools.daemon_v2.actions.proposals import promote_proposals
 from loom_tools.daemon_v2.actions.retry_blocked import (
     escalate_blocked_issues,
@@ -81,9 +85,22 @@ def run_iteration(ctx: DaemonContext) -> IterationResult:
     ctx.state.iteration = ctx.iteration
 
     # 3. Check completions
-    completions = check_completions(ctx)
+    #    Each completion is handled individually so a failure in one
+    #    (e.g. missing lock file during cleanup) does not skip the rest.
+    completions: list[CompletionEntry] = []
+    try:
+        completions = check_completions(ctx)
+    except Exception as e:
+        log_warning(f"Non-critical error checking completions: {e}")
+
     for completion in completions:
-        handle_completion(ctx, completion)
+        try:
+            handle_completion(ctx, completion)
+        except Exception as e:
+            log_warning(
+                f"Non-critical error handling completion for "
+                f"{completion.name}: {e}"
+            )
 
     # Recompute active shepherd count after completions modify ctx.state
     if completions and ctx.state is not None and ctx.snapshot is not None:
@@ -99,14 +116,28 @@ def run_iteration(ctx: DaemonContext) -> IterationResult:
     #    Detects shepherds with dead tmux sessions, stale heartbeats, or
     #    missing progress files. Runs before action planning so reclaimed
     #    slots are available for new spawns.
-    _reclaim_stale_shepherds(ctx)
+    try:
+        _reclaim_stale_shepherds(ctx)
+    except Exception as e:
+        log_warning(f"Non-critical error reclaiming stale shepherds: {e}")
 
     # 4b. Detect completed support roles (tmux session exited)
     #     Support roles have no progress files — we detect completion by
     #     checking whether their tmux session is still alive.
-    support_completions = _reclaim_completed_support_roles(ctx)
+    support_completions: list[CompletionEntry] = []
+    try:
+        support_completions = _reclaim_completed_support_roles(ctx)
+    except Exception as e:
+        log_warning(f"Non-critical error reclaiming support roles: {e}")
+
     for sc in support_completions:
-        handle_completion(ctx, sc)
+        try:
+            handle_completion(ctx, sc)
+        except Exception as e:
+            log_warning(
+                f"Non-critical error handling support role completion "
+                f"for {sc.name}: {e}"
+            )
     completions.extend(support_completions)
 
     # 5. Get recommended actions

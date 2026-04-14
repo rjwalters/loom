@@ -91,6 +91,9 @@ def run(ctx: DaemonContext) -> int:
             deadline = time.time() + ctx.config.timeout_min * 60
 
         # 12. Main loop
+        consecutive_errors = 0
+        MAX_CONSECUTIVE_ERRORS = 10  # Crash only after this many in a row
+
         while ctx.running:
             ctx.iteration += 1
 
@@ -112,41 +115,62 @@ def run(ctx: DaemonContext) -> int:
                 log_warning("Yielding to other daemon instance. Exiting.")
                 break
 
-            # Poll and process IPC commands from /loom skill BEFORE iteration.
-            # The /loom skill writes spawn_shepherd/stop/etc. signals here.
-            commands = command_poller.poll()
-            if commands:
-                log_info(f"Iteration {ctx.iteration}: Processing {len(commands)} signal command(s)")
-                _process_commands(ctx, commands, command_poller)
-                # Update signal_queue_depth in state file after processing
-                _update_signal_queue_depth(ctx, command_poller.queue_depth())
+            try:
+                # Poll and process IPC commands from /loom skill BEFORE iteration.
+                # The /loom skill writes spawn_shepherd/stop/etc. signals here.
+                commands = command_poller.poll()
+                if commands:
+                    log_info(f"Iteration {ctx.iteration}: Processing {len(commands)} signal command(s)")
+                    _process_commands(ctx, commands, command_poller)
+                    # Update signal_queue_depth in state file after processing
+                    _update_signal_queue_depth(ctx, command_poller.queue_depth())
 
-            # Retry any pending spawn signals that were queued when all slots were full.
-            # Runs before each iteration so reclaimed slots are immediately reused.
-            if ctx.pending_spawns:
-                _retry_pending_spawns(ctx)
+                # Retry any pending spawn signals that were queued when all slots were full.
+                # Runs before each iteration so reclaimed slots are immediately reused.
+                if ctx.pending_spawns:
+                    _retry_pending_spawns(ctx)
 
-            # Run iteration (only when orchestration is active — activated by /loom)
-            if ctx.orchestration_active:
-                log_info(f"Iteration {ctx.iteration}: Starting...")
-                start_time = time.time()
-                result = run_iteration(ctx)
-                duration = int(time.time() - start_time)
+                # Run iteration (only when orchestration is active — activated by /loom)
+                if ctx.orchestration_active:
+                    log_info(f"Iteration {ctx.iteration}: Starting...")
+                    start_time = time.time()
+                    result = run_iteration(ctx)
+                    duration = int(time.time() - start_time)
 
-                # Log result
-                log_info(f"Iteration {ctx.iteration}: {result.summary} ({duration}s)")
+                    # Log result
+                    log_info(f"Iteration {ctx.iteration}: {result.summary} ({duration}s)")
 
-                # Update metrics
-                _update_metrics(ctx, result.status, duration, result.summary)
+                    # Update metrics
+                    _update_metrics(ctx, result.status, duration, result.summary)
 
-                # Check for shutdown in result
-                if result.status == "shutdown" or "SHUTDOWN" in result.summary:
-                    break
-            else:
-                log_info(
-                    f"Iteration {ctx.iteration}: Standby — "
-                    "waiting for /loom to activate orchestration"
+                    # Check for shutdown in result
+                    if result.status == "shutdown" or "SHUTDOWN" in result.summary:
+                        break
+                else:
+                    log_info(
+                        f"Iteration {ctx.iteration}: Standby — "
+                        "waiting for /loom to activate orchestration"
+                    )
+
+                # Successful iteration — reset error counter
+                consecutive_errors = 0
+
+            except (KeyboardInterrupt, SystemExit):
+                # These are intentional exits — always re-raise
+                raise
+            except Exception as e:
+                consecutive_errors += 1
+                log_warning(
+                    f"Iteration {ctx.iteration}: Non-critical error "
+                    f"({consecutive_errors}/{MAX_CONSECUTIVE_ERRORS}): {e}"
                 )
+                if consecutive_errors >= MAX_CONSECUTIVE_ERRORS:
+                    log_error(
+                        f"Iteration {ctx.iteration}: "
+                        f"{MAX_CONSECUTIVE_ERRORS} consecutive errors — "
+                        f"treating as fatal"
+                    )
+                    raise
 
             # Check stop signal again before sleeping
             if check_stop_signal(ctx):
@@ -198,24 +222,31 @@ def _responsive_sleep(
             ctx.running = False
             break
 
-        # Process any IPC commands that arrived during the sleep tick
-        commands = command_poller.poll()
-        if commands:
-            log_info(f"Sleep-tick: processing {len(commands)} signal command(s)")
-            _process_commands(ctx, commands, command_poller)
-            _update_signal_queue_depth(ctx, command_poller.queue_depth())
+        # Process any IPC commands that arrived during the sleep tick.
+        # Wrapped in try/except so transient errors (e.g., missing lock
+        # files, stale state) don't crash the daemon during sleep.
+        try:
+            commands = command_poller.poll()
+            if commands:
+                log_info(f"Sleep-tick: processing {len(commands)} signal command(s)")
+                _process_commands(ctx, commands, command_poller)
+                _update_signal_queue_depth(ctx, command_poller.queue_depth())
 
-        # Retry pending spawns that were queued when all slots were full.
-        # Doing this during sleep ticks means a freed slot triggers a spawn
-        # within 2s rather than waiting for the next full iteration.
-        if ctx.pending_spawns:
-            _retry_pending_spawns(ctx)
+            # Retry pending spawns that were queued when all slots were full.
+            # Doing this during sleep ticks means a freed slot triggers a spawn
+            # within 2s rather than waiting for the next full iteration.
+            if ctx.pending_spawns:
+                _retry_pending_spawns(ctx)
 
-        # Fast-path assignment: if idle shepherd slots exist and the cached
-        # snapshot shows ready issues, spawn immediately without waiting for
-        # the next full iteration. This eliminates poll_interval latency when
-        # a shepherd completes and ready issues are already queued.
-        _fast_path_assign(ctx)
+            # Fast-path assignment: if idle shepherd slots exist and the cached
+            # snapshot shows ready issues, spawn immediately without waiting for
+            # the next full iteration. This eliminates poll_interval latency when
+            # a shepherd completes and ready issues are already queued.
+            _fast_path_assign(ctx)
+        except (KeyboardInterrupt, SystemExit):
+            raise
+        except Exception as e:
+            log_warning(f"Sleep-tick: non-critical error (continuing): {e}")
 
 
 def _process_commands(
