@@ -15,6 +15,7 @@ from loom_tools.agent_spawn import (
 )
 from loom_tools.claim import claim_issue, release_claim
 from loom_tools.common.github import gh_run
+from loom_tools.daemon_v2.actions.dependencies import filter_issues_by_dependencies
 from loom_tools.common.issue_failures import (
     INFRASTRUCTURE_ERROR_CLASSES,
     get_failure_entry,
@@ -37,8 +38,31 @@ STARTUP_GRACE_PERIOD = 120  # 2 minutes
 NO_PROGRESS_GRACE_PERIOD = 300  # 5 minutes
 
 
+def _collect_open_issue_numbers(ctx: DaemonContext) -> set[int]:
+    """Collect all open issue numbers from the snapshot pipeline.
+
+    Includes issues in ready, building, and blocked states so that
+    dependency checks can determine whether a prerequisite is still open.
+    """
+    if ctx.snapshot is None:
+        return set()
+
+    pipeline = ctx.snapshot.get("pipeline", {})
+    nums: set[int] = set()
+    for key in ("ready_issues", "building_issues", "blocked_issues"):
+        for item in pipeline.get(key, []):
+            n = item.get("number")
+            if n is not None:
+                nums.add(n)
+    return nums
+
+
 def spawn_shepherds(ctx: DaemonContext) -> int:
     """Spawn shepherds for ready issues.
+
+    Filters out issues whose ``## Dependencies`` reference open issues
+    before scheduling, so shepherds are not wasted on work that cannot
+    proceed yet.
 
     Returns the number of shepherds successfully spawned.
     """
@@ -54,6 +78,14 @@ def spawn_shepherds(ctx: DaemonContext) -> int:
 
     if not ready_issues:
         log_info("No ready issues to assign")
+        return 0
+
+    # Filter out issues with unmet dependencies
+    open_issues = _collect_open_issue_numbers(ctx)
+    ready_issues = filter_issues_by_dependencies(ready_issues, open_issues)
+
+    if not ready_issues:
+        log_info("No ready issues after dependency filtering")
         return 0
 
     # Limit to available slots

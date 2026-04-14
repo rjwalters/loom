@@ -269,7 +269,7 @@ def compute_support_role_state(
 # Pipeline data collection (parallel gh queries)
 # ---------------------------------------------------------------------------
 
-_ISSUE_FIELDS = ["number", "title", "labels", "createdAt"]
+_ISSUE_FIELDS = ["number", "title", "labels", "createdAt", "body"]
 
 # Labels that indicate an issue has been processed or claimed — used to identify
 # issues that still need curator attention.
