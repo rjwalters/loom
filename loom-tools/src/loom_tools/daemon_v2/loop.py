@@ -63,23 +63,24 @@ def run(ctx: DaemonContext) -> int:
     signal.signal(signal.SIGTERM, signal_handler)
 
     try:
-        # 5. Rotate existing state file
+        # 5. Run crash recovery BEFORE rotating state, so we can read the
+        #    previous daemon state to find orphaned sessions and stale labels.
+        log_info("Running startup cleanup (crash recovery)...")
+        cleanup_config = load_config()
+        handle_daemon_startup(ctx.repo_root, cleanup_config)
+
+        # 6. Rotate existing state file (after crash recovery has read it)
         _rotate_state_file(ctx)
 
-        # 6. Initialize state and metrics files
+        # 7. Initialize state and metrics files
         _init_state_file(ctx)
         _init_metrics_file(ctx)
 
-        # 7. Clear any existing stop signal
+        # 8. Clear any existing stop signal
         clear_stop_signal(ctx)
 
-        # 8. Print startup header
+        # 9. Print startup header
         _print_header(ctx)
-
-        # 9. Run startup cleanup
-        log_info("Running startup cleanup...")
-        cleanup_config = load_config()
-        handle_daemon_startup(ctx.repo_root, cleanup_config)
 
         # 10. Initialize CommandPoller for signal-based IPC with /loom skill
         command_poller = CommandPoller(ctx.repo_root)
@@ -168,6 +169,16 @@ def run(ctx: DaemonContext) -> int:
 
     except Exception as e:
         log_error(f"Daemon error: {e}")
+
+        # Run crash cleanup: release labels and kill tmux sessions so the
+        # system doesn't appear busy when it is actually dead.
+        try:
+            log_warning("Running crash cleanup...")
+            crash_config = load_config()
+            handle_daemon_shutdown(ctx.repo_root, crash_config)
+        except Exception as cleanup_err:
+            log_error(f"Crash cleanup also failed: {cleanup_err}")
+
         return DaemonExitCode.ERROR
 
     finally:

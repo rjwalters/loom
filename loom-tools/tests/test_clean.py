@@ -16,6 +16,7 @@ from loom_tools.clean import (
     check_grace_period,
     check_uncommitted_changes,
     clean_agent_config,
+    clean_daemon_crash_state,
     find_editable_pip_installs,
     main,
     print_summary,
@@ -584,4 +585,115 @@ class TestDocumentedDivergences:
         The implementations are equivalent but use different I/O mechanisms.
         """
         pass  # Behavior is equivalent
+
+
+class TestCleanDaemonCrashState:
+    """Tests for clean_daemon_crash_state (--daemon flag, issue #3099)."""
+
+    def test_cleans_claims_dir(self, mock_repo: pathlib.Path) -> None:
+        """Should remove all claim files."""
+        claims_dir = mock_repo / ".loom" / "claims"
+        claims_dir.mkdir(parents=True)
+        (claims_dir / "42.json").write_text('{"issue": 42}')
+        (claims_dir / "43.json").write_text('{"issue": 43}')
+
+        with patch("loom_tools.clean._list_loom_tmux_sessions", return_value=[]), \
+             patch("loom_tools.daemon_cleanup._terminate_active_sessions"), \
+             patch("loom_tools.daemon_cleanup._revert_shepherd_labels"):
+            clean_daemon_crash_state(mock_repo)
+
+        assert not list(claims_dir.glob("*.json"))
+
+    def test_cleans_progress_dir(self, mock_repo: pathlib.Path) -> None:
+        """Should remove all progress files."""
+        progress_dir = mock_repo / ".loom" / "progress"
+        progress_dir.mkdir(parents=True)
+        (progress_dir / "shepherd-abc.json").write_text('{"task_id": "abc"}')
+
+        with patch("loom_tools.clean._list_loom_tmux_sessions", return_value=[]), \
+             patch("loom_tools.daemon_cleanup._terminate_active_sessions"), \
+             patch("loom_tools.daemon_cleanup._revert_shepherd_labels"):
+            clean_daemon_crash_state(mock_repo)
+
+        assert not list(progress_dir.glob("*.json"))
+
+    def test_resets_issue_failures(self, mock_repo: pathlib.Path) -> None:
+        """Should reset issue-failures.json to empty entries."""
+        failures_file = mock_repo / ".loom" / "issue-failures.json"
+        failures_file.write_text('{"entries": {"42": {"count": 3}}}')
+
+        with patch("loom_tools.clean._list_loom_tmux_sessions", return_value=[]), \
+             patch("loom_tools.daemon_cleanup._terminate_active_sessions"), \
+             patch("loom_tools.daemon_cleanup._revert_shepherd_labels"):
+            clean_daemon_crash_state(mock_repo)
+
+        data = json.loads(failures_file.read_text())
+        assert data == {"entries": {}}
+
+    def test_finalizes_daemon_state(self, mock_repo: pathlib.Path) -> None:
+        """Should mark daemon state as not running and reset shepherds."""
+        state_path = mock_repo / ".loom" / "daemon-state.json"
+        state_path.write_text(json.dumps({
+            "running": True,
+            "shepherds": {
+                "shepherd-1": {"status": "working", "issue": 42, "task_id": "abc"},
+            },
+        }))
+
+        with patch("loom_tools.clean._list_loom_tmux_sessions", return_value=[]), \
+             patch("loom_tools.daemon_cleanup._terminate_active_sessions"), \
+             patch("loom_tools.daemon_cleanup._revert_shepherd_labels"):
+            clean_daemon_crash_state(mock_repo)
+
+        data = json.loads(state_path.read_text())
+        assert data["running"] is False
+        assert data["shepherds"]["shepherd-1"]["status"] == "idle"
+        assert data["shepherds"]["shepherd-1"]["issue"] is None
+        assert data["shepherds"]["shepherd-1"]["task_id"] is None
+
+    def test_dry_run_preserves_files(self, mock_repo: pathlib.Path) -> None:
+        """Dry run should not modify any files."""
+        claims_dir = mock_repo / ".loom" / "claims"
+        claims_dir.mkdir(parents=True)
+        claim_file = claims_dir / "42.json"
+        claim_file.write_text('{"issue": 42}')
+
+        progress_dir = mock_repo / ".loom" / "progress"
+        progress_dir.mkdir(parents=True)
+        progress_file = progress_dir / "shepherd-abc.json"
+        progress_file.write_text('{"task_id": "abc"}')
+
+        failures_file = mock_repo / ".loom" / "issue-failures.json"
+        failures_file.write_text('{"entries": {"42": {"count": 3}}}')
+
+        with patch("loom_tools.clean._list_loom_tmux_sessions", return_value=[]), \
+             patch("loom_tools.daemon_cleanup._terminate_active_sessions"), \
+             patch("loom_tools.daemon_cleanup._revert_shepherd_labels"):
+            clean_daemon_crash_state(mock_repo, dry_run=True)
+
+        assert claim_file.exists()
+        assert progress_file.exists()
+        assert json.loads(failures_file.read_text())["entries"]["42"]["count"] == 3
+
+
+class TestMainDaemonFlag:
+    """Tests for the --daemon CLI flag."""
+
+    def test_daemon_flag_runs_crash_recovery(self, mock_repo: pathlib.Path) -> None:
+        """--daemon should call clean_daemon_crash_state."""
+        with patch("loom_tools.clean.find_repo_root", return_value=mock_repo), \
+             patch("loom_tools.clean.clean_daemon_crash_state") as m_clean:
+            result = main(["--daemon"])
+
+        m_clean.assert_called_once_with(mock_repo, dry_run=False)
+        assert result == 0
+
+    def test_daemon_dry_run(self, mock_repo: pathlib.Path) -> None:
+        """--daemon --dry-run should pass dry_run=True."""
+        with patch("loom_tools.clean.find_repo_root", return_value=mock_repo), \
+             patch("loom_tools.clean.clean_daemon_crash_state") as m_clean:
+            result = main(["--daemon", "--dry-run"])
+
+        m_clean.assert_called_once_with(mock_repo, dry_run=True)
+        assert result == 0
 

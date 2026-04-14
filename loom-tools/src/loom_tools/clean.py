@@ -602,59 +602,159 @@ def clean_branches(
             stats.kept_branches += 1
 
 
+def _list_loom_tmux_sessions() -> list[str]:
+    """List all tmux sessions on the loom socket.
+
+    Returns session names (e.g. ``["loom-shepherd-1", "loom-champion"]``).
+    """
+    try:
+        result = subprocess.run(
+            ["tmux", "-L", "loom", "list-sessions", "-F", "#{session_name}"],
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode != 0:
+            return []
+        return [s.strip() for s in result.stdout.strip().split("\n") if s.strip()]
+    except (FileNotFoundError, Exception):
+        return []
+
+
 def clean_tmux_sessions(
     stats: CleanupStats,
     dry_run: bool = False,
 ) -> None:
-    """Clean up Loom tmux sessions."""
-    try:
-        result = subprocess.run(
-            ["tmux", "list-sessions"],
-            capture_output=True,
-            text=True,
-        )
+    """Clean up Loom tmux sessions on the loom socket."""
+    sessions = _list_loom_tmux_sessions()
 
-        if result.returncode != 0:
-            log_success("No Loom tmux sessions found")
-            return
-
-        sessions = []
-        for line in result.stdout.strip().split("\n"):
-            if line.startswith("loom-"):
-                session = line.split(":")[0]
-                sessions.append(session)
-
-        if not sessions:
-            log_success("No Loom tmux sessions found")
-            return
-
-        print("Found Loom tmux sessions:")
-        for session in sessions:
-            print(f"  - {session}")
-        print()
-
-        if dry_run:
-            log_info("Would kill these sessions")
-            stats.killed_tmux = len(sessions)
-        else:
-            for session in sessions:
-                try:
-                    subprocess.run(
-                        ["tmux", "kill-session", "-t", session],
-                        capture_output=True,
-                        text=True,
-                        check=True,
-                    )
-                    log_success(f"Killed: {session}")
-                    stats.killed_tmux += 1
-                except Exception:
-                    pass
-
-    except FileNotFoundError:
-        # tmux not installed
-        log_success("No Loom tmux sessions found (tmux not available)")
-    except Exception:
+    if not sessions:
         log_success("No Loom tmux sessions found")
+        return
+
+    print("Found Loom tmux sessions:")
+    for session in sessions:
+        print(f"  - {session}")
+    print()
+
+    if dry_run:
+        log_info("Would kill these sessions")
+        stats.killed_tmux = len(sessions)
+    else:
+        for session in sessions:
+            try:
+                subprocess.run(
+                    ["tmux", "-L", "loom", "kill-session", "-t", session],
+                    capture_output=True,
+                    text=True,
+                    check=True,
+                )
+                log_success(f"Killed: {session}")
+                stats.killed_tmux += 1
+            except Exception:
+                pass
+
+
+def clean_daemon_crash_state(
+    repo_root: pathlib.Path,
+    dry_run: bool = False,
+) -> None:
+    """Full daemon crash recovery: kill sessions, revert labels, clear state.
+
+    This is the one-shot manual cleanup invoked by ``loom-clean --daemon``
+    that performs everything the issue #3099 manual steps describe:
+
+    1. Kill all orphaned tmux sessions on the loom socket
+    2. Revert stale ``loom:building`` labels to ``loom:issue``
+    3. Clear stale claim files, progress files, and issue-failures.json
+    """
+    from loom_tools.daemon_cleanup import (
+        _revert_shepherd_labels,
+        _terminate_active_sessions,
+    )
+
+    state_path = repo_root / ".loom" / "daemon-state.json"
+
+    # 1. Kill all loom tmux sessions
+    print("Step 1: Kill orphaned tmux sessions")
+    stats = CleanupStats()
+    clean_tmux_sessions(stats, dry_run=dry_run)
+    print()
+
+    # 2. Terminate tracked sessions from daemon state and revert labels
+    print("Step 2: Terminate tracked sessions and revert stale labels")
+    _terminate_active_sessions(state_path, dry_run=dry_run)
+    _revert_shepherd_labels(state_path, dry_run=dry_run)
+    print()
+
+    # 3. Clear stale claim files
+    print("Step 3: Clear stale claims")
+    claims_dir = repo_root / ".loom" / "claims"
+    if claims_dir.is_dir():
+        claim_files = list(claims_dir.glob("*.json"))
+        if claim_files:
+            for claim_file in claim_files:
+                if dry_run:
+                    log_info(f"Would remove: {claim_file.name}")
+                else:
+                    claim_file.unlink(missing_ok=True)
+                    log_info(f"Removed: {claim_file.name}")
+        else:
+            log_success("No stale claim files")
+    else:
+        log_success("No claims directory")
+    print()
+
+    # 4. Clear stale progress files
+    print("Step 4: Clear stale progress files")
+    progress_dir = repo_root / ".loom" / "progress"
+    if progress_dir.is_dir():
+        progress_files = list(progress_dir.glob("*.json"))
+        if progress_files:
+            for pf in progress_files:
+                if dry_run:
+                    log_info(f"Would remove: {pf.name}")
+                else:
+                    pf.unlink(missing_ok=True)
+                    log_info(f"Removed: {pf.name}")
+        else:
+            log_success("No stale progress files")
+    else:
+        log_success("No progress directory")
+    print()
+
+    # 5. Reset issue-failures.json
+    print("Step 5: Reset issue-failures.json")
+    failures_file = repo_root / ".loom" / "issue-failures.json"
+    if failures_file.exists():
+        if dry_run:
+            log_info("Would reset: issue-failures.json")
+        else:
+            write_json_file(failures_file, {"entries": {}})
+            log_success("Reset issue-failures.json")
+    else:
+        log_success("No issue-failures.json to reset")
+    print()
+
+    # 6. Mark daemon state as not running
+    print("Step 6: Finalize daemon state")
+    if state_path.exists() and not dry_run:
+        data = read_json_file(state_path)
+        if isinstance(data, dict):
+            data["running"] = False
+            # Reset all shepherds to idle
+            shepherds = data.get("shepherds", {})
+            if isinstance(shepherds, dict):
+                for entry in shepherds.values():
+                    if isinstance(entry, dict):
+                        entry["status"] = "idle"
+                        entry["issue"] = None
+                        entry["task_id"] = None
+            write_json_file(state_path, data)
+            log_success("Daemon state finalized (running=false, shepherds reset)")
+    elif dry_run:
+        log_info("Would finalize daemon state")
+    else:
+        log_success("No daemon state to finalize")
 
 
 def clean_agent_config(
@@ -815,12 +915,20 @@ Safe mode (--safe):
   - Applies grace period after merge to avoid race conditions
   - Tracks cleanup state in daemon-state.json
 
+Daemon crash cleanup (--daemon):
+  - Kill all orphaned tmux sessions on the loom socket
+  - Revert stale loom:building labels to loom:issue
+  - Clear claims, progress files, and issue-failures.json
+  - Finalize daemon state (running=false, shepherds=idle)
+
 Examples:
   loom-clean                      # Interactive standard cleanup
   loom-clean --force              # Non-interactive cleanup (CI/automation)
   loom-clean --deep               # Include build artifacts
   loom-clean --safe               # Safe mode (MERGED PRs only)
   loom-clean --safe --force       # Safe mode, non-interactive
+  loom-clean --daemon             # Full daemon crash recovery
+  loom-clean --daemon --dry-run   # Preview daemon crash recovery
   loom-clean --worktrees-only     # Just worktrees
   loom-clean --branches-only      # Just branches
 """,
@@ -877,6 +985,11 @@ Examples:
         dest="tmux_only",
         help="Only clean tmux sessions (skip worktrees and branches)",
     )
+    parser.add_argument(
+        "--daemon",
+        action="store_true",
+        help="Daemon crash recovery: kill sessions, revert labels, clear state",
+    )
 
     args = parser.parse_args(argv)
 
@@ -885,6 +998,23 @@ Examples:
     except FileNotFoundError:
         log_error("Not in a git repository with .loom directory")
         return 1
+
+    # --daemon: full daemon crash recovery (separate workflow)
+    if args.daemon:
+        print()
+        print("========================================")
+        print("  Loom Daemon Crash Recovery")
+        if args.dry_run:
+            print("  (DRY RUN MODE)")
+        print("========================================")
+        print()
+        clean_daemon_crash_state(repo_root, dry_run=args.dry_run)
+        if args.dry_run:
+            log_warning("Dry run complete - no changes made")
+        else:
+            log_success("Daemon crash recovery complete!")
+        print()
+        return 0
 
     # Show banner
     print()
