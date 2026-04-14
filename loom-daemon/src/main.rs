@@ -376,7 +376,7 @@ fn handle_cli_command(command: Commands) -> Result<()> {
                     println!("  CLAUDE.md       - AI context documentation");
                     println!("  .claude/        - Claude Code configuration");
                     println!("  .codex/         - Codex configuration");
-                    println!("  .github/        - GitHub workflow templates");
+                    println!("  .github/        - GitHub labels and issue templates");
                     println!("  .gitignore      - Updated with Loom patterns");
 
                     if !report.added.is_empty()

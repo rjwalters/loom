@@ -9,8 +9,7 @@ This directory contains default configuration files and templates for Loom works
 - `CLAUDE.md` - AI development context template (copied to workspace root)
 - `.claude/` - Claude Code configuration template (copied to workspace root)
 - `.codex/` - Codex configuration template (copied to workspace root)
-- `.github/` - GitHub workflow and issue templates (copied to workspace root)
-  - `workflows/label-external-issues.yml` - Auto-label external contributions
+- `.github/` - GitHub labels and issue templates (copied to workspace root)
   - `ISSUE_TEMPLATE/task.yml` - Development task template
   - `ISSUE_TEMPLATE/config.yml` - Issue template configuration
 - `.loom-README.md` - README template for `.loom/` directory
@@ -42,7 +41,7 @@ loom-daemon init --defaults /path/to/custom-defaults /path/to/repo
 3. Copies scaffolding files to workspace root:
    - `CLAUDE.md` - AI development context
    - `.claude/` - Claude Code configuration
-   - `.github/` - GitHub labels and workflows
+   - `.github/` - GitHub labels and issue templates
 4. Updates `.gitignore` with Loom ephemeral patterns
 
 **Default Resolution** (when using `--defaults`):
@@ -80,11 +79,10 @@ During workspace initialization, Loom automatically copies scaffolding files to 
 - `.claude/` → `<workspace>/.claude/`
 - `.codex/` → `<workspace>/.codex/`
 - `.github/` → `<workspace>/.github/`
-  - `workflows/label-external-issues.yml` - Auto-labels external issues
   - `ISSUE_TEMPLATE/task.yml` - Development task template
   - `ISSUE_TEMPLATE/config.yml` - Template configuration
 
-This ensures every Loom-enabled repository has consistent AI context, configuration files, and GitHub workflow automation that can be committed to version control.
+This ensures every Loom-enabled repository has consistent AI context, configuration files, and GitHub issue templates that can be committed to version control.
 
 **When scaffolding runs:**
 - Initial workspace setup (`initialize_loom_workspace`)

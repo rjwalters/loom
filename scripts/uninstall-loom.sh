@@ -931,7 +931,7 @@ Removes Loom configuration, roles, scripts, and tooling:
 - .loom/ directory (configuration, roles, scripts)
 - .claude/ slash commands and agent definitions
 - .codex/ configuration
-- .github/ Loom-specific labels and workflows
+- .github/ Loom-specific labels and issue templates
 - CLAUDE.md documentation
 - .gitignore Loom patterns
 - Runtime artifacts (state files, logs)"
