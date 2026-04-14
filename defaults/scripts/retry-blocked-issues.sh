@@ -218,6 +218,17 @@ $(if [[ $new_retry_count -ge $MAX_RETRY_COUNT ]]; then echo "**Warning**: This i
 ---
 *Automated by Loom daemon retry system*" >/dev/null 2>&1
 
+        # Clear persistent failure log entry so daemon doesn't re-block on startup
+        ISSUE_FAILURES_FILE="$REPO_ROOT/.loom/issue-failures.json"
+        if [[ -f "$ISSUE_FAILURES_FILE" ]]; then
+            temp_file=$(mktemp)
+            if jq --arg key "$issue_num" 'del(.entries[$key])' "$ISSUE_FAILURES_FILE" > "$temp_file" 2>/dev/null; then
+                mv "$temp_file" "$ISSUE_FAILURES_FILE"
+            else
+                rm -f "$temp_file"
+            fi
+        fi
+
         # Update retry metadata in daemon-state.json
         if [[ -f "$DAEMON_STATE_FILE" ]]; then
             local_retry_exhausted="false"

@@ -42,6 +42,8 @@ Available actions:
 +----------------------+---------------------------------------+
 | set_max_shepherds    | count (int)                           |
 +----------------------+---------------------------------------+
+| reset_failures       | issue (int) OR all (bool)             |
++----------------------+---------------------------------------+
 
 Note: ``start_orchestration`` must be sent by the /loom skill before the
 daemon will run its autonomous iteration loop. Until received, the daemon
