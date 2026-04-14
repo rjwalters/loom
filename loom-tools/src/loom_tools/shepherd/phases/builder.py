@@ -533,60 +533,77 @@ class BuilderPhase:
         if ctx.worktree_path and ctx.worktree_path.is_dir():
             prior_commits = self._count_commits_ahead_of_main(ctx.worktree_path)
             if prior_commits > 0:
-                log_info(
-                    f"Prior work found ({prior_commits} commit(s) since main). "
-                    f"Resuming from checkpoint — skipping builder invocation."
+                # Guard: check if the feature branch already has a closed/merged
+                # PR — this means a previous attempt was rejected and we should
+                # NOT resubmit the same stale work.  Reset the worktree and let
+                # the builder start fresh.  See issue #3106.
+                closed_pr = self._has_closed_pr_for_branch(
+                    ctx.config.issue, ctx.repo_root
                 )
-                ctx.report_milestone(
-                    "checkpoint_loaded",
-                    stage="committed",
-                    recovery_path=str(ctx.worktree_path),
-                    skip_stages=["builder"],
-                )
-                diag = self._gather_diagnostics(ctx)
-                recovery = self._recover_from_existing_worktree(ctx, diag, exit_code=0)
-                if recovery is not None:
-                    return recovery
+                if closed_pr is not None:
+                    log_warning(
+                        f"Prior work from rejected PR #{closed_pr} detected "
+                        f"for issue #{ctx.config.issue} — resetting worktree "
+                        f"to start fresh instead of resubmitting stale work"
+                    )
+                    self._reset_stale_worktree(ctx)
+                    # Don't return — fall through to normal builder invocation
+                    # so a fresh builder can start from scratch.
+                else:
+                    log_info(
+                        f"Prior work found ({prior_commits} commit(s) since main). "
+                        f"Resuming from checkpoint — skipping builder invocation."
+                    )
+                    ctx.report_milestone(
+                        "checkpoint_loaded",
+                        stage="committed",
+                        recovery_path=str(ctx.worktree_path),
+                        skip_stages=["builder"],
+                    )
+                    diag = self._gather_diagnostics(ctx)
+                    recovery = self._recover_from_existing_worktree(ctx, diag, exit_code=0)
+                    if recovery is not None:
+                        return recovery
 
-                # recovery returned None — determine why before returning FAILED.
-                # Case: workflow already complete (PR created + review label added).
-                # This happens when the shepherd crashes after the builder finishes
-                # but before advancing to the judge phase.  On restart, the builder
-                # phase runs again, detects prior commits, but recovery has nothing
-                # to do because the workflow is already done.  Return SUCCESS so the
-                # shepherd advances to the judge phase instead of cycling.
-                if diag.get("pr_number") is not None and diag.get(
-                    "pr_has_review_label", False
-                ):
-                    ctx.pr_number = diag["pr_number"]
+                    # recovery returned None — determine why before returning FAILED.
+                    # Case: workflow already complete (PR created + review label added).
+                    # This happens when the shepherd crashes after the builder finishes
+                    # but before advancing to the judge phase.  On restart, the builder
+                    # phase runs again, detects prior commits, but recovery has nothing
+                    # to do because the workflow is already done.  Return SUCCESS so the
+                    # shepherd advances to the judge phase instead of cycling.
+                    if diag.get("pr_number") is not None and diag.get(
+                        "pr_has_review_label", False
+                    ):
+                        ctx.pr_number = diag["pr_number"]
+                        return PhaseResult(
+                            status=PhaseStatus.SUCCESS,
+                            message=(
+                                f"builder phase complete - PR #{diag['pr_number']} "
+                                f"already exists with review label "
+                                f"(prior checkpoint detected)"
+                            ),
+                            phase_name="builder",
+                            data={
+                                "pr_number": diag["pr_number"],
+                                "recovered_from_checkpoint": True,
+                            },
+                        )
+
+                    log_warning(
+                        f"Prior checkpoint recovery failed for issue #{ctx.config.issue} "
+                        f"— recovery could not complete push/PR workflow"
+                    )
                     return PhaseResult(
-                        status=PhaseStatus.SUCCESS,
+                        status=PhaseStatus.FAILED,
                         message=(
-                            f"builder phase complete - PR #{diag['pr_number']} "
-                            f"already exists with review label "
-                            f"(prior checkpoint detected)"
+                            f"prior checkpoint recovery failed: worktree has "
+                            f"{prior_commits} commit(s) ahead of main but "
+                            f"could not complete push/PR workflow"
                         ),
                         phase_name="builder",
-                        data={
-                            "pr_number": diag["pr_number"],
-                            "recovered_from_checkpoint": True,
-                        },
+                        data={"prior_commits": prior_commits},
                     )
-
-                log_warning(
-                    f"Prior checkpoint recovery failed for issue #{ctx.config.issue} "
-                    f"— recovery could not complete push/PR workflow"
-                )
-                return PhaseResult(
-                    status=PhaseStatus.FAILED,
-                    message=(
-                        f"prior checkpoint recovery failed: worktree has "
-                        f"{prior_commits} commit(s) ahead of main but "
-                        f"could not complete push/PR workflow"
-                    ),
-                    phase_name="builder",
-                    data={"prior_commits": prior_commits},
-                )
 
         # Snapshot main's dirty state before spawning the builder so we can
         # distinguish pre-existing dirt from actual worktree escapes later.
@@ -3898,6 +3915,11 @@ class BuilderPhase:
             ls_res.returncode == 0 and ls_res.stdout.strip()
         )
 
+        # -- Closed/rejected PR (stale branch detection, issue #3106) --------
+        diag["closed_pr_for_branch"] = self._has_closed_pr_for_branch(
+            ctx.config.issue, ctx.repo_root
+        )
+
         # -- Existing PR -----------------------------------------------------
         branch_name_for_pr = NamingConventions.branch_name(ctx.config.issue)
         pr_res = subprocess.run(
@@ -4094,6 +4116,11 @@ class BuilderPhase:
             parts.append(
                 f"WARNING: commits reference wrong issue(s): "
                 f"{diag['wrong_issue_refs']}"
+            )
+        if diag.get("closed_pr_for_branch") is not None:
+            parts.append(
+                f"WARNING: stale branch — closed PR #{diag['closed_pr_for_branch']} "
+                f"exists for this branch"
             )
         parts.append(f"log={diag['log_file']}")
         diag["summary"] = "; ".join(parts)
@@ -4471,6 +4498,117 @@ class BuilderPhase:
 
         return steps
 
+    def _has_closed_pr_for_branch(
+        self, issue: int, repo_root: Path
+    ) -> int | None:
+        """Check if a closed/merged PR already exists for this issue's branch.
+
+        When a feature branch already has a closed (rejected) or merged PR,
+        creating a new PR from the same branch is likely to submit stale or
+        previously-rejected work.  The builder should start fresh instead.
+
+        Returns the PR number if a closed/merged PR exists, None otherwise.
+        See issue #3106.
+        """
+        branch = NamingConventions.branch_name(issue)
+        result = subprocess.run(
+            [
+                "gh", "pr", "list",
+                "--head", branch,
+                "--state", "closed",
+                "--json", "number",
+                "--jq", ".[0].number // empty",
+            ],
+            cwd=repo_root,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        pr_num_str = result.stdout.strip()
+        if pr_num_str:
+            try:
+                return int(pr_num_str)
+            except ValueError:
+                pass
+        return None
+
+    def _validate_build_before_pr(
+        self, ctx: ShepherdContext
+    ) -> tuple[bool, str]:
+        """Run a quick build/test validation before creating a PR.
+
+        Prevents submitting broken work that wastes Judge review cycles.
+        Runs the detected test command in the worktree and returns
+        (passed, message).
+
+        This is a lightweight pre-PR gate, not a full baseline comparison.
+        It only checks that the build/tests pass in the worktree.
+
+        Returns:
+            Tuple of (passed: bool, message: str).  When passed is False,
+            the message describes the failure.
+        See issue #3106.
+        """
+        wt = ctx.worktree_path
+        if not wt or not wt.is_dir():
+            # No worktree to validate — allow PR creation (the builder
+            # may have pushed from elsewhere).
+            return True, "no worktree to validate"
+
+        test_info = self._detect_test_command(wt)
+        if test_info is None:
+            # No test runner detected — allow PR creation.
+            return True, "no test runner detected"
+
+        test_cmd, display_name = test_info
+        log_info(
+            f"Pre-PR validation: running {display_name} in worktree "
+            f"for issue #{ctx.config.issue}"
+        )
+
+        try:
+            result = subprocess.run(
+                test_cmd,
+                cwd=str(wt),
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=300,  # 5 minute timeout for pre-PR validation
+            )
+        except subprocess.TimeoutExpired:
+            log_warning(
+                f"Pre-PR validation timed out after 300s for issue "
+                f"#{ctx.config.issue} — allowing PR creation"
+            )
+            return True, "validation timed out (allowing PR)"
+        except OSError as e:
+            log_warning(
+                f"Pre-PR validation could not run {display_name}: {e} "
+                f"— allowing PR creation"
+            )
+            return True, f"could not run {display_name}: {e}"
+
+        if result.returncode == 0:
+            log_info(
+                f"Pre-PR validation passed: {display_name} exited with 0"
+            )
+            return True, f"{display_name} passed"
+
+        # Extract tail of output for diagnostics
+        output_lines = (result.stdout or "").splitlines()
+        stderr_lines = (result.stderr or "").splitlines()
+        tail = (output_lines + stderr_lines)[-20:]
+        tail_str = "\n".join(tail)
+
+        log_warning(
+            f"Pre-PR validation failed: {display_name} exited with "
+            f"{result.returncode} for issue #{ctx.config.issue}\n"
+            f"Output tail:\n{tail_str}"
+        )
+        return False, (
+            f"{display_name} failed (exit code {result.returncode})"
+        )
+
     def _direct_completion(
         self, ctx: ShepherdContext, diag: dict[str, Any]
     ) -> bool:
@@ -4583,6 +4721,33 @@ class BuilderPhase:
                     existing_pr = str(kw_pr_num)
                 if existing_pr:
                     continue
+
+                # Guard: refuse to create PR when a closed/merged PR already
+                # exists for this branch.  This means the branch contains
+                # stale/rejected work from a prior attempt.  See issue #3106.
+                closed_pr = self._has_closed_pr_for_branch(
+                    ctx.config.issue, ctx.repo_root
+                )
+                if closed_pr is not None:
+                    log_warning(
+                        f"Direct completion: refusing to create PR for issue "
+                        f"#{ctx.config.issue} — closed/merged PR #{closed_pr} "
+                        f"already exists for branch {branch} (stale work)"
+                    )
+                    return False
+
+                # Guard: run build/test validation before creating a PR.
+                # This prevents submitting broken work that wastes Judge
+                # review cycles.  See issue #3106.
+                build_ok, build_msg = self._validate_build_before_pr(ctx)
+                if not build_ok:
+                    log_warning(
+                        f"Direct completion: refusing to create PR for issue "
+                        f"#{ctx.config.issue} — pre-PR validation failed: "
+                        f"{build_msg}"
+                    )
+                    return False
+
                 pr_body = self._build_direct_completion_pr_body(ctx)
                 result = subprocess.run(
                     [
