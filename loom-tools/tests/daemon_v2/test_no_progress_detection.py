@@ -23,6 +23,7 @@ from loom_tools.daemon_v2.actions.shepherds import (
     STARTUP_GRACE_PERIOD,
     _check_no_progress_file,
     _save_diagnostic_output,
+    _sync_phase_from_progress,
     force_reclaim_stale_shepherds,
 )
 from loom_tools.daemon_v2.config import DaemonConfig
@@ -712,3 +713,416 @@ class TestTmuxSessionGracePeriod:
 
         assert reclaimed == 0
         assert ctx.state.shepherds["shepherd-1"].status == "working"
+
+
+# -----------------------------------------------------------------------
+# Phase-aware grace periods (issue #3103)
+# -----------------------------------------------------------------------
+
+
+class TestPhaseAwareGracePeriods:
+    """Tests for phase-aware no-progress grace periods.
+
+    Judge/Doctor/Champion phases get 900s (15 min) instead of the default
+    300s (5 min) because they involve waiting for external agents.
+    """
+
+    def test_judge_phase_not_reclaimed_at_600s(self, tmp_path: pathlib.Path) -> None:
+        """Shepherd in judge phase at 600s should NOT be reclaimed (grace=900s)."""
+        progress_dir = tmp_path / ".loom" / "progress"
+        progress_dir.mkdir(parents=True)
+
+        ctx = _make_ctx(
+            repo_root=tmp_path,
+            shepherds={
+                "shepherd-1": {
+                    "status": "working",
+                    "issue": 42,
+                    "task_id": "abc1234",
+                    "started": _ts(600),  # 600s — past 300s but within 900s judge grace
+                    "last_phase": "judge",
+                },
+            },
+        )
+        entry = ctx.state.shepherds["shepherd-1"]
+
+        with patch("loom_tools.daemon_v2.actions.shepherds.session_exists", return_value=True):
+            with patch("loom_tools.daemon_v2.actions.shepherds.capture_tmux_output", return_value="some output"):
+                result = _check_no_progress_file(ctx, "shepherd-1", entry)
+
+        assert result is False  # NOT reclaimed — within 900s judge grace
+
+    def test_doctor_phase_not_reclaimed_at_600s(self, tmp_path: pathlib.Path) -> None:
+        """Shepherd in doctor phase at 600s should NOT be reclaimed (grace=900s)."""
+        progress_dir = tmp_path / ".loom" / "progress"
+        progress_dir.mkdir(parents=True)
+
+        ctx = _make_ctx(
+            repo_root=tmp_path,
+            shepherds={
+                "shepherd-1": {
+                    "status": "working",
+                    "issue": 42,
+                    "task_id": "abc1234",
+                    "started": _ts(600),
+                    "last_phase": "doctor",
+                },
+            },
+        )
+        entry = ctx.state.shepherds["shepherd-1"]
+
+        with patch("loom_tools.daemon_v2.actions.shepherds.session_exists", return_value=True):
+            with patch("loom_tools.daemon_v2.actions.shepherds.capture_tmux_output", return_value="output"):
+                result = _check_no_progress_file(ctx, "shepherd-1", entry)
+
+        assert result is False
+
+    def test_champion_phase_not_reclaimed_at_600s(self, tmp_path: pathlib.Path) -> None:
+        """Shepherd in champion phase at 600s should NOT be reclaimed (grace=900s)."""
+        progress_dir = tmp_path / ".loom" / "progress"
+        progress_dir.mkdir(parents=True)
+
+        ctx = _make_ctx(
+            repo_root=tmp_path,
+            shepherds={
+                "shepherd-1": {
+                    "status": "working",
+                    "issue": 42,
+                    "task_id": "abc1234",
+                    "started": _ts(600),
+                    "last_phase": "champion",
+                },
+            },
+        )
+        entry = ctx.state.shepherds["shepherd-1"]
+
+        with patch("loom_tools.daemon_v2.actions.shepherds.session_exists", return_value=True):
+            with patch("loom_tools.daemon_v2.actions.shepherds.capture_tmux_output", return_value="output"):
+                result = _check_no_progress_file(ctx, "shepherd-1", entry)
+
+        assert result is False
+
+    def test_judge_phase_reclaimed_past_900s(self, tmp_path: pathlib.Path) -> None:
+        """Shepherd in judge phase past 900s SHOULD be reclaimed."""
+        progress_dir = tmp_path / ".loom" / "progress"
+        progress_dir.mkdir(parents=True)
+
+        ctx = _make_ctx(
+            repo_root=tmp_path,
+            shepherds={
+                "shepherd-1": {
+                    "status": "working",
+                    "issue": 42,
+                    "task_id": "abc1234",
+                    "started": _ts(910),  # Past 900s judge grace
+                    "last_phase": "judge",
+                },
+            },
+        )
+        entry = ctx.state.shepherds["shepherd-1"]
+
+        with patch("loom_tools.daemon_v2.actions.shepherds.capture_tmux_output", return_value=""):
+            result = _check_no_progress_file(ctx, "shepherd-1", entry)
+
+        assert result is True
+
+    def test_builder_phase_reclaimed_at_610s(self, tmp_path: pathlib.Path) -> None:
+        """Shepherd in builder phase at 610s SHOULD be reclaimed (grace=600s)."""
+        progress_dir = tmp_path / ".loom" / "progress"
+        progress_dir.mkdir(parents=True)
+
+        ctx = _make_ctx(
+            repo_root=tmp_path,
+            shepherds={
+                "shepherd-1": {
+                    "status": "working",
+                    "issue": 42,
+                    "task_id": "abc1234",
+                    "started": _ts(610),
+                    "last_phase": "builder",
+                },
+            },
+        )
+        entry = ctx.state.shepherds["shepherd-1"]
+
+        with patch("loom_tools.daemon_v2.actions.shepherds.capture_tmux_output", return_value=""):
+            result = _check_no_progress_file(ctx, "shepherd-1", entry)
+
+        assert result is True
+
+    def test_unknown_phase_uses_default_grace(self, tmp_path: pathlib.Path) -> None:
+        """Unknown phase falls back to default no_progress_grace_period (600s)."""
+        progress_dir = tmp_path / ".loom" / "progress"
+        progress_dir.mkdir(parents=True)
+
+        ctx = _make_ctx(
+            repo_root=tmp_path,
+            shepherds={
+                "shepherd-1": {
+                    "status": "working",
+                    "issue": 42,
+                    "task_id": "abc1234",
+                    "started": _ts(610),
+                    "last_phase": "some_unknown_phase",
+                },
+            },
+        )
+        entry = ctx.state.shepherds["shepherd-1"]
+
+        with patch("loom_tools.daemon_v2.actions.shepherds.capture_tmux_output", return_value=""):
+            result = _check_no_progress_file(ctx, "shepherd-1", entry)
+
+        assert result is True  # Falls back to 600s default
+
+    def test_none_phase_uses_default_grace(self, tmp_path: pathlib.Path) -> None:
+        """None phase falls back to default no_progress_grace_period (600s)."""
+        progress_dir = tmp_path / ".loom" / "progress"
+        progress_dir.mkdir(parents=True)
+
+        ctx = _make_ctx(
+            repo_root=tmp_path,
+            shepherds={
+                "shepherd-1": {
+                    "status": "working",
+                    "issue": 42,
+                    "task_id": "abc1234",
+                    "started": _ts(610),
+                    "last_phase": None,
+                },
+            },
+        )
+        entry = ctx.state.shepherds["shepherd-1"]
+
+        with patch("loom_tools.daemon_v2.actions.shepherds.capture_tmux_output", return_value=""):
+            result = _check_no_progress_file(ctx, "shepherd-1", entry)
+
+        assert result is True
+
+    def test_config_phase_grace_periods_customizable(self, tmp_path: pathlib.Path) -> None:
+        """Custom phase_grace_periods dict is respected."""
+        progress_dir = tmp_path / ".loom" / "progress"
+        progress_dir.mkdir(parents=True)
+
+        config = DaemonConfig(phase_grace_periods={"judge": 1800})  # 30 min
+        ctx = DaemonContext(
+            config=config,
+            repo_root=tmp_path,
+        )
+        ctx.snapshot = {
+            "computed": {"health_warnings": []},
+            "shepherds": {"progress": []},
+        }
+        state = DaemonState()
+        state.shepherds["shepherd-1"] = ShepherdEntry(
+            status="working",
+            issue=42,
+            task_id="abc1234",
+            started=_ts(1000),  # 1000s — past 900s default but within 1800s custom
+            last_phase="judge",
+        )
+        ctx.state = state
+
+        entry = ctx.state.shepherds["shepherd-1"]
+
+        with patch("loom_tools.daemon_v2.actions.shepherds.session_exists", return_value=True):
+            with patch("loom_tools.daemon_v2.actions.shepherds.capture_tmux_output", return_value=""):
+                result = _check_no_progress_file(ctx, "shepherd-1", entry)
+
+        assert result is False  # Within custom 1800s grace
+
+
+# -----------------------------------------------------------------------
+# _sync_phase_from_progress (issue #3103)
+# -----------------------------------------------------------------------
+
+
+class TestSyncPhaseFromProgress:
+    """Tests for syncing entry.last_phase from snapshot progress data."""
+
+    def test_syncs_phase_from_matching_task_id(self) -> None:
+        """Phase is updated when progress entry matches by task_id."""
+        ctx = _make_ctx(
+            shepherds={
+                "shepherd-1": {
+                    "status": "working",
+                    "issue": 42,
+                    "task_id": "abc1234",
+                    "last_phase": "started",
+                },
+            },
+            progress=[
+                {"task_id": "abc1234", "issue": 42, "current_phase": "judge"},
+            ],
+        )
+        entry = ctx.state.shepherds["shepherd-1"]
+        _sync_phase_from_progress(ctx, entry)
+        assert entry.last_phase == "judge"
+
+    def test_syncs_phase_from_matching_issue(self) -> None:
+        """Phase is updated when progress entry matches by issue number."""
+        ctx = _make_ctx(
+            shepherds={
+                "shepherd-1": {
+                    "status": "working",
+                    "issue": 42,
+                    "task_id": "different_id",
+                    "last_phase": "started",
+                },
+            },
+            progress=[
+                {"task_id": "other_task", "issue": 42, "current_phase": "doctor"},
+            ],
+        )
+        entry = ctx.state.shepherds["shepherd-1"]
+        _sync_phase_from_progress(ctx, entry)
+        assert entry.last_phase == "doctor"
+
+    def test_no_progress_preserves_existing_phase(self) -> None:
+        """No matching progress entry leaves last_phase unchanged."""
+        ctx = _make_ctx(
+            shepherds={
+                "shepherd-1": {
+                    "status": "working",
+                    "issue": 42,
+                    "task_id": "abc1234",
+                    "last_phase": "builder",
+                },
+            },
+            progress=[
+                {"task_id": "xxx", "issue": 99, "current_phase": "judge"},
+            ],
+        )
+        entry = ctx.state.shepherds["shepherd-1"]
+        _sync_phase_from_progress(ctx, entry)
+        assert entry.last_phase == "builder"
+
+    def test_empty_current_phase_preserves_existing(self) -> None:
+        """Progress entry with empty current_phase does not overwrite."""
+        ctx = _make_ctx(
+            shepherds={
+                "shepherd-1": {
+                    "status": "working",
+                    "issue": 42,
+                    "task_id": "abc1234",
+                    "last_phase": "builder",
+                },
+            },
+            progress=[
+                {"task_id": "abc1234", "issue": 42, "current_phase": ""},
+            ],
+        )
+        entry = ctx.state.shepherds["shepherd-1"]
+        _sync_phase_from_progress(ctx, entry)
+        assert entry.last_phase == "builder"
+
+    def test_none_issue_does_not_crash(self) -> None:
+        """Entry with no issue should not crash."""
+        ctx = _make_ctx(
+            shepherds={
+                "shepherd-1": {
+                    "status": "working",
+                    "issue": None,
+                    "task_id": "abc1234",
+                    "last_phase": "started",
+                },
+            },
+            progress=[
+                {"task_id": "abc1234", "issue": 42, "current_phase": "judge"},
+            ],
+        )
+        entry = ctx.state.shepherds["shepherd-1"]
+        _sync_phase_from_progress(ctx, entry)
+        assert entry.last_phase == "started"  # Unchanged — issue is None
+
+    def test_none_snapshot_does_not_crash(self) -> None:
+        """None snapshot should not crash."""
+        ctx = _make_ctx(
+            shepherds={
+                "shepherd-1": {
+                    "status": "working",
+                    "issue": 42,
+                    "task_id": "abc1234",
+                    "last_phase": "started",
+                },
+            },
+        )
+        ctx.snapshot = None
+        entry = ctx.state.shepherds["shepherd-1"]
+        _sync_phase_from_progress(ctx, entry)
+        assert entry.last_phase == "started"
+
+    def test_phase_sync_affects_grace_period_in_reclaim(self, tmp_path: pathlib.Path) -> None:
+        """Integration: progress showing 'judge' phase extends grace period for stall check."""
+        progress_dir = tmp_path / ".loom" / "progress"
+        progress_dir.mkdir(parents=True)
+
+        # Shepherd spawned 600s ago with last_phase="started" in daemon state,
+        # but progress file shows current_phase="judge".
+        # Without phase sync: 600s > 300s (started grace) -> reclaimed
+        # With phase sync: 600s < 900s (judge grace) -> NOT reclaimed
+        ctx = _make_ctx(
+            repo_root=tmp_path,
+            shepherds={
+                "shepherd-1": {
+                    "status": "working",
+                    "issue": 42,
+                    "task_id": "abc1234",
+                    "started": _ts(600),
+                    "last_phase": "started",  # Stale phase in daemon state
+                },
+            },
+            progress=[
+                {"task_id": "abc1234", "issue": 42, "current_phase": "judge"},
+            ],
+        )
+
+        @patch("loom_tools.agent_spawn._is_claude_running", return_value=True)
+        @patch("loom_tools.agent_spawn._get_pane_pid", return_value=12345)
+        @patch("loom_tools.daemon_v2.actions.shepherds.session_exists", return_value=True)
+        @patch("loom_tools.daemon_v2.actions.shepherds.capture_tmux_output", return_value="output")
+        def run_test(mock_capture, mock_session, mock_pid, mock_claude):
+            reclaimed = force_reclaim_stale_shepherds(ctx)
+            return reclaimed
+
+        reclaimed = run_test()
+        assert reclaimed == 0  # NOT reclaimed because phase synced to "judge"
+        assert ctx.state.shepherds["shepherd-1"].status == "working"
+        assert ctx.state.shepherds["shepherd-1"].last_phase == "judge"  # Phase was synced
+
+
+# -----------------------------------------------------------------------
+# DaemonConfig.get_phase_grace_period
+# -----------------------------------------------------------------------
+
+
+class TestGetPhaseGracePeriod:
+    """Tests for DaemonConfig.get_phase_grace_period helper."""
+
+    def test_known_phases(self) -> None:
+        cfg = DaemonConfig()
+        assert cfg.get_phase_grace_period("judge") == 900
+        assert cfg.get_phase_grace_period("doctor") == 900
+        assert cfg.get_phase_grace_period("champion") == 900
+        assert cfg.get_phase_grace_period("builder") == 600
+        assert cfg.get_phase_grace_period("curator") == 600
+        assert cfg.get_phase_grace_period("started") == 600
+        assert cfg.get_phase_grace_period("merge") == 600
+
+    def test_unknown_phase_fallback(self) -> None:
+        cfg = DaemonConfig()
+        assert cfg.get_phase_grace_period("unknown_phase") == cfg.no_progress_grace_period
+
+    def test_none_phase_fallback(self) -> None:
+        cfg = DaemonConfig()
+        assert cfg.get_phase_grace_period(None) == cfg.no_progress_grace_period
+
+    def test_empty_string_phase_fallback(self) -> None:
+        cfg = DaemonConfig()
+        assert cfg.get_phase_grace_period("") == cfg.no_progress_grace_period
+
+    def test_custom_phase_grace_periods(self) -> None:
+        cfg = DaemonConfig(phase_grace_periods={"judge": 1800, "builder": 600})
+        assert cfg.get_phase_grace_period("judge") == 1800
+        assert cfg.get_phase_grace_period("builder") == 600
+        # Unknown falls back to no_progress_grace_period
+        assert cfg.get_phase_grace_period("doctor") == 600
