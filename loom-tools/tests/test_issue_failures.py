@@ -11,6 +11,7 @@ from loom_tools.common.issue_failures import (
     BACKOFF_BASE,
     INFRASTRUCTURE_ERROR_CLASSES,
     MAX_FAILURES_BEFORE_BLOCK,
+    _DEFAULT_FAILURE_THRESHOLD,
     IssueFailureEntry,
     IssueFailureLog,
     get_failure_entry,
@@ -81,6 +82,15 @@ class TestIssueFailureEntry:
             assert entry.should_auto_block is False, (
                 f"{error_class} should not auto-block"
             )
+
+    def test_dependency_blocked_never_auto_blocks(self) -> None:
+        """dependency_blocked is an infrastructure error and should never auto-block."""
+        assert "dependency_blocked" in INFRASTRUCTURE_ERROR_CLASSES
+        entry = IssueFailureEntry(
+            total_failures=MAX_FAILURES_BEFORE_BLOCK + 10,
+            error_class="dependency_blocked",
+        )
+        assert entry.should_auto_block is False
 
     def test_non_infrastructure_error_still_auto_blocks(self) -> None:
         """Non-infrastructure failures still auto-block at threshold."""
@@ -414,3 +424,33 @@ class TestIntegration:
         # Issue 42 should be in backoff, 99 should pass
         assert len(result) == 1
         assert result[0]["number"] == 99
+
+
+# ── Configurable threshold ────────────────────────────────────
+
+
+class TestConfigurableThreshold:
+    def test_default_threshold_value(self) -> None:
+        """Default threshold is 5 when env var is not set."""
+        assert _DEFAULT_FAILURE_THRESHOLD == 5
+
+    def test_env_var_overrides_threshold(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """LOOM_ISSUE_FAILURE_THRESHOLD env var overrides the default."""
+        monkeypatch.setenv("LOOM_ISSUE_FAILURE_THRESHOLD", "10")
+        # Re-import to pick up the env var change
+        import importlib
+
+        import loom_tools.common.issue_failures as mod
+
+        importlib.reload(mod)
+        try:
+            assert mod.MAX_FAILURES_BEFORE_BLOCK == 10
+        finally:
+            # Restore original value
+            monkeypatch.delenv("LOOM_ISSUE_FAILURE_THRESHOLD", raising=False)
+            importlib.reload(mod)
+
+    def test_entry_uses_module_level_threshold(self) -> None:
+        """IssueFailureEntry.block_threshold falls back to MAX_FAILURES_BEFORE_BLOCK."""
+        entry = IssueFailureEntry(total_failures=1, error_class="builder_stuck")
+        assert entry.block_threshold == MAX_FAILURES_BEFORE_BLOCK

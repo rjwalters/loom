@@ -27,6 +27,7 @@ File format::
 from __future__ import annotations
 
 import logging
+import os
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -37,8 +38,13 @@ from loom_tools.common.state import read_json_file, write_json_file
 
 logger = logging.getLogger(__name__)
 
-# After this many total failures, auto-block the issue (default for most error classes)
-MAX_FAILURES_BEFORE_BLOCK = 5
+# After this many total failures, auto-block the issue (default for most error classes).
+# Override with LOOM_ISSUE_FAILURE_THRESHOLD env var for repos where early failures
+# are expected (e.g., greenfield projects with dependency chains).  See issue #3101.
+_DEFAULT_FAILURE_THRESHOLD = 5
+MAX_FAILURES_BEFORE_BLOCK = int(
+    os.environ.get("LOOM_ISSUE_FAILURE_THRESHOLD", str(_DEFAULT_FAILURE_THRESHOLD))
+)
 
 # Per-error-class block thresholds (lower = block sooner)
 # Budget exhaustion means the issue is too complex for a single session;
@@ -49,11 +55,13 @@ ERROR_CLASS_BLOCK_THRESHOLDS: dict[str, int] = {
 
 # Infrastructure error classes that should NOT count toward auto-blocking.
 # These represent environment/platform failures (MCP server down, auth timeout,
-# worktree branch conflicts), not problems with the issue itself.  Blocking an
-# issue for infrastructure failures is counterproductive — the issue would
-# succeed once infrastructure recovers.  See issue #2772, #2918.
+# worktree branch conflicts) or dependency ordering issues, not problems with
+# the issue itself.  Blocking an issue for infrastructure failures is
+# counterproductive — the issue would succeed once infrastructure recovers.
+# See issue #2772, #2918, #3101.
 INFRASTRUCTURE_ERROR_CLASSES: frozenset[str] = frozenset({
     "auth_infrastructure_failure",
+    "dependency_blocked",
     "mcp_infrastructure_failure",
     "worktree_conflict",
 })
