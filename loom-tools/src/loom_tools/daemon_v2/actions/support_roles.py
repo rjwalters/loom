@@ -4,7 +4,12 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from loom_tools.agent_spawn import spawn_agent, session_exists, kill_stuck_session
+from loom_tools.agent_spawn import (
+    is_session_active,
+    kill_stuck_session,
+    session_exists,
+    spawn_agent,
+)
 from loom_tools.common.logging import log_info, log_success, log_warning
 from loom_tools.common.time_utils import now_utc
 from loom_tools.daemon_v2.actions.completions import CompletionEntry
@@ -178,12 +183,18 @@ def spawn_roles_from_actions(ctx: DaemonContext) -> int:
 
 
 def reclaim_completed_support_roles(ctx: DaemonContext) -> list[CompletionEntry]:
-    """Detect support roles whose tmux sessions have exited and mark them idle.
+    """Detect support roles whose Claude process has finished and mark them idle.
 
     Iterates over all support roles with status ``"running"`` and checks
-    whether their tmux session is still alive.  When a session is gone the
-    role is considered complete and a :class:`CompletionEntry` is returned
-    so the caller can feed it through :func:`handle_completion`.
+    whether the Claude process inside their tmux session is still active.
+    A role is considered complete when:
+
+    - The tmux session no longer exists at all, OR
+    - The tmux session exists but the Claude process has exited (the shell
+      is sitting at an idle prompt).
+
+    In the second case the lingering tmux session is killed so it does not
+    block future spawns.
 
     Returns a list of ``CompletionEntry`` objects for completed roles.
     """
@@ -196,13 +207,22 @@ def reclaim_completed_support_roles(ctx: DaemonContext) -> list[CompletionEntry]
         if entry.status != "running":
             continue
 
-        # Check if the tmux session is still alive
-        if session_exists(role_name):
+        # Check if the tmux session has a live Claude process
+        if is_session_active(role_name):
             continue
 
-        log_info(
-            f"Support role {role_name} tmux session exited — marking as completed"
-        )
+        # Session is either gone or Claude has exited.
+        # If the tmux session still exists (shell-only), kill it.
+        if session_exists(role_name):
+            log_info(
+                f"Support role {role_name} Claude process exited "
+                f"(tmux session still open) — killing stale session"
+            )
+            kill_stuck_session(role_name)
+        else:
+            log_info(
+                f"Support role {role_name} tmux session exited — marking as completed"
+            )
 
         completed.append(
             CompletionEntry(

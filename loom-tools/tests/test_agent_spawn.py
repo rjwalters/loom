@@ -18,6 +18,7 @@ from loom_tools.agent_spawn import (
     check_claude_cli,
     check_stop_signals,
     check_tmux,
+    is_session_active,
     kill_stuck_session,
     run,
     session_exists,
@@ -237,6 +238,58 @@ class TestSessionIsAlive:
             args=[], returncode=1, stdout=""
         )
         assert session_is_alive("test") is False
+
+
+class TestIsSessionActive:
+    """Tests for is_session_active (session exists AND Claude running)."""
+
+    @patch("loom_tools.agent_spawn._is_claude_running", return_value=True)
+    @patch("loom_tools.agent_spawn._get_pane_pid", return_value="12345")
+    @patch("loom_tools.agent_spawn._tmux")
+    def test_active_when_session_and_claude_running(
+        self,
+        mock_tmux: MagicMock,
+        _mock_pid: MagicMock,
+        _mock_running: MagicMock,
+    ) -> None:
+        mock_tmux.return_value = subprocess.CompletedProcess(
+            args=[], returncode=0, stdout=""
+        )
+        assert is_session_active("test") is True
+
+    @patch("loom_tools.agent_spawn._tmux")
+    def test_not_active_when_session_missing(self, mock_tmux: MagicMock) -> None:
+        mock_tmux.return_value = subprocess.CompletedProcess(
+            args=[], returncode=1, stdout=""
+        )
+        assert is_session_active("test") is False
+
+    @patch("loom_tools.agent_spawn._is_claude_running", return_value=False)
+    @patch("loom_tools.agent_spawn._get_pane_pid", return_value="12345")
+    @patch("loom_tools.agent_spawn._tmux")
+    def test_not_active_when_claude_exited(
+        self,
+        mock_tmux: MagicMock,
+        _mock_pid: MagicMock,
+        _mock_running: MagicMock,
+    ) -> None:
+        """Session exists but Claude has exited (shell-only) -- should return False."""
+        mock_tmux.return_value = subprocess.CompletedProcess(
+            args=[], returncode=0, stdout=""
+        )
+        assert is_session_active("test") is False
+
+    @patch("loom_tools.agent_spawn._get_pane_pid", return_value=None)
+    @patch("loom_tools.agent_spawn._tmux")
+    def test_not_active_when_no_shell_pid(
+        self,
+        mock_tmux: MagicMock,
+        _mock_pid: MagicMock,
+    ) -> None:
+        mock_tmux.return_value = subprocess.CompletedProcess(
+            args=[], returncode=0, stdout=""
+        )
+        assert is_session_active("test") is False
 
 
 class TestSessionIsStuck:

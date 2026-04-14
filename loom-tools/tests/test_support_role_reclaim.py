@@ -53,18 +53,29 @@ class TestReclaimCompletedSupportRoles:
             },
         )
 
-        with mock.patch(
-            "loom_tools.daemon_v2.actions.support_roles.session_exists",
-            return_value=False,
+        with (
+            mock.patch(
+                "loom_tools.daemon_v2.actions.support_roles.is_session_active",
+                return_value=False,
+            ),
+            mock.patch(
+                "loom_tools.daemon_v2.actions.support_roles.session_exists",
+                return_value=False,
+            ),
+            mock.patch(
+                "loom_tools.daemon_v2.actions.support_roles.kill_stuck_session",
+            ) as mock_kill,
         ):
             completed = reclaim_completed_support_roles(ctx)
 
         assert len(completed) == 1
         assert completed[0].type == "support_role"
         assert completed[0].name == "judge"
+        # Session was already gone — no need to kill
+        mock_kill.assert_not_called()
 
     def test_alive_session_not_reclaimed(self, tmp_path: pathlib.Path) -> None:
-        """A running role with a live tmux session should NOT be reclaimed."""
+        """A running role with a live Claude process should NOT be reclaimed."""
         ctx = _make_ctx(
             tmp_path,
             support_roles={
@@ -77,12 +88,46 @@ class TestReclaimCompletedSupportRoles:
         )
 
         with mock.patch(
-            "loom_tools.daemon_v2.actions.support_roles.session_exists",
+            "loom_tools.daemon_v2.actions.support_roles.is_session_active",
             return_value=True,
         ):
             completed = reclaim_completed_support_roles(ctx)
 
         assert len(completed) == 0
+
+    def test_session_exists_but_claude_exited(self, tmp_path: pathlib.Path) -> None:
+        """A session with no Claude process (shell-only) should be reclaimed and killed."""
+        ctx = _make_ctx(
+            tmp_path,
+            support_roles={
+                "architect": SupportRoleEntry(
+                    status="running",
+                    tmux_session="loom-architect",
+                    started="2026-01-30T10:00:00Z",
+                ),
+            },
+        )
+
+        with (
+            mock.patch(
+                "loom_tools.daemon_v2.actions.support_roles.is_session_active",
+                return_value=False,  # Claude not running
+            ),
+            mock.patch(
+                "loom_tools.daemon_v2.actions.support_roles.session_exists",
+                return_value=True,  # But tmux session still exists
+            ),
+            mock.patch(
+                "loom_tools.daemon_v2.actions.support_roles.kill_stuck_session",
+            ) as mock_kill,
+        ):
+            completed = reclaim_completed_support_roles(ctx)
+
+        assert len(completed) == 1
+        assert completed[0].type == "support_role"
+        assert completed[0].name == "architect"
+        # Stale shell-only session should be killed
+        mock_kill.assert_called_once_with("architect")
 
     def test_idle_roles_skipped(self, tmp_path: pathlib.Path) -> None:
         """Idle roles should not be checked or reclaimed."""
@@ -97,15 +142,15 @@ class TestReclaimCompletedSupportRoles:
         )
 
         with mock.patch(
-            "loom_tools.daemon_v2.actions.support_roles.session_exists",
-        ) as mock_exists:
+            "loom_tools.daemon_v2.actions.support_roles.is_session_active",
+        ) as mock_active:
             completed = reclaim_completed_support_roles(ctx)
 
         assert len(completed) == 0
-        mock_exists.assert_not_called()
+        mock_active.assert_not_called()
 
     def test_multiple_roles_mixed_states(self, tmp_path: pathlib.Path) -> None:
-        """Multiple roles: only running ones with dead sessions are reclaimed."""
+        """Multiple roles: only running ones without active Claude are reclaimed."""
         ctx = _make_ctx(
             tmp_path,
             support_roles={
@@ -128,19 +173,34 @@ class TestReclaimCompletedSupportRoles:
             },
         )
 
-        def mock_session_exists(name: str) -> bool:
-            # judge dead, champion alive, doctor dead
+        def mock_is_active(name: str) -> bool:
+            # champion is active, judge and doctor are not
             return name == "champion"
 
-        with mock.patch(
-            "loom_tools.daemon_v2.actions.support_roles.session_exists",
-            side_effect=mock_session_exists,
+        def mock_exists(name: str) -> bool:
+            # judge session gone, doctor session still there (shell-only)
+            return name == "doctor"
+
+        with (
+            mock.patch(
+                "loom_tools.daemon_v2.actions.support_roles.is_session_active",
+                side_effect=mock_is_active,
+            ),
+            mock.patch(
+                "loom_tools.daemon_v2.actions.support_roles.session_exists",
+                side_effect=mock_exists,
+            ),
+            mock.patch(
+                "loom_tools.daemon_v2.actions.support_roles.kill_stuck_session",
+            ) as mock_kill,
         ):
             completed = reclaim_completed_support_roles(ctx)
 
         assert len(completed) == 2
         names = {c.name for c in completed}
         assert names == {"judge", "doctor"}
+        # Only doctor's stale session should be killed (judge was already gone)
+        mock_kill.assert_called_once_with("doctor")
 
     def test_no_state_returns_empty(self, tmp_path: pathlib.Path) -> None:
         """When ctx.state is None, returns empty list."""
@@ -190,7 +250,7 @@ class TestIterationWrapperFunction:
     """Tests for _reclaim_completed_support_roles in iteration.py."""
 
     def test_no_running_roles_skips_check(self, tmp_path: pathlib.Path) -> None:
-        """When no roles are running, session_exists is never called."""
+        """When no roles are running, is_session_active is never called."""
         ctx = _make_ctx(
             tmp_path,
             support_roles={
@@ -200,15 +260,15 @@ class TestIterationWrapperFunction:
         )
 
         with mock.patch(
-            "loom_tools.daemon_v2.actions.support_roles.session_exists",
-        ) as mock_exists:
+            "loom_tools.daemon_v2.actions.support_roles.is_session_active",
+        ) as mock_active:
             result = _reclaim_completed_support_roles(ctx)
 
         assert result == []
-        mock_exists.assert_not_called()
+        mock_active.assert_not_called()
 
     def test_running_role_triggers_check(self, tmp_path: pathlib.Path) -> None:
-        """When a role is running, the check runs and detects dead session."""
+        """When a role is running, the check detects inactive Claude process."""
         ctx = _make_ctx(
             tmp_path,
             support_roles={
@@ -220,9 +280,18 @@ class TestIterationWrapperFunction:
             },
         )
 
-        with mock.patch(
-            "loom_tools.daemon_v2.actions.support_roles.session_exists",
-            return_value=False,
+        with (
+            mock.patch(
+                "loom_tools.daemon_v2.actions.support_roles.is_session_active",
+                return_value=False,
+            ),
+            mock.patch(
+                "loom_tools.daemon_v2.actions.support_roles.session_exists",
+                return_value=False,
+            ),
+            mock.patch(
+                "loom_tools.daemon_v2.actions.support_roles.kill_stuck_session",
+            ),
         ):
             result = _reclaim_completed_support_roles(ctx)
 
@@ -306,8 +375,15 @@ class TestRunIterationWithSupportRoleReclaim:
             ),
             mock.patch("loom_tools.daemon_v2.iteration.write_json_file"),
             mock.patch(
+                "loom_tools.daemon_v2.actions.support_roles.is_session_active",
+                return_value=False,
+            ),
+            mock.patch(
                 "loom_tools.daemon_v2.actions.support_roles.session_exists",
                 return_value=False,
+            ),
+            mock.patch(
+                "loom_tools.daemon_v2.actions.support_roles.kill_stuck_session",
             ),
         ):
             from loom_tools.daemon_v2.iteration import run_iteration

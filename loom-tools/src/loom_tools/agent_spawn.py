@@ -218,6 +218,32 @@ def capture_tmux_output(name: str, lines: int = 200) -> str:
     return ""
 
 
+def is_session_active(name: str) -> bool:
+    """Check if a tmux session exists AND the Claude process is still running.
+
+    Returns True only when both conditions hold.  When the session exists but
+    Claude has exited (leaving only an idle shell), returns False.  When the
+    session does not exist at all, also returns False.
+
+    This is the correct check for determining whether a support role is still
+    working — ``session_exists()`` alone cannot distinguish a live agent from
+    a finished one whose shell lingers in the tmux pane.
+    """
+    session_name = f"{SESSION_PREFIX}{name}"
+    try:
+        result = _tmux("has-session", "-t", session_name)
+        if result.returncode != 0:
+            return False
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        return False
+
+    # Session exists — check for a live Claude process
+    shell_pid = _get_pane_pid(session_name)
+    if not shell_pid:
+        return False
+    return _is_claude_running(shell_pid)
+
+
 def kill_stuck_session(name: str) -> None:
     """Kill a stuck session with graceful then forced shutdown."""
     session_name = f"{SESSION_PREFIX}{name}"
