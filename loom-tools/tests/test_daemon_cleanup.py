@@ -9,6 +9,9 @@ import time
 from unittest import mock
 
 from loom_tools.daemon_cleanup import (
+    _ensure_shepherd_config_dirs,
+    _kill_orphaned_tmux_sessions,
+    _reset_failure_counters,
     _revert_shepherd_labels,
     _run_orphan_recovery,
     _terminate_active_sessions,
@@ -573,7 +576,9 @@ class TestRunOrphanRecoveryBackground:
 
         config = load_config()
 
-        with mock.patch("loom_tools.daemon_cleanup._run_archive_logs"), \
+        with mock.patch("loom_tools.daemon_cleanup._kill_orphaned_tmux_sessions"), \
+             mock.patch("loom_tools.daemon_cleanup._ensure_shepherd_config_dirs"), \
+             mock.patch("loom_tools.daemon_cleanup._run_archive_logs"), \
              mock.patch("loom_tools.daemon_cleanup._run_loom_clean"), \
              mock.patch("loom_tools.daemon_cleanup.cleanup_stale_progress_files"), \
              mock.patch("loom_tools.orphan_recovery.run_orphan_recovery", side_effect=fake_recovery):
@@ -597,7 +602,9 @@ class TestRunOrphanRecoveryBackground:
 
         config = load_config()
 
-        with mock.patch("loom_tools.daemon_cleanup._run_archive_logs"), \
+        with mock.patch("loom_tools.daemon_cleanup._kill_orphaned_tmux_sessions"), \
+             mock.patch("loom_tools.daemon_cleanup._ensure_shepherd_config_dirs"), \
+             mock.patch("loom_tools.daemon_cleanup._run_archive_logs"), \
              mock.patch("loom_tools.daemon_cleanup._run_loom_clean"), \
              mock.patch("loom_tools.daemon_cleanup.cleanup_stale_progress_files"), \
              mock.patch("loom_tools.claim.cleanup_claims"), \
@@ -632,7 +639,9 @@ class TestRunOrphanRecoveryBackground:
         config = load_config()
 
         def run_startup():
-            with mock.patch("loom_tools.daemon_cleanup._run_archive_logs"), \
+            with mock.patch("loom_tools.daemon_cleanup._kill_orphaned_tmux_sessions"), \
+                 mock.patch("loom_tools.daemon_cleanup._ensure_shepherd_config_dirs"), \
+                 mock.patch("loom_tools.daemon_cleanup._run_archive_logs"), \
                  mock.patch("loom_tools.daemon_cleanup._run_loom_clean"), \
                  mock.patch("loom_tools.daemon_cleanup.cleanup_stale_progress_files"), \
                  mock.patch("loom_tools.claim.cleanup_claims"), \
@@ -754,7 +763,9 @@ class TestHandleDaemonStartupCleanupSignals:
         loom_dir.mkdir()
         config = load_config()
 
-        with mock.patch("loom_tools.daemon_cleanup._run_archive_logs"), \
+        with mock.patch("loom_tools.daemon_cleanup._kill_orphaned_tmux_sessions"), \
+             mock.patch("loom_tools.daemon_cleanup._ensure_shepherd_config_dirs"), \
+             mock.patch("loom_tools.daemon_cleanup._run_archive_logs"), \
              mock.patch("loom_tools.daemon_cleanup._run_loom_clean"), \
              mock.patch("loom_tools.daemon_cleanup.cleanup_stale_progress_files"), \
              mock.patch("loom_tools.daemon_cleanup.cleanup_stale_signal_files") as mock_cleanup, \
@@ -773,7 +784,9 @@ class TestHandleDaemonStartupCleanupSignals:
         loom_dir.mkdir()
         config = load_config()
 
-        with mock.patch("loom_tools.daemon_cleanup._run_archive_logs"), \
+        with mock.patch("loom_tools.daemon_cleanup._kill_orphaned_tmux_sessions"), \
+             mock.patch("loom_tools.daemon_cleanup._ensure_shepherd_config_dirs"), \
+             mock.patch("loom_tools.daemon_cleanup._run_archive_logs"), \
              mock.patch("loom_tools.daemon_cleanup._run_loom_clean"), \
              mock.patch("loom_tools.daemon_cleanup.cleanup_stale_progress_files"), \
              mock.patch("loom_tools.daemon_cleanup.cleanup_stale_signal_files") as mock_cleanup, \
@@ -811,6 +824,8 @@ class TestHandleDaemonStartupCrashRecovery:
         with mock.patch("loom_tools.daemon_cleanup.session_exists", return_value=True), \
              mock.patch("loom_tools.daemon_cleanup.kill_stuck_session") as m_kill, \
              mock.patch("loom_tools.common.github.gh_run"), \
+             mock.patch("loom_tools.daemon_cleanup._kill_orphaned_tmux_sessions"), \
+             mock.patch("loom_tools.daemon_cleanup._ensure_shepherd_config_dirs"), \
              mock.patch("loom_tools.daemon_cleanup._run_archive_logs"), \
              mock.patch("loom_tools.daemon_cleanup._run_loom_clean"), \
              mock.patch("loom_tools.daemon_cleanup.cleanup_stale_progress_files"), \
@@ -840,6 +855,8 @@ class TestHandleDaemonStartupCrashRecovery:
         with mock.patch("loom_tools.daemon_cleanup.session_exists", return_value=False), \
              mock.patch("loom_tools.daemon_cleanup.kill_stuck_session"), \
              mock.patch("loom_tools.common.github.gh_run") as m_gh, \
+             mock.patch("loom_tools.daemon_cleanup._kill_orphaned_tmux_sessions"), \
+             mock.patch("loom_tools.daemon_cleanup._ensure_shepherd_config_dirs"), \
              mock.patch("loom_tools.daemon_cleanup._run_archive_logs"), \
              mock.patch("loom_tools.daemon_cleanup._run_loom_clean"), \
              mock.patch("loom_tools.daemon_cleanup.cleanup_stale_progress_files"), \
@@ -886,6 +903,8 @@ class TestHandleDaemonStartupCrashRecovery:
 
         with mock.patch("loom_tools.daemon_cleanup._terminate_active_sessions", side_effect=track_terminate), \
              mock.patch("loom_tools.daemon_cleanup._revert_shepherd_labels", side_effect=track_revert), \
+             mock.patch("loom_tools.daemon_cleanup._kill_orphaned_tmux_sessions"), \
+             mock.patch("loom_tools.daemon_cleanup._ensure_shepherd_config_dirs"), \
              mock.patch("loom_tools.daemon_cleanup._run_orphan_recovery", side_effect=track_orphan_recovery), \
              mock.patch("loom_tools.daemon_cleanup._run_archive_logs"), \
              mock.patch("loom_tools.daemon_cleanup._run_loom_clean"), \
@@ -904,7 +923,9 @@ class TestHandleDaemonStartupCrashRecovery:
 
         config = load_config()
 
-        with mock.patch("loom_tools.daemon_cleanup._run_archive_logs"), \
+        with mock.patch("loom_tools.daemon_cleanup._kill_orphaned_tmux_sessions"), \
+             mock.patch("loom_tools.daemon_cleanup._ensure_shepherd_config_dirs"), \
+             mock.patch("loom_tools.daemon_cleanup._run_archive_logs"), \
              mock.patch("loom_tools.daemon_cleanup._run_loom_clean"), \
              mock.patch("loom_tools.daemon_cleanup.cleanup_stale_progress_files"), \
              mock.patch("loom_tools.daemon_cleanup.cleanup_stale_signal_files"), \
@@ -930,6 +951,8 @@ class TestHandleDaemonStartupCrashRecovery:
         with mock.patch("loom_tools.daemon_cleanup.session_exists") as m_exists, \
              mock.patch("loom_tools.daemon_cleanup.kill_stuck_session") as m_kill, \
              mock.patch("loom_tools.common.github.gh_run") as m_gh, \
+             mock.patch("loom_tools.daemon_cleanup._kill_orphaned_tmux_sessions"), \
+             mock.patch("loom_tools.daemon_cleanup._ensure_shepherd_config_dirs"), \
              mock.patch("loom_tools.daemon_cleanup._run_archive_logs"), \
              mock.patch("loom_tools.daemon_cleanup._run_loom_clean"), \
              mock.patch("loom_tools.daemon_cleanup.cleanup_stale_progress_files"), \
@@ -941,3 +964,293 @@ class TestHandleDaemonStartupCrashRecovery:
         # log but do not kill or call gh
         m_kill.assert_not_called()
         m_gh.assert_not_called()
+
+
+class TestKillOrphanedTmuxSessions:
+    """Tests for _kill_orphaned_tmux_sessions() called during daemon startup."""
+
+    def test_kills_all_sessions_on_loom_socket(self) -> None:
+        """All sessions on the loom socket should be killed at startup."""
+        fake_result = mock.MagicMock(
+            returncode=0, stdout="loom-shepherd-1\nloom-shepherd-2\nloom-champion\n"
+        )
+        with mock.patch("loom_tools.daemon_cleanup._tmux_run") as m_tmux:
+            m_tmux.return_value = fake_result
+            _kill_orphaned_tmux_sessions()
+
+        # First call is list-sessions, subsequent calls are kill-session
+        assert m_tmux.call_count == 4
+        m_tmux.assert_any_call("kill-session", "-t", "loom-shepherd-1")
+        m_tmux.assert_any_call("kill-session", "-t", "loom-shepherd-2")
+        m_tmux.assert_any_call("kill-session", "-t", "loom-champion")
+
+    def test_no_sessions_found(self) -> None:
+        """Should handle empty session list gracefully."""
+        fake_result = mock.MagicMock(returncode=1, stdout="")
+        with mock.patch("loom_tools.daemon_cleanup._tmux_run") as m_tmux:
+            m_tmux.return_value = fake_result
+            _kill_orphaned_tmux_sessions()
+
+        # Only the list-sessions call
+        m_tmux.assert_called_once()
+
+    def test_tmux_not_available(self) -> None:
+        """Should handle missing tmux gracefully."""
+        with mock.patch(
+            "loom_tools.daemon_cleanup._tmux_run",
+            side_effect=FileNotFoundError("tmux not found"),
+        ):
+            # Should not raise
+            _kill_orphaned_tmux_sessions()
+
+    def test_dry_run_does_not_kill(self) -> None:
+        """Dry run should list but not kill sessions."""
+        fake_result = mock.MagicMock(
+            returncode=0, stdout="loom-shepherd-1\nloom-champion\n"
+        )
+        with mock.patch("loom_tools.daemon_cleanup._tmux_run") as m_tmux:
+            m_tmux.return_value = fake_result
+            _kill_orphaned_tmux_sessions(dry_run=True)
+
+        # Only the list-sessions call, no kill calls
+        m_tmux.assert_called_once()
+
+    def test_timeout_during_kill_continues(self) -> None:
+        """Timeout killing one session should not prevent killing others."""
+        import subprocess as sp
+
+        fake_list = mock.MagicMock(
+            returncode=0, stdout="loom-shepherd-1\nloom-shepherd-2\n"
+        )
+
+        def side_effect(*args, **kwargs):
+            if args == ("list-sessions", "-F", "#{session_name}"):
+                return fake_list
+            if args == ("kill-session", "-t", "loom-shepherd-1"):
+                raise sp.TimeoutExpired(cmd="tmux", timeout=10)
+            return mock.MagicMock(returncode=0)
+
+        with mock.patch("loom_tools.daemon_cleanup._tmux_run", side_effect=side_effect):
+            _kill_orphaned_tmux_sessions()
+
+        # Should not raise despite timeout on first kill
+
+
+class TestEnsureShepherdConfigDirs:
+    """Tests for _ensure_shepherd_config_dirs()."""
+
+    def test_creates_dirs_and_lockfiles(self, tmp_path: pathlib.Path) -> None:
+        """Should create config dirs and lock files for each shepherd slot."""
+        (tmp_path / ".loom").mkdir()
+
+        _ensure_shepherd_config_dirs(tmp_path, max_shepherds=3)
+
+        for i in range(1, 4):
+            config_dir = tmp_path / ".loom" / "claude-config" / f"shepherd-{i}"
+            lock_file = config_dir / ".claude.json.lock"
+            assert config_dir.is_dir(), f"Config dir for shepherd-{i} should exist"
+            assert lock_file.exists(), f"Lock file for shepherd-{i} should exist"
+
+    def test_does_not_overwrite_existing(self, tmp_path: pathlib.Path) -> None:
+        """Should not overwrite existing lock files."""
+        (tmp_path / ".loom").mkdir()
+        config_dir = tmp_path / ".loom" / "claude-config" / "shepherd-1"
+        config_dir.mkdir(parents=True)
+        lock_file = config_dir / ".claude.json.lock"
+        lock_file.write_text("existing content")
+
+        _ensure_shepherd_config_dirs(tmp_path, max_shepherds=1)
+
+        assert lock_file.read_text() == "existing content"
+
+    def test_creates_missing_lockfile_in_existing_dir(self, tmp_path: pathlib.Path) -> None:
+        """Should create lock file even if config dir already exists."""
+        (tmp_path / ".loom").mkdir()
+        config_dir = tmp_path / ".loom" / "claude-config" / "shepherd-1"
+        config_dir.mkdir(parents=True)
+
+        _ensure_shepherd_config_dirs(tmp_path, max_shepherds=1)
+
+        lock_file = config_dir / ".claude.json.lock"
+        assert lock_file.exists()
+
+    def test_dry_run_does_not_create(self, tmp_path: pathlib.Path) -> None:
+        """Dry run should not create any directories or files."""
+        (tmp_path / ".loom").mkdir()
+
+        _ensure_shepherd_config_dirs(tmp_path, max_shepherds=3, dry_run=True)
+
+        config_base = tmp_path / ".loom" / "claude-config"
+        assert not config_base.exists()
+
+    def test_zero_shepherds(self, tmp_path: pathlib.Path) -> None:
+        """Should handle zero max_shepherds gracefully."""
+        (tmp_path / ".loom").mkdir()
+
+        _ensure_shepherd_config_dirs(tmp_path, max_shepherds=0)
+
+        config_base = tmp_path / ".loom" / "claude-config"
+        # No directories should be created
+        if config_base.exists():
+            assert list(config_base.iterdir()) == []
+
+
+class TestResetFailureCounters:
+    """Tests for _reset_failure_counters()."""
+
+    def test_resets_existing_file(self, tmp_path: pathlib.Path) -> None:
+        """Should replace failure log with empty entries."""
+        loom_dir = tmp_path / ".loom"
+        loom_dir.mkdir()
+        failures_file = loom_dir / "issue-failures.json"
+        failures_file.write_text(json.dumps({
+            "entries": {
+                "42": {"issue": 42, "total_failures": 3, "error_class": "builder_stuck"},
+                "99": {"issue": 99, "total_failures": 5, "error_class": "budget_exhausted"},
+            },
+            "updated_at": "2026-01-20T10:00:00Z",
+        }))
+
+        _reset_failure_counters(tmp_path)
+
+        data = json.loads(failures_file.read_text())
+        assert data["entries"] == {}
+        assert "updated_at" in data
+
+    def test_no_file_does_not_error(self, tmp_path: pathlib.Path) -> None:
+        """Should handle missing failure log gracefully."""
+        loom_dir = tmp_path / ".loom"
+        loom_dir.mkdir()
+
+        _reset_failure_counters(tmp_path)
+
+        failures_file = loom_dir / "issue-failures.json"
+        assert not failures_file.exists()
+
+    def test_dry_run_does_not_reset(self, tmp_path: pathlib.Path) -> None:
+        """Dry run should not modify the failure log."""
+        loom_dir = tmp_path / ".loom"
+        loom_dir.mkdir()
+        failures_file = loom_dir / "issue-failures.json"
+        original = json.dumps({
+            "entries": {"42": {"issue": 42, "total_failures": 3}},
+        })
+        failures_file.write_text(original)
+
+        _reset_failure_counters(tmp_path, dry_run=True)
+
+        assert failures_file.read_text() == original
+
+
+class TestHandleDaemonStartupNewSteps:
+    """Tests that handle_daemon_startup calls the three new cleanup steps."""
+
+    def test_startup_kills_orphaned_sessions(self, tmp_path: pathlib.Path) -> None:
+        """Startup should kill orphaned tmux sessions."""
+        loom_dir = tmp_path / ".loom"
+        loom_dir.mkdir()
+        config = load_config()
+
+        with mock.patch("loom_tools.daemon_cleanup._kill_orphaned_tmux_sessions") as m_kill, \
+             mock.patch("loom_tools.daemon_cleanup._ensure_shepherd_config_dirs"), \
+             mock.patch("loom_tools.daemon_cleanup._terminate_active_sessions"), \
+             mock.patch("loom_tools.daemon_cleanup._revert_shepherd_labels"), \
+             mock.patch("loom_tools.daemon_cleanup._run_archive_logs"), \
+             mock.patch("loom_tools.daemon_cleanup._run_loom_clean"), \
+             mock.patch("loom_tools.daemon_cleanup.cleanup_stale_progress_files"), \
+             mock.patch("loom_tools.daemon_cleanup.cleanup_stale_signal_files"), \
+             mock.patch("loom_tools.daemon_cleanup._run_orphan_recovery"):
+            handle_daemon_startup(tmp_path, config, dry_run=True)
+
+        m_kill.assert_called_once_with(dry_run=True)
+
+    def test_startup_ensures_config_dirs(self, tmp_path: pathlib.Path) -> None:
+        """Startup should ensure shepherd config directories exist."""
+        loom_dir = tmp_path / ".loom"
+        loom_dir.mkdir()
+        config = load_config()
+
+        with mock.patch("loom_tools.daemon_cleanup._kill_orphaned_tmux_sessions"), \
+             mock.patch("loom_tools.daemon_cleanup._ensure_shepherd_config_dirs") as m_ensure, \
+             mock.patch("loom_tools.daemon_cleanup._terminate_active_sessions"), \
+             mock.patch("loom_tools.daemon_cleanup._revert_shepherd_labels"), \
+             mock.patch("loom_tools.daemon_cleanup._run_archive_logs"), \
+             mock.patch("loom_tools.daemon_cleanup._run_loom_clean"), \
+             mock.patch("loom_tools.daemon_cleanup.cleanup_stale_progress_files"), \
+             mock.patch("loom_tools.daemon_cleanup.cleanup_stale_signal_files"), \
+             mock.patch("loom_tools.daemon_cleanup._run_orphan_recovery"):
+            handle_daemon_startup(tmp_path, config, max_shepherds=5, dry_run=True)
+
+        m_ensure.assert_called_once_with(tmp_path, 5, dry_run=True)
+
+    def test_startup_with_fresh_resets_failures(self, tmp_path: pathlib.Path) -> None:
+        """Startup with fresh=True should reset failure counters."""
+        loom_dir = tmp_path / ".loom"
+        loom_dir.mkdir()
+        config = load_config()
+
+        with mock.patch("loom_tools.daemon_cleanup._kill_orphaned_tmux_sessions"), \
+             mock.patch("loom_tools.daemon_cleanup._ensure_shepherd_config_dirs"), \
+             mock.patch("loom_tools.daemon_cleanup._terminate_active_sessions"), \
+             mock.patch("loom_tools.daemon_cleanup._revert_shepherd_labels"), \
+             mock.patch("loom_tools.daemon_cleanup._reset_failure_counters") as m_reset, \
+             mock.patch("loom_tools.daemon_cleanup._run_archive_logs"), \
+             mock.patch("loom_tools.daemon_cleanup._run_loom_clean"), \
+             mock.patch("loom_tools.daemon_cleanup.cleanup_stale_progress_files"), \
+             mock.patch("loom_tools.daemon_cleanup.cleanup_stale_signal_files"), \
+             mock.patch("loom_tools.daemon_cleanup._run_orphan_recovery"):
+            handle_daemon_startup(tmp_path, config, fresh=True, dry_run=True)
+
+        m_reset.assert_called_once_with(tmp_path, dry_run=True)
+
+    def test_startup_without_fresh_does_not_reset_failures(self, tmp_path: pathlib.Path) -> None:
+        """Startup without fresh=True should not reset failure counters."""
+        loom_dir = tmp_path / ".loom"
+        loom_dir.mkdir()
+        config = load_config()
+
+        with mock.patch("loom_tools.daemon_cleanup._kill_orphaned_tmux_sessions"), \
+             mock.patch("loom_tools.daemon_cleanup._ensure_shepherd_config_dirs"), \
+             mock.patch("loom_tools.daemon_cleanup._terminate_active_sessions"), \
+             mock.patch("loom_tools.daemon_cleanup._revert_shepherd_labels"), \
+             mock.patch("loom_tools.daemon_cleanup._reset_failure_counters") as m_reset, \
+             mock.patch("loom_tools.daemon_cleanup._run_archive_logs"), \
+             mock.patch("loom_tools.daemon_cleanup._run_loom_clean"), \
+             mock.patch("loom_tools.daemon_cleanup.cleanup_stale_progress_files"), \
+             mock.patch("loom_tools.daemon_cleanup.cleanup_stale_signal_files"), \
+             mock.patch("loom_tools.daemon_cleanup._run_orphan_recovery"):
+            handle_daemon_startup(tmp_path, config, dry_run=True)
+
+        m_reset.assert_not_called()
+
+    def test_startup_kills_sessions_before_other_cleanup(self, tmp_path: pathlib.Path) -> None:
+        """Tmux session killing should happen first (before claim cleanup, orphan recovery)."""
+        loom_dir = tmp_path / ".loom"
+        loom_dir.mkdir()
+        config = load_config()
+
+        call_order: list[str] = []
+
+        def track_kill(**kwargs):
+            call_order.append("kill_sessions")
+
+        def track_claims(repo_root):
+            call_order.append("cleanup_claims")
+
+        def track_orphan(repo_root, **kwargs):
+            call_order.append("orphan_recovery")
+
+        with mock.patch("loom_tools.daemon_cleanup._kill_orphaned_tmux_sessions", side_effect=track_kill), \
+             mock.patch("loom_tools.daemon_cleanup._ensure_shepherd_config_dirs"), \
+             mock.patch("loom_tools.daemon_cleanup._terminate_active_sessions"), \
+             mock.patch("loom_tools.daemon_cleanup._revert_shepherd_labels"), \
+             mock.patch("loom_tools.daemon_cleanup._run_archive_logs"), \
+             mock.patch("loom_tools.daemon_cleanup._run_loom_clean"), \
+             mock.patch("loom_tools.daemon_cleanup.cleanup_stale_progress_files"), \
+             mock.patch("loom_tools.daemon_cleanup.cleanup_stale_signal_files"), \
+             mock.patch("loom_tools.claim.cleanup_claims", side_effect=track_claims), \
+             mock.patch("loom_tools.daemon_cleanup._run_orphan_recovery", side_effect=track_orphan):
+            handle_daemon_startup(tmp_path, config)
+
+        assert call_order.index("kill_sessions") < call_order.index("cleanup_claims")
+        assert call_order.index("kill_sessions") < call_order.index("orphan_recovery")

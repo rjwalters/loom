@@ -42,6 +42,7 @@ class DaemonConfig:
     iteration_timeout: int = DEFAULT_ITERATION_TIMEOUT
     force_mode: bool = False
     auto_build: bool = True
+    fresh: bool = False
     debug_mode: bool = False
     timeout_min: int = 0  # 0 = no timeout
 
@@ -82,6 +83,7 @@ class DaemonConfig:
         force_mode: bool = False,
         auto_build: bool = False,
         no_auto_build: bool = False,
+        fresh: bool = False,
         debug_mode: bool = False,
         timeout_min: int = 0,
     ) -> DaemonConfig:
@@ -91,6 +93,7 @@ class DaemonConfig:
             force_mode: Enable force mode (auto-promote, auto-merge)
             auto_build: Enable automatic shepherd spawning (kept for backward compat, now default)
             no_auto_build: Explicitly disable automatic shepherd spawning
+            fresh: Reset failure counters on startup (clean slate)
             debug_mode: Enable debug logging
             timeout_min: Stop daemon after N minutes (0 = no timeout)
         """
@@ -107,6 +110,7 @@ class DaemonConfig:
             iteration_timeout=env_int("LOOM_ITERATION_TIMEOUT", DEFAULT_ITERATION_TIMEOUT),
             force_mode=resolved_force,
             auto_build=resolved_auto_build,
+            fresh=fresh,
             debug_mode=debug_mode or env_bool("LOOM_DEBUG_MODE", False),
             timeout_min=timeout_min or env_int("LOOM_TIMEOUT_MIN", 0),
             max_shepherds=env_int("LOOM_MAX_SHEPHERDS", DEFAULT_MAX_SHEPHERDS),
