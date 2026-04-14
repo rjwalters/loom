@@ -140,6 +140,16 @@ def run_iteration(ctx: DaemonContext) -> IterationResult:
             )
     completions.extend(support_completions)
 
+    # 4c. Patch demand-based actions after support role reclaim.
+    #     The snapshot (step 1) computed recommended_actions before support
+    #     role reclaim happened. If a support role was "running" at snapshot
+    #     time but just completed, demand-based triggers (spawn_judge_demand,
+    #     spawn_doctor_demand, spawn_champion_demand) may be missing.
+    #     Patch them in so roles are re-spawned immediately rather than
+    #     waiting until the next iteration.
+    if support_completions and ctx.snapshot is not None and ctx.state is not None:
+        _patch_demand_actions_after_reclaim(ctx, support_completions)
+
     # 5. Get recommended actions
     actions = ctx.get_recommended_actions()
     if ctx.config.debug_mode:
@@ -278,6 +288,61 @@ def _reclaim_completed_support_roles(
     return completed
 
 
+def _patch_demand_actions_after_reclaim(
+    ctx: DaemonContext,
+    reclaimed: list,
+) -> None:
+    """Patch demand-based actions into snapshot after support role reclaim.
+
+    When a support role completes (tmux session exits) *after* the snapshot
+    was built, the snapshot's recommended_actions won't include demand
+    triggers for that role because it was "running" at snapshot time.  This
+    function checks the current PR counts from the snapshot and injects
+    the appropriate demand action so the role is re-spawned immediately.
+    """
+    if ctx.snapshot is None or ctx.state is None:
+        return
+
+    computed = ctx.snapshot.get("computed", {})
+    actions: list[str] = computed.get("recommended_actions", [])
+
+    reclaimed_roles = {c.name for c in reclaimed}
+
+    # Champion: PRs ready to merge
+    if "champion" in reclaimed_roles:
+        merge_count = computed.get("prs_ready_to_merge", 0)
+        champion_entry = ctx.state.support_roles.get("champion")
+        champion_status = champion_entry.status if champion_entry else "idle"
+        if merge_count > 0 and champion_status != "running" and "spawn_champion_demand" not in actions:
+            actions.append("spawn_champion_demand")
+            computed["champion_demand"] = True
+            log_info(f"Patched spawn_champion_demand: {merge_count} PR(s) ready to merge")
+
+    # Judge: PRs awaiting review
+    if "judge" in reclaimed_roles:
+        review_count = computed.get("prs_awaiting_review", 0)
+        judge_entry = ctx.state.support_roles.get("judge")
+        judge_status = judge_entry.status if judge_entry else "idle"
+        if review_count > 0 and judge_status != "running" and "spawn_judge_demand" not in actions and "spawn_judge_targeted" not in actions:
+            actions.append("spawn_judge_demand")
+            computed["judge_demand"] = True
+            log_info(f"Patched spawn_judge_demand: {review_count} PR(s) awaiting review")
+
+    # Doctor: PRs needing fixes
+    if "doctor" in reclaimed_roles:
+        changes_count = computed.get("prs_needing_fixes", 0)
+        doctor_entry = ctx.state.support_roles.get("doctor")
+        doctor_status = doctor_entry.status if doctor_entry else "idle"
+        if changes_count > 0 and doctor_status != "running" and "spawn_doctor_demand" not in actions and "spawn_doctor_targeted" not in actions:
+            actions.append("spawn_doctor_demand")
+            computed["doctor_demand"] = True
+            log_info(f"Patched spawn_doctor_demand: {changes_count} PR(s) needing fixes")
+
+    # Remove "wait" if we added demand actions
+    if any(a.startswith("spawn_") for a in actions) and "wait" in actions:
+        actions.remove("wait")
+
+
 def _save_daemon_state(ctx: DaemonContext) -> None:
     """Save the current daemon state to disk."""
     if ctx.state is None:
@@ -302,6 +367,14 @@ def _build_summary(ctx: DaemonContext, result: IterationResult) -> str:
         f"blocked={computed.get('total_blocked', 0)}",
         f"shepherds={computed.get('active_shepherds', 0)}/{ctx.config.max_shepherds}",
     ]
+
+    # Add PR counts when there are actionable PRs
+    prs_review = computed.get("prs_awaiting_review", 0)
+    prs_fixes = computed.get("prs_needing_fixes", 0)
+    prs_merge = computed.get("prs_ready_to_merge", 0)
+    total_prs = prs_review + prs_fixes + prs_merge
+    if total_prs > 0:
+        parts.append(f"prs={prs_review}r/{prs_fixes}f/{prs_merge}m")
 
     # Add spawned counts if any
     if result.shepherds_spawned > 0:
