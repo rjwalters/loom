@@ -758,7 +758,9 @@ class TestHandleDaemonStartupCleanupSignals:
              mock.patch("loom_tools.daemon_cleanup._run_loom_clean"), \
              mock.patch("loom_tools.daemon_cleanup.cleanup_stale_progress_files"), \
              mock.patch("loom_tools.daemon_cleanup.cleanup_stale_signal_files") as mock_cleanup, \
-             mock.patch("loom_tools.daemon_cleanup._run_orphan_recovery"):
+             mock.patch("loom_tools.daemon_cleanup._run_orphan_recovery"), \
+             mock.patch("loom_tools.daemon_cleanup._terminate_active_sessions"), \
+             mock.patch("loom_tools.daemon_cleanup._revert_shepherd_labels"):
             handle_daemon_startup(tmp_path, config, dry_run=True)
 
         mock_cleanup.assert_called_once()
@@ -775,8 +777,167 @@ class TestHandleDaemonStartupCleanupSignals:
              mock.patch("loom_tools.daemon_cleanup._run_loom_clean"), \
              mock.patch("loom_tools.daemon_cleanup.cleanup_stale_progress_files"), \
              mock.patch("loom_tools.daemon_cleanup.cleanup_stale_signal_files") as mock_cleanup, \
-             mock.patch("loom_tools.daemon_cleanup._run_orphan_recovery"):
+             mock.patch("loom_tools.daemon_cleanup._run_orphan_recovery"), \
+             mock.patch("loom_tools.daemon_cleanup._terminate_active_sessions"), \
+             mock.patch("loom_tools.daemon_cleanup._revert_shepherd_labels"):
             handle_daemon_startup(tmp_path, config, dry_run=True)
 
         mock_cleanup.assert_called_once()
         assert mock_cleanup.call_args.kwargs.get("dry_run") is True
+
+
+class TestHandleDaemonStartupCrashRecovery:
+    """Tests that daemon startup cleans up after a crash (issue #3099)."""
+
+    def _write_state(self, state_path: pathlib.Path, data: dict) -> None:
+        state_path.parent.mkdir(parents=True, exist_ok=True)
+        state_path.write_text(json.dumps(data))
+
+    def test_startup_kills_orphaned_sessions(self, tmp_path: pathlib.Path) -> None:
+        """Startup should terminate tmux sessions left by a crashed daemon."""
+        state_path = tmp_path / ".loom" / "daemon-state.json"
+        self._write_state(state_path, {
+            "running": True,
+            "shepherds": {
+                "shepherd-1": {"status": "working", "issue": 42},
+            },
+            "support_roles": {
+                "champion": {"status": "running", "tmux_session": "loom-champion"},
+            },
+        })
+
+        config = load_config()
+
+        with mock.patch("loom_tools.daemon_cleanup.session_exists", return_value=True), \
+             mock.patch("loom_tools.daemon_cleanup.kill_stuck_session") as m_kill, \
+             mock.patch("loom_tools.common.github.gh_run"), \
+             mock.patch("loom_tools.daemon_cleanup._run_archive_logs"), \
+             mock.patch("loom_tools.daemon_cleanup._run_loom_clean"), \
+             mock.patch("loom_tools.daemon_cleanup.cleanup_stale_progress_files"), \
+             mock.patch("loom_tools.daemon_cleanup.cleanup_stale_signal_files"), \
+             mock.patch("loom_tools.daemon_cleanup._run_orphan_recovery"):
+            handle_daemon_startup(tmp_path, config)
+
+        # Both shepherd and support role sessions should be killed
+        assert m_kill.call_count == 2
+        m_kill.assert_any_call("shepherd-1")
+        m_kill.assert_any_call("champion")
+
+    def test_startup_reverts_stale_labels(self, tmp_path: pathlib.Path) -> None:
+        """Startup should revert loom:building labels from a crashed daemon."""
+        state_path = tmp_path / ".loom" / "daemon-state.json"
+        self._write_state(state_path, {
+            "running": True,
+            "shepherds": {
+                "shepherd-1": {"status": "working", "issue": 42},
+                "shepherd-2": {"status": "working", "issue": 43},
+            },
+            "support_roles": {},
+        })
+
+        config = load_config()
+
+        with mock.patch("loom_tools.daemon_cleanup.session_exists", return_value=False), \
+             mock.patch("loom_tools.daemon_cleanup.kill_stuck_session"), \
+             mock.patch("loom_tools.common.github.gh_run") as m_gh, \
+             mock.patch("loom_tools.daemon_cleanup._run_archive_logs"), \
+             mock.patch("loom_tools.daemon_cleanup._run_loom_clean"), \
+             mock.patch("loom_tools.daemon_cleanup.cleanup_stale_progress_files"), \
+             mock.patch("loom_tools.daemon_cleanup.cleanup_stale_signal_files"), \
+             mock.patch("loom_tools.daemon_cleanup._run_orphan_recovery"):
+            handle_daemon_startup(tmp_path, config)
+
+        # Both issues should have labels reverted
+        assert m_gh.call_count == 2
+        m_gh.assert_any_call([
+            "issue", "edit", "42",
+            "--remove-label", "loom:building",
+            "--add-label", "loom:issue",
+        ])
+        m_gh.assert_any_call([
+            "issue", "edit", "43",
+            "--remove-label", "loom:building",
+            "--add-label", "loom:issue",
+        ])
+
+    def test_startup_crash_recovery_order(self, tmp_path: pathlib.Path) -> None:
+        """Crash recovery should: terminate sessions, revert labels, THEN other cleanup."""
+        state_path = tmp_path / ".loom" / "daemon-state.json"
+        self._write_state(state_path, {
+            "running": True,
+            "shepherds": {
+                "shepherd-1": {"status": "working", "issue": 42},
+            },
+            "support_roles": {},
+        })
+
+        call_order: list[str] = []
+
+        def track_terminate(*a, **kw):
+            call_order.append("terminate_sessions")
+
+        def track_revert(*a, **kw):
+            call_order.append("revert_labels")
+
+        def track_orphan_recovery(*a, **kw):
+            call_order.append("orphan_recovery")
+
+        config = load_config()
+
+        with mock.patch("loom_tools.daemon_cleanup._terminate_active_sessions", side_effect=track_terminate), \
+             mock.patch("loom_tools.daemon_cleanup._revert_shepherd_labels", side_effect=track_revert), \
+             mock.patch("loom_tools.daemon_cleanup._run_orphan_recovery", side_effect=track_orphan_recovery), \
+             mock.patch("loom_tools.daemon_cleanup._run_archive_logs"), \
+             mock.patch("loom_tools.daemon_cleanup._run_loom_clean"), \
+             mock.patch("loom_tools.daemon_cleanup.cleanup_stale_progress_files"), \
+             mock.patch("loom_tools.daemon_cleanup.cleanup_stale_signal_files"):
+            handle_daemon_startup(tmp_path, config, dry_run=True)
+
+        # Session termination and label revert must happen before orphan recovery
+        assert call_order.index("terminate_sessions") < call_order.index("orphan_recovery")
+        assert call_order.index("revert_labels") < call_order.index("orphan_recovery")
+
+    def test_startup_with_no_previous_state(self, tmp_path: pathlib.Path) -> None:
+        """Startup without previous daemon state should not error."""
+        loom_dir = tmp_path / ".loom"
+        loom_dir.mkdir()
+
+        config = load_config()
+
+        with mock.patch("loom_tools.daemon_cleanup._run_archive_logs"), \
+             mock.patch("loom_tools.daemon_cleanup._run_loom_clean"), \
+             mock.patch("loom_tools.daemon_cleanup.cleanup_stale_progress_files"), \
+             mock.patch("loom_tools.daemon_cleanup.cleanup_stale_signal_files"), \
+             mock.patch("loom_tools.daemon_cleanup._run_orphan_recovery"):
+            # Should not raise
+            handle_daemon_startup(tmp_path, config, dry_run=True)
+
+    def test_startup_dry_run_does_not_kill_or_revert(self, tmp_path: pathlib.Path) -> None:
+        """Dry run startup should not kill sessions or call gh."""
+        state_path = tmp_path / ".loom" / "daemon-state.json"
+        self._write_state(state_path, {
+            "running": True,
+            "shepherds": {
+                "shepherd-1": {"status": "working", "issue": 42},
+            },
+            "support_roles": {
+                "champion": {"status": "running", "tmux_session": "loom-champion"},
+            },
+        })
+
+        config = load_config()
+
+        with mock.patch("loom_tools.daemon_cleanup.session_exists") as m_exists, \
+             mock.patch("loom_tools.daemon_cleanup.kill_stuck_session") as m_kill, \
+             mock.patch("loom_tools.common.github.gh_run") as m_gh, \
+             mock.patch("loom_tools.daemon_cleanup._run_archive_logs"), \
+             mock.patch("loom_tools.daemon_cleanup._run_loom_clean"), \
+             mock.patch("loom_tools.daemon_cleanup.cleanup_stale_progress_files"), \
+             mock.patch("loom_tools.daemon_cleanup.cleanup_stale_signal_files"), \
+             mock.patch("loom_tools.daemon_cleanup._run_orphan_recovery"):
+            handle_daemon_startup(tmp_path, config, dry_run=True)
+
+        # In dry_run mode, _terminate_active_sessions and _revert_shepherd_labels
+        # log but do not kill or call gh
+        m_kill.assert_not_called()
+        m_gh.assert_not_called()

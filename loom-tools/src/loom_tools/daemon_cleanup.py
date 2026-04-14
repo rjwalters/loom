@@ -657,12 +657,29 @@ def handle_daemon_startup(
     *,
     dry_run: bool = False,
 ) -> None:
-    """Cleanup stale artifacts from a previous daemon session."""
+    """Cleanup stale artifacts from a previous daemon session.
+
+    Steps 0a-0b run *before* the daemon state is rotated by the caller so
+    they can read the previous daemon state to discover which sessions were
+    active and which issues had ``loom:building`` labels.  This handles the
+    crash scenario where the previous daemon died without running shutdown
+    cleanup.
+    """
     log_info("Daemon Startup Cleanup")
 
     state_path = repo_root / ".loom" / "daemon-state.json"
 
-    # 0. Clean up expired file-based claims from previous session
+    # 0a. Kill orphaned tmux sessions left by a crashed previous daemon.
+    #     Must happen before state rotation so we can read previous state.
+    log_info("Cleaning up orphaned tmux sessions from previous daemon...")
+    _terminate_active_sessions(state_path, dry_run=dry_run)
+
+    # 0b. Revert stale loom:building labels for issues that were mid-build
+    #     when the previous daemon crashed.
+    log_info("Reverting stale labels from previous daemon...")
+    _revert_shepherd_labels(state_path, dry_run=dry_run)
+
+    # 0c. Clean up expired file-based claims from previous session
     log_info("Cleaning up expired claims...")
     if not dry_run:
         from loom_tools.claim import cleanup_claims
