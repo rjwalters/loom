@@ -31,11 +31,11 @@ if TYPE_CHECKING:
 # Tier 1: Early warning for shepherds that may have failed at startup.
 # After this many seconds without a progress file, log a warning and
 # capture tmux output but do NOT kill the session.
-STARTUP_GRACE_PERIOD = 120  # 2 minutes
+STARTUP_GRACE_PERIOD = 300  # 5 minutes
 
 # Tier 2: Hard reclaim for shepherds that never created a progress file.
 # After this many seconds, kill the session and save diagnostic output.
-NO_PROGRESS_GRACE_PERIOD = 300  # 5 minutes
+NO_PROGRESS_GRACE_PERIOD = 600  # 10 minutes
 
 
 def _collect_open_issue_numbers(ctx: DaemonContext) -> set[int]:
@@ -553,9 +553,9 @@ def _check_no_progress_file(
     """Check if a working shepherd has no progress file past the grace period.
 
     Implements two-tier detection:
-      Tier 1 (startup_grace_period, default 120s): Log a warning, capture tmux
+      Tier 1 (startup_grace_period, default 300s): Log a warning, capture tmux
         output snapshot, and set ``startup_warning_at`` but do NOT reclaim.
-      Tier 2 (no_progress_grace_period, default 300s): Save diagnostic output
+      Tier 2 (no_progress_grace_period, default 600s): Save diagnostic output
         to ``.loom/logs/`` and return True to trigger reclaim.
 
     Returns True if the shepherd should be considered stale (Tier 2).
