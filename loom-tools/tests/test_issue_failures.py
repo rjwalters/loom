@@ -14,6 +14,7 @@ from loom_tools.common.issue_failures import (
     _DEFAULT_FAILURE_THRESHOLD,
     IssueFailureEntry,
     IssueFailureLog,
+    _decay_on_main_advance,
     get_failure_entry,
     load_failure_log,
     merge_into_daemon_state,
@@ -454,3 +455,271 @@ class TestConfigurableThreshold:
         """IssueFailureEntry.block_threshold falls back to MAX_FAILURES_BEFORE_BLOCK."""
         entry = IssueFailureEntry(total_failures=1, error_class="builder_stuck")
         assert entry.block_threshold == MAX_FAILURES_BEFORE_BLOCK
+
+
+# ── Commit-based decay ────────────────────────────────────────
+
+
+class TestDecayOnMainAdvance:
+    """Tests for failure counter decay when main branch advances (issue #3112)."""
+
+    def test_no_decay_when_sha_unchanged(self) -> None:
+        """No decay when main SHA has not changed."""
+        log = IssueFailureLog(
+            entries={"42": IssueFailureEntry(issue=42, total_failures=4)},
+            last_known_main_sha="aaa111",
+        )
+        modified = _decay_on_main_advance(log, "aaa111")
+        assert modified is False
+        assert log.entries["42"].total_failures == 4
+
+    def test_no_decay_when_sha_first_seen(self) -> None:
+        """First time seeing a SHA — record it, don't decay."""
+        log = IssueFailureLog(
+            entries={"42": IssueFailureEntry(issue=42, total_failures=4)},
+            last_known_main_sha=None,
+        )
+        modified = _decay_on_main_advance(log, "aaa111")
+        assert modified is False
+        assert log.entries["42"].total_failures == 4
+        assert log.last_known_main_sha == "aaa111"
+
+    def test_decay_halves_failure_count(self) -> None:
+        """When main advances, failure counts are halved."""
+        log = IssueFailureLog(
+            entries={"42": IssueFailureEntry(issue=42, total_failures=4)},
+            last_known_main_sha="aaa111",
+        )
+        modified = _decay_on_main_advance(log, "bbb222")
+        assert modified is True
+        assert log.entries["42"].total_failures == 2
+        assert log.last_known_main_sha == "bbb222"
+
+    def test_decay_removes_zero_entries(self) -> None:
+        """Entries that decay to zero are removed."""
+        log = IssueFailureLog(
+            entries={"42": IssueFailureEntry(issue=42, total_failures=1)},
+            last_known_main_sha="aaa111",
+        )
+        modified = _decay_on_main_advance(log, "bbb222")
+        assert modified is True
+        assert "42" not in log.entries
+
+    def test_decay_mixed_entries(self) -> None:
+        """Some entries removed, others reduced."""
+        log = IssueFailureLog(
+            entries={
+                "42": IssueFailureEntry(issue=42, total_failures=1),  # -> 0, removed
+                "99": IssueFailureEntry(issue=99, total_failures=6),  # -> 3, kept
+                "77": IssueFailureEntry(issue=77, total_failures=2),  # -> 1, kept
+            },
+            last_known_main_sha="aaa111",
+        )
+        modified = _decay_on_main_advance(log, "bbb222")
+        assert modified is True
+        assert "42" not in log.entries
+        assert log.entries["99"].total_failures == 3
+        assert log.entries["77"].total_failures == 1
+
+    def test_decay_unblocks_previously_blocked_issue(self) -> None:
+        """An issue at the block threshold is unblocked after decay."""
+        entry = IssueFailureEntry(
+            issue=42,
+            total_failures=MAX_FAILURES_BEFORE_BLOCK,
+            error_class="builder_stuck",
+        )
+        assert entry.should_auto_block is True
+
+        log = IssueFailureLog(
+            entries={"42": entry},
+            last_known_main_sha="aaa111",
+        )
+        _decay_on_main_advance(log, "bbb222")
+
+        # 5 // 2 = 2, which is below the block threshold
+        assert log.entries["42"].total_failures == MAX_FAILURES_BEFORE_BLOCK // 2
+        assert log.entries["42"].should_auto_block is False
+
+    def test_no_decay_when_entries_empty(self) -> None:
+        """No modification when there are no failure entries."""
+        log = IssueFailureLog(
+            entries={},
+            last_known_main_sha="aaa111",
+        )
+        modified = _decay_on_main_advance(log, "bbb222")
+        assert modified is False
+        assert log.last_known_main_sha == "bbb222"
+
+    def test_successive_decays(self) -> None:
+        """Multiple main advances progressively decay failures."""
+        log = IssueFailureLog(
+            entries={"42": IssueFailureEntry(issue=42, total_failures=8)},
+            last_known_main_sha="sha1",
+        )
+
+        # First advance: 8 -> 4
+        _decay_on_main_advance(log, "sha2")
+        assert log.entries["42"].total_failures == 4
+
+        # Second advance: 4 -> 2
+        _decay_on_main_advance(log, "sha3")
+        assert log.entries["42"].total_failures == 2
+
+        # Third advance: 2 -> 1
+        _decay_on_main_advance(log, "sha4")
+        assert log.entries["42"].total_failures == 1
+
+        # Fourth advance: 1 -> 0, removed
+        _decay_on_main_advance(log, "sha5")
+        assert "42" not in log.entries
+
+
+class TestLoadWithDecay:
+    """Tests for load_failure_log with commit-based decay via _main_sha."""
+
+    def test_load_triggers_decay_on_sha_change(self, repo: pathlib.Path) -> None:
+        """Loading with a new SHA triggers decay and saves."""
+        # Write initial state with known SHA
+        _write_failures(repo, {
+            "entries": {
+                "42": {
+                    "issue": 42,
+                    "total_failures": 4,
+                    "error_class": "builder_stuck",
+                    "phase": "builder",
+                }
+            },
+            "updated_at": "2026-01-01T00:00:00Z",
+            "last_known_main_sha": "old_sha",
+        })
+
+        log = load_failure_log(repo, _main_sha="new_sha")
+        assert log.entries["42"].total_failures == 2  # 4 // 2
+
+        # Verify it was persisted
+        data = _read_failures(repo)
+        assert data["entries"]["42"]["total_failures"] == 2
+        assert data["last_known_main_sha"] == "new_sha"
+
+    def test_load_no_decay_when_sha_same(self, repo: pathlib.Path) -> None:
+        """Loading with the same SHA does not trigger decay."""
+        _write_failures(repo, {
+            "entries": {
+                "42": {
+                    "issue": 42,
+                    "total_failures": 4,
+                    "error_class": "builder_stuck",
+                    "phase": "builder",
+                }
+            },
+            "updated_at": "2026-01-01T00:00:00Z",
+            "last_known_main_sha": "same_sha",
+        })
+
+        log = load_failure_log(repo, _main_sha="same_sha")
+        assert log.entries["42"].total_failures == 4
+
+    def test_load_no_decay_when_sha_none(self, repo: pathlib.Path) -> None:
+        """Loading with SHA=None (git unavailable) skips decay."""
+        _write_failures(repo, {
+            "entries": {
+                "42": {
+                    "issue": 42,
+                    "total_failures": 4,
+                    "error_class": "builder_stuck",
+                    "phase": "builder",
+                }
+            },
+            "updated_at": "2026-01-01T00:00:00Z",
+            "last_known_main_sha": "old_sha",
+        })
+
+        log = load_failure_log(repo, _main_sha=None)
+        assert log.entries["42"].total_failures == 4
+
+    def test_load_decay_removes_entries_at_one(self, repo: pathlib.Path) -> None:
+        """Entries with 1 failure are removed on decay (1 // 2 == 0)."""
+        _write_failures(repo, {
+            "entries": {
+                "42": {
+                    "issue": 42,
+                    "total_failures": 1,
+                    "error_class": "builder_stuck",
+                    "phase": "builder",
+                }
+            },
+            "updated_at": "2026-01-01T00:00:00Z",
+            "last_known_main_sha": "old_sha",
+        })
+
+        log = load_failure_log(repo, _main_sha="new_sha")
+        assert "42" not in log.entries
+
+    def test_load_decay_then_filter_unblocks_issue(self, repo: pathlib.Path) -> None:
+        """After decay, previously blocked issues pass the backoff filter."""
+        _write_failures(repo, {
+            "entries": {
+                "42": {
+                    "issue": 42,
+                    "total_failures": MAX_FAILURES_BEFORE_BLOCK,
+                    "error_class": "builder_stuck",
+                    "phase": "builder",
+                }
+            },
+            "updated_at": "2026-01-01T00:00:00Z",
+            "last_known_main_sha": "old_sha",
+        })
+
+        # Before decay: issue is blocked
+        log_before = load_failure_log(repo, _main_sha="old_sha")
+        issues = [{"number": 42}]
+        result = filter_issues_by_failure_backoff(issues, log_before, current_iteration=1)
+        assert len(result) == 0  # Blocked
+
+        # After main advances: issue is unblocked
+        log_after = load_failure_log(repo, _main_sha="new_sha")
+        result = filter_issues_by_failure_backoff(issues, log_after, current_iteration=3)
+        assert len(result) == 1  # Unblocked (2 failures, backoff=2, iter 3 % 3 == 0)
+
+
+class TestIssueFailureLogSerialization:
+    """Tests for last_known_main_sha serialization."""
+
+    def test_round_trip_with_sha(self) -> None:
+        log = IssueFailureLog(
+            entries={},
+            updated_at="2026-01-01T00:00:00Z",
+            last_known_main_sha="abc123def456",
+        )
+        data = log.to_dict()
+        assert data["last_known_main_sha"] == "abc123def456"
+
+        restored = IssueFailureLog.from_dict(data)
+        assert restored.last_known_main_sha == "abc123def456"
+
+    def test_round_trip_without_sha(self) -> None:
+        log = IssueFailureLog(
+            entries={},
+            updated_at="2026-01-01T00:00:00Z",
+        )
+        data = log.to_dict()
+        assert "last_known_main_sha" not in data
+
+        restored = IssueFailureLog.from_dict(data)
+        assert restored.last_known_main_sha is None
+
+    def test_backward_compatible_load(self) -> None:
+        """Old files without last_known_main_sha field load correctly."""
+        data = {
+            "entries": {
+                "42": {
+                    "issue": 42,
+                    "total_failures": 3,
+                    "error_class": "builder_stuck",
+                }
+            },
+            "updated_at": "2026-01-01T00:00:00Z",
+        }
+        log = IssueFailureLog.from_dict(data)
+        assert log.last_known_main_sha is None
+        assert log.entries["42"].total_failures == 3

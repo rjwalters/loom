@@ -20,14 +20,21 @@ File format::
                 "last_success_at": null
             }
         },
-        "updated_at": "2026-01-22T14:30:00Z"
+        "updated_at": "2026-01-22T14:30:00Z",
+        "last_known_main_sha": "abc123..."
     }
+
+**Commit-based decay**: When the main branch advances (new commits land),
+failure counters are automatically halved. This ensures that transient
+failures caused by missing infrastructure or stale state don't permanently
+block issues after the underlying conditions change. See issue #3112.
 """
 
 from __future__ import annotations
 
 import logging
 import os
+import subprocess
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -70,9 +77,37 @@ INFRASTRUCTURE_ERROR_CLASSES: frozenset[str] = frozenset({
 # 1st failure: 0, 2nd: 2, 3rd: 4, 4th: 8, 5th: auto-block
 BACKOFF_BASE = 2
 
+# Sentinel for _main_sha parameter — distinguishes "auto-detect" from "None"
+_SENTINEL: Any = object()
+
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def get_main_branch_sha(repo_root: Path) -> str | None:
+    """Get the current SHA of the main branch (origin/main).
+
+    Uses ``git rev-parse`` to resolve ``origin/main``. Falls back to ``main``
+    if the remote ref is unavailable. Returns ``None`` on any error so that
+    callers can gracefully skip the decay check.
+    """
+    for ref in ("origin/main", "main"):
+        try:
+            result = subprocess.run(
+                ["git", "rev-parse", ref],
+                capture_output=True,
+                text=True,
+                cwd=repo_root,
+                timeout=5,
+            )
+            if result.returncode == 0:
+                sha = result.stdout.strip()
+                if sha:
+                    return sha
+        except Exception:
+            continue
+    return None
 
 
 @dataclass
@@ -155,6 +190,7 @@ class IssueFailureLog:
 
     entries: dict[str, IssueFailureEntry] = field(default_factory=dict)
     updated_at: str | None = None
+    last_known_main_sha: str | None = None
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> IssueFailureLog:
@@ -166,19 +202,89 @@ class IssueFailureLog:
         return cls(
             entries=entries,
             updated_at=data.get("updated_at"),
+            last_known_main_sha=data.get("last_known_main_sha"),
         )
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        d: dict[str, Any] = {
             "entries": {k: v.to_dict() for k, v in self.entries.items()},
             "updated_at": self.updated_at,
         }
+        if self.last_known_main_sha is not None:
+            d["last_known_main_sha"] = self.last_known_main_sha
+        return d
 
 
-def load_failure_log(repo_root: Path) -> IssueFailureLog:
+def _decay_on_main_advance(
+    log: IssueFailureLog,
+    current_sha: str,
+) -> bool:
+    """Decay failure counters if the main branch has advanced.
+
+    When new commits land on main, the conditions that caused failures may
+    no longer apply (e.g., missing infrastructure got deployed, stale state
+    was cleaned up). Halving failure counts gives issues another chance while
+    still preserving some history for genuinely broken issues.
+
+    Entries whose count drops to zero are removed entirely.
+
+    Returns True if the log was modified.
+    """
+    if log.last_known_main_sha is None:
+        # First time tracking — record SHA without decaying
+        log.last_known_main_sha = current_sha
+        return False
+
+    if log.last_known_main_sha == current_sha:
+        return False
+
+    # Main has advanced — decay all failure counters
+    old_sha = log.last_known_main_sha
+
+    if not log.entries:
+        log.last_known_main_sha = current_sha
+        return False
+
+    to_remove: list[str] = []
+    for key, entry in log.entries.items():
+        entry.total_failures = entry.total_failures // 2
+        if entry.total_failures == 0:
+            to_remove.append(key)
+
+    for key in to_remove:
+        del log.entries[key]
+
+    log.last_known_main_sha = current_sha
+
+    removed_count = len(to_remove)
+    remaining_count = len(log.entries)
+    logger.info(
+        "Main branch advanced (%s -> %s): decayed failure counters "
+        "(removed=%d, remaining=%d)",
+        old_sha[:8] if old_sha else "?",
+        current_sha[:8],
+        removed_count,
+        remaining_count,
+    )
+    return True
+
+
+def load_failure_log(
+    repo_root: Path,
+    *,
+    _main_sha: str | None = _SENTINEL,
+) -> IssueFailureLog:
     """Load the persistent failure log from disk.
 
+    Automatically checks if the main branch has advanced since the last save,
+    and if so, halves all failure counters (commit-based decay). Entries that
+    decay to zero are removed.
+
     Returns an empty log if the file is missing or corrupt.
+
+    Args:
+        repo_root: Repository root path.
+        _main_sha: Override for testing. Use the sentinel default to auto-detect.
     """
     paths = LoomPaths(repo_root)
     fpath = paths.issue_failures_file
@@ -189,17 +295,41 @@ def load_failure_log(repo_root: Path) -> IssueFailureLog:
     try:
         data = read_json_file(fpath)
         if isinstance(data, dict):
-            return IssueFailureLog.from_dict(data)
+            log = IssueFailureLog.from_dict(data)
+        else:
+            return IssueFailureLog()
     except Exception:
         logger.warning("Corrupt issue-failures.json, starting fresh")
+        return IssueFailureLog()
 
-    return IssueFailureLog()
+    # Check for main branch advance and decay if needed
+    if _main_sha is _SENTINEL:
+        current_sha = get_main_branch_sha(repo_root)
+    else:
+        current_sha = _main_sha
+
+    if current_sha is not None and log.entries:
+        modified = _decay_on_main_advance(log, current_sha)
+        if modified:
+            save_failure_log(repo_root, log)
+
+    return log
 
 
 def save_failure_log(repo_root: Path, log: IssueFailureLog) -> None:
-    """Save the persistent failure log to disk."""
+    """Save the persistent failure log to disk.
+
+    Also records the current main branch SHA so we can detect advances
+    on the next load.
+    """
     paths = LoomPaths(repo_root)
     log.updated_at = _now_iso()
+
+    # Update the main SHA on save so the next load can compare
+    current_sha = get_main_branch_sha(repo_root)
+    if current_sha is not None:
+        log.last_known_main_sha = current_sha
+
     write_json_file(paths.issue_failures_file, log.to_dict())
 
 
