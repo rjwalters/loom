@@ -1339,12 +1339,18 @@ def compute_health(
     curated_count: int = 0,
     architect_count: int = 0,
     hermit_count: int = 0,
+    review_count: int = 0,
+    changes_count: int = 0,
+    merge_count: int = 0,
 ) -> tuple[str, list[dict[str, str]]]:
     """Compute health status and warnings.
 
     Returns ``(health_status, health_warnings)``.
     """
     warnings: list[dict[str, str]] = []
+
+    # Total actionable PR work (PRs needing review, fixes, or merging)
+    actionable_pr_count = review_count + changes_count + merge_count
 
     # contradictory_labels — entities with mutually exclusive labels
     if contradictory_labels:
@@ -1358,8 +1364,8 @@ def compute_health(
                 "message": f"{entity_type} #{number} has contradictory labels: {labels}",
             })
 
-    # pipeline_stalled
-    if ready_count == 0 and building_count == 0 and blocked_count > 0:
+    # pipeline_stalled — only when there are no actionable PRs either
+    if ready_count == 0 and building_count == 0 and blocked_count > 0 and actionable_pr_count == 0:
         warnings.append({
             "code": "pipeline_stalled",
             "level": "warning",
@@ -1391,12 +1397,27 @@ def compute_health(
             "message": f"Pipeline blocked on human input: {', '.join(parts)}",
         })
 
-    # no_work_available
-    if ready_count == 0 and building_count == 0 and blocked_count == 0 and total_proposals == 0:
+    # no_work_available — only when there are also no actionable PRs
+    if ready_count == 0 and building_count == 0 and blocked_count == 0 and total_proposals == 0 and actionable_pr_count == 0:
         warnings.append({
             "code": "no_work_available",
             "level": "info",
             "message": "No ready, building, blocked, or proposed issues — pipeline is empty",
+        })
+
+    # prs_in_progress — informational: no issue work but PRs need attention
+    if ready_count == 0 and building_count == 0 and blocked_count == 0 and total_proposals == 0 and actionable_pr_count > 0:
+        parts = []
+        if review_count > 0:
+            parts.append(f"{review_count} awaiting review")
+        if changes_count > 0:
+            parts.append(f"{changes_count} needing fixes")
+        if merge_count > 0:
+            parts.append(f"{merge_count} ready to merge")
+        warnings.append({
+            "code": "prs_in_progress",
+            "level": "info",
+            "message": f"No issue work, but {actionable_pr_count} PR(s) need attention: {', '.join(parts)}",
         })
 
     # stale_heartbeats
@@ -1716,6 +1737,9 @@ def build_snapshot(
         curated_count=curated_count,
         architect_count=architect_count,
         hermit_count=hermit_count,
+        review_count=review_count,
+        changes_count=changes_count,
+        merge_count=merge_count,
     )
 
     # 18. Build support_roles output (schema matches shell)

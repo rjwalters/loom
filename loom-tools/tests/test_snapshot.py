@@ -1478,6 +1478,81 @@ class TestHealth:
         ci_warns = [w for w in warnings if w["code"] == "ci_failing"]
         assert len(ci_warns) == 0
 
+    def test_no_work_available_suppressed_when_prs_exist(self) -> None:
+        """no_work_available should NOT be emitted when PRs need attention."""
+        status, warnings = compute_health(
+            ready_count=0, building_count=0, blocked_count=0,
+            total_proposals=0, stale_heartbeat_count=0, orphaned_count=0,
+            usage_healthy=True, session_percent=50.0,
+            review_count=1,
+        )
+        assert not any(w["code"] == "no_work_available" for w in warnings)
+
+    def test_no_work_available_suppressed_when_merge_ready(self) -> None:
+        """no_work_available should NOT be emitted when PRs ready to merge."""
+        status, warnings = compute_health(
+            ready_count=0, building_count=0, blocked_count=0,
+            total_proposals=0, stale_heartbeat_count=0, orphaned_count=0,
+            usage_healthy=True, session_percent=50.0,
+            merge_count=2,
+        )
+        assert not any(w["code"] == "no_work_available" for w in warnings)
+
+    def test_no_work_available_suppressed_when_changes_requested(self) -> None:
+        """no_work_available should NOT be emitted when PRs need fixes."""
+        status, warnings = compute_health(
+            ready_count=0, building_count=0, blocked_count=0,
+            total_proposals=0, stale_heartbeat_count=0, orphaned_count=0,
+            usage_healthy=True, session_percent=50.0,
+            changes_count=1,
+        )
+        assert not any(w["code"] == "no_work_available" for w in warnings)
+
+    def test_prs_in_progress_shown_when_only_pr_work(self) -> None:
+        """prs_in_progress should be emitted when no issue work but PRs exist."""
+        status, warnings = compute_health(
+            ready_count=0, building_count=0, blocked_count=0,
+            total_proposals=0, stale_heartbeat_count=0, orphaned_count=0,
+            usage_healthy=True, session_percent=50.0,
+            review_count=1, merge_count=2,
+        )
+        pr_warns = [w for w in warnings if w["code"] == "prs_in_progress"]
+        assert len(pr_warns) == 1
+        assert "3 PR(s) need attention" in pr_warns[0]["message"]
+        assert "1 awaiting review" in pr_warns[0]["message"]
+        assert "2 ready to merge" in pr_warns[0]["message"]
+        assert status == "degraded"  # info-level only
+
+    def test_prs_in_progress_not_shown_when_issues_exist(self) -> None:
+        """prs_in_progress should NOT be emitted when issue work exists."""
+        status, warnings = compute_health(
+            ready_count=1, building_count=0, blocked_count=0,
+            total_proposals=0, stale_heartbeat_count=0, orphaned_count=0,
+            usage_healthy=True, session_percent=50.0,
+            review_count=1, merge_count=2,
+        )
+        assert not any(w["code"] == "prs_in_progress" for w in warnings)
+
+    def test_pipeline_stalled_suppressed_when_prs_actionable(self) -> None:
+        """pipeline_stalled should NOT be emitted when actionable PRs exist."""
+        status, warnings = compute_health(
+            ready_count=0, building_count=0, blocked_count=3,
+            total_proposals=0, stale_heartbeat_count=0, orphaned_count=0,
+            usage_healthy=True, session_percent=50.0,
+            merge_count=1,
+        )
+        assert not any(w["code"] == "pipeline_stalled" for w in warnings)
+
+    def test_pipeline_stalled_still_emitted_without_prs(self) -> None:
+        """pipeline_stalled should still be emitted when no actionable PRs."""
+        status, warnings = compute_health(
+            ready_count=0, building_count=0, blocked_count=3,
+            total_proposals=0, stale_heartbeat_count=0, orphaned_count=0,
+            usage_healthy=True, session_percent=50.0,
+            review_count=0, changes_count=0, merge_count=0,
+        )
+        assert any(w["code"] == "pipeline_stalled" for w in warnings)
+
 
 # ---------------------------------------------------------------------------
 # Tmux pool detection

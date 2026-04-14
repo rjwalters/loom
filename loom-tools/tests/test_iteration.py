@@ -11,8 +11,14 @@ from unittest import mock
 
 from loom_tools.daemon_v2.config import DaemonConfig
 from loom_tools.daemon_v2.context import DaemonContext
-from loom_tools.daemon_v2.iteration import _build_summary, run_iteration, IterationResult
-from loom_tools.models.daemon_state import DaemonState, ShepherdEntry
+from loom_tools.daemon_v2.iteration import (
+    _build_summary,
+    _patch_demand_actions_after_reclaim,
+    run_iteration,
+    IterationResult,
+)
+from loom_tools.daemon_v2.actions.completions import CompletionEntry
+from loom_tools.models.daemon_state import DaemonState, ShepherdEntry, SupportRoleEntry
 
 
 def _make_ctx(
@@ -273,3 +279,142 @@ class TestBuildSummaryHumanInput:
         result = IterationResult(status="success", summary="")
         summary = _build_summary(ctx, result)
         assert "human_input_needed" not in summary
+
+
+class TestBuildSummaryPRCounts:
+    """Tests for PR counts in _build_summary."""
+
+    def test_summary_includes_pr_counts_when_prs_exist(self, tmp_path: pathlib.Path) -> None:
+        """Summary shows PR counts when there are actionable PRs."""
+        ctx = _make_ctx(tmp_path)
+        ctx.snapshot["computed"]["prs_awaiting_review"] = 2
+        ctx.snapshot["computed"]["prs_needing_fixes"] = 1
+        ctx.snapshot["computed"]["prs_ready_to_merge"] = 3
+
+        result = IterationResult(status="success", summary="")
+        summary = _build_summary(ctx, result)
+        assert "prs=2r/1f/3m" in summary
+
+    def test_summary_omits_pr_counts_when_zero(self, tmp_path: pathlib.Path) -> None:
+        """Summary omits PR counts when no actionable PRs."""
+        ctx = _make_ctx(tmp_path)
+        ctx.snapshot["computed"]["prs_awaiting_review"] = 0
+        ctx.snapshot["computed"]["prs_needing_fixes"] = 0
+        ctx.snapshot["computed"]["prs_ready_to_merge"] = 0
+
+        result = IterationResult(status="success", summary="")
+        summary = _build_summary(ctx, result)
+        assert "prs=" not in summary
+
+    def test_summary_shows_pr_counts_with_only_review(self, tmp_path: pathlib.Path) -> None:
+        """Summary shows PR counts when only review-requested PRs exist."""
+        ctx = _make_ctx(tmp_path)
+        ctx.snapshot["computed"]["prs_awaiting_review"] = 1
+        ctx.snapshot["computed"]["prs_needing_fixes"] = 0
+        ctx.snapshot["computed"]["prs_ready_to_merge"] = 0
+
+        result = IterationResult(status="success", summary="")
+        summary = _build_summary(ctx, result)
+        assert "prs=1r/0f/0m" in summary
+
+
+class TestPatchDemandActionsAfterReclaim:
+    """Tests for _patch_demand_actions_after_reclaim."""
+
+    def test_patches_champion_demand_on_reclaim(self, tmp_path: pathlib.Path) -> None:
+        """When champion completes and PRs ready to merge, patches demand action."""
+        ctx = _make_ctx(tmp_path)
+        ctx.state.support_roles["champion"] = SupportRoleEntry(status="idle")
+        ctx.snapshot["computed"]["prs_ready_to_merge"] = 2
+        ctx.snapshot["computed"]["recommended_actions"] = ["wait"]
+
+        reclaimed = [CompletionEntry(type="support_role", name="champion")]
+        _patch_demand_actions_after_reclaim(ctx, reclaimed)
+
+        actions = ctx.snapshot["computed"]["recommended_actions"]
+        assert "spawn_champion_demand" in actions
+        assert ctx.snapshot["computed"]["champion_demand"] is True
+        assert "wait" not in actions
+
+    def test_patches_judge_demand_on_reclaim(self, tmp_path: pathlib.Path) -> None:
+        """When judge completes and PRs awaiting review, patches demand action."""
+        ctx = _make_ctx(tmp_path)
+        ctx.state.support_roles["judge"] = SupportRoleEntry(status="idle")
+        ctx.snapshot["computed"]["prs_awaiting_review"] = 1
+        ctx.snapshot["computed"]["recommended_actions"] = ["wait"]
+
+        reclaimed = [CompletionEntry(type="support_role", name="judge")]
+        _patch_demand_actions_after_reclaim(ctx, reclaimed)
+
+        actions = ctx.snapshot["computed"]["recommended_actions"]
+        assert "spawn_judge_demand" in actions
+        assert ctx.snapshot["computed"]["judge_demand"] is True
+
+    def test_patches_doctor_demand_on_reclaim(self, tmp_path: pathlib.Path) -> None:
+        """When doctor completes and PRs need fixes, patches demand action."""
+        ctx = _make_ctx(tmp_path)
+        ctx.state.support_roles["doctor"] = SupportRoleEntry(status="idle")
+        ctx.snapshot["computed"]["prs_needing_fixes"] = 1
+        ctx.snapshot["computed"]["recommended_actions"] = ["wait"]
+
+        reclaimed = [CompletionEntry(type="support_role", name="doctor")]
+        _patch_demand_actions_after_reclaim(ctx, reclaimed)
+
+        actions = ctx.snapshot["computed"]["recommended_actions"]
+        assert "spawn_doctor_demand" in actions
+        assert ctx.snapshot["computed"]["doctor_demand"] is True
+
+    def test_no_patch_when_no_pr_work(self, tmp_path: pathlib.Path) -> None:
+        """No patch when no PRs need attention for the reclaimed role."""
+        ctx = _make_ctx(tmp_path)
+        ctx.state.support_roles["champion"] = SupportRoleEntry(status="idle")
+        ctx.snapshot["computed"]["prs_ready_to_merge"] = 0
+        ctx.snapshot["computed"]["recommended_actions"] = ["wait"]
+
+        reclaimed = [CompletionEntry(type="support_role", name="champion")]
+        _patch_demand_actions_after_reclaim(ctx, reclaimed)
+
+        actions = ctx.snapshot["computed"]["recommended_actions"]
+        assert "spawn_champion_demand" not in actions
+        assert "wait" in actions
+
+    def test_no_patch_when_already_has_demand_action(self, tmp_path: pathlib.Path) -> None:
+        """No duplicate patch when demand action already exists."""
+        ctx = _make_ctx(tmp_path)
+        ctx.state.support_roles["judge"] = SupportRoleEntry(status="idle")
+        ctx.snapshot["computed"]["prs_awaiting_review"] = 1
+        ctx.snapshot["computed"]["recommended_actions"] = ["spawn_judge_demand"]
+
+        reclaimed = [CompletionEntry(type="support_role", name="judge")]
+        _patch_demand_actions_after_reclaim(ctx, reclaimed)
+
+        actions = ctx.snapshot["computed"]["recommended_actions"]
+        assert actions.count("spawn_judge_demand") == 1
+
+    def test_no_patch_when_targeted_action_exists(self, tmp_path: pathlib.Path) -> None:
+        """No patch when targeted demand action already exists."""
+        ctx = _make_ctx(tmp_path)
+        ctx.state.support_roles["judge"] = SupportRoleEntry(status="idle")
+        ctx.snapshot["computed"]["prs_awaiting_review"] = 1
+        ctx.snapshot["computed"]["recommended_actions"] = ["spawn_judge_targeted"]
+
+        reclaimed = [CompletionEntry(type="support_role", name="judge")]
+        _patch_demand_actions_after_reclaim(ctx, reclaimed)
+
+        actions = ctx.snapshot["computed"]["recommended_actions"]
+        assert "spawn_judge_demand" not in actions
+
+    def test_removes_wait_when_demand_added(self, tmp_path: pathlib.Path) -> None:
+        """Wait action removed when demand action is patched in."""
+        ctx = _make_ctx(tmp_path)
+        ctx.state.support_roles["champion"] = SupportRoleEntry(status="idle")
+        ctx.snapshot["computed"]["prs_ready_to_merge"] = 1
+        ctx.snapshot["computed"]["recommended_actions"] = ["check_stuck", "wait"]
+
+        reclaimed = [CompletionEntry(type="support_role", name="champion")]
+        _patch_demand_actions_after_reclaim(ctx, reclaimed)
+
+        actions = ctx.snapshot["computed"]["recommended_actions"]
+        assert "spawn_champion_demand" in actions
+        assert "wait" not in actions
+        assert "check_stuck" in actions  # other actions preserved
