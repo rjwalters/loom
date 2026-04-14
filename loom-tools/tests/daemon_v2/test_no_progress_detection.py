@@ -1,8 +1,8 @@
 """Tests for no-progress-file shepherd detection.
 
 Covers two-tier startup detection:
-  Tier 1 (~120s): Early warning — log + tmux capture, do NOT kill.
-  Tier 2 (~300s): Hard reclaim — save diagnostic log, kill and reset.
+  Tier 1 (~300s): Early warning — log + tmux capture, do NOT kill.
+  Tier 2 (~600s): Hard reclaim — save diagnostic log, kill and reset.
 
 Also covers the scenario where a shepherd is spawned but never creates a
 progress file (e.g., stuck at a permission prompt). The daemon should
@@ -78,10 +78,10 @@ class TestConstants:
     """Verify grace period constants match expected values."""
 
     def test_startup_grace_period(self) -> None:
-        assert STARTUP_GRACE_PERIOD == 120
+        assert STARTUP_GRACE_PERIOD == 300
 
     def test_no_progress_grace_period(self) -> None:
-        assert NO_PROGRESS_GRACE_PERIOD == 300
+        assert NO_PROGRESS_GRACE_PERIOD == 600
 
     def test_config_defaults_match_constants(self) -> None:
         cfg = DaemonConfig()
@@ -137,7 +137,7 @@ class TestCheckNoProgressFile:
                     "status": "working",
                     "issue": 42,
                     "task_id": "abc1234",
-                    "started": _ts(310),  # 310s — past 300s hard reclaim
+                    "started": _ts(610),  # 610s — past 600s hard reclaim
                 },
             },
         )
@@ -201,7 +201,7 @@ class TestTier1EarlyWarning:
     """Tests for Tier 1 early warning (between startup and hard reclaim grace)."""
 
     def test_tier1_warning_fires_sets_startup_warning_at(self, tmp_path: pathlib.Path) -> None:
-        """Shepherd at 130s with no progress triggers warning but NOT reclaim."""
+        """Shepherd at 310s with no progress triggers warning but NOT reclaim."""
         progress_dir = tmp_path / ".loom" / "progress"
         progress_dir.mkdir(parents=True)
 
@@ -212,7 +212,7 @@ class TestTier1EarlyWarning:
                     "status": "working",
                     "issue": 42,
                     "task_id": "abc1234",
-                    "started": _ts(130),  # Past 120s, before 300s
+                    "started": _ts(310),  # Past 300s, before 600s
                 },
             },
         )
@@ -238,7 +238,7 @@ class TestTier1EarlyWarning:
                     "status": "working",
                     "issue": 42,
                     "task_id": "abc1234",
-                    "started": _ts(200),
+                    "started": _ts(400),  # Between 300s and 600s
                     "startup_warning_at": first_warning_ts,
                 },
             },
@@ -326,7 +326,7 @@ class TestForceReclaimNoProgress:
     def test_reclaims_shepherd_past_hard_reclaim(
         self, mock_session, mock_pid, mock_claude, mock_capture, tmp_path: pathlib.Path
     ) -> None:
-        """Shepherd past hard reclaim (300s) without progress file gets reclaimed."""
+        """Shepherd past hard reclaim (600s) without progress file gets reclaimed."""
         progress_dir = tmp_path / ".loom" / "progress"
         progress_dir.mkdir(parents=True)
 
@@ -337,7 +337,7 @@ class TestForceReclaimNoProgress:
                     "status": "working",
                     "issue": 42,
                     "task_id": "abc1234",
-                    "started": _ts(310),  # Past 300s
+                    "started": _ts(610),  # Past 600s
                 },
             },
         )
@@ -370,7 +370,7 @@ class TestForceReclaimNoProgress:
                     "status": "working",
                     "issue": 42,
                     "task_id": "abc1234",
-                    "started": _ts(310),
+                    "started": _ts(610),  # Past 600s hard reclaim
                 },
             },
         )
@@ -438,7 +438,7 @@ class TestForceReclaimNoProgress:
                     "status": "working",
                     "issue": 42,
                     "task_id": "abc1234",
-                    "started": _ts(200),  # Between 120s and 300s
+                    "started": _ts(400),  # Between 300s and 600s
                 },
             },
         )
@@ -596,7 +596,7 @@ class TestTmuxSessionGracePeriod:
                     "status": "working",
                     "issue": 2928,
                     "task_id": "abc1234",
-                    "started": _ts(23),  # 23s after spawn — well within 120s grace
+                    "started": _ts(23),  # 23s after spawn — well within 300s grace
                 },
             },
         )
@@ -621,7 +621,7 @@ class TestTmuxSessionGracePeriod:
                     "status": "working",
                     "issue": 42,
                     "task_id": "abc1234",
-                    "started": _ts(130),  # 130s — past the 120s grace period
+                    "started": _ts(310),  # 310s — past the 300s grace period
                 },
             },
         )
@@ -644,7 +644,7 @@ class TestTmuxSessionGracePeriod:
                     "status": "working",
                     "issue": 42,
                     "task_id": "abc1234",
-                    "started": _ts(119),  # 119s — one second before grace expires
+                    "started": _ts(299),  # 299s — one second before grace expires
                 },
             },
         )
