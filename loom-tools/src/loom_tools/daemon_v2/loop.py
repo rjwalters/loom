@@ -67,7 +67,12 @@ def run(ctx: DaemonContext) -> int:
         #    previous daemon state to find orphaned sessions and stale labels.
         log_info("Running startup cleanup (crash recovery)...")
         cleanup_config = load_config()
-        handle_daemon_startup(ctx.repo_root, cleanup_config)
+        handle_daemon_startup(
+            ctx.repo_root,
+            cleanup_config,
+            fresh=ctx.config.fresh,
+            max_shepherds=ctx.config.max_shepherds,
+        )
 
         # 6. Rotate existing state file (after crash recovery has read it)
         _rotate_state_file(ctx)

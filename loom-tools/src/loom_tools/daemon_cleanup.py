@@ -26,7 +26,7 @@ import time
 from dataclasses import dataclass
 from typing import Any
 
-from loom_tools.agent_spawn import kill_stuck_session, session_exists
+from loom_tools.agent_spawn import TMUX_SOCKET, kill_stuck_session, session_exists
 from loom_tools.common.config import env_bool, env_int
 from loom_tools.common.logging import log_error, log_info, log_success, log_warning
 from loom_tools.common.repo import find_repo_root
@@ -651,11 +651,131 @@ def handle_shepherd_complete(
     log_success(f"Shepherd complete cleanup finished for issue #{issue_number}")
 
 
+def _tmux_run(*args: str) -> subprocess.CompletedProcess[str]:
+    """Run a tmux command on the loom socket (local helper)."""
+    cmd = ["tmux", "-L", TMUX_SOCKET, *args]
+    return subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+
+
+def _kill_orphaned_tmux_sessions(
+    *,
+    dry_run: bool = False,
+) -> None:
+    """Kill all orphaned loom tmux sessions from a previous daemon run.
+
+    Lists all sessions on the ``loom`` tmux socket and kills every one.
+    This is safe at startup because no sessions from the *current* daemon
+    have been created yet.
+    """
+    try:
+        result = _tmux_run("list-sessions", "-F", "#{session_name}")
+        if result.returncode != 0 or not result.stdout.strip():
+            log_info("No orphaned tmux sessions found")
+            return
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        log_info("tmux not available, skipping orphaned session cleanup")
+        return
+
+    sessions = [s.strip() for s in result.stdout.strip().splitlines() if s.strip()]
+    if not sessions:
+        log_info("No orphaned tmux sessions found")
+        return
+
+    log_info(f"Found {len(sessions)} orphaned tmux session(s) to clean up")
+    killed = 0
+    for session_name in sessions:
+        if dry_run:
+            log_info(f"[DRY-RUN] Would kill orphaned session: {session_name}")
+        else:
+            try:
+                _tmux_run("kill-session", "-t", session_name)
+                log_info(f"Killed orphaned session: {session_name}")
+                killed += 1
+            except (subprocess.TimeoutExpired, FileNotFoundError):
+                log_warning(f"Failed to kill session: {session_name}")
+
+    if not dry_run and killed > 0:
+        log_success(f"Killed {killed} orphaned tmux session(s)")
+
+
+def _ensure_shepherd_config_dirs(
+    repo_root: pathlib.Path,
+    max_shepherds: int,
+    *,
+    dry_run: bool = False,
+) -> None:
+    """Ensure config directories and lock files exist for all shepherd slots.
+
+    Creates ``.loom/claude-config/shepherd-N/`` directories and an empty
+    ``.claude.json.lock`` file in each one.  This prevents crashes at spawn
+    time when a shepherd tries to acquire a lock file that doesn't exist
+    (see issue #3097).
+    """
+    config_base = repo_root / ".loom" / "claude-config"
+
+    created = 0
+    for i in range(1, max_shepherds + 1):
+        agent_name = f"shepherd-{i}"
+        config_dir = config_base / agent_name
+        lock_file = config_dir / ".claude.json.lock"
+
+        if dry_run:
+            if not config_dir.is_dir():
+                log_info(f"[DRY-RUN] Would create config dir: {config_dir}")
+            if not lock_file.exists():
+                log_info(f"[DRY-RUN] Would create lock file: {lock_file}")
+            continue
+
+        if not config_dir.is_dir():
+            config_dir.mkdir(parents=True, exist_ok=True)
+            log_info(f"Created config dir: {config_dir}")
+            created += 1
+
+        if not lock_file.exists():
+            lock_file.touch()
+            log_info(f"Created lock file: {lock_file}")
+
+    if not dry_run:
+        log_info(
+            f"Ensured config dirs for {max_shepherds} shepherd slot(s) "
+            f"({created} new)"
+        )
+
+
+def _reset_failure_counters(
+    repo_root: pathlib.Path,
+    *,
+    dry_run: bool = False,
+) -> None:
+    """Reset the persistent issue failure log to empty.
+
+    Called when the daemon starts with ``--fresh`` to give all previously
+    failed issues a clean slate.
+    """
+    from loom_tools.common.paths import LoomPaths
+
+    paths = LoomPaths(repo_root)
+    fpath = paths.issue_failures_file
+
+    if not fpath.is_file():
+        log_info("No issue-failures.json to reset")
+        return
+
+    if dry_run:
+        log_info(f"[DRY-RUN] Would reset {fpath}")
+        return
+
+    write_json_file(fpath, {"entries": {}, "updated_at": now_utc().strftime("%Y-%m-%dT%H:%M:%SZ")})
+    log_success("Reset issue failure counters (--fresh)")
+
+
 def handle_daemon_startup(
     repo_root: pathlib.Path,
     config: CleanupConfig,
     *,
     dry_run: bool = False,
+    fresh: bool = False,
+    max_shepherds: int = 10,
 ) -> None:
     """Cleanup stale artifacts from a previous daemon session.
 
@@ -679,7 +799,12 @@ def handle_daemon_startup(
     log_info("Reverting stale labels from previous daemon...")
     _revert_shepherd_labels(state_path, dry_run=dry_run)
 
-    # 0c. Clean up expired file-based claims from previous session
+    # 0c. Kill any remaining orphaned tmux sessions on the loom socket.
+    #     This catches sessions missed by state-based termination above.
+    log_info("Killing orphaned tmux sessions...")
+    _kill_orphaned_tmux_sessions(dry_run=dry_run)
+
+    # 0d. Clean up expired file-based claims from previous session
     log_info("Cleaning up expired claims...")
     if not dry_run:
         from loom_tools.claim import cleanup_claims
@@ -688,7 +813,17 @@ def handle_daemon_startup(
     else:
         log_info("[DRY-RUN] Would clean up expired claims")
 
-    # 1. Orphaned shepherd recovery — run in background to avoid blocking startup.
+    # 2. Ensure config directories and lock files exist for all shepherd slots.
+    #    Missing lock files cause crashes at spawn time (see #3097).
+    log_info("Ensuring shepherd config directories...")
+    _ensure_shepherd_config_dirs(repo_root, max_shepherds, dry_run=dry_run)
+
+    # 3. Optionally reset failure counters when starting fresh.
+    if fresh:
+        log_info("Resetting failure counters (--fresh)...")
+        _reset_failure_counters(repo_root, dry_run=dry_run)
+
+    # 4. Orphaned shepherd recovery — run in background to avoid blocking startup.
     #    With many orphans (e.g. 60+), sequential GitHub API calls previously
     #    delayed iteration 1 by 2-3 minutes.  Running in a daemon thread lets
     #    the daemon process signals and start iterations immediately while
@@ -702,12 +837,12 @@ def handle_daemon_startup(
         run_background=not dry_run,
     )
 
-    # 2. Archive orphaned task outputs
+    # 5. Archive orphaned task outputs
     if config.archive_logs:
         log_info("Archiving orphaned task outputs...")
         _run_archive_logs(repo_root, dry_run=dry_run)
 
-    # 3. Process pending cleanups from previous session
+    # 6. Process pending cleanups from previous session
     if state_path.exists():
         data = read_json_file(state_path)
         if isinstance(data, dict):
@@ -726,11 +861,11 @@ def handle_daemon_startup(
                     data["cleanup"] = cleanup
                     write_json_file(state_path, data)
 
-    # 4. Clean stale worktrees
+    # 7. Clean stale worktrees
     log_info("Cleaning stale worktrees...")
     _run_loom_clean(repo_root, dry_run=dry_run)
 
-    # 5. Prune old archives
+    # 8. Prune old archives
     log_info("Pruning old archives...")
     _run_archive_logs(
         repo_root,
@@ -739,7 +874,7 @@ def handle_daemon_startup(
         retention_days=config.retention_days,
     )
 
-    # 6. Cleanup stale progress files (with startup-specific limits)
+    # 9. Cleanup stale progress files (with startup-specific limits)
     cleanup_stale_progress_files(
         repo_root,
         config.progress_stale_hours,
@@ -748,7 +883,7 @@ def handle_daemon_startup(
         timeout_seconds=config.startup_cleanup_timeout,
     )
 
-    # 7. Discard stale unprocessed signal files from previous session
+    # 10. Discard stale unprocessed signal files from previous session
     log_info(
         f"Discarding stale signal files (older than {config.signal_stale_hours}h)..."
     )
@@ -1114,6 +1249,9 @@ Examples:
   # On daemon startup
   loom-daemon-cleanup daemon-startup
 
+  # On daemon startup with fresh failure counters
+  loom-daemon-cleanup daemon-startup --fresh
+
   # Preview periodic cleanup
   loom-daemon-cleanup periodic --dry-run
 """,
@@ -1141,6 +1279,18 @@ Examples:
         "--dry-run",
         action="store_true",
         help="Show what would be cleaned without making changes",
+    )
+    parser.add_argument(
+        "--fresh",
+        action="store_true",
+        help="Reset failure counters on daemon-startup (clean slate for retries)",
+    )
+    parser.add_argument(
+        "--max-shepherds",
+        type=int,
+        default=10,
+        metavar="N",
+        help="Number of shepherd config dirs to ensure (default: 10)",
     )
 
     args = parser.parse_args(argv)
@@ -1170,7 +1320,13 @@ Examples:
                 repo_root, issue_number, config, dry_run=args.dry_run
             )
         elif args.event == "daemon-startup":
-            handle_daemon_startup(repo_root, config, dry_run=args.dry_run)
+            handle_daemon_startup(
+                repo_root,
+                config,
+                dry_run=args.dry_run,
+                fresh=args.fresh,
+                max_shepherds=args.max_shepherds,
+            )
         elif args.event == "daemon-shutdown":
             handle_daemon_shutdown(repo_root, config, dry_run=args.dry_run)
         elif args.event == "periodic":

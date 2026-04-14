@@ -151,6 +151,7 @@ Examples:
     loom-daemon --force         # Force mode (auto-promote, auto-merge, auto-build)
     loom-daemon -t 180          # Run for 3 hours then gracefully stop
     loom-daemon --merge -t 60   # Merge mode for 1 hour
+    loom-daemon --fresh         # Reset failure counters on startup
     loom-daemon --status        # Check if daemon is running
     loom-daemon --health        # Show daemon health
 """,
@@ -175,6 +176,11 @@ Examples:
         "--merge", "-m",
         action="store_true",
         help="Alias for --force (for CLI parity with /loom --merge)",
+    )
+    parser.add_argument(
+        "--fresh",
+        action="store_true",
+        help="Reset failure counters on startup (clean slate for all previously failed issues)",
     )
     parser.add_argument(
         "--debug", "-d",
@@ -224,6 +230,7 @@ Examples:
         force_mode=force_mode,
         auto_build=auto_build,
         no_auto_build=no_auto_build,
+        fresh=args.fresh,
         debug_mode=args.debug,
         timeout_min=args.timeout_min,
     )
