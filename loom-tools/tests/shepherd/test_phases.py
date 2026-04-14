@@ -1450,6 +1450,7 @@ class TestBuilderCheckpointResume:
             patch.object(
                 builder, "_count_commits_ahead_of_main", return_value=3
             ),
+            patch.object(builder, "_has_closed_pr_for_branch", return_value=None),
             patch.object(builder, "_gather_diagnostics", return_value={}),
             patch.object(
                 builder,
@@ -1536,6 +1537,7 @@ class TestBuilderCheckpointResume:
             patch.object(
                 builder, "_count_commits_ahead_of_main", return_value=2
             ),
+            patch.object(builder, "_has_closed_pr_for_branch", return_value=None),
             patch.object(builder, "_gather_diagnostics", return_value=fake_diag),
             patch.object(
                 builder, "_recover_from_existing_worktree", return_value=None
@@ -1578,6 +1580,7 @@ class TestBuilderCheckpointResume:
             patch.object(
                 builder, "_count_commits_ahead_of_main", return_value=2
             ),
+            patch.object(builder, "_has_closed_pr_for_branch", return_value=None),
             patch.object(builder, "_gather_diagnostics", return_value=fake_diag),
             patch.object(
                 builder, "_recover_from_existing_worktree", return_value=None
@@ -1998,8 +2001,10 @@ class TestBuilderDiagnostics:
             diag = builder._gather_diagnostics(mock_context)
 
         assert diag["pr_number"] == 123
-        assert len(branch_lookup_called) == 1
-        # Keyword search should NOT be called when branch-name lookup succeeds
+        # Two branch-name lookups: one for open PRs, one for closed PRs
+        # (stale branch detection, issue #3106)
+        assert len(branch_lookup_called) == 2
+        # Keyword search should NOT be called when branch-name lookup finds a PR
         assert len(keyword_lookup_called) == 0, (
             "Keyword search should be skipped when branch-name lookup finds a PR"
         )
@@ -11384,6 +11389,8 @@ class TestBuilderDirectCompletion:
                 "_build_direct_completion_pr_body",
                 return_value="Closes #42\n\n## Changes\n```\nfile.py | 2 +-\n```\n\n## Test plan\n- [ ] Verify",
             ),
+            patch.object(builder, "_has_closed_pr_for_branch", return_value=None),
+            patch.object(builder, "_validate_build_before_pr", return_value=(True, "passed")),
             patch(
                 "loom_tools.shepherd.phases.builder.subprocess.run"
             ) as mock_run,
@@ -11465,6 +11472,8 @@ class TestBuilderDirectCompletion:
                 "_build_direct_completion_pr_body",
                 return_value="Closes #42\n\n## Test plan\n- [ ] Verify",
             ),
+            patch.object(builder, "_has_closed_pr_for_branch", return_value=None),
+            patch.object(builder, "_validate_build_before_pr", return_value=(True, "passed")),
             patch(
                 "loom_tools.shepherd.phases.builder.subprocess.run"
             ) as mock_run,
@@ -11530,6 +11539,8 @@ class TestBuilderDirectCompletion:
                 "_build_direct_completion_pr_body",
                 return_value="Closes #42\n\n## Changes\n```\nbuilder.py | 10 ++++\n```\n\n## Test plan\n- [ ] Verify",
             ),
+            patch.object(builder, "_has_closed_pr_for_branch", return_value=None),
+            patch.object(builder, "_validate_build_before_pr", return_value=(True, "passed")),
             patch(
                 "loom_tools.shepherd.phases.builder.subprocess.run"
             ) as mock_run,
@@ -11616,6 +11627,8 @@ class TestBuilderDirectCompletion:
                 "_build_direct_completion_pr_body",
                 return_value="Closes #42\n\n## Test plan\n- [ ] Verify",
             ),
+            patch.object(builder, "_has_closed_pr_for_branch", return_value=None),
+            patch.object(builder, "_validate_build_before_pr", return_value=(True, "passed")),
             patch(
                 "loom_tools.shepherd.phases.builder.subprocess.run"
             ) as mock_run,
@@ -11785,6 +11798,8 @@ class TestBuilderDirectCompletion:
                 "_build_direct_completion_pr_body",
                 return_value="Closes #42\n\n## Test plan\n- [ ] Verify",
             ),
+            patch.object(builder, "_has_closed_pr_for_branch", return_value=None),
+            patch.object(builder, "_validate_build_before_pr", return_value=(True, "passed")),
             patch(
                 "loom_tools.shepherd.phases.builder.subprocess.run"
             ) as mock_run,
@@ -11828,6 +11843,8 @@ class TestBuilderDirectCompletion:
                 "_build_direct_completion_pr_body",
                 return_value="Closes #99",
             ),
+            patch.object(builder, "_has_closed_pr_for_branch", return_value=None),
+            patch.object(builder, "_validate_build_before_pr", return_value=(True, "passed")),
             patch(
                 "loom_tools.shepherd.phases.builder.subprocess.run"
             ) as mock_run,
@@ -11871,6 +11888,8 @@ class TestBuilderDirectCompletion:
                 "_build_direct_completion_pr_body",
                 return_value="Closes #55",
             ),
+            patch.object(builder, "_has_closed_pr_for_branch", return_value=None),
+            patch.object(builder, "_validate_build_before_pr", return_value=(True, "passed")),
             patch(
                 "loom_tools.shepherd.phases.builder.subprocess.run"
             ) as mock_run,
@@ -11936,6 +11955,8 @@ class TestBuilderDirectCompletion:
                 "_build_direct_completion_pr_body",
                 return_value="Closes #42\n\n## Test plan\n- [ ] Verify",
             ),
+            patch.object(builder, "_has_closed_pr_for_branch", return_value=None),
+            patch.object(builder, "_validate_build_before_pr", return_value=(True, "passed")),
             patch(
                 "loom_tools.shepherd.phases.builder.subprocess.run"
             ) as mock_run,
@@ -11986,6 +12007,274 @@ class TestBuilderDirectCompletion:
         checkpoint = read_checkpoint(worktree)
         assert checkpoint is not None
         assert checkpoint.stage == "pushed"
+
+
+class TestBuilderHasClosedPrForBranch:
+    """Test _has_closed_pr_for_branch for stale branch detection.  See #3106."""
+
+    def test_returns_pr_number_when_closed_pr_exists(
+        self, mock_context: MagicMock
+    ) -> None:
+        """Should return the closed PR number when one exists."""
+        builder = BuilderPhase()
+
+        with patch(
+            "loom_tools.shepherd.phases.builder.subprocess.run"
+        ) as mock_run:
+            mock_run.return_value = MagicMock(
+                returncode=0, stdout="123\n", stderr=""
+            )
+            result = builder._has_closed_pr_for_branch(42, Path("/fake/repo"))
+
+        assert result == 123
+        call_args = mock_run.call_args[0][0]
+        assert call_args[:3] == ["gh", "pr", "list"]
+        assert "--head" in call_args
+        assert "feature/issue-42" in call_args
+        assert "--state" in call_args
+        state_idx = call_args.index("--state")
+        assert call_args[state_idx + 1] == "closed"
+
+    def test_returns_none_when_no_closed_pr(
+        self, mock_context: MagicMock
+    ) -> None:
+        """Should return None when no closed PR exists."""
+        builder = BuilderPhase()
+
+        with patch(
+            "loom_tools.shepherd.phases.builder.subprocess.run"
+        ) as mock_run:
+            mock_run.return_value = MagicMock(
+                returncode=0, stdout="", stderr=""
+            )
+            result = builder._has_closed_pr_for_branch(42, Path("/fake/repo"))
+
+        assert result is None
+
+    def test_returns_none_on_command_failure(
+        self, mock_context: MagicMock
+    ) -> None:
+        """Should return None when gh command fails."""
+        builder = BuilderPhase()
+
+        with patch(
+            "loom_tools.shepherd.phases.builder.subprocess.run"
+        ) as mock_run:
+            mock_run.return_value = MagicMock(
+                returncode=1, stdout="", stderr="error"
+            )
+            result = builder._has_closed_pr_for_branch(42, Path("/fake/repo"))
+
+        assert result is None
+
+    def test_returns_none_on_non_numeric_output(
+        self, mock_context: MagicMock
+    ) -> None:
+        """Should return None when output is not a valid number."""
+        builder = BuilderPhase()
+
+        with patch(
+            "loom_tools.shepherd.phases.builder.subprocess.run"
+        ) as mock_run:
+            mock_run.return_value = MagicMock(
+                returncode=0, stdout="not-a-number\n", stderr=""
+            )
+            result = builder._has_closed_pr_for_branch(42, Path("/fake/repo"))
+
+        assert result is None
+
+
+class TestBuilderValidateBuildBeforePr:
+    """Test _validate_build_before_pr for pre-PR validation.  See #3106."""
+
+    def test_passes_when_tests_succeed(
+        self, mock_context: MagicMock, tmp_path: Path
+    ) -> None:
+        """Should return (True, msg) when build/tests pass."""
+        builder = BuilderPhase()
+        worktree = tmp_path / "issue-42"
+        worktree.mkdir()
+        mock_context.worktree_path = worktree
+        mock_context.config = ShepherdConfig(issue=42)
+
+        with (
+            patch.object(
+                builder, "_detect_test_command",
+                return_value=(["pnpm", "test"], "pnpm test"),
+            ),
+            patch(
+                "loom_tools.shepherd.phases.builder.subprocess.run"
+            ) as mock_run,
+        ):
+            mock_run.return_value = MagicMock(
+                returncode=0, stdout="all tests pass\n", stderr=""
+            )
+            passed, msg = builder._validate_build_before_pr(mock_context)
+
+        assert passed is True
+        assert "passed" in msg
+
+    def test_fails_when_tests_fail(
+        self, mock_context: MagicMock, tmp_path: Path
+    ) -> None:
+        """Should return (False, msg) when build/tests fail."""
+        builder = BuilderPhase()
+        worktree = tmp_path / "issue-42"
+        worktree.mkdir()
+        mock_context.worktree_path = worktree
+        mock_context.config = ShepherdConfig(issue=42)
+
+        with (
+            patch.object(
+                builder, "_detect_test_command",
+                return_value=(["pnpm", "test"], "pnpm test"),
+            ),
+            patch(
+                "loom_tools.shepherd.phases.builder.subprocess.run"
+            ) as mock_run,
+        ):
+            mock_run.return_value = MagicMock(
+                returncode=1, stdout="FAIL: test_foo\n", stderr=""
+            )
+            passed, msg = builder._validate_build_before_pr(mock_context)
+
+        assert passed is False
+        assert "pnpm test" in msg
+        assert "exit code 1" in msg
+
+    def test_passes_when_no_test_runner(
+        self, mock_context: MagicMock, tmp_path: Path
+    ) -> None:
+        """Should return (True, msg) when no test runner is detected."""
+        builder = BuilderPhase()
+        worktree = tmp_path / "issue-42"
+        worktree.mkdir()
+        mock_context.worktree_path = worktree
+        mock_context.config = ShepherdConfig(issue=42)
+
+        with patch.object(builder, "_detect_test_command", return_value=None):
+            passed, msg = builder._validate_build_before_pr(mock_context)
+
+        assert passed is True
+        assert "no test runner" in msg
+
+    def test_passes_when_no_worktree(self, mock_context: MagicMock) -> None:
+        """Should return (True, msg) when no worktree exists."""
+        builder = BuilderPhase()
+        mock_context.worktree_path = None
+        mock_context.config = ShepherdConfig(issue=42)
+
+        passed, msg = builder._validate_build_before_pr(mock_context)
+
+        assert passed is True
+        assert "no worktree" in msg
+
+    def test_passes_on_timeout(
+        self, mock_context: MagicMock, tmp_path: Path
+    ) -> None:
+        """Should return (True, msg) when validation times out."""
+        builder = BuilderPhase()
+        worktree = tmp_path / "issue-42"
+        worktree.mkdir()
+        mock_context.worktree_path = worktree
+        mock_context.config = ShepherdConfig(issue=42)
+
+        with (
+            patch.object(
+                builder, "_detect_test_command",
+                return_value=(["pnpm", "test"], "pnpm test"),
+            ),
+            patch(
+                "loom_tools.shepherd.phases.builder.subprocess.run",
+                side_effect=subprocess.TimeoutExpired(cmd="pnpm test", timeout=300),
+            ),
+        ):
+            passed, msg = builder._validate_build_before_pr(mock_context)
+
+        assert passed is True
+        assert "timed out" in msg
+
+
+class TestBuilderDirectCompletionStaleBranch:
+    """Test _direct_completion rejects stale branches.  See #3106."""
+
+    def test_refuses_pr_when_closed_pr_exists(
+        self, mock_context: MagicMock
+    ) -> None:
+        """Should refuse to create PR when a closed PR exists for the branch."""
+        builder = BuilderPhase()
+        mock_context.repo_root = Path("/fake/repo")
+        mock_context.config = ShepherdConfig(issue=42)
+        diag = {
+            "has_uncommitted_changes": False,
+            "commits_ahead": 2,
+            "remote_branch_exists": True,
+            "pr_number": None,
+            "pr_has_review_label": False,
+            "branch": "feature/issue-42",
+        }
+
+        with (
+            patch.object(builder, "_has_closed_pr_for_branch", return_value=99),
+            patch(
+                "loom_tools.shepherd.phases.builder.subprocess.run"
+            ) as mock_run,
+        ):
+            # Open-PR checks return empty (no open PR)
+            empty = MagicMock(returncode=0, stdout="", stderr="")
+            mock_run.side_effect = [
+                empty,  # gh pr list --head (no existing open PR)
+                empty,  # gh pr list --search "Closes #42"
+                empty,  # gh pr list --search "Fixes #42"
+                empty,  # gh pr list --search "Resolves #42"
+            ]
+            result = builder._direct_completion(mock_context, diag)
+
+        assert result is False
+        # gh pr create must NOT have been called
+        for call in mock_run.call_args_list:
+            assert call[0][0][:3] != ["gh", "pr", "create"]
+
+    def test_refuses_pr_when_build_fails(
+        self, mock_context: MagicMock
+    ) -> None:
+        """Should refuse to create PR when pre-PR build validation fails."""
+        builder = BuilderPhase()
+        mock_context.repo_root = Path("/fake/repo")
+        mock_context.config = ShepherdConfig(issue=42)
+        diag = {
+            "has_uncommitted_changes": False,
+            "commits_ahead": 2,
+            "remote_branch_exists": True,
+            "pr_number": None,
+            "pr_has_review_label": False,
+            "branch": "feature/issue-42",
+        }
+
+        with (
+            patch.object(builder, "_has_closed_pr_for_branch", return_value=None),
+            patch.object(
+                builder, "_validate_build_before_pr",
+                return_value=(False, "pnpm test failed (exit code 1)"),
+            ),
+            patch(
+                "loom_tools.shepherd.phases.builder.subprocess.run"
+            ) as mock_run,
+        ):
+            # Open-PR checks return empty (no open PR)
+            empty = MagicMock(returncode=0, stdout="", stderr="")
+            mock_run.side_effect = [
+                empty,  # gh pr list --head (no existing open PR)
+                empty,  # gh pr list --search "Closes #42"
+                empty,  # gh pr list --search "Fixes #42"
+                empty,  # gh pr list --search "Resolves #42"
+            ]
+            result = builder._direct_completion(mock_context, diag)
+
+        assert result is False
+        # gh pr create must NOT have been called
+        for call in mock_run.call_args_list:
+            assert call[0][0][:3] != ["gh", "pr", "create"]
 
 
 class TestBuildDirectCompletionPrBody:
