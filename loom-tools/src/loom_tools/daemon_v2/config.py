@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from loom_tools.common.config import env_bool, env_int
 
@@ -28,6 +28,20 @@ DEFAULT_SPAWN_STAGGER_DELAY = 3  # seconds between shepherd spawns
 DEFAULT_STALL_DIAGNOSTIC_THRESHOLD = 3  # consecutive stalled iterations
 DEFAULT_STALL_RECOVERY_THRESHOLD = 5
 DEFAULT_STALL_RESTART_THRESHOLD = 10
+
+# Per-phase no-progress grace periods (seconds).
+# Phases like judge and doctor involve waiting for external agents and
+# legitimately take much longer than the builder phase.  The default
+# ``no_progress_grace_period`` (600s) is used as fallback for unknown phases.
+DEFAULT_PHASE_GRACE_PERIODS: dict[str, int] = {
+    "started": 600,     # Initial startup: 10 min
+    "curator": 600,     # Curation: 10 min
+    "builder": 600,     # Building: 10 min
+    "judge": 900,       # Judge review cycles: 15 min
+    "doctor": 900,      # Doctor fix cycles: 15 min
+    "champion": 900,    # Champion merge: 15 min
+    "merge": 600,       # Merge operations: 10 min
+}
 
 
 @dataclass
@@ -69,6 +83,13 @@ class DaemonConfig:
     startup_grace_period: int = DEFAULT_STARTUP_GRACE_PERIOD
     no_progress_grace_period: int = DEFAULT_NO_PROGRESS_GRACE_PERIOD
     spawn_stagger_delay: int = DEFAULT_SPAWN_STAGGER_DELAY
+    # Per-phase grace periods for no-progress detection.
+    # When a shepherd's current phase is known (from progress files),
+    # this dict overrides no_progress_grace_period with a phase-specific
+    # timeout.  Unknown phases fall back to no_progress_grace_period.
+    phase_grace_periods: dict[str, int] = field(
+        default_factory=lambda: dict(DEFAULT_PHASE_GRACE_PERIODS)
+    )
 
     # Stall escalation thresholds
     stall_diagnostic_threshold: int = DEFAULT_STALL_DIAGNOSTIC_THRESHOLD
@@ -134,6 +155,16 @@ class DaemonConfig:
                 "LOOM_STALL_RESTART_THRESHOLD", DEFAULT_STALL_RESTART_THRESHOLD
             ),
         )
+
+    def get_phase_grace_period(self, phase: str | None) -> int:
+        """Return the no-progress grace period for *phase*.
+
+        Uses ``phase_grace_periods`` when a matching entry exists; falls back
+        to the flat ``no_progress_grace_period`` for unknown or ``None`` phases.
+        """
+        if phase and phase in self.phase_grace_periods:
+            return self.phase_grace_periods[phase]
+        return self.no_progress_grace_period
 
     def mode_display(self) -> str:
         """Return a display string for the current mode."""

@@ -393,6 +393,10 @@ def force_reclaim_stale_shepherds(ctx: DaemonContext) -> int:
         if entry.status != "working":
             continue
 
+        # Sync last_phase from progress data so stall decisions use the
+        # most recent phase even if the daemon state hasn't been refreshed.
+        _sync_phase_from_progress(ctx, entry)
+
         is_stale = False
 
         # Compute spawn age once — used by both Check 1 and Check 3.
@@ -552,11 +556,14 @@ def _check_no_progress_file(
 ) -> bool:
     """Check if a working shepherd has no progress file past the grace period.
 
-    Implements two-tier detection:
+    Implements two-tier detection with **phase-aware** timeouts:
       Tier 1 (startup_grace_period, default 300s): Log a warning, capture tmux
         output snapshot, and set ``startup_warning_at`` but do NOT reclaim.
-      Tier 2 (no_progress_grace_period, default 600s): Save diagnostic output
-        to ``.loom/logs/`` and return True to trigger reclaim.
+      Tier 2 (phase-dependent grace): Save diagnostic output to
+        ``.loom/logs/`` and return True to trigger reclaim.  The hard reclaim
+        threshold adapts to the shepherd's current phase: judge/doctor/champion
+        phases get 900s (15 min) while builder/curator/started get 600s (10 min).
+        See ``DaemonConfig.phase_grace_periods`` for the full mapping.
 
     Returns True if the shepherd should be considered stale (Tier 2).
     """
@@ -571,7 +578,8 @@ def _check_no_progress_file(
         return False
 
     startup_grace = ctx.config.startup_grace_period
-    hard_reclaim_grace = ctx.config.no_progress_grace_period
+    # Use phase-aware grace period for the hard reclaim threshold.
+    hard_reclaim_grace = ctx.config.get_phase_grace_period(entry.last_phase)
 
     if spawn_age < startup_grace:
         return False
@@ -590,7 +598,8 @@ def _check_no_progress_file(
             entry.startup_warning_at = now.strftime("%Y-%m-%dT%H:%M:%SZ")
             log_warning(
                 f"STALL-T1: {name} has no progress file after {spawn_age}s "
-                f"(task_id={entry.task_id}, issue=#{entry.issue}) — monitoring"
+                f"(task_id={entry.task_id}, issue=#{entry.issue}, "
+                f"phase={entry.last_phase}, grace={hard_reclaim_grace}s) — monitoring"
             )
             # Capture a tmux output snapshot for debugging
             if session_exists(name):
@@ -605,7 +614,8 @@ def _check_no_progress_file(
     # Tier 2: Hard reclaim
     log_warning(
         f"STALL-T2: {name} has no progress file after {spawn_age}s "
-        f"(task_id={entry.task_id}, issue=#{entry.issue}) — reclaiming"
+        f"(task_id={entry.task_id}, issue=#{entry.issue}, "
+        f"phase={entry.last_phase}, grace={hard_reclaim_grace}s) — reclaiming"
     )
     _save_diagnostic_output(ctx, name)
     return True
@@ -631,6 +641,34 @@ def _has_progress_data(ctx: DaemonContext, entry: ShepherdEntry) -> bool:
         prog.get("issue") == entry.issue
         for prog in shepherd_progress
     )
+
+
+def _sync_phase_from_progress(
+    ctx: DaemonContext,
+    entry: ShepherdEntry,
+) -> None:
+    """Sync ``entry.last_phase`` from snapshot progress data.
+
+    If the snapshot contains a progress entry for this shepherd's issue with a
+    ``current_phase`` value, update ``entry.last_phase`` so that downstream
+    stall-detection logic can use accurate phase-aware timeouts.
+    """
+    if ctx.snapshot is None or entry.issue is None:
+        return
+
+    shepherd_progress = (
+        ctx.snapshot.get("shepherds", {}).get("progress", [])
+    )
+    for prog in shepherd_progress:
+        # Match by task_id first, then fall back to issue number
+        if (
+            (entry.task_id and prog.get("task_id") == entry.task_id)
+            or prog.get("issue") == entry.issue
+        ):
+            phase = prog.get("current_phase")
+            if phase:
+                entry.last_phase = phase
+            return
 
 
 def _save_diagnostic_output(ctx: DaemonContext, name: str) -> None:
