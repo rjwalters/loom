@@ -705,12 +705,14 @@ def detect_orphaned_prs(
     daemon_state: DaemonState,
     review_requested: list[dict[str, Any]],
     changes_requested: list[dict[str, Any]],
+    merge_conflicted: list[dict[str, Any]] | None = None,
 ) -> list[OrphanedPR]:
     """Detect PRs needing attention that no active shepherd is tracking.
 
-    A PR is orphaned when it has ``loom:review-requested`` (needs judge) or
-    ``loom:changes-requested`` (needs doctor) but no working shepherd has it
-    as its ``pr_number``.
+    A PR is orphaned when it has ``loom:review-requested`` (needs judge),
+    ``loom:changes-requested`` (needs doctor), or ``loom:pr`` +
+    ``loom:merge-conflict`` (approved but blocked by conflicts, needs doctor)
+    but no working shepherd has it as its ``pr_number``.
 
     Returns orphaned PRs sorted by PR number ascending (FIFO).
     """
@@ -728,6 +730,12 @@ def detect_orphaned_prs(
             orphaned.append(OrphanedPR(pr_number=pr_num, needed_role="judge"))
 
     for pr in changes_requested:
+        pr_num = pr.get("number")
+        if pr_num is not None and pr_num not in tracked_prs:
+            orphaned.append(OrphanedPR(pr_number=pr_num, needed_role="doctor"))
+
+    # Approved PRs with merge conflicts need doctor attention (issue #3104)
+    for pr in merge_conflicted or []:
         pr_num = pr.get("number")
         if pr_num is not None and pr_num not in tracked_prs:
             orphaned.append(OrphanedPR(pr_number=pr_num, needed_role="doctor"))
@@ -1075,6 +1083,7 @@ def compute_recommended_actions(
     spinning_prs: list[SpinningPR] | None = None,
     curated_count: int = 0,
     uncurated_count: int = 0,
+    merge_conflict_count: int = 0,
 ) -> tuple[list[str], dict[str, Any]]:
     """Compute recommended actions and demand flags.
 
@@ -1140,7 +1149,7 @@ def compute_recommended_actions(
         demand["champion_demand"] = True
 
     doctor_status = support_roles.get("doctor", SupportRoleState()).status
-    if changes_count > 0 and doctor_status != "running":
+    if (changes_count > 0 or merge_conflict_count > 0) and doctor_status != "running":
         if doctor_targeted:
             actions.append("spawn_doctor_targeted")
             demand["doctor_targeted_prs"] = [o.pr_number for o in doctor_targeted]
@@ -1574,6 +1583,14 @@ def build_snapshot(
     changes_count = len(changes_requested)
     merge_count = len(ready_to_merge)
 
+    # Approved PRs (loom:pr) that also have loom:merge-conflict — these are
+    # blocking: approved but can't merge.  Derived from ready_to_merge since
+    # it already includes labels.  See issue #3104.
+    merge_conflicted = [
+        pr for pr in ready_to_merge if _has_label(pr, "loom:merge-conflict")
+    ]
+    merge_conflict_count = len(merge_conflicted)
+
     total_proposals = architect_count + hermit_count + curated_count
     total_in_flight = building_count + review_count + changes_count + merge_count
 
@@ -1620,7 +1637,7 @@ def build_snapshot(
     orphaned_count = len(orphaned)
 
     # 12. Orphaned PRs (PRs needing attention without an active shepherd)
-    orphaned_prs = detect_orphaned_prs(daemon_state, review_requested, changes_requested)
+    orphaned_prs = detect_orphaned_prs(daemon_state, review_requested, changes_requested, merge_conflicted)
 
     # 13. Pipeline health (retry/backoff classification)
     p_health = compute_pipeline_health(
@@ -1666,6 +1683,7 @@ def build_snapshot(
         spinning_prs=spinning_prs,
         curated_count=curated_count,
         uncurated_count=uncurated_count,
+        merge_conflict_count=merge_conflict_count,
     )
 
     # 16. Promotable proposals
@@ -1737,6 +1755,8 @@ def build_snapshot(
             "review_requested": review_requested,
             "changes_requested": changes_requested,
             "ready_to_merge": ready_to_merge,
+            "merge_conflicted": merge_conflicted,
+            "merge_conflict_count": merge_conflict_count,
             "orphaned": [o.to_dict() for o in orphaned_prs],
             "orphaned_count": len(orphaned_prs),
             "spinning": [s.to_dict() for s in spinning_prs],
@@ -1795,6 +1815,7 @@ def build_snapshot(
             "prs_awaiting_review": review_count,
             "prs_needing_fixes": changes_count,
             "prs_ready_to_merge": merge_count,
+            "prs_with_merge_conflicts": merge_conflict_count,
             "champion_demand": demand["champion_demand"],
             "doctor_demand": demand["doctor_demand"],
             "judge_demand": demand["judge_demand"],
