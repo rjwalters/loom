@@ -24,6 +24,7 @@ DEFAULT_JUDGE_INTERVAL = 300  # seconds
 DEFAULT_CURATOR_INTERVAL = 300  # seconds
 DEFAULT_STARTUP_GRACE_PERIOD = 120  # seconds before early warning
 DEFAULT_NO_PROGRESS_GRACE_PERIOD = 300  # seconds before hard reclaim
+DEFAULT_SPAWN_STAGGER_DELAY = 3  # seconds between shepherd spawns
 DEFAULT_STALL_DIAGNOSTIC_THRESHOLD = 3  # consecutive stalled iterations
 DEFAULT_STALL_RECOVERY_THRESHOLD = 5
 DEFAULT_STALL_RESTART_THRESHOLD = 10
@@ -67,6 +68,7 @@ class DaemonConfig:
     # Shepherd startup detection thresholds
     startup_grace_period: int = DEFAULT_STARTUP_GRACE_PERIOD
     no_progress_grace_period: int = DEFAULT_NO_PROGRESS_GRACE_PERIOD
+    spawn_stagger_delay: int = DEFAULT_SPAWN_STAGGER_DELAY
 
     # Stall escalation thresholds
     stall_diagnostic_threshold: int = DEFAULT_STALL_DIAGNOSTIC_THRESHOLD
@@ -113,6 +115,7 @@ class DaemonConfig:
             max_proposals=env_int("LOOM_MAX_PROPOSALS", DEFAULT_MAX_PROPOSALS),
             startup_grace_period=env_int("LOOM_STARTUP_GRACE_PERIOD", DEFAULT_STARTUP_GRACE_PERIOD),
             no_progress_grace_period=env_int("LOOM_NO_PROGRESS_GRACE_PERIOD", DEFAULT_NO_PROGRESS_GRACE_PERIOD),
+            spawn_stagger_delay=env_int("LOOM_SPAWN_STAGGER", DEFAULT_SPAWN_STAGGER_DELAY),
             architect_cooldown=env_int("LOOM_ARCHITECT_COOLDOWN", DEFAULT_ARCHITECT_COOLDOWN),
             hermit_cooldown=env_int("LOOM_HERMIT_COOLDOWN", DEFAULT_HERMIT_COOLDOWN),
             guide_interval=env_int("LOOM_GUIDE_INTERVAL", DEFAULT_GUIDE_INTERVAL),

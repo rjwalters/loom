@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import pathlib
 import subprocess
+import time
 from typing import TYPE_CHECKING, Any
 
 from loom_tools.agent_spawn import (
@@ -59,10 +60,20 @@ def spawn_shepherds(ctx: DaemonContext) -> int:
     issues_to_spawn = ready_issues[:available_slots]
     spawned = 0
 
+    stagger_delay = ctx.config.spawn_stagger_delay
+
     for issue in issues_to_spawn:
         issue_num = issue.get("number")
         if issue_num is None:
             continue
+
+        # Stagger spawns to avoid auth cache thundering herd.
+        # Each shepherd runs a pre-flight `claude auth status` check that
+        # contends on a shared lock file; spacing spawns apart lets each
+        # agent complete its auth check before the next one starts.
+        if spawned > 0 and stagger_delay > 0:
+            log_info(f"Staggering spawn by {stagger_delay}s to avoid auth contention")
+            time.sleep(stagger_delay)
 
         # Find an idle shepherd slot
         shepherd_name = _find_idle_shepherd(ctx)
