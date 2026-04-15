@@ -7,6 +7,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.1] - 2026-04-14
+
+### Summary
+
+Stability and reliability release focused on daemon resilience, stall detection improvements, and auth/session robustness.
+
+### Added
+
+- Auto-decay failure counters when main branch advances (#3124)
+- 3 missing daemon startup cleanup steps (#3129)
+- Auto-detect CI presence and avoid false `ci_failing` warnings (#3121)
+- Parse issue dependencies to avoid scheduling issues with unmet prerequisites (#3119)
+- Comprehensive failure counter reset mechanism (#3118)
+- Pre-PR validation gate and stale branch detection to builder (#3130)
+- Configurable issue failure threshold with dependency block exemptions (#3113)
+
+### Fixed
+
+- Daemon accounts for actionable PRs in health status and work detection (#3128)
+- Eliminate auth cache lock contention across all agent spawns (#3122)
+- Implement per-phase stall detection timeouts to prevent killing active shepherds (#3126)
+- Increase stall detection thresholds for initial agent planning (#3115)
+- Detect completed support roles by checking Claude process, not just tmux session (#3127)
+- Detect merge-conflicted approved PRs and dispatch Doctor to resolve them (#3125)
+- Clean up orphaned sessions and stale labels after daemon crash (#3123)
+- Catch non-critical errors in daemon loop instead of crashing (#3120)
+- Handle missing `.claude.json.lock` in session cleanup (#3117)
+- Don't install external issue labeling workflow by default (#3116)
+- Stagger agent spawns to avoid auth cache thundering herd (#3114)
+- Use `hex::encode` for sha2 0.11 compatibility
+
+### Dependencies
+
+- Bump the dev-dependencies group with 6 updates (#3093)
+- Bump tokio in the all-dependencies group (#3092)
+
 ## [0.2.3] - 2026-02-15
 
 ### Summary
