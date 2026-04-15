@@ -573,6 +573,26 @@ Loom uses the `gh` CLI for all GitHub operations. By default it uses the credent
 
 See `.loom/docs/github-authentication.md` for the detailed setup guide, required token permissions per role, and troubleshooting.
 
+## Releasing
+
+Use `scripts/version.sh` to manage versions across all packages:
+
+```bash
+./scripts/version.sh              # Show current version
+./scripts/version.sh check        # Verify all files are in sync
+./scripts/version.sh bump patch   # Bump patch (minor, major also supported)
+./scripts/version.sh bump patch --tag  # Bump + commit + tag
+./scripts/version.sh set 1.0.0 --tag   # Set explicit version + commit + tag
+```
+
+**Full release flow**:
+```bash
+./scripts/version.sh bump patch --tag
+git push origin main --tags
+```
+
+The script updates all 7 version-bearing files (`package.json`, `mcp-loom/package.json`, `src-tauri/tauri.conf.json`, 3 `Cargo.toml` files, `CLAUDE.md`) plus `Cargo.lock`. The GitHub Actions release workflow (`.github/workflows/release.yml`) triggers on tag push to build and publish macOS DMGs.
+
 ## Resources
 
 - **Main Repository**: https://github.com/rjwalters/loom
