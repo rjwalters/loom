@@ -8,6 +8,10 @@ The API mode is controlled by the ``LOOM_GH_API_MODE`` environment variable:
 - ``auto`` (default): Try GraphQL first, fall back to REST on rate limit.
 - ``graphql``: Use GraphQL only (original behavior).
 - ``rest``: Use REST only.
+
+This module provides both a ``GitHubForge`` class implementing the
+``ForgeClient`` protocol and backward-compatible module-level functions
+that delegate to a singleton ``GitHubForge`` instance.
 """
 
 from __future__ import annotations
@@ -22,6 +26,12 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any, Literal, Sequence
 
+from loom_tools.common.forge import (
+    ForgeCIStatus,
+    ForgeClient,
+    ForgeIssue,
+    ForgePullRequest,
+)
 from loom_tools.common.state import parse_command_output, safe_parse_json
 
 EntityType = Literal["issue", "pr"]
@@ -55,7 +65,7 @@ def get_api_mode() -> ApiMode:
 
 
 # ---------------------------------------------------------------------------
-# Repository NWO (name with owner)
+# Repository NWO (name with owner) — module-level for backward compatibility
 # ---------------------------------------------------------------------------
 
 _nwo_cache: str | None = None
@@ -293,11 +303,421 @@ def _normalize_rest_entity(
 
 
 # ---------------------------------------------------------------------------
-# High-level entity view functions
+# GitHubForge — ForgeClient implementation
+# ---------------------------------------------------------------------------
+
+_DEFAULT_ISSUE_FIELDS = ["number", "url", "state", "title", "labels"]
+
+
+class GitHubForge:
+    """GitHub implementation of the ``ForgeClient`` protocol.
+
+    Wraps the existing ``gh`` CLI functions behind the forge-agnostic
+    interface. Maintains backward compatibility: all existing module-level
+    functions continue to work by delegating to a singleton instance.
+
+    This class is **not** required to inherit from ``ForgeClient`` —
+    Python's structural subtyping (``Protocol``) means it satisfies the
+    protocol as long as all methods/properties match. We do *not*
+    inherit to keep the class lightweight and avoid metaclass conflicts.
+
+    GitHub-specific methods like ``run()``, ``api_rest()``, and
+    ``parallel_queries()`` are available but are NOT part of the
+    ``ForgeClient`` protocol.
+    """
+
+    def __init__(self, cwd: Path | None = None) -> None:
+        self._cwd = cwd
+        self._nwo_cache: str | None = None
+
+    # --- ForgeClient.forge_type ---
+
+    @property
+    def forge_type(self) -> str:
+        """Identifier for the forge backend."""
+        return "github"
+
+    # --- GitHub-specific: raw command execution (NOT on ForgeClient) ---
+
+    def run(
+        self,
+        args: Sequence[str],
+        *,
+        check: bool = True,
+        capture: bool = True,
+        cwd: Path | None = None,
+    ) -> subprocess.CompletedProcess[str]:
+        """Run a ``gh`` CLI command. GitHub-specific escape hatch.
+
+        This method is intentionally NOT part of the ``ForgeClient`` protocol.
+        It exists for callers that need raw ``gh`` access (e.g., ``gh pr merge``,
+        ``gh issue create`` with custom args). These callers will be migrated
+        to protocol-level methods in follow-up issues.
+        """
+        return gh_run(args, check=check, capture=capture, cwd=cwd or self._cwd)
+
+    def api_rest(
+        self,
+        endpoint: str,
+        *,
+        method: str = "GET",
+        fields: dict[str, str] | None = None,
+        cwd: Path | None = None,
+    ) -> subprocess.CompletedProcess[str]:
+        """Make a REST API call. GitHub-specific helper."""
+        return gh_api_rest(
+            endpoint, method=method, fields=fields, cwd=cwd or self._cwd,
+        )
+
+    # --- Issue operations (ForgeClient) ---
+
+    def get_issue(self, number: int) -> ForgeIssue | None:
+        """Fetch a single issue by number."""
+        data = gh_issue_view(number, cwd=self._cwd)
+        if data is None:
+            return None
+        return _dict_to_forge_issue(data)
+
+    def list_issues(
+        self,
+        *,
+        labels: Sequence[str] | None = None,
+        state: str = "open",
+        limit: int | None = None,
+    ) -> list[ForgeIssue]:
+        """List issues matching the given filters."""
+        results = gh_list(
+            "issue", labels=labels, state=state, limit=limit,
+        )
+        return [_dict_to_forge_issue(d) for d in results]
+
+    def create_issue(
+        self,
+        title: str,
+        body: str,
+        labels: Sequence[str] | None = None,
+    ) -> ForgeIssue | None:
+        """Create a new issue."""
+        args = ["issue", "create", "--title", title, "--body", body]
+        if labels:
+            for label in labels:
+                args.extend(["--label", label])
+        args.extend(["--json", "number,url,state,title,labels"])
+
+        result = gh_run(args, check=False, cwd=self._cwd)
+        if result.returncode != 0 or not result.stdout.strip():
+            return None
+        data = safe_parse_json(result.stdout)
+        if not isinstance(data, dict):
+            return None
+        return _dict_to_forge_issue(data)
+
+    def close_issue(self, number: int) -> bool:
+        """Close an issue."""
+        result = gh_run(
+            ["issue", "close", str(number)], check=False, cwd=self._cwd,
+        )
+        return result.returncode == 0
+
+    def comment_on_issue(self, number: int, body: str) -> bool:
+        """Add a comment to an issue."""
+        return gh_issue_comment(number, body, cwd=self._cwd)
+
+    # --- Pull request operations (ForgeClient) ---
+
+    def get_pull_request(self, number: int) -> ForgePullRequest | None:
+        """Fetch a single pull request by number."""
+        fields = ["number", "state", "title", "labels", "url", "headRefName", "body"]
+        data = gh_pr_view(number, fields=fields, cwd=self._cwd)
+        if data is None:
+            return None
+        return _dict_to_forge_pr(data)
+
+    def list_pull_requests(
+        self,
+        *,
+        labels: Sequence[str] | None = None,
+        state: str = "open",
+        head: str | None = None,
+        search: str | None = None,
+        limit: int | None = None,
+    ) -> list[ForgePullRequest]:
+        """List pull requests matching the given filters."""
+        results = gh_list(
+            "pr", labels=labels, state=state, head=head,
+            search=search, limit=limit,
+        )
+        return [_dict_to_forge_pr(d) for d in results]
+
+    def create_pull_request(
+        self,
+        title: str,
+        body: str,
+        head: str,
+        base: str | None = None,
+        labels: Sequence[str] | None = None,
+    ) -> ForgePullRequest | None:
+        """Create a new pull request."""
+        args = ["pr", "create", "--title", title, "--body", body, "--head", head]
+        if base:
+            args.extend(["--base", base])
+        if labels:
+            for label in labels:
+                args.extend(["--label", label])
+        args.extend(["--json", "number,url,state,title,labels,headRefName"])
+
+        result = gh_run(args, check=False, cwd=self._cwd)
+        if result.returncode != 0 or not result.stdout.strip():
+            return None
+        data = safe_parse_json(result.stdout)
+        if not isinstance(data, dict):
+            return None
+        return _dict_to_forge_pr(data)
+
+    def close_pull_request(
+        self, number: int, comment: str | None = None,
+    ) -> bool:
+        """Close a pull request, optionally leaving a comment."""
+        if comment:
+            gh_run(
+                ["pr", "comment", str(number), "--body", comment],
+                check=False, cwd=self._cwd,
+            )
+        result = gh_run(
+            ["pr", "close", str(number)], check=False, cwd=self._cwd,
+        )
+        return result.returncode == 0
+
+    def merge_pull_request(
+        self, number: int, method: str = "squash",
+    ) -> bool:
+        """Merge a pull request."""
+        args = ["pr", "merge", str(number), f"--{method}", "--delete-branch"]
+        result = gh_run(args, check=False, cwd=self._cwd)
+        return result.returncode == 0
+
+    def comment_on_pull_request(self, number: int, body: str) -> bool:
+        """Add a comment to a pull request."""
+        result = gh_run(
+            ["pr", "comment", str(number), "--body", body],
+            check=False, cwd=self._cwd,
+        )
+        return result.returncode == 0
+
+    def get_pull_request_reviews(
+        self, number: int,
+    ) -> list[dict[str, Any]]:
+        """Fetch reviews for a pull request."""
+        result = gh_run(
+            ["pr", "view", str(number), "--json", "reviews"],
+            check=False, cwd=self._cwd,
+        )
+        if result.returncode != 0 or not result.stdout.strip():
+            return []
+        data = safe_parse_json(result.stdout)
+        if isinstance(data, dict) and "reviews" in data:
+            reviews = data["reviews"]
+            return reviews if isinstance(reviews, list) else []
+        return []
+
+    # --- Label operations (ForgeClient) ---
+
+    def add_labels(
+        self, entity_type: EntityType, number: int, labels: Sequence[str],
+    ) -> bool:
+        """Add labels to an issue or PR."""
+        return gh_entity_edit(
+            entity_type, number, add_labels=labels, cwd=self._cwd,
+        )
+
+    def remove_labels(
+        self, entity_type: EntityType, number: int, labels: Sequence[str],
+    ) -> bool:
+        """Remove labels from an issue or PR."""
+        return gh_entity_edit(
+            entity_type, number, remove_labels=labels, cwd=self._cwd,
+        )
+
+    def transition_labels(
+        self,
+        entity_type: EntityType,
+        number: int,
+        add: Sequence[str] | None = None,
+        remove: Sequence[str] | None = None,
+    ) -> bool:
+        """Atomically add and remove labels."""
+        return gh_entity_edit(
+            entity_type, number, add_labels=add, remove_labels=remove,
+            cwd=self._cwd,
+        )
+
+    # --- CI status (ForgeClient) ---
+
+    def get_default_branch_ci_status(self) -> ForgeCIStatus:
+        """Get CI status for the latest runs on the default branch."""
+        raw = gh_get_default_branch_ci_status()
+        return ForgeCIStatus(
+            status=raw.get("status", "unknown"),
+            failed_runs=raw.get("failed_runs", []),
+            total_runs=raw.get("total_runs", 0),
+            message=raw.get("message", ""),
+        )
+
+    # --- Repository metadata (ForgeClient) ---
+
+    def get_repo_nwo(self) -> str | None:
+        """Return the ``owner/repo`` identifier."""
+        return get_repo_nwo(self._cwd)
+
+    def get_repo_default_branch(self) -> str | None:
+        """Return the name of the repository's default branch."""
+        result = gh_run(
+            ["repo", "view", "--json", "defaultBranchRef"],
+            check=False, cwd=self._cwd,
+        )
+        if result.returncode != 0 or not result.stdout.strip():
+            return None
+        data = safe_parse_json(result.stdout)
+        if isinstance(data, dict):
+            ref = data.get("defaultBranchRef")
+            if isinstance(ref, dict):
+                return ref.get("name")
+        return None
+
+    # --- Batch operations (ForgeClient) ---
+
+    def get_issues_batch(
+        self, numbers: Sequence[int],
+    ) -> dict[int, ForgeIssue | None]:
+        """Fetch multiple issues by number concurrently."""
+        results: dict[int, ForgeIssue | None] = {}
+
+        def _fetch(num: int) -> tuple[int, ForgeIssue | None]:
+            return (num, self.get_issue(num))
+
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            futures = [pool.submit(_fetch, n) for n in numbers]
+            for f in futures:
+                num, issue = f.result()
+                results[num] = issue
+
+        return results
+
+    def find_pull_request_for_issue(
+        self, issue: int, state: str = "open",
+    ) -> int | None:
+        """Find a PR associated with a given issue."""
+        # Try branch naming convention first
+        prs = gh_list(
+            "pr", head=f"feature/issue-{issue}", state=state,
+            fields=["number"],
+        )
+        if prs:
+            return prs[0].get("number")
+
+        # Fall back to search by closing reference
+        prs = gh_list(
+            "pr", search=f"Closes #{issue}", state=state,
+            fields=["number"],
+        )
+        if prs:
+            return prs[0].get("number")
+
+        return None
+
+    # --- GitHub-specific methods (NOT on ForgeClient) ---
+
+    def parallel_queries(
+        self,
+        queries: Sequence[tuple[Sequence[str]]],
+        *,
+        max_workers: int = 4,
+    ) -> list[list[dict[str, Any]]]:
+        """Execute multiple ``gh`` JSON queries concurrently.
+
+        GitHub-specific. Not part of the ``ForgeClient`` protocol.
+        """
+        return gh_parallel_queries(queries, max_workers=max_workers)
+
+
+# ---------------------------------------------------------------------------
+# Conversion helpers (dict -> forge dataclasses)
 # ---------------------------------------------------------------------------
 
 
-_DEFAULT_ISSUE_FIELDS = ["number", "url", "state", "title", "labels"]
+def _extract_label_names(labels_data: Any) -> list[str]:
+    """Extract label name strings from various label representations.
+
+    Handles both ``[{"name": "bug"}]`` (gh CLI output) and
+    ``["bug"]`` (plain string list) formats.
+    """
+    if not isinstance(labels_data, list):
+        return []
+    names: list[str] = []
+    for item in labels_data:
+        if isinstance(item, dict):
+            name = item.get("name", "")
+            if name:
+                names.append(name)
+        elif isinstance(item, str):
+            names.append(item)
+    return names
+
+
+def _dict_to_forge_issue(data: dict[str, Any]) -> ForgeIssue:
+    """Convert a raw ``gh`` JSON dict to a ``ForgeIssue``."""
+    return ForgeIssue(
+        number=data.get("number", 0),
+        state=data.get("state", "OPEN"),
+        title=data.get("title", ""),
+        url=data.get("url", ""),
+        labels=_extract_label_names(data.get("labels")),
+        body=data.get("body"),
+    )
+
+
+def _dict_to_forge_pr(data: dict[str, Any]) -> ForgePullRequest:
+    """Convert a raw ``gh`` JSON dict to a ``ForgePullRequest``."""
+    return ForgePullRequest(
+        number=data.get("number", 0),
+        state=data.get("state", "OPEN"),
+        title=data.get("title", ""),
+        url=data.get("url", ""),
+        labels=_extract_label_names(data.get("labels")),
+        head_branch=data.get("headRefName"),
+        body=data.get("body"),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Singleton forge instance
+# ---------------------------------------------------------------------------
+
+_forge_instance: GitHubForge | None = None
+
+
+def get_forge(cwd: Path | None = None) -> GitHubForge:
+    """Return a singleton ``GitHubForge`` instance.
+
+    The first call determines the ``cwd``; subsequent calls return the
+    same instance regardless of ``cwd`` argument. Use ``_reset_forge()``
+    in tests to clear the singleton.
+    """
+    global _forge_instance
+    if _forge_instance is None:
+        _forge_instance = GitHubForge(cwd=cwd)
+    return _forge_instance
+
+
+def _reset_forge() -> None:
+    """Reset the singleton forge instance (for testing)."""
+    global _forge_instance
+    _forge_instance = None
+
+
+# ---------------------------------------------------------------------------
+# High-level entity view functions (backward-compatible module-level)
+# ---------------------------------------------------------------------------
 
 
 def gh_issue_view(
@@ -497,7 +917,7 @@ def gh_entity_edit(
             cwd=cwd,
         )
         if result.returncode != 0:
-            # Label may not exist — treat as success
+            # Label may not exist -- treat as success
             pass
 
     return success
