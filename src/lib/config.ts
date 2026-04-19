@@ -41,6 +41,21 @@ export interface TerminalConfig {
 }
 
 /**
+ * Forge configuration for selecting the git hosting backend.
+ */
+export interface ForgeConfig {
+  /** Forge type: "auto" (detect from remote URL), "github", or "gitea" */
+  type?: "auto" | "github" | "gitea";
+  /** Gitea-specific settings */
+  gitea?: {
+    /** Base URL of the Gitea instance */
+    url: string;
+    /** Name of env var holding the Gitea API token (default: "GITEA_TOKEN") */
+    api_token_env?: string;
+  };
+}
+
+/**
  * Root configuration structure for Loom workspace.
  * Stored in .loom/config.json and committed to version control.
  */
@@ -51,6 +66,8 @@ export interface LoomConfig {
   terminals: TerminalConfig[];
   /** Offline mode flag - when true, skips Claude Code agent launch and uses simple status echoes */
   offlineMode?: boolean;
+  /** Forge backend configuration (defaults to GitHub when absent) */
+  forge?: ForgeConfig;
 }
 
 /**

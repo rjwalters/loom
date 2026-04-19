@@ -1,8 +1,19 @@
-"""Tests for the ForgeClient protocol and forge-neutral data types."""
+"""Tests for loom_tools.common.forge module.
+
+Tests cover both the ForgeClient protocol / data types and the forge
+detection / configuration logic.
+"""
 
 from __future__ import annotations
 
+import json
+import os
+import subprocess
+from pathlib import Path
 from typing import Any, Sequence
+from unittest import mock
+
+import pytest
 
 from loom_tools.common.forge import (
     EntityType,
@@ -11,12 +22,18 @@ from loom_tools.common.forge import (
     ForgeIssue,
     ForgeLabel,
     ForgePullRequest,
+    ForgeType,
+    _detect_from_host,
+    _get_remote_url,
+    _parse_host,
+    detect_forge,
+    get_forge_config,
 )
 
 
-# ---------------------------------------------------------------------------
+# ===========================================================================
 # Dataclass construction tests
-# ---------------------------------------------------------------------------
+# ===========================================================================
 
 
 class TestForgeIssue:
@@ -128,9 +145,9 @@ class TestForgeCIStatus:
         assert b.failed_runs == []
 
 
-# ---------------------------------------------------------------------------
+# ===========================================================================
 # Protocol compliance tests
-# ---------------------------------------------------------------------------
+# ===========================================================================
 
 
 class MockForgeClient:
@@ -416,9 +433,9 @@ class TestProtocolNonCompliance:
         assert not isinstance(Partial(), ForgeClient)
 
 
-# ---------------------------------------------------------------------------
+# ===========================================================================
 # Edge case tests
-# ---------------------------------------------------------------------------
+# ===========================================================================
 
 
 class TestEdgeCases:
@@ -446,3 +463,365 @@ class TestEdgeCases:
         assert val == "issue"
         val = "pr"
         assert val == "pr"
+
+
+# ===========================================================================
+# Forge detection tests
+# ===========================================================================
+
+
+# ---------------------------------------------------------------------------
+# _parse_host
+# ---------------------------------------------------------------------------
+
+
+class TestParseHost:
+    """Tests for _parse_host URL parsing."""
+
+    def test_ssh_github(self) -> None:
+        assert _parse_host("git@github.com:owner/repo.git") == "github.com"
+
+    def test_ssh_gitea(self) -> None:
+        assert _parse_host("git@gitea.example.com:owner/repo.git") == "gitea.example.com"
+
+    def test_ssh_without_git_suffix(self) -> None:
+        assert _parse_host("git@github.com:owner/repo") == "github.com"
+
+    def test_https_github(self) -> None:
+        assert _parse_host("https://github.com/owner/repo.git") == "github.com"
+
+    def test_https_gitea(self) -> None:
+        assert _parse_host("https://gitea.example.com/owner/repo.git") == "gitea.example.com"
+
+    def test_https_without_git_suffix(self) -> None:
+        assert _parse_host("https://github.com/owner/repo") == "github.com"
+
+    def test_http_url(self) -> None:
+        assert _parse_host("http://github.com/owner/repo.git") == "github.com"
+
+    def test_custom_ssh_host(self) -> None:
+        assert _parse_host("git@git.mycompany.com:org/project.git") == "git.mycompany.com"
+
+    def test_invalid_url(self) -> None:
+        assert _parse_host("not-a-url") is None
+
+    def test_empty_string(self) -> None:
+        assert _parse_host("") is None
+
+    def test_ssh_with_port_style(self) -> None:
+        # Some SSH configs use host:path format
+        assert _parse_host("git@gitea.local:owner/repo.git") == "gitea.local"
+
+
+# ---------------------------------------------------------------------------
+# _detect_from_host
+# ---------------------------------------------------------------------------
+
+
+class TestDetectFromHost:
+    """Tests for _detect_from_host hostname matching."""
+
+    def test_github_com(self) -> None:
+        assert _detect_from_host("github.com") == ForgeType.GITHUB
+
+    def test_unknown_host_defaults_github(self) -> None:
+        assert _detect_from_host("unknown.example.com") == ForgeType.GITHUB
+
+    def test_gitea_via_config_url(self) -> None:
+        config = {"gitea": {"url": "https://gitea.example.com"}}
+        assert _detect_from_host("gitea.example.com", config) == ForgeType.GITEA
+
+    def test_gitea_config_url_mismatch(self) -> None:
+        config = {"gitea": {"url": "https://gitea.example.com"}}
+        assert _detect_from_host("other.example.com", config) == ForgeType.GITHUB
+
+    def test_no_forge_config(self) -> None:
+        assert _detect_from_host("gitea.example.com", None) == ForgeType.GITHUB
+
+    def test_empty_forge_config(self) -> None:
+        assert _detect_from_host("gitea.example.com", {}) == ForgeType.GITHUB
+
+    def test_gitea_config_without_url(self) -> None:
+        config = {"gitea": {}}
+        assert _detect_from_host("gitea.example.com", config) == ForgeType.GITHUB
+
+    def test_gitea_config_url_with_path(self) -> None:
+        config = {"gitea": {"url": "https://gitea.example.com/prefix"}}
+        assert _detect_from_host("gitea.example.com", config) == ForgeType.GITEA
+
+
+# ---------------------------------------------------------------------------
+# get_forge_config
+# ---------------------------------------------------------------------------
+
+
+class TestGetForgeConfig:
+    """Tests for get_forge_config config loading."""
+
+    def test_config_with_forge_section(self, tmp_path: Path) -> None:
+        loom_dir = tmp_path / ".loom"
+        loom_dir.mkdir()
+        config = {
+            "version": "2",
+            "forge": {
+                "type": "gitea",
+                "gitea": {"url": "https://gitea.example.com"},
+            },
+            "terminals": [],
+        }
+        (loom_dir / "config.json").write_text(json.dumps(config))
+        result = get_forge_config(tmp_path)
+        assert result == {"type": "gitea", "gitea": {"url": "https://gitea.example.com"}}
+
+    def test_config_without_forge_section(self, tmp_path: Path) -> None:
+        loom_dir = tmp_path / ".loom"
+        loom_dir.mkdir()
+        config = {"version": "2", "terminals": []}
+        (loom_dir / "config.json").write_text(json.dumps(config))
+        result = get_forge_config(tmp_path)
+        assert result == {}
+
+    def test_missing_config_file(self, tmp_path: Path) -> None:
+        result = get_forge_config(tmp_path)
+        assert result == {}
+
+    def test_invalid_json(self, tmp_path: Path) -> None:
+        loom_dir = tmp_path / ".loom"
+        loom_dir.mkdir()
+        (loom_dir / "config.json").write_text("not json")
+        result = get_forge_config(tmp_path)
+        assert result == {}
+
+
+# ---------------------------------------------------------------------------
+# detect_forge
+# ---------------------------------------------------------------------------
+
+
+class TestDetectForge:
+    """Tests for detect_forge end-to-end detection."""
+
+    def test_env_var_github(self) -> None:
+        with mock.patch.dict(os.environ, {"LOOM_FORGE_TYPE": "github"}):
+            assert detect_forge() == ForgeType.GITHUB
+
+    def test_env_var_gitea(self) -> None:
+        with mock.patch.dict(os.environ, {"LOOM_FORGE_TYPE": "gitea"}):
+            assert detect_forge() == ForgeType.GITEA
+
+    def test_env_var_case_insensitive(self) -> None:
+        with mock.patch.dict(os.environ, {"LOOM_FORGE_TYPE": "GITHUB"}):
+            assert detect_forge() == ForgeType.GITHUB
+
+    def test_env_var_with_whitespace(self) -> None:
+        with mock.patch.dict(os.environ, {"LOOM_FORGE_TYPE": " gitea "}):
+            assert detect_forge() == ForgeType.GITEA
+
+    def test_env_var_invalid_falls_through(self, tmp_path: Path) -> None:
+        """Invalid env var falls through to next detection method."""
+        loom_dir = tmp_path / ".loom"
+        loom_dir.mkdir()
+        config = {"version": "2", "forge": {"type": "gitea"}, "terminals": []}
+        (loom_dir / "config.json").write_text(json.dumps(config))
+        with mock.patch.dict(os.environ, {"LOOM_FORGE_TYPE": "invalid"}):
+            assert detect_forge(tmp_path) == ForgeType.GITEA
+
+    def test_config_override_gitea(self, tmp_path: Path) -> None:
+        loom_dir = tmp_path / ".loom"
+        loom_dir.mkdir()
+        config = {"version": "2", "forge": {"type": "gitea"}, "terminals": []}
+        (loom_dir / "config.json").write_text(json.dumps(config))
+        with mock.patch.dict(os.environ, {}, clear=True):
+            # Ensure no env var set
+            os.environ.pop("LOOM_FORGE_TYPE", None)
+            assert detect_forge(tmp_path) == ForgeType.GITEA
+
+    def test_config_auto_falls_through(self, tmp_path: Path) -> None:
+        """Config type 'auto' falls through to URL detection."""
+        loom_dir = tmp_path / ".loom"
+        loom_dir.mkdir()
+        config = {"version": "2", "forge": {"type": "auto"}, "terminals": []}
+        (loom_dir / "config.json").write_text(json.dumps(config))
+
+        mock_result = subprocess.CompletedProcess(
+            args=[], returncode=0, stdout="https://github.com/owner/repo.git\n"
+        )
+        with (
+            mock.patch.dict(os.environ, {}, clear=True),
+            mock.patch("loom_tools.common.forge.subprocess.run", return_value=mock_result),
+        ):
+            os.environ.pop("LOOM_FORGE_TYPE", None)
+            assert detect_forge(tmp_path) == ForgeType.GITHUB
+
+    def test_auto_detect_github_ssh(self) -> None:
+        mock_result = subprocess.CompletedProcess(
+            args=[], returncode=0, stdout="git@github.com:owner/repo.git\n"
+        )
+        with (
+            mock.patch.dict(os.environ, {}, clear=True),
+            mock.patch("loom_tools.common.forge.subprocess.run", return_value=mock_result),
+        ):
+            os.environ.pop("LOOM_FORGE_TYPE", None)
+            assert detect_forge() == ForgeType.GITHUB
+
+    def test_auto_detect_github_https(self) -> None:
+        mock_result = subprocess.CompletedProcess(
+            args=[], returncode=0, stdout="https://github.com/owner/repo.git\n"
+        )
+        with (
+            mock.patch.dict(os.environ, {}, clear=True),
+            mock.patch("loom_tools.common.forge.subprocess.run", return_value=mock_result),
+        ):
+            os.environ.pop("LOOM_FORGE_TYPE", None)
+            assert detect_forge() == ForgeType.GITHUB
+
+    def test_auto_detect_gitea_via_config_url(self, tmp_path: Path) -> None:
+        """Gitea detected via matching config URL."""
+        loom_dir = tmp_path / ".loom"
+        loom_dir.mkdir()
+        config = {
+            "version": "2",
+            "forge": {
+                "type": "auto",
+                "gitea": {"url": "https://gitea.mycompany.com"},
+            },
+            "terminals": [],
+        }
+        (loom_dir / "config.json").write_text(json.dumps(config))
+
+        mock_result = subprocess.CompletedProcess(
+            args=[], returncode=0, stdout="git@gitea.mycompany.com:team/project.git\n"
+        )
+        with (
+            mock.patch.dict(os.environ, {}, clear=True),
+            mock.patch("loom_tools.common.forge.subprocess.run", return_value=mock_result),
+        ):
+            os.environ.pop("LOOM_FORGE_TYPE", None)
+            assert detect_forge(tmp_path) == ForgeType.GITEA
+
+    def test_default_github_no_remote(self) -> None:
+        """Default to GitHub when no remote URL is available."""
+        mock_result = subprocess.CompletedProcess(
+            args=[], returncode=1, stdout="", stderr="fatal: not a git repository"
+        )
+        with (
+            mock.patch.dict(os.environ, {}, clear=True),
+            mock.patch("loom_tools.common.forge.subprocess.run", return_value=mock_result),
+        ):
+            os.environ.pop("LOOM_FORGE_TYPE", None)
+            assert detect_forge() == ForgeType.GITHUB
+
+    def test_default_github_no_config_no_env(self) -> None:
+        """Default to GitHub when nothing is configured."""
+        mock_result = subprocess.CompletedProcess(
+            args=[], returncode=0, stdout="https://github.com/owner/repo.git\n"
+        )
+        with (
+            mock.patch.dict(os.environ, {}, clear=True),
+            mock.patch("loom_tools.common.forge.subprocess.run", return_value=mock_result),
+        ):
+            os.environ.pop("LOOM_FORGE_TYPE", None)
+            assert detect_forge() == ForgeType.GITHUB
+
+    def test_env_var_takes_priority_over_config(self, tmp_path: Path) -> None:
+        """Env var overrides config file."""
+        loom_dir = tmp_path / ".loom"
+        loom_dir.mkdir()
+        config = {"version": "2", "forge": {"type": "gitea"}, "terminals": []}
+        (loom_dir / "config.json").write_text(json.dumps(config))
+        with mock.patch.dict(os.environ, {"LOOM_FORGE_TYPE": "github"}):
+            assert detect_forge(tmp_path) == ForgeType.GITHUB
+
+    def test_config_takes_priority_over_url(self, tmp_path: Path) -> None:
+        """Config type overrides URL detection."""
+        loom_dir = tmp_path / ".loom"
+        loom_dir.mkdir()
+        config = {"version": "2", "forge": {"type": "gitea"}, "terminals": []}
+        (loom_dir / "config.json").write_text(json.dumps(config))
+
+        # Even though URL points to github.com, config says gitea
+        mock_result = subprocess.CompletedProcess(
+            args=[], returncode=0, stdout="https://github.com/owner/repo.git\n"
+        )
+        with (
+            mock.patch.dict(os.environ, {}, clear=True),
+            mock.patch("loom_tools.common.forge.subprocess.run", return_value=mock_result),
+        ):
+            os.environ.pop("LOOM_FORGE_TYPE", None)
+            assert detect_forge(tmp_path) == ForgeType.GITEA
+
+    def test_backward_compatible_no_forge_config(self, tmp_path: Path) -> None:
+        """Existing repos without forge config default to GitHub."""
+        loom_dir = tmp_path / ".loom"
+        loom_dir.mkdir()
+        config = {"version": "2", "terminals": []}
+        (loom_dir / "config.json").write_text(json.dumps(config))
+
+        mock_result = subprocess.CompletedProcess(
+            args=[], returncode=0, stdout="https://github.com/owner/repo.git\n"
+        )
+        with (
+            mock.patch.dict(os.environ, {}, clear=True),
+            mock.patch("loom_tools.common.forge.subprocess.run", return_value=mock_result),
+        ):
+            os.environ.pop("LOOM_FORGE_TYPE", None)
+            assert detect_forge(tmp_path) == ForgeType.GITHUB
+
+
+# ---------------------------------------------------------------------------
+# _get_remote_url
+# ---------------------------------------------------------------------------
+
+
+class TestGetRemoteUrl:
+    """Tests for _get_remote_url subprocess handling."""
+
+    def test_success(self) -> None:
+        mock_result = subprocess.CompletedProcess(
+            args=[], returncode=0, stdout="https://github.com/owner/repo.git\n"
+        )
+        with mock.patch("loom_tools.common.forge.subprocess.run", return_value=mock_result):
+            assert _get_remote_url() == "https://github.com/owner/repo.git"
+
+    def test_failure(self) -> None:
+        mock_result = subprocess.CompletedProcess(
+            args=[], returncode=1, stdout="", stderr="fatal: not a git repository"
+        )
+        with mock.patch("loom_tools.common.forge.subprocess.run", return_value=mock_result):
+            assert _get_remote_url() is None
+
+    def test_empty_stdout(self) -> None:
+        mock_result = subprocess.CompletedProcess(
+            args=[], returncode=0, stdout="\n"
+        )
+        with mock.patch("loom_tools.common.forge.subprocess.run", return_value=mock_result):
+            assert _get_remote_url() is None
+
+    def test_os_error(self) -> None:
+        with mock.patch(
+            "loom_tools.common.forge.subprocess.run", side_effect=OSError("not found")
+        ):
+            assert _get_remote_url() is None
+
+
+# ---------------------------------------------------------------------------
+# ForgeType enum
+# ---------------------------------------------------------------------------
+
+
+class TestForgeType:
+    """Tests for ForgeType enum values."""
+
+    def test_github_value(self) -> None:
+        assert ForgeType.GITHUB.value == "github"
+
+    def test_gitea_value(self) -> None:
+        assert ForgeType.GITEA.value == "gitea"
+
+    def test_from_string(self) -> None:
+        assert ForgeType("github") == ForgeType.GITHUB
+        assert ForgeType("gitea") == ForgeType.GITEA
+
+    def test_invalid_value(self) -> None:
+        with pytest.raises(ValueError):
+            ForgeType("gitlab")

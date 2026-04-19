@@ -61,6 +61,31 @@ export type InputRequestFromSchema = z.infer<typeof InputRequestSchema>;
 // ============================================================================
 
 /**
+ * Gitea-specific forge configuration
+ */
+export const GiteaConfigSchema = z.object({
+  /** Base URL of the Gitea instance */
+  url: z.string().url(),
+  /** Name of env var holding the Gitea API token (default: "GITEA_TOKEN") */
+  api_token_env: z.string().default("GITEA_TOKEN"),
+});
+
+export type GiteaConfigFromSchema = z.infer<typeof GiteaConfigSchema>;
+
+/**
+ * Forge configuration for selecting the git hosting backend.
+ * Optional field in LoomConfig — repos without it default to GitHub.
+ */
+export const ForgeConfigSchema = z.object({
+  /** Forge type: "auto" (detect from remote URL), "github", or "gitea" */
+  type: z.enum(["auto", "github", "gitea"]).default("auto"),
+  /** Gitea-specific settings (required when type is "gitea" or auto-detecting a Gitea host) */
+  gitea: GiteaConfigSchema.optional(),
+});
+
+export type ForgeConfigFromSchema = z.infer<typeof ForgeConfigSchema>;
+
+/**
  * Role configuration schema for agent settings
  */
 export const RoleConfigSchema = z.record(z.string(), z.unknown());
@@ -95,6 +120,8 @@ export const LoomConfigSchema = z.object({
   terminals: z.array(TerminalConfigSchema),
   /** Offline mode flag */
   offlineMode: z.boolean().optional(),
+  /** Forge backend configuration (defaults to GitHub when absent) */
+  forge: ForgeConfigSchema.optional(),
 });
 
 export type LoomConfigFromSchema = z.infer<typeof LoomConfigSchema>;
@@ -107,6 +134,7 @@ export const RawLoomConfigSchema = z.object({
   terminals: z.array(z.record(z.string(), z.unknown())).optional(),
   agents: z.array(z.record(z.string(), z.unknown())).optional(),
   offlineMode: z.boolean().optional(),
+  forge: z.record(z.string(), z.unknown()).optional(),
 });
 
 // ============================================================================

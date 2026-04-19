@@ -1,20 +1,188 @@
-"""Forge-agnostic protocol for issue tracker and code forge operations.
+"""Forge-agnostic protocol and detection for issue tracker and code forge operations.
 
-Defines the ``ForgeClient`` protocol that abstracts all forge operations
-(issues, PRs, labels, CI, comments, etc.) behind a single interface.
-Both ``GitHubForge`` and ``GiteaForge`` will implement this protocol.
+This module provides:
 
-This module is the foundation of the forge-agnostic abstraction layer.
-It defines only the interface and data types -- no implementation.
+1. **ForgeClient protocol** -- abstracts all forge operations (issues, PRs, labels,
+   CI, comments, etc.) behind a single interface. Both ``GitHubForge`` and
+   ``GiteaForge`` will implement this protocol.
+
+2. **Forge detection** -- determines which forge backend to use via a 4-step
+   resolution order:
+   a. ``LOOM_FORGE_TYPE`` env var (``"github"`` | ``"gitea"``)
+   b. ``.loom/config.json`` ``forge.type`` field (if not ``"auto"``)
+   c. Auto-detect from git remote origin URL host
+   d. Default to ``ForgeType.GITHUB`` (backward compatible)
 """
 
 from __future__ import annotations
 
+import enum
+import logging
+import os
+import re
+import subprocess
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Literal, Protocol, Sequence, runtime_checkable
 
+from loom_tools.common.state import read_json_file
 
 EntityType = Literal["issue", "pr"]
+
+logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Forge type enum and detection
+# ---------------------------------------------------------------------------
+
+
+class ForgeType(enum.Enum):
+    """Supported forge backends."""
+
+    GITHUB = "github"
+    GITEA = "gitea"
+
+
+def _parse_host(url: str) -> str | None:
+    """Extract hostname from a git remote URL.
+
+    Supports both SSH and HTTPS formats:
+
+    - SSH: ``git@gitea.example.com:owner/repo.git`` -> ``gitea.example.com``
+    - HTTPS: ``https://gitea.example.com/owner/repo`` -> ``gitea.example.com``
+
+    Returns ``None`` if the URL cannot be parsed.
+    """
+    # SSH format: git@host:owner/repo.git
+    ssh_match = re.match(r"git@([^:]+):", url)
+    if ssh_match:
+        return ssh_match.group(1)
+
+    # HTTPS format: https://host/owner/repo.git
+    https_match = re.match(r"https?://([^/]+)/", url)
+    if https_match:
+        return https_match.group(1)
+
+    return None
+
+
+def _get_remote_url(cwd: Path | None = None) -> str | None:
+    """Get the git remote origin URL.
+
+    Returns ``None`` if the URL cannot be determined.
+    """
+    try:
+        result = subprocess.run(
+            ["git", "remote", "get-url", "origin"],
+            cwd=cwd,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        if result.returncode != 0 or not result.stdout.strip():
+            return None
+        return result.stdout.strip()
+    except OSError:
+        return None
+
+
+def _detect_from_host(host: str, forge_config: dict[str, Any] | None = None) -> ForgeType:
+    """Determine forge type from a hostname.
+
+    Rules:
+    - ``github.com`` -> :attr:`ForgeType.GITHUB`
+    - Host matches configured Gitea URL -> :attr:`ForgeType.GITEA`
+    - Everything else -> :attr:`ForgeType.GITHUB` (safe default)
+    """
+    if host == "github.com":
+        return ForgeType.GITHUB
+
+    # Check if host matches the configured Gitea URL
+    if forge_config:
+        gitea_config = forge_config.get("gitea", {})
+        if isinstance(gitea_config, dict):
+            gitea_url = gitea_config.get("url", "")
+            if gitea_url:
+                # Extract host from the configured Gitea URL
+                gitea_url_match = re.match(r"https?://([^/]+)", gitea_url)
+                if gitea_url_match and gitea_url_match.group(1) == host:
+                    return ForgeType.GITEA
+
+    # Default to GitHub for unknown hosts (backward compatible)
+    return ForgeType.GITHUB
+
+
+def get_forge_config(cwd: Path | None = None) -> dict[str, Any]:
+    """Read the ``forge`` section from ``.loom/config.json``.
+
+    Returns an empty dict if the config file is missing or has no
+    ``forge`` key.
+
+    Args:
+        cwd: Working directory to find ``.loom/config.json``. Defaults
+            to the current directory.
+    """
+    config_dir = (cwd or Path.cwd()) / ".loom"
+    config_file = config_dir / "config.json"
+
+    data = read_json_file(config_file)
+    if not isinstance(data, dict):
+        return {}
+
+    forge = data.get("forge", {})
+    return forge if isinstance(forge, dict) else {}
+
+
+def detect_forge(cwd: Path | None = None) -> ForgeType:
+    """Detect the forge type for the current repository.
+
+    Resolution order:
+
+    1. ``LOOM_FORGE_TYPE`` env var (``"github"`` | ``"gitea"``)
+    2. ``.loom/config.json`` ``forge.type`` field (if not ``"auto"``)
+    3. Auto-detect from git remote origin URL host
+    4. Default to :attr:`ForgeType.GITHUB` (backward compatible)
+
+    Args:
+        cwd: Working directory for git operations and config lookup.
+            Defaults to the current directory.
+
+    Returns:
+        The detected :class:`ForgeType`.
+    """
+    # 1. Environment variable override (highest priority)
+    env_val = os.environ.get("LOOM_FORGE_TYPE", "").lower().strip()
+    if env_val:
+        try:
+            return ForgeType(env_val)
+        except ValueError:
+            logger.warning(
+                "Invalid LOOM_FORGE_TYPE=%r, continuing with other detection methods",
+                env_val,
+            )
+
+    # 2. Config file override
+    forge_config = get_forge_config(cwd)
+    config_type = forge_config.get("type", "auto")
+    if isinstance(config_type, str) and config_type.lower() not in ("auto", ""):
+        try:
+            return ForgeType(config_type.lower())
+        except ValueError:
+            logger.warning(
+                "Invalid forge.type=%r in config, continuing with auto-detection",
+                config_type,
+            )
+
+    # 3. Auto-detect from git remote URL
+    remote_url = _get_remote_url(cwd)
+    if remote_url:
+        host = _parse_host(remote_url)
+        if host:
+            return _detect_from_host(host, forge_config)
+
+    # 4. Default to GitHub (backward compatible)
+    return ForgeType.GITHUB
 
 
 # ---------------------------------------------------------------------------
