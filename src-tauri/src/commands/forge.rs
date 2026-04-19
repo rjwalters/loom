@@ -81,7 +81,7 @@ fn get_configured_gitea_host() -> Option<String> {
 /// 3. Return `true` if the host is `github.com` or matches the Gitea host from `.loom/config.json`
 /// 4. Fall back to `false` for unrecognized hosts
 #[tauri::command]
-pub fn check_github_remote() -> Result<bool, String> {
+pub fn check_forge_remote() -> Result<bool, String> {
     let output = Command::new("git")
         .args(["remote", "get-url", "origin"])
         .output()

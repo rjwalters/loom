@@ -1,8 +1,8 @@
 use crate::activity::{ActivityDb, AgentInput, AgentOutput, InputContext, InputType};
 use crate::errors::DaemonError;
+use crate::forge_parser::parse_forge_events;
 use crate::git_parser;
 use crate::git_utils;
-use crate::github_parser::parse_github_events;
 use crate::terminal::TerminalManager;
 use crate::types::{Request, Response};
 use anyhow::Result;
@@ -260,9 +260,9 @@ fn handle_request(
                             // Parse terminal output for forge events and record them
                             // TODO: Read forge_host from configuration once #3135 lands
                             let forge_host = "github.com";
-                            let github_events = parse_github_events(&output_str, forge_host);
-                            for parsed_event in github_events {
-                                let prompt_event = parsed_event.to_prompt_github_event(None);
+                            let forge_events = parse_forge_events(&output_str, forge_host);
+                            for parsed_event in forge_events {
+                                let prompt_event = parsed_event.to_prompt_forge_event(None);
                                 if let Err(e) = db.record_prompt_github_event(&prompt_event) {
                                     log::warn!("Failed to record GitHub event: {e}");
                                 } else {

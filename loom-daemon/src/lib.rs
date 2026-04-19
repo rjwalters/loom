@@ -12,9 +12,9 @@
 
 pub mod activity;
 pub mod errors;
+pub mod forge_parser;
 pub mod git_parser;
 pub mod git_utils;
-pub mod github_parser;
 pub mod health_monitor;
 pub mod init;
 pub mod ipc;
