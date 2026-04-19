@@ -12,7 +12,10 @@ from unittest import mock
 import pytest
 
 from loom_tools.daemon_v2.actions.completions import CompletionEntry
-from loom_tools.daemon_v2.actions.support_roles import reclaim_completed_support_roles
+from loom_tools.daemon_v2.actions.support_roles import (
+    cleanup_idle_support_sessions,
+    reclaim_completed_support_roles,
+)
 from loom_tools.daemon_v2.config import DaemonConfig
 from loom_tools.daemon_v2.context import DaemonContext
 from loom_tools.daemon_v2.iteration import _reclaim_completed_support_roles
@@ -87,9 +90,18 @@ class TestReclaimCompletedSupportRoles:
             },
         )
 
-        with mock.patch(
-            "loom_tools.daemon_v2.actions.support_roles.is_session_active",
-            return_value=True,
+        with (
+            mock.patch(
+                "loom_tools.daemon_v2.actions.support_roles.is_session_active",
+                return_value=True,
+            ),
+            mock.patch(
+                "loom_tools.daemon_v2.actions.support_roles.session_exists",
+                return_value=False,
+            ),
+            mock.patch(
+                "loom_tools.daemon_v2.actions.support_roles.kill_stuck_session",
+            ),
         ):
             completed = reclaim_completed_support_roles(ctx)
 
@@ -108,6 +120,10 @@ class TestReclaimCompletedSupportRoles:
             },
         )
 
+        def mock_exists(name: str) -> bool:
+            # Only the architect session lingers
+            return name == "architect"
+
         with (
             mock.patch(
                 "loom_tools.daemon_v2.actions.support_roles.is_session_active",
@@ -115,7 +131,7 @@ class TestReclaimCompletedSupportRoles:
             ),
             mock.patch(
                 "loom_tools.daemon_v2.actions.support_roles.session_exists",
-                return_value=True,  # But tmux session still exists
+                side_effect=mock_exists,
             ),
             mock.patch(
                 "loom_tools.daemon_v2.actions.support_roles.kill_stuck_session",
@@ -129,8 +145,8 @@ class TestReclaimCompletedSupportRoles:
         # Stale shell-only session should be killed
         mock_kill.assert_called_once_with("architect")
 
-    def test_idle_roles_skipped(self, tmp_path: pathlib.Path) -> None:
-        """Idle roles should not be checked or reclaimed."""
+    def test_idle_roles_not_reclaimed_as_completions(self, tmp_path: pathlib.Path) -> None:
+        """Idle roles should not produce CompletionEntry objects."""
         ctx = _make_ctx(
             tmp_path,
             support_roles={
@@ -141,13 +157,22 @@ class TestReclaimCompletedSupportRoles:
             },
         )
 
-        with mock.patch(
-            "loom_tools.daemon_v2.actions.support_roles.is_session_active",
-        ) as mock_active:
+        with (
+            mock.patch(
+                "loom_tools.daemon_v2.actions.support_roles.is_session_active",
+                return_value=False,
+            ),
+            mock.patch(
+                "loom_tools.daemon_v2.actions.support_roles.session_exists",
+                return_value=False,
+            ),
+            mock.patch(
+                "loom_tools.daemon_v2.actions.support_roles.kill_stuck_session",
+            ),
+        ):
             completed = reclaim_completed_support_roles(ctx)
 
         assert len(completed) == 0
-        mock_active.assert_not_called()
 
     def test_multiple_roles_mixed_states(self, tmp_path: pathlib.Path) -> None:
         """Multiple roles: only running ones without active Claude are reclaimed."""
@@ -178,7 +203,8 @@ class TestReclaimCompletedSupportRoles:
             return name == "champion"
 
         def mock_exists(name: str) -> bool:
-            # judge session gone, doctor session still there (shell-only)
+            # judge session gone, doctor session still there (shell-only),
+            # all other roles have no lingering sessions
             return name == "doctor"
 
         with (
@@ -199,7 +225,8 @@ class TestReclaimCompletedSupportRoles:
         assert len(completed) == 2
         names = {c.name for c in completed}
         assert names == {"judge", "doctor"}
-        # Only doctor's stale session should be killed (judge was already gone)
+        # Only doctor's stale session should be killed (judge was already gone,
+        # no other roles have lingering sessions per mock_exists)
         mock_kill.assert_called_once_with("doctor")
 
     def test_no_state_returns_empty(self, tmp_path: pathlib.Path) -> None:
@@ -249,8 +276,8 @@ class TestHandleCompletionIntegration:
 class TestIterationWrapperFunction:
     """Tests for _reclaim_completed_support_roles in iteration.py."""
 
-    def test_no_running_roles_skips_check(self, tmp_path: pathlib.Path) -> None:
-        """When no roles are running, is_session_active is never called."""
+    def test_no_running_roles_skips_reclaim(self, tmp_path: pathlib.Path) -> None:
+        """When no roles are running, no CompletionEntry objects are produced."""
         ctx = _make_ctx(
             tmp_path,
             support_roles={
@@ -259,13 +286,22 @@ class TestIterationWrapperFunction:
             },
         )
 
-        with mock.patch(
-            "loom_tools.daemon_v2.actions.support_roles.is_session_active",
-        ) as mock_active:
+        with (
+            mock.patch(
+                "loom_tools.daemon_v2.actions.support_roles.is_session_active",
+                return_value=False,
+            ),
+            mock.patch(
+                "loom_tools.daemon_v2.actions.support_roles.session_exists",
+                return_value=False,
+            ),
+            mock.patch(
+                "loom_tools.daemon_v2.actions.support_roles.kill_stuck_session",
+            ),
+        ):
             result = _reclaim_completed_support_roles(ctx)
 
         assert result == []
-        mock_active.assert_not_called()
 
     def test_running_role_triggers_check(self, tmp_path: pathlib.Path) -> None:
         """When a role is running, the check detects inactive Claude process."""
@@ -396,3 +432,180 @@ class TestRunIterationWithSupportRoleReclaim:
         assert state.support_roles["judge"].tmux_session is None
         # Completion should be counted
         assert result.completions_handled == 1
+
+
+class TestCleanupIdleSupportSessions:
+    """Tests for cleanup_idle_support_sessions (belt-and-suspenders cleanup).
+
+    This function catches tmux sessions that linger for roles already marked
+    idle — e.g., when kill_stuck_session failed silently on a prior iteration.
+    See issue #3136.
+    """
+
+    def test_idle_role_with_lingering_session_is_killed(
+        self, tmp_path: pathlib.Path
+    ) -> None:
+        """An idle role whose tmux session still exists should have it killed."""
+        ctx = _make_ctx(
+            tmp_path,
+            support_roles={
+                "guide": SupportRoleEntry(
+                    status="idle",
+                    tmux_session="loom-guide",
+                    last_completed="2026-01-30T09:00:00Z",
+                ),
+            },
+        )
+
+        with (
+            mock.patch(
+                "loom_tools.daemon_v2.actions.support_roles.session_exists",
+                return_value=True,  # Session still exists for idle role
+            ),
+            mock.patch(
+                "loom_tools.daemon_v2.actions.support_roles.is_session_active",
+                return_value=False,  # But Claude is not running
+            ),
+            mock.patch(
+                "loom_tools.daemon_v2.actions.support_roles.kill_stuck_session",
+            ) as mock_kill,
+        ):
+            cleaned = cleanup_idle_support_sessions(ctx)
+
+        assert cleaned >= 1
+        mock_kill.assert_any_call("guide")
+        # tmux_session field should be cleared
+        assert ctx.state.support_roles["guide"].tmux_session is None
+
+    def test_idle_role_without_session_is_noop(
+        self, tmp_path: pathlib.Path
+    ) -> None:
+        """An idle role with no lingering tmux session needs no cleanup."""
+        ctx = _make_ctx(
+            tmp_path,
+            support_roles={
+                "guide": SupportRoleEntry(
+                    status="idle",
+                    last_completed="2026-01-30T09:00:00Z",
+                ),
+            },
+        )
+
+        with (
+            mock.patch(
+                "loom_tools.daemon_v2.actions.support_roles.session_exists",
+                return_value=False,
+            ),
+            mock.patch(
+                "loom_tools.daemon_v2.actions.support_roles.kill_stuck_session",
+            ) as mock_kill,
+        ):
+            cleaned = cleanup_idle_support_sessions(ctx)
+
+        assert cleaned == 0
+        mock_kill.assert_not_called()
+
+    def test_running_role_skipped(self, tmp_path: pathlib.Path) -> None:
+        """Running roles should NOT be cleaned up by this function."""
+        ctx = _make_ctx(
+            tmp_path,
+            support_roles={
+                "champion": SupportRoleEntry(
+                    status="running",
+                    tmux_session="loom-champion",
+                    started="2026-01-30T10:00:00Z",
+                ),
+            },
+        )
+
+        with (
+            mock.patch(
+                "loom_tools.daemon_v2.actions.support_roles.session_exists",
+                return_value=False,  # No lingering sessions
+            ),
+            mock.patch(
+                "loom_tools.daemon_v2.actions.support_roles.kill_stuck_session",
+            ) as mock_kill,
+        ):
+            cleaned = cleanup_idle_support_sessions(ctx)
+
+        assert cleaned == 0
+        mock_kill.assert_not_called()
+
+    def test_active_claude_on_idle_role_not_killed(
+        self, tmp_path: pathlib.Path
+    ) -> None:
+        """If an idle role somehow has an active Claude process, don't kill it.
+
+        This is a state inconsistency (idle status but Claude running), so
+        the function should log a warning and skip the kill.
+        """
+        ctx = _make_ctx(
+            tmp_path,
+            support_roles={
+                "judge": SupportRoleEntry(
+                    status="idle",
+                    tmux_session="loom-judge",
+                    last_completed="2026-01-30T09:00:00Z",
+                ),
+            },
+        )
+
+        def mock_exists(name: str) -> bool:
+            return name == "judge"
+
+        with (
+            mock.patch(
+                "loom_tools.daemon_v2.actions.support_roles.session_exists",
+                side_effect=mock_exists,
+            ),
+            mock.patch(
+                "loom_tools.daemon_v2.actions.support_roles.is_session_active",
+                return_value=True,  # Claude still running despite idle status
+            ),
+            mock.patch(
+                "loom_tools.daemon_v2.actions.support_roles.kill_stuck_session",
+            ) as mock_kill,
+        ):
+            cleaned = cleanup_idle_support_sessions(ctx)
+
+        assert cleaned == 0
+        mock_kill.assert_not_called()
+
+    def test_role_with_no_state_entry_cleaned(
+        self, tmp_path: pathlib.Path
+    ) -> None:
+        """A role not in daemon state but with a lingering session gets cleaned."""
+        ctx = _make_ctx(
+            tmp_path,
+            support_roles={},  # No entries at all
+        )
+
+        def mock_exists(name: str) -> bool:
+            return name == "architect"
+
+        with (
+            mock.patch(
+                "loom_tools.daemon_v2.actions.support_roles.session_exists",
+                side_effect=mock_exists,
+            ),
+            mock.patch(
+                "loom_tools.daemon_v2.actions.support_roles.is_session_active",
+                return_value=False,
+            ),
+            mock.patch(
+                "loom_tools.daemon_v2.actions.support_roles.kill_stuck_session",
+            ) as mock_kill,
+        ):
+            cleaned = cleanup_idle_support_sessions(ctx)
+
+        assert cleaned == 1
+        mock_kill.assert_called_once_with("architect")
+
+    def test_none_state_returns_zero(self, tmp_path: pathlib.Path) -> None:
+        """When ctx.state is None, returns 0."""
+        ctx = _make_ctx(tmp_path)
+        ctx.state = None
+
+        cleaned = cleanup_idle_support_sessions(ctx)
+        assert cleaned == 0

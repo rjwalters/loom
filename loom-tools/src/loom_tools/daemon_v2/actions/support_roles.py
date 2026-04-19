@@ -206,6 +206,11 @@ def reclaim_completed_support_roles(ctx: DaemonContext) -> list[CompletionEntry]
     In the second case the lingering tmux session is killed so it does not
     block future spawns.
 
+    After processing running roles, also cleans up any tmux sessions that
+    linger for roles already marked ``"idle"`` (belt-and-suspenders cleanup
+    in case a prior ``kill_stuck_session`` call failed silently).
+    See issue #3136.
+
     Returns a list of ``CompletionEntry`` objects for completed roles.
     """
     if ctx.state is None:
@@ -241,4 +246,69 @@ def reclaim_completed_support_roles(ctx: DaemonContext) -> list[CompletionEntry]
             )
         )
 
+    # Belt-and-suspenders: kill tmux sessions for roles already marked idle.
+    # This catches sessions that survived a prior kill attempt (e.g., if
+    # kill_stuck_session failed silently or the daemon crashed between
+    # detection and cleanup).  See issue #3136.
+    cleanup_idle_support_sessions(ctx)
+
     return completed
+
+
+def cleanup_idle_support_sessions(ctx: DaemonContext) -> int:
+    """Kill tmux sessions that linger for support roles marked ``"idle"``.
+
+    When a support role completes, the daemon marks it idle and attempts to
+    kill the tmux session.  If that kill fails (silently swallowed error,
+    daemon crash, etc.), the session persists indefinitely because
+    subsequent iterations skip non-``"running"`` roles.
+
+    This function acts as a safety net: it checks every idle (or absent)
+    support role for a lingering tmux session and kills it.  It is cheap
+    to call (just ``tmux has-session`` per role) and safe to run every
+    iteration.
+
+    Returns the number of sessions cleaned up.
+    """
+    if ctx.state is None:
+        return 0
+
+    cleaned = 0
+
+    for role_name in SUPPORT_ROLES:
+        entry = ctx.state.support_roles.get(role_name)
+        # Only clean up roles that are NOT running — running roles are
+        # handled by reclaim_completed_support_roles above.
+        if entry and entry.status == "running":
+            continue
+
+        if session_exists(role_name):
+            # Session exists for a role that is idle (or has no state entry).
+            # Check if Claude is actually running (defensive — shouldn't happen
+            # for an idle role, but avoid killing a legitimately active session
+            # whose state entry was lost).
+            if is_session_active(role_name):
+                log_warning(
+                    f"Support role {role_name} has active Claude process "
+                    f"but state is '{entry.status if entry else 'missing'}' "
+                    f"— skipping cleanup (state inconsistency)"
+                )
+                continue
+
+            log_info(
+                f"Cleaning up lingering tmux session for idle support role "
+                f"{role_name}"
+            )
+            kill_stuck_session(role_name)
+            cleaned += 1
+
+            # Also clear the tmux_session field in state if present
+            if entry and entry.tmux_session:
+                entry.tmux_session = None
+
+    if cleaned > 0:
+        log_success(
+            f"Cleaned up {cleaned} lingering idle support role session(s)"
+        )
+
+    return cleaned

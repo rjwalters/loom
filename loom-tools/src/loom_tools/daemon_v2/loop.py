@@ -31,6 +31,7 @@ from loom_tools.daemon_v2.signals import (
 )
 from loom_tools.daemon_cleanup import handle_daemon_shutdown, handle_daemon_startup, load_config
 from loom_tools.daemon_v2.actions.shepherds import spawn_shepherds
+from loom_tools.daemon_v2.actions.support_roles import cleanup_idle_support_sessions
 
 
 def run(ctx: DaemonContext) -> int:
@@ -234,6 +235,7 @@ def _responsive_sleep(
     - Check for stop signal (exit early if found)
     - Poll CommandPoller for new signal commands
     - Run fast-path shepherd assignment when idle slots + cached ready issues exist
+    - Clean up lingering idle support role tmux sessions (see issue #3136)
     - Keep the daemon responsive without busy-waiting
     """
     elapsed = 0
@@ -267,6 +269,15 @@ def _responsive_sleep(
             # the next full iteration. This eliminates poll_interval latency when
             # a shepherd completes and ready issues are already queued.
             _fast_path_assign(ctx)
+
+            # Clean up lingering tmux sessions for idle support roles.
+            # This catches sessions that survived the kill attempt during
+            # reclaim_completed_support_roles (e.g., kill_stuck_session
+            # failed silently).  Running during sleep ticks ensures cleanup
+            # happens within seconds rather than waiting for the next full
+            # iteration.  See issue #3136.
+            if ctx.state is not None:
+                cleanup_idle_support_sessions(ctx)
         except (KeyboardInterrupt, SystemExit):
             raise
         except Exception as e:
