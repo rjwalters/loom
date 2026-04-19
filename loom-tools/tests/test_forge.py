@@ -4,8 +4,6 @@ from __future__ import annotations
 
 from typing import Any, Sequence
 
-import pytest
-
 from loom_tools.common.forge import (
     EntityType,
     ForgeCIStatus,
