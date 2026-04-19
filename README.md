@@ -223,6 +223,16 @@ See [DEVELOPMENT.md](docs/guides/development.md) for complete guidelines.
 
 Creates a new GitHub repo with Loom pre-installed and initial roadmap.
 
+## Built with Loom
+
+If your project was built with Loom, you can add a badge to your README:
+
+[![Built with Loom](https://img.shields.io/badge/Built_with-Loom-blue?logo=github)](https://github.com/rjwalters/loom)
+
+```markdown
+[![Built with Loom](https://img.shields.io/badge/Built_with-Loom-blue?logo=github)](https://github.com/rjwalters/loom)
+```
+
 ## License
 
 MIT License © 2025 [Robb Walters](https://github.com/rjwalters)
