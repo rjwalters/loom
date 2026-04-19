@@ -34,8 +34,7 @@ pub fn is_git_repo(working_dir: &Path) -> bool {
         .args(["rev-parse", "--git-dir"])
         .current_dir(working_dir)
         .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
+        .is_ok_and(|o| o.status.success())
 }
 
 /// Git diff statistics parsed from `git diff --stat`
