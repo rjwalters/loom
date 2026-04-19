@@ -9,15 +9,24 @@ from unittest import mock
 
 import pytest
 
+from loom_tools.common.forge import (
+    ForgeCIStatus,
+    ForgeClient,
+    ForgeIssue,
+    ForgePullRequest,
+)
 from loom_tools.common.github import (
     ApiMode,
+    GitHubForge,
     _gh_cmd,
     _is_rate_limited,
     _normalize_rest_entity,
     _normalize_rest_labels,
     _parse_nwo,
+    _reset_forge,
     _reset_nwo_cache,
     get_api_mode,
+    get_forge,
     get_repo_nwo,
     gh_entity_edit,
     gh_get_default_branch_ci_status,
@@ -825,3 +834,357 @@ class TestGhCmd:
         """Falls back to gh when gh-cached is not found on PATH."""
         with mock.patch("loom_tools.common.github.shutil.which", return_value=None):
             assert _gh_cmd() == "gh"
+
+
+# ---------------------------------------------------------------------------
+# GitHubForge — ForgeClient protocol conformance
+# ---------------------------------------------------------------------------
+
+
+class TestGitHubForgeProtocol:
+    """Tests that GitHubForge satisfies the ForgeClient protocol."""
+
+    def test_is_forge_client_instance(self) -> None:
+        """GitHubForge instances satisfy the ForgeClient protocol."""
+        forge = GitHubForge()
+        assert isinstance(forge, ForgeClient)
+
+    def test_forge_type(self) -> None:
+        """forge_type property returns 'github'."""
+        forge = GitHubForge()
+        assert forge.forge_type == "github"
+
+
+# ---------------------------------------------------------------------------
+# GitHubForge — get_issue / list_issues
+# ---------------------------------------------------------------------------
+
+
+class TestGitHubForgeIssues:
+    """Tests for GitHubForge issue operations."""
+
+    def test_get_issue_returns_forge_issue(self) -> None:
+        """get_issue returns a ForgeIssue dataclass."""
+        issue_data = {
+            "number": 42,
+            "state": "OPEN",
+            "title": "Test issue",
+            "url": "https://github.com/o/r/issues/42",
+            "labels": [{"name": "bug"}],
+        }
+        forge = GitHubForge()
+        with mock.patch("loom_tools.common.github.get_api_mode", return_value=ApiMode.GRAPHQL):
+            with mock.patch("loom_tools.common.github.gh_run") as mock_gh:
+                mock_gh.return_value = mock.Mock(
+                    returncode=0, stdout=json.dumps(issue_data), stderr=""
+                )
+                result = forge.get_issue(42)
+
+        assert isinstance(result, ForgeIssue)
+        assert result.number == 42
+        assert result.state == "OPEN"
+        assert result.title == "Test issue"
+        assert result.labels == ["bug"]
+
+    def test_get_issue_returns_none_when_not_found(self) -> None:
+        """get_issue returns None for missing issue."""
+        forge = GitHubForge()
+        with mock.patch("loom_tools.common.github.get_api_mode", return_value=ApiMode.GRAPHQL):
+            with mock.patch("loom_tools.common.github.gh_run") as mock_gh:
+                mock_gh.return_value = mock.Mock(returncode=1, stdout="", stderr="not found")
+                result = forge.get_issue(999)
+
+        assert result is None
+
+    def test_list_issues_returns_forge_issues(self) -> None:
+        """list_issues returns a list of ForgeIssue objects."""
+        issues_data = [
+            {"number": 1, "title": "Issue 1", "labels": [{"name": "bug"}], "state": "OPEN"},
+            {"number": 2, "title": "Issue 2", "labels": [], "state": "OPEN"},
+        ]
+        forge = GitHubForge()
+        with mock.patch("loom_tools.common.github.gh_run") as mock_gh:
+            mock_gh.return_value = mock.Mock(
+                returncode=0, stdout=json.dumps(issues_data)
+            )
+            result = forge.list_issues(labels=["bug"])
+
+        assert len(result) == 2
+        assert all(isinstance(i, ForgeIssue) for i in result)
+        assert result[0].number == 1
+        assert result[0].labels == ["bug"]
+
+    def test_comment_on_issue(self) -> None:
+        """comment_on_issue delegates to gh_issue_comment."""
+        forge = GitHubForge()
+        with mock.patch("loom_tools.common.github.get_api_mode", return_value=ApiMode.GRAPHQL):
+            with mock.patch("loom_tools.common.github.gh_run") as mock_gh:
+                mock_gh.return_value = mock.Mock(returncode=0, stderr="")
+                result = forge.comment_on_issue(42, "test comment")
+
+        assert result is True
+
+
+# ---------------------------------------------------------------------------
+# GitHubForge — get_pull_request / list_pull_requests
+# ---------------------------------------------------------------------------
+
+
+class TestGitHubForgePullRequests:
+    """Tests for GitHubForge pull request operations."""
+
+    def test_get_pull_request_returns_forge_pr(self) -> None:
+        """get_pull_request returns a ForgePullRequest dataclass."""
+        pr_data = {
+            "number": 10,
+            "state": "OPEN",
+            "title": "Test PR",
+            "url": "https://github.com/o/r/pull/10",
+            "labels": [{"name": "loom:review-requested"}],
+            "headRefName": "feature/issue-42",
+            "body": "Closes #42",
+        }
+        forge = GitHubForge()
+        with mock.patch("loom_tools.common.github.get_api_mode", return_value=ApiMode.GRAPHQL):
+            with mock.patch("loom_tools.common.github.gh_run") as mock_gh:
+                mock_gh.return_value = mock.Mock(
+                    returncode=0, stdout=json.dumps(pr_data), stderr=""
+                )
+                result = forge.get_pull_request(10)
+
+        assert isinstance(result, ForgePullRequest)
+        assert result.number == 10
+        assert result.state == "OPEN"
+        assert result.head_branch == "feature/issue-42"
+        assert result.labels == ["loom:review-requested"]
+
+    def test_get_pull_request_returns_none_when_not_found(self) -> None:
+        """get_pull_request returns None for missing PR."""
+        forge = GitHubForge()
+        with mock.patch("loom_tools.common.github.get_api_mode", return_value=ApiMode.GRAPHQL):
+            with mock.patch("loom_tools.common.github.gh_run") as mock_gh:
+                mock_gh.return_value = mock.Mock(returncode=1, stdout="", stderr="not found")
+                result = forge.get_pull_request(999)
+
+        assert result is None
+
+    def test_list_pull_requests_returns_forge_prs(self) -> None:
+        """list_pull_requests returns a list of ForgePullRequest objects."""
+        prs_data = [
+            {"number": 10, "title": "PR 1", "labels": [], "state": "OPEN"},
+        ]
+        forge = GitHubForge()
+        with mock.patch("loom_tools.common.github.gh_run") as mock_gh:
+            mock_gh.return_value = mock.Mock(
+                returncode=0, stdout=json.dumps(prs_data)
+            )
+            result = forge.list_pull_requests()
+
+        assert len(result) == 1
+        assert isinstance(result[0], ForgePullRequest)
+        assert result[0].number == 10
+
+    def test_comment_on_pull_request(self) -> None:
+        """comment_on_pull_request runs gh pr comment."""
+        forge = GitHubForge()
+        with mock.patch("loom_tools.common.github.gh_run") as mock_gh:
+            mock_gh.return_value = mock.Mock(returncode=0, stderr="")
+            result = forge.comment_on_pull_request(10, "LGTM!")
+
+        assert result is True
+        call_args = mock_gh.call_args[0][0]
+        assert "pr" in call_args
+        assert "comment" in call_args
+
+    def test_merge_pull_request(self) -> None:
+        """merge_pull_request runs gh pr merge."""
+        forge = GitHubForge()
+        with mock.patch("loom_tools.common.github.gh_run") as mock_gh:
+            mock_gh.return_value = mock.Mock(returncode=0, stderr="")
+            result = forge.merge_pull_request(10, method="squash")
+
+        assert result is True
+        call_args = mock_gh.call_args[0][0]
+        assert "pr" in call_args
+        assert "merge" in call_args
+        assert "--squash" in call_args
+
+    def test_get_pull_request_reviews(self) -> None:
+        """get_pull_request_reviews returns review list."""
+        review_data = {
+            "reviews": [
+                {"state": "APPROVED", "author": {"login": "user1"}},
+            ],
+        }
+        forge = GitHubForge()
+        with mock.patch("loom_tools.common.github.gh_run") as mock_gh:
+            mock_gh.return_value = mock.Mock(
+                returncode=0, stdout=json.dumps(review_data), stderr=""
+            )
+            result = forge.get_pull_request_reviews(10)
+
+        assert len(result) == 1
+        assert result[0]["state"] == "APPROVED"
+
+
+# ---------------------------------------------------------------------------
+# GitHubForge — label operations
+# ---------------------------------------------------------------------------
+
+
+class TestGitHubForgeLabels:
+    """Tests for GitHubForge label operations."""
+
+    def test_add_labels(self) -> None:
+        """add_labels delegates to gh_entity_edit."""
+        forge = GitHubForge()
+        with mock.patch("loom_tools.common.github.get_api_mode", return_value=ApiMode.GRAPHQL):
+            with mock.patch("loom_tools.common.github.gh_run") as mock_gh:
+                mock_gh.return_value = mock.Mock(returncode=0, stderr="")
+                result = forge.add_labels("issue", 42, ["bug", "urgent"])
+
+        assert result is True
+
+    def test_remove_labels(self) -> None:
+        """remove_labels delegates to gh_entity_edit."""
+        forge = GitHubForge()
+        with mock.patch("loom_tools.common.github.get_api_mode", return_value=ApiMode.GRAPHQL):
+            with mock.patch("loom_tools.common.github.gh_run") as mock_gh:
+                mock_gh.return_value = mock.Mock(returncode=0, stderr="")
+                result = forge.remove_labels("issue", 42, ["loom:issue"])
+
+        assert result is True
+
+    def test_transition_labels(self) -> None:
+        """transition_labels adds and removes in one call."""
+        forge = GitHubForge()
+        with mock.patch("loom_tools.common.github.get_api_mode", return_value=ApiMode.GRAPHQL):
+            with mock.patch("loom_tools.common.github.gh_run") as mock_gh:
+                mock_gh.return_value = mock.Mock(returncode=0, stderr="")
+                result = forge.transition_labels(
+                    "issue", 42,
+                    add=["loom:building"],
+                    remove=["loom:issue"],
+                )
+
+        assert result is True
+        call_args = mock_gh.call_args[0][0]
+        assert "--add-label" in call_args
+        assert "--remove-label" in call_args
+
+
+# ---------------------------------------------------------------------------
+# GitHubForge — CI status
+# ---------------------------------------------------------------------------
+
+
+class TestGitHubForgeCIStatus:
+    """Tests for GitHubForge CI status."""
+
+    def test_get_default_branch_ci_status_returns_dataclass(self) -> None:
+        """get_default_branch_ci_status returns a ForgeCIStatus."""
+        mock_runs = [
+            {"name": "CI", "conclusion": "success", "status": "completed", "headBranch": "main"},
+        ]
+        forge = GitHubForge()
+        with mock.patch("loom_tools.common.github.gh_run") as mock_gh:
+            mock_gh.return_value = mock.Mock(
+                returncode=0, stdout=json.dumps(mock_runs)
+            )
+            result = forge.get_default_branch_ci_status()
+
+        assert isinstance(result, ForgeCIStatus)
+        assert result.status == "passing"
+        assert result.total_runs == 1
+
+
+# ---------------------------------------------------------------------------
+# GitHubForge — repo metadata
+# ---------------------------------------------------------------------------
+
+
+class TestGitHubForgeRepoMetadata:
+    """Tests for GitHubForge repository metadata."""
+
+    def test_get_repo_nwo(self) -> None:
+        """get_repo_nwo delegates to module-level get_repo_nwo."""
+        forge = GitHubForge()
+        with mock.patch("loom_tools.common.github.subprocess.run") as mock_run:
+            mock_run.return_value = mock.Mock(
+                returncode=0, stdout="git@github.com:owner/repo.git\n"
+            )
+            _reset_nwo_cache()
+            result = forge.get_repo_nwo()
+
+        assert result == "owner/repo"
+        _reset_nwo_cache()
+
+    def test_get_repo_default_branch(self) -> None:
+        """get_repo_default_branch parses defaultBranchRef."""
+        forge = GitHubForge()
+        with mock.patch("loom_tools.common.github.gh_run") as mock_gh:
+            mock_gh.return_value = mock.Mock(
+                returncode=0,
+                stdout=json.dumps({"defaultBranchRef": {"name": "main"}}),
+                stderr="",
+            )
+            result = forge.get_repo_default_branch()
+
+        assert result == "main"
+
+
+# ---------------------------------------------------------------------------
+# GitHubForge — GitHub-specific run() escape hatch
+# ---------------------------------------------------------------------------
+
+
+class TestGitHubForgeRun:
+    """Tests for GitHubForge.run() (GitHub-specific, not on ForgeClient)."""
+
+    def test_run_delegates_to_gh_run(self) -> None:
+        """run() delegates to module-level gh_run."""
+        forge = GitHubForge()
+        with mock.patch("loom_tools.common.github.gh_run") as mock_gh:
+            mock_gh.return_value = mock.Mock(returncode=0, stdout="ok", stderr="")
+            result = forge.run(["issue", "list"], check=False)
+
+        assert result.returncode == 0
+        mock_gh.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# get_forge() singleton
+# ---------------------------------------------------------------------------
+
+
+class TestGetForge:
+    """Tests for the get_forge() factory."""
+
+    def setup_method(self) -> None:
+        _reset_forge()
+
+    def teardown_method(self) -> None:
+        _reset_forge()
+
+    def test_returns_github_forge(self) -> None:
+        """get_forge() returns a GitHubForge instance."""
+        forge = get_forge()
+        assert isinstance(forge, GitHubForge)
+
+    def test_returns_same_instance(self) -> None:
+        """get_forge() returns the same singleton instance."""
+        forge1 = get_forge()
+        forge2 = get_forge()
+        assert forge1 is forge2
+
+    def test_satisfies_forge_client_protocol(self) -> None:
+        """get_forge() returns a ForgeClient-compatible instance."""
+        forge = get_forge()
+        assert isinstance(forge, ForgeClient)
+
+    def test_reset_clears_singleton(self) -> None:
+        """_reset_forge() allows creating a new instance."""
+        forge1 = get_forge()
+        _reset_forge()
+        forge2 = get_forge()
+        assert forge1 is not forge2
