@@ -534,22 +534,25 @@ class TestStateNormalization:
 
 
 class TestCIStatus:
-    """Tests for get_default_branch_ci_status()."""
+    """Tests for get_default_branch_ci_status() and get_commit_ci_status()."""
 
     def test_passing(self) -> None:
         forge = _make_forge()
-        # First call: get repo info (default branch), second: statuses
+        # First call: get repo info (default branch), second: commit statuses,
+        # third: actions runs (404 = not available)
         repo_resp = _mock_response(json_data={"default_branch": "main"})
         statuses_resp = _mock_response(json_data=[
             {"context": "ci/test", "status": "success"},
             {"context": "ci/lint", "status": "success"},
         ])
-        with mock.patch.object(forge._session, "request", side_effect=[repo_resp, statuses_resp]):
+        actions_resp = _mock_response(404)  # Actions API not available
+        with mock.patch.object(forge._session, "request", side_effect=[repo_resp, statuses_resp, actions_resp]):
             result = forge.get_default_branch_ci_status()
 
         assert isinstance(result, ForgeCIStatus)
         assert result.status == "passing"
         assert result.failed_runs == []
+        assert result.total_runs == 2
 
     def test_failing(self) -> None:
         forge = _make_forge()
@@ -558,10 +561,256 @@ class TestCIStatus:
             {"context": "ci/test", "status": "failure"},
             {"context": "ci/lint", "status": "success"},
         ]
-        with mock.patch.object(forge._session, "request", return_value=_mock_response(json_data=statuses)):
+        actions_resp = _mock_response(404)
+        with mock.patch.object(forge._session, "request", side_effect=[
+            _mock_response(json_data=statuses),
+            actions_resp,
+        ]):
             result = forge.get_default_branch_ci_status()
         assert result.status == "failing"
         assert "ci/test" in result.failed_runs
+
+    def test_error_status_treated_as_failure(self) -> None:
+        """Gitea 'error' status maps to failure."""
+        forge = _make_forge()
+        forge._default_branch_cache = "main"
+        statuses = [{"context": "ci/deploy", "status": "error"}]
+        with mock.patch.object(forge._session, "request", side_effect=[
+            _mock_response(json_data=statuses),
+            _mock_response(404),
+        ]):
+            result = forge.get_default_branch_ci_status()
+        assert result.status == "failing"
+        assert "ci/deploy" in result.failed_runs
+
+    def test_warning_status_treated_as_pending(self) -> None:
+        """Gitea 'warning' status maps to pending (not failure)."""
+        forge = _make_forge()
+        forge._default_branch_cache = "main"
+        statuses = [{"context": "ci/check", "status": "warning"}]
+        with mock.patch.object(forge._session, "request", side_effect=[
+            _mock_response(json_data=statuses),
+            _mock_response(404),
+        ]):
+            result = forge.get_default_branch_ci_status()
+        assert result.status == "passing"
+        assert result.failed_runs == []
+        assert "pending" in result.message.lower()
+
+    def test_pending_status(self) -> None:
+        """Gitea 'pending' status is not treated as failure."""
+        forge = _make_forge()
+        forge._default_branch_cache = "main"
+        statuses = [
+            {"context": "ci/test", "status": "pending"},
+            {"context": "ci/lint", "status": "success"},
+        ]
+        with mock.patch.object(forge._session, "request", side_effect=[
+            _mock_response(json_data=statuses),
+            _mock_response(404),
+        ]):
+            result = forge.get_default_branch_ci_status()
+        assert result.status == "passing"
+        assert result.failed_runs == []
+
+    def test_empty_statuses_returns_unknown(self) -> None:
+        """Empty status list returns unknown."""
+        forge = _make_forge()
+        forge._default_branch_cache = "main"
+        with mock.patch.object(forge._session, "request", side_effect=[
+            _mock_response(json_data=[]),
+            _mock_response(404),
+        ]):
+            result = forge.get_default_branch_ci_status()
+        assert result.status == "unknown"
+
+    def test_no_ci_configured(self) -> None:
+        """API error on status fetch returns unknown."""
+        forge = _make_forge()
+        forge._default_branch_cache = "main"
+        with mock.patch.object(forge._session, "request", side_effect=[
+            _mock_response(json_data=[]),  # empty statuses
+            _mock_response(404),  # no actions
+        ]):
+            result = forge.get_default_branch_ci_status()
+        assert result.status == "unknown"
+
+    def test_latest_status_per_context(self) -> None:
+        """Only the latest status per context is used."""
+        forge = _make_forge()
+        forge._default_branch_cache = "main"
+        # First in list is latest; ci/test succeeded after previous failure
+        statuses = [
+            {"context": "ci/test", "status": "success"},
+            {"context": "ci/test", "status": "failure"},  # older, ignored
+        ]
+        with mock.patch.object(forge._session, "request", side_effect=[
+            _mock_response(json_data=statuses),
+            _mock_response(404),
+        ]):
+            result = forge.get_default_branch_ci_status()
+        assert result.status == "passing"
+        assert result.total_runs == 1
+
+    def test_cannot_determine_default_branch(self) -> None:
+        """Returns unknown when default branch cannot be determined."""
+        forge = _make_forge()
+        with mock.patch.object(forge._session, "request", return_value=_mock_response(500)):
+            result = forge.get_default_branch_ci_status()
+        assert result.status == "unknown"
+
+
+class TestCIStatusActionsRuns:
+    """Tests for Gitea Actions runs integration."""
+
+    def test_actions_runs_passing(self) -> None:
+        """Actions runs that pass contribute to passing status."""
+        forge = _make_forge()
+        forge._default_branch_cache = "main"
+        statuses = []  # No commit statuses
+        actions = {"workflow_runs": [
+            {"name": "CI", "status": "completed", "conclusion": "success"},
+            {"name": "Lint", "status": "completed", "conclusion": "success"},
+        ]}
+        with mock.patch.object(forge._session, "request", side_effect=[
+            _mock_response(json_data=statuses),
+            _mock_response(json_data=actions),
+        ]):
+            result = forge.get_default_branch_ci_status()
+        assert result.status == "passing"
+        assert result.total_runs == 2
+
+    def test_actions_runs_failing(self) -> None:
+        """Failed Actions runs are reported as failures."""
+        forge = _make_forge()
+        forge._default_branch_cache = "main"
+        statuses = []
+        actions = {"workflow_runs": [
+            {"name": "CI", "status": "completed", "conclusion": "failure"},
+            {"name": "Lint", "status": "completed", "conclusion": "success"},
+        ]}
+        with mock.patch.object(forge._session, "request", side_effect=[
+            _mock_response(json_data=statuses),
+            _mock_response(json_data=actions),
+        ]):
+            result = forge.get_default_branch_ci_status()
+        assert result.status == "failing"
+        assert "CI" in result.failed_runs
+
+    def test_actions_cancelled_treated_as_failure(self) -> None:
+        """Cancelled Actions runs are treated as failures."""
+        forge = _make_forge()
+        forge._default_branch_cache = "main"
+        actions = {"workflow_runs": [
+            {"name": "Deploy", "status": "completed", "conclusion": "cancelled"},
+        ]}
+        with mock.patch.object(forge._session, "request", side_effect=[
+            _mock_response(json_data=[]),
+            _mock_response(json_data=actions),
+        ]):
+            result = forge.get_default_branch_ci_status()
+        assert result.status == "failing"
+        assert "Deploy" in result.failed_runs
+
+    def test_actions_in_progress_not_counted(self) -> None:
+        """In-progress Actions runs are not counted as failures."""
+        forge = _make_forge()
+        forge._default_branch_cache = "main"
+        actions = {"workflow_runs": [
+            {"name": "CI", "status": "running", "conclusion": ""},
+        ]}
+        with mock.patch.object(forge._session, "request", side_effect=[
+            _mock_response(json_data=[]),
+            _mock_response(json_data=actions),
+        ]):
+            result = forge.get_default_branch_ci_status()
+        assert result.status == "passing"
+
+    def test_actions_api_404_fallback(self) -> None:
+        """When Actions API returns 404, falls back to commit statuses only."""
+        forge = _make_forge()
+        forge._default_branch_cache = "main"
+        statuses = [{"context": "ci/test", "status": "success"}]
+        with mock.patch.object(forge._session, "request", side_effect=[
+            _mock_response(json_data=statuses),
+            _mock_response(404),  # Actions API not available
+        ]):
+            result = forge.get_default_branch_ci_status()
+        assert result.status == "passing"
+        assert result.total_runs == 1
+
+    def test_merge_commit_statuses_and_actions(self) -> None:
+        """Both commit statuses and Actions runs are merged."""
+        forge = _make_forge()
+        forge._default_branch_cache = "main"
+        statuses = [{"context": "external/check", "status": "success"}]
+        actions = {"workflow_runs": [
+            {"name": "CI", "status": "completed", "conclusion": "success"},
+        ]}
+        with mock.patch.object(forge._session, "request", side_effect=[
+            _mock_response(json_data=statuses),
+            _mock_response(json_data=actions),
+        ]):
+            result = forge.get_default_branch_ci_status()
+        assert result.status == "passing"
+        assert result.total_runs == 2  # 1 commit status + 1 actions run
+
+    def test_merge_with_failure_from_either_source(self) -> None:
+        """Failure from either source results in overall failure."""
+        forge = _make_forge()
+        forge._default_branch_cache = "main"
+        statuses = [{"context": "external/check", "status": "failure"}]
+        actions = {"workflow_runs": [
+            {"name": "CI", "status": "completed", "conclusion": "success"},
+        ]}
+        with mock.patch.object(forge._session, "request", side_effect=[
+            _mock_response(json_data=statuses),
+            _mock_response(json_data=actions),
+        ]):
+            result = forge.get_default_branch_ci_status()
+        assert result.status == "failing"
+        assert "external/check" in result.failed_runs
+
+    def test_actions_list_format(self) -> None:
+        """Handle Gitea Actions API returning a plain list instead of dict."""
+        forge = _make_forge()
+        forge._default_branch_cache = "main"
+        actions_list = [
+            {"name": "CI", "status": "completed", "conclusion": "success"},
+        ]
+        with mock.patch.object(forge._session, "request", side_effect=[
+            _mock_response(json_data=[]),
+            _mock_response(json_data=actions_list),
+        ]):
+            result = forge.get_default_branch_ci_status()
+        assert result.status == "passing"
+
+
+class TestGetCommitCIStatus:
+    """Tests for get_commit_ci_status() with specific SHA."""
+
+    def test_commit_status_for_sha(self) -> None:
+        """get_commit_ci_status queries the correct SHA."""
+        forge = _make_forge()
+        statuses = [{"context": "ci/test", "status": "success"}]
+        with mock.patch.object(forge._session, "request", side_effect=[
+            _mock_response(json_data=statuses),
+            _mock_response(404),
+        ]) as mock_req:
+            result = forge.get_commit_ci_status("abc123")
+
+        assert result.status == "passing"
+        # Verify the SHA was used in the URL
+        first_call_url = mock_req.call_args_list[0][1].get("url", "") or mock_req.call_args_list[0][0][1]
+        assert "abc123" in str(first_call_url) or "abc123" in str(mock_req.call_args_list[0])
+
+    def test_commit_status_no_repo(self) -> None:
+        """Returns unknown when repo cannot be determined."""
+        forge = _make_forge()
+        forge._nwo_cache = None
+        with mock.patch.object(forge, "get_repo_nwo", return_value=None):
+            result = forge.get_commit_ci_status("abc123")
+        assert result.status == "unknown"
 
 
 # ===========================================================================

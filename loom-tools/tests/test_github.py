@@ -1097,6 +1097,114 @@ class TestGitHubForgeCIStatus:
         assert result.status == "passing"
         assert result.total_runs == 1
 
+    def test_get_commit_ci_status_passing(self) -> None:
+        """get_commit_ci_status returns passing when all checks pass."""
+        check_runs_data = json.dumps({
+            "check_runs": [
+                {"name": "CI", "conclusion": "success"},
+                {"name": "Lint", "conclusion": "success"},
+            ],
+        })
+        status_data = json.dumps({
+            "statuses": [
+                {"context": "coverage", "state": "success"},
+            ],
+        })
+        forge = GitHubForge()
+        with mock.patch("loom_tools.common.github.subprocess.run") as mock_run:
+            mock_run.return_value = mock.Mock(
+                returncode=0, stdout="git@github.com:owner/repo.git\n",
+            )
+            _reset_nwo_cache()
+            with mock.patch("loom_tools.common.github.gh_run") as mock_gh:
+                mock_gh.side_effect = [
+                    mock.Mock(returncode=0, stdout=check_runs_data, stderr=""),
+                    mock.Mock(returncode=0, stdout=status_data, stderr=""),
+                ]
+                result = forge.get_commit_ci_status("abc123def")
+        _reset_nwo_cache()
+
+        assert isinstance(result, ForgeCIStatus)
+        assert result.status == "passing"
+        assert result.total_runs == 3
+        assert result.failed_runs == []
+
+    def test_get_commit_ci_status_failing(self) -> None:
+        """get_commit_ci_status returns failing when a check fails."""
+        check_runs_data = json.dumps({
+            "check_runs": [
+                {"name": "CI", "conclusion": "failure"},
+                {"name": "Lint", "conclusion": "success"},
+            ],
+        })
+        status_data = json.dumps({"statuses": []})
+        forge = GitHubForge()
+        with mock.patch("loom_tools.common.github.subprocess.run") as mock_run:
+            mock_run.return_value = mock.Mock(
+                returncode=0, stdout="git@github.com:owner/repo.git\n",
+            )
+            _reset_nwo_cache()
+            with mock.patch("loom_tools.common.github.gh_run") as mock_gh:
+                mock_gh.side_effect = [
+                    mock.Mock(returncode=0, stdout=check_runs_data, stderr=""),
+                    mock.Mock(returncode=0, stdout=status_data, stderr=""),
+                ]
+                result = forge.get_commit_ci_status("abc123def")
+        _reset_nwo_cache()
+
+        assert result.status == "failing"
+        assert "CI" in result.failed_runs
+
+    def test_get_commit_ci_status_no_checks(self) -> None:
+        """get_commit_ci_status returns unknown when no checks found."""
+        forge = GitHubForge()
+        with mock.patch("loom_tools.common.github.subprocess.run") as mock_run:
+            mock_run.return_value = mock.Mock(
+                returncode=0, stdout="git@github.com:owner/repo.git\n",
+            )
+            _reset_nwo_cache()
+            with mock.patch("loom_tools.common.github.gh_run") as mock_gh:
+                mock_gh.side_effect = [
+                    mock.Mock(returncode=0, stdout=json.dumps({"check_runs": []}), stderr=""),
+                    mock.Mock(returncode=0, stdout=json.dumps({"statuses": []}), stderr=""),
+                ]
+                result = forge.get_commit_ci_status("abc123def")
+        _reset_nwo_cache()
+
+        assert result.status == "unknown"
+
+    def test_get_commit_ci_status_commit_status_error(self) -> None:
+        """Commit status 'error' state is treated as failure."""
+        forge = GitHubForge()
+        with mock.patch("loom_tools.common.github.subprocess.run") as mock_run:
+            mock_run.return_value = mock.Mock(
+                returncode=0, stdout="git@github.com:owner/repo.git\n",
+            )
+            _reset_nwo_cache()
+            with mock.patch("loom_tools.common.github.gh_run") as mock_gh:
+                mock_gh.side_effect = [
+                    mock.Mock(returncode=0, stdout=json.dumps({"check_runs": []}), stderr=""),
+                    mock.Mock(returncode=0, stdout=json.dumps({
+                        "statuses": [{"context": "deploy", "state": "error"}],
+                    }), stderr=""),
+                ]
+                result = forge.get_commit_ci_status("abc123def")
+        _reset_nwo_cache()
+
+        assert result.status == "failing"
+        assert "deploy" in result.failed_runs
+
+    def test_get_commit_ci_status_no_nwo(self) -> None:
+        """Returns unknown when repo NWO cannot be determined."""
+        forge = GitHubForge()
+        _reset_nwo_cache()
+        with mock.patch("loom_tools.common.github.subprocess.run") as mock_run:
+            mock_run.return_value = mock.Mock(returncode=1, stdout="")
+            result = forge.get_commit_ci_status("abc123")
+        _reset_nwo_cache()
+
+        assert result.status == "unknown"
+
 
 # ---------------------------------------------------------------------------
 # GitHubForge — repo metadata

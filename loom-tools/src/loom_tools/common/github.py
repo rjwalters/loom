@@ -563,6 +563,77 @@ class GitHubForge:
             message=raw.get("message", ""),
         )
 
+    def get_commit_ci_status(self, sha: str) -> ForgeCIStatus:
+        """Get CI status for a specific commit SHA.
+
+        Uses the GitHub Check Runs API and combined commit status API.
+        """
+        nwo = self.get_repo_nwo()
+        if not nwo:
+            return ForgeCIStatus(
+                status="unknown", message="Cannot determine repository",
+            )
+
+        failed_runs: list[str] = []
+        total_checks = 0
+
+        # 1. Check Runs API (GitHub Actions results)
+        check_result = gh_api_rest(
+            f"repos/{nwo}/commits/{sha}/check-runs", cwd=self._cwd,
+        )
+        if check_result.returncode == 0 and check_result.stdout.strip():
+            data = safe_parse_json(check_result.stdout)
+            if isinstance(data, dict):
+                check_runs = data.get("check_runs", [])
+                if isinstance(check_runs, list):
+                    for cr in check_runs:
+                        if not isinstance(cr, dict):
+                            continue
+                        total_checks += 1
+                        conclusion = (cr.get("conclusion") or "").lower()
+                        if conclusion in (
+                            "failure", "timed_out", "cancelled", "action_required",
+                        ):
+                            failed_runs.append(cr.get("name", "Unknown"))
+
+        # 2. Combined commit status API (older commit statuses)
+        status_result = gh_api_rest(
+            f"repos/{nwo}/commits/{sha}/status", cwd=self._cwd,
+        )
+        if status_result.returncode == 0 and status_result.stdout.strip():
+            data = safe_parse_json(status_result.stdout)
+            if isinstance(data, dict):
+                statuses = data.get("statuses", [])
+                if isinstance(statuses, list):
+                    for s in statuses:
+                        if not isinstance(s, dict):
+                            continue
+                        total_checks += 1
+                        state = (s.get("state") or "").lower()
+                        if state in ("failure", "error"):
+                            ctx = s.get("context", "Unknown")
+                            failed_runs.append(ctx)
+
+        if total_checks == 0:
+            return ForgeCIStatus(
+                status="unknown",
+                message=f"No CI checks found for {sha[:8]}",
+            )
+
+        if failed_runs:
+            return ForgeCIStatus(
+                status="failing",
+                failed_runs=failed_runs,
+                total_runs=total_checks,
+                message=f"CI failing: {len(failed_runs)} check(s) failed for {sha[:8]}",
+            )
+
+        return ForgeCIStatus(
+            status="passing",
+            total_runs=total_checks,
+            message=f"CI passing for {sha[:8]}",
+        )
+
     # --- Repository metadata (ForgeClient) ---
 
     def get_repo_nwo(self) -> str | None:
