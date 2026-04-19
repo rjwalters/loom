@@ -15,13 +15,14 @@
 #     1. Validates target repository (must be a Git repo)
 #     2. Creates installation worktree (.loom/worktrees/loom-installation)
 #     3. Initializes Loom configuration (copies defaults to .loom/)
-#     4. Syncs GitHub labels for Loom workflow
+#     4. Syncs workflow labels (GitHub or Gitea)
 #     5. Configures branch rulesets (interactive mode only)
 #     6. Creates pull request with loom:review-requested label
 #
 #   Requirements:
-#     - Target must be a Git repository
-#     - GitHub CLI (gh) must be authenticated
+#     - Target must be a Git repository with a remote
+#     - For GitHub: GitHub CLI (gh) must be authenticated
+#     - For Gitea: GITEA_TOKEN or FORGE_TOKEN environment variable must be set
 #     - loom-daemon binary must be built (pnpm daemon:build)
 #
 #   After installation:
@@ -146,19 +147,19 @@ if ! git -C "$TARGET_PATH" rev-parse --git-dir >/dev/null 2>&1; then
   echo ""
   warning "$TARGET_PATH is not a git repository."
   echo ""
-  echo "Would you like to initialize git and set up GitHub?"
+  echo "Would you like to initialize git and set up a remote repository?"
   echo ""
   echo "This will:"
   echo "  1. Run 'git init' in the directory"
   echo "  2. Create a sensible .gitignore file"
   echo "  3. Create an initial commit"
-  echo "  4. Create a GitHub repository and set up remote (required for Full Install)"
+  echo "  4. Create a remote repository and set up the origin (required for Full Install)"
   echo ""
-  read -r -p "Initialize git and GitHub? [y/N] " -n 1 INIT_GIT
+  read -r -p "Initialize git and remote? [y/N] " -n 1 INIT_GIT
   echo ""
 
   if [[ ! $INIT_GIT =~ ^[Yy]$ ]]; then
-    error "Full Install requires a git repository with GitHub remote.\n       Run 'git init' and 'gh repo create' manually, or use Quick Install."
+    error "Full Install requires a git repository with a remote.\n       Run 'git init' and set up a remote manually, or use Quick Install."
   fi
 
   # Initialize git
@@ -217,41 +218,51 @@ GITIGNORE
   success "Initial commit created"
   echo ""
 
-  # GitHub repository creation is required for Full Install
-  info "Full Install requires a GitHub repository."
+  # Remote repository creation is required for Full Install
+  info "Full Install requires a remote repository (GitHub or Gitea)."
   echo ""
 
-  # Check GitHub authentication
-  if ! gh auth status &> /dev/null; then
-    warning "GitHub CLI is not authenticated"
-    info "Please authenticate with GitHub:"
+  # Check if gh CLI is available (needed for GitHub repo creation)
+  if command -v gh &> /dev/null; then
+    # Check GitHub authentication
+    if ! gh auth status &> /dev/null; then
+      warning "GitHub CLI is not authenticated"
+      info "Please authenticate with GitHub:"
+      echo ""
+      gh auth login || error "GitHub authentication failed"
+      echo ""
+    fi
+
+    # Prompt for repository visibility
+    echo "Repository visibility:"
+    echo "  1. Private (default)"
+    echo "  2. Public"
+    read -r -p "Choose visibility [1/2]: " -n 1 VISIBILITY
     echo ""
-    gh auth login || error "GitHub authentication failed"
-    echo ""
-  fi
 
-  # Prompt for repository visibility
-  echo "Repository visibility:"
-  echo "  1. Private (default)"
-  echo "  2. Public"
-  read -r -p "Choose visibility [1/2]: " -n 1 VISIBILITY
-  echo ""
+    VISIBILITY_FLAG="--private"
+    if [[ "$VISIBILITY" == "2" ]]; then
+      VISIBILITY_FLAG="--public"
+    fi
 
-  VISIBILITY_FLAG="--private"
-  if [[ "$VISIBILITY" == "2" ]]; then
-    VISIBILITY_FLAG="--public"
-  fi
+    # Get directory name for repo name suggestion
+    DIR_NAME=$(basename "$TARGET_PATH")
+    read -r -p "Repository name [$DIR_NAME]: " REPO_NAME
+    REPO_NAME="${REPO_NAME:-$DIR_NAME}"
 
-  # Get directory name for repo name suggestion
-  DIR_NAME=$(basename "$TARGET_PATH")
-  read -r -p "Repository name [$DIR_NAME]: " REPO_NAME
-  REPO_NAME="${REPO_NAME:-$DIR_NAME}"
-
-  info "Creating GitHub repository: $REPO_NAME..."
-  if gh repo create "$REPO_NAME" $VISIBILITY_FLAG --source="$TARGET_PATH" --push; then
-    success "GitHub repository created and pushed"
+    info "Creating GitHub repository: $REPO_NAME..."
+    if gh repo create "$REPO_NAME" $VISIBILITY_FLAG --source="$TARGET_PATH" --push; then
+      success "GitHub repository created and pushed"
+    else
+      error "Failed to create repository. Cannot proceed with Full Install."
+    fi
   else
-    error "Failed to create GitHub repository. Cannot proceed with Full Install."
+    warning "GitHub CLI (gh) not available."
+    info "For GitHub repos: install gh CLI (brew install gh)"
+    info "For Gitea repos: create the repository manually and add the remote:"
+    echo "  git remote add origin https://your-gitea-instance/owner/repo.git"
+    echo "  git push -u origin main"
+    error "Cannot auto-create repository without gh CLI. Set up the remote manually and re-run."
   fi
   echo ""
 fi
@@ -514,7 +525,9 @@ if [[ "$FORCE_OVERWRITE" != "true" ]] && [[ "$CLEAN_FIRST" != "true" ]]; then
   fi
 
   # Check 2: Is there already an open installation PR?
-  REPO_NWOPATH=$(git -C "$TARGET_PATH" config --get remote.origin.url 2>/dev/null | sed -E 's#^.*(github\.com[/:])##; s/\.git$//' || true)
+  # Extract owner/repo from URL (handles GitHub, Gitea, and other forges)
+  _ORIGIN_URL=$(git -C "$TARGET_PATH" config --get remote.origin.url 2>/dev/null || true)
+  REPO_NWOPATH=$(echo "$_ORIGIN_URL" | sed -E 's/\.git$//; s#^.*[:/]([^/]+/[^/]+)$#\1#' || true)
   if [[ -n "$REPO_NWOPATH" ]] && [[ "$REPO_NWOPATH" =~ ^[^/]+/[^/]+$ ]]; then
     EXISTING_INSTALL_PR=$(gh pr list -R "$REPO_NWOPATH" --state open --search "Install Loom" --json url,headRefName --jq '
       [.[] | select(.headRefName | startswith("feature/loom-installation"))][0].url' 2>/dev/null || true)
@@ -760,7 +773,7 @@ echo ""
 # STEP 4: Sync GitHub Labels
 # ============================================================================
 CURRENT_STEP="Sync Labels"
-header "Step 4: Syncing GitHub Labels"
+header "Step 4: Syncing Workflow Labels"
 echo ""
 
 if [[ ! -x "$LOOM_ROOT/scripts/install/sync-labels.sh" ]]; then
@@ -818,7 +831,7 @@ else
     else
       echo ""
       warning "Failed to configure branch ruleset (may require admin permissions)"
-      info "You can configure manually via GitHub Settings > Rules > Rulesets"
+      info "You can configure manually via your forge's Settings > Branch Protection"
     fi
   else
     info "Skipping branch ruleset setup"
@@ -932,9 +945,9 @@ PR_URL=$(echo "$LAST_OUTPUT_LINE" | cut -d'|' -f1)
 MERGE_STATUS=$(echo "$LAST_OUTPUT_LINE" | cut -d'|' -f2)
 
 # Validate PR URL - also try to extract from the raw output if parsing failed
-if [[ ! "$PR_URL" =~ ^https://github\.com/ ]]; then
-  # Fallback: try to extract URL from anywhere in the output
-  PR_URL=$(echo "$PR_URL_RAW" | grep -oE 'https://github\.com/[^[:space:]|]+/pull/[0-9]+' | head -1 | tr -d '[:space:]')
+if [[ ! "$PR_URL" =~ ^https:// ]]; then
+  # Fallback: try to extract URL from anywhere in the output (GitHub or Gitea)
+  PR_URL=$(echo "$PR_URL_RAW" | grep -oE 'https://[^[:space:]|]+/(pull|pulls)/[0-9]+' | head -1 | tr -d '[:space:]')
 fi
 
 if [[ ! "$PR_URL" =~ ^https:// ]]; then

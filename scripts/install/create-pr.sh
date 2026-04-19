@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # Create pull request for Loom installation or uninstallation
 #
+# Supports both GitHub (via gh CLI) and Gitea (via API).
+#
 # Environment variables:
 #   LOOM_VERSION       - Loom version string (default: "unknown")
 #   LOOM_COMMIT        - Loom commit hash (default: "unknown")
@@ -16,6 +18,10 @@ BASE_BRANCH="${2:-}"
 LOOM_VERSION="${LOOM_VERSION:-unknown}"
 LOOM_COMMIT="${LOOM_COMMIT:-unknown}"
 FORCE_AUTO_MERGE="${FORCE_AUTO_MERGE:-false}"
+
+# Source forge detection helper
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "${SCRIPT_DIR}/forge-detect.sh"
 
 # ANSI color codes
 RED='\033[0;31m'
@@ -48,22 +54,18 @@ fi
 cd "$WORKTREE_PATH"
 
 # Detect the target repository from git remote
-# This ensures we use the fork instead of upstream when both exist
 ORIGIN_URL=$(git config --get remote.origin.url 2>/dev/null || echo "")
 if [[ -z "$ORIGIN_URL" ]]; then
   error "Could not determine repository from git remote"
 fi
 
-# Extract owner/repo from URL (handles both HTTPS and SSH)
-# HTTPS: https://github.com/owner/repo.git -> owner/repo
-# SSH: git@github.com:owner/repo.git -> owner/repo
-REPO=$(echo "$ORIGIN_URL" | sed -E 's#^.*(github\.com[/:])##; s/\.git$//')
-
-if [[ ! "$REPO" =~ ^[^/]+/[^/]+$ ]]; then
-  error "Could not extract valid repository from URL: $ORIGIN_URL"
+# Detect forge type and extract owner/repo
+if ! detect_forge_and_repo "$ORIGIN_URL"; then
+  error "Could not detect forge type from URL: $ORIGIN_URL"
 fi
 
-info "Target repository: $REPO"
+REPO="${FORGE_OWNER}/${FORGE_REPO}"
+info "Target repository: $REPO (${FORGE_TYPE})"
 
 # Get current branch
 BRANCH_NAME=$(git rev-parse --abbrev-ref HEAD)
@@ -77,7 +79,6 @@ git add -A
 if git diff --staged --quiet; then
   info "No changes to commit - Loom is already installed"
   info "Skipping commit and PR creation"
-  # Exit successfully with a special marker that the caller can detect
   echo "NO_CHANGES_NEEDED"
   exit 0
 fi
@@ -87,7 +88,7 @@ if [[ -z "${COMMIT_MSG:-}" ]]; then
   COMMIT_MSG=$(cat <<EOF
 Install Loom ${LOOM_VERSION} orchestration framework
 
-Adds Loom configuration and GitHub workflow integration:
+Adds Loom configuration and workflow integration:
 - .loom/ directory with configuration and scripts
 - .claude/commands/ slash commands for roles (/builder, /judge, etc.)
 - .claude/settings.json tool permissions
@@ -107,14 +108,13 @@ success "Changes committed"
 info "Pushing branch: $BRANCH_NAME"
 
 # Push branch (use --force in case branch exists remotely from previous failed installation)
-# Redirect output to stderr so it doesn't interfere with PR URL capture
 PUSH_OUTPUT=""
 PUSH_EXIT_CODE=0
 PUSH_OUTPUT=$(git push -u origin "$BRANCH_NAME" --force 2>&1) || PUSH_EXIT_CODE=$?
 
 if [[ $PUSH_EXIT_CODE -ne 0 ]]; then
-  # Check if the error is due to missing workflow scope
-  if echo "$PUSH_OUTPUT" | grep -q "refusing to allow.*workflow"; then
+  # Check if the error is due to missing workflow scope (GitHub-specific)
+  if [[ "$FORGE_TYPE" == "github" ]] && echo "$PUSH_OUTPUT" | grep -q "refusing to allow.*workflow"; then
     echo "" >&2
     echo -e "${YELLOW}⚠ GitHub rejected push: missing 'workflow' scope${NC}" >&2
     echo "" >&2
@@ -126,10 +126,7 @@ if [[ $PUSH_EXIT_CODE -ne 0 ]]; then
     WORKFLOW_FILES=$(git diff --name-only HEAD~1 HEAD 2>/dev/null | grep "^\.github/workflows/" || true)
 
     if [[ -n "$WORKFLOW_FILES" ]]; then
-      # Unstage workflow files and amend the commit
       git reset HEAD~1 --soft >&2
-
-      # Re-add everything except workflows
       git add -A >&2
       for wf in $WORKFLOW_FILES; do
         if [[ -f "$wf" ]]; then
@@ -138,11 +135,10 @@ if [[ $PUSH_EXIT_CODE -ne 0 ]]; then
         fi
       done
 
-      # Amend commit message to note skipped workflows
       COMMIT_MSG_NO_WORKFLOW=$(cat <<EOF
 Install Loom ${LOOM_VERSION} orchestration framework
 
-Adds Loom configuration and GitHub workflow integration:
+Adds Loom configuration and workflow integration:
 - .loom/ directory with configuration and scripts
 - .claude/ MCP servers and prompts
 - .github/ labels (workflows skipped - requires 'workflow' scope)
@@ -157,7 +153,6 @@ EOF
 )
       git commit -m "$COMMIT_MSG_NO_WORKFLOW" >&2
 
-      # Retry push
       git push -u origin "$BRANCH_NAME" --force >&2 || {
         error "Failed to push even without workflow files"
       }
@@ -182,12 +177,10 @@ EOF
 
       success "Branch pushed (without workflows)"
     else
-      # No workflow files found, but still failed - re-raise the error
       echo "$PUSH_OUTPUT" >&2
       error "Failed to push branch: $BRANCH_NAME"
     fi
   else
-    # Different error - show output and fail
     echo "$PUSH_OUTPUT" >&2
     error "Failed to push branch: $BRANCH_NAME"
   fi
@@ -209,13 +202,13 @@ This PR adds Loom orchestration framework to the repository.
 
 ## What's Included
 
-- ✅ \`.loom/\` - Configuration, roles, and scripts
-- ✅ \`.claude/commands/\` - Slash commands for roles (/builder, /judge, /curator, etc.)
-- ✅ \`.claude/settings.json\` - Claude Code tool permissions
-- ✅ \`.github/\` - Labels and workflows
-- ✅ \`CLAUDE.md\` - Documentation with Loom reference
+- \`.loom/\` - Configuration, roles, and scripts
+- \`.claude/commands/\` - Slash commands for roles (/builder, /judge, etc.)
+- \`.claude/settings.json\` - Claude Code tool permissions
+- \`.github/\` - Labels and workflows
+- \`CLAUDE.md\` - Documentation with Loom reference
 
-## GitHub Labels
+## Labels
 
 Synced Loom workflow labels via \`.github/labels.yml\`
 
@@ -228,7 +221,7 @@ After merging:
 See \`CLAUDE.md\` for complete usage details.
 
 ---
-🤖 Generated by [Loom](https://github.com/rjwalters/loom) installation
+Generated by [Loom](https://github.com/rjwalters/loom) installation
 EOF
   )
 fi
@@ -238,54 +231,111 @@ if [[ -z "${PR_TITLE:-}" ]]; then
   PR_TITLE="Install Loom ${LOOM_VERSION}"
 fi
 
-# Create pull request and capture the URL
-# Redirect stderr to stdout to capture the full output, then extract the URL
-# Use || to prevent set -e from exiting before we can report the error
-GH_PR_EXIT=0
-GH_PR_OUTPUT=$(gh pr create \
-  -R "$REPO" \
-  --base "$BASE_BRANCH" \
-  --title "$PR_TITLE" \
-  --body "$PR_BODY" \
-  --label "loom:pr" 2>&1) || GH_PR_EXIT=$?
+# ============================================================================
+# Create PR - forge-specific
+# ============================================================================
 
-if [[ $GH_PR_EXIT -ne 0 ]]; then
-  # Check if a PR already exists for this branch
-  if echo "$GH_PR_OUTPUT" | grep -qi "already exists"; then
-    warning "A pull request already exists for this branch"
-    info "Looking up existing PR..."
+PR_URL=""
 
-    # Find the existing PR URL
-    EXISTING_PR=$(gh pr list -R "$REPO" --head "$BRANCH_NAME" --base "$BASE_BRANCH" --json url --jq '.[0].url' 2>/dev/null || true)
+if [[ "$FORGE_TYPE" == "github" ]]; then
+  # Create PR via GitHub CLI
+  GH_PR_EXIT=0
+  GH_PR_OUTPUT=$(gh pr create \
+    -R "$REPO" \
+    --base "$BASE_BRANCH" \
+    --title "$PR_TITLE" \
+    --body "$PR_BODY" \
+    --label "loom:pr" 2>&1) || GH_PR_EXIT=$?
 
-    if [[ -n "$EXISTING_PR" ]]; then
-      success "Found existing PR: $EXISTING_PR"
-      PR_URL="$EXISTING_PR"
+  if [[ $GH_PR_EXIT -ne 0 ]]; then
+    if echo "$GH_PR_OUTPUT" | grep -qi "already exists"; then
+      warning "A pull request already exists for this branch"
+      info "Looking up existing PR..."
+
+      EXISTING_PR=$(gh pr list -R "$REPO" --head "$BRANCH_NAME" --base "$BASE_BRANCH" --json url --jq '.[0].url' 2>/dev/null || true)
+
+      if [[ -n "$EXISTING_PR" ]]; then
+        success "Found existing PR: $EXISTING_PR"
+        PR_URL="$EXISTING_PR"
+      else
+        echo "Error: PR already exists but could not find its URL" >&2
+        echo "gh output was:" >&2
+        echo "$GH_PR_OUTPUT" >&2
+        exit 1
+      fi
     else
-      echo "Error: PR already exists but could not find its URL" >&2
+      echo "Error: Failed to create pull request" >&2
       echo "gh output was:" >&2
       echo "$GH_PR_OUTPUT" >&2
       exit 1
     fi
   else
-    echo "Error: Failed to create pull request" >&2
-    echo "gh output was:" >&2
-    echo "$GH_PR_OUTPUT" >&2
-    exit 1
-  fi
-else
-  # Extract URL from output (gh CLI outputs the PR URL as the last line)
-  PR_URL=$(echo "$GH_PR_OUTPUT" | grep -oE 'https://github\.com/[^[:space:]]+/pull/[0-9]+' | head -1 | tr -d '[:space:]')
+    PR_URL=$(echo "$GH_PR_OUTPUT" | grep -oE 'https://[^[:space:]]+/pull/[0-9]+' | head -1 | tr -d '[:space:]')
 
-  # Validate the URL
-  if [[ -z "$PR_URL" ]] || [[ ! "$PR_URL" =~ ^https://github\.com/[^[:space:]]+/pull/[0-9]+$ ]]; then
-    echo "Error: Failed to create PR or invalid URL returned" >&2
-    echo "gh output was:" >&2
-    echo "$GH_PR_OUTPUT" >&2
-    exit 1
+    if [[ -z "$PR_URL" ]]; then
+      echo "Error: Failed to create PR or invalid URL returned" >&2
+      echo "gh output was:" >&2
+      echo "$GH_PR_OUTPUT" >&2
+      exit 1
+    fi
+
+    success "Pull request created: $PR_URL"
   fi
 
-  success "Pull request created: $PR_URL"
+elif [[ "$FORGE_TYPE" == "gitea" ]]; then
+  # Create PR via Gitea API
+  if [[ -z "$FORGE_TOKEN" ]]; then
+    error "Gitea API token required to create pull request. Set GITEA_TOKEN or FORGE_TOKEN."
+  fi
+
+  PR_PAYLOAD=$(cat <<EOJSON
+{
+  "title": $(echo "$PR_TITLE" | python3 -c 'import json,sys; print(json.dumps(sys.stdin.read().strip()))'),
+  "body": $(echo "$PR_BODY" | python3 -c 'import json,sys; print(json.dumps(sys.stdin.read().strip()))'),
+  "head": "$BRANCH_NAME",
+  "base": "$BASE_BRANCH",
+  "labels": []
+}
+EOJSON
+  )
+
+  GITEA_RESPONSE=$(gitea_api POST "/repos/${FORGE_OWNER}/${FORGE_REPO}/pulls" "$PR_PAYLOAD")
+  GITEA_HTTP_CODE=$(echo "$GITEA_RESPONSE" | tail -1)
+  GITEA_BODY=$(echo "$GITEA_RESPONSE" | sed '$d')
+
+  if [[ "$GITEA_HTTP_CODE" == "201" ]]; then
+    PR_URL=$(echo "$GITEA_BODY" | python3 -c 'import json,sys; data=json.load(sys.stdin); print(data.get("html_url",""))' 2>/dev/null || echo "")
+    PR_NUMBER=$(echo "$GITEA_BODY" | python3 -c 'import json,sys; data=json.load(sys.stdin); print(data.get("number",""))' 2>/dev/null || echo "")
+
+    if [[ -n "$PR_URL" ]]; then
+      success "Pull request created: $PR_URL"
+
+      # Try to add loom:pr label
+      if [[ -n "$PR_NUMBER" ]]; then
+        gitea_api POST "/repos/${FORGE_OWNER}/${FORGE_REPO}/issues/${PR_NUMBER}/labels" '{"labels":["loom:pr"]}' > /dev/null 2>&1 || true
+      fi
+    else
+      warning "PR created but could not extract URL from response"
+      PR_URL="unknown"
+    fi
+
+  elif [[ "$GITEA_HTTP_CODE" == "409" ]]; then
+    warning "A pull request already exists for this branch"
+    # Try to find existing PR
+    EXISTING_RESPONSE=$(gitea_api GET "/repos/${FORGE_OWNER}/${FORGE_REPO}/pulls?state=open&head=${FORGE_OWNER}:${BRANCH_NAME}&base=${BASE_BRANCH}")
+    EXISTING_BODY=$(echo "$EXISTING_RESPONSE" | sed '$d')
+    PR_URL=$(echo "$EXISTING_BODY" | python3 -c 'import json,sys; data=json.load(sys.stdin); print(data[0].get("html_url","") if data else "")' 2>/dev/null || echo "")
+
+    if [[ -n "$PR_URL" ]]; then
+      success "Found existing PR: $PR_URL"
+    else
+      error "PR already exists but could not find its URL"
+    fi
+  else
+    echo "Error: Failed to create pull request (HTTP $GITEA_HTTP_CODE)" >&2
+    echo "Response: $GITEA_BODY" >&2
+    exit 1
+  fi
 fi
 
 # ============================================================================
@@ -296,21 +346,39 @@ MERGE_STATUS="manual"
 if [[ "$FORCE_AUTO_MERGE" == "true" ]]; then
   info "Force mode: Attempting to merge PR..."
 
-  # First try immediate squash merge (works when no review requirements or 0 approvals)
-  # Note: We use --squash because Loom's repository settings disable merge commits
-  if gh pr merge "$PR_URL" --squash --delete-branch 2>/dev/null; then
-    success "PR merged successfully"
-    MERGE_STATUS="merged"
-  else
-    # If immediate merge fails, try enabling auto-merge
-    info "Immediate merge not available (ruleset may require reviews)"
-    if gh pr merge "$PR_URL" --auto --squash --delete-branch 2>/dev/null; then
-      success "Auto-merge enabled - PR will merge once requirements are met"
-      MERGE_STATUS="auto"
+  if [[ "$FORGE_TYPE" == "github" ]]; then
+    if gh pr merge "$PR_URL" --squash --delete-branch 2>/dev/null; then
+      success "PR merged successfully"
+      MERGE_STATUS="merged"
     else
-      warning "Could not merge or enable auto-merge - manual merge required"
-      warning "This may be because auto-merge is not enabled on the repository"
-      info "To enable: GitHub Settings > General > Allow auto-merge"
+      info "Immediate merge not available (ruleset may require reviews)"
+      if gh pr merge "$PR_URL" --auto --squash --delete-branch 2>/dev/null; then
+        success "Auto-merge enabled - PR will merge once requirements are met"
+        MERGE_STATUS="auto"
+      else
+        warning "Could not merge or enable auto-merge - manual merge required"
+        warning "This may be because auto-merge is not enabled on the repository"
+        info "To enable: GitHub Settings > General > Allow auto-merge"
+        MERGE_STATUS="manual"
+      fi
+    fi
+
+  elif [[ "$FORGE_TYPE" == "gitea" ]]; then
+    # Extract PR number for Gitea merge
+    GITEA_PR_NUMBER=$(echo "$PR_URL" | grep -oE '[0-9]+$' || echo "")
+    if [[ -n "$GITEA_PR_NUMBER" ]]; then
+      MERGE_RESPONSE=$(gitea_api POST "/repos/${FORGE_OWNER}/${FORGE_REPO}/pulls/${GITEA_PR_NUMBER}/merge" '{"Do":"squash","delete_branch_after_merge":true}')
+      MERGE_CODE=$(echo "$MERGE_RESPONSE" | tail -1)
+
+      if [[ "$MERGE_CODE" == "200" || "$MERGE_CODE" == "204" ]]; then
+        success "PR merged successfully"
+        MERGE_STATUS="merged"
+      else
+        warning "Could not merge PR - manual merge required (HTTP $MERGE_CODE)"
+        MERGE_STATUS="manual"
+      fi
+    else
+      warning "Could not extract PR number for merge"
       MERGE_STATUS="manual"
     fi
   fi
@@ -319,7 +387,5 @@ else
 fi
 
 # Output the PR URL and merge status (stdout, so it can be captured by caller)
-# Format: PR_URL|MERGE_STATUS
-# Use exec to ensure we're writing directly to FD 1 without any buffering issues
-exec 1>&1  # Ensure FD 1 is stdout
+exec 1>&1
 printf "%s|%s" "$PR_URL" "$MERGE_STATUS"
