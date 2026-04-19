@@ -7,6 +7,59 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-04-19
+
+### Summary
+
+Major feature release: Loom is now forge-agnostic with full Gitea support. A new ForgeClient abstraction layer enables Loom to orchestrate development workflows against both GitHub and Gitea, with automatic forge detection from git remote URLs.
+
+### Added
+
+- ForgeClient protocol with 21 methods for forge-agnostic operations (#3132)
+- GitHubForge implementation wrapping existing GitHub code behind ForgeClient (#3133)
+- GiteaForge implementation with full Gitea REST API v1 support (#3144)
+- Forge detection and selection from git remote URL, config, or environment (#3135)
+- CachedForgeClient replacing `gh-cached` with forge-neutral caching (#3149)
+- Gitea CI status integration with client-side aggregation and Actions API fallback (#3148)
+- Gitea branch protection and repository settings support (#3145)
+- `loom-forge` CLI entry point for forge-agnostic shell script dispatch (#3146)
+- `loom-auto-merge` CLI with poll-and-merge fallback for Gitea (#3170)
+- Forge-agnostic dispatch for raw-API shell scripts: `merge-pr.sh`, `check-ci-status.sh`, `test-plan-metrics.sh` (#3147)
+- Shared `forge-helpers.sh` bash library with 14 dispatch functions (#3147)
+- `forge-detect.sh` helper for shell-level forge detection (#3145)
+- End-to-end integration tests with Docker Gitea instance (#3156)
+- GitHub Actions CI workflow for Gitea integration tests (#3156)
+- Pagination, HTTP 429 retry with backoff, and expanded body-search patterns in GiteaForge (#3158)
+- "Built with Loom" badge for downstream projects (#3137)
+- Forge authentication documentation covering both GitHub and Gitea (#3157)
+
+### Changed
+
+- Parameterized `github_parser.rs` to support configurable forge URL patterns (#3134)
+- Installation scripts (`validate-target.sh`, `create-pr.sh`, `sync-labels.sh`) now detect and support both forges (#3157)
+- `check_github_remote` Tauri command now recognizes Gitea hosts (#3159)
+- `reset_github_labels` dispatches through `loom-forge` CLI instead of `gh` directly (#3160)
+- `shepherd/labels.py` migrated from `gh` CLI calls to ForgeClient abstraction (#3168)
+- CLAUDE.md templates updated with multi-forge context and mandatory shepherd lifecycle section
+- `defaults/config.json` now includes `forge` configuration section (#3157)
+
+### Renamed
+
+- `github_parser.rs` → `forge_parser.rs` (#3161)
+- `ParsedGitHubEvent` → `ParsedForgeEvent` (#3161)
+- `check_github_remote` → `check_forge_remote` (#3161)
+- `PromptGitHubEvent` → `PromptForgeEvent` and related types (#3169)
+- `github_events.rs` → `forge_events.rs` (#3169)
+
+### Removed
+
+- Dead Tauri commands: `check_label_exists`, `create_github_label`, `update_github_label` (#3160)
+- Expired `loom:in-progress` migration code (#3160)
+
+### Fixed
+
+- Idle support role tmux sessions no longer consume memory indefinitely (#3136)
+
 ## [0.4.1] - 2026-04-14
 
 ### Summary
