@@ -22,6 +22,7 @@ Shell scripts replace ``gh issue/pr`` calls with ``loom-forge`` equivalents:
     loom-forge issue comment 42 --body "Recovery message"
     loom-forge issue create --title "..." --body "..." --label "..."
     loom-forge pr list --state open --json number,headRefName,body,labels
+    loom-forge pr edit 123 --remove-label "loom:reviewing" --add-label "loom:review-requested"
     loom-forge auth status
 
 For GitHub: dispatches to ``gh`` CLI (identical behavior).
@@ -298,6 +299,20 @@ def _cmd_pr_list(forge: ForgeClient, args: list[str]) -> int:
     return 0
 
 
+def _cmd_pr_edit(forge: ForgeClient, args: list[str]) -> int:
+    """Handle: loom-forge pr edit <number> [--add-label X]... [--remove-label X]..."""
+    if not args:
+        print("Error: PR number required", file=sys.stderr)
+        return 1
+
+    number = int(args.pop(0))
+    add_labels = _pop_all_flags(args, "--add-label")
+    remove_labels = _pop_all_flags(args, "--remove-label")
+
+    success = forge.transition_labels("pr", number, add=add_labels, remove=remove_labels)
+    return 0 if success else 1
+
+
 def _cmd_auth_status(forge: ForgeClient, args: list[str]) -> int:
     """Handle: loom-forge auth status
 
@@ -345,6 +360,7 @@ _ISSUE_COMMANDS = {
 
 _PR_COMMANDS = {
     "list": _cmd_pr_list,
+    "edit": _cmd_pr_edit,
 }
 
 _TOP_COMMANDS = {
@@ -363,7 +379,7 @@ def _print_usage() -> None:
         "\n"
         "Entities:\n"
         "  issue    Issue operations (list, view, edit, comment, create)\n"
-        "  pr       Pull request operations (list)\n"
+        "  pr       Pull request operations (list, edit)\n"
         "  auth     Authentication (status)\n"
         "\n"
         "Examples:\n"
@@ -373,6 +389,7 @@ def _print_usage() -> None:
         "  loom-forge issue comment 42 --body 'Recovery message'\n"
         "  loom-forge issue create --title 'Title' --body 'Body' --label bug\n"
         "  loom-forge pr list --state open --json number,headRefName,body,labels\n"
+        "  loom-forge pr edit 123 --remove-label loom:reviewing --add-label loom:review-requested\n"
         "  loom-forge auth status\n",
         file=sys.stderr,
     )
