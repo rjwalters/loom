@@ -1009,6 +1009,32 @@ class TestGitHubForgePullRequests:
         assert "merge" in call_args
         assert "--squash" in call_args
 
+    def test_auto_merge_pull_request_success(self) -> None:
+        """auto_merge_pull_request delegates to gh pr merge --auto."""
+        forge = GitHubForge()
+        with mock.patch("loom_tools.common.github.gh_run") as mock_gh:
+            mock_gh.return_value = mock.Mock(returncode=0, stdout="", stderr="")
+            result = forge.auto_merge_pull_request(10, method="squash")
+
+        assert result is True
+        call_args = mock_gh.call_args[0][0]
+        assert "pr" in call_args
+        assert "merge" in call_args
+        assert "--auto" in call_args
+        assert "--squash" in call_args
+        assert "--delete-branch" in call_args
+
+    def test_auto_merge_pull_request_failure(self) -> None:
+        """auto_merge_pull_request returns False on gh failure."""
+        forge = GitHubForge()
+        with mock.patch("loom_tools.common.github.gh_run") as mock_gh:
+            mock_gh.return_value = mock.Mock(
+                returncode=1, stdout="", stderr="auto-merge not available",
+            )
+            result = forge.auto_merge_pull_request(10)
+
+        assert result is False
+
     def test_get_pull_request_reviews(self) -> None:
         """get_pull_request_reviews returns review list."""
         review_data = {

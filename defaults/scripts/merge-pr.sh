@@ -139,6 +139,17 @@ if [[ "$AUTO_MERGE" == "true" ]]; then
     info "[dry-run] Would enable auto-merge for PR #$PR_NUMBER"
     exit 0
   fi
+  # Prefer loom-auto-merge CLI (forge-agnostic, with poll-and-merge for Gitea)
+  if command -v loom-auto-merge &>/dev/null; then
+    info "Using loom-auto-merge (forge-agnostic auto-merge)"
+    if loom-auto-merge "$PR_NUMBER" --method squash; then
+      success "Auto-merge completed for PR #$PR_NUMBER"
+      exit 0
+    else
+      error "Failed to auto-merge PR #$PR_NUMBER"
+    fi
+  fi
+  # Fallback: shell-based forge_auto_merge
   if forge_auto_merge "$REPO_NWO" "$PR_NUMBER" 2>/dev/null; then
     success "Auto-merge enabled for PR #$PR_NUMBER"
     exit 0

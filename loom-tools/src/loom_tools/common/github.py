@@ -496,6 +496,34 @@ class GitHubForge:
         result = gh_run(args, check=False, cwd=self._cwd)
         return result.returncode == 0
 
+    def auto_merge_pull_request(
+        self,
+        number: int,
+        method: str = "squash",
+        poll_interval: int = 30,
+        timeout: int = 600,
+    ) -> bool:
+        """Enable GitHub's native auto-merge for a PR.
+
+        Delegates to ``gh pr merge --auto`` which queues the merge
+        until all required checks pass. The ``poll_interval`` and
+        ``timeout`` parameters are ignored (GitHub handles polling
+        server-side).
+        """
+        args = [
+            "pr", "merge", str(number),
+            "--auto", f"--{method}", "--delete-branch",
+        ]
+        result = gh_run(args, check=False, cwd=self._cwd)
+        if result.returncode == 0:
+            logger.info("Auto-merge enabled for PR #%d (GitHub)", number)
+            return True
+        logger.warning(
+            "Failed to enable auto-merge for PR #%d: %s",
+            number, (result.stderr or result.stdout or "").strip(),
+        )
+        return False
+
     def comment_on_pull_request(self, number: int, body: str) -> bool:
         """Add a comment to a pull request."""
         result = gh_run(

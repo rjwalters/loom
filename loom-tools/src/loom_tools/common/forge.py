@@ -399,6 +399,35 @@ class ForgeClient(Protocol):
         """
         ...
 
+    def auto_merge_pull_request(
+        self,
+        number: int,
+        method: str = "squash",
+        poll_interval: int = 30,
+        timeout: int = 600,
+    ) -> bool:
+        """Enable auto-merge or poll-and-merge for a pull request.
+
+        For forges with native auto-merge support (e.g. GitHub), this
+        enables auto-merge and returns immediately. For forges without
+        native support (e.g. Gitea), this polls CI status and merges
+        when checks pass.
+
+        Parameters
+        ----------
+        number:
+            PR number.
+        method:
+            Merge method (``"squash"``, ``"merge"``, ``"rebase"``).
+        poll_interval:
+            Seconds between CI status polls (Gitea only).
+        timeout:
+            Maximum seconds to wait for CI before giving up (Gitea only).
+
+        Returns ``True`` if the PR was merged or auto-merge was enabled.
+        """
+        ...
+
     def comment_on_pull_request(self, number: int, body: str) -> bool:
         """Add a comment to a pull request. Returns ``True`` on success."""
         ...
