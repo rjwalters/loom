@@ -451,6 +451,14 @@ class ForgeClient(Protocol):
         """Get CI status for the latest runs on the default branch."""
         ...
 
+    def get_commit_ci_status(self, sha: str) -> ForgeCIStatus:
+        """Get CI status for a specific commit SHA.
+
+        Returns aggregated CI status from all status checks and/or
+        workflow runs associated with the given commit.
+        """
+        ...
+
     # --- Repository metadata ---
 
     def get_repo_nwo(self) -> str | None:

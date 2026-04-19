@@ -600,36 +600,43 @@ class GiteaForge:
     # CI status
     # ------------------------------------------------------------------
 
-    def get_default_branch_ci_status(self) -> ForgeCIStatus:
-        """Get CI status for the latest commit on the default branch."""
-        rp = self._repo_path()
-        default_branch = self.get_repo_default_branch()
-        if not rp or not default_branch:
-            return ForgeCIStatus(
-                status="unknown", message="Cannot determine repo or default branch",
-            )
+    # Gitea commit status values -> Loom internal status
+    _STATUS_MAP_FAILURE = frozenset({"failure", "error"})
+    _STATUS_MAP_PENDING = frozenset({"pending", "warning"})
+    _STATUS_MAP_SUCCESS = frozenset({"success"})
 
-        resp = self._request(
-            "GET", f"{rp}/commits/{default_branch}/statuses",
-        )
-        if resp is None:
-            return ForgeCIStatus(
-                status="unknown", message="Failed to fetch CI statuses",
-            )
+    # Gitea Actions run conclusion -> Loom internal status
+    _ACTIONS_FAILURE = frozenset({"failure", "cancelled"})
+    _ACTIONS_PENDING_STATUSES = frozenset({"queued", "waiting", "running", "in_progress"})
 
-        try:
-            statuses = resp.json()
-        except ValueError:
-            return ForgeCIStatus(
-                status="unknown", message="Invalid CI status response",
-            )
+    def _classify_gitea_status(self, status: str) -> str:
+        """Map a Gitea status value to Loom internal status.
 
-        if not isinstance(statuses, list) or not statuses:
+        Returns ``"success"``, ``"failure"``, or ``"pending"``.
+        """
+        s = status.lower()
+        if s in self._STATUS_MAP_FAILURE:
+            return "failure"
+        if s in self._STATUS_MAP_PENDING:
+            return "pending"
+        if s in self._STATUS_MAP_SUCCESS:
+            return "success"
+        return "pending"  # unknown values treated as pending
+
+    def _aggregate_commit_statuses(
+        self, statuses: list[dict[str, Any]],
+    ) -> ForgeCIStatus:
+        """Aggregate a list of Gitea commit status objects.
+
+        Groups by ``context`` (keeping only the latest per context),
+        then derives the worst-case overall status.
+        """
+        if not statuses:
             return ForgeCIStatus(
                 status="unknown", message="No CI statuses found",
             )
 
-        # Aggregate: group by context (workflow name), take latest
+        # Group by context, keep latest (first in list = most recent)
         latest_by_context: dict[str, dict[str, Any]] = {}
         for s in statuses:
             if not isinstance(s, dict):
@@ -639,10 +646,13 @@ class GiteaForge:
                 latest_by_context[ctx] = s
 
         failed_runs: list[str] = []
+        has_pending = False
         for ctx, s in latest_by_context.items():
-            state = s.get("status", "").lower()
-            if state in ("failure", "error"):
+            classified = self._classify_gitea_status(s.get("status", ""))
+            if classified == "failure":
                 failed_runs.append(ctx)
+            elif classified == "pending":
+                has_pending = True
 
         total = len(latest_by_context)
         if failed_runs:
@@ -653,11 +663,183 @@ class GiteaForge:
                 message=f"CI failing: {len(failed_runs)} check(s) failed",
             )
 
+        if has_pending:
+            return ForgeCIStatus(
+                status="passing",
+                total_runs=total,
+                message="CI passing (some checks pending)",
+            )
+
         return ForgeCIStatus(
             status="passing",
             total_runs=total,
             message="CI passing",
         )
+
+    def _fetch_actions_runs(self, rp: str, ref: str) -> list[dict[str, Any]] | None:
+        """Fetch Gitea Actions workflow runs for a branch/ref.
+
+        Returns ``None`` if the Actions API is unavailable (404) or
+        on any error, enabling callers to fall back to commit statuses only.
+
+        Only available on Gitea 1.19+.
+        """
+        resp = self._request(
+            "GET",
+            f"{rp}/actions/runs",
+            params={"branch": ref, "limit": 10},
+        )
+        if resp is None:
+            return None
+
+        try:
+            data = resp.json()
+        except ValueError:
+            return None
+
+        # Gitea Actions API returns {"workflow_runs": [...]} or just [...]
+        if isinstance(data, dict):
+            runs = data.get("workflow_runs", [])
+        elif isinstance(data, list):
+            runs = data
+        else:
+            return None
+
+        if not isinstance(runs, list):
+            return None
+
+        return runs
+
+    def _aggregate_actions_runs(
+        self, runs: list[dict[str, Any]],
+    ) -> ForgeCIStatus:
+        """Aggregate Gitea Actions workflow runs into a ForgeCIStatus.
+
+        Groups by workflow name, keeps only the latest run per workflow.
+        """
+        if not runs:
+            return ForgeCIStatus(
+                status="unknown", message="No Actions runs found",
+            )
+
+        latest_by_name: dict[str, dict[str, Any]] = {}
+        for run in runs:
+            if not isinstance(run, dict):
+                continue
+            name = run.get("name", "Unknown")
+            if name not in latest_by_name:
+                latest_by_name[name] = run
+
+        failed_runs: list[str] = []
+        for name, run in latest_by_name.items():
+            status = run.get("status", "").lower()
+            conclusion = run.get("conclusion", "").lower()
+
+            # If not completed, skip (pending)
+            if status in self._ACTIONS_PENDING_STATUSES:
+                continue
+
+            if conclusion in self._ACTIONS_FAILURE:
+                failed_runs.append(name)
+
+        total = len(latest_by_name)
+        if failed_runs:
+            return ForgeCIStatus(
+                status="failing",
+                failed_runs=failed_runs,
+                total_runs=total,
+                message=f"CI failing: {len(failed_runs)} workflow(s) failed",
+            )
+
+        return ForgeCIStatus(
+            status="passing",
+            total_runs=total,
+            message="CI passing",
+        )
+
+    def _merge_ci_results(
+        self,
+        commit_result: ForgeCIStatus,
+        actions_result: ForgeCIStatus | None,
+    ) -> ForgeCIStatus:
+        """Merge commit status and Actions run results.
+
+        If both sources are available, combines them. If either source
+        reports failure, the merged result is failing.
+        """
+        if actions_result is None or actions_result.status == "unknown":
+            return commit_result
+        if commit_result.status == "unknown":
+            return actions_result
+
+        # Merge: combine failed runs and total counts
+        all_failed = list(set(commit_result.failed_runs + actions_result.failed_runs))
+        total = commit_result.total_runs + actions_result.total_runs
+
+        if all_failed:
+            return ForgeCIStatus(
+                status="failing",
+                failed_runs=all_failed,
+                total_runs=total,
+                message=f"CI failing: {len(all_failed)} check(s) failed",
+            )
+
+        return ForgeCIStatus(
+            status="passing",
+            total_runs=total,
+            message="CI passing",
+        )
+
+    def get_default_branch_ci_status(self) -> ForgeCIStatus:
+        """Get CI status for the latest commit on the default branch.
+
+        Queries both commit statuses and Gitea Actions runs (if available).
+        Gitea Actions API (1.19+) is feature-detected via 404 fallback.
+        """
+        default_branch = self.get_repo_default_branch()
+        if not default_branch:
+            return ForgeCIStatus(
+                status="unknown", message="Cannot determine default branch",
+            )
+        return self.get_commit_ci_status(default_branch)
+
+    def get_commit_ci_status(self, sha: str) -> ForgeCIStatus:
+        """Get CI status for a specific commit or ref.
+
+        Queries both commit statuses and Gitea Actions runs (if available),
+        then merges the results. Handles Gitea version differences by
+        gracefully falling back when Actions API returns 404.
+        """
+        rp = self._repo_path()
+        if not rp:
+            return ForgeCIStatus(
+                status="unknown", message="Cannot determine repository",
+            )
+
+        # 1. Fetch commit statuses (available in all Gitea versions)
+        resp = self._request(
+            "GET", f"{rp}/commits/{sha}/statuses",
+        )
+
+        commit_statuses: list[dict[str, Any]] = []
+        if resp is not None:
+            try:
+                data = resp.json()
+                if isinstance(data, list):
+                    commit_statuses = data
+            except ValueError:
+                pass
+
+        commit_result = self._aggregate_commit_statuses(commit_statuses)
+
+        # 2. Try Gitea Actions runs (1.19+, graceful 404 fallback)
+        actions_runs = self._fetch_actions_runs(rp, sha)
+        actions_result: ForgeCIStatus | None = None
+        if actions_runs is not None:
+            actions_result = self._aggregate_actions_runs(actions_runs)
+
+        # 3. Merge both results
+        return self._merge_ci_results(commit_result, actions_result)
 
     # ------------------------------------------------------------------
     # Repository metadata

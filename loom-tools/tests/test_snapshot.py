@@ -1286,19 +1286,25 @@ class TestCollectPipelineDataCiAutoDetect:
             result = collect_pipeline_data(repo, ci_health_check_enabled=True)
         assert result["ci_status"]["status"] == "no_ci"
 
-    def test_workflows_present_calls_gh(self, tmp_path: pathlib.Path) -> None:
-        """When .github/workflows/ has files, gh_get_default_branch_ci_status is called."""
+    def test_workflows_present_calls_forge(self, tmp_path: pathlib.Path) -> None:
+        """When .github/workflows/ has files, forge.get_default_branch_ci_status is called."""
+        from loom_tools.common.forge import ForgeCIStatus
+
         repo = tmp_path / "repo"
         wf_dir = repo / ".github" / "workflows"
         wf_dir.mkdir(parents=True)
         (wf_dir / "ci.yml").write_text("name: CI\n")
+
+        mock_forge = mock.MagicMock()
+        mock_forge.get_default_branch_ci_status.return_value = ForgeCIStatus(
+            status="passing", failed_runs=[], total_runs=1, message="CI passing",
+        )
         with mock.patch("loom_tools.snapshot.gh_parallel_queries") as mock_queries, \
              mock.patch("loom_tools.snapshot._collect_usage", return_value={}), \
-             mock.patch("loom_tools.snapshot.gh_get_default_branch_ci_status") as mock_ci:
+             mock.patch("loom_tools.snapshot.get_forge", return_value=mock_forge):
             mock_queries.return_value = [[] for _ in range(10)]
-            mock_ci.return_value = {"status": "passing", "failed_runs": [], "total_runs": 1, "message": "CI passing"}
             result = collect_pipeline_data(repo, ci_health_check_enabled=True)
-        mock_ci.assert_called_once()
+        mock_forge.get_default_branch_ci_status.assert_called_once()
         assert result["ci_status"]["status"] == "passing"
 
     def test_ci_disabled_skips_detection(self, tmp_path: pathlib.Path) -> None:
@@ -1309,10 +1315,10 @@ class TestCollectPipelineDataCiAutoDetect:
         (wf_dir / "ci.yml").write_text("name: CI\n")
         with mock.patch("loom_tools.snapshot.gh_parallel_queries") as mock_queries, \
              mock.patch("loom_tools.snapshot._collect_usage", return_value={}), \
-             mock.patch("loom_tools.snapshot.gh_get_default_branch_ci_status") as mock_ci:
+             mock.patch("loom_tools.snapshot.get_forge") as mock_get_forge:
             mock_queries.return_value = [[] for _ in range(10)]
             result = collect_pipeline_data(repo, ci_health_check_enabled=False)
-        mock_ci.assert_not_called()
+        mock_get_forge.assert_not_called()
         assert result["ci_status"]["status"] == "unknown"
 
 

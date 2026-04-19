@@ -260,6 +260,9 @@ class MockForgeClient:
     def get_default_branch_ci_status(self) -> ForgeCIStatus:
         return ForgeCIStatus(status="passing")
 
+    def get_commit_ci_status(self, sha: str) -> ForgeCIStatus:
+        return ForgeCIStatus(status="passing")
+
     # --- Repository metadata ---
 
     def get_repo_nwo(self) -> str | None:

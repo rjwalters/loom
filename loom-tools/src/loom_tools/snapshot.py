@@ -28,6 +28,7 @@ from typing import Any, Sequence
 
 import shutil
 
+from loom_tools.common.forge import get_forge
 from loom_tools.common.github import gh_parallel_queries, gh_get_default_branch_ci_status
 from loom_tools.common.issue_failures import load_failure_log, IssueFailureLog
 from loom_tools.common.logging import log_info, log_warning
@@ -343,7 +344,15 @@ def collect_pipeline_data(
     if ci_health_check_enabled:
         workflows_dir = repo_root / ".github" / "workflows"
         if workflows_dir.is_dir() and any(workflows_dir.iterdir()):
-            ci_status = gh_get_default_branch_ci_status()
+            # Use forge-agnostic CI status (works for both GitHub and Gitea)
+            forge = get_forge()
+            forge_ci = forge.get_default_branch_ci_status()
+            ci_status = {
+                "status": forge_ci.status,
+                "failed_runs": forge_ci.failed_runs,
+                "total_runs": forge_ci.total_runs,
+                "message": forge_ci.message,
+            }
         else:
             ci_status = {"status": "no_ci", "message": "No CI workflows configured (.github/workflows/ not found)"}
 
