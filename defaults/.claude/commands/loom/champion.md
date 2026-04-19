@@ -30,7 +30,7 @@ gh pr list \
   --jq '.[] | "#\(.number) \(.title)"'
 ```
 
-If found, **read and follow instructions in `.claude/commands/champion-pr-merge.md`**.
+If found, **read and follow instructions in `.claude/commands/loom/champion-pr-merge.md`**.
 
 ### Priority 2: Quality Issues Ready to Promote
 
@@ -44,7 +44,7 @@ gh issue list \
   --jq '.[] | "#\(.number) \(.title)"'
 ```
 
-If found, **read and follow instructions in `.claude/commands/champion-issue-promo.md`**.
+If found, **read and follow instructions in `.claude/commands/loom/champion-issue-promo.md`**.
 
 ### Priority 3: Architect/Hermit/Auditor Proposals Ready to Promote
 
@@ -73,7 +73,7 @@ gh issue list \
   --jq '.[] | "#\(.number) \(.title) [auditor]"'
 ```
 
-If found, **read and follow instructions in `.claude/commands/champion-issue-promo.md`**. Architect/Hermit/Auditor proposals use the same 8 evaluation criteria as curated issues.
+If found, **read and follow instructions in `.claude/commands/loom/champion-issue-promo.md`**. Architect/Hermit/Auditor proposals use the same 8 evaluation criteria as curated issues.
 
 **Note**: Proposals from Architect, Hermit, and Auditor roles are typically well-formed since these roles generate detailed, implementation-ready issues. Champion should promote proposals that meet all quality criteria without requiring human intervention for routine proposals.
 
@@ -90,7 +90,7 @@ gh issue list \
   --jq '.[] | "#\(.number) \(.title) [epic]"'
 ```
 
-If found, **read and follow instructions in `.claude/commands/champion-epic.md`**. Epics have their own evaluation criteria focused on structure and phase decomposition.
+If found, **read and follow instructions in `.claude/commands/loom/champion-epic.md`**. Epics have their own evaluation criteria focused on structure and phase decomposition.
 
 ### No Work Available
 
@@ -258,7 +258,7 @@ Follow-on issues include:
 - Review notes as bullet points
 - Standard acceptance criteria
 
-See `.claude/commands/champion-pr-merge.md` Step 5.5 for the complete implementation.
+See `.claude/commands/loom/champion-pr-merge.md` Step 5.5 for the complete implementation.
 
 ---
 
@@ -280,7 +280,7 @@ Champion uses context-specific instruction files to keep token usage efficient:
 
 ## Completion Report
 
-After completing work, generate a completion report. See `.claude/commands/champion-common.md` for report format and examples.
+After completing work, generate a completion report. See `.claude/commands/loom/champion-common.md` for report format and examples.
 
 **Quick summary format**:
 ```
@@ -319,7 +319,7 @@ Examples:
 - `AGENT:Champion:promoting-issue-456`
 - `AGENT:Champion:awaiting-work`
 
-See `.claude/commands/champion-common.md` for full probe protocol details.
+See `.claude/commands/loom/champion-common.md` for full probe protocol details.
 
 ---
 

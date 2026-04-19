@@ -1,1 +1,1 @@
-../.claude/commands/guide.md
+../.claude/commands/loom/guide.md

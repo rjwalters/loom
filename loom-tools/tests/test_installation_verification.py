@@ -52,7 +52,7 @@ EXPECTED_INSTALLED_DIRS = [
     ".loom/roles",
     ".loom/scripts",
     ".loom/docs",
-    ".claude/commands",
+    ".claude/commands/loom",
 ]
 
 EXPECTED_INSTALLED_FILES = [

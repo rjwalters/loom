@@ -1,1 +1,1 @@
-../.claude/commands/doctor.md
+../.claude/commands/loom/doctor.md

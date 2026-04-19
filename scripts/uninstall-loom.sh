@@ -280,7 +280,11 @@ if [[ -d "$DEFAULTS_PATH" ]]; then
 
     # Check if the file exists in target and add to removal list
     # CLAUDE.md gets smart removal (step 6), not direct removal
+    # .claude/settings.json gets smart removal (selective Loom hook/permission removal)
     if [[ "$target_file" == "CLAUDE.md" ]]; then
+      continue
+    fi
+    if [[ "$target_file" == ".claude/settings.json" ]]; then
       continue
     fi
 
@@ -363,7 +367,7 @@ RUNTIME_DIRS=(
   ".loom/logs"
 )
 
-# 5. Mark CLAUDE.md and .gitignore for smart removal
+# 5. Mark CLAUDE.md, .gitignore, and settings.json for smart removal
 if [[ -f "$TARGET_PATH/CLAUDE.md" ]]; then
   SMART_REMOVE_FILES+=("CLAUDE.md")
 fi
@@ -373,9 +377,14 @@ if [[ -f "$TARGET_PATH/.gitignore" ]]; then
   SMART_REMOVE_FILES+=(".gitignore")
 fi
 
+# .claude/settings.json needs selective Loom hook/permission removal
+if [[ -f "$TARGET_PATH/.claude/settings.json" ]]; then
+  SMART_REMOVE_FILES+=(".claude/settings.json")
+fi
+
 # 6. Detect unknown files in Loom-installed directories
 # Only scan directories that the install process creates — NOT runtime dirs like worktrees/
-LOOM_DIRS=(".loom/roles" ".loom/scripts" ".loom/docs" ".claude/commands" ".claude/agents")
+LOOM_DIRS=(".loom/roles" ".loom/scripts" ".loom/docs" ".claude/commands/loom" ".claude/agents")
 
 # Claimed role name prefixes — any file in .loom/roles/ matching these prefixes
 # is owned by Loom and should be removed during uninstall. This handles deprecated
@@ -442,6 +451,7 @@ REMOVE_DIRS=(
   ".loom/scripts/cli"
   ".loom/docs"
   ".loom"
+  ".claude/commands/loom"
   ".claude/commands"
   ".claude/agents"
   ".claude"
@@ -486,6 +496,9 @@ if [[ ${#SMART_REMOVE_FILES[@]} -gt 0 ]]; then
       .gitignore)
         echo "  - .gitignore (remove Loom-specific patterns only)"
         ;;
+      .claude/settings.json)
+        echo "  - .claude/settings.json (remove Loom hooks and permissions only)"
+        ;;
     esac
   done
   echo ""
@@ -497,12 +510,12 @@ PRESERVED_CUSTOM_FILES=()
 if [[ ${#UNKNOWN_FILES[@]} -gt 0 ]]; then
   if [[ "$CLEAN_MODE" == "true" ]]; then
     # Clean mode: remove unknown files from Loom-OWNED directories only
-    # NEVER remove unknown files from SHARED directories (.claude/commands/, .claude/agents/)
-    # because those may contain custom project-specific commands not installed by Loom
+    # NEVER remove unknown files from SHARED directories (.claude/agents/)
+    # because those may contain custom project-specific agent definitions not installed by Loom
     #
     # Shared directories: directories where both Loom and users put files
-    # Loom-owned directories: directories that Loom fully manages (.loom/*)
-    SHARED_DIR_PREFIXES=(".claude/commands/" ".claude/agents/")
+    # Loom-owned directories: directories that Loom fully manages (.loom/*, .claude/commands/loom/)
+    SHARED_DIR_PREFIXES=(".claude/agents/")
 
     for f in "${UNKNOWN_FILES[@]}"; do
       is_shared=false
@@ -833,6 +846,86 @@ if [[ -f "$WORKTREE_ABS/.gitignore" ]]; then
     fi
   else
     info ".gitignore had no Loom patterns to remove"
+  fi
+fi
+
+# Handle .claude/settings.json - remove only Loom hooks and permissions
+if [[ -f "$WORKTREE_ABS/.claude/settings.json" ]]; then
+  SETTINGS_FILE="$WORKTREE_ABS/.claude/settings.json"
+  LOOM_DEFAULTS_SETTINGS="$LOOM_ROOT/defaults/.claude/settings.json"
+  info "Removing Loom hooks and permissions from .claude/settings.json..."
+
+  if command -v jq &> /dev/null && [[ -f "$LOOM_DEFAULTS_SETTINGS" ]]; then
+    # Use jq to selectively remove Loom hooks (command starts with .loom/hooks/)
+    # and Loom permissions (exact matches from defaults)
+
+    # Build jq filter to remove Loom hooks
+    # Step 1: Remove hooks with .loom/hooks/ command prefix
+    # Step 2: Clean up empty matcher entries and hook types
+    # Step 3: Remove Loom-specific permissions
+    LOOM_PERMS=$(jq -r '.permissions.allow // [] | .[]' "$LOOM_DEFAULTS_SETTINGS" 2>/dev/null)
+
+    # Build the jq permission removal filter
+    PERM_FILTER=""
+    while IFS= read -r perm; do
+      [[ -z "$perm" ]] && continue
+      # Escape special jq characters
+      escaped_perm=$(printf '%s' "$perm" | sed 's/\\/\\\\/g; s/"/\\"/g')
+      if [[ -n "$PERM_FILTER" ]]; then
+        PERM_FILTER="$PERM_FILTER, \"$escaped_perm\""
+      else
+        PERM_FILTER="\"$escaped_perm\""
+      fi
+    done <<< "$LOOM_PERMS"
+
+    # Apply the combined jq transformation
+    jq --arg hook_prefix ".loom/hooks/" "
+      # Remove Loom hooks (commands starting with .loom/hooks/)
+      (if .hooks then
+        .hooks |= with_entries(
+          .value |= map(
+            .hooks |= map(select(.command | startswith(\$hook_prefix) | not))
+          )
+          | .value |= map(select(.hooks | length > 0))
+        )
+        | if (.hooks | to_entries | map(select(.value | length > 0)) | length) == 0
+          then del(.hooks)
+          else .hooks |= with_entries(select(.value | length > 0))
+          end
+      else . end)
+      # Remove Loom permissions
+      | (if .permissions.allow then
+          .permissions.allow |= map(select(. as \$p | [$PERM_FILTER] | index(\$p) | not))
+          | if (.permissions.allow | length) == 0 then del(.permissions.allow) else . end
+          | if .permissions == {} then del(.permissions) else . end
+        else . end)
+    " "$SETTINGS_FILE" > "${SETTINGS_FILE}.tmp" 2>/dev/null
+
+    if [[ $? -eq 0 ]] && [[ -s "${SETTINGS_FILE}.tmp" ]]; then
+      mv "${SETTINGS_FILE}.tmp" "$SETTINGS_FILE"
+
+      # Check if file is now essentially empty (just {})
+      remaining=$(jq 'to_entries | length' "$SETTINGS_FILE" 2>/dev/null || echo "0")
+      if [[ "$remaining" == "0" ]]; then
+        rm -f "$SETTINGS_FILE"
+        REMOVED_LIST+=(".claude/settings.json")
+        success ".claude/settings.json removed (was entirely Loom content)"
+      else
+        REMOVED_LIST+=(".claude/settings.json (Loom hooks/permissions removed)")
+        success ".claude/settings.json Loom hooks and permissions removed, project settings preserved"
+      fi
+    else
+      rm -f "${SETTINGS_FILE}.tmp"
+      warning "Failed to process .claude/settings.json with jq - preserving as-is"
+    fi
+  else
+    if ! command -v jq &> /dev/null; then
+      warning "jq not available - cannot selectively remove Loom hooks from .claude/settings.json"
+      info "To complete removal, manually edit .claude/settings.json and remove hooks with .loom/hooks/ commands"
+    else
+      warning "Loom defaults settings not found - cannot determine which permissions to remove"
+      info "To complete removal, manually edit .claude/settings.json and remove Loom entries"
+    fi
   fi
 fi
 

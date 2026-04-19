@@ -1,1 +1,1 @@
-../.claude/commands/curator.md
+../.claude/commands/loom/curator.md

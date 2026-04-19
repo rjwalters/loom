@@ -131,7 +131,7 @@ your-repo/
 │   ├── config.json      # Terminal configuration
 │   ├── roles/           # Agent role definitions
 │   └── scripts/         # Helper scripts
-├── .claude/commands/    # Slash commands
+├── .claude/commands/loom/  # Slash commands
 ├── .github/labels.yml   # Workflow labels
 └── CLAUDE.md            # AI context document
 ```

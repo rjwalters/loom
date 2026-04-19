@@ -730,7 +730,7 @@ EXPECTED_FILES=(
   ".loom/hooks/skill-router.sh"
   "CLAUDE.md"
   ".github/labels.yml"
-  ".claude/commands"
+  ".claude/commands/loom"
   ".claude/settings.json"
 )
 

@@ -1035,6 +1035,51 @@ If setup fails, it's usually due to:
 - Lacking admin permissions (ask repo owner)
 - GitHub API unreachable (check network/auth)
 
+## Custom Guard Hooks
+
+Loom ships with built-in guard hooks (`guard-destructive.sh` for dangerous Bash commands). You can add project-specific guards to protect read-only directories from accidental edits.
+
+### Protecting Read-Only Directories
+
+Many projects have directories that should never be modified by agents (vendor code, generated files, external SDKs, process design kits). Loom provides a template hook for this.
+
+**Setup**:
+
+1. Copy the template to your hooks directory:
+   ```bash
+   cp defaults/hooks/guard-readonly-dirs.sh.template .loom/hooks/guard-readonly-dirs.sh
+   chmod +x .loom/hooks/guard-readonly-dirs.sh
+   ```
+
+2. Edit `.loom/hooks/guard-readonly-dirs.sh` and add your protected directories:
+   ```bash
+   PROTECTED_DIRS=(
+       "vendor/"
+       "third_party/"
+       "generated/"
+   )
+   ```
+
+3. Register the hook in `.claude/settings.json`:
+   ```json
+   {
+     "hooks": {
+       "PreToolUse": [
+         {
+           "matcher": "Edit|Write",
+           "hooks": [{ "type": "command", "command": ".loom/hooks/guard-readonly-dirs.sh" }]
+         }
+       ]
+     }
+   }
+   ```
+
+**How it works**: The hook intercepts Edit and Write tool calls, resolves the target file path to an absolute path, and checks whether it falls within any of the listed directories (relative to the repository root). If it does, the edit is blocked with a clear error message. The hook follows the same error-handling patterns as `guard-destructive.sh` (ERR trap, jq fallback, never exits non-zero).
+
+**Interaction with other hooks**: This hook uses the `Edit|Write` matcher, while `guard-destructive.sh` uses the `Bash` matcher, so they do not conflict. If `guard-worktree-paths.sh` is also active (same `Edit|Write` matcher), both hooks run in sequence -- if either denies, the action is blocked.
+
+**Template location**: `defaults/hooks/guard-readonly-dirs.sh.template`
+
 ## Troubleshooting
 
 ### Common Issues

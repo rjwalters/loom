@@ -1,1 +1,1 @@
-../.claude/commands/builder.md
+../.claude/commands/loom/builder.md

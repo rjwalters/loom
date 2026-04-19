@@ -1,1 +1,1 @@
-../.claude/commands/architect.md
+../.claude/commands/loom/architect.md

@@ -1,1 +1,1 @@
-../.claude/commands/shepherd-lifecycle.md
+../.claude/commands/loom/shepherd-lifecycle.md
