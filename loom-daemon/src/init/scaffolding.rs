@@ -292,28 +292,43 @@ mod tests {
         // Setup git repo
         fs::create_dir(workspace.join(".git")).unwrap();
 
-        // Create defaults directory with .claude commands
-        fs::create_dir_all(defaults.join(".claude").join("commands")).unwrap();
+        // Create defaults directory with .claude commands in loom/ subdirectory
+        fs::create_dir_all(defaults.join(".claude").join("commands").join("loom")).unwrap();
         fs::write(
-            defaults.join(".claude").join("commands").join("loom.md"),
+            defaults
+                .join(".claude")
+                .join("commands")
+                .join("loom")
+                .join("loom.md"),
             "loom command from defaults",
         )
         .unwrap();
         fs::write(
-            defaults.join(".claude").join("commands").join("builder.md"),
+            defaults
+                .join(".claude")
+                .join("commands")
+                .join("loom")
+                .join("builder.md"),
             "builder command from defaults",
         )
         .unwrap();
 
         // Create existing .claude directory in workspace with custom commands
-        fs::create_dir_all(workspace.join(".claude").join("commands")).unwrap();
+        fs::create_dir_all(workspace.join(".claude").join("commands").join("loom")).unwrap();
         fs::write(
             workspace.join(".claude").join("commands").join("custom.md"),
             "my custom command",
         )
         .unwrap();
-        fs::write(workspace.join(".claude").join("commands").join("loom.md"), "old loom command")
-            .unwrap();
+        fs::write(
+            workspace
+                .join(".claude")
+                .join("commands")
+                .join("loom")
+                .join("loom.md"),
+            "old loom command",
+        )
+        .unwrap();
 
         // Run setup with force=true (force-merge mode)
         let mut report = InitReport::default();
@@ -331,14 +346,21 @@ mod tests {
         assert_eq!(custom_content, "my custom command");
 
         // Verify loom.md was UPDATED with new content (default file)
-        let loom_content =
-            fs::read_to_string(workspace.join(".claude").join("commands").join("loom.md")).unwrap();
+        let loom_content = fs::read_to_string(
+            workspace
+                .join(".claude")
+                .join("commands")
+                .join("loom")
+                .join("loom.md"),
+        )
+        .unwrap();
         assert_eq!(loom_content, "loom command from defaults");
 
         // Verify builder.md was ADDED (new file from defaults)
         assert!(workspace
             .join(".claude")
             .join("commands")
+            .join("loom")
             .join("builder.md")
             .exists());
     }
@@ -352,28 +374,40 @@ mod tests {
         // Setup git repo
         fs::create_dir(workspace.join(".git")).unwrap();
 
-        // Create defaults directory with .claude commands
-        fs::create_dir_all(defaults.join(".claude").join("commands")).unwrap();
+        // Create defaults directory with .claude commands in loom/ subdirectory
+        fs::create_dir_all(defaults.join(".claude").join("commands").join("loom")).unwrap();
         fs::write(
-            defaults.join(".claude").join("commands").join("loom.md"),
+            defaults
+                .join(".claude")
+                .join("commands")
+                .join("loom")
+                .join("loom.md"),
             "loom command from defaults",
         )
         .unwrap();
         fs::write(
-            defaults.join(".claude").join("commands").join("builder.md"),
+            defaults
+                .join(".claude")
+                .join("commands")
+                .join("loom")
+                .join("builder.md"),
             "builder command from defaults",
         )
         .unwrap();
 
         // Create existing .claude directory in workspace with custom commands
-        fs::create_dir_all(workspace.join(".claude").join("commands")).unwrap();
+        fs::create_dir_all(workspace.join(".claude").join("commands").join("loom")).unwrap();
         fs::write(
             workspace.join(".claude").join("commands").join("custom.md"),
             "my custom command",
         )
         .unwrap();
         fs::write(
-            workspace.join(".claude").join("commands").join("loom.md"),
+            workspace
+                .join(".claude")
+                .join("commands")
+                .join("loom")
+                .join("loom.md"),
             "custom loom command",
         )
         .unwrap();
@@ -395,20 +429,28 @@ mod tests {
 
         // Verify loom.md was UPDATED with new content (default file)
         // .claude/ always force-merges on reinstall to propagate command updates
-        let loom_content =
-            fs::read_to_string(workspace.join(".claude").join("commands").join("loom.md")).unwrap();
+        let loom_content = fs::read_to_string(
+            workspace
+                .join(".claude")
+                .join("commands")
+                .join("loom")
+                .join("loom.md"),
+        )
+        .unwrap();
         assert_eq!(loom_content, "loom command from defaults");
 
         // Verify builder.md was added (new file)
         assert!(workspace
             .join(".claude")
             .join("commands")
+            .join("loom")
             .join("builder.md")
             .exists());
         let builder_content = fs::read_to_string(
             workspace
                 .join(".claude")
                 .join("commands")
+                .join("loom")
                 .join("builder.md"),
         )
         .unwrap();

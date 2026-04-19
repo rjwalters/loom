@@ -69,7 +69,7 @@ To create a custom role:
 
 1. Create `.claude/commands/loom/my-role.md` with the full role definition
 2. Optionally create `roles/my-role.json` with metadata
-3. Use it via `/my-role` in CLI or select in Tauri App terminal settings
+3. Use it via `/loom/my-role` in CLI or select in Tauri App terminal settings
 
 ### Role File Structure
 
