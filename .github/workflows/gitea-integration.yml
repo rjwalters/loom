@@ -1,0 +1,70 @@
+name: Gitea Integration Tests
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'loom-tools/src/loom_tools/common/gitea.py'
+      - 'loom-tools/src/loom_tools/common/forge.py'
+      - 'loom-tools/tests/integration/**'
+      - 'tests/integration/**'
+      - '.github/workflows/gitea-integration.yml'
+  pull_request:
+    paths:
+      - 'loom-tools/src/loom_tools/common/gitea.py'
+      - 'loom-tools/src/loom_tools/common/forge.py'
+      - 'loom-tools/tests/integration/**'
+      - 'tests/integration/**'
+      - '.github/workflows/gitea-integration.yml'
+
+concurrency:
+  group: gitea-integration-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  gitea-e2e:
+    name: Gitea E2E Tests
+    runs-on: ubuntu-latest
+    services:
+      gitea:
+        image: gitea/gitea:1.22
+        ports:
+          - 3000:3000
+        env:
+          GITEA__security__INSTALL_LOCK: "true"
+          GITEA__server__ROOT_URL: http://localhost:3000
+          GITEA__database__DB_TYPE: sqlite3
+          GITEA__service__DISABLE_REGISTRATION: "false"
+        options: >-
+          --health-cmd "curl -sf http://localhost:3000/api/v1/version"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 20
+          --health-start-period 10s
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          cd loom-tools
+          pip install -e ".[dev]" 2>/dev/null || pip install -e .
+          pip install pytest requests
+
+      - name: Bootstrap Gitea
+        run: ./tests/integration/setup-gitea.sh
+
+      - name: Run integration tests
+        env:
+          GITEA_URL: http://localhost:3000
+          GITEA_TOKEN_FILE: tests/integration/.gitea-token
+        run: |
+          export GITEA_TOKEN=$(cat tests/integration/.gitea-token)
+          export GITEA_REPO=loom-test/test-repo
+          cd loom-tools
+          python -m pytest tests/integration/ -v --tb=short

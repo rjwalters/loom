@@ -1,0 +1,23 @@
+# Gitea integration test environment
+# Usage: docker compose up -d && ./setup-gitea.sh && cd ../../loom-tools && pytest tests/integration/ -v
+services:
+  gitea:
+    image: gitea/gitea:1.22
+    ports:
+      - "3000:3000"
+    environment:
+      - GITEA__security__INSTALL_LOCK=true
+      - GITEA__server__ROOT_URL=http://localhost:3000
+      - GITEA__database__DB_TYPE=sqlite3
+      - GITEA__service__DISABLE_REGISTRATION=false
+    volumes:
+      - gitea-data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:3000/api/v1/version"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 10s
+
+volumes:
+  gitea-data:
