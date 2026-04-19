@@ -1065,8 +1065,7 @@ impl TerminalManager {
         // Skip restore when LOOM_NO_RESTORE=1 is set (used in tests to prevent
         // cross-test-binary contamination via shared tmux server)
         let no_restore = std::env::var("LOOM_NO_RESTORE")
-            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-            .unwrap_or(false);
+            .is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"));
 
         if self.terminals.is_empty() && !no_restore {
             log::debug!("Registry empty, attempting to restore from tmux");
