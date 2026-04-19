@@ -78,6 +78,9 @@ Thumbs.db
 # - settings.json: Team-wide permissions (DO commit)
 # - settings.local.json: Personal preferences (gitignored)
 .claude/settings.local.json
+
+# Skill routing local overrides (untracked, user-specific)
+.loom/config/skill-routes.local.json
 .loom/*.log
 .loom/*.sock
 .loom/logs/
