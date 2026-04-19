@@ -886,7 +886,7 @@ class TestBatchOperations:
             result = forge.find_pull_request_for_issue(42)
         assert result == 50
 
-    def test_find_pr_by_body(self) -> None:
+    def test_find_pr_by_body_closes(self) -> None:
         forge = _make_forge()
         # First call returns no match for branch, second returns all PRs
         no_match_prs = [
@@ -904,6 +904,70 @@ class TestBatchOperations:
         ]):
             result = forge.find_pull_request_for_issue(42)
         assert result == 60
+
+    def test_find_pr_by_body_fixes(self) -> None:
+        """find_pull_request_for_issue matches 'Fixes #N' in PR body."""
+        forge = _make_forge()
+        no_match = []  # no branch match
+        all_prs = [
+            {"number": 70, "state": "open", "title": "Fix", "html_url": "u",
+             "labels": [], "head": {"ref": "hotfix"}, "merged": False,
+             "body": "Fixes #42"},
+        ]
+        with mock.patch.object(forge._session, "request", side_effect=[
+            _mock_response(json_data=no_match),
+            _mock_response(json_data=all_prs),
+        ]):
+            result = forge.find_pull_request_for_issue(42)
+        assert result == 70
+
+    def test_find_pr_by_body_resolves(self) -> None:
+        """find_pull_request_for_issue matches 'Resolves #N' in PR body."""
+        forge = _make_forge()
+        no_match = []
+        all_prs = [
+            {"number": 80, "state": "open", "title": "Resolve", "html_url": "u",
+             "labels": [], "head": {"ref": "fix-it"}, "merged": False,
+             "body": "Resolves #42 with a proper fix"},
+        ]
+        with mock.patch.object(forge._session, "request", side_effect=[
+            _mock_response(json_data=no_match),
+            _mock_response(json_data=all_prs),
+        ]):
+            result = forge.find_pull_request_for_issue(42)
+        assert result == 80
+
+    def test_find_pr_by_body_case_insensitive(self) -> None:
+        """find_pull_request_for_issue matches closing keywords case-insensitively."""
+        forge = _make_forge()
+        no_match = []
+        all_prs = [
+            {"number": 90, "state": "open", "title": "Fix", "html_url": "u",
+             "labels": [], "head": {"ref": "fix-branch"}, "merged": False,
+             "body": "fixes #42"},
+        ]
+        with mock.patch.object(forge._session, "request", side_effect=[
+            _mock_response(json_data=no_match),
+            _mock_response(json_data=all_prs),
+        ]):
+            result = forge.find_pull_request_for_issue(42)
+        assert result == 90
+
+    def test_find_pr_no_false_positive_on_partial_number(self) -> None:
+        """find_pull_request_for_issue does not match 'Closes #421' for issue 42."""
+        forge = _make_forge()
+        no_match = []
+        all_prs = [
+            {"number": 100, "state": "open", "title": "Other", "html_url": "u",
+             "labels": [], "head": {"ref": "other"}, "merged": False,
+             "body": "Closes #421"},
+        ]
+        with mock.patch.object(forge._session, "request", side_effect=[
+            _mock_response(json_data=no_match),
+            _mock_response(json_data=all_prs),
+        ]):
+            result = forge.find_pull_request_for_issue(42)
+        assert result is None
 
 
 # ===========================================================================
@@ -951,6 +1015,182 @@ class TestErrorHandling:
             assert forge.get_issue(42) is None
             assert forge.list_issues() == []
             assert forge.get_pull_request(10) is None
+
+    def test_403_includes_scope_hint(self) -> None:
+        """403 error message includes token scope guidance."""
+        forge = _make_forge()
+        with (
+            mock.patch.object(forge._session, "request", return_value=_mock_response(403)),
+            mock.patch("loom_tools.common.gitea.logger") as mock_logger,
+        ):
+            forge.get_issue(42)
+        error_msg = mock_logger.error.call_args[0][0] % mock_logger.error.call_args[0][1:]
+        assert "scope" in error_msg.lower() or "permission" in error_msg.lower()
+
+    def test_401_includes_token_validity_hint(self) -> None:
+        """401 error message includes token validity guidance."""
+        forge = _make_forge()
+        with (
+            mock.patch.object(forge._session, "request", return_value=_mock_response(401)),
+            mock.patch("loom_tools.common.gitea.logger") as mock_logger,
+        ):
+            forge.get_issue(42)
+        error_msg = mock_logger.error.call_args[0][0] % mock_logger.error.call_args[0][1:]
+        assert "valid" in error_msg.lower() or "expired" in error_msg.lower()
+
+
+# ===========================================================================
+# Rate limiting
+# ===========================================================================
+
+
+class TestRateLimiting:
+    """Tests for HTTP 429 retry with backoff."""
+
+    def test_retries_on_429_then_succeeds(self) -> None:
+        """429 is retried and succeeds on the second attempt."""
+        forge = _make_forge()
+        rate_limit_resp = _mock_response(429)
+        rate_limit_resp.headers = {}
+        success_resp = _mock_response(json_data={"number": 1, "state": "open", "title": "A", "html_url": "u", "labels": []})
+
+        with (
+            mock.patch.object(forge._session, "request", side_effect=[rate_limit_resp, success_resp]),
+            mock.patch("loom_tools.common.gitea.time.sleep") as mock_sleep,
+            mock.patch("loom_tools.common.gitea.logger"),
+        ):
+            result = forge.get_issue(1)
+
+        assert result is not None
+        assert result.number == 1
+        mock_sleep.assert_called_once()
+
+    def test_respects_retry_after_header(self) -> None:
+        """Uses Retry-After header when present."""
+        forge = _make_forge()
+        rate_limit_resp = _mock_response(429)
+        rate_limit_resp.headers = {"Retry-After": "5"}
+        success_resp = _mock_response(json_data={"number": 1, "state": "open", "title": "A", "html_url": "u", "labels": []})
+
+        with (
+            mock.patch.object(forge._session, "request", side_effect=[rate_limit_resp, success_resp]),
+            mock.patch("loom_tools.common.gitea.time.sleep") as mock_sleep,
+            mock.patch("loom_tools.common.gitea.logger"),
+        ):
+            forge.get_issue(1)
+
+        mock_sleep.assert_called_once_with(5.0)
+
+    def test_exhausts_retries_on_persistent_429(self) -> None:
+        """Returns None after exhausting all retries."""
+        forge = _make_forge()
+        rate_limit_resp = _mock_response(429)
+        rate_limit_resp.headers = {}
+
+        with (
+            mock.patch.object(forge._session, "request", return_value=rate_limit_resp),
+            mock.patch("loom_tools.common.gitea.time.sleep"),
+            mock.patch("loom_tools.common.gitea.logger") as mock_logger,
+        ):
+            result = forge.get_issue(1)
+
+        assert result is None
+        mock_logger.error.assert_called()
+        assert "exhausted" in mock_logger.error.call_args[0][0].lower()
+
+    def test_exponential_backoff(self) -> None:
+        """Backoff doubles on each retry."""
+        forge = _make_forge()
+        rate_limit_resp = _mock_response(429)
+        rate_limit_resp.headers = {}
+        success_resp = _mock_response(json_data={"number": 1, "state": "open", "title": "A", "html_url": "u", "labels": []})
+
+        # 3 rate limits then success (4 total attempts = max retries + 1)
+        with (
+            mock.patch.object(forge._session, "request", side_effect=[
+                rate_limit_resp, rate_limit_resp, rate_limit_resp, success_resp,
+            ]),
+            mock.patch("loom_tools.common.gitea.time.sleep") as mock_sleep,
+            mock.patch("loom_tools.common.gitea.logger"),
+        ):
+            result = forge.get_issue(1)
+
+        assert result is not None
+        # Backoff: 1.0, 2.0, 4.0
+        sleep_calls = [call[0][0] for call in mock_sleep.call_args_list]
+        assert sleep_calls == [1.0, 2.0, 4.0]
+
+
+# ===========================================================================
+# Pagination
+# ===========================================================================
+
+
+class TestPagination:
+    """Tests for paginated list methods."""
+
+    def test_list_issues_paginates(self) -> None:
+        """list_issues fetches multiple pages until a short page."""
+        forge = _make_forge()
+        # Page 1: full page of 50, page 2: partial page of 10
+        page1 = [
+            {"number": i, "state": "open", "title": f"Issue {i}", "html_url": f"u{i}", "labels": []}
+            for i in range(1, 51)
+        ]
+        page2 = [
+            {"number": i, "state": "open", "title": f"Issue {i}", "html_url": f"u{i}", "labels": []}
+            for i in range(51, 61)
+        ]
+        with mock.patch.object(forge._session, "request", side_effect=[
+            _mock_response(json_data=page1),
+            _mock_response(json_data=page2),
+        ]):
+            result = forge.list_issues()
+        assert len(result) == 60
+
+    def test_list_issues_respects_limit(self) -> None:
+        """list_issues stops after limit items."""
+        forge = _make_forge()
+        page1 = [
+            {"number": i, "state": "open", "title": f"Issue {i}", "html_url": f"u{i}", "labels": []}
+            for i in range(1, 11)
+        ]
+        with mock.patch.object(forge._session, "request", return_value=_mock_response(json_data=page1)):
+            result = forge.list_issues(limit=5)
+        assert len(result) == 5
+
+    def test_list_prs_paginates(self) -> None:
+        """list_pull_requests fetches multiple pages."""
+        forge = _make_forge()
+        page1 = [
+            {"number": i, "state": "open", "title": f"PR {i}", "html_url": f"u{i}",
+             "labels": [], "head": {"ref": f"branch-{i}"}, "merged": False}
+            for i in range(1, 51)
+        ]
+        page2 = [
+            {"number": 51, "state": "open", "title": "PR 51", "html_url": "u51",
+             "labels": [], "head": {"ref": "branch-51"}, "merged": False},
+        ]
+        with mock.patch.object(forge._session, "request", side_effect=[
+            _mock_response(json_data=page1),
+            _mock_response(json_data=page2),
+        ]):
+            result = forge.list_pull_requests()
+        assert len(result) == 51
+
+    def test_label_cache_paginates(self) -> None:
+        """Label cache fetches all labels across pages."""
+        forge = _make_forge()
+        page1 = [{"name": f"label-{i}", "id": i} for i in range(1, 51)]
+        page2 = [{"name": f"label-{i}", "id": i} for i in range(51, 61)]
+        with mock.patch.object(forge._session, "request", side_effect=[
+            _mock_response(json_data=page1),
+            _mock_response(json_data=page2),
+        ]):
+            forge._populate_label_cache()
+        assert forge._label_cache is not None
+        assert len(forge._label_cache) == 60
+        assert "label-55" in forge._label_cache
 
 
 # ===========================================================================

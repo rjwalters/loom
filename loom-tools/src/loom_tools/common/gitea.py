@@ -15,6 +15,7 @@ import logging
 import os
 import re
 import subprocess
+import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any, Sequence
@@ -33,6 +34,13 @@ logger = logging.getLogger(__name__)
 
 # Default request timeout in seconds
 _DEFAULT_TIMEOUT = 30
+
+# Rate limit retry configuration
+_RATE_LIMIT_MAX_RETRIES = 3
+_RATE_LIMIT_INITIAL_BACKOFF = 1.0  # seconds
+
+# Default page size for paginated requests
+_DEFAULT_PAGE_LIMIT = 50
 
 
 class GiteaForge:
@@ -101,25 +109,67 @@ class GiteaForge:
 
         Returns the ``Response`` on success (2xx), or ``None`` on failure.
         Logs appropriate messages for auth failures, network errors, etc.
+
+        Retries with exponential backoff on HTTP 429 (rate limited).
         """
         url = self._api_url(path)
-        try:
-            resp = self._session.request(
-                method, url, json=json, params=params,
-                timeout=_DEFAULT_TIMEOUT,
-            )
-        except requests.ConnectionError:
-            logger.error("Connection error reaching Gitea at %s", url)
-            return None
-        except requests.Timeout:
-            logger.error("Request timed out: %s %s", method, url)
-            return None
+        backoff = _RATE_LIMIT_INITIAL_BACKOFF
+
+        for attempt in range(_RATE_LIMIT_MAX_RETRIES + 1):
+            try:
+                resp = self._session.request(
+                    method, url, json=json, params=params,
+                    timeout=_DEFAULT_TIMEOUT,
+                )
+            except requests.ConnectionError:
+                logger.error("Connection error reaching Gitea at %s", url)
+                return None
+            except requests.Timeout:
+                logger.error("Request timed out: %s %s", method, url)
+                return None
+
+            # Handle rate limiting with retry + exponential backoff
+            if resp.status_code == 429:
+                if attempt < _RATE_LIMIT_MAX_RETRIES:
+                    # Use Retry-After header if present, otherwise use backoff
+                    retry_after = resp.headers.get("Retry-After")
+                    if retry_after:
+                        try:
+                            wait = float(retry_after)
+                        except (ValueError, TypeError):
+                            wait = backoff
+                    else:
+                        wait = backoff
+                    logger.warning(
+                        "Gitea rate limited (429) for %s %s, "
+                        "retrying in %.1fs (attempt %d/%d)",
+                        method, url, wait, attempt + 1, _RATE_LIMIT_MAX_RETRIES,
+                    )
+                    time.sleep(wait)
+                    backoff *= 2  # exponential backoff
+                    continue
+                else:
+                    logger.error(
+                        "Gitea rate limited (429) for %s %s, "
+                        "exhausted all %d retries",
+                        method, url, _RATE_LIMIT_MAX_RETRIES,
+                    )
+                    return None
+
+            # Not rate limited, break out of retry loop
+            break
 
         if resp.status_code in (401, 403):
+            scope_hint = (
+                " Ensure the token has 'repo' scope (or fine-grained "
+                "read/write permissions for issues, PRs, and labels)."
+                if resp.status_code == 403
+                else " Verify the token is valid and has not expired."
+            )
             logger.error(
                 "Gitea auth failed (%d) for %s %s. "
-                "Check GITEA_TOKEN env var or forge.gitea.token config.",
-                resp.status_code, method, url,
+                "Check GITEA_TOKEN env var or forge.gitea.token config.%s",
+                resp.status_code, method, url, scope_hint,
             )
             return None
 
@@ -139,6 +189,61 @@ class GiteaForge:
 
         return resp
 
+    def _request_paginated(
+        self,
+        method: str,
+        path: str,
+        *,
+        params: dict[str, Any] | None = None,
+        limit: int | None = None,
+    ) -> list[dict[str, Any]]:
+        """Make paginated API requests, collecting all pages.
+
+        Loops through pages until no more results or ``limit`` is reached.
+        Returns the combined list of JSON objects from all pages.
+
+        If ``limit`` is provided, stops after collecting that many items
+        (uses it as the per-page size too for efficiency).
+        """
+        all_items: list[dict[str, Any]] = []
+        page = 1
+        per_page = min(limit, _DEFAULT_PAGE_LIMIT) if limit else _DEFAULT_PAGE_LIMIT
+
+        effective_params = dict(params or {})
+
+        while True:
+            effective_params["page"] = page
+            effective_params["limit"] = per_page
+
+            resp = self._request(method, path, params=effective_params)
+            if resp is None:
+                break
+
+            try:
+                items = resp.json()
+            except ValueError:
+                break
+
+            if not isinstance(items, list):
+                break
+
+            all_items.extend(
+                item for item in items if isinstance(item, dict)
+            )
+
+            # If caller specified a limit and we have enough, stop
+            if limit is not None and len(all_items) >= limit:
+                all_items = all_items[:limit]
+                break
+
+            # If we got fewer items than per_page, we've reached the last page
+            if len(items) < per_page:
+                break
+
+            page += 1
+
+        return all_items
+
     def _repo_path(self) -> str | None:
         """Return ``repos/{owner}/{repo}`` prefix, or None."""
         nwo = self.get_repo_nwo()
@@ -151,26 +256,16 @@ class GiteaForge:
     # ------------------------------------------------------------------
 
     def _populate_label_cache(self) -> None:
-        """Fetch all repository labels and populate the name→ID cache."""
+        """Fetch all repository labels and populate the name→ID cache.
+
+        Uses pagination to fetch all labels (not just the first page).
+        """
         rp = self._repo_path()
         if not rp:
             self._label_cache = {}
             return
 
-        resp = self._request("GET", f"{rp}/labels", params={"limit": 50})
-        if resp is None:
-            self._label_cache = {}
-            return
-
-        try:
-            labels = resp.json()
-        except ValueError:
-            self._label_cache = {}
-            return
-
-        if not isinstance(labels, list):
-            self._label_cache = {}
-            return
+        labels = self._request_paginated("GET", f"{rp}/labels")
 
         self._label_cache = {
             label["name"]: label["id"]
@@ -313,7 +408,11 @@ class GiteaForge:
         state: str = "open",
         limit: int | None = None,
     ) -> list[ForgeIssue]:
-        """List issues matching the given filters."""
+        """List issues matching the given filters.
+
+        Uses pagination to fetch all matching issues (not just the first
+        page of 50). Pass ``limit`` to cap the total number of results.
+        """
         rp = self._repo_path()
         if not rp:
             return []
@@ -323,18 +422,11 @@ class GiteaForge:
         }
         if labels:
             params["labels"] = ",".join(labels)
-        if limit is not None:
-            params["limit"] = limit
-        resp = self._request("GET", f"{rp}/issues", params=params)
-        if resp is None:
-            return []
-        try:
-            items = resp.json()
-        except ValueError:
-            return []
-        if not isinstance(items, list):
-            return []
-        return [self._to_forge_issue(d) for d in items if isinstance(d, dict)]
+
+        items = self._request_paginated(
+            "GET", f"{rp}/issues", params=params, limit=limit,
+        )
+        return [self._to_forge_issue(d) for d in items]
 
     def create_issue(
         self,
@@ -409,7 +501,11 @@ class GiteaForge:
         search: str | None = None,
         limit: int | None = None,
     ) -> list[ForgePullRequest]:
-        """List pull requests matching the given filters."""
+        """List pull requests matching the given filters.
+
+        Uses pagination to fetch all matching PRs (not just the first
+        page of 50). Pass ``limit`` to cap the total number of results.
+        """
         if search:
             logger.warning(
                 "Gitea does not support 'search' parameter for pull request listing; "
@@ -422,19 +518,12 @@ class GiteaForge:
         params: dict[str, Any] = {"state": state}
         if labels:
             params["labels"] = ",".join(labels)
-        if limit is not None:
-            params["limit"] = limit
-        resp = self._request("GET", f"{rp}/pulls", params=params)
-        if resp is None:
-            return []
-        try:
-            items = resp.json()
-        except ValueError:
-            return []
-        if not isinstance(items, list):
-            return []
 
-        prs = [self._to_forge_pr(d) for d in items if isinstance(d, dict)]
+        items = self._request_paginated(
+            "GET", f"{rp}/pulls", params=params, limit=limit,
+        )
+
+        prs = [self._to_forge_pr(d) for d in items]
 
         # Client-side head branch filtering (Gitea API doesn't support it natively)
         if head:
@@ -923,13 +1012,17 @@ class GiteaForge:
 
         return results
 
+    # Patterns that indicate a PR closes an issue (case-insensitive)
+    _CLOSING_KEYWORDS = ("Closes", "Fixes", "Resolves")
+
     def find_pull_request_for_issue(
         self, issue: int, state: str = "open",
     ) -> int | None:
         """Find a PR associated with a given issue.
 
         Searches by branch naming convention first, then falls back to
-        body content matching.
+        body content matching for closing keywords (Closes, Fixes,
+        Resolves).
         """
         # Try branch naming convention
         prs = self.list_pull_requests(
@@ -938,10 +1031,15 @@ class GiteaForge:
         if prs:
             return prs[0].number
 
-        # Fall back: list PRs and search body for closing reference
-        all_prs = self.list_pull_requests(state=state, limit=50)
+        # Fall back: list all PRs and search body for closing references.
+        # Uses pagination (no silent truncation at 50).
+        all_prs = self.list_pull_requests(state=state)
+        closing_pattern = re.compile(
+            rf"(?:{'|'.join(self._CLOSING_KEYWORDS)})\s+#{issue}\b",
+            re.IGNORECASE,
+        )
         for pr in all_prs:
-            if pr.body and f"Closes #{issue}" in pr.body:
+            if pr.body and closing_pattern.search(pr.body):
                 return pr.number
 
         return None
