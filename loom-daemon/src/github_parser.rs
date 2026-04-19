@@ -1,11 +1,14 @@
-//! GitHub CLI output parser for detecting GitHub events from terminal output.
+//! Forge CLI output parser for detecting forge events from terminal output.
 //!
-//! This module parses terminal output to detect when agents interact with GitHub
-//! through the `gh` CLI, capturing:
+//! This module parses terminal output to detect when agents interact with a forge
+//! (GitHub, Gitea, etc.) through CLI tools, capturing:
 //! - Issue creation/closing
 //! - PR creation/merging/closing
 //! - Label changes
 //! - Review submissions
+//!
+//! The URL matching is parameterized by forge host, allowing the same parser to
+//! work with GitHub (`github.com`), Gitea, and other forge instances.
 //!
 //! # Example
 //!
@@ -13,8 +16,8 @@
 //! use github_parser::parse_github_events;
 //!
 //! let output = "Creating pull request for feature/issue-42 into main...\nhttps://github.com/owner/repo/pull/123";
-//! let events = parse_github_events(output);
-//! // Returns: [GitHubEvent { event_type: PrCreated, pr_number: Some(123), ... }]
+//! let events = parse_github_events(output, "github.com");
+//! // Returns: [ParsedGitHubEvent { event_type: PrCreated, pr_number: Some(123), ... }]
 //! ```
 
 use crate::activity::{PromptGitHubEvent, PromptGitHubEventType};
@@ -64,22 +67,29 @@ impl ParsedGitHubEvent {
     }
 }
 
-/// Parse terminal output for GitHub CLI events
+/// Parse terminal output for forge CLI events
 ///
-/// Detects patterns from `gh` CLI output such as:
-/// - `https://github.com/owner/repo/issues/123` (issue created)
-/// - `https://github.com/owner/repo/pull/456` (PR created)
+/// Detects patterns from CLI output such as:
+/// - `https://{forge_host}/owner/repo/issues/123` (issue created)
+/// - `https://{forge_host}/owner/repo/pull/456` (PR created, GitHub)
+/// - `https://{forge_host}/owner/repo/pulls/456` (PR created, Gitea)
 /// - `Merged pull request #789`
 /// - `Closed issue #123`
 /// - Label change patterns
+///
+/// The `forge_host` parameter specifies which hostname to match in URLs
+/// (e.g., `"github.com"`, `"gitea.example.com"`).
 #[allow(clippy::too_many_lines)]
-pub fn parse_github_events(output: &str) -> Vec<ParsedGitHubEvent> {
+pub fn parse_github_events(output: &str, forge_host: &str) -> Vec<ParsedGitHubEvent> {
     let mut events = Vec::new();
 
-    // Pattern: Issue/PR URL from gh create commands
-    // Matches: https://github.com/owner/repo/issues/123
-    // Matches: https://github.com/owner/repo/pull/456
-    if let Ok(url_re) = Regex::new(r"https://github\.com/[^/]+/[^/]+/(issues|pull)/(\d+)") {
+    // Pattern: Issue/PR URL from forge CLI create commands
+    // Matches: https://{forge_host}/owner/repo/issues/123
+    // Matches: https://{forge_host}/owner/repo/pull/456  (GitHub)
+    // Matches: https://{forge_host}/owner/repo/pulls/456 (Gitea)
+    let escaped_host = regex::escape(forge_host);
+    let url_pattern = format!(r"https://{}/[^/]+/[^/]+/(issues|pulls?)/(\d+)", escaped_host);
+    if let Ok(url_re) = Regex::new(&url_pattern) {
         for cap in url_re.captures_iter(output) {
             if let (Some(type_match), Some(number_match)) = (cap.get(1), cap.get(2)) {
                 if let Ok(number) = number_match.as_str().parse::<i32>() {
@@ -91,7 +101,7 @@ pub fn parse_github_events(output: &str) -> Vec<ParsedGitHubEvent> {
                             labels_added: Vec::new(),
                             labels_removed: Vec::new(),
                         },
-                        "pull" => ParsedGitHubEvent {
+                        "pull" | "pulls" => ParsedGitHubEvent {
                             event_type: PromptGitHubEventType::PrCreated,
                             issue_number: None,
                             pr_number: Some(number),
@@ -277,10 +287,13 @@ fn extract_issue_pr_from_context(output: &str) -> (Option<i32>, Option<i32>) {
 mod tests {
     use super::*;
 
+    const GITHUB_HOST: &str = "github.com";
+    const GITEA_HOST: &str = "gitea.example.com";
+
     #[test]
     fn test_parse_issue_created() {
         let output = "Creating issue...\nhttps://github.com/owner/repo/issues/42";
-        let events = parse_github_events(output);
+        let events = parse_github_events(output, GITHUB_HOST);
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].event_type, PromptGitHubEventType::IssueCreated);
         assert_eq!(events[0].issue_number, Some(42));
@@ -289,7 +302,7 @@ mod tests {
     #[test]
     fn test_parse_pr_created() {
         let output = "Creating pull request for feature/test into main in owner/repo\n\nhttps://github.com/owner/repo/pull/123";
-        let events = parse_github_events(output);
+        let events = parse_github_events(output, GITHUB_HOST);
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].event_type, PromptGitHubEventType::PrCreated);
         assert_eq!(events[0].pr_number, Some(123));
@@ -298,7 +311,7 @@ mod tests {
     #[test]
     fn test_parse_pr_merged() {
         let output = "Merged pull request #456 (squash)";
-        let events = parse_github_events(output);
+        let events = parse_github_events(output, GITHUB_HOST);
         assert!(!events.is_empty());
         let merge_event = events
             .iter()
@@ -312,7 +325,7 @@ mod tests {
     #[test]
     fn test_parse_issue_closed() {
         let output = "Closed issue #789";
-        let events = parse_github_events(output);
+        let events = parse_github_events(output, GITHUB_HOST);
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].event_type, PromptGitHubEventType::IssueClosed);
         assert_eq!(events[0].issue_number, Some(789));
@@ -321,7 +334,7 @@ mod tests {
     #[test]
     fn test_parse_label_added() {
         let output = "gh issue edit 42 --add-label \"loom:building\"";
-        let events = parse_github_events(output);
+        let events = parse_github_events(output, GITHUB_HOST);
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].event_type, PromptGitHubEventType::LabelAdded);
         assert_eq!(events[0].labels_added, vec!["loom:building"]);
@@ -331,7 +344,7 @@ mod tests {
     #[test]
     fn test_parse_label_removed() {
         let output = "gh issue edit 42 --remove-label loom:issue";
-        let events = parse_github_events(output);
+        let events = parse_github_events(output, GITHUB_HOST);
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].event_type, PromptGitHubEventType::LabelRemoved);
         assert_eq!(events[0].labels_removed, vec!["loom:issue"]);
@@ -340,7 +353,7 @@ mod tests {
     #[test]
     fn test_parse_review_approved() {
         let output = "Approved pull request #123";
-        let events = parse_github_events(output);
+        let events = parse_github_events(output, GITHUB_HOST);
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].event_type, PromptGitHubEventType::ReviewSubmitted);
         assert_eq!(events[0].pr_number, Some(123));
@@ -349,7 +362,7 @@ mod tests {
     #[test]
     fn test_parse_multiple_events() {
         let output = "gh issue edit 42 --remove-label loom:issue --add-label loom:building";
-        let events = parse_github_events(output);
+        let events = parse_github_events(output, GITHUB_HOST);
         assert_eq!(events.len(), 2);
 
         let remove_event = events
@@ -372,7 +385,7 @@ mod tests {
     #[test]
     fn test_no_false_positives() {
         let output = "Compiling loom-daemon v0.1.0\nFinished release target";
-        let events = parse_github_events(output);
+        let events = parse_github_events(output, GITHUB_HOST);
         assert!(events.is_empty());
     }
 
@@ -391,5 +404,52 @@ mod tests {
         assert_eq!(event.issue_number, Some(42));
         assert_eq!(event.label_after, Some(vec!["loom:building".to_string()]));
         assert!(event.label_before.is_none());
+    }
+
+    // --- Gitea-specific tests ---
+
+    #[test]
+    fn test_gitea_issue_created() {
+        let output = "Creating issue...\nhttps://gitea.example.com/owner/repo/issues/42";
+        let events = parse_github_events(output, GITEA_HOST);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event_type, PromptGitHubEventType::IssueCreated);
+        assert_eq!(events[0].issue_number, Some(42));
+    }
+
+    #[test]
+    fn test_gitea_pr_created_with_pulls_path() {
+        // Gitea uses /pulls/ instead of /pull/
+        let output = "Creating pull request...\nhttps://gitea.example.com/owner/repo/pulls/99";
+        let events = parse_github_events(output, GITEA_HOST);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event_type, PromptGitHubEventType::PrCreated);
+        assert_eq!(events[0].pr_number, Some(99));
+    }
+
+    #[test]
+    fn test_github_url_not_matched_with_gitea_host() {
+        // When configured for Gitea, GitHub URLs should not match
+        let output = "https://github.com/owner/repo/pull/123";
+        let events = parse_github_events(output, GITEA_HOST);
+        assert!(events.is_empty(), "GitHub URL should not match when forge_host is set to Gitea");
+    }
+
+    #[test]
+    fn test_gitea_url_not_matched_with_github_host() {
+        // When configured for GitHub, Gitea URLs should not match
+        let output = "https://gitea.example.com/owner/repo/pulls/42";
+        let events = parse_github_events(output, GITHUB_HOST);
+        assert!(events.is_empty(), "Gitea URL should not match when forge_host is set to GitHub");
+    }
+
+    #[test]
+    fn test_github_pull_path_still_works() {
+        // GitHub's /pull/ path should still work (not just /pulls/)
+        let output = "https://github.com/owner/repo/pull/456";
+        let events = parse_github_events(output, GITHUB_HOST);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event_type, PromptGitHubEventType::PrCreated);
+        assert_eq!(events[0].pr_number, Some(456));
     }
 }

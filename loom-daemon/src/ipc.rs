@@ -257,8 +257,10 @@ fn handle_request(
                                 log::warn!("Failed to record output to activity database: {e}");
                             }
 
-                            // Parse terminal output for GitHub events and record them
-                            let github_events = parse_github_events(&output_str);
+                            // Parse terminal output for forge events and record them
+                            // TODO: Read forge_host from configuration once #3135 lands
+                            let forge_host = "github.com";
+                            let github_events = parse_github_events(&output_str, forge_host);
                             for parsed_event in github_events {
                                 let prompt_event = parsed_event.to_prompt_github_event(None);
                                 if let Err(e) = db.record_prompt_github_event(&prompt_event) {
