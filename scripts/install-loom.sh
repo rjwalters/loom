@@ -663,6 +663,25 @@ else
 fi
 echo ""
 
+# Copy default config files (skill-routes.json template, etc.)
+info "Installing default config files..."
+if [[ -d "$LOOM_ROOT/defaults/config" ]]; then
+  mkdir -p .loom/config
+  for config_file in "$LOOM_ROOT/defaults/config/"*.json; do
+    [[ -f "$config_file" ]] || continue
+    config_name=$(basename "$config_file")
+    if [[ -f ".loom/config/$config_name" ]] && [[ "$FORCE_OVERWRITE" != "true" ]] && [[ "$CLEAN_FIRST" != "true" ]]; then
+      info "Skipping existing config: $config_name (use --force to overwrite)"
+    else
+      cp "$config_file" ".loom/config/$config_name"
+      success "Installed config: $config_name"
+    fi
+  done
+else
+  info "No config directory found in defaults (skipping)"
+fi
+echo ""
+
 # Set up Python tools (loom-tools package)
 # This creates a virtual environment in loom-tools/.venv and installs loom-shepherd, etc.
 info "Setting up Python tools..."
@@ -708,6 +727,7 @@ EXPECTED_FILES=(
   ".loom/scripts/worktree.sh"
   ".loom/scripts/lib/loom-tools.sh"
   ".loom/hooks/guard-destructive.sh"
+  ".loom/hooks/skill-router.sh"
   "CLAUDE.md"
   ".github/labels.yml"
   ".claude/commands/loom"
@@ -1076,4 +1096,3 @@ esac
 echo ""
 
 info "See CLAUDE.md in the target repository for complete usage details."
-echo ""

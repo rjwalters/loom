@@ -19,6 +19,17 @@
           }
         ]
       }
+    ],
+    "UserPromptSubmit": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash -c 'ROOT=$(cd \"$(git rev-parse --git-common-dir 2>/dev/null)/..\" 2>/dev/null && pwd) && [ -x \"$ROOT/.loom/hooks/skill-router.sh\" ] && exec \"$ROOT/.loom/hooks/skill-router.sh\" || exit 0'"
+          }
+        ]
+      }
     ]
   },
   "permissions": {
