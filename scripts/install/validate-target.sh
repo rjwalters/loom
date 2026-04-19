@@ -95,7 +95,8 @@ elif [[ "$FORGE_TYPE" == "gitea" ]]; then
   success "Gitea API access verified"
 fi
 
-success "${FORGE_TYPE^} repository: $REPO_NAME"
+FORGE_TYPE_DISPLAY=$(printf '%s' "$FORGE_TYPE" | awk '{print toupper(substr($0,1,1)) tolower(substr($0,2))}')
+success "$FORGE_TYPE_DISPLAY repository: $REPO_NAME"
 
 # Check git status - warn if dirty
 if [[ -n "$(git status --porcelain)" ]]; then
