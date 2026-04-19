@@ -2,17 +2,29 @@
 
 from __future__ import annotations
 
-import json
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
+from loom_tools.common.forge import ForgeIssue, ForgePullRequest
 from loom_tools.shepherd.labels import (
     LabelCache,
+    add_label,
+    get_issue_metadata,
     get_pr_for_issue,
+    remove_label,
     transition_labels,
     transition_issue_labels,
     transition_pr_labels,
 )
+
+
+def _make_forge_mock() -> MagicMock:
+    """Create a mock ForgeClient."""
+    mock = MagicMock()
+    mock.add_labels.return_value = True
+    mock.remove_labels.return_value = True
+    mock.transition_labels.return_value = True
+    return mock
 
 
 class TestLabelCache:
@@ -111,16 +123,55 @@ class TestLabelCache:
         assert cache.has_pr_label(42, "pr_label") is True
         assert cache.has_pr_label(42, "issue_label") is False
 
-    def test_run_gh_delegates_to_common_gh_run(self) -> None:
-        """_run_gh should delegate to common.github.gh_run."""
-        cache = LabelCache(Path("/fake/repo"))
-        with patch("loom_tools.shepherd.labels.gh_run") as mock_gh:
-            mock_gh.return_value.returncode = 0
-            mock_gh.return_value.stdout = "label1\nlabel2\n"
-            result = cache._run_gh(["issue", "view", "42", "--json", "labels"])
-        assert result == "label1\nlabel2"
-        mock_gh.assert_called_once()
-        assert mock_gh.call_args[1]["cwd"] == Path("/fake/repo")
+    def test_fetch_labels_uses_forge_get_issue(self) -> None:
+        """_fetch_labels for issues should delegate to ForgeClient.get_issue."""
+        forge_mock = _make_forge_mock()
+        forge_mock.get_issue.return_value = ForgeIssue(
+            number=42, state="OPEN", title="Test", url="https://example.com/42",
+            labels=["label1", "label2"],
+        )
+        cache = LabelCache(forge=forge_mock)
+        labels = cache._fetch_labels("issue", 42)
+        assert labels == {"label1", "label2"}
+        forge_mock.get_issue.assert_called_once_with(42)
+
+    def test_fetch_labels_uses_forge_get_pull_request(self) -> None:
+        """_fetch_labels for PRs should delegate to ForgeClient.get_pull_request."""
+        forge_mock = _make_forge_mock()
+        forge_mock.get_pull_request.return_value = ForgePullRequest(
+            number=100, state="OPEN", title="PR", url="https://example.com/pr/100",
+            labels=["pr_label"],
+        )
+        cache = LabelCache(forge=forge_mock)
+        labels = cache._fetch_labels("pr", 100)
+        assert labels == {"pr_label"}
+        forge_mock.get_pull_request.assert_called_once_with(100)
+
+    def test_fetch_labels_returns_empty_set_on_none(self) -> None:
+        """_fetch_labels returns empty set when entity not found."""
+        forge_mock = _make_forge_mock()
+        forge_mock.get_issue.return_value = None
+        cache = LabelCache(forge=forge_mock)
+        labels = cache._fetch_labels("issue", 999)
+        assert labels == set()
+
+    def test_constructor_accepts_forge_parameter(self) -> None:
+        """LabelCache should accept an optional forge parameter."""
+        forge_mock = _make_forge_mock()
+        cache = LabelCache(forge=forge_mock)
+        assert cache._forge is forge_mock
+
+    def test_lazy_forge_creation(self) -> None:
+        """LabelCache should lazily create ForgeClient from repo_root."""
+        with patch("loom_tools.shepherd.labels._get_forge_client") as mock_get:
+            mock_get.return_value = _make_forge_mock()
+            mock_get.return_value.get_issue.return_value = ForgeIssue(
+                number=42, state="OPEN", title="Test", url="",
+                labels=["label1"],
+            )
+            cache = LabelCache(repo_root=Path("/fake/repo"))
+            cache._fetch_labels("issue", 42)
+            mock_get.assert_called_once_with(Path("/fake/repo"))
 
 
 class TestGenericLabelOperations:
@@ -203,9 +254,9 @@ class TestAtomicLabelTransitions:
     """Tests for atomic label transition functions."""
 
     def test_transition_labels_add_and_remove(self) -> None:
-        """transition_labels should use single gh command with both flags."""
-        with patch("loom_tools.shepherd.labels.gh_run") as mock_run:
-            mock_run.return_value.returncode = 0
+        """transition_labels should delegate to ForgeClient.transition_labels."""
+        forge_mock = _make_forge_mock()
+        with patch("loom_tools.shepherd.labels._get_forge_client", return_value=forge_mock):
             result = transition_labels(
                 "issue",
                 42,
@@ -214,50 +265,52 @@ class TestAtomicLabelTransitions:
             )
 
             assert result is True
-            mock_run.assert_called_once()
-            call_args = mock_run.call_args[0][0]
-            assert call_args == [
-                "issue", "edit", "42",
-                "--remove-label", "loom:issue",
-                "--add-label", "loom:building",
-            ]
+            forge_mock.transition_labels.assert_called_once_with(
+                "issue", 42,
+                add=["loom:building"],
+                remove=["loom:issue"],
+            )
 
     def test_transition_labels_add_only(self) -> None:
         """transition_labels should work with only add."""
-        with patch("loom_tools.shepherd.labels.gh_run") as mock_run:
-            mock_run.return_value.returncode = 0
+        forge_mock = _make_forge_mock()
+        with patch("loom_tools.shepherd.labels._get_forge_client", return_value=forge_mock):
             result = transition_labels("issue", 42, add=["loom:building"])
 
             assert result is True
-            call_args = mock_run.call_args[0][0]
-            assert "--add-label" in call_args
-            assert "loom:building" in call_args
-            assert "--remove-label" not in call_args
+            forge_mock.transition_labels.assert_called_once_with(
+                "issue", 42,
+                add=["loom:building"],
+                remove=None,
+            )
 
     def test_transition_labels_remove_only(self) -> None:
         """transition_labels should work with only remove."""
-        with patch("loom_tools.shepherd.labels.gh_run") as mock_run:
-            mock_run.return_value.returncode = 0
+        forge_mock = _make_forge_mock()
+        with patch("loom_tools.shepherd.labels._get_forge_client", return_value=forge_mock):
             result = transition_labels("issue", 42, remove=["loom:issue"])
 
             assert result is True
-            call_args = mock_run.call_args[0][0]
-            assert "--remove-label" in call_args
-            assert "loom:issue" in call_args
-            assert "--add-label" not in call_args
+            forge_mock.transition_labels.assert_called_once_with(
+                "issue", 42,
+                add=None,
+                remove=["loom:issue"],
+            )
 
     def test_transition_labels_noop(self) -> None:
         """transition_labels should return True with no changes."""
-        with patch("loom_tools.shepherd.labels.gh_run") as mock_run:
+        forge_mock = _make_forge_mock()
+        with patch("loom_tools.shepherd.labels._get_forge_client", return_value=forge_mock):
             result = transition_labels("issue", 42)
 
             assert result is True
-            mock_run.assert_not_called()
+            forge_mock.transition_labels.assert_not_called()
 
     def test_transition_labels_failure(self) -> None:
         """transition_labels should return False on failure."""
-        with patch("loom_tools.shepherd.labels.gh_run") as mock_run:
-            mock_run.return_value.returncode = 1
+        forge_mock = _make_forge_mock()
+        forge_mock.transition_labels.return_value = False
+        with patch("loom_tools.shepherd.labels._get_forge_client", return_value=forge_mock):
             result = transition_labels(
                 "issue",
                 42,
@@ -269,8 +322,8 @@ class TestAtomicLabelTransitions:
 
     def test_transition_labels_multiple_add_remove(self) -> None:
         """transition_labels should handle multiple labels."""
-        with patch("loom_tools.shepherd.labels.gh_run") as mock_run:
-            mock_run.return_value.returncode = 0
+        forge_mock = _make_forge_mock()
+        with patch("loom_tools.shepherd.labels._get_forge_client", return_value=forge_mock):
             result = transition_labels(
                 "issue",
                 42,
@@ -279,19 +332,15 @@ class TestAtomicLabelTransitions:
             )
 
             assert result is True
-            call_args = mock_run.call_args[0][0]
-            # Check all labels are present
-            assert call_args.count("--add-label") == 2
-            assert call_args.count("--remove-label") == 2
-            assert "loom:building" in call_args
-            assert "loom:wip" in call_args
-            assert "loom:issue" in call_args
-            assert "loom:curated" in call_args
+            forge_mock.transition_labels.assert_called_once()
+            call_kwargs = forge_mock.transition_labels.call_args
+            assert call_kwargs[1]["add"] == ["loom:building", "loom:wip"]
+            assert set(call_kwargs[1]["remove"]) == {"loom:issue", "loom:curated"}
 
     def test_transition_labels_pr(self) -> None:
         """transition_labels should work for PRs."""
-        with patch("loom_tools.shepherd.labels.gh_run") as mock_run:
-            mock_run.return_value.returncode = 0
+        forge_mock = _make_forge_mock()
+        with patch("loom_tools.shepherd.labels._get_forge_client", return_value=forge_mock):
             result = transition_labels(
                 "pr",
                 100,
@@ -300,8 +349,11 @@ class TestAtomicLabelTransitions:
             )
 
             assert result is True
-            call_args = mock_run.call_args[0][0]
-            assert call_args[:3] == ["pr", "edit", "100"]
+            forge_mock.transition_labels.assert_called_once_with(
+                "pr", 100,
+                add=["loom:pr"],
+                remove=["loom:review-requested"],
+            )
 
     def test_transition_issue_labels_convenience(self) -> None:
         """transition_issue_labels should delegate to transition_labels."""
@@ -344,9 +396,9 @@ class TestAtomicLabelTransitions:
             )
 
     def test_transition_labels_with_repo_root(self) -> None:
-        """transition_labels should pass repo_root to gh_run."""
-        with patch("loom_tools.shepherd.labels.gh_run") as mock_run:
-            mock_run.return_value.returncode = 0
+        """transition_labels should pass repo_root to _get_forge_client."""
+        forge_mock = _make_forge_mock()
+        with patch("loom_tools.shepherd.labels._get_forge_client", return_value=forge_mock) as mock_get:
             repo_root = Path("/fake/repo")
             transition_labels(
                 "issue",
@@ -355,208 +407,154 @@ class TestAtomicLabelTransitions:
                 repo_root=repo_root,
             )
 
-            mock_run.assert_called_once()
-            assert mock_run.call_args[1]["cwd"] == repo_root
+            mock_get.assert_called_once_with(repo_root)
+
+    def test_transition_labels_enforce_exclusion(self) -> None:
+        """enforce_exclusion should add conflicting labels to the remove set."""
+        forge_mock = _make_forge_mock()
+        with patch("loom_tools.shepherd.labels._get_forge_client", return_value=forge_mock):
+            result = transition_labels(
+                "pr",
+                100,
+                add=["loom:pr"],
+                enforce_exclusion=True,
+            )
+
+            assert result is True
+            call_kwargs = forge_mock.transition_labels.call_args
+            remove_set = set(call_kwargs[1]["remove"])
+            assert "loom:changes-requested" in remove_set
+            assert "loom:review-requested" in remove_set
+            assert "loom:pr" not in remove_set
+
+    def test_transition_labels_enforce_exclusion_merges_with_explicit_remove(self) -> None:
+        """enforce_exclusion should merge with explicitly provided remove labels."""
+        forge_mock = _make_forge_mock()
+        with patch("loom_tools.shepherd.labels._get_forge_client", return_value=forge_mock):
+            result = transition_labels(
+                "issue",
+                42,
+                add=["loom:building"],
+                remove=["loom:curated"],
+                enforce_exclusion=True,
+            )
+
+            assert result is True
+            call_kwargs = forge_mock.transition_labels.call_args
+            remove_set = set(call_kwargs[1]["remove"])
+            # Should include both explicit and exclusion-derived removes
+            assert "loom:curated" in remove_set
+            assert "loom:issue" in remove_set
+            assert "loom:blocked" in remove_set
+
+
+class TestStandaloneLabelFunctions:
+    """Tests for standalone add_label, remove_label functions."""
+
+    def test_add_label_delegates_to_forge(self) -> None:
+        """add_label should delegate to ForgeClient.add_labels."""
+        forge_mock = _make_forge_mock()
+        with patch("loom_tools.shepherd.labels._get_forge_client", return_value=forge_mock):
+            result = add_label("issue", 42, "loom:building")
+            assert result is True
+            forge_mock.add_labels.assert_called_once_with("issue", 42, ["loom:building"])
+
+    def test_add_label_returns_false_on_failure(self) -> None:
+        """add_label should return False when ForgeClient fails."""
+        forge_mock = _make_forge_mock()
+        forge_mock.add_labels.return_value = False
+        with patch("loom_tools.shepherd.labels._get_forge_client", return_value=forge_mock):
+            result = add_label("issue", 42, "loom:building")
+            assert result is False
+
+    def test_remove_label_delegates_to_forge(self) -> None:
+        """remove_label should delegate to ForgeClient.remove_labels."""
+        forge_mock = _make_forge_mock()
+        with patch("loom_tools.shepherd.labels._get_forge_client", return_value=forge_mock):
+            result = remove_label("issue", 42, "loom:building")
+            assert result is True
+            forge_mock.remove_labels.assert_called_once_with("issue", 42, ["loom:building"])
+
+    def test_remove_label_always_returns_true(self) -> None:
+        """remove_label should always return True (label may not have existed)."""
+        forge_mock = _make_forge_mock()
+        forge_mock.remove_labels.return_value = False
+        with patch("loom_tools.shepherd.labels._get_forge_client", return_value=forge_mock):
+            result = remove_label("issue", 42, "loom:building")
+            assert result is True
+
+    def test_add_label_passes_repo_root(self) -> None:
+        """add_label should pass repo_root to _get_forge_client."""
+        forge_mock = _make_forge_mock()
+        repo_root = Path("/fake/repo")
+        with patch("loom_tools.shepherd.labels._get_forge_client", return_value=forge_mock) as mock_get:
+            add_label("issue", 42, "loom:building", repo_root=repo_root)
+            mock_get.assert_called_once_with(repo_root)
+
+
+class TestGetIssueMetadata:
+    """Tests for get_issue_metadata."""
+
+    def test_returns_metadata_dict(self) -> None:
+        """get_issue_metadata should return a dict with expected keys."""
+        forge_mock = _make_forge_mock()
+        forge_mock.get_issue.return_value = ForgeIssue(
+            number=42, state="OPEN", title="Test Issue",
+            url="https://example.com/42",
+            labels=["loom:issue", "loom:curated"],
+        )
+        with patch("loom_tools.shepherd.labels._get_forge_client", return_value=forge_mock):
+            result = get_issue_metadata(42)
+
+        assert result is not None
+        assert result["url"] == "https://example.com/42"
+        assert result["state"] == "OPEN"
+        assert result["title"] == "Test Issue"
+        assert result["labels"] == [{"name": "loom:issue"}, {"name": "loom:curated"}]
+
+    def test_returns_none_when_not_found(self) -> None:
+        """get_issue_metadata should return None when issue not found."""
+        forge_mock = _make_forge_mock()
+        forge_mock.get_issue.return_value = None
+        with patch("loom_tools.shepherd.labels._get_forge_client", return_value=forge_mock):
+            result = get_issue_metadata(999)
+
+        assert result is None
 
 
 class TestGetPrForIssue:
-    """Tests for get_pr_for_issue using closingIssuesReferences validation."""
+    """Tests for get_pr_for_issue delegating to ForgeClient."""
 
-    def _mock_run(self, outputs: list[tuple[int, str]]):  # type: ignore[return]
-        """Return a mock that yields (returncode, stdout) pairs in sequence."""
-        from unittest.mock import MagicMock
-        mock = MagicMock()
-        results = []
-        for returncode, stdout in outputs:
-            r = MagicMock()
-            r.returncode = returncode
-            r.stdout = stdout
-            results.append(r)
-        mock.side_effect = results
-        return mock
-
-    def test_branch_lookup_returns_pr_number(self) -> None:
-        """Method 1 (branch-based) returns PR number on match."""
-        with patch("loom_tools.shepherd.labels.gh_run") as mock_run:
-            mock_run.return_value.returncode = 0
-            mock_run.return_value.stdout = "42"
+    def test_returns_pr_number_when_found(self) -> None:
+        """get_pr_for_issue should return PR number from ForgeClient."""
+        forge_mock = _make_forge_mock()
+        forge_mock.find_pull_request_for_issue.return_value = 42
+        with patch("loom_tools.shepherd.labels._get_forge_client", return_value=forge_mock):
             result = get_pr_for_issue(100, state="open")
         assert result == 42
+        forge_mock.find_pull_request_for_issue.assert_called_once_with(100, state="open")
 
-    def test_branch_lookup_null_falls_through_to_body_search(self) -> None:
-        """When branch lookup returns null, falls through to body search."""
-        closing_refs = [{"number": 100}]
-        body_search_output = json.dumps([
-            {"number": 99, "closingIssuesReferences": closing_refs}
-        ])
-        mock = self._mock_run([
-            (0, "null"),           # Method 1: branch lookup → null
-            (0, body_search_output),  # Method 2: "Closes #100" → match
-        ])
-        with patch("loom_tools.shepherd.labels.gh_run", mock):
-            result = get_pr_for_issue(100, state="open")
-        assert result == 99
-
-    def test_body_search_validates_closing_refs(self) -> None:
-        """Body search result must appear in closingIssuesReferences to be accepted."""
-        # PR 848 has "Closes" in body but closingIssuesReferences references issue 2839
-        # on a different repo — not matching our issue 100.
-        false_positive_output = json.dumps([
-            {
-                "number": 848,
-                "closingIssuesReferences": [
-                    {"number": 2839}  # different issue — false positive
-                ],
-            }
-        ])
-        mock = self._mock_run([
-            (0, "null"),               # Method 1: branch lookup → null
-            (0, false_positive_output),  # Method 2: "Closes #100" → false positive
-            (0, "[]"),                 # Method 3: "Fixes #100" → empty
-            (0, "[]"),                 # Method 4: "Resolves #100" → empty
-        ])
-        with patch("loom_tools.shepherd.labels.gh_run", mock):
-            result = get_pr_for_issue(100, state="merged")
-        assert result is None
-
-    def test_body_search_accepts_correct_closing_ref(self) -> None:
-        """Body search accepts PR when closingIssuesReferences contains the target issue."""
-        closing_refs = [{"number": 100}]
-        output = json.dumps([
-            {"number": 55, "closingIssuesReferences": closing_refs}
-        ])
-        mock = self._mock_run([
-            (0, "null"),   # Method 1: branch lookup → null
-            (0, output),   # Method 2: "Closes #100" → valid match
-        ])
-        with patch("loom_tools.shepherd.labels.gh_run", mock):
-            result = get_pr_for_issue(100, state="open")
-        assert result == 55
-
-    def test_fixes_pattern_validated_by_closing_refs(self) -> None:
-        """'Fixes' pattern also validated via closingIssuesReferences."""
-        closes_output = json.dumps([])
-        fixes_output = json.dumps([
-            {"number": 77, "closingIssuesReferences": [{"number": 200}]}
-        ])
-        mock = self._mock_run([
-            (0, "null"),        # Method 1: branch lookup → null
-            (0, closes_output), # Method 2: "Closes #200" → empty
-            (0, fixes_output),  # Method 3: "Fixes #200" → valid match
-        ])
-        with patch("loom_tools.shepherd.labels.gh_run", mock):
-            result = get_pr_for_issue(200, state="open")
-        assert result == 77
-
-    def test_resolves_pattern_validated_by_closing_refs(self) -> None:
-        """'Resolves' pattern also validated via closingIssuesReferences."""
-        resolves_output = json.dumps([
-            {"number": 88, "closingIssuesReferences": [{"number": 300}]}
-        ])
-        mock = self._mock_run([
-            (0, "null"),     # Method 1: branch lookup → null
-            (0, "[]"),       # Method 2: "Closes #300" → empty
-            (0, "[]"),       # Method 3: "Fixes #300" → empty
-            (0, resolves_output),  # Method 4: "Resolves #300" → valid match
-        ])
-        with patch("loom_tools.shepherd.labels.gh_run", mock):
-            result = get_pr_for_issue(300, state="open")
-        assert result == 88
-
-    def test_returns_none_when_no_pr_found(self) -> None:
-        """Returns None when no method finds a matching PR."""
-        mock = self._mock_run([
-            (0, "null"),  # Method 1: branch lookup → null
-            (0, "[]"),    # Method 2: "Closes" → empty
-            (0, "[]"),    # Method 3: "Fixes" → empty
-            (0, "[]"),    # Method 4: "Resolves" → empty
-        ])
-        with patch("loom_tools.shepherd.labels.gh_run", mock):
+    def test_returns_none_when_not_found(self) -> None:
+        """get_pr_for_issue should return None when no PR found."""
+        forge_mock = _make_forge_mock()
+        forge_mock.find_pull_request_for_issue.return_value = None
+        with patch("loom_tools.shepherd.labels._get_forge_client", return_value=forge_mock):
             result = get_pr_for_issue(999, state="open")
         assert result is None
 
-    def test_multiple_candidates_first_valid_wins(self) -> None:
-        """When multiple PRs match a search, first one with correct closing ref wins."""
-        output = json.dumps([
-            {"number": 10, "closingIssuesReferences": [{"number": 999}]},  # wrong issue
-            {"number": 20, "closingIssuesReferences": [{"number": 42}]},   # correct
-            {"number": 30, "closingIssuesReferences": [{"number": 42}]},   # also correct
-        ])
-        mock = self._mock_run([
-            (0, "null"),   # Method 1: branch lookup → null
-            (0, output),   # Method 2: "Closes #42" → multiple candidates
-        ])
-        with patch("loom_tools.shepherd.labels.gh_run", mock):
-            result = get_pr_for_issue(42, state="open")
-        assert result == 20  # first valid candidate
-
-    def test_invalid_json_from_body_search_skipped(self) -> None:
-        """Invalid JSON from body search is skipped gracefully."""
-        mock = self._mock_run([
-            (0, "null"),           # Method 1: branch lookup → null
-            (0, "not valid json"), # Method 2: invalid JSON
-            (0, "[]"),             # Method 3: empty
-            (0, "[]"),             # Method 4: empty
-        ])
-        with patch("loom_tools.shepherd.labels.gh_run", mock):
-            result = get_pr_for_issue(42, state="open")
-        assert result is None
-
-    def test_gh_command_failure_skips_that_method(self) -> None:
-        """gh command failure (non-zero exit) is skipped gracefully."""
-        mock = self._mock_run([
-            (1, ""),    # Method 1: branch lookup fails
-            (1, ""),    # Method 2: command fails
-            (1, ""),    # Method 3: command fails
-            (1, ""),    # Method 4: command fails
-        ])
-        with patch("loom_tools.shepherd.labels.gh_run", mock):
-            result = get_pr_for_issue(42, state="open")
-        assert result is None
-
-    def test_empty_closing_refs_list_not_accepted(self) -> None:
-        """PR with empty closingIssuesReferences is not accepted as a match."""
-        output = json.dumps([
-            {"number": 55, "closingIssuesReferences": []}  # no closing refs
-        ])
-        mock = self._mock_run([
-            (0, "null"),   # Method 1: branch lookup → null
-            (0, output),   # Method 2: candidate with empty closingIssuesReferences
-            (0, "[]"),     # Method 3: empty
-            (0, "[]"),     # Method 4: empty
-        ])
-        with patch("loom_tools.shepherd.labels.gh_run", mock):
-            result = get_pr_for_issue(42, state="open")
-        assert result is None
-
-    def test_passes_state_to_gh_command(self) -> None:
-        """The state parameter is forwarded to gh pr list commands."""
-        mock = self._mock_run([
-            (0, "null"),  # Method 1: branch lookup → null
-            (0, "[]"),    # Method 2: empty
-            (0, "[]"),    # Method 3: empty
-            (0, "[]"),    # Method 4: empty
-        ])
-        with patch("loom_tools.shepherd.labels.gh_run", mock):
+    def test_passes_state_to_forge(self) -> None:
+        """get_pr_for_issue should pass state to ForgeClient."""
+        forge_mock = _make_forge_mock()
+        forge_mock.find_pull_request_for_issue.return_value = None
+        with patch("loom_tools.shepherd.labels._get_forge_client", return_value=forge_mock):
             get_pr_for_issue(42, state="merged")
+        forge_mock.find_pull_request_for_issue.assert_called_once_with(42, state="merged")
 
-        # Check that "merged" appears in the call args
-        calls = mock.call_args_list
-        for call in calls:
-            args_list = call[0][0]
-            assert "merged" in args_list
-
-    def test_passes_repo_root_to_gh_run(self) -> None:
-        """repo_root is forwarded as cwd to gh_run."""
+    def test_passes_repo_root(self) -> None:
+        """get_pr_for_issue should pass repo_root to _get_forge_client."""
+        forge_mock = _make_forge_mock()
+        forge_mock.find_pull_request_for_issue.return_value = None
         repo_root = Path("/some/repo")
-        mock = self._mock_run([
-            (0, "null"),  # Method 1: branch lookup → null
-            (0, "[]"),    # Method 2: empty
-            (0, "[]"),    # Method 3: empty
-            (0, "[]"),    # Method 4: empty
-        ])
-        with patch("loom_tools.shepherd.labels.gh_run", mock):
+        with patch("loom_tools.shepherd.labels._get_forge_client", return_value=forge_mock) as mock_get:
             get_pr_for_issue(42, repo_root=repo_root)
-
-        for call in mock.call_args_list:
-            assert call[1].get("cwd") == repo_root
+        mock_get.assert_called_once_with(repo_root)
