@@ -442,6 +442,7 @@ forge_list_merged_prs() {
         filtered=$(echo "$batch" | jq '[.[] | select(.merged == true) | {number: .number, mergedAt: .merged_at}]')
       fi
 
+      # shellcheck disable=SC2034
       local filtered_len
       filtered_len=$(echo "$filtered" | jq 'length')
       results=$(echo "$results" "$filtered" | jq -s '.[0] + .[1]')
