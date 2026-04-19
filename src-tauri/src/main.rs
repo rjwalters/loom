@@ -235,11 +235,8 @@ fn main() {
             write_file,
             append_to_console_log,
             append_to_input_log,
-            // GitHub commands
+            // GitHub/forge commands
             check_github_remote,
-            check_label_exists,
-            create_github_label,
-            update_github_label,
             reset_github_labels,
             // Project commands
             create_local_project,

@@ -389,6 +389,32 @@ class TestMainPrList:
         assert output[0]["headRefName"] == "feature/issue-1"
 
 
+class TestMainPrEdit:
+    """Tests for 'loom-forge pr edit'."""
+
+    def test_pr_edit_labels(self) -> None:
+        forge = FakeForge()
+        with mock.patch("loom_tools.forge_cli.get_forge", return_value=forge):
+            rc = main([
+                "pr", "edit", "10",
+                "--remove-label", "loom:reviewing",
+                "--add-label", "loom:review-requested",
+            ])
+        assert rc == 0
+        assert len(forge.label_ops) == 1
+        entity, num, add, remove = forge.label_ops[0]
+        assert entity == "pr"
+        assert num == 10
+        assert add == ["loom:review-requested"]
+        assert remove == ["loom:reviewing"]
+
+    def test_pr_edit_no_number(self) -> None:
+        forge = FakeForge()
+        with mock.patch("loom_tools.forge_cli.get_forge", return_value=forge):
+            rc = main(["pr", "edit"])
+        assert rc == 1
+
+
 class TestMainAuthStatus:
     """Tests for 'loom-forge auth status'."""
 
