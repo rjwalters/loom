@@ -600,6 +600,148 @@ class GiteaForge:
         resp = self._request("POST", f"{rp}/pulls/{number}/merge", json=payload)
         return resp is not None
 
+    def auto_merge_pull_request(
+        self,
+        number: int,
+        method: str = "squash",
+        poll_interval: int = 30,
+        timeout: int = 600,
+    ) -> bool:
+        """Poll CI status and merge when checks pass.
+
+        Gitea has no native auto-merge queue, so this polls the CI
+        status of the PR's head commit and merges once all checks
+        are green. If no CI checks are found, merges immediately
+        (assumes no branch protection requires checks).
+
+        Parameters
+        ----------
+        number:
+            PR number.
+        method:
+            Merge method (``"squash"``, ``"merge"``, ``"rebase"``).
+        poll_interval:
+            Seconds between CI status polls.
+        timeout:
+            Maximum seconds to wait for CI before giving up.
+        """
+        rp = self._repo_path()
+        if not rp:
+            return False
+
+        # Get PR to extract head SHA
+        resp = self._request("GET", f"{rp}/pulls/{number}")
+        if resp is None:
+            logger.error("Cannot fetch PR #%d for auto-merge", number)
+            return False
+        try:
+            pr_data = resp.json()
+        except ValueError:
+            logger.error("Invalid JSON from PR #%d", number)
+            return False
+        if not isinstance(pr_data, dict):
+            return False
+
+        # Check if already merged
+        if pr_data.get("merged") is True:
+            logger.info("PR #%d is already merged", number)
+            return True
+
+        head_info = pr_data.get("head", {})
+        head_sha = head_info.get("sha") if isinstance(head_info, dict) else None
+        if not head_sha:
+            logger.warning(
+                "Cannot determine head SHA for PR #%d, attempting immediate merge",
+                number,
+            )
+            return self.merge_pull_request(number, method=method)
+
+        logger.info(
+            "Starting poll-and-merge for PR #%d (sha=%s, interval=%ds, timeout=%ds)",
+            number, head_sha[:8], poll_interval, timeout,
+        )
+
+        elapsed = 0
+        while elapsed < timeout:
+            ci_result = self._get_raw_ci_state(head_sha)
+
+            if ci_result == "passing":
+                logger.info("CI passing for PR #%d, merging", number)
+                return self.merge_pull_request(number, method=method)
+
+            if ci_result == "failing":
+                logger.warning("CI failing for PR #%d", number)
+                return False
+
+            if ci_result == "no_checks":
+                logger.info(
+                    "No CI checks found for PR #%d, merging immediately",
+                    number,
+                )
+                return self.merge_pull_request(number, method=method)
+
+            # CI pending — wait and retry
+            logger.info(
+                "CI pending for PR #%d, waiting %ds... (%d/%ds elapsed)",
+                number, poll_interval, elapsed, timeout,
+            )
+            time.sleep(poll_interval)
+            elapsed += poll_interval
+
+        logger.warning(
+            "Timeout waiting for CI on PR #%d after %ds", number, timeout,
+        )
+        return False
+
+    def _get_raw_ci_state(self, sha: str) -> str:
+        """Query raw CI state for a commit, distinguishing pending from passing.
+
+        Returns one of: ``"passing"``, ``"failing"``, ``"pending"``,
+        ``"no_checks"``.
+
+        Unlike ``get_commit_ci_status()`` which treats pending as passing
+        (optimistic for dashboard display), this method distinguishes
+        pending checks so the auto-merge poll loop can wait for completion.
+        """
+        rp = self._repo_path()
+        if not rp:
+            return "no_checks"
+
+        # Fetch commit statuses
+        resp = self._request("GET", f"{rp}/commits/{sha}/statuses")
+        statuses: list[dict[str, Any]] = []
+        if resp is not None:
+            try:
+                data = resp.json()
+                if isinstance(data, list):
+                    statuses = data
+            except ValueError:
+                pass
+
+        # Group by context, take latest
+        latest_by_context: dict[str, str] = {}
+        for s in statuses:
+            if not isinstance(s, dict):
+                continue
+            ctx = s.get("context", "unknown")
+            if ctx not in latest_by_context:
+                latest_by_context[ctx] = self._classify_gitea_status(
+                    s.get("status", ""),
+                )
+
+        if not latest_by_context:
+            return "no_checks"
+
+        has_failure = any(v == "failure" for v in latest_by_context.values())
+        if has_failure:
+            return "failing"
+
+        has_pending = any(v == "pending" for v in latest_by_context.values())
+        if has_pending:
+            return "pending"
+
+        return "passing"
+
     def comment_on_pull_request(self, number: int, body: str) -> bool:
         """Add a comment to a pull request (shares issue comment API)."""
         rp = self._repo_path()

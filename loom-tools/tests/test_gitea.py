@@ -1226,3 +1226,215 @@ class TestGetForgeFactory:
             forge = get_forge()
 
         assert forge.forge_type == "github"
+
+
+# ===========================================================================
+# Auto-merge (poll-and-merge)
+# ===========================================================================
+
+
+class TestAutoMergePullRequest:
+    """Tests for GiteaForge.auto_merge_pull_request() poll-and-merge."""
+
+    def _pr_response(
+        self,
+        number: int = 42,
+        merged: bool = False,
+        head_sha: str = "abc123def456",
+    ) -> mock.MagicMock:
+        """Create a mock PR API response."""
+        return _mock_response(json_data={
+            "number": number,
+            "state": "open",
+            "title": "Test PR",
+            "html_url": f"https://gitea.example.com/owner/repo/pulls/{number}",
+            "labels": [],
+            "merged": merged,
+            "head": {"sha": head_sha, "ref": "feature/test"},
+        })
+
+    def _ci_passing(self) -> mock.MagicMock:
+        """CI statuses response with all passing."""
+        return _mock_response(json_data=[
+            {"context": "ci/build", "status": "success", "state": "success"},
+        ])
+
+    def _ci_failing(self) -> mock.MagicMock:
+        """CI statuses response with a failure."""
+        return _mock_response(json_data=[
+            {"context": "ci/build", "status": "failure", "state": "failure"},
+        ])
+
+    def _ci_pending(self) -> mock.MagicMock:
+        """CI statuses response with pending check."""
+        return _mock_response(json_data=[
+            {"context": "ci/build", "status": "pending", "state": "pending"},
+        ])
+
+    def _no_ci(self) -> mock.MagicMock:
+        """CI statuses response with no checks."""
+        return _mock_response(json_data=[])
+
+    def _merge_success(self) -> mock.MagicMock:
+        """Successful merge response."""
+        return _mock_response(json_data={"sha": "merged123"})
+
+    def test_passing_ci_merges_immediately(self) -> None:
+        """When CI is passing, should merge right away."""
+        forge = _make_forge()
+
+        responses = [
+            self._pr_response(),       # GET pulls/42 (fetch PR)
+            self._ci_passing(),        # GET commits/{sha}/statuses
+            self._merge_success(),     # POST pulls/42/merge
+        ]
+
+        with mock.patch.object(
+            forge._session, "request", side_effect=responses,
+        ):
+            result = forge.auto_merge_pull_request(42, poll_interval=1, timeout=5)
+
+        assert result is True
+
+    def test_failing_ci_returns_false(self) -> None:
+        """When CI fails, should return False without merging."""
+        forge = _make_forge()
+
+        responses = [
+            self._pr_response(),   # GET pulls/42
+            self._ci_failing(),    # GET commits/{sha}/statuses
+        ]
+
+        with mock.patch.object(
+            forge._session, "request", side_effect=responses,
+        ):
+            result = forge.auto_merge_pull_request(42, poll_interval=1, timeout=5)
+
+        assert result is False
+
+    def test_no_ci_merges_immediately(self) -> None:
+        """When no CI checks exist, should merge immediately."""
+        forge = _make_forge()
+
+        responses = [
+            self._pr_response(),       # GET pulls/42
+            self._no_ci(),             # GET commits/{sha}/statuses (empty)
+            self._merge_success(),     # POST pulls/42/merge
+        ]
+
+        with mock.patch.object(
+            forge._session, "request", side_effect=responses,
+        ):
+            result = forge.auto_merge_pull_request(42, poll_interval=1, timeout=5)
+
+        assert result is True
+
+    def test_already_merged_returns_true(self) -> None:
+        """When PR is already merged, should return True."""
+        forge = _make_forge()
+
+        responses = [
+            self._pr_response(merged=True),  # GET pulls/42 (merged=True)
+        ]
+
+        with mock.patch.object(
+            forge._session, "request", side_effect=responses,
+        ):
+            result = forge.auto_merge_pull_request(42)
+
+        assert result is True
+
+    def test_pending_then_passing_polls_and_merges(self) -> None:
+        """When CI is pending then passes, should poll and merge."""
+        forge = _make_forge()
+
+        responses = [
+            self._pr_response(),       # GET pulls/42
+            self._ci_pending(),        # poll 1: GET commits/{sha}/statuses (pending)
+            self._ci_passing(),        # poll 2: GET commits/{sha}/statuses (passing)
+            self._merge_success(),     # POST pulls/42/merge
+        ]
+
+        with (
+            mock.patch.object(forge._session, "request", side_effect=responses),
+            mock.patch("loom_tools.common.gitea.time.sleep") as mock_sleep,
+        ):
+            result = forge.auto_merge_pull_request(42, poll_interval=10, timeout=60)
+
+        assert result is True
+        mock_sleep.assert_called_once_with(10)
+
+    def test_timeout_returns_false(self) -> None:
+        """When CI stays pending past timeout, should return False."""
+        forge = _make_forge()
+
+        responses = [
+            self._pr_response(),   # GET pulls/42
+            self._ci_pending(),    # poll 1: statuses
+            self._ci_pending(),    # poll 2: statuses
+        ]
+
+        with (
+            mock.patch.object(forge._session, "request", side_effect=responses),
+            mock.patch("loom_tools.common.gitea.time.sleep"),
+        ):
+            result = forge.auto_merge_pull_request(42, poll_interval=5, timeout=10)
+
+        assert result is False
+
+    def test_pr_fetch_failure_returns_false(self) -> None:
+        """When PR cannot be fetched, should return False."""
+        forge = _make_forge()
+
+        with mock.patch.object(
+            forge._session, "request", return_value=_mock_response(404),
+        ):
+            result = forge.auto_merge_pull_request(999)
+
+        assert result is False
+
+    def test_no_head_sha_falls_back_to_direct_merge(self) -> None:
+        """When PR has no head SHA, should attempt direct merge."""
+        forge = _make_forge()
+
+        pr_no_head = _mock_response(json_data={
+            "number": 42,
+            "state": "open",
+            "title": "Test PR",
+            "html_url": "https://gitea.example.com/owner/repo/pulls/42",
+            "labels": [],
+            "merged": False,
+            "head": {},  # no sha
+        })
+
+        responses = [
+            pr_no_head,            # GET pulls/42 (no head SHA)
+            self._merge_success(), # POST pulls/42/merge (direct)
+        ]
+
+        with mock.patch.object(
+            forge._session, "request", side_effect=responses,
+        ):
+            result = forge.auto_merge_pull_request(42)
+
+        assert result is True
+
+    def test_configurable_poll_interval(self) -> None:
+        """Verify poll_interval and timeout parameters are respected."""
+        forge = _make_forge()
+
+        responses = [
+            self._pr_response(),
+            self._ci_pending(),
+            self._ci_passing(),
+            self._merge_success(),
+        ]
+
+        with (
+            mock.patch.object(forge._session, "request", side_effect=responses),
+            mock.patch("loom_tools.common.gitea.time.sleep") as mock_sleep,
+        ):
+            forge.auto_merge_pull_request(42, poll_interval=15, timeout=120)
+
+        # Should sleep for 15 seconds (the configured interval)
+        mock_sleep.assert_called_once_with(15)

@@ -591,6 +591,22 @@ class CachedForgeClient:
             self._invalidate("merge_pull_request", entity_id=str(number))
         return result
 
+    def auto_merge_pull_request(
+        self,
+        number: int,
+        method: str = "squash",
+        poll_interval: int = 30,
+        timeout: int = 600,
+    ) -> bool:
+        # Mutations bypass cache; invalidate PR entries on success.
+        result = self._inner.auto_merge_pull_request(
+            number, method=method,
+            poll_interval=poll_interval, timeout=timeout,
+        )
+        if result:
+            self._invalidate("auto_merge_pull_request", entity_id=str(number))
+        return result
+
     def comment_on_pull_request(self, number: int, body: str) -> bool:
         result = self._inner.comment_on_pull_request(number, body)
         if result:
@@ -651,6 +667,15 @@ class CachedForgeClient:
             return cached
         result = self._inner.get_default_branch_ci_status()
         self._put_cached("get_default_branch_ci_status", ar, result)
+        return result
+
+    def get_commit_ci_status(self, sha: str) -> ForgeCIStatus:
+        ar = self._args_repr(sha)
+        cached = self._get_cached("get_commit_ci_status", ar)
+        if cached is not _MISSING:
+            return cached
+        result = self._inner.get_commit_ci_status(sha)
+        self._put_cached("get_commit_ci_status", ar, result)
         return result
 
     # --- Repository metadata (cached, long TTL) ---

@@ -226,6 +226,15 @@ class MockForgeClient:
     ) -> bool:
         return True
 
+    def auto_merge_pull_request(
+        self,
+        number: int,
+        method: str = "squash",
+        poll_interval: int = 30,
+        timeout: int = 600,
+    ) -> bool:
+        return True
+
     def comment_on_pull_request(self, number: int, body: str) -> bool:
         return True
 

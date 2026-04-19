@@ -43,6 +43,7 @@ loom-test-failure-analysis = "loom_tools.test_failure_analysis:main"
 loom-usage = "loom_tools.common.usage:main"
 loom-backlog = "loom_tools.backlog:main"
 loom-forge = "loom_tools.forge_cli:cli_main"
+loom-auto-merge = "loom_tools.auto_merge:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
