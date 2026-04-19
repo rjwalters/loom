@@ -227,138 +227,310 @@ REMOVE_DIRS=()         # Directories to remove if empty after file removal
 UNKNOWN_FILES=()       # Files in Loom directories that don't match known patterns
 SMART_REMOVE_FILES=()  # Files needing smart removal (CLAUDE.md, .gitignore)
 
-# 1. Build manifest from defaults/ directory (if available)
-DEFAULTS_PATH="$LOOM_ROOT/defaults"
-KNOWN_DEFAULTS=()
+# Check if install-metadata.json has an installed_files manifest
+# If so, use it as the authoritative source instead of walking defaults/
+METADATA_FILE="$TARGET_PATH/.loom/install-metadata.json"
+USE_MANIFEST=false
 
-if [[ -d "$DEFAULTS_PATH" ]]; then
-  # Walk defaults/ to find all files that Loom installs
-  while IFS= read -r -d '' file; do
-    rel_path="${file#$DEFAULTS_PATH/}"
-
-    # Map defaults paths to target repo paths
-    case "$rel_path" in
-      # roles/ -> .loom/roles/
-      roles/*)
-        target_file=".loom/$rel_path"
-        ;;
-      # scripts/ -> .loom/scripts/
-      scripts/*)
-        target_file=".loom/$rel_path"
-        ;;
-      # config.json -> .loom/config.json
-      config.json)
-        target_file=".loom/config.json"
-        ;;
-      # package.json -> .loom/package.json (if installed there)
-      package.json)
-        target_file=".loom/package.json"
-        ;;
-      # .loom-README.md -> .loom/README.md
-      .loom-README.md)
-        target_file=".loom/README.md"
-        ;;
-      # README.md from defaults -> skip (this is Loom's own README)
-      README.md)
-        continue
-        ;;
-      # .loom/ files -> .loom/ (CLAUDE.md in .loom/)
-      .loom/*)
-        target_file="$rel_path"
-        ;;
-      # .DS_Store -> skip
-      .DS_Store)
-        continue
-        ;;
-      # All other files map directly (CLAUDE.md, .claude/*, .codex/*, .github/*)
-      *)
-        target_file="$rel_path"
-        ;;
-    esac
-
-    KNOWN_DEFAULTS+=("$target_file")
-
-    # Check if the file exists in target and add to removal list
-    # CLAUDE.md gets smart removal (step 6), not direct removal
-    # .claude/settings.json gets smart removal (selective Loom hook/permission removal)
-    if [[ "$target_file" == "CLAUDE.md" ]]; then
-      continue
-    fi
-    if [[ "$target_file" == ".claude/settings.json" ]]; then
-      continue
-    fi
-
-    if [[ -f "$TARGET_PATH/$target_file" ]]; then
-      REMOVE_FILES+=("$target_file")
-    fi
-  done < <(find -L "$DEFAULTS_PATH" -type f -print0 | sort -z)
-else
-  warning "Loom defaults/ directory not found at $DEFAULTS_PATH"
-  info "Using fallback pattern matching for file detection"
+if [[ -f "$METADATA_FILE" ]]; then
+  # Check if the metadata has the installed_files field
+  if grep -q '"installed_files"' "$METADATA_FILE" 2>/dev/null; then
+    USE_MANIFEST=true
+    info "Using installed file manifest from install-metadata.json"
+  fi
 fi
 
-# 2. Add generated role .md files (correspond to .json files)
-if [[ -d "$TARGET_PATH/.loom/roles" ]]; then
-  for json_file in "$TARGET_PATH/.loom/roles/"*.json; do
-    [[ -f "$json_file" ]] || continue
-    base_name=$(basename "$json_file" .json)
-    md_file=".loom/roles/${base_name}.md"
-    if [[ -f "$TARGET_PATH/$md_file" ]]; then
-      # Add if not already in the list
-      if ! printf '%s\n' ${REMOVE_FILES[@]+"${REMOVE_FILES[@]}"} | grep -q "^${md_file}$" 2>/dev/null; then
-        REMOVE_FILES+=("$md_file")
+if [[ "$USE_MANIFEST" == "true" ]]; then
+  # ── Manifest-based removal (new path) ──────────────────────────────────
+  # Parse installed_files array from JSON using lightweight shell tools.
+  # Handles both single-line and multi-line JSON array formats.
+  # Extract the array content, split on commas, strip quotes.
+  MANIFEST_CONTENT=$(cat "$METADATA_FILE" | tr '\n' ' ')
+  INSTALLED_LIST=$(echo "$MANIFEST_CONTENT" | grep -o '"installed_files"[[:space:]]*:[[:space:]]*\[.*\]' | sed 's/.*\[//;s/\]//' | tr ',' '\n')
+
+  while IFS= read -r file_path; do
+    # Trim whitespace and quotes
+    file_path=$(echo "$file_path" | sed 's/^[[:space:]]*"//;s/"[[:space:]]*$//')
+    [[ -z "$file_path" ]] && continue
+
+    # CLAUDE.md gets smart removal (step 6), not direct removal
+    # .claude/settings.json gets smart removal (selective Loom hook/permission removal)
+    if [[ "$file_path" == "CLAUDE.md" ]]; then
+      continue
+    fi
+    if [[ "$file_path" == ".claude/settings.json" ]]; then
+      continue
+    fi
+
+    if [[ -f "$TARGET_PATH/$file_path" ]]; then
+      REMOVE_FILES+=("$file_path")
+    fi
+  done <<< "$INSTALLED_LIST"
+
+  # Also add install-metadata.json itself to removal
+  REMOVE_FILES+=(".loom/install-metadata.json")
+
+  # Add runtime artifacts not tracked in the manifest
+  RUNTIME_ARTIFACTS=(
+    ".loom/state.json"
+    ".loom/daemon-state.json"
+    ".loom/stop-daemon"
+    ".loom/manifest.json"
+    ".loom/loom-source-path"
+    ".loom/metrics_state.json"
+    ".loom/stuck-config.json"
+    ".loom/activity.db"
+  )
+
+  for artifact in "${RUNTIME_ARTIFACTS[@]}"; do
+    if [[ -f "$TARGET_PATH/$artifact" ]]; then
+      if ! printf '%s\n' ${REMOVE_FILES[@]+"${REMOVE_FILES[@]}"} | grep -q "^${artifact}$" 2>/dev/null; then
+        REMOVE_FILES+=("$artifact")
       fi
     fi
   done
-fi
 
-# 3. Add runtime artifacts
-RUNTIME_ARTIFACTS=(
-  ".loom/state.json"
-  ".loom/daemon-state.json"
-  ".loom/config.json"
-  ".loom/stop-daemon"
-  ".loom/manifest.json"
-  ".loom/loom-source-path"
-  ".loom/metrics_state.json"
-  ".loom/stuck-config.json"
-  ".loom/activity.db"
-)
-
-for artifact in "${RUNTIME_ARTIFACTS[@]}"; do
-  if [[ -f "$TARGET_PATH/$artifact" ]]; then
-    if ! printf '%s\n' ${REMOVE_FILES[@]+"${REMOVE_FILES[@]}"} | grep -q "^${artifact}$" 2>/dev/null; then
-      REMOVE_FILES+=("$artifact")
+  # Add archived daemon state files
+  for f in "$TARGET_PATH/.loom/"*-daemon-state.json; do
+    [[ -f "$f" ]] || continue
+    rel_f="${f#$TARGET_PATH/}"
+    if ! printf '%s\n' ${REMOVE_FILES[@]+"${REMOVE_FILES[@]}"} | grep -q "^${rel_f}$" 2>/dev/null; then
+      REMOVE_FILES+=("$rel_f")
     fi
-  fi
-done
+  done
 
-# Add archived daemon state files
-for f in "$TARGET_PATH/.loom/"*-daemon-state.json; do
-  [[ -f "$f" ]] || continue
-  rel_f="${f#$TARGET_PATH/}"
-  if ! printf '%s\n' ${REMOVE_FILES[@]+"${REMOVE_FILES[@]}"} | grep -q "^${rel_f}$" 2>/dev/null; then
+  # Add log files
+  for f in "$TARGET_PATH/.loom/"*.log; do
+    [[ -f "$f" ]] || continue
+    rel_f="${f#$TARGET_PATH/}"
     REMOVE_FILES+=("$rel_f")
-  fi
-done
+  done
 
-# Add log files
-for f in "$TARGET_PATH/.loom/"*.log; do
-  [[ -f "$f" ]] || continue
-  rel_f="${f#$TARGET_PATH/}"
-  if ! printf '%s\n' ${REMOVE_FILES[@]+"${REMOVE_FILES[@]}"} | grep -q "^${rel_f}$" 2>/dev/null; then
+  # Add socket files
+  for f in "$TARGET_PATH/.loom/"*.sock; do
+    [[ -f "$f" ]] || continue
+    rel_f="${f#$TARGET_PATH/}"
     REMOVE_FILES+=("$rel_f")
-  fi
-done
+  done
 
-# Add socket files
-for f in "$TARGET_PATH/.loom/"*.sock; do
-  [[ -f "$f" ]] || continue
-  rel_f="${f#$TARGET_PATH/}"
-  if ! printf '%s\n' ${REMOVE_FILES[@]+"${REMOVE_FILES[@]}"} | grep -q "^${rel_f}$" 2>/dev/null; then
-    REMOVE_FILES+=("$rel_f")
+  # In --clean mode, also find and remove non-manifest files in Loom-owned directories.
+  # The manifest tells us what Loom installed, but --clean means "wipe everything Loom-owned".
+  # Shared directories (.claude/commands/, .claude/agents/) are still preserved.
+  if [[ "$CLEAN_MODE" == "true" ]]; then
+    LOOM_OWNED_DIRS=(".loom/roles" ".loom/scripts" ".loom/docs" ".loom/hooks")
+    for loom_dir in "${LOOM_OWNED_DIRS[@]}"; do
+      [[ -d "$TARGET_PATH/$loom_dir" ]] || continue
+      while IFS= read -r -d '' file; do
+        rel_file="${file#$TARGET_PATH/}"
+        # Check if already in removal list
+        is_listed=false
+        for listed in ${REMOVE_FILES[@]+"${REMOVE_FILES[@]}"}; do
+          if [[ "$rel_file" == "$listed" ]]; then
+            is_listed=true
+            break
+          fi
+        done
+        if [[ "$is_listed" == "false" ]]; then
+          REMOVE_FILES+=("$rel_file")
+        fi
+      done < <(find "$TARGET_PATH/$loom_dir" -type f -print0 2>/dev/null | sort -z)
+    done
   fi
-done
+
+else
+  # ── Heuristic-based removal (legacy path for pre-manifest installs) ────
+
+  # 1. Build manifest from defaults/ directory (if available)
+  DEFAULTS_PATH="$LOOM_ROOT/defaults"
+  KNOWN_DEFAULTS=()
+
+  if [[ -d "$DEFAULTS_PATH" ]]; then
+    # Walk defaults/ to find all files that Loom installs
+    while IFS= read -r -d '' file; do
+      rel_path="${file#$DEFAULTS_PATH/}"
+
+      # Map defaults paths to target repo paths
+      case "$rel_path" in
+        # roles/ -> .loom/roles/
+        roles/*)
+          target_file=".loom/$rel_path"
+          ;;
+        # scripts/ -> .loom/scripts/
+        scripts/*)
+          target_file=".loom/$rel_path"
+          ;;
+        # config.json -> .loom/config.json
+        config.json)
+          target_file=".loom/config.json"
+          ;;
+        # package.json -> .loom/package.json (if installed there)
+        package.json)
+          target_file=".loom/package.json"
+          ;;
+        # .loom-README.md -> .loom/README.md
+        .loom-README.md)
+          target_file=".loom/README.md"
+          ;;
+        # README.md from defaults -> skip (this is Loom's own README)
+        README.md)
+          continue
+          ;;
+        # .loom/ files -> .loom/ (CLAUDE.md in .loom/)
+        .loom/*)
+          target_file="$rel_path"
+          ;;
+        # .DS_Store -> skip
+        .DS_Store)
+          continue
+          ;;
+        # All other files map directly (CLAUDE.md, .claude/*, .codex/*, .github/*)
+        *)
+          target_file="$rel_path"
+          ;;
+      esac
+
+      KNOWN_DEFAULTS+=("$target_file")
+
+      # Check if the file exists in target and add to removal list
+      # CLAUDE.md gets smart removal (step 6), not direct removal
+      if [[ "$target_file" == "CLAUDE.md" ]]; then
+        continue
+      fi
+
+      if [[ -f "$TARGET_PATH/$target_file" ]]; then
+        REMOVE_FILES+=("$target_file")
+      fi
+    done < <(find -L "$DEFAULTS_PATH" -type f -print0 | sort -z)
+  else
+    warning "Loom defaults/ directory not found at $DEFAULTS_PATH"
+    info "Using fallback pattern matching for file detection"
+  fi
+
+  # 2. Add generated role .md files (correspond to .json files)
+  if [[ -d "$TARGET_PATH/.loom/roles" ]]; then
+    for json_file in "$TARGET_PATH/.loom/roles/"*.json; do
+      [[ -f "$json_file" ]] || continue
+      base_name=$(basename "$json_file" .json)
+      md_file=".loom/roles/${base_name}.md"
+      if [[ -f "$TARGET_PATH/$md_file" ]]; then
+        # Add if not already in the list
+        if ! printf '%s\n' ${REMOVE_FILES[@]+"${REMOVE_FILES[@]}"} | grep -q "^${md_file}$" 2>/dev/null; then
+          REMOVE_FILES+=("$md_file")
+        fi
+      fi
+    done
+  fi
+
+  # 3. Add runtime artifacts
+  RUNTIME_ARTIFACTS=(
+    ".loom/state.json"
+    ".loom/daemon-state.json"
+    ".loom/config.json"
+    ".loom/stop-daemon"
+    ".loom/manifest.json"
+    ".loom/loom-source-path"
+    ".loom/metrics_state.json"
+    ".loom/stuck-config.json"
+    ".loom/activity.db"
+    ".loom/install-metadata.json"
+  )
+
+  for artifact in "${RUNTIME_ARTIFACTS[@]}"; do
+    if [[ -f "$TARGET_PATH/$artifact" ]]; then
+      if ! printf '%s\n' ${REMOVE_FILES[@]+"${REMOVE_FILES[@]}"} | grep -q "^${artifact}$" 2>/dev/null; then
+        REMOVE_FILES+=("$artifact")
+      fi
+    fi
+  done
+
+  # Add archived daemon state files
+  for f in "$TARGET_PATH/.loom/"*-daemon-state.json; do
+    [[ -f "$f" ]] || continue
+    rel_f="${f#$TARGET_PATH/}"
+    if ! printf '%s\n' ${REMOVE_FILES[@]+"${REMOVE_FILES[@]}"} | grep -q "^${rel_f}$" 2>/dev/null; then
+      REMOVE_FILES+=("$rel_f")
+    fi
+  done
+
+  # Add log files
+  for f in "$TARGET_PATH/.loom/"*.log; do
+    [[ -f "$f" ]] || continue
+    rel_f="${f#$TARGET_PATH/}"
+    if ! printf '%s\n' ${REMOVE_FILES[@]+"${REMOVE_FILES[@]}"} | grep -q "^${rel_f}$" 2>/dev/null; then
+      REMOVE_FILES+=("$rel_f")
+    fi
+  done
+
+  # Add socket files
+  for f in "$TARGET_PATH/.loom/"*.sock; do
+    [[ -f "$f" ]] || continue
+    rel_f="${f#$TARGET_PATH/}"
+    if ! printf '%s\n' ${REMOVE_FILES[@]+"${REMOVE_FILES[@]}"} | grep -q "^${rel_f}$" 2>/dev/null; then
+      REMOVE_FILES+=("$rel_f")
+    fi
+  done
+
+  # 6. Detect unknown files in Loom-installed directories
+  # Only scan directories that the install process creates — NOT runtime dirs like worktrees/
+  LOOM_DIRS=(".loom/roles" ".loom/scripts" ".loom/docs" ".claude/commands" ".claude/agents")
+
+  # Claimed role name prefixes — any file in .loom/roles/ matching these prefixes
+  # is owned by Loom and should be removed during uninstall. This handles deprecated
+  # role files from older versions (e.g., builder-complexity.md, hermit-patterns.md)
+  # without needing to maintain an explicit list of deprecated filenames.
+  CLAIMED_ROLE_PREFIXES=(
+    architect auditor builder champion curator
+    doctor driver guide hermit judge
+    loom shepherd
+  )
+
+  for loom_dir in "${LOOM_DIRS[@]}"; do
+    if [[ ! -d "$TARGET_PATH/$loom_dir" ]]; then
+      continue
+    fi
+
+    while IFS= read -r -d '' file; do
+      rel_file="${file#$TARGET_PATH/}"
+
+      # Check if this file is in our removal list or known defaults
+      is_known=false
+      for known in ${REMOVE_FILES[@]+"${REMOVE_FILES[@]}"} ${KNOWN_DEFAULTS[@]+"${KNOWN_DEFAULTS[@]}"}; do
+        if [[ "$rel_file" == "$known" ]]; then
+          is_known=true
+          break
+        fi
+      done
+
+      # For .loom/roles/, also check claimed role name prefixes
+      # This catches deprecated role files from older Loom versions
+      if [[ "$is_known" == "false" ]] && [[ "$loom_dir" == ".loom/roles" ]]; then
+        base_name=$(basename "$rel_file")
+        for prefix in "${CLAIMED_ROLE_PREFIXES[@]}"; do
+          if [[ "$base_name" == "${prefix}"* ]]; then
+            is_known=true
+            # Add to removal list since it's a claimed Loom file
+            REMOVE_FILES+=("$rel_file")
+            break
+          fi
+        done
+      fi
+
+      if [[ "$is_known" == "false" ]]; then
+        UNKNOWN_FILES+=("$rel_file")
+      fi
+    done < <(find "$TARGET_PATH/$loom_dir" -type f -print0 2>/dev/null | sort -z)
+  done
+
+  # Also add the CLI wrapper if it exists (new location: .loom/bin/loom)
+  if [[ -f "$TARGET_PATH/.loom/bin/loom" ]] && [[ -x "$TARGET_PATH/.loom/bin/loom" ]]; then
+    REMOVE_FILES+=(".loom/bin/loom")
+  fi
+
+  # Backward compatibility: also check old location (repo root)
+  if [[ -f "$TARGET_PATH/loom" ]] && [[ -x "$TARGET_PATH/loom" ]]; then
+    REMOVE_FILES+=("loom")
+  fi
+fi
 
 # 4. Add runtime directories (worktrees, progress)
 RUNTIME_DIRS=(
@@ -382,66 +554,6 @@ if [[ -f "$TARGET_PATH/.claude/settings.json" ]]; then
   SMART_REMOVE_FILES+=(".claude/settings.json")
 fi
 
-# 6. Detect unknown files in Loom-installed directories
-# Only scan directories that the install process creates — NOT runtime dirs like worktrees/
-LOOM_DIRS=(".loom/roles" ".loom/scripts" ".loom/docs" ".claude/commands/loom" ".claude/agents")
-
-# Claimed role name prefixes — any file in .loom/roles/ matching these prefixes
-# is owned by Loom and should be removed during uninstall. This handles deprecated
-# role files from older versions (e.g., builder-complexity.md, hermit-patterns.md)
-# without needing to maintain an explicit list of deprecated filenames.
-CLAIMED_ROLE_PREFIXES=(
-  architect auditor builder champion curator
-  doctor driver guide hermit judge
-  loom shepherd
-)
-
-for loom_dir in "${LOOM_DIRS[@]}"; do
-  if [[ ! -d "$TARGET_PATH/$loom_dir" ]]; then
-    continue
-  fi
-
-  while IFS= read -r -d '' file; do
-    rel_file="${file#$TARGET_PATH/}"
-
-    # Check if this file is in our removal list or known defaults
-    is_known=false
-    for known in ${REMOVE_FILES[@]+"${REMOVE_FILES[@]}"} ${KNOWN_DEFAULTS[@]+"${KNOWN_DEFAULTS[@]}"}; do
-      if [[ "$rel_file" == "$known" ]]; then
-        is_known=true
-        break
-      fi
-    done
-
-    # For .loom/roles/, also check claimed role name prefixes
-    # This catches deprecated role files from older Loom versions
-    if [[ "$is_known" == "false" ]] && [[ "$loom_dir" == ".loom/roles" ]]; then
-      base_name=$(basename "$rel_file")
-      for prefix in "${CLAIMED_ROLE_PREFIXES[@]}"; do
-        if [[ "$base_name" == "${prefix}"* ]]; then
-          is_known=true
-          # Add to removal list since it's a claimed Loom file
-          REMOVE_FILES+=("$rel_file")
-          break
-        fi
-      done
-    fi
-
-    if [[ "$is_known" == "false" ]]; then
-      UNKNOWN_FILES+=("$rel_file")
-    fi
-  done < <(find "$TARGET_PATH/$loom_dir" -type f -print0 2>/dev/null | sort -z)
-done
-
-# Also add the CLI wrapper if it exists (new location: .loom/bin/loom)
-if [[ -f "$TARGET_PATH/.loom/bin/loom" ]] && [[ -x "$TARGET_PATH/.loom/bin/loom" ]]; then
-  REMOVE_FILES+=(".loom/bin/loom")
-fi
-
-# Backward compatibility: also check old location (repo root)
-if [[ -f "$TARGET_PATH/loom" ]] && [[ -x "$TARGET_PATH/loom" ]]; then
-  REMOVE_FILES+=("loom")
-fi
 
 # Track directories to check for emptiness after removal
 REMOVE_DIRS=(
@@ -450,6 +562,7 @@ REMOVE_DIRS=(
   ".loom/scripts"
   ".loom/scripts/cli"
   ".loom/docs"
+  ".loom/hooks"
   ".loom"
   ".claude/commands/loom"
   ".claude/commands"
@@ -947,9 +1060,8 @@ for dir in "${REMOVE_DIRS[@]}"; do
       rm -rf "$dir_path"
       REMOVED_LIST+=("$dir/ (empty directory)")
       success "Removed empty directory: $dir"
-    else
-      info "Preserved directory $dir (contains files)"
     fi
+    # Silently skip non-empty directories — they contain project-specific files
   fi
 done
 
