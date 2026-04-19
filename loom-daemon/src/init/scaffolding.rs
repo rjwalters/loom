@@ -14,6 +14,7 @@ use super::InitReport;
 
 /// Prefix used to identify Loom-owned hooks in settings.json.
 /// Hooks with commands starting with this prefix are managed by Loom.
+#[allow(dead_code)]
 pub const LOOM_HOOK_PREFIX: &str = ".loom/hooks/";
 
 /// Loom section markers for CLAUDE.md content preservation
@@ -190,6 +191,7 @@ fn merge_permissions(
 ///
 /// Loom hooks are identified by command paths starting with `.loom/hooks/`.
 /// After removal, empty matcher entries and empty hook type arrays are cleaned up.
+#[allow(dead_code)]
 pub fn remove_loom_hooks(settings: &mut Value) {
     let Some(hooks) = settings.get_mut("hooks").and_then(|h| h.as_object_mut()) else {
         return;
@@ -238,6 +240,7 @@ pub fn remove_loom_hooks(settings: &mut Value) {
 /// Remove Loom-specific permissions from a settings.json value.
 ///
 /// Removes permissions that match Loom's default permission list exactly.
+#[allow(dead_code)]
 pub fn remove_loom_permissions(settings: &mut Value, loom_defaults: &Value) {
     let Some(loom_perms) = loom_defaults
         .get("permissions")
