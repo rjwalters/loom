@@ -3,7 +3,7 @@
 mod budget;
 mod costs;
 mod db;
-mod github_events;
+mod forge_events;
 mod logging;
 mod metrics;
 mod patterns;
@@ -20,7 +20,7 @@ pub use budget::*;
 #[allow(unused_imports)]
 pub use costs::*;
 #[allow(unused_imports)]
-pub use github_events::*;
+pub use forge_events::*;
 #[allow(unused_imports)]
 pub use logging::*;
 #[allow(unused_imports)]

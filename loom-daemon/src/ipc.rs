@@ -263,11 +263,11 @@ fn handle_request(
                             let forge_events = parse_forge_events(&output_str, forge_host);
                             for parsed_event in forge_events {
                                 let prompt_event = parsed_event.to_prompt_forge_event(None);
-                                if let Err(e) = db.record_prompt_github_event(&prompt_event) {
-                                    log::warn!("Failed to record GitHub event: {e}");
+                                if let Err(e) = db.record_prompt_forge_event(&prompt_event) {
+                                    log::warn!("Failed to record forge event: {e}");
                                 } else {
                                     log::debug!(
-                                        "Recorded GitHub event: {:?} (issue: {:?}, pr: {:?})",
+                                        "Recorded forge event: {:?} (issue: {:?}, pr: {:?})",
                                         prompt_event.event_type,
                                         prompt_event.issue_number,
                                         prompt_event.pr_number

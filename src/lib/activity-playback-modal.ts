@@ -442,11 +442,11 @@ async function queryTimelineEntriesFallback(
     limit: filter.limit ?? 100,
   });
 
-  // Get prompt-GitHub correlations if filtering by issue/PR
-  let githubEntries: RawPromptGitHubEntry[] = [];
+  // Get prompt-forge correlations if filtering by issue/PR
+  let forgeEntries: RawPromptForgeEntry[] = [];
   if (filter.issue_number) {
     try {
-      githubEntries = await invoke<RawPromptGitHubEntry[]>("get_prompts_for_issue", {
+      forgeEntries = await invoke<RawPromptForgeEntry[]>("get_prompts_for_issue", {
         workspacePath,
         issueNumber: filter.issue_number,
       });
@@ -455,7 +455,7 @@ async function queryTimelineEntriesFallback(
     }
   } else if (filter.pr_number) {
     try {
-      githubEntries = await invoke<RawPromptGitHubEntry[]>("get_prompts_for_pr", {
+      forgeEntries = await invoke<RawPromptForgeEntry[]>("get_prompts_for_pr", {
         workspacePath,
         prNumber: filter.pr_number,
       });
@@ -464,8 +464,8 @@ async function queryTimelineEntriesFallback(
     }
   }
 
-  // Create a map of activity IDs from GitHub entries for filtering
-  const activityIds = new Set(githubEntries.map((e) => e.activity_id));
+  // Create a map of activity IDs from forge entries for filtering
+  const activityIds = new Set(forgeEntries.map((e) => e.activity_id));
 
   // Transform and filter activities
   let entries: TimelineEntry[] = activities.map((a) => ({
@@ -523,7 +523,7 @@ interface RawActivityEntry {
   notes: string | null;
 }
 
-interface RawPromptGitHubEntry {
+interface RawPromptForgeEntry {
   id: number | null;
   activity_id: number;
   issue_number: number | null;

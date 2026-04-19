@@ -143,7 +143,8 @@ pub fn init_schema(conn: &Connection) -> Result<()> {
             -- NOTE: idx_token_usage_provider is created in migrate_token_usage_table()
             -- because the provider column may not exist in older databases.
 
-            -- GitHub events for correlating agent activity with GitHub actions
+            -- Forge events for correlating agent activity with forge actions
+            -- NOTE: table name kept as 'github_events' for migration compatibility
             CREATE TABLE IF NOT EXISTS github_events (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 activity_id INTEGER,
@@ -179,7 +180,8 @@ pub fn init_schema(conn: &Connection) -> Result<()> {
             CREATE INDEX IF NOT EXISTS idx_prompt_changes_input_id ON prompt_changes(input_id);
             CREATE INDEX IF NOT EXISTS idx_prompt_changes_after_commit ON prompt_changes(after_commit);
 
-            -- Prompt-GitHub correlation table for linking prompts to GitHub actions
+            -- Prompt-forge correlation table for linking prompts to forge actions
+            -- NOTE: table name kept as 'prompt_github' for migration compatibility
             CREATE TABLE IF NOT EXISTS prompt_github (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 input_id INTEGER REFERENCES agent_inputs(id),

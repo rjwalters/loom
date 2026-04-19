@@ -56,8 +56,8 @@ pub use models::{ActivityEntry, AgentInput, AgentOutput, InputContext, InputType
 // These types are available for future use but not currently imported elsewhere
 #[allow(unused_imports)]
 pub use models::{
-    AgentMetric, LintResults, PrReworkStats, ProductivitySummary, PromptChanges, PromptGitHubEvent,
-    PromptGitHubEventType, PromptSuccessStats, QualityMetrics, TestResults, TokenUsage,
+    AgentMetric, LintResults, PrReworkStats, ProductivitySummary, PromptChanges, PromptForgeEvent,
+    PromptForgeEventType, PromptSuccessStats, QualityMetrics, TestResults, TokenUsage,
 };
 
 // Cost analytics types (Issue #1064)
