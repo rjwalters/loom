@@ -90,7 +90,7 @@ Install Loom ${LOOM_VERSION} orchestration framework
 
 Adds Loom configuration and workflow integration:
 - .loom/ directory with configuration and scripts
-- .claude/commands/ slash commands for roles (/builder, /judge, etc.)
+- .claude/commands/loom/ slash commands for roles (/loom/builder, /loom/judge, etc.)
 - .claude/settings.json tool permissions
 - .github/ labels and workflows
 - Documentation (CLAUDE.md)
@@ -203,7 +203,7 @@ This PR adds Loom orchestration framework to the repository.
 ## What's Included
 
 - \`.loom/\` - Configuration, roles, and scripts
-- \`.claude/commands/\` - Slash commands for roles (/builder, /judge, etc.)
+- \`.claude/commands/loom/\` - Slash commands for roles (/loom/builder, /loom/judge, etc.)
 - \`.claude/settings.json\` - Claude Code tool permissions
 - \`.github/\` - Labels and workflows
 - \`CLAUDE.md\` - Documentation with Loom reference

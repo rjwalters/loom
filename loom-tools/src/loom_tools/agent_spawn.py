@@ -384,14 +384,14 @@ def validate_role(role: str, repo_root: pathlib.Path) -> bool:
     if role_file.is_file() or role_file.is_symlink():
         return True
 
-    # Check .claude/commands/<role>.md as fallback
-    role_file = repo_root / ".claude" / "commands" / f"{role}.md"
+    # Check .claude/commands/loom/<role>.md as fallback
+    role_file = repo_root / ".claude" / "commands" / "loom" / f"{role}.md"
     if role_file.is_file():
         return True
 
     log_error(f"Role not found: {role}")
     log_info(f"Expected at: {repo_root}/.loom/roles/{role}.md")
-    log_info(f"         or: {repo_root}/.claude/commands/{role}.md")
+    log_info(f"         or: {repo_root}/.claude/commands/loom/{role}.md")
     log_info("")
     log_info("Available roles:")
     roles_dir = repo_root / ".loom" / "roles"

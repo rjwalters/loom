@@ -331,7 +331,7 @@ fn handle_cli_command(command: Commands) -> Result<()> {
                                 validation.scripts_found.len()
                             );
                             println!(
-                                "  .claude/commands/ - {} slash commands found",
+                                "  .claude/commands/loom/ - {} slash commands found",
                                 validation.commands_found.len()
                             );
 

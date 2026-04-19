@@ -1,1 +1,1 @@
-../.claude/commands/champion.md
+../.claude/commands/loom/champion.md

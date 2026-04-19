@@ -375,7 +375,7 @@ fi
 
 # 6. Detect unknown files in Loom-installed directories
 # Only scan directories that the install process creates — NOT runtime dirs like worktrees/
-LOOM_DIRS=(".loom/roles" ".loom/scripts" ".loom/docs" ".claude/commands" ".claude/agents")
+LOOM_DIRS=(".loom/roles" ".loom/scripts" ".loom/docs" ".claude/commands/loom" ".claude/agents")
 
 # Claimed role name prefixes — any file in .loom/roles/ matching these prefixes
 # is owned by Loom and should be removed during uninstall. This handles deprecated
@@ -442,6 +442,7 @@ REMOVE_DIRS=(
   ".loom/scripts/cli"
   ".loom/docs"
   ".loom"
+  ".claude/commands/loom"
   ".claude/commands"
   ".claude/agents"
   ".claude"
@@ -497,12 +498,12 @@ PRESERVED_CUSTOM_FILES=()
 if [[ ${#UNKNOWN_FILES[@]} -gt 0 ]]; then
   if [[ "$CLEAN_MODE" == "true" ]]; then
     # Clean mode: remove unknown files from Loom-OWNED directories only
-    # NEVER remove unknown files from SHARED directories (.claude/commands/, .claude/agents/)
-    # because those may contain custom project-specific commands not installed by Loom
+    # NEVER remove unknown files from SHARED directories (.claude/agents/)
+    # because those may contain custom project-specific agent definitions not installed by Loom
     #
     # Shared directories: directories where both Loom and users put files
-    # Loom-owned directories: directories that Loom fully manages (.loom/*)
-    SHARED_DIR_PREFIXES=(".claude/commands/" ".claude/agents/")
+    # Loom-owned directories: directories that Loom fully manages (.loom/*, .claude/commands/loom/)
+    SHARED_DIR_PREFIXES=(".claude/agents/")
 
     for f in "${UNKNOWN_FILES[@]}"; do
       is_shared=false

@@ -332,12 +332,13 @@ mod tests {
         fs::write(workspace.join(".loom").join("roles").join("builder.md"), "").unwrap();
         fs::write(workspace.join(".loom").join("scripts").join("worktree.sh"), "").unwrap();
 
-        // Create .claude/commands/
-        fs::create_dir_all(workspace.join(".claude").join("commands")).unwrap();
+        // Create .claude/commands/loom/
+        fs::create_dir_all(workspace.join(".claude").join("commands").join("loom")).unwrap();
         fs::write(
             workspace
                 .join(".claude")
                 .join("commands")
+                .join("loom")
                 .join("builder.md"),
             "",
         )

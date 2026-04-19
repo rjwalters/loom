@@ -710,7 +710,7 @@ EXPECTED_FILES=(
   ".loom/hooks/guard-destructive.sh"
   "CLAUDE.md"
   ".github/labels.yml"
-  ".claude/commands"
+  ".claude/commands/loom"
   ".claude/settings.json"
 )
 

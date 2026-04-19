@@ -153,8 +153,8 @@ pub fn validate_loom_source_repo(workspace_path: &Path) -> ValidationReport {
             .push("Missing .loom/scripts/ directory".to_string());
     }
 
-    // Check .claude/commands/
-    let commands_dir = workspace_path.join(".claude").join("commands");
+    // Check .claude/commands/loom/
+    let commands_dir = workspace_path.join(".claude").join("commands").join("loom");
     if commands_dir.is_dir() {
         if let Ok(entries) = fs::read_dir(&commands_dir) {
             for entry in entries.filter_map(Result::ok) {
@@ -171,7 +171,7 @@ pub fn validate_loom_source_repo(workspace_path: &Path) -> ValidationReport {
     } else {
         report
             .issues
-            .push("Missing .claude/commands/ directory".to_string());
+            .push("Missing .claude/commands/loom/ directory".to_string());
     }
 
     // Check documentation files

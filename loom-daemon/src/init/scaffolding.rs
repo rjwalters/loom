@@ -814,22 +814,34 @@ WARNING: Never run `lake build` inside Docker - causes memory corruption.
         fs::create_dir(workspace.join(".git")).unwrap();
 
         // Create defaults with .claude commands
-        fs::create_dir_all(defaults.join(".claude").join("commands")).unwrap();
+        fs::create_dir_all(defaults.join(".claude").join("commands").join("loom")).unwrap();
         fs::write(
-            defaults.join(".claude").join("commands").join("loom.md"),
+            defaults
+                .join(".claude")
+                .join("commands")
+                .join("loom")
+                .join("loom.md"),
             "loom command v2 with bug fix",
         )
         .unwrap();
         fs::write(
-            defaults.join(".claude").join("commands").join("builder.md"),
+            defaults
+                .join(".claude")
+                .join("commands")
+                .join("loom")
+                .join("builder.md"),
             "builder command v2",
         )
         .unwrap();
 
         // Create existing .claude directory in workspace (simulates previous install)
-        fs::create_dir_all(workspace.join(".claude").join("commands")).unwrap();
+        fs::create_dir_all(workspace.join(".claude").join("commands").join("loom")).unwrap();
         fs::write(
-            workspace.join(".claude").join("commands").join("loom.md"),
+            workspace
+                .join(".claude")
+                .join("commands")
+                .join("loom")
+                .join("loom.md"),
             "loom command v1 with bug",
         )
         .unwrap();
@@ -847,8 +859,14 @@ WARNING: Never run `lake build` inside Docker - causes memory corruption.
         setup_repository_scaffolding(workspace, &defaults, false, &mut report).unwrap();
 
         // Verify: loom.md was UPDATED (default command updated with bug fix)
-        let loom_content =
-            fs::read_to_string(workspace.join(".claude").join("commands").join("loom.md")).unwrap();
+        let loom_content = fs::read_to_string(
+            workspace
+                .join(".claude")
+                .join("commands")
+                .join("loom")
+                .join("loom.md"),
+        )
+        .unwrap();
         assert_eq!(loom_content, "loom command v2 with bug fix");
 
         // Verify: builder.md was ADDED (new default command)
@@ -856,6 +874,7 @@ WARNING: Never run `lake build` inside Docker - causes memory corruption.
             workspace
                 .join(".claude")
                 .join("commands")
+                .join("loom")
                 .join("builder.md"),
         )
         .unwrap();
@@ -874,10 +893,10 @@ WARNING: Never run `lake build` inside Docker - causes memory corruption.
         // Verify report reflects the changes
         assert!(report
             .updated
-            .contains(&".claude/commands/loom.md".to_string()));
+            .contains(&".claude/commands/loom/loom.md".to_string()));
         assert!(report
             .added
-            .contains(&".claude/commands/builder.md".to_string()));
+            .contains(&".claude/commands/loom/builder.md".to_string()));
         assert!(report
             .preserved
             .contains(&".claude/commands/my-custom.md".to_string()));

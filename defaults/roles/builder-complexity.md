@@ -1,1 +1,1 @@
-../.claude/commands/builder-complexity.md
+../.claude/commands/loom/builder-complexity.md

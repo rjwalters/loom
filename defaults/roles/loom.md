@@ -1,1 +1,1 @@
-../.claude/commands/loom.md
+../.claude/commands/loom/loom.md

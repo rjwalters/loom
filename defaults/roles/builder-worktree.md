@@ -1,1 +1,1 @@
-../.claude/commands/builder-worktree.md
+../.claude/commands/loom/builder-worktree.md

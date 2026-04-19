@@ -1,1 +1,1 @@
-../.claude/commands/judge.md
+../.claude/commands/loom/judge.md
