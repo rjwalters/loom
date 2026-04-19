@@ -160,9 +160,10 @@ while [[ "${1:-}" == -* ]]; do
   esac
 done
 
-# Early validation for --full: requires gh CLI
+# Early validation for --full: requires gh CLI (for GitHub repos)
+# Gitea repos use the API directly and don't need gh CLI
 if [[ "$INSTALL_TYPE" == "2" ]] && ! command -v gh &> /dev/null; then
-  error "Full Install requires GitHub CLI (gh)\n       Install: brew install gh\n       Or use --quick for installation without GitHub integration"
+  warning "GitHub CLI (gh) not found. Required for GitHub repos.\n       Install: brew install gh\n       For Gitea repos, set GITEA_TOKEN instead.\n       Or use --quick for installation without forge integration"
 fi
 
 # Get target path from argument or prompt
@@ -268,9 +269,10 @@ GITIGNORE
   success "Initial commit created"
   echo ""
 
-  # Offer GitHub repository creation
+  # Offer remote repository creation
   if command -v gh &> /dev/null; then
     echo "Would you like to create a GitHub repository for this project?"
+    echo "(For Gitea, create the repository manually and add the remote)"
     echo ""
     read -r -p "Create GitHub repository? [y/N] " -n 1 CREATE_REPO
     echo ""
@@ -304,16 +306,17 @@ GITIGNORE
 
       info "Creating GitHub repository: $REPO_NAME..."
       if gh repo create "$REPO_NAME" $VISIBILITY_FLAG --source="$TARGET_PATH" --push; then
-        success "GitHub repository created and pushed"
+        success "Repository created and pushed"
       else
-        warning "Failed to create GitHub repository. Continuing with local git only."
+        warning "Failed to create repository. Continuing with local git only."
         info "You can create the repository later with: gh repo create"
       fi
       echo ""
     fi
   else
-    info "GitHub CLI (gh) not found - skipping GitHub repository creation"
-    info "Install with: brew install gh"
+    info "GitHub CLI (gh) not found - skipping remote repository creation"
+    info "For GitHub: install gh CLI (brew install gh)"
+    info "For Gitea: create the repo manually and run: git remote add origin <url>"
     echo ""
   fi
 fi
@@ -362,12 +365,13 @@ else
   INSTALL_INSTRUCTIONS="${INSTALL_INSTRUCTIONS}\n  • Rust/Cargo: curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh"
 fi
 
-# Check for GitHub CLI (optional but needed for Full Install)
+# Check for GitHub CLI (optional, needed for Full Install with GitHub repos)
 if command -v gh &> /dev/null; then
   success "gh: $(gh --version | head -1)"
 else
-  warning "gh (GitHub CLI) not found - Full Install will not be available"
+  warning "gh (GitHub CLI) not found - needed for Full Install with GitHub repos"
   info "  Install with: brew install gh"
+  info "  For Gitea repos, gh is not required (set GITEA_TOKEN instead)"
 fi
 
 echo ""
@@ -629,30 +633,52 @@ case "$METHOD" in
     info "Running Full Install with Workflow..."
     echo ""
 
-    # Check prerequisites
-    if ! command -v gh &> /dev/null; then
-      error "GitHub CLI (gh) is required for full installation\n       Install: brew install gh"
+    # Detect forge type from remote URL
+    cd "$TARGET_PATH"
+    _ORIGIN_URL=$(git config --get remote.origin.url 2>/dev/null || echo "")
+    _DETECTED_FORGE="github"
+    if [[ -n "$_ORIGIN_URL" ]] && [[ ! "$_ORIGIN_URL" =~ github\.com ]]; then
+      _DETECTED_FORGE="gitea"
     fi
 
-    # Check GitHub authentication
-    if ! gh auth status &> /dev/null; then
-      warning "GitHub CLI is not authenticated"
-      info "Please authenticate with GitHub:"
-      echo ""
-      gh auth login || error "GitHub authentication failed"
-      echo ""
-    fi
+    # Check prerequisites based on detected forge
+    if [[ "$_DETECTED_FORGE" == "github" ]]; then
+      if ! command -v gh &> /dev/null; then
+        error "GitHub CLI (gh) is required for GitHub repos\n       Install: brew install gh\n       For Gitea repos, set GITEA_TOKEN instead"
+      fi
 
-    success "GitHub CLI is authenticated"
+      # Check GitHub authentication
+      if ! gh auth status &> /dev/null; then
+        warning "GitHub CLI is not authenticated"
+        info "Please authenticate with GitHub:"
+        echo ""
+        gh auth login || error "GitHub authentication failed"
+        echo ""
+      fi
+      success "GitHub CLI is authenticated"
+    else
+      # Gitea forge
+      if [[ -z "${GITEA_TOKEN:-${FORGE_TOKEN:-}}" ]]; then
+        warning "Gitea detected but no API token found"
+        info "Set GITEA_TOKEN or FORGE_TOKEN environment variable"
+        info "Create a token at: <your-gitea-instance>/user/settings/applications"
+      else
+        success "Gitea API token configured"
+      fi
+    fi
     echo ""
 
     # Show repository info
-    cd "$TARGET_PATH"
-    REPO_INFO=$(gh repo view --json nameWithOwner,description 2>/dev/null || echo "{}")
-    REPO_NAME=$(echo "$REPO_INFO" | jq -r '.nameWithOwner // "unknown"' 2>/dev/null || echo "unknown")
+    REPO_NAME="unknown"
+    if [[ "$_DETECTED_FORGE" == "github" ]]; then
+      REPO_INFO=$(gh repo view --json nameWithOwner,description 2>/dev/null || echo "{}")
+      REPO_NAME=$(echo "$REPO_INFO" | jq -r '.nameWithOwner // "unknown"' 2>/dev/null || echo "unknown")
+    elif [[ -n "$_ORIGIN_URL" ]]; then
+      REPO_NAME=$(echo "$_ORIGIN_URL" | sed -E 's/\.git$//; s#^.*[:/]([^/]+/[^/]+)$#\1#' || echo "unknown")
+    fi
 
     if [[ "$REPO_NAME" != "unknown" ]]; then
-      info "Target repository: $REPO_NAME"
+      info "Target repository: $REPO_NAME (${_DETECTED_FORGE})"
     else
       warning "Could not detect remote repository. This may be a local-only repo."
       read -r -p "Continue anyway? [y/N] " -n 1 CONTINUE_LOCAL

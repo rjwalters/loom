@@ -7,9 +7,11 @@ This repository uses **Loom** for AI-powered development orchestration.
 
 ## What is Loom?
 
-Loom is a multi-terminal desktop application for macOS that orchestrates AI-powered development workers using git worktrees and GitHub as the coordination layer. It enables both automated orchestration (Tauri App Mode) and manual coordination (Manual Orchestration Mode).
+Loom is a multi-terminal desktop application for macOS that orchestrates AI-powered development workers using git worktrees and a forge (GitHub or Gitea) as the coordination layer. It enables both automated orchestration (Tauri App Mode) and manual coordination (Manual Orchestration Mode).
 
 **Loom Repository**: https://github.com/rjwalters/loom
+
+**Supported Forges**: GitHub (full support), Gitea (supported via forge abstraction layer). Forge type is auto-detected from your git remote URL. For Gitea, set `GITEA_TOKEN` or `FORGE_TOKEN` with an API token from your instance's `/user/settings/applications` page.
 
 ## Installing Loom
 
@@ -41,7 +43,9 @@ Additional options for `install-loom.sh`:
 
 ## Critical Rules
 
-**Never use `gh pr merge`** — Always use `./.loom/scripts/merge-pr.sh <PR_NUMBER>` instead. The `gh pr merge` command attempts a local checkout which fails in worktrees. The merge script uses the GitHub API directly. A PreToolUse hook enforces this.
+**Never use `gh pr merge`** — Always use `./.loom/scripts/merge-pr.sh <PR_NUMBER>` instead. The `gh pr merge` command attempts a local checkout which fails in worktrees. The merge script uses the forge API directly. A PreToolUse hook enforces this.
+
+**Forge CLI note** — The `gh` commands shown throughout this document are for GitHub repositories. For Gitea repositories, Loom's scripts handle forge API calls internally; agents do not need to call `gh` directly. The label-based workflow is the same regardless of forge.
 
 **`--permission-mode bypassPermissions` silently disables PreToolUse hooks** — If you invoke Claude Code with `--permission-mode bypassPermissions`, ALL PreToolUse hooks (including `guard-destructive.sh`) are skipped entirely and will not fire. Loom agents use `--dangerously-skip-permissions` instead, which runs Claude in non-interactive mode while still firing hooks. If you have a shell alias like `alias claude="claude --permission-mode bypassPermissions"`, your interactive sessions will have no hook protection. Use `--dangerously-skip-permissions` for automation that requires hooks to run.
 
@@ -368,7 +372,7 @@ Full role definitions with detailed guidelines are available in:
 
 ## Label-Based Workflow
 
-Agents coordinate work through GitHub labels. This enables autonomous operation without direct communication.
+Agents coordinate work through forge labels (GitHub or Gitea). This enables autonomous operation without direct communication.
 
 ### Label Flow
 
@@ -1099,8 +1103,11 @@ git worktree prune
 
 **Labels out of sync**:
 ```bash
-# Re-sync labels from configuration
+# Re-sync labels from configuration (GitHub)
 gh label sync --file .github/labels.yml
+
+# Or use the Loom sync script (works with both GitHub and Gitea)
+./scripts/install/sync-labels.sh .
 ```
 
 **Terminal won't start (Tauri App)**:

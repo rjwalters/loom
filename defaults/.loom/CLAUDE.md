@@ -7,9 +7,11 @@ This repository uses **Loom** for AI-powered development orchestration.
 
 ## What is Loom?
 
-Loom is a multi-terminal desktop application for macOS that orchestrates AI-powered development workers using git worktrees and GitHub as the coordination layer. It enables both automated orchestration (Tauri App Mode) and manual coordination (Manual Orchestration Mode).
+Loom is a multi-terminal desktop application for macOS that orchestrates AI-powered development workers using git worktrees and a forge (GitHub or Gitea) as the coordination layer. It enables both automated orchestration (Tauri App Mode) and manual coordination (Manual Orchestration Mode).
 
 **Loom Repository**: https://github.com/rjwalters/loom
+
+> **Forge note**: The `gh` commands shown below are for GitHub. For Gitea repositories, Loom scripts handle API calls internally. The label-based workflow is identical regardless of forge.
 
 ## Usage Modes
 

@@ -7,7 +7,7 @@ This repository uses **Loom** for AI-powered development orchestration.
 
 ## What is Loom?
 
-Loom is a multi-terminal desktop application for macOS that orchestrates AI-powered development workers using git worktrees and GitHub as the coordination layer. It enables both automated orchestration (Tauri App Mode) and manual coordination (Manual Orchestration Mode).
+Loom is a multi-terminal desktop application for macOS that orchestrates AI-powered development workers using git worktrees and a forge (GitHub or Gitea) as the coordination layer. It enables both automated orchestration (Tauri App Mode) and manual coordination (Manual Orchestration Mode).
 
 **Loom Repository**: https://github.com/rjwalters/loom
 
@@ -566,7 +566,7 @@ See `.loom/docs/troubleshooting.md` for detailed troubleshooting including:
 loom-clean --force                       # Clean stale worktrees/branches
 ./.loom/scripts/stale-building-check.sh --recover  # Recover stuck issues
 ./.loom/scripts/recover-orphaned-shepherds.sh --recover  # Recover orphaned shepherds after crash
-gh label sync --file .github/labels.yml  # Re-sync labels
+gh label sync --file .github/labels.yml  # Re-sync labels (GitHub only)
 touch .loom/stop-daemon                  # Graceful daemon shutdown
 ```
 
@@ -587,11 +587,19 @@ Loom provides a unified MCP server (`mcp-loom`) for programmatic control. See th
 mcp__loom__get_agent_metrics --command summary --period week
 ```
 
-## GitHub Authentication
+## Forge Authentication
+
+### GitHub
 
 Loom uses the `gh` CLI for all GitHub operations. By default it uses the credential from `gh auth login`, which has access to all repositories. To scope access to a single repository, create a fine-grained PAT and set `export GH_TOKEN=github_pat_xxx` before running Loom.
 
 See `.loom/docs/github-authentication.md` for the detailed setup guide, required token permissions per role, and troubleshooting.
+
+### Gitea
+
+For Gitea repositories, Loom uses the Gitea API with token authentication. Set `GITEA_TOKEN` or `FORGE_TOKEN` environment variable with an API token created at `<your-gitea-instance>/user/settings/applications`. The token needs repository read/write permissions (issues, pull requests, labels).
+
+See `.loom/docs/forge-authentication.md` for the complete authentication guide covering both GitHub and Gitea.
 
 ## Releasing
 
@@ -621,6 +629,7 @@ The script updates all 7 version-bearing files (`package.json`, `mcp-loom/packag
 - **Troubleshooting**: `.loom/docs/troubleshooting.md`
 - **Daemon Reference**: `.loom/docs/daemon-reference.md`
 - **GitHub Authentication**: `.loom/docs/github-authentication.md`
+- **Forge Authentication** (GitHub + Gitea): `.loom/docs/forge-authentication.md`
 - **Scripts**: `.loom/scripts/`
 
 ---

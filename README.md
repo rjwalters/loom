@@ -4,9 +4,11 @@
 [![GitHub Release](https://img.shields.io/github/v/release/rjwalters/loom?include_prereleases)](https://github.com/rjwalters/loom/releases)
 [![Lines of Code](https://raw.githubusercontent.com/rjwalters/loom/ghloc/.ghloc/badge.svg)](https://github.com/rjwalters/loom)
 
-**AI-powered development orchestration using GitHub as the coordination layer.**
+**AI-powered development orchestration using your forge as the coordination layer.**
 
-Loom spawns AI agents that claim issues, implement features, review PRs, and merge code—all coordinated through GitHub labels. Your only job: write issues, review PRs, merge what you like.
+Loom spawns AI agents that claim issues, implement features, review PRs, and merge code -- all coordinated through labels. Your only job: write issues, review PRs, merge what you like.
+
+**Supported Forges**: GitHub (full support) | Gitea (supported via forge abstraction layer)
 
 ## Quick Start
 
