@@ -20,13 +20,13 @@
 //! // Returns: [ParsedForgeEvent { event_type: PrCreated, pr_number: Some(123), ... }]
 //! ```
 
-use crate::activity::{PromptGitHubEvent, PromptGitHubEventType};
+use crate::activity::{PromptForgeEvent, PromptForgeEventType};
 use regex::Regex;
 
 /// A parsed forge event from terminal output
 #[derive(Debug, Clone)]
 pub struct ParsedForgeEvent {
-    pub event_type: PromptGitHubEventType,
+    pub event_type: PromptForgeEventType,
     pub issue_number: Option<i32>,
     pub pr_number: Option<i32>,
     pub labels_added: Vec<String>,
@@ -34,8 +34,8 @@ pub struct ParsedForgeEvent {
 }
 
 impl ParsedForgeEvent {
-    /// Convert to a `PromptGitHubEvent` for database storage
-    pub fn to_prompt_forge_event(&self, input_id: Option<i64>) -> PromptGitHubEvent {
+    /// Convert to a `PromptForgeEvent` for database storage
+    pub fn to_prompt_forge_event(&self, input_id: Option<i64>) -> PromptForgeEvent {
         let (label_before, label_after) =
             if !self.labels_added.is_empty() || !self.labels_removed.is_empty() {
                 // For label changes, we track removed as "before" and added as "after"
@@ -55,7 +55,7 @@ impl ParsedForgeEvent {
                 (None, None)
             };
 
-        PromptGitHubEvent {
+        PromptForgeEvent {
             id: None,
             input_id,
             issue_number: self.issue_number,
@@ -95,14 +95,14 @@ pub fn parse_forge_events(output: &str, forge_host: &str) -> Vec<ParsedForgeEven
                 if let Ok(number) = number_match.as_str().parse::<i32>() {
                     let event = match type_match.as_str() {
                         "issues" => ParsedForgeEvent {
-                            event_type: PromptGitHubEventType::IssueCreated,
+                            event_type: PromptForgeEventType::IssueCreated,
                             issue_number: Some(number),
                             pr_number: None,
                             labels_added: Vec::new(),
                             labels_removed: Vec::new(),
                         },
                         "pull" | "pulls" => ParsedForgeEvent {
-                            event_type: PromptGitHubEventType::PrCreated,
+                            event_type: PromptForgeEventType::PrCreated,
                             issue_number: None,
                             pr_number: Some(number),
                             labels_added: Vec::new(),
@@ -124,7 +124,7 @@ pub fn parse_forge_events(output: &str, forge_host: &str) -> Vec<ParsedForgeEven
             if let Some(number_match) = cap.get(1) {
                 if let Ok(number) = number_match.as_str().parse::<i32>() {
                     events.push(ParsedForgeEvent {
-                        event_type: PromptGitHubEventType::PrMerged,
+                        event_type: PromptForgeEventType::PrMerged,
                         issue_number: None,
                         pr_number: Some(number),
                         labels_added: Vec::new(),
@@ -145,7 +145,7 @@ pub fn parse_forge_events(output: &str, forge_host: &str) -> Vec<ParsedForgeEven
             if let Some(number_match) = number {
                 if let Ok(number) = number_match.as_str().parse::<i32>() {
                     events.push(ParsedForgeEvent {
-                        event_type: PromptGitHubEventType::IssueClosed,
+                        event_type: PromptForgeEventType::IssueClosed,
                         issue_number: Some(number),
                         pr_number: None,
                         labels_added: Vec::new(),
@@ -163,7 +163,7 @@ pub fn parse_forge_events(output: &str, forge_host: &str) -> Vec<ParsedForgeEven
             if let Some(number_match) = cap.get(1) {
                 if let Ok(number) = number_match.as_str().parse::<i32>() {
                     events.push(ParsedForgeEvent {
-                        event_type: PromptGitHubEventType::PrClosed,
+                        event_type: PromptForgeEventType::PrClosed,
                         issue_number: None,
                         pr_number: Some(number),
                         labels_added: Vec::new(),
@@ -194,7 +194,7 @@ pub fn parse_forge_events(output: &str, forge_host: &str) -> Vec<ParsedForgeEven
                     let (issue_number, pr_number) = extract_issue_pr_from_context(output);
 
                     events.push(ParsedForgeEvent {
-                        event_type: PromptGitHubEventType::LabelAdded,
+                        event_type: PromptForgeEventType::LabelAdded,
                         issue_number,
                         pr_number,
                         labels_added: labels,
@@ -222,7 +222,7 @@ pub fn parse_forge_events(output: &str, forge_host: &str) -> Vec<ParsedForgeEven
                     let (issue_number, pr_number) = extract_issue_pr_from_context(output);
 
                     events.push(ParsedForgeEvent {
-                        event_type: PromptGitHubEventType::LabelRemoved,
+                        event_type: PromptForgeEventType::LabelRemoved,
                         issue_number,
                         pr_number,
                         labels_added: Vec::new(),
@@ -242,7 +242,7 @@ pub fn parse_forge_events(output: &str, forge_host: &str) -> Vec<ParsedForgeEven
             if let Some(number_match) = cap.get(2) {
                 if let Ok(number) = number_match.as_str().parse::<i32>() {
                     events.push(ParsedForgeEvent {
-                        event_type: PromptGitHubEventType::ReviewSubmitted,
+                        event_type: PromptForgeEventType::ReviewSubmitted,
                         issue_number: None,
                         pr_number: Some(number),
                         labels_added: Vec::new(),
@@ -295,7 +295,7 @@ mod tests {
         let output = "Creating issue...\nhttps://github.com/owner/repo/issues/42";
         let events = parse_forge_events(output, GITHUB_HOST);
         assert_eq!(events.len(), 1);
-        assert_eq!(events[0].event_type, PromptGitHubEventType::IssueCreated);
+        assert_eq!(events[0].event_type, PromptForgeEventType::IssueCreated);
         assert_eq!(events[0].issue_number, Some(42));
     }
 
@@ -304,7 +304,7 @@ mod tests {
         let output = "Creating pull request for feature/test into main in owner/repo\n\nhttps://github.com/owner/repo/pull/123";
         let events = parse_forge_events(output, GITHUB_HOST);
         assert_eq!(events.len(), 1);
-        assert_eq!(events[0].event_type, PromptGitHubEventType::PrCreated);
+        assert_eq!(events[0].event_type, PromptForgeEventType::PrCreated);
         assert_eq!(events[0].pr_number, Some(123));
     }
 
@@ -315,7 +315,7 @@ mod tests {
         assert!(!events.is_empty());
         let merge_event = events
             .iter()
-            .find(|e| e.event_type == PromptGitHubEventType::PrMerged);
+            .find(|e| e.event_type == PromptForgeEventType::PrMerged);
         assert!(merge_event.is_some());
         if let Some(evt) = merge_event {
             assert_eq!(evt.pr_number, Some(456));
@@ -327,7 +327,7 @@ mod tests {
         let output = "Closed issue #789";
         let events = parse_forge_events(output, GITHUB_HOST);
         assert_eq!(events.len(), 1);
-        assert_eq!(events[0].event_type, PromptGitHubEventType::IssueClosed);
+        assert_eq!(events[0].event_type, PromptForgeEventType::IssueClosed);
         assert_eq!(events[0].issue_number, Some(789));
     }
 
@@ -336,7 +336,7 @@ mod tests {
         let output = "gh issue edit 42 --add-label \"loom:building\"";
         let events = parse_forge_events(output, GITHUB_HOST);
         assert_eq!(events.len(), 1);
-        assert_eq!(events[0].event_type, PromptGitHubEventType::LabelAdded);
+        assert_eq!(events[0].event_type, PromptForgeEventType::LabelAdded);
         assert_eq!(events[0].labels_added, vec!["loom:building"]);
         assert_eq!(events[0].issue_number, Some(42));
     }
@@ -346,7 +346,7 @@ mod tests {
         let output = "gh issue edit 42 --remove-label loom:issue";
         let events = parse_forge_events(output, GITHUB_HOST);
         assert_eq!(events.len(), 1);
-        assert_eq!(events[0].event_type, PromptGitHubEventType::LabelRemoved);
+        assert_eq!(events[0].event_type, PromptForgeEventType::LabelRemoved);
         assert_eq!(events[0].labels_removed, vec!["loom:issue"]);
     }
 
@@ -355,7 +355,7 @@ mod tests {
         let output = "Approved pull request #123";
         let events = parse_forge_events(output, GITHUB_HOST);
         assert_eq!(events.len(), 1);
-        assert_eq!(events[0].event_type, PromptGitHubEventType::ReviewSubmitted);
+        assert_eq!(events[0].event_type, PromptForgeEventType::ReviewSubmitted);
         assert_eq!(events[0].pr_number, Some(123));
     }
 
@@ -367,10 +367,10 @@ mod tests {
 
         let remove_event = events
             .iter()
-            .find(|e| e.event_type == PromptGitHubEventType::LabelRemoved);
+            .find(|e| e.event_type == PromptForgeEventType::LabelRemoved);
         let add_event = events
             .iter()
-            .find(|e| e.event_type == PromptGitHubEventType::LabelAdded);
+            .find(|e| e.event_type == PromptForgeEventType::LabelAdded);
 
         assert!(remove_event.is_some());
         assert!(add_event.is_some());
@@ -392,7 +392,7 @@ mod tests {
     #[test]
     fn test_to_prompt_forge_event() {
         let parsed = ParsedForgeEvent {
-            event_type: PromptGitHubEventType::LabelAdded,
+            event_type: PromptForgeEventType::LabelAdded,
             issue_number: Some(42),
             pr_number: None,
             labels_added: vec!["loom:building".to_string()],
@@ -413,7 +413,7 @@ mod tests {
         let output = "Creating issue...\nhttps://gitea.example.com/owner/repo/issues/42";
         let events = parse_forge_events(output, GITEA_HOST);
         assert_eq!(events.len(), 1);
-        assert_eq!(events[0].event_type, PromptGitHubEventType::IssueCreated);
+        assert_eq!(events[0].event_type, PromptForgeEventType::IssueCreated);
         assert_eq!(events[0].issue_number, Some(42));
     }
 
@@ -423,7 +423,7 @@ mod tests {
         let output = "Creating pull request...\nhttps://gitea.example.com/owner/repo/pulls/99";
         let events = parse_forge_events(output, GITEA_HOST);
         assert_eq!(events.len(), 1);
-        assert_eq!(events[0].event_type, PromptGitHubEventType::PrCreated);
+        assert_eq!(events[0].event_type, PromptForgeEventType::PrCreated);
         assert_eq!(events[0].pr_number, Some(99));
     }
 
@@ -449,7 +449,7 @@ mod tests {
         let output = "https://github.com/owner/repo/pull/456";
         let events = parse_forge_events(output, GITHUB_HOST);
         assert_eq!(events.len(), 1);
-        assert_eq!(events[0].event_type, PromptGitHubEventType::PrCreated);
+        assert_eq!(events[0].event_type, PromptForgeEventType::PrCreated);
         assert_eq!(events[0].pr_number, Some(456));
     }
 }

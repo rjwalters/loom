@@ -169,10 +169,10 @@ pub struct PromptChanges {
     pub tests_modified: i32,
 }
 
-/// GitHub event types that can be parsed from terminal output
+/// Forge event types that can be parsed from terminal output
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum PromptGitHubEventType {
+pub enum PromptForgeEventType {
     IssueCreated,
     IssueClosed,
     PrCreated,
@@ -183,7 +183,7 @@ pub enum PromptGitHubEventType {
     ReviewSubmitted,
 }
 
-impl PromptGitHubEventType {
+impl PromptForgeEventType {
     pub fn as_str(&self) -> &str {
         match self {
             Self::IssueCreated => "issue_created",
@@ -212,9 +212,9 @@ impl PromptGitHubEventType {
     }
 }
 
-/// Prompt-GitHub correlation record for tracking which prompts triggered GitHub actions
+/// Prompt-forge correlation record for tracking which prompts triggered forge actions
 #[derive(Debug, Clone)]
-pub struct PromptGitHubEvent {
+pub struct PromptForgeEvent {
     #[allow(dead_code)]
     pub id: Option<i64>,
     pub input_id: Option<i64>,
@@ -222,7 +222,7 @@ pub struct PromptGitHubEvent {
     pub pr_number: Option<i32>,
     pub label_before: Option<Vec<String>>,
     pub label_after: Option<Vec<String>>,
-    pub event_type: PromptGitHubEventType,
+    pub event_type: PromptForgeEventType,
 }
 
 /// Test results parsed from terminal output

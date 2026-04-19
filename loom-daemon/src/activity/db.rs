@@ -7,7 +7,7 @@
 //! - [`super::claims`]: Issue claim registry
 //! - [`super::cost_analytics`]: Budget and cost analysis
 //! - [`super::metrics`]: Task metrics and productivity
-//! - [`super::prompts`]: Prompt tracking (git changes, GitHub events)
+//! - [`super::prompts`]: Prompt tracking (git changes, forge events)
 //! - [`super::quality`]: Quality metrics (tests, PR reviews, rework)
 
 use anyhow::Result;
@@ -18,7 +18,7 @@ use std::path::PathBuf;
 use super::models::{
     ActivityEntry, AgentInput, AgentMetric, AgentOutput, BudgetConfig, BudgetPeriod, BudgetStatus,
     ClaimResult, ClaimType, CostByIssue, CostByPr, CostByRole, CostSummary, InputContext,
-    InputType, IssueClaim, PrReworkStats, ProductivitySummary, PromptChanges, PromptGitHubEvent,
+    InputType, IssueClaim, PrReworkStats, ProductivitySummary, PromptChanges, PromptForgeEvent,
     PromptSuccessStats, QualityMetrics, RunwayProjection, TokenUsage,
 };
 use super::schema::init_schema;
@@ -205,14 +205,14 @@ impl ActivityDb {
     // ========================================================================
 
     /// Record a prompt-GitHub correlation event.
-    pub fn record_prompt_github_event(&self, event: &PromptGitHubEvent) -> Result<i64> {
-        prompts::record_prompt_github_event(&self.conn, event)
+    pub fn record_prompt_forge_event(&self, event: &PromptForgeEvent) -> Result<i64> {
+        prompts::record_prompt_forge_event(&self.conn, event)
     }
 
     /// Get prompt-GitHub events for a specific input.
     #[allow(dead_code)]
-    pub fn get_prompt_github_events(&self, input_id: i64) -> Result<Vec<PromptGitHubEvent>> {
-        prompts::get_prompt_github_events(&self.conn, input_id)
+    pub fn get_prompt_forge_events(&self, input_id: i64) -> Result<Vec<PromptForgeEvent>> {
+        prompts::get_prompt_forge_events(&self.conn, input_id)
     }
 
     /// Get terminal activity history (inputs joined with outputs)
@@ -1225,8 +1225,8 @@ mod tests {
     }
 
     #[test]
-    fn test_record_prompt_github_event() -> Result<()> {
-        use super::super::models::PromptGitHubEventType;
+    fn test_record_prompt_forge_event() -> Result<()> {
+        use super::super::models::PromptForgeEventType;
 
         let temp_file = NamedTempFile::new()?;
         let db = ActivityDb::new(temp_file.path().to_path_buf())?;
@@ -1244,24 +1244,24 @@ mod tests {
         let input_id = db.record_input(&input)?;
 
         // Record a GitHub event linked to this input
-        let event = PromptGitHubEvent {
+        let event = PromptForgeEvent {
             id: None,
             input_id: Some(input_id),
             issue_number: Some(42),
             pr_number: None,
             label_before: None,
             label_after: Some(vec!["loom:building".to_string()]),
-            event_type: PromptGitHubEventType::LabelAdded,
+            event_type: PromptForgeEventType::LabelAdded,
         };
 
-        let event_id = db.record_prompt_github_event(&event)?;
+        let event_id = db.record_prompt_forge_event(&event)?;
         assert!(event_id > 0);
 
         // Retrieve the events
-        let events = db.get_prompt_github_events(input_id)?;
+        let events = db.get_prompt_forge_events(input_id)?;
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].issue_number, Some(42));
-        assert_eq!(events[0].event_type, PromptGitHubEventType::LabelAdded);
+        assert_eq!(events[0].event_type, PromptForgeEventType::LabelAdded);
         assert_eq!(events[0].label_after, Some(vec!["loom:building".to_string()]));
 
         Ok(())
@@ -1269,7 +1269,7 @@ mod tests {
 
     #[test]
     fn test_record_multiple_github_events() -> Result<()> {
-        use super::super::models::PromptGitHubEventType;
+        use super::super::models::PromptForgeEventType;
 
         let temp_file = NamedTempFile::new()?;
         let db = ActivityDb::new(temp_file.path().to_path_buf())?;
@@ -1287,35 +1287,35 @@ mod tests {
         let input_id = db.record_input(&input)?;
 
         // Record multiple events from the same input
-        let event1 = PromptGitHubEvent {
+        let event1 = PromptForgeEvent {
             id: None,
             input_id: Some(input_id),
             issue_number: None,
             pr_number: Some(123),
             label_before: None,
             label_after: None,
-            event_type: PromptGitHubEventType::PrCreated,
+            event_type: PromptForgeEventType::PrCreated,
         };
-        db.record_prompt_github_event(&event1)?;
+        db.record_prompt_forge_event(&event1)?;
 
-        let event2 = PromptGitHubEvent {
+        let event2 = PromptForgeEvent {
             id: None,
             input_id: Some(input_id),
             issue_number: None,
             pr_number: Some(123),
             label_before: None,
             label_after: Some(vec!["loom:review-requested".to_string()]),
-            event_type: PromptGitHubEventType::LabelAdded,
+            event_type: PromptForgeEventType::LabelAdded,
         };
-        db.record_prompt_github_event(&event2)?;
+        db.record_prompt_forge_event(&event2)?;
 
         // Retrieve all events for this input
-        let retrieved_events = db.get_prompt_github_events(input_id)?;
+        let retrieved_events = db.get_prompt_forge_events(input_id)?;
         assert_eq!(retrieved_events.len(), 2);
 
         let pr_created = retrieved_events
             .iter()
-            .find(|e| e.event_type == PromptGitHubEventType::PrCreated);
+            .find(|e| e.event_type == PromptForgeEventType::PrCreated);
         assert!(pr_created.is_some());
         if let Some(evt) = pr_created {
             assert_eq!(evt.pr_number, Some(123));
@@ -1323,7 +1323,7 @@ mod tests {
 
         let label_added = retrieved_events
             .iter()
-            .find(|e| e.event_type == PromptGitHubEventType::LabelAdded);
+            .find(|e| e.event_type == PromptForgeEventType::LabelAdded);
         assert!(label_added.is_some());
 
         Ok(())
@@ -1331,23 +1331,23 @@ mod tests {
 
     #[test]
     fn test_github_event_without_input_link() -> Result<()> {
-        use super::super::models::PromptGitHubEventType;
+        use super::super::models::PromptForgeEventType;
 
         let temp_file = NamedTempFile::new()?;
         let db = ActivityDb::new(temp_file.path().to_path_buf())?;
 
         // Record a GitHub event without linking to a specific input
-        let event = PromptGitHubEvent {
+        let event = PromptForgeEvent {
             id: None,
             input_id: None,
             issue_number: Some(100),
             pr_number: None,
             label_before: Some(vec!["loom:issue".to_string()]),
             label_after: Some(vec!["loom:building".to_string()]),
-            event_type: PromptGitHubEventType::LabelAdded,
+            event_type: PromptForgeEventType::LabelAdded,
         };
 
-        let event_id = db.record_prompt_github_event(&event)?;
+        let event_id = db.record_prompt_forge_event(&event)?;
         assert!(event_id > 0);
 
         Ok(())

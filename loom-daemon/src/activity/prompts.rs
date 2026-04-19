@@ -1,12 +1,12 @@
-//! Prompt tracking: git changes and GitHub event correlation.
+//! Prompt tracking: git changes and forge event correlation.
 //!
 //! Extracted from `db.rs` — provides recording and querying of prompt-level
-//! tracking data including git changes per prompt and GitHub event correlation.
+//! tracking data including git changes per prompt and forge event correlation.
 
 use anyhow::Result;
 use rusqlite::{params, Connection};
 
-use super::models::{PromptChanges, PromptGitHubEvent, PromptGitHubEventType};
+use super::models::{PromptChanges, PromptForgeEvent, PromptForgeEventType};
 
 // ========================================================================
 // Prompt Changes (Git)
@@ -103,9 +103,9 @@ pub(super) fn get_terminal_changes_summary(
 ///
 /// Links a prompt (agent input) with a GitHub action it triggered,
 /// such as creating an issue, opening a PR, or changing labels.
-pub(super) fn record_prompt_github_event(
+pub(super) fn record_prompt_forge_event(
     conn: &Connection,
-    event: &PromptGitHubEvent,
+    event: &PromptForgeEvent,
 ) -> Result<i64> {
     let label_before_json = event
         .label_before
@@ -138,10 +138,10 @@ pub(super) fn record_prompt_github_event(
 }
 
 /// Get prompt-GitHub events for a specific input.
-pub(super) fn get_prompt_github_events(
+pub(super) fn get_prompt_forge_events(
     conn: &Connection,
     input_id: i64,
-) -> Result<Vec<PromptGitHubEvent>> {
+) -> Result<Vec<PromptForgeEvent>> {
     let mut stmt = conn.prepare(
         r"
         SELECT id, input_id, issue_number, pr_number, label_before, label_after, event_type
@@ -170,13 +170,13 @@ pub(super) fn get_prompt_github_events(
             .transpose()
             .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
 
-        let event_type = PromptGitHubEventType::from_str(&event_type_str).ok_or_else(|| {
+        let event_type = PromptForgeEventType::from_str(&event_type_str).ok_or_else(|| {
             rusqlite::Error::ToSqlConversionFailure(
                 format!("Invalid event_type: {event_type_str}").into(),
             )
         })?;
 
-        Ok(PromptGitHubEvent {
+        Ok(PromptForgeEvent {
             id: Some(id),
             input_id,
             issue_number,

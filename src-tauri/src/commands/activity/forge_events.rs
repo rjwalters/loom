@@ -27,15 +27,15 @@ pub fn log_github_event(
 }
 
 // ============================================================================
-// Prompt-GitHub Correlation (Phase 2: Correlation & Context)
+// Prompt-Forge Correlation (Phase 2: Correlation & Context)
 // ============================================================================
 
-/// GitHub event types for prompt correlation
-/// These map to specific GitHub CLI operations detected in terminal output
+/// Forge event types for prompt correlation
+/// These map to specific forge CLI operations detected in terminal output
 #[allow(dead_code)]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "snake_case")]
-pub enum PromptGitHubEventType {
+pub enum PromptForgeEventType {
     /// Issue was claimed (label changed to loom:building)
     IssueClaimed,
     /// New PR was created
@@ -60,7 +60,7 @@ pub enum PromptGitHubEventType {
     PrApproved,
 }
 
-impl std::fmt::Display for PromptGitHubEventType {
+impl std::fmt::Display for PromptForgeEventType {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let s = match self {
             Self::IssueClaimed => "issue_claimed",
@@ -79,10 +79,10 @@ impl std::fmt::Display for PromptGitHubEventType {
     }
 }
 
-/// Entry for prompt-GitHub correlation
+/// Entry for prompt-forge correlation
 #[allow(dead_code)]
 #[derive(Debug, Serialize, Deserialize)]
-pub struct PromptGitHubEntry {
+pub struct PromptForgeEntry {
     pub id: Option<i64>,
     pub activity_id: i64,
     pub issue_number: Option<i32>,
@@ -93,11 +93,11 @@ pub struct PromptGitHubEntry {
     pub event_time: String,
 }
 
-/// Log a prompt-GitHub correlation entry
+/// Log a prompt-forge correlation entry
 #[allow(dead_code)]
 #[tauri::command]
 #[allow(clippy::needless_pass_by_value)]
-pub fn log_prompt_github(
+pub fn log_prompt_forge(
     workspace_path: String,
     activity_id: i64,
     event_type: String,
@@ -122,18 +122,18 @@ pub fn log_prompt_github(
             event_type
         ],
     )
-    .map_err(|e| format!("Failed to log prompt-GitHub correlation: {e}"))?;
+    .map_err(|e| format!("Failed to log prompt-forge correlation: {e}"))?;
 
     Ok(conn.last_insert_rowid())
 }
 
-/// Query prompt-GitHub correlations for a specific issue
+/// Query prompt-forge correlations for a specific issue
 #[allow(dead_code)]
 #[tauri::command]
 pub fn get_prompts_for_issue(
     workspace_path: &str,
     issue_number: i32,
-) -> Result<Vec<PromptGitHubEntry>, String> {
+) -> Result<Vec<PromptForgeEntry>, String> {
     let conn =
         open_activity_db(workspace_path).map_err(|e| format!("Failed to open database: {e}"))?;
 
@@ -148,7 +148,7 @@ pub fn get_prompts_for_issue(
 
     let entries = stmt
         .query_map([issue_number], |row| {
-            Ok(PromptGitHubEntry {
+            Ok(PromptForgeEntry {
                 id: row.get(0)?,
                 activity_id: row.get(1)?,
                 issue_number: row.get(2)?,
@@ -159,20 +159,20 @@ pub fn get_prompts_for_issue(
                 event_time: row.get(7)?,
             })
         })
-        .map_err(|e| format!("Failed to query prompt-GitHub entries: {e}"))?
+        .map_err(|e| format!("Failed to query prompt-forge entries: {e}"))?
         .collect::<Result<Vec<_>, _>>()
         .map_err(|e| format!("Failed to collect entries: {e}"))?;
 
     Ok(entries)
 }
 
-/// Query prompt-GitHub correlations for a specific PR
+/// Query prompt-forge correlations for a specific PR
 #[allow(dead_code)]
 #[tauri::command]
 pub fn get_prompts_for_pr(
     workspace_path: &str,
     pr_number: i32,
-) -> Result<Vec<PromptGitHubEntry>, String> {
+) -> Result<Vec<PromptForgeEntry>, String> {
     let conn =
         open_activity_db(workspace_path).map_err(|e| format!("Failed to open database: {e}"))?;
 
@@ -187,7 +187,7 @@ pub fn get_prompts_for_pr(
 
     let entries = stmt
         .query_map([pr_number], |row| {
-            Ok(PromptGitHubEntry {
+            Ok(PromptForgeEntry {
                 id: row.get(0)?,
                 activity_id: row.get(1)?,
                 issue_number: row.get(2)?,
@@ -198,7 +198,7 @@ pub fn get_prompts_for_pr(
                 event_time: row.get(7)?,
             })
         })
-        .map_err(|e| format!("Failed to query prompt-GitHub entries: {e}"))?
+        .map_err(|e| format!("Failed to query prompt-forge entries: {e}"))?
         .collect::<Result<Vec<_>, _>>()
         .map_err(|e| format!("Failed to collect entries: {e}"))?;
 
