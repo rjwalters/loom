@@ -8,7 +8,7 @@
 
 Loom spawns AI agents that claim issues, implement features, review PRs, and merge code -- all coordinated through labels. Your only job: write issues, review PRs, merge what you like.
 
-**Supported Forges**: GitHub (full support) | Gitea (supported via forge abstraction layer)
+**Supported Forges**: GitHub | Gitea — Loom auto-detects your forge from the git remote URL. A [ForgeClient abstraction layer](docs/architecture/system-overview.md) makes the workflow identical regardless of forge.
 
 ## Quick Start
 
@@ -71,11 +71,33 @@ See [WORKFLOWS.md](docs/workflows.md) for complete label documentation.
 - PR conflict resolution with `/doctor`
 - Main branch validation with `/auditor`
 
+**Forge-Agnostic**
+- Works with GitHub and Gitea out of the box
+- Auto-detects forge from git remote URL
+- ForgeClient abstraction with 21 methods
+- Forge-neutral caching layer for API efficiency
+
 **Developer Experience**
 - Git worktree isolation per issue
 - Simple CLI: `/shepherd 42` monitors a single issue end-to-end via the daemon
 - MCP integration for programmatic control (19 tools)
 - Graceful shutdown: `touch .loom/stop-daemon`
+
+## Forge Support
+
+Loom's ForgeClient abstraction layer provides a unified interface across forges. All orchestration features — label-driven workflows, issue claiming, PR review, auto-merge — work identically on both platforms.
+
+| Feature | GitHub | Gitea |
+|---------|--------|-------|
+| Label-based workflow | Yes | Yes |
+| Issue/PR operations | Yes | Yes |
+| CI status checks | Yes | Yes (Actions API + commit status) |
+| Auto-merge | Yes (merge queue) | Yes (poll-and-merge fallback) |
+| Branch protection | Yes | Yes |
+| Authentication | `gh auth login` or `GH_TOKEN` | `GITEA_TOKEN` or `FORGE_TOKEN` |
+| Forge detection | Automatic from remote URL | Automatic from remote URL |
+
+See [Forge Authentication](.loom/docs/forge-authentication.md) for setup details.
 
 ## Installation
 
@@ -120,7 +142,7 @@ your-repo/
 
 ```bash
 /loom              # Start continuous orchestration
-/loom --force      # Aggressive mode (auto-promotes proposals)
+/loom --merge      # Aggressive mode (auto-promotes proposals, auto-merges)
 ```
 
 The daemon monitors your pipeline, spawns shepherds for ready issues, and triggers support roles (architect, hermit, auditor) on schedule.
@@ -131,7 +153,7 @@ To orchestrate one issue end-to-end, start the daemon first, then use `/shepherd
 
 ```bash
 # In a terminal outside Claude Code
-./.loom/scripts/start-daemon.sh
+./.loom/scripts/daemon.sh start
 
 # Then in Claude Code
 /shepherd 42         # Orchestrate issue through full lifecycle
