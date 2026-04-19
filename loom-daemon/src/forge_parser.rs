@@ -13,19 +13,19 @@
 //! # Example
 //!
 //! ```ignore
-//! use github_parser::parse_github_events;
+//! use forge_parser::parse_forge_events;
 //!
 //! let output = "Creating pull request for feature/issue-42 into main...\nhttps://github.com/owner/repo/pull/123";
-//! let events = parse_github_events(output, "github.com");
-//! // Returns: [ParsedGitHubEvent { event_type: PrCreated, pr_number: Some(123), ... }]
+//! let events = parse_forge_events(output, "github.com");
+//! // Returns: [ParsedForgeEvent { event_type: PrCreated, pr_number: Some(123), ... }]
 //! ```
 
 use crate::activity::{PromptGitHubEvent, PromptGitHubEventType};
 use regex::Regex;
 
-/// A parsed GitHub event from terminal output
+/// A parsed forge event from terminal output
 #[derive(Debug, Clone)]
-pub struct ParsedGitHubEvent {
+pub struct ParsedForgeEvent {
     pub event_type: PromptGitHubEventType,
     pub issue_number: Option<i32>,
     pub pr_number: Option<i32>,
@@ -33,9 +33,9 @@ pub struct ParsedGitHubEvent {
     pub labels_removed: Vec<String>,
 }
 
-impl ParsedGitHubEvent {
+impl ParsedForgeEvent {
     /// Convert to a `PromptGitHubEvent` for database storage
-    pub fn to_prompt_github_event(&self, input_id: Option<i64>) -> PromptGitHubEvent {
+    pub fn to_prompt_forge_event(&self, input_id: Option<i64>) -> PromptGitHubEvent {
         let (label_before, label_after) =
             if !self.labels_added.is_empty() || !self.labels_removed.is_empty() {
                 // For label changes, we track removed as "before" and added as "after"
@@ -80,7 +80,7 @@ impl ParsedGitHubEvent {
 /// The `forge_host` parameter specifies which hostname to match in URLs
 /// (e.g., `"github.com"`, `"gitea.example.com"`).
 #[allow(clippy::too_many_lines)]
-pub fn parse_github_events(output: &str, forge_host: &str) -> Vec<ParsedGitHubEvent> {
+pub fn parse_forge_events(output: &str, forge_host: &str) -> Vec<ParsedForgeEvent> {
     let mut events = Vec::new();
 
     // Pattern: Issue/PR URL from forge CLI create commands
@@ -94,14 +94,14 @@ pub fn parse_github_events(output: &str, forge_host: &str) -> Vec<ParsedGitHubEv
             if let (Some(type_match), Some(number_match)) = (cap.get(1), cap.get(2)) {
                 if let Ok(number) = number_match.as_str().parse::<i32>() {
                     let event = match type_match.as_str() {
-                        "issues" => ParsedGitHubEvent {
+                        "issues" => ParsedForgeEvent {
                             event_type: PromptGitHubEventType::IssueCreated,
                             issue_number: Some(number),
                             pr_number: None,
                             labels_added: Vec::new(),
                             labels_removed: Vec::new(),
                         },
-                        "pull" | "pulls" => ParsedGitHubEvent {
+                        "pull" | "pulls" => ParsedForgeEvent {
                             event_type: PromptGitHubEventType::PrCreated,
                             issue_number: None,
                             pr_number: Some(number),
@@ -123,7 +123,7 @@ pub fn parse_github_events(output: &str, forge_host: &str) -> Vec<ParsedGitHubEv
         for cap in merge_re.captures_iter(output) {
             if let Some(number_match) = cap.get(1) {
                 if let Ok(number) = number_match.as_str().parse::<i32>() {
-                    events.push(ParsedGitHubEvent {
+                    events.push(ParsedForgeEvent {
                         event_type: PromptGitHubEventType::PrMerged,
                         issue_number: None,
                         pr_number: Some(number),
@@ -144,7 +144,7 @@ pub fn parse_github_events(output: &str, forge_host: &str) -> Vec<ParsedGitHubEv
             let number = cap.get(1).or_else(|| cap.get(2));
             if let Some(number_match) = number {
                 if let Ok(number) = number_match.as_str().parse::<i32>() {
-                    events.push(ParsedGitHubEvent {
+                    events.push(ParsedForgeEvent {
                         event_type: PromptGitHubEventType::IssueClosed,
                         issue_number: Some(number),
                         pr_number: None,
@@ -162,7 +162,7 @@ pub fn parse_github_events(output: &str, forge_host: &str) -> Vec<ParsedGitHubEv
         for cap in close_pr_re.captures_iter(output) {
             if let Some(number_match) = cap.get(1) {
                 if let Ok(number) = number_match.as_str().parse::<i32>() {
-                    events.push(ParsedGitHubEvent {
+                    events.push(ParsedForgeEvent {
                         event_type: PromptGitHubEventType::PrClosed,
                         issue_number: None,
                         pr_number: Some(number),
@@ -193,7 +193,7 @@ pub fn parse_github_events(output: &str, forge_host: &str) -> Vec<ParsedGitHubEv
                     // Try to find associated issue/PR number
                     let (issue_number, pr_number) = extract_issue_pr_from_context(output);
 
-                    events.push(ParsedGitHubEvent {
+                    events.push(ParsedForgeEvent {
                         event_type: PromptGitHubEventType::LabelAdded,
                         issue_number,
                         pr_number,
@@ -221,7 +221,7 @@ pub fn parse_github_events(output: &str, forge_host: &str) -> Vec<ParsedGitHubEv
                 if !labels.is_empty() {
                     let (issue_number, pr_number) = extract_issue_pr_from_context(output);
 
-                    events.push(ParsedGitHubEvent {
+                    events.push(ParsedForgeEvent {
                         event_type: PromptGitHubEventType::LabelRemoved,
                         issue_number,
                         pr_number,
@@ -241,7 +241,7 @@ pub fn parse_github_events(output: &str, forge_host: &str) -> Vec<ParsedGitHubEv
         for cap in review_re.captures_iter(output) {
             if let Some(number_match) = cap.get(2) {
                 if let Ok(number) = number_match.as_str().parse::<i32>() {
-                    events.push(ParsedGitHubEvent {
+                    events.push(ParsedForgeEvent {
                         event_type: PromptGitHubEventType::ReviewSubmitted,
                         issue_number: None,
                         pr_number: Some(number),
@@ -293,7 +293,7 @@ mod tests {
     #[test]
     fn test_parse_issue_created() {
         let output = "Creating issue...\nhttps://github.com/owner/repo/issues/42";
-        let events = parse_github_events(output, GITHUB_HOST);
+        let events = parse_forge_events(output, GITHUB_HOST);
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].event_type, PromptGitHubEventType::IssueCreated);
         assert_eq!(events[0].issue_number, Some(42));
@@ -302,7 +302,7 @@ mod tests {
     #[test]
     fn test_parse_pr_created() {
         let output = "Creating pull request for feature/test into main in owner/repo\n\nhttps://github.com/owner/repo/pull/123";
-        let events = parse_github_events(output, GITHUB_HOST);
+        let events = parse_forge_events(output, GITHUB_HOST);
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].event_type, PromptGitHubEventType::PrCreated);
         assert_eq!(events[0].pr_number, Some(123));
@@ -311,7 +311,7 @@ mod tests {
     #[test]
     fn test_parse_pr_merged() {
         let output = "Merged pull request #456 (squash)";
-        let events = parse_github_events(output, GITHUB_HOST);
+        let events = parse_forge_events(output, GITHUB_HOST);
         assert!(!events.is_empty());
         let merge_event = events
             .iter()
@@ -325,7 +325,7 @@ mod tests {
     #[test]
     fn test_parse_issue_closed() {
         let output = "Closed issue #789";
-        let events = parse_github_events(output, GITHUB_HOST);
+        let events = parse_forge_events(output, GITHUB_HOST);
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].event_type, PromptGitHubEventType::IssueClosed);
         assert_eq!(events[0].issue_number, Some(789));
@@ -334,7 +334,7 @@ mod tests {
     #[test]
     fn test_parse_label_added() {
         let output = "gh issue edit 42 --add-label \"loom:building\"";
-        let events = parse_github_events(output, GITHUB_HOST);
+        let events = parse_forge_events(output, GITHUB_HOST);
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].event_type, PromptGitHubEventType::LabelAdded);
         assert_eq!(events[0].labels_added, vec!["loom:building"]);
@@ -344,7 +344,7 @@ mod tests {
     #[test]
     fn test_parse_label_removed() {
         let output = "gh issue edit 42 --remove-label loom:issue";
-        let events = parse_github_events(output, GITHUB_HOST);
+        let events = parse_forge_events(output, GITHUB_HOST);
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].event_type, PromptGitHubEventType::LabelRemoved);
         assert_eq!(events[0].labels_removed, vec!["loom:issue"]);
@@ -353,7 +353,7 @@ mod tests {
     #[test]
     fn test_parse_review_approved() {
         let output = "Approved pull request #123";
-        let events = parse_github_events(output, GITHUB_HOST);
+        let events = parse_forge_events(output, GITHUB_HOST);
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].event_type, PromptGitHubEventType::ReviewSubmitted);
         assert_eq!(events[0].pr_number, Some(123));
@@ -362,7 +362,7 @@ mod tests {
     #[test]
     fn test_parse_multiple_events() {
         let output = "gh issue edit 42 --remove-label loom:issue --add-label loom:building";
-        let events = parse_github_events(output, GITHUB_HOST);
+        let events = parse_forge_events(output, GITHUB_HOST);
         assert_eq!(events.len(), 2);
 
         let remove_event = events
@@ -385,13 +385,13 @@ mod tests {
     #[test]
     fn test_no_false_positives() {
         let output = "Compiling loom-daemon v0.1.0\nFinished release target";
-        let events = parse_github_events(output, GITHUB_HOST);
+        let events = parse_forge_events(output, GITHUB_HOST);
         assert!(events.is_empty());
     }
 
     #[test]
-    fn test_to_prompt_github_event() {
-        let parsed = ParsedGitHubEvent {
+    fn test_to_prompt_forge_event() {
+        let parsed = ParsedForgeEvent {
             event_type: PromptGitHubEventType::LabelAdded,
             issue_number: Some(42),
             pr_number: None,
@@ -399,7 +399,7 @@ mod tests {
             labels_removed: Vec::new(),
         };
 
-        let event = parsed.to_prompt_github_event(Some(100));
+        let event = parsed.to_prompt_forge_event(Some(100));
         assert_eq!(event.input_id, Some(100));
         assert_eq!(event.issue_number, Some(42));
         assert_eq!(event.label_after, Some(vec!["loom:building".to_string()]));
@@ -411,7 +411,7 @@ mod tests {
     #[test]
     fn test_gitea_issue_created() {
         let output = "Creating issue...\nhttps://gitea.example.com/owner/repo/issues/42";
-        let events = parse_github_events(output, GITEA_HOST);
+        let events = parse_forge_events(output, GITEA_HOST);
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].event_type, PromptGitHubEventType::IssueCreated);
         assert_eq!(events[0].issue_number, Some(42));
@@ -421,7 +421,7 @@ mod tests {
     fn test_gitea_pr_created_with_pulls_path() {
         // Gitea uses /pulls/ instead of /pull/
         let output = "Creating pull request...\nhttps://gitea.example.com/owner/repo/pulls/99";
-        let events = parse_github_events(output, GITEA_HOST);
+        let events = parse_forge_events(output, GITEA_HOST);
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].event_type, PromptGitHubEventType::PrCreated);
         assert_eq!(events[0].pr_number, Some(99));
@@ -431,7 +431,7 @@ mod tests {
     fn test_github_url_not_matched_with_gitea_host() {
         // When configured for Gitea, GitHub URLs should not match
         let output = "https://github.com/owner/repo/pull/123";
-        let events = parse_github_events(output, GITEA_HOST);
+        let events = parse_forge_events(output, GITEA_HOST);
         assert!(events.is_empty(), "GitHub URL should not match when forge_host is set to Gitea");
     }
 
@@ -439,7 +439,7 @@ mod tests {
     fn test_gitea_url_not_matched_with_github_host() {
         // When configured for GitHub, Gitea URLs should not match
         let output = "https://gitea.example.com/owner/repo/pulls/42";
-        let events = parse_github_events(output, GITHUB_HOST);
+        let events = parse_forge_events(output, GITHUB_HOST);
         assert!(events.is_empty(), "Gitea URL should not match when forge_host is set to GitHub");
     }
 
@@ -447,7 +447,7 @@ mod tests {
     fn test_github_pull_path_still_works() {
         // GitHub's /pull/ path should still work (not just /pulls/)
         let output = "https://github.com/owner/repo/pull/456";
-        let events = parse_github_events(output, GITHUB_HOST);
+        let events = parse_forge_events(output, GITHUB_HOST);
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].event_type, PromptGitHubEventType::PrCreated);
         assert_eq!(events[0].pr_number, Some(456));
