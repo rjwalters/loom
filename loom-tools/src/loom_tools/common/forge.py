@@ -498,19 +498,34 @@ class ForgeClient(Protocol):
 # ---------------------------------------------------------------------------
 
 
-def get_forge(cwd: Path | None = None) -> ForgeClient:
+def get_forge(cwd: Path | None = None, *, cached: bool = True) -> ForgeClient:
     """Return a ``ForgeClient`` for the detected forge type.
 
     Uses :func:`detect_forge` to determine which backend to instantiate.
     Imports are lazy to avoid circular dependencies and so that
     ``requests`` is only loaded when Gitea is actually used.
+
+    When *cached* is ``True`` (the default), the returned client is
+    wrapped with :class:`~loom_tools.common.cached_forge.CachedForgeClient`
+    for TTL-based LRU caching of read-only operations.  Set *cached* to
+    ``False`` to get the raw backend (useful for tests or when caching
+    is undesirable).  Caching can also be disabled globally via the
+    ``FORGE_CACHE_DISABLE=1`` environment variable.
     """
     forge_type = detect_forge(cwd)
     if forge_type == ForgeType.GITEA:
         from loom_tools.common.gitea import GiteaForge
 
-        return GiteaForge(cwd=cwd)
-    # Default: GitHub
-    from loom_tools.common.github import GitHubForge
+        inner: ForgeClient = GiteaForge(cwd=cwd)
+    else:
+        # Default: GitHub
+        from loom_tools.common.github import GitHubForge
 
-    return GitHubForge(cwd=cwd)
+        inner = GitHubForge(cwd=cwd)
+
+    if cached:
+        from loom_tools.common.cached_forge import CachedForgeClient
+
+        return CachedForgeClient(inner)
+
+    return inner
