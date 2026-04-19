@@ -5,10 +5,17 @@
 use std::fs;
 use std::path::Path;
 
+use serde_json::Value;
+
 use super::file_ops::{copy_dir_with_report, force_merge_dir_with_report, merge_dir_with_report};
 use super::git::extract_repo_info;
 use super::templates::{substitute_template_variables, LoomMetadata};
 use super::InitReport;
+
+/// Prefix used to identify Loom-owned hooks in settings.json.
+/// Hooks with commands starting with this prefix are managed by Loom.
+#[allow(dead_code)]
+pub const LOOM_HOOK_PREFIX: &str = ".loom/hooks/";
 
 /// Loom section markers for CLAUDE.md content preservation
 pub const LOOM_SECTION_START: &str = "<!-- BEGIN LOOM ORCHESTRATION -->";
@@ -24,6 +31,256 @@ pub const LOOM_ROOT_POINTER: &str = "This repository uses [Loom](https://github.
 /// Wrap Loom content in section markers
 pub fn wrap_loom_content(content: &str) -> String {
     format!("{}\n{}\n{}", LOOM_SECTION_START, content.trim(), LOOM_SECTION_END)
+}
+
+/// Read and parse an existing settings.json file, returning None if missing or invalid.
+fn read_existing_settings(path: &Path) -> Option<Value> {
+    let content = fs::read_to_string(path).ok()?;
+    let value: Value = serde_json::from_str(&content).ok()?;
+    if value.is_object() {
+        Some(value)
+    } else {
+        None
+    }
+}
+
+/// Deep-merge Loom's default settings.json into an existing project settings.json.
+///
+/// Merge strategy:
+/// - **Hooks**: For each hook type (e.g., `PreToolUse`), for each matcher entry,
+///   merge Loom hooks alongside existing hooks. Deduplicates by command path.
+///   Preserves all project hook types and matchers that Loom doesn't define.
+/// - **Permissions**: Union of `permissions.allow` arrays (dedup exact strings).
+/// - **Other keys**: Preserves all keys from the existing settings that Loom doesn't define.
+pub fn merge_settings_json(existing: &Value, loom_defaults: &Value) -> Value {
+    let mut result = existing.clone();
+    let Some(result_obj) = result.as_object_mut() else {
+        return loom_defaults.clone();
+    };
+
+    // Merge hooks
+    if let Some(loom_hooks) = loom_defaults.get("hooks").and_then(|h| h.as_object()) {
+        let merged_hooks =
+            merge_hooks(existing.get("hooks").and_then(|h| h.as_object()), loom_hooks);
+        result_obj.insert("hooks".to_string(), Value::Object(merged_hooks));
+    }
+
+    // Merge permissions
+    if let Some(loom_perms) = loom_defaults.get("permissions").and_then(|p| p.as_object()) {
+        let merged_perms =
+            merge_permissions(existing.get("permissions").and_then(|p| p.as_object()), loom_perms);
+        result_obj.insert("permissions".to_string(), Value::Object(merged_perms));
+    }
+
+    result
+}
+
+/// Merge hooks from Loom defaults into existing hooks.
+///
+/// For each hook type in Loom defaults:
+///   - For each matcher entry, find matching entry in existing (same matcher value)
+///     - If found: merge hooks arrays, deduplicating by command path
+///     - If not found: add the entire matcher entry
+///   - All existing hook types not in Loom defaults are preserved unchanged
+fn merge_hooks(
+    existing: Option<&serde_json::Map<String, Value>>,
+    loom: &serde_json::Map<String, Value>,
+) -> serde_json::Map<String, Value> {
+    let mut result = existing.cloned().unwrap_or_default();
+
+    for (hook_type, loom_matchers) in loom {
+        let Some(loom_matchers_arr) = loom_matchers.as_array() else {
+            continue;
+        };
+
+        let existing_matchers = result
+            .entry(hook_type.clone())
+            .or_insert_with(|| Value::Array(Vec::new()));
+
+        let Some(existing_arr) = existing_matchers.as_array_mut() else {
+            continue;
+        };
+
+        for loom_matcher_entry in loom_matchers_arr {
+            let loom_matcher_val = loom_matcher_entry
+                .get("matcher")
+                .and_then(|m| m.as_str())
+                .unwrap_or("");
+
+            // Find matching entry in existing
+            let found = existing_arr.iter_mut().find(|entry| {
+                entry.get("matcher").and_then(|m| m.as_str()).unwrap_or("") == loom_matcher_val
+            });
+
+            if let Some(existing_entry) = found {
+                // Merge hooks arrays within this matcher entry
+                merge_hook_commands(existing_entry, loom_matcher_entry);
+            } else {
+                // No matching entry exists - add the entire matcher entry
+                existing_arr.push(loom_matcher_entry.clone());
+            }
+        }
+    }
+
+    result
+}
+
+/// Merge hook commands within a single matcher entry, deduplicating by command path.
+fn merge_hook_commands(existing_entry: &mut Value, loom_entry: &Value) {
+    let Some(existing_hooks) = existing_entry
+        .get_mut("hooks")
+        .and_then(|h| h.as_array_mut())
+    else {
+        return;
+    };
+
+    let Some(loom_hooks) = loom_entry.get("hooks").and_then(|h| h.as_array()) else {
+        return;
+    };
+
+    // Collect existing command paths for dedup
+    let existing_commands: std::collections::HashSet<String> = existing_hooks
+        .iter()
+        .filter_map(|h| h.get("command").and_then(|c| c.as_str()).map(String::from))
+        .collect();
+
+    // Add Loom hooks that aren't already present
+    for loom_hook in loom_hooks {
+        let cmd = loom_hook
+            .get("command")
+            .and_then(|c| c.as_str())
+            .unwrap_or("");
+        if !existing_commands.contains(cmd) {
+            existing_hooks.push(loom_hook.clone());
+        }
+    }
+}
+
+/// Merge permissions, unioning the allow arrays.
+fn merge_permissions(
+    existing: Option<&serde_json::Map<String, Value>>,
+    loom: &serde_json::Map<String, Value>,
+) -> serde_json::Map<String, Value> {
+    let mut result = existing.cloned().unwrap_or_default();
+
+    if let Some(loom_allow) = loom.get("allow").and_then(|a| a.as_array()) {
+        let existing_allow = result
+            .entry("allow".to_string())
+            .or_insert_with(|| Value::Array(Vec::new()));
+
+        if let Some(existing_arr) = existing_allow.as_array_mut() {
+            let existing_set: std::collections::HashSet<String> = existing_arr
+                .iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect();
+
+            for perm in loom_allow {
+                if let Some(perm_str) = perm.as_str() {
+                    if !existing_set.contains(perm_str) {
+                        existing_arr.push(perm.clone());
+                    }
+                }
+            }
+        }
+    }
+
+    result
+}
+
+/// Remove Loom-owned hooks from a settings.json value.
+///
+/// Loom hooks are identified by command paths starting with `.loom/hooks/`.
+/// After removal, empty matcher entries and empty hook type arrays are cleaned up.
+#[allow(dead_code)]
+pub fn remove_loom_hooks(settings: &mut Value) {
+    let Some(hooks) = settings.get_mut("hooks").and_then(|h| h.as_object_mut()) else {
+        return;
+    };
+
+    // Process each hook type
+    let hook_types: Vec<String> = hooks.keys().cloned().collect();
+    for hook_type in &hook_types {
+        let Some(matchers) = hooks.get_mut(hook_type).and_then(|m| m.as_array_mut()) else {
+            continue;
+        };
+
+        // For each matcher entry, remove Loom hooks from the hooks array
+        for matcher_entry in matchers.iter_mut() {
+            if let Some(hook_arr) = matcher_entry
+                .get_mut("hooks")
+                .and_then(|h| h.as_array_mut())
+            {
+                hook_arr.retain(|hook| {
+                    let cmd = hook.get("command").and_then(|c| c.as_str()).unwrap_or("");
+                    !cmd.starts_with(LOOM_HOOK_PREFIX)
+                });
+            }
+        }
+
+        // Remove matcher entries with empty hooks arrays
+        matchers.retain(|entry| {
+            !entry
+                .get("hooks")
+                .and_then(|h| h.as_array())
+                .is_some_and(Vec::is_empty)
+        });
+    }
+
+    // Remove hook types with empty matcher arrays
+    hooks.retain(|_, v| !v.as_array().is_some_and(Vec::is_empty));
+
+    // If hooks object is now empty, remove it entirely
+    if hooks.is_empty() {
+        if let Some(obj) = settings.as_object_mut() {
+            obj.remove("hooks");
+        }
+    }
+}
+
+/// Remove Loom-specific permissions from a settings.json value.
+///
+/// Removes permissions that match Loom's default permission list exactly.
+#[allow(dead_code)]
+pub fn remove_loom_permissions(settings: &mut Value, loom_defaults: &Value) {
+    let Some(loom_perms) = loom_defaults
+        .get("permissions")
+        .and_then(|p| p.get("allow"))
+        .and_then(|a| a.as_array())
+    else {
+        return;
+    };
+
+    let loom_perm_set: std::collections::HashSet<&str> =
+        loom_perms.iter().filter_map(|v| v.as_str()).collect();
+
+    let Some(allow) = settings
+        .get_mut("permissions")
+        .and_then(|p| p.get_mut("allow"))
+        .and_then(|a| a.as_array_mut())
+    else {
+        return;
+    };
+
+    allow.retain(|v| !v.as_str().is_some_and(|s| loom_perm_set.contains(s)));
+
+    // Clean up empty permissions
+    if allow.is_empty() {
+        if let Some(perms) = settings
+            .get_mut("permissions")
+            .and_then(|p| p.as_object_mut())
+        {
+            perms.remove("allow");
+        }
+    }
+    if settings
+        .get("permissions")
+        .and_then(|p| p.as_object())
+        .is_some_and(serde_json::Map::is_empty)
+    {
+        if let Some(obj) = settings.as_object_mut() {
+            obj.remove("permissions");
+        }
+    }
 }
 
 /// Setup repository scaffolding files
@@ -196,9 +453,15 @@ pub fn setup_repository_scaffolding(
     // This ensures command updates from loom propagate to target repos while
     // preserving any custom commands the project has added.
     // Consistent with .loom/roles/ and .loom/scripts/ behavior.
+    //
+    // Special handling for settings.json: deep-merge hooks and permissions
+    // instead of overwriting, so project-specific hooks are preserved.
     let claude_src = defaults_path.join(".claude");
     let claude_dst = workspace_path.join(".claude");
     if claude_src.exists() {
+        // Save existing settings.json before directory copy overwrites it
+        let existing_settings = read_existing_settings(&claude_dst.join("settings.json"));
+
         if claude_dst.exists() {
             // Reinstall: always force-merge to update default commands
             // Custom commands (files not in defaults) are preserved
@@ -208,6 +471,21 @@ pub fn setup_repository_scaffolding(
             // Fresh install: copy all
             copy_dir_with_report(&claude_src, &claude_dst, ".claude", report)
                 .map_err(|e| format!("Failed to copy .claude directory: {e}"))?;
+        }
+
+        // If there was an existing settings.json, merge Loom's defaults into it
+        // instead of using the overwritten copy
+        if let Some(existing) = existing_settings {
+            let settings_path = claude_dst.join("settings.json");
+            let loom_defaults = read_existing_settings(&settings_path);
+            if let Some(loom) = loom_defaults {
+                let merged = merge_settings_json(&existing, &loom);
+                if let Ok(pretty) = serde_json::to_string_pretty(&merged) {
+                    if let Err(e) = fs::write(&settings_path, pretty) {
+                        eprintln!("Warning: Failed to write merged settings.json: {e}");
+                    }
+                }
+            }
         }
     }
 
@@ -942,5 +1220,413 @@ WARNING: Never run `lake build` inside Docker - causes memory corruption.
         assert!(report
             .preserved
             .contains(&".claude/commands/my-custom.md".to_string()));
+    }
+
+    // =========================================================================
+    // settings.json merge tests
+    // =========================================================================
+
+    #[test]
+    fn test_merge_settings_fresh_install_no_existing() {
+        // When no existing settings.json, Loom defaults are used as-is
+        let loom_defaults: serde_json::Value = serde_json::from_str(
+            r#"{
+            "hooks": {
+                "PreToolUse": [{
+                    "matcher": "Bash",
+                    "hooks": [{"type": "command", "command": ".loom/hooks/guard-destructive.sh"}]
+                }]
+            },
+            "permissions": {
+                "allow": ["Bash(gh:*)", "Bash(git:*)"]
+            }
+        }"#,
+        )
+        .unwrap();
+
+        // Empty existing
+        let existing: serde_json::Value = serde_json::from_str("{}").unwrap();
+        let merged = merge_settings_json(&existing, &loom_defaults);
+
+        // Should have Loom's hooks
+        let hooks = merged.get("hooks").unwrap();
+        let pre_tool = hooks.get("PreToolUse").unwrap().as_array().unwrap();
+        assert_eq!(pre_tool.len(), 1);
+        assert_eq!(pre_tool[0]["matcher"], "Bash");
+
+        // Should have Loom's permissions
+        let perms = merged
+            .get("permissions")
+            .unwrap()
+            .get("allow")
+            .unwrap()
+            .as_array()
+            .unwrap();
+        assert_eq!(perms.len(), 2);
+    }
+
+    #[test]
+    fn test_merge_settings_preserves_project_hooks() {
+        let existing: serde_json::Value = serde_json::from_str(
+            r#"{
+            "hooks": {
+                "PreToolUse": [{
+                    "matcher": "Edit",
+                    "hooks": [{"type": "command", "command": ".claude/hooks/guard-pdk-files.sh"}]
+                }],
+                "UserPromptSubmit": [{
+                    "matcher": "",
+                    "hooks": [{"type": "command", "command": "skill-router.sh"}]
+                }]
+            },
+            "permissions": {
+                "allow": ["Bash(gh:*)", "CustomPermission"]
+            }
+        }"#,
+        )
+        .unwrap();
+
+        let loom_defaults: serde_json::Value = serde_json::from_str(
+            r#"{
+            "hooks": {
+                "PreToolUse": [{
+                    "matcher": "Bash",
+                    "hooks": [{"type": "command", "command": ".loom/hooks/guard-destructive.sh"}]
+                }]
+            },
+            "permissions": {
+                "allow": ["Bash(gh:*)", "Bash(git:*)"]
+            }
+        }"#,
+        )
+        .unwrap();
+
+        let merged = merge_settings_json(&existing, &loom_defaults);
+
+        // PreToolUse should have both Edit (project) and Bash (Loom) matchers
+        let pre_tool = merged["hooks"]["PreToolUse"].as_array().unwrap();
+        assert_eq!(pre_tool.len(), 2, "Should have both Edit and Bash matchers");
+
+        // Edit matcher should be preserved
+        let edit_matcher = pre_tool.iter().find(|m| m["matcher"] == "Edit").unwrap();
+        assert_eq!(edit_matcher["hooks"][0]["command"], ".claude/hooks/guard-pdk-files.sh");
+
+        // Bash matcher should be added from Loom
+        let bash_matcher = pre_tool.iter().find(|m| m["matcher"] == "Bash").unwrap();
+        assert_eq!(bash_matcher["hooks"][0]["command"], ".loom/hooks/guard-destructive.sh");
+
+        // UserPromptSubmit (project-only) should be preserved
+        let user_prompt = merged["hooks"]["UserPromptSubmit"].as_array().unwrap();
+        assert_eq!(user_prompt.len(), 1);
+        assert_eq!(user_prompt[0]["hooks"][0]["command"], "skill-router.sh");
+
+        // Permissions should be unioned (3 unique: gh, git, CustomPermission)
+        let perms = merged["permissions"]["allow"].as_array().unwrap();
+        assert_eq!(perms.len(), 3, "Should have 3 unique permissions");
+        let perm_strs: Vec<&str> = perms.iter().map(|p| p.as_str().unwrap()).collect();
+        assert!(perm_strs.contains(&"Bash(gh:*)"));
+        assert!(perm_strs.contains(&"Bash(git:*)"));
+        assert!(perm_strs.contains(&"CustomPermission"));
+    }
+
+    #[test]
+    fn test_merge_settings_deduplicates_hooks() {
+        // When project already has the Loom hook, don't add it again
+        let existing: serde_json::Value = serde_json::from_str(
+            r#"{
+            "hooks": {
+                "PreToolUse": [{
+                    "matcher": "Bash",
+                    "hooks": [
+                        {"type": "command", "command": ".loom/hooks/guard-destructive.sh"},
+                        {"type": "command", "command": ".claude/hooks/custom-bash-guard.sh"}
+                    ]
+                }]
+            }
+        }"#,
+        )
+        .unwrap();
+
+        let loom_defaults: serde_json::Value = serde_json::from_str(
+            r#"{
+            "hooks": {
+                "PreToolUse": [{
+                    "matcher": "Bash",
+                    "hooks": [{"type": "command", "command": ".loom/hooks/guard-destructive.sh"}]
+                }]
+            }
+        }"#,
+        )
+        .unwrap();
+
+        let merged = merge_settings_json(&existing, &loom_defaults);
+
+        // Should not duplicate the Loom hook
+        let bash_hooks = &merged["hooks"]["PreToolUse"][0]["hooks"];
+        let hooks_arr = bash_hooks.as_array().unwrap();
+        assert_eq!(hooks_arr.len(), 2, "Should not duplicate existing Loom hook");
+
+        // Both hooks should still be present
+        let commands: Vec<&str> = hooks_arr
+            .iter()
+            .map(|h| h["command"].as_str().unwrap())
+            .collect();
+        assert!(commands.contains(&".loom/hooks/guard-destructive.sh"));
+        assert!(commands.contains(&".claude/hooks/custom-bash-guard.sh"));
+    }
+
+    #[test]
+    fn test_merge_settings_preserves_other_keys() {
+        // Keys like enabledPlugins, MCP config, etc. should be preserved
+        let existing: serde_json::Value = serde_json::from_str(
+            r#"{
+            "enabledPlugins": {"some-plugin": true},
+            "model": "opus",
+            "permissions": {
+                "allow": ["CustomPermission"]
+            }
+        }"#,
+        )
+        .unwrap();
+
+        let loom_defaults: serde_json::Value = serde_json::from_str(
+            r#"{
+            "hooks": {
+                "PreToolUse": [{
+                    "matcher": "Bash",
+                    "hooks": [{"type": "command", "command": ".loom/hooks/guard-destructive.sh"}]
+                }]
+            },
+            "permissions": {
+                "allow": ["Bash(gh:*)"]
+            }
+        }"#,
+        )
+        .unwrap();
+
+        let merged = merge_settings_json(&existing, &loom_defaults);
+
+        // enabledPlugins and model should be preserved
+        assert_eq!(merged["enabledPlugins"]["some-plugin"], true);
+        assert_eq!(merged["model"], "opus");
+
+        // Hooks should be added
+        assert!(merged.get("hooks").is_some());
+
+        // Permissions should be merged
+        let perms = merged["permissions"]["allow"].as_array().unwrap();
+        assert_eq!(perms.len(), 2);
+    }
+
+    #[test]
+    fn test_remove_loom_hooks() {
+        let mut settings: serde_json::Value = serde_json::from_str(r#"{
+            "hooks": {
+                "PreToolUse": [
+                    {
+                        "matcher": "Bash",
+                        "hooks": [
+                            {"type": "command", "command": ".loom/hooks/guard-destructive.sh"},
+                            {"type": "command", "command": ".claude/hooks/custom-guard.sh"}
+                        ]
+                    },
+                    {
+                        "matcher": "Edit",
+                        "hooks": [{"type": "command", "command": ".claude/hooks/guard-pdk-files.sh"}]
+                    }
+                ],
+                "UserPromptSubmit": [{
+                    "matcher": "",
+                    "hooks": [{"type": "command", "command": "skill-router.sh"}]
+                }]
+            }
+        }"#).unwrap();
+
+        remove_loom_hooks(&mut settings);
+
+        // Loom hook should be removed from PreToolUse/Bash
+        let bash_hooks = &settings["hooks"]["PreToolUse"][0]["hooks"];
+        let hooks_arr = bash_hooks.as_array().unwrap();
+        assert_eq!(hooks_arr.len(), 1);
+        assert_eq!(hooks_arr[0]["command"], ".claude/hooks/custom-guard.sh");
+
+        // Edit matcher should be untouched
+        let edit_hooks = &settings["hooks"]["PreToolUse"][1]["hooks"];
+        assert_eq!(edit_hooks.as_array().unwrap().len(), 1);
+
+        // UserPromptSubmit should be untouched
+        let user_prompt = &settings["hooks"]["UserPromptSubmit"];
+        assert_eq!(user_prompt.as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn test_remove_loom_hooks_cleans_empty_matchers() {
+        // When removing Loom hook leaves a matcher with no hooks, remove the matcher
+        let mut settings: serde_json::Value = serde_json::from_str(
+            r#"{
+            "hooks": {
+                "PreToolUse": [{
+                    "matcher": "Bash",
+                    "hooks": [{"type": "command", "command": ".loom/hooks/guard-destructive.sh"}]
+                }]
+            }
+        }"#,
+        )
+        .unwrap();
+
+        remove_loom_hooks(&mut settings);
+
+        // hooks key should be removed entirely since nothing remains
+        assert!(
+            settings.get("hooks").is_none(),
+            "hooks key should be removed when empty, got: {:?}",
+            settings
+        );
+    }
+
+    #[test]
+    fn test_remove_loom_permissions() {
+        let mut settings: serde_json::Value = serde_json::from_str(
+            r#"{
+            "permissions": {
+                "allow": ["Bash(gh:*)", "Bash(git:*)", "CustomPermission", "WebSearch"]
+            }
+        }"#,
+        )
+        .unwrap();
+
+        let loom_defaults: serde_json::Value = serde_json::from_str(
+            r#"{
+            "permissions": {
+                "allow": ["Bash(gh:*)", "Bash(git:*)", "WebSearch"]
+            }
+        }"#,
+        )
+        .unwrap();
+
+        remove_loom_permissions(&mut settings, &loom_defaults);
+
+        let perms = settings["permissions"]["allow"].as_array().unwrap();
+        assert_eq!(perms.len(), 1);
+        assert_eq!(perms[0], "CustomPermission");
+    }
+
+    #[test]
+    fn test_remove_loom_permissions_cleans_empty() {
+        let mut settings: serde_json::Value = serde_json::from_str(
+            r#"{
+            "permissions": {
+                "allow": ["Bash(gh:*)"]
+            },
+            "model": "opus"
+        }"#,
+        )
+        .unwrap();
+
+        let loom_defaults: serde_json::Value = serde_json::from_str(
+            r#"{
+            "permissions": {
+                "allow": ["Bash(gh:*)"]
+            }
+        }"#,
+        )
+        .unwrap();
+
+        remove_loom_permissions(&mut settings, &loom_defaults);
+
+        // permissions key should be removed entirely
+        assert!(settings.get("permissions").is_none());
+        // other keys should be preserved
+        assert_eq!(settings["model"], "opus");
+    }
+
+    #[test]
+    fn test_merge_settings_in_scaffolding_reinstall() {
+        // Integration test: verify settings.json is merged during reinstall
+        let temp_dir = TempDir::new().unwrap();
+        let workspace = temp_dir.path();
+        let defaults = temp_dir.path().join("defaults");
+
+        // Setup git repo
+        fs::create_dir(workspace.join(".git")).unwrap();
+
+        // Create defaults with .claude/commands and settings.json
+        fs::create_dir_all(defaults.join(".claude").join("commands")).unwrap();
+        fs::write(defaults.join(".claude").join("commands").join("loom.md"), "loom command")
+            .unwrap();
+        fs::write(
+            defaults.join(".claude").join("settings.json"),
+            r#"{
+                "hooks": {
+                    "PreToolUse": [{
+                        "matcher": "Bash",
+                        "hooks": [{"type": "command", "command": ".loom/hooks/guard-destructive.sh"}]
+                    }]
+                },
+                "permissions": {
+                    "allow": ["Bash(gh:*)", "Bash(git:*)"]
+                }
+            }"#,
+        ).unwrap();
+
+        // Create existing .claude directory with project settings
+        fs::create_dir_all(workspace.join(".claude").join("commands")).unwrap();
+        fs::write(
+            workspace.join(".claude").join("settings.json"),
+            r#"{
+                "hooks": {
+                    "PreToolUse": [{
+                        "matcher": "Edit",
+                        "hooks": [{"type": "command", "command": ".claude/hooks/guard-pdk.sh"}]
+                    }],
+                    "UserPromptSubmit": [{
+                        "matcher": "",
+                        "hooks": [{"type": "command", "command": "skill-router.sh"}]
+                    }]
+                },
+                "permissions": {
+                    "allow": ["Bash(gh:*)", "CustomPermission"]
+                },
+                "enabledPlugins": {"my-plugin": true}
+            }"#,
+        )
+        .unwrap();
+
+        // Run setup (reinstall)
+        let mut report = InitReport::default();
+        setup_repository_scaffolding(workspace, &defaults, true, &mut report).unwrap();
+
+        // Read the resulting settings.json
+        let result_content =
+            fs::read_to_string(workspace.join(".claude").join("settings.json")).unwrap();
+        let result: serde_json::Value = serde_json::from_str(&result_content).unwrap();
+
+        // PreToolUse should have both matchers (Edit from project, Bash from Loom)
+        let pre_tool = result["hooks"]["PreToolUse"].as_array().unwrap();
+        assert_eq!(pre_tool.len(), 2, "Should have Edit and Bash matchers");
+
+        // Project's Edit matcher should be preserved
+        let has_edit = pre_tool.iter().any(|m| m["matcher"] == "Edit");
+        assert!(has_edit, "Project's Edit matcher should be preserved");
+
+        // Loom's Bash matcher should be added
+        let has_bash = pre_tool.iter().any(|m| m["matcher"] == "Bash");
+        assert!(has_bash, "Loom's Bash matcher should be added");
+
+        // Project's UserPromptSubmit should be preserved
+        assert!(
+            result["hooks"].get("UserPromptSubmit").is_some(),
+            "Project's UserPromptSubmit hooks should be preserved"
+        );
+
+        // Permissions should be unioned
+        let perms = result["permissions"]["allow"].as_array().unwrap();
+        let perm_strs: Vec<&str> = perms.iter().map(|p| p.as_str().unwrap()).collect();
+        assert!(perm_strs.contains(&"Bash(gh:*)"));
+        assert!(perm_strs.contains(&"Bash(git:*)"));
+        assert!(perm_strs.contains(&"CustomPermission"));
+
+        // enabledPlugins should be preserved
+        assert_eq!(result["enabledPlugins"]["my-plugin"], true);
     }
 }
