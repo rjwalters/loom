@@ -178,6 +178,26 @@ gh pr create --label "loom:review-requested"
 
 ## Development Workflow
 
+### Shepherd Lifecycle (MANDATORY)
+
+When implementing issues — whether manually, via `/shepherd`, or by spawning subagents — **all stages of the shepherd lifecycle must be executed in order**. Do not skip stages.
+
+```
+Curator → Builder → Judge → Doctor (if needed) → Merge
+```
+
+| Stage | What happens | Skip allowed? |
+|-------|-------------|---------------|
+| **Curator** | Enrich the issue with technical details, acceptance criteria, scope | No |
+| **Builder** | Implement, test, commit, create PR | No |
+| **Judge** | Review the PR, approve or request changes | No |
+| **Doctor** | Fix issues from judge feedback | Only if judge approves |
+| **Merge** | Champion auto-merges approved PRs | No |
+
+**When spawning subagents to shepherd issues**: each subagent must run the full lifecycle, not just the builder phase. If parallelizing multiple issues, each agent must independently execute Curator → Builder → Judge → Doctor → Merge. Simply creating a PR and labeling it `loom:review-requested` is only the Builder stage — the work is not complete until the PR has been reviewed and merged.
+
+**When using `/shepherd`**: the skill handles this automatically. Prefer `/shepherd <issue>` over manual orchestration to avoid accidentally skipping stages.
+
 ### Builder Workflow
 
 1. Find issue: `gh issue list --label="loom:issue"`
