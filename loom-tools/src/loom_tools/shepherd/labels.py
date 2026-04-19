@@ -1,12 +1,15 @@
-"""Label caching and manipulation for GitHub issues and PRs."""
+"""Label caching and manipulation for issues and PRs.
+
+Uses the ForgeClient abstraction for all forge operations, enabling
+support for both GitHub and Gitea backends.
+"""
 
 from __future__ import annotations
 
-import json
 from pathlib import Path
 from typing import Literal
 
-from loom_tools.common.github import gh_issue_view, gh_run
+from loom_tools.common.forge import ForgeClient, get_forge
 
 # Entity type for generic label operations
 EntityType = Literal["issue", "pr"]
@@ -35,43 +38,43 @@ def get_exclusion_conflicts(labels: set[str]) -> list[dict[str, object]]:
     return conflicts
 
 
+def _get_forge_client(repo_root: Path | None = None) -> ForgeClient:
+    """Get a ForgeClient instance for the given repo root."""
+    return get_forge(repo_root)
+
+
 class LabelCache:
     """Cache for issue/PR labels with invalidation.
 
-    Reduces GitHub API calls by caching label lookups.
+    Reduces forge API calls by caching label lookups.
     Call invalidate() after any label mutation (add/remove).
     """
 
-    def __init__(self, repo_root: Path | None = None) -> None:
+    def __init__(
+        self,
+        repo_root: Path | None = None,
+        forge: ForgeClient | None = None,
+    ) -> None:
         self._labels: dict[tuple[EntityType, int], set[str]] = {}
         self._repo_root = repo_root
+        self._forge = forge
 
-    def _run_gh(self, args: list[str]) -> str:
-        """Run gh command and return stdout.
-
-        Delegates to the centralized ``gh_run`` for consistent behavior.
-        """
-        result = gh_run(args, check=False, cwd=self._repo_root)
-        if result.returncode != 0:
-            return ""
-        return result.stdout.strip()
+    def _get_forge(self) -> ForgeClient:
+        """Get or lazily create the ForgeClient instance."""
+        if self._forge is None:
+            self._forge = _get_forge_client(self._repo_root)
+        return self._forge
 
     def _fetch_labels(self, entity_type: EntityType, number: int) -> set[str]:
-        """Fetch labels for an issue or PR from GitHub."""
-        output = self._run_gh(
-            [
-                entity_type,
-                "view",
-                str(number),
-                "--json",
-                "labels",
-                "--jq",
-                ".labels[].name",
-            ]
-        )
-        if not output:
+        """Fetch labels for an issue or PR via ForgeClient."""
+        forge = self._get_forge()
+        if entity_type == "issue":
+            entity = forge.get_issue(number)
+        else:
+            entity = forge.get_pull_request(number)
+        if entity is None:
             return set()
-        return set(output.splitlines())
+        return set(entity.labels)
 
     def get_labels(
         self, entity_type: EntityType, number: int, *, refresh: bool = False
@@ -127,14 +130,14 @@ class LabelCache:
     # -------------------------------------------------------------------------
 
     def _fetch_issue_labels(self, issue: int) -> set[str]:
-        """Fetch labels for an issue from GitHub.
+        """Fetch labels for an issue from the forge.
 
         Deprecated: Use _fetch_labels("issue", issue) instead.
         """
         return self._fetch_labels("issue", issue)
 
     def _fetch_pr_labels(self, pr: int) -> set[str]:
-        """Fetch labels for a PR from GitHub.
+        """Fetch labels for a PR from the forge.
 
         Deprecated: Use _fetch_labels("pr", pr) instead.
         """
@@ -309,12 +312,8 @@ def add_label(
     Returns:
         True if successful
     """
-    result = gh_run(
-        [entity_type, "edit", str(number), "--add-label", label],
-        check=False,
-        cwd=repo_root,
-    )
-    return result.returncode == 0
+    forge = _get_forge_client(repo_root)
+    return forge.add_labels(entity_type, number, [label])
 
 
 def remove_label(
@@ -331,11 +330,8 @@ def remove_label(
     Returns:
         True if successful (or label didn't exist)
     """
-    gh_run(
-        [entity_type, "edit", str(number), "--remove-label", label],
-        check=False,
-        cwd=repo_root,
-    )
+    forge = _get_forge_client(repo_root)
+    forge.remove_labels(entity_type, number, [label])
     # Always return True - label may not have existed
     return True
 
@@ -351,11 +347,10 @@ def transition_labels(
 ) -> bool:
     """Atomically add and remove labels in a single API call.
 
-    This function performs label transitions atomically using a single
-    `gh issue/pr edit` command with both --add-label and --remove-label
-    flags. If the command fails mid-execution, the labels may be in an
-    inconsistent state, but this is much less likely than with separate
-    API calls.
+    This function performs label transitions atomically using the
+    ForgeClient's transition_labels method. The enforce_exclusion logic
+    is applied above the ForgeClient layer to ensure consistent behavior
+    across all forge backends.
 
     Args:
         entity_type: "issue" or "pr"
@@ -385,29 +380,30 @@ def transition_labels(
     if not add and not remove:
         return True  # Nothing to do
 
-    # Build the effective remove set
-    effective_remove = set(remove or [])
+    # Build the effective remove set -- enforce_exclusion logic stays above
+    # ForgeClient to ensure consistent behavior across all forge backends.
+    effective_remove = list(remove or [])
 
     if enforce_exclusion and add:
+        extra_remove: set[str] = set()
         for label in add:
             for group in LABEL_EXCLUSION_GROUPS:
                 if label in group:
                     # Remove all other labels in the group
-                    effective_remove |= group - {label}
+                    extra_remove |= group - {label}
+        # Merge without duplicates
+        existing = set(effective_remove)
+        for label in sorted(extra_remove):
+            if label not in existing:
+                effective_remove.append(label)
 
-    args: list[str] = [entity_type, "edit", str(number)]
-
-    # Add --remove-label flags first (order doesn't matter to gh, but
-    # conceptually we remove the old state before adding the new)
-    for label in sorted(effective_remove):
-        args.extend(["--remove-label", label])
-
-    # Add --add-label flags
-    for label in add or []:
-        args.extend(["--add-label", label])
-
-    result = gh_run(args, check=False, cwd=repo_root)
-    return result.returncode == 0
+    forge = _get_forge_client(repo_root)
+    return forge.transition_labels(
+        entity_type,
+        number,
+        add=add,
+        remove=effective_remove if effective_remove else None,
+    )
 
 
 def transition_issue_labels(
@@ -457,94 +453,31 @@ def transition_pr_labels(
 def get_issue_metadata(issue: int, repo_root: Path | None = None) -> dict | None:
     """Fetch issue metadata (url, state, title, labels) in a single API call.
 
-    Uses the dual-mode GitHub API layer (GraphQL with REST fallback).
+    Uses the ForgeClient abstraction for forge-agnostic operation.
 
     Returns None if issue doesn't exist.
     """
-    return gh_issue_view(
-        issue,
-        fields=["url", "state", "title", "labels"],
-        cwd=repo_root,
-    )
+    forge = _get_forge_client(repo_root)
+    forge_issue = forge.get_issue(issue)
+    if forge_issue is None:
+        return None
+    return {
+        "url": forge_issue.url,
+        "state": forge_issue.state,
+        "title": forge_issue.title,
+        "labels": [{"name": label} for label in forge_issue.labels],
+    }
 
 
 def get_pr_for_issue(
     issue: int, state: str = "open", repo_root: Path | None = None
 ) -> int | None:
-    """Find a PR for an issue using multiple search patterns.
+    """Find a PR for an issue.
 
-    Tries in order:
-    1. Branch name: feature/issue-{issue}
-    2. Body search validated by closingIssuesReferences: "Closes #{issue}"
-    3. Body search validated by closingIssuesReferences: "Fixes #{issue}"
-    4. Body search validated by closingIssuesReferences: "Resolves #{issue}"
-
-    Methods 2-4 use GitHub's ``closingIssuesReferences`` field to confirm the
-    PR genuinely auto-closes this repo's issue, preventing false positives from
-    cross-repo references in PR bodies (e.g. Dependabot changelogs that contain
-    both "Fixes" headings and upstream issue numbers).
+    Delegates to ForgeClient.find_pull_request_for_issue() which handles
+    the search logic for each forge backend.
 
     Returns PR number if found, None otherwise.
     """
-
-    def _run(args: list[str]) -> str:
-        result = gh_run(args, check=False, cwd=repo_root)
-        if result.returncode != 0:
-            return ""
-        return result.stdout.strip()
-
-    # Method 1: Branch-based lookup (deterministic, no indexing lag)
-    output = _run(
-        [
-            "pr",
-            "list",
-            "--head",
-            f"feature/issue-{issue}",
-            "--state",
-            state,
-            "--json",
-            "number",
-            "--jq",
-            ".[0].number",
-        ]
-    )
-    if output and output != "null":
-        try:
-            return int(output)
-        except ValueError:
-            pass
-
-    # Methods 2-4: Search body for linking keywords, then validate via
-    # closingIssuesReferences to avoid false positives from cross-repo refs.
-    for pattern in [f"Closes #{issue}", f"Fixes #{issue}", f"Resolves #{issue}"]:
-        output = _run(
-            [
-                "pr",
-                "list",
-                "--search",
-                pattern,
-                "--state",
-                state,
-                "--json",
-                "number,closingIssuesReferences",
-            ]
-        )
-        if not output:
-            continue
-        try:
-            candidates = json.loads(output)
-        except (json.JSONDecodeError, ValueError):
-            continue
-        if not isinstance(candidates, list):
-            continue
-        for pr in candidates:
-            pr_number = pr.get("number")
-            if not isinstance(pr_number, int):
-                continue
-            closing_refs = pr.get("closingIssuesReferences", [])
-            if isinstance(closing_refs, list) and any(
-                ref.get("number") == issue for ref in closing_refs
-            ):
-                return pr_number
-
-    return None
+    forge = _get_forge_client(repo_root)
+    return forge.find_pull_request_for_issue(issue, state=state)
