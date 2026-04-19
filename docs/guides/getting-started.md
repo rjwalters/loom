@@ -34,7 +34,7 @@ Running `loom-daemon init` creates these files in your repository:
 - `CLAUDE.md` - AI context document for Claude Code (11KB template)
 
 **Tooling (Commit these)**:
-- `.claude/commands/` - Claude Code slash commands for each role
+- `.claude/commands/loom/` - Claude Code slash commands for each role
 - `.codex/` - Codex configuration (if available)
 - `.github/labels.yml` - Workflow label definitions
 
@@ -355,12 +355,13 @@ CLAUDE.md             # Technical context for Claude Code agents
 
 ```
 .claude/
-├── commands/         # Slash commands for Claude Code
+├── commands/
+│   └── loom/         # Loom slash commands for Claude Code
 └── README.md         # Documentation
 ```
 
 **What to do:**
-1. Explore available slash commands in `.claude/commands/`
+1. Explore available slash commands in `.claude/commands/loom/`
 2. Add custom slash commands for your project
 3. See [Claude Code docs](https://docs.claude.com/en/docs/claude-code) for details
 

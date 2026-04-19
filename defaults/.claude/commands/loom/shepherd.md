@@ -175,7 +175,7 @@ When the progress file shows `status: completed` or `status: error`, summarize t
 ## Reference Documentation
 
 For detailed orchestration workflow, phase definitions, and troubleshooting:
-- **Lifecycle details**: `.claude/commands/shepherd-lifecycle.md`
+- **Lifecycle details**: `.claude/commands/loom/shepherd-lifecycle.md`
 - **Daemon startup**: `.loom/scripts/daemon.sh --help`
 - **Daemon status**: `.loom/scripts/daemon.sh status`
 - **Signal protocol**: `loom-tools/src/loom_tools/daemon_v2/command_poller.py`

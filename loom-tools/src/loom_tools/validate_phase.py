@@ -395,8 +395,8 @@ def _mark_phase_failed(
         f"**Phase contract failed**: `{phase}` phase did not produce expected outcome. "
         f"{reason}\n\n"
         "For label state documentation and manual recovery steps, see "
-        "[`.claude/commands/shepherd-lifecycle.md`]"
-        "(../blob/main/.claude/commands/shepherd-lifecycle.md#label-state-machine)."
+        "[`.claude/commands/loom/shepherd-lifecycle.md`]"
+        "(../blob/main/.claude/commands/loom/shepherd-lifecycle.md#label-state-machine)."
     )
     if diagnostics:
         body += f"\n\n{diagnostics}"

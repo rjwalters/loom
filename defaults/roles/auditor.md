@@ -1,1 +1,1 @@
-../.claude/commands/auditor.md
+../.claude/commands/loom/auditor.md

@@ -1,1 +1,1 @@
-../.claude/commands/driver.md
+../.claude/commands/loom/driver.md

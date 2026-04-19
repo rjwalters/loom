@@ -282,12 +282,12 @@ else
   fail "CLAUDE.md missing"
 fi
 
-# Test 11: .claude/commands
-echo "Test 11: Install creates .claude/commands"
-if [[ -d "$INSTALL_REPO/.claude/commands" ]]; then
-  pass ".claude/commands directory exists"
+# Test 11: .claude/commands/loom
+echo "Test 11: Install creates .claude/commands/loom"
+if [[ -d "$INSTALL_REPO/.claude/commands/loom" ]]; then
+  pass ".claude/commands/loom directory exists"
 else
-  fail ".claude/commands directory missing"
+  fail ".claude/commands/loom directory missing"
 fi
 
 # Test 12: .claude/settings.json
@@ -552,7 +552,7 @@ simulate_loom_install "$REINSTALL_REPO"
 
 if [[ -d "$REINSTALL_REPO/.loom/roles" ]] && \
    [[ -f "$REINSTALL_REPO/CLAUDE.md" ]] && \
-   [[ -d "$REINSTALL_REPO/.claude/commands" ]]; then
+   [[ -d "$REINSTALL_REPO/.claude/commands/loom" ]]; then
   pass "Reinstall cycle completed successfully"
 else
   fail "Reinstall cycle left incomplete state"

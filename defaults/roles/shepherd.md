@@ -1,1 +1,1 @@
-../.claude/commands/shepherd.md
+../.claude/commands/loom/shepherd.md

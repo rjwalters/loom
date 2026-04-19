@@ -1,1 +1,1 @@
-../.claude/commands/builder-pr.md
+../.claude/commands/loom/builder-pr.md

@@ -1,1 +1,1 @@
-../.claude/commands/hermit-patterns.md
+../.claude/commands/loom/hermit-patterns.md
