@@ -708,16 +708,48 @@ echo "$LOOM_ROOT" > "$TARGET_PATH/.loom/loom-source-path"
 success "Loom source path recorded"
 
 # Store installation metadata (commit hash moved here from CLAUDE.md for idempotency)
+# Also record the list of installed files so the uninstaller knows exactly what to remove.
+# This prevents the uninstaller from using heuristics and accidentally touching project files.
 info "Recording installation metadata..."
+
+# Collect all installed files (relative paths from repo root)
+INSTALLED_FILES_JSON="["
+FIRST_FILE=true
+while IFS= read -r -d '' file; do
+  rel_path="${file#./}"
+  # Skip runtime artifacts that are gitignored
+  case "$rel_path" in
+    .loom/state.json|.loom/daemon-state.json|.loom/loom-source-path|.loom/install-metadata.json|.loom/manifest.json)
+      continue
+      ;;
+  esac
+  if [[ "$FIRST_FILE" == "true" ]]; then
+    FIRST_FILE=false
+  else
+    INSTALLED_FILES_JSON="${INSTALLED_FILES_JSON},"
+  fi
+  INSTALLED_FILES_JSON="${INSTALLED_FILES_JSON}\"${rel_path}\""
+done < <(find . -type f \
+  -not -path './.git/*' \
+  -not -path './.loom/worktrees/*' \
+  -not -path './.loom/progress/*' \
+  -not -path './.loom/logs/*' \
+  -not -name '*.log' \
+  -not -name '*.sock' \
+  -not -name '.DS_Store' \
+  -print0 | sort -z)
+INSTALLED_FILES_JSON="${INSTALLED_FILES_JSON}]"
+
 cat > .loom/install-metadata.json <<METADATA
 {
   "loom_version": "${LOOM_VERSION}",
   "loom_commit": "${LOOM_COMMIT}",
   "install_date": "$(date +%Y-%m-%d)",
-  "loom_source": "${LOOM_ROOT}"
+  "loom_source": "${LOOM_ROOT}",
+  "installed_files": ${INSTALLED_FILES_JSON}
 }
 METADATA
-success "Installation metadata recorded"
+success "Installation metadata recorded ($(echo "$INSTALLED_FILES_JSON" | grep -o '"' | wc -l | awk '{print $1/2}') files tracked)"
 echo ""
 
 # Verify expected files were created

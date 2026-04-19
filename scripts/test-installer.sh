@@ -148,13 +148,40 @@ simulate_loom_install() {
 .loom/.daemon.*
 GITIGNORE_EOF
 
-  # Create install metadata
-  cat > "$target/.loom/install-metadata.json" << 'META_EOF'
+  # Build installed_files manifest by collecting all files we just installed
+  local installed_files_json="["
+  local first_file=true
+  while IFS= read -r -d '' file; do
+    local rel_path="${file#$target/}"
+    # Skip runtime artifacts and metadata
+    case "$rel_path" in
+      .loom/install-metadata.json|.loom/state.json|.loom/daemon-state.json|.loom/loom-source-path|.loom/manifest.json)
+        continue
+        ;;
+    esac
+    if [[ "$first_file" == "true" ]]; then
+      first_file=false
+    else
+      installed_files_json="${installed_files_json},"
+    fi
+    installed_files_json="${installed_files_json}\"${rel_path}\""
+  done < <(find "$target" -type f \
+    -not -path "$target/.git/*" \
+    -not -path "$target/.loom/worktrees/*" \
+    -not -name '.DS_Store' \
+    -not -name '*.log' \
+    -not -name '*.sock' \
+    -print0 | sort -z)
+  installed_files_json="${installed_files_json}]"
+
+  # Create install metadata with installed_files manifest
+  cat > "$target/.loom/install-metadata.json" <<META_EOF
 {
   "loom_version": "0.0.0-test",
   "loom_commit": "test",
   "install_date": "2026-01-01",
-  "loom_source": "/tmp/test-loom"
+  "loom_source": "/tmp/test-loom",
+  "installed_files": ${installed_files_json}
 }
 META_EOF
 
@@ -653,6 +680,122 @@ if [[ -f "$MIXED_REPO/CLAUDE.md" ]]; then
   fi
 else
   fail "Mixed CLAUDE.md: entire file was removed (should preserve user content)"
+fi
+echo ""
+
+
+# ==========================================================================
+# Section 7: Project-Specific Files in .loom/ Subdirectories
+# ==========================================================================
+echo "--- Section 7: Project-Specific Files in .loom/ ---"
+echo ""
+
+# Test 33: Project-specific directories in .loom/ survive uninstall
+echo "Test 33: Project dirs in .loom/ survive uninstall (manifest-based)"
+PROJECT_REPO="$TEST_DIR/project-dirs-test"
+create_temp_repo "$PROJECT_REPO"
+simulate_loom_install "$PROJECT_REPO"
+
+# Create project-specific directories and files inside .loom/
+# These simulate real-world usage (e.g., sphere's claims/, diagnostics/)
+mkdir -p "$PROJECT_REPO/.loom/claims"
+echo '{"claim": "test"}' > "$PROJECT_REPO/.loom/claims/claim-1.json"
+mkdir -p "$PROJECT_REPO/.loom/diagnostics"
+echo "diagnostic data" > "$PROJECT_REPO/.loom/diagnostics/report.txt"
+mkdir -p "$PROJECT_REPO/.loom/methodology-cache"
+echo "cached data" > "$PROJECT_REPO/.loom/methodology-cache/cache.json"
+mkdir -p "$PROJECT_REPO/.loom/tests"
+echo "test config" > "$PROJECT_REPO/.loom/tests/test-config.json"
+
+# Also create project-specific hooks in .claude/hooks/
+mkdir -p "$PROJECT_REPO/.claude/hooks"
+echo '#!/bin/bash' > "$PROJECT_REPO/.claude/hooks/guard-pdk-files.sh"
+echo '#!/bin/bash' > "$PROJECT_REPO/.claude/hooks/skill-router.sh"
+
+# And project-specific agents
+mkdir -p "$PROJECT_REPO/.claude/agents"
+echo "# AMS Architect" > "$PROJECT_REPO/.claude/agents/ams-architect.md"
+echo "# Layout Place" > "$PROJECT_REPO/.claude/agents/layout-place.md"
+
+git -C "$PROJECT_REPO" add -A
+git -C "$PROJECT_REPO" commit -m "Add project-specific files" --quiet
+
+# Run uninstall (non-interactive, non-clean)
+"$UNINSTALL_SCRIPT" --yes --local "$PROJECT_REPO" > /dev/null 2>&1 || true
+
+# Verify project-specific directories and files survived
+if [[ -f "$PROJECT_REPO/.loom/claims/claim-1.json" ]]; then
+  pass "Project dir .loom/claims/ preserved after uninstall"
+else
+  fail "Project dir .loom/claims/ was removed by uninstall"
+fi
+
+if [[ -f "$PROJECT_REPO/.loom/diagnostics/report.txt" ]]; then
+  pass "Project dir .loom/diagnostics/ preserved after uninstall"
+else
+  fail "Project dir .loom/diagnostics/ was removed by uninstall"
+fi
+
+if [[ -f "$PROJECT_REPO/.loom/methodology-cache/cache.json" ]]; then
+  pass "Project dir .loom/methodology-cache/ preserved after uninstall"
+else
+  fail "Project dir .loom/methodology-cache/ was removed by uninstall"
+fi
+
+if [[ -f "$PROJECT_REPO/.loom/tests/test-config.json" ]]; then
+  pass "Project dir .loom/tests/ preserved after uninstall"
+else
+  fail "Project dir .loom/tests/ was removed by uninstall"
+fi
+
+# Verify project-specific hooks survived
+if [[ -f "$PROJECT_REPO/.claude/hooks/guard-pdk-files.sh" ]]; then
+  pass "Project hook .claude/hooks/guard-pdk-files.sh preserved"
+else
+  fail "Project hook .claude/hooks/guard-pdk-files.sh was removed"
+fi
+
+if [[ -f "$PROJECT_REPO/.claude/hooks/skill-router.sh" ]]; then
+  pass "Project hook .claude/hooks/skill-router.sh preserved"
+else
+  fail "Project hook .claude/hooks/skill-router.sh was removed"
+fi
+
+# Verify project-specific agents survived
+if [[ -f "$PROJECT_REPO/.claude/agents/ams-architect.md" ]]; then
+  pass "Project agent .claude/agents/ams-architect.md preserved"
+else
+  fail "Project agent .claude/agents/ams-architect.md was removed"
+fi
+
+# Verify Loom files WERE removed
+if [[ ! -d "$PROJECT_REPO/.loom/roles" ]] || [[ $(find "$PROJECT_REPO/.loom/roles" -type f 2>/dev/null | wc -l | tr -d ' ') -eq 0 ]]; then
+  pass "Loom roles were correctly removed"
+else
+  fail "Loom roles were not removed"
+fi
+
+if [[ ! -d "$PROJECT_REPO/.loom/scripts" ]] || [[ $(find "$PROJECT_REPO/.loom/scripts" -type f 2>/dev/null | wc -l | tr -d ' ') -eq 0 ]]; then
+  pass "Loom scripts were correctly removed"
+else
+  fail "Loom scripts were not removed"
+fi
+
+# Test 34: No "Preserved directory" noise (uninstall output check)
+echo "Test 34: No 'Preserved directory' noise in uninstall output"
+NOISE_REPO="$TEST_DIR/noise-test"
+create_temp_repo "$NOISE_REPO"
+simulate_loom_install "$NOISE_REPO"
+mkdir -p "$NOISE_REPO/.loom/project-data"
+echo "data" > "$NOISE_REPO/.loom/project-data/info.txt"
+git -C "$NOISE_REPO" add -A
+git -C "$NOISE_REPO" commit -m "Add project data" --quiet
+
+UNINSTALL_OUTPUT=$("$UNINSTALL_SCRIPT" --yes --local "$NOISE_REPO" 2>&1 || true)
+if echo "$UNINSTALL_OUTPUT" | grep -q "Preserved directory"; then
+  fail "Uninstall output contains 'Preserved directory' noise"
+else
+  pass "No 'Preserved directory' noise in uninstall output"
 fi
 echo ""
 
