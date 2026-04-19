@@ -729,14 +729,16 @@ while IFS= read -r -d '' file; do
     INSTALLED_FILES_JSON="${INSTALLED_FILES_JSON},"
   fi
   INSTALLED_FILES_JSON="${INSTALLED_FILES_JSON}\"${rel_path}\""
-done < <(find . -type f \
-  -not -path './.git/*' \
+done < <(find \
+  .loom .claude .codex .github .githooks CLAUDE.md .gitignore \
+  -maxdepth 20 -type f \
   -not -path './.loom/worktrees/*' \
   -not -path './.loom/progress/*' \
   -not -path './.loom/logs/*' \
   -not -name '*.log' \
   -not -name '*.sock' \
   -not -name '.DS_Store' \
+  2>/dev/null \
   -print0 | sort -z)
 INSTALLED_FILES_JSON="${INSTALLED_FILES_JSON}]"
 

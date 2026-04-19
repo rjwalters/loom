@@ -165,12 +165,15 @@ GITIGNORE_EOF
       installed_files_json="${installed_files_json},"
     fi
     installed_files_json="${installed_files_json}\"${rel_path}\""
-  done < <(find "$target" -type f \
-    -not -path "$target/.git/*" \
+  done < <(find \
+    "$target/.loom" "$target/.claude" "$target/.codex" "$target/.github" \
+    "$target/.githooks" "$target/CLAUDE.md" "$target/.gitignore" \
+    -maxdepth 20 -type f \
     -not -path "$target/.loom/worktrees/*" \
     -not -name '.DS_Store' \
     -not -name '*.log' \
     -not -name '*.sock' \
+    2>/dev/null \
     -print0 | sort -z)
   installed_files_json="${installed_files_json}]"
 
