@@ -18,6 +18,10 @@
           {
             "type": "command",
             "command": ".loom/hooks/skill-router.sh"
+          },
+          {
+            "type": "command",
+            "command": ".loom/hooks/methodology-inject.sh"
           }
         ]
       }

@@ -1080,7 +1080,97 @@ Many projects have directories that should never be modified by agents (vendor c
 
 **Template location**: `defaults/hooks/guard-readonly-dirs.sh.template`
 
+## Methodology Injection Framework
+
+Loom provides an opt-in methodology injection hook that automatically injects project-specific context into every agent session. This is useful for domain knowledge, coding conventions, design rules, or any context that agents need to do their job well.
+
+### Quick Start
+
+1. Create the context directory in your repository:
+   ```bash
+   mkdir -p .loom/context/roles .loom/context/topics
+   ```
+
+2. Add a universal context file (injected on every prompt):
+   ```bash
+   cat > .loom/context/universal.md << 'EOF'
+   # Project Rules
+   - Use TypeScript strict mode
+   - All functions must have JSDoc comments
+   - Run tests before creating PRs
+   EOF
+   ```
+
+3. The hook is already registered in `.claude/settings.json`. It activates automatically when `.loom/context/` exists and silently does nothing when the directory is absent.
+
+### Context File Structure
+
+```
+.loom/context/
+├── config.json              # Optional configuration
+├── universal.md             # Injected on every prompt
+├── roles/
+│   ├── builder.md           # Injected when LOOM_ROLE=builder
+│   ├── judge.md             # Injected when LOOM_ROLE=judge
+│   └── ...
+└── topics/
+    ├── security.md          # Injected when prompt matches "security"
+    ├── security.pattern     # Optional: custom regex pattern for matching
+    ├── database.md          # Injected when prompt matches "database"
+    └── ...
+```
+
+**Universal context** (`universal.md`): Always injected when the context directory exists. Use for project-wide rules and conventions.
+
+**Role context** (`roles/<role>.md`): Injected when the `LOOM_ROLE` environment variable matches the filename, or when a slash command (e.g., `/builder`) is detected in the prompt. Role names are case-insensitive.
+
+**Topic context** (`topics/<name>.md`): Injected when the prompt matches a keyword pattern. By default, the filename is used as the regex pattern (e.g., `security.md` matches prompts containing "security"). For custom patterns, create a sidecar `.pattern` file with a regex (e.g., `security.pattern` containing `security|auth|token|credential`).
+
+### Configuration
+
+Create `.loom/context/config.json` to customize behavior:
+
+```json
+{
+  "max_context_chars": 8000,
+  "enabled": true,
+  "inject_universal": true,
+  "inject_role": true,
+  "inject_topics": true
+}
+```
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `max_context_chars` | 8000 | Maximum total characters injected (prevents overwhelming the context window) |
+| `enabled` | true | Set to false to disable injection without removing files |
+| `inject_universal` | true | Whether to inject `universal.md` |
+| `inject_role` | true | Whether to inject role-specific context |
+| `inject_topics` | true | Whether to inject topic-matched context |
+
+### How It Works
+
+The `methodology-inject.sh` hook runs as a `UserPromptSubmit` hook alongside `skill-router.sh`. On each prompt:
+
+1. Checks for `.loom/context/` directory -- exits silently if absent
+2. Reads `universal.md` if present
+3. Detects the active role via `LOOM_ROLE` env var or prompt slash command
+4. Scans `topics/` files, matching prompt against filename or sidecar `.pattern` regex
+5. Concatenates matching content, capped at `max_context_chars`
+6. Returns the collected context as `additionalContext`
+
+The hook follows the same error-handling patterns as other Loom hooks: it never exits non-zero, logs errors to `.loom/logs/hook-errors.log`, and fails silently on any unexpected error.
+
+### Example Context Files
+
+Example context files are provided in `defaults/hooks/example-context/` to guide setup. Copy them to your `.loom/context/` directory and customize:
+
+```bash
+cp -r defaults/hooks/example-context/* .loom/context/
+```
+
 ## Troubleshooting
+
 
 ### Common Issues
 
