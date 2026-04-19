@@ -21,6 +21,10 @@ ignore = [
     "RUSTSEC-2024-0429",  # gtk-sys - unmaintained
     "RUSTSEC-2024-0370",  # gdk-pixbuf-sys - unmaintained
 
+    # rand 0.7.3 unsoundness with custom logger - transitive via tauri -> wry -> kuchikiki -> selectors -> phf_codegen
+    # Not exploitable in our context (requires custom global logger using rand::rng())
+    "RUSTSEC-2026-0097",  # rand - unsound with custom logger
+
     # Other unmaintained transitive dependencies
     "RUSTSEC-2025-0057",  # fxhash - unmaintained
     "RUSTSEC-2025-0075",  # unmaintained
