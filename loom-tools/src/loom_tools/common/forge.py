@@ -491,3 +491,26 @@ class ForgeClient(Protocol):
         Returns the PR number, or ``None`` if no matching PR is found.
         """
         ...
+
+
+# ---------------------------------------------------------------------------
+# Factory function
+# ---------------------------------------------------------------------------
+
+
+def get_forge(cwd: Path | None = None) -> ForgeClient:
+    """Return a ``ForgeClient`` for the detected forge type.
+
+    Uses :func:`detect_forge` to determine which backend to instantiate.
+    Imports are lazy to avoid circular dependencies and so that
+    ``requests`` is only loaded when Gitea is actually used.
+    """
+    forge_type = detect_forge(cwd)
+    if forge_type == ForgeType.GITEA:
+        from loom_tools.common.gitea import GiteaForge
+
+        return GiteaForge(cwd=cwd)
+    # Default: GitHub
+    from loom_tools.common.github import GitHubForge
+
+    return GitHubForge(cwd=cwd)
