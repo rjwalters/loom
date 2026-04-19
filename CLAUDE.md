@@ -613,13 +613,14 @@ Use `scripts/version.sh` to manage versions across all packages:
 ./scripts/version.sh set 1.0.0 --tag   # Set explicit version + commit + tag
 ```
 
-**Full release flow**:
+**Full release flow** (use `/release` skill for guided process):
 ```bash
 ./scripts/version.sh bump patch --tag
 git push origin main --tags
+gh release create vX.Y.Z --title "vX.Y.Z" --notes "Release notes..."
 ```
 
-The script updates all 7 version-bearing files (`package.json`, `mcp-loom/package.json`, `src-tauri/tauri.conf.json`, 3 `Cargo.toml` files, `CLAUDE.md`) plus `Cargo.lock`. The GitHub Actions release workflow (`.github/workflows/release.yml`) triggers on tag push to build and publish macOS DMGs.
+The script updates all 7 version-bearing files (`package.json`, `mcp-loom/package.json`, `src-tauri/tauri.conf.json`, 3 `Cargo.toml` files, `CLAUDE.md`) plus `Cargo.lock`. The GitHub Actions release workflow (`.github/workflows/release.yml`) triggers on GitHub Release creation (`release: types: [created]`), NOT on tag push. You must create a GitHub Release via `gh release create` to trigger the build.
 
 ## Resources
 
