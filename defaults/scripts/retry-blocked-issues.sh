@@ -26,6 +26,13 @@
 
 set -euo pipefail
 
+# Use loom-forge for forge-agnostic issue/PR operations (supports GitHub + Gitea)
+if command -v loom-forge &>/dev/null; then
+    FORGE="loom-forge"
+else
+    FORGE="gh"
+fi
+
 # Configuration
 MAX_RETRY_COUNT="${LOOM_MAX_RETRY_COUNT:-3}"
 RETRY_COOLDOWN="${LOOM_RETRY_COOLDOWN:-1800}"            # 30 minutes
@@ -105,7 +112,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 # Get blocked issues
-BLOCKED_ISSUES=$(gh issue list --label "loom:blocked" --state open --json number,title,createdAt 2>/dev/null || echo "[]")
+BLOCKED_ISSUES=$($FORGE issue list --label "loom:blocked" --state open --json number,title,createdAt 2>/dev/null || echo "[]")
 BLOCKED_COUNT=$(echo "$BLOCKED_ISSUES" | jq 'length')
 
 if [[ "$BLOCKED_COUNT" -eq 0 ]]; then
@@ -204,10 +211,10 @@ if [[ "$EXECUTE" == "true" ]]; then
         next_cooldown_min=$((next_cooldown / 60))
 
         # Transition labels: loom:blocked -> loom:issue
-        gh issue edit "$issue_num" --remove-label "loom:blocked" --add-label "loom:issue" >/dev/null 2>&1
+        $FORGE issue edit "$issue_num" --remove-label "loom:blocked" --add-label "loom:issue" >/dev/null 2>&1
 
         # Add comment
-        gh issue comment "$issue_num" --body "**[daemon] Retry attempt $new_retry_count/$MAX_RETRY_COUNT**
+        $FORGE issue comment "$issue_num" --body "**[daemon] Retry attempt $new_retry_count/$MAX_RETRY_COUNT**
 
 Previous failure: \`$error_class\`
 
