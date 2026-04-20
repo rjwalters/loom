@@ -359,6 +359,37 @@ def match(text: str, pattern: str) -> bool:
 
 def adapt_patterns(patterns: list[str]) -> list[re.Pattern]:
     return [re.compile(convert_glob_to_regex(p)) for p in patterns]
+
+# NOT a stateless ceremony: Dispatch-table class (uses self for method dispatch)
+class CommandRouter:
+    """Routes commands to handler methods. Stateless by design --
+    the class provides method-dispatch organization, not instance state."""
+
+    def route(self, command: str, args: dict) -> Result:
+        handler = {
+            "create": self.handle_create,
+            "update": self.handle_update,
+            "delete": self.handle_delete,
+            "list": self.handle_list,
+        }.get(command)
+        if not handler:
+            return Result(error=f"Unknown command: {command}")
+        return handler(args)
+
+    def handle_create(self, args: dict) -> Result:
+        return Result(data=create_record(args))
+
+    def handle_update(self, args: dict) -> Result:
+        return Result(data=update_record(args["id"], args))
+
+    def handle_delete(self, args: dict) -> Result:
+        return Result(data=delete_record(args["id"]))
+
+    def handle_list(self, args: dict) -> Result:
+        return Result(data=list_records(args.get("filter")))
+    # This class has no self.x = assignments but DOES use self.method()
+    # for internal dispatch. Converting to module functions would lose
+    # the dispatch-table organization. Do NOT flag this.
 ```
 
 ```typescript
@@ -391,7 +422,7 @@ function normalizeData(data: RawData): NormalizedData {
 **Detection scripts:**
 
 ```bash
-# Python: Find classes with no instance state (AST-based)
+# Python: Find classes with no instance state (AST-based, excludes dispatch-table classes)
 python3 -c "
 import ast, sys, os
 for root, dirs, files in os.walk('.'):
@@ -411,7 +442,22 @@ for root, dirs, files in os.walk('.'):
                     for t in n.targets)
                 for n in ast.walk(node)
             )
-            if not has_self_assign:
+            if has_self_assign:
+                continue
+            # Skip dispatch-table classes: no self.x= but uses self.method() calls
+            has_self_method_call = any(
+                isinstance(n, ast.Call) and
+                isinstance(n.func, ast.Attribute) and
+                isinstance(n.func.value, ast.Name) and n.func.value.id == 'self'
+                for n in ast.walk(node)
+            )
+            if has_self_method_call:
+                continue
+            # Large classes (10+ methods) may use class as namespace intentionally
+            method_count = sum(1 for n in node.body if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)))
+            if method_count >= 10:
+                print(f'{path}:{node.lineno}: {node.name} (no instance state, {method_count} methods — large class, verify namespace use before converting)')
+            else:
                 print(f'{path}:{node.lineno}: {node.name} (no instance state)')
 "
 

@@ -144,7 +144,7 @@ Classes where `__init__` is `pass`/empty/missing AND no methods assign to `self.
 Current hermit flags "one-method classes" but not "zero-state classes." A class with multiple methods passes the one-method heuristic even when it has no instance state.
 
 ```bash
-# Find Python classes with no instance state
+# Find Python classes with no instance state (excludes dispatch-table classes)
 python3 -c "
 import ast, sys, os
 for root, dirs, files in os.walk('.'):
@@ -164,7 +164,22 @@ for root, dirs, files in os.walk('.'):
                     for t in n.targets)
                 for n in ast.walk(node)
             )
-            if not has_self_assign:
+            if has_self_assign:
+                continue
+            # Skip dispatch-table classes: no self.x= but uses self.method() calls
+            has_self_method_call = any(
+                isinstance(n, ast.Call) and
+                isinstance(n.func, ast.Attribute) and
+                isinstance(n.func.value, ast.Name) and n.func.value.id == 'self'
+                for n in ast.walk(node)
+            )
+            if has_self_method_call:
+                continue
+            # Large classes (10+ methods) may use class as namespace intentionally
+            method_count = sum(1 for n in node.body if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)))
+            if method_count >= 10:
+                print(f'{path}:{node.lineno}: {node.name} (no instance state, {method_count} methods — large class, verify namespace use before converting)')
+            else:
                 print(f'{path}:{node.lineno}: {node.name} (no instance state)')
 "
 
