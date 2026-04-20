@@ -211,12 +211,14 @@ class ChangeDetector:
         """
         return True  # <-- validation never actually runs
 
-# GOOD: Either implement it or remove the interface
+# GOOD (preferred): Finish the feature — check if dependencies now exist
 class ChangeDetector:
     def _is_component_modified(self, component: Component, baseline: Snapshot) -> bool:
         current_hash = component.content_hash()
         baseline_hash = baseline.get_hash(component.id)
         return current_hash != baseline_hash
+
+# GOOD (alternative): Remove if the feature is clearly abandoned
 ```
 
 ```typescript
@@ -231,10 +233,14 @@ class PermissionChecker {
   }
 }
 
-// GOOD: Implement or simplify
-function canAccess(user: User, resource: Resource): boolean {
-  return user.roles.some(role => resource.allowedRoles.includes(role));
+// GOOD (preferred): Finish the feature
+function canAccess(user: User, resource: Resource, operation: Operation): boolean {
+  return user.roles.some(role =>
+    resource.allowedRoles.includes(role) && role.permits(operation)
+  );
 }
+
+// GOOD (alternative): Remove if clearly abandoned
 ```
 
 **Detection scripts:**

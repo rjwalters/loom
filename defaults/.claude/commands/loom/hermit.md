@@ -108,6 +108,8 @@ Methods whose body is trivially a single `return <literal>` but whose docstring/
 
 Current hermit finds `TODO`/`FIXME` comments but treats them as reminders rather than recognizing that the hardcoded return makes the surrounding code inert.
 
+**Default recommendation**: When creating proposals for stub theater findings, prefer "finish the feature" over "remove the code." Stubs often indicate an unfinished feature whose dependencies may now exist. Check whether the data/APIs the stub was waiting for have since been implemented. Only propose removal when the feature is clearly abandoned or the surrounding code has no users.
+
 ```bash
 # Find Python methods whose body is ONLY a return literal
 rg "def \w+\(self" -A 5 --type py | \\
