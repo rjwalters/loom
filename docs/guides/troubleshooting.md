@@ -37,7 +37,7 @@ This guide helps you diagnose and fix common issues in Loom.
    cd /path/to/target-repo
    git worktree list  # Find orphaned worktrees
    git worktree remove .loom/worktrees/issue-XXX --force
-   git branch -D feature/loom-installation-X
+   git branch -D feature/loom-install-vX.Y.Z
    gh issue close XXX --comment "Retrying installation"
 
    # Retry installation

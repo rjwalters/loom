@@ -13,7 +13,7 @@
 #
 #   What this script does:
 #     1. Validates target repository (must be a Git repo)
-#     2. Creates installation worktree (.loom/worktrees/loom-installation)
+#     2. Creates installation worktree (.loom/worktrees/loom-install-vX.Y.Z)
 #     3. Initializes Loom configuration (copies defaults to .loom/)
 #     4. Syncs workflow labels (GitHub or Gitea)
 #     5. Configures branch rulesets (interactive mode only)
@@ -530,7 +530,7 @@ if [[ "$FORCE_OVERWRITE" != "true" ]] && [[ "$CLEAN_FIRST" != "true" ]]; then
   REPO_NWOPATH=$(echo "$_ORIGIN_URL" | sed -E 's/\.git$//; s#^.*[:/]([^/]+/[^/]+)$#\1#' || true)
   if [[ -n "$REPO_NWOPATH" ]] && [[ "$REPO_NWOPATH" =~ ^[^/]+/[^/]+$ ]]; then
     EXISTING_INSTALL_PR=$(gh pr list -R "$REPO_NWOPATH" --state open --search "Install Loom" --json url,headRefName --jq '
-      [.[] | select(.headRefName | startswith("feature/loom-installation"))][0].url' 2>/dev/null || true)
+      [.[] | select(.headRefName | startswith("feature/loom-install-"))][0].url' 2>/dev/null || true)
 
     if [[ -n "$EXISTING_INSTALL_PR" ]]; then
       warning "An open Loom installation PR already exists:"
