@@ -449,22 +449,40 @@ for root, dirs, files in os.walk('.'):
                 for n in ast.walk(node)
             )
             if has_self_assign:
-                continue
-            # Skip dispatch-table classes: no self.x= but uses self.method() calls
+                continue  # Has instance state -- not a stateless ceremony
+            # Exclusion 1: Internal method dispatch (self.method() calls)
             has_self_method_call = any(
                 isinstance(n, ast.Call) and
-                isinstance(n.func, ast.Attribute) and
-                isinstance(n.func.value, ast.Name) and n.func.value.id == 'self'
+                isinstance(getattr(n, 'func', None), ast.Attribute) and
+                isinstance(getattr(n.func, 'value', None), ast.Name) and
+                n.func.value.id == 'self'
                 for n in ast.walk(node)
             )
             if has_self_method_call:
-                continue
-            # Large classes (10+ methods) may use class as namespace intentionally
-            method_count = sum(1 for n in node.body if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)))
+                continue  # Uses internal dispatch -- likely a namespace
+            # Exclusion 2: Method count threshold (10+ methods = namespace)
+            method_count = sum(
+                1 for n in ast.walk(node)
+                if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
+            )
             if method_count >= 10:
-                print(f'{path}:{node.lineno}: {node.name} (no instance state, {method_count} methods — large class, verify namespace use before converting)')
-            else:
-                print(f'{path}:{node.lineno}: {node.name} (no instance state)')
+                continue  # Too many methods to practically convert
+            # Exclusion 3: Dispatch-table pattern (self.method refs inside dict/list/set)
+            has_dispatch_table = False
+            for n in ast.walk(node):
+                if not isinstance(n, (ast.Dict, ast.List, ast.Set)):
+                    continue
+                for val in ast.walk(n):
+                    if (isinstance(val, ast.Attribute) and
+                        isinstance(getattr(val, 'value', None), ast.Name) and
+                        val.value.id == 'self'):
+                        has_dispatch_table = True
+                        break
+                if has_dispatch_table:
+                    break
+            if has_dispatch_table:
+                continue  # Builds dispatch table from self.method references
+            print(f'{path}:{node.lineno}: {node.name} (no instance state)')
 "
 
 # TypeScript: classes with no 'this.' property assignments
