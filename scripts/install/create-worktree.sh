@@ -29,8 +29,8 @@ cd "$TARGET_PATH"
 # Ensure .loom/worktrees directory exists
 mkdir -p .loom/worktrees
 
-WORKTREE_PATH=".loom/worktrees/loom-installation"
-BASE_BRANCH_NAME="feature/loom-installation"
+WORKTREE_PATH=".loom/worktrees/loom-install-v${LOOM_VERSION}"
+BASE_BRANCH_NAME="feature/loom-install-v${LOOM_VERSION}"
 
 info "Creating worktree for Loom installation..."
 
