@@ -1,0 +1,7 @@
+{
+  "loom_version": "0.6.2",
+  "loom_commit": "a6e4f0b",
+  "install_date": "2026-04-21",
+  "loom_source": "/Users/rwalters/GitHub/loom",
+  "installed_files": [".claude/README.md",".claude/settings.json",".codex/config.toml",".githooks/pre-commit",".github/CONFIGURATION.md",".github/dependabot.yml",".github/ISSUE_TEMPLATE/auditor-capability-request.yml",".github/ISSUE_TEMPLATE/config.yml",".github/ISSUE_TEMPLATE/task.yml",".github/labels.yml",".github/workflows/ci.yml",".github/workflows/e2e.yml",".github/workflows/gitea-integration.yml",".github/workflows/loc.yml",".github/workflows/release.yml",".github/workflows/security.yml",".github/workflows/shell-lint.yml",".gitignore",".loom/config.json",".loom/config/skill-routes.json",".loom/docs/daemon-reference.md",".loom/docs/forge-authentication.md",".loom/docs/github-authentication.md",".loom/docs/tool-use-concurrency-errors.md",".loom/docs/troubleshooting.md",".loom/hooks/guard-destructive.sh",".loom/hooks/guard-worktree-paths.sh",".loom/hooks/methodology-inject.sh",".loom/hooks/post-worktree.sh",".loom/hooks/skill-router.sh",".loom/README.md","CLAUDE.md"]
+}

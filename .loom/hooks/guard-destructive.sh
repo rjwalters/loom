@@ -4,6 +4,16 @@
 # Claude Code PreToolUse hook that intercepts Bash commands before execution.
 # Receives JSON on stdin with tool_input.command and cwd fields.
 #
+# IMPORTANT: This hook only fires when Claude Code is invoked with:
+#   --dangerously-skip-permissions  ← hooks FIRE (used by Loom agents)
+#
+# It does NOT fire with:
+#   --permission-mode bypassPermissions  ← hooks SKIPPED entirely
+#
+# If you have a shell alias like 'alias claude="claude --permission-mode bypassPermissions"',
+# this safety hook will be silently disabled in interactive sessions.
+# Use --dangerously-skip-permissions instead for automation that needs hooks.
+#
 # Decisions:
 #   - Block (deny): Dangerous commands that should never run
 #   - Ask: Commands that need human confirmation
@@ -17,11 +27,9 @@
 # diagnostics, and results in an "allow" decision to prevent infinite retry
 # loops in Claude Code.
 
-# Determine main repo root via git-common-dir (works from worktrees and subdirectories)
-# Falls back to script location if git is unavailable
-MAIN_ROOT="$(cd "$(git rev-parse --git-common-dir 2>/dev/null)/.." 2>/dev/null && pwd)" || \
-MAIN_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." 2>/dev/null && pwd 2>/dev/null || echo ".")"
-HOOK_ERROR_LOG="${MAIN_ROOT}/.loom/logs/hook-errors.log"
+# Determine log directory relative to this script's location
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd 2>/dev/null || echo ".")"
+HOOK_ERROR_LOG="${SCRIPT_DIR}/../logs/hook-errors.log"
 
 # Log a diagnostic error message (best-effort, never fails the script)
 log_hook_error() {
@@ -53,19 +61,10 @@ if [[ -z "$COMMAND" ]]; then
     exit 0
 fi
 
-# Resolve repo root from cwd using git-common-dir (works correctly in worktrees).
-# show-toplevel returns the worktree root, but git-common-dir always points to
-# the main repo's .git dir, so its parent is the true repository root.
+# Resolve repo root from cwd (handles worktree paths safely)
 REPO_ROOT=""
 if [[ -n "$CWD" ]] && [[ -d "$CWD" ]]; then
-    COMMON_GIT_DIR=$(git -C "$CWD" rev-parse --git-common-dir 2>/dev/null || true)
-    if [[ -n "$COMMON_GIT_DIR" ]]; then
-        if [[ "$COMMON_GIT_DIR" = /* ]]; then
-            REPO_ROOT=$(cd "$COMMON_GIT_DIR/.." 2>/dev/null && pwd || true)
-        else
-            REPO_ROOT=$(cd "$CWD/$COMMON_GIT_DIR/.." 2>/dev/null && pwd || true)
-        fi
-    fi
+    REPO_ROOT=$(git -C "$CWD" rev-parse --show-toplevel 2>/dev/null || true)
 elif [[ -n "$CWD" ]]; then
     # CWD doesn't exist (e.g., deleted worktree) — log but continue without repo root
     log_hook_error "cwd does not exist: $CWD — skipping repo root resolution"
@@ -329,34 +328,6 @@ if [[ -n "$WORKTREE_PATH" ]]; then
     if echo "$COMMAND" | grep -qE '(pip|pip3|uv pip)\s+install\s+.*-e\s' || \
        echo "$COMMAND" | grep -qE '(pip|pip3|uv pip)\s+install\s+.*--editable\s'; then
         deny "BLOCKED: 'pip install -e' is not allowed inside worktrees. Editable installs overwrite the global .pth file, breaking parallel builders (see issue #2495). PYTHONPATH is already configured for this worktree — imports resolve correctly without editable installs."
-    fi
-fi
-
-# =============================================================================
-# LOOM: Block cd to main repo paths from worktrees (prevents worktree escapes)
-#
-# When a builder CDs to the main repo (outside their worktree), subsequent
-# file operations land in the main repo, causing "worktree escape" failures
-# (e.g., WORK_LOG.md dirtied on main). The Edit/Write hook can't catch this
-# because the modification happens via Bash, not via Edit/Write tools.
-# See issue #2893.
-# =============================================================================
-
-WORKTREE_PATH="${LOOM_WORKTREE_PATH:-}"
-if [[ -n "$WORKTREE_PATH" ]] && [[ -n "$REPO_ROOT" ]]; then
-    # Extract first absolute cd target (handles: "cd /x", "cmd && cd /x", etc.)
-    CD_ABS=$(echo "$COMMAND" | \
-        grep -oE '(^|[[:space:];|&]+)cd[[:space:]]+/[^[:space:];&|"'"'"']+' | \
-        head -1 | sed 's/.*cd[[:space:]]*//')
-    if [[ -n "$CD_ABS" ]]; then
-        CD_NORM="${CD_ABS%/}"
-        REPO_NORM="${REPO_ROOT%/}"
-        WT_NORM="${WORKTREE_PATH%/}"
-        # Block if under main repo but outside worktree
-        if [[ "$CD_NORM" = "$REPO_NORM" ]] || \
-           ([[ "$CD_NORM/" = "$REPO_NORM/"* ]] && [[ "$CD_NORM/" != "$WT_NORM/"* ]]); then
-            deny "BLOCKED: Do not 'cd' to main repo paths ('$CD_ABS') from a worktree. All 'gh', 'git', and '.loom/scripts/' commands work from within your worktree ('$WORKTREE_PATH'). There is no need to navigate to the main repository."
-        fi
     fi
 fi
 
