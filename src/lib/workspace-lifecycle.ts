@@ -70,7 +70,7 @@ async function expandAndValidatePath(
 /**
  * Ensure repository scaffolding is set up
  *
- * Creates CLAUDE.md, .claude/, .codex/ if needed
+ * Creates CLAUDE.md, .claude/ if needed
  *
  * @param workspacePath - Path to workspace
  */

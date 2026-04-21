@@ -8,7 +8,6 @@ This directory contains default configuration files and templates for Loom works
 - `roles/` - System prompt templates for different terminal roles
 - `CLAUDE.md` - AI development context template (copied to workspace root)
 - `.claude/` - Claude Code configuration template (copied to workspace root)
-- `.codex/` - Codex configuration template (copied to workspace root)
 - `.github/` - GitHub labels and issue templates (copied to workspace root)
   - `ISSUE_TEMPLATE/task.yml` - Development task template
   - `ISSUE_TEMPLATE/config.yml` - Issue template configuration
@@ -77,7 +76,6 @@ loom-daemon init --defaults /path/to/my-org-loom-defaults /path/to/project
 During workspace initialization, Loom automatically copies scaffolding files to the workspace root **if they don't already exist**:
 - `CLAUDE.md` → `<workspace>/CLAUDE.md`
 - `.claude/` → `<workspace>/.claude/`
-- `.codex/` → `<workspace>/.codex/`
 - `.github/` → `<workspace>/.github/`
   - `ISSUE_TEMPLATE/task.yml` - Development task template
   - `ISSUE_TEMPLATE/config.yml` - Template configuration

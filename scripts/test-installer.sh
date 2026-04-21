@@ -121,11 +121,6 @@ simulate_loom_install() {
     cp -r "$DEFAULTS_DIR/.claude" "$target/.claude"
   fi
 
-  # Copy .codex directory
-  if [[ -d "$DEFAULTS_DIR/.codex" ]]; then
-    cp -r "$DEFAULTS_DIR/.codex" "$target/.codex"
-  fi
-
   # Copy .github directory (labels.yml)
   if [[ -d "$DEFAULTS_DIR/.github" ]]; then
     mkdir -p "$target/.github"

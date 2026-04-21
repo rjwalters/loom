@@ -458,7 +458,7 @@ export async function launchAmpAgent(terminalId: string): Promise<void> {
  * - Loads role file and writes to CODEX.md (system prompt)
  * - Uses --full-auto for autonomous execution
  * - Workspace-write sandbox with on-failure approval
- * - Permissions configured in .codex/config.toml
+ * - Permissions configured via Codex defaults
  *
  * NOTE: Worktrees are now created on-demand when claiming issues, not automatically.
  * Agents start in the main workspace and create worktrees using `pnpm worktree <issue>`.
@@ -510,7 +510,7 @@ export async function launchCodexAgent(
   // Note: We send the prompt directly in the command instead of via a file
   // This prevents conflicts with files in the main workspace
   // --full-auto: Combines -a on-failure and --sandbox workspace-write
-  // Additional config from .codex/config.toml (sandbox_permissions, etc.)
+  // Codex runs in full-auto mode with workspace-write sandbox
   // Using single quotes around the heredoc to prevent shell expansion
   const command = `codex --full-auto "$(cat <<'ROLE_EOF'\n${processedPrompt}\nROLE_EOF\n)"`;
   logger.info("Sending Codex command to terminal", {

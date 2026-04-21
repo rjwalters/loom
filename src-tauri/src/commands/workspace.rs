@@ -57,7 +57,7 @@ pub fn copy_loom_config(defaults_path: &Path, loom_path: &Path) -> Result<(), St
     Ok(())
 }
 
-/// Helper function to setup repository scaffolding (CLAUDE.md, .claude/, .codex/)
+/// Helper function to setup repository scaffolding (CLAUDE.md, .claude/)
 ///
 /// Copies workspace-root files from defaults/.loom/ (templates for target repos).
 /// Note: defaults/CLAUDE.md is for the Loom repo itself (dogfooding).
@@ -83,16 +83,6 @@ pub fn setup_repository_scaffolding(
         if claude_dir_src.exists() {
             copy_dir_recursive(&claude_dir_src, &claude_dir_dst)
                 .map_err(|e| format!("Failed to copy .claude directory: {e}"))?;
-        }
-    }
-
-    // Copy .codex/ directory if it doesn't exist
-    let codex_dir_dst = workspace_path.join(".codex");
-    if !codex_dir_dst.exists() {
-        let codex_dir_src = defaults_path.join(".codex");
-        if codex_dir_src.exists() {
-            copy_dir_recursive(&codex_dir_src, &codex_dir_dst)
-                .map_err(|e| format!("Failed to copy .codex directory: {e}"))?;
         }
     }
 
@@ -338,7 +328,7 @@ pub fn initialize_loom_workspace(path: &str, defaults_path: &str) -> Result<(), 
             .map_err(|e| format!("Failed to create .gitignore: {e}"))?;
     }
 
-    // Setup repository scaffolding (CLAUDE.md, .claude/, .codex/)
+    // Setup repository scaffolding (CLAUDE.md, .claude/)
     setup_repository_scaffolding(workspace_path, &defaults)?;
 
     Ok(())
@@ -473,7 +463,7 @@ pub fn reset_workspace_to_defaults(
             .map_err(|e| format!("Failed to create .gitignore: {e}"))?;
     }
 
-    // Setup repository scaffolding (CLAUDE.md, .claude/, .codex/)
+    // Setup repository scaffolding (CLAUDE.md, .claude/)
     setup_repository_scaffolding(workspace, &defaults)?;
 
     Ok(())

@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.3] - 2026-04-21
+
+### Summary
+
+Hermit role improvements to reduce false positives in stateless ceremony detection, dead code removal, and installation infrastructure cleanup.
+
+### Changed
+
+- Hermit stub theater now defaults to "finish the feature" over removal
+
+### Fixed
+
+- Exclude dispatch-table classes from stateless ceremony heuristic (#3199, #3200)
+- Skip classes with 10+ methods in stateless ceremony check (#3200)
+
+### Removed
+
+- Duplicate `health_check.py` module — parallel drift of `daemon_diagnostic.py`, -1034 LOC (#3202)
+- Stale `.codex/` configuration directory and all installer references
+- Broken Lines of Code badge (ghloc branch was pruned; workflow will regenerate it)
+
 ## [0.5.0] - 2026-04-19
 
 ### Summary
