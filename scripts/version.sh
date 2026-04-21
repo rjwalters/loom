@@ -120,9 +120,12 @@ set_version() {
     echo "  Updated $file"
   done
 
-  # Cargo.toml files - sed the version line (first occurrence only)
+  # Cargo.toml files - sed the version line in [package] section
+  # Uses awk instead of sed to reliably replace only the first 'version =' line
+  # (BSD sed on macOS doesn't support GNU sed's 0,/pattern/ address)
   for file in src-tauri/Cargo.toml loom-daemon/Cargo.toml loom-api/Cargo.toml; do
-    sed -i '' "0,/^version = \".*\"/s//version = \"$new_version\"/" "$REPO_ROOT/$file"
+    awk -v ver="$new_version" '!done && /^version = "/ { print "version = \"" ver "\""; done=1; next } 1' \
+      "$REPO_ROOT/$file" > "$REPO_ROOT/$file.tmp" && mv "$REPO_ROOT/$file.tmp" "$REPO_ROOT/$file"
     echo "  Updated $file"
   done
 
