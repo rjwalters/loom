@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.4] - 2026-04-22
+
+### Summary
+
+Bug fix for broken `loom-forge` fallback in duplicate detection, plus documentation updates mandating `merge-pr.sh` for all PR merges.
+
+### Fixed
+
+- `check-duplicate.sh` now validates `loom-forge` works before using it, falling back to `gh` when the editable install is broken (#3206)
+
+### Changed
+
+- Documentation (CLAUDE.md, champion.md, builder.md) now mandates `.loom/scripts/merge-pr.sh` instead of `gh pr merge` (#3207)
+
 ## [0.6.3] - 2026-04-21
 
 ### Summary
