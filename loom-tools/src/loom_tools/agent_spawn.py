@@ -621,8 +621,13 @@ def spawn_agent(
     _tmux("set-environment", "-t", session_name, "LOOM_TERMINAL_ID", name)
     _tmux("set-environment", "-t", session_name, "LOOM_WORKSPACE", str(working_dir))
     _tmux("set-environment", "-t", session_name, "LOOM_ROLE", role)
-    # Unset CLAUDECODE to prevent nested session guard from blocking subprocess
-    _tmux("set-environment", "-t", session_name, "-u", "CLAUDECODE")
+    # Clear CLAUDECODE to prevent nested session guard from blocking subprocess.
+    # Use explicit empty set instead of -u (unset): tmux's -u removes the
+    # session-level override, causing the session to INHERIT the variable from
+    # the tmux server environment.  If the server was started from a Claude Code
+    # session (which sets CLAUDECODE), -u allows it to leak through.  Setting to
+    # empty string explicitly overrides the server-level value.  See issue #3208.
+    _tmux("set-environment", "-t", session_name, "CLAUDECODE", "")
 
     # Propagate shepherd task ID so claude-wrapper.sh can skip auth pre-flight
     # check for shepherd subprocess sessions (see issue #2524).

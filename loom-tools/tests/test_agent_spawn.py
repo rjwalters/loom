@@ -410,13 +410,18 @@ class TestRunValidation:
 
 
 class TestClaudeCodeEnvUnset:
-    """Test that CLAUDECODE env var is unset in tmux sessions (issue #2240)."""
+    """Test that CLAUDECODE env var is cleared in tmux sessions (issue #2240, #3208)."""
 
     @patch("loom_tools.agent_spawn._tmux")
-    def test_spawn_agent_unsets_claudecode(
+    def test_spawn_agent_clears_claudecode(
         self, mock_tmux: MagicMock, mock_repo: pathlib.Path
     ) -> None:
-        """spawn_agent must call set-environment -u CLAUDECODE on the tmux session."""
+        """spawn_agent must set CLAUDECODE to empty string on the tmux session.
+
+        Using set-environment with an explicit empty value (not -u) prevents
+        the session from inheriting CLAUDECODE from the tmux server
+        environment.  See issue #3208.
+        """
         from loom_tools.agent_spawn import spawn_agent
 
         # Create required role file and wrapper script
@@ -437,19 +442,23 @@ class TestClaudeCodeEnvUnset:
             repo_root=mock_repo,
         )
 
-        # Find the set-environment -u CLAUDECODE call
+        # Find the set-environment CLAUDECODE "" call (explicit empty, not -u)
         tmux_calls = [c.args for c in mock_tmux.call_args_list]
-        unset_calls = [
+        clear_calls = [
             c
             for c in tmux_calls
             if len(c) >= 4
             and c[0] == "set-environment"
-            and "-u" in c
             and "CLAUDECODE" in c
+            and "-u" not in c
         ]
-        assert len(unset_calls) == 1, (
-            f"Expected exactly one 'set-environment -u CLAUDECODE' call, "
-            f"got {len(unset_calls)}. All tmux calls: {tmux_calls}"
+        assert len(clear_calls) == 1, (
+            f"Expected exactly one 'set-environment -t ... CLAUDECODE \"\"' call, "
+            f"got {len(clear_calls)}. All tmux calls: {tmux_calls}"
+        )
+        # Verify the value is empty string (not some other value)
+        assert clear_calls[0][-1] == "", (
+            f"CLAUDECODE should be set to empty string, got: {clear_calls[0][-1]}"
         )
 
 
