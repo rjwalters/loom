@@ -176,6 +176,16 @@ gh pr create --label "loom:review-requested"
 - Never run `git worktree` directly (helper prevents nested worktrees)
 - Worktrees auto-removed when PRs merged
 
+### Merging PRs
+
+**Never use `gh pr merge`** -- always use `./.loom/scripts/merge-pr.sh <PR_NUMBER>` instead. The `gh pr merge` command attempts a local checkout which fails when the PR branch is linked to a worktree. The merge script merges via the forge API directly and handles worktree cleanup automatically.
+
+```bash
+./.loom/scripts/merge-pr.sh <PR_NUMBER>         # Standard merge with worktree cleanup
+./.loom/scripts/merge-pr.sh <PR_NUMBER> --auto   # Auto-confirm (for automation)
+./.loom/scripts/merge-pr.sh <PR_NUMBER> --dry-run # Preview without merging
+```
+
 ## Development Workflow
 
 ### Shepherd Lifecycle (MANDATORY)
