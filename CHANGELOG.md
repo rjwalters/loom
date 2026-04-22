@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.5] - 2026-04-22
+
+### Summary
+
+Fix for shell shepherd builders hitting thinking stalls when tmux server inherits CLAUDECODE from a parent Claude Code session.
+
+### Fixed
+
+- Prevent CLAUDECODE environment variable leaking through tmux server inheritance by using explicit empty set instead of `-u` (unset) in `agent_spawn.py` and `spawn-shell-shepherd.sh` (#3208)
+- Add diagnostic logging in `claude-wrapper.sh` for skip-permissions mode and CLAUDECODE presence (#3208)
+
 ## [0.6.4] - 2026-04-22
 
 ### Summary
