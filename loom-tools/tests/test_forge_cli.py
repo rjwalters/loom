@@ -438,6 +438,12 @@ class TestMainHelp:
         rc = main(["--help"])
         assert rc == 0
 
+    def test_version_flag(self, capsys: pytest.CaptureFixture[str]) -> None:
+        rc = main(["--version"])
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert out.startswith("loom-forge ")
+
     def test_unknown_entity(self) -> None:
         rc = main(["unknown", "list"])
         assert rc == 1
