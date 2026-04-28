@@ -399,6 +399,12 @@ def main(argv: list[str] | None = None) -> int:
     """Entry point for the ``loom-forge`` CLI."""
     args = list(argv if argv is not None else sys.argv[1:])
 
+    if args and args[0] == "--version":
+        from importlib.metadata import version
+
+        print(f"loom-forge {version('loom-tools')}")
+        return 0
+
     if not args or args[0] in ("-h", "--help"):
         _print_usage()
         return 0 if args and args[0] in ("-h", "--help") else 1
