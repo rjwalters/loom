@@ -137,6 +137,17 @@ export NON_INTERACTIVE
 TARGET_PATH="$(cd "$TARGET_PATH" 2>/dev/null && pwd)" || \
   error "Target path does not exist: $TARGET_PATH"
 
+# Snapshot the pre-install working tree state. The post-install verification
+# (near the end of this script) compares against this snapshot so that the
+# user's pre-existing dirty state is not incorrectly flagged as "unstaged
+# changes after installation". Without this snapshot, the installer would
+# recommend destructive cleanup commands (git restore --staged . && git
+# checkout -- .) that destroy the user's uncommitted work.
+PRE_INSTALL_STATUS=""
+if git -C "$TARGET_PATH" rev-parse --git-dir >/dev/null 2>&1; then
+  PRE_INSTALL_STATUS=$(git -C "$TARGET_PATH" status --porcelain 2>/dev/null || true)
+fi
+
 # Check if target is a git repository - offer to initialize if not
 if ! git -C "$TARGET_PATH" rev-parse --git-dir >/dev/null 2>&1; then
   if [[ "$NON_INTERACTIVE" == "true" ]]; then
@@ -1046,38 +1057,51 @@ success "Pull request created"
 echo ""
 
 # ============================================================================
-# Post-Install Verification: Ensure main working tree is clean
+# Post-Install Verification: Detect changes introduced by the installer
 # ============================================================================
+# We compare the current `git status --porcelain` against the snapshot taken
+# at install start (PRE_INSTALL_STATUS). Only entries that did not exist in
+# the pre-install snapshot are reported as install residue. Pre-existing
+# dirty state in the user's working tree was already acknowledged earlier
+# (validate-target.sh); we must not flag it again here, and we must never
+# recommend destructive cleanup that would discard the user's work.
 CURRENT_STEP="Verify Working Tree"
 header "Verifying main working directory..."
 echo ""
 
 cd "$TARGET_PATH"
-VERIFY_CLEAN=true
 
-# Check for staged changes
-if ! git diff --staged --quiet 2>/dev/null; then
-  VERIFY_CLEAN=false
-  warning "Main working directory has staged changes after installation"
+POST_INSTALL_STATUS=$(git status --porcelain 2>/dev/null || true)
+
+# Compute install-introduced entries: lines present after install but not
+# before. We use line-level set difference via grep -F -v -x against the
+# pre-install snapshot. Empty snapshot is handled by treating all current
+# entries as new (which is correct).
+if [[ -z "$POST_INSTALL_STATUS" ]]; then
+  INSTALL_RESIDUE=""
+elif [[ -z "$PRE_INSTALL_STATUS" ]]; then
+  INSTALL_RESIDUE="$POST_INSTALL_STATUS"
+else
+  INSTALL_RESIDUE=$(printf '%s\n' "$POST_INSTALL_STATUS" \
+    | grep -F -x -v -f <(printf '%s\n' "$PRE_INSTALL_STATUS") \
+    || true)
 fi
 
-# Check for unstaged changes
-if ! git diff --quiet 2>/dev/null; then
-  VERIFY_CLEAN=false
-  warning "Main working directory has unstaged changes after installation"
-fi
-
-if [[ "$VERIFY_CLEAN" == "true" ]]; then
-  success "Main working directory is clean"
+if [[ -z "$INSTALL_RESIDUE" ]]; then
+  success "Main working directory is clean (relative to pre-install state)"
 else
   echo ""
-  warning "Unexpected changes detected in main working directory:"
-  git status --short 2>/dev/null || true
+  warning "Installer left changes in the main working directory:"
+  printf '%s\n' "$INSTALL_RESIDUE"
   echo ""
-  warning "To clean up manually:"
+  warning "These paths appear new since the installer started. Inspect them"
+  warning "before cleaning up — do not blindly discard, as some may overlap"
+  warning "with your own in-progress work."
+  echo ""
+  warning "To inspect:"
   warning "  cd $TARGET_PATH"
-  warning "  git restore --staged ."
-  warning "  git checkout -- ."
+  warning "  git status"
+  warning "  git diff <path>"
 fi
 
 echo ""

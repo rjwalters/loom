@@ -799,6 +799,85 @@ echo ""
 
 
 # ==========================================================================
+# Section 35-38: Post-install verification snapshot diff (issue #3219)
+# ==========================================================================
+# These tests exercise the snapshot-comparison math used by install-loom.sh
+# to distinguish installer-introduced residue from the user's pre-existing
+# dirty working tree. The math is short enough to mirror inline; if it
+# drifts from install-loom.sh, both must be updated.
+
+# Helper: replicate the symmetric-difference logic from install-loom.sh
+diff_snapshot() {
+  local pre="$1"
+  local post="$2"
+  if [[ -z "$post" ]]; then
+    return 0
+  fi
+  if [[ -z "$pre" ]]; then
+    printf '%s' "$post"
+    return 0
+  fi
+  printf '%s\n' "$post" | grep -F -x -v -f <(printf '%s\n' "$pre") || true
+}
+
+echo "--- Section: Post-install verification snapshot diff (#3219) ---"
+echo ""
+
+# Test 35: empty pre, empty post -> empty diff (clean repo, clean after)
+echo "Test 35: Empty snapshot, empty post-state yields empty diff"
+RESULT=$(diff_snapshot "" "")
+if [[ -z "$RESULT" ]]; then
+  pass "Clean -> clean produces no residue"
+else
+  fail "Clean -> clean unexpectedly produced: $RESULT"
+fi
+echo ""
+
+# Test 36: pre-existing dirty state with no install changes -> empty diff
+echo "Test 36: Pre-existing dirty entries are filtered out of residue"
+PRE=' M README.md
+?? local-notes.txt'
+POST=' M README.md
+?? local-notes.txt'
+RESULT=$(diff_snapshot "$PRE" "$POST")
+if [[ -z "$RESULT" ]]; then
+  pass "User's pre-existing dirty state does not register as residue"
+else
+  fail "Pre-existing entries leaked into residue: $RESULT"
+fi
+echo ""
+
+# Test 37: genuine new install residue is detected
+echo "Test 37: New install-introduced entries surface in residue"
+PRE=' M README.md'
+POST=' M README.md
+ M .loom/config.json
+?? .loom/loom-source-path'
+RESULT=$(diff_snapshot "$PRE" "$POST")
+EXPECTED=' M .loom/config.json
+?? .loom/loom-source-path'
+if [[ "$RESULT" == "$EXPECTED" ]]; then
+  pass "Install-introduced entries appear in residue"
+else
+  fail "Residue mismatch. Got: [$RESULT] Expected: [$EXPECTED]"
+fi
+echo ""
+
+# Test 38: empty pre with non-empty post returns full post (initial-clean repo
+# that is dirty after install)
+echo "Test 38: Empty pre-snapshot returns full post-state as residue"
+POST=' M .loom/config.json
+?? .loom/loom-source-path'
+RESULT=$(diff_snapshot "" "$POST")
+if [[ "$RESULT" == "$POST" ]]; then
+  pass "Empty snapshot treats all post-entries as new"
+else
+  fail "Empty snapshot mishandled. Got: [$RESULT]"
+fi
+echo ""
+
+
+# ==========================================================================
 # Summary
 # ==========================================================================
 echo "======================================"
