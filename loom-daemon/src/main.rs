@@ -412,16 +412,22 @@ fn handle_cli_command(command: Commands) -> Result<()> {
                         }
                         if !report.verification_failures.is_empty() {
                             eprintln!(
-                                "\nVerification failures ({}):",
+                                "\nUnexpected file divergence ({}):",
                                 report.verification_failures.len()
                             );
                             for failure in &report.verification_failures {
                                 eprintln!("  {failure}");
                             }
-                            eprintln!("\n  Some scripts may not have been updated correctly.");
                             eprintln!(
-                                "  Try running install again with --force, or copy manually from defaults/."
+                                "\n  These files were copied from defaults but their installed"
                             );
+                            eprintln!(
+                                "  contents differ from the source. This is informational only —"
+                            );
+                            eprintln!(
+                                "  installation completed. Inspect the listed files to confirm"
+                            );
+                            eprintln!("  they look correct.");
                         }
                     }
 
