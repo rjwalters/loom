@@ -508,8 +508,39 @@ if [[ "$FORCE_OVERWRITE" != "true" ]] && [[ "$CLEAN_FIRST" != "true" ]]; then
   echo ""
 
   # Check 1: Is Loom already installed with the same version?
-  if [[ -f "$TARGET_PATH/CLAUDE.md" ]]; then
+  # Layered version detection — prefer .loom/install-metadata.json (deterministic
+  # JSON written at install time), fall back to .loom/CLAUDE.md (substituted
+  # template), then root CLAUDE.md (legacy). Reject `{{...}}` placeholder leaks
+  # from stale/corrupted installs.
+  INSTALLED_VERSION=""
+
+  # Source 1: .loom/install-metadata.json (preferred — deterministic JSON)
+  if [[ -f "$TARGET_PATH/.loom/install-metadata.json" ]]; then
+    if command -v jq >/dev/null 2>&1; then
+      INSTALLED_VERSION=$(jq -r '.loom_version // empty' "$TARGET_PATH/.loom/install-metadata.json" 2>/dev/null || true)
+    else
+      # Robust grep fallback when jq is unavailable
+      INSTALLED_VERSION=$(grep -o '"loom_version"[[:space:]]*:[[:space:]]*"[^"]*"' "$TARGET_PATH/.loom/install-metadata.json" 2>/dev/null | head -1 | sed 's/.*"loom_version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/' || true)
+    fi
+  fi
+
+  # Source 2: .loom/CLAUDE.md (substituted template)
+  if [[ -z "$INSTALLED_VERSION" ]] && [[ -f "$TARGET_PATH/.loom/CLAUDE.md" ]]; then
+    INSTALLED_VERSION=$(grep 'Loom Version' "$TARGET_PATH/.loom/CLAUDE.md" 2>/dev/null | head -1 | sed 's/.*Loom Version.*: //' | sed 's/\*//g' | tr -d '[:space:]' || true)
+  fi
+
+  # Source 3: root CLAUDE.md (legacy fallback)
+  if [[ -z "$INSTALLED_VERSION" ]] && [[ -f "$TARGET_PATH/CLAUDE.md" ]]; then
     INSTALLED_VERSION=$(grep 'Loom Version' "$TARGET_PATH/CLAUDE.md" 2>/dev/null | head -1 | sed 's/.*Loom Version.*: //' | sed 's/\*//g' | tr -d '[:space:]' || true)
+  fi
+
+  # Reject placeholder leaks (e.g. literal `{{LOOM_VERSION}}` from corrupted/stale
+  # template that was never substituted).
+  if [[ "$INSTALLED_VERSION" =~ ^\{\{.*\}\}$ ]]; then
+    INSTALLED_VERSION="unknown (stale template — re-run with --force to fix)"
+  fi
+
+  if [[ -n "$INSTALLED_VERSION" ]]; then
     if [[ "$INSTALLED_VERSION" == "$LOOM_VERSION" ]]; then
       info "Loom v${LOOM_VERSION} is already installed in this repository."
       info "Use --force to reinstall or --clean for a fresh install."
@@ -518,7 +549,7 @@ if [[ "$FORCE_OVERWRITE" != "true" ]] && [[ "$CLEAN_FIRST" != "true" ]]; then
       # Disable error trap and exit successfully
       trap - EXIT SIGINT SIGTERM
       exit 0
-    elif [[ -n "$INSTALLED_VERSION" ]]; then
+    else
       info "Existing Loom installation detected: v${INSTALLED_VERSION}"
       info "Upgrading to: v${LOOM_VERSION}"
     fi
