@@ -6,6 +6,11 @@
 # Usage:
 #   ./scripts/install/setup-branch-protection.sh /path/to/target-repo [branch-name]
 #
+# Environment:
+#   LOOM_NON_INTERACTIVE=true  Skip prompts; on overlap conflict, default to
+#                              "skip" (preserves existing protection, avoids
+#                              creating duplicate rulesets — issue #3216).
+#
 # For GitHub, creates or updates a ruleset with recommended rules:
 #   - Prevent branch deletion and force pushes
 #   - Require linear history (squash merges only)
@@ -32,10 +37,54 @@ error() { echo -e "\033[0;31m✗ $*\033[0m"; }
 source "${SCRIPT_DIR}/forge-detect.sh"
 
 # --- GitHub branch protection (rulesets API) ---
+
+# Enumerate rulesets that target the default branch via cross-name overlap.
+# Sets array OVERLAPPING_RULESETS to "id|name|enforcement" lines for any
+# active/evaluate ruleset whose conditions include ~DEFAULT_BRANCH,
+# refs/heads/<branch>, or refs/heads/*, AND whose name does not match
+# RULESET_NAME (the same-named case is handled by the in-place update path).
+# Disabled rulesets are ignored (they cannot conflict at runtime).
+detect_overlapping_rulesets() {
+  local owner="$1"
+  local repo="$2"
+  local our_name="$3"
+  local branch="$4"
+
+  OVERLAPPING_RULESETS=()
+
+  local rulesets_json
+  rulesets_json=$(gh api "repos/${owner}/${repo}/rulesets" 2>/dev/null || echo "[]")
+
+  while IFS='|' read -r rs_id rs_name rs_enforcement; do
+    [[ -z "$rs_id" ]] && continue
+    # Skip our own same-named ruleset; handled by existing in-place update path
+    if [[ "$rs_name" == "$our_name" ]]; then
+      continue
+    fi
+    # Ignore disabled rulesets (inactive, can't conflict at runtime)
+    if [[ "$rs_enforcement" == "disabled" ]]; then
+      continue
+    fi
+
+    # Fetch detail to inspect ref_name conditions
+    local detail
+    detail=$(gh api "repos/${owner}/${repo}/rulesets/${rs_id}" 2>/dev/null || echo "{}")
+
+    local includes
+    includes=$(echo "$detail" | jq -r '.conditions.ref_name.include // [] | .[]' 2>/dev/null || echo "")
+
+    # Match ~DEFAULT_BRANCH token, refs/heads/<branch>, or wildcard refs/heads/*
+    if echo "$includes" | grep -qE "^(~DEFAULT_BRANCH|refs/heads/${branch}|refs/heads/\*)$"; then
+      OVERLAPPING_RULESETS+=("${rs_id}|${rs_name}|${rs_enforcement}")
+    fi
+  done < <(echo "$rulesets_json" | jq -r '.[] | select(.target == "branch") | "\(.id)|\(.name)|\(.enforcement)"' 2>/dev/null || true)
+}
+
 setup_github_branch_protection() {
   local owner="$FORGE_OWNER"
   local repo="$FORGE_REPO"
   local ruleset_name="$RULESET_NAME"
+  local branch="$BRANCH_NAME"
 
   # Check if user has admin permissions
   local has_admin
@@ -83,7 +132,79 @@ setup_github_branch_protection() {
     ]
   }'
 
-  # Check if a ruleset named "main" already exists
+  # Detect cross-name overlapping rulesets BEFORE the same-name update path,
+  # so we don't silently POST a second ruleset overlapping a differently-named
+  # pre-existing one. See issue #3216 for the bug this fixes.
+  detect_overlapping_rulesets "$owner" "$repo" "$ruleset_name" "$branch"
+
+  if (( ${#OVERLAPPING_RULESETS[@]} > 0 )); then
+    warning "Found ${#OVERLAPPING_RULESETS[@]} existing ruleset(s) targeting the default branch:"
+    local entry rs_id rs_name rs_enforcement
+    for entry in "${OVERLAPPING_RULESETS[@]}"; do
+      IFS='|' read -r rs_id rs_name rs_enforcement <<< "$entry"
+      echo "    - id=${rs_id} name='${rs_name}' enforcement=${rs_enforcement}"
+    done
+    echo ""
+
+    # Determine action: in non-interactive mode, default to Skip (safest).
+    local action="skip"
+    if [[ "${LOOM_NON_INTERACTIVE:-false}" != "true" ]]; then
+      echo "How would you like to handle this?"
+      echo "  [s] Skip    - keep existing ruleset(s), do not add Loom's (default, safest)"
+      echo "  [r] Replace - delete the conflicting ruleset(s), then add Loom's"
+      echo "  [u] Update  - update the first conflicting ruleset in-place with Loom's rules"
+      echo ""
+      local reply
+      read -p "Choose [s/r/u] (default: s): " -n 1 -r reply
+      echo ""
+      case "$reply" in
+        r|R) action="replace" ;;
+        u|U) action="update" ;;
+        *)   action="skip" ;;
+      esac
+    else
+      info "Non-interactive mode: defaulting to 'skip' to avoid creating duplicate rulesets"
+    fi
+
+    case "$action" in
+      skip)
+        info "Skipping ruleset creation; existing protection is preserved."
+        info "To replace later, re-run interactively or delete the existing ruleset first."
+        return 0
+        ;;
+      replace)
+        info "Replacing conflicting ruleset(s)..."
+        for entry in "${OVERLAPPING_RULESETS[@]}"; do
+          IFS='|' read -r rs_id rs_name rs_enforcement <<< "$entry"
+          info "  Deleting ruleset id=${rs_id} name='${rs_name}'"
+          if ! gh api --method DELETE "repos/${owner}/${repo}/rulesets/${rs_id}" > /dev/null 2>&1; then
+            error "Failed to delete ruleset id=${rs_id}; aborting to avoid duplicates."
+            return 1
+          fi
+        done
+        # Fall through to standard create/update path below.
+        ;;
+      update)
+        # Update the first conflicting ruleset in place with Loom's rules.
+        # Preserves the existing ruleset's name/id; PUTs the rules onto it.
+        IFS='|' read -r rs_id rs_name rs_enforcement <<< "${OVERLAPPING_RULESETS[0]}"
+        info "Updating ruleset id=${rs_id} name='${rs_name}' in place with Loom rules..."
+        local update_payload
+        update_payload=$(echo "$ruleset_payload" | jq --arg n "$rs_name" '.name = $n')
+        if echo "$update_payload" | gh api --method PUT "repos/${owner}/${repo}/rulesets/${rs_id}" --input - > /dev/null 2>&1; then
+          success "Branch ruleset updated in place (id=${rs_id} name='${rs_name}')"
+          echo ""
+          info "To modify: GitHub Settings > Rules > Rulesets"
+          return 0
+        else
+          error "Failed to update existing ruleset id=${rs_id}"
+          return 1
+        fi
+        ;;
+    esac
+  fi
+
+  # Check if a ruleset named "main" already exists (same-name in-place update).
   local existing_id
   existing_id=$(gh api "repos/${owner}/${repo}/rulesets" --jq '.[] | select(.name == "'"$ruleset_name"'") | .id' 2>/dev/null || echo "")
 
@@ -165,7 +286,11 @@ setup_gitea_branch_protection() {
     "block_admin_merge_override": false
   }'
 
-  # Check if branch protection already exists
+  # Check if branch protection already exists.
+  # Gitea's API is keyed by branch name (unlike GitHub's rulesets, which are
+  # keyed by id and can have many overlapping rulesets per branch). So this
+  # upsert by branch name fully covers conflict detection — no analogue of
+  # the cross-name overlap bug from issue #3216 exists here.
   local existing_response existing_code
   existing_response=$(gitea_api GET "/repos/${owner}/${repo}/branch_protections/${BRANCH_NAME}")
   existing_code=$(echo "$existing_response" | tail -1)

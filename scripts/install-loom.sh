@@ -938,8 +938,11 @@ step5_branch_rulesets() {
     if [[ $REPLY =~ ^[Yy]$ ]]; then
       info "Applying branch ruleset..."
 
-      # Apply ruleset
-      if "$LOOM_ROOT/scripts/install/setup-branch-protection.sh" "$TARGET_PATH" "$DEFAULT_BRANCH"; then
+      # Apply ruleset (interactive — setup-branch-protection.sh will prompt on
+      # cross-name overlap; LOOM_NON_INTERACTIVE is explicitly unset/false here
+      # so the helper presents the Skip/Replace/Update options when overlap
+      # is detected — see issue #3216).
+      if LOOM_NON_INTERACTIVE=false "$LOOM_ROOT/scripts/install/setup-branch-protection.sh" "$TARGET_PATH" "$DEFAULT_BRANCH"; then
         echo ""
       else
         echo ""
