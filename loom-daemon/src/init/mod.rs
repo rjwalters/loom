@@ -185,6 +185,12 @@ fn copy_single_file(
 }
 
 /// Sync a managed directory: clean stale files on reinstall, then copy fresh from defaults.
+///
+/// After copying, this function performs a fail-fast assertion that every file
+/// (including those in subdirectories) present in `defaults/<dir_name>/` exists
+/// in the destination. This guards against silent omissions like the regression
+/// reported in issue #3220, where `scripts/lib/forge-helpers.sh` was missing
+/// from installs even though `lib/loom-tools.sh` was verified by name.
 fn sync_managed_dir(
     defaults: &Path,
     loom_path: &Path,
@@ -202,8 +208,58 @@ fn sync_managed_dir(
         }
         copy_dir_with_report(&src, &dst, &report_prefix, report)
             .map_err(|e| format!("Failed to copy {dir_name} directory: {e}"))?;
+
+        // Fail-fast: ensure every source file (including subdirectories) reached
+        // the destination. This catches bugs in copy_dir_with_report and
+        // unexpected filesystem failures (permission denied on a subdir, etc.)
+        // before they propagate to a broken install.
+        let missing = find_missing_files(&src, &dst);
+        if !missing.is_empty() {
+            return Err(format!(
+                "Sync of {dir_name} directory completed but {} file(s) are missing from \
+                 destination (likely a copy bug or filesystem error): {}",
+                missing.len(),
+                missing.join(", ")
+            ));
+        }
     }
     Ok(())
+}
+
+/// Recursively find files present in `src` but missing from `dst`.
+///
+/// Returns relative paths (from `src`) for each missing file. Used as a
+/// post-copy assertion to detect partial copies. Subdirectories are walked
+/// recursively so that nested files (e.g., `scripts/lib/*.sh`) are checked.
+fn find_missing_files(src: &Path, dst: &Path) -> Vec<String> {
+    let mut missing = Vec::new();
+    collect_missing_files(src, dst, "", &mut missing);
+    missing
+}
+
+fn collect_missing_files(src: &Path, dst: &Path, prefix: &str, out: &mut Vec<String>) {
+    let Ok(entries) = std::fs::read_dir(src) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        let file_name = entry.file_name();
+        let file_name_str = file_name.to_string_lossy();
+        let rel_path = if prefix.is_empty() {
+            file_name_str.to_string()
+        } else {
+            format!("{prefix}/{file_name_str}")
+        };
+        let src_child = entry.path();
+        let dst_child = dst.join(&file_name);
+        if file_type.is_dir() {
+            collect_missing_files(&src_child, &dst_child, &rel_path, out);
+        } else if !dst_child.exists() {
+            out.push(rel_path);
+        }
+    }
 }
 
 /// Ensure all `.sh` files in a directory (and subdirectories) are executable.
@@ -884,5 +940,67 @@ mod tests {
             "lib/loom-tools.sh should be executable, mode: {:o}",
             perms.mode()
         );
+    }
+
+    #[test]
+    fn test_find_missing_files_empty_when_all_present() {
+        // Regression test for issue #3220: the post-copy assertion in
+        // sync_managed_dir uses find_missing_files to detect partial copies.
+        let temp_dir = TempDir::new().unwrap();
+        let src = temp_dir.path().join("src");
+        let dst = temp_dir.path().join("dst");
+
+        fs::create_dir_all(src.join("lib")).unwrap();
+        fs::create_dir_all(dst.join("lib")).unwrap();
+        fs::write(src.join("a.sh"), "a").unwrap();
+        fs::write(dst.join("a.sh"), "a").unwrap();
+        fs::write(src.join("lib").join("b.sh"), "b").unwrap();
+        fs::write(dst.join("lib").join("b.sh"), "b").unwrap();
+
+        let missing = find_missing_files(&src, &dst);
+        assert!(missing.is_empty(), "Expected no missing files, got: {missing:?}");
+    }
+
+    #[test]
+    fn test_find_missing_files_detects_missing_subdirectory_file() {
+        // Specifically verifies the issue #3220 scenario: a file in a
+        // subdirectory (e.g., scripts/lib/forge-helpers.sh) is missing
+        // from the destination.
+        let temp_dir = TempDir::new().unwrap();
+        let src = temp_dir.path().join("src");
+        let dst = temp_dir.path().join("dst");
+
+        fs::create_dir_all(src.join("lib")).unwrap();
+        fs::create_dir_all(dst.join("lib")).unwrap();
+        fs::write(src.join("a.sh"), "a").unwrap();
+        fs::write(dst.join("a.sh"), "a").unwrap();
+        fs::write(src.join("lib").join("loom-tools.sh"), "tools").unwrap();
+        fs::write(dst.join("lib").join("loom-tools.sh"), "tools").unwrap();
+        // Source has forge-helpers.sh but destination does NOT — this is
+        // the exact failure mode from issue #3220.
+        fs::write(src.join("lib").join("forge-helpers.sh"), "helpers").unwrap();
+
+        let missing = find_missing_files(&src, &dst);
+        assert_eq!(missing.len(), 1, "Expected 1 missing file, got: {missing:?}");
+        assert_eq!(missing[0], "lib/forge-helpers.sh");
+    }
+
+    #[test]
+    fn test_find_missing_files_detects_entire_missing_subdir() {
+        // If a whole subdirectory is missing, every file under it should be reported.
+        let temp_dir = TempDir::new().unwrap();
+        let src = temp_dir.path().join("src");
+        let dst = temp_dir.path().join("dst");
+
+        fs::create_dir_all(src.join("lib")).unwrap();
+        fs::create_dir_all(&dst).unwrap();
+        fs::write(src.join("lib").join("a.sh"), "a").unwrap();
+        fs::write(src.join("lib").join("b.sh"), "b").unwrap();
+
+        let missing = find_missing_files(&src, &dst);
+        assert_eq!(missing.len(), 2, "Expected 2 missing files, got: {missing:?}");
+        let mut sorted = missing;
+        sorted.sort();
+        assert_eq!(sorted, vec!["lib/a.sh".to_string(), "lib/b.sh".to_string()]);
     }
 }
