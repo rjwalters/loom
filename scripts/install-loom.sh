@@ -130,6 +130,16 @@ if [[ -z "$TARGET_PATH" ]]; then
   error "Target repository path required\nUsage: $0 [--yes|-y] /path/to/target-repo"
 fi
 
+# Auto-detect non-interactive mode when stdin is not a TTY (e.g. `curl | bash`,
+# CI pipelines, or any redirected stdin). Without this guard, interactive
+# `read -p` prompts fail under `set -euo pipefail`, which trips the EXIT
+# cleanup trap and rolls back the entire installation. The explicit `--yes`
+# flag is still honored when set on a TTY.
+if [[ "$NON_INTERACTIVE" != "true" ]] && [[ ! -t 0 ]]; then
+  NON_INTERACTIVE=true
+  info "Detected non-interactive stdin (not a TTY) — running in non-interactive mode"
+fi
+
 # Export for sub-scripts
 export NON_INTERACTIVE
 
@@ -901,38 +911,52 @@ echo ""
 # ============================================================================
 # STEP 5: Configure Branch Rulesets
 # ============================================================================
+# Optional post-install hardening — wrap the entire block in a non-fatal
+# subshell. If anything inside fails (interactive read on non-TTY, missing
+# permissions, etc.), the installation continues to PR creation rather than
+# triggering the EXIT cleanup trap and rolling back completed work.
 CURRENT_STEP="Configure Branch Rulesets"
 header "Step 5: Configure Branch Rulesets"
 echo ""
 
-# Detect default branch
-cd "$TARGET_PATH"
-DEFAULT_BRANCH=$(git symbolic-ref refs/remotes/origin/HEAD 2>/dev/null | sed 's@^refs/remotes/origin/@@' || echo "main")
-info "Detected default branch: ${DEFAULT_BRANCH}"
+step5_branch_rulesets() {
+  # Detect default branch
+  cd "$TARGET_PATH"
+  local DEFAULT_BRANCH
+  DEFAULT_BRANCH=$(git symbolic-ref refs/remotes/origin/HEAD 2>/dev/null | sed 's@^refs/remotes/origin/@@' || echo "main")
+  info "Detected default branch: ${DEFAULT_BRANCH}"
 
-# Prompt user
-if [[ "$NON_INTERACTIVE" == "true" ]]; then
-  info "Non-interactive mode: Skipping branch ruleset setup"
-  info "To configure manually, run: $LOOM_ROOT/scripts/install/setup-branch-protection.sh $TARGET_PATH $DEFAULT_BRANCH"
-else
-  echo ""
-  read -p "Configure branch ruleset for '${DEFAULT_BRANCH}' branch? (y/N) " -n 1 -r
-  echo ""
-  if [[ $REPLY =~ ^[Yy]$ ]]; then
-    info "Applying branch ruleset..."
-
-    # Apply ruleset
-    if "$LOOM_ROOT/scripts/install/setup-branch-protection.sh" "$TARGET_PATH" "$DEFAULT_BRANCH"; then
-      echo ""
-    else
-      echo ""
-      warning "Failed to configure branch ruleset (may require admin permissions)"
-      info "You can configure manually via your forge's Settings > Branch Protection"
-    fi
+  # Prompt user
+  if [[ "$NON_INTERACTIVE" == "true" ]]; then
+    info "Non-interactive mode: Skipping branch ruleset setup"
+    info "To configure manually, run: $LOOM_ROOT/scripts/install/setup-branch-protection.sh $TARGET_PATH $DEFAULT_BRANCH"
   else
-    info "Skipping branch ruleset setup"
-    info "To configure later, run: $LOOM_ROOT/scripts/install/setup-branch-protection.sh $TARGET_PATH $DEFAULT_BRANCH"
+    echo ""
+    local REPLY
+    read -p "Configure branch ruleset for '${DEFAULT_BRANCH}' branch? (y/N) " -n 1 -r
+    echo ""
+    if [[ $REPLY =~ ^[Yy]$ ]]; then
+      info "Applying branch ruleset..."
+
+      # Apply ruleset
+      if "$LOOM_ROOT/scripts/install/setup-branch-protection.sh" "$TARGET_PATH" "$DEFAULT_BRANCH"; then
+        echo ""
+      else
+        echo ""
+        warning "Failed to configure branch ruleset (may require admin permissions)"
+        info "You can configure manually via your forge's Settings > Branch Protection"
+      fi
+    else
+      info "Skipping branch ruleset setup"
+      info "To configure later, run: $LOOM_ROOT/scripts/install/setup-branch-protection.sh $TARGET_PATH $DEFAULT_BRANCH"
+    fi
   fi
+}
+
+# Run Step 5 non-fatally — never let an optional hardening step roll back the install.
+if ! step5_branch_rulesets; then
+  warning "Step 5 (branch rulesets) encountered an error — continuing with installation"
+  info "To configure manually after install: $LOOM_ROOT/scripts/install/setup-branch-protection.sh $TARGET_PATH"
 fi
 
 echo ""
@@ -940,38 +964,50 @@ echo ""
 # ============================================================================
 # STEP 5b: Configure Repository Settings
 # ============================================================================
+# Optional post-install configuration — wrapped in a non-fatal helper for the
+# same reason as Step 5: an interactive prompt on non-TTY stdin (or a missing
+# admin permission) must not roll back the entire installation.
 CURRENT_STEP="Configure Repository Settings"
 header "Step 5b: Configure Repository Settings"
 echo ""
 
-if [[ "$NON_INTERACTIVE" == "true" ]]; then
-  # In non-interactive mode, apply repository settings automatically
-  # This is needed for auto-merge to work on the installation PR
-  info "Applying repository settings (required for auto-merge)..."
-  if "$LOOM_ROOT/scripts/install/setup-repository-settings.sh" "$TARGET_PATH"; then
-    echo ""
-  else
-    echo ""
-    warning "Failed to configure repository settings (may require admin permissions)"
-    info "Auto-merge may not be available for the installation PR"
-  fi
-else
-  echo ""
-  read -p "Configure repository merge and auto-merge settings? (y/N) " -n 1 -r
-  echo ""
-  if [[ $REPLY =~ ^[Yy]$ ]]; then
-    info "Applying repository settings..."
+step5b_repository_settings() {
+  if [[ "$NON_INTERACTIVE" == "true" ]]; then
+    # In non-interactive mode, apply repository settings automatically
+    # This is needed for auto-merge to work on the installation PR
+    info "Applying repository settings (required for auto-merge)..."
     if "$LOOM_ROOT/scripts/install/setup-repository-settings.sh" "$TARGET_PATH"; then
       echo ""
     else
       echo ""
       warning "Failed to configure repository settings (may require admin permissions)"
-      info "You can configure manually via GitHub Settings > General"
+      info "Auto-merge may not be available for the installation PR"
     fi
   else
-    info "Skipping repository settings"
-    info "To configure later, run: $LOOM_ROOT/scripts/install/setup-repository-settings.sh $TARGET_PATH"
+    echo ""
+    local REPLY
+    read -p "Configure repository merge and auto-merge settings? (y/N) " -n 1 -r
+    echo ""
+    if [[ $REPLY =~ ^[Yy]$ ]]; then
+      info "Applying repository settings..."
+      if "$LOOM_ROOT/scripts/install/setup-repository-settings.sh" "$TARGET_PATH"; then
+        echo ""
+      else
+        echo ""
+        warning "Failed to configure repository settings (may require admin permissions)"
+        info "You can configure manually via GitHub Settings > General"
+      fi
+    else
+      info "Skipping repository settings"
+      info "To configure later, run: $LOOM_ROOT/scripts/install/setup-repository-settings.sh $TARGET_PATH"
+    fi
   fi
+}
+
+# Run Step 5b non-fatally — see comment on Step 5 above.
+if ! step5b_repository_settings; then
+  warning "Step 5b (repository settings) encountered an error — continuing with installation"
+  info "To configure manually after install: $LOOM_ROOT/scripts/install/setup-repository-settings.sh $TARGET_PATH"
 fi
 
 echo ""
