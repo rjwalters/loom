@@ -27,6 +27,7 @@ mod post_init;
 mod scaffolding;
 mod templates;
 
+use std::collections::HashSet;
 use std::fs;
 use std::path::Path;
 
@@ -154,10 +155,34 @@ pub fn initialize_workspace(
     // Verify all copied files match their sources
     verify_all_copied_files(workspace, &defaults, &loom_path, &mut report);
 
+    // Filter out verification failures for files that were intentionally preserved.
+    // Preserved files (existing user customizations) are expected to differ from the
+    // source defaults — flagging them as failures is misleading and the prior
+    // "rerun with --force" remediation would clobber the user's intentional edits.
+    filter_preserved_from_verification_failures(&mut report);
+
     // Generate installation manifest (.loom/manifest.json)
     generate_manifest(workspace);
 
     Ok(report)
+}
+
+/// Remove `verification_failures` entries whose path appears in `preserved`.
+///
+/// Verification failure entries are formatted as `"{rel_path} ({reason})"`. We
+/// extract the leading path component and drop the entry if it matches a
+/// preserved path. A preserved file is, by definition, expected to differ from
+/// the source default (the user customized it), so it should not surface as a
+/// "verification failure".
+fn filter_preserved_from_verification_failures(report: &mut InitReport) {
+    if report.preserved.is_empty() || report.verification_failures.is_empty() {
+        return;
+    }
+    let preserved: HashSet<&str> = report.preserved.iter().map(String::as_str).collect();
+    report.verification_failures.retain(|f| {
+        let rel_path = f.split(" (").next().unwrap_or(f.as_str());
+        !preserved.contains(rel_path)
+    });
 }
 
 /// Copy a single file from defaults to the loom directory, tracking in report.
@@ -819,6 +844,112 @@ mod tests {
                 .contains(&".loom/scripts/lib/obsolete.sh".to_string()),
             "Report should list obsolete.sh as removed, got: {:?}",
             report.removed
+        );
+    }
+
+    #[test]
+    fn test_filter_preserved_from_verification_failures_removes_preserved() {
+        // Files preserved by merge strategy must not appear as verification failures
+        // (this is the regression case from issue #3218).
+        let mut report = InitReport {
+            preserved: vec![
+                ".claude/settings.json".to_string(),
+                ".github/labels.yml".to_string(),
+            ],
+            verification_failures: vec![
+                ".claude/settings.json (content mismatch: source 100 bytes, installed 200 bytes)"
+                    .to_string(),
+                ".github/labels.yml (content mismatch: source 50 bytes, installed 75 bytes)"
+                    .to_string(),
+                ".loom/scripts/genuine.sh (content mismatch: source 10 bytes, installed 20 bytes)"
+                    .to_string(),
+            ],
+            ..Default::default()
+        };
+
+        filter_preserved_from_verification_failures(&mut report);
+
+        // Only the genuine non-preserved failure should remain
+        assert_eq!(report.verification_failures.len(), 1);
+        assert!(report.verification_failures[0].contains(".loom/scripts/genuine.sh"));
+    }
+
+    #[test]
+    fn test_filter_preserved_from_verification_failures_no_preserved() {
+        // When nothing is preserved, all failures pass through unchanged
+        let mut report = InitReport {
+            preserved: vec![],
+            verification_failures: vec![".loom/scripts/foo.sh (content mismatch)".to_string()],
+            ..Default::default()
+        };
+        filter_preserved_from_verification_failures(&mut report);
+        assert_eq!(report.verification_failures.len(), 1);
+    }
+
+    #[test]
+    fn test_filter_preserved_from_verification_failures_no_failures() {
+        // No-op when there are no failures, even if there are preserved files
+        let mut report = InitReport {
+            preserved: vec![".claude/settings.json".to_string()],
+            verification_failures: vec![],
+            ..Default::default()
+        };
+        filter_preserved_from_verification_failures(&mut report);
+        assert!(report.verification_failures.is_empty());
+    }
+
+    #[test]
+    fn test_preserved_files_excluded_from_verification_failures_end_to_end() {
+        // End-to-end: a customized .github/labels.yml (preserved by merge_dir_with_report
+        // on reinstall) should not appear as a verification failure after init, even
+        // though its bytes differ from the source defaults. This is the regression case
+        // from issue #3218.
+        let temp_dir = TempDir::new().unwrap();
+        let workspace = temp_dir.path();
+        let defaults = temp_dir.path().join("defaults");
+
+        fs::create_dir(workspace.join(".git")).unwrap();
+
+        // Minimal defaults
+        fs::create_dir_all(defaults.join("roles")).unwrap();
+        fs::write(defaults.join("config.json"), "{}").unwrap();
+        fs::write(defaults.join("roles").join("builder.md"), "builder").unwrap();
+
+        // .github scaffolding default with content X
+        fs::create_dir_all(defaults.join(".github")).unwrap();
+        fs::write(defaults.join(".github").join("labels.yml"), "- name: default\n  color: ffffff")
+            .unwrap();
+
+        // Pre-existing customized .github/labels.yml with content Y (different bytes)
+        fs::create_dir_all(workspace.join(".github")).unwrap();
+        fs::write(
+            workspace.join(".github").join("labels.yml"),
+            "- name: customized\n  color: 000000\n  description: user edit",
+        )
+        .unwrap();
+
+        let result =
+            initialize_workspace(workspace.to_str().unwrap(), defaults.to_str().unwrap(), false);
+        assert!(result.is_ok());
+        let report = result.unwrap();
+
+        // The customized file must be reported as preserved
+        assert!(
+            report.preserved.contains(&".github/labels.yml".to_string()),
+            "preserved should contain .github/labels.yml, got: {:?}",
+            report.preserved
+        );
+
+        // And it must NOT appear as a verification failure (the bug we're fixing)
+        let leaked: Vec<&String> = report
+            .verification_failures
+            .iter()
+            .filter(|f| f.contains(".github/labels.yml"))
+            .collect();
+        assert!(
+            leaked.is_empty(),
+            "preserved file leaked into verification_failures: {:?}",
+            report.verification_failures
         );
     }
 
