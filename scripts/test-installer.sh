@@ -349,6 +349,49 @@ else
   fail ".loom/scripts has only $SCRIPT_COUNT scripts (expected >5)"
 fi
 
+# Test 15b: .loom/scripts/lib/ subdirectory and its helpers (regression test for #3220)
+# These files are sourced by ~17 other scripts (merge-pr.sh, agent-spawn.sh, etc.)
+# and must always be present after a successful install.
+echo "Test 15b: Install creates .loom/scripts/lib/ with all required helpers"
+LIB_DIR="$INSTALL_REPO/.loom/scripts/lib"
+LIB_MISSING=0
+if [[ ! -d "$LIB_DIR" ]]; then
+  fail ".loom/scripts/lib/ directory missing (regression of #3220)"
+  LIB_MISSING=1
+else
+  for lib_file in loom-tools.sh forge-helpers.sh pipe-pane-cmd.sh; do
+    if [[ ! -f "$LIB_DIR/$lib_file" ]]; then
+      fail ".loom/scripts/lib/$lib_file missing (regression of #3220)"
+      LIB_MISSING=1
+    fi
+  done
+  if [[ $LIB_MISSING -eq 0 ]]; then
+    pass ".loom/scripts/lib/ contains all required helpers (loom-tools.sh, forge-helpers.sh, pipe-pane-cmd.sh)"
+  fi
+fi
+
+# Test 15c: every file in defaults/scripts/ exists in installed .loom/scripts/
+# This is a structural check that catches future regressions like #3220 where
+# new files added to defaults/scripts/ might not reach the install target.
+echo "Test 15c: All files in defaults/scripts/ are installed under .loom/scripts/"
+SCRIPTS_MISSING_COUNT=0
+SCRIPTS_MISSING_LIST=""
+if [[ -d "$DEFAULTS_DIR/scripts" ]]; then
+  while IFS= read -r -d '' src_file; do
+    rel_path="${src_file#$DEFAULTS_DIR/scripts/}"
+    dst_file="$INSTALL_REPO/.loom/scripts/$rel_path"
+    if [[ ! -f "$dst_file" ]]; then
+      SCRIPTS_MISSING_COUNT=$((SCRIPTS_MISSING_COUNT + 1))
+      SCRIPTS_MISSING_LIST="${SCRIPTS_MISSING_LIST}\n  - $rel_path"
+    fi
+  done < <(find "$DEFAULTS_DIR/scripts" -type f -print0)
+fi
+if [[ $SCRIPTS_MISSING_COUNT -eq 0 ]]; then
+  pass "All defaults/scripts/ files installed (recursive parity check)"
+else
+  fail "$SCRIPTS_MISSING_COUNT script(s) from defaults/scripts/ missing in install:$(printf '%b' "$SCRIPTS_MISSING_LIST")"
+fi
+
 # Test 16: .loom/hooks/guard-destructive.sh
 echo "Test 16: Install creates .loom/hooks/guard-destructive.sh"
 if [[ -f "$INSTALL_REPO/.loom/hooks/guard-destructive.sh" ]]; then

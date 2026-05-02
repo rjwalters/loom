@@ -807,11 +807,17 @@ success "Installation metadata recorded ($(echo "$INSTALLED_FILES_JSON" | grep -
 echo ""
 
 # Verify expected files were created
+# NOTE: lib/ entries are listed explicitly as a defensive belt-and-suspenders check.
+# The recursive verification block below catches any other missing files under
+# defaults/scripts/, but listing lib/ here ensures these specific helpers
+# (sourced by ~17 other scripts) cannot regress silently. See issue #3220.
 EXPECTED_FILES=(
   ".loom/config.json"
   ".loom/roles"
   ".loom/scripts/worktree.sh"
   ".loom/scripts/lib/loom-tools.sh"
+  ".loom/scripts/lib/forge-helpers.sh"
+  ".loom/scripts/lib/pipe-pane-cmd.sh"
   ".loom/hooks/guard-destructive.sh"
   ".loom/hooks/skill-router.sh"
   "CLAUDE.md"
@@ -830,9 +836,15 @@ done
 success "All Loom files installed"
 echo ""
 
-# Verify installed scripts match source defaults
+# Verify installed scripts match source defaults (recursive walk).
+# Missing files are now a HARD ERROR — the previous warning-only behavior
+# allowed regressions like #3220 (lib/forge-helpers.sh missing) to slip through.
+# Content mismatches remain warnings since template substitution and platform
+# differences (line endings, etc.) can cause false positives.
 info "Verifying scripts match source..."
-VERIFY_FAILURES=0
+VERIFY_MISSING=0
+VERIFY_MISMATCHES=0
+MISSING_SCRIPTS=()
 if [[ -d "$LOOM_ROOT/defaults/scripts" ]] && [[ -d ".loom/scripts" ]]; then
   while IFS= read -r -d '' src_file; do
     rel_path="${src_file#$LOOM_ROOT/defaults/scripts/}"
@@ -840,16 +852,23 @@ if [[ -d "$LOOM_ROOT/defaults/scripts" ]] && [[ -d ".loom/scripts" ]]; then
     if [[ -f "$dst_file" ]]; then
       if ! cmp -s "$src_file" "$dst_file"; then
         warning "Script mismatch: .loom/scripts/$rel_path differs from source"
-        VERIFY_FAILURES=$((VERIFY_FAILURES + 1))
+        VERIFY_MISMATCHES=$((VERIFY_MISMATCHES + 1))
       fi
     else
-      warning "Script missing: .loom/scripts/$rel_path not installed"
-      VERIFY_FAILURES=$((VERIFY_FAILURES + 1))
+      MISSING_SCRIPTS+=(".loom/scripts/$rel_path")
+      VERIFY_MISSING=$((VERIFY_MISSING + 1))
     fi
   done < <(find "$LOOM_ROOT/defaults/scripts" -type f -print0)
 fi
-if [[ $VERIFY_FAILURES -gt 0 ]]; then
-  warning "$VERIFY_FAILURES script(s) failed verification — see above"
+if [[ $VERIFY_MISSING -gt 0 ]]; then
+  echo "" >&2
+  for missing in "${MISSING_SCRIPTS[@]}"; do
+    echo "  MISSING: $missing" >&2
+  done
+  error "$VERIFY_MISSING script(s) missing from installation — install incomplete (see #3220)"
+fi
+if [[ $VERIFY_MISMATCHES -gt 0 ]]; then
+  warning "$VERIFY_MISMATCHES script(s) had content mismatches — see above"
 else
   success "All scripts verified (match source defaults)"
 fi
