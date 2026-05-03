@@ -562,7 +562,27 @@ Configure merge settings during installation or manually:
 
 Settings applied: squash merge only (no merge commits/rebase), delete branches on merge, auto-merge enabled.
 
-## Troubleshooting
+### Multi-Account Token Pool
+
+For environments that rotate among multiple Claude OAuth accounts, Loom can bootstrap a per-account token pool at `.loom/tokens/` from numbered triples in `.env`:
+
+```env
+ACCOUNT_EMAIL_1=user1@example.com
+ACCOUNT_KEY_1=sk-ant-oat01-...
+ACCOUNT_TOKEN_FILE_1=user1.token
+```
+
+Run `loom-tokens bootstrap` to materialize the pool:
+
+```bash
+loom-tokens bootstrap            # Idempotent — only writes new/missing tokens.
+loom-tokens bootstrap --dry-run  # Preview without writing.
+loom-tokens bootstrap --force    # Overwrite on-disk tokens that have drifted from .env.
+```
+
+Each account becomes `.loom/tokens/<file>.token` (mode `0600`). An `index.json` manifest is written alongside with sha256 fingerprints (8 chars) for drift detection — **no secret material is stored in the manifest**. Numbering gaps are allowed; partial triples are skipped with a warning.
+
+`.loom/tokens/` is gitignored. The pool is consumed by external rotation logic (e.g. a `claude-wrapper.sh` that picks the least-used token); only the bootstrap step is provided here.
 
 See `.loom/docs/troubleshooting.md` for detailed troubleshooting including:
 - Cleaning up stale worktrees and branches
