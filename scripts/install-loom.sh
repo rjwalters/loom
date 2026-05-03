@@ -113,6 +113,18 @@ cleanup_on_error() {
       git worktree remove "${WORKTREE_PATH}" --force 2>/dev/null || true
       if [[ -n "${BRANCH_NAME:-}" ]]; then
         git branch -D "${BRANCH_NAME}" 2>/dev/null || true
+
+        # Delete the remote branch too if create-pr.sh pushed it before
+        # failing (e.g. fail at the gh-pr-create step left vibesql/kicad-tools
+        # with orphan remote branches in #3244). Restrict to our install branch
+        # prefix so unrelated branches are never touched.
+        if [[ "${BRANCH_NAME}" =~ ^feature/loom-install-v ]]; then
+          if git ls-remote --heads origin "${BRANCH_NAME}" 2>/dev/null | grep -q .; then
+            info "Deleting orphan remote branch: ${BRANCH_NAME}"
+            git push origin --delete "${BRANCH_NAME}" 2>/dev/null || \
+              warning "Could not delete remote branch ${BRANCH_NAME} (manual cleanup may be needed)"
+          fi
+        fi
       fi
     fi
 
