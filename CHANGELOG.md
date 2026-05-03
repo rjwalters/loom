@@ -7,6 +7,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-05-03
+
+### Summary
+
+Multi-account Claude OAuth token rotation: Loom can now spread agent spawns across multiple Pro/Max accounts and recover automatically when a single account hits its weekly limit. Includes a `loom-tokens` CLI for pool management and a hardened `spawn-claude.sh` wrapper. Plus a batch of `install-loom.sh` hardening fixes from real-world install failures.
+
+### Added
+
+- `loom-tokens bootstrap` CLI — materialize numbered `ACCOUNT_EMAIL_N` / `ACCOUNT_KEY_N` / `ACCOUNT_TOKEN_FILE_N` triples from `.env` into per-account `.loom/tokens/<name>.token` files (mode 0600) with `index.json` manifest containing sha256 fingerprints — no secret material in the manifest (#3239)
+- `loom-tokens check` CLI — probe each account via Anthropic Messages API, parse rate-limit headers (suffix-match for rename resilience), write atomic JSON `.ranking` for the spawn-time selector (#3241)
+- `loom-tokens pin` / `unpin` / `unblock` CLI — operator controls for allowlist management and bad-token recovery (#3243)
+- `.loom/scripts/spawn-claude.sh` wrapper with 3-tier token selection (ranking → allowlist → random), `CLAUDE_CODE_OAUTH_TOKEN` injection, `mkdir`-lock guarded bad-token tracking, and exit-code-first error classification (fixes lean-genius bug where exit-0 with rate-limit substring in stdout was misclassified as RECOVERABLE) (#3242)
+- `.loom/scripts/probe-tokens.sh` cron-friendly periodic-probe wrapper
+- `agent_spawn.py` integration: injects selected `CLAUDE_CODE_OAUTH_TOKEN` when `.loom/tokens/` is configured; falls back to existing keychain auth when not (#3240)
+- Auto-unpin guardrail: when all allowlisted accounts hit the consecutive-failure threshold (default 5), `spawn-claude.sh` clears `.allowlist` to prevent pin-induced lockout
+- Empty-pool guard: `spawn-claude.sh` refuses to silently auto-clear `.bad_tokens` (operators must explicitly `unblock` or `unpin`)
+- `loom-forge --version` flag (#3214)
+
+### Fixed
+
+- `install-loom.sh` no longer omits `.loom/scripts/lib/`, which was breaking `merge-pr.sh` and ~30 other scripts (regression of #2392; hardened with three layers of defense including post-copy assertion and recursive parity check) (#3225)
+- `install-loom.sh` post-install "unstaged changes" warning now snapshots pre-install state and only flags installer-introduced changes; replaces destructive `git restore` recommendation with inspect-first guidance (#3222)
+- `install-loom.sh` non-TTY stdin no longer crashes the install and rolls back completed work — fixes the `curl | bash` install path (#3223)
+- `install-loom.sh` detects pre-existing overlapping branch rulesets via `~DEFAULT_BRANCH` enumeration; offers Skip / Replace / Update on conflict instead of silently creating duplicates (#3224)
+- `install-loom.sh` pre-flight upgrade message no longer leaks the literal `{{LOOM_VERSION}}` placeholder; uses layered version detection from `install-metadata.json` with placeholder rejection (#3221)
+- `loom-daemon init` no longer flags merge-preserved customizations (`.claude/`, `.codex/`, `.github/`) as "Verification failures" with misleading `--force` advice (#3226)
+
+### Changed
+
+- `defaults/scripts/cli/loom-scale.sh` now invokes `claude-wrapper.sh` instead of `claude` directly (#3240)
+- Dependency bumps: production (#3211) and dev (#3212) groups
+
 ## [0.6.5] - 2026-04-22
 
 ### Summary
