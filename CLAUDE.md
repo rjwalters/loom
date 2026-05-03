@@ -617,6 +617,55 @@ Loom provides a unified MCP server (`mcp-loom`) for programmatic control. See th
 mcp__loom__get_agent_metrics --command summary --period week
 ```
 
+## Token Rotation (Multi-Account Claude Code)
+
+For Pro/Max plans, Loom supports rotating between multiple Claude Code OAuth tokens. This spreads load across accounts and recovers automatically when a single token hits its weekly limit.
+
+### Setup
+
+1. Add account credentials to `.env` at the workspace root:
+   ```env
+   ACCOUNT_KEY_1=sk-ant-oat01-...
+   ACCOUNT_TOKEN_FILE_1=robb-personal.token
+   ACCOUNT_KEY_2=sk-ant-oat01-...
+   ACCOUNT_TOKEN_FILE_2=robb-work.token
+   ```
+2. Run `loom-tokens bootstrap` to materialize per-account `.token` files into `.loom/tokens/` (mode 0600, parent dir 0700). See issue #3234.
+3. Spawn agents through `.loom/scripts/spawn-claude.sh` instead of invoking `claude` directly. The wrapper selects a token using a 3-tier algorithm (ranking → allowlist → random), exports `CLAUDE_CODE_OAUTH_TOKEN`, then `exec`s `claude` (or pass `--use-wrapper` to layer on top of `claude-wrapper.sh` for retry behavior).
+
+### Selection algorithm (`loom_tools.tokens.select`)
+
+Three tiers, falling through to the next when the current tier yields nothing:
+
+1. **Ranking** — `.loom/tokens/.ranking` (pipe-delimited `name|status`, refreshed every <10 min). Picks the first non-`exhausted`/non-`blocked` token.
+2. **Allowlist** — `.loom/tokens/.allowlist` (one name per line). Random pick from allowed accounts.
+3. **Random** — uniform pick from all `*.token` files.
+
+Tokens marked bad in `.loom/tokens/.bad_tokens` are skipped at every tier.
+
+### Bad-token tracking (`loom_tools.tokens.bad_tokens`)
+
+When a token returns `TOKEN_EXPIRED` or `TOKEN_EXHAUSTED`, callers append an entry to `.loom/tokens/.bad_tokens`. Writes are guarded with a `mkdir`-based lock (POSIX-atomic, macOS-compatible — `flock` is **not** used because it isn't available on stock macOS). Reads use word-boundary regex so `agent-1` and `agent-10` don't collide.
+
+### Error classification (`.loom/scripts/lib/classify-error.sh`)
+
+The `classify_error <output> <exit_code>` function returns one of `SUCCESS`, `TIMEOUT`, `CWD_DELETED`, `TOKEN_EXPIRED`, `TOKEN_EXHAUSTED`, `RECOVERABLE`. Critical fix from #3233: exit code is checked **before** output substring matching — clean exits (`exit_code == 0`) always return `SUCCESS` regardless of stdout content. The previous lean-genius implementation returned `RECOVERABLE` for clean exits whose stdout contained substrings like `500` or `rate limit`.
+
+### Worktree handling
+
+When invoked from a worktree, `spawn-claude.sh` resolves the canonical repo root via `git rev-parse --git-common-dir` and locates `.loom/tokens/` there — never in the worktree's path. This avoids each worktree maintaining its own bad-tokens list.
+
+### Hard-fail on missing pool
+
+`spawn-claude.sh` exits `78` (`EX_CONFIG`) with a message instructing the user to run `loom-tokens bootstrap` when `.loom/tokens/` is absent or all tokens are bad. It does **not** silently fall back to keychain — that path belongs in `loom-daemon` (#3236), and only when token rotation has not been configured at all.
+
+### Tests
+
+```bash
+PYTHONPATH=loom-tools/src python3 -m pytest loom-tools/tests/tokens/ -v
+bash .loom/scripts/tests/test-spawn-claude.sh
+```
+
 ## Forge Authentication
 
 ### GitHub
