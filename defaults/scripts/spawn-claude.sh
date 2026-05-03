@@ -122,6 +122,39 @@ fi
 
 # --- Token selection ---
 if [[ -z "${LOOM_SPAWN_NO_EXPORT:-}" && -z "${CLAUDE_CODE_OAUTH_TOKEN:-}" ]]; then
+    # Pre-flight: auto-unpin if every allowlisted account has hit the
+    # consecutive-failure threshold (default 5). Without this, an
+    # operator-set pin can trap the spawner once all pinned accounts
+    # exhaust their weekly quota. Empty-pool guard: we never silently
+    # clear .bad_tokens — if that file blocks every account, the user
+    # must intervene (e.g. `loom-tokens unblock <name>`).
+    PYTHONPATH="${PACKAGE_PATH}${PYTHONPATH:+:$PYTHONPATH}" \
+        "$PYTHON" - "$WORKSPACE" <<'PY' || true
+import sys
+from pathlib import Path
+try:
+    from loom_tools.tokens import allowlist as a
+    from loom_tools.tokens import failure_counts as fc
+except Exception:
+    sys.exit(0)
+ws = Path(sys.argv[1])
+try:
+    pinned = a.read_allowlist(ws)
+    if not pinned:
+        sys.exit(0)
+    if all(fc.threshold_reached(ws, n) for n in pinned):
+        a.clear_allowlist(ws)
+        fc.reset_all(ws)
+        print(
+            f"[auto-unpin] All {len(pinned)} pinned account(s) hit "
+            f"{fc.DEFAULT_THRESHOLD} consecutive failures; "
+            f"cleared .allowlist.",
+            file=sys.stderr,
+        )
+except Exception as exc:  # noqa: BLE001
+    print(f"[auto-unpin] skipped ({exc!r})", file=sys.stderr)
+PY
+
     # Capture stdout (JSON) and stderr (errors) separately so log output
     # does not contaminate the JSON we feed to python -c.
     _selection_stderr_file="$(mktemp)"
@@ -135,7 +168,10 @@ if [[ -z "${LOOM_SPAWN_NO_EXPORT:-}" && -z "${CLAUDE_CODE_OAUTH_TOKEN:-}" ]]; th
         cat "$_selection_stderr_file" >&2 || true
         rm -f "$_selection_stderr_file"
         log_error "Run 'loom-tokens bootstrap' to populate .loom/tokens/, or"
-        log_error "set CLAUDE_CODE_OAUTH_TOKEN explicitly to bypass selection."
+        log_error "use 'loom-tokens unblock <name>' if .bad_tokens is the cause."
+        log_error "Spawn-claude refuses to auto-clear .bad_tokens — that's"
+        log_error "intentional: an empty pool indicates a real auth problem."
+        log_error "Set CLAUDE_CODE_OAUTH_TOKEN explicitly to bypass selection."
         exit 78  # EX_CONFIG
     fi
     rm -f "$_selection_stderr_file"
