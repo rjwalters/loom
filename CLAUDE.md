@@ -682,6 +682,33 @@ When invoked from a worktree, `spawn-claude.sh` resolves the canonical repo root
 
 `spawn-claude.sh` exits `78` (`EX_CONFIG`) with a message instructing the user to run `loom-tokens bootstrap` when `.loom/tokens/` is absent or all tokens are bad. It does **not** silently fall back to keychain — that path belongs in `loom-daemon` (#3236), and only when token rotation has not been configured at all.
 
+### Operator CLI (`loom-tokens pin/unpin/unblock`)
+
+Operators can restrict the rotation pool to a subset of accounts (an "allowlist") and manually un-blacklist accounts marked bad. Auto-recovery prevents pin-induced lockouts.
+
+```bash
+loom-tokens pin agent-3 agent-7   # Set allowlist to exactly these
+loom-tokens pin add agent-2       # Append (idempotent)
+loom-tokens pin remove agent-3    # Remove
+loom-tokens pin status            # Show current allowlist
+loom-tokens unpin                 # Delete allowlist (back to full pool)
+
+loom-tokens unblock agent-1       # Remove one entry from .bad_tokens
+loom-tokens unblock --all         # Clear .bad_tokens entirely
+```
+
+**Validation**: `pin` accepts only exact bootstrapped account names — substring/fuzzy matches are rejected. The allowlist is sorted, deduplicated, and `mkdir`-lock guarded so concurrent operator commands don't drop entries.
+
+**Reason-aware bad-token TTL**: bad-tokens entries with reason `auth` (401) ignore `LOOM_TOKENS_BAD_TTL` (default 21600s = 6h) and persist until `loom-tokens unblock`. Other reasons expire automatically.
+
+**Auto-unpin** (`failure_counts`): the wrapper tracks consecutive `TOKEN_EXHAUSTED` failures per account in `.loom/tokens/.failure_counts` (JSON). When **every** account in the allowlist hits the threshold (default 5), the wrapper auto-clears `.allowlist` and `.failure_counts` with a loud stderr log line. Operators can re-pin afterwards. The threshold is `>= 5`, so a 6th failure does not silently exceed; it still triggers (idempotent at-or-above).
+
+Counters are reset on:
+- a successful spawn for that account, or
+- any operator allowlist mutation (`pin`, `unpin`, `add`, `remove`).
+
+**Empty-pool guard**: if the selector finds the allowlist minus `.bad_tokens` is empty, `spawn-claude.sh` exits `78` (`EX_CONFIG`) with operator instructions. It refuses to silently auto-clear `.bad_tokens` — that masks real auth problems (lean-genius failure mode 3).
+
 ### Tests
 
 ```bash

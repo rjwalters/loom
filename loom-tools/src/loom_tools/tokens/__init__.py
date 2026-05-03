@@ -28,8 +28,25 @@ Public API:
 
 from __future__ import annotations
 
+from loom_tools.tokens.allowlist import (
+    AllowlistError,
+    UnknownAccountError,
+    add_to_allowlist,
+    clear_allowlist,
+    list_accounts,
+    read_allowlist,
+    remove_from_allowlist,
+    write_allowlist,
+)
 from loom_tools.tokens.bad_tokens import cleanup_bad_tokens, is_bad, mark_bad
 from loom_tools.tokens.bootstrap import bootstrap_tokens
+from loom_tools.tokens.failure_counts import (
+    DEFAULT_THRESHOLD,
+    record_failure,
+    record_success,
+    reset_all,
+    threshold_reached,
+)
 from loom_tools.tokens.select import (
     EmptyTokenPoolError,
     SelectedToken,
@@ -38,12 +55,25 @@ from loom_tools.tokens.select import (
 )
 
 __all__ = [
+    "DEFAULT_THRESHOLD",
+    "AllowlistError",
     "EmptyTokenPoolError",
     "SelectedToken",
     "TokenSelectionError",
+    "UnknownAccountError",
+    "add_to_allowlist",
     "bootstrap_tokens",
     "cleanup_bad_tokens",
+    "clear_allowlist",
     "is_bad",
+    "list_accounts",
     "mark_bad",
+    "read_allowlist",
+    "record_failure",
+    "record_success",
+    "remove_from_allowlist",
+    "reset_all",
     "select_token",
+    "threshold_reached",
+    "write_allowlist",
 ]
