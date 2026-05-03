@@ -41,6 +41,36 @@ from loom_tools.common.claude_config import (
 from loom_tools.common.logging import log_error, log_info, log_success, log_warning
 from loom_tools.common.repo import find_repo_root
 
+
+def _select_oauth_token(repo_root: pathlib.Path) -> str | None:
+    """Select an OAuth token from the workspace token pool, if available.
+
+    Returns the selected token string or None when:
+      - The ``loom_tools.tokens.select`` module is not yet present
+        (issue #3235 not merged into the current worktree).
+      - No ``.loom/tokens/`` directory exists in the workspace
+        (token rotation not bootstrapped via #3234's ``loom-tokens bootstrap``).
+      - Selection raises any exception (token pool corrupt, all tokens bad,
+        etc.) — the fallback is the per-agent Keychain auth path.
+
+    On any None return, callers should NOT inject ``CLAUDE_CODE_OAUTH_TOKEN``;
+    Claude Code falls back to its Keychain credential under the per-agent
+    ``CLAUDE_CONFIG_DIR``-hashed service name. See issue #3236.
+    """
+    tokens_dir = repo_root / ".loom" / "tokens"
+    if not tokens_dir.is_dir():
+        return None
+    try:
+        # Imported lazily so the module is optional until #3235 lands.
+        from loom_tools.tokens.select import select_token  # type: ignore[import-not-found]
+    except ImportError:
+        return None
+    try:
+        return select_token(repo_root)
+    except Exception as exc:  # pragma: no cover - defensive
+        log_warning(f"Token selection failed ({exc}); falling back to Keychain auth")
+        return None
+
 # tmux configuration (must match agent_monitor.py)
 TMUX_SOCKET = "loom"
 SESSION_PREFIX = "loom-"
@@ -710,17 +740,51 @@ def spawn_agent(
     if shepherd_task_id:
         shepherd_prefix = f"LOOM_SHEPHERD_TASK_ID='{shepherd_task_id}' "
 
+    # OAuth token rotation prefix (see issue #3236).
+    # If a workspace token pool exists (created by `loom-tokens bootstrap`)
+    # and the selection library is installed, pick an account and inline its
+    # token as CLAUDE_CODE_OAUTH_TOKEN so Claude Code uses it instead of the
+    # per-agent Keychain entry.  When neither condition holds, do nothing —
+    # the existing Keychain-auth path under CLAUDE_CONFIG_DIR continues to
+    # work unchanged (backward compatible).
+    #
+    # Honour any CLAUDE_CODE_OAUTH_TOKEN already in the caller's environment:
+    # if the user explicitly set it, do not override.
+    token_prefix = ""
+    inherited_token = os.environ.get("CLAUDE_CODE_OAUTH_TOKEN", "")
+    if inherited_token:
+        # Quote single-quotes safely for shell interpolation.
+        safe = inherited_token.replace("'", "'\"'\"'")
+        token_prefix = f"CLAUDE_CODE_OAUTH_TOKEN='{safe}' "
+        log_info("Using CLAUDE_CODE_OAUTH_TOKEN from caller environment")
+    else:
+        selected = _select_oauth_token(repo_root)
+        if selected:
+            safe = selected.replace("'", "'\"'\"'")
+            token_prefix = f"CLAUDE_CODE_OAUTH_TOKEN='{safe}' "
+            # Also surface the selected token on the tmux session env so any
+            # later interactive `claude` invocation in the same session
+            # inherits it (mirrors CLAUDE_CONFIG_DIR handling above).
+            _tmux(
+                "set-environment", "-t", session_name,
+                "CLAUDE_CODE_OAUTH_TOKEN", selected,
+            )
+            log_info("Injected CLAUDE_CODE_OAUTH_TOKEN from workspace token pool")
+
     # Build the Claude CLI command
     wrapper_script = repo_root / ".loom" / "scripts" / "claude-wrapper.sh"
     if wrapper_script.is_file() and os.access(wrapper_script, os.X_OK):
         claude_cmd = (
-            f"{pythonpath_prefix}{worktree_prefix}{max_retries_prefix}{shepherd_prefix}"
+            f"{token_prefix}{pythonpath_prefix}{worktree_prefix}"
+            f"{max_retries_prefix}{shepherd_prefix}"
             f"LOOM_TERMINAL_ID='{name}' LOOM_WORKSPACE='{working_dir}' "
             f"CLAUDE_CONFIG_DIR='{config_dir}' TMPDIR='{config_dir / 'tmp'}' "
             f"'{wrapper_script}' --dangerously-skip-permissions \"{role_cmd}\""
         )
     else:
-        claude_cmd = f'claude --dangerously-skip-permissions "{role_cmd}"'
+        claude_cmd = (
+            f"{token_prefix}claude --dangerously-skip-permissions \"{role_cmd}\""
+        )
         log_warning("claude-wrapper.sh not found, using claude directly (no retry logic)")
 
     # Send the command to the session
