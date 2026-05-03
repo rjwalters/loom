@@ -919,6 +919,38 @@ else
 fi
 echo ""
 
+# Test 39: gh pr create passes --head explicitly (regression for #3244)
+# Without --head, gh tries to auto-detect from origin and can fail in shells
+# where its host detection is degraded, even with -R already set.
+echo "Test 39: create-pr.sh passes --head to gh pr create"
+if grep -A8 'gh pr create \\' "$LOOM_ROOT/scripts/install/create-pr.sh" | \
+     grep -q -- '--head "\$BRANCH_NAME"'; then
+  pass "create-pr.sh's gh pr create includes --head \$BRANCH_NAME"
+else
+  fail "create-pr.sh's gh pr create is missing --head — would orphan remote branches when origin auto-detect fails (#3244)"
+fi
+echo ""
+
+# Test 40: install-loom.sh cleanup_on_error deletes the orphan remote branch
+# when the install fails after push but before PR creation completes (#3244).
+echo "Test 40: cleanup_on_error deletes orphan remote install branches"
+if grep -q 'git push origin --delete "\${BRANCH_NAME}"' "$INSTALL_SCRIPT"; then
+  pass "cleanup_on_error deletes orphan remote branches"
+else
+  fail "cleanup_on_error is missing remote-branch cleanup for orphaned install branches (#3244)"
+fi
+echo ""
+
+# Test 41: Remote-branch cleanup is prefix-restricted to feature/loom-install-v*
+# so a branch like 'topic/feature/loom-install-v0.7.0' wouldn't match.
+echo "Test 41: remote-branch cleanup is restricted to feature/loom-install-v* prefix"
+if grep -q '"\${BRANCH_NAME}" =~ \^feature/loom-install-v' "$INSTALL_SCRIPT"; then
+  pass "Cleanup regex is anchored at start of branch name (^feature/loom-install-v)"
+else
+  fail "Cleanup regex is not anchored — could delete unrelated branches"
+fi
+echo ""
+
 
 # ==========================================================================
 # Summary

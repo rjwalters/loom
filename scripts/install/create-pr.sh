@@ -240,8 +240,13 @@ PR_URL=""
 if [[ "$FORGE_TYPE" == "github" ]]; then
   # Create PR via GitHub CLI
   GH_PR_EXIT=0
+  # Pass --head explicitly so gh doesn't try to auto-detect from the local
+  # origin remote — that path can fail with "could not resolve remote 'origin'"
+  # in shell environments where gh's host detection is degraded, even when
+  # -R already pins the target repo (see #3244).
   GH_PR_OUTPUT=$(gh pr create \
     -R "$REPO" \
+    --head "$BRANCH_NAME" \
     --base "$BASE_BRANCH" \
     --title "$PR_TITLE" \
     --body "$PR_BODY" \
