@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.1] - 2026-05-04
+
+### Summary
+
+Patch fix for `install-loom.sh`: PR creation now passes `--head` so it doesn't fail in shells where gh's origin auto-detection is degraded, and the rollback path cleans up orphan remote branches when the install fails after push. Caught and fixed during the v0.7.0 rollout to vibesql and kicad-tools.
+
+### Fixed
+
+- `scripts/install/create-pr.sh` — pass `--head "$BRANCH_NAME"` to `gh pr create` so it skips origin auto-detection (which can fail with "could not resolve remote 'origin'" in shells where gh's host detection is degraded, even when `-R` already pins the target repo) (#3245)
+- `scripts/install-loom.sh` — `cleanup_on_error` now deletes the remote branch when the install fails after the push step, restricted to `feature/loom-install-v*` so unrelated branches are never touched (#3245)
+- Three new regression tests in `scripts/test-installer.sh` covering the `--head` flag, the remote-branch cleanup call, and the prefix-anchored regex (#3245)
+
 ## [0.7.0] - 2026-05-03
 
 ### Summary
