@@ -44,6 +44,7 @@ loom-usage = "loom_tools.common.usage:main"
 loom-backlog = "loom_tools.backlog:main"
 loom-forge = "loom_tools.forge_cli:cli_main"
 loom-auto-merge = "loom_tools.auto_merge:main"
+loom-tokens = "loom_tools.tokens.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
