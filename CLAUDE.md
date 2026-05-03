@@ -584,6 +584,29 @@ Each account becomes `.loom/tokens/<file>.token` (mode `0600`). An `index.json` 
 
 `.loom/tokens/` is gitignored. The pool is consumed by external rotation logic (e.g. a `claude-wrapper.sh` that picks the least-used token); only the bootstrap step is provided here.
 
+#### Account health probe + ranking
+
+Once bootstrapped, `loom-tokens check` probes each account for current rate-limit headers and (optionally) writes a JSON ranking that the spawn-time selector can consume:
+
+```bash
+loom-tokens check                  # Probe + print human table
+loom-tokens check --ranking        # Probe + write .loom/tokens/.ranking atomically
+loom-tokens check --json           # Emit full JSON report to stdout
+./.loom/scripts/probe-tokens.sh    # Cron-friendly wrapper for periodic invocation
+```
+
+The probe sends a minimal `POST /v1/messages` request (1 input, 1 output token) and parses rate-limit response headers. The header parser matches by **suffix** (`-5h-utilization`, `-7d-utilization`, `-7d-reset`) so future renames of the `anthropic-ratelimit-tokens-*` prefix still work; the full header set is logged on the first probe of each run.
+
+Status assignment: `available` (utilizations < 95%), `exhausted` (`7d_utilization >= 0.95`), `rate_limited` (current 429), `blocked` (401 auth failure or token listed in `.bad_tokens`). Probe failures (network, timeout, 5xx) are logged and skipped — one bad account does not abort the run.
+
+OAuth tokens shaped `sk-ant-oat01-*` are sent with `Authorization: Bearer` + `anthropic-beta: oauth-2025-04-20`; plain API keys use `x-api-key`.
+
+Cron example (probe every 10 minutes):
+
+```cron
+*/10 * * * * cd /path/to/repo && ./.loom/scripts/probe-tokens.sh --ranking >> .loom/logs/probe-tokens.log 2>&1
+```
+
 See `.loom/docs/troubleshooting.md` for detailed troubleshooting including:
 - Cleaning up stale worktrees and branches
 - Stuck agent detection and intervention
