@@ -19,7 +19,7 @@ jobs:
     runs-on: macos-14  # Apple Silicon runner
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Setup pnpm
         uses: pnpm/action-setup@v4
