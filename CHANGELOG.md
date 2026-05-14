@@ -7,6 +7,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.2] - 2026-05-14
+
+### Summary
+
+Hardening release driven by a high-throughput parallel-shepherding session that surfaced latent bugs in merge tooling, installer hooks, and role workflow gates. Headline fixes: auto-merge no longer collides with the host worktree (#3284), installer hooks use `${CLAUDE_PROJECT_DIR}` so they survive cwd changes (#3277), and Champion closes issues via GraphQL `closingIssuesReferences` instead of a brittle regex (#3276). Plus a new `worktree.sh --sparse`/`--full` cone-mode flag, curator/builder decomposition guardrails, security patches for 9 transitive npm vulnerabilities, and dependency bumps.
+
+### Added
+
+- `defaults/scripts/worktree.sh` — `--sparse <paths...>` and `--full` flags for cone-mode checkout, with per-worktree config, always-included safety set (`.claude/`, `.loom/`, `.githooks/`, `scripts/`), and `LOOM_WORKTREE_ALWAYS_INCLUDE` env var. JSON output gains `sparse` and `cone` fields (#3278)
+- `loom:epic` and `loom:epic-phase` labels in the install bundle (`defaults/.github/labels.yml`), plus idempotent preflight in the `epic` skill (#3273)
+- Re-curation playbook section in `curator.md` with decision table for revisiting already-`loom:curated` issues (#3275)
+
+### Changed
+
+- Installer writes hook commands with `${CLAUDE_PROJECT_DIR}/` prefix; `merge_hook_commands` strips legacy bare-relative entries to prevent duplicate-hook accumulation on upgrade (#3277, resolves #3251)
+- Champion closes referenced issues via `gh`'s GraphQL `closingIssuesReferences` instead of `grep -Eo "(Closes|Fixes|Resolves) #[0-9]+"`. Gitea backend uses a word-boundary regex that excludes `Updates`/`See`/`References`/`Discloses` (#3276)
+- `merge-pr.sh --auto` path is now worktree-safe — enables auto-merge via GraphQL `enablePullRequestAutoMerge` (no local checkout), inherits the sync-path `Base branch was modified` retry loop, and falls through to shared cleanup after confirming merge (#3284)
+- Curator must not pre-curate decomposed sub-issues; sub-issues land in `loom:triage` for a dedicated curator pass (#3272)
+- Builder-complexity decomposition no longer self-adds `loom:issue` to sub-issues — preserves the curator + human gate (#3282, resolves #3253)
+- `loom:curated` label description revised to reflect additive (not "awaiting approval") semantics (#3275)
+- `scripts/install-loom.sh` builds `loom-daemon` via direct `cargo build` instead of `pnpm daemon:build`, decoupling the daemon build from pnpm install-state (#3271)
+- Dependency bumps: tokio 1.52.1 → 1.52.3, tauri 2.10.3 → 2.11.1, tauri-plugin-dialog 2.7.0 → 2.7.1, tauri-plugin-opener 2.5.3 → 2.5.4, tower-http 0.6.8 → 0.6.10 (#3264); pnpm/action-setup 4→6 (#3262); codeql-action 3→4 (#3259); action-gh-release 2→3 (#3261); setup-python 5→6 (#3260); checkout 4→6 (#3258); dev-dependencies group — biome, playwright, tailwindcss, vitest, vite, postcss (#3268); production-dependencies (#3248)
+
+### Fixed
+
+- `defaults/scripts/worktree.sh` submodule init uses `--init --recursive` (handles nested), 300s timeout (`LOOM_SUBMODULE_TIMEOUT`), and preserves stderr (#3274)
+- `defaults/optional/github-workflows/label-external-issues.yml` — removed broken `push:` trigger, dead `validate` guard job, and redundant `if: github.event_name == 'issues'` predicate (#3269)
+- Removed ineffective `/clear` "Context Clearing (Cost Optimization)" instruction from 8 role files (architect, auditor, champion, champion-common, curator, guide, hermit, judge) — `/clear` is a CLI construct that agents emit as plain text, never executed (#3270)
+- `pnpm.overrides` patches 9 transitive vulnerabilities (2 high `fast-uri`, 5 moderate `hono`/`ip-address`, 2 low `hono`/`qs`); `pnpm audit --audit-level moderate` now exits 0 (#3283)
+
 ## [0.7.1] - 2026-05-04
 
 ### Summary
