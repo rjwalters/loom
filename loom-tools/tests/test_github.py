@@ -1010,30 +1010,104 @@ class TestGitHubForgePullRequests:
         assert "--squash" in call_args
 
     def test_auto_merge_pull_request_success(self) -> None:
-        """auto_merge_pull_request delegates to gh pr merge --auto."""
+        """auto_merge_pull_request uses GraphQL mutation (worktree-safe).
+
+        Per issue #3279: must NOT shell out to ``gh pr merge --auto``,
+        which performs a local checkout that collides with worktrees
+        owning the head branch. Instead it must call the GraphQL
+        ``enablePullRequestAutoMerge`` mutation (a pure API call).
+        """
         forge = GitHubForge()
-        with mock.patch("loom_tools.common.github.gh_run") as mock_gh:
-            mock_gh.return_value = mock.Mock(returncode=0, stdout="", stderr="")
+        # First gh_run: fetch node_id; second gh_run: GraphQL mutation.
+        node_id_result = mock.Mock(
+            returncode=0, stdout="PR_kwDOABC123\n", stderr="",
+        )
+        graphql_result = mock.Mock(
+            returncode=0,
+            stdout='{"data":{"enablePullRequestAutoMerge":{"pullRequest":{"number":10}}}}',
+            stderr="",
+        )
+        with mock.patch(
+            "loom_tools.common.github.gh_run",
+        ) as mock_gh, mock.patch(
+            "loom_tools.common.github.get_repo_nwo",
+            return_value="acme/widget",
+        ):
+            mock_gh.side_effect = [node_id_result, graphql_result]
             result = forge.auto_merge_pull_request(10, method="squash")
 
         assert result is True
-        call_args = mock_gh.call_args[0][0]
-        assert "pr" in call_args
-        assert "merge" in call_args
-        assert "--auto" in call_args
-        assert "--squash" in call_args
-        assert "--delete-branch" in call_args
+        # Verify the first call fetched the node_id via REST.
+        first_args = mock_gh.call_args_list[0][0][0]
+        assert first_args[0] == "api"
+        assert "repos/acme/widget/pulls/10" in first_args
+        # Verify the second call invoked GraphQL with the mutation.
+        second_args = mock_gh.call_args_list[1][0][0]
+        assert second_args[0] == "api"
+        assert second_args[1] == "graphql"
+        joined = " ".join(second_args)
+        assert "enablePullRequestAutoMerge" in joined
+        assert "pullRequestId=PR_kwDOABC123" in joined
+        assert "mergeMethod=SQUASH" in joined
+        # Critical regression guard: must NOT use `gh pr merge --auto`.
+        for call in mock_gh.call_args_list:
+            call_args = call[0][0]
+            if "pr" in call_args and "merge" in call_args:
+                assert "--auto" not in call_args, \
+                    "must not shell out to `gh pr merge --auto` (worktree-unsafe)"
 
     def test_auto_merge_pull_request_failure(self) -> None:
-        """auto_merge_pull_request returns False on gh failure."""
+        """auto_merge_pull_request returns False on GraphQL failure."""
         forge = GitHubForge()
-        with mock.patch("loom_tools.common.github.gh_run") as mock_gh:
-            mock_gh.return_value = mock.Mock(
-                returncode=1, stdout="", stderr="auto-merge not available",
-            )
+        node_id_result = mock.Mock(
+            returncode=0, stdout="PR_kwDOABC123\n", stderr="",
+        )
+        graphql_fail = mock.Mock(
+            returncode=1, stdout="",
+            stderr="auto-merge not available on this repository",
+        )
+        with mock.patch(
+            "loom_tools.common.github.gh_run",
+        ) as mock_gh, mock.patch(
+            "loom_tools.common.github.get_repo_nwo",
+            return_value="acme/widget",
+        ):
+            mock_gh.side_effect = [node_id_result, graphql_fail]
             result = forge.auto_merge_pull_request(10)
 
         assert result is False
+
+    def test_auto_merge_pull_request_no_node_id(self) -> None:
+        """auto_merge_pull_request returns False if node_id lookup fails."""
+        forge = GitHubForge()
+        node_id_fail = mock.Mock(returncode=1, stdout="", stderr="not found")
+        with mock.patch(
+            "loom_tools.common.github.gh_run",
+        ) as mock_gh, mock.patch(
+            "loom_tools.common.github.get_repo_nwo",
+            return_value="acme/widget",
+        ):
+            mock_gh.return_value = node_id_fail
+            result = forge.auto_merge_pull_request(10)
+
+        assert result is False
+        # Should not have called GraphQL after node_id lookup failed.
+        assert mock_gh.call_count == 1
+
+    def test_auto_merge_pull_request_no_nwo(self) -> None:
+        """auto_merge_pull_request returns False if repo NWO unresolved."""
+        forge = GitHubForge()
+        with mock.patch(
+            "loom_tools.common.github.gh_run",
+        ) as mock_gh, mock.patch(
+            "loom_tools.common.github.get_repo_nwo",
+            return_value=None,
+        ):
+            result = forge.auto_merge_pull_request(10)
+
+        assert result is False
+        # Should not have called gh at all.
+        assert mock_gh.call_count == 0
 
     def test_get_pull_request_reviews(self) -> None:
         """get_pull_request_reviews returns review list."""
