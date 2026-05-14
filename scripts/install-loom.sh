@@ -23,7 +23,7 @@
 #     - Target must be a Git repository with a remote
 #     - For GitHub: GitHub CLI (gh) must be authenticated
 #     - For Gitea: GITEA_TOKEN or FORGE_TOKEN environment variable must be set
-#     - loom-daemon binary must be built (pnpm daemon:build)
+#     - loom-daemon binary must be buildable (cargo build --package loom-daemon --release)
 #
 #   After installation:
 #     - Merge the generated PR in the target repository
@@ -438,7 +438,7 @@ else
   MISSING_DEPS+=("node")
 fi
 
-# Check for pnpm (needed to build daemon)
+# Check for pnpm (used by the JS workspace; no longer required for the daemon build)
 if command -v pnpm &> /dev/null; then
   success "pnpm: $(pnpm --version)"
 else
@@ -683,7 +683,13 @@ echo ""
 # Cargo's incremental compilation makes this fast (~1-2s) when nothing changed
 info "Building loom-daemon..."
 cd "$LOOM_ROOT"
-pnpm daemon:build || error "Failed to build loom-daemon"
+# Inlined from package.json `daemon:build` script to decouple from pnpm preflight (issue #3252).
+# The daemon is pure Rust; invoking via pnpm forced lockfile/workspace/build-script validation
+# of the loom source checkout, causing unrelated JS-toolchain drift to abort installation.
+cargo build --package loom-daemon --release || error "Failed to build loom-daemon"
+# Copy to architecture-specific name (Tauri sidecar convention)
+rm -f target/release/loom-daemon-aarch64-apple-darwin
+cp target/release/loom-daemon target/release/loom-daemon-aarch64-apple-darwin
 
 success "loom-daemon binary ready"
 
