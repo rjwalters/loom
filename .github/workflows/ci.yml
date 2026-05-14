@@ -59,7 +59,7 @@ jobs:
     if: always() && (github.event_name == 'push' || needs.changes.outputs.frontend == 'true')
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: pnpm/action-setup@v4
         with:
           version: 9
@@ -76,7 +76,7 @@ jobs:
     if: always() && (github.event_name == 'push' || needs.changes.outputs.frontend == 'true')
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: pnpm/action-setup@v4
         with:
           version: 9
@@ -93,7 +93,7 @@ jobs:
     if: always() && (github.event_name == 'push' || needs.changes.outputs.frontend == 'true')
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: pnpm/action-setup@v4
         with:
           version: 9
@@ -110,7 +110,7 @@ jobs:
     if: always() && (github.event_name == 'push' || needs.changes.outputs.backend == 'true')
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - name: Install system dependencies
         run: |
           sudo apt-get update || true
@@ -134,7 +134,7 @@ jobs:
     if: always() && (github.event_name == 'push' || needs.changes.outputs.backend == 'true')
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - name: Install system dependencies
         run: |
           sudo apt-get update || true
@@ -154,7 +154,7 @@ jobs:
     if: always() && (github.event_name == 'push' || needs.changes.outputs.mcp == 'true')
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: actions/setup-node@v4
         with:
           node-version: "20"
@@ -170,6 +170,6 @@ jobs:
     # macOS runner required: uninstall-loom.sh uses sed -i '' (macOS syntax)
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - name: Run installer tests
         run: bash scripts/test-installer.sh
