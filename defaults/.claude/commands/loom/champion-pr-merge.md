@@ -354,9 +354,14 @@ After successful merge, verify that linked issues were automatically closed by G
 ```bash
 PR_NUMBER=$1
 
-# Extract linked issues from PR body
-PR_BODY=$(gh pr view "$PR_NUMBER" --json body --jq -r '.body')
-LINKED_ISSUES=$(echo "$PR_BODY" | grep -Eo "(Closes|Fixes|Resolves) #[0-9]+" | grep -Eo "[0-9]+" | sort -u)
+# Extract linked issues using GitHub's own parser (closingIssuesReferences).
+# This is the authoritative set of issues GitHub will auto-close on merge.
+# It correctly ignores `Updates #N`, `See #N`, code-fenced text, and substring
+# traps like `Discloses #N`. The previous regex-based approach silently
+# misclassified `Updates #N` as a closing reference — see issue #3267.
+source "$(git rev-parse --show-toplevel)/.loom/scripts/lib/forge-helpers.sh"
+forge_detect
+LINKED_ISSUES=$(forge_pr_close_targets "$PR_NUMBER")
 
 if [ -z "$LINKED_ISSUES" ]; then
   echo "No linked issues found in PR body"
