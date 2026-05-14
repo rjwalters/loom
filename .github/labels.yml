@@ -77,7 +77,7 @@
   color: "6366F1"  # indigo-500 - indicates meta/tooling request
 
 - name: loom:curated
-  description: Enhanced by Curator, awaiting human approval
+  description: "Curator-enriched. Additive marker; coexists with loom:issue (highest-quality state for Builders)"
   color: "10B981"  # emerald-500
 
 # Status Labels
