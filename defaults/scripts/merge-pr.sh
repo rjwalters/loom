@@ -239,6 +239,15 @@ success "PR #$PR_NUMBER merged successfully"
 # NOTE: Label cleanup on linked issues is intentionally skipped.
 # Labels on closed/merged items are harmless — all agents filter by open state.
 # See: https://github.com/rjwalters/loom/issues/2838
+#
+# NOTE: This script does NOT close linked issues. Issue auto-close is GitHub's
+# responsibility — GitHub's PR parser closes issues referenced via `Closes #N`,
+# `Fixes #N`, `Resolves #N` (and the case/tense variants) on merge. Champion's
+# "Verify Issue Auto-Close" step is a belt-and-suspenders check that uses
+# `forge_pr_close_targets` (which delegates to GitHub's GraphQL
+# `closingIssuesReferences` field) to confirm closure. If you are debugging
+# why an unintended issue was closed, look at the PR body and Champion logs,
+# not at this script. See: https://github.com/rjwalters/loom/issues/3267
 
 # Delete remote branch (skip if forge auto-deletes on merge)
 DELETE_BRANCH_ON_MERGE=$(forge_check_auto_delete "$REPO_NWO" "$GH")

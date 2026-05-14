@@ -115,6 +115,90 @@ else
     echo -e "  ${RED}FAIL${NC}: forge_get_repo_nwo returned empty"
 fi
 
+# --- Test forge_pr_close_targets (Gitea fallback regex path) ---
+# These tests exercise the regex fallback that is used for Gitea (and that
+# serves as the safety net behavior we want to guarantee even without the
+# GitHub GraphQL path). We test the regex directly to avoid needing a live
+# forge or stubbing `gh pr view`.
+echo ""
+echo "Testing forge_pr_close_targets regex (Gitea fallback semantics)..."
+
+# Helper: run the same regex used inside forge_pr_close_targets's Gitea branch.
+# Note: `|| true` neutralizes grep's exit code 1 (no match) under `set -e`.
+_close_targets_regex() {
+    local body="$1"
+    { echo "$body" \
+        | grep -Eoi '\b(close[sd]?|fix(e[sd])?|resolve[sd]?)\b[[:space:]]+#[0-9]+' \
+        | grep -Eo '[0-9]+' \
+        | sort -un \
+        | tr '\n' ' ' \
+        | sed 's/ $//'; } || true
+}
+
+result=$(_close_targets_regex "Closes #42")
+assert_eq "42" "$result" "Closes #N matches"
+
+result=$(_close_targets_regex "Fixes #42")
+assert_eq "42" "$result" "Fixes #N matches"
+
+result=$(_close_targets_regex "Resolves #42")
+assert_eq "42" "$result" "Resolves #N matches"
+
+result=$(_close_targets_regex "closes #42")
+assert_eq "42" "$result" "lowercase closes #N matches (case-insensitive)"
+
+result=$(_close_targets_regex "Closed #42")
+assert_eq "42" "$result" "tense variant 'Closed #N' matches"
+
+result=$(_close_targets_regex "Updates #42")
+assert_eq "" "$result" "Updates #N is correctly ignored (the bug from #3267)"
+
+result=$(_close_targets_regex "See #42")
+assert_eq "" "$result" "See #N is correctly ignored"
+
+result=$(_close_targets_regex "References #42")
+assert_eq "" "$result" "References #N is correctly ignored"
+
+result=$(_close_targets_regex "Discloses #42")
+assert_eq "" "$result" "substring trap 'Discloses #N' is correctly ignored"
+
+result=$(_close_targets_regex "")
+assert_eq "" "$result" "empty body returns nothing"
+
+result=$(_close_targets_regex "Closes #1, Fixes #2, Resolves #3")
+assert_eq "1 2 3" "$result" "multiple closing keywords match all targets"
+
+result=$(_close_targets_regex "Closes #5. Updates #6.")
+assert_eq "5" "$result" "mixed Closes/Updates closes only Closes target"
+
+result=$(_close_targets_regex "Closes #7 and Fixes #7")
+assert_eq "7" "$result" "duplicate references are de-duplicated"
+
+# --- Test forge_pr_close_targets dispatches to GitHub path ---
+echo ""
+echo "Testing forge_pr_close_targets GitHub dispatch (using stub gh)..."
+
+# Create a stub `gh` that captures the closingIssuesReferences invocation
+# and returns canned output. Place it on PATH ahead of the real gh.
+STUB_DIR=$(mktemp -d)
+cat > "$STUB_DIR/gh" <<'STUB'
+#!/usr/bin/env bash
+# Stub gh that only handles the close-targets query.
+# Usage: gh pr view <N> --json closingIssuesReferences --jq '.closingIssuesReferences[].number'
+if [[ "$1" == "pr" && "$2" == "view" && "$*" == *"closingIssuesReferences"* ]]; then
+  printf '123\n456\n'
+  exit 0
+fi
+exit 1
+STUB
+chmod +x "$STUB_DIR/gh"
+
+FORGE_TYPE="github"
+result=$(forge_pr_close_targets "999" "$STUB_DIR/gh" | tr '\n' ' ' | sed 's/ $//')
+assert_eq "123 456" "$result" "GitHub path delegates to gh pr view --json closingIssuesReferences"
+
+rm -rf "$STUB_DIR"
+
 # --- Summary ---
 echo ""
 echo "────────────────────────────────"

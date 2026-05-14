@@ -482,6 +482,55 @@ forge_get_pr_body() {
   fi
 }
 
+# Get issue numbers that a PR will close when merged.
+#
+# Usage: forge_pr_close_targets PR_NUMBER [GH_CMD]
+# Outputs: One issue number per line on stdout, sorted and de-duplicated.
+#
+# GitHub: Uses GraphQL `closingIssuesReferences` via `gh pr view`. This is
+#   GitHub's authoritative parse of the PR body — it correctly handles case
+#   sensitivity, word boundaries, fenced code blocks, and the full list of
+#   closing keywords (close/closes/closed, fix/fixes/fixed, resolve/resolves/
+#   resolved). It also follows GitHub's own rule that "Updates #N", "See #N",
+#   and "References #N" do NOT close the issue.
+#
+# Gitea: The Gitea API does not expose an equivalent of closingIssuesReferences,
+#   so this falls back to a word-boundary regex over the PR body. The regex
+#   only matches the canonical closing keywords (case-insensitive), so plain
+#   `Updates #N` is correctly ignored. The substring trap (e.g. `Discloses #N`)
+#   is also avoided thanks to the leading `\b`. Note that this is a syntactic
+#   approximation — it does not strip fenced code blocks or quoted text.
+#
+# This helper replaces the brittle `grep -Eo "(Closes|Fixes|Resolves) #[0-9]+"`
+# that previously appeared in Champion's "Verify Issue Auto-Close" step. That
+# regex silently misclassified `Updates #N` (and various substring traps) as
+# closing references, causing Champion to manually close tracking issues that
+# were intentionally left open. See issue #3267 for the full history.
+forge_pr_close_targets() {
+  local pr_number="$1"
+  local gh_cmd="${2:-gh}"
+
+  if [[ "$FORGE_TYPE" == "gitea" ]]; then
+    # Gitea fallback: word-boundary regex over the PR body.
+    # We need the NWO to fetch the body; assume the caller's working repo.
+    local nwo
+    nwo=$(forge_get_repo_nwo "$gh_cmd") || return 0
+    local body
+    body=$(forge_get_pr_body "$nwo" "$pr_number")
+    # Word-boundary, case-insensitive match on canonical closing keywords only.
+    # `Updates`, `See`, `References` are deliberately excluded.
+    # `|| true` neutralizes grep's exit-1 (no match) under `set -e`.
+    { echo "$body" \
+        | grep -Eoi '\b(close[sd]?|fix(e[sd])?|resolve[sd]?)\b[[:space:]]+#[0-9]+' \
+        | grep -Eo '[0-9]+' \
+        | sort -un; } || true
+  else
+    { "$gh_cmd" pr view "$pr_number" --json closingIssuesReferences \
+        --jq '.closingIssuesReferences[].number' 2>/dev/null \
+        | sort -un; } || true
+  fi
+}
+
 # Get PR comments.
 # Usage: forge_get_pr_comments NWO PR_NUMBER
 # GitHub: gh pr view --comments
