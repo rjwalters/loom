@@ -14,8 +14,23 @@ use super::InitReport;
 
 /// Prefix used to identify Loom-owned hooks in settings.json.
 /// Hooks with commands starting with this prefix are managed by Loom.
+///
+/// Hooks are written with `${CLAUDE_PROJECT_DIR}/` prefix so that Claude Code
+/// expands them at hook-invocation time to the project root, ensuring the
+/// commands resolve regardless of the agent's current working directory.
 #[allow(dead_code)]
-pub const LOOM_HOOK_PREFIX: &str = ".loom/hooks/";
+pub const LOOM_HOOK_PREFIX: &str = "${CLAUDE_PROJECT_DIR}/.loom/hooks/";
+
+/// Legacy prefix for hooks installed before the `${CLAUDE_PROJECT_DIR}` migration.
+/// Used during merge/remove operations to detect and migrate stale entries.
+#[allow(dead_code)]
+pub const LEGACY_LOOM_HOOK_PREFIX: &str = ".loom/hooks/";
+
+/// Returns true if a command string belongs to Loom (matches new or legacy prefix).
+#[allow(dead_code)]
+fn is_loom_hook_command(cmd: &str) -> bool {
+    cmd.starts_with(LOOM_HOOK_PREFIX) || cmd.starts_with(LEGACY_LOOM_HOOK_PREFIX)
+}
 
 /// Loom section markers for CLAUDE.md content preservation
 pub const LOOM_SECTION_START: &str = "<!-- BEGIN LOOM ORCHESTRATION -->";
@@ -126,6 +141,10 @@ fn merge_hooks(
 }
 
 /// Merge hook commands within a single matcher entry, deduplicating by command path.
+///
+/// Also strips legacy Loom hook entries (bare `.loom/hooks/...` paths from pre-3265
+/// installs) so that re-running install does not leave duplicate hook invocations
+/// alongside the new `${CLAUDE_PROJECT_DIR}/.loom/hooks/...` entries.
 fn merge_hook_commands(existing_entry: &mut Value, loom_entry: &Value) {
     let Some(existing_hooks) = existing_entry
         .get_mut("hooks")
@@ -137,6 +156,14 @@ fn merge_hook_commands(existing_entry: &mut Value, loom_entry: &Value) {
     let Some(loom_hooks) = loom_entry.get("hooks").and_then(|h| h.as_array()) else {
         return;
     };
+
+    // First, strip legacy bare-relative Loom hooks so they don't coexist with the
+    // new ${CLAUDE_PROJECT_DIR}-prefixed versions. We only strip the *legacy* prefix
+    // here -- new-prefix entries are kept and serve as the dedup signal below.
+    existing_hooks.retain(|h| {
+        let cmd = h.get("command").and_then(|c| c.as_str()).unwrap_or("");
+        !cmd.starts_with(LEGACY_LOOM_HOOK_PREFIX) || cmd.starts_with(LOOM_HOOK_PREFIX)
+    });
 
     // Collect existing command paths for dedup
     let existing_commands: std::collections::HashSet<String> = existing_hooks
@@ -189,7 +216,11 @@ fn merge_permissions(
 
 /// Remove Loom-owned hooks from a settings.json value.
 ///
-/// Loom hooks are identified by command paths starting with `.loom/hooks/`.
+/// Loom hooks are identified by command paths starting with either the new
+/// `${CLAUDE_PROJECT_DIR}/.loom/hooks/` prefix or the legacy `.loom/hooks/`
+/// prefix (pre-3265 installs). Both are stripped so uninstall is clean for
+/// users on any prior version.
+///
 /// After removal, empty matcher entries and empty hook type arrays are cleaned up.
 #[allow(dead_code)]
 pub fn remove_loom_hooks(settings: &mut Value) {
@@ -212,7 +243,7 @@ pub fn remove_loom_hooks(settings: &mut Value) {
             {
                 hook_arr.retain(|hook| {
                     let cmd = hook.get("command").and_then(|c| c.as_str()).unwrap_or("");
-                    !cmd.starts_with(LOOM_HOOK_PREFIX)
+                    !is_loom_hook_command(cmd)
                 });
             }
         }
@@ -1331,7 +1362,56 @@ WARNING: Never run `lake build` inside Docker - causes memory corruption.
 
     #[test]
     fn test_merge_settings_deduplicates_hooks() {
-        // When project already has the Loom hook, don't add it again
+        // When project already has the new-prefix Loom hook, don't add it again
+        let existing: serde_json::Value = serde_json::from_str(
+            r#"{
+            "hooks": {
+                "PreToolUse": [{
+                    "matcher": "Bash",
+                    "hooks": [
+                        {"type": "command", "command": "${CLAUDE_PROJECT_DIR}/.loom/hooks/guard-destructive.sh"},
+                        {"type": "command", "command": ".claude/hooks/custom-bash-guard.sh"}
+                    ]
+                }]
+            }
+        }"#,
+        )
+        .unwrap();
+
+        let loom_defaults: serde_json::Value = serde_json::from_str(
+            r#"{
+            "hooks": {
+                "PreToolUse": [{
+                    "matcher": "Bash",
+                    "hooks": [{"type": "command", "command": "${CLAUDE_PROJECT_DIR}/.loom/hooks/guard-destructive.sh"}]
+                }]
+            }
+        }"#,
+        )
+        .unwrap();
+
+        let merged = merge_settings_json(&existing, &loom_defaults);
+
+        // Should not duplicate the Loom hook
+        let bash_hooks = &merged["hooks"]["PreToolUse"][0]["hooks"];
+        let hooks_arr = bash_hooks.as_array().unwrap();
+        assert_eq!(hooks_arr.len(), 2, "Should not duplicate existing Loom hook");
+
+        // Both hooks should still be present
+        let commands: Vec<&str> = hooks_arr
+            .iter()
+            .map(|h| h["command"].as_str().unwrap())
+            .collect();
+        assert!(commands.contains(&"${CLAUDE_PROJECT_DIR}/.loom/hooks/guard-destructive.sh"));
+        assert!(commands.contains(&".claude/hooks/custom-bash-guard.sh"));
+    }
+
+    #[test]
+    fn test_merge_settings_migrates_legacy_hooks() {
+        // Pre-3265 installs have bare-relative `.loom/hooks/...` entries.
+        // On re-install, the merge must strip the legacy entry and add the new
+        // `${CLAUDE_PROJECT_DIR}/.loom/hooks/...` entry so the result has no
+        // duplicate invocations.
         let existing: serde_json::Value = serde_json::from_str(
             r#"{
             "hooks": {
@@ -1352,7 +1432,7 @@ WARNING: Never run `lake build` inside Docker - causes memory corruption.
             "hooks": {
                 "PreToolUse": [{
                     "matcher": "Bash",
-                    "hooks": [{"type": "command", "command": ".loom/hooks/guard-destructive.sh"}]
+                    "hooks": [{"type": "command", "command": "${CLAUDE_PROJECT_DIR}/.loom/hooks/guard-destructive.sh"}]
                 }]
             }
         }"#,
@@ -1361,18 +1441,33 @@ WARNING: Never run `lake build` inside Docker - causes memory corruption.
 
         let merged = merge_settings_json(&existing, &loom_defaults);
 
-        // Should not duplicate the Loom hook
         let bash_hooks = &merged["hooks"]["PreToolUse"][0]["hooks"];
         let hooks_arr = bash_hooks.as_array().unwrap();
-        assert_eq!(hooks_arr.len(), 2, "Should not duplicate existing Loom hook");
 
-        // Both hooks should still be present
         let commands: Vec<&str> = hooks_arr
             .iter()
             .map(|h| h["command"].as_str().unwrap())
             .collect();
-        assert!(commands.contains(&".loom/hooks/guard-destructive.sh"));
+
+        // Legacy bare-relative entry must be stripped
+        assert!(
+            !commands.contains(&".loom/hooks/guard-destructive.sh"),
+            "Legacy bare-relative hook should be removed during merge"
+        );
+        // New prefix entry must be present
+        assert!(
+            commands.contains(&"${CLAUDE_PROJECT_DIR}/.loom/hooks/guard-destructive.sh"),
+            "New ${{CLAUDE_PROJECT_DIR}}-prefixed hook must be added"
+        );
+        // Custom project hook must be preserved
         assert!(commands.contains(&".claude/hooks/custom-bash-guard.sh"));
+
+        // Exactly 2 entries: new Loom hook + custom project hook (no duplicate)
+        assert_eq!(
+            hooks_arr.len(),
+            2,
+            "Should have exactly 2 hooks: new Loom hook + custom project hook"
+        );
     }
 
     #[test]
