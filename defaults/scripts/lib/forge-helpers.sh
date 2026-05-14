@@ -305,7 +305,9 @@ forge_delete_branch() {
 
 # Enable auto-merge on a PR.
 # Usage: forge_auto_merge NWO PR_NUMBER
-# GitHub: gh pr merge --auto --squash --delete-branch
+# GitHub: GraphQL enablePullRequestAutoMerge mutation (pure API, no
+#         working-tree dependency — `gh pr merge --auto` does a local
+#         checkout that collides with worktrees owning the head branch).
 # Gitea: POST /repos/{owner}/{repo}/pulls/{n}/merge with merge_when_checks_succeed
 forge_auto_merge() {
   local nwo="$1"
@@ -316,7 +318,17 @@ forge_auto_merge() {
     gitea_api POST "repos/$FORGE_OWNER/$FORGE_REPO/pulls/$pr_number/merge" \
       -d '{"Do":"squash","merge_when_checks_succeed":true,"delete_branch_after_merge":true}'
   else
-    gh pr merge "$pr_number" --auto --squash --delete-branch 2>/dev/null
+    # Resolve PR node_id (required by GraphQL mutation).
+    local node_id
+    node_id=$(gh api "repos/$nwo/pulls/$pr_number" --jq '.node_id' 2>/dev/null) || return 1
+    [[ -z "$node_id" ]] && return 1
+
+    local mutation='mutation($pullRequestId: ID!, $mergeMethod: PullRequestMergeMethod!) { enablePullRequestAutoMerge(input: {pullRequestId: $pullRequestId, mergeMethod: $mergeMethod}) { pullRequest { number autoMergeRequest { enabledAt } } } }'
+
+    gh api graphql \
+      -f "query=$mutation" \
+      -F "pullRequestId=$node_id" \
+      -F "mergeMethod=SQUASH" 2>/dev/null
   fi
 }
 

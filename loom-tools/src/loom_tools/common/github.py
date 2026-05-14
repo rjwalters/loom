@@ -505,18 +505,73 @@ class GitHubForge:
     ) -> bool:
         """Enable GitHub's native auto-merge for a PR.
 
-        Delegates to ``gh pr merge --auto`` which queues the merge
-        until all required checks pass. The ``poll_interval`` and
-        ``timeout`` parameters are ignored (GitHub handles polling
-        server-side).
+        Uses the GraphQL ``enablePullRequestAutoMerge`` mutation instead
+        of ``gh pr merge --auto`` to avoid the working-tree checkout that
+        the CLI performs. The CLI variant fails with
+        ``'<branch>' is already used by worktree at ...`` when invoked
+        from inside a worktree whose branch matches the PR head. The
+        GraphQL mutation is a pure API call with no working-tree
+        dependency.
+
+        The ``poll_interval`` and ``timeout`` parameters are ignored
+        (GitHub handles polling server-side).
         """
-        args = [
-            "pr", "merge", str(number),
-            "--auto", f"--{method}", "--delete-branch",
-        ]
-        result = gh_run(args, check=False, cwd=self._cwd)
+        nwo = get_repo_nwo(self._cwd)
+        if not nwo:
+            logger.warning(
+                "Failed to enable auto-merge for PR #%d: could not "
+                "resolve repository NWO",
+                number,
+            )
+            return False
+
+        # Step 1: Look up the PR's GraphQL node_id (required by the
+        # mutation). REST returns `node_id` in the PR object.
+        owner, _, repo = nwo.partition("/")
+        node_id_result = gh_run(
+            [
+                "api",
+                f"repos/{owner}/{repo}/pulls/{number}",
+                "--jq", ".node_id",
+            ],
+            check=False, cwd=self._cwd,
+        )
+        if node_id_result.returncode != 0 or not node_id_result.stdout.strip():
+            logger.warning(
+                "Failed to enable auto-merge for PR #%d: "
+                "could not fetch node_id: %s",
+                number,
+                (node_id_result.stderr or node_id_result.stdout or "").strip(),
+            )
+            return False
+        node_id = node_id_result.stdout.strip()
+
+        # Step 2: Enable auto-merge via GraphQL.
+        # mergeMethod must be uppercase (SQUASH, MERGE, REBASE).
+        merge_method = method.upper()
+        mutation = (
+            "mutation($pullRequestId: ID!, $mergeMethod: PullRequestMergeMethod!) {"
+            "  enablePullRequestAutoMerge(input: {"
+            "    pullRequestId: $pullRequestId,"
+            "    mergeMethod: $mergeMethod"
+            "  }) {"
+            "    pullRequest { number autoMergeRequest { enabledAt } }"
+            "  }"
+            "}"
+        )
+        result = gh_run(
+            [
+                "api", "graphql",
+                "-f", f"query={mutation}",
+                "-F", f"pullRequestId={node_id}",
+                "-F", f"mergeMethod={merge_method}",
+            ],
+            check=False, cwd=self._cwd,
+        )
         if result.returncode == 0:
-            logger.info("Auto-merge enabled for PR #%d (GitHub)", number)
+            logger.info(
+                "Auto-merge enabled for PR #%d (GitHub, GraphQL)", number,
+            )
             return True
         logger.warning(
             "Failed to enable auto-merge for PR #%d: %s",

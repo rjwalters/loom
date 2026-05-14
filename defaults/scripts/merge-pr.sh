@@ -134,29 +134,95 @@ info "Merging PR #$PR_NUMBER: $PR_TITLE"
 info "Branch: $PR_BRANCH"
 
 # Handle auto-merge mode
+#
+# The auto-merge path now mirrors the sync path's resilience patterns:
+#   - Retry on "Base branch was modified" with the same backoff loop.
+#   - Recheck PR state on failure (concurrent shepherd may have already
+#     merged it).
+#   - Fall through to the shared cleanup block (lines below) instead of
+#     exiting early. Cleanup is gated on `PR.merged == true`; if the
+#     server-side merge is still queued, we skip local cleanup and let
+#     loom-clean handle it.
+#
+# See issue #3279.
 if [[ "$AUTO_MERGE" == "true" ]]; then
   if [[ "$DRY_RUN" == "true" ]]; then
     info "[dry-run] Would enable auto-merge for PR #$PR_NUMBER"
     exit 0
   fi
-  # Prefer loom-auto-merge CLI (forge-agnostic, with poll-and-merge for Gitea)
-  if command -v loom-auto-merge &>/dev/null; then
-    info "Using loom-auto-merge (forge-agnostic auto-merge)"
-    if loom-auto-merge "$PR_NUMBER" --method squash; then
-      success "Auto-merge completed for PR #$PR_NUMBER"
-      exit 0
+
+  MAX_MERGE_RETRIES=3
+  MERGE_RETRY_DELAY=5
+  AUTO_MERGE_OK=false
+
+  for MERGE_ATTEMPT in $(seq 1 $MAX_MERGE_RETRIES); do
+    AUTO_MERGE_OUTPUT=""
+    # Prefer loom-auto-merge CLI (forge-agnostic, with poll-and-merge for Gitea)
+    if command -v loom-auto-merge &>/dev/null; then
+      [[ $MERGE_ATTEMPT -eq 1 ]] && info "Using loom-auto-merge (forge-agnostic auto-merge)"
+      if AUTO_MERGE_OUTPUT=$(loom-auto-merge "$PR_NUMBER" --method squash 2>&1); then
+        AUTO_MERGE_OK=true
+        break
+      fi
     else
-      error "Failed to auto-merge PR #$PR_NUMBER"
+      # Fallback: shell-based forge_auto_merge
+      if AUTO_MERGE_OUTPUT=$(forge_auto_merge "$REPO_NWO" "$PR_NUMBER" 2>&1); then
+        AUTO_MERGE_OK=true
+        break
+      fi
     fi
+
+    # Check if PR merged despite error (concurrent merge by another shepherd)
+    RECHECK_JSON=$(forge_get_pr_nocache "$REPO_NWO" "$PR_NUMBER" "$GH" 2>/dev/null || echo '{}')
+    RECHECK=$(echo "$RECHECK_JSON" | jq -r '.merged // false')
+    if [[ "$RECHECK" == "true" ]]; then
+      warning "Auto-merge reported error but PR is already merged (race condition)"
+      AUTO_MERGE_OK=true
+      break
+    fi
+
+    # Retry on stale-branch race ("Base branch was modified")
+    if echo "$AUTO_MERGE_OUTPUT" | grep -q "Base branch was modified"; then
+      if [[ $MERGE_ATTEMPT -lt $MAX_MERGE_RETRIES ]]; then
+        info "Branch is behind base branch, updating... (attempt $MERGE_ATTEMPT/$MAX_MERGE_RETRIES)"
+        forge_update_branch "$REPO_NWO" "$PR_NUMBER" 2>/dev/null || \
+          warning "Failed to update branch (continuing anyway)"
+        info "Waiting ${MERGE_RETRY_DELAY}s for branch to sync..."
+        sleep "$MERGE_RETRY_DELAY"
+        MERGE_RETRY_DELAY=$((MERGE_RETRY_DELAY * 2))
+        continue
+      fi
+    fi
+
+    # Other auto-merge errors — fail immediately (no retry would help)
+    error "Failed to enable auto-merge for PR #$PR_NUMBER: $AUTO_MERGE_OUTPUT"
+  done
+
+  if [[ "$AUTO_MERGE_OK" != "true" ]]; then
+    error "Failed to enable auto-merge for PR #$PR_NUMBER after $MAX_MERGE_RETRIES attempts"
   fi
-  # Fallback: shell-based forge_auto_merge
-  if forge_auto_merge "$REPO_NWO" "$PR_NUMBER" 2>/dev/null; then
-    success "Auto-merge enabled for PR #$PR_NUMBER"
+
+  success "Auto-merge enabled for PR #$PR_NUMBER"
+
+  # Check whether the server-side merge has already completed. GitHub
+  # auto-merge queues until checks pass, so on most PRs this is still
+  # false right after enabling. If merged, fall through to the shared
+  # cleanup block below. Otherwise skip cleanup — loom-clean will
+  # handle the stale worktree later.
+  POST_AUTO_JSON=$(forge_get_pr_nocache "$REPO_NWO" "$PR_NUMBER" "$GH" 2>/dev/null || echo '{}')
+  POST_AUTO_MERGED=$(echo "$POST_AUTO_JSON" | jq -r '.merged // false')
+  if [[ "$POST_AUTO_MERGED" != "true" ]]; then
+    info "Auto-merge queued (server-side merge pending checks); skipping local cleanup"
+    info "Run loom-clean later to remove the worktree once GitHub completes the merge"
     exit 0
-  else
-    error "Failed to enable auto-merge for PR #$PR_NUMBER"
   fi
+  info "PR #$PR_NUMBER already merged server-side; running cleanup"
+  # Fall through to the shared cleanup block (branch deletion + worktree).
 fi
+
+# Synchronous-merge path. Skipped when --auto already succeeded server-side
+# (in which case we fall through to the shared cleanup block below).
+if [[ "$AUTO_MERGE" != "true" ]]; then
 
 # Check mergeability
 if [[ "$PR_MERGEABLE" == "false" ]]; then
@@ -235,6 +301,8 @@ if [[ "$VERIFY_MERGED" != "true" ]]; then
 fi
 
 success "PR #$PR_NUMBER merged successfully"
+
+fi  # end synchronous-merge path (AUTO_MERGE != "true")
 
 # NOTE: Label cleanup on linked issues is intentionally skipped.
 # Labels on closed/merged items are harmless — all agents filter by open state.
