@@ -513,12 +513,30 @@ If you need to clean up worktrees:
 # Create worktree for issue
 ./.loom/scripts/worktree.sh 42
 
+# Cone-mode sparse checkout - materialize only listed paths + safety set
+# Useful in large monorepos to keep per-worktree disk usage small
+./.loom/scripts/worktree.sh 42 --sparse src/lib defaults/scripts
+
+# Convert a sparse worktree back to a full checkout
+./.loom/scripts/worktree.sh 42 --full
+
 # Check if you're in a worktree
 ./.loom/scripts/worktree.sh --check
 
 # Show help
 ./.loom/scripts/worktree.sh --help
 ```
+
+**Sparse-Mode Notes**:
+- `--sparse` and `--full` are mutually exclusive
+- `--sparse` requires at least one path
+- Always-included safety set: `.claude/`, `.loom/`, `.githooks/`, `scripts/`,
+  plus all tracked top-level files (extend via `LOOM_WORKTREE_ALWAYS_INCLUDE`)
+- Sparse-checkout config is written to the per-worktree config only, never to
+  shared `.git/config` (prevents the stale-config trap from breaking
+  `actions/checkout` on self-hosted runners)
+- Re-running `--sparse` is idempotent: same cone is a no-op, different cone
+  replaces the cone; `--full` on an already-full worktree is also a no-op
 
 ## Development Workflow
 
