@@ -116,6 +116,35 @@ gh issue list --label="loom:issue" --state=open --json number,title,labels \
 
 **Why prioritize these**: Human already approved the concept, Curator adds technical detail before Builder starts.
 
+### Re-curating Approved Issues
+
+Use this playbook when refreshing an already-approved (`loom:issue`) issue against current `main` — e.g., stale file refs, dependent fixes have merged, or scope drift needs clarification.
+
+**Default behavior** (recommended unless the four questions below indicate otherwise):
+
+1. **Retain `loom:issue`** — Do not remove human approval for non-material updates.
+2. **Add `loom:curated`** — Signals "fresh enrichment against current main is available." `loom:curated` is *additive*, not exclusive; it coexists with `loom:issue`. Builders prioritize `loom:issue` + `loom:curated` over `loom:issue` alone, so re-curation has direct downstream impact on Builder selection.
+3. **Prefer body edits over comments for stale references** — Keep the body as the single source of truth for Builders. Use a dated curator comment summarizing what changed (e.g., "Refreshed file refs after #NNNN merged on YYYY-MM-DD").
+4. **For material scope changes** — When you rewrite the problem statement, re-narrow root cause, or change acceptance criteria materially, remove `loom:issue` and leave only `loom:curated`. This forces fresh human re-approval.
+
+**The four decision questions** (use these to deviate from the default):
+
+| Question | Default | Deviate when |
+|----------|---------|--------------|
+| Retain `loom:issue`? | Yes | Material scope or AC change |
+| (Re-)add `loom:curated`? | Always yes | Never skip |
+| Comment vs body edit? | Body edit + dated comment | Pure context/links → comment |
+| Substantive rewrite? | Drop `loom:issue`, keep `loom:curated` | Minor refresh → keep both |
+
+**Discovery query** — find approved issues that haven't been re-curated recently:
+
+```bash
+# Approved issues missing fresh curation
+gh issue list --label="loom:issue" --state=open --json number,title,labels,updatedAt \
+  --jq '.[] | select(([.labels[].name] | contains(["loom:curated"]) | not)) |
+  "#\(.number) (updated \(.updatedAt)): \(.title)"'
+```
+
 ### Priority 2: Unlabeled Issues (Fallback)
 
 If no Priority 1 issues exist, find unlabeled issues:
