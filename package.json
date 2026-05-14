@@ -81,19 +81,19 @@
     "zod": "^4.4.2"
   },
   "devDependencies": {
-    "@biomejs/biome": "^2.4.13",
-    "@playwright/test": "^1.59.1",
-    "@tailwindcss/postcss": "^4.2.4",
-    "@tauri-apps/cli": "^2.10.1",
-    "@vitest/coverage-v8": "^4.1.5",
-    "@vitest/ui": "^4.1.5",
+    "@biomejs/biome": "^2.4.15",
+    "@playwright/test": "^1.60.0",
+    "@tailwindcss/postcss": "^4.3.0",
+    "@tauri-apps/cli": "^2.11.1",
+    "@vitest/coverage-v8": "^4.1.6",
+    "@vitest/ui": "^4.1.6",
     "autoprefixer": "^10.5.0",
     "happy-dom": "^20.9.0",
-    "postcss": "^8.5.12",
-    "tailwindcss": "^4.2.4",
+    "postcss": "^8.5.14",
+    "tailwindcss": "^4.3.0",
     "typescript": "^6.0.3",
-    "vite": "^8.0.10",
-    "vitest": "^4.1.5"
+    "vite": "^8.0.13",
+    "vitest": "^4.1.6"
   },
   "pnpm": {
     "overrides": {
