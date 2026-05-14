@@ -973,7 +973,11 @@ if [[ -f "$WORKTREE_ABS/.claude/settings.json" ]]; then
     # and Loom permissions (exact matches from defaults)
 
     # Build jq filter to remove Loom hooks
-    # Step 1: Remove hooks with .loom/hooks/ command prefix
+    # Step 1: Remove hooks whose command starts with the new Loom prefix
+    #         (${CLAUDE_PROJECT_DIR}/.loom/hooks/) OR the legacy bare-relative
+    #         prefix (.loom/hooks/) from pre-3265 installs. Both must be
+    #         stripped so uninstall is clean regardless of when Loom was first
+    #         installed.
     # Step 2: Clean up empty matcher entries and hook types
     # Step 3: Remove Loom-specific permissions
     LOOM_PERMS=$(jq -r '.permissions.allow // [] | .[]' "$LOOM_DEFAULTS_SETTINGS" 2>/dev/null)
@@ -991,13 +995,26 @@ if [[ -f "$WORKTREE_ABS/.claude/settings.json" ]]; then
       fi
     done <<< "$LOOM_PERMS"
 
-    # Apply the combined jq transformation
-    jq --arg hook_prefix ".loom/hooks/" "
-      # Remove Loom hooks (commands starting with .loom/hooks/)
+    # Apply the combined jq transformation.
+    #
+    # Note: $hook_prefix is the new Loom prefix, which contains the literal
+    # string '${CLAUDE_PROJECT_DIR}'. We single-quote the value passed to
+    # --arg so bash does NOT expand the variable -- the shell's
+    # $CLAUDE_PROJECT_DIR is unset/empty in this context, and we need the
+    # literal string preserved so jq's startswith check matches the
+    # template-installed entries verbatim.
+    jq --arg hook_prefix '${CLAUDE_PROJECT_DIR}/.loom/hooks/' \
+       --arg legacy_hook_prefix '.loom/hooks/' "
+      # Remove Loom hooks (commands starting with either the new prefix or
+      # the legacy bare-relative prefix from pre-3265 installs)
       (if .hooks then
         .hooks |= with_entries(
           .value |= map(
-            .hooks |= map(select(.command | startswith(\$hook_prefix) | not))
+            .hooks |= map(select(
+              (.command | startswith(\$hook_prefix))
+              or (.command | startswith(\$legacy_hook_prefix))
+              | not
+            ))
           )
           | .value |= map(select(.hooks | length > 0))
         )

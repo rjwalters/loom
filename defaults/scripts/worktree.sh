@@ -779,11 +779,23 @@ if _try_worktree_add; then
 
     # Initialize submodules with reference to main workspace (for object sharing)
     # This is much faster than downloading from network and saves disk space.
+    #
     # In sparse mode, `git submodule status` already lists only submodules
     # whose path lies inside the materialized cone -- so this loop naturally
     # filters out out-of-cone submodules without extra logic.
+    #
+    # Uses --recursive to handle nested submodules (a top-level submodule may
+    # itself declare submodules; without --recursive those remain empty and a
+    # builder sees a half-populated reference directory with no error).
+    # Timeout is generous (300s) because cold clones of large reference corpora
+    # without an object cache can legitimately exceed 30s. Override via
+    # LOOM_SUBMODULE_TIMEOUT.
+    # Stderr is preserved (not redirected to /dev/null) so the underlying git
+    # error is visible to whoever runs worktree.sh -- the previous "Some
+    # submodules failed to initialize" warning was a black box.
     MAIN_GIT_DIR=$(git rev-parse --git-common-dir 2>/dev/null)
     UNINIT_SUBMODULES=$(cd "$ABS_WORKTREE_PATH" && git submodule status 2>/dev/null | grep '^-' | wc -l | tr -d ' ')
+    SUBMODULE_TIMEOUT="${LOOM_SUBMODULE_TIMEOUT:-300}"
 
     if [[ "$UNINIT_SUBMODULES" -gt 0 ]]; then
         if [[ "$JSON_OUTPUT" != "true" ]]; then
@@ -798,12 +810,12 @@ if _try_worktree_add; then
 
             if [[ -d "$ref_path" ]]; then
                 # Use reference to share objects with main workspace (fast, no network)
-                if ! timeout 30 git submodule update --init --reference "$ref_path" -- "$submod_path" 2>/dev/null; then
+                if ! timeout "$SUBMODULE_TIMEOUT" git submodule update --init --recursive --reference "$ref_path" -- "$submod_path"; then
                     echo "SUBMODULE_FAILED" > /tmp/loom-submodule-status-$$
                 fi
             else
                 # No reference available, initialize normally (may need network)
-                if ! timeout 30 git submodule update --init -- "$submod_path" 2>/dev/null; then
+                if ! timeout "$SUBMODULE_TIMEOUT" git submodule update --init --recursive -- "$submod_path"; then
                     echo "SUBMODULE_FAILED" > /tmp/loom-submodule-status-$$
                 fi
             fi
@@ -814,6 +826,7 @@ if _try_worktree_add; then
             rm -f "/tmp/loom-submodule-status-$$"
             if [[ "$JSON_OUTPUT" != "true" ]]; then
                 print_warning "Some submodules failed to initialize (worktree still created)"
+                print_info "See stderr above for the underlying git error."
                 print_info "You may need to run: git submodule update --init --recursive"
             fi
         else

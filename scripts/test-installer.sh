@@ -323,6 +323,42 @@ else
   fail ".claude/settings.json missing"
 fi
 
+# Test 12b: Hook commands use ${CLAUDE_PROJECT_DIR} prefix (issue #3265)
+# Hooks must use ${CLAUDE_PROJECT_DIR}/.loom/hooks/... so they resolve regardless
+# of the agent's current working directory. Bare-relative paths fail when the
+# session cwd has moved into a subdirectory.
+echo "Test 12b: Hook commands use \${CLAUDE_PROJECT_DIR} prefix"
+SETTINGS_FILE="$INSTALL_REPO/.claude/settings.json"
+if [[ -f "$SETTINGS_FILE" ]] && command -v jq &> /dev/null; then
+  HOOK_PREFIX_FAIL=0
+  for hook_name in guard-destructive.sh skill-router.sh methodology-inject.sh; do
+    # Collect every command in the settings.json that ends with this hook script.
+    matches=$(jq -r --arg name "$hook_name" \
+      '[.. | objects | select(.command? != null) | .command | select(endswith($name))][]' \
+      "$SETTINGS_FILE" 2>/dev/null)
+    if [[ -z "$matches" ]]; then
+      fail "Hook command for $hook_name not found in settings.json"
+      HOOK_PREFIX_FAIL=1
+      continue
+    fi
+    while IFS= read -r cmd; do
+      [[ -z "$cmd" ]] && continue
+      # The literal string '${CLAUDE_PROJECT_DIR}' must appear at the start
+      # (not the expanded value -- the JSON stores the placeholder verbatim
+      # and Claude Code expands it at hook-invocation time).
+      if [[ "$cmd" != '${CLAUDE_PROJECT_DIR}/.loom/hooks/'* ]]; then
+        fail "Hook command does not use \${CLAUDE_PROJECT_DIR} prefix: $cmd"
+        HOOK_PREFIX_FAIL=1
+      fi
+    done <<< "$matches"
+  done
+  if [[ $HOOK_PREFIX_FAIL -eq 0 ]]; then
+    pass "All Loom hook commands use \${CLAUDE_PROJECT_DIR} prefix"
+  fi
+else
+  fail "Cannot verify hook command prefixes (settings.json or jq missing)"
+fi
+
 # Test 13: .github/labels.yml
 echo "Test 13: Install creates .github/labels.yml"
 if [[ -f "$INSTALL_REPO/.github/labels.yml" ]]; then
