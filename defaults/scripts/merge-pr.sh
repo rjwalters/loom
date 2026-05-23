@@ -36,6 +36,56 @@ info() { echo -e "${BLUE}$*${NC}"; }
 success() { echo -e "${GREEN}$*${NC}"; }
 warning() { echo -e "${YELLOW}$*${NC}"; }
 
+# Function to show help
+show_help() {
+    cat << EOF
+Loom PR Merge - Worktree-safe merge using forge API (GitHub or Gitea)
+
+Usage: ./.loom/scripts/merge-pr.sh <pr-number> [options]
+
+Merges a PR via the forge API (not 'gh pr merge') to avoid
+"already used by worktree" errors when merging from inside a worktree.
+
+Supports both GitHub and Gitea forges. Forge detection is automatic
+(see forge-helpers.sh for details).
+
+Options:
+  --no-cleanup-worktree  Skip local worktree cleanup after merge
+  --cleanup-worktree     (no-op, worktree cleanup is now the default)
+  --dry-run              Show what would happen without merging
+  --auto                 Enable auto-merge instead of immediate merge
+  -h, --help             Show this help and exit
+
+By default, the local worktree is cleaned up after a successful merge.
+Pass --no-cleanup-worktree to skip this (e.g., when other terminals may
+have their CWD inside the worktree).
+
+Exit codes:
+  0 = merged (or auto-merge enabled, or --help)
+  1 = failed
+
+Examples:
+  ./.loom/scripts/merge-pr.sh 123
+    Merges PR #123 (squash), deletes remote branch, cleans up worktree
+
+  ./.loom/scripts/merge-pr.sh 123 --dry-run
+    Shows what would happen without merging
+
+  ./.loom/scripts/merge-pr.sh 123 --auto
+    Enables auto-merge instead of merging immediately
+
+  ./.loom/scripts/merge-pr.sh 123 --no-cleanup-worktree
+    Merges PR but leaves the local worktree in place
+EOF
+}
+
+# Early help check — runs before any git/forge initialization so --help works
+# in any directory and without forge authentication.
+if [[ $# -gt 0 ]] && { [[ "$1" == "--help" ]] || [[ "$1" == "-h" ]]; }; then
+    show_help
+    exit 0
+fi
+
 # Find the main repository root (works from worktrees too)
 # When run from a worktree, git rev-parse --show-toplevel returns the worktree path,
 # not the main repository. This function navigates via the gitdir to find the actual root.
