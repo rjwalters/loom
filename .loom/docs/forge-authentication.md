@@ -98,6 +98,53 @@ curl -s -H "Authorization: token $GITEA_TOKEN" \
   https://your-instance/api/v1/repos/owner/repo/issues?limit=1 | jq '.[0].title'
 ```
 
+### Basic Auth Mode (token-less Gitea instances)
+
+Some self-hosted Gitea deployments (cleanroom mirrors, air-gapped environments, locked-down corporate instances) disable the personal-access-token UI and only expose username/password authentication. For those instances, Loom supports HTTP Basic Auth.
+
+Set `GITEA_USERNAME` to switch into Basic Auth mode. The password is taken from the existing `GITEA_TOKEN` (or `FORGE_TOKEN`) variable -- the field is reused so existing config schemas keep working.
+
+```bash
+export GITEA_USERNAME=sphere
+export GITEA_TOKEN='<your-gitea-password>'    # password goes here in Basic mode
+```
+
+Or in `.loom/config.json`:
+
+```json
+{
+  "forge": {
+    "type": "gitea",
+    "gitea": {
+      "url": "https://cleanroom-gitea.example.com",
+      "username": "sphere",
+      "token": "<password>"
+    }
+  }
+}
+```
+
+**Precedence**:
+1. If `GITEA_USERNAME` (env) or `forge.gitea.username` (config) is set, Loom uses HTTP Basic Auth (`Authorization: Basic base64(user:pass)`).
+2. Otherwise, Loom uses token auth (`Authorization: token <T>`).
+3. Env vars take precedence over `.loom/config.json` in both modes.
+
+**HTTPS requirement (security guard)**: Loom refuses to start in Basic Auth mode against an `http://` URL because HTTP Basic Auth only base64-encodes the password -- sending it in plaintext leaks the credential on the wire. The error message is:
+
+> Gitea Basic Auth requires HTTPS to avoid leaking credentials. Set forge.gitea.url to an https:// URL, or set LOOM_ALLOW_INSECURE_BASIC_AUTH=1 to override (not recommended).
+
+For air-gapped LAN deployments where TLS is genuinely unavailable, you can override the guard:
+
+```bash
+export LOOM_ALLOW_INSECURE_BASIC_AUTH=1
+```
+
+This is **not** recommended outside isolated networks. Anyone with access to the network segment can read the password.
+
+**Restrictions**:
+- The username cannot contain a colon (`:`). RFC 7617 disallows it because the colon is the user/password separator.
+- The password (taken from `token`) may contain any characters -- it is properly handled by `curl -u` and by the Python `requests` library.
+
 ### Gitea Instance URL
 
 Loom auto-detects the Gitea API URL from your git remote. For HTTPS remotes like `https://gitea.example.com/owner/repo.git`, the API base URL is `https://gitea.example.com/api/v1`.

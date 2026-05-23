@@ -9,9 +9,15 @@
 #   forge_detect   # sets FORGE_TYPE to "github" or "gitea"
 #
 # Environment Variables:
-#   LOOM_FORGE_TYPE  - Override forge detection ("github" or "gitea")
-#   GITEA_TOKEN      - API token for Gitea authentication
-#   GITEA_URL        - Base URL for Gitea instance (e.g. "https://gitea.example.com")
+#   LOOM_FORGE_TYPE              - Override forge detection ("github" or "gitea")
+#   GITEA_TOKEN                  - API token / password for Gitea authentication
+#   GITEA_URL                    - Base URL for Gitea instance (e.g. "https://gitea.example.com")
+#   GITEA_USERNAME               - If set, use HTTP Basic Auth (username + password)
+#                                  instead of token auth. Password is taken from
+#                                  GITEA_TOKEN. Requires an https:// URL unless
+#                                  LOOM_ALLOW_INSECURE_BASIC_AUTH=1.
+#   LOOM_ALLOW_INSECURE_BASIC_AUTH - Set to 1 to permit Basic Auth over http://
+#                                    (not recommended; for air-gapped LAN only).
 #
 # Forge detection priority:
 #   1. LOOM_FORGE_TYPE env var
@@ -27,6 +33,7 @@ set -euo pipefail
 FORGE_TYPE=""
 _GITEA_BASE_URL=""
 _GITEA_TOKEN=""
+_GITEA_USERNAME=""
 
 # Detect forge type from environment, config, or remote URL.
 # Sets FORGE_TYPE to "github" or "gitea".
@@ -115,13 +122,16 @@ _extract_host() {
   echo ""
 }
 
-# Load Gitea configuration (URL and token)
+# Load Gitea configuration (URL, token/password, and optional username for Basic Auth)
 _load_gitea_config() {
   # Token: env var first, then config
   _GITEA_TOKEN="${GITEA_TOKEN:-}"
 
   # URL: env var first, then config
   _GITEA_BASE_URL="${GITEA_URL:-}"
+
+  # Username: env var first, then config. When set, switches to HTTP Basic Auth.
+  _GITEA_USERNAME="${GITEA_USERNAME:-}"
 
   local config_file
   if [[ -n "${REPO_ROOT:-}" ]]; then
@@ -139,9 +149,37 @@ _load_gitea_config() {
     if [[ -z "$_GITEA_BASE_URL" ]]; then
       _GITEA_BASE_URL=$(jq -r '.forge.gitea.url // ""' "$config_file" 2>/dev/null || echo "")
     fi
+    if [[ -z "$_GITEA_USERNAME" ]]; then
+      _GITEA_USERNAME=$(jq -r '.forge.gitea.username // ""' "$config_file" 2>/dev/null || echo "")
+    fi
   fi
 
   _GITEA_BASE_URL="${_GITEA_BASE_URL%/}"  # strip trailing slash
+}
+
+# Validate the Gitea Basic Auth configuration. Refuses http:// URLs when a
+# username is set (since Basic Auth over plaintext would leak the password)
+# unless LOOM_ALLOW_INSECURE_BASIC_AUTH=1 is explicitly exported.
+# Returns 0 if the configuration is safe to use, 1 (with stderr message) otherwise.
+# Does not log the password or username.
+_gitea_validate_basic_auth() {
+  if [[ -z "$_GITEA_USERNAME" ]]; then
+    return 0
+  fi
+  # Username with ':' would corrupt the Basic-Auth user:pass split (RFC 7617).
+  if [[ "$_GITEA_USERNAME" == *:* ]]; then
+    echo "Error: GITEA_USERNAME may not contain ':' (HTTP Basic Auth disallows colons in usernames)." >&2
+    return 1
+  fi
+  if [[ "$_GITEA_BASE_URL" == http://* ]]; then
+    if [[ "${LOOM_ALLOW_INSECURE_BASIC_AUTH:-}" != "1" ]]; then
+      echo "Error: Gitea Basic Auth requires HTTPS to avoid leaking credentials." >&2
+      echo "       Set forge.gitea.url (or GITEA_URL) to an https:// URL, or set" >&2
+      echo "       LOOM_ALLOW_INSECURE_BASIC_AUTH=1 to override (not recommended)." >&2
+      return 1
+    fi
+  fi
+  return 0
 }
 
 # --- Gitea API Helper ---
@@ -159,7 +197,17 @@ gitea_api() {
     return 1
   fi
   if [[ -z "$_GITEA_TOKEN" ]]; then
-    echo "Error: Gitea token not configured" >&2
+    # In Basic Auth mode, the "token" field carries the password.
+    if [[ -n "$_GITEA_USERNAME" ]]; then
+      echo "Error: Gitea password (GITEA_TOKEN / forge.gitea.token) not configured" >&2
+    else
+      echo "Error: Gitea token not configured" >&2
+    fi
+    return 1
+  fi
+
+  # Enforce HTTPS guard if Basic Auth is in use.
+  if ! _gitea_validate_basic_auth; then
     return 1
   fi
 
@@ -167,13 +215,26 @@ gitea_api() {
   local http_code
   local response
 
-  response=$(curl -s -w "\n%{http_code}" \
-    -X "$method" \
-    -H "Authorization: token $_GITEA_TOKEN" \
-    -H "Content-Type: application/json" \
-    -H "Accept: application/json" \
-    "$@" \
-    "$url" 2>/dev/null)
+  if [[ -n "$_GITEA_USERNAME" ]]; then
+    # HTTP Basic Auth (username + password). curl handles base64 encoding
+    # of "user:pass" internally; we never echo the password to the log.
+    response=$(curl -s -w "\n%{http_code}" \
+      -X "$method" \
+      -u "${_GITEA_USERNAME}:${_GITEA_TOKEN}" \
+      -H "Content-Type: application/json" \
+      -H "Accept: application/json" \
+      "$@" \
+      "$url" 2>/dev/null)
+  else
+    # Token auth (existing behavior, unchanged).
+    response=$(curl -s -w "\n%{http_code}" \
+      -X "$method" \
+      -H "Authorization: token $_GITEA_TOKEN" \
+      -H "Content-Type: application/json" \
+      -H "Accept: application/json" \
+      "$@" \
+      "$url" 2>/dev/null)
+  fi
 
   http_code=$(echo "$response" | tail -1)
   local body

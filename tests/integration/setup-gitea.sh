@@ -29,7 +29,17 @@ TOKEN_NAME="integration-test"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 TOKEN_FILE="${SCRIPT_DIR}/.gitea-token"
 
-# Determine the Gitea container name
+# Determine the Gitea container name.
+#
+# Two environments are supported:
+#   1. Local dev via docker-compose.yml -> container name like
+#      `integration-gitea-1` (or `gitea` / `gitea-1` for older Compose).
+#   2. GitHub Actions `services:` block -> container name is a runner-assigned
+#      hash (e.g. `d39a49ea..._giteagitea122_f8b481`). The only stable handle
+#      is the image `gitea/gitea:*`.
+#
+# Strategy: prefer the well-known compose names if present; otherwise fall back
+# to a single container running the gitea/gitea image.
 CONTAINER_NAME=""
 for candidate in integration-gitea-1 gitea gitea-1; do
     if docker ps --format '{{.Names}}' | grep -q "^${candidate}$"; then
@@ -39,7 +49,24 @@ for candidate in integration-gitea-1 gitea gitea-1; do
 done
 
 if [ -z "$CONTAINER_NAME" ]; then
-    echo "ERROR: No running Gitea container found. Run 'docker compose up -d' first." >&2
+    # Fallback: look up by image (GitHub Actions services use hash names).
+    # `docker ps --filter ancestor=...` matches the exact tag we know we use,
+    # plus an untagged form for safety.
+    matches=$(docker ps --filter 'ancestor=gitea/gitea:1.22' --format '{{.Names}}')
+    if [ -z "$matches" ]; then
+        matches=$(docker ps --format '{{.Names}}\t{{.Image}}' \
+            | awk -F'\t' '$2 ~ /^gitea\/gitea(:|$)/ {print $1}')
+    fi
+    # Pick the first match (there should only be one in CI / dev).
+    CONTAINER_NAME=$(echo "$matches" | head -n1)
+fi
+
+if [ -z "$CONTAINER_NAME" ]; then
+    echo "ERROR: No running Gitea container found." >&2
+    echo "  - Local dev: run 'docker compose up -d' in $(dirname "$0")" >&2
+    echo "  - CI: ensure the workflow defines a 'gitea/gitea' service" >&2
+    echo "Currently running containers:" >&2
+    docker ps --format '  {{.Names}} ({{.Image}})' >&2 || true
     exit 1
 fi
 
@@ -59,14 +86,31 @@ for i in $(seq 1 60); do
     sleep 1
 done
 
-# Create admin user via gitea CLI inside the container
+# Create admin user via gitea CLI inside the container.
+#
+# The official `gitea/gitea` image refuses to run the `gitea` binary as
+# root (`setting.go:loadRunModeFrom: Gitea is not supposed to be run as
+# root`). `docker exec` defaults to root, so we must explicitly use the
+# `git` user that the entrypoint set up.
 echo "Creating admin user..."
-docker exec "$CONTAINER_NAME" gitea admin user create \
+admin_create_output=$(docker exec -u git "$CONTAINER_NAME" gitea admin user create \
     --username "$ADMIN_USER" \
     --password "$ADMIN_PASS" \
     --email "$ADMIN_EMAIL" \
     --admin \
-    --must-change-password=false 2>/dev/null || echo "(user may already exist)"
+    --must-change-password=false 2>&1) || admin_create_rc=$?
+admin_create_rc="${admin_create_rc:-0}"
+if [ "$admin_create_rc" -ne 0 ]; then
+    # Idempotency: a second run will fail with "user already exists"; that's
+    # fine. Surface anything else.
+    if echo "$admin_create_output" | grep -qiE 'already exists|user_already_exist'; then
+        echo "(user already exists, continuing)"
+    else
+        echo "ERROR: failed to create admin user (rc=$admin_create_rc):" >&2
+        echo "$admin_create_output" >&2
+        exit 1
+    fi
+fi
 
 # Generate API token
 echo "Generating API token..."

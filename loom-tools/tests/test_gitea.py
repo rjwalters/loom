@@ -148,6 +148,161 @@ class TestConstructor:
 
 
 # ===========================================================================
+# Basic Auth mode (issue #3297)
+# ===========================================================================
+
+
+def _make_basic_forge(
+    *,
+    username_env: str | None = None,
+    username_config: str | None = None,
+    url: str = _BASE_URL,
+    token_env: str | None = None,
+    allow_insecure: bool = False,
+) -> Any:
+    """Helper to build a GiteaForge configured for Basic Auth mode.
+
+    Always passes `clear=True` for environment so stray host-level
+    ``GITEA_USERNAME``/``LOOM_ALLOW_INSECURE_BASIC_AUTH`` cannot affect
+    the test.
+    """
+    from loom_tools.common.gitea import GiteaForge
+
+    gitea_cfg: dict[str, Any] = {"url": url, "token": _TOKEN}
+    if username_config is not None:
+        gitea_cfg["username"] = username_config
+    config = {"gitea": gitea_cfg}
+
+    env_patch: dict[str, str] = {}
+    if username_env is not None:
+        env_patch["GITEA_USERNAME"] = username_env
+    if token_env is not None:
+        env_patch["GITEA_TOKEN"] = token_env
+    if allow_insecure:
+        env_patch["LOOM_ALLOW_INSECURE_BASIC_AUTH"] = "1"
+
+    with (
+        mock.patch("loom_tools.common.gitea.get_forge_config", return_value=config),
+        mock.patch.dict(os.environ, env_patch, clear=True),
+    ):
+        forge = GiteaForge(cwd=Path("/tmp/test"))
+    forge._nwo_cache = "owner/repo"
+    return forge
+
+
+class TestBasicAuthMode:
+    """Tests for HTTP Basic Auth mode (GITEA_USERNAME / forge.gitea.username)."""
+
+    def test_token_auth_unchanged_when_username_unset(self) -> None:
+        """No username => session keeps `Authorization: token …` and `_auth` is None."""
+        # Clear env to ensure GITEA_USERNAME is not leaked in from host
+        with mock.patch.dict(os.environ, {}, clear=True):
+            forge = _make_forge()
+        assert forge._auth is None
+        assert forge._session.headers.get("Authorization") == f"token {_TOKEN}"
+
+    def test_basic_auth_when_username_env_set(self) -> None:
+        """Username via env switches to Basic mode, no Authorization header."""
+        forge = _make_basic_forge(username_env="alice")
+        assert forge._auth == ("alice", _TOKEN)
+        # In Basic mode there must be NO Authorization header on the session
+        assert "Authorization" not in forge._session.headers
+
+    def test_basic_auth_when_username_config_set(self) -> None:
+        """Username via config also switches to Basic mode."""
+        forge = _make_basic_forge(username_config="alice")
+        assert forge._auth == ("alice", _TOKEN)
+        assert "Authorization" not in forge._session.headers
+
+    def test_env_username_beats_config_username(self) -> None:
+        """GITEA_USERNAME env beats forge.gitea.username config."""
+        forge = _make_basic_forge(username_env="bob", username_config="alice")
+        assert forge._auth == ("bob", _TOKEN)
+
+    def test_request_passes_auth_to_session(self) -> None:
+        """Basic mode forwards `auth=(user, pass)` on every session.request call."""
+        forge = _make_basic_forge(username_env="alice")
+        with mock.patch.object(
+            forge._session, "request", return_value=_mock_response(json_data={}),
+        ) as mock_req:
+            forge._request("GET", "user")
+        # Check auth kwarg was forwarded
+        _, kwargs = mock_req.call_args
+        assert kwargs.get("auth") == ("alice", _TOKEN)
+
+    def test_token_mode_passes_none_auth(self) -> None:
+        """Token mode passes auth=None to session.request (header carries creds)."""
+        with mock.patch.dict(os.environ, {}, clear=True):
+            forge = _make_forge()
+        with mock.patch.object(
+            forge._session, "request", return_value=_mock_response(json_data={}),
+        ) as mock_req:
+            forge._request("GET", "user")
+        _, kwargs = mock_req.call_args
+        assert kwargs.get("auth") is None
+
+
+class TestBasicAuthHttpsGuard:
+    """Tests for the HTTPS guard on Basic Auth mode."""
+
+    def test_http_url_with_username_raises(self) -> None:
+        with pytest.raises(ValueError, match="Basic Auth requires HTTPS"):
+            _make_basic_forge(
+                username_env="alice", url="http://insecure.example.com",
+            )
+
+    def test_http_url_allowed_with_override(self) -> None:
+        """LOOM_ALLOW_INSECURE_BASIC_AUTH=1 permits http://."""
+        forge = _make_basic_forge(
+            username_env="alice",
+            url="http://insecure.example.com",
+            allow_insecure=True,
+        )
+        assert forge._auth == ("alice", _TOKEN)
+
+    def test_https_url_with_username_ok(self) -> None:
+        """https:// URLs always work with Basic Auth."""
+        forge = _make_basic_forge(
+            username_env="alice", url="https://secure.example.com",
+        )
+        assert forge._auth == ("alice", _TOKEN)
+
+    def test_http_url_without_username_unaffected(self) -> None:
+        """The HTTPS guard ONLY fires in Basic mode. Token mode + http:// works."""
+        from loom_tools.common.gitea import GiteaForge
+        config = {"gitea": {"url": "http://insecure.example.com", "token": _TOKEN}}
+        with (
+            mock.patch("loom_tools.common.gitea.get_forge_config", return_value=config),
+            mock.patch.dict(os.environ, {}, clear=True),
+        ):
+            forge = GiteaForge(cwd=Path("/tmp/test"))
+        assert forge._auth is None
+        assert forge._session.headers["Authorization"] == f"token {_TOKEN}"
+
+    def test_username_with_colon_rejected(self) -> None:
+        """RFC 7617: ':' in username would corrupt user:pass split."""
+        with pytest.raises(ValueError, match="must not contain ':'"):
+            _make_basic_forge(username_env="alice:bob")
+
+    def test_empty_username_env_treated_as_unset(self) -> None:
+        """Empty GITEA_USERNAME falls through to token mode (no crash)."""
+        forge = _make_basic_forge(username_env="")
+        assert forge._auth is None
+        assert forge._session.headers.get("Authorization") == f"token {_TOKEN}"
+
+    def test_error_messages_do_not_leak_password(self) -> None:
+        """The HTTPS-guard ValueError must not contain the password."""
+        secret = "super-secret-pw-do-not-leak"
+        with pytest.raises(ValueError) as exc_info:
+            _make_basic_forge(
+                username_env="alice",
+                url="http://insecure.example.com",
+                token_env=secret,
+            )
+        assert secret not in str(exc_info.value)
+
+
+# ===========================================================================
 # Issue operations
 # ===========================================================================
 
