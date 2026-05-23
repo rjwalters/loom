@@ -693,6 +693,11 @@ cp target/release/loom-daemon target/release/loom-daemon-aarch64-apple-darwin
 
 success "loom-daemon binary ready"
 
+# Log the daemon binary identity so a stale binary can be diagnosed
+# post-hoc when an install regression is reported (issue #3287).
+DAEMON_VERSION=$("$LOOM_ROOT/target/release/loom-daemon" --version 2>/dev/null || echo "(unknown)")
+info "loom-daemon binary: $DAEMON_VERSION"
+
 # Run loom-daemon init in the worktree
 cd "$TARGET_PATH/$WORKTREE_PATH"
 # Use --force to overwrite existing installation when requested (--force or --clean flags)
@@ -823,6 +828,55 @@ cat > .loom/install-metadata.json <<METADATA
 METADATA
 success "Installation metadata recorded ($(echo "$INSTALLED_FILES_JSON" | grep -o '"' | wc -l | awk '{print $1/2}') files tracked)"
 echo ""
+
+# Reconcile install-metadata.json against on-disk state.
+# Issue #3287: a metadata-vs-disk divergence is itself a hard error — regardless
+# of which step caused it (a stale daemon binary, a hostile gitignore, a copy
+# race, etc.). This is the cheapest single check that catches every variant.
+info "Verifying all metadata-listed files exist on disk..."
+MISSING_FROM_METADATA=()
+if command -v jq >/dev/null 2>&1; then
+  while IFS= read -r path; do
+    [[ -n "$path" ]] || continue
+    if [[ ! -e "$path" ]]; then
+      MISSING_FROM_METADATA+=("$path")
+    fi
+  done < <(jq -r '.installed_files[]' .loom/install-metadata.json)
+else
+  warning "jq not available — skipping metadata reconciliation check"
+fi
+if (( ${#MISSING_FROM_METADATA[@]} > 0 )); then
+  echo "" >&2
+  for f in "${MISSING_FROM_METADATA[@]}"; do
+    echo "  MISSING: $f" >&2
+  done
+  error "${#MISSING_FROM_METADATA[@]} file(s) in install-metadata.json are missing from disk — install incomplete (see #3287)"
+fi
+success "Metadata reconciliation passed (all listed files present)"
+echo ""
+
+# Verify no installed lib files are gitignored.
+# This catches the hostile-gitignore variant of issue #3287 *after* the
+# daemon's own check, providing belt-and-suspenders coverage for users on
+# stale daemon binaries that predate the in-daemon gitignore audit.
+if [[ -d ".loom/scripts/lib" ]]; then
+  info "Checking that installed lib/*.sh files are not gitignored..."
+  IGNORED_LIB_FILES=$(git check-ignore .loom/scripts/lib/*.sh 2>/dev/null || true)
+  if [[ -n "$IGNORED_LIB_FILES" ]]; then
+    echo "" >&2
+    echo "  The following lib files are matched by a .gitignore rule:" >&2
+    while IFS= read -r ignored_line; do
+      echo "    $ignored_line" >&2
+    done <<<"$IGNORED_LIB_FILES"
+    echo "" >&2
+    echo "  These files will be silently dropped on commit, breaking installs" >&2
+    echo "  in fresh clones and worktrees. Remove the offending pattern from" >&2
+    echo "  .gitignore (commonly '.loom/' or '.loom/scripts/') before retrying." >&2
+    error "Installed lib files are gitignored — install would produce a broken commit (see #3287)"
+  fi
+  success "lib/*.sh files are not gitignored"
+  echo ""
+fi
 
 # Verify expected files were created
 # NOTE: lib/ entries are listed explicitly as a defensive belt-and-suspenders check.

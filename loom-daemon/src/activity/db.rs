@@ -94,7 +94,10 @@ impl ActivityDb {
             ",
         )?;
 
-        let inputs = stmt.query_map(params![terminal_id, limit], |row| {
+        // rusqlite 0.39 dropped the `ToSql` impl for `usize`; convert to i64 for SQLite.
+        // Saturate at i64::MAX on 64-bit platforms where `usize` can exceed i64.
+        let limit_i64 = i64::try_from(limit).unwrap_or(i64::MAX);
+        let inputs = stmt.query_map(params![terminal_id, limit_i64], |row| {
             let id: i64 = row.get(0)?;
             let terminal_id: String = row.get(1)?;
             let timestamp_str: String = row.get(2)?;
@@ -243,7 +246,10 @@ impl ActivityDb {
             ",
         )?;
 
-        let entries = stmt.query_map(params![terminal_id, limit], |row| {
+        // rusqlite 0.39 dropped the `ToSql` impl for `usize`; convert to i64 for SQLite.
+        // Saturate at i64::MAX on 64-bit platforms where `usize` can exceed i64.
+        let limit_i64 = i64::try_from(limit).unwrap_or(i64::MAX);
+        let entries = stmt.query_map(params![terminal_id, limit_i64], |row| {
             // Parse context JSON to extract git_branch
             let ctx_json: String = row.get(5)?;
             let ctx: InputContext = serde_json::from_str(&ctx_json).unwrap_or_default();

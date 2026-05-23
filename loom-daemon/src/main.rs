@@ -18,6 +18,7 @@ use std::sync::{Arc, Mutex};
 #[derive(Parser)]
 #[command(name = "loom-daemon")]
 #[command(about = "Loom daemon for AI-powered development orchestration", long_about = None)]
+#[command(version = env!("CARGO_PKG_VERSION"))]
 struct Cli {
     #[command(subcommand)]
     command: Option<Commands>,

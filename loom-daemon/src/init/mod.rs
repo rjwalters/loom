@@ -32,7 +32,7 @@ use std::fs;
 use std::path::Path;
 
 use file_ops::{clean_managed_dir, copy_dir_with_report, verify_copied_files, TemplateContext};
-use post_init::{generate_manifest, update_gitignore};
+use post_init::{find_overbroad_loom_patterns, generate_manifest, update_gitignore};
 use scaffolding::setup_repository_scaffolding;
 
 // Re-export public types and functions
@@ -120,6 +120,22 @@ pub fn initialize_workspace(
 
     // Validate workspace is a git repository
     validate_git_repository(workspace_path)?;
+
+    // Check for over-broad gitignore patterns that would shadow installed Loom
+    // files (e.g., `.loom/scripts/lib/*.sh`). This catches the regression
+    // reported in issue #3287, where a target repo's `.gitignore` contained
+    // `.loom/` and caused the install worktree's lib files to never be
+    // committed to main. We fail fast here, before any file operations.
+    let bad_patterns = find_overbroad_loom_patterns(workspace);
+    if !bad_patterns.is_empty() {
+        return Err(format!(
+            "Refusing to install: .gitignore contains pattern(s) that would block \
+             installed Loom files from being committed (e.g., .loom/scripts/lib/*.sh). \
+             Remove or scope these patterns to specific runtime files before \
+             reinstalling. Offending patterns: {}",
+            bad_patterns.join(", ")
+        ));
+    }
 
     // Check for self-installation (Loom source repo)
     if is_loom_source_repo(workspace) {
