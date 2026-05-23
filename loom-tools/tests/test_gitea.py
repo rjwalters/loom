@@ -531,17 +531,39 @@ class TestMergePullRequest:
 
     def test_squash_merge(self) -> None:
         forge = _make_forge()
-        with mock.patch.object(forge._session, "request", return_value=_mock_response(json_data={})) as mock_req:
+        # merge_pull_request polls GET /pulls/{n} for mergeability first,
+        # then POSTs to /merge. Provide both responses in order.
+        responses = [
+            _mock_response(json_data={"mergeable": True}),  # poll: ready
+            _mock_response(json_data={}),                    # merge: ok
+        ]
+        with mock.patch.object(forge._session, "request", side_effect=responses) as mock_req:
             assert forge.merge_pull_request(10, "squash") is True
 
+        # The last call is the POST to /merge with the merge payload.
         call_args = mock_req.call_args
         assert call_args[1]["json"]["Do"] == "squash"
         assert call_args[1]["json"]["delete_branch_after_merge"] is True
 
     def test_failure(self) -> None:
         forge = _make_forge()
+        # Both the poll GET and the merge POST fail (e.g., 409). The poll
+        # break-on-error path falls through to the merge attempt, which
+        # also fails — so merge_pull_request returns False.
         with mock.patch.object(forge._session, "request", return_value=_mock_response(409)):
             assert forge.merge_pull_request(10) is False
+
+    def test_returns_true_when_already_merged(self) -> None:
+        """If the poll sees merged: True, treat that as success."""
+        forge = _make_forge()
+        with mock.patch.object(
+            forge._session,
+            "request",
+            return_value=_mock_response(json_data={"merged": True}),
+        ) as mock_req:
+            assert forge.merge_pull_request(10) is True
+        assert mock_req.call_count == 1
+        assert mock_req.call_args[0][0] == "GET"
 
 
 class TestClosePullRequest:
@@ -1434,6 +1456,16 @@ class TestAutoMergePullRequest:
         """Successful merge response."""
         return _mock_response(json_data={"sha": "merged123"})
 
+    def _mergeable_poll(self) -> mock.MagicMock:
+        """GET /pulls/{n} response used by merge_pull_request's mergeability poll.
+
+        ``merge_pull_request`` issues a GET before the POST /merge to wait
+        for Gitea's async mergeability computation. Tests that exercise the
+        auto-merge path must include this response right before each
+        ``_merge_success()`` in their side_effect list.
+        """
+        return _mock_response(json_data={"mergeable": True, "merged": False})
+
     def test_passing_ci_merges_immediately(self) -> None:
         """When CI is passing, should merge right away."""
         forge = _make_forge()
@@ -1441,6 +1473,7 @@ class TestAutoMergePullRequest:
         responses = [
             self._pr_response(),       # GET pulls/42 (fetch PR)
             self._ci_passing(),        # GET commits/{sha}/statuses
+            self._mergeable_poll(),    # GET pulls/42 (mergeability poll)
             self._merge_success(),     # POST pulls/42/merge
         ]
 
@@ -1474,6 +1507,7 @@ class TestAutoMergePullRequest:
         responses = [
             self._pr_response(),       # GET pulls/42
             self._no_ci(),             # GET commits/{sha}/statuses (empty)
+            self._mergeable_poll(),    # GET pulls/42 (mergeability poll)
             self._merge_success(),     # POST pulls/42/merge
         ]
 
@@ -1507,6 +1541,7 @@ class TestAutoMergePullRequest:
             self._pr_response(),       # GET pulls/42
             self._ci_pending(),        # poll 1: GET commits/{sha}/statuses (pending)
             self._ci_passing(),        # poll 2: GET commits/{sha}/statuses (passing)
+            self._mergeable_poll(),    # GET pulls/42 (mergeability poll)
             self._merge_success(),     # POST pulls/42/merge
         ]
 
@@ -1563,8 +1598,9 @@ class TestAutoMergePullRequest:
         })
 
         responses = [
-            pr_no_head,            # GET pulls/42 (no head SHA)
-            self._merge_success(), # POST pulls/42/merge (direct)
+            pr_no_head,             # GET pulls/42 (no head SHA)
+            self._mergeable_poll(), # GET pulls/42 (mergeability poll inside merge_pull_request)
+            self._merge_success(),  # POST pulls/42/merge (direct)
         ]
 
         with mock.patch.object(
@@ -1582,6 +1618,7 @@ class TestAutoMergePullRequest:
             self._pr_response(),
             self._ci_pending(),
             self._ci_passing(),
+            self._mergeable_poll(),
             self._merge_success(),
         ]
 
@@ -1591,5 +1628,7 @@ class TestAutoMergePullRequest:
         ):
             forge.auto_merge_pull_request(42, poll_interval=15, timeout=120)
 
-        # Should sleep for 15 seconds (the configured interval)
+        # Should sleep for 15 seconds (the configured CI poll interval).
+        # The mergeability poll inside merge_pull_request sees mergeable=True
+        # on the first GET, so it doesn't add any sleep calls.
         mock_sleep.assert_called_once_with(15)
