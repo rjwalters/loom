@@ -240,11 +240,21 @@ class GiteaForge:
             return None
 
         if resp.status_code >= 400:
-            # 4xx (not auth) — return None silently (404 = not found, etc.)
-            logger.debug(
-                "Gitea %d for %s %s: %s",
-                resp.status_code, method, url, resp.text[:200],
-            )
+            # 4xx (not auth). 404 is expected (not found, etc.), so keep
+            # those at debug level. Other 4xx (405 Method Not Allowed, 409
+            # Conflict, 422 Unprocessable) usually indicate an API misuse
+            # that the caller will want to see — log at warning with the
+            # response body so the failure mode is visible without a debugger.
+            if resp.status_code == 404:
+                logger.debug(
+                    "Gitea %d for %s %s: %s",
+                    resp.status_code, method, url, resp.text[:200],
+                )
+            else:
+                logger.warning(
+                    "Gitea %d for %s %s: %s",
+                    resp.status_code, method, url, resp.text[:500],
+                )
             return None
 
         return resp
@@ -649,10 +659,53 @@ class GiteaForge:
     def merge_pull_request(
         self, number: int, method: str = "squash",
     ) -> bool:
-        """Merge a pull request."""
+        """Merge a pull request.
+
+        Gitea computes the ``mergeable`` flag asynchronously after a PR is
+        created (or after the head branch is updated). Issuing a merge
+        request before that computation finishes returns HTTP 405 with a
+        body like ``"Please try again later"``. To make the call robust
+        for callers that create-then-merge (e.g. integration tests), we
+        briefly poll ``GET /pulls/{number}`` for ``mergeable: true``
+        before attempting the merge. The poll is short (a few seconds);
+        production callers that wait on CI should use
+        :meth:`auto_merge_pull_request` instead.
+        """
         rp = self._repo_path()
         if not rp:
             return False
+
+        # Best-effort wait for Gitea to compute mergeability. Don't fail
+        # if the poll itself errors — fall through to the merge attempt
+        # and let the merge response be the source of truth.
+        deadline = time.time() + 10.0
+        while time.time() < deadline:
+            pr_resp = self._request("GET", f"{rp}/pulls/{number}")
+            if pr_resp is None:
+                break
+            try:
+                pr_data = pr_resp.json()
+            except ValueError:
+                break
+            if not isinstance(pr_data, dict):
+                break
+            if pr_data.get("merged") is True:
+                # Already merged — nothing to do.
+                return True
+            mergeable = pr_data.get("mergeable")
+            if mergeable is True:
+                break
+            if mergeable is False:
+                # Definitive: Gitea knows the PR can't be merged
+                # (conflicts, draft, etc.). Don't waste a merge call.
+                logger.warning(
+                    "Gitea PR #%d is not mergeable; skipping merge attempt",
+                    number,
+                )
+                return False
+            # mergeable is None — still computing; back off briefly
+            time.sleep(0.5)
+
         payload = {
             "Do": method,
             "delete_branch_after_merge": True,

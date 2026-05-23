@@ -21,7 +21,6 @@ import pytest
 import requests
 
 from loom_tools.common.forge import (
-    EntityType,
     ForgeIssue,
     ForgePullRequest,
     ForgeType,
@@ -170,7 +169,7 @@ class TestLabelTransitions:
         assert issue is not None
 
         result = gitea_forge.add_labels(
-            EntityType.ISSUE, issue.number, ["loom:issue", "loom:building"],
+            "issue", issue.number, ["loom:issue", "loom:building"],
         )
         assert result is True
 
@@ -190,7 +189,7 @@ class TestLabelTransitions:
         assert issue is not None
 
         result = gitea_forge.remove_labels(
-            EntityType.ISSUE, issue.number, ["loom:building"],
+            "issue", issue.number, ["loom:building"],
         )
         assert result is True
 
@@ -209,7 +208,7 @@ class TestLabelTransitions:
         assert issue is not None
 
         result = gitea_forge.transition_labels(
-            EntityType.ISSUE,
+            "issue",
             issue.number,
             add=["loom:building"],
             remove=["loom:issue"],
@@ -253,7 +252,7 @@ class TestLabelTransitions:
             # This should trigger a cache refresh since the label wasn't
             # in the cache when it was first populated
             result = gitea_forge.add_labels(
-                EntityType.ISSUE, issue.number, [new_label],
+                "issue", issue.number, [new_label],
             )
             assert result is True
 
@@ -394,7 +393,7 @@ class TestPRLifecycle:
 
         # Transition: review-requested -> pr
         result = gitea_forge.transition_labels(
-            EntityType.PULL_REQUEST,
+            "pr",
             pr.number,
             add=["loom:pr"],
             remove=["loom:review-requested"],
