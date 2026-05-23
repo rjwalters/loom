@@ -5,11 +5,11 @@
 
 # Core Workflow States
 - name: loom:triage
-  description: New issue awaiting Curator enhancement
+  description: "New issue awaiting Curator enhancement. Applied by: humans or any agent filing a new issue (intake label)."
   color: "9CA3AF"  # gray-400 - neutral initial state
 
 - name: loom:issue
-  description: Approved for work by human (ready for Builder to claim)
+  description: "Approved for work by human (ready for Builder to claim). Applied by: humans only (or Champion in --merge mode)."
   color: "3B82F6"  # blue-500
 
 # DEPRECATED: loom:in-progress removed (use role-specific labels)
@@ -20,27 +20,27 @@
 
 # Role-Specific Workflow Labels
 - name: loom:building
-  description: Builder is implementing this issue
+  description: "Builder is implementing this issue. Applied by: Builder/Shepherd only (claim label)."
   color: "F59E0B"  # amber-500 - matches other in-progress states
 
 - name: loom:curating
-  description: Curator is enhancing this issue
+  description: "Curator is enhancing this issue. Applied by: Curator only (claim label)."
   color: "F59E0B"  # amber-500 - matches other in-progress states
 
 - name: loom:treating
-  description: Doctor is fixing this bug or addressing PR feedback
+  description: "Doctor is fixing this bug or addressing PR feedback. Applied by: Doctor only (claim label)."
   color: "F59E0B"  # amber-500 - matches other in-progress states
 
 - name: loom:reviewing
-  description: Judge is actively reviewing this PR
+  description: "Judge is actively reviewing this PR. Applied by: Judge only (claim label)."
   color: "F59E0B"  # amber-500 - matches other in-progress states
 
 - name: loom:review-requested
-  description: PR ready for Judge to review
+  description: "PR ready for Judge to review. Applied by: Builder when opening PR."
   color: "10B981"  # emerald-500
 
 - name: loom:changes-requested
-  description: "PR requires changes before re-review (Judge requested modifications)"
+  description: "PR requires changes before re-review (Judge requested modifications). Applied by: Judge."
   color: "F59E0B"  # amber-500 - matches other "action required" labels
 
 - name: loom:merge-conflict
@@ -56,20 +56,20 @@
   color: "DC2626"  # red-600 - indicates broken state
 
 - name: loom:pr
-  description: PR approved by Judge, ready for human to merge
+  description: "PR approved by Judge, ready for human to merge. Applied by: Judge."
   color: "3B82F6"  # blue-500
 
 # Agent Proposal Labels
 - name: loom:architect
-  description: Architect proposal awaiting user approval
+  description: "Architect proposal awaiting user approval. Applied by: Architect only."
   color: "9333EA"  # purple (violet-600)
 
 - name: loom:hermit
-  description: Hermit removal/simplification proposal awaiting user approval
+  description: "Hermit removal/simplification proposal awaiting user approval. Applied by: Hermit only."
   color: "9333EA"  # purple (violet-600)
 
 - name: loom:auditor
-  description: Bug discovered by Auditor during main branch validation
+  description: "Bug discovered by Auditor during main branch validation. Applied by: Auditor only."
   color: "d93f0b"  # red - indicates runtime/build issue
 
 - name: loom:auditor-capability-request
@@ -77,7 +77,7 @@
   color: "6366F1"  # indigo-500 - indicates meta/tooling request
 
 - name: loom:curated
-  description: "Curator-enriched. Additive marker; coexists with loom:issue (highest-quality state for Builders)"
+  description: "Curator-enriched, awaiting human approval. Additive marker; coexists with loom:issue (highest-quality state for Builders). Applied by: Curator only."
   color: "10B981"  # emerald-500
 
 # Status Labels

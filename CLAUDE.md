@@ -126,12 +126,13 @@ Agents coordinate through GitHub labels. See `.github/labels.yml` for full defin
 
 **Issue Lifecycle**:
 ```
-(created) → loom:issue → loom:building → (closed)
-           ↑ Curator      ↑ Builder
-
-(created) → loom:curating → loom:curated → loom:issue
-           ↑ Curator        ↑ Curator      ↑ Champion approves
+(created) → loom:triage → loom:curating → loom:curated → loom:issue → loom:building → (closed)
+           ↑ filer        ↑ Curator        ↑ Curator      ↑ human     ↑ Builder
+                                                          (or Champion
+                                                           in --merge mode)
 ```
+
+See `.github/labels.yml` for the authoritative `Applied by:` field on every label.
 
 **PR Lifecycle**:
 ```
