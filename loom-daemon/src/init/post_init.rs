@@ -6,6 +6,63 @@ use std::fs;
 use std::path::Path;
 use std::process::Command;
 
+/// Gitignore patterns that would shadow installed Loom files like
+/// `.loom/scripts/lib/*.sh`. If a user's gitignore contains any of these, the
+/// installer must fail loudly: the files will exist on disk after install but
+/// will not be committed to the repo, producing a "successful" install that
+/// breaks on the next worktree (see issue #3287).
+///
+/// Note: `.loom/` is intentionally listed even though some users may *want*
+/// to ignore the entire `.loom/` directory. In that mode they should not be
+/// running `install-loom.sh` at all — the installer's job is to commit Loom
+/// files into the target repo. Hard-failing here surfaces that mismatch
+/// instead of producing a silently broken install.
+const OVERBROAD_LOOM_PATTERNS: &[&str] = &[
+    ".loom/",
+    ".loom",
+    ".loom/*",
+    ".loom/**",
+    ".loom/scripts/",
+    ".loom/scripts",
+    ".loom/scripts/*",
+    ".loom/scripts/**",
+    ".loom/scripts/lib/",
+    ".loom/scripts/lib",
+    ".loom/scripts/lib/*",
+    ".loom/scripts/lib/*.sh",
+];
+
+/// Scan `.gitignore` for patterns that would block installed Loom files
+/// (specifically `.loom/scripts/lib/*.sh`) from being committed.
+///
+/// Returns a sorted list of offending pattern lines (trimmed of whitespace).
+/// Empty result means the gitignore is safe.
+///
+/// This is the detection half of the issue #3287 fix. The installer treats a
+/// non-empty result as a hard error: the user must remove the broad pattern
+/// (or scope it more narrowly) before installation can proceed.
+pub fn find_overbroad_loom_patterns(workspace_path: &Path) -> Vec<String> {
+    let gitignore_path = workspace_path.join(".gitignore");
+    let Ok(contents) = fs::read_to_string(&gitignore_path) else {
+        return Vec::new();
+    };
+
+    let mut found: Vec<String> = Vec::new();
+    for raw_line in contents.lines() {
+        let line = raw_line.trim();
+        // Skip blanks, comments, and negation entries (a negation can't shadow files)
+        if line.is_empty() || line.starts_with('#') || line.starts_with('!') {
+            continue;
+        }
+        if OVERBROAD_LOOM_PATTERNS.contains(&line) {
+            found.push(line.to_string());
+        }
+    }
+    found.sort();
+    found.dedup();
+    found
+}
+
 /// Generate installation manifest by running verify-install.sh
 ///
 /// Attempts to run `.loom/scripts/verify-install.sh generate --quiet` to create
@@ -294,6 +351,119 @@ mod tests {
             assert!(
                 contents.contains(pattern),
                 "Missing pattern in generated .gitignore: {pattern}"
+            );
+        }
+    }
+
+    #[test]
+    fn find_overbroad_loom_patterns_empty_when_no_gitignore() {
+        let tmp = TempDir::new().unwrap();
+        let found = find_overbroad_loom_patterns(tmp.path());
+        assert!(
+            found.is_empty(),
+            "Expected empty result when .gitignore is absent, got {found:?}"
+        );
+    }
+
+    #[test]
+    fn find_overbroad_loom_patterns_detects_dot_loom_slash() {
+        // Issue #3287: a target repo with `.loom/` in .gitignore would have all
+        // installed Loom files (including `.loom/scripts/lib/*.sh`) silently
+        // dropped at commit time.
+        let tmp = TempDir::new().unwrap();
+        fs::write(tmp.path().join(".gitignore"), "node_modules/\n.loom/\nsome-other-pattern\n")
+            .unwrap();
+        let found = find_overbroad_loom_patterns(tmp.path());
+        assert_eq!(found, vec![".loom/".to_string()]);
+    }
+
+    #[test]
+    fn find_overbroad_loom_patterns_detects_dot_loom_scripts() {
+        let tmp = TempDir::new().unwrap();
+        fs::write(tmp.path().join(".gitignore"), ".loom/scripts/\n# comment\n").unwrap();
+        let found = find_overbroad_loom_patterns(tmp.path());
+        assert_eq!(found, vec![".loom/scripts/".to_string()]);
+    }
+
+    #[test]
+    fn find_overbroad_loom_patterns_detects_lib_specifically() {
+        let tmp = TempDir::new().unwrap();
+        fs::write(tmp.path().join(".gitignore"), ".loom/scripts/lib/*.sh\n").unwrap();
+        let found = find_overbroad_loom_patterns(tmp.path());
+        assert_eq!(found, vec![".loom/scripts/lib/*.sh".to_string()]);
+    }
+
+    #[test]
+    fn find_overbroad_loom_patterns_ignores_safe_runtime_patterns() {
+        // The patterns written by update_gitignore() are runtime-only and
+        // must not be flagged as over-broad.
+        let tmp = TempDir::new().unwrap();
+        update_gitignore(tmp.path()).unwrap();
+        let found = find_overbroad_loom_patterns(tmp.path());
+        assert!(found.is_empty(), "update_gitignore output should be safe, got: {found:?}");
+    }
+
+    #[test]
+    fn find_overbroad_loom_patterns_ignores_comments_and_negations() {
+        let tmp = TempDir::new().unwrap();
+        // Negations and comments mentioning `.loom/` must not be flagged
+        fs::write(
+            tmp.path().join(".gitignore"),
+            "# .loom/ — see docs\n!.loom/scripts/lib/\n.loom/worktrees/\n",
+        )
+        .unwrap();
+        let found = find_overbroad_loom_patterns(tmp.path());
+        assert!(found.is_empty(), "Expected no flags, got: {found:?}");
+    }
+
+    #[test]
+    fn find_overbroad_loom_patterns_dedups_and_sorts() {
+        let tmp = TempDir::new().unwrap();
+        fs::write(tmp.path().join(".gitignore"), ".loom/scripts/\n.loom/\n.loom/scripts/\n")
+            .unwrap();
+        let found = find_overbroad_loom_patterns(tmp.path());
+        assert_eq!(found, vec![".loom/".to_string(), ".loom/scripts/".to_string()]);
+    }
+
+    #[test]
+    fn initialize_workspace_rejects_overbroad_gitignore() {
+        // End-to-end: an install against a target with `.loom/` in .gitignore
+        // must fail with a clear error message (issue #3287). Without this
+        // check, files copy successfully on disk but never make it into the
+        // commit, producing a "successful" install that is silently broken.
+        let tmp = TempDir::new().unwrap();
+        let workspace = tmp.path();
+        let defaults = tmp.path().join("defaults");
+
+        fs::create_dir(workspace.join(".git")).unwrap();
+        fs::create_dir_all(defaults.join("roles")).unwrap();
+        fs::create_dir_all(defaults.join("scripts").join("lib")).unwrap();
+        fs::write(defaults.join("config.json"), "{}").unwrap();
+        fs::write(defaults.join("roles").join("builder.md"), "builder").unwrap();
+        fs::write(
+            defaults
+                .join("scripts")
+                .join("lib")
+                .join("forge-helpers.sh"),
+            "#!/bin/bash",
+        )
+        .unwrap();
+
+        // Hostile .gitignore: `.loom/` would prevent the lib files from ever
+        // being committed (the file copy would succeed, but git would silently
+        // drop them at commit time).
+        fs::write(workspace.join(".gitignore"), ".loom/\n").unwrap();
+
+        let result = crate::init::initialize_workspace(
+            workspace.to_str().unwrap(),
+            defaults.to_str().unwrap(),
+            false,
+        );
+        assert!(result.is_err(), "install should refuse hostile .gitignore but returned Ok");
+        if let Err(err) = result {
+            assert!(
+                err.contains(".loom/") && err.contains("Refusing to install"),
+                "error message should call out the offending pattern; got: {err}"
             );
         }
     }
