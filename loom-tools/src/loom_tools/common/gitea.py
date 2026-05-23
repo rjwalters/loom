@@ -678,6 +678,13 @@ class GiteaForge:
         # Best-effort wait for Gitea to compute mergeability. Don't fail
         # if the poll itself errors — fall through to the merge attempt
         # and let the merge response be the source of truth.
+        #
+        # Note: Gitea returns ``mergeable: false`` as the *initial* value
+        # while it's still computing mergeability (not ``null`` as one
+        # might expect). Treat both ``None`` and ``False`` as "still
+        # computing" and keep polling until ``True`` or the deadline.
+        # After the deadline, attempt the merge POST regardless and let
+        # the merge response be the source of truth.
         deadline = time.time() + 10.0
         while time.time() < deadline:
             pr_resp = self._request("GET", f"{rp}/pulls/{number}")
@@ -695,15 +702,9 @@ class GiteaForge:
             mergeable = pr_data.get("mergeable")
             if mergeable is True:
                 break
-            if mergeable is False:
-                # Definitive: Gitea knows the PR can't be merged
-                # (conflicts, draft, etc.). Don't waste a merge call.
-                logger.warning(
-                    "Gitea PR #%d is not mergeable; skipping merge attempt",
-                    number,
-                )
-                return False
-            # mergeable is None — still computing; back off briefly
+            # mergeable is None or False — still computing or transient;
+            # keep polling. We don't short-circuit on False because Gitea
+            # uses False as the default while computing mergeability.
             time.sleep(0.5)
 
         payload = {

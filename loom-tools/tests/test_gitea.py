@@ -553,19 +553,6 @@ class TestMergePullRequest:
         with mock.patch.object(forge._session, "request", return_value=_mock_response(409)):
             assert forge.merge_pull_request(10) is False
 
-    def test_skips_merge_when_definitely_not_mergeable(self) -> None:
-        """If Gitea reports mergeable: False, skip the merge POST entirely."""
-        forge = _make_forge()
-        with mock.patch.object(
-            forge._session,
-            "request",
-            return_value=_mock_response(json_data={"mergeable": False}),
-        ) as mock_req:
-            assert forge.merge_pull_request(10) is False
-        # Only the poll GET was issued; no merge POST.
-        assert mock_req.call_count == 1
-        assert mock_req.call_args[0][0] == "GET"
-
     def test_returns_true_when_already_merged(self) -> None:
         """If the poll sees merged: True, treat that as success."""
         forge = _make_forge()
