@@ -1,12 +1,23 @@
 """Gitea implementation of the ``ForgeClient`` protocol.
 
-Uses Gitea's REST API v1 via ``requests.Session`` with token authentication.
+Uses Gitea's REST API v1 via ``requests.Session``. Supports two
+authentication modes:
 
-Authentication:
-- ``GITEA_TOKEN`` env var (primary)
-- ``.loom/config.json`` ``forge.gitea.token`` (fallback)
+* **Token auth** (default): ``Authorization: token <T>`` header.
+* **Basic auth**: HTTP Basic ``username + password``. Triggered when a
+  username is configured. The password is taken from the existing
+  ``token`` field (or ``GITEA_TOKEN`` env var) for backward compatibility
+  -- no new ``password`` field is introduced.
+
+Authentication config (env vars take priority over ``.loom/config.json``):
+
+* ``GITEA_TOKEN`` / ``forge.gitea.token`` -- token (or password in Basic mode).
+* ``GITEA_USERNAME`` / ``forge.gitea.username`` -- if set, switches to Basic Auth.
+* ``LOOM_ALLOW_INSECURE_BASIC_AUTH=1`` -- override the HTTPS guard.
 
 Base URL is required and comes from ``.loom/config.json`` ``forge.gitea.url``.
+Basic Auth over ``http://`` is refused by default to avoid leaking
+credentials; set ``LOOM_ALLOW_INSECURE_BASIC_AUTH=1`` to permit it.
 """
 
 from __future__ import annotations
@@ -46,8 +57,11 @@ _DEFAULT_PAGE_LIMIT = 50
 class GiteaForge:
     """Gitea implementation of the ``ForgeClient`` protocol.
 
-    Wraps Gitea's REST API v1 behind the forge-agnostic interface.
-    Uses ``requests.Session`` with ``Authorization: token {value}`` headers.
+    Wraps Gitea's REST API v1 behind the forge-agnostic interface. Uses
+    ``requests.Session`` with either ``Authorization: token {value}``
+    headers (token auth, the default) or per-request ``auth=(user, pass)``
+    (HTTP Basic Auth, triggered by ``GITEA_USERNAME`` /
+    ``forge.gitea.username``).
 
     Label operations require integer IDs. A lazy name-to-ID cache is
     maintained and auto-populated on the first label operation.
@@ -58,6 +72,8 @@ class GiteaForge:
         self._nwo_cache: str | None = None
         self._label_cache: dict[str, int] | None = None
         self._default_branch_cache: str | None = None
+        # Populated only when Basic Auth is in use. None means token auth.
+        self._auth: tuple[str, str] | None = None
 
         # Load config
         forge_config = get_forge_config(cwd)
@@ -73,7 +89,8 @@ class GiteaForge:
                 ".loom/config.json (e.g. \"https://gitea.example.com\")"
             )
 
-        # API token: env var takes priority
+        # API token / password: env var takes priority.
+        # In Basic Auth mode, this carries the password.
         token = os.environ.get("GITEA_TOKEN", "") or gitea_config.get("token", "")
         if not token:
             raise ValueError(
@@ -81,13 +98,43 @@ class GiteaForge:
                 "forge.gitea.token in .loom/config.json"
             )
 
+        # Username: env var first, then config. If set, switches to Basic Auth.
+        username = (
+            os.environ.get("GITEA_USERNAME", "")
+            or gitea_config.get("username", "")
+        )
+
         # Build session
         self._session = requests.Session()
         self._session.headers.update({
-            "Authorization": f"token {token}",
             "Content-Type": "application/json",
             "Accept": "application/json",
         })
+
+        if username:
+            # HTTP Basic Auth mode. RFC 7617 disallows ':' in the username
+            # (it would corrupt the user:pass split).
+            if ":" in username:
+                raise ValueError(
+                    "Gitea username must not contain ':' (HTTP Basic Auth "
+                    "disallows colons in usernames)."
+                )
+            # Refuse Basic Auth over http:// unless explicitly allowed.
+            if self._base_url.startswith("http://") and (
+                os.environ.get("LOOM_ALLOW_INSECURE_BASIC_AUTH", "") != "1"
+            ):
+                raise ValueError(
+                    "Gitea Basic Auth requires HTTPS to avoid leaking "
+                    "credentials. Set forge.gitea.url to an https:// URL, "
+                    "or set LOOM_ALLOW_INSECURE_BASIC_AUTH=1 to override "
+                    "(not recommended)."
+                )
+            # Do NOT add an Authorization header in Basic mode; requests
+            # will compute the Basic header from `auth=` on each call.
+            self._auth = (username, token)
+        else:
+            # Token auth (existing behavior, unchanged).
+            self._session.headers["Authorization"] = f"token {token}"
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -120,6 +167,7 @@ class GiteaForge:
                 resp = self._session.request(
                     method, url, json=json, params=params,
                     timeout=_DEFAULT_TIMEOUT,
+                    auth=self._auth,  # None for token auth, (user, pass) for Basic
                 )
             except requests.ConnectionError:
                 logger.error("Connection error reaching Gitea at %s", url)
@@ -160,12 +208,24 @@ class GiteaForge:
             break
 
         if resp.status_code in (401, 403):
-            scope_hint = (
-                " Ensure the token has 'repo' scope (or fine-grained "
-                "read/write permissions for issues, PRs, and labels)."
-                if resp.status_code == 403
-                else " Verify the token is valid and has not expired."
-            )
+            if resp.status_code == 403:
+                scope_hint = (
+                    " Ensure the token has 'repo' scope (or fine-grained "
+                    "read/write permissions for issues, PRs, and labels)."
+                )
+            elif self._auth is not None:
+                scope_hint = (
+                    " Verify the username/password are correct. (Basic Auth "
+                    "mode is in use because GITEA_USERNAME / "
+                    "forge.gitea.username is set.)"
+                )
+            else:
+                scope_hint = (
+                    " Verify the token is valid and has not expired. If this "
+                    "instance only supports password auth, set "
+                    "GITEA_USERNAME or forge.gitea.username to switch to "
+                    "Basic Auth."
+                )
             logger.error(
                 "Gitea auth failed (%d) for %s %s. "
                 "Check GITEA_TOKEN env var or forge.gitea.token config.%s",
