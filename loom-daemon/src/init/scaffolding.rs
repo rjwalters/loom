@@ -1156,7 +1156,9 @@ WARNING: Never run `lake build` inside Docker - causes memory corruption.
     #[test]
     fn test_claude_commands_always_updated_on_reinstall() {
         // .claude/ commands should always be force-merged on reinstall (without --force flag)
-        // This ensures command updates propagate while custom commands are preserved
+        // This ensures command updates propagate while custom commands are preserved.
+        // Issue #3310: also covers `.claude/agents/` (subagent definitions),
+        // which live alongside `.claude/commands/` and must propagate the same way.
         let temp_dir = TempDir::new().unwrap();
         let workspace = temp_dir.path();
         let defaults = temp_dir.path().join("defaults");
@@ -1164,8 +1166,9 @@ WARNING: Never run `lake build` inside Docker - causes memory corruption.
         // Setup git repo
         fs::create_dir(workspace.join(".git")).unwrap();
 
-        // Create defaults with .claude commands
+        // Create defaults with .claude commands AND agents
         fs::create_dir_all(defaults.join(".claude").join("commands").join("loom")).unwrap();
+        fs::create_dir_all(defaults.join(".claude").join("agents")).unwrap();
         fs::write(
             defaults
                 .join(".claude")
@@ -1184,9 +1187,26 @@ WARNING: Never run `lake build` inside Docker - causes memory corruption.
             "builder command v2",
         )
         .unwrap();
+        fs::write(
+            defaults
+                .join(".claude")
+                .join("agents")
+                .join("loom-builder.md"),
+            "loom-builder subagent v2",
+        )
+        .unwrap();
+        fs::write(
+            defaults
+                .join(".claude")
+                .join("agents")
+                .join("loom-judge.md"),
+            "loom-judge subagent v1",
+        )
+        .unwrap();
 
         // Create existing .claude directory in workspace (simulates previous install)
         fs::create_dir_all(workspace.join(".claude").join("commands").join("loom")).unwrap();
+        fs::create_dir_all(workspace.join(".claude").join("agents")).unwrap();
         fs::write(
             workspace
                 .join(".claude")
@@ -1202,6 +1222,22 @@ WARNING: Never run `lake build` inside Docker - causes memory corruption.
                 .join("commands")
                 .join("my-custom.md"),
             "my project-specific command",
+        )
+        .unwrap();
+        fs::write(
+            workspace
+                .join(".claude")
+                .join("agents")
+                .join("loom-builder.md"),
+            "loom-builder subagent v1 with bug",
+        )
+        .unwrap();
+        fs::write(
+            workspace
+                .join(".claude")
+                .join("agents")
+                .join("my-custom-agent.md"),
+            "project-specific custom subagent",
         )
         .unwrap();
 
@@ -1251,6 +1287,121 @@ WARNING: Never run `lake build` inside Docker - causes memory corruption.
         assert!(report
             .preserved
             .contains(&".claude/commands/my-custom.md".to_string()));
+
+        // Issue #3310: verify .claude/agents/ propagates identically.
+        // Default subagent updated:
+        let agent_content = fs::read_to_string(
+            workspace
+                .join(".claude")
+                .join("agents")
+                .join("loom-builder.md"),
+        )
+        .unwrap();
+        assert_eq!(agent_content, "loom-builder subagent v2");
+        // New default subagent added:
+        let new_agent_content = fs::read_to_string(
+            workspace
+                .join(".claude")
+                .join("agents")
+                .join("loom-judge.md"),
+        )
+        .unwrap();
+        assert_eq!(new_agent_content, "loom-judge subagent v1");
+        // Project-specific custom subagent preserved:
+        let custom_agent_content = fs::read_to_string(
+            workspace
+                .join(".claude")
+                .join("agents")
+                .join("my-custom-agent.md"),
+        )
+        .unwrap();
+        assert_eq!(custom_agent_content, "project-specific custom subagent");
+
+        assert!(report
+            .updated
+            .contains(&".claude/agents/loom-builder.md".to_string()));
+        assert!(report
+            .added
+            .contains(&".claude/agents/loom-judge.md".to_string()));
+        assert!(report
+            .preserved
+            .contains(&".claude/agents/my-custom-agent.md".to_string()));
+    }
+
+    #[test]
+    fn test_fresh_install_copies_claude_agents() {
+        // Issue #3310: a fresh install (no existing .claude/) must copy the
+        // full `.claude/agents/` tree from defaults so native subagent
+        // dispatch (subagent_type="loom-builder", etc.) works out of the
+        // box. Previously the .claude/ directory copy happened only via
+        // copy_dir_with_report — this test pins the behavior so the
+        // installer cannot silently regress agents/ in the future.
+        let temp_dir = TempDir::new().unwrap();
+        let workspace = temp_dir.path();
+        let defaults = temp_dir.path().join("defaults");
+
+        // Setup git repo
+        fs::create_dir(workspace.join(".git")).unwrap();
+
+        // Create defaults with .claude/agents/ (and a commands/ stub so the
+        // .claude/ src directory is non-empty, mirroring real defaults).
+        fs::create_dir_all(defaults.join(".claude").join("commands").join("loom")).unwrap();
+        fs::create_dir_all(defaults.join(".claude").join("agents")).unwrap();
+        fs::write(
+            defaults
+                .join(".claude")
+                .join("commands")
+                .join("loom")
+                .join("builder.md"),
+            "builder command",
+        )
+        .unwrap();
+        fs::write(
+            defaults
+                .join(".claude")
+                .join("agents")
+                .join("loom-builder.md"),
+            "loom-builder subagent body",
+        )
+        .unwrap();
+        fs::write(
+            defaults
+                .join(".claude")
+                .join("agents")
+                .join("loom-judge.md"),
+            "loom-judge subagent body",
+        )
+        .unwrap();
+
+        // Workspace starts with NO .claude/ — pure fresh install
+        assert!(!workspace.join(".claude").exists());
+
+        let mut report = InitReport::default();
+        setup_repository_scaffolding(workspace, &defaults, false, &mut report).unwrap();
+
+        // The fresh-install path must produce the full agents tree.
+        let installed_builder = workspace
+            .join(".claude")
+            .join("agents")
+            .join("loom-builder.md");
+        assert!(
+            installed_builder.exists(),
+            "fresh install must copy .claude/agents/loom-builder.md (see #3310)"
+        );
+        assert_eq!(fs::read_to_string(&installed_builder).unwrap(), "loom-builder subagent body");
+        assert!(workspace
+            .join(".claude")
+            .join("agents")
+            .join("loom-judge.md")
+            .exists());
+
+        // Report should track every agent file as "added".
+        assert!(report
+            .added
+            .contains(&".claude/agents/loom-builder.md".to_string()));
+        assert!(report
+            .added
+            .contains(&".claude/agents/loom-judge.md".to_string()));
     }
 
     // =========================================================================

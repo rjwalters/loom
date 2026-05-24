@@ -73,6 +73,8 @@ pub struct ValidationReport {
     pub scripts_found: Vec<String>,
     /// Slash commands found
     pub commands_found: Vec<String>,
+    /// Subagent definitions found in .claude/agents/
+    pub agents_found: Vec<String>,
     /// Whether CLAUDE.md exists
     pub has_claude_md: bool,
     /// Whether .github/labels.yml exists
@@ -431,15 +433,52 @@ mod tests {
 
         // Create .claude/commands/loom/
         fs::create_dir_all(workspace.join(".claude").join("commands").join("loom")).unwrap();
-        fs::write(
-            workspace
-                .join(".claude")
-                .join("commands")
-                .join("loom")
-                .join("builder.md"),
-            "",
-        )
-        .unwrap();
+        for cmd in [
+            "builder.md",
+            "judge.md",
+            "curator.md",
+            "doctor.md",
+            "shepherd.md",
+        ] {
+            fs::write(
+                workspace
+                    .join(".claude")
+                    .join("commands")
+                    .join("loom")
+                    .join(cmd),
+                "",
+            )
+            .unwrap();
+        }
+
+        // Create .claude/agents/ (subagent definitions — required for
+        // native Claude Code subagent dispatch). See issue #3310.
+        fs::create_dir_all(workspace.join(".claude").join("agents")).unwrap();
+        for agent in [
+            "loom-builder.md",
+            "loom-judge.md",
+            "loom-curator.md",
+            "loom-doctor.md",
+            "loom-shepherd.md",
+        ] {
+            fs::write(workspace.join(".claude").join("agents").join(agent), "").unwrap();
+        }
+
+        // Create roles to satisfy the >=5 role-count check (issue #3310 makes
+        // agents/ subject to the same kind of minimum-count audit and the
+        // validation report now bails on too-few defaults across the board).
+        for role in [
+            "builder.md",
+            "judge.md",
+            "curator.md",
+            "doctor.md",
+            "shepherd.md",
+        ] {
+            fs::write(workspace.join(".loom").join("roles").join(role), "").unwrap();
+        }
+
+        // Create a couple of scripts to satisfy the >=2 script-count check.
+        fs::write(workspace.join(".loom").join("scripts").join("daemon.sh"), "").unwrap();
 
         // Create docs
         fs::write(workspace.join("CLAUDE.md"), "").unwrap();
@@ -466,8 +505,58 @@ mod tests {
         assert!(validation.roles_found.contains(&"builder".to_string()));
         assert!(validation.scripts_found.contains(&"worktree".to_string()));
         assert!(validation.commands_found.contains(&"builder".to_string()));
+        // Issue #3310: subagent definitions must be discovered for native
+        // Claude Code `subagent_type` dispatch to work.
+        assert!(validation
+            .agents_found
+            .contains(&"loom-builder".to_string()));
         assert!(validation.has_claude_md);
         assert!(validation.has_labels_yml);
+        // Verify the missing-agents-directory issue is NOT raised when
+        // the directory exists with the expected fixtures.
+        assert!(!validation
+            .issues
+            .iter()
+            .any(|i| i.contains("Missing .claude/agents/")));
+    }
+
+    #[test]
+    fn test_self_install_flags_missing_agents_directory() {
+        // Issue #3310: a self-installed Loom checkout that is missing
+        // `.claude/agents/` cannot dispatch subagents. The validation
+        // report must surface this as an explicit issue so downstream
+        // tooling (installer reconciliation, `loom-daemon init`) can
+        // fail loudly instead of silently producing a broken install.
+        let temp_dir = TempDir::new().unwrap();
+        let workspace = temp_dir.path();
+
+        // Mark this directory as a Loom source repo via the marker file.
+        // We deliberately do NOT create `.claude/agents/` here.
+        fs::create_dir(workspace.join(".git")).unwrap();
+        fs::write(workspace.join(".loom-source"), "").unwrap();
+        fs::create_dir_all(workspace.join(".loom").join("roles")).unwrap();
+        fs::create_dir_all(workspace.join(".loom").join("scripts")).unwrap();
+        fs::create_dir_all(workspace.join(".claude").join("commands").join("loom")).unwrap();
+        fs::write(workspace.join("CLAUDE.md"), "").unwrap();
+        fs::create_dir_all(workspace.join(".github")).unwrap();
+        fs::write(workspace.join(".github").join("labels.yml"), "").unwrap();
+
+        let result =
+            initialize_workspace(workspace.to_str().unwrap(), "nonexistent-defaults", false);
+        assert!(result.is_ok());
+
+        let report = result.unwrap();
+        assert!(report.is_self_install);
+        let validation = report.validation.expect("validation report present");
+        assert!(validation.agents_found.is_empty());
+        assert!(
+            validation
+                .issues
+                .iter()
+                .any(|i| i == "Missing .claude/agents/ directory"),
+            "Expected missing-agents-directory issue, got: {:?}",
+            validation.issues
+        );
     }
 
     #[test]

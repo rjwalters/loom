@@ -895,6 +895,7 @@ EXPECTED_FILES=(
   "CLAUDE.md"
   ".github/labels.yml"
   ".claude/commands/loom"
+  ".claude/agents"
   ".claude/settings.json"
 )
 

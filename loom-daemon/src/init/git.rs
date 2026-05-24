@@ -105,6 +105,42 @@ pub fn is_loom_source_repo(workspace_path: &Path) -> bool {
     false
 }
 
+/// Collect file stems of every entry in `dir` whose extension matches `ext`.
+///
+/// Returns an empty vec when the directory is unreadable or missing — callers
+/// surface the "missing directory" issue separately.
+fn collect_file_stems(dir: &Path, ext: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let Ok(entries) = fs::read_dir(dir) else {
+        return out;
+    };
+    for entry in entries.filter_map(Result::ok) {
+        let path = entry.path();
+        if path.extension().is_some_and(|e| e == ext) {
+            if let Some(name) = path.file_stem() {
+                out.push(name.to_string_lossy().to_string());
+            }
+        }
+    }
+    out
+}
+
+/// Scan `dir` for files with extension `ext`, populating `found`. If `dir`
+/// does not exist, push a `Missing <missing_msg>` entry into `issues`.
+fn scan_or_record_missing(
+    dir: &Path,
+    ext: &str,
+    found: &mut Vec<String>,
+    issues: &mut Vec<String>,
+    missing_msg: &str,
+) {
+    if dir.is_dir() {
+        found.extend(collect_file_stems(dir, ext));
+    } else {
+        issues.push(format!("Missing {missing_msg}"));
+    }
+}
+
 /// Validate an existing Loom source repository configuration
 ///
 /// Instead of copying files, this validates that the expected structure exists
@@ -113,66 +149,40 @@ pub fn validate_loom_source_repo(workspace_path: &Path) -> ValidationReport {
     let mut report = ValidationReport::default();
     let loom_path = workspace_path.join(".loom");
 
-    // Check roles
-    let roles_dir = loom_path.join("roles");
-    if roles_dir.is_dir() {
-        if let Ok(entries) = fs::read_dir(&roles_dir) {
-            for entry in entries.filter_map(Result::ok) {
-                let path = entry.path();
-                if path.extension().is_some_and(|e| e == "md") {
-                    if let Some(name) = path.file_stem() {
-                        report.roles_found.push(name.to_string_lossy().to_string());
-                    }
-                }
-            }
-        }
-    } else {
-        report
-            .issues
-            .push("Missing .loom/roles/ directory".to_string());
-    }
+    scan_or_record_missing(
+        &loom_path.join("roles"),
+        "md",
+        &mut report.roles_found,
+        &mut report.issues,
+        ".loom/roles/ directory",
+    );
 
-    // Check scripts
-    let scripts_dir = loom_path.join("scripts");
-    if scripts_dir.is_dir() {
-        if let Ok(entries) = fs::read_dir(&scripts_dir) {
-            for entry in entries.filter_map(Result::ok) {
-                let path = entry.path();
-                if path.extension().is_some_and(|e| e == "sh") {
-                    if let Some(name) = path.file_stem() {
-                        report
-                            .scripts_found
-                            .push(name.to_string_lossy().to_string());
-                    }
-                }
-            }
-        }
-    } else {
-        report
-            .issues
-            .push("Missing .loom/scripts/ directory".to_string());
-    }
+    scan_or_record_missing(
+        &loom_path.join("scripts"),
+        "sh",
+        &mut report.scripts_found,
+        &mut report.issues,
+        ".loom/scripts/ directory",
+    );
 
-    // Check .claude/commands/loom/
-    let commands_dir = workspace_path.join(".claude").join("commands").join("loom");
-    if commands_dir.is_dir() {
-        if let Ok(entries) = fs::read_dir(&commands_dir) {
-            for entry in entries.filter_map(Result::ok) {
-                let path = entry.path();
-                if path.extension().is_some_and(|e| e == "md") {
-                    if let Some(name) = path.file_stem() {
-                        report
-                            .commands_found
-                            .push(name.to_string_lossy().to_string());
-                    }
-                }
-            }
-        }
-    } else {
-        report
-            .issues
-            .push("Missing .claude/commands/loom/ directory".to_string());
-    }
+    scan_or_record_missing(
+        &workspace_path.join(".claude").join("commands").join("loom"),
+        "md",
+        &mut report.commands_found,
+        &mut report.issues,
+        ".claude/commands/loom/ directory",
+    );
+
+    // .claude/agents/ holds subagent definitions (loom-builder, loom-judge, …).
+    // Required for native Claude Code `subagent_type` dispatch — without these
+    // files fresh installs cannot use the loom-* subagents. See issue #3310.
+    scan_or_record_missing(
+        &workspace_path.join(".claude").join("agents"),
+        "md",
+        &mut report.agents_found,
+        &mut report.issues,
+        ".claude/agents/ directory",
+    );
 
     // Check documentation files
     report.has_claude_md = workspace_path.join("CLAUDE.md").exists();
@@ -204,6 +214,17 @@ pub fn validate_loom_source_repo(workspace_path: &Path) -> ValidationReport {
         report.issues.push(format!(
             "Expected at least 4 slash commands, found {}",
             report.commands_found.len()
+        ));
+    }
+
+    // The shipped agents pool currently contains 11 loom-* subagents
+    // (architect, auditor, builder, champion, curator, daemon, doctor,
+    // guide, hermit, judge, shepherd). Require at least 5 so a degraded
+    // install (missing core dispatchers like loom-builder) is flagged.
+    if report.agents_found.len() < 5 {
+        report.issues.push(format!(
+            "Expected at least 5 subagent definitions in .claude/agents/, found {}",
+            report.agents_found.len()
         ));
     }
 
