@@ -80,6 +80,14 @@ Thumbs.db
 # - settings.local.json: Personal preferences (gitignored)
 .claude/settings.local.json
 
+# Dogfood symlink (issue #3311):
+# When loom is installed *on* the loom source repo, `.claude/agents` is a
+# symlink to `defaults/.claude/agents/` so the in-repo agent definitions
+# always reflect the committed source-of-truth (no copy = no drift).
+# Created by `./scripts/install-loom.sh --dogfood .` or auto-detected when
+# installing into the loom repo itself.
+.claude/agents
+
 # Skill routing local overrides (untracked, user-specific)
 .loom/config/skill-routes.local.json
 .loom/*.log
