@@ -1,8 +1,8 @@
 # Sweep
 
-Process an explicit list of issues through the full shepherd lifecycle from the current Claude session — no external daemon required. Runs sequentially by default, or in **parallel waves** of up to `N` builders when `--builders-per-wave N` is supplied.
+Process an explicit list of issues through the full shepherd lifecycle from the current Claude session — no external daemon required. Runs sequentially by default, or in **parallel waves** of up to `N` builders when `--builders-per-wave N` is supplied. Supports `--dry-run` to preview the candidate plan without mutating anything.
 
-> **Scope.** This skill accepts either an explicit list of issue numbers or a natural-language description of which issues to process, and runs them through the full lifecycle in waves. `--dry-run` and other knobs sketched in #3298 are **deliberately deferred** — see "Limitations" below.
+> **Scope.** This skill accepts either an explicit list of issue numbers or a natural-language description of which issues to process, and runs them through the full lifecycle in waves. Supports `--dry-run` to preview the plan without mutations. Other knobs sketched in #3298 are **deliberately deferred** — see "Limitations" below.
 >
 > If you need fully autonomous orchestration with work generation, use `/loom`. If you need a single-issue lifecycle, use `/shepherd <N>`. `/sweep` exists for the in-between case: "I have these N issues, run them in this session, without spinning up a daemon."
 
@@ -10,7 +10,7 @@ Process an explicit list of issues through the full shepherd lifecycle from the 
 
 **Arguments**: $ARGUMENTS
 
-`$ARGUMENTS` is interpreted in one of **two modes**, chosen by inspection of the non-flag tokens:
+`$ARGUMENTS` is interpreted in one of **two modes**, chosen by inspection of the non-flag tokens. Before classifying, **strip all recognized flag tokens** (`--builders-per-wave N`, `--dry-run`) from the token list — flags are honoured in both modes.
 
 ### Mode A — Explicit numeric list (fast path, regression guard)
 
@@ -47,16 +47,18 @@ Combine flags as needed. Always pass `--state open` explicitly (default) unless 
 3. **Out-of-band queries** (anything `gh issue list` cannot express by itself — body-content searches, file-touch queries like "issues touching `loom-daemon`", "issues without tests", repository-diff inspection). These require per-issue body or diff inspection, which is **out of scope for this skill**. Ask the user to clarify or supply explicit issue numbers. Do **not** attempt heuristic per-issue inspection here.
 4. **Ambiguous time windows** ("recent", "lately", "this sprint"). Ask the user to specify a concrete date or duration rather than guessing. The translation table above only covers concrete forms ("last week", "last N days") which compute deterministically.
 
-### Optional flag
+### Optional flags
 
 - **`--builders-per-wave N`** — dispatch up to `N` builders in parallel per wave. Default `1` (fully sequential, matching the MVP behaviour). `N` must be an integer `>= 1`. Honoured in both modes — flag tokens are stripped before the Mode A / Mode B classification.
+- **`--dry-run`** — print the planned candidate list (with wave grouping) and EXIT without performing any mutation. Recognized as a bare flag token (no value). May appear anywhere in `$ARGUMENTS`. Default is off. Honoured in both modes — stripped before classification along with other flags.
 
 ### Validation rules
 
+- Recognize `--dry-run` as a flag token anywhere in `$ARGUMENTS`, strip it from the candidate list before validation, and store it as a boolean (`DRY_RUN=true` if present, else `false`).
 - At least one candidate (numeric token or NL description) must be supplied. If `$ARGUMENTS` (after stripping flag tokens) is empty, display:
   ```
-  Usage: /sweep <issue-number> [<issue-number> ...] [--builders-per-wave N]
-         /sweep <natural-language description>     [--builders-per-wave N]
+  Usage: /sweep <issue-number> [<issue-number> ...] [--builders-per-wave N] [--dry-run]
+         /sweep <natural-language description>     [--builders-per-wave N] [--dry-run]
 
   See #3298 for the full design.
   ```
@@ -97,6 +99,8 @@ The cap is **soft** — there is no hard upper bound. The warning is the only gu
 /sweep 123 456 789 --builders-per-wave 2      # Two builders per wave (recommended)
 /sweep 1 2 3 4 5 6 --builders-per-wave 3      # Three builders per wave (validated)
 /sweep 1 2 --builders-per-wave 5              # Silently clamps to 2 (candidate count)
+/sweep 123 456 789 --dry-run                  # Print plan and EXIT without mutating
+/sweep 1 2 3 4 5 --dry-run --builders-per-wave 2  # Preview with wave grouping
 ```
 
 ### Mode B — Natural-language description
@@ -119,6 +123,9 @@ The cap is **soft** — there is no hard upper bound. The warning is the only gu
 
 # Mixed mode — union of explicit numbers AND an NL-derived set:
 /sweep #3310 #3312 and any other loom:issue with 'docs' in the title
+
+# Dry-run a NL-derived candidate set before committing to side effects:
+/sweep all loom:curated issues --dry-run
 ```
 
 ### Clarification triggers (Mode B asks before spawning)
@@ -158,6 +165,67 @@ If a future maintainer is tempted to "simplify" by replacing the wave-loop with 
 ### Other constraints
 
 - **Do NOT write to `.loom/daemon-state.json`.** That file is owned by the standalone daemon. `/sweep` runs independently and must not race with the daemon on shepherd-slot bookkeeping. Reading `daemon-state.json` for situational awareness is fine; writing is not.
+
+## 0. Dry-run gate (if `--dry-run`)
+
+If `--dry-run` was supplied, **this stage runs before any mutation** and EXITs after printing the plan. The dry-run gate is the single inviolable contract of `--dry-run`: no label edits, no `worktree.sh` invocation, no `gh pr create`, no `merge-pr.sh`, no daemon-state writes, no Task/subagent dispatch.
+
+**Procedure:**
+
+1. **Survey each candidate (read-only).** For every deduplicated, validated issue number `N` in the candidate list:
+   ```bash
+   gh issue view N --json number,title,labels,state --jq '{number, title, state, labels: [.labels[].name]}'
+   ```
+   This is a `gh issue view` read — it does not mutate anything. (If `gh` is unauthenticated or the issue is unreachable, log the error against that candidate and continue surveying the rest.)
+
+2. **Compute wave partition.** Partition the candidate list into waves of size `--builders-per-wave` (default `1`), preserving input order. Record `(issue, wave_index, total_waves)` for each candidate. Apply the same silent-clamp and pre-flight-skip rules that the live path uses (closed / `loom:building` / `loom:blocked` issues are tagged as "would skip" in the plan but still appear in the output for transparency).
+
+3. **Print the plan.** Emit a table or block per the format below.
+
+4. **EXIT.** Do not proceed to "Wave Lifecycle". The shell must return as soon as the plan is printed.
+
+**Output spec** (minimum useful — do **not** add token-pool selection or agent dispatch internals):
+
+```
+/sweep --dry-run plan: M candidate(s) across W wave(s) (--builders-per-wave=N)
+
+  Wave 1:
+    #123  "Add foo widget"                labels: loom:issue                    → would build
+    #124  "Fix bar bug"                   labels: loom:curated                  → would curate, build
+  Wave 2:
+    #125  "Refactor baz module"           labels: loom:building                 → would skip (already in flight)
+    #126  "Document quux"                 labels: (none)                        → would curate, build
+
+Total: 3 would-build, 1 would-skip. No issues were modified.
+```
+
+**Per-candidate fields (required):**
+- Issue number
+- Title (truncated reasonably if very long)
+- Current labels (comma-separated, or `(none)`)
+- Planned action (`would build`, `would curate, build`, `would skip (<reason>)`)
+- Wave assignment (shown via the `Wave N:` group header)
+
+**Footer (required):** total candidates, total waves, count of `would-build` vs `would-skip`, and an explicit confirmation that nothing was modified.
+
+**Explicitly out of scope for dry-run output** (do not add these — see Limitations):
+- Token-pool / account selection internals
+- Subagent dispatch order or parallelism counts beyond wave size
+- Persisting the plan to disk
+- Diffing this plan against a previous or actual sweep
+
+**Verifying "nothing mutates":**
+
+```bash
+# Before:
+LABELS_BEFORE=$(gh issue view N --json labels --jq '[.labels[].name]|sort')
+PRS_BEFORE=$(gh pr list --state open --json number --jq '[.[].number]|sort')
+WORKTREES_BEFORE=$(ls .loom/worktrees/ 2>/dev/null | wc -l)
+# Run: /sweep --dry-run N
+# All three must be unchanged after the dry-run returns.
+```
+
+These three checks — label set per candidate, open PR set, worktree count — are the acceptance criteria. If any of them differ pre/post a `--dry-run` invocation, the dry-run gate is broken.
 
 ## Wave Lifecycle
 
@@ -333,7 +401,7 @@ The full `/sweep` design in #3298 includes many features that are intentionally 
 |---------|--------|-------|
 | Parallel waves (`--builders-per-wave N`) | **Implemented (#3316)** | Soft cap at N=3 (warns above). One level deep — no `/shepherd` subagent. |
 | Natural-language selectors (label/author/title/time-window filters via NL description) | **Implemented (#3318)** | Mode B in Arguments. Out-of-band queries (body/diff inspection, file-touch filters) still trigger clarification. |
-| `--dry-run` | Deferred (#3319) | Useful for validating a candidate list before committing to side effects. |
+| `--dry-run` | **Implemented (#3319)** | Prints the candidate plan (with wave grouping) and exits without mutating labels, worktrees, or PRs. |
 | `--max-waves` cap | Deferred | Operator-level brake on long sweeps. |
 | `--paused-merge` / `--no-judge` | Deferred | Merge-mode variants for trusted batches. |
 | `--include-blocked` (unblock pass) | Deferred | Currently `/sweep` skips `loom:blocked` issues outright. |
