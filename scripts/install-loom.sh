@@ -35,6 +35,7 @@ set -euo pipefail
 NON_INTERACTIVE=false
 FORCE_OVERWRITE=false
 CLEAN_FIRST=false
+DOGFOOD_MODE=""  # "" (auto-detect), "true" (forced), "false" (forced off)
 TARGET_PATH=""
 
 while [[ $# -gt 0 ]]; do
@@ -51,14 +52,25 @@ while [[ $# -gt 0 ]]; do
       CLEAN_FIRST=true
       shift
       ;;
+    --dogfood)
+      DOGFOOD_MODE="true"
+      shift
+      ;;
+    --no-dogfood)
+      DOGFOOD_MODE="false"
+      shift
+      ;;
     -h|--help)
       echo "Usage: $0 [OPTIONS] /path/to/target-repo"
       echo ""
       echo "Options:"
-      echo "  -y, --yes     Non-interactive mode"
-      echo "  -f, --force   Force overwrite existing files and enable auto-merge"
-      echo "  --clean       Run uninstall first, then fresh install (combines both operations)"
-      echo "  -h, --help    Show this help message"
+      echo "  -y, --yes        Non-interactive mode"
+      echo "  -f, --force      Force overwrite existing files and enable auto-merge"
+      echo "  --clean          Run uninstall first, then fresh install (combines both operations)"
+      echo "  --dogfood        Force dogfood mode: symlink .claude/agents -> ../defaults/.claude/agents"
+      echo "                   (auto-detected when installing into the Loom source repo itself)"
+      echo "  --no-dogfood     Disable dogfood mode even when installing into the Loom source repo"
+      echo "  -h, --help       Show this help message"
       exit 0
       ;;
     *)
@@ -309,6 +321,28 @@ if [[ -n "$MAIN_WORKTREE" ]] && [[ "$TARGET_PATH" != "$MAIN_WORKTREE" ]]; then
   warning "Target path is inside a worktree: $TARGET_PATH"
   info "Resolving to main repository root: $MAIN_WORKTREE"
   TARGET_PATH="$MAIN_WORKTREE"
+fi
+
+# Dogfood mode detection (issue #3311):
+# When installing Loom *on* the Loom source repo itself, copying
+# defaults/.claude/agents/ into .claude/agents/ would create silent drift
+# from the source of truth. Instead, replace the copied directory with a
+# gitignored symlink so the in-repo .claude/agents/ always reflects the
+# committed defaults/.claude/agents/ tree.
+#
+# Detection: TARGET_PATH equals LOOM_ROOT (the same git repo). Operator can
+# force on/off with --dogfood / --no-dogfood. Defaults to auto-detect.
+if [[ -z "$DOGFOOD_MODE" ]]; then
+  if [[ "$TARGET_PATH" == "$LOOM_ROOT" ]]; then
+    DOGFOOD_MODE="true"
+    info "Detected dogfood install (target == Loom source repo): .claude/agents will be symlinked"
+  else
+    DOGFOOD_MODE="false"
+  fi
+elif [[ "$DOGFOOD_MODE" == "true" ]] && [[ "$TARGET_PATH" != "$LOOM_ROOT" ]]; then
+  warning "--dogfood specified but target ($TARGET_PATH) is not the Loom source repo ($LOOM_ROOT)"
+  warning "Dogfood symlink would point outside the target repository; disabling dogfood mode"
+  DOGFOOD_MODE="false"
 fi
 
 # ============================================================================
@@ -712,6 +746,69 @@ fi
 
 echo ""
 
+# Dogfood mode (issue #3311): replace the copied .claude/agents/ tree in the
+# main checkout with a symlink to defaults/.claude/agents/. This avoids silent
+# drift between defaults/ and .claude/agents/ when working *on* the Loom
+# source repo. The .gitignore entry for `.claude/agents` (committed) ensures
+# git status stays clean and the install PR does not stage agent files.
+#
+# Why operate on $TARGET_PATH (main checkout) rather than the install worktree:
+#   - The relative symlink target `../defaults/.claude/agents` only resolves
+#     correctly when `.claude/` sits next to `defaults/` (i.e. at the repo
+#     root, not inside `.loom/worktrees/loom-install-*/`).
+#   - The install worktree's `.claude/agents/` files are now gitignored, so
+#     they will not be staged by `git add -A` in create-pr.sh — leaving them
+#     in place is harmless and avoids a destructive delete inside the
+#     worktree before the PR is created.
+if [[ "$DOGFOOD_MODE" == "true" ]]; then
+  info "Dogfood mode: ensuring .claude/agents symlink in $TARGET_PATH..."
+  DOGFOOD_LINK_PATH="$TARGET_PATH/.claude/agents"
+  DOGFOOD_LINK_TARGET="../defaults/.claude/agents"
+  DOGFOOD_ABS_TARGET="$TARGET_PATH/defaults/.claude/agents"
+
+  if [[ ! -d "$DOGFOOD_ABS_TARGET" ]]; then
+    warning "Dogfood symlink target does not exist: $DOGFOOD_ABS_TARGET"
+    warning "Skipping symlink creation; .claude/agents may be missing or stale"
+  else
+    mkdir -p "$TARGET_PATH/.claude"
+    if [[ -L "$DOGFOOD_LINK_PATH" ]]; then
+      EXISTING_TARGET=$(readlink "$DOGFOOD_LINK_PATH")
+      if [[ "$EXISTING_TARGET" == "$DOGFOOD_LINK_TARGET" ]]; then
+        success ".claude/agents symlink already correct (-> $DOGFOOD_LINK_TARGET)"
+      else
+        info "Updating .claude/agents symlink: $EXISTING_TARGET -> $DOGFOOD_LINK_TARGET"
+        rm -f "$DOGFOOD_LINK_PATH"
+        ln -s "$DOGFOOD_LINK_TARGET" "$DOGFOOD_LINK_PATH"
+        success "Updated .claude/agents symlink"
+      fi
+    elif [[ -e "$DOGFOOD_LINK_PATH" ]]; then
+      # Real directory or file occupies the path — replace with symlink.
+      # Safe because (a) defaults/.claude/agents/ has the canonical content,
+      # and (b) .claude/agents is gitignored so any local edits would not have
+      # been committed anyway. Preserve any local-only files by refusing to
+      # delete when the directory contains files not present in defaults.
+      LOCAL_ONLY_FILES=$(comm -23 \
+        <(cd "$DOGFOOD_LINK_PATH" 2>/dev/null && find . -type f | sort) \
+        <(cd "$DOGFOOD_ABS_TARGET" 2>/dev/null && find . -type f | sort) \
+        2>/dev/null || true)
+      if [[ -n "$LOCAL_ONLY_FILES" ]]; then
+        warning ".claude/agents contains local-only files not present in defaults:"
+        echo "$LOCAL_ONLY_FILES" | sed 's/^/    /'
+        warning "Refusing to replace with symlink. Move or commit these files, then re-run."
+      else
+        info "Replacing copied .claude/agents/ directory with symlink to defaults/..."
+        rm -rf "$DOGFOOD_LINK_PATH"
+        ln -s "$DOGFOOD_LINK_TARGET" "$DOGFOOD_LINK_PATH"
+        success "Replaced .claude/agents/ with symlink -> $DOGFOOD_LINK_TARGET"
+      fi
+    else
+      ln -s "$DOGFOOD_LINK_TARGET" "$DOGFOOD_LINK_PATH"
+      success "Created .claude/agents symlink -> $DOGFOOD_LINK_TARGET"
+    fi
+  fi
+  echo ""
+fi
+
 # Configure git hooks path so .githooks/ pre-commit works without husky/npx
 info "Configuring git hooks path..."
 git config core.hooksPath .githooks
@@ -798,6 +895,13 @@ while IFS= read -r -d '' file; do
       continue
       ;;
   esac
+  # Dogfood mode (issue #3311): exclude .claude/agents/* — these files exist
+  # locally in the install worktree but are gitignored and will not be
+  # committed. Listing them in install-metadata.json's installed_files would
+  # cause downstream verify-install.sh runs to flag false drift after merge.
+  if [[ "$DOGFOOD_MODE" == "true" ]] && [[ "$rel_path" == .claude/agents/* ]]; then
+    continue
+  fi
   if [[ "$FIRST_FILE" == "true" ]]; then
     FIRST_FILE=false
   else
