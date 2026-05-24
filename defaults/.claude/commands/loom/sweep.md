@@ -2,7 +2,7 @@
 
 Process an explicit list of issues through the full shepherd lifecycle from the current Claude session — no external daemon required. Runs sequentially by default, or in **parallel waves** of up to `N` builders when `--builders-per-wave N` is supplied.
 
-> **Scope.** This skill accepts an explicit list of issue numbers and processes them in waves. Selectors (`label:`, `author:`, `epic:`, `topic:`), `--dry-run`, and other knobs sketched in #3298 are **deliberately deferred** — see "Limitations" below.
+> **Scope.** This skill accepts either an explicit list of issue numbers or a natural-language description of which issues to process, and runs them through the full lifecycle in waves. `--dry-run` and other knobs sketched in #3298 are **deliberately deferred** — see "Limitations" below.
 >
 > If you need fully autonomous orchestration with work generation, use `/loom`. If you need a single-issue lifecycle, use `/shepherd <N>`. `/sweep` exists for the in-between case: "I have these N issues, run them in this session, without spinning up a daemon."
 
@@ -10,23 +10,65 @@ Process an explicit list of issues through the full shepherd lifecycle from the 
 
 **Arguments**: $ARGUMENTS
 
-Parse the arguments as a whitespace-separated list of issue numbers, with one optional flag:
+`$ARGUMENTS` is interpreted in one of **two modes**, chosen by inspection of the non-flag tokens:
 
-- **`--builders-per-wave N`** — dispatch up to `N` builders in parallel per wave. Default `1` (fully sequential, matching the MVP behaviour). `N` must be an integer `>= 1`.
+### Mode A — Explicit numeric list (fast path, regression guard)
 
-Each non-flag token must be a positive integer (optionally prefixed with `#`, e.g. `123` or `#123`).
+If **every** whitespace-separated non-flag token matches the regex `^#?\d+$` (a positive integer with an optional leading `#`), treat the arguments as today's explicit issue list. **No LLM interpretation, no extra `gh` calls.** This is the MVP behaviour and must remain bit-for-bit compatible — `/sweep 123 456` and `/sweep #123 #456` continue to work exactly as before.
 
-**Validation rules:**
+### Mode B — Natural-language interpretation
 
-- At least one issue number must be supplied. If `$ARGUMENTS` is empty, display:
+Otherwise, treat `$ARGUMENTS` as an English description of which open issues to process. The orchestrator (Claude, this session) translates the description into one or more `gh issue list` invocations using the appropriate flags, surfaces the derived candidate set, awaits user confirmation, then proceeds with the rest of the lifecycle exactly as in Mode A.
+
+**This is deliberately not a formal grammar.** There is no parser, no operator precedence, no fixed vocabulary. The orchestrator reads the description and picks reasonable `gh issue list` flags. The interpretation rules below are prose, not a spec.
+
+**Translation guide — common NL fragments to `gh issue list` flags** (verified against `gh` v2):
+
+| NL fragment | `gh issue list` flag(s) |
+|-------------|------------------------|
+| "labeled `loom:curated`" / "all `loom:curated` issues" | `--label loom:curated` |
+| "filed by rjwalters" | `--author rjwalters` |
+| "all my ..." / "my agent-filed ..." | `--author @me` (NOT `--assignee` — Loom files but does not self-assign) |
+| "in the last week" / "from the last N days" | `--search "created:>=YYYY-MM-DD"` (compute the date) |
+| "with 'docs' in the title" | `--search "docs in:title"` |
+| "open" (always assumed) | `--state open` (the default) |
+| "closed too" | `--state all` |
+
+Combine flags as needed. Always pass `--state open` explicitly (default) unless the user asks for closed issues. Default to `--limit 100` rather than the `gh` default of `30` to avoid silent truncation (see edge case below).
+
+**Mixed mode is supported.** `/sweep #3310 #3312 and any other loom:issue with 'docs' in the title` should be interpreted as the union of `{3310, 3312}` and the `gh issue list --label loom:issue --search "docs in:title"` result. Because the tokens contain non-numeric words, this falls into Mode B and the orchestrator handles the union.
+
+**Unknown-label guard.** Loom never invents labels (CLAUDE.md "Never create new GitHub labels"). If the description mentions a label not present in `.github/labels.yml` (e.g. `bug` in this repo), **do not** silently fabricate a `--label bug` filter — ask the user to clarify which existing label they meant, or supply explicit issue numbers.
+
+### Edge cases (prose rules, applied in either mode but mostly relevant to Mode B)
+
+1. **Zero matches.** Print the derived `gh issue list` command and its empty result, then EXIT cleanly. Do not spawn any agents and do not fall through to Mode A.
+2. **More than the result cap.** `gh issue list` defaults to `--limit 30`; this skill should pass `--limit 100` explicitly. If results still hit the cap (100 candidates), print a warning that the result set was truncated and ask the user to narrow the description before proceeding. Do not silently process only the first 100.
+3. **Out-of-band queries** (anything `gh issue list` cannot express by itself — body-content searches, file-touch queries like "issues touching `loom-daemon`", "issues without tests", repository-diff inspection). These require per-issue body or diff inspection, which is **out of scope for this skill**. Ask the user to clarify or supply explicit issue numbers. Do **not** attempt heuristic per-issue inspection here.
+4. **Ambiguous time windows** ("recent", "lately", "this sprint"). Ask the user to specify a concrete date or duration rather than guessing. The translation table above only covers concrete forms ("last week", "last N days") which compute deterministically.
+
+### Optional flag
+
+- **`--builders-per-wave N`** — dispatch up to `N` builders in parallel per wave. Default `1` (fully sequential, matching the MVP behaviour). `N` must be an integer `>= 1`. Honoured in both modes — flag tokens are stripped before the Mode A / Mode B classification.
+
+### Validation rules
+
+- At least one candidate (numeric token or NL description) must be supplied. If `$ARGUMENTS` (after stripping flag tokens) is empty, display:
   ```
   Usage: /sweep <issue-number> [<issue-number> ...] [--builders-per-wave N]
+         /sweep <natural-language description>     [--builders-per-wave N]
 
   See #3298 for the full design.
   ```
   and EXIT.
-- Reject any non-flag token that is not a positive integer (after stripping a leading `#`). Display an error showing the offending token and EXIT.
-- Deduplicate the issue list (preserve first-seen order).
+- **Mode A** (every non-flag token matches `^#?\d+$`):
+  - Strip leading `#` from each token, parse as a positive integer.
+  - Reject any token that fails to parse as a positive integer (after stripping). Display an error showing the offending token and EXIT.
+  - Deduplicate the issue list (preserve first-seen order).
+- **Mode B** (any non-flag token does not match `^#?\d+$`):
+  - Translate the description to `gh issue list` invocation(s) per the guide above.
+  - Run the command, deduplicate, and **display the candidate set to the user before spawning any agents.** Await confirmation. If the user declines, EXIT cleanly.
+  - If the description is ambiguous, hits an out-of-band query, or references an unknown label, ask for clarification first — do not guess.
 - **`--builders-per-wave N` validation:**
   - Parse `N` as an integer. Reject non-integer values with a clear error and EXIT.
   - Reject `N < 1` (including `0` and negative values) with: `Error: --builders-per-wave must be >= 1 (got: <N>)` and EXIT. Do **not** silently default to `1`.
@@ -46,6 +88,8 @@ The cap is **soft** — there is no hard upper bound. The warning is the only gu
 
 ## Examples
 
+### Mode A — Explicit numeric list (fast path)
+
 ```bash
 /sweep 123                                    # Sequential lifecycle for issue 123
 /sweep 123 456 789                            # Sequential lifecycle for three issues
@@ -53,6 +97,44 @@ The cap is **soft** — there is no hard upper bound. The warning is the only gu
 /sweep 123 456 789 --builders-per-wave 2      # Two builders per wave (recommended)
 /sweep 1 2 3 4 5 6 --builders-per-wave 3      # Three builders per wave (validated)
 /sweep 1 2 --builders-per-wave 5              # Silently clamps to 2 (candidate count)
+```
+
+### Mode B — Natural-language description
+
+```bash
+# Label filter — translates to: gh issue list --label loom:curated --state open --limit 100
+/sweep all loom:curated issues
+
+# Compound label + author + time filter — translates to:
+#   gh issue list --label loom:curated --author rjwalters \
+#                 --search "created:>=2026-05-17" --state open --limit 100
+/sweep all loom:curated issues filed by rjwalters in the last week
+
+# Title search on a label-filtered set — translates to:
+#   gh issue list --label loom:issue --search "docs in:title" --state open --limit 100
+/sweep loom:issue items with 'docs' in the title
+
+# "My" → --author @me (Loom files but does not self-assign):
+/sweep all my agent-filed loom:issue items --builders-per-wave 2
+
+# Mixed mode — union of explicit numbers AND an NL-derived set:
+/sweep #3310 #3312 and any other loom:issue with 'docs' in the title
+```
+
+### Clarification triggers (Mode B asks before spawning)
+
+```bash
+# Ambiguous time window — asks "what duration do you mean?"
+/sweep recent loom:issue items
+
+# Out-of-band query — gh issue list cannot inspect file paths in the diff
+/sweep issues labeled loom:issue except the ones touching loom-daemon
+
+# Unknown label — 'bug' is not in .github/labels.yml; ask which label was meant
+/sweep all my agent-filed bugs that aren't blocked
+
+# Pure nonsense — no derivable candidate set
+/sweep nonsense gibberish
 ```
 
 ## Execution Model
@@ -250,7 +332,7 @@ The full `/sweep` design in #3298 includes many features that are intentionally 
 | Feature | Status | Notes |
 |---------|--------|-------|
 | Parallel waves (`--builders-per-wave N`) | **Implemented (#3316)** | Soft cap at N=3 (warns above). One level deep — no `/shepherd` subagent. |
-| Selectors (`label:`, `author:`, `epic:#N`, `topic:`, bare invocation) | Deferred (#3318) | Currently only explicit issue numbers are accepted. |
+| Natural-language selectors (label/author/title/time-window filters via NL description) | **Implemented (#3318)** | Mode B in Arguments. Out-of-band queries (body/diff inspection, file-touch filters) still trigger clarification. |
 | `--dry-run` | Deferred (#3319) | Useful for validating a candidate list before committing to side effects. |
 | `--max-waves` cap | Deferred | Operator-level brake on long sweeps. |
 | `--paused-merge` / `--no-judge` | Deferred | Merge-mode variants for trusted batches. |
