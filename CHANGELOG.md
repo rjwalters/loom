@@ -7,6 +7,52 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-05-24
+
+### Summary
+
+`/loom:sweep` matures from MVP to a full orchestration surface: parallel wave dispatch (`--builders-per-wave N`), natural-language selector interpretation, and `--dry-run` previews. Together these are Phase 1 of a phased plan to deprecate `loom-daemon` + the shepherd model in favor of in-session sweep-driven orchestration (architect's proposal on #3317 — ~10:1 LOC simplification opportunity). v0.8 ships sweep alongside the daemon (daemon stays default) so users can validate sweep against real workloads before Phase 2 lands in v0.9.
+
+Also in this release: a long-overdue dogfood fix that makes `loom-*` subagents discoverable in installed repos and in this checkout itself (#3305 umbrella → #3313 / #3314 / #3315), Gitea hardening for basic-auth instances and merge-mergeability races, and a clarified label-ownership taxonomy in `.github/labels.yml` + `CLAUDE.md`.
+
+### Added
+
+- `/loom:sweep --builders-per-wave N` — in-session parallel wave dispatch for the sweep skill. Each wave dispatches up to N `loom-builder` subagents directly from the orchestrator session (one level deep, sidestepping the two-level-deep race documented in #3289). Defaults to N=1 (sequential MVP behavior); N=2 recommended, N=3 validated, N≥4 warns. Silent clamp when N > candidate count. Prominent "CRITICAL: One level deep — never spawn `/shepherd` as a subagent" guardrail in the skill text (#3316 / PR #3320)
+- `/loom:sweep` natural-language selector interpretation — dual-mode contract: regex fast-path for `^#?\d+$` tokens (preserves explicit `#N #M #K` MVP behavior bit-for-bit); natural-language description for anything else, translated to `gh issue list` flags (`--label`, `--author`, `--search`, `--state`) by the orchestrator. Deliberately non-formal: no grammar, no parser. Documents 4 edge cases (zero matches, >100 cap warning, file-touch queries → clarification, ambiguous time windows → clarification) (#3318 / PR #3321)
+- `/loom:sweep --dry-run` — read-only preview that prints the candidate list, wave layout (respects `--builders-per-wave`), and total wave count without spawning agents, editing labels, creating worktrees, or merging PRs. Concrete acceptance: pre/post snapshots of candidate labels, open-PR list, and `.loom/worktrees/` count are unchanged (#3319 / PR #3322)
+- Installer copies `defaults/.claude/agents/loom-*.md` into target `.claude/agents/` so native subagent dispatch (`Agent(subagent_type="loom-builder", ...)`) works in fresh installs. Adds parallel `.claude/agents/` validation to `loom-daemon init` (≥5 subagent files required) mirroring the existing `.claude/commands/loom/` check (#3310 / PR #3314)
+- Installer dogfood mode — auto-detected when `TARGET_PATH == LOOM_ROOT` or forced with `--dogfood` / `--no-dogfood`. Creates `.claude/agents -> ../defaults/.claude/agents` symlink in the loom repo's own checkout instead of copying (zero drift from source of truth). `.gitignore` gains `.claude/agents`. Refuses to replace local-only agent files (#3311 / PR #3315)
+- Gitea basic-auth support for token-less self-hosted instances — `loom-forge` and helpers now accept `GITEA_USER` / `GITEA_PASS` env vars as a fallback when `GITEA_TOKEN` is absent (#3303)
+- `loom-tools/src/loom_tools/common/gitea.py:merge_pull_request` polls `mergeable` for up to 10s (treating both `null` and `false` as "still computing" since Gitea returns `false` as the initial async-computation value, not `null`) then attempts the merge POST and lets the response be the source of truth (#3306 / PR #3309)
+
+### Changed
+
+- `defaults/.claude/README.md` rewrites the subagent-invocation pattern to show `subagent_type="loom-<role>"` (native dispatch) as the primary pattern; the legacy `general-purpose` + slash-command-in-prompt pattern is preserved and clearly marked as a fallback. Together with the installer copy/symlink work, this closes the gap where the docs documented one pattern but the lookup path didn't support it (#3312 / PR #3313)
+- `.github/labels.yml` — every lifecycle label description gains an `Applied by:` clause naming the agent or role that owns the transition. Prevents the "intake should be `loom:curating` or `loom:triage`?" confusion that caused a mislabel mid-session. Covers `loom:triage`, `loom:issue`, `loom:building`, `loom:curating`, `loom:curated`, `loom:treating`, `loom:reviewing`, `loom:review-requested`, `loom:changes-requested`, `loom:pr`, `loom:architect`, `loom:hermit`, `loom:auditor` (#3307 / PR #3308)
+- `CLAUDE.md` "Issue Lifecycle" diagram (lines 127-134) — fixes two pre-existing bugs: missing `loom:triage` intake state and incorrect attribution of `loom:issue` to the Curator (humans, or Champion in `--merge` mode, apply that label). Now shows the full chain: `loom:triage → loom:curating → loom:curated → loom:issue → loom:building → (closed)` (#3307 / PR #3308)
+- 5 sites in `loom-tools/tests/integration/test_gitea_e2e.py` migrated from `EntityType.ISSUE` / `EntityType.PULL_REQUEST` attribute access to literal strings `"issue"` / `"pr"`. `EntityType` is `Literal["issue", "pr"]`, not an Enum — the tests were written against an Enum shape that never existed. Took the Gitea Integration Tests workflow from 0/31 → 31/31 passing combined with the bootstrap fixes (#3306 / PR #3309)
+- `tests/integration/setup-gitea.sh` — detects the Gitea container by `gitea/gitea` image name (works on GHA's hash-named service containers as well as local-compose); admin user creation runs as `git` user (Gitea refuses to run as root) (#3303)
+- `loom-tools/src/loom_tools/common/gitea.py:_request` — non-404 4xx responses now log response body at warning level (was debug) — surfaces 405/409/422 failure modes that were previously swallowed (#3306 / PR #3309)
+
+### Fixed
+
+- Installer refuses to install when the target's `.gitignore` would shadow `lib/*.sh` (regression guard for the recurring "installer skipped lib/" class of bugs) (#3287 / PR #3304)
+- `loom-daemon` `db.rs` — `query_map` call sites converted from `usize` to `i64` after rusqlite 0.39.0 dropped the `ToSql` impl for `usize` (Dependabot bump #3295 had broken main's Rust CI; bundled into this PR as a side benefit) (#3287 / PR #3304)
+- `scripts/install-loom.sh` — pass `--head` to `gh pr create` and clean up orphan remote branches on install failure (#3245, backport from v0.7.1)
+
+### Dependencies
+
+- Dependabot: all-dependencies group bumped, including rusqlite 0.37.0 → 0.39.0 (#3295)
+- `actions/upload-artifact` 4 → 7 (#3293)
+- `actions/setup-node` 4 → 6 (#3292)
+- `dorny/paths-filter` 3 → 4 (#3291)
+- `zod` bumped via audit fix (#3296)
+- `@tauri-apps/cli` bumped via audit fix (#3294)
+
+### Strategic context
+
+This release is **Phase 1 of the phased daemon-deprecation plan** described in architect proposal #3317. Sweep is now functional enough for users to drive full Curator → Builder → Judge → Doctor → Merge lifecycles from a single Claude session. Phase 2 (soft-deprecate the daemon via `LOOM_USE_SWEEP=1` env flag) and Phase 3 (remove daemon in v1.0) depend on closing two prerequisites: `/schedule` integration for periodic background roles (#3323) and `.loom/sweep-history.json` for cross-session state (#3324). v0.8 ships sweep alongside the daemon (daemon stays default) so we can gather real-world validation before committing further.
+
 ## [0.7.2] - 2026-05-14
 
 ### Summary
