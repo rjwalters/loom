@@ -169,6 +169,7 @@ describe("worktree-manager", () => {
       const expectedCommands = [
         'mkdir -p "/path/to/workspace/.loom/worktrees/test-terminal-7"',
         'git worktree add -b "worktree/test-terminal-7" "/path/to/workspace/.loom/worktrees/test-terminal-7" HEAD',
+        'touch "/path/to/workspace/.loom/worktrees/test-terminal-7/.loom-managed"',
         'cd "/path/to/workspace/.loom/worktrees/test-terminal-7"',
         'git config user.name "Test User"',
         'git config user.email "test@example.com"',
