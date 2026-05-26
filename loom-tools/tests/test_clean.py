@@ -697,3 +697,583 @@ class TestMainDaemonFlag:
         m_clean.assert_called_once_with(mock_repo, dry_run=True)
         assert result == 0
 
+
+# ---------------------------------------------------------------------------
+# Aggressive mode (--aggressive) tests — see issue #3332.
+# ---------------------------------------------------------------------------
+
+from loom_tools.clean import (  # noqa: E402
+    DECISION_KEEP,
+    DECISION_REMOVE,
+    LOOM_MANAGED_SENTINEL,
+    AggressiveStats,
+    WorktreeInfo,
+    clean_aggressive,
+    enumerate_git_worktrees,
+    evaluate_aggressive_candidate,
+    print_aggressive_summary,
+)
+
+
+def _mk_managed_worktree(
+    repo_root: pathlib.Path,
+    issue: int,
+    *,
+    head: str = "deadbeef" * 5,
+    branch: str | None = None,
+    locked: bool = False,
+    sentinel: bool = True,
+    age_seconds: int | None = None,
+) -> WorktreeInfo:
+    """Create an on-disk worktree-like directory and matching WorktreeInfo.
+
+    The directory is created under ``<repo_root>/.loom/worktrees/issue-N``.
+    A ``.loom-managed`` sentinel is written by default (toggle via
+    ``sentinel=False``).
+    """
+    wt_dir = repo_root / ".loom" / "worktrees" / f"issue-{issue}"
+    wt_dir.mkdir(parents=True, exist_ok=True)
+    if sentinel:
+        (wt_dir / LOOM_MANAGED_SENTINEL).write_text("")
+    if age_seconds is not None:
+        import os
+        target = wt_dir.stat().st_mtime - age_seconds
+        os.utime(wt_dir, (target, target))
+    if branch is None:
+        branch = f"refs/heads/feature/issue-{issue}"
+    return WorktreeInfo(
+        path=wt_dir,
+        head=head,
+        branch=branch,
+        detached=False,
+        locked=locked,
+        lock_reason=None,
+        bare=False,
+    )
+
+
+class TestEnumerateGitWorktrees:
+    """Tests for `enumerate_git_worktrees` parsing of `--porcelain` output."""
+
+    def test_parses_single_worktree(self, tmp_path: pathlib.Path) -> None:
+        porcelain = (
+            "worktree /tmp/repo\n"
+            "HEAD aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n"
+            "branch refs/heads/main\n"
+        )
+        completed = subprocess.CompletedProcess(
+            args=[], returncode=0, stdout=porcelain, stderr=""
+        )
+        with patch("loom_tools.clean.subprocess.run", return_value=completed):
+            result = enumerate_git_worktrees(tmp_path)
+        assert len(result) == 1
+        assert result[0].path == pathlib.Path("/tmp/repo")
+        assert result[0].head == "a" * 40
+        assert result[0].branch == "refs/heads/main"
+        assert result[0].branch_short == "main"
+        assert not result[0].locked
+        assert not result[0].detached
+        assert not result[0].bare
+
+    def test_parses_multiple_with_locked_and_detached(
+        self, tmp_path: pathlib.Path
+    ) -> None:
+        porcelain = (
+            "worktree /tmp/repo\n"
+            "HEAD aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n"
+            "branch refs/heads/main\n"
+            "\n"
+            "worktree /tmp/repo/.loom/worktrees/issue-1\n"
+            "HEAD bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\n"
+            "branch refs/heads/feature/issue-1\n"
+            "locked stale shepherd\n"
+            "\n"
+            "worktree /tmp/repo/.loom/worktrees/issue-2\n"
+            "HEAD cccccccccccccccccccccccccccccccccccccccc\n"
+            "detached\n"
+            "\n"
+        )
+        completed = subprocess.CompletedProcess(
+            args=[], returncode=0, stdout=porcelain, stderr=""
+        )
+        with patch("loom_tools.clean.subprocess.run", return_value=completed):
+            result = enumerate_git_worktrees(tmp_path)
+        assert len(result) == 3
+        # main
+        assert result[0].branch_short == "main"
+        # locked with reason
+        assert result[1].locked
+        assert result[1].lock_reason == "stale shepherd"
+        assert result[1].branch_short == "feature/issue-1"
+        # detached
+        assert result[2].detached
+        assert result[2].branch is None
+
+    def test_handles_bare_worktree(self, tmp_path: pathlib.Path) -> None:
+        porcelain = (
+            "worktree /tmp/repo.git\n"
+            "bare\n"
+        )
+        completed = subprocess.CompletedProcess(
+            args=[], returncode=0, stdout=porcelain, stderr=""
+        )
+        with patch("loom_tools.clean.subprocess.run", return_value=completed):
+            result = enumerate_git_worktrees(tmp_path)
+        assert len(result) == 1
+        assert result[0].bare
+        assert result[0].head is None
+
+    def test_locked_without_reason(self, tmp_path: pathlib.Path) -> None:
+        porcelain = (
+            "worktree /tmp/repo/.loom/worktrees/issue-3\n"
+            "HEAD dddddddddddddddddddddddddddddddddddddddd\n"
+            "branch refs/heads/feature/issue-3\n"
+            "locked\n"
+        )
+        completed = subprocess.CompletedProcess(
+            args=[], returncode=0, stdout=porcelain, stderr=""
+        )
+        with patch("loom_tools.clean.subprocess.run", return_value=completed):
+            result = enumerate_git_worktrees(tmp_path)
+        assert len(result) == 1
+        assert result[0].locked
+        assert result[0].lock_reason is None
+
+    def test_returns_empty_on_subprocess_error(
+        self, tmp_path: pathlib.Path
+    ) -> None:
+        completed = subprocess.CompletedProcess(
+            args=[], returncode=1, stdout="", stderr="error"
+        )
+        with patch("loom_tools.clean.subprocess.run", return_value=completed):
+            result = enumerate_git_worktrees(tmp_path)
+        assert result == []
+
+
+class TestEvaluateAggressiveCandidate:
+    """Tests for `evaluate_aggressive_candidate` decision tree."""
+
+    def test_skips_bare_main_worktree(
+        self, mock_repo: pathlib.Path
+    ) -> None:
+        wt = WorktreeInfo(path=mock_repo, bare=True)
+        decision, reason = evaluate_aggressive_candidate(
+            wt, mock_repo, active_shepherd_issues=set(),
+            min_age_seconds=0, force=False,
+        )
+        assert decision == DECISION_KEEP
+        assert reason == "bare_main_worktree"
+
+    def test_skips_main_repo_worktree_by_path(
+        self, mock_repo: pathlib.Path
+    ) -> None:
+        wt = WorktreeInfo(
+            path=mock_repo, head="x" * 40, branch="refs/heads/main"
+        )
+        with patch("loom_tools.clean._check_open_pr", return_value=(False, True)):
+            decision, reason = evaluate_aggressive_candidate(
+                wt, mock_repo, active_shepherd_issues=set(),
+                min_age_seconds=0, force=False,
+            )
+        assert decision == DECISION_KEEP
+        assert reason == "bare_main_worktree"
+
+    def test_skips_open_pr(self, mock_repo: pathlib.Path) -> None:
+        wt = _mk_managed_worktree(mock_repo, issue=42)
+        with patch(
+            "loom_tools.clean._check_open_pr", return_value=(True, True)
+        ):
+            decision, reason = evaluate_aggressive_candidate(
+                wt, mock_repo, active_shepherd_issues=set(),
+                min_age_seconds=0, force=False,
+            )
+        assert decision == DECISION_KEEP
+        assert reason == "open_pr"
+
+    def test_fails_closed_on_pr_lookup_error(
+        self, mock_repo: pathlib.Path
+    ) -> None:
+        """A failed `gh pr list` must skip — never remove."""
+        wt = _mk_managed_worktree(mock_repo, issue=42)
+        with patch(
+            "loom_tools.clean._check_open_pr", return_value=(False, False)
+        ):
+            decision, reason = evaluate_aggressive_candidate(
+                wt, mock_repo, active_shepherd_issues=set(),
+                min_age_seconds=0, force=False,
+            )
+        assert decision == DECISION_KEEP
+        assert reason == "pr_lookup_failed"
+
+    def test_skips_active_shepherd(self, mock_repo: pathlib.Path) -> None:
+        wt = _mk_managed_worktree(mock_repo, issue=99)
+        with patch(
+            "loom_tools.clean._check_open_pr", return_value=(False, True)
+        ):
+            decision, reason = evaluate_aggressive_candidate(
+                wt, mock_repo, active_shepherd_issues={99},
+                min_age_seconds=0, force=False,
+            )
+        assert decision == DECISION_KEEP
+        assert reason == "active_shepherd"
+
+    def test_skips_worktree_without_sentinel(
+        self, mock_repo: pathlib.Path
+    ) -> None:
+        """Missing .loom-managed sentinel => user_owned (skip)."""
+        wt = _mk_managed_worktree(mock_repo, issue=42, sentinel=False)
+        with patch(
+            "loom_tools.clean._check_open_pr", return_value=(False, True)
+        ):
+            decision, reason = evaluate_aggressive_candidate(
+                wt, mock_repo, active_shepherd_issues=set(),
+                min_age_seconds=0, force=False,
+            )
+        assert decision == DECISION_KEEP
+        assert reason == "user_owned"
+
+    def test_skips_worktree_at_noncanonical_path(
+        self, mock_repo: pathlib.Path, tmp_path: pathlib.Path
+    ) -> None:
+        """Worktrees outside .loom/worktrees/ => user_owned (skip)."""
+        elsewhere = tmp_path / "elsewhere"
+        elsewhere.mkdir()
+        (elsewhere / LOOM_MANAGED_SENTINEL).write_text("")
+        wt = WorktreeInfo(
+            path=elsewhere,
+            head="a" * 40,
+            branch="refs/heads/feature/issue-50",
+        )
+        with patch(
+            "loom_tools.clean._check_open_pr", return_value=(False, True)
+        ):
+            decision, reason = evaluate_aggressive_candidate(
+                wt, mock_repo, active_shepherd_issues=set(),
+                min_age_seconds=0, force=False,
+            )
+        assert decision == DECISION_KEEP
+        assert reason == "user_owned"
+
+    def test_skips_uncommitted_without_force(
+        self, mock_repo: pathlib.Path
+    ) -> None:
+        wt = _mk_managed_worktree(mock_repo, issue=42)
+        with patch(
+            "loom_tools.clean._check_open_pr", return_value=(False, True)
+        ), patch(
+            "loom_tools.clean.check_uncommitted_changes", return_value=True
+        ):
+            decision, reason = evaluate_aggressive_candidate(
+                wt, mock_repo, active_shepherd_issues=set(),
+                min_age_seconds=0, force=False,
+            )
+        assert decision == DECISION_KEEP
+        assert reason == "uncommitted"
+
+    def test_uncommitted_with_force_falls_through(
+        self, mock_repo: pathlib.Path
+    ) -> None:
+        wt = _mk_managed_worktree(mock_repo, issue=42)
+        with patch(
+            "loom_tools.clean._check_open_pr", return_value=(False, True)
+        ), patch(
+            "loom_tools.clean.check_uncommitted_changes", return_value=True
+        ), patch(
+            "loom_tools.clean._is_ancestor_of_origin_main", return_value=True
+        ):
+            decision, reason = evaluate_aggressive_candidate(
+                wt, mock_repo, active_shepherd_issues=set(),
+                min_age_seconds=0, force=True,
+            )
+        assert decision == DECISION_REMOVE
+        assert reason == "reachable_from_origin_main"
+
+    def test_reachable_head_removed(self, mock_repo: pathlib.Path) -> None:
+        wt = _mk_managed_worktree(mock_repo, issue=42)
+        with patch(
+            "loom_tools.clean._check_open_pr", return_value=(False, True)
+        ), patch(
+            "loom_tools.clean.check_uncommitted_changes", return_value=False
+        ), patch(
+            "loom_tools.clean._is_ancestor_of_origin_main", return_value=True
+        ):
+            decision, reason = evaluate_aggressive_candidate(
+                wt, mock_repo, active_shepherd_issues=set(),
+                min_age_seconds=0, force=False,
+            )
+        assert decision == DECISION_REMOVE
+        assert reason == "reachable_from_origin_main"
+
+    def test_too_recent_skipped(self, mock_repo: pathlib.Path) -> None:
+        """mtime guard skips young worktrees with unreachable HEAD."""
+        wt = _mk_managed_worktree(mock_repo, issue=42, age_seconds=60)
+        with patch(
+            "loom_tools.clean._check_open_pr", return_value=(False, True)
+        ), patch(
+            "loom_tools.clean.check_uncommitted_changes", return_value=False
+        ), patch(
+            "loom_tools.clean._is_ancestor_of_origin_main", return_value=False
+        ):
+            decision, reason = evaluate_aggressive_candidate(
+                wt, mock_repo, active_shepherd_issues=set(),
+                min_age_seconds=3600, force=False,
+            )
+        assert decision == DECISION_KEEP
+        assert reason == "too_recent"
+
+    def test_stale_unreachable_skipped_by_default(
+        self, mock_repo: pathlib.Path
+    ) -> None:
+        """Stale worktree with unreachable HEAD => skip unreachable_head."""
+        wt = _mk_managed_worktree(mock_repo, issue=42, age_seconds=99999)
+        with patch(
+            "loom_tools.clean._check_open_pr", return_value=(False, True)
+        ), patch(
+            "loom_tools.clean.check_uncommitted_changes", return_value=False
+        ), patch(
+            "loom_tools.clean._is_ancestor_of_origin_main", return_value=False
+        ):
+            decision, reason = evaluate_aggressive_candidate(
+                wt, mock_repo, active_shepherd_issues=set(),
+                min_age_seconds=3600, force=False,
+            )
+        assert decision == DECISION_KEEP
+        assert reason == "unreachable_head"
+
+    def test_stale_unreachable_force_override(
+        self, mock_repo: pathlib.Path
+    ) -> None:
+        """Operator can force-remove unreachable worktrees via --force."""
+        wt = _mk_managed_worktree(mock_repo, issue=42, age_seconds=99999)
+        with patch(
+            "loom_tools.clean._check_open_pr", return_value=(False, True)
+        ), patch(
+            "loom_tools.clean.check_uncommitted_changes", return_value=False
+        ), patch(
+            "loom_tools.clean._is_ancestor_of_origin_main", return_value=False
+        ):
+            decision, reason = evaluate_aggressive_candidate(
+                wt, mock_repo, active_shepherd_issues=set(),
+                min_age_seconds=3600, force=True,
+            )
+        assert decision == DECISION_REMOVE
+        assert reason == "force_override_unreachable"
+
+    def test_aggressive_mtime_stale_removed_when_reachable(
+        self, mock_repo: pathlib.Path
+    ) -> None:
+        """A stale worktree without `.loom-in-use` is removed when HEAD
+        is reachable from origin/main (reachability beats mtime guard)."""
+        wt = _mk_managed_worktree(mock_repo, issue=42, age_seconds=99999)
+        # No .loom-in-use marker by construction.
+        assert not (wt.path / ".loom-in-use").exists()
+        with patch(
+            "loom_tools.clean._check_open_pr", return_value=(False, True)
+        ), patch(
+            "loom_tools.clean.check_uncommitted_changes", return_value=False
+        ), patch(
+            "loom_tools.clean._is_ancestor_of_origin_main", return_value=True
+        ):
+            decision, reason = evaluate_aggressive_candidate(
+                wt, mock_repo, active_shepherd_issues=set(),
+                min_age_seconds=3600, force=False,
+            )
+        assert decision == DECISION_REMOVE
+        assert reason == "reachable_from_origin_main"
+
+
+class TestCleanAggressive:
+    """End-to-end tests for `clean_aggressive` orchestration."""
+
+    def test_dry_run_does_not_mutate(self, mock_repo: pathlib.Path) -> None:
+        wt = _mk_managed_worktree(mock_repo, issue=42, age_seconds=99999)
+        wt_info = wt  # The WorktreeInfo we want enumerate to return.
+        with patch(
+            "loom_tools.clean.enumerate_git_worktrees",
+            return_value=[wt_info],
+        ), patch(
+            "loom_tools.clean._check_open_pr", return_value=(False, True)
+        ), patch(
+            "loom_tools.clean._is_ancestor_of_origin_main", return_value=True
+        ), patch(
+            "loom_tools.clean.check_uncommitted_changes", return_value=False
+        ), patch(
+            "loom_tools.clean._active_shepherd_issues", return_value=set()
+        ):
+            stats = clean_aggressive(mock_repo, dry_run=True, force=False)
+        # Directory still exists (dry run).
+        assert wt.path.exists()
+        assert stats.removed == 1
+        assert stats.errors == 0
+
+    def test_skips_open_pr_end_to_end(self, mock_repo: pathlib.Path) -> None:
+        wt_info = _mk_managed_worktree(
+            mock_repo, issue=42, age_seconds=99999
+        )
+        with patch(
+            "loom_tools.clean.enumerate_git_worktrees",
+            return_value=[wt_info],
+        ), patch(
+            "loom_tools.clean._check_open_pr", return_value=(True, True)
+        ), patch(
+            "loom_tools.clean._active_shepherd_issues", return_value=set()
+        ):
+            stats = clean_aggressive(mock_repo, dry_run=True, force=False)
+        assert stats.removed == 0
+        assert stats.skipped_open_pr == 1
+        assert wt_info.path.exists()
+
+    def test_skips_missing_sentinel_end_to_end(
+        self, mock_repo: pathlib.Path
+    ) -> None:
+        wt_info = _mk_managed_worktree(
+            mock_repo, issue=42, age_seconds=99999, sentinel=False
+        )
+        with patch(
+            "loom_tools.clean.enumerate_git_worktrees",
+            return_value=[wt_info],
+        ), patch(
+            "loom_tools.clean._check_open_pr", return_value=(False, True)
+        ), patch(
+            "loom_tools.clean._active_shepherd_issues", return_value=set()
+        ):
+            stats = clean_aggressive(mock_repo, dry_run=True, force=False)
+        assert stats.removed == 0
+        assert stats.skipped_user_owned == 1
+
+    def test_active_shepherd_read_from_state(
+        self, mock_repo: pathlib.Path
+    ) -> None:
+        """`_active_shepherd_issues` should ignore idle shepherds."""
+        state_file = mock_repo / ".loom" / "daemon-state.json"
+        state_file.write_text(json.dumps({
+            "shepherds": {
+                "shepherd-1": {"status": "working", "issue": 77},
+                "shepherd-2": {"status": "idle", "issue": 88},
+                "shepherd-3": {"status": "working", "issue": 91},
+            }
+        }))
+        from loom_tools.clean import _active_shepherd_issues
+        active = _active_shepherd_issues(mock_repo)
+        assert active == {77, 91}
+
+    def test_active_shepherd_empty_when_missing(
+        self, mock_repo: pathlib.Path
+    ) -> None:
+        from loom_tools.clean import _active_shepherd_issues
+        active = _active_shepherd_issues(mock_repo)
+        assert active == set()
+
+    def test_empty_worktree_list(self, mock_repo: pathlib.Path) -> None:
+        with patch(
+            "loom_tools.clean.enumerate_git_worktrees", return_value=[]
+        ):
+            stats = clean_aggressive(mock_repo, dry_run=True)
+        assert stats.removed == 0
+        assert stats.errors == 0
+
+
+class TestNormalModeUnchanged:
+    """Regression: normal modes must still respect .loom-in-use, process
+    checks, and the CLOSED-issue precondition."""
+
+    def test_normal_mode_skips_in_use_marker(
+        self, mock_repo: pathlib.Path
+    ) -> None:
+        """Normal `loom-clean --force` must still skip .loom-in-use."""
+        from loom_tools.clean import clean_worktrees
+
+        wt = mock_repo / ".loom" / "worktrees" / "issue-42"
+        wt.mkdir(parents=True)
+        (wt / ".loom-in-use").write_text(json.dumps({
+            "shepherd_task_id": "abc", "pid": 1234
+        }))
+
+        stats = CleanupStats()
+        clean_worktrees(mock_repo, stats, dry_run=True, force=True)
+        # Marker should keep it preserved.
+        assert stats.skipped_in_use == 1
+        assert stats.cleaned_worktrees == 0
+
+
+class TestPrintAggressiveSummary:
+    """Tests for the aggressive-mode summary renderer."""
+
+    def test_render_removed(self, capsys: pytest.CaptureFixture[str]) -> None:
+        print_aggressive_summary(AggressiveStats(removed=3))
+        out = capsys.readouterr().out
+        assert "Aggressive Cleanup Summary" in out
+        assert "Removed: 3" in out
+
+    def test_render_dry_run(self, capsys: pytest.CaptureFixture[str]) -> None:
+        print_aggressive_summary(AggressiveStats(removed=2), dry_run=True)
+        out = capsys.readouterr().out
+        assert "Would remove: 2" in out
+
+    def test_render_skip_reasons(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        stats = AggressiveStats(
+            skipped_open_pr=1,
+            skipped_active_shepherd=1,
+            skipped_user_owned=1,
+            skipped_uncommitted=1,
+            skipped_too_recent=1,
+            skipped_unreachable=1,
+        )
+        print_aggressive_summary(stats)
+        out = capsys.readouterr().out
+        assert "open PR" in out
+        assert "active shepherd" in out
+        assert "user-owned" in out
+        assert "uncommitted" in out
+        assert "younger than min-age" in out
+        assert "unreachable" in out
+
+
+class TestAggressiveCLI:
+    """CLI wiring for `--aggressive`."""
+
+    def test_aggressive_dry_run(self, mock_repo: pathlib.Path) -> None:
+        with patch("loom_tools.clean.find_repo_root", return_value=mock_repo), \
+             patch("loom_tools.clean.clean_aggressive") as m_clean:
+            m_clean.return_value = AggressiveStats()
+            result = main(["--aggressive", "--dry-run"])
+        m_clean.assert_called_once()
+        kwargs = m_clean.call_args.kwargs
+        assert kwargs["dry_run"] is True
+        assert kwargs["force"] is False
+        assert kwargs["min_age_seconds"] == 86400
+        assert result == 0
+
+    def test_aggressive_force_passes_through(
+        self, mock_repo: pathlib.Path
+    ) -> None:
+        with patch("loom_tools.clean.find_repo_root", return_value=mock_repo), \
+             patch("loom_tools.clean.clean_aggressive") as m_clean:
+            m_clean.return_value = AggressiveStats()
+            result = main(["--aggressive", "--force"])
+        kwargs = m_clean.call_args.kwargs
+        assert kwargs["force"] is True
+        assert kwargs["dry_run"] is False
+        assert result == 0
+
+    def test_aggressive_custom_min_age(
+        self, mock_repo: pathlib.Path
+    ) -> None:
+        with patch("loom_tools.clean.find_repo_root", return_value=mock_repo), \
+             patch("loom_tools.clean.clean_aggressive") as m_clean:
+            m_clean.return_value = AggressiveStats()
+            main(["--aggressive", "--force", "--aggressive-min-age", "3600"])
+        kwargs = m_clean.call_args.kwargs
+        assert kwargs["min_age_seconds"] == 3600
+
+    def test_aggressive_returns_1_on_errors(
+        self, mock_repo: pathlib.Path
+    ) -> None:
+        with patch("loom_tools.clean.find_repo_root", return_value=mock_repo), \
+             patch("loom_tools.clean.clean_aggressive") as m_clean:
+            m_clean.return_value = AggressiveStats(errors=2)
+            result = main(["--aggressive", "--force"])
+        assert result == 1
+
