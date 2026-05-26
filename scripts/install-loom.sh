@@ -12,6 +12,9 @@
 #     ./scripts/install-loom.sh /path/to/target-repo
 #
 #   What this script does:
+#     0. Validates source/target checkout state (warns or refuses if either is
+#        on a non-main branch or behind origin/main; override with
+#        --allow-non-main-source / --allow-stale-target)
 #     1. Validates target repository (must be a Git repo)
 #     2. Creates installation worktree (.loom/worktrees/loom-install-vX.Y.Z)
 #     3. Initializes Loom configuration (copies defaults to .loom/)
@@ -36,6 +39,8 @@ NON_INTERACTIVE=false
 FORCE_OVERWRITE=false
 CLEAN_FIRST=false
 DOGFOOD_MODE=""  # "" (auto-detect), "true" (forced), "false" (forced off)
+ALLOW_NON_MAIN_SOURCE=false
+ALLOW_STALE_TARGET=false
 TARGET_PATH=""
 
 while [[ $# -gt 0 ]]; do
@@ -60,17 +65,29 @@ while [[ $# -gt 0 ]]; do
       DOGFOOD_MODE="false"
       shift
       ;;
+    --allow-non-main-source)
+      ALLOW_NON_MAIN_SOURCE=true
+      shift
+      ;;
+    --allow-stale-target)
+      ALLOW_STALE_TARGET=true
+      shift
+      ;;
     -h|--help)
       echo "Usage: $0 [OPTIONS] /path/to/target-repo"
       echo ""
       echo "Options:"
-      echo "  -y, --yes        Non-interactive mode"
-      echo "  -f, --force      Force overwrite existing files and enable auto-merge"
-      echo "  --clean          Run uninstall first, then fresh install (combines both operations)"
-      echo "  --dogfood        Force dogfood mode: symlink .claude/agents -> ../defaults/.claude/agents"
-      echo "                   (auto-detected when installing into the Loom source repo itself)"
-      echo "  --no-dogfood     Disable dogfood mode even when installing into the Loom source repo"
-      echo "  -h, --help       Show this help message"
+      echo "  -y, --yes                  Non-interactive mode"
+      echo "  -f, --force                Force overwrite existing files and enable auto-merge"
+      echo "  --clean                    Run uninstall first, then fresh install (combines both operations)"
+      echo "  --dogfood                  Force dogfood mode: symlink .claude/agents -> ../defaults/.claude/agents"
+      echo "                             (auto-detected when installing into the Loom source repo itself)"
+      echo "  --no-dogfood               Disable dogfood mode even when installing into the Loom source repo"
+      echo "  --allow-non-main-source    Proceed even if the Loom source checkout is not on a clean main"
+      echo "                             (non-main branch, detached HEAD, or behind origin/main)"
+      echo "  --allow-stale-target       Proceed even if the target checkout is not on a clean main"
+      echo "                             (non-main branch or behind origin/main); ignored in dogfood mode"
+      echo "  -h, --help                 Show this help message"
       exit 0
       ;;
     *)
@@ -110,6 +127,76 @@ warning() {
 
 header() {
   echo -e "${CYAN}$*${NC}"
+}
+
+# Check the state of the Loom *source* checkout (the directory that contains
+# this script). We refuse to install from a feature branch, a stale main, or
+# an arbitrary detached HEAD unless the operator explicitly opts in. Detached
+# HEAD on a `v*` tag is treated as a clean tagged release (still emits a mild
+# warning so the operator knows they're not on a moving branch). Staleness is
+# best-effort: we never run `git fetch` here — the operator is responsible for
+# refreshing `origin/main` if they want the staleness check to be accurate.
+check_source_state() {
+  local branch tag_match=""
+  branch=$(git -C "$LOOM_ROOT" rev-parse --abbrev-ref HEAD 2>/dev/null || echo "unknown")
+
+  # Tagged-release exemption: detached HEAD that resolves to a v* tag is OK.
+  if [[ "$branch" == "HEAD" ]]; then
+    tag_match=$(git -C "$LOOM_ROOT" describe --exact-match --tags HEAD 2>/dev/null || true)
+  fi
+
+  local stale=""
+  # Best-effort: only check upstream if origin/main exists locally. If there
+  # is no origin remote at all, or origin/main has never been fetched, we
+  # skip the staleness check silently rather than erroring — the operator
+  # has not opted into upstream tracking.
+  if git -C "$LOOM_ROOT" rev-parse --verify --quiet origin/main >/dev/null 2>&1; then
+    local behind
+    behind=$(git -C "$LOOM_ROOT" rev-list --count HEAD..origin/main 2>/dev/null || echo 0)
+    if [[ "$behind" -gt 0 ]]; then
+      stale="local is $behind commit(s) behind origin/main (run 'git -C $LOOM_ROOT fetch && git -C $LOOM_ROOT pull' to refresh)"
+    fi
+  fi
+
+  # Tagged release on a clean snapshot is fine — just announce it.
+  if [[ "$branch" == "HEAD" ]] && [[ -n "$tag_match" ]] && [[ -z "$stale" ]]; then
+    info "Loom source is at tagged release: $tag_match (detached HEAD)"
+    return 0
+  fi
+
+  # Clean main, up to date — nothing to say.
+  if [[ "$branch" == "main" ]] && [[ -z "$stale" ]]; then
+    return 0
+  fi
+
+  warning "Loom source checkout is not on a clean main:"
+  if [[ "$branch" != "main" ]]; then
+    if [[ "$branch" == "HEAD" ]] && [[ -n "$tag_match" ]]; then
+      echo "    detached HEAD on tag: $tag_match (no branch)"
+    elif [[ "$branch" == "HEAD" ]]; then
+      echo "    detached HEAD (no branch, no matching tag)"
+    else
+      echo "    branch: $branch (expected: main)"
+    fi
+  fi
+  [[ -n "$stale" ]] && echo "    $stale"
+  echo "  Source path: $LOOM_ROOT"
+
+  if [[ "$ALLOW_NON_MAIN_SOURCE" == "true" ]]; then
+    info "Continuing anyway (--allow-non-main-source)"
+    return 0
+  fi
+
+  if [[ "$NON_INTERACTIVE" == "true" ]]; then
+    error "Refusing to install from non-main / stale source in --yes mode. Pass --allow-non-main-source to override."
+  fi
+
+  local reply=""
+  read -r -p "Proceed with this source checkout anyway? [y/N] " -n 1 reply
+  echo ""
+  if [[ ! "$reply" =~ ^[Yy]$ ]]; then
+    error "Aborted by user. Switch to main and pull, or pass --allow-non-main-source."
+  fi
 }
 
 # Cleanup function called on error
@@ -166,6 +253,12 @@ fi
 
 # Export for sub-scripts
 export NON_INTERACTIVE
+
+# Source-state guard (#3327): before doing any heavy work, verify that the
+# Loom source checkout is on a clean main. Refuse / prompt / continue based
+# on flags + interactive vs. --yes mode. Runs after NON_INTERACTIVE finalization
+# so the refusal logic sees the effective value (including TTY auto-detect).
+check_source_state
 
 # Resolve target to absolute path (git repository root, not worktree)
 TARGET_PATH="$(cd "$TARGET_PATH" 2>/dev/null && pwd)" || \
@@ -552,6 +645,7 @@ echo ""
 export LOOM_VERSION
 export LOOM_COMMIT
 export LOOM_ROOT
+export ALLOW_STALE_TARGET
 
 # Export FORCE_AUTO_MERGE for create-pr.sh
 # When --force is passed, also enable auto-merge on the installation PR
