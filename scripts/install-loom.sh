@@ -38,6 +38,7 @@ set -euo pipefail
 NON_INTERACTIVE=false
 FORCE_OVERWRITE=false
 CLEAN_FIRST=false
+ALLOW_ACTIVE_SESSION=false
 DOGFOOD_MODE=""  # "" (auto-detect), "true" (forced), "false" (forced off)
 ALLOW_NON_MAIN_SOURCE=false
 ALLOW_STALE_TARGET=false
@@ -55,6 +56,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --clean)
       CLEAN_FIRST=true
+      shift
+      ;;
+    --allow-active-session)
+      ALLOW_ACTIVE_SESSION=true
       shift
       ;;
     --dogfood)
@@ -79,7 +84,12 @@ while [[ $# -gt 0 ]]; do
       echo "Options:"
       echo "  -y, --yes                  Non-interactive mode"
       echo "  -f, --force                Force overwrite existing files and enable auto-merge"
+      echo "                             (does NOT bypass active-session detection)"
       echo "  --clean                    Run uninstall first, then fresh install (combines both operations)"
+      echo "  --allow-active-session     Proceed even if a live Loom session is detected in"
+      echo "                             the target (daemon running, recent state file, or"
+      echo "                             active issue worktrees). Required to override the"
+      echo "                             pre-flight active-session guard."
       echo "  --dogfood                  Force dogfood mode: symlink .claude/agents -> ../defaults/.claude/agents"
       echo "                             (auto-detected when installing into the Loom source repo itself)"
       echo "  --no-dogfood               Disable dogfood mode even when installing into the Loom source repo"
@@ -414,6 +424,43 @@ if [[ -n "$MAIN_WORKTREE" ]] && [[ "$TARGET_PATH" != "$MAIN_WORKTREE" ]]; then
   warning "Target path is inside a worktree: $TARGET_PATH"
   info "Resolving to main repository root: $MAIN_WORKTREE"
   TARGET_PATH="$MAIN_WORKTREE"
+fi
+
+# ============================================================================
+# PRE-FLIGHT: Active Loom session detection (issue #3331)
+# ============================================================================
+# Refuse to install on top of a live Loom session unless the operator passes
+# --allow-active-session. This guards against installing while a daemon is
+# running or builders are actively in-flight (state corruption, lost work).
+#
+# Indicators (any one triggers detection):
+#   1. .loom/daemon-loop.pid exists AND PID is alive (kill -0 / ps -p check)
+#   2. .loom/daemon-state.json has "running": true AND was updated within the
+#      last 5 minutes
+#   3. Any .loom/worktrees/issue-N directory with mtime activity in the last
+#      5 minutes (in-flight builder)
+#
+# --force does NOT imply --allow-active-session by design: --force is for
+# overwriting files, not for racing with live processes. The operator must
+# opt in to both independently.
+ACTIVE_SESSION_CHECK="$LOOM_ROOT/scripts/install/check-active-session.sh"
+if [[ -x "$ACTIVE_SESSION_CHECK" ]]; then
+  if ! "$ACTIVE_SESSION_CHECK" "$TARGET_PATH"; then
+    if [[ "$ALLOW_ACTIVE_SESSION" == "true" ]]; then
+      warning "Continuing despite active session (--allow-active-session was passed)"
+      echo ""
+    else
+      echo "" >&2
+      error "Refusing to install: an active Loom session was detected in the target.
+
+To proceed:
+  • Stop the running daemon:   cd '$TARGET_PATH' && ./.loom/scripts/daemon.sh stop
+  • Wait for in-flight builders to finish, OR
+  • Pass --allow-active-session to override this guard (use with caution).
+
+Note: --force does NOT bypass this check; --allow-active-session must be set explicitly."
+    fi
+  fi
 fi
 
 # Dogfood mode detection (issue #3311):
