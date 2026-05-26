@@ -963,19 +963,58 @@ echo ""
 # This catches the hostile-gitignore variant of issue #3287 *after* the
 # daemon's own check, providing belt-and-suspenders coverage for users on
 # stale daemon binaries that predate the in-daemon gitignore audit.
+#
+# Issue #3326: use `git check-ignore -v` so we can surface the specific
+# `<gitignore-file>:<line>:<pattern>` triple and offer an actionable fix
+# instead of a generic "commonly '.loom/' or '.loom/scripts/'" hint.
 if [[ -d ".loom/scripts/lib" ]]; then
   info "Checking that installed lib/*.sh files are not gitignored..."
-  IGNORED_LIB_FILES=$(git check-ignore .loom/scripts/lib/*.sh 2>/dev/null || true)
+  # -v emits "<gitignore>:<line>:<pattern>\t<file>" for each match.
+  IGNORED_LIB_FILES=$(git check-ignore -v .loom/scripts/lib/*.sh 2>/dev/null || true)
   if [[ -n "$IGNORED_LIB_FILES" ]]; then
+    # Parse first match to extract gitignore path, line, and pattern for the
+    # suggested-fix block. Subsequent matches are still listed verbatim below.
+    first_match=$(echo "$IGNORED_LIB_FILES" | head -1)
+    pattern_info="${first_match%%$'\t'*}"          # "<gitignore>:<line>:<pattern>"
+    pattern="${pattern_info##*:}"                  # "<pattern>"
+    gi_path_and_line="${pattern_info%:*}"          # "<gitignore>:<line>"
+    line_no="${gi_path_and_line##*:}"              # "<line>"
+    gi_file="${gi_path_and_line%:*}"               # "<gitignore>"
+
     echo "" >&2
     echo "  The following lib files are matched by a .gitignore rule:" >&2
-    while IFS= read -r ignored_line; do
-      echo "    $ignored_line" >&2
+    while IFS=$'\t' read -r match file; do
+      [[ -z "$match" && -z "$file" ]] && continue
+      # match is "<gitignore>:<line>:<pattern>"
+      m_pattern="${match##*:}"
+      m_path_and_line="${match%:*}"
+      m_line="${m_path_and_line##*:}"
+      m_gi="${m_path_and_line%:*}"
+      echo "    $file" >&2
+      echo "      matched by ${m_gi}:${m_line} pattern '${m_pattern}'" >&2
     done <<<"$IGNORED_LIB_FILES"
     echo "" >&2
-    echo "  These files will be silently dropped on commit, breaking installs" >&2
-    echo "  in fresh clones and worktrees. Remove the offending pattern from" >&2
-    echo "  .gitignore (commonly '.loom/' or '.loom/scripts/') before retrying." >&2
+
+    # Suggest a fix based on the shape of the offending pattern.
+    # 1. Unanchored single-segment dir (e.g. `lib/`, `bin/`, `share/`): suggest
+    #    anchoring to repo root by prefixing with `/`. This is the most common
+    #    cause (Python venv-template .gitignores ship with unanchored `lib/`).
+    # 2. Loom-wildcard pattern (e.g. `.loom`, `.loom/`, `.loom*`): the user is
+    #    explicitly hiding Loom — they need to delete the rule, not anchor it,
+    #    because Loom's working dir must be committed.
+    # 3. Anything else: generic guidance to narrow or remove the pattern.
+    if [[ "$pattern" =~ ^[a-zA-Z0-9_-]+/$ ]]; then
+      echo "  Suggested fix: anchor the pattern to the repo root." >&2
+      echo "    Change line ${line_no} of ${gi_file} from:  ${pattern}" >&2
+      echo "    To:                                          /${pattern}" >&2
+    elif [[ "$pattern" == .loom* ]]; then
+      echo "  Suggested fix: remove this pattern from ${gi_file}:${line_no}." >&2
+      echo "  Loom's working directory (.loom/) must be committed to git." >&2
+    else
+      echo "  Suggested fix: remove or narrow the pattern '${pattern}' at ${gi_file}:${line_no}." >&2
+    fi
+    echo "" >&2
+    echo "  Then commit the .gitignore fix and re-run the installer." >&2
     error "Installed lib files are gitignored — install would produce a broken commit (see #3287)"
   fi
   success "lib/*.sh files are not gitignored"
