@@ -173,9 +173,9 @@ gh pr create --label "loom:review-requested"
 
 ### Best Practices
 
-- Always use `./.loom/scripts/worktree.sh <issue-number>`
+- Always use `./.loom/scripts/worktree.sh <issue-number>` (it writes a `.loom-managed` sentinel that authorizes cleanup)
 - Never run `git worktree` directly (helper prevents nested worktrees)
-- Worktrees auto-removed when PRs merged
+- Loom-managed worktrees (under `.loom/worktrees/` with the `.loom-managed` sentinel) are auto-removed when their PR merges. User-provisioned worktrees at other paths are never removed by Loom — set `LOOM_PRESERVE_WORKTREE=1` to disable cleanup globally for a session.
 
 ### Merging PRs
 

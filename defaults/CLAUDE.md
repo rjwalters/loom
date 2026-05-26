@@ -489,14 +489,23 @@ git push -u origin feature/issue-42
 gh pr create --label "loom:review-requested"
 ```
 
+### Worktree Ownership Model
+
+Loom distinguishes between worktrees it created and worktrees the user created. Cleanup tooling only acts on Loom-managed worktrees.
+
+- **Loom-managed**: Worktrees created by `./.loom/scripts/worktree.sh` (or the Tauri app's terminal-worktree machinery). These live under `.loom/worktrees/` and contain a `.loom-managed` sentinel file in their root. `merge-pr.sh`, `agent-destroy.sh`, and `loom-clean` may remove them automatically.
+- **User-managed**: Any other worktree — anything not under `.loom/worktrees/`, or anything under `.loom/worktrees/` that lacks the `.loom-managed` sentinel. Loom tooling and Loom-aware agents MUST NOT remove these. They survive merges, agent shutdowns, and `loom-clean` runs.
+
+To disable all Loom-side worktree removal for a session (e.g., when running Loom inline from an editor-provisioned worktree), set `LOOM_PRESERVE_WORKTREE=1`. Both `merge-pr.sh` and `agent-destroy.sh` honor this flag.
+
 ### Worktree Best Practices
 
-- **Always use the helper script**: `./.loom/scripts/worktree.sh <issue-number>`
+- **Always use the helper script**: `./.loom/scripts/worktree.sh <issue-number>` (it writes the `.loom-managed` sentinel automatically)
 - **Never run git worktree directly**: The helper prevents nested worktrees
 - **Never delete worktrees manually**: Use `loom-clean` for cleanup (see warning below)
 - **One worktree per issue**: Keeps work isolated and organized
 - **Semantic naming**: Worktrees named `.loom/worktrees/issue-{number}`
-- **Clean up when done**: Worktrees are automatically removed when PRs are merged
+- **Clean up when done**: Loom-managed worktrees are automatically removed when their PR merges. User-provisioned worktrees are never touched.
 
 **WARNING: Never delete worktrees directly with `git worktree remove`**
 

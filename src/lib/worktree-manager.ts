@@ -255,6 +255,10 @@ export async function setupWorktreeForAgent(
     // that's already checked out in another worktree (including main repo)
     await sendCommand(terminalId, `git worktree add -b "${branchName}" "${worktreePath}" HEAD`);
 
+    // Sentinel marker for Loom-managed cleanup (see issue #3334).
+    // Cleanup tooling refuses to remove worktrees lacking this file.
+    await sendCommand(terminalId, `touch "${worktreePath}/.loom-managed"`);
+
     // Change to worktree directory
     await sendCommand(terminalId, `cd "${worktreePath}"`);
 
@@ -477,6 +481,12 @@ export async function createWorktreeDirect(
     if (result.code !== 0) {
       throw new Error(`Failed to create worktree: ${result.stderr}`);
     }
+
+    // Sentinel marker for Loom-managed cleanup (see issue #3334).
+    const sentinelCmd = Command.create("touch", [`${worktreePath}/.loom-managed`], {
+      cwd: workspacePath,
+    });
+    await sentinelCmd.execute();
 
     logger.info("Worktree created successfully", {
       terminalId,
