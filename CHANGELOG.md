@@ -7,6 +7,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.1] - 2026-05-26
+
+### Summary
+
+Installer and worktree hardening. Headline: Loom no longer removes worktrees it didn't create — `merge-pr.sh` and `agent-destroy.sh` refuse to clean up any worktree lacking a `.loom-managed` sentinel file (written by `worktree.sh` at creation time), and `LOOM_PRESERVE_WORKTREE=1` is a session-wide opt-out. This fixes Anton's regression where Loom would delete editor-provisioned worktrees mid-session (#3334).
+
+Around that core fix, five installer-side improvements ship: legacy root `CLAUDE.md` upgrade path (#3325), actionable `gitignore`-guard errors with file/line/pattern + suggested fix (#3326), source-state and target-state guards refusing installs from non-`main` branches or stale targets (#3327), active-session detection refusing to install on top of a live Loom (#3331), and docs-only markers on installer-generated PRs so target CI can opt to skip them (#3333). `loom-clean` gains an `--aggressive` mode for cleaning up vestigial locked worktrees (#3332), built on the same sentinel ownership model.
+
+### Fixed
+
+- Worktree cleanup honors a `.loom-managed` sentinel and `LOOM_PRESERVE_WORKTREE=1` opt-out. `worktree.sh` and the Tauri-app worktree creators write the sentinel; `merge-pr.sh` and `agent-destroy.sh` refuse to remove worktrees lacking it. CLAUDE.md documents the worktree ownership model explicitly (Loom owns under `.loom/worktrees/` with sentinel; everything else is user-owned). Closes Anton's regression where merge-time worktree cleanup was deleting editor-provisioned worktrees (#3334 / PR #3335)
+- Installer upgrade path now detects legacy root `CLAUDE.md` files (markerless installer-managed content) via a curated `LEGACY_LOOM_SIGNATURES` heuristic in `loom-daemon/src/init/scaffolding.rs` and replaces them with the modern marker block instead of appending, eliminating duplicate Loom content and stale `{{LOOM_VERSION}}` / `{{INSTALL_DATE}}` placeholder leaks. Defense-in-depth `assert_no_placeholders()` runs immediately before every root-CLAUDE.md write (#3325 / PR #3337)
+
+### Added
+
+- `loom-clean --aggressive` for removing vestigial locked agent worktrees. Implements an 8-step decision tree (open-PR → active-shepherd → `.loom-managed` sentinel → uncommitted → reachability from `origin/main` → mtime → fallback) with strict fail-closed semantics. Enumerates `git worktree list --porcelain` to catch orphans not in `gh` issue results. Locked worktrees are unlocked before removal; an unreachable HEAD fallback requires `--force` and logs the SHA for `git reflog` recovery (#3332 / PR #3340)
+- Installer-generated PRs now carry passive docs-only markers (`chore(loom):` title prefix, `loom-install: true` body line, `Skip-CI-Hint: docs-only` commit trailer). New `--skip-target-ci` flag is the opt-in equivalent that prepends `[skip ci]` to title and commit subject. Existing `PR_TITLE` / `PR_BODY` / `COMMIT_MSG` env-var overrides remain composable. Ships new `defaults/.loom/docs/ci-integration.md` with `paths-ignore` examples for target repos (#3333 / PR #3341)
+- Installer detects an active Loom session in the target before mutating anything. New `scripts/install/check-active-session.sh` helper checks three indicators (live `daemon-loop.pid`, `daemon-state.json` with `"running": true` within 5 minutes, recently-active `.loom/worktrees/issue-N` dirs). `--allow-active-session` is the explicit override; `--force` deliberately does *not* imply it (#3331 / PR #3339)
+- Installer refuses to run from a non-`main` branch of the Loom source checkout (with optional `--allow-non-main-source`) and from a target with uncommitted changes or stale state (with optional `--allow-stale-target`). Dogfood-exempt when `TARGET_PATH == LOOM_ROOT`. Tagged-release detached-HEAD exemption handles `git describe --exact-match` matches (#3327 / PR #3338)
+- Installer's gitignore-guard error now uses `git check-ignore -v` to surface the offending `<file>:<line>:<pattern>` and branches the suggested fix on pattern shape — unanchored single-segment dirs get an anchor suggestion (`lib/` → `/lib/`), `.loom*`-shaped patterns get a deletion suggestion, anything else gets generic narrow-or-remove guidance (#3326 / PR #3336)
+
+### Changed
+
+- `Cargo.lock` dependency group bumped (2 updates, #3328)
+- Dev-dependency group bumped: `vitest` 4.1.6→4.1.7, `vite` 8.0.13→8.0.14, `@vitest/coverage-v8` 4.1.6→4.1.7, `@vitest/ui` 4.1.6→4.1.7, `postcss` 8.5.14→8.5.15 (#3329)
+- Dogfood install of root `CLAUDE.md` now resolves `{{LOOM_VERSION}}` / `{{INSTALL_DATE}}` placeholders correctly (precursor fix in `54b0a335`, generalized by #3325's structural fix above)
+
 ## [0.8.0] - 2026-05-24
 
 ### Summary
