@@ -54,6 +54,66 @@ class CleanupStats:
 
 
 @dataclass
+class AggressiveStats:
+    """Statistics for ``--aggressive`` worktree cleanup.
+
+    Tracks counts for each branch of the aggressive decision tree so that
+    ``print_summary`` can render an audit-friendly report.  Per the
+    "skip beats remove" rule, every skip reason must be enumerable.
+    """
+
+    removed: int = 0
+    skipped_open_pr: int = 0
+    skipped_active_shepherd: int = 0
+    skipped_user_owned: int = 0  # missing .loom-managed sentinel or non-canonical path
+    skipped_uncommitted: int = 0
+    skipped_too_recent: int = 0
+    skipped_unreachable: int = 0  # HEAD not on origin/main; would lose work
+    skipped_locked: int = 0  # main worktree or special entries we don't touch
+    errors: int = 0
+
+
+@dataclass
+class WorktreeInfo:
+    """A single record parsed from ``git worktree list --porcelain``.
+
+    Attributes
+    ----------
+    path:
+        Absolute path to the worktree directory.
+    head:
+        SHA of HEAD in the worktree (or ``None`` for bare worktrees).
+    branch:
+        Full ref of the branch (e.g. ``refs/heads/feature/issue-42``) or
+        ``None`` if detached.
+    detached:
+        ``True`` if the worktree has detached HEAD.
+    locked:
+        ``True`` if the worktree is locked (``git worktree add --lock`` or
+        ``git worktree lock``).
+    lock_reason:
+        Optional reason string passed to ``git worktree lock --reason``.
+    bare:
+        ``True`` for the bare main worktree entry.
+    """
+
+    path: pathlib.Path
+    head: str | None = None
+    branch: str | None = None
+    detached: bool = False
+    locked: bool = False
+    lock_reason: str | None = None
+    bare: bool = False
+
+    @property
+    def branch_short(self) -> str | None:
+        """Short branch name (without ``refs/heads/`` prefix)."""
+        if self.branch is None:
+            return None
+        return self.branch.removeprefix("refs/heads/")
+
+
+@dataclass
 class PRStatus:
     """Status of a PR associated with an issue."""
 
@@ -843,6 +903,498 @@ def _get_dir_size(path: pathlib.Path) -> str:
         return "unknown"
 
 
+# ---------------------------------------------------------------------------
+# Aggressive cleanup: enumerate `git worktree list --porcelain` and apply a
+# strict decision tree.  See issue #3332 for the rationale.
+# ---------------------------------------------------------------------------
+
+# Default minimum worktree age for --aggressive removal (24h in seconds).
+DEFAULT_AGGRESSIVE_MIN_AGE = 86400
+
+# Decision constants returned by `evaluate_aggressive_candidate`.
+DECISION_REMOVE = "remove"
+DECISION_KEEP = "keep"
+
+# Sentinel filename used to mark Loom-managed worktrees (see issue #3334).
+LOOM_MANAGED_SENTINEL = ".loom-managed"
+
+
+def enumerate_git_worktrees(repo_root: pathlib.Path) -> list[WorktreeInfo]:
+    """Parse ``git worktree list --porcelain`` into structured records.
+
+    The porcelain format emits one record per worktree separated by blank
+    lines.  Each record looks like::
+
+        worktree /path/to/worktree
+        HEAD abc123...
+        branch refs/heads/feature/issue-42
+        locked optional reason text
+
+    A bare worktree is identified by a ``bare`` line in place of ``HEAD``.
+    Detached HEAD worktrees emit ``detached`` instead of ``branch``.
+
+    On any error the function returns an empty list rather than raising —
+    aggressive cleanup must fail closed.
+    """
+    try:
+        result = subprocess.run(
+            ["git", "worktree", "list", "--porcelain"],
+            capture_output=True,
+            text=True,
+            cwd=repo_root,
+            check=False,
+        )
+        if result.returncode != 0:
+            return []
+    except Exception:
+        return []
+
+    worktrees: list[WorktreeInfo] = []
+    current: WorktreeInfo | None = None
+
+    for raw_line in result.stdout.splitlines():
+        line = raw_line.rstrip("\n")
+        if not line:
+            if current is not None:
+                worktrees.append(current)
+                current = None
+            continue
+
+        if line.startswith("worktree "):
+            # Start of a new record — flush any partial entry first.
+            if current is not None:
+                worktrees.append(current)
+            current = WorktreeInfo(path=pathlib.Path(line[len("worktree ") :]))
+        elif current is None:
+            # Skip stray lines outside a record (defensive).
+            continue
+        elif line.startswith("HEAD "):
+            current.head = line[len("HEAD ") :].strip()
+        elif line.startswith("branch "):
+            current.branch = line[len("branch ") :].strip()
+        elif line == "detached":
+            current.detached = True
+        elif line == "bare":
+            current.bare = True
+        elif line == "locked":
+            current.locked = True
+        elif line.startswith("locked "):
+            current.locked = True
+            current.lock_reason = line[len("locked ") :].strip() or None
+        # Other fields (prunable, etc.) are ignored.
+
+    if current is not None:
+        worktrees.append(current)
+
+    return worktrees
+
+
+def _is_ancestor_of_origin_main(
+    repo_root: pathlib.Path,
+    head_sha: str,
+) -> bool:
+    """Return True if ``head_sha`` is reachable from ``origin/main``.
+
+    Uses ``git merge-base --is-ancestor`` which returns exit 0 when the
+    ancestor relationship holds.  Any error or non-zero exit returns
+    False so the caller fails closed.
+    """
+    if not head_sha:
+        return False
+    try:
+        result = subprocess.run(
+            ["git", "merge-base", "--is-ancestor", head_sha, "origin/main"],
+            capture_output=True,
+            text=True,
+            cwd=repo_root,
+            check=False,
+        )
+        return result.returncode == 0
+    except Exception:
+        return False
+
+
+def _check_open_pr(branch_short: str | None) -> tuple[bool, bool]:
+    """Check whether ``branch_short`` has an open PR.
+
+    Returns
+    -------
+    tuple[bool, bool]
+        ``(has_open_pr, lookup_succeeded)``.  When ``lookup_succeeded`` is
+        False the caller must treat the candidate as "uncertain" and
+        skip (fail closed).
+    """
+    if not branch_short:
+        return False, True
+    try:
+        prs = gh_list(
+            "pr",
+            head=branch_short,
+            state="open",
+            fields=["number", "state"],
+            limit=1,
+        )
+    except Exception:
+        return False, False
+    return bool(prs), True
+
+
+def _active_shepherd_issues(repo_root: pathlib.Path) -> set[int]:
+    """Return the set of issue numbers currently held by active shepherds.
+
+    Reads ``.loom/daemon-state.json`` and collects ``shepherds[*].issue``
+    for every shepherd whose status is not ``idle``.  Missing or malformed
+    state files yield an empty set — callers must combine this with the
+    other gates (PR check, sentinel, reachability) rather than relying on
+    it alone.
+    """
+    paths = LoomPaths(repo_root)
+    if not paths.daemon_state_file.exists():
+        return set()
+
+    data = read_json_file(paths.daemon_state_file)
+    if not isinstance(data, dict):
+        return set()
+
+    shepherds = data.get("shepherds")
+    if not isinstance(shepherds, dict):
+        return set()
+
+    active: set[int] = set()
+    for entry in shepherds.values():
+        if not isinstance(entry, dict):
+            continue
+        status = entry.get("status")
+        if status == "idle":
+            continue
+        issue = entry.get("issue")
+        if isinstance(issue, int):
+            active.add(issue)
+    return active
+
+
+def _worktree_age_seconds(path: pathlib.Path) -> float | None:
+    """Return the worktree's directory mtime age in seconds, or None."""
+    try:
+        st = path.stat()
+    except OSError:
+        return None
+    now = datetime.now(timezone.utc).timestamp()
+    return max(0.0, now - st.st_mtime)
+
+
+def evaluate_aggressive_candidate(
+    wt: WorktreeInfo,
+    repo_root: pathlib.Path,
+    active_shepherd_issues: set[int],
+    min_age_seconds: int,
+    force: bool,
+) -> tuple[str, str]:
+    """Apply the aggressive decision tree to a single worktree.
+
+    Decision order (first hit wins; "skip" beats "remove"):
+
+    1. Skip the main / bare worktree (never touch).
+    2. Open-PR check → skip (``reason=open_pr``).
+    3. Active-shepherd check → skip (``reason=active_shepherd``).
+    4. Sentinel / canonical-path check → skip (``reason=user_owned``)
+       when the worktree is outside ``.loom/worktrees/`` OR is inside
+       it but lacks the ``.loom-managed`` sentinel.
+    5. Uncommitted-changes check → skip (``reason=uncommitted``) unless
+       ``force`` is True.
+    6. Reachability check → if HEAD is an ancestor of ``origin/main`` the
+       work is preserved on the remote, so it is safe to remove.
+    7. mtime guard → skip (``reason=too_recent``) when the worktree is
+       younger than ``min_age_seconds``.
+    8. Fallback → skip (``reason=unreachable_head``) unless ``force`` is
+       True (the operator accepts data-loss risk).
+
+    Returns
+    -------
+    tuple[str, str]
+        ``(decision, reason)`` where ``decision`` is one of
+        :data:`DECISION_REMOVE` / :data:`DECISION_KEEP`.
+    """
+    # 1) Never touch the bare/main worktree.
+    if wt.bare:
+        return DECISION_KEEP, "bare_main_worktree"
+
+    # Resolve repo_root once for path comparisons.
+    try:
+        resolved_repo = repo_root.resolve()
+    except OSError:
+        resolved_repo = repo_root
+    try:
+        resolved_wt = wt.path.resolve()
+    except OSError:
+        resolved_wt = wt.path
+
+    if resolved_wt == resolved_repo:
+        return DECISION_KEEP, "bare_main_worktree"
+
+    # 2) Open-PR check (forge-aware via gh_list).
+    if wt.branch_short:
+        has_pr, ok = _check_open_pr(wt.branch_short)
+        if not ok:
+            # Fail closed when the lookup failed.
+            return DECISION_KEEP, "pr_lookup_failed"
+        if has_pr:
+            return DECISION_KEEP, "open_pr"
+
+    # 3) Active-shepherd check (daemon state).
+    if wt.branch_short:
+        issue_num = NamingConventions.issue_from_branch(wt.branch_short)
+        if issue_num is not None and issue_num in active_shepherd_issues:
+            return DECISION_KEEP, "active_shepherd"
+
+    # 4) Sentinel / canonical-path check.
+    worktrees_dir = (resolved_repo / ".loom" / "worktrees").resolve()
+    try:
+        is_under_loom = (
+            resolved_wt == worktrees_dir
+            or worktrees_dir in resolved_wt.parents
+        )
+    except Exception:
+        is_under_loom = False
+
+    if not is_under_loom:
+        # Defense in depth: never touch worktrees at non-canonical paths.
+        return DECISION_KEEP, "user_owned"
+
+    sentinel = resolved_wt / LOOM_MANAGED_SENTINEL
+    if not sentinel.exists():
+        # Couples to #3334.  Pre-existing worktrees can be opted in by
+        # running `touch .loom/worktrees/issue-N/.loom-managed`.
+        return DECISION_KEEP, "user_owned"
+
+    # 5) Uncommitted changes (unless --force overrides).
+    if check_uncommitted_changes(resolved_wt) and not force:
+        return DECISION_KEEP, "uncommitted"
+
+    # 6) Reachability — HEAD on origin/main means the work is preserved.
+    head_reachable = bool(wt.head) and _is_ancestor_of_origin_main(
+        repo_root, wt.head or ""
+    )
+    if head_reachable:
+        return DECISION_REMOVE, "reachable_from_origin_main"
+
+    # 7) mtime guard.
+    age = _worktree_age_seconds(resolved_wt)
+    if age is not None and age < min_age_seconds:
+        return DECISION_KEEP, "too_recent"
+
+    # 8) Fallback — HEAD not reachable.  Removing would lose work.
+    if force:
+        return DECISION_REMOVE, "force_override_unreachable"
+    return DECISION_KEEP, "unreachable_head"
+
+
+def _remove_aggressive_worktree(
+    repo_root: pathlib.Path,
+    wt: WorktreeInfo,
+    dry_run: bool,
+) -> bool:
+    """Unlock (if locked), remove the worktree, and delete its branch.
+
+    Returns True on success, False on any error.  Errors are logged but
+    not raised so the caller can continue processing other worktrees.
+    """
+    if dry_run:
+        log_info(f"Would remove worktree: {wt.path}")
+        if wt.branch_short:
+            log_info(f"Would delete branch: {wt.branch_short}")
+        return True
+
+    # Unlock if locked — `git worktree remove` refuses locked entries.
+    if wt.locked:
+        try:
+            subprocess.run(
+                ["git", "worktree", "unlock", str(wt.path)],
+                capture_output=True,
+                text=True,
+                cwd=repo_root,
+                check=False,
+            )
+        except Exception:
+            log_warning(f"  Failed to unlock worktree: {wt.path}")
+
+    # Remove the worktree with --force (covers dirty/locked edge cases).
+    try:
+        result = subprocess.run(
+            ["git", "worktree", "remove", "--force", str(wt.path)],
+            capture_output=True,
+            text=True,
+            cwd=repo_root,
+            check=False,
+        )
+        if result.returncode != 0:
+            log_warning(
+                f"  Failed to remove worktree {wt.path}: {result.stderr.strip()}"
+            )
+            return False
+        log_success(f"  Removed worktree: {wt.path}")
+    except Exception as e:
+        log_warning(f"  Error removing worktree {wt.path}: {e}")
+        return False
+
+    # Delete the local branch (force delete since we just nuked the worktree).
+    if wt.branch_short:
+        try:
+            result = subprocess.run(
+                ["git", "branch", "-D", wt.branch_short],
+                capture_output=True,
+                text=True,
+                cwd=repo_root,
+                check=False,
+            )
+            if result.returncode == 0:
+                log_success(f"  Deleted branch: {wt.branch_short}")
+            else:
+                # Branch may already be gone or referenced elsewhere — not fatal.
+                log_info(
+                    f"  Branch not deleted ({wt.branch_short}): "
+                    f"{result.stderr.strip()}"
+                )
+        except Exception as e:
+            log_info(f"  Branch delete skipped ({wt.branch_short}): {e}")
+
+    return True
+
+
+def clean_aggressive(
+    repo_root: pathlib.Path,
+    dry_run: bool = False,
+    force: bool = False,
+    min_age_seconds: int = DEFAULT_AGGRESSIVE_MIN_AGE,
+) -> AggressiveStats:
+    """Aggressive cleanup pass for vestigial / locked Loom worktrees.
+
+    Enumerates every worktree (not just ``.loom/worktrees/issue-*``)
+    and applies :func:`evaluate_aggressive_candidate`.  Worktrees whose
+    decision is ``DECISION_REMOVE`` are unlocked, removed (with
+    ``--force``), and their branches force-deleted.  All other
+    worktrees are left alone with a one-line audit log.
+
+    Returns an :class:`AggressiveStats` instance summarising the run.
+    """
+    stats = AggressiveStats()
+    active_shepherds = _active_shepherd_issues(repo_root)
+
+    worktrees = enumerate_git_worktrees(repo_root)
+    if not worktrees:
+        log_info("No worktrees enumerated from `git worktree list`")
+        return stats
+
+    for wt in worktrees:
+        # Compact one-line label for logging.
+        label = str(wt.path)
+        if wt.branch_short:
+            label = f"{wt.path} [{wt.branch_short}]"
+        elif wt.detached:
+            label = f"{wt.path} [detached]"
+
+        decision, reason = evaluate_aggressive_candidate(
+            wt,
+            repo_root,
+            active_shepherds,
+            min_age_seconds,
+            force,
+        )
+
+        if decision == DECISION_KEEP:
+            if reason == "bare_main_worktree":
+                stats.skipped_locked += 1
+                log_info(f"  Skip (main worktree): {label}")
+            elif reason in ("open_pr", "pr_lookup_failed"):
+                stats.skipped_open_pr += 1
+                log_info(f"  Skip ({reason}): {label}")
+            elif reason == "active_shepherd":
+                stats.skipped_active_shepherd += 1
+                log_info(f"  Skip (active shepherd): {label}")
+            elif reason == "user_owned":
+                stats.skipped_user_owned += 1
+                log_info(f"  Skip (user-owned / no .loom-managed sentinel): {label}")
+            elif reason == "uncommitted":
+                stats.skipped_uncommitted += 1
+                log_warning(
+                    f"  Skip (uncommitted changes; pass --force to override): {label}"
+                )
+            elif reason == "too_recent":
+                stats.skipped_too_recent += 1
+                log_info(f"  Skip (younger than min-age): {label}")
+            elif reason == "unreachable_head":
+                stats.skipped_unreachable += 1
+                log_warning(
+                    f"  Skip (HEAD not on origin/main — would lose work): {label}"
+                )
+                if wt.head:
+                    log_info(
+                        f"    HEAD={wt.head[:12]} (recoverable via `git reflog`)"
+                    )
+            else:
+                stats.errors += 1
+                log_warning(f"  Skip (unknown reason: {reason}): {label}")
+            continue
+
+        # decision == DECISION_REMOVE
+        if reason == "force_override_unreachable":
+            log_warning(
+                f"  Removing despite unreachable HEAD ({wt.head[:12] if wt.head else '?'}): {label}"
+            )
+        else:
+            log_info(f"  Remove ({reason}): {label}")
+
+        if _remove_aggressive_worktree(repo_root, wt, dry_run):
+            stats.removed += 1
+        else:
+            stats.errors += 1
+
+    # Final prune to clean up administrative references.
+    if not dry_run:
+        try:
+            subprocess.run(
+                ["git", "worktree", "prune"],
+                capture_output=True,
+                text=True,
+                cwd=repo_root,
+                check=False,
+            )
+        except Exception:
+            pass
+
+    return stats
+
+
+def print_aggressive_summary(stats: AggressiveStats, dry_run: bool = False) -> None:
+    """Render the aggressive-mode counters in audit-friendly form."""
+    print()
+    print("========================================")
+    print("  Aggressive Cleanup Summary")
+    print("========================================")
+    print()
+    if dry_run:
+        print(f"  Would remove: {stats.removed} worktree(s)")
+    else:
+        print(f"  Removed: {stats.removed} worktree(s)")
+    if stats.skipped_open_pr:
+        print(f"  Skipped (open PR / lookup failed): {stats.skipped_open_pr}")
+    if stats.skipped_active_shepherd:
+        print(f"  Skipped (active shepherd): {stats.skipped_active_shepherd}")
+    if stats.skipped_user_owned:
+        print(f"  Skipped (user-owned / no .loom-managed sentinel): {stats.skipped_user_owned}")
+    if stats.skipped_uncommitted:
+        print(f"  Skipped (uncommitted changes): {stats.skipped_uncommitted}")
+    if stats.skipped_too_recent:
+        print(f"  Skipped (younger than min-age): {stats.skipped_too_recent}")
+    if stats.skipped_unreachable:
+        print(f"  Skipped (HEAD unreachable — would lose work): {stats.skipped_unreachable}")
+    if stats.skipped_locked:
+        print(f"  Skipped (main worktree): {stats.skipped_locked}")
+    if stats.errors:
+        print(f"  Errors: {stats.errors}")
+    print()
+
+
 def print_summary(stats: CleanupStats, dry_run: bool = False, safe_mode: bool = False) -> None:
     """Print cleanup summary."""
     print()
@@ -921,16 +1473,42 @@ Daemon crash cleanup (--daemon):
   - Clear claims, progress files, and issue-failures.json
   - Finalize daemon state (running=false, shepherds=idle)
 
+Aggressive cleanup (--aggressive):
+  - Enumerates ALL worktrees (`git worktree list --porcelain`),
+    not just `.loom/worktrees/issue-*`.
+  - Overrides safety gates that strand vestigial worktrees:
+    ignores `.loom-in-use` markers, ignores stale
+    `find_processes_using_directory` matches, and skips the
+    `issue_state == "CLOSED"` precondition.
+  - Still respects these gates in order (first hit wins,
+    "skip" beats "remove"):
+      1. Open PR on the branch -> skip (open_pr)
+      2. Active shepherd holds the issue -> skip (active_shepherd)
+      3. Worktree path outside `.loom/worktrees/` or missing the
+         `.loom-managed` sentinel -> skip (user_owned)
+      4. Uncommitted changes -> skip (uncommitted) unless --force
+      5. HEAD reachable from origin/main -> REMOVE (work preserved)
+      6. Worktree younger than --aggressive-min-age -> skip (too_recent)
+      7. Otherwise skip (unreachable_head); pass --force to override.
+  - Locked worktrees are unlocked, then removed with `--force`.
+  - Pre-existing Loom worktrees created before the `.loom-managed`
+    sentinel existed must be opted in via
+    `touch .loom/worktrees/issue-N/.loom-managed` before the first
+    --aggressive run.
+  - Always preview first: `loom-clean --aggressive --dry-run`.
+
 Examples:
-  loom-clean                      # Interactive standard cleanup
-  loom-clean --force              # Non-interactive cleanup (CI/automation)
-  loom-clean --deep               # Include build artifacts
-  loom-clean --safe               # Safe mode (MERGED PRs only)
-  loom-clean --safe --force       # Safe mode, non-interactive
-  loom-clean --daemon             # Full daemon crash recovery
-  loom-clean --daemon --dry-run   # Preview daemon crash recovery
-  loom-clean --worktrees-only     # Just worktrees
-  loom-clean --branches-only      # Just branches
+  loom-clean                              # Interactive standard cleanup
+  loom-clean --force                      # Non-interactive cleanup (CI/automation)
+  loom-clean --deep                       # Include build artifacts
+  loom-clean --safe                       # Safe mode (MERGED PRs only)
+  loom-clean --safe --force               # Safe mode, non-interactive
+  loom-clean --daemon                     # Full daemon crash recovery
+  loom-clean --daemon --dry-run           # Preview daemon crash recovery
+  loom-clean --worktrees-only             # Just worktrees
+  loom-clean --branches-only              # Just branches
+  loom-clean --aggressive --dry-run       # Preview vestigial-worktree cleanup
+  loom-clean --aggressive --force         # Remove vestigial worktrees (no prompts)
 """,
     )
 
@@ -990,6 +1568,26 @@ Examples:
         action="store_true",
         help="Daemon crash recovery: kill sessions, revert labels, clear state",
     )
+    parser.add_argument(
+        "--aggressive",
+        action="store_true",
+        help=(
+            "Aggressive: enumerate `git worktree list --porcelain`, ignore "
+            "`.loom-in-use` markers and process-table noise, and remove "
+            "vestigial worktrees whose work is reachable from origin/main. "
+            "Respects open PRs, active shepherds, the `.loom-managed` "
+            "sentinel, and uncommitted changes. Use --dry-run to preview."
+        ),
+    )
+    parser.add_argument(
+        "--aggressive-min-age",
+        type=int,
+        default=DEFAULT_AGGRESSIVE_MIN_AGE,
+        help=(
+            "Minimum worktree age in seconds for --aggressive removal "
+            f"(default: {DEFAULT_AGGRESSIVE_MIN_AGE} = 24h)."
+        ),
+    )
 
     args = parser.parse_args(argv)
 
@@ -1015,6 +1613,48 @@ Examples:
             log_success("Daemon crash recovery complete!")
         print()
         return 0
+
+    # --aggressive: vestigial-worktree cleanup (separate workflow; see #3332)
+    if args.aggressive:
+        print()
+        print("========================================")
+        print("  Loom Aggressive Worktree Cleanup")
+        if args.dry_run:
+            print("  (DRY RUN MODE)")
+        print("========================================")
+        print()
+        log_warning(
+            "Aggressive mode overrides .loom-in-use markers and process-table "
+            "guards. Respects open PRs, active shepherds, the .loom-managed "
+            "sentinel, uncommitted changes, and reachability from origin/main."
+        )
+        print()
+
+        if not args.dry_run and not args.force:
+            try:
+                response = input(
+                    "Proceed with aggressive cleanup? [y/N] "
+                ).strip().lower()
+            except (EOFError, KeyboardInterrupt):
+                response = ""
+            if response not in ("y", "yes"):
+                log_info("Aggressive cleanup cancelled")
+                return 0
+
+        agg_stats = clean_aggressive(
+            repo_root,
+            dry_run=args.dry_run,
+            force=args.force,
+            min_age_seconds=args.aggressive_min_age,
+        )
+        print_aggressive_summary(agg_stats, dry_run=args.dry_run)
+        if args.dry_run:
+            log_warning("Dry run complete - no changes made")
+            log_info("Run without --dry-run to perform cleanup")
+        else:
+            log_success("Aggressive cleanup complete!")
+        print()
+        return 1 if agg_stats.errors > 0 else 0
 
     # Show banner
     print()
