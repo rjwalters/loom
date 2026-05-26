@@ -18,6 +18,11 @@
 # Pass --no-cleanup-worktree to skip this (e.g., when other terminals may
 # have their CWD inside the worktree).
 #
+# Cleanup is restricted to Loom-managed worktrees (those containing the
+# .loom-managed sentinel written by worktree.sh). Worktrees lacking the
+# sentinel are treated as user-owned and never removed. Set
+# LOOM_PRESERVE_WORKTREE=1 to disable cleanup unconditionally for a session.
+#
 # Exit codes:
 #   0 = merged (or auto-merge enabled)
 #   1 = failed
@@ -59,6 +64,12 @@ Options:
 By default, the local worktree is cleaned up after a successful merge.
 Pass --no-cleanup-worktree to skip this (e.g., when other terminals may
 have their CWD inside the worktree).
+
+Cleanup is restricted to Loom-managed worktrees (those under
+.loom/worktrees/issue-N that contain a .loom-managed sentinel file written
+by worktree.sh). User-provisioned worktrees at other paths are never
+removed. Set LOOM_PRESERVE_WORKTREE=1 to disable cleanup unconditionally
+for a session.
 
 Exit codes:
   0 = merged (or auto-merge enabled, or --help)
@@ -378,38 +389,52 @@ else
     warning "Could not delete branch '$PR_BRANCH' (may already be deleted)"
 fi
 
-# Cleanup worktree if requested
+# Cleanup worktree if requested.
+#
+# Ownership model (see issue #3334): Loom owns worktrees it created under
+# .loom/worktrees/ (marked with a .loom-managed sentinel file by worktree.sh).
+# Any worktree lacking the sentinel is treated as user-owned and is never
+# removed by this script. Operators can also set LOOM_PRESERVE_WORKTREE=1 to
+# skip cleanup unconditionally.
 if [[ "$CLEANUP_WORKTREE" == "true" ]]; then
-  # Extract issue number from branch name (feature/issue-N pattern)
-  ISSUE_NUM=$(echo "$PR_BRANCH" | grep -oE '[0-9]+$' || true)
-  if [[ -n "$ISSUE_NUM" ]]; then
-    WORKTREE_PATH="$REPO_ROOT/.loom/worktrees/issue-$ISSUE_NUM"
-    if [[ -d "$WORKTREE_PATH" ]]; then
-      # Check if we're currently inside the worktree being removed
-      CURRENT_DIR="$(pwd -P 2>/dev/null || pwd)"
-      WORKTREE_REAL="$(cd "$WORKTREE_PATH" 2>/dev/null && pwd -P || echo "$WORKTREE_PATH")"
-      IN_WORKTREE=false
-      if [[ "$CURRENT_DIR" == "$WORKTREE_REAL"* ]]; then
-        IN_WORKTREE=true
-        cd "$REPO_ROOT"
-      fi
-      info "Removing worktree: $WORKTREE_PATH"
-      if git -C "$REPO_ROOT" worktree remove "$WORKTREE_PATH" --force 2>/dev/null; then
-        success "Worktree removed"
-        if [[ "$IN_WORKTREE" == "true" ]]; then
-          echo ""
-          warning "Your shell's working directory was inside the removed worktree."
-          warning "Run this command to fix:"
-          echo "  cd $REPO_ROOT"
+  if [[ "${LOOM_PRESERVE_WORKTREE:-0}" == "1" ]]; then
+    info "Worktree cleanup skipped (LOOM_PRESERVE_WORKTREE=1)"
+  else
+    # Extract issue number from branch name (feature/issue-N pattern)
+    ISSUE_NUM=$(echo "$PR_BRANCH" | grep -oE '[0-9]+$' || true)
+    if [[ -n "$ISSUE_NUM" ]]; then
+      WORKTREE_PATH="$REPO_ROOT/.loom/worktrees/issue-$ISSUE_NUM"
+      if [[ -d "$WORKTREE_PATH" ]]; then
+        if [[ ! -f "$WORKTREE_PATH/.loom-managed" ]]; then
+          warning "Worktree at $WORKTREE_PATH lacks .loom-managed sentinel — refusing to remove (user-owned)"
+        else
+          # Check if we're currently inside the worktree being removed
+          CURRENT_DIR="$(pwd -P 2>/dev/null || pwd)"
+          WORKTREE_REAL="$(cd "$WORKTREE_PATH" 2>/dev/null && pwd -P || echo "$WORKTREE_PATH")"
+          IN_WORKTREE=false
+          if [[ "$CURRENT_DIR" == "$WORKTREE_REAL"* ]]; then
+            IN_WORKTREE=true
+            cd "$REPO_ROOT"
+          fi
+          info "Removing worktree: $WORKTREE_PATH"
+          if git -C "$REPO_ROOT" worktree remove "$WORKTREE_PATH" --force 2>/dev/null; then
+            success "Worktree removed"
+            if [[ "$IN_WORKTREE" == "true" ]]; then
+              echo ""
+              warning "Your shell's working directory was inside the removed worktree."
+              warning "Run this command to fix:"
+              echo "  cd $REPO_ROOT"
+            fi
+          else
+            warning "Could not remove worktree at $WORKTREE_PATH"
+          fi
         fi
       else
-        warning "Could not remove worktree at $WORKTREE_PATH"
+        info "No worktree found at $WORKTREE_PATH"
       fi
     else
-      info "No worktree found at $WORKTREE_PATH"
+      warning "Could not determine issue number from branch '$PR_BRANCH' for worktree cleanup"
     fi
-  else
-    warning "Could not determine issue number from branch '$PR_BRANCH' for worktree cleanup"
   fi
 fi
 

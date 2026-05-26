@@ -754,6 +754,19 @@ if _try_worktree_add; then
     # Get absolute path to worktree
     ABS_WORKTREE_PATH=$(cd "$WORKTREE_PATH" && pwd)
 
+    # Write a sentinel marker identifying this worktree as Loom-managed.
+    # Cleanup tooling (merge-pr.sh, agent-destroy.sh, loom-clean) refuses to
+    # remove worktrees lacking this marker, so user-provisioned worktrees at
+    # arbitrary paths are never touched by Loom. See issue #3334.
+    cat > "$ABS_WORKTREE_PATH/.loom-managed" <<EOF
+# Loom-managed worktree marker
+# Created by .loom/scripts/worktree.sh
+# Issue: $ISSUE_NUMBER
+# Branch: $BRANCH_NAME
+# Removing this file makes Loom treat the worktree as user-owned and refuse
+# to clean it up automatically.
+EOF
+
     # Sparse-mode: configure cone and materialize tracked files.
     # This must run before submodule init / symlinking so the working tree
     # exists and helpers see the same file layout as full mode.
