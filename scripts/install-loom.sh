@@ -42,6 +42,7 @@ ALLOW_ACTIVE_SESSION=false
 DOGFOOD_MODE=""  # "" (auto-detect), "true" (forced), "false" (forced off)
 ALLOW_NON_MAIN_SOURCE=false
 ALLOW_STALE_TARGET=false
+SKIP_TARGET_CI=false  # When true, install PR carries `[skip ci]` (issue #3333)
 TARGET_PATH=""
 
 while [[ $# -gt 0 ]]; do
@@ -78,6 +79,10 @@ while [[ $# -gt 0 ]]; do
       ALLOW_STALE_TARGET=true
       shift
       ;;
+    --skip-target-ci)
+      SKIP_TARGET_CI=true
+      shift
+      ;;
     -h|--help)
       echo "Usage: $0 [OPTIONS] /path/to/target-repo"
       echo ""
@@ -97,7 +102,19 @@ while [[ $# -gt 0 ]]; do
       echo "                             (non-main branch, detached HEAD, or behind origin/main)"
       echo "  --allow-stale-target       Proceed even if the target checkout is not on a clean main"
       echo "                             (non-main branch or behind origin/main); ignored in dogfood mode"
+      echo "  --skip-target-ci           Add '[skip ci]' to the install PR title and commit subject so the"
+      echo "                             target repository's CI does not run on the install PR. Use only when"
+      echo "                             the target's required-checks rulesets do not depend on CI completing"
+      echo "                             (the universal GitHub-native skip directive)."
       echo "  -h, --help                 Show this help message"
+      echo ""
+      echo "Default install PR markers (always on — see .loom/docs/ci-integration.md after install):"
+      echo "  - PR title prefix:        chore(loom): Install Loom <version>"
+      echo "  - PR body marker line:    loom-install: true"
+      echo "  - Commit trailer:         Skip-CI-Hint: docs-only"
+      echo "  These passive markers are detectable by opt-in CI (path-ignore, title filters,"
+      echo "  body grep) and do NOT suppress CI globally. Use --skip-target-ci for the active"
+      echo "  global skip when the target's required-checks rulesets do not depend on CI."
       exit 0
       ;;
     *)
@@ -701,6 +718,13 @@ if [[ "$FORCE_OVERWRITE" == "true" ]]; then
 else
   export FORCE_AUTO_MERGE=false
 fi
+
+# Export SKIP_TARGET_CI for create-pr.sh (issue #3333).
+# When --skip-target-ci is passed, the install PR title and commit subject
+# are prepended with `[skip ci]` — the universal GitHub-native CI skip
+# directive. Default-off so install PRs into repos with required-check
+# rulesets do not silently break CI gating.
+export SKIP_TARGET_CI
 
 # Verify installation scripts directory exists
 if [[ ! -d "$LOOM_ROOT/scripts/install" ]]; then
@@ -1597,6 +1621,38 @@ case "$MERGE_STATUS" in
     echo "       Download Loom.app from releases, open workspace"
     ;;
 esac
+echo ""
+
+# ---------------------------------------------------------------------------
+# CI integration hint (issue #3333).
+#
+# The install PR carries passive markers (chore(loom): title prefix,
+# `loom-install: true` body line, `Skip-CI-Hint: docs-only` commit trailer)
+# that target repos can detect via path-ignore, title filters, or body grep
+# to skip expensive CI on docs-only install PRs. Point operators at the
+# integration doc so they know what's available.
+# ---------------------------------------------------------------------------
+header "Optional: Skip CI on this and future install PRs"
+echo "  The install PR includes passive markers (title prefix, body line,"
+echo "  commit trailer) detectable by opt-in CI filters. To skip CI for"
+echo "  Loom install/update PRs, add a paths-ignore block to the target's"
+echo "  workflows:"
+echo ""
+echo "      on:"
+echo "        pull_request:"
+echo "          paths-ignore:"
+echo "            - '.loom/**'"
+echo "            - '.claude/**'"
+echo "            - '.codex/**'"
+echo "            - 'CLAUDE.md'"
+echo "            - '.github/labels.yml'"
+echo ""
+echo "  Full integration guide: ${TARGET_PATH}/.loom/docs/ci-integration.md"
+if [[ "$SKIP_TARGET_CI" == "true" ]]; then
+  echo ""
+  echo "  Note: --skip-target-ci was set — this install PR carries [skip ci]"
+  echo "  and target CI workflows were skipped via the universal directive."
+fi
 echo ""
 
 info "See CLAUDE.md in the target repository for complete usage details."
