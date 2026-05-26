@@ -112,7 +112,7 @@ run_guard_in_repo() {
     local tmp
     tmp=$(mktemp -d /tmp/loom-gitignore-guard-test.XXXXXX)
     (
-        cd "$tmp"
+        cd "$tmp" || exit 1
         git init -q .
         git config user.email "test@example.com"
         git config user.name "Test"
