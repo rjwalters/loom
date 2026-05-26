@@ -57,6 +57,46 @@ pub fn substitute_template_variables(
         .replace("{{INSTALL_DATE}}", &loom_metadata.install_date)
 }
 
+/// Template variable placeholders that must be substituted before a file is written.
+///
+/// Used by [`assert_no_placeholders`] to fail-fast if a templated file is about to be
+/// written with unsubstituted placeholders (defense-in-depth against the upgrade-path
+/// regression in #3325, where the installer left literal `{{LOOM_VERSION}}` etc.
+/// on disk).
+pub const TEMPLATE_PLACEHOLDERS: &[&str] = &[
+    "{{REPO_OWNER}}",
+    "{{REPO_NAME}}",
+    "{{LOOM_VERSION}}",
+    "{{LOOM_COMMIT}}",
+    "{{INSTALL_DATE}}",
+];
+
+/// Assert that `content` contains none of the known template placeholders.
+///
+/// Returns `Err` with a descriptive message naming the offending placeholders and the
+/// `file_label` (e.g. `"CLAUDE.md"`) so callers can surface a clear install-time error.
+/// Returns `Ok(())` when no placeholders remain.
+///
+/// This is a defense-in-depth check intended to be called immediately before writing
+/// a file that was supposed to have been template-substituted. It does **not** itself
+/// perform substitution — that's [`substitute_template_variables`]'s job.
+pub fn assert_no_placeholders(content: &str, file_label: &str) -> Result<(), String> {
+    let leaked: Vec<&str> = TEMPLATE_PLACEHOLDERS
+        .iter()
+        .copied()
+        .filter(|p| content.contains(p))
+        .collect();
+    if leaked.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "Refusing to write {file_label}: unsubstituted template placeholder(s) detected: {}. \
+             This indicates a bug in the installer's template handling — please report it.",
+            leaked.join(", ")
+        ))
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
@@ -98,6 +138,35 @@ mod tests {
         assert!(result_fallback.contains("**Loom Version**: unknown"));
         assert!(result_fallback.contains("**Loom Commit**: unknown"));
         assert!(result_fallback.contains("**Repository**: OWNER/REPO"));
+    }
+
+    #[test]
+    fn test_assert_no_placeholders_passes_on_clean_content() {
+        // Substituted content should pass — no `{{...}}` markers left.
+        let clean = "**Loom Version**: 0.8.0\n**Installation Date**: 2026-05-26";
+        assert!(assert_no_placeholders(clean, "CLAUDE.md").is_ok());
+
+        // Empty content trivially passes.
+        assert!(assert_no_placeholders("", "CLAUDE.md").is_ok());
+
+        // Content that happens to contain "{{" but not a known placeholder is fine.
+        assert!(assert_no_placeholders("see {{custom}} for details", "CLAUDE.md").is_ok());
+    }
+
+    #[test]
+    fn test_assert_no_placeholders_rejects_leaked_placeholders() {
+        // Bare LOOM_VERSION placeholder must be detected.
+        let leaky = "**Loom Version**: {{LOOM_VERSION}}";
+        let err = assert_no_placeholders(leaky, "CLAUDE.md").unwrap_err();
+        assert!(err.contains("CLAUDE.md"));
+        assert!(err.contains("{{LOOM_VERSION}}"));
+
+        // Multiple leaks should all be enumerated.
+        let multi = "{{LOOM_VERSION}} {{INSTALL_DATE}} {{REPO_OWNER}}";
+        let err = assert_no_placeholders(multi, "root.md").unwrap_err();
+        assert!(err.contains("{{LOOM_VERSION}}"));
+        assert!(err.contains("{{INSTALL_DATE}}"));
+        assert!(err.contains("{{REPO_OWNER}}"));
     }
 
     #[test]
