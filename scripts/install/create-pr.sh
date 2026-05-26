@@ -3,13 +3,40 @@
 #
 # Supports both GitHub (via gh CLI) and Gitea (via API).
 #
+# Default behavior (issue #3333):
+#   The auto-generated install PR carries three passive "docs-only" markers so
+#   target repositories that opt-in via path-ignore, title-prefix matching, or
+#   commit-message scanning can skip expensive CI for install PRs:
+#
+#     1. PR title prefix: "chore(loom): Install Loom <version>"
+#     2. PR body marker line (separator-isolated): "loom-install: true"
+#     3. Commit message trailer:                   "Skip-CI-Hint: docs-only"
+#
+#   These markers are PASSIVE — they do not include `[skip ci]` or `[ci skip]`
+#   directives and therefore do not suppress CI globally. Target repos must
+#   opt-in explicitly (path-ignore, custom workflow filter) for them to take
+#   effect.
+#
+#   Set SKIP_TARGET_CI=true (or pass `--skip-target-ci` to install-loom.sh)
+#   to additionally prepend `[skip ci]` to the PR title and commit subject —
+#   the universal GitHub-native CI skip directive.
+#
 # Environment variables:
 #   LOOM_VERSION       - Loom version string (default: "unknown")
 #   LOOM_COMMIT        - Loom commit hash (default: "unknown")
 #   FORCE_AUTO_MERGE   - If "true", attempt to auto-merge the PR (default: "false")
-#   PR_TITLE           - Custom PR title (default: auto-generated install title)
-#   PR_BODY            - Custom PR body (default: auto-generated install body)
-#   COMMIT_MSG         - Custom commit message (default: auto-generated install message)
+#   SKIP_TARGET_CI     - If "true", add `[skip ci]` prefix to PR title and
+#                        commit subject (default: "false"). Opt-in via the
+#                        `--skip-target-ci` flag on install-loom.sh.
+#   PR_TITLE           - Custom PR title (default: auto-generated install title
+#                        with `chore(loom): ` prefix). When set, FULLY OVERRIDES
+#                        the default — no marker injection occurs.
+#   PR_BODY            - Custom PR body (default: auto-generated install body
+#                        with `loom-install: true` marker line). When set,
+#                        FULLY OVERRIDES the default — no marker injection.
+#   COMMIT_MSG         - Custom commit message (default: auto-generated install
+#                        message with `Skip-CI-Hint: docs-only` trailer). When
+#                        set, FULLY OVERRIDES the default — no marker injection.
 
 set -euo pipefail
 
@@ -18,6 +45,7 @@ BASE_BRANCH="${2:-}"
 LOOM_VERSION="${LOOM_VERSION:-unknown}"
 LOOM_COMMIT="${LOOM_COMMIT:-unknown}"
 FORCE_AUTO_MERGE="${FORCE_AUTO_MERGE:-false}"
+SKIP_TARGET_CI="${SKIP_TARGET_CI:-false}"
 
 # Source forge detection helper
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -84,9 +112,21 @@ if git diff --staged --quiet; then
 fi
 
 # Create commit message (use custom if provided, otherwise default install message)
+#
+# Default subject is prefixed `chore(loom):` so conventional-commit-aware
+# tooling can filter; trailer `Skip-CI-Hint: docs-only` is detectable by
+# repos that opt in. When SKIP_TARGET_CI=true, prepend `[skip ci]` to the
+# subject line (universal GitHub convention).
+#
+# When COMMIT_MSG is set in the environment, it FULLY OVERRIDES the default
+# — no marker injection occurs (composability with custom install scripts).
 if [[ -z "${COMMIT_MSG:-}" ]]; then
+  commit_subject="chore(loom): Install Loom ${LOOM_VERSION} orchestration framework"
+  if [[ "$SKIP_TARGET_CI" == "true" ]]; then
+    commit_subject="[skip ci] ${commit_subject}"
+  fi
   COMMIT_MSG=$(cat <<EOF
-Install Loom ${LOOM_VERSION} orchestration framework
+${commit_subject}
 
 Adds Loom configuration and workflow integration:
 - .loom/ directory with configuration and scripts
@@ -97,6 +137,7 @@ Adds Loom configuration and workflow integration:
 
 Loom Version: ${LOOM_VERSION}
 Loom Commit: ${LOOM_COMMIT}
+Skip-CI-Hint: docs-only
 EOF
   )
 fi
@@ -135,8 +176,12 @@ if [[ $PUSH_EXIT_CODE -ne 0 ]]; then
         fi
       done
 
+      commit_subject_no_workflow="chore(loom): Install Loom ${LOOM_VERSION} orchestration framework"
+      if [[ "$SKIP_TARGET_CI" == "true" ]]; then
+        commit_subject_no_workflow="[skip ci] ${commit_subject_no_workflow}"
+      fi
       COMMIT_MSG_NO_WORKFLOW=$(cat <<EOF
-Install Loom ${LOOM_VERSION} orchestration framework
+${commit_subject_no_workflow}
 
 Adds Loom configuration and workflow integration:
 - .loom/ directory with configuration and scripts
@@ -149,6 +194,7 @@ To add workflows later, run: gh auth refresh -s workflow
 
 Loom Version: ${LOOM_VERSION}
 Loom Commit: ${LOOM_COMMIT}
+Skip-CI-Hint: docs-only
 EOF
 )
       git commit -m "$COMMIT_MSG_NO_WORKFLOW" >&2
@@ -192,6 +238,14 @@ fi
 info "Creating pull request..."
 
 # Create PR body (use custom if provided, otherwise default install body)
+#
+# The marker line `loom-install: true` is separator-isolated on its own line
+# so trivially greppable from CI scripts that read PR bodies via API. The
+# trailing `docs-only: true` line provides a second machine-detectable
+# signal. See defaults/.loom/docs/ci-integration.md for opt-in patterns.
+#
+# When PR_BODY is set in the environment, it FULLY OVERRIDES the default —
+# no marker injection occurs (composability with custom install scripts).
 if [[ -z "${PR_BODY:-}" ]]; then
   PR_BODY=$(cat <<EOF
 ## Loom Installation
@@ -221,14 +275,30 @@ After merging:
 See \`CLAUDE.md\` for complete usage details.
 
 ---
+
+<!-- Loom install markers (see .loom/docs/ci-integration.md for opt-in CI patterns) -->
+loom-install: true
+docs-only: true
+
+---
 Generated by [Loom](https://github.com/rjwalters/loom) installation
 EOF
   )
 fi
 
-# Use custom PR title if provided, otherwise default install title
+# Use custom PR title if provided, otherwise default install title.
+#
+# Default title is prefixed `chore(loom):` so conventional-commit-aware CI
+# can filter on it. When SKIP_TARGET_CI=true, additionally prepend
+# `[skip ci]` (universal GitHub convention) — the opt-in escape hatch.
+#
+# When PR_TITLE is set in the environment, it FULLY OVERRIDES the default —
+# no marker injection occurs.
 if [[ -z "${PR_TITLE:-}" ]]; then
-  PR_TITLE="Install Loom ${LOOM_VERSION}"
+  PR_TITLE="chore(loom): Install Loom ${LOOM_VERSION}"
+  if [[ "$SKIP_TARGET_CI" == "true" ]]; then
+    PR_TITLE="[skip ci] ${PR_TITLE}"
+  fi
 fi
 
 # ============================================================================

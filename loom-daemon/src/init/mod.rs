@@ -163,6 +163,10 @@ pub fn initialize_workspace(
     sync_managed_dir(&defaults, &loom_path, "roles", is_reinstall, &mut report)?;
     sync_managed_dir(&defaults, &loom_path, "scripts", is_reinstall, &mut report)?;
     sync_managed_dir(&defaults, &loom_path, "hooks", is_reinstall, &mut report)?;
+    // `docs` ships static reference documentation (e.g. ci-integration.md
+    // from issue #3333). Sync alongside other managed dirs so installed
+    // repos always carry the latest copy.
+    sync_managed_dir(&defaults, &loom_path, "docs", is_reinstall, &mut report)?;
     make_shell_scripts_executable(&loom_path.join("hooks"));
     make_shell_scripts_executable(&loom_path.join("scripts"));
 
@@ -343,7 +347,7 @@ fn verify_all_copied_files(
     report: &mut InitReport,
 ) {
     // Verify .loom managed directories (no template substitution needed)
-    for dir_name in &["roles", "scripts", "hooks"] {
+    for dir_name in &["roles", "scripts", "hooks", "docs"] {
         let src = defaults.join(dir_name);
         let dst = loom_path.join(dir_name);
         let prefix = format!(".loom/{dir_name}");
