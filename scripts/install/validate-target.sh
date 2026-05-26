@@ -104,6 +104,47 @@ if [[ -n "$(git status --porcelain)" ]]; then
   echo -e "${YELLOW}  Installation will create a worktree, so this is safe to proceed.${NC}"
 fi
 
+# Target-state guard (#3327): warn/refuse if the target checkout is on a
+# non-main branch or is behind origin/main. Dogfood exemption: when the
+# target IS the Loom source repo (TARGET_PATH == LOOM_ROOT) the source-state
+# check already covered this; don't double-warn.
+#
+# Environment inputs (exported by install-loom.sh parent):
+#   ALLOW_STALE_TARGET=true|false  - operator override
+#   NON_INTERACTIVE=true|false     - refuse vs. prompt
+#   LOOM_ROOT                      - canonical Loom source path
+ALLOW_STALE_TARGET="${ALLOW_STALE_TARGET:-false}"
+NON_INTERACTIVE="${NON_INTERACTIVE:-false}"
+if [[ "${LOOM_ROOT:-}" != "$TARGET_PATH" ]]; then
+  target_branch=$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo "unknown")
+  target_stale=""
+  if git rev-parse --verify --quiet origin/main >/dev/null 2>&1; then
+    target_behind=$(git rev-list --count HEAD..origin/main 2>/dev/null || echo 0)
+    if [[ "$target_behind" -gt 0 ]]; then
+      target_stale="local is $target_behind commit(s) behind origin/main (run 'git fetch && git pull' to refresh)"
+    fi
+  fi
+
+  if [[ "$target_branch" != "main" ]] || [[ -n "$target_stale" ]]; then
+    echo -e "${YELLOW}⚠ Warning: Target checkout is not on a clean main:${NC}"
+    [[ "$target_branch" != "main" ]] && echo "    branch: $target_branch (expected: main)"
+    [[ -n "$target_stale" ]]         && echo "    $target_stale"
+    echo "  Target path: $TARGET_PATH"
+
+    if [[ "$ALLOW_STALE_TARGET" == "true" ]]; then
+      info "Continuing anyway (--allow-stale-target)"
+    elif [[ "$NON_INTERACTIVE" == "true" ]]; then
+      error "Refusing to install into non-main / stale target in --yes mode. Pass --allow-stale-target to override."
+    else
+      read -r -p "Proceed with this target checkout anyway? [y/N] " -n 1 reply
+      echo ""
+      if [[ ! "$reply" =~ ^[Yy]$ ]]; then
+        error "Aborted by user. Switch the target to main and pull, or pass --allow-stale-target."
+      fi
+    fi
+  fi
+fi
+
 success "Validation complete"
 echo ""
 echo "Target repository: $REPO_NAME"
