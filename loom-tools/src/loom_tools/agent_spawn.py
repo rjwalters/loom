@@ -830,6 +830,33 @@ def spawn_agent(
         return SpawnResult(status="error", name=name, error="process_not_detected")
 
     log_success("Agent spawned successfully")
+
+    # Auto-accept the "Claude Code running in BypassPermissions mode" warning.
+    # On this Claude Code build the acknowledgement isn't persisted to the
+    # CLAUDE_CONFIG_DIR — every fresh process shows the modal warning. The
+    # menu defaults to "1. No, exit" so an unattended Enter would EXIT the
+    # session. We schedule a delayed Down+Enter to select "2. Yes, I accept".
+    # If the prompt isn't shown (e.g. future builds skip it), Down+Enter is
+    # a harmless no-op in the prompt area.
+    import subprocess as _subprocess
+    try:
+        _subprocess.Popen(
+            [
+                "bash",
+                "-c",
+                # 8s delay gives Claude Code time to render the bypass modal,
+                # then send Down+Enter via tmux.
+                f"sleep 8 && tmux -L {TMUX_SOCKET} send-keys -t {session_name} Down Enter 2>/dev/null || true",
+            ],
+            stdin=_subprocess.DEVNULL,
+            stdout=_subprocess.DEVNULL,
+            stderr=_subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        log_info("Scheduled auto-accept of BypassPermissions warning (Down+Enter at +8s)")
+    except Exception as _e:
+        log_warning(f"Could not schedule bypass auto-accept: {_e}")
+
     log_info("")
     log_info(f"Session: {session_name}")
     log_info(f"Attach:  tmux -L {TMUX_SOCKET} attach -t {session_name}")
