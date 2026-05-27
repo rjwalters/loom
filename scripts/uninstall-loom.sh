@@ -1072,7 +1072,9 @@ for dir in "${REMOVE_DIRS[@]}"; do
   dir_path="$WORKTREE_ABS/$dir"
   if [[ -d "$dir_path" ]]; then
     # Check if directory is empty (or only contains .DS_Store)
-    remaining=$(find "$dir_path" -type f -not -name '.DS_Store' 2>/dev/null | head -1)
+    # `-print -quit` (instead of piping to `head -1`) avoids SIGPIPE on `find`,
+    # which under `set -o pipefail` would trip the EXIT trap and abort the script.
+    remaining=$(find "$dir_path" -type f -not -name '.DS_Store' -print -quit 2>/dev/null)
     if [[ -z "$remaining" ]]; then
       rm -rf "$dir_path"
       REMOVED_LIST+=("$dir/ (empty directory)")
