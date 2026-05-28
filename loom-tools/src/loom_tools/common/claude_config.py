@@ -53,6 +53,23 @@ _MUTABLE_DIRS = [
     "tmp",
 ]
 
+# Project-scoped subdirectories of <repo_root>/.claude/ that must be visible
+# inside ``CLAUDE_CONFIG_DIR`` for Claude Code 2.1+ to resolve namespaced
+# slash commands (e.g., ``/loom:shepherd``) and skill routing.
+#
+# Without these symlinks, the per-agent ``CLAUDE_CONFIG_DIR`` is a bare
+# directory with no view of the project's slash-command tree, so Claude Code
+# replies "Unknown command: /loom:<role>" even when ``.claude/commands/loom/
+# <role>.md`` exists in the project.  See issue #3346.
+#
+# The symlinks point at the project's ``.claude/<name>`` directory (absolute
+# path).  They are refreshed on every ``setup_agent_config_dir`` call so a
+# moved/recreated worktree always sees the current project paths.
+_PROJECT_CLAUDE_LINKS = [
+    "commands",
+    "agents",
+]
+
 
 def _copy_settings_without_plugins(src: Path, dst: Path) -> bool:
     """Copy settings.json stripping the ``enabledPlugins`` key.
@@ -339,7 +356,88 @@ def validate_agent_config_dir(agent_name: str, repo_root: Path) -> bool:
             )
             return False
 
+    # Project-claude links must be present and resolvable whenever the
+    # project itself has the corresponding directory.  A missing or dangling
+    # symlink here causes Claude Code 2.1+ to fail with "Unknown command:
+    # /loom:<role>".  See issue #3346.
+    project_claude = repo_root / ".claude"
+    for name in _PROJECT_CLAUDE_LINKS:
+        src = project_claude / name
+        if not src.exists():
+            # Project doesn't have this dir — nothing to link, nothing to
+            # validate.  Don't fail validation just because the workspace
+            # hasn't installed Loom's command tree.
+            continue
+        dst = config_dir / name
+        if not dst.exists():
+            log.debug(
+                "Agent config dir validation failed for %s: project link "
+                "'%s' is missing or dangling",
+                agent_name,
+                name,
+            )
+            return False
+
     return True
+
+
+def _link_project_claude_dirs(repo_root: Path, config_dir: Path) -> None:
+    """Refresh symlinks from ``CLAUDE_CONFIG_DIR/<name>`` to ``<repo>/.claude/<name>``.
+
+    For each entry in ``_PROJECT_CLAUDE_LINKS`` (e.g. ``commands``, ``agents``),
+    ensure ``config_dir/<name>`` is a symlink pointing at the absolute project
+    path ``repo_root/.claude/<name>``.  This is what makes the per-agent
+    ``CLAUDE_CONFIG_DIR`` resolve project-defined namespaced slash commands
+    such as ``/loom:shepherd`` (issue #3346).
+
+    Behaviour:
+      - Source missing  → skip silently (nothing to link).
+      - Destination missing  → create the symlink.
+      - Destination is a symlink to the correct target  → no-op.
+      - Destination is a symlink to a *different* path (e.g. moved worktree)
+        → replace it (unlink + symlink).
+      - Destination is a regular file or directory  → leave it alone and
+        warn; we do not destroy user-created content.
+    """
+    project_claude = repo_root / ".claude"
+    for name in _PROJECT_CLAUDE_LINKS:
+        src = (project_claude / name).resolve() if (project_claude / name).exists() else None
+        if src is None:
+            # No project-side dir to link — skip.  This is the case for repos
+            # that haven't installed Loom's command tree, and is harmless.
+            continue
+
+        dst = config_dir / name
+        if dst.is_symlink():
+            try:
+                current_target = dst.resolve()
+            except OSError:
+                current_target = None
+            if current_target == src:
+                continue
+            # Wrong target (e.g., moved worktree) — refresh.
+            try:
+                dst.unlink()
+            except OSError as exc:
+                log.debug("Could not unlink stale symlink %s: %s", dst, exc)
+                continue
+        elif dst.exists():
+            # Non-symlink directory or file is present.  Don't destroy it —
+            # the agent (or operator) may have intentionally placed content
+            # there.  Warn once and move on; project commands won't resolve
+            # via this config dir, but we won't lose user data.
+            log.warning(
+                "Skipping project-claude link for %s: %s exists and is not a symlink",
+                name,
+                dst,
+            )
+            continue
+
+        try:
+            dst.symlink_to(src)
+            log.debug("Linked %s -> %s", dst, src)
+        except OSError as exc:
+            log.warning("Failed to symlink %s -> %s: %s", dst, src, exc)
 
 
 def setup_agent_config_dir(agent_name: str, repo_root: Path) -> Path:
@@ -414,6 +512,19 @@ def setup_agent_config_dir(agent_name: str, repo_root: Path) -> Path:
     # Create mutable directories
     for dirname in _MUTABLE_DIRS:
         (config_dir / dirname).mkdir(exist_ok=True)
+
+    # Symlink project's ``.claude/commands`` and ``.claude/agents`` into the
+    # per-agent ``CLAUDE_CONFIG_DIR`` so Claude Code 2.1+ can resolve
+    # namespaced slash commands like ``/loom:shepherd``.  Without this, the
+    # config dir is a bare directory and Claude Code falls back to "Unknown
+    # command" even when ``.claude/commands/loom/<role>.md`` exists in the
+    # project.  See issue #3346.
+    #
+    # We refresh these links every call (idempotent): if the link exists and
+    # already points at the correct project path, do nothing; if it exists
+    # but points elsewhere (e.g., a moved worktree), replace it; if missing,
+    # create it.
+    _link_project_claude_dirs(repo_root, config_dir)
 
     # Clone macOS Keychain credentials to the per-config-dir service name.
     # Claude Code v2.1.42+ hashes the config dir path into the keychain
