@@ -363,6 +363,23 @@ Stop processing and print the summary when any of these conditions hold:
 
 This skill does **not** implement disk-pressure checks, max-waves caps, or doctor-cycle global limits — those are deferred (see Limitations).
 
+## Host Sleep Readiness (#3350)
+
+Long sweeps run for many minutes — sometimes hours overnight — and the host going to sleep mid-run tears down in-flight subagent sockets to `api.anthropic.com`, killing curator / builder / judge subagents and losing all their work (see #3350 for the incident report).
+
+**Before the first wave**, run the host-sleep readiness check and surface its output to the user:
+
+```bash
+./.loom/scripts/check-host-sleep.sh
+```
+
+This is advisory-only. The script always exits `0` and **must not block** the sweep — proceed regardless of what it prints. It prints a platform-aware warning to stderr when the host is configured in a way that allows it to sleep:
+
+- **macOS:** even with a user-idle sleep assertion (Amphetamine, `caffeinate -dimsu`, etc.), macOS Maintenance Sleep can still fire and tear down sockets. The reliable defenses are `sudo pmset -c sleep 0` or flipping your sleep manager's "allow system sleep when display is off" toggle to OFF.
+- **systemd Linux:** wrap the session in `systemd-inhibit --what=idle:sleep --who=loom --why=sweep -- <cmd>`, which IS reliable.
+
+If the user is running an overnight sweep, they should heed the warning before walking away.
+
 ## Daemon Coexistence
 
 `/sweep` does not require the daemon and does not interact with `.loom/daemon-state.json` for writes. If the daemon is running, `/sweep` and the daemon may both try to claim the same `loom:issue` label.
