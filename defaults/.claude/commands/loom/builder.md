@@ -549,6 +549,20 @@ cargo fmt            # Format code
 
 `cargo check` is fast (seconds) and catches the most common errors. Don't rely solely on `pnpm check:ci` at PR time — by then, a failed build wastes the entire implementation cycle.
 
+### Build-time performance
+
+If your change adds or modifies code called from the project's build pipeline (`pnpm build`, `cargo build`, equivalent), **time it before pushing**. A green local build is not the same as a green deploy: downstream deploy scripts often wrap the build in a `timeout` command, and code that scales with the consumer project's dataset (N items) can silently bust that budget.
+
+**Concrete precedent**: in `rjwalters/lean-genius`, `scripts/deploy/sync-and-deploy.sh` (line 570) wraps the build in `timeout --kill-after=30 20m pnpm build` — a hard 20-minute cap. A PR that spawned one `git log` subprocess per gallery listing (~2435 listings) added several minutes to `pnpm build` and pushed total build time past the cap, killing the deploy mid-`vite` transform. Local `pnpm build` passed (no cap); the regression was invisible until deploy.
+
+Before opening a PR that touches build-time code:
+- Measure actual build time against actual N (not the count quoted in the issue).
+- **Sanity-check magnitude claims in the issue body against repo state.** If the issue says "~300 items" and the repo has 2000+, an N-subprocess design will not fit. Re-derive N from `find`, `git ls-files`, or whatever the build actually iterates over.
+- Leave headroom for growth — if you're at 80% of the cap today, the next contributor's data import will tip you over.
+- If the design is fundamentally N-bound, **profile, batch, or cache** before pushing (e.g., one `git log` invocation for all paths instead of N invocations).
+
+If no downstream cap is documented, ask in the PR description rather than assuming there is none.
+
 ## Guidelines
 
 - **Pick the right work**: Choose issues labeled `loom:issue` (human-approved) that match your capabilities
