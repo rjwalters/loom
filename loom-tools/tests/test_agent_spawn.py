@@ -1045,3 +1045,193 @@ class TestKillStuckSessionCapture:
         tmux_calls = [str(c) for c in mock_tmux.call_args_list]
         assert any("send-keys" in c for c in tmux_calls)
         assert any("kill-session" in c for c in tmux_calls)
+
+
+class TestAutoAcceptBypassPrompt:
+    """Tests for the bypass-permissions modal auto-accept logic (issue #3348)."""
+
+    @patch("loom_tools.agent_spawn._tmux")
+    def test_sends_down_enter_when_modal_detected(
+        self, mock_tmux: MagicMock, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """When the modal text appears in the pane, Down+Enter is sent."""
+        monkeypatch.delenv("LOOM_AUTO_ACCEPT_BYPASS", raising=False)
+        from loom_tools.agent_spawn import _auto_accept_bypass_prompt
+
+        # capture-pane returns the bypass warning text on the first call.
+        mock_tmux.return_value = subprocess.CompletedProcess(
+            args=[],
+            returncode=0,
+            stdout=(
+                "WARNING: Claude Code running in Bypass Permissions mode\n"
+                "1. No, exit\n"
+                "2. Yes, I accept\n"
+            ),
+        )
+
+        sleeps: list[float] = []
+        result = _auto_accept_bypass_prompt(
+            "loom-builder-1",
+            timeout=15,
+            poll_interval=1,
+            sleep_fn=sleeps.append,
+        )
+
+        assert result is True, "should report success when modal detected"
+        # Find the send-keys call: ("send-keys", "-t", session, "Down", "Enter")
+        send_keys_calls = [
+            c.args
+            for c in mock_tmux.call_args_list
+            if len(c.args) >= 5 and c.args[0] == "send-keys"
+        ]
+        assert len(send_keys_calls) == 1, (
+            f"expected exactly one send-keys call, got {send_keys_calls}"
+        )
+        assert send_keys_calls[0] == (
+            "send-keys", "-t", "loom-builder-1", "Down", "Enter",
+        )
+        # Should have detected on first iteration — no sleeps.
+        assert sleeps == [], f"expected no sleeps on immediate detection, got {sleeps}"
+
+    @patch("loom_tools.agent_spawn._tmux")
+    def test_polls_until_modal_appears(
+        self, mock_tmux: MagicMock, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Modal can appear after several poll iterations; keystrokes still sent."""
+        monkeypatch.delenv("LOOM_AUTO_ACCEPT_BYPASS", raising=False)
+        from loom_tools.agent_spawn import _auto_accept_bypass_prompt
+
+        empty = subprocess.CompletedProcess(args=[], returncode=0, stdout="")
+        with_prompt = subprocess.CompletedProcess(
+            args=[],
+            returncode=0,
+            stdout="WARNING: ... Bypass Permissions mode ... (1) No, exit",
+        )
+        send_ok = subprocess.CompletedProcess(args=[], returncode=0, stdout="")
+
+        # First two captures empty, third has the prompt, then send-keys returns ok.
+        mock_tmux.side_effect = [empty, empty, with_prompt, send_ok]
+
+        sleeps: list[float] = []
+        result = _auto_accept_bypass_prompt(
+            "loom-shepherd-1",
+            timeout=10,
+            poll_interval=1,
+            sleep_fn=sleeps.append,
+        )
+
+        assert result is True
+        # Two sleeps (after iters 0 and 1) before detection on iter 2.
+        assert sleeps == [1, 1], f"expected 2 sleeps, got {sleeps}"
+        send_keys_calls = [
+            c.args
+            for c in mock_tmux.call_args_list
+            if len(c.args) >= 5 and c.args[0] == "send-keys"
+        ]
+        assert len(send_keys_calls) == 1
+        assert send_keys_calls[0][-2:] == ("Down", "Enter")
+
+    @patch("loom_tools.agent_spawn._tmux")
+    def test_honours_timeout_when_modal_never_appears(
+        self, mock_tmux: MagicMock, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """If the modal never appears, return False after the timeout budget."""
+        monkeypatch.delenv("LOOM_AUTO_ACCEPT_BYPASS", raising=False)
+        from loom_tools.agent_spawn import _auto_accept_bypass_prompt
+
+        # Every capture returns benign shell output — no marker.
+        mock_tmux.return_value = subprocess.CompletedProcess(
+            args=[], returncode=0, stdout="$ claude --dangerously--ready\n",
+        )
+
+        sleeps: list[float] = []
+        # Use a short timeout so the test runs fast.
+        result = _auto_accept_bypass_prompt(
+            "loom-builder-2",
+            timeout=5,
+            poll_interval=1,
+            sleep_fn=sleeps.append,
+        )
+
+        assert result is False, "should return False on poll timeout"
+        # No send-keys call should have been emitted.
+        send_keys_calls = [
+            c.args
+            for c in mock_tmux.call_args_list
+            if len(c.args) >= 1 and c.args[0] == "send-keys"
+        ]
+        assert send_keys_calls == [], (
+            f"expected no send-keys on timeout, got {send_keys_calls}"
+        )
+        # Five sleeps total (one per poll, until elapsed >= timeout).
+        assert len(sleeps) == 5, f"expected 5 sleeps, got {len(sleeps)}: {sleeps}"
+
+    @patch("loom_tools.agent_spawn._tmux")
+    def test_disabled_by_env_var(
+        self, mock_tmux: MagicMock, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """LOOM_AUTO_ACCEPT_BYPASS=0 disables the auto-accept entirely."""
+        monkeypatch.setenv("LOOM_AUTO_ACCEPT_BYPASS", "0")
+        from loom_tools.agent_spawn import _auto_accept_bypass_prompt
+
+        sleeps: list[float] = []
+        result = _auto_accept_bypass_prompt(
+            "loom-builder-3",
+            timeout=15,
+            poll_interval=1,
+            sleep_fn=sleeps.append,
+        )
+
+        assert result is False
+        # tmux must not be invoked at all when disabled.
+        assert mock_tmux.call_count == 0
+        assert sleeps == []
+
+    @patch("loom_tools.agent_spawn._tmux")
+    def test_detects_alternate_marker(
+        self, mock_tmux: MagicMock, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The ``--dangerously-skip-permissions`` marker also triggers detection."""
+        monkeypatch.delenv("LOOM_AUTO_ACCEPT_BYPASS", raising=False)
+        from loom_tools.agent_spawn import _auto_accept_bypass_prompt
+
+        mock_tmux.return_value = subprocess.CompletedProcess(
+            args=[],
+            returncode=0,
+            stdout="claude --dangerously-skip-permissions (warning) ...",
+        )
+
+        result = _auto_accept_bypass_prompt(
+            "loom-builder-4",
+            timeout=5,
+            poll_interval=1,
+            sleep_fn=lambda _s: None,
+        )
+        assert result is True
+
+    @patch("loom_tools.agent_spawn._tmux")
+    def test_capture_pane_failure_does_not_raise(
+        self, mock_tmux: MagicMock, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Non-zero capture-pane returncode is treated as 'no modal yet'."""
+        monkeypatch.delenv("LOOM_AUTO_ACCEPT_BYPASS", raising=False)
+        from loom_tools.agent_spawn import _auto_accept_bypass_prompt
+
+        mock_tmux.return_value = subprocess.CompletedProcess(
+            args=[], returncode=1, stdout="",
+        )
+
+        result = _auto_accept_bypass_prompt(
+            "loom-builder-5",
+            timeout=3,
+            poll_interval=1,
+            sleep_fn=lambda _s: None,
+        )
+        assert result is False
+        # No send-keys emitted.
+        send_keys_calls = [
+            c
+            for c in mock_tmux.call_args_list
+            if c.args and c.args[0] == "send-keys"
+        ]
+        assert send_keys_calls == []

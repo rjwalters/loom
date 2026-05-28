@@ -79,6 +79,19 @@ SESSION_PREFIX = "loom-"
 DEFAULT_STUCK_THRESHOLD = 300  # 5 minutes
 DEFAULT_VERIFY_TIMEOUT = 10  # seconds
 
+# Bypass-permissions modal auto-accept (see issue #3348 / PR #112).
+# Claude Code 2.1.x shows a "WARNING: Claude Code running in Bypass Permissions
+# mode" modal on every spawn — the acknowledgement is not persisted to
+# CLAUDE_CONFIG_DIR — and the default selection ("1. No, exit") would exit the
+# session on an unattended Enter.  We poll the pane for the modal text, then
+# send Down+Enter to select "2. Yes, I accept".
+BYPASS_PROMPT_MARKERS = (
+    "Bypass Permissions mode",  # primary marker (matches "WARNING: ... Bypass Permissions mode")
+    "--dangerously-skip-permissions",
+)
+DEFAULT_BYPASS_POLL_TIMEOUT = 15  # seconds — total budget for the poll loop
+DEFAULT_BYPASS_POLL_INTERVAL = 1  # seconds — sleep between capture-pane attempts
+
 # Patterns in log output that indicate transient API errors
 # (agent is waiting for "try again" input, not actually stuck on a logic problem)
 API_ERROR_PATTERNS = (
@@ -361,6 +374,72 @@ def _is_claude_running(shell_pid: str) -> bool:
                 continue
     except (subprocess.TimeoutExpired, FileNotFoundError):
         pass
+    return False
+
+
+def _bypass_prompt_visible(session_name: str) -> bool:
+    """Return True when the pane contains the bypass-permissions modal text.
+
+    The detection is intentionally permissive — any of the markers in
+    ``BYPASS_PROMPT_MARKERS`` count as a hit, so future renames of the warning
+    string remain auto-accepted until we update the list.
+    """
+    try:
+        result = _tmux("capture-pane", "-t", session_name, "-p", "-S", "-200")
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        return False
+    if result.returncode != 0:
+        return False
+    pane = result.stdout or ""
+    return any(marker in pane for marker in BYPASS_PROMPT_MARKERS)
+
+
+def _auto_accept_bypass_prompt(
+    session_name: str,
+    timeout: int = DEFAULT_BYPASS_POLL_TIMEOUT,
+    poll_interval: int = DEFAULT_BYPASS_POLL_INTERVAL,
+    sleep_fn=time.sleep,
+) -> bool:
+    """Poll the tmux pane for the bypass-permissions modal and accept it.
+
+    Sends ``Down Enter`` to select "2. Yes, I accept" once the modal is
+    detected (default selection is "1. No, exit", which would terminate the
+    spawn on an unattended Enter).  Returns True if the modal was detected
+    and the keystrokes were sent; False if the poll timed out (the modal
+    never appeared — either Claude Code already proceeded past it or this
+    build does not show it).
+
+    Gated by ``LOOM_AUTO_ACCEPT_BYPASS``.  Default is "1" (enabled); set to
+    "0" to disable on builds where ``--dangerously-skip-permissions`` already
+    suppresses the modal.  See issue #3348.
+
+    Args:
+        session_name: Fully qualified tmux session (e.g. ``loom-builder-1``).
+        timeout: Total poll budget in seconds.
+        poll_interval: Seconds between ``capture-pane`` attempts.
+        sleep_fn: Sleep function (injected for tests).  Defaults to
+            ``time.sleep``.
+    """
+    if os.environ.get("LOOM_AUTO_ACCEPT_BYPASS", "1") == "0":
+        log_info("Bypass auto-accept disabled via LOOM_AUTO_ACCEPT_BYPASS=0")
+        return False
+
+    elapsed = 0
+    while elapsed < timeout:
+        if _bypass_prompt_visible(session_name):
+            log_info(
+                f"Bypass-permissions modal detected after {elapsed}s — "
+                "sending Down+Enter to accept"
+            )
+            _tmux("send-keys", "-t", session_name, "Down", "Enter")
+            return True
+        sleep_fn(poll_interval)
+        elapsed += poll_interval
+
+    log_info(
+        f"Bypass-permissions modal not detected within {timeout}s "
+        "(claude may have skipped the prompt or already moved past it)"
+    )
     return False
 
 
@@ -831,31 +910,17 @@ def spawn_agent(
 
     log_success("Agent spawned successfully")
 
-    # Auto-accept the "Claude Code running in BypassPermissions mode" warning.
-    # On this Claude Code build the acknowledgement isn't persisted to the
-    # CLAUDE_CONFIG_DIR — every fresh process shows the modal warning. The
-    # menu defaults to "1. No, exit" so an unattended Enter would EXIT the
-    # session. We schedule a delayed Down+Enter to select "2. Yes, I accept".
-    # If the prompt isn't shown (e.g. future builds skip it), Down+Enter is
-    # a harmless no-op in the prompt area.
-    import subprocess as _subprocess
+    # Auto-accept the "Claude Code running in Bypass Permissions mode" modal.
+    # On Claude Code 2.1.x the acknowledgement is not persisted to the
+    # CLAUDE_CONFIG_DIR — every fresh process shows the modal warning, with
+    # default selection "1. No, exit".  We poll for the modal text (rather
+    # than racing a fixed sleep) and send Down+Enter once it appears.
+    # Disable on builds that already suppress the modal by exporting
+    # ``LOOM_AUTO_ACCEPT_BYPASS=0``.  See issue #3348.
     try:
-        _subprocess.Popen(
-            [
-                "bash",
-                "-c",
-                # 8s delay gives Claude Code time to render the bypass modal,
-                # then send Down+Enter via tmux.
-                f"sleep 8 && tmux -L {TMUX_SOCKET} send-keys -t {session_name} Down Enter 2>/dev/null || true",
-            ],
-            stdin=_subprocess.DEVNULL,
-            stdout=_subprocess.DEVNULL,
-            stderr=_subprocess.DEVNULL,
-            start_new_session=True,
-        )
-        log_info("Scheduled auto-accept of BypassPermissions warning (Down+Enter at +8s)")
-    except Exception as _e:
-        log_warning(f"Could not schedule bypass auto-accept: {_e}")
+        _auto_accept_bypass_prompt(session_name)
+    except Exception as exc:  # pragma: no cover - defensive
+        log_warning(f"Bypass auto-accept failed: {exc}")
 
     log_info("")
     log_info(f"Session: {session_name}")
