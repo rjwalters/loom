@@ -695,7 +695,7 @@ After:
 - [ ] User preference to enable/disable per terminal
 - [ ] Respects OS notification permissions
 
-**Technical Approach**: Use Tauri notification API
+**Technical Approach**: Use macOS notification API via terminal-notifier or similar
 
 **Related**: #45 (terminal status tracking), #67 (user preferences)
 

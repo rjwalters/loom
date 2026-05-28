@@ -19,13 +19,13 @@ Several architectural approaches were considered for terminal management:
 
 Use a **two-tier architecture**:
 
-1. **Tauri Frontend** (TypeScript): UI, state management, user interaction
-2. **Rust Daemon** (`loom-daemon`): Terminal lifecycle management
+1. **CLI / MCP clients** (Claude Code, scripts, MCP tools): user-facing entry points
+2. **Rust Daemon** (`loom-daemon`): Terminal lifecycle management and orchestration
 3. **tmux**: Persistent terminal multiplexer
 
 **Architecture**:
 ```
-Tauri App (UI)
+CLI / MCP clients
     ↕ IPC (JSON over Unix socket)
 Rust Daemon (loom-daemon)
     ↕ Commands
@@ -101,7 +101,7 @@ Terminal Processes (bash, Claude Code)
 - Slower than Rust
 - Larger memory footprint
 - JavaScript async model more complex for IPC
-- Contradicts Tauri philosophy (Rust backend)
+- Loom's surface is CLI-first; a Rust binary keeps deployment simple
 
 ### 3. Docker Containers
 
@@ -115,18 +115,6 @@ Terminal Processes (bash, Claude Code)
 - Slower startup times
 - Overkill for terminal management
 - Requires Docker installation
-
-### 4. Built-in Tauri Shell
-
-**Pros**:
-- Simplest approach
-- Built into Tauri
-
-**Rejected because**:
-- No persistence
-- Limited control
-- Can't survive app restarts
-- No multiplexing
 
 ## Implementation Details
 

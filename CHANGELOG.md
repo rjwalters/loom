@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Breaking changes
+
+- Removed the Tauri desktop application surface entirely. Loom is now CLI + daemon only. Removed: `src-tauri/`, `src/`, the entire JS toolchain (`tsconfig*.json`, `vite.config.ts`, `vitest.config.ts`, `playwright.config.ts`, `biome.json`, `tailwind.config.js`, `postcss.config.js`, `pnpm-lock.yaml`, `pnpm-workspace.yaml`, `index.html`), GUI dev scripts (`scripts/dev-app*.sh`), `e2e/`, and the `e2e.yml` workflow. Decoupled mcp-loom log paths from Tauri, dropped `src-tauri` from the Cargo workspace members, rewrote `.github/workflows/release.yml` to publish `loom-daemon` binaries instead of DMGs, and trimmed `scripts/version.sh` from 7 to 5 version-bearing files (dropped `src-tauri/tauri.conf.json` and `src-tauri/Cargo.toml`). Existing DMG release artifacts remain available in prior GitHub releases as historical artifacts. The project name "Loom" is unaffected — only the desktop-app surface goes. Closes #3330.
+
 ## [0.8.1] - 2026-05-26
 
 ### Summary

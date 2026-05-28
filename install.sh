@@ -406,7 +406,7 @@ is_loom_source_repo() {
   # Check for marker file
   [[ -f "$path/.loom-source" ]] && return 0
   # Check for Loom-specific directory structure
-  [[ -d "$path/src-tauri" && -d "$path/loom-daemon" && -d "$path/defaults" ]] && return 0
+  [[ -d "$path/loom-daemon" && -d "$path/loom-api" && -d "$path/defaults" ]] && return 0
   return 1
 }
 

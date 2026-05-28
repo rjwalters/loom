@@ -5,7 +5,6 @@
  *
  * Use these alternatives instead:
  * - Daemon log: `tail -n 20 ~/.loom/daemon.log`
- * - Tauri log: `tail -n 20 ~/.loom/tauri.log`
  * - Terminal logs: `ls /tmp/loom-*.out` and `tail -n 20 /tmp/loom-terminal-1.out`
  *
  * The MCP server no longer exposes log reading tools to reduce tool count

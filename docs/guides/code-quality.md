@@ -24,16 +24,15 @@
 
 **CI/CD (GitHub Actions)**:
 - Workflow: `.github/workflows/ci.yml`
-- Jobs run in parallel: frontend lint/format, rust format, rust clippy, builds
+- Jobs run in parallel: rust format, rust clippy, builds, mcp-loom build, installer tests
 - All warnings treated as errors (`-D warnings` for clippy)
 - Dependency caching for faster builds
-- Frontend build artifacts downloaded before Tauri compilation
 
 **VSCode Integration**:
 - Settings: `.vscode/settings.json`
 - Extensions: `.vscode/extensions.json`
 - Format on save enabled for all languages
-- Biome for TS/JS, rust-analyzer for Rust
+- rust-analyzer for Rust
 
 ## Development Workflow
 
@@ -49,14 +48,11 @@
 
 **Available Scripts**:
 ```bash
-pnpm lint              # Biome linting
-pnpm format            # Biome formatting
 pnpm format:rust       # Rust formatting check
 pnpm format:rust:write # Rust formatting fix
 pnpm clippy            # Clippy with exact CI flags
 pnpm clippy:fix        # Clippy auto-fix
 pnpm check             # Cargo check
-pnpm build             # TypeScript + Vite build
 pnpm check:all         # Run everything (full CI simulation)
 ```
 
@@ -74,24 +70,6 @@ pnpm check:all  # This runs the full CI suite locally
 If this passes, CI should pass too.
 
 **Package Manager Preference**: Always use `pnpm` (not `npm`) as the package manager for this project.
-
-## Development Workflow
-
-Use the appropriate script based on your scenario:
-
-- **`pnpm app:dev`**: Normal development with hot reload (fastest iteration)
-  - Use when: Making frequent frontend changes
-  - Caveat: Hot reload sometimes misses changes (see "Stale Code Issue" below)
-
-- **`pnpm app:preview`**: Complete rebuild + launch (recommended for testing)
-  - Use when: After pulling new code, switching branches, or hot reload misses changes
-  - Always rebuilds both frontend AND Tauri binary before launching
-  - This is the "safe" option that guarantees fresh code
-
-- **`pnpm app:build`**: Production build
-  - Use when: Creating release builds
-
-**Stale Code Issue**: If you pull new code or switch branches, run `pnpm app:preview` to ensure you're running the latest code. The `tauri dev` command caches the built frontend and hot reload doesn't always catch everything, leading to wasted debugging time.
 
 ## Clippy Configuration Details
 
@@ -111,7 +89,7 @@ rustflags = [
 
 **When to use `#[allow(clippy::expect_used)]`**:
 - Mutex locks (poisoning is panic-level, not recoverable)
-- Main function startup (Tauri failure is fatal)
+- Main function startup (binary cannot continue without a usable runtime)
 - Other truly exceptional scenarios
 
 **Handling expect/unwrap warnings**:
@@ -119,100 +97,20 @@ rustflags = [
 - Use `expect()` with descriptive messages only when panic is acceptable
 - Add `#[allow]` attribute with explanatory comment when necessary
 
-## Self-Modification Problem
+## Self-Modification Workflow
 
-**CRITICAL**: Loom cannot develop itself using `app:dev` mode due to hot reload causing restart loops.
+When agents modify the Loom codebase itself, the daemon binary continues running with the old image — file changes do not auto-restart it. To pick up daemon changes, restart the daemon explicitly:
 
-### The Problem
-
-When running Loom in development mode (`pnpm app:dev`), Vite watches for file changes and triggers hot module replacement (HMR). If agent terminals within Loom are working on the Loom codebase itself:
-
-1. Agent edits source file (e.g., `src/lib/workspace-reset.ts`)
-2. Vite detects change and triggers HMR
-3. Tauri reloads the app
-4. App restart interrupts the agent mid-work
-5. Agent continues, edits another file
-6. **Infinite restart loop**
-
-This makes it impossible for Loom to work on its own codebase in dev mode.
-
-### Solutions
-
-**Option 1: Use Preview Mode (Recommended)**
 ```bash
-pnpm app:preview
+pnpm daemon:stop
+pnpm daemon:build
+pnpm daemon:dev
 ```
-- Builds the app once, then runs without hot reload
-- Agents can edit files without triggering restarts
-- Still faster than full production builds
-- Requires rebuild to see UI changes
 
-**Option 2: Use Production Mode**
+For changes to `mcp-loom`, rebuild and restart any Claude Code session using it:
+
 ```bash
-pnpm app:build
-# Then run the built app from ./target/release/
-```
-- Fully optimized production build
-- No hot reload at all
-- Slowest rebuild cycle
-
-**Option 3: Work on Different Workspace**
-```bash
-# Clone Loom to a separate directory
-git clone https://github.com/your-username/loom ~/loom-dev
-cd ~/loom-dev
-pnpm app:preview
-
-# Point agent terminals at original workspace
-# Agents work in ~/GitHub/loom, app runs from ~/loom-dev
-```
-- Separates running app from workspace being edited
-- Best for testing factory reset and agent features
-- Requires keeping both repos in sync
-
-**Option 4: Disable Agent Terminals**
-```bash
-# Use app:dev but don't run any agent terminals
-pnpm app:dev
-# Keep terminals as plain shells or run agents on different repos
-```
-- Good for frontend development only
-- Can't test agent orchestration features
-
-### When to Use Each Mode
-
-**Use `app:dev`**:
-- Frontend-only development (CSS, UI components, layouts)
-- No agent terminals running
-- Working on a different repository with agent terminals
-
-**Use `app:preview`**:
-- Testing factory reset, agent launching, worktree management
-- Agent terminals working on Loom codebase
-- Integration testing with agents
-
-**Use `app:build`**:
-- Final testing before release
-- Performance profiling
-- Packaging for distribution
-
-### Vite Ignore Configuration
-
-Vite is already configured to ignore `.loom/**` directories:
-
-```typescript
-// vite.config.ts
-export default defineConfig({
-  server: {
-    watch: {
-      ignored: ["**/.loom/**"],  // Ignores .loom/worktrees/, .loom/config.json, etc.
-    },
-  },
-});
+cd mcp-loom && npm run build
 ```
 
-However, this only prevents changes to `.loom/` from triggering reloads. Changes to `src/**`, `loom-daemon/**`, or other source files will still trigger HMR.
-
-### Summary
-
-**DO NOT use `app:dev` when agent terminals are working on the Loom codebase.** Always use `app:preview` or `app:build` for self-modification scenarios.
+For shell scripts, slash commands, role definitions, and Python tools, changes take effect on the next invocation — no restart required.

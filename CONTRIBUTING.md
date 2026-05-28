@@ -75,9 +75,10 @@ See the [Getting Started Guide](docs/guides/getting-started.md) and [CLI Referen
 
 ```
 loom/
-├── src/                    # TypeScript frontend (Svelte + Tauri)
-├── src-tauri/              # Rust backend (Tauri commands)
-├── loom-daemon/            # Rust daemon (terminal management)
+├── loom-daemon/            # Rust daemon (terminal management, orchestration)
+├── loom-api/               # Rust shared types and protocol definitions
+├── mcp-loom/               # Unified MCP server (TypeScript)
+├── loom-tools/             # Python tools (loom-shepherd, loom-clean, etc.)
 ├── .loom/                  # Workspace config and agent roles
 ├── defaults/               # Default configuration templates
 ├── docs/                   # Documentation

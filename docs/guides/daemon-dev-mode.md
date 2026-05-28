@@ -85,39 +85,28 @@ The script automatically highlights important events:
 
 ## Usage
 
-### Two-Terminal Workflow (Recommended)
+### Running the Daemon Monitor
 
-**Terminal 1:**
 ```bash
 pnpm run daemon:dev
 ```
 
-**Terminal 2:**
-```bash
-pnpm run tauri:dev
-```
-
 **What you'll see:**
 
-1. **Terminal 1** shows daemon activity:
-   - Daemon startup sequence
-   - Client connection when Tauri app launches
-   - Terminal creation/destruction
-   - IPC request stream
-   - Errors and warnings in real-time
-
-2. **Terminal 2** shows Tauri/Vite output:
-   - Hot reload events
-   - Build status
-   - Browser console logs
+The interactive monitor shows daemon activity:
+- Daemon startup sequence
+- Client connections from Claude Code / scripts
+- Terminal creation/destruction
+- IPC request stream
+- Errors and warnings in real-time
 
 ### When to Use Each Mode
 
 | Mode | Command | Use Case |
 |------|---------|----------|
 | **Interactive Dev** | `pnpm run daemon:dev` | Daily development (recommended) |
-| **Background** | `pnpm run app:dev` | Automated workflows, CI testing |
-| **Foreground Cargo** | `pnpm run daemon:run` | Low-level Rust debugging with breakpoints |
+| **Headless background** | `pnpm run daemon:headless` | Automated workflows, scripted testing |
+| **Foreground Cargo** | `pnpm run daemon:preview` | Low-level Rust debugging with breakpoints |
 
 ## Technical Details
 
@@ -174,29 +163,21 @@ tail -50 .daemon.log | grep -c "WARN"
 
 ### Old Way (Manual)
 ```bash
-# Terminal 1
 cd loom-daemon
 RUST_LOG=info cargo run
 # Output scrolls by, hard to spot issues
 # Manual restart needed for changes
 # No metrics, just raw logs
-
-# Terminal 2
-pnpm tauri:dev
 ```
 
 ### New Way (Interactive)
 ```bash
-# Terminal 1
 pnpm run daemon:dev
-# ✓ Color-coded logs
-# ✓ Real-time metrics
-# ✓ Auto-restart on Ctrl+C
-# ✓ Connection monitoring
-# ✓ Error highlighting
-
-# Terminal 2
-pnpm run tauri:dev
+# - Color-coded logs
+# - Real-time metrics
+# - Auto-stop on Ctrl+C
+# - Connection monitoring
+# - Error highlighting
 ```
 
 ## Future Enhancements

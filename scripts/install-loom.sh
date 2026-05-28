@@ -886,7 +886,7 @@ cd "$LOOM_ROOT"
 # The daemon is pure Rust; invoking via pnpm forced lockfile/workspace/build-script validation
 # of the loom source checkout, causing unrelated JS-toolchain drift to abort installation.
 cargo build --package loom-daemon --release || error "Failed to build loom-daemon"
-# Copy to architecture-specific name (Tauri sidecar convention)
+# Copy to architecture-specific name (matches release artifact naming)
 rm -f target/release/loom-daemon-aarch64-apple-darwin
 cp target/release/loom-daemon target/release/loom-daemon-aarch64-apple-darwin
 
@@ -1593,8 +1593,9 @@ case "$MERGE_STATUS" in
     echo "    cd $TARGET_PATH && claude"
     echo "    Then use /builder, /judge, or other role commands"
     echo ""
-    echo "  Tauri App Mode (requires Loom.app - see README):"
-    echo "    Download Loom.app from releases, open workspace"
+    echo "  Daemon Mode (autonomous orchestration):"
+    echo "    cd $TARGET_PATH && ./.loom/scripts/daemon.sh start"
+    echo "    Then in Claude Code: /loom"
     ;;
   auto)
     # Auto-merge enabled - PR will merge once requirements are met
@@ -1607,8 +1608,9 @@ case "$MERGE_STATUS" in
     echo "    cd $TARGET_PATH && claude"
     echo "    Then use /builder, /judge, or other role commands"
     echo ""
-    echo "  Tauri App Mode (requires Loom.app - see README):"
-    echo "    Download Loom.app from releases, open workspace"
+    echo "  Daemon Mode (autonomous orchestration):"
+    echo "    cd $TARGET_PATH && ./.loom/scripts/daemon.sh start"
+    echo "    Then in Claude Code: /loom"
     ;;
   *)
     # Manual merge required
@@ -1617,8 +1619,9 @@ case "$MERGE_STATUS" in
     echo "     Manual Mode (recommended to start):"
     echo "       cd $TARGET_PATH && claude"
     echo "       Then use /builder, /judge, or other role commands"
-    echo "     Tauri App Mode (requires Loom.app - see README):"
-    echo "       Download Loom.app from releases, open workspace"
+    echo "     Daemon Mode (autonomous orchestration):"
+    echo "       cd $TARGET_PATH && ./.loom/scripts/daemon.sh start"
+    echo "       Then in Claude Code: /loom"
     ;;
 esac
 echo ""

@@ -289,7 +289,6 @@ sh 'loom-daemon init'
    Error: Defaults directory not found. Tried paths:
      ./defaults
      /path/to/git/root/defaults
-     /Applications/Loom.app/Contents/Resources/_up_/defaults
    ```
    - Defaults directory couldn't be resolved
    - Solution: Specify `--defaults` explicitly or check installation
@@ -469,8 +468,8 @@ loom-daemon init --defaults /path/to/loom/defaults
 export LOOM_DEFAULTS_PATH=/path/to/loom/defaults
 loom-daemon init
 
-# Option 3: Check bundled path (production)
-ls /Applications/Loom.app/Contents/Resources/_up_/defaults
+# Option 3: Inspect Loom source clone
+ls /path/to/loom-source/defaults
 ```
 
 ### Issue: ".loom already exists" but appears empty

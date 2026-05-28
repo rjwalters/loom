@@ -2822,32 +2822,32 @@ class TestBuilderScopedTestVerification:
         """Should classify Rust files correctly."""
         builder = BuilderPhase()
         files = [
-            "src-tauri/src/main.rs",
+            "loom-api/src/lib.rs",
             "loom-daemon/src/init.rs",
         ]
         languages = builder._classify_changed_files(files)
         assert languages == {"rust"}
 
-    def test_classify_changed_files_typescript(self) -> None:
-        """Should classify TypeScript files correctly."""
+    def test_classify_changed_files_javascript(self) -> None:
+        """Should classify JavaScript/TypeScript files correctly."""
         builder = BuilderPhase()
         files = [
-            "src/main.ts",
-            "src/lib/terminal-manager.ts",
+            "mcp-loom/src/index.ts",
+            "mcp-loom/src/tools/terminals.ts",
         ]
         languages = builder._classify_changed_files(files)
-        assert languages == {"typescript"}
+        assert languages == {"javascript"}
 
     def test_classify_changed_files_mixed(self) -> None:
         """Should classify mixed files correctly."""
         builder = BuilderPhase()
         files = [
             "loom-tools/src/loom_tools/shepherd/phases/builder.py",
-            "src/main.ts",
-            "src-tauri/src/main.rs",
+            "mcp-loom/src/index.ts",
+            "loom-api/src/lib.rs",
         ]
         languages = builder._classify_changed_files(files)
-        assert languages == {"python", "typescript", "rust"}
+        assert languages == {"python", "javascript", "rust"}
 
     def test_classify_changed_files_config(self) -> None:
         """Should classify config files correctly."""

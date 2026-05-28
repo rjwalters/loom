@@ -682,7 +682,5 @@ Common error types:
 
 ## See Also
 
-- [MCP Loom UI](./loom-ui.md) - UI interaction and console logs
-- [MCP Loom Logs](./loom-logs.md) - Daemon and terminal log access
 - [MCP Overview](./README.md) - Introduction to Loom MCP servers
 - [Loom Daemon IPC Protocol](../../loom-daemon/README.md) - Low-level IPC details

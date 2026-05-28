@@ -597,7 +597,7 @@ In MOM, the daemon spawns subagents using the Task tool. No pre-configured termi
 | Doctor | 1 | PR conflict resolution |
 | Auditor | 1 | Main branch validation |
 
-### Required Terminal Configuration for Tauri App Mode
+### Required Terminal Configuration for Daemon Mode
 
 | Terminal ID | Role | Purpose |
 |-------------|------|---------|

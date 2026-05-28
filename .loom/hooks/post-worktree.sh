@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Post-worktree hook: provide loom-daemon binary for Tauri compatibility
+# Post-worktree hook: provide loom-daemon binary for the new worktree
 #
 # Called by worktree.sh after creating a new worktree.
 # Arguments: $1=worktree_path  $2=branch_name  $3=issue_number
@@ -49,7 +49,7 @@ if ! command -v cargo &>/dev/null; then
     exit 0
 fi
 
-echo "  Building loom-daemon (release) for Tauri compatibility..."
+echo "  Building loom-daemon (release)..."
 echo "  (main workspace binary not found at $MAIN_BINARY)"
 if cargo build --release -p loom-daemon --manifest-path "$WORKTREE_PATH/Cargo.toml" 2>&1; then
     echo "  loom-daemon build complete"

@@ -102,14 +102,11 @@ git worktree prune
 gh label sync --file .github/labels.yml
 ```
 
-### Terminal won't start (Tauri App)
+### Daemon won't start
 
 ```bash
 # Check daemon logs
 tail -f ~/.loom/daemon.log
-
-# Check terminal logs
-tail -f /tmp/loom-terminal-1.out
 ```
 
 ### Claude Code not found

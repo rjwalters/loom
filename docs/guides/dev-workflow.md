@@ -1,182 +1,75 @@
-# Development Workflow for Hot Reload with Persistent Daemon
+# Development Workflow
 
-This document describes the recommended workflow for frontend development with hot reload while keeping terminal sessions alive.
+This document describes the recommended workflow for working on `loom-daemon` and related tooling.
 
 ## Related Documentation
 
 - [README.md](../../README.md) - Project overview and quick start
 - [DEVELOPMENT.md](development.md) - Code quality and testing
+- [daemon-dev-mode.md](daemon-dev-mode.md) - Detailed daemon dev mode reference
 - [scripts/README.md](../../scripts/README.md) - Daemon script reference
 - [CLAUDE.md](../../CLAUDE.md) - AI development context
 
 ## Quick Start
 
-### Two-Terminal Development Workflow
+### Interactive Daemon Monitor
 
-**Terminal 1 - Interactive Daemon Monitor:**
 ```bash
 pnpm run daemon:dev
 ```
 
 This gives you a **live monitoring dashboard** showing:
-- ✅ Daemon status (running/stopped)
-- ⏱ Uptime counter
-- 🔌 Active connections
-- 📟 Terminal count
-- ⚠️ Errors and warnings
-- 🎨 Color-coded logs (errors=red, warnings=yellow, info=green)
-- 🔄 Real-time activity stream
+- Daemon status (running/stopped)
+- Uptime counter
+- Active connections
+- Terminal count
+- Errors and warnings
+- Color-coded logs (errors=red, warnings=yellow, info=green)
+- Real-time activity stream
 
-**Terminal 2 - Tauri Dev Mode:**
-```bash
-pnpm run tauri:dev
-```
-
-This gives you hot reload for:
-- TypeScript changes (`src/**/*.ts`)
-- CSS changes (`src/style.css`)
-- HTML changes (`index.html`)
-
-**Why this workflow is great:**
-- See daemon activity in real-time
-- Catch errors immediately
-- Monitor connection health
-- Watch terminal lifecycle events
-- Easy debugging with live logs
-- Ctrl+C in Terminal 1 cleanly stops daemon
-- Frontend hot-reloads preserve daemon state
+Ctrl+C cleanly stops the daemon.
 
 ## Workflow
 
-### 1. Initial Connection
-1. Start the daemon (Terminal 1)
-2. Start the Tauri app (Terminal 2)
-3. Select a workspace
-4. Create some terminals or let it create defaults
+### 1. Make Code Changes
 
-At this point:
-- Frontend has xterm.js instances connected to terminals
-- OutputPoller is polling each terminal for updates
-- Daemon has tmux sessions for each terminal
+Edit Rust code in `loom-daemon/`, `loom-api/`, or TypeScript in `mcp-loom/`. Edit Python tools in `loom-tools/`. Edit shell scripts in `defaults/scripts/` or `scripts/`.
 
-### 2. Frontend Hot Reload
-When you save a frontend file (TS/CSS/HTML):
+### 2. Rebuild and Test
 
-**What happens automatically:**
-- Vite detects the change and rebuilds
-- Browser/webview reloads
-- App state resets (terminal IDs, xterm instances lost)
-- Daemon **stays running** with all tmux sessions intact
-
-**What you need to do:**
-1. App will auto-reload your workspace (if stored)
-2. It will attempt to reconnect terminals automatically
-3. If reconnection fails or looks wrong:
-   - Go to **Help → Daemon Status...**
-   - Click **Yes** when asked "Would you like to reconnect terminals?"
-   - This will:
-     - Query daemon for active terminals
-     - Match them to your config
-     - Recreate xterm.js instances
-     - Restart output polling
-
-### 3. Verifying Connection
-
-After hot reload or manual reconnection:
-
-**Good signs:**
-- Primary terminal shows content
-- You can type in the terminal
-- Mini terminal cards show correct status
-- No error states on terminals
-
-**Bad signs:**
-- Terminals show "Missing Session" error
-- No output when you type
-- Console shows "No response" errors
-
-**If you see bad signs:**
-1. Check daemon is running (Terminal 1 should have output)
-2. Try manual reconnection: **Help → Daemon Status... → Yes**
-3. If still broken, restart daemon (Ctrl+C in Terminal 1, then restart)
-
-## Common Scenarios
-
-### Scenario A: Quick CSS Tweak
-```
-1. Edit src/style.css
-2. Save (Cmd+S)
-3. App hot-reloads automatically
-4. Terminals reconnect automatically
-5. Continue working
+For daemon changes:
+```bash
+pnpm run daemon:build          # release build
+cargo test --workspace          # run all Rust tests
 ```
 
-### Scenario B: TypeScript Refactoring
-```
-1. Edit src/lib/ui.ts
-2. Save (Cmd+S)
-3. App hot-reloads automatically
-4. If terminals look disconnected:
-   - Help → Daemon Status... → Yes
-5. Verify primary terminal works
-6. Continue editing
+For mcp-loom changes:
+```bash
+cd mcp-loom && npm run build
 ```
 
-### Scenario C: Daemon Gets Into Bad State
-```
-1. Terminals showing errors
-2. Reconnection doesn't help
-3. Solution:
-   - Ctrl+C in Terminal 1 (daemon)
-   - Restart daemon
-   - Help → Daemon Status... → Yes
-   - Should be clean now
+For Python tool changes:
+```bash
+cd loom-tools && uv run pytest tests/ -x -q
 ```
 
-### Scenario D: Want Fresh Start
-```
-1. Close workspace: File → Close Workspace
-2. Ctrl+C daemon (Terminal 1)
-3. Clear old sessions: tmux kill-server
-4. Restart daemon
-5. Restart Tauri app (Terminal 2)
-6. Select workspace
-7. Fresh terminals created
+### 3. Test the Daemon Locally
+
+Restart the daemon to load the new binary:
+```bash
+pnpm run daemon:stop
+pnpm run daemon:dev
 ```
 
-## Technical Details
-
-### What Gets Preserved Across Hot Reload
-- ✅ Daemon process (runs independently)
-- ✅ Terminal tmux sessions (in daemon)
-- ✅ Terminal history/scrollback (in tmux)
-- ✅ Terminal IDs (stable, generated by daemon)
-- ✅ Workspace selection (stored in Tauri state)
-- ✅ Config file (`.loom/config.json` on disk)
-
-### What Gets Reset on Hot Reload
-- ❌ Frontend JavaScript state
-- ❌ xterm.js instances (in-memory)
-- ❌ OutputPoller state (needs restart)
-- ❌ Event listeners (re-attached on render)
-
-### How Reconnection Works
-1. `initializeApp()` runs on startup
-2. Loads stored workspace path
-3. Validates it's still a git repo
-4. Calls `handleWorkspacePathInput()`
-5. Loads config from `.loom/config.json`
-6. Calls `reconnectTerminals()`
-7. Queries daemon: `list_terminals`
-8. For each terminal in config:
-   - If found in daemon: reconnect
-   - If missing: mark as error
-9. Creates xterm.js for primary terminal
-10. Starts output polling
+Or run in the foreground without the monitor:
+```bash
+pnpm run daemon:preview
+```
 
 ## Debugging Tips
 
 ### Check Daemon Health
+
 ```bash
 # See if daemon process is running
 ps aux | grep loom-daemon
@@ -184,21 +77,12 @@ ps aux | grep loom-daemon
 # Check socket exists
 ls -la ~/.loom/daemon.sock
 
-# Test daemon responds to ping
-# (You'll need to manually send JSON via socat or nc)
-```
-
-### Console Logging
-Open DevTools (Cmd+Option+I) and watch for:
-```
-[reconnectTerminals] Querying daemon for active terminals...
-[reconnectTerminals] Found X active daemon terminals
-[reconnectTerminals] Config has Y agents
-[reconnectTerminals] Reconnecting agent <name> (<id>)
-[reconnectTerminals] Reconnection complete: X reconnected, Y missing
+# Tail daemon log
+tail -f ~/.loom/daemon.log
 ```
 
 ### Check tmux Sessions
+
 ```bash
 # List all tmux sessions (these are your terminals)
 tmux ls
@@ -210,62 +94,37 @@ tmux attach -t loom-<id>
 tmux kill-server
 ```
 
-## Performance Notes
+### When to Restart the Daemon
 
-### Hot Reload Speed
-- TypeScript changes: ~1-2 seconds
-- CSS changes: ~500ms
-- Vite is optimized for fast rebuilds
-
-### Reconnection Overhead
-- Querying daemon: ~10ms
-- Creating xterm.js instance: ~50ms
-- Fetching terminal history: ~100ms (depends on scrollback size)
-- Total: < 200ms for typical case
-
-### When to Restart Daemon
-You should restart the daemon if:
-- Memory usage looks high (daemon has a memory leak)
-- Terminals are behaving weirdly (corrupted state)
-- You changed daemon code (need new binary)
+Restart the daemon if:
+- You rebuilt `loom-daemon`
+- Memory usage looks high
+- State is corrupted
 - You want a completely fresh start
-
-You don't need to restart if:
-- Just doing frontend changes (CSS/TS/HTML)
-- Terminals are working fine
-- Just did a hot reload
 
 ## Available Commands
 
 ### Development
-- `pnpm run daemon:dev` - **Interactive daemon monitor** (Terminal 1)
-- `pnpm run tauri:dev` - **Tauri dev mode** (Terminal 2)
+
+- `pnpm run daemon:dev` - **Interactive daemon monitor**
+- `pnpm run daemon:headless` - Start daemon in background (silent)
+- `pnpm run daemon:stop` - Stop daemon
+- `pnpm run daemon:preview` - Run daemon in foreground (cargo run)
 
 ### Building
-- `pnpm run build` - Build frontend (TypeScript + Vite)
-- `pnpm run tauri:build` - Build production app (Tauri + daemon)
-- `pnpm run daemon:build` - Build daemon binary only
+
+- `pnpm run daemon:build` - Build release daemon binary
+- `cargo build --workspace` - Build everything in the Rust workspace
 
 ### Testing
-- `pnpm run daemon:test` - Run daemon integration tests
-- `pnpm run check` - Check workspace compilation
+
+- `pnpm run daemon:test` - Run daemon tests only
+- `pnpm run test` - Run the full workspace test suite
+- `pnpm run test:python` - Run Python tool tests
 
 ### Code Quality
-- `pnpm run check:all` - Run all checks (lint, format, clippy, build)
-- `pnpm run lint` - Check frontend code style
-- `pnpm run lint:fix` - Auto-fix frontend linting issues
-- `pnpm run format:write` - Auto-format frontend code
+
+- `pnpm run check:all` - Run all checks (format, clippy, build, test)
 - `pnpm run format:rust:write` - Auto-format Rust code
 - `pnpm run clippy` - Run Rust linter
 - `pnpm run clippy:fix` - Auto-fix Rust linting issues
-
-## Future Improvements
-
-Potential enhancements to this workflow:
-
-1. ✅ **Simplified dev workflow**: Single command to start everything (DONE: `pnpm run app:dev`)
-2. ✅ **Easy daemon restart**: Quick command to restart daemon (DONE: `pnpm run app:dev:restart`)
-3. **Smarter reconnection**: Detect hot reload and reconnect automatically without user action
-4. **Connection health indicator**: Show connection status in UI (green = connected, red = disconnected)
-5. **Reconnect on terminal switch**: Auto-reconnect when switching primary terminal if connection lost
-6. **Daemon restart without tmux loss**: Save tmux session state to disk so daemon restart preserves terminals

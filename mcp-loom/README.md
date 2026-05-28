@@ -75,7 +75,6 @@ The following tools were removed to reduce complexity. Use the alternatives list
 | Removed Tool | Alternative |
 |--------------|-------------|
 | `tail_daemon_log` | `tail -n 20 ~/.loom/daemon.log` |
-| `tail_tauri_log` | `tail -n 20 ~/.loom/tauri.log` |
 | `list_terminal_logs` | `ls /tmp/loom-*.out` |
 | `tail_terminal_log` | `tail -n 20 /tmp/loom-terminal-1.out` |
 | `read_console_log` | `tail -n 20 ~/.loom/console.log` |

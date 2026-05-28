@@ -6,7 +6,7 @@
 
 ## What is Manual Orchestration Mode (MOM)?
 
-MOM is where you manually run Claude Code terminals with specialized role assignments (Builder, Judge, Curator, etc.) to coordinate development work through GitHub labels. Unlike Tauri App Mode (automated orchestration), MOM gives you direct control over each agent's actions through slash commands.
+MOM is where you manually run Claude Code terminals with specialized role assignments (Builder, Judge, Curator, etc.) to coordinate development work through GitHub labels. Unlike Daemon Mode (continuous autonomous orchestration), MOM gives you direct control over each agent's actions through slash commands.
 
 ## Prerequisites
 
@@ -341,17 +341,19 @@ cp defaults/roles/builder.md .loom/roles/my-custom-role.md
 
 See [defaults/roles/README.md](../../defaults/roles/README.md) for details.
 
-### Automate with Tauri App Mode
+### Automate with Daemon Mode
 
-Once comfortable with MOM, try **Tauri App Mode** for fully automated orchestration:
+Once comfortable with MOM, try **Daemon Mode** for continuous autonomous orchestration:
 
 ```bash
-# Open the Loom desktop app
-open -a Loom  # or launch from Applications
+# Start the daemon in a terminal
+./.loom/scripts/daemon.sh start
 
-# Select your workspace
-# Click "Start Engine"
-# Watch agents work autonomously
+# Activate orchestration from Claude Code
+/loom
+
+# Or for aggressive autonomous development
+/loom --merge
 ```
 
 ---
@@ -415,7 +417,7 @@ gh auth status
 - **[Workflows Documentation](../workflows.md)** - Complete label workflow reference
 - **[Role Definitions](../../defaults/roles/README.md)** - Learn about each role
 - **[Git Workflow Guide](git-workflow.md)** - Worktree management and branching strategy
-- **[Architecture Patterns](architecture-patterns.md)** - Understand Loom's design
+- **[Development Workflow](dev-workflow.md)** - Daemon dev workflow
 
 ---
 

@@ -8,7 +8,7 @@
 
 Loom spawns AI agents that claim issues, implement features, review PRs, and merge code -- all coordinated through labels. Your only job: write issues, review PRs, merge what you like.
 
-**Supported Forges**: GitHub | Gitea — Loom auto-detects your forge from the git remote URL. A [ForgeClient abstraction layer](docs/architecture/system-overview.md) makes the workflow identical regardless of forge.
+**Supported Forges**: GitHub | Gitea — Loom auto-detects your forge from the git remote URL. A ForgeClient abstraction layer makes the workflow identical regardless of forge.
 
 ## Quick Start
 
@@ -22,8 +22,6 @@ cd loom
 cd /path/to/your/repo
 /loom
 ```
-
-Or download [Loom.app](https://github.com/rjwalters/loom/releases) for the GUI.
 
 ## How It Works
 
@@ -120,9 +118,6 @@ See [Forge Authentication](.loom/docs/forge-authentication.md) for setup details
 ./loom-daemon init /path/to/your/repo
 ```
 
-**GUI application:**
-Download from [Releases](https://github.com/rjwalters/loom/releases)
-
 ### What Gets Installed
 
 ```
@@ -199,7 +194,6 @@ gh pr create --label "loom:review-requested"
 
 | Document | Description |
 |----------|-------------|
-| [System Overview](docs/architecture/system-overview.md) | Architecture and data flow |
 | [ADR Index](docs/adr/README.md) | Architecture decision records |
 | [MCP Tools](docs/mcp/README.md) | Programmatic control interface |
 
@@ -224,16 +218,15 @@ gh pr create --label "loom:review-requested"
 # Clone and setup
 git clone https://github.com/rjwalters/loom
 cd loom
-pnpm install
 
-# Run development server
-pnpm app:dev
+# Run the daemon in dev mode
+./scripts/dev-daemon.sh
 
 # Run tests
 cargo test --workspace
 
-# Build release
-pnpm app:build
+# Build release daemon
+cargo build --package loom-daemon --release
 ```
 
 See [DEVELOPMENT.md](docs/guides/development.md) for complete guidelines.

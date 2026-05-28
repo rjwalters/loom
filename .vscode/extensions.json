@@ -3,12 +3,6 @@
     // Rust
     "rust-lang.rust-analyzer",
 
-    // Frontend
-    "biomejs.biome",
-
-    // Tauri
-    "tauri-apps.tauri-vscode",
-
     // Git
     "eamodio.gitlens",
 

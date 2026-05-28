@@ -79,7 +79,7 @@ That's all you need to use Loom!
 
 Additional requirements to build and contribute to Loom:
 
-1. **Rust** (for Tauri backend compilation)
+1. **Rust** (for daemon and api compilation)
    ```bash
    # Install Rust via rustup (recommended)
    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
@@ -89,7 +89,7 @@ Additional requirements to build and contribute to Loom:
    cargo --version
    ```
 
-2. **System Dependencies** (for Tauri)
+2. **System Dependencies**
 
    **macOS:**
    ```bash
@@ -99,18 +99,10 @@ Additional requirements to build and contribute to Loom:
    **Linux (Ubuntu/Debian):**
    ```bash
    sudo apt update
-   sudo apt install libwebkit2gtk-4.0-dev \
-     build-essential \
-     curl \
-     wget \
-     file \
-     libssl-dev \
-     libgtk-3-dev \
-     libayatana-appindicator3-dev \
-     librsvg2-dev
+   sudo apt install build-essential pkg-config libssl-dev
    ```
 
-3. **Node.js** (v18 or later)
+3. **Node.js** (v18 or later, for mcp-loom)
    ```bash
    # Install via nvm (recommended)
    nvm install 18
@@ -268,39 +260,6 @@ The Full Install workflow:
 This runs the complete Full Install workflow automatically.
 
 **Next:** Review the output to understand what was created.
-
-### Option 4: GUI Application
-
-Visual application with workspace management and terminal controls.
-
-#### Steps
-
-1. **Download and Install**
-   - Download `Loom.app` from the [releases page](https://github.com/rjwalters/loom/releases)
-   - Move `Loom.app` to your Applications folder
-   - Open `Loom.app`
-
-2. **Select Workspace**
-   - Click "Choose Workspace" in the workspace selector
-   - Navigate to your git repository
-   - Select the repository root directory
-   - Loom will validate that it's a valid git repository
-
-3. **Initialize Workspace** (Automatic)
-   - If this is the first time using Loom in this repository
-   - The app will automatically create `.loom/` configuration
-   - Default terminal roles will be installed
-
-4. **Create Terminals**
-   - Click "+" to create agent terminals
-   - Configure each terminal's role via the settings icon
-   - Assign specialized roles (Worker, Curator, Reviewer, etc.)
-
-5. **Start Working**
-   - Terminals are now ready for manual commands or AI agents
-   - See [WORKFLOWS.md](../workflows.md) for agent coordination patterns
-
-**Next:** Configure terminal roles via the settings UI.
 
 ### Initialization Flags
 
@@ -651,9 +610,6 @@ Error: Defaults directory not found. Tried paths: ...
 ```bash
 # Specify defaults directory explicitly
 loom-daemon init --defaults /path/to/loom/defaults
-
-# Or use bundled defaults (production build)
-loom-daemon init --defaults /Applications/Loom.app/Contents/Resources/_up_/defaults
 ```
 
 **For developers:**

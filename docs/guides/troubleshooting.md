@@ -249,7 +249,6 @@ Loom provides a unified MCP server (`mcp-loom`) for AI-powered debugging:
 
 #### Log Tools
 - `mcp__loom__tail_daemon_log` - Read daemon logs
-- `mcp__loom__tail_tauri_log` - Read Tauri app logs
 - `mcp__loom__list_terminal_logs` - List terminal log files
 - `mcp__loom__tail_terminal_log` - Read specific terminal logs
 
@@ -263,9 +262,7 @@ See [MCP Documentation](../mcp/README.md) for full API reference.
 
 ### Log Locations
 
-- **Frontend console:** `~/.loom/console.log` (JSON structured logs)
 - **Daemon:** `~/.loom/daemon.log` (JSON structured logs)
-- **Tauri app:** `~/.loom/tauri.log` (Tauri application logs)
 - **Terminal output:** `/tmp/loom-terminal-*.out` (raw terminal output)
 
 ### Log Querying with jq
@@ -412,7 +409,7 @@ When opening a bug report, include:
 
 ### Using the Rust Debugger
 
-For debugging the daemon or Tauri backend:
+For debugging the daemon:
 
 ```bash
 # Build with debug symbols
@@ -422,12 +419,6 @@ cargo build --package loom-daemon
 lldb target/debug/loom-daemon
 ```
 
-### Frontend DevTools
-
-Open the Tauri DevTools:
-- Press `Cmd+Option+I` in the running app
-- Inspect console, network, and application state
-
 ### Trace Mode
 
 Enable verbose logging:
@@ -435,7 +426,7 @@ Enable verbose logging:
 ```bash
 # Set environment variable before starting
 export RUST_LOG=debug
-pnpm app:preview
+pnpm daemon:preview
 ```
 
 Check `~/.loom/daemon.log` for detailed trace output.

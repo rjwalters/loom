@@ -64,7 +64,7 @@ pub fn extract_repo_info(workspace_path: &Path) -> Option<(String, String)> {
 /// # Detection Methods
 ///
 /// 1. **Marker file**: `.loom-source` file exists (most reliable)
-/// 2. **Directory structure**: Has `src-tauri/`, `loom-daemon/`, and `defaults/` directories
+/// 2. **Directory structure**: Has `loom-api/`, `loom-daemon/`, and `defaults/` directories
 /// 3. **Git remote**: Remote URL matches known Loom repositories
 ///
 /// # Returns
@@ -77,11 +77,11 @@ pub fn is_loom_source_repo(workspace_path: &Path) -> bool {
     }
 
     // Method 2: Check for Loom-specific directory structure
-    let has_src_tauri = workspace_path.join("src-tauri").is_dir();
+    let has_loom_api = workspace_path.join("loom-api").is_dir();
     let has_loom_daemon = workspace_path.join("loom-daemon").is_dir();
     let has_defaults = workspace_path.join("defaults").is_dir();
 
-    if has_src_tauri && has_loom_daemon && has_defaults {
+    if has_loom_api && has_loom_daemon && has_defaults {
         // Additional check: defaults should have config.json and roles/
         let defaults_has_config = workspace_path.join("defaults").join("config.json").exists();
         let defaults_has_roles = workspace_path.join("defaults").join("roles").is_dir();
@@ -95,7 +95,7 @@ pub fn is_loom_source_repo(workspace_path: &Path) -> bool {
     if let Some((owner, repo)) = extract_repo_info(workspace_path) {
         // Match various Loom repository locations
         let is_loom_repo =
-            (workspace_path.join("src-tauri").is_dir() || owner == "rjwalters") && repo == "loom";
+            (workspace_path.join("loom-api").is_dir() || owner == "rjwalters") && repo == "loom";
 
         if is_loom_repo {
             return true;
@@ -314,8 +314,9 @@ pub fn resolve_defaults_path(defaults_path: &str) -> Result<PathBuf, String> {
         }
     }
 
-    // Try resolving as bundled resource (production mode)
-    // In production, resources are in .app/Contents/Resources/ on macOS
+    // Legacy: try resolving as bundled resource (when shipped inside a macOS .app bundle).
+    // The GUI .app shipping path was removed in v0.9; this fallback is kept defensively for
+    // any third-party packagers that wrap loom-daemon in a Contents/MacOS layout.
     if let Ok(exe_path) = std::env::current_exe() {
         // Get the app bundle Resources directory
         if let Some(exe_dir) = exe_path.parent() {
@@ -323,14 +324,14 @@ pub fn resolve_defaults_path(defaults_path: &str) -> Result<PathBuf, String> {
             if let Some(contents_dir) = exe_dir.parent() {
                 let resources_dir = contents_dir.join("Resources");
 
-                // Try with _up_ prefix (Tauri bundles ../defaults as _up_/defaults)
+                // Try with _up_ prefix (legacy bundling layout used `_up_/defaults`)
                 let up_path = resources_dir.join("_up_").join(defaults_path);
                 tried_paths.push(up_path.display().to_string());
                 if up_path.exists() {
                     return Ok(up_path);
                 }
 
-                // Try with subdirectory name (standard Tauri bundling)
+                // Try with subdirectory name (standard .app bundling layout)
                 let resources_path = resources_dir.join(defaults_path);
                 tried_paths.push(resources_path.display().to_string());
                 if resources_path.exists() {

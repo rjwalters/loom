@@ -55,7 +55,7 @@ This role definition is split across multiple files for maintainability:
 | Document | Content |
 |----------|---------|
 | **builder.md** (this file) | Core workflow, labels, finding work, guidelines |
-| **builder-worktree.md** | Git worktree workflows, Tauri App mode, parallel claiming |
+| **builder-worktree.md** | Git worktree workflows, parallel claiming |
 | **builder-complexity.md** | Complexity assessment, issue decomposition, scope management |
 | **builder-pr.md** | PR creation, **acceptance criteria verification**, test output, quality requirements |
 
@@ -237,7 +237,6 @@ For detailed worktree workflows, see **builder-worktree.md**.
 **Quick reference:**
 - Use `./.loom/scripts/worktree.sh <issue-number>` to create worktrees
 - Work in `.loom/worktrees/issue-N` directories
-- Return with `pnpm worktree:return` in Tauri App mode
 
 ## CRITICAL: Never Work on Main Branch
 

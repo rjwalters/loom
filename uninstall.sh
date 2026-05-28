@@ -83,7 +83,7 @@ fi
 is_loom_source_repo() {
   local path="$1"
   [[ -f "$path/.loom-source" ]] && return 0
-  [[ -d "$path/src-tauri" && -d "$path/loom-daemon" && -d "$path/defaults" ]] && return 0
+  [[ -d "$path/loom-daemon" && -d "$path/loom-api" && -d "$path/defaults" ]] && return 0
   return 1
 }
 

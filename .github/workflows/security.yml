@@ -7,7 +7,6 @@ on:
     types: [opened, synchronize, reopened]
     paths:
       - 'Cargo.lock'
-      - 'pnpm-lock.yaml'
       - '.github/workflows/security.yml'
   schedule:
     - cron: '0 0 * * 0'  # Weekly on Sunday
@@ -25,21 +24,6 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - run: cargo install cargo-audit
       - run: cargo audit --deny warnings
-
-  npm-audit:
-    name: NPM Audit (JS Dependencies)
-    runs-on: ubuntu-22.04
-    steps:
-      - uses: actions/checkout@v6
-      - uses: pnpm/action-setup@v6
-        with:
-          version: 9
-      - uses: actions/setup-node@v6
-        with:
-          node-version: '20'
-          cache: 'pnpm'
-      - run: pnpm install --frozen-lockfile
-      - run: pnpm audit --audit-level moderate
 
   codeql:
     name: CodeQL Analysis

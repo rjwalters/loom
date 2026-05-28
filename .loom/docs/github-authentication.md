@@ -54,7 +54,7 @@ export GH_TOKEN=github_pat_xxxxxxxxxxxxxxxxxxxx
 source .env  # where .env contains: export GH_TOKEN=github_pat_xxx
 ```
 
-When using Tauri App Mode, set the variable before launching the app so all spawned terminals inherit it.
+When using Daemon Mode, set the variable before launching the daemon so all spawned terminals inherit it.
 
 ## Verifying Authentication
 
@@ -86,7 +86,7 @@ If `gh auth status` shows the default credential instead of `GH_TOKEN`, verify t
 
 - Confirm `echo $GH_TOKEN` shows the token value
 - The variable must be **exported**, not just set: `export GH_TOKEN=...`
-- If using Tauri App Mode, restart the app after setting the variable
+- If using Daemon Mode, restart the daemon after setting the variable
 
 ### Permission errors (403 / insufficient scope)
 

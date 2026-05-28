@@ -364,7 +364,7 @@ fn handle_cli_command(command: Commands) -> Result<()> {
                         println!("   The Loom repo's .loom/ directory IS the source of truth.");
                         println!("\nTo use Loom orchestration:");
                         println!("  - Open Claude Code terminals with /builder, /judge, etc.");
-                        println!("  - Or launch the Loom Tauri app with this workspace");
+                        println!("  - Or start the daemon: ./.loom/scripts/daemon.sh start");
 
                         return Ok(());
                     }
@@ -440,8 +440,9 @@ fn handle_cli_command(command: Commands) -> Result<()> {
                     println!("     Manual Mode (recommended to start):");
                     println!("       cd {workspace_str} && claude");
                     println!("       Then use /builder, /judge, or other role commands");
-                    println!("     Tauri App Mode (requires Loom.app - see README):");
-                    println!("       Download Loom.app from releases, open workspace");
+                    println!("     Daemon Mode (autonomous orchestration):");
+                    println!("       cd {workspace_str} && ./.loom/scripts/daemon.sh start");
+                    println!("       Then in Claude Code: /loom");
                     Ok(())
                 }
                 Err(e) => {
