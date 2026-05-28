@@ -222,6 +222,15 @@ Curator → Builder → Judge → Doctor (if needed) → Merge
 2. Enhance issue with technical details
 3. Mark curated: `gh issue edit 42 --add-label "loom:curated"`
 
+### Overnight / long-running orchestration: keep the host awake (#3350)
+
+`/sweep`, `/loom`, and `/shepherd` automatically run `./.loom/scripts/check-host-sleep.sh` at startup and warn when the host can sleep. This is **advisory only** — Loom never blocks on it. Heed the warning before walking away from a long run.
+
+- **macOS:** user-idle sleep assertions (Amphetamine, `caffeinate -dimsu`, etc.) do **not** reliably defeat Maintenance Sleep on Apple Silicon. Use `sudo pmset -c sleep 0` for AC-only sleep disable, or flip your sleep manager's "allow system sleep when display is off" toggle to OFF.
+- **systemd Linux:** wrap the session in `systemd-inhibit --what=idle:sleep --who=loom --why=loom -- <cmd>`.
+
+Manual invocation: `./.loom/scripts/check-host-sleep.sh` (or `--quiet` for stderr-only output).
+
 ## Configuration
 
 ### Workspace Configuration

@@ -1174,6 +1174,20 @@ cp -r defaults/hooks/example-context/* .loom/context/
 
 ### Common Issues
 
+**Overnight / long-running orchestration: keep the host awake (#3350)**:
+
+`/sweep`, `/loom`, and `/shepherd` automatically run `./.loom/scripts/check-host-sleep.sh` at startup and warn when the host can sleep. This is **advisory only** — Loom never blocks on it. Heed the warning before walking away from a long run.
+
+- **macOS:** user-idle sleep assertions (Amphetamine, `caffeinate -dimsu`, etc.) do **not** reliably defeat Maintenance Sleep on Apple Silicon. Use `sudo pmset -c sleep 0` for AC-only sleep disable, or flip your sleep manager's "allow system sleep when display is off" toggle to OFF. Restore with `sudo pmset -c sleep 1` afterwards.
+- **systemd Linux:** wrap the session in `systemd-inhibit --what=idle:sleep --who=loom --why=loom -- <cmd>`. This is reliable.
+
+If you want to invoke the check manually:
+
+```bash
+./.loom/scripts/check-host-sleep.sh         # full warning (or success line)
+./.loom/scripts/check-host-sleep.sh --quiet # stderr warning only, no stdout line
+```
+
 **Merging PRs from worktrees**:
 
 Use `merge-pr.sh` instead of `gh pr merge` to avoid worktree checkout errors:

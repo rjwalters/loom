@@ -33,6 +33,23 @@ Parse the issue number and any flags from the arguments.
 
 ## Execution
 
+### Step 0: Host Sleep Readiness (#3350)
+
+A shepherd lifecycle (curator → builder → judge → optional doctor → merge) can take 30–60 minutes or more, especially in `--merge` mode with conflict resolution. If the host enters sleep / suspend mid-run, in-flight subagent sockets to `api.anthropic.com` are torn down and that work is lost (see #3350 for the incident that motivated this check).
+
+Before spawning the shepherd, run the host-sleep readiness check and surface its output to the user:
+
+```bash
+./.loom/scripts/check-host-sleep.sh
+```
+
+This is advisory-only. The script always exits `0` and **must not block** the shepherd — proceed regardless of what it prints. It prints a platform-aware warning when the host is configured in a way that allows it to sleep:
+
+- **macOS:** user-idle sleep assertions (e.g. Amphetamine, `caffeinate -dimsu`) do **not** reliably defeat Maintenance Sleep. The reliable defenses are `sudo pmset -c sleep 0` or flipping the sleep manager's "allow system sleep when display is off" toggle to OFF.
+- **systemd Linux:** wrap the session in `systemd-inhibit --what=idle:sleep --who=loom --why=shepherd -- <cmd>`, which IS reliable.
+
+If you are about to walk away from a `--merge` run, heed the warning before doing so.
+
 ### Step 1: Daemon Detection
 
 Check whether the standalone daemon is running:
