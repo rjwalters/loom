@@ -9,10 +9,12 @@ from unittest import mock
 import pytest
 
 from loom_tools.common.claude_config import (
+    _PROJECT_CLAUDE_LINKS,
     _SHARED_CONFIG_FILES,
     _copy_settings_without_plugins,
     _ensure_onboarding_complete,
     _keychain_service_name,
+    _link_project_claude_dirs,
     _resolve_state_file,
     cleanup_agent_config_dir,
     cleanup_all_agent_config_dirs,
@@ -220,6 +222,163 @@ class TestSetupAgentConfigDir:
         assert data["theme"] == "dark"
         assert data["effortCalloutDismissed"] is True
         assert data["opusProMigrationComplete"] is True
+
+
+class TestLinkProjectClaudeDirs:
+    """Tests for the project-claude link logic (issue #3346).
+
+    The per-agent ``CLAUDE_CONFIG_DIR`` must expose the project's
+    ``.claude/commands`` and ``.claude/agents`` so Claude Code 2.1+ can
+    resolve namespaced slash commands like ``/loom:shepherd``.
+    """
+
+    def test_constant_has_commands_and_agents(self) -> None:
+        """The link list must include the directories Claude Code consults."""
+        assert "commands" in _PROJECT_CLAUDE_LINKS
+        assert "agents" in _PROJECT_CLAUDE_LINKS
+
+    def test_creates_symlinks_to_project_claude_dirs(
+        self, mock_repo: pathlib.Path
+    ) -> None:
+        """When ``<repo>/.claude/commands`` exists it must be linked into the
+        agent config dir as a symlink pointing at the project path."""
+        project_commands = mock_repo / ".claude" / "commands" / "loom"
+        project_commands.mkdir(parents=True)
+        (project_commands / "shepherd.md").write_text("# shepherd role\n")
+
+        config_dir = setup_agent_config_dir("shepherd-1", mock_repo)
+        dst = config_dir / "commands"
+        assert dst.is_symlink(), "commands/ should be a symlink"
+        assert dst.resolve() == (mock_repo / ".claude" / "commands").resolve()
+        # The role file is reachable via the link.
+        assert (dst / "loom" / "shepherd.md").is_file()
+
+    def test_skips_when_project_dir_missing(self, mock_repo: pathlib.Path) -> None:
+        """Repos without ``.claude/commands`` get no link and no error."""
+        config_dir = setup_agent_config_dir("shepherd-1", mock_repo)
+        assert not (config_dir / "commands").exists()
+        assert not (config_dir / "agents").exists()
+
+    def test_links_agents_dir_when_present(self, mock_repo: pathlib.Path) -> None:
+        agents = mock_repo / ".claude" / "agents"
+        agents.mkdir(parents=True)
+        (agents / "loom-shepherd.md").write_text("# agent\n")
+
+        config_dir = setup_agent_config_dir("shepherd-1", mock_repo)
+        dst = config_dir / "agents"
+        assert dst.is_symlink()
+        assert dst.resolve() == agents.resolve()
+
+    def test_idempotent_keeps_existing_correct_link(
+        self, mock_repo: pathlib.Path
+    ) -> None:
+        """Re-running setup with the same project paths must be a no-op."""
+        commands = mock_repo / ".claude" / "commands"
+        commands.mkdir(parents=True)
+
+        setup_agent_config_dir("shepherd-1", mock_repo)
+        config_dir = mock_repo / ".loom" / "claude-config" / "shepherd-1"
+        first_target = (config_dir / "commands").resolve()
+
+        # Run again; link must still be present and point at the same place.
+        setup_agent_config_dir("shepherd-1", mock_repo)
+        assert (config_dir / "commands").is_symlink()
+        assert (config_dir / "commands").resolve() == first_target
+
+    def test_refreshes_stale_symlink(self, mock_repo: pathlib.Path) -> None:
+        """If the link points at a stale path, setup must replace it."""
+        commands = mock_repo / ".claude" / "commands"
+        commands.mkdir(parents=True)
+
+        config_dir = mock_repo / ".loom" / "claude-config" / "shepherd-1"
+        config_dir.mkdir(parents=True)
+
+        # Pre-create a wrong-target symlink.
+        wrong = mock_repo / "wrong-target"
+        wrong.mkdir()
+        (config_dir / "commands").symlink_to(wrong)
+
+        setup_agent_config_dir("shepherd-1", mock_repo)
+
+        assert (config_dir / "commands").is_symlink()
+        assert (config_dir / "commands").resolve() == commands.resolve()
+
+    def test_preserves_existing_non_symlink_directory(
+        self, mock_repo: pathlib.Path
+    ) -> None:
+        """If ``commands/`` already exists as a real directory (e.g. operator
+        placed content there), we must not destroy it."""
+        commands = mock_repo / ".claude" / "commands"
+        commands.mkdir(parents=True)
+
+        config_dir = mock_repo / ".loom" / "claude-config" / "shepherd-1"
+        config_dir.mkdir(parents=True)
+        # Operator-placed plain directory.
+        plain = config_dir / "commands"
+        plain.mkdir()
+        (plain / "user-file.md").write_text("# user content\n")
+
+        setup_agent_config_dir("shepherd-1", mock_repo)
+
+        # Plain dir preserved; not converted to symlink.
+        assert plain.is_dir() and not plain.is_symlink()
+        assert (plain / "user-file.md").is_file()
+
+    def test_link_helper_called_directly(self, mock_repo: pathlib.Path) -> None:
+        """The helper itself must be safe to call without a full setup."""
+        commands = mock_repo / ".claude" / "commands"
+        commands.mkdir(parents=True)
+
+        config_dir = mock_repo / "agent-conf"
+        config_dir.mkdir()
+
+        _link_project_claude_dirs(mock_repo, config_dir)
+
+        assert (config_dir / "commands").is_symlink()
+        assert (config_dir / "commands").resolve() == commands.resolve()
+
+    def test_validate_fails_when_project_link_missing(
+        self, mock_repo: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """If the project has ``.claude/commands`` but the agent's link is
+        missing, validation must fail so the dir gets rebuilt."""
+        commands = mock_repo / ".claude" / "commands"
+        commands.mkdir(parents=True)
+
+        fake_home = mock_repo / "fake-home"
+        fake_home.mkdir()
+        (fake_home / ".claude").mkdir()
+        (fake_home / ".claude.json").write_text(
+            '{"hasCompletedOnboarding":true,"theme":"dark",'
+            '"effortCalloutDismissed":true,"opusProMigrationComplete":true}'
+        )
+        monkeypatch.setattr(pathlib.Path, "home", staticmethod(lambda: fake_home))
+
+        setup_agent_config_dir("shepherd-1", mock_repo)
+        config_dir = mock_repo / ".loom" / "claude-config" / "shepherd-1"
+        assert validate_agent_config_dir("shepherd-1", mock_repo) is True
+
+        # Break the link.
+        (config_dir / "commands").unlink()
+        assert validate_agent_config_dir("shepherd-1", mock_repo) is False
+
+    def test_validate_tolerates_missing_project_dir(
+        self, mock_repo: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """If the project itself doesn't have ``.claude/commands``, the link
+        is not required and validation must still pass."""
+        # No project .claude/commands created.
+        fake_home = mock_repo / "fake-home"
+        fake_home.mkdir()
+        (fake_home / ".claude").mkdir()
+        (fake_home / ".claude.json").write_text(
+            '{"hasCompletedOnboarding":true,"theme":"dark",'
+            '"effortCalloutDismissed":true,"opusProMigrationComplete":true}'
+        )
+        monkeypatch.setattr(pathlib.Path, "home", staticmethod(lambda: fake_home))
+
+        setup_agent_config_dir("shepherd-1", mock_repo)
+        assert validate_agent_config_dir("shepherd-1", mock_repo) is True
 
 
 class TestEnsureOnboardingComplete:

@@ -42,6 +42,13 @@ mod claude_config {
         "tmp",
     ];
 
+    /// Project-scoped subdirectories of `<repo_root>/.claude/` that must be
+    /// visible inside `CLAUDE_CONFIG_DIR` for Claude Code 2.1+ to resolve
+    /// namespaced slash commands (`/loom:<role>`) and skill routing.
+    ///
+    /// Must match the Python `_PROJECT_CLAUDE_LINKS` list.  See issue #3346.
+    const PROJECT_CLAUDE_LINKS: &[&str] = &["commands", "agents"];
+
     /// Create an isolated `CLAUDE_CONFIG_DIR` for a terminal.
     ///
     /// Creates `.loom/claude-config/{agent_name}/` with symlinks to shared
@@ -243,6 +250,83 @@ mod claude_config {
         }
     }
 
+    /// Refresh symlinks from `CLAUDE_CONFIG_DIR/<name>` to
+    /// `<repo>/.claude/<name>` for each entry in `PROJECT_CLAUDE_LINKS`.
+    ///
+    /// This is what makes the per-agent `CLAUDE_CONFIG_DIR` resolve
+    /// project-defined namespaced slash commands such as `/loom:shepherd`
+    /// (issue #3346).
+    ///
+    /// Behaviour:
+    ///   - Source missing  → skip silently (nothing to link).
+    ///   - Destination missing  → create the symlink.
+    ///   - Destination is a symlink to the correct target  → no-op.
+    ///   - Destination is a symlink to a different path (e.g. moved worktree)
+    ///     → replace it.
+    ///   - Destination is a regular file or directory  → leave alone (warn).
+    fn link_project_claude_dirs(repo_root: &Path, config_dir: &Path) {
+        let project_claude = repo_root.join(".claude");
+        for name in PROJECT_CLAUDE_LINKS {
+            let src = project_claude.join(name);
+            if !src.exists() {
+                // No project-side dir to link — harmless for repos that
+                // haven't installed Loom's command tree.
+                continue;
+            }
+            // Use the canonical absolute path so the link survives `cd`/cwd
+            // changes and is unambiguous when inspected with `ls -l`.
+            let src_abs = match fs::canonicalize(&src) {
+                Ok(p) => p,
+                Err(e) => {
+                    log::debug!(
+                        "Could not canonicalize project link source {}: {e}",
+                        src.display()
+                    );
+                    continue;
+                }
+            };
+
+            let dst = config_dir.join(name);
+            let dst_meta = fs::symlink_metadata(&dst);
+            match dst_meta {
+                Ok(meta) if meta.file_type().is_symlink() => {
+                    // Already a symlink — check whether it points at the
+                    // correct target.  Resolve via canonicalize so we
+                    // compare absolute paths.
+                    if let Ok(cur) = fs::canonicalize(&dst) {
+                        if cur == src_abs {
+                            continue;
+                        }
+                    }
+                    // Wrong target (or unreadable) — refresh.
+                    if let Err(e) = fs::remove_file(&dst) {
+                        log::debug!("Could not unlink stale symlink {}: {e}", dst.display());
+                        continue;
+                    }
+                }
+                Ok(_) => {
+                    // Non-symlink directory or file present — don't destroy
+                    // it.  Warn and skip; commands won't resolve via this
+                    // config dir, but we won't lose user data.
+                    log::warn!(
+                        "Skipping project-claude link for {name}: {} exists and is not a symlink",
+                        dst.display()
+                    );
+                    continue;
+                }
+                Err(_) => {
+                    // Doesn't exist — fall through to create.
+                }
+            }
+
+            if let Err(e) = std::os::unix::fs::symlink(&src_abs, &dst) {
+                log::warn!("Failed to symlink {} -> {}: {e}", dst.display(), src_abs.display());
+            } else {
+                log::debug!("Linked {} -> {}", dst.display(), src_abs.display());
+            }
+        }
+    }
+
     pub fn setup_agent_config_dir(agent_name: &str, repo_root: &Path) -> Option<PathBuf> {
         let config_dir = repo_root
             .join(".loom")
@@ -335,6 +419,14 @@ mod claude_config {
                 log::debug!("Failed to create mutable dir {}: {e}", dir.display());
             }
         }
+
+        // Symlink project's `.claude/commands` and `.claude/agents` into
+        // the per-agent `CLAUDE_CONFIG_DIR` so Claude Code 2.1+ can resolve
+        // namespaced slash commands like `/loom:shepherd`.  Without these
+        // links the config dir is a bare directory and Claude Code falls
+        // back to "Unknown command" even when `.claude/commands/loom/
+        // <role>.md` exists in the project.  See issue #3346.
+        link_project_claude_dirs(repo_root, &config_dir);
 
         // Clone macOS Keychain credentials to the per-config-dir service name.
         clone_keychain_credentials(&config_dir);
@@ -711,6 +803,130 @@ mod claude_config {
                 data.get("enabledPlugins").is_none(),
                 "enabledPlugins must not be present in fallback"
             );
+        }
+
+        #[test]
+        fn test_project_claude_links_constant_includes_commands_and_agents() {
+            // Constant must include the two directories Claude Code 2.1+
+            // consults when resolving namespaced slash commands.
+            // See issue #3346.
+            assert!(PROJECT_CLAUDE_LINKS.contains(&"commands"));
+            assert!(PROJECT_CLAUDE_LINKS.contains(&"agents"));
+        }
+
+        #[test]
+        fn test_setup_links_project_commands_when_present() {
+            // When `<repo>/.claude/commands` exists, the config dir must
+            // contain a symlink to it so `/loom:shepherd` resolves.
+            // See issue #3346.
+            let tmp = tempfile::tempdir().unwrap();
+            let repo_root = tmp.path();
+            fs::create_dir_all(repo_root.join(".loom")).unwrap();
+
+            let project_commands = repo_root.join(".claude").join("commands").join("loom");
+            fs::create_dir_all(&project_commands).unwrap();
+            fs::write(project_commands.join("shepherd.md"), "# shepherd\n").unwrap();
+
+            let config_dir = setup_agent_config_dir("shepherd-1", repo_root).unwrap();
+            let dst = config_dir.join("commands");
+            let meta = fs::symlink_metadata(&dst).unwrap();
+            assert!(meta.file_type().is_symlink(), "config_dir/commands must be a symlink");
+
+            // Canonicalize both sides for a stable comparison
+            // (tempdir paths on macOS go through /private symlinks).
+            let expected = fs::canonicalize(repo_root.join(".claude").join("commands")).unwrap();
+            let actual = fs::canonicalize(&dst).unwrap();
+            assert_eq!(actual, expected);
+
+            // The role file is reachable through the link.
+            assert!(dst.join("loom").join("shepherd.md").is_file());
+        }
+
+        #[test]
+        fn test_setup_skips_project_link_when_dir_missing() {
+            // Repos without `.claude/commands` get no link and no error.
+            let tmp = tempfile::tempdir().unwrap();
+            let repo_root = tmp.path();
+            fs::create_dir_all(repo_root.join(".loom")).unwrap();
+
+            let config_dir = setup_agent_config_dir("shepherd-2", repo_root).unwrap();
+            assert!(!config_dir.join("commands").exists());
+            assert!(!config_dir.join("agents").exists());
+        }
+
+        #[test]
+        fn test_setup_refreshes_stale_project_link() {
+            // If the config dir already has a symlink pointing at the wrong
+            // target, setup must replace it with the correct one.
+            let tmp = tempfile::tempdir().unwrap();
+            let repo_root = tmp.path();
+            fs::create_dir_all(repo_root.join(".loom")).unwrap();
+
+            let project_commands = repo_root.join(".claude").join("commands");
+            fs::create_dir_all(&project_commands).unwrap();
+
+            let config_dir = repo_root
+                .join(".loom")
+                .join("claude-config")
+                .join("shepherd-3");
+            fs::create_dir_all(&config_dir).unwrap();
+
+            // Pre-create a wrong-target symlink.
+            let wrong = repo_root.join("wrong-target");
+            fs::create_dir_all(&wrong).unwrap();
+            std::os::unix::fs::symlink(&wrong, config_dir.join("commands")).unwrap();
+
+            let _ = setup_agent_config_dir("shepherd-3", repo_root).unwrap();
+
+            let expected = fs::canonicalize(&project_commands).unwrap();
+            let actual = fs::canonicalize(config_dir.join("commands")).unwrap();
+            assert_eq!(actual, expected);
+        }
+
+        #[test]
+        fn test_setup_preserves_non_symlink_directory() {
+            // If `commands/` is a real directory (operator placed content
+            // there), we must not destroy it.
+            let tmp = tempfile::tempdir().unwrap();
+            let repo_root = tmp.path();
+            fs::create_dir_all(repo_root.join(".loom")).unwrap();
+
+            let project_commands = repo_root.join(".claude").join("commands");
+            fs::create_dir_all(&project_commands).unwrap();
+
+            let config_dir = repo_root
+                .join(".loom")
+                .join("claude-config")
+                .join("shepherd-4");
+            fs::create_dir_all(&config_dir).unwrap();
+            let plain = config_dir.join("commands");
+            fs::create_dir_all(&plain).unwrap();
+            fs::write(plain.join("user-file.md"), "user content\n").unwrap();
+
+            let _ = setup_agent_config_dir("shepherd-4", repo_root).unwrap();
+
+            // Still a plain dir; user content preserved.
+            let meta = fs::symlink_metadata(&plain).unwrap();
+            assert!(!meta.file_type().is_symlink());
+            assert!(plain.join("user-file.md").is_file());
+        }
+
+        #[test]
+        fn test_link_helper_idempotent() {
+            // Calling setup twice with the same project paths is a no-op.
+            let tmp = tempfile::tempdir().unwrap();
+            let repo_root = tmp.path();
+            fs::create_dir_all(repo_root.join(".loom")).unwrap();
+
+            let project_commands = repo_root.join(".claude").join("commands");
+            fs::create_dir_all(&project_commands).unwrap();
+
+            let first = setup_agent_config_dir("shepherd-5", repo_root).unwrap();
+            let first_target = fs::canonicalize(first.join("commands")).unwrap();
+
+            let _ = setup_agent_config_dir("shepherd-5", repo_root).unwrap();
+            let second_target = fs::canonicalize(first.join("commands")).unwrap();
+            assert_eq!(first_target, second_target);
         }
     }
 }
