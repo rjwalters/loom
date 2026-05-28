@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import fnmatch
 import json
 import logging
 import os
@@ -241,6 +242,20 @@ _BUILD_ARTIFACT_PATTERNS: list[str] = [
     "pnpm-lock.yaml",
     ".venv",
     NO_CHANGES_MARKER,
+]
+
+# Default timeout (seconds) for the post-builder quality gate build command.
+# Overridden by `buildGate.timeoutSeconds` in `.loom/config.json`.
+_BUILD_GATE_DEFAULT_TIMEOUT = 600
+
+# Patterns excluded by default when no `realChangeGlobs` is configured.
+# These are scratch/log artifacts that should never count as "real" changes.
+# A repo can override this list via `buildGate.realChangeGlobs` (positive
+# globs — files must match at least one).
+_BUILD_GATE_DEFAULT_EXCLUSIONS: list[str] = [
+    ".loom-*",
+    "*.log",
+    ".no-changes-needed",
 ]
 
 
@@ -1034,6 +1049,20 @@ class BuilderPhase:
         if escape is not None:
             # Retries exhausted, still escaping
             return escape
+
+        # Post-builder quality gate (issue #3347) — opt-in via
+        # `.loom/config.json` `buildGate` block.  Runs the three deterministic
+        # checks (commits-ahead, real-changes, build-passes) after the builder
+        # exits but BEFORE any PR creation step.  On failure the gate releases
+        # the loom:building claim so another builder can re-attempt the issue.
+        # Skip when validation already shows a PR exists (fast path) — the
+        # builder finished its workflow before this hook could run.
+        if not self.validate(ctx, quiet=True):
+            gate_result = self._run_post_builder_quality_gate(ctx)
+            if gate_result is not None:
+                # Gate failed — claim already released, no PR opened.
+                self._cleanup_stale_worktree(ctx)
+                return gate_result
 
         # Fast path: when the builder already completed its full git workflow
         # (PR with loom:review-requested exists), skip test verification to
@@ -4604,6 +4633,328 @@ class BuilderPhase:
         )
         return False, (
             f"{display_name} failed (exit code {result.returncode})"
+        )
+
+    # ------------------------------------------------------------------
+    # Post-builder quality gate (issue #3347)
+    # ------------------------------------------------------------------
+
+    def _load_build_gate_config(
+        self, ctx: ShepherdContext
+    ) -> dict[str, Any] | None:
+        """Load `.loom/config.json`'s `buildGate` block.
+
+        Returns the buildGate dict when present and ``enabled`` is not False;
+        otherwise ``None`` (gate disabled).  Backward-compatible: repos with
+        no buildGate config see zero behavior change.
+
+        Schema::
+
+            {
+              "buildGate": {
+                "enabled": true,                # default true if block present
+                "command": "cargo build",       # required to run build check
+                "realChangeGlobs": ["*.rs"],    # optional; positive globs
+                "timeoutSeconds": 600           # optional; default 600
+              }
+            }
+        """
+        config_path = ctx.repo_root / ".loom" / "config.json"
+        if not config_path.is_file():
+            return None
+        data = read_json_file(config_path)
+        if not isinstance(data, dict):
+            return None
+        gate = data.get("buildGate")
+        if not isinstance(gate, dict):
+            return None
+        if gate.get("enabled") is False:
+            return None
+        return gate
+
+    def _gate_check_has_commits(self, worktree: Path) -> tuple[bool, str]:
+        """Verify the worktree has at least one commit ahead of origin/main.
+
+        Returns ``(ok, message)``.  ``message`` describes the failure on
+        ``ok=False``.
+        """
+        count = self._count_commits_ahead_of_main(worktree)
+        if count == 0:
+            return False, "no commits ahead of origin/main"
+        return True, f"{count} commit(s) ahead of origin/main"
+
+    def _gate_check_has_real_changes(
+        self,
+        worktree: Path,
+        real_change_globs: list[str] | None,
+    ) -> tuple[bool, str]:
+        """Verify the worktree has at least one "real" source change.
+
+        When ``real_change_globs`` is provided, a file is "real" if its path
+        matches at least one positive glob.  When omitted, every changed file
+        is considered "real" unless it matches one of the default exclusions
+        (``.loom-*``, ``*.log``, etc.).
+
+        Returns ``(ok, message)``.  ``message`` lists the changed-file count
+        on success, or describes the failure on ``ok=False``.
+        """
+        result = subprocess.run(
+            ["git", "-C", str(worktree), "diff", "--name-only", "origin/main..HEAD"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if result.returncode != 0:
+            # Treat git errors as "no changes" rather than swallowing — let
+            # the caller decide.  But if git itself failed, we cannot validate
+            # so fail conservatively.
+            return False, (
+                f"git diff failed (exit {result.returncode}): "
+                f"{(result.stderr or '').strip()[:200]}"
+            )
+
+        changed_files = [
+            line for line in result.stdout.splitlines() if line.strip()
+        ]
+        if not changed_files:
+            return False, "no files changed vs origin/main"
+
+        if real_change_globs:
+            matched = [
+                f for f in changed_files
+                if any(fnmatch.fnmatch(f, g) for g in real_change_globs)
+            ]
+            if not matched:
+                return False, (
+                    f"no real source changes among {len(changed_files)} "
+                    f"changed file(s) (configured globs: "
+                    f"{', '.join(real_change_globs)})"
+                )
+            return True, (
+                f"{len(matched)}/{len(changed_files)} changed file(s) match "
+                f"realChangeGlobs"
+            )
+
+        # No globs configured — apply default exclusions
+        kept = [
+            f for f in changed_files
+            if not any(
+                fnmatch.fnmatch(f, p) or fnmatch.fnmatch(Path(f).name, p)
+                for p in _BUILD_GATE_DEFAULT_EXCLUSIONS
+            )
+        ]
+        if not kept:
+            return False, (
+                f"all {len(changed_files)} changed file(s) match scratch "
+                f"exclusion patterns ({', '.join(_BUILD_GATE_DEFAULT_EXCLUSIONS)})"
+            )
+        return True, f"{len(kept)} real-change file(s) detected"
+
+    def _gate_check_build_passes(
+        self,
+        worktree: Path,
+        command: str,
+        timeout: int,
+    ) -> tuple[bool, str]:
+        """Run the configured build command in the worktree.
+
+        Returns ``(ok, message)``.  On failure, the message includes the
+        exit code and a trailing snippet of stdout/stderr.
+        """
+        try:
+            argv = shlex.split(command)
+        except ValueError as exc:
+            return False, f"could not parse buildGate.command: {exc}"
+        if not argv:
+            return False, "buildGate.command is empty"
+
+        log_info(
+            f"Post-builder quality gate: running '{command}' "
+            f"(timeout={timeout}s)"
+        )
+        try:
+            result = subprocess.run(
+                argv,
+                cwd=str(worktree),
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=timeout,
+            )
+        except subprocess.TimeoutExpired:
+            return False, (
+                f"build command '{command}' timed out after {timeout}s"
+            )
+        except (OSError, FileNotFoundError) as exc:
+            return False, (
+                f"could not execute build command '{command}': {exc}"
+            )
+
+        if result.returncode == 0:
+            return True, f"'{command}' passed"
+
+        out_tail = "\n".join(
+            ((result.stdout or "") + (result.stderr or "")).splitlines()[-20:]
+        )
+        return False, (
+            f"'{command}' exited with {result.returncode}\n"
+            f"output tail:\n{out_tail}"
+        )
+
+    def _run_post_builder_quality_gate(
+        self, ctx: ShepherdContext
+    ) -> PhaseResult | None:
+        """Deterministic post-builder quality gate (issue #3347).
+
+        Runs three orchestrator-side checks after the builder agent exits
+        but before any PR is created:
+
+        1. **has-commits**: worktree has at least one commit ahead of
+           ``origin/main``.
+        2. **has-real-changes**: changed files match the configured
+           ``realChangeGlobs`` (or default scratch exclusions).
+        3. **build-passes**: the configured ``buildGate.command`` exits 0.
+
+        On any failure: release the ``loom:building`` claim back to
+        ``loom:issue``, log an ``error`` milestone with
+        ``reason=build_failed_post_builder``, and return a ``FAILED``
+        ``PhaseResult`` so the caller short-circuits before PR creation.
+
+        Returns:
+            ``None`` when the gate is disabled, no worktree exists, or all
+            three checks pass.  A ``FAILED`` ``PhaseResult`` when any check
+            fails (and the claim has been released).
+        """
+        gate = self._load_build_gate_config(ctx)
+        if gate is None:
+            return None  # Gate disabled / unconfigured — no-op
+
+        worktree = ctx.worktree_path
+        if worktree is None or not worktree.is_dir():
+            # Can't run gate without a worktree; skip rather than fail.
+            log_info(
+                "Post-builder quality gate: no worktree present, skipping"
+            )
+            return None
+
+        # Validate config types
+        command = gate.get("command")
+        if command is not None and not isinstance(command, str):
+            log_warning(
+                "buildGate.command must be a string; ignoring quality gate"
+            )
+            return None
+        real_change_globs = gate.get("realChangeGlobs")
+        if real_change_globs is not None and not isinstance(real_change_globs, list):
+            log_warning(
+                "buildGate.realChangeGlobs must be a list; ignoring globs"
+            )
+            real_change_globs = None
+        timeout_value = gate.get("timeoutSeconds", _BUILD_GATE_DEFAULT_TIMEOUT)
+        try:
+            timeout = int(timeout_value)
+        except (TypeError, ValueError):
+            timeout = _BUILD_GATE_DEFAULT_TIMEOUT
+
+        log_info(
+            f"Post-builder quality gate enabled for issue "
+            f"#{ctx.config.issue}; running checks"
+        )
+
+        # 1. has-commits
+        ok, msg = self._gate_check_has_commits(worktree)
+        if not ok:
+            return self._fail_post_builder_gate(
+                ctx, check="has_commits", detail=msg
+            )
+
+        # 2. has-real-changes
+        ok, msg = self._gate_check_has_real_changes(
+            worktree,
+            real_change_globs if isinstance(real_change_globs, list) else None,
+        )
+        if not ok:
+            return self._fail_post_builder_gate(
+                ctx, check="has_real_changes", detail=msg
+            )
+
+        # 3. build-passes (only when a command is configured)
+        if command:
+            ok, msg = self._gate_check_build_passes(
+                worktree, command, timeout
+            )
+            if not ok:
+                return self._fail_post_builder_gate(
+                    ctx, check="build_passes", detail=msg
+                )
+        else:
+            log_info(
+                "Post-builder quality gate: no buildGate.command "
+                "configured, skipping build check"
+            )
+
+        log_success(
+            f"Post-builder quality gate passed for issue #{ctx.config.issue}"
+        )
+        return None
+
+    def _fail_post_builder_gate(
+        self,
+        ctx: ShepherdContext,
+        *,
+        check: str,
+        detail: str,
+    ) -> PhaseResult:
+        """Handle a post-builder gate failure: release claim, return FAILED.
+
+        Releases the ``loom:building`` claim back to ``loom:issue`` so the
+        next builder can re-attempt the issue, logs an ``error`` milestone
+        with ``reason=build_failed_post_builder``, and returns a ``FAILED``
+        ``PhaseResult``.  No PR is opened.
+        """
+        log_warning(
+            f"Post-builder quality gate FAILED for issue #{ctx.config.issue}: "
+            f"check={check} detail={detail}"
+        )
+
+        # Release the claim atomically: loom:building -> loom:issue
+        try:
+            transition_issue_labels(
+                ctx.config.issue,
+                add=["loom:issue"],
+                remove=["loom:building"],
+                repo_root=ctx.repo_root,
+            )
+            ctx.label_cache.invalidate_issue(ctx.config.issue)
+        except Exception as exc:  # pragma: no cover — best-effort cleanup
+            log_warning(
+                f"Failed to release claim for issue #{ctx.config.issue} "
+                f"after gate failure: {exc}"
+            )
+
+        # Milestone for observability
+        ctx.report_milestone(
+            "error",
+            error=(
+                f"post_builder_quality_gate_failed check={check} "
+                f"reason=build_failed_post_builder"
+            ),
+            will_retry=False,
+        )
+
+        return PhaseResult(
+            status=PhaseStatus.FAILED,
+            message=(
+                f"post-builder quality gate failed ({check}): {detail}"
+            ),
+            phase_name="builder",
+            data={
+                "post_builder_gate_failed": True,
+                "gate_check": check,
+                "gate_detail": detail,
+                "reason": "build_failed_post_builder",
+                "claim_released": True,
+            },
         )
 
     def _direct_completion(

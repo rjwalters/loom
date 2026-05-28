@@ -20357,3 +20357,499 @@ class TestRunPhaseWithRetryThinkingStallTimeoutThreading:
         mock_run_worker.assert_called_once()
         call_kwargs = mock_run_worker.call_args[1]
         assert call_kwargs["thinking_stall_timeout"] == 720
+
+
+# ----------------------------------------------------------------------
+# Post-builder quality gate (issue #3347)
+# ----------------------------------------------------------------------
+
+
+def _write_build_gate_config(repo_root: Path, gate: dict | None) -> None:
+    """Helper: write .loom/config.json with optional buildGate block."""
+    loom_dir = repo_root / ".loom"
+    loom_dir.mkdir(parents=True, exist_ok=True)
+    payload: dict = {"nextAgentNumber": 1, "terminals": []}
+    if gate is not None:
+        payload["buildGate"] = gate
+    (loom_dir / "config.json").write_text(json.dumps(payload))
+
+
+class TestLoadBuildGateConfig:
+    """Test _load_build_gate_config reads .loom/config.json correctly."""
+
+    def test_returns_none_when_config_missing(
+        self, mock_context: MagicMock, tmp_path: Path
+    ) -> None:
+        """No config file -> None (gate disabled)."""
+        builder = BuilderPhase()
+        mock_context.repo_root = tmp_path
+        assert builder._load_build_gate_config(mock_context) is None
+
+    def test_returns_none_when_buildgate_missing(
+        self, mock_context: MagicMock, tmp_path: Path
+    ) -> None:
+        """Config without buildGate block -> None."""
+        builder = BuilderPhase()
+        mock_context.repo_root = tmp_path
+        _write_build_gate_config(tmp_path, gate=None)
+        assert builder._load_build_gate_config(mock_context) is None
+
+    def test_returns_none_when_buildgate_disabled(
+        self, mock_context: MagicMock, tmp_path: Path
+    ) -> None:
+        """buildGate.enabled=false -> None (explicitly disabled)."""
+        builder = BuilderPhase()
+        mock_context.repo_root = tmp_path
+        _write_build_gate_config(
+            tmp_path,
+            gate={"enabled": False, "command": "cargo build"},
+        )
+        assert builder._load_build_gate_config(mock_context) is None
+
+    def test_returns_dict_when_enabled(
+        self, mock_context: MagicMock, tmp_path: Path
+    ) -> None:
+        """buildGate present and not disabled -> returns dict."""
+        builder = BuilderPhase()
+        mock_context.repo_root = tmp_path
+        _write_build_gate_config(
+            tmp_path,
+            gate={"command": "cargo build", "realChangeGlobs": ["*.rs"]},
+        )
+        result = builder._load_build_gate_config(mock_context)
+        assert result is not None
+        assert result["command"] == "cargo build"
+        assert result["realChangeGlobs"] == ["*.rs"]
+
+
+class TestGateCheckHasCommits:
+    """Test _gate_check_has_commits."""
+
+    def test_fails_when_zero_commits(self, tmp_path: Path) -> None:
+        builder = BuilderPhase()
+        with patch.object(
+            builder, "_count_commits_ahead_of_main", return_value=0
+        ):
+            ok, msg = builder._gate_check_has_commits(tmp_path)
+        assert ok is False
+        assert "no commits" in msg
+
+    def test_passes_when_one_or_more_commits(self, tmp_path: Path) -> None:
+        builder = BuilderPhase()
+        with patch.object(
+            builder, "_count_commits_ahead_of_main", return_value=3
+        ):
+            ok, msg = builder._gate_check_has_commits(tmp_path)
+        assert ok is True
+        assert "3 commit" in msg
+
+
+class TestGateCheckHasRealChanges:
+    """Test _gate_check_has_real_changes."""
+
+    def test_fails_when_no_files_changed(self, tmp_path: Path) -> None:
+        builder = BuilderPhase()
+        with patch(
+            "loom_tools.shepherd.phases.builder.subprocess.run",
+            return_value=MagicMock(returncode=0, stdout="", stderr=""),
+        ):
+            ok, msg = builder._gate_check_has_real_changes(tmp_path, None)
+        assert ok is False
+        assert "no files changed" in msg
+
+    def test_passes_when_glob_matches(self, tmp_path: Path) -> None:
+        builder = BuilderPhase()
+        with patch(
+            "loom_tools.shepherd.phases.builder.subprocess.run",
+            return_value=MagicMock(
+                returncode=0,
+                stdout="src/foo.rs\nREADME.md\n",
+                stderr="",
+            ),
+        ):
+            ok, msg = builder._gate_check_has_real_changes(tmp_path, ["*.rs"])
+        assert ok is True
+        assert "1/2" in msg
+
+    def test_fails_when_no_glob_matches(self, tmp_path: Path) -> None:
+        builder = BuilderPhase()
+        with patch(
+            "loom_tools.shepherd.phases.builder.subprocess.run",
+            return_value=MagicMock(
+                returncode=0,
+                stdout="logfile.log\nscratch.txt\n",
+                stderr="",
+            ),
+        ):
+            ok, msg = builder._gate_check_has_real_changes(tmp_path, ["*.rs"])
+        assert ok is False
+        assert "no real source changes" in msg
+
+    def test_passes_with_default_exclusions(self, tmp_path: Path) -> None:
+        """When no globs are configured, default exclusions filter scratch."""
+        builder = BuilderPhase()
+        with patch(
+            "loom_tools.shepherd.phases.builder.subprocess.run",
+            return_value=MagicMock(
+                returncode=0,
+                stdout="src/foo.py\n.loom-build.log\n",
+                stderr="",
+            ),
+        ):
+            ok, msg = builder._gate_check_has_real_changes(tmp_path, None)
+        assert ok is True
+        # src/foo.py kept, .loom-build.log excluded
+        assert "1 real-change" in msg
+
+    def test_fails_when_only_scratch_files(self, tmp_path: Path) -> None:
+        """Only scratch files -> gate fails even without configured globs."""
+        builder = BuilderPhase()
+        with patch(
+            "loom_tools.shepherd.phases.builder.subprocess.run",
+            return_value=MagicMock(
+                returncode=0,
+                stdout=".loom-build.log\nscratch.log\n",
+                stderr="",
+            ),
+        ):
+            ok, msg = builder._gate_check_has_real_changes(tmp_path, None)
+        assert ok is False
+        assert "scratch exclusion" in msg
+
+
+class TestGateCheckBuildPasses:
+    """Test _gate_check_build_passes."""
+
+    def test_passes_when_command_exits_zero(self, tmp_path: Path) -> None:
+        builder = BuilderPhase()
+        with patch(
+            "loom_tools.shepherd.phases.builder.subprocess.run",
+            return_value=MagicMock(returncode=0, stdout="", stderr=""),
+        ):
+            ok, msg = builder._gate_check_build_passes(
+                tmp_path, "cargo build", 60
+            )
+        assert ok is True
+        assert "passed" in msg
+
+    def test_fails_when_command_exits_nonzero(self, tmp_path: Path) -> None:
+        builder = BuilderPhase()
+        with patch(
+            "loom_tools.shepherd.phases.builder.subprocess.run",
+            return_value=MagicMock(
+                returncode=1,
+                stdout="error: compilation failed\n",
+                stderr="",
+            ),
+        ):
+            ok, msg = builder._gate_check_build_passes(
+                tmp_path, "cargo build", 60
+            )
+        assert ok is False
+        assert "exited with 1" in msg
+        assert "compilation failed" in msg
+
+    def test_fails_on_timeout(self, tmp_path: Path) -> None:
+        builder = BuilderPhase()
+        with patch(
+            "loom_tools.shepherd.phases.builder.subprocess.run",
+            side_effect=subprocess.TimeoutExpired(
+                cmd="cargo build", timeout=5
+            ),
+        ):
+            ok, msg = builder._gate_check_build_passes(
+                tmp_path, "cargo build", 5
+            )
+        assert ok is False
+        assert "timed out" in msg
+
+    def test_fails_on_empty_command(self, tmp_path: Path) -> None:
+        builder = BuilderPhase()
+        ok, msg = builder._gate_check_build_passes(tmp_path, "", 60)
+        assert ok is False
+        assert "empty" in msg
+
+
+class TestRunPostBuilderQualityGate:
+    """End-to-end tests for _run_post_builder_quality_gate."""
+
+    def test_returns_none_when_gate_disabled(
+        self, mock_context: MagicMock, tmp_path: Path
+    ) -> None:
+        """No buildGate config -> None (gate skipped, builder proceeds to PR)."""
+        builder = BuilderPhase()
+        mock_context.repo_root = tmp_path
+        mock_context.worktree_path = tmp_path / "wt"
+        (tmp_path / "wt").mkdir()
+        assert builder._run_post_builder_quality_gate(mock_context) is None
+
+    def test_returns_none_when_gate_explicitly_disabled(
+        self, mock_context: MagicMock, tmp_path: Path
+    ) -> None:
+        """enabled=false -> None."""
+        builder = BuilderPhase()
+        mock_context.repo_root = tmp_path
+        mock_context.worktree_path = tmp_path / "wt"
+        (tmp_path / "wt").mkdir()
+        _write_build_gate_config(
+            tmp_path,
+            gate={"enabled": False, "command": "cargo build"},
+        )
+        assert builder._run_post_builder_quality_gate(mock_context) is None
+
+    def test_returns_none_when_no_worktree(
+        self, mock_context: MagicMock, tmp_path: Path
+    ) -> None:
+        """No worktree -> None (cannot run gate)."""
+        builder = BuilderPhase()
+        mock_context.repo_root = tmp_path
+        mock_context.worktree_path = None
+        _write_build_gate_config(
+            tmp_path,
+            gate={"command": "cargo build"},
+        )
+        assert builder._run_post_builder_quality_gate(mock_context) is None
+
+    def test_fails_when_no_commits(
+        self, mock_context: MagicMock, tmp_path: Path
+    ) -> None:
+        """has-commits check fails -> release claim, FAILED, no PR."""
+        builder = BuilderPhase()
+        worktree = tmp_path / "wt"
+        worktree.mkdir()
+        mock_context.repo_root = tmp_path
+        mock_context.worktree_path = worktree
+        _write_build_gate_config(
+            tmp_path,
+            gate={"command": "cargo build", "realChangeGlobs": ["*.rs"]},
+        )
+
+        with (
+            patch.object(builder, "_count_commits_ahead_of_main", return_value=0),
+            patch(
+                "loom_tools.shepherd.phases.builder.transition_issue_labels"
+            ) as mock_trans,
+        ):
+            result = builder._run_post_builder_quality_gate(mock_context)
+
+        assert result is not None
+        assert result.status == PhaseStatus.FAILED
+        assert result.data["gate_check"] == "has_commits"
+        assert result.data["claim_released"] is True
+        assert result.data["reason"] == "build_failed_post_builder"
+        # Claim release: must call transition_issue_labels with
+        # add=loom:issue, remove=loom:building
+        mock_trans.assert_called_once()
+        kwargs = mock_trans.call_args.kwargs
+        assert kwargs["add"] == ["loom:issue"]
+        assert kwargs["remove"] == ["loom:building"]
+
+    def test_fails_when_no_real_changes(
+        self, mock_context: MagicMock, tmp_path: Path
+    ) -> None:
+        """has-real-changes check fails -> release claim, FAILED."""
+        builder = BuilderPhase()
+        worktree = tmp_path / "wt"
+        worktree.mkdir()
+        mock_context.repo_root = tmp_path
+        mock_context.worktree_path = worktree
+        _write_build_gate_config(
+            tmp_path,
+            gate={"command": "cargo build", "realChangeGlobs": ["*.rs"]},
+        )
+
+        with (
+            patch.object(builder, "_count_commits_ahead_of_main", return_value=2),
+            patch(
+                "loom_tools.shepherd.phases.builder.subprocess.run"
+            ) as mock_run,
+            patch(
+                "loom_tools.shepherd.phases.builder.transition_issue_labels"
+            ) as mock_trans,
+        ):
+            mock_run.return_value = MagicMock(
+                returncode=0,
+                stdout="docs/notes.md\nscratch.log\n",
+                stderr="",
+            )
+            result = builder._run_post_builder_quality_gate(mock_context)
+
+        assert result is not None
+        assert result.status == PhaseStatus.FAILED
+        assert result.data["gate_check"] == "has_real_changes"
+        # Build command must NOT have been invoked (we short-circuit on
+        # real-changes failure).
+        for call in mock_run.call_args_list:
+            assert call[0][0][:1] != ["cargo"]
+        mock_trans.assert_called_once()
+
+    def test_fails_when_build_fails(
+        self, mock_context: MagicMock, tmp_path: Path
+    ) -> None:
+        """build-passes check fails -> release claim, FAILED."""
+        builder = BuilderPhase()
+        worktree = tmp_path / "wt"
+        worktree.mkdir()
+        mock_context.repo_root = tmp_path
+        mock_context.worktree_path = worktree
+        _write_build_gate_config(
+            tmp_path,
+            gate={"command": "cargo build", "realChangeGlobs": ["*.rs"]},
+        )
+
+        with (
+            patch.object(builder, "_count_commits_ahead_of_main", return_value=2),
+            patch.object(
+                builder, "_gate_check_has_real_changes",
+                return_value=(True, "1 real-change file(s) detected"),
+            ),
+            patch.object(
+                builder, "_gate_check_build_passes",
+                return_value=(False, "'cargo build' exited with 1"),
+            ),
+            patch(
+                "loom_tools.shepherd.phases.builder.transition_issue_labels"
+            ) as mock_trans,
+        ):
+            result = builder._run_post_builder_quality_gate(mock_context)
+
+        assert result is not None
+        assert result.status == PhaseStatus.FAILED
+        assert result.data["gate_check"] == "build_passes"
+        mock_trans.assert_called_once()
+
+    def test_passes_all_three_checks(
+        self, mock_context: MagicMock, tmp_path: Path
+    ) -> None:
+        """All checks pass -> None (builder proceeds to PR creation)."""
+        builder = BuilderPhase()
+        worktree = tmp_path / "wt"
+        worktree.mkdir()
+        mock_context.repo_root = tmp_path
+        mock_context.worktree_path = worktree
+        _write_build_gate_config(
+            tmp_path,
+            gate={"command": "cargo build", "realChangeGlobs": ["*.rs"]},
+        )
+
+        with (
+            patch.object(builder, "_count_commits_ahead_of_main", return_value=2),
+            patch.object(
+                builder, "_gate_check_has_real_changes",
+                return_value=(True, "1/2 changed file(s) match"),
+            ),
+            patch.object(
+                builder, "_gate_check_build_passes",
+                return_value=(True, "'cargo build' passed"),
+            ),
+            patch(
+                "loom_tools.shepherd.phases.builder.transition_issue_labels"
+            ) as mock_trans,
+        ):
+            result = builder._run_post_builder_quality_gate(mock_context)
+
+        assert result is None
+        # Claim must NOT be released on a passing gate
+        mock_trans.assert_not_called()
+
+    def test_skips_build_check_when_no_command(
+        self, mock_context: MagicMock, tmp_path: Path
+    ) -> None:
+        """No buildGate.command -> only commits + real-changes checked."""
+        builder = BuilderPhase()
+        worktree = tmp_path / "wt"
+        worktree.mkdir()
+        mock_context.repo_root = tmp_path
+        mock_context.worktree_path = worktree
+        _write_build_gate_config(
+            tmp_path,
+            gate={"realChangeGlobs": ["*.py"]},
+        )
+
+        with (
+            patch.object(builder, "_count_commits_ahead_of_main", return_value=1),
+            patch.object(
+                builder, "_gate_check_has_real_changes",
+                return_value=(True, "1/1 changed file(s) match"),
+            ),
+            patch.object(
+                builder, "_gate_check_build_passes"
+            ) as mock_build,
+        ):
+            result = builder._run_post_builder_quality_gate(mock_context)
+
+        assert result is None
+        mock_build.assert_not_called()
+
+
+class TestPostBuilderGateIntegration:
+    """Integration: ensure the gate fires inside BuilderPhase.run().
+
+    Lightweight smoke tests — we don't run the full builder pipeline,
+    we just verify the wiring at the validate/completion handoff.
+    """
+
+    def test_gate_invoked_after_builder_exit(
+        self, mock_context: MagicMock, tmp_path: Path
+    ) -> None:
+        """When the builder exits cleanly and no PR yet exists, the gate runs."""
+        builder = BuilderPhase()
+        worktree = tmp_path / "wt"
+        worktree.mkdir()
+        mock_context.repo_root = tmp_path
+        mock_context.worktree_path = worktree
+        mock_context.config = ShepherdConfig(issue=42)
+        mock_context.check_shutdown = MagicMock(return_value=False)
+        mock_context.has_issue_label = MagicMock(return_value=True)
+        _write_build_gate_config(
+            tmp_path,
+            gate={"command": "cargo build", "realChangeGlobs": ["*.rs"]},
+        )
+
+        with (
+            # Skip preflight gates
+            patch.object(builder, "should_skip", return_value=(False, "")),
+            patch("loom_tools.shepherd.phases.builder.get_pr_for_issue", return_value=None),
+            patch.object(builder, "_run_quality_validation", return_value=None),
+            patch.object(builder, "_run_reproducibility_check", return_value=None),
+            patch.object(builder, "_is_stale_worktree", return_value=False),
+            patch.object(builder, "_commit_prior_uncommitted_work", return_value=False),
+            patch.object(builder, "_snapshot_main_dirty", return_value=set()),
+            patch.object(builder, "_count_commits_ahead_of_main", return_value=0),
+            patch.object(builder, "_detect_worktree_escape", return_value=None),
+            patch.object(builder, "_is_rate_limited", return_value=False),
+            patch.object(builder, "validate", return_value=False),
+            patch.object(builder, "_cleanup_stale_worktree"),
+            patch.object(
+                builder, "_run_post_builder_quality_gate"
+            ) as mock_gate,
+            patch(
+                "loom_tools.shepherd.phases.builder.run_phase_with_retry",
+                return_value=0,
+            ),
+            patch(
+                "loom_tools.shepherd.phases.builder.transition_issue_labels"
+            ),
+            patch(
+                "loom_tools.shepherd.phases.builder.subprocess.run",
+                return_value=MagicMock(returncode=0, stdout="", stderr=""),
+            ),
+        ):
+            mock_gate.return_value = PhaseResult(
+                status=PhaseStatus.FAILED,
+                message="post-builder quality gate failed (has_commits): no commits",
+                phase_name="builder",
+                data={
+                    "post_builder_gate_failed": True,
+                    "gate_check": "has_commits",
+                    "reason": "build_failed_post_builder",
+                    "claim_released": True,
+                },
+            )
+            result = builder.run(mock_context)
+
+        # Gate must have been invoked, and its FAILED result must propagate
+        mock_gate.assert_called_once()
+        assert result.status == PhaseStatus.FAILED
+        assert result.data["post_builder_gate_failed"] is True
+        assert result.data["reason"] == "build_failed_post_builder"

@@ -59,6 +59,18 @@ This role definition is split across multiple files for maintainability:
 | **builder-complexity.md** | Complexity assessment, issue decomposition, scope management |
 | **builder-pr.md** | PR creation, **acceptance criteria verification**, test output, quality requirements |
 
+## Post-Builder Quality Gate (optional, configured per-repo)
+
+If this repository configures a `buildGate` block in `.loom/config.json`, the shepherd orchestrator runs three deterministic checks **after you exit but before any PR is opened**:
+
+1. At least one commit ahead of `origin/main`.
+2. At least one changed file matches the configured `realChangeGlobs` (or default scratch exclusions).
+3. The configured build command exits 0 in the worktree.
+
+If any check fails the orchestrator releases the claim (`loom:building` -> `loom:issue`) and **no PR is opened**. The next builder retries from scratch.
+
+This is enforced by the orchestrator independent of your prompt — you cannot disable it from inside the agent session. In practice this means: commit real source changes, make sure the build passes before you exit, and don't rely on logfiles or scratch files being treated as "the implementation." See `.loom/docs/build-gate.md` for the full schema.
+
 ## Argument Handling
 
 Check for an argument passed via the slash command:

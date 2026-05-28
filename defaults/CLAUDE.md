@@ -635,6 +635,23 @@ Configuration is stored in `.loom/config.json` (committed to git for team sharin
 
 The size limit can also be bypassed per-PR by adding the `loom:auto-merge-ok` label (applied by Judge or human to signal a large PR is safe to auto-merge). In force mode (`--merge`), the size limit is waived entirely.
 
+**Post-Builder Quality Gate (`buildGate`)**:
+
+An optional deterministic gate runs after the builder agent exits but before PR creation. When any of three checks fails (has-commits, has-real-changes, build-passes), the orchestrator releases the issue claim and no PR is opened. This is opt-in via `.loom/config.json`:
+
+```json
+{
+  "buildGate": {
+    "enabled": true,
+    "command": "cargo build --workspace",
+    "realChangeGlobs": ["*.rs", "*.toml", "Cargo.lock"],
+    "timeoutSeconds": 600
+  }
+}
+```
+
+Repos without a `buildGate` block see zero behavior change. See `.loom/docs/build-gate.md` for the full schema and failure semantics.
+
 ### Daemon Configuration (Layer 2)
 
 The Loom daemon uses these configuration parameters:
