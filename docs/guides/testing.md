@@ -33,12 +33,6 @@ cargo test --test integration_basic   # Run specific test file
 - Each test spawns isolated daemon in temp directory
 - Automatic cleanup on test completion
 
-## Frontend Testing (Planned)
-
-1. **Unit Tests**: Vitest for pure functions (state.ts, ui.ts)
-2. **Integration Tests**: Playwright for E2E workflows
-3. **Type Tests**: TypeScript strict mode as first line of defense
-
 ## MCP Testing and Instrumentation
 
 **Location**: `mcp-loom/`, `.mcp.json`
@@ -48,36 +42,9 @@ Loom provides a unified MCP (Model Context Protocol) server that enables AI agen
 **Full API Documentation**: [docs/mcp/README.md](../mcp/README.md)
 
 **Tool Categories**:
-- **[Log Tools](../mcp/loom-logs.md)** - Daemon, Tauri, and terminal logs (4 tools)
-- **[UI Tools](../mcp/loom-ui.md)** - UI interaction, console logs, workspace state (13 tools)
-- **[Terminal Tools](../mcp/loom-terminals.md)** - Terminal management and IPC (17 tools)
-
-### Console Logging to File
-
-**Implementation**: `src/main.ts` (console interceptor) + `src-tauri/src/main.rs` (`append_to_console_log`)
-
-All browser console output is automatically written to `~/.loom/console.log`:
-
-```typescript
-// Console interception (src/main.ts)
-const originalConsoleLog = console.log;
-console.log = (...args: unknown[]) => {
-  originalConsoleLog(...args);  // Still log to DevTools
-  writeToConsoleLog("INFO", ...args);  // Also write to file
-};
-```
-
-**Log Format**:
-```
-[2025-10-15T05:05:06.088Z] [INFO] [launchAgentsForTerminals] Starting agent launch...
-[2025-10-15T05:05:06.814Z] [INFO] [launchAgentInTerminal] Worktree setup complete
-```
-
-**Benefits**:
-- Persistent logs survive app restarts
-- AI agents can read logs via MCP to diagnose issues
-- Debug output visible without watching DevTools in real-time
-- Full visibility into factory reset and agent launch processes
+- **Log Tools** - Daemon and terminal logs (see [docs/mcp/README.md](../mcp/README.md))
+- **UI Tools** - Workspace state and orchestration controls (see [docs/mcp/README.md](../mcp/README.md))
+- **[Terminal Tools](../mcp/loom-terminals.md)** - Terminal management and IPC
 
 ### MCP Loom Server
 
@@ -233,7 +200,6 @@ mcp__loom__trigger_force_start
 
 ## Debugging
 
-1. **State inspection**: Add `console.log(state.getTerminals())` in render
-2. **TypeScript errors**: Run `pnpm exec tsc --noEmit`
-3. **Hot reload**: Vite provides instant feedback on save
-4. **Tauri DevTools**: Open with Cmd+Option+I in dev mode
+1. **Daemon state inspection**: `cat ~/.loom/daemon-state.json | jq` and `cat .loom/state.json | jq`
+2. **Tail logs**: `tail -f ~/.loom/daemon.log`
+3. **tmux sessions**: `tmux -L loom list-sessions`

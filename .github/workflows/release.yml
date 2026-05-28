@@ -14,23 +14,12 @@ permissions:
   contents: write
 
 jobs:
-  build-macos:
-    name: Build macOS App
+  build-daemon:
+    name: Build loom-daemon
     runs-on: macos-14  # Apple Silicon runner
     steps:
       - name: Checkout repository
         uses: actions/checkout@v6
-
-      - name: Setup pnpm
-        uses: pnpm/action-setup@v6
-        with:
-          version: 9
-
-      - name: Setup Node.js
-        uses: actions/setup-node@v6
-        with:
-          node-version: '20'
-          cache: 'pnpm'
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
@@ -41,15 +30,12 @@ jobs:
         uses: Swatinem/rust-cache@v2
         with:
           workspaces: |
-            src-tauri
-            loom-daemon
-
-      - name: Install frontend dependencies
-        run: pnpm install --frozen-lockfile
+            .
 
       - name: Build daemon (ARM64)
         run: |
           cargo build --package loom-daemon --release --target aarch64-apple-darwin
+          mkdir -p target/release
           cp target/aarch64-apple-darwin/release/loom-daemon target/release/loom-daemon-aarch64-apple-darwin
 
       - name: Build daemon (x86_64)
@@ -58,63 +44,18 @@ jobs:
           mkdir -p target/release
           cp target/x86_64-apple-darwin/release/loom-daemon target/release/loom-daemon-x86_64-apple-darwin || true
 
-      - name: Build Tauri app (ARM64)
-        run: pnpm tauri build --target aarch64-apple-darwin
-        env:
-          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
-          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
-
-      - name: Build Tauri app (x86_64)
-        run: pnpm tauri build --target x86_64-apple-darwin
-        env:
-          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
-          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
-
-      - name: Get app version
-        id: version
-        run: |
-          APP_VERSION=$(jq -r '.version' src-tauri/tauri.conf.json)
-          echo "app_version=${APP_VERSION}" >> "$GITHUB_OUTPUT"
-
-      - name: Create universal binary (optional)
-        run: |
-          # Create universal DMG filename
-          VERSION="${{ github.event.release.tag_name || inputs.tag || 'dev' }}"
-          APP_VERSION="${{ steps.version.outputs.app_version }}"
-
-          # The individual .app bundles are in:
-          # - target/aarch64-apple-darwin/release/bundle/macos/Loom.app
-          # - target/x86_64-apple-darwin/release/bundle/macos/Loom.app
-
-          # Rename DMGs with version and architecture
-          if [ -f "target/aarch64-apple-darwin/release/bundle/dmg/Loom_${APP_VERSION}_aarch64.dmg" ]; then
-            cp "target/aarch64-apple-darwin/release/bundle/dmg/Loom_${APP_VERSION}_aarch64.dmg" \
-               "target/Loom-${VERSION}-aarch64.dmg"
-          fi
-
-          if [ -f "target/x86_64-apple-darwin/release/bundle/dmg/Loom_${APP_VERSION}_x64.dmg" ]; then
-            cp "target/x86_64-apple-darwin/release/bundle/dmg/Loom_${APP_VERSION}_x64.dmg" \
-               "target/Loom-${VERSION}-x64.dmg"
-          fi
-
       - name: List build artifacts
         run: |
-          echo "=== ARM64 bundles ==="
-          ls -la target/aarch64-apple-darwin/release/bundle/dmg/ || true
-          ls -la target/aarch64-apple-darwin/release/bundle/macos/ || true
-          echo "=== x86_64 bundles ==="
-          ls -la target/x86_64-apple-darwin/release/bundle/dmg/ || true
-          ls -la target/x86_64-apple-darwin/release/bundle/macos/ || true
-          echo "=== Renamed artifacts ==="
-          ls -la target/*.dmg || true
+          echo "=== Daemon binaries ==="
+          ls -la target/release/loom-daemon-* || true
 
       - name: Upload release assets
         if: github.event_name == 'release'
         uses: softprops/action-gh-release@v3
         with:
           files: |
-            target/aarch64-apple-darwin/release/bundle/dmg/*.dmg
-            target/x86_64-apple-darwin/release/bundle/dmg/*.dmg
+            target/release/loom-daemon-aarch64-apple-darwin
+            target/release/loom-daemon-x86_64-apple-darwin
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
@@ -122,8 +63,8 @@ jobs:
         if: github.event_name == 'workflow_dispatch'
         uses: actions/upload-artifact@v7
         with:
-          name: macos-builds
+          name: loom-daemon-binaries
           path: |
-            target/aarch64-apple-darwin/release/bundle/dmg/*.dmg
-            target/x86_64-apple-darwin/release/bundle/dmg/*.dmg
+            target/release/loom-daemon-aarch64-apple-darwin
+            target/release/loom-daemon-x86_64-apple-darwin
           retention-days: 7

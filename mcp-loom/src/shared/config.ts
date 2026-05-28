@@ -16,9 +16,6 @@ export const LOOM_DIR = join(homedir(), ".loom");
 /** Daemon log file path */
 export const DAEMON_LOG = join(LOOM_DIR, "daemon.log");
 
-/** Tauri application log file path */
-export const TAURI_LOG = join(LOOM_DIR, "tauri.log");
-
 /** Browser console log file path */
 export const CONSOLE_LOG_PATH = join(LOOM_DIR, "console.log");
 

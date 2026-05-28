@@ -27,7 +27,7 @@ Usage:
 pnpm run daemon:dev
 ```
 
-**Recommended for development**: Use this in one terminal while running `pnpm tauri:dev` in another.
+**Recommended for development**: Use this in one terminal while issuing slash commands to Claude Code in another.
 
 ### start-daemon.sh
 Starts the daemon in the background silently and stores its PID.
@@ -85,13 +85,10 @@ These scripts are used by the pnpm commands in `package.json`:
 | Command | Description | Use Case |
 |---------|-------------|----------|
 | `pnpm run daemon:dev` | **Interactive dev mode** (recommended) | Two-terminal development workflow |
-| `pnpm run app:dev` | Start daemon + Tauri dev (all-in-one) | One-command automated startup |
-| `pnpm run app:dev:restart` | Restart daemon only | When daemon gets into bad state |
-| `pnpm run app:stop` | Stop daemon | Clean shutdown |
-| `pnpm run daemon:start` | Start daemon in background (silent) | Scripting/automation |
+| `pnpm run daemon:headless` | Start daemon in background (silent) | Scripting/automation |
 | `pnpm run daemon:stop` | Stop daemon | Manual control |
-| `pnpm run daemon:restart` | Restart daemon | Manual recovery |
-| `pnpm run daemon:run` | Run daemon in foreground (cargo run) | Low-level debugging |
+| `pnpm run daemon:preview` | Run daemon in foreground (cargo run) | Low-level debugging |
+| `pnpm run daemon:build` | Build release daemon binary | Release packaging |
 
 ## Files Created
 

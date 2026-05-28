@@ -225,7 +225,7 @@ Hermit creates ──→ loom:hermit ──→ (human approves) ──→ loom:i
 ## Autonomous Operation
 
 Agents can run autonomously at configured intervals using either:
-1. **Tauri App Mode**: Visual terminal management with interval timers
+1. **Daemon Mode**: `loom-daemon` manages support roles and shepherds on a schedule
 2. **Manual Orchestration Mode**: Multiple Claude Code terminals with periodic commands
 
 ### Autonomous Agents
@@ -340,16 +340,17 @@ Every 15 minutes: Review issue backlog, update priorities and organization
 
 ## Configuration
 
-### Setting Up Autonomous Agents (Tauri App)
+### Setting Up Autonomous Agents (Daemon Mode)
 
-1. Open Loom application
-2. Select this repository as workspace
-3. Create terminals and assign roles:
-   - Terminal 1: Judge (autonomous, 5 min)
-   - Terminal 2: Curator (autonomous, 5 min)
-   - Terminal 3: Architect (autonomous, 15 min)
-   - Terminal 4: Builder (manual)
-4. Start engine
+1. Start the daemon: `./.loom/scripts/daemon.sh start`
+2. The daemon manages these roles on a schedule:
+   - Judge (5 min intervals) - PR review
+   - Curator (5 min intervals) - issue enhancement
+   - Architect (15 min intervals) - proposal generation
+   - Hermit (15 min intervals) - simplification proposals
+   - Guide (15 min intervals) - backlog triage
+   - Champion (10 min intervals) - proposal promotion and auto-merge
+3. Builders are spawned per-issue as shepherds when `loom:issue` items are ready
 
 ### Setting Up Manual Orchestration Mode
 

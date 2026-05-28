@@ -509,7 +509,6 @@ cd .loom/worktrees/issue-42           # Branch: feature/issue-42
 
 **Worktree locations:**
 - `.loom/worktrees/issue-N` - Per-issue work (Builder creates these)
-- `.loom/worktrees/terminal-N` - Per-terminal isolation (Tauri App only)
 
 **Rules:**
 - Always use `./.loom/scripts/worktree.sh` (never `git worktree` directly)

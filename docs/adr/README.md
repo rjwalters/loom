@@ -15,14 +15,9 @@ An Architecture Decision Record captures an important architectural decision mad
 ### Core Architecture
 
 - [ADR-0001: Observer Pattern for State Management](0001-observer-pattern-state-management.md)
-  - **Status**: Accepted
+  - **Status**: Superseded (frontend removed in v0.9)
   - **Summary**: Use Observer Pattern with Map-based store for decoupled state management
   - **Key Decision**: Prefer Observer Pattern over Redux/MobX for simplicity and learning value
-
-- [ADR-0002: Vanilla TypeScript over React/Vue/Svelte](0002-vanilla-typescript-over-frameworks.md)
-  - **Status**: Accepted
-  - **Summary**: Build frontend with Vanilla TypeScript using direct DOM manipulation
-  - **Key Decision**: Prioritize performance, learning value, and simplicity over framework features
 
 - [ADR-0008: tmux + Rust Daemon Architecture](0008-tmux-daemon-architecture.md)
   - **Status**: Accepted
@@ -36,11 +31,6 @@ An Architecture Decision Record captures an important architectural decision mad
   - **Summary**: Split `.loom/config.json` (user preferences) and `.loom/state.json` (runtime state)
   - **Key Decision**: Separate concerns for safer restarts and independent schema evolution
 
-- [ADR-0007: Tauri IPC for Filesystem Operations](0007-tauri-ipc-for-filesystem-operations.md)
-  - **Status**: Accepted
-  - **Summary**: Use Rust backend IPC commands for filesystem access instead of Tauri FS API
-  - **Key Decision**: Full filesystem access and better validation via Rust backend
-
 ### Workflows & Coordination
 
 - [ADR-0004: Git Worktree Paths Inside Workspace](0004-worktree-paths-inside-workspace.md)
@@ -52,13 +42,6 @@ An Architecture Decision Record captures an important architectural decision mad
   - **Status**: Accepted
   - **Summary**: Use GitHub labels as state machine for agent workflow coordination
   - **Key Decision**: Leverage GitHub labels over database, message queue, or file-based queue
-
-### UI & Interaction
-
-- [ADR-0005: HTML5 Drag API over Mouse Events](0005-html5-drag-api-over-mouse-events.md)
-  - **Status**: Accepted
-  - **Summary**: Use HTML5 Drag and Drop API for terminal card reordering
-  - **Key Decision**: Native browser drag behavior over custom mouse event implementation
 
 ## Creating a New ADR
 

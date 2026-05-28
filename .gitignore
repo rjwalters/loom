@@ -6,14 +6,9 @@ target/
 # Build outputs
 dist/
 dist-ssr/
-src-tauri/target/
-src-tauri/gen/
 
 # Test outputs
 coverage/
-playwright-report/
-test-results/
-e2e/screenshots/
 
 # Env files
 .env

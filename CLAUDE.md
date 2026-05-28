@@ -7,7 +7,7 @@ This repository uses **Loom** for AI-powered development orchestration.
 
 ## What is Loom?
 
-Loom is a multi-terminal desktop application for macOS that orchestrates AI-powered development workers using git worktrees and a forge (GitHub or Gitea) as the coordination layer. It enables both automated orchestration (Tauri App Mode) and manual coordination (Manual Orchestration Mode).
+Loom is a CLI + daemon for AI-powered development orchestration. It coordinates AI development workers using git worktrees and a forge (GitHub or Gitea) as the coordination layer. It supports both manual coordination (Manual Orchestration Mode) and continuous autonomous orchestration (Daemon Mode).
 
 **Loom Repository**: https://github.com/rjwalters/loom
 
@@ -62,15 +62,7 @@ Use Claude Code terminals with specialized roles for hands-on development:
 2. Use slash commands: `/builder`, `/judge`, `/curator`, etc.
 3. Each terminal acts as a specialized agent
 
-### 2. Tauri App Mode
-
-Launch the Loom desktop application for automated orchestration:
-
-1. Install Loom app, open it, select this repository
-2. Configure terminals with roles and intervals
-3. Start engine - terminals launch automatically
-
-### 3. Daemon Mode (Layer 2)
+### 2. Daemon Mode (Layer 2)
 
 ```bash
 ./.loom/scripts/daemon.sh start                  # auto-build enabled (default)
@@ -153,8 +145,6 @@ See `.github/labels.yml` for the authoritative `Applied by:` field on every labe
 ## Git Worktree Workflow
 
 Loom uses git worktrees to isolate agent work.
-
-**Terminal Worktrees** (`.loom/worktrees/terminal-N`): Agent isolation in Tauri App Mode only.
 
 **Issue Worktrees** (`.loom/worktrees/issue-N`): Issue-specific work for Builder agents.
 
@@ -750,7 +740,7 @@ git push origin main --tags
 gh release create vX.Y.Z --title "vX.Y.Z" --notes "Release notes..."
 ```
 
-The script updates all 7 version-bearing files (`package.json`, `mcp-loom/package.json`, `src-tauri/tauri.conf.json`, 3 `Cargo.toml` files, `CLAUDE.md`) plus `Cargo.lock`. The GitHub Actions release workflow (`.github/workflows/release.yml`) triggers on GitHub Release creation (`release: types: [created]`), NOT on tag push. You must create a GitHub Release via `gh release create` to trigger the build.
+The script updates all 5 version-bearing files (`package.json`, `mcp-loom/package.json`, 2 `Cargo.toml` files (`loom-daemon`, `loom-api`), `CLAUDE.md`) plus `Cargo.lock`. The GitHub Actions release workflow (`.github/workflows/release.yml`) triggers on GitHub Release creation (`release: types: [created]`), NOT on tag push. You must create a GitHub Release via `gh release create` to trigger the build.
 
 ## Resources
 

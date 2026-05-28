@@ -223,11 +223,8 @@ _LANGUAGE_EXTENSIONS: dict[str, str] = {
 # Paths that indicate which language is affected (takes precedence over extension)
 _LANGUAGE_PATH_PATTERNS: list[tuple[str, str]] = [
     ("loom-tools/", "python"),
-    ("src-tauri/", "rust"),
     ("loom-daemon/", "rust"),
     ("loom-api/", "rust"),
-    ("src/", "typescript"),
-    ("e2e/", "typescript"),
     ("mcp-loom/", "javascript"),
 ]
 

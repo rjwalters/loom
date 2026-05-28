@@ -17,10 +17,9 @@ The unified `mcp-loom` package provides all Loom MCP tools in a single server. T
 
 ### Log Tools
 
-**Purpose**: Access Loom's various log files (daemon, Tauri, terminal output)
+**Purpose**: Access Loom's various log files (daemon, terminal output)
 
 - `tail_daemon_log` - Read daemon logs (backend activity)
-- `tail_tauri_log` - Read Tauri logs (frontend activity)
 - `list_terminal_logs` - Find available terminal logs
 - `tail_terminal_log` - Read specific terminal output
 
@@ -308,17 +307,13 @@ const output = await mcp__loom__get_terminal_output({
          │
          ▼
 ┌──────────────────────────────────┐
-│      Loom Application            │
-│                                  │
-│  ┌──────────┐    ┌────────────┐ │
-│  │  Tauri   │◄──►│   Daemon   │ │
-│  │  (UI)    │    │ (Backend)  │ │
-│  └──────────┘    └────────────┘ │
+│           loom-daemon            │
+│  Orchestration + IPC server      │
 └──────────────────────────────────┘
          │                │
          ▼                ▼
     ~/.loom/          /tmp/
-    console.log       loom-daemon.sock
+    daemon.log        loom-daemon.sock
     state.json        loom-*.out
     config.json
 ```
@@ -326,9 +321,7 @@ const output = await mcp__loom__get_terminal_output({
 ### File System
 
 **Loom Directory** (`~/.loom/`):
-- `console.log` - Browser console output
 - `daemon.log` - Daemon activity logs
-- `tauri.log` - Tauri application logs
 - `mcp-command.json` - File-based IPC commands
 
 **Workspace Directory** (`{workspace}/.loom/`):
@@ -477,9 +470,9 @@ if (heartbeat.status === "not_running") {
 
 For detailed tool documentation by category, see:
 
-- **[Log Tools Reference](./loom-logs.md)** - 4 tools for log access
-- **[UI Tools Reference](./loom-ui.md)** - 13 tools for UI interaction
-- **[Terminal Tools Reference](./loom-terminals.md)** - 17 tools for terminal and autonomous mode control
+- **[Terminal Tools Reference](./loom-terminals.md)** - tools for terminal and autonomous mode control
+
+Log and UI tools are described inline in the top of this document.
 
 ---
 

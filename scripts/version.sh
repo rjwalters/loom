@@ -18,8 +18,6 @@ REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 VERSION_FILES=(
   "package.json"
   "mcp-loom/package.json"
-  "src-tauri/tauri.conf.json"
-  "src-tauri/Cargo.toml"
   "loom-daemon/Cargo.toml"
   "loom-api/Cargo.toml"
   "CLAUDE.md"
@@ -62,7 +60,7 @@ check_versions() {
 
   # Check Cargo.lock
   local lock_versions
-  lock_versions=$(grep -A1 'name = "app"\|name = "loom-daemon"\|name = "loom-api"' "$REPO_ROOT/Cargo.lock" | grep '^version' | sed 's/version = "\(.*\)"/\1/' | sort -u)
+  lock_versions=$(grep -A1 'name = "loom-daemon"\|name = "loom-api"' "$REPO_ROOT/Cargo.lock" | grep '^version' | sed 's/version = "\(.*\)"/\1/' | sort -u)
   local lock_count
   lock_count=$(echo "$lock_versions" | wc -l | tr -d ' ')
   if [ "$lock_count" -eq 1 ] && [ "$(echo "$lock_versions" | tr -d '[:space:]')" = "$expected" ]; then
@@ -112,7 +110,7 @@ set_version() {
   echo ""
 
   # JSON files - use jq for clean updates
-  for file in package.json mcp-loom/package.json src-tauri/tauri.conf.json; do
+  for file in package.json mcp-loom/package.json; do
     local tmp
     tmp=$(mktemp)
     jq --arg v "$new_version" '.version = $v' "$REPO_ROOT/$file" > "$tmp"
@@ -123,7 +121,7 @@ set_version() {
   # Cargo.toml files - sed the version line in [package] section
   # Uses awk instead of sed to reliably replace only the first 'version =' line
   # (BSD sed on macOS doesn't support GNU sed's 0,/pattern/ address)
-  for file in src-tauri/Cargo.toml loom-daemon/Cargo.toml loom-api/Cargo.toml; do
+  for file in loom-daemon/Cargo.toml loom-api/Cargo.toml; do
     awk -v ver="$new_version" '!done && /^version = "/ { print "version = \"" ver "\""; done=1; next } 1' \
       "$REPO_ROOT/$file" > "$REPO_ROOT/$file.tmp" && mv "$REPO_ROOT/$file.tmp" "$REPO_ROOT/$file"
     echo "  Updated $file"
@@ -134,7 +132,7 @@ set_version() {
   echo "  Updated CLAUDE.md"
 
   # Cargo.lock
-  (cd "$REPO_ROOT" && cargo update app loom-daemon loom-api 2>/dev/null)
+  (cd "$REPO_ROOT" && cargo update loom-daemon loom-api 2>/dev/null)
   echo "  Updated Cargo.lock"
 
   echo ""
@@ -148,8 +146,8 @@ do_tag() {
   echo "Committing and tagging..."
   (
     cd "$REPO_ROOT"
-    git add package.json mcp-loom/package.json src-tauri/tauri.conf.json \
-           src-tauri/Cargo.toml loom-daemon/Cargo.toml loom-api/Cargo.toml \
+    git add package.json mcp-loom/package.json \
+           loom-daemon/Cargo.toml loom-api/Cargo.toml \
            CLAUDE.md Cargo.lock
     git commit -m "chore: bump version to $version"
     git tag -a "v$version" -m "v$version"

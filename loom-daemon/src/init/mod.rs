@@ -1,9 +1,9 @@
 //! Loom workspace initialization module
 //!
 //! This module provides functionality for initializing Loom workspaces
-//! without requiring the Tauri application. It can be used from:
+//! from the daemon and CLI surface. It can be used from:
 //! - CLI mode (loom-daemon init)
-//! - Tauri IPC commands (shared code)
+//! - MCP tools (shared code)
 //!
 //! The initialization process:
 //! 1. Validates the target is a git repository
@@ -400,7 +400,7 @@ mod tests {
         assert!(!is_loom_source_repo(workspace));
 
         // Create partial structure (not enough)
-        fs::create_dir(workspace.join("src-tauri")).unwrap();
+        fs::create_dir(workspace.join("loom-api")).unwrap();
         assert!(!is_loom_source_repo(workspace));
 
         // Create more structure
@@ -424,7 +424,7 @@ mod tests {
         fs::create_dir(workspace.join(".git")).unwrap();
 
         // Create Loom source structure
-        fs::create_dir(workspace.join("src-tauri")).unwrap();
+        fs::create_dir(workspace.join("loom-api")).unwrap();
         fs::create_dir(workspace.join("loom-daemon")).unwrap();
         fs::create_dir_all(workspace.join("defaults").join("roles")).unwrap();
         fs::write(workspace.join("defaults").join("config.json"), "{}").unwrap();

@@ -66,7 +66,7 @@ Scan for:
 - Changed ForgeClient protocol methods
 - Changed CLI command flags/behavior
 - Changed MCP tool interfaces
-- Removed or renamed Tauri commands
+- Removed or renamed daemon commands
 - Changed config file format
 
 ### New Capabilities (MINOR bump)
@@ -105,7 +105,7 @@ Once the user approves:
 
 1. **Update CHANGELOG.md**: Insert the new entry below `## [Unreleased]`
 2. **Bump version**: Run `./scripts/version.sh bump <level> --tag`
-   - This updates all 7 files: `package.json`, `mcp-loom/package.json`, `src-tauri/tauri.conf.json`, 3 `Cargo.toml` files, `CLAUDE.md`
+   - This updates all 5 files: `package.json`, `mcp-loom/package.json`, 2 `Cargo.toml` files (`loom-daemon`, `loom-api`), `CLAUDE.md`
    - Plus `Cargo.lock`
    - Creates the commit and tag automatically
 3. **Verify**: `./scripts/version.sh check`
@@ -156,15 +156,15 @@ Present a summary:
 - GitHub Release: created
 - Build workflow: [triggered / status]
 - CHANGELOG: updated with N items
-- Version files: 7 files + Cargo.lock updated
+- Version files: 5 files + Cargo.lock updated
 ```
 
 ## Important Notes
 
 - **Version script**: `scripts/version.sh` is the single source of truth for version management. Never manually edit version numbers.
-- **7 version-bearing files**: `package.json`, `mcp-loom/package.json`, `src-tauri/tauri.conf.json`, `src-tauri/Cargo.toml`, `loom-daemon/Cargo.toml`, `loom-api/Cargo.toml`, `CLAUDE.md`
+- **5 version-bearing files**: `package.json`, `mcp-loom/package.json`, `loom-daemon/Cargo.toml`, `loom-api/Cargo.toml`, `CLAUDE.md`
 - **Release workflow trigger**: The build workflow (`.github/workflows/release.yml`) triggers on GitHub Release creation (`release: types: [created]`), NOT on tag push. You must create a GitHub Release via `gh release create`.
 - **Conventional commits**: This project uses conventional commit prefixes (`feat:`, `fix:`, `chore:`, etc.).
-- **Build output**: The release workflow builds macOS DMGs (Apple Silicon + Intel) and attaches them to the GitHub Release.
+- **Build output**: The release workflow builds `loom-daemon` binaries (Apple Silicon + Intel) and attaches them to the GitHub Release.
 - **CLAUDE.md update**: The version script updates the `**Loom Version**` line in CLAUDE.md automatically.
 - **Branch protection**: Direct pushes to main will show a ruleset bypass warning — this is expected for release commits.

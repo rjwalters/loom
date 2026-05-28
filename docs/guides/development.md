@@ -1,40 +1,34 @@
-# Development Guide
+# Loom Development Guide
 
-This guide covers the development workflow, tooling, and best practices for contributing to Loom.
+This guide describes how to set up the Loom source repo for development and contribute changes.
 
 ## Prerequisites
 
-- **Node.js** 20+ and pnpm
-- **Rust** 1.60+ (stable)
-- **tmux** (for terminal management)
-- **Git**
+- **Rust** (stable channel)
+- **Node.js** (v18+) and **pnpm** (for `mcp-loom`)
+- **Python 3.10+** with **uv** (for `loom-tools`)
+- **tmux**
+- A POSIX shell (bash/zsh)
 
-## Documentation Overview
+## Quick Start
 
-This guide covers code quality, tooling, and development practices. For:
-- **Day-to-day development workflow**: See [DEV_WORKFLOW.md](dev-workflow.md)
-- **Project vision and architecture**: See [README.md](../../README.md)
-- **Agent workflows**: See [WORKFLOWS.md](../workflows.md)
-
-## Getting Started
-
-1. Clone the repository:
+1. Clone the repo:
    ```bash
-   git clone https://github.com/rjwalters/loom.git
+   git clone https://github.com/rjwalters/loom
    cd loom
    ```
 
-2. Install dependencies:
+2. Build the daemon:
    ```bash
-   pnpm install
+   cargo build --workspace --release
    ```
 
-3. Run the development environment:
+3. Run the daemon in dev mode:
    ```bash
-   pnpm run app:dev
+   ./scripts/dev-daemon.sh
    ```
 
-   This starts both the daemon and Tauri dev server in one command. For detailed workflow information, see [DEV_WORKFLOW.md](dev-workflow.md).
+   For detailed daemon workflow information, see [dev-workflow.md](dev-workflow.md).
 
 ## Code Quality Tools
 
@@ -42,145 +36,74 @@ This guide covers code quality, tooling, and development practices. For:
 
 Loom uses a comprehensive set of tools to maintain code quality:
 
-#### Frontend (TypeScript/JavaScript)
-- **[Biome](https://biomejs.dev/)** - Fast formatter and linter for TypeScript/JavaScript
-- Configuration: `biome.json`
-
-#### Backend (Rust)
+#### Rust
 - **[rustfmt](https://rust-lang.github.io/rustfmt/)** - Official Rust formatter
 - **[clippy](https://github.com/rust-lang/rust-clippy)** - Official Rust linter
 - Configuration: `rustfmt.toml` and `.cargo/config.toml`
 
+#### TypeScript (mcp-loom)
+- `tsc --noEmit` for typecheck
+- `esbuild` for bundling
+
+#### Python (loom-tools)
+- `pytest` for tests; `ruff` / `mypy` if configured per package
+
 ### Available Commands
-
-#### Application Development Commands
-```bash
-# Start daemon + Tauri dev in one command
-pnpm run app:dev
-
-# Restart daemon when it gets into bad state
-pnpm run app:dev:restart
-
-# Stop the background daemon
-pnpm run app:stop
-```
 
 #### Daemon Management
 ```bash
-# Start daemon in background
-pnpm run daemon:start
+# Start daemon in interactive monitor (recommended)
+pnpm run daemon:dev
 
-# Stop daemon
+# Run daemon in foreground (cargo run)
+pnpm run daemon:preview
+
+# Start in background
+pnpm run daemon:headless
+
+# Stop
 pnpm run daemon:stop
 
-# Restart daemon
-pnpm run daemon:restart
-
-# Run daemon in foreground (for debugging)
-pnpm run daemon:dev
+# Build release binary
+pnpm run daemon:build
 ```
 
-For detailed workflow information, see [DEV_WORKFLOW.md](dev-workflow.md).
+For detailed workflow information, see [dev-workflow.md](dev-workflow.md).
 
-#### Frontend Linting and Formatting
+#### Rust Linting and Formatting
 ```bash
-# Check for linting issues
-pnpm run lint
-
-# Fix linting issues automatically
-pnpm run lint:fix
-
-# Check formatting (no changes)
-pnpm run format
-
-# Format code
-pnpm run format:write
-```
-
-#### Backend Linting and Formatting
-```bash
-# Check Rust formatting
+# Check formatting
 pnpm run format:rust
 
-# Format Rust code
+# Apply formatting
 pnpm run format:rust:write
 
-# Run clippy linter
+# Run clippy
 pnpm run clippy
 
-# Fix clippy issues automatically
+# Auto-fix clippy issues
 pnpm run clippy:fix
 ```
 
-#### Comprehensive Checks
+#### Combined Checks
+
 ```bash
-# Run all checks (lint, format, compile, build)
+# Run everything locally (matches CI)
 pnpm run check:all
 
-# Check workspace compilation
-pnpm run check
-
-# Check daemon compilation
-pnpm run daemon:check
+# CI variant (with --locked for reproducible builds)
+pnpm run check:ci
 ```
 
-### Git Hooks
+## Continuous Integration
 
-Pre-commit hooks live in `.githooks/pre-commit` (a plain shell script, no dependencies).
+GitHub Actions runs the following on every push and PR:
 
-The hooks path is activated by `git config core.hooksPath .githooks`, which runs automatically via the `prepare` script on `pnpm install`.
-
-When you commit:
-1. **TypeScript/JavaScript files** are automatically formatted and linted with Biome
-2. **Rust files** are automatically formatted with rustfmt
-
-If there are errors that can't be auto-fixed, the commit will be blocked.
-
-### Testing
-
-Loom has comprehensive testing at multiple levels:
-
-#### Unit Tests
-```bash
-# Run all workspace tests
-cargo test --workspace
-
-# Run with verbose output
-cargo test --workspace -- --nocapture
-```
-
-#### Integration Tests (Daemon)
-```bash
-# Run daemon integration tests
-pnpm run daemon:test
-
-# Run with verbose output
-pnpm run daemon:test:verbose
-
-# Run specific test
-cargo test --test integration_basic test_ping_pong -- --nocapture
-```
-
-#### Script Integration Tests
-```bash
-# Test daemon management scripts
-pnpm run daemon:test:scripts
-```
-
-**Requirements**: Tests require `tmux` installed (`brew install tmux` on macOS)
-
-See [scripts/README.md](scripts/README.md) for details on daemon management script testing.
-
-### CI/CD
-
-GitHub Actions runs the following checks on every PR and push to `main`:
-
-- **Frontend Linting** - Biome checks
-- **Frontend Formatting** - Biome format checks
-- **Frontend Build** - TypeScript compilation and Vite build
 - **Rust Formatting** - rustfmt checks
 - **Rust Linting** - clippy checks with warnings as errors
 - **Rust Build** - Cargo workspace check
+- **mcp-loom Build** - TypeScript compile + bundle
+- **Installer Integration Tests** - macOS installer smoke tests
 
 See `.github/workflows/ci.yml` for the full CI configuration.
 
@@ -188,25 +111,19 @@ See `.github/workflows/ci.yml` for the full CI configuration.
 
 ```
 loom/
-├── src/                    # Frontend TypeScript source
-│   ├── lib/               # Reusable modules (state, config, ui, theme)
-│   ├── main.ts            # Application entry point
-│   └── style.css          # TailwindCSS styles
-├── src-tauri/             # Tauri Rust backend
-│   └── src/
-│       ├── main.rs        # Tauri commands and application
-│       └── daemon_client.rs  # Daemon IPC client
-├── loom-daemon/           # Standalone Rust daemon
+├── loom-daemon/           # Rust daemon (orchestration, IPC, tmux mgmt)
 │   └── src/
 │       ├── main.rs        # Daemon entry point
-│       ├── types.rs       # Shared types for IPC
-│       ├── terminal.rs    # tmux terminal management
-│       └── ipc.rs         # Unix socket server
+│       ├── ipc.rs         # Unix socket server
+│       └── ...
+├── loom-api/              # Shared Rust types and IPC protocol
+├── mcp-loom/              # Unified MCP server (TypeScript/Node)
+├── loom-tools/            # Python tools (loom-shepherd, loom-clean, etc.)
+├── defaults/              # Default configuration templates installed into target repos
+├── scripts/               # Installation, daemon, and maintenance scripts
 ├── .github/workflows/     # GitHub Actions CI
 ├── .vscode/               # VSCode settings and extensions
-├── biome.json             # Biome configuration
-├── rustfmt.toml           # Rustfmt configuration
-└── .cargo/config.toml     # Cargo and clippy configuration
+└── rustfmt.toml           # Rustfmt configuration
 ```
 
 ## Development Workflow
@@ -215,7 +132,7 @@ loom/
 
 1. Create a feature branch:
    ```bash
-   git checkout -b feature/your-feature-name
+   git checkout -b feature/issue-N
    ```
 
 2. Make your changes
@@ -227,14 +144,15 @@ loom/
 
 4. Commit your changes (pre-commit hooks will run automatically)
 
-5. Push and create a PR:
+5. Push and create a PR with `loom:review-requested`:
    ```bash
-   git push -u origin feature/your-feature-name
+   git push -u origin feature/issue-N
+   gh pr create --label loom:review-requested --body "Closes #N"
    ```
 
 ### Working with the Daemon
 
-The daemon manages tmux terminal sessions independently of the GUI.
+The daemon manages tmux terminal sessions and orchestrates support roles.
 
 ```bash
 # Run daemon in development mode (with logging)
@@ -242,9 +160,6 @@ pnpm run daemon:dev
 
 # Build daemon for production
 pnpm run daemon:build
-
-# Check daemon compilation
-pnpm run daemon:check
 ```
 
 ## VSCode Setup
@@ -252,39 +167,33 @@ pnpm run daemon:check
 Install the recommended extensions when prompted. The workspace includes:
 
 - **rust-analyzer** - Rust language server
-- **Biome** - TypeScript/JavaScript formatter and linter
-- **Tauri** - Tauri development tools
 
-Settings in `.vscode/settings.json` enable format-on-save for all languages.
+Settings in `.vscode/settings.json` enable format-on-save.
 
 ## Troubleshooting
 
 ### Linting Errors
 
 If you see linting errors:
-1. Try auto-fixing: `pnpm run lint:fix` (frontend) or `pnpm run clippy:fix` (Rust)
+1. Try auto-fixing: `pnpm run clippy:fix`
 2. Check the error messages for manual fixes needed
 3. If a rule is too strict, discuss with the team before disabling it
 
 ### Build Errors
 
 If builds fail:
-1. Clean and rebuild: `rm -rf node_modules dist target && pnpm install && pnpm run build`
+1. Clean and rebuild: `rm -rf target && cargo build --workspace`
 2. Check that all dependencies are installed
-3. Verify Rust version: `rustc --version` (should be 1.60+)
-4. Verify Node version: `node --version` (should be 20+)
+3. Verify Rust version: `rustc --version` (should be 1.70+)
 
 ### Git Hook Issues
 
 If pre-commit hooks fail:
 1. Check the error output for specific issues
-2. Try manual fixes: `pnpm run lint:fix && pnpm run format:rust:write`
+2. Try manual fixes: `pnpm run format:rust:write && pnpm run clippy:fix`
 3. If hooks are misconfigured, reconfigure: `git config core.hooksPath .githooks`
 
 ## Additional Resources
 
-- [Tauri Documentation](https://tauri.app/)
-- [Biome Documentation](https://biomejs.dev/)
 - [Rust Book](https://doc.rust-lang.org/book/)
-- [TypeScript Documentation](https://www.typescriptlang.org/docs/)
-- [TailwindCSS Documentation](https://tailwindcss.com/docs)
+- [tmux Manual](https://www.man7.org/linux/man-pages/man1/tmux.1.html)

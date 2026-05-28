@@ -29,7 +29,7 @@ Closes #2
 
 1. Create feature branch from main
 2. Implement feature
-3. Test manually (`pnpm tauri:dev`)
+3. Test manually (`./scripts/dev-daemon.sh`)
 4. **CRITICAL: Run `pnpm check:ci`** - This runs the exact same checks as CI
 5. Fix any errors found by local CI checks
 6. Create PR with detailed description

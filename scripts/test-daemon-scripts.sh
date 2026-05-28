@@ -96,8 +96,7 @@ echo ""
 
 # Test 5: Ping daemon (test IPC communication)
 echo "Test 5: Ping daemon via IPC"
-# Use Tauri command to ping (requires Tauri to be built)
-# For now, just check process responds to signal 0
+# Just check the daemon process responds to signal 0
 if [ -f "$DAEMON_PID_FILE" ]; then
   PID=$(cat "$DAEMON_PID_FILE")
   if kill -0 "$PID" 2>/dev/null; then

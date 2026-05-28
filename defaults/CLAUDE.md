@@ -7,7 +7,7 @@ This repository uses **Loom** for AI-powered development orchestration.
 
 ## What is Loom?
 
-Loom is a multi-terminal desktop application for macOS that orchestrates AI-powered development workers using git worktrees and a forge (GitHub or Gitea) as the coordination layer. It enables both automated orchestration (Tauri App Mode) and manual coordination (Manual Orchestration Mode).
+Loom is a CLI + daemon for AI-powered development orchestration. It coordinates AI development workers using git worktrees and a forge (GitHub or Gitea) as the coordination layer. It supports manual coordination (Manual Orchestration Mode) and continuous autonomous orchestration (Daemon Mode).
 
 **Loom Repository**: https://github.com/rjwalters/loom
 
@@ -168,30 +168,7 @@ Use Claude Code terminals with specialized roles for hands-on development coordi
 # Enhances unlabeled issues, marks as loom:curated
 ```
 
-### 2. Tauri App Mode
-
-Launch the Loom desktop application for automated orchestration with visual terminal management.
-
-**Setup**:
-1. Install Loom app (see main repository for download)
-2. Open Loom application
-3. Select this repository as workspace
-4. Configure terminals with roles and intervals
-5. Start engine - terminals launch automatically
-
-**When to use Tauri App**:
-- Production-scale development
-- Fully autonomous agent workflows
-- Visual monitoring of multiple agents
-- Hands-off orchestration
-
-**Features**:
-- Visual terminal multiplexing
-- Real-time agent monitoring
-- Autonomous mode with configurable intervals
-- Persistent workspace configuration
-
-### 3. Daemon Mode (Layer 2)
+### 2. Daemon Mode (Layer 2)
 
 Run the Loom daemon for fully autonomous system orchestration.
 
@@ -434,36 +411,15 @@ Agents coordinate work through forge labels (GitHub or Gitea). This enables auto
 
 ## Git Worktree Workflow
 
-Loom uses git worktrees to isolate agent work. Loom supports two types of worktrees depending on the usage mode:
+Loom uses git worktrees to isolate agent work on issues.
 
 ### Worktree Strategy Overview
 
-**Terminal Worktrees** (`.loom/worktrees/terminal-N`):
-- **Purpose**: Agent isolation in Tauri App Mode
-- **When**: Created automatically for each terminal in the Loom desktop application
-- **Why**: Allows multiple autonomous agents to work on different branches simultaneously without conflicts
-- **Scope**: Per terminal/agent (persistent across app restarts)
-- **Used in**: Tauri App Mode only
-
 **Issue Worktrees** (`.loom/worktrees/issue-N`):
 - **Purpose**: Issue-specific work isolation for Builder agents
-- **When**: Created manually by Builder when claiming an issue (both MOM and Tauri App)
+- **When**: Created by Builder when claiming an issue
 - **Why**: Isolates work on specific issues with dedicated feature branches
 - **Scope**: Per issue (temporary, cleaned up when PR is merged)
-- **Used in**: Both Manual Orchestration Mode and Tauri App Mode
-
-### When to Use Which Worktree Type
-
-**Manual Orchestration Mode (Claude Code CLI)**:
-- No terminal worktrees (agents work in main workspace initially)
-- Builder creates issue worktrees via `./.loom/scripts/worktree.sh <issue-number>`
-- Single agent per terminal, human-controlled
-
-**Tauri App Mode (Autonomous Agents)**:
-- Automatic terminal worktrees for agent isolation (`.loom/worktrees/terminal-N`)
-- Builder ALSO creates issue worktrees when claiming work (`.loom/worktrees/issue-N`)
-- Multiple autonomous agents can run simultaneously
-- Builder works in issue worktree, not terminal worktree
 
 ### Creating Worktrees (for Agents)
 
@@ -493,7 +449,7 @@ gh pr create --label "loom:review-requested"
 
 Loom distinguishes between worktrees it created and worktrees the user created. Cleanup tooling only acts on Loom-managed worktrees.
 
-- **Loom-managed**: Worktrees created by `./.loom/scripts/worktree.sh` (or the Tauri app's terminal-worktree machinery). These live under `.loom/worktrees/` and contain a `.loom-managed` sentinel file in their root. `merge-pr.sh`, `agent-destroy.sh`, and `loom-clean` may remove them automatically.
+- **Loom-managed**: Worktrees created by `./.loom/scripts/worktree.sh`. These live under `.loom/worktrees/` and contain a `.loom-managed` sentinel file in their root. `merge-pr.sh`, `agent-destroy.sh`, and `loom-clean` may remove them automatically.
 - **User-managed**: Any other worktree — anything not under `.loom/worktrees/`, or anything under `.loom/worktrees/` that lacks the `.loom-managed` sentinel. Loom tooling and Loom-aware agents MUST NOT remove these. They survive merges, agent shutdowns, and `loom-clean` runs.
 
 To disable all Loom-side worktree removal for a session (e.g., when running Loom inline from an editor-provisioned worktree), set `LOOM_PRESERVE_WORKTREE=1`. Both `merge-pr.sh` and `agent-destroy.sh` honor this flag.
@@ -875,9 +831,9 @@ The daemon state file provides comprehensive information for debugging, crash re
 
 Loom subagents inherit the model of the parent conversation. Agent definitions do not specify a `model:` field in their frontmatter, so the model used depends on how the parent session was launched. This avoids per-model quota bucket exhaustion where a hardcoded model assignment causes rate limit failures even when other model quotas are available.
 
-Model preferences for the Tauri App (terminal configuration) are defined in each role's JSON metadata file via the `suggestedModel` field. These are used by the Loom desktop application when launching terminals, not by Claude Code subagent routing.
+Each role ships JSON metadata with a `suggestedModel` field that records the historically-validated model for that role. The metadata is informational only — Claude Code subagent routing still inherits from the parent conversation.
 
-**Suggested models by role** (for Tauri App terminal configuration):
+**Suggested models by role**:
 
 | Role | Model | Rationale |
 |------|-------|-----------|
@@ -1272,13 +1228,10 @@ gh label sync --file .github/labels.yml
 ./scripts/install/sync-labels.sh .
 ```
 
-**Terminal won't start (Tauri App)**:
+**Daemon won't start**:
 ```bash
 # Check daemon logs
 tail -f ~/.loom/daemon.log
-
-# Check terminal logs
-tail -f /tmp/loom-terminal-1.out
 ```
 
 **Claude Code not found**:
@@ -1631,7 +1584,6 @@ All Loom MCP tools are provided through a single `mcp-loom` package, which conso
 
 **Log Tools:**
 - `tail_daemon_log` - Tail daemon log file
-- `tail_tauri_log` - Tail Tauri application log
 - `list_terminal_logs` - List available terminal output logs
 - `tail_terminal_log` - Tail a specific terminal's output log
 

@@ -80,7 +80,7 @@ export GITEA_TOKEN=your_token_here
 source .env  # where .env contains: export GITEA_TOKEN=your_token_here
 ```
 
-When using Tauri App Mode, set the variable before launching the app so all spawned terminals inherit it.
+When using Daemon Mode, set the variable before launching the daemon so all spawned terminals inherit it.
 
 ### Verifying Authentication
 

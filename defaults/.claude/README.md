@@ -26,16 +26,12 @@ The `settings.json` file pre-approves common development commands to streamline 
 - Configuration: config, check-ignore
 
 ### Package Management
-- `pnpm install` - Install dependencies
-- `pnpm build` - Build project
-- `pnpm tauri:dev` - Run Tauri dev server
 - `pnpm daemon:dev` - Run daemon in dev mode
+- `pnpm daemon:build` - Build daemon (release)
 - `pnpm check:all` - Run all checks
 - `pnpm check:ci` - Run CI checks locally
 
 ### Code Quality
-- `pnpm lint` - Biome linting
-- `pnpm format` - Biome formatting
 - `pnpm clippy` - Rust linting
 - `pnpm test` - Run tests
 
@@ -73,7 +69,6 @@ The project includes two MCP servers configured in `.mcp.json`:
 ### loom-logs
 Monitor Loom application logs:
 - `tail_daemon_log` - View daemon logs (`~/.loom/daemon.log`)
-- `tail_tauri_log` - View Tauri app logs (`~/.loom/tauri.log`)
 - `list_terminal_logs` - List terminal output files
 - `tail_terminal_log` - View specific terminal output
 
@@ -92,7 +87,7 @@ Interact with the Loom application UI and state:
 - `trigger_start` - Trigger workspace start with confirmation dialog (factory reset with 6 terminals)
 - `trigger_force_start` - Trigger force start without confirmation (immediate reset)
 
-**Label State Machine Reset**: When workspace is started (via `trigger_start` or `trigger_force_start`), the `reset_github_labels` Tauri command automatically resets the GitHub label state machine:
+**Label State Machine Reset**: When workspace is started (via `trigger_start` or `trigger_force_start`), the `reset_github_labels` daemon command automatically resets the GitHub label state machine:
 - Removes `loom:building` from all open issues (workers can reclaim them)
 - Replaces `loom:reviewing` with `loom:review-requested` on all open PRs (reviewer can re-review)
 - This ensures a clean state when restarting the workspace with fresh agent terminals
@@ -153,7 +148,7 @@ To create a custom slash command:
 2. Include role purpose, workflow guidelines, and iteration instructions
 3. Use it with `/your-command` (or `/your-namespace/command`)
 
-**Note**: `.loom/roles/` contains symlinks to `.claude/commands/loom/` for Tauri App compatibility. The single source of truth for all Loom role definitions is `.claude/commands/loom/`.
+**Note**: `.loom/roles/` contains symlinks to `.claude/commands/loom/` for backward compatibility. The single source of truth for all Loom role definitions is `.claude/commands/loom/`.
 
 ## Custom Subagents
 
