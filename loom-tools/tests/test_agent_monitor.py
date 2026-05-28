@@ -187,7 +187,8 @@ class TestAgentMonitor:
             "loom_tools.agent_monitor.find_repo_root", return_value=temp_repo
         ):
             monitor = AgentMonitor(config)
-            assert monitor._extract_role_command() == "/builder 42"
+            # Namespaced form required by Claude Code 2.1+ (see issue #3345).
+            assert monitor._extract_role_command() == "/loom:builder 42"
 
     def test_extract_role_command_other(self, temp_repo: pathlib.Path) -> None:
         config = MonitorConfig(name="judge-123")

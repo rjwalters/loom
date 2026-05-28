@@ -332,8 +332,9 @@ _UI_CHROME_LINE_PATTERNS = [
     re.compile(r"resets\s+\w+\s+\d"),
     # Shell prompt capture: "user@host dir % "
     re.compile(r"^\w+@\w+\s+\S+\s+%\s*$"),
-    # Skill/command echo: "/builder 2055"
-    re.compile(r"^/\w+\s+\d+\s*$"),
+    # Skill/command echo: "/builder 2055" (legacy) or "/loom:builder 2055"
+    # (namespaced form required by Claude Code 2.1+, see issue #3345).
+    re.compile(r"^/[\w:]+\s+\d+\s*$"),
     # Spinner status line: "· Photosynthesizing…"
     re.compile(r"^·\s"),
 ]

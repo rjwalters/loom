@@ -440,10 +440,13 @@ check_stuck_at_prompt() {
         return 1  # Can't determine, session may be gone
     fi
 
-    # Check for role slash command visible at the prompt line
-    # Pattern: ❯ followed by a role command like /builder, /judge, /curator, /doctor, /shepherd
+    # Check for role slash command visible at the prompt line.
+    # Pattern: ❯ followed by either:
+    #   - legacy bare form (`/builder`, `/judge`, ...), or
+    #   - namespaced form (`/loom:builder`, `/loom:judge`, ...) required by
+    #     Claude Code 2.1+ — see issue #3345.
     local command_at_prompt=false
-    if echo "$pane_content" | grep -qE '❯[[:space:]]*/?(builder|judge|curator|doctor|shepherd)'; then
+    if echo "$pane_content" | grep -qE '❯[[:space:]]*/?(loom:)?(builder|judge|curator|doctor|shepherd)'; then
         command_at_prompt=true
     fi
 
@@ -1140,11 +1143,14 @@ main() {
                     prompt_stuck_recovery_attempted=true
                     prompt_stuck_recovery_time=$now
 
-                    # Extract the likely role command from the session name for retry
+                    # Extract the likely role command from the session name for retry.
+                    # Uses the namespaced `/loom:<role>` form required by Claude Code 2.1+
+                    # (subdirectory commands at `.claude/commands/loom/<role>.md` are
+                    # resolved via `namespace:command` syntax — see issue #3345).
                     local role_cmd=""
                     if [[ "$name" == builder-issue-* ]]; then
                         local issue_num="${name#builder-issue-}"
-                        role_cmd="/builder ${issue_num}"
+                        role_cmd="/loom:builder ${issue_num}"
                     elif [[ "$name" == judge-* ]] || [[ "$name" == curator-* ]] || [[ "$name" == doctor-* ]]; then
                         # For other roles, we can't easily reconstruct the command
                         # Enter nudge is still attempted

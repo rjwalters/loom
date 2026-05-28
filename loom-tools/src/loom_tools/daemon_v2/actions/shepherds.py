@@ -516,7 +516,7 @@ def force_reclaim_stale_shepherds(ctx: DaemonContext) -> int:
                 severity="warning",
                 message=(
                     f"Shepherd for issue #{issue} exhausted retries due to {actual_error_class}. "
-                    f"Fix the underlying issue, then re-run: /shepherd {issue} -m"
+                    f"Fix the underlying issue, then re-run: /loom:shepherd {issue} -m"
                 ),
                 context={
                     "issue": issue,

@@ -73,7 +73,8 @@ class TestStallRecoveryWarnings:
         assert w.severity == "warning"
         assert w.acknowledged is False
         assert "42" in w.message
-        assert "/shepherd 42 -m" in w.message
+        # Namespaced form required by Claude Code 2.1+ (see issue #3345).
+        assert "/loom:shepherd 42 -m" in w.message
         assert w.context["issue"] == 42
         assert w.context["shepherd"] == "shepherd-1"
         assert w.context["requires_role"] == "shepherd"
@@ -297,7 +298,8 @@ class TestStallRecoveryWarnings:
         force_reclaim_stale_shepherds(ctx)
 
         assert len(ctx.state.warnings) == 1
-        assert "/shepherd 123 -m" in ctx.state.warnings[0].message
+        # Namespaced form required by Claude Code 2.1+ (see issue #3345).
+        assert "/loom:shepherd 123 -m" in ctx.state.warnings[0].message
 
     def test_warning_has_correct_timestamp(
         self, _mock_session, _mock_kill, _mock_record, _mock_unclaim, _mock_release,

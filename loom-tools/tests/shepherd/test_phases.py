@@ -17591,6 +17591,18 @@ class TestStripUiChrome:
         assert "/builder" not in result
         assert "real output" in result
 
+    def test_strips_namespaced_command_echo(self) -> None:
+        """Claude Code 2.1+ echoes commands in `/namespace:command` form.
+
+        Regression for issue #3345: the chrome regex must strip both the
+        bare-form echo (`/builder 2055`) and the namespaced echo
+        (`/loom:builder 2055`).
+        """
+        text = "/loom:builder 2055\nreal output\n"
+        result = _strip_ui_chrome(text)
+        assert "/loom:builder" not in result
+        assert "real output" in result
+
     def test_strips_block_art_lines(self) -> None:
         text = "▐▛███▜▌\n▝▜█████▛▘\nreal output\n"
         result = _strip_ui_chrome(text)
