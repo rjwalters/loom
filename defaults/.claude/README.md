@@ -205,9 +205,11 @@ The agent definition wires the correct system prompt, tool allowlist, and model 
 
 ```python
 # Legacy fallback - role selection happens via the slash command in the prompt.
+# Note: Claude Code 2.1+ requires the namespaced `/loom:<role>` form for
+# subdirectory commands (`.claude/commands/loom/<role>.md`). See issue #3345.
 result = Task(
     description="Builder phase for issue #123",
-    prompt="/builder 123",
+    prompt="/loom:builder 123",
     subagent_type="general-purpose",
     run_in_background=False
 )

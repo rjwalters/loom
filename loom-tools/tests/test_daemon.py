@@ -540,27 +540,31 @@ class TestOrchestrationDelegation:
         """Verify iteration command format matches bash.
 
         Bash (lines 607-613):
-        - ITERATE_CMD="/loom iterate"
+        - ITERATE_CMD="/loom:loom iterate"
         - if [[ -n "$FORCE_FLAG" ]]; then
         -     ITERATE_CMD="$ITERATE_CMD $FORCE_FLAG"
         - fi
         - if [[ -n "$DEBUG_FLAG" ]]; then
         -     ITERATE_CMD="$ITERATE_CMD $DEBUG_FLAG"
         - fi
+
+        Note: the namespaced `/loom:loom` form is required by Claude Code 2.1+
+        (subdirectory commands at `.claude/commands/loom/loom.md` use
+        `namespace:command` syntax — see issue #3345).
         """
         from loom_tools.daemon import DaemonConfig
 
         # Python builds the same command (lines 332-338)
         config = DaemonConfig(force_mode=True, debug_mode=True)
 
-        cmd_parts = ["/loom", "iterate"]
+        cmd_parts = ["/loom:loom", "iterate"]
         if config.force_mode:
             cmd_parts.append("--force")
         if config.debug_mode:
             cmd_parts.append("--debug")
 
         iterate_cmd = " ".join(cmd_parts)
-        assert iterate_cmd == "/loom iterate --force --debug"
+        assert iterate_cmd == "/loom:loom iterate --force --debug"
 
     def test_shepherd_scaling_delegated_to_iterate(self) -> None:
         """Document that shepherd scaling is delegated to /loom iterate.

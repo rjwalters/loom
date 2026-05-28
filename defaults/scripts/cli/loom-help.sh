@@ -93,7 +93,7 @@ ${YELLOW}QUICK START:${NC}
     ./.loom/bin/loom attach shepherd-1
 
     ${GRAY}# Send a command to an agent${NC}
-    ./.loom/bin/loom send shepherd-1 "/shepherd 123"
+    ./.loom/bin/loom send shepherd-1 "/loom:shepherd 123"
 
     ${GRAY}# View logs${NC}
     ./.loom/bin/loom logs shepherd-1
@@ -109,7 +109,7 @@ ${YELLOW}EXAMPLES:${NC}
     ./.loom/bin/loom health                 Run diagnostic health check
     ./.loom/bin/loom health --json          Machine-readable health report
     ./.loom/bin/loom attach shepherd-1      Connect to agent terminal
-    ./.loom/bin/loom send shepherd-1 "/shepherd 123"  Send command to agent
+    ./.loom/bin/loom send shepherd-1 "/loom:shepherd 123"  Send command to agent
     ./.loom/bin/loom stop                   Graceful shutdown
     ./.loom/bin/loom stop --force           Force kill all sessions
     ./.loom/bin/loom stop shepherd-1        Stop single agent

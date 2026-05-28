@@ -716,8 +716,13 @@ def spawn_agent(
             "LOOM_WORKTREE_PATH", str(working_dir),
         )
 
-    # Build the role slash command
-    role_cmd = f"/{role}"
+    # Build the role slash command.
+    # Note: role definitions live under `.claude/commands/loom/<role>.md` since
+    # #3176, and Claude Code 2.1+ resolves subdirectory commands using the
+    # `namespace:command` form (e.g., `/loom:builder`).  Emitting the bare
+    # `/<role>` form here would fail with "Unknown command" on Claude Code 2.1+
+    # — see issue #3345.
+    role_cmd = f"/loom:{role}"
     if args:
         role_cmd = f"{role_cmd} {args}"
 

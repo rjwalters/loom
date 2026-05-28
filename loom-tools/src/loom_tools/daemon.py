@@ -1,7 +1,9 @@
 """Loom Daemon Loop - Python implementation for robust continuous operation.
 
 This module implements the daemon loop that orchestrates Loom iterations,
-delegating iteration work to Claude via the /loom iterate command.
+delegating iteration work to Claude via the /loom:loom iterate command.
+(The `/loom:loom` form is required by Claude Code 2.1+ because the role
+file lives at `.claude/commands/loom/loom.md`; see issue #3345.)
 
 Features:
     - Deterministic loop behavior (no LLM interpretation variability)
@@ -380,8 +382,11 @@ class DaemonLoop:
         """Run a single daemon iteration via Claude CLI."""
         start_time = time.time()
 
-        # Build the command
-        cmd_parts = ["/loom", "iterate"]
+        # Build the command.
+        # The daemon role file lives at `.claude/commands/loom/loom.md` since #3176,
+        # so Claude Code 2.1+ resolves it via the namespaced `/loom:loom` form
+        # (subdirectory commands use `namespace:command` syntax — see issue #3345).
+        cmd_parts = ["/loom:loom", "iterate"]
         if self.config.force_mode:
             cmd_parts.append("--force")
         if self.config.debug_mode:

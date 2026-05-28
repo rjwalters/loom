@@ -485,9 +485,14 @@ class AgentMonitor:
         if not pane_content:
             return False
 
-        # Check for role slash command visible at the prompt line
+        # Check for role slash command visible at the prompt line.
+        # Matches both legacy bare form (`/builder`) and namespaced form
+        # (`/loom:builder`) required by Claude Code 2.1+ — see issue #3345.
         command_at_prompt = bool(
-            re.search(r"❯\s*/?(builder|judge|curator|doctor|shepherd)", pane_content)
+            re.search(
+                r"❯\s*/?(loom:)?(builder|judge|curator|doctor|shepherd)",
+                pane_content,
+            )
         )
 
         # Check for processing indicators
@@ -496,11 +501,16 @@ class AgentMonitor:
         return command_at_prompt and not processing
 
     def _extract_role_command(self) -> str:
-        """Extract the likely role command from the session name for retry."""
+        """Extract the likely role command from the session name for retry.
+
+        Returns the namespaced `/loom:<role>` form expected by Claude Code 2.1+,
+        which resolves subdirectory commands (under `.claude/commands/loom/`)
+        using `namespace:command` syntax. See issue #3345.
+        """
         name = self.config.name
         if name.startswith("builder-issue-"):
             issue_num = name[len("builder-issue-"):]
-            return f"/builder {issue_num}"
+            return f"/loom:builder {issue_num}"
         return ""
 
     def _attempt_prompt_stuck_recovery(self, role_cmd: str) -> bool:
