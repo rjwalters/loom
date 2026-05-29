@@ -192,18 +192,20 @@ If `--dry-run` was supplied, **this stage runs before any mutation** and EXITs a
   Wave 1:
     #123  "Add foo widget"                labels: loom:issue                    → would build
     #124  "Fix bar bug"                   labels: loom:curated                  → would curate, build
+    #199  "Tweak gizmo"                   labels: loom:issue                    → would route to Judge (existing PR #200 in flight)
   Wave 2:
     #125  "Refactor baz module"           labels: loom:building                 → would skip (already in flight)
     #126  "Document quux"                 labels: (none)                        → would curate, build
+    #198  "Polish frobnicator"            labels: loom:issue                    → would merge (existing PR #201 already loom:pr)
 
-Total: 3 would-build, 1 would-skip. No issues were modified.
+Total: 3 would-build, 1 would-route-to-judge, 1 would-merge, 1 would-skip. No issues were modified.
 ```
 
 **Per-candidate fields (required):**
 - Issue number
 - Title (truncated reasonably if very long)
 - Current labels (comma-separated, or `(none)`)
-- Planned action (`would build`, `would curate, build`, `would skip (<reason>)`)
+- Planned action (`would build`, `would curate, build`, `would skip (<reason>)`, `would route to Judge (existing PR #X in flight)`, `would merge (existing PR #X already loom:pr)`)
 - Wave assignment (shown via the `Wave N:` group header)
 
 **Footer (required):** total candidates, total waves, count of `would-build` vs `would-skip`, and an explicit confirmation that nothing was modified.
@@ -239,18 +241,33 @@ For each issue `N` in the wave, before any role skill is invoked:
 
 1. **Verify the issue is open and not already in flight.**
    ```bash
-   gh issue view N --json state,labels --jq '{state: .state, labels: [.labels[].name]}'
+   gh issue view N --json state,labels,closedByPullRequestsReferences \
+     --jq '{state, labels: [.labels[].name], linked_prs: [.closedByPullRequestsReferences[].url]}'
    ```
    - If the issue is closed, skip it (log a warning). It does NOT contribute to this wave.
    - If the issue already has `loom:building`, skip it — another shepherd or builder is working on it. Log a warning. Does NOT contribute to this wave.
    - If the issue has `loom:blocked`, skip it. Log a warning. Does NOT contribute to this wave.
+   - **Existing-PR probe (#3359).** If `linked_prs` is non-empty, probe each linked PR for its state and labels:
+     ```bash
+     gh pr view <pr_url> --json state,labels --jq '{state, labels: [.labels[].name]}'
+     ```
+     Filter to PRs whose `state == "OPEN"` (uppercase — `closedByPullRequestsReferences` includes MERGED and CLOSED PRs, which are not the duplicate-builder hazard). Apply the routing rules below based on the count of **open** linked PRs:
 
-2. **Read the issue body before briefing any builder.** This is a non-negotiable rule from prior sweep sessions (a misleading title hid the real requirement in the body).
+     | Open linked PRs | Action |
+     |-----------------|--------|
+     | 0 | Continue with pre-flight (no behavior change). |
+     | 1, no `loom:pr` label | **Skip Builder phase.** Log `skip (existing PR #X in flight)` with the PR URL. The existing PR is routed into the Judge phase (step 5) **for this wave** in place of a freshly-built PR; the Builder is not dispatched. Wave size shrinks by one per the pre-flight skip rule. |
+     | 1, has `loom:pr` label | **Skip Curator + Builder + Judge.** Route the PR directly to Merge (step 7). The PR has already been judged. |
+     | 2 or more | Log all PR URLs and skip the issue. This is a human-attention case (which PR is canonical?) — sweep does not pick one. |
+
+     Use `closedByPullRequestsReferences` (verified working in `gh` 2.93.0; matches the convention used in `champion-reference.md` and `champion-pr-merge.md`). It uses GitHub's native parser for `Closes/Fixes/Resolves #N` (and correctly excludes `Updates #N` / `Related to #N`) — do **not** body-grep PRs for closing keywords (re-introduces the #3267 bug). Per-issue the linked-PR count is 0 or 1 in practice, so the secondary `gh pr view` is one extra call per surviving candidate, not N×M.
+
+2. **Read the issue body before briefing any builder.** This is a non-negotiable rule from prior sweep sessions (a misleading title hid the real requirement in the body). Skipped only if pre-flight already routed the issue to Judge/Merge via the existing-PR rules above — those branches use the PR as the source of truth, not the issue body.
    ```bash
    gh issue view N --json title,body
    ```
 
-> **Pre-flight skip rule.** If `K` of the wave's `N` candidates are skipped at pre-flight, dispatch only `N - K` builders for this wave. **Do not pull a candidate forward** from the next wave to backfill. Wave boundaries stay clean, and the next wave runs at its originally planned size.
+> **Pre-flight skip rule.** If `K` of the wave's `N` candidates are skipped at pre-flight (closed, `loom:building`, `loom:blocked`, or multi-PR ambiguity), dispatch only `N - K` builders for this wave. Issues routed to Judge or Merge via the existing-PR rules consume a wave slot but skip the Builder dispatch. **Do not pull a candidate forward** from the next wave to backfill. Wave boundaries stay clean, and the next wave runs at its originally planned size.
 
 ### 2. Curator phase (still per-issue, before the wave dispatch)
 
@@ -347,8 +364,11 @@ When the entire list has been processed, print a summary table that includes wav
   #125  → skipped (already in flight: loom:building)                     [wave 1]
   #126  → blocked (builder failed: build error)                          [wave 2]
   #127  → merged  (PR #459)                                              [wave 2]
+  #199  → routed  (existing PR #200, judged in this wave)                [wave 2]
+  #198  → merged  (existing PR #201, was loom:pr)                        [wave 2]
+  #197  → skipped (multiple open PRs reference issue: #210, #211)        [wave 2]
 
-Total: 2 merged, 2 blocked, 1 skipped.
+Total: 4 merged, 2 blocked, 2 skipped.
 ```
 
 Wave annotation makes it easier to triage failures (e.g., "every issue in wave 2 failed → probably a base-branch problem, not the issues themselves").
@@ -397,7 +417,7 @@ fi
 
 Do not auto-stop the daemon. Do not block on this warning — proceed with the sweep.
 
-Per-issue, the pre-flight check (step 1) already detects `loom:building` and skips, which is the natural defense against races: if the daemon claimed an issue first, `/sweep` will see `loom:building` and skip.
+Per-issue, the pre-flight check (step 1) already detects `loom:building` and skips, which is the natural defense against races: if the daemon claimed an issue first, `/sweep` will see `loom:building` and skip. The existing-PR probe (#3359) is the complementary defense for the case where a human or prior shepherd opened a PR but the `loom:building` label was never set or has since been removed — sweep will route the existing PR to Judge/Merge rather than spawn a duplicate Builder.
 
 ## Constraints
 
@@ -419,6 +439,7 @@ The full `/sweep` design in #3298 includes many features that are intentionally 
 | Parallel waves (`--builders-per-wave N`) | **Implemented (#3316)** | Soft cap at N=3 (warns above). One level deep — no `/shepherd` subagent. |
 | Natural-language selectors (label/author/title/time-window filters via NL description) | **Implemented (#3318)** | Mode B in Arguments. Out-of-band queries (body/diff inspection, file-touch filters) still trigger clarification. |
 | `--dry-run` | **Implemented (#3319)** | Prints the candidate plan (with wave grouping) and exits without mutating labels, worktrees, or PRs. |
+| Existing-PR detection in pre-flight | **Implemented (#3359)** | Pre-flight probes `closedByPullRequestsReferences`; routes existing open linked PRs to Judge (or Merge if already `loom:pr`) instead of dispatching a duplicate Builder. Multi-PR ambiguity skips with a log. |
 | `--max-waves` cap | Deferred | Operator-level brake on long sweeps. |
 | `--paused-merge` / `--no-judge` | Deferred | Merge-mode variants for trusted batches. |
 | `--include-blocked` (unblock pass) | Deferred | Currently `/sweep` skips `loom:blocked` issues outright. |
