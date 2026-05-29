@@ -392,48 +392,63 @@ fi
 # Cleanup worktree if requested.
 #
 # Ownership model (see issue #3334): Loom owns worktrees it created under
-# .loom/worktrees/ (marked with a .loom-managed sentinel file by worktree.sh).
-# Any worktree lacking the sentinel is treated as user-owned and is never
-# removed by this script. Operators can also set LOOM_PRESERVE_WORKTREE=1 to
-# skip cleanup unconditionally.
+# .loom/worktrees/ (marked with a .loom-managed sentinel file by worktree.sh
+# or pr-worktree.sh). Any worktree lacking the sentinel is treated as
+# user-owned and is never removed by this script. Operators can also set
+# LOOM_PRESERVE_WORKTREE=1 to skip cleanup unconditionally.
+#
+# Two worktree-path conventions are recognized:
+#   - .loom/worktrees/issue-<N>/  (Loom-issue branches: feature/issue-<N>)
+#   - .loom/worktrees/pr-<N>/     (external-fork / ad-hoc branches; #3358)
+#
+# Branch-to-issue regex is the strict `^feature/issue-([0-9]+)$` pattern so
+# branches like `release-1` or `fix-bug-42` correctly classify as PR-style
+# (not issue-style) and clean up the right worktree.
+_remove_loom_worktree() {
+  local worktree_path="$1"
+  if [[ ! -d "$worktree_path" ]]; then
+    info "No worktree found at $worktree_path"
+    return 0
+  fi
+  if [[ ! -f "$worktree_path/.loom-managed" ]]; then
+    warning "Worktree at $worktree_path lacks .loom-managed sentinel — refusing to remove (user-owned)"
+    return 0
+  fi
+  # If our shell is inside the worktree we're removing, hop out first.
+  local current_dir worktree_real in_worktree=false
+  current_dir="$(pwd -P 2>/dev/null || pwd)"
+  worktree_real="$(cd "$worktree_path" 2>/dev/null && pwd -P || echo "$worktree_path")"
+  if [[ "$current_dir" == "$worktree_real"* ]]; then
+    in_worktree=true
+    cd "$REPO_ROOT"
+  fi
+  info "Removing worktree: $worktree_path"
+  if git -C "$REPO_ROOT" worktree remove "$worktree_path" --force 2>/dev/null; then
+    success "Worktree removed"
+    if [[ "$in_worktree" == "true" ]]; then
+      echo ""
+      warning "Your shell's working directory was inside the removed worktree."
+      warning "Run this command to fix:"
+      echo "  cd $REPO_ROOT"
+    fi
+  else
+    warning "Could not remove worktree at $worktree_path"
+  fi
+}
+
 if [[ "$CLEANUP_WORKTREE" == "true" ]]; then
   if [[ "${LOOM_PRESERVE_WORKTREE:-0}" == "1" ]]; then
     info "Worktree cleanup skipped (LOOM_PRESERVE_WORKTREE=1)"
   else
-    # Extract issue number from branch name (feature/issue-N pattern)
-    ISSUE_NUM=$(echo "$PR_BRANCH" | grep -oE '[0-9]+$' || true)
-    if [[ -n "$ISSUE_NUM" ]]; then
-      WORKTREE_PATH="$REPO_ROOT/.loom/worktrees/issue-$ISSUE_NUM"
-      if [[ -d "$WORKTREE_PATH" ]]; then
-        if [[ ! -f "$WORKTREE_PATH/.loom-managed" ]]; then
-          warning "Worktree at $WORKTREE_PATH lacks .loom-managed sentinel — refusing to remove (user-owned)"
-        else
-          # Check if we're currently inside the worktree being removed
-          CURRENT_DIR="$(pwd -P 2>/dev/null || pwd)"
-          WORKTREE_REAL="$(cd "$WORKTREE_PATH" 2>/dev/null && pwd -P || echo "$WORKTREE_PATH")"
-          IN_WORKTREE=false
-          if [[ "$CURRENT_DIR" == "$WORKTREE_REAL"* ]]; then
-            IN_WORKTREE=true
-            cd "$REPO_ROOT"
-          fi
-          info "Removing worktree: $WORKTREE_PATH"
-          if git -C "$REPO_ROOT" worktree remove "$WORKTREE_PATH" --force 2>/dev/null; then
-            success "Worktree removed"
-            if [[ "$IN_WORKTREE" == "true" ]]; then
-              echo ""
-              warning "Your shell's working directory was inside the removed worktree."
-              warning "Run this command to fix:"
-              echo "  cd $REPO_ROOT"
-            fi
-          else
-            warning "Could not remove worktree at $WORKTREE_PATH"
-          fi
-        fi
-      else
-        info "No worktree found at $WORKTREE_PATH"
-      fi
+    # Strict pattern: only `feature/issue-<N>` matches. Trailing-number
+    # heuristics would misclassify branches like `release-1`.
+    if [[ "$PR_BRANCH" =~ ^feature/issue-([0-9]+)$ ]]; then
+      ISSUE_NUM="${BASH_REMATCH[1]}"
+      _remove_loom_worktree "$REPO_ROOT/.loom/worktrees/issue-$ISSUE_NUM"
     else
-      warning "Could not determine issue number from branch '$PR_BRANCH' for worktree cleanup"
+      # External-fork / ad-hoc branch — the doctor would have used a
+      # `pr-<PR_NUMBER>` worktree if any.
+      _remove_loom_worktree "$REPO_ROOT/.loom/worktrees/pr-$PR_NUMBER"
     fi
   fi
 fi
