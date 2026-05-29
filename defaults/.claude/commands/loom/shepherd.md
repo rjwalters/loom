@@ -87,10 +87,10 @@ If found, skip to Step 5 (monitor the existing shepherd using its `task_id`).
 
 ### Step 3: Verify Issue is Open
 
-Before writing the spawn signal, check that the issue is still open:
+Before writing the spawn signal, check that the issue is still open and not flagged operator-only:
 
 ```bash
-gh issue view <N> --json state --jq '.state'
+gh issue view <N> --json state,labels --jq '{state: .state, labels: [.labels[].name]}'
 ```
 
 **If the issue is CLOSED**, display this message and EXIT:
@@ -106,7 +106,22 @@ To proceed, reopen the issue first:
 Then run /shepherd <N> again.
 ```
 
-**If the issue is OPEN**, proceed to Step 4.
+**If the issue has `loom:operator-only`**, display this message and EXIT (regardless of `--merge`):
+
+```
+Issue #<N> is labeled loom:operator-only.
+
+This issue requires human action outside the automation (credentials,
+infrastructure rotations, manual deploys, hardware access). A shepherd
+cannot make progress on it. If you believe the label is incorrect,
+remove it first:
+
+  gh issue edit <N> --remove-label "loom:operator-only"
+
+Then run /shepherd <N> again.
+```
+
+**If the issue is OPEN and not operator-only**, proceed to Step 4.
 
 ### Step 4: Write Spawn Signal
 
