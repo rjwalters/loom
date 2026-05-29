@@ -93,6 +93,10 @@
   description: Signal to abort shepherd for this issue (returns to loom:issue)
   color: "F97316"  # orange-500 - warning/signal color
 
+- name: loom:operator-only
+  description: "Issue requires human action outside the automation (credentials, infra rotations, manual deploys, hardware access). Sweep/shepherd skip in pre-flight; curator may still enrich. Applied by: humans or any agent that recognizes the constraint."
+  color: "F97316"  # orange-500 - operator-action signal (matches loom:abort)
+
 # Epic Labels
 - name: loom:epic
   description: Multi-phase epic proposal (decomposes into implementation issues)

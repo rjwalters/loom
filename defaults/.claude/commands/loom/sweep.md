@@ -247,6 +247,7 @@ For each issue `N` in the wave, before any role skill is invoked:
    - If the issue is closed, skip it (log a warning). It does NOT contribute to this wave.
    - If the issue already has `loom:building`, skip it — another shepherd or builder is working on it. Log a warning. Does NOT contribute to this wave.
    - If the issue has `loom:blocked`, skip it. Log a warning. Does NOT contribute to this wave.
+   - If the issue has `loom:operator-only`, skip it — requires human action outside automation (credentials, infra rotations, manual deploys, hardware access). Log a warning with reason "operator-only". Does NOT contribute to this wave. **Checked before the existing-PR probe** so operator-only issues aren't probed at all.
    - **Existing-PR probe (#3359).** If `linked_prs` is non-empty, probe each linked PR for its state and labels:
      ```bash
      gh pr view <pr_url> --json state,labels --jq '{state, labels: [.labels[].name]}'
@@ -267,7 +268,7 @@ For each issue `N` in the wave, before any role skill is invoked:
    gh issue view N --json title,body
    ```
 
-> **Pre-flight skip rule.** If `K` of the wave's `N` candidates are skipped at pre-flight (closed, `loom:building`, `loom:blocked`, or multi-PR ambiguity), dispatch only `N - K` builders for this wave. Issues routed to Judge or Merge via the existing-PR rules consume a wave slot but skip the Builder dispatch. **Do not pull a candidate forward** from the next wave to backfill. Wave boundaries stay clean, and the next wave runs at its originally planned size.
+> **Pre-flight skip rule.** If `K` of the wave's `N` candidates are skipped at pre-flight (closed, `loom:building`, `loom:blocked`, `loom:operator-only`, or multi-PR ambiguity), dispatch only `N - K` builders for this wave. Issues routed to Judge or Merge via the existing-PR rules consume a wave slot but skip the Builder dispatch. **Do not pull a candidate forward** from the next wave to backfill. Wave boundaries stay clean, and the next wave runs at its originally planned size.
 
 ### 2. Curator phase (still per-issue, before the wave dispatch)
 
@@ -428,7 +429,7 @@ Per-issue, the pre-flight check (step 1) already detects `loom:building` and ski
 - **No `gh pr merge`.** Always use `./.loom/scripts/merge-pr.sh`.
 - **No daemon-state writes.** Read-only access to `daemon-state.json` for situational awareness.
 - **Read the issue body** (`gh issue view N --json body`) before briefing the builder. Don't rely on the title.
-- **Skip operator-only issues** (issues that require human action, such as releases or credential changes). Log and move on.
+- **Skip operator-only issues** (issues labeled `loom:operator-only` — see Wave Lifecycle step 1). Log and move on.
 
 ## Limitations (Deferred for Follow-up Issues)
 
@@ -440,6 +441,7 @@ The full `/sweep` design in #3298 includes many features that are intentionally 
 | Natural-language selectors (label/author/title/time-window filters via NL description) | **Implemented (#3318)** | Mode B in Arguments. Out-of-band queries (body/diff inspection, file-touch filters) still trigger clarification. |
 | `--dry-run` | **Implemented (#3319)** | Prints the candidate plan (with wave grouping) and exits without mutating labels, worktrees, or PRs. |
 | Existing-PR detection in pre-flight | **Implemented (#3359)** | Pre-flight probes `closedByPullRequestsReferences`; routes existing open linked PRs to Judge (or Merge if already `loom:pr`) instead of dispatching a duplicate Builder. Multi-PR ambiguity skips with a log. |
+| `loom:operator-only` enforcement | **Implemented (#3360)** | Pre-flight skips issues with `loom:operator-only` (human action required: credentials, infra, hardware). Champion `--merge` mode also refuses to auto-promote them. |
 | `--max-waves` cap | Deferred | Operator-level brake on long sweeps. |
 | `--paused-merge` / `--no-judge` | Deferred | Merge-mode variants for trusted batches. |
 | `--include-blocked` (unblock pass) | Deferred | Currently `/sweep` skips `loom:blocked` issues outright. |

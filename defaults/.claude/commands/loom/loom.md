@@ -554,6 +554,7 @@ loom-clean --deep       # Also remove build artifacts
 | `loom:issue` | Approved and ready for work | Champion/Human |
 | `loom:building` | Builder is implementing | Builder |
 | `loom:blocked` | Work is blocked | Builder |
+| `loom:operator-only` | Requires human action; sweep/shepherd skip | Human |
 | `loom:urgent` | Critical priority | Guide/Human |
 
 **Workflow labels (PR lifecycle):**
