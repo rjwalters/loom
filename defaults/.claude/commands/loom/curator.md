@@ -145,6 +145,13 @@ gh issue list --label="loom:issue" --state=open --json number,title,labels,updat
   "#\(.number) (updated \(.updatedAt)): \(.title)"'
 ```
 
+### Multi-phase sweep dependency check
+
+> **Multi-phase sweep dependency check.** If the issue you're curating is part of an epic/phase chain (`loom:epic-phase` label, or body references a sibling phase that may have just merged):
+> 1. Run `git fetch origin main` before reading any file.
+> 2. Read dependency files from `origin/main` directly (`git show origin/main:path/to/file`) rather than the local checkout, which may pre-date sibling merges in the same /sweep session.
+> 3. If your verification finds that "Phase N didn't deliver X", explicitly check whether X is on `origin/main` before filing it as a blocker.
+
 ### Priority 2: Unlabeled Issues (Fallback)
 
 If no Priority 1 issues exist, find unlabeled issues:
@@ -300,6 +307,10 @@ The Builder's complexity-assessment path (`defaults/.claude/commands/loom/builde
 - Document implementation options and trade-offs
 - Add planning details (architecture, dependencies, risks)
 - Assess and add `loom:urgent` label if issue is time-sensitive or critical
+
+### Verify enumerations
+
+> **Verify enumerations.** If the issue body lists specific callers, files, sites, or line numbers, treat the enumeration as a *starting point*, not authoritative. Run a comprehensive `git ls-files <pattern> | xargs grep -nE '<pattern>'` to verify completeness. Report any additions in your curator comment so the builder gets the correct scope.
 
 ### Process-Improvement Issues
 
