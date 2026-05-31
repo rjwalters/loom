@@ -11,6 +11,11 @@
 # Options:
 #   --no-cleanup-worktree  Skip local worktree cleanup after merge
 #   --cleanup-worktree     (no-op, worktree cleanup is now the default)
+#   --worktree-path <dir>  Explicit worktree path to clean up (bypasses
+#                          .loom-managed sentinel guard — caller asserts
+#                          responsibility). Also deletes the matching local
+#                          branch via `git branch -d` (refuses on unmerged
+#                          commits — Git's own safety check).
 #   --dry-run              Show what would happen without merging
 #   --auto                 Enable auto-merge instead of immediate merge
 #
@@ -22,6 +27,13 @@
 # .loom-managed sentinel written by worktree.sh). Worktrees lacking the
 # sentinel are treated as user-owned and never removed. Set
 # LOOM_PRESERVE_WORKTREE=1 to disable cleanup unconditionally for a session.
+#
+# Override: pass --worktree-path <dir> to opt into removing a non-Loom
+# worktree (the sentinel guard is bypassed only when this flag is supplied).
+# Discovery: if neither the default issue-N nor pr-N worktree exists, the
+# script walks `git worktree list --porcelain` looking for a worktree whose
+# branch matches the merged PR's head branch. It emits a hint (not an
+# auto-remove) so the operator can re-run with --worktree-path.
 #
 # Exit codes:
 #   0 = merged (or auto-merge enabled)
@@ -57,6 +69,12 @@ Supports both GitHub and Gitea forges. Forge detection is automatic
 Options:
   --no-cleanup-worktree  Skip local worktree cleanup after merge
   --cleanup-worktree     (no-op, worktree cleanup is now the default)
+  --worktree-path <dir>  Explicit worktree path to clean up. Bypasses the
+                         .loom-managed sentinel guard (caller asserts
+                         responsibility — this is the documented opt-in
+                         for removing non-Loom worktrees). Also deletes
+                         the matching local branch via 'git branch -d'
+                         (Git refuses on unmerged commits).
   --dry-run              Show what would happen without merging
   --auto                 Enable auto-merge instead of immediate merge
   -h, --help             Show this help and exit
@@ -68,8 +86,27 @@ have their CWD inside the worktree).
 Cleanup is restricted to Loom-managed worktrees (those under
 .loom/worktrees/issue-N that contain a .loom-managed sentinel file written
 by worktree.sh). User-provisioned worktrees at other paths are never
-removed. Set LOOM_PRESERVE_WORKTREE=1 to disable cleanup unconditionally
-for a session.
+removed by the default code path. Set LOOM_PRESERVE_WORKTREE=1 to disable
+cleanup unconditionally for a session.
+
+When --worktree-path <dir> is passed explicitly, the operator is taking
+responsibility for the cleanup decision: the sentinel guard is bypassed
+for that one path. The path is validated against 'git worktree list'
+and rejected if it is not a worktree of this repository.
+
+Discovery fallback: if neither .loom/worktrees/issue-N/ nor
+.loom/worktrees/pr-<PR_NUMBER>/ exists, the script walks
+'git worktree list --porcelain' looking for a worktree whose branch
+matches the merged PR head branch. It NEVER auto-removes a discovered
+user-owned worktree; it only logs the path and suggests re-running with
+--worktree-path <found-path>.
+
+Precedence (highest wins):
+  1. LOOM_PRESERVE_WORKTREE=1     (always skip cleanup)
+  2. --no-cleanup-worktree        (always skip cleanup; warns if combined
+                                  with --worktree-path)
+  3. --worktree-path <dir>        (explicit path; bypasses sentinel)
+  4. default: .loom/worktrees/issue-N or pr-N + sentinel guard
 
 Exit codes:
   0 = merged (or auto-merge enabled, or --help)
@@ -87,6 +124,10 @@ Examples:
 
   ./.loom/scripts/merge-pr.sh 123 --no-cleanup-worktree
     Merges PR but leaves the local worktree in place
+
+  ./.loom/scripts/merge-pr.sh 123 --worktree-path ../adhoc-wt
+    Merges PR #123 and removes the worktree at ../adhoc-wt plus its
+    matching local branch (bypasses the .loom-managed sentinel guard).
 EOF
 }
 
@@ -148,11 +189,22 @@ PR_NUMBER=""
 CLEANUP_WORKTREE=true
 DRY_RUN=false
 AUTO_MERGE=false
+WORKTREE_PATH_OVERRIDE=""
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --cleanup-worktree) shift ;;  # no-op, cleanup is now the default
     --no-cleanup-worktree) CLEANUP_WORKTREE=false; shift ;;
+    --worktree-path)
+      [[ $# -lt 2 ]] && error "--worktree-path requires a value"
+      WORKTREE_PATH_OVERRIDE="$2"
+      shift 2
+      ;;
+    --worktree-path=*)
+      WORKTREE_PATH_OVERRIDE="${1#--worktree-path=}"
+      [[ -z "$WORKTREE_PATH_OVERRIDE" ]] && error "--worktree-path= requires a value"
+      shift
+      ;;
     --dry-run) DRY_RUN=true; shift ;;
     --auto) AUTO_MERGE=true; shift ;;
     -*)  error "Unknown option: $1" ;;
@@ -167,8 +219,34 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-[[ -z "$PR_NUMBER" ]] && error "Usage: merge-pr.sh <pr-number> [--no-cleanup-worktree] [--dry-run] [--auto]"
+[[ -z "$PR_NUMBER" ]] && error "Usage: merge-pr.sh <pr-number> [--no-cleanup-worktree] [--worktree-path <dir>] [--dry-run] [--auto]"
 [[ "$PR_NUMBER" =~ ^[0-9]+$ ]] || error "PR number must be numeric: $PR_NUMBER"
+
+# Validate --worktree-path early (before any network calls) so bad input
+# fails fast. The path must be a real directory and must appear in the
+# repository's worktree list. We resolve to an absolute path via cd so
+# downstream comparisons against the porcelain output work cleanly.
+if [[ -n "$WORKTREE_PATH_OVERRIDE" ]]; then
+  if [[ ! -d "$WORKTREE_PATH_OVERRIDE" ]]; then
+    error "--worktree-path does not exist or is not a directory: $WORKTREE_PATH_OVERRIDE"
+  fi
+  _WT_ABS="$(cd "$WORKTREE_PATH_OVERRIDE" 2>/dev/null && pwd -P)" || \
+    error "--worktree-path could not be resolved: $WORKTREE_PATH_OVERRIDE"
+  # Verify the path is actually a worktree of this repo. `git worktree list`
+  # prints absolute paths in column 1; awk on $1 is robust to trailing
+  # metadata columns. We compare against the resolved absolute path.
+  if ! git -C "$REPO_ROOT" worktree list --porcelain 2>/dev/null | \
+       awk -v p="$_WT_ABS" '/^worktree / { if ($2 == p) { found=1; exit } } END { exit !found }'; then
+    error "--worktree-path is not a registered worktree of this repository: $WORKTREE_PATH_OVERRIDE (resolved: $_WT_ABS)"
+  fi
+  WORKTREE_PATH_OVERRIDE="$_WT_ABS"
+  unset _WT_ABS
+
+  # Warn if combined with --no-cleanup-worktree (no-op wins).
+  if [[ "$CLEANUP_WORKTREE" == "false" ]]; then
+    warning "--worktree-path was supplied but --no-cleanup-worktree wins; no cleanup will occur"
+  fi
+fi
 
 # Fetch PR state
 PR_JSON=$(forge_get_pr "$REPO_NWO" "$PR_NUMBER" "$GH") || \
@@ -404,15 +482,80 @@ fi
 # Branch-to-issue regex is the strict `^feature/issue-([0-9]+)$` pattern so
 # branches like `release-1` or `fix-bug-42` correctly classify as PR-style
 # (not issue-style) and clean up the right worktree.
+# Look up the branch attached to a worktree via porcelain. Prints the branch
+# short-name (without refs/heads/ prefix) on stdout. Returns 0 with empty
+# output for detached / bare worktrees (no branch line in the stanza).
+_worktree_branch_for() {
+  local target="$1" target_abs
+  target_abs="$(cd "$target" 2>/dev/null && pwd -P)" || target_abs="$target"
+  git -C "$REPO_ROOT" worktree list --porcelain 2>/dev/null | \
+    awk -v p="$target_abs" '
+      /^worktree / { wt=$2; br=""; next }
+      /^branch /   { br=$2 }
+      /^$/         { if (wt == p && br != "") { sub(/^refs\/heads\//, "", br); print br; exit } }
+      END          { if (wt == p && br != "") { sub(/^refs\/heads\//, "", br); print br } }
+    '
+}
+
+# Walk porcelain output for a worktree whose branch matches the given branch
+# short-name. Prints the worktree absolute path or nothing. Skips detached /
+# bare entries (they have no `branch refs/heads/...` line).
+_find_worktree_by_branch() {
+  local want_branch="$1"
+  git -C "$REPO_ROOT" worktree list --porcelain 2>/dev/null | \
+    awk -v want="refs/heads/${want_branch}" '
+      /^worktree / { wt=$2; br=""; next }
+      /^branch /   { br=$2 }
+      /^$/         { if (br == want) { print wt; exit } }
+      END          { if (br == want) { print wt } }
+    '
+}
+
+# Delete the matching local branch. Uses `git branch -d` (not -D) so unmerged
+# commits abort the delete — that's the right safety net. Never fails the
+# cleanup pipeline; warns on errors.
+_maybe_delete_local_branch() {
+  local branch="$1"
+  if [[ -z "$branch" ]]; then
+    return 0
+  fi
+  if ! git -C "$REPO_ROOT" show-ref --verify --quiet "refs/heads/$branch"; then
+    info "Local branch '$branch' does not exist — skipping branch delete"
+    return 0
+  fi
+  if git -C "$REPO_ROOT" branch -d "$branch" 2>/dev/null; then
+    success "Local branch '$branch' deleted"
+  else
+    warning "Could not delete local branch '$branch' (may have unmerged commits — use 'git branch -D' if intentional)"
+  fi
+}
+
+# _remove_loom_worktree <path> [allow_unmanaged]
+#
+# When allow_unmanaged is "true" (only set by the --worktree-path code path),
+# the .loom-managed sentinel check is skipped — the caller has taken explicit
+# responsibility for the cleanup decision. The default (no second arg, or
+# "false") preserves the original sentinel guard.
 _remove_loom_worktree() {
   local worktree_path="$1"
+  local allow_unmanaged="${2:-false}"
   if [[ ! -d "$worktree_path" ]]; then
     info "No worktree found at $worktree_path"
     return 0
   fi
-  if [[ ! -f "$worktree_path/.loom-managed" ]]; then
+  if [[ "$allow_unmanaged" != "true" ]] && [[ ! -f "$worktree_path/.loom-managed" ]]; then
     warning "Worktree at $worktree_path lacks .loom-managed sentinel — refusing to remove (user-owned)"
     return 0
+  fi
+  if [[ "$allow_unmanaged" == "true" ]] && [[ ! -f "$worktree_path/.loom-managed" ]]; then
+    info "Bypassing sentinel guard (--worktree-path explicit opt-in for $worktree_path)"
+  fi
+  # Record the attached branch BEFORE removing the worktree (the porcelain
+  # entry vanishes once the worktree is gone). Only relevant when allow_unmanaged
+  # — the default issue/pr path already has the branch encoded in PR_BRANCH.
+  local attached_branch=""
+  if [[ "$allow_unmanaged" == "true" ]]; then
+    attached_branch="$(_worktree_branch_for "$worktree_path")"
   fi
   # If our shell is inside the worktree we're removing, hop out first.
   local current_dir worktree_real in_worktree=false
@@ -431,6 +574,12 @@ _remove_loom_worktree() {
       warning "Run this command to fix:"
       echo "  cd $REPO_ROOT"
     fi
+    # For the explicit-override path, also tidy up the attached local branch.
+    # We defer this to AFTER `git worktree remove` succeeds so the worktree's
+    # checkout lock is released first.
+    if [[ "$allow_unmanaged" == "true" ]] && [[ -n "$attached_branch" ]]; then
+      _maybe_delete_local_branch "$attached_branch"
+    fi
   else
     warning "Could not remove worktree at $worktree_path"
   fi
@@ -439,16 +588,49 @@ _remove_loom_worktree() {
 if [[ "$CLEANUP_WORKTREE" == "true" ]]; then
   if [[ "${LOOM_PRESERVE_WORKTREE:-0}" == "1" ]]; then
     info "Worktree cleanup skipped (LOOM_PRESERVE_WORKTREE=1)"
+  elif [[ -n "$WORKTREE_PATH_OVERRIDE" ]]; then
+    # Explicit operator opt-in: bypass the sentinel guard for THIS path only.
+    # The path was already validated at parse time (exists + is a registered
+    # worktree of this repo). _remove_loom_worktree will also delete the
+    # matching local branch via `git branch -d` (refuses on unmerged commits).
+    info "Cleanup target overridden by --worktree-path: $WORKTREE_PATH_OVERRIDE"
+    _remove_loom_worktree "$WORKTREE_PATH_OVERRIDE" "true"
   else
     # Strict pattern: only `feature/issue-<N>` matches. Trailing-number
     # heuristics would misclassify branches like `release-1`.
+    DEFAULT_WT_PATH=""
     if [[ "$PR_BRANCH" =~ ^feature/issue-([0-9]+)$ ]]; then
       ISSUE_NUM="${BASH_REMATCH[1]}"
-      _remove_loom_worktree "$REPO_ROOT/.loom/worktrees/issue-$ISSUE_NUM"
+      DEFAULT_WT_PATH="$REPO_ROOT/.loom/worktrees/issue-$ISSUE_NUM"
     else
       # External-fork / ad-hoc branch — the doctor would have used a
       # `pr-<PR_NUMBER>` worktree if any.
-      _remove_loom_worktree "$REPO_ROOT/.loom/worktrees/pr-$PR_NUMBER"
+      DEFAULT_WT_PATH="$REPO_ROOT/.loom/worktrees/pr-$PR_NUMBER"
+    fi
+    if [[ -d "$DEFAULT_WT_PATH" ]]; then
+      _remove_loom_worktree "$DEFAULT_WT_PATH"
+    else
+      # Discovery fallback (warn-only): the Loom-convention path is missing,
+      # so walk porcelain looking for any worktree tracking $PR_BRANCH. We
+      # never auto-remove a discovered worktree — that would violate the
+      # ownership model from #3334. Instead we surface the path so the
+      # operator can re-run with --worktree-path.
+      DISCOVERED_WT="$(_find_worktree_by_branch "$PR_BRANCH")"
+      if [[ -n "$DISCOVERED_WT" ]]; then
+        if [[ -f "$DISCOVERED_WT/.loom-managed" ]]; then
+          # Rare case: Loom-managed worktree at a non-standard path. The
+          # sentinel says it's safe to remove, so do so.
+          info "Discovered Loom-managed worktree at non-standard path: $DISCOVERED_WT"
+          _remove_loom_worktree "$DISCOVERED_WT"
+        else
+          warning "Discovered worktree for branch '$PR_BRANCH' at: $DISCOVERED_WT"
+          warning "Worktree lacks .loom-managed sentinel — not removing (user-owned)."
+          warning "To clean it up, re-run with: --worktree-path '$DISCOVERED_WT'"
+          warning "Or manually: git worktree remove '$DISCOVERED_WT'"
+        fi
+      else
+        info "No worktree found at $DEFAULT_WT_PATH (and none tracking '$PR_BRANCH' in 'git worktree list')"
+      fi
     fi
   fi
 fi
