@@ -263,6 +263,33 @@ touch .loom/stop-daemon
 - Slightly higher latency per iteration (CLI startup)
 - No conversation context between iterations (by design - this is a feature for long-running operation)
 
+### 3. Spawn-Loop Mode (Phase 1, opt-in)
+
+A minimal alternative to the full daemon for multi-account `/loom:sweep` launching (#3374, Phase 1 of the shepherd/daemon deprecation epic #3372). Polls `loom:issue`, atomically claims ready issues (label flip + `mkdir`-based file lock under `.loom/locks/issue-<N>/`), and detaches `claude -p "/loom:sweep N"` per issue — each spawn picks its own OAuth token via `spawn-claude.sh`. No work generation, no support-role triggers, no shepherd-N pool-slot bookkeeping.
+
+```bash
+# Opt-in gate is required (protects existing daemon users from accidental dual-orchestration)
+LOOM_USE_SPAWN_LOOP=1 ./.loom/scripts/spawn-loop.sh start
+
+./.loom/scripts/spawn-loop.sh status
+./.loom/scripts/spawn-loop.sh stop          # or: touch .loom/stop-spawn-loop
+```
+
+| File | Purpose |
+|------|---------|
+| `.loom/spawn-loop.pid` | Loop PID (gitignored) |
+| `.loom/spawn-loop-state.json` | `{started_at, running:[{issue, pid, started_at, token}]}` (gitignored) |
+| `.loom/logs/spawn-loop.log` | Timestamped spawn/exit/error entries |
+| `.loom/logs/sweep-issue-<N>.log` | Per-issue child output |
+| `.loom/locks/issue-<N>/` | Atomic claim lock dir (gitignored) |
+| `.loom/stop-spawn-loop` | Touch to request graceful shutdown |
+
+**Crash recovery**: if a child dies while a `.loom/sweep-checkpoint/issue-<N>.json` exists, the loop flips the issue back to `loom:issue` so the next tick re-spawns; the sweep skill itself (#3373) reads the checkpoint on entry and skips already-completed phases.
+
+**Coexistence with `daemon.sh`**: if `.loom/daemon-loop.pid` is alive, the spawn loop warns at startup and proceeds. Both will race for `loom:issue` items; operators should pick one or the other in practice.
+
+**Tunables (env)**: `MAX_PARALLEL=3`, `POLL_INTERVAL=30`, `SHUTDOWN_GRACE_SEC=300`, `LOOM_REPO=owner/repo` (override remote auto-detection).
+
 ## Agent Roles
 
 Loom provides specialized roles for different development tasks. Each role follows specific guidelines and uses GitHub labels for coordination.
