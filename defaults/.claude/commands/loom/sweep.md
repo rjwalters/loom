@@ -357,7 +357,7 @@ Use the dedicated merge script (CLAUDE.md "Merging PRs" mandate — never `gh pr
 ./.loom/scripts/merge-pr.sh <PR_NUMBER> --auto
 ```
 
-The script merges via the forge API and cleans up the worktree.
+The script merges via the forge API and cleans up the worktree. `--auto` enables GitHub's server-side auto-merge queue (queues the merge until required checks pass); on PRs that are already in `CLEAN` state (fast CI), the script transparently falls back to an immediate merge — see #3371.
 
 ### 8. Wave settled → advance to next wave
 

@@ -333,6 +333,18 @@ if [[ "$AUTO_MERGE" == "true" ]]; then
       fi
     fi
 
+    # PR is already CLEAN — GitHub's enablePullRequestAutoMerge mutation rejects
+    # this state with "Pull request Pull request is in clean status" (the
+    # doubled-word prefix is from GitHub's GraphQL error formatter). Match on
+    # the unique substring to stay robust against future normalization. Fall
+    # through to the synchronous-merge path below instead of erroring. See #3371.
+    if echo "$AUTO_MERGE_OUTPUT" | grep -q "is in clean status"; then
+      info "PR #$PR_NUMBER is already CLEAN; falling back to immediate merge"
+      AUTO_MERGE=false      # let the synchronous-merge block at ~line 364 run
+      AUTO_MERGE_OK=true    # bypass the post-loop "after N attempts" guard
+      break
+    fi
+
     # Other auto-merge errors — fail immediately (no retry would help)
     error "Failed to enable auto-merge for PR #$PR_NUMBER: $AUTO_MERGE_OUTPUT"
   done
@@ -341,22 +353,27 @@ if [[ "$AUTO_MERGE" == "true" ]]; then
     error "Failed to enable auto-merge for PR #$PR_NUMBER after $MAX_MERGE_RETRIES attempts"
   fi
 
-  success "Auto-merge enabled for PR #$PR_NUMBER"
+  # If the CLEAN-status fall-through fired above, AUTO_MERGE has been flipped
+  # to false. Skip the "Auto-merge enabled" success message and the post-auto
+  # state poll — let the synchronous-merge block at ~line 376 take over.
+  if [[ "$AUTO_MERGE" == "true" ]]; then
+    success "Auto-merge enabled for PR #$PR_NUMBER"
 
-  # Check whether the server-side merge has already completed. GitHub
-  # auto-merge queues until checks pass, so on most PRs this is still
-  # false right after enabling. If merged, fall through to the shared
-  # cleanup block below. Otherwise skip cleanup — loom-clean will
-  # handle the stale worktree later.
-  POST_AUTO_JSON=$(forge_get_pr_nocache "$REPO_NWO" "$PR_NUMBER" "$GH" 2>/dev/null || echo '{}')
-  POST_AUTO_MERGED=$(echo "$POST_AUTO_JSON" | jq -r '.merged // false')
-  if [[ "$POST_AUTO_MERGED" != "true" ]]; then
-    info "Auto-merge queued (server-side merge pending checks); skipping local cleanup"
-    info "Run loom-clean later to remove the worktree once GitHub completes the merge"
-    exit 0
+    # Check whether the server-side merge has already completed. GitHub
+    # auto-merge queues until checks pass, so on most PRs this is still
+    # false right after enabling. If merged, fall through to the shared
+    # cleanup block below. Otherwise skip cleanup — loom-clean will
+    # handle the stale worktree later.
+    POST_AUTO_JSON=$(forge_get_pr_nocache "$REPO_NWO" "$PR_NUMBER" "$GH" 2>/dev/null || echo '{}')
+    POST_AUTO_MERGED=$(echo "$POST_AUTO_JSON" | jq -r '.merged // false')
+    if [[ "$POST_AUTO_MERGED" != "true" ]]; then
+      info "Auto-merge queued (server-side merge pending checks); skipping local cleanup"
+      info "Run loom-clean later to remove the worktree once GitHub completes the merge"
+      exit 0
+    fi
+    info "PR #$PR_NUMBER already merged server-side; running cleanup"
+    # Fall through to the shared cleanup block (branch deletion + worktree).
   fi
-  info "PR #$PR_NUMBER already merged server-side; running cleanup"
-  # Fall through to the shared cleanup block (branch deletion + worktree).
 fi
 
 # Synchronous-merge path. Skipped when --auto already succeeded server-side
