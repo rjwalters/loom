@@ -173,7 +173,7 @@ gh pr create --label "loom:review-requested"
 
 ```bash
 ./.loom/scripts/merge-pr.sh <PR_NUMBER>         # Standard merge with worktree cleanup
-./.loom/scripts/merge-pr.sh <PR_NUMBER> --auto   # Auto-confirm (for automation)
+./.loom/scripts/merge-pr.sh <PR_NUMBER> --auto   # Enable auto-merge instead of immediate merge (queues until checks pass; on CLEAN PRs falls back to immediate merge)
 ./.loom/scripts/merge-pr.sh <PR_NUMBER> --dry-run # Preview without merging
 ```
 
