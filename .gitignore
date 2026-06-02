@@ -67,6 +67,10 @@ Thumbs.db
 .loom/claude-config/
 .loom/tokens/
 .loom/sweep-checkpoint/
+.loom/spawn-loop.pid
+.loom/spawn-loop-state.json
+.loom/stop-spawn-loop
+.loom/locks/
 
 # Loom workspace config (DO commit for team sharing)
 # - config.json: Persistent terminal configurations (roles, themes, intervals)

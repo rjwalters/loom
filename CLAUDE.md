@@ -84,6 +84,18 @@ Use Claude Code terminals with specialized roles for hands-on development:
 
 **Graceful shutdown**: `./.loom/scripts/daemon.sh stop` (or `touch .loom/stop-daemon`)
 
+### 3. Spawn-Loop Mode (Phase 1, opt-in)
+
+A minimal alternative to the full daemon for multi-account `/loom:sweep` launching (#3374, Phase 1 of the shepherd/daemon deprecation epic #3372). Polls `loom:issue`, atomically claims ready issues, and detaches `claude -p "/loom:sweep N"` per issue — each spawn picks its own OAuth token via `spawn-claude.sh`. No work generation, no support-role triggers, no pool-slot bookkeeping.
+
+```bash
+LOOM_USE_SPAWN_LOOP=1 ./.loom/scripts/spawn-loop.sh start  # opt-in gate is required
+./.loom/scripts/spawn-loop.sh status
+./.loom/scripts/spawn-loop.sh stop                          # or: touch .loom/stop-spawn-loop
+```
+
+State lives in `.loom/spawn-loop-state.json`, logs in `.loom/logs/spawn-loop.log`, claim locks under `.loom/locks/issue-<N>/`. Crashed children whose checkpoints (#3373) survive are re-queued on the next tick. If `daemon-loop.pid` is alive, the loop warns and proceeds (both will compete for `loom:issue` items — pick one). Overrides: `MAX_PARALLEL=3`, `POLL_INTERVAL=30`, `SHUTDOWN_GRACE_SEC=300`.
+
 ## Agent Roles
 
 ### Orchestration Roles
