@@ -290,6 +290,26 @@ LOOM_USE_SPAWN_LOOP=1 ./.loom/scripts/spawn-loop.sh start
 
 **Tunables (env)**: `MAX_PARALLEL=3`, `POLL_INTERVAL=30`, `SHUTDOWN_GRACE_SEC=300`, `LOOM_REPO=owner/repo` (override remote auto-detection).
 
+### Scheduled Support Roles (Phase 2a, opt-in)
+
+GitHub Actions workflows under `.github/workflows/loom-*.yml` provide a daemon-free way to run the periodic support roles (Champion, Curator, Judge, Auditor, Guide) on cron schedules that match the daemon's historical intervals (Phase 2a of #3372, see #3375). Each workflow checks out the repo, installs the Claude CLI, and runs `claude -p "/<role>" --dangerously-skip-permissions` for one tick of work — no Loom-side state file, no long-running process.
+
+| Workflow | Role | Schedule (commented) |
+|----------|------|----------------------|
+| `loom-champion.yml` | `/champion` | `*/10 * * * *` |
+| `loom-curator.yml`  | `/curator`  | `*/5 * * * *`  |
+| `loom-judge.yml`    | `/judge`    | `*/5 * * * *`  |
+| `loom-auditor.yml`  | `/auditor`  | `*/10 * * * *` |
+| `loom-guide.yml`    | `/guide`    | `*/15 * * * *` |
+
+**Disabled by default.** Every shipped workflow has its `schedule:` block commented out so forks don't burn Actions minutes accidentally. To opt in on a fork:
+
+1. Add a `CLAUDE_API_KEY` repository secret (Settings -> Secrets and variables -> Actions). Workflows run on a single API key — token rotation is for per-task spawns only; scheduled support roles are predictable load that doesn't benefit from rotation.
+2. Uncomment the `schedule:` / `- cron:` lines in each `.github/workflows/loom-*.yml` you want to enable.
+3. Optionally trigger a run via `workflow_dispatch` (the Actions UI's "Run workflow" button) to smoke-test before the next scheduled tick.
+
+Architect and Hermit cadence (work-generation triggers) is intentionally out of scope here — see follow-up #3381 (Phase 2d). The schedule-driven model coexists with the daemon during Phase 2; Phase 3 removes the daemon brain entirely.
+
 ## Agent Roles
 
 Loom provides specialized roles for different development tasks. Each role follows specific guidelines and uses GitHub labels for coordination.
