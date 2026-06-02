@@ -38,7 +38,17 @@ Combine flags as needed. Always pass `--state open` explicitly (default) unless 
 
 **Mixed mode is supported.** `/sweep #3310 #3312 and any other loom:issue with 'docs' in the title` should be interpreted as the union of `{3310, 3312}` and the `gh issue list --label loom:issue --search "docs in:title"` result. Because the tokens contain non-numeric words, this falls into Mode B and the orchestrator handles the union.
 
-**Unknown-label guard.** Loom never invents labels (CLAUDE.md "Never create new GitHub labels"). If the description mentions a label not present in `.github/labels.yml` (e.g. `bug` in this repo), **do not** silently fabricate a `--label bug` filter — ask the user to clarify which existing label they meant, or supply explicit issue numbers.
+**Unknown-label guard.** Loom never invents labels (CLAUDE.md "Never create new GitHub labels" — that rule is about label *creation* via `gh label create`, which is separate from validating that a label the user already named actually exists on the repo). To validate label tokens in the user's description, query the **live repo label set** as the source of truth:
+
+```bash
+gh label list -R <repo> --limit 200 --json name --jq '.[].name'
+```
+
+Run this query **once at the start of Mode B label-token validation** and reuse the result for every subsequent token check within the same `/sweep` invocation (at most one `gh label list` call per invocation, regardless of how many label tokens appear in the description). Pass `--limit 200` explicitly (do not rely on `gh`'s default of 30, matching the explicit-limit convention used elsewhere in this skill for `gh issue list`). Scope the query to the repo currently being swept.
+
+If a label token in the description is not in the repo's actual label set, **do not** silently fabricate a `--label <name>` filter — ask the user to clarify which existing label they meant, or supply explicit issue numbers.
+
+**Offline fallback.** If `gh label list` fails (non-zero exit — network outage, auth failure, rate limit), fall back to consulting `.github/labels.yml` and log a warning to stderr (e.g., `warning: gh label list failed, falling back to .github/labels.yml (Loom-managed subset only)`). This keeps the skill functional in offline or restricted environments. Note that `.github/labels.yml` is only the Loom-managed subset, so the fallback may produce false "unknown-label" rejections for labels added via the GitHub UI, Dependabot, or other project conventions; this is the trade-off for offline operation.
 
 ### Edge cases (prose rules, applied in either mode but mostly relevant to Mode B)
 
@@ -137,7 +147,7 @@ The cap is **soft** — there is no hard upper bound. The warning is the only gu
 # Out-of-band query — gh issue list cannot inspect file paths in the diff
 /sweep issues labeled loom:issue except the ones touching loom-daemon
 
-# Unknown label — 'bug' is not in .github/labels.yml; ask which label was meant
+# Unknown label — 'bug' is not in the repo's label set (from `gh label list`); ask which label was meant
 /sweep all my agent-filed bugs that aren't blocked
 
 # Pure nonsense — no derivable candidate set
