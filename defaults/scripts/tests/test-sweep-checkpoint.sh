@@ -22,7 +22,7 @@ fi
 TMP_REPO="$(mktemp -d)"
 trap 'rm -rf "$TMP_REPO"' EXIT
 
-cd "$TMP_REPO"
+cd "$TMP_REPO" || exit 1
 git init -q .
 mkdir -p .loom/scripts
 # Use a script-relative copy so `repo_root` lands here, not in the real loom checkout.

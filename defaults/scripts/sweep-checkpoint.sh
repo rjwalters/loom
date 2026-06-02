@@ -23,8 +23,9 @@
 # this issue and the next sweep should skip it.
 #
 # On merge-done, callers should invoke `delete` to remove the checkpoint —
-# a closed issue with a stale checkpoint is detected by `is-stale` and also
-# cleaned up on the next sweep entry with a warning.
+# stale-checkpoint detection (closed issue + leftover checkpoint) is performed
+# inline by the sweep skill (see defaults/.claude/commands/loom/sweep.md), not
+# by this helper, and the next sweep entry will clean it up with a warning.
 #
 # Usage:
 #   sweep-checkpoint.sh write <issue> <phase> [--task-id ID] [--pr-number N]
