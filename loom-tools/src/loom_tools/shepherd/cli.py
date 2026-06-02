@@ -11,6 +11,7 @@ import time
 from pathlib import Path
 
 from loom_tools.common.config import env_int
+from loom_tools.common.deprecation import warn_deprecated
 from loom_tools.common.git import (
     attempt_rebase,
     get_uncommitted_files,
@@ -2666,6 +2667,19 @@ def _record_fallback_failure(ctx: ShepherdContext, exit_code: int) -> None:
 
 def main(argv: list[str] | None = None) -> int:
     """Main entry point for loom-shepherd CLI."""
+    # Soft-deprecation warning (issue #3376, epic #3372). Emitted to stderr
+    # before any other output. Suppressed by LOOM_SUPPRESS_DEPRECATION=1
+    # (the daemon may set this when spawning shepherds as subprocesses to
+    # avoid log spam; manual invocations always see the warning).
+    warn_deprecated(
+        "/shepherd (loom-shepherd CLI)",
+        replacement=(
+            "/loom:sweep <issue> for the same lifecycle, or "
+            "LOOM_USE_SPAWN_LOOP=1 + ./.loom/scripts/spawn-loop.sh "
+            "for multi-account batches"
+        ),
+    )
+
     # Route shepherd output through stdout to eliminate Bash tool duplication.
     # Claude Code's Bash tool captures output via two mechanisms: PTY (which
     # includes stderr) and explicit stderr capture.  Both are shown in the
