@@ -24,6 +24,9 @@ jobs:
   auditor:
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    permissions:
+      issues: write
+      pull-requests: write
     steps:
       - uses: actions/checkout@v4
       - name: Install Claude CLI
