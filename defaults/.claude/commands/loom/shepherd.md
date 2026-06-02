@@ -1,5 +1,21 @@
 # Shepherd
 
+## ⚠️ Deprecated
+
+**Before doing anything else, emit this notice to the user verbatim as the first line of your response:**
+
+> ⚠️  DEPRECATED: `/shepherd` is scheduled for removal in the next major release.
+>     Use `/loom:sweep <issue>` for the same lifecycle, or enable
+>     `LOOM_USE_SPAWN_LOOP=1` + `./.loom/scripts/spawn-loop.sh` for
+>     multi-account batches. See #3372.
+>     (Suppress this notice in shell entry points with `LOOM_SUPPRESS_DEPRECATION=1`;
+>     the markdown skill warning always renders — explicit operator awareness is
+>     the goal of the soft-deprecation window.)
+
+After printing the notice, continue with the lifecycle below. **No behavior change** — the skill still works during the deprecation window. This warning exists so operators have time to migrate to `/loom:sweep` and the spawn loop before Phase 3 deletes the shepherd brain (see epic #3372, this notice tracked in #3376).
+
+---
+
 Orchestrate a single issue through its full lifecycle as a **signal-writer and observer** — you coordinate the shepherd process through JSON signals and state observation. You NEVER spawn shepherd or worker processes directly via Bash.
 
 ## Arguments

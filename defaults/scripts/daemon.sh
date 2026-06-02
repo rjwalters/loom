@@ -61,6 +61,19 @@ PIDFILE="$REPO_ROOT/.loom/daemon-loop.pid"
 LOGFILE="$REPO_ROOT/.loom/daemon.log"
 STOP_SIGNAL="$REPO_ROOT/.loom/stop-daemon"
 
+# Source the soft-deprecation helper (issue #3376, epic #3372). Sourcing is
+# side-effect-free — only function definitions. We invoke warn_deprecated
+# from cmd_start so status/stop/restart introspection remains clean.
+# shellcheck source=lib/deprecation.sh
+if [[ -f "$SCRIPT_DIR/lib/deprecation.sh" ]]; then
+    # shellcheck disable=SC1091
+    source "$SCRIPT_DIR/lib/deprecation.sh"
+else
+    # Helper missing — define a stub so cmd_start does not fail. Older
+    # installs may not have the helper yet during the rollout window.
+    warn_deprecated() { :; }
+fi
+
 # ── Parse command ────────────────────────────────────────────────────────────
 COMMAND=""
 ARGS=()
@@ -203,6 +216,14 @@ cmd_stop() {
 
 # ── Command: start ───────────────────────────────────────────────────────────
 cmd_start() {
+    # Soft-deprecation warning (issue #3376, epic #3372). Suppressed by
+    # LOOM_SUPPRESS_DEPRECATION=1. The Python loom-daemon emits its own
+    # warning on startup; this one fires earlier so the message is visible
+    # even when the daemon fails before reaching its Python entry point.
+    warn_deprecated \
+        "loom-daemon (./.loom/scripts/daemon.sh start)" \
+        "./.loom/scripts/spawn-loop.sh (Phase 1, #3374) + GitHub Actions schedules (Phase 2a, #3375)"
+
     local pid
     if pid=$(daemon_pid); then
         echo "Daemon already running (PID $pid)"

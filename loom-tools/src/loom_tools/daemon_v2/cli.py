@@ -7,6 +7,7 @@ import os
 import sys
 from typing import Sequence
 
+from loom_tools.common.deprecation import warn_deprecated
 from loom_tools.common.logging import log_error, log_info, log_success
 from loom_tools.common.repo import find_repo_root
 from loom_tools.common.state import read_json_file
@@ -233,6 +234,19 @@ Examples:
         fresh=args.fresh,
         debug_mode=args.debug,
         timeout_min=args.timeout_min,
+    )
+
+    # Emit soft-deprecation warning before entering the run loop.
+    # Issue #3376, epic #3372: the daemon is scheduled for removal in the
+    # next major release. Warning is suppressible via LOOM_SUPPRESS_DEPRECATION=1.
+    # Skipped for --status / --health (already returned above) to keep
+    # introspection output clean.
+    warn_deprecated(
+        "loom-daemon",
+        replacement=(
+            "./.loom/scripts/spawn-loop.sh (Phase 1, #3374) "
+            "+ GitHub Actions schedules (Phase 2a, #3375)"
+        ),
     )
 
     # Create context and run

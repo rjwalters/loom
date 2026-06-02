@@ -1784,6 +1784,34 @@ Or run the setup script to generate `.mcp.json` automatically:
 ./scripts/setup-mcp.sh
 ```
 
+## Migration: deprecations announced for the next major release
+
+Loom is in the middle of an orchestration-architecture migration (epic #3372). The shepherd brain (`loom-tools/src/loom_tools/shepherd/`), the daemon brain (`loom-tools/src/loom_tools/daemon_v2/`), and the `/shepherd` slash command will be **deleted in the next major release** in favour of a minimal spawn loop (#3374) + GitHub Actions workflows (#3375). The phased rollout is:
+
+| Phase | Issue | What ships | Status |
+|-------|-------|-----------|--------|
+| Phase 1 | #3374 | Minimal multi-account spawn loop (`./.loom/scripts/spawn-loop.sh`) | shipped |
+| Phase 2a | #3375 | GitHub Actions workflows replacing support-role daemons | in progress (parallel) |
+| Phase 2b | #3376 | **Soft-deprecation warnings on every deprecated entry point** (this PR) | this change |
+| Phase 3 | TBD | Hard deletion of shepherd brain, daemon brain, and `/shepherd` skill | next major release |
+| Phase 4 | TBD | Coordinated downstream sphere-install migration | parallel with Phase 3 |
+
+**Deprecated entry points (still functional, now warn on use):**
+
+| Deprecated | Replacement | Warning emitted from |
+|------------|-------------|----------------------|
+| `loom-daemon` (Python entry point) | `./.loom/scripts/spawn-loop.sh` (Phase 1) + GitHub Actions schedules (Phase 2a) | `loom_tools.daemon_v2.cli.main()` |
+| `./.loom/scripts/daemon.sh start` (shell wrapper) | Same as above | `cmd_start` in `daemon.sh`, via `lib/deprecation.sh` |
+| `loom-shepherd` CLI / `/shepherd` invocations | `/loom:sweep <issue>` for the same lifecycle | `loom_tools.shepherd.cli.main()` |
+| `/shepherd` slash command (`defaults/.claude/commands/loom/shepherd.md`) | `/loom:sweep <issue>` | Markdown header instructs the LLM to emit the warning |
+
+**Suppression**: set `LOOM_SUPPRESS_DEPRECATION=1` to silence the warnings emitted from Python and shell entry points. The `/shepherd` markdown skill warning always renders by design — operators should explicitly migrate, not silence. Sphere installs and other downstream automation that haven't migrated yet can use this env var to keep their logs clean during the deprecation window.
+
+**Helpers**: the warning text is centralized in two places so removal in Phase 3 is a single-PR sweep:
+
+- Python: `loom_tools.common.deprecation.warn_deprecated(component, replacement, ref="#3372")`
+- Shell: `source .loom/scripts/lib/deprecation.sh; warn_deprecated <component> <replacement> [ref]` — the bash helper is safe to source (no side effects).
+
 ## Resources
 
 ### Loom Documentation

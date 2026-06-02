@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Deprecated
+
+- `loom-daemon`, the `loom-shepherd` CLI, and the `/shepherd` slash command are soft-deprecated ahead of removal in the next major release (epic #3372, this notice tracked in #3376). Each entry point now emits a one-shot `⚠️  DEPRECATED` block to stderr on invocation pointing at the replacement path: `./.loom/scripts/spawn-loop.sh` (Phase 1, #3374) + GitHub Actions schedules (Phase 2a, #3375) for autonomous orchestration, and `/loom:sweep <issue>` for single-issue lifecycle. **No behavior change** — the warned components continue to function identically during the soft-deprecation window. Suppress the warning in shell entry points (e.g. downstream installers that have not yet migrated) with `LOOM_SUPPRESS_DEPRECATION=1`; the markdown skill warning always renders by design. Two new helpers ship the warning message in both Python (`loom_tools.common.deprecation.warn_deprecated`) and shell (`.loom/scripts/lib/deprecation.sh`); the shell helper is safe to `source` without side effects. See the "Migration: deprecations announced for the next major release" section in CLAUDE.md for the full before/after table.
+
 ## [0.9.0] - 2026-05-28
 
 ### Summary
