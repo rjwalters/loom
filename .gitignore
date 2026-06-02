@@ -66,6 +66,7 @@ Thumbs.db
 .loom/usage-cache.json
 .loom/claude-config/
 .loom/tokens/
+.loom/sweep-checkpoint/
 
 # Loom workspace config (DO commit for team sharing)
 # - config.json: Persistent terminal configurations (roles, themes, intervals)

@@ -245,9 +245,44 @@ For each wave `W` (partition of the issue list into chunks of up to `--builders-
 
 See `.claude/commands/loom/shepherd-lifecycle.md` for the canonical phase-by-phase reference, label state machine, and recovery procedures. The summary below tells you which skill to invoke at each phase; the lifecycle reference tells you what each phase does in detail.
 
+### Checkpoint-driven resume (#3373)
+
+Sweep persists a per-issue phase checkpoint after each successful lifecycle phase so that a killed-and-relaunched sweep can pick up where it left off. The checkpoint is the **only** state required to resume — worktree preservation is handled by `worktree.sh`'s idempotency (re-running for an existing worktree is a no-op).
+
+- **Checkpoint file**: `.loom/sweep-checkpoint/issue-<N>.json` (gitignored).
+- **Schema**: `{phase: "<curator-done|builder-done|judge-done|doctor-done|merge-done>", task_id, timestamp, pr_number?}`.
+- **Helper**: `.loom/scripts/sweep-checkpoint.sh {write|read|phase|exists|delete|list}` — wraps the read/write/delete operations with atomic writes (`.tmp` + `mv`) and validates the phase enum.
+- **Write timing**: After the *successful completion* of each lifecycle phase below. Never write a checkpoint speculatively before the phase finishes — a kill mid-phase must resume at the start of that phase.
+- **Read timing**: At the start of per-issue pre-flight (step 1) for every issue in the candidate list, before any worktree or label mutation for that issue.
+- **Delete timing**: On `merge-done` (step 7) and on stale-checkpoint detection (step 1).
+- **Scope limit (no mid-builder recovery)**: A kill during the Builder phase resumes at *builder start* — the worktree state and partial diff survive, but sweep does not inspect the diff or attempt to resume mid-edit. This is intentional per #3372/#3373.
+
+The skip rules per `phase` value are documented inline in each step below.
+
+#### Stale-checkpoint cleanup
+
+A "stale checkpoint" is one whose issue is already closed on the forge (e.g., the merge happened in a different sweep invocation, or the issue was closed manually after sweep was killed). Detect and clean these up on entry — see step 1.
+
 ### 1. Per-issue pre-flight (still per-issue, before the wave dispatch)
 
 For each issue `N` in the wave, before any role skill is invoked:
+
+0. **Read the resume checkpoint (if any).** Before any other pre-flight work for this issue:
+   ```bash
+   CHECKPOINT_PHASE=$(./.loom/scripts/sweep-checkpoint.sh phase N)
+   ```
+   `CHECKPOINT_PHASE` is one of: empty string (no checkpoint), `curator-done`, `builder-done`, `judge-done`, `doctor-done`, `merge-done`. Carry this value through the rest of the lifecycle and use it at each phase to decide whether to skip.
+
+   **Stale-checkpoint cleanup.** If a checkpoint exists for `N` *and* the issue's `state` (from step 1's `gh issue view`) is `CLOSED`, the checkpoint is stale (the issue was closed out-of-band — most commonly because a different sweep invocation already merged it, or a human closed it manually). Remove it with a warning and skip the issue entirely:
+   ```bash
+   if [[ -n "$CHECKPOINT_PHASE" && "$ISSUE_STATE" == "CLOSED" ]]; then
+     echo "WARNING: stale sweep checkpoint for closed issue #N (phase=$CHECKPOINT_PHASE) — removing"
+     ./.loom/scripts/sweep-checkpoint.sh delete N
+     # Skip issue — does NOT contribute to this wave.
+   fi
+   ```
+
+   **`merge-done` short-circuit.** If `CHECKPOINT_PHASE == "merge-done"`, the issue was already merged in a previous sweep run but the checkpoint was not deleted (rare — e.g., sweep was killed between the merge call and the delete call). Delete the checkpoint and log `already complete; skipping`. The issue does NOT contribute to this wave.
 
 1. **Verify the issue is open and not already in flight.**
    ```bash
@@ -284,10 +319,15 @@ For each issue `N` in the wave, before any role skill is invoked:
 
 For each surviving issue `N` in the wave:
 
-- If the issue does not already have `loom:curated` or `loom:issue`, run the curator skill on it.
+- **Checkpoint skip.** If `CHECKPOINT_PHASE` is one of `curator-done`, `builder-done`, `judge-done`, `doctor-done`, skip the curator phase entirely (it already completed in a prior sweep run). Do NOT re-invoke the curator skill — re-curating is wasted work and can produce churn on an issue that's already mid-lifecycle.
+- Otherwise (no checkpoint, or `CHECKPOINT_PHASE` is empty): if the issue does not already have `loom:curated` or `loom:issue`, run the curator skill on it.
   - Load and follow the instructions in `.claude/commands/loom/curator.md` for issue `N`.
   - Expected exit state: issue has `loom:curated`.
-- If the issue already has `loom:curated` or `loom:issue`, skip the curator phase.
+- If the issue already has `loom:curated` or `loom:issue`, skip the curator skill invocation but still write the checkpoint below (so future sweep runs can skip the redundant label probe).
+- **On successful completion** (curator ran, or curator-skip-because-already-curated), write the checkpoint:
+  ```bash
+  ./.loom/scripts/sweep-checkpoint.sh write N curator-done --task-id "sweep-$$"
+  ```
 
 Curator runs sequentially per-issue within wave setup — it is cheap and does not benefit from parallelism here.
 
@@ -303,23 +343,42 @@ Each issue must reach `loom:issue` before the Builder can claim it.
 
 ### 4. Builder phase (parallel within the wave)
 
-Dispatch up to `min(--builders-per-wave, surviving-candidates-in-wave)` `loom-builder` subagents **in a single tool-call block** from this orchestrator session. **Do NOT invoke `/shepherd` as a subagent here** — see the "One level deep" rule in Execution Model above.
+**Checkpoint skip.** For each surviving issue, if `CHECKPOINT_PHASE` is one of `builder-done`, `judge-done`, `doctor-done`, the Builder phase has already completed for this issue. Read the `pr_number` from the checkpoint and route the PR directly into the Judge phase (step 5) — do NOT dispatch a builder subagent.
+
+```bash
+EXISTING_PR=$(./.loom/scripts/sweep-checkpoint.sh read N | sed -n 's/.*"pr_number"[[:space:]]*:[[:space:]]*\([0-9]*\).*/\1/p')
+```
+
+If `CHECKPOINT_PHASE` is `judge-done` or `doctor-done`, see the corresponding skip rules in steps 5/6 — the PR is routed further along, not back to Builder.
+
+For issues without `builder-done`-or-later checkpoints, proceed with the normal Builder dispatch:
+
+Dispatch up to `min(--builders-per-wave, surviving-candidates-in-wave-needing-builder)` `loom-builder` subagents **in a single tool-call block** from this orchestrator session. **Do NOT invoke `/shepherd` as a subagent here** — see the "One level deep" rule in Execution Model above.
 
 Each builder is responsible for:
 
 - Claiming its issue (`loom:issue` → `loom:building`).
-- Creating an issue worktree via `./.loom/scripts/worktree.sh N`.
+- Creating an issue worktree via `./.loom/scripts/worktree.sh N` (idempotent — re-entering after a kill reuses the existing worktree and branch).
 - Implementing the change, running tests, committing.
 - Pushing the branch and opening a PR labeled `loom:review-requested`.
 - Closing references: `Closes #N` in the PR body.
 
 **Await all builders in the wave** before proceeding to Judge. Collect each builder's PR number (or failure marker).
 
+**On successful PR creation**, write the `builder-done` checkpoint for that issue (record the PR number):
+```bash
+./.loom/scripts/sweep-checkpoint.sh write N builder-done --task-id "sweep-$$" --pr-number <PR>
+```
+
+If the builder failed (no PR opened), do NOT write a checkpoint — leave the checkpoint at the previous phase (typically `curator-done`) so the next sweep retries the builder from scratch.
+
 **Per-builder failure isolation.** If builder for issue `#A` fails to open a PR (build error, test failure, unrecoverable conflict, etc.), log it and **continue** with the other builders' PRs in this wave. The failed issue is recorded as `blocked (builder failed)` in the summary. Do NOT abort the wave. Do NOT skip Judge for the other PRs.
+
+**Mid-builder kill semantics (#3373).** If sweep is killed during the Builder phase, the next invocation will see `CHECKPOINT_PHASE == "curator-done"` (no `builder-done` was written), so the Builder dispatches again from scratch. The worktree from the killed run is preserved by `worktree.sh`'s idempotency — `./.loom/scripts/worktree.sh N` is a no-op if `.loom/worktrees/issue-N` already exists. The builder re-enters the worktree, sees the partial diff, and decides whether to commit / amend / discard. **Sweep itself does not introspect the partial diff** — that's the builder's job.
 
 ### 5. Judge phase (sequential per PR within the wave)
 
-For each PR successfully opened in the wave, in the order the builders completed (or any deterministic order — wave-internal ordering is not load-bearing), run the Judge phase sequentially:
+For each PR in the wave (including PRs whose Builder just ran *and* PRs routed in via a `builder-done` checkpoint), in the order the builders completed (or any deterministic order — wave-internal ordering is not load-bearing), run the Judge phase sequentially:
 
 ```
 for pr in wave_prs:
@@ -330,11 +389,19 @@ for pr in wave_prs:
         merge(pr)           # step 7
 ```
 
+**Checkpoint skip.** For each PR:
+- If `CHECKPOINT_PHASE == "judge-done"` for the corresponding issue, the Judge already approved the PR in a prior sweep run. Skip the Judge invocation and route the PR straight to Merge (step 7). The PR should already carry `loom:pr` (judge writes that label as part of the approve path); if it doesn't, the checkpoint and forge state have diverged — log a warning and re-run Judge.
+- If `CHECKPOINT_PHASE == "doctor-done"`, Doctor has already addressed Judge's earlier feedback. **Re-run the Judge phase** for this PR — Judge has not yet evaluated the post-doctor diff in the current sweep run. (The previous Judge result that led to Doctor was `changes-requested`, not `judge-done`.)
+- Otherwise (`builder-done`, or no checkpoint yet because Builder just ran in this wave), run Judge normally.
+
 - Load and follow the instructions in `.claude/commands/loom/judge.md` for the PR.
 - The judge uses `gh pr comment` (NOT `gh pr review --approve`) because GitHub's self-review API restriction applies — see `judge.md` for the full explanation.
 - Expected exit states per PR:
-  - **Approve** → PR labeled `loom:pr`. Continue to Merge (step 7) for this PR, then advance to the next PR in the wave.
-  - **Request changes** → PR labeled `loom:changes-requested`. Continue to Doctor (step 6) **inline for this PR**, then re-judge, then merge or block.
+  - **Approve** → PR labeled `loom:pr`. Write the `judge-done` checkpoint for this issue (carrying the PR number), then continue to Merge (step 7) for this PR, then advance to the next PR in the wave.
+    ```bash
+    ./.loom/scripts/sweep-checkpoint.sh write N judge-done --task-id "sweep-$$" --pr-number <PR>
+    ```
+  - **Request changes** → PR labeled `loom:changes-requested`. Continue to Doctor (step 6) **inline for this PR**, then re-judge, then merge or block. Do **not** write a `judge-done` checkpoint here — the PR is not yet approved, and a resume after a kill should re-enter Doctor, not skip Judge.
 
 **Why sequential and not parallel?** Parallel Judges add coordination complexity without clear benefit — each judge needs to checkout the PR and reason about it independently. Defer parallel-judge to a future issue if benchmarks justify it.
 
@@ -344,6 +411,11 @@ If Judge requests changes on PR `#X` mid-wave, run a **single inline Doctor→Ju
 
 - Load and follow the instructions in `.claude/commands/loom/doctor.md` for PR `#X`.
 - Doctor addresses the judge's feedback, commits the fixes, and pushes.
+- **On successful Doctor completion**, write the `doctor-done` checkpoint for the issue (carrying the PR number) **before** re-invoking Judge:
+  ```bash
+  ./.loom/scripts/sweep-checkpoint.sh write N doctor-done --task-id "sweep-$$" --pr-number <PR>
+  ```
+  This way, if sweep is killed between Doctor and the follow-up Judge, the resume run will see `doctor-done` and re-enter at the Judge phase (step 5), not redo the Doctor work.
 - On completion, re-label the PR from `loom:changes-requested` back to `loom:review-requested` and **re-run the Judge phase** (step 5) for this PR.
 - **Limit: a single Doctor→Judge cycle per PR.** If Judge still requests changes after one Doctor pass, mark this PR as blocked, log a warning, and proceed to the next PR in the wave (do NOT block the wave on it).
 
@@ -358,6 +430,15 @@ Use the dedicated merge script (CLAUDE.md "Merging PRs" mandate — never `gh pr
 ```
 
 The script merges via the forge API and cleans up the worktree. `--auto` enables GitHub's server-side auto-merge queue (queues the merge until required checks pass); on PRs that are already in `CLEAN` state (fast CI), the script transparently falls back to an immediate merge — see #3371.
+
+**On successful merge** (script returns 0), delete the issue's sweep checkpoint:
+```bash
+./.loom/scripts/sweep-checkpoint.sh delete N
+```
+
+This is the terminal state. The checkpoint must be removed so a future `/loom:sweep` invocation that references the same issue number (e.g., as part of a wider candidate set) doesn't take a `merge-done` short-circuit on the stale state. The stale-checkpoint cleanup in step 1 is the belt-and-suspenders defense if this delete is missed (e.g., sweep killed between `merge-pr.sh` success and the delete call); on the next sweep run that touches the issue, step 1 detects the closed-issue + checkpoint mismatch and removes it.
+
+If `merge-pr.sh` fails (e.g., the merge queue rejects the PR, or required checks haven't passed and `--auto` is rejected), do **not** delete the checkpoint — leave it at `judge-done` so the next sweep retries the merge from a clean state.
 
 ### 8. Wave settled → advance to next wave
 
@@ -452,6 +533,7 @@ The full `/sweep` design in #3298 includes many features that are intentionally 
 | `--dry-run` | **Implemented (#3319)** | Prints the candidate plan (with wave grouping) and exits without mutating labels, worktrees, or PRs. |
 | Existing-PR detection in pre-flight | **Implemented (#3359)** | Pre-flight probes `closedByPullRequestsReferences`; routes existing open linked PRs to Judge (or Merge if already `loom:pr`) instead of dispatching a duplicate Builder. Multi-PR ambiguity skips with a log. |
 | `loom:operator-only` enforcement | **Implemented (#3360)** | Pre-flight skips issues with `loom:operator-only` (human action required: credentials, infra, hardware). Champion `--merge` mode also refuses to auto-promote them. |
+| Checkpoint/resume after kill | **Implemented (#3373)** | Per-issue phase checkpoint at `.loom/sweep-checkpoint/issue-<N>.json`. Sweep reads on entry and skips completed phases. No mid-builder recovery — kill during Builder resumes at builder start, worktree preserved by `worktree.sh` idempotency. |
 | `--max-waves` cap | Deferred | Operator-level brake on long sweeps. |
 | `--paused-merge` / `--no-judge` | Deferred | Merge-mode variants for trusted batches. |
 | `--include-blocked` (unblock pass) | Deferred | Currently `/sweep` skips `loom:blocked` issues outright. |
@@ -476,5 +558,7 @@ For the full design discussion (including the open questions raised by the curat
 - **Curator skill**: `.claude/commands/loom/curator.md`
 - **Label definitions**: `.github/labels.yml`
 - **Merge script**: `./.loom/scripts/merge-pr.sh`
+- **Sweep checkpoint helper**: `./.loom/scripts/sweep-checkpoint.sh` — read/write/delete per-issue phase checkpoints for resume after kill (#3373).
 - **Original proposal & open questions**: issue #3298
 - **Parallel-shepherd stall hazard**: issue #3289
+- **Checkpoint/resume design**: issue #3373 (Phase 0 of #3372 shepherd/daemon deprecation epic)
