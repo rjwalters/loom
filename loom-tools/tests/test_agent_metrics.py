@@ -12,24 +12,19 @@ import pytest
 from loom_tools.agent_metrics import (
     CostRow,
     EffectivenessRow,
-    FallbackSummary,
-    FallbackVelocity,
     SummaryMetrics,
     VelocityRow,
     _get_period_filter,
     _get_role_filter,
     format_costs_text,
+    format_db_unavailable_text,
     format_effectiveness_text,
-    format_summary_fallback_text,
     format_summary_text,
-    format_velocity_fallback_text,
     format_velocity_text,
     get_costs,
     get_effectiveness,
     get_summary,
-    get_summary_fallback,
     get_velocity,
-    get_velocity_fallback,
     main,
 )
 
@@ -329,74 +324,18 @@ class TestVelocity:
 
 
 # ---------------------------------------------------------------------------
-# Fallback path tests
+# Missing-database error path tests (Phase 3.1.5 / #3394 — no fallback)
 # ---------------------------------------------------------------------------
 
 
-class TestFallbackSummary:
-    """Tests for the fallback summary when DB is unavailable."""
+class TestMissingDatabase:
+    """Tests for the explicit error path when activity.db is missing."""
 
-    def test_fallback_with_daemon_state(self, mock_repo: pathlib.Path) -> None:
-        # Write a daemon state file
-        state_file = mock_repo / ".loom" / "daemon-state.json"
-        state_file.write_text(
-            json.dumps(
-                {
-                    "completed_issues": [100, 101, 102],
-                    "total_prs_merged": 3,
-                }
-            )
-        )
-
-        with mock.patch("loom_tools.agent_metrics.find_repo_root", return_value=mock_repo):
-            with mock.patch("loom_tools.agent_metrics.gh_run") as mock_gh:
-                # Mock gh issue list and pr list
-                mock_gh.side_effect = [
-                    mock.Mock(returncode=0, stdout="5"),
-                    mock.Mock(returncode=0, stdout="2"),
-                ]
-                fb = get_summary_fallback(mock_repo)
-
-        assert fb.completed_issues == 3
-        assert fb.total_prs_merged == 3
-        assert fb.open_issues == 5
-        assert fb.open_prs == 2
-        assert "not available" in fb.note
-
-    def test_fallback_no_daemon_state(self, mock_repo: pathlib.Path) -> None:
-        with mock.patch("loom_tools.agent_metrics.find_repo_root", return_value=mock_repo):
-            with mock.patch("loom_tools.agent_metrics.gh_run") as mock_gh:
-                mock_gh.side_effect = [
-                    mock.Mock(returncode=0, stdout="0"),
-                    mock.Mock(returncode=0, stdout="0"),
-                ]
-                fb = get_summary_fallback(mock_repo)
-
-        assert fb.completed_issues == 0
-        assert fb.total_prs_merged == 0
-
-
-class TestFallbackVelocity:
-    """Tests for the fallback velocity when DB is unavailable."""
-
-    def test_fallback_with_daemon_state(self, mock_repo: pathlib.Path) -> None:
-        state_file = mock_repo / ".loom" / "daemon-state.json"
-        state_file.write_text(
-            json.dumps(
-                {
-                    "started_at": "2026-01-23T10:00:00Z",
-                    "completed_issues": [1, 2, 3],
-                    "total_prs_merged": 2,
-                }
-            )
-        )
-
-        with mock.patch("loom_tools.agent_metrics.find_repo_root", return_value=mock_repo):
-            fb = get_velocity_fallback(mock_repo)
-
-        assert fb.completed_issues == 3
-        assert fb.prs_merged == 2
-        assert fb.session_started == "2026-01-23T10:00:00Z"
+    def test_format_db_unavailable_mentions_path(self, tmp_path: pathlib.Path) -> None:
+        missing = tmp_path / "no-such.db"
+        msg = format_db_unavailable_text(missing)
+        assert "not found" in msg
+        assert str(missing) in msg
 
 
 # ---------------------------------------------------------------------------
@@ -423,13 +362,6 @@ class TestTextFormatting:
         assert "50K" in output
         assert "$1.5000" in output
         assert "85.0%" in output
-
-    def test_summary_fallback_text(self) -> None:
-        fb = FallbackSummary(completed_issues=5, total_prs_merged=3, open_issues=10, open_prs=2)
-        output = format_summary_fallback_text(fb)
-        assert "daemon state" in output
-        assert "5" in output
-        assert "not available" in output
 
     def test_effectiveness_text_table(self) -> None:
         rows = [
@@ -471,16 +403,6 @@ class TestTextFormatting:
         assert "2026-W04" in output
         assert "20" in output
 
-    def test_velocity_fallback_text(self) -> None:
-        fb = FallbackVelocity(
-            completed_issues=5, prs_merged=3, session_started="2026-01-23T10:00:00Z"
-        )
-        output = format_velocity_fallback_text(fb)
-        assert "daemon state" in output
-        assert "5" in output
-        assert "2026-01-23T10:00:00Z" in output
-
-
 # ---------------------------------------------------------------------------
 # JSON formatting tests
 # ---------------------------------------------------------------------------
@@ -518,14 +440,6 @@ class TestJsonFormatting:
         output = json.dumps([r.to_dict() for r in rows], indent=2)
         parsed = json.loads(output)
         assert isinstance(parsed, list)
-
-    def test_fallback_summary_json_valid(self) -> None:
-        fb = FallbackSummary(completed_issues=5, total_prs_merged=3, open_issues=10, open_prs=2)
-        output = json.dumps(fb.to_dict(), indent=2)
-        parsed = json.loads(output)
-        assert "note" in parsed
-        assert parsed["completed_issues"] == 5
-
 
 # ---------------------------------------------------------------------------
 # ANSI color tests
@@ -602,16 +516,41 @@ class TestCLI:
                 rc = main(["velocity", "--format", "json"])
         assert rc == 0
 
-    def test_fallback_when_no_db(self, mock_repo: pathlib.Path, tmp_path: pathlib.Path) -> None:
+    def test_errors_when_no_db_json(
+        self,
+        mock_repo: pathlib.Path,
+        tmp_path: pathlib.Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """Missing activity DB returns rc=1 with a JSON error payload (#3394)."""
         nonexistent = tmp_path / "no-such-file.db"
         with mock.patch("loom_tools.agent_metrics.find_repo_root", return_value=mock_repo):
             with mock.patch(
                 "loom_tools.agent_metrics._get_activity_db_path", return_value=nonexistent
             ):
-                with mock.patch("loom_tools.agent_metrics.gh_run") as mock_gh:
-                    mock_gh.return_value = mock.Mock(returncode=0, stdout="0")
-                    rc = main(["summary", "--format", "json"])
-        assert rc == 0
+                rc = main(["summary", "--format", "json"])
+        assert rc == 1
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["error"] == "Activity database not available"
+        assert payload["db_path"] == str(nonexistent)
+
+    def test_errors_when_no_db_text(
+        self,
+        mock_repo: pathlib.Path,
+        tmp_path: pathlib.Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """Missing activity DB returns rc=1 with a human-readable error (#3394)."""
+        nonexistent = tmp_path / "no-such-file.db"
+        with mock.patch("loom_tools.agent_metrics.find_repo_root", return_value=mock_repo):
+            with mock.patch(
+                "loom_tools.agent_metrics._get_activity_db_path", return_value=nonexistent
+            ):
+                rc = main(["summary"])
+        assert rc == 1
+        out = capsys.readouterr().out
+        assert "not found" in out
+        assert str(nonexistent) in out
 
     def test_role_filter_cli(self, activity_db: pathlib.Path, mock_repo: pathlib.Path) -> None:
         with mock.patch("loom_tools.agent_metrics.find_repo_root", return_value=mock_repo):

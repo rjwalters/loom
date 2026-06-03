@@ -1,8 +1,11 @@
 """Agent performance metrics for self-aware agents.
 
 Enables agents to query their own effectiveness, costs, and velocity.
-Reads from the activity database (~/.loom/activity.db) when available,
-falling back to daemon-state.json and GitHub API.
+Reads exclusively from the activity database (``~/.loom/activity.db``).
+
+If the activity database is missing, the CLI emits a clear error and
+exits non-zero (see Phase 3.1.5 / #3394: the legacy ``daemon-state.json``
+fallback has been removed in preparation for full daemon retirement).
 
 Commands:
     summary         Overall metrics summary (default)
@@ -12,7 +15,7 @@ Commands:
 
 Exit codes:
     0 - Success
-    1 - Error
+    1 - Error (including activity database not available)
 """
 
 from __future__ import annotations
@@ -23,13 +26,11 @@ import os
 import pathlib
 import sqlite3
 import sys
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any
 
-from loom_tools.common.github import gh_run
-from loom_tools.common.logging import log_error, log_warning
+from loom_tools.common.logging import log_error
 from loom_tools.common.repo import find_repo_root
-from loom_tools.common.state import read_daemon_state
 
 # ANSI color codes for direct stdout formatting.
 # Logging helpers write to stderr; metrics output goes to stdout.
@@ -158,46 +159,6 @@ class VelocityRow:
         }
 
 
-@dataclass
-class FallbackSummary:
-    """Limited metrics when the activity DB is unavailable."""
-
-    completed_issues: int = 0
-    total_prs_merged: int = 0
-    open_issues: int = 0
-    open_prs: int = 0
-    note: str = "Limited data - activity database not available"
-
-    def to_dict(self) -> dict[str, Any]:
-        return {
-            "completed_issues": self.completed_issues,
-            "total_prs_merged": self.total_prs_merged,
-            "open_issues": self.open_issues,
-            "open_prs": self.open_prs,
-            "note": self.note,
-        }
-
-
-@dataclass
-class FallbackVelocity:
-    """Limited velocity when the activity DB is unavailable."""
-
-    completed_issues: int = 0
-    prs_merged: int = 0
-    session_started: str = ""
-    note: str = "Velocity from daemon state (limited data)"
-
-    def to_dict(self) -> dict[str, Any]:
-        d: dict[str, Any] = {
-            "completed_issues": self.completed_issues,
-            "prs_merged": self.prs_merged,
-            "note": self.note,
-        }
-        if self.session_started:
-            d["session_started"] = self.session_started
-        return d
-
-
 # ---------------------------------------------------------------------------
 # SQL helpers
 # ---------------------------------------------------------------------------
@@ -297,43 +258,6 @@ def get_summary(
         issues_count=row.get("issues_count", 0) or 0,
         prs_count=row.get("prs_count", 0) or 0,
         success_rate=sr or 0.0,
-    )
-
-
-def get_summary_fallback(repo_root: pathlib.Path) -> FallbackSummary:
-    """Get limited summary metrics from daemon state and GitHub."""
-    state = read_daemon_state(repo_root)
-
-    completed = len(state.completed_issues) if state.completed_issues else 0
-    prs_merged = state.total_prs_merged or 0
-
-    open_issues = 0
-    open_prs = 0
-    try:
-        result = gh_run(
-            ["issue", "list", "--state", "open", "--json", "number", "--jq", "length"],
-            check=False,
-        )
-        if result.returncode == 0 and result.stdout.strip():
-            open_issues = int(result.stdout.strip())
-    except Exception:
-        pass
-
-    try:
-        result = gh_run(
-            ["pr", "list", "--state", "open", "--json", "number", "--jq", "length"],
-            check=False,
-        )
-        if result.returncode == 0 and result.stdout.strip():
-            open_prs = int(result.stdout.strip())
-    except Exception:
-        pass
-
-    return FallbackSummary(
-        completed_issues=completed,
-        total_prs_merged=prs_merged,
-        open_issues=open_issues,
-        open_prs=open_prs,
     )
 
 
@@ -460,17 +384,6 @@ def get_velocity(db_path: pathlib.Path) -> list[VelocityRow]:
     ]
 
 
-def get_velocity_fallback(repo_root: pathlib.Path) -> FallbackVelocity:
-    """Get limited velocity from daemon state."""
-    state = read_daemon_state(repo_root)
-
-    return FallbackVelocity(
-        completed_issues=len(state.completed_issues) if state.completed_issues else 0,
-        prs_merged=state.total_prs_merged or 0,
-        session_started=state.started_at or "",
-    )
-
-
 # ---------------------------------------------------------------------------
 # Text formatters
 # ---------------------------------------------------------------------------
@@ -504,23 +417,6 @@ def format_summary_text(m: SummaryMetrics, period: str) -> str:
     return "\n".join(lines)
 
 
-def format_summary_fallback_text(m: FallbackSummary) -> str:
-    """Format fallback summary for human display."""
-    lines = [
-        "",
-        _c(_BLUE, "Agent Performance Summary") + " (daemon state)",
-        _c(_GRAY, "\u2500" * 40),
-        f"  Completed Issues: {m.completed_issues}",
-        f"  PRs Merged:       {m.total_prs_merged}",
-        f"  Open Issues:      {m.open_issues}",
-        f"  Open PRs:         {m.open_prs}",
-        "",
-        _c(_YELLOW, "Note: Activity database not available. Enable tracking for detailed metrics."),
-        "",
-    ]
-    return "\n".join(lines)
-
-
 def format_effectiveness_text(rows: list[EffectivenessRow], period: str) -> str:
     """Format effectiveness table for human display."""
     lines = [
@@ -541,11 +437,6 @@ def format_effectiveness_text(rows: list[EffectivenessRow], period: str) -> str:
     return "\n".join(lines)
 
 
-def format_effectiveness_unavailable_text() -> str:
-    """Format message when effectiveness data is unavailable."""
-    return _c(_YELLOW, "Activity database not available. Enable tracking for effectiveness metrics.")
-
-
 def format_costs_text(rows: list[CostRow]) -> str:
     """Format cost table for human display."""
     lines = [
@@ -562,11 +453,6 @@ def format_costs_text(rows: list[CostRow]) -> str:
         )
     lines.append("")
     return "\n".join(lines)
-
-
-def format_costs_unavailable_text() -> str:
-    """Format message when cost data is unavailable."""
-    return _c(_YELLOW, "Activity database not available. Enable tracking for cost metrics.")
 
 
 def format_velocity_text(rows: list[VelocityRow]) -> str:
@@ -587,24 +473,13 @@ def format_velocity_text(rows: list[VelocityRow]) -> str:
     return "\n".join(lines)
 
 
-def format_velocity_fallback_text(m: FallbackVelocity) -> str:
-    """Format fallback velocity for human display."""
-    lines = [
-        "",
-        _c(_BLUE, "Development Velocity") + " (daemon state)",
-        _c(_GRAY, "\u2500" * 40),
-        f"  Issues Completed: {m.completed_issues}",
-        f"  PRs Merged:       {m.prs_merged}",
-    ]
-    if m.session_started:
-        lines.append(f"  Session Started:  {m.session_started}")
-    lines.append("")
-    return "\n".join(lines)
-
-
-def format_velocity_unavailable_text() -> str:
-    """Format message when no velocity data is available."""
-    return _c(_YELLOW, "No velocity data available.")
+def format_db_unavailable_text(db_path: pathlib.Path) -> str:
+    """Format error message when the activity database is missing."""
+    return _c(
+        _RED,
+        f"Error: activity database not found at {db_path}. "
+        "Set LOOM_ACTIVITY_DB or enable agent activity tracking.",
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -684,23 +559,44 @@ Examples:
         return 1
 
     try:
-        repo_root = find_repo_root()
+        # Anchor to a git repo so the CLI behaves consistently with the
+        # other loom-tools entry points; the activity database itself lives
+        # under ``~/.loom`` (overridable via LOOM_ACTIVITY_DB), not in the
+        # repo, but failing fast outside a repo matches operator expectations.
+        find_repo_root()
     except FileNotFoundError:
         log_error("Not in a git repository with .loom directory")
         return 1
 
     db_path = _get_activity_db_path()
-    db_available = db_path.is_file()
+    if not db_path.is_file():
+        # No more daemon-state.json fallback (#3394). The activity DB is
+        # the single source of truth for metrics; surface a clear error so
+        # operators know what to configure rather than silently returning
+        # empty/stale state.
+        if args.output_format == "json":
+            print(
+                json.dumps(
+                    {
+                        "error": "Activity database not available",
+                        "db_path": str(db_path),
+                    },
+                    indent=2,
+                )
+            )
+        else:
+            print(format_db_unavailable_text(db_path))
+        return 1
 
     try:
         if args.command == "summary":
-            return _cmd_summary(db_available, db_path, repo_root, args)
+            return _cmd_summary(db_path, args)
         elif args.command == "effectiveness":
-            return _cmd_effectiveness(db_available, db_path, args)
+            return _cmd_effectiveness(db_path, args)
         elif args.command == "costs":
-            return _cmd_costs(db_available, db_path, args)
+            return _cmd_costs(db_path, args)
         elif args.command == "velocity":
-            return _cmd_velocity(db_available, db_path, repo_root, args)
+            return _cmd_velocity(db_path, args)
     except Exception as e:
         log_error(f"Failed to get metrics: {e}")
         return 1
@@ -708,39 +604,16 @@ Examples:
     return 0
 
 
-def _cmd_summary(
-    db_available: bool,
-    db_path: pathlib.Path,
-    repo_root: pathlib.Path,
-    args: argparse.Namespace,
-) -> int:
-    if db_available:
-        metrics = get_summary(db_path, args.role, args.period)
-        if args.output_format == "json":
-            print(json.dumps(metrics.to_dict(), indent=2))
-        else:
-            print(format_summary_text(metrics, args.period))
+def _cmd_summary(db_path: pathlib.Path, args: argparse.Namespace) -> int:
+    metrics = get_summary(db_path, args.role, args.period)
+    if args.output_format == "json":
+        print(json.dumps(metrics.to_dict(), indent=2))
     else:
-        fb = get_summary_fallback(repo_root)
-        if args.output_format == "json":
-            print(json.dumps(fb.to_dict(), indent=2))
-        else:
-            print(format_summary_fallback_text(fb))
+        print(format_summary_text(metrics, args.period))
     return 0
 
 
-def _cmd_effectiveness(
-    db_available: bool,
-    db_path: pathlib.Path,
-    args: argparse.Namespace,
-) -> int:
-    if not db_available:
-        if args.output_format == "json":
-            print(json.dumps({"error": "Activity database not available", "roles": []}))
-        else:
-            print(format_effectiveness_unavailable_text())
-        return 0
-
+def _cmd_effectiveness(db_path: pathlib.Path, args: argparse.Namespace) -> int:
     rows = get_effectiveness(db_path, args.role, args.period)
     if args.output_format == "json":
         print(json.dumps([r.to_dict() for r in rows], indent=2))
@@ -749,18 +622,7 @@ def _cmd_effectiveness(
     return 0
 
 
-def _cmd_costs(
-    db_available: bool,
-    db_path: pathlib.Path,
-    args: argparse.Namespace,
-) -> int:
-    if not db_available:
-        if args.output_format == "json":
-            print(json.dumps({"error": "Activity database not available", "costs": []}))
-        else:
-            print(format_costs_unavailable_text())
-        return 0
-
+def _cmd_costs(db_path: pathlib.Path, args: argparse.Namespace) -> int:
     rows = get_costs(db_path, args.issue)
     if args.output_format == "json":
         print(json.dumps([r.to_dict() for r in rows], indent=2))
@@ -769,30 +631,12 @@ def _cmd_costs(
     return 0
 
 
-def _cmd_velocity(
-    db_available: bool,
-    db_path: pathlib.Path,
-    repo_root: pathlib.Path,
-    args: argparse.Namespace,
-) -> int:
-    if db_available:
-        rows = get_velocity(db_path)
-        if args.output_format == "json":
-            print(json.dumps([r.to_dict() for r in rows], indent=2))
-        else:
-            print(format_velocity_text(rows))
+def _cmd_velocity(db_path: pathlib.Path, args: argparse.Namespace) -> int:
+    rows = get_velocity(db_path)
+    if args.output_format == "json":
+        print(json.dumps([r.to_dict() for r in rows], indent=2))
     else:
-        fb = get_velocity_fallback(repo_root)
-        if fb.completed_issues or fb.prs_merged:
-            if args.output_format == "json":
-                print(json.dumps(fb.to_dict(), indent=2))
-            else:
-                print(format_velocity_fallback_text(fb))
-        else:
-            if args.output_format == "json":
-                print(json.dumps({"error": "No velocity data available"}))
-            else:
-                print(format_velocity_unavailable_text())
+        print(format_velocity_text(rows))
     return 0
 
 
