@@ -242,9 +242,17 @@ def format_intervention_summary(
     issue = detection.issue or "ISSUE"
 
     if intervention_type == "alert":
+        # The per-issue sweep log is the spawn loop's stdout/stderr destination
+        # for each detached `claude -p "/loom:sweep N"` child (#3374). Replaces
+        # the daemon-state.json::shepherds[].output_file path retired in #3392.
+        log_hint: str
+        if isinstance(issue, int):
+            log_hint = f"tail -n 200 .loom/logs/sweep-issue-{issue}.log"
+        else:
+            log_hint = "tail -n 200 .loom/logs/sweep-issue-<N>.log"
         lines.extend(
             [
-                f'  - Review agent output: cat $(jq -r \'.shepherds["{detection.agent_id}"].output_file\' .loom/daemon-state.json)',
+                f"  - Review agent output: {log_hint}",
                 f"  - Check issue status: gh issue view {issue}",
             ]
         )
