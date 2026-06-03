@@ -1,24 +1,29 @@
-"""Orphaned shepherd detection and recovery for Loom daemon.
+"""Orphaned task detection and recovery (spawn-loop edition).
 
-Detects and recovers orphaned shepherd state that occurs when:
-- Daemon crashes mid-session leaving task_ids that no longer exist
-- Issues have loom:building label but no active shepherd
-- Progress files exist but the shepherd task is not running
+Detects and recovers orphaned state that occurs when:
 
-This is distinct from stuck detection (stuck_detection.py):
-- Stuck = running but struggling
-- Orphan = not running at all
+- An issue carries the ``loom:building`` label but no spawn-loop task is
+  tracking it (untracked building issue).
+- A spawn-loop task entry has a stale ``last_heartbeat`` and a dead PID
+  (loop crash or unresponsive tick — see #3411).
 
-Known invocation paths (see also issue #2567 investigation):
-- Daemon iteration loop: ``daemon_v2/iteration.py`` when snapshot detects
-  orphaned_count > 0 via ``determine_actions()``
-- Daemon startup cleanup: ``daemon_cleanup.py`` ``daemon-startup`` event
-- Daemon stall recovery: Level 2 escalation runs unconditionally
-- CLI: ``recover-orphaned-shepherds.sh [--recover]``
+This module was ported from the daemon-state edition in Phase 3.1.6
+(epic #3372, tracker #3378, issue #3395).  The pre-port version read
+``.loom/daemon-state.json::shepherds`` plus ``.loom/progress/`` files and
+``recent_failures``; all three of those state sources go away with the
+daemon brain.
 
-No autonomous agent role calls this directly.  The Guide role runs the
-separate ``stale-building-check.sh`` script which has different thresholds
-(2h staleness vs 5min heartbeat) and detection logic.
+The new sources of truth are:
+
+- ``.loom/spawn-loop-state.json::running`` (a flat list of live sweep tasks,
+  written by ``defaults/scripts/spawn-loop.sh`` — see
+  :mod:`loom_tools.models.spawn_loop_state`).
+- ``gh issue list --label loom:building`` (unchanged).
+
+Stuck-but-running detection lives in :mod:`loom_tools.stuck_detection` (2-min
+heartbeat).  This module's heartbeat threshold is intentionally higher
+(5 minutes by default) because orphan recovery is post-crash cleanup, not
+real-time monitoring.
 
 Exit codes:
     0 - No orphans detected
@@ -32,7 +37,6 @@ import argparse
 import json
 import os
 import pathlib
-import re
 import subprocess
 import sys
 from dataclasses import dataclass, field
@@ -43,27 +47,20 @@ from loom_tools.common.git import parse_porcelain_path
 from loom_tools.common.github import get_repo_nwo, gh_issue_list, gh_run
 from loom_tools.common.logging import log_error, log_info, log_success, log_warning
 from loom_tools.common.repo import find_repo_root
-from loom_tools.common.state import (
-    find_progress_for_issue,
-    read_daemon_state,
-    read_json_file,
-    read_progress_files,
-    write_json_file,
-)
+from loom_tools.common.state import read_spawn_loop_state
 from loom_tools.common.time_utils import elapsed_seconds, format_duration, now_utc
-from loom_tools.models.daemon_state import DaemonState, ShepherdEntry
-from loom_tools.models.progress import ShepherdProgress
+from loom_tools.models.spawn_loop_state import SpawnLoopState, SpawnLoopTask
 
-# Default heartbeat stale threshold (5 minutes for orphan recovery)
-# This is intentionally higher than stuck_detection's 120s because
-# orphan recovery is post-crash cleanup, not real-time monitoring.
+# Default heartbeat stale threshold (5 minutes for orphan recovery).
+# Intentionally higher than stuck_detection's 120s because orphan recovery
+# is post-crash cleanup, not real-time monitoring.
 DEFAULT_HEARTBEAT_STALE_THRESHOLD = 300
 
 # Grace period for recently-applied loom:building labels (10 minutes).
 # Issues with loom:building added less than this many seconds ago are
-# assumed to be actively worked on and skipped by orphan recovery.
-# This protects manual /shepherd runs and newly-claimed issues from
-# being incorrectly recovered before claims or heartbeats are established.
+# assumed to be actively worked on and skipped by orphan recovery.  This
+# protects newly-claimed issues and manual sweeps from being incorrectly
+# recovered before claims or heartbeats are established.
 DEFAULT_LABEL_GRACE_PERIOD = 600
 
 # Deduplication window for orphan recovery comments (5 minutes).
@@ -71,30 +68,24 @@ DEFAULT_LABEL_GRACE_PERIOD = 600
 # skip posting another to avoid duplicate noise (see issue #2658).
 ORPHAN_COMMENT_DEDUP_SECONDS = 300
 
-# Task ID format: exactly 7 lowercase hex characters
-TASK_ID_PATTERN = re.compile(r"^[a-f0-9]{7}$")
-
 
 @dataclass
 class OrphanEntry:
     """A detected orphan."""
 
-    type: str  # stale_task_id, invalid_task_id, untracked_building, stale_heartbeat
-    shepherd_id: str | None = None
+    type: str  # untracked_building | stale_heartbeat
     issue: int | None = None
-    task_id: str | None = None
+    pid: int | None = None
     title: str | None = None
     reason: str = ""
     age_seconds: int | None = None
 
     def to_dict(self) -> dict[str, Any]:
         d: dict[str, Any] = {"type": self.type, "reason": self.reason}
-        if self.shepherd_id is not None:
-            d["shepherd_id"] = self.shepherd_id
         if self.issue is not None:
             d["issue"] = self.issue
-        if self.task_id is not None:
-            d["task_id"] = self.task_id
+        if self.pid is not None:
+            d["pid"] = self.pid
         if self.title is not None:
             d["title"] = self.title
         if self.age_seconds is not None:
@@ -106,20 +97,17 @@ class OrphanEntry:
 class RecoveryEntry:
     """A recovery action taken."""
 
-    action: str  # reset_shepherd, reset_issue_label, cleanup_stale_worktree, mark_progress_errored
-    shepherd_id: str | None = None
+    action: str  # reset_issue_label | cleanup_stale_worktree
     issue: int | None = None
-    task_id: str | None = None
+    pid: int | None = None
     reason: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         d: dict[str, Any] = {"action": self.action, "reason": self.reason}
-        if self.shepherd_id is not None:
-            d["shepherd_id"] = self.shepherd_id
         if self.issue is not None:
             d["issue"] = self.issue
-        if self.task_id is not None:
-            d["task_id"] = self.task_id
+        if self.pid is not None:
+            d["pid"] = self.pid
         return d
 
 
@@ -171,27 +159,25 @@ def _get_label_grace_period() -> int:
     return DEFAULT_LABEL_GRACE_PERIOD
 
 
-def _is_valid_task_id(task_id: str) -> bool:
-    """Check if a task ID matches the expected 7-char hex format."""
-    return bool(TASK_ID_PATTERN.fullmatch(task_id))
+def _pid_alive(pid: int) -> bool:
+    """Return True if *pid* is a live process.
 
-
-def _check_task_exists(task_id: str, output_file: str | None) -> bool:
-    """Check if a task likely exists by verifying its output file.
-
-    Checks the recorded output file path, and also scans common
-    task output locations under /tmp/claude.
+    Uses ``os.kill(pid, 0)`` which raises ``ProcessLookupError`` for dead
+    PIDs and ``PermissionError`` for live PIDs we don't own (treated as
+    alive — better to skip recovery than tear down somebody else's work).
     """
-    if output_file and pathlib.Path(output_file).is_file():
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
         return True
-
-    claude_task_dir = pathlib.Path("/tmp/claude")
-    if claude_task_dir.is_dir():
-        for p in claude_task_dir.rglob("*.output"):
-            if task_id in p.name:
-                return True
-
-    return False
+    except OSError:
+        # Any other OSError (rare) — be conservative: assume alive.
+        return True
+    return True
 
 
 def _get_building_label_age(issue: int) -> int | None:
@@ -251,83 +237,21 @@ def _get_building_label_age(issue: int) -> int | None:
         return None
 
 
-def check_daemon_state_tasks(
-    daemon_state: DaemonState,
-    result: OrphanRecoveryResult,
-    *,
-    verbose: bool = False,
-) -> None:
-    """Phase 1: Validate task_ids in daemon-state.json.
-
-    Checks working shepherds for:
-    - Invalid task ID format (not 7-char hex)
-    - Stale task IDs (output file no longer exists)
-    """
-    for shepherd_id, entry in daemon_state.shepherds.items():
-        if entry.status != "working":
-            continue
-
-        task_id = entry.task_id
-        if task_id is None:
-            continue
-
-        if verbose:
-            log_info(
-                f"Checking {shepherd_id}: task_id={task_id}, "
-                f"issue=#{entry.issue}, status={entry.status}"
-            )
-
-        if not _is_valid_task_id(task_id):
-            if verbose:
-                log_warning(
-                    f"  ORPHANED: {shepherd_id} has invalid task_id "
-                    f"format '{task_id}' (expected 7 hex chars)"
-                )
-            result.orphaned.append(
-                OrphanEntry(
-                    type="invalid_task_id",
-                    shepherd_id=shepherd_id,
-                    task_id=task_id,
-                    issue=entry.issue,
-                    reason="invalid_task_id_format",
-                )
-            )
-            continue
-
-        if not _check_task_exists(task_id, entry.output_file):
-            if verbose:
-                log_warning(
-                    f"  ORPHANED: {shepherd_id} has stale task_id {task_id}"
-                )
-            result.orphaned.append(
-                OrphanEntry(
-                    type="stale_task_id",
-                    shepherd_id=shepherd_id,
-                    task_id=task_id,
-                    issue=entry.issue,
-                    reason="task_not_found",
-                )
-            )
-        elif verbose:
-            log_info(f"  OK: task exists for {shepherd_id}")
-
-
 def check_untracked_building(
-    daemon_state: DaemonState,
-    progress_files: list[ShepherdProgress],
+    spawn_loop_state: SpawnLoopState,
     result: OrphanRecoveryResult,
     *,
     repo_root: pathlib.Path | None = None,
-    heartbeat_threshold: int = DEFAULT_HEARTBEAT_STALE_THRESHOLD,
     label_grace_period: int = DEFAULT_LABEL_GRACE_PERIOD,
     verbose: bool = False,
 ) -> None:
-    """Phase 2: Find loom:building issues without active shepherds.
+    """Find ``loom:building`` issues without an active spawn-loop task.
 
-    Cross-references loom:building issues with daemon-state tracked issues
-    and checks progress files for fresh heartbeats.  Issues with a valid
-    file-based claim are skipped even if no daemon entry or fresh heartbeat
-    exists, because a CLI shepherd may be legitimately working on them.
+    Cross-references ``gh issue list --label loom:building`` against the
+    tracked issue set in ``.loom/spawn-loop-state.json::running``.  Issues
+    with a valid file-based claim are skipped (CLI-driven sweeps may hold
+    a claim without a spawn-loop entry).  Issues with a recently-applied
+    ``loom:building`` label are also skipped (label-age grace period).
     """
     try:
         building_issues = gh_issue_list(labels=["loom:building"])
@@ -340,10 +264,9 @@ def check_untracked_building(
             log_info("No loom:building issues found")
         return
 
-    tracked_issues: set[int] = set()
-    for entry in daemon_state.shepherds.values():
-        if entry.status == "working" and entry.issue is not None:
-            tracked_issues.add(entry.issue)
+    tracked_issues: set[int] = {
+        task.issue for task in spawn_loop_state.running if task.issue
+    }
 
     for issue_data in building_issues:
         issue_num = issue_data.get("number", 0)
@@ -354,14 +277,12 @@ def check_untracked_building(
 
         if issue_num in tracked_issues:
             if verbose:
-                log_info(f"  OK: tracked in daemon-state")
+                log_info(f"  OK: tracked in spawn-loop-state")
             continue
 
-        # File-based claim check (primary protection).
-        # This is checked first because it's local (no API call) and
-        # therefore the most reliable protection against false positives.
-        # A CLI shepherd may hold a valid claim without a daemon entry
-        # or fresh progress heartbeat (e.g., during a long builder subprocess).
+        # File-based claim check (primary protection, no API call).
+        # A CLI-driven sweep may hold a valid claim without a spawn-loop
+        # entry, e.g. during a long builder subprocess.
         if repo_root is not None:
             if has_valid_claim(repo_root, issue_num):
                 if verbose:
@@ -380,9 +301,8 @@ def check_untracked_building(
             )
 
         # Label-age grace period: skip issues where loom:building was
-        # applied recently.  This protects manual /shepherd runs and
-        # newly-claimed issues from premature orphan recovery before
-        # claims or heartbeats are established.
+        # applied recently.  Protects newly-claimed issues from premature
+        # orphan recovery before claims or heartbeats are established.
         if label_grace_period > 0:
             label_age = _get_building_label_age(issue_num)
             if label_age is not None and label_age < label_grace_period:
@@ -394,173 +314,102 @@ def check_untracked_building(
                     )
                 continue
 
-        # Not tracked in daemon-state; check progress files
-        has_fresh_progress = False
-        for progress in progress_files:
-            if progress.issue != issue_num:
-                continue
-            if progress.status != "working":
-                continue
-
-            hb = progress.last_heartbeat
-            if not hb:
-                if verbose:
-                    log_info(
-                        f"  Progress file for issue #{issue_num} "
-                        "has no heartbeat -- not trusted"
-                    )
-                continue
-
-            try:
-                age = elapsed_seconds(hb)
-            except (ValueError, OverflowError):
-                if verbose:
-                    log_info(
-                        f"  Progress file for issue #{issue_num} "
-                        "has unparseable heartbeat -- not trusted"
-                    )
-                continue
-
-            if age > heartbeat_threshold:
-                if verbose:
-                    log_info(
-                        f"  Progress file for issue #{issue_num} "
-                        f"has stale heartbeat ({age}s old) -- not trusted"
-                    )
-                continue
-
-            has_fresh_progress = True
-            if verbose:
-                log_info(
-                    f"  Found active progress file for issue #{issue_num} "
-                    f"(heartbeat {age}s old)"
-                )
-            break
-
-        if not has_fresh_progress:
-            if verbose:
-                log_warning(
-                    f"  ORPHANED: #{issue_num} has loom:building "
-                    "but no active shepherd"
-                )
-            result.orphaned.append(
-                OrphanEntry(
-                    type="untracked_building",
-                    issue=issue_num,
-                    title=issue_title,
-                    reason="no_daemon_entry",
-                )
+        if verbose:
+            log_warning(
+                f"  ORPHANED: #{issue_num} has loom:building "
+                "but no active spawn-loop task"
             )
+        result.orphaned.append(
+            OrphanEntry(
+                type="untracked_building",
+                issue=issue_num,
+                title=issue_title,
+                reason="no_spawn_loop_entry",
+            )
+        )
 
 
-def check_stale_progress(
-    progress_files: list[ShepherdProgress],
+def check_stale_heartbeats(
+    spawn_loop_state: SpawnLoopState,
     result: OrphanRecoveryResult,
     *,
     heartbeat_threshold: int = DEFAULT_HEARTBEAT_STALE_THRESHOLD,
     verbose: bool = False,
 ) -> None:
-    """Phase 3: Check progress files for stale heartbeats.
+    """Flag spawn-loop tasks whose heartbeat is stale and PID is dead.
 
-    Iterates progress files and flags those with stale heartbeats
-    as orphaned.
+    The spawn loop refreshes ``last_heartbeat`` every tick for every live
+    child PID (#3411).  A stale heartbeat therefore implies either:
+
+    - The spawn loop itself crashed or hung (no ticks happening), or
+    - The PID is gone but the state entry was not reaped (shouldn't happen,
+      but defensive).
+
+    Either way the entry is orphaned and should be cleaned up.  If the PID
+    is still alive we skip the entry — the spawn loop may have just been
+    paused / SIGSTOPped, and tearing down active work is the worst possible
+    outcome.
     """
-    for progress in progress_files:
+    for task in spawn_loop_state.running:
         if verbose:
             log_info(
-                f"Checking progress: task={progress.task_id}, "
-                f"issue=#{progress.issue}, status={progress.status}"
+                f"Checking task: issue=#{task.issue}, pid={task.pid}, "
+                f"heartbeat={task.last_heartbeat or '<missing>'}"
             )
 
-        if progress.status != "working":
-            if verbose:
-                log_info(f"  Skipping (status: {progress.status})")
-            continue
-
-        hb = progress.last_heartbeat
+        hb = task.last_heartbeat
         if not hb:
+            # No heartbeat is expected for pre-#3411 state files; nothing
+            # to flag.  (stuck_detection.py handles missing-heartbeat
+            # diagnostics on a faster cadence.)
+            if verbose:
+                log_info(
+                    f"  Skipping issue #{task.issue}: no heartbeat field"
+                )
             continue
 
         try:
             age = elapsed_seconds(hb)
         except (ValueError, OverflowError):
+            if verbose:
+                log_info(
+                    f"  Skipping issue #{task.issue}: "
+                    f"unparseable heartbeat '{hb}'"
+                )
+            continue
+
+        if age <= heartbeat_threshold:
+            if verbose:
+                log_info(
+                    f"  OK: issue #{task.issue} heartbeat {age}s old "
+                    f"(threshold: {heartbeat_threshold}s)"
+                )
+            continue
+
+        # Stale heartbeat — but skip if PID is still alive (loop paused,
+        # not crashed).  Tearing down an active sweep is the worst case.
+        if _pid_alive(task.pid):
+            if verbose:
+                log_info(
+                    f"  Skipping issue #{task.issue}: heartbeat stale "
+                    f"({age}s) but pid {task.pid} is alive"
+                )
             continue
 
         if verbose:
-            threshold_mins = heartbeat_threshold // 60
-            log_info(
-                f"  Heartbeat age: {age // 60}m "
-                f"(threshold: {threshold_mins}m)"
+            log_warning(
+                f"  ORPHANED: issue #{task.issue} heartbeat "
+                f"{age // 60}m old, pid {task.pid} dead"
             )
-
-        if age > heartbeat_threshold:
-            if verbose:
-                log_warning(
-                    f"  ORPHANED: task {progress.task_id} "
-                    f"has stale heartbeat ({age // 60}m old)"
-                )
-            result.orphaned.append(
-                OrphanEntry(
-                    type="stale_heartbeat",
-                    task_id=progress.task_id,
-                    issue=progress.issue if progress.issue else None,
-                    age_seconds=age,
-                    reason="heartbeat_stale",
-                )
+        result.orphaned.append(
+            OrphanEntry(
+                type="stale_heartbeat",
+                issue=task.issue if task.issue else None,
+                pid=task.pid,
+                age_seconds=age,
+                reason="heartbeat_stale",
             )
-
-
-def recover_shepherd(
-    repo_root: pathlib.Path,
-    shepherd_id: str,
-    issue: int | None,
-    task_id: str | None,
-    reason: str,
-    result: OrphanRecoveryResult,
-    *,
-    label_grace_period: int = DEFAULT_LABEL_GRACE_PERIOD,
-) -> None:
-    """Recovery action: Reset shepherd entry in daemon-state to idle."""
-    daemon_state_path = repo_root / ".loom" / "daemon-state.json"
-    data = read_json_file(daemon_state_path)
-    if not isinstance(data, dict):
-        return
-
-    ts = now_utc().strftime("%Y-%m-%dT%H:%M:%SZ")
-
-    shepherds = data.get("shepherds", {})
-    old_entry = shepherds.get(shepherd_id, {})
-
-    shepherds[shepherd_id] = {
-        "status": "idle",
-        "idle_since": ts,
-        "idle_reason": "orphan_recovery",
-        "last_issue": old_entry.get("issue"),
-        "last_completed": ts,
-    }
-    data["shepherds"] = shepherds
-    write_json_file(daemon_state_path, data)
-
-    log_info(f"Reset shepherd {shepherd_id} to idle in daemon-state")
-
-    if issue is not None and issue != 0:
-        recover_issue(
-            issue,
-            reason,
-            result,
-            repo_root=repo_root,
-            label_grace_period=label_grace_period,
         )
-
-    result.recovered.append(
-        RecoveryEntry(
-            action="reset_shepherd",
-            shepherd_id=shepherd_id,
-            issue=issue,
-            task_id=task_id,
-            reason=reason,
-        )
-    )
 
 
 def _cleanup_stale_worktree(repo_root: pathlib.Path, issue: int) -> bool:
@@ -674,30 +523,6 @@ def _cleanup_stale_worktree(repo_root: pathlib.Path, issue: int) -> bool:
     return True
 
 
-def _has_fresh_progress(
-    repo_root: pathlib.Path,
-    issue: int,
-    heartbeat_threshold: int = DEFAULT_HEARTBEAT_STALE_THRESHOLD,
-) -> bool:
-    """Re-read progress files from disk and check for a fresh heartbeat.
-
-    This is used as a last-chance guard before recovery to avoid acting on
-    stale scan results.  Returns True if a working progress file with a
-    fresh heartbeat exists for the given issue.
-    """
-    progress = find_progress_for_issue(repo_root, issue)
-    if progress is None or progress.status != "working":
-        return False
-    hb = progress.last_heartbeat
-    if not hb:
-        return False
-    try:
-        age = elapsed_seconds(hb)
-    except (ValueError, OverflowError):
-        return False
-    return age <= heartbeat_threshold
-
-
 def _has_recent_orphan_comment(
     issue: int, dedup_seconds: int = ORPHAN_COMMENT_DEDUP_SECONDS
 ) -> bool:
@@ -740,20 +565,16 @@ def recover_issue(
     result: OrphanRecoveryResult,
     *,
     repo_root: pathlib.Path | None = None,
-    heartbeat_threshold: int = DEFAULT_HEARTBEAT_STALE_THRESHOLD,
     label_grace_period: int = DEFAULT_LABEL_GRACE_PERIOD,
 ) -> None:
-    """Recovery action: Reset issue labels from loom:building to loom:issue.
+    """Recovery action: Reset issue labels from ``loom:building`` to ``loom:issue``.
 
     If ``repo_root`` is provided and a valid file-based claim exists for the
-    issue, recovery is skipped to avoid disrupting an active shepherd.
-
-    Additionally, re-reads progress files from disk before acting.  A fresh
-    heartbeat that appeared after the initial scan will abort recovery.
+    issue, recovery is skipped to avoid disrupting an active sweep.
 
     A label-age grace period provides defense-in-depth: if the
     ``loom:building`` label was applied recently (within *label_grace_period*
-    seconds), recovery is skipped regardless of claim or heartbeat state.
+    seconds), recovery is skipped regardless of claim state.
     """
     # Defense-in-depth: skip recovery if the label was recently applied.
     if label_grace_period > 0:
@@ -772,19 +593,10 @@ def recover_issue(
         )
         return
 
-    if repo_root is not None and _has_fresh_progress(
-        repo_root, issue, heartbeat_threshold
-    ):
-        log_warning(
-            f"Skipping recovery for issue #{issue}: "
-            "fresh progress heartbeat found on re-read"
-        )
-        return
-
     if repo_root is None:
         log_warning(
             f"repo_root is None for issue #{issue} recovery — "
-            "cannot verify claims or progress files"
+            "cannot verify claims"
         )
 
     # Clean up stale worktree if present (0 commits ahead, no meaningful changes)
@@ -799,7 +611,6 @@ def recover_issue(
                     reason=reason,
                 )
             )
-
 
     try:
         gh_run([
@@ -824,13 +635,13 @@ def recover_issue(
         "This issue was automatically recovered from an orphaned state.\n\n"
         f"**Reason**: {reason}\n"
         "**What happened**:\n"
-        "- The daemon or shepherd that was working on this issue "
+        "- The spawn-loop task that was working on this issue "
         "crashed or was terminated\n"
         "- The issue was left in `loom:building` state with no active worker\n\n"
         "**Action taken**:\n"
         + "\n".join(actions)
         + "\n\n"
-        "This issue is now available for a new shepherd to pick up.\n\n"
+        "This issue is now available for a new sweep to pick up.\n\n"
         "---\n"
         f"*Recovered by loom-recover-orphans at {ts}*"
     )
@@ -852,59 +663,6 @@ def recover_issue(
     log_success(f"Recovered issue #{issue}")
 
 
-def recover_progress_file(
-    repo_root: pathlib.Path,
-    progress: ShepherdProgress,
-    result: OrphanRecoveryResult,
-    *,
-    label_grace_period: int = DEFAULT_LABEL_GRACE_PERIOD,
-) -> None:
-    """Recovery action: Mark progress file status as errored."""
-    progress_dir = repo_root / ".loom" / "progress"
-    progress_path = progress_dir / f"shepherd-{progress.task_id}.json"
-
-    if not progress_path.is_file():
-        return
-
-    data = read_json_file(progress_path)
-    if not isinstance(data, dict):
-        return
-
-    ts = now_utc().strftime("%Y-%m-%dT%H:%M:%SZ")
-    data["status"] = "errored"
-    data["last_heartbeat"] = ts
-
-    milestones = data.get("milestones", [])
-    milestones.append({
-        "event": "error",
-        "timestamp": ts,
-        "data": {"error": "orphan_recovery", "will_retry": False},
-    })
-    data["milestones"] = milestones
-
-    write_json_file(progress_path, data)
-    log_info(f"Marked progress file for task {progress.task_id} as errored")
-
-    issue = progress.issue if progress.issue else None
-    if issue is not None and issue != 0:
-        recover_issue(
-            issue,
-            "stale_heartbeat",
-            result,
-            repo_root=repo_root,
-            label_grace_period=label_grace_period,
-        )
-
-    result.recovered.append(
-        RecoveryEntry(
-            action="mark_progress_errored",
-            task_id=progress.task_id,
-            issue=issue,
-            reason="stale_heartbeat",
-        )
-    )
-
-
 def run_orphan_recovery(
     repo_root: pathlib.Path,
     *,
@@ -913,58 +671,47 @@ def run_orphan_recovery(
 ) -> OrphanRecoveryResult:
     """Run all orphan detection phases and optionally recover.
 
-    Known invocation paths:
-    - Daemon iteration loop (daemon_v2/iteration.py) when snapshot detects
-      orphaned_count > 0
-    - Daemon startup cleanup (daemon_cleanup.py daemon-startup event)
-    - Daemon stall recovery Level 2 (unconditional, bypasses orphaned_count gate)
-    - CLI: ``recover-orphaned-shepherds.sh [--recover]``
+    Reads ``.loom/spawn-loop-state.json`` (Phase 1, #3374) and cross-checks
+    against ``gh issue list --label loom:building``.
 
-    No autonomous agent role (Guide, Champion, Auditor) calls this directly.
-    The Guide role runs ``stale-building-check.sh`` which is a separate script
-    with different thresholds (2h vs 5min) and detection logic.
+    Known invocation paths after Phase 3.1.6 (#3395):
 
-    Returns an OrphanRecoveryResult with all detected orphans
-    and any recovery actions taken.
+    - CLI: ``./.loom/scripts/recover-orphaned-shepherds.sh [--recover]``
+      (script is a thin stub delegating here).
+    - Pre-Phase-3 daemon callers (``daemon_v2/iteration.py``,
+      ``daemon_cleanup.py``) still call ``run_orphan_recovery`` with the
+      same ``(repo_root, *, recover, verbose)`` signature; they retire as a
+      unit in Phase 3.3.
+
+    Returns an :class:`OrphanRecoveryResult` with all detected orphans and
+    any recovery actions taken.
     """
     result = OrphanRecoveryResult(recover_mode=recover)
     heartbeat_threshold = _get_heartbeat_stale_threshold()
     label_grace_period = _get_label_grace_period()
 
-    daemon_state = read_daemon_state(repo_root)
-    progress_files = read_progress_files(repo_root)
+    spawn_loop_state = read_spawn_loop_state(repo_root)
 
-    # Log diagnostic context: is a daemon actively running?
-    # When daemon_state.running is False, this recovery was likely triggered
-    # by a CLI invocation, daemon startup cleanup, or a lingering daemon
-    # from a previous session.  This helps diagnose unexpected recovery
-    # events (see issue #2567).
-    if not daemon_state.running:
-        if verbose:
-            log_info(
-                "Orphan recovery running without active daemon "
-                "(daemon_state.running=False). "
-                "Invocation is likely from CLI, daemon startup, "
-                "or a lingering previous session."
-            )
+    if not spawn_loop_state.present and verbose:
+        log_info(
+            "No .loom/spawn-loop-state.json found — assuming no "
+            "spawn-loop tasks. Proceeding to forge cross-check only."
+        )
+        # An absent state file means "nothing tracked locally"; the forge
+        # cross-check still runs and may surface untracked-building orphans.
 
-    # Phase 1: Check daemon-state task IDs
-    check_daemon_state_tasks(daemon_state, result, verbose=verbose)
-
-    # Phase 2: Check untracked loom:building issues
+    # Phase A: cross-check loom:building issues against spawn-loop tasks.
     check_untracked_building(
-        daemon_state,
-        progress_files,
+        spawn_loop_state,
         result,
         repo_root=repo_root,
-        heartbeat_threshold=heartbeat_threshold,
         label_grace_period=label_grace_period,
         verbose=verbose,
     )
 
-    # Phase 3: Check stale progress files
-    check_stale_progress(
-        progress_files,
+    # Phase B: flag spawn-loop tasks with stale heartbeats whose PID is dead.
+    check_stale_heartbeats(
+        spawn_loop_state,
         result,
         heartbeat_threshold=heartbeat_threshold,
         verbose=verbose,
@@ -973,40 +720,18 @@ def run_orphan_recovery(
     if not recover:
         return result
 
-    # Perform recovery for detected orphans
+    # Perform recovery for detected orphans.  Both orphan types resolve to
+    # the same recovery action: flip the issue label back to loom:issue so
+    # a new sweep can pick it up.
     for orphan in list(result.orphaned):
-        if orphan.type in ("stale_task_id", "invalid_task_id"):
-            if orphan.shepherd_id:
-                recover_shepherd(
-                    repo_root,
-                    orphan.shepherd_id,
-                    orphan.issue,
-                    orphan.task_id,
-                    orphan.reason,
-                    result,
-                    label_grace_period=label_grace_period,
-                )
-        elif orphan.type == "untracked_building":
-            if orphan.issue:
-                recover_issue(
-                    orphan.issue,
-                    orphan.reason,
-                    result,
-                    repo_root=repo_root,
-                    heartbeat_threshold=heartbeat_threshold,
-                    label_grace_period=label_grace_period,
-                )
-        elif orphan.type == "stale_heartbeat":
-            # Find the matching progress file
-            for progress in progress_files:
-                if progress.task_id == orphan.task_id:
-                    recover_progress_file(
-                        repo_root,
-                        progress,
-                        result,
-                        label_grace_period=label_grace_period,
-                    )
-                    break
+        if orphan.issue:
+            recover_issue(
+                orphan.issue,
+                orphan.reason,
+                result,
+                repo_root=repo_root,
+                label_grace_period=label_grace_period,
+            )
 
     return result
 
@@ -1021,36 +746,23 @@ def format_result_human(result: OrphanRecoveryResult) -> str:
     lines: list[str] = []
 
     if result.total_orphaned == 0:
-        lines.append("No orphaned shepherds found")
+        lines.append("No orphaned tasks found")
     else:
-        lines.append(f"Found {result.total_orphaned} orphaned shepherd(s)")
+        lines.append(f"Found {result.total_orphaned} orphaned task(s)")
         lines.append("")
 
         for orphan in result.orphaned:
-            if orphan.type == "invalid_task_id":
-                lines.append(
-                    f"  [{orphan.type}] {orphan.shepherd_id}: "
-                    f"invalid task_id '{orphan.task_id}' "
-                    f"(issue #{orphan.issue})"
-                )
-            elif orphan.type == "stale_task_id":
-                lines.append(
-                    f"  [{orphan.type}] {orphan.shepherd_id}: "
-                    f"task {orphan.task_id} not found "
-                    f"(issue #{orphan.issue})"
-                )
-            elif orphan.type == "untracked_building":
+            if orphan.type == "untracked_building":
                 lines.append(
                     f"  [{orphan.type}] #{orphan.issue}: "
                     f"{orphan.title or 'no title'} "
-                    f"-- no active shepherd"
+                    f"-- no active spawn-loop task"
                 )
             elif orphan.type == "stale_heartbeat":
                 age_str = format_duration(orphan.age_seconds or 0)
                 lines.append(
-                    f"  [{orphan.type}] task {orphan.task_id}: "
-                    f"heartbeat stale ({age_str}) "
-                    f"(issue #{orphan.issue})"
+                    f"  [{orphan.type}] issue #{orphan.issue} "
+                    f"(pid {orphan.pid}): heartbeat stale ({age_str})"
                 )
 
         if result.recover_mode:
@@ -1066,7 +778,7 @@ def format_result_human(result: OrphanRecoveryResult) -> str:
 def main(argv: list[str] | None = None) -> int:
     """Main entry point for orphan recovery CLI."""
     parser = argparse.ArgumentParser(
-        description="Detect and recover orphaned shepherd state",
+        description="Detect and recover orphaned spawn-loop task state",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""\
 Exit codes:
@@ -1075,16 +787,16 @@ Exit codes:
     2 - Orphans detected
 
 Orphan types:
-    stale_task_id       - Shepherd has task_id but task output file is gone
-    invalid_task_id     - Shepherd has malformed task_id (not 7-char hex)
-    untracked_building  - Issue has loom:building but no active shepherd
-    stale_heartbeat     - Progress file heartbeat is stale
+    untracked_building  - Issue has loom:building but no spawn-loop task
+    stale_heartbeat     - Spawn-loop task heartbeat is stale and pid is dead
 
 Recovery actions:
-    reset_shepherd          - Reset shepherd entry to idle in daemon-state
     reset_issue_label       - Swap loom:building -> loom:issue on issue
     cleanup_stale_worktree  - Remove stale worktree + branches (0 commits, no changes)
-    mark_progress_errored   - Mark progress file status as errored
+
+Sources of truth:
+    .loom/spawn-loop-state.json           - Live spawn-loop tasks (Phase 1, #3374)
+    gh issue list --label loom:building   - Forge label cross-check
 
 Environment variables:
     LOOM_HEARTBEAT_STALE_THRESHOLD  Seconds before heartbeat is stale (default: 300)
@@ -1117,7 +829,7 @@ Environment variables:
         return 1
 
     if not args.json:
-        log_info("Orphaned Shepherd Detection & Recovery")
+        log_info("Orphaned Spawn-Loop Task Detection & Recovery")
         if not args.recover:
             log_info("DRY RUN - No changes will be made")
             log_info("Use --recover to actually perform recovery")
