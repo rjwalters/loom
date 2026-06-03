@@ -436,7 +436,7 @@ Safety Features:
   ✓ Symlinks .mcp.json from main (MCP config visible in worktrees)
   ✓ Runs project-specific hooks after creation
   ✓ Stashes/restores local changes during pull
-  ✓ Per-issue lock serializes concurrent invocations (issue #3380)
+  ✓ Repo-global lock serializes concurrent invocations (issue #3380)
   ✓ Recovers from stale .git/worktrees/issue-N/index.lock files
   ✓ Recovers from half-created .loom/worktrees/issue-N/ dirs
 

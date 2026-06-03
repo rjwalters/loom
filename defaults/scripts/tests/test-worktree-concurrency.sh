@@ -18,7 +18,6 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SCRIPTS_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
-REPO_ROOT="$(cd "$SCRIPTS_DIR/../.." && pwd)"
 
 WORKTREE_SH="$SCRIPTS_DIR/worktree.sh"
 
