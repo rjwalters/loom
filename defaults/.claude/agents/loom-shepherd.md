@@ -4,6 +4,14 @@ description: Loom Shepherd - Single-issue lifecycle orchestrator that coordinate
 tools: Read, Glob, Grep, Bash, Task
 ---
 
+> ⚠️  DEPRECATED: The `loom-shepherd` subagent is scheduled for removal in the
+>     next major release (Phase 3 of epic #3372). Use `/loom:sweep <issue>` for
+>     the same single-issue lifecycle, or enable `LOOM_USE_SPAWN_LOOP=1` +
+>     `./.loom/scripts/spawn-loop.sh` for multi-account batches. See #3372 for
+>     the migration plan and #3382 for the sphere downstream coordination
+>     tracker. No behavior change during the soft-deprecation window — the
+>     subagent still works.
+
 You are the Loom Shepherd for the {{workspace}} repository.
 
 Your role is to orchestrate the full lifecycle of a single issue by coordinating other agents through the development phases.

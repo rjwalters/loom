@@ -1814,7 +1814,7 @@ Loom is in the middle of an orchestration-architecture migration (epic #3372). T
 | Phase 2a | #3375 | GitHub Actions workflows replacing support-role daemons | in progress (parallel) |
 | Phase 2b | #3376 | **Soft-deprecation warnings on every deprecated entry point** (this PR) | this change |
 | Phase 3 | TBD | Hard deletion of shepherd brain, daemon brain, and `/shepherd` skill | next major release |
-| Phase 4 | TBD | Coordinated downstream sphere-install migration | parallel with Phase 3 |
+| Phase 4 | #3382 | Coordinated downstream sphere-install migration (deprecation banners in installed templates + this migration section) | in progress (parallel) |
 
 **Deprecated entry points (still functional, now warn on use):**
 
@@ -1831,6 +1831,62 @@ Loom is in the middle of an orchestration-architecture migration (epic #3372). T
 
 - Python: `loom_tools.common.deprecation.warn_deprecated(component, replacement, ref="#3372")`
 - Shell: `source .loom/scripts/lib/deprecation.sh; warn_deprecated <component> <replacement> [ref]` — the bash helper is safe to source (no side effects).
+
+## Migrating off shepherd + daemon (downstream consumers, Phase 4 of #3372)
+
+If you installed Loom via `scripts/install-loom.sh` (or `install.sh`), the daemon brain (`loom-tools/src/loom_tools/daemon_v2/`), the shepherd brain (`loom-tools/src/loom_tools/shepherd/`), and the `/shepherd` slash command are scheduled for **hard deletion in the next major Loom release** (Phase 3 of epic #3372, tracked as part of #3382). This section is the migration guide for downstream consumers. It complements the upstream phase table in the section above — that table is the timeline; this section is the action list.
+
+### What you can still rely on (post-Phase-3)
+
+These surfaces are **not** going away and are the supported replacements:
+
+| Capability | Replacement | Where |
+|------------|-------------|-------|
+| Single-issue lifecycle (curator → builder → judge → doctor → merge) | `/loom:sweep <issue>` | `.claude/commands/loom/sweep.md` |
+| Multi-issue / multi-account batch orchestration | `LOOM_USE_SPAWN_LOOP=1 ./.loom/scripts/spawn-loop.sh` | Phase 1, #3374 |
+| Periodic support roles (Champion, Curator, Judge, Auditor, Guide) | GitHub Actions cron workflows | `.github/workflows/loom-*.yml`, Phase 2a, #3375 |
+| Per-task multi-account token rotation | `./.loom/scripts/spawn-claude.sh` + `.loom/tokens/` | Unchanged |
+| Label-based coordination (`loom:issue` → `loom:building` → `loom:pr` → merged) | Unchanged | `.github/labels.yml` |
+| Worktree workflow (`./.loom/scripts/worktree.sh`) | Unchanged | `.loom/scripts/worktree.sh` |
+| `merge-pr.sh` for worktree-safe PR merging | Unchanged | `.loom/scripts/merge-pr.sh` |
+
+### What is being deprecated (and what to do)
+
+| Deprecated surface | Soft-deprecated since | What to do |
+|--------------------|----------------------|------------|
+| `loom-daemon` Python CLI / `./.loom/scripts/daemon.sh start` | Phase 2b (#3376) | Stop calling them. For build-out: switch to the spawn loop. For support roles: enable the GitHub Actions workflows under `.github/workflows/loom-*.yml`. |
+| `loom-shepherd` Python CLI | Phase 2b (#3376) | Replace shell invocations with `claude -p "/loom:sweep <N>" --dangerously-skip-permissions`. The lifecycle phases are identical; checkpointing (#3373) is preserved. |
+| `/shepherd` slash command | Phase 2b (#3376) | Use `/loom:sweep <issue>` instead. Both run Curator → Builder → Judge → Doctor → Merge; the sweep skill is the maintained path. |
+| `loom-daemon`/`loom-shepherd` subagents (`.claude/agents/loom-{daemon,shepherd}.md`) | Phase 4 (this section, #3382) | Stop dispatching to them from custom slash commands or hooks. The agent files themselves will be removed in Phase 3 along with the role definitions they point at (`.loom/roles/{loom,shepherd}.md`). |
+| `.loom/daemon-state.json` and `.loom/progress/shepherd-*.json` consumers | Will be silent after Phase 3 | The producers are being deleted. The per-consumer disposition table lives in `docs/migration/daemon-state-consumers.md` (PR #3389) — read it before writing new code that depends on either file. Most operator CLIs are slated to port to `.loom/spawn-loop-state.json` + forge queries; a few retire entirely. |
+
+### Three migration paths for downstream consumers
+
+You have three valid choices for handling the next major release. None of them require you to migrate before Phase 3 ships — they just determine what happens on your next `install-loom.sh` run.
+
+**(a) Migrate now (recommended for active deployments).** Switch to `/loom:sweep` + spawn loop + GitHub Actions workflows on your main branch before Phase 3 ships. Your `install-loom.sh` run after Phase 3 lands will cleanly install the new defaults with no manual cleanup.
+
+**(b) Defer migration (acceptable for downstream timelines).** Coordinate with the Loom maintainer to time Phase 3's merge with a migration window that suits your release schedule. The mechanic is a comment thread on #3382. Soft-deprecation warnings (Phase 2b) will continue rendering in your logs during the deferral; use `LOOM_SUPPRESS_DEPRECATION=1` to silence the Python/shell variants if needed (the `/shepherd` markdown skill warning always renders).
+
+**(c) Pin to a pre-Phase-3 Loom version (acceptable, but opts you out of upgrades).** Stop running `install-loom.sh` against your repo, or pin `loom` to a specific tag in your install scripts. This is a valid operator choice — it simply means you stop receiving Loom upgrades until you choose to migrate. The installer is idempotent and will not overwrite your pinned files on a no-op invocation, but rerunning it after pinning intentionally to a new Loom version will replace them.
+
+### Why this matters for the installed `defaults/` tree
+
+When Phase 3 ships, the next time you run `scripts/install-loom.sh` (or `install.sh`) against your repo, these files will **disappear from `defaults/`** and therefore from your repo's `.claude/agents/` and `.claude/commands/loom/`:
+
+- `defaults/.claude/agents/loom-daemon.md`
+- `defaults/.claude/agents/loom-shepherd.md`
+- `defaults/.claude/commands/loom/shepherd.md`
+- `defaults/.claude/commands/loom/shepherd-lifecycle.md`
+- `defaults/roles/loom.md` and `defaults/roles/shepherd.md`
+
+If you have custom slash commands, hooks, or scripts that reference any of these paths, the next install will quietly stop installing them. The deprecation banners on the three template files (added in Phase 4, this issue) exist so you see the warning on your **very next** install — well before Phase 3 actually removes them.
+
+### Coordination and questions
+
+- **Upstream tracker**: #3382 ("Phase 4: sphere downstream coordination tracker"). Open a comment there if you need to coordinate timing, request a deferral window, or report a missing migration path.
+- **Consumer inventory + disposition table**: `docs/migration/daemon-state-consumers.md` (PR #3389) — read this if you have code that imports from `loom_tools.daemon_v2` or `loom_tools.shepherd`, or reads `.loom/daemon-state.json` or `.loom/progress/`.
+- **Phase 2d follow-up**: Architect/Hermit work-generation cadence after the daemon is removed — tracked in #3381.
 
 ## Resources
 
