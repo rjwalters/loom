@@ -50,9 +50,17 @@
 #
 # State files:
 #   .loom/spawn-loop.pid             Running PID
-#   .loom/spawn-loop-state.json      {started_at, running:[{issue, pid, started_at, token, output_file}]}
+#   .loom/spawn-loop-state.json      {started_at, running:[{issue, pid, started_at, token, output_file, last_heartbeat}]}
 #   .loom/logs/spawn-loop.log        Loop log (timestamped spawn/exit/error entries)
 #   .loom/logs/sweep-issue-<N>.log   Per-issue child output (same path stored in tasks[].output_file)
+#
+# Heartbeat semantics (#3392):
+#   Each task's `last_heartbeat` is refreshed once per tick when the child PID
+#   is still alive (i.e. the loop has confirmed the child is responsive enough
+#   to not be reaped). Consumed by `loom-stuck-detection` (Phase 3.1.3 of epic
+#   #3372) as the staleness signal — replaces the per-shepherd progress files
+#   (`.loom/progress/shepherd-*.json::last_heartbeat`) that the daemon brain
+#   used to write.
 #   .loom/locks/issue-<N>/           Atomic claim lock (mkdir primitive)
 #   .loom/stop-spawn-loop            Touch to request graceful shutdown
 #
@@ -189,6 +197,10 @@ state_count_running() {
 #   $4 output_file  Absolute path to per-issue child log (optional; spawn_sweep
 #                   always supplies it). Empty/missing -> omitted from the JSON
 #                   entry so old consumers tolerate it.
+#
+# Also seeds `last_heartbeat` with the spawn timestamp so consumers
+# (loom-stuck-detection, #3392) have a non-null value for newly-spawned tasks
+# that haven't yet survived a `state_reap_dead` tick.
 state_add_child() {
     local issue="$1" pid="$2" token="${3:-unknown}" output_file="${4:-}"
     python3 - "$STATEFILE" "$issue" "$pid" "$token" "$output_file" <<'PY'
@@ -196,11 +208,15 @@ import json, sys, datetime, os
 path, issue, pid, token, output_file = sys.argv[1:6]
 with open(path) as f:
     data = json.load(f)
+now = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 entry = {
     "issue": int(issue),
     "pid": int(pid),
-    "started_at": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+    "started_at": now,
     "token": token,
+    # #3392: seed `last_heartbeat` with the spawn timestamp so loom-stuck-detection
+    # has a non-null value before the first `state_reap_dead` tick refreshes it.
+    "last_heartbeat": now,
 }
 if output_file:
     # #3393: per-task output-file path consumed by loom-completions to detect
@@ -217,28 +233,45 @@ PY
 # Remove all children whose pid is no longer alive. Prints issue numbers of
 # the removed entries (one per line) so the caller can decide whether to
 # unlock / re-queue.
+#
+# Side effect (#3392): for every child confirmed alive (signal 0 succeeds),
+# refresh `last_heartbeat` to the current UTC timestamp. This is the spawn
+# loop's heartbeat write — `loom-stuck-detection` reads this field to detect
+# children that the OS has not killed but that have stopped making progress
+# (e.g. wedged on a network call). Note the limitation: this is a
+# *loop-level* heartbeat, not a *task-level* one — a wedged child whose PID
+# is still alive will keep refreshing forever. Detection of true wedging
+# requires the child itself to write to its own state, which the spawn loop
+# does not coordinate (by design — see #3372 epic for the minimal-spawn-loop
+# scope). The 2-minute default `heartbeat_stale` threshold is therefore best
+# at catching loop crashes / unresponsive ticks, not hung sweep subprocesses.
 state_reap_dead() {
     [[ -f "$STATEFILE" ]] || return 0
     python3 - "$STATEFILE" <<'PY'
-import json, os, sys, errno
+import json, os, sys, errno, datetime
 path = sys.argv[1]
 with open(path) as f:
     data = json.load(f)
+now_iso = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 alive, dead = [], []
 for c in data.get("running", []):
     pid = int(c.get("pid", 0))
     try:
         os.kill(pid, 0)  # signal 0: existence check
+        c["last_heartbeat"] = now_iso
         alive.append(c)
     except ProcessLookupError:
         dead.append(c)
     except PermissionError:
         # Process exists but we don't own it — count as alive (defensive).
+        # Still refresh heartbeat: if we can't signal it, we still see it.
+        c["last_heartbeat"] = now_iso
         alive.append(c)
     except OSError as e:
         if e.errno == errno.ESRCH:
             dead.append(c)
         else:
+            c["last_heartbeat"] = now_iso
             alive.append(c)
 data["running"] = alive
 tmp = path + ".tmp"
