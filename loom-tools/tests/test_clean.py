@@ -12,14 +12,20 @@ import pytest
 from loom_tools.clean import (
     CleanupStats,
     PRStatus,
+    _active_locked_issues,
+    _active_spawn_loop_issues,
+    _clear_stale_spawn_loop_locks,
     _get_dir_size,
     check_grace_period,
     check_uncommitted_changes,
     clean_agent_config,
     clean_daemon_crash_state,
+    clean_stale_spawn_loop_locks,
+    clean_worktrees,
     find_editable_pip_installs,
     main,
     print_summary,
+    update_cleanup_state,
 )
 from loom_tools.common.repo import clear_repo_cache
 
@@ -531,6 +537,142 @@ class TestCleanAgentConfig:
         assert not (config_base / "agent-1").exists()
 
 
+class TestSpawnLoopIntegration:
+    """Spawn-loop-aware claim-set integration (Phase 3.1.9, #3398).
+
+    Verifies that ``loom-clean`` reads ``.loom/spawn-loop-state.json`` and
+    ``.loom/locks/issue-<N>/`` instead of the retired ``.loom/daemon-state.json``.
+    """
+
+    def test_active_locked_issues_empty_when_no_dir(
+        self, mock_repo: pathlib.Path
+    ) -> None:
+        assert _active_locked_issues(mock_repo) == set()
+
+    def test_active_locked_issues_reads_issue_dirs(
+        self, mock_repo: pathlib.Path
+    ) -> None:
+        locks_dir = mock_repo / ".loom" / "locks"
+        locks_dir.mkdir(parents=True)
+        (locks_dir / "issue-42").mkdir()
+        (locks_dir / "issue-99").mkdir()
+        # Non-issue-N entries should be ignored.
+        (locks_dir / "stray.txt").write_text("noise")
+        (locks_dir / "garbage").mkdir()
+        assert _active_locked_issues(mock_repo) == {42, 99}
+
+    def test_active_spawn_loop_unions_state_and_locks(
+        self, mock_repo: pathlib.Path
+    ) -> None:
+        # Locks hold #100; state holds #200 — both should appear.
+        locks_dir = mock_repo / ".loom" / "locks"
+        locks_dir.mkdir(parents=True)
+        (locks_dir / "issue-100").mkdir()
+        state_path = mock_repo / ".loom" / "spawn-loop-state.json"
+        state_path.write_text(json.dumps({
+            "running": [{"issue": 200, "pid": 1}],
+        }))
+        assert _active_spawn_loop_issues(mock_repo) == {100, 200}
+
+    def test_active_spawn_loop_handles_missing_state(
+        self, mock_repo: pathlib.Path
+    ) -> None:
+        # No state file, no locks — empty set, no exceptions.
+        assert _active_spawn_loop_issues(mock_repo) == set()
+
+    def test_clear_stale_locks_keeps_live_tasks(
+        self, mock_repo: pathlib.Path
+    ) -> None:
+        locks_dir = mock_repo / ".loom" / "locks"
+        locks_dir.mkdir(parents=True)
+        (locks_dir / "issue-42").mkdir()
+        (locks_dir / "issue-43").mkdir()
+        state_path = mock_repo / ".loom" / "spawn-loop-state.json"
+        state_path.write_text(json.dumps({
+            "running": [{"issue": 42, "pid": 12345}],
+        }))
+        removed = _clear_stale_spawn_loop_locks(mock_repo)
+        assert removed == 1
+        assert (locks_dir / "issue-42").exists()
+        assert not (locks_dir / "issue-43").exists()
+
+    def test_clear_stale_locks_dry_run(self, mock_repo: pathlib.Path) -> None:
+        locks_dir = mock_repo / ".loom" / "locks"
+        locks_dir.mkdir(parents=True)
+        (locks_dir / "issue-7").mkdir()
+        removed = _clear_stale_spawn_loop_locks(mock_repo, dry_run=True)
+        assert removed == 1
+        assert (locks_dir / "issue-7").exists()  # dry-run keeps the dir
+
+    def test_clean_stale_spawn_loop_locks_public_wrapper(
+        self, mock_repo: pathlib.Path
+    ) -> None:
+        locks_dir = mock_repo / ".loom" / "locks"
+        locks_dir.mkdir(parents=True)
+        (locks_dir / "issue-11").mkdir()
+        stats = CleanupStats()
+        # Just verify the wrapper doesn't blow up and the dir is gone.
+        clean_stale_spawn_loop_locks(mock_repo, stats)
+        assert not (locks_dir / "issue-11").exists()
+
+    def test_clean_worktrees_skips_active_spawn_loop_issue(
+        self, mock_repo: pathlib.Path
+    ) -> None:
+        """A worktree for an issue in `spawn-loop-state.json::running` is preserved."""
+        # Create a worktree dir for issue 50.
+        wt = mock_repo / ".loom" / "worktrees" / "issue-50"
+        wt.mkdir(parents=True)
+        # Spawn-loop says #50 is running.
+        state_path = mock_repo / ".loom" / "spawn-loop-state.json"
+        state_path.write_text(json.dumps({
+            "running": [{"issue": 50, "pid": 1}],
+        }))
+        stats = CleanupStats()
+        # Patch out external probes that would otherwise short-circuit.
+        with patch("loom_tools.clean.find_processes_using_directory", return_value=[]), \
+             patch("loom_tools.clean.find_editable_pip_installs", return_value=[]):
+            clean_worktrees(mock_repo, stats)
+        assert wt.exists(), "live spawn-loop task must prevent worktree removal"
+        assert stats.skipped_in_use == 1
+
+    def test_clean_worktrees_force_bypasses_spawn_loop_check(
+        self, mock_repo: pathlib.Path
+    ) -> None:
+        """`--force` ignores the spawn-loop active check (existing semantics)."""
+        wt = mock_repo / ".loom" / "worktrees" / "issue-60"
+        wt.mkdir(parents=True)
+        # #60 is running per spawn-loop-state — would normally be preserved.
+        state_path = mock_repo / ".loom" / "spawn-loop-state.json"
+        state_path.write_text(json.dumps({
+            "running": [{"issue": 60, "pid": 2}],
+        }))
+        stats = CleanupStats()
+        # `force=True` skips the in-use check; gh issue view will be polled
+        # for the CLOSED check — short-circuit by patching gh_run.
+        with patch("loom_tools.clean.find_processes_using_directory", return_value=[]), \
+             patch("loom_tools.clean.find_editable_pip_installs", return_value=[]), \
+             patch("loom_tools.clean.gh_run") as m_gh:
+            m_gh.return_value = subprocess.CompletedProcess(
+                args=[], returncode=0, stdout="OPEN", stderr=""
+            )
+            clean_worktrees(mock_repo, stats, force=True)
+        # With force=True + OPEN state, the worktree should NOT be removed
+        # (issue is OPEN — open-issue gate still wins), but the spawn-loop
+        # active check should NOT increment skipped_in_use.
+        assert stats.skipped_in_use == 0, "force=True bypasses spawn-loop check"
+
+    def test_update_cleanup_state_is_noop(self, mock_repo: pathlib.Path) -> None:
+        """Phase 3.1.9 (#3398): the shim must not write anything."""
+        # Pre-create a daemon-state.json to prove it's not touched.
+        ds = mock_repo / ".loom" / "daemon-state.json"
+        ds.write_text(json.dumps({"running": True, "shepherds": {}}))
+        original = ds.read_text()
+        update_cleanup_state(mock_repo, 1, "cleaned")
+        update_cleanup_state(mock_repo, 2, "pending")
+        update_cleanup_state(mock_repo, 3, "error")
+        assert ds.read_text() == original, "update_cleanup_state must not write"
+
+
 class TestDocumentedDivergences:
     """Tests documenting intentional behavioral differences between bash and Python.
 
@@ -588,34 +730,80 @@ class TestDocumentedDivergences:
 
 
 class TestCleanDaemonCrashState:
-    """Tests for clean_daemon_crash_state (--daemon flag, issue #3099)."""
+    """Tests for clean_daemon_crash_state (--daemon flag).
 
-    def test_cleans_claims_dir(self, mock_repo: pathlib.Path) -> None:
-        """Should remove all claim files."""
-        claims_dir = mock_repo / ".loom" / "claims"
-        claims_dir.mkdir(parents=True)
-        (claims_dir / "42.json").write_text('{"issue": 42}')
-        (claims_dir / "43.json").write_text('{"issue": 43}')
+    Rewritten in Phase 3.1.9 (#3398) — the function now targets
+    spawn-loop state files (`.loom/spawn-loop-state.json` +
+    `.loom/locks/issue-<N>/`) instead of the retired daemon brain's
+    `.loom/daemon-state.json` + `.loom/claims/` + `.loom/progress/`.
+    """
+
+    def _ghrun_factory(self, building_issues: list[int]):
+        """Build a mock gh_run that returns `building_issues` for an
+        `issue list --label loom:building` invocation."""
+        def fake(args, check=False):
+            del check
+            joined = " ".join(args)
+            stdout = ""
+            if "issue" in args and "list" in args and "loom:building" in joined:
+                stdout = "\n".join(str(n) for n in building_issues) + (
+                    "\n" if building_issues else ""
+                )
+            return subprocess.CompletedProcess(
+                args=args, returncode=0, stdout=stdout, stderr=""
+            )
+        return fake
+
+    def test_clears_stale_locks_only(self, mock_repo: pathlib.Path) -> None:
+        """Locks whose issue is not in spawn-loop-state.running are removed."""
+        locks_dir = mock_repo / ".loom" / "locks"
+        locks_dir.mkdir(parents=True)
+        (locks_dir / "issue-42").mkdir()
+        (locks_dir / "issue-43").mkdir()
+
+        state_path = mock_repo / ".loom" / "spawn-loop-state.json"
+        state_path.write_text(json.dumps({
+            "started_at": "2026-06-02T16:12:19Z",
+            "running": [{"issue": 42, "pid": 12345}],
+        }))
 
         with patch("loom_tools.clean._list_loom_tmux_sessions", return_value=[]), \
-             patch("loom_tools.daemon_cleanup._terminate_active_sessions"), \
-             patch("loom_tools.daemon_cleanup._revert_shepherd_labels"):
+             patch("loom_tools.clean.gh_run", side_effect=self._ghrun_factory([])):
             clean_daemon_crash_state(mock_repo)
 
-        assert not list(claims_dir.glob("*.json"))
+        assert (locks_dir / "issue-42").exists(), "live task lock must remain"
+        assert not (locks_dir / "issue-43").exists(), "stale lock must go"
 
-    def test_cleans_progress_dir(self, mock_repo: pathlib.Path) -> None:
-        """Should remove all progress files."""
-        progress_dir = mock_repo / ".loom" / "progress"
-        progress_dir.mkdir(parents=True)
-        (progress_dir / "shepherd-abc.json").write_text('{"task_id": "abc"}')
+    def test_reverts_stale_building_labels(self, mock_repo: pathlib.Path) -> None:
+        """Issues with loom:building but no live task get their labels reverted."""
+        # Live task on #100; #200 is building but orphaned.
+        state_path = mock_repo / ".loom" / "spawn-loop-state.json"
+        state_path.write_text(json.dumps({
+            "started_at": "2026-06-02T16:12:19Z",
+            "running": [{"issue": 100, "pid": 1}],
+        }))
+
+        edit_calls: list[list[str]] = []
+
+        def fake_run(args, capture_output=True, text=True, check=False):
+            del capture_output, text, check
+            edit_calls.append(list(args))
+            return subprocess.CompletedProcess(
+                args=args, returncode=0, stdout="", stderr=""
+            )
 
         with patch("loom_tools.clean._list_loom_tmux_sessions", return_value=[]), \
-             patch("loom_tools.daemon_cleanup._terminate_active_sessions"), \
-             patch("loom_tools.daemon_cleanup._revert_shepherd_labels"):
+             patch("loom_tools.clean.gh_run", side_effect=self._ghrun_factory([100, 200])), \
+             patch("loom_tools.clean.subprocess.run", side_effect=fake_run):
             clean_daemon_crash_state(mock_repo)
 
-        assert not list(progress_dir.glob("*.json"))
+        # Exactly one gh edit call, for issue 200 (orphaned).
+        edits = [c for c in edit_calls if "issue" in c and "edit" in c]
+        assert len(edits) == 1
+        assert "200" in edits[0]
+        assert "--remove-label" in edits[0]
+        assert "loom:building" in edits[0]
+        assert "loom:issue" in edits[0]
 
     def test_resets_issue_failures(self, mock_repo: pathlib.Path) -> None:
         """Should reset issue-failures.json to empty entries."""
@@ -623,57 +811,29 @@ class TestCleanDaemonCrashState:
         failures_file.write_text('{"entries": {"42": {"count": 3}}}')
 
         with patch("loom_tools.clean._list_loom_tmux_sessions", return_value=[]), \
-             patch("loom_tools.daemon_cleanup._terminate_active_sessions"), \
-             patch("loom_tools.daemon_cleanup._revert_shepherd_labels"):
+             patch("loom_tools.clean.gh_run", side_effect=self._ghrun_factory([])):
             clean_daemon_crash_state(mock_repo)
 
         data = json.loads(failures_file.read_text())
         assert data == {"entries": {}}
 
-    def test_finalizes_daemon_state(self, mock_repo: pathlib.Path) -> None:
-        """Should mark daemon state as not running and reset shepherds."""
-        state_path = mock_repo / ".loom" / "daemon-state.json"
-        state_path.write_text(json.dumps({
-            "running": True,
-            "shepherds": {
-                "shepherd-1": {"status": "working", "issue": 42, "task_id": "abc"},
-            },
-        }))
-
-        with patch("loom_tools.clean._list_loom_tmux_sessions", return_value=[]), \
-             patch("loom_tools.daemon_cleanup._terminate_active_sessions"), \
-             patch("loom_tools.daemon_cleanup._revert_shepherd_labels"):
-            clean_daemon_crash_state(mock_repo)
-
-        data = json.loads(state_path.read_text())
-        assert data["running"] is False
-        assert data["shepherds"]["shepherd-1"]["status"] == "idle"
-        assert data["shepherds"]["shepherd-1"]["issue"] is None
-        assert data["shepherds"]["shepherd-1"]["task_id"] is None
-
     def test_dry_run_preserves_files(self, mock_repo: pathlib.Path) -> None:
         """Dry run should not modify any files."""
-        claims_dir = mock_repo / ".loom" / "claims"
-        claims_dir.mkdir(parents=True)
-        claim_file = claims_dir / "42.json"
-        claim_file.write_text('{"issue": 42}')
-
-        progress_dir = mock_repo / ".loom" / "progress"
-        progress_dir.mkdir(parents=True)
-        progress_file = progress_dir / "shepherd-abc.json"
-        progress_file.write_text('{"task_id": "abc"}')
+        locks_dir = mock_repo / ".loom" / "locks"
+        locks_dir.mkdir(parents=True)
+        (locks_dir / "issue-999").mkdir()
 
         failures_file = mock_repo / ".loom" / "issue-failures.json"
         failures_file.write_text('{"entries": {"42": {"count": 3}}}')
 
         with patch("loom_tools.clean._list_loom_tmux_sessions", return_value=[]), \
-             patch("loom_tools.daemon_cleanup._terminate_active_sessions"), \
-             patch("loom_tools.daemon_cleanup._revert_shepherd_labels"):
+             patch("loom_tools.clean.gh_run", side_effect=self._ghrun_factory([])):
             clean_daemon_crash_state(mock_repo, dry_run=True)
 
-        assert claim_file.exists()
-        assert progress_file.exists()
-        assert json.loads(failures_file.read_text())["entries"]["42"]["count"] == 3
+        assert (locks_dir / "issue-999").exists(), "dry run keeps locks"
+        assert (
+            json.loads(failures_file.read_text())["entries"]["42"]["count"] == 3
+        ), "dry run keeps failures"
 
 
 class TestMainDaemonFlag:
@@ -1141,21 +1301,29 @@ class TestCleanAggressive:
         assert stats.removed == 0
         assert stats.skipped_user_owned == 1
 
-    def test_active_shepherd_read_from_state(
+    def test_active_shepherd_read_from_spawn_loop_state(
         self, mock_repo: pathlib.Path
     ) -> None:
-        """`_active_shepherd_issues` should ignore idle shepherds."""
-        state_file = mock_repo / ".loom" / "daemon-state.json"
+        """`_active_shepherd_issues` (alias for `_active_spawn_loop_issues`)
+        unions ``spawn-loop-state.json::running`` and ``.loom/locks/issue-N/``.
+        Phase 3.1.9 (#3398) — no more daemon-state.json reads.
+        """
+        state_file = mock_repo / ".loom" / "spawn-loop-state.json"
         state_file.write_text(json.dumps({
-            "shepherds": {
-                "shepherd-1": {"status": "working", "issue": 77},
-                "shepherd-2": {"status": "idle", "issue": 88},
-                "shepherd-3": {"status": "working", "issue": 91},
-            }
+            "running": [
+                {"issue": 77, "pid": 1},
+                {"issue": 91, "pid": 2},
+            ],
         }))
+        # And a stale lock for #88 — should still count as "active" because
+        # locks survive crashes and may belong to in-flight recovery.
+        locks_dir = mock_repo / ".loom" / "locks"
+        locks_dir.mkdir(parents=True)
+        (locks_dir / "issue-88").mkdir()
+
         from loom_tools.clean import _active_shepherd_issues
         active = _active_shepherd_issues(mock_repo)
-        assert active == {77, 91}
+        assert active == {77, 88, 91}
 
     def test_active_shepherd_empty_when_missing(
         self, mock_repo: pathlib.Path

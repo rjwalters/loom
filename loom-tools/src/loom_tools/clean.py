@@ -27,7 +27,7 @@ from loom_tools.common.github import gh_list, gh_run
 from loom_tools.common.logging import log_error, log_info, log_success, log_warning
 from loom_tools.common.paths import LoomPaths, NamingConventions
 from loom_tools.common.repo import find_repo_root
-from loom_tools.common.state import read_json_file, write_json_file
+from loom_tools.common.state import read_json_file, read_spawn_loop_state, write_json_file
 from loom_tools.common.time_utils import parse_iso_timestamp
 from loom_tools.common.worktree_safety import find_processes_using_directory
 
@@ -223,50 +223,27 @@ def update_cleanup_state(
     issue_num: int,
     status: str,
 ) -> None:
-    """Update cleanup state in daemon-state.json.
+    """No-op shim (Phase 3.1.9, #3398).
+
+    Previously wrote per-issue cleanup status into
+    ``.loom/daemon-state.json::cleanup``. That state file is retired
+    with the daemon brain (epic #3372); the spawn loop's per-issue lock
+    presence + ``.loom/spawn-loop-state.json`` are the new source of
+    truth for "is this issue in flight". Cleanup status was only used
+    by the daemon UI, which is also being retired.
+
+    The function signature is preserved so callers don't have to thread
+    conditionals; future ports can drop the call sites in Phase 3.3.
 
     Args:
-        repo_root: Repository root path.
-        issue_num: Issue number.
-        status: One of "cleaned", "pending", "error".
+        repo_root: Repository root path (unused).
+        issue_num: Issue number (unused).
+        status: One of "cleaned", "pending", "error" (unused).
     """
-    paths = LoomPaths(repo_root)
-
-    if not paths.daemon_state_file.exists():
-        return
-
-    data = read_json_file(paths.daemon_state_file)
-    if not isinstance(data, dict):
-        return
-
-    timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-    worktree_name = NamingConventions.worktree_name(issue_num)
-
-    # Initialize cleanup section if needed
-    if "cleanup" not in data:
-        data["cleanup"] = {
-            "lastRun": None,
-            "lastCleaned": [],
-            "pendingCleanup": [],
-            "errors": [],
-        }
-
-    cleanup = data["cleanup"]
-
-    if status == "cleaned":
-        cleanup["lastCleaned"] = cleanup.get("lastCleaned", []) + [worktree_name]
-        cleanup["lastRun"] = timestamp
-    elif status == "pending":
-        pending = cleanup.get("pendingCleanup", [])
-        if worktree_name not in pending:
-            pending.append(worktree_name)
-        cleanup["pendingCleanup"] = pending
-    elif status == "error":
-        errors = cleanup.get("errors", [])
-        errors.append({"issue": issue_num, "timestamp": timestamp})
-        cleanup["errors"] = errors
-
-    write_json_file(paths.daemon_state_file, data)
+    # Intentionally empty — no replacement state file. The spawn-loop
+    # tracks live work; completed cleanups are observable from
+    # ``git worktree list`` and forge state directly.
+    del repo_root, issue_num, status
 
 
 def cleanup_worktree(
@@ -435,6 +412,11 @@ def clean_worktrees(
         log_info("No worktrees directory found")
         return
 
+    # Snapshot active spawn-loop issues once so we don't re-read the state
+    # file inside the per-worktree loop. Cheap and avoids torn-read races.
+    # See `_active_spawn_loop_issues` (Phase 3.1.9, #3398).
+    active_issues = _active_spawn_loop_issues(repo_root)
+
     for worktree_dir in sorted(paths.worktrees_dir.glob(f"{NamingConventions.WORKTREE_PREFIX}*")):
         if not worktree_dir.is_dir():
             continue
@@ -446,6 +428,15 @@ def clean_worktrees(
         worktree_path = worktree_dir.resolve()
 
         print(f"Checking worktree: issue-{issue_num}")
+
+        # Spawn-loop active check (Phase 3.1.9, #3398). `--force` bypasses
+        # this gate just like the in-use marker / active-process gates.
+        if not force and issue_num in active_issues:
+            log_info(
+                f"  Issue #{issue_num} has a live spawn-loop task or claim-lock - preserving"
+            )
+            stats.skipped_in_use += 1
+            continue
 
         # Check for in-use marker
         marker_file = worktree_path / ".loom-in-use"
@@ -567,6 +558,29 @@ def clean_worktrees(
                 else:
                     log_info(f"  Skipping: {worktree_dir}")
                     stats.skipped_open += 1
+
+
+def clean_stale_spawn_loop_locks(
+    repo_root: pathlib.Path,
+    stats: CleanupStats,
+    dry_run: bool = False,
+) -> None:
+    """Remove ``.loom/locks/issue-<N>/`` dirs not backed by a live task.
+
+    Phase 3.1.9 (#3398) addition — the spawn loop drops a claim-lock dir
+    on issue claim and removes it on child exit. Surviving locks without
+    a corresponding ``spawn-loop-state.json::running[].issue`` entry are
+    debris from crashed children and safe to remove.
+
+    This is invoked from the standard worktree cleanup path; it does NOT
+    consult the forge (no `gh` calls) since the spawn-loop-state file is
+    the local source of truth for "is a child still running".
+    """
+    removed = _clear_stale_spawn_loop_locks(repo_root, dry_run=dry_run)
+    if removed:
+        stats.cleaned_worktrees += 0  # counted separately below
+        # We piggyback on the worktree counter narrative but don't double
+        # count — operators see lock removals as their own log lines.
 
 
 def prune_orphaned_worktrees(
@@ -718,72 +732,47 @@ def clean_daemon_crash_state(
     repo_root: pathlib.Path,
     dry_run: bool = False,
 ) -> None:
-    """Full daemon crash recovery: kill sessions, revert labels, clear state.
+    """Spawn-loop-aware crash recovery (Phase 3.1.9, #3398).
 
-    This is the one-shot manual cleanup invoked by ``loom-clean --daemon``
-    that performs everything the issue #3099 manual steps describe:
+    Originally a daemon-only flow that touched ``.loom/daemon-state.json``,
+    ``.loom/claims/``, and ``.loom/progress/``. Those state files belong
+    to the legacy daemon brain, which is being retired (epic #3372).
 
-    1. Kill all orphaned tmux sessions on the loom socket
-    2. Revert stale ``loom:building`` labels to ``loom:issue``
-    3. Clear stale claim files, progress files, and issue-failures.json
+    The post-port behaviour does only what is still meaningful for a
+    spawn-loop-only workspace:
+
+    1. Kill orphaned tmux sessions on the loom socket (unchanged).
+    2. Revert stale ``loom:building`` labels for issues that no longer
+       have a live spawn-loop task (the spawn loop is authoritative).
+    3. Clear stale ``.loom/locks/issue-<N>/`` claim-lock dirs for issues
+       that are *not* tracked in ``.loom/spawn-loop-state.json::running``.
+    4. Reset ``.loom/issue-failures.json`` (still consumed by Champion).
+
+    The ``--daemon`` flag's banner is preserved for muscle memory but the
+    operator-facing rename (``loom-cleanup``, see #3412) is the long-term
+    home for any future daemon-era cleanup logic.
     """
-    from loom_tools.daemon_cleanup import (
-        _revert_shepherd_labels,
-        _terminate_active_sessions,
-    )
-
-    state_path = repo_root / ".loom" / "daemon-state.json"
-
-    # 1. Kill all loom tmux sessions
+    # 1. Kill all loom tmux sessions (still useful for stale sweep workers).
     print("Step 1: Kill orphaned tmux sessions")
     stats = CleanupStats()
     clean_tmux_sessions(stats, dry_run=dry_run)
     print()
 
-    # 2. Terminate tracked sessions from daemon state and revert labels
-    print("Step 2: Terminate tracked sessions and revert stale labels")
-    _terminate_active_sessions(state_path, dry_run=dry_run)
-    _revert_shepherd_labels(state_path, dry_run=dry_run)
+    # 2. Revert stale `loom:building` labels for issues no longer running
+    #    in the spawn loop. Was previously a `daemon-state.json` scan;
+    #    `_revert_stale_building_labels_spawn_loop` reads
+    #    `.loom/spawn-loop-state.json` and `gh issue list --label loom:building`.
+    print("Step 2: Revert stale `loom:building` labels")
+    _revert_stale_building_labels_spawn_loop(repo_root, dry_run=dry_run)
     print()
 
-    # 3. Clear stale claim files
-    print("Step 3: Clear stale claims")
-    claims_dir = repo_root / ".loom" / "claims"
-    if claims_dir.is_dir():
-        claim_files = list(claims_dir.glob("*.json"))
-        if claim_files:
-            for claim_file in claim_files:
-                if dry_run:
-                    log_info(f"Would remove: {claim_file.name}")
-                else:
-                    claim_file.unlink(missing_ok=True)
-                    log_info(f"Removed: {claim_file.name}")
-        else:
-            log_success("No stale claim files")
-    else:
-        log_success("No claims directory")
+    # 3. Clear stale spawn-loop claim locks (issues with no live task).
+    print("Step 3: Clear stale spawn-loop claim locks")
+    _clear_stale_spawn_loop_locks(repo_root, dry_run=dry_run)
     print()
 
-    # 4. Clear stale progress files
-    print("Step 4: Clear stale progress files")
-    progress_dir = repo_root / ".loom" / "progress"
-    if progress_dir.is_dir():
-        progress_files = list(progress_dir.glob("*.json"))
-        if progress_files:
-            for pf in progress_files:
-                if dry_run:
-                    log_info(f"Would remove: {pf.name}")
-                else:
-                    pf.unlink(missing_ok=True)
-                    log_info(f"Removed: {pf.name}")
-        else:
-            log_success("No stale progress files")
-    else:
-        log_success("No progress directory")
-    print()
-
-    # 5. Reset issue-failures.json
-    print("Step 5: Reset issue-failures.json")
+    # 4. Reset issue-failures.json
+    print("Step 4: Reset issue-failures.json")
     failures_file = repo_root / ".loom" / "issue-failures.json"
     if failures_file.exists():
         if dry_run:
@@ -795,26 +784,123 @@ def clean_daemon_crash_state(
         log_success("No issue-failures.json to reset")
     print()
 
-    # 6. Mark daemon state as not running
-    print("Step 6: Finalize daemon state")
-    if state_path.exists() and not dry_run:
-        data = read_json_file(state_path)
-        if isinstance(data, dict):
-            data["running"] = False
-            # Reset all shepherds to idle
-            shepherds = data.get("shepherds", {})
-            if isinstance(shepherds, dict):
-                for entry in shepherds.values():
-                    if isinstance(entry, dict):
-                        entry["status"] = "idle"
-                        entry["issue"] = None
-                        entry["task_id"] = None
-            write_json_file(state_path, data)
-            log_success("Daemon state finalized (running=false, shepherds reset)")
-    elif dry_run:
-        log_info("Would finalize daemon state")
-    else:
-        log_success("No daemon state to finalize")
+
+def _revert_stale_building_labels_spawn_loop(
+    repo_root: pathlib.Path,
+    dry_run: bool = False,
+) -> int:
+    """Revert ``loom:building`` -> ``loom:issue`` for orphaned issues.
+
+    An issue is "orphaned" when it carries ``loom:building`` but no live
+    spawn-loop task is tracking it (neither in
+    ``.loom/spawn-loop-state.json::running`` nor under
+    ``.loom/locks/issue-<N>/``). Mirrors the cross-check
+    :mod:`loom_tools.orphan_recovery` performs, scoped down for cleanup.
+
+    Returns the number of labels reverted (0 for dry-run skip or no orphans).
+    """
+    active = _active_spawn_loop_issues(repo_root)
+    try:
+        result = gh_run(
+            ["issue", "list", "--label", "loom:building", "--state", "open",
+             "--json", "number", "--jq", ".[].number"],
+            check=False,
+        )
+    except Exception as e:
+        log_warning(f"  Could not list building issues: {e}")
+        return 0
+
+    if result.returncode != 0:
+        log_warning("  `gh issue list` failed — skipping label revert")
+        return 0
+
+    building: list[int] = []
+    for line in result.stdout.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            building.append(int(line))
+        except ValueError:
+            continue
+
+    orphans = [n for n in building if n not in active]
+    if not orphans:
+        log_success("  No orphaned `loom:building` labels found")
+        return 0
+
+    reverted = 0
+    for issue_num in orphans:
+        if dry_run:
+            log_info(f"  Would revert label on #{issue_num}: building -> issue")
+            continue
+        try:
+            subprocess.run(
+                ["gh", "issue", "edit", str(issue_num),
+                 "--remove-label", "loom:building",
+                 "--add-label", "loom:issue"],
+                capture_output=True, text=True, check=False,
+            )
+            log_success(f"  Reverted #{issue_num}: building -> issue")
+            reverted += 1
+        except Exception as e:
+            log_warning(f"  Failed to revert #{issue_num}: {e}")
+    return reverted
+
+
+def _clear_stale_spawn_loop_locks(
+    repo_root: pathlib.Path,
+    dry_run: bool = False,
+) -> int:
+    """Remove ``.loom/locks/issue-<N>/`` dirs for issues not in running set.
+
+    The spawn loop releases its own locks on child exit (``release_lock``
+    in ``spawn-loop.sh``), so a surviving lock without a corresponding
+    ``running[].issue`` entry indicates a crashed child whose recovery has
+    already happened (or for which recovery is no longer interesting —
+    e.g. the issue was closed manually).
+
+    Returns the number of locks removed (or that would be removed in
+    dry-run mode).
+    """
+    locks_dir = _spawn_loop_locks_dir(repo_root)
+    if not locks_dir.is_dir():
+        log_success("  No `.loom/locks/` directory")
+        return 0
+
+    state = read_spawn_loop_state(repo_root)
+    live_issues = {t.issue for t in state.running if t.issue}
+
+    removed = 0
+    found_any = False
+    for entry in sorted(locks_dir.iterdir()):
+        if not entry.is_dir() or not entry.name.startswith("issue-"):
+            continue
+        found_any = True
+        try:
+            issue_num = int(entry.name[len("issue-") :])
+        except ValueError:
+            log_warning(f"  Skipping malformed lock dir: {entry.name}")
+            continue
+
+        if issue_num in live_issues:
+            log_info(f"  Keeping lock for live task: {entry.name}")
+            continue
+
+        if dry_run:
+            log_info(f"  Would remove stale lock: {entry.name}")
+            removed += 1
+        else:
+            try:
+                shutil.rmtree(entry)
+                log_success(f"  Removed stale lock: {entry.name}")
+                removed += 1
+            except Exception as e:
+                log_warning(f"  Failed to remove {entry.name}: {e}")
+
+    if not found_any:
+        log_success("  No spawn-loop locks to inspect")
+    return removed
 
 
 def clean_agent_config(
@@ -1039,38 +1125,81 @@ def _check_open_pr(branch_short: str | None) -> tuple[bool, bool]:
     return bool(prs), True
 
 
-def _active_shepherd_issues(repo_root: pathlib.Path) -> set[int]:
-    """Return the set of issue numbers currently held by active shepherds.
+def _spawn_loop_locks_dir(repo_root: pathlib.Path) -> pathlib.Path:
+    """Path to the spawn-loop's atomic claim-lock directory.
 
-    Reads ``.loom/daemon-state.json`` and collects ``shepherds[*].issue``
-    for every shepherd whose status is not ``idle``.  Missing or malformed
-    state files yield an empty set — callers must combine this with the
+    See ``defaults/scripts/spawn-loop.sh``: each in-flight sweep child holds
+    a ``.loom/locks/issue-<N>/`` directory (mkdir-atomic primitive). The
+    directory's presence is the lock; a tiny ``owner.json`` metadata file
+    lives inside for debugging but is not load-bearing.
+    """
+    return repo_root / ".loom" / "locks"
+
+
+def _active_locked_issues(repo_root: pathlib.Path) -> set[int]:
+    """Issues with a present ``.loom/locks/issue-<N>/`` claim-lock dir.
+
+    The lock dir is created on claim and removed on child exit (see
+    ``release_lock`` in ``spawn-loop.sh``). A lock without a corresponding
+    spawn-loop-state entry is *probably* stale (crashed child failed to
+    release), but caller policy lives in :func:`_active_spawn_loop_issues`
+    — this helper returns the raw set so other callers can reason about
+    locks independently of state-file contents.
+    """
+    locks_dir = _spawn_loop_locks_dir(repo_root)
+    if not locks_dir.is_dir():
+        return set()
+    active: set[int] = set()
+    # Pattern: issue-<N> directories only; ignore stray files.
+    for entry in locks_dir.iterdir():
+        if not entry.is_dir():
+            continue
+        name = entry.name
+        if not name.startswith("issue-"):
+            continue
+        try:
+            active.add(int(name[len("issue-") :]))
+        except ValueError:
+            continue
+    return active
+
+
+def _active_spawn_loop_issues(repo_root: pathlib.Path) -> set[int]:
+    """Return the set of issue numbers currently in flight in the spawn loop.
+
+    Reads two sources and unions them (either alone is sufficient evidence
+    that a worktree is in use):
+
+    1. ``.loom/spawn-loop-state.json::running[*].issue`` — the spawn loop's
+       authoritative list of live sweep children. See
+       :class:`loom_tools.models.spawn_loop_state.SpawnLoopState`.
+    2. ``.loom/locks/issue-<N>/`` — atomic claim-lock dirs created by
+       ``acquire_lock`` in ``spawn-loop.sh`` and released only on child
+       exit. Surviving locks belong to either active children (covered by
+       #1) or crashed children — in both cases we conservatively treat the
+       worktree as "in use" so cleanup does not race the recovery flow.
+
+    Missing/malformed state files and missing locks-dir yield an empty set;
+    callers (e.g. :func:`evaluate_aggressive_candidate`) combine this with
     other gates (PR check, sentinel, reachability) rather than relying on
     it alone.
+
+    Phase 3.1.9 port (#3398, epic #3372): replaces the prior
+    ``daemon-state.json::shepherds`` read so ``loom-clean`` works against
+    workspaces that have migrated off the Python daemon brain.
     """
-    paths = LoomPaths(repo_root)
-    if not paths.daemon_state_file.exists():
-        return set()
-
-    data = read_json_file(paths.daemon_state_file)
-    if not isinstance(data, dict):
-        return set()
-
-    shepherds = data.get("shepherds")
-    if not isinstance(shepherds, dict):
-        return set()
-
-    active: set[int] = set()
-    for entry in shepherds.values():
-        if not isinstance(entry, dict):
-            continue
-        status = entry.get("status")
-        if status == "idle":
-            continue
-        issue = entry.get("issue")
-        if isinstance(issue, int):
-            active.add(issue)
+    state = read_spawn_loop_state(repo_root)
+    active: set[int] = {task.issue for task in state.running if task.issue}
+    active |= _active_locked_issues(repo_root)
     return active
+
+
+# Backwards-compatible alias retained for callers that imported the old
+# name (notably aggressive-mode tests). The decision is "is this issue
+# being worked on by an orchestrator?" — the spawn loop is the only
+# orchestrator we recognize after Phase 3.1.x, so the rename is a pure
+# refactor.
+_active_shepherd_issues = _active_spawn_loop_issues
 
 
 def _worktree_age_seconds(path: pathlib.Path) -> float | None:
@@ -1465,13 +1594,12 @@ Safe mode (--safe):
   - Only removes worktrees when PR is MERGED (not just closed)
   - Checks for uncommitted changes before removal
   - Applies grace period after merge to avoid race conditions
-  - Tracks cleanup state in daemon-state.json
 
-Daemon crash cleanup (--daemon):
-  - Kill all orphaned tmux sessions on the loom socket
-  - Revert stale loom:building labels to loom:issue
-  - Clear claims, progress files, and issue-failures.json
-  - Finalize daemon state (running=false, shepherds=idle)
+Crash cleanup (--daemon):
+  - Kill orphaned tmux sessions on the loom socket
+  - Revert stale `loom:building` labels for issues with no live spawn-loop task
+  - Clear stale `.loom/locks/issue-<N>/` claim-lock dirs
+  - Reset `.loom/issue-failures.json`
 
 Aggressive cleanup (--aggressive):
   - Enumerates ALL worktrees (`git worktree list --porcelain`),
@@ -1483,7 +1611,8 @@ Aggressive cleanup (--aggressive):
   - Still respects these gates in order (first hit wins,
     "skip" beats "remove"):
       1. Open PR on the branch -> skip (open_pr)
-      2. Active shepherd holds the issue -> skip (active_shepherd)
+      2. Active spawn-loop task or claim-lock holds the issue
+         -> skip (active_shepherd) [name preserved for back-compat]
       3. Worktree path outside `.loom/worktrees/` or missing the
          `.loom-managed` sentinel -> skip (user_owned)
       4. Uncommitted changes -> skip (uncommitted) unless --force
@@ -1566,7 +1695,11 @@ Examples:
     parser.add_argument(
         "--daemon",
         action="store_true",
-        help="Daemon crash recovery: kill sessions, revert labels, clear state",
+        help=(
+            "Crash recovery: kill tmux sessions, revert stale `loom:building` "
+            "labels for issues with no live spawn-loop task, clear stale "
+            "claim-lock dirs, reset issue-failures.json"
+        ),
     )
     parser.add_argument(
         "--aggressive",
@@ -1575,8 +1708,9 @@ Examples:
             "Aggressive: enumerate `git worktree list --porcelain`, ignore "
             "`.loom-in-use` markers and process-table noise, and remove "
             "vestigial worktrees whose work is reachable from origin/main. "
-            "Respects open PRs, active shepherds, the `.loom-managed` "
-            "sentinel, and uncommitted changes. Use --dry-run to preview."
+            "Respects open PRs, active spawn-loop tasks (and lock dirs), the "
+            "`.loom-managed` sentinel, and uncommitted changes. Use --dry-run "
+            "to preview."
         ),
     )
     parser.add_argument(
@@ -1597,11 +1731,13 @@ Examples:
         log_error("Not in a git repository with .loom directory")
         return 1
 
-    # --daemon: full daemon crash recovery (separate workflow)
+    # --daemon: crash recovery (spawn-loop-aware after Phase 3.1.9, #3398).
+    # Flag name preserved for muscle memory; behaviour now targets the
+    # spawn loop's state files instead of the retired daemon brain.
     if args.daemon:
         print()
         print("========================================")
-        print("  Loom Daemon Crash Recovery")
+        print("  Loom Crash Recovery")
         if args.dry_run:
             print("  (DRY RUN MODE)")
         print("========================================")
@@ -1610,7 +1746,7 @@ Examples:
         if args.dry_run:
             log_warning("Dry run complete - no changes made")
         else:
-            log_success("Daemon crash recovery complete!")
+            log_success("Crash recovery complete!")
         print()
         return 0
 
@@ -1741,6 +1877,12 @@ Examples:
             grace_period=args.grace_period,
         )
         prune_orphaned_worktrees(repo_root, dry_run=args.dry_run)
+        print()
+
+        # Phase 3.1.9 (#3398) - also prune stale spawn-loop claim locks.
+        print("Cleaning Stale Spawn-Loop Locks")
+        print()
+        clean_stale_spawn_loop_locks(repo_root, stats, dry_run=args.dry_run)
         print()
 
     # Cleanup: Branches
