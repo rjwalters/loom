@@ -15,6 +15,7 @@ from loom_tools.models.daemon_state import (
     SupportRoleEntry,
     Warning,
 )
+from loom_tools.models.spawn_loop_state import SpawnLoopState, SpawnLoopTask
 from loom_tools.status import (
     _Colors,
     format_seconds,
@@ -29,6 +30,7 @@ from loom_tools.status import (
     render_pipeline_status,
     render_session_stats,
     render_shepherds,
+    render_spawn_loop_tasks,
     render_stuck_detection,
     render_support_roles,
     render_system_state,
@@ -892,3 +894,352 @@ class TestFastMode:
         assert exc_info.value.code == 1
         captured = capsys.readouterr()
         assert "mutually exclusive" in captured.err
+
+
+# ---------------------------------------------------------------------------
+# Spawn-loop primary path (Phase 3.1.1 port, #3390)
+# ---------------------------------------------------------------------------
+
+
+class TestSpawnLoopPath:
+    """When .loom/spawn-loop-state.json is present, the spawn loop is treated
+    as the primary live-state source; daemon-state-derived sections are
+    suppressed in the output. See issue #3390."""
+
+    def test_render_daemon_status_spawn_loop_running(self, tmp_path):
+        """Spawn loop with live pidfile renders Running + Spawn Loop label."""
+        loom_dir = tmp_path / ".loom"
+        loom_dir.mkdir(parents=True)
+        (loom_dir / "spawn-loop.pid").write_text("12345\n")
+        sls = SpawnLoopState(
+            started_at="2026-01-30T16:00:00Z",
+            running=[],
+            present=True,
+        )
+        ds = DaemonState()  # Empty daemon state — should be ignored.
+        lines = render_daemon_status(ds, tmp_path, NC, _now=NOW, spawn_loop_state=sls)
+        combined = "\n".join(lines)
+        assert "Spawn Loop:" in combined
+        assert "Running" in combined
+        assert "Daemon:" not in combined
+        assert "2h 0m" in combined  # 16:00 -> 18:00
+        assert "Tracked Tasks: 0" in combined
+
+    def test_render_daemon_status_spawn_loop_stopped(self, tmp_path):
+        """Spawn loop present but pidfile missing renders Stopped."""
+        sls = SpawnLoopState(
+            started_at="2026-01-30T16:00:00Z",
+            running=[],
+            present=True,
+        )
+        ds = DaemonState()
+        lines = render_daemon_status(ds, tmp_path, NC, _now=NOW, spawn_loop_state=sls)
+        combined = "\n".join(lines)
+        assert "Spawn Loop:" in combined
+        assert "Stopped" in combined
+
+    def test_render_daemon_status_spawn_loop_stopping(self, tmp_path):
+        """Spawn loop with stop-spawn-loop signal renders Stopping."""
+        loom_dir = tmp_path / ".loom"
+        loom_dir.mkdir(parents=True)
+        (loom_dir / "spawn-loop.pid").write_text("12345\n")
+        (loom_dir / "stop-spawn-loop").touch()
+        sls = SpawnLoopState(
+            started_at="2026-01-30T16:00:00Z",
+            running=[],
+            present=True,
+        )
+        ds = DaemonState()
+        lines = render_daemon_status(ds, tmp_path, NC, _now=NOW, spawn_loop_state=sls)
+        combined = "\n".join(lines)
+        assert "Stopping" in combined
+
+    def test_render_daemon_status_absent_falls_back_to_daemon(self, tmp_path):
+        """Absent spawn-loop-state file falls back to daemon-state path."""
+        sls = SpawnLoopState.absent()
+        ds = DaemonState(running=True, started_at="2026-01-30T16:00:00Z")
+        lines = render_daemon_status(ds, tmp_path, NC, _now=NOW, spawn_loop_state=sls)
+        combined = "\n".join(lines)
+        assert "Daemon:" in combined
+        assert "Spawn Loop:" not in combined
+        assert "Running" in combined
+
+    def test_render_spawn_loop_tasks_empty(self):
+        sls = SpawnLoopState(started_at="2026-01-30T16:00:00Z", running=[], present=True)
+        lines = render_spawn_loop_tasks(sls, NC, _now=NOW)
+        combined = "\n".join(lines)
+        assert "No tasks running" in combined
+
+    def test_render_spawn_loop_tasks_with_running(self):
+        sls = SpawnLoopState(
+            started_at="2026-01-30T16:00:00Z",
+            running=[
+                SpawnLoopTask(
+                    issue=42, pid=999,
+                    started_at="2026-01-30T17:00:00Z",
+                    token="robb-personal",
+                ),
+                SpawnLoopTask(
+                    issue=100, pid=1001,
+                    started_at="2026-01-30T17:30:00Z",
+                    token=None,
+                ),
+            ],
+            present=True,
+        )
+        lines = render_spawn_loop_tasks(sls, NC, _now=NOW)
+        combined = "\n".join(lines)
+        assert "2 task(s) running" in combined
+        assert "sweep-42:" in combined
+        assert "Issue #42" in combined
+        assert "pid=999" in combined
+        assert "[token: robb-personal]" in combined
+        assert "sweep-100:" in combined
+        # No token printed for the second task.
+        # Use a precise per-row check rather than scanning whole string.
+        sweep_100_line = next(l for l in lines if "sweep-100:" in l)
+        assert "[token:" not in sweep_100_line
+
+    def test_render_spawn_loop_tasks_with_heartbeat(self):
+        sls = SpawnLoopState(
+            running=[
+                SpawnLoopTask(
+                    issue=7, pid=1,
+                    started_at="2026-01-30T17:00:00Z",
+                    last_heartbeat="2026-01-30T17:55:00Z",
+                ),
+            ],
+            present=True,
+        )
+        lines = render_spawn_loop_tasks(sls, NC, _now=NOW)
+        combined = "\n".join(lines)
+        assert "[heartbeat: 5m ago]" in combined
+
+    def test_output_formatted_spawn_loop_suppresses_legacy_sections(self, tmp_path):
+        """When spawn loop is present, support-role and pipeline sections
+        derived from daemon-state are not rendered."""
+        sls = SpawnLoopState(
+            started_at="2026-01-30T16:00:00Z",
+            running=[SpawnLoopTask(issue=42, pid=999, started_at="2026-01-30T17:00:00Z")],
+            present=True,
+        )
+        # Daemon state has data that would normally render — we expect it
+        # to be suppressed because the spawn loop took over.
+        ds = DaemonState(
+            running=True,
+            shepherds={
+                "shepherd-1": ShepherdEntry(status="working", issue=99),
+            },
+            support_roles={
+                "guide": SupportRoleEntry(status="running"),
+            },
+            warnings=[Warning(time="2026-01-30T17:00:00Z", severity="warning", message="test")],
+        )
+        snapshot = {
+            "computed": {
+                "total_ready": 5, "total_building": 1,
+                "prs_awaiting_review": 0, "prs_ready_to_merge": 0,
+            },
+            "proposals": {"architect": [], "hermit": [], "curated": []},
+        }
+        result = output_formatted(
+            snapshot, ds, tmp_path, use_color=False, _now=NOW,
+            spawn_loop_state=sls,
+        )
+        # System state (forge-derived) still renders.
+        assert "Ready issues" in result
+        # Spawn-loop-task section renders the spawn-loop entry.
+        assert "sweep-42:" in result
+        assert "Issue #42" in result
+        # Daemon-state shepherd #99 is NOT shown (suppressed).
+        assert "Issue #99" not in result
+        # Support role section header is not present.
+        assert "Support Roles:" not in result
+        # Session statistics header is not present.
+        assert "Session Statistics:" not in result
+        # Pipeline-status header is not present.
+        assert "Pipeline Status:" not in result
+        # Warnings section header is not present.
+        assert "Recent Warnings:" not in result
+        # Spawn-loop label IS present.
+        assert "Spawn Loop:" in result
+
+    def test_output_formatted_spawn_loop_absent_uses_daemon_path(self, tmp_path):
+        """No spawn-loop-state — output looks like the legacy daemon-state
+        format (regression guard for the fallback)."""
+        ds = DaemonState(
+            running=True,
+            started_at="2026-01-30T16:00:00Z",
+            shepherds={"shepherd-1": ShepherdEntry(status="idle")},
+            support_roles={"guide": SupportRoleEntry(status="idle")},
+        )
+        snapshot = {
+            "computed": {
+                "total_ready": 0, "total_building": 0,
+                "prs_awaiting_review": 0, "prs_ready_to_merge": 0,
+            },
+            "proposals": {"architect": [], "hermit": [], "curated": []},
+        }
+        result = output_formatted(
+            snapshot, ds, tmp_path, use_color=False, _now=NOW,
+            spawn_loop_state=SpawnLoopState.absent(),
+        )
+        assert "Daemon:" in result
+        assert "Spawn Loop:" not in result
+        assert "Support Roles:" in result
+        assert "Session Statistics:" in result
+        assert "Pipeline Status:" in result
+
+    def test_render_agents_table_spawn_loop(self, tmp_path, capsys):
+        sls = SpawnLoopState(
+            running=[
+                SpawnLoopTask(
+                    issue=42, pid=999,
+                    started_at="2026-01-30T17:00:00Z",
+                ),
+            ],
+            present=True,
+        )
+        ds = DaemonState()  # ignored
+        render_agents_table(ds, tmp_path, _now=NOW, spawn_loop_state=sls)
+        out = capsys.readouterr().out
+        assert "sweep-42" in out
+        assert "#42" in out
+        assert "sweep" in out  # phase column
+        assert "running" in out
+
+    def test_render_agents_table_spawn_loop_empty(self, tmp_path, capsys):
+        """Empty spawn loop still renders a placeholder row."""
+        sls = SpawnLoopState(running=[], present=True)
+        ds = DaemonState()
+        render_agents_table(ds, tmp_path, _now=NOW, spawn_loop_state=sls)
+        out = capsys.readouterr().out
+        assert "spawn-loop" in out
+        assert "idle" in out
+
+    def test_output_fast_spawn_loop_running(self, tmp_path, capsys):
+        """Fast mode with live spawn loop shows Spawn Loop header + PID."""
+        loom_dir = tmp_path / ".loom"
+        loom_dir.mkdir(parents=True)
+        (loom_dir / "spawn-loop.pid").write_text("54321\n")
+        sls = SpawnLoopState(
+            started_at="2026-01-30T16:00:00Z",
+            running=[SpawnLoopTask(issue=42, pid=999, started_at="2026-01-30T17:00:00Z")],
+            present=True,
+        )
+        ds = DaemonState()
+        output_fast(ds, tmp_path, _now=NOW, spawn_loop_state=sls)
+        out = capsys.readouterr().out
+        assert "Spawn Loop:" in out
+        assert "Running" in out
+        assert "54321" in out
+        assert "sweep-42" in out
+
+    def test_output_fast_spawn_loop_absent_uses_daemon(self, tmp_path, capsys):
+        """Fast mode falls back to daemon-state when spawn-loop absent."""
+        ds = DaemonState(running=True, started_at="2026-01-30T16:00:00Z", daemon_pid=9999)
+        (tmp_path / ".loom").mkdir(parents=True, exist_ok=True)
+        output_fast(ds, tmp_path, _now=NOW, spawn_loop_state=SpawnLoopState.absent())
+        out = capsys.readouterr().out
+        assert "Daemon:" in out
+        assert "Spawn Loop:" not in out
+        assert "9999" in out
+
+    def test_main_spawn_loop_present_no_gh_in_fast_mode(self, tmp_path, monkeypatch, capsys):
+        """main(["--fast"]) reads spawn-loop-state.json and renders without gh."""
+        import subprocess
+
+        loom_dir = tmp_path / ".loom"
+        loom_dir.mkdir(parents=True)
+        (loom_dir / "spawn-loop.pid").write_text("99\n")
+        (loom_dir / "spawn-loop-state.json").write_text(json.dumps({
+            "started_at": "2026-01-30T16:00:00Z",
+            "running": [
+                {
+                    "issue": 42, "pid": 999,
+                    "started_at": "2026-01-30T17:00:00Z",
+                    "token": "robb-personal",
+                },
+            ],
+        }))
+        # No daemon-state file on disk.
+        monkeypatch.setattr("loom_tools.status.find_repo_root", lambda: tmp_path)
+
+        original_run = subprocess.run
+        gh_calls: list[list[str]] = []
+
+        def patched_run(cmd, *args, **kwargs):
+            if isinstance(cmd, (list, tuple)) and cmd and "gh" in str(cmd[0]):
+                gh_calls.append(list(cmd))
+            return original_run(cmd, *args, **kwargs)
+
+        monkeypatch.setattr(subprocess, "run", patched_run)
+
+        main(["--fast"])
+        out = capsys.readouterr().out
+        assert "Spawn Loop:" in out
+        assert "Running" in out
+        assert "sweep-42" in out
+        assert gh_calls == []
+
+
+# ---------------------------------------------------------------------------
+# read_spawn_loop_state (state.py reader)
+# ---------------------------------------------------------------------------
+
+
+class TestReadSpawnLoopState:
+    """Verify the state reader handles present/absent/malformed cases."""
+
+    def test_absent_when_file_missing(self, tmp_path):
+        from loom_tools.common.state import read_spawn_loop_state
+
+        result = read_spawn_loop_state(tmp_path)
+        assert result.present is False
+        assert result.running == []
+
+    def test_present_with_running_tasks(self, tmp_path):
+        from loom_tools.common.state import read_spawn_loop_state
+
+        loom_dir = tmp_path / ".loom"
+        loom_dir.mkdir(parents=True)
+        (loom_dir / "spawn-loop-state.json").write_text(json.dumps({
+            "started_at": "2026-01-30T16:00:00Z",
+            "running": [
+                {"issue": 42, "pid": 100, "started_at": "2026-01-30T17:00:00Z", "token": "tok-a"},
+                {"issue": 99, "pid": 200, "started_at": "2026-01-30T17:30:00Z"},
+            ],
+        }))
+        result = read_spawn_loop_state(tmp_path)
+        assert result.present is True
+        assert result.started_at == "2026-01-30T16:00:00Z"
+        assert len(result.running) == 2
+        assert result.running[0].issue == 42
+        assert result.running[0].pid == 100
+        assert result.running[0].token == "tok-a"
+        assert result.running[1].issue == 99
+        assert result.running[1].token is None
+
+    def test_present_but_empty_running(self, tmp_path):
+        from loom_tools.common.state import read_spawn_loop_state
+
+        loom_dir = tmp_path / ".loom"
+        loom_dir.mkdir(parents=True)
+        (loom_dir / "spawn-loop-state.json").write_text(json.dumps({
+            "started_at": "2026-01-30T16:00:00Z",
+            "running": [],
+        }))
+        result = read_spawn_loop_state(tmp_path)
+        assert result.present is True
+        assert result.running == []
+
+    def test_malformed_json_still_present(self, tmp_path):
+        from loom_tools.common.state import read_spawn_loop_state
+
+        loom_dir = tmp_path / ".loom"
+        loom_dir.mkdir(parents=True)
+        (loom_dir / "spawn-loop-state.json").write_text("this is not json")
+        result = read_spawn_loop_state(tmp_path)
+        # File exists -> present=True, even though parse failed
+        assert result.present is True
+        assert result.running == []

@@ -18,6 +18,7 @@ from loom_tools.models.baseline_health import BaselineHealth
 from loom_tools.models.daemon_state import DaemonState
 from loom_tools.models.health import AlertsFile, HealthMetrics
 from loom_tools.models.progress import ShepherdProgress
+from loom_tools.models.spawn_loop_state import SpawnLoopState
 from loom_tools.models.stuck import StuckHistory
 
 
@@ -144,6 +145,27 @@ def read_daemon_state(repo_root: pathlib.Path) -> DaemonState:
     if isinstance(data, list):
         return DaemonState()
     return DaemonState.from_dict(data)
+
+
+def read_spawn_loop_state(repo_root: pathlib.Path) -> SpawnLoopState:
+    """Load ``.loom/spawn-loop-state.json`` into a :class:`SpawnLoopState`.
+
+    Returns a :class:`SpawnLoopState` with ``present=False`` when the file
+    is missing — callers (e.g. ``loom-status``) use this to fall back to
+    ``.loom/daemon-state.json`` for back-compat (Phase 3 port, #3390).
+
+    Phase 3.4 (#3401) trims the daemon-state fallback once all 3.1.x ports
+    have landed.
+    """
+    paths = LoomPaths(repo_root)
+    if not paths.spawn_loop_state_file.exists():
+        return SpawnLoopState.absent()
+    data = read_json_file(paths.spawn_loop_state_file)
+    if not isinstance(data, dict):
+        # File exists but malformed — still mark as present so the caller
+        # knows the spawn loop is at least configured; just return empty.
+        return SpawnLoopState(present=True)
+    return SpawnLoopState.from_dict(data)
 
 
 def read_progress_files(repo_root: pathlib.Path) -> list[ShepherdProgress]:

@@ -4,6 +4,12 @@ Replaces the former ``loom-status.sh`` (814 LOC) with a Python module that
 reuses ``snapshot.build_snapshot()`` for data collection and provides
 colored terminal formatting.
 
+Phase 3 port (#3390, epic #3372): primary live-state source is now
+``.loom/spawn-loop-state.json`` (Phase 1, #3374) plus forge queries.
+``.loom/daemon-state.json`` is retained as a fallback so the CLI keeps
+working against workspaces still running the legacy Python daemon brain.
+The fallback is removed in Phase 3.4 (#3401).
+
 Usage::
 
     loom-status              # colored terminal output
@@ -21,9 +27,14 @@ from datetime import datetime, timezone
 from typing import Any, Sequence
 
 from loom_tools.common.repo import find_repo_root
-from loom_tools.common.state import read_daemon_state, read_json_file
+from loom_tools.common.state import (
+    read_daemon_state,
+    read_json_file,
+    read_spawn_loop_state,
+)
 from loom_tools.common.time_utils import parse_iso_timestamp
 from loom_tools.models.daemon_state import DaemonState
+from loom_tools.models.spawn_loop_state import SpawnLoopState, SpawnLoopTask
 from loom_tools.snapshot import build_snapshot
 
 # ---------------------------------------------------------------------------
@@ -169,12 +180,43 @@ def render_daemon_status(
     c: _Colors,
     *,
     _now: datetime | None = None,
+    spawn_loop_state: SpawnLoopState | None = None,
 ) -> list[str]:
-    """Render daemon status section."""
-    lines: list[str] = []
-    stop_file = repo_root / ".loom" / "stop-daemon"
+    """Render orchestrator status section.
 
-    if stop_file.exists():
+    When *spawn_loop_state* is provided and ``present=True``, the spawn
+    loop is treated as the active orchestrator (label "Spawn Loop") and
+    daemon-state fields are ignored. Otherwise this falls back to the
+    legacy daemon-state-derived display.
+    """
+    lines: list[str] = []
+    stop_daemon = repo_root / ".loom" / "stop-daemon"
+    stop_loop = repo_root / ".loom" / "stop-spawn-loop"
+    loop_pidfile = repo_root / ".loom" / "spawn-loop.pid"
+
+    # Spawn-loop primary path: explicit running detection via pidfile + state.
+    if spawn_loop_state is not None and spawn_loop_state.present:
+        loop_alive = loop_pidfile.exists()
+        if stop_loop.exists():
+            status = f"{c.yellow}Stopping{c.reset}"
+        elif loop_alive:
+            status = f"{c.green}Running{c.reset}"
+        else:
+            status = f"{c.red}Stopped{c.reset}"
+
+        uptime = (
+            format_uptime(spawn_loop_state.started_at, _now=_now)
+            if loop_alive and spawn_loop_state.started_at
+            else "n/a"
+        )
+
+        lines.append(f"  {c.bold}Spawn Loop:{c.reset} {status}")
+        lines.append(f"  {c.bold}Uptime:{c.reset} {uptime}")
+        lines.append(f"  {c.bold}Tracked Tasks:{c.reset} {len(spawn_loop_state.running)}")
+        return lines
+
+    # Legacy daemon-state fallback.
+    if stop_daemon.exists():
         status = f"{c.yellow}Stopping{c.reset}"
     elif daemon_state.running:
         status = f"{c.green}Running{c.reset}"
@@ -187,6 +229,46 @@ def render_daemon_status(
     lines.append(f"  {c.bold}Daemon:{c.reset} {status}")
     lines.append(f"  {c.bold}Uptime:{c.reset} {uptime}")
     lines.append(f"  {c.bold}Last Poll:{c.reset} {last_poll}")
+
+    return lines
+
+
+def render_spawn_loop_tasks(
+    spawn_loop_state: SpawnLoopState,
+    c: _Colors,
+    *,
+    _now: datetime | None = None,
+) -> list[str]:
+    """Render spawn-loop in-flight task rows (replacement for render_shepherds).
+
+    Each spawn-loop child is a ``claude -p "/loom:sweep N"`` invocation with
+    its own OAuth token. We have far less per-task state than the daemon
+    brain emitted (no phases, no judge retries, no PR number), so the row
+    is intentionally minimal: ``issue``, ``pid``, ``uptime``, ``token``.
+    """
+    lines = [f"  {c.bold}In-Flight Tasks:{c.reset}"]
+
+    if not spawn_loop_state.running:
+        lines.append(f"    {c.gray}No tasks running (spawn loop idle){c.reset}")
+        return lines
+
+    lines.append(f"    {c.cyan}{len(spawn_loop_state.running)} task(s) running{c.reset}")
+    lines.append("")
+
+    for task in sorted(spawn_loop_state.running, key=lambda t: t.issue):
+        uptime = (
+            format_uptime(task.started_at, _now=_now)
+            if task.started_at
+            else "unknown"
+        )
+        token_part = f" [token: {task.token}]" if task.token and task.token != "unknown" else ""
+        heartbeat_part = ""
+        if task.last_heartbeat:
+            heartbeat_part = f" [heartbeat: {time_ago(task.last_heartbeat, _now=_now)}]"
+        lines.append(
+            f"    {c.green}sweep-{task.issue}:{c.reset} Issue #{task.issue} "
+            f"pid={task.pid} ({uptime}){token_part}{heartbeat_part}"
+        )
 
     return lines
 
@@ -521,10 +603,21 @@ def output_formatted(
     *,
     use_color: bool = True,
     _now: datetime | None = None,
+    spawn_loop_state: SpawnLoopState | None = None,
 ) -> str:
-    """Render full formatted status display."""
+    """Render full formatted status display.
+
+    When *spawn_loop_state* is supplied with ``present=True``, the spawn loop
+    is treated as the primary source for live-task and orchestrator status;
+    daemon-state-derived sections (support roles, session stats, pipeline,
+    warnings) are suppressed because the spawn loop does not populate them.
+    Forge-derived sections (system state, layer-3 actions, stuck detection)
+    render the same way in both modes.
+    """
     c = _Colors(use_color=use_color)
     lines: list[str] = []
+
+    spawn_loop_primary = spawn_loop_state is not None and spawn_loop_state.present
 
     lines.append("")
     lines.append(f"{c.bold}{c.cyan}======================================================================={c.reset}")
@@ -532,19 +625,30 @@ def output_formatted(
     lines.append(f"{c.bold}{c.cyan}======================================================================={c.reset}")
     lines.append("")
 
-    lines.extend(render_daemon_status(daemon_state, repo_root, c, _now=_now))
+    lines.extend(render_daemon_status(
+        daemon_state, repo_root, c, _now=_now,
+        spawn_loop_state=spawn_loop_state,
+    ))
     lines.append("")
     lines.extend(render_system_state(snapshot, c))
     lines.append("")
-    lines.extend(render_shepherds(daemon_state, c, _now=_now))
-    lines.append("")
-    lines.extend(render_support_roles(daemon_state, c, _now=_now))
-    lines.append("")
-    lines.extend(render_session_stats(daemon_state, c))
-    lines.append("")
-    lines.extend(render_pipeline_status(daemon_state, c, _now=_now))
-    lines.append("")
-    lines.extend(render_warnings(daemon_state, c))
+    if spawn_loop_primary:
+        # Spawn loop only tracks in-flight sweep children — no shepherd pool,
+        # no support roles, no pipeline blocked-list, no warnings ring.
+        # Operators get forge-derived pipeline counts via render_system_state
+        # above; per-task detail comes from render_spawn_loop_tasks.
+        assert spawn_loop_state is not None  # for type checkers
+        lines.extend(render_spawn_loop_tasks(spawn_loop_state, c, _now=_now))
+    else:
+        lines.extend(render_shepherds(daemon_state, c, _now=_now))
+        lines.append("")
+        lines.extend(render_support_roles(daemon_state, c, _now=_now))
+        lines.append("")
+        lines.extend(render_session_stats(daemon_state, c))
+        lines.append("")
+        lines.extend(render_pipeline_status(daemon_state, c, _now=_now))
+        lines.append("")
+        lines.extend(render_warnings(daemon_state, c))
     lines.append("")
     lines.extend(render_stuck_detection(repo_root, c))
     lines.append("")
@@ -566,8 +670,15 @@ def render_agents_table(
     repo_root: pathlib.Path,
     *,
     _now: datetime | None = None,
+    spawn_loop_state: SpawnLoopState | None = None,
 ) -> None:
-    """Render a rich table of all active agents directly to stdout."""
+    """Render a rich table of all active agents directly to stdout.
+
+    When *spawn_loop_state* has ``present=True``, the table is populated from
+    spawn-loop tasks (``task_id`` is the issue number, "Phase" is "sweep").
+    Otherwise the table is populated from daemon-state shepherds and support
+    roles — the legacy path.
+    """
     from rich.console import Console
     from rich.table import Table
     import rich.box
@@ -580,6 +691,34 @@ def render_agents_table(
     table.add_column("Phase")
     table.add_column("Runtime")
     table.add_column("Last Heartbeat")
+
+    # Spawn-loop primary path.
+    if spawn_loop_state is not None and spawn_loop_state.present:
+        for task in sorted(spawn_loop_state.running, key=lambda t: t.issue):
+            status_markup = "[green]running[/green]"
+            runtime_str = (
+                format_uptime(task.started_at, _now=_now)
+                if task.started_at
+                else "-"
+            )
+            heartbeat_str = (
+                time_ago(task.last_heartbeat, _now=_now)
+                if task.last_heartbeat
+                else "-"
+            )
+            table.add_row(
+                f"sweep-{task.issue}",
+                status_markup,
+                f"#{task.issue}",
+                "sweep",
+                runtime_str,
+                heartbeat_str,
+            )
+        if not spawn_loop_state.running:
+            # Add a placeholder so the table renders something meaningful.
+            table.add_row("(spawn-loop)", "[dim]idle[/dim]", "-", "-", "-", "-")
+        console.print(table)
+        return
 
     for sid in sorted(daemon_state.shepherds):
         entry = daemon_state.shepherds[sid]
@@ -652,14 +791,50 @@ def output_fast(
     repo_root: pathlib.Path,
     *,
     _now: datetime | None = None,
+    spawn_loop_state: SpawnLoopState | None = None,
 ) -> None:
-    """Print a fast agent status table (no gh queries)."""
+    """Print a fast agent status table (no gh queries).
+
+    When *spawn_loop_state* has ``present=True``, the header reflects the
+    spawn loop (orchestrator name "Spawn Loop", PID from ``.loom/spawn-loop.pid``
+    if present) and the table is populated from spawn-loop tasks. Otherwise
+    the legacy daemon-state path is used.
+    """
     from rich.console import Console
 
     console = Console()
-    stop_file = repo_root / ".loom" / "stop-daemon"
+    stop_daemon = repo_root / ".loom" / "stop-daemon"
+    stop_loop = repo_root / ".loom" / "stop-spawn-loop"
+    loop_pidfile = repo_root / ".loom" / "spawn-loop.pid"
 
-    if stop_file.exists():
+    if spawn_loop_state is not None and spawn_loop_state.present:
+        loop_alive = loop_pidfile.exists()
+        if stop_loop.exists():
+            loop_status = "[yellow]Stopping[/yellow]"
+        elif loop_alive:
+            loop_status = "[green]Running[/green]"
+        else:
+            loop_status = "[red]Stopped[/red]"
+
+        uptime = (
+            format_uptime(spawn_loop_state.started_at, _now=_now)
+            if loop_alive and spawn_loop_state.started_at
+            else "n/a"
+        )
+        pid_str = "unknown"
+        if loop_pidfile.exists():
+            try:
+                pid_str = loop_pidfile.read_text().strip() or "unknown"
+            except OSError:
+                pass
+
+        console.print(f"Spawn Loop: {loop_status}  |  Uptime: {uptime}  |  PID: {pid_str}")
+        console.print()
+        render_agents_table(daemon_state, repo_root, _now=_now, spawn_loop_state=spawn_loop_state)
+        return
+
+    # Legacy daemon-state path.
+    if stop_daemon.exists():
         daemon_status = "[yellow]Stopping[/yellow]"
     elif daemon_state.running:
         daemon_status = "[green]Running[/green]"
@@ -738,13 +913,18 @@ EXAMPLES:
     loom-status --json | jq '.computed'
 
 FILES:
-    .loom/daemon-state.json     Daemon state file
-    .loom/stop-daemon           Shutdown signal file
+    .loom/spawn-loop-state.json  Spawn loop state (primary, #3374)
+    .loom/spawn-loop.pid         Spawn loop process ID
+    .loom/stop-spawn-loop        Spawn loop shutdown signal
+    .loom/daemon-state.json      Legacy daemon state (fallback, removed in 3.4)
+    .loom/stop-daemon            Legacy daemon shutdown signal
 
 RELATED COMMANDS:
-    /loom                       Run the daemon (Layer 2)
+    /loom                       Run the daemon (Layer 2, legacy)
+    ./.loom/scripts/spawn-loop.sh start    Run the spawn loop (Phase 1)
     /loom status                Equivalent to this script
-    touch .loom/stop-daemon     Signal graceful shutdown
+    touch .loom/stop-spawn-loop  Signal graceful spawn-loop shutdown
+    touch .loom/stop-daemon      Signal graceful daemon shutdown
 """
 
 
@@ -774,7 +954,8 @@ def main(argv: Sequence[str] | None = None) -> None:
     if fast_mode:
         repo_root = find_repo_root()
         daemon_state = read_daemon_state(repo_root)
-        output_fast(daemon_state, repo_root)
+        spawn_loop_state = read_spawn_loop_state(repo_root)
+        output_fast(daemon_state, repo_root, spawn_loop_state=spawn_loop_state)
         return
 
     # Build snapshot (includes parallel gh queries)
@@ -785,8 +966,13 @@ def main(argv: Sequence[str] | None = None) -> None:
     else:
         repo_root = find_repo_root()
         daemon_state = read_daemon_state(repo_root)
+        spawn_loop_state = read_spawn_loop_state(repo_root)
         colored = _use_color()
-        print(output_formatted(snapshot, daemon_state, repo_root, use_color=colored))
+        print(output_formatted(
+            snapshot, daemon_state, repo_root,
+            use_color=colored,
+            spawn_loop_state=spawn_loop_state,
+        ))
 
 
 if __name__ == "__main__":

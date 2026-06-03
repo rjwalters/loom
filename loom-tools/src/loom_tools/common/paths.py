@@ -35,6 +35,7 @@ class LoomPaths:
 
     # State file names
     DAEMON_STATE_FILE = "daemon-state.json"
+    SPAWN_LOOP_STATE_FILE = "spawn-loop-state.json"
     HEALTH_METRICS_FILE = "health-metrics.json"
     ALERTS_FILE = "alerts.json"
     STUCK_HISTORY_FILE = "stuck-history.json"
@@ -119,6 +120,11 @@ class LoomPaths:
     def daemon_state_file(self) -> Path:
         """Path to .loom/daemon-state.json."""
         return self.loom_dir / self.DAEMON_STATE_FILE
+
+    @property
+    def spawn_loop_state_file(self) -> Path:
+        """Path to .loom/spawn-loop-state.json (Phase 1, #3374)."""
+        return self.loom_dir / self.SPAWN_LOOP_STATE_FILE
 
     @property
     def health_metrics_file(self) -> Path:
