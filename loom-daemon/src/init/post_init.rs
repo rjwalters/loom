@@ -109,21 +109,22 @@ pub fn update_gitignore(workspace_path: &Path) -> Result<(), String> {
 
     // Ephemeral/runtime files that should be ignored.
     // Keep in sync with the Loom source repo's .gitignore (lines 36–78).
+    //
+    // Phase 3.5 (#3402, epic #3372): removed patterns for retired daemon-brain
+    // state files (`daemon-state.json`, archived `[0-9][0-9]-daemon-state.json`,
+    // `progress/`, `stuck-history.json`, `alerts.json`, `health-metrics.json`)
+    // and added `spawn-loop-state.json` for the Phase 1 spawn loop (#3374).
     let ephemeral_patterns = [
         ".loom-in-use",
         ".loom-checkpoint",
         ".loom/.daemon.pid",
         ".loom/.daemon.log",
         ".loom/daemon.sock",
-        ".loom/daemon-state.json",
         ".loom/daemon-loop.pid",
         ".loom/daemon-metrics.json",
         ".loom/loom-source-path",
-        ".loom/[0-9][0-9]-daemon-state.json",
-        ".loom/stuck-history.json",
-        ".loom/alerts.json",
+        ".loom/spawn-loop-state.json",
         ".loom/issue-failures.json",
-        ".loom/health-metrics.json",
         ".loom/interventions/",
         ".loom/worktrees/",
         ".loom/state.json",
@@ -132,7 +133,6 @@ pub fn update_gitignore(workspace_path: &Path) -> Result<(), String> {
         ".loom/claims/",
         ".loom/signals/",
         ".loom/status/",
-        ".loom/progress/",
         ".loom/retry-state/",
         ".loom/diagnostics/",
         ".loom/guide-docs-state.json",
@@ -244,17 +244,23 @@ mod tests {
         // Spot-check key runtime patterns
         assert!(contents.contains(".loom-in-use"));
         assert!(contents.contains(".loom-checkpoint"));
-        assert!(contents.contains(".loom/daemon-state.json"));
+        assert!(contents.contains(".loom/spawn-loop-state.json"));
         assert!(contents.contains(".loom/worktrees/"));
-        assert!(contents.contains(".loom/progress/"));
         assert!(contents.contains(".loom/*.log"));
         assert!(contents.contains(".loom/logs/"));
         assert!(contents.contains(".loom/daemon-metrics.json"));
-        assert!(contents.contains(".loom/[0-9][0-9]-daemon-state.json"));
         assert!(contents.contains(".loom/activity.db"));
         assert!(contents.contains(".loom/issue-failures.json"));
         assert!(contents.contains(".loom/usage-cache.json"));
         assert!(contents.contains("# Loom runtime state"));
+
+        // Retired daemon-brain patterns must NOT be emitted (Phase 3.5, #3402)
+        assert!(!contents.contains(".loom/daemon-state.json"));
+        assert!(!contents.contains(".loom/[0-9][0-9]-daemon-state.json"));
+        assert!(!contents.contains(".loom/progress/"));
+        assert!(!contents.contains(".loom/stuck-history.json"));
+        assert!(!contents.contains(".loom/alerts.json"));
+        assert!(!contents.contains(".loom/health-metrics.json"));
 
         // config.json must NOT be gitignored
         assert!(!contents.contains(".loom/config.json"));
@@ -280,8 +286,8 @@ mod tests {
         assert_eq!(contents.matches(".loom/worktrees/").count(), 1);
         // New patterns added
         assert!(contents.contains(".loom-in-use"));
-        assert!(contents.contains(".loom/daemon-state.json"));
-        assert!(contents.contains(".loom/progress/"));
+        assert!(contents.contains(".loom/spawn-loop-state.json"));
+        assert!(contents.contains(".loom/daemon-metrics.json"));
         assert!(contents.contains(".loom/activity.db"));
     }
 
@@ -294,7 +300,7 @@ mod tests {
 
         let contents = fs::read_to_string(tmp.path().join(".gitignore")).unwrap();
 
-        assert_eq!(contents.matches(".loom/daemon-state.json").count(), 1);
+        assert_eq!(contents.matches(".loom/spawn-loop-state.json").count(), 1);
         assert_eq!(contents.matches(".loom-in-use").count(), 1);
         assert_eq!(contents.matches(".loom/worktrees/").count(), 1);
     }
@@ -315,15 +321,11 @@ mod tests {
             ".loom/.daemon.pid",
             ".loom/.daemon.log",
             ".loom/daemon.sock",
-            ".loom/daemon-state.json",
             ".loom/daemon-loop.pid",
             ".loom/daemon-metrics.json",
             ".loom/loom-source-path",
-            ".loom/[0-9][0-9]-daemon-state.json",
-            ".loom/stuck-history.json",
-            ".loom/alerts.json",
+            ".loom/spawn-loop-state.json",
             ".loom/issue-failures.json",
-            ".loom/health-metrics.json",
             ".loom/interventions/",
             ".loom/worktrees/",
             ".loom/state.json",
@@ -332,7 +334,6 @@ mod tests {
             ".loom/claims/",
             ".loom/signals/",
             ".loom/status/",
-            ".loom/progress/",
             ".loom/retry-state/",
             ".loom/diagnostics/",
             ".loom/guide-docs-state.json",
@@ -351,6 +352,22 @@ mod tests {
             assert!(
                 contents.contains(pattern),
                 "Missing pattern in generated .gitignore: {pattern}"
+            );
+        }
+
+        // Retired patterns (Phase 3.5, #3402) must no longer appear
+        let retired = [
+            ".loom/daemon-state.json",
+            ".loom/[0-9][0-9]-daemon-state.json",
+            ".loom/progress/",
+            ".loom/stuck-history.json",
+            ".loom/alerts.json",
+            ".loom/health-metrics.json",
+        ];
+        for pattern in &retired {
+            assert!(
+                !contents.contains(pattern),
+                "Retired pattern should not be in generated .gitignore: {pattern}"
             );
         }
     }
@@ -499,7 +516,7 @@ mod tests {
         );
 
         // Specific ephemeral patterns should be added instead
-        assert!(contents.contains(".loom/daemon-state.json"));
+        assert!(contents.contains(".loom/spawn-loop-state.json"));
         assert!(contents.contains(".loom/state.json"));
         assert!(contents.contains(".loom/worktrees/"));
 
