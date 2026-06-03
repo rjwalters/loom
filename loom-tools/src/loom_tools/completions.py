@@ -1,8 +1,14 @@
 """Check task completions and detect silent failures.
 
-This module polls all active task IDs from daemon-state.json and checks if
-their output files indicate completion. It detects silent failures where
-tasks have exited but issues are still in loom:building state.
+This module polls all active task IDs from ``.loom/spawn-loop-state.json``
+(Phase 1, #3374) and checks if their output files indicate completion. It
+detects silent failures where tasks have exited but issues are still in
+``loom:building`` state.
+
+When ``.loom/spawn-loop-state.json`` is missing (i.e., the workspace is still
+running the legacy Python daemon brain), this module falls back to reading
+``.loom/daemon-state.json`` instead. Phase 3.4 (#3401) will trim the fallback
+once all 3.1.x ports have landed.
 
 Detects:
     - completed: Task completed successfully
@@ -25,14 +31,18 @@ import os
 import pathlib
 import sys
 from dataclasses import dataclass, field
-from typing import Any
 
 from loom_tools.common.github import gh_run
 from loom_tools.common.logging import log_error, log_info, log_success, log_warning
 from loom_tools.common.repo import find_repo_root
-from loom_tools.common.state import read_daemon_state, read_json_file
+from loom_tools.common.state import (
+    read_daemon_state,
+    read_json_file,
+    read_spawn_loop_state,
+)
 from loom_tools.common.time_utils import elapsed_seconds, now_utc
 from loom_tools.models.daemon_state import DaemonState
+from loom_tools.models.spawn_loop_state import SpawnLoopState
 
 # Staleness thresholds (in seconds)
 HEARTBEAT_STALE_THRESHOLD = int(os.environ.get("LOOM_HEARTBEAT_STALE_THRESHOLD", "300"))
@@ -44,7 +54,7 @@ class TaskStatus:
     """Status of a single task."""
 
     id: str
-    category: str  # "shepherd" or "support"
+    category: str  # "shepherd", "support", or "sweep" (spawn-loop primary path)
     issue: int | None
     task_id: str | None
     status: str  # "completed", "errored", "stale", "orphaned", "running", "missing_output"
@@ -96,12 +106,174 @@ def _check_output_for_completion(output_file: pathlib.Path) -> str | None:
     return None
 
 
+def check_spawn_loop_tasks(
+    spawn_loop_state: SpawnLoopState,
+    verbose: bool = False,
+) -> tuple[list[TaskStatus], list[TaskStatus], list[TaskStatus], list[TaskStatus]]:
+    """Check all spawn-loop sweep tasks and categorize them.
+
+    The spawn loop (Phase 1, #3374) replaces the per-shepherd
+    ``daemon-state.json::shepherds[*].output_file`` with a flat
+    ``running[*].output_file`` list. The detection algorithm itself is
+    identical to :func:`check_shepherd_tasks` — only the source of the
+    output-file path changes.
+
+    A task's ``id`` is rendered as ``sweep-<issue>`` so report output stays
+    distinguishable from shepherd entries in mixed-mode workspaces.
+
+    Returns:
+        Tuple of (completed, errored, stale, running) lists.
+    """
+    now_epoch = now_utc().timestamp()
+
+    completed: list[TaskStatus] = []
+    errored: list[TaskStatus] = []
+    stale: list[TaskStatus] = []
+    running: list[TaskStatus] = []
+
+    for task in spawn_loop_state.running:
+        task_id = f"sweep-{task.issue}"
+        if verbose:
+            log_info(
+                f"Checking spawn-loop task {task_id}: "
+                f"issue={task.issue} pid={task.pid} output_file={task.output_file}"
+            )
+
+        # Heartbeat staleness — only triggers when a heartbeat field is
+        # populated. The spawn loop itself does not currently write
+        # last_heartbeat (#3392 may add it as a sibling field). This branch
+        # remains for forward-compat so existing detection thresholds apply
+        # uniformly once heartbeats are emitted.
+        if task.last_heartbeat:
+            try:
+                heartbeat_age = elapsed_seconds(task.last_heartbeat)
+                if verbose:
+                    log_info(f"  Heartbeat age: {heartbeat_age}s")
+                if heartbeat_age > HEARTBEAT_STALE_THRESHOLD:
+                    stale.append(
+                        TaskStatus(
+                            id=task_id,
+                            category="sweep",
+                            issue=task.issue,
+                            task_id=task_id,
+                            status="stale",
+                            reason=f"heartbeat_stale:{heartbeat_age}s",
+                        )
+                    )
+                    log_warning(f"Sweep task {task_id} has stale heartbeat ({heartbeat_age}s)")
+                    continue
+            except Exception:
+                pass
+
+        output_file_path = task.output_file
+        if not output_file_path:
+            # No output-file in this entry (e.g., pre-#3393 state file). We
+            # cannot reason about silent failure without a log path, so we
+            # treat it as still running and rely on the orphan-issue check
+            # (label-based) to catch genuine failures.
+            running.append(
+                TaskStatus(
+                    id=task_id,
+                    category="sweep",
+                    issue=task.issue,
+                    task_id=task_id,
+                    status="running",
+                    reason="no_output_file_field",
+                )
+            )
+            if verbose:
+                log_info(f"  {task_id} has no output_file in state — treating as running")
+            continue
+
+        output_file = pathlib.Path(output_file_path)
+
+        if not output_file.exists():
+            errored.append(
+                TaskStatus(
+                    id=task_id,
+                    category="sweep",
+                    issue=task.issue,
+                    task_id=task_id,
+                    status="errored",
+                    reason="missing_output",
+                )
+            )
+            log_warning(f"Sweep task {task_id} output file missing: {output_file_path}")
+            continue
+
+        # Output file mtime staleness check.
+        output_mtime = _get_file_mtime(output_file)
+        output_age = int(now_epoch - output_mtime)
+
+        if output_age > OUTPUT_STALE_THRESHOLD:
+            stale.append(
+                TaskStatus(
+                    id=task_id,
+                    category="sweep",
+                    issue=task.issue,
+                    task_id=task_id,
+                    status="stale",
+                    reason=f"output_stale:{output_age}s",
+                )
+            )
+            log_warning(f"Sweep task {task_id} has stale output ({output_age}s)")
+            continue
+
+        # Completion-marker scan.
+        result = _check_output_for_completion(output_file)
+        if result == "completed":
+            completed.append(
+                TaskStatus(
+                    id=task_id,
+                    category="sweep",
+                    issue=task.issue,
+                    task_id=task_id,
+                    status="completed",
+                )
+            )
+            log_success(f"Sweep task {task_id} completed (issue #{task.issue})")
+            continue
+        elif result == "errored":
+            errored.append(
+                TaskStatus(
+                    id=task_id,
+                    category="sweep",
+                    issue=task.issue,
+                    task_id=task_id,
+                    status="errored",
+                    reason="exit_error",
+                )
+            )
+            log_error(f"Sweep task {task_id} exited with error (issue #{task.issue})")
+            continue
+
+        # Still running.
+        running.append(
+            TaskStatus(
+                id=task_id,
+                category="sweep",
+                issue=task.issue,
+                task_id=task_id,
+                status="running",
+            )
+        )
+        if verbose:
+            log_info(f"  {task_id} still running")
+
+    return completed, errored, stale, running
+
+
 def check_shepherd_tasks(
     repo_root: pathlib.Path,
     daemon_state: DaemonState,
     verbose: bool = False,
 ) -> tuple[list[TaskStatus], list[TaskStatus], list[TaskStatus], list[TaskStatus]]:
     """Check all shepherd tasks and categorize them.
+
+    This is the legacy (pre-#3393) daemon-state-driven path. Retained so the
+    CLI keeps working against workspaces still running the Python daemon
+    brain. Phase 3.4 (#3401) will trim this once the spawn loop is the
+    universally-installed orchestrator.
 
     Returns:
         Tuple of (completed, errored, stale, running) lists.
@@ -282,8 +454,6 @@ def check_support_role_tasks(
     Returns:
         Tuple of (completed, errored, stale, running) lists.
     """
-    now_epoch = now_utc().timestamp()
-
     completed = []
     errored = []
     stale = []
@@ -342,16 +512,14 @@ def check_support_role_tasks(
 
 
 def check_orphaned_building(
-    daemon_state: DaemonState,
+    tracked_issues: set[int | None] | set[int],
 ) -> list[int]:
-    """Check for issues labeled loom:building but not tracked by any shepherd."""
-    # Get tracked issues from active shepherds
-    tracked_issues = {
-        s.issue
-        for s in daemon_state.shepherds.values()
-        if s.status == "working" and s.issue is not None
-    }
+    """Check for issues labeled loom:building but not tracked by any active task.
 
+    Args:
+        tracked_issues: Set of issue numbers known to be claimed by an active
+            task (either a working shepherd or a spawn-loop sweep child).
+    """
     # Query GitHub for loom:building issues
     try:
         result = gh_run(
@@ -437,7 +605,20 @@ def run_check(
     dry_run: bool = False,
     json_output: bool = False,
 ) -> CompletionReport:
-    """Run completion checks and return a report."""
+    """Run completion checks and return a report.
+
+    Source-of-truth dispatch:
+
+    1. If ``.loom/spawn-loop-state.json`` is present (Phase 1, #3374), iterate
+       over ``running[*]`` task entries — this is the maintained path after
+       Phase 3.
+    2. Otherwise fall back to ``.loom/daemon-state.json::shepherds`` and
+       ``support_roles`` — the pre-Phase-3 path. Phase 3.4 (#3401) trims this.
+
+    The ``loom:building`` orphan-check (via ``gh issue list``) runs in both
+    modes; the only difference is the set of "tracked" issues we compare
+    against.
+    """
     report = CompletionReport()
 
     try:
@@ -446,16 +627,73 @@ def run_check(
         log_error("Not in a git repository with .loom directory")
         return report
 
-    state_file = repo_root / ".loom" / "daemon-state.json"
+    spawn_loop_state = read_spawn_loop_state(repo_root)
+    daemon_state_file = repo_root / ".loom" / "daemon-state.json"
 
-    if not state_file.exists():
-        if json_output:
-            print(json.dumps({"error": "state_file_not_found", "file": str(state_file)}))
-        else:
-            log_error(f"State file not found: {state_file}")
+    # Spawn-loop primary path. Returns early — the spawn loop does not track
+    # support roles or per-shepherd progress files, so those checks are
+    # intentionally skipped.
+    if spawn_loop_state.present:
+        if not json_output:
+            log_info("Checking spawn-loop sweep tasks...")
+
+        s_completed, s_errored, s_stale, s_running = check_spawn_loop_tasks(
+            spawn_loop_state, verbose
+        )
+        report.completed.extend(s_completed)
+        report.errored.extend(s_errored)
+        report.stale.extend(s_stale)
+        report.running.extend(s_running)
+
+        if not json_output:
+            log_info("Checking for orphaned issues...")
+
+        tracked_sweep: set[int] = {
+            t.issue for t in spawn_loop_state.running if t.issue
+        }
+        report.orphaned = check_orphaned_building(tracked_sweep)
+
+        for issue_num in report.orphaned:
+            log_warning(f"Issue #{issue_num} is in loom:building but not tracked by any sweep task")
+
+        if recover:
+            if not json_output:
+                log_info("Performing recovery actions...")
+
+            # Recover errored sweep tasks (matches legacy behavior — only
+            # shepherd/sweep entries are recovered, not support roles).
+            for task in report.errored:
+                if task.category == "sweep" and task.issue:
+                    if recover_issue(task.issue, dry_run):
+                        report.recoveries.append(f"revert:{task.issue}")
+
+            # Recover orphaned issues
+            for issue_num in report.orphaned:
+                if recover_issue(issue_num, dry_run):
+                    report.recoveries.append(f"revert_orphan:{issue_num}")
+
         return report
 
-    # Load state
+    # Legacy daemon-state fallback path.
+    if not daemon_state_file.exists():
+        if json_output:
+            print(
+                json.dumps(
+                    {
+                        "error": "state_file_not_found",
+                        "file": str(daemon_state_file),
+                        "spawn_loop_state": "absent",
+                    }
+                )
+            )
+        else:
+            log_error(f"State file not found: {daemon_state_file}")
+            log_error(
+                "Neither .loom/spawn-loop-state.json nor .loom/daemon-state.json "
+                "exists — is the spawn loop or daemon running?"
+            )
+        return report
+
     daemon_state = read_daemon_state(repo_root)
 
     # Check shepherd tasks
@@ -486,7 +724,12 @@ def run_check(
     if not json_output:
         log_info("Checking for orphaned issues...")
 
-    report.orphaned = check_orphaned_building(daemon_state)
+    tracked_shepherd: set[int] = {
+        s.issue
+        for s in daemon_state.shepherds.values()
+        if s.status == "working" and s.issue is not None
+    }
+    report.orphaned = check_orphaned_building(tracked_shepherd)
 
     for issue_num in report.orphaned:
         log_warning(f"Issue #{issue_num} is in loom:building but not tracked by any shepherd")
@@ -581,6 +824,10 @@ Task states detected:
   orphaned         Issue in loom:building but no active task
   missing_output   Output file doesn't exist
   running          Task is still active
+
+Source of truth:
+  .loom/spawn-loop-state.json   Primary (Phase 1, #3374)
+  .loom/daemon-state.json       Legacy fallback (trimmed in Phase 3.4, #3401)
 
 Environment variables:
   LOOM_HEARTBEAT_STALE_THRESHOLD   Seconds before heartbeat is stale (default: 300)

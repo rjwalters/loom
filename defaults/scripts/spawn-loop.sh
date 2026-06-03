@@ -50,11 +50,22 @@
 #
 # State files:
 #   .loom/spawn-loop.pid             Running PID
-#   .loom/spawn-loop-state.json      {started_at, running:[{issue, pid, started_at, token}]}
+#   .loom/spawn-loop-state.json      {started_at, running:[{issue, pid, started_at, token, output_file}]}
 #   .loom/logs/spawn-loop.log        Loop log (timestamped spawn/exit/error entries)
-#   .loom/logs/sweep-issue-<N>.log   Per-issue child output
+#   .loom/logs/sweep-issue-<N>.log   Per-issue child output (same path stored in tasks[].output_file)
 #   .loom/locks/issue-<N>/           Atomic claim lock (mkdir primitive)
 #   .loom/stop-spawn-loop            Touch to request graceful shutdown
+#
+# spawn-loop-state.json task fields (#3393, Phase 3.1.4):
+#   issue        int   GitHub issue number being processed
+#   pid          int   Child process PID (for liveness checks via os.kill(pid,0))
+#   started_at   str   ISO-8601 UTC timestamp of spawn
+#   token        str   Token account name (currently always "unknown" — token
+#                      attribution lives in the per-issue log + bad-tokens file)
+#   output_file  str   Absolute path to per-issue child output log. Read by
+#                      `loom-completions` to detect silent failures (presence
+#                      of AGENT_EXIT_CODE marker + file mtime staleness).
+#                      Format: $LOOM_DIR/logs/sweep-issue-<N>.log
 #
 # Exit codes:
 #   0   Normal exit (start/stop succeeded)
@@ -170,19 +181,32 @@ state_count_running() {
 }
 
 # Add a child to state.running.
+#
+# Positional args:
+#   $1 issue        GitHub issue number (int)
+#   $2 pid          Child process PID (int)
+#   $3 token        Token account name or "unknown" (defaults to "unknown")
+#   $4 output_file  Absolute path to per-issue child log (optional; spawn_sweep
+#                   always supplies it). Empty/missing -> omitted from the JSON
+#                   entry so old consumers tolerate it.
 state_add_child() {
-    local issue="$1" pid="$2" token="${3:-unknown}"
-    python3 - "$STATEFILE" "$issue" "$pid" "$token" <<'PY'
+    local issue="$1" pid="$2" token="${3:-unknown}" output_file="${4:-}"
+    python3 - "$STATEFILE" "$issue" "$pid" "$token" "$output_file" <<'PY'
 import json, sys, datetime, os
-path, issue, pid, token = sys.argv[1:5]
+path, issue, pid, token, output_file = sys.argv[1:6]
 with open(path) as f:
     data = json.load(f)
-data.setdefault("running", []).append({
+entry = {
     "issue": int(issue),
     "pid": int(pid),
     "started_at": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
     "token": token,
-})
+}
+if output_file:
+    # #3393: per-task output-file path consumed by loom-completions to detect
+    # silent failures (AGENT_EXIT_CODE markers + mtime staleness).
+    entry["output_file"] = output_file
+data.setdefault("running", []).append(entry)
 tmp = path + ".tmp"
 with open(tmp, "w") as f:
     json.dump(data, f, indent=2)
@@ -335,7 +359,11 @@ spawn_sweep() {
     # parsing the child's stderr. Record "unknown" — token attribution lives in
     # the per-issue log file and the bad-tokens manifest, not in spawn-loop
     # state.
-    state_add_child "$issue" "$pid" "unknown"
+    #
+    # `$log_path` is also recorded as the entry's `output_file` so downstream
+    # consumers (loom-completions, #3393) can detect silent failures without
+    # re-deriving the path convention.
+    state_add_child "$issue" "$pid" "unknown" "$log_path"
     log_info "spawned issue=$issue pid=$pid log=$log_path"
 }
 

@@ -9,7 +9,8 @@ The spawn loop writes a minimal state file with the following shape::
           "issue": 42,
           "pid": 12345,
           "started_at": "2026-06-02T16:15:00Z",
-          "token": "robb-personal"
+          "token": "robb-personal",
+          "output_file": "/path/to/.loom/logs/sweep-issue-42.log"
         },
         ...
       ]
@@ -20,6 +21,10 @@ status, no pipeline state, no warnings, and no completed-issue history — the
 spawn loop tracks only the bare minimum needed to reap dead children and
 respect MAX_PARALLEL. Anything richer comes from the forge (`gh issue list`,
 `gh pr list`).
+
+The ``output_file`` field was added in Phase 3.1.4 (#3393) so ``loom-completions``
+can detect silent failures (AGENT_EXIT_CODE marker + mtime staleness) without
+re-deriving the spawn loop's per-issue log path convention.
 
 This module is part of the Phase 3 port (epic #3372, tracker #3378) and is
 read by ``loom-status`` and other operator CLIs as they migrate off
@@ -45,6 +50,11 @@ class SpawnLoopTask:
     # ``checkpoint.sh``) backwards compatible. ``loom-stuck-detection`` (a
     # sibling port) will likely populate this.
     last_heartbeat: str | None = None
+    # Absolute path to the per-task output log written by ``spawn-loop.sh``
+    # (Phase 3.1.4, #3393). Consumed by ``loom-completions`` to detect
+    # silent failures (AGENT_EXIT_CODE markers + mtime staleness). Optional
+    # for backward-compatibility with state files written before #3393.
+    output_file: str | None = None
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> SpawnLoopTask:
@@ -57,11 +67,12 @@ class SpawnLoopTask:
             started_at=data.get("started_at"),
             token=data.get("token"),
             last_heartbeat=data.get("last_heartbeat"),
+            output_file=data.get("output_file"),
         )
 
     def to_dict(self) -> dict[str, Any]:
         d: dict[str, Any] = {"issue": self.issue, "pid": self.pid}
-        for k in ("started_at", "token", "last_heartbeat"):
+        for k in ("started_at", "token", "last_heartbeat", "output_file"):
             v = getattr(self, k)
             if v is not None:
                 d[k] = v
