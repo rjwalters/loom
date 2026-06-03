@@ -497,3 +497,409 @@ class TestEdgeCases:
         assert len(errored) == 0
         assert len(stale) == 0
         assert len(running) == 0
+
+
+# ---------------------------------------------------------------------------
+# Spawn-loop primary path tests (Phase 3.1.4, #3393)
+# ---------------------------------------------------------------------------
+
+
+class TestSpawnLoopTasks:
+    """Tests for the spawn-loop task-driven detection path.
+
+    When ``.loom/spawn-loop-state.json`` is present, the CLI iterates over
+    ``tasks[]`` instead of ``daemon-state.json::shepherds``. The polling /
+    silent-failure-detection algorithm itself is unchanged — only the source
+    of output-file paths.
+    """
+
+    def test_spawn_loop_task_completed_via_output_file(self, tmp_path: pathlib.Path) -> None:
+        """AGENT_EXIT_CODE=0 in output_file -> completed."""
+        from loom_tools.completions import check_spawn_loop_tasks
+        from loom_tools.models.spawn_loop_state import SpawnLoopState, SpawnLoopTask
+
+        output_file = tmp_path / "sweep-issue-42.log"
+        output_file.write_text("Some output\nAGENT_EXIT_CODE=0\nMore output")
+
+        state = SpawnLoopState(
+            started_at="2026-06-02T16:00:00Z",
+            running=[
+                SpawnLoopTask(
+                    issue=42,
+                    pid=12345,
+                    started_at="2026-06-02T16:15:00Z",
+                    token="robb-personal",
+                    output_file=str(output_file),
+                )
+            ],
+            present=True,
+        )
+
+        completed, errored, stale, running = check_spawn_loop_tasks(state)
+
+        assert len(completed) == 1
+        assert completed[0].id == "sweep-42"
+        assert completed[0].issue == 42
+        assert completed[0].category == "sweep"
+        assert len(errored) == 0
+        assert len(stale) == 0
+        assert len(running) == 0
+
+    def test_spawn_loop_task_errored_via_output_file(self, tmp_path: pathlib.Path) -> None:
+        """AGENT_EXIT_CODE=1 in output_file -> errored."""
+        from loom_tools.completions import check_spawn_loop_tasks
+        from loom_tools.models.spawn_loop_state import SpawnLoopState, SpawnLoopTask
+
+        output_file = tmp_path / "sweep-issue-99.log"
+        output_file.write_text("crashed\nAGENT_EXIT_CODE=2\n")
+
+        state = SpawnLoopState(
+            running=[
+                SpawnLoopTask(
+                    issue=99,
+                    pid=12345,
+                    output_file=str(output_file),
+                )
+            ],
+            present=True,
+        )
+
+        completed, errored, stale, running = check_spawn_loop_tasks(state)
+
+        assert len(errored) == 1
+        assert errored[0].id == "sweep-99"
+        assert errored[0].reason == "exit_error"
+
+    def test_spawn_loop_task_missing_output_file(self, tmp_path: pathlib.Path) -> None:
+        """output_file path that doesn't exist -> errored with reason missing_output."""
+        from loom_tools.completions import check_spawn_loop_tasks
+        from loom_tools.models.spawn_loop_state import SpawnLoopState, SpawnLoopTask
+
+        state = SpawnLoopState(
+            running=[
+                SpawnLoopTask(
+                    issue=42,
+                    pid=12345,
+                    output_file=str(tmp_path / "does-not-exist.log"),
+                )
+            ],
+            present=True,
+        )
+
+        completed, errored, stale, running = check_spawn_loop_tasks(state)
+
+        assert len(errored) == 1
+        assert errored[0].reason == "missing_output"
+
+    def test_spawn_loop_task_no_output_file_field_treats_as_running(self) -> None:
+        """Pre-#3393 state files lack output_file; treat such tasks as running."""
+        from loom_tools.completions import check_spawn_loop_tasks
+        from loom_tools.models.spawn_loop_state import SpawnLoopState, SpawnLoopTask
+
+        state = SpawnLoopState(
+            running=[
+                SpawnLoopTask(issue=42, pid=12345, output_file=None),
+            ],
+            present=True,
+        )
+
+        completed, errored, stale, running = check_spawn_loop_tasks(state)
+
+        assert len(running) == 1
+        assert running[0].reason == "no_output_file_field"
+        assert len(errored) == 0
+
+    def test_spawn_loop_task_running_when_no_marker(self, tmp_path: pathlib.Path) -> None:
+        """Fresh output file without AGENT_EXIT_CODE marker -> running."""
+        from loom_tools.completions import check_spawn_loop_tasks
+        from loom_tools.models.spawn_loop_state import SpawnLoopState, SpawnLoopTask
+
+        output_file = tmp_path / "sweep-issue-7.log"
+        output_file.write_text("still chugging along...\n")
+
+        state = SpawnLoopState(
+            running=[
+                SpawnLoopTask(issue=7, pid=12345, output_file=str(output_file)),
+            ],
+            present=True,
+        )
+
+        completed, errored, stale, running = check_spawn_loop_tasks(state)
+
+        assert len(running) == 1
+        assert running[0].id == "sweep-7"
+        assert len(completed) == 0
+        assert len(errored) == 0
+
+    def test_spawn_loop_task_stale_output_mtime(
+        self, tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Output file with very old mtime -> stale."""
+        import os
+        import time
+
+        from loom_tools.completions import OUTPUT_STALE_THRESHOLD, check_spawn_loop_tasks
+        from loom_tools.models.spawn_loop_state import SpawnLoopState, SpawnLoopTask
+
+        output_file = tmp_path / "sweep-issue-5.log"
+        output_file.write_text("output without exit code\n")
+
+        # Backdate mtime past the staleness threshold.
+        old_time = time.time() - OUTPUT_STALE_THRESHOLD - 120
+        os.utime(output_file, (old_time, old_time))
+
+        state = SpawnLoopState(
+            running=[
+                SpawnLoopTask(issue=5, pid=12345, output_file=str(output_file)),
+            ],
+            present=True,
+        )
+
+        completed, errored, stale, running = check_spawn_loop_tasks(state)
+
+        assert len(stale) == 1
+        assert stale[0].id == "sweep-5"
+        assert "output_stale" in (stale[0].reason or "")
+
+    def test_spawn_loop_task_stale_heartbeat(self) -> None:
+        """Stale last_heartbeat field -> stale (forward-compat for #3392)."""
+        from datetime import datetime, timedelta, timezone
+
+        from loom_tools.completions import HEARTBEAT_STALE_THRESHOLD, check_spawn_loop_tasks
+        from loom_tools.models.spawn_loop_state import SpawnLoopState, SpawnLoopTask
+
+        stale_time = (
+            datetime.now(timezone.utc) - timedelta(seconds=HEARTBEAT_STALE_THRESHOLD + 60)
+        ).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+        state = SpawnLoopState(
+            running=[
+                SpawnLoopTask(
+                    issue=11,
+                    pid=12345,
+                    last_heartbeat=stale_time,
+                    output_file="/tmp/whatever.log",  # not reached
+                ),
+            ],
+            present=True,
+        )
+
+        completed, errored, stale, running = check_spawn_loop_tasks(state)
+
+        assert len(stale) == 1
+        assert "heartbeat_stale" in (stale[0].reason or "")
+
+    def test_run_check_prefers_spawn_loop_when_present(
+        self, tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """When spawn-loop-state.json is present, daemon-state.json is ignored."""
+        from loom_tools.completions import run_check
+
+        # Build a workspace with BOTH state files. The spawn-loop file should win.
+        mock_repo = tmp_path / "repo"
+        mock_repo.mkdir()
+        (mock_repo / ".git").mkdir()
+        (mock_repo / ".loom").mkdir()
+
+        # Spawn-loop state with one completed sweep child.
+        sweep_log = mock_repo / ".loom" / "logs" / "sweep-issue-42.log"
+        sweep_log.parent.mkdir(parents=True)
+        sweep_log.write_text("AGENT_EXIT_CODE=0\n")
+        spawn_state = mock_repo / ".loom" / "spawn-loop-state.json"
+        spawn_state.write_text(
+            json.dumps(
+                {
+                    "started_at": "2026-06-02T16:00:00Z",
+                    "running": [
+                        {
+                            "issue": 42,
+                            "pid": 12345,
+                            "started_at": "2026-06-02T16:15:00Z",
+                            "token": "robb-personal",
+                            "output_file": str(sweep_log),
+                        }
+                    ],
+                }
+            )
+        )
+
+        # Daemon state would normally surface a non-existent shepherd; if the
+        # spawn-loop path is taken correctly, we never read this file's
+        # shepherd entries and so no spurious "errored" is reported for it.
+        daemon_state = mock_repo / ".loom" / "daemon-state.json"
+        daemon_state.write_text(
+            json.dumps(
+                {
+                    "started_at": "2026-06-02T16:00:00Z",
+                    "running": True,
+                    "iteration": 1,
+                    "shepherds": {
+                        "shepherd-1": {
+                            "status": "working",
+                            "issue": 999,
+                            "task_id": "old",
+                            "output_file": "/tmp/nonexistent-old-path.log",
+                            "execution_mode": "direct",
+                        }
+                    },
+                    "support_roles": {},
+                }
+            )
+        )
+
+        clear_repo_cache()
+        monkeypatch.chdir(mock_repo)
+
+        # Stub out gh_run so the orphan check returns no hits.
+        from loom_tools import completions as completions_mod
+
+        class _FakeResult:
+            returncode = 0
+            stdout = "[]"
+
+        monkeypatch.setattr(
+            completions_mod, "gh_run", lambda *a, **kw: _FakeResult()
+        )
+
+        report = run_check(verbose=False, recover=False, dry_run=False, json_output=True)
+
+        # The sweep child is the only thing reported — and as completed.
+        # The shepherd entry from daemon-state.json must NOT appear.
+        ids = [t.id for t in report.completed + report.errored + report.stale + report.running]
+        assert "sweep-42" in ids
+        assert "shepherd-1" not in ids
+        assert len(report.completed) == 1
+        assert report.completed[0].category == "sweep"
+
+    def test_run_check_falls_back_to_daemon_state_when_spawn_loop_absent(
+        self, tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """No spawn-loop-state.json -> legacy daemon-state.json path executes."""
+        from loom_tools.completions import run_check
+
+        mock_repo = tmp_path / "repo"
+        mock_repo.mkdir()
+        (mock_repo / ".git").mkdir()
+        (mock_repo / ".loom").mkdir()
+        (mock_repo / ".loom" / "progress").mkdir()
+
+        # Only a daemon-state file — no spawn-loop file.
+        daemon_state = mock_repo / ".loom" / "daemon-state.json"
+        daemon_state.write_text(
+            json.dumps(
+                {
+                    "started_at": "2026-06-02T16:00:00Z",
+                    "running": True,
+                    "iteration": 1,
+                    "shepherds": {},
+                    "support_roles": {},
+                }
+            )
+        )
+
+        clear_repo_cache()
+        monkeypatch.chdir(mock_repo)
+
+        from loom_tools import completions as completions_mod
+
+        class _FakeResult:
+            returncode = 0
+            stdout = "[]"
+
+        monkeypatch.setattr(
+            completions_mod, "gh_run", lambda *a, **kw: _FakeResult()
+        )
+
+        report = run_check(verbose=False, recover=False, dry_run=False, json_output=True)
+
+        # No shepherds, no support roles, no orphans -> clean report.
+        assert not report.has_failures
+
+    def test_run_check_spawn_loop_orphan_detection_uses_sweep_issue_set(
+        self, tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Orphaned issues == loom:building issues - sweep-tracked issues."""
+        from loom_tools.completions import run_check
+
+        mock_repo = tmp_path / "repo"
+        mock_repo.mkdir()
+        (mock_repo / ".git").mkdir()
+        (mock_repo / ".loom").mkdir()
+
+        # Sweep tracks issue 42; gh reports both 42 and 7 as loom:building.
+        # 7 is the orphan.
+        sweep_log = mock_repo / ".loom" / "logs" / "sweep-issue-42.log"
+        sweep_log.parent.mkdir(parents=True)
+        sweep_log.write_text("still running\n")
+
+        spawn_state = mock_repo / ".loom" / "spawn-loop-state.json"
+        spawn_state.write_text(
+            json.dumps(
+                {
+                    "started_at": "2026-06-02T16:00:00Z",
+                    "running": [
+                        {
+                            "issue": 42,
+                            "pid": 12345,
+                            "output_file": str(sweep_log),
+                        }
+                    ],
+                }
+            )
+        )
+
+        clear_repo_cache()
+        monkeypatch.chdir(mock_repo)
+
+        from loom_tools import completions as completions_mod
+
+        class _FakeResult:
+            returncode = 0
+            stdout = json.dumps([{"number": 42}, {"number": 7}])
+
+        monkeypatch.setattr(
+            completions_mod, "gh_run", lambda *a, **kw: _FakeResult()
+        )
+
+        report = run_check(verbose=False, recover=False, dry_run=False, json_output=True)
+
+        assert report.orphaned == [7]
+        assert report.has_failures is True
+
+
+class TestSpawnLoopSchema:
+    """Confirm the SpawnLoopTask model exposes the output_file field added in #3393."""
+
+    def test_spawn_loop_task_from_dict_populates_output_file(self) -> None:
+        from loom_tools.models.spawn_loop_state import SpawnLoopTask
+
+        task = SpawnLoopTask.from_dict(
+            {
+                "issue": 42,
+                "pid": 12345,
+                "started_at": "2026-06-02T16:00:00Z",
+                "token": "robb-personal",
+                "output_file": "/abs/path/to/sweep-issue-42.log",
+            }
+        )
+        assert task.output_file == "/abs/path/to/sweep-issue-42.log"
+
+    def test_spawn_loop_task_from_dict_tolerates_missing_output_file(self) -> None:
+        from loom_tools.models.spawn_loop_state import SpawnLoopTask
+
+        task = SpawnLoopTask.from_dict({"issue": 42, "pid": 12345})
+        assert task.output_file is None
+
+    def test_spawn_loop_task_to_dict_round_trips_output_file(self) -> None:
+        from loom_tools.models.spawn_loop_state import SpawnLoopTask
+
+        task = SpawnLoopTask(issue=42, pid=12345, output_file="/abs/log.log")
+        d = task.to_dict()
+        assert d["output_file"] == "/abs/log.log"
+
+    def test_spawn_loop_task_to_dict_omits_none_output_file(self) -> None:
+        from loom_tools.models.spawn_loop_state import SpawnLoopTask
+
+        task = SpawnLoopTask(issue=42, pid=12345)
+        d = task.to_dict()
+        assert "output_file" not in d
