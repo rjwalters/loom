@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import pathlib
-import subprocess
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import TYPE_CHECKING, Any
@@ -476,27 +475,24 @@ def _handle_support_role_completion(
 
 
 def _trigger_shepherd_cleanup(repo_root: pathlib.Path, issue: int | None) -> None:
-    """Trigger shepherd cleanup via loom-daemon-cleanup."""
+    """Trigger shepherd cleanup by invoking ``daemon_cleanup`` directly.
+
+    Historically this delegated to the ``loom-daemon-cleanup`` CLI via
+    subprocess.  As of #3396 (Phase 3.1.7 of #3372) that CLI was renamed
+    to ``loom-cleanup`` and reduced to log archival only -- the
+    ``shepherd-complete`` event no longer has a CLI surface.  The
+    underlying Python helper still lives in ``daemon_cleanup.py`` and
+    retires with the rest of the daemon brain in Phase 3.2.
+    """
     if issue is None:
         return
 
     try:
-        # Use loom-daemon-cleanup for event-driven cleanup
-        venv_cleanup = repo_root / "loom-tools" / ".venv" / "bin" / "loom-daemon-cleanup"
-        if venv_cleanup.is_file():
-            subprocess.run(
-                [str(venv_cleanup), "shepherd-complete", str(issue)],
-                capture_output=True,
-                timeout=60,
-                cwd=repo_root,
-            )
-        else:
-            # Try system-installed
-            subprocess.run(
-                ["loom-daemon-cleanup", "shepherd-complete", str(issue)],
-                capture_output=True,
-                timeout=60,
-                cwd=repo_root,
-            )
-    except Exception:
-        log_warning(f"Failed to trigger cleanup for issue #{issue}")
+        from loom_tools.daemon_cleanup import (
+            handle_shepherd_complete,
+            load_config,
+        )
+
+        handle_shepherd_complete(repo_root, issue, load_config())
+    except Exception as exc:
+        log_warning(f"Failed to trigger cleanup for issue #{issue}: {exc}")

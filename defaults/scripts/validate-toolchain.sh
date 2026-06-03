@@ -20,7 +20,7 @@ set -euo pipefail
 
 # Critical commands - daemon cannot function without these
 CRITICAL_COMMANDS=(
-    "loom-daemon-cleanup"
+    "loom-cleanup"
     "loom-recover-orphans"
     "loom-snapshot"
 )
@@ -59,7 +59,7 @@ OPTIONS:
     --help      Show this help message
 
 CRITICAL COMMANDS (required):
-    loom-daemon-cleanup   - Cleanup stale artifacts at daemon startup
+    loom-cleanup          - Log archival (post-daemon-brain)
     loom-recover-orphans  - Recover orphaned shepherds after crash
     loom-snapshot         - Generate pipeline snapshot for iteration
 
@@ -82,7 +82,7 @@ INSTALLATION:
     uv pip install -e ./loom-tools
 
     # Verify installation:
-    which loom-daemon-cleanup
+    which loom-cleanup
 
 EXIT CODES:
     0 - All critical commands available
@@ -114,7 +114,7 @@ command_exists() {
     # Map command names to module paths
     local module_name
     case "$cmd" in
-        loom-daemon-cleanup) module_name="loom_tools.daemon_cleanup" ;;
+        loom-cleanup) module_name="loom_tools.cleanup" ;;
         loom-recover-orphans) module_name="loom_tools.orphan_recovery" ;;
         loom-snapshot) module_name="loom_tools.snapshot" ;;
         loom-stuck-detection) module_name="loom_tools.stuck_detection" ;;
