@@ -52,7 +52,8 @@ Safety Features:
   - Only cleans worktrees with MERGED PRs (not just closed)
   - Checks for uncommitted changes before removal
   - Grace period after merge to avoid race conditions
-  - Tracks cleanup state in daemon-state.json
+  - Respects active spawn-loop tasks (.loom/spawn-loop-state.json)
+    and claim-lock dirs (.loom/locks/issue-N/) — see #3398
 
 Cleanup Criteria:
   A worktree is cleaned when ALL of the following are true:
