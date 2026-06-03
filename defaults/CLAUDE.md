@@ -1843,6 +1843,7 @@ These surfaces are **not** going away and are the supported replacements:
 | Capability | Replacement | Where |
 |------------|-------------|-------|
 | Single-issue lifecycle (curator → builder → judge → doctor → merge) | `/loom:sweep <issue>` | `.claude/commands/loom/sweep.md` |
+| PR-side back half (judge / doctor → judge / merge for an existing open PR set) | `/loom:sweep --prs <pr-number-list>` (Mode C, #3384) | `.claude/commands/loom/sweep.md` |
 | Multi-issue / multi-account batch orchestration | `LOOM_USE_SPAWN_LOOP=1 ./.loom/scripts/spawn-loop.sh` | Phase 1, #3374 |
 | Periodic support roles (Champion, Curator, Judge, Auditor, Guide) | GitHub Actions cron workflows | `.github/workflows/loom-*.yml`, Phase 2a, #3375 |
 | Per-task multi-account token rotation | `./.loom/scripts/spawn-claude.sh` + `.loom/tokens/` | Unchanged |

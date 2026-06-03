@@ -1,16 +1,24 @@
 # Sweep
 
-Process an explicit list of issues through the full shepherd lifecycle from the current Claude session — no external daemon required. Runs sequentially by default, or in **parallel waves** of up to `N` builders when `--builders-per-wave N` is supplied. Supports `--dry-run` to preview the candidate plan without mutating anything.
+Process an explicit list of issues — **or an explicit/NL-described set of open PRs** — through the appropriate lifecycle from the current Claude session, no external daemon required. Runs sequentially by default, or in **parallel waves** of up to `N` builders when `--builders-per-wave N` is supplied (issue-set modes only). Supports `--dry-run` to preview the candidate plan without mutating anything.
 
-> **Scope.** This skill accepts either an explicit list of issue numbers or a natural-language description of which issues to process, and runs them through the full lifecycle in waves. Supports `--dry-run` to preview the plan without mutations. Other knobs sketched in #3298 are **deliberately deferred** — see "Limitations" below.
+> **Scope.** This skill accepts either an explicit list of issue numbers, a natural-language description of which issues to process, **or an explicit/NL-described list of open PRs** (Mode C, the "back half" of the lifecycle: Judge → Doctor → Merge per PR's current label). Runs the appropriate lifecycle in waves. Supports `--dry-run` to preview the plan without mutations. Other knobs sketched in #3298 are **deliberately deferred** — see "Limitations" below.
 >
-> If you need fully autonomous orchestration with work generation, use `/loom`. If you need a single-issue lifecycle, use `/shepherd <N>`. `/sweep` exists for the in-between case: "I have these N issues, run them in this session, without spinning up a daemon."
+> If you need fully autonomous orchestration with work generation, use `/loom`. If you need a single-issue lifecycle, use `/shepherd <N>`. `/sweep` exists for the in-between case: "I have these N issues (or PRs), run them in this session, without spinning up a daemon."
 
 ## Arguments
 
 **Arguments**: $ARGUMENTS
 
-`$ARGUMENTS` is interpreted in one of **two modes**, chosen by inspection of the non-flag tokens. Before classifying, **strip all recognized flag tokens** (`--builders-per-wave N`, `--dry-run`) from the token list — flags are honoured in both modes.
+`$ARGUMENTS` is interpreted in one of **three modes**, chosen by inspection of the non-flag tokens and the presence of a `--prs` flag. Before classifying, **strip all recognized flag tokens** (`--builders-per-wave N`, `--dry-run`, `--prs`) from the token list — flags are honoured in their respective modes.
+
+**Mode selection summary** (full rules below):
+
+| Trigger | Mode | Subject |
+|---------|------|---------|
+| `--prs` flag present | **Mode C** (PR-set) | Open PRs, routed per their current label |
+| No `--prs`, all non-flag tokens match `^#?\d+$` | **Mode A** (numeric issue list) | Issues, full lifecycle |
+| No `--prs`, any non-flag token does not match `^#?\d+$` | **Mode B** (NL) | Issues (default) **or** PRs (if NL clearly indicates PRs — see Mode C NL triggers below) |
 
 ### Mode A — Explicit numeric list (fast path, regression guard)
 
@@ -50,6 +58,50 @@ If a label token in the description is not in the repo's actual label set, **do 
 
 **Offline fallback.** If `gh label list` fails (non-zero exit — network outage, auth failure, rate limit), fall back to consulting `.github/labels.yml` and log a warning to stderr (e.g., `warning: gh label list failed, falling back to .github/labels.yml (Loom-managed subset only)`). This keeps the skill functional in offline or restricted environments. Note that `.github/labels.yml` is only the Loom-managed subset, so the fallback may produce false "unknown-label" rejections for labels added via the GitHub UI, Dependabot, or other project conventions; this is the trade-off for offline operation.
 
+### Mode C — PR-set mode (back half of the lifecycle: Judge → Doctor → Merge)
+
+When the user wants to drive a known set of open PRs through Judge / Doctor / Merge **without** spawning Curator or Builder, use Mode C. This is the symmetric counterpart to Mode A/B: same wave/dry-run/checkpoint machinery, different unit-of-work (PR instead of issue) and a different per-unit routing table.
+
+**Mode C entry triggers** (any of these select Mode C):
+
+1. **Explicit flag with explicit list**: the user passes `--prs` **and** every non-flag token matches `^#?\d+$`. Tokens are interpreted as **PR numbers** (not issue numbers). Example: `/sweep --prs 100 101 102`.
+2. **Explicit flag with NL description**: the user passes `--prs` **and** at least one non-flag token is non-numeric. The orchestrator translates the description into one or more `gh pr list` invocations (NOT `gh issue list`) — see the PR-side translation guide below. Example: `/sweep --prs all open loom:pr`.
+3. **NL trigger without `--prs`**: the user's description **clearly** indicates PRs ("PRs", "pull requests", "review-requested PRs", "all open `loom:pr`", "merge-ready PRs", etc.) — see the NL trigger list below. The orchestrator infers Mode C and proceeds as if `--prs` had been passed. If the description is ambiguous between issues and PRs, ask for clarification rather than guess.
+
+**PR-side NL trigger phrases** (any of these in the description selects Mode C, even without `--prs`):
+
+- `PRs`, `pull requests`, `pull request`
+- `review-requested PRs`, `loom:review-requested`
+- `changes-requested PRs`, `loom:changes-requested`
+- `merge-ready PRs`, `loom:pr` (in a PR context)
+- `all open loom:pr`
+- `judge-pending PRs`, `judge-ready PRs`
+- `pending review`
+
+When uncertain whether the description means issues or PRs (e.g., `/sweep all loom:review-requested` — the label only applies to PRs but the user did not say "PRs"), ask for clarification rather than infer.
+
+**PR-side translation guide — common NL fragments to `gh pr list` flags** (verified against `gh` v2):
+
+| NL fragment | `gh pr list` flag(s) |
+|-------------|----------------------|
+| "all `loom:review-requested` PRs" / "PRs awaiting Judge" | `--label loom:review-requested` |
+| "all `loom:changes-requested` PRs" / "PRs needing Doctor" | `--label loom:changes-requested` |
+| "all `loom:pr` PRs" / "merge-ready PRs" / "PRs approved for merge" | `--label loom:pr` |
+| "filed by rjwalters" | `--author rjwalters` |
+| "all my agent-filed PRs" | `--author @me` |
+| "open" (always assumed) | `--state open` (the default) |
+| "in the last week" / "from the last N days" | `--search "created:>=YYYY-MM-DD"` (compute the date) |
+
+Combine flags as needed. Always pass `--state open` explicitly (Mode C operates exclusively on open PRs — closed/merged PRs are skipped). Default to `--limit 100` rather than the `gh` default of `30` to avoid silent truncation. The same **unknown-label guard** (one `gh label list` call per invocation, with `.github/labels.yml` offline fallback) applies to PR labels too — PR and issue labels are in the same repo-wide label set.
+
+**Mode C validation rules:**
+
+- `--prs` strips from the token list before classification, exactly like `--builders-per-wave N` and `--dry-run`.
+- Numeric tokens (after stripping `--prs`): same `^#?\d+$` regex as Mode A. Strip leading `#`, parse as positive integers, deduplicate (preserve first-seen order). Reject any token that fails to parse, with a clear error citing the offending token, and EXIT.
+- NL tokens (after stripping `--prs`): translate to one or more `gh pr list` invocations per the guide above. Run the command, deduplicate the resulting PR list, and **display the candidate set to the user before spawning any agents**. Await confirmation. If the user declines, EXIT cleanly.
+- **`--builders-per-wave N` is silently ignored in Mode C**. The Builder phase is skipped wholesale for PR-set mode; per-PR Judge is sequential within a wave (matching the existing issue-side wave policy). If the user passes both `--prs` and `--builders-per-wave N`, print a one-line note that the flag has no effect in Mode C and proceed without it. Mode C waves are size-1 by default — one PR settles fully (Judge → optional Doctor → optional Merge) before the next PR is touched. This may relax in a future issue; today it preserves the load-bearing #3289 sequencing rule.
+- Mixed Mode C and Mode A/B is **not** supported in this skill — if the user wants to sweep some issues and some PRs in one invocation, ask them to run two `/sweep` calls (one for each mode). Implementing PR/issue mixing would require routing logic for the cross product of (issue-state × PR-state); cleanly out of scope.
+
 ### Edge cases (prose rules, applied in either mode but mostly relevant to Mode B)
 
 1. **Zero matches.** Print the derived `gh issue list` command and its empty result, then EXIT cleanly. Do not spawn any agents and do not fall through to Mode A.
@@ -59,28 +111,44 @@ If a label token in the description is not in the repo's actual label set, **do 
 
 ### Optional flags
 
-- **`--builders-per-wave N`** — dispatch up to `N` builders in parallel per wave. Default `1` (fully sequential, matching the MVP behaviour). `N` must be an integer `>= 1`. Honoured in both modes — flag tokens are stripped before the Mode A / Mode B classification.
-- **`--dry-run`** — print the planned candidate list (with wave grouping) and EXIT without performing any mutation. Recognized as a bare flag token (no value). May appear anywhere in `$ARGUMENTS`. Default is off. Honoured in both modes — stripped before classification along with other flags.
+- **`--builders-per-wave N`** — dispatch up to `N` builders in parallel per wave. Default `1` (fully sequential, matching the MVP behaviour). `N` must be an integer `>= 1`. Honoured in Modes A and B (issue-side); **silently ignored in Mode C** (PR-set mode has no Builder phase — see Mode C validation rules above). Flag tokens are stripped before classification.
+- **`--dry-run`** — print the planned candidate list (with wave grouping) and EXIT without performing any mutation. Recognized as a bare flag token (no value). May appear anywhere in `$ARGUMENTS`. Default is off. Honoured in **all three** modes — stripped before classification along with other flags. Mode C dry-run prints the PR-set plan (per-PR routing) instead of the issue-set plan.
+- **`--prs`** — switch into Mode C (PR-set mode). Recognized as a bare flag token (no value). May appear anywhere in `$ARGUMENTS`. Default is off. When present, non-flag tokens are interpreted as **PR numbers** (numeric tokens) or as a **PR-list description** (NL tokens). When absent, an NL trigger phrase listed in the Mode C section can still select Mode C. See "Mode C" above for full semantics.
 
 ### Validation rules
 
-- Recognize `--dry-run` as a flag token anywhere in `$ARGUMENTS`, strip it from the candidate list before validation, and store it as a boolean (`DRY_RUN=true` if present, else `false`).
+- Recognize `--dry-run`, `--prs`, and `--builders-per-wave N` as flag tokens anywhere in `$ARGUMENTS`, strip them from the candidate list before validation, and store them as flags / parameters (`DRY_RUN=true|false`, `PRS_MODE=true|false`, `BUILDERS_PER_WAVE=N`).
 - At least one candidate (numeric token or NL description) must be supplied. If `$ARGUMENTS` (after stripping flag tokens) is empty, display:
   ```
   Usage: /sweep <issue-number> [<issue-number> ...] [--builders-per-wave N] [--dry-run]
          /sweep <natural-language description>     [--builders-per-wave N] [--dry-run]
+         /sweep --prs <pr-number> [<pr-number> ...] [--dry-run]
+         /sweep --prs <natural-language PR description> [--dry-run]
+         /sweep <natural-language PR description>       [--dry-run]   # PR NL triggers select Mode C
 
-  See #3298 for the full design.
+  See #3298 and #3384 for the full design.
   ```
   and EXIT.
-- **Mode A** (every non-flag token matches `^#?\d+$`):
+- **Mode-selection precedence** (apply in order):
+  1. If `--prs` is present, classify as **Mode C** (numeric → explicit PR list; NL → translated `gh pr list`).
+  2. Else if any non-flag token does not match `^#?\d+$` AND the description contains a PR-side NL trigger phrase (see Mode C "PR-side NL trigger phrases"), classify as **Mode C** (NL-inferred).
+  3. Else if every non-flag token matches `^#?\d+$`, classify as **Mode A** (numeric issue list).
+  4. Else classify as **Mode B** (NL issue list).
+
+  This ordering is deliberate: an explicit `--prs` flag is the strongest signal, an unambiguous NL trigger is the next, and the existing Mode A/B classifier (regression-guarded) handles everything else.
+- **Mode A** (every non-flag token matches `^#?\d+$`, `--prs` absent, no PR NL trigger):
   - Strip leading `#` from each token, parse as a positive integer.
   - Reject any token that fails to parse as a positive integer (after stripping). Display an error showing the offending token and EXIT.
   - Deduplicate the issue list (preserve first-seen order).
-- **Mode B** (any non-flag token does not match `^#?\d+$`):
+- **Mode B** (any non-flag token does not match `^#?\d+$`, `--prs` absent, no PR NL trigger):
   - Translate the description to `gh issue list` invocation(s) per the guide above.
   - Run the command, deduplicate, and **display the candidate set to the user before spawning any agents.** Await confirmation. If the user declines, EXIT cleanly.
   - If the description is ambiguous, hits an out-of-band query, or references an unknown label, ask for clarification first — do not guess.
+- **Mode C** (`--prs` flag present, OR PR-side NL trigger detected):
+  - If every non-flag token matches `^#?\d+$`: strip leading `#`, parse as positive integers, deduplicate (preserve first-seen order). Reject any non-parseable token with a clear error and EXIT. Resolved list is **PR numbers**.
+  - If any non-flag token does not match `^#?\d+$`: translate to `gh pr list` invocation(s) per the PR-side guide above. Run the command, deduplicate, and **display the candidate set to the user before spawning any agents.** Await confirmation. If the user declines, EXIT cleanly.
+  - If the description is ambiguous between issues and PRs (e.g., `loom:review-requested` is PR-only but the description omits "PRs" / "pull requests"), ask the user to clarify before proceeding. Do not guess.
+  - If `--builders-per-wave N` was supplied, print a one-line note that the flag has no effect in Mode C and proceed without it (Mode C waves are size-1; see Mode C section).
 - **`--builders-per-wave N` validation:**
   - Parse `N` as an integer. Reject non-integer values with a clear error and EXIT.
   - Reject `N < 1` (including `0` and negative values) with: `Error: --builders-per-wave must be >= 1 (got: <N>)` and EXIT. Do **not** silently default to `1`.
@@ -152,15 +220,56 @@ The cap is **soft** — there is no hard upper bound. The warning is the only gu
 
 # Pure nonsense — no derivable candidate set
 /sweep nonsense gibberish
+
+# Ambiguous between Mode B (issues) and Mode C (PRs) — loom:review-requested
+# is PR-only but the description does not say "PRs". Ask which was meant.
+/sweep all loom:review-requested
+```
+
+### Mode C — PR-set mode (explicit `--prs` flag)
+
+```bash
+# Explicit numeric PR list — each PR routed by its current label
+# (review-requested → Judge, changes-requested → Doctor→Judge, loom:pr → Merge)
+/sweep --prs 100 101 102
+
+# Leading # is allowed
+/sweep --prs #100 #101 #102
+
+# Single PR, equivalent to /shepherd-style back-half-only handling for that PR
+/sweep --prs 100
+
+# Dry-run a PR-set plan — prints per-PR action plan and EXITs without mutating
+/sweep --prs 100 101 102 --dry-run
+
+# NL description with explicit flag — translates to: gh pr list --label loom:pr --state open --limit 100
+/sweep --prs all open loom:pr
+
+# Compound filter — translates to:
+#   gh pr list --label loom:review-requested --author @me --state open --limit 100
+/sweep --prs all my review-requested PRs
+```
+
+### Mode C — PR-set mode (NL trigger, no flag)
+
+```bash
+# "PRs" in the description selects Mode C even without --prs:
+# translates to: gh pr list --label loom:pr --state open --limit 100
+/sweep all open loom:pr PRs
+
+# "pull requests" also triggers Mode C:
+/sweep all loom:review-requested pull requests
+
+# "merge-ready PRs" triggers Mode C:
+/sweep all merge-ready PRs
 ```
 
 ## Execution Model
 
-`/sweep` processes the issue list in **waves**:
+`/sweep` processes the candidate list in **waves**:
 
-- The candidate list is partitioned into waves of up to `N = --builders-per-wave` issues (default `1`).
-- Issues are picked into waves in the order given. Within a wave, builders are dispatched in parallel; across waves, processing is sequential.
-- **Each wave fully settles** (all builders → per-PR Judge → optional Doctor → merge) before the next wave starts.
+- **Mode A/B (issue-set)**: the candidate list is partitioned into waves of up to `N = --builders-per-wave` issues (default `1`). Issues are picked into waves in order. Within a wave, builders are dispatched in parallel; across waves, processing is sequential. Each wave fully settles (all builders → per-PR Judge → optional Doctor → merge) before the next wave starts.
+- **Mode C (PR-set)**: the candidate list is processed in **size-1 waves** (one PR per wave). `--builders-per-wave` is ignored because there is no Builder phase. Each PR is routed per its current label (Judge / Doctor→Judge / Merge — see "PR-set Wave Lifecycle" below) and fully settles before the next PR is touched. Sequential per-PR processing matches the load-bearing #3289 sequencing rule and parallels the issue-side "per-PR Judge is sequential within a wave" policy.
 
 ### CRITICAL: One level deep — never spawn `/shepherd` as a subagent
 
@@ -178,9 +287,9 @@ If a future maintainer is tempted to "simplify" by replacing the wave-loop with 
 
 ## 0. Dry-run gate (if `--dry-run`)
 
-If `--dry-run` was supplied, **this stage runs before any mutation** and EXITs after printing the plan. The dry-run gate is the single inviolable contract of `--dry-run`: no label edits, no `worktree.sh` invocation, no `gh pr create`, no `merge-pr.sh`, no daemon-state writes, no Task/subagent dispatch.
+If `--dry-run` was supplied, **this stage runs before any mutation** and EXITs after printing the plan. The dry-run gate is the single inviolable contract of `--dry-run`: no label edits, no `worktree.sh` invocation, no `gh pr create`, no `merge-pr.sh`, no daemon-state writes, no Task/subagent dispatch. This contract is uniform across Modes A, B, and C.
 
-**Procedure:**
+### Procedure — Modes A and B (issue-set)
 
 1. **Survey each candidate (read-only).** For every deduplicated, validated issue number `N` in the candidate list:
    ```bash
@@ -190,11 +299,11 @@ If `--dry-run` was supplied, **this stage runs before any mutation** and EXITs a
 
 2. **Compute wave partition.** Partition the candidate list into waves of size `--builders-per-wave` (default `1`), preserving input order. Record `(issue, wave_index, total_waves)` for each candidate. Apply the same silent-clamp and pre-flight-skip rules that the live path uses (closed / `loom:building` / `loom:blocked` issues are tagged as "would skip" in the plan but still appear in the output for transparency).
 
-3. **Print the plan.** Emit a table or block per the format below.
+3. **Print the plan.** Emit a table or block per the issue-set format below.
 
 4. **EXIT.** Do not proceed to "Wave Lifecycle". The shell must return as soon as the plan is printed.
 
-**Output spec** (minimum useful — do **not** add token-pool selection or agent dispatch internals):
+**Issue-set output spec** (Modes A and B; minimum useful — do **not** add token-pool selection or agent dispatch internals):
 
 ```
 /sweep --dry-run plan: M candidate(s) across W wave(s) (--builders-per-wave=N)
@@ -220,6 +329,57 @@ Total: 3 would-build, 1 would-route-to-judge, 1 would-merge, 1 would-skip. No is
 
 **Footer (required):** total candidates, total waves, count of `would-build` vs `would-skip`, and an explicit confirmation that nothing was modified.
 
+### Procedure — Mode C (PR-set)
+
+1. **Survey each PR candidate (read-only).** For every deduplicated, validated PR number `P` in the candidate list:
+   ```bash
+   gh pr view P --json number,title,labels,state --jq '{number, title, state, labels: [.labels[].name]}'
+   ```
+   This is a `gh pr view` read — it does not mutate anything. (If `gh` is unauthenticated or the PR is unreachable, log the error against that candidate and continue surveying the rest.)
+
+2. **Compute wave partition.** Mode C waves are size-1 (`--builders-per-wave` is ignored). Each PR is its own wave. Record `(pr, wave_index=N, total_waves=M)` for each candidate. Apply the same skip rules the live path uses (closed PRs, multiple-label conflicts, missing required label all tagged "would skip" in the plan but still listed for transparency).
+
+3. **Print the plan.** Emit the PR-set output spec below.
+
+4. **EXIT.** Do not proceed to "PR-set Wave Lifecycle". The shell must return as soon as the plan is printed.
+
+**PR-set output spec** (Mode C):
+
+```
+/sweep --prs --dry-run plan: M candidate(s) across M wave(s) (PR-set mode, --builders-per-wave ignored)
+
+  Wave 1:
+    PR #200  "Add foo widget"                labels: loom:review-requested        → would Judge
+  Wave 2:
+    PR #201  "Fix bar bug"                   labels: loom:changes-requested       → would Doctor → Judge (single cycle)
+  Wave 3:
+    PR #202  "Refactor baz"                  labels: loom:pr                      → would merge (via merge-pr.sh --auto)
+  Wave 4:
+    PR #203  "Polish frobnicator"            labels: (none)                       → would skip (no actionable label)
+  Wave 5:
+    PR #204  "Document quux"                 state: MERGED                        → would skip (PR already merged)
+
+Total: 1 would-judge, 1 would-doctor-then-judge, 1 would-merge, 2 would-skip. No PRs were modified.
+```
+
+**Per-PR fields (required):**
+- PR number (prefixed `PR #` to distinguish from issue numbers)
+- Title (truncated reasonably if very long)
+- Current labels (comma-separated, or `(none)`)
+- Planned action (`would Judge`, `would Doctor → Judge (single cycle)`, `would merge (via merge-pr.sh --auto)`, `would skip (<reason>)`)
+- Wave assignment (one PR per wave; shown via the `Wave N:` group header)
+
+**Footer (required):** total candidates, total waves, count of `would-judge` / `would-doctor-then-judge` / `would-merge` / `would-skip`, and an explicit confirmation that nothing was modified.
+
+**Mode C skip reasons** (action column should clearly state which applies):
+- `would skip (no actionable label)` — PR has neither `loom:review-requested`, `loom:changes-requested`, nor `loom:pr`.
+- `would skip (PR already merged)` — `gh pr view` reports `state: MERGED`.
+- `would skip (PR closed without merge)` — `state: CLOSED` (non-merged).
+- `would skip (loom:blocked)` — PR carries `loom:blocked` (do not act on operator-flagged PRs).
+- `would skip (multiple actionable labels)` — PR carries two or more of `{loom:review-requested, loom:changes-requested, loom:pr}` simultaneously (human-attention case — which transition is canonical?).
+
+### Out of scope for dry-run output (all modes)
+
 **Explicitly out of scope for dry-run output** (do not add these — see Limitations):
 - Token-pool / account selection internals
 - Subagent dispatch order or parallelism counts beyond wave size
@@ -230,18 +390,134 @@ Total: 3 would-build, 1 would-route-to-judge, 1 would-merge, 1 would-skip. No is
 
 ```bash
 # Before:
-LABELS_BEFORE=$(gh issue view N --json labels --jq '[.labels[].name]|sort')
+LABELS_BEFORE=$(gh pr view P --json labels --jq '[.labels[].name]|sort')   # Mode C
+ISSUE_LABELS_BEFORE=$(gh issue view N --json labels --jq '[.labels[].name]|sort')  # Modes A/B
 PRS_BEFORE=$(gh pr list --state open --json number --jq '[.[].number]|sort')
 WORKTREES_BEFORE=$(ls .loom/worktrees/ 2>/dev/null | wc -l)
-# Run: /sweep --dry-run N
-# All three must be unchanged after the dry-run returns.
+# Run: /sweep --dry-run ...   (any mode)
+# All three (or four, for Mode C) must be unchanged after the dry-run returns.
 ```
 
-These three checks — label set per candidate, open PR set, worktree count — are the acceptance criteria. If any of them differ pre/post a `--dry-run` invocation, the dry-run gate is broken.
+These checks — label set per candidate (issue or PR), open PR set, worktree count — are the acceptance criteria. If any of them differ pre/post a `--dry-run` invocation, the dry-run gate is broken.
 
-## Wave Lifecycle
+## PR-set Wave Lifecycle (Mode C only)
 
-For each wave `W` (partition of the issue list into chunks of up to `--builders-per-wave` candidates, processed in given order), execute the full lifecycle below. **All stages are mandatory** for every issue — do not skip any stage (CLAUDE.md "Shepherd Lifecycle (MANDATORY)").
+If Mode C was selected, the wave lifecycle is the **back half** of the issue-side lifecycle: **no Curator, no Approval gate, no Builder**. Each PR is routed by its current label to Judge, Doctor→Judge, or Merge directly.
+
+> **Stage skip is explicit and load-bearing for Mode C.** The issue-side "MANDATORY: do not skip any stage" rule applies to the **issue** lifecycle. For an existing open PR, the Curator and Builder stages already ran (the PR exists, so the issue was implemented). Re-running them would be incorrect and wasteful. Mode C's wave lifecycle is the symmetric counterpart that handles the post-Builder phases without touching the front half.
+
+For each PR `P` in the candidate list, processed sequentially one PR per wave (size-1 waves):
+
+### C0. Per-PR pre-flight (before any role dispatch)
+
+```bash
+gh pr view P --json number,state,labels,closingIssuesReferences \
+  --jq '{number, state, labels: [.labels[].name], closes: [.closingIssuesReferences[].number]}'
+```
+
+Apply the following skip rules (each "skip" logs the reason; the PR does NOT contribute to any further phase; advance to the next PR):
+
+| Condition | Action | Reason |
+|-----------|--------|--------|
+| `state != OPEN` (MERGED or CLOSED) | skip | PR is not open; nothing to do |
+| Has `loom:blocked` | skip | Operator-flagged; do not act |
+| Has none of `{loom:review-requested, loom:changes-requested, loom:pr}` | skip | No actionable label — Mode C only handles these three states |
+| Has two or more of `{loom:review-requested, loom:changes-requested, loom:pr}` simultaneously | skip | Conflicting state; human-attention case |
+| Has `loom:operator-only` | skip | Operator-only PR; do not act |
+
+Determine the **closing issue number** (used for checkpoint scope below) from `closingIssuesReferences`. This is the GitHub-native `Closes/Fixes/Resolves #N` parser (matches the convention used by the issue-side pre-flight via `closedByPullRequestsReferences`). Record up to one closing issue number per PR:
+
+- **0 closing issues** → no checkpoint scope for this PR. Log a warning at PR start (`PR #P lacks a Closes #N reference; skipping per-issue checkpoint for this PR`) and proceed without checkpointing. Mid-phase resume after a kill will not be available for this PR — Judge / Doctor / Merge will simply re-run from scratch on the next sweep, which is acceptable since the operations are idempotent at the GitHub-state level (Judge re-runs if `loom:review-requested` is still set; Merge re-runs only if the PR is still open and labeled `loom:pr`).
+- **1 closing issue** → use that issue number `N` as the checkpoint key. The existing `./.loom/scripts/sweep-checkpoint.sh` is keyed by issue number (#3373) and is reused as-is. **Read the existing checkpoint** before dispatching Judge:
+  ```bash
+  CHECKPOINT_PHASE=$(./.loom/scripts/sweep-checkpoint.sh phase N)
+  ```
+  If `CHECKPOINT_PHASE == "merge-done"`, the closing issue was already merged in a previous sweep — skip this PR with `already merged (per checkpoint)` and delete the stale checkpoint.
+- **2 or more closing issues** → log all closing issue numbers and skip checkpointing (multi-closing PRs are uncommon; a follow-up issue can add a multi-key checkpoint variant if needed). Proceed with Judge/Doctor/Merge as normal.
+
+### C1. Per-PR routing by current label
+
+Apply exactly one of the three branches below, based on the PR's current label:
+
+#### C1a. `loom:review-requested` → Judge phase only
+
+- Load and follow the instructions in `.claude/commands/loom/judge.md` for this PR.
+- Dispatch `loom-judge` as a **single subagent Task** from this orchestrator session. Do **NOT** invoke `/shepherd` or `/judge` slash-commands as subagents — see "CRITICAL: One level deep" in the Execution Model.
+- Expected exit states:
+  - **Approve** → PR labeled `loom:pr` by Judge. If a closing-issue checkpoint is in scope, write `judge-done`:
+    ```bash
+    ./.loom/scripts/sweep-checkpoint.sh write N judge-done --task-id "sweep-$$" --pr-number P
+    ```
+    Continue to **C2 (Merge)** for this PR.
+  - **Request changes** → PR labeled `loom:changes-requested` by Judge. Continue to **C1b (Doctor → Judge)** for this PR (single inline cycle, matching the issue-side cap).
+
+#### C1b. `loom:changes-requested` → inline Doctor → Judge (single cycle)
+
+If the PR entered the wave already labeled `loom:changes-requested` (e.g., from a previous Judge run), or just transitioned there from C1a, run a **single inline Doctor → Judge cycle** for this PR:
+
+- Load and follow the instructions in `.claude/commands/loom/doctor.md` for this PR.
+- Dispatch `loom-doctor` as a **single subagent Task** from this orchestrator session. Do **NOT** invoke `/shepherd` or `/doctor` slash-commands as subagents — see "CRITICAL: One level deep".
+- Doctor addresses the judge feedback, commits the fixes, pushes, and re-labels the PR `loom:review-requested`.
+- If a closing-issue checkpoint is in scope, write `doctor-done` **before** the follow-up Judge:
+  ```bash
+  ./.loom/scripts/sweep-checkpoint.sh write N doctor-done --task-id "sweep-$$" --pr-number P
+  ```
+- Re-dispatch `loom-judge` for the PR (now `loom:review-requested` again).
+- Expected exit states:
+  - **Approve** → PR labeled `loom:pr`. Write `judge-done` checkpoint (if in scope), continue to **C2 (Merge)**.
+  - **Request changes again** → PR labeled `loom:changes-requested`. **Cap reached: do NOT run a second Doctor.** Mark this PR as blocked (log `PR #P blocked: doctor cycle exhausted after one Doctor→Judge round; human attention required`), advance to the next PR in the candidate list. Do NOT block the rest of the candidate list on it.
+
+This single-cycle cap matches the issue-side Wave Lifecycle §6 ("Limit: a single Doctor→Judge cycle per PR") — Mode C inherits the same rule for the same reason (bounds worst-case latency, prevents Judge/Doctor disagreement loops).
+
+#### C1c. `loom:pr` → Merge phase only
+
+If the PR entered the wave already labeled `loom:pr`, skip Judge and Doctor entirely — the PR has already been judged. Continue directly to **C2 (Merge)**.
+
+### C2. Merge (per PR)
+
+Use the dedicated merge script (CLAUDE.md "Merging PRs" mandate — never `gh pr merge`):
+
+```bash
+./.loom/scripts/merge-pr.sh P --auto
+```
+
+The script merges via the forge API and cleans up the worktree. `--auto` enables GitHub's server-side auto-merge queue (queues the merge until required checks pass); on PRs that are already in `CLEAN` state, the script transparently falls back to an immediate merge — see #3371.
+
+**On successful merge** (script returns 0):
+- If a closing-issue checkpoint is in scope, delete it:
+  ```bash
+  ./.loom/scripts/sweep-checkpoint.sh delete N
+  ```
+- Advance to the next PR in the candidate list.
+
+**On merge failure** (script returns non-zero):
+- Log the failure (`PR #P merge failed: <reason>`).
+- Do **NOT** delete the checkpoint — leave it at `judge-done` (or earlier) so the next sweep retries.
+- Advance to the next PR in the candidate list (do not block the rest of the list).
+
+### C3. Wave settled → advance to next PR
+
+Mode C waves are size-1, so "wave settled" is synonymous with "this PR reached a terminal state (merged, blocked, or skipped)". Advance to the next PR in the candidate list and repeat from C0. Do not parallelize PRs (sequential per-PR processing is load-bearing — see "CRITICAL: One level deep" in the Execution Model).
+
+### Mode C summary output
+
+When the entire PR list has been processed, print a per-PR summary:
+
+```
+/sweep --prs complete. Processed M PR(s):
+
+  PR #200  → merged                                                                  [judged, merged]
+  PR #201  → blocked (judge requested changes after doctor cycle exhausted)          [judged, doctor, judged]
+  PR #202  → merged  (was already loom:pr; no judge or doctor)                       [merge-only]
+  PR #203  → skipped (no actionable label)                                           [pre-flight skip]
+  PR #204  → skipped (PR already merged)                                             [pre-flight skip]
+
+Total: 2 merged, 1 blocked, 2 skipped.
+```
+
+## Wave Lifecycle (Modes A and B only — issue-set)
+
+For each wave `W` (partition of the issue list into chunks of up to `--builders-per-wave` candidates, processed in given order), execute the full lifecycle below. **All stages are mandatory** for every issue — do not skip any stage (CLAUDE.md "Shepherd Lifecycle (MANDATORY)"). This section applies to Modes A and B only — Mode C uses the shorter "PR-set Wave Lifecycle" section above.
 
 See `.claude/commands/loom/shepherd-lifecycle.md` for the canonical phase-by-phase reference, label state machine, and recovery procedures. The summary below tells you which skill to invoke at each phase; the lifecycle reference tells you what each phase does in detail.
 
@@ -513,14 +789,15 @@ Per-issue, the pre-flight check (step 1) already detects `loom:building` and ski
 
 ## Constraints
 
-- **Wave model, one level deep.** When `--builders-per-wave > 1`, dispatch `loom-builder` / `loom-judge` / `loom-doctor` subagents **directly from this orchestrator session** in a single tool-call block. **Never invoke `/shepherd` as a subagent from `/sweep`** — that is the two-levels-deep pattern that triggers the #3289 stall. See "CRITICAL: One level deep" in the Execution Model.
-- **Per-PR Judge is sequential within a wave.** Builders parallelize, judges do not. Don't parallelize judges without a separate design pass.
-- **Single Doctor→Judge cycle per PR.** Inline within the wave. If it still fails, the PR is blocked — do not retry indefinitely.
-- **No new labels.** Use only the existing Loom label set (see `.github/labels.yml`).
-- **No `gh pr merge`.** Always use `./.loom/scripts/merge-pr.sh`.
+- **Wave model, one level deep.** When `--builders-per-wave > 1` (Modes A/B only), dispatch `loom-builder` / `loom-judge` / `loom-doctor` subagents **directly from this orchestrator session** in a single tool-call block. In Mode C, dispatch `loom-judge` and `loom-doctor` as **single subagent Tasks** per PR (size-1 waves). **Never invoke `/shepherd`, `/judge`, or `/doctor` as a subagent from `/sweep`** — that is the two-levels-deep pattern that triggers the #3289 stall. See "CRITICAL: One level deep" in the Execution Model.
+- **Per-PR Judge is sequential within a wave.** Builders parallelize (Modes A/B); judges do not. Mode C inherits this: PRs are processed one per size-1 wave. Don't parallelize judges or PRs without a separate design pass.
+- **Single Doctor→Judge cycle per PR.** Inline within the wave (Modes A/B issue-side and Mode C PR-side both enforce this). If Judge still requests changes after one Doctor pass, the PR is blocked — do not retry indefinitely.
+- **Mode C skips Curator, Approval gate, and Builder.** These phases already ran (the PR exists). Re-running them would be incorrect.
+- **No new labels.** Use only the existing Loom label set (see `.github/labels.yml`). Mode C operates entirely on `loom:review-requested`, `loom:changes-requested`, `loom:pr`, `loom:blocked`, `loom:operator-only` — all existing.
+- **No `gh pr merge`.** Always use `./.loom/scripts/merge-pr.sh` (uniform across Modes A/B/C).
 - **No daemon-state writes.** Read-only access to `daemon-state.json` for situational awareness.
-- **Read the issue body** (`gh issue view N --json body`) before briefing the builder. Don't rely on the title.
-- **Skip operator-only issues** (issues labeled `loom:operator-only` — see Wave Lifecycle step 1). Log and move on.
+- **Read the issue body** (`gh issue view N --json body`) before briefing the builder (Modes A/B). Mode C uses the PR diff + comments as the source of truth and does not need the issue body.
+- **Skip operator-only items.** Issues labeled `loom:operator-only` (Modes A/B, see issue-set Wave Lifecycle step 1) and PRs labeled `loom:operator-only` (Mode C, see C0) are skipped. Log and move on.
 
 ## Limitations (Deferred for Follow-up Issues)
 
@@ -528,12 +805,13 @@ The full `/sweep` design in #3298 includes many features that are intentionally 
 
 | Feature | Status | Notes |
 |---------|--------|-------|
-| Parallel waves (`--builders-per-wave N`) | **Implemented (#3316)** | Soft cap at N=3 (warns above). One level deep — no `/shepherd` subagent. |
+| Parallel waves (`--builders-per-wave N`) | **Implemented (#3316)** | Soft cap at N=3 (warns above). One level deep — no `/shepherd` subagent. Issue-side only; ignored in Mode C. |
 | Natural-language selectors (label/author/title/time-window filters via NL description) | **Implemented (#3318)** | Mode B in Arguments. Out-of-band queries (body/diff inspection, file-touch filters) still trigger clarification. |
-| `--dry-run` | **Implemented (#3319)** | Prints the candidate plan (with wave grouping) and exits without mutating labels, worktrees, or PRs. |
+| `--dry-run` | **Implemented (#3319, extended in #3384)** | Prints the candidate plan (with wave grouping) and exits without mutating labels, worktrees, or PRs. Issue-set (Modes A/B) and PR-set (Mode C) output formats. |
 | Existing-PR detection in pre-flight | **Implemented (#3359)** | Pre-flight probes `closedByPullRequestsReferences`; routes existing open linked PRs to Judge (or Merge if already `loom:pr`) instead of dispatching a duplicate Builder. Multi-PR ambiguity skips with a log. |
 | `loom:operator-only` enforcement | **Implemented (#3360)** | Pre-flight skips issues with `loom:operator-only` (human action required: credentials, infra, hardware). Champion `--merge` mode also refuses to auto-promote them. |
-| Checkpoint/resume after kill | **Implemented (#3373)** | Per-issue phase checkpoint at `.loom/sweep-checkpoint/issue-<N>.json`. Sweep reads on entry and skips completed phases. No mid-builder recovery — kill during Builder resumes at builder start, worktree preserved by `worktree.sh` idempotency. |
+| Checkpoint/resume after kill | **Implemented (#3373)** | Per-issue phase checkpoint at `.loom/sweep-checkpoint/issue-<N>.json`. Sweep reads on entry and skips completed phases. No mid-builder recovery — kill during Builder resumes at builder start, worktree preserved by `worktree.sh` idempotency. Mode C reuses the helper keyed by the PR's closing-issue number (`closingIssuesReferences`); PRs without a `Closes #N` reference run without checkpointing. |
+| PR-set mode (`--prs` flag and PR NL triggers; Judge/Doctor/Merge from current PR label) | **Implemented (#3384)** | Mode C. Skips Curator, Approval gate, Builder. Size-1 waves. `--builders-per-wave` ignored. Reuses issue-keyed checkpoint via `closingIssuesReferences`. |
 | `--max-waves` cap | Deferred | Operator-level brake on long sweeps. |
 | `--paused-merge` / `--no-judge` | Deferred | Merge-mode variants for trusted batches. |
 | `--include-blocked` (unblock pass) | Deferred | Currently `/sweep` skips `loom:blocked` issues outright. |
@@ -541,7 +819,11 @@ The full `/sweep` design in #3298 includes many features that are intentionally 
 | Config-driven defaults (`.loom/config.json` keys `sweep.*`) | Deferred | No knobs to configure yet. |
 | Disk-pressure stop condition | Deferred | Wave sequencing limits disk usage; revisit if waves grow large. |
 | Doctor-cycle counting across PRs | Deferred | Single Doctor→Judge cycle limit per PR is enforced inline. |
-| Parallel Judges within a wave | Deferred | Sequential per-PR Judge today; needs benchmarking before parallelizing. |
+| Parallel Judges within a wave | Deferred | Sequential per-PR Judge today; needs benchmarking before parallelizing. Mode C is also strictly sequential per PR (size-1 waves). |
+| Parallel PRs in Mode C | Deferred | Mode C uses size-1 waves. Multi-PR-per-wave is feasible (one judge per PR in parallel) but inherits the same #3289 risk that gated parallel issue-side Judges. |
+| Mixed-mode invocations (some issues + some PRs in one `/sweep`) | Won't fix (split into two calls) | Routing logic for the cross product of issue-state × PR-state is complex; cleaner to require two invocations. |
+| Multi-closing-issue PRs (PR with `Closes #N` + `Closes #M`) | Partial — runs without checkpoint | Mode C logs all closing issues and proceeds with Judge/Doctor/Merge but skips checkpointing for the PR. Multi-key checkpoint variant is a follow-up. |
+| PRs without `Closes #N` references | Partial — runs without checkpoint | Mode C logs a warning and processes the PR without checkpointing. Judge/Doctor/Merge are idempotent at the GitHub-state level so re-running on the next sweep is safe. |
 | Cross-wave backfill on pre-flight skips | Won't fix | Intentionally clean wave boundaries — see step 1 of the Wave Lifecycle. |
 | Spinoff-issue filing for out-of-scope discoveries | Deferred | Build it once we have richer summary output to surface them cleanly. |
 | Daemon `pipeline_state` situational awareness reads | Deferred | Skill only warns when the daemon is running. |
@@ -558,7 +840,8 @@ For the full design discussion (including the open questions raised by the curat
 - **Curator skill**: `.claude/commands/loom/curator.md`
 - **Label definitions**: `.github/labels.yml`
 - **Merge script**: `./.loom/scripts/merge-pr.sh`
-- **Sweep checkpoint helper**: `./.loom/scripts/sweep-checkpoint.sh` — read/write/delete per-issue phase checkpoints for resume after kill (#3373).
+- **Sweep checkpoint helper**: `./.loom/scripts/sweep-checkpoint.sh` — read/write/delete per-issue phase checkpoints for resume after kill (#3373). Mode C reuses this via the PR's closing-issue number when available.
 - **Original proposal & open questions**: issue #3298
+- **PR-set mode (Mode C) design**: issue #3384
 - **Parallel-shepherd stall hazard**: issue #3289
 - **Checkpoint/resume design**: issue #3373 (Phase 0 of #3372 shepherd/daemon deprecation epic)

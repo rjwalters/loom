@@ -88,6 +88,8 @@ Use Claude Code terminals with specialized roles for hands-on development:
 
 A minimal alternative to the full daemon for multi-account `/loom:sweep` launching (#3374, Phase 1 of the shepherd/daemon deprecation epic #3372). Polls `loom:issue`, atomically claims ready issues, and detaches `claude -p "/loom:sweep N"` per issue — each spawn picks its own OAuth token via `spawn-claude.sh`. No work generation, no support-role triggers, no pool-slot bookkeeping.
 
+> **Note**: `/loom:sweep` also supports a **PR-set mode** (Mode C, #3384) via `--prs <pr-number-list>` or NL phrases like "all open `loom:pr`" — drives Judge / Doctor → Judge / Merge from an existing open-PR set without re-running Curator or Builder. The spawn loop is issue-keyed and does not invoke PR-set mode; operators use it directly via `claude -p "/loom:sweep --prs ..."`.
+
 ```bash
 LOOM_USE_SPAWN_LOOP=1 ./.loom/scripts/spawn-loop.sh start  # opt-in gate is required
 ./.loom/scripts/spawn-loop.sh status
