@@ -455,8 +455,8 @@ The daemon integrates with cleanup scripts to manage task artifacts and worktree
 # Safe worktree cleanup (only MERGED PRs)
 loom-clean --safe --worktrees-only [--dry-run] [--grace-period N]
 
-# Event-driven daemon cleanup
-./.loom/scripts/daemon-cleanup.sh <event> [options]
+# Log archival via Python (delegates to archive-logs.sh)
+./.loom/scripts/cleanup.sh logs [--dry-run] [--prune-only] [--retention-days N]
 ```
 
 ### Cleanup Configuration
