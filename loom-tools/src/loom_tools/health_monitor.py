@@ -1,27 +1,33 @@
-"""Proactive health monitoring and alerting for Loom daemon.
+"""Forge-derived health monitor for the spawn-loop orchestrator (Phase 3.1.8).
 
-Replaces the former ``health-check.sh`` (1,008 LOC) with a Python module that
-reuses ``snapshot.build_snapshot()`` for data collection and the existing
-``HealthMetrics`` / ``AlertsFile`` models for persistence.
+Originally a daemon-state.json + health-metrics.json consumer that maintained a
+24h time-series of throughput/latency/error metrics. After the shepherd/daemon
+deprecation (#3372, tracker #3378), most of the inputs no longer exist:
 
-This module is a **proactive monitoring** system (different from the diagnostic
-``health_check.py``):
+- ``health-metrics.json`` and ``alerts.json`` retire (no time-series storage).
+- ``daemon-metrics.json`` (iteration counts, success rate, avg duration) is
+  daemon-brain-internal — no producer once daemon_v2 is deleted.
+- ``daemon-state.json`` lifetime counters (``completed_issues``,
+  ``total_prs_merged``) require persistent shepherd memory the spawn loop
+  intentionally does not keep.
 
-- Time-series metrics collection (throughput, latency, error rates)
-- Composite health score computation (0-100)
-- Alert generation and management (with acknowledgement)
-- 24-hour historical data retention for trend analysis
-- JSON metrics storage in ``.loom/health-metrics.json`` and ``.loom/alerts.json``
+This port chooses a **simplified, point-in-time composite score** computed from
+forge queries (`gh issue list` / `gh pr list` via `snapshot.collect_pipeline_data`)
+plus `.loom/spawn-loop-state.json`. No history, no persistent alerts, no
+acknowledgement state. The CLI returns a single snapshot per invocation — same
+shape as `loom-status`, narrower focus.
+
+See issue #3397 for the recipe-decision discussion.
 
 Usage::
 
-    loom-health-monitor                    # Display health summary
-    loom-health-monitor --json             # Output health status as JSON
-    loom-health-monitor --collect          # Collect and store health metrics
-    loom-health-monitor --alerts           # Show current alerts
-    loom-health-monitor --acknowledge <id> # Acknowledge an alert
-    loom-health-monitor --clear-alerts     # Clear all alerts
-    loom-health-monitor --history [hours]  # Show metric history
+    loom-health-monitor              # Display health summary
+    loom-health-monitor --json       # Output health status as JSON
+    loom-health-monitor --alerts     # Show live alerts (computed from snapshot)
+
+The retired flags ``--collect``, ``--acknowledge``, ``--clear-alerts``, and
+``--history`` print a one-line deprecation note and exit non-zero so operators
+don't silently rely on them. They can be removed in a follow-up.
 """
 
 from __future__ import annotations
@@ -29,51 +35,32 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import pathlib
 import sys
-import time
-from datetime import datetime, timezone
-from typing import Any, Sequence
+from dataclasses import dataclass, field
+from datetime import datetime
+from typing import Any
 
 from loom_tools.common.config import env_int
 from loom_tools.common.repo import find_repo_root
-from loom_tools.common.state import (
-    read_alerts,
-    read_daemon_state,
-    read_health_metrics,
-    read_json_file,
-    write_json_file,
-)
-from loom_tools.common.time_utils import (
-    format_duration,
-    now_utc,
-    parse_iso_timestamp,
-)
-from loom_tools.models.daemon_state import DaemonState
-from loom_tools.models.health import (
-    Alert,
-    AlertsFile,
-    ErrorRates,
-    HealthMetrics,
-    LatencyMetric,
-    MetricEntry,
-    PipelineHealthMetric,
-    QueueDepths,
-    ResourceUsage,
-    ThroughputMetric,
-)
+from loom_tools.common.state import read_spawn_loop_state
+from loom_tools.common.time_utils import now_utc, parse_iso_timestamp
+from loom_tools.models.spawn_loop_state import SpawnLoopState
 
 # ---------------------------------------------------------------------------
-# Configuration (env-overridable thresholds)
+# Configuration
 # ---------------------------------------------------------------------------
 
-RETENTION_HOURS = env_int("LOOM_HEALTH_RETENTION_HOURS", 24)
-THROUGHPUT_DECLINE_THRESHOLD = env_int("LOOM_THROUGHPUT_DECLINE_THRESHOLD", 50)
-QUEUE_GROWTH_THRESHOLD = env_int("LOOM_QUEUE_GROWTH_THRESHOLD", 5)
-STUCK_AGENT_THRESHOLD = env_int("LOOM_STUCK_AGENT_THRESHOLD", 10)
-ERROR_RATE_THRESHOLD = env_int("LOOM_ERROR_RATE_THRESHOLD", 20)
+# Heartbeat threshold matches loom-stuck-detection (#3411).
+STUCK_HEARTBEAT_SECONDS = env_int("LOOM_STUCK_HEARTBEAT_SECONDS", 120)
 
-# Maximum alerts to retain
-MAX_ALERTS = 100
+# Score-deduction thresholds (env-overridable).
+READY_QUEUE_HIGH = env_int("LOOM_HEALTH_READY_HIGH", 20)
+READY_QUEUE_MEDIUM = env_int("LOOM_HEALTH_READY_MEDIUM", 10)
+REVIEW_BACKLOG_HIGH = env_int("LOOM_HEALTH_REVIEW_HIGH", 10)
+REVIEW_BACKLOG_MEDIUM = env_int("LOOM_HEALTH_REVIEW_MEDIUM", 5)
+MERGE_CONFLICT_HIGH = env_int("LOOM_HEALTH_MERGE_CONFLICT_HIGH", 5)
+MERGE_CONFLICT_MEDIUM = env_int("LOOM_HEALTH_MERGE_CONFLICT_MEDIUM", 3)
 
 # ---------------------------------------------------------------------------
 # ANSI color support
@@ -111,229 +98,243 @@ def _use_color() -> bool:
 
 
 # ---------------------------------------------------------------------------
-# Metric collection
+# Snapshot data shape (the inputs to the composite score)
 # ---------------------------------------------------------------------------
 
 
-def collect_current_metrics(
-    repo_root: Any,
+@dataclass
+class HealthSnapshot:
+    """Point-in-time inputs derived from forge + spawn-loop-state.
+
+    Fields default to zero/empty so the score gracefully reports "100/100"
+    in an idle, healthy workspace.
+    """
+
+    timestamp: str = ""
+    # Issue queues (forge)
+    ready_count: int = 0
+    building_count: int = 0
+    blocked_count: int = 0
+    # PR queues (forge)
+    review_requested_count: int = 0
+    changes_requested_count: int = 0
+    ready_to_merge_count: int = 0
+    merge_conflict_count: int = 0
+    # Spawn loop
+    spawn_loop_present: bool = False
+    running_tasks: int = 0
+    stuck_tasks: int = 0  # tasks with stale (>= STUCK_HEARTBEAT_SECONDS) heartbeat
+    # Diagnostic: building issues that no running task claims (orphan drift).
+    orphan_building: int = 0
+
+
+@dataclass
+class Alert:
+    """Live alert. Computed each invocation; not persisted."""
+
+    type: str
+    severity: str  # "info" | "warning" | "critical"
+    message: str
+    context: dict[str, Any] = field(default_factory=dict)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "type": self.type,
+            "severity": self.severity,
+            "message": self.message,
+            "context": self.context,
+        }
+
+
+# ---------------------------------------------------------------------------
+# Data collection
+# ---------------------------------------------------------------------------
+
+
+def _count_stuck_tasks(
+    spawn_loop_state: SpawnLoopState,
+    *,
+    now: datetime,
+    threshold_seconds: int = STUCK_HEARTBEAT_SECONDS,
+) -> int:
+    """Count spawn-loop tasks whose heartbeat is older than the threshold.
+
+    A task with no ``last_heartbeat`` field is counted as stuck only if its
+    ``started_at`` is older than the threshold (otherwise it's a fresh spawn
+    that hasn't received its first heartbeat yet).
+    """
+    stuck = 0
+    for task in spawn_loop_state.running:
+        anchor = task.last_heartbeat or task.started_at
+        if not anchor:
+            # No timestamp at all — can't classify. Don't count as stuck.
+            continue
+        try:
+            ts = parse_iso_timestamp(anchor)
+        except (ValueError, OSError):
+            continue
+        age = (now - ts).total_seconds()
+        if age >= threshold_seconds:
+            stuck += 1
+    return stuck
+
+
+def collect_snapshot(
+    repo_root: pathlib.Path,
     *,
     _now: datetime | None = None,
-) -> MetricEntry:
-    """Collect current metrics from daemon state and snapshot data.
+    _pipeline_data: dict[str, Any] | None = None,
+    _spawn_loop_state: SpawnLoopState | None = None,
+) -> HealthSnapshot:
+    """Build a HealthSnapshot from forge queries + spawn-loop-state.
 
-    Uses ``snapshot.build_snapshot()`` for authoritative pipeline data,
-    and ``daemon-metrics.json`` for iteration-level statistics.
+    Pipeline data is fetched via :func:`snapshot.collect_pipeline_data` —
+    the same parallel ``gh`` orchestrator used by ``loom-status``. Spawn-loop
+    state is read from ``.loom/spawn-loop-state.json``.
+
+    ``_pipeline_data`` and ``_spawn_loop_state`` are test-injection seams.
     """
-    import pathlib
-
-    repo_root = pathlib.Path(repo_root)
     now = _now or now_utc()
     timestamp = now.strftime("%Y-%m-%dT%H:%M:%SZ")
 
-    # Get snapshot data (reuses the same logic as loom-status)
-    snapshot_data: dict[str, Any] = {}
-    try:
-        from loom_tools.snapshot import build_snapshot
+    # Forge pipeline (10 parallel gh queries).
+    if _pipeline_data is None:
+        from loom_tools.snapshot import collect_pipeline_data
 
-        snapshot_data = build_snapshot(repo_root=repo_root)
-    except Exception:
-        pass
-
-    computed = snapshot_data.get("computed", {})
-    pipeline_health = snapshot_data.get("pipeline_health", {})
-    systematic_failure = snapshot_data.get("systematic_failure", {})
-    usage = snapshot_data.get("usage", {})
-
-    # Queue depths from snapshot
-    queue_depths = QueueDepths(
-        ready=computed.get("total_ready", 0),
-        building=computed.get("total_building", 0),
-        review_requested=computed.get("prs_awaiting_review", 0),
-        changes_requested=computed.get("prs_needing_fixes", 0),
-        ready_to_merge=computed.get("prs_ready_to_merge", 0),
-    )
-
-    # Shepherd and stale heartbeat data
-    active_shepherds = computed.get("active_shepherds", 0)
-    stale_heartbeats = computed.get("stale_heartbeat_count", 0)
-
-    # Pipeline health
-    pipeline_status = pipeline_health.get("status", "healthy")
-    blocked_count = computed.get("total_blocked", 0)
-    retryable_count = pipeline_health.get("retryable_count", 0)
-    permanent_blocked_count = pipeline_health.get("permanent_blocked_count", 0)
-    sys_failure_active = systematic_failure.get("active", False)
-
-    # Daemon metrics from daemon-metrics.json
-    daemon_metrics_path = repo_root / ".loom" / "daemon-metrics.json"
-    daemon_metrics = read_json_file(daemon_metrics_path)
-    if isinstance(daemon_metrics, list):
-        daemon_metrics = {}
-
-    session_percent = usage.get(
-        "session_percent", daemon_metrics.get("session_percent", 0)
-    )
-    iteration_count = daemon_metrics.get("total_iterations", 0)
-    avg_duration = daemon_metrics.get("average_iteration_seconds", 0)
-    consecutive_failures = daemon_metrics.get("health", {}).get(
-        "consecutive_failures", 0
-    )
-    successful = daemon_metrics.get("successful_iterations", 0)
-    success_rate: float = 100.0
-    if iteration_count > 0:
-        success_rate = (successful * 100.0) / iteration_count
-
-    # Throughput from daemon state
-    daemon_state = read_daemon_state(repo_root)
-    issues_per_hour: float = 0.0
-    prs_per_hour: float = 0.0
-
-    if daemon_state.started_at:
         try:
-            started_dt = parse_iso_timestamp(daemon_state.started_at)
-            hours_running = (now - started_dt).total_seconds() / 3600
-            completed_count = len(daemon_state.completed_issues)
-            prs_merged = daemon_state.total_prs_merged
+            pipeline = collect_pipeline_data(repo_root, ci_health_check_enabled=False)
+        except Exception:
+            pipeline = {}
+    else:
+        pipeline = _pipeline_data
 
-            if hours_running > 0:
-                issues_per_hour = completed_count / hours_running
-                prs_per_hour = prs_merged / hours_running
-        except (ValueError, OSError):
-            pass
+    ready = pipeline.get("ready_issues", []) or []
+    building = pipeline.get("building_issues", []) or []
+    blocked = pipeline.get("blocked_issues", []) or []
+    review_requested = pipeline.get("review_requested", []) or []
+    changes_requested = pipeline.get("changes_requested", []) or []
+    ready_to_merge = pipeline.get("ready_to_merge", []) or []
 
-    return MetricEntry(
+    # Merge-conflict subset of ready_to_merge — approved-but-blocked PRs.
+    merge_conflict_count = sum(
+        1
+        for pr in ready_to_merge
+        if any(
+            (lbl.get("name") if isinstance(lbl, dict) else None) == "loom:merge-conflict"
+            for lbl in pr.get("labels", []) or []
+        )
+    )
+
+    # Spawn-loop state.
+    sls = (
+        _spawn_loop_state
+        if _spawn_loop_state is not None
+        else read_spawn_loop_state(repo_root)
+    )
+    running_issues = {task.issue for task in sls.running}
+    running_tasks = len(sls.running)
+    stuck = _count_stuck_tasks(sls, now=now)
+
+    # Orphan-drift: loom:building issues that no running task is working.
+    # Only meaningful when spawn loop is present (otherwise we don't know
+    # which tasks "should" be running).
+    orphan_building = 0
+    if sls.present and running_tasks > 0:
+        building_numbers = {
+            int(item.get("number") or 0) for item in building if item.get("number")
+        }
+        orphan_building = len(building_numbers - running_issues)
+
+    return HealthSnapshot(
         timestamp=timestamp,
-        throughput=ThroughputMetric(
-            issues_per_hour=round(issues_per_hour, 2),
-            prs_per_hour=round(prs_per_hour, 2),
-        ),
-        latency=LatencyMetric(avg_iteration_seconds=avg_duration),
-        queue_depths=queue_depths,
-        error_rates=ErrorRates(
-            consecutive_failures=consecutive_failures,
-            success_rate=round(success_rate, 1),
-            stuck_agents=stale_heartbeats,
-        ),
-        resource_usage=ResourceUsage(
-            active_shepherds=active_shepherds,
-            session_percent=session_percent,
-        ),
-        pipeline_health=PipelineHealthMetric(
-            status=pipeline_status,
-            blocked_count=blocked_count,
-            retryable_count=retryable_count,
-            permanent_blocked_count=permanent_blocked_count,
-            systematic_failure_active=sys_failure_active,
-        ),
+        ready_count=len(ready),
+        building_count=len(building),
+        blocked_count=len(blocked),
+        review_requested_count=len(review_requested),
+        changes_requested_count=len(changes_requested),
+        ready_to_merge_count=len(ready_to_merge),
+        merge_conflict_count=merge_conflict_count,
+        spawn_loop_present=sls.present,
+        running_tasks=running_tasks,
+        stuck_tasks=stuck,
+        orphan_building=orphan_building,
     )
 
 
 # ---------------------------------------------------------------------------
-# Health score computation
+# Composite-score recipe (see PR body for rationale)
 # ---------------------------------------------------------------------------
 
 
-def calculate_health_score(
-    metrics: HealthMetrics,
-    *,
-    throughput_decline_threshold: int = THROUGHPUT_DECLINE_THRESHOLD,
-    queue_growth_threshold: int = QUEUE_GROWTH_THRESHOLD,
-) -> int:
-    """Calculate composite health score (0-100) from recent metrics.
+def calculate_health_score(snapshot: HealthSnapshot) -> int:
+    """Compute a composite health score in [0, 100].
 
-    Scoring factors (max deduction):
-    - Error rate: 0-25 points
-    - Consecutive failures: 0-15 points
-    - Stuck agents: 0-20 points
-    - Queue growth: 0-15 points
-    - Resource usage: 0-15 points
-    - Throughput decline: 0-15 points
-    - Pipeline stall: 0-20 points
-    - Systematic failure: 0-15 points
+    Recipe (5 factors, max deduction 80; floor at 0):
+
+    1. **Stuck tasks** (0-20): spawn-loop children with stale heartbeats.
+       1: -10, 2: -15, >=3: -20.
+    2. **Orphan building** (0-15): ``loom:building`` issues with no running
+       task. 1: -5, 2: -10, >=3: -15.
+    3. **Ready queue depth** (0-15): backlog absolute. Deducts when issues are
+       waiting and nothing is running. >= READY_QUEUE_HIGH: -15,
+       >= READY_QUEUE_MEDIUM: -10, >=1 (when running==0): -5.
+    4. **Review backlog** (0-15): review-requested + changes-requested PRs.
+       >= REVIEW_BACKLOG_HIGH: -15, >= REVIEW_BACKLOG_MEDIUM: -10, >=1: -3.
+    5. **Merge-conflict backlog** (0-15): approved PRs that can't merge.
+       >= MERGE_CONFLICT_HIGH: -15, >= MERGE_CONFLICT_MEDIUM: -10, >=1: -5.
+
+    Total max deduction = 80, so a fully degraded system bottoms out at 20.
+    The floor at 0 is symbolic — the recipe shouldn't reach it.
     """
-    if not metrics.metrics:
-        return 100
-
-    latest = metrics.metrics[-1]
     score = 100
 
-    # Factor 1: Error rate (0-25 points)
-    sr = latest.error_rates.success_rate
-    if sr < 50:
-        score -= 25
-    elif sr < 70:
-        score -= 15
-    elif sr < 90:
-        score -= 5
-
-    # Factor 2: Consecutive failures (0-15 points)
-    cf = latest.error_rates.consecutive_failures
-    if cf >= 5:
-        score -= 15
-    elif cf >= 3:
-        score -= 10
-    elif cf >= 1:
-        score -= 5
-
-    # Factor 3: Stuck agents (0-20 points)
-    stuck = latest.error_rates.stuck_agents
-    if stuck >= 3:
+    # Factor 1: Stuck tasks
+    if snapshot.stuck_tasks >= 3:
         score -= 20
-    elif stuck >= 2:
+    elif snapshot.stuck_tasks == 2:
         score -= 15
-    elif stuck >= 1:
+    elif snapshot.stuck_tasks == 1:
         score -= 10
 
-    # Factor 4: Queue growth (0-15 points)
-    if len(metrics.metrics) >= 2:
-        prev = metrics.metrics[-2]
-        growth = latest.queue_depths.ready - prev.queue_depths.ready
-        if growth >= queue_growth_threshold:
-            score -= 15
-        elif growth >= 3:
-            score -= 10
-        elif growth >= 1:
-            score -= 5
-
-    # Factor 5: Resource usage (0-15 points)
-    sp = latest.resource_usage.session_percent
-    if sp >= 95:
+    # Factor 2: Orphan building (drift between loom:building and spawn loop)
+    if snapshot.orphan_building >= 3:
         score -= 15
-    elif sp >= 90:
+    elif snapshot.orphan_building == 2:
         score -= 10
-    elif sp >= 80:
+    elif snapshot.orphan_building == 1:
         score -= 5
 
-    # Factor 6: Throughput decline (0-15 points)
-    if len(metrics.metrics) >= 2:
-        prev = metrics.metrics[-2]
-        prev_throughput = prev.throughput.issues_per_hour
-        cur_throughput = latest.throughput.issues_per_hour
-        if prev_throughput > 0 and cur_throughput < prev_throughput:
-            decline_pct = ((prev_throughput - cur_throughput) * 100) / prev_throughput
-            if decline_pct >= throughput_decline_threshold:
-                score -= 15
-            elif decline_pct >= 30:
-                score -= 10
-            elif decline_pct >= 10:
-                score -= 5
-
-    # Factor 7: Pipeline stall (0-20 points)
-    if latest.pipeline_health.status == "stalled":
-        score -= 20
-    elif latest.pipeline_health.status == "degraded":
-        score -= 10
-
-    # Factor 8: Systematic failure (0-15 points)
-    if latest.pipeline_health.systematic_failure_active:
+    # Factor 3: Ready queue depth
+    if snapshot.ready_count >= READY_QUEUE_HIGH:
         score -= 15
+    elif snapshot.ready_count >= READY_QUEUE_MEDIUM:
+        score -= 10
+    elif snapshot.ready_count >= 1 and snapshot.running_tasks == 0:
+        # Issues piling up with no one working = mild penalty even at low N.
+        score -= 5
+
+    # Factor 4: Review backlog
+    review_total = snapshot.review_requested_count + snapshot.changes_requested_count
+    if review_total >= REVIEW_BACKLOG_HIGH:
+        score -= 15
+    elif review_total >= REVIEW_BACKLOG_MEDIUM:
+        score -= 10
+    elif review_total >= 1:
+        score -= 3
+
+    # Factor 5: Merge-conflict backlog
+    if snapshot.merge_conflict_count >= MERGE_CONFLICT_HIGH:
+        score -= 15
+    elif snapshot.merge_conflict_count >= MERGE_CONFLICT_MEDIUM:
+        score -= 10
+    elif snapshot.merge_conflict_count >= 1:
+        score -= 5
 
     return max(0, min(100, score))
 
 
 def get_health_status(score: int) -> str:
-    """Map numeric score to status label."""
+    """Map numeric score to status label. Thresholds unchanged from v1."""
     if score >= 90:
         return "excellent"
     if score >= 70:
@@ -346,336 +347,220 @@ def get_health_status(score: int) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Alert generation
+# Alerts (live, not persisted)
 # ---------------------------------------------------------------------------
 
 
-def generate_alerts(
-    metrics: HealthMetrics,
-    *,
-    _now: datetime | None = None,
-) -> list[Alert]:
-    """Generate alerts based on current metrics."""
-    if not metrics.metrics:
-        return []
+def generate_alerts(snapshot: HealthSnapshot) -> list[Alert]:
+    """Generate alerts from the current snapshot.
 
-    now = _now or now_utc()
-    timestamp = now.strftime("%Y-%m-%dT%H:%M:%SZ")
-    epoch = int(now.timestamp())
-    latest = metrics.metrics[-1]
+    Unlike the daemon-state version, alerts are recomputed on every CLI
+    invocation. There is no acknowledgement state.
+    """
     alerts: list[Alert] = []
 
-    # Stuck agents
-    stuck = latest.error_rates.stuck_agents
-    if stuck >= 1:
-        severity = "critical" if stuck >= 3 else "warning"
-        alerts.append(Alert(
-            id=f"alert-stuck-{epoch}",
-            type="stuck_agents",
-            severity=severity,
-            message=f"{stuck} agent(s) with stale heartbeats",
-            timestamp=timestamp,
-            context={"stuck_count": stuck},
-        ))
+    # Stuck tasks
+    if snapshot.stuck_tasks >= 1:
+        severity = "critical" if snapshot.stuck_tasks >= 3 else "warning"
+        alerts.append(
+            Alert(
+                type="stuck_tasks",
+                severity=severity,
+                message=f"{snapshot.stuck_tasks} spawn-loop task(s) with stale heartbeats",
+                context={
+                    "stuck_count": snapshot.stuck_tasks,
+                    "threshold_seconds": STUCK_HEARTBEAT_SECONDS,
+                },
+            )
+        )
 
-    # Consecutive failures
-    cf = latest.error_rates.consecutive_failures
-    if cf >= 3:
-        severity = "critical" if cf >= 5 else "warning"
-        alerts.append(Alert(
-            id=f"alert-failures-{epoch}",
-            type="high_error_rate",
-            severity=severity,
-            message=f"{cf} consecutive iteration failures",
-            timestamp=timestamp,
-            context={"consecutive_failures": cf},
-        ))
+    # Orphan building
+    if snapshot.orphan_building >= 1:
+        severity = "warning" if snapshot.orphan_building < 3 else "critical"
+        alerts.append(
+            Alert(
+                type="orphan_building",
+                severity=severity,
+                message=(
+                    f"{snapshot.orphan_building} loom:building issue(s) "
+                    "with no running spawn-loop task"
+                ),
+                context={"orphan_count": snapshot.orphan_building},
+            )
+        )
 
-    # Resource exhaustion
-    sp = latest.resource_usage.session_percent
-    if sp >= 90:
-        severity = "critical" if sp >= 97 else "warning"
-        alerts.append(Alert(
-            id=f"alert-resource-{epoch}",
-            type="resource_exhaustion",
-            severity=severity,
-            message=f"Session budget at {sp}%",
-            timestamp=timestamp,
-            context={"session_percent": sp},
-        ))
-
-    # Pipeline stall
-    if latest.pipeline_health.status == "stalled":
-        blocked = latest.pipeline_health.blocked_count
-        retryable = latest.pipeline_health.retryable_count
-        permanent = latest.pipeline_health.permanent_blocked_count
-        severity = "critical" if retryable == 0 else "warning"
-        alerts.append(Alert(
-            id=f"alert-pipeline-stall-{epoch}",
-            type="pipeline_stall",
-            severity=severity,
-            message=(
-                f"Pipeline stalled: {blocked} blocked "
-                f"({retryable} retryable, {permanent} permanent)"
-            ),
-            timestamp=timestamp,
-            context={
-                "blocked_count": blocked,
-                "retryable_count": retryable,
-                "permanent_blocked_count": permanent,
-            },
-        ))
-
-    # Systematic failure
-    if latest.pipeline_health.systematic_failure_active:
-        alerts.append(Alert(
-            id=f"alert-systematic-failure-{epoch}",
-            type="systematic_failure",
-            severity="critical",
-            message="Systematic failure detected - shepherd spawning paused",
-            timestamp=timestamp,
-        ))
-
-    # Queue growth
-    if len(metrics.metrics) >= 2:
-        prev = metrics.metrics[-2]
-        growth = latest.queue_depths.ready - prev.queue_depths.ready
-        if growth >= QUEUE_GROWTH_THRESHOLD:
-            alerts.append(Alert(
-                id=f"alert-queue-{epoch}",
-                type="queue_growth",
+    # Pipeline stall: ready issues pending AND no running tasks AND no
+    # ready-to-merge PRs. This is the spawn-loop equivalent of the old
+    # "pipeline stalled" alert.
+    if (
+        snapshot.ready_count >= 1
+        and snapshot.running_tasks == 0
+        and snapshot.ready_to_merge_count == 0
+    ):
+        alerts.append(
+            Alert(
+                type="pipeline_stall",
                 severity="warning",
-                message=f"Ready queue grew by {growth} (now {latest.queue_depths.ready})",
-                timestamp=timestamp,
-                context={"growth": growth, "current": latest.queue_depths.ready},
-            ))
+                message=(
+                    f"{snapshot.ready_count} ready issue(s) and no spawn-loop "
+                    "task(s) running — is the loop alive?"
+                ),
+                context={"ready_count": snapshot.ready_count},
+            )
+        )
+
+    # Review backlog
+    review_total = snapshot.review_requested_count + snapshot.changes_requested_count
+    if review_total >= REVIEW_BACKLOG_MEDIUM:
+        severity = "critical" if review_total >= REVIEW_BACKLOG_HIGH else "warning"
+        alerts.append(
+            Alert(
+                type="review_backlog",
+                severity=severity,
+                message=(
+                    f"{review_total} PR(s) awaiting review/fixes "
+                    f"({snapshot.review_requested_count} review-requested, "
+                    f"{snapshot.changes_requested_count} changes-requested)"
+                ),
+                context={
+                    "review_requested": snapshot.review_requested_count,
+                    "changes_requested": snapshot.changes_requested_count,
+                },
+            )
+        )
+
+    # Merge-conflict backlog
+    if snapshot.merge_conflict_count >= MERGE_CONFLICT_MEDIUM:
+        severity = (
+            "critical"
+            if snapshot.merge_conflict_count >= MERGE_CONFLICT_HIGH
+            else "warning"
+        )
+        alerts.append(
+            Alert(
+                type="merge_conflict_backlog",
+                severity=severity,
+                message=(
+                    f"{snapshot.merge_conflict_count} approved PR(s) blocked "
+                    "on merge conflicts"
+                ),
+                context={"merge_conflict_count": snapshot.merge_conflict_count},
+            )
+        )
 
     return alerts
 
 
 # ---------------------------------------------------------------------------
-# Core operations
+# Display
 # ---------------------------------------------------------------------------
 
 
-def collect_metrics(repo_root: Any, *, _now: datetime | None = None) -> str:
-    """Collect metrics, update health score, generate alerts. Return summary."""
-    import pathlib
-
-    repo_root = pathlib.Path(repo_root)
-    now = _now or now_utc()
-    timestamp = now.strftime("%Y-%m-%dT%H:%M:%SZ")
-
-    # Collect current metric
-    entry = collect_current_metrics(repo_root, _now=now)
-
-    # Read existing metrics
-    health = read_health_metrics(repo_root)
-    if not health.initialized_at:
-        health.initialized_at = timestamp
-        health.retention_hours = RETENTION_HOURS
-
-    # Append new metric
-    health.metrics.append(entry)
-
-    # Prune old metrics
-    cutoff = now.timestamp() - (RETENTION_HOURS * 3600)
-    health.metrics = [
-        m
-        for m in health.metrics
-        if _metric_epoch(m) > cutoff
-    ]
-
-    # Calculate health score
-    score = calculate_health_score(health)
+def format_health_json(snapshot: HealthSnapshot) -> str:
+    score = calculate_health_score(snapshot)
     status = get_health_status(score)
-    health.health_score = score
-    health.health_status = status
-    health.last_updated = timestamp
-
-    # Write metrics
-    metrics_path = repo_root / ".loom" / "health-metrics.json"
-    write_json_file(metrics_path, health.to_dict())
-
-    # Generate and store alerts
-    new_alerts = generate_alerts(health, _now=now)
-    if new_alerts:
-        alerts_file = read_alerts(repo_root)
-        if not alerts_file.initialized_at:
-            alerts_file.initialized_at = timestamp
-        alerts_file.alerts.extend(new_alerts)
-        # Keep only last MAX_ALERTS
-        alerts_file.alerts = alerts_file.alerts[-MAX_ALERTS:]
-        alerts_path = repo_root / ".loom" / "alerts.json"
-        write_json_file(alerts_path, alerts_file.to_dict())
-
-    return f"Metrics collected. Health score: {score} ({status})"
-
-
-def _metric_epoch(entry: MetricEntry) -> float:
-    """Convert metric timestamp to epoch seconds."""
-    if not entry.timestamp:
-        return 0.0
-    try:
-        dt = parse_iso_timestamp(entry.timestamp)
-        return dt.timestamp()
-    except (ValueError, OSError):
-        return 0.0
-
-
-def acknowledge_alert(repo_root: Any, alert_id: str) -> str:
-    """Mark an alert as acknowledged. Returns status message."""
-    import pathlib
-
-    repo_root = pathlib.Path(repo_root)
-    alerts_file = read_alerts(repo_root)
-
-    found = False
-    now = now_utc()
-    timestamp = now.strftime("%Y-%m-%dT%H:%M:%SZ")
-
-    for alert in alerts_file.alerts:
-        if alert.id == alert_id:
-            alert.acknowledged = True
-            alert.acknowledged_at = timestamp
-            found = True
-            break
-
-    if not found:
-        return f"Alert not found: {alert_id}"
-
-    alerts_path = repo_root / ".loom" / "alerts.json"
-    write_json_file(alerts_path, alerts_file.to_dict())
-    return f"Alert acknowledged: {alert_id}"
-
-
-def clear_alerts(repo_root: Any) -> str:
-    """Clear all alerts. Returns status message."""
-    import pathlib
-
-    repo_root = pathlib.Path(repo_root)
-    now = now_utc()
-    timestamp = now.strftime("%Y-%m-%dT%H:%M:%SZ")
-
-    alerts_file = AlertsFile(initialized_at=timestamp)
-    alerts_path = repo_root / ".loom" / "alerts.json"
-    write_json_file(alerts_path, alerts_file.to_dict())
-    return "All alerts cleared"
-
-
-# ---------------------------------------------------------------------------
-# Display functions
-# ---------------------------------------------------------------------------
-
-
-def format_health_json(repo_root: Any) -> str:
-    """Format health status as JSON."""
-    import pathlib
-
-    repo_root = pathlib.Path(repo_root)
-    health = read_health_metrics(repo_root)
-    alerts_file = read_alerts(repo_root)
-
-    unack_count = sum(1 for a in alerts_file.alerts if not a.acknowledged)
-
-    latest: dict[str, Any] = {}
-    if health.metrics:
-        latest = health.metrics[-1].to_dict()
-
+    alerts = generate_alerts(snapshot)
     output = {
-        "health_score": health.health_score,
-        "health_status": health.health_status,
-        "last_updated": health.last_updated,
-        "metric_count": len(health.metrics),
-        "unacknowledged_alerts": unack_count,
-        "total_alerts": len(alerts_file.alerts),
-        "latest_metrics": latest,
-        "metrics_history": [m.to_dict() for m in health.metrics],
+        "timestamp": snapshot.timestamp,
+        "health_score": score,
+        "health_status": status,
+        "snapshot": {
+            "ready_count": snapshot.ready_count,
+            "building_count": snapshot.building_count,
+            "blocked_count": snapshot.blocked_count,
+            "review_requested_count": snapshot.review_requested_count,
+            "changes_requested_count": snapshot.changes_requested_count,
+            "ready_to_merge_count": snapshot.ready_to_merge_count,
+            "merge_conflict_count": snapshot.merge_conflict_count,
+            "spawn_loop_present": snapshot.spawn_loop_present,
+            "running_tasks": snapshot.running_tasks,
+            "stuck_tasks": snapshot.stuck_tasks,
+            "orphan_building": snapshot.orphan_building,
+        },
+        "alerts": [a.to_dict() for a in alerts],
     }
     return json.dumps(output, indent=2)
 
 
-def format_health_human(repo_root: Any) -> str:
-    """Format health status for human display."""
-    import pathlib
-
-    repo_root = pathlib.Path(repo_root)
-    health = read_health_metrics(repo_root)
-    alerts_file = read_alerts(repo_root)
+def format_health_human(snapshot: HealthSnapshot) -> str:
+    score = calculate_health_score(snapshot)
+    status = get_health_status(score)
+    alerts = generate_alerts(snapshot)
     c = _Colors(use_color=_use_color())
 
-    score = health.health_score
-    status = health.health_status
-    last_updated = health.last_updated or "never"
-    metric_count = len(health.metrics)
-    unack_count = sum(1 for a in alerts_file.alerts if not a.acknowledged)
-    total_alerts = len(alerts_file.alerts)
-
-    lines: list[str] = []
-    lines.append("")
-    lines.append(
-        f"{c.bold}{c.cyan}======================================================================={c.reset}"
-    )
-    lines.append(
-        f"{c.bold}{c.cyan}  LOOM HEALTH STATUS{c.reset}"
-    )
-    lines.append(
-        f"{c.bold}{c.cyan}======================================================================={c.reset}"
-    )
-    lines.append("")
-
-    # Score with color
     if score < 30:
         score_color = c.red
     elif score < 70:
         score_color = c.yellow
+    elif score < 90:
+        score_color = c.cyan
     else:
         score_color = c.green
 
+    lines: list[str] = []
+    lines.append("")
+    lines.append(
+        f"{c.bold}{c.cyan}======================================================================={c.reset}"
+    )
+    lines.append(f"{c.bold}{c.cyan}  LOOM HEALTH STATUS{c.reset}")
+    lines.append(
+        f"{c.bold}{c.cyan}======================================================================={c.reset}"
+    )
+    lines.append("")
     lines.append(
         f"  {c.bold}Health Score:{c.reset} {score_color}{score}/100{c.reset} ({status})"
     )
-    lines.append(f"  {c.bold}Last Updated:{c.reset} {last_updated}")
-    lines.append(f"  {c.bold}Metrics Stored:{c.reset} {metric_count} samples")
+    lines.append(f"  {c.bold}Timestamp:{c.reset}    {snapshot.timestamp}")
     lines.append("")
 
-    # Alert summary
-    if unack_count > 0:
+    # Spawn loop section
+    sl_status = (
+        f"{c.green}present{c.reset}"
+        if snapshot.spawn_loop_present
+        else f"{c.gray}absent{c.reset}"
+    )
+    lines.append(f"  {c.bold}Spawn Loop:{c.reset}     {sl_status}")
+    lines.append(
+        f"  {c.bold}Running Tasks:{c.reset}  {snapshot.running_tasks}"
+    )
+    stuck_color = c.red if snapshot.stuck_tasks else c.green
+    lines.append(
+        f"  {c.bold}Stuck Tasks:{c.reset}    {stuck_color}{snapshot.stuck_tasks}{c.reset}"
+    )
+    if snapshot.orphan_building:
         lines.append(
-            f"  {c.bold}Alerts:{c.reset} {c.red}{unack_count} unacknowledged{c.reset} ({total_alerts} total)"
-        )
-    else:
-        lines.append(
-            f"  {c.bold}Alerts:{c.reset} {c.green}No unacknowledged alerts{c.reset} ({total_alerts} total)"
+            f"  {c.bold}Orphan Building:{c.reset} {c.yellow}{snapshot.orphan_building}{c.reset} "
+            f"({c.gray}loom:building w/o running task{c.reset})"
         )
     lines.append("")
 
-    # Latest metrics
-    if health.metrics:
-        latest = health.metrics[-1]
-        lines.append(f"  {c.bold}Current Metrics:{c.reset}")
+    # Pipeline section
+    lines.append(f"  {c.bold}Issue Queues:{c.reset}")
+    lines.append(
+        f"    ready={snapshot.ready_count}, building={snapshot.building_count}, "
+        f"blocked={snapshot.blocked_count}"
+    )
+    lines.append(f"  {c.bold}PR Queues:{c.reset}")
+    lines.append(
+        f"    review-requested={snapshot.review_requested_count}, "
+        f"changes-requested={snapshot.changes_requested_count}, "
+        f"ready-to-merge={snapshot.ready_to_merge_count}"
+    )
+    if snapshot.merge_conflict_count:
         lines.append(
-            f"    Throughput: {latest.throughput.issues_per_hour} issues/hr, "
-            f"{latest.throughput.prs_per_hour} PRs/hr"
+            f"    {c.yellow}merge-conflict={snapshot.merge_conflict_count}{c.reset} "
+            f"({c.gray}approved PRs blocked{c.reset})"
         )
-        lines.append(
-            f"    Queue Depths: ready={latest.queue_depths.ready}, "
-            f"building={latest.queue_depths.building}, "
-            f"review={latest.queue_depths.review_requested}"
-        )
-        lines.append(
-            f"    Error Rates: {latest.error_rates.success_rate}% success, "
-            f"{latest.error_rates.consecutive_failures} failures, "
-            f"{latest.error_rates.stuck_agents} stuck"
-        )
-        lines.append(
-            f"    Resources: {latest.resource_usage.active_shepherds} shepherds, "
-            f"{latest.resource_usage.session_percent}% session"
-        )
+    lines.append("")
+
+    # Alerts section
+    if alerts:
+        lines.append(f"  {c.bold}Active Alerts:{c.reset} {c.yellow}{len(alerts)}{c.reset}")
+        for a in alerts:
+            sev_color = c.red if a.severity == "critical" else c.yellow
+            lines.append(f"    [{sev_color}{a.severity}{c.reset}] {a.type}: {a.message}")
     else:
-        lines.append(
-            f"  {c.gray}No metrics collected yet. Run: loom-health-monitor --collect{c.reset}"
-        )
+        lines.append(f"  {c.bold}Active Alerts:{c.reset} {c.green}none{c.reset}")
     lines.append("")
     lines.append(
         f"{c.bold}{c.cyan}======================================================================={c.reset}"
@@ -684,103 +569,35 @@ def format_health_human(repo_root: Any) -> str:
     return "\n".join(lines)
 
 
-def format_alerts_json(repo_root: Any) -> str:
-    """Format alerts as JSON."""
-    import pathlib
-
-    repo_root = pathlib.Path(repo_root)
-    alerts_file = read_alerts(repo_root)
-    return json.dumps(alerts_file.to_dict(), indent=2)
+def format_alerts_json(snapshot: HealthSnapshot) -> str:
+    return json.dumps(
+        {"alerts": [a.to_dict() for a in generate_alerts(snapshot)]},
+        indent=2,
+    )
 
 
-def format_alerts_human(repo_root: Any) -> str:
-    """Format alerts for human display."""
-    import pathlib
-
-    repo_root = pathlib.Path(repo_root)
-    alerts_file = read_alerts(repo_root)
+def format_alerts_human(snapshot: HealthSnapshot) -> str:
+    alerts = generate_alerts(snapshot)
     c = _Colors(use_color=_use_color())
-
-    unack = [a for a in alerts_file.alerts if not a.acknowledged]
-
-    lines: list[str] = []
-    lines.append("")
-    lines.append(
-        f"{c.bold}{c.cyan}======================================================================={c.reset}"
-    )
-    lines.append(f"{c.bold}{c.cyan}  LOOM ALERTS{c.reset}")
-    lines.append(
-        f"{c.bold}{c.cyan}======================================================================={c.reset}"
-    )
-    lines.append("")
-
-    if not unack:
-        lines.append(f"  {c.green}No unacknowledged alerts{c.reset}")
+    lines: list[str] = [
+        "",
+        f"{c.bold}{c.cyan}======================================================================={c.reset}",
+        f"{c.bold}{c.cyan}  LOOM ALERTS (live){c.reset}",
+        f"{c.bold}{c.cyan}======================================================================={c.reset}",
+        "",
+    ]
+    if not alerts:
+        lines.append(f"  {c.green}No active alerts{c.reset}")
     else:
-        lines.append(f"  {c.yellow}{len(unack)} unacknowledged alert(s):{c.reset}")
+        lines.append(f"  {c.yellow}{len(alerts)} active alert(s):{c.reset}")
         lines.append("")
-        for a in unack:
-            lines.append(f"    [{a.severity}] {a.type}: {a.message}")
-            lines.append(f"      ID: {a.id}")
-            lines.append(f"      Time: {a.timestamp}")
-            lines.append("")
-
+        for a in alerts:
+            sev_color = c.red if a.severity == "critical" else c.yellow
+            lines.append(f"    [{sev_color}{a.severity}{c.reset}] {a.type}: {a.message}")
+    lines.append("")
     lines.append(
         f"{c.bold}{c.cyan}======================================================================={c.reset}"
     )
-    lines.append("")
-    return "\n".join(lines)
-
-
-def format_history_json(repo_root: Any, hours: int = 1) -> str:
-    """Format metric history as JSON."""
-    import pathlib
-
-    repo_root = pathlib.Path(repo_root)
-    health = read_health_metrics(repo_root)
-
-    now = now_utc()
-    cutoff = now.timestamp() - (hours * 3600)
-    filtered = [m for m in health.metrics if _metric_epoch(m) > cutoff]
-
-    output = {
-        "initialized_at": health.initialized_at,
-        "retention_hours": health.retention_hours,
-        "metrics": [m.to_dict() for m in filtered],
-        "health_score": health.health_score,
-        "health_status": health.health_status,
-        "last_updated": health.last_updated,
-    }
-    return json.dumps(output, indent=2)
-
-
-def format_history_human(repo_root: Any, hours: int = 1) -> str:
-    """Format metric history for human display."""
-    import pathlib
-
-    repo_root = pathlib.Path(repo_root)
-    health = read_health_metrics(repo_root)
-    c = _Colors(use_color=_use_color())
-
-    now = now_utc()
-    cutoff = now.timestamp() - (hours * 3600)
-    filtered = [m for m in health.metrics if _metric_epoch(m) > cutoff]
-
-    lines: list[str] = []
-    lines.append("")
-    lines.append(
-        f"{c.bold}Metric History (last {hours} hour(s), {len(filtered)} samples):{c.reset}"
-    )
-    lines.append("")
-
-    for m in filtered:
-        lines.append(
-            f"{m.timestamp}: "
-            f"ready={m.queue_depths.ready}, "
-            f"building={m.queue_depths.building}, "
-            f"stuck={m.error_rates.stuck_agents}"
-        )
-
     lines.append("")
     return "\n".join(lines)
 
@@ -790,47 +607,55 @@ def format_history_human(repo_root: Any, hours: int = 1) -> str:
 # ---------------------------------------------------------------------------
 
 
+_RETIRED_FLAGS_MSG = (
+    "loom-health-monitor: --collect, --history, --acknowledge, and --clear-alerts "
+    "were retired in the Phase 3 port (issue #3397). The monitor is now a "
+    "point-in-time snapshot — no persistent metrics, no acknowledgement state."
+)
+
+
 def main(argv: list[str] | None = None) -> int:
     """Main entry point for the health monitor CLI."""
     parser = argparse.ArgumentParser(
-        description="Proactive health monitoring for Loom daemon",
+        description="Forge-derived health monitor for the spawn-loop orchestrator",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""\
 Commands:
     (default)              Display health summary
-    --collect              Collect and store health metrics
-    --alerts               Show current alerts
-    --acknowledge <id>     Acknowledge an alert
-    --clear-alerts         Clear all alerts
-    --history [hours]      Show metric history (default: 1 hour)
+    --json                 Output as JSON
+    --alerts               Show live alerts only
 
 Environment Variables:
-    LOOM_HEALTH_RETENTION_HOURS       Metric retention period (default: 24)
-    LOOM_THROUGHPUT_DECLINE_THRESHOLD Throughput decline % (default: 50)
-    LOOM_QUEUE_GROWTH_THRESHOLD       Queue growth count (default: 5)
-    LOOM_STUCK_AGENT_THRESHOLD        Stuck minutes (default: 10)
-    LOOM_ERROR_RATE_THRESHOLD         Error rate % (default: 20)
+    LOOM_STUCK_HEARTBEAT_SECONDS    Stuck-task threshold (default: 120)
+    LOOM_HEALTH_READY_HIGH          Ready queue HIGH threshold  (default: 20)
+    LOOM_HEALTH_READY_MEDIUM        Ready queue MEDIUM threshold (default: 10)
+    LOOM_HEALTH_REVIEW_HIGH         Review backlog HIGH threshold  (default: 10)
+    LOOM_HEALTH_REVIEW_MEDIUM       Review backlog MEDIUM threshold (default: 5)
+    LOOM_HEALTH_MERGE_CONFLICT_HIGH    Merge-conflict HIGH (default: 5)
+    LOOM_HEALTH_MERGE_CONFLICT_MEDIUM  Merge-conflict MEDIUM (default: 3)
 """,
     )
     parser.add_argument("--json", action="store_true", help="Output as JSON")
+    parser.add_argument("--alerts", action="store_true", help="Show active alerts only")
+    # Retired flags — accepted so existing operator scripts get a clear error
+    # rather than an argparse "unrecognized argument" abort.
+    parser.add_argument("--collect", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--acknowledge", metavar="ID", help=argparse.SUPPRESS)
+    parser.add_argument("--clear-alerts", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument(
-        "--collect", action="store_true", help="Collect and store health metrics"
-    )
-    parser.add_argument("--alerts", action="store_true", help="Show current alerts")
-    parser.add_argument("--acknowledge", metavar="ID", help="Acknowledge an alert")
-    parser.add_argument(
-        "--clear-alerts", action="store_true", help="Clear all alerts"
-    )
-    parser.add_argument(
-        "--history",
-        nargs="?",
-        const=1,
-        type=int,
-        metavar="HOURS",
-        help="Show metric history (default: 1 hour)",
+        "--history", nargs="?", const=1, type=int, metavar="HOURS", help=argparse.SUPPRESS
     )
 
     args = parser.parse_args(argv)
+
+    if (
+        args.collect
+        or args.acknowledge
+        or args.clear_alerts
+        or args.history is not None
+    ):
+        print(_RETIRED_FLAGS_MSG, file=sys.stderr)
+        return 2
 
     try:
         repo_root = find_repo_root()
@@ -838,41 +663,19 @@ Environment Variables:
         print("Error: Not in a git repository with .loom directory", file=sys.stderr)
         return 1
 
-    if args.collect:
-        msg = collect_metrics(repo_root)
-        print(msg)
-        return 0
-
-    if args.acknowledge:
-        msg = acknowledge_alert(repo_root, args.acknowledge)
-        print(msg)
-        return 0 if "acknowledged" in msg.lower() else 1
-
-    if args.clear_alerts:
-        msg = clear_alerts(repo_root)
-        print(msg)
-        return 0
+    snapshot = collect_snapshot(repo_root)
 
     if args.alerts:
         if args.json:
-            print(format_alerts_json(repo_root))
+            print(format_alerts_json(snapshot))
         else:
-            print(format_alerts_human(repo_root))
+            print(format_alerts_human(snapshot))
         return 0
 
-    if args.history is not None:
-        hours = args.history
-        if args.json:
-            print(format_history_json(repo_root, hours))
-        else:
-            print(format_history_human(repo_root, hours))
-        return 0
-
-    # Default: show health status
     if args.json:
-        print(format_health_json(repo_root))
+        print(format_health_json(snapshot))
     else:
-        print(format_health_human(repo_root))
+        print(format_health_human(snapshot))
     return 0
 
 
