@@ -192,7 +192,7 @@ When an agent crashes or is cancelled while building, issues can get stuck in `l
 
 ## Stuck Agent Detection
 
-`loom-stuck-detection` (post-v1.0.0) checks for stuck sweep children using `.loom/spawn-loop-state.json` task pids and `.loom/sweep-checkpoint/issue-<N>.json` checkpoint timestamps.
+`loom-stuck-detection` (post-v0.10.0) checks for stuck sweep children using `.loom/spawn-loop-state.json` task pids and `.loom/sweep-checkpoint/issue-<N>.json` checkpoint timestamps.
 
 ### Check for stuck agents
 
@@ -207,7 +207,7 @@ loom-stuck-detection check --json
 loom-stuck-detection check-issue 123
 ```
 
-### Stuck indicators (post-v1.0.0)
+### Stuck indicators (post-v0.10.0)
 
 | Indicator | Default Threshold | Description |
 |-----------|-------------------|-------------|
@@ -215,7 +215,7 @@ loom-stuck-detection check-issue 123
 | `dead_pid` | (instant) | PID in spawn-loop-state.json is no longer alive |
 | `error_spike` | 5 errors | Multiple errors in `.loom/logs/sweep-issue-N.log` |
 
-The pre-v1.0.0 indicators `missing_milestone:worktree_created` and `extended_work` were retired with the daemon brain — see [the migration guide § Per-CLI breaking changes](../../docs/migration/v1.0.0-shepherd-deprecation.md#per-cli-breaking-changes) for the field-level diff.
+The pre-v0.10.0 indicators `missing_milestone:worktree_created` and `extended_work` were retired when the Python daemon brain (`daemon_v2/`) was removed — see [the migration guide § Per-CLI breaking changes](../../docs/migration/v0.10.0-shepherd-deprecation.md#per-cli-breaking-changes) for the field-level diff. The shell-level daemon surface (`./.loom/scripts/daemon.sh`) is preserved but does not write progress files, so milestone-based heuristics no longer apply.
 
 ## Spawn-Loop Troubleshooting
 
@@ -300,7 +300,7 @@ If `.loom/locks/issue-<N>/` exists for a closed/merged issue, remove it manually
 
 ### Work generation (Architect / Hermit) not running
 
-**This is by design post-v1.0.0.** The spawn loop does not generate work — Architect and Hermit cadence is tracked under follow-up #3381. If you need new work generated automatically, run Architect/Hermit on a cron via the Phase 2a GitHub Actions pattern (`.github/workflows/loom-*.yml`); the existing five shipped workflows cover Champion / Curator / Judge / Auditor / Guide, but Architect and Hermit cron workflows are not yet shipped.
+**This is by design post-v0.10.0.** The spawn loop does not generate work — Architect and Hermit cadence is tracked under follow-up #3381. If you need new work generated automatically, run Architect/Hermit on a cron via the Phase 2a GitHub Actions pattern (`.github/workflows/loom-*.yml`); the existing five shipped workflows cover Champion / Curator / Judge / Auditor / Guide, but Architect and Hermit cron workflows are not yet shipped.
 
 For now, trigger them manually when the queue is empty:
 
