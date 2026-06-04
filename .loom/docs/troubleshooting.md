@@ -118,30 +118,24 @@ which claude
 # Install if missing (see Claude Code documentation)
 ```
 
-### Shepherd output invisible when invoked with `2>&1`
+### Sweep output invisible when invoked with `2>&1`
 
-When `loom-shepherd.sh` is run with `2>&1` redirection (e.g., from Claude Code's Bash tool for long-running processes), output may be silently dropped. This is because the Bash tool's capture buffer can be exhausted by a long-running child process when both stdout and stderr are forced through the same pipe.
+When `claude -p "/loom:sweep N"` is run with `2>&1` redirection (e.g., from Claude Code's Bash tool for long-running processes), output may be silently dropped. This is because the Bash tool's capture buffer can be exhausted by a long-running child process when both stdout and stderr are forced through the same pipe.
 
 **Workaround** — use a file redirect:
 
 ```bash
 # Redirect to file, then cat the result
-./.loom/scripts/loom-shepherd.sh 123 -m > /tmp/shepherd-123.log 2>&1
-cat /tmp/shepherd-123.log
+claude -p "/loom:sweep 123" --dangerously-skip-permissions > /tmp/sweep-123.log 2>&1
+cat /tmp/sweep-123.log
 ```
 
-**Built-in log file** — the shepherd wrapper automatically tees all output to `.loom/logs/loom-shepherd-issue-N.log`. The log path is printed on the very first line:
-
-```
-[INFO] Shepherd log: /path/to/.loom/logs/loom-shepherd-issue-123.log
-```
-
-If output is invisible in your terminal, check this log file:
+**Built-in log file** — when the spawn loop spawns a sweep child, it automatically tees all output to `.loom/logs/sweep-issue-N.log`. If output is invisible in your terminal, check this log file:
 
 ```bash
-cat .loom/logs/loom-shepherd-issue-123.log
+cat .loom/logs/sweep-issue-123.log
 # or follow in real time:
-tail -f .loom/logs/loom-shepherd-issue-123.log
+tail -f .loom/logs/sweep-issue-123.log
 ```
 
 ### API Error: 400 due to tool use concurrency issues
@@ -198,7 +192,7 @@ When an agent crashes or is cancelled while building, issues can get stuck in `l
 
 ## Stuck Agent Detection
 
-The Loom daemon automatically detects stuck or struggling agents and can trigger interventions.
+`loom-stuck-detection` (post-v1.0.0) checks for stuck sweep children using `.loom/spawn-loop-state.json` task pids and `.loom/sweep-checkpoint/issue-<N>.json` checkpoint timestamps.
 
 ### Check for stuck agents
 
@@ -209,164 +203,108 @@ loom-stuck-detection check
 # Check with JSON output
 loom-stuck-detection check --json
 
-# Check specific agent
-loom-stuck-detection check-agent shepherd-1
+# Check a specific issue
+loom-stuck-detection check-issue 123
 ```
 
-### View stuck detection status
-
-```bash
-# Show status summary
-loom-stuck-detection status
-
-# View intervention history
-loom-stuck-detection history
-loom-stuck-detection history shepherd-1
-```
-
-### Configure stuck detection thresholds
-
-```bash
-# Adjust thresholds
-loom-stuck-detection configure \
-  --idle-threshold 900 \
-  --working-threshold 2400 \
-  --intervention-mode escalate
-
-# Intervention modes: none, alert, suggest, pause, clarify, escalate
-```
-
-### Handle stuck agents
-
-```bash
-# Clear intervention for specific agent
-loom-stuck-detection clear shepherd-1
-
-# Clear all interventions
-loom-stuck-detection clear all
-
-# Resume a paused agent
-./.loom/scripts/signal.sh clear shepherd-1
-```
-
-### Stuck indicators
+### Stuck indicators (post-v1.0.0)
 
 | Indicator | Default Threshold | Description |
 |-----------|-------------------|-------------|
-| `no_progress` | 10 minutes | No output written to task output file |
-| `extended_work` | 30 minutes | Working on same issue without creating PR |
-| `looping` | 3 occurrences | Repeated similar error patterns |
-| `error_spike` | 5 errors | Multiple errors in short period |
+| `stale_heartbeat` | 5 minutes | No checkpoint update for extended time |
+| `dead_pid` | (instant) | PID in spawn-loop-state.json is no longer alive |
+| `error_spike` | 5 errors | Multiple errors in `.loom/logs/sweep-issue-N.log` |
 
-### Intervention types
+The pre-v1.0.0 indicators `missing_milestone:worktree_created` and `extended_work` were retired with the daemon brain — see [the migration guide § Per-CLI breaking changes](../../docs/migration/v1.0.0-shepherd-deprecation.md#per-cli-breaking-changes) for the field-level diff.
 
-| Type | Trigger | Action |
-|------|---------|--------|
-| `alert` | Low severity | Write to `.loom/interventions/`, human reviews |
-| `suggest` | Medium severity | Suggest role switch (e.g., Builder -> Doctor) |
-| `pause` | High severity | Auto-pause via signal.sh, requires manual restart |
-| `clarify` | Error spike | Suggest requesting clarification from issue author |
-| `escalate` | Critical | Full escalation: pause + alert + human notification |
+## Spawn-Loop Troubleshooting
 
-## Daemon Troubleshooting (Layer 2)
+The spawn loop replaces the historical daemon brain; orchestration state lives at `.loom/spawn-loop-state.json`.
 
-### Check daemon state
+### Check spawn-loop state
 
 ```bash
-# View current daemon state
-cat .loom/daemon-state.json | jq
+# View current spawn-loop state
+./.loom/scripts/spawn-loop.sh status
 
-# Check if daemon is running
-jq '.running' .loom/daemon-state.json
+# Or read the state file directly
+cat .loom/spawn-loop-state.json | jq
 
-# View active shepherds
-jq '.shepherds | to_entries[] | select(.value.issue != null)' .loom/daemon-state.json
+# Check if loop is running
+test -f .loom/spawn-loop.pid && ps -p "$(cat .loom/spawn-loop.pid)" -o pid,etime,command
+
+# List active sweep children
+jq '.running[] | {issue, pid, started_at}' .loom/spawn-loop-state.json
 ```
 
 ### Graceful shutdown
 
 ```bash
-# Signal daemon to stop
-touch .loom/stop-daemon
-
-# Monitor shutdown progress
-watch -n 5 'cat .loom/daemon-state.json | jq ".shepherds"'
+# Signal the spawn loop to stop accepting new work and drain in-flight children
+./.loom/scripts/spawn-loop.sh stop
+# or, equivalently:
+touch .loom/stop-spawn-loop
 ```
+
+The loop honors `SHUTDOWN_GRACE_SEC` (default 300s) before SIGKILL'ing any remaining sweep children.
 
 ### Force stop (use with caution)
 
 ```bash
-# Remove stop signal if exists
-rm -f .loom/stop-daemon
+# Remove stop signal if it was set but never picked up
+rm -f .loom/stop-spawn-loop
 
-# Clear daemon state (will restart fresh)
-rm -f .loom/daemon-state.json
+# Hard-kill the loop process
+test -f .loom/spawn-loop.pid && kill -9 "$(cat .loom/spawn-loop.pid)" || true
+rm -f .loom/spawn-loop.pid
 ```
 
-### Stuck shepherd
+### Stuck sweep child
+
+A sweep child whose pid is alive but whose `.loom/sweep-checkpoint/issue-<N>.json` mtime is stale is likely stuck. To recover:
 
 ```bash
-# Check shepherd assignments
-jq '.shepherds' .loom/daemon-state.json
+# Check checkpoint mtime
+ls -la .loom/sweep-checkpoint/issue-123.json
 
-# Check if assigned issue is blocked
-gh issue view <issue-number> --json labels --jq '.labels[].name'
+# Look at the child's log for errors
+tail -200 .loom/logs/sweep-issue-123.log
 
-# Manually clear stuck shepherd (daemon will reassign)
-jq '.shepherds["shepherd-1"] = {"issue": null, "idle_since": "'$(date -u +%Y-%m-%dT%H:%M:%SZ)'"}' \
-  .loom/daemon-state.json > tmp.json && mv tmp.json .loom/daemon-state.json
+# If you need to kill it manually:
+jq '.running[] | select(.issue==123) | .pid' .loom/spawn-loop-state.json | xargs -I{} kill {}
+
+# The loop will detect the dead pid on the next tick and release the claim
+# (the checkpoint survives, so the issue will resume from its last completed phase
+# the next time the loop spawns it)
 ```
 
-### Work generation not triggering
+### Spawn-loop is not picking up issues
 
-When the pipeline is empty but Architect/Hermit are not being triggered, use `loom-tools snapshot` to diagnose:
+Issues need the `loom:issue` label (human-approved, ready for work) to be eligible. If the queue looks empty but the loop is idle, check:
 
 ```bash
-# 1. Check pipeline state via loom-tools snapshot (authoritative source)
-python3 -m loom_tools.snapshot --pretty | jq '{
-  ready: .computed.total_ready,
-  needs_work_gen: .computed.needs_work_generation,
-  architect_cooldown_ok: .computed.architect_cooldown_ok,
-  hermit_cooldown_ok: .computed.hermit_cooldown_ok,
-  recommended_actions: .computed.recommended_actions
-}'
+# 1. Confirm there are ready issues
+gh issue list --label "loom:issue" --state open
 
-# Expected output when pipeline empty and work generation should trigger:
-# {
-#   "ready": 0,
-#   "needs_work_gen": true,
-#   "architect_cooldown_ok": true,
-#   "hermit_cooldown_ok": true,
-#   "recommended_actions": ["trigger_architect", "trigger_hermit", "wait"]
-# }
+# 2. Confirm the claim locks aren't stale (a previous crash may have left lock dirs)
+ls -la .loom/locks/
 
-# 2. Check if triggers have ever fired
-jq '.last_architect_trigger, .last_hermit_trigger' .loom/daemon-state.json
+# 3. Confirm the opt-in gate is set
+echo "LOOM_USE_SPAWN_LOOP=$LOOM_USE_SPAWN_LOOP"
 
-# If both are null with ready=0, work generation never triggered
-
-# 3. Verify proposal counts aren't at max
-echo "Architect proposals: $(gh issue list --label 'loom:architect' --state open --json number --jq 'length')"
-echo "Hermit proposals: $(gh issue list --label 'loom:hermit' --state open --json number --jq 'length')"
-# Max is 2 per role by default
-
-# 4. Force trigger manually (for testing)
-# Run daemon iteration with debug mode to see all decisions:
-/loom iterate --debug
+# 4. Look at recent loop activity
+tail -100 .loom/logs/spawn-loop.log
 ```
 
-**Common causes:**
+If `.loom/locks/issue-<N>/` exists for a closed/merged issue, remove it manually — the next tick will then claim that slot if a new ready issue lands.
 
-| Cause | Symptom | Solution |
-|-------|---------|----------|
-| Cooldown not elapsed | `architect_cooldown_ok: false` | Wait 30 minutes or reset timestamps |
-| Proposals at max | 2+ open `loom:architect` or `loom:hermit` issues | Promote or close existing proposals |
-| Iteration not acting on recommended_actions | `trigger_architect` in actions but `last_architect_trigger: null` | Bug in iteration - verify loom.md implementation |
+### Work generation (Architect / Hermit) not running
 
-**Reset cooldowns manually (for testing):**
+**This is by design post-v1.0.0.** The spawn loop does not generate work — Architect and Hermit cadence is tracked under follow-up #3381. If you need new work generated automatically, run Architect/Hermit on a cron via the Phase 2a GitHub Actions pattern (`.github/workflows/loom-*.yml`); the existing five shipped workflows cover Champion / Curator / Judge / Auditor / Guide, but Architect and Hermit cron workflows are not yet shipped.
+
+For now, trigger them manually when the queue is empty:
 
 ```bash
-# Reset cooldown timestamps to force immediate trigger
-jq '.last_architect_trigger = "2020-01-01T00:00:00Z" | .last_hermit_trigger = "2020-01-01T00:00:00Z"' \
-  .loom/daemon-state.json > tmp.json && mv tmp.json .loom/daemon-state.json
+claude -p "/architect" --dangerously-skip-permissions
+claude -p "/hermit"    --dangerously-skip-permissions
 ```

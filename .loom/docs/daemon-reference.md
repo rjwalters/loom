@@ -1,298 +1,60 @@
-# Loom Daemon Reference
+# Loom Daemon Reference (Deprecated)
 
-Detailed configuration and state management for the Loom daemon (Layer 2).
+> **Status: DEPRECATED.** The Python `loom-daemon` brain and `/shepherd`
+> orchestrator are being deleted in Loom **v1.0.0** as part of the
+> shepherd/daemon deprecation epic (#3372). The historical contents of this
+> page — `ISSUE_THRESHOLD` / `MAX_SHEPHERDS` tuning tables, the
+> `daemon-state.json` schema, session-rotation procedures, shepherd
+> pool sizing, etc. — described a brain that no longer exists.
 
-## Daemon Configuration Parameters
+If you are looking for the replacements, see:
 
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| `ISSUE_THRESHOLD` | 3 | Trigger Architect/Hermit when `loom:issue` count below this |
-| `MAX_PROPOSALS` | 5 | Maximum pending proposal issues |
-| `MAX_SHEPHERDS` | 10 | Maximum concurrent shepherd processes |
-| `ISSUES_PER_SHEPHERD` | 2 | Scale factor: target = ready_issues / ISSUES_PER_SHEPHERD |
-| `POLL_INTERVAL` | 30 | Seconds between full daemon loop iterations |
-| `ISSUE_STRATEGY` | fifo | Issue selection strategy (see below) |
-| `ARCHITECT_COOLDOWN` | 1800 | Seconds between Architect role triggers (30 min) |
-| `HERMIT_COOLDOWN` | 1800 | Seconds between Hermit role triggers (30 min) |
-| `MAX_ARCHITECT_PROPOSALS` | 2 | Maximum open `loom:architect` proposals before stopping triggers |
-| `MAX_HERMIT_PROPOSALS` | 2 | Maximum open `loom:hermit` proposals before stopping triggers |
-| `GUIDE_INTERVAL` | 900 | Seconds between Guide role re-triggers (15 min) |
-| `CHAMPION_INTERVAL` | 600 | Seconds between Champion role re-triggers (10 min) |
-| `DOCTOR_INTERVAL` | 300 | Seconds between Doctor role re-triggers (5 min) |
-| `AUDITOR_INTERVAL` | 600 | Seconds between Auditor role re-triggers (10 min) |
-| `JUDGE_INTERVAL` | 300 | Seconds between Judge role re-triggers (5 min) |
-| `SPAWN_STAGGER` | 3 | Seconds between shepherd spawns to avoid auth cache contention |
+| Old (deprecated) | New (supported) | Where |
+|------------------|-----------------|-------|
+| `./.loom/scripts/daemon.sh start` / Python `loom-daemon` CLI | `LOOM_USE_SPAWN_LOOP=1 ./.loom/scripts/spawn-loop.sh start` | [Spawn-loop mode](../../CLAUDE.md#3-spawn-loop-mode-phase-1-opt-in) |
+| `.loom/daemon-state.json` | `.loom/spawn-loop-state.json` | Written by `spawn-loop.sh`; see [`spawn-loop.sh status`](../../.loom/scripts/spawn-loop.sh) |
+| `.loom/progress/shepherd-*.json` heartbeats | `.loom/sweep-checkpoint/issue-<N>.json` (#3373) | Written by `/loom:sweep` |
+| `/shepherd <issue>` slash command | `/loom:sweep <issue>` | `.claude/commands/loom/sweep.md` |
+| Support-role daemons (Champion, Curator, Judge, Auditor, Guide) | GitHub Actions cron workflows | `.github/workflows/loom-*.yml` (#3375) |
 
-## Work Generation
+For the migration narrative — including per-CLI breaking changes, how to
+enable the spawn loop, and how to opt in to the GitHub Actions workflows —
+see [`docs/migration/v1.0.0-shepherd-deprecation.md`](../../docs/migration/v1.0.0-shepherd-deprecation.md).
 
-The daemon automatically triggers Architect and Hermit roles when the pipeline is empty. This keeps development flowing without manual intervention.
+For the engineering inventory that drove the deletion decisions (which
+consumers retire, which port, which are unchanged), see
+[`docs/migration/daemon-state-consumers.md`](../../docs/migration/daemon-state-consumers.md).
 
-### When Work Generation Triggers
+## Why this file is intentionally minimal
 
-Work generation (Architect/Hermit) triggers when ALL conditions are met:
+The legacy schema and tuning advice on this page were a pre-Phase-3 reference
+for a multi-process Python daemon that polled the forge, scaled a
+`shepherd-N` pool, ran work-generation triggers (Architect/Hermit), and
+maintained a JSON state file as the canonical source of truth. None of that
+exists post-v1.0.0:
 
-| Condition | Threshold | Rationale |
-|-----------|-----------|-----------|
-| `ready_issues < ISSUE_THRESHOLD` | 3 | Pipeline needs more work |
-| `proposals < MAX_*_PROPOSALS` | 2 per role | Don't flood with proposals |
-| `cooldown_elapsed > *_COOLDOWN` | 1800s (30min) | Avoid thrashing |
+- The spawn loop has **no work-generation triggers** — Architect and Hermit
+  cadence is out of scope for Phase 1 and tracked under follow-up #3381.
+- The spawn loop **does not maintain a shepherd-N pool**. Each ready issue
+  detaches its own `claude -p "/loom:sweep N"` child; concurrency is bounded
+  by `MAX_PARALLEL` only.
+- The spawn loop **does not track `pipeline_state`, `warnings`,
+  `completed_issues`, `total_prs_merged`, or `last_*_trigger`**. The forge
+  is the source of truth for pipeline state; failure counters live in
+  `.loom/tokens/.failure_counts` (token-rotation only).
+- Support roles are **cron-driven** under GitHub Actions, not long-running
+  processes — there is no `JUDGE_INTERVAL` / `CHAMPION_INTERVAL` / etc. to
+  tune from a daemon config.
 
-### Work Generation Flow
+Re-creating a "compatibility-shape" `daemon-state.json` from the spawn loop
+was considered and rejected — see the rationale in
+`docs/migration/daemon-state-consumers.md` §"Conclusion: what Phase 3 deletes
+vs preserves".
 
-```
-Pipeline Check:
-  └── ready_issues < 3?
-      └── YES: Check Architect
-          ├── proposals < 2?
-          ├── cooldown elapsed > 30min?
-          └── ALL YES → Spawn Architect Task
-                └── Architect creates proposal with loom:architect label
-                └── Champion evaluates and promotes to loom:issue (or human approves)
+## Rust `loom-daemon` (unrelated, still supported)
 
-      └── YES: Check Hermit (same conditions)
-          └── Spawn Hermit Task
-                └── Hermit creates proposal with loom:hermit label
-                └── Champion evaluates and promotes to loom:issue (or human approves)
-```
-
-### Verifying Work Generation
-
-Use `loom-tools snapshot` to check work generation state:
-
-```bash
-# Check if work generation should trigger
-python3 -m loom_tools.snapshot --pretty | jq '{
-  ready: .computed.total_ready,
-  needs_work_gen: .computed.needs_work_generation,
-  architect_cooldown_ok: .computed.architect_cooldown_ok,
-  hermit_cooldown_ok: .computed.hermit_cooldown_ok,
-  recommended_actions: .computed.recommended_actions
-}'
-
-# Check trigger timestamps
-jq '.last_architect_trigger, .last_hermit_trigger' .loom/daemon-state.json
-```
-
-### Forcing Work Generation (Testing)
-
-```bash
-# Reset cooldowns to force immediate trigger
-jq '.last_architect_trigger = "2020-01-01T00:00:00Z" | .last_hermit_trigger = "2020-01-01T00:00:00Z"' \
-  .loom/daemon-state.json > tmp.json && mv tmp.json .loom/daemon-state.json
-
-# Run iteration to trigger
-/loom iterate --debug
-```
-
-## Issue Selection Strategy
-
-Set via `LOOM_ISSUE_STRATEGY` environment variable. Controls the order in which shepherds pick up issues from the ready queue. The `loom:urgent` label always takes precedence regardless of strategy.
-
-| Strategy | Description |
-|----------|-------------|
-| `fifo` | **Default.** Oldest issues first (FIFO). Prevents starvation where new issues indefinitely deprioritize older ones. |
-| `lifo` | Newest issues first (LIFO). Original GitHub CLI default behavior. |
-| `priority` | Same as `fifo` but explicitly named. Issues with `loom:urgent` label first (oldest to newest), then remaining issues oldest to newest. |
-
-**Priority behavior:**
-- Issues with `loom:urgent` label are **always** processed first, regardless of strategy
-- Within the urgent partition, issues are sorted by age (oldest first)
-- Non-urgent issues are then sorted according to the selected strategy
-
-**Example:**
-```bash
-# Use FIFO (default) - prevents issue starvation
-LOOM_ISSUE_STRATEGY=fifo /loom
-
-# Use LIFO - newest issues first (for fast iteration)
-LOOM_ISSUE_STRATEGY=lifo /loom
-
-# Priority mode - explicit about urgent-first ordering
-LOOM_ISSUE_STRATEGY=priority /loom
-```
-
-## Batch Orchestration (Merge Mode)
-
-In the default issue lifecycle, a human must manually promote `loom:curated` issues to `loom:issue` before Builders can claim them. This human gate ensures oversight but becomes a bottleneck during high-throughput batch sessions.
-
-**Merge mode** (`--merge`) solves this by automating the approval gate:
-
-```
-Normal mode:   Curator → loom:curated → [human promotes] → loom:issue → Builder claims
-Merge mode:    Curator → loom:curated → [Champion auto-promotes] → loom:issue → Builder claims
-```
-
-When `--merge` is active:
-1. **Champion auto-promotes** all `loom:curated` issues to `loom:issue` using a simplified quality check (problem statement, at least one acceptance criterion, no `loom:blocked`) as a substitute for human review
-2. **Shepherds skip Gate 1** (the human approval check), proceeding directly from curation to building
-3. **Shepherds auto-merge** PRs after Judge approval (skip the manual merge gate)
-4. All auto-promoted items are marked with `[force-mode]` in their audit trail for traceability
-
-**Why no `loom:approved` label?** The `loom:issue` label already means "approved for work" (see `.github/labels.yml`). In normal mode, a human adds it; in merge mode, Champion adds it. The same label serves both cases, keeping the state machine simple. Adding a separate `loom:approved` label would require updating every agent that currently checks for `loom:issue` and would complicate the already-working workflow with no functional benefit.
-
-**Starting a batch session:**
-
-```bash
-# Start daemon with merge mode (implies --auto-build)
-./.loom/scripts/daemon.sh start --auto-build
-/loom --merge
-
-# Or combine in one step
-LOOM_FORCE_MODE=true ./.loom/scripts/daemon.sh start --auto-build
-```
-
-**Safety guarantees in merge mode:**
-- Judge review is never skipped (GitHub API prevents self-review, so label-based review always runs)
-- `loom:blocked` issues are respected (not auto-promoted)
-- Force-push and other destructive operations remain blocked
-- All actions are auditable via `[force-mode]` markers
-
-## Daemon State File
-
-The daemon state file (`.loom/daemon-state.json`) provides comprehensive information for debugging, crash recovery, and system observability.
-
-### Full State Structure
-
-```json
-{
-  "started_at": "2026-01-23T10:00:00Z",
-  "last_poll": "2026-01-23T11:30:00Z",
-  "running": true,
-  "iteration": 42,
-
-  "shepherds": {
-    "shepherd-1": {
-      "status": "working",
-      "issue": 123,
-      "task_id": "abc123",
-      "output_file": "/tmp/claude/.../abc123.output",
-      "started": "2026-01-23T10:15:00Z",
-      "last_phase": "builder",
-      "pr_number": null
-    },
-    "shepherd-2": {
-      "status": "idle",
-      "issue": null,
-      "idle_since": "2026-01-23T11:00:00Z",
-      "idle_reason": "no_ready_issues",
-      "last_issue": 100,
-      "last_completed": "2026-01-23T10:58:00Z"
-    }
-  },
-
-  "pipeline_state": {
-    "ready": ["#1083", "#1080"],
-    "building": ["#1044"],
-    "review_requested": ["PR #1056"],
-    "changes_requested": ["PR #1059"],
-    "ready_to_merge": ["PR #1058"],
-    "blocked": [
-      {
-        "type": "pr",
-        "number": 1059,
-        "reason": "merge_conflicts",
-        "detected_at": "2026-01-23T11:20:00Z"
-      }
-    ],
-    "last_updated": "2026-01-23T11:30:00Z"
-  },
-
-  "warnings": [
-    {
-      "time": "2026-01-23T11:10:00Z",
-      "type": "blocked_pr",
-      "severity": "warning",
-      "message": "PR #1059 has merge conflicts",
-      "context": {"pr_number": 1059, "requires_role": "doctor"},
-      "acknowledged": false
-    }
-  ],
-
-  "completed_issues": [100, 101, 102],
-  "total_prs_merged": 3,
-  "last_architect_trigger": "2026-01-23T10:00:00Z",
-  "last_hermit_trigger": "2026-01-23T10:30:00Z"
-}
-```
-
-### Shepherd Status Values
-
-- `working` - Actively processing an issue
-- `idle` - No issue assigned, waiting for work
-- `errored` - Encountered an error, may need intervention
-- `paused` - Manually paused via signal or stuck detection
-
-### Idle Reasons
-
-- `no_ready_issues` - No issues with `loom:issue` label available
-- `at_capacity` - All shepherd slots filled
-- `completed_issue` - Just finished an issue, waiting for next
-- `rate_limited` - Paused due to API rate limits
-- `shutdown_signal` - Paused due to graceful shutdown
-
-### Warning Types
-
-- `blocked_pr` - PR has merge conflicts or failed checks
-- `shepherd_error` - Shepherd encountered recoverable error
-- `role_failure` - Support role failed to complete
-- `stuck_agent` - Agent detected as stuck
-
-## Session Rotation
-
-When a new daemon session starts, the existing `daemon-state.json` is automatically rotated to preserve session history:
-
-```
-.loom/
-├── daemon-state.json          # Current session (always this name)
-├── 00-daemon-state.json       # First archived session
-├── 01-daemon-state.json       # Second archived session
-├── 02-daemon-state.json       # Third archived session
-└── ...
-```
-
-**Why session rotation?**
-- Debugging patterns across multiple sessions
-- Analyzing daemon behavior over time
-- Post-mortem analysis when issues occur
-- Understanding long-term trends in the development pipeline
-
-**Configuration**:
-- `LOOM_MAX_ARCHIVED_SESSIONS` - Maximum sessions to keep (default: 10)
-
-**Commands**:
-```bash
-# Preview session rotation
-./.loom/scripts/rotate-daemon-state.sh --dry-run
-
-# Manually prune old sessions
-./.loom/scripts/daemon-cleanup.sh prune-sessions
-
-# Keep more archived sessions
-./.loom/scripts/rotate-daemon-state.sh --max-sessions 20
-```
-
-Archived sessions include a `session_summary` field with final statistics:
-```json
-{
-  "session_summary": {
-    "session_id": 5,
-    "archived_at": "2026-01-24T15:30:00Z",
-    "issues_completed": 12,
-    "prs_merged": 10,
-    "total_iterations": 156
-  }
-}
-```
-
-## Required Terminal Configuration
-
-| Terminal ID | Role | Purpose |
-|-------------|------|---------|
-| shepherd-1, shepherd-2, shepherd-3 | shepherd.md | Issue orchestration pool |
-| terminal-architect | architect.md | Work generation (proposals) |
-| terminal-hermit | hermit.md | Simplification proposals |
-| terminal-guide | guide.md | Backlog triage (always running) |
-| terminal-champion | champion.md | Auto-merge (always running) |
-| terminal-doctor | doctor.md | PR conflict resolution (always running) |
-| terminal-auditor | auditor.md | Main branch validation (always running) |
-| terminal-judge | judge.md | PR review (always running) |
+This page is about the deleted **Python** `loom-daemon` CLI. The **Rust**
+binary at `loom-daemon/` (Tauri-side IPC daemon, tmux session manager) is a
+different component and is unaffected by Phase 3. Its source lives in
+`loom-daemon/src/`, its tests in `loom-daemon/tests/`, and its release
+artifacts ship with the rest of the Tauri quickstart.

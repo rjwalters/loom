@@ -11,29 +11,31 @@ Loom is a CLI + daemon for AI-powered development orchestration. It coordinates 
 
 **Loom Repository**: https://github.com/rjwalters/loom
 
-## Three-Layer Architecture
+## Orchestration Architecture
+
+Loom decomposes development into three coordination tiers, with the forge (GitHub / Gitea) as the shared state.
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
-│                    Layer 3: Human Observer                      │
-│  - Watches system health and intervenes when needed             │
+│                    Tier 3: Human Observer                       │
+│  - Watches system health, intervenes on blocked work            │
 │  - Overrides Champion on controversial proposals                │
 └─────────────────────────────────────────────────────────────────┘
                               │ observes/intervenes
                               ▼
 ┌─────────────────────────────────────────────────────────────────┐
-│                    Layer 2: Loom Daemon                         │
-│  /loom - Continuous system orchestrator                         │
-│  - Monitors state, generates work, scales shepherds             │
+│              Tier 2: Spawn loop + GitHub Actions cron           │
+│  spawn-loop.sh — claims ready issues, spawns sweep children     │
+│  .github/workflows/loom-*.yml — periodic support roles          │
 └─────────────────────────────────────────────────────────────────┘
-                              │ spawns/manages
+                              │ spawns/triggers
                               ▼
 ┌─────────────────────────────────────────────────────────────────┐
-│                    Layer 1: Shepherds                           │
-│  /shepherd <issue> - Single-issue lifecycle orchestrator        │
-│  - Coordinates: Curator → Builder → Judge → Doctor → Merge      │
+│                    Tier 1: /loom:sweep <issue>                  │
+│  Single-issue lifecycle: Curator → Builder → Judge → Doctor →   │
+│  Merge. One detached process per issue. Mode C: PR-set sweeps.  │
 └─────────────────────────────────────────────────────────────────┘
-                              │ triggers
+                              │ dispatches
                               ▼
 ┌─────────────────────────────────────────────────────────────────┐
 │                    Worker Roles                                 │
@@ -42,15 +44,16 @@ Loom is a CLI + daemon for AI-powered development orchestration. It coordinates 
 └─────────────────────────────────────────────────────────────────┘
 ```
 
-| Layer | Role | Purpose | Mode |
-|-------|------|---------|------|
-| Layer 3 | Human | Oversight - approve proposals, handle edge cases | Observer |
-| Layer 2 | `/loom` | System orchestration - work generation, shepherd scaling | Continuous daemon |
-| Layer 1 | `/shepherd <issue>` | Issue orchestration - lifecycle from creation to merge | Per-issue |
-| Layer 0 | `/builder`, `/judge`, etc. | Task execution - single focused work units | Per-task |
+| Tier | Entry point | Purpose | Mode |
+|------|-------------|---------|------|
+| Tier 3 | Human | Oversight — approve proposals, handle edge cases | Observer |
+| Tier 2 | `./.loom/scripts/spawn-loop.sh` + GH Actions cron | Multi-issue batch + scheduled support roles | Continuous / cron |
+| Tier 1 | `/loom:sweep <issue>` | Single-issue lifecycle (Curator → Merge) | Per-issue |
+| Tier 0 | `/builder`, `/judge`, etc. | Task execution — single focused work units | Per-task |
 
-**Use `/shepherd <issue>`** when you have a specific issue to implement.
-**Use `/loom`** for fully autonomous development with work generation.
+**Use `/loom:sweep <issue>`** when you have a specific issue to implement (interactively or from a script).
+**Use `LOOM_USE_SPAWN_LOOP=1 ./.loom/scripts/spawn-loop.sh start`** for multi-issue autonomous batches.
+**Enable the GitHub Actions cron workflows** under `.github/workflows/loom-*.yml` for periodic Champion / Curator / Judge / Auditor / Guide ticks.
 
 ## Usage Modes
 
@@ -62,27 +65,27 @@ Use Claude Code terminals with specialized roles for hands-on development:
 2. Use slash commands: `/builder`, `/judge`, `/curator`, etc.
 3. Each terminal acts as a specialized agent
 
-### 2. Daemon Mode (Layer 2)
+### 2. Single-issue lifecycle: `/loom:sweep <issue>`
 
-```bash
-./.loom/scripts/daemon.sh start                  # auto-build enabled (default)
-./.loom/scripts/daemon.sh start --no-auto-build  # support roles only
+Run a complete Curator → Builder → Judge → Doctor → Merge lifecycle on one issue:
+
+```text
+/loom:sweep 123
 ```
 
+Or from a script:
+
 ```bash
-/loom           # Activate daemon orchestration (daemon must be started first)
-/loom --merge   # Aggressive autonomous development
+claude -p "/loom:sweep 123" --dangerously-skip-permissions
 ```
 
-**Default mode** (no flags): Daemon manages support roles (judge, champion, doctor, auditor, curator, guide) AND auto-spawns shepherds from the `loom:issue` queue. Once orchestration is activated via `/loom`, issues are picked up and built automatically.
+Sweep also has a **PR-set mode (Mode C, #3384)** that drives Judge / Doctor → Judge / Merge from an existing open-PR set without re-running Curator or Builder:
 
-**Support-only mode** (`--no-auto-build` flag): Daemon manages support roles only. Shepherds are NOT auto-spawned. Use `/shepherd <N>` to shepherd specific issues manually. The `--auto-build` / `-a` flag is retained for backward compatibility but is now a no-op (already the default).
+```text
+/loom:sweep --prs 456 789
+```
 
-**Merge Mode** enables: auto-promotion of proposals, auto-merge after Judge approval, audit trail with `[force-mode]` markers, safety guardrails still apply. Merge mode does **not** skip the Judge phase (code review always runs due to GitHub's self-review API restriction). Merge mode implies `--auto-build`.
-
-**Batch Orchestration Pattern**: In normal mode, the `loom:curated` -> `loom:issue` transition requires a human to promote the issue (the human approval gate). In batch/high-throughput sessions, use `--merge` mode to have Champion auto-promote `loom:curated` issues to `loom:issue`, replacing the manual gate with Champion's automated quality evaluation. No separate `loom:approved` label is needed -- `--merge` makes the existing lifecycle fully automatic.
-
-**Graceful shutdown**: `./.loom/scripts/daemon.sh stop` (or `touch .loom/stop-daemon`)
+Checkpoints (#3373) under `.loom/sweep-checkpoint/issue-<N>.json` survive crashes — restarting `/loom:sweep N` resumes from the last completed phase.
 
 ### 3. Spawn-Loop Mode (Phase 1, opt-in)
 
@@ -120,29 +123,24 @@ Architect and Hermit cadence (work-generation triggers) is intentionally out of 
 
 ## Agent Roles
 
-### Orchestration Roles
-
-| Role | File | Purpose |
-|------|------|---------|
-| Loom Daemon | `loom.md` | System orchestration, work generation (Layer 2) |
-| Shepherd | `shepherd.md` | Single-issue lifecycle orchestration (Layer 1) |
-
 ### Worker Roles
 
 | Role | File | Purpose | Mode |
 |------|------|---------|------|
 | Builder | `builder.md` | Implement features and fixes | Manual |
-| Judge | `judge.md` | Evaluate pull requests | Autonomous 5min |
-| Champion | `champion.md` | Evaluate proposals, auto-merge PRs | Autonomous 10min |
-| Curator | `curator.md` | Enhance and organize issues | Autonomous 5min |
-| Architect | `architect.md` | Create architectural proposals | Autonomous 15min |
-| Hermit | `hermit.md` | Identify simplification opportunities | Autonomous 15min |
+| Judge | `judge.md` | Evaluate pull requests | Cron 5min (GH Actions) |
+| Champion | `champion.md` | Evaluate proposals, auto-merge PRs | Cron 10min (GH Actions) |
+| Curator | `curator.md` | Enhance and organize issues | Cron 5min (GH Actions) |
+| Architect | `architect.md` | Create architectural proposals | Manual (cadence #3381) |
+| Hermit | `hermit.md` | Identify simplification opportunities | Manual (cadence #3381) |
 | Doctor | `doctor.md` | Fix bugs and address PR feedback | Manual |
-| Guide | `guide.md` | Prioritize and triage issues | Autonomous 15min |
+| Guide | `guide.md` | Prioritize and triage issues | Cron 15min (GH Actions) |
 | Driver | `driver.md` | Direct command execution | Manual |
-| Auditor | `auditor.md` | Validate main branch build and runtime | Autonomous 10min |
+| Auditor | `auditor.md` | Validate main branch build and runtime | Cron 10min (GH Actions) |
 
-Full role definitions: `.loom/roles/*.md`
+Full role definitions: `.loom/roles/*.md`.
+
+> **Note**: the historical `loom.md` (daemon brain) and `shepherd.md` (single-issue orchestrator) role files were removed in v1.0.0 along with the `/shepherd` slash command — see [the migration guide](docs/migration/v1.0.0-shepherd-deprecation.md). Their orchestration responsibilities moved to `/loom:sweep` (Tier 1) and the spawn loop + GH Actions cron (Tier 2). The worker-role markdown files above are unchanged.
 
 ## Label-Based Workflow
 
@@ -213,9 +211,9 @@ gh pr create --label "loom:review-requested"
 
 ## Development Workflow
 
-### Shepherd Lifecycle (MANDATORY)
+### Sweep Lifecycle (MANDATORY)
 
-When implementing issues — whether manually, via `/shepherd`, or by spawning subagents — **all stages of the shepherd lifecycle must be executed in order**. Do not skip stages.
+When implementing issues — whether manually, via `/loom:sweep`, or by spawning subagents — **all stages of the lifecycle must be executed in order**. Do not skip stages.
 
 ```
 Curator → Builder → Judge → Doctor (if needed) → Merge
@@ -229,9 +227,9 @@ Curator → Builder → Judge → Doctor (if needed) → Merge
 | **Doctor** | Fix issues from judge feedback | Only if judge approves |
 | **Merge** | Champion auto-merges approved PRs | No |
 
-**When spawning subagents to shepherd issues**: each subagent must run the full lifecycle, not just the builder phase. If parallelizing multiple issues, each agent must independently execute Curator → Builder → Judge → Doctor → Merge. Simply creating a PR and labeling it `loom:review-requested` is only the Builder stage — the work is not complete until the PR has been reviewed and merged.
+**When spawning subagents to handle an issue**: each subagent must run the full lifecycle, not just the builder phase. If parallelizing multiple issues, each agent must independently execute Curator → Builder → Judge → Doctor → Merge. Simply creating a PR and labeling it `loom:review-requested` is only the Builder stage — the work is not complete until the PR has been reviewed and merged.
 
-**When using `/shepherd`**: the skill handles this automatically. Prefer `/shepherd <issue>` over manual orchestration to avoid accidentally skipping stages.
+**When using `/loom:sweep`**: the skill handles all stages automatically. Prefer `/loom:sweep <issue>` over manual orchestration to avoid accidentally skipping stages.
 
 ### Builder Workflow
 
@@ -258,7 +256,7 @@ Curator → Builder → Judge → Doctor (if needed) → Merge
 
 ### Overnight / long-running orchestration: keep the host awake (#3350)
 
-`/sweep`, `/loom`, and `/shepherd` automatically run `./.loom/scripts/check-host-sleep.sh` at startup and warn when the host can sleep. This is **advisory only** — Loom never blocks on it. Heed the warning before walking away from a long run.
+`/loom:sweep` and the spawn loop automatically run `./.loom/scripts/check-host-sleep.sh` at startup and warn when the host can sleep. This is **advisory only** — Loom never blocks on it. Heed the warning before walking away from a long run.
 
 - **macOS:** user-idle sleep assertions (Amphetamine, `caffeinate -dimsu`, etc.) do **not** reliably defeat Maintenance Sleep on Apple Silicon. Use `sudo pmset -c sleep 0` for AC-only sleep disable, or flip your sleep manager's "allow system sleep when display is off" toggle to OFF.
 - **systemd Linux:** wrap the session in `systemd-inhibit --what=idle:sleep --who=loom --why=loom -- <cmd>`.
@@ -290,276 +288,43 @@ Configuration stored in `.loom/config.json` (committed to git for team sharing):
 }
 ```
 
-### Daemon Configuration
+### Spawn-Loop Configuration
 
-See `.loom/docs/daemon-reference.md` for detailed daemon configuration including:
-- Configuration parameters (ISSUE_THRESHOLD, MAX_SHEPHERDS, etc.)
-- Issue selection strategies (fifo, lifo, priority)
-- Daemon state file structure
-- Session rotation
+The spawn loop replaces the historical daemon brain. See [`.loom/docs/daemon-reference.md`](.loom/docs/daemon-reference.md) for the deprecation stub and [`docs/migration/v1.0.0-shepherd-deprecation.md`](docs/migration/v1.0.0-shepherd-deprecation.md) for the migration guide.
 
-**Daemon State File** (`.loom/daemon-state.json`):
-
-The daemon state file provides comprehensive information for debugging, crash recovery, and system observability.
+**State file** (`.loom/spawn-loop-state.json`, gitignored):
 
 ```json
 {
-  "started_at": "2026-01-23T10:00:00Z",
-  "last_poll": "2026-01-23T11:30:00Z",
-  "running": true,
-  "iteration": 42,
-  "daemon_session_id": "1706400000-12345",
-
-  "shepherds": {
-    "shepherd-1": {
-      "status": "working",
-      "issue": 123,
-      "task_id": "abc123",
-      "output_file": "/tmp/claude/.../abc123.output",
-      "started": "2026-01-23T10:15:00Z",
-      "last_phase": "builder",
-      "pr_number": null
-    },
-    "shepherd-2": {
-      "status": "idle",
-      "issue": null,
-      "idle_since": "2026-01-23T11:00:00Z",
-      "idle_reason": "no_ready_issues",
-      "last_issue": 100,
-      "last_completed": "2026-01-23T10:58:00Z"
-    }
-  },
-
-  "pipeline_state": {
-    "ready": ["#1083", "#1080"],
-    "building": ["#1044"],
-    "review_requested": ["PR #1056"],
-    "changes_requested": ["PR #1059"],
-    "ready_to_merge": ["PR #1058"],
-    "blocked": [
-      {
-        "type": "pr",
-        "number": 1059,
-        "reason": "merge_conflicts",
-        "detected_at": "2026-01-23T11:20:00Z"
-      }
-    ],
-    "last_updated": "2026-01-23T11:30:00Z"
-  },
-
-  "warnings": [
+  "started_at": "2026-06-04T10:00:00Z",
+  "running": [
     {
-      "time": "2026-01-23T11:10:00Z",
-      "type": "blocked_pr",
-      "severity": "warning",
-      "message": "PR #1059 has merge conflicts",
-      "context": {"pr_number": 1059, "requires_role": "doctor"},
-      "acknowledged": false
+      "issue": 123,
+      "pid": 49281,
+      "started_at": "2026-06-04T10:15:00Z",
+      "token": "agent-3.token"
     }
-  ],
-
-  "completed_issues": [100, 101, 102],
-  "total_prs_merged": 3,
-  "last_architect_trigger": "2026-01-23T10:00:00Z",
-  "last_hermit_trigger": "2026-01-23T10:30:00Z"
-}
-```
-
-**Shepherd Status Values**:
-- `working` - Actively processing an issue
-- `idle` - No issue assigned, waiting for work
-- `errored` - Encountered an error, may need intervention
-- `paused` - Manually paused via signal or stuck detection
-
-**Idle Reasons**:
-- `no_ready_issues` - No issues with `loom:issue` label available
-- `at_capacity` - All shepherd slots filled
-- `completed_issue` - Just finished an issue, waiting for next
-- `rate_limited` - Paused due to API rate limits
-- `shutdown_signal` - Paused due to graceful shutdown
-
-**Warning Types**:
-- `blocked_pr` - PR has merge conflicts or failed checks
-- `shepherd_error` - Shepherd encountered recoverable error
-- `role_failure` - Support role failed to complete
-- `stuck_agent` - Agent detected as stuck
-
-### Shepherd Progress Milestones
-
-Shepherds report progress milestones to `.loom/progress/` for daemon visibility. This enables:
-- Real-time progress monitoring without parsing output files
-- Heartbeat-based stuck detection (more reliable than file timestamps)
-- Phase-level visibility into shepherd activity
-- Better debugging when issues arise
-
-**Progress File** (`.loom/progress/shepherd-{task_id}.json`):
-
-```json
-{
-  "task_id": "a7dc1e0",
-  "issue": 123,
-  "mode": "default",
-  "started_at": "2026-01-25T10:00:00Z",
-  "current_phase": "builder",
-  "last_heartbeat": "2026-01-25T10:15:00Z",
-  "status": "working",
-  "milestones": [
-    {"event": "started", "timestamp": "2026-01-25T10:00:00Z", "data": {"issue": 123, "mode": "default"}},
-    {"event": "phase_entered", "timestamp": "2026-01-25T10:01:00Z", "data": {"phase": "curator"}},
-    {"event": "phase_entered", "timestamp": "2026-01-25T10:05:00Z", "data": {"phase": "builder"}},
-    {"event": "worktree_created", "timestamp": "2026-01-25T10:06:00Z", "data": {"path": ".loom/worktrees/issue-123"}},
-    {"event": "heartbeat", "timestamp": "2026-01-25T10:15:00Z", "data": {"action": "running tests"}}
   ]
 }
 ```
 
-**Milestone Events**:
+That's the entire schema. Pipeline state, warnings, completed-issue history, and work-generation cooldowns are not tracked here — the forge is the source of truth for queue state, and the spawn loop is intentionally minimal (see `docs/migration/daemon-state-consumers.md` for the design rationale).
 
-| Event | When | Data |
-|-------|------|------|
-| `started` | Shepherd begins orchestration | `issue`, `mode` |
-| `phase_entered` | Enters new orchestration phase | `phase` (curator, builder, judge, etc.) |
-| `phase_completed` | Phase finishes processing | `phase`, `duration_seconds`, `status` |
-| `worktree_created` | Worktree created for issue | `path` |
-| `first_commit` | First commit made in worktree | `sha` |
-| `pr_created` | Pull request created | `pr_number` |
-| `heartbeat` | Periodic during long operations | `action` (description) |
-| `completed` | Orchestration finished | `pr_merged` |
-| `blocked` | Work is blocked | `reason`, `details` |
-| `error` | Encountered an error | `error`, `will_retry` |
-| `judge_retry` | Judge phase retry attempted | `attempt`, `max_retries`, `reason` |
-| `checkpoint_saved` | Builder checkpoint written | `stage`, `recovery_path`, `details` |
-| `checkpoint_loaded` | Resuming from checkpoint | `stage`, `recovery_path`, `skip_stages` |
+**Tunables (env)**:
 
-**Reporting Milestones**:
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `MAX_PARALLEL` | 3 | Maximum concurrent `/loom:sweep` children |
+| `POLL_INTERVAL` | 30 | Seconds between `loom:issue` polls |
+| `SHUTDOWN_GRACE_SEC` | 300 | Seconds to wait for in-flight children at shutdown |
+| `LOOM_USE_SPAWN_LOOP` | (unset) | Opt-in gate, required to start the loop |
+| `LOOM_REPO` | (auto) | Override remote auto-detection (`owner/repo`) |
 
-Shepherds use the `report-milestone.sh` script:
+**Sweep checkpoints** (`.loom/sweep-checkpoint/issue-<N>.json`, gitignored):
 
-```bash
-# Report shepherd started (mode is "default", "force", or "wait")
-./.loom/scripts/report-milestone.sh started --task-id abc123 --issue 42 --mode default
+When a sweep child crashes mid-flight, the checkpoint records the last completed phase. On the next spawn the sweep skill resumes from that phase. The exact schema is owned by the sweep skill (#3373) and is not part of the spawn loop's public surface.
 
-# Report phase transition
-./.loom/scripts/report-milestone.sh phase_entered --task-id abc123 --phase builder
-
-# Report phase completion
-./.loom/scripts/report-milestone.sh phase_completed --task-id abc123 --phase builder --duration-seconds 120 --status success
-
-# Report heartbeat during long operation
-./.loom/scripts/report-milestone.sh heartbeat --task-id abc123 --action "running tests"
-
-# Report PR created
-./.loom/scripts/report-milestone.sh pr_created --task-id abc123 --pr-number 456
-
-# Report completion
-./.loom/scripts/report-milestone.sh completed --task-id abc123 --pr-merged
-
-# Report error (with retry)
-./.loom/scripts/report-milestone.sh error --task-id abc123 --error "build failed" --will-retry
-
-# Report judge retry
-./.loom/scripts/report-milestone.sh judge_retry --task-id abc123 --attempt 1 --max-retries 3 --reason "no review submitted"
-```
-
-**Daemon Snapshot Integration**:
-
-The `loom-tools snapshot` command includes shepherd progress in its output:
-
-```json
-{
-  "shepherds": {
-    "progress": [
-      {
-        "task_id": "a7dc1e0",
-        "issue": 123,
-        "current_phase": "builder",
-        "last_heartbeat": "2026-01-25T10:15:00Z",
-        "status": "working",
-        "heartbeat_age_seconds": 45,
-        "heartbeat_stale": false
-      }
-    ],
-    "stale_heartbeat_count": 0
-  }
-}
-```
-
-**Stuck Detection with Milestones**:
-
-The `loom-stuck-detection` command uses milestones for more accurate detection:
-
-| Indicator | Threshold | Description |
-|-----------|-----------|-------------|
-| `stale_heartbeat` | 2 minutes | No heartbeat for extended time |
-| `missing_milestone:worktree_created` | 5 minutes | Expected worktree not created |
-| `extended_work` | 30 minutes | Same phase for too long |
-
-**Progress File Cleanup**:
-
-Progress files are automatically cleaned up:
-- On `shepherd-complete` event (completed issues)
-- On `daemon-startup` (stale files from previous session)
-- On `periodic` cleanup (files older than 24 hours)
-
-**Session Rotation**:
-
-When a new daemon session starts, the existing `daemon-state.json` is automatically rotated to preserve session history:
-
-```
-.loom/
-├── daemon-state.json          # Current session (always this name)
-├── 00-daemon-state.json       # First archived session
-├── 01-daemon-state.json       # Second archived session
-├── 02-daemon-state.json       # Third archived session
-└── ...
-```
-
-**Why session rotation?**
-- Debugging patterns across multiple sessions
-- Analyzing daemon behavior over time
-- Post-mortem analysis when issues occur
-- Understanding long-term trends in the development pipeline
-
-**Configuration**:
-- `LOOM_MAX_ARCHIVED_SESSIONS` - Maximum sessions to keep (default: 10)
-
-**Commands**:
-```bash
-# Preview session rotation
-./.loom/scripts/rotate-daemon-state.sh --dry-run
-
-# Manually prune old sessions
-./.loom/scripts/daemon-cleanup.sh prune-sessions
-
-# Keep more archived sessions
-./.loom/scripts/rotate-daemon-state.sh --max-sessions 20
-```
-
-Archived sessions include a `session_summary` field with final statistics:
-```json
-{
-  "session_summary": {
-    "session_id": 5,
-    "archived_at": "2026-01-24T15:30:00Z",
-    "issues_completed": 12,
-    "prs_merged": 10,
-    "total_iterations": 156
-  }
-}
-```
-
-**Required Terminal Configuration for Daemon**:
-
-| Terminal ID | Role | Purpose |
-|-------------|------|---------|
-| shepherd-1, shepherd-2, shepherd-3 | shepherd.md | Issue orchestration pool |
-| terminal-architect | architect.md | Work generation (proposals) |
-| terminal-hermit | hermit.md | Simplification proposals |
-| terminal-guide | guide.md | Backlog triage (always running) |
-| terminal-champion | champion.md | Auto-merge (always running) |
-| terminal-doctor | doctor.md | PR conflict resolution (always running) |
-| terminal-auditor | auditor.md | Main branch validation (always running) |
-| terminal-curator | curator.md | Issue enrichment background role (always running) |
+**Scheduled support roles** run as separate GitHub Actions cron jobs — see `.github/workflows/loom-*.yml`. They have no persistent state on the Loom side; each tick is a fresh `claude -p "/<role>" --dangerously-skip-permissions` invocation.
 
 ### Custom Roles
 
@@ -644,7 +409,7 @@ Cron example (probe every 10 minutes):
 See `.loom/docs/troubleshooting.md` for detailed troubleshooting including:
 - Cleaning up stale worktrees and branches
 - Stuck agent detection and intervention
-- Daemon troubleshooting
+- Spawn-loop troubleshooting
 - Common issues and solutions
 
 **Quick fixes**:
@@ -652,9 +417,8 @@ See `.loom/docs/troubleshooting.md` for detailed troubleshooting including:
 ```bash
 loom-clean --force                       # Clean stale worktrees/branches
 ./.loom/scripts/stale-building-check.sh --recover  # Recover stuck issues
-./.loom/scripts/recover-orphaned-shepherds.sh --recover  # Recover orphaned shepherds after crash
 gh label sync --file .github/labels.yml  # Re-sync labels (GitHub only)
-touch .loom/stop-daemon                  # Graceful daemon shutdown
+touch .loom/stop-spawn-loop              # Graceful spawn-loop shutdown
 ```
 
 ## MCP Hooks

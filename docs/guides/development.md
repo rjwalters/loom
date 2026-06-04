@@ -118,7 +118,7 @@ loom/
 │       └── ...
 ├── loom-api/              # Shared Rust types and IPC protocol
 ├── mcp-loom/              # Unified MCP server (TypeScript/Node)
-├── loom-tools/            # Python tools (loom-shepherd, loom-clean, etc.)
+├── loom-tools/            # Python tools (loom-status, loom-clean, loom-tokens, etc.)
 ├── defaults/              # Default configuration templates installed into target repos
 ├── scripts/               # Installation, daemon, and maintenance scripts
 ├── .github/workflows/     # GitHub Actions CI

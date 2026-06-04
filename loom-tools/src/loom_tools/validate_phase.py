@@ -1,10 +1,10 @@
-"""Validate shepherd phase contracts.
+"""Validate sweep phase contracts.
 
 Ports the logic from ``defaults/scripts/validate-phase.sh`` to a Python module
 with both a programmatic API and a CLI (``loom-validate-phase``).
 
 Phase contract validators check that the expected artifacts exist after a
-shepherd phase completes (e.g. the builder created a PR with the correct
+``/loom:sweep`` phase completes (e.g. the builder created a PR with the correct
 label). When a contract is not satisfied, the validator marks the issue with
 the ``loom:blocked`` label and provides
 diagnostic information for manual intervention.
