@@ -53,7 +53,9 @@ Run `pnpm check:ci` before pushing. This runs the full CI suite locally (linting
 
 If you want to explore the codebase or run Loom locally:
 
-**Prerequisites**: Node.js 20+, pnpm, Rust (stable), tmux, Git, GitHub CLI (`gh`)
+**Prerequisites**: Node.js 20+, pnpm, Rust 1.96.0 or newer (see `rust-toolchain.toml`), tmux, Git, GitHub CLI (`gh`)
+
+> **Minimum Supported Rust Version (MSRV)**: Rust 1.96.0. The `loom-daemon` crate depends on `rusqlite` → `libsqlite3-sys`, which uses `cfg_select!` (stabilised in Rust 1.96). Building with an older stable toolchain will fail. Run `rustup update stable` or `rustup install 1.96.0` if needed. The `rust-toolchain.toml` at the repo root pins the toolchain automatically when you use `rustup`.
 
 ```bash
 git clone https://github.com/rjwalters/loom.git
