@@ -340,16 +340,20 @@ Every 15 minutes: Review issue backlog, update priorities and organization
 
 ## Configuration
 
-### Setting Up Autonomous Agents (post-v1.0.0)
+### Setting Up Autonomous Agents (post-v0.10.0)
 
-> **The Python `loom-daemon` brain was removed in v1.0.0.** Historical
-> guidance like "start the daemon, it manages roles on a schedule, and
-> spawns shepherds per issue" no longer matches the codebase — the
-> daemon brain, the shepherd pool, and the `/shepherd` slash command
-> were all deleted as part of the shepherd/daemon deprecation epic
-> (#3372). For the breaking-change inventory and per-CLI replacement
-> table, see [`docs/migration/v1.0.0-shepherd-deprecation.md`](migration/v1.0.0-shepherd-deprecation.md)
-> and the stub at [`.loom/docs/daemon-reference.md`](../.loom/docs/daemon-reference.md).
+> **The Python `loom-daemon` brain was removed in v0.10.0; the shell-level
+> daemon surface is preserved.** Historical guidance like "start the
+> daemon, it manages roles on a schedule, and spawns shepherds per issue"
+> no longer matches the codebase — the Python brain, the shepherd pool,
+> and the `/shepherd` slash command were all deleted as part of the
+> shepherd/daemon deprecation epic (#3372). However,
+> `./.loom/scripts/daemon.sh` (start/stop/status) survives, re-implemented
+> as a tmux session launcher around the spawn loop + GitHub Actions cron +
+> token-rotated separate Claude Code sessions. For the breaking-change
+> inventory and per-CLI replacement table, see
+> [`docs/migration/v0.10.0-shepherd-deprecation.md`](migration/v0.10.0-shepherd-deprecation.md)
+> and [`.loom/docs/daemon-reference.md`](../.loom/docs/daemon-reference.md).
 
 The autonomous responsibilities the daemon used to own are now split
 across two daemon-free mechanisms. They can be enabled independently.

@@ -341,18 +341,21 @@ cp defaults/roles/builder.md .loom/roles/my-custom-role.md
 
 See [defaults/roles/README.md](../../defaults/roles/README.md) for details.
 
-### Automate Beyond MOM (Spawn Loop + GitHub Actions)
+### Automate Beyond MOM (Spawn Loop, daemon.sh, GitHub Actions)
 
-> **Heads up — the legacy daemon is gone in v1.0.0.** The Python
-> `loom-daemon` brain (`./.loom/scripts/daemon.sh start`) and the `/loom`
-> / `/loom --merge` slash commands were removed as part of the
-> shepherd/daemon deprecation epic (#3372). The migration narrative —
+> **Heads up — the Python daemon brain is gone in v0.10.0; the shell-level
+> daemon surface is preserved.** The Python `loom-daemon` brain and the
+> `/loom` / `/loom --merge` slash commands were removed as part of the
+> shepherd/daemon deprecation epic (#3372). However,
+> `./.loom/scripts/daemon.sh` (start/stop/status) survives — it now drives
+> the spawn loop and (optionally) per-role panes in tmux, with multi-account
+> token rotation at the process-spawn boundary. The migration narrative —
 > including what each entry point maps to — lives at
-> [`docs/migration/v1.0.0-shepherd-deprecation.md`](../migration/v1.0.0-shepherd-deprecation.md).
+> [`docs/migration/v0.10.0-shepherd-deprecation.md`](../migration/v0.10.0-shepherd-deprecation.md).
 
 Once comfortable with the manual MOM workflow above, you can move toward
-autonomous orchestration in two complementary ways. They replace the old
-daemon brain at different layers and can be enabled independently.
+autonomous orchestration. There are two complementary execution surfaces,
+each suited to different runtime expectations.
 
 **1. Multi-issue spawn loop (Tier 2 — single-host batching)**
 
