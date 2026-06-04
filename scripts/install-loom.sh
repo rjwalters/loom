@@ -237,6 +237,8 @@ cleanup_on_error() {
       info "Cleaning up worktree: ${WORKTREE_PATH}..."
       cd "$TARGET_PATH" 2>/dev/null || true
       git worktree remove "${WORKTREE_PATH}" --force 2>/dev/null || true
+      git worktree prune 2>/dev/null || true
+      rm -rf "${TARGET_PATH}/${WORKTREE_PATH}"
       if [[ -n "${BRANCH_NAME:-}" ]]; then
         git branch -D "${BRANCH_NAME}" 2>/dev/null || true
 
@@ -1439,6 +1441,8 @@ if [[ "$PR_URL_RAW" == *"NO_CHANGES_NEEDED"* ]]; then
   # Remove the worktree
   cd "$TARGET_PATH"
   git worktree remove "${WORKTREE_PATH}" --force 2>/dev/null || true
+  git worktree prune 2>/dev/null || true
+  rm -rf "${TARGET_PATH}/${WORKTREE_PATH}"
   git branch -D "${BRANCH_NAME}" 2>/dev/null || true
 
   # Restore any staged changes left by --clean uninstall
