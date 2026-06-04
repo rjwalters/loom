@@ -118,6 +118,12 @@ while [[ $# -gt 0 ]]; do
       exit 0
       ;;
     *)
+      if [[ "$1" == -* ]]; then
+        echo "Error: unknown flag: $1" >&2
+        echo "       (--quick and --full belong to ./install.sh, not scripts/install-loom.sh)" >&2
+        echo "Use --help for usage." >&2
+        exit 1
+      fi
       TARGET_PATH="$1"
       shift
       ;;
