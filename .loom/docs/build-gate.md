@@ -114,8 +114,8 @@ A gate failure is **not** the same as a builder failure: the issue is automatica
 }
 ```
 
-These fields are available in shepherd state and milestone logs for postmortem analysis.
+These fields are available in sweep logs (`.loom/logs/sweep-issue-N.log`) and sweep checkpoints (`.loom/sweep-checkpoint/issue-N.json`) for postmortem analysis.
 
 ## Why orchestrator-side?
 
-The gate intentionally lives in the shepherd's builder phase (`loom_tools/shepherd/phases/builder.py`), not in the builder *role* prompt. The point is deterministic enforcement independent of agent self-discipline: an agent that crashed, was rate-limited, or simply ignored its prompt should still not produce a PR.
+The gate intentionally lives in the orchestrator's builder phase (the `/loom:sweep` skill's Builder step), not in the builder *role* prompt. The point is deterministic enforcement independent of agent self-discipline: an agent that crashed, was rate-limited, or simply ignored its prompt should still not produce a PR.

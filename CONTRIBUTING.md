@@ -78,7 +78,7 @@ loom/
 ├── loom-daemon/            # Rust daemon (terminal management, orchestration)
 ├── loom-api/               # Rust shared types and protocol definitions
 ├── mcp-loom/               # Unified MCP server (TypeScript)
-├── loom-tools/             # Python tools (loom-shepherd, loom-clean, etc.)
+├── loom-tools/             # Python tools (loom-status, loom-clean, loom-tokens, etc.)
 ├── .loom/                  # Workspace config and agent roles
 ├── defaults/               # Default configuration templates
 ├── docs/                   # Documentation

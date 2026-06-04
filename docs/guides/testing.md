@@ -200,6 +200,6 @@ mcp__loom__trigger_force_start
 
 ## Debugging
 
-1. **Daemon state inspection**: `cat ~/.loom/daemon-state.json | jq` and `cat .loom/state.json | jq`
-2. **Tail logs**: `tail -f ~/.loom/daemon.log`
+1. **Spawn-loop state inspection**: `cat .loom/spawn-loop-state.json | jq` and `cat .loom/state.json | jq`
+2. **Tail logs**: `tail -f ~/.loom/daemon.log` (Rust daemon) and `tail -f .loom/logs/spawn-loop.log` (spawn loop)
 3. **tmux sessions**: `tmux -L loom list-sessions`

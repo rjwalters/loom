@@ -18,31 +18,40 @@ git clone https://github.com/rjwalters/loom
 cd loom
 ./install.sh /path/to/your/repo
 
-# Start autonomous development
+# Start autonomous development on a single issue from Claude Code
 cd /path/to/your/repo
-/loom
+# In Claude Code:
+/loom:sweep 42
+```
+
+For multi-issue autonomous batches, start the spawn loop instead:
+
+```bash
+LOOM_USE_SPAWN_LOOP=1 ./.loom/scripts/spawn-loop.sh start
 ```
 
 ## How It Works
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
-│                    Human (Layer 3)                              │
+│                    Human (Tier 3)                               │
 │  Write issues, review PRs, merge what you approve               │
 └─────────────────────────────────────────────────────────────────┘
                               │
 ┌─────────────────────────────────────────────────────────────────┐
-│                    Loom Daemon (Layer 2)                        │
-│  /loom - Monitors pipeline, spawns shepherds, generates work    │
+│        Tier 2: Spawn loop + GitHub Actions cron                 │
+│  spawn-loop.sh claims ready issues, detaches per-issue sweeps   │
+│  .github/workflows/loom-*.yml runs support roles on cron        │
 └─────────────────────────────────────────────────────────────────┘
                               │
 ┌─────────────────────────────────────────────────────────────────┐
-│                    Shepherds (Layer 1)                          │
-│  /shepherd <issue> - Orchestrates: Curator → Builder → Judge    │
+│        Tier 1: /loom:sweep <issue>                              │
+│  Single-issue lifecycle: Curator → Builder → Judge → Doctor →   │
+│  Merge. Checkpoints survive crashes.                            │
 └─────────────────────────────────────────────────────────────────┘
                               │
 ┌─────────────────────────────────────────────────────────────────┐
-│                    Workers (Layer 0)                            │
+│                    Workers (Tier 0)                             │
 │  /builder, /judge, /curator, /doctor - Execute single tasks     │
 └─────────────────────────────────────────────────────────────────┘
 ```
@@ -77,9 +86,9 @@ See [WORKFLOWS.md](docs/workflows.md) for complete label documentation.
 
 **Developer Experience**
 - Git worktree isolation per issue
-- Simple CLI: `/shepherd 42` monitors a single issue end-to-end via the daemon
+- Simple slash command: `/loom:sweep 42` runs a single issue end-to-end
 - MCP integration for programmatic control (19 tools)
-- Graceful shutdown: `touch .loom/stop-daemon`
+- Graceful shutdown: `touch .loom/stop-spawn-loop`
 
 ## Forge Support
 
@@ -133,29 +142,34 @@ your-repo/
 
 ## Usage
 
-### Daemon Mode (Fully Autonomous)
-
-```bash
-/loom              # Start continuous orchestration
-/loom --merge      # Aggressive mode (auto-promotes proposals, auto-merges)
-```
-
-The daemon monitors your pipeline, spawns shepherds for ready issues, and triggers support roles (architect, hermit, auditor) on schedule.
-
 ### Single-Issue Mode
 
-To orchestrate one issue end-to-end, start the daemon first, then use `/shepherd`:
+To orchestrate one issue end-to-end from inside Claude Code:
 
-```bash
-# In a terminal outside Claude Code
-./.loom/scripts/daemon.sh start
-
-# Then in Claude Code
-/shepherd 42         # Orchestrate issue through full lifecycle
-/shepherd 42 --merge # Same, but auto-merge after Judge approves
+```text
+/loom:sweep 42          # Curator → Builder → Judge → Doctor → Merge
+/loom:sweep --prs 123   # PR-set mode: Judge / Doctor → Judge / Merge from an open-PR set
 ```
 
-`/shepherd` writes a signal to the daemon and then monitors progress — it requires the daemon to be running.
+From a script:
+
+```bash
+claude -p "/loom:sweep 42" --dangerously-skip-permissions
+```
+
+Sweep is self-contained — there is no separate daemon to start. Checkpoints under `.loom/sweep-checkpoint/` survive crashes; restarting the sweep resumes from the last completed phase.
+
+### Multi-Issue Mode (spawn loop)
+
+For autonomous batches that claim ready issues continuously:
+
+```bash
+LOOM_USE_SPAWN_LOOP=1 ./.loom/scripts/spawn-loop.sh start
+./.loom/scripts/spawn-loop.sh status
+./.loom/scripts/spawn-loop.sh stop                  # or: touch .loom/stop-spawn-loop
+```
+
+The spawn loop polls `loom:issue`, atomically claims ready items, and detaches one `/loom:sweep N` child per issue (up to `MAX_PARALLEL`, default 3). Each spawn picks its own OAuth token via `spawn-claude.sh` for multi-account rotation. The loop has no work-generation triggers — see the [GitHub Actions cron workflows](.github/workflows/) for periodic Champion / Curator / Judge / Auditor / Guide ticks (Phase 2a, opt-in per workflow).
 
 ### Individual Agent Commands
 
@@ -201,16 +215,16 @@ gh pr create --label "loom:review-requested"
 
 | Role | Purpose | Mode |
 |------|---------|------|
-| `/loom` | System orchestration, work generation | Continuous daemon |
-| `/shepherd` | Issue lifecycle orchestration (requires daemon) | Per-issue |
+| `/loom:sweep` | Single-issue lifecycle orchestration (Curator → Merge) | Per-issue |
+| `./.loom/scripts/spawn-loop.sh` | Multi-issue batch claimer (Tier 2) | Continuous, opt-in |
 | `/builder` | Implement features and fixes | Manual |
-| `/judge` | Review pull requests | Autonomous |
-| `/curator` | Enhance and organize issues | Autonomous |
-| `/architect` | Create architectural proposals | Autonomous |
-| `/hermit` | Identify simplification opportunities | Autonomous |
+| `/judge` | Review pull requests | Cron via GH Actions |
+| `/curator` | Enhance and organize issues | Cron via GH Actions |
+| `/architect` | Create architectural proposals | Manual (cadence #3381) |
+| `/hermit` | Identify simplification opportunities | Manual (cadence #3381) |
 | `/doctor` | Fix PR feedback and conflicts | Manual |
-| `/champion` | Evaluate proposals, auto-merge PRs | Autonomous |
-| `/auditor` | Validate main branch builds | Autonomous |
+| `/champion` | Evaluate proposals, auto-merge PRs | Cron via GH Actions |
+| `/auditor` | Validate main branch builds | Cron via GH Actions |
 
 ## Development
 
