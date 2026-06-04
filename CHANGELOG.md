@@ -7,10 +7,63 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.1] - 2026-06-04
+
+### Summary
+
+A bridge release toward v0.10.0. Loom 0.9.1 ships the **soft-deprecation infrastructure** for the upcoming **shepherd removal** (epic #3372): the `loom-shepherd` CLI, the `/shepherd` Claude Code slash command, and the Python `daemon_v2/` brain now emit a one-shot stderr warning pointing at their replacements. A comprehensive `docs/migration/v0.10.0-shepherd-deprecation.md` guide lands ahead of the deletions. **Nothing is removed yet** — every deprecated component continues to function identically, so downstream consumers (notably sphere) get a full release cycle to migrate.
+
+**Daemon mode is preserved going forward.** The Python daemon brain (`loom_tools/daemon_v2/`) is on the v0.10.0 chopping block, but the shell-level daemon surface (`./.loom/scripts/daemon.sh` + tmux session runner + multi-account token rotation) survives — re-implemented around the spawn loop and GitHub Actions cron in v0.10.0. The architectural reason: Claude Code subagents inherit the parent's `CLAUDE_CODE_OAUTH_TOKEN`, so multi-account rotation only works at process-spawn boundaries. The daemon's tmux-launched-separate-sessions surface is the long-running counterpart to `/loom:sweep`'s subagent dispatch — both are first-class execution surfaces post-v0.10.0.
+
+Around the deprecation framing, this release ships the **replacement substrate** — `./.loom/scripts/spawn-loop.sh` as a minimal multi-account orchestrator (#3374), scheduled support-role workflows under `.github/workflows/loom-*.yml` (#3375), and `/loom:sweep` matures with checkpoint/resume (#3373), Mode C PR-set lifecycle (#3417), `loom:operator-only` skip semantics (#3362), and existing-PR pre-flight routing (#3361). Eight of the nine `loom-*` operator CLIs are ported from `daemon-state.json` to spawn-loop + forge data sources (the ninth, `loom-daemon-cleanup`, is renamed to `loom-cleanup`). Several worktree/merge correctness fixes round it out.
+
+### Added
+
+- **Spawn-loop orchestrator** — `./.loom/scripts/spawn-loop.sh` is a minimal alternative to the full daemon for multi-account `/loom:sweep` launching. Polls `loom:issue`, atomically claims ready issues via `.loom/locks/issue-<N>/`, and detaches `claude -p "/loom:sweep N"` per issue with its own OAuth token via `spawn-claude.sh`. No work generation, no support-role triggers, no pool-slot bookkeeping. State at `.loom/spawn-loop-state.json`, logs at `.loom/logs/spawn-loop.log`. Crashed children with surviving checkpoints (#3373) are re-queued on the next tick. Opt-in via `LOOM_USE_SPAWN_LOOP=1`. (#3374 / PR #3385)
+- **Scheduled support-role GitHub Actions workflows** — `.github/workflows/loom-*.yml` provide a daemon-free way to run the periodic support roles (Champion, Curator, Judge, Auditor, Guide) on cron schedules. Each workflow checks out the repo, installs the Claude CLI, and runs `claude -p "/<role>" --dangerously-skip-permissions` for one tick. **Disabled by default** — every workflow ships with its `schedule:` block commented out so forks don't burn Actions minutes accidentally. Activation requires a `CLAUDE_API_KEY` repo secret and uncommenting the `- cron:` lines. (Phase 2a of #3372, #3375 / PR #3386)
+- **Soft-deprecation infrastructure** — `loom-shepherd`, the `/shepherd` slash command, and the Python `daemon_v2` brain now emit a one-shot stderr `⚠️  DEPRECATED` block on invocation pointing at replacements. **No behavior change**: every component continues to function identically. Two helpers ship the warning text: Python (`loom_tools.common.deprecation.warn_deprecated`) and shell (`.loom/scripts/lib/deprecation.sh`, safe to source). Suppress with `LOOM_SUPPRESS_DEPRECATION=1` (Python + shell entry points only — the markdown `/shepherd` skill warning always renders by design). The `./.loom/scripts/daemon.sh` warning that shipped under this PR will be withdrawn in v0.10.0, since the shell-level daemon surface is preserved. (#3376 / PR #3387)
+- **`/loom:sweep` checkpoint/resume** — per-issue phase checkpoint at `.loom/sweep-checkpoint/issue-<N>.json` so a killed-and-relaunched sweep can pick up where it left off. Schema: `{phase, task_id, timestamp, pr_number?}` with `curator-done` / `builder-done` / `judge-done` / `doctor-done` / `merge-done` states. Helper script `.loom/scripts/sweep-checkpoint.sh {write|read|phase|exists|delete|list}` with atomic writes. Stale-checkpoint cleanup on entry. No mid-builder recovery — kill during Builder resumes at builder start, worktree preserved by `worktree.sh` idempotency. (Phase 0 of #3372, #3373 / PR #3383)
+- **`/loom:sweep` Mode C — PR-set lifecycle** — drive Judge / Doctor → Judge / Merge from an open-PR set without re-running Curator or Builder. Two trigger forms: explicit `--prs` flag (`/sweep --prs 100 101`), or NL phrase ("all open `loom:pr`"). Size-1 waves; reuses the issue-keyed checkpoint helper via `closingIssuesReferences`. (#3384 / PR #3417)
+- **`loom:operator-only` label** — pre-flight skip in `/loom:sweep` for issues requiring human action outside automation (credential rotations, infra ops, manual deploys, hardware access). Champion `--merge` mode also refuses to auto-promote them. (#3360 / PR #3362)
+- **Existing-PR detection in `/loom:sweep` pre-flight** — probes `closedByPullRequestsReferences` and routes single open linked PRs to Judge (or Merge if already `loom:pr`) instead of dispatching a duplicate Builder. Multi-PR ambiguity is logged and skipped (human-attention case). (#3359 / PR #3361)
+- **Phase 4 sphere-downstream migration banners** — added soft-deprecation banners to `defaults/.claude/commands/loom/shepherd.md` and the deprecated subagent files, plus a "Migration: deprecations targeted for v0.10.0" section in both `CLAUDE.md` and `defaults/CLAUDE.md` so the next downstream install surfaces the migration narrative without operator intervention. (#3382 / PR #3404)
+
+### Refactored
+
+- **Eight `loom-*` CLIs ported from `daemon-state.json` to spawn-loop + forge data sources** (Phase 3.1.x of #3372). Each port preserves CLI output shape and continues to honor `daemon-state.json` as a fallback during the 0.9.x deprecation window:
+  - `loom-status` → `spawn-loop-state.json` + forge with daemon-state fallback (#3390 / PR #3407)
+  - `loom-backlog` → `issue-failures.json` only (#3391 / PR #3408)
+  - `loom-stuck-detection` → `spawn-loop-state.json` heartbeats (#3392 / PR #3411)
+  - `loom-completions` → spawn-loop output-file paths (#3393 / PR #3410)
+  - `loom-agent-metrics` → `activity.db` only (dropped `daemon-state.json` fallback) (#3394 / PR #3409)
+  - `loom-orphan-recovery` → spawn-loop tasks + forge cross-check (#3395 / PR #3414)
+  - `loom-health-monitor` → forge + spawn-loop inputs (#3397 / PR #3413)
+  - `loom-clean` → spawn-loop claim-set (`.loom/locks/issue-<N>/`) (#3398 / PR #3415)
+
+### Renamed
+
+- `loom-daemon-cleanup` → `loom-cleanup` (CLI rename, drops session-rotation events that were specific to the Python daemon brain). (#3396 / PR #3412)
+
+### Fixed
+
+- **Worktree creation serialization** — `./.loom/scripts/worktree.sh` now serializes concurrent invocations for the same issue and cleans up partial state on failure, preventing the duplicate-worktree / locked-branch corruption pattern observed under parallel `/loom:sweep` waves. (#3380 / PR #3416)
+- **`merge-pr.sh` fall-through to immediate merge when PR is CLEAN** — `--auto` queues via GitHub's server-side auto-merge, but on PRs already in `CLEAN` state the script now transparently falls back to an immediate merge instead of blocking on a queue that has nothing to wait for. (#3371 / PR #3379)
+- **`/loom:sweep` Mode B unknown-label guard uses live repo label set** — instead of consulting only `.github/labels.yml` (which is the Loom-managed subset and misses labels added via the GitHub UI or Dependabot), the orchestrator queries `gh label list` once per sweep invocation as the source of truth, falling back to the YAML only on `gh` failure. (#3370)
+- **`merge-pr.sh --worktree-path` override + porcelain warn-only fallback** — surface worktree-detection failures without aborting the merge. (#3364 / PR #3367)
+- **Doctor isolates external-fork PRs in `pr-<N>` worktrees** — prevents external-fork doctor cycles from contaminating the issue's main worktree. (#3363)
+- **`loom-daemon` post-init retires daemon-brain `.gitignore` patterns** — removes stale ignore entries that referenced now-defunct daemon-brain artifacts. (#3406)
+
 ### Changed (docs)
 
-- Documentation sweep across `CLAUDE.md`, `defaults/CLAUDE.md`, `.loom/docs/`, `docs/guides/`, and READMEs to retire references to `/shepherd`, the Python `loom-daemon` CLI, `.loom/daemon-state.json`, and `.loom/progress/` in favor of `/loom:sweep`, the spawn-loop (`./.loom/scripts/spawn-loop.sh`), and the GitHub Actions cron workflows. `.loom/docs/daemon-reference.md` is now a deprecated stub pointing at the spawn-loop replacements. Historical ADRs (`docs/adr/0004-*`, `docs/adr/0008-*`) and historical CHANGELOG entries are intentionally not rewritten. Closes #3403 (Phase 3.6 of epic #3372)
-- **Phase 3.6.5 reconciliation**: the migration narrative in CLAUDE.md, defaults/CLAUDE.md, the migration guide, and seven other docs is rewritten to reflect the revised plan — **the shepherd surface is removed in v0.10.0, but daemon mode (`./.loom/scripts/daemon.sh` + tmux + multi-account token rotation) is preserved**. The Python brain (`loom_tools/daemon_v2/`) is still removed; the shell-level launcher is re-implemented around the spawn loop + GitHub Actions cron + token-rotated tmux panes. `docs/migration/v1.0.0-shepherd-deprecation.md` is renamed to `v0.10.0-shepherd-deprecation.md` and rewritten end-to-end. The stale `[1.0.0] - unreleased` CHANGELOG placeholder is removed (v1.0.0 is now unscheduled). The architectural framing the rewrite captures: Loom needs to support **both** subagent dispatch (one Claude Code session, shared OAuth token, fast iteration) and tmux-launched separate Claude Code sessions (multi-process, rotated tokens, multi-day runtime), because token rotation only works at process-spawn boundaries (subagents inherit the parent's `CLAUDE_CODE_OAUTH_TOKEN`). Closes #3420 (Phase 3.6.5 of epic #3372)
+- **Documentation sweep retiring `/shepherd`, `loom-daemon`, `daemon-state.json`, and `.loom/progress/` references** across `CLAUDE.md`, `defaults/CLAUDE.md`, `.loom/docs/`, `docs/guides/`, and READMEs in favor of `/loom:sweep`, the spawn-loop, and the GitHub Actions cron workflows. `.loom/docs/daemon-reference.md` is now a deprecated-stub pointing at the spawn-loop replacements. Adds **`docs/migration/v0.10.0-shepherd-deprecation.md`** — the authoritative migration guide for the v0.10.0 release. Historical ADRs and CHANGELOG entries are intentionally preserved. (Phase 3.6 of #3372, #3403 / PR #3419)
+- **Phase 3.6.5 reconciliation** — rewrites the migration narrative across CLAUDE.md, defaults/CLAUDE.md, the migration guide, and seven other docs to reflect that **daemon mode (`./.loom/scripts/daemon.sh` + tmux + multi-account token rotation) is preserved**. The shepherd surface and the Python daemon brain are still removed in v0.10.0; the shell-level daemon launcher is re-implemented around the spawn loop. Renames the migration guide to `v0.10.0-shepherd-deprecation.md`. Deletes the stale `## [1.0.0] - unreleased` CHANGELOG placeholder (v1.0.0 is now unscheduled). The architectural framing the rewrite captures: Loom supports **both** subagent dispatch (one Claude Code session, shared OAuth token, fast iteration) and tmux-launched separate Claude Code sessions (multi-process, rotated tokens, multi-day runtime), because token rotation only works at process-spawn boundaries. (Phase 3.6.5 of #3372, #3420 / PR #3421)
+- **`docs/migration/daemon-state-consumers.md`** — inventory of all `daemon-state.json` and `.loom/progress/` consumers across the codebase, with category tags and Phase 3 PR sequencing recommendations. (Phase 2c of #3372, #3377 / PR #3389)
+- **`docs/design/architect-hermit-cadence.md`** — design doc covering the architect/hermit work-generation cadence after the Python brain is removed (Phase 2d follow-up, #3381). (#3388)
+- **Curator/architect playbook entries for multi-phase sweeps** — added to `.loom/roles/curator.md` and `.loom/roles/architect.md`. (#3365 / PR #3366)
+
+### Build
+
+- Dependabot bump: 3 dependencies updated. (#3368)
 
 ## [0.9.0] - 2026-05-28
 
