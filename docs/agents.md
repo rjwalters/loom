@@ -340,17 +340,69 @@ Every 15 minutes: Review issue backlog, update priorities and organization
 
 ## Configuration
 
-### Setting Up Autonomous Agents (Daemon Mode)
+### Setting Up Autonomous Agents (post-v1.0.0)
 
-1. Start the daemon: `./.loom/scripts/daemon.sh start`
-2. The daemon manages these roles on a schedule:
-   - Judge (5 min intervals) - PR review
-   - Curator (5 min intervals) - issue enhancement
-   - Architect (15 min intervals) - proposal generation
-   - Hermit (15 min intervals) - simplification proposals
-   - Guide (15 min intervals) - backlog triage
-   - Champion (10 min intervals) - proposal promotion and auto-merge
-3. Builders are spawned per-issue as shepherds when `loom:issue` items are ready
+> **The Python `loom-daemon` brain was removed in v1.0.0.** Historical
+> guidance like "start the daemon, it manages roles on a schedule, and
+> spawns shepherds per issue" no longer matches the codebase — the
+> daemon brain, the shepherd pool, and the `/shepherd` slash command
+> were all deleted as part of the shepherd/daemon deprecation epic
+> (#3372). For the breaking-change inventory and per-CLI replacement
+> table, see [`docs/migration/v1.0.0-shepherd-deprecation.md`](migration/v1.0.0-shepherd-deprecation.md)
+> and the stub at [`.loom/docs/daemon-reference.md`](../.loom/docs/daemon-reference.md).
+
+The autonomous responsibilities the daemon used to own are now split
+across two daemon-free mechanisms. They can be enabled independently.
+
+**1. Per-issue lifecycle: spawn loop launches `/loom:sweep <N>`**
+
+`./.loom/scripts/spawn-loop.sh` is a minimal multi-account launcher
+that polls `loom:issue`, atomically claims ready issues, and detaches
+one `claude -p "/loom:sweep N"` child per issue. Each child runs the
+full Curator → Builder → Judge → Doctor → Merge lifecycle for one
+issue and exits. There is no shepherd pool, no `daemon-state.json`,
+no work-generation cooldowns — concurrency is bounded by
+`MAX_PARALLEL` (default `3`).
+
+```bash
+LOOM_USE_SPAWN_LOOP=1 ./.loom/scripts/spawn-loop.sh start  # opt-in gate required
+./.loom/scripts/spawn-loop.sh status
+./.loom/scripts/spawn-loop.sh stop                          # or: touch .loom/stop-spawn-loop
+```
+
+Tunables (env): `MAX_PARALLEL`, `POLL_INTERVAL` (seconds between polls,
+default `30`), `SHUTDOWN_GRACE_SEC` (default `300`). State lives in
+`.loom/spawn-loop-state.json`, logs in `.loom/logs/spawn-loop.log`,
+claim locks under `.loom/locks/issue-<N>/`. Sweep checkpoints
+(`.loom/sweep-checkpoint/issue-<N>.json`) survive crashes — a restarted
+sweep resumes from the last completed phase.
+
+**2. Periodic support roles: GitHub Actions cron**
+
+The periodic roles the old daemon ran in-process (Judge, Curator,
+Champion, Auditor, Guide) are now GitHub Actions workflows under
+`.github/workflows/loom-*.yml`. Each workflow checks out the repo,
+installs the Claude CLI, and runs `claude -p "/<role>"
+--dangerously-skip-permissions` for one tick of work — no Loom-side
+state file, no long-running process. Cron schedules approximate the
+daemon's historical intervals:
+
+| Workflow            | Role        | Schedule (commented) |
+|---------------------|-------------|----------------------|
+| `loom-judge.yml`    | `/judge`    | `*/5 * * * *`        |
+| `loom-curator.yml`  | `/curator`  | `*/5 * * * *`        |
+| `loom-champion.yml` | `/champion` | `*/10 * * * *`       |
+| `loom-auditor.yml`  | `/auditor`  | `*/10 * * * *`       |
+| `loom-guide.yml`    | `/guide`    | `*/15 * * * *`       |
+
+Workflows ship with `schedule:` blocks **commented out** so forks
+don't accidentally burn Actions minutes. To opt in: add a
+`CLAUDE_API_KEY` repository secret, uncomment the `schedule:` /
+`- cron:` lines in each workflow you want to enable, and optionally
+smoke-test via the Actions UI's **Run workflow** button.
+
+Architect and Hermit cadence (work-generation triggers) is
+intentionally out of scope for now — see follow-up #3381.
 
 ### Setting Up Manual Orchestration Mode
 

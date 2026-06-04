@@ -341,20 +341,74 @@ cp defaults/roles/builder.md .loom/roles/my-custom-role.md
 
 See [defaults/roles/README.md](../../defaults/roles/README.md) for details.
 
-### Automate with Daemon Mode
+### Automate Beyond MOM (Spawn Loop + GitHub Actions)
 
-Once comfortable with MOM, try **Daemon Mode** for continuous autonomous orchestration:
+> **Heads up — the legacy daemon is gone in v1.0.0.** The Python
+> `loom-daemon` brain (`./.loom/scripts/daemon.sh start`) and the `/loom`
+> / `/loom --merge` slash commands were removed as part of the
+> shepherd/daemon deprecation epic (#3372). The migration narrative —
+> including what each entry point maps to — lives at
+> [`docs/migration/v1.0.0-shepherd-deprecation.md`](../migration/v1.0.0-shepherd-deprecation.md).
+
+Once comfortable with the manual MOM workflow above, you can move toward
+autonomous orchestration in two complementary ways. They replace the old
+daemon brain at different layers and can be enabled independently.
+
+**1. Multi-issue spawn loop (Tier 2 — single-host batching)**
+
+`./.loom/scripts/spawn-loop.sh` polls `loom:issue`, atomically claims
+ready issues, and detaches one `claude -p "/loom:sweep N"` process per
+issue. Each child runs the full Curator → Builder → Judge → Doctor →
+Merge lifecycle on its own. There is no shepherd pool to size, no
+`daemon-state.json` to tune — concurrency is bounded by `MAX_PARALLEL`
+(default `3`) and the spawn loop is intentionally minimal.
 
 ```bash
-# Start the daemon in a terminal
-./.loom/scripts/daemon.sh start
+# Opt-in gate is required (the loop refuses to start without it)
+LOOM_USE_SPAWN_LOOP=1 ./.loom/scripts/spawn-loop.sh start
 
-# Activate orchestration from Claude Code
-/loom
+# Check what's running
+./.loom/scripts/spawn-loop.sh status
 
-# Or for aggressive autonomous development
-/loom --merge
+# Graceful shutdown — finishes in-flight children, then exits
+./.loom/scripts/spawn-loop.sh stop   # or: touch .loom/stop-spawn-loop
 ```
+
+If you have a multi-account Claude token pool bootstrapped under
+`.loom/tokens/`, each spawn picks its own OAuth token via
+`spawn-claude.sh`. See the **Multi-Account Token Pool** section of
+`.loom/CLAUDE.md` for the rotation setup.
+
+**2. Scheduled support roles (Tier 2 — cron-driven, daemon-free)**
+
+The periodic support roles that the old daemon ran in-process —
+Champion, Curator, Judge, Auditor, Guide — are now GitHub Actions cron
+workflows under `.github/workflows/loom-*.yml`. Each workflow checks out
+the repo, installs the Claude CLI, and runs
+`claude -p "/<role>" --dangerously-skip-permissions` for one tick of
+work — no Loom-side state file, no long-running process.
+
+**Workflows ship with `schedule:` blocks commented out** so forks don't
+burn Actions minutes accidentally. To opt in:
+
+1. Add a `CLAUDE_API_KEY` repository secret
+   (Settings → Secrets and variables → Actions).
+2. Uncomment the `schedule:` / `- cron:` lines in each
+   `.github/workflows/loom-*.yml` you want to enable.
+3. Optionally smoke-test via the Actions UI's **Run workflow** button
+   (`workflow_dispatch`) before the next scheduled tick.
+
+The two tiers compose: spawn loop on your machine launches sweeps for
+ready issues; GitHub Actions cron drives the support roles that move
+issues and PRs between labels. Either can run on its own.
+
+For the full reference (state-file schema, env tunables, opt-in
+checklist, troubleshooting), see the
+[**Spawn-Loop Mode**](../../.loom/CLAUDE.md#3-spawn-loop-mode-phase-1-opt-in)
+and
+[**Scheduled Support Roles**](../../.loom/CLAUDE.md#4-scheduled-support-roles-phase-2a-opt-in)
+sections of `.loom/CLAUDE.md`, and the deprecation stub at
+[`.loom/docs/daemon-reference.md`](../../.loom/docs/daemon-reference.md).
 
 ---
 
