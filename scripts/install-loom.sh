@@ -1094,6 +1094,51 @@ done < <(find \
   -print0 | sort -z)
 INSTALLED_FILES_JSON="${INSTALLED_FILES_JSON}]"
 
+# --- Stale-file sweep (upgrade path) ---
+# Compare the previous install's file list (from install-metadata.json) against
+# the new set. Files present in the old set but not the new set are orphans from
+# upstream renames/deletions and must be removed so they don't accumulate.
+# Only files the installer originally wrote are candidates — operator-added files
+# are never in PREV_INSTALLED_FILES, so they are safe by construction.
+STALE_FILES=()
+if [[ -f "$TARGET_PATH/.loom/install-metadata.json" ]] && command -v jq >/dev/null 2>&1; then
+  while IFS= read -r prev_file; do
+    [[ -n "$prev_file" ]] || continue
+    # Is this file still in the new installed set?
+    if ! echo "$INSTALLED_FILES_JSON" | grep -qF "\"${prev_file}\""; then
+      STALE_FILES+=("$prev_file")
+    fi
+  done < <(jq -r '.installed_files[]' "$TARGET_PATH/.loom/install-metadata.json")
+fi
+
+if (( ${#STALE_FILES[@]} > 0 )); then
+  echo ""
+  info "Stale files from previous Loom install (removed or renamed upstream):"
+  for f in "${STALE_FILES[@]}"; do
+    echo "    - $f"
+  done
+  echo ""
+  PROCEED_DELETE=true
+  if [[ "$NON_INTERACTIVE" != "true" ]] && [[ "$FORCE_OVERWRITE" != "true" ]]; then
+    read -r -p "Remove these ${#STALE_FILES[@]} stale file(s)? [y/N] " CONFIRM_DELETE
+    [[ "$CONFIRM_DELETE" =~ ^[Yy]$ ]] || PROCEED_DELETE=false
+  fi
+  if [[ "$PROCEED_DELETE" == "true" ]]; then
+    DELETED_COUNT=0
+    for f in "${STALE_FILES[@]}"; do
+      if git rm --quiet --force "$f" 2>/dev/null; then
+        (( DELETED_COUNT++ )) || true
+      else
+        warning "Could not remove stale file: $f (may have been removed already)"
+      fi
+    done
+    success "Removed $DELETED_COUNT stale file(s) from previous Loom version"
+  else
+    info "Skipping stale file removal (user declined)"
+  fi
+fi
+# --- End stale-file sweep ---
+
 cat > .loom/install-metadata.json <<METADATA
 {
   "loom_version": "${LOOM_VERSION}",
