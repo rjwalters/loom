@@ -7,7 +7,7 @@ This repository uses **Loom** for AI-powered development orchestration.
 
 ## What is Loom?
 
-Loom is a CLI + daemon for AI-powered development orchestration. It coordinates AI development workers using git worktrees and a forge (GitHub or Gitea) as the coordination layer. It supports manual coordination (Manual Orchestration Mode) and continuous autonomous orchestration via a minimal spawn loop plus GitHub Actions cron workflows for support roles.
+Loom is a CLI + daemon for AI-powered development orchestration. It coordinates AI development workers using git worktrees and a forge (GitHub or Gitea) as the coordination layer. It supports manual coordination (Manual Orchestration Mode), continuous autonomous orchestration via the Rust `loom-daemon` binary (MCP-level dispatch + pub/sub + monitoring), and GitHub Actions cron schedules for periodic support roles.
 
 **Loom Repository**: https://github.com/rjwalters/loom
 
@@ -64,10 +64,12 @@ Loom decomposes development into three coordination tiers, with the forge (GitHu
                               │ observes/intervenes
                               ▼
 ┌─────────────────────────────────────────────────────────────────┐
-│             Tier 2: Spawn loop + GitHub Actions cron            │
-│  ./.loom/scripts/spawn-loop.sh                                  │
-│   - Claims ready `loom:issue` items, detaches per-issue sweep   │
-│   - Multi-account token rotation per spawn                      │
+│            Tier 2: loom-daemon + GitHub Actions cron            │
+│  loom-daemon (Rust binary, MCP-level surface)                   │
+│   - dispatch_sweep / list_sweeps (sweep registry)               │
+│   - subscribe_to_events / publish_event (event bus)             │
+│   - get_sweep_status / cancel_sweep / tail_sweep_log            │
+│   - Multi-account token rotation per dispatch                   │
 │  .github/workflows/loom-*.yml                                   │
 │   - Cron-driven Champion / Curator / Judge / Auditor / Guide    │
 └─────────────────────────────────────────────────────────────────┘
@@ -97,7 +99,7 @@ Loom decomposes development into three coordination tiers, with the forge (GitHu
 | Tier | Entry point | Purpose | Mode |
 |------|-------------|---------|------|
 | Tier 3 | Human | Oversight — approve proposals, handle edge cases | Observer |
-| Tier 2 | `./.loom/scripts/spawn-loop.sh` + GH Actions cron | Multi-issue batch + scheduled support roles | Continuous / cron |
+| Tier 2 | `loom-daemon` (MCP) + GH Actions cron | Multi-issue dispatch + scheduled support roles | Continuous / cron |
 | Tier 1 | `/loom:sweep <issue>` | Issue lifecycle from creation to merge | Per-issue |
 | Tier 0 | `/builder`, `/judge`, etc. | Task execution — single focused work units | Per-task |
 
@@ -109,10 +111,10 @@ Loom decomposes development into three coordination tiers, with the forge (GitHu
 - Intervene for blocked issues or stuck agents
 - Provide strategic direction on what to build
 
-**Tier 2 (Spawn loop + GH Actions cron)**:
-- The spawn loop polls `loom:issue` and spawns `/loom:sweep` children, one per ready issue, up to `MAX_PARALLEL` (default 3)
-- The GitHub Actions workflows under `.github/workflows/loom-*.yml` run periodic support roles (Champion, Curator, Judge, Auditor, Guide) on cron schedules
-- Architect / Hermit cadence (work generation) is currently manual — tracked under follow-up #3381
+**Tier 2 (`loom-daemon` + GH Actions cron)**:
+- The Rust `loom-daemon` binary exposes MCP tools for dispatching `/loom:sweep` children with multi-account OAuth token rotation (`mcp__loom__dispatch_sweep`), tracking running sweeps (`mcp__loom__list_sweeps`, `mcp__loom__get_sweep_status`), pub/sub eventing on a frozen 6-topic taxonomy (`mcp__loom__publish_event`, `mcp__loom__subscribe_to_events`), and cancellation (`mcp__loom__cancel_sweep`). State is in-memory only — the forge is the source of truth for queue state.
+- The GitHub Actions workflows under `.github/workflows/loom-*.yml` run periodic support roles (Champion, Curator, Judge, Auditor, Guide) on cron schedules.
+- Architect / Hermit cadence (work generation) is currently manual — tracked under follow-up #3381.
 
 **Tier 1 (`/loom:sweep`)**:
 - Fully autonomous once spawned
@@ -126,10 +128,11 @@ Loom decomposes development into three coordination tiers, with the forge (GitHu
 - You want to orchestrate one issue through its full lifecycle
 - Running manual orchestration mode
 
-**Use the spawn loop** (`LOOM_USE_SPAWN_LOOP=1 ./.loom/scripts/spawn-loop.sh start`) when:
-- You want autonomous multi-issue batch processing
-- Multiple ready issues need to be claimed in parallel
-- Running production-scale orchestration with multi-account token rotation
+**Use `mcp__loom__dispatch_sweep`** (against a running `loom-daemon`) when:
+- You want autonomous multi-issue dispatch with multi-account token rotation
+- Multiple sweeps need to run in parallel under daemon supervision
+- You need to monitor sweep lifecycle events (pub/sub) or cancel in-flight sweeps
+- Running production-scale orchestration where the daemon's reaper task and in-memory registry are the source of truth for "what is currently dispatched"
 
 ## Usage Modes
 
@@ -187,32 +190,39 @@ claude -p "/loom:sweep 123" --dangerously-skip-permissions
 
 Checkpoints (#3373) under `.loom/sweep-checkpoint/issue-<N>.json` survive crashes — restarting `/loom:sweep N` resumes from the last completed phase.
 
-### 3. Spawn-Loop Mode (Phase 1, opt-in)
+### 3. Daemon Mode (`loom-daemon` + MCP tools)
 
-A minimal alternative to the full daemon for multi-account `/loom:sweep` launching (#3374, Phase 1 of the shepherd/daemon deprecation epic #3372). Polls `loom:issue`, atomically claims ready issues (label flip + `mkdir`-based file lock under `.loom/locks/issue-<N>/`), and detaches `claude -p "/loom:sweep N"` per issue — each spawn picks its own OAuth token via `spawn-claude.sh`. No work generation, no support-role triggers, no shepherd-N pool-slot bookkeeping.
+The Rust `loom-daemon` binary is the Tier 2 dispatch backend. It is a single long-lived process exposing a Unix-socket IPC surface and a paired `mcp-loom` MCP server. Each IPC `Request` variant maps 1:1 to an MCP tool, so any MCP client — most commonly a Claude Code session running `/loom:sweep` — can dispatch sweeps, observe registry state, subscribe to lifecycle events, and cancel in-flight work.
 
-```bash
-# Opt-in gate is required (protects existing daemon users from accidental dual-orchestration)
-LOOM_USE_SPAWN_LOOP=1 ./.loom/scripts/spawn-loop.sh start
+**MCP surface** (Phases A–C of epic #3449, all shipped):
 
-./.loom/scripts/spawn-loop.sh status
-./.loom/scripts/spawn-loop.sh stop          # or: touch .loom/stop-spawn-loop
-```
+| MCP tool | Purpose | Phase |
+|----------|---------|-------|
+| `mcp__loom__dispatch_sweep` | Dispatch a sweep for an issue (token rotation via `spawn-claude.sh`) | A (#3452) |
+| `mcp__loom__list_sweeps` | Enumerate running sweeps in the in-memory registry | A (#3452) |
+| `mcp__loom__publish_event` | Publish a sweep-lifecycle event on the in-memory bus | B (#3453) |
+| `mcp__loom__subscribe_to_events` | Stream topic-filtered events to a subscriber | B (#3453) |
+| `mcp__loom__get_sweep_status` | Inspect a running sweep's state (PID, phase, started_at) | C (#3455) |
+| `mcp__loom__tail_sweep_log` | Tail `.loom/logs/sweep-issue-<N>.log` | C (#3455) |
+| `mcp__loom__cancel_sweep` | Cancel a running sweep (SIGTERM → grace → SIGKILL) | C (#3455) |
+| `mcp__loom__tail_event_bus` | Tail the event bus without subscribing to a topic | C (#3455) |
+
+**Event taxonomy (frozen for v0.10.0)**: `sweep.issue.{N}.phase`, `sweep.issue.{N}.blocker`, `sweep.issue.{N}.exited`, `sweep.issue.{N}.crashed`, `sweep.global.dispatch`, `sweep.global.completed`. New topics require a follow-up issue — the v0.10.0 set is intentionally frozen.
+
+**`/loom:sweep` backend detection (Stage -1, Phase D #3454)**: the skill probes whether the daemon is reachable (a Ping over the IPC socket with a 500ms timeout) AND whether a multi-account token pool exists (`.loom/tokens/` contains ≥ 2 `ACCOUNT_KEY_*` entries). **Strict AND** — either probe failing falls through to in-process subagent dispatch (the existing Mode A/B/C lifecycle, no behaviour change for solo-token operators). Mode C (`--prs`) always uses subagent dispatch; the daemon does not handle PR-set dispatch in v0.10.0. The `--no-daemon` flag forces subagent dispatch unconditionally.
+
+**Per-sweep state on disk**:
 
 | File | Purpose |
 |------|---------|
-| `.loom/spawn-loop.pid` | Loop PID (gitignored) |
-| `.loom/spawn-loop-state.json` | `{started_at, running:[{issue, pid, started_at, token}]}` (gitignored) |
-| `.loom/logs/spawn-loop.log` | Timestamped spawn/exit/error entries |
-| `.loom/logs/sweep-issue-<N>.log` | Per-issue child output |
-| `.loom/locks/issue-<N>/` | Atomic claim lock dir (gitignored) |
-| `.loom/stop-spawn-loop` | Touch to request graceful shutdown |
+| `.loom/logs/sweep-issue-<N>.log` | Per-issue child output (tailable via `mcp__loom__tail_sweep_log`) |
+| `.loom/sweep-checkpoint/issue-<N>.json` | Crash-resume checkpoint (#3373); the sweep skill reads it on entry and skips already-completed phases |
 
-**Crash recovery**: if a child dies while a `.loom/sweep-checkpoint/issue-<N>.json` exists, the loop flips the issue back to `loom:issue` so the next tick re-spawns; the sweep skill itself (#3373) reads the checkpoint on entry and skips already-completed phases.
+The daemon **does not** poll the forge for ready issues, **does not** maintain a `shepherd-N` pool, and **does not** drive support roles on cron. Those responsibilities live in `mcp__loom__dispatch_sweep` (operator-driven enqueue) and the GitHub Actions cron workflows (periodic support roles).
 
-**Coexistence with daemon mode**: the `daemon.sh` shell wrapper is **preserved** in v0.10.0 (the Python `loom-daemon` brain it historically called is removed; the shell launcher is re-implemented around the spawn loop and tmux). The spawn loop and `daemon.sh` are two ways to run the same Tier-2 orchestration — the spawn loop is the headless minimal driver, while `daemon.sh` adds a tmux multi-pane container with per-pane OAuth token rotation. If both are running, they will race for `loom:issue` items; pick one in practice.
+For the full surface — IPC request/response variants, event-bus internals, registry behaviour, reaper semantics — see [`.loom/docs/daemon-reference.md`](.loom/docs/daemon-reference.md).
 
-**Tunables (env)**: `MAX_PARALLEL=3`, `POLL_INTERVAL=30`, `SHUTDOWN_GRACE_SEC=300`, `LOOM_REPO=owner/repo` (override remote auto-detection).
+> **Legacy spawn loop deprecated**: `defaults/scripts/spawn-loop.sh` (Phase 1, #3374) is deprecated as of Phase E of #3449. It emits a stderr warning on every `start` / `status` / `stop` invocation and will be deleted in v0.11.0. Use `mcp__loom__dispatch_sweep` against `loom-daemon` instead. Suppress the warning with `LOOM_SUPPRESS_DEPRECATION=1` while you migrate. See [the migration guide](../docs/migration/v0.10.0-shepherd-deprecation.md).
 
 ### Scheduled Support Roles (Phase 2a, opt-in)
 
@@ -232,7 +242,7 @@ GitHub Actions workflows under `.github/workflows/loom-*.yml` provide a daemon-f
 2. Uncomment the `schedule:` / `- cron:` lines in each `.github/workflows/loom-*.yml` you want to enable.
 3. Optionally trigger a run via `workflow_dispatch` (the Actions UI's "Run workflow" button) to smoke-test before the next scheduled tick.
 
-Architect and Hermit cadence (work-generation triggers) is intentionally out of scope here — see follow-up #3381. Post-v0.10.0, the schedule-driven cron workflows are the recommended path for support roles since the Python daemon brain is removed. Operators who want support roles co-located with the issue-work pane can still run them in tmux via `./.loom/scripts/daemon.sh` (each pane gets its own rotated OAuth token, unlike the GH Actions workflows which use a single API key) — **but note: `./.loom/scripts/daemon.sh` is currently absent on `origin/main` (deleted in #3432, rebuild in flight under epic #3449, ~4-6 weeks); until that lands, use the GH Actions workflows or `./.loom/scripts/spawn-loop.sh`.**
+Architect and Hermit cadence (work-generation triggers) is intentionally out of scope here — see follow-up #3381. Post-v0.10.0, the schedule-driven cron workflows are the recommended path for support roles since the Python daemon brain is removed. Operators who want multi-account-rotated dispatch (rather than the single-CI-token GH Actions surface) should use `mcp__loom__dispatch_sweep` against `loom-daemon` from a Claude Code session — each dispatched sweep picks a fresh OAuth token via `spawn-claude.sh`.
 
 ## Agent Roles
 
@@ -306,11 +316,7 @@ Full role definitions with detailed guidelines are available in:
 - `.loom/roles/guide.md` - Issue triage and prioritization
 - `.loom/roles/auditor.md` - Main branch validation
 
-> **Stop-gap — daemon backend in flight (v0.10.0 rebuild, epic #3449)**
->
-> `./.loom/scripts/daemon.sh` does not exist on `origin/main` as of v0.9.1; the dispatcher was deleted in #3432 and is being rebuilt in epic #3449 (~4-6 weeks, scheduled for v0.10.0). The note below describes the intended target state. Until Phase A through E of #3449 land, daemon operator commands (`./.loom/scripts/daemon.sh start|stop|status`) will fail with "no such file or directory". Use `./.loom/scripts/spawn-loop.sh` for headless multi-issue dispatch in the interim. Tracker: #3451 (this stop-gap), #3449 (rebuild epic).
-
-> **Note**: the historical `shepherd.md` (single-issue orchestrator) role file was removed in v0.10.0 along with the `/shepherd` slash command — see [the migration guide](../docs/migration/v0.10.0-shepherd-deprecation.md). Its orchestration responsibilities moved to `/loom:sweep` (Tier 1) and the spawn loop + GH Actions cron (Tier 2). The `loom.md` role file is preserved and documents the daemon-mode operator surface (`./.loom/scripts/daemon.sh` + tmux + token-rotated separate Claude Code sessions — see stop-gap warning above re: in-flight rebuild #3449); the Python brain it historically referenced (`loom_tools/daemon_v2/`) is removed in v0.10.0, but the shell-level daemon surface stays. The worker-role markdown files above are unchanged.
+> **Note**: the historical `shepherd.md` (single-issue orchestrator) role file was removed in v0.10.0 along with the `/shepherd` slash command — see [the migration guide](../docs/migration/v0.10.0-shepherd-deprecation.md). Its orchestration responsibilities moved to `/loom:sweep` (Tier 1) and the `loom-daemon` + GH Actions cron (Tier 2). The `loom.md` role file is preserved and documents the daemon-mode operator surface: a Claude Code session that observes the running `loom-daemon` via MCP tools (`mcp__loom__list_sweeps`, `mcp__loom__get_sweep_status`, `mcp__loom__subscribe_to_events`) and dispatches new work via `mcp__loom__dispatch_sweep`. The historical Python brain (`loom_tools/daemon_v2/`) is gone; the MCP-level surface is the supported coordination point. The worker-role markdown files above are unchanged.
 
 ## Label-Based Workflow
 
@@ -617,47 +623,41 @@ An optional deterministic gate runs after the builder agent exits but before PR 
 
 Repos without a `buildGate` block see zero behavior change. See `.loom/docs/build-gate.md` for the full schema and failure semantics.
 
-### Spawn-Loop Configuration (Tier 2)
+### Daemon Configuration (Tier 2)
 
-> **Stop-gap — daemon backend in flight (v0.10.0 rebuild, epic #3449)**
->
-> The paragraph below claims `./.loom/scripts/daemon.sh` "now wraps the spawn loop with tmux + per-pane token rotation". On `origin/main` as of v0.9.1, that file does not exist (deleted in #3432, rebuild in flight under epic #3449, ~4-6 weeks). Until the rebuild lands, the only working multi-issue dispatch backend is `./.loom/scripts/spawn-loop.sh` (headless) or the GitHub Actions cron workflows.
+The Rust `loom-daemon` binary is the load-bearing Tier 2 dispatch backend. It is a single long-lived process that holds the sweep registry, the event bus, and the reaper task in memory — there is no on-disk state file the operator needs to touch. The forge is the source of truth for queue state; the daemon's in-memory registry tracks only currently-dispatched sweeps.
 
-The spawn loop replaces the historical Python daemon brain. Its surface is intentionally narrow — there are no work-generation triggers, no pool-slot bookkeeping, and no state-file-based pipeline tracking. The shell-level daemon surface (`./.loom/scripts/daemon.sh`) is preserved and now wraps the spawn loop with tmux + per-pane token rotation. See [`.loom/docs/daemon-reference.md`](.loom/docs/daemon-reference.md) and [the migration guide](../docs/migration/v0.10.0-shepherd-deprecation.md) for details.
+**Process model**: the daemon runs as a detached background process. Each `mcp__loom__dispatch_sweep` request fork+execs a fresh `claude -p "/loom:sweep N"` child via `defaults/scripts/spawn-claude.sh`, picking an OAuth token from the `.loom/tokens/` pool (token rotation only works at process-spawn boundaries; the daemon never holds the token itself). The reaper task ticks every 30 seconds, sweeping dead PIDs out of the registry and emitting `sweep.issue.{N}.exited` / `sweep.issue.{N}.crashed` events.
 
-**Tunables (env)**:
+**MCP tools available** (each maps 1:1 to a daemon IPC `Request` variant):
 
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `MAX_PARALLEL` | 3 | Maximum concurrent `/loom:sweep` children |
-| `POLL_INTERVAL` | 30 | Seconds between `loom:issue` polls |
-| `SHUTDOWN_GRACE_SEC` | 300 | Seconds to wait for in-flight children at shutdown |
-| `LOOM_USE_SPAWN_LOOP` | (unset) | Opt-in gate, required to start the loop |
-| `LOOM_REPO` | (auto) | Override remote auto-detection (`owner/repo`) |
+| MCP tool | Description |
+|----------|-------------|
+| `mcp__loom__dispatch_sweep` | Dispatch a sweep for an issue (returns a sweep ID) |
+| `mcp__loom__list_sweeps` | Enumerate registry entries |
+| `mcp__loom__get_sweep_status` | Inspect a single sweep's state |
+| `mcp__loom__cancel_sweep` | SIGTERM → grace → SIGKILL a running sweep |
+| `mcp__loom__tail_sweep_log` | Tail `.loom/logs/sweep-issue-<N>.log` |
+| `mcp__loom__publish_event` | Publish a sweep-lifecycle event |
+| `mcp__loom__subscribe_to_events` | Topic-filtered event stream |
+| `mcp__loom__tail_event_bus` | Untopiced event tail |
 
-**State file** (`.loom/spawn-loop-state.json`, gitignored):
+See [`.loom/docs/daemon-reference.md`](.loom/docs/daemon-reference.md) for the wire protocol, the frozen 6-topic event taxonomy, and the registry/reaper semantics.
 
-```json
-{
-  "started_at": "2026-06-04T10:00:00Z",
-  "running": [
-    {
-      "issue": 123,
-      "pid": 49281,
-      "started_at": "2026-06-04T10:15:00Z",
-      "token": "agent-3.token"
-    }
-  ]
-}
-```
+**Per-sweep state on disk**:
 
-That's the entire schema. Pipeline state, warnings, completed-issue history, and work-generation cooldowns are not tracked — the forge is the source of truth for queue state, and the spawn loop is intentionally minimal.
+| File | Purpose |
+|------|---------|
+| `.loom/logs/sweep-issue-<N>.log` | Per-issue child output (tailable via `mcp__loom__tail_sweep_log`) |
+| `.loom/sweep-checkpoint/issue-<N>.json` | Crash-resume checkpoint (#3373); sweep skill reads it on entry |
 
-**Issue selection** is FIFO within the `loom:issue` queue, with the `loom:urgent` label taking precedence (urgent-first, then oldest-first). The pre-v0.10.0 `LOOM_ISSUE_STRATEGY` env var (with `lifo` / `priority` alternatives) no longer applies; the strategy lives inside the spawn loop and is not currently configurable.
+**Issue selection** is operator-driven via `mcp__loom__dispatch_sweep` — the daemon does not autonomously claim items from the `loom:issue` queue. (The `/loom:sweep` skill is the typical caller; Stage -1 backend detection picks an issue and dispatches it when both daemon and pool probes succeed.)
 
-**Sweep checkpoints** (`.loom/sweep-checkpoint/issue-<N>.json`, gitignored) — the per-issue checkpoint format is owned by the sweep skill (#3373). When a sweep child crashes, the spawn loop flips the issue back to `loom:issue` so the next tick re-spawns; the sweep skill itself reads the checkpoint on entry and skips already-completed phases.
+**Sweep checkpoints** (`.loom/sweep-checkpoint/issue-<N>.json`, gitignored) — the per-issue checkpoint format is owned by the sweep skill (#3373). When a sweep child crashes, the next dispatch reads the checkpoint and skips already-completed phases.
 
 **Scheduled support roles** run as separate GitHub Actions cron jobs under `.github/workflows/loom-*.yml`. They have no persistent state on the Loom side; each tick is a fresh `claude -p "/<role>" --dangerously-skip-permissions` invocation.
+
+> **Legacy spawn-loop state**: the v0.9.x state file `.loom/spawn-loop-state.json` is still written by the deprecated `spawn-loop.sh` (scheduled for deletion in v0.11.0). The daemon does not consume it. Operators who need to observe running sweeps should call `mcp__loom__list_sweeps` against the daemon instead.
 
 ### Model Selection Strategy
 
@@ -989,7 +989,7 @@ cp -r defaults/hooks/example-context/* .loom/context/
 
 **Overnight / long-running orchestration: keep the host awake (#3350)**:
 
-`/loom:sweep` and the spawn loop automatically run `./.loom/scripts/check-host-sleep.sh` at startup and warn when the host can sleep. This is **advisory only** — Loom never blocks on it. Heed the warning before walking away from a long run.
+`/loom:sweep` automatically runs `./.loom/scripts/check-host-sleep.sh` at startup and warns when the host can sleep. This is **advisory only** — Loom never blocks on it. Heed the warning before walking away from a long run.
 
 - **macOS:** user-idle sleep assertions (Amphetamine, `caffeinate -dimsu`, etc.) do **not** reliably defeat Maintenance Sleep on Apple Silicon. Use `sudo pmset -c sleep 0` for AC-only sleep disable, or flip your sleep manager's "allow system sleep when display is off" toggle to OFF. Restore with `sudo pmset -c sleep 1` afterwards.
 - **systemd Linux:** wrap the session in `systemd-inhibit --what=idle:sleep --who=loom --why=loom -- <cmd>`. This is reliable.
@@ -1114,9 +1114,9 @@ When an agent crashes or is cancelled while building, issues can get stuck in `l
 - Issues without PRs older than threshold are flagged/recovered
 - Issues with stale PRs are flagged but not auto-recovered (need manual review)
 
-**Orphaned task recovery (spawn-loop crashes)**:
+**Orphaned task recovery (daemon dispatch crashes)**:
 
-When the spawn loop crashes or is terminated abruptly, sweep children may be left with stale `.loom/locks/issue-<N>/` lock directories or stale entries in `.loom/spawn-loop-state.json`. `loom-orphan-recovery` (the ported successor to the historical `recover-orphaned-shepherds.sh`) handles this:
+When a dispatched sweep child crashes abruptly and the daemon's reaper hasn't yet caught up, sweep state may diverge briefly from forge state. `loom-orphan-recovery` (the ported successor to the historical `recover-orphaned-shepherds.sh`) reconciles this:
 
 ```bash
 # Check for orphaned tasks (dry run)
@@ -1130,22 +1130,20 @@ loom-orphan-recovery --json
 ```
 
 **What it detects** (post-v0.10.0):
-- Stale pids in `.loom/spawn-loop-state.json` (tasks whose process no longer exists)
-- `loom:building` issues with no live task in the spawn loop
+- Dead PIDs still listed by `mcp__loom__list_sweeps`
+- `loom:building` issues with no live sweep in the daemon registry
 - Stale lock dirs at `.loom/locks/issue-<N>/` for closed/merged issues
 
 **What it recovers**:
-- Removes stale entries from `.loom/spawn-loop-state.json`
 - Returns orphaned issues from `loom:building` to `loom:issue`
 - Adds recovery comments to affected issues
 - Removes stale lock dirs
 
-**Automatic recovery on spawn-loop startup**:
-The spawn loop runs orphan recovery at startup. This ensures it starts with a clean claim set after a crash.
+The daemon's 30-second reaper task usually catches this autonomously; `loom-orphan-recovery` is the manual cross-check.
 
 ### Stuck Agent Detection
 
-`loom-stuck-detection` checks for stuck sweep children using `.loom/spawn-loop-state.json` task pids and `.loom/sweep-checkpoint/issue-<N>.json` checkpoint timestamps.
+`loom-stuck-detection` checks for stuck sweep children by combining the daemon registry (via `mcp__loom__list_sweeps`) with `.loom/sweep-checkpoint/issue-<N>.json` checkpoint timestamps.
 
 **Check for stuck agents**:
 ```bash
@@ -1164,49 +1162,34 @@ loom-stuck-detection check-issue 123
 | Indicator | Default Threshold | Description |
 |-----------|-------------------|-------------|
 | `stale_heartbeat` | 5 minutes | No checkpoint update for extended time |
-| `dead_pid` | (instant) | PID in spawn-loop-state.json is no longer alive |
+| `dead_pid` | (instant) | PID in daemon registry is no longer alive |
 | `error_spike` | 5 errors | Multiple errors in `.loom/logs/sweep-issue-N.log` |
 
 The pre-v0.10.0 indicators `no_progress`, `extended_work`, and `looping` are no longer tractable post-deletion of `.loom/progress/` — see [the migration guide § Per-CLI breaking changes](../docs/migration/v0.10.0-shepherd-deprecation.md#per-cli-breaking-changes) for the diff.
 
-### Spawn-Loop Troubleshooting
+### Daemon Troubleshooting
 
-**Check spawn-loop state**:
+**Inspect the daemon registry**:
 ```bash
-# Status summary (human-readable)
-./.loom/scripts/spawn-loop.sh status
+# From a Claude Code session: list all currently-dispatched sweeps
+# mcp__loom__list_sweeps
 
-# Or read the state file directly
-cat .loom/spawn-loop-state.json | jq
+# Or inspect a single sweep
+# mcp__loom__get_sweep_status --sweep_id <id>
 
-# Check if loop is running
-test -f .loom/spawn-loop.pid && ps -p "$(cat .loom/spawn-loop.pid)" -o pid,etime,command
-
-# List active sweep children
-jq '.running[] | {issue, pid, started_at}' .loom/spawn-loop-state.json
+# Tail per-sweep output
+# mcp__loom__tail_sweep_log --issue 123
 ```
 
-**Graceful shutdown**:
+**Cancel a stuck sweep**:
 ```bash
-# Signal the spawn loop to stop accepting new work and drain in-flight children
-./.loom/scripts/spawn-loop.sh stop
-# or, equivalently:
-touch .loom/stop-spawn-loop
+# From a Claude Code session
+# mcp__loom__cancel_sweep --sweep_id <id>
+# Sends SIGTERM, waits the configured grace window, then SIGKILL.
+# The checkpoint survives so the next dispatch resumes from the last phase.
 ```
 
-The loop honors `SHUTDOWN_GRACE_SEC` (default 300s) before SIGKILL'ing any remaining sweep children.
-
-**Force stop** (use with caution):
-```bash
-# Remove stop signal if it was set but never picked up
-rm -f .loom/stop-spawn-loop
-
-# Hard-kill the loop process
-test -f .loom/spawn-loop.pid && kill -9 "$(cat .loom/spawn-loop.pid)" || true
-rm -f .loom/spawn-loop.pid
-```
-
-**Stuck sweep child**:
+**Stuck sweep child** (without using MCP tools):
 
 A sweep child whose pid is alive but whose `.loom/sweep-checkpoint/issue-<N>.json` mtime is stale is likely stuck. Recovery:
 
@@ -1217,17 +1200,22 @@ ls -la .loom/sweep-checkpoint/issue-123.json
 # Look at the child's log for errors
 tail -200 .loom/logs/sweep-issue-123.log
 
-# Kill the stuck pid; the loop will detect the dead pid on the next tick
-# and release the claim (the checkpoint survives, so the issue will resume
-# from its last completed phase the next time the loop spawns it).
-jq '.running[] | select(.issue==123) | .pid' .loom/spawn-loop-state.json | xargs -I{} kill {}
+# Kill the stuck pid; the daemon reaper will detect it within 30 seconds and
+# emit a `sweep.issue.123.crashed` event. The checkpoint survives so the next
+# `mcp__loom__dispatch_sweep` resumes from the last completed phase.
 ```
+
+**Subscribe to sweep events for live debugging**:
+```bash
+# mcp__loom__subscribe_to_events --topic "sweep.issue.123.*"
+# mcp__loom__tail_event_bus
+```
+
+See [`.loom/docs/daemon-reference.md`](.loom/docs/daemon-reference.md) for the full event taxonomy and IPC surface.
 
 **Work generation (Architect / Hermit) not running**:
 
-**This is by design post-v0.10.0.** The spawn loop does not generate work — Architect and Hermit cadence is tracked under follow-up #3381. If you need new work generated automatically, run Architect/Hermit on a cron via the Phase 2a GitHub Actions pattern (`.github/workflows/loom-*.yml`); the existing five shipped workflows cover Champion / Curator / Judge / Auditor / Guide, but Architect and Hermit cron workflows are not yet shipped.
-
-For now, trigger them manually when the queue is empty:
+**This is by design post-v0.10.0.** Neither the daemon nor the GH Actions cron generates work for Architect / Hermit — that cadence is tracked under follow-up #3381. For now, trigger them manually when the queue is empty:
 
 ```bash
 claude -p "/architect" --dangerously-skip-permissions
@@ -1500,51 +1488,43 @@ Or run the setup script to generate `.mcp.json` automatically:
 ./scripts/setup-mcp.sh
 ```
 
-## Migration: deprecations targeted for v0.10.0
+## Migration: v0.10.0 shepherd/daemon deprecation
 
-> **Stop-gap — daemon "preserved" claim is currently aspirational (epic #3449, stop-gap #3451)**
->
-> The next paragraph says daemon mode "is preserved as a user-facing surface" and that `./.loom/scripts/daemon.sh` "continues to provide a tmux session container". On `origin/main` as of v0.9.1, `./.loom/scripts/daemon.sh` does **not** exist — it was deleted in #3432 and is being rebuilt in epic #3449 over an estimated 4-6 weeks for v0.10.0. The shepherd/Python-daemon-brain deletions are real and shipped; the daemon-shell rebuild is in flight. Until #3449 ships, use `./.loom/scripts/spawn-loop.sh` (headless) or GitHub Actions cron workflows.
+Loom's orchestration architecture migration (epic #3372) deleted the shepherd brain (`loom-tools/src/loom_tools/shepherd/`), the Python daemon brain (`loom-tools/src/loom_tools/daemon_v2/`), and the `/shepherd` slash command. Epic #3449 then rebuilt the **daemon surface as a Rust binary** (`loom-daemon`) that exposes MCP tools for dispatch, monitoring, and pub/sub eventing — phases A through D have all shipped on main; phase E (this work) deprecates the v0.9.x `defaults/scripts/spawn-loop.sh` interim implementation.
 
-Loom is in the middle of an orchestration-architecture migration (epic #3372). In **v0.10.0** (the next planned minor release), the shepherd brain (`loom-tools/src/loom_tools/shepherd/`), the Python daemon brain (`loom-tools/src/loom_tools/daemon_v2/`), and the `/shepherd` slash command will be **deleted** in favour of a minimal spawn loop (#3374) + GitHub Actions workflows (#3375). **Daemon mode itself is preserved as a user-facing surface** — `./.loom/scripts/daemon.sh` continues to provide a tmux session container with multi-account token rotation, re-implemented around the spawn loop. The phased rollout is:
-
-| Phase | Issue | What ships | Status |
+| Phase | Issue | What shipped | Status |
 |-------|-------|-----------|--------|
-| Phase 1 | #3374 | Minimal multi-account spawn loop (`./.loom/scripts/spawn-loop.sh`) | shipped |
-| Phase 2a | #3375 | GitHub Actions workflows for support roles (Champion, Curator, Judge, Auditor, Guide) | shipped (workflows disabled by default) |
-| Phase 2b | #3376 | **Soft-deprecation warnings on deprecated entry points** | shipped |
-| Phase 3 | TBD | Deletion of shepherd brain, Python daemon brain, and `/shepherd` skill; re-implementation of `daemon.sh` around spawn loop + tmux | **v0.10.0** |
-| Phase 4 | #3382 | Coordinated downstream sphere-install migration (deprecation banners in installed templates + this migration section) | shipped |
+| Phase 1 | #3374 | Minimal multi-account spawn loop (`spawn-loop.sh`) | shipped (deprecated in Phase E) |
+| Phase 2a | #3375 | GitHub Actions workflows for support roles | shipped (disabled by default) |
+| Phase 2b | #3376 | Soft-deprecation warnings on deprecated entry points | shipped |
+| Phase 3 | #3378 | Deletion of shepherd brain, Python daemon brain, `/shepherd` skill | shipped |
+| Phase 4 | #3382 | Coordinated downstream sphere-install migration | shipped |
+| #3449 Phase A | #3452 | `loom-daemon`: `dispatch_sweep`, `list_sweeps`, in-memory registry, reaper task | shipped |
+| #3449 Phase B | #3453 | `loom-daemon`: event bus (tokio broadcast), 6 frozen topics, `publish_event` / `subscribe_to_events` IPC | shipped |
+| #3449 Phase C | #3455 | MCP tools: `get_sweep_status`, `tail_sweep_log`, `subscribe_to_events`, `publish_event`, `cancel_sweep`, `tail_event_bus`; `.loom/docs/daemon-reference.md` rewrite | shipped |
+| #3449 Phase D | #3454 | `/loom:sweep` Stage -1 backend detection (strict-AND daemon + pool probe) | shipped |
+| #3449 Phase E | #3456 | `spawn-loop.sh` deprecation warning + operator-doc rewrite | this PR |
 
-**v1.0.0 is intentionally unscheduled.** Loom remains pre-1.0 while the architecture settles. The migration guide filename
-`docs/migration/v0.10.0-shepherd-deprecation.md` is named for the release that will ship the deletions.
+**v1.0.0 is intentionally unscheduled.** Loom remains pre-1.0 while the architecture settles. The migration guide filename `docs/migration/v0.10.0-shepherd-deprecation.md` is named for the release that ships the deletions.
 
-**Deprecated entry points (still functional, now warn on use):**
+**Removed entry points** (no longer present in v0.10.0+):
 
-| Deprecated | Replacement | Warning emitted from |
-|------------|-------------|----------------------|
-| `loom-daemon` (Python entry point) | `./.loom/scripts/daemon.sh` (preserved, re-implemented) OR `./.loom/scripts/spawn-loop.sh` (headless) + GitHub Actions schedules | `loom_tools.daemon_v2.cli.main()` |
-| `loom-shepherd` CLI / `/shepherd` invocations | `/loom:sweep <issue>` for the same lifecycle | `loom_tools.shepherd.cli.main()` |
-| `/shepherd` slash command (`defaults/.claude/commands/loom/shepherd.md`) | `/loom:sweep <issue>` | Markdown header instructs the LLM to emit the warning |
+| Removed | Replacement |
+|---------|-------------|
+| `loom-daemon` (Python entry point) | Rust `loom-daemon` binary + `mcp__loom__dispatch_sweep` + GitHub Actions schedules |
+| `loom-shepherd` CLI / `/shepherd` slash command | `/loom:sweep <issue>` for the same per-issue lifecycle |
 
-> **Note**: `./.loom/scripts/daemon.sh` was listed as deprecated in 0.9.1 under the original plan that anticipated removing daemon mode entirely. **That plan was revised**: the shell-level daemon surface is preserved in v0.10.0. The warning attached to `daemon.sh start` in 0.9.1 will be withdrawn in v0.10.0. The Python `loom-daemon` CLI warning escalates to a genuine "command not found" error.
+**Deprecated entry points (still functional in v0.10.x, removed in v0.11.0)**:
 
-**Suppression**: set `LOOM_SUPPRESS_DEPRECATION=1` to silence the warnings emitted from Python and shell entry points. The `/shepherd` markdown skill warning always renders by design — operators should explicitly migrate, not silence. Sphere installs and other downstream automation that haven't migrated yet can use this env var to keep their logs clean during the deprecation window.
+| Deprecated | Replacement | Warning |
+|------------|-------------|---------|
+| `defaults/scripts/spawn-loop.sh` | `mcp__loom__dispatch_sweep` against `loom-daemon` | Stderr banner on every invocation (Phase E of #3449); suppressible with `LOOM_SUPPRESS_DEPRECATION=1` |
 
-**Helpers**: the warning text is centralized in two places so removal in Phase 3 is a single-PR sweep:
+## Migrating off shepherd / spawn-loop (downstream consumers)
 
-- Python: `loom_tools.common.deprecation.warn_deprecated(component, replacement, ref="#3372")`
-- Shell: `source .loom/scripts/lib/deprecation.sh; warn_deprecated <component> <replacement> [ref]` — the bash helper is safe to source (no side effects).
+If you installed Loom via `scripts/install-loom.sh` (or `install.sh`), the shepherd brain and Python daemon brain are already gone; the spawn-loop deprecation in this phase is your final migration step before v0.11.0 deletes it.
 
-## Migrating off shepherd (downstream consumers, Phase 4 of #3372)
-
-> **Stop-gap reminder — daemon "preserved" claim is currently aspirational (epic #3449, stop-gap #3451)**
->
-> The references to `./.loom/scripts/daemon.sh` below describe the intended v0.10.0 target state. As of v0.9.1, that file does **not** exist on `origin/main` (deleted in #3432, rebuild in flight under epic #3449, ~4-6 weeks). Until that lands, downstream consumers should treat the "daemon.sh preserved" prose as forward-looking and use `./.loom/scripts/spawn-loop.sh` (headless) or GitHub Actions cron workflows.
-
-If you installed Loom via `scripts/install-loom.sh` (or `install.sh`), the shepherd brain (`loom-tools/src/loom_tools/shepherd/`), the Python daemon brain (`loom-tools/src/loom_tools/daemon_v2/`), and the `/shepherd` slash command are scheduled for **deletion in v0.10.0** (Phase 3 of epic #3372, tracked as part of #3382). **The user-facing daemon mode surface — `./.loom/scripts/daemon.sh` + tmux + token rotation — is preserved**, just re-implemented around the spawn loop. This section is the migration guide for downstream consumers; it complements the upstream phase table in the section above.
-
-### What you can still rely on (post-v0.10.0)
+### What you can still rely on (v0.10.0)
 
 These surfaces are **not** going away and are the supported replacements:
 
@@ -1552,8 +1532,8 @@ These surfaces are **not** going away and are the supported replacements:
 |------------|-------------|-------|
 | Single-issue lifecycle (curator → builder → judge → doctor → merge) | `/loom:sweep <issue>` | `.claude/commands/loom/sweep.md` |
 | PR-side back half (judge / doctor → judge / merge for an existing open PR set) | `/loom:sweep --prs <pr-number-list>` (Mode C, #3384) | `.claude/commands/loom/sweep.md` |
-| **Daemon-managed tmux session with per-pane token rotation** | `./.loom/scripts/daemon.sh start` | **Preserved**, re-implemented around spawn loop |
-| Multi-issue / multi-account batch orchestration (headless) | `LOOM_USE_SPAWN_LOOP=1 ./.loom/scripts/spawn-loop.sh` | Phase 1, #3374 |
+| **Multi-account dispatch with monitoring and pub/sub** | `mcp__loom__dispatch_sweep`, `mcp__loom__list_sweeps`, `mcp__loom__get_sweep_status`, `mcp__loom__subscribe_to_events`, `mcp__loom__cancel_sweep`, `mcp__loom__tail_sweep_log`, `mcp__loom__publish_event`, `mcp__loom__tail_event_bus` | `loom-daemon` (Rust binary) + `mcp-loom` MCP server |
+| `/loom:sweep` backend detection | Stage -1 strict-AND probe (daemon reachable AND multi-account pool present) | `.claude/commands/loom/sweep.md` Stage -1 |
 | Periodic support roles (Champion, Curator, Judge, Auditor, Guide) | GitHub Actions cron workflows | `.github/workflows/loom-*.yml`, Phase 2a, #3375 |
 | Per-task multi-account token rotation | `./.loom/scripts/spawn-claude.sh` + `.loom/tokens/` | Unchanged |
 | Label-based coordination (`loom:issue` → `loom:building` → `loom:pr` → merged) | Unchanged | `.github/labels.yml` |
@@ -1562,47 +1542,27 @@ These surfaces are **not** going away and are the supported replacements:
 
 ### What is being deprecated (and what to do)
 
-| Deprecated surface | Soft-deprecated since | What to do |
-|--------------------|----------------------|------------|
-| `loom-daemon` Python CLI | Phase 2b (#3376) | Replace direct calls with `./.loom/scripts/daemon.sh start` (preserved, re-implemented) for the tmux multi-account surface, or `./.loom/scripts/spawn-loop.sh` for the headless minimal surface. |
-| `loom-shepherd` Python CLI | Phase 2b (#3376) | Replace shell invocations with `claude -p "/loom:sweep <N>" --dangerously-skip-permissions`. The lifecycle phases are identical; checkpointing (#3373) is preserved. |
-| `/shepherd` slash command | Phase 2b (#3376) | Use `/loom:sweep <issue>` instead. Both run Curator → Builder → Judge → Doctor → Merge; the sweep skill is the maintained path. |
-| `loom-shepherd` subagent (`.claude/agents/loom-shepherd.md`) | Phase 4 (this section, #3382) | Stop dispatching to it from custom slash commands or hooks. The agent file will be removed in v0.10.0 along with the role definition it points at (`.loom/roles/shepherd.md`). The `loom-daemon` subagent is preserved and now documents the shell-level daemon surface. |
-| `.loom/daemon-state.json` and `.loom/progress/shepherd-*.json` consumers | Will be silent after v0.10.0 | The producers are being deleted (the Python brain wrote them). The per-consumer disposition table lives in `docs/migration/daemon-state-consumers.md` (PR #3389) — read it before writing new code that depends on either file. Most operator CLIs are slated to port to `.loom/spawn-loop-state.json` + forge queries; a few retire entirely. |
+| Deprecated surface | Status | What to do |
+|--------------------|--------|------------|
+| `defaults/scripts/spawn-loop.sh` | Deprecated in v0.10.x (Phase E of #3449), deletion in v0.11.0 | Migrate to `mcp__loom__dispatch_sweep` against `loom-daemon`. The script still works through v0.10.x but emits a stderr warning on every `start` / `status` / `stop` invocation. Suppress with `LOOM_SUPPRESS_DEPRECATION=1` if you need the noise gone during migration. |
+| `loom-shepherd` Python CLI (already removed in v0.10.0) | Removed | Replace shell invocations with `claude -p "/loom:sweep <N>" --dangerously-skip-permissions`. The lifecycle phases are identical; checkpointing (#3373) is preserved. |
+| `/shepherd` slash command (already removed in v0.10.0) | Removed | Use `/loom:sweep <issue>` instead. |
+| `loom-shepherd` subagent (already removed in v0.10.0) | Removed | Stop dispatching to it from custom slash commands or hooks. |
+| `.loom/daemon-state.json` and `.loom/progress/shepherd-*.json` consumers | Producers removed | Replace reads with `mcp__loom__list_sweeps` / `mcp__loom__get_sweep_status` against the daemon, plus forge queries. See `docs/migration/daemon-state-consumers.md` for the per-consumer disposition. |
 
-### Three migration paths for downstream consumers
+**Suppression**: set `LOOM_SUPPRESS_DEPRECATION=1` to silence the deprecation warnings emitted from the deprecated shell entry points. Sphere installs and other downstream automation mid-migration can use this env var to keep their logs clean during the v0.10.x → v0.11.0 window.
 
-You have three valid choices for handling v0.10.0. None of them require you to migrate before Phase 3 ships — they just determine what happens on your next `install-loom.sh` run.
+**Helpers**: the warning text is centralized in two places so removal in v0.11.0 is a single-PR sweep:
 
-**(a) Migrate now (recommended for active deployments).** Switch to `/loom:sweep` + spawn loop + GitHub Actions workflows on your main branch before Phase 3 ships. If you had `./.loom/scripts/daemon.sh start` in your automation, no operator-side change is needed — the API is preserved; only the internals change. Your `install-loom.sh` run after Phase 3 lands will cleanly install the new defaults with no manual cleanup.
-
-**(b) Defer migration (acceptable for downstream timelines).** Coordinate with the Loom maintainer to time Phase 3's merge with a migration window that suits your release schedule. The mechanic is a comment thread on #3382. Soft-deprecation warnings (Phase 2b) will continue rendering in your logs during the deferral; use `LOOM_SUPPRESS_DEPRECATION=1` to silence the Python/shell variants if needed (the `/shepherd` markdown skill warning always renders).
-
-**(c) Pin to a pre-Phase-3 Loom version (acceptable, but opts you out of upgrades).** Stop running `install-loom.sh` against your repo, or pin `loom` to a specific tag in your install scripts. This is a valid operator choice — it simply means you stop receiving Loom upgrades until you choose to migrate. The installer is idempotent and will not overwrite your pinned files on a no-op invocation, but rerunning it after pinning intentionally to a new Loom version will replace them.
-
-### Why this matters for the installed `defaults/` tree
-
-When Phase 3 ships in v0.10.0, the next time you run `scripts/install-loom.sh` (or `install.sh`) against your repo, these files will **disappear from `defaults/`** and therefore from your repo's `.claude/agents/` and `.claude/commands/loom/`:
-
-- `defaults/.claude/agents/loom-shepherd.md`
-- `defaults/.claude/commands/loom/shepherd.md`
-- `defaults/.claude/commands/loom/shepherd-lifecycle.md`
-- `defaults/roles/shepherd.md`
-
-These are **preserved**:
-
-- `defaults/.claude/agents/loom-daemon.md` (retitled to document the shell-level daemon surface)
-- `defaults/roles/loom.md` (likewise)
-- `./.loom/scripts/daemon.sh` (re-implemented around spawn loop + tmux + token rotation)
-
-If you have custom slash commands, hooks, or scripts that reference any of the **deleted** paths, the next install will quietly stop installing them. The deprecation banners on the template files (added in Phase 4, this issue) exist so you see the warning on your **very next** install — well before Phase 3 actually removes them.
+- Shell: `defaults/scripts/spawn-loop.sh::_deprecation_warn()` — fires on every `start` / `status` / `stop` subcommand.
 
 ### Coordination and questions
 
-- **Upstream tracker**: #3382 ("Phase 4: sphere downstream coordination tracker"). Open a comment there if you need to coordinate timing, request a deferral window, or report a missing migration path.
-- **Consumer inventory + disposition table**: `docs/migration/daemon-state-consumers.md` (PR #3389) — read this if you have code that imports from `loom_tools.daemon_v2` or `loom_tools.shepherd`, or reads `.loom/daemon-state.json` or `.loom/progress/`.
-- **Migration guide**: `docs/migration/v0.10.0-shepherd-deprecation.md`.
-- **Phase 2d follow-up**: Architect/Hermit work-generation cadence after the Python brain is removed — tracked in #3381.
+- **Daemon-rebuild epic**: #3449 (Phases A–E shipped; Phase F is the dedicated daemon-rebuild migration guide).
+- **Original shepherd-deprecation epic**: #3372.
+- **Consumer inventory + disposition table**: `docs/migration/daemon-state-consumers.md` — read this if you have code that imports from `loom_tools.daemon_v2` or `loom_tools.shepherd`, or reads `.loom/daemon-state.json` or `.loom/progress/`.
+- **Full migration guide**: [`docs/migration/v0.10.0-shepherd-deprecation.md`](../docs/migration/v0.10.0-shepherd-deprecation.md).
+- **Architect/Hermit cadence (work generation)** after the Python brain is removed — tracked in #3381.
 
 ## Resources
 
