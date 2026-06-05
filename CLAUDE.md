@@ -140,7 +140,11 @@ Architect and Hermit cadence (work-generation triggers) is intentionally out of 
 
 Full role definitions: `.loom/roles/*.md`.
 
-> **Note**: the historical `shepherd.md` (single-issue orchestrator) role file was removed in v0.10.0 along with the `/shepherd` slash command — see [the migration guide](docs/migration/v0.10.0-shepherd-deprecation.md). Its orchestration responsibilities moved to `/loom:sweep` (Tier 1) and the spawn loop + GH Actions cron (Tier 2). The `loom.md` role file is preserved and documents the daemon-mode operator surface (`./.loom/scripts/daemon.sh` + tmux + token-rotated separate Claude Code sessions); the Python brain it historically referenced (`loom_tools/daemon_v2/`) is removed in v0.10.0, but the shell-level daemon surface stays. The worker-role markdown files above are unchanged.
+> **Stop-gap — daemon backend in flight (v0.10.0 rebuild, epic #3449)**
+>
+> `./.loom/scripts/daemon.sh` does not exist on `origin/main` as of v0.9.1; the dispatcher was deleted in #3432 and is being rebuilt in epic #3449 (~4-6 weeks, scheduled for v0.10.0). The text below describes the intended target state. Until Phase A through E of #3449 land, daemon operator commands (`./.loom/scripts/daemon.sh start|stop|status`) will fail with "no such file or directory". Use `./.loom/scripts/spawn-loop.sh` for headless multi-issue dispatch in the interim. Tracker: #3451 (this stop-gap), #3449 (rebuild epic).
+
+> **Note**: the historical `shepherd.md` (single-issue orchestrator) role file was removed in v0.10.0 along with the `/shepherd` slash command — see [the migration guide](docs/migration/v0.10.0-shepherd-deprecation.md). Its orchestration responsibilities moved to `/loom:sweep` (Tier 1) and the spawn loop + GH Actions cron (Tier 2). The `loom.md` role file is preserved and documents the daemon-mode operator surface (`./.loom/scripts/daemon.sh` + tmux + token-rotated separate Claude Code sessions — see stop-gap warning above re: in-flight rebuild #3449); the Python brain it historically referenced (`loom_tools/daemon_v2/`) is removed in v0.10.0, but the shell-level daemon surface stays. The worker-role markdown files above are unchanged.
 
 ## Label-Based Workflow
 
@@ -289,6 +293,10 @@ Configuration stored in `.loom/config.json` (committed to git for team sharing):
 ```
 
 ### Spawn-Loop Configuration
+
+> **Stop-gap — daemon backend in flight (v0.10.0 rebuild, epic #3449)**
+>
+> The paragraph below claims `./.loom/scripts/daemon.sh` is "preserved and re-implemented" — but the file does not exist on `origin/main` as of v0.9.1 (deleted in #3432). The rebuild is tracked in epic #3449 (~4-6 weeks). Until that lands, the only working multi-issue dispatch backend is `./.loom/scripts/spawn-loop.sh` (headless) or the GitHub Actions cron workflows. The daemon prose stays here as a forward-looking pointer at the target state.
 
 The spawn loop replaces the historical Python daemon brain. The shell-level daemon surface (`./.loom/scripts/daemon.sh`) is preserved and re-implemented around the spawn loop + GitHub Actions cron + token-rotated tmux panes (see [`.loom/docs/daemon-reference.md`](.loom/docs/daemon-reference.md)). For the full migration narrative, see [`docs/migration/v0.10.0-shepherd-deprecation.md`](docs/migration/v0.10.0-shepherd-deprecation.md).
 
@@ -551,6 +559,10 @@ The script updates all 5 version-bearing files (`package.json`, `mcp-loom/packag
 
 ## Migration: v0.10.0 shepherd/daemon deprecation (completed)
 
+> **Stop-gap — daemon "preserved" claim is currently aspirational (epic #3449, stop-gap #3451)**
+>
+> The next paragraph says the shell-level daemon surface "is preserved, re-implemented as a tmux session launcher around the spawn loop". On `origin/main` as of v0.9.1, `./.loom/scripts/daemon.sh` does **not** exist — it was deleted in #3432 and is being rebuilt in epic #3449 over an estimated 4-6 weeks for v0.10.0. The shepherd/Python-daemon-brain deletions are real and shipped; the daemon-shell rebuild is in flight. Until #3449 ships, use `./.loom/scripts/spawn-loop.sh` (headless) or GitHub Actions cron workflows.
+
 The orchestration-architecture migration (epic #3372) is complete as of v0.10.0. The shepherd brain (`loom-tools/src/loom_tools/shepherd/`), the Python daemon brain (`loom-tools/src/loom_tools/daemon_v2/`), and the `/shepherd` slash command were deleted and replaced by the spawn loop (#3374) + GitHub Actions workflows (#3375). The shell-level daemon surface (`./.loom/scripts/daemon.sh`) is preserved, re-implemented as a tmux session launcher around the spawn loop. The completed phases:
 
 | Phase | Issue | What shipped | Status |
@@ -558,7 +570,7 @@ The orchestration-architecture migration (epic #3372) is complete as of v0.10.0.
 | Phase 1 | #3374 | Minimal multi-account spawn loop (`./.loom/scripts/spawn-loop.sh`) | shipped |
 | Phase 2a | #3375 | GitHub Actions workflows for support roles | shipped (disabled by default) |
 | Phase 2b | #3376 | Soft-deprecation warnings on deprecated entry points | shipped |
-| Phase 3 | #3378 | Deletion of shepherd brain, Python daemon brain, `/shepherd` skill; `daemon.sh` re-implemented | shipped (v0.10.0) |
+| Phase 3 | #3378 | Deletion of shepherd brain, Python daemon brain, `/shepherd` skill; `daemon.sh` re-implemented | partial (deletions shipped; daemon.sh re-implementation in flight under epic #3449) |
 | Phase 4 | #3382 | Coordinated downstream sphere-install migration | shipped |
 
 **v1.0.0 is intentionally unscheduled.** Loom remains pre-1.0 while the architecture settles.
@@ -567,7 +579,7 @@ The orchestration-architecture migration (epic #3372) is complete as of v0.10.0.
 
 | Removed | Replacement |
 |---------|-------------|
-| `loom-daemon` Python CLI | `./.loom/scripts/daemon.sh` (preserved) or `./.loom/scripts/spawn-loop.sh` (headless) + GitHub Actions schedules |
+| `loom-daemon` Python CLI | `./.loom/scripts/daemon.sh` (rebuild in flight, epic #3449 — use `./.loom/scripts/spawn-loop.sh` headless until then) + GitHub Actions schedules |
 | `loom-shepherd` CLI / `/shepherd` slash command | `/loom:sweep <issue>` for the same per-issue lifecycle |
 
 Full migration narrative and per-CLI replacement table: [`docs/migration/v0.10.0-shepherd-deprecation.md`](docs/migration/v0.10.0-shepherd-deprecation.md).

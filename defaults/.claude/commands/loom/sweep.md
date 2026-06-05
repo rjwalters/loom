@@ -770,6 +770,8 @@ If the user is running an overnight sweep, they should heed the warning before w
 
 ## Daemon Coexistence
 
+> **Stop-gap note (epic #3449, stop-gap #3451)**: `./.loom/scripts/daemon.sh` does not currently exist on `origin/main` (deleted in #3432, rebuild in flight under epic #3449). The PID-file check below is a defensive coexistence guard that fires only if a daemon process is already running — it's a no-op in v0.9.x. The `./.loom/scripts/daemon.sh stop` instruction in the warning text is forward-looking until the rebuild lands.
+
 `/sweep` does not require the daemon and does not interact with `.loom/daemon-state.json` for writes. If the daemon is running, `/sweep` and the daemon may both try to claim the same `loom:issue` label.
 
 **Coexistence behavior:** before the first wave, check whether the daemon is running. If it is, warn the user once at the start of the sweep:
