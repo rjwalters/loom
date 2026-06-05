@@ -1,8 +1,16 @@
 use crate::activity::{ActivityEntry, ClaimResult, ClaimType, ClaimsSummary, IssueClaim};
 use crate::errors::DaemonError;
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
 
 pub type TerminalId = String;
+
+/// Unique identifier for a sweep dispatched via the daemon (Issue #3452).
+///
+/// Format mirrors the spawn-loop convention:
+/// `sweep-issue-<N>-<unix-secs>` or `sweep-prs-<n1>-<n2>-..-<unix-secs>`.
+pub type SweepId = String;
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "type", content = "payload")]
@@ -113,6 +121,27 @@ pub enum Request {
     ReleaseTerminalClaims {
         terminal_id: TerminalId,
     },
+    // ========================================================================
+    // Sweep Registry Requests (Issue #3452 — Phase A of #3449)
+    // ========================================================================
+    /// Dispatch a `/loom:sweep` child for the given kind.
+    ///
+    /// Shells out to `defaults/scripts/spawn-claude.sh` for token rotation and
+    /// detaches a `claude -p "/loom:sweep <args>"` child. Tracking is in-memory
+    /// only — no daemon state file is written.
+    ///
+    /// `idempotency_key` allows the caller to deduplicate concurrent dispatches.
+    /// If a `Running` sweep with the same key exists, the existing `sweep_id`
+    /// is returned with no new spawn. If the matching sweep has `Exited` or
+    /// `Crashed`, a new sweep is spawned.
+    DispatchSweep {
+        kind: SweepKind,
+        idempotency_key: Option<String>,
+    },
+    /// List tracked sweeps, optionally filtered by state.
+    ListSweeps {
+        state_filter: Option<SweepState>,
+    },
     Shutdown,
 }
 
@@ -170,6 +199,20 @@ pub enum Response {
         count: usize,
     },
     Success,
+    // ========================================================================
+    // Sweep Registry Responses (Issue #3452 — Phase A of #3449)
+    // ========================================================================
+    /// Result of a successful `DispatchSweep` request.
+    SweepDispatched {
+        sweep_id: SweepId,
+        pid: u32,
+        token_name: String,
+        log_path: PathBuf,
+    },
+    /// Result of a `ListSweeps` request.
+    SweepList {
+        sweeps: Vec<SweepInfo>,
+    },
     /// Legacy error response (deprecated, use `StructuredError` for new code)
     /// Kept for backwards compatibility with existing frontends
     Error {
@@ -207,4 +250,90 @@ pub enum AgentStatus {
     WaitingForInput,
     Error,
     Stopped,
+}
+
+// ========================================================================
+// Sweep Registry Types (Issue #3452 — Phase A of #3449)
+// ========================================================================
+
+/// The kind of sweep to dispatch.
+///
+/// This phase delivers issue-keyed dispatch. PR-set dispatch (Mode C) is
+/// reserved here for future phases — the daemon's API surface accepts it,
+/// but Phase A only fully implements `Issue`. `PrSet` is an explicit
+/// non-goal for Phase A per epic #3449.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "type", content = "value")]
+pub enum SweepKind {
+    /// Issue-keyed sweep: `claude -p "/loom:sweep <N>"`.
+    Issue(u32),
+    /// PR-set sweep: `claude -p "/loom:sweep --prs <n1> <n2> ..."`.
+    /// Reserved for future phases; current code returns an error.
+    PrSet(Vec<u32>),
+}
+
+/// Lifecycle state of a tracked sweep.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "state", content = "details")]
+pub enum SweepState {
+    /// Spawn requested but the child PID has not yet been confirmed alive.
+    /// In Phase A this transient state collapses immediately into `Running`,
+    /// but the variant is reserved for future async-spawn paths.
+    Pending,
+    /// Child PID is alive (verified by the most recent reaper tick).
+    Running,
+    /// Child exited; recorded by the reaper task on a `kill(pid, 0)` failure.
+    Exited {
+        /// Exit code if available (`waitpid` is not used post-detach;
+        /// in practice this is always `None` for detached children).
+        code: Option<i32>,
+        at: DateTime<Utc>,
+    },
+    /// Child died with a checkpoint present on disk; the reaper has
+    /// flipped the issue label back to `loom:issue` so the next dispatch
+    /// can resume from the checkpointed phase (sweep skill #3373).
+    Crashed { at: DateTime<Utc> },
+}
+
+impl SweepState {
+    /// Returns true when the sweep is no longer live.
+    #[must_use]
+    pub fn is_terminal(&self) -> bool {
+        matches!(self, Self::Exited { .. } | Self::Crashed { .. })
+    }
+}
+
+/// In-memory record of a dispatched sweep.
+///
+/// This is the schema returned by `ListSweeps`; downstream consumers
+/// (mcp-loom, UI) should treat this as the canonical sweep shape.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SweepInfo {
+    /// Stable opaque ID assigned at dispatch time.
+    pub sweep_id: SweepId,
+    /// The dispatched kind (used to render the prompt).
+    pub kind: SweepKind,
+    /// PID of the detached child process.
+    pub pid: u32,
+    /// Token account name selected by `spawn-claude.sh` (e.g. `agent-2.token`).
+    /// "unknown" when not surfaced by the wrapper (Phase A logs this in
+    /// the per-sweep log rather than recording it on the entry).
+    pub token_name: String,
+    /// Path to the per-sweep log file (relative to the workspace).
+    pub log_path: PathBuf,
+    /// Optional idempotency key supplied at dispatch.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub idempotency_key: Option<String>,
+    /// Timestamp of the original spawn.
+    pub started_at: DateTime<Utc>,
+    /// Current lifecycle state.
+    pub state: SweepState,
+    /// Most-recent phase the sweep advertised via its checkpoint, if any.
+    /// Populated by `sweep_registry::reconstruct_from_checkpoints`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub latest_phase: Option<String>,
+    /// PR number the sweep eventually opened, if known. Reserved for
+    /// future phases (Phase A always sets this to `None`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pr_number: Option<i32>,
 }

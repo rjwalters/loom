@@ -3,6 +3,7 @@ use loom_daemon::health_monitor;
 use loom_daemon::ipc::IpcServer;
 use loom_daemon::metrics_collector;
 use loom_daemon::role_validation;
+use loom_daemon::sweep_registry::{self, SweepRegistry, SweepRegistryConfig};
 use loom_daemon::terminal::TerminalManager;
 use loom_daemon::{extract_configured_terminal_ids, rotate_log_file};
 
@@ -192,8 +193,32 @@ async fn main() -> Result<()> {
         // Note: metrics_handle is dropped here, but the thread keeps running if enabled
     }
 
+    // Initialize the sweep registry (Issue #3452 — Phase A of #3449).
+    // The registry tracks `/loom:sweep` children dispatched via the
+    // `DispatchSweep` IPC request. It writes no daemon-side state file;
+    // recovery on restart relies on lock dirs + sweep checkpoints + the
+    // forge (labels). The reaper task polls live PIDs on a configurable
+    // interval (`LOOM_SWEEP_REAPER_INTERVAL_SECS`, default 30s).
+    let sweep_workspace = workspace_from_env
+        .as_ref()
+        .map(std::path::PathBuf::from)
+        .or_else(|| std::env::current_dir().ok())
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+    let sweep_config = SweepRegistryConfig::new(sweep_workspace.clone());
+    let mut sweep = SweepRegistry::new(sweep_config);
+    match sweep.reconstruct() {
+        Ok(0) => log::debug!("sweep_registry: no sweeps to reconstruct"),
+        Ok(n) => log::info!(
+            "sweep_registry: reconstructed {n} sweep entr{}",
+            if n == 1 { "y" } else { "ies" }
+        ),
+        Err(e) => log::warn!("sweep_registry: reconstruction failed: {e}"),
+    }
+    let sweep_registry = Arc::new(Mutex::new(sweep));
+    let _reaper_handle = sweep_registry::spawn_reaper_task(sweep_registry.clone());
+
     // Start IPC server
-    let server = IpcServer::new(socket_path.clone(), tm, activity_db);
+    let server = IpcServer::new(socket_path.clone(), tm, activity_db, sweep_registry);
 
     // Setup signal handler for graceful shutdown
     let socket_path_clone = socket_path.clone();
