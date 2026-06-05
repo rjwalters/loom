@@ -83,6 +83,61 @@
 
 set -euo pipefail
 
+# ─── Deprecation warning (Phase E of #3449, deletion deferred to v0.11.0) ────
+#
+# `spawn-loop.sh` is the historical multi-account dispatcher (Phase 1 of the
+# shepherd/daemon deprecation epic #3372). It has been superseded by the Rust
+# `loom-daemon` binary, which now provides the load-bearing multi-account
+# dispatch surface via MCP tools (Phases A–D of epic #3449, all shipped on
+# main):
+#
+#   - `mcp__loom__dispatch_sweep`   (Phase A) — dispatch a sweep for an issue
+#   - `mcp__loom__list_sweeps`      (Phase A) — observe running sweeps
+#   - `mcp__loom__subscribe_to_events`, `mcp__loom__publish_event`,
+#     `mcp__loom__get_sweep_status`, `mcp__loom__tail_sweep_log`,
+#     `mcp__loom__cancel_sweep`, `mcp__loom__tail_event_bus`
+#                                   (Phases B / C)
+#   - `/loom:sweep` Stage -1 backend detection auto-routes to the daemon when
+#     it is reachable AND a multi-account token pool exists (Phase D).
+#
+# This script is retained through v0.10.x for downstream forks mid-migration
+# (per curator risk note C on #3456). It will be DELETED in v0.11.0. The
+# warning fires on every `start` / `status` / `stop` invocation; the script
+# still works as before.
+#
+# Migration hint (one-liner): use `mcp__loom__dispatch_sweep` from a Claude
+# Code session to enqueue work against the running `loom-daemon`. See
+# `docs/migration/v0.10.0-shepherd-deprecation.md` for the full guide; the
+# dedicated daemon-rebuild migration guide is filed under Phase F of #3449.
+#
+# Suppression: set `LOOM_SUPPRESS_DEPRECATION=1` to silence this warning if
+# you are intentionally keeping `spawn-loop.sh` in your automation during the
+# v0.10.x → v0.11.0 window.
+_deprecation_warn() {
+    if [[ "${LOOM_SUPPRESS_DEPRECATION:-}" == "1" ]]; then
+        return 0
+    fi
+    cat >&2 <<'WARN'
+─────────────────────────────────────────────────────────────────────────────
+DEPRECATION WARNING (#3449 Phase E): defaults/scripts/spawn-loop.sh
+
+This script is deprecated and scheduled for DELETION in v0.11.0. The
+multi-account dispatch surface has moved to the Rust `loom-daemon` binary
+and its MCP tools.
+
+  Migration: use `mcp__loom__dispatch_sweep` from a Claude Code session, or
+             let `/loom:sweep <issue>` auto-detect the daemon (Stage -1
+             backend probe — see defaults/.claude/commands/loom/sweep.md).
+
+  See docs/migration/v0.10.0-shepherd-deprecation.md for the full migration
+  guide. A dedicated daemon-rebuild migration guide will land under Phase F
+  of epic #3449.
+
+  Silence this warning by exporting LOOM_SUPPRESS_DEPRECATION=1.
+─────────────────────────────────────────────────────────────────────────────
+WARN
+}
+
 # ─── Path resolution ────────────────────────────────────────────────────────
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # Resolve repo root via git common-dir to handle invocation from worktrees.
@@ -529,6 +584,7 @@ run_loop() {
 
 # ─── Commands ───────────────────────────────────────────────────────────────
 cmd_start() {
+    _deprecation_warn
     if [[ "${LOOM_USE_SPAWN_LOOP:-}" != "1" ]]; then
         cat >&2 <<EOF
 spawn-loop is opt-in. Set LOOM_USE_SPAWN_LOOP=1 to start:
@@ -561,6 +617,7 @@ EOF
 }
 
 cmd_stop() {
+    _deprecation_warn
     if [[ ! -f "$PIDFILE" ]]; then
         echo "spawn-loop not running"
         return 0
@@ -588,6 +645,7 @@ cmd_stop() {
 }
 
 cmd_status() {
+    _deprecation_warn
     if [[ ! -f "$PIDFILE" ]]; then
         echo "spawn-loop: not running"
         return 1

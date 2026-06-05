@@ -275,6 +275,49 @@ assert_contains "LOOM_USE_SPAWN_LOOP" "$help_output" "usage documents opt-in env
 assert_contains "MAX_PARALLEL" "$help_output" "usage documents MAX_PARALLEL override"
 assert_contains "POLL_INTERVAL" "$help_output" "usage documents POLL_INTERVAL override"
 
+# ─── Section 9: deprecation warning (Phase E of #3449) ──────────────────────
+echo ""
+echo "Testing deprecation warning fires on subcommand invocations..."
+
+# Stop the spawn-loop running in our hermetic temp dir before checking warnings
+# (status uses cmd_status which calls _deprecation_warn before the not-running
+# check). The script exits with 1 from cmd_status when not running, so we
+# tolerate that and just inspect stderr.
+set +e
+status_stderr="$( "$SPAWN_LOOP" status 2>&1 1>/dev/null )"
+set -e
+assert_contains "DEPRECATION WARNING" "$status_stderr" "status emits deprecation banner on stderr"
+assert_contains "#3449" "$status_stderr" "deprecation warning references epic #3449"
+assert_contains "v0.11.0" "$status_stderr" "deprecation warning names v0.11.0 removal target"
+assert_contains "mcp__loom__dispatch_sweep" "$status_stderr" "deprecation warning includes Phase A migration hint"
+
+# Stop also fires the warning.
+set +e
+stop_stderr="$( "$SPAWN_LOOP" stop 2>&1 1>/dev/null )"
+set -e
+assert_contains "DEPRECATION WARNING" "$stop_stderr" "stop emits deprecation banner on stderr"
+
+# Start fires the warning too (even when blocked by the opt-in gate).
+set +e
+start_stderr="$( "$SPAWN_LOOP" start 2>&1 1>/dev/null )"
+set -e
+assert_contains "DEPRECATION WARNING" "$start_stderr" "start emits deprecation banner on stderr"
+
+# LOOM_SUPPRESS_DEPRECATION=1 silences it.
+set +e
+suppressed_stderr="$( LOOM_SUPPRESS_DEPRECATION=1 "$SPAWN_LOOP" status 2>&1 1>/dev/null )"
+set -e
+if [[ "$suppressed_stderr" == *"DEPRECATION WARNING"* ]]; then
+    TESTS_RUN=$((TESTS_RUN + 1))
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "  ${RED}FAIL${NC}: LOOM_SUPPRESS_DEPRECATION=1 silences the warning"
+    echo "    Got stderr: '$suppressed_stderr'"
+else
+    TESTS_RUN=$((TESTS_RUN + 1))
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "  ${GREEN}PASS${NC}: LOOM_SUPPRESS_DEPRECATION=1 silences the warning"
+fi
+
 # ─── Summary ────────────────────────────────────────────────────────────────
 echo ""
 echo "─────────────────────────────────────────"
