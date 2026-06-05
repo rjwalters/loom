@@ -1,8 +1,12 @@
 """Loom system status display for Layer 3 observation.
 
 Replaces the former ``loom-status.sh`` (814 LOC) with a Python module that
-reuses ``snapshot.build_snapshot()`` for data collection and provides
-colored terminal formatting.
+provides colored terminal formatting.
+
+Phase 3.2 port (#3399, epic #3372): ``build_snapshot()`` from the deleted
+``snapshot.py`` is replaced by ``collect_pipeline_data()`` from
+``forge_snapshot.py``.  The snapshot dict is built locally from forge data
+plus ``.loom/spawn-loop-state.json``.
 
 Phase 3 port (#3390, epic #3372): primary live-state source is now
 ``.loom/spawn-loop-state.json`` (Phase 1, #3374) plus forge queries.
@@ -32,10 +36,10 @@ from loom_tools.common.state import (
     read_json_file,
     read_spawn_loop_state,
 )
-from loom_tools.common.time_utils import parse_iso_timestamp
+from loom_tools.common.time_utils import now_utc, parse_iso_timestamp
+from loom_tools.forge_snapshot import collect_pipeline_data
 from loom_tools.models.daemon_state import DaemonState
 from loom_tools.models.spawn_loop_state import SpawnLoopState, SpawnLoopTask
-from loom_tools.snapshot import build_snapshot
 
 # ---------------------------------------------------------------------------
 # ANSI color support with TTY detection
@@ -951,20 +955,64 @@ def main(argv: Sequence[str] | None = None) -> None:
         print("Error: --fast and --json are mutually exclusive", file=sys.stderr)
         sys.exit(1)
 
+    repo_root = find_repo_root()
+
     if fast_mode:
-        repo_root = find_repo_root()
         daemon_state = read_daemon_state(repo_root)
         spawn_loop_state = read_spawn_loop_state(repo_root)
         output_fast(daemon_state, repo_root, spawn_loop_state=spawn_loop_state)
         return
 
-    # Build snapshot (includes parallel gh queries)
-    snapshot = build_snapshot()
+    # Build snapshot from forge queries (replaces build_snapshot() from deleted snapshot.py).
+    pipeline = collect_pipeline_data(repo_root)
+    now = now_utc()
+    timestamp = now.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    # Build a minimal snapshot dict that the render functions expect.
+    ready_to_merge = pipeline.get("ready_to_merge", [])
+    merge_conflicted = [
+        pr for pr in ready_to_merge
+        if any(
+            (lbl.get("name") if isinstance(lbl, dict) else None) == "loom:merge-conflict"
+            for lbl in pr.get("labels", []) or []
+        )
+    ]
+    snapshot: dict[str, Any] = {
+        "timestamp": timestamp,
+        "pipeline": {
+            "ready_issues": pipeline.get("ready_issues", []),
+            "building_issues": pipeline.get("building_issues", []),
+            "blocked_issues": pipeline.get("blocked_issues", []),
+        },
+        "proposals": {
+            "architect": pipeline.get("architect_proposals", []),
+            "hermit": pipeline.get("hermit_proposals", []),
+            "curated": pipeline.get("curated_issues", []),
+        },
+        "prs": {
+            "review_requested": pipeline.get("review_requested", []),
+            "changes_requested": pipeline.get("changes_requested", []),
+            "ready_to_merge": ready_to_merge,
+            "merge_conflicted": merge_conflicted,
+            "merge_conflict_count": len(merge_conflicted),
+        },
+        "computed": {
+            "total_ready": len(pipeline.get("ready_issues", [])),
+            "total_building": len(pipeline.get("building_issues", [])),
+            "total_blocked": len(pipeline.get("blocked_issues", [])),
+            "total_uncurated": len(pipeline.get("uncurated_issues", [])),
+            "prs_awaiting_review": len(pipeline.get("review_requested", [])),
+            "prs_needing_fixes": len(pipeline.get("changes_requested", [])),
+            "prs_ready_to_merge": len(ready_to_merge),
+            "prs_with_merge_conflicts": len(merge_conflicted),
+        },
+        "usage": pipeline.get("usage", {"error": "no data"}),
+        "ci_status": pipeline.get("ci_status", {"status": "unknown"}),
+    }
 
     if json_mode:
         print(output_json(snapshot))
     else:
-        repo_root = find_repo_root()
         daemon_state = read_daemon_state(repo_root)
         spawn_loop_state = read_spawn_loop_state(repo_root)
         colored = _use_color()

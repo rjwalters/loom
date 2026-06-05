@@ -14,11 +14,15 @@ dependencies = [
 ]
 
 [project.scripts]
-loom-shepherd = "loom_tools.shepherd.cli:main"
+# loom-shepherd removed in Phase 3.3 (#3400) — shepherd brain deleted
+# loom-shepherd = "loom_tools.shepherd.cli:main"
 loom-agent-wait = "loom_tools.agent_wait:main"
 loom-agent-monitor = "loom_tools.agent_monitor:main"
+# loom-daemon-diagnostic: daemon_diagnostic.py is kept (ported to spawn-loop) but
+# still references DaemonState fallback; entry point preserved until Phase 3.4
 loom-daemon-diagnostic = "loom_tools.daemon_diagnostic:main"
-loom-daemon-loop = "loom_tools.daemon:main"
+# loom-daemon-loop removed in Phase 3.2 (#3399) — daemon.py (V1) deleted
+# loom-daemon-loop = "loom_tools.daemon:main"
 loom-stuck-detection = "loom_tools.stuck_detection:main"
 loom-claim = "loom_tools.claim:main"
 loom-check-completions = "loom_tools.completions:main"
@@ -26,7 +30,8 @@ loom-clean = "loom_tools.clean:main"
 loom-milestone = "loom_tools.milestones:main"
 loom-worktree = "loom_tools.worktree:main"
 loom-recover-orphans = "loom_tools.orphan_recovery:main"
-loom-validate-state = "loom_tools.validate_state:main"
+# loom-validate-state removed in Phase 3.2 (#3399) — validate_state.py deleted
+# loom-validate-state = "loom_tools.validate_state:main"
 loom-status = "loom_tools.status:main"
 loom-cleanup = "loom_tools.cleanup:main"
 loom-agent-metrics = "loom_tools.agent_metrics:main"
@@ -36,10 +41,14 @@ loom-validate-phase = "loom_tools.validate_phase:main"
 loom-agent-spawn = "loom_tools.agent_spawn:main"
 loom-health-monitor = "loom_tools.health_monitor:main"
 loom-baseline-health = "loom_tools.baseline_health_cli:main"
-loom-snapshot = "loom_tools.snapshot:main"
+# loom-snapshot removed in Phase 3.2 (#3399) — snapshot.py (daemon brain) deleted;
+# use forge_snapshot.collect_pipeline_data() directly
+# loom-snapshot = "loom_tools.snapshot:main"
 loom-checkpoint = "loom_tools.checkpoints:main"
-loom-daemon = "loom_tools.daemon_v2.cli:main"
-loom-test-failure-analysis = "loom_tools.test_failure_analysis:main"
+# loom-daemon removed in Phase 3.2 (#3399) — daemon_v2/ brain deleted
+# loom-daemon = "loom_tools.daemon_v2.cli:main"
+# loom-test-failure-analysis removed in Phase 3.2 (#3399) — test_failure_analysis.py retiring
+# loom-test-failure-analysis = "loom_tools.test_failure_analysis:main"
 loom-usage = "loom_tools.common.usage:main"
 loom-backlog = "loom_tools.backlog:main"
 loom-forge = "loom_tools.forge_cli:cli_main"

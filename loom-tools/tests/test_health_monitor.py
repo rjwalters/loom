@@ -364,7 +364,7 @@ class TestCollectSnapshot:
         # When collect_pipeline_data raises, collect_snapshot returns zeros.
         sls = SpawnLoopState(started_at=TS, running=[], present=True)
         with patch(
-            "loom_tools.snapshot.collect_pipeline_data",
+            "loom_tools.forge_snapshot.collect_pipeline_data",
             side_effect=RuntimeError("forge unreachable"),
         ):
             snap = collect_snapshot(tmp_path, _now=NOW, _spawn_loop_state=sls)

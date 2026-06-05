@@ -23,11 +23,10 @@ import sys
 import pytest
 
 # All Python CLI commands that loom-tools should expose
+# Phase 3.2 (#3399): removed loom-shepherd (phase 3.3), loom-daemon-loop (daemon.py deleted)
 EXPECTED_CLI_COMMANDS = [
-    "loom-shepherd",
     "loom-agent-monitor",
     "loom-daemon-diagnostic",
-    "loom-daemon-loop",
     "loom-stuck-detection",
     "loom-claim",
     "loom-check-completions",
@@ -43,9 +42,8 @@ PYTHON_ROUTING_SCRIPTS = [
 ]
 
 # Wrapper scripts that call Python internally (not exec replacement)
-PYTHON_INTEGRATION_SCRIPTS = [
-    "health-check.sh",
-]
+# Phase 3.2 (#3399): health-check.sh deleted (daemon producer shell script)
+PYTHON_INTEGRATION_SCRIPTS: list[str] = []
 
 # Files that loom-daemon init should create/manage
 EXPECTED_INSTALLED_DIRS = [
@@ -171,20 +169,6 @@ class TestWrapperScriptRouting:
         assert "command -v loom-shepherd" in content, (
             "loom-shepherd.sh doesn't check PATH for system-installed command"
         )
-
-    def test_health_check_delegates_to_python(
-        self, defaults_dir: pathlib.Path
-    ) -> None:
-        """health-check.sh should delegate to Python loom-health-monitor."""
-        script = defaults_dir / "scripts" / "health-check.sh"
-        assert script.exists(), "health-check.sh not found"
-
-        content = script.read_text()
-        # Accept either direct command reference or run_loom_tool helper
-        assert (
-            "loom-health-monitor" in content
-            or 'run_loom_tool "health-monitor"' in content
-        ), "health-check.sh doesn't delegate to loom-health-monitor"
 
     def test_cleanup_delegates_to_python(
         self, defaults_dir: pathlib.Path

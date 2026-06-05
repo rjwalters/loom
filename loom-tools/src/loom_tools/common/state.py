@@ -2,6 +2,13 @@
 
 Provides centralized JSON parsing utilities with consistent error handling.
 All parsing functions gracefully handle failures by returning defaults.
+
+Phase 3.2 note: read_daemon_state(), read_progress_files(), and
+find_progress_for_issue() were removed in PR #3399 along with the Python
+daemon brain (daemon_v2/) and the state files they read
+(.loom/daemon-state.json, .loom/progress/).  Callers that still need a
+DaemonState placeholder for backwards-compat render paths import
+DaemonState directly and instantiate a default: ``DaemonState()``.
 """
 
 from __future__ import annotations
@@ -15,9 +22,7 @@ from typing import Any, TypeVar
 
 from loom_tools.common.paths import LoomPaths
 from loom_tools.models.baseline_health import BaselineHealth
-from loom_tools.models.daemon_state import DaemonState
 from loom_tools.models.health import AlertsFile, HealthMetrics
-from loom_tools.models.progress import ShepherdProgress
 from loom_tools.models.spawn_loop_state import SpawnLoopState
 from loom_tools.models.stuck import StuckHistory
 
@@ -138,13 +143,38 @@ def write_json_file(
         raise
 
 
-def read_daemon_state(repo_root: pathlib.Path) -> DaemonState:
-    """Load ``.loom/daemon-state.json`` into a :class:`DaemonState`."""
-    paths = LoomPaths(repo_root)
-    data = read_json_file(paths.daemon_state_file)
-    if isinstance(data, list):
-        return DaemonState()
-    return DaemonState.from_dict(data)
+def read_daemon_state(repo_root: pathlib.Path) -> "DaemonState":
+    """Stub: always returns an empty DaemonState.
+
+    The daemon-state.json producer (daemon_v2/) was deleted in Phase 3.2
+    (#3399). This stub is kept so that Phase 3.1.x CLI ports (status.py,
+    completions.py) that have a daemon-state fallback path continue to
+    import without error.  Phase 3.4 (#3401) removes this stub along with
+    all remaining daemon-state read paths.
+    """
+    from loom_tools.models.daemon_state import DaemonState  # local import avoids circular
+
+    return DaemonState()
+
+
+def read_progress_files(repo_root: pathlib.Path) -> list:
+    """Stub: always returns empty list.
+
+    Progress files (.loom/progress/shepherd-*.json) are retired in Phase 3.2
+    (#3399). This stub is kept so that callers (test_failure_analysis.py,
+    validate_phase.py) continue to import without error.
+    Phase 3.3 (#3400) or Phase 3.4 (#3401) will remove the callers.
+    """
+    return []
+
+
+def find_progress_for_issue(repo_root: pathlib.Path, issue: int) -> None:
+    """Stub: always returns None.
+
+    Progress files (.loom/progress/shepherd-*.json) are retired in Phase 3.2
+    (#3399). This stub keeps validate_phase.py importable until Phase 3.4.
+    """
+    return None
 
 
 def read_spawn_loop_state(repo_root: pathlib.Path) -> SpawnLoopState:
@@ -166,55 +196,6 @@ def read_spawn_loop_state(repo_root: pathlib.Path) -> SpawnLoopState:
         # knows the spawn loop is at least configured; just return empty.
         return SpawnLoopState(present=True)
     return SpawnLoopState.from_dict(data)
-
-
-def read_progress_files(repo_root: pathlib.Path) -> list[ShepherdProgress]:
-    """Load all ``.loom/progress/shepherd-*.json`` files."""
-    paths = LoomPaths(repo_root)
-    if not paths.progress_dir.is_dir():
-        return []
-    results: list[ShepherdProgress] = []
-    for p in sorted(paths.progress_dir.glob("shepherd-*.json")):
-        data = read_json_file(p)
-        if isinstance(data, dict):
-            results.append(ShepherdProgress.from_dict(data))
-    return results
-
-
-def find_progress_for_issue(
-    repo_root: pathlib.Path, issue: int
-) -> ShepherdProgress | None:
-    """Find the most recent progress file for a specific issue.
-
-    Searches all ``.loom/progress/shepherd-*.json`` files and returns
-    the one with the matching issue number. If multiple files exist
-    for the same issue (e.g., from retries), returns the most recent
-    one based on ``started_at`` timestamp.
-
-    Args:
-        repo_root: Repository root path.
-        issue: Issue number to search for.
-
-    Returns:
-        ShepherdProgress for the issue if found, None otherwise.
-    """
-    paths = LoomPaths(repo_root)
-    if not paths.progress_dir.is_dir():
-        return None
-
-    candidates: list[ShepherdProgress] = []
-    for p in paths.progress_dir.glob("shepherd-*.json"):
-        data = read_json_file(p)
-        if isinstance(data, dict):
-            progress = ShepherdProgress.from_dict(data)
-            if progress.issue == issue:
-                candidates.append(progress)
-
-    if not candidates:
-        return None
-
-    # Return most recent by started_at (ISO format sorts lexicographically)
-    return max(candidates, key=lambda p: p.started_at or "")
 
 
 def read_health_metrics(repo_root: pathlib.Path) -> HealthMetrics:
