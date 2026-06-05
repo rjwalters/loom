@@ -7,8 +7,7 @@ paths (``shepherd-complete``, ``daemon-startup``, ``daemon-shutdown``,
 away with the daemon brain (retired in Phase 3.2).
 
 What remains is the log-archival logic that operates on ``.loom/logs/``
-(by delegating to ``archive-logs.sh``).  This piece ports cleanly because
-it does not read ``daemon-state.json`` at all.
+(by delegating to ``archive-logs.sh``).
 
 CLI surface::
 

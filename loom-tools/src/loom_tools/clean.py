@@ -225,12 +225,10 @@ def update_cleanup_state(
 ) -> None:
     """No-op shim (Phase 3.1.9, #3398).
 
-    Previously wrote per-issue cleanup status into
-    ``.loom/daemon-state.json::cleanup``. That state file is retired
-    with the daemon brain (epic #3372); the spawn loop's per-issue lock
-    presence + ``.loom/spawn-loop-state.json`` are the new source of
-    truth for "is this issue in flight". Cleanup status was only used
-    by the daemon UI, which is also being retired.
+    Previously wrote per-issue cleanup status into a now-retired state file.
+    The spawn loop's per-issue lock presence + ``.loom/spawn-loop-state.json``
+    are the new source of truth for "is this issue in flight". Cleanup status
+    was only used by the daemon UI, which is also being retired.
 
     The function signature is preserved so callers don't have to thread
     conditionals; future ports can drop the call sites in Phase 3.3.
@@ -734,9 +732,8 @@ def clean_daemon_crash_state(
 ) -> None:
     """Spawn-loop-aware crash recovery (Phase 3.1.9, #3398).
 
-    Originally a daemon-only flow that touched ``.loom/daemon-state.json``,
-    ``.loom/claims/``, and ``.loom/progress/``. Those state files belong
-    to the legacy daemon brain, which is being retired (epic #3372).
+    Originally a daemon-only flow that touched ``.loom/claims/`` and
+    ``.loom/progress/``.
 
     The post-port behaviour does only what is still meaningful for a
     spawn-loop-only workspace:
@@ -759,8 +756,7 @@ def clean_daemon_crash_state(
     print()
 
     # 2. Revert stale `loom:building` labels for issues no longer running
-    #    in the spawn loop. Was previously a `daemon-state.json` scan;
-    #    `_revert_stale_building_labels_spawn_loop` reads
+    #    in the spawn loop. `_revert_stale_building_labels_spawn_loop` reads
     #    `.loom/spawn-loop-state.json` and `gh issue list --label loom:building`.
     print("Step 2: Revert stale `loom:building` labels")
     _revert_stale_building_labels_spawn_loop(repo_root, dry_run=dry_run)
@@ -1184,9 +1180,7 @@ def _active_spawn_loop_issues(repo_root: pathlib.Path) -> set[int]:
     other gates (PR check, sentinel, reachability) rather than relying on
     it alone.
 
-    Phase 3.1.9 port (#3398, epic #3372): replaces the prior
-    ``daemon-state.json::shepherds`` read so ``loom-clean`` works against
-    workspaces that have migrated off the Python daemon brain.
+    Reads from ``.loom/spawn-loop-state.json`` and file-based claim locks.
     """
     state = read_spawn_loop_state(repo_root)
     active: set[int] = {task.issue for task in state.running if task.issue}

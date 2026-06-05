@@ -11,13 +11,6 @@ from loom_tools.models.agent_wait import (
     WaitResult,
     WaitStatus,
 )
-from loom_tools.models.daemon_state import (
-    DaemonState,
-    PipelineState,
-    ShepherdEntry,
-    SupportRoleEntry,
-    Warning,
-)
 from loom_tools.models.health import Alert, AlertsFile, HealthMetrics, MetricEntry
 from loom_tools.models.stuck import (
     StuckDetection,
@@ -39,12 +32,6 @@ __all__ = [
     "StuckConfig",
     "WaitResult",
     "WaitStatus",
-    # daemon_state
-    "DaemonState",
-    "PipelineState",
-    "ShepherdEntry",
-    "SupportRoleEntry",
-    "Warning",
     # health
     "Alert",
     "AlertsFile",

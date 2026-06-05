@@ -24,8 +24,6 @@ import sys
 import threading
 import time
 from dataclasses import dataclass
-from typing import Any
-
 from loom_tools.agent_spawn import TMUX_SOCKET, kill_stuck_session, session_exists
 from loom_tools.common.config import env_bool, env_int
 from loom_tools.common.logging import log_error, log_info, log_success, log_warning
@@ -91,41 +89,6 @@ def load_config() -> CleanupConfig:
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
-
-
-def has_active_shepherds(daemon_state: dict[str, Any]) -> bool:
-    """Return ``True`` if any shepherd in *daemon_state* has a non-null issue."""
-    shepherds = daemon_state.get("shepherds", {})
-    for entry in shepherds.values():
-        if isinstance(entry, dict) and entry.get("issue") is not None:
-            return True
-    return False
-
-
-def update_cleanup_timestamp(
-    state_path: pathlib.Path,
-    event: str,
-) -> None:
-    """Record the last cleanup event in the daemon state file."""
-    data = read_json_file(state_path)
-    if not isinstance(data, dict):
-        return
-
-    ts = now_utc().strftime("%Y-%m-%dT%H:%M:%SZ")
-
-    cleanup = data.get("cleanup")
-    if not isinstance(cleanup, dict):
-        cleanup = {
-            "lastRun": None,
-            "lastCleaned": [],
-            "pendingCleanup": [],
-            "errors": [],
-        }
-
-    cleanup["lastRun"] = ts
-    cleanup["lastEvent"] = event
-    data["cleanup"] = cleanup
-    write_json_file(state_path, data)
 
 
 def _run_archive_logs(
@@ -604,23 +567,8 @@ def handle_shepherd_complete(
     pr_data = safe_parse_json(pr_info)
     merged_at = pr_data.get("mergedAt") if isinstance(pr_data, dict) else None
 
-    state_path = repo_root / ".loom" / "daemon-state.json"
-
     if not merged_at:
-        log_info("PR not merged yet, scheduling for later cleanup")
-        if not dry_run and state_path.exists():
-            data = read_json_file(state_path)
-            if isinstance(data, dict):
-                cleanup = data.get("cleanup", {})
-                if not isinstance(cleanup, dict):
-                    cleanup = {}
-                pending = cleanup.get("pendingCleanup", [])
-                item = f"issue-{issue_number}"
-                if item not in pending:
-                    pending.append(item)
-                cleanup["pendingCleanup"] = pending
-                data["cleanup"] = cleanup
-                write_json_file(state_path, data)
+        log_info("PR not merged yet, skipping cleanup")
         return
 
     # Archive logs
@@ -644,9 +592,6 @@ def handle_shepherd_complete(
         from loom_tools.claim import release_claim
 
         release_claim(repo_root, issue_number)
-
-    if not dry_run:
-        update_cleanup_timestamp(state_path, "shepherd-complete")
 
     log_success(f"Shepherd complete cleanup finished for issue #{issue_number}")
 
@@ -777,34 +722,14 @@ def handle_daemon_startup(
     fresh: bool = False,
     max_shepherds: int = 10,
 ) -> None:
-    """Cleanup stale artifacts from a previous daemon session.
-
-    Steps 0a-0b run *before* the daemon state is rotated by the caller so
-    they can read the previous daemon state to discover which sessions were
-    active and which issues had ``loom:building`` labels.  This handles the
-    crash scenario where the previous daemon died without running shutdown
-    cleanup.
-    """
+    """Cleanup stale artifacts from a previous daemon session."""
     log_info("Daemon Startup Cleanup")
 
-    state_path = repo_root / ".loom" / "daemon-state.json"
-
     # 0a. Kill orphaned tmux sessions left by a crashed previous daemon.
-    #     Must happen before state rotation so we can read previous state.
-    log_info("Cleaning up orphaned tmux sessions from previous daemon...")
-    _terminate_active_sessions(state_path, dry_run=dry_run)
-
-    # 0b. Revert stale loom:building labels for issues that were mid-build
-    #     when the previous daemon crashed.
-    log_info("Reverting stale labels from previous daemon...")
-    _revert_shepherd_labels(state_path, dry_run=dry_run)
-
-    # 0c. Kill any remaining orphaned tmux sessions on the loom socket.
-    #     This catches sessions missed by state-based termination above.
     log_info("Killing orphaned tmux sessions...")
     _kill_orphaned_tmux_sessions(dry_run=dry_run)
 
-    # 0d. Clean up expired file-based claims from previous session
+    # 0b. Clean up expired file-based claims from previous session
     log_info("Cleaning up expired claims...")
     if not dry_run:
         from loom_tools.claim import cleanup_claims
@@ -813,22 +738,16 @@ def handle_daemon_startup(
     else:
         log_info("[DRY-RUN] Would clean up expired claims")
 
-    # 2. Ensure config directories and lock files exist for all shepherd slots.
-    #    Missing lock files cause crashes at spawn time (see #3097).
+    # 1. Ensure config directories and lock files exist for all shepherd slots.
     log_info("Ensuring shepherd config directories...")
     _ensure_shepherd_config_dirs(repo_root, max_shepherds, dry_run=dry_run)
 
-    # 3. Optionally reset failure counters when starting fresh.
+    # 2. Optionally reset failure counters when starting fresh.
     if fresh:
         log_info("Resetting failure counters (--fresh)...")
         _reset_failure_counters(repo_root, dry_run=dry_run)
 
-    # 4. Orphaned shepherd recovery — run in background to avoid blocking startup.
-    #    With many orphans (e.g. 60+), sequential GitHub API calls previously
-    #    delayed iteration 1 by 2-3 minutes.  Running in a daemon thread lets
-    #    the daemon process signals and start iterations immediately while
-    #    recovery proceeds concurrently (see issue #2973).
-    #    In dry-run mode we run synchronously so callers can inspect the result.
+    # 3. Orphaned shepherd recovery.
     log_info("Checking for orphaned shepherds from previous session...")
     _run_orphan_recovery(
         repo_root,
@@ -837,35 +756,16 @@ def handle_daemon_startup(
         run_background=not dry_run,
     )
 
-    # 5. Archive orphaned task outputs
+    # 4. Archive orphaned task outputs
     if config.archive_logs:
         log_info("Archiving orphaned task outputs...")
         _run_archive_logs(repo_root, dry_run=dry_run)
 
-    # 6. Process pending cleanups from previous session
-    if state_path.exists():
-        data = read_json_file(state_path)
-        if isinstance(data, dict):
-            cleanup = data.get("cleanup", {})
-            pending = (
-                cleanup.get("pendingCleanup", []) if isinstance(cleanup, dict) else []
-            )
-            if pending:
-                log_info("Processing pending cleanups from previous session...")
-                for item in list(pending):
-                    log_info(f"  Processing: {item}")
-                    if not dry_run:
-                        pending.remove(item)
-                if not dry_run:
-                    cleanup["pendingCleanup"] = pending
-                    data["cleanup"] = cleanup
-                    write_json_file(state_path, data)
-
-    # 7. Clean stale worktrees
+    # 5. Clean stale worktrees
     log_info("Cleaning stale worktrees...")
     _run_loom_clean(repo_root, dry_run=dry_run)
 
-    # 8. Prune old archives
+    # 6. Prune old archives
     log_info("Pruning old archives...")
     _run_archive_logs(
         repo_root,
@@ -874,7 +774,7 @@ def handle_daemon_startup(
         retention_days=config.retention_days,
     )
 
-    # 9. Cleanup stale progress files (with startup-specific limits)
+    # 7. Cleanup stale progress files (with startup-specific limits)
     cleanup_stale_progress_files(
         repo_root,
         config.progress_stale_hours,
@@ -883,144 +783,13 @@ def handle_daemon_startup(
         timeout_seconds=config.startup_cleanup_timeout,
     )
 
-    # 10. Discard stale unprocessed signal files from previous session
+    # 8. Discard stale unprocessed signal files from previous session
     log_info(
         f"Discarding stale signal files (older than {config.signal_stale_hours}h)..."
     )
     cleanup_stale_signal_files(repo_root, config.signal_stale_hours, dry_run=dry_run)
 
-    if not dry_run:
-        update_cleanup_timestamp(state_path, "daemon-startup")
-
     log_success("Daemon startup cleanup complete")
-
-
-def _terminate_active_sessions(
-    state_path: pathlib.Path,
-    *,
-    dry_run: bool = False,
-) -> None:
-    """Terminate all active tmux sessions tracked in daemon state.
-
-    Kills shepherds first (they hold issue locks and may be mid-commit),
-    then support roles.  Uses graceful shutdown (Ctrl-C) before force-kill
-    via the existing ``kill_stuck_session()`` helper.
-    """
-    if not state_path.exists():
-        return
-
-    data = read_json_file(state_path)
-    if not isinstance(data, dict):
-        return
-
-    terminated = 0
-
-    # Kill shepherds first — they hold issue locks
-    shepherds = data.get("shepherds", {})
-    if isinstance(shepherds, dict):
-        for name, entry in shepherds.items():
-            if not isinstance(entry, dict):
-                continue
-            if entry.get("status") not in ("working", "errored"):
-                continue
-            if dry_run:
-                log_info(f"[DRY-RUN] Would terminate shepherd session: {name}")
-            elif session_exists(name):
-                log_info(f"Terminating shepherd session: {name}")
-                kill_stuck_session(name)
-                terminated += 1
-
-    # Then kill support roles
-    support_roles = data.get("support_roles", {})
-    if isinstance(support_roles, dict):
-        for role_name, entry in support_roles.items():
-            if not isinstance(entry, dict):
-                continue
-            if entry.get("status") not in ("running", "working"):
-                continue
-            # Support role entries may store their tmux session name;
-            # fall back to the role name itself.
-            tmux_session = entry.get("tmux_session", role_name)
-            # kill_stuck_session prepends SESSION_PREFIX, so strip it
-            # if the stored value already includes it.
-            session_name = (
-                tmux_session.removeprefix("loom-") if tmux_session else role_name
-            )
-            if dry_run:
-                log_info(
-                    f"[DRY-RUN] Would terminate support role session: {role_name}"
-                )
-            elif session_exists(session_name):
-                log_info(f"Terminating support role session: {role_name}")
-                kill_stuck_session(session_name)
-                terminated += 1
-
-    if dry_run:
-        log_info("[DRY-RUN] Would terminate all active tmux sessions")
-    elif terminated > 0:
-        log_success(f"Terminated {terminated} active tmux session(s)")
-    else:
-        log_info("No active tmux sessions to terminate")
-
-
-def _revert_shepherd_labels(
-    state_path: pathlib.Path,
-    *,
-    dry_run: bool = False,
-) -> None:
-    """Revert issue labels for working shepherds during shutdown.
-
-    For each shepherd with ``status == "working"`` and a non-null ``issue``,
-    swap ``loom:building`` back to ``loom:issue`` so the issue returns to the
-    ready queue.  Errors are logged but do not prevent shutdown from continuing.
-    """
-    if not state_path.exists():
-        return
-
-    data = read_json_file(state_path)
-    if not isinstance(data, dict):
-        return
-
-    shepherds = data.get("shepherds", {})
-    if not isinstance(shepherds, dict):
-        return
-
-    from loom_tools.common.github import gh_run
-
-    for name, entry in shepherds.items():
-        if not isinstance(entry, dict):
-            continue
-        if entry.get("status") != "working":
-            continue
-        issue_num = entry.get("issue")
-        if issue_num is None:
-            continue
-
-        if dry_run:
-            log_info(
-                f"[DRY-RUN] Would revert issue #{issue_num} labels "
-                f"(loom:building → loom:issue) for {name}"
-            )
-        else:
-            # Release file-based claim alongside label revert
-            from loom_tools.claim import release_claim
-
-            repo_root = state_path.parent.parent
-            release_claim(repo_root, issue_num)
-
-            try:
-                gh_run([
-                    "issue", "edit", str(issue_num),
-                    "--remove-label", "loom:building",
-                    "--add-label", "loom:issue",
-                ])
-                log_info(
-                    f"SHUTDOWN: Reverted issue #{issue_num} labels to loom:issue"
-                )
-            except Exception as e:
-                log_warning(
-                    f"SHUTDOWN: Failed to revert labels for #{issue_num}: {e}"
-                )
 
 
 def handle_daemon_shutdown(
@@ -1029,64 +798,15 @@ def handle_daemon_shutdown(
     *,
     dry_run: bool = False,
 ) -> None:
-    """Archive logs and finalize state before daemon exits."""
+    """Archive logs and clean up before daemon exits."""
     log_info("Daemon Shutdown Cleanup")
-
-    state_path = repo_root / ".loom" / "daemon-state.json"
 
     # 1. Archive all current task outputs
     if config.archive_logs:
         log_info("Archiving task outputs...")
         _run_archive_logs(repo_root, dry_run=dry_run)
 
-    # 2. Terminate all active tmux sessions
-    _terminate_active_sessions(state_path, dry_run=dry_run)
-
-    # 3. Revert issue labels for working shepherds before resetting state
-    _revert_shepherd_labels(state_path, dry_run=dry_run)
-
-    # 4. Finalize daemon-state.json
-    if state_path.exists():
-        log_info("Finalizing daemon-state.json...")
-        stopped_at = now_utc().strftime("%Y-%m-%dT%H:%M:%SZ")
-
-        if dry_run:
-            log_info(
-                f"[DRY-RUN] Would set running=false, stopped_at={stopped_at}, "
-                "reset support roles and shepherds to idle"
-            )
-        else:
-            data = read_json_file(state_path)
-            if isinstance(data, dict):
-                data["running"] = False
-                data["stopped_at"] = stopped_at
-
-                # Reset support roles
-                support_roles = data.get("support_roles")
-                if isinstance(support_roles, dict):
-                    for role_entry in support_roles.values():
-                        if isinstance(role_entry, dict):
-                            role_entry["status"] = "idle"
-                            role_entry["task_id"] = None
-                            role_entry["last_completed"] = stopped_at
-
-                # Reset shepherds
-                shepherds = data.get("shepherds")
-                if isinstance(shepherds, dict):
-                    for shepherd_entry in shepherds.values():
-                        if isinstance(shepherd_entry, dict):
-                            shepherd_entry["status"] = "idle"
-                            shepherd_entry["issue"] = None
-                            shepherd_entry["task_id"] = None
-                            shepherd_entry["idle_since"] = stopped_at
-                            shepherd_entry["idle_reason"] = "shutdown_signal"
-
-                write_json_file(state_path, data)
-                log_success(
-                    f"daemon-state.json finalized (running=false, stopped_at={stopped_at})"
-                )
-
-    # 5. Run session reflection if available
+    # 2. Run session reflection if available
     for script_dir in [repo_root / "scripts", repo_root / ".loom" / "scripts"]:
         reflection = script_dir / "session-reflection.sh"
         if reflection.exists() and os.access(reflection, os.X_OK):
@@ -1110,9 +830,6 @@ def handle_daemon_shutdown(
                 log_warning(f"session-reflection.sh error: {exc}")
             break
 
-    if not dry_run:
-        update_cleanup_timestamp(state_path, "daemon-shutdown")
-
     log_success("Daemon shutdown cleanup complete")
 
 
@@ -1122,29 +839,17 @@ def handle_periodic(
     *,
     dry_run: bool = False,
 ) -> None:
-    """Conservative periodic cleanup (respects active shepherds)."""
+    """Periodic cleanup."""
     log_info("Periodic Cleanup")
 
-    state_path = repo_root / ".loom" / "daemon-state.json"
-    daemon_state = read_json_file(state_path) if state_path.exists() else {}
-    if not isinstance(daemon_state, dict):
-        daemon_state = {}
-
-    active = has_active_shepherds(daemon_state)
-    if active:
-        log_info("Active shepherds detected - running conservative cleanup only")
-
-    # Archive task outputs (safe even with active shepherds)
+    # Archive task outputs
     if config.archive_logs:
         log_info("Archiving task outputs...")
         _run_archive_logs(repo_root, dry_run=dry_run)
 
-    # Only clean worktrees if no active shepherds
-    if not active:
-        log_info("No active shepherds - running full worktree cleanup...")
-        _run_loom_clean(repo_root, dry_run=dry_run)
-    else:
-        log_info("Skipping worktree cleanup (active shepherds)")
+    # Clean stale worktrees
+    log_info("Running worktree cleanup...")
+    _run_loom_clean(repo_root, dry_run=dry_run)
 
     # Prune old archives
     log_info("Pruning old archives...")
@@ -1160,9 +865,6 @@ def handle_periodic(
         repo_root, config.progress_stale_hours, dry_run=dry_run
     )
 
-    if not dry_run:
-        update_cleanup_timestamp(state_path, "periodic")
-
     log_success("Periodic cleanup complete")
 
 
@@ -1172,39 +874,13 @@ def handle_prune_sessions(
     *,
     dry_run: bool = False,
 ) -> None:
-    """Prune old daemon state session archives."""
+    """Prune old session archives.
+
+    Session archives are no longer produced.
+    This handler is a no-op but is kept for CLI compatibility.
+    """
     log_info("Prune Session Archives")
-
-    loom_dir = repo_root / ".loom"
-    archives = sorted(loom_dir.glob("[0-9][0-9]-daemon-state.json"))
-
-    if not archives:
-        log_info("No archived sessions found")
-        return
-
-    log_info(
-        f"Found {len(archives)} archived session(s) "
-        f"(max: {config.max_archived_sessions})"
-    )
-
-    to_delete = len(archives) - config.max_archived_sessions
-    if to_delete <= 0:
-        log_info("No pruning needed (under limit)")
-        return
-
-    log_info(f"Pruning {to_delete} oldest session(s)...")
-
-    for archive in archives[:to_delete]:
-        if dry_run:
-            log_info(f"[DRY-RUN] Would delete: {archive.name}")
-        else:
-            archive.unlink(missing_ok=True)
-            log_info(f"Deleted: {archive.name}")
-
-    state_path = repo_root / ".loom" / "daemon-state.json"
-    if not dry_run:
-        update_cleanup_timestamp(state_path, "prune-sessions")
-
+    log_info("No session archives to prune")
     log_success("Session pruning complete")
 
 

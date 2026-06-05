@@ -2,11 +2,6 @@
 
 Provides centralized JSON parsing utilities with consistent error handling.
 All parsing functions gracefully handle failures by returning defaults.
-
-Phase 3.3 note: read_progress_files() and find_progress_for_issue() were
-removed in PR #3400 along with the Python shepherd brain (shepherd/) and the
-progress files they read (.loom/progress/).  read_daemon_state() is kept as a
-stub for Phase 3.4 (#3401) daemon-state fallback-path cleanup.
 """
 
 from __future__ import annotations
@@ -141,29 +136,11 @@ def write_json_file(
         raise
 
 
-def read_daemon_state(repo_root: pathlib.Path) -> "DaemonState":
-    """Stub: always returns an empty DaemonState.
-
-    The daemon-state.json producer (daemon_v2/) was deleted in Phase 3.2
-    (#3399). This stub is kept so that Phase 3.1.x CLI ports (status.py,
-    completions.py) that have a daemon-state fallback path continue to
-    import without error.  Phase 3.4 (#3401) removes this stub along with
-    all remaining daemon-state read paths.
-    """
-    from loom_tools.models.daemon_state import DaemonState  # local import avoids circular
-
-    return DaemonState()
-
-
 def read_spawn_loop_state(repo_root: pathlib.Path) -> SpawnLoopState:
     """Load ``.loom/spawn-loop-state.json`` into a :class:`SpawnLoopState`.
 
     Returns a :class:`SpawnLoopState` with ``present=False`` when the file
-    is missing — callers (e.g. ``loom-status``) use this to fall back to
-    ``.loom/daemon-state.json`` for back-compat (Phase 3 port, #3390).
-
-    Phase 3.4 (#3401) trims the daemon-state fallback once all 3.1.x ports
-    have landed.
+    is missing.
     """
     paths = LoomPaths(repo_root)
     if not paths.spawn_loop_state_file.exists():

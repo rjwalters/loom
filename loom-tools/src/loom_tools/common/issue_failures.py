@@ -1,9 +1,7 @@
 """Persistent cross-session failure log for issues.
 
 Writes failure history to ``.loom/issue-failures.json`` so that retry metadata
-survives daemon restarts. The in-memory ``blocked_issue_retries`` dict in
-``daemon-state.json`` is ephemeral per session; this file provides the
-durable record.
+survives process restarts.
 
 File format::
 
@@ -399,19 +397,13 @@ def get_failure_entry(repo_root: Path, issue: int) -> IssueFailureEntry | None:
 def reset_failures(repo_root: Path, issue: int | None = None) -> int:
     """Reset all failure tracking for a specific issue or all issues.
 
-    Clears failure state from all three locations:
-    1. ``.loom/issue-failures.json`` (persistent cross-session failure log)
-    2. ``daemon-state.json`` ``blocked_issue_retries`` (per-issue retry metadata)
-    3. ``daemon-state.json`` ``recent_failures`` (sliding window)
-
+    Clears failure state from ``.loom/issue-failures.json``.
     When *issue* is ``None``, all failure state is cleared.
 
     Returns the number of entries cleared from the persistent failure log.
     """
-    paths = LoomPaths(repo_root)
     cleared = 0
 
-    # 1. Clear persistent failure log
     log = load_failure_log(repo_root)
     if issue is not None:
         issue_key = str(issue)
@@ -423,49 +415,6 @@ def reset_failures(repo_root: Path, issue: int | None = None) -> int:
         log.entries.clear()
     save_failure_log(repo_root, log)
 
-    # 2. Clear daemon-state.json fields
-    state_file = paths.daemon_state_file
-    if state_file.is_file():
-        try:
-            data = read_json_file(state_file)
-            if isinstance(data, dict):
-                if issue is not None:
-                    issue_key = str(issue)
-                    # Clear blocked_issue_retries for this issue
-                    retries: dict = data.get("blocked_issue_retries", {})
-                    retries.pop(issue_key, None)
-
-                    # Remove from recent_failures
-                    failures: list[dict] = data.get("recent_failures", [])
-                    data["recent_failures"] = [
-                        f for f in failures if f.get("issue") != issue
-                    ]
-
-                    # Remove from needs_human_input
-                    human: list[dict] = data.get("needs_human_input", [])
-                    data["needs_human_input"] = [
-                        h for h in human
-                        if not (
-                            h.get("type") == "exhausted_retry"
-                            and h.get("issue") == issue
-                        )
-                    ]
-                else:
-                    # Clear all failure state
-                    data["blocked_issue_retries"] = {}
-                    data["recent_failures"] = []
-                    data["systematic_failure"] = {}
-                    data["needs_human_input"] = [
-                        h for h in data.get("needs_human_input", [])
-                        if h.get("type") != "exhausted_retry"
-                    ]
-
-                write_json_file(state_file, data)
-        except Exception:
-            logger.warning(
-                "Failed to clear daemon-state.json failure fields"
-            )
-
     if issue is not None:
         logger.info("Reset all failure tracking for issue #%d", issue)
     else:
@@ -474,34 +423,3 @@ def reset_failures(repo_root: Path, issue: int | None = None) -> int:
     return cleared
 
 
-def merge_into_daemon_state(
-    repo_root: Path,
-    blocked_issue_retries: dict[str, Any],
-) -> dict[str, Any]:
-    """Merge persistent failure log into daemon state's blocked_issue_retries.
-
-    For each entry in the persistent failure log, if the daemon state doesn't
-    already have retry data (or has lower counts), update it from the
-    persistent log.
-
-    Returns the merged blocked_issue_retries dict.
-    """
-    log = load_failure_log(repo_root)
-
-    for issue_key, entry in log.entries.items():
-        existing = blocked_issue_retries.get(issue_key, {})
-        existing_count = existing.get("retry_count", 0)
-
-        # Use persistent log's count if higher
-        if entry.total_failures > existing_count:
-            existing["retry_count"] = entry.total_failures
-            existing["error_class"] = entry.error_class
-            existing["last_blocked_phase"] = entry.phase
-            existing["last_blocked_details"] = entry.details
-            if entry.last_failure_at:
-                existing["last_blocked_at"] = entry.last_failure_at
-            if entry.should_auto_block:
-                existing["retry_exhausted"] = True
-            blocked_issue_retries[issue_key] = existing
-
-    return blocked_issue_retries
