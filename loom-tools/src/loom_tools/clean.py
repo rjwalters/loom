@@ -677,7 +677,7 @@ def clean_branches(
 def _list_loom_tmux_sessions() -> list[str]:
     """List all tmux sessions on the loom socket.
 
-    Returns session names (e.g. ``["loom-shepherd-1", "loom-champion"]``).
+    Returns session names (e.g. ``["loom-champion", "loom-builder-1"]``).
     """
     try:
         result = subprocess.run(

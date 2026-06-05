@@ -499,13 +499,13 @@ git worktree remove .loom/worktrees/issue-{issue} --force 2>/dev/null || true
 git branch -D feature/issue-{issue} 2>/dev/null || true
 # Reset labels and retry
 gh issue edit {issue} --remove-label loom:blocked --add-label loom:issue
-./.loom/scripts/loom-shepherd.sh {issue} --merge
+claude -p "/loom:sweep {issue}" --dangerously-skip-permissions
 ```
 
 **Option B: Retry preserving worktree** (if worktree may have partial work)
 ```bash
 gh issue edit {issue} --remove-label loom:blocked --add-label loom:issue
-./.loom/scripts/loom-shepherd.sh {issue} --merge
+claude -p "/loom:sweep {issue}" --dangerously-skip-permissions
 ```
 
 **Option C: Complete manually**
