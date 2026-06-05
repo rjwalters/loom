@@ -1,24 +1,26 @@
 /**
- * Sweep tools for Loom MCP server (Issue #3452 — Phase A of #3449).
+ * Sweep tools for Loom MCP server.
  *
- * Exposes two tools for interacting with the loom-daemon's sweep registry:
+ * Phase A (Issue #3452) shipped `dispatch_sweep` + `list_sweeps`.
+ * Phase B (Issue #3453) shipped the event bus IPC surface (consumed below).
+ * Phase C (Issue #3455) adds the monitoring + subscription tools:
  *
- *   - `dispatch_sweep`  Spawn a `/loom:sweep` child via the daemon's
- *                       in-memory registry. The daemon shells out to
- *                       `defaults/scripts/spawn-claude.sh` for token rotation
- *                       and detaches the child; tracking is purely in-memory
- *                       (no daemon-side state file is written).
- *   - `list_sweeps`     Query tracked sweeps, optionally filtered by state.
- *
- * Remaining monitoring tools (`get_sweep_status`, `tail_sweep_log`,
- * `cancel_sweep`, pub/sub bus) come in Phase C — out of scope for this PR.
+ *   - `dispatch_sweep`      Spawn a `/loom:sweep` child via the daemon.
+ *   - `list_sweeps`         Query tracked sweeps, optionally filtered.
+ *   - `get_sweep_status`    Fetch a single SweepInfo + N recent events.
+ *   - `tail_sweep_log`      Read last N lines from a sweep's log file.
+ *   - `subscribe_to_events` Long-lived stream filtered by topic prefix.
+ *   - `publish_event`       Operator override / test escape hatch.
+ *   - `cancel_sweep`        SIGTERM -> grace -> SIGKILL; transitions to Exited.
+ *   - `tail_event_bus`      Debug fire-hose subscription with --since window.
  *
  * @see loom-daemon/src/types.rs — Request/Response variants.
  * @see loom-daemon/src/sweep_registry.rs — backend implementation.
+ * @see loom-daemon/src/event_bus.rs — pub/sub bus + topic taxonomy.
  */
 
 import type { Tool } from "@modelcontextprotocol/sdk/types.js";
-import { sendDaemonRequest } from "../shared/daemon.js";
+import { sendDaemonRequest, sendDaemonStreamRequest } from "../shared/daemon.js";
 
 // ============================================================================
 // Wire types
@@ -99,9 +101,47 @@ interface StructuredErrorResponse {
   payload: { message?: string };
 }
 
+interface SweepStatusResponse {
+  type: "SweepStatus";
+  payload: {
+    info: SweepInfo | null;
+  };
+}
+
+interface SweepLogTailResponse {
+  type: "SweepLogTail";
+  payload: {
+    sweep_id: string;
+    lines: string[];
+    log_path: string;
+  };
+}
+
+interface SweepCancelledResponse {
+  type: "SweepCancelled";
+  payload: {
+    sweep_id: string;
+    pid: number;
+    sigkill_sent: boolean;
+    was_running: boolean;
+  };
+}
+
+interface EventPublishedResponse {
+  type: "EventPublished";
+  payload: {
+    topic: string;
+    receivers: number;
+  };
+}
+
 type DaemonResponse =
   | DispatchResponse
   | ListResponse
+  | SweepStatusResponse
+  | SweepLogTailResponse
+  | SweepCancelledResponse
+  | EventPublishedResponse
   | ErrorResponse
   | StructuredErrorResponse
   | { type: string; payload?: unknown };
@@ -138,6 +178,38 @@ function buildStateFilter(stateArg: unknown): SweepState | null {
     return { state: "Crashed", details: {} };
   }
   return { state: stateArg };
+}
+
+/**
+ * Parse a duration string of the form `<N>s`, `<N>m`, or `<N>h` (case-
+ * insensitive). Returns the duration in milliseconds, or `null` for any
+ * invalid input. Used by `tail_event_bus --since`.
+ *
+ * Examples:
+ *   "10m" -> 600000
+ *   "1h"  -> 3600000
+ *   "30s" -> 30000
+ *   "10"  -> null (no unit)
+ *   "1d"  -> null (unsupported unit; days not in scope)
+ */
+export function parseDuration(input: string): number | null {
+  const trimmed = input.trim();
+  if (trimmed.length < 2) return null;
+  const match = trimmed.match(/^(\d+)([smhSMH])$/);
+  if (!match) return null;
+  const value = parseInt(match[1], 10);
+  if (!Number.isFinite(value) || value <= 0) return null;
+  const unit = match[2].toLowerCase();
+  switch (unit) {
+    case "s":
+      return value * 1000;
+    case "m":
+      return value * 60 * 1000;
+    case "h":
+      return value * 60 * 60 * 1000;
+    default:
+      return null;
+  }
 }
 
 // ============================================================================
@@ -192,6 +264,120 @@ async function listSweeps(args: {
   }
 }
 
+// ---------------------------------------------------------------------------
+// Phase C: monitoring + subscription helpers (Issue #3455)
+// ---------------------------------------------------------------------------
+
+async function getSweepStatus(args: {
+  sweep_id: string;
+}): Promise<{ success: true; info: SweepInfo | null } | { success: false; error: string }> {
+  try {
+    const response = (await sendDaemonRequest({
+      type: "GetSweepStatus",
+      payload: { sweep_id: args.sweep_id },
+    })) as DaemonResponse;
+
+    if (response.type === "SweepStatus") {
+      return { success: true, info: (response as SweepStatusResponse).payload.info };
+    }
+    const err = extractError(response);
+    return { success: false, error: err ?? `Unexpected response: ${response.type}` };
+  } catch (error) {
+    return { success: false, error: `Error fetching sweep status: ${error}` };
+  }
+}
+
+async function tailSweepLog(args: {
+  sweep_id: string;
+  lines: number;
+}): Promise<
+  | { success: true; payload: SweepLogTailResponse["payload"] }
+  | { success: false; error: string }
+> {
+  try {
+    const response = (await sendDaemonRequest({
+      type: "TailSweepLog",
+      payload: { sweep_id: args.sweep_id, lines: args.lines },
+    })) as DaemonResponse;
+
+    if (response.type === "SweepLogTail") {
+      return { success: true, payload: (response as SweepLogTailResponse).payload };
+    }
+    const err = extractError(response);
+    return { success: false, error: err ?? `Unexpected response: ${response.type}` };
+  } catch (error) {
+    return { success: false, error: `Error tailing sweep log: ${error}` };
+  }
+}
+
+async function cancelSweep(args: {
+  sweep_id: string;
+  grace_secs: number;
+}): Promise<
+  | { success: true; payload: SweepCancelledResponse["payload"] }
+  | { success: false; error: string }
+> {
+  try {
+    const response = (await sendDaemonRequest({
+      type: "CancelSweep",
+      payload: { sweep_id: args.sweep_id, grace_secs: args.grace_secs },
+    })) as DaemonResponse;
+
+    if (response.type === "SweepCancelled") {
+      return { success: true, payload: (response as SweepCancelledResponse).payload };
+    }
+    const err = extractError(response);
+    return { success: false, error: err ?? `Unexpected response: ${response.type}` };
+  } catch (error) {
+    return { success: false, error: `Error cancelling sweep: ${error}` };
+  }
+}
+
+async function publishEvent(args: {
+  topic: string;
+  payload: unknown;
+}): Promise<
+  | { success: true; payload: EventPublishedResponse["payload"] }
+  | { success: false; error: string }
+> {
+  try {
+    const response = (await sendDaemonRequest({
+      type: "PublishEvent",
+      payload: { topic: args.topic, payload: args.payload },
+    })) as DaemonResponse;
+
+    if (response.type === "EventPublished") {
+      return { success: true, payload: (response as EventPublishedResponse).payload };
+    }
+    const err = extractError(response);
+    return { success: false, error: err ?? `Unexpected response: ${response.type}` };
+  } catch (error) {
+    return { success: false, error: `Error publishing event: ${error}` };
+  }
+}
+
+async function streamEvents(args: {
+  topics: string[];
+  durationMs?: number;
+  maxLines?: number;
+}): Promise<{ success: true; lines: string[]; closedByTimeout: boolean; elapsedMs: number } | { success: false; error: string }> {
+  try {
+    const result = await sendDaemonStreamRequest(
+      {
+        type: "SubscribeEvents",
+        payload: { topics: args.topics },
+      },
+      {
+        durationMs: args.durationMs,
+        maxLines: args.maxLines,
+      }
+    );
+    return { success: true, ...result };
+  } catch (error) {
+    return { success: false, error: `Error streaming events: ${error}` };
+  }
+}
+
 // ============================================================================
 // Tool definitions
 // ============================================================================
@@ -199,10 +385,8 @@ async function listSweeps(args: {
 /**
  * Sweep tool definitions exposed by the MCP server.
  *
- * Only two tools ship in Phase A. The remaining monitoring tools
- * (`get_sweep_status`, `tail_sweep_log`, `cancel_sweep`,
- * `subscribe_to_events`, `publish_event`) are reserved for Phase C of
- * epic #3449.
+ * Phase A shipped `dispatch_sweep` + `list_sweeps`. Phase C (Issue #3455)
+ * adds the six monitoring + subscription tools that follow.
  */
 export const sweepTools: Tool[] = [
   {
@@ -265,6 +449,180 @@ export const sweepTools: Tool[] = [
           enum: ["Pending", "Running", "Exited", "Crashed"],
           description:
             "Optional lifecycle state filter. Omit to list all tracked sweeps.",
+        },
+      },
+    },
+  },
+  {
+    name: "get_sweep_status",
+    description:
+      "Return the `SweepInfo` for a single sweep, plus optionally the N " +
+      "most-recent events observed on the in-memory event bus for that " +
+      "sweep's topics. Recent events are collected via a short subscribe " +
+      "window (default ~200ms); set `recent_events` to 0 to skip that step " +
+      "and return only the SweepInfo. Returns an error if the sweep ID is " +
+      "unknown to the registry.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        sweep_id: {
+          type: "string",
+          description: "The sweep ID returned by `dispatch_sweep`.",
+        },
+        recent_events: {
+          type: "number",
+          description:
+            "Maximum number of recent events to surface alongside the " +
+            "SweepInfo. Defaults to 10. The bus is in-memory and transient " +
+            "— this is a best-effort recent-history sample, not a replay log.",
+        },
+      },
+      required: ["sweep_id"],
+    },
+  },
+  {
+    name: "tail_sweep_log",
+    description:
+      "Read the last N lines of a sweep's per-sweep log file " +
+      "(`.loom/logs/sweep-issue-<N>.log`). The log path is resolved from " +
+      "the registry entry — callers don't need to know the workspace layout. " +
+      "Returns an error if the sweep ID is unknown or the log file is " +
+      "missing on disk.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        sweep_id: {
+          type: "string",
+          description: "The sweep ID returned by `dispatch_sweep`.",
+        },
+        lines: {
+          type: "number",
+          description: "Number of trailing lines to return. Defaults to 100.",
+        },
+      },
+      required: ["sweep_id"],
+    },
+  },
+  {
+    name: "subscribe_to_events",
+    description:
+      "Open a long-lived subscription to the loom-daemon's in-memory event " +
+      "bus, filtered by topic prefix. Events arrive as line-delimited JSON " +
+      "frames matching the `Response::EventStream { events: [Event] }` shape " +
+      "from `loom-daemon/src/types.rs`. Topic matching is segment-aligned " +
+      "prefix match (`sweep.issue` matches `sweep.issue.123.phase` but not " +
+      "`sweep.issuetype.foo`). The MCP layer caps each subscription with a " +
+      "`duration` window so a single tool call returns deterministically; " +
+      "set a longer duration for continuous monitoring scenarios. The bus " +
+      "taxonomy is frozen for v0.10.0 (see `.loom/docs/daemon-reference.md`).",
+    inputSchema: {
+      type: "object",
+      properties: {
+        topics: {
+          type: "array",
+          items: { type: "string" },
+          description:
+            "Topic prefixes to subscribe to. Pass an empty array (or omit) " +
+            "to receive all events — equivalent to `tail_event_bus` but " +
+            "without the time-window default.",
+        },
+        duration: {
+          type: "string",
+          description:
+            "How long to keep the subscription open. Accepts `<N>s`, `<N>m`, " +
+            "or `<N>h` (case-insensitive). Defaults to `30s`. Set a longer " +
+            "window for continuous monitoring.",
+        },
+        max_events: {
+          type: "number",
+          description:
+            "Optional upper bound on the number of frames returned. The " +
+            "subscription closes once either bound (duration or count) is " +
+            "reached, whichever comes first.",
+        },
+      },
+    },
+  },
+  {
+    name: "publish_event",
+    description:
+      "Publish a JSON event onto the loom-daemon's in-memory bus. Operator " +
+      "override and testing escape hatch — production publishes happen via " +
+      "the sweep skill, not this tool. Returns the number of receivers the " +
+      "event routed to. `topic` should follow the frozen taxonomy " +
+      "(`sweep.issue.{N}.phase` etc.); the bus accepts arbitrary topic " +
+      "strings, but downstream consumers only subscribe to documented topics.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        topic: {
+          type: "string",
+          description:
+            "Topic string. See `.loom/docs/daemon-reference.md` for the " +
+            "frozen taxonomy.",
+        },
+        payload: {
+          description:
+            "Opaque JSON payload. Per-topic schemas are documented in " +
+            "`defaults/.claude/commands/loom/sweep.md`.",
+        },
+      },
+      required: ["topic", "payload"],
+    },
+  },
+  {
+    name: "cancel_sweep",
+    description:
+      "Cancel a running sweep. Sends SIGTERM to the child PID, waits the " +
+      "grace window (default 30 seconds), then escalates to SIGKILL if the " +
+      "child is still alive. Transitions the registry entry from `Running` " +
+      "to `Exited{code: None, at: <now>}` regardless of which signal " +
+      "delivered the kill, and releases the per-issue lock. Idempotent: " +
+      "calling against an already-terminal sweep returns success with " +
+      "`was_running: false`.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        sweep_id: {
+          type: "string",
+          description: "The sweep ID returned by `dispatch_sweep`.",
+        },
+        grace: {
+          type: "number",
+          description:
+            "Seconds between SIGTERM and SIGKILL. Defaults to 30. A value " +
+            "of 0 escalates to SIGKILL immediately after the first poll " +
+            "iteration (~100ms).",
+        },
+      },
+      required: ["sweep_id"],
+    },
+  },
+  {
+    name: "tail_event_bus",
+    description:
+      "Debug-oriented fire-hose subscription that streams ALL events on " +
+      "the bus regardless of topic (added per curator risk note D — " +
+      "multi-child interactions are qualitatively harder to debug than " +
+      "hermetic children). `--since` accepts `<N>s`, `<N>m`, or `<N>h` and " +
+      "caps how long the subscription stays open (the bus is in-memory and " +
+      "transient — `--since` is a streaming window, not a backward-looking " +
+      "replay filter). For topic-filtered streams, use `subscribe_to_events`.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        since: {
+          type: "string",
+          description:
+            "Streaming window duration. Accepts `<N>s`, `<N>m`, or `<N>h`. " +
+            "Defaults to `10m`.",
+        },
+        max_events: {
+          type: "number",
+          description:
+            "Optional upper bound on the number of frames returned. The " +
+            "subscription closes once either bound (duration or count) is " +
+            "reached, whichever comes first.",
         },
       },
     },
@@ -393,6 +751,315 @@ export async function handleSweepTool(
         {
           type: "text",
           text: `=== List Sweeps (${result.sweeps.length}) ===\n\n${lines}`,
+        },
+      ];
+    }
+
+    // ----- Phase C: monitoring + subscription tools -----
+
+    case "get_sweep_status": {
+      const sweepId = typeof args?.sweep_id === "string" ? args.sweep_id : "";
+      if (!sweepId) {
+        return [
+          {
+            type: "text",
+            text: "=== Get Sweep Status ===\n\nFailed\n\nError: `sweep_id` is required.",
+          },
+        ];
+      }
+      const recentEventsArg = args?.recent_events;
+      const recentEvents =
+        typeof recentEventsArg === "number" && Number.isFinite(recentEventsArg)
+          ? Math.max(0, Math.floor(recentEventsArg))
+          : 10;
+
+      const statusResult = await getSweepStatus({ sweep_id: sweepId });
+      if (!statusResult.success) {
+        return [
+          {
+            type: "text",
+            text: `=== Get Sweep Status ===\n\nFailed\n\n${statusResult.error}`,
+          },
+        ];
+      }
+      if (!statusResult.info) {
+        return [
+          {
+            type: "text",
+            text: `=== Get Sweep Status ===\n\nNo sweep with ID: ${sweepId}`,
+          },
+        ];
+      }
+
+      // Surface the SweepInfo as a structured JSON block plus a short
+      // human summary. Then attempt a short subscribe window for
+      // recent events — best-effort, never fails the whole tool.
+      const info = statusResult.info;
+      const sections: string[] = [
+        `=== Get Sweep Status: ${info.sweep_id} ===`,
+        "",
+        formatSweepLine(info),
+        "",
+        "Raw SweepInfo:",
+        "```json",
+        JSON.stringify(info, null, 2),
+        "```",
+      ];
+
+      if (recentEvents > 0) {
+        const topicPrefix =
+          info.kind.type === "Issue" ? `sweep.issue.${info.kind.value}` : "sweep";
+        const stream = await streamEvents({
+          topics: [topicPrefix],
+          durationMs: 200,
+          maxLines: recentEvents,
+        });
+        if (stream.success) {
+          if (stream.lines.length === 0) {
+            sections.push("", `Recent events (last ${recentEvents}, prefix=${topicPrefix}): none observed in 200ms window.`);
+          } else {
+            sections.push(
+              "",
+              `Recent events (${stream.lines.length}, prefix=${topicPrefix}):`,
+              "```",
+              ...stream.lines,
+              "```",
+            );
+          }
+        } else {
+          sections.push("", `Recent events: subscribe failed (${stream.error}).`);
+        }
+      }
+
+      return [{ type: "text", text: sections.join("\n") }];
+    }
+
+    case "tail_sweep_log": {
+      const sweepId = typeof args?.sweep_id === "string" ? args.sweep_id : "";
+      if (!sweepId) {
+        return [
+          {
+            type: "text",
+            text: "=== Tail Sweep Log ===\n\nFailed\n\nError: `sweep_id` is required.",
+          },
+        ];
+      }
+      const linesArg = args?.lines;
+      const lines =
+        typeof linesArg === "number" && Number.isFinite(linesArg)
+          ? Math.max(0, Math.floor(linesArg))
+          : 100;
+
+      const result = await tailSweepLog({ sweep_id: sweepId, lines });
+      if (!result.success) {
+        return [
+          {
+            type: "text",
+            text: `=== Tail Sweep Log ===\n\nFailed\n\n${result.error}`,
+          },
+        ];
+      }
+      const { log_path, lines: tail } = result.payload;
+      const body =
+        tail.length === 0
+          ? "(log is empty)"
+          : tail.join("\n");
+      return [
+        {
+          type: "text",
+          text: `=== Tail Sweep Log: ${sweepId} ===\n\nLog: ${log_path}\nLines: ${tail.length}\n\n${body}`,
+        },
+      ];
+    }
+
+    case "subscribe_to_events": {
+      const topicsArg = args?.topics;
+      const topics = Array.isArray(topicsArg)
+        ? topicsArg.filter((t): t is string => typeof t === "string")
+        : [];
+      const durationArg = args?.duration;
+      let durationMs = 30000;
+      if (typeof durationArg === "string" && durationArg.length > 0) {
+        const parsed = parseDuration(durationArg);
+        if (parsed === null) {
+          return [
+            {
+              type: "text",
+              text:
+                "=== Subscribe To Events ===\n\nFailed\n\nError: invalid `duration` " +
+                `'${durationArg}'. Use formats like '30s', '10m', or '1h'.`,
+            },
+          ];
+        }
+        durationMs = parsed;
+      }
+      const maxLinesArg = args?.max_events;
+      const maxLines =
+        typeof maxLinesArg === "number" && Number.isFinite(maxLinesArg) && maxLinesArg > 0
+          ? Math.floor(maxLinesArg)
+          : undefined;
+
+      const result = await streamEvents({ topics, durationMs, maxLines });
+      if (!result.success) {
+        return [
+          {
+            type: "text",
+            text: `=== Subscribe To Events ===\n\nFailed\n\n${result.error}`,
+          },
+        ];
+      }
+      const summary = [
+        `Topics:           ${topics.length === 0 ? "(all)" : topics.join(", ")}`,
+        `Frames received:  ${result.lines.length}`,
+        `Elapsed:          ${result.elapsedMs}ms`,
+        `Closed by:        ${result.closedByTimeout ? "duration window" : "daemon / max"}`,
+      ].join("\n");
+      const body =
+        result.lines.length === 0
+          ? "(no events observed)"
+          : result.lines.join("\n");
+      return [
+        {
+          type: "text",
+          text: `=== Subscribe To Events ===\n\n${summary}\n\nFrames:\n${body}`,
+        },
+      ];
+    }
+
+    case "publish_event": {
+      const topic = typeof args?.topic === "string" ? args.topic : "";
+      if (!topic) {
+        return [
+          {
+            type: "text",
+            text: "=== Publish Event ===\n\nFailed\n\nError: `topic` is required.",
+          },
+        ];
+      }
+      if (!("payload" in (args ?? {}))) {
+        return [
+          {
+            type: "text",
+            text: "=== Publish Event ===\n\nFailed\n\nError: `payload` is required (use {} for empty).",
+          },
+        ];
+      }
+      const payload = (args as { payload: unknown }).payload;
+
+      const result = await publishEvent({ topic, payload });
+      if (!result.success) {
+        return [
+          {
+            type: "text",
+            text: `=== Publish Event ===\n\nFailed\n\n${result.error}`,
+          },
+        ];
+      }
+      return [
+        {
+          type: "text",
+          text:
+            `=== Publish Event ===\n\nSuccess\n\nTopic:      ${result.payload.topic}\n` +
+            `Receivers:  ${result.payload.receivers}`,
+        },
+      ];
+    }
+
+    case "cancel_sweep": {
+      const sweepId = typeof args?.sweep_id === "string" ? args.sweep_id : "";
+      if (!sweepId) {
+        return [
+          {
+            type: "text",
+            text: "=== Cancel Sweep ===\n\nFailed\n\nError: `sweep_id` is required.",
+          },
+        ];
+      }
+      const graceArg = args?.grace;
+      const graceSecs =
+        typeof graceArg === "number" && Number.isFinite(graceArg) && graceArg >= 0
+          ? Math.floor(graceArg)
+          : 30;
+
+      const result = await cancelSweep({ sweep_id: sweepId, grace_secs: graceSecs });
+      if (!result.success) {
+        return [
+          {
+            type: "text",
+            text: `=== Cancel Sweep ===\n\nFailed\n\n${result.error}`,
+          },
+        ];
+      }
+      const { pid, sigkill_sent, was_running } = result.payload;
+      const lines = [
+        `Sweep ID:      ${result.payload.sweep_id}`,
+        `PID:           ${pid}`,
+        `Was running:   ${was_running}`,
+        `SIGKILL sent:  ${sigkill_sent}`,
+        `Grace:         ${graceSecs}s`,
+      ].join("\n");
+      const summary = was_running
+        ? sigkill_sent
+          ? "Child survived SIGTERM; escalated to SIGKILL."
+          : "Child terminated within grace window."
+        : "Already terminal; no signal sent (idempotent success).";
+      return [
+        {
+          type: "text",
+          text: `=== Cancel Sweep ===\n\n${summary}\n\n${lines}`,
+        },
+      ];
+    }
+
+    case "tail_event_bus": {
+      const sinceArg = args?.since;
+      let durationMs = 10 * 60 * 1000; // default: 10m
+      if (typeof sinceArg === "string" && sinceArg.length > 0) {
+        const parsed = parseDuration(sinceArg);
+        if (parsed === null) {
+          return [
+            {
+              type: "text",
+              text:
+                "=== Tail Event Bus ===\n\nFailed\n\nError: invalid `since` " +
+                `'${sinceArg}'. Use formats like '30s', '10m', or '1h'.`,
+            },
+          ];
+        }
+        durationMs = parsed;
+      }
+      const maxLinesArg = args?.max_events;
+      const maxLines =
+        typeof maxLinesArg === "number" && Number.isFinite(maxLinesArg) && maxLinesArg > 0
+          ? Math.floor(maxLinesArg)
+          : undefined;
+
+      // tail_event_bus subscribes to ALL topics (empty filter) — its
+      // only knob over subscribe_to_events is the catch-all default
+      // and the operator-friendly `--since` window naming.
+      const result = await streamEvents({ topics: [], durationMs, maxLines });
+      if (!result.success) {
+        return [
+          {
+            type: "text",
+            text: `=== Tail Event Bus ===\n\nFailed\n\n${result.error}`,
+          },
+        ];
+      }
+      const summary = [
+        `Window:           ${typeof sinceArg === "string" ? sinceArg : "10m (default)"}`,
+        `Frames received:  ${result.lines.length}`,
+        `Elapsed:          ${result.elapsedMs}ms`,
+        `Closed by:        ${result.closedByTimeout ? "since window" : "daemon / max"}`,
+      ].join("\n");
+      const body =
+        result.lines.length === 0
+          ? "(no events observed)"
+          : result.lines.join("\n");
+      return [
+        {
+          type: "text",
+          text: `=== Tail Event Bus ===\n\n${summary}\n\nFrames:\n${body}`,
         },
       ];
     }
