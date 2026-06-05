@@ -26,6 +26,27 @@
 # below enumerates defaults/ instead — files Loom never shipped are not in
 # the manifest, so the uninstaller can't accidentally delete them.
 
+# Read the Loom-internal skip list at `<defaults>/.loom-internal.list` and
+# emit one defaults-relative path per line on stdout (comments, blank
+# lines, and surrounding whitespace stripped). Missing file → no output.
+#
+# This mirrors `loom_daemon::init::scaffolding::load_internal_skip_list` so
+# both surfaces consult the same declarative source. See issue #3464.
+_read_loom_internal_skip_list() {
+  local defaults_dir="$1"
+  local list_file="$defaults_dir/.loom-internal.list"
+  [[ -r "$list_file" ]] || return 0
+  # Strip comments and blanks; trim surrounding whitespace from each entry.
+  awk '
+    {
+      sub(/^[[:space:]]+/, "")
+      sub(/[[:space:]]+$/, "")
+      if ($0 == "" || $0 ~ /^#/) next
+      print
+    }
+  ' "$list_file"
+}
+
 # Print the installed-files manifest as a JSON array.
 #
 # Skip rules (mirror install-side behavior):
@@ -34,6 +55,9 @@
 #   - defaults/hooks/example-context/** → example methodology content
 #   - defaults/hooks/*.template     → templates, not installed verbatim
 #   - defaults/package.json         → only installed if target lacks one
+#   - any entry in defaults/.loom-internal.list (issue #3464) — Loom-
+#     internal files (e.g. .claude/commands/loom/release.md) that the
+#     Rust installer also skips at copy time
 #
 # Path translations (defaults-relative → target-relative):
 #   .loom-README.md       → .loom/README.md
@@ -62,6 +86,12 @@ _emit_installed_files_manifest() {
     return 0
   fi
 
+  # Issue #3464: load the declarative Loom-internal skip list once and stash
+  # it in a newline-delimited string. We use grep -Fx for the per-file check
+  # below so additions to the list don't require any code change here.
+  local internal_skip_paths
+  internal_skip_paths="$(_read_loom_internal_skip_list "$defaults_dir")"
+
   local json="["
   local first=true
   local rel_path target_path
@@ -82,6 +112,12 @@ _emit_installed_files_manifest() {
   while IFS= read -r -d '' file; do
     rel_path="${file#"${defaults_dir}"/}"
 
+    # The skip list itself is metadata about Loom's install boundary; it
+    # is not a shipped file.
+    if [[ "$rel_path" == ".loom-internal.list" ]]; then
+      continue
+    fi
+
     # Skip rules — files Loom does NOT install verbatim into the target.
     case "$rel_path" in
       README.md)
@@ -97,6 +133,15 @@ _emit_installed_files_manifest() {
         continue
         ;;
     esac
+
+    # Issue #3464: drop Loom-internal files declared in
+    # defaults/.loom-internal.list. Exact-match against the
+    # defaults-relative path; behavior mirrors the Rust installer's
+    # `load_internal_skip_list` + `_filtered` copy variants.
+    if [[ -n "$internal_skip_paths" ]] \
+        && printf '%s\n' "$internal_skip_paths" | grep -Fxq -- "$rel_path"; then
+      continue
+    fi
 
     # Translate defaults-relative → target-relative.
     case "$rel_path" in
