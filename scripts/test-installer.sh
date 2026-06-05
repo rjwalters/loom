@@ -1579,6 +1579,72 @@ fi
 echo ""
 
 
+# Test 52: Loom-internal skills are not shipped to consumer repos (#3464)
+# After `loom-daemon init` against a fresh consumer repo, the entries
+# listed in defaults/.loom-internal.list must NOT exist in the consumer
+# tree, while sibling commands (builder, judge, curator) must exist.
+#
+# This test runs the real `loom-daemon init` (the same call install.sh
+# makes) rather than `simulate_loom_install`, because the leakage fix
+# lives inside `loom-daemon::init::scaffolding::setup_repository_scaffolding`
+# and the simulator's `cp -r .claude` does not exercise the skip path.
+echo "Test 52: Loom-internal skills excluded from consumer install (#3464)"
+DAEMON_BIN_52="$LOOM_ROOT/target/release/loom-daemon"
+SKIP_LIST_FILE="$LOOM_ROOT/defaults/.loom-internal.list"
+if [[ ! -x "$DAEMON_BIN_52" ]]; then
+  warn "Skipping Test 52 — loom-daemon release binary not built at $DAEMON_BIN_52"
+elif [[ ! -f "$SKIP_LIST_FILE" ]]; then
+  fail "defaults/.loom-internal.list is missing — the skip mechanism requires this file"
+else
+  INTERNAL_REPO="$TEST_DIR/internal-skip-test"
+  create_temp_repo "$INTERNAL_REPO"
+
+  # `loom-daemon init` builds a real consumer install in INTERNAL_REPO.
+  # Suppress stdout — we only care about side effects on the filesystem.
+  if "$DAEMON_BIN_52" init --defaults "$LOOM_ROOT/defaults" "$INTERNAL_REPO" >/dev/null 2>&1; then
+    # Each listed defaults-relative path must NOT exist in the consumer.
+    skip_violations=0
+    while IFS= read -r skip_rel; do
+      # Strip comments and blank lines (mirror the skip-list reader).
+      skip_rel="${skip_rel%%#*}"
+      # shellcheck disable=SC2295
+      skip_rel="${skip_rel#"${skip_rel%%[![:space:]]*}"}"
+      skip_rel="${skip_rel%"${skip_rel##*[![:space:]]}"}"
+      [[ -z "$skip_rel" ]] && continue
+      if [[ -e "$INTERNAL_REPO/$skip_rel" ]]; then
+        fail "Loom-internal file leaked to consumer: $skip_rel"
+        skip_violations=$((skip_violations + 1))
+      fi
+    done < "$SKIP_LIST_FILE"
+    if [[ "$skip_violations" -eq 0 ]]; then
+      pass "All defaults/.loom-internal.list entries absent from consumer tree"
+    fi
+
+    # AC1: specifically pin .claude/commands/loom/release.md as absent.
+    if [[ -e "$INTERNAL_REPO/.claude/commands/loom/release.md" ]]; then
+      fail "AC1: .claude/commands/loom/release.md must not be installed to consumers"
+    else
+      pass "AC1: .claude/commands/loom/release.md is absent from consumer install"
+    fi
+
+    # The siblings must continue to ship — pin three representative skills.
+    sibling_ok=true
+    for sibling in builder.md judge.md curator.md; do
+      if [[ ! -f "$INTERNAL_REPO/.claude/commands/loom/$sibling" ]]; then
+        fail "Consumer install missing .claude/commands/loom/$sibling"
+        sibling_ok=false
+      fi
+    done
+    if $sibling_ok; then
+      pass "Consumer install includes builder.md, judge.md, curator.md (skip-list is narrow)"
+    fi
+  else
+    fail "loom-daemon init failed against fresh consumer repo $INTERNAL_REPO"
+  fi
+fi
+echo ""
+
+
 # ==========================================================================
 # Summary
 # ==========================================================================
