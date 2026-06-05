@@ -1,11 +1,12 @@
 use crate::activity::{ActivityDb, AgentInput, AgentOutput, InputContext, InputType};
 use crate::errors::DaemonError;
+use crate::event_bus::EventBus;
 use crate::forge_parser::parse_forge_events;
 use crate::git_parser;
 use crate::git_utils;
 use crate::sweep_registry::SweepRegistry;
 use crate::terminal::TerminalManager;
-use crate::types::{Request, Response};
+use crate::types::{Event, Request, Response};
 use anyhow::Result;
 use chrono::Utc;
 use std::path::PathBuf;
@@ -43,6 +44,7 @@ pub struct IpcServer {
     terminal_manager: Arc<Mutex<TerminalManager>>,
     activity_db: Arc<Mutex<ActivityDb>>,
     sweep_registry: Arc<Mutex<SweepRegistry>>,
+    event_bus: Arc<EventBus>,
 }
 
 impl IpcServer {
@@ -51,12 +53,14 @@ impl IpcServer {
         terminal_manager: Arc<Mutex<TerminalManager>>,
         activity_db: Arc<Mutex<ActivityDb>>,
         sweep_registry: Arc<Mutex<SweepRegistry>>,
+        event_bus: Arc<EventBus>,
     ) -> Self {
         Self {
             socket_path,
             terminal_manager,
             activity_db,
             sweep_registry,
+            event_bus,
         }
     }
 
@@ -73,8 +77,9 @@ impl IpcServer {
                     let tm = self.terminal_manager.clone();
                     let db = self.activity_db.clone();
                     let sr = self.sweep_registry.clone();
+                    let bus = self.event_bus.clone();
                     tokio::spawn(async move {
-                        if let Err(e) = handle_client(stream, tm, db, sr).await {
+                        if let Err(e) = handle_client(stream, tm, db, sr, bus).await {
                             log::error!("Client error: {e}");
                         }
                     });
@@ -92,6 +97,7 @@ async fn handle_client(
     terminal_manager: Arc<Mutex<TerminalManager>>,
     activity_db: Arc<Mutex<ActivityDb>>,
     sweep_registry: Arc<Mutex<SweepRegistry>>,
+    event_bus: Arc<EventBus>,
 ) -> Result<()> {
     let (reader, mut writer) = stream.into_split();
     let mut lines = BufReader::new(reader).lines();
@@ -100,13 +106,77 @@ async fn handle_client(
         let request: Request = serde_json::from_str(&line)?;
         log::debug!("Request: {request:?}");
 
-        let response = handle_request(request, &terminal_manager, &activity_db, &sweep_registry);
+        // SubscribeEvents is the only structurally-different request: it
+        // returns a stream of `EventStream` frames on the same connection
+        // rather than a single response. Once a client subscribes, the
+        // connection is dedicated to the stream until the client closes
+        // it (or the bus drops).
+        if let Request::SubscribeEvents { topics } = request {
+            stream_events(&event_bus, &mut writer, topics).await?;
+            // After streaming ends (client disconnect or bus closed) the
+            // connection has no more useful state — exit the loop.
+            break;
+        }
+
+        let response =
+            handle_request(request, &terminal_manager, &activity_db, &sweep_registry, &event_bus);
 
         let response_json = serde_json::to_string(&response)?;
         writer.write_all(response_json.as_bytes()).await?;
         writer.write_all(b"\n").await?;
     }
 
+    Ok(())
+}
+
+/// Stream events from the bus to `writer` as long as the bus is alive
+/// and the client connection is open.
+///
+/// This is the streaming-response path used by `Request::SubscribeEvents`.
+/// Each event is encoded as a single `Response::EventStream { events }`
+/// frame containing exactly one event (the `events: Vec<Event>` shape
+/// gives us room to batch in a future revision without a protocol break).
+///
+/// Termination: the loop ends when either
+///
+/// - the bus is dropped (`Subscription::recv` returns `Closed`), or
+/// - `writer.write_all` returns an error (the client closed the socket).
+async fn stream_events(
+    bus: &Arc<EventBus>,
+    writer: &mut tokio::net::unix::OwnedWriteHalf,
+    topics: Vec<String>,
+) -> Result<()> {
+    use crate::event_bus::RecvError;
+
+    let mut subscription = bus.subscribe(topics);
+
+    loop {
+        match subscription.recv().await {
+            Ok(event) => {
+                let frame = Response::EventStream {
+                    events: vec![event],
+                };
+                let frame_json = serde_json::to_string(&frame)?;
+                if writer.write_all(frame_json.as_bytes()).await.is_err() {
+                    // Client disconnected — gracefully exit.
+                    break;
+                }
+                if writer.write_all(b"\n").await.is_err() {
+                    break;
+                }
+            }
+            Err(RecvError::Closed) => {
+                log::debug!("event stream: bus closed, ending subscription");
+                break;
+            }
+            Err(RecvError::Empty) => {
+                // recv() should never return Empty (it blocks); but if
+                // the underlying receiver ever changes semantics, just
+                // yield and try again.
+                tokio::task::yield_now().await;
+            }
+        }
+    }
     Ok(())
 }
 
@@ -119,6 +189,7 @@ fn handle_request(
     terminal_manager: &Arc<Mutex<TerminalManager>>,
     activity_db: &Arc<Mutex<ActivityDb>>,
     sweep_registry: &Arc<Mutex<SweepRegistry>>,
+    event_bus: &Arc<EventBus>,
 ) -> Response {
     match request {
         Request::Ping => Response::Pong,
@@ -722,6 +793,40 @@ fn handle_request(
             Response::SweepList { sweeps }
         }
 
+        // ====================================================================
+        // Event Bus Handlers (Issue #3453 — Phase B of #3449)
+        // ====================================================================
+        Request::PublishEvent { topic, payload } => {
+            // Generic publish path used by sweep children — the topic is
+            // the canonical name (e.g., "sweep.issue.123.phase") and the
+            // payload is opaque JSON. See `defaults/.claude/commands/loom/
+            // sweep.md` for the per-topic payload schema.
+            let event = Event::Generic {
+                topic: topic.clone(),
+                payload,
+            };
+            match event_bus.publish(event) {
+                Ok(receivers) => Response::EventPublished { topic, receivers },
+                Err(_) => Response::EventPublished {
+                    topic,
+                    receivers: 0,
+                },
+            }
+        }
+
+        Request::SubscribeEvents { .. } => {
+            // SubscribeEvents is intercepted in `handle_client` before it
+            // reaches this dispatcher because it requires a streaming
+            // response (not a single Response frame). If this branch is
+            // ever reached, the IPC server's handle_client logic is bugged
+            // — fail loud so it doesn't silently mis-route.
+            Response::Error {
+                message: "internal: SubscribeEvents must be handled by stream_events, not \
+                          handle_request"
+                    .to_string(),
+            }
+        }
+
         Request::Shutdown => {
             log::info!("Shutdown requested");
             std::process::exit(0);
@@ -738,8 +843,12 @@ mod tests {
     use crate::types::{SweepKind, SweepState};
     use tempfile::tempdir;
 
-    fn setup_test_context(
-    ) -> (Arc<Mutex<TerminalManager>>, Arc<Mutex<ActivityDb>>, Arc<Mutex<SweepRegistry>>) {
+    fn setup_test_context() -> (
+        Arc<Mutex<TerminalManager>>,
+        Arc<Mutex<ActivityDb>>,
+        Arc<Mutex<SweepRegistry>>,
+        Arc<EventBus>,
+    ) {
         let tm = Arc::new(Mutex::new(TerminalManager::new()));
         let dir = tempdir().unwrap();
         let db_path = dir.path().join("test_activity.db");
@@ -747,18 +856,21 @@ mod tests {
         let db = Arc::new(Mutex::new(db));
         let mut sr_config = SweepRegistryConfig::new(dir.path().to_path_buf());
         sr_config.skip_label_flip = true;
-        let sr = Arc::new(Mutex::new(SweepRegistry::new(sr_config)));
+        let bus = Arc::new(EventBus::new());
+        let mut registry = SweepRegistry::new(sr_config);
+        registry.set_event_bus(bus.clone());
+        let sr = Arc::new(Mutex::new(registry));
         // Keep dir alive so the temp directory isn't deleted
         std::mem::forget(dir);
-        (tm, db, sr)
+        (tm, db, sr, bus)
     }
 
     // ===== Ping/Pong =====
 
     #[test]
     fn test_handle_request_ping() {
-        let (tm, db, sr) = setup_test_context();
-        let response = handle_request(Request::Ping, &tm, &db, &sr);
+        let (tm, db, sr, bus) = setup_test_context();
+        let response = handle_request(Request::Ping, &tm, &db, &sr, &bus);
         assert!(matches!(response, Response::Pong));
     }
 
@@ -766,10 +878,10 @@ mod tests {
 
     #[test]
     fn test_handle_request_list_terminals_empty() {
-        let (tm, db, sr) = setup_test_context();
+        let (tm, db, sr, bus) = setup_test_context();
         // Set LOOM_NO_RESTORE to prevent tmux restore attempts
         std::env::set_var("LOOM_NO_RESTORE", "1");
-        let response = handle_request(Request::ListTerminals, &tm, &db, &sr);
+        let response = handle_request(Request::ListTerminals, &tm, &db, &sr, &bus);
         std::env::remove_var("LOOM_NO_RESTORE");
         match response {
             Response::TerminalList { terminals } => {
@@ -783,7 +895,7 @@ mod tests {
 
     #[test]
     fn test_handle_request_get_current_commit_nonexistent_dir() {
-        let (tm, db, sr) = setup_test_context();
+        let (tm, db, sr, bus) = setup_test_context();
         let response = handle_request(
             Request::GetCurrentCommit {
                 working_dir: "/nonexistent/path".to_string(),
@@ -791,6 +903,7 @@ mod tests {
             &tm,
             &db,
             &sr,
+            &bus,
         );
         match response {
             Response::CurrentCommit { commit } => {
@@ -804,7 +917,7 @@ mod tests {
 
     #[test]
     fn test_handle_request_get_terminal_activity_empty() {
-        let (tm, db, sr) = setup_test_context();
+        let (tm, db, sr, bus) = setup_test_context();
         let response = handle_request(
             Request::GetTerminalActivity {
                 id: "nonexistent".to_string(),
@@ -813,6 +926,7 @@ mod tests {
             &tm,
             &db,
             &sr,
+            &bus,
         );
         match response {
             Response::TerminalActivity { entries } => {
@@ -826,8 +940,8 @@ mod tests {
 
     #[test]
     fn test_handle_request_get_all_claims_empty() {
-        let (tm, db, sr) = setup_test_context();
-        let response = handle_request(Request::GetAllClaims, &tm, &db, &sr);
+        let (tm, db, sr, bus) = setup_test_context();
+        let response = handle_request(Request::GetAllClaims, &tm, &db, &sr, &bus);
         match response {
             Response::Claims(claims) => {
                 assert!(claims.is_empty());
@@ -840,7 +954,7 @@ mod tests {
 
     #[test]
     fn test_handle_request_get_claims_summary() {
-        let (tm, db, sr) = setup_test_context();
+        let (tm, db, sr, bus) = setup_test_context();
         let response = handle_request(
             Request::GetClaimsSummary {
                 stale_threshold_secs: Some(3600),
@@ -848,6 +962,7 @@ mod tests {
             &tm,
             &db,
             &sr,
+            &bus,
         );
         match response {
             Response::ClaimsSummary(summary) => {
@@ -861,7 +976,7 @@ mod tests {
 
     #[test]
     fn test_handle_request_capture_git_changes_no_repo() {
-        let (tm, db, sr) = setup_test_context();
+        let (tm, db, sr, bus) = setup_test_context();
         let response = handle_request(
             Request::CaptureGitChanges {
                 input_id: 1,
@@ -871,6 +986,7 @@ mod tests {
             &tm,
             &db,
             &sr,
+            &bus,
         );
         match response {
             Response::GitChangesCaptured {
@@ -933,9 +1049,10 @@ exit 0
 
     #[test]
     fn test_handle_request_list_sweeps_empty() {
-        let (tm, db, _) = setup_test_context();
+        let (tm, db, _, bus) = setup_test_context();
         let (sr, _dir, _rec) = setup_sweep_registry_in_tempdir();
-        let response = handle_request(Request::ListSweeps { state_filter: None }, &tm, &db, &sr);
+        let response =
+            handle_request(Request::ListSweeps { state_filter: None }, &tm, &db, &sr, &bus);
         match response {
             Response::SweepList { sweeps } => {
                 assert!(sweeps.is_empty());
@@ -947,7 +1064,7 @@ exit 0
     #[test]
     #[serial_test::serial]
     fn test_handle_request_dispatch_sweep_happy_path() {
-        let (tm, db, _) = setup_test_context();
+        let (tm, db, _, bus) = setup_test_context();
         let (sr, _dir, _rec) = setup_sweep_registry_in_tempdir();
 
         let response = handle_request(
@@ -958,6 +1075,7 @@ exit 0
             &tm,
             &db,
             &sr,
+            &bus,
         );
         match response {
             Response::SweepDispatched {
@@ -975,7 +1093,8 @@ exit 0
         }
 
         // Follow-up ListSweeps should see the new entry.
-        let response = handle_request(Request::ListSweeps { state_filter: None }, &tm, &db, &sr);
+        let response =
+            handle_request(Request::ListSweeps { state_filter: None }, &tm, &db, &sr, &bus);
         match response {
             Response::SweepList { sweeps } => {
                 assert_eq!(sweeps.len(), 1);
@@ -987,7 +1106,7 @@ exit 0
 
     #[test]
     fn test_handle_request_dispatch_sweep_rejects_prset_in_phase_a() {
-        let (tm, db, _) = setup_test_context();
+        let (tm, db, _, bus) = setup_test_context();
         let (sr, _dir, _rec) = setup_sweep_registry_in_tempdir();
 
         let response = handle_request(
@@ -998,6 +1117,7 @@ exit 0
             &tm,
             &db,
             &sr,
+            &bus,
         );
         match response {
             Response::Error { message } => {
@@ -1007,6 +1127,69 @@ exit 0
                 );
             }
             other => panic!("Expected Error, got: {other:?}"),
+        }
+    }
+
+    // ===== Event bus IPC handlers (Issue #3453, Phase B) =====
+
+    #[tokio::test]
+    async fn test_handle_request_publish_event_routes_to_subscribers() {
+        let (tm, db, sr, bus) = setup_test_context();
+        let mut sub = bus.subscribe::<[&str; 0], &str>([]);
+
+        let response = handle_request(
+            Request::PublishEvent {
+                topic: "sweep.issue.123.phase".to_string(),
+                payload: serde_json::json!({"phase": "builder"}),
+            },
+            &tm,
+            &db,
+            &sr,
+            &bus,
+        );
+
+        match response {
+            Response::EventPublished { topic, receivers } => {
+                assert_eq!(topic, "sweep.issue.123.phase");
+                assert!(receivers >= 1, "expected at least 1 receiver; got {receivers}");
+            }
+            other => panic!("Expected EventPublished, got: {other:?}"),
+        }
+
+        // Subscriber should now see the published event.
+        let ev = sub.recv().await.unwrap();
+        match ev {
+            Event::Generic { topic, payload } => {
+                assert_eq!(topic, "sweep.issue.123.phase");
+                assert_eq!(payload, serde_json::json!({"phase": "builder"}));
+            }
+            other => panic!("Expected Generic event, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_handle_request_subscribe_events_short_circuits_to_error() {
+        // SubscribeEvents must be handled by stream_events (not the
+        // dispatcher). If it ever reaches handle_request, the dispatcher
+        // returns an Error sentinel so the bug is visible.
+        let (tm, db, sr, bus) = setup_test_context();
+        let response = handle_request(
+            Request::SubscribeEvents {
+                topics: vec!["sweep".to_string()],
+            },
+            &tm,
+            &db,
+            &sr,
+            &bus,
+        );
+        match response {
+            Response::Error { message } => {
+                assert!(
+                    message.contains("SubscribeEvents must be handled by stream_events"),
+                    "expected internal-bug error message; got: {message}"
+                );
+            }
+            other => panic!("Expected Error sentinel, got: {other:?}"),
         }
     }
 }
