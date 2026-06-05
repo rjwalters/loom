@@ -1,95 +1,297 @@
 # Loom Daemon Reference
 
-> **⚠️ Stop-gap — daemon backend in flight (epic #3449, stop-gap #3451)**
->
-> The "preserved, re-implemented" claim below describes the v0.10.0 target state. As of v0.9.1, `./.loom/scripts/daemon.sh` does **not** exist on `origin/main` — it was deleted in #3432 and is being rebuilt in epic #3449 (~4-6 weeks). Until that rebuild lands, all `./.loom/scripts/daemon.sh start|stop|status` commands in this page will fail with "no such file or directory". Use `./.loom/scripts/spawn-loop.sh` (headless) or `/loom:sweep <issue>` instead.
+> **Status: ACTIVE (v0.10.0).** This page describes the Rust `loom-daemon`
+> binary and its MCP-facing surface — the dispatch + pub/sub + monitoring
+> tools delivered by epic #3449 (Phases A through C). The legacy Python
+> `loom-daemon` brain (`loom_tools/daemon_v2/`) and the `/shepherd`
+> orchestrator were deleted in the v0.10.0 deprecation epic (#3372). The
+> shell-level `./.loom/scripts/daemon.sh` tmux session launcher (when
+> rebuilt under epic #3449's later phases) wraps this same daemon binary.
 
-> **Status: PRESERVED, RE-IMPLEMENTED in v0.10.0.** The Python `loom-daemon`
-> brain (`loom_tools/daemon_v2/`) and the `/shepherd` orchestrator are
-> deleted in v0.10.0 as part of the shepherd/daemon-brain deprecation epic
-> (#3372). **The shell-level daemon surface — `./.loom/scripts/daemon.sh` +
-> tmux session runner + per-pane OAuth token rotation — is preserved.**
-> The user-facing API is unchanged; only the internals are different.
->
-> The historical contents of this page — `ISSUE_THRESHOLD` /
-> `MAX_SHEPHERDS` tuning tables, the `daemon-state.json` schema,
-> session-rotation procedures, shepherd pool sizing, etc. — described a
-> Python brain that no longer exists. Those tunables are gone.
+## What the daemon is
 
-## What daemon mode is in v0.10.0
+`loom-daemon` is a Rust process that exposes a Unix-socket IPC surface
+(framed JSON, line-delimited) and a paired `mcp-loom` MCP server which
+maps each IPC request 1:1 to an MCP tool. The daemon is **the
+coordination point** for:
 
-`./.loom/scripts/daemon.sh start` opens a tmux session whose panes each
-run a fresh Claude Code session via `spawn-claude.sh` (one rotated OAuth
-token per pane). This is the **"daemon-managed tmux sessions that launch
-Loom agents as separate Claude Code sessions"** execution surface. It is
-the long-running, multi-account-rotated counterpart to `/loom:sweep`'s
-in-session subagent dispatch.
+- **Dispatching** `/loom:sweep` children with multi-account OAuth token
+  rotation (via `defaults/scripts/spawn-claude.sh`).
+- **Tracking** running sweeps in an in-memory registry (no on-disk state
+  file — the forge is the source of truth for queue state).
+- **Publishing** sweep-lifecycle events on an in-memory pub/sub bus, and
+  **subscribing** external monitors to topic-filtered streams.
+- **Cancelling** in-flight sweeps with SIGTERM → grace → SIGKILL.
+- **Reaping** dead PIDs (every 30s) to maintain registry liveness and
+  emit `sweep.issue.*.exited` / `sweep.issue.*.crashed` events.
 
-| Surface | Process model | Token model | Best for |
-|---------|---------------|-------------|----------|
-| `/loom:sweep` (subagent dispatch) | Single process, multiple subagents | Single OAuth token (parent's) | Operator-driven batches, ≤ hours of runtime |
-| `./.loom/scripts/daemon.sh` (tmux) | Multiple processes (one per pane + sweep child) | Rotated per process via `spawn-claude.sh` | Multi-day autonomous operation across multiple accounts |
+It is **not** a work generator. It does not poll the forge for ready
+issues, it does not maintain a `shepherd-N` pool, and it does not run
+support roles on cron. Those responsibilities live in `spawn-loop.sh`
+(`./.loom/scripts/spawn-loop.sh`) and the GitHub Actions cron workflows
+(`.github/workflows/loom-*.yml`).
 
-Both surfaces are first-class. Pick by runtime expectations. See
-[`docs/migration/v0.10.0-shepherd-deprecation.md`](../../docs/migration/v0.10.0-shepherd-deprecation.md)
-for the migration narrative.
+## Architecture (Phases A-C)
 
-## What is removed in v0.10.0
+```
+┌────────────────────────────────────────────────────────────────┐
+│                      MCP clients (Claude Code)                 │
+│  - dispatch_sweep, list_sweeps                          (A)    │
+│  - publish_event, subscribe_to_events                   (B)    │
+│  - get_sweep_status, tail_sweep_log, cancel_sweep       (C)    │
+│  - tail_event_bus                                       (C)    │
+└────────────────────────────────────────────────────────────────┘
+                              │ stdio JSON-RPC
+                              ▼
+┌────────────────────────────────────────────────────────────────┐
+│                    mcp-loom (TypeScript)                       │
+│  - Validates args, normalizes payloads, formats output         │
+│  - One MCP tool per IPC Request variant                        │
+└────────────────────────────────────────────────────────────────┘
+                              │ Unix socket, line-delimited JSON
+                              ▼
+┌────────────────────────────────────────────────────────────────┐
+│                    loom-daemon (Rust)                          │
+│  ┌──────────────────┐  ┌──────────────────┐  ┌──────────────┐  │
+│  │ SweepRegistry    │  │ EventBus         │  │ ReaperTask   │  │
+│  │ (BTreeMap)       │  │ (broadcast chan) │  │ (30s tick)   │  │
+│  └──────────────────┘  └──────────────────┘  └──────────────┘  │
+│                              │                                  │
+│                              ▼                                  │
+│                    fork+exec /loom:sweep N                      │
+│                    via spawn-claude.sh                          │
+└────────────────────────────────────────────────────────────────┘
+                              │ detached child
+                              ▼
+                       /loom:sweep <issue>
+                       (Claude Code session)
+```
 
-If you were relying on these, you have a migration:
+## IPC surface (Request/Response variants)
 
-| Removed | Replacement | Where |
-|---------|-------------|-------|
-| Python `loom-daemon` CLI entry point | `./.loom/scripts/daemon.sh start` (re-implemented) | This page |
-| `/shepherd <issue>` slash command | `/loom:sweep <issue>` | `.claude/commands/loom/sweep.md` |
-| `loom-shepherd` Python CLI | `claude -p "/loom:sweep <N>" --dangerously-skip-permissions` | Same skill, headless invocation |
-| `.loom/daemon-state.json` | `.loom/spawn-loop-state.json` (smaller schema) | Written by `spawn-loop.sh`; see [`spawn-loop.sh status`](../../.loom/scripts/spawn-loop.sh) |
-| `.loom/progress/shepherd-*.json` heartbeats | `.loom/sweep-checkpoint/issue-<N>.json` (#3373) | Written by `/loom:sweep` |
-| `loom-validate-state` | Presence check on `.loom/spawn-loop-state.json` | Use `[[ -f .loom/spawn-loop-state.json ]]` |
-| Support-role daemons running inside the Python brain | GitHub Actions cron workflows | `.github/workflows/loom-*.yml` (#3375) |
+The wire protocol is line-delimited JSON. Each `Request` is one line; the
+daemon responds with one line per request — except `SubscribeEvents`,
+which holds the connection open and streams one `EventStream` frame per
+event. Connection framing matches the existing terminal-management IPC
+surface; no new transport is introduced.
 
-For the per-CLI breaking changes and field-level diff, see
-[`docs/migration/v0.10.0-shepherd-deprecation.md § Per-CLI breaking
-changes`](../../docs/migration/v0.10.0-shepherd-deprecation.md#per-cli-breaking-changes).
+Source of truth: [`loom-daemon/src/types.rs`](../../loom-daemon/src/types.rs).
 
-For the engineering inventory that drove the deletion decisions (which
-consumers retire, which port, which are unchanged), see
-[`docs/migration/daemon-state-consumers.md`](../../docs/migration/daemon-state-consumers.md).
+| Request | MCP tool | Response | Phase |
+|---------|----------|----------|-------|
+| `DispatchSweep`     | `dispatch_sweep`       | `SweepDispatched`   | A (#3452) |
+| `ListSweeps`        | `list_sweeps`          | `SweepList`         | A (#3452) |
+| `PublishEvent`      | `publish_event`        | `EventPublished`    | B (#3453) |
+| `SubscribeEvents`   | `subscribe_to_events`, `tail_event_bus` | `EventStream` (stream) | B (#3453) |
+| `GetSweepStatus`    | `get_sweep_status`     | `SweepStatus`       | C (#3455) |
+| `TailSweepLog`      | `tail_sweep_log`       | `SweepLogTail`      | C (#3455) |
+| `CancelSweep`       | `cancel_sweep`         | `SweepCancelled`    | C (#3455) |
 
-## Why this file is intentionally minimal
+## Event taxonomy (frozen for v0.10.0)
 
-The legacy schema and tuning advice on this page were a pre-Phase-3
-reference for a multi-process Python daemon that polled the forge, scaled
-a `shepherd-N` pool, ran work-generation triggers (Architect/Hermit), and
-maintained a JSON state file as the canonical source of truth. **None of
-that exists post-v0.10.0.** The shell-level daemon mode that survives is
-deliberately thinner:
+The bus accepts arbitrary topic strings, but the documented taxonomy is
+the contract subscribers should rely on. **New topics require a follow-up
+issue** — the v0.10.0 set is intentionally frozen.
 
-- The daemon **does not** generate work — Architect and Hermit cadence is
-  out of scope for v0.10.0 and tracked under follow-up #3381.
-- The daemon **does not maintain a shepherd-N pool**. Each ready issue
-  detaches its own `claude -p "/loom:sweep N"` child via the spawn loop;
-  concurrency is bounded by `MAX_PARALLEL` only.
-- The daemon **does not track `pipeline_state`, `warnings`,
-  `completed_issues`, `total_prs_merged`, or `last_*_trigger`**. The forge
-  is the source of truth for pipeline state; failure counters live in
-  `.loom/tokens/.failure_counts` (token-rotation only).
-- Support roles run as **cron-driven** GitHub Actions workflows, not as
-  long-running daemon-managed processes (though operators can opt to run
-  them in tmux panes — see the migration guide). There is no
-  `JUDGE_INTERVAL` / `CHAMPION_INTERVAL` / etc. to tune from a daemon
-  config.
+| Topic | Publisher | Payload |
+|-------|-----------|---------|
+| `sweep.issue.{N}.phase`   | Sweep child via `publish_event` | `{phase, pr_number?}` |
+| `sweep.issue.{N}.blocker` | Sweep child                     | `{reason, label_added}` |
+| `sweep.issue.{N}.exited`  | Daemon reaper (or `cancel_sweep`) | `{exit_code, duration_sec}` |
+| `sweep.issue.{N}.crashed` | Daemon reaper                   | `{checkpoint_phase}` |
+| `sweep.global.dispatch`   | Daemon                          | `{sweep_id, kind}` |
+| `sweep.global.completed`  | Daemon                          | `{sweep_id, outcome}` |
 
-Re-creating a "compatibility-shape" `daemon-state.json` from the spawn
-loop was considered and rejected — see the rationale in
-`docs/migration/daemon-state-consumers.md` §"Conclusion: what Phase 3
-deletes vs preserves".
+In addition, the bus internally emits:
 
-## Rust `loom-daemon` (unrelated, still supported)
+- `sweep.system.topic_lag` — synthetic event when a subscription falls
+  behind the publisher past the bus capacity. Mirrors tokio's `Lagged`
+  semantics; carries `{skipped: usize}`.
 
-This page is about the **shell-level Loom daemon mode** + the deleted
-**Python** `loom-daemon` CLI. The **Rust** binary at `loom-daemon/`
-(Tauri-side IPC daemon, tmux session manager) is a different component
-and is unaffected by Phase 3. Its source lives in `loom-daemon/src/`, its
-tests in `loom-daemon/tests/`, and its release artifacts ship with the
-rest of the Tauri quickstart.
+Topic matching is **segment-aligned prefix** (`sweep.issue` matches
+`sweep.issue.123.phase` but not `sweep.issuetype.foo`). See
+[`event_bus::topic_matches`](../../loom-daemon/src/event_bus.rs) for the
+authoritative routing rule.
+
+## MCP tool reference
+
+All tools live in `mcp-loom/src/tools/sweeps.ts`. Each tool name maps
+1:1 to an IPC `Request` variant.
+
+### `dispatch_sweep` (Phase A)
+
+Spawn a `/loom:sweep` child via the daemon's registry. The daemon shells
+out to `defaults/scripts/spawn-claude.sh` for token rotation and detaches
+the child. Returns the `sweep_id`, child PID, token-account name, and
+per-sweep log path.
+
+Inputs:
+- `kind` (required) — `{"Issue": <N>}` or `{"PrSet": [<N>, ...]}`. Phase
+  A only fully implements `Issue`; `PrSet` is rejected by the registry.
+- `idempotency_key` (optional) — dedup key. Running sweeps with the same
+  key return the existing `sweep_id` without spawning a new child.
+
+### `list_sweeps` (Phase A)
+
+Return all tracked sweeps, optionally filtered by lifecycle state.
+Terminal entries are garbage-collected ~1h after the transition.
+
+Inputs:
+- `state_filter` (optional) — one of `Pending`, `Running`, `Exited`,
+  `Crashed`.
+
+### `publish_event` (Phase B)
+
+Publish a JSON event onto the in-memory bus. Operator override / test
+escape hatch — production publishes happen via the sweep skill, not this
+tool.
+
+Inputs:
+- `topic` (required) — should follow the frozen taxonomy.
+- `payload` (required) — opaque JSON.
+
+### `subscribe_to_events` (Phase C)
+
+Open a long-lived subscription to the event bus, filtered by topic
+prefix. Frames arrive as line-delimited JSON matching
+`Response::EventStream { events: [Event] }`. The MCP layer caps each
+subscription with a `duration` window so a single tool call returns
+deterministically.
+
+Inputs:
+- `topics` (optional) — array of topic prefixes; empty = all events.
+- `duration` (optional, default `30s`) — `<N>s`/`<N>m`/`<N>h` window.
+- `max_events` (optional) — upper bound on frames returned.
+
+### `get_sweep_status` (Phase C)
+
+Return the `SweepInfo` for a single sweep plus up to N recent events
+observed on its topics (default 10). The bus is in-memory and transient
+— recent-events collection is a best-effort short subscribe window
+(~200ms), not a replay log.
+
+Inputs:
+- `sweep_id` (required).
+- `recent_events` (optional, default 10) — set to 0 to skip the
+  subscribe window.
+
+### `tail_sweep_log` (Phase C)
+
+Read the last N lines of a sweep's per-sweep log file
+(`.loom/logs/sweep-issue-<N>.log`). The log path is resolved from the
+registry entry.
+
+Inputs:
+- `sweep_id` (required).
+- `lines` (optional, default 100).
+
+### `cancel_sweep` (Phase C)
+
+SIGTERM → wait `grace` seconds → SIGKILL the sweep's child PID.
+Transitions the registry entry from `Running` to `Exited{code: None,
+at: now}` and releases the per-issue lock. Idempotent: cancelling an
+already-terminal sweep returns success with `was_running: false`.
+
+Inputs:
+- `sweep_id` (required).
+- `grace` (optional, default 30) — seconds between SIGTERM and SIGKILL.
+
+### `tail_event_bus` (Phase C)
+
+Debug-oriented fire-hose subscription that streams ALL events on the bus
+regardless of topic. Added per curator risk note D — multi-child
+interactions are qualitatively harder to debug than hermetic children.
+
+Inputs:
+- `since` (optional, default `10m`) — `<N>s`/`<N>m`/`<N>h` streaming
+  window. **Note**: the bus is transient — `since` is a streaming
+  duration, not a backward-looking replay filter.
+- `max_events` (optional) — upper bound on frames returned.
+
+## In-memory registry layout
+
+The sweep registry (`loom-daemon/src/sweep_registry.rs`) holds a
+`BTreeMap<SweepId, SweepInfo>` keyed by stable IDs of the form
+`sweep-issue-<N>-<unix-secs>` or `sweep-prs-<n1>-<n2>-...-<unix-secs>`.
+`SweepInfo` carries:
+
+- `sweep_id`, `kind` (`Issue(N)` or `PrSet(Vec<u32>)`), `pid`,
+  `token_name`, `log_path`.
+- `idempotency_key` (optional), `started_at`.
+- `state` — one of `Pending`, `Running`, `Exited{code, at}`,
+  `Crashed{at}`.
+- `latest_phase` (optional) — most-recent phase advertised via
+  checkpoint.
+- `pr_number` (optional, reserved).
+
+The wire shape is pinned by `sweep_info_schema_snapshot` in
+`sweep_registry.rs` — a change to the JSON shape requires deliberate
+test update.
+
+## Reaper task
+
+The reaper (`sweep_registry::spawn_reaper_task`) ticks every 30 seconds
+(env-overridable via `LOOM_SWEEP_REAPER_INTERVAL_SECS`). Each tick:
+
+1. Snapshots live `Running`/`Pending` entries.
+2. Tests each PID via `kill(pid, 0)`.
+3. On dead PID:
+   - If a sweep checkpoint exists at
+     `.loom/sweep-checkpoint/issue-<N>.json`, marks the entry `Crashed`
+     and flips the forge label `loom:building` → `loom:issue` so the
+     next dispatch resumes from the checkpointed phase.
+   - Otherwise marks the entry `Exited{code: None}`.
+   - Emits `sweep.issue.{N}.exited` or `sweep.issue.{N}.crashed`, plus
+     a global `sweep.global.completed` event.
+4. Garbage-collects terminal entries older than the retention window
+   (default 1 hour).
+
+## Locks and lifecycle
+
+Each dispatched sweep acquires a directory lock under
+`.loom/locks/issue-<N>/` via `mkdir` (POSIX-atomic). The lock dir
+contains an `owner.json` with the dispatching daemon PID and the sweep
+ID. The reaper releases the lock when a child dies; `cancel_sweep`
+releases it explicitly. On daemon startup, `SweepRegistry::reconstruct`
+admits live-lock owners back into the registry and drops stale locks
+whose owner PID is dead.
+
+## What this page does NOT describe
+
+The legacy schema and tuning advice that historically lived here — the
+Python `daemon-state.json` schema, `MAX_SHEPHERDS`/`ISSUE_THRESHOLD`
+tunables, work-generation cooldowns, `shepherd-N` pool sizing — described
+a Python brain that no longer exists. **None of that exists post-v0.10.0.**
+
+- The daemon **does not** generate work. Architect and Hermit cadence
+  is out of scope and tracked under follow-up #3381.
+- The daemon **does not maintain a shepherd-N pool**. Each issue
+  detaches its own `claude -p "/loom:sweep N"` child; concurrency
+  bounds live in `spawn-loop.sh` (`MAX_PARALLEL`) or are operator-set
+  via separate `dispatch_sweep` MCP calls.
+- The daemon **does not track** `pipeline_state`, `warnings`,
+  `completed_issues`, or `last_*_trigger`. The forge is the source of
+  truth for pipeline state.
+- Support roles run as **cron-driven GitHub Actions workflows**, not as
+  long-running daemon-managed processes. There is no `JUDGE_INTERVAL`
+  or `CHAMPION_INTERVAL` to tune from daemon config.
+
+The decision to delete rather than re-implement the legacy state file
+is documented in `docs/migration/daemon-state-consumers.md` §"Conclusion:
+what Phase 3 deletes vs preserves".
+
+## Related resources
+
+- **Architecture epic**: [#3449](https://github.com/rjwalters/loom/issues/3449)
+  (rebuild of the daemon backend).
+- **Phase A** (dispatch surface): #3452 / PR #3459.
+- **Phase B** (event bus): #3453 / PR #3460.
+- **Phase C** (monitoring + subscription tools): #3455.
+- **Migration guide**:
+  [`docs/migration/v0.10.0-shepherd-deprecation.md`](../../docs/migration/v0.10.0-shepherd-deprecation.md).
+- **Source**:
+  - [`loom-daemon/src/types.rs`](../../loom-daemon/src/types.rs) — IPC types.
+  - [`loom-daemon/src/sweep_registry.rs`](../../loom-daemon/src/sweep_registry.rs) — registry + reaper.
+  - [`loom-daemon/src/event_bus.rs`](../../loom-daemon/src/event_bus.rs) — pub/sub bus.
+  - [`loom-daemon/src/ipc.rs`](../../loom-daemon/src/ipc.rs) — request dispatcher.
+  - [`mcp-loom/src/tools/sweeps.ts`](../../mcp-loom/src/tools/sweeps.ts) — MCP tool definitions.
