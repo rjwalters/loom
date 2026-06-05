@@ -27,7 +27,7 @@ loom-stuck-detection = "loom_tools.stuck_detection:main"
 loom-claim = "loom_tools.claim:main"
 loom-check-completions = "loom_tools.completions:main"
 loom-clean = "loom_tools.clean:main"
-loom-milestone = "loom_tools.milestones:main"
+# loom-milestone removed in Phase 3.3 (#3400) — milestones.py deleted with shepherd brain
 loom-worktree = "loom_tools.worktree:main"
 loom-recover-orphans = "loom_tools.orphan_recovery:main"
 # loom-validate-state removed in Phase 3.2 (#3399) — validate_state.py deleted

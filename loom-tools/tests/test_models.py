@@ -3,6 +3,9 @@
 Phase 3.2 (#3399): DaemonState, ShepherdEntry, SupportRoleEntry, and Warning
 test classes removed — the daemon brain and its state file are deleted.
 The stub daemon_state.py exists only for Phase 3.4 fallback-path cleanup.
+
+Phase 3.3 (#3400): ShepherdProgress and Milestone test classes removed —
+models/progress.py deleted with the shepherd brain.
 """
 
 from __future__ import annotations
@@ -19,7 +22,6 @@ from loom_tools.models.health import (
     MetricEntry,
     PipelineHealthMetric,
 )
-from loom_tools.models.progress import Milestone, ShepherdProgress
 from loom_tools.models.stuck import (
     StuckDetection,
     StuckHistory,
@@ -97,53 +99,6 @@ class TestAlertsFile:
         af2 = AlertsFile.from_dict(out)
         assert len(af2.alerts) == len(af.alerts)
         assert af2.alerts[0].id == af.alerts[0].id
-
-
-# -- ShepherdProgress ------------------------------------------------------
-
-
-class TestShepherdProgress:
-    @pytest.fixture()
-    def raw(self) -> dict:
-        return _load("progress.json")
-
-    def test_from_dict(self, raw: dict) -> None:
-        sp = ShepherdProgress.from_dict(raw)
-        assert sp.task_id == "00d085c"
-        assert sp.issue == 1618
-        assert sp.mode == "force-merge"
-        assert sp.status == "completed"
-        assert len(sp.milestones) == 7
-
-    def test_milestones(self, raw: dict) -> None:
-        sp = ShepherdProgress.from_dict(raw)
-        assert sp.milestones[0].event == "started"
-        assert sp.milestones[0].data["issue"] == 1618
-        assert sp.milestones[-1].event == "completed"
-        assert sp.milestones[-1].data["pr_merged"] is True
-
-    def test_round_trip(self, raw: dict) -> None:
-        sp = ShepherdProgress.from_dict(raw)
-        out = sp.to_dict()
-        sp2 = ShepherdProgress.from_dict(out)
-        assert sp2.task_id == sp.task_id
-        assert len(sp2.milestones) == len(sp.milestones)
-
-    def test_empty_dict(self) -> None:
-        sp = ShepherdProgress.from_dict({})
-        assert sp.task_id == ""
-        assert sp.milestones == []
-
-
-class TestMilestone:
-    def test_round_trip(self) -> None:
-        data = {
-            "event": "pr_created",
-            "timestamp": "2026-01-30T16:50:07Z",
-            "data": {"pr_number": 1631},
-        }
-        m = Milestone.from_dict(data)
-        assert m.to_dict() == data
 
 
 # -- Stuck Detection -------------------------------------------------------

@@ -134,8 +134,12 @@ class TestBuilderDiagnostics:
         assert "feature/issue-42" in md
         assert "configured" in md
 
-    def test_to_markdown_with_progress_info(self):
-        """Verify previous attempt section is rendered with progress info."""
+    def test_to_markdown_with_worktree_mtime(self):
+        """Verify previous attempt section is rendered with worktree mtime.
+
+        Phase 3.3 (#3400): progress_status/progress_started_at/progress_milestones
+        removed — progress files retired with shepherd brain.
+        """
         d = BuilderDiagnostics(
             worktree_path="/tmp/wt",
             worktree_exists=True,
@@ -143,58 +147,10 @@ class TestBuilderDiagnostics:
             commits_ahead="0",
             issue=42,
             worktree_mtime="2026-01-15T10:30:00Z",
-            progress_status="builder",
-            progress_started_at="2026-01-15T10:00:00Z",
-            progress_last_heartbeat="2026-01-15T10:25:00Z",
-            progress_milestones=[
-                "started at 2026-01-15T10:00:00Z ({'issue': 42})",
-                "phase_entered at 2026-01-15T10:01:00Z ({'phase': 'curator'})",
-                "phase_entered at 2026-01-15T10:05:00Z ({'phase': 'builder'})",
-            ],
         )
         md = d.to_markdown()
         assert "### Previous Attempt" in md
-        assert "**Started**: 2026-01-15T10:00:00Z" in md
         assert "**Worktree last modified**: 2026-01-15T10:30:00Z" in md
-        assert "**Last phase**: `builder`" in md
-        assert "**Last heartbeat**: 2026-01-15T10:25:00Z" in md
-        assert "**Recent milestones**:" in md
-        assert "phase_entered at 2026-01-15T10:05:00Z" in md
-
-    def test_to_markdown_with_partial_progress_info(self):
-        """Verify partial progress info is rendered correctly."""
-        d = BuilderDiagnostics(
-            worktree_path="/tmp/wt",
-            worktree_exists=True,
-            issue=42,
-            worktree_mtime="2026-01-15T10:30:00Z",
-            # No progress file found
-            progress_status="",
-            progress_started_at="",
-        )
-        md = d.to_markdown()
-        # Should still show Previous Attempt section with worktree mtime
-        assert "### Previous Attempt" in md
-        assert "**Worktree last modified**: 2026-01-15T10:30:00Z" in md
-        # But not the progress-specific fields
-        assert "**Last phase**" not in md
-
-    def test_to_markdown_milestones_limited_to_last_five(self):
-        """Verify only last 5 milestones are shown."""
-        d = BuilderDiagnostics(
-            worktree_path="/tmp/wt",
-            issue=42,
-            progress_started_at="2026-01-15T10:00:00Z",
-            progress_milestones=[
-                f"event_{i} at time_{i}" for i in range(10)
-            ],
-        )
-        md = d.to_markdown()
-        # Should show last 5 only
-        assert "event_5" in md
-        assert "event_9" in md
-        assert "event_0" not in md
-        assert "event_4" not in md
 
 
 # ---------------------------------------------------------------------------
@@ -243,22 +199,6 @@ class TestGatherBuilderDiagnostics:
             assert "Info: Trying again" in diag.log_tail
         finally:
             log_path.unlink(missing_ok=True)
-
-    def test_handles_missing_progress_file(self, tmp_path: Path):
-        """Verify graceful handling when no progress file exists."""
-        repo = _make_repo(tmp_path)
-        wt = tmp_path / ".loom" / "worktrees" / "issue-42"
-        wt.mkdir(parents=True)
-        (wt / ".git").mkdir()
-
-        with patch("loom_tools.validate_phase._run_gh") as mock_gh:
-            mock_gh.return_value = _completed(stdout="loom:building\n")
-            diag = _gather_builder_diagnostics(42, str(wt), repo)
-
-        # Should have empty progress fields
-        assert diag.progress_status == ""
-        assert diag.progress_started_at == ""
-        assert diag.progress_milestones is None
 
     def test_handles_missing_worktree(self, tmp_path: Path):
         """Verify graceful handling when worktree doesn't exist."""

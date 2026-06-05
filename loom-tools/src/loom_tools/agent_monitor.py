@@ -35,9 +35,6 @@ from loom_tools.models.agent_wait import (
     WaitStatus,
 )
 
-# Progress tracking directory
-PROGRESS_DIR = pathlib.Path("/tmp/loom-agent-progress")
-
 # Adaptive contract checking intervals (see issue #1678)
 # Contract checks are expensive (GitHub API calls), so we start with longer
 # intervals and decrease them over time as completion becomes more likely.
@@ -359,21 +356,13 @@ class AgentMonitor:
         return None
 
     def _check_errored_status(self) -> bool:
-        """Check shepherd progress file for errored status."""
-        if not self.config.task_id:
-            return False
+        """Stub: shepherd progress files removed in Phase 3.3 (#3400).
 
-        progress_file = (
-            self.repo_root
-            / ".loom"
-            / "progress"
-            / f"shepherd-{self.config.task_id}.json"
-        )
-        if not progress_file.exists():
-            return False
-
-        data = read_json_file(progress_file)
-        return data.get("status") == "errored" if isinstance(data, dict) else False
+        Progress files (.loom/progress/shepherd-*.json) are retired.
+        Always returns False. Phase 3.4 (#3401) will remove task_id
+        from MonitorConfig and clean up callers.
+        """
+        return False
 
     def _check_and_resolve_prompts(self) -> bool:
         """Check for and auto-resolve interactive prompts (e.g., plan mode)."""
@@ -867,41 +856,17 @@ class AgentMonitor:
         log_info(f"Diagnostics captured to {diag_file}")
 
     def _cleanup_progress_files(self) -> None:
-        """Clean up progress tracking files."""
-        for suffix in ("", ".hash", ".time"):
-            progress_file = PROGRESS_DIR / f"{self.config.name}{suffix}"
-            try:
-                progress_file.unlink(missing_ok=True)
-            except Exception:
-                pass
+        """No-op: shepherd progress tracking removed in Phase 3.3 (#3400)."""
+        pass
 
     async def _emit_heartbeat(self) -> None:
-        """Emit periodic heartbeat to keep shepherd progress file fresh."""
-        if not self.config.task_id:
-            return
+        """No-op: shepherd milestone heartbeat removed in Phase 3.3 (#3400).
 
-        now = time.time()
-        since_last = now - self._last_heartbeat_time
-        if since_last < self.config.heartbeat_interval:
-            return
-
-        self._last_heartbeat_time = now
-
-        elapsed_min = self.elapsed // 60
-        phase_desc = self.config.phase or "agent"
-
-        try:
-            from loom_tools.milestones import report_milestone
-
-            report_milestone(
-                self.repo_root,
-                self.config.task_id,
-                "heartbeat",
-                quiet=True,
-                action=f"{phase_desc} running ({elapsed_min}m elapsed)",
-            )
-        except Exception:
-            pass
+        Progress files (.loom/progress/shepherd-*.json) and milestones.py
+        were deleted. task_id / heartbeat_interval on MonitorConfig are
+        retained for Phase 3.4 (#3401) cleanup.
+        """
+        pass
 
 
 async def monitor_agent(config: MonitorConfig) -> WaitResult:

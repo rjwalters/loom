@@ -3,12 +3,10 @@
 Provides centralized JSON parsing utilities with consistent error handling.
 All parsing functions gracefully handle failures by returning defaults.
 
-Phase 3.2 note: read_daemon_state(), read_progress_files(), and
-find_progress_for_issue() were removed in PR #3399 along with the Python
-daemon brain (daemon_v2/) and the state files they read
-(.loom/daemon-state.json, .loom/progress/).  Callers that still need a
-DaemonState placeholder for backwards-compat render paths import
-DaemonState directly and instantiate a default: ``DaemonState()``.
+Phase 3.3 note: read_progress_files() and find_progress_for_issue() were
+removed in PR #3400 along with the Python shepherd brain (shepherd/) and the
+progress files they read (.loom/progress/).  read_daemon_state() is kept as a
+stub for Phase 3.4 (#3401) daemon-state fallback-path cleanup.
 """
 
 from __future__ import annotations
@@ -155,26 +153,6 @@ def read_daemon_state(repo_root: pathlib.Path) -> "DaemonState":
     from loom_tools.models.daemon_state import DaemonState  # local import avoids circular
 
     return DaemonState()
-
-
-def read_progress_files(repo_root: pathlib.Path) -> list:
-    """Stub: always returns empty list.
-
-    Progress files (.loom/progress/shepherd-*.json) are retired in Phase 3.2
-    (#3399). This stub is kept so that callers (test_failure_analysis.py,
-    validate_phase.py) continue to import without error.
-    Phase 3.3 (#3400) or Phase 3.4 (#3401) will remove the callers.
-    """
-    return []
-
-
-def find_progress_for_issue(repo_root: pathlib.Path, issue: int) -> None:
-    """Stub: always returns None.
-
-    Progress files (.loom/progress/shepherd-*.json) are retired in Phase 3.2
-    (#3399). This stub keeps validate_phase.py importable until Phase 3.4.
-    """
-    return None
 
 
 def read_spawn_loop_state(repo_root: pathlib.Path) -> SpawnLoopState:

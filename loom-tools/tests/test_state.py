@@ -8,15 +8,14 @@ import subprocess
 from unittest.mock import Mock
 
 from loom_tools.common.state import (
-    find_progress_for_issue,
     parse_command_output,
     read_json_file,
     safe_parse_json,
     write_json_file,
 )
 
-# Note: find_progress_for_issue is a stub in Phase 3.2 (always returns None).
-# Tests that expect non-None results are removed; only stub-compatible tests remain.
+# Phase 3.3 (#3400): find_progress_for_issue removed from state.py along with
+# progress files (.loom/progress/) and the shepherd brain. Tests removed.
 
 
 # ---------------------------------------------------------------------------
@@ -213,18 +212,3 @@ def test_read_json_file_corrupt_with_custom_default(tmp_path: pathlib.Path) -> N
     assert result == {"error": "fallback"}
 
 
-# ---------------------------------------------------------------------------
-# Tests for find_progress_for_issue (Phase 3.2 stub: always returns None)
-# ---------------------------------------------------------------------------
-
-
-def test_find_progress_for_issue_no_progress_dir(tmp_path: pathlib.Path) -> None:
-    """Stub always returns None regardless of filesystem state."""
-    result = find_progress_for_issue(tmp_path, 42)
-    assert result is None
-
-
-def test_find_progress_for_issue_no_matching_files(tmp_path: pathlib.Path) -> None:
-    """Stub always returns None (progress files retired in Phase 3.2)."""
-    result = find_progress_for_issue(tmp_path, 42)
-    assert result is None

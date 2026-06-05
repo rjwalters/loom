@@ -22,11 +22,6 @@ class TestLoomPaths:
         paths = LoomPaths(tmp_path)
         assert paths.scripts_dir == tmp_path / ".loom" / "scripts"
 
-    def test_progress_dir(self, tmp_path: Path) -> None:
-        """Test progress_dir property."""
-        paths = LoomPaths(tmp_path)
-        assert paths.progress_dir == tmp_path / ".loom" / "progress"
-
     def test_worktrees_dir(self, tmp_path: Path) -> None:
         """Test worktrees_dir property."""
         paths = LoomPaths(tmp_path)
@@ -36,11 +31,6 @@ class TestLoomPaths:
         """Test logs_dir property."""
         paths = LoomPaths(tmp_path)
         assert paths.logs_dir == tmp_path / ".loom" / "logs"
-
-    def test_daemon_state_file(self, tmp_path: Path) -> None:
-        """Test daemon_state_file property."""
-        paths = LoomPaths(tmp_path)
-        assert paths.daemon_state_file == tmp_path / ".loom" / "daemon-state.json"
 
     def test_health_metrics_file(self, tmp_path: Path) -> None:
         """Test health_metrics_file property."""
@@ -77,11 +67,6 @@ class TestLoomPaths:
         paths = LoomPaths(tmp_path)
         assert paths.worktree_path(42) == tmp_path / ".loom" / "worktrees" / "issue-42"
         assert paths.worktree_path(123) == tmp_path / ".loom" / "worktrees" / "issue-123"
-
-    def test_progress_file(self, tmp_path: Path) -> None:
-        """Test progress_file method."""
-        paths = LoomPaths(tmp_path)
-        assert paths.progress_file("abc1234") == tmp_path / ".loom" / "progress" / "shepherd-abc1234.json"
 
     def test_builder_log_file(self, tmp_path: Path) -> None:
         """Test builder_log_file method."""
