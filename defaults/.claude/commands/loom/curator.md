@@ -312,6 +312,43 @@ The Builder's complexity-assessment path (`defaults/.claude/commands/loom/builde
 
 > **Verify enumerations.** If the issue body lists specific callers, files, sites, or line numbers, treat the enumeration as a *starting point*, not authoritative. Run a comprehensive `git ls-files <pattern> | xargs grep -nE '<pattern>'` to verify completeness. Report any additions in your curator comment so the builder gets the correct scope.
 
+> **Verify against build base (origin/main).** The curator runs in the user's working tree (where uncommitted files are visible); the builder runs in a fresh worktree off `origin/main` (where they are not). If your "Affected Files" enumeration silently includes uncommitted paths, the builder will block on a broken setup. Before applying `loom:curated`, verify every path you enumerated under `## Affected Files` exists on the build base:
+>
+> ```bash
+> # Curator pre-flight: verify Affected Files exist on origin/main
+> git fetch origin --quiet
+>
+> # AFFECTED_FILES is the set of paths you enumerated under `## Affected Files`
+> MISSING=()
+> for path in "${AFFECTED_FILES[@]}"; do
+>   if ! git ls-tree -r origin/main --name-only | grep -qFx "$path"; then
+>     MISSING+=("$path")
+>   fi
+> done
+>
+> if (( ${#MISSING[@]} > 0 )); then
+>   # Surface in a warning comment + apply loom:blocked; do NOT apply loom:curated
+>   COMMENT="⚠️ **Curator pre-flight: uncommitted source files**
+>
+> The following files in the Affected Files enumeration are not on \`origin/main\`:
+> $(printf -- '- \`%s\`\n' "${MISSING[@]}")
+>
+> This will block the Builder, which dispatches into a fresh worktree off \`origin/main\`. Either:
+> - Commit + push these files first, then remove the \`loom:blocked\` label, OR
+> - Adjust the Affected Files section to scope down to committed-only changes."
+>   gh issue comment "$N" --body "$COMMENT"
+>   gh issue edit "$N" --add-label "loom:blocked"
+>   # Exit without further state changes — the next curator tick will re-evaluate.
+>   exit 0
+> fi
+> ```
+>
+> Implementation notes:
+> - Use `grep -qFx` (exact match) — not `grep -qF` — so `src/foo.ts` doesn't match `src/foo.ts.bak`.
+> - Run `git fetch origin --quiet` once at the top of the verification pass; do not refetch per file.
+> - If the issue has no `## Affected Files` section yet, this check is a no-op for this tick — add the section in the same pass and let the next curator tick run the verification.
+> - The `loom:blocked` label is the right escape hatch: it's already in the workflow, and is removed by the user (not by Loom) once the underlying files are committed and pushed.
+
 ### Process-Improvement Issues
 
 Issues about agent behavior or workflow failures need special curation to prevent superficial fixes (e.g., adding cross-references instead of structural changes). When curating these issues:
