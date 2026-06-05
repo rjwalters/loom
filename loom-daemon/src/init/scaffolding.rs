@@ -2,15 +2,25 @@
 //!
 //! Sets up CLAUDE.md, .claude/, .codex/, and .github/ directories.
 
+use std::collections::HashSet;
 use std::fs;
 use std::path::Path;
 
 use serde_json::Value;
 
-use super::file_ops::{copy_dir_with_report, force_merge_dir_with_report, merge_dir_with_report};
+use super::file_ops::{
+    copy_dir_with_report, copy_dir_with_report_filtered, force_merge_dir_with_report,
+    force_merge_dir_with_report_filtered, merge_dir_with_report,
+};
 use super::git::extract_repo_info;
 use super::templates::{assert_no_placeholders, substitute_template_variables, LoomMetadata};
 use super::InitReport;
+
+/// Name of the skip-list file under `defaults/` that lists Loom-internal
+/// paths the installer must not ship to consumer repositories.
+///
+/// See [`load_internal_skip_list`] for the file format. Issue #3464.
+pub const INTERNAL_SKIP_LIST_NAME: &str = ".loom-internal.list";
 
 /// Prefix used to identify Loom-owned hooks in settings.json.
 /// Hooks with commands starting with this prefix are managed by Loom.
@@ -101,6 +111,40 @@ fn is_legacy_loom_managed_root(existing_content: &str) -> bool {
     LEGACY_LOOM_SIGNATURES
         .iter()
         .any(|sig| existing_content.contains(sig))
+}
+
+/// Load the Loom-internal skip list from `<defaults>/.loom-internal.list`.
+///
+/// Returns a set of defaults-relative path strings (e.g.
+/// `".claude/commands/loom/release.md"`) that the installer must NOT copy
+/// into consumer repositories.
+///
+/// File format:
+/// - One defaults-relative path per line.
+/// - Lines starting with `#` are comments and ignored.
+/// - Blank lines are ignored.
+/// - Leading/trailing whitespace on each entry is stripped.
+/// - Paths are matched exactly against the defaults-relative path the
+///   copy helpers see (e.g. `.claude/commands/loom/release.md`). No
+///   globbing.
+///
+/// Missing or unreadable files yield an empty set — the install path is
+/// expected to function unchanged for repos that ship without a skip
+/// list. Issue #3464.
+pub fn load_internal_skip_list(defaults_path: &Path) -> HashSet<String> {
+    let mut set = HashSet::new();
+    let path = defaults_path.join(INTERNAL_SKIP_LIST_NAME);
+    let Ok(contents) = fs::read_to_string(&path) else {
+        return set;
+    };
+    for raw_line in contents.lines() {
+        let line = raw_line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        set.insert(line.to_string());
+    }
+    set
 }
 
 /// Read and parse an existing settings.json file, returning None if missing or invalid.
@@ -560,6 +604,14 @@ pub fn setup_repository_scaffolding(
     //
     // Special handling for settings.json: deep-merge hooks and permissions
     // instead of overwriting, so project-specific hooks are preserved.
+    //
+    // Issue #3464: skip files listed in `defaults/.loom-internal.list` so
+    // Loom-internal skills (e.g. `.claude/commands/loom/release.md`) are not
+    // shipped to consumer repositories. The skip list is loaded once and the
+    // closure does a HashSet lookup per file. An empty list (or missing file)
+    // is a no-op.
+    let skip_list = load_internal_skip_list(defaults_path);
+    let skip_predicate = |rel_path: &str| -> bool { skip_list.contains(rel_path) };
     let claude_src = defaults_path.join(".claude");
     let claude_dst = workspace_path.join(".claude");
     if claude_src.exists() {
@@ -569,12 +621,24 @@ pub fn setup_repository_scaffolding(
         if claude_dst.exists() {
             // Reinstall: always force-merge to update default commands
             // Custom commands (files not in defaults) are preserved
-            force_merge_dir_with_report(&claude_src, &claude_dst, ".claude", report)
-                .map_err(|e| format!("Failed to force-merge .claude directory: {e}"))?;
+            force_merge_dir_with_report_filtered(
+                &claude_src,
+                &claude_dst,
+                ".claude",
+                report,
+                &skip_predicate,
+            )
+            .map_err(|e| format!("Failed to force-merge .claude directory: {e}"))?;
         } else {
             // Fresh install: copy all
-            copy_dir_with_report(&claude_src, &claude_dst, ".claude", report)
-                .map_err(|e| format!("Failed to copy .claude directory: {e}"))?;
+            copy_dir_with_report_filtered(
+                &claude_src,
+                &claude_dst,
+                ".claude",
+                report,
+                &skip_predicate,
+            )
+            .map_err(|e| format!("Failed to copy .claude directory: {e}"))?;
         }
 
         // If there was an existing settings.json, merge Loom's defaults into it
@@ -663,6 +727,146 @@ mod tests {
         assert!(wrapped.starts_with(LOOM_SECTION_START));
         assert!(wrapped.ends_with(LOOM_SECTION_END));
         assert!(wrapped.contains("Loom content here"));
+    }
+
+    #[test]
+    fn test_load_internal_skip_list_missing_file() {
+        // Missing skip-list file yields an empty set so existing repos that
+        // ship without one keep their current behavior.
+        let temp_dir = TempDir::new().unwrap();
+        let set = load_internal_skip_list(temp_dir.path());
+        assert!(set.is_empty());
+    }
+
+    #[test]
+    fn test_load_internal_skip_list_parses_entries() {
+        // Issue #3464: confirm comment lines, blank lines, and surrounding
+        // whitespace are handled correctly so the file is operator-editable
+        // without surprise behavior.
+        let temp_dir = TempDir::new().unwrap();
+        fs::write(
+            temp_dir.path().join(INTERNAL_SKIP_LIST_NAME),
+            "# Loom-internal files\n\
+             \n\
+             .claude/commands/loom/release.md\n\
+             \n\
+             # second-section comment\n\
+             .claude/commands/loom/some-other.md  \n",
+        )
+        .unwrap();
+
+        let set = load_internal_skip_list(temp_dir.path());
+        assert_eq!(set.len(), 2);
+        assert!(set.contains(".claude/commands/loom/release.md"));
+        assert!(set.contains(".claude/commands/loom/some-other.md"));
+    }
+
+    #[test]
+    fn test_setup_repository_scaffolding_skips_internal_files() {
+        // End-to-end coverage of issue #3464: when defaults/.loom-internal.list
+        // lists a path under .claude/, the installer must skip it on both
+        // fresh install and reinstall, while sibling commands continue to
+        // ship.
+        let temp_dir = TempDir::new().unwrap();
+        let workspace = temp_dir.path();
+        let defaults = temp_dir.path().join("defaults");
+
+        fs::create_dir(workspace.join(".git")).unwrap();
+        fs::create_dir_all(defaults.join(".claude").join("commands").join("loom")).unwrap();
+
+        fs::write(
+            defaults
+                .join(".claude")
+                .join("commands")
+                .join("loom")
+                .join("builder.md"),
+            "builder command",
+        )
+        .unwrap();
+        fs::write(
+            defaults
+                .join(".claude")
+                .join("commands")
+                .join("loom")
+                .join("judge.md"),
+            "judge command",
+        )
+        .unwrap();
+        fs::write(
+            defaults
+                .join(".claude")
+                .join("commands")
+                .join("loom")
+                .join("release.md"),
+            "loom-internal release skill",
+        )
+        .unwrap();
+
+        // Skip-list excludes release.md.
+        fs::write(
+            defaults.join(INTERNAL_SKIP_LIST_NAME),
+            "# header\n.claude/commands/loom/release.md\n",
+        )
+        .unwrap();
+
+        let mut report = InitReport::default();
+        setup_repository_scaffolding(workspace, &defaults, false, &mut report).unwrap();
+
+        // release.md must NOT be in the consumer's installed tree.
+        assert!(
+            !workspace
+                .join(".claude")
+                .join("commands")
+                .join("loom")
+                .join("release.md")
+                .exists(),
+            "issue #3464: .claude/commands/loom/release.md must be skipped on install"
+        );
+        // The siblings must still be installed verbatim.
+        assert!(workspace
+            .join(".claude")
+            .join("commands")
+            .join("loom")
+            .join("builder.md")
+            .exists());
+        assert!(workspace
+            .join(".claude")
+            .join("commands")
+            .join("loom")
+            .join("judge.md")
+            .exists());
+
+        // Reinstall: same outcome, plus a stale local copy (if one exists)
+        // is left in place rather than being overwritten or deleted.
+        fs::write(
+            workspace
+                .join(".claude")
+                .join("commands")
+                .join("loom")
+                .join("release.md"),
+            "stale local copy",
+        )
+        .unwrap();
+        let mut report2 = InitReport::default();
+        setup_repository_scaffolding(workspace, &defaults, true, &mut report2).unwrap();
+        let local = fs::read_to_string(
+            workspace
+                .join(".claude")
+                .join("commands")
+                .join("loom")
+                .join("release.md"),
+        )
+        .unwrap();
+        assert_eq!(
+            local, "stale local copy",
+            "skip rule must leave pre-existing local copies untouched"
+        );
+        // And the report must not list release.md as added/updated.
+        assert!(!report2
+            .added
+            .iter()
+            .chain(report2.updated.iter())
+            .any(|p| p == ".claude/commands/loom/release.md"));
     }
 
     #[test]
