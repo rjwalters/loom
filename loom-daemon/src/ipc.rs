@@ -3,6 +3,7 @@ use crate::errors::DaemonError;
 use crate::forge_parser::parse_forge_events;
 use crate::git_parser;
 use crate::git_utils;
+use crate::sweep_registry::SweepRegistry;
 use crate::terminal::TerminalManager;
 use crate::types::{Request, Response};
 use anyhow::Result;
@@ -41,6 +42,7 @@ pub struct IpcServer {
     socket_path: PathBuf,
     terminal_manager: Arc<Mutex<TerminalManager>>,
     activity_db: Arc<Mutex<ActivityDb>>,
+    sweep_registry: Arc<Mutex<SweepRegistry>>,
 }
 
 impl IpcServer {
@@ -48,11 +50,13 @@ impl IpcServer {
         socket_path: PathBuf,
         terminal_manager: Arc<Mutex<TerminalManager>>,
         activity_db: Arc<Mutex<ActivityDb>>,
+        sweep_registry: Arc<Mutex<SweepRegistry>>,
     ) -> Self {
         Self {
             socket_path,
             terminal_manager,
             activity_db,
+            sweep_registry,
         }
     }
 
@@ -68,8 +72,9 @@ impl IpcServer {
                 Ok((stream, _)) => {
                     let tm = self.terminal_manager.clone();
                     let db = self.activity_db.clone();
+                    let sr = self.sweep_registry.clone();
                     tokio::spawn(async move {
-                        if let Err(e) = handle_client(stream, tm, db).await {
+                        if let Err(e) = handle_client(stream, tm, db, sr).await {
                             log::error!("Client error: {e}");
                         }
                     });
@@ -86,6 +91,7 @@ async fn handle_client(
     stream: UnixStream,
     terminal_manager: Arc<Mutex<TerminalManager>>,
     activity_db: Arc<Mutex<ActivityDb>>,
+    sweep_registry: Arc<Mutex<SweepRegistry>>,
 ) -> Result<()> {
     let (reader, mut writer) = stream.into_split();
     let mut lines = BufReader::new(reader).lines();
@@ -94,7 +100,7 @@ async fn handle_client(
         let request: Request = serde_json::from_str(&line)?;
         log::debug!("Request: {request:?}");
 
-        let response = handle_request(request, &terminal_manager, &activity_db);
+        let response = handle_request(request, &terminal_manager, &activity_db, &sweep_registry);
 
         let response_json = serde_json::to_string(&response)?;
         writer.write_all(response_json.as_bytes()).await?;
@@ -112,6 +118,7 @@ fn handle_request(
     request: Request,
     terminal_manager: &Arc<Mutex<TerminalManager>>,
     activity_db: &Arc<Mutex<ActivityDb>>,
+    sweep_registry: &Arc<Mutex<SweepRegistry>>,
 ) -> Response {
     match request {
         Request::Ping => Response::Pong,
@@ -684,6 +691,37 @@ fn handle_request(
             }
         }
 
+        // ====================================================================
+        // Sweep Registry Handlers (Issue #3452 — Phase A of #3449)
+        // ====================================================================
+        Request::DispatchSweep {
+            kind,
+            idempotency_key,
+        } => {
+            let mut sr = sweep_registry
+                .lock()
+                .expect("Sweep registry mutex poisoned");
+            match sr.dispatch(kind, idempotency_key) {
+                Ok(outcome) => Response::SweepDispatched {
+                    sweep_id: outcome.sweep_id,
+                    pid: outcome.pid,
+                    token_name: outcome.token_name,
+                    log_path: outcome.log_path,
+                },
+                Err(e) => Response::Error {
+                    message: format!("dispatch_sweep failed: {e}"),
+                },
+            }
+        }
+
+        Request::ListSweeps { state_filter } => {
+            let sr = sweep_registry
+                .lock()
+                .expect("Sweep registry mutex poisoned");
+            let sweeps = sr.list(state_filter.as_ref());
+            Response::SweepList { sweeps }
+        }
+
         Request::Shutdown => {
             log::info!("Shutdown requested");
             std::process::exit(0);
@@ -696,25 +734,31 @@ fn handle_request(
 mod tests {
     use super::*;
     use crate::activity::ActivityDb;
+    use crate::sweep_registry::{SweepRegistry, SweepRegistryConfig};
+    use crate::types::{SweepKind, SweepState};
     use tempfile::tempdir;
 
-    fn setup_test_context() -> (Arc<Mutex<TerminalManager>>, Arc<Mutex<ActivityDb>>) {
+    fn setup_test_context(
+    ) -> (Arc<Mutex<TerminalManager>>, Arc<Mutex<ActivityDb>>, Arc<Mutex<SweepRegistry>>) {
         let tm = Arc::new(Mutex::new(TerminalManager::new()));
         let dir = tempdir().unwrap();
         let db_path = dir.path().join("test_activity.db");
         let db = ActivityDb::new(db_path).unwrap();
         let db = Arc::new(Mutex::new(db));
+        let mut sr_config = SweepRegistryConfig::new(dir.path().to_path_buf());
+        sr_config.skip_label_flip = true;
+        let sr = Arc::new(Mutex::new(SweepRegistry::new(sr_config)));
         // Keep dir alive so the temp directory isn't deleted
         std::mem::forget(dir);
-        (tm, db)
+        (tm, db, sr)
     }
 
     // ===== Ping/Pong =====
 
     #[test]
     fn test_handle_request_ping() {
-        let (tm, db) = setup_test_context();
-        let response = handle_request(Request::Ping, &tm, &db);
+        let (tm, db, sr) = setup_test_context();
+        let response = handle_request(Request::Ping, &tm, &db, &sr);
         assert!(matches!(response, Response::Pong));
     }
 
@@ -722,10 +766,10 @@ mod tests {
 
     #[test]
     fn test_handle_request_list_terminals_empty() {
-        let (tm, db) = setup_test_context();
+        let (tm, db, sr) = setup_test_context();
         // Set LOOM_NO_RESTORE to prevent tmux restore attempts
         std::env::set_var("LOOM_NO_RESTORE", "1");
-        let response = handle_request(Request::ListTerminals, &tm, &db);
+        let response = handle_request(Request::ListTerminals, &tm, &db, &sr);
         std::env::remove_var("LOOM_NO_RESTORE");
         match response {
             Response::TerminalList { terminals } => {
@@ -739,13 +783,14 @@ mod tests {
 
     #[test]
     fn test_handle_request_get_current_commit_nonexistent_dir() {
-        let (tm, db) = setup_test_context();
+        let (tm, db, sr) = setup_test_context();
         let response = handle_request(
             Request::GetCurrentCommit {
                 working_dir: "/nonexistent/path".to_string(),
             },
             &tm,
             &db,
+            &sr,
         );
         match response {
             Response::CurrentCommit { commit } => {
@@ -759,7 +804,7 @@ mod tests {
 
     #[test]
     fn test_handle_request_get_terminal_activity_empty() {
-        let (tm, db) = setup_test_context();
+        let (tm, db, sr) = setup_test_context();
         let response = handle_request(
             Request::GetTerminalActivity {
                 id: "nonexistent".to_string(),
@@ -767,6 +812,7 @@ mod tests {
             },
             &tm,
             &db,
+            &sr,
         );
         match response {
             Response::TerminalActivity { entries } => {
@@ -780,8 +826,8 @@ mod tests {
 
     #[test]
     fn test_handle_request_get_all_claims_empty() {
-        let (tm, db) = setup_test_context();
-        let response = handle_request(Request::GetAllClaims, &tm, &db);
+        let (tm, db, sr) = setup_test_context();
+        let response = handle_request(Request::GetAllClaims, &tm, &db, &sr);
         match response {
             Response::Claims(claims) => {
                 assert!(claims.is_empty());
@@ -794,13 +840,14 @@ mod tests {
 
     #[test]
     fn test_handle_request_get_claims_summary() {
-        let (tm, db) = setup_test_context();
+        let (tm, db, sr) = setup_test_context();
         let response = handle_request(
             Request::GetClaimsSummary {
                 stale_threshold_secs: Some(3600),
             },
             &tm,
             &db,
+            &sr,
         );
         match response {
             Response::ClaimsSummary(summary) => {
@@ -814,7 +861,7 @@ mod tests {
 
     #[test]
     fn test_handle_request_capture_git_changes_no_repo() {
-        let (tm, db) = setup_test_context();
+        let (tm, db, sr) = setup_test_context();
         let response = handle_request(
             Request::CaptureGitChanges {
                 input_id: 1,
@@ -823,6 +870,7 @@ mod tests {
             },
             &tm,
             &db,
+            &sr,
         );
         match response {
             Response::GitChangesCaptured {
@@ -849,5 +897,116 @@ mod tests {
     fn test_get_git_branch_nonexistent_dir() {
         let dir = "/nonexistent/path".to_string();
         assert!(get_git_branch(Some(&dir)).is_none());
+    }
+
+    // ===== Sweep registry IPC handlers (Issue #3452) =====
+
+    /// Build a SweepRegistry that won't actually launch real children.
+    /// The fixture spawn binary writes its argv to a sibling log and exits
+    /// immediately (same pattern as the sweep_registry unit tests).
+    fn setup_sweep_registry_in_tempdir(
+    ) -> (Arc<Mutex<SweepRegistry>>, tempfile::TempDir, std::path::PathBuf) {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempdir().unwrap();
+        let scripts_dir = dir.path().join(".loom").join("scripts");
+        std::fs::create_dir_all(&scripts_dir).unwrap();
+        let fake_bin = scripts_dir.join("spawn-claude.sh");
+        let record_log = dir.path().join("ipc-fake-spawn.log");
+        let script = format!(
+            r#"#!/usr/bin/env bash
+echo "argv: $*" >> "{rec}"
+exit 0
+"#,
+            rec = record_log.display()
+        );
+        std::fs::write(&fake_bin, script).unwrap();
+        let mut perms = std::fs::metadata(&fake_bin).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&fake_bin, perms).unwrap();
+
+        let mut config = SweepRegistryConfig::new(dir.path().to_path_buf());
+        config.spawn_bin = Some(fake_bin);
+        config.skip_label_flip = true;
+        let sr = Arc::new(Mutex::new(SweepRegistry::new(config)));
+        (sr, dir, record_log)
+    }
+
+    #[test]
+    fn test_handle_request_list_sweeps_empty() {
+        let (tm, db, _) = setup_test_context();
+        let (sr, _dir, _rec) = setup_sweep_registry_in_tempdir();
+        let response = handle_request(Request::ListSweeps { state_filter: None }, &tm, &db, &sr);
+        match response {
+            Response::SweepList { sweeps } => {
+                assert!(sweeps.is_empty());
+            }
+            other => panic!("Expected SweepList, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_handle_request_dispatch_sweep_happy_path() {
+        let (tm, db, _) = setup_test_context();
+        let (sr, _dir, _rec) = setup_sweep_registry_in_tempdir();
+
+        let response = handle_request(
+            Request::DispatchSweep {
+                kind: SweepKind::Issue(2024),
+                idempotency_key: None,
+            },
+            &tm,
+            &db,
+            &sr,
+        );
+        match response {
+            Response::SweepDispatched {
+                sweep_id,
+                pid,
+                token_name,
+                log_path,
+            } => {
+                assert!(sweep_id.starts_with("sweep-issue-2024-"));
+                assert!(pid > 0);
+                assert_eq!(token_name, "unknown");
+                assert!(log_path.to_string_lossy().contains("sweep-issue-2024.log"));
+            }
+            other => panic!("Expected SweepDispatched, got: {other:?}"),
+        }
+
+        // Follow-up ListSweeps should see the new entry.
+        let response = handle_request(Request::ListSweeps { state_filter: None }, &tm, &db, &sr);
+        match response {
+            Response::SweepList { sweeps } => {
+                assert_eq!(sweeps.len(), 1);
+                assert!(matches!(sweeps[0].state, SweepState::Running));
+            }
+            other => panic!("Expected SweepList, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_handle_request_dispatch_sweep_rejects_prset_in_phase_a() {
+        let (tm, db, _) = setup_test_context();
+        let (sr, _dir, _rec) = setup_sweep_registry_in_tempdir();
+
+        let response = handle_request(
+            Request::DispatchSweep {
+                kind: SweepKind::PrSet(vec![100, 200]),
+                idempotency_key: None,
+            },
+            &tm,
+            &db,
+            &sr,
+        );
+        match response {
+            Response::Error { message } => {
+                assert!(
+                    message.contains("PrSet"),
+                    "expected PrSet rejection message; got: {message}"
+                );
+            }
+            other => panic!("Expected Error, got: {other:?}"),
+        }
     }
 }
