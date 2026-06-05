@@ -130,60 +130,24 @@ def _read_claim(claim_file: pathlib.Path) -> ClaimInfo | None:
     return ClaimInfo.from_dict(data)
 
 
-def _is_claim_abandoned(
-    repo_root: pathlib.Path,
-    claim: ClaimInfo,
-) -> bool:
-    """Check if a claim is abandoned by inspecting the owner's progress file heartbeat.
+def _is_claim_abandoned(claim: ClaimInfo) -> bool:
+    """Check if a claim is abandoned based on claim age.
 
-    A claim is considered abandoned if:
-    1. The owner's progress file exists and last_heartbeat is stale
-       (older than LOOM_HEARTBEAT_STALE_THRESHOLD, default 300s).
-    2. No progress file exists and the claim is older than 10 minutes.
+    A claim is considered abandoned if it was created more than
+    NO_PROGRESS_FILE_THRESHOLD seconds ago (default: 10 minutes).
 
     Returns True if the claim should be treated as abandoned.
     """
-    # Extract task_id from agent_id (format: "shepherd-{task_id}")
-    if not claim.agent_id.startswith("shepherd-"):
-        # Non-shepherd claims can't be checked via progress files
-        return False
-
-    task_id = claim.agent_id[len("shepherd-"):]
-    progress_file = repo_root / ".loom" / "progress" / f"shepherd-{task_id}.json"
-
-    now = _now_utc()
-
-    if progress_file.exists():
-        data = read_json_file(progress_file)
-        if data and isinstance(data, dict):
-            last_heartbeat = data.get("last_heartbeat")
-            if last_heartbeat:
-                try:
-                    hb_time = datetime.strptime(
-                        last_heartbeat, "%Y-%m-%dT%H:%M:%SZ"
-                    ).replace(tzinfo=timezone.utc)
-                    age = (now - hb_time).total_seconds()
-                    if age > DEFAULT_HEARTBEAT_STALE_THRESHOLD:
-                        return True
-                except (ValueError, TypeError):
-                    pass
-        # Progress file exists but no valid heartbeat — treat as stale
-        # if the claim itself is old enough
-        return False
-
-    # No progress file: treat as abandoned if claim is older than 10 minutes
     claimed_at = claim.claimed_at
     if claimed_at:
         try:
             claim_time = datetime.strptime(
                 claimed_at, "%Y-%m-%dT%H:%M:%SZ"
             ).replace(tzinfo=timezone.utc)
-            claim_age = (now - claim_time).total_seconds()
-            if claim_age > NO_PROGRESS_FILE_THRESHOLD:
+            if (_now_utc() - claim_time).total_seconds() > NO_PROGRESS_FILE_THRESHOLD:
                 return True
         except (ValueError, TypeError):
             pass
-
     return False
 
 
@@ -236,7 +200,7 @@ def claim_issue(
                 log_warning("Found expired claim, cleaning up...")
                 _remove_claim_dir(claim_dir)
                 return claim_issue(repo_root, issue_number, agent_id, ttl)
-            elif existing and _is_claim_abandoned(repo_root, existing):
+            elif existing and _is_claim_abandoned(existing):
                 # Claim is still within TTL but owner's heartbeat is stale
                 log_warning(
                     f"Claim by {existing.agent_id} appears abandoned "
@@ -405,7 +369,7 @@ def has_valid_claim(repo_root: pathlib.Path, issue_number: int) -> bool:
 
     if _is_expired(existing.expires_at):
         return False
-    if _is_claim_abandoned(repo_root, existing):
+    if _is_claim_abandoned(existing):
         return False
     return True
 
