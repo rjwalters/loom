@@ -32,6 +32,7 @@ jobs:
               - 'loom-api/**'
               - 'Cargo.toml'
               - 'Cargo.lock'
+              - 'rust-toolchain.toml'
               - '.github/workflows/ci.yml'
             mcp:
               - 'mcp-loom/**'
