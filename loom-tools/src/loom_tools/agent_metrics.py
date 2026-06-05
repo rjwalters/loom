@@ -4,8 +4,7 @@ Enables agents to query their own effectiveness, costs, and velocity.
 Reads exclusively from the activity database (``~/.loom/activity.db``).
 
 If the activity database is missing, the CLI emits a clear error and
-exits non-zero (see Phase 3.1.5 / #3394: the legacy ``daemon-state.json``
-fallback has been removed in preparation for full daemon retirement).
+exits non-zero.
 
 Commands:
     summary         Overall metrics summary (default)
@@ -570,10 +569,9 @@ Examples:
 
     db_path = _get_activity_db_path()
     if not db_path.is_file():
-        # No more daemon-state.json fallback (#3394). The activity DB is
-        # the single source of truth for metrics; surface a clear error so
-        # operators know what to configure rather than silently returning
-        # empty/stale state.
+        # The activity DB is the single source of truth for metrics; surface a
+        # clear error so operators know what to configure rather than silently
+        # returning empty/stale state.
         if args.output_format == "json":
             print(
                 json.dumps(

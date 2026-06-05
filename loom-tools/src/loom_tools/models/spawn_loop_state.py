@@ -27,8 +27,7 @@ can detect silent failures (AGENT_EXIT_CODE marker + mtime staleness) without
 re-deriving the spawn loop's per-issue log path convention.
 
 This module is part of the Phase 3 port (epic #3372, tracker #3378) and is
-read by ``loom-status`` and other operator CLIs as they migrate off
-``.loom/daemon-state.json``.
+read by ``loom-status`` and other operator CLIs.
 """
 
 from __future__ import annotations
@@ -84,7 +83,6 @@ class SpawnLoopState:
     """Parsed contents of ``.loom/spawn-loop-state.json``.
 
     ``present`` is True when the file existed and parsed successfully.
-    Callers use this to decide whether to fall back to ``daemon-state.json``.
     """
 
     started_at: str | None = None

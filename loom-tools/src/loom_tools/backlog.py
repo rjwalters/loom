@@ -5,18 +5,12 @@ policy retroactively, and escalating permanently-stuck issues to a
 human-review queue.
 
 **Source of truth.** Reads exclusively from ``.loom/issue-failures.json``
-(the durable cross-session failure log) — the ephemeral
-``.loom/daemon-state.json::blocked_issue_retries`` read path that this
-module used previously has been removed as part of the Phase 3
-shepherd/daemon deprecation (epic #3372, tracker #3378). Unlike sibling
-Phase 3.1.x CLI ports, this consumer does **not** keep a fallback to
-``daemon-state.json``.
+(the durable cross-session failure log).
 
-**Escalation persistence.** Without ``daemon-state.json::needs_human_input``
-to coordinate against, escalated issues are marked on the forge instead
-via the existing ``loom:blocked`` label. The label acts as the
-deduplication signal — re-running ``prune`` will skip issues that already
-carry ``loom:blocked``. The optional ``--comment`` flag still posts a
+**Escalation persistence.** Escalated issues are marked on the forge via
+the existing ``loom:blocked`` label. The label acts as the deduplication
+signal — re-running ``prune`` will skip issues that already carry
+``loom:blocked``. The optional ``--comment`` flag still posts a
 human-readable comment alongside the label.
 
 Usage::

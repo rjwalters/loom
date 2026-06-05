@@ -7,13 +7,9 @@ Detects and recovers orphaned state that occurs when:
 - A spawn-loop task entry has a stale ``last_heartbeat`` and a dead PID
   (loop crash or unresponsive tick — see #3411).
 
-This module was ported from the daemon-state edition in Phase 3.1.6
-(epic #3372, tracker #3378, issue #3395).  The pre-port version read
-``.loom/daemon-state.json::shepherds`` plus ``.loom/progress/`` files and
-``recent_failures``; all three of those state sources go away with the
-daemon brain.
+This module was ported in Phase 3.1.6 (epic #3372, tracker #3378, issue #3395).
 
-The new sources of truth are:
+The sources of truth are:
 
 - ``.loom/spawn-loop-state.json::running`` (a flat list of live sweep tasks,
   written by ``defaults/scripts/spawn-loop.sh`` — see

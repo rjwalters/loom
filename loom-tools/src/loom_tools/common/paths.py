@@ -2,7 +2,7 @@
 
 This module provides a single source of truth for:
 - Directory paths within .loom/
-- File paths for state files (daemon-state.json, health-metrics.json, etc.)
+- File paths for state files (spawn-loop-state.json, health-metrics.json, etc.)
 - Naming conventions for branches and worktrees
 """
 
@@ -17,8 +17,8 @@ class LoomPaths:
 
     Usage:
         paths = LoomPaths(repo_root)
-        print(paths.daemon_state_file)  # repo_root/.loom/daemon-state.json
-        print(paths.worktree_path(42))  # repo_root/.loom/worktrees/issue-42
+        print(paths.spawn_loop_state_file)  # repo_root/.loom/spawn-loop-state.json
+        print(paths.worktree_path(42))       # repo_root/.loom/worktrees/issue-42
     """
 
     # Directory names (relative to .loom/)

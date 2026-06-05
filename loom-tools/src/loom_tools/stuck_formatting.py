@@ -243,8 +243,7 @@ def format_intervention_summary(
 
     if intervention_type == "alert":
         # The per-issue sweep log is the spawn loop's stdout/stderr destination
-        # for each detached `claude -p "/loom:sweep N"` child (#3374). Replaces
-        # the daemon-state.json::shepherds[].output_file path retired in #3392.
+        # for each detached `claude -p "/loom:sweep N"` child (#3374).
         log_hint: str
         if isinstance(issue, int):
             log_hint = f"tail -n 200 .loom/logs/sweep-issue-{issue}.log"

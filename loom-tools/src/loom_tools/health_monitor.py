@@ -1,17 +1,9 @@
 """Forge-derived health monitor for the spawn-loop orchestrator (Phase 3.1.8).
 
-Originally a daemon-state.json + health-metrics.json consumer that maintained a
-24h time-series of throughput/latency/error metrics. After the shepherd/daemon
-deprecation (#3372, tracker #3378), most of the inputs no longer exist:
-
-- ``health-metrics.json`` and ``alerts.json`` retire (no time-series storage).
-- ``daemon-metrics.json`` (iteration counts, success rate, avg duration) is
-  daemon-brain-internal — no producer once daemon_v2 is deleted.
-- ``daemon-state.json`` lifetime counters (``completed_issues``,
-  ``total_prs_merged``) require persistent shepherd memory the spawn loop
-  intentionally does not keep.
-
-This port chooses a **simplified, point-in-time composite score** computed from
+Originally a multi-source consumer that maintained a 24h time-series of
+throughput/latency/error metrics. After the shepherd/daemon deprecation (#3372,
+tracker #3378), most of the historical inputs no longer exist. This port chooses
+a **simplified, point-in-time composite score** computed from
 forge queries (`gh issue list` / `gh pr list` via `snapshot.collect_pipeline_data`)
 plus `.loom/spawn-loop-state.json`. No history, no persistent alerts, no
 acknowledgement state. The CLI returns a single snapshot per invocation — same

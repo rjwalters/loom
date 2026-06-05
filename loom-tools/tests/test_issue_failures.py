@@ -17,7 +17,6 @@ from loom_tools.common.issue_failures import (
     _decay_on_main_advance,
     get_failure_entry,
     load_failure_log,
-    merge_into_daemon_state,
     record_failure,
     record_success,
     save_failure_log,
@@ -243,62 +242,6 @@ class TestGetFailureEntry:
         assert entry is None
 
 
-# ── merge_into_daemon_state ────────────────────────────────────
-
-
-class TestMergeIntoDaemonState:
-    def test_merge_into_empty_state(self, repo: pathlib.Path) -> None:
-        record_failure(repo, 42, error_class="builder_stuck", phase="builder")
-        record_failure(repo, 42, error_class="builder_stuck", phase="builder")
-
-        retries: dict = {}
-        result = merge_into_daemon_state(repo, retries)
-        assert "42" in result
-        assert result["42"]["retry_count"] == 2
-        assert result["42"]["error_class"] == "builder_stuck"
-
-    def test_merge_preserves_higher_count(self, repo: pathlib.Path) -> None:
-        record_failure(repo, 42, error_class="builder_stuck")
-
-        retries = {"42": {"retry_count": 5, "error_class": "old"}}
-        result = merge_into_daemon_state(repo, retries)
-        # Existing count is higher, so should be preserved
-        assert result["42"]["retry_count"] == 5
-        assert result["42"]["error_class"] == "old"
-
-    def test_merge_updates_when_persistent_higher(self, repo: pathlib.Path) -> None:
-        for _ in range(3):
-            record_failure(repo, 42, error_class="builder_stuck", phase="builder")
-
-        retries = {"42": {"retry_count": 1, "error_class": "old"}}
-        result = merge_into_daemon_state(repo, retries)
-        assert result["42"]["retry_count"] == 3
-        assert result["42"]["error_class"] == "builder_stuck"
-
-    def test_merge_sets_retry_exhausted(self, repo: pathlib.Path) -> None:
-        for _ in range(MAX_FAILURES_BEFORE_BLOCK):
-            record_failure(repo, 42, error_class="builder_stuck")
-
-        retries: dict = {}
-        result = merge_into_daemon_state(repo, retries)
-        assert result["42"]["retry_exhausted"] is True
-
-    def test_merge_does_not_set_retry_exhausted_for_infra(self, repo: pathlib.Path) -> None:
-        for _ in range(MAX_FAILURES_BEFORE_BLOCK):
-            record_failure(repo, 42, error_class="mcp_infrastructure_failure")
-
-        retries: dict = {}
-        result = merge_into_daemon_state(repo, retries)
-        assert result["42"]["retry_count"] == MAX_FAILURES_BEFORE_BLOCK
-        assert "retry_exhausted" not in result["42"] or result["42"].get("retry_exhausted") is not True
-
-    def test_merge_no_failures(self, repo: pathlib.Path) -> None:
-        retries = {"42": {"retry_count": 1}}
-        result = merge_into_daemon_state(repo, retries)
-        # No persistent failures, so original should be unchanged
-        assert result["42"]["retry_count"] == 1
-
-
 # ── filter_issues_by_failure_backoff ───────────────────────────
 
 
@@ -407,18 +350,11 @@ class TestIntegration:
         assert entry.should_auto_block is True
         assert entry.total_failures == MAX_FAILURES_BEFORE_BLOCK
 
-    def test_merge_then_filter(self, repo: pathlib.Path) -> None:
-        """Merge on startup -> filter during iteration."""
-        # Simulate previous session failures
+    def test_filter_with_failure_backoff(self, repo: pathlib.Path) -> None:
+        """Filter should skip issues in backoff."""
         for _ in range(3):
             record_failure(repo, 42, error_class="builder_stuck", phase="builder")
 
-        # Simulate daemon startup merge
-        retries: dict = {}
-        retries = merge_into_daemon_state(repo, retries)
-        assert retries["42"]["retry_count"] == 3
-
-        # Simulate iteration filtering
         log = load_failure_log(repo)
         issues = [{"number": 42}, {"number": 99}]
         result = filter_issues_by_failure_backoff(issues, log, current_iteration=1)

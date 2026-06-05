@@ -1,11 +1,7 @@
 """Stuck agent detection for the Loom spawn loop.
 
-Phase 3.1.3 port (#3392, epic #3372). The previous implementation read
-``.loom/daemon-state.json`` (shepherd pool) plus per-shepherd progress files
-under ``.loom/progress/shepherd-*.json``. Both producers are slated for
-hard-deletion in Phase 3 of the deprecation epic. This module now reads
-``.loom/spawn-loop-state.json`` (#3374, Phase 1) and matches agents on the
-spawn loop's per-task entries.
+Phase 3.1.3 port (#3392, epic #3372). Reads ``.loom/spawn-loop-state.json``
+(#3374, Phase 1) and matches agents on the spawn loop's per-task entries.
 
 Agent identifier scheme: spawn-loop tasks are addressed as ``sweep-<issue>``
 (matching the per-issue log file ``.loom/logs/sweep-issue-<N>.log``).
