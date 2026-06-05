@@ -36,8 +36,8 @@ EXPECTED_CLI_COMMANDS = [
 ]
 
 # Wrapper scripts that should route to Python implementations
+# Phase 3.3 (#3400): loom-shepherd.sh deleted with shepherd brain
 PYTHON_ROUTING_SCRIPTS = [
-    "loom-shepherd.sh",
     "cleanup.sh",
 ]
 
@@ -148,28 +148,6 @@ class TestWrapperScriptRouting:
     def repo_root(self) -> pathlib.Path:
         return _find_repo_root()
 
-    def test_shepherd_wrapper_routes_to_python(
-        self, defaults_dir: pathlib.Path, repo_root: pathlib.Path
-    ) -> None:
-        """loom-shepherd.sh should invoke the Python loom-shepherd command."""
-        script = defaults_dir / "scripts" / "loom-shepherd.sh"
-        assert script.exists(), "loom-shepherd.sh not found in defaults/scripts/"
-
-        content = script.read_text()
-        # Should check for venv binary
-        assert ".venv/bin/loom-shepherd" in content, (
-            "loom-shepherd.sh doesn't check for venv Python binary"
-        )
-        # Should invoke the binary (without exec — exec breaks output capture
-        # in CLI tool contexts like Claude Code Bash tool)
-        assert '"$LOOM_TOOLS/.venv/bin/loom-shepherd" "${args[@]}"' in content, (
-            "loom-shepherd.sh doesn't invoke the venv binary"
-        )
-        # Should also check PATH fallback
-        assert "command -v loom-shepherd" in content, (
-            "loom-shepherd.sh doesn't check PATH for system-installed command"
-        )
-
     def test_cleanup_delegates_to_python(
         self, defaults_dir: pathlib.Path
     ) -> None:
@@ -195,17 +173,6 @@ class TestWrapperScriptRouting:
         assert "loom-daemon-diagnostic" in content, (
             "loom CLI doesn't reference loom-daemon-diagnostic"
         )
-
-    def test_shepherd_wrapper_no_deprecated_fallback(
-        self, defaults_dir: pathlib.Path
-    ) -> None:
-        """loom-shepherd.sh should NOT fall back to deprecated shell scripts."""
-        script = defaults_dir / "scripts" / "loom-shepherd.sh"
-        content = script.read_text()
-        assert "deprecated/" not in content, (
-            "loom-shepherd.sh still references deprecated/ directory"
-        )
-
 
 class TestInstallationFileStructure:
     """Verify the expected file structure is present after installation."""

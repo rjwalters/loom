@@ -1,19 +1,19 @@
-"""Tests for baseline health model, I/O, preflight phase, and CLI."""
+"""Tests for baseline health model, I/O, and CLI.
+
+Phase 3.3 (#3400): TestCacheStaleness and TestPreflightPhase removed —
+shepherd/phases/preflight.py deleted with the shepherd brain.
+"""
 
 from __future__ import annotations
 
-import json
-from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 import pytest
 
 from loom_tools.common.paths import LoomPaths
 from loom_tools.common.state import read_baseline_health, write_baseline_health
 from loom_tools.models.baseline_health import BaselineHealth, FailingTest
-from loom_tools.shepherd.phases.base import PhaseStatus
-from loom_tools.shepherd.phases.preflight import PreflightPhase, _is_cache_stale
 
 
 # ---------------------------------------------------------------------------
@@ -111,165 +111,6 @@ class TestBaselineHealthIO:
         (loom_dir / "baseline-health.json").write_text("[]")
         health = read_baseline_health(tmp_path)
         assert health.status == "unknown"
-
-
-# ---------------------------------------------------------------------------
-# Cache staleness tests
-# ---------------------------------------------------------------------------
-
-
-class TestCacheStaleness:
-    """Tests for _is_cache_stale."""
-
-    def test_empty_timestamp_is_stale(self) -> None:
-        assert _is_cache_stale("", 15) is True
-
-    def test_invalid_timestamp_is_stale(self) -> None:
-        assert _is_cache_stale("not-a-timestamp", 15) is True
-
-    def test_recent_timestamp_is_fresh(self) -> None:
-        recent = datetime.now(timezone.utc).isoformat()
-        assert _is_cache_stale(recent, 15) is False
-
-    def test_old_timestamp_is_stale(self) -> None:
-        old = (datetime.now(timezone.utc) - timedelta(minutes=30)).isoformat()
-        assert _is_cache_stale(old, 15) is True
-
-    def test_exactly_at_ttl_is_not_stale(self) -> None:
-        # 14 minutes ago with 15 min TTL should be fresh
-        ts = (datetime.now(timezone.utc) - timedelta(minutes=14)).isoformat()
-        assert _is_cache_stale(ts, 15) is False
-
-    def test_naive_timestamp_treated_as_utc(self) -> None:
-        # Naive timestamps are treated as UTC
-        recent = datetime.now(timezone.utc).replace(tzinfo=None).isoformat()
-        assert _is_cache_stale(recent, 15) is False
-
-
-# ---------------------------------------------------------------------------
-# PreflightPhase tests
-# ---------------------------------------------------------------------------
-
-
-def _make_ctx(tmp_path: Path, **overrides: object) -> MagicMock:
-    """Create a minimal mock ShepherdContext."""
-    ctx = MagicMock()
-    ctx.repo_root = tmp_path
-    ctx.config.issue = 42
-    ctx.config.should_skip_phase.return_value = False
-    ctx.config.is_force_mode = False
-    for k, v in overrides.items():
-        setattr(ctx.config, k, v)
-    return ctx
-
-
-def _write_health(tmp_path: Path, **kwargs: object) -> None:
-    """Write a baseline-health.json file."""
-    loom_dir = tmp_path / ".loom"
-    loom_dir.mkdir(exist_ok=True)
-    data = {
-        "status": "unknown",
-        "checked_at": "",
-        "main_commit": "",
-        "failing_tests": [],
-        "issue_tracking": "",
-        "cache_ttl_minutes": 15,
-    }
-    data.update(kwargs)
-    (loom_dir / "baseline-health.json").write_text(json.dumps(data))
-
-
-class TestPreflightPhase:
-    """Tests for the PreflightPhase."""
-
-    def test_skip_when_builder_skipped(self, tmp_path: Path) -> None:
-        ctx = _make_ctx(tmp_path)
-        ctx.config.should_skip_phase.return_value = True
-        phase = PreflightPhase()
-        skip, reason = phase.should_skip(ctx)
-        assert skip is True
-        assert "builder phase skipped" in reason
-
-    def test_no_cache_file_succeeds(self, tmp_path: Path) -> None:
-        ctx = _make_ctx(tmp_path)
-        phase = PreflightPhase()
-        result = phase.run(ctx)
-        assert result.status == PhaseStatus.SUCCESS
-        assert result.data["baseline_status"] == "unknown"
-
-    def test_healthy_baseline_succeeds(self, tmp_path: Path) -> None:
-        _write_health(
-            tmp_path,
-            status="healthy",
-            checked_at=datetime.now(timezone.utc).isoformat(),
-            main_commit="abc1234",
-        )
-        ctx = _make_ctx(tmp_path)
-        phase = PreflightPhase()
-        result = phase.run(ctx)
-        assert result.status == PhaseStatus.SUCCESS
-        assert result.data["baseline_status"] == "healthy"
-
-    @patch("loom_tools.shepherd.phases.preflight._get_main_head")
-    def test_failing_baseline_blocks(self, mock_head: MagicMock, tmp_path: Path) -> None:
-        commit = "abc1234567890"
-        mock_head.return_value = commit
-        _write_health(
-            tmp_path,
-            status="failing",
-            checked_at=datetime.now(timezone.utc).isoformat(),
-            main_commit=commit,
-            failing_tests=[{"name": "test_foo", "ecosystem": "", "failure_message": ""}],
-            issue_tracking="#2042",
-        )
-        ctx = _make_ctx(tmp_path)
-        phase = PreflightPhase()
-        result = phase.run(ctx)
-        assert result.status == PhaseStatus.FAILED
-        assert result.data["baseline_status"] == "failing"
-        assert "test_foo" in result.data["failing_tests"]
-        assert result.data["issue_tracking"] == "#2042"
-
-    def test_stale_failing_cache_proceeds(self, tmp_path: Path) -> None:
-        old_time = (datetime.now(timezone.utc) - timedelta(minutes=30)).isoformat()
-        _write_health(
-            tmp_path,
-            status="failing",
-            checked_at=old_time,
-            main_commit="abc1234",
-        )
-        ctx = _make_ctx(tmp_path)
-        phase = PreflightPhase()
-        result = phase.run(ctx)
-        assert result.status == PhaseStatus.SUCCESS
-        assert result.data.get("cache_stale") is True
-
-    @patch("loom_tools.shepherd.phases.preflight._get_main_head")
-    def test_commit_mismatch_proceeds(self, mock_head: MagicMock, tmp_path: Path) -> None:
-        mock_head.return_value = "newcommit123"
-        _write_health(
-            tmp_path,
-            status="failing",
-            checked_at=datetime.now(timezone.utc).isoformat(),
-            main_commit="oldcommit456",
-        )
-        ctx = _make_ctx(tmp_path)
-        phase = PreflightPhase()
-        result = phase.run(ctx)
-        assert result.status == PhaseStatus.SUCCESS
-        assert result.data.get("commit_mismatch") is True
-
-    def test_unexpected_status_proceeds(self, tmp_path: Path) -> None:
-        _write_health(tmp_path, status="weird_value")
-        ctx = _make_ctx(tmp_path)
-        phase = PreflightPhase()
-        result = phase.run(ctx)
-        assert result.status == PhaseStatus.SUCCESS
-
-    def test_validate_always_true(self, tmp_path: Path) -> None:
-        ctx = _make_ctx(tmp_path)
-        phase = PreflightPhase()
-        assert phase.validate(ctx) is True
 
 
 # ---------------------------------------------------------------------------

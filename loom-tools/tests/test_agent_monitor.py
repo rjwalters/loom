@@ -198,34 +198,12 @@ class TestAgentMonitor:
             monitor = AgentMonitor(config)
             assert monitor._extract_role_command() == ""
 
-    def test_check_errored_status_no_task_id(self, temp_repo: pathlib.Path) -> None:
-        config = MonitorConfig(name="test")
-        with mock.patch(
-            "loom_tools.agent_monitor.find_repo_root", return_value=temp_repo
-        ):
-            monitor = AgentMonitor(config)
-            assert monitor._check_errored_status() is False
+    def test_check_errored_status_stub_always_false(self, temp_repo: pathlib.Path) -> None:
+        """Phase 3.3 (#3400): _check_errored_status is a stub that always returns False.
 
-    def test_check_errored_status_file_exists_errored(
-        self, temp_repo: pathlib.Path
-    ) -> None:
+        Progress files (.loom/progress/shepherd-*.json) are retired with the shepherd brain.
+        """
         config = MonitorConfig(name="test", task_id="abc123")
-        progress_file = temp_repo / ".loom" / "progress" / "shepherd-abc123.json"
-        progress_file.write_text(json.dumps({"status": "errored"}))
-
-        with mock.patch(
-            "loom_tools.agent_monitor.find_repo_root", return_value=temp_repo
-        ):
-            monitor = AgentMonitor(config)
-            assert monitor._check_errored_status() is True
-
-    def test_check_errored_status_file_exists_working(
-        self, temp_repo: pathlib.Path
-    ) -> None:
-        config = MonitorConfig(name="test", task_id="abc123")
-        progress_file = temp_repo / ".loom" / "progress" / "shepherd-abc123.json"
-        progress_file.write_text(json.dumps({"status": "working"}))
-
         with mock.patch(
             "loom_tools.agent_monitor.find_repo_root", return_value=temp_repo
         ):

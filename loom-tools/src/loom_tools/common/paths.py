@@ -24,7 +24,6 @@ class LoomPaths:
     # Directory names (relative to .loom/)
     LOOM_DIR = ".loom"
     SCRIPTS_DIR = "scripts"
-    PROGRESS_DIR = "progress"
     WORKTREES_DIR = "worktrees"
     LOGS_DIR = "logs"
     DOCS_DIR = "docs"
@@ -34,7 +33,6 @@ class LoomPaths:
     CLAUDE_CONFIG_DIR = "claude-config"
 
     # State file names
-    DAEMON_STATE_FILE = "daemon-state.json"
     SPAWN_LOOP_STATE_FILE = "spawn-loop-state.json"
     HEALTH_METRICS_FILE = "health-metrics.json"
     ALERTS_FILE = "alerts.json"
@@ -64,11 +62,6 @@ class LoomPaths:
     def scripts_dir(self) -> Path:
         """Path to .loom/scripts directory."""
         return self.loom_dir / self.SCRIPTS_DIR
-
-    @property
-    def progress_dir(self) -> Path:
-        """Path to .loom/progress directory."""
-        return self.loom_dir / self.PROGRESS_DIR
 
     @property
     def worktrees_dir(self) -> Path:
@@ -115,11 +108,6 @@ class LoomPaths:
             Path to .loom/claude-config/{agent_name}/
         """
         return self.claude_config_base_dir / agent_name
-
-    @property
-    def daemon_state_file(self) -> Path:
-        """Path to .loom/daemon-state.json."""
-        return self.loom_dir / self.DAEMON_STATE_FILE
 
     @property
     def spawn_loop_state_file(self) -> Path:
@@ -186,17 +174,6 @@ class LoomPaths:
             Path to .loom/worktrees/issue-{N}
         """
         return self.worktrees_dir / NamingConventions.worktree_name(issue)
-
-    def progress_file(self, task_id: str) -> Path:
-        """Path to progress file for a specific shepherd task.
-
-        Args:
-            task_id: The 7-character hex task ID.
-
-        Returns:
-            Path to .loom/progress/shepherd-{task_id}.json
-        """
-        return self.progress_dir / f"shepherd-{task_id}.json"
 
     def builder_log_file(self, issue: int) -> Path:
         """Path to builder log file for a specific issue.

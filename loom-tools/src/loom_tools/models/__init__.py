@@ -19,7 +19,6 @@ from loom_tools.models.daemon_state import (
     Warning,
 )
 from loom_tools.models.health import Alert, AlertsFile, HealthMetrics, MetricEntry
-from loom_tools.models.progress import Milestone, ShepherdProgress
 from loom_tools.models.stuck import (
     StuckDetection,
     StuckHistory,
@@ -51,9 +50,6 @@ __all__ = [
     "AlertsFile",
     "HealthMetrics",
     "MetricEntry",
-    # progress
-    "Milestone",
-    "ShepherdProgress",
     # stuck
     "StuckDetection",
     "StuckHistory",

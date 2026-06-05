@@ -31,7 +31,6 @@ from typing import Any
 from loom_tools.common.git import derive_commit_message, parse_porcelain_path
 from loom_tools.common.logging import log_warning, strip_ansi
 from loom_tools.common.paths import LoomPaths
-from loom_tools.common.state import find_progress_for_issue
 
 
 class ValidationStatus(Enum):
@@ -432,31 +431,17 @@ class BuilderDiagnostics:
     issue_labels: str = ""
     main_uncommitted: str = ""
     issue: int = 0
-    # New fields for enhanced diagnostics
+    # Enhanced diagnostics
     worktree_mtime: str = ""  # ISO timestamp of worktree last modification
-    progress_status: str = ""  # Current phase from progress file
-    progress_started_at: str = ""  # When shepherd started (ISO timestamp)
-    progress_last_heartbeat: str = ""  # Last heartbeat time (ISO timestamp)
-    progress_milestones: list[str] | None = None  # Recent milestone events
 
     def to_markdown(self) -> str:
         parts: list[str] = ["<details>\n<summary>Diagnostic Information</summary>\n"]
 
         # Previous attempt timing section
-        if self.progress_started_at or self.worktree_mtime:
+        if self.worktree_mtime:
             parts.append("### Previous Attempt")
-            if self.progress_started_at:
-                parts.append(f"**Started**: {self.progress_started_at}")
             if self.worktree_mtime:
                 parts.append(f"**Worktree last modified**: {self.worktree_mtime}")
-            if self.progress_status:
-                parts.append(f"**Last phase**: `{self.progress_status}`")
-            if self.progress_last_heartbeat:
-                parts.append(f"**Last heartbeat**: {self.progress_last_heartbeat}")
-            if self.progress_milestones:
-                parts.append("**Recent milestones**:")
-                for ms in self.progress_milestones[-5:]:  # Show last 5
-                    parts.append(f"  - {ms}")
             parts.append("")
 
         # Worktree state section
@@ -595,19 +580,6 @@ def _gather_builder_diagnostics(
             capture_output=True, text=True, check=False,
         )
         diag.has_remote_tracking = r.returncode == 0
-
-    # Look up progress file for this issue
-    progress = find_progress_for_issue(repo_root, issue)
-    if progress:
-        diag.progress_status = progress.current_phase
-        diag.progress_started_at = progress.started_at
-        diag.progress_last_heartbeat = progress.last_heartbeat or ""
-        # Format milestones as human-readable strings
-        if progress.milestones:
-            diag.progress_milestones = [
-                f"{m.event} at {m.timestamp}" + (f" ({m.data})" if m.data else "")
-                for m in progress.milestones
-            ]
 
     # Session log
     session_name = f"loom-builder-issue-{issue}"
