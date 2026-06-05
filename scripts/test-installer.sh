@@ -1194,6 +1194,392 @@ echo ""
 
 
 # ==========================================================================
+# Section 9: Consumer-File Preservation Across Reinstall (#3450)
+# ==========================================================================
+# Regression tests for issue #3450: install.sh --quick --yes on a v0.7.2
+# Loom install destroyed three sets of consumer-owned files:
+#   1. CLAUDE.md — 1011-line consumer file rewritten to 2 lines
+#   2. .gitignore — 296 lines truncated to ~38 (Loom-only)
+#   3. .github/workflows/{ci,deploy}.yml + .github/ISSUE_TEMPLATE/agent-submission.yml — deleted
+#
+# Root cause: scripts/install-loom.sh's installed_files manifest used
+# `find .loom .claude .codex .github .githooks CLAUDE.md .gitignore` and
+# captured every file under those roots — INCLUDING consumer-authored files
+# that Loom never installed. scripts/uninstall-loom.sh then hard-deleted
+# every manifest entry (except CLAUDE.md / .claude/settings.json) and the
+# CLAUDE.md substring-match branch fired on any file mentioning the legacy
+# Loom signature phrases.
+#
+# These tests simulate the v0.7.2-shape over-broad manifest and verify that
+# the uninstall path now preserves consumer-owned content end-to-end.
+
+echo "--- Section 9: Consumer-File Preservation Across Reinstall (#3450) ---"
+echo ""
+
+# Helper: write an "over-broad" install-metadata.json that lists consumer files.
+# This is the shape that v0.7.2's scripts/install-loom.sh produced.
+write_overbroad_manifest() {
+  local target="$1"
+  shift
+  local files=("$@")
+
+  local json="["
+  local first=true
+  for f in "${files[@]}"; do
+    if [[ "$first" == "true" ]]; then
+      first=false
+    else
+      json="${json},"
+    fi
+    json="${json}\"${f}\""
+  done
+  json="${json}]"
+
+  mkdir -p "$target/.loom"
+  cat > "$target/.loom/install-metadata.json" <<META_EOF
+{
+  "loom_version": "0.7.2",
+  "loom_commit": "v072test",
+  "install_date": "2025-01-01",
+  "loom_source": "$LOOM_ROOT",
+  "installed_files": ${json}
+}
+META_EOF
+}
+
+# Test 48: .gitignore consumer content survives uninstall (AC2)
+# Even when v0.7.2-shape manifest lists .gitignore as Loom-installed, the
+# uninstall must route it through smart-removal — never hard-delete.
+echo "Test 48: .gitignore consumer content survives uninstall (v0.7.2 manifest)"
+GI_REPO="$TEST_DIR/gitignore-preserve-test"
+create_temp_repo "$GI_REPO"
+simulate_loom_install "$GI_REPO"
+
+# Replace .gitignore with consumer content + Loom patterns (mimics real-world
+# v0.7.2 user state where the consumer's pre-existing .gitignore was extended
+# by the installer with Loom runtime patterns).
+cat > "$GI_REPO/.gitignore" <<'GI_EOF'
+# Consumer ignore rules (must survive uninstall)
+node_modules/
+target/
+__pycache__/
+.venv/
+*.log
+.idea/
+.DS_Store
+dist/
+build/
+coverage/
+.env
+.env.local
+
+# Loom - AI Development Orchestration
+.loom/state.json
+.loom/worktrees/
+.loom/*.log
+.loom/*.sock
+GI_EOF
+
+# Over-broad manifest lists .gitignore as Loom-owned (the v0.7.2 bug).
+write_overbroad_manifest "$GI_REPO" \
+  ".gitignore" \
+  ".loom/config.json" \
+  ".loom/roles/builder.json"
+
+git -C "$GI_REPO" add -A
+git -C "$GI_REPO" commit -m "v0.7.2 user state" --quiet
+
+GI_LINES_BEFORE=$(wc -l < "$GI_REPO/.gitignore" | tr -d ' ')
+
+"$UNINSTALL_SCRIPT" --yes --local "$GI_REPO" > /dev/null 2>&1 || true
+
+if [[ -f "$GI_REPO/.gitignore" ]]; then
+  if grep -q "node_modules/" "$GI_REPO/.gitignore" && \
+     grep -q "__pycache__/" "$GI_REPO/.gitignore" && \
+     grep -q ".venv/" "$GI_REPO/.gitignore"; then
+    GI_LINES_AFTER=$(wc -l < "$GI_REPO/.gitignore" | tr -d ' ')
+    pass ".gitignore consumer content preserved ($GI_LINES_BEFORE -> $GI_LINES_AFTER lines)"
+  else
+    fail ".gitignore consumer content was destroyed (lines: $(wc -l < "$GI_REPO/.gitignore" | tr -d ' '))"
+  fi
+else
+  fail ".gitignore was hard-deleted by uninstall (v0.7.2 manifest path)"
+fi
+
+# Verify Loom-specific patterns were smart-removed
+if grep -q "Loom - AI Development Orchestration" "$GI_REPO/.gitignore" 2>/dev/null; then
+  fail ".gitignore Loom marker header should have been removed"
+else
+  pass ".gitignore Loom marker header was smart-removed"
+fi
+echo ""
+
+# Test 49: CLAUDE.md consumer content survives uninstall when consumer text
+# mentions the legacy Loom signature substrings (AC1).
+# Reproduces the 1011-line -> 2-line CLAUDE.md destruction reported in #3450.
+echo "Test 49: CLAUDE.md with consumer content mentioning Loom is preserved"
+CMD_REPO="$TEST_DIR/claudemd-mentions-loom-test"
+create_temp_repo "$CMD_REPO"
+simulate_loom_install "$CMD_REPO"
+
+# Write a multi-hundred-line consumer CLAUDE.md whose content happens to
+# mention the legacy substrings (in code blocks, headings, changelog).
+# This is the file shape that triggered the v0.7.2 bug.
+{
+  echo "# My Project Guide"
+  echo ""
+  echo "This is the consumer-authored project guide. It must NOT be deleted."
+  echo ""
+  echo "## Changelog"
+  echo ""
+  echo "- v1.0: Initial release"
+  echo "- v1.1: We migrated from a system whose docs mentioned"
+  echo '  "# Loom Orchestration - Repository Guide" in a heading.'
+  echo "- v1.2: Updated installer docs reference 'Generated by Loom Installation Process'"
+  echo "  in a code block:"
+  echo ""
+  echo '  ```'
+  echo "  Generated by Loom Installation Process"
+  echo '  ```'
+  echo ""
+  echo "## Architecture"
+  echo ""
+  for i in $(seq 1 200); do
+    echo "Project documentation paragraph $i — consumer-owned content."
+  done
+  echo ""
+  echo "<!-- BEGIN LOOM ORCHESTRATION -->"
+  echo "This repository uses Loom for AI-powered development orchestration."
+  echo "<!-- END LOOM ORCHESTRATION -->"
+  echo ""
+  echo "## Closing Notes"
+  echo ""
+  echo "More consumer content after the Loom block — must also survive."
+} > "$CMD_REPO/CLAUDE.md"
+
+git -C "$CMD_REPO" add -A
+git -C "$CMD_REPO" commit -m "v0.7.2 CLAUDE.md user state" --quiet
+
+CMD_LINES_BEFORE=$(wc -l < "$CMD_REPO/CLAUDE.md" | tr -d ' ')
+
+"$UNINSTALL_SCRIPT" --yes --local "$CMD_REPO" > /dev/null 2>&1 || true
+
+if [[ -f "$CMD_REPO/CLAUDE.md" ]]; then
+  CMD_LINES_AFTER=$(wc -l < "$CMD_REPO/CLAUDE.md" | tr -d ' ')
+  if grep -q "My Project Guide" "$CMD_REPO/CLAUDE.md" && \
+     grep -q "consumer-owned content" "$CMD_REPO/CLAUDE.md" && \
+     grep -q "Closing Notes" "$CMD_REPO/CLAUDE.md"; then
+    pass "CLAUDE.md consumer content preserved ($CMD_LINES_BEFORE -> $CMD_LINES_AFTER lines)"
+  else
+    fail "CLAUDE.md consumer content was destroyed (lines: $CMD_LINES_AFTER, originally $CMD_LINES_BEFORE)"
+  fi
+  # The Loom marker block should be removed
+  if grep -q "BEGIN LOOM ORCHESTRATION" "$CMD_REPO/CLAUDE.md"; then
+    fail "CLAUDE.md still contains Loom marker block (should be removed)"
+  else
+    pass "CLAUDE.md Loom marker block was removed"
+  fi
+else
+  fail "CLAUDE.md was deleted entirely (v0.7.2 substring heuristic bug)"
+fi
+echo ""
+
+# Test 49b: CLAUDE.md without markers but with legacy signatures in consumer
+# content survives uninstall. This reproduces the 1011-line -> 2-line
+# destruction reported in #3450 when the v0.7.2 marker shape didn't match
+# the modern sed pattern and the substring heuristic fired on consumer text.
+echo "Test 49b: CLAUDE.md without markers but mentioning Loom is preserved"
+CMD2_REPO="$TEST_DIR/claudemd-no-markers-test"
+create_temp_repo "$CMD2_REPO"
+simulate_loom_install "$CMD2_REPO"
+
+# Write a multi-hundred-line consumer CLAUDE.md WITHOUT modern markers.
+# Consumer text mentions "Generated by Loom Installation Process" in a
+# changelog code block — exactly the kind of mention that the substring
+# heuristic conflates with "this file IS Loom-generated".
+{
+  echo "# Consumer Project Guide"
+  echo ""
+  echo "Comprehensive consumer-authored documentation. Must NOT be deleted."
+  echo ""
+  echo "## Migration history"
+  echo ""
+  echo "Previously this repo was managed by an installer that wrote:"
+  echo ""
+  echo '```'
+  echo "Generated by Loom Installation Process"
+  echo '```'
+  echo ""
+  echo "as a footer. We've since written our own docs."
+  echo ""
+  for i in $(seq 1 300); do
+    echo "Section $i: detailed consumer-owned guidance and architecture notes."
+  done
+} > "$CMD2_REPO/CLAUDE.md"
+
+git -C "$CMD2_REPO" add -A
+git -C "$CMD2_REPO" commit -m "Consumer CLAUDE.md with no markers" --quiet
+
+CMD2_LINES_BEFORE=$(wc -l < "$CMD2_REPO/CLAUDE.md" | tr -d ' ')
+
+"$UNINSTALL_SCRIPT" --yes --local "$CMD2_REPO" > /dev/null 2>&1 || true
+
+if [[ -f "$CMD2_REPO/CLAUDE.md" ]]; then
+  CMD2_LINES_AFTER=$(wc -l < "$CMD2_REPO/CLAUDE.md" | tr -d ' ')
+  if grep -q "Consumer Project Guide" "$CMD2_REPO/CLAUDE.md" && \
+     grep -q "Section 300" "$CMD2_REPO/CLAUDE.md"; then
+    pass "CLAUDE.md (no-markers) consumer content preserved ($CMD2_LINES_BEFORE -> $CMD2_LINES_AFTER lines)"
+  else
+    fail "CLAUDE.md (no-markers) consumer content truncated (lines: $CMD2_LINES_AFTER, originally $CMD2_LINES_BEFORE)"
+  fi
+else
+  fail "CLAUDE.md (no-markers) was deleted entirely by substring heuristic (#3450 bug)"
+fi
+echo ""
+
+# Test 50: .github/workflows/* consumer files survive uninstall (AC3)
+# When the v0.7.2 manifest listed consumer-authored workflow files, the
+# uninstall hard-delete loop wiped them. The narrowed manifest (Fix 1) plus
+# the inert uninstall path mean these survive.
+echo "Test 50: .github/workflows/* consumer files survive (v0.7.2 manifest)"
+GH_REPO_DIR="$TEST_DIR/github-workflows-preserve-test"
+create_temp_repo "$GH_REPO_DIR"
+simulate_loom_install "$GH_REPO_DIR"
+
+# Create consumer-authored workflow + issue template files
+mkdir -p "$GH_REPO_DIR/.github/workflows"
+mkdir -p "$GH_REPO_DIR/.github/ISSUE_TEMPLATE"
+cat > "$GH_REPO_DIR/.github/workflows/ci.yml" <<'WF_EOF'
+name: CI
+on: [push, pull_request]
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: echo "consumer CI"
+WF_EOF
+cat > "$GH_REPO_DIR/.github/workflows/deploy.yml" <<'WF_EOF'
+name: Deploy
+on:
+  push:
+    branches: [main]
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "consumer deploy"
+WF_EOF
+cat > "$GH_REPO_DIR/.github/ISSUE_TEMPLATE/agent-submission.yml" <<'IT_EOF'
+name: Agent Submission
+description: Consumer-owned issue template
+body:
+  - type: textarea
+    id: details
+    attributes:
+      label: Details
+IT_EOF
+
+# Over-broad manifest: includes consumer-authored .github files (the v0.7.2 bug).
+write_overbroad_manifest "$GH_REPO_DIR" \
+  ".github/labels.yml" \
+  ".github/ISSUE_TEMPLATE/config.yml" \
+  ".github/ISSUE_TEMPLATE/task.yml" \
+  ".github/workflows/ci.yml" \
+  ".github/workflows/deploy.yml" \
+  ".github/ISSUE_TEMPLATE/agent-submission.yml" \
+  ".loom/config.json"
+
+git -C "$GH_REPO_DIR" add -A
+git -C "$GH_REPO_DIR" commit -m "v0.7.2 user state with consumer workflows" --quiet
+
+"$UNINSTALL_SCRIPT" --yes --local "$GH_REPO_DIR" > /dev/null 2>&1 || true
+
+if [[ -f "$GH_REPO_DIR/.github/workflows/ci.yml" ]]; then
+  pass ".github/workflows/ci.yml preserved across uninstall"
+else
+  fail ".github/workflows/ci.yml was deleted (v0.7.2 manifest bug)"
+fi
+
+if [[ -f "$GH_REPO_DIR/.github/workflows/deploy.yml" ]]; then
+  pass ".github/workflows/deploy.yml preserved across uninstall"
+else
+  fail ".github/workflows/deploy.yml was deleted (v0.7.2 manifest bug)"
+fi
+
+if [[ -f "$GH_REPO_DIR/.github/ISSUE_TEMPLATE/agent-submission.yml" ]]; then
+  pass ".github/ISSUE_TEMPLATE/agent-submission.yml preserved across uninstall"
+else
+  fail ".github/ISSUE_TEMPLATE/agent-submission.yml was deleted (v0.7.2 manifest bug)"
+fi
+echo ""
+
+# Test 51: Manifest narrowing — fresh install-loom.sh produces a manifest
+# whose installed_files list contains ONLY files shipped under defaults/.
+# Specifically, .gitignore must NOT be in the manifest (smart-removal owns it).
+echo "Test 51: Fresh install manifest only lists files shipped in defaults/"
+# Simulate what the narrowed install-loom.sh produces by exercising the
+# helper directly. We don't need to run the full installer — the manifest
+# narrowing logic is what we're testing.
+NARROW_REPO="$TEST_DIR/narrow-manifest-test"
+create_temp_repo "$NARROW_REPO"
+simulate_loom_install "$NARROW_REPO"
+
+# Add some consumer-authored files OUTSIDE Loom's defaults/ footprint.
+mkdir -p "$NARROW_REPO/.github/workflows"
+echo "name: ConsumerCI" > "$NARROW_REPO/.github/workflows/ci.yml"
+cat >> "$NARROW_REPO/.gitignore" <<'EOF'
+# Consumer additions
+my-secrets/
+EOF
+git -C "$NARROW_REPO" add -A
+git -C "$NARROW_REPO" commit -m "consumer additions" --quiet 2>/dev/null || true
+
+# The manifest in simulate_loom_install was written by the same over-broad
+# find. We assert what the *narrowed* shell helper would emit. The helper
+# lives in scripts/install/manifest.sh (sourced by install-loom.sh).
+MANIFEST_LIB="$LOOM_ROOT/scripts/install/manifest.sh"
+if [[ -f "$MANIFEST_LIB" ]]; then
+  NARROW_JSON=$(
+    # shellcheck disable=SC1090
+    source "$MANIFEST_LIB"
+    LOOM_ROOT="$LOOM_ROOT" TARGET_PATH="$NARROW_REPO" _emit_installed_files_manifest 2>/dev/null
+  )
+
+  # AC3 narrowing: the manifest must NOT list the consumer's .github/workflows/ci.yml.
+  if echo "$NARROW_JSON" | grep -qF '".github/workflows/ci.yml"'; then
+    fail "Narrowed manifest still lists consumer-owned .github/workflows/ci.yml"
+  else
+    pass "Narrowed manifest excludes consumer-owned .github/workflows/ci.yml"
+  fi
+
+  # AC2 narrowing: the manifest must NOT list .gitignore (smart-removal owns it).
+  if echo "$NARROW_JSON" | grep -qF '".gitignore"'; then
+    fail "Narrowed manifest still lists .gitignore (must be smart-removed only)"
+  else
+    pass "Narrowed manifest excludes .gitignore (handled by smart-removal)"
+  fi
+
+  # Positive check: the manifest must list at least one file Loom actually ships.
+  if echo "$NARROW_JSON" | grep -qF '".loom/config.json"'; then
+    pass "Narrowed manifest includes Loom-shipped .loom/config.json"
+  else
+    fail "Narrowed manifest is missing Loom-shipped .loom/config.json"
+  fi
+
+  # Positive check: roles are translated correctly (defaults/roles/X → .loom/roles/X)
+  if echo "$NARROW_JSON" | grep -qF '".loom/roles/builder.json"'; then
+    pass "Narrowed manifest translates defaults/roles/* → .loom/roles/*"
+  else
+    fail "Narrowed manifest missing translated defaults/roles/* entries"
+  fi
+else
+  fail "scripts/install/manifest.sh is missing"
+fi
+echo ""
+
+
+# ==========================================================================
 # Summary
 # ==========================================================================
 echo "======================================"
