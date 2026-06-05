@@ -162,6 +162,12 @@ header() {
   echo -e "${CYAN}$*${NC}"
 }
 
+# Source the installed-files manifest helper (#3450). The helper is in its
+# own file so the test suite can exercise it without sourcing the full
+# installer (which has argv-parsing side effects).
+# shellcheck source=scripts/install/manifest.sh
+source "$LOOM_ROOT/scripts/install/manifest.sh"
+
 # Check the state of the Loom *source* checkout (the directory that contains
 # this script). We refuse to install from a feature branch, a stale main, or
 # an arbitrary detached HEAD unless the operator explicitly opts in. Detached
@@ -1057,42 +1063,16 @@ success "Loom source path recorded"
 # This prevents the uninstaller from using heuristics and accidentally touching project files.
 info "Recording installation metadata..."
 
-# Collect all installed files (relative paths from repo root)
-INSTALLED_FILES_JSON="["
-FIRST_FILE=true
-while IFS= read -r -d '' file; do
-  rel_path="${file#./}"
-  # Skip runtime artifacts that are gitignored
-  case "$rel_path" in
-    .loom/state.json|.loom/daemon-state.json|.loom/loom-source-path|.loom/install-metadata.json|.loom/manifest.json)
-      continue
-      ;;
-  esac
-  # Dogfood mode (issue #3311): exclude .claude/agents/* — these files exist
-  # locally in the install worktree but are gitignored and will not be
-  # committed. Listing them in install-metadata.json's installed_files would
-  # cause downstream verify-install.sh runs to flag false drift after merge.
-  if [[ "$DOGFOOD_MODE" == "true" ]] && [[ "$rel_path" == .claude/agents/* ]]; then
-    continue
-  fi
-  if [[ "$FIRST_FILE" == "true" ]]; then
-    FIRST_FILE=false
-  else
-    INSTALLED_FILES_JSON="${INSTALLED_FILES_JSON},"
-  fi
-  INSTALLED_FILES_JSON="${INSTALLED_FILES_JSON}\"${rel_path}\""
-done < <(find \
-  .loom .claude .codex .github .githooks CLAUDE.md .gitignore \
-  -maxdepth 20 -type f \
-  -not -path './.loom/worktrees/*' \
-  -not -path './.loom/progress/*' \
-  -not -path './.loom/logs/*' \
-  -not -name '*.log' \
-  -not -name '*.sock' \
-  -not -name '.DS_Store' \
-  2>/dev/null \
-  -print0 | sort -z)
-INSTALLED_FILES_JSON="${INSTALLED_FILES_JSON}]"
+# Collect all installed files (relative paths from repo root).
+#
+# Issue #3450: the old implementation walked the *target* repo with
+#   find .loom .claude .codex .github .githooks CLAUDE.md .gitignore
+# which over-captured consumer-authored files. The uninstaller trusted that
+# manifest as authoritative for deletion and silently destroyed consumer
+# .github/workflows/*.yml, .gitignore, and CLAUDE.md. Now we walk
+# $LOOM_ROOT/defaults/ (the actual Loom-shipped files) via the
+# _emit_installed_files_manifest helper above.
+INSTALLED_FILES_JSON="$(_emit_installed_files_manifest)"
 
 # --- Stale-file sweep (upgrade path) ---
 # Compare the previous install's file list (from install-metadata.json) against
@@ -1100,10 +1080,41 @@ INSTALLED_FILES_JSON="${INSTALLED_FILES_JSON}]"
 # upstream renames/deletions and must be removed so they don't accumulate.
 # Only files the installer originally wrote are candidates — operator-added files
 # are never in PREV_INSTALLED_FILES, so they are safe by construction.
+#
+# Issue #3450 defense-in-depth: v0.7.2 (and earlier) wrote an over-broad
+# manifest that included consumer-authored .github/workflows/*.yml, custom
+# .gitignore entries, and pre-existing CLAUDE.md. The narrowed manifest no
+# longer lists those paths — but the sweep below would happily git-rm them
+# as "stale". The carve-out here mirrors the uninstall-side skip list so an
+# upgrade from a v0.7.2 install does NOT delete consumer-owned files. See
+# scripts/uninstall-loom.sh near the "v0.7.2's over-broad manifest" comment.
 STALE_FILES=()
 if [[ -f "$TARGET_PATH/.loom/install-metadata.json" ]] && command -v jq >/dev/null 2>&1; then
   while IFS= read -r prev_file; do
     [[ -n "$prev_file" ]] || continue
+
+    # Defense-in-depth (#3450): never sweep files in Loom's "consumer-owned"
+    # carve-out, even if they appear in the previous manifest. Mirrors the
+    # uninstall-side skip list.
+    case "$prev_file" in
+      CLAUDE.md|.gitignore|.claude/settings.json)
+        continue
+        ;;
+      .github/workflows/*)
+        # Loom doesn't ship any workflows under .github/workflows/ today.
+        continue
+        ;;
+      .github/ISSUE_TEMPLATE/*)
+        case "$prev_file" in
+          .github/ISSUE_TEMPLATE/config.yml|.github/ISSUE_TEMPLATE/task.yml)
+            ;;
+          *)
+            continue
+            ;;
+        esac
+        ;;
+    esac
+
     # Is this file still in the new installed set?
     if ! echo "$INSTALLED_FILES_JSON" | grep -qF "\"${prev_file}\""; then
       STALE_FILES+=("$prev_file")
