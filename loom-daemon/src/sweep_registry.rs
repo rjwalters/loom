@@ -550,6 +550,133 @@ impl SweepRegistry {
     }
 
     // ------------------------------------------------------------------------
+    // Cancellation + status accessors (Issue #3455, Phase C)
+    // ------------------------------------------------------------------------
+
+    /// Return the `SweepInfo` for the given sweep ID, cloned (so callers
+    /// can release the registry lock immediately). Phase C exposes this
+    /// as the `get_sweep_status` MCP tool.
+    #[must_use]
+    pub fn get_status(&self, sweep_id: &str) -> Option<SweepInfo> {
+        self.entries.get(sweep_id).cloned()
+    }
+
+    /// Cancel a running sweep.
+    ///
+    /// Sends SIGTERM, waits up to `grace` for the child to exit (polled
+    /// via `kill(pid, 0)`), then SIGKILL if still alive. On any path the
+    /// registry entry is transitioned to `Exited{code: None, at: now}`
+    /// and the per-issue lock is released. Emits the same lifecycle
+    /// events the reaper would emit on a clean exit
+    /// (`sweep.issue.{N}.exited` + `sweep.global.completed`).
+    ///
+    /// Returns [`CancelOutcome`] describing what actually happened. Calls
+    /// against unknown sweep IDs return `Err`. Calls against already-
+    /// terminal sweeps return `Ok` with `was_running = false` — cancel
+    /// is idempotent so monitor-tool retries don't surface as errors.
+    pub fn cancel(&mut self, sweep_id: &str, grace: Duration) -> Result<CancelOutcome> {
+        let (pid, kind, was_running, started_at) = {
+            let info = self
+                .entries
+                .get(sweep_id)
+                .ok_or_else(|| anyhow!("unknown sweep_id: {sweep_id}"))?;
+            let alive = matches!(info.state, SweepState::Running | SweepState::Pending);
+            (info.pid, info.kind.clone(), alive, info.started_at)
+        };
+
+        if !was_running {
+            // Already terminal — nothing to signal. Return success so
+            // duplicate cancel-from-monitor requests stay idempotent.
+            return Ok(CancelOutcome {
+                sweep_id: sweep_id.to_string(),
+                pid,
+                sigkill_sent: false,
+                was_running: false,
+            });
+        }
+
+        // Step 1: SIGTERM (signal 15). We send via `kill(2)` directly
+        // rather than spawning `kill(1)` so the path is identical on
+        // macOS + Linux and we don't depend on `PATH`.
+        let term_sent = send_signal(pid, 15);
+        if !term_sent {
+            log::warn!(
+                "cancel_sweep: SIGTERM to pid {pid} for sweep {sweep_id} failed \
+                 (process may already be dead)"
+            );
+        }
+
+        // Step 2: poll for exit up to the grace window. We poll every
+        // 100ms (matches the spawn-loop's shutdown-grace polling
+        // cadence). The poll loop is a blocking sleep — acceptable for
+        // an IPC handler since cancel is a low-frequency operator action.
+        let poll_interval = Duration::from_millis(100);
+        let deadline = std::time::Instant::now() + grace;
+        let mut exited_within_grace = !is_pid_alive(pid);
+        while !exited_within_grace && std::time::Instant::now() < deadline {
+            std::thread::sleep(poll_interval);
+            exited_within_grace = !is_pid_alive(pid);
+        }
+
+        // Step 3: SIGKILL if still alive.
+        let sigkill_sent = if exited_within_grace {
+            false
+        } else {
+            let killed = send_signal(pid, 9);
+            if !killed {
+                log::warn!("cancel_sweep: SIGKILL to pid {pid} also failed");
+            }
+            true
+        };
+
+        // Step 4: transition state, release lock, emit events.
+        let now = Utc::now();
+        let duration_sec = (now - started_at).num_seconds();
+        if let Some(info) = self.entries.get_mut(sweep_id) {
+            info.state = SweepState::Exited {
+                code: None,
+                at: now,
+            };
+        }
+        if let SweepKind::Issue(issue) = &kind {
+            let _ = self.release_lock(*issue);
+            self.emit_event(Event::SweepExited {
+                issue: *issue,
+                exit_code: None,
+                duration_sec,
+            });
+        }
+        self.emit_event(Event::SweepGlobalCompleted {
+            sweep_id: sweep_id.to_string(),
+            outcome: SweepOutcome::Exited,
+        });
+
+        Ok(CancelOutcome {
+            sweep_id: sweep_id.to_string(),
+            pid,
+            sigkill_sent,
+            was_running: true,
+        })
+    }
+
+    /// Read the last `lines` lines from a sweep's log file.
+    ///
+    /// Resolves the log path from the registry entry (so callers don't
+    /// have to know the workspace-relative naming convention). Returns
+    /// the absolute log path alongside the tail so the MCP layer can
+    /// surface it.
+    pub fn tail_log(&self, sweep_id: &str, lines: usize) -> Result<(PathBuf, Vec<String>)> {
+        let info = self
+            .entries
+            .get(sweep_id)
+            .ok_or_else(|| anyhow!("unknown sweep_id: {sweep_id}"))?;
+        let log_path = info.log_path.clone();
+        let tail = tail_lines(&log_path, lines)
+            .with_context(|| format!("failed to tail {}", log_path.display()))?;
+        Ok((log_path, tail))
+    }
+
+    // ------------------------------------------------------------------------
     // Reaper
     // ------------------------------------------------------------------------
 
@@ -837,6 +964,19 @@ pub struct DispatchOutcome {
     pub was_new: bool,
 }
 
+/// Result of a `cancel` call (Issue #3455, Phase C).
+#[derive(Debug, Clone)]
+pub struct CancelOutcome {
+    pub sweep_id: SweepId,
+    pub pid: u32,
+    /// `true` when the child did not exit within the grace window and
+    /// a SIGKILL was issued.
+    pub sigkill_sent: bool,
+    /// `true` when the sweep was in `Running`/`Pending` state at the
+    /// moment of the call; `false` when it was already terminal.
+    pub was_running: bool,
+}
+
 /// Generate a stable sweep ID for the given kind. Format follows the
 /// spawn-loop log naming convention so operators can correlate.
 #[must_use]
@@ -950,12 +1090,55 @@ fn read_checkpoint_phase(path: &Path) -> Option<String> {
         .map(ToString::to_string)
 }
 
+/// Send a signal to a PID. Returns `true` on success (signal queued or
+/// process already absent and the caller can treat that as "done"). PID
+/// 0 is rejected to avoid the POSIX broadcast-to-group semantics.
+#[cfg(unix)]
+fn send_signal(pid: u32, sig: i32) -> bool {
+    if pid == 0 {
+        return false;
+    }
+    let Ok(pid_t): Result<i32, _> = pid.try_into() else {
+        return false;
+    };
+    libc_kill(pid_t, sig) == 0
+}
+
+#[cfg(not(unix))]
+fn send_signal(_pid: u32, _sig: i32) -> bool {
+    // Non-unix platforms are not supported; return false so the cancel
+    // path surfaces a "kill failed" log but still transitions state.
+    false
+}
+
+/// Read the last `n` lines of a file. Returns an empty vec when the
+/// file is empty; returns an error when the file does not exist (so the
+/// caller can distinguish "no log yet" from "log gone").
+///
+/// Implementation is a simple full-read + split — sweep logs are
+/// bounded by the lifetime of a sweep (~tens of minutes typical) and
+/// the buffering overhead is dwarfed by the IPC round-trip. If sweep
+/// logs grow to GB-scale in a future release, swap this for a reverse
+/// reader.
+fn tail_lines(path: &Path, n: usize) -> Result<Vec<String>> {
+    let contents = std::fs::read_to_string(path)
+        .with_context(|| format!("failed to read {}", path.display()))?;
+    if n == 0 {
+        return Ok(Vec::new());
+    }
+    let mut out: Vec<String> = contents.lines().map(ToString::to_string).collect();
+    if out.len() > n {
+        out = out.split_off(out.len() - n);
+    }
+    Ok(out)
+}
+
 // ============================================================================
 // Tests
 // ============================================================================
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::panic)]
+#[allow(clippy::unwrap_used, clippy::panic, clippy::expect_used)]
 mod tests {
     use super::*;
     use serial_test::serial;
@@ -1577,5 +1760,298 @@ exit 0
                 "details": {"at": "2026-06-05T10:05:00Z"}
             })
         );
+    }
+
+    // ========================================================================
+    // Phase C tests (Issue #3455)
+    // ========================================================================
+
+    #[test]
+    fn get_status_returns_clone_or_none() {
+        let dir = tempdir().unwrap();
+        let (mut registry, _record_log) = fixture_registry(dir.path());
+
+        assert!(registry.get_status("missing").is_none());
+
+        let sweep_id = "sweep-status-test".to_string();
+        registry.entries.insert(
+            sweep_id.clone(),
+            SweepInfo {
+                sweep_id: sweep_id.clone(),
+                kind: SweepKind::Issue(42),
+                pid: 1234,
+                token_name: "agent-1.token".into(),
+                log_path: registry.compute_log_path(42),
+                idempotency_key: None,
+                started_at: Utc::now(),
+                state: SweepState::Running,
+                latest_phase: Some("builder".into()),
+                pr_number: None,
+            },
+        );
+
+        let info = registry.get_status(&sweep_id).expect("status should exist");
+        assert_eq!(info.pid, 1234);
+        assert!(matches!(info.kind, SweepKind::Issue(42)));
+        assert!(matches!(info.state, SweepState::Running));
+    }
+
+    #[test]
+    fn tail_log_returns_last_n_lines() {
+        let dir = tempdir().unwrap();
+        let (mut registry, _record_log) = fixture_registry(dir.path());
+
+        let log_path = registry.compute_log_path(99);
+        std::fs::create_dir_all(log_path.parent().unwrap()).unwrap();
+        let body = (1..=20)
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(&log_path, body).unwrap();
+
+        let sweep_id = "sweep-tail-test".to_string();
+        registry.entries.insert(
+            sweep_id.clone(),
+            SweepInfo {
+                sweep_id: sweep_id.clone(),
+                kind: SweepKind::Issue(99),
+                pid: 1,
+                token_name: "unknown".into(),
+                log_path: log_path.clone(),
+                idempotency_key: None,
+                started_at: Utc::now(),
+                state: SweepState::Running,
+                latest_phase: None,
+                pr_number: None,
+            },
+        );
+
+        let (path, tail) = registry.tail_log(&sweep_id, 5).unwrap();
+        assert_eq!(path, log_path);
+        assert_eq!(tail.len(), 5);
+        assert_eq!(tail[0], "line 16");
+        assert_eq!(tail[4], "line 20");
+
+        // Requesting more lines than the file has should yield the whole file.
+        let (_path, tail) = registry.tail_log(&sweep_id, 1000).unwrap();
+        assert_eq!(tail.len(), 20);
+
+        // Zero is honored (returns empty vec).
+        let (_path, tail) = registry.tail_log(&sweep_id, 0).unwrap();
+        assert!(tail.is_empty());
+    }
+
+    #[test]
+    fn tail_log_rejects_unknown_sweep() {
+        let dir = tempdir().unwrap();
+        let (registry, _record_log) = fixture_registry(dir.path());
+        let err = registry.tail_log("nope", 10).unwrap_err();
+        assert!(err.to_string().contains("unknown sweep_id"));
+    }
+
+    #[test]
+    fn cancel_unknown_sweep_returns_error() {
+        let dir = tempdir().unwrap();
+        let (mut registry, _record_log) = fixture_registry(dir.path());
+        let err = registry
+            .cancel("does-not-exist", Duration::from_millis(50))
+            .unwrap_err();
+        assert!(err.to_string().contains("unknown sweep_id"));
+    }
+
+    #[test]
+    fn cancel_on_already_terminal_is_idempotent_noop() {
+        let dir = tempdir().unwrap();
+        let (mut registry, _record_log) = fixture_registry(dir.path());
+
+        let sweep_id = "sweep-already-exited".to_string();
+        registry.entries.insert(
+            sweep_id.clone(),
+            SweepInfo {
+                sweep_id: sweep_id.clone(),
+                kind: SweepKind::Issue(11),
+                pid: 1,
+                token_name: "unknown".into(),
+                log_path: registry.compute_log_path(11),
+                idempotency_key: None,
+                started_at: Utc::now(),
+                state: SweepState::Exited {
+                    code: Some(0),
+                    at: Utc::now(),
+                },
+                latest_phase: None,
+                pr_number: None,
+            },
+        );
+
+        let outcome = registry
+            .cancel(&sweep_id, Duration::from_millis(50))
+            .unwrap();
+        assert!(!outcome.was_running);
+        assert!(!outcome.sigkill_sent);
+        // State should remain Exited (not flipped to Exited{None, now}).
+        let info = registry.get(&sweep_id).unwrap();
+        if let SweepState::Exited { code, .. } = &info.state {
+            assert_eq!(*code, Some(0));
+        } else {
+            panic!("state should remain Exited");
+        }
+    }
+
+    #[test]
+    fn cancel_dead_pid_transitions_to_exited_without_sigkill() {
+        let dir = tempdir().unwrap();
+        let (mut registry, _record_log) = fixture_registry(dir.path());
+
+        let sweep_id = "sweep-dead-pid".to_string();
+        registry.entries.insert(
+            sweep_id.clone(),
+            SweepInfo {
+                sweep_id: sweep_id.clone(),
+                kind: SweepKind::Issue(22),
+                pid: 2_147_483_640, // ~i32::MAX, almost certainly dead
+                token_name: "unknown".into(),
+                log_path: registry.compute_log_path(22),
+                idempotency_key: None,
+                started_at: Utc::now(),
+                state: SweepState::Running,
+                latest_phase: None,
+                pr_number: None,
+            },
+        );
+
+        let outcome = registry
+            .cancel(&sweep_id, Duration::from_millis(200))
+            .unwrap();
+        assert!(outcome.was_running);
+        // SIGTERM to a dead pid is a no-op success; the poll loop sees
+        // pid dead immediately and never escalates to SIGKILL.
+        assert!(!outcome.sigkill_sent);
+        let info = registry.get(&sweep_id).unwrap();
+        assert!(matches!(info.state, SweepState::Exited { .. }));
+    }
+
+    /// AC #3: SIGTERM -> grace -> SIGKILL against a fixture child that
+    /// ignores SIGTERM. Spawns `bash -c 'trap "" TERM; sleep 5'`, asks
+    /// the registry to cancel with a short grace, and asserts that the
+    /// registry transitioned + sigkill_sent=true. We then `wait()` on the
+    /// `Child` handle to reap the zombie before asserting liveness.
+    #[test]
+    fn cancel_escalates_to_sigkill_when_child_ignores_sigterm() {
+        let dir = tempdir().unwrap();
+        let (mut registry, _record_log) = fixture_registry(dir.path());
+
+        // Spawn a real child that traps SIGTERM and sleeps for 30s.
+        // We need a real PID so SIGTERM/SIGKILL paths are exercised end
+        // to end. We keep the Child handle so we can `wait()` after the
+        // cancel — without that, SIGKILL leaves the child as a zombie
+        // and `kill(pid, 0)` still returns success (the PID is still in
+        // the process table).
+        let mut child = Command::new("bash")
+            .arg("-c")
+            .arg("trap '' TERM; sleep 30")
+            .spawn()
+            .expect("spawn fixture child");
+        let pid = child.id();
+
+        // Give bash a moment to install the trap before we try to TERM it.
+        std::thread::sleep(Duration::from_millis(100));
+
+        let sweep_id = "sweep-trap-term".to_string();
+        registry.entries.insert(
+            sweep_id.clone(),
+            SweepInfo {
+                sweep_id: sweep_id.clone(),
+                kind: SweepKind::Issue(77),
+                pid,
+                token_name: "unknown".into(),
+                log_path: registry.compute_log_path(77),
+                idempotency_key: None,
+                started_at: Utc::now(),
+                state: SweepState::Running,
+                latest_phase: None,
+                pr_number: None,
+            },
+        );
+
+        // Use a short grace — long enough for SIGTERM to be delivered to
+        // a healthy bash (~200ms), short enough to keep the test fast.
+        let outcome = registry
+            .cancel(&sweep_id, Duration::from_millis(500))
+            .expect("cancel should succeed");
+        assert!(outcome.was_running);
+        assert!(
+            outcome.sigkill_sent,
+            "trap '' TERM child should have survived SIGTERM and escalated to SIGKILL"
+        );
+
+        // Reap the zombie so the PID is truly gone from the process table.
+        let exit_status = child.wait().expect("wait on cancelled child");
+        // Exit status: killed by SIGKILL means no clean exit code on Unix;
+        // `success()` should be false. We don't assert specifics — the
+        // platform's signal-vs-exit-code reporting varies.
+        assert!(!exit_status.success(), "child should not have exited cleanly after SIGKILL");
+
+        let info = registry.get(&sweep_id).unwrap();
+        assert!(matches!(info.state, SweepState::Exited { .. }));
+    }
+
+    #[test]
+    fn cancel_emits_exited_and_completed_events() {
+        // Bus emission path: cancel a dead-pid sweep and confirm we
+        // see sweep.issue.{N}.exited + sweep.global.completed.
+        use crate::event_bus::EventBus;
+
+        let dir = tempdir().unwrap();
+        let (mut registry, _record_log) = fixture_registry(dir.path());
+        let bus = Arc::new(EventBus::new());
+        registry.set_event_bus(bus.clone());
+        let mut sub = bus.subscribe::<[&str; 0], &str>([]);
+
+        let sweep_id = "sweep-cancel-event".to_string();
+        registry.entries.insert(
+            sweep_id.clone(),
+            SweepInfo {
+                sweep_id: sweep_id.clone(),
+                kind: SweepKind::Issue(88),
+                pid: 2_147_483_640,
+                token_name: "unknown".into(),
+                log_path: registry.compute_log_path(88),
+                idempotency_key: None,
+                started_at: Utc::now(),
+                state: SweepState::Running,
+                latest_phase: None,
+                pr_number: None,
+            },
+        );
+
+        registry
+            .cancel(&sweep_id, Duration::from_millis(100))
+            .unwrap();
+
+        // Drain two events synchronously (cancel emits inline).
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let mut saw_exited = false;
+            let mut saw_completed = false;
+            for _ in 0..2 {
+                match sub.recv().await.unwrap() {
+                    Event::SweepExited { issue, .. } => {
+                        assert_eq!(issue, 88);
+                        saw_exited = true;
+                    }
+                    Event::SweepGlobalCompleted { outcome, .. } => {
+                        assert_eq!(outcome, SweepOutcome::Exited);
+                        saw_completed = true;
+                    }
+                    other => panic!("unexpected event: {other:?}"),
+                }
+            }
+            assert!(saw_exited);
+            assert!(saw_completed);
+        });
     }
 }

@@ -173,6 +173,33 @@ pub enum Request {
     SubscribeEvents {
         topics: Vec<String>,
     },
+    // ========================================================================
+    // Sweep Monitoring Requests (Issue #3455 — Phase C of #3449)
+    // ========================================================================
+    /// Return the `SweepInfo` for a given sweep ID. The daemon does NOT
+    /// include the recent event log here — recent events are filtered
+    /// client-side via a separate `SubscribeEvents` call. Phase C exposes
+    /// this as `get_sweep_status` in the MCP layer.
+    GetSweepStatus {
+        sweep_id: SweepId,
+    },
+    /// Read the last `lines` lines from a sweep's per-sweep log file.
+    /// Resolved relative to the registry's workspace root. Used by the
+    /// `tail_sweep_log` MCP tool.
+    TailSweepLog {
+        sweep_id: SweepId,
+        lines: usize,
+    },
+    /// Cancel a running sweep: send SIGTERM, wait the grace window, then
+    /// SIGKILL if still alive. Transitions the registry entry from
+    /// `Running` -> `Exited{code: None, at: now}` and releases the lock.
+    CancelSweep {
+        sweep_id: SweepId,
+        /// Seconds to wait between SIGTERM and SIGKILL. Defaults are
+        /// chosen by the MCP layer; the daemon honours whatever value
+        /// arrives in the request.
+        grace_secs: u64,
+    },
     Shutdown,
 }
 
@@ -260,6 +287,37 @@ pub enum Response {
     /// allowance for future batching without a wire-protocol change.
     EventStream {
         events: Vec<Event>,
+    },
+    // ========================================================================
+    // Sweep Monitoring Responses (Issue #3455 — Phase C of #3449)
+    // ========================================================================
+    /// Result of a `GetSweepStatus` request.
+    ///
+    /// `info` is `None` when no sweep with the requested ID is tracked.
+    SweepStatus {
+        info: Option<SweepInfo>,
+    },
+    /// Result of a `TailSweepLog` request.
+    ///
+    /// `lines` carries the requested tail (most-recent last). Missing
+    /// log files are reported via `Response::Error` instead of an empty
+    /// vec, so callers can distinguish "no entries yet" from "log gone".
+    SweepLogTail {
+        sweep_id: SweepId,
+        lines: Vec<String>,
+        /// Path actually read; useful for surfacing in operator output.
+        log_path: PathBuf,
+    },
+    /// Result of a `CancelSweep` request.
+    ///
+    /// `was_running` is `false` when the sweep was already terminal at
+    /// the moment of the cancel call (no-op success — the registry
+    /// state is unchanged).
+    SweepCancelled {
+        sweep_id: SweepId,
+        pid: u32,
+        sigkill_sent: bool,
+        was_running: bool,
     },
     /// Legacy error response (deprecated, use `StructuredError` for new code)
     /// Kept for backwards compatibility with existing frontends
