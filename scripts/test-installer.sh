@@ -1155,6 +1155,45 @@ echo ""
 
 
 # ==========================================================================
+# Section 8: Flag Rejection Tests (#3423 acceptance criteria)
+# ==========================================================================
+# The unknown-flag guard in install-loom.sh (lines ~120-124) fires before any
+# path validation, so a non-existent path is fine for these tests.
+echo "--- Section 8: Flag Rejection ---"
+echo ""
+
+# Test 45: --quick is rejected with an actionable error message
+# Note: set -e is active; capture stderr + suppress non-zero exit via || true.
+echo "Test 45: install-loom.sh --quick is rejected with actionable error"
+STDERR_45=$("$INSTALL_SCRIPT" --quick /tmp/fakepath 2>&1 >/dev/null || true)
+if [[ -n "$STDERR_45" ]] && echo "$STDERR_45" | grep -q 'unknown flag: --quick'; then
+  pass "--quick rejected with correct error message"
+else
+  fail "--quick should be rejected with 'Error: unknown flag: --quick' (stderr=$STDERR_45)"
+fi
+echo ""
+
+# Test 46: --foo (arbitrary unknown flag) is rejected with an actionable error message
+echo "Test 46: install-loom.sh --foo is rejected with actionable error"
+STDERR_46=$("$INSTALL_SCRIPT" --foo /tmp/fakepath 2>&1 >/dev/null || true)
+if [[ -n "$STDERR_46" ]] && echo "$STDERR_46" | grep -q 'unknown flag: --foo'; then
+  pass "--foo rejected with correct error message"
+else
+  fail "--foo should be rejected with 'Error: unknown flag: --foo' (stderr=$STDERR_46)"
+fi
+echo ""
+
+# Test 47: hint text references install.sh so the operator knows where --quick/--full belong
+echo "Test 47: flag-rejection error mentions install.sh as the correct entry point"
+if echo "$STDERR_45" | grep -q 'install\.sh'; then
+  pass "flag-rejection stderr contains 'install.sh' hint text"
+else
+  fail "flag-rejection stderr is missing 'install.sh' hint (stderr=$STDERR_45)"
+fi
+echo ""
+
+
+# ==========================================================================
 # Summary
 # ==========================================================================
 echo "======================================"
