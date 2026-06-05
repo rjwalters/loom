@@ -1638,6 +1638,14 @@ else
     if $sibling_ok; then
       pass "Consumer install includes builder.md, judge.md, curator.md (skip-list is narrow)"
     fi
+
+    # #3468 AC1: the new generic /loom:bump skill must ship to consumers.
+    # (It is the public counterpart to the Loom-internal /loom:release skill.)
+    if [[ -f "$INTERNAL_REPO/.claude/commands/loom/bump.md" ]]; then
+      pass "AC1 (#3468): /loom:bump skill ships to consumers"
+    else
+      fail "AC1 (#3468): .claude/commands/loom/bump.md missing from consumer install"
+    fi
   else
     fail "loom-daemon init failed against fresh consumer repo $INTERNAL_REPO"
   fi
