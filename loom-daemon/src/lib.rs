@@ -12,6 +12,7 @@
 
 pub mod activity;
 pub mod errors;
+pub mod event_bus;
 pub mod forge_parser;
 pub mod git_parser;
 pub mod git_utils;

@@ -142,6 +142,37 @@ pub enum Request {
     ListSweeps {
         state_filter: Option<SweepState>,
     },
+    // ========================================================================
+    // Event Bus Requests (Issue #3453 — Phase B of #3449)
+    // ========================================================================
+    /// Publish a sweep-lifecycle event onto the in-memory bus.
+    ///
+    /// `topic` must follow the frozen taxonomy (`sweep.issue.{N}.phase`,
+    /// `sweep.issue.{N}.blocker`, `sweep.issue.{N}.exited`, etc.). The bus
+    /// itself accepts arbitrary topic strings, but downstream consumers
+    /// only subscribe to the documented topics.
+    ///
+    /// `payload` is opaque JSON — the schema is per-topic and documented
+    /// in `defaults/.claude/commands/loom/sweep.md`.
+    PublishEvent {
+        topic: String,
+        payload: serde_json::Value,
+    },
+    /// Subscribe to one or more topic prefixes on the event bus.
+    ///
+    /// This is a long-lived request: instead of returning a single
+    /// `Response`, the daemon streams `Response::EventStream { events }`
+    /// frames over the open connection as events arrive on the bus.
+    /// An empty `topics` vec subscribes to all events on the bus (useful
+    /// for the `tail_event_bus` debug tool slated for Phase C).
+    ///
+    /// Topic matching is **prefix match**, segment-aligned —
+    /// `sweep.issue` matches `sweep.issue.123.phase` but not
+    /// `sweep.issuetype.foo`. See `event_bus::topic_matches` for the
+    /// authoritative routing rule.
+    SubscribeEvents {
+        topics: Vec<String>,
+    },
     Shutdown,
 }
 
@@ -212,6 +243,23 @@ pub enum Response {
     /// Result of a `ListSweeps` request.
     SweepList {
         sweeps: Vec<SweepInfo>,
+    },
+    // ========================================================================
+    // Event Bus Responses (Issue #3453 — Phase B of #3449)
+    // ========================================================================
+    /// Acknowledgement frame returned by a successful `PublishEvent`.
+    /// Includes the receiver count so debug tooling can verify routing.
+    EventPublished {
+        topic: String,
+        receivers: usize,
+    },
+    /// A frame in the long-lived event stream returned by `SubscribeEvents`.
+    ///
+    /// Each frame may carry one or more events. The daemon sends one
+    /// frame per event in practice; the `events` vec is a structural
+    /// allowance for future batching without a wire-protocol change.
+    EventStream {
+        events: Vec<Event>,
     },
     /// Legacy error response (deprecated, use `StructuredError` for new code)
     /// Kept for backwards compatibility with existing frontends
@@ -336,4 +384,108 @@ pub struct SweepInfo {
     /// future phases (Phase A always sets this to `None`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pr_number: Option<i32>,
+}
+
+// ========================================================================
+// Event Bus Types (Issue #3453 — Phase B of #3449)
+// ========================================================================
+
+/// A sweep-lifecycle event published on the in-memory bus.
+///
+/// The enum is tagged on the `type` field; the topic each variant maps
+/// to is determined by [`Event::topic`]. Subscribers route by topic
+/// prefix (see `event_bus::topic_matches`).
+///
+/// The taxonomy below is **frozen for v0.10.0** — new topics require a
+/// follow-up issue per epic #3449.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type")]
+pub enum Event {
+    /// `sweep.issue.{N}.phase` — sweep child advanced a phase.
+    /// Payload published by the sweep skill via `PublishEvent`.
+    SweepPhase {
+        issue: u32,
+        phase: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pr_number: Option<i32>,
+    },
+    /// `sweep.issue.{N}.blocker` — sweep child encountered a blocker.
+    SweepBlocker {
+        issue: u32,
+        reason: String,
+        label_added: String,
+    },
+    /// `sweep.issue.{N}.exited` — reaper detected clean exit.
+    SweepExited {
+        issue: u32,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        exit_code: Option<i32>,
+        duration_sec: i64,
+    },
+    /// `sweep.issue.{N}.crashed` — reaper detected dead pid + checkpoint.
+    SweepCrashed {
+        issue: u32,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        checkpoint_phase: Option<String>,
+    },
+    /// `sweep.global.dispatch` — daemon dispatched a new sweep.
+    SweepGlobalDispatch { sweep_id: SweepId, kind: SweepKind },
+    /// `sweep.global.completed` — daemon reaper recorded sweep completion.
+    SweepGlobalCompleted {
+        sweep_id: SweepId,
+        outcome: SweepOutcome,
+    },
+    /// Synthetic event signalling that the subscription fell behind the
+    /// publisher. The number of events dropped is reported in `skipped`.
+    /// Matches `tokio::sync::broadcast::Receiver::Lagged` semantics.
+    TopicLag { skipped: u64 },
+    /// Generic event for forward compatibility — a topic + opaque payload.
+    /// Used by the `PublishEvent` IPC variant when the publisher does not
+    /// supply a strongly-typed event.
+    Generic {
+        topic: String,
+        payload: serde_json::Value,
+    },
+}
+
+impl Event {
+    /// Resolve the topic string for this event.
+    ///
+    /// Per-variant rules:
+    ///
+    /// | Variant | Topic |
+    /// |---------|-------|
+    /// | `SweepPhase {issue, ..}` | `sweep.issue.{issue}.phase` |
+    /// | `SweepBlocker {issue, ..}` | `sweep.issue.{issue}.blocker` |
+    /// | `SweepExited {issue, ..}` | `sweep.issue.{issue}.exited` |
+    /// | `SweepCrashed {issue, ..}` | `sweep.issue.{issue}.crashed` |
+    /// | `SweepGlobalDispatch {..}` | `sweep.global.dispatch` |
+    /// | `SweepGlobalCompleted {..}` | `sweep.global.completed` |
+    /// | `TopicLag {..}` | `sweep.system.topic_lag` |
+    /// | `Generic {topic, ..}` | the explicit topic string |
+    #[must_use]
+    pub fn topic(&self) -> String {
+        match self {
+            Self::SweepPhase { issue, .. } => format!("sweep.issue.{issue}.phase"),
+            Self::SweepBlocker { issue, .. } => format!("sweep.issue.{issue}.blocker"),
+            Self::SweepExited { issue, .. } => format!("sweep.issue.{issue}.exited"),
+            Self::SweepCrashed { issue, .. } => format!("sweep.issue.{issue}.crashed"),
+            Self::SweepGlobalDispatch { .. } => "sweep.global.dispatch".to_string(),
+            Self::SweepGlobalCompleted { .. } => "sweep.global.completed".to_string(),
+            Self::TopicLag { .. } => "sweep.system.topic_lag".to_string(),
+            Self::Generic { topic, .. } => topic.clone(),
+        }
+    }
+}
+
+/// Outcome of a completed sweep, used by `Event::SweepGlobalCompleted`.
+///
+/// `Exited` is the clean-exit path; `Crashed` is the dead-pid +
+/// checkpoint-present path that triggers a `loom:building` →
+/// `loom:issue` label re-arm on the reaper side.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SweepOutcome {
+    Exited,
+    Crashed,
 }
