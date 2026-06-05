@@ -1,4 +1,5 @@
 use loom_daemon::activity::{self, ActivityDb, StatsQueries};
+use loom_daemon::event_bus::EventBus;
 use loom_daemon::health_monitor;
 use loom_daemon::ipc::IpcServer;
 use loom_daemon::metrics_collector;
@@ -205,7 +206,16 @@ async fn main() -> Result<()> {
         .or_else(|| std::env::current_dir().ok())
         .unwrap_or_else(|| std::path::PathBuf::from("."));
     let sweep_config = SweepRegistryConfig::new(sweep_workspace.clone());
-    let mut sweep = SweepRegistry::new(sweep_config);
+
+    // Phase B (#3453): construct the in-memory pub/sub event bus *before*
+    // the sweep registry so we can wire it in at construction time. The
+    // bus is shared between the registry (publisher for reaper + dispatch
+    // events) and the IPC server (publisher for `PublishEvent` requests
+    // from sweep children, plus consumer for `SubscribeEvents` streams).
+    let event_bus = Arc::new(EventBus::new());
+    log::info!("event_bus: started in-memory pub/sub (capacity={})", event_bus.capacity());
+
+    let mut sweep = SweepRegistry::with_event_bus(sweep_config, event_bus.clone());
     match sweep.reconstruct() {
         Ok(0) => log::debug!("sweep_registry: no sweeps to reconstruct"),
         Ok(n) => log::info!(
@@ -218,7 +228,7 @@ async fn main() -> Result<()> {
     let _reaper_handle = sweep_registry::spawn_reaper_task(sweep_registry.clone());
 
     // Start IPC server
-    let server = IpcServer::new(socket_path.clone(), tm, activity_db, sweep_registry);
+    let server = IpcServer::new(socket_path.clone(), tm, activity_db, sweep_registry, event_bus);
 
     // Setup signal handler for graceful shutdown
     let socket_path_clone = socket_path.clone();

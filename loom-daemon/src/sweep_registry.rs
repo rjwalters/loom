@@ -37,7 +37,8 @@
 //! - Sweep checkpoints under `.loom/sweep-checkpoint/issue-<N>.json` (#3373).
 //! - Forge labels (`loom:issue` vs `loom:building`).
 
-use crate::types::{SweepId, SweepInfo, SweepKind, SweepState};
+use crate::event_bus::EventBus;
+use crate::types::{Event, SweepId, SweepInfo, SweepKind, SweepOutcome, SweepState};
 
 use anyhow::{anyhow, Context, Result};
 use chrono::Utc;
@@ -179,16 +180,50 @@ struct LockOwner {
 pub struct SweepRegistry {
     config: SweepRegistryConfig,
     entries: BTreeMap<SweepId, SweepInfo>,
+    /// Optional event bus for lifecycle events (Issue #3453, Phase B).
+    /// When `None`, the registry behaves identically to Phase A — bus
+    /// emission is best-effort and never blocks core dispatch/reaper
+    /// progress.
+    bus: Option<Arc<EventBus>>,
 }
 
 impl SweepRegistry {
-    /// Construct an empty registry.
+    /// Construct an empty registry without an event bus.
+    ///
+    /// Equivalent to Phase A's behavior. Use [`set_event_bus`](Self::set_event_bus)
+    /// or [`with_event_bus`](Self::with_event_bus) to attach a bus.
     #[must_use]
     pub fn new(config: SweepRegistryConfig) -> Self {
         Self {
             config,
             entries: BTreeMap::new(),
+            bus: None,
         }
+    }
+
+    /// Construct an empty registry with the given event bus pre-attached.
+    #[must_use]
+    pub fn with_event_bus(config: SweepRegistryConfig, bus: Arc<EventBus>) -> Self {
+        Self {
+            config,
+            entries: BTreeMap::new(),
+            bus: Some(bus),
+        }
+    }
+
+    /// Attach (or replace) the event bus used for lifecycle emission.
+    /// Additive setter — exposed so `main.rs` can construct the bus and
+    /// the registry separately, then wire them together at startup.
+    pub fn set_event_bus(&mut self, bus: Arc<EventBus>) {
+        self.bus = Some(bus);
+    }
+
+    /// Read-only accessor for the event bus, if any. Exposed so external
+    /// callers (IPC handlers) can publish directly via the same bus the
+    /// registry uses.
+    #[must_use]
+    pub fn event_bus(&self) -> Option<&Arc<EventBus>> {
+        self.bus.as_ref()
     }
 
     /// Returns a shared, mutex-guarded registry suitable for tokio tasks.
@@ -307,6 +342,14 @@ impl SweepRegistry {
         };
         self.entries.insert(sweep_id.clone(), info);
 
+        // 7. Emit `sweep.global.dispatch` (best-effort — never block
+        //    dispatch progress on the bus). If no subscribers are
+        //    listening, the bus returns NoSubscribers; log at debug.
+        self.emit_event(Event::SweepGlobalDispatch {
+            sweep_id: sweep_id.clone(),
+            kind: kind.clone(),
+        });
+
         Ok(DispatchOutcome {
             sweep_id,
             pid,
@@ -314,6 +357,20 @@ impl SweepRegistry {
             log_path,
             was_new: true,
         })
+    }
+
+    /// Internal helper: publish an event on the attached bus (if any).
+    /// Best-effort — logs a debug line if no subscribers are listening.
+    fn emit_event(&self, event: Event) {
+        if let Some(ref bus) = self.bus {
+            let topic = event.topic();
+            match bus.publish(event) {
+                Ok(n) => log::debug!("event_bus: published {topic} to {n} subscriber(s)"),
+                Err(_) => {
+                    log::debug!("event_bus: published {topic} (no subscribers)");
+                }
+            }
+        }
     }
 
     fn find_running_by_key(&self, key: &str) -> Option<&SweepInfo> {
@@ -501,17 +558,34 @@ impl SweepRegistry {
     /// and GCs entries older than the retention window.
     ///
     /// Returns the number of entries whose state changed.
+    ///
+    /// Emits the following events when an attached event bus is present
+    /// (Issue #3453, Phase B):
+    ///
+    /// - `sweep.issue.{N}.exited` on a clean-exit transition.
+    /// - `sweep.issue.{N}.crashed` on a checkpoint-present transition
+    ///   (which also re-arms the `loom:issue` label).
+    /// - `sweep.global.completed` on every terminal transition, regardless
+    ///   of which per-issue event also fired.
     pub fn reap_once(&mut self) -> usize {
         let mut changes = 0usize;
 
         // Snapshot keys + pids first so we can borrow mutably below.
-        let candidates: Vec<(SweepId, u32, SweepState, SweepKind)> = self
+        // Capture started_at so we can compute durations for Exited events.
+        let candidates: Vec<(SweepId, u32, SweepState, SweepKind, chrono::DateTime<Utc>)> = self
             .entries
             .iter()
-            .map(|(id, info)| (id.clone(), info.pid, info.state.clone(), info.kind.clone()))
+            .map(|(id, info)| {
+                (id.clone(), info.pid, info.state.clone(), info.kind.clone(), info.started_at)
+            })
             .collect();
 
-        for (sweep_id, pid, state, kind) in candidates {
+        // Buffer events to emit after we've finished mutating the
+        // registry — so we never call into the bus while holding the
+        // registry mutex's lifetime budget unnecessarily.
+        let mut events_to_emit: Vec<Event> = Vec::new();
+
+        for (sweep_id, pid, state, kind, started_at) in candidates {
             match state {
                 SweepState::Running | SweepState::Pending if !is_pid_alive(pid) => {
                     changes += 1;
@@ -519,6 +593,8 @@ impl SweepRegistry {
                         SweepKind::Issue(n) => Some(*n),
                         SweepKind::PrSet(_) => None,
                     };
+                    let now = Utc::now();
+                    let duration_sec = (now - started_at).num_seconds();
                     // Release lock and decide between Exited vs Crashed.
                     if let Some(issue) = issue {
                         let _ = self.release_lock(issue);
@@ -530,24 +606,64 @@ impl SweepRegistry {
                             if !self.config.skip_label_flip {
                                 let _ = self.restore_label_to_ready(issue);
                             }
+                            let checkpoint_phase = read_checkpoint_phase(&checkpoint);
                             if let Some(info) = self.entries.get_mut(&sweep_id) {
-                                info.state = SweepState::Crashed { at: Utc::now() };
+                                info.state = SweepState::Crashed { at: now };
+                                if info.latest_phase.is_none() {
+                                    info.latest_phase.clone_from(&checkpoint_phase);
+                                }
                             }
-                        } else if let Some(info) = self.entries.get_mut(&sweep_id) {
+                            events_to_emit.push(Event::SweepCrashed {
+                                issue,
+                                checkpoint_phase,
+                            });
+                            events_to_emit.push(Event::SweepGlobalCompleted {
+                                sweep_id: sweep_id.clone(),
+                                outcome: SweepOutcome::Crashed,
+                            });
+                        } else {
+                            if let Some(info) = self.entries.get_mut(&sweep_id) {
+                                info.state = SweepState::Exited {
+                                    code: None,
+                                    at: now,
+                                };
+                            }
+                            events_to_emit.push(Event::SweepExited {
+                                issue,
+                                exit_code: None,
+                                duration_sec,
+                            });
+                            events_to_emit.push(Event::SweepGlobalCompleted {
+                                sweep_id: sweep_id.clone(),
+                                outcome: SweepOutcome::Exited,
+                            });
+                        }
+                    } else {
+                        if let Some(info) = self.entries.get_mut(&sweep_id) {
                             info.state = SweepState::Exited {
                                 code: None,
-                                at: Utc::now(),
+                                at: now,
                             };
                         }
-                    } else if let Some(info) = self.entries.get_mut(&sweep_id) {
-                        info.state = SweepState::Exited {
-                            code: None,
-                            at: Utc::now(),
-                        };
+                        // PrSet sweeps don't have a single issue id, so we
+                        // only emit the global event. Per-issue events are
+                        // intentionally not emitted for PrSet (out of scope
+                        // for Phase A — see sweep_registry::dispatch).
+                        events_to_emit.push(Event::SweepGlobalCompleted {
+                            sweep_id: sweep_id.clone(),
+                            outcome: SweepOutcome::Exited,
+                        });
                     }
                 }
                 _ => {}
             }
+        }
+
+        // Drain the buffered events onto the bus. Each emission is
+        // best-effort and never propagates an error back into reaper
+        // progress.
+        for event in events_to_emit {
+            self.emit_event(event);
         }
 
         // GC: drop terminal entries past the retention window.
@@ -1030,6 +1146,140 @@ exit 0
 
         let all = registry.list(None);
         assert_eq!(all.len(), 1);
+    }
+
+    /// AC #2: reaper emits `sweep.issue.{N}.crashed` AND re-arms the
+    /// `loom:building` -> `loom:issue` label when a dead pid has a
+    /// checkpoint on disk. We don't actually invoke `gh` here (that's
+    /// covered by integration tests with `skip_label_flip = false`); we
+    /// assert the event payload and the registry state transition, which
+    /// is the contract Phase B exposes to subscribers.
+    #[tokio::test]
+    async fn reaper_emits_crashed_event_with_checkpoint_phase() {
+        use crate::event_bus::EventBus;
+
+        let dir = tempdir().unwrap();
+        let (mut registry, _record_log) = fixture_registry(dir.path());
+        let bus = Arc::new(EventBus::new());
+        registry.set_event_bus(bus.clone());
+        let mut sub = bus.subscribe::<[&str; 0], &str>([]);
+
+        let cp_dir = registry.config.checkpoint_dir();
+        std::fs::create_dir_all(&cp_dir).unwrap();
+        std::fs::write(cp_dir.join("issue-55.json"), r#"{"phase":"doctor","issue":55}"#).unwrap();
+
+        let sweep_id = "sweep-issue-55-test".to_string();
+        registry.entries.insert(
+            sweep_id.clone(),
+            SweepInfo {
+                sweep_id: sweep_id.clone(),
+                kind: SweepKind::Issue(55),
+                pid: 2_147_483_640,
+                token_name: "unknown".into(),
+                log_path: registry.compute_log_path(55),
+                idempotency_key: None,
+                started_at: Utc::now(),
+                state: SweepState::Running,
+                latest_phase: None,
+                pr_number: None,
+            },
+        );
+
+        let changed = registry.reap_once();
+        assert!(changed >= 1);
+
+        // Should observe: sweep.issue.55.crashed + sweep.global.completed
+        let mut saw_crashed = false;
+        let mut saw_completed = false;
+        for _ in 0..2 {
+            let ev = sub.recv().await.unwrap();
+            match ev {
+                Event::SweepCrashed {
+                    issue,
+                    checkpoint_phase,
+                } => {
+                    assert_eq!(issue, 55);
+                    assert_eq!(checkpoint_phase.as_deref(), Some("doctor"));
+                    saw_crashed = true;
+                }
+                Event::SweepGlobalCompleted {
+                    sweep_id: sid,
+                    outcome,
+                } => {
+                    assert_eq!(sid, sweep_id);
+                    assert_eq!(outcome, SweepOutcome::Crashed);
+                    saw_completed = true;
+                }
+                other => panic!("unexpected event: {other:?}"),
+            }
+        }
+        assert!(saw_crashed, "expected sweep.issue.55.crashed event");
+        assert!(saw_completed, "expected sweep.global.completed event");
+
+        // And the registry state should be Crashed (the label re-arm
+        // side-effect is suppressed because skip_label_flip is true in
+        // the fixture; the contract is the state transition + event
+        // emission, which together signal the re-arm has happened in
+        // production).
+        let info = registry.get(&sweep_id).unwrap();
+        assert!(matches!(info.state, SweepState::Crashed { .. }));
+    }
+
+    /// Clean-exit (no checkpoint) emits `sweep.issue.{N}.exited` plus
+    /// `sweep.global.completed{outcome=Exited}`.
+    #[tokio::test]
+    async fn reaper_emits_exited_event_for_clean_exit() {
+        use crate::event_bus::EventBus;
+
+        let dir = tempdir().unwrap();
+        let (mut registry, _record_log) = fixture_registry(dir.path());
+        let bus = Arc::new(EventBus::new());
+        registry.set_event_bus(bus.clone());
+        let mut sub = bus.subscribe::<[&str; 0], &str>([]);
+
+        let sweep_id = "sweep-issue-66-test".to_string();
+        registry.entries.insert(
+            sweep_id.clone(),
+            SweepInfo {
+                sweep_id: sweep_id.clone(),
+                kind: SweepKind::Issue(66),
+                pid: 2_147_483_640,
+                token_name: "unknown".into(),
+                log_path: registry.compute_log_path(66),
+                idempotency_key: None,
+                started_at: Utc::now() - chrono::Duration::seconds(10),
+                state: SweepState::Running,
+                latest_phase: None,
+                pr_number: None,
+            },
+        );
+
+        let changed = registry.reap_once();
+        assert!(changed >= 1);
+
+        let mut saw_exited = false;
+        let mut saw_completed = false;
+        for _ in 0..2 {
+            let ev = sub.recv().await.unwrap();
+            match ev {
+                Event::SweepExited {
+                    issue,
+                    duration_sec,
+                    ..
+                } => {
+                    assert_eq!(issue, 66);
+                    assert!(duration_sec >= 0);
+                    saw_exited = true;
+                }
+                Event::SweepGlobalCompleted { outcome, .. } => {
+                    assert_eq!(outcome, SweepOutcome::Exited);
+                    saw_completed = true;
+                }
+                other => panic!("unexpected event: {other:?}"),
+            }
+        }
+        assert!(saw_exited);
+        assert!(saw_completed);
     }
 
     #[test]
