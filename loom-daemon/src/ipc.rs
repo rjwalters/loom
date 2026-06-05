@@ -701,7 +701,7 @@ fn handle_request(
             let mut sr = sweep_registry
                 .lock()
                 .expect("Sweep registry mutex poisoned");
-            match sr.dispatch(kind, idempotency_key) {
+            match sr.dispatch(&kind, idempotency_key) {
                 Ok(outcome) => Response::SweepDispatched {
                     sweep_id: outcome.sweep_id,
                     pid: outcome.pid,

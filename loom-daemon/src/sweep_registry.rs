@@ -244,7 +244,7 @@ impl SweepRegistry {
     /// On idempotency hit returns the existing entry with `was_new = false`.
     pub fn dispatch(
         &mut self,
-        kind: SweepKind,
+        kind: &SweepKind,
         idempotency_key: Option<String>,
     ) -> Result<DispatchOutcome> {
         // 1. Idempotency dedup against Running entries.
@@ -261,7 +261,7 @@ impl SweepRegistry {
         }
 
         // 2. Phase A only fully implements Issue dispatch.
-        let issue_number = match &kind {
+        let issue_number = match kind {
             SweepKind::Issue(n) => *n,
             SweepKind::PrSet(_) => {
                 return Err(anyhow!(
@@ -272,7 +272,7 @@ impl SweepRegistry {
         };
 
         // 3. Acquire the claim lock atomically.
-        let sweep_id = generate_sweep_id(&kind);
+        let sweep_id = generate_sweep_id(kind);
         self.acquire_lock(issue_number, &sweep_id)?;
 
         // 4. Flip the forge label loom:issue -> loom:building (best-effort
@@ -513,32 +513,25 @@ impl SweepRegistry {
 
         for (sweep_id, pid, state, kind) in candidates {
             match state {
-                SweepState::Running | SweepState::Pending => {
-                    if !is_pid_alive(pid) {
-                        changes += 1;
-                        let issue = match &kind {
-                            SweepKind::Issue(n) => Some(*n),
-                            SweepKind::PrSet(_) => None,
-                        };
-                        // Release lock and decide between Exited vs Crashed.
-                        if let Some(issue) = issue {
-                            let _ = self.release_lock(issue);
-                            let checkpoint = self
-                                .config
-                                .checkpoint_dir()
-                                .join(format!("issue-{issue}.json"));
-                            if checkpoint.exists() {
-                                if !self.config.skip_label_flip {
-                                    let _ = self.restore_label_to_ready(issue);
-                                }
-                                if let Some(info) = self.entries.get_mut(&sweep_id) {
-                                    info.state = SweepState::Crashed { at: Utc::now() };
-                                }
-                            } else if let Some(info) = self.entries.get_mut(&sweep_id) {
-                                info.state = SweepState::Exited {
-                                    code: None,
-                                    at: Utc::now(),
-                                };
+                SweepState::Running | SweepState::Pending if !is_pid_alive(pid) => {
+                    changes += 1;
+                    let issue = match &kind {
+                        SweepKind::Issue(n) => Some(*n),
+                        SweepKind::PrSet(_) => None,
+                    };
+                    // Release lock and decide between Exited vs Crashed.
+                    if let Some(issue) = issue {
+                        let _ = self.release_lock(issue);
+                        let checkpoint = self
+                            .config
+                            .checkpoint_dir()
+                            .join(format!("issue-{issue}.json"));
+                        if checkpoint.exists() {
+                            if !self.config.skip_label_flip {
+                                let _ = self.restore_label_to_ready(issue);
+                            }
+                            if let Some(info) = self.entries.get_mut(&sweep_id) {
+                                info.state = SweepState::Crashed { at: Utc::now() };
                             }
                         } else if let Some(info) = self.entries.get_mut(&sweep_id) {
                             info.state = SweepState::Exited {
@@ -546,6 +539,11 @@ impl SweepRegistry {
                                 at: Utc::now(),
                             };
                         }
+                    } else if let Some(info) = self.entries.get_mut(&sweep_id) {
+                        info.state = SweepState::Exited {
+                            code: None,
+                            at: Utc::now(),
+                        };
                     }
                 }
                 _ => {}
@@ -634,8 +632,7 @@ impl SweepRegistry {
                 }
                 let log_path = self.compute_log_path(issue);
                 let started_at = chrono::DateTime::parse_from_rfc3339(&owner.acquired_at)
-                    .map(|t| t.with_timezone(&Utc))
-                    .unwrap_or_else(|_| Utc::now());
+                    .map_or_else(|_| Utc::now(), |t| t.with_timezone(&Utc));
                 self.entries.insert(
                     owner.sweep_id.clone(),
                     SweepInfo {
@@ -921,7 +918,7 @@ exit 0
         let (mut registry, record_log) = fixture_registry(dir.path());
 
         let outcome = registry
-            .dispatch(SweepKind::Issue(42), None)
+            .dispatch(&SweepKind::Issue(42), None)
             .expect("dispatch should succeed");
 
         assert!(outcome.was_new);
@@ -966,10 +963,10 @@ exit 0
         let dir = tempdir().unwrap();
         let (mut registry, _record_log) = fixture_registry(dir.path());
 
-        let first = registry.dispatch(SweepKind::Issue(7), None);
+        let first = registry.dispatch(&SweepKind::Issue(7), None);
         assert!(first.is_ok());
 
-        let second = registry.dispatch(SweepKind::Issue(7), None);
+        let second = registry.dispatch(&SweepKind::Issue(7), None);
         assert!(second.is_err(), "second dispatch for issue #7 should fail (lock collision)");
         let err = second.unwrap_err().to_string();
         assert!(err.contains("lock collision"), "expected lock collision error; got: {err}");
@@ -982,7 +979,7 @@ exit 0
         let (mut registry, _record_log) = fixture_registry(dir.path());
 
         let first = registry
-            .dispatch(SweepKind::Issue(99), Some("key-A".to_string()))
+            .dispatch(&SweepKind::Issue(99), Some("key-A".to_string()))
             .unwrap();
         assert!(first.was_new);
 
@@ -990,7 +987,7 @@ exit 0
         // Issue #99 is the same kind, but we don't need a different issue —
         // the dedup is purely on the idempotency key.
         let second = registry
-            .dispatch(SweepKind::Issue(99), Some("key-A".to_string()))
+            .dispatch(&SweepKind::Issue(99), Some("key-A".to_string()))
             .unwrap();
         assert!(!second.was_new);
         assert_eq!(first.sweep_id, second.sweep_id);
@@ -1001,7 +998,7 @@ exit 0
         let dir = tempdir().unwrap();
         let (mut registry, _record_log) = fixture_registry(dir.path());
 
-        let outcome = registry.dispatch(SweepKind::PrSet(vec![1, 2, 3]), None);
+        let outcome = registry.dispatch(&SweepKind::PrSet(vec![1, 2, 3]), None);
         assert!(outcome.is_err());
         assert!(outcome
             .unwrap_err()
@@ -1015,7 +1012,7 @@ exit 0
         let (mut registry, _record_log) = fixture_registry(dir.path());
 
         // Dispatch and then poke an entry into Exited state directly.
-        let outcome = registry.dispatch(SweepKind::Issue(11), None).unwrap();
+        let outcome = registry.dispatch(&SweepKind::Issue(11), None).unwrap();
         let entry = registry.entries.get_mut(&outcome.sweep_id).unwrap();
         entry.state = SweepState::Exited {
             code: Some(0),
@@ -1248,7 +1245,7 @@ exit 0
         config.skip_label_flip = true;
         let mut registry = SweepRegistry::new(config);
 
-        let outcome = registry.dispatch(SweepKind::Issue(123), None).unwrap();
+        let outcome = registry.dispatch(&SweepKind::Issue(123), None).unwrap();
         assert!(outcome.was_new);
 
         let needle = format!("CLAUDE_CODE_OAUTH_TOKEN={token_value}");
