@@ -225,7 +225,7 @@ Hermit creates ──→ loom:hermit ──→ (human approves) ──→ loom:i
 ## Autonomous Operation
 
 Agents can run autonomously at configured intervals using either:
-1. **Daemon Mode**: `loom-daemon` manages support roles and shepherds on a schedule
+1. **Spawn loop + GitHub Actions cron**: `./.loom/scripts/spawn-loop.sh` claims `loom:issue` items and spawns `/loom:sweep` children; `.github/workflows/loom-*.yml` run periodic support roles on cron schedules
 2. **Manual Orchestration Mode**: Multiple Claude Code terminals with periodic commands
 
 ### Autonomous Agents

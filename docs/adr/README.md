@@ -43,6 +43,13 @@ An Architecture Decision Record captures an important architectural decision mad
   - **Summary**: Use GitHub labels as state machine for agent workflow coordination
   - **Key Decision**: Leverage GitHub labels over database, message queue, or file-based queue
 
+### Orchestration Architecture
+
+- [ADR-0009: Deprecate and Delete Shepherd Brain and Python Daemon (Phase 3)](0009-shepherd-deprecation.md)
+  - **Status**: Accepted
+  - **Summary**: Delete `loom_tools/shepherd/` (~16.8k LOC) and `loom_tools/daemon_v2/` (~4.7k LOC); replace with spawn loop + GitHub Actions cron + `/loom:sweep`
+  - **Key Decision**: Forge-as-state-machine + stateless components over persistent Python orchestration brain
+
 ## Creating a New ADR
 
 When making a significant architectural decision:
