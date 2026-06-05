@@ -794,6 +794,53 @@ fn handle_request(
         }
 
         // ====================================================================
+        // Sweep Monitoring Handlers (Issue #3455 — Phase C of #3449)
+        // ====================================================================
+        Request::GetSweepStatus { sweep_id } => {
+            let sr = sweep_registry
+                .lock()
+                .expect("Sweep registry mutex poisoned");
+            let info = sr.get_status(&sweep_id);
+            Response::SweepStatus { info }
+        }
+
+        Request::TailSweepLog { sweep_id, lines } => {
+            let sr = sweep_registry
+                .lock()
+                .expect("Sweep registry mutex poisoned");
+            match sr.tail_log(&sweep_id, lines) {
+                Ok((log_path, lines)) => Response::SweepLogTail {
+                    sweep_id,
+                    lines,
+                    log_path,
+                },
+                Err(e) => Response::Error {
+                    message: format!("tail_sweep_log failed: {e}"),
+                },
+            }
+        }
+
+        Request::CancelSweep {
+            sweep_id,
+            grace_secs,
+        } => {
+            let mut sr = sweep_registry
+                .lock()
+                .expect("Sweep registry mutex poisoned");
+            match sr.cancel(&sweep_id, std::time::Duration::from_secs(grace_secs)) {
+                Ok(outcome) => Response::SweepCancelled {
+                    sweep_id: outcome.sweep_id,
+                    pid: outcome.pid,
+                    sigkill_sent: outcome.sigkill_sent,
+                    was_running: outcome.was_running,
+                },
+                Err(e) => Response::Error {
+                    message: format!("cancel_sweep failed: {e}"),
+                },
+            }
+        }
+
+        // ====================================================================
         // Event Bus Handlers (Issue #3453 — Phase B of #3449)
         // ====================================================================
         Request::PublishEvent { topic, payload } => {
@@ -835,7 +882,7 @@ fn handle_request(
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::panic)]
+#[allow(clippy::unwrap_used, clippy::panic, clippy::expect_used)]
 mod tests {
     use super::*;
     use crate::activity::ActivityDb;
@@ -1164,6 +1211,118 @@ exit 0
                 assert_eq!(payload, serde_json::json!({"phase": "builder"}));
             }
             other => panic!("Expected Generic event, got: {other:?}"),
+        }
+    }
+
+    // ===== Sweep monitoring IPC handlers (Issue #3455, Phase C) =====
+
+    #[test]
+    fn test_handle_request_get_sweep_status_missing() {
+        let (tm, db, _, bus) = setup_test_context();
+        let (sr, _dir, _rec) = setup_sweep_registry_in_tempdir();
+        let response = handle_request(
+            Request::GetSweepStatus {
+                sweep_id: "no-such-sweep".to_string(),
+            },
+            &tm,
+            &db,
+            &sr,
+            &bus,
+        );
+        match response {
+            Response::SweepStatus { info } => assert!(info.is_none()),
+            other => panic!("Expected SweepStatus, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_handle_request_tail_sweep_log_missing_sweep_returns_error() {
+        let (tm, db, _, bus) = setup_test_context();
+        let (sr, _dir, _rec) = setup_sweep_registry_in_tempdir();
+        let response = handle_request(
+            Request::TailSweepLog {
+                sweep_id: "no-such-sweep".to_string(),
+                lines: 10,
+            },
+            &tm,
+            &db,
+            &sr,
+            &bus,
+        );
+        match response {
+            Response::Error { message } => {
+                assert!(
+                    message.contains("unknown sweep_id"),
+                    "expected unknown sweep_id; got: {message}"
+                );
+            }
+            other => panic!("Expected Error, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_handle_request_cancel_sweep_unknown_returns_error() {
+        let (tm, db, _, bus) = setup_test_context();
+        let (sr, _dir, _rec) = setup_sweep_registry_in_tempdir();
+        let response = handle_request(
+            Request::CancelSweep {
+                sweep_id: "no-such-sweep".to_string(),
+                grace_secs: 1,
+            },
+            &tm,
+            &db,
+            &sr,
+            &bus,
+        );
+        match response {
+            Response::Error { message } => {
+                assert!(
+                    message.contains("unknown sweep_id"),
+                    "expected unknown sweep_id; got: {message}"
+                );
+            }
+            other => panic!("Expected Error, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_handle_request_get_sweep_status_returns_existing() {
+        let (tm, db, _, bus) = setup_test_context();
+        let (sr, _dir, _rec) = setup_sweep_registry_in_tempdir();
+
+        // Dispatch a sweep to get a real entry in the registry.
+        let dispatched = handle_request(
+            Request::DispatchSweep {
+                kind: SweepKind::Issue(444),
+                idempotency_key: None,
+            },
+            &tm,
+            &db,
+            &sr,
+            &bus,
+        );
+        let sweep_id = match dispatched {
+            Response::SweepDispatched { sweep_id, .. } => sweep_id,
+            other => panic!("Expected SweepDispatched, got: {other:?}"),
+        };
+
+        let response = handle_request(
+            Request::GetSweepStatus {
+                sweep_id: sweep_id.clone(),
+            },
+            &tm,
+            &db,
+            &sr,
+            &bus,
+        );
+        match response {
+            Response::SweepStatus { info } => {
+                let info = info.expect("status should be Some");
+                assert_eq!(info.sweep_id, sweep_id);
+                assert!(matches!(info.kind, SweepKind::Issue(444)));
+            }
+            other => panic!("Expected SweepStatus, got: {other:?}"),
         }
     }
 
