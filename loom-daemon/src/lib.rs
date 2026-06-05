@@ -20,6 +20,7 @@ pub mod init;
 pub mod ipc;
 pub mod metrics_collector;
 pub mod role_validation;
+pub mod sweep_registry;
 pub mod terminal;
 pub mod types;
 
