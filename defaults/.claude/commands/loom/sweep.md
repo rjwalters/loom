@@ -10,7 +10,7 @@ Process an explicit list of issues — **or an explicit/NL-described set of open
 
 **Arguments**: $ARGUMENTS
 
-`$ARGUMENTS` is interpreted in one of **three modes**, chosen by inspection of the non-flag tokens and the presence of a `--prs` flag. Before classifying, **strip all recognized flag tokens** (`--builders-per-wave N`, `--dry-run`, `--prs`) from the token list — flags are honoured in their respective modes.
+`$ARGUMENTS` is interpreted in one of **three modes**, chosen by inspection of the non-flag tokens and the presence of a `--prs` flag. Before classifying, **strip all recognized flag tokens** (`--builders-per-wave N`, `--dry-run`, `--prs`, `--no-daemon`) from the token list — flags are honoured in their respective modes.
 
 **Mode selection summary** (full rules below):
 
@@ -96,7 +96,7 @@ Combine flags as needed. Always pass `--state open` explicitly (Mode C operates 
 
 **Mode C validation rules:**
 
-- `--prs` strips from the token list before classification, exactly like `--builders-per-wave N` and `--dry-run`.
+- `--prs` strips from the token list before classification, exactly like `--builders-per-wave N`, `--dry-run`, and `--no-daemon`.
 - Numeric tokens (after stripping `--prs`): same `^#?\d+$` regex as Mode A. Strip leading `#`, parse as positive integers, deduplicate (preserve first-seen order). Reject any token that fails to parse, with a clear error citing the offending token, and EXIT.
 - NL tokens (after stripping `--prs`): translate to one or more `gh pr list` invocations per the guide above. Run the command, deduplicate the resulting PR list, and **display the candidate set to the user before spawning any agents**. Await confirmation. If the user declines, EXIT cleanly.
 - **`--builders-per-wave N` is silently ignored in Mode C**. The Builder phase is skipped wholesale for PR-set mode; per-PR Judge is sequential within a wave (matching the existing issue-side wave policy). If the user passes both `--prs` and `--builders-per-wave N`, print a one-line note that the flag has no effect in Mode C and proceed without it. Mode C waves are size-1 by default — one PR settles fully (Judge → optional Doctor → optional Merge) before the next PR is touched. This may relax in a future issue; today it preserves the load-bearing #3289 sequencing rule.
@@ -114,19 +114,20 @@ Combine flags as needed. Always pass `--state open` explicitly (Mode C operates 
 - **`--builders-per-wave N`** — dispatch up to `N` builders in parallel per wave. Default `1` (fully sequential, matching the MVP behaviour). `N` must be an integer `>= 1`. Honoured in Modes A and B (issue-side); **silently ignored in Mode C** (PR-set mode has no Builder phase — see Mode C validation rules above). Flag tokens are stripped before classification.
 - **`--dry-run`** — print the planned candidate list (with wave grouping) and EXIT without performing any mutation. Recognized as a bare flag token (no value). May appear anywhere in `$ARGUMENTS`. Default is off. Honoured in **all three** modes — stripped before classification along with other flags. Mode C dry-run prints the PR-set plan (per-PR routing) instead of the issue-set plan.
 - **`--prs`** — switch into Mode C (PR-set mode). Recognized as a bare flag token (no value). May appear anywhere in `$ARGUMENTS`. Default is off. When present, non-flag tokens are interpreted as **PR numbers** (numeric tokens) or as a **PR-list description** (NL tokens). When absent, an NL trigger phrase listed in the Mode C section can still select Mode C. See "Mode C" above for full semantics.
+- **`--no-daemon`** — force in-process subagent dispatch even when the daemon is running with a multi-account token pool. Recognized as a bare flag token (no value). May appear anywhere in `$ARGUMENTS`. Default is off. When present, **Stage -1 (Backend detection) skips the `PROBE_DAEMON` step entirely** and the skill always falls through to the existing Mode A/B/C subagent dispatch path. Honoured in **all three** modes — stripped before classification along with other flags. Use this when you want the predictable single-process behaviour even though daemon dispatch is available (e.g., debugging, demoing the subagent path, or running under a token configuration that you don't want shared with daemon-spawned sweeps). See "Stage -1: Backend detection" below.
 
 ### Validation rules
 
-- Recognize `--dry-run`, `--prs`, and `--builders-per-wave N` as flag tokens anywhere in `$ARGUMENTS`, strip them from the candidate list before validation, and store them as flags / parameters (`DRY_RUN=true|false`, `PRS_MODE=true|false`, `BUILDERS_PER_WAVE=N`).
+- Recognize `--dry-run`, `--prs`, `--no-daemon`, and `--builders-per-wave N` as flag tokens anywhere in `$ARGUMENTS`, strip them from the candidate list before validation, and store them as flags / parameters (`DRY_RUN=true|false`, `PRS_MODE=true|false`, `NO_DAEMON=true|false`, `BUILDERS_PER_WAVE=N`).
 - At least one candidate (numeric token or NL description) must be supplied. If `$ARGUMENTS` (after stripping flag tokens) is empty, display:
   ```
-  Usage: /sweep <issue-number> [<issue-number> ...] [--builders-per-wave N] [--dry-run]
-         /sweep <natural-language description>     [--builders-per-wave N] [--dry-run]
+  Usage: /sweep <issue-number> [<issue-number> ...] [--builders-per-wave N] [--dry-run] [--no-daemon]
+         /sweep <natural-language description>     [--builders-per-wave N] [--dry-run] [--no-daemon]
          /sweep --prs <pr-number> [<pr-number> ...] [--dry-run]
          /sweep --prs <natural-language PR description> [--dry-run]
          /sweep <natural-language PR description>       [--dry-run]   # PR NL triggers select Mode C
 
-  See #3298 and #3384 for the full design.
+  See #3298, #3384, and #3454 for the full design.
   ```
   and EXIT.
 - **Mode-selection precedence** (apply in order):
@@ -154,6 +155,10 @@ Combine flags as needed. Always pass `--state open` explicitly (Mode C operates 
   - Reject `N < 1` (including `0` and negative values) with: `Error: --builders-per-wave must be >= 1 (got: <N>)` and EXIT. Do **not** silently default to `1`.
   - If `N > 3`, print a warning and continue: `WARNING: --builders-per-wave=<N> is unvalidated. N<=3 is recommended; N>=4 may exhaust context or hit rate limits. Proceeding at your own risk.`
   - If `N` exceeds the number of candidates at any wave, **silently clamp** to the candidate count for that wave. Do not warn, do not stall.
+- **`--no-daemon` validation:**
+  - Bare flag, no value. If a value is supplied (`--no-daemon=true`, `--no-daemon something`), treat the `=value` form as an error and EXIT (`Error: --no-daemon takes no value`). The standalone-token form is the only accepted spelling.
+  - Honoured in all three modes (A, B, C). The flag is a no-op in Mode C (Mode C is always subagent-side — see Stage -1's `DECIDE` precedence below) but is accepted without error so operators can pass it unconditionally from scripts.
+  - When `NO_DAEMON=true`, Stage -1 short-circuits to the subagent path **before** issuing the daemon Ping probe. No daemon-state files are read or written, and no `mcp__loom__*` calls are made for backend probing.
 
 **Wave-size guidance:**
 
@@ -179,6 +184,7 @@ The cap is **soft** — there is no hard upper bound. The warning is the only gu
 /sweep 1 2 --builders-per-wave 5              # Silently clamps to 2 (candidate count)
 /sweep 123 456 789 --dry-run                  # Print plan and EXIT without mutating
 /sweep 1 2 3 4 5 --dry-run --builders-per-wave 2  # Preview with wave grouping
+/sweep 123 456 --no-daemon                    # Force in-process subagent dispatch even when daemon is up (#3454)
 ```
 
 ### Mode B — Natural-language description
@@ -284,6 +290,196 @@ If a future maintainer is tempted to "simplify" by replacing the wave-loop with 
 ### Other constraints
 
 - **Do NOT write to `.loom/daemon-state.json`.** That file is owned by the standalone daemon. `/sweep` runs independently and must not race with the daemon on shepherd-slot bookkeeping. Reading `daemon-state.json` for situational awareness is fine; writing is not.
+
+## Stage -1: Backend detection (Phase D of #3449)
+
+Before **any** other stage — including the dry-run gate and all wave lifecycles — decide whether to **delegate dispatch to the in-process loom-daemon** or **fall through to the existing in-process subagent dispatch**. This stage is prose for the LLM running this skill; it does not run a separate binary. Implementation is small, side-effect-free probes followed by a single routing decision.
+
+This stage exists because Phase A of epic #3449 (#3452) shipped `mcp__loom__dispatch_sweep`, an MCP tool that queues a sweep on the daemon's spawn queue and returns immediately. When the daemon is reachable **and** a multi-account token pool is configured, dispatching to the daemon means each sweep runs in its own detached process with its own rotated OAuth token — load is balanced across accounts, and the orchestrator session exits sub-2-second after dispatch. When either precondition is missing, today's Mode A/B/C subagent path is the right choice — it works on a solo token, it doesn't depend on a running daemon, and it is the verified behaviour for the v0.9.x line.
+
+The contract is **strict AND between two preconditions**, with an explicit Mode C short-circuit and an explicit `--no-daemon` opt-out. There is **no implicit auto-start** of the daemon if the pool exists but the daemon is down; there is **no implicit "use daemon if reachable even without a pool"** branch. Either probe failing → subagent fallthrough.
+
+### Decision tree (the contract)
+
+```text
+PROBE_MODE:
+  If --prs flag present OR any PR-side NL trigger detected → Mode C (subagent always)
+
+PROBE_DAEMON:
+  Ping ~/.loom/loom-daemon.sock with 500ms timeout. Pong → reachable.
+
+PROBE_POOL:
+  Count *.token files in .loom/tokens/ OR ACCOUNT_KEY_* lines in .env. Pool exists if count >= 2.
+
+DECIDE:
+  if Mode C: use_subagent()
+  elif --no-daemon: use_subagent()
+  elif PROBE_DAEMON AND PROBE_POOL: use_daemon()
+  else: use_subagent()
+```
+
+The precedence is deliberate:
+
+1. **Mode C → subagent** (always, regardless of daemon/pool state). The daemon's dispatch surface is **issue-keyed only** in v0.10.0 (`mcp__loom__dispatch_sweep --kind '{"Issue":N}'`); PR-set dispatch is an explicit non-goal of the parent epic and is not on the v0.10.0 roadmap. PR-set sweeps therefore route to the existing in-process subagent path, which already supports Mode C end-to-end.
+2. **`--no-daemon` → subagent** (operator opt-out, after Mode C but before any probes). When this flag is present, do not even attempt the `PROBE_DAEMON` Ping — saves a 500ms ceiling and produces predictable behaviour for debug/demo/scripted runs.
+3. **`PROBE_DAEMON ∧ PROBE_POOL → daemon`** (the only way to land on the daemon path). **Strict AND**: both probes must succeed. Either missing → fallthrough.
+4. **Else → subagent** (the universal fallthrough, equivalent to v0.9.x behaviour).
+
+### The three probes
+
+#### PROBE_MODE — mode classification (already done)
+
+Mode classification happens in the existing "Mode-selection precedence" rules above (Arguments → Validation rules). By the time Stage -1 runs, the skill knows whether it is in Mode A, B, or C. **If the mode is C, the decision is already made — go straight to the subagent path** (the "Stage 0: Dry-run gate" section below, then "PR-set Wave Lifecycle"). Do not run the daemon or pool probes for Mode C.
+
+#### PROBE_DAEMON — is the loom-daemon reachable?
+
+The daemon listens on `~/.loom/loom-daemon.sock` (a Unix-domain socket). A reachability probe is a cheap `mcp__loom__list_sweeps` invocation — the daemon answers with the current sweep list (which may be an empty array if the daemon is up but no sweeps are queued). Either a successful response **or** an empty-list response is a "pong" — the daemon is reachable.
+
+Use a **500ms timeout** on this probe. The MCP layer accepts a timeout parameter; do not raise it. The 500ms ceiling covers two failure modes simultaneously:
+
+- **No daemon running.** The Unix socket file does not exist, or the connection refused immediately. The MCP call returns an error in well under 500ms; treat as `PROBE_DAEMON = false`.
+- **Stale socket.** The socket file exists but no process is listening (e.g., the daemon crashed without cleanup). The connection hangs until the OS times out — that's the 500ms guard. Timeout → treat as `PROBE_DAEMON = false`. **Do not retry, do not auto-clean the stale socket, do not auto-start the daemon.** Those behaviours belong in operator tools, not in this skill.
+
+A successful response (any well-formed `EventStream`/sweep-list payload, including the empty case) → `PROBE_DAEMON = true`.
+
+```text
+PROBE_DAEMON pseudocode (LLM-directed):
+
+  if NO_DAEMON:
+      PROBE_DAEMON = false   # short-circuit; do not even issue the call
+  else:
+      try:
+          response = mcp__loom__list_sweeps(timeout_ms=500)
+          PROBE_DAEMON = true        # any structured response = reachable
+      except timeout, connection_error, no_such_tool:
+          PROBE_DAEMON = false
+```
+
+The `no_such_tool` case covers older Loom installs without Phase A's MCP additions — treat as "daemon not reachable" and fall through. Do not try to detect the daemon by other means (no `ps` parsing, no PID file reads — the socket probe is the authoritative reachability test).
+
+#### PROBE_POOL — does a multi-account token pool exist?
+
+A pool exists if **either** of these is true (logical OR, both checked):
+
+1. **Materialized pool**: `.loom/tokens/*.token` contains **two or more** files. The bootstrap step (`loom-tokens bootstrap`) writes one `*.token` file per `ACCOUNT_KEY_*` triple in `.env`; a count `>= 2` means at least two distinct accounts are available for rotation.
+2. **Configured pool**: `.env` at the workspace root contains **two or more** `ACCOUNT_KEY_*` lines. This catches the case where the operator has configured multiple accounts but hasn't yet run `loom-tokens bootstrap` — the daemon's spawn-time selector can still pick a token, and the pool will be materialized on demand.
+
+Both checks are cheap, local, and side-effect-free:
+
+```bash
+TOKEN_FILE_COUNT=$(ls .loom/tokens/*.token 2>/dev/null | wc -l | tr -d ' ')
+ENV_KEY_COUNT=$(grep -c '^ACCOUNT_KEY_' .env 2>/dev/null || echo 0)
+if (( TOKEN_FILE_COUNT >= 2 )) || (( ENV_KEY_COUNT >= 2 )); then
+  PROBE_POOL=true
+else
+  PROBE_POOL=false
+fi
+```
+
+A single-token configuration (`TOKEN_FILE_COUNT == 1` and `ENV_KEY_COUNT <= 1`) is **not** a pool — the daemon dispatch path needs at least two accounts to make rotation meaningful, and a single-token operator gets no benefit from delegating to the daemon. Fall through to the subagent path in that case.
+
+> **Why >= 2 and not >= 1?** A pool of one is not a pool — it is a single token, and rotation requires alternatives. The daemon's dispatch advantage (per-sweep token selection, weekly-quota recovery) only materializes once two-or-more accounts are configured. Single-token operators see no degradation in the subagent path; this preserves the existing solo-token experience.
+
+### The daemon-dispatch path (when `DECIDE = use_daemon`)
+
+When `DECIDE` lands on `use_daemon`, the skill **dispatches each candidate issue** to the daemon and **exits sub-2-second**. There is no in-session orchestration after dispatch — operators monitor with `mcp__loom__list_sweeps` (Phase A) or the richer Phase C tools once they land.
+
+For each candidate issue `N` in the candidate set:
+
+```text
+mcp__loom__dispatch_sweep(kind={"Issue": N})
+```
+
+The daemon enqueues the sweep, returns a sweep ID, and the skill logs the dispatch (`Dispatched sweep <sweep-id> for issue #N to daemon`). The daemon's spawn-time logic picks an OAuth token from the rotation pool, detaches a `claude -p "/loom:sweep N"` child, and runs the sweep in that child's session — completely independent of this orchestrator session.
+
+**The skill does NOT subscribe to events.** Phase B's pub/sub bus is consumed by long-running monitors and the spawn loop, not by the skill itself. The skill is fire-and-forget: dispatch, log, exit.
+
+**Mode C is excluded.** Mode C uses `--prs` (or NL triggers); the daemon does not handle PR-set dispatch in v0.10.0. If `PROBE_MODE` returned Mode C, this branch is unreachable — the `DECIDE` precedence sends Mode C to subagent before this branch is evaluated.
+
+**Exit immediately after the last `mcp__loom__dispatch_sweep` returns.** Do **not** run the dry-run gate, the issue-side wave lifecycle, or any of the "0." through "8." stages below — those are subagent-path-only and would double-orchestrate. The skill's job in the daemon path is dispatch and exit; the daemon-side child runs the full Curator → Builder → Judge → Doctor → Merge lifecycle in its own session.
+
+**Dry-run interaction:** when `--dry-run` is passed alongside the daemon path, **the dry-run gate (Stage 0) still runs and the skill EXITs without dispatching**. Dry-run is a read-only contract independent of backend choice; it prints the candidate plan and exits without mutation regardless of whether the daemon would have been used. This is intentional — operators previewing a sweep should see the plan before any backend dispatches.
+
+### The subagent fallthrough (when `DECIDE = use_subagent`)
+
+Otherwise — `DECIDE` is `use_subagent` for **any** of the reasons above (Mode C, `--no-daemon`, daemon unreachable, no pool, or any probe error) — **continue to "0. Dry-run gate" below and run the existing Mode A/B/C lifecycle in-process exactly as today**. This is the v0.9.x behaviour, unchanged. The skill prose from "0. Dry-run gate" onward is the canonical subagent path.
+
+No behaviour change for solo-token operators: their `PROBE_POOL` returns `false`, the `DECIDE` lands on `use_subagent`, and the rest of the skill runs as it always has.
+
+### Smoke tests (documented expectations)
+
+These are the AC #3 and AC #4 contracts, written for the operator.
+
+**Daemon-on + multi-account pool (AC #3):**
+
+```bash
+# Preconditions:
+#   - loom-daemon is running (`pgrep loom-daemon` matches, ~/.loom/loom-daemon.sock exists)
+#   - At least 2 accounts in .env / .loom/tokens/
+
+/loom:sweep 123 456
+
+# Expected:
+#   1. Stage -1 runs: PROBE_MODE=A, PROBE_DAEMON=true, PROBE_POOL=true.
+#   2. DECIDE = use_daemon.
+#   3. Skill calls mcp__loom__dispatch_sweep for issue 123 → logs sweep ID.
+#   4. Skill calls mcp__loom__dispatch_sweep for issue 456 → logs sweep ID.
+#   5. Skill exits in < 2 seconds.
+#   6. Daemon runs the two sweeps independently in detached processes.
+#   7. Operator monitors progress via mcp__loom__list_sweeps or Phase C tools.
+```
+
+**Daemon-off OR single-token (AC #4):**
+
+```bash
+# Preconditions:
+#   - Either loom-daemon is not running, OR .env has < 2 ACCOUNT_KEY_* lines.
+
+/loom:sweep 123 456
+
+# Expected:
+#   1. Stage -1 runs: PROBE_MODE=A, PROBE_DAEMON or PROBE_POOL is false.
+#   2. DECIDE = use_subagent.
+#   3. Skill continues to "0. Dry-run gate" → "Wave Lifecycle" → ... exactly as today.
+#   4. Issue 123 runs Curator→Builder→Judge→Doctor→Merge in-session.
+#   5. Issue 456 runs the same way in the next wave (default --builders-per-wave=1).
+#   6. Skill exits when both issues have settled (potentially many minutes).
+```
+
+**`--no-daemon` opt-out:**
+
+```bash
+# Preconditions: any. The flag forces the subagent path.
+
+/loom:sweep 123 456 --no-daemon
+
+# Expected:
+#   1. Stage -1 sees NO_DAEMON=true → PROBE_DAEMON skipped entirely.
+#   2. DECIDE = use_subagent.
+#   3. Skill continues to "0. Dry-run gate" → "Wave Lifecycle" → ... exactly as today.
+```
+
+**Mode C (PR-set):**
+
+```bash
+# Preconditions: any. Mode C short-circuits Stage -1's daemon path.
+
+/loom:sweep --prs 200 201
+
+# Expected:
+#   1. PROBE_MODE = C (because --prs is present).
+#   2. DECIDE = use_subagent (regardless of daemon/pool state).
+#   3. Skill continues to "0. Dry-run gate" → "PR-set Wave Lifecycle" → ... exactly as today.
+```
+
+### What Stage -1 does NOT do
+
+- **Does not auto-start the daemon** if the pool exists but the daemon is unreachable. Auto-start is operator policy, not skill policy.
+- **Does not write `~/.loom/loom-daemon.sock` cleanup** for stale sockets. Stale-socket cleanup belongs to the daemon's own startup logic and to operator tools.
+- **Does not subscribe to the Phase B event bus.** Subscription is consumed by long-running monitors and the spawn loop, not by this skill. Phase D is dispatch-only.
+- **Does not retry probe failures.** Either probe returns within 500ms (or its natural latency) and is treated as authoritative; no retry, no backoff.
+- **Does not mutate any forge state** during the probes. `mcp__loom__list_sweeps` and the local pool checks are read-only. Even in the daemon path, mutation happens inside the daemon-side child sweep, not in this orchestrator session.
+- **Does not log to `.loom/daemon-state.json` or any daemon-owned state file.** Read-only access is fine for situational awareness; writes are forbidden (same constraint as the existing "Daemon Coexistence" section).
 
 ## 0. Dry-run gate (if `--dry-run`)
 
@@ -814,6 +1010,7 @@ The full `/sweep` design in #3298 includes many features that are intentionally 
 | `loom:operator-only` enforcement | **Implemented (#3360)** | Pre-flight skips issues with `loom:operator-only` (human action required: credentials, infra, hardware). Champion `--merge` mode also refuses to auto-promote them. |
 | Checkpoint/resume after kill | **Implemented (#3373)** | Per-issue phase checkpoint at `.loom/sweep-checkpoint/issue-<N>.json`. Sweep reads on entry and skips completed phases. No mid-builder recovery — kill during Builder resumes at builder start, worktree preserved by `worktree.sh` idempotency. Mode C reuses the helper keyed by the PR's closing-issue number (`closingIssuesReferences`); PRs without a `Closes #N` reference run without checkpointing. |
 | PR-set mode (`--prs` flag and PR NL triggers; Judge/Doctor/Merge from current PR label) | **Implemented (#3384)** | Mode C. Skips Curator, Approval gate, Builder. Size-1 waves. `--builders-per-wave` ignored. Reuses issue-keyed checkpoint via `closingIssuesReferences`. |
+| Daemon backend detection (Stage -1) | **Implemented (#3454)** | Strict-AND between daemon reachability and multi-account pool. Mode C and `--no-daemon` short-circuit to subagent. No implicit auto-start. Dispatch-only — Phase D does not subscribe to the event bus. See "Stage -1: Backend detection". |
 | `--max-waves` cap | Deferred | Operator-level brake on long sweeps. |
 | `--paused-merge` / `--no-judge` | Deferred | Merge-mode variants for trusted batches. |
 | `--include-blocked` (unblock pass) | Deferred | Currently `/sweep` skips `loom:blocked` issues outright. |
@@ -942,3 +1139,6 @@ These are deferred to Phase C (#3454) and Phase D follow-ups — do **not** impl
 - **PR-set mode (Mode C) design**: issue #3384
 - **Parallel-shepherd stall hazard**: issue #3289
 - **Checkpoint/resume design**: issue #3373 (Phase 0 of #3372 shepherd/daemon deprecation epic)
+- **Daemon backend detection (Stage -1)**: issue #3454 (Phase D of #3449 daemon rebuild epic)
+- **Daemon dispatch MCP tool (`mcp__loom__dispatch_sweep`)**: issue #3452 (Phase A of #3449)
+- **Daemon event bus (Phase B)**: issue #3453 (Phase B of #3449)
