@@ -22,7 +22,7 @@ from loom_tools.common.issue_failures import (
     record_success,
     save_failure_log,
 )
-from loom_tools.snapshot import filter_issues_by_failure_backoff
+from loom_tools.forge_snapshot import filter_issues_by_failure_backoff
 
 
 @pytest.fixture

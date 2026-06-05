@@ -220,41 +220,6 @@ class TestGatherBuilderDiagnostics:
         assert "T" in diag.worktree_mtime
         assert "Z" in diag.worktree_mtime
 
-    def test_populates_progress_info(self, tmp_path: Path):
-        """Verify progress file info is captured."""
-        repo = _make_repo(tmp_path)
-        wt = tmp_path / ".loom" / "worktrees" / "issue-42"
-        wt.mkdir(parents=True)
-        (wt / ".git").mkdir()
-
-        # Create progress file
-        progress_dir = tmp_path / ".loom" / "progress"
-        progress_dir.mkdir(parents=True)
-        (progress_dir / "shepherd-abc123.json").write_text(
-            json.dumps({
-                "task_id": "abc123",
-                "issue": 42,
-                "started_at": "2026-01-15T10:00:00Z",
-                "current_phase": "builder",
-                "last_heartbeat": "2026-01-15T10:25:00Z",
-                "milestones": [
-                    {"event": "started", "timestamp": "2026-01-15T10:00:00Z", "data": {"issue": 42}},
-                    {"event": "phase_entered", "timestamp": "2026-01-15T10:05:00Z", "data": {"phase": "builder"}},
-                ],
-            })
-        )
-
-        with patch("loom_tools.validate_phase._run_gh") as mock_gh:
-            mock_gh.return_value = _completed(stdout="loom:building\n")
-            diag = _gather_builder_diagnostics(42, str(wt), repo)
-
-        assert diag.progress_status == "builder"
-        assert diag.progress_started_at == "2026-01-15T10:00:00Z"
-        assert diag.progress_last_heartbeat == "2026-01-15T10:25:00Z"
-        assert diag.progress_milestones is not None
-        assert len(diag.progress_milestones) == 2
-        assert "started at 2026-01-15T10:00:00Z" in diag.progress_milestones[0]
-
     def test_strips_ansi_from_log_tail(self, tmp_path: Path):
         """Verify ANSI sequences are stripped from log output."""
         repo = _make_repo(tmp_path)

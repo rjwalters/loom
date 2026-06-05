@@ -199,7 +199,7 @@ def collect_snapshot(
 
     # Forge pipeline (10 parallel gh queries).
     if _pipeline_data is None:
-        from loom_tools.snapshot import collect_pipeline_data
+        from loom_tools.forge_snapshot import collect_pipeline_data
 
         try:
             pipeline = collect_pipeline_data(repo_root, ci_health_check_enabled=False)

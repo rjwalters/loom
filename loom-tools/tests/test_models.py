@@ -1,4 +1,9 @@
-"""Tests for model from_dict / to_dict round-trips using fixture data."""
+"""Tests for model from_dict / to_dict round-trips using fixture data.
+
+Phase 3.2 (#3399): DaemonState, ShepherdEntry, SupportRoleEntry, and Warning
+test classes removed — the daemon brain and its state file are deleted.
+The stub daemon_state.py exists only for Phase 3.4 fallback-path cleanup.
+"""
 
 from __future__ import annotations
 
@@ -7,13 +12,6 @@ import pathlib
 
 import pytest
 
-from loom_tools.models.daemon_state import (
-    DaemonState,
-    PipelineState,
-    ShepherdEntry,
-    SupportRoleEntry,
-    Warning,
-)
 from loom_tools.models.health import (
     Alert,
     AlertsFile,
@@ -35,153 +33,6 @@ FIXTURES = pathlib.Path(__file__).parent / "fixtures"
 
 def _load(name: str) -> dict:
     return json.loads((FIXTURES / name).read_text())
-
-
-# -- DaemonState -----------------------------------------------------------
-
-
-class TestDaemonState:
-    @pytest.fixture()
-    def raw(self) -> dict:
-        return _load("daemon-state.json")
-
-    def test_from_dict(self, raw: dict) -> None:
-        ds = DaemonState.from_dict(raw)
-        assert ds.iteration == 4
-        assert ds.running is False
-        assert ds.force_mode is True
-        assert ds.execution_mode == "direct"
-        assert len(ds.shepherds) == 3
-        assert ds.shepherds["shepherd-2"].status == "working"
-        assert ds.shepherds["shepherd-2"].issue == 1354
-        assert ds.shepherds["shepherd-1"].idle_reason == "task_not_found"
-        assert len(ds.support_roles) == 5
-        assert ds.support_roles["guide"].status == "running"
-
-    def test_pipeline_state(self, raw: dict) -> None:
-        ds = DaemonState.from_dict(raw)
-        ps = ds.pipeline_state
-        assert len(ps.ready) == 3
-        assert len(ps.building) == 3
-        assert ps.last_updated == "2026-01-27T04:26:10Z"
-
-    def test_round_trip(self, raw: dict) -> None:
-        ds = DaemonState.from_dict(raw)
-        out = ds.to_dict()
-        ds2 = DaemonState.from_dict(out)
-        assert ds2.iteration == ds.iteration
-        assert ds2.running == ds.running
-        assert len(ds2.shepherds) == len(ds.shepherds)
-        assert ds2.shepherds["shepherd-2"].issue == ds.shepherds["shepherd-2"].issue
-
-    def test_empty_dict(self) -> None:
-        ds = DaemonState.from_dict({})
-        assert ds.iteration == 0
-        assert ds.running is False
-        assert ds.shepherds == {}
-
-    def test_needs_human_input_default(self) -> None:
-        ds = DaemonState.from_dict({})
-        assert ds.needs_human_input == []
-
-    def test_needs_human_input_round_trip(self) -> None:
-        blockers = [
-            {"type": "approval_needed", "count": 2, "description": "2 curated issue(s) awaiting approval"},
-            {"type": "proposal_review", "count": 1, "description": "1 architect proposal(s) awaiting review"},
-        ]
-        ds = DaemonState(needs_human_input=blockers)
-        out = ds.to_dict()
-        assert out["needs_human_input"] == blockers
-        ds2 = DaemonState.from_dict(out)
-        assert ds2.needs_human_input == blockers
-
-    def test_needs_human_input_from_existing_state(self) -> None:
-        """needs_human_input field is preserved when loading existing state files."""
-        data = {
-            "running": True,
-            "iteration": 5,
-            "needs_human_input": [
-                {"type": "blocked", "count": 3, "description": "3 blocked issues"},
-            ],
-        }
-        ds = DaemonState.from_dict(data)
-        assert len(ds.needs_human_input) == 1
-        assert ds.needs_human_input[0]["type"] == "blocked"
-
-
-class TestShepherdEntry:
-    def test_idle_entry(self) -> None:
-        entry = ShepherdEntry.from_dict({
-            "status": "idle",
-            "issue": None,
-            "idle_since": "2026-01-27T04:29:30Z",
-            "idle_reason": "task_not_found",
-        })
-        assert entry.status == "idle"
-        assert entry.issue is None
-        assert entry.idle_reason == "task_not_found"
-
-    def test_to_dict_drops_none(self) -> None:
-        entry = ShepherdEntry(status="working", issue=42, task_id="abc")
-        d = entry.to_dict()
-        assert "idle_since" not in d
-        assert "idle_reason" not in d
-        assert d["issue"] == 42
-
-
-class TestSupportRoleEntry:
-    def test_round_trip(self) -> None:
-        data = {"status": "running", "task_id": "22", "started": "2026-01-27T04:18:07Z"}
-        entry = SupportRoleEntry.from_dict(data)
-        out = entry.to_dict()
-        assert out["status"] == "running"
-        assert out["task_id"] == "22"
-        assert "last_completed" not in out
-
-    def test_round_trip_with_tmux_session(self) -> None:
-        """Test tmux_session field (used by agent-spawn.sh execution model)."""
-        data = {
-            "status": "running",
-            "tmux_session": "loom-guide",
-            "started": "2026-01-27T04:18:07Z",
-        }
-        entry = SupportRoleEntry.from_dict(data)
-        assert entry.tmux_session == "loom-guide"
-        out = entry.to_dict()
-        assert out["status"] == "running"
-        assert out["tmux_session"] == "loom-guide"
-        assert "task_id" not in out  # task_id is None, should not appear
-
-    def test_both_task_id_and_tmux_session(self) -> None:
-        """Test that both identifiers can coexist (backward compatibility)."""
-        data = {
-            "status": "running",
-            "task_id": "abc1234",
-            "tmux_session": "loom-guide",
-            "started": "2026-01-27T04:18:07Z",
-        }
-        entry = SupportRoleEntry.from_dict(data)
-        assert entry.task_id == "abc1234"
-        assert entry.tmux_session == "loom-guide"
-        out = entry.to_dict()
-        assert out["task_id"] == "abc1234"
-        assert out["tmux_session"] == "loom-guide"
-
-
-class TestWarning:
-    def test_round_trip(self) -> None:
-        data = {
-            "time": "2026-01-23T11:10:00Z",
-            "type": "blocked_pr",
-            "severity": "warning",
-            "message": "PR #1059 has merge conflicts",
-            "context": {"pr_number": 1059},
-            "acknowledged": False,
-        }
-        w = Warning.from_dict(data)
-        assert w.type == "blocked_pr"
-        out = w.to_dict()
-        assert out == data
 
 
 # -- HealthMetrics ----------------------------------------------------------
