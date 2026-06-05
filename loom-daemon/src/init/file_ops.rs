@@ -83,6 +83,31 @@ pub fn copy_dir_with_report(
     prefix: &str,
     report: &mut InitReport,
 ) -> io::Result<()> {
+    copy_dir_with_report_filtered(src, dst, prefix, report, &|_| false)
+}
+
+/// Copy directory recursively with reporting, honoring a skip predicate.
+///
+/// Identical to [`copy_dir_with_report`] but consults `skip` for every file
+/// (paths are passed as the same defaults-relative path that callers see in
+/// `report.added` — i.e. `prefix/<file_name>` with `/` separators).
+///
+/// `skip` is called with a defaults-relative-style path string. Returning
+/// `true` causes the file to be omitted from the copy and from the report.
+/// Directories are walked unconditionally — the skip predicate decides per
+/// file, so a single skipped file inside a copied directory works as
+/// expected.
+///
+/// Used by `setup_repository_scaffolding` to keep Loom-internal skills
+/// (e.g. `.claude/commands/loom/release.md`, see issue #3464) out of
+/// consumer-installed `.claude/` trees.
+pub fn copy_dir_with_report_filtered(
+    src: &Path,
+    dst: &Path,
+    prefix: &str,
+    report: &mut InitReport,
+    skip: &dyn Fn(&str) -> bool,
+) -> io::Result<()> {
     fs::create_dir_all(dst)?;
 
     for entry in fs::read_dir(src)? {
@@ -94,8 +119,11 @@ pub fn copy_dir_with_report(
         let rel_path = format!("{}/{}", prefix, file_name.to_string_lossy());
 
         if file_type.is_dir() {
-            copy_dir_with_report(&src_path, &dst_path, &rel_path, report)?;
+            copy_dir_with_report_filtered(&src_path, &dst_path, &rel_path, report, skip)?;
         } else {
+            if skip(&rel_path) {
+                continue;
+            }
             let existed = dst_path.exists();
             fs::copy(&src_path, &dst_path)?;
             if existed {
@@ -209,6 +237,27 @@ pub fn force_merge_dir_with_report(
     prefix: &str,
     report: &mut InitReport,
 ) -> io::Result<()> {
+    force_merge_dir_with_report_filtered(src, dst, prefix, report, &|_| false)
+}
+
+/// Force-merge directory recursively with reporting, honoring a skip predicate.
+///
+/// Identical to [`force_merge_dir_with_report`] but consults `skip` for every
+/// file. Skipped source files are NOT copied and NOT reported as added /
+/// updated; if such a file already exists in the destination it is left in
+/// place (we do not delete user-resolved local copies — the consumer install
+/// path either never created the file in the first place, or it predates the
+/// skip rule).
+///
+/// See [`copy_dir_with_report_filtered`] for predicate semantics. Used by
+/// `setup_repository_scaffolding` for the `.claude/` reinstall path.
+pub fn force_merge_dir_with_report_filtered(
+    src: &Path,
+    dst: &Path,
+    prefix: &str,
+    report: &mut InitReport,
+    skip: &dyn Fn(&str) -> bool,
+) -> io::Result<()> {
     fs::create_dir_all(dst)?;
 
     // Collect files in source for comparison
@@ -242,8 +291,11 @@ pub fn force_merge_dir_with_report(
         let rel_path = format!("{}/{}", prefix, file_name.to_string_lossy());
 
         if file_type.is_dir() {
-            force_merge_dir_with_report(&src_path, &dst_path, &rel_path, report)?;
+            force_merge_dir_with_report_filtered(&src_path, &dst_path, &rel_path, report, skip)?;
         } else {
+            if skip(&rel_path) {
+                continue;
+            }
             let existed = dst_path.exists();
             // Always copy from source (overwrite if exists)
             fs::copy(&src_path, &dst_path)?;
@@ -560,6 +612,112 @@ mod tests {
             "Template-substituted files should not produce verification failures, got: {:?}",
             report.verification_failures
         );
+    }
+
+    #[test]
+    fn test_copy_dir_with_report_filtered_skips_matching_files() {
+        // Issue #3464: the skip predicate must drop matching files from
+        // both the copy and the report. The path passed to the predicate
+        // is the same rel_path used in report.added (prefix-joined).
+        let temp_dir = TempDir::new().unwrap();
+        let src = temp_dir.path().join("src");
+        let dst = temp_dir.path().join("dst");
+
+        // Mirror the real .claude/commands/loom/ shape that motivates the
+        // skip rule: a deeply nested file we want excluded sits next to
+        // files that must continue to ship.
+        fs::create_dir_all(src.join("commands").join("loom")).unwrap();
+        fs::write(src.join("commands").join("loom").join("builder.md"), "ship me").unwrap();
+        fs::write(src.join("commands").join("loom").join("judge.md"), "ship me").unwrap();
+        fs::write(src.join("commands").join("loom").join("release.md"), "loom-internal").unwrap();
+
+        let mut report = super::super::InitReport::default();
+        copy_dir_with_report_filtered(&src, &dst, ".claude", &mut report, &|p| {
+            p == ".claude/commands/loom/release.md"
+        })
+        .unwrap();
+
+        // release.md must NOT exist in the destination tree.
+        assert!(
+            !dst.join("commands")
+                .join("loom")
+                .join("release.md")
+                .exists(),
+            "skipped file must not be copied"
+        );
+        // builder.md and judge.md must exist (skip predicate is narrow).
+        assert!(dst
+            .join("commands")
+            .join("loom")
+            .join("builder.md")
+            .exists());
+        assert!(dst.join("commands").join("loom").join("judge.md").exists());
+
+        // Report bookkeeping: skipped file is not in `added`, but the
+        // siblings are.
+        assert!(report
+            .added
+            .contains(&".claude/commands/loom/builder.md".to_string()));
+        assert!(report
+            .added
+            .contains(&".claude/commands/loom/judge.md".to_string()));
+        assert!(!report
+            .added
+            .contains(&".claude/commands/loom/release.md".to_string()));
+    }
+
+    #[test]
+    fn test_force_merge_dir_with_report_filtered_skips_matching_files() {
+        // Issue #3464: reinstall path must also honor the skip predicate.
+        // We additionally pin the "skipped file is not reported as
+        // updated/added even when a stale copy exists in dst" behavior —
+        // existing local files are left as-is, not deleted.
+        let temp_dir = TempDir::new().unwrap();
+        let src = temp_dir.path().join("src");
+        let dst = temp_dir.path().join("dst");
+
+        fs::create_dir_all(src.join("commands").join("loom")).unwrap();
+        fs::write(src.join("commands").join("loom").join("builder.md"), "v2").unwrap();
+        fs::write(src.join("commands").join("loom").join("release.md"), "v2-internal").unwrap();
+
+        // Simulate a pre-existing (pre-skip-rule) install of release.md.
+        fs::create_dir_all(dst.join("commands").join("loom")).unwrap();
+        fs::write(dst.join("commands").join("loom").join("release.md"), "stale local copy")
+            .unwrap();
+        // And a custom command not in defaults — must be preserved.
+        fs::write(dst.join("commands").join("my-custom.md"), "mine").unwrap();
+
+        let mut report = super::super::InitReport::default();
+        force_merge_dir_with_report_filtered(&src, &dst, ".claude", &mut report, &|p| {
+            p == ".claude/commands/loom/release.md"
+        })
+        .unwrap();
+
+        // builder.md was updated from src.
+        let installed_builder =
+            fs::read_to_string(dst.join("commands").join("loom").join("builder.md")).unwrap();
+        assert_eq!(installed_builder, "v2");
+        assert!(report
+            .added
+            .contains(&".claude/commands/loom/builder.md".to_string()));
+
+        // release.md: the stale local copy is LEFT IN PLACE (we do not
+        // delete; install/uninstall ownership is decoupled). What matters
+        // for the leakage fix is that we did not write the v2 source over
+        // it AND did not report it as added/updated.
+        let stale =
+            fs::read_to_string(dst.join("commands").join("loom").join("release.md")).unwrap();
+        assert_eq!(stale, "stale local copy");
+        assert!(!report
+            .added
+            .iter()
+            .chain(report.updated.iter())
+            .any(|p| p == ".claude/commands/loom/release.md"));
+
+        // Custom command preserved (existing behavior).
+        assert!(report
+            .preserved
+            .contains(&".claude/commands/my-custom.md".to_string()));
     }
 
     #[test]

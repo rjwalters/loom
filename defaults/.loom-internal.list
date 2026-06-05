@@ -1,0 +1,21 @@
+# Loom-internal files — paths relative to defaults/ that the installer
+# MUST NOT copy into consumer repositories. Loom's own source checkout
+# still resolves these files via the working tree (they continue to live
+# under defaults/), but `loom-daemon init` and the install-side helpers
+# skip them when materializing a consumer repo.
+#
+# Format: one defaults-relative path per line. Lines starting with "#"
+# and blank lines are ignored. Trailing whitespace is stripped.
+#
+# Skip rules are exact-string matches against the defaults-relative path
+# (e.g. ".claude/commands/loom/release.md"). No globbing.
+#
+# Both install (loom-daemon/src/init/scaffolding.rs::setup_repository_scaffolding)
+# and uninstall (scripts/install/manifest.sh::_emit_installed_files_manifest)
+# consume this file. Keep additions narrow — every entry is a piece of
+# Loom-internal tooling that downstream consumers would otherwise see as
+# a stray `/loom:*` skill or auxiliary file.
+#
+# Tracked under issue #3464.
+
+.claude/commands/loom/release.md
