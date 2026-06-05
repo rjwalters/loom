@@ -989,6 +989,172 @@ echo ""
 
 
 # ==========================================================================
+# Section 5: Stale-File Sweep (Upgrade Path)
+# ==========================================================================
+# These tests exercise the stale-file sweep logic from install-loom.sh
+# (lines ~1097–1140). The sweep reads the previous install's installed_files
+# list from .loom/install-metadata.json, compares it against the new set, and
+# git-rm's any files present in the old list but absent from the new list.
+# The logic is mirrored inline here (like the diff_snapshot tests above) to
+# allow isolated verification without invoking the full install workflow.
+#
+# Helper: replicate the stale-file identification logic from install-loom.sh.
+# Arguments:
+#   $1  - path to install-metadata.json (may not exist)
+#   $2  - INSTALLED_FILES_JSON string (the new install's file list as JSON)
+# Prints one stale file path per line (empty output = no stale files).
+find_stale_files() {
+  local metadata_file="$1"
+  local new_files_json="$2"
+  if [[ ! -f "$metadata_file" ]]; then
+    return 0
+  fi
+  if ! command -v jq >/dev/null 2>&1; then
+    return 0
+  fi
+  while IFS= read -r prev_file; do
+    [[ -n "$prev_file" ]] || continue
+    if ! echo "$new_files_json" | grep -qF "\"${prev_file}\""; then
+      echo "$prev_file"
+    fi
+  done < <(jq -r '.installed_files[]' "$metadata_file")
+}
+
+echo "--- Section 5: Stale-File Sweep (Upgrade Path) ---"
+echo ""
+
+# Test 42: Fresh install — no previous install-metadata.json → sweep is skipped
+echo "Test 42: Fresh install (no previous metadata) skips stale-file sweep"
+FRESH_SWEEP_REPO="$TEST_DIR/fresh-sweep-test"
+create_temp_repo "$FRESH_SWEEP_REPO"
+simulate_loom_install "$FRESH_SWEEP_REPO"
+# Remove the metadata that simulate_loom_install wrote so we simulate
+# a repo that has never been installed before (no metadata.json present).
+rm -f "$FRESH_SWEEP_REPO/.loom/install-metadata.json"
+NEW_FILES_JSON='[".loom/scripts/worktree.sh",".loom/roles/builder.md"]'
+STALE=$(find_stale_files "$FRESH_SWEEP_REPO/.loom/install-metadata.json" "$NEW_FILES_JSON")
+if [[ -z "$STALE" ]]; then
+  pass "No stale files detected when metadata is absent (sweep skipped)"
+else
+  fail "Sweep returned stale files when metadata is absent: $STALE"
+fi
+echo ""
+
+# Test 43: Upgrade with removals — file in old metadata absent from new set →
+# that file is identified as stale and git-rm'd.
+echo "Test 43: Upgrade removes file absent from new defaults"
+UPGRADE_SWEEP_REPO="$TEST_DIR/upgrade-sweep-test"
+create_temp_repo "$UPGRADE_SWEEP_REPO"
+simulate_loom_install "$UPGRADE_SWEEP_REPO"
+
+# Create a fake stale file that was in the previous install but is no longer
+# shipped in the new defaults.  Commit it so git rm can remove it.
+STALE_FILE=".loom/scripts/some-deleted-file.sh"
+mkdir -p "$UPGRADE_SWEEP_REPO/.loom/scripts"
+echo "#!/bin/bash" > "$UPGRADE_SWEEP_REPO/$STALE_FILE"
+git -C "$UPGRADE_SWEEP_REPO" add "$STALE_FILE"
+git -C "$UPGRADE_SWEEP_REPO" commit -m "Add stale script" --quiet
+
+# Overwrite install-metadata.json to list the stale file as previously installed.
+# Note: install-metadata.json is gitignored (runtime artifact); write directly to
+# disk without committing, just as the real installer does.
+cat > "$UPGRADE_SWEEP_REPO/.loom/install-metadata.json" <<EOF
+{
+  "loom_version": "0.0.0-old",
+  "loom_commit": "old",
+  "install_date": "2026-01-01",
+  "loom_source": "$LOOM_ROOT",
+  "installed_files": ["$STALE_FILE"]
+}
+EOF
+
+# New install's file list does NOT include the stale file.
+NEW_FILES_JSON='[".loom/scripts/worktree.sh",".loom/roles/builder.md"]'
+
+# Identify stale files (mirrors the install-loom.sh identification step).
+STALE=$(find_stale_files "$UPGRADE_SWEEP_REPO/.loom/install-metadata.json" "$NEW_FILES_JSON")
+if [[ "$STALE" == "$STALE_FILE" ]]; then
+  pass "Stale file correctly identified: $STALE_FILE"
+else
+  fail "Expected stale file '$STALE_FILE', got: '$STALE'"
+fi
+
+# Apply the sweep (mirrors install-loom.sh's git-rm step) and verify removal.
+if [[ -n "$STALE" ]]; then
+  while IFS= read -r f; do
+    git -C "$UPGRADE_SWEEP_REPO" rm --quiet --force "$f" 2>/dev/null || true
+  done <<< "$STALE"
+fi
+if [[ ! -f "$UPGRADE_SWEEP_REPO/$STALE_FILE" ]]; then
+  pass "Stale file removed from working tree after sweep"
+else
+  fail "Stale file still present after sweep: $STALE_FILE"
+fi
+echo ""
+
+# Test 44: Operator-added file — a file present on disk but NOT listed in the
+# previous installed_files is NOT touched by the sweep.
+echo "Test 44: Operator-added file not in previous metadata is preserved"
+OPERATOR_SWEEP_REPO="$TEST_DIR/operator-sweep-test"
+create_temp_repo "$OPERATOR_SWEEP_REPO"
+simulate_loom_install "$OPERATOR_SWEEP_REPO"
+
+# Operator adds a custom script after installation; it is never in installed_files.
+OPERATOR_FILE=".loom/scripts/my-custom-helper.sh"
+mkdir -p "$OPERATOR_SWEEP_REPO/.loom/scripts"
+echo "#!/bin/bash" > "$OPERATOR_SWEEP_REPO/$OPERATOR_FILE"
+git -C "$OPERATOR_SWEEP_REPO" add "$OPERATOR_FILE"
+git -C "$OPERATOR_SWEEP_REPO" commit -m "Add operator custom helper" --quiet
+
+# Previous metadata lists only a different (genuinely stale) file, not the
+# operator file — exactly as would happen in a real upgrade scenario.
+# Note: install-metadata.json is gitignored (runtime artifact); write directly to
+# disk without committing, just as the real installer does.
+PREV_STALE_FILE=".loom/scripts/old-removed-helper.sh"
+cat > "$OPERATOR_SWEEP_REPO/.loom/install-metadata.json" <<EOF
+{
+  "loom_version": "0.0.0-old",
+  "loom_commit": "old",
+  "install_date": "2026-01-01",
+  "loom_source": "$LOOM_ROOT",
+  "installed_files": ["$PREV_STALE_FILE"]
+}
+EOF
+
+# New install's file list also does not include $PREV_STALE_FILE (it was removed),
+# and never mentioned $OPERATOR_FILE (it was operator-added).
+NEW_FILES_JSON='[".loom/scripts/worktree.sh",".loom/roles/builder.md"]'
+
+# Run the sweep: only $PREV_STALE_FILE should surface as stale.
+STALE=$(find_stale_files "$OPERATOR_SWEEP_REPO/.loom/install-metadata.json" "$NEW_FILES_JSON")
+if [[ "$STALE" == "$PREV_STALE_FILE" ]]; then
+  pass "Only previously-installed stale file identified (not the operator file)"
+else
+  fail "Unexpected stale files: '$STALE' (expected only '$PREV_STALE_FILE')"
+fi
+
+# Verify operator file is not in the stale list.
+if echo "$STALE" | grep -qF "$OPERATOR_FILE"; then
+  fail "Operator-added file incorrectly flagged as stale: $OPERATOR_FILE"
+else
+  pass "Operator-added file not in stale list (safe by construction)"
+fi
+
+# After applying the sweep the operator file must still be on disk.
+if [[ -n "$STALE" ]]; then
+  while IFS= read -r f; do
+    git -C "$OPERATOR_SWEEP_REPO" rm --quiet --force "$f" 2>/dev/null || true
+  done <<< "$STALE"
+fi
+if [[ -f "$OPERATOR_SWEEP_REPO/$OPERATOR_FILE" ]]; then
+  pass "Operator-added file preserved on disk after stale-file sweep"
+else
+  fail "Operator-added file was removed by stale-file sweep (should be preserved)"
+fi
+echo ""
+
+
+# ==========================================================================
 # Summary
 # ==========================================================================
 echo "======================================"
