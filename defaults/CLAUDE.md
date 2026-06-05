@@ -232,7 +232,7 @@ GitHub Actions workflows under `.github/workflows/loom-*.yml` provide a daemon-f
 2. Uncomment the `schedule:` / `- cron:` lines in each `.github/workflows/loom-*.yml` you want to enable.
 3. Optionally trigger a run via `workflow_dispatch` (the Actions UI's "Run workflow" button) to smoke-test before the next scheduled tick.
 
-Architect and Hermit cadence (work-generation triggers) is intentionally out of scope here — see follow-up #3381. Post-v0.10.0, the schedule-driven cron workflows are the recommended path for support roles since the Python daemon brain is removed. Operators who want support roles co-located with the issue-work pane can still run them in tmux via `./.loom/scripts/daemon.sh` (each pane gets its own rotated OAuth token, unlike the GH Actions workflows which use a single API key).
+Architect and Hermit cadence (work-generation triggers) is intentionally out of scope here — see follow-up #3381. Post-v0.10.0, the schedule-driven cron workflows are the recommended path for support roles since the Python daemon brain is removed. Operators who want support roles co-located with the issue-work pane can still run them in tmux via `./.loom/scripts/daemon.sh` (each pane gets its own rotated OAuth token, unlike the GH Actions workflows which use a single API key) — **but note: `./.loom/scripts/daemon.sh` is currently absent on `origin/main` (deleted in #3432, rebuild in flight under epic #3449, ~4-6 weeks); until that lands, use the GH Actions workflows or `./.loom/scripts/spawn-loop.sh`.**
 
 ## Agent Roles
 
@@ -306,7 +306,11 @@ Full role definitions with detailed guidelines are available in:
 - `.loom/roles/guide.md` - Issue triage and prioritization
 - `.loom/roles/auditor.md` - Main branch validation
 
-> **Note**: the historical `shepherd.md` (single-issue orchestrator) role file was removed in v0.10.0 along with the `/shepherd` slash command — see [the migration guide](../docs/migration/v0.10.0-shepherd-deprecation.md). Its orchestration responsibilities moved to `/loom:sweep` (Tier 1) and the spawn loop + GH Actions cron (Tier 2). The `loom.md` role file is preserved and documents the daemon-mode operator surface (`./.loom/scripts/daemon.sh` + tmux + token-rotated separate Claude Code sessions); the Python brain it historically referenced (`loom_tools/daemon_v2/`) is removed in v0.10.0, but the shell-level daemon surface stays. The worker-role markdown files above are unchanged.
+> **Stop-gap — daemon backend in flight (v0.10.0 rebuild, epic #3449)**
+>
+> `./.loom/scripts/daemon.sh` does not exist on `origin/main` as of v0.9.1; the dispatcher was deleted in #3432 and is being rebuilt in epic #3449 (~4-6 weeks, scheduled for v0.10.0). The note below describes the intended target state. Until Phase A through E of #3449 land, daemon operator commands (`./.loom/scripts/daemon.sh start|stop|status`) will fail with "no such file or directory". Use `./.loom/scripts/spawn-loop.sh` for headless multi-issue dispatch in the interim. Tracker: #3451 (this stop-gap), #3449 (rebuild epic).
+
+> **Note**: the historical `shepherd.md` (single-issue orchestrator) role file was removed in v0.10.0 along with the `/shepherd` slash command — see [the migration guide](../docs/migration/v0.10.0-shepherd-deprecation.md). Its orchestration responsibilities moved to `/loom:sweep` (Tier 1) and the spawn loop + GH Actions cron (Tier 2). The `loom.md` role file is preserved and documents the daemon-mode operator surface (`./.loom/scripts/daemon.sh` + tmux + token-rotated separate Claude Code sessions — see stop-gap warning above re: in-flight rebuild #3449); the Python brain it historically referenced (`loom_tools/daemon_v2/`) is removed in v0.10.0, but the shell-level daemon surface stays. The worker-role markdown files above are unchanged.
 
 ## Label-Based Workflow
 
@@ -614,6 +618,10 @@ An optional deterministic gate runs after the builder agent exits but before PR 
 Repos without a `buildGate` block see zero behavior change. See `.loom/docs/build-gate.md` for the full schema and failure semantics.
 
 ### Spawn-Loop Configuration (Tier 2)
+
+> **Stop-gap — daemon backend in flight (v0.10.0 rebuild, epic #3449)**
+>
+> The paragraph below claims `./.loom/scripts/daemon.sh` "now wraps the spawn loop with tmux + per-pane token rotation". On `origin/main` as of v0.9.1, that file does not exist (deleted in #3432, rebuild in flight under epic #3449, ~4-6 weeks). Until the rebuild lands, the only working multi-issue dispatch backend is `./.loom/scripts/spawn-loop.sh` (headless) or the GitHub Actions cron workflows.
 
 The spawn loop replaces the historical Python daemon brain. Its surface is intentionally narrow — there are no work-generation triggers, no pool-slot bookkeeping, and no state-file-based pipeline tracking. The shell-level daemon surface (`./.loom/scripts/daemon.sh`) is preserved and now wraps the spawn loop with tmux + per-pane token rotation. See [`.loom/docs/daemon-reference.md`](.loom/docs/daemon-reference.md) and [the migration guide](../docs/migration/v0.10.0-shepherd-deprecation.md) for details.
 
@@ -1494,6 +1502,10 @@ Or run the setup script to generate `.mcp.json` automatically:
 
 ## Migration: deprecations targeted for v0.10.0
 
+> **Stop-gap — daemon "preserved" claim is currently aspirational (epic #3449, stop-gap #3451)**
+>
+> The next paragraph says daemon mode "is preserved as a user-facing surface" and that `./.loom/scripts/daemon.sh` "continues to provide a tmux session container". On `origin/main` as of v0.9.1, `./.loom/scripts/daemon.sh` does **not** exist — it was deleted in #3432 and is being rebuilt in epic #3449 over an estimated 4-6 weeks for v0.10.0. The shepherd/Python-daemon-brain deletions are real and shipped; the daemon-shell rebuild is in flight. Until #3449 ships, use `./.loom/scripts/spawn-loop.sh` (headless) or GitHub Actions cron workflows.
+
 Loom is in the middle of an orchestration-architecture migration (epic #3372). In **v0.10.0** (the next planned minor release), the shepherd brain (`loom-tools/src/loom_tools/shepherd/`), the Python daemon brain (`loom-tools/src/loom_tools/daemon_v2/`), and the `/shepherd` slash command will be **deleted** in favour of a minimal spawn loop (#3374) + GitHub Actions workflows (#3375). **Daemon mode itself is preserved as a user-facing surface** — `./.loom/scripts/daemon.sh` continues to provide a tmux session container with multi-account token rotation, re-implemented around the spawn loop. The phased rollout is:
 
 | Phase | Issue | What ships | Status |
@@ -1525,6 +1537,10 @@ Loom is in the middle of an orchestration-architecture migration (epic #3372). I
 - Shell: `source .loom/scripts/lib/deprecation.sh; warn_deprecated <component> <replacement> [ref]` — the bash helper is safe to source (no side effects).
 
 ## Migrating off shepherd (downstream consumers, Phase 4 of #3372)
+
+> **Stop-gap reminder — daemon "preserved" claim is currently aspirational (epic #3449, stop-gap #3451)**
+>
+> The references to `./.loom/scripts/daemon.sh` below describe the intended v0.10.0 target state. As of v0.9.1, that file does **not** exist on `origin/main` (deleted in #3432, rebuild in flight under epic #3449, ~4-6 weeks). Until that lands, downstream consumers should treat the "daemon.sh preserved" prose as forward-looking and use `./.loom/scripts/spawn-loop.sh` (headless) or GitHub Actions cron workflows.
 
 If you installed Loom via `scripts/install-loom.sh` (or `install.sh`), the shepherd brain (`loom-tools/src/loom_tools/shepherd/`), the Python daemon brain (`loom-tools/src/loom_tools/daemon_v2/`), and the `/shepherd` slash command are scheduled for **deletion in v0.10.0** (Phase 3 of epic #3372, tracked as part of #3382). **The user-facing daemon mode surface — `./.loom/scripts/daemon.sh` + tmux + token rotation — is preserved**, just re-implemented around the spawn loop. This section is the migration guide for downstream consumers; it complements the upstream phase table in the section above.
 

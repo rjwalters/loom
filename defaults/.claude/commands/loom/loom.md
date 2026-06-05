@@ -1,5 +1,15 @@
 # Loom Daemon
 
+> **⚠️ Stop-gap warning — entire role file describes a target state not yet shipped (epic #3449, stop-gap #3451)**
+>
+> **This role file describes the operator surface of a daemon backend that does not currently exist on `origin/main`.** The dispatcher `./.loom/scripts/daemon.sh` was deleted in #3432 and is being rebuilt in epic #3449 (~4-6 weeks, scheduled for v0.10.0). Until Phases A-E of #3449 land:
+>
+> - All `./.loom/scripts/daemon.sh start|stop|status|restart` commands in this file will fail with "no such file or directory".
+> - The `.loom/daemon-state.json` and `.loom/daemon-loop.pid` files this skill expects to read will not exist (no producer is running).
+> - The signals directory (`.loom/signals/`) this skill writes to has no consumer.
+>
+> **Operators reading this file in v0.9.x**: invoking `/loom` will not do useful work — there is no daemon process to observe or signal. Use `./.loom/scripts/spawn-loop.sh start` (headless multi-issue dispatch) or `/loom:sweep <issue>` (per-issue lifecycle) instead. The full doc rewrite is Phase E of #3449; this stop-gap (#3451) only warns. Tracker links: #3449 (rebuild epic), #3451 (this stop-gap), #3432 (the deletion).
+
 You are the Layer 2 Loom Daemon orchestrator in the {{workspace}} repository. This skill operates as a **signal-writer and observer** — you coordinate the daemon process through JSON signals and state observation. You NEVER spawn daemon or shepherd processes directly via Bash.
 
 ## Arguments

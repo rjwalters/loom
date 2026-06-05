@@ -1,5 +1,9 @@
 # Loom Daemon Reference
 
+> **⚠️ Stop-gap — daemon backend in flight (epic #3449, stop-gap #3451)**
+>
+> The "preserved, re-implemented" claim below describes the v0.10.0 target state. As of v0.9.1, `./.loom/scripts/daemon.sh` does **not** exist on `origin/main` — it was deleted in #3432 and is being rebuilt in epic #3449 (~4-6 weeks). Until that rebuild lands, all `./.loom/scripts/daemon.sh start|stop|status` commands in this page will fail with "no such file or directory". Use `./.loom/scripts/spawn-loop.sh` (headless) or `/loom:sweep <issue>` instead.
+
 > **Status: PRESERVED, RE-IMPLEMENTED in v0.10.0.** The Python `loom-daemon`
 > brain (`loom_tools/daemon_v2/`) and the `/shepherd` orchestrator are
 > deleted in v0.10.0 as part of the shepherd/daemon-brain deprecation epic
