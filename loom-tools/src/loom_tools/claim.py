@@ -30,11 +30,6 @@ from loom_tools.common.state import read_json_file, write_json_file
 # Default TTL: 30 minutes
 DEFAULT_TTL = 1800
 
-# Default heartbeat staleness threshold: 5 minutes (300 seconds)
-DEFAULT_HEARTBEAT_STALE_THRESHOLD = int(
-    os.environ.get("LOOM_HEARTBEAT_STALE_THRESHOLD", "300")
-)
-
 # Threshold for claims without progress files: 10 minutes (600 seconds)
 NO_PROGRESS_FILE_THRESHOLD = 600
 
