@@ -20,7 +20,21 @@ use std::sync::{Arc, Mutex};
 #[derive(Parser)]
 #[command(name = "loom-daemon")]
 #[command(about = "Loom daemon for AI-powered development orchestration", long_about = None)]
-#[command(version = env!("CARGO_PKG_VERSION"))]
+// Embed git commit + build timestamp alongside the crate version so
+// `--version` distinguishes rebuilds of the same release. Motivated by
+// issue #3470: stale daemon binaries are otherwise indistinguishable from
+// fresh ones and cause hard-to-diagnose install regressions (#3287 class).
+// `LOOM_DAEMON_GIT_COMMIT` and `LOOM_DAEMON_BUILD_TIME` are populated by
+// `build.rs`; both fall back to "unknown" when the build host lacks the
+// tooling, which is loud but harmless.
+#[command(version = concat!(
+    env!("CARGO_PKG_VERSION"),
+    " (commit ",
+    env!("LOOM_DAEMON_GIT_COMMIT"),
+    ", built ",
+    env!("LOOM_DAEMON_BUILD_TIME"),
+    ")"
+))]
 struct Cli {
     #[command(subcommand)]
     command: Option<Commands>,
