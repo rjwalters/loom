@@ -48,6 +48,7 @@ class CleanupStats:
     skipped_editable: int = 0
     cleaned_branches: int = 0
     kept_branches: int = 0
+    errored_branches: int = 0
     killed_tmux: int = 0
     cleaned_config_dirs: int = 0
     errors: int = 0
@@ -609,16 +610,141 @@ def prune_orphaned_worktrees(
         log_warning(f"Error pruning worktrees: {e}")
 
 
+def _current_branch(repo_root: pathlib.Path) -> str | None:
+    """Return the currently checked-out branch name (or None if detached/error).
+
+    Used by :func:`clean_branches` to avoid deleting the branch the operator
+    is sitting on.
+    """
+    try:
+        result = subprocess.run(
+            ["git", "symbolic-ref", "--short", "HEAD"],
+            capture_output=True,
+            text=True,
+            cwd=repo_root,
+            check=False,
+        )
+        if result.returncode != 0:
+            return None
+        name = result.stdout.strip()
+        return name or None
+    except Exception:
+        return None
+
+
+def _checked_out_branches(repo_root: pathlib.Path) -> set[str]:
+    """Return the set of branch names currently checked out by ANY worktree.
+
+    ``git branch -D`` refuses to delete a branch that's checked out in
+    another worktree, but it's nicer to surface that as a "protected"
+    rule rather than letting the delete fail noisily. Reads
+    ``git worktree list --porcelain`` and harvests every ``branch
+    refs/heads/<name>`` line.
+    """
+    checked_out: set[str] = set()
+    try:
+        result = subprocess.run(
+            ["git", "worktree", "list", "--porcelain"],
+            capture_output=True,
+            text=True,
+            cwd=repo_root,
+            check=False,
+        )
+        if result.returncode != 0:
+            return checked_out
+        prefix = "branch refs/heads/"
+        for line in result.stdout.splitlines():
+            line = line.rstrip("\n")
+            if line.startswith(prefix):
+                checked_out.add(line[len(prefix) :].strip())
+    except Exception:
+        pass
+    return checked_out
+
+
+def _default_branch(repo_root: pathlib.Path) -> str | None:
+    """Return the upstream default branch (e.g. ``main``) or None.
+
+    Reads ``refs/remotes/origin/HEAD`` which is set by ``git clone`` / by
+    ``git remote set-head origin --auto``. Falls back to None when the ref
+    isn't configured (older clones, custom remotes) — the caller treats
+    ``main`` as a hard-coded safe default in that case.
+    """
+    try:
+        result = subprocess.run(
+            ["git", "symbolic-ref", "refs/remotes/origin/HEAD"],
+            capture_output=True,
+            text=True,
+            cwd=repo_root,
+            check=False,
+        )
+        if result.returncode != 0:
+            return None
+        # Output looks like "refs/remotes/origin/main" -> strip the prefix.
+        ref = result.stdout.strip()
+        prefix = "refs/remotes/origin/"
+        if ref.startswith(prefix):
+            return ref[len(prefix) :]
+        return None
+    except Exception:
+        return None
+
+
+def _remote_branch_exists(repo_root: pathlib.Path, branch: str) -> bool:
+    """Check whether ``refs/remotes/origin/<branch>`` exists locally.
+
+    Pure local probe — no network, no API. Used by :func:`clean_branches`
+    to detect branches whose remote tracking ref has been pruned (typically
+    after the upstream branch was deleted post-merge). Such branches are
+    "stale" regardless of their naming pattern.
+    """
+    try:
+        result = subprocess.run(
+            ["git", "show-ref", "--verify", "--quiet", f"refs/remotes/origin/{branch}"],
+            capture_output=True,
+            text=True,
+            cwd=repo_root,
+            check=False,
+        )
+        return result.returncode == 0
+    except Exception:
+        # Fail closed: if we can't probe, claim the remote exists so we
+        # don't delete a branch on a transient git error.
+        return True
+
+
 def clean_branches(
     repo_root: pathlib.Path,
     stats: CleanupStats,
     dry_run: bool = False,
     force: bool = False,
 ) -> None:
-    """Clean up branches for closed issues."""
+    """Clean up local branches that are stale or for closed issues.
+
+    Two-pass strategy (see #3471 for the history — the previous single-pass
+    implementation silently skipped ~100% of stale branches because the
+    name filter only matched ``feature/issue-*``):
+
+    1. **Generic stale-detection pass.** For every local branch (except
+       the default branch and the currently-checked-out branch), check
+       whether ``refs/remotes/origin/<branch>`` still exists. If the
+       remote ref has been pruned (typical after upstream deletes the
+       branch post-merge), the branch is stale and is deleted. This pass
+       is pattern-agnostic — it catches ``pr-*``, ``fix/*``, ``feat/*``,
+       ``docs/*``, and bare-named branches that the old filter missed.
+
+    2. **Issue-state pass.** Branches that *do* still have a remote and
+       match the ``feature/issue-*`` naming convention are then probed
+       against the forge: if the corresponding issue is CLOSED, the
+       branch is deleted. This catches the "issue closed but PR still
+       open" edge case (rare, but worth keeping).
+    """
     try:
+        # Use --format to avoid the "* "/"+ " marker noise that ``git
+        # branch`` adds for the current/linked-worktree branches. Parsing
+        # those markers manually is fragile (see #3471 history).
         result = subprocess.run(
-            ["git", "branch"],
+            ["git", "branch", "--format=%(refname:short)"],
             capture_output=True,
             text=True,
             cwd=repo_root,
@@ -627,31 +753,89 @@ def clean_branches(
     except Exception:
         branches = []
 
-    feature_branches = []
+    normalized: list[str] = []
     for branch in branches:
-        branch = branch.strip().lstrip("* ")
-        if branch.startswith(NamingConventions.BRANCH_PREFIX):
-            feature_branches.append(branch)
+        branch = branch.strip()
+        if branch:
+            normalized.append(branch)
 
-    if not feature_branches:
-        log_success("No feature branches found")
+    if not normalized:
+        log_success("No local branches found")
         return
 
-    for branch in feature_branches:
-        # Extract issue number
+    # Branches we must never touch:
+    #   - the default branch (``origin/HEAD`` target),
+    #   - ``main`` as a hard fallback when the default isn't configured,
+    #   - the currently-checked-out branch (deleting your own checkout
+    #     is a bad time),
+    #   - any branch checked out in another worktree (git refuses to
+    #     delete those anyway; surfacing them as "protected" keeps the
+    #     log clean).
+    default = _default_branch(repo_root)
+    current = _current_branch(repo_root)
+    protected: set[str] = {"main"}
+    if default:
+        protected.add(default)
+    if current:
+        protected.add(current)
+    protected |= _checked_out_branches(repo_root)
+
+    # ------------------------------------------------------------------
+    # Pass 1: generic stale-detection via remote-ref existence probe.
+    # ------------------------------------------------------------------
+    issue_pass_candidates: list[str] = []
+    for branch in normalized:
+        if branch in protected:
+            continue
+
+        if not _remote_branch_exists(repo_root, branch):
+            # Remote ref is gone -> branch is stale (upstream deleted it,
+            # typically post-merge). Delete regardless of naming pattern.
+            print(f"  Stale (no origin/{branch}) - deleting {branch}")
+            if dry_run:
+                stats.cleaned_branches += 1
+                continue
+            try:
+                subprocess.run(
+                    ["git", "branch", "-D", branch],
+                    capture_output=True,
+                    text=True,
+                    cwd=repo_root,
+                    check=True,
+                )
+                stats.cleaned_branches += 1
+            except Exception:
+                stats.errors += 1
+        else:
+            # Remote still exists -> defer to issue-state pass below.
+            issue_pass_candidates.append(branch)
+
+    # ------------------------------------------------------------------
+    # Pass 2: issue-state probe for ``feature/issue-*`` branches whose
+    # remote still exists. Catches "issue closed but PR still open" cases.
+    # ------------------------------------------------------------------
+    for branch in issue_pass_candidates:
+        if not branch.startswith(NamingConventions.BRANCH_PREFIX):
+            continue
+
         issue_num = NamingConventions.issue_from_branch(branch)
         if issue_num is None:
             continue
 
-        # Check issue status
+        # Check issue status. Pin gh to the repo root so we don't
+        # accidentally inherit the cwd of an unrelated worktree (#3471).
         try:
             result = gh_run(
                 ["issue", "view", str(issue_num), "--json", "state", "--jq", ".state"],
                 check=False,
+                cwd=repo_root,
             )
-            status = result.stdout.strip() if result.returncode == 0 else "NOT_FOUND"
-        except Exception:
+            exit_code = result.returncode
+            status = result.stdout.strip() if exit_code == 0 else "NOT_FOUND"
+        except Exception as exc:
+            exit_code = -1
             status = "NOT_FOUND"
+            log_warning(f"  gh issue view raised for #{issue_num} ({branch}): {exc}")
 
         if status == "CLOSED":
             print(f"  Issue #{issue_num} CLOSED - deleting {branch}")
@@ -672,6 +856,15 @@ def clean_branches(
         elif status == "OPEN":
             print(f"  Issue #{issue_num} OPEN - keeping {branch}")
             stats.kept_branches += 1
+        else:
+            # Don't silently fall through. Surface the gh failure so the
+            # operator can investigate (auth, repo mismatch, network, etc.)
+            # and keep the branch (state is unknown — fail closed).
+            log_warning(
+                f"  Could not probe issue #{issue_num} for {branch}: "
+                f"gh exit code {exit_code}"
+            )
+            stats.errored_branches += 1
 
 
 def _list_loom_tmux_sessions() -> list[str]:
@@ -1542,12 +1735,14 @@ def print_summary(stats: CleanupStats, dry_run: bool = False, safe_mode: bool = 
         print(f"  Skipped (grace period): {stats.skipped_grace}")
         print(f"  Skipped (uncommitted): {stats.skipped_uncommitted}")
 
-    if stats.cleaned_branches > 0 or stats.kept_branches > 0:
+    if stats.cleaned_branches > 0 or stats.kept_branches > 0 or stats.errored_branches > 0:
         if dry_run:
             print(f"  Would delete: {stats.cleaned_branches} branch(es)")
         else:
             print(f"  Deleted: {stats.cleaned_branches} branch(es)")
         print(f"  Kept: {stats.kept_branches} branch(es)")
+        if stats.errored_branches > 0:
+            print(f"  Errored (gh probe failed): {stats.errored_branches} branch(es)")
 
     if stats.killed_tmux > 0:
         if dry_run:
