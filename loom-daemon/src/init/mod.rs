@@ -1013,6 +1013,152 @@ mod tests {
     }
 
     #[test]
+    fn test_docs_subdirectory_copied_on_fresh_install() {
+        // Regression-guard for issue #3470: the `.loom/docs/` managed
+        // directory (containing static reference docs like
+        // `ci-integration.md` from issue #3333) must be copied during
+        // initialization. The line-169 `sync_managed_dir(..., "docs", ...)`
+        // call already exists on main — this test prevents the entry from
+        // silently being deleted or refactored away in the future, which
+        // would re-introduce the v0.10 field failure where consumers got
+        // `MISSING: .loom/docs/ci-integration.md` from the post-install
+        // metadata verification (the #3287 safety net).
+        let temp_dir = TempDir::new().unwrap();
+        let workspace = temp_dir.path();
+        let defaults = temp_dir.path().join("defaults");
+
+        fs::create_dir(workspace.join(".git")).unwrap();
+
+        // Create defaults mirroring the real shape, including `.loom/docs/`
+        // with the file that triggered the original failure.
+        fs::create_dir_all(defaults.join("roles")).unwrap();
+        fs::create_dir_all(defaults.join("docs")).unwrap();
+        fs::write(defaults.join("config.json"), "{}").unwrap();
+        fs::write(defaults.join("roles").join("builder.md"), "builder").unwrap();
+        fs::write(
+            defaults.join("docs").join("ci-integration.md"),
+            "# CI Integration\n\nStatic reference documentation.",
+        )
+        .unwrap();
+        // A second doc, to confirm we copy the whole directory and not
+        // just one named file.
+        fs::write(
+            defaults.join("docs").join("troubleshooting.md"),
+            "# Troubleshooting\n\nMore docs.",
+        )
+        .unwrap();
+
+        let result =
+            initialize_workspace(workspace.to_str().unwrap(), defaults.to_str().unwrap(), false);
+
+        assert!(result.is_ok(), "init failed: {:?}", result.err());
+        let report = result.unwrap();
+
+        // The `.loom/docs/` directory must exist on disk post-init.
+        let docs_dir = workspace.join(".loom").join("docs");
+        assert!(docs_dir.exists(), ".loom/docs/ directory should exist");
+        assert!(docs_dir.is_dir(), ".loom/docs/ should be a directory");
+
+        // The specific file the field failure flagged must be present.
+        let ci_md = docs_dir.join("ci-integration.md");
+        assert!(
+            ci_md.exists(),
+            ".loom/docs/ci-integration.md should exist (this is the file the \
+             v0.10 install regression reported as MISSING in issue #3470)"
+        );
+        let content = fs::read_to_string(&ci_md).unwrap();
+        assert_eq!(content, "# CI Integration\n\nStatic reference documentation.");
+
+        // The sibling doc must also be present (whole-directory copy).
+        let troubleshooting = docs_dir.join("troubleshooting.md");
+        assert!(troubleshooting.exists(), ".loom/docs/troubleshooting.md should exist");
+
+        // Report bookkeeping: both docs files should be tracked as added.
+        assert!(
+            report
+                .added
+                .contains(&".loom/docs/ci-integration.md".to_string()),
+            "Report should include docs/ci-integration.md, got: {:?}",
+            report.added
+        );
+        assert!(
+            report
+                .added
+                .contains(&".loom/docs/troubleshooting.md".to_string()),
+            "Report should include docs/troubleshooting.md, got: {:?}",
+            report.added
+        );
+
+        // No verification failures: the fail-fast assertion inside
+        // sync_managed_dir (the #3220/#3287 safety net) should be quiet,
+        // and the post-copy `verify_all_copied_files` walk over the docs
+        // dir should not produce any content mismatches.
+        assert!(
+            report.verification_failures.is_empty(),
+            "Expected no verification failures, got: {:?}",
+            report.verification_failures
+        );
+    }
+
+    #[test]
+    fn test_docs_subdirectory_restored_on_reinstall() {
+        // Reinstall analog of test_docs_subdirectory_copied_on_fresh_install:
+        // the docs dir must be cleaned and re-copied so stale files are
+        // removed and updated content lands. This pins the #3470 fix on
+        // the reinstall path (which is the path the field failure
+        // exercised — Studio was upgrading v0.9 -> v0.10).
+        let temp_dir = TempDir::new().unwrap();
+        let workspace = temp_dir.path();
+        let defaults = temp_dir.path().join("defaults");
+
+        fs::create_dir(workspace.join(".git")).unwrap();
+
+        // Defaults with updated docs.
+        fs::create_dir_all(defaults.join("roles")).unwrap();
+        fs::create_dir_all(defaults.join("docs")).unwrap();
+        fs::write(defaults.join("config.json"), "{}").unwrap();
+        fs::write(defaults.join("roles").join("builder.md"), "builder").unwrap();
+        fs::write(defaults.join("docs").join("ci-integration.md"), "# CI Integration v2").unwrap();
+
+        // Pre-existing install with stale content + a stale file.
+        fs::create_dir_all(workspace.join(".loom").join("docs")).unwrap();
+        fs::write(
+            workspace
+                .join(".loom")
+                .join("docs")
+                .join("ci-integration.md"),
+            "# CI Integration v1 (old)",
+        )
+        .unwrap();
+        fs::write(workspace.join(".loom").join("docs").join("obsolete-doc.md"), "stale").unwrap();
+
+        let result =
+            initialize_workspace(workspace.to_str().unwrap(), defaults.to_str().unwrap(), false);
+
+        assert!(result.is_ok(), "reinstall failed: {:?}", result.err());
+        let report = result.unwrap();
+
+        // Updated file has new content.
+        let ci_md = workspace
+            .join(".loom")
+            .join("docs")
+            .join("ci-integration.md");
+        let content = fs::read_to_string(&ci_md).unwrap();
+        assert_eq!(content, "# CI Integration v2");
+
+        // Stale file removed.
+        let obsolete = workspace.join(".loom").join("docs").join("obsolete-doc.md");
+        assert!(!obsolete.exists(), "Stale docs file should be removed on reinstall");
+        assert!(
+            report
+                .removed
+                .contains(&".loom/docs/obsolete-doc.md".to_string()),
+            "Report should list obsolete-doc.md as removed, got: {:?}",
+            report.removed
+        );
+    }
+
+    #[test]
     fn test_filter_preserved_from_verification_failures_removes_preserved() {
         // Files preserved by merge strategy must not appear as verification failures
         // (this is the regression case from issue #3218).
