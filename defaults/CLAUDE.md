@@ -661,11 +661,16 @@ See [`.loom/docs/daemon-reference.md`](.loom/docs/daemon-reference.md) for the w
 
 ### Model Selection Strategy
 
-Loom subagents inherit the model of the parent conversation. Agent definitions do not specify a `model:` field in their frontmatter, so the model used depends on how the parent session was launched. This avoids per-model quota bucket exhaustion where a hardcoded model assignment causes rate limit failures even when other model quotas are available.
+Model selection is a first-class orchestration concern (issue #3477, Phase 1). Each worker's model is resolved through a fixed precedence chain — highest first:
 
-Each role ships JSON metadata with a `suggestedModel` field that records the historically-validated model for that role. The metadata is informational only — Claude Code subagent routing still inherits from the parent conversation.
+1. **Explicit dispatch param** — `mcp__loom__dispatch_sweep`'s optional `model` argument (daemon path), an explicit `--model` flag passed to `spawn-claude.sh` / `claude-wrapper.sh`, or an operator-requested model for an in-session sweep.
+2. **Workspace override** — `.loom/config.json` → `terminals[].roleConfig.model` (optional). Pin exact IDs here (e.g., `claude-sonnet-4-6`) when your workspace needs deterministic cost/behavior.
+3. **Role default** — `.loom/roles/<role>.json` → `suggestedModel` (ships as an alias). The `/loom:sweep` skill passes the resolved model to role subagents via the Task tool's `model` parameter.
+4. **Session default** — when nothing above resolves, NO `--model` flag (and no Task `model` param) is emitted at all, and the worker inherits the parent session/CLI default. This is the zero-config behavior: nothing configured means nothing changes.
 
-**Suggested models by role**:
+The spawn plumbing also honors a `LOOM_MODEL` environment variable (`spawn-claude.sh`, `claude-wrapper.sh`): it is injected as `--model <value>` unless an explicit `--model` is already present in the args. Retries inside `claude-wrapper.sh` always reuse the same model — re-consulting policy on retry (attempt-based escalation) is deliberately out of scope for Phase 1.
+
+**Suggested models by role** (`suggestedModel`, live as the role-default tier):
 
 | Role | Model | Rationale |
 |------|-------|-----------|
@@ -679,11 +684,32 @@ Each role ships JSON metadata with a `suggestedModel` field that records the his
 | Guide | `sonnet` | Triage is systematic |
 | Driver | `sonnet` | General-purpose default |
 
-**Valid model values**: `haiku`, `sonnet`, `opus`
+**Valid model values**: aliases (`haiku`, `sonnet`, `opus`) or pinned model IDs (e.g., `claude-sonnet-4-6`).
 
 - **haiku**: Fast, cheap - for simple status checks and monitoring
 - **sonnet**: Balanced - for structured tasks with clear criteria
 - **opus**: Most capable - for complex reasoning and implementation
+
+**Aliases vs pinned IDs**: shipped role JSONs use aliases so defaults stay sensible across model releases with zero maintenance. The GitHub Actions cron workflows (`.github/workflows/loom-*.yml`) are the exception — they pin exact IDs because scheduled support roles are predictable, cost-sensitive load and a stale pin is visible and cheap to bump in the consuming repo.
+
+**Workspace override example** (`.loom/config.json`):
+
+```json
+{
+  "terminals": [
+    {
+      "id": "terminal-1",
+      "name": "Builder",
+      "role": "claude-code-worker",
+      "roleConfig": {
+        "workerType": "claude",
+        "roleFile": "builder.md",
+        "model": "claude-sonnet-4-6"
+      }
+    }
+  ]
+}
+```
 
 ### Custom Roles
 

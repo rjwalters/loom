@@ -130,6 +130,12 @@ Inputs:
   A only fully implements `Issue`; `PrSet` is rejected by the registry.
 - `idempotency_key` (optional) — dedup key. Running sweeps with the same
   key return the existing `sweep_id` without spawning a new child.
+- `model` (optional, issue #3477 Phase 1) — Claude model for the spawned
+  child, as an alias (`sonnet`, `opus`, `haiku`) or a pinned ID
+  (`claude-sonnet-4-6`). Forwarded as `--model <value>` on the
+  `spawn-claude.sh` argv. When omitted (or empty), NO `--model` flag is
+  emitted and the child inherits the session/CLI default. The field is
+  `#[serde(default)]` on the wire, so pre-#3477 clients remain compatible.
 
 ### `list_sweeps` (Phase A)
 

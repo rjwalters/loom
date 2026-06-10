@@ -134,9 +134,20 @@ pub enum Request {
     /// If a `Running` sweep with the same key exists, the existing `sweep_id`
     /// is returned with no new spawn. If the matching sweep has `Exited` or
     /// `Crashed`, a new sweep is spawned.
+    ///
+    /// `model` (issue #3477, Phase 1) optionally selects the Claude model for
+    /// the spawned child. When `Some`, the daemon appends `--model <value>`
+    /// to the `spawn-claude.sh` invocation — the highest-precedence tier of
+    /// the model chain (explicit dispatch param, then workspace
+    /// `roleConfig.model`, then role `suggestedModel`, then session default).
+    /// When `None` (or absent on the wire — `#[serde(default)]` keeps
+    /// existing clients compatible), NO `--model` flag is emitted and the
+    /// session/CLI default is preserved.
     DispatchSweep {
         kind: SweepKind,
         idempotency_key: Option<String>,
+        #[serde(default)]
+        model: Option<String>,
     },
     /// List tracked sweeps, optionally filtered by state.
     ListSweeps {
