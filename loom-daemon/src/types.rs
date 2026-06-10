@@ -453,6 +453,15 @@ pub struct SweepInfo {
     /// future phases (Phase A always sets this to `None`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pr_number: Option<i32>,
+    /// Model requested at dispatch time (issue #3482, Phase 3a
+    /// observability). Mirrors the `model` param of `DispatchSweep`:
+    /// `Some(value)` when an explicit non-empty model was supplied,
+    /// `None` otherwise — consumers should render `None` as "default"
+    /// (the child inherited the session/CLI default; no `--model` flag
+    /// was emitted). `#[serde(default)]` keeps pre-#3482 wire data and
+    /// clients compatible.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
 }
 
 // ========================================================================

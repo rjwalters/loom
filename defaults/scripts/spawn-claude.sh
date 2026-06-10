@@ -112,25 +112,46 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-# --- Model selection (issue #3477, Phase 1) ---
+# --- Model selection (issue #3477, Phase 1; observability #3482, Phase 3a) ---
 # Precedence: explicit `--model` in the passthrough args > LOOM_MODEL env >
 # nothing (session/CLI default — no --model flag emitted at all).
-if [[ -n "${LOOM_MODEL:-}" ]]; then
-    _has_model_arg=false
-    for _arg in ${PASSTHROUGH_ARGS[@]+"${PASSTHROUGH_ARGS[@]}"}; do
-        case "$_arg" in
-            --model|--model=*)
-                _has_model_arg=true
-                break
-                ;;
-        esac
-    done
-    if [[ "$_has_model_arg" == "false" ]]; then
-        PASSTHROUGH_ARGS+=(--model "$LOOM_MODEL")
-        log_info "spawn-claude: using model '$LOOM_MODEL' (from LOOM_MODEL)"
-    else
+#
+# Observability (#3482): exactly ONE structured `spawn-claude: model=<value>`
+# line is emitted on every spawn, covering all three precedence cases —
+# including `model=default` when nothing is configured. The line is
+# stderr-only and changes NO spawn behavior; downstream log scrapers key on
+# the `model=` token.
+_explicit_model=""
+_has_model_arg=false
+_prev_was_model_flag=false
+for _arg in ${PASSTHROUGH_ARGS[@]+"${PASSTHROUGH_ARGS[@]}"}; do
+    if [[ "$_prev_was_model_flag" == "true" ]]; then
+        _explicit_model="$_arg"
+        _prev_was_model_flag=false
+        continue
+    fi
+    case "$_arg" in
+        --model)
+            _has_model_arg=true
+            _prev_was_model_flag=true
+            ;;
+        --model=*)
+            _has_model_arg=true
+            _explicit_model="${_arg#--model=}"
+            ;;
+    esac
+done
+
+if [[ "$_has_model_arg" == "true" ]]; then
+    if [[ -n "${LOOM_MODEL:-}" ]]; then
         log_info "spawn-claude: explicit --model in args wins over LOOM_MODEL='$LOOM_MODEL'"
     fi
+    log_info "spawn-claude: model=${_explicit_model:-default} (from --model arg)"
+elif [[ -n "${LOOM_MODEL:-}" ]]; then
+    PASSTHROUGH_ARGS+=(--model "$LOOM_MODEL")
+    log_info "spawn-claude: model=$LOOM_MODEL (from LOOM_MODEL)"
+else
+    log_info "spawn-claude: model=default"
 fi
 
 # --- Locate loom_tools package source ---

@@ -208,6 +208,77 @@ fi
 out=$("$CHECKPOINT" attempt 50)
 assert_eq "attempt cleared after attempt-less rewrite" "" "$out"
 
+# --- Optional model field (#3482, Phase 3a per-model observability) ---
+
+# 24. write with --model round-trips through read and model
+assert "write doctor-done with --model" "$CHECKPOINT" write 60 doctor-done --task-id t --pr-number 321 --attempt 2 --model claude-opus-4-8
+out=$("$CHECKPOINT" read 60)
+if echo "$out" | grep -q '"model": "claude-opus-4-8"'; then
+    echo "PASS: model persisted as string in JSON"
+    PASS=$((PASS + 1))
+else
+    echo "FAIL: model missing or wrong: $out" >&2
+    FAIL=$((FAIL + 1))
+fi
+out=$("$CHECKPOINT" model 60)
+assert_eq "model command reads back claude-opus-4-8" "claude-opus-4-8" "$out"
+
+# 25. pr_number and attempt still intact alongside model
+out=$("$CHECKPOINT" read 60)
+if echo "$out" | grep -q '"pr_number": 321' && echo "$out" | grep -q '"attempt": 2'; then
+    echo "PASS: pr_number and attempt coexist with model"
+    PASS=$((PASS + 1))
+else
+    echo "FAIL: pr_number/attempt lost when model present: $out" >&2
+    FAIL=$((FAIL + 1))
+fi
+
+# 26. Backward compat: write WITHOUT --model omits the field entirely
+"$CHECKPOINT" write 61 builder-done --task-id t >/dev/null
+out=$("$CHECKPOINT" read 61)
+if echo "$out" | grep -q '"model"'; then
+    echo "FAIL: model field should be omitted when not provided: $out" >&2
+    FAIL=$((FAIL + 1))
+else
+    echo "PASS: model field omitted when not provided"
+    PASS=$((PASS + 1))
+fi
+
+# 27. Legacy checkpoint (no model field): model prints empty, exit 0
+out=$("$CHECKPOINT" model 61)
+assert_eq "model is empty on legacy checkpoint (= default/unknown)" "" "$out"
+assert_exit "model on legacy checkpoint exits 0" 0 "$CHECKPOINT" model 61
+
+# 28. Legacy checkpoint read path unaffected (phase still resolves)
+out=$("$CHECKPOINT" phase 61)
+assert_eq "phase still reads on model-less checkpoint" "builder-done" "$out"
+
+# 29. model on missing checkpoint: empty output, exit 0 (mirrors phase/attempt)
+out=$("$CHECKPOINT" model 9999)
+assert_eq "model is empty when no checkpoint" "" "$out"
+assert_exit "model on missing checkpoint exits 0" 0 "$CHECKPOINT" model 9999
+
+# 30. Invalid --model values rejected with exit 1 (JSON-unsafe charset)
+assert_exit "model with quote exits 1" 1 "$CHECKPOINT" write 62 doctor-done --model 'op"us'
+assert_exit "model with space exits 1" 1 "$CHECKPOINT" write 62 doctor-done --model 'op us'
+if "$CHECKPOINT" exists 62 >/dev/null 2>&1; then
+    echo "FAIL: rejected --model write should not create a checkpoint" >&2
+    FAIL=$((FAIL + 1))
+else
+    echo "PASS: rejected --model write leaves no checkpoint behind"
+    PASS=$((PASS + 1))
+fi
+
+# 31. Alias model values accepted (sonnet/opus/haiku)
+assert "alias model 'sonnet' accepted" "$CHECKPOINT" write 63 judge-done --model sonnet
+out=$("$CHECKPOINT" model 63)
+assert_eq "alias model reads back" "sonnet" "$out"
+
+# 32. Overwrite a model-bearing checkpoint without --model drops the field
+"$CHECKPOINT" write 60 doctor-done --task-id t >/dev/null
+out=$("$CHECKPOINT" model 60)
+assert_eq "model cleared after model-less rewrite" "" "$out"
+
 echo
 echo "Results: $PASS passed, $FAIL failed"
 [[ $FAIL -eq 0 ]] || exit 1

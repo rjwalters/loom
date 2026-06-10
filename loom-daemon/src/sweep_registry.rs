@@ -333,7 +333,11 @@ impl SweepRegistry {
             .spawn_child(issue_number, &log_path, &sweep_id, model)
             .context("failed to spawn sweep child")?;
 
-        // 6. Record the entry.
+        // 6. Record the entry. The model is carried on the registry entry
+        //    (#3482, Phase 3a observability) so `list_sweeps` /
+        //    `get_sweep_status` can report which model a sweep runs. Empty
+        //    strings are normalized to None, matching the spawn-side rule
+        //    that `--model ""` is never emitted.
         let info = SweepInfo {
             sweep_id: sweep_id.clone(),
             kind: kind.clone(),
@@ -345,6 +349,7 @@ impl SweepRegistry {
             state: SweepState::Running,
             latest_phase: None,
             pr_number: None,
+            model: model.filter(|m| !m.is_empty()).map(String::from),
         };
         self.entries.insert(sweep_id.clone(), info);
 
@@ -909,6 +914,9 @@ impl SweepRegistry {
                         state: SweepState::Running,
                         latest_phase: None,
                         pr_number: None,
+                        // Lock owner.json does not record the model; the
+                        // dispatching daemon instance is gone (#3482).
+                        model: None,
                     },
                 );
                 admitted += 1;
@@ -958,6 +966,7 @@ impl SweepRegistry {
                         state: SweepState::Crashed { at: Utc::now() },
                         latest_phase: phase,
                         pr_number: None,
+                        model: None, // not recoverable from a checkpoint-only entry
                     },
                 );
                 admitted += 1;
@@ -1276,6 +1285,8 @@ exit 0
             !recorded.contains("--model"),
             "model=None must not emit --model; got: {recorded}"
         );
+        // #3482: model=None dispatches record no model on the entry.
+        assert_eq!(registry.get(&outcome.sweep_id).unwrap().model, None);
 
         // The lock dir should exist while Running.
         let lock = dir.path().join(".loom").join("locks").join("issue-42");
@@ -1304,6 +1315,13 @@ exit 0
             recorded.contains("argv: -p /loom:sweep 43 --model claude-sonnet-4-6"),
             "expected --model in argv; got: {recorded}"
         );
+        // #3482 (Phase 3a): the dispatch model is carried on the registry
+        // entry so list_sweeps / get_sweep_status report it.
+        assert_eq!(
+            registry.get(&outcome.sweep_id).unwrap().model.as_deref(),
+            Some("claude-sonnet-4-6"),
+            "dispatch model must be recorded on the SweepInfo entry"
+        );
     }
 
     /// Issue #3477: an empty-string model is treated as unset — `--model ""`
@@ -1328,6 +1346,12 @@ exit 0
         assert!(
             !recorded.contains("--model"),
             "empty model must not emit --model; got: {recorded}"
+        );
+        // #3482: empty-string model normalizes to None on the entry too.
+        assert_eq!(
+            registry.get(&outcome.sweep_id).unwrap().model,
+            None,
+            "empty model must be recorded as None on the SweepInfo entry"
         );
     }
 
@@ -1442,6 +1466,7 @@ exit 0
                 state: SweepState::Running,
                 latest_phase: None,
                 pr_number: None,
+                model: None,
             },
         );
 
@@ -1511,6 +1536,7 @@ exit 0
                 state: SweepState::Running,
                 latest_phase: None,
                 pr_number: None,
+                model: None,
             },
         );
 
@@ -1562,6 +1588,7 @@ exit 0
                 state: SweepState::Running,
                 latest_phase: None,
                 pr_number: None,
+                model: None,
             },
         );
 
@@ -1595,6 +1622,7 @@ exit 0
                 state: SweepState::Running,
                 latest_phase: None,
                 pr_number: None,
+                model: None,
             },
         );
 
@@ -1791,6 +1819,7 @@ exit 0
             state: SweepState::Running,
             latest_phase: Some("builder".to_string()),
             pr_number: Some(456),
+            model: Some("claude-sonnet-4-6".to_string()),
         };
         let json = serde_json::to_value(vec![info]).unwrap();
         let expected = serde_json::json!([{
@@ -1804,10 +1833,32 @@ exit 0
             "state": {"state": "Running"},
             "latest_phase": "builder",
             "pr_number": 456,
+            "model": "claude-sonnet-4-6",
         }]);
         assert_eq!(
             json, expected,
             "SweepInfo wire schema drifted — update the snapshot intentionally if this is desired"
+        );
+
+        // model=None is omitted from the wire (skip_serializing_if), and
+        // pre-#3482 JSON without the field deserializes to model=None —
+        // the backward-compat half of the schema pin.
+        let legacy_json = serde_json::json!({
+            "sweep_id": "sweep-issue-43-1700000000",
+            "kind": {"type": "Issue", "value": 43},
+            "pid": 1,
+            "token_name": "unknown",
+            "log_path": ".loom/logs/sweep-issue-43.log",
+            "started_at": "2026-06-05T10:00:00Z",
+            "state": {"state": "Running"},
+        });
+        let legacy: SweepInfo =
+            serde_json::from_value(legacy_json).expect("legacy SweepInfo without model must parse");
+        assert_eq!(legacy.model, None);
+        let reserialized = serde_json::to_value(&legacy).unwrap();
+        assert!(
+            reserialized.get("model").is_none(),
+            "model=None must be omitted from serialized SweepInfo"
         );
 
         // Also pin the variant shapes for Exited and Crashed.
@@ -1866,6 +1917,7 @@ exit 0
                 state: SweepState::Running,
                 latest_phase: Some("builder".into()),
                 pr_number: None,
+                model: None,
             },
         );
 
@@ -1902,6 +1954,7 @@ exit 0
                 state: SweepState::Running,
                 latest_phase: None,
                 pr_number: None,
+                model: None,
             },
         );
 
@@ -1960,6 +2013,7 @@ exit 0
                 },
                 latest_phase: None,
                 pr_number: None,
+                model: None,
             },
         );
 
@@ -1996,6 +2050,7 @@ exit 0
                 state: SweepState::Running,
                 latest_phase: None,
                 pr_number: None,
+                model: None,
             },
         );
 
@@ -2050,6 +2105,7 @@ exit 0
                 state: SweepState::Running,
                 latest_phase: None,
                 pr_number: None,
+                model: None,
             },
         );
 
@@ -2101,6 +2157,7 @@ exit 0
                 state: SweepState::Running,
                 latest_phase: None,
                 pr_number: None,
+                model: None,
             },
         );
 
