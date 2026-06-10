@@ -1029,8 +1029,12 @@ mod tests {
 
         fs::create_dir(workspace.join(".git")).unwrap();
 
-        // Create defaults mirroring the real shape, including `.loom/docs/`
-        // with the file that triggered the original failure.
+        // Create defaults mirroring the real shipped shape: docs live at
+        // `defaults/docs/` alongside `defaults/roles/` (issue #3476 moved
+        // them there from `defaults/.loom/docs/`, which `sync_managed_dir`
+        // never looked at). The companion test
+        // `test_real_defaults_tree_ships_docs_at_top_level` pins the actual
+        // shipped tree to this layout so the two can't silently diverge.
         fs::create_dir_all(defaults.join("roles")).unwrap();
         fs::create_dir_all(defaults.join("docs")).unwrap();
         fs::write(defaults.join("config.json"), "{}").unwrap();
@@ -1155,6 +1159,57 @@ mod tests {
                 .contains(&".loom/docs/obsolete-doc.md".to_string()),
             "Report should list obsolete-doc.md as removed, got: {:?}",
             report.removed
+        );
+    }
+
+    #[test]
+    fn test_real_defaults_tree_ships_docs_at_top_level() {
+        // Regression guard for #3476 Bug 2. The tempdir tests above fabricate
+        // a defaults/ layout, so they structurally cannot catch the failure
+        // mode where the SHIPPED tree diverges from what `sync_managed_dir`
+        // expects: v0.10.0 shipped docs at `defaults/.loom/docs/` while
+        // `sync_managed_dir(&defaults, ..., "docs", ...)` resolved
+        // `defaults/docs/`, so the copy silently no-oped and real installs
+        // failed the #3287 metadata check with
+        // `MISSING: .loom/docs/ci-integration.md`.
+        //
+        // This test runs against the actual repository tree (resolved via
+        // CARGO_MANIFEST_DIR) and asserts every managed dir that
+        // `initialize_workspace` syncs — including docs — exists at the
+        // top level of defaults/ where `sync_managed_dir` will find it.
+        let defaults = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("loom-daemon/ has a parent")
+            .join("defaults");
+        assert!(
+            defaults.is_dir(),
+            "shipped defaults/ tree not found at {defaults:?} — did the repo layout change?"
+        );
+
+        for dir_name in &["roles", "scripts", "hooks", "docs"] {
+            let managed = defaults.join(dir_name);
+            assert!(
+                managed.is_dir(),
+                "defaults/{dir_name}/ is missing — sync_managed_dir(\"{dir_name}\") would \
+                 silently no-op and installs would diverge from the manifest (#3476)"
+            );
+        }
+
+        // The specific file the field failure flagged.
+        assert!(
+            defaults.join("docs").join("ci-integration.md").is_file(),
+            "defaults/docs/ci-integration.md missing — the #3287 metadata guard would \
+             report it MISSING on every install (#3476)"
+        );
+
+        // The old nested location must stay gone: a file reappearing at
+        // defaults/.loom/docs/ would be manifest-listed (via the `.loom/*`
+        // literal rule in scripts/install/manifest.sh) but never copied by
+        // sync_managed_dir — the exact divergence this issue fixed.
+        assert!(
+            !defaults.join(".loom").join("docs").exists(),
+            "defaults/.loom/docs/ has reappeared — docs must live at defaults/docs/ \
+             so sync_managed_dir copies them (#3476)"
         );
     }
 
