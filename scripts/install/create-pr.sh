@@ -242,7 +242,7 @@ info "Creating pull request..."
 # The marker line `loom-install: true` is separator-isolated on its own line
 # so trivially greppable from CI scripts that read PR bodies via API. The
 # trailing `docs-only: true` line provides a second machine-detectable
-# signal. See defaults/.loom/docs/ci-integration.md for opt-in patterns.
+# signal. See defaults/docs/ci-integration.md for opt-in patterns.
 #
 # When PR_BODY is set in the environment, it FULLY OVERRIDES the default —
 # no marker injection occurs (composability with custom install scripts).
