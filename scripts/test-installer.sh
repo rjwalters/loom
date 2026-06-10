@@ -992,13 +992,16 @@ echo ""
 # Section 5: Stale-File Sweep (Upgrade Path)
 # ==========================================================================
 # These tests exercise the stale-file sweep logic from install-loom.sh
-# (lines ~1097–1140). The sweep reads the previous install's installed_files
-# list from .loom/install-metadata.json, compares it against the new set, and
-# git-rm's any files present in the old list but absent from the new list.
+# (the "Stale-file sweep (upgrade path)" loop). The sweep reads the previous
+# install's installed_files list from .loom/install-metadata.json, compares it
+# against the new set, and git-rm's any files present in the old list but
+# absent from the new list.
 # The logic is mirrored inline here (like the diff_snapshot tests above) to
 # allow isolated verification without invoking the full install workflow.
 #
-# Helper: replicate the stale-file identification logic from install-loom.sh.
+# Helper: replicate the stale-file identification logic from install-loom.sh,
+# INCLUDING the consumer-owned carve-out (#3450, #3480). Keep the case
+# statement in sync with the one in install-loom.sh.
 # Arguments:
 #   $1  - path to install-metadata.json (may not exist)
 #   $2  - INSTALLED_FILES_JSON string (the new install's file list as JSON)
@@ -1014,10 +1017,37 @@ find_stale_files() {
   fi
   while IFS= read -r prev_file; do
     [[ -n "$prev_file" ]] || continue
+    # Mirror of the consumer-owned carve-out in install-loom.sh: .github/
+    # is an allowlist of Loom-shipped files; anything else under .github/
+    # is consumer-owned by default and never swept.
+    case "$prev_file" in
+      CLAUDE.md|.gitignore|.claude/settings.json)
+        continue
+        ;;
+      .github/labels.yml|.github/CONFIGURATION.md|.github/ISSUE_TEMPLATE/config.yml|.github/ISSUE_TEMPLATE/task.yml)
+        # Loom-shipped — fall through to the sweep.
+        ;;
+      .github/*)
+        # Consumer-owned by default.
+        continue
+        ;;
+    esac
     if ! echo "$new_files_json" | grep -qF "\"${prev_file}\""; then
       echo "$prev_file"
     fi
   done < <(jq -r '.installed_files[]' "$metadata_file")
+}
+
+# Guard: the carve-out case statement above is a hand-maintained mirror of the
+# one in install-loom.sh. Fail loudly if the allowlist drifts.
+assert_carveout_in_sync() {
+  local expected=".github/labels.yml|.github/CONFIGURATION.md|.github/ISSUE_TEMPLATE/config.yml|.github/ISSUE_TEMPLATE/task.yml"
+  if grep -qF "$expected" "$SCRIPT_DIR/install-loom.sh" \
+    && grep -qF "$expected" "$SCRIPT_DIR/uninstall-loom.sh"; then
+    pass "Carve-out allowlist present in install-loom.sh and uninstall-loom.sh"
+  else
+    fail "Carve-out allowlist drifted between test mirror, install-loom.sh, and uninstall-loom.sh"
+  fi
 }
 
 echo "--- Section 5: Stale-File Sweep (Upgrade Path) ---"
@@ -1151,6 +1181,99 @@ if [[ -f "$OPERATOR_SWEEP_REPO/$OPERATOR_FILE" ]]; then
 else
   fail "Operator-added file was removed by stale-file sweep (should be preserved)"
 fi
+echo ""
+
+# Test 44b: Consumer-owned .github/ files captured by an over-broad legacy
+# manifest (v0.7.x, #3450) survive the sweep, while genuinely stale
+# Loom-shipped .github/ files are still swept (#3480 — rjwalters/vibesql#5168).
+echo "Test 44b: Consumer .github/ files in over-broad manifest survive sweep"
+GITHUB_SWEEP_REPO="$TEST_DIR/github-sweep-test"
+create_temp_repo "$GITHUB_SWEEP_REPO"
+simulate_loom_install "$GITHUB_SWEEP_REPO"
+
+# Consumer-owned .github files (the exact shapes deleted in vibesql#5168).
+CONSUMER_ACTION=".github/actions/foo/action.yml"
+CONSUMER_DEPENDABOT=".github/dependabot.yml"
+CONSUMER_TOPLEVEL=".github/consumer.json"
+mkdir -p "$GITHUB_SWEEP_REPO/.github/actions/foo"
+echo "name: foo" > "$GITHUB_SWEEP_REPO/$CONSUMER_ACTION"
+echo "version: 2" > "$GITHUB_SWEEP_REPO/$CONSUMER_DEPENDABOT"
+echo "{}" > "$GITHUB_SWEEP_REPO/$CONSUMER_TOPLEVEL"
+
+# A Loom-shipped .github file that the new version no longer ships — this
+# one MUST still be swept (the allowlist lets it fall through).
+STALE_LOOM_GH_FILE=".github/CONFIGURATION.md"
+mkdir -p "$GITHUB_SWEEP_REPO/.github"
+echo "# Loom configuration" > "$GITHUB_SWEEP_REPO/$STALE_LOOM_GH_FILE"
+
+git -C "$GITHUB_SWEEP_REPO" add .github
+git -C "$GITHUB_SWEEP_REPO" commit -m "Consumer .github files + legacy Loom file" --quiet
+
+# Over-broad previous manifest: lists consumer files (the v0.7.x bug), the
+# stale Loom-shipped file, and a still-shipped allowlisted file.
+cat > "$GITHUB_SWEEP_REPO/.loom/install-metadata.json" <<EOF
+{
+  "loom_version": "0.7.1",
+  "loom_commit": "old",
+  "install_date": "2026-01-01",
+  "loom_source": "$LOOM_ROOT",
+  "installed_files": ["$CONSUMER_ACTION","$CONSUMER_DEPENDABOT","$CONSUMER_TOPLEVEL","$STALE_LOOM_GH_FILE",".github/labels.yml"]
+}
+EOF
+
+# New install ships labels.yml but no longer ships CONFIGURATION.md, and of
+# course never shipped the consumer files.
+NEW_FILES_JSON='[".github/labels.yml",".loom/roles/builder.md"]'
+
+STALE=$(find_stale_files "$GITHUB_SWEEP_REPO/.loom/install-metadata.json" "$NEW_FILES_JSON")
+
+# Consumer files must NOT surface as stale.
+GITHUB_SWEEP_OK=true
+for consumer_file in "$CONSUMER_ACTION" "$CONSUMER_DEPENDABOT" "$CONSUMER_TOPLEVEL"; do
+  if echo "$STALE" | grep -qF "$consumer_file"; then
+    fail "Consumer-owned file incorrectly flagged as stale: $consumer_file"
+    GITHUB_SWEEP_OK=false
+  fi
+done
+if [[ "$GITHUB_SWEEP_OK" == "true" ]]; then
+  pass "Consumer-owned .github/ files not flagged as stale (allowlist default-skip)"
+fi
+
+# The stale Loom-shipped .github file MUST surface as stale.
+if echo "$STALE" | grep -qF "$STALE_LOOM_GH_FILE"; then
+  pass "Stale Loom-shipped .github file still identified: $STALE_LOOM_GH_FILE"
+else
+  fail "Stale Loom-shipped .github file not identified (expected '$STALE_LOOM_GH_FILE' in: '$STALE')"
+fi
+
+# Allowlisted file present in both sets must NOT be flagged (regression).
+if echo "$STALE" | grep -qF ".github/labels.yml"; then
+  fail "Still-shipped .github/labels.yml incorrectly flagged as stale"
+else
+  pass "Still-shipped allowlisted file (.github/labels.yml) not flagged as stale"
+fi
+
+# Apply the sweep; consumer files survive on disk, stale Loom file is gone.
+if [[ -n "$STALE" ]]; then
+  while IFS= read -r f; do
+    git -C "$GITHUB_SWEEP_REPO" rm --quiet --force "$f" 2>/dev/null || true
+  done <<< "$STALE"
+fi
+if [[ -f "$GITHUB_SWEEP_REPO/$CONSUMER_ACTION" ]] \
+  && [[ -f "$GITHUB_SWEEP_REPO/$CONSUMER_DEPENDABOT" ]] \
+  && [[ -f "$GITHUB_SWEEP_REPO/$CONSUMER_TOPLEVEL" ]]; then
+  pass "Consumer-owned .github/ files preserved on disk after sweep"
+else
+  fail "Consumer-owned .github/ file(s) deleted by sweep (vibesql#5168 regression)"
+fi
+if [[ ! -f "$GITHUB_SWEEP_REPO/$STALE_LOOM_GH_FILE" ]]; then
+  pass "Stale Loom-shipped .github file removed by sweep"
+else
+  fail "Stale Loom-shipped .github file still present after sweep: $STALE_LOOM_GH_FILE"
+fi
+
+# Drift guard: the test mirror's allowlist must match both real scripts.
+assert_carveout_in_sync
 echo ""
 
 

@@ -1093,25 +1093,28 @@ if [[ -f "$TARGET_PATH/.loom/install-metadata.json" ]] && command -v jq >/dev/nu
   while IFS= read -r prev_file; do
     [[ -n "$prev_file" ]] || continue
 
-    # Defense-in-depth (#3450): never sweep files in Loom's "consumer-owned"
-    # carve-out, even if they appear in the previous manifest. Mirrors the
-    # uninstall-side skip list.
+    # Defense-in-depth (#3450, #3480): never sweep files in Loom's
+    # "consumer-owned" carve-out, even if they appear in the previous
+    # manifest. Mirrors the uninstall-side skip list.
+    #
+    # .github/ is an ALLOWLIST: only the files Loom actually ships into
+    # targets (source of truth: defaults/.github/ as walked by
+    # scripts/install/manifest.sh) fall through to the sweep. Everything
+    # else under .github/ — consumer workflows, composite actions,
+    # dependabot.yml, etc. — is consumer-owned by default and never swept,
+    # even when a legacy over-broad manifest (v0.7.x, #3450) lists it.
+    # If Loom ever ships new .github/ files (e.g. workflows), add those
+    # exact paths here AND in scripts/uninstall-loom.sh.
     case "$prev_file" in
       CLAUDE.md|.gitignore|.claude/settings.json)
         continue
         ;;
-      .github/workflows/*)
-        # Loom doesn't ship any workflows under .github/workflows/ today.
-        continue
+      .github/labels.yml|.github/CONFIGURATION.md|.github/ISSUE_TEMPLATE/config.yml|.github/ISSUE_TEMPLATE/task.yml)
+        # Loom-shipped — fall through to the sweep.
         ;;
-      .github/ISSUE_TEMPLATE/*)
-        case "$prev_file" in
-          .github/ISSUE_TEMPLATE/config.yml|.github/ISSUE_TEMPLATE/task.yml)
-            ;;
-          *)
-            continue
-            ;;
-        esac
+      .github/*)
+        # Consumer-owned by default.
+        continue
         ;;
     esac
 
