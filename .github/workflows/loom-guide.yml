@@ -35,4 +35,7 @@ jobs:
         env:
           ANTHROPIC_API_KEY: ${{ secrets.CLAUDE_API_KEY }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: claude -p "/guide" --dangerously-skip-permissions
+        # Pinned model ID per the role mapping (issue #3477, Phase 1): cron
+        # support roles are predictable, cost-sensitive load, so they pin an
+        # exact ID rather than an alias. Bump deliberately on lineup changes.
+        run: claude -p "/guide" --model claude-sonnet-4-6 --dangerously-skip-permissions

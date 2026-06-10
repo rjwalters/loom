@@ -277,10 +277,16 @@ impl SweepRegistry {
     /// Dispatch a sweep. See module docs.
     ///
     /// On idempotency hit returns the existing entry with `was_new = false`.
+    ///
+    /// `model` (issue #3477): when `Some` and non-empty, the spawned child
+    /// receives `--model <value>` appended to the `spawn-claude.sh` argv.
+    /// When `None`, no `--model` flag is emitted at all — the session/CLI
+    /// default is preserved end-to-end.
     pub fn dispatch(
         &mut self,
         kind: &SweepKind,
         idempotency_key: Option<String>,
+        model: Option<&str>,
     ) -> Result<DispatchOutcome> {
         // 1. Idempotency dedup against Running entries.
         if let Some(ref key) = idempotency_key {
@@ -324,7 +330,7 @@ impl SweepRegistry {
         // 5. Compute the log path and spawn the child.
         let log_path = self.compute_log_path(issue_number);
         let (pid, token_name) = self
-            .spawn_child(issue_number, &log_path, &sweep_id)
+            .spawn_child(issue_number, &log_path, &sweep_id, model)
             .context("failed to spawn sweep child")?;
 
         // 6. Record the entry.
@@ -489,7 +495,13 @@ impl SweepRegistry {
             .join(format!("sweep-issue-{issue}.log"))
     }
 
-    fn spawn_child(&self, issue: u32, log_path: &Path, sweep_id: &str) -> Result<(u32, String)> {
+    fn spawn_child(
+        &self,
+        issue: u32,
+        log_path: &Path,
+        sweep_id: &str,
+        model: Option<&str>,
+    ) -> Result<(u32, String)> {
         let spawn_bin = self.config.resolve_spawn_bin()?;
 
         // Ensure log dir exists.
@@ -524,9 +536,17 @@ impl SweepRegistry {
 
         let prompt = format!("/loom:sweep {issue}");
         let mut cmd = Command::new(&spawn_bin);
-        cmd.arg("-p")
-            .arg(&prompt)
-            .env("LOOM_TERMINAL_ID", format!("daemon-{sweep_id}"))
+        cmd.arg("-p").arg(&prompt);
+        // Model selection (issue #3477, Phase 1): the dispatch-param tier of
+        // the precedence chain. Appended as an explicit `--model` arg (which
+        // beats any ambient LOOM_MODEL env inside spawn-claude.sh). Empty
+        // strings are treated as unset — `--model ""` must never be emitted.
+        if let Some(m) = model {
+            if !m.is_empty() {
+                cmd.arg("--model").arg(m);
+            }
+        }
+        cmd.env("LOOM_TERMINAL_ID", format!("daemon-{sweep_id}"))
             // Always pin LOOM_WORKSPACE to the registry's configured root so
             // spawn-claude.sh resolves `.loom/tokens/` from the same place
             // the daemon thinks the workspace is — never inheriting an
@@ -1217,7 +1237,7 @@ exit 0
         let (mut registry, record_log) = fixture_registry(dir.path());
 
         let outcome = registry
-            .dispatch(&SweepKind::Issue(42), None)
+            .dispatch(&SweepKind::Issue(42), None, None)
             .expect("dispatch should succeed");
 
         assert!(outcome.was_new);
@@ -1250,10 +1270,65 @@ exit 0
             recorded.contains("argv: -p /loom:sweep 42"),
             "expected argv in recorded log; got: {recorded}"
         );
+        // Issue #3477 zero-behavior-change criterion: with model=None the
+        // spawned command must NOT receive a --model flag at all.
+        assert!(
+            !recorded.contains("--model"),
+            "model=None must not emit --model; got: {recorded}"
+        );
 
         // The lock dir should exist while Running.
         let lock = dir.path().join(".loom").join("locks").join("issue-42");
         assert!(lock.exists(), "expected lock dir at {}", lock.display());
+    }
+
+    /// Issue #3477 (Phase 1): a `model` dispatch param threads through to
+    /// the spawn command as an explicit `--model <value>` argument.
+    #[test]
+    #[serial]
+    fn dispatch_with_model_appends_model_arg() {
+        let dir = tempdir().unwrap();
+        let (mut registry, record_log) = fixture_registry(dir.path());
+
+        let outcome = registry
+            .dispatch(&SweepKind::Issue(43), None, Some("claude-sonnet-4-6"))
+            .expect("dispatch should succeed");
+
+        let needle = format!("LOOM_TERMINAL_ID=daemon-{}", outcome.sweep_id);
+        assert!(
+            wait_for_contents(&record_log, &needle, 10000),
+            "fake spawn-claude.sh did not finish writing within 10s"
+        );
+        let recorded = std::fs::read_to_string(&record_log).unwrap();
+        assert!(
+            recorded.contains("argv: -p /loom:sweep 43 --model claude-sonnet-4-6"),
+            "expected --model in argv; got: {recorded}"
+        );
+    }
+
+    /// Issue #3477: an empty-string model is treated as unset — `--model ""`
+    /// must never be emitted (acceptance criterion: no flag at all, not an
+    /// empty flag).
+    #[test]
+    #[serial]
+    fn dispatch_with_empty_model_emits_no_model_flag() {
+        let dir = tempdir().unwrap();
+        let (mut registry, record_log) = fixture_registry(dir.path());
+
+        let outcome = registry
+            .dispatch(&SweepKind::Issue(44), None, Some(""))
+            .expect("dispatch should succeed");
+
+        let needle = format!("LOOM_TERMINAL_ID=daemon-{}", outcome.sweep_id);
+        assert!(
+            wait_for_contents(&record_log, &needle, 10000),
+            "fake spawn-claude.sh did not finish writing within 10s"
+        );
+        let recorded = std::fs::read_to_string(&record_log).unwrap();
+        assert!(
+            !recorded.contains("--model"),
+            "empty model must not emit --model; got: {recorded}"
+        );
     }
 
     #[test]
@@ -1262,10 +1337,10 @@ exit 0
         let dir = tempdir().unwrap();
         let (mut registry, _record_log) = fixture_registry(dir.path());
 
-        let first = registry.dispatch(&SweepKind::Issue(7), None);
+        let first = registry.dispatch(&SweepKind::Issue(7), None, None);
         assert!(first.is_ok());
 
-        let second = registry.dispatch(&SweepKind::Issue(7), None);
+        let second = registry.dispatch(&SweepKind::Issue(7), None, None);
         assert!(second.is_err(), "second dispatch for issue #7 should fail (lock collision)");
         let err = second.unwrap_err().to_string();
         assert!(err.contains("lock collision"), "expected lock collision error; got: {err}");
@@ -1278,7 +1353,7 @@ exit 0
         let (mut registry, _record_log) = fixture_registry(dir.path());
 
         let first = registry
-            .dispatch(&SweepKind::Issue(99), Some("key-A".to_string()))
+            .dispatch(&SweepKind::Issue(99), Some("key-A".to_string()), None)
             .unwrap();
         assert!(first.was_new);
 
@@ -1286,7 +1361,7 @@ exit 0
         // Issue #99 is the same kind, but we don't need a different issue —
         // the dedup is purely on the idempotency key.
         let second = registry
-            .dispatch(&SweepKind::Issue(99), Some("key-A".to_string()))
+            .dispatch(&SweepKind::Issue(99), Some("key-A".to_string()), None)
             .unwrap();
         assert!(!second.was_new);
         assert_eq!(first.sweep_id, second.sweep_id);
@@ -1297,7 +1372,7 @@ exit 0
         let dir = tempdir().unwrap();
         let (mut registry, _record_log) = fixture_registry(dir.path());
 
-        let outcome = registry.dispatch(&SweepKind::PrSet(vec![1, 2, 3]), None);
+        let outcome = registry.dispatch(&SweepKind::PrSet(vec![1, 2, 3]), None, None);
         assert!(outcome.is_err());
         assert!(outcome
             .unwrap_err()
@@ -1311,7 +1386,9 @@ exit 0
         let (mut registry, _record_log) = fixture_registry(dir.path());
 
         // Dispatch and then poke an entry into Exited state directly.
-        let outcome = registry.dispatch(&SweepKind::Issue(11), None).unwrap();
+        let outcome = registry
+            .dispatch(&SweepKind::Issue(11), None, None)
+            .unwrap();
         let entry = registry.entries.get_mut(&outcome.sweep_id).unwrap();
         entry.state = SweepState::Exited {
             code: Some(0),
@@ -1678,7 +1755,9 @@ exit 0
         config.skip_label_flip = true;
         let mut registry = SweepRegistry::new(config);
 
-        let outcome = registry.dispatch(&SweepKind::Issue(123), None).unwrap();
+        let outcome = registry
+            .dispatch(&SweepKind::Issue(123), None, None)
+            .unwrap();
         assert!(outcome.was_new);
 
         let needle = format!("CLAUDE_CODE_OAUTH_TOKEN={token_value}");

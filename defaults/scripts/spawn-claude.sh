@@ -33,6 +33,11 @@
 #   LOOM_SPAWN_NO_EXPORT   If set, skip selection (caller already exported a
 #                          token). Useful for testing the dispatch path.
 #   LOOM_PYTHON            Override the python interpreter (default: python3).
+#   LOOM_MODEL             Model to pass as `claude --model <value>` (issue
+#                          #3477). Lowest-priority tier: an explicit `--model`
+#                          in the passthrough args always wins. When neither
+#                          is set, NO --model flag is emitted and the session/
+#                          CLI default is preserved.
 
 set -euo pipefail
 
@@ -106,6 +111,27 @@ while [[ $# -gt 0 ]]; do
             ;;
     esac
 done
+
+# --- Model selection (issue #3477, Phase 1) ---
+# Precedence: explicit `--model` in the passthrough args > LOOM_MODEL env >
+# nothing (session/CLI default — no --model flag emitted at all).
+if [[ -n "${LOOM_MODEL:-}" ]]; then
+    _has_model_arg=false
+    for _arg in ${PASSTHROUGH_ARGS[@]+"${PASSTHROUGH_ARGS[@]}"}; do
+        case "$_arg" in
+            --model|--model=*)
+                _has_model_arg=true
+                break
+                ;;
+        esac
+    done
+    if [[ "$_has_model_arg" == "false" ]]; then
+        PASSTHROUGH_ARGS+=(--model "$LOOM_MODEL")
+        log_info "spawn-claude: using model '$LOOM_MODEL' (from LOOM_MODEL)"
+    else
+        log_info "spawn-claude: explicit --model in args wins over LOOM_MODEL='$LOOM_MODEL'"
+    fi
+fi
 
 # --- Locate loom_tools package source ---
 # Search order:

@@ -219,6 +219,7 @@ export function parseDuration(input: string): number | null {
 async function dispatchSweep(args: {
   kind: SweepKind;
   idempotency_key?: string;
+  model?: string;
 }): Promise<{ success: true; result: DispatchResponse["payload"] } | { success: false; error: string }> {
   try {
     const response = (await sendDaemonRequest({
@@ -226,6 +227,10 @@ async function dispatchSweep(args: {
       payload: {
         kind: args.kind,
         idempotency_key: args.idempotency_key ?? null,
+        // Issue #3477 (Phase 1): optional model override. `null` (the
+        // default) means the daemon emits NO --model flag and the spawned
+        // child inherits the session/CLI default.
+        model: args.model ?? null,
       },
     })) as DaemonResponse;
 
@@ -427,6 +432,17 @@ export const sweepTools: Tool[] = [
             "already exists, the existing sweep ID is returned with no new " +
             "spawn. Matches against `Exited`/`Crashed` entries are NOT deduped " +
             "(the dedup window is the lifetime of the Running entry).",
+        },
+        model: {
+          type: "string",
+          description:
+            "Optional Claude model for the spawned sweep child (issue #3477). " +
+            "Accepts an alias (`sonnet`, `opus`, `haiku`) or a pinned ID " +
+            "(`claude-sonnet-4-6`). This is the highest-precedence tier of " +
+            "the model chain: explicit dispatch param > workspace " +
+            "`roleConfig.model` > role `suggestedModel` > session default. " +
+            "Omit to preserve the session/CLI default (no --model flag is " +
+            "emitted at all).",
         },
       },
       required: ["kind"],
@@ -701,8 +717,14 @@ export async function handleSweepTool(
 
       const idempotencyKey =
         typeof args?.idempotency_key === "string" ? (args.idempotency_key as string) : undefined;
+      // Issue #3477: optional model override. Empty strings are treated as
+      // unset so the daemon never receives `--model ""`.
+      const model =
+        typeof args?.model === "string" && args.model.length > 0
+          ? (args.model as string)
+          : undefined;
 
-      const result = await dispatchSweep({ kind: normalized, idempotency_key: idempotencyKey });
+      const result = await dispatchSweep({ kind: normalized, idempotency_key: idempotencyKey, model });
       if (!result.success) {
         return [
           {
