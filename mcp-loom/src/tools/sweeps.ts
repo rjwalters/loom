@@ -71,6 +71,12 @@ export interface SweepInfo {
   state: SweepState;
   latest_phase?: string;
   pr_number?: number;
+  /**
+   * Model requested at dispatch (issue #3482, Phase 3a observability).
+   * Absent/undefined means no explicit model was supplied — the child
+   * inherited the session/CLI default; render as "default".
+   */
+  model?: string;
 }
 
 interface DispatchResponse {
@@ -661,6 +667,8 @@ function formatSweepLine(info: SweepInfo): string {
     `  PID:        ${info.pid}`,
     `  State:      ${stateLabel}`,
     `  Token:      ${info.token_name}`,
+    // Issue #3482 (Phase 3a): absent model renders as "default".
+    `  Model:      ${info.model ?? "default"}`,
     `  Log:        ${info.log_path}`,
     `  Started:    ${info.started_at}`,
   ];
@@ -737,6 +745,10 @@ export async function handleSweepTool(
         `Sweep ID:   ${result.result.sweep_id}`,
         `PID:        ${result.result.pid}`,
         `Token:      ${result.result.token_name}`,
+        // Issue #3482 (Phase 3a): echo the dispatched model so the spawn
+        // is attributable from the dispatch transcript alone. "default"
+        // means no --model flag was emitted (session/CLI default).
+        `Model:      ${model ?? "default"}`,
         `Log:        ${result.result.log_path}`,
       ].join("\n");
       return [

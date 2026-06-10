@@ -100,7 +100,13 @@ class SummaryMetrics:
 
 @dataclass
 class EffectivenessRow:
-    """Effectiveness metrics for a single role."""
+    """Effectiveness metrics for a single role (optionally per model).
+
+    ``model`` (#3482, Phase 3a) is populated only when grouping by model
+    (``--by-model``); NULL/absent model values in the DB render as
+    ``"default"``. When empty, the key is omitted from ``to_dict`` so the
+    pre-#3482 JSON shape is byte-identical for existing consumers.
+    """
 
     role: str = ""
     total_prompts: int = 0
@@ -108,9 +114,10 @@ class EffectivenessRow:
     success_rate: float = 0.0
     avg_cost: float = 0.0
     avg_duration_sec: float = 0.0
+    model: str = ""
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        d: dict[str, Any] = {
             "role": self.role,
             "total_prompts": self.total_prompts,
             "successful_prompts": self.successful_prompts,
@@ -118,24 +125,34 @@ class EffectivenessRow:
             "avg_cost": self.avg_cost,
             "avg_duration_sec": self.avg_duration_sec,
         }
+        if self.model:
+            d["model"] = self.model
+        return d
 
 
 @dataclass
 class CostRow:
-    """Cost breakdown for a single issue."""
+    """Cost breakdown for a single issue (optionally per model).
+
+    ``model`` semantics match :class:`EffectivenessRow` (#3482).
+    """
 
     issue_number: int = 0
     prompt_count: int = 0
     total_cost: float = 0.0
     total_tokens: int = 0
+    model: str = ""
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        d: dict[str, Any] = {
             "issue_number": self.issue_number,
             "prompt_count": self.prompt_count,
             "total_cost": self.total_cost,
             "total_tokens": self.total_tokens,
         }
+        if self.model:
+            d["model"] = self.model
+        return d
 
 
 @dataclass
@@ -197,6 +214,36 @@ def _query_db(db_path: pathlib.Path, sql: str) -> list[dict[str, Any]]:
         return [dict(row) for row in rows]
     finally:
         conn.close()
+
+
+def _db_has_model_column(db_path: pathlib.Path) -> bool:
+    """Return True when ``resource_usage.model`` exists in *db_path*.
+
+    Older activity databases predate the model column (and possibly the
+    ``resource_usage`` table itself); per-model grouping must degrade
+    gracefully rather than erroring on them (#3482).
+    """
+    conn = sqlite3.connect(str(db_path))
+    try:
+        rows = conn.execute("PRAGMA table_info(resource_usage)").fetchall()
+        return any(row[1] == "model" for row in rows)
+    except sqlite3.Error:
+        return False
+    finally:
+        conn.close()
+
+
+def _model_expr(db_path: pathlib.Path) -> str:
+    """SQL expression for the model dimension, NULL/absent-tolerant.
+
+    NULL and empty-string models render as ``'default'`` (rows recorded
+    before per-model attribution, or spawns that inherited the session/CLI
+    default). On schemas without the column, a literal ``'default'`` keeps
+    the query valid so old databases never break metrics (#3482).
+    """
+    if _db_has_model_column(db_path):
+        return "COALESCE(NULLIF(r.model, ''), 'default')"
+    return "'default'"
 
 
 # ---------------------------------------------------------------------------
@@ -264,16 +311,28 @@ def get_effectiveness(
     db_path: pathlib.Path,
     role: str,
     period: str,
+    by_model: bool = False,
 ) -> list[EffectivenessRow]:
-    """Get effectiveness metrics grouped by role."""
+    """Get effectiveness metrics grouped by role (and model when *by_model*).
+
+    With ``by_model=True`` (#3482, Phase 3a) each (role, model) pair gets
+    its own row, using the existing ``resource_usage.model`` column;
+    NULL/absent model values group under ``'default'``.
+    """
     role_filter = _get_role_filter(role)
     period_filter = _get_period_filter(period)
+    model_select = ""
+    model_group = ""
+    if by_model:
+        model_select = f"{_model_expr(db_path)} as model,"
+        model_group = f", {_model_expr(db_path)}"
 
     rows = _query_db(
         db_path,
         f"""
         SELECT
             COALESCE(i.agent_role, 'unknown') as role,
+            {model_select}
             COUNT(*) as total_prompts,
             SUM(
                 CASE WHEN q.tests_passed > 0
@@ -294,7 +353,7 @@ def get_effectiveness(
         LEFT JOIN quality_metrics q ON i.id = q.input_id
         LEFT JOIN resource_usage r ON i.id = r.input_id
         WHERE 1=1 {role_filter} {period_filter}
-        GROUP BY COALESCE(i.agent_role, 'unknown')
+        GROUP BY COALESCE(i.agent_role, 'unknown'){model_group}
         ORDER BY success_rate DESC
         """,
     )
@@ -307,6 +366,7 @@ def get_effectiveness(
             success_rate=r.get("success_rate", 0.0) or 0.0,
             avg_cost=r.get("avg_cost", 0.0) or 0.0,
             avg_duration_sec=r.get("avg_duration_sec", 0.0) or 0.0,
+            model=(r.get("model") or "default") if by_model else "",
         )
         for r in rows
     ]
@@ -315,15 +375,26 @@ def get_effectiveness(
 def get_costs(
     db_path: pathlib.Path,
     issue_number: int | None,
+    by_model: bool = False,
 ) -> list[CostRow]:
-    """Get cost breakdown by issue."""
+    """Get cost breakdown by issue (and model when *by_model*).
+
+    With ``by_model=True`` (#3482, Phase 3a) each (issue, model) pair gets
+    its own row; NULL/absent model values group under ``'default'``.
+    """
     issue_filter = f"WHERE pg.issue_number = {issue_number}" if issue_number else ""
+    model_select = ""
+    model_group = ""
+    if by_model:
+        model_select = f"{_model_expr(db_path)} as model,"
+        model_group = f", {_model_expr(db_path)}"
 
     rows = _query_db(
         db_path,
         f"""
         SELECT
             pg.issue_number,
+            {model_select}
             COUNT(DISTINCT i.id) as prompt_count,
             ROUND(COALESCE(SUM(r.cost_usd), 0), 4) as total_cost,
             COALESCE(SUM(r.tokens_input + r.tokens_output), 0) as total_tokens
@@ -331,7 +402,7 @@ def get_costs(
         JOIN agent_inputs i ON pg.input_id = i.id
         LEFT JOIN resource_usage r ON i.id = r.input_id
         {issue_filter}
-        GROUP BY pg.issue_number
+        GROUP BY pg.issue_number{model_group}
         ORDER BY total_cost DESC
         LIMIT 20
         """,
@@ -343,6 +414,7 @@ def get_costs(
             prompt_count=r.get("prompt_count", 0) or 0,
             total_cost=r.get("total_cost", 0.0) or 0.0,
             total_tokens=r.get("total_tokens", 0) or 0,
+            model=(r.get("model") or "default") if by_model else "",
         )
         for r in rows
         if r.get("issue_number") is not None
@@ -417,19 +489,37 @@ def format_summary_text(m: SummaryMetrics, period: str) -> str:
 
 
 def format_effectiveness_text(rows: list[EffectivenessRow], period: str) -> str:
-    """Format effectiveness table for human display."""
+    """Format effectiveness table for human display.
+
+    A Model column is included when any row carries a model dimension
+    (``--by-model``, #3482).
+    """
+    with_model = any(r.model for r in rows)
+    if with_model:
+        header = (
+            f"{'Role':<12} {'Model':<22} {'Prompts':>10} {'Success':>10} "
+            f"{'Rate':>10} {'Avg Cost':>10} {'Avg Time':>10}"
+        )
+        width = 90
+    else:
+        header = (
+            f"{'Role':<12} {'Prompts':>10} {'Success':>10} "
+            f"{'Rate':>10} {'Avg Cost':>10} {'Avg Time':>10}"
+        )
+        width = 68
     lines = [
         "",
         _c(_BLUE, "Agent Effectiveness by Role") + f" ({period})",
-        _c(_GRAY, "\u2500" * 68),
-        f"{'Role':<12} {'Prompts':>10} {'Success':>10} {'Rate':>10} {'Avg Cost':>10} {'Avg Time':>10}",
-        _c(_GRAY, "\u2500" * 68),
+        _c(_GRAY, "\u2500" * width),
+        header,
+        _c(_GRAY, "\u2500" * width),
     ]
     for r in rows:
         rate_clr = _rate_color(r.success_rate)
         rate_str = _c(rate_clr, f"{r.success_rate:.1f}%")
+        model_col = f"{(r.model or 'default'):<22} " if with_model else ""
         lines.append(
-            f"{r.role:<12} {r.total_prompts:>10} {r.successful_prompts:>10} "
+            f"{r.role:<12} {model_col}{r.total_prompts:>10} {r.successful_prompts:>10} "
             f"{rate_str:>10} {'$' + f'{r.avg_cost:.4f}':>10} {f'{r.avg_duration_sec:.1f}s':>10}"
         )
     lines.append("")
@@ -437,17 +527,29 @@ def format_effectiveness_text(rows: list[EffectivenessRow], period: str) -> str:
 
 
 def format_costs_text(rows: list[CostRow]) -> str:
-    """Format cost table for human display."""
+    """Format cost table for human display.
+
+    A Model column is included when any row carries a model dimension
+    (``--by-model``, #3482).
+    """
+    with_model = any(r.model for r in rows)
+    if with_model:
+        header = f"{'Issue':<8} {'Model':<22} {'Prompts':>10} {'Cost':>12} {'Tokens':>12}"
+        width = 90
+    else:
+        header = f"{'Issue':<8} {'Prompts':>10} {'Cost':>12} {'Tokens':>12}"
+        width = 68
     lines = [
         "",
         _c(_BLUE, "Cost Breakdown by Issue"),
-        _c(_GRAY, "\u2500" * 68),
-        f"{'Issue':<8} {'Prompts':>10} {'Cost':>12} {'Tokens':>12}",
-        _c(_GRAY, "\u2500" * 68),
+        _c(_GRAY, "\u2500" * width),
+        header,
+        _c(_GRAY, "\u2500" * width),
     ]
     for r in rows:
+        model_col = f"{(r.model or 'default'):<22} " if with_model else ""
         lines.append(
-            f"{'#' + str(r.issue_number):<8} {r.prompt_count:>10} "
+            f"{'#' + str(r.issue_number):<8} {model_col}{r.prompt_count:>10} "
             f"{'$' + f'{r.total_cost:.4f}':>12} {r.total_tokens:>12}"
         )
     lines.append("")
@@ -503,6 +605,8 @@ Options:
   --period PERIOD       Time period: today, week, month, all (default: week)
   --format FORMAT       Output format: text, json (default: text)
   --issue NUMBER        Filter by issue number (costs command)
+  --by-model            Add a per-model dimension (effectiveness/costs commands);
+                        NULL/absent model values render as 'default' (#3482)
 
 Exit codes:
   0 - Success
@@ -512,7 +616,9 @@ Examples:
   loom-agent-metrics                           # Summary for this week
   loom-agent-metrics --role builder            # Builder metrics
   loom-agent-metrics effectiveness             # Effectiveness by role
+  loom-agent-metrics effectiveness --by-model  # Effectiveness by role x model
   loom-agent-metrics costs --issue 123         # Cost for issue #123
+  loom-agent-metrics costs --by-model          # Cost per issue x model
   loom-agent-metrics velocity --format json    # Velocity as JSON
 """,
     )
@@ -548,6 +654,15 @@ Examples:
         type=int,
         default=None,
         help="Filter by issue number (costs command)",
+    )
+    parser.add_argument(
+        "--by-model",
+        dest="by_model",
+        action="store_true",
+        help=(
+            "Add a per-model dimension to effectiveness/costs output; "
+            "NULL/absent model values render as 'default' (#3482)"
+        ),
     )
 
     args = parser.parse_args(argv)
@@ -612,7 +727,7 @@ def _cmd_summary(db_path: pathlib.Path, args: argparse.Namespace) -> int:
 
 
 def _cmd_effectiveness(db_path: pathlib.Path, args: argparse.Namespace) -> int:
-    rows = get_effectiveness(db_path, args.role, args.period)
+    rows = get_effectiveness(db_path, args.role, args.period, by_model=args.by_model)
     if args.output_format == "json":
         print(json.dumps([r.to_dict() for r in rows], indent=2))
     else:
@@ -621,7 +736,7 @@ def _cmd_effectiveness(db_path: pathlib.Path, args: argparse.Namespace) -> int:
 
 
 def _cmd_costs(db_path: pathlib.Path, args: argparse.Namespace) -> int:
-    rows = get_costs(db_path, args.issue)
+    rows = get_costs(db_path, args.issue, by_model=args.by_model)
     if args.output_format == "json":
         print(json.dumps([r.to_dict() for r in rows], indent=2))
     else:

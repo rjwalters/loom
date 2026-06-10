@@ -215,6 +215,8 @@ output=$(LOOM_WORKSPACE="$TEST_WS" PATH="$STUB_DIR:$PATH" \
     "$SCRIPTS_DIR/spawn-claude.sh" -p "ping" 2>&1 || true)
 assert_contains "stub-claude args=-p ping --model claude-sonnet-4-6" "$output" \
     "LOOM_MODEL env injects --model into claude args"
+assert_contains "spawn-claude: model=claude-sonnet-4-6 (from LOOM_MODEL)" "$output" \
+    "structured model log line emitted for LOOM_MODEL case (#3482)"
 
 # Case 1: explicit --model arg wins over LOOM_MODEL env
 output=$(LOOM_WORKSPACE="$TEST_WS" PATH="$STUB_DIR:$PATH" \
@@ -222,6 +224,8 @@ output=$(LOOM_WORKSPACE="$TEST_WS" PATH="$STUB_DIR:$PATH" \
     "$SCRIPTS_DIR/spawn-claude.sh" -p "ping" --model claude-opus-4-8 2>&1 || true)
 assert_contains "stub-claude args=-p ping --model claude-opus-4-8" "$output" \
     "explicit --model arg wins over LOOM_MODEL env"
+assert_contains "spawn-claude: model=claude-opus-4-8 (from --model arg)" "$output" \
+    "structured model log line emitted for explicit --model arg case (#3482)"
 TESTS_RUN=$((TESTS_RUN + 1))
 if [[ "$output" != *"claude-sonnet-4-6"* ]] || [[ "$output" == *"wins over LOOM_MODEL"* ]]; then
     TESTS_PASSED=$((TESTS_PASSED + 1))
@@ -238,6 +242,8 @@ output=$(LOOM_WORKSPACE="$TEST_WS" PATH="$STUB_DIR:$PATH" \
     "$SCRIPTS_DIR/spawn-claude.sh" -p "ping" --model=claude-opus-4-8 2>&1 || true)
 assert_contains "stub-claude args=-p ping --model=claude-opus-4-8" "$output" \
     "--model=value form wins over LOOM_MODEL env"
+assert_contains "spawn-claude: model=claude-opus-4-8 (from --model arg)" "$output" \
+    "structured model log line emitted for --model=value form (#3482)"
 TESTS_RUN=$((TESTS_RUN + 1))
 if [[ "$output" != *"--model claude-sonnet-4-6"* ]]; then
     TESTS_PASSED=$((TESTS_PASSED + 1))
@@ -260,6 +266,8 @@ else
     echo -e "  ${RED}FAIL${NC}: no LOOM_MODEL + no --model arg emits NO --model (session default preserved)"
     echo "    In: '$output'"
 fi
+assert_contains "spawn-claude: model=default" "$output" \
+    "structured model=default log line emitted when nothing configured (#3482)"
 
 # Empty LOOM_MODEL is treated as unset — no --model emitted
 output=$(LOOM_WORKSPACE="$TEST_WS" PATH="$STUB_DIR:$PATH" \
@@ -274,6 +282,8 @@ else
     echo -e "  ${RED}FAIL${NC}: empty LOOM_MODEL emits NO --model"
     echo "    In: '$output'"
 fi
+assert_contains "spawn-claude: model=default" "$output" \
+    "structured model=default log line emitted for empty LOOM_MODEL (#3482)"
 
 # ============================================================
 # Summary

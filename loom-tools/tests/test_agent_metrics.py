@@ -100,6 +100,73 @@ def activity_db(tmp_path: pathlib.Path) -> pathlib.Path:
 
 
 @pytest.fixture
+def model_db(tmp_path: pathlib.Path) -> pathlib.Path:
+    """Activity DB whose resource_usage table HAS the model column (#3482).
+
+    Includes a NULL-model row and an empty-string-model row to exercise the
+    'absent model renders as default' acceptance criterion.
+    """
+    db_path = tmp_path / "model-activity.db"
+    conn = sqlite3.connect(str(db_path))
+    conn.executescript(
+        """
+        CREATE TABLE agent_inputs (
+            id INTEGER PRIMARY KEY,
+            agent_role TEXT,
+            timestamp TEXT
+        );
+        CREATE TABLE resource_usage (
+            input_id INTEGER,
+            model TEXT,
+            tokens_input INTEGER,
+            tokens_output INTEGER,
+            cost_usd REAL,
+            duration_ms INTEGER
+        );
+        CREATE TABLE prompt_github (
+            input_id INTEGER,
+            issue_number INTEGER,
+            pr_number INTEGER,
+            event_type TEXT
+        );
+        CREATE TABLE quality_metrics (
+            input_id INTEGER,
+            tests_passed INTEGER,
+            tests_failed INTEGER
+        );
+
+        -- builder: two opus prompts, one sonnet prompt, one NULL-model prompt
+        INSERT INTO agent_inputs VALUES (1, 'builder', datetime('now', '-1 day'));
+        INSERT INTO agent_inputs VALUES (2, 'builder', datetime('now', '-1 day'));
+        INSERT INTO agent_inputs VALUES (3, 'builder', datetime('now', '-2 days'));
+        INSERT INTO agent_inputs VALUES (4, 'builder', datetime('now', '-2 days'));
+        -- judge: one empty-string-model prompt (treated as default)
+        INSERT INTO agent_inputs VALUES (5, 'judge', datetime('now', '-1 day'));
+
+        INSERT INTO resource_usage VALUES (1, 'claude-opus-4-8', 1000, 500, 0.10, 30000);
+        INSERT INTO resource_usage VALUES (2, 'claude-opus-4-8', 2000, 1000, 0.20, 40000);
+        INSERT INTO resource_usage VALUES (3, 'claude-sonnet-4-6', 500, 250, 0.02, 10000);
+        INSERT INTO resource_usage VALUES (4, NULL, 800, 400, 0.04, 15000);
+        INSERT INTO resource_usage VALUES (5, '', 600, 300, 0.03, 12000);
+
+        INSERT INTO prompt_github VALUES (1, 42, NULL, 'issue_work');
+        INSERT INTO prompt_github VALUES (2, 42, NULL, 'issue_work');
+        INSERT INTO prompt_github VALUES (3, 42, NULL, 'issue_work');
+        INSERT INTO prompt_github VALUES (4, 43, NULL, 'issue_work');
+        INSERT INTO prompt_github VALUES (5, NULL, 100, 'pr_review');
+
+        INSERT INTO quality_metrics VALUES (1, 5, 0);
+        INSERT INTO quality_metrics VALUES (2, 0, 2);
+        INSERT INTO quality_metrics VALUES (3, 3, 0);
+        INSERT INTO quality_metrics VALUES (4, 1, 0);
+        INSERT INTO quality_metrics VALUES (5, 2, 0);
+        """
+    )
+    conn.close()
+    return db_path
+
+
+@pytest.fixture
 def empty_db(tmp_path: pathlib.Path) -> pathlib.Path:
     """Create an empty activity database (tables exist but no rows)."""
     db_path = tmp_path / "empty.db"
@@ -296,6 +363,112 @@ class TestCosts:
     def test_empty_db(self, empty_db: pathlib.Path) -> None:
         rows = get_costs(empty_db, issue_number=None)
         assert rows == []
+
+
+# ---------------------------------------------------------------------------
+# Per-model dimension tests (#3482, Phase 3a)
+# ---------------------------------------------------------------------------
+
+
+class TestByModel:
+    """Tests for the --by-model grouping dimension."""
+
+    def test_effectiveness_groups_by_role_and_model(self, model_db: pathlib.Path) -> None:
+        rows = get_effectiveness(model_db, role="", period="all", by_model=True)
+        pairs = {(r.role, r.model) for r in rows}
+        assert ("builder", "claude-opus-4-8") in pairs
+        assert ("builder", "claude-sonnet-4-6") in pairs
+        # NULL model groups under 'default'
+        assert ("builder", "default") in pairs
+        # Empty-string model also groups under 'default'
+        assert ("judge", "default") in pairs
+
+    def test_effectiveness_model_row_counts(self, model_db: pathlib.Path) -> None:
+        rows = get_effectiveness(model_db, role="builder", period="all", by_model=True)
+        by_model = {r.model: r for r in rows}
+        assert by_model["claude-opus-4-8"].total_prompts == 2
+        assert by_model["claude-sonnet-4-6"].total_prompts == 1
+        assert by_model["default"].total_prompts == 1
+
+    def test_effectiveness_without_by_model_unchanged(self, model_db: pathlib.Path) -> None:
+        """Default (no --by-model) output keeps the pre-#3482 shape."""
+        rows = get_effectiveness(model_db, role="", period="all")
+        assert all(r.model == "" for r in rows)
+        for r in rows:
+            assert "model" not in r.to_dict()
+
+    def test_effectiveness_json_includes_model_key(self, model_db: pathlib.Path) -> None:
+        rows = get_effectiveness(model_db, role="", period="all", by_model=True)
+        parsed = json.loads(json.dumps([r.to_dict() for r in rows]))
+        assert all("model" in r for r in parsed)
+
+    def test_costs_groups_by_issue_and_model(self, model_db: pathlib.Path) -> None:
+        rows = get_costs(model_db, issue_number=42, by_model=True)
+        models = {r.model for r in rows}
+        assert models == {"claude-opus-4-8", "claude-sonnet-4-6"}
+        assert all(r.issue_number == 42 for r in rows)
+
+    def test_costs_null_model_renders_default(self, model_db: pathlib.Path) -> None:
+        rows = get_costs(model_db, issue_number=43, by_model=True)
+        assert len(rows) == 1
+        assert rows[0].model == "default"
+
+    def test_costs_without_by_model_unchanged(self, model_db: pathlib.Path) -> None:
+        rows = get_costs(model_db, issue_number=None)
+        assert all(r.model == "" for r in rows)
+        for r in rows:
+            assert "model" not in r.to_dict()
+
+    def test_by_model_degrades_on_schema_without_model_column(
+        self, activity_db: pathlib.Path
+    ) -> None:
+        """Old DBs whose resource_usage lacks the model column must not break."""
+        rows = get_effectiveness(activity_db, role="", period="all", by_model=True)
+        assert len(rows) >= 1
+        assert all(r.model == "default" for r in rows)
+
+        cost_rows = get_costs(activity_db, issue_number=None, by_model=True)
+        assert len(cost_rows) >= 1
+        assert all(r.model == "default" for r in cost_rows)
+
+    def test_effectiveness_text_has_model_column(self, model_db: pathlib.Path) -> None:
+        rows = get_effectiveness(model_db, role="", period="all", by_model=True)
+        output = format_effectiveness_text(rows, "all")
+        assert "Model" in output
+        assert "claude-opus-4-8" in output
+        assert "default" in output
+
+    def test_effectiveness_text_no_model_column_by_default(
+        self, model_db: pathlib.Path
+    ) -> None:
+        rows = get_effectiveness(model_db, role="", period="all")
+        output = format_effectiveness_text(rows, "all")
+        assert "Model" not in output
+
+    def test_costs_text_has_model_column(self, model_db: pathlib.Path) -> None:
+        rows = get_costs(model_db, issue_number=None, by_model=True)
+        output = format_costs_text(rows)
+        assert "Model" in output
+
+    def test_cli_by_model_flag(self, model_db: pathlib.Path, mock_repo: pathlib.Path) -> None:
+        with mock.patch("loom_tools.agent_metrics.find_repo_root", return_value=mock_repo):
+            with mock.patch(
+                "loom_tools.agent_metrics._get_activity_db_path", return_value=model_db
+            ):
+                rc = main(
+                    ["effectiveness", "--by-model", "--format", "json", "--period", "all"]
+                )
+        assert rc == 0
+
+    def test_cli_costs_by_model_flag(
+        self, model_db: pathlib.Path, mock_repo: pathlib.Path
+    ) -> None:
+        with mock.patch("loom_tools.agent_metrics.find_repo_root", return_value=mock_repo):
+            with mock.patch(
+                "loom_tools.agent_metrics._get_activity_db_path", return_value=model_db
+            ):
+                rc = main(["costs", "--by-model", "--format", "json"])
+        assert rc == 0
 
 
 # ---------------------------------------------------------------------------
