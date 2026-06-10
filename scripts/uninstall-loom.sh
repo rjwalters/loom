@@ -270,26 +270,22 @@ if [[ "$USE_MANIFEST" == "true" ]]; then
       # Loom patterns. See issue #3450.
       continue
     fi
-    # Defense in depth (issue #3450): refuse to register any file under
-    # .github/workflows/ or .github/ISSUE_TEMPLATE/ for hard-delete unless
-    # it's one Loom actually ships. Consumer-authored workflow files were
-    # captured by v0.7.2's over-broad manifest and then silently deleted.
+    # Defense in depth (issues #3450, #3480): .github/ is an ALLOWLIST —
+    # only the files Loom actually ships into targets (source of truth:
+    # defaults/.github/ as walked by scripts/install/manifest.sh) may be
+    # registered for hard-delete. Everything else under .github/ —
+    # consumer workflows, composite actions, dependabot.yml, etc. — is
+    # consumer-owned by default and must be preserved, even when a legacy
+    # over-broad manifest (v0.7.x, #3450) lists it. If Loom ever ships new
+    # .github/ files (e.g. workflows), add those exact paths here AND in
+    # the install-side sweep carve-out in scripts/install-loom.sh.
     case "$file_path" in
-      .github/workflows/*)
-        # Loom does not currently ship any files under .github/workflows/.
-        # If that changes, list the shipped names here.
-        continue
+      .github/labels.yml|.github/CONFIGURATION.md|.github/ISSUE_TEMPLATE/config.yml|.github/ISSUE_TEMPLATE/task.yml)
+        # Loom-shipped — eligible for removal.
         ;;
-      .github/ISSUE_TEMPLATE/*)
-        # Loom ships exactly these issue templates today. Anything else under
-        # .github/ISSUE_TEMPLATE/ is consumer-authored and must be preserved.
-        case "$file_path" in
-          .github/ISSUE_TEMPLATE/config.yml|.github/ISSUE_TEMPLATE/task.yml)
-            ;;
-          *)
-            continue
-            ;;
-        esac
+      .github/*)
+        # Consumer-owned by default.
+        continue
         ;;
     esac
 
