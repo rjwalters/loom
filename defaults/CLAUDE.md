@@ -668,7 +668,31 @@ Model selection is a first-class orchestration concern (issue #3477, Phase 1). E
 3. **Role default** — `.loom/roles/<role>.json` → `suggestedModel` (ships as an alias). The `/loom:sweep` skill passes the resolved model to role subagents via the Task tool's `model` parameter.
 4. **Session default** — when nothing above resolves, NO `--model` flag (and no Task `model` param) is emitted at all, and the worker inherits the parent session/CLI default. This is the zero-config behavior: nothing configured means nothing changes.
 
-The spawn plumbing also honors a `LOOM_MODEL` environment variable (`spawn-claude.sh`, `claude-wrapper.sh`): it is injected as `--model <value>` unless an explicit `--model` is already present in the args. Retries inside `claude-wrapper.sh` always reuse the same model — re-consulting policy on retry (attempt-based escalation) is deliberately out of scope for Phase 1.
+The spawn plumbing also honors a `LOOM_MODEL` environment variable (`spawn-claude.sh`, `claude-wrapper.sh`): it is injected as `--model <value>` unless an explicit `--model` is already present in the args. Retries inside `claude-wrapper.sh` always reuse the same model — transport-level failures (token exhaustion, crashes, 5xx) are not quality signals and never change the model.
+
+**Escalation on Judge rejection (`sweep.escalation`, Phase 2, issue #3481)**:
+
+The `/loom:sweep` orchestrator escalates one rung up a capability ladder when the Judge rejects a PR (`loom:changes-requested`) and a Doctor is dispatched to address the feedback. The escalation decision is made by the sweep orchestrator at Doctor-dispatch time — never by `claude-wrapper.sh` retries, never by worker self-assessment. Mode C (`--prs`) inherits the same rule for its Doctor phase (step C1b).
+
+The ladder is configured in `.loom/config.json`:
+
+```json
+{
+  "sweep": {
+    "escalation": ["sonnet", "opus"]
+  }
+}
+```
+
+| Value | Behavior |
+|-------|----------|
+| Key absent | Default ladder `["sonnet", "opus"]` applies |
+| `[]` or `false` | Escalation disabled entirely (pure Phase 1 behavior) |
+| Non-empty array | As configured; rungs accept aliases or pinned IDs |
+
+**Precedence interaction**: escalation replaces only tier 3 (`suggestedModel`) / tier 4 (session default) resolution for the rejection-triggered Doctor. Tier 1 (explicit dispatch param) and tier 2 (`roleConfig.model` workspace pin) always win — pins are never overridden. `ladder[0]` never overrides anything either: first attempts of every role use the unmodified precedence chain, and the ladder only fires on rejection (the rejection-triggered Doctor gets `ladder[1]`).
+
+**Cap interaction**: escalation composes with — and does not extend — the single Doctor→Judge cycle cap. A second Judge rejection blocks the PR rather than dispatching another Doctor, so a configured third rung (e.g., a frontier model) is dormant until a future issue raises the cap. The sweep checkpoint's optional `attempt` field (`sweep-checkpoint.sh write N doctor-done --attempt 2`) is forward-compat bookkeeping for that future; absent means attempt 1, and legacy checkpoints without the field read cleanly.
 
 **Suggested models by role** (`suggestedModel`, live as the role-default tier):
 

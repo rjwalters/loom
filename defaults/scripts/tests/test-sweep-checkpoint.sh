@@ -141,6 +141,73 @@ for phase in curator-done builder-done judge-done doctor-done merge-done; do
     fi
 done
 
+# --- Optional attempt field (#3481, model escalation bookkeeping) ---
+
+# 16. write with --attempt round-trips through read and attempt
+assert "write doctor-done with --attempt 2" "$CHECKPOINT" write 50 doctor-done --task-id t --pr-number 123 --attempt 2
+out=$("$CHECKPOINT" read 50)
+if echo "$out" | grep -q '"attempt": 2'; then
+    echo "PASS: attempt persisted as integer in JSON"
+    PASS=$((PASS + 1))
+else
+    echo "FAIL: attempt missing or wrong: $out" >&2
+    FAIL=$((FAIL + 1))
+fi
+out=$("$CHECKPOINT" attempt 50)
+assert_eq "attempt command reads back 2" "2" "$out"
+
+# 17. pr_number still intact alongside attempt
+out=$("$CHECKPOINT" read 50)
+if echo "$out" | grep -q '"pr_number": 123'; then
+    echo "PASS: pr_number coexists with attempt"
+    PASS=$((PASS + 1))
+else
+    echo "FAIL: pr_number lost when attempt present: $out" >&2
+    FAIL=$((FAIL + 1))
+fi
+
+# 18. Backward compat: write WITHOUT --attempt omits the field entirely
+"$CHECKPOINT" write 51 builder-done --task-id t >/dev/null
+out=$("$CHECKPOINT" read 51)
+if echo "$out" | grep -q '"attempt"'; then
+    echo "FAIL: attempt field should be omitted when not provided: $out" >&2
+    FAIL=$((FAIL + 1))
+else
+    echo "PASS: attempt field omitted when not provided"
+    PASS=$((PASS + 1))
+fi
+
+# 19. Legacy checkpoint (no attempt field): attempt prints empty, exit 0
+out=$("$CHECKPOINT" attempt 51)
+assert_eq "attempt is empty on legacy checkpoint (= attempt 1)" "" "$out"
+assert_exit "attempt on legacy checkpoint exits 0" 0 "$CHECKPOINT" attempt 51
+
+# 20. Legacy checkpoint read path unaffected (phase still resolves)
+out=$("$CHECKPOINT" phase 51)
+assert_eq "phase still reads on attempt-less checkpoint" "builder-done" "$out"
+
+# 21. attempt on missing checkpoint: empty output, exit 0 (mirrors phase)
+out=$("$CHECKPOINT" attempt 9999)
+assert_eq "attempt is empty when no checkpoint" "" "$out"
+assert_exit "attempt on missing checkpoint exits 0" 0 "$CHECKPOINT" attempt 9999
+
+# 22. Invalid --attempt values rejected with exit 1
+assert_exit "non-numeric --attempt exits 1" 1 "$CHECKPOINT" write 52 doctor-done --attempt abc
+assert_exit "zero --attempt exits 1" 1 "$CHECKPOINT" write 52 doctor-done --attempt 0
+assert_exit "negative --attempt exits 1" 1 "$CHECKPOINT" write 52 doctor-done --attempt -1
+if "$CHECKPOINT" exists 52 >/dev/null 2>&1; then
+    echo "FAIL: rejected --attempt write should not create a checkpoint" >&2
+    FAIL=$((FAIL + 1))
+else
+    echo "PASS: rejected --attempt write leaves no checkpoint behind"
+    PASS=$((PASS + 1))
+fi
+
+# 23. Overwrite an attempt-bearing checkpoint without --attempt drops the field
+"$CHECKPOINT" write 50 doctor-done --task-id t >/dev/null
+out=$("$CHECKPOINT" attempt 50)
+assert_eq "attempt cleared after attempt-less rewrite" "" "$out"
+
 echo
 echo "Results: $PASS passed, $FAIL failed"
 [[ $FAIL -eq 0 ]] || exit 1
