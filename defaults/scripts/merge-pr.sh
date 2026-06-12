@@ -380,16 +380,18 @@ if [[ "$AUTO_MERGE" == "true" ]]; then
 
       # Required contexts on the merge-target branch. Empty output means there
       # is no branch protection rule (or no required checks configured), so
-      # every failing check is informational. The Gitea variant returns a
-      # sentinel ("__GITEA_TODO__") which we treat as "all required" — that
-      # short-circuits the fallback and preserves the existing refusal until
-      # Gitea support is implemented (TODO in forge-helpers.sh, #3486).
-      _UNSTABLE_REQUIRED="$(forge_get_required_status_check_contexts "$REPO_NWO" "$_UNSTABLE_BASE_REF" "$GH" 2>/dev/null || true)"
-
-      if echo "$_UNSTABLE_REQUIRED" | grep -qx "__GITEA_TODO__"; then
-        warning "UNSTABLE-fallback is GitHub-only in v0.10.0; preserving refusal for Gitea (see #3486)"
+      # every failing check is informational. A nonzero exit from the helper
+      # signals a lookup failure (e.g. Gitea 5xx, network error, missing token,
+      # or an unknown forge) — fail closed and preserve the UNSTABLE refusal.
+      _UNSTABLE_REQUIRED=""
+      _UNSTABLE_LOOKUP_RC=0
+      _UNSTABLE_REQUIRED="$(forge_get_required_status_check_contexts "$REPO_NWO" "$_UNSTABLE_BASE_REF" "$GH" 2>/dev/null)" || _UNSTABLE_LOOKUP_RC=$?
+      if [[ "$_UNSTABLE_LOOKUP_RC" -ne 0 ]]; then
+        warning "Failed to resolve required status checks for $_UNSTABLE_BASE_REF (rc=$_UNSTABLE_LOOKUP_RC); preserving UNSTABLE refusal"
+        unset _UNSTABLE_LOOKUP_RC
         error "Failed to enable auto-merge for PR #$PR_NUMBER: $AUTO_MERGE_OUTPUT"
       fi
+      unset _UNSTABLE_LOOKUP_RC
 
       # Compute set difference: failing_checks \ required_contexts.
       # `comm -23 <failing> <required>` lists lines unique to failing.
