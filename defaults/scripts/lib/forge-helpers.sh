@@ -656,24 +656,88 @@ forge_get_pr_reviews() {
 #   checks" means every failing check is informational, which is the case the
 #   UNSTABLE-fallback wants to unblock.
 #
-# Gitea: TODO (#3486). The Gitea branch-protection API has different semantics
-#   for status checks — branch protection rules carry a `status_check_contexts`
-#   array on `GET /repos/{owner}/{repo}/branch_protections/{name}`, but its
-#   "required" semantics need a separate verification before we'd want to
-#   short-circuit the safety net. For v0.10.0 we return a sentinel ("__GITEA_TODO__")
-#   so the merge-pr.sh fallback fails-closed (treats EVERY failing check as
-#   required, leaving the existing UNSTABLE refusal intact). This matches the
-#   issue's "Forge-specific notes" guidance.
+# Gitea: GET /api/v1/repos/{owner}/{repo}/branch_protections/{name}. Gitea's
+#   branch-protection rule carries both `enable_status_check` (boolean toggle)
+#   and `status_check_contexts` (array of context patterns). The contexts are
+#   only enforced when `enable_status_check` is true — when it's false, the
+#   contexts list is informational and we emit empty output (every failing
+#   check is then treated as informational, same as the GitHub "no rule" path).
+#
+#   Distinguishing 404 (no protection rule, emit empty → fallback fires) from
+#   5xx / network error (emit empty + nonzero exit → caller fails closed) is
+#   important: the issue explicitly requires fail-closed semantics on lookup
+#   failure. `gitea_api` collapses both 4xx and 5xx into exit 1, so this
+#   function uses a direct curl invocation that captures the HTTP code and
+#   branches on it explicitly.
+#
+#   Unknown forge types fall through to a fail-closed nonzero exit, leaving
+#   the caller's existing UNSTABLE refusal intact.
 forge_get_required_status_check_contexts() {
   local nwo="$1"
   local branch="$2"
   local gh_cmd="${3:-gh}"
 
   if [[ "$FORGE_TYPE" == "gitea" ]]; then
-    # TODO(#3486): implement Gitea support. For now emit a sentinel that the
-    # merge-pr.sh caller treats as "all required" so the fallback short-circuits.
-    echo "__GITEA_TODO__"
+    forge_split_nwo "$nwo"
+
+    # Sanity-check Gitea config before issuing the request. Missing URL or
+    # token is treated as fail-closed (nonzero exit, empty stdout) so the
+    # caller preserves the UNSTABLE refusal.
+    if [[ -z "$_GITEA_BASE_URL" ]] || [[ -z "$_GITEA_TOKEN" ]]; then
+      return 1
+    fi
+    if ! _gitea_validate_basic_auth; then
+      return 1
+    fi
+
+    local url="${_GITEA_BASE_URL}/api/v1/repos/${FORGE_OWNER}/${FORGE_REPO}/branch_protections/${branch}"
+    local response
+    if [[ -n "$_GITEA_USERNAME" ]]; then
+      response=$(curl -s -w "\n%{http_code}" \
+        -X GET \
+        -u "${_GITEA_USERNAME}:${_GITEA_TOKEN}" \
+        -H "Accept: application/json" \
+        "$url" 2>/dev/null) || return 1
+    else
+      response=$(curl -s -w "\n%{http_code}" \
+        -X GET \
+        -H "Authorization: token $_GITEA_TOKEN" \
+        -H "Accept: application/json" \
+        "$url" 2>/dev/null) || return 1
+    fi
+
+    local http_code body
+    http_code=$(echo "$response" | tail -1)
+    body=$(echo "$response" | sed '$d')
+
+    # 404: no branch protection rule exists. Mirror GitHub's "no rule means no
+    # required" behavior — emit empty, exit 0 so the fallback fires.
+    if [[ "$http_code" == "404" ]]; then
+      return 0
+    fi
+
+    # 5xx / network failure / auth error / anything else non-2xx: fail closed.
+    # Empty stdout, nonzero exit; the caller will preserve the UNSTABLE refusal.
+    if [[ "$http_code" -lt 200 ]] || [[ "$http_code" -ge 300 ]]; then
+      return 1
+    fi
+
+    # 2xx: parse `enable_status_check` and `status_check_contexts`. When the
+    # toggle is off, contexts are not enforced — emit empty. Otherwise emit
+    # each context on its own line. A missing/null array also yields empty.
+    echo "$body" | jq -r '
+      if (.enable_status_check // false) then
+        (.status_check_contexts // []) | .[]
+      else
+        empty
+      end
+    ' 2>/dev/null || return 1
     return 0
+  fi
+
+  if [[ "$FORGE_TYPE" != "github" ]]; then
+    # Unknown forge — fail closed so the caller preserves the UNSTABLE refusal.
+    return 1
   fi
 
   forge_split_nwo "$nwo"
