@@ -634,6 +634,73 @@ forge_get_pr_reviews() {
   fi
 }
 
+# Get branch-protection required status check contexts for a branch.
+#
+# Usage: forge_get_required_status_check_contexts NWO BRANCH [GH_CMD]
+# Outputs: One context name per line on stdout. Empty output means the branch
+#   has no required status checks configured (every failing check is
+#   informational from a branch-protection standpoint).
+# Exit code: 0 on success (including empty result), nonzero on lookup failure.
+#
+# This is used by merge-pr.sh's UNSTABLE-fallback (sibling of #3371's CLEAN
+# fallback) to decide whether an auto-merge "Pull request is in unstable status"
+# error can be safely bypassed. If every failing check on the PR is outside this
+# set, the immediate-merge path is taken; otherwise the existing UNSTABLE
+# refusal is preserved. See issue #3486.
+#
+# GitHub: GraphQL query against
+#   `repository(owner, name).ref(qualifiedName: "refs/heads/<branch>")
+#    .branchProtectionRule.requiredStatusCheckContexts`.
+#   Branches with no protection rule, or whose rule has no required contexts,
+#   yield empty output (exit 0). This is the desired behavior — "no required
+#   checks" means every failing check is informational, which is the case the
+#   UNSTABLE-fallback wants to unblock.
+#
+# Gitea: TODO (#3486). The Gitea branch-protection API has different semantics
+#   for status checks — branch protection rules carry a `status_check_contexts`
+#   array on `GET /repos/{owner}/{repo}/branch_protections/{name}`, but its
+#   "required" semantics need a separate verification before we'd want to
+#   short-circuit the safety net. For v0.10.0 we return a sentinel ("__GITEA_TODO__")
+#   so the merge-pr.sh fallback fails-closed (treats EVERY failing check as
+#   required, leaving the existing UNSTABLE refusal intact). This matches the
+#   issue's "Forge-specific notes" guidance.
+forge_get_required_status_check_contexts() {
+  local nwo="$1"
+  local branch="$2"
+  local gh_cmd="${3:-gh}"
+
+  if [[ "$FORGE_TYPE" == "gitea" ]]; then
+    # TODO(#3486): implement Gitea support. For now emit a sentinel that the
+    # merge-pr.sh caller treats as "all required" so the fallback short-circuits.
+    echo "__GITEA_TODO__"
+    return 0
+  fi
+
+  forge_split_nwo "$nwo"
+
+  local query='query($owner: String!, $name: String!, $ref: String!) {
+    repository(owner: $owner, name: $name) {
+      ref(qualifiedName: $ref) {
+        branchProtectionRule {
+          requiredStatusCheckContexts
+        }
+      }
+    }
+  }'
+
+  # `gh api graphql --jq` with a missing path field yields `null`; pipe through
+  # jq to flatten the optional contexts array into a newline-separated list.
+  # Each step is allowed to yield empty output without failing the helper —
+  # absent protection rule or empty contexts list both mean "no required checks".
+  "$gh_cmd" api graphql \
+    -f "query=$query" \
+    -F "owner=$FORGE_OWNER" \
+    -F "name=$FORGE_REPO" \
+    -F "ref=refs/heads/$branch" \
+    --jq '.data.repository.ref.branchProtectionRule.requiredStatusCheckContexts // [] | .[]' \
+    2>/dev/null || return 0
+}
+
 # Get repo NWO (name with owner).
 # Usage: forge_get_repo_nwo [GH_CMD]
 # Returns "owner/repo" on stdout.
