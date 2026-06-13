@@ -167,8 +167,18 @@ pub fn initialize_workspace(
     // from issue #3333). Sync alongside other managed dirs so installed
     // repos always carry the latest copy.
     sync_managed_dir(&defaults, &loom_path, "docs", is_reinstall, &mut report)?;
+
+    // Sync `.loom/bin/` from `defaults/.loom/bin/`. The manifest generator
+    // (scripts/install/manifest.sh) walks `defaults/.loom/` and registers
+    // every file under it as Loom-installed, so the bin/ subdirectory must
+    // be copied here or the post-install metadata-vs-disk verification
+    // fails fast on missing `.loom/bin/loom`. Pass `defaults/.loom` as the
+    // helper's `defaults` arg so src=`defaults/.loom/bin` and dst=`.loom/bin`.
+    sync_managed_dir(&defaults.join(".loom"), &loom_path, "bin", is_reinstall, &mut report)?;
+
     make_shell_scripts_executable(&loom_path.join("hooks"));
     make_shell_scripts_executable(&loom_path.join("scripts"));
+    make_shell_scripts_executable(&loom_path.join("bin"));
 
     // Update .gitignore and setup scaffolding
     update_gitignore(workspace)?;
@@ -633,6 +643,38 @@ mod tests {
         // Both files from defaults should be reported as added (directory was cleaned first)
         assert!(report.added.contains(&".loom/roles/builder.md".to_string()));
         assert!(report.added.contains(&".loom/roles/judge.md".to_string()));
+    }
+
+    #[test]
+    fn test_loom_bin_directory_copied_on_install() {
+        // Regression: `.loom/bin/` (the loom CLI wrapper) must be copied from
+        // `defaults/.loom/bin/`. The install manifest generator walks
+        // `defaults/.loom/` and lists `.loom/bin/loom` as a shipped file, so
+        // if initialize_workspace omits the copy, the installer's
+        // post-install metadata-vs-disk check fails with
+        // "MISSING: .loom/bin/loom" and rolls the whole install back.
+        let temp_dir = TempDir::new().unwrap();
+        let workspace = temp_dir.path();
+        let defaults = workspace.join("defaults");
+
+        // Minimal git repo + defaults.
+        fs::create_dir(workspace.join(".git")).unwrap();
+        fs::create_dir_all(&defaults).unwrap();
+        fs::write(defaults.join("config.json"), "{}").unwrap();
+
+        // Ship a loom CLI wrapper under defaults/.loom/bin/.
+        fs::create_dir_all(defaults.join(".loom").join("bin")).unwrap();
+        let wrapper = "#!/usr/bin/env bash\necho loom\n";
+        fs::write(defaults.join(".loom").join("bin").join("loom"), wrapper).unwrap();
+
+        let result =
+            initialize_workspace(workspace.to_str().unwrap(), defaults.to_str().unwrap(), false);
+        assert!(result.is_ok(), "init failed: {result:?}");
+
+        // The wrapper must land at .loom/bin/loom with identical contents.
+        let installed = workspace.join(".loom").join("bin").join("loom");
+        assert!(installed.exists(), ".loom/bin/loom should be copied from defaults/.loom/bin/");
+        assert_eq!(fs::read_to_string(&installed).unwrap(), wrapper);
     }
 
     #[test]
