@@ -32,6 +32,11 @@ jobs:
           workspaces: |
             .
 
+      - name: Ensure both Apple targets installed
+        run: |
+          rustup target add aarch64-apple-darwin
+          rustup target add x86_64-apple-darwin
+
       - name: Build daemon (ARM64)
         run: |
           cargo build --package loom-daemon --release --target aarch64-apple-darwin
