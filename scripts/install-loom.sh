@@ -1088,7 +1088,19 @@ INSTALLED_FILES_JSON="$(_emit_installed_files_manifest)"
 # as "stale". The carve-out here mirrors the uninstall-side skip list so an
 # upgrade from a v0.7.2 install does NOT delete consumer-owned files. See
 # scripts/uninstall-loom.sh near the "v0.7.2's over-broad manifest" comment.
+#
+# Issue #3492 ownership-boundary intersection: in addition to the
+# `.github/*`-style allowlist below, every candidate is intersected
+# against the CURRENT Loom ownership set (_emit_loom_ownership_set —
+# the same path set _emit_installed_files_manifest produces). If a
+# stale-manifest entry is NOT in the current ownership set, the current
+# defaults/ does not ship it; it is preserved with a warning rather
+# than git-rm'd. This defends against pre-#3450 manifests that listed
+# consumer-authored .claude/skills/**, .claude/commands/<non-loom>/**,
+# etc.
+LOOM_OWNERSHIP_SET="$(_emit_loom_ownership_set)"
 STALE_FILES=()
+PRESERVED_NOT_OWNED=()
 if [[ -f "$TARGET_PATH/.loom/install-metadata.json" ]] && command -v jq >/dev/null 2>&1; then
   while IFS= read -r prev_file; do
     [[ -n "$prev_file" ]] || continue
@@ -1118,11 +1130,30 @@ if [[ -f "$TARGET_PATH/.loom/install-metadata.json" ]] && command -v jq >/dev/nu
         ;;
     esac
 
+    # Issue #3492: intersect against the current ownership boundary. A
+    # path the previous manifest claimed Loom owned but that the current
+    # defaults/ no longer ships is consumer-authored (captured by an
+    # over-broad pre-#3450 manifest) and must NOT be git-rm'd.
+    if [[ -n "$LOOM_OWNERSHIP_SET" ]] \
+        && ! printf '%s\n' "$LOOM_OWNERSHIP_SET" | grep -Fxq -- "$prev_file"; then
+      PRESERVED_NOT_OWNED+=("$prev_file")
+      continue
+    fi
+
     # Is this file still in the new installed set?
     if ! echo "$INSTALLED_FILES_JSON" | grep -qF "\"${prev_file}\""; then
       STALE_FILES+=("$prev_file")
     fi
   done < <(jq -r '.installed_files[]' "$TARGET_PATH/.loom/install-metadata.json")
+fi
+
+# Issue #3492: surface preserved paths so operators can audit their tree
+# for other pre-#3450 contamination. Single warning per file, no silent
+# skip.
+if (( ${#PRESERVED_NOT_OWNED[@]} > 0 )); then
+  for f in "${PRESERVED_NOT_OWNED[@]}"; do
+    warning "preserving ${f} (not owned by current Loom defaults/; likely consumer-authored, captured by pre-#3450 manifest)"
+  done
 fi
 
 if (( ${#STALE_FILES[@]} > 0 )); then
