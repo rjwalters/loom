@@ -248,6 +248,17 @@ if [[ "$USE_MANIFEST" == "true" ]]; then
   MANIFEST_CONTENT=$(cat "$METADATA_FILE" | tr '\n' ' ')
   INSTALLED_LIST=$(echo "$MANIFEST_CONTENT" | grep -o '"installed_files"[[:space:]]*:[[:space:]]*\[.*\]' | sed 's/.*\[//;s/\]//' | tr ',' '\n')
 
+  # Issue #3492: compute the current Loom ownership boundary once. Every
+  # manifest entry below is intersected against it; paths the previous
+  # manifest claimed Loom owned but that the current defaults/ no longer
+  # ships are preserved with a warning rather than rm -f'd. Defends
+  # against pre-#3450 manifests that captured consumer-authored
+  # .claude/skills/**, .claude/commands/<non-loom>/**, etc.
+  # shellcheck source=scripts/install/manifest.sh
+  source "$LOOM_ROOT/scripts/install/manifest.sh"
+  LOOM_OWNERSHIP_SET="$(_emit_loom_ownership_set)"
+  PRESERVED_NOT_OWNED=()
+
   while IFS= read -r file_path; do
     # Trim whitespace and quotes
     file_path=$(echo "$file_path" | sed 's/^[[:space:]]*"//;s/"[[:space:]]*$//')
@@ -289,10 +300,29 @@ if [[ "$USE_MANIFEST" == "true" ]]; then
         ;;
     esac
 
+    # Issue #3492: intersect against the current ownership boundary. A
+    # path the previous manifest claimed Loom owned but that the current
+    # defaults/ no longer ships is consumer-authored (captured by an
+    # over-broad pre-#3450 manifest) and must NOT be rm -f'd.
+    if [[ -n "$LOOM_OWNERSHIP_SET" ]] \
+        && ! printf '%s\n' "$LOOM_OWNERSHIP_SET" | grep -Fxq -- "$file_path"; then
+      PRESERVED_NOT_OWNED+=("$file_path")
+      continue
+    fi
+
     if [[ -f "$TARGET_PATH/$file_path" ]]; then
       REMOVE_FILES+=("$file_path")
     fi
   done <<< "$INSTALLED_LIST"
+
+  # Issue #3492: surface preserved paths so operators can audit their tree
+  # for other pre-#3450 contamination. Single warning per file, no silent
+  # skip.
+  if (( ${#PRESERVED_NOT_OWNED[@]} > 0 )); then
+    for f in "${PRESERVED_NOT_OWNED[@]}"; do
+      warning "preserving ${f} (not owned by current Loom defaults/; likely consumer-authored, captured by pre-#3450 manifest)"
+    done
+  fi
 
   # Also add install-metadata.json itself to removal
   REMOVE_FILES+=(".loom/install-metadata.json")

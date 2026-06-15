@@ -196,7 +196,7 @@ _emit_installed_files_manifest() {
     fi
 
     _append "$target_path"
-  done < <(find "$defaults_dir" -type f \
+  done < <(find -L "$defaults_dir" -type f \
     -not -name '.DS_Store' \
     -not -name '*.log' \
     -not -name '*.sock' \
@@ -204,4 +204,59 @@ _emit_installed_files_manifest() {
 
   json="${json}]"
   printf '%s' "$json"
+}
+
+# Emit the current Loom ownership boundary as a newline-delimited list of
+# target-relative paths on stdout. This is the SAME set of paths that
+# `_emit_installed_files_manifest` produces (same `defaults/` walk, same
+# skip rules, same `.loom-internal.list` consultation, same path
+# translations), but rendered as plain lines for grep/fgrep consumption
+# in the install-/uninstall-side deletion gates.
+#
+# Issue #3492: pre-#3450 installs persisted an over-broad on-disk
+# manifest under `.loom/install-metadata.json` that captured consumer-
+# authored files. Both deletion call sites (the uninstall hard-delete
+# loop in scripts/uninstall-loom.sh and the upgrade stale-file sweep in
+# scripts/install-loom.sh) trusted that manifest as authoritative and
+# wiped consumer content under `.claude/skills/`, `.claude/commands/<non-
+# loom>/`, etc. The existing `.github/*` allowlist and the
+# CLAUDE.md/.gitignore/.claude/settings.json carve-outs only covered a
+# narrow slice of the problem.
+#
+# This helper generalizes that carve-out: callers intersect each
+# deletion candidate against the current ownership set
+# (`deletion_set = stale_manifest ∩ loom_owns_now`). Paths the previous
+# manifest claimed Loom owned but that the current `defaults/` no longer
+# ships are preserved and warned, never deleted.
+#
+# Output: one target-relative path per line, sorted deterministically by
+# the underlying find. Missing `defaults/` → empty output.
+_emit_loom_ownership_set() {
+  local json
+  json="$(_emit_installed_files_manifest)"
+
+  # Strip JSON array delimiters and split the comma-delimited string
+  # into one entry per line, stripping surrounding quotes/whitespace.
+  # Awk avoids a perl/python dependency.
+  printf '%s' "$json" | awk '
+    {
+      # Strip leading "[" and trailing "]"
+      sub(/^\[/, "")
+      sub(/\]$/, "")
+      # Split on the "," that separates JSON string entries. Loom-
+      # shipped paths never contain commas, so a naive split is safe.
+      n = split($0, items, ",")
+      for (i = 1; i <= n; i++) {
+        entry = items[i]
+        # Strip leading/trailing whitespace and surrounding quotes.
+        sub(/^[[:space:]]+/, "", entry)
+        sub(/[[:space:]]+$/, "", entry)
+        sub(/^"/, "", entry)
+        sub(/"$/, "", entry)
+        if (entry != "") {
+          print entry
+        }
+      }
+    }
+  '
 }

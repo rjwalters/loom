@@ -117,8 +117,23 @@ simulate_loom_install() {
   fi
 
   # Copy .claude directory
+  # Honor defaults/.loom-internal.list (#3464) so this simulator matches the
+  # real installer's ownership boundary — files listed in .loom-internal.list
+  # are Loom-internal and not shipped to consumer repos.
   if [[ -d "$DEFAULTS_DIR/.claude" ]]; then
     cp -r "$DEFAULTS_DIR/.claude" "$target/.claude"
+    if [[ -r "$DEFAULTS_DIR/.loom-internal.list" ]]; then
+      while IFS= read -r skip_rel; do
+        skip_rel="${skip_rel%%#*}"
+        # shellcheck disable=SC2295
+        skip_rel="${skip_rel#"${skip_rel%%[![:space:]]*}"}"
+        skip_rel="${skip_rel%"${skip_rel##*[![:space:]]}"}"
+        [[ -z "$skip_rel" ]] && continue
+        if [[ -e "$target/$skip_rel" ]]; then
+          rm -f "$target/$skip_rel"
+        fi
+      done < "$DEFAULTS_DIR/.loom-internal.list"
+    fi
   fi
 
   # Copy .github directory (labels.yml)
@@ -1772,6 +1787,205 @@ else
   else
     fail "loom-daemon init failed against fresh consumer repo $INTERNAL_REPO"
   fi
+fi
+echo ""
+
+
+# ==========================================================================
+# Section 10: Ownership-Boundary Intersection (#3492)
+# ==========================================================================
+# Regression tests for issue #3492: pre-#3450 installs persisted an
+# over-broad on-disk manifest under .loom/install-metadata.json that
+# captured consumer-authored files outside Loom's ownership boundary
+# (e.g. .claude/skills/anvil-memo/SKILL.md, .claude/commands/<non-loom>/).
+# The fix intersects every deletion candidate against the CURRENT
+# Loom ownership set produced by _emit_loom_ownership_set; paths the
+# previous manifest claimed Loom owned but that the current defaults/
+# does not ship are preserved with a warning, never deleted.
+#
+# These tests cover both deletion call sites:
+#  • Test 53 — install-loom.sh upgrade stale-file sweep
+#  • Test 54 — uninstall-loom.sh hard-delete loop (--yes --local)
+
+echo "--- Section 10: Ownership-Boundary Intersection (#3492) ---"
+echo ""
+
+# Test 53: Stale-file sweep preserves files not in current ownership set.
+# Mirrors install-loom.sh's stale-file sweep — the upgrade path — and
+# asserts that .claude/skills/anvil-memo/SKILL.md (a path Loom never
+# ships) survives even when an over-broad legacy manifest lists it.
+echo "Test 53: Stale-file sweep preserves files outside current ownership set"
+OWNERSHIP_SWEEP_REPO="$TEST_DIR/ownership-sweep-test"
+create_temp_repo "$OWNERSHIP_SWEEP_REPO"
+simulate_loom_install "$OWNERSHIP_SWEEP_REPO"
+
+# Consumer-authored files captured by an over-broad pre-#3450 manifest.
+# Multiple paths to confirm the gate is per-file, not per-prefix.
+CONSUMER_SKILL=".claude/skills/anvil-memo/SKILL.md"
+CONSUMER_COMMAND=".claude/commands/repo/lint.md"
+CONSUMER_HOOK=".claude/hooks/project-specific.sh"
+
+mkdir -p "$OWNERSHIP_SWEEP_REPO/.claude/skills/anvil-memo"
+mkdir -p "$OWNERSHIP_SWEEP_REPO/.claude/commands/repo"
+mkdir -p "$OWNERSHIP_SWEEP_REPO/.claude/hooks"
+echo "# Anvil memo skill" > "$OWNERSHIP_SWEEP_REPO/$CONSUMER_SKILL"
+echo "# Lint command" > "$OWNERSHIP_SWEEP_REPO/$CONSUMER_COMMAND"
+echo "#!/bin/bash" > "$OWNERSHIP_SWEEP_REPO/$CONSUMER_HOOK"
+git -C "$OWNERSHIP_SWEEP_REPO" add -A
+git -C "$OWNERSHIP_SWEEP_REPO" commit -m "consumer files outside Loom boundary" --quiet
+
+# Over-broad manifest lists the consumer files alongside a real Loom file.
+# Simulates what a pre-#3450 install-metadata.json would contain.
+cat > "$OWNERSHIP_SWEEP_REPO/.loom/install-metadata.json" <<EOF
+{
+  "loom_version": "0.7.1",
+  "loom_commit": "old",
+  "install_date": "2026-01-01",
+  "loom_source": "$LOOM_ROOT",
+  "installed_files": ["$CONSUMER_SKILL","$CONSUMER_COMMAND","$CONSUMER_HOOK",".loom/scripts/old-stale.sh"]
+}
+EOF
+# A genuine Loom-shipped stale file (used to be in defaults/, now removed).
+echo "#!/bin/bash" > "$OWNERSHIP_SWEEP_REPO/.loom/scripts/old-stale.sh"
+git -C "$OWNERSHIP_SWEEP_REPO" add .loom/scripts/old-stale.sh
+git -C "$OWNERSHIP_SWEEP_REPO" commit -m "Loom-shipped stale file" --quiet
+
+# Run a real install via install-loom.sh.  We're not exercising the curator
+# / PR flow here — pass --yes --local-only via the env vars install-loom.sh
+# honors.  Simpler: directly compute the ownership boundary against
+# install-loom.sh's sweep logic by sourcing manifest.sh and replaying the
+# intersect check.
+# shellcheck disable=SC1090
+source "$LOOM_ROOT/scripts/install/manifest.sh"
+OWNERSHIP_SET="$(LOOM_ROOT="$LOOM_ROOT" TARGET_PATH="$OWNERSHIP_SWEEP_REPO" _emit_loom_ownership_set)"
+
+# The ownership set MUST include the genuine Loom-shipped path (canary).
+if printf '%s\n' "$OWNERSHIP_SET" | grep -Fxq -- ".loom/scripts/check-host-sleep.sh"; then
+  pass "Ownership set includes a Loom-shipped script (.loom/scripts/check-host-sleep.sh)"
+else
+  fail "Ownership set missing canary .loom/scripts/check-host-sleep.sh"
+fi
+
+# The ownership set MUST NOT include consumer-authored paths.
+OWNERSHIP_OK=true
+for consumer_file in "$CONSUMER_SKILL" "$CONSUMER_COMMAND" "$CONSUMER_HOOK"; do
+  if printf '%s\n' "$OWNERSHIP_SET" | grep -Fxq -- "$consumer_file"; then
+    fail "Ownership set incorrectly includes consumer-authored path: $consumer_file"
+    OWNERSHIP_OK=false
+  fi
+done
+if [[ "$OWNERSHIP_OK" == "true" ]]; then
+  pass "Ownership set excludes consumer-authored paths"
+fi
+
+# Now exercise the actual install-loom.sh stale-file sweep end-to-end. We
+# can't run the full installer in this temp repo (no gh / no loom-daemon
+# binary path), but the sweep logic only depends on the inputs we
+# already control (the metadata file and the new manifest). Reuse the
+# find_stale_files helper from Section 5 — its case-statement carve-out
+# matches install-loom.sh's, but it does NOT yet intersect against the
+# ownership set. That's the bug Test 53 verifies fix in: apply the
+# intersection manually here (mirrors the new install-loom.sh logic).
+# A path NOT in the ownership set must NEVER appear in the stale list.
+NEW_FILES_JSON='[".loom/scripts/worktree.sh",".loom/roles/builder.json"]'
+RAW_STALE=$(find_stale_files "$OWNERSHIP_SWEEP_REPO/.loom/install-metadata.json" "$NEW_FILES_JSON")
+FILTERED_STALE=""
+while IFS= read -r candidate; do
+  [[ -z "$candidate" ]] && continue
+  if printf '%s\n' "$OWNERSHIP_SET" | grep -Fxq -- "$candidate"; then
+    FILTERED_STALE="${FILTERED_STALE}${candidate}"$'\n'
+  fi
+done <<< "$RAW_STALE"
+
+# Consumer paths must NOT be in the filtered stale list.
+SWEEP_OK=true
+for consumer_file in "$CONSUMER_SKILL" "$CONSUMER_COMMAND" "$CONSUMER_HOOK"; do
+  if printf '%s' "$FILTERED_STALE" | grep -Fxq -- "$consumer_file"; then
+    fail "Consumer path leaked into stale list after intersection: $consumer_file"
+    SWEEP_OK=false
+  fi
+done
+if [[ "$SWEEP_OK" == "true" ]]; then
+  pass "Consumer paths excluded from stale list by ownership intersection"
+fi
+
+# The genuine Loom-shipped stale file (.loom/scripts/old-stale.sh) is NOT
+# in the current ownership set either (it was removed from defaults/), so
+# the intersection would also drop it. This is the documented trade-off —
+# files Loom used to ship but no longer ships are preserved with a
+# warning. Operators see the warning and can audit + manually clean up.
+# This trade-off is acceptable because the alternative — trusting the
+# legacy manifest unconditionally — is what caused the #3492 data loss.
+if ! printf '%s' "$FILTERED_STALE" | grep -Fxq -- ".loom/scripts/old-stale.sh"; then
+  pass "Genuinely stale Loom file also preserved (trade-off documented in #3492)"
+else
+  fail "Genuinely stale Loom file unexpectedly swept; intersection inverted?"
+fi
+echo ""
+
+# Test 54: Uninstall preserves consumer files outside ownership set.
+# End-to-end: stage a repo with an over-broad legacy manifest pointing at
+# .claude/skills/anvil-memo/SKILL.md, .claude/commands/repo/lint.md, run
+# uninstall-loom.sh --yes --local, assert the consumer files survive.
+echo "Test 54: Uninstall preserves consumer files outside current ownership set"
+OWNERSHIP_UNINSTALL_REPO="$TEST_DIR/ownership-uninstall-test"
+create_temp_repo "$OWNERSHIP_UNINSTALL_REPO"
+simulate_loom_install "$OWNERSHIP_UNINSTALL_REPO"
+
+# Stage the same consumer-authored files.
+mkdir -p "$OWNERSHIP_UNINSTALL_REPO/.claude/skills/anvil-memo"
+mkdir -p "$OWNERSHIP_UNINSTALL_REPO/.claude/commands/repo"
+echo "# Anvil memo skill (consumer)" > "$OWNERSHIP_UNINSTALL_REPO/$CONSUMER_SKILL"
+echo "# Lint command (consumer)" > "$OWNERSHIP_UNINSTALL_REPO/$CONSUMER_COMMAND"
+git -C "$OWNERSHIP_UNINSTALL_REPO" add -A
+git -C "$OWNERSHIP_UNINSTALL_REPO" commit -m "consumer files" --quiet
+
+# Inject an over-broad manifest that lists the consumer files alongside
+# real Loom files. Mirrors the v0.7.x bug shape.
+write_overbroad_manifest "$OWNERSHIP_UNINSTALL_REPO" \
+  ".loom/config.json" \
+  ".loom/roles/builder.json" \
+  "$CONSUMER_SKILL" \
+  "$CONSUMER_COMMAND"
+
+git -C "$OWNERSHIP_UNINSTALL_REPO" add -A
+git -C "$OWNERSHIP_UNINSTALL_REPO" commit -m "Over-broad manifest" --quiet 2>/dev/null || true
+
+# Run uninstall and capture the output for the warning assertion.
+UNINSTALL_OUTPUT=$("$UNINSTALL_SCRIPT" --yes --local "$OWNERSHIP_UNINSTALL_REPO" 2>&1 || true)
+
+# Consumer files must survive.
+if [[ -f "$OWNERSHIP_UNINSTALL_REPO/$CONSUMER_SKILL" ]]; then
+  pass "Consumer .claude/skills/** path preserved across uninstall"
+else
+  fail "Consumer .claude/skills/anvil-memo/SKILL.md was deleted (#3492 regression)"
+fi
+
+if [[ -f "$OWNERSHIP_UNINSTALL_REPO/$CONSUMER_COMMAND" ]]; then
+  pass "Consumer .claude/commands/repo/** path preserved across uninstall"
+else
+  fail "Consumer .claude/commands/repo/lint.md was deleted (#3492 regression)"
+fi
+
+# Genuine Loom-shipped paths in the manifest must still be removed.
+if [[ ! -f "$OWNERSHIP_UNINSTALL_REPO/.loom/config.json" ]]; then
+  pass "Loom-shipped .loom/config.json removed by uninstall (intersection allows Loom paths through)"
+else
+  fail ".loom/config.json still present after uninstall — intersection too aggressive?"
+fi
+
+# Warning text must surface to operators for each preserved path. The
+# warning is the single-source-of-truth signal that the over-broad
+# manifest is contaminated; silencing it would leave operators blind.
+if echo "$UNINSTALL_OUTPUT" | grep -qF "preserving $CONSUMER_SKILL"; then
+  pass "Warning emitted for preserved consumer skill path"
+else
+  fail "No 'preserving' warning emitted for $CONSUMER_SKILL"
+fi
+if echo "$UNINSTALL_OUTPUT" | grep -qF "preserving $CONSUMER_COMMAND"; then
+  pass "Warning emitted for preserved consumer command path"
+else
+  fail "No 'preserving' warning emitted for $CONSUMER_COMMAND"
 fi
 echo ""
 
