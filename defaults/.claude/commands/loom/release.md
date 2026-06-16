@@ -248,6 +248,59 @@ Choose [m/s/a]:
 
 On `[m]`, skip Phase 5's automated bump and walk the operator through the manual edit/commit/tag flow with the version they confirmed in Phase 3. On `[s]` or `[a]`, exit cleanly.
 
+### Phase 2a.5: Drift gate (pre-bump consistency check)
+
+Before Phase 2b reads the current version from a single source, verify the detected tool's manifest set agrees on the current version. This catches drifted-manifest mis-bumps that Phase 5 step 4 cannot detect: `version.sh bump` (and any conformant implementation) reads current via the first file in its manifest list, computes the next version, and unconditionally rewrites every file — so the post-bump `check` will see consistency, but a drifted file went `X.Y.Z-drift → X.Y.(Z+1)` instead of `X.Y.Z → X.Y.(Z+1)`. The release ships corrupted version metadata and no phase later than this one can catch it.
+
+The gate is meaningful exactly when the detected tool's manifest set has >1 file. Single-source tools (cargo workspace inheritance via `cargo-release` / `cargo-set-version`, `poetry`, `npm`) are structurally drift-free and skip it with an explicit no-op (silent fallthrough on a future-added tool is the same failure mode this gate exists to fix). The Cargo `cargo-workspace` direct-edit fallback is also a no-op here — the mixed-inheritance case (members pinning literal `version = "X.Y.Z"`) is surfaced at Phase 5 step 2 for operator confirmation, not gated here.
+
+```bash
+case "$VERSION_TOOL" in
+  version.sh)
+    # Fatal: ./scripts/version.sh check is documented as required (see the
+    # `scripts/version.sh interface` table below). A drifted set here means
+    # Phase 2b would read a single file's version and Phase 5's unconditional
+    # bump would mis-delta the drifted file. The operator must resolve manually.
+    if ! ./scripts/version.sh check >/dev/null; then
+      echo "ERROR: Version files have drifted before bump. Phase 2b would read a single file's version and Phase 5 would mis-bump the drifted file(s)." >&2
+      echo "Run './scripts/version.sh check' to inspect the drift, resolve manually (edit the offending file to match the others), then re-invoke /loom:release." >&2
+      exit 1
+    fi
+    ;;
+  bumpversion|bump2version)
+    # Advisory: bumpversion's [bumpversion:file:*] sections are validated at
+    # bump time; a dry-run surfaces drift before committing to a level.
+    # --allow-dirty is required because Phase 4 may have already staged
+    # CHANGELOG.md. Treat as advisory (not fatal) — the tool will hard-fail at
+    # bump time anyway, and the dry-run can fail for reasons unrelated to drift.
+    if ! "$VERSION_TOOL" patch --dry-run --allow-dirty >/dev/null 2>&1; then
+      echo "WARN: $VERSION_TOOL dry-run failed; manifest set may be drifted." >&2
+      echo "Inspect with: $VERSION_TOOL patch --dry-run --allow-dirty --verbose" >&2
+    fi
+    ;;
+  cargo-workspace)
+    # Mixed-inheritance workspaces can drift between [workspace.package].version
+    # and member crates that pin a literal `version = "X.Y.Z"`. `cargo check
+    # --workspace` catches stale Cargo.lock entries but does NOT cross-check
+    # pinned literals; Phase 5 step 2 surfaces pinned members for operator
+    # confirmation instead. Explicit no-op here.
+    : # advisory no-op — Phase 5 step 2 covers this case
+    ;;
+  cargo-release|cargo-set-version|poetry|npm)
+    # Single-source by construction:
+    #   - cargo-release / cargo-set-version: workspace inheritance, the workspace
+    #     root Cargo.toml is the only authored version source.
+    #   - poetry: pyproject.toml only.
+    #   - npm: package.json only (package-lock.json is regenerated, not authored).
+    : # no-op — structurally drift-free
+    ;;
+esac
+```
+
+**Failure mode**: when the gate trips for `version.sh`, the operator must resolve the drift manually (typically by editing the offending file to match the others, then re-invoking). Do not auto-resolve — drift implies a real edit landed unreviewed, and Loom should surface that for human judgment.
+
+**`--yes` / automation-mode asymmetry**: when the skill is invoked non-interactively (e.g., `--yes` flag), the `bumpversion` / `bump2version` branch already prints to stderr and continues (advisory mode mirrors Phase 1.5). The `version.sh` branch, however, **still hard-fails** in `--yes` mode — this is the one place where `--yes` cannot soften the gate, because mis-bumping a tagged release ships corrupted version metadata to a published artifact, which is far worse than blocking the pipeline. Automated release pipelines that hit this must surface the drift to an operator before re-running.
+
 ### Phase 2b: Gather changes
 
 ```bash
@@ -611,7 +664,7 @@ When the skill detects `./scripts/version.sh` (Phase 2a), it dispatches the foll
 |---|---|---|
 | `./scripts/version.sh` | Print current version to stdout | 2b |
 | `./scripts/version.sh list` | List version-bearing files, one per line | 5 step 2 |
-| `./scripts/version.sh check` | Verify all version-bearing files agree | 5 step 4 |
+| `./scripts/version.sh check` | Verify all version-bearing files agree | 2a.5 (drift gate), 5 step 4 |
 | `./scripts/version.sh bump <level> --tag` | Bump (`patch`/`minor`/`major`), commit, tag | 5 step 3 |
 | `./scripts/version.sh set <version> [--tag]` | Set explicit version, commit, optionally tag | (not used by skill; supported by Loom's bundled script for operator convenience) |
 
