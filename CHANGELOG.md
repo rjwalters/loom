@@ -7,6 +7,121 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.10.2] - 2026-06-15
+
+### Summary
+
+A small patch release with one critical fix and one downstream-quality improvement. **#3492 is the urgency driver**: reinstalling Loom over a repo previously installed with a pre-#3450 version silently deleted consumer-authored files under `.claude/` (the on-disk manifest was over-broad, and the reinstall/prune path trusted it). The fix intersects deletion candidates against Loom's *current* `defaults/` ownership boundary before deleting, so any path Loom no longer ships is preserved with a warning. Anyone on 0.10.0/0.10.1 should upgrade promptly.
+
+The other notable change generalizes the `/loom:release` skill so downstream repos don't have to fork it on install, and adds an installer migration prompt that handles customized `release.md` files.
+
+### Fixed
+
+- **Reinstall preserves consumer-authored files** — both the install-time stale-file sweep (`scripts/install-loom.sh`) and the uninstall-time hard-delete loop (`scripts/uninstall-loom.sh`) now intersect each deletion candidate against the current Loom ownership boundary (`defaults/` enumeration + `defaults/.loom-internal.list`). Any path Loom's *current* defaults do not ship is preserved with a `preserving <path> (not owned by current Loom defaults/; likely consumer-authored, captured by pre-#3450 manifest)` warning. Resolves the destructive-loss class that #3450 only fixed at manifest *generation* time. Shared `_emit_loom_ownership_set` helper in `scripts/install/manifest.sh` keeps both call sites in sync. Also fixes a latent `find` → `find -L` bug so symlinked role files at `defaults/roles/*.md` are correctly included in the ownership set. (#3492 / PR #3494)
+
+### Added
+
+- **`./scripts/version.sh list` subcommand** — emits the canonical `VERSION_FILES` array one path per line so the release skill (and any other tooling) can discover the version-bearing file set without hardcoding. (#3495 / PR #3496)
+- **`scripts/install-loom.sh` migration prompt for customized `release.md`** — detects when the on-disk `defaults/.claude/commands/loom/release.md` diverges from the canonical shipped version and prompts `[y/N/d=show diff]` (default N = preserve). `--yes` preserves silently; `--force` replaces silently. Snapshots the customized file *before* `loom-daemon init` overwrites it. Composes with the #3492 ownership-boundary work. (#3495 / PR #3496)
+
+### Changed
+
+- **Generalized `/loom:release` skill** — `defaults/.claude/commands/loom/release.md` is now project-agnostic: uses `{{workspace}}` for project name (no more hardcoded "Loom"), discovers version-bearing files via `./scripts/version.sh list` (resolves the prior 7/5/5/5 prose inconsistency), degrades gracefully when `.github/workflows/` is absent (clean-main gate instead of empty CI output), detects `.github/workflows/release.yml` before claiming the GitHub Release triggers a build, drops Loom-specific semver examples (`ForgeClient` / MCP / daemon references) in favor of generic categories, and adds a CHANGELOG.md bootstrap path for young repos. Loom's own release flow continues to work via dogfooding; downstream consumers (e.g. Anvil) no longer need to fork the skill. (#3495 / PR #3496)
+- **`release.md` now ships to consumer installs** — removed from `defaults/.loom-internal.list` so every downstream install gets a working release skill out of the box. (#3495 / PR #3496)
+
+### Build
+
+- Bump the cargo `all-dependencies` group with 2 updates. (Dependabot, PR #3493)
+
+### Tests
+
+- 9 new installer tests (Tests 53–54 for the ownership-boundary intersection, Section 11 / Tests 55–63 for the four operator-flag combinations of the customized-`release.md` migration prompt). 109/109 installer tests pass.
+
+## [0.10.1] - 2026-06-13
+
+### Summary
+
+A patch release dominated by the **model-selection plumbing** (#3477 / #3481 / #3482) and a cluster of install/upgrade hardening. Model selection lands as a first-class orchestration concern: a fixed precedence chain (explicit dispatch param → workspace `roleConfig.model` → role `suggestedModel` → session default), deterministic escalation on Judge rejection (`sweep.escalation` ladder), and per-model observability across spawn, daemon, checkpoint, and metrics surfaces. Several install regressions hit by operators upgrading from v0.7.x are fixed, plus Gitea support and unstable-state fallbacks in `merge-pr.sh`.
+
+### Added
+
+- **Model-selection Phase 1 (#3477 / PR #3479)** — fixed precedence chain across `/loom:sweep`, the Rust `loom-daemon`, `spawn-claude.sh`, and `claude-wrapper.sh`. Subagent role workers receive an explicit `model` param via the Task tool when any tier above session default resolves. Aliases (`sonnet`/`opus`/`haiku`) and pinned IDs (e.g. `claude-sonnet-4-6`) are both valid at every tier. Static per-role `suggestedModel` mapping ships in `.loom/roles/*.json` (Builder/Judge/Architect = opus; Curator/Doctor/Hermit/Champion/Guide = sonnet).
+- **Model-selection Phase 2 (#3481 / PR #3484)** — deterministic escalation on Judge rejection. When the Judge requests changes and `/loom:sweep` dispatches a Doctor, the Doctor's model escalates one rung up the `sweep.escalation` ladder (default `["sonnet", "opus"]`) instead of resolving through tier 3/4. Tier-1/tier-2 pins always win. Composes with the single Doctor→Judge cycle cap. Mode C inherits the same rule.
+- **Model-selection Phase 3a (#3482 / PR #3485)** — per-model observability. Spawn-claude logs the resolved model, the daemon records it on each sweep, `sweep-checkpoint.sh write` accepts `--model <resolved>`, and the metrics pipeline groups by model. Absent fields read cleanly on legacy checkpoints.
+- **Gitea support in `merge-pr.sh --auto` UNSTABLE-fallback** (#3488 / PR #3489) — the immediate-merge fallback path is now forge-agnostic.
+
+### Fixed
+
+- **`loom-daemon init` regression guards** — adds a docs subdir regression test and embeds commit / build time in `--version` output for downstream debugging. (#3470 / PR #3472)
+- **`loom-clean` silently skipped stale branches** — three compounding bugs caused stale local branches for closed issues to remain. (#3473)
+- **Install upgrade from v0.7.1 → v0.10.0** — hybrid CLAUDE.md placeholders (some `{{INSTALL_DATE}}`, some already-substituted) confused the upgrade-time docs sync. Also missing docs sync source path. (#3476 / PR #3478)
+- **`.github/` install sweep inverted to allowlist** — the previous carve-out was a denylist that missed consumer files added under conventions Loom doesn't know about (custom workflows, `dependabot.yml`, project-specific actions). Inverted to an allowlist of just the Loom-shipped paths so consumer additions survive. (#3480 / PR #3483)
+- **`merge-pr.sh` immediate-merge fallback on UNSTABLE** — when failing required checks are non-required (e.g. optional CI jobs marked failure), the script now transparently merges instead of blocking on the auto-merge queue. (#3486 / PR #3487)
+- **`loom-daemon init` copies `defaults/.loom/bin/`** — the workspace bootstrapping step missed `defaults/.loom/bin/` so workspace-local helper binaries were absent. (#3490)
+- **Release workflow installs both Apple targets explicitly** (#3491) — `aarch64-apple-darwin` + `x86_64-apple-darwin` so both binaries always ship.
+
+### Build
+
+- Bump `actions/checkout` from 4 to 6. (Dependabot, PR #3474)
+- Bump the cargo `all-dependencies` group with 3 updates. (Dependabot, PR #3475)
+
+## [0.10.0] - 2026-06-05
+
+### Summary
+
+The major architectural milestone signaled by the 0.9.1 deprecation cycle: **deletion of the shepherd brain (`loom-tools/src/loom_tools/shepherd/`), the Python daemon brain (`loom-tools/src/loom_tools/daemon_v2/`), and the `/shepherd` slash command** (epic #3372), paired with the **Rust `loom-daemon` rebuild** (epic #3449). The replacement architecture is two-surface: `/loom:sweep` for in-session subagent dispatch (Tier 1) and the Rust `loom-daemon` binary for multi-account MCP-level dispatch (Tier 2). Six MCP tools (`dispatch_sweep`, `list_sweeps`, `get_sweep_status`, `cancel_sweep`, `tail_sweep_log`, `subscribe_to_events`, `publish_event`, `tail_event_bus`) cover dispatch, monitoring, pub/sub eventing, and cancellation. A frozen 6-topic event taxonomy ships for v0.10.0; new topics require a follow-up issue.
+
+`/loom:sweep` grows a **Stage -1 backend detection** that probes for the daemon and a multi-account token pool — strict AND — and delegates to the daemon when both are present, falling back to in-process subagent dispatch otherwise. Mode C (`--prs`) and `--no-daemon` short-circuit to subagent. Solo-token operators see no behavior change.
+
+Around the deletion: `defaults/scripts/spawn-loop.sh` (the minimal multi-account orchestrator from v0.9.1) is soft-deprecated with a stderr warning per invocation; deletion is queued for v0.11.0. A new `/loom:bump` skill provides a project-agnostic version-bump + tag flow for consumer projects.
+
+Several install/upgrade fixes land in the same release: stale-file sweep on upgrade, consumer `CLAUDE.md`/`.gitignore`/`.github/` preservation, Loom-internal skill exclusion from consumer installs.
+
+**v1.0.0 is intentionally unscheduled.** Loom remains pre-1.0 while the architecture settles.
+
+### Added
+
+- **`loom-daemon` Phase A — `Sweep` resource + `DispatchSweep` MCP tool** (#3452 / PR #3459) — in-memory sweep registry (HashMap keyed by issue number), `mcp__loom__dispatch_sweep` enqueues a sweep that fork+execs `claude -p "/loom:sweep N"` via `spawn-claude.sh` (token rotation at process-spawn boundary), `mcp__loom__list_sweeps` enumerates the registry, reaper task sweeps dead PIDs every 30s.
+- **`loom-daemon` Phase B — pub/sub event bus** (#3453 / PR #3460) — tokio `broadcast::channel<Event>` (capacity 1024). Sweep children publish via `Request::PublishEvent { topic, payload }`. Six frozen topics: `sweep.issue.{N}.phase`, `sweep.issue.{N}.blocker`, `sweep.issue.{N}.exited`, `sweep.issue.{N}.crashed`, `sweep.global.dispatch`, `sweep.global.completed`. Pass-through overflow on slow subscribers (synthetic `topic_lag` event), no silent drops.
+- **`mcp-loom` Phase C — sweep monitoring + subscription MCP tools** (#3455 / PR #3463) — `get_sweep_status`, `tail_sweep_log`, `subscribe_to_events`, `publish_event`, `cancel_sweep` (SIGTERM → grace → SIGKILL), `tail_event_bus`. `.loom/docs/daemon-reference.md` rewritten to document the wire protocol, registry semantics, and reaper task.
+- **`/loom:sweep` Phase D — backend detection (Stage -1)** (#3454 / PR #3462) — strict-AND probe for daemon reachability (500ms Ping timeout) and multi-account token pool (`.loom/tokens/*.token` count ≥ 2 OR `.env` `ACCOUNT_KEY_*` count ≥ 2). Both succeed → delegate to daemon via `dispatch_sweep`, exit sub-2-second. Either fails → fall through to in-process subagent dispatch (existing Mode A/B/C lifecycle, no behavior change). `--no-daemon` forces subagent unconditionally; Mode C always uses subagent.
+- **`/loom:bump` skill** (#3468 / PR #3469) — generic version-bump + tag flow for consumer projects. Independent of the `/loom:release` skill (which handles CHANGELOG / GitHub Release creation in addition to the bump).
+- **Curator: verify Affected Files against `origin/main`** (#3418 / PR #3447) — curated "Affected Files" lists are now checked against the actual repo state to catch references to deleted, moved, or renamed files before they reach the Builder.
+- **Stale-file sweep on installer upgrade** (#3431) — `scripts/install-loom.sh` now removes files from the previous install's manifest that the current `defaults/` no longer ships. Paired with the carve-outs documented under v0.10.1's `.github/` allowlist fix.
+- **`rust-toolchain.toml` pinning Rust 1.96.0** (#3427) — fixes `cfg_select!` breakage and adds rustfmt/clippy components (#3446).
+
+### Changed
+
+- **Two-surface orchestration architecture** — `/loom:sweep` (Tier 1, in-session) and `loom-daemon` (Tier 2, MCP-level multi-account dispatch). Periodic support roles (Champion, Curator, Judge, Auditor, Guide) run on GitHub Actions cron under `.github/workflows/loom-*.yml` (shipped in v0.9.1, opt-in by default).
+- **Architecture narrative rewrites + ADR-0009** (#3435) — `CLAUDE.md`, `defaults/CLAUDE.md`, and `.loom/docs/` rewritten around the post-deletion architecture. ADR-0009 records the shepherd/daemon-Python-brain deprecation decision.
+- **`v0.10.0` daemon-rebuild migration guide** (#3457 / PR #3466) — `docs/migration/v0.10.0-shepherd-deprecation.md` documents the deletion narrative, per-CLI breaking changes, and the replacement surfaces.
+
+### Deprecated
+
+- **`defaults/scripts/spawn-loop.sh`** (#3456 / PR #3465) — soft-deprecated as of Phase E of #3449. Emits a stderr warning on every `start` / `status` / `stop` invocation. Suppress with `LOOM_SUPPRESS_DEPRECATION=1`. Deletion queued for v0.11.0. The replacement is `mcp__loom__dispatch_sweep` against `loom-daemon`.
+
+### Removed
+
+- **`loom-tools/src/loom_tools/shepherd/` (shepherd brain + `/shepherd` slash command + milestone writers)** (#3433, BREAKING) — the per-issue orchestrator deleted. Replacement: `/loom:sweep <issue>`.
+- **`loom-tools/src/loom_tools/daemon_v2/` (Python daemon brain + producer shell scripts)** (#3432, BREAKING) — the work-generation and pool-management brain deleted. Replacement: `mcp__loom__dispatch_sweep` (operator-driven enqueue) + GitHub Actions cron workflows (support roles).
+- **`daemon-state.json` fallback paths in 9 ported CLIs** (#3434) — the v0.9.1 ports of `loom-status`, `loom-backlog`, `loom-stuck-detection`, etc. carried fallback reads from `daemon-state.json` during the deprecation window. All trimmed; the spawn-loop + forge are now the only data sources.
+- **Dead shepherd-progress logic from `_is_claim_abandoned()`** (#3440).
+- **Dead `DEFAULT_HEARTBEAT_STALE_THRESHOLD` constant** (#3441 / PR #3448).
+
+### Fixed
+
+- **Preserve consumer-owned `CLAUDE.md`, `.gitignore`, `.github/` on reinstall** (#3450 / PR #3461) — narrow carve-outs in the install-time stale-file sweep so consumer-authored files at these roots survive upgrades. (Generation-time fix; the *consumption-time* fix lands in v0.10.2.)
+- **Exclude Loom-internal skills from consumer install** (#3464 / PR #3467) — `defaults/.loom-internal.list` enumerates skills meant for the Loom-source repo only (architect-patterns, hermit-patterns, etc.) so consumer installs don't get cluttered with them.
+- **`scripts/install-loom.sh`: reject unknown flags** (#3429) — previously silently ignored. Now fails fast with a clear error.
+- **`scripts/install-loom.sh`: `rm -rf` worktree dir after `git worktree remove`** (#3426) — Git's worktree remove leaves a stub directory under some conditions; the cleanup path now follows up with the directory removal.
+- **`validate_phase`: replace stale `loom-shepherd.sh` references with `/loom:sweep`** (#3439).
+- **CI: add `rust-toolchain.toml` to backend paths-filter** (#3444) so toolchain changes trigger the relevant Rust jobs.
+
+### Tests
+
+- **Installer upgrade-path tests for the stale-file sweep (Tests 42-44)** (#3442).
+- **Installer flag-rejection tests for the unknown-flag guard (Tests 45-47)** (#3443).
+
 ## [0.9.1] - 2026-06-04
 
 ### Summary
