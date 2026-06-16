@@ -81,6 +81,97 @@ install_hooks_and_cli() {
   fi
 }
 
+# Export LOOM_VERSION and LOOM_COMMIT so `loom-daemon init`'s template
+# substitution can fill {{LOOM_VERSION}} / {{LOOM_COMMIT}} placeholders in
+# the CLAUDE.md templates instead of falling back to the literal string
+# "unknown" (see loom-daemon/src/init/templates.rs:49-50). Issue #3502.
+#
+# Mirrors the env-export pattern from scripts/install-loom.sh:710,723.
+prepare_loom_metadata_env() {
+  local loom_root="$1"
+
+  if [[ ! -f "$loom_root/package.json" ]]; then
+    warning "Cannot find package.json in $loom_root — LOOM_VERSION will be 'unknown'"
+    return 0
+  fi
+
+  LOOM_VERSION=$(node -pe "require('$loom_root/package.json').version" 2>/dev/null) || {
+    warning "Failed to extract version from package.json — LOOM_VERSION will be 'unknown'"
+    return 0
+  }
+
+  LOOM_COMMIT=$(git -C "$loom_root" rev-parse --short HEAD 2>/dev/null) || {
+    warning "Failed to get git commit hash — LOOM_COMMIT will be 'unknown'"
+    LOOM_COMMIT=""
+  }
+
+  export LOOM_VERSION
+  export LOOM_COMMIT
+}
+
+# Post-`loom-daemon init` artifacts that loom-daemon does not write itself.
+# Invoked by both the `--quick` reinstall branch and the fresh `--quick`
+# install case so neither path drops:
+#   - .loom/config/skill-routes.json (port of scripts/install-loom.sh:1032-1048)
+#   - .loom/loom-source-path        (port of scripts/install-loom.sh:1067-1074)
+#   - .loom/install-metadata.json   (port of scripts/install-loom.sh:1261-1270)
+#
+# See issue #3502. Note: setup-python-tools.sh is intentionally NOT invoked
+# from --quick — Python tooling is out of scope for the fast install path.
+finalize_quick_install() {
+  local loom_root="$1"
+  local target="$2"
+
+  # 1. Copy default config files (skill-routes.json template, etc.).
+  if [[ -d "$loom_root/defaults/config" ]]; then
+    mkdir -p "$target/.loom/config"
+    for config_file in "$loom_root/defaults/config/"*.json; do
+      [[ -f "$config_file" ]] || continue
+      local config_name
+      config_name=$(basename "$config_file")
+      if [[ -f "$target/.loom/config/$config_name" ]]; then
+        info "Skipping existing config: $config_name"
+      else
+        cp "$config_file" "$target/.loom/config/$config_name"
+        success "Installed config: $config_name"
+      fi
+    done
+  fi
+
+  # 2. Record Loom source path (consumed by agent-metrics.sh and other
+  # wrapper scripts to locate loom-tools/ in the source checkout).
+  echo "$loom_root" > "$target/.loom/loom-source-path"
+  success "Recorded Loom source path"
+
+  # 3. Write install-metadata.json with the same schema as the legacy
+  # installer so uninstall-loom.sh and install-loom.sh's upgrade detector
+  # can both consume it.
+  local installed_files_json="[]"
+  if [[ -f "$loom_root/scripts/install/manifest.sh" ]]; then
+    # shellcheck source=/dev/null
+    LOOM_ROOT="$loom_root" TARGET_PATH="$target" \
+      source "$loom_root/scripts/install/manifest.sh"
+    installed_files_json="$(LOOM_ROOT="$loom_root" TARGET_PATH="$target" \
+      _emit_installed_files_manifest)"
+  else
+    warning "manifest.sh not found — install-metadata.json will have empty installed_files"
+  fi
+
+  local install_date
+  install_date="$(date +%Y-%m-%d)"
+
+  cat > "$target/.loom/install-metadata.json" <<METADATA
+{
+  "loom_version": "${LOOM_VERSION:-unknown}",
+  "loom_commit": "${LOOM_COMMIT:-unknown}",
+  "install_date": "${install_date}",
+  "loom_source": "${loom_root}",
+  "installed_files": ${installed_files_json}
+}
+METADATA
+  success "Recorded installation metadata"
+}
+
 # Verify critical installation files exist
 verify_install() {
   local target="$1"
@@ -88,6 +179,8 @@ verify_install() {
     ".loom/config.json"
     ".loom/scripts/worktree.sh"
     ".loom/scripts/lib/loom-tools.sh"
+    ".loom/install-metadata.json"
+    ".loom/config/skill-routes.json"
   )
   local missing=0
   for file in "${critical_files[@]}"; do
@@ -96,8 +189,25 @@ verify_install() {
       missing=$((missing + 1))
     fi
   done
+
+  # Defense-in-depth: surface any unsubstituted {{LOOM_VERSION}} /
+  # {{INSTALL_DATE}} survivors in .loom/CLAUDE.md (issue #3502). Also
+  # surface the literal "unknown" version line, which means the daemon's
+  # substituter ran but LOOM_VERSION was not exported before invocation.
+  local claude_md="$target/.loom/CLAUDE.md"
+  if [[ -f "$claude_md" ]]; then
+    if grep -q '{{LOOM_VERSION}}\|{{LOOM_COMMIT}}\|{{INSTALL_DATE}}\|{{REPO_OWNER}}\|{{REPO_NAME}}' "$claude_md"; then
+      warning "Unsubstituted template placeholder(s) found in .loom/CLAUDE.md"
+      missing=$((missing + 1))
+    fi
+    if grep -Eq '^\*\*Loom Version\*\*:[[:space:]]+unknown' "$claude_md"; then
+      warning ".loom/CLAUDE.md has 'Loom Version: unknown' — LOOM_VERSION was not exported before loom-daemon init"
+      missing=$((missing + 1))
+    fi
+  fi
+
   if [[ $missing -gt 0 ]]; then
-    warning "$missing critical file(s) missing after installation"
+    warning "$missing critical file(s) missing or corrupted after installation"
   fi
 }
 
@@ -475,12 +585,18 @@ elif [[ -d "$TARGET_PATH/.loom" ]]; then
       echo ""
     fi
 
+    # Export LOOM_VERSION / LOOM_COMMIT so the daemon's template substituter
+    # fills CLAUDE.md correctly (issue #3502).
+    prepare_loom_metadata_env "$LOOM_ROOT"
+
     # Run loom-daemon init
     "$LOOM_ROOT/target/release/loom-daemon" init --force --defaults "$LOOM_ROOT/defaults" "$TARGET_PATH" || \
       error "Installation failed"
 
     # Install hooks and CLI wrapper (not handled by loom-daemon init)
     install_hooks_and_cli "$LOOM_ROOT" "$TARGET_PATH"
+    # Emit skill-routes.json, install-metadata.json, loom-source-path (#3502).
+    finalize_quick_install "$LOOM_ROOT" "$TARGET_PATH"
     verify_install "$TARGET_PATH"
 
     echo ""
@@ -606,6 +722,10 @@ case "$METHOD" in
       echo ""
     fi
 
+    # Export LOOM_VERSION / LOOM_COMMIT so the daemon's template substituter
+    # fills CLAUDE.md correctly (issue #3502).
+    prepare_loom_metadata_env "$LOOM_ROOT"
+
     # Handle --clean: run local uninstall first, then fresh install
     if [[ "$FORCE_FLAG" == "--clean" ]]; then
       info "Running local uninstall before fresh install..."
@@ -623,6 +743,8 @@ case "$METHOD" in
 
     # Install hooks and CLI wrapper (not handled by loom-daemon init)
     install_hooks_and_cli "$LOOM_ROOT" "$TARGET_PATH"
+    # Emit skill-routes.json, install-metadata.json, loom-source-path (#3502).
+    finalize_quick_install "$LOOM_ROOT" "$TARGET_PATH"
     verify_install "$TARGET_PATH"
 
     echo ""
