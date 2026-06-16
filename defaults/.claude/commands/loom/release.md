@@ -148,12 +148,87 @@ This keeps automated release pipelines unblocked while leaving an audit trail in
 
 ## Phase 2: Gather Changes
 
+### Phase 2a: Detect the version-bumping tool
+
+Before any bump-related probe (current version, `list`, `bump`), detect which version tool the host repo uses. **First match wins**, in this order: bundled `./scripts/version.sh` → `cargo-release` → `bumpversion`/`bump2version` → `poetry` → `npm`. The detected tool is recorded in `VERSION_TOOL` and surfaced to the operator before any bump runs.
+
+`./scripts/version.sh` is intentionally first: it is installed by `install-loom.sh` and may have been deliberately customized for this repo (added a project-specific manifest, removed Loom-internal files). Honoring an explicit script wins over auto-detecting a different tool. Operators who prefer their native tool can delete `scripts/version.sh` after install — the next release will pick up the detected tool instead.
+
+```bash
+# Detection order — first match wins. Portable to bash 3.2 (macOS default).
+VERSION_TOOL=""
+VERSION_TOOL_REASON=""
+
+if [ -x ./scripts/version.sh ]; then
+  VERSION_TOOL="version.sh"
+  VERSION_TOOL_REASON="./scripts/version.sh is executable"
+elif command -v cargo-release >/dev/null 2>&1 && [ -f Cargo.toml ]; then
+  VERSION_TOOL="cargo-release"
+  VERSION_TOOL_REASON="cargo-release on PATH and Cargo.toml present"
+elif command -v bumpversion >/dev/null 2>&1 && { [ -f .bumpversion.cfg ] || [ -f setup.cfg ]; }; then
+  VERSION_TOOL="bumpversion"
+  VERSION_TOOL_REASON="bumpversion on PATH and .bumpversion.cfg/setup.cfg present"
+elif command -v bump2version >/dev/null 2>&1 && [ -f .bumpversion.cfg ]; then
+  VERSION_TOOL="bump2version"
+  VERSION_TOOL_REASON="bump2version on PATH and .bumpversion.cfg present"
+elif command -v poetry >/dev/null 2>&1 && [ -f pyproject.toml ] && grep -q '\[tool.poetry\]' pyproject.toml; then
+  VERSION_TOOL="poetry"
+  VERSION_TOOL_REASON="poetry on PATH and [tool.poetry] in pyproject.toml"
+elif command -v npm >/dev/null 2>&1 && [ -f package.json ]; then
+  VERSION_TOOL="npm"
+  VERSION_TOOL_REASON="npm on PATH and package.json present"
+fi
+
+if [ -n "$VERSION_TOOL" ]; then
+  echo "Detected version tool: $VERSION_TOOL ($VERSION_TOOL_REASON)"
+else
+  echo "No version tool detected. Probed candidates (in order):"
+  echo "  1. ./scripts/version.sh        (not executable or absent)"
+  echo "  2. cargo-release + Cargo.toml  (one or both missing)"
+  echo "  3. bumpversion + .bumpversion.cfg/setup.cfg"
+  echo "  4. bump2version + .bumpversion.cfg"
+  echo "  5. poetry + pyproject.toml with [tool.poetry]"
+  echo "  6. npm + package.json"
+fi
+```
+
+**Surface the detected tool to the operator** before any subsequent phase runs. If `VERSION_TOOL` is empty, **do not silently proceed** — ask the operator how to handle the bump:
+
+```
+No version-bumping tool was detected in this repo.
+
+Options:
+  [m] Manual: I'll edit the manifest files myself, then come back to commit + tag.
+  [s] Install Loom's bundled scripts/version.sh (re-run `install-loom.sh` or copy it manually)
+      and re-invoke /loom:release.
+  [a] Abort.
+
+Choose [m/s/a]:
+```
+
+On `[m]`, skip Phase 5's automated bump and walk the operator through the manual edit/commit/tag flow with the version they confirmed in Phase 3. On `[s]` or `[a]`, exit cleanly.
+
+### Phase 2b: Gather changes
+
 ```bash
 # Find the last release tag
 git tag --sort=-v:refname | head -1
 
-# Show current version
-./scripts/version.sh
+# Show current version (only if a tool was detected; tool-specific syntax below)
+case "$VERSION_TOOL" in
+  version.sh)   ./scripts/version.sh ;;
+  cargo-release)
+    # cargo-release does not have a "show version" subcommand; read it from Cargo.toml.
+    grep -m1 '^version' Cargo.toml | sed 's/.*"\(.*\)"/\1/'
+    ;;
+  bumpversion|bump2version)
+    grep -m1 '^current_version' .bumpversion.cfg 2>/dev/null | sed 's/.*=[[:space:]]*//' \
+      || grep -m1 '^current_version' setup.cfg 2>/dev/null | sed 's/.*=[[:space:]]*//'
+    ;;
+  poetry)       poetry version -s ;;
+  npm)          node -p "require('./package.json').version" ;;
+  *)            echo "(no version tool — operator will report current version manually)" ;;
+esac
 
 # List all commits since that tag
 git log <last-tag>..HEAD --oneline
@@ -252,23 +327,93 @@ Present the draft and ask for revisions. Iterate until approved.
 Once the user approves:
 
 1. **Update CHANGELOG.md** (if it exists): Insert the new entry below `## [Unreleased]`.
-2. **Discover the version-bearing files** so the user knows what will change:
-   ```bash
-   ./scripts/version.sh list
-   ```
-   This emits the canonical list, one path per line, straight from the script's source-of-truth array.
-3. **Bump version**: Run `./scripts/version.sh bump <level> --tag`
-   - This updates every file emitted by `./scripts/version.sh list`.
-   - Any derived artifacts the script updates as a side effect (e.g., a lockfile via `cargo update` or `npm install`) are handled by the script itself.
-   - The script creates the commit and tag automatically.
-4. **Verify**: `./scripts/version.sh check`
+2. **Discover the version-bearing files** so the user knows what will change. Dispatch on `VERSION_TOOL` from Phase 2a:
 
-Note: the version bump script creates the commit. To keep the CHANGELOG bump and the version bump together in a single tagged commit, commit the CHANGELOG first and then move the tag forward after the version bump:
+   ```bash
+   case "$VERSION_TOOL" in
+     version.sh)
+       ./scripts/version.sh list
+       ;;
+     cargo-release)
+       # cargo-release uses Cargo workspace metadata; show the members it will touch.
+       cargo metadata --no-deps --format-version 1 \
+         | python3 -c 'import json,sys; m=json.load(sys.stdin)["packages"]; [print(p["manifest_path"]) for p in m]'
+       ;;
+     bumpversion|bump2version)
+       # bumpversion's manifest set lives in the [bumpversion:file:...] sections.
+       grep -E '^\[bumpversion:file:' .bumpversion.cfg 2>/dev/null \
+         || grep -E '^\[bumpversion:file:' setup.cfg 2>/dev/null \
+         || echo "(no [bumpversion:file:*] sections — only the config file itself will be bumped)"
+       ;;
+     poetry)
+       echo "pyproject.toml"
+       ;;
+     npm)
+       echo "package.json"
+       [ -f package-lock.json ] && echo "package-lock.json"
+       ;;
+   esac
+   ```
+
+   Show the operator the manifest set the chosen tool will modify. For `bumpversion`/`bump2version` the set is whatever the config declares; for `cargo-release` it is the workspace members; for the others it is the single package manifest.
+
+3. **Bump version**: dispatch the bump command on `VERSION_TOOL`. `<level>` is `patch` / `minor` / `major` from Phase 3; `X.Y.Z` is the resolved version string. Each branch must produce a tagged version commit equivalent to `./scripts/version.sh bump <level> --tag`.
+
+   ```bash
+   case "$VERSION_TOOL" in
+     version.sh)
+       ./scripts/version.sh bump <level> --tag
+       ;;
+     cargo-release)
+       # cargo-release defaults to dry-run; --execute performs the work.
+       # --no-publish skips `cargo publish` (the GitHub Release flow in Phase 6 handles distribution).
+       cargo release <level> --execute --no-publish
+       ;;
+     bumpversion)
+       bumpversion <level> --tag --commit
+       ;;
+     bump2version)
+       bump2version <level> --tag --commit
+       ;;
+     poetry)
+       poetry version <level>
+       git add pyproject.toml
+       git commit -m "chore: bump version to $(poetry version -s)"
+       git tag "v$(poetry version -s)"
+       ;;
+     npm)
+       # npm version handles commit + tag automatically; --no-git-tag-version=false is the default.
+       npm version <level> -m "chore: bump version to %s"
+       ;;
+   esac
+   ```
+
+   - Each branch produces both the commit and the tag in a form the rest of the skill can push.
+   - Tool-specific side effects (lockfile regeneration, etc.) are handled by the tool itself; do not double-update.
+
+4. **Verify**:
+
+   ```bash
+   case "$VERSION_TOOL" in
+     version.sh)   ./scripts/version.sh check ;;
+     cargo-release) cargo check --workspace ;;
+     bumpversion|bump2version)
+       # bumpversion writes current_version back to the config; re-read to confirm.
+       grep -m1 '^current_version' .bumpversion.cfg 2>/dev/null \
+         || grep -m1 '^current_version' setup.cfg 2>/dev/null
+       ;;
+     poetry)       poetry version ;;
+     npm)          node -p "require('./package.json').version" ;;
+   esac
+   git tag --sort=-v:refname | head -1   # confirm the new tag exists
+   ```
+
+Note: every tool in the dispatch above creates its own commit. To keep the CHANGELOG bump and the version bump together in a single tagged commit, commit the CHANGELOG first and then move the tag forward after the version bump:
 
 ```bash
 git add CHANGELOG.md
 git commit -m "docs: add X.Y.Z changelog entry"
-./scripts/version.sh bump <level> --tag
+# ...run the tool-specific bump above...
 # Move tag to include both commits
 git tag -f vX.Y.Z
 ```
@@ -304,7 +449,7 @@ After final confirmation:
 
 ## Phase 7: Post-Release Summary
 
-Present a summary. Tailor the build-workflow line based on whether a release workflow was detected in Phase 6:
+Present a summary. Tailor the build-workflow line based on whether a release workflow was detected in Phase 6, and the version-files line based on the detected tool from Phase 2a:
 
 ```
 ## Release Complete
@@ -312,16 +457,25 @@ Present a summary. Tailor the build-workflow line based on whether a release wor
 - Version: vX.Y.Z
 - Commit: <sha>
 - Tag: vX.Y.Z
+- Version tool: <VERSION_TOOL or "manual" if no tool detected>
 - GitHub Release: created
 - Build workflow: [triggered / N/A — no release workflow configured]
 - CHANGELOG: updated with N items
-- Version files updated: $(./scripts/version.sh list | wc -l | tr -d ' ') files (see `./scripts/version.sh list`)
+- Version files updated: <tool-specific count or summary>
 ```
+
+For the version-files line, report what the chosen tool actually modified:
+
+- `version.sh`: `$(./scripts/version.sh list | wc -l | tr -d ' ')` files (see `./scripts/version.sh list`)
+- `cargo-release`: the workspace member set (from Phase 5 step 2)
+- `bumpversion`/`bump2version`: the `[bumpversion:file:*]` set from `.bumpversion.cfg` / `setup.cfg`
+- `poetry`: `pyproject.toml`
+- `npm`: `package.json` (+ `package-lock.json` if present)
 
 ## Important Notes
 
-- **Version script**: `scripts/version.sh` is the single source of truth for version management. Never manually edit version numbers — let the script update every tracked file plus any derived artifacts.
-- **Discover, don't hardcode**: the set of version-bearing files is discovered at release time via `./scripts/version.sh list`. Do not bake a count or path list into prose; the script is authoritative.
+- **Version tool detection** (Phase 2a): the skill detects the host repo's version-bumping tool in a fixed order — `./scripts/version.sh` → `cargo-release` → `bumpversion`/`bump2version` → `poetry` → `npm` — and dispatches the bump command on the detected tool. The bundled `./scripts/version.sh` is intentionally first so Loom installs that have been customized for the repo continue to be honored.
+- **Discover, don't hardcode**: the set of version-bearing files is discovered at release time from whichever tool is detected (`./scripts/version.sh list`, Cargo workspace metadata, `[bumpversion:file:*]` sections, or the single canonical manifest for poetry/npm). Do not bake a count or path list into prose.
 - **Release workflow trigger** (when applicable): if `.github/workflows/release.yml` exists, it typically triggers on GitHub Release creation (`release: types: [created]`), NOT on tag push. In that case you must create a GitHub Release via `gh release create` to trigger the build. If no release workflow is configured, the tag push alone completes the release and no build artifacts are produced.
 - **Conventional commits**: many projects (including this one if it uses `feat:` / `fix:` / `chore:` prefixes) use conventional commits to drive the semver decision. Use the prefix breakdown from Phase 2 as input to Phase 3.
 - **Branch protection**: direct pushes to main from a release flow may show a ruleset bypass warning — this is expected for release commits when the project's policy allows admin bypass for tagged releases. If your project doesn't allow that, run the release through a PR instead.
