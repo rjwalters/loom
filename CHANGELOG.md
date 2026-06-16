@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.10.4] - 2026-06-16
+
+### Summary
+
+Patch release tying up two `/loom:release` follow-ups from v0.10.3 and seeding the first concrete step on the topics-injection-vs-procedural-overrides design space (#3503). Two fixes restore correctness — Phase 1.5's phantom `MISSING entries: (?, ...)` line on bash 3.2, and `install.sh --quick`'s dropped metadata/skill-routes/CLAUDE.md substitution — plus one additive seam mechanism (Option B) so projects can layer procedural overrides on top of the default `/loom:release` skill without forking it.
+
+### Fixed
+
+- **Phase 1.5 phantom MISSING entry on bash 3.2** — adds a single-line `[ -n "$_t" ] || continue` defensive guard at array population in `defaults/.claude/commands/loom/release.md`. Eliminates the bash-3.2 timing-sensitive `< <(...)` process-substitution boundary failure that surfaced `MISSING entries: (?, N commits)` during the v0.10.3 release flow. Real gaps are still detected (verified on synthesized CHANGELOG with `## [0.10.2]` block removed). (#3501 / PR #3504)
+- **`install.sh --quick` emits metadata, skill-routes, and CLAUDE.md substitution** — the fast install path now produces the three artifacts the upgrade detector / skill-router / template substituter expect: `install-metadata.json` (consumed by `scripts/install-loom.sh:763` and the uninstaller), `config/skill-routes.json`, and CLAUDE.md `{{LOOM_VERSION}}` / `{{LOOM_COMMIT}}` substitution (via a new `prepare_loom_metadata_env` helper that exports the vars before `loom-daemon init`). Shared `finalize_quick_install` helper invoked from both the reinstall and fresh-install branches. `verify_install` now also warns on surviving `{{...}}` placeholders or the literal `Loom Version: unknown` line so the regression class trips immediately next time. (#3502 / PR #3505)
+
+### Added
+
+- **`/loom:release` skill seams (Option B)** — annotates `defaults/.claude/commands/loom/release.md` with five named `<!-- LOOM-EXTENSION-POINT: <name> -->` HTML-comment markers at well-chosen phase boundaries that project-side topics files can target for procedural overrides: `pre-changelog-style` (Gap 3: CHANGELOG style override), `pre-push` (Gap 4: irreversibility prompt), `post-push` (Gap 1: multi-workflow trigger gate), `pre-github-release` (Gap 2: ordering enforcement), and `post-summary` (project-specific follow-ups). Adds a new "Operator extension points" doc section listing every seam, a new "scripts/version.sh interface" section documenting the subcommands the skill dispatches (`bump`, `set`, `list`, `check`, `--tag`) so projects with pre-existing forks know what to support, and an example topics file at `defaults/hooks/example-context/topics/release.md`. Markers are HTML comments so they render invisibly in the prose. No procedural content of the skill was changed. Options A (phase-extension files) and C (`@override`/`@inject` directives) from #3503's proposal sketch remain deferred. (#3503 / PR #3506)
+
 ## [0.10.3] - 2026-06-16
 
 ### Summary
