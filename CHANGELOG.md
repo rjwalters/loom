@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.10.3] - 2026-06-16
+
+### Summary
+
+Two quality-of-life improvements to `/loom:release` that compound the v0.10.2 generalization work — the skill now catches missed CHANGELOG entries before they accumulate, and it dispatches to the host repo's preferred version-bumping tool instead of always invoking the bundled `scripts/version.sh`. Both changes are skill-prose only; no binary or wire-protocol changes.
+
+### Added
+
+- **Phase 1.5 CHANGELOG completeness gate** — release skill now checks the last N (default 5) tags against `^## \[X.Y.Z\]` headers in `CHANGELOG.md` before cutting the next release. Detected gaps surface a three-way `[b]ackfill / [c]ontinue / [a]bort` prompt; `--yes` non-interactive mode prints a stderr warning and continues without blocking. No-op when `CHANGELOG.md` is absent (Phase 4 bootstrap still handles young repos). Catches the "we shipped v0.10.0 and v0.10.1 without their CHANGELOG blocks" failure mode the v0.10.2 backfill uncovered. (#3497 / PR #3499)
+- **Phase 2a version-tool detection** — release skill now probes the host repo for an existing version-bumping tool before invoking the bundled `scripts/version.sh`. Detection order (first match wins): `./scripts/version.sh` → `cargo-release` → `bumpversion`/`bump2version` → `poetry` → `npm`. The detected tool is surfaced to the operator before bumping; the no-tool case asks for explicit operator direction rather than silently falling through. Bump command syntax dispatches per tool. Loom's own release flow is unchanged since `./scripts/version.sh` is first in the order. (#3498 / PR #3500)
+
 ## [0.10.2] - 2026-06-15
 
 ### Summary
