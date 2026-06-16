@@ -153,9 +153,11 @@ This keeps automated release pipelines unblocked while leaving an audit trail in
 
 ### Phase 2a: Detect the version-bumping tool
 
-Before any bump-related probe (current version, `list`, `bump`), detect which version tool the host repo uses. **First match wins**, in this order: bundled `./scripts/version.sh` → `cargo-release` → `bumpversion`/`bump2version` → `poetry` → `npm`. The detected tool is recorded in `VERSION_TOOL` and surfaced to the operator before any bump runs.
+Before any bump-related probe (current version, `list`, `bump`), detect which version tool the host repo uses. **First match wins**, in this order: bundled `./scripts/version.sh` → `cargo-release` → `cargo set-version` (cargo-edit) → `cargo-workspace` (direct-edit fallback for `[workspace.package]` repos) → `bumpversion`/`bump2version` → `poetry` → `npm`. The detected tool is recorded in `VERSION_TOOL` and surfaced to the operator before any bump runs.
 
 `./scripts/version.sh` is intentionally first: it is installed by `install-loom.sh` and may have been deliberately customized for this repo (added a project-specific manifest, removed Loom-internal files). Honoring an explicit script wins over auto-detecting a different tool. Operators who prefer their native tool can delete `scripts/version.sh` after install — the next release will pick up the detected tool instead.
+
+The Cargo-aware probes (`cargo-release`, `cargo set-version`, `cargo-workspace`) come before the Python/JS probes because any repo with `[workspace.package]` in `Cargo.toml` is unambiguously a Rust workspace and the Cargo handlers are guaranteed to be correct for it. The `cargo-workspace` tier is a generic native-Cargo direct-edit fallback that does not require any external tool — it handles the most common Rust project shape (`[workspace]` + `[workspace.package].version` with `version.workspace = true` inheritance) using only `sed` + `cargo update --workspace`.
 
 ```bash
 # Detection order — first match wins. Portable to bash 3.2 (macOS default).
@@ -168,6 +170,20 @@ if [ -x ./scripts/version.sh ]; then
 elif command -v cargo-release >/dev/null 2>&1 && [ -f Cargo.toml ]; then
   VERSION_TOOL="cargo-release"
   VERSION_TOOL_REASON="cargo-release on PATH and Cargo.toml present"
+elif command -v cargo-set-version >/dev/null 2>&1 && [ -f Cargo.toml ]; then
+  # cargo-edit installs `cargo-set-version` as a binary on PATH; probe the binary
+  # the same way cargo-release is probed above. cargo-edit handles workspace
+  # inheritance natively, so prefer it over the direct-edit fallback when present.
+  VERSION_TOOL="cargo-set-version"
+  VERSION_TOOL_REASON="cargo-set-version (cargo-edit) on PATH and Cargo.toml present"
+elif [ -f Cargo.toml ] && grep -q '^\[workspace\.package\]' Cargo.toml; then
+  # Generic native-Cargo direct-edit fallback. Handles the common Rust shape
+  # (`[workspace]` + `[workspace.package].version` with `version.workspace = true`
+  # inheritance) using only sed + `cargo update --workspace` — no external tool
+  # required. Goes ahead of bumpversion/poetry/npm because `[workspace.package]`
+  # is unambiguous evidence the repo is a Rust workspace.
+  VERSION_TOOL="cargo-workspace"
+  VERSION_TOOL_REASON="Cargo.toml with [workspace.package] (no cargo-release or cargo-edit on PATH)"
 elif command -v bumpversion >/dev/null 2>&1 && { [ -f .bumpversion.cfg ] || [ -f setup.cfg ]; }; then
   VERSION_TOOL="bumpversion"
   VERSION_TOOL_REASON="bumpversion on PATH and .bumpversion.cfg/setup.cfg present"
@@ -186,16 +202,37 @@ if [ -n "$VERSION_TOOL" ]; then
   echo "Detected version tool: $VERSION_TOOL ($VERSION_TOOL_REASON)"
 else
   echo "No version tool detected. Probed candidates (in order):"
-  echo "  1. ./scripts/version.sh        (not executable or absent)"
-  echo "  2. cargo-release + Cargo.toml  (one or both missing)"
-  echo "  3. bumpversion + .bumpversion.cfg/setup.cfg"
-  echo "  4. bump2version + .bumpversion.cfg"
-  echo "  5. poetry + pyproject.toml with [tool.poetry]"
-  echo "  6. npm + package.json"
+  echo "  1. ./scripts/version.sh                              (not executable or absent)"
+  echo "  2. cargo-release + Cargo.toml                        (one or both missing)"
+  echo "  3. cargo-set-version (cargo-edit) + Cargo.toml       (one or both missing)"
+  echo "  4. cargo-workspace ([workspace.package] in Cargo.toml) (Cargo.toml missing or has no [workspace.package])"
+  echo "  5. bumpversion + .bumpversion.cfg/setup.cfg"
+  echo "  6. bump2version + .bumpversion.cfg"
+  echo "  7. poetry + pyproject.toml with [tool.poetry]"
+  echo "  8. npm + package.json"
 fi
 ```
 
-**Surface the detected tool to the operator** before any subsequent phase runs. If `VERSION_TOOL` is empty, **do not silently proceed** — ask the operator how to handle the bump:
+**Surface the detected tool to the operator** before any subsequent phase runs. If `VERSION_TOOL` is empty, **do not silently proceed** — ask the operator how to handle the bump. The `[s]` option text **branches on `[ -f Cargo.toml ]`**: when Cargo is present (a single-crate Cargo repo without `[workspace.package]`, since the workspace case is handled by the `cargo-workspace` detector), suggest installing a Cargo-aware bumper; otherwise suggest the bundled `scripts/version.sh`.
+
+When `[ -f Cargo.toml ]` (single-crate Cargo repo with no `[workspace.package]`):
+
+```
+No version-bumping tool was detected in this repo.
+
+Options:
+  [m] Manual: I'll edit the manifest files myself, then come back to commit + tag.
+  [s] Install a Cargo-aware version bumper and re-invoke /loom:release.
+      Recommended: `cargo install cargo-edit` (provides `cargo set-version`)
+      Alternative: `cargo install cargo-release`
+      (Loom's bundled scripts/version.sh is shaped for Loom's own multi-file
+       layout and will not help a generic Cargo repo.)
+  [a] Abort.
+
+Choose [m/s/a]:
+```
+
+When `Cargo.toml` is absent (non-Cargo repo with no detected tool):
 
 ```
 No version-bumping tool was detected in this repo.
@@ -220,8 +257,12 @@ git tag --sort=-v:refname | head -1
 # Show current version (only if a tool was detected; tool-specific syntax below)
 case "$VERSION_TOOL" in
   version.sh)   ./scripts/version.sh ;;
-  cargo-release)
-    # cargo-release does not have a "show version" subcommand; read it from Cargo.toml.
+  cargo-release|cargo-set-version|cargo-workspace)
+    # None of the cargo-* tiers have a "show version" subcommand; read it from
+    # the workspace root Cargo.toml. The top-level `version = "X.Y.Z"` line
+    # (column-0, no indent) is `[workspace.package].version` in workspace repos
+    # and the package version in single-crate repos. Inline dependency versions
+    # look like `{ version = "..." }` and don't match this pattern.
     grep -m1 '^version' Cargo.toml | sed 's/.*"\(.*\)"/\1/'
     ;;
   bumpversion|bump2version)
@@ -337,10 +378,49 @@ Once the user approves:
      version.sh)
        ./scripts/version.sh list
        ;;
-     cargo-release)
-       # cargo-release uses Cargo workspace metadata; show the members it will touch.
+     cargo-release|cargo-set-version)
+       # cargo-release and cargo set-version (cargo-edit) both operate on the
+       # Cargo workspace; show the member manifests they will touch.
        cargo metadata --no-deps --format-version 1 \
          | python3 -c 'import json,sys; m=json.load(sys.stdin)["packages"]; [print(p["manifest_path"]) for p in m]'
+       ;;
+     cargo-workspace)
+       # Direct-edit fallback: the workspace root Cargo.toml owns
+       # `[workspace.package].version`, and member crates that opt in via
+       # `version.workspace = true` inherit it transparently. If any member
+       # pins a literal `version = "X.Y.Z"` instead of inheriting, surface
+       # those manifests too so the operator can decide whether to bump them
+       # manually or accept the inconsistency.
+       echo Cargo.toml
+       cargo metadata --no-deps --format-version 1 2>/dev/null \
+         | python3 -c '
+import json, sys, re
+try:
+    packages = json.load(sys.stdin)["packages"]
+except Exception:
+    sys.exit(0)
+root = None
+for p in packages:
+    mp = p["manifest_path"]
+    # The workspace root Cargo.toml lives one directory above each member,
+    # so identify members by mismatched dirname; the root is already listed
+    # above.
+    pass
+for p in packages:
+    mp = p["manifest_path"]
+    try:
+        with open(mp) as f:
+            text = f.read()
+    except OSError:
+        continue
+    # Look for a literal top-level `version = "X.Y.Z"` (not `version.workspace`,
+    # not `version = { workspace = true }`). Members that inherit the workspace
+    # version do NOT have a top-level `version = "..."` line.
+    if re.search(r"(?m)^version\s*=\s*\"[0-9]+\.[0-9]+\.[0-9]+\"", text):
+        # Skip the workspace root itself (already printed above).
+        if mp.endswith("/Cargo.toml") and mp != "Cargo.toml":
+            print(mp)
+' 2>/dev/null || true
        ;;
      bumpversion|bump2version)
        # bumpversion's manifest set lives in the [bumpversion:file:...] sections.
@@ -358,7 +438,7 @@ Once the user approves:
    esac
    ```
 
-   Show the operator the manifest set the chosen tool will modify. For `bumpversion`/`bump2version` the set is whatever the config declares; for `cargo-release` it is the workspace members; for the others it is the single package manifest.
+   Show the operator the manifest set the chosen tool will modify. For `bumpversion`/`bump2version` the set is whatever the config declares; for `cargo-release` and `cargo-set-version` it is the workspace member manifests (`cargo set-version --workspace` handles inheritance natively); for `cargo-workspace` it is the workspace root `Cargo.toml` plus any member that pins a literal `version = "X.Y.Z"` instead of inheriting (mixed-inheritance case — let the operator confirm before bumping the additional manifests); for the others it is the single package manifest.
 
 3. **Bump version**: dispatch the bump command on `VERSION_TOOL`. `<level>` is `patch` / `minor` / `major` from Phase 3; `X.Y.Z` is the resolved version string. Each branch must produce a tagged version commit equivalent to `./scripts/version.sh bump <level> --tag`.
 
@@ -371,6 +451,41 @@ Once the user approves:
        # cargo-release defaults to dry-run; --execute performs the work.
        # --no-publish skips `cargo publish` (the GitHub Release flow in Phase 6 handles distribution).
        cargo release <level> --execute --no-publish
+       ;;
+     cargo-set-version)
+       # cargo set-version (cargo-edit) handles workspace inheritance natively.
+       # --workspace bumps the workspace root; member crates with
+       # `version.workspace = true` inherit. It does NOT commit or tag, so do
+       # both explicitly afterward.
+       cargo set-version --bump <level> --workspace
+       NEW_VERSION=$(grep -m1 '^version' Cargo.toml | sed 's/.*"\(.*\)"/\1/')
+       # Regenerate Cargo.lock to reflect the new version.
+       cargo update --workspace
+       git add -A
+       git commit -m "chore: bump version to ${NEW_VERSION}"
+       git tag "v${NEW_VERSION}"
+       ;;
+     cargo-workspace)
+       # Direct-edit fallback: rewrite the top-level `version = "X.Y.Z"` line in
+       # the workspace root Cargo.toml. The pattern `^version = "..."` (column-0,
+       # no indent) is `[workspace.package].version`; inline dependency versions
+       # look like `{ version = "..." }` and don't match.
+       #
+       # `NEW_VERSION` is `X.Y.Z` resolved from the operator's Phase 3 decision
+       # (level + current version). The skill computes it before this step runs.
+       #
+       # NOTE: this only updates the workspace root. If Phase 5 step 2 surfaced
+       # additional member manifests with literal `version = "X.Y.Z"` lines
+       # (mixed-inheritance workspace), the operator must decide whether to
+       # update those manually before continuing — the auto-walk is intentionally
+       # not baked in here (see implementation note in step 2 above).
+       sed -i.bak -E 's/^version = "[0-9]+\.[0-9]+\.[0-9]+"/version = "'"${NEW_VERSION}"'"/' Cargo.toml
+       rm -f Cargo.toml.bak
+       # Regenerate Cargo.lock to reflect the new workspace version.
+       cargo update --workspace
+       git add Cargo.toml Cargo.lock
+       git commit -m "chore: bump version to ${NEW_VERSION}"
+       git tag "v${NEW_VERSION}"
        ;;
      bumpversion)
        bumpversion <level> --tag --commit
@@ -399,7 +514,11 @@ Once the user approves:
    ```bash
    case "$VERSION_TOOL" in
      version.sh)   ./scripts/version.sh check ;;
-     cargo-release) cargo check --workspace ;;
+     cargo-release|cargo-set-version|cargo-workspace)
+       # All cargo-* tiers verify by running a workspace-wide cargo check; this
+       # catches both stale Cargo.lock entries and any mistyped version literals.
+       cargo check --workspace
+       ;;
      bumpversion|bump2version)
        # bumpversion writes current_version back to the config; re-read to confirm.
        grep -m1 '^current_version' .bumpversion.cfg 2>/dev/null \
@@ -476,6 +595,8 @@ For the version-files line, report what the chosen tool actually modified:
 
 - `version.sh`: `$(./scripts/version.sh list | wc -l | tr -d ' ')` files (see `./scripts/version.sh list`)
 - `cargo-release`: the workspace member set (from Phase 5 step 2)
+- `cargo-set-version`: the workspace member set bumped by `cargo set-version --workspace` (from Phase 5 step 2) plus `Cargo.lock`
+- `cargo-workspace`: workspace root `Cargo.toml` + `Cargo.lock` (plus any member manifests the operator confirmed in the mixed-inheritance case)
 - `bumpversion`/`bump2version`: the `[bumpversion:file:*]` set from `.bumpversion.cfg` / `setup.cfg`
 - `poetry`: `pyproject.toml`
 - `npm`: `package.json` (+ `package-lock.json` if present)
@@ -484,7 +605,7 @@ For the version-files line, report what the chosen tool actually modified:
 
 ## `scripts/version.sh` interface
 
-When the skill detects `./scripts/version.sh` (Phase 2a), it dispatches the following subcommands. Projects that ship a custom `scripts/version.sh` from a pre-v0.10.3 install must implement these, or delete the script entirely and let detection fall through to the next supported tool (`cargo-release`, `bumpversion`, `poetry`, `npm`).
+When the skill detects `./scripts/version.sh` (Phase 2a), it dispatches the following subcommands. Projects that ship a custom `scripts/version.sh` from a pre-v0.10.3 install must implement these, or delete the script entirely and let detection fall through to the next supported tool (`cargo-release`, `cargo-set-version`, `cargo-workspace`, `bumpversion`, `poetry`, `npm`).
 
 | Subcommand | Purpose | Required by Phase |
 |---|---|---|
@@ -521,7 +642,7 @@ Projects that find injection insufficient (i.e. need to REPLACE a phase's conten
 
 ## Important Notes
 
-- **Version tool detection** (Phase 2a): the skill detects the host repo's version-bumping tool in a fixed order — `./scripts/version.sh` → `cargo-release` → `bumpversion`/`bump2version` → `poetry` → `npm` — and dispatches the bump command on the detected tool. The bundled `./scripts/version.sh` is intentionally first so Loom installs that have been customized for the repo continue to be honored.
+- **Version tool detection** (Phase 2a): the skill detects the host repo's version-bumping tool in a fixed order — `./scripts/version.sh` → `cargo-release` → `cargo set-version` (cargo-edit) → `cargo-workspace` ([workspace.package] direct-edit fallback) → `bumpversion`/`bump2version` → `poetry` → `npm` — and dispatches the bump command on the detected tool. The bundled `./scripts/version.sh` is intentionally first so Loom installs that have been customized for the repo continue to be honored. The `cargo-workspace` tier is a no-external-tool fallback that covers the most common Rust project shape (`[workspace.package]` + `version.workspace = true` inheritance) using only `sed` + `cargo update --workspace`.
 - **Discover, don't hardcode**: the set of version-bearing files is discovered at release time from whichever tool is detected (`./scripts/version.sh list`, Cargo workspace metadata, `[bumpversion:file:*]` sections, or the single canonical manifest for poetry/npm). Do not bake a count or path list into prose.
 - **Release workflow trigger** (when applicable): if `.github/workflows/release.yml` exists, it typically triggers on GitHub Release creation (`release: types: [created]`), NOT on tag push. In that case you must create a GitHub Release via `gh release create` to trigger the build. If no release workflow is configured, the tag push alone completes the release and no build artifacts are produced.
 - **Conventional commits**: many projects (including this one if it uses `feat:` / `fix:` / `chore:` prefixes) use conventional commits to drive the semver decision. Use the prefix breakdown from Phase 2 as input to Phase 3.
