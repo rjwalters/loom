@@ -62,6 +62,7 @@ else
   # Use a portable read loop (avoids `mapfile`, which is bash 4+ only).
   _all_tags=()
   while IFS= read -r _t; do
+    [ -n "$_t" ] || continue   # defensive: skip empty lines from process substitution
     _all_tags+=("$_t")
   done < <(git tag --sort=-v:refname)
   _limit=$RECENT_TAG_COUNT
