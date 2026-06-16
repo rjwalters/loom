@@ -1,36 +1,48 @@
 # Release Manager
 
-You are preparing a release of **Loom** from the {{workspace}} repository.
+You are preparing a release of **{{workspace}}** from the {{workspace}} repository.
 
 ## Overview
 
 This skill guides a careful, interactive release process. Every release must:
-1. Verify CI is green on main
+1. Verify the main branch is in a release-ready state (CI green or clean-main if CI is absent)
 2. Analyze what changed since the last release
 3. Help the user decide the correct semver bump
 4. Draft and refine the CHANGELOG entry
-5. Update version across all 7 version-bearing files
+5. Update version across every version-bearing file (discovered from `./scripts/version.sh list`)
 6. Commit, tag, and (with confirmation) push
-7. Create a GitHub Release to trigger the build workflow
+7. If a release workflow is configured, create a GitHub Release to trigger it
 
 **Do not rush. Each phase requires user confirmation before proceeding.**
 
+**Project-specific customization**: this skill is generic. If your project needs release-time reminders (e.g., "remember to bump the protocol version when the API changes"), drop a `release.md` file in `.loom/context/topics/` — the methodology-injection hook will inject it on every invocation. Do NOT fork this skill.
+
 ## Phase 1: Pre-flight Checks
 
-Before starting, verify the release is safe to cut:
+Before starting, verify the release is safe to cut. The exact CI gate depends on whether the repo has any GitHub Actions workflows configured.
 
 ```bash
-# Check CI status on main
-gh run list --branch main --limit 5 --json name,conclusion --jq '.[] | "\(.name): \(.conclusion)"'
+# Detect whether CI workflows exist. The CI gate degrades gracefully
+# when none are present (greenfield repos without CI yet). Uses `find`
+# rather than `compgen -G` so the check works under both bash and zsh.
+if [ -d ".github/workflows" ] && [ -n "$(find .github/workflows -maxdepth 1 -type f \( -name '*.yml' -o -name '*.yaml' \) 2>/dev/null | head -1)" ]; then
+  echo "CI workflows detected; checking run status on main..."
+  gh run list --branch main --limit 5 --json name,conclusion --jq '.[] | "\(.name): \(.conclusion)"'
+else
+  echo "No CI workflows detected; using git status + open-PR check as the clean-main gate"
+fi
 
 # Check for open PRs that might need to land first
 gh pr list --state open --json number,title --jq '.[] | "#\(.number) \(.title)"'
 
-# Check for uncommitted changes
+# Check for uncommitted changes (always required)
 git status
 ```
 
-Present findings to the user. If CI is failing, stop and fix first. If there are open PRs, ask if they should land before the release.
+Present findings to the user:
+- If CI exists and is failing, stop and fix first.
+- If CI is absent, treat clean `git status` + zero blocking open PRs as the gate.
+- If there are open PRs, ask if they should land before the release.
 
 ## Phase 2: Gather Changes
 
@@ -58,38 +70,72 @@ If there are zero commits since the last tag, stop and tell the user there's not
 
 ## Phase 3: Semver Decision
 
-Present a semver analysis. Reference https://semver.org:
+Present a semver analysis. Reference https://semver.org. The categories below are generic — apply them to whatever public surface your project exposes (libraries, CLIs, protocols, file formats, etc.).
 
 ### Breaking Changes (MAJOR bump)
 Scan for:
-- Removed or renamed public API functions/types
-- Changed ForgeClient protocol methods
-- Changed CLI command flags/behavior
-- Changed MCP tool interfaces
-- Removed or renamed daemon commands
-- Changed config file format
+- Removed or renamed public API functions, types, or modules
+- Changed function signatures or return types in exported surfaces
+- Removed or renamed CLI commands, subcommands, or flags
+- Changed CLI command behavior in a way that breaks scripted callers
+- Changed wire-protocol / plugin-interface / IPC contracts
+- Changed configuration file format in a non-backward-compatible way
+- Removed or renamed environment variables that callers set
 
 ### New Capabilities (MINOR bump)
-- New forge support (e.g., Gitea, GitLab)
-- New CLI commands (`loom-forge`, `loom-auto-merge`)
-- New agent roles or orchestration features
-- New MCP tools
-- New configuration options
+- New public API surface (functions, types, modules)
+- New CLI commands, subcommands, or flags (additive, backward-compatible)
+- New configuration options (with sensible defaults preserving old behavior)
+- New optional plugin / protocol / IPC capabilities
+- New roles, agents, or orchestration features
 
 ### Bug Fixes / Internal (PATCH bump)
-- Bug fixes that don't change API
-- Performance improvements
-- Internal refactoring
+- Bug fixes that don't change any public API
+- Performance improvements with identical observable behavior
+- Internal refactoring not visible to consumers
 - Documentation updates
-- Dependency bumps
+- Dependency bumps (unless they change observable behavior)
 
 Present your recommendation and **ask the user to confirm or override**. Do not proceed until confirmed.
 
 ## Phase 4: Draft CHANGELOG
 
-Draft a CHANGELOG entry following the existing format in `CHANGELOG.md`. Study existing entries to match style.
+If `CHANGELOG.md` exists at the repo root, draft a new entry following its existing format. Study existing entries to match style.
 
-Key formatting rules:
+```bash
+# Check whether a CHANGELOG.md exists
+if [ -f CHANGELOG.md ]; then
+  echo "CHANGELOG.md found — drafting a new entry below ## [Unreleased]"
+  head -50 CHANGELOG.md
+else
+  echo "No CHANGELOG.md found — offering to bootstrap one"
+fi
+```
+
+If `CHANGELOG.md` is **absent** (e.g., a young repo that hasn't created one yet), ask the user: "No CHANGELOG.md found at the repo root. Create one with the standard 'Keep a Changelog' template? [Y/n]". If yes, write:
+
+```markdown
+# Changelog
+
+All notable changes to this project will be documented in this file.
+
+The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
+and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
+## [Unreleased]
+
+## [X.Y.Z] - YYYY-MM-DD
+
+### Summary
+<one-paragraph release theme>
+
+### Added
+- ...
+```
+
+If the user declines bootstrap, skip the CHANGELOG update and proceed with version bump only.
+
+Key formatting rules (when `CHANGELOG.md` exists or has just been bootstrapped):
 - Use `## [X.Y.Z] - YYYY-MM-DD` header with today's date
 - Start with a `### Summary` paragraph describing the release theme
 - Group changes under `### Added`, `### Changed`, `### Fixed`, `### Removed`, `### Renamed` as appropriate
@@ -103,14 +149,20 @@ Present the draft and ask for revisions. Iterate until approved.
 
 Once the user approves:
 
-1. **Update CHANGELOG.md**: Insert the new entry below `## [Unreleased]`
-2. **Bump version**: Run `./scripts/version.sh bump <level> --tag`
-   - This updates all 5 files: `package.json`, `mcp-loom/package.json`, 2 `Cargo.toml` files (`loom-daemon`, `loom-api`), `CLAUDE.md`
-   - Plus `Cargo.lock`
-   - Creates the commit and tag automatically
-3. **Verify**: `./scripts/version.sh check`
+1. **Update CHANGELOG.md** (if it exists): Insert the new entry below `## [Unreleased]`.
+2. **Discover the version-bearing files** so the user knows what will change:
+   ```bash
+   ./scripts/version.sh list
+   ```
+   This emits the canonical list, one path per line, straight from the script's source-of-truth array.
+3. **Bump version**: Run `./scripts/version.sh bump <level> --tag`
+   - This updates every file emitted by `./scripts/version.sh list`.
+   - Any derived artifacts the script updates as a side effect (e.g., a lockfile via `cargo update` or `npm install`) are handled by the script itself.
+   - The script creates the commit and tag automatically.
+4. **Verify**: `./scripts/version.sh check`
 
-Note: The version bump script creates the commit, so commit the CHANGELOG first:
+Note: the version bump script creates the commit. To keep the CHANGELOG bump and the version bump together in a single tagged commit, commit the CHANGELOG first and then move the tag forward after the version bump:
+
 ```bash
 git add CHANGELOG.md
 git commit -m "docs: add X.Y.Z changelog entry"
@@ -130,22 +182,27 @@ After final confirmation:
    git push origin main --tags
    ```
 
-2. **Create GitHub Release** (this triggers the build workflow):
+2. **Create GitHub Release**:
    ```bash
    gh release create vX.Y.Z --title "vX.Y.Z" --notes-file - <<< "$(changelog excerpt)"
    ```
    Use the CHANGELOG entry as the release notes.
 
-3. **Verify build triggered**:
+3. **Build workflow trigger** (only when a release workflow is configured):
    ```bash
-   gh run list --workflow=release.yml --limit 1
+   if ls .github/workflows/release.yml 2>/dev/null; then
+     echo "release.yml detected — the GitHub Release will trigger the build workflow."
+     gh run list --workflow=release.yml --limit 1
+   else
+     echo "No release.yml workflow detected — the GitHub Release will not trigger any build."
+   fi
    ```
 
 **Do not push or create the release without explicit user confirmation.**
 
 ## Phase 7: Post-Release Summary
 
-Present a summary:
+Present a summary. Tailor the build-workflow line based on whether a release workflow was detected in Phase 6:
 
 ```
 ## Release Complete
@@ -154,17 +211,15 @@ Present a summary:
 - Commit: <sha>
 - Tag: vX.Y.Z
 - GitHub Release: created
-- Build workflow: [triggered / status]
+- Build workflow: [triggered / N/A — no release workflow configured]
 - CHANGELOG: updated with N items
-- Version files: 5 files + Cargo.lock updated
+- Version files updated: $(./scripts/version.sh list | wc -l | tr -d ' ') files (see `./scripts/version.sh list`)
 ```
 
 ## Important Notes
 
-- **Version script**: `scripts/version.sh` is the single source of truth for version management. Never manually edit version numbers.
-- **5 version-bearing files**: `package.json`, `mcp-loom/package.json`, `loom-daemon/Cargo.toml`, `loom-api/Cargo.toml`, `CLAUDE.md`
-- **Release workflow trigger**: The build workflow (`.github/workflows/release.yml`) triggers on GitHub Release creation (`release: types: [created]`), NOT on tag push. You must create a GitHub Release via `gh release create`.
-- **Conventional commits**: This project uses conventional commit prefixes (`feat:`, `fix:`, `chore:`, etc.).
-- **Build output**: The release workflow builds `loom-daemon` binaries (Apple Silicon + Intel) and attaches them to the GitHub Release.
-- **CLAUDE.md update**: The version script updates the `**Loom Version**` line in CLAUDE.md automatically.
-- **Branch protection**: Direct pushes to main will show a ruleset bypass warning — this is expected for release commits.
+- **Version script**: `scripts/version.sh` is the single source of truth for version management. Never manually edit version numbers — let the script update every tracked file plus any derived artifacts.
+- **Discover, don't hardcode**: the set of version-bearing files is discovered at release time via `./scripts/version.sh list`. Do not bake a count or path list into prose; the script is authoritative.
+- **Release workflow trigger** (when applicable): if `.github/workflows/release.yml` exists, it typically triggers on GitHub Release creation (`release: types: [created]`), NOT on tag push. In that case you must create a GitHub Release via `gh release create` to trigger the build. If no release workflow is configured, the tag push alone completes the release and no build artifacts are produced.
+- **Conventional commits**: many projects (including this one if it uses `feat:` / `fix:` / `chore:` prefixes) use conventional commits to drive the semver decision. Use the prefix breakdown from Phase 2 as input to Phase 3.
+- **Branch protection**: direct pushes to main from a release flow may show a ruleset bypass warning — this is expected for release commits when the project's policy allows admin bypass for tagged releases. If your project doesn't allow that, run the release through a PR instead.

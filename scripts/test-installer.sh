@@ -1758,11 +1758,14 @@ else
       pass "All defaults/.loom-internal.list entries absent from consumer tree"
     fi
 
-    # AC1: specifically pin .claude/commands/loom/release.md as absent.
-    if [[ -e "$INTERNAL_REPO/.claude/commands/loom/release.md" ]]; then
-      fail "AC1: .claude/commands/loom/release.md must not be installed to consumers"
+    # Issue #3495: release.md is now generalized and SHIPS to consumers
+    # (it discovers version files via `./scripts/version.sh list` and uses
+    # `{{workspace}}` for the project name). Pin its presence so a future
+    # regression that re-adds it to .loom-internal.list fails this test.
+    if [[ -f "$INTERNAL_REPO/.claude/commands/loom/release.md" ]]; then
+      pass "#3495: generalized .claude/commands/loom/release.md ships to consumers"
     else
-      pass "AC1: .claude/commands/loom/release.md is absent from consumer install"
+      fail "#3495: .claude/commands/loom/release.md missing from consumer install"
     fi
 
     # The siblings must continue to ship — pin three representative skills.
@@ -1986,6 +1989,209 @@ if echo "$UNINSTALL_OUTPUT" | grep -qF "preserving $CONSUMER_COMMAND"; then
   pass "Warning emitted for preserved consumer command path"
 else
   fail "No 'preserving' warning emitted for $CONSUMER_COMMAND"
+fi
+echo ""
+
+
+# ==========================================================================
+# Section 11: Customized release.md migration (#3495)
+# ==========================================================================
+# These tests exercise the migration logic that install-loom.sh runs around
+# the loom-daemon init step: snapshot any pre-existing
+# `.claude/commands/loom/release.md`, then after init compare the snapshot
+# against the canonical defaults/ version and restore-vs-overwrite based on
+# operator flags. The block is self-contained in install-loom.sh (it uses
+# only NON_INTERACTIVE / FORCE_OVERWRITE and the snapshot path) so we
+# replay the exact shell shape here against controlled fixtures.
+
+# Helper: run the migration logic with a given pre-init disk content and
+# the given (NON_INTERACTIVE, FORCE_OVERWRITE) combination. Echoes the
+# post-migration on-disk content so the caller can assert.
+#
+# Args:
+#   $1  pre-init disk content for .claude/commands/loom/release.md
+#       (empty string means "no pre-existing file")
+#   $2  canonical defaults content (what daemon init writes after snapshot)
+#   $3  NON_INTERACTIVE  (true|false)
+#   $4  FORCE_OVERWRITE  (true|false)
+#   $5  interactive input fed via stdin (only consulted when both flags are false)
+#
+# Returns the final on-disk content via stdout.
+run_release_md_migration() {
+  local pre_init_content="$1"
+  local canonical_content="$2"
+  local non_interactive="$3"
+  local force_overwrite="$4"
+  local interactive_input="$5"
+
+  local sandbox
+  sandbox="$(mktemp -d)"
+  local loom_root_fake="$sandbox/loom-root"
+  local target="$sandbox/target"
+
+  mkdir -p "$loom_root_fake/defaults/.claude/commands/loom"
+  mkdir -p "$target/.claude/commands/loom"
+  printf '%s' "$canonical_content" > "$loom_root_fake/defaults/.claude/commands/loom/release.md"
+
+  # Replicate the "snapshot before init" step from install-loom.sh.
+  local RELEASE_MD_REL=".claude/commands/loom/release.md"
+  local RELEASE_MD_SNAPSHOT=""
+  if [[ -n "$pre_init_content" ]]; then
+    printf '%s' "$pre_init_content" > "$target/$RELEASE_MD_REL"
+    RELEASE_MD_SNAPSHOT="$(mktemp)"
+    cp "$target/$RELEASE_MD_REL" "$RELEASE_MD_SNAPSHOT"
+  fi
+
+  # Simulate loom-daemon init's overwrite-with-canonical behavior.
+  cp "$loom_root_fake/defaults/$RELEASE_MD_REL" "$target/$RELEASE_MD_REL"
+
+  # Inline the migration block from install-loom.sh against the local
+  # sandbox. The block must read identically — if it diverges from the
+  # installer, the test stops being a regression gate.
+  local NON_INTERACTIVE="$non_interactive"
+  local FORCE_OVERWRITE="$force_overwrite"
+  local LOOM_ROOT="$loom_root_fake"
+  (
+    cd "$target"
+    if [[ -n "${RELEASE_MD_SNAPSHOT:-}" ]] && [[ -f "$RELEASE_MD_SNAPSHOT" ]]; then
+      CANONICAL_RELEASE_MD="$LOOM_ROOT/defaults/$RELEASE_MD_REL"
+      if [[ -f "$CANONICAL_RELEASE_MD" ]] && ! cmp -s "$RELEASE_MD_SNAPSHOT" "$CANONICAL_RELEASE_MD"; then
+        PRESERVE_RELEASE_MD=true
+        if [[ "$FORCE_OVERWRITE" == "true" ]]; then
+          PRESERVE_RELEASE_MD=false
+        elif [[ "$NON_INTERACTIVE" == "true" ]]; then
+          : # preserve silently
+        else
+          # Interactive: consume the canned answer from stdin.
+          while read -r CONFIRM_RELEASE_MD; do
+            case "$CONFIRM_RELEASE_MD" in
+              y|Y) PRESERVE_RELEASE_MD=false; break ;;
+              n|N|"") break ;;
+              d|D) continue ;;
+              *) continue ;;
+            esac
+          done
+        fi
+        if [[ "$PRESERVE_RELEASE_MD" == "true" ]]; then
+          cp "$RELEASE_MD_SNAPSHOT" "$RELEASE_MD_REL"
+        fi
+      fi
+      rm -f "$RELEASE_MD_SNAPSHOT"
+    fi
+  ) <<< "$interactive_input" >/dev/null 2>&1
+
+  cat "$target/$RELEASE_MD_REL"
+  rm -rf "$sandbox"
+}
+
+echo "--- Section 11: Customized release.md migration (#3495) ---"
+echo ""
+
+CUSTOM_RELEASE="# Custom Anvil release\nThis was forked."
+CANONICAL_RELEASE="# Release Manager\nYou are preparing a release of **{{workspace}}**."
+
+# Test 55: --yes (NON_INTERACTIVE) preserves customization silently
+echo "Test 55: --yes preserves customized release.md silently"
+RESULT_55=$(run_release_md_migration "$CUSTOM_RELEASE" "$CANONICAL_RELEASE" "true" "false" "")
+if [[ "$RESULT_55" == "$(printf '%s' "$CUSTOM_RELEASE")" ]]; then
+  pass "--yes mode preserved customized release.md"
+else
+  fail "--yes mode should have preserved customization; got: $RESULT_55"
+fi
+
+# Test 56: --force replaces with canonical
+echo "Test 56: --force replaces customized release.md with canonical"
+RESULT_56=$(run_release_md_migration "$CUSTOM_RELEASE" "$CANONICAL_RELEASE" "false" "true" "")
+if [[ "$RESULT_56" == "$(printf '%s' "$CANONICAL_RELEASE")" ]]; then
+  pass "--force replaced customized release.md with canonical"
+else
+  fail "--force should have replaced with canonical; got: $RESULT_56"
+fi
+
+# Test 57: interactive default (empty/N) preserves customization
+echo "Test 57: Interactive default (N) preserves customization"
+RESULT_57=$(run_release_md_migration "$CUSTOM_RELEASE" "$CANONICAL_RELEASE" "false" "false" "")
+if [[ "$RESULT_57" == "$(printf '%s' "$CUSTOM_RELEASE")" ]]; then
+  pass "Interactive default (N) preserved customization"
+else
+  fail "Interactive default should preserve; got: $RESULT_57"
+fi
+
+# Test 58: interactive y replaces with canonical
+echo "Test 58: Interactive 'y' replaces customization with canonical"
+RESULT_58=$(run_release_md_migration "$CUSTOM_RELEASE" "$CANONICAL_RELEASE" "false" "false" "y")
+if [[ "$RESULT_58" == "$(printf '%s' "$CANONICAL_RELEASE")" ]]; then
+  pass "Interactive 'y' replaced customization with canonical"
+else
+  fail "Interactive 'y' should replace with canonical; got: $RESULT_58"
+fi
+
+# Test 59: idempotency — when pre-init matches canonical, no detection
+echo "Test 59: Identical pre-init and canonical → no migration prompt path"
+RESULT_59=$(run_release_md_migration "$CANONICAL_RELEASE" "$CANONICAL_RELEASE" "false" "false" "")
+if [[ "$RESULT_59" == "$(printf '%s' "$CANONICAL_RELEASE")" ]]; then
+  pass "Identical content → canonical kept (no detection path triggered)"
+else
+  fail "Identical content should be no-op; got: $RESULT_59"
+fi
+
+# Test 60: fresh install (no pre-existing) — canonical is kept
+echo "Test 60: Fresh install (no pre-existing release.md) keeps canonical"
+RESULT_60=$(run_release_md_migration "" "$CANONICAL_RELEASE" "false" "false" "")
+if [[ "$RESULT_60" == "$(printf '%s' "$CANONICAL_RELEASE")" ]]; then
+  pass "Fresh install keeps canonical (no snapshot path)"
+else
+  fail "Fresh install should keep canonical; got: $RESULT_60"
+fi
+
+# Test 61: the release.md skill discovers files via ./scripts/version.sh list
+echo "Test 61: release.md skill discovers version files via './scripts/version.sh list'"
+RELEASE_MD_SHIPPED="$LOOM_ROOT/defaults/.claude/commands/loom/release.md"
+if [[ -f "$RELEASE_MD_SHIPPED" ]]; then
+  if grep -q '\./scripts/version\.sh list' "$RELEASE_MD_SHIPPED"; then
+    pass "release.md uses './scripts/version.sh list' for discovery"
+  else
+    fail "release.md does not invoke './scripts/version.sh list'"
+  fi
+  if grep -q '{{workspace}}' "$RELEASE_MD_SHIPPED"; then
+    pass "release.md uses {{workspace}} for project name"
+  else
+    fail "release.md missing {{workspace}} for project name"
+  fi
+  # The Loom-specific bullets should no longer be present in the generic skill.
+  if ! grep -qE 'ForgeClient|loom-daemon binaries' "$RELEASE_MD_SHIPPED"; then
+    pass "release.md does not name Loom-specific symbols (ForgeClient, loom-daemon binaries)"
+  else
+    fail "release.md still references Loom-specific symbols"
+  fi
+else
+  fail "release.md skill not present at $RELEASE_MD_SHIPPED"
+fi
+
+# Test 62: ./scripts/version.sh list emits the expected 5 entries
+echo "Test 62: 'scripts/version.sh list' emits the 5 version-bearing files"
+LIST_OUTPUT="$("$LOOM_ROOT/scripts/version.sh" list)"
+EXPECTED_LIST="package.json
+mcp-loom/package.json
+loom-daemon/Cargo.toml
+loom-api/Cargo.toml
+CLAUDE.md"
+if [[ "$LIST_OUTPUT" == "$EXPECTED_LIST" ]]; then
+  pass "'version.sh list' emits the 5 expected files"
+else
+  fail "'version.sh list' output diverged from expectation"
+  echo "  Expected:"
+  echo "$EXPECTED_LIST" | sed 's/^/    /'
+  echo "  Got:"
+  echo "$LIST_OUTPUT" | sed 's/^/    /'
+fi
+
+# Test 63: ./scripts/version.sh check still works after the list addition
+echo "Test 63: 'scripts/version.sh check' still works (regression)"
+if "$LOOM_ROOT/scripts/version.sh" check >/dev/null 2>&1; then
+  pass "'version.sh check' still works alongside the new 'list' subcommand"
+else
+  fail "'version.sh check' regressed after adding 'list'"
 fi
 echo ""
 
