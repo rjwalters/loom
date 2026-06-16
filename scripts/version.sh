@@ -3,6 +3,7 @@
 #
 # Usage:
 #   ./scripts/version.sh                  # Show current version
+#   ./scripts/version.sh list             # List version-bearing files (one per line)
 #   ./scripts/version.sh check            # Verify all files are in sync
 #   ./scripts/version.sh bump patch       # 0.4.1 → 0.4.2
 #   ./scripts/version.sh bump minor       # 0.4.1 → 0.5.0
@@ -163,6 +164,15 @@ case "${1:-}" in
   ""|show)
     echo "$(get_version)"
     ;;
+  list)
+    # Emit the VERSION_FILES array, one entry per line.
+    # Used by the /loom:release skill to discover version-bearing files
+    # without hardcoding the count or names in skill prose. Cargo.lock is
+    # intentionally excluded — it's a derived artifact updated by
+    # `cargo update` as a side effect of the bump, not a directly-edited
+    # version source.
+    printf '%s\n' "${VERSION_FILES[@]}"
+    ;;
   check)
     check_versions
     ;;
@@ -186,7 +196,7 @@ case "${1:-}" in
     fi
     ;;
   *)
-    echo "Usage: $0 [show|check|bump <major|minor|patch> [--tag]|set <version> [--tag]]"
+    echo "Usage: $0 [show|list|check|bump <major|minor|patch> [--tag]|set <version> [--tag]]"
     exit 1
     ;;
 esac

@@ -913,6 +913,21 @@ info "loom-daemon binary: $DAEMON_VERSION"
 
 # Run loom-daemon init in the worktree
 cd "$TARGET_PATH/$WORKTREE_PATH"
+
+# Issue #3495: snapshot any pre-existing .claude/commands/loom/release.md
+# before `loom-daemon init` overwrites it. The generalized skill replaces
+# the historical Loom-internal one — but consumers (e.g. anvil) may have
+# hand-customized their fork. We restore the snapshot below the stale-file
+# sweep if the operator declines the migration. RELEASE_MD_SNAPSHOT stays
+# empty when there's no pre-existing file (greenfield install) or when no
+# customization is detectable.
+RELEASE_MD_REL=".claude/commands/loom/release.md"
+RELEASE_MD_SNAPSHOT=""
+if [[ -f "$RELEASE_MD_REL" ]]; then
+  RELEASE_MD_SNAPSHOT="$(mktemp)"
+  cp "$RELEASE_MD_REL" "$RELEASE_MD_SNAPSHOT"
+fi
+
 # Use --force to overwrite existing installation when requested (--force or --clean flags)
 # Otherwise, use merge mode to preserve custom project roles/commands
 # Use --defaults to point to Loom's defaults directory
@@ -1183,6 +1198,65 @@ if (( ${#STALE_FILES[@]} > 0 )); then
   fi
 fi
 # --- End stale-file sweep ---
+
+# --- Customized release.md migration (#3495) ---
+# Detect a pre-init customized .claude/commands/loom/release.md and offer to
+# preserve it. The skill was previously Loom-internal (kept out of consumer
+# trees via .loom-internal.list) so anvil and similar repos hand-forked it.
+# As of #3495 the canonical defaults/ version is generic and SHIPS to every
+# consumer. This step compares the pre-init snapshot against the canonical
+# and, on mismatch, prompts the operator before letting the freshly-copied
+# canonical version stand.
+#
+# Defaults:
+#   - Interactive: prompt [y/N/d=show diff], default N (preserve customization)
+#   - --yes (NON_INTERACTIVE): preserve silently
+#   - --force (FORCE_OVERWRITE): replace silently with a warning
+#   - Idempotent: if snapshot matches canonical (no customization), no-op
+if [[ -n "${RELEASE_MD_SNAPSHOT:-}" ]] && [[ -f "$RELEASE_MD_SNAPSHOT" ]]; then
+  CANONICAL_RELEASE_MD="$LOOM_ROOT/defaults/$RELEASE_MD_REL"
+  if [[ -f "$CANONICAL_RELEASE_MD" ]] && ! cmp -s "$RELEASE_MD_SNAPSHOT" "$CANONICAL_RELEASE_MD"; then
+    # Customization detected (pre-init disk content differs from canonical).
+    PRESERVE_RELEASE_MD=true
+    if [[ "$FORCE_OVERWRITE" == "true" ]]; then
+      PRESERVE_RELEASE_MD=false
+      warning "Replaced customized release.md with generalized version (--force)"
+    elif [[ "$NON_INTERACTIVE" == "true" ]]; then
+      info "Preserved customized release.md (--yes default; pass --force to replace)"
+    else
+      echo ""
+      info "Customized release.md detected. The generalized Loom version now"
+      info "ships out of the box and should work for any project."
+      while true; do
+        read -r -p "Replace customized release.md with the generalized version? [y/N/d=show diff] " CONFIRM_RELEASE_MD
+        case "$CONFIRM_RELEASE_MD" in
+          y|Y)
+            PRESERVE_RELEASE_MD=false
+            break
+            ;;
+          d|D)
+            echo ""
+            diff -u "$RELEASE_MD_SNAPSHOT" "$CANONICAL_RELEASE_MD" || true
+            echo ""
+            ;;
+          n|N|"")
+            break
+            ;;
+          *)
+            echo "Please answer y, N, or d."
+            ;;
+        esac
+      done
+    fi
+    if [[ "$PRESERVE_RELEASE_MD" == "true" ]]; then
+      cp "$RELEASE_MD_SNAPSHOT" "$RELEASE_MD_REL"
+      info "Preserved customized release.md (re-run with --force to replace next time)"
+    fi
+  fi
+  rm -f "$RELEASE_MD_SNAPSHOT"
+  RELEASE_MD_SNAPSHOT=""
+fi
+# --- End customized release.md migration ---
 
 cat > .loom/install-metadata.json <<METADATA
 {

@@ -17,5 +17,12 @@
 # a stray `/loom:*` skill or auxiliary file.
 #
 # Tracked under issue #3464.
-
-.claude/commands/loom/release.md
+#
+# Issue #3495: `.claude/commands/loom/release.md` was previously listed
+# here when the skill was Loom-specific (it hardcoded the Loom project
+# name, version-file count, and Loom-only semver examples). The skill is
+# now generalized — it discovers everything via `./scripts/version.sh
+# list` and uses `{{workspace}}` for the project name — so it ships to
+# every downstream repo. The installer migration step in
+# `scripts/install-loom.sh` handles consumers that had a hand-customized
+# fork by snapshotting before init and prompting before replacing.
