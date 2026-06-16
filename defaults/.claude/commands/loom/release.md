@@ -44,6 +44,108 @@ Present findings to the user:
 - If CI is absent, treat clean `git status` + zero blocking open PRs as the gate.
 - If there are open PRs, ask if they should land before the release.
 
+## Phase 1.5: CHANGELOG Completeness Gate
+
+Before gathering changes for the **current** release, verify that the last N shipped tags each have an entry in `CHANGELOG.md`. This catches the "we shipped v0.10.0 and v0.10.1 without adding their CHANGELOG blocks" failure mode — it's cheap to detect at release time and forensically expensive to reconstruct weeks later.
+
+**No-op when CHANGELOG is absent.** If `CHANGELOG.md` does not exist at the repo root, skip this gate entirely — Phase 4 already handles the bootstrap path for young repos.
+
+```bash
+# Skip the gate when CHANGELOG.md is absent — Phase 4 will offer to bootstrap it.
+if [ ! -f CHANGELOG.md ]; then
+  echo "No CHANGELOG.md — skipping completeness gate (Phase 4 will offer bootstrap)"
+else
+  # Default N=5 — covers roughly a quarter of releases at weekly cadence.
+  RECENT_TAG_COUNT=${RECENT_TAG_COUNT:-5}
+  missing_tags=()
+  # Read the full descending tag list once so we can compute prev-tag ranges.
+  # Use a portable read loop (avoids `mapfile`, which is bash 4+ only).
+  _all_tags=()
+  while IFS= read -r _t; do
+    _all_tags+=("$_t")
+  done < <(git tag --sort=-v:refname)
+  _limit=$RECENT_TAG_COUNT
+  if [ "${#_all_tags[@]}" -lt "$_limit" ]; then
+    _limit=${#_all_tags[@]}
+  fi
+  i=0
+  while [ "$i" -lt "$_limit" ]; do
+    tag="${_all_tags[$i]}"
+    # Strip leading 'v' for matching against `## [X.Y.Z]` headers.
+    version="${tag#v}"
+    if ! grep -qE "^## \[${version}\]" CHANGELOG.md; then
+      tag_date=$(git log -1 --format=%cs "$tag" 2>/dev/null || echo "?")
+      next_idx=$((i + 1))
+      if [ "$next_idx" -lt "${#_all_tags[@]}" ]; then
+        prev_tag="${_all_tags[$next_idx]}"
+        commit_count=$(git rev-list --count "${prev_tag}..${tag}" 2>/dev/null || echo "?")
+      else
+        # Oldest tag in the window: fall back to total reachable commits.
+        commit_count=$(git rev-list --count "$tag" 2>/dev/null || echo "?")
+      fi
+      missing_tags+=("$tag ($tag_date, $commit_count commits)")
+    fi
+    i=$((i + 1))
+  done
+
+  if [ "${#missing_tags[@]}" -gt 0 ]; then
+    echo "⚠️  CHANGELOG has no entry for the following recent tags:"
+    for entry in "${missing_tags[@]}"; do
+      echo "    $entry"
+    done
+  fi
+fi
+```
+
+If any recent tag is missing an entry, surface the gap to the operator and offer the three-way choice. Interactive prompt format:
+
+```
+⚠️  CHANGELOG has no entry for the following recent tags:
+    v0.10.0 (2026-06-05, 26 commits)
+    v0.10.1 (2026-06-13, 14 commits)
+
+Options:
+  [b] Backfill these entries now (drafts entries via Phase 4 logic, one per gap)
+  [c] Continue without backfill (leaves the gap in CHANGELOG.md)
+  [a] Abort the release
+
+Choose [b/c/a]:
+```
+
+### `[b]` Backfill path
+
+For each missing tag (oldest gap first to preserve chronological order in the file):
+
+1. Determine the previous shipped tag (the next-older tag in `git tag --sort=-v:refname`).
+2. Reuse Phase 4's draft logic with the `<prev-tag>..<missing-tag>` commit range as input.
+3. Present the draft to the operator for revisions exactly as Phase 4 does for the current release.
+4. Insert the approved entry into `CHANGELOG.md` in the correct chronological slot (after the next-newer entry, before the next-older entry).
+5. Commit each backfill as a separate `docs(changelog): backfill <version> entry` commit, or fold them all into a single `docs(changelog): backfill <X.Y.Z>, <A.B.C>` commit at the operator's preference.
+
+Backfill commits land on `main` before the current-release flow continues — they do **not** become part of the new release tag.
+
+### `[c]` Continue path
+
+Acknowledge the gap and proceed to Phase 2. The gap remains in `CHANGELOG.md`; record nothing extra. This is the right choice for urgent fixes where the operator intends to backfill later.
+
+### `[a]` Abort path
+
+Stop the release. Exit cleanly with a one-line summary listing the missing tags so the operator can plan the backfill before the next attempt.
+
+### `--yes` non-interactive mode
+
+When the skill is invoked non-interactively (e.g., `--yes` flag or detected automation context), do **not** block:
+
+- Print a single-line warning to stderr: `WARN: CHANGELOG missing entries for: v0.10.0, v0.10.1 (continuing — re-run interactively to backfill)`.
+- Continue to Phase 2 (equivalent to the `[c]` path).
+
+This keeps automated release pipelines unblocked while leaving an audit trail in the log.
+
+### Tuning
+
+- `RECENT_TAG_COUNT` (default 5) — number of most-recent tags to check. Override via env var for projects with non-weekly cadence.
+- The gate scans only the **top N tags by semver descending**. Older gaps are out of scope; if you discover a deeper historical gap, file a separate backfill issue rather than letting it block the current release.
+
 ## Phase 2: Gather Changes
 
 ```bash
