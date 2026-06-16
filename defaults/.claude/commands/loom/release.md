@@ -674,13 +674,15 @@ The skill currently never invokes `set`, but it is documented here because the b
 
 This skill exposes the following named seams (HTML-comment markers) that project-specific topic injections can target. Seam names are stable contracts — once published they will not be renamed; new seams may be added over time. Markers are HTML comments, so they do not render in the prose.
 
-| Seam | Location | Intended use |
-|---|---|---|
-| `pre-changelog-style` | Just before Phase 1.5 (CHANGELOG Completeness Gate) | Inject CHANGELOG-style overrides (e.g., themed-section grouping, Keep-a-Changelog opt-outs, project-specific entry conventions). |
-| `pre-push` | Just before Phase 6 (Push and Release) | Inject the project's irreversibility prompt or any final pre-push gate (e.g., "confirm you intend to push tag `vX.Y.Z` and trigger N downstream workflows"). |
-| `post-push` | Inside Phase 6, after the `git push origin main --tags` step and before the GitHub Release is created | Inject post-push procedural steps such as polling multiple registry/publish workflows for completion before continuing. |
-| `pre-github-release` | Inside Phase 6, immediately before `gh release create` | Inject pre-release-creation gates (e.g., "wait for both Crates and npm workflows to finish before creating the GitHub Release"). |
-| `post-summary` | After Phase 7 (Post-Release Summary) | Inject project-specific follow-up steps (e.g., "post release announcement", "ping #releases Slack channel", "open the next milestone"). |
+| Seam | Marker location | Phase scope | Intended use |
+|---|---|---|---|
+| `pre-changelog-style` | Just before Phase 1.5 (CHANGELOG Completeness Gate) | **Phase 1.5 AND Phase 4** — content injected here is in scope for both Phase 1.5's gap-detection regex (`^## \[X.Y.Z\]`) and Phase 4's CHANGELOG drafting prose. The single marker placed before Phase 1.5 covers both phases by contract. | Inject CHANGELOG-style overrides (e.g., themed-section grouping, Keep-a-Changelog opt-outs, project-specific entry conventions, custom header patterns like `## Release notes — vX.Y.Z (YYYY-MM-DD)`). |
+| `pre-push` | Just before Phase 6 (Push and Release) | Phase 6 (pre-push) | Inject the project's irreversibility prompt or any final pre-push gate (e.g., "confirm you intend to push tag `vX.Y.Z` and trigger N downstream workflows"). |
+| `post-push` | Inside Phase 6, after the `git push origin main --tags` step and before the GitHub Release is created | Phase 6 (between push and GitHub Release creation) | Inject post-push procedural steps such as polling multiple registry/publish workflows for completion before continuing. |
+| `pre-github-release` | Inside Phase 6, immediately before `gh release create` | Phase 6 (immediately pre-release) | Inject pre-release-creation gates (e.g., "wait for both Crates and npm workflows to finish before creating the GitHub Release"). |
+| `post-summary` | After Phase 7 (Post-Release Summary) | Phase 7 (post-summary) | Inject project-specific follow-up steps (e.g., "post release announcement", "ping #releases Slack channel", "open the next milestone"). |
+
+**Note on `pre-changelog-style` dual-phase scope**: the seam name records the marker *location* (just before Phase 1.5), but the contract is that any injected content authored against this seam applies to both Phase 1.5 (the detection regex) and Phase 4 (the drafting prose). Projects whose CHANGELOG style still produces `## [X.Y.Z]` headers (the default Keep-a-Changelog shape) only need to influence Phase 4; projects with a non-default header pattern need both phases to honor the override, and the single marker covers them by contract. There is intentionally no separate `pre-changelog-draft` seam — the dual-phase contract avoids the API surface cost. If your project genuinely needs separate Phase 1.5 vs Phase 4 injection points, file an issue referencing this note so the design can be revisited with concrete evidence.
 
 **How projects use these seams**: drop a `release.md` file in `.loom/context/topics/` (the existing methodology-injection mechanism) and reference the target seam name in prose. The agent reading the skill plus the injected topic file will compose them at runtime. Example topic snippet:
 
@@ -691,7 +693,34 @@ At extension point `pre-github-release`: do NOT run `gh release create` until BO
 Poll with `gh run list --workflow=<file> --limit 1 --json conclusion` until both report `success`.
 ```
 
-Projects that find injection insufficient (i.e. need to REPLACE a phase's content, not just inject alongside it) should file an issue requesting Option A (named phase-extension files) — see the architect notes on #3503.
+### Composition semantics: augment vs replace (prose-prefix convention)
+
+The seam names (`pre-X`, `post-X`) describe *where* a topic-file override fires, not whether it composes additively with or overrides the skill's default behavior at that seam. The composition mode is signaled by the **prose prefix** the topic-file author writes when referencing the seam. The agent reading both files honors the prefix at runtime.
+
+| Prose prefix | Semantics | Composition rule |
+|---|---|---|
+| `At extension point <seam>: <directive>` | **Augment** (additive) | Run the default behavior at this seam AND the injected directive. The default is preserved; the override runs alongside it (typically before for `pre-X`, after for `post-X`). |
+| `At extension point <seam>, replacing default behavior: <directive>` | **Replace** (override) | The injected directive REPLACES whatever the default does at this seam. The default behavior at that seam does not run. |
+
+**Worked examples**:
+
+- *Augment example* — add a confirmation gate before the existing push, without removing it:
+
+  > At extension point `pre-push`: ask the operator to confirm the irreversibility of pushing tag `vX.Y.Z` before proceeding.
+
+  Phase 6 runs the confirmation first, then runs its default `git push origin main --tags` step.
+
+- *Replace example* — substitute a multi-workflow gate for the default "create the release immediately" behavior:
+
+  > At extension point `pre-github-release`, replacing default behavior: poll `.github/workflows/publish-crate.yml` and `.github/workflows/publish-npm.yml` until both succeed, THEN run `gh release create vX.Y.Z --title "vX.Y.Z" --notes-file -` with the CHANGELOG excerpt.
+
+  Phase 6's default `gh release create` does not run on its own; the topic-file directive owns the GitHub Release creation entirely.
+
+**When in doubt**: prefer the augment form. It is the safer default — the skill's existing behavior at the seam is preserved, and the override layers on top. Use the replace form only when the default behavior at the seam is incompatible with the project's release flow (the multi-workflow gate above is the canonical case: you cannot run `gh release create` immediately AND wait for upstream workflows; one must yield).
+
+**Compatibility note**: topic files authored before this convention was documented (i.e. without an explicit "replacing default behavior" prefix) are treated as augment by default. If such a file's directive is structurally incompatible with the augment reading (e.g., it says "do NOT run X" where X is the default at that seam), the agent should surface the ambiguity to the operator rather than guess.
+
+Projects that find injection insufficient (i.e. need to REPLACE a phase's content at scale, not just inject alongside or replace a single seam's default action) should file an issue requesting Option A (named phase-extension files) — see the architect notes on #3503.
 
 ## Important Notes
 

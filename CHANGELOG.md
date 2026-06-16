@@ -7,7 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.10.4] - 2026-06-16
+### Changed
+
+- **`/loom:release` seam-contract clarification** — documents the v0.10.4 Option B seam markers more precisely without renaming any existing seam or adding new ones. Two clarifications land in `defaults/.claude/commands/loom/release.md` and the example topics file at `defaults/hooks/example-context/topics/release.md`: (1) the `pre-changelog-style` row in the "Operator extension points" table now records its phase scope explicitly as **Phase 1.5 AND Phase 4** — a single marker placed before Phase 1.5 covers both phases by contract, so projects with non-default header patterns (e.g., `## Release notes — vX.Y.Z (YYYY-MM-DD)`) do not need a separate Phase 4 marker; (2) a new "Composition semantics: augment vs replace" subsection documents the prose-prefix convention that distinguishes augment overrides (`At extension point <seam>: <directive>`) from replace overrides (`At extension point <seam>, replacing default behavior: <directive>`), with worked examples and a "prefer augment unless structurally incompatible" guidance line. The example topics file is updated to demonstrate both prefixes (one augment for `pre-changelog-style` and `pre-push`, one replace for `pre-github-release`). No seam renames, no new markers, no breaking changes to existing topic files — the prose-prefix convention is purely additive, and topic files authored before the convention was documented are treated as augment by default. Defers the structural alternatives (option (b) — separate `pre-changelog-draft` marker, and the `replace-X` parallel seam family) to follow-up issues if the prose-level convention proves insufficient over a release cycle. (#3509)
 
 ### Summary
 
