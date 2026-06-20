@@ -935,11 +935,14 @@ if [[ -f "$WORKTREE_ABS/CLAUDE.md" ]]; then
     # Remove only the Loom section (between markers, inclusive)
     info "Removing Loom section from CLAUDE.md (marker-based)..."
 
-    # Use sed to remove everything between markers (inclusive)
-    sed -i '' '/<!-- BEGIN LOOM ORCHESTRATION -->/,/<!-- END LOOM ORCHESTRATION -->/d' "$CLAUDE_MD"
+    # Use sed to remove everything between markers (inclusive).
+    # Portable in-place: pipe through a temp file and mv, avoiding the BSD vs
+    # GNU `sed -i` syntax divergence (matches the house idiom in version.sh).
+    sed '/<!-- BEGIN LOOM ORCHESTRATION -->/,/<!-- END LOOM ORCHESTRATION -->/d' "$CLAUDE_MD" > "${CLAUDE_MD}.tmp" && mv "${CLAUDE_MD}.tmp" "$CLAUDE_MD"
 
-    # Clean up any trailing blank lines
-    sed -i '' -e :a -e '/^\n*$/{$d;N;ba' -e '}' "$CLAUDE_MD"
+    # Clean up any trailing blank lines (awk equivalent of the old sed
+    # blank-trim, consistent with the .gitignore handling below).
+    awk 'NF || prev_blank++ < 1 { print; if (NF) prev_blank=0 }' "$CLAUDE_MD" > "${CLAUDE_MD}.tmp" && mv "${CLAUDE_MD}.tmp" "$CLAUDE_MD"
 
     # If file is now empty or only whitespace, remove it
     if [[ ! -s "$CLAUDE_MD" ]] || ! grep -q '[^[:space:]]' "$CLAUDE_MD" 2>/dev/null; then
@@ -1032,8 +1035,9 @@ if [[ -f "$WORKTREE_ABS/.gitignore" ]]; then
     awk 'NF || prev_blank++ < 1 { print; if (NF) prev_blank=0 }' "$GITIGNORE" > "${GITIGNORE}.tmp"
     mv "${GITIGNORE}.tmp" "$GITIGNORE"
 
-    # Remove trailing blank lines
-    sed -i '' -e :a -e '/^\n*$/{$d;N;ba' -e '}' "$GITIGNORE"
+    # Remove trailing blank lines (awk equivalent, consistent with the
+    # consecutive-blank-line trim immediately above).
+    awk 'NF || prev_blank++ < 1 { print; if (NF) prev_blank=0 }' "$GITIGNORE" > "${GITIGNORE}.tmp" && mv "${GITIGNORE}.tmp" "$GITIGNORE"
 
     # If file is now empty, remove it
     if [[ ! -s "$GITIGNORE" ]] || ! grep -q '[^[:space:]]' "$GITIGNORE" 2>/dev/null; then

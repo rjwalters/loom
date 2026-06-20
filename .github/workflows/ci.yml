@@ -87,8 +87,8 @@ jobs:
     name: Installer Integration Tests
     needs: changes
     if: always() && (github.event_name == 'push' || needs.changes.outputs.scripts == 'true')
-    # macOS runner required: uninstall-loom.sh uses sed -i '' (macOS syntax)
-    runs-on: macos-latest
+    # Portable across GNU/BSD sed (temp-file + mv idiom) — runs on ubuntu (#3515)
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
       - name: Run installer tests
