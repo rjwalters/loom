@@ -128,8 +128,9 @@ set_version() {
     echo "  Updated $file"
   done
 
-  # CLAUDE.md
-  sed -i '' "s/\*\*Loom Version\*\*: .*/\*\*Loom Version\*\*: $new_version/" "$REPO_ROOT/CLAUDE.md"
+  # CLAUDE.md — portable in-place edit via temp file + mv (matches the
+  # Cargo.toml idiom above; avoids BSD vs GNU `sed -i` divergence).
+  sed "s/\*\*Loom Version\*\*: .*/\*\*Loom Version\*\*: $new_version/" "$REPO_ROOT/CLAUDE.md" > "$REPO_ROOT/CLAUDE.md.tmp" && mv "$REPO_ROOT/CLAUDE.md.tmp" "$REPO_ROOT/CLAUDE.md"
   echo "  Updated CLAUDE.md"
 
   # Cargo.lock
