@@ -1,0 +1,145 @@
+[
+  {
+    "total_loc": 124242,
+    "total_files": 607,
+    "languages": [
+      {
+        "language": "JSON",
+        "lines": 3326,
+        "code": 3314,
+        "comments": 0,
+        "blanks": 12,
+        "files": 44
+      },
+      {
+        "language": "License",
+        "lines": 21,
+        "code": 17,
+        "comments": 0,
+        "blanks": 4,
+        "files": 1
+      },
+      {
+        "language": "Rust",
+        "lines": 28138,
+        "code": 20124,
+        "comments": 4857,
+        "blanks": 3157,
+        "files": 47
+      },
+      {
+        "language": "TypeScript",
+        "lines": 9084,
+        "code": 7597,
+        "comments": 529,
+        "blanks": 958,
+        "files": 73
+      },
+      {
+        "language": "CSS",
+        "lines": 140,
+        "code": 124,
+        "comments": 3,
+        "blanks": 13,
+        "files": 2
+      },
+      {
+        "language": "Shell",
+        "lines": 32184,
+        "code": 21925,
+        "comments": 6398,
+        "blanks": 3861,
+        "files": 125
+      },
+      {
+        "language": "YAML",
+        "lines": 1322,
+        "code": 999,
+        "comments": 146,
+        "blanks": 177,
+        "files": 25
+      },
+      {
+        "language": "SVG",
+        "lines": 344,
+        "code": 207,
+        "comments": 73,
+        "blanks": 64,
+        "files": 12
+      },
+      {
+        "language": "Python",
+        "lines": 50096,
+        "code": 38769,
+        "comments": 5773,
+        "blanks": 5554,
+        "files": 116
+      },
+      {
+        "language": "HTML",
+        "lines": 26,
+        "code": 26,
+        "comments": 0,
+        "blanks": 0,
+        "files": 2
+      },
+      {
+        "language": "TOML",
+        "lines": 335,
+        "code": 222,
+        "comments": 68,
+        "blanks": 45,
+        "files": 12
+      },
+      {
+        "language": "Markdown",
+        "lines": 39928,
+        "code": 29878,
+        "comments": 0,
+        "blanks": 10050,
+        "files": 126
+      },
+      {
+        "language": "JavaScript",
+        "lines": 22,
+        "code": 21,
+        "comments": 0,
+        "blanks": 1,
+        "files": 3
+      },
+      {
+        "language": "SQL",
+        "lines": 71,
+        "code": 53,
+        "comments": 10,
+        "blanks": 8,
+        "files": 2
+      },
+      {
+        "language": "TypeScript Typings",
+        "lines": 2,
+        "code": 0,
+        "comments": 2,
+        "blanks": 0,
+        "files": 2
+      },
+      {
+        "language": "#!",
+        "lines": 923,
+        "code": 811,
+        "comments": 0,
+        "blanks": 112,
+        "files": 8
+      },
+      {
+        "language": "gitignore",
+        "lines": 261,
+        "code": 155,
+        "comments": 61,
+        "blanks": 45,
+        "files": 7
+      }
+    ],
+    "created_at": "2026-06-30T19:18:02.324339429Z"
+  }
+]
