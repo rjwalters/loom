@@ -48,7 +48,7 @@ jobs:
     if: always() && (github.event_name == 'push' || needs.changes.outputs.backend == 'true')
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt
@@ -63,7 +63,7 @@ jobs:
     if: always() && (github.event_name == 'push' || needs.changes.outputs.backend == 'true')
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --workspace
@@ -74,7 +74,7 @@ jobs:
     if: always() && (github.event_name == 'push' || needs.changes.outputs.mcp == 'true')
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: actions/setup-node@v6
         with:
           node-version: "20"
@@ -90,6 +90,6 @@ jobs:
     # Portable across GNU/BSD sed (temp-file + mv idiom) — runs on ubuntu (#3515)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - name: Run installer tests
         run: bash scripts/test-installer.sh

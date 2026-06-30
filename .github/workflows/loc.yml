@@ -11,7 +11,7 @@ jobs:
   loc:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - uses: rjwalters/ghloc@main
         continue-on-error: true
