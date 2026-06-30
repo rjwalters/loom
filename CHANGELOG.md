@@ -7,9 +7,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.10.5] - 2026-06-30
+
+### Summary
+
+Patch release hardening the install path and the `/loom:release` tooling. Two installer correctness fixes (the `loom-shepherd` sentinel that made every install report failure, and non-portable in-place `sed` edits) plus a transitive-dependency security bump clear real breakage; the release skill gains two more version-tool backends and a pre-bump drift gate; routine dependency maintenance lands alongside.
+
+### Added
+
+- **`/loom:release` cargo-set-version + cargo-workspace fallbacks** — the version-tool detector now supports `cargo set-version` (cargo-edit) and a no-external-tool `cargo-workspace` direct-edit fallback for `[workspace.package]` repos. (#3510)
+- **`/loom:release` Phase 2a.5 drift gate** — a pre-bump consistency check that fails fast when the manifest set has drifted, preventing a mis-delta'd version file from shipping in a tagged release. (#3508 / PR #3511)
+
+### Fixed
+
+- **Installer no longer gates on the removed `loom-shepherd` binary** — `setup-python-tools.sh` repoints its install sentinel from the deleted `loom-shepherd` to `loom-status`, so `--check`, the idempotency fast-path, and post-install verification stop reporting failure on a successful editable install. (#3520 / PR #3521)
+- **Portable in-place `sed` edits; installer CI on ubuntu** — replaces non-portable `sed -i` usage and runs the installer integration tests on ubuntu. (#3516)
+
 ### Changed
 
-- **`/loom:release` seam-contract clarification** — documents the v0.10.4 Option B seam markers more precisely without renaming any existing seam or adding new ones. Two clarifications land in `defaults/.claude/commands/loom/release.md` and the example topics file at `defaults/hooks/example-context/topics/release.md`: (1) the `pre-changelog-style` row in the "Operator extension points" table now records its phase scope explicitly as **Phase 1.5 AND Phase 4** — a single marker placed before Phase 1.5 covers both phases by contract, so projects with non-default header patterns (e.g., `## Release notes — vX.Y.Z (YYYY-MM-DD)`) do not need a separate Phase 4 marker; (2) a new "Composition semantics: augment vs replace" subsection documents the prose-prefix convention that distinguishes augment overrides (`At extension point <seam>: <directive>`) from replace overrides (`At extension point <seam>, replacing default behavior: <directive>`), with worked examples and a "prefer augment unless structurally incompatible" guidance line. The example topics file is updated to demonstrate both prefixes (one augment for `pre-changelog-style` and `pre-push`, one replace for `pre-github-release`). No seam renames, no new markers, no breaking changes to existing topic files — the prose-prefix convention is purely additive, and topic files authored before the convention was documented are treated as augment by default. Defers the structural alternatives (option (b) — separate `pre-changelog-draft` marker, and the `replace-X` parallel seam family) to follow-up issues if the prose-level convention proves insufficient over a release cycle. (#3509)
+- **`/loom:release` seam-contract clarification** — records the `pre-changelog-style` seam's phase scope (Phase 1.5 AND Phase 4) and documents the augment-vs-replace prose-prefix convention for seam overrides. Purely additive; no seam renames. (#3509)
+- **Builder absolute-path discipline + `check-main-clean.sh` backstop** — documents the capture-the-worktree-path-once rule and adds a post-builder main-clean backstop to catch worktree contamination. (#3514)
+- **Dependency maintenance** — bump `actions/checkout` 6 → 7 across all workflows (#3517) and the Cargo `all-dependencies` group: `tower-http` 0.6 → 0.7 plus `log`, `env_logger`, and `uuid` lockfile updates (#3523).
+
+### Security
+
+- **Bump `anyhow` 1.0.102 → 1.0.103 (RUSTSEC-2026-0190)** — clears the `cargo audit` "unsound" denial for `Error::downcast_mut()` that was failing the Security Scan. (#3522)
+
+## [0.10.4] - 2026-06-16
 
 ### Summary
 
