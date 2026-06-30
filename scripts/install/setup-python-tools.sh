@@ -109,11 +109,15 @@ if [[ ! -f "$LOOM_TOOLS/pyproject.toml" ]]; then
 fi
 
 VENV_PATH="$LOOM_TOOLS/.venv"
-LOOM_SHEPHERD="$VENV_PATH/bin/loom-shepherd"
+# Sentinel binary used to detect a complete installation. Must be a command
+# defined in loom-tools/pyproject.toml [project.scripts]. loom-status is stable
+# (core status command) and its --help short-circuits with sys.exit(0) before
+# any forge queries, so the runtime verify step below works offline.
+LOOM_SENTINEL="$VENV_PATH/bin/loom-status"
 
 # Check-only mode
 if [[ "$CHECK_ONLY" == "true" ]]; then
-  if [[ -x "$LOOM_SHEPHERD" ]]; then
+  if [[ -x "$LOOM_SENTINEL" ]]; then
     success "loom-tools is installed and ready"
     exit 0
   else
@@ -122,7 +126,7 @@ if [[ "$CHECK_ONLY" == "true" ]]; then
 fi
 
 # Check if already installed (unless --force)
-if [[ "$FORCE" != "true" ]] && [[ -x "$LOOM_SHEPHERD" ]]; then
+if [[ "$FORCE" != "true" ]] && [[ -x "$LOOM_SENTINEL" ]]; then
   success "loom-tools already installed"
   exit 0
 fi
@@ -168,13 +172,13 @@ info "Installing loom-tools..."
 "$VENV_PATH/bin/pip" install -e "$LOOM_TOOLS" --quiet || error "Failed to install loom-tools"
 
 # Verify installation
-if [[ ! -x "$LOOM_SHEPHERD" ]]; then
-  error "Installation verification failed: loom-shepherd not found"
+if [[ ! -x "$LOOM_SENTINEL" ]]; then
+  error "Installation verification failed: loom-status not found"
 fi
 
 # Test that it runs
-if ! "$LOOM_SHEPHERD" --help &>/dev/null; then
-  error "Installation verification failed: loom-shepherd cannot run"
+if ! "$LOOM_SENTINEL" --help &>/dev/null; then
+  error "Installation verification failed: loom-status cannot run"
 fi
 
 success "loom-tools installed successfully"
