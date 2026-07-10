@@ -8,8 +8,150 @@ This module provides a single source of truth for:
 
 from __future__ import annotations
 
+import os
 import re
+import warnings
 from pathlib import Path
+
+
+def _namespaced(override: str, repo_root: Path) -> Path:
+    """Namespace an absolute override root by the repo basename.
+
+    Mirrors bash ``${override%/}/<repo-basename>``: strip trailing slash(es)
+    from the override, then join the repo's basename. If ``repo_root`` has no
+    final component (e.g. ``/``), fall back to the trimmed override alone.
+
+    Args:
+        override: An absolute override path (validated by the caller).
+        repo_root: The repository root whose basename provides the namespace.
+
+    Returns:
+        ``<override-without-trailing-slash>/<repo-basename>``.
+    """
+    trimmed = override.rstrip("/")
+    base = Path(trimmed)
+    name = repo_root.name
+    if name:
+        return base / name
+    return base
+
+
+def _resolve_worktree_root(repo_root: Path) -> Path:
+    """Resolve the worktree base directory, honoring overrides.
+
+    Resolution precedence (first match wins), mirroring
+    ``defaults/scripts/lib/worktree-root.sh`` (``loom_worktree_root``) and
+    ``loom-daemon/src/worktree_root.rs`` (``worktree_root``):
+
+    1. ``LOOM_WORKTREE_ROOT`` env var          — highest priority
+    2. ``.loom/config.json`` -> ``worktree.root`` — soft-fail JSON read
+    3. ``${repo_root}/.loom/worktrees``         — default, UNCHANGED behavior
+
+    When an override (env var or config key) is set, the returned path is
+    namespaced by repo basename so multiple workspaces can share one external
+    volume without colliding (``${override}/<repo-basename>``).
+
+    A relative override (env var or config key) is rejected with a warning and
+    the function falls back to the default — matching the bash stderr warning
+    and Rust ``log::warn!`` behavior, not a hard error. An external worktree
+    root must be absolute so cleanup/GC comparison sites (which compare
+    absolute paths) match.
+
+    With neither override set, the return value is byte-for-byte identical to
+    the historical hardcoded ``${repo_root}/.loom/worktrees`` path.
+
+    This helper never creates directories; callers ``mkdir -p`` as needed.
+
+    Args:
+        repo_root: The absolute repository root path.
+
+    Returns:
+        The absolute worktree base directory.
+    """
+    default = repo_root / LoomPaths.LOOM_DIR / LoomPaths.WORKTREES_DIR
+
+    # 1. Env var override — highest priority.
+    env_root = os.environ.get("LOOM_WORKTREE_ROOT")
+    if env_root:
+        if Path(env_root).is_absolute():
+            return _namespaced(env_root, repo_root)
+        warnings.warn(
+            "LOOM_WORKTREE_ROOT must be an absolute path "
+            f"(got: '{env_root}'); falling back to default",
+            stacklevel=2,
+        )
+        return default
+
+    # 2. Config key override — .loom/config.json -> worktree.root.
+    cfg_root = _read_config_worktree_root(repo_root)
+    if cfg_root:
+        if Path(cfg_root).is_absolute():
+            return _namespaced(cfg_root, repo_root)
+        warnings.warn(
+            "worktree.root in .loom/config.json must be an absolute path "
+            f"(got: '{cfg_root}'); falling back to default",
+            stacklevel=2,
+        )
+        return default
+
+    # 3. Default — unchanged historical behavior.
+    return default
+
+
+def _read_config_worktree_root(repo_root: Path) -> str | None:
+    """Read ``.loom/config.json`` -> ``worktree.root``, soft-failing to ``None``.
+
+    Missing file, parse error, missing key, or a non-string/empty value all
+    resolve to ``None`` (never a hard error), mirroring the soft-fail read in
+    the bash/Rust ports.
+
+    Args:
+        repo_root: The absolute repository root path.
+
+    Returns:
+        The configured worktree root string, or ``None`` when unset/invalid.
+    """
+    # Imported lazily to avoid a module-level import cycle
+    # (common.state imports from common.paths).
+    from loom_tools.common.state import read_json_file
+
+    config_path = repo_root / LoomPaths.LOOM_DIR / LoomPaths.CONFIG_FILE
+    data = read_json_file(config_path, default={})
+    if not isinstance(data, dict):
+        return None
+    worktree = data.get("worktree")
+    if not isinstance(worktree, dict):
+        return None
+    root = worktree.get("root")
+    if isinstance(root, str) and root:
+        return root
+    return None
+
+
+def is_worktree_path(path: Path, repo_root: Path) -> bool:
+    """Whether ``path`` is a Loom-managed worktree eligible for GC.
+
+    Two-way match mirroring ``loom-daemon/src/worktree_root.rs::is_worktree_path``
+    and ``defaults/scripts/agent-destroy.sh``: a path counts if it lives under
+    the resolved worktree root for ``repo_root`` (override-aware) OR contains the
+    historical ``.loom/worktrees`` substring. The substring branch preserves
+    default-path detection unchanged and covers mixed setups where an override
+    was configured after worktrees were already created under the default base.
+
+    Args:
+        path: The candidate worktree path (should be resolved by the caller).
+        repo_root: The absolute repository root path.
+
+    Returns:
+        True if ``path`` is under the resolved root or matches the legacy
+        substring, False otherwise.
+    """
+    root = LoomPaths(repo_root).worktrees_dir
+    try:
+        under_root = path == root or root in path.parents
+    except Exception:
+        under_root = False
+    return under_root or ".loom/worktrees" in str(path)
 
 
 class LoomPaths:
@@ -65,8 +207,16 @@ class LoomPaths:
 
     @property
     def worktrees_dir(self) -> Path:
-        """Path to .loom/worktrees directory."""
-        return self.loom_dir / self.WORKTREES_DIR
+        """Path to the worktree base directory.
+
+        Honors an overridden worktree root (``LOOM_WORKTREE_ROOT`` env var, then
+        ``.loom/config.json`` -> ``worktree.root``), namespaced by repo basename,
+        falling back to ``.loom/worktrees`` when no override is set. See
+        :func:`_resolve_worktree_root` for the full precedence chain. Resolved at
+        call time (matching the bash/Rust ports), so env/config changes between
+        ``LoomPaths()`` construction and property access are always picked up.
+        """
+        return _resolve_worktree_root(self.repo_root)
 
     @property
     def logs_dir(self) -> Path:

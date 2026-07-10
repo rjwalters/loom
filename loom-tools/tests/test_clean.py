@@ -319,3 +319,132 @@ class TestGhPinnedToRepoRoot:
         assert captured_cwd == [repo_root], (
             f"expected gh_run cwd={repo_root!r}, got {captured_cwd!r}"
         )
+
+
+# ---------------------------------------------------------------------------
+# Two-way is_under_loom gate in evaluate_aggressive_candidate (issue #3537)
+# ---------------------------------------------------------------------------
+
+
+class TestEvaluateAggressiveCandidateGate:
+    """Cover the two-way ``is_under_loom`` gate in
+    :func:`evaluate_aggressive_candidate`.
+
+    Mirrors ``worktree_root.rs``'s ``gate_matches_default_path_worktree`` /
+    ``gate_matches_override_path_worktree`` /
+    ``gate_matches_default_substring_even_with_override_set`` /
+    ``gate_rejects_unrelated_path``.
+
+    Worktrees are built with ``branch=None`` so the earlier PR / active-shepherd
+    branches are skipped and evaluation falls straight through to the gate at
+    step 4. "Under loom" worktrees carry a ``.loom-managed`` sentinel so they
+    pass the sentinel check and continue to the ``force`` fallback
+    (``force_override_unreachable``, a REMOVE decision); an unrelated path is
+    rejected at the gate with ``user_owned`` (a KEEP decision). The two decisions
+    are the observable proof that the gate accepted vs. rejected the path.
+    """
+
+    def _worktree_info(self, path: pathlib.Path):
+        from loom_tools.clean import WorktreeInfo
+
+        return WorktreeInfo(path=path, head=None, branch=None)
+
+    def _make_managed(self, path: pathlib.Path) -> None:
+        from loom_tools.clean import LOOM_MANAGED_SENTINEL
+
+        path.mkdir(parents=True, exist_ok=True)
+        (path / LOOM_MANAGED_SENTINEL).write_text("")
+
+    def test_gate_accepts_default_path_worktree(
+        self, tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A worktree under the default .loom/worktrees base is Loom-managed."""
+        from loom_tools.clean import DECISION_REMOVE, evaluate_aggressive_candidate
+
+        monkeypatch.delenv("LOOM_WORKTREE_ROOT", raising=False)
+        repo_root = tmp_path / "my-repo"
+        repo_root.mkdir()
+        wt_path = repo_root / ".loom" / "worktrees" / "issue-42"
+        self._make_managed(wt_path)
+
+        decision, _reason = evaluate_aggressive_candidate(
+            self._worktree_info(wt_path),
+            repo_root,
+            active_shepherd_issues=set(),
+            min_age_seconds=0,
+            force=True,
+        )
+        # Accepted by the gate → proceeds past user_owned to the force fallback.
+        assert decision == DECISION_REMOVE
+
+    def test_gate_accepts_override_path_worktree(
+        self, tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A worktree under the override root is Loom-managed (override-aware)."""
+        from loom_tools.clean import DECISION_REMOVE, evaluate_aggressive_candidate
+
+        override = tmp_path / "ext"
+        monkeypatch.setenv("LOOM_WORKTREE_ROOT", str(override))
+        repo_root = tmp_path / "my-repo"
+        repo_root.mkdir()
+        # Override root is namespaced by repo basename: <override>/my-repo/issue-7
+        wt_path = override / "my-repo" / "issue-7"
+        self._make_managed(wt_path)
+
+        decision, _reason = evaluate_aggressive_candidate(
+            self._worktree_info(wt_path),
+            repo_root,
+            active_shepherd_issues=set(),
+            min_age_seconds=0,
+            force=True,
+        )
+        assert decision == DECISION_REMOVE
+
+    def test_gate_accepts_default_substring_with_override_set(
+        self, tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Mixed setup: override configured, but a worktree still lives under the
+        historical .loom/worktrees base — the substring branch must still match."""
+        from loom_tools.clean import DECISION_REMOVE, evaluate_aggressive_candidate
+
+        override = tmp_path / "ext"
+        monkeypatch.setenv("LOOM_WORKTREE_ROOT", str(override))
+        repo_root = tmp_path / "my-repo"
+        repo_root.mkdir()
+        wt_path = repo_root / ".loom" / "worktrees" / "issue-99"
+        self._make_managed(wt_path)
+
+        decision, _reason = evaluate_aggressive_candidate(
+            self._worktree_info(wt_path),
+            repo_root,
+            active_shepherd_issues=set(),
+            min_age_seconds=0,
+            force=True,
+        )
+        assert decision == DECISION_REMOVE
+
+    def test_gate_rejects_unrelated_path(
+        self, tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A worktree at an unrelated path is not Loom-managed → user_owned."""
+        from loom_tools.clean import (
+            DECISION_KEEP,
+            evaluate_aggressive_candidate,
+        )
+
+        override = tmp_path / "ext"
+        monkeypatch.setenv("LOOM_WORKTREE_ROOT", str(override))
+        repo_root = tmp_path / "my-repo"
+        repo_root.mkdir()
+        wt_path = tmp_path / "some" / "other" / "place" / "issue-42"
+        self._make_managed(wt_path)
+
+        decision, reason = evaluate_aggressive_candidate(
+            self._worktree_info(wt_path),
+            repo_root,
+            active_shepherd_issues=set(),
+            min_age_seconds=0,
+            force=True,
+        )
+        assert decision == DECISION_KEEP
+        assert reason == "user_owned"
