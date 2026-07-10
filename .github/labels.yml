@@ -93,8 +93,13 @@
   description: Signal to abort shepherd for this issue (returns to loom:issue)
   color: "F97316"  # orange-500 - warning/signal color
 
+# loom:operator-only vs loom:blocked: operator-only = a human must act OUTSIDE
+# automation (credentials, infra, hardware) and sweep/shepherd skip it entirely;
+# blocked = waiting on a dependency but otherwise automatable. Keep the
+# description at/under GitHub's 100-char label-description limit so sync-labels.sh
+# can create it (a longer description fails with HTTP 422 and the label never syncs).
 - name: loom:operator-only
-  description: "Issue requires human action outside the automation (credentials, infra rotations, manual deploys, hardware access). Sweep/shepherd skip in pre-flight; curator may still enrich. Applied by: humans or any agent that recognizes the constraint."
+  description: "Requires human action outside automation (credentials, infra, hardware); sweep/shepherd skip"
   color: "F97316"  # orange-500 - operator-action signal (matches loom:abort)
 
 # Epic Labels
