@@ -1001,6 +1001,49 @@ impl TerminalManager {
             .map(Path::to_path_buf)
     }
 
+    /// Whether `LOOM_PRESERVE_WORKTREE` disables worktree cleanup for this run.
+    ///
+    /// Mirrors `defaults/scripts/agent-destroy.sh`'s guard exactly: bash tests
+    /// `[[ "${LOOM_PRESERVE_WORKTREE:-0}" == "1" ]]`, i.e. an **exact-string**
+    /// comparison against `"1"` — *not* a truthy/falsy coercion. So
+    /// `LOOM_PRESERVE_WORKTREE=true` or `=yes` does NOT enable preserve, matching
+    /// bash. When set, cleanup is skipped unconditionally (the outermost guard).
+    fn preserve_worktree_env() -> bool {
+        std::env::var("LOOM_PRESERVE_WORKTREE").is_ok_and(|v| v == "1")
+    }
+
+    /// Whether the worktree at `worktree_path` is eligible for automatic removal
+    /// under the Loom ownership model (issue #3334).
+    ///
+    /// Mirrors `defaults/scripts/agent-destroy.sh` (~lines 129-160): only
+    /// worktrees carrying a `.loom-managed` sentinel file in their root are
+    /// Loom-created and thus eligible for cleanup. A missing sentinel means the
+    /// worktree is user-owned; we refuse to remove it and log a warning worded
+    /// identically to bash (`— refusing to remove (user-owned)`, using an em dash).
+    ///
+    /// The `LOOM_PRESERVE_WORKTREE=1` override is checked first (outermost), so a
+    /// preserve request short-circuits ahead of the sentinel check — parity with
+    /// bash's outer-to-inner guard ordering.
+    fn worktree_removal_allowed(worktree_path: &Path) -> bool {
+        if Self::preserve_worktree_env() {
+            log::info!(
+                "Worktree cleanup skipped (LOOM_PRESERVE_WORKTREE=1): {}",
+                worktree_path.display()
+            );
+            return false;
+        }
+
+        if !worktree_path.join(".loom-managed").is_file() {
+            log::warn!(
+                "Worktree at {} lacks .loom-managed sentinel — refusing to remove (user-owned)",
+                worktree_path.display()
+            );
+            return false;
+        }
+
+        true
+    }
+
     /// Set up per-agent `CLAUDE_CONFIG_DIR` isolation for a tmux session.
     ///
     /// Creates an isolated config directory and sets `CLAUDE_CONFIG_DIR` and `TMPDIR`
@@ -1401,39 +1444,48 @@ impl TerminalManager {
 
         // Now that the tmux session is dead, safe to remove the worktree
         // without breaking any shell's working directory.
+        // Ownership-model guards (bash parity with agent-destroy.sh, #3334):
+        // honor LOOM_PRESERVE_WORKTREE=1 (outermost) and refuse to remove a
+        // worktree lacking the `.loom-managed` sentinel (user-owned). Both run
+        // before the actual `git worktree remove` (and its fs::remove_dir_all
+        // fallback). worktree_removal_allowed() logs the reason for a skip; when
+        // it returns false we skip only the removal and still fall through to the
+        // output-file / CLAUDE_CONFIG_DIR cleanup and registry removal below.
         if let Some((worktree_path, path, repo_root)) = worktree_to_remove {
-            log::info!("Removing worktree at {} (no other terminals using it)", path.display());
+            if Self::worktree_removal_allowed(&path) {
+                log::info!("Removing worktree at {} (no other terminals using it)", path.display());
 
-            // repo_root was resolved before the gate (via find_repo_root_from_worktree)
-            // and is reused here to run git from the repo root, avoiding
-            // CWD-inside-worktree issues.
+                // repo_root was resolved before the gate (via find_repo_root_from_worktree)
+                // and is reused here to run git from the repo root, avoiding
+                // CWD-inside-worktree issues.
 
-            // First try to remove the worktree via git
-            let mut cmd = Command::new("git");
-            cmd.args(["worktree", "remove", &worktree_path]);
-            if let Some(ref root) = repo_root {
-                cmd.current_dir(root);
-            }
-            let output = cmd.output();
-
-            if let Ok(output) = output {
-                if !output.status.success() {
-                    let stderr = String::from_utf8_lossy(&output.stderr);
-                    log::warn!("git worktree remove failed: {stderr}");
-                    log::info!("Attempting force removal...");
-
-                    // Try force removal
-                    let mut cmd = Command::new("git");
-                    cmd.args(["worktree", "remove", "--force", &worktree_path]);
-                    if let Some(ref root) = repo_root {
-                        cmd.current_dir(root);
-                    }
-                    let _ = cmd.output();
+                // First try to remove the worktree via git
+                let mut cmd = Command::new("git");
+                cmd.args(["worktree", "remove", &worktree_path]);
+                if let Some(ref root) = repo_root {
+                    cmd.current_dir(root);
                 }
-            }
+                let output = cmd.output();
 
-            // Also try to remove directory manually as fallback
-            let _ = fs::remove_dir_all(&path);
+                if let Ok(output) = output {
+                    if !output.status.success() {
+                        let stderr = String::from_utf8_lossy(&output.stderr);
+                        log::warn!("git worktree remove failed: {stderr}");
+                        log::info!("Attempting force removal...");
+
+                        // Try force removal
+                        let mut cmd = Command::new("git");
+                        cmd.args(["worktree", "remove", "--force", &worktree_path]);
+                        if let Some(ref root) = repo_root {
+                            cmd.current_dir(root);
+                        }
+                        let _ = cmd.output();
+                    }
+                }
+
+                // Also try to remove directory manually as fallback
+                let _ = fs::remove_dir_all(&path);
+            }
         }
 
         // Clean up the output file
@@ -2061,5 +2113,117 @@ mod tests {
     fn test_terminal_manager_new_is_empty() {
         let tm = TerminalManager::new();
         assert!(tm.terminals.is_empty());
+    }
+
+    // ===== worktree ownership-model guard tests (#3540) =====
+    //
+    // These cover the bash-parity guards added to destroy_terminal()'s removal
+    // path: the `.loom-managed` sentinel check and the LOOM_PRESERVE_WORKTREE=1
+    // override (mirroring defaults/scripts/agent-destroy.sh ~lines 129-160).
+    //
+    // std::env::set_var mutates process-global state; serialize env-touching
+    // tests so parallel `cargo test` execution doesn't race on
+    // LOOM_PRESERVE_WORKTREE. Same pattern as worktree_root.rs's ENV_LOCK.
+    use std::sync::Mutex;
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    /// Run `f` with LOOM_PRESERVE_WORKTREE set to `value` (or unset if None),
+    /// restoring the prior value afterward. Serialized via ENV_LOCK.
+    fn with_preserve_env<T>(value: Option<&str>, f: impl FnOnce() -> T) -> T {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let prev = std::env::var("LOOM_PRESERVE_WORKTREE").ok();
+        match value {
+            Some(v) => std::env::set_var("LOOM_PRESERVE_WORKTREE", v),
+            None => std::env::remove_var("LOOM_PRESERVE_WORKTREE"),
+        }
+        let result = f();
+        match prev {
+            Some(p) => std::env::set_var("LOOM_PRESERVE_WORKTREE", p),
+            None => std::env::remove_var("LOOM_PRESERVE_WORKTREE"),
+        }
+        result
+    }
+
+    /// Create a worktree dir with a `.loom-managed` sentinel file (simulating a
+    /// Loom-created worktree).
+    fn make_managed_worktree() -> tempfile::TempDir {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join(".loom-managed"), "").unwrap();
+        tmp
+    }
+
+    #[test]
+    fn removal_allowed_when_sentinel_present_and_env_unset() {
+        // The common case: worktree present, `.loom-managed` sentinel present,
+        // LOOM_PRESERVE_WORKTREE unset → removal proceeds (no behavior change).
+        let wt = make_managed_worktree();
+        with_preserve_env(None, || {
+            assert!(TerminalManager::worktree_removal_allowed(wt.path()));
+        });
+    }
+
+    #[test]
+    fn removal_skipped_when_sentinel_absent() {
+        // A worktree path recorded via set_worktree_path()/SetWorktreePath IPC
+        // that lacks `.loom-managed` (user-owned or an unvalidated IPC path) must
+        // NOT be removed — the guard refuses it.
+        let tmp = tempfile::tempdir().unwrap();
+        with_preserve_env(None, || {
+            assert!(!TerminalManager::worktree_removal_allowed(tmp.path()));
+        });
+    }
+
+    #[test]
+    fn removal_skipped_when_preserve_env_is_one() {
+        // LOOM_PRESERVE_WORKTREE=1 skips removal unconditionally, even with the
+        // sentinel present.
+        let wt = make_managed_worktree();
+        with_preserve_env(Some("1"), || {
+            assert!(!TerminalManager::worktree_removal_allowed(wt.path()));
+        });
+    }
+
+    #[test]
+    fn removal_skipped_when_preserve_env_is_one_even_without_sentinel() {
+        // The env override is the outermost guard: it short-circuits ahead of the
+        // sentinel check, so removal is skipped regardless of sentinel presence.
+        let tmp = tempfile::tempdir().unwrap();
+        with_preserve_env(Some("1"), || {
+            assert!(!TerminalManager::worktree_removal_allowed(tmp.path()));
+        });
+    }
+
+    #[test]
+    fn removal_allowed_when_preserve_env_is_non_one_value() {
+        // Parity with bash's exact-string check `[[ ... == "1" ]]`: non-"1"
+        // truthy-looking values do NOT enable preserve. With the sentinel present,
+        // removal still proceeds.
+        let wt = make_managed_worktree();
+        for value in ["true", "yes", "0", "", "TRUE", "11", "1 "] {
+            with_preserve_env(Some(value), || {
+                assert!(
+                    TerminalManager::worktree_removal_allowed(wt.path()),
+                    "LOOM_PRESERVE_WORKTREE={value:?} must not enable preserve"
+                );
+            });
+        }
+    }
+
+    #[test]
+    fn preserve_worktree_env_matches_exact_string_one() {
+        with_preserve_env(Some("1"), || {
+            assert!(TerminalManager::preserve_worktree_env());
+        });
+        for value in ["true", "yes", "0", "", "01", "1x"] {
+            with_preserve_env(Some(value), || {
+                assert!(
+                    !TerminalManager::preserve_worktree_env(),
+                    "LOOM_PRESERVE_WORKTREE={value:?} must not be treated as preserve"
+                );
+            });
+        }
+        with_preserve_env(None, || {
+            assert!(!TerminalManager::preserve_worktree_env());
+        });
     }
 }
