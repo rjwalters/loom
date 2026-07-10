@@ -433,6 +433,9 @@ Safety Features:
   ✓ Non-interactive (safe for AI agents)
   ✓ Reuses existing branches automatically
   ✓ Symlinks node_modules from main (avoids pnpm install)
+  ✓ Symlinks nested per-package node_modules for pnpm/monorepo workspaces
+  ✓ Symlinks extra gitignored paths via .loom/config.json worktree.linkPaths
+  ✓ Excludes created symlinks via .git/info/exclude (no accidental git add)
   ✓ Symlinks .mcp.json from main (MCP config visible in worktrees)
   ✓ Runs project-specific hooks after creation
   ✓ Stashes/restores local changes during pull
@@ -462,6 +465,21 @@ Project-Specific Hooks:
     #!/bin/bash
     cd "\$1"
     pnpm install  # or: lake exe cache get, pip install -e ., etc.
+
+Monorepo / Generated-Artifact Symlinks:
+  In addition to the root node_modules symlink, worktree.sh symlinks:
+    - Nested per-package node_modules (e.g. apps/web/node_modules) discovered by
+      scanning the main workspace for node_modules dirs that sit next to a
+      package.json (pnpm/monorepo layouts). No YAML parser dependency.
+    - Extra gitignored paths listed in .loom/config.json under worktree.linkPaths,
+      e.g. generated wasm-pack bindings that are expensive to rebuild per worktree:
+
+        { "worktree": { "linkPaths": ["apps/web/src/wasm"] } }
+
+  Each created symlink is added to the worktree's .git/info/exclude so 'git add -A'
+  never stages it. All symlinking is best-effort — a failed link warns and
+  continues; it never aborts worktree creation. Repos with no nested node_modules
+  and no worktree.linkPaths config see no behavior change.
 
 Resuming Abandoned Work:
   If an agent abandoned work on issue #42, a new agent can resume:
@@ -1114,6 +1132,100 @@ EOF
                 print_warning "Could not symlink node_modules (will install on first build)"
             fi
         fi
+    fi
+
+    # Resolve the info/exclude path that applies to this worktree. Running
+    # `git rev-parse --git-path info/exclude` from inside the worktree returns
+    # the correct file for whatever git layout is in play (info/exclude is a
+    # common-dir path, so worktrees inherit the main repo's .git/info/exclude;
+    # asking git rather than hardcoding a path keeps us correct across layouts).
+    # Entries appended here keep `git add -A` from staging the created symlinks
+    # even when the repo's .gitignore rules don't match a symlink (the classic
+    # `node_modules/` dir-rule-vs-symlink hazard from #3528).
+    WORKTREE_INFO_EXCLUDE=$(cd "$ABS_WORKTREE_PATH" 2>/dev/null \
+        && git rev-parse --git-path info/exclude 2>/dev/null)
+    if [[ -n "$WORKTREE_INFO_EXCLUDE" && "$WORKTREE_INFO_EXCLUDE" != /* ]]; then
+        # git rev-parse may return a path relative to the worktree cwd; anchor it.
+        WORKTREE_INFO_EXCLUDE="$ABS_WORKTREE_PATH/$WORKTREE_INFO_EXCLUDE"
+    fi
+
+    # Idempotently append a path to the worktree's info/exclude. Safe to call
+    # repeatedly (grep -qxF guards against duplicate lines) and best-effort
+    # (a missing exclude file just means git tracked the ignore elsewhere).
+    _append_worktree_exclude() {
+        local entry="$1"
+        if [[ -z "$WORKTREE_INFO_EXCLUDE" ]]; then
+            return 0
+        fi
+        mkdir -p "$(dirname "$WORKTREE_INFO_EXCLUDE")" 2>/dev/null || true
+        grep -qxF "$entry" "$WORKTREE_INFO_EXCLUDE" 2>/dev/null \
+            || echo "$entry" >> "$WORKTREE_INFO_EXCLUDE" 2>/dev/null || true
+    }
+
+    # Symlink nested (per-package) node_modules for pnpm/monorepo workspaces.
+    # The root node_modules symlink above does not cover per-package installs
+    # (e.g. apps/web/node_modules), so a fresh worktree fails typecheck/build
+    # until each is linked. Directory-scan discovery (no YAML parser dependency,
+    # see #3528): find node_modules dirs at shallow depth that sit next to a
+    # package.json, skipping the root (already handled) and anything nested
+    # inside another node_modules (avoids recursing into node_modules/.pnpm/**).
+    if [[ -d "$MAIN_NODE_MODULES" ]]; then
+        while IFS= read -r -d '' pkg_node_modules; do
+            pkg_dir="$(dirname "$pkg_node_modules")"
+            rel_path="${pkg_dir#"$MAIN_WORKSPACE_DIR"/}"
+            # Skip if the prefix strip did nothing (path not under main workspace).
+            if [[ "$rel_path" == "$pkg_dir" ]]; then
+                continue
+            fi
+            # Only mirror package roots (node_modules alongside a package.json).
+            if [[ ! -f "$pkg_dir/package.json" ]]; then
+                continue
+            fi
+            worktree_pkg_dir="$ABS_WORKTREE_PATH/$rel_path"
+            worktree_pkg_node_modules="$worktree_pkg_dir/node_modules"
+            if [[ -d "$worktree_pkg_dir" && ! -e "$worktree_pkg_node_modules" ]]; then
+                if ln -s "$pkg_node_modules" "$worktree_pkg_node_modules" 2>/dev/null; then
+                    _append_worktree_exclude "$rel_path/node_modules"
+                    if [[ "$JSON_OUTPUT" != "true" ]]; then
+                        print_success "Symlinked $rel_path/node_modules from main workspace"
+                    fi
+                else
+                    if [[ "$JSON_OUTPUT" != "true" ]]; then
+                        print_warning "Could not symlink $rel_path/node_modules"
+                    fi
+                fi
+            fi
+        done < <(find "$MAIN_WORKSPACE_DIR" -mindepth 2 -maxdepth 3 -type d \
+                    -name node_modules -not -path "*/node_modules/*" -print0 2>/dev/null)
+    fi
+
+    # Symlink additional gitignored paths configured in .loom/config.json under
+    # worktree.linkPaths (e.g. generated wasm-pack bindings that are expensive
+    # to rebuild per worktree). Best-effort: missing config, missing jq, malformed
+    # JSON, or an empty/absent key all silently skip this step (#3528). Mirrors
+    # the inline-jq-with-guard pattern from validate-roles.sh.
+    LOOM_CONFIG_FILE="$MAIN_WORKSPACE_DIR/.loom/config.json"
+    if command -v jq >/dev/null 2>&1 && [[ -f "$LOOM_CONFIG_FILE" ]]; then
+        while IFS= read -r link_path; do
+            if [[ -z "$link_path" ]]; then
+                continue
+            fi
+            link_src="$MAIN_WORKSPACE_DIR/$link_path"
+            link_dst="$ABS_WORKTREE_PATH/$link_path"
+            if [[ -e "$link_src" && ! -e "$link_dst" ]]; then
+                mkdir -p "$(dirname "$link_dst")" 2>/dev/null || true
+                if ln -s "$link_src" "$link_dst" 2>/dev/null; then
+                    _append_worktree_exclude "$link_path"
+                    if [[ "$JSON_OUTPUT" != "true" ]]; then
+                        print_success "Symlinked $link_path from main workspace"
+                    fi
+                else
+                    if [[ "$JSON_OUTPUT" != "true" ]]; then
+                        print_warning "Could not symlink $link_path"
+                    fi
+                fi
+            fi
+        done < <(jq -r '.worktree.linkPaths[]? // empty' "$LOOM_CONFIG_FILE" 2>/dev/null)
     fi
 
     # Symlink .mcp.json from main workspace if available
