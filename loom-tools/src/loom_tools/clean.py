@@ -1464,11 +1464,18 @@ def evaluate_aggressive_candidate(
             return DECISION_KEEP, "active_shepherd"
 
     # 4) Sentinel / canonical-path check.
-    worktrees_dir = (resolved_repo / ".loom" / "worktrees").resolve()
+    #    Two-way gate (mirrors worktree_root.rs::is_worktree_path and
+    #    agent-destroy.sh): a worktree counts as "under loom" if it resolves
+    #    under the override-aware worktree root OR contains the historical
+    #    `.loom/worktrees` substring. The substring branch preserves default +
+    #    mixed-setup detection when an override was configured after worktrees
+    #    were already created under the default base.
+    worktrees_dir = LoomPaths(resolved_repo).worktrees_dir.resolve()
     try:
         is_under_loom = (
             resolved_wt == worktrees_dir
             or worktrees_dir in resolved_wt.parents
+            or ".loom/worktrees" in str(resolved_wt)
         )
     except Exception:
         is_under_loom = False

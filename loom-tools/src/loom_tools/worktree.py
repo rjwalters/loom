@@ -489,8 +489,17 @@ def create_worktree(
     else:
         branch_name = f"feature/issue-{issue_number}"
 
-    # Worktree path
-    worktree_path = pathlib.Path(".loom/worktrees") / f"issue-{issue_number}"
+    # Worktree path (override-aware via LoomPaths).
+    #
+    # Resolve the repo root explicitly rather than relying on cwd: in the
+    # in-worktree branch above we os.chdir'd to the main workspace, but in the
+    # non-worktree branch cwd is only implicitly the repo root. _get_main_workspace
+    # works from any cwd (parent of the git common dir); fall back to cwd if it
+    # cannot be determined. LoomPaths then honors LOOM_WORKTREE_ROOT / config.
+    from loom_tools.common.paths import LoomPaths
+
+    repo_root = _get_main_workspace() or pathlib.Path.cwd().resolve()
+    worktree_path = LoomPaths(repo_root).worktree_path(issue_number)
 
     # Check if worktree already exists
     if worktree_path.exists():

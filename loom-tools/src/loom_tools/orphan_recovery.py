@@ -416,7 +416,9 @@ def _cleanup_stale_worktree(repo_root: pathlib.Path, issue: int) -> bool:
 
     Returns True if cleanup was performed, False otherwise.
     """
-    worktree_path = repo_root / ".loom" / "worktrees" / f"issue-{issue}"
+    from loom_tools.common.paths import LoomPaths
+
+    worktree_path = LoomPaths(repo_root).worktree_path(issue)
     if not worktree_path.is_dir():
         return False
 

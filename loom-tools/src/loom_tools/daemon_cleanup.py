@@ -576,8 +576,10 @@ def handle_shepherd_complete(
         log_info(f"Archiving logs for issue #{issue_number}...")
         _run_archive_logs(repo_root, dry_run=dry_run)
 
-    # Clean up worktree
-    worktree_path = repo_root / ".loom" / "worktrees" / f"issue-{issue_number}"
+    # Clean up worktree (override-aware via LoomPaths).
+    from loom_tools.common.paths import LoomPaths
+
+    worktree_path = LoomPaths(repo_root).worktree_path(issue_number)
     if worktree_path.is_dir():
         log_info(f"Cleaning worktree for issue #{issue_number}...")
         _run_loom_clean(repo_root, dry_run=dry_run, grace_period=config.grace_period)
