@@ -151,6 +151,7 @@ do_tag() {
     git add package.json mcp-loom/package.json \
            loom-daemon/Cargo.toml loom-api/Cargo.toml \
            CLAUDE.md Cargo.lock
+    [ -f "CHANGELOG.md" ] && git add CHANGELOG.md
     git commit -m "chore: bump version to $version"
     git tag -a "v$version" -m "v$version"
   )

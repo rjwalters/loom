@@ -583,15 +583,7 @@ for p in packages:
    git tag --sort=-v:refname | head -1   # confirm the new tag exists
    ```
 
-Note: every tool in the dispatch above creates its own commit. To keep the CHANGELOG bump and the version bump together in a single tagged commit, commit the CHANGELOG first and then move the tag forward after the version bump:
-
-```bash
-git add CHANGELOG.md
-git commit -m "docs: add X.Y.Z changelog entry"
-# ...run the tool-specific bump above...
-# Move tag to include both commits
-git tag -f vX.Y.Z
-```
+Note: the generated `version.sh do_tag` stages `CHANGELOG.md` alongside the version-bearing files, so the changelog bump and the version bump land in the same tagged commit automatically — no separate commit or `git tag -f` choreography is needed. Simply promote `## [Unreleased]` → `## [X.Y.Z]` in `CHANGELOG.md` before invoking the bump.
 
 Show the user the result and ask for final confirmation.
 
