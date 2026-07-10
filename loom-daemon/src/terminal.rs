@@ -986,6 +986,21 @@ impl TerminalManager {
             .or_else(|| std::env::var("LOOM_WORKSPACE").ok().map(PathBuf::from))
     }
 
+    /// Derive the repository root by walking up from a worktree path.
+    ///
+    /// Distinct from `find_repo_root` above (which starts from a tmux session's
+    /// `working_dir` / `LOOM_WORKSPACE`): this walks a *worktree* path
+    /// (e.g. `/repo/.loom/worktrees/issue-42` or `/Volumes/Ext/repo/issue-42`)
+    /// looking for the ancestor that contains both `.loom/` and `.git`, i.e. the
+    /// main workspace. Used by `destroy_terminal()` both to gate override-aware
+    /// worktree GC and to run `git worktree remove` from the repo root.
+    fn find_repo_root_from_worktree(worktree_path: &Path) -> Option<PathBuf> {
+        worktree_path
+            .ancestors()
+            .find(|p| p.join(".loom").is_dir() && p.join(".git").exists())
+            .map(Path::to_path_buf)
+    }
+
     /// Set up per-agent `CLAUDE_CONFIG_DIR` isolation for a tmux session.
     ///
     /// Creates an isolated config directory and sets `CLAUDE_CONFIG_DIR` and `TMPDIR`
@@ -1326,10 +1341,24 @@ impl TerminalManager {
         // Capture worktree info before killing the session.
         // We need to kill the tmux session FIRST to avoid leaving the shell's
         // CWD pointing at a deleted worktree path (see issue #2413).
-        let worktree_to_remove: Option<(String, PathBuf)> =
+        //
+        // The GC gate is override-aware (#3536): a worktree qualifies if it lives
+        // under the resolved worktree root (which honors LOOM_WORKTREE_ROOT /
+        // `.loom/config.json` → worktree.root) OR contains the historical
+        // `.loom/worktrees` substring. We derive `repo_root` from the worktree
+        // path *before* the gate so it's available both here and for the later
+        // `git worktree remove` invocation without duplicating the ancestor walk.
+        let worktree_to_remove: Option<(String, PathBuf, Option<PathBuf>)> =
             if let Some(ref worktree_path) = info.worktree_path {
                 let path = PathBuf::from(worktree_path);
-                if path.to_string_lossy().contains(".loom/worktrees") {
+                let repo_root = Self::find_repo_root_from_worktree(&path);
+                let is_worktree = match repo_root {
+                    Some(ref root) => crate::worktree_root::is_worktree_path(&path, root),
+                    // No repo root resolved (worktree already partly gone): fall
+                    // back to the historical substring check alone.
+                    None => path.to_string_lossy().contains(".loom/worktrees"),
+                };
+                if is_worktree {
                     let other_users = self
                         .terminals
                         .values()
@@ -1337,7 +1366,7 @@ impl TerminalManager {
                         .count();
 
                     if other_users == 0 {
-                        Some((worktree_path.clone(), path))
+                        Some((worktree_path.clone(), path, repo_root))
                     } else {
                         log::info!(
                             "Skipping worktree removal at {} ({} other terminal(s) still using it)",
@@ -1372,15 +1401,12 @@ impl TerminalManager {
 
         // Now that the tmux session is dead, safe to remove the worktree
         // without breaking any shell's working directory.
-        if let Some((worktree_path, path)) = worktree_to_remove {
+        if let Some((worktree_path, path, repo_root)) = worktree_to_remove {
             log::info!("Removing worktree at {} (no other terminals using it)", path.display());
 
-            // Derive repo root from worktree path (e.g., /repo/.loom/worktrees/issue-42 → /repo)
-            // Run git from repo root to avoid CWD-inside-worktree issues
-            let repo_root = path
-                .ancestors()
-                .find(|p| p.join(".loom").is_dir() && p.join(".git").exists())
-                .map(std::path::Path::to_path_buf);
+            // repo_root was resolved before the gate (via find_repo_root_from_worktree)
+            // and is reused here to run git from the repo root, avoiding
+            // CWD-inside-worktree issues.
 
             // First try to remove the worktree via git
             let mut cmd = Command::new("git");
