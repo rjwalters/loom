@@ -27,6 +27,13 @@ set -e
 # separated paths).
 LOOM_WORKTREE_ALWAYS_INCLUDE_DEFAULT=(.claude .loom .githooks scripts)
 
+# Shared worktree-root resolver (env var / config key / default). Sourced so
+# the worktree base can be redirected to an external volume (#3530). With no
+# override configured, loom_worktree_root returns the historical
+# ${repo_root}/.loom/worktrees path unchanged.
+# shellcheck source=lib/worktree-root.sh
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/worktree-root.sh"
+
 # Colors for output
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -219,7 +226,13 @@ cleanup_partial_worktree_state() {
     done
 
     # 2. Orphan worktree dir (exists but git doesn't know about it).
-    local wt_path=".loom/worktrees/issue-$issue"
+    #    Resolve the base through loom_worktree_root so an overridden root
+    #    (#3530) has its orphan debris cleaned too. The repo root is the parent
+    #    of the git common dir (works whether or not cwd is the main workspace).
+    local repo_root
+    repo_root=$(cd "$(dirname "$git_common")" 2>/dev/null && pwd) || repo_root="$(pwd)"
+    local wt_path
+    wt_path="$(loom_worktree_root "$repo_root")/issue-$issue"
     if [[ -d "$wt_path" ]]; then
         # `git worktree list --porcelain` emits absolute paths on the
         # `worktree ` line; compare against the resolved absolute path.
@@ -726,8 +739,17 @@ else
     BRANCH_NAME="feature/issue-$ISSUE_NUMBER"
 fi
 
-# Worktree path
-WORKTREE_PATH=".loom/worktrees/issue-$ISSUE_NUMBER"
+# Worktree path. At this point cwd is the main workspace root (the script
+# auto-navigates out of any worktree above), so REPO_ROOT is the current dir.
+# loom_worktree_root returns an absolute base; when no override is configured
+# it is "$REPO_ROOT/.loom/worktrees" — identical to the historical relative
+# ".loom/worktrees" resolved against this same cwd.
+WORKTREE_REPO_ROOT="$(pwd)"
+WORKTREE_ROOT_DIR="$(loom_worktree_root "$WORKTREE_REPO_ROOT")"
+# Ensure the base dir exists. `git worktree add` creates only the leaf, so an
+# external override root (e.g. /Volumes/Stripe/<repo>) needs its parents made.
+mkdir -p "$WORKTREE_ROOT_DIR" 2>/dev/null || true
+WORKTREE_PATH="$WORKTREE_ROOT_DIR/issue-$ISSUE_NUMBER"
 
 # Check if worktree already exists
 if [[ -d "$WORKTREE_PATH" ]]; then
