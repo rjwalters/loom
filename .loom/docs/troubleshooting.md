@@ -102,6 +102,38 @@ git worktree prune
 gh label sync --file .github/labels.yml
 ```
 
+Label sync is a manual/install-time step (`./scripts/install/sync-labels.sh .`),
+not something CI re-applies when `.github/labels.yml` changes. If a label is
+defined in `labels.yml` but missing from the live repo, applying it fails with
+`failed to update 1 issue` (the standard `gh` error for "label does not exist").
+Run the sync script — or create the one label directly — to reconcile:
+
+```bash
+gh label list --search operator                      # empty => not provisioned
+gh label create "loom:operator-only" --color F97316 \
+  --description "Requires human action outside automation (credentials, infra, hardware); sweep/shepherd skip"
+```
+
+**GitHub caps label descriptions at 100 characters.** A `labels.yml` entry with a
+longer description fails to sync (HTTP 422 "description is too long") and the label
+silently never gets created. Keep descriptions at or under 100 chars.
+
+#### `loom:blocked` vs `loom:operator-only`
+
+These two status labels look similar but mean different things to the automation:
+
+- **`loom:blocked`** — work is *automatable* but currently waiting on a dependency
+  (another issue, an unmerged PR, missing context). The intent is "unblock it, then
+  a Builder can proceed."
+- **`loom:operator-only`** — work requires a *human to act outside automation
+  entirely* (rotating credentials, infra changes, hardware access, manual deploys).
+  Sweep/shepherd skip these in pre-flight rather than attempting them; a human must
+  do the work off-automation before the issue can proceed.
+
+Reaching for `loom:blocked` when you mean `loom:operator-only` conflates "waiting on
+a dependency" with "needs a human action," which muddies the daemon/sweep skip
+semantics. Use `loom:operator-only` for the human-must-act-off-automation case.
+
 ### Daemon won't start
 
 ```bash
