@@ -7,6 +7,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.10.6] - 2026-07-11
+
+### Summary
+
+Patch release delivering the configurable-worktree-root feature end to end plus worktree ergonomics for JS monorepos. `LOOM_WORKTREE_ROOT` lets operators relocate worktrees outside the repo (#3538), with the daemon's terminal-destroy GC (#3539, #3542) and the Python `LoomPaths`/CLI surface (#3541) both honoring the override; nested-workspace `node_modules` symlinking (#3534) rounds out the worktree work. Release tooling, installer, and label fixes clear real breakage, and a transitive-dependency security bump keeps the Security Scan green.
+
+### Added
+
+- **Opt-in configurable worktree root (`LOOM_WORKTREE_ROOT`)** — operators can relocate Loom-managed worktrees outside `.loom/worktrees/` via environment variable. (#3538)
+- **Nested workspace `node_modules` symlinking + configurable gitignored artifacts** — worktree creation now symlinks nested workspace `node_modules` directories and supports a configurable list of gitignored artifacts to carry into new worktrees. (#3534)
+
+### Fixed
+
+- **Daemon terminal-destroy GC honors the worktree-root override** — `destroy_terminal` resolves the override-aware worktree root instead of assuming `.loom/worktrees/` (#3539), guards removal with the `.loom-managed` sentinel, and preserves the caller's environment (#3542).
+- **`LoomPaths` and GC/CLI sites honor `LOOM_WORKTREE_ROOT`** — the Python tooling (`loom-clean`, orphan recovery, daemon cleanup) resolves the same override-aware root as the daemon. (#3541)
+- **`version.sh do_tag` stages `CHANGELOG.md`** — the changelog promotion now ships in the tagged release commit instead of being left unstaged; this release is the first cut with the fix in place. (#3535)
+- **Installer preserves consumer CLAUDE.md content on single legacy signature** — the upgrade path no longer discards a consumer's custom CLAUDE.md content when exactly one legacy Loom signature is present. (#3533)
+- **`loom:operator-only` label description fits GitHub's 100-char cap** — label sync no longer fails on the over-length description. (#3532)
+
+### Changed
+
+- **Prometheus comparison note** — documents adopt/reject/spike verdicts from a Prometheus-orchestration comparison review. (#3531)
+
+### Security
+
+- **Bump `crossbeam-epoch` 0.9.18 → 0.9.20 (RUSTSEC-2026-0204)** — clears the `cargo audit` denial for the invalid pointer dereference in the `fmt::Pointer` impl that was failing the Security Scan. (#3543)
+
 ## [0.10.5] - 2026-06-30
 
 ### Summary
