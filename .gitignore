@@ -103,6 +103,19 @@ Thumbs.db
 # to the daemon's `update_gitignore` list in loom-daemon/src/init/post_init.rs.
 .claude/commands
 
+# Co-install hygiene (issue #3578, sibling of #3565):
+# Loom ships no skills of its own (`defaults/.claude/skills/` does not exist),
+# so `.claude/skills/` in the live tree is a pure destination for co-installed
+# tools that write `.claude/skills/<ns>/…` (e.g. `repo` writes
+# `.claude/skills/repo/SKILL.md`). Ignoring it keeps a foreign tool's files
+# from being accidentally staged into loom's tree by `git add -A`.
+# IMPORTANT: this ignore lives ONLY in loom's own committed .gitignore. It must
+# NOT be added to the daemon's `update_gitignore` list in
+# loom-daemon/src/init/post_init.rs, so consumer repos keep any skills they author TRACKED.
+# If loom ever ships its own skills, materialize/dogfood them like
+# `.claude/commands/loom/` (out of scope here).
+.claude/skills
+
 # Skill routing local overrides (untracked, user-specific)
 .loom/config/skill-routes.local.json
 .loom/*.log
