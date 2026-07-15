@@ -312,6 +312,44 @@ extract_rm_targets() {
     }'
 }
 
+normalize_abs_path() {
+    # Lexically normalize an ABSOLUTE path without touching the filesystem:
+    #   - collapse duplicate slashes    (//etc        -> /etc)
+    #   - drop "." segments             (/usr/./      -> /usr)
+    #   - resolve ".." segments         (/tmp/..      -> /,   /tmp/../etc -> /etc)
+    #   - ".." at or above root stays at root (/a/../../../etc -> /etc)
+    #   - strip trailing slash except bare root (/tmp/ -> /tmp)
+    # Pure-bash and portable: `realpath -m` is GNU-only and silently no-ops on
+    # macOS, so this MUST NOT rely on it. Without this normalization any
+    # `..`/`//`/`.` traversal (e.g. `rm -rf /tmp/..` -> `/`) would slip past the
+    # protected-path check below and wrongly ALLOW root/system-dir deletion.
+    local path="$1"
+    local seg
+    local -a parts=() out=()
+    local oldIFS="$IFS"
+    IFS='/'
+    read -r -a parts <<< "$path"
+    IFS="$oldIFS"
+    for seg in "${parts[@]}"; do
+        case "$seg" in
+            ''|'.')
+                : ;;                                    # skip empties (// or leading /) and "."
+            '..')
+                if [[ ${#out[@]} -gt 0 ]]; then
+                    out=("${out[@]:0:$(( ${#out[@]} - 1 ))}")   # pop last segment
+                fi
+                ;;                                       # ".." at/above root: stay at root
+            *)
+                out+=("$seg") ;;
+        esac
+    done
+    if [[ ${#out[@]} -eq 0 ]]; then
+        printf '/'
+    else
+        printf '/%s' "${out[@]}"
+    fi
+}
+
 # Cheap pre-check keeps awk off the hot path for the ~99% of commands that have
 # no recursive/force rm at all.
 if echo "$COMMAND" | grep -qE 'rm[[:space:]]+-[a-zA-Z]*[rf]'; then
@@ -343,17 +381,23 @@ if echo "$COMMAND" | grep -qE 'rm[[:space:]]+-[a-zA-Z]*[rf]'; then
                 continue ;;
         esac
 
-        # Resolve path to absolute
+        # Resolve path to absolute (raw — normalization happens next).
         ABS_PATH=""
         if [[ "$target" = /* ]]; then
             ABS_PATH="$target"
         elif [[ -n "$CWD" ]]; then
-            ABS_PATH=$(cd "$CWD" 2>/dev/null && realpath -m "$target" 2>/dev/null || echo "$CWD/$target")
+            ABS_PATH="$CWD/$target"
         fi
 
-        # Normalize a trailing slash (except bare "/") so "/tmp/" == "/tmp".
-        if [[ -n "$ABS_PATH" && "$ABS_PATH" != "/" ]]; then
-            ABS_PATH="${ABS_PATH%/}"
+        # Lexically normalize the absolute target BEFORE the protected-path
+        # check. This collapses //, resolves . and .., and strips trailing
+        # slashes, so traversal/normalization tricks cannot smuggle a
+        # root/system-dir deletion past the check below:
+        #   /tmp/..  -> /        //etc     -> /etc
+        #   /usr/./  -> /usr      /a/../../../etc -> /etc
+        # Done in pure shell because `realpath -m` is GNU-only (no-ops on macOS).
+        if [[ "$ABS_PATH" = /* ]]; then
+            ABS_PATH=$(normalize_abs_path "$ABS_PATH")
         fi
 
         # Block catastrophic targets only: root, the user's home directory, and

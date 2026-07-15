@@ -735,6 +735,29 @@ assert_deny "Regression: rm -rf \$HOME still denied" \
 assert_deny "Regression: rm -rf on a bare top-level dir still denied" \
     "rm -rf /usr"
 
+# Traversal / normalization bypasses — `..`, `//`, and `.` MUST be resolved
+# before the protected-path check, otherwise they smuggle a root/system-dir
+# deletion past it (catastrophic bypass caught in review of #3553).
+assert_deny "Regression: rm -rf /tmp/.. (resolves to /) still denied" \
+    "rm -rf /tmp/.."
+assert_deny "Regression: rm -rf /var/../ (resolves to /) still denied" \
+    "rm -rf /var/../"
+assert_deny "Regression: rm -rf /tmp/../etc (resolves to /etc) still denied" \
+    "rm -rf /tmp/../etc"
+assert_deny "Regression: rm -rf /usr/./ (resolves to /usr) still denied" \
+    "rm -rf /usr/./"
+assert_deny "Regression: rm -rf /home/../home (resolves to /home) still denied" \
+    "rm -rf /home/../home"
+assert_deny "Regression: rm -rf /a/../../../etc (resolves to /etc) still denied" \
+    "rm -rf /a/../../../etc"
+assert_deny "Regression: rm -rf //etc (collapses to /etc) still denied" \
+    "rm -rf //etc"
+# The normalizer must NOT over-block: genuinely-scoped subpaths still ALLOW.
+assert_allow "Allow rm -rf /tmp/x scoped subpath after normalization" \
+    "rm -rf /tmp/x"
+assert_allow "Allow rm -rf /tmp/a/../b scoped subpath (normalizes to /tmp/b)" \
+    "rm -rf /tmp/a/../b"
+
 # Force-push to protected branches (all flag forms).
 assert_deny "Regression: force-push to main still denied" \
     "git push --force origin main"
