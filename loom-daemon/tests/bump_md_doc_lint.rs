@@ -1,7 +1,8 @@
 //! Doc-lint test for `defaults/.claude/commands/loom/bump.md` (Issue #3468).
 //!
-//! The `/loom:bump` skill is the generic, consumer-facing counterpart to the
-//! Loom-internal `/loom:release` skill. It must ship to consumer repos (it is
+//! The `/loom:bump` skill is the generic, consumer-facing quick-bump. The full
+//! release methodology now lives in `/repo:release` (rjwalters/repo, #3563);
+//! `/loom:release` was retired. `/loom:bump` must ship to consumer repos (it is
 //! NOT in `defaults/.loom-internal.list`) and its prose must document a
 //! specific contract: seven detection sources, eight lifecycle phases, an
 //! explicit-confirmation gate on push + GitHub Release, and a parameterized
@@ -204,25 +205,25 @@ fn bump_md_gates_push_and_release_on_confirmation() {
     );
 }
 
-/// Acceptance check that the skill self-identifies as the generic
-/// counterpart to `/loom:release` (so consumers reading it understand
-/// when to reach for it vs. when `/loom:release` would apply).
+/// Acceptance check that the skill self-identifies as the generic quick-bump
+/// and points at `/repo:release` for the full release methodology (so readers
+/// understand when to reach for the lightweight bump vs. the full flow). The
+/// retired `/loom:release` skill (#3563) must NOT be referenced.
 #[test]
-fn bump_md_distinguishes_itself_from_loom_release() {
+fn bump_md_distinguishes_itself_from_repo_release() {
     let content = read_bump_md();
     assert!(
-        content.contains("/loom:release"),
-        "bump.md must reference `/loom:release` so readers understand the \
-         relationship between the generic and the Loom-internal skill"
+        content.contains("/repo:release"),
+        "bump.md must reference `/repo:release` so readers know where the full \
+         release methodology lives (rjwalters/repo, #3563)"
     );
     assert!(
         content.contains("generic"),
-        "bump.md must describe itself as the generic counterpart"
+        "bump.md must describe itself as the generic quick-bump"
     );
     assert!(
-        content.contains("Loom-internal") || content.contains("Loom itself"),
-        "bump.md must describe `/loom:release` as Loom-internal so consumers \
-         understand it is not shipped to them"
+        !content.contains("/loom:release"),
+        "bump.md must NOT reference the retired `/loom:release` skill (#3563)"
     );
 }
 

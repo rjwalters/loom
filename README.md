@@ -245,6 +245,16 @@ cargo build --package loom-daemon --release
 
 See [DEVELOPMENT.md](docs/guides/development.md) for complete guidelines.
 
+## Releasing
+
+Releases are driven by `/repo:release` — install [repo](https://github.com/rjwalters/repo) for the release command. It runs the full methodology (pre-flight/CI gate, CHANGELOG completeness and version-drift gates, semver decision, tag, GitHub Release) and detects and honors Loom's bundled `scripts/version.sh` as its first-priority version tool:
+
+```bash
+./scripts/version.sh bump patch --tag   # underlying mechanics; /repo:release orchestrates these
+git push origin main --tags
+gh release create vX.Y.Z --title "vX.Y.Z" --notes "Release notes..."
+```
+
 ## Bootstrap New Projects
 
 ```bash

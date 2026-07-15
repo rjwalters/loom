@@ -99,7 +99,7 @@ pub fn copy_dir_with_report(
 /// expected.
 ///
 /// Used by `setup_repository_scaffolding` to keep Loom-internal skills
-/// (e.g. `.claude/commands/loom/release.md`, see issue #3464) out of
+/// (e.g. `.claude/commands/loom/internal-only.md`, see issue #3464) out of
 /// consumer-installed `.claude/` trees.
 pub fn copy_dir_with_report_filtered(
     src: &Path,

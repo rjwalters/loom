@@ -168,8 +168,8 @@ case "${1:-}" in
     ;;
   list)
     # Emit the VERSION_FILES array, one entry per line.
-    # Used by the /loom:release skill to discover version-bearing files
-    # without hardcoding the count or names in skill prose. Cargo.lock is
+    # Consumed by /repo:release (rjwalters/repo) to discover version-bearing
+    # files without hardcoding the count or names in prose. Cargo.lock is
     # intentionally excluded — it's a derived artifact updated by
     # `cargo update` as a side effect of the bump, not a directly-edited
     # version source.

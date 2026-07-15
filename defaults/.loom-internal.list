@@ -8,7 +8,7 @@
 # and blank lines are ignored. Trailing whitespace is stripped.
 #
 # Skip rules are exact-string matches against the defaults-relative path
-# (e.g. ".claude/commands/loom/release.md"). No globbing.
+# (e.g. ".claude/commands/loom/imagine.md"). No globbing.
 #
 # Both install (loom-daemon/src/init/scaffolding.rs::setup_repository_scaffolding)
 # and uninstall (scripts/install/manifest.sh::_emit_installed_files_manifest)
@@ -18,11 +18,11 @@
 #
 # Tracked under issue #3464.
 #
-# Issue #3495: `.claude/commands/loom/release.md` was previously listed
-# here when the skill was Loom-specific (it hardcoded the Loom project
-# name, version-file count, and Loom-only semver examples). The skill is
-# now generalized — it discovers everything via `./scripts/version.sh
-# list` and uses `{{workspace}}` for the project name — so it ships to
-# every downstream repo. The installer migration step in
-# `scripts/install-loom.sh` handles consumers that had a hand-customized
-# fork by snapshotting before init and prompting before replacing.
+# Issue #3563: the `/loom:release` skill (`.claude/commands/loom/release.md`)
+# was retired in favor of `/repo:release` from
+# https://github.com/rjwalters/repo. Loom no longer ships a release skill, so
+# there is no internal-list entry for it. Consumers that received the
+# generalized skill during the #3495 window (when it briefly shipped) keep a
+# harmless stray copy; it is not re-installed and can be deleted by hand.
+# Releases are driven by `/repo:release`, which honors `scripts/version.sh` as
+# its first-priority version tool — see the root CLAUDE.md "Releasing" section.
