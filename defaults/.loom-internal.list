@@ -21,8 +21,19 @@
 # Issue #3563: the `/loom:release` skill (`.claude/commands/loom/release.md`)
 # was retired in favor of `/repo:release` from
 # https://github.com/rjwalters/repo. Loom no longer ships a release skill, so
-# there is no internal-list entry for it. Consumers that received the
-# generalized skill during the #3495 window (when it briefly shipped) keep a
-# harmless stray copy; it is not re-installed and can be deleted by hand.
+# there is no internal-list entry for it.
+#
+# Issue #3572: consumers that received the generalized skill during the #3495
+# window (when it briefly shipped) carried a stray copy on disk. That stray is
+# now ACTIVELY REMOVED on the next `install-loom.sh` update by the content-gated
+# retired-file cleanup block (search "Retired-file cleanup" in
+# scripts/install-loom.sh). The removal is gated on a frozen sha256 allowlist of
+# every shipped release.md version, so an unmodified copy is deleted while a
+# consumer-customized copy (hash matches none) is preserved with an
+# informational log line. release.md's only placeholder is the runtime
+# {{workspace}} token (not install-time substituted), so shipped bytes are
+# identical across consumers and the hash gate is exact. The generic stale-file
+# sweep still skips it by design (the #3492 ownership intersection preserves
+# non-owned paths); the explicit cleanup is what removes it.
 # Releases are driven by `/repo:release`, which honors `scripts/version.sh` as
 # its first-priority version tool — see the root CLAUDE.md "Releasing" section.
