@@ -190,6 +190,8 @@ claude -p "/loom:sweep 123" --dangerously-skip-permissions
 
 Checkpoints (#3373) under `.loom/sweep-checkpoint/issue-<N>.json` survive crashes — restarting `/loom:sweep N` resumes from the last completed phase.
 
+**Wave parallelism default (#3566)**: when `--builders-per-wave` is omitted, `/loom:sweep` auto-resolves the wave size at Stage -1 from the chosen backend and scratch-volume disk headroom — the daemon detached-process path (isolated OS processes, not nested subagents) targets up to **10**, while the in-session subagent path stays at the **#3289-safe cap of 3**. The disk gate measures the **worktree-root filesystem** (`LOOM_WORKTREE_ROOT` / `worktree.root`, #3539/#3541), so a dedicated scratch volume rarely binds. Passing an explicit `--builders-per-wave N` overrides auto. `--dry-run` prints the resolved size, mechanism, and gating reason. See `.claude/commands/loom/sweep.md` → "Resolve auto wave size".
+
 ### 3. Daemon Mode (`loom-daemon` + MCP tools)
 
 The Rust `loom-daemon` binary is the Tier 2 dispatch backend. It is a single long-lived process exposing a Unix-socket IPC surface and a paired `mcp-loom` MCP server. Each IPC `Request` variant maps 1:1 to an MCP tool, so any MCP client — most commonly a Claude Code session running `/loom:sweep` — can dispatch sweeps, observe registry state, subscribe to lifecycle events, and cancel in-flight work.
