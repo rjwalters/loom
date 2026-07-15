@@ -308,7 +308,19 @@ done
 # =============================================================================
 
 if echo "$COMMAND" | grep -qE 'gh\s+pr\s+merge'; then
-    deny "Use ./.loom/scripts/merge-pr.sh <PR_NUMBER> instead of 'gh pr merge'. The script merges via the GitHub API without local checkout, which avoids worktree errors."
+    # Resolve the merge-pr.sh path for the current repo context. Prefer an
+    # in-repo installed copy (./.loom/scripts/merge-pr.sh); fall back to the
+    # loom-checkout copy under defaults/scripts/ (via $LOOM_HOME) when the repo
+    # runs scripts directly from the checkout rather than an installed copy.
+    MERGE_SCRIPT="./.loom/scripts/merge-pr.sh"
+    if [[ -n "$REPO_ROOT" ]] && [[ ! -x "$REPO_ROOT/.loom/scripts/merge-pr.sh" ]]; then
+        if [[ -n "${LOOM_HOME:-}" ]] && [[ -x "$LOOM_HOME/defaults/scripts/merge-pr.sh" ]]; then
+            MERGE_SCRIPT="$LOOM_HOME/defaults/scripts/merge-pr.sh"
+        elif [[ -x "$REPO_ROOT/defaults/scripts/merge-pr.sh" ]]; then
+            MERGE_SCRIPT="$REPO_ROOT/defaults/scripts/merge-pr.sh"
+        fi
+    fi
+    deny "Use $MERGE_SCRIPT <PR_NUMBER> instead of 'gh pr merge'. The script merges via the GitHub API without local checkout, which avoids worktree errors."
 fi
 
 # =============================================================================
