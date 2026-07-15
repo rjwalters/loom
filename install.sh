@@ -170,6 +170,13 @@ finalize_quick_install() {
 }
 METADATA
   success "Recorded installation metadata"
+
+  # Quick Install ships .github/labels.yml but does NOT create the labels on
+  # the forge (that is a Full Install step). Point the operator at the shipped
+  # sync script so the label-based workflow doesn't break on first use (#3582).
+  info "Labels not yet synced. Run '.loom/scripts/sync-labels.sh' from the"
+  info "  repo root to create the Loom workflow labels on the forge (or use"
+  info "  Full Install, which syncs them automatically)."
 }
 
 # Verify critical installation files exist
