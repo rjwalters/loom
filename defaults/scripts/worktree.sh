@@ -531,6 +531,30 @@ if [[ "$1" == "--json" ]]; then
     shift
 fi
 
+# JSON stdout-purity contract (#3546).
+#
+# `git worktree add` and `git submodule update` write some of their feedback
+# lines to *stdout*, not stderr — e.g. "branch '...' set up to track '...'",
+# "HEAD is now at <sha> <subject>", "Submodule path '...': checked out '<sha>'".
+# In --json mode those lines would prefix the JSON document, so a consumer
+# piping into `jq` hits `parse error ... line 1` AND (because the noise precedes
+# the JSON) closes the pipe on the first bad line, SIGPIPE-killing this script
+# mid-creation and leaving an orphan branch with no registered worktree.
+#
+# Fix the whole class rather than one call: in --json mode save the real stdout
+# on fd 3 and redirect fd 1 to stderr, so *only* the final JSON document (which
+# we emit explicitly to >&3) can reach the caller's stdout. Any stray git stdout
+# now lands harmlessly on stderr. `trap '' PIPE` makes a consumer that closes
+# early survive as a clean write failure instead of a fatal signal. In human
+# mode fd 3 is just an alias for stdout, so the `>&3` JSON writes below are a
+# no-op there and git progress stays visible on stdout as before.
+if [[ "$JSON_OUTPUT" == "true" ]]; then
+    exec 3>&1 1>&2
+    trap '' PIPE
+else
+    exec 3>&1
+fi
+
 # Check for --return-to flag
 if [[ "$1" == "--return-to" ]]; then
     RETURN_TO_DIR="$2"
@@ -538,7 +562,7 @@ if [[ "$1" == "--return-to" ]]; then
     # Validate return directory exists
     if [[ ! -d "$RETURN_TO_DIR" ]]; then
         if [[ "$JSON_OUTPUT" == "true" ]]; then
-            echo '{"error": "Return directory does not exist", "returnTo": "'"$RETURN_TO_DIR"'"}'
+            echo '{"error": "Return directory does not exist", "returnTo": "'"$RETURN_TO_DIR"'"}' >&3
         else
             print_error "Return directory does not exist: $RETURN_TO_DIR"
         fi
@@ -603,7 +627,7 @@ done
 # Validate flag combinations
 if [[ "$SPARSE_MODE" == "true" && "$FULL_MODE" == "true" ]]; then
     if [[ "$JSON_OUTPUT" == "true" ]]; then
-        echo '{"success": false, "error": "--sparse and --full are mutually exclusive"}'
+        echo '{"success": false, "error": "--sparse and --full are mutually exclusive"}' >&3
     else
         print_error "--sparse and --full are mutually exclusive"
     fi
@@ -612,7 +636,7 @@ fi
 
 if [[ "$SPARSE_MODE" == "true" && ${#SPARSE_PATHS[@]} -eq 0 ]]; then
     if [[ "$JSON_OUTPUT" == "true" ]]; then
-        echo '{"success": false, "error": "--sparse requires at least one path"}'
+        echo '{"success": false, "error": "--sparse requires at least one path"}' >&3
     else
         print_error "--sparse requires at least one path"
         echo ""
@@ -643,7 +667,7 @@ if check_if_in_worktree; then
     GIT_COMMON_DIR=$(git rev-parse --git-common-dir 2>/dev/null)
     if [[ -z "$GIT_COMMON_DIR" ]]; then
         if [[ "$JSON_OUTPUT" == "true" ]]; then
-            echo '{"error": "Failed to find git common directory"}'
+            echo '{"error": "Failed to find git common directory"}' >&3
         else
             print_error "Failed to find git common directory"
         fi
@@ -663,7 +687,7 @@ if check_if_in_worktree; then
         fi
     else
         if [[ "$JSON_OUTPUT" == "true" ]]; then
-            echo '{"error": "Failed to change to main workspace", "mainWorkspace": "'"$MAIN_WORKSPACE"'"}'
+            echo '{"error": "Failed to change to main workspace", "mainWorkspace": "'"$MAIN_WORKSPACE"'"}' >&3
         else
             print_error "Failed to change to main workspace: $MAIN_WORKSPACE"
             print_info "Please manually run: cd $MAIN_WORKSPACE"
@@ -687,7 +711,7 @@ cleanup_partial_worktree_state "$ISSUE_NUMBER" || true
 
 if ! acquire_worktree_lock "$ISSUE_NUMBER"; then
     if [[ "$JSON_OUTPUT" == "true" ]]; then
-        echo '{"success": false, "error": "worktree-lock-timeout", "issueNumber": '"$ISSUE_NUMBER"', "holderPid": "'"${WORKTREE_LOCK_HOLDER_PID:-}"'", "timeoutSeconds": '"$LOOM_WORKTREE_LOCK_TIMEOUT"'}'
+        echo '{"success": false, "error": "worktree-lock-timeout", "issueNumber": '"$ISSUE_NUMBER"', "holderPid": "'"${WORKTREE_LOCK_HOLDER_PID:-}"'", "timeoutSeconds": '"$LOOM_WORKTREE_LOCK_TIMEOUT"'}' >&3
     else
         print_error "Timed out waiting for worktree lock after ${LOOM_WORKTREE_LOCK_TIMEOUT}s"
         if [[ -n "${WORKTREE_LOCK_HOLDER_PID:-}" ]]; then
@@ -759,7 +783,7 @@ if [[ -d "$WORKTREE_PATH" ]]; then
     if [[ "$SPARSE_MODE" == "true" || "$FULL_MODE" == "true" ]]; then
         if ! git worktree list | grep -q "$WORKTREE_PATH"; then
             if [[ "$JSON_OUTPUT" == "true" ]]; then
-                echo '{"success": false, "error": "Directory exists but is not a registered worktree"}'
+                echo '{"success": false, "error": "Directory exists but is not a registered worktree"}' >&3
             else
                 print_error "Directory exists but is not a registered worktree: $WORKTREE_PATH"
             fi
@@ -771,7 +795,7 @@ if [[ -d "$WORKTREE_PATH" ]]; then
             log_worktree_size "$WORKTREE_PATH" "Worktree size (full)"
             if [[ "$JSON_OUTPUT" == "true" ]]; then
                 ABS_WT=$(cd "$WORKTREE_PATH" && pwd)
-                echo '{"success": true, "worktreePath": "'"$ABS_WT"'", "branchName": "'"$BRANCH_NAME"'", "issueNumber": '"$ISSUE_NUMBER"', "sparse": false, "cone": []}'
+                echo '{"success": true, "worktreePath": "'"$ABS_WT"'", "branchName": "'"$BRANCH_NAME"'", "issueNumber": '"$ISSUE_NUMBER"', "sparse": false, "cone": []}' >&3
             else
                 print_success "Worktree converted to full checkout"
                 print_info "To use this worktree: cd $WORKTREE_PATH"
@@ -787,7 +811,7 @@ if [[ -d "$WORKTREE_PATH" ]]; then
         if [[ "$JSON_OUTPUT" == "true" ]]; then
             ABS_WT=$(cd "$WORKTREE_PATH" && pwd)
             CONE_JSON=$(printf '%s\n' "${CONE_PATHS[@]}" | awk 'BEGIN{printf "["} {if(NR>1)printf ","; printf "\"%s\"", $0} END{printf "]"}')
-            echo '{"success": true, "worktreePath": "'"$ABS_WT"'", "branchName": "'"$BRANCH_NAME"'", "issueNumber": '"$ISSUE_NUMBER"', "sparse": true, "cone": '"$CONE_JSON"'}'
+            echo '{"success": true, "worktreePath": "'"$ABS_WT"'", "branchName": "'"$BRANCH_NAME"'", "issueNumber": '"$ISSUE_NUMBER"', "sparse": true, "cone": '"$CONE_JSON"'}' >&3
         else
             print_success "Sparse-checkout cone applied"
             print_info "To use this worktree: cd $WORKTREE_PATH"
@@ -1301,9 +1325,9 @@ EOF
         # "cone": [...] fields; full mode keeps "sparse": false with an empty cone.
         if [[ "$SPARSE_MODE" == "true" ]]; then
             CONE_JSON=$(printf '%s\n' "${SPARSE_CONE_PATHS[@]}" | awk 'BEGIN{printf "["} {if(NR>1)printf ","; printf "\"%s\"", $0} END{printf "]"}')
-            echo '{"success": true, "worktreePath": "'"$ABS_WORKTREE_PATH"'", "branchName": "'"$BRANCH_NAME"'", "issueNumber": '"$ISSUE_NUMBER"', "returnTo": "'"${ABS_RETURN_TO:-}"'", "sparse": true, "cone": '"$CONE_JSON"'}'
+            echo '{"success": true, "worktreePath": "'"$ABS_WORKTREE_PATH"'", "branchName": "'"$BRANCH_NAME"'", "issueNumber": '"$ISSUE_NUMBER"', "returnTo": "'"${ABS_RETURN_TO:-}"'", "sparse": true, "cone": '"$CONE_JSON"'}' >&3
         else
-            echo '{"success": true, "worktreePath": "'"$ABS_WORKTREE_PATH"'", "branchName": "'"$BRANCH_NAME"'", "issueNumber": '"$ISSUE_NUMBER"', "returnTo": "'"${ABS_RETURN_TO:-}"'", "sparse": false, "cone": []}'
+            echo '{"success": true, "worktreePath": "'"$ABS_WORKTREE_PATH"'", "branchName": "'"$BRANCH_NAME"'", "issueNumber": '"$ISSUE_NUMBER"', "returnTo": "'"${ABS_RETURN_TO:-}"'", "sparse": false, "cone": []}' >&3
         fi
     else
         # Human-readable output
@@ -1319,7 +1343,7 @@ EOF
     fi
 else
     if [[ "$JSON_OUTPUT" == "true" ]]; then
-        echo '{"success": false, "error": "Failed to create worktree"}'
+        echo '{"success": false, "error": "Failed to create worktree"}' >&3
     fi
     # Human-readable error already printed by _try_worktree_add / _handle_feature_branch_in_main_worktree
     exit 1
