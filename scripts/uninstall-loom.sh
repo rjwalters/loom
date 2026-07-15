@@ -1187,7 +1187,27 @@ if [[ "$LOCAL_MODE" == "true" ]]; then
   echo ""
 
   cd "$TARGET_PATH"
-  git add -A
+
+  # Issue #3545: stage ONLY the paths this uninstall actually touched — never a
+  # bare `git add -A`. A bare `git add -A` stages every pending change in the
+  # tree, sweeping unrelated user work (in-progress edits, an embedded
+  # `.claude/worktrees/agent-*/`, etc.) into the index alongside the Loom
+  # deletions. The `install.sh --quick` reinstall path then prints generic
+  # `git add -A && git commit` guidance that would commit those user files.
+  # Scope staging to the Loom-managed paths that were removed / smart-edited so
+  # user files are never staged.
+  STAGE_PATHS=(
+    ${REMOVE_FILES[@]+"${REMOVE_FILES[@]}"}
+    ${REMOVE_UNKNOWN_FILES[@]+"${REMOVE_UNKNOWN_FILES[@]}"}
+    ${SMART_REMOVE_FILES[@]+"${SMART_REMOVE_FILES[@]}"}
+    ".loom/CLAUDE.md"
+  )
+  for _stage_path in ${STAGE_PATHS[@]+"${STAGE_PATHS[@]}"}; do
+    # `-A` stages deletions and modifications alike; per-path invocation with
+    # `|| true` tolerates pathspecs that never matched (e.g. an untracked file
+    # that was removed, or a smart-remove target that did not exist).
+    git add -A -- "$_stage_path" 2>/dev/null || true
+  done
 
   if git diff --staged --quiet; then
     info "No changes detected - Loom files may have already been removed"
