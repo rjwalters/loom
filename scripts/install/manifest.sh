@@ -56,7 +56,7 @@ _read_loom_internal_skip_list() {
 #   - defaults/hooks/*.template     → templates, not installed verbatim
 #   - defaults/package.json         → only installed if target lacks one
 #   - any entry in defaults/.loom-internal.list (issue #3464) — Loom-
-#     internal files (e.g. .claude/commands/loom/release.md) that the
+#     internal files (e.g. .claude/commands/loom/internal-only.md) that the
 #     Rust installer also skips at copy time
 #
 # Path translations (defaults-relative → target-relative):

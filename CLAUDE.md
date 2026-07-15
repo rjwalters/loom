@@ -528,7 +528,10 @@ Use `scripts/version.sh` to manage versions across all packages:
 ./scripts/version.sh set 1.0.0 --tag   # Set explicit version + commit + tag
 ```
 
-**Full release flow** (use `/release` skill for guided process):
+**Full release flow** — releases are driven by `/repo:release` from
+[rjwalters/repo](https://github.com/rjwalters/repo) (install repo for the
+command). `/repo:release` detects and honors `scripts/version.sh` as its
+first-priority version tool, so the underlying mechanics are unchanged:
 ```bash
 ./scripts/version.sh bump patch --tag
 git push origin main --tags

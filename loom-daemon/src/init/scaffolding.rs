@@ -183,8 +183,8 @@ fn slice_is_discardable_legacy(slice: &str) -> bool {
 /// Load the Loom-internal skip list from `<defaults>/.loom-internal.list`.
 ///
 /// Returns a set of defaults-relative path strings (e.g.
-/// `".claude/commands/loom/release.md"`) that the installer must NOT copy
-/// into consumer repositories.
+/// `".claude/commands/loom/internal-only.md"`) that the installer must NOT
+/// copy into consumer repositories.
 ///
 /// File format:
 /// - One defaults-relative path per line.
@@ -192,7 +192,7 @@ fn slice_is_discardable_legacy(slice: &str) -> bool {
 /// - Blank lines are ignored.
 /// - Leading/trailing whitespace on each entry is stripped.
 /// - Paths are matched exactly against the defaults-relative path the
-///   copy helpers see (e.g. `.claude/commands/loom/release.md`). No
+///   copy helpers see (e.g. `.claude/commands/loom/internal-only.md`). No
 ///   globbing.
 ///
 /// Missing or unreadable files yield an empty set — the install path is
@@ -698,8 +698,8 @@ pub fn setup_repository_scaffolding(
     // instead of overwriting, so project-specific hooks are preserved.
     //
     // Issue #3464: skip files listed in `defaults/.loom-internal.list` so
-    // Loom-internal skills (e.g. `.claude/commands/loom/release.md`) are not
-    // shipped to consumer repositories. The skip list is loaded once and the
+    // Loom-internal skills (e.g. `.claude/commands/loom/internal-only.md`) are
+    // not shipped to consumer repositories. The skip list is loaded once and the
     // closure does a HashSet lookup per file. An empty list (or missing file)
     // is a no-op.
     let skip_list = load_internal_skip_list(defaults_path);
