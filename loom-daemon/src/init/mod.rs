@@ -24,6 +24,7 @@
 mod file_ops;
 mod git;
 mod post_init;
+mod retired;
 mod scaffolding;
 mod templates;
 
@@ -33,6 +34,7 @@ use std::path::Path;
 
 use file_ops::{clean_managed_dir, copy_dir_with_report, verify_copied_files, TemplateContext};
 use post_init::{find_overbroad_loom_patterns, generate_manifest, update_gitignore};
+use retired::cleanup_retired_files;
 use scaffolding::setup_repository_scaffolding;
 
 // Re-export public types and functions
@@ -192,6 +194,20 @@ pub fn initialize_workspace(
     // source defaults — flagging them as failures is misleading and the prior
     // "rerun with --force" remediation would clobber the user's intentional edits.
     filter_preserved_from_verification_failures(&mut report);
+
+    // Content-gated cleanup of retired Loom strays (issue #3576). The daemon
+    // init sync is source-driven and never removes destination-only files, so a
+    // stray `.claude/commands/loom/release.md` (the `/loom:release` skill
+    // retired by #3563) lingers on disk for Quick-Install consumers. Remove it
+    // iff its sha256 matches a frozen shipped digest (unmodified); preserve a
+    // customized copy; no-op when absent. Mirrors the shell-side
+    // `LOOM_RETIRED_FILES` block in scripts/install-loom.sh (PR #3575).
+    //
+    // Placed after scaffolding (post-sync) and before generate_manifest so the
+    // manifest reflects on-disk state. The self-install short-circuit above
+    // (returns at ~line 147 before scaffolding) means this never runs on the
+    // Loom source repo — it must not mutate the source tree.
+    cleanup_retired_files(workspace, &mut report);
 
     // Generate installation manifest (.loom/manifest.json)
     generate_manifest(workspace);
@@ -571,6 +587,49 @@ mod tests {
             "Expected missing-agents-directory issue, got: {:?}",
             validation.issues
         );
+    }
+
+    #[test]
+    fn test_self_install_skips_retired_file_cleanup() {
+        // Issue #3576: the retired-file cleanup is placed AFTER the self-install
+        // short-circuit in `initialize_workspace`, so it must never touch the
+        // Loom source tree. A stray `.claude/commands/loom/release.md` in a
+        // self-install workspace is left exactly as-is: not removed, and not
+        // even recorded in `report.preserved` (which would signal the cleanup
+        // ran and evaluated it — i.e. the call was misplaced before the early
+        // return).
+        let temp_dir = TempDir::new().unwrap();
+        let workspace = temp_dir.path();
+
+        fs::create_dir(workspace.join(".git")).unwrap();
+        fs::write(workspace.join(".loom-source"), "").unwrap();
+        fs::create_dir_all(workspace.join(".loom").join("roles")).unwrap();
+        fs::create_dir_all(workspace.join(".loom").join("scripts")).unwrap();
+        fs::create_dir_all(workspace.join(".claude").join("commands").join("loom")).unwrap();
+        fs::create_dir_all(workspace.join(".claude").join("agents")).unwrap();
+        fs::write(workspace.join("CLAUDE.md"), "").unwrap();
+        fs::create_dir_all(workspace.join(".github")).unwrap();
+        fs::write(workspace.join(".github").join("labels.yml"), "").unwrap();
+
+        // A retired stray on disk in the source tree.
+        let stray = workspace
+            .join(".claude")
+            .join("commands")
+            .join("loom")
+            .join("release.md");
+        fs::write(&stray, "some release.md content\n").unwrap();
+
+        let result =
+            initialize_workspace(workspace.to_str().unwrap(), "nonexistent-defaults", false);
+        assert!(result.is_ok());
+        let report = result.unwrap();
+
+        assert!(report.is_self_install);
+        // Cleanup never ran: file untouched, and it appears in neither list.
+        assert!(stray.exists(), "self-install must not remove the stray release.md");
+        let retired = ".claude/commands/loom/release.md".to_string();
+        assert!(!report.removed.contains(&retired));
+        assert!(!report.preserved.contains(&retired));
     }
 
     #[test]
