@@ -1,16 +1,20 @@
 #!/usr/bin/env bash
-# Test suite for .loom/hooks/guard-destructive.sh
+# Test suite for defaults/hooks/guard-destructive.sh
 #
 # Usage: ./tests/hooks/test-guard-destructive.sh
 #
 # Tests the PreToolUse guard hook against various command patterns.
 # Exit code 0 = all tests pass, 1 = failures detected.
+#
+# The guard under test is the canonical source at defaults/hooks/ (the
+# version-controlled source of truth), NOT the gitignored .loom/hooks/ install
+# artifact — so the suite validates exactly what ships.
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
-GUARD="$REPO_ROOT/.loom/hooks/guard-destructive.sh"
+GUARD="$REPO_ROOT/defaults/hooks/guard-destructive.sh"
 
 PASS=0
 FAIL=0
@@ -55,6 +59,77 @@ run_guard_in_worktree() {
     exit_code=${exit_code:-0}
     echo "$output"
     return $exit_code
+}
+
+# --- SQL opt-out helpers (guards.sqlDdl / LOOM_GUARD_SQL) ---
+
+# Create a throwaway git repo whose .loom/config.json holds the given JSON.
+# Echoes the repo path (which becomes the guard's cwd / resolved REPO_ROOT).
+# NB: callers invoke this via command substitution (a subshell), so this must
+# not try to record state in the parent — cleanup is done by path at the end.
+make_sql_repo() {
+    local config_json="$1"
+    local dir
+    dir=$(mktemp -d 2>/dev/null)
+    git -C "$dir" init -q >/dev/null 2>&1
+    mkdir -p "$dir/.loom"
+    printf '%s' "$config_json" > "$dir/.loom/config.json"
+    echo "$dir"
+}
+
+# Run the guard with an optional env assignment (e.g. "LOOM_GUARD_SQL=0").
+run_guard_env() {
+    local env_kv="$1"
+    local cmd="$2"
+    local cwd="${3:-$REPO_ROOT}"
+    local output
+    local exit_code=0
+    if [[ -n "$env_kv" ]]; then
+        output=$(make_input "$cmd" "$cwd" | env "$env_kv" "$GUARD" 2>&1) || exit_code=$?
+    else
+        output=$(make_input "$cmd" "$cwd" | "$GUARD" 2>&1) || exit_code=$?
+    fi
+    echo "$output"
+    return $exit_code
+}
+
+# Assert deny with an env assignment + cwd (repo root).
+assert_deny_env() {
+    local description="$1"; local env_kv="$2"; local cmd="$3"; local cwd="${4:-$REPO_ROOT}"
+    TOTAL=$((TOTAL + 1))
+    local output
+    output=$(run_guard_env "$env_kv" "$cmd" "$cwd") || true
+    if echo "$output" | jq -e '.hookSpecificOutput.permissionDecision == "deny"' >/dev/null 2>&1; then
+        PASS=$((PASS + 1))
+        echo -e "  ${GREEN}PASS${NC}: $description"
+    else
+        FAIL=$((FAIL + 1))
+        echo -e "  ${RED}FAIL${NC}: $description"
+        echo -e "       Command: $cmd (env: ${env_kv:-none}, cwd: $cwd)"
+        echo -e "       Expected: deny"
+        echo -e "       Got: $output"
+    fi
+}
+
+# Assert allow (exit 0, no decision) with an env assignment + cwd.
+assert_allow_env() {
+    local description="$1"; local env_kv="$2"; local cmd="$3"; local cwd="${4:-$REPO_ROOT}"
+    TOTAL=$((TOTAL + 1))
+    local output
+    local exit_code=0
+    output=$(run_guard_env "$env_kv" "$cmd" "$cwd") || exit_code=$?
+    if [[ $exit_code -eq 0 ]] && \
+       ! echo "$output" | jq -e '.hookSpecificOutput.permissionDecision' >/dev/null 2>&1; then
+        PASS=$((PASS + 1))
+        echo -e "  ${GREEN}PASS${NC}: $description"
+    else
+        FAIL=$((FAIL + 1))
+        echo -e "  ${RED}FAIL${NC}: $description"
+        echo -e "       Command: $cmd (env: ${env_kv:-none}, cwd: $cwd)"
+        echo -e "       Expected: allow (exit 0, no decision)"
+        echo -e "       Exit code: $exit_code"
+        echo -e "       Got: $output"
+    fi
 }
 
 # Assert the guard denies a command when inside a worktree
@@ -485,6 +560,90 @@ assert_allow "Allow pip install -e outside worktree" \
 
 assert_allow "Allow pip install -e ./loom-tools outside worktree" \
     "pip install -e ./loom-tools"
+
+echo ""
+
+# =========================================================================
+echo -e "${YELLOW}--- SQL DDL/DML opt-out (guards.sqlDdl / LOOM_GUARD_SQL) ---${NC}"
+# =========================================================================
+
+# Repo with the SQL guard explicitly disabled via .loom/config.json.
+SQL_OFF_REPO=$(make_sql_repo '{"guards":{"sqlDdl":false}}')
+# Repo with the SQL guard explicitly enabled via .loom/config.json.
+SQL_ON_REPO=$(make_sql_repo '{"guards":{"sqlDdl":true}}')
+# Repo whose config has no guards key at all — must default to guard ON.
+SQL_ABSENT_REPO=$(make_sql_repo '{"champion":{"auto_merge_max_lines":200}}')
+# Repo with malformed config — must fall through to guard ON.
+SQL_BAD_REPO=$(make_sql_repo '{ this is not valid json ')
+
+# --- Non-regression: guard ON by default still blocks all five SQL cases ---
+assert_deny "SQL default-on: block DROP DATABASE (config guards absent)" \
+    "psql -c 'DROP DATABASE mydb;'" "$SQL_ABSENT_REPO"
+assert_deny "SQL default-on: block DROP TABLE (config guards absent)" \
+    "mysql -e 'DROP TABLE users;'" "$SQL_ABSENT_REPO"
+assert_deny "SQL default-on: block DROP SCHEMA (config guards absent)" \
+    "psql -c 'DROP SCHEMA public CASCADE;'" "$SQL_ABSENT_REPO"
+assert_deny "SQL default-on: block TRUNCATE TABLE (config guards absent)" \
+    "psql -c 'TRUNCATE TABLE users;'" "$SQL_ABSENT_REPO"
+assert_deny "SQL default-on: block DELETE FROM without WHERE (config guards absent)" \
+    "psql -c 'DELETE FROM users;'" "$SQL_ABSENT_REPO"
+
+# --- Non-regression: explicit guards.sqlDdl:true still blocks ---
+assert_deny "SQL config-on: block DROP TABLE" \
+    "mysql -e 'DROP TABLE users;'" "$SQL_ON_REPO"
+assert_deny "SQL config-on: block DELETE FROM without WHERE" \
+    "psql -c 'DELETE FROM users;'" "$SQL_ON_REPO"
+
+# --- Non-regression: malformed config falls through to guard ON ---
+assert_deny "SQL malformed-config: block DROP TABLE (fall through to on)" \
+    "mysql -e 'DROP TABLE users;'" "$SQL_BAD_REPO"
+assert_deny "SQL malformed-config: block DELETE FROM without WHERE" \
+    "psql -c 'DELETE FROM users;'" "$SQL_BAD_REPO"
+
+# --- Opt-out via config: all five SQL cases pass through as allow ---
+assert_allow "SQL config-off: allow DROP DATABASE" \
+    "psql -c 'DROP DATABASE mydb;'" "$SQL_OFF_REPO"
+assert_allow "SQL config-off: allow DROP TABLE" \
+    "mysql -e 'DROP TABLE users;'" "$SQL_OFF_REPO"
+assert_allow "SQL config-off: allow DROP SCHEMA" \
+    "psql -c 'DROP SCHEMA public CASCADE;'" "$SQL_OFF_REPO"
+assert_allow "SQL config-off: allow TRUNCATE TABLE" \
+    "psql -c 'TRUNCATE TABLE users;'" "$SQL_OFF_REPO"
+assert_allow "SQL config-off: allow DELETE FROM without WHERE" \
+    "psql -c 'DELETE FROM users;'" "$SQL_OFF_REPO"
+
+# --- Opt-out must NOT weaken non-SQL guards ---
+assert_deny "SQL config-off: rm -rf / still blocked" \
+    "rm -rf /" "$SQL_OFF_REPO"
+assert_deny "SQL config-off: force-push to main still blocked" \
+    "git push --force origin main" "$SQL_OFF_REPO"
+assert_deny "SQL config-off: gh repo delete still blocked" \
+    "gh repo delete myrepo --yes" "$SQL_OFF_REPO"
+assert_deny "SQL config-off: aws ec2 terminate still blocked" \
+    "aws ec2 terminate-instances --instance-ids i-1234" "$SQL_OFF_REPO"
+assert_deny "SQL config-off: aws s3 rb still blocked" \
+    "aws s3 rb s3://my-bucket --force" "$SQL_OFF_REPO"
+
+# --- Env override: LOOM_GUARD_SQL=0 disables even when config says true ---
+assert_allow_env "LOOM_GUARD_SQL=0 overrides config-on: allow DROP TABLE" \
+    "LOOM_GUARD_SQL=0" "mysql -e 'DROP TABLE users;'" "$SQL_ON_REPO"
+assert_allow_env "LOOM_GUARD_SQL=0 overrides config-on: allow DELETE FROM without WHERE" \
+    "LOOM_GUARD_SQL=0" "psql -c 'DELETE FROM users;'" "$SQL_ON_REPO"
+
+# --- Env override: LOOM_GUARD_SQL=1 forces on even when config says false ---
+assert_deny_env "LOOM_GUARD_SQL=1 overrides config-off: block DROP TABLE" \
+    "LOOM_GUARD_SQL=1" "mysql -e 'DROP TABLE users;'" "$SQL_OFF_REPO"
+assert_deny_env "LOOM_GUARD_SQL=1 overrides config-off: block DELETE FROM without WHERE" \
+    "LOOM_GUARD_SQL=1" "psql -c 'DELETE FROM users;'" "$SQL_OFF_REPO"
+
+# --- Env override: LOOM_GUARD_SQL=0 still doesn't weaken non-SQL guards ---
+assert_deny_env "LOOM_GUARD_SQL=0: rm -rf / still blocked" \
+    "LOOM_GUARD_SQL=0" "rm -rf /" "$SQL_ON_REPO"
+
+# Clean up temp repos created above.
+for _sql_dir in "$SQL_OFF_REPO" "$SQL_ON_REPO" "$SQL_ABSENT_REPO" "$SQL_BAD_REPO"; do
+    [[ -n "$_sql_dir" && "$_sql_dir" != "/" && -d "$_sql_dir/.loom" ]] && rm -rf "$_sql_dir"
+done
 
 echo ""
 
