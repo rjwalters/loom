@@ -902,6 +902,40 @@ If setup fails, it's usually due to:
 
 Loom ships with built-in guard hooks (`guard-destructive.sh` for dangerous Bash commands). You can add project-specific guards to protect read-only directories from accidental edits.
 
+### SQL DDL/DML Guard Opt-Out (`guards.sqlDdl` / `LOOM_GUARD_SQL`)
+
+`guard-destructive.sh` blocks SQL DDL/DML patterns — `DROP DATABASE`, `DROP TABLE`, `DROP SCHEMA`, `TRUNCATE TABLE`, and `DELETE FROM` without a `WHERE` clause. For most repos this is a useful safety net, but for a project that is **itself a database engine** (e.g. a SQLite-compatible engine running a SQL conformance suite) those statements are the product's own dev/test vocabulary and the guard is a category error — the match is a case-insensitive substring, so it even fires when the words appear in a comment or a `--description` label.
+
+Such repos can opt out of the SQL guard while keeping every other guard (`rm -rf /`, force-push to `main`, `gh repo delete`, `aws ec2 terminate`, `aws s3 rb`, etc.) fully active.
+
+The SQL guard is **on by default**. It is resolved in this order (highest precedence first):
+
+1. **`LOOM_GUARD_SQL` env var** — `0`/`false`/`no` disables the SQL guard; `1`/`true`/`yes` forces it on. Overrides the config value.
+2. **`.loom/config.json`** — `guards.sqlDdl` (default `true` when absent). Set it to `false` to disable:
+   ```json
+   {
+     "guards": {
+       "sqlDdl": false
+     }
+   }
+   ```
+3. **Default** — `true` (guard on).
+
+The config read is best-effort: a missing, empty, or malformed `.loom/config.json` falls through to guard-ON and never causes the hook to exit non-zero. Only the SQL DDL/DML blocks are affected — disabling the SQL guard does not weaken any other guard.
+
+**Examples**:
+
+```bash
+# Disable the SQL guard for a single command (e.g. a one-off dev query)
+LOOM_GUARD_SQL=0 vibesql -c "DROP TABLE t"
+
+# Persist the opt-out for the whole repo
+#   .loom/config.json  ->  { "guards": { "sqlDdl": false } }
+
+# Force the SQL guard on for one command even when the repo opts out
+LOOM_GUARD_SQL=1 psql -c "DROP TABLE users"
+```
+
 ### Protecting Read-Only Directories
 
 Many projects have directories that should never be modified by agents (vendor code, generated files, external SDKs, process design kits). Loom provides a template hook for this.

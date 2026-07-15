@@ -74,6 +74,49 @@ elif [[ -n "$CWD" ]]; then
     log_hook_error "cwd does not exist: $CWD — skipping repo root resolution"
 fi
 
+# =============================================================================
+# SQL DDL/DML guard toggle — default ON.
+#
+# The SQL DDL/DML blocks (DROP DATABASE/TABLE/SCHEMA, TRUNCATE TABLE, and
+# DELETE FROM without WHERE) are a category error for repos that are themselves
+# database engines, where those statements are the product's own dev/test
+# vocabulary. Such repos opt out; everyone else keeps the guard on.
+#
+# Resolution order (highest precedence first):
+#   1. LOOM_GUARD_SQL env var (0/false/no disables, 1/true/yes forces on)
+#   2. .loom/config.json  ->  guards.sqlDdl  (default true when absent)
+#   3. Default: true (guard on)
+#
+# The resolution runs LAZILY — sql_guard_enabled() is only invoked once a
+# command has already matched a SQL DDL/DML pattern, so the jq config read never
+# touches the hot path for the ~99% of commands that are not SQL. The result is
+# cached so a command matching multiple SQL patterns pays for at most one read.
+#
+# The config read is best-effort: any parse failure falls through to guard-ON
+# and never trips the ERR trap or produces a non-zero exit.
+# =============================================================================
+_SQL_GUARD_CACHE=""
+sql_guard_enabled() {
+    if [[ -z "$_SQL_GUARD_CACHE" ]]; then
+        local enabled=true
+        if [[ -n "$REPO_ROOT" && -f "$REPO_ROOT/.loom/config.json" ]]; then
+            # jq // is alternative-on-null, not default-on-missing, so use
+            # if/then/else to treat only an explicit `false` as disabled (a
+            # missing guards.sqlDdl key stays on). On malformed JSON jq exits
+            # non-zero and the `||` fallback restores the guard-ON default.
+            enabled=$(jq -r 'if .guards.sqlDdl == false then "false" else "true" end' "$REPO_ROOT/.loom/config.json" 2>/dev/null) || enabled=true
+            [[ -n "$enabled" ]] || enabled=true
+        fi
+        # Env override wins over config.
+        case "${LOOM_GUARD_SQL:-}" in
+            0|false|no)  enabled=false ;;
+            1|true|yes)  enabled=true ;;
+        esac
+        _SQL_GUARD_CACHE="$enabled"
+    fi
+    [[ "$_SQL_GUARD_CACHE" == "true" ]]
+}
+
 # Helper: output a deny decision and exit
 deny() {
     local reason="$1"
@@ -164,12 +207,6 @@ ALWAYS_BLOCK_PATTERNS=(
     'poweroff'
     'init 0'
     'init 6'
-
-    # Database destruction
-    'DROP DATABASE'
-    'DROP TABLE'
-    'DROP SCHEMA'
-    'TRUNCATE TABLE'
 )
 
 for pattern in "${ALWAYS_BLOCK_PATTERNS[@]}"; do
@@ -177,6 +214,21 @@ for pattern in "${ALWAYS_BLOCK_PATTERNS[@]}"; do
         deny "BLOCKED: Command matches dangerous pattern: $pattern"
     fi
 done
+
+# =============================================================================
+# DATABASE DESTRUCTION - Gated by the SQL DDL/DML guard toggle
+#
+# Kept separate from ALWAYS_BLOCK_PATTERNS so DB-engine repos can opt out
+# (guards.sqlDdl:false / LOOM_GUARD_SQL=0). A single alternation grep matches
+# all four DDL statements in one pass (cheaper than a per-pattern loop), and
+# sql_guard_enabled() is consulted only after a match, so the config read stays
+# off the hot path.
+# =============================================================================
+SQL_DDL_PATTERN='DROP DATABASE|DROP TABLE|DROP SCHEMA|TRUNCATE TABLE'
+if echo "$COMMAND" | grep -qiE "$SQL_DDL_PATTERN" && sql_guard_enabled; then
+    matched=$(echo "$COMMAND" | grep -oiE "$SQL_DDL_PATTERN" | head -1)
+    deny "BLOCKED: Command matches dangerous pattern: ${matched:-SQL DDL statement}"
+fi
 
 # =============================================================================
 # rm -rf SCOPE CHECK - Block rm with recursive/force flags outside repo
@@ -245,9 +297,13 @@ fi
 # DELETE without WHERE - Database safety
 # =============================================================================
 
+# Gated by the SQL DDL/DML guard toggle. DB-engine repos opt out via
+# guards.sqlDdl:false or LOOM_GUARD_SQL=0. sql_guard_enabled() is consulted only
+# after the DELETE-FROM-without-WHERE match, keeping the config read off the hot
+# path for non-SQL commands.
 if echo "$COMMAND" | grep -qiE 'DELETE\s+FROM\s+' && \
    ! echo "$COMMAND" | grep -qiE 'WHERE\s+'; then
-    deny "BLOCKED: DELETE FROM without WHERE clause"
+    sql_guard_enabled && deny "BLOCKED: DELETE FROM without WHERE clause"
 fi
 
 # =============================================================================
