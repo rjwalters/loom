@@ -987,6 +987,68 @@ if [[ "$DOGFOOD_MODE" == "true" ]]; then
     fi
   fi
   echo ""
+
+  # Dogfood mode (issue #3565): materialize loom's live `.claude/commands/loom/`
+  # as a real COPY of `defaults/.claude/commands/loom/`, NOT a symlink into
+  # `defaults/`.
+  #
+  # Why a copy and not a symlink (unlike .claude/agents above):
+  #   A symlink `.claude/commands -> ../defaults/.claude/commands` (or a
+  #   per-file symlink into defaults/) still redirects on-disk writes into the
+  #   shipped `defaults/` tree. A co-installed tool that writes
+  #   `.claude/commands/<ns>/foo.md` would therefore pollute loom's own
+  #   distribution artifact (this is exactly how it bit us — see #3565).
+  #   Materializing a REAL gitignored directory makes loom's live
+  #   `.claude/commands/` a pure destination like every consumer's: sibling
+  #   namespaces land harmlessly next to `loom/` and never touch `defaults/`.
+  #
+  # The command markdown carries no init-substituted placeholders
+  # ({{LOOM_VERSION}} etc.), so a plain copy is byte-identical to a consumer
+  # install — no template substitution needed for this layer.
+  #
+  # `.claude/commands` is gitignored in loom's own committed .gitignore (added
+  # in #3565), so this real directory is never staged by `git add -A`. The
+  # daemon's consumer `update_gitignore` list is intentionally NOT touched —
+  # consumer repos keep `.claude/commands/loom/` tracked.
+  info "Dogfood mode: materializing .claude/commands/loom copy in $TARGET_PATH..."
+  CMD_SRC="$TARGET_PATH/defaults/.claude/commands/loom"
+  CMD_LIVE_DIR="$TARGET_PATH/.claude/commands"
+  CMD_LIVE_LOOM="$CMD_LIVE_DIR/loom"
+
+  if [[ ! -d "$CMD_SRC" ]]; then
+    warning "Dogfood commands source does not exist: $CMD_SRC"
+    warning "Skipping .claude/commands materialization; commands may be missing or stale"
+  else
+    mkdir -p "$TARGET_PATH/.claude"
+
+    # If `.claude/commands` is still the legacy whole-dir symlink into
+    # defaults/, remove it so we can build a real destination directory in its
+    # place. Any sibling namespaces from co-installed tools already live in a
+    # real dir and are preserved.
+    if [[ -L "$CMD_LIVE_DIR" ]]; then
+      info "Removing legacy .claude/commands symlink -> $(readlink "$CMD_LIVE_DIR")"
+      rm -f "$CMD_LIVE_DIR"
+    fi
+    mkdir -p "$CMD_LIVE_DIR"
+
+    # Build the fresh copy in a temp dir on the same filesystem, then swap it
+    # into place with an atomic rename so an in-progress Claude Code session
+    # never observes a missing or half-written `.claude/commands/loom/`. Only
+    # the `loom/` subdir is swapped — sibling namespaces under
+    # `.claude/commands/` are untouched, and `.claude/commands/` itself is
+    # always present.
+    CMD_TMP="$(mktemp -d "$TARGET_PATH/.claude/.commands-bootstrap.XXXXXX")"
+    cp -R "$CMD_SRC/." "$CMD_TMP/loom-new"
+    if [[ -e "$CMD_LIVE_LOOM" || -L "$CMD_LIVE_LOOM" ]]; then
+      # Move the old copy aside first (brief; new content is byte-identical).
+      rm -rf "$CMD_TMP/loom-old"
+      mv "$CMD_LIVE_LOOM" "$CMD_TMP/loom-old"
+    fi
+    mv "$CMD_TMP/loom-new" "$CMD_LIVE_LOOM"
+    rm -rf "$CMD_TMP"
+    success "Materialized .claude/commands/loom/ (real copy of defaults/, gitignored)"
+  fi
+  echo ""
 fi
 
 # Configure git hooks path so .githooks/ pre-commit works without husky/npx

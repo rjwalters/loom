@@ -72,7 +72,7 @@ After the tables, close with a short **where to start**:
 
 After printing the overview, do a lightweight accuracy check against what is actually installed:
 
-1. List the installed command files: `ls .claude/commands/loom/*.md` (read-only). If that path is missing, try `ls defaults/.claude/commands/loom/*.md` (this repo keeps the canonical source there and symlinks `.claude/commands`).
+1. List the installed command files: `ls .claude/commands/loom/*.md` (read-only). If that path is missing, try `ls defaults/.claude/commands/loom/*.md` (the loom source repo keeps the canonical source there and materializes a real, gitignored copy at `.claude/commands`).
 2. Reduce each result to its base name without `.md`.
 3. **Exclude** the known reference sub-docs and deprecated stubs — these are internal building blocks, not invocable entry points, and must never appear in the listing:
    - anything ending in `-patterns` or `-reference` (e.g. `architect-patterns`, `architect-reference`, `champion-reference`, `hermit-patterns`, `loom-reference`)
