@@ -2197,6 +2197,57 @@ echo ""
 
 
 # ==========================================================================
+# Section 12: Local-mode uninstall staging scope (#3545)
+# ==========================================================================
+
+# Test 64: Local-mode uninstall stages ONLY Loom-managed paths, never
+# unrelated user changes. Regression guard for #3545: the old bare
+# `git add -A` in Step 8 (local mode) swept in any pending user work —
+# an in-progress edit or an embedded worktree — which the install.sh
+# --quick reinstall path would then fold into its commit guidance.
+echo "Test 64: Local uninstall stages only Loom paths, not user changes (#3545)"
+SCOPE_REPO="$TEST_DIR/scoped-staging-test"
+create_temp_repo "$SCOPE_REPO"
+simulate_loom_install "$SCOPE_REPO"
+
+# Commit a baseline that includes a tracked user file alongside the Loom install.
+mkdir -p "$SCOPE_REPO/src"
+echo "original" > "$SCOPE_REPO/src/app.txt"
+git -C "$SCOPE_REPO" add -A
+git -C "$SCOPE_REPO" commit -m "loom install + user file" --quiet
+
+# Dirty the tree the way a user mid-edit would: modify a tracked file and drop
+# an untracked file (mimics the .claude/worktrees/agent-*/ near-miss in #3545).
+echo "user edit" >> "$SCOPE_REPO/src/app.txt"
+mkdir -p "$SCOPE_REPO/user-junk"
+echo "scratch" > "$SCOPE_REPO/user-junk/notes.txt"
+
+"$UNINSTALL_SCRIPT" --yes --local "$SCOPE_REPO" > /dev/null 2>&1 || true
+
+# The untracked user file must remain untracked/unstaged (?? in porcelain).
+if git -C "$SCOPE_REPO" status --porcelain -- user-junk/notes.txt | grep -q '^??'; then
+  pass "Untracked user file left unstaged by local uninstall (#3545)"
+else
+  fail "Untracked user file was staged by local uninstall (bare 'git add -A' regression, #3545)"
+fi
+
+# The modified tracked user file must remain a working-tree modification ( M).
+if git -C "$SCOPE_REPO" status --porcelain -- src/app.txt | grep -q '^ M'; then
+  pass "Modified tracked user file left unstaged by local uninstall (#3545)"
+else
+  fail "Modified tracked user file was staged by local uninstall (#3545)"
+fi
+
+# Loom file deletions MUST still be staged — that is the uninstall's job.
+if git -C "$SCOPE_REPO" diff --staged --name-only | grep -q '^\.loom/'; then
+  pass "Loom file deletions staged by local uninstall (scoped staging still works)"
+else
+  fail "Loom file deletions were not staged by local uninstall (#3545 over-scoped)"
+fi
+echo ""
+
+
+# ==========================================================================
 # Summary
 # ==========================================================================
 echo "======================================"

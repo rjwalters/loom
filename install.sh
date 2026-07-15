@@ -563,6 +563,28 @@ elif [[ -d "$TARGET_PATH/.loom" ]]; then
     info "Non-interactive mode: proceeding with reinstall"
   fi
 
+  # Issue #3545: for a --quick reinstall, guard uncommitted user changes across
+  # the uninstall→reinstall cycle (mirrors the stash guard in the sibling
+  # scripts/install-loom.sh --clean path). The uninstall runs `git add` in the
+  # target tree and the reinstall reconciles the index afterwards; stashing
+  # first keeps a user's pre-existing staged/working changes from being caught
+  # up in either step. The non-quick reinstall delegates to install-loom.sh,
+  # which performs its own guarding, so it is intentionally left unstashed here.
+  REINSTALL_STASHED_USER_CHANGES=false
+  if [[ "$INSTALL_TYPE" == "1" ]]; then
+    if ! git -C "$TARGET_PATH" diff --quiet 2>/dev/null || \
+       ! git -C "$TARGET_PATH" diff --staged --quiet 2>/dev/null; then
+      info "Stashing uncommitted user changes before reinstall..."
+      if git -C "$TARGET_PATH" stash push -m "loom-install: preserving user changes before --quick reinstall" 2>/dev/null; then
+        REINSTALL_STASHED_USER_CHANGES=true
+        success "User changes stashed"
+      else
+        warning "Failed to stash user changes - continuing without stash"
+        warning "Uncommitted changes may appear alongside the reinstall diff"
+      fi
+    fi
+  fi
+
   # Uninstall existing installation (local mode, no separate PR)
   info "Uninstalling existing Loom installation..."
   "$LOOM_ROOT/scripts/uninstall-loom.sh" --yes --local "$TARGET_PATH" || \
@@ -598,6 +620,29 @@ elif [[ -d "$TARGET_PATH/.loom" ]]; then
     # Emit skill-routes.json, install-metadata.json, loom-source-path (#3502).
     finalize_quick_install "$LOOM_ROOT" "$TARGET_PATH"
     verify_install "$TARGET_PATH"
+
+    # Issue #3545: reconcile the git index after the uninstall→reinstall cycle.
+    # The chained uninstall staged the deletion of every prior Loom file (now
+    # scoped to Loom-managed paths — see scripts/uninstall-loom.sh), then
+    # `loom-daemon init --force` rewrote those files to disk WITHOUT touching
+    # the index. Left as-is, `git status` shows ~150 paired staged-`D` /
+    # untracked-`??` entries instead of the real version-upgrade diff. Unstage
+    # the uninstall's staged deletions so the working tree reflects only the
+    # actual old→new file changes.
+    info "Reconciling git index after reinstall..."
+    git -C "$TARGET_PATH" restore --staged . 2>/dev/null || \
+      git -C "$TARGET_PATH" reset -q HEAD -- . 2>/dev/null || true
+
+    # Restore any user changes stashed before the uninstall (see above).
+    if [[ "$REINSTALL_STASHED_USER_CHANGES" == "true" ]]; then
+      info "Restoring stashed user changes..."
+      if git -C "$TARGET_PATH" stash pop 2>/dev/null; then
+        success "User changes restored"
+      else
+        warning "Failed to restore stashed user changes automatically"
+        warning "Run 'git stash pop' in $TARGET_PATH to recover your changes"
+      fi
+    fi
 
     echo ""
     success "Quick reinstallation complete!"
