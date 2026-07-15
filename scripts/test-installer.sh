@@ -1293,6 +1293,163 @@ echo ""
 
 
 # ==========================================================================
+# Section 5b: Retired-File Cleanup (#3572)
+# ==========================================================================
+# Exercises the content-gated retired-file cleanup block in install-loom.sh
+# (the "Retired-file cleanup (content-gated)" block after the stale-file
+# sweep). A file on the frozen retired-file allowlist is git-rm'd ONLY when its
+# on-disk content hashes to a shipped digest (unmodified); a consumer-modified
+# copy is preserved; an absent file is a no-op. The gate logic is mirrored
+# inline here (like find_stale_files above) so it can be verified without
+# invoking the full installer, plus a drift guard that asserts the real
+# allowlist in install-loom.sh still carries the digests this mirror expects.
+
+# Mirror of install-loom.sh's LOOM_RETIRED_FILES allowlist (#3572). Keep in
+# sync with install-loom.sh — assert_retired_allowlist_in_sync guards drift.
+RETIRED_ALLOWLIST_MIRROR=$(cat <<'RETIRED'
+.claude/commands/loom/release.md 11aef217942f45bd03d90a24e5efae9209041cb59f09c888df4dc7e8208910dd
+.claude/commands/loom/release.md 0df6c20846c98850413243362c80dea2fd01330c8d97033ef5f7c3989578fe8c
+.claude/commands/loom/release.md c45841f8da42d1bda20bc180c8a93d14242238d9a2c1d9f5a1bdac32b5e9e556
+.claude/commands/loom/release.md d91e198e977ad7799f44fa1a6827c9836bca6d31c9357ed92fc400a3c88381de
+.claude/commands/loom/release.md 0d7030dd14f32f6f382a6430cd04e5f0475825d567aaed7570b73a4c43128ad1
+.claude/commands/loom/release.md 4a077ed25cb44add0afbc4d6bda23cb372f5f3c4c2ef23b7a24b586e66e4f3e7
+.claude/commands/loom/release.md 5f9930dc72a263866122b18018a64b8fed4bd53ef623d0eef27ed1e31fa0502f
+.claude/commands/loom/release.md b7fae9d13d2bfaee3bde514cabe44ac70b6551351a9e49357ede00f82c17cf35
+.claude/commands/loom/release.md f6523d9be058e40397f0ce30c08a8f2b60e9b38adae04bd7c919e0cc840acfec
+.claude/commands/loom/release.md 29a845f7f8912545d23832551753304df6e72dd4a9c8082c2d8ada1f09f449e1
+.claude/commands/loom/release.md 795c1df1d3f3706ba448482b037a0c9e4eb6272a719adb2688b9ddfc91ab4de6
+RETIRED
+)
+
+# The git blob sha of the last release.md version Loom shipped (parent of the
+# #3571 deletion). Immutable + content-addressed; its sha256 is the first row
+# of the mirror above. Used to reconstruct real shipped bytes at test time.
+RETIRED_LAST_SHIPPED_BLOB="b1dac86f43dbe159b1a617b31010cdaab7b88bc5"
+RETIRED_RELEASE_PATH=".claude/commands/loom/release.md"
+
+_test_sha256() { shasum -a 256 "$1" 2>/dev/null | awk '{print $1}'; }
+
+# Mirror of the install-loom.sh gate: prints REMOVE / PRESERVE / NONE for the
+# retired path under repo $1.
+retired_decision() {
+  local repo="$1" rp="$RETIRED_RELEASE_PATH"
+  [[ -f "$repo/$rp" ]] || { echo "NONE"; return 0; }
+  local fh; fh="$(_test_sha256 "$repo/$rp")"
+  local matched=false ap ah
+  if [[ -n "$fh" ]]; then
+    while read -r ap ah; do
+      [[ -n "$ap" && "${ap:0:1}" != "#" ]] || continue
+      if [[ "$ap" == "$rp" && "$ah" == "$fh" ]]; then matched=true; break; fi
+    done <<< "$RETIRED_ALLOWLIST_MIRROR"
+  fi
+  if [[ "$matched" == "true" ]]; then echo "REMOVE"; else echo "PRESERVE"; fi
+}
+
+# Drift guard: every digest in the test mirror must be present in the real
+# install-loom.sh allowlist (and vice-versa for the release.md rows).
+assert_retired_allowlist_in_sync() {
+  local ok=true ap ah
+  while read -r ap ah; do
+    [[ -n "$ap" && "${ap:0:1}" != "#" ]] || continue
+    if ! grep -qF "$ap $ah" "$SCRIPT_DIR/install-loom.sh"; then
+      ok=false
+      warn "mirror digest missing from install-loom.sh: $ap $ah"
+    fi
+  done <<< "$RETIRED_ALLOWLIST_MIRROR"
+  if [[ "$ok" == "true" ]]; then
+    pass "Retired-file allowlist in test mirror matches install-loom.sh"
+  else
+    fail "Retired-file allowlist drifted between test mirror and install-loom.sh"
+  fi
+}
+
+echo "--- Section 5b: Retired-File Cleanup (#3572) ---"
+echo ""
+
+# Test 44a: an unmodified (hash-matching) retired file is removed on update.
+echo "Test 44a: Unmodified retired release.md is removed"
+RETIRED_REMOVE_REPO="$TEST_DIR/retired-remove-test"
+create_temp_repo "$RETIRED_REMOVE_REPO"
+mkdir -p "$RETIRED_REMOVE_REPO/$(dirname "$RETIRED_RELEASE_PATH")"
+if git -C "$LOOM_ROOT" cat-file -e "$RETIRED_LAST_SHIPPED_BLOB" 2>/dev/null; then
+  git -C "$LOOM_ROOT" cat-file blob "$RETIRED_LAST_SHIPPED_BLOB" \
+    > "$RETIRED_REMOVE_REPO/$RETIRED_RELEASE_PATH"
+  git -C "$RETIRED_REMOVE_REPO" add "$RETIRED_RELEASE_PATH"
+  git -C "$RETIRED_REMOVE_REPO" commit -m "Add shipped release.md" --quiet
+
+  # The reconstructed bytes must hash to the head of the allowlist — this is
+  # the real linkage between "what Loom shipped" and "what the gate removes".
+  SHIPPED_HASH="$(_test_sha256 "$RETIRED_REMOVE_REPO/$RETIRED_RELEASE_PATH")"
+  if grep -qF "$RETIRED_RELEASE_PATH $SHIPPED_HASH" "$SCRIPT_DIR/install-loom.sh"; then
+    pass "Reconstructed shipped release.md hash is in install-loom.sh allowlist"
+  else
+    fail "Shipped release.md hash ($SHIPPED_HASH) absent from install-loom.sh allowlist"
+  fi
+
+  if [[ "$(retired_decision "$RETIRED_REMOVE_REPO")" == "REMOVE" ]]; then
+    pass "Unmodified release.md gated for removal"
+  else
+    fail "Unmodified release.md not gated for removal"
+  fi
+  # Apply the sweep (mirrors install-loom.sh git-rm step) and verify removal.
+  git -C "$RETIRED_REMOVE_REPO" rm --quiet --force "$RETIRED_RELEASE_PATH" 2>/dev/null || true
+  if [[ ! -f "$RETIRED_REMOVE_REPO/$RETIRED_RELEASE_PATH" ]]; then
+    pass "Unmodified release.md removed from working tree"
+  else
+    fail "Unmodified release.md still present after cleanup"
+  fi
+
+  # Test 44d: idempotency — a second run with the file already gone is a no-op.
+  echo ""
+  echo "Test 44d: Cleanup is idempotent (second run is a no-op)"
+  if [[ "$(retired_decision "$RETIRED_REMOVE_REPO")" == "NONE" ]]; then
+    pass "Second cleanup run is a no-op (file already absent)"
+  else
+    fail "Second cleanup run did not treat absent file as no-op"
+  fi
+else
+  warn "Skipping Test 44a/44d: shipped release.md blob $RETIRED_LAST_SHIPPED_BLOB unreachable (shallow clone?)"
+fi
+echo ""
+
+# Test 44b: a consumer-modified retired file (hash matches none) is preserved.
+echo "Test 44b: Consumer-modified release.md is preserved"
+RETIRED_KEEP_REPO="$TEST_DIR/retired-keep-test"
+create_temp_repo "$RETIRED_KEEP_REPO"
+mkdir -p "$RETIRED_KEEP_REPO/$(dirname "$RETIRED_RELEASE_PATH")"
+printf '# my customized release skill\nlocal edits here\n' \
+  > "$RETIRED_KEEP_REPO/$RETIRED_RELEASE_PATH"
+git -C "$RETIRED_KEEP_REPO" add "$RETIRED_RELEASE_PATH"
+git -C "$RETIRED_KEEP_REPO" commit -m "Add customized release.md" --quiet
+if [[ "$(retired_decision "$RETIRED_KEEP_REPO")" == "PRESERVE" ]]; then
+  pass "Consumer-modified release.md gated for preservation"
+else
+  fail "Consumer-modified release.md not preserved (hash matched allowlist unexpectedly)"
+fi
+if [[ -f "$RETIRED_KEEP_REPO/$RETIRED_RELEASE_PATH" ]]; then
+  pass "Consumer-modified release.md left on disk"
+else
+  fail "Consumer-modified release.md was removed (should be preserved)"
+fi
+echo ""
+
+# Test 44c: absent retired file is a no-op (no error, no removal).
+echo "Test 44c: Absent release.md is a no-op"
+RETIRED_ABSENT_REPO="$TEST_DIR/retired-absent-test"
+create_temp_repo "$RETIRED_ABSENT_REPO"
+if [[ "$(retired_decision "$RETIRED_ABSENT_REPO")" == "NONE" ]]; then
+  pass "Absent release.md yields no cleanup action"
+else
+  fail "Absent release.md did not yield a no-op"
+fi
+echo ""
+
+# Drift guard: the test mirror's digests must match install-loom.sh.
+assert_retired_allowlist_in_sync
+echo ""
+
+
+# ==========================================================================
 # Section 8: Flag Rejection Tests (#3423 acceptance criteria)
 # ==========================================================================
 # The unknown-flag guard in install-loom.sh (lines ~120-124) fires before any
