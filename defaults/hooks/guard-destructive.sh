@@ -160,9 +160,14 @@ ask() {
 # =============================================================================
 
 ALWAYS_BLOCK_PATTERNS=(
-    # GitHub destructive operations
-    'gh repo delete'
-    'gh repo archive'
+    # GitHub destructive operations — command-position anchored (start-of-line
+    # or a shell separator must precede the verb) so the phrase inside a flag
+    # value no longer trips. NOTE: the catastrophic scan still runs over the
+    # full raw command, including quoted/heredoc text, so a `gh repo delete`
+    # that a shell would actually execute (leading, sudo-prefixed, or after a
+    # separator) still denies (#3553).
+    '(^|[;&|[:space:]])gh repo delete'
+    '(^|[;&|[:space:]])gh repo archive'
 
     # Force push to main/master (various flag forms)
     'git push --force origin main'
@@ -172,11 +177,16 @@ ALWAYS_BLOCK_PATTERNS=(
     'git push --force-with-lease origin main'
     'git push --force-with-lease origin master'
 
-    # Filesystem destruction
-    'rm -rf /'
-    'rm -rf /\*'
-    'rm -rf ~'
-    'rm -rf \$HOME'
+    # Filesystem destruction — anchored to a *real* root/home target so that a
+    # scoped path like `rm -rf /tmp/x` no longer trips the catastrophic rule,
+    # while root / home obliteration still denies. The left side of `rm` is
+    # deliberately NOT anchored, so a quoted payload such as `bash -c 'rm -rf /'`
+    # (root followed by a closing quote) still matches (#3553). The trailing
+    # class matches anything that is not a path-continuation character (so `/`,
+    # `/ `, `/*`, `/;`, `/'` all count as "root itself" but `/tmp` does not).
+    'rm[[:space:]]+-[a-zA-Z]*[rf][a-zA-Z]*[[:space:]]+/([^[:alnum:]._~/-]|$)'
+    'rm[[:space:]]+-[a-zA-Z]*[rf][a-zA-Z]*[[:space:]]+~([^[:alnum:]._~/-]|$)'
+    'rm[[:space:]]+-[a-zA-Z]*[rf][a-zA-Z]*[[:space:]]+\$HOME([^[:alnum:]._~/-]|$)'
 
     # Fork bombs
     ':\(\)\{ :\|:& \};:'
@@ -200,13 +210,16 @@ ALWAYS_BLOCK_PATTERNS=(
     # Docker mass destruction
     'docker system prune'
 
-    # System reboot/shutdown
-    'reboot'
-    'shutdown'
-    'halt'
-    'poweroff'
-    'init 0'
-    'init 6'
+    # System reboot/shutdown — command-position + trailing-boundary anchored so
+    # a flag name (e.g. --instance-initiated-shutdown-behavior) or the word in a
+    # comment/message ("this reboots the box") no longer trips them, while the
+    # bare command (optionally sudo-prefixed, or after a separator) still denies.
+    '(^|[;&|[:space:]])reboot([;&|[:space:]]|$)'
+    '(^|[;&|[:space:]])shutdown([;&|[:space:]]|$)'
+    '(^|[;&|[:space:]])halt([;&|[:space:]]|$)'
+    '(^|[;&|[:space:]])poweroff([;&|[:space:]]|$)'
+    '(^|[;&|[:space:]])init[[:space:]]+0([;&|[:space:]]|$)'
+    '(^|[;&|[:space:]])init[[:space:]]+6([;&|[:space:]]|$)'
 )
 
 for pattern in "${ALWAYS_BLOCK_PATTERNS[@]}"; do
@@ -214,6 +227,26 @@ for pattern in "${ALWAYS_BLOCK_PATTERNS[@]}"; do
         deny "BLOCKED: Command matches dangerous pattern: $pattern"
     fi
 done
+
+# =============================================================================
+# COMMENT-STRIPPED WORKING COPY - used ONLY for the ASK-word and SQL DDL/DML
+# matches below, never for the catastrophic ALWAYS_BLOCK scan.
+#
+# Strips a `#…EOL` shell comment when the `#` is at start-of-line or preceded
+# by whitespace (the common comment shape), so a pattern word that appears only
+# in a trailing comment ("# drop database first", "# git push --force") no
+# longer trips the ASK/DDL gates. This is best-effort: a `#` inside a quoted
+# string that happens to be whitespace-preceded is also stripped, but since the
+# stripped copy is used only for the *narrowing* ASK/DDL matches (never the
+# catastrophic scan) the worst case is a missed ask on quoted data, never a
+# missed catastrophic block. The sed only runs when a `#` is actually present,
+# keeping it off the hot path (#3553).
+# =============================================================================
+if [[ "$COMMAND" == *"#"* ]]; then
+    COMMAND_NO_COMMENT=$(printf '%s\n' "$COMMAND" | sed -E 's/(^|[[:space:]])#.*$//')
+else
+    COMMAND_NO_COMMENT="$COMMAND"
+fi
 
 # =============================================================================
 # DATABASE DESTRUCTION - Gated by the SQL DDL/DML guard toggle
@@ -225,24 +258,66 @@ done
 # off the hot path.
 # =============================================================================
 SQL_DDL_PATTERN='DROP DATABASE|DROP TABLE|DROP SCHEMA|TRUNCATE TABLE'
-if echo "$COMMAND" | grep -qiE "$SQL_DDL_PATTERN" && sql_guard_enabled; then
-    matched=$(echo "$COMMAND" | grep -oiE "$SQL_DDL_PATTERN" | head -1)
+if echo "$COMMAND_NO_COMMENT" | grep -qiE "$SQL_DDL_PATTERN" && sql_guard_enabled; then
+    matched=$(echo "$COMMAND_NO_COMMENT" | grep -oiE "$SQL_DDL_PATTERN" | head -1)
     deny "BLOCKED: Command matches dangerous pattern: ${matched:-SQL DDL statement}"
 fi
 
 # =============================================================================
-# rm -rf SCOPE CHECK - Block rm with recursive/force flags outside repo
+# rm -rf SCOPE CHECK - Block rm with recursive/force flags on protected paths
+#
+# Only *actual local* `rm` command words are inspected. `extract_rm_targets`
+# splits the command on ; | & && || and, for each simple-command segment whose
+# command word is `rm` (optionally sudo-prefixed) AND which carries a
+# recursive/force flag, emits the non-flag argument tokens. Consequences (#3553):
+#   - A token from an earlier command in the same line (e.g. the `host-ip.txt`
+#     in `HOST=$(cat host-ip.txt); ssh $HOST rm -rf …`) is never mis-read as an
+#     rm target — only tokens of a real `rm` segment are considered.
+#   - An `rm` inside a remote payload (`ssh host 'rm -rf /home/ubuntu/foo'`) is
+#     NOT treated as a local rm: the wrapper's command word is `ssh`/`scp`, not
+#     `rm`, so no local target is emitted and the local scope check is skipped.
+#     The ALWAYS_BLOCK catastrophic patterns above still scan the whole string,
+#     so a remote or quoted `rm -rf /` still denies.
+#   - Only root, the user's $HOME, and *top-level* directories (/tmp, /var, /etc,
+#     /usr, /home, /opt, /bin, …) are blocked. A scoped subpath such as
+#     `rm -rf /tmp/whatever` or `rm -rf /var/foo` is allowed — the guard stops
+#     obliteration of a whole system/root directory, not cleanup of a subpath.
 # =============================================================================
 
-# Match rm commands with -r or -f flags (in any combination: -rf, -r -f, -fr, etc.)
-if echo "$COMMAND" | grep -qE 'rm\s+(-[a-zA-Z]*[rf][a-zA-Z]*\s+)+' || \
-   echo "$COMMAND" | grep -qE 'rm\s+-[a-zA-Z]*r[a-zA-Z]*\s' || \
-   echo "$COMMAND" | grep -qE 'rm\s+-[a-zA-Z]*f[a-zA-Z]*\s+-[a-zA-Z]*r[a-zA-Z]*\s'; then
+extract_rm_targets() {
+    # Emit one rm-target token per line for every local `rm -r/-f` invocation.
+    # Portable awk only (no GNU/BSD-specific escapes); replaces the shell
+    # separators with newlines, then inspects each simple command.
+    printf '%s' "$1" | awk '
+    {
+        gsub(/&&|\|\||[;|&]/, "\n")
+        n = split($0, segs, "\n")
+        for (i = 1; i <= n; i++) {
+            seg = segs[i]
+            sub(/^[ \t]+/, "", seg)
+            sub(/^sudo[ \t]+/, "", seg)
+            sub(/^[ \t]+/, "", seg)
+            if (seg !~ /^rm([ \t]|$)/) continue
+            m = split(seg, toks, /[ \t]+/)
+            has_rf = 0
+            for (j = 2; j <= m; j++)
+                if (toks[j] ~ /^-/ && toks[j] ~ /[rRfF]/) has_rf = 1
+            if (!has_rf) continue
+            for (j = 2; j <= m; j++) {
+                if (toks[j] == "") continue
+                if (toks[j] ~ /^-/) continue
+                print toks[j]
+            }
+        }
+    }'
+}
 
-    # Extract target paths from the rm command (skip flags)
-    TARGETS=$(echo "$COMMAND" | sed 's/rm\s\+//' | tr ' ' '\n' | grep -v '^-' | head -20)
+# Cheap pre-check keeps awk off the hot path for the ~99% of commands that have
+# no recursive/force rm at all.
+if echo "$COMMAND" | grep -qE 'rm[[:space:]]+-[a-zA-Z]*[rf]'; then
+    RM_TARGETS=$(extract_rm_targets "$COMMAND" | head -20)
 
-    for target in $TARGETS; do
+    for target in $RM_TARGETS; do
         # Skip empty targets
         [[ -z "$target" ]] && continue
 
@@ -276,18 +351,19 @@ if echo "$COMMAND" | grep -qE 'rm\s+(-[a-zA-Z]*[rf][a-zA-Z]*\s+)+' || \
             ABS_PATH=$(cd "$CWD" 2>/dev/null && realpath -m "$target" 2>/dev/null || echo "$CWD/$target")
         fi
 
-        # Block dangerous absolute paths
-        if [[ "$ABS_PATH" == "/" ]] || [[ "$ABS_PATH" == "/home" ]] || \
-           [[ "$ABS_PATH" == "$HOME" ]] || [[ "$ABS_PATH" == "/tmp" ]] || \
-           [[ "$ABS_PATH" == "/usr" ]] || [[ "$ABS_PATH" == "/var" ]] || \
-           [[ "$ABS_PATH" == "/etc" ]] || [[ "$ABS_PATH" == "/opt" ]]; then
-            deny "BLOCKED: rm on protected system path: $ABS_PATH"
+        # Normalize a trailing slash (except bare "/") so "/tmp/" == "/tmp".
+        if [[ -n "$ABS_PATH" && "$ABS_PATH" != "/" ]]; then
+            ABS_PATH="${ABS_PATH%/}"
         fi
 
-        # Block if outside repo root (when we know the repo root)
-        if [[ -n "$REPO_ROOT" ]] && [[ -n "$ABS_PATH" ]]; then
-            if [[ "$ABS_PATH" != "$REPO_ROOT"* ]]; then
-                deny "BLOCKED: rm target outside repository: $ABS_PATH (repo: $REPO_ROOT)"
+        # Block catastrophic targets only: root, the user's home directory, and
+        # any top-level directory (^/<one-segment>$ — covers /tmp, /home, /usr,
+        # /var, /etc, /opt, /bin, /lib, …). Deeper paths are allowed.
+        if [[ -n "$ABS_PATH" ]]; then
+            if [[ "$ABS_PATH" == "/" ]] || \
+               [[ -n "$HOME" && "$ABS_PATH" == "$HOME" ]] || \
+               [[ "$ABS_PATH" =~ ^/[^/]+$ ]]; then
+                deny "BLOCKED: rm on protected system path: $ABS_PATH"
             fi
         fi
     done
@@ -301,8 +377,8 @@ fi
 # guards.sqlDdl:false or LOOM_GUARD_SQL=0. sql_guard_enabled() is consulted only
 # after the DELETE-FROM-without-WHERE match, keeping the config read off the hot
 # path for non-SQL commands.
-if echo "$COMMAND" | grep -qiE 'DELETE\s+FROM\s+' && \
-   ! echo "$COMMAND" | grep -qiE 'WHERE\s+'; then
+if echo "$COMMAND_NO_COMMENT" | grep -qiE 'DELETE[[:space:]]+FROM[[:space:]]+' && \
+   ! echo "$COMMAND_NO_COMMENT" | grep -qiE 'WHERE[[:space:]]+'; then
     sql_guard_enabled && deny "BLOCKED: DELETE FROM without WHERE clause"
 fi
 
@@ -360,7 +436,7 @@ ASK_PATTERNS=(
 )
 
 for pattern in "${ASK_PATTERNS[@]}"; do
-    if echo "$COMMAND" | grep -qE "$pattern"; then
+    if echo "$COMMAND_NO_COMMENT" | grep -qE "$pattern"; then
         ask "Command requires confirmation: $COMMAND"
     fi
 done
