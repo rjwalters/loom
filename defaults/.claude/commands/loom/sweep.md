@@ -10,15 +10,20 @@ Process an explicit list of issues — **or an explicit/NL-described set of open
 
 **Arguments**: $ARGUMENTS
 
-`$ARGUMENTS` is interpreted in one of **three modes**, chosen by inspection of the non-flag tokens and the presence of a `--prs` flag. Before classifying, **strip all recognized flag tokens** (`--builders-per-wave N`, `--dry-run`, `--prs`, `--no-daemon`) from the token list — flags are honoured in their respective modes.
+`$ARGUMENTS` is interpreted in one of **three modes** (A/B/C), chosen by inspection of the non-flag tokens and the presence of a `--prs` flag — plus a dedicated **actionable-backlog sentinel** for the bare, sole token `all`. Before classifying, **strip all recognized flag tokens** (`--builders-per-wave N`, `--dry-run`, `--prs`, `--no-daemon`) from the token list — flags are honoured in their respective modes.
+
+**`/sweep all` (the actionable-backlog sentinel).** When the non-flag token list is exactly `["all"]` (case-insensitive), `/sweep` takes a dedicated, deterministic path that resolves the **actionable open backlog** — open issues carrying `loom:issue` or `loom:curated`, minus in-flight / held / container labels — via a single fixed `gh issue list` query (no Mode B NL translation), then hands the set to the same confirmation gate and wave machinery every other mode uses. `/sweep all --prs` resolves the actionable open **PR** set and drives Mode C. Only the bare, sole `all` token triggers this; `all open loom:issue items` and every other multi-token `all …` phrase still route to Mode B (or Mode C for PR phrases) exactly as before. See "Actionable-backlog sentinel (`all`)" and "Actionable candidate taxonomy" under Validation rules.
 
 **Mode selection summary** (full rules below):
 
 | Trigger | Mode | Subject |
 |---------|------|---------|
+| Non-flag tokens == `["all"]` (case-insensitive, single token) | **Actionable backlog** (evaluated first — new step 0) | Actionable open issues (or actionable open PRs with `--prs`, via Mode C) |
 | `--prs` flag present | **Mode C** (PR-set) | Open PRs, routed per their current label |
 | No `--prs`, all non-flag tokens match `^#?\d+$` | **Mode A** (numeric issue list) | Issues, full lifecycle |
 | No `--prs`, any non-flag token does not match `^#?\d+$` | **Mode B** (NL) | Issues (default) **or** PRs (if NL clearly indicates PRs — see Mode C NL triggers below) |
+
+> **Actionable-backlog sentinel (bare `all`).** The row above fires **only** when the non-flag token list is exactly `["all"]` (case-insensitive — `all`, `ALL`, `All`). Any multi-token phrase that merely begins with `all` (`all open loom:issue items`, `all merge-ready PRs`) has length > 1 and falls through to Mode B / Mode C **unchanged**. See "Actionable-backlog sentinel" under Validation rules for the deterministic query and taxonomy.
 
 ### Mode A — Explicit numeric list (fast path, regression guard)
 
@@ -123,20 +128,60 @@ Combine flags as needed. Always pass `--state open` explicitly (Mode C operates 
   ```
   Usage: /sweep <issue-number> [<issue-number> ...] [--builders-per-wave N] [--dry-run] [--no-daemon]
          /sweep <natural-language description>     [--builders-per-wave N] [--dry-run] [--no-daemon]
+         /sweep all                                [--builders-per-wave N] [--dry-run] [--no-daemon]   # actionable open backlog
+         /sweep all --prs                          [--dry-run]                                         # actionable open PRs (Mode C)
          /sweep --prs <pr-number> [<pr-number> ...] [--dry-run]
          /sweep --prs <natural-language PR description> [--dry-run]
          /sweep <natural-language PR description>       [--dry-run]   # PR NL triggers select Mode C
 
-  See #3298, #3384, and #3454 for the full design.
+  See #3298, #3384, #3454, and #3568 for the full design.
   ```
   and EXIT.
 - **Mode-selection precedence** (apply in order):
+  0. **Actionable-backlog sentinel.** If the non-flag token list (after flag-stripping) is **exactly `["all"]`** — a single token, case-insensitive (`all`, `ALL`, `All`) — take the dedicated **actionable-backlog** path (see "Actionable-backlog sentinel (`all`)" below). This step is evaluated **before** every other step so the bare `all` token can never be swallowed by the Mode B NL classifier (step 4):
+     - `--prs` **absent** → resolve the deterministic **actionable open issues** set, then hand off **unchanged** to the Mode A/B issue-set wave machinery (confirmation gate, Stage -1 backend detection, wave partition — all as today).
+     - `--prs` **present** → resolve the deterministic **actionable open PRs** set and drive the existing **Mode C** PR-set lifecycle (subagent path).
+
+     The guard is `lowercased(non_flag_tokens) == ["all"]` — length exactly 1. Any additional non-flag token (`all open loom:issue items`, `all my agent-filed ...`, `all merge-ready PRs`) has length > 1 and falls straight through to steps 1–4 unchanged. This is the backward-compatibility contract.
   1. If `--prs` is present, classify as **Mode C** (numeric → explicit PR list; NL → translated `gh pr list`).
   2. Else if any non-flag token does not match `^#?\d+$` AND the description contains a PR-side NL trigger phrase (see Mode C "PR-side NL trigger phrases"), classify as **Mode C** (NL-inferred).
   3. Else if every non-flag token matches `^#?\d+$`, classify as **Mode A** (numeric issue list).
   4. Else classify as **Mode B** (NL issue list).
 
-  This ordering is deliberate: an explicit `--prs` flag is the strongest signal, an unambiguous NL trigger is the next, and the existing Mode A/B classifier (regression-guarded) handles everything else.
+  This ordering is deliberate: the bare `all` sentinel is intercepted first (else it would land in step 4), an explicit `--prs` flag is the next strongest signal, an unambiguous NL trigger is next, and the existing Mode A/B classifier (regression-guarded) handles everything else.
+
+- **Actionable-backlog sentinel (`all`)** — the deterministic path taken by step 0 above:
+  - **Trigger**: non-flag tokens exactly `["all"]` (case-insensitive). Flags (`--dry-run`, `--builders-per-wave N`, `--prs`, `--no-daemon`) are stripped first and compose normally, so `all --dry-run` and `all --builders-per-wave 2` still trigger the sentinel.
+  - **Candidate resolution (issues, `--prs` absent)** — one deterministic `gh issue list` call, no LLM/NL translation:
+    ```bash
+    gh issue list --state open --limit 100 \
+      --search 'label:loom:issue,loom:curated \
+                -label:loom:building -label:loom:curating -label:loom:treating -label:loom:reviewing \
+                -label:loom:blocked -label:loom:abort -label:loom:operator-only -label:loom:triage \
+                -label:loom:epic -label:loom:epic-phase' \
+      --json number,title,labels
+    ```
+    This is the single source of truth for the **"actionable" taxonomy** — see "Actionable candidate taxonomy" immediately below. Pass `--limit 100` explicitly (never rely on gh's default of 30) and apply the existing **edge-case rules**: zero matches → print the resolved query + empty result and EXIT cleanly (edge case #1, do **not** fall through to any other mode); 100 candidates returned → warn about truncation and ask the operator to narrow before proceeding (edge case #2). An equivalent two-call union (`--label loom:issue` ∪ `--label loom:curated`, deduped client-side, then drop any candidate whose labels intersect the exclude set) is acceptable — it matches the Mode B mixed-mode union pattern — but the single `--search` call above is preferred.
+  - **Candidate resolution (PRs, `--prs` present)** — the symmetric deterministic `gh pr list` call, handed to the Mode C PR-set lifecycle (subagent path):
+    ```bash
+    gh pr list --state open --limit 100 \
+      --label loom:review-requested,loom:changes-requested,loom:pr \
+      --json number,title,labels
+    ```
+    Excluded PR labels (`loom:blocked`, `loom:operator-only`) are dropped client-side. Same zero-match / truncation edge-case rules apply.
+  - **Existing-PR routing (issues path)**: the sentinel adds **no** new PR-detection logic. Issues with an open linked PR are **not** filtered out of the `gh issue list` query — they are handed to the wave machinery, which already routes an issue with one open linked PR to Judge (or Merge if the PR is already `loom:pr`) via the existing #3359 per-issue existing-PR probe (Wave Lifecycle §1, `closedByPullRequestsReferences` filtered to `state == OPEN`). This keeps a single source of truth for existing-PR routing.
+  - **Mandatory confirmation gate**: the sentinel path **always** displays the resolved candidate set and awaits operator confirmation before spawning any agent — identical to Mode B/C's "display candidate set before spawning any agents" rule. A large machine-derived backlog must never auto-dispatch silently. Declining EXITs cleanly.
+  - **Flag composition**: `--dry-run` resolves the candidate set, prints the standard issue-set (or PR-set) dry-run plan with wave grouping + skip annotations, and EXITs with no mutation (the Stage-0 dry-run contract is backend-independent). `--builders-per-wave N` and `--no-daemon` compose with the wave / Stage -1 machinery exactly as for Mode A/B. Stage -1 backend detection is unchanged: after `all` resolves the issue set, the normal strict-AND daemon/pool probe decides daemon-dispatch vs subagent fallthrough; `all --prs` (Mode C) always routes to the subagent path per the existing Mode C short-circuit.
+
+- **Actionable candidate taxonomy** (the single source of truth for what `all` resolves — lives here beside the Mode B label logic so there is one definition):
+  - **Include** open issues carrying a ready-to-build label (comma = OR in the `--search` `label:` qualifier): `loom:issue`, `loom:curated`.
+  - **Exclude** (skipped by the `-label:` NOT qualifiers; still listed in `--dry-run` for transparency, matching sweep's skip-transparency rule):
+    - In-flight: `loom:building`, `loom:curating`, `loom:treating`, `loom:reviewing`
+    - Held / not-yet-ready: `loom:blocked`, `loom:abort`, `loom:operator-only`, `loom:triage`
+    - Orchestration containers (not directly buildable): `loom:epic`, `loom:epic-phase`
+    - Issues with an **open** linked PR — NOT filtered in the query; routed by the existing #3359 per-issue existing-PR probe (see "Existing-PR routing" above).
+  - **PR variant (`--prs`)**: include `loom:review-requested`, `loom:changes-requested`, `loom:pr`; exclude `loom:blocked`, `loom:operator-only`.
+  - All named labels already exist on the repo — the sentinel invents no labels.
 - **Mode A** (every non-flag token matches `^#?\d+$`, `--prs` absent, no PR NL trigger):
   - Strip leading `#` from each token, parse as a positive integer.
   - Reject any token that fails to parse as a positive integer (after stripping). Display an error showing the offending token and EXIT.
@@ -187,6 +232,32 @@ The subagent-path cap is **soft** — there is no hard upper bound and the warni
 /sweep 123 456 789 --dry-run                  # Print plan and EXIT without mutating
 /sweep 1 2 3 4 5 --dry-run --builders-per-wave 2  # Preview with wave grouping
 /sweep 123 456 --no-daemon                    # Force in-process subagent dispatch even when daemon is up (#3454)
+```
+
+### Actionable backlog — the `all` sentinel
+
+```bash
+# Deterministic actionable open-issue set (loom:issue + loom:curated, minus in-flight /
+# held / container labels and issues with an open linked PR). No Mode B NL translation.
+# Displays the resolved candidate set and awaits confirmation before dispatching.
+/sweep all
+
+# Case-insensitive — ALL / All also trigger the sentinel
+/sweep ALL
+
+# Preview the actionable set + wave plan without mutating anything
+/sweep all --dry-run
+
+# Same actionable set, two builders per wave
+/sweep all --builders-per-wave 2
+
+# Actionable open PRs (Mode C: Judge / Doctor → Judge / Merge per PR's current label)
+/sweep all --prs
+/sweep all --prs --dry-run
+
+# NOT the sentinel — >1 non-flag token, still routes to Mode B exactly as before
+/sweep all open loom:issue items
+/sweep all my agent-filed loom:issue items --builders-per-wave 2
 ```
 
 ### Mode B — Natural-language description
@@ -1118,6 +1189,7 @@ The full `/sweep` design in #3298 includes many features that are intentionally 
 |---------|--------|-------|
 | Parallel waves (`--builders-per-wave N`) | **Implemented (#3316, auto default #3566)** | Omitted flag resolves to an auto wave size at Stage -1 (#3566): up to 10 on the daemon detached-process path, capped at 3 on the in-session subagent path. The N=3 soft cap is **subagent-path-specific** (the #3289 nested-dispatch ceiling — warns above on explicit override); the daemon path scales to 10 because each sweep is an isolated process, not a nested subagent. One level deep — no `/shepherd` subagent. Issue-side only; ignored in Mode C. |
 | Natural-language selectors (label/author/title/time-window filters via NL description) | **Implemented (#3318)** | Mode B in Arguments. Out-of-band queries (body/diff inspection, file-touch filters) still trigger clarification. |
+| Actionable-backlog sentinel (`/sweep all`) | **Implemented (#3568)** | Bare, sole `all` token (case-insensitive) takes a deterministic actionable-open-issues path (`loom:issue` + `loom:curated`, minus in-flight / held / `loom:epic`(-`phase`) labels) via a single fixed `gh issue list` query — no Mode B NL translation. `all --prs` resolves actionable open PRs (Mode C). Mandatory confirmation gate; `--dry-run` / `--builders-per-wave` / `--no-daemon` compose unchanged. Multi-token `all …` phrases still route to Mode B/C. Existing linked-PR routing deferred to the #3359 per-issue probe. |
 | `--dry-run` | **Implemented (#3319, extended in #3384)** | Prints the candidate plan (with wave grouping) and exits without mutating labels, worktrees, or PRs. Issue-set (Modes A/B) and PR-set (Mode C) output formats. |
 | Existing-PR detection in pre-flight | **Implemented (#3359)** | Pre-flight probes `closedByPullRequestsReferences`; routes existing open linked PRs to Judge (or Merge if already `loom:pr`) instead of dispatching a duplicate Builder. Multi-PR ambiguity skips with a log. |
 | `loom:operator-only` enforcement | **Implemented (#3360)** | Pre-flight skips issues with `loom:operator-only` (human action required: credentials, infra, hardware). Champion `--merge` mode also refuses to auto-promote them. |
