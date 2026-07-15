@@ -34,6 +34,12 @@ LOOM_WORKTREE_ALWAYS_INCLUDE_DEFAULT=(.claude .loom .githooks scripts)
 # shellcheck source=lib/worktree-root.sh
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/worktree-root.sh"
 
+# Shared default-branch resolver (env var / symbolic-ref / ls-remote / probe).
+# Sourced so worktree base operations work on repos whose default branch is not
+# `main` (e.g. `master`) without hardcoding `origin/main` everywhere (#3549).
+# shellcheck source=lib/default-branch.sh
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/default-branch.sh"
+
 # Colors for output
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -373,20 +379,22 @@ log_worktree_size() {
     fi
 }
 
-# Function to fetch latest changes from origin/main
-# Uses fetch-only approach to avoid conflicts with worktrees that have main checked out
+# Function to fetch latest changes from the default branch
+# Uses fetch-only approach to avoid conflicts with worktrees that have the
+# default branch checked out. Relies on the global DEFAULT_BRANCH (resolved via
+# loom_default_branch before this is called).
 fetch_latest_main() {
     if [[ "$JSON_OUTPUT" != "true" ]]; then
-        print_info "Fetching latest changes from origin/main..."
+        print_info "Fetching latest changes from origin/$DEFAULT_BRANCH..."
     fi
 
-    if git fetch origin main 2>/dev/null; then
+    if git fetch origin "$DEFAULT_BRANCH" 2>/dev/null; then
         if [[ "$JSON_OUTPUT" != "true" ]]; then
-            print_success "Fetched latest origin/main"
+            print_success "Fetched latest origin/$DEFAULT_BRANCH"
         fi
     else
         if [[ "$JSON_OUTPUT" != "true" ]]; then
-            print_warning "Could not fetch origin/main (continuing with local state)"
+            print_warning "Could not fetch origin/$DEFAULT_BRANCH (continuing with local state)"
         fi
     fi
 }
@@ -785,8 +793,21 @@ if [[ -n "$PRUNE_OUTPUT" ]]; then
     fi
 fi
 
-# Fetch latest changes from origin/main before creating the worktree
-# Uses fetch-only to avoid conflicts with worktrees that have main checked out
+# Resolve the repo's default branch once (cwd is now the main workspace, so
+# git symbolic-ref sees refs/remotes/origin/HEAD). Hard-fail rather than proceed
+# with an empty/wrong branch — an empty `origin/` refspec is worse than the
+# original bug (#3549).
+if ! DEFAULT_BRANCH="$(loom_default_branch)"; then
+    if [[ "$JSON_OUTPUT" == "true" ]]; then
+        echo '{"success": false, "error": "Could not determine the default branch (see stderr; set LOOM_DEFAULT_BRANCH or run: git remote set-head origin -a)"}' >&3
+    else
+        print_error "Could not determine the default branch. Set LOOM_DEFAULT_BRANCH or run: git remote set-head origin -a"
+    fi
+    exit 1
+fi
+
+# Fetch latest changes from origin/$DEFAULT_BRANCH before creating the worktree
+# Uses fetch-only to avoid conflicts with worktrees that have it checked out
 fetch_latest_main
 
 # Determine branch name
@@ -863,8 +884,8 @@ if [[ -d "$WORKTREE_PATH" ]]; then
     # Check if it's registered with git
     if git worktree list | grep -q "$WORKTREE_PATH"; then
         # Check if worktree is stale: no commits ahead of main and behind main
-        local_commits_ahead=$(git -C "$WORKTREE_PATH" rev-list --count "origin/main..HEAD" 2>/dev/null) || local_commits_ahead="0"
-        local_commits_behind=$(git -C "$WORKTREE_PATH" rev-list --count "HEAD..origin/main" 2>/dev/null) || local_commits_behind="0"
+        local_commits_ahead=$(git -C "$WORKTREE_PATH" rev-list --count "origin/$DEFAULT_BRANCH..HEAD" 2>/dev/null) || local_commits_ahead="0"
+        local_commits_behind=$(git -C "$WORKTREE_PATH" rev-list --count "HEAD..origin/$DEFAULT_BRANCH" 2>/dev/null) || local_commits_behind="0"
         local_uncommitted=$(git -C "$WORKTREE_PATH" status --porcelain 2>/dev/null) || local_uncommitted=""
 
         if [[ "$local_commits_ahead" -gt 0 || -n "$local_uncommitted" ]]; then
@@ -887,18 +908,18 @@ if [[ -d "$WORKTREE_PATH" ]]; then
             # Stale worktree: no commits ahead, no uncommitted changes
             # Reset in place instead of removing (avoids CWD corruption)
             if [[ "$JSON_OUTPUT" != "true" ]]; then
-                print_warning "Stale worktree detected (0 commits ahead, $local_commits_behind behind main, no uncommitted changes)"
-                print_info "Resetting worktree in place to origin/main..."
+                print_warning "Stale worktree detected (0 commits ahead, $local_commits_behind behind $DEFAULT_BRANCH, no uncommitted changes)"
+                print_info "Resetting worktree in place to origin/$DEFAULT_BRANCH..."
             fi
 
             # Back-fill/refresh the Loom sentinel on both reset outcomes: the
             # worktree remains usable either way, so keep it cleanup-eligible
             # (#3548).
             write_loom_sentinel "$WORKTREE_PATH"
-            if git -C "$WORKTREE_PATH" fetch origin main 2>/dev/null && \
-               git -C "$WORKTREE_PATH" reset --hard origin/main 2>/dev/null; then
+            if git -C "$WORKTREE_PATH" fetch origin "$DEFAULT_BRANCH" 2>/dev/null && \
+               git -C "$WORKTREE_PATH" reset --hard "origin/$DEFAULT_BRANCH" 2>/dev/null; then
                 if [[ "$JSON_OUTPUT" != "true" ]]; then
-                    print_success "Stale worktree reset to origin/main"
+                    print_success "Stale worktree reset to origin/$DEFAULT_BRANCH"
                     echo ""
                     print_info "To use this worktree: cd $WORKTREE_PATH"
                 fi
@@ -933,11 +954,11 @@ if git show-ref --verify --quiet "refs/heads/$BRANCH_NAME"; then
 
     CREATE_ARGS=("$WORKTREE_PATH" "$BRANCH_NAME")
 else
-    # Create new branch from main
+    # Create new branch from the default branch
     if [[ "$JSON_OUTPUT" != "true" ]]; then
-        print_info "Creating new branch from main"
+        print_info "Creating new branch from $DEFAULT_BRANCH"
     fi
-    CREATE_ARGS=("$WORKTREE_PATH" "-b" "$BRANCH_NAME" "origin/main")
+    CREATE_ARGS=("$WORKTREE_PATH" "-b" "$BRANCH_NAME" "origin/$DEFAULT_BRANCH")
 fi
 
 # In sparse mode, defer file materialization until after we configure the cone.
@@ -987,8 +1008,8 @@ _handle_feature_branch_in_main_worktree() {
             echo ""
             echo "  The branch is in use elsewhere. To free it, find the worktree with:"
             echo "    git worktree list"
-            echo "  Then switch that worktree to main:"
-            echo "    cd <worktree-path> && git checkout main"
+            echo "  Then switch that worktree to $DEFAULT_BRANCH:"
+            echo "    cd <worktree-path> && git checkout $DEFAULT_BRANCH"
         fi
         return 0  # Handled (with human-readable message), no retry possible
     fi
@@ -1011,7 +1032,7 @@ _handle_feature_branch_in_main_worktree() {
             echo "  Branch is already checked out at: $conflict_path"
             echo ""
             echo "  To fix:"
-            echo "    cd $conflict_path && git checkout main"
+            echo "    cd $conflict_path && git checkout $DEFAULT_BRANCH"
         fi
         return 0  # Handled (with error message), no retry
     fi
@@ -1030,28 +1051,29 @@ _handle_feature_branch_in_main_worktree() {
             echo "  To fix manually:"
             echo "    cd $abs_conflict"
             echo "    git stash  # or commit your changes"
-            echo "    git checkout main"
+            echo "    git checkout $DEFAULT_BRANCH"
             echo "  Then rerun: ./.loom/scripts/worktree.sh $ISSUE_NUMBER"
         fi
         return 0  # Handled (with error message), no retry
     fi
 
-    # Main workspace is clean — auto-switch to main and signal caller to retry
+    # Main workspace is clean — auto-switch to the default branch and signal
+    # caller to retry.
     if [[ "$JSON_OUTPUT" != "true" ]]; then
         print_warning "Branch '$branch' is checked out in the main worktree."
-        print_info "Main worktree is clean — auto-switching to main branch..."
+        print_info "Main worktree is clean — auto-switching to $DEFAULT_BRANCH branch..."
     fi
 
-    if git -C "$abs_conflict" checkout main 2>/dev/null; then
+    if git -C "$abs_conflict" checkout "$DEFAULT_BRANCH" 2>/dev/null; then
         if [[ "$JSON_OUTPUT" != "true" ]]; then
-            print_success "Main worktree switched to main branch"
+            print_success "Main worktree switched to $DEFAULT_BRANCH branch"
         fi
         return 2  # Signal: auto-recovered, caller should retry
     else
         if [[ "$JSON_OUTPUT" != "true" ]]; then
-            print_error "Failed to switch main worktree to main branch."
+            print_error "Failed to switch main worktree to $DEFAULT_BRANCH branch."
             echo "  To fix manually:"
-            echo "    cd $abs_conflict && git checkout main"
+            echo "    cd $abs_conflict && git checkout $DEFAULT_BRANCH"
             echo "  Then rerun: ./.loom/scripts/worktree.sh $ISSUE_NUMBER"
         fi
         return 0  # Handled (with error message), no retry
