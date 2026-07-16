@@ -218,26 +218,60 @@ pub fn update_gitignore(workspace_path: &Path) -> Result<(), String> {
             lines.splice(b..=e, block_lines.iter().cloned());
         }
         _ => {
-            // No marked block. Migrate any legacy markerless block by dropping
-            // the old header and any bare ephemeral pattern lines, then append
-            // the marked block at EOF (the one-time create-at-EOF path).
+            // No well-formed BEGIN <= END pair. This covers a legacy markerless
+            // block, a fresh consumer file, and corrupted single/misordered
+            // markers. Migrate in place rather than relocating to EOF (#3592).
+
+            // 1. Normalize orphan/corrupted markers. Because we did not match the
+            //    in-place arm, any marker line present here is stray (an END-only
+            //    orphan, a BEGIN-only orphan, or an END-before-BEGIN pair). Drop
+            //    them so they can neither accumulate every run (orphan-END
+            //    unbounded growth) nor drive a destructive splice that swallows
+            //    user content (orphan-BEGIN). #3592
             lines.retain(|line| {
                 let t = line.trim();
-                t != GITIGNORE_BLOCK_HEADER && !EPHEMERAL_PATTERNS.contains(&t)
+                t != GITIGNORE_BEGIN_MARKER && t != GITIGNORE_END_MARKER
             });
-            // Drop exactly one trailing empty element (the file's final '\n')
-            // so the block is appended directly after the existing content with
-            // no spurious blank line. This makes the append the exact inverse of
-            // uninstall's marker-span deletion, so an install -> uninstall ->
-            // install round-trip is byte-identical (issue #3590).
-            if lines.last().is_some_and(String::is_empty) {
-                lines.pop();
+
+            // 2. Locate the legacy markerless block: the bare header and/or bare
+            //    ephemeral pattern lines. Remember where the first such line sits
+            //    so the marked block can be spliced back into that same span.
+            let is_legacy = |line: &str| {
+                let t = line.trim();
+                t == GITIGNORE_BLOCK_HEADER || EPHEMERAL_PATTERNS.contains(&t)
+            };
+            let first_legacy = lines.iter().position(|l| is_legacy(l));
+
+            match first_legacy {
+                Some(start) => {
+                    // Remove every legacy line, then splice the marked block into
+                    // the original position. Because we replace in place instead
+                    // of removing-then-appending, flanking blank lines stay put:
+                    // the block does not relocate to EOF and no double-blank
+                    // artifact is left behind where the old block used to sit
+                    // (#3592). Any user content that followed the legacy block
+                    // still follows the managed block.
+                    lines.retain(|l| !is_legacy(l));
+                    lines.splice(start..start, block_lines.iter().cloned());
+                }
+                None => {
+                    // Genuinely no Loom header/patterns/markers: create the block
+                    // at EOF. Drop exactly one trailing empty element (the file's
+                    // final '\n') so the block is appended directly after the
+                    // existing content with no spurious blank line. This makes the
+                    // append the exact inverse of uninstall's marker-span
+                    // deletion, so an install -> uninstall -> install round-trip
+                    // is byte-identical (issue #3590).
+                    if lines.last().is_some_and(String::is_empty) {
+                        lines.pop();
+                    }
+                    for bl in &block_lines {
+                        lines.push(bl.clone());
+                    }
+                    // Re-add exactly one trailing empty element => single '\n'.
+                    lines.push(String::new());
+                }
             }
-            for bl in &block_lines {
-                lines.push(bl.clone());
-            }
-            // Re-add exactly one trailing empty element => single trailing '\n'.
-            lines.push(String::new());
         }
     }
 
@@ -682,5 +716,111 @@ mod tests {
         update_gitignore(tmp.path()).unwrap();
         let again = fs::read_to_string(&gitignore).unwrap();
         assert_eq!(contents, again, "post-migration update must be idempotent");
+    }
+
+    #[test]
+    fn migrates_mid_file_legacy_block_in_place_without_double_blank() {
+        // Regression for #3592: a legacy markerless block sitting mid-file,
+        // flanked by a blank line on each side with user content AFTER it, must
+        // migrate to the marked form (a) in place (not relocated to EOF),
+        // (b) without leaving a double-blank artifact, and (c) idempotently.
+        let tmp = TempDir::new().unwrap();
+        let gitignore = tmp.path().join(".gitignore");
+
+        fs::write(
+            &gitignore,
+            "node_modules/\n\n# Loom runtime state (don't commit these)\n\
+             .loom-in-use\n.loom/state.json\n.loom/worktrees/\n.loom/logs/\n\
+             \ndist/\n",
+        )
+        .unwrap();
+
+        update_gitignore(tmp.path()).unwrap();
+        let contents = fs::read_to_string(&gitignore).unwrap();
+
+        // (a) Exactly one BEGIN and one END marker.
+        assert_eq!(contents.matches(GITIGNORE_BEGIN_MARKER).count(), 1);
+        assert_eq!(contents.matches(GITIGNORE_END_MARKER).count(), 1);
+
+        // (b) The block stayed in place: user content that followed the legacy
+        // block still follows the managed block, and content that preceded it
+        // still precedes it.
+        let begin_pos = contents.find(GITIGNORE_BEGIN_MARKER).unwrap();
+        let end_pos = contents.find(GITIGNORE_END_MARKER).unwrap();
+        let node_pos = contents.find("node_modules/").unwrap();
+        let dist_pos = contents.find("dist/").unwrap();
+        assert!(node_pos < begin_pos, "node_modules/ must stay before the block");
+        assert!(dist_pos > end_pos, "dist/ must stay after the block");
+
+        // (c) No double-blank artifact anywhere.
+        assert!(
+            !contents.contains("\n\n\n"),
+            "migration must not leave a double-blank artifact: {contents:?}"
+        );
+
+        // No duplicate patterns outside the block.
+        assert_eq!(contents.matches(".loom/state.json").count(), 1);
+        assert_eq!(contents.matches(".loom/worktrees/").count(), 1);
+
+        // (d) A second run is a byte-identical no-op.
+        update_gitignore(tmp.path()).unwrap();
+        let again = fs::read_to_string(&gitignore).unwrap();
+        assert_eq!(contents, again, "second migration run must be a byte-identical no-op");
+    }
+
+    #[test]
+    fn orphan_end_marker_converges_without_growth() {
+        // Regression for #3592: a stray END marker above user content (a
+        // corrupted / hand-edited .gitignore) previously drove unbounded marker
+        // growth (+1 block per run) because `position()` found the orphan END,
+        // `begin > end`, and the legacy arm re-appended a fresh block forever.
+        let tmp = TempDir::new().unwrap();
+        let gitignore = tmp.path().join(".gitignore");
+
+        fs::write(&gitignore, "# <<< loom-managed <<<\nnode_modules/\ndist/\n").unwrap();
+
+        update_gitignore(tmp.path()).unwrap();
+        let after_one = fs::read_to_string(&gitignore).unwrap();
+
+        // Converges to exactly one well-formed marked block.
+        assert_eq!(after_one.matches(GITIGNORE_BEGIN_MARKER).count(), 1);
+        assert_eq!(after_one.matches(GITIGNORE_END_MARKER).count(), 1);
+        // User content survives.
+        assert!(after_one.contains("node_modules/"));
+        assert!(after_one.contains("dist/"));
+
+        // A second run is a byte-identical no-op (no growth).
+        update_gitignore(tmp.path()).unwrap();
+        let after_two = fs::read_to_string(&gitignore).unwrap();
+        assert_eq!(after_one, after_two, "orphan-END migration must converge, not grow");
+        assert_eq!(after_two.matches(GITIGNORE_END_MARKER).count(), 1);
+    }
+
+    #[test]
+    fn orphan_begin_marker_converges_without_eating_user_content() {
+        // Regression for #3592: a stray BEGIN marker above user content
+        // previously converged only by having the in-place splice swallow every
+        // line from the orphan BEGIN through the real END, silently deleting the
+        // intervening user line (e.g. `dist/`).
+        let tmp = TempDir::new().unwrap();
+        let gitignore = tmp.path().join(".gitignore");
+
+        fs::write(&gitignore, "# >>> loom-managed (do not edit) >>>\nnode_modules/\ndist/\n")
+            .unwrap();
+
+        update_gitignore(tmp.path()).unwrap();
+        let after_one = fs::read_to_string(&gitignore).unwrap();
+
+        // Converges to exactly one well-formed marked block.
+        assert_eq!(after_one.matches(GITIGNORE_BEGIN_MARKER).count(), 1);
+        assert_eq!(after_one.matches(GITIGNORE_END_MARKER).count(), 1);
+        // The user line between the orphan marker and EOF must survive.
+        assert!(after_one.contains("dist/"), "user content must not be eaten");
+        assert!(after_one.contains("node_modules/"));
+
+        // A second run is a byte-identical no-op.
+        update_gitignore(tmp.path()).unwrap();
+        let after_two = fs::read_to_string(&gitignore).unwrap();
+        assert_eq!(after_one, after_two, "orphan-BEGIN migration must be idempotent");
     }
 }
