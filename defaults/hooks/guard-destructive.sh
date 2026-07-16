@@ -281,7 +281,25 @@ lifecycle_or_cloud_reason() {
             seg = segs[i]
             sub(/^[ \t]+/, "", seg)
             sub(/^sudo[ \t]+/, "", seg)
-            sub(/^env[ \t]+/, "", seg)
+            # Strip a leading `env` wrapper, then loop-strip the env flags and
+            # NAME=value assignments a shell resolves past before the command
+            # word, so `env FOO=bar halt` resolves to command word `halt` (not
+            # `FOO=bar`) and still denies. `env -i FOO=bar halt` and `env -u
+            # NAME halt` likewise resolve to `halt`. A bare `env halt` (no
+            # assignment) is unaffected — the loop matches nothing and leaves
+            # `halt` as the command word. Portable awk only (no GNU/BSD-specific
+            # escapes), consistent with extract_rm_targets(). (#3586)
+            if (sub(/^env([ \t]+|$)/, "", seg)) {
+                sub(/^[ \t]+/, "", seg)
+                stripped = 1
+                while (stripped) {
+                    stripped = 0
+                    if (sub(/^-u[ \t]+[^ \t]+([ \t]+|$)/, "", seg)) { stripped = 1; continue }
+                    if (sub(/^-i([ \t]+|$)/, "", seg))              { stripped = 1; continue }
+                    if (sub(/^--([ \t]+|$)/, "", seg))              { break }
+                    if (sub(/^[A-Za-z_][A-Za-z0-9_]*=[^ \t]*([ \t]+|$)/, "", seg)) { stripped = 1; continue }
+                }
+            }
             sub(/^[ \t]+/, "", seg)
             m = split(seg, toks, /[ \t]+/)
             if (m == 0) continue
