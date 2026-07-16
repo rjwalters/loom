@@ -707,6 +707,29 @@ assert_ask "Cloud: aws s3 cp (mutating) asks" \
     "aws s3 cp ./file s3://my-bucket/file"
 assert_ask "Cloud: aws lambda delete-function asks" \
     "aws lambda delete-function --function-name f"
+# --- #3595: invoke/publish/copy/assign/mb restored to the mutating verb list ---
+# aws lambda invoke executes arbitrary Lambda code with side effects; it is
+# neither read-only nor a catastrophic deny, so the pre-#3595 verb-narrowing
+# silently un-gated it. Restore the ask (toggle on).
+assert_ask "Cloud: aws lambda invoke asks (toggle on, #3595)" \
+    "aws lambda invoke --function-name f out.json"
+assert_ask "Cloud: aws lambda publish-version asks (#3595)" \
+    "aws lambda publish-version --function-name f"
+assert_ask "Cloud: aws lambda publish-layer-version asks (#3595)" \
+    "aws lambda publish-layer-version --layer-name l --zip-file fileb://l.zip"
+assert_ask "Cloud: aws sns publish asks (#3595)" \
+    "aws sns publish --topic-arn arn:aws:sns:us-east-1:1:t --message hi"
+assert_ask "Cloud: aws ec2 copy-image asks (#3595)" \
+    "aws ec2 copy-image --source-image-id ami-123 --source-region us-east-1 --name copy"
+assert_ask "Cloud: aws ec2 assign-private-ip-addresses asks (#3595)" \
+    "aws ec2 assign-private-ip-addresses --network-interface-id eni-123 --secondary-private-ip-address-count 1"
+assert_ask "Cloud: aws s3 mb (make-bucket) asks (#3595)" \
+    "aws s3 mb s3://my-new-bucket"
+# invoke/publish must NOT re-broaden into read-only false-positives.
+assert_allow "Cloud: aws lambda get-function is read-only (allow, #3595)" \
+    "aws lambda get-function --function-name f"
+assert_allow "Cloud: aws sns list-topics is read-only (allow, #3595)" \
+    "aws sns list-topics"
 
 # --- Docker verbs unchanged: mutating asks, read-only allowed (toggle on) ---
 assert_ask "Cloud: docker rm still asks" \
@@ -730,6 +753,8 @@ assert_allow "Cloud config-off: aws ec2 terminate-instances allowed" \
     "aws ec2 terminate-instances --instance-ids i-1234" "$CLOUD_OFF_REPO"
 assert_allow "Cloud config-off: aws ec2 run-instances allowed" \
     "aws ec2 run-instances --image-id ami-123" "$CLOUD_OFF_REPO"
+assert_allow "Cloud config-off: aws lambda invoke allowed (#3595)" \
+    "aws lambda invoke --function-name f out.json" "$CLOUD_OFF_REPO"
 assert_allow "Cloud config-off: docker rm allowed" \
     "docker rm my-container" "$CLOUD_OFF_REPO"
 
@@ -744,6 +769,8 @@ assert_ask "Cloud config-on: docker rm still asks" \
 # --- Env override: LOOM_GUARD_CLOUD=0 bypasses even when config says true ---
 assert_allow_env "LOOM_GUARD_CLOUD=0 overrides config-on: aws ec2 terminate allowed" \
     "LOOM_GUARD_CLOUD=0" "aws ec2 terminate-instances --instance-ids i-1234" "$CLOUD_ON_REPO"
+assert_allow_env "LOOM_GUARD_CLOUD=0: aws lambda invoke allowed (#3595)" \
+    "LOOM_GUARD_CLOUD=0" "aws lambda invoke --function-name f out.json" "$CLOUD_ON_REPO"
 assert_allow_env "LOOM_GUARD_CLOUD=0: docker rm allowed" \
     "LOOM_GUARD_CLOUD=0" "docker rm my-container" "$CLOUD_ON_REPO"
 

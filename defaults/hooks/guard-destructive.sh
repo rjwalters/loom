@@ -618,7 +618,8 @@ done
 # comment-stripped command): only mutating subcommands match, never read-only
 # describe*/get*/list*/ls. So `aws ec2 describe-instances`, `aws s3 ls`, and
 # `aws lambda list-functions` no longer prompt, while `run-instances`,
-# `create-*`, `terminate-instances`, `stop-instances`, etc. still ask.
+# `create-*`, `terminate-instances`, `stop-instances`, `lambda invoke`,
+# `lambda publish*`, `sns publish`, etc. still ask.
 #
 # The docker entries already name only mutating verbs (rm/rmi/stop/kill/restart)
 # and never match read-only `docker ps`/`docker logs`, so they are unchanged —
@@ -628,9 +629,17 @@ CLOUD_ASK_PATTERNS=(
     # aws mutating subcommands (verb-anchored). The service list covers the
     # common infra-mutating namespaces; the verb list is the mutating vocabulary
     # (never describe*/get*/list*/ls). terminate lands here — an ask, not a deny.
-    'aws (ec2|lambda|s3api|rds|iam|autoscaling|cloudformation|eks|ecs|elb|elbv2|route53|dynamodb|sns|sqs) (run|create|delete|terminate|stop|start|modify|update|put|reboot|authorize|revoke|attach|detach|associate|disassociate|register|deregister|enable|disable|add|remove|set|import|restore|reset|cancel|scale)'
-    # aws s3 (high-level) mutating verbs. `ls` is intentionally excluded.
-    'aws s3 (rm|rb|cp|mv|sync)'
+    # invoke/publish are mutating (lambda invoke runs arbitrary code with side
+    # effects; lambda publish-version / publish-layer-version and sns publish
+    # mutate state) — there is no read-only `aws <svc> invoke|publish`, so they
+    # cannot introduce describe/get/list false-positives. copy (ec2
+    # copy-image/copy-snapshot) and assign (ec2 assign-*-addresses) are likewise
+    # mutating-only. All were caught by the pre-#3593 bare `aws ec2|lambda`
+    # prefixes and must stay asks (#3595).
+    'aws (ec2|lambda|s3api|rds|iam|autoscaling|cloudformation|eks|ecs|elb|elbv2|route53|dynamodb|sns|sqs) (run|create|delete|terminate|stop|start|modify|update|put|reboot|authorize|revoke|attach|detach|associate|disassociate|register|deregister|enable|disable|add|remove|set|import|restore|reset|cancel|scale|invoke|publish|copy|assign)'
+    # aws s3 (high-level) mutating verbs. `ls` is intentionally excluded. `mb`
+    # (make-bucket) is mutating and was caught by the old bare `aws s3` prefix.
+    'aws s3 (rm|rb|cp|mv|sync|mb)'
 
     # Docker operations (already mutating-verb only; does not match docker ps/logs)
     'docker rm'
