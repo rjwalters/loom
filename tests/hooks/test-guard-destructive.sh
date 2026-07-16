@@ -753,6 +753,21 @@ assert_deny "Regression (#3584): 'sudo reboot' still denied" \
 assert_deny "Regression (#3584): 'foo && reboot' still denied" \
     "foo && reboot"
 
+# #3586: `env` wrapper with NAME=value assignments / flags must resolve the
+# command word past the env prelude and still DENY. `env halt` (no assignment)
+# already worked; the assignment forms regressed under the #3585 command-word
+# anchoring because `toks[1]` was `FOO=bar` instead of `halt`.
+assert_deny "Regression (#3586): 'env halt' still denied" \
+    "env halt"
+assert_deny "Regression (#3586): 'env FOO=bar halt' resolves command word past assignment" \
+    "env FOO=bar halt"
+assert_deny "Regression (#3586): 'env FOO=bar BAZ=qux halt' skips multiple assignments" \
+    "env FOO=bar BAZ=qux halt"
+assert_deny "Regression (#3586): 'env -i FOO=bar halt' skips flag + assignment" \
+    "env -i FOO=bar halt"
+assert_deny "Regression (#3586): 'env -u NAME reboot' skips two-token -u flag" \
+    "env -u SOMEVAR reboot"
+
 echo ""
 
 # =========================================================================
