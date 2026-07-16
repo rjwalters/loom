@@ -117,6 +117,49 @@ sql_guard_enabled() {
     [[ "$_SQL_GUARD_CACHE" == "true" ]]
 }
 
+# =============================================================================
+# Cloud CLI guard toggle — default ON.
+#
+# The cloud/docker ASK patterns (mutating aws ec2/lambda/s3/... subcommands and
+# docker rm/rmi/stop/kill/restart) prompt for confirmation on every match. For a
+# repo whose *purpose* is managing cloud infrastructure (launch/stop/terminate
+# dev VMs, build/tear-down containers), that friction is a category error — the
+# mutating calls are the product's own dev/test vocabulary. Such repos opt out;
+# everyone else keeps the guard on. The genuinely catastrophic aws/docker denies
+# in ALWAYS_BLOCK_PATTERNS are NOT gated by this toggle and stay active.
+#
+# Resolution order (highest precedence first):
+#   1. LOOM_GUARD_CLOUD env var (0/false/no disables, 1/true/yes forces on)
+#   2. .loom/config.json  ->  guards.cloudCli  (default true when absent)
+#   3. Default: true (guard on)
+#
+# Mirrors sql_guard_enabled() exactly: cached in _CLOUD_GUARD_CACHE, invoked
+# LAZILY only after a cloud pattern has already matched so the jq config read
+# never touches the hot path for non-cloud commands. The config read is
+# best-effort: any parse failure falls through to guard-ON.
+# =============================================================================
+_CLOUD_GUARD_CACHE=""
+cloud_guard_enabled() {
+    if [[ -z "$_CLOUD_GUARD_CACHE" ]]; then
+        local enabled=true
+        if [[ -n "$REPO_ROOT" && -f "$REPO_ROOT/.loom/config.json" ]]; then
+            # jq // is alternative-on-null, not default-on-missing, so use
+            # if/then/else to treat only an explicit `false` as disabled (a
+            # missing guards.cloudCli key stays on). On malformed JSON jq exits
+            # non-zero and the `||` fallback restores the guard-ON default.
+            enabled=$(jq -r 'if .guards.cloudCli == false then "false" else "true" end' "$REPO_ROOT/.loom/config.json" 2>/dev/null) || enabled=true
+            [[ -n "$enabled" ]] || enabled=true
+        fi
+        # Env override wins over config.
+        case "${LOOM_GUARD_CLOUD:-}" in
+            0|false|no)  enabled=false ;;
+            1|true|yes)  enabled=true ;;
+        esac
+        _CLOUD_GUARD_CACHE="$enabled"
+    fi
+    [[ "$_CLOUD_GUARD_CACHE" == "true" ]]
+}
+
 # Helper: output a deny decision and exit
 deny() {
     local reason="$1"
@@ -203,9 +246,14 @@ ALWAYS_BLOCK_PATTERNS=(
     # matches "h·az·ard … delete" across unrelated prose tokens (#3584) — so they
     # are handled by the segment-parsed lifecycle/cloud check further below, NOT
     # here.
+    # NOTE: `aws ec2 terminate` is deliberately NOT in this raw catastrophic
+    # scan. For a repo whose job is standing up and tearing down dev VMs the
+    # teardown path (`terminate-instances`) is a first-class workflow, so it is
+    # downgraded to an ask via the toggle-gated CLOUD_ASK_PATTERNS below (and
+    # fully bypassed when LOOM_GUARD_CLOUD=0 / guards.cloudCli:false). The other
+    # aws forms here stay ungated — they remain a hard safety floor (#3593).
     'aws s3 rm.*--recursive'
     'aws s3 rb'
-    'aws ec2 terminate'
     'aws iam delete'
     'aws cloudformation delete-stack'
 
@@ -526,17 +574,9 @@ ASK_PATTERNS=(
     'gh release delete'
     'gh label delete'
 
-    # Cloud CLI operations
-    'aws s3'
-    'aws ec2'
-    'aws lambda'
-
-    # Docker operations
-    'docker rm'
-    'docker rmi'
-    'docker stop'
-    'docker kill'
-    'docker restart'
+    # NOTE: cloud CLI (aws) + docker ASK patterns are NOT in this ungated array.
+    # They live in CLOUD_ASK_PATTERNS below, gated by cloud_guard_enabled() so
+    # cloud-dev repos can opt down (LOOM_GUARD_CLOUD=0 / guards.cloudCli:false).
 
     # Service management
     'systemctl restart'
@@ -562,6 +602,55 @@ ASK_PATTERNS=(
 
 for pattern in "${ASK_PATTERNS[@]}"; do
     if echo "$COMMAND_NO_COMMENT" | grep -qE "$pattern"; then
+        ask "Command requires confirmation: $COMMAND"
+    fi
+done
+
+# =============================================================================
+# CLOUD CLI ASK patterns — gated by the cloud CLI guard toggle
+#
+# Kept separate from ASK_PATTERNS so cloud-dev repos can opt out
+# (guards.cloudCli:false / LOOM_GUARD_CLOUD=0). cloud_guard_enabled() is
+# consulted only AFTER a cloud pattern matches, so the config read stays off the
+# hot path for non-cloud commands (mirrors the SQL DDL block above).
+#
+# The aws entries are VERB-ANCHORED (case-sensitive ERE against the
+# comment-stripped command): only mutating subcommands match, never read-only
+# describe*/get*/list*/ls. So `aws ec2 describe-instances`, `aws s3 ls`, and
+# `aws lambda list-functions` no longer prompt, while `run-instances`,
+# `create-*`, `terminate-instances`, `stop-instances`, `lambda invoke`,
+# `lambda publish*`, `sns publish`, etc. still ask.
+#
+# The docker entries already name only mutating verbs (rm/rmi/stop/kill/restart)
+# and never match read-only `docker ps`/`docker logs`, so they are unchanged —
+# they only move under this toggle.
+# =============================================================================
+CLOUD_ASK_PATTERNS=(
+    # aws mutating subcommands (verb-anchored). The service list covers the
+    # common infra-mutating namespaces; the verb list is the mutating vocabulary
+    # (never describe*/get*/list*/ls). terminate lands here — an ask, not a deny.
+    # invoke/publish are mutating (lambda invoke runs arbitrary code with side
+    # effects; lambda publish-version / publish-layer-version and sns publish
+    # mutate state) — there is no read-only `aws <svc> invoke|publish`, so they
+    # cannot introduce describe/get/list false-positives. copy (ec2
+    # copy-image/copy-snapshot) and assign (ec2 assign-*-addresses) are likewise
+    # mutating-only. All were caught by the pre-#3593 bare `aws ec2|lambda`
+    # prefixes and must stay asks (#3595).
+    'aws (ec2|lambda|s3api|rds|iam|autoscaling|cloudformation|eks|ecs|elb|elbv2|route53|dynamodb|sns|sqs) (run|create|delete|terminate|stop|start|modify|update|put|reboot|authorize|revoke|attach|detach|associate|disassociate|register|deregister|enable|disable|add|remove|set|import|restore|reset|cancel|scale|invoke|publish|copy|assign)'
+    # aws s3 (high-level) mutating verbs. `ls` is intentionally excluded. `mb`
+    # (make-bucket) is mutating and was caught by the old bare `aws s3` prefix.
+    'aws s3 (rm|rb|cp|mv|sync|mb)'
+
+    # Docker operations (already mutating-verb only; does not match docker ps/logs)
+    'docker rm'
+    'docker rmi'
+    'docker stop'
+    'docker kill'
+    'docker restart'
+)
+
+for pattern in "${CLOUD_ASK_PATTERNS[@]}"; do
+    if echo "$COMMAND_NO_COMMENT" | grep -qE "$pattern" && cloud_guard_enabled; then
         ask "Command requires confirmation: $COMMAND"
     fi
 done

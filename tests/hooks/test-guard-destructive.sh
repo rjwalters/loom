@@ -132,6 +132,24 @@ assert_allow_env() {
     fi
 }
 
+# Assert ask with an env assignment + cwd (repo root).
+assert_ask_env() {
+    local description="$1"; local env_kv="$2"; local cmd="$3"; local cwd="${4:-$REPO_ROOT}"
+    TOTAL=$((TOTAL + 1))
+    local output
+    output=$(run_guard_env "$env_kv" "$cmd" "$cwd") || true
+    if echo "$output" | jq -e '.hookSpecificOutput.permissionDecision == "ask"' >/dev/null 2>&1; then
+        PASS=$((PASS + 1))
+        echo -e "  ${GREEN}PASS${NC}: $description"
+    else
+        FAIL=$((FAIL + 1))
+        echo -e "  ${RED}FAIL${NC}: $description"
+        echo -e "       Command: $cmd (env: ${env_kv:-none}, cwd: $cwd)"
+        echo -e "       Expected: ask"
+        echo -e "       Got: $output"
+    fi
+}
+
 # Assert the guard denies a command when inside a worktree
 assert_deny_in_worktree() {
     local description="$1"
@@ -303,7 +321,9 @@ assert_deny "Block aws s3 rm recursive" \
 assert_deny "Block aws s3 rb" \
     "aws s3 rb s3://my-bucket --force"
 
-assert_deny "Block aws ec2 terminate" \
+# aws ec2 terminate-instances is no longer an ALWAYS_BLOCK deny (#3593) — it is
+# a toggle-gated ask (see the cloud-toggle section below).
+assert_ask "Ask (not deny) for aws ec2 terminate-instances (#3593)" \
     "aws ec2 terminate-instances --instance-ids i-1234"
 
 assert_deny "Block gcloud delete" \
@@ -423,7 +443,8 @@ assert_ask "Ask for gh issue close" \
 assert_ask "Ask for gh release delete" \
     "gh release delete v1.0"
 
-assert_ask "Ask for aws s3 ls" \
+# aws s3 ls is read-only — verb-narrowed cloud ASK patterns no longer prompt (#3593).
+assert_allow "Allow aws s3 ls (read-only, #3593)" \
     "aws s3 ls"
 
 assert_ask "Ask for docker rm" \
@@ -625,7 +646,9 @@ assert_deny "SQL config-off: force-push to main still blocked" \
     "git push --force origin main" "$SQL_OFF_REPO"
 assert_deny "SQL config-off: gh repo delete still blocked" \
     "gh repo delete myrepo --yes" "$SQL_OFF_REPO"
-assert_deny "SQL config-off: aws ec2 terminate still blocked" \
+# aws ec2 terminate-instances is no longer an ALWAYS_BLOCK deny (#3593); with the
+# SQL guard off (cloud guard still on) it is a toggle-gated ask.
+assert_ask "SQL config-off: aws ec2 terminate-instances now asks (#3593)" \
     "aws ec2 terminate-instances --instance-ids i-1234" "$SQL_OFF_REPO"
 assert_deny "SQL config-off: aws s3 rb still blocked" \
     "aws s3 rb s3://my-bucket --force" "$SQL_OFF_REPO"
@@ -649,6 +672,135 @@ assert_deny_env "LOOM_GUARD_SQL=0: rm -rf / still blocked" \
 # Clean up temp repos created above.
 for _sql_dir in "$SQL_OFF_REPO" "$SQL_ON_REPO" "$SQL_ABSENT_REPO" "$SQL_BAD_REPO"; do
     [[ -n "$_sql_dir" && "$_sql_dir" != "/" && -d "$_sql_dir/.loom" ]] && rm -rf "$_sql_dir"
+done
+
+echo ""
+
+# =========================================================================
+echo -e "${YELLOW}--- Cloud CLI opt-out + verb-narrowing (guards.cloudCli / LOOM_GUARD_CLOUD) (#3593) ---${NC}"
+# =========================================================================
+
+# --- Verb-narrowing: read-only aws calls no longer prompt (default guard on) ---
+assert_allow "Cloud: aws ec2 describe-instances is read-only (allow)" \
+    "aws ec2 describe-instances"
+assert_allow "Cloud: aws ec2 describe-images is read-only (allow)" \
+    "aws ec2 describe-images --owners self"
+assert_allow "Cloud: aws s3 ls is read-only (allow)" \
+    "aws s3 ls s3://my-bucket"
+assert_allow "Cloud: aws lambda list-functions is read-only (allow)" \
+    "aws lambda list-functions"
+assert_allow "Cloud: aws ec2 get-console-output is read-only (allow)" \
+    "aws ec2 get-console-output --instance-id i-1234"
+
+# --- Verb-narrowing: mutating aws subcommands still ask (default guard on) ---
+assert_ask "Cloud: aws ec2 run-instances asks" \
+    "aws ec2 run-instances --image-id ami-123 --count 1"
+assert_ask "Cloud: aws ec2 create-volume asks" \
+    "aws ec2 create-volume --size 10 --availability-zone us-east-1a"
+assert_ask "Cloud: aws ec2 stop-instances asks" \
+    "aws ec2 stop-instances --instance-ids i-1234"
+assert_ask "Cloud: aws ec2 start-instances asks" \
+    "aws ec2 start-instances --instance-ids i-1234"
+assert_ask "Cloud: aws ec2 terminate-instances asks (toggle on)" \
+    "aws ec2 terminate-instances --instance-ids i-1234"
+assert_ask "Cloud: aws s3 cp (mutating) asks" \
+    "aws s3 cp ./file s3://my-bucket/file"
+assert_ask "Cloud: aws lambda delete-function asks" \
+    "aws lambda delete-function --function-name f"
+# --- #3595: invoke/publish/copy/assign/mb restored to the mutating verb list ---
+# aws lambda invoke executes arbitrary Lambda code with side effects; it is
+# neither read-only nor a catastrophic deny, so the pre-#3595 verb-narrowing
+# silently un-gated it. Restore the ask (toggle on).
+assert_ask "Cloud: aws lambda invoke asks (toggle on, #3595)" \
+    "aws lambda invoke --function-name f out.json"
+assert_ask "Cloud: aws lambda publish-version asks (#3595)" \
+    "aws lambda publish-version --function-name f"
+assert_ask "Cloud: aws lambda publish-layer-version asks (#3595)" \
+    "aws lambda publish-layer-version --layer-name l --zip-file fileb://l.zip"
+assert_ask "Cloud: aws sns publish asks (#3595)" \
+    "aws sns publish --topic-arn arn:aws:sns:us-east-1:1:t --message hi"
+assert_ask "Cloud: aws ec2 copy-image asks (#3595)" \
+    "aws ec2 copy-image --source-image-id ami-123 --source-region us-east-1 --name copy"
+assert_ask "Cloud: aws ec2 assign-private-ip-addresses asks (#3595)" \
+    "aws ec2 assign-private-ip-addresses --network-interface-id eni-123 --secondary-private-ip-address-count 1"
+assert_ask "Cloud: aws s3 mb (make-bucket) asks (#3595)" \
+    "aws s3 mb s3://my-new-bucket"
+# invoke/publish must NOT re-broaden into read-only false-positives.
+assert_allow "Cloud: aws lambda get-function is read-only (allow, #3595)" \
+    "aws lambda get-function --function-name f"
+assert_allow "Cloud: aws sns list-topics is read-only (allow, #3595)" \
+    "aws sns list-topics"
+
+# --- Docker verbs unchanged: mutating asks, read-only allowed (toggle on) ---
+assert_ask "Cloud: docker rm still asks" \
+    "docker rm my-container"
+assert_ask "Cloud: docker stop still asks" \
+    "docker stop my-container"
+assert_allow "Cloud: docker ps still allowed (read-only)" \
+    "docker ps -a"
+assert_allow "Cloud: docker logs still allowed (read-only)" \
+    "docker logs my-container"
+
+# Repos toggling the cloud guard via .loom/config.json (reuse make_sql_repo — it
+# just writes arbitrary config JSON).
+CLOUD_OFF_REPO=$(make_sql_repo '{"guards":{"cloudCli":false}}')
+CLOUD_ON_REPO=$(make_sql_repo '{"guards":{"cloudCli":true}}')
+CLOUD_ABSENT_REPO=$(make_sql_repo '{"champion":{"auto_merge_max_lines":200}}')
+CLOUD_BAD_REPO=$(make_sql_repo '{ not valid json ')
+
+# --- Config opt-out: guards.cloudCli:false fully bypasses cloud/docker ASK ---
+assert_allow "Cloud config-off: aws ec2 terminate-instances allowed" \
+    "aws ec2 terminate-instances --instance-ids i-1234" "$CLOUD_OFF_REPO"
+assert_allow "Cloud config-off: aws ec2 run-instances allowed" \
+    "aws ec2 run-instances --image-id ami-123" "$CLOUD_OFF_REPO"
+assert_allow "Cloud config-off: aws lambda invoke allowed (#3595)" \
+    "aws lambda invoke --function-name f out.json" "$CLOUD_OFF_REPO"
+assert_allow "Cloud config-off: docker rm allowed" \
+    "docker rm my-container" "$CLOUD_OFF_REPO"
+
+# --- Default-on (absent/malformed config) still asks on mutating cloud calls ---
+assert_ask "Cloud config-absent: aws ec2 terminate-instances still asks" \
+    "aws ec2 terminate-instances --instance-ids i-1234" "$CLOUD_ABSENT_REPO"
+assert_ask "Cloud malformed-config: aws ec2 run-instances still asks" \
+    "aws ec2 run-instances --image-id ami-123" "$CLOUD_BAD_REPO"
+assert_ask "Cloud config-on: docker rm still asks" \
+    "docker rm my-container" "$CLOUD_ON_REPO"
+
+# --- Env override: LOOM_GUARD_CLOUD=0 bypasses even when config says true ---
+assert_allow_env "LOOM_GUARD_CLOUD=0 overrides config-on: aws ec2 terminate allowed" \
+    "LOOM_GUARD_CLOUD=0" "aws ec2 terminate-instances --instance-ids i-1234" "$CLOUD_ON_REPO"
+assert_allow_env "LOOM_GUARD_CLOUD=0: aws lambda invoke allowed (#3595)" \
+    "LOOM_GUARD_CLOUD=0" "aws lambda invoke --function-name f out.json" "$CLOUD_ON_REPO"
+assert_allow_env "LOOM_GUARD_CLOUD=0: docker rm allowed" \
+    "LOOM_GUARD_CLOUD=0" "docker rm my-container" "$CLOUD_ON_REPO"
+
+# --- Env override: LOOM_GUARD_CLOUD=1 forces on even when config says false ---
+assert_ask_env "LOOM_GUARD_CLOUD=1 overrides config-off: aws ec2 terminate asks" \
+    "LOOM_GUARD_CLOUD=1" "aws ec2 terminate-instances --instance-ids i-1234" "$CLOUD_OFF_REPO"
+assert_ask_env "LOOM_GUARD_CLOUD=1 overrides config-off: docker rm asks" \
+    "LOOM_GUARD_CLOUD=1" "docker rm my-container" "$CLOUD_OFF_REPO"
+
+# --- Catastrophic denies are NOT gated by the cloud toggle (stay hard denies) ---
+assert_deny_env "Cloud toggle off does NOT weaken: aws s3 rb still denied" \
+    "LOOM_GUARD_CLOUD=0" "aws s3 rb s3://prod-bucket --force" "$CLOUD_OFF_REPO"
+assert_deny_env "Cloud toggle off does NOT weaken: aws s3 rm --recursive still denied" \
+    "LOOM_GUARD_CLOUD=0" "aws s3 rm s3://prod-bucket/data --recursive" "$CLOUD_OFF_REPO"
+assert_deny_env "Cloud toggle off does NOT weaken: aws iam delete-user still denied" \
+    "LOOM_GUARD_CLOUD=0" "aws iam delete-user --user-name bob" "$CLOUD_OFF_REPO"
+assert_deny_env "Cloud toggle off does NOT weaken: aws cloudformation delete-stack still denied" \
+    "LOOM_GUARD_CLOUD=0" "aws cloudformation delete-stack --stack-name prod" "$CLOUD_OFF_REPO"
+assert_deny_env "Cloud toggle off does NOT weaken: docker system prune still denied" \
+    "LOOM_GUARD_CLOUD=0" "docker system prune -af" "$CLOUD_OFF_REPO"
+
+# --- Cloud toggle off must NOT weaken non-cloud guards ---
+assert_deny_env "Cloud config-off: rm -rf / still blocked" \
+    "LOOM_GUARD_CLOUD=0" "rm -rf /" "$CLOUD_OFF_REPO"
+assert_deny_env "Cloud config-off: force-push to main still blocked" \
+    "LOOM_GUARD_CLOUD=0" "git push --force origin main" "$CLOUD_OFF_REPO"
+
+# Clean up cloud temp repos.
+for _cloud_dir in "$CLOUD_OFF_REPO" "$CLOUD_ON_REPO" "$CLOUD_ABSENT_REPO" "$CLOUD_BAD_REPO"; do
+    [[ -n "$_cloud_dir" && "$_cloud_dir" != "/" && -d "$_cloud_dir/.loom" ]] && rm -rf "$_cloud_dir"
 done
 
 echo ""
@@ -832,8 +984,9 @@ assert_deny "Regression: gh repo delete after && still denied" \
 assert_deny "Regression: sudo gh repo archive still denied" \
     "sudo gh repo archive acme/widgets"
 
-# Cloud infra destruction.
-assert_deny "Regression: aws ec2 terminate still denied" \
+# Cloud infra destruction. `aws ec2 terminate-instances` is now a toggle-gated
+# ask, not a deny (#3593); the genuinely catastrophic aws forms still deny.
+assert_ask "Regression: aws ec2 terminate-instances now asks not denies (#3593)" \
     "aws ec2 terminate-instances --instance-ids i-1234"
 assert_deny "Regression: aws s3 rb still denied" \
     "aws s3 rb s3://prod-bucket --force"

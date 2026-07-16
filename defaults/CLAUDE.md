@@ -908,7 +908,7 @@ Loom ships with built-in guard hooks (`guard-destructive.sh` for dangerous Bash 
 
 `guard-destructive.sh` blocks SQL DDL/DML patterns — `DROP DATABASE`, `DROP TABLE`, `DROP SCHEMA`, `TRUNCATE TABLE`, and `DELETE FROM` without a `WHERE` clause. For most repos this is a useful safety net, but for a project that is **itself a database engine** (e.g. a SQLite-compatible engine running a SQL conformance suite) those statements are the product's own dev/test vocabulary and the guard is a category error — the match is a case-insensitive substring, so it even fires when the words appear in a comment or a `--description` label.
 
-Such repos can opt out of the SQL guard while keeping every other guard (`rm -rf /`, force-push to `main`, `gh repo delete`, `aws ec2 terminate`, `aws s3 rb`, etc.) fully active.
+Such repos can opt out of the SQL guard while keeping every other guard (`rm -rf /`, force-push to `main`, `gh repo delete`, `aws s3 rb`, `aws iam delete`, etc.) fully active.
 
 The SQL guard is **on by default**. It is resolved in this order (highest precedence first):
 
@@ -936,6 +936,42 @@ LOOM_GUARD_SQL=0 vibesql -c "DROP TABLE t"
 
 # Force the SQL guard on for one command even when the repo opts out
 LOOM_GUARD_SQL=1 psql -c "DROP TABLE users"
+```
+
+### Cloud CLI Guard Opt-Out (`guards.cloudCli` / `LOOM_GUARD_CLOUD`)
+
+`guard-destructive.sh` asks for confirmation on **mutating** cloud/container CLI calls — `aws ec2 run-instances`/`create-*`/`stop-instances`/`start-instances`/`terminate-instances`, `aws s3 rm`/`rb`/`cp`/`mv`/`sync`, other mutating `aws <service> <verb>` forms, and `docker rm`/`rmi`/`stop`/`kill`/`restart`. Read-only calls (`aws ec2 describe-instances`, `aws s3 ls`, `aws lambda list-functions`, `docker ps`, `docker logs`, etc.) are **not** prompted. For a repo whose *purpose* is managing cloud infrastructure (launch/stop/terminate dev VMs, build/tear-down containers), even the mutating asks are workflow friction rather than a safety win.
+
+Such repos can opt out of the cloud/docker ASK category while keeping every other guard active — including the genuinely catastrophic cloud denies (`aws s3 rm ... --recursive`, `aws s3 rb`, `aws iam delete-*`, `aws cloudformation delete-stack`, `docker system prune`), which are **never** gated by this toggle and stay hard denies even with the cloud guard off.
+
+The cloud guard is **on by default**. It is resolved in this order (highest precedence first):
+
+1. **`LOOM_GUARD_CLOUD` env var** — `0`/`false`/`no` disables the cloud/docker ASK category; `1`/`true`/`yes` forces it on. Overrides the config value.
+2. **`.loom/config.json`** — `guards.cloudCli` (default `true` when absent). Set it to `false` to disable:
+   ```json
+   {
+     "guards": {
+       "cloudCli": false
+     }
+   }
+   ```
+3. **Default** — `true` (guard on).
+
+The config read is best-effort: a missing, empty, or malformed `.loom/config.json` falls through to guard-ON and never causes the hook to exit non-zero. Only the cloud/docker ASK patterns are affected — disabling the cloud guard does not weaken the catastrophic cloud denies or any other guard.
+
+Note: `aws ec2 terminate-instances` is an **ask** (not a hard deny) so a legitimate VM-teardown workflow is possible; with `guards.cloudCli:false` / `LOOM_GUARD_CLOUD=0` it passes through without prompting.
+
+**Examples**:
+
+```bash
+# Tear down a dev VM without a prompt for a single command
+LOOM_GUARD_CLOUD=0 aws ec2 terminate-instances --instance-ids i-1234
+
+# Persist the opt-out for a cloud-management repo
+#   .loom/config.json  ->  { "guards": { "cloudCli": false } }
+
+# Force the cloud guard on for one command even when the repo opts out
+LOOM_GUARD_CLOUD=1 aws ec2 terminate-instances --instance-ids i-1234
 ```
 
 ### Protecting Read-Only Directories
