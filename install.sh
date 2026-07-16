@@ -218,6 +218,47 @@ verify_install() {
   fi
 }
 
+# Issue #3588: re-append the current Loom ephemeral .gitignore patterns after a
+# --quick reinstall stash pop that was performed against a HEAD-reset .gitignore.
+#
+# The reinstall restores .gitignore to its committed HEAD state before popping so
+# the user's stashed hunk applies cleanly (see the pop block below). That reset
+# strips the Loom patterns the daemon's `init` had (re-)written, so we re-apply
+# them here. The pattern list is derived from the post-init snapshot (lines that
+# were present there but absent from the committed HEAD version) rather than
+# hard-coded, so it never drifts from the daemon's authoritative list in
+# loom-daemon/src/init/post_init.rs. Appending only missing lines keeps this
+# idempotent (append-only), mirroring `update_gitignore`.
+reapply_loom_gitignore_patterns() {
+  local target_path="$1"
+  local postinit_snapshot="$2"
+  local gitignore="$target_path/.gitignore"
+
+  [[ -f "$postinit_snapshot" && -f "$gitignore" ]] || return 0
+
+  # The committed .gitignore (the stash base the user's hunk was recorded
+  # against). Lines present in the post-init snapshot but not here are exactly
+  # the Loom patterns `init` (re-)appended.
+  local head_version loom_lines
+  head_version="$(git -C "$target_path" show HEAD:.gitignore 2>/dev/null)"
+
+  loom_lines="$(grep -vxF -f <(printf '%s\n' "$head_version") "$postinit_snapshot" 2>/dev/null || true)"
+  [[ -z "$loom_lines" ]] && return 0
+
+  local line
+  while IFS= read -r line; do
+    [[ -z "$line" ]] && continue
+    if ! grep -qxF -- "$line" "$gitignore" 2>/dev/null; then
+      # Ensure a trailing newline before appending (command substitution strips
+      # the newline, so a non-empty result means the file did NOT end in \n).
+      if [[ -s "$gitignore" && -n "$(tail -c1 "$gitignore" 2>/dev/null)" ]]; then
+        printf '\n' >>"$gitignore"
+      fi
+      printf '%s\n' "$line" >>"$gitignore"
+    fi
+  done <<<"$loom_lines"
+}
+
 # Determine Loom repository root
 LOOM_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
@@ -641,14 +682,76 @@ elif [[ -d "$TARGET_PATH/.loom" ]]; then
       git -C "$TARGET_PATH" reset -q HEAD -- . 2>/dev/null || true
 
     # Restore any user changes stashed before the uninstall (see above).
+    #
+    # Issue #3588: the uninstall→init round-trip rewrites .gitignore
+    # non-reversibly — the uninstall strips Loom patterns from mid-block and
+    # collapses blank lines (scripts/uninstall-loom.sh), then `init` re-appends
+    # the patterns at end-of-file (loom-daemon update_gitignore). That moves
+    # lines relative to HEAD, so a stashed .gitignore hunk — recorded against
+    # the committed context — no longer has a matching 3-way base on disk and
+    # `git stash pop` conflicts. Previously the pop was silenced with
+    # `2>/dev/null`: the conflict was hidden, the stash silently kept, and the
+    # user's uncommitted .gitignore edit stranded (data-loss risk).
+    #
+    # Fix: before popping, restore .gitignore to its committed HEAD state so the
+    # pop's 3-way base matches the stash base and the user's hunk applies
+    # cleanly; then re-append the current Loom ephemeral patterns (append-only,
+    # idempotent). If the pop still fails for any reason, surface the real
+    # conflict output and a working recovery path instead of hiding it.
     if [[ "$REINSTALL_STASHED_USER_CHANGES" == "true" ]]; then
       info "Restoring stashed user changes..."
-      if git -C "$TARGET_PATH" stash pop 2>/dev/null; then
+
+      # If .gitignore is tracked at HEAD, snapshot the post-init version (which
+      # carries the current Loom patterns) and reset the working copy to HEAD so
+      # the pop's 3-way base lines up with the committed context. Skip this for
+      # repos where .gitignore is untracked/newly created — there is no HEAD
+      # base to restore and the plain pop already applies cleanly.
+      REINSTALL_GITIGNORE_RESET=false
+      REINSTALL_GITIGNORE_POSTINIT=""
+      if git -C "$TARGET_PATH" cat-file -e HEAD:.gitignore 2>/dev/null; then
+        REINSTALL_GITIGNORE_POSTINIT="$(mktemp 2>/dev/null || true)"
+        if [[ -n "$REINSTALL_GITIGNORE_POSTINIT" ]] && \
+           cp "$TARGET_PATH/.gitignore" "$REINSTALL_GITIGNORE_POSTINIT" 2>/dev/null && \
+           git -C "$TARGET_PATH" checkout HEAD -- .gitignore 2>/dev/null; then
+          REINSTALL_GITIGNORE_RESET=true
+        fi
+      fi
+
+      REINSTALL_POP_OUTPUT="$(git -C "$TARGET_PATH" stash pop 2>&1)"
+      REINSTALL_POP_STATUS=$?
+
+      if [[ $REINSTALL_POP_STATUS -eq 0 ]]; then
+        # Pop succeeded. When we reset .gitignore to HEAD the user's hunk is now
+        # applied but the current Loom patterns are missing — re-append them.
+        if [[ "$REINSTALL_GITIGNORE_RESET" == "true" ]]; then
+          reapply_loom_gitignore_patterns "$TARGET_PATH" "$REINSTALL_GITIGNORE_POSTINIT"
+        fi
         success "User changes restored"
       else
+        # Genuine conflict (e.g. the user also edited a Loom-managed file that
+        # `init` rewrote). Roll .gitignore back to the post-init snapshot so the
+        # tree is not left half-reset, then surface the real conflict and a
+        # concrete recovery path. Do NOT abort — the reinstall itself succeeded;
+        # only the user-change restore needs manual attention.
+        if [[ "$REINSTALL_GITIGNORE_RESET" == "true" ]]; then
+          cp "$REINSTALL_GITIGNORE_POSTINIT" "$TARGET_PATH/.gitignore" 2>/dev/null || true
+        fi
+        REINSTALL_STASH_REF="$(git -C "$TARGET_PATH" stash list 2>/dev/null | head -1 | cut -d: -f1)"
+        [[ -z "$REINSTALL_STASH_REF" ]] && REINSTALL_STASH_REF="stash@{0}"
         warning "Failed to restore stashed user changes automatically"
-        warning "Run 'git stash pop' in $TARGET_PATH to recover your changes"
+        echo ""
+        echo "  git stash pop reported:"
+        printf '%s\n' "$REINSTALL_POP_OUTPUT" | sed 's/^/    /'
+        echo ""
+        echo "  Your changes are preserved in the stash ($REINSTALL_STASH_REF)."
+        echo "  A plain 'git stash pop' will conflict the same way, so recover by hand:"
+        echo "    cd $TARGET_PATH"
+        echo "    git stash show -p $REINSTALL_STASH_REF              # inspect the stashed diff"
+        echo "    git stash show -p $REINSTALL_STASH_REF | git apply --3way   # or reconcile by hand"
+        echo "    git stash drop $REINSTALL_STASH_REF                 # once you've reconciled"
       fi
+
+      [[ -n "$REINSTALL_GITIGNORE_POSTINIT" ]] && rm -f "$REINSTALL_GITIGNORE_POSTINIT" 2>/dev/null || true
     fi
 
     echo ""
