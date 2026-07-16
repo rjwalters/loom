@@ -717,8 +717,17 @@ elif [[ -d "$TARGET_PATH/.loom" ]]; then
         fi
       fi
 
-      REINSTALL_POP_OUTPUT="$(git -C "$TARGET_PATH" stash pop 2>&1)"
-      REINSTALL_POP_STATUS=$?
+      # Capture the pop in an `if` condition so the assignment is exempt from
+      # `set -e`. A plain top-level `VAR="$(cmd)"` assignment inherits the
+      # command-substitution exit status, so a conflicting `git stash pop`
+      # (non-zero) would trip `set -euo pipefail` on the assignment itself and
+      # abort the installer before the conflict-surfacing branch below ever
+      # runs (issue #3588 / PR review).
+      if REINSTALL_POP_OUTPUT="$(git -C "$TARGET_PATH" stash pop 2>&1)"; then
+        REINSTALL_POP_STATUS=0
+      else
+        REINSTALL_POP_STATUS=$?
+      fi
 
       if [[ $REINSTALL_POP_STATUS -eq 0 ]]; then
         # Pop succeeded. When we reset .gitignore to HEAD the user's hunk is now

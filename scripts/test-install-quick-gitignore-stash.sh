@@ -153,6 +153,60 @@ else
 fi
 echo ""
 
+# --------------------------------------------------------------------------
+# Scenario 5 (conflict path): a genuine, unresolvable stash-pop conflict must
+# NOT abort the installer. The user customizes a Loom-managed tracked file
+# (.loom/roles/builder.md) and commits it, then makes an uncommitted edit to
+# the same region. The reinstall's `init` overwrites that file with canonical
+# content, so the stashed hunk no longer 3-way merges and `git stash pop`
+# conflicts for real. The installer must: (a) exit 0, (b) preserve the stash,
+# (c) print the recovery instructions (`git stash show -p`) and the completion
+# banner — instead of dying mid-stream under `set -euo pipefail`.
+#
+# This assertion FAILS against the pre-fix PR code (the plain `VAR="$(...)"`
+# capture let a conflicting pop trip `set -e` on the assignment, exiting 1
+# before the conflict branch) and PASSES after the `if`-condition fix.
+R5="$TEST_DIR/genuine-conflict"
+setup_repo "$R5"
+CONFLICT_FILE=".loom/roles/builder.md"
+if [[ -f "$R5/$CONFLICT_FILE" ]]; then
+  # Customize the managed file and commit so init's rewrite diverges from HEAD.
+  { echo "USER CUSTOM SENTINEL LINE"; cat "$R5/$CONFLICT_FILE"; } >"$R5/$CONFLICT_FILE.tmp"
+  mv "$R5/$CONFLICT_FILE.tmp" "$R5/$CONFLICT_FILE"
+  git -C "$R5" add -A
+  git -C "$R5" commit -qm "customize managed file" >/dev/null 2>&1
+  # Uncommitted edit to the same first line -> stashed, then conflicts on pop.
+  perl -0pi -e 's/USER CUSTOM SENTINEL LINE/USER CUSTOM SENTINEL LINE EDITED/' "$R5/$CONFLICT_FILE"
+
+  CONFLICT_OUT="$TEST_DIR/conflict-out.txt"
+  "$INSTALL_SCRIPT" -y --quick "$R5" >"$CONFLICT_OUT" 2>&1
+  CONFLICT_EXIT=$?
+
+  if [[ $CONFLICT_EXIT -eq 0 ]]; then
+    pass "genuine stash-pop conflict: installer exits 0 (does not abort under set -e)"
+  else
+    fail "genuine stash-pop conflict: installer exited $CONFLICT_EXIT (set -e aborted the conflict branch — #3588)"
+  fi
+  if [[ "$(git -C "$R5" stash list | wc -l | tr -d ' ')" != "0" ]]; then
+    pass "genuine stash-pop conflict: stash preserved for manual recovery"
+  else
+    fail "genuine stash-pop conflict: stash lost (user changes unrecoverable)"
+  fi
+  if grep -q "git stash show -p" "$CONFLICT_OUT" && grep -q "preserved in the stash" "$CONFLICT_OUT"; then
+    pass "genuine stash-pop conflict: recovery instructions + stash ref printed"
+  else
+    fail "genuine stash-pop conflict: recovery instructions not printed (dead conflict branch — #3588)"
+  fi
+  if grep -q "Quick reinstallation complete" "$CONFLICT_OUT"; then
+    pass "genuine stash-pop conflict: completion banner still printed"
+  else
+    fail "genuine stash-pop conflict: completion banner missing (installer died mid-stream — #3588)"
+  fi
+else
+  warn "managed file $CONFLICT_FILE not present after install — skipping conflict-path scenario"
+fi
+echo ""
+
 echo "======================================"
 echo "Test Summary"
 echo "======================================"
