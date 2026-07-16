@@ -713,6 +713,49 @@ assert_allow "Allow HOST=cat(...); ssh ... rm -rf remote-path (phantom class)" \
 echo ""
 
 # =========================================================================
+echo -e "${YELLOW}--- #3584: lifecycle/cloud words in prose no longer DENY ---${NC}"
+# =========================================================================
+
+# The ALWAYS_BLOCK lifecycle words (halt/reboot/poweroff/shutdown/init 0/init 6)
+# and the az/gcloud cloud-delete CLIs were unanchored (or anchored only to a
+# whitespace-inclusive boundary), so they DENIED on ordinary prose in comments,
+# commit messages, and flag names. Command-word segment parsing (#3584) fixes
+# this: they now deny ONLY when a segment's command word is exactly the word.
+
+# 1. `halt` inside a trailing comment must ALLOW (comment-stripped, and its
+#    command word is `echo`, not `halt`).
+assert_allow "Allow 'halt' in a trailing comment (#3584)" \
+    'echo "stopping" # stops billing then the box will halt'
+
+# 2. `reboot` inside a commit message must ALLOW (command word is `git`).
+assert_allow "Allow 'reboot' inside a commit message (#3584)" \
+    'git commit -m "recover cleanly after a reboot event"'
+
+# 3. `az`/`delete` as substrings of unrelated prose tokens (h·az·ard … delete)
+#    must ALLOW — the command word is `gh`, not `az`/`gcloud`.
+assert_allow "Allow 'hazard...delete' prose in a gh pr comment body (#3584)" \
+    'gh pr comment --body "the hazard here is a swallowed delete of a row"'
+
+# 4. `shutdown` inside a flag name must NOT deny. `aws ec2` is an ASK gate, so
+#    ASK is the acceptable outcome per the issue's Acceptance (never DENY).
+assert_ask "Ask (not deny) for 'shutdown' inside an aws ec2 flag name (#3584)" \
+    "aws ec2 run-instances --instance-initiated-shutdown-behavior stop"
+
+# Regression: the lifecycle/cloud words as STANDALONE commands still DENY.
+assert_deny "Regression (#3584): 'az group delete' as command word still denied" \
+    "az group delete my-rg --yes"
+assert_deny "Regression (#3584): 'gcloud ... delete' as command word still denied" \
+    "gcloud compute instances delete my-instance"
+assert_deny "Regression (#3584): standalone 'halt' still denied" \
+    "halt"
+assert_deny "Regression (#3584): 'sudo reboot' still denied" \
+    "sudo reboot"
+assert_deny "Regression (#3584): 'foo && reboot' still denied" \
+    "foo && reboot"
+
+echo ""
+
+# =========================================================================
 echo -e "${YELLOW}--- #3553 regression guard: catastrophic commands STILL deny ---${NC}"
 # =========================================================================
 
