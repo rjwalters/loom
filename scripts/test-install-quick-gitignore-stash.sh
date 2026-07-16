@@ -207,6 +207,79 @@ else
 fi
 echo ""
 
+# --------------------------------------------------------------------------
+# Scenario 6 (issue #3590): install -> uninstall -> install on a repo with a
+# committed, customized .gitignore is byte-identical, and uninstall removes the
+# entire Loom-managed block (marker-delimited). This asserts the round-trip is
+# reversible at the byte level — the root cause #3589 only worked around.
+#
+# FAILS against pre-#3590 code: uninstall stripped a drifted 4-pattern subset +
+# reflowed blank lines, and init re-appended at EOF, so the block moved and
+# ~26 patterns were left behind.
+# --------------------------------------------------------------------------
+UNINSTALL_SCRIPT="$LOOM_ROOT/scripts/uninstall-loom.sh"
+R6="$TEST_DIR/roundtrip-byte-identical"
+git init -q "$R6"
+git -C "$R6" config user.email test@example.com
+git -C "$R6" config user.name "Test User"
+# A customized consumer .gitignore with intentional spacing and no Loom content.
+printf '# consumer rules\nnode_modules/\ntarget/\n\n*.log\ndist/\n' >"$R6/.gitignore"
+echo "hello" >"$R6/README.md"
+git -C "$R6" add -A
+git -C "$R6" commit -qm "init"
+# First install writes the marked Loom block; commit it as the baseline.
+"$INSTALL_SCRIPT" -y --quick "$R6" >/dev/null 2>&1
+git -C "$R6" add -A
+git -C "$R6" commit -qm "loom install" >/dev/null 2>&1
+cp "$R6/.gitignore" "$TEST_DIR/gi-baseline"
+
+# Sanity: the marked block exists after install.
+if grep -qxF "# >>> loom-managed (do not edit) >>>" "$R6/.gitignore" && \
+   grep -qxF "# <<< loom-managed <<<" "$R6/.gitignore"; then
+  pass "install writes a marker-delimited Loom block"
+else
+  fail "install did not write marker-delimited Loom block (#3590)"
+fi
+
+# install -> uninstall -> install (a second --quick reinstall runs uninstall+init
+# internally). With no user edits it must be a byte-for-byte no-op.
+"$INSTALL_SCRIPT" -y --quick "$R6" >/dev/null 2>&1
+if diff -q "$TEST_DIR/gi-baseline" "$R6/.gitignore" >/dev/null; then
+  pass ".gitignore is byte-identical after install -> uninstall -> install (#3590)"
+else
+  fail ".gitignore changed across the round-trip (not byte-stable — #3590)"
+  diff "$TEST_DIR/gi-baseline" "$R6/.gitignore" || true
+fi
+if git -C "$R6" diff --exit-code -- .gitignore >/dev/null 2>&1; then
+  pass "git diff shows no .gitignore movement after round-trip"
+else
+  fail "git diff shows .gitignore movement after round-trip (#3590)"
+fi
+
+# Uninstall alone must remove the ENTIRE Loom block (markers + all patterns),
+# leaving the user's consumer content (and its blank line) verbatim.
+"$UNINSTALL_SCRIPT" --yes --local "$R6" >/dev/null 2>&1 || true
+if [[ -f "$R6/.gitignore" ]]; then
+  if grep -q "loom-managed" "$R6/.gitignore" 2>/dev/null || \
+     grep -qxF ".loom/worktrees/" "$R6/.gitignore" 2>/dev/null || \
+     grep -qxF ".loom/logs/" "$R6/.gitignore" 2>/dev/null || \
+     grep -q "# Loom runtime state" "$R6/.gitignore" 2>/dev/null; then
+    fail "uninstall left residual Loom patterns in .gitignore (#3590)"
+  else
+    pass "uninstall removed the entire Loom-managed block (no residue)"
+  fi
+  if diff -q <(printf '# consumer rules\nnode_modules/\ntarget/\n\n*.log\ndist/\n') \
+       "$R6/.gitignore" >/dev/null; then
+    pass "uninstall preserved consumer content + spacing verbatim"
+  else
+    fail "uninstall mutated consumer content/spacing outside the block (#3590)"
+    diff <(printf '# consumer rules\nnode_modules/\ntarget/\n\n*.log\ndist/\n') "$R6/.gitignore" || true
+  fi
+else
+  fail "uninstall hard-deleted a .gitignore that still had consumer content (#3590)"
+fi
+echo ""
+
 echo "======================================"
 echo "Test Summary"
 echo "======================================"

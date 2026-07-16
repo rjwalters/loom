@@ -63,6 +63,81 @@ pub fn find_overbroad_loom_patterns(workspace_path: &Path) -> Vec<String> {
     found
 }
 
+/// Sentinel that opens the Loom-managed `.gitignore` block.
+///
+/// The managed block is delimited by [`GITIGNORE_BEGIN_MARKER`] and
+/// [`GITIGNORE_END_MARKER`] so that both `update_gitignore` (add/refresh) and
+/// `scripts/uninstall-loom.sh` (remove) operate on a single, self-locating,
+/// contiguous region. This mirrors the `<!-- BEGIN/END LOOM ORCHESTRATION -->`
+/// convention already used for CLAUDE.md. See issue #3590.
+pub const GITIGNORE_BEGIN_MARKER: &str = "# >>> loom-managed (do not edit) >>>";
+
+/// Sentinel that closes the Loom-managed `.gitignore` block.
+pub const GITIGNORE_END_MARKER: &str = "# <<< loom-managed <<<";
+
+/// Human-readable header emitted inside the managed block. Pre-#3590 installs
+/// wrote this same line as a bare (markerless) header; detecting it lets us
+/// migrate those installs to the marked form in place.
+const GITIGNORE_BLOCK_HEADER: &str = "# Loom runtime state (don't commit these)";
+
+/// Ephemeral/runtime files that should be ignored — the single source of truth
+/// for the Loom-managed `.gitignore` block.
+///
+/// Keep in sync with the Loom source repo's `.gitignore`.
+///
+/// Phase 3.5 (#3402, epic #3372): removed patterns for retired daemon-brain
+/// state files (`daemon-state.json`, archived `[0-9][0-9]-daemon-state.json`,
+/// `progress/`, `stuck-history.json`, `alerts.json`, `health-metrics.json`)
+/// and added `spawn-loop-state.json` for the Phase 1 spawn loop (#3374).
+pub const EPHEMERAL_PATTERNS: &[&str] = &[
+    ".loom-in-use",
+    ".loom-checkpoint",
+    ".loom/.daemon.pid",
+    ".loom/.daemon.log",
+    ".loom/daemon.sock",
+    ".loom/daemon-loop.pid",
+    ".loom/daemon-metrics.json",
+    ".loom/loom-source-path",
+    ".loom/spawn-loop-state.json",
+    ".loom/issue-failures.json",
+    ".loom/interventions/",
+    ".loom/worktrees/",
+    ".loom/state.json",
+    ".loom/mcp-command.json",
+    ".loom/activity.db",
+    ".loom/claims/",
+    ".loom/signals/",
+    ".loom/status/",
+    ".loom/retry-state/",
+    ".loom/diagnostics/",
+    ".loom/guide-docs-state.json",
+    ".loom/metrics_state.json",
+    ".loom/manifest.json",
+    ".loom/stuck-config.json",
+    ".loom/metrics/",
+    ".loom/usage-cache.json",
+    ".loom/claude-config/",
+    ".loom/*.log",
+    ".loom/*.sock",
+    ".loom/logs/",
+];
+
+/// Build the Loom-managed `.gitignore` block (marker lines + header + patterns),
+/// with no leading or trailing newline. Callers add surrounding newlines.
+fn managed_gitignore_block() -> String {
+    let mut block = String::new();
+    block.push_str(GITIGNORE_BEGIN_MARKER);
+    block.push('\n');
+    block.push_str(GITIGNORE_BLOCK_HEADER);
+    block.push('\n');
+    for pattern in EPHEMERAL_PATTERNS {
+        block.push_str(pattern);
+        block.push('\n');
+    }
+    block.push_str(GITIGNORE_END_MARKER);
+    block
+}
+
 /// Generate installation manifest by running verify-install.sh
 ///
 /// Attempts to run `.loom/scripts/verify-install.sh generate --quiet` to create
@@ -106,122 +181,70 @@ pub fn generate_manifest(workspace_path: &Path) {
 /// Creates .gitignore if it doesn't exist.
 pub fn update_gitignore(workspace_path: &Path) -> Result<(), String> {
     let gitignore_path = workspace_path.join(".gitignore");
+    let block = managed_gitignore_block();
 
-    // Ephemeral/runtime files that should be ignored.
-    // Keep in sync with the Loom source repo's .gitignore (lines 36–78).
-    //
-    // Phase 3.5 (#3402, epic #3372): removed patterns for retired daemon-brain
-    // state files (`daemon-state.json`, archived `[0-9][0-9]-daemon-state.json`,
-    // `progress/`, `stuck-history.json`, `alerts.json`, `health-metrics.json`)
-    // and added `spawn-loop-state.json` for the Phase 1 spawn loop (#3374).
-    let ephemeral_patterns = [
-        ".loom-in-use",
-        ".loom-checkpoint",
-        ".loom/.daemon.pid",
-        ".loom/.daemon.log",
-        ".loom/daemon.sock",
-        ".loom/daemon-loop.pid",
-        ".loom/daemon-metrics.json",
-        ".loom/loom-source-path",
-        ".loom/spawn-loop-state.json",
-        ".loom/issue-failures.json",
-        ".loom/interventions/",
-        ".loom/worktrees/",
-        ".loom/state.json",
-        ".loom/mcp-command.json",
-        ".loom/activity.db",
-        ".loom/claims/",
-        ".loom/signals/",
-        ".loom/status/",
-        ".loom/retry-state/",
-        ".loom/diagnostics/",
-        ".loom/guide-docs-state.json",
-        ".loom/metrics_state.json",
-        ".loom/manifest.json",
-        ".loom/stuck-config.json",
-        ".loom/metrics/",
-        ".loom/usage-cache.json",
-        ".loom/claude-config/",
-        ".loom/*.log",
-        ".loom/*.sock",
-        ".loom/logs/",
-    ];
-
-    // Legacy patterns that should be removed during migration.
-    // These overly broad patterns block config.json from being tracked.
-    let legacy_patterns_to_remove = [".loom/*.json", ".loom/config.json"];
-
-    if gitignore_path.exists() {
-        let contents = fs::read_to_string(&gitignore_path)
-            .map_err(|e| format!("Failed to read .gitignore: {e}"))?;
-
-        let mut new_contents = contents.clone();
-        let mut modified = false;
-
-        // Remove legacy patterns that block config.json from being tracked.
-        // Older installs and /imagine used `.loom/*.json` which is too broad.
-        for legacy in &legacy_patterns_to_remove {
-            // Remove lines that exactly match the legacy pattern (with optional trailing whitespace)
-            let filtered: Vec<&str> = new_contents
-                .lines()
-                .filter(|line| line.trim() != *legacy)
-                .collect();
-            let joined = filtered.join("\n");
-            // Preserve trailing newline
-            let joined = if new_contents.ends_with('\n') && !joined.ends_with('\n') {
-                format!("{joined}\n")
-            } else {
-                joined
-            };
-            if joined != new_contents {
-                new_contents = joined;
-                modified = true;
-            }
-        }
-
-        // Also remove negation patterns that were paired with the legacy *.json glob
-        let negation_legacy = "!.loom/roles/*.json";
-        let filtered: Vec<&str> = new_contents
-            .lines()
-            .filter(|line| line.trim() != negation_legacy)
-            .collect();
-        let joined = filtered.join("\n");
-        let joined = if new_contents.ends_with('\n') && !joined.ends_with('\n') {
-            format!("{joined}\n")
-        } else {
-            joined
-        };
-        if joined != new_contents {
-            new_contents = joined;
-            modified = true;
-        }
-
-        // Add ephemeral patterns if not present
-        for pattern in &ephemeral_patterns {
-            if !new_contents.contains(pattern) {
-                if !new_contents.ends_with('\n') {
-                    new_contents.push('\n');
-                }
-                new_contents.push_str(pattern);
-                new_contents.push('\n');
-                modified = true;
-            }
-        }
-
-        // Write back if we made changes
-        if modified {
-            fs::write(&gitignore_path, new_contents)
-                .map_err(|e| format!("Failed to write .gitignore: {e}"))?;
-        }
-    } else {
-        // Create .gitignore with ephemeral patterns
-        let mut loom_entries = String::from("# Loom runtime state (don't commit these)\n");
-        for pattern in &ephemeral_patterns {
-            loom_entries.push_str(pattern);
-            loom_entries.push('\n');
-        }
-        fs::write(&gitignore_path, loom_entries)
+    // Create a fresh .gitignore containing only the managed block.
+    if !gitignore_path.exists() {
+        fs::write(&gitignore_path, format!("{block}\n"))
             .map_err(|e| format!("Failed to create .gitignore: {e}"))?;
+        return Ok(());
+    }
+
+    let contents = fs::read_to_string(&gitignore_path)
+        .map_err(|e| format!("Failed to read .gitignore: {e}"))?;
+
+    // Split on '\n'. When the file ends with '\n', the trailing element is an
+    // empty string; joining back with '\n' reproduces the original bytes
+    // exactly, so line-vector edits are byte-preserving for untouched regions.
+    let mut lines: Vec<String> = contents.split('\n').map(str::to_string).collect();
+
+    // Remove legacy over-broad patterns that block config.json from being
+    // tracked (older installs and /imagine used `.loom/*.json`), plus the
+    // negation that was paired with that glob.
+    let legacy_overbroad = [".loom/*.json", ".loom/config.json", "!.loom/roles/*.json"];
+    lines.retain(|line| !legacy_overbroad.contains(&line.trim()));
+
+    let begin = lines
+        .iter()
+        .position(|l| l.trim() == GITIGNORE_BEGIN_MARKER);
+    let end = lines.iter().position(|l| l.trim() == GITIGNORE_END_MARKER);
+
+    let block_lines: Vec<String> = block.split('\n').map(str::to_string).collect();
+
+    match (begin, end) {
+        (Some(b), Some(e)) if b <= e => {
+            // Marked block already present: refresh it in place (patterns may
+            // have changed between versions) without moving it.
+            lines.splice(b..=e, block_lines.iter().cloned());
+        }
+        _ => {
+            // No marked block. Migrate any legacy markerless block by dropping
+            // the old header and any bare ephemeral pattern lines, then append
+            // the marked block at EOF (the one-time create-at-EOF path).
+            lines.retain(|line| {
+                let t = line.trim();
+                t != GITIGNORE_BLOCK_HEADER && !EPHEMERAL_PATTERNS.contains(&t)
+            });
+            // Drop exactly one trailing empty element (the file's final '\n')
+            // so the block is appended directly after the existing content with
+            // no spurious blank line. This makes the append the exact inverse of
+            // uninstall's marker-span deletion, so an install -> uninstall ->
+            // install round-trip is byte-identical (issue #3590).
+            if lines.last().is_some_and(String::is_empty) {
+                lines.pop();
+            }
+            for bl in &block_lines {
+                lines.push(bl.clone());
+            }
+            // Re-add exactly one trailing empty element => single trailing '\n'.
+            lines.push(String::new());
+        }
+    }
+
+    let new_contents = lines.join("\n");
+    if new_contents != contents {
+        fs::write(&gitignore_path, &new_contents)
+            .map_err(|e| format!("Failed to write .gitignore: {e}"))?;
     }
 
     Ok(())
@@ -522,5 +545,142 @@ mod tests {
 
         // Non-Loom content preserved
         assert!(contents.contains("node_modules/"));
+    }
+
+    /// Mimic `scripts/uninstall-loom.sh`'s marker-span deletion: drop every
+    /// line from the BEGIN marker through the END marker (inclusive).
+    fn remove_managed_block(contents: &str) -> String {
+        let mut out: Vec<&str> = Vec::new();
+        let mut in_block = false;
+        for line in contents.split('\n') {
+            if line.trim() == GITIGNORE_BEGIN_MARKER {
+                in_block = true;
+                continue;
+            }
+            if in_block {
+                if line.trim() == GITIGNORE_END_MARKER {
+                    in_block = false;
+                }
+                continue;
+            }
+            out.push(line);
+        }
+        out.join("\n")
+    }
+
+    #[test]
+    fn create_wraps_patterns_in_markers() {
+        let tmp = TempDir::new().unwrap();
+        update_gitignore(tmp.path()).unwrap();
+        let contents = fs::read_to_string(tmp.path().join(".gitignore")).unwrap();
+
+        assert!(contents.contains(GITIGNORE_BEGIN_MARKER), "missing BEGIN marker");
+        assert!(contents.contains(GITIGNORE_END_MARKER), "missing END marker");
+        // BEGIN must precede END, and each appears exactly once.
+        assert_eq!(contents.matches(GITIGNORE_BEGIN_MARKER).count(), 1);
+        assert_eq!(contents.matches(GITIGNORE_END_MARKER).count(), 1);
+        let b = contents.find(GITIGNORE_BEGIN_MARKER).unwrap();
+        let e = contents.find(GITIGNORE_END_MARKER).unwrap();
+        assert!(b < e, "BEGIN marker must precede END marker");
+        // Patterns live inside the block.
+        assert!(contents.contains(".loom/worktrees/"));
+    }
+
+    #[test]
+    fn in_place_update_does_not_move_or_duplicate_block() {
+        let tmp = TempDir::new().unwrap();
+        let gitignore = tmp.path().join(".gitignore");
+
+        // User content that already carries a marked block, followed by more
+        // user content AFTER the block (so an EOF re-append would reorder it).
+        fs::write(
+            &gitignore,
+            format!(
+                "node_modules/\n{block}\n# trailing user content\ndist/\n",
+                block = managed_gitignore_block()
+            ),
+        )
+        .unwrap();
+
+        update_gitignore(tmp.path()).unwrap();
+        let contents = fs::read_to_string(&gitignore).unwrap();
+
+        // Exactly one block, refreshed in place.
+        assert_eq!(contents.matches(GITIGNORE_BEGIN_MARKER).count(), 1);
+        assert_eq!(contents.matches(GITIGNORE_END_MARKER).count(), 1);
+        // Content after the block is untouched and still after the block.
+        let end_pos = contents.find(GITIGNORE_END_MARKER).unwrap();
+        let trailing_pos = contents.find("# trailing user content").unwrap();
+        assert!(trailing_pos > end_pos, "trailing user content must not move");
+        assert!(contents.contains("node_modules/"));
+        assert!(contents.contains("dist/"));
+    }
+
+    #[test]
+    fn roundtrip_is_byte_identical() {
+        // install -> uninstall -> install on a committed, customized .gitignore
+        // (whose Loom block is exactly what install produces) must be a no-op at
+        // the byte level. This is the core acceptance criterion of issue #3590.
+        let tmp = TempDir::new().unwrap();
+        let gitignore = tmp.path().join(".gitignore");
+
+        // A realistic consumer .gitignore.
+        fs::write(&gitignore, "# consumer rules\nnode_modules/\n__pycache__/\n.venv/\n*.log\n")
+            .unwrap();
+
+        // First install writes the managed block.
+        update_gitignore(tmp.path()).unwrap();
+        let after_install = fs::read_to_string(&gitignore).unwrap();
+        assert!(after_install.contains(GITIGNORE_BEGIN_MARKER));
+
+        // Simulate `uninstall-loom.sh` removing the marked span, then reinstall.
+        let after_uninstall = remove_managed_block(&after_install);
+        fs::write(&gitignore, &after_uninstall).unwrap();
+        update_gitignore(tmp.path()).unwrap();
+        let after_reinstall = fs::read_to_string(&gitignore).unwrap();
+
+        assert_eq!(
+            after_install, after_reinstall,
+            "install -> uninstall -> install must be byte-identical"
+        );
+
+        // And uninstall fully removes the Loom block (no residual patterns).
+        assert!(!after_uninstall.contains(GITIGNORE_BEGIN_MARKER));
+        assert!(!after_uninstall.contains(GITIGNORE_END_MARKER));
+        assert!(!after_uninstall.contains(".loom/worktrees/"));
+        assert!(!after_uninstall.contains("# Loom runtime state"));
+        // User content survives the uninstall verbatim.
+        assert_eq!(
+            after_uninstall,
+            "# consumer rules\nnode_modules/\n__pycache__/\n.venv/\n*.log\n"
+        );
+    }
+
+    #[test]
+    fn migrates_legacy_markerless_block_in_place() {
+        let tmp = TempDir::new().unwrap();
+        let gitignore = tmp.path().join(".gitignore");
+
+        // Pre-#3590 install: bare header + bare patterns, no markers.
+        fs::write(
+            &gitignore,
+            "node_modules/\n# Loom runtime state (don't commit these)\n\
+             .loom/state.json\n.loom/worktrees/\n.loom/*.log\n",
+        )
+        .unwrap();
+
+        update_gitignore(tmp.path()).unwrap();
+        let contents = fs::read_to_string(&gitignore).unwrap();
+
+        // Migrated to the marked form.
+        assert_eq!(contents.matches(GITIGNORE_BEGIN_MARKER).count(), 1);
+        assert_eq!(contents.matches(GITIGNORE_END_MARKER).count(), 1);
+        // No duplicate bare patterns outside the block.
+        assert_eq!(contents.matches(".loom/state.json").count(), 1);
+        assert_eq!(contents.matches(".loom/worktrees/").count(), 1);
+        // Now idempotent: a second run is a no-op.
+        update_gitignore(tmp.path()).unwrap();
+        let again = fs::read_to_string(&gitignore).unwrap();
+        assert_eq!(contents, again, "post-migration update must be idempotent");
     }
 }
