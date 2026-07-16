@@ -1005,41 +1005,88 @@ if [[ -f "$WORKTREE_ABS/.loom/CLAUDE.md" ]]; then
   success ".loom/CLAUDE.md removed"
 fi
 
-# Handle .gitignore - remove Loom-specific patterns
+# Handle .gitignore - remove the Loom-managed block
+#
+# Issue #3590: the Loom-managed region is delimited by sentinel markers written
+# by `update_gitignore` (loom-daemon/src/init/post_init.rs). Deleting the whole
+# marked span in one pass is the single source of truth — it removes every Loom
+# pattern (not a drifted 4-item subset) and never reflows user spacing outside
+# the block, so an install -> uninstall -> install round-trip is byte-stable.
+# The markers mirror the `<!-- BEGIN/END LOOM ORCHESTRATION -->` convention used
+# for CLAUDE.md above.
 if [[ -f "$WORKTREE_ABS/.gitignore" ]]; then
   info "Removing Loom patterns from .gitignore..."
 
   GITIGNORE="$WORKTREE_ABS/.gitignore"
 
-  # Loom-specific patterns to remove (exact matches)
-  LOOM_PATTERNS=(
-    ".loom/state.json"
-    ".loom/worktrees/"
-    ".loom/*.log"
-    ".loom/*.sock"
-    "# Loom - AI Development Orchestration"
-  )
+  # Keep these in sync with post_init.rs (GITIGNORE_BEGIN_MARKER / END_MARKER).
+  GITIGNORE_BEGIN_MARKER="# >>> loom-managed (do not edit) >>>"
+  GITIGNORE_END_MARKER="# <<< loom-managed <<<"
 
   MODIFIED=false
-  for pattern in "${LOOM_PATTERNS[@]}"; do
-    if grep -qF "$pattern" "$GITIGNORE" 2>/dev/null; then
-      # Remove the exact line
-      grep -vF "$pattern" "$GITIGNORE" > "${GITIGNORE}.tmp" || true
-      mv "${GITIGNORE}.tmp" "$GITIGNORE"
-      MODIFIED=true
-    fi
-  done
+
+  if grep -qxF "$GITIGNORE_BEGIN_MARKER" "$GITIGNORE" 2>/dev/null && \
+     grep -qxF "$GITIGNORE_END_MARKER" "$GITIGNORE" 2>/dev/null; then
+    # Marker-delimited block: delete BEGIN..END inclusive in a single pass.
+    # Exact-line matching (awk `$0==`) needs no regex escaping and leaves every
+    # other line — including user blank lines — byte-for-byte untouched.
+    awk -v b="$GITIGNORE_BEGIN_MARKER" -v e="$GITIGNORE_END_MARKER" '
+      $0 == b { inblock = 1; next }
+      inblock { if ($0 == e) inblock = 0; next }
+      { print }
+    ' "$GITIGNORE" > "${GITIGNORE}.tmp" && mv "${GITIGNORE}.tmp" "$GITIGNORE"
+    MODIFIED=true
+  else
+    # Backward-compat: legacy markerless installs (pre-#3590) wrote a header
+    # plus bare patterns. Remove the known headers and the full authoritative
+    # pattern set by exact whole-line match. This enumerated list exists ONLY
+    # for these legacy files; the marker path above is the source of truth for
+    # current installs. Blank lines are left as-is (no whole-file reflow).
+    LOOM_LEGACY_LINES=(
+      "# Loom runtime state (don't commit these)"
+      "# Loom - AI Development Orchestration"
+      ".loom-in-use"
+      ".loom-checkpoint"
+      ".loom/.daemon.pid"
+      ".loom/.daemon.log"
+      ".loom/daemon.sock"
+      ".loom/daemon-loop.pid"
+      ".loom/daemon-metrics.json"
+      ".loom/loom-source-path"
+      ".loom/spawn-loop-state.json"
+      ".loom/issue-failures.json"
+      ".loom/interventions/"
+      ".loom/worktrees/"
+      ".loom/state.json"
+      ".loom/mcp-command.json"
+      ".loom/activity.db"
+      ".loom/claims/"
+      ".loom/signals/"
+      ".loom/status/"
+      ".loom/retry-state/"
+      ".loom/diagnostics/"
+      ".loom/guide-docs-state.json"
+      ".loom/metrics_state.json"
+      ".loom/manifest.json"
+      ".loom/stuck-config.json"
+      ".loom/metrics/"
+      ".loom/usage-cache.json"
+      ".loom/claude-config/"
+      ".loom/*.log"
+      ".loom/*.sock"
+      ".loom/logs/"
+    )
+    for pattern in "${LOOM_LEGACY_LINES[@]}"; do
+      if grep -qxF "$pattern" "$GITIGNORE" 2>/dev/null; then
+        grep -vxF "$pattern" "$GITIGNORE" > "${GITIGNORE}.tmp" || true
+        mv "${GITIGNORE}.tmp" "$GITIGNORE"
+        MODIFIED=true
+      fi
+    done
+  fi
 
   if [[ "$MODIFIED" == "true" ]]; then
-    # Clean up consecutive blank lines left by removal
-    awk 'NF || prev_blank++ < 1 { print; if (NF) prev_blank=0 }' "$GITIGNORE" > "${GITIGNORE}.tmp"
-    mv "${GITIGNORE}.tmp" "$GITIGNORE"
-
-    # Remove trailing blank lines (awk equivalent, consistent with the
-    # consecutive-blank-line trim immediately above).
-    awk 'NF || prev_blank++ < 1 { print; if (NF) prev_blank=0 }' "$GITIGNORE" > "${GITIGNORE}.tmp" && mv "${GITIGNORE}.tmp" "$GITIGNORE"
-
-    # If file is now empty, remove it
+    # If file is now empty (or only whitespace), remove it
     if [[ ! -s "$GITIGNORE" ]] || ! grep -q '[^[:space:]]' "$GITIGNORE" 2>/dev/null; then
       rm -f "$GITIGNORE"
       REMOVED_LIST+=(".gitignore")
