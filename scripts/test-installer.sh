@@ -346,7 +346,7 @@ echo "Test 12b: Hook commands use \${CLAUDE_PROJECT_DIR} prefix"
 SETTINGS_FILE="$INSTALL_REPO/.claude/settings.json"
 if [[ -f "$SETTINGS_FILE" ]] && command -v jq &> /dev/null; then
   HOOK_PREFIX_FAIL=0
-  for hook_name in guard-destructive.sh skill-router.sh methodology-inject.sh; do
+  for hook_name in guard-destructive.sh guard-loom-workflow.sh skill-router.sh methodology-inject.sh; do
     # Collect every command in the settings.json that ends with this hook script.
     matches=$(jq -r --arg name "$hook_name" \
       '[.. | objects | select(.command? != null) | .command | select(endswith($name))][]' \
@@ -453,6 +453,18 @@ if [[ -f "$INSTALL_REPO/.loom/hooks/guard-destructive.sh" ]]; then
   fi
 else
   fail "guard-destructive.sh missing"
+fi
+
+# Test 16b: .loom/hooks/guard-loom-workflow.sh (issue #3604)
+echo "Test 16b: Install creates .loom/hooks/guard-loom-workflow.sh"
+if [[ -f "$INSTALL_REPO/.loom/hooks/guard-loom-workflow.sh" ]]; then
+  if [[ -x "$INSTALL_REPO/.loom/hooks/guard-loom-workflow.sh" ]]; then
+    pass "guard-loom-workflow.sh exists and is executable"
+  else
+    fail "guard-loom-workflow.sh exists but is not executable"
+  fi
+else
+  fail "guard-loom-workflow.sh missing"
 fi
 
 # Test 17: .loom/config.json
