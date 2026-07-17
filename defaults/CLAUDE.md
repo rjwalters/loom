@@ -1064,7 +1064,7 @@ Loom provides an opt-in methodology injection hook that automatically injects pr
 
 **Role context** (`roles/<role>.md`): Injected when the `LOOM_ROLE` environment variable matches the filename, or when a slash command (e.g., `/builder`) is detected in the prompt. Role names are case-insensitive.
 
-**Topic context** (`topics/<name>.md`): Injected when the prompt matches a keyword pattern. By default, the filename is used as the regex pattern (e.g., `security.md` matches prompts containing "security"). For custom patterns, create a sidecar `.pattern` file with a regex (e.g., `security.pattern` containing `security|auth|token|credential`).
+**Topic context** (`topics/<name>.md`): Injected when the prompt matches the topic keyword. By default the filename is matched as an **anchored** token — the topic name must appear either as a slash command (`/loom:<name>` or `/repo:<name>`) or as a standalone word that is not part of a flag or path segment. So `security.md` injects on "check the security model" or `/loom:security`, but a "release" topic does **not** inject on `cargo build --release` or `target/release`. For custom matching, create a sidecar `.pattern` file with a regex (e.g., `security.pattern` containing `security|auth|token|credential`); the sidecar overrides the filename fallback entirely.
 
 ### Configuration
 
