@@ -527,15 +527,30 @@ if [[ "$CLEAN_FIRST" == "true" ]]; then
   if [[ -d "$TARGET_PATH/.loom" ]]; then
     # Preserve uncommitted user changes before uninstall
     # The uninstall --local mode runs 'git add -A' which would stage user changes
-    # along with uninstall deletions, and our cleanup would discard them
+    # along with uninstall deletions, and our cleanup would discard them.
+    #
+    # Issue #3597: scope the stash to Loom-owned paths. The original unscoped
+    # `git stash push` swept sibling installers' uncommitted tracked changes
+    # into the stash (and the cleanup's `git checkout -- .` would otherwise
+    # revert them outright). Restrict to dirty ∩ (Loom ownership set +
+    # .gitignore); empty intersection → no stash.
+    # shellcheck source=scripts/install/stash-scope.sh
+    source "$LOOM_ROOT/scripts/install/stash-scope.sh"
     STASHED_USER_CHANGES=false
-    if ! git -C "$TARGET_PATH" diff --quiet 2>/dev/null || \
-       ! git -C "$TARGET_PATH" diff --staged --quiet 2>/dev/null; then
-      warning "Working tree has uncommitted changes"
-      info "Stashing user changes to preserve them during clean install..."
-      if git -C "$TARGET_PATH" stash push -m "loom-install: preserving user changes before --clean" 2>/dev/null; then
+    CLEAN_OWNED_DIRTY=()
+    while IFS= read -r _owned_path; do
+      [[ -n "$_owned_path" ]] && CLEAN_OWNED_DIRTY+=("$_owned_path")
+    done < <(_emit_loom_owned_dirty_paths "$LOOM_ROOT" "$TARGET_PATH")
+    if [[ ${#CLEAN_OWNED_DIRTY[@]} -gt 0 ]]; then
+      warning "Working tree has uncommitted Loom-owned changes"
+      info "Stashing Loom-owned changes to preserve them during clean install..."
+      if git -C "$TARGET_PATH" stash push \
+           -m "loom-install: preserving user changes before --clean" \
+           -- "${CLEAN_OWNED_DIRTY[@]}" 2>/dev/null; then
         STASHED_USER_CHANGES=true
-        success "User changes stashed"
+        CLEAN_STASH_REF="$(git -C "$TARGET_PATH" stash list 2>/dev/null | head -1)"
+        success "Loom-owned changes stashed → ${CLEAN_STASH_REF:-stash@{0}}"
+        info "  Stashed ${#CLEAN_OWNED_DIRTY[@]} Loom-owned path(s): ${CLEAN_OWNED_DIRTY[*]}"
       else
         warning "Failed to stash changes - uncommitted changes may be lost during --clean install"
         warning "Consider committing your changes first, then retry"
@@ -568,14 +583,26 @@ if [[ "$CLEAN_FIRST" == "true" ]]; then
 
     CLEANUP_FAILED=false
 
-    if ! git -C "$TARGET_PATH" restore --staged . 2>/dev/null; then
-      warning "Failed to unstage changes from uninstall"
-      CLEANUP_FAILED=true
-    fi
+    # Issue #3597: scope the unstage/checkout to Loom-owned dirty paths so
+    # sibling installers' uncommitted tracked changes (which were NOT stashed
+    # above) are never reverted. The uninstall only stages Loom-managed paths
+    # (#3450), so this intersection is exactly the set of staged deletions to
+    # undo and restore.
+    CLEANUP_PATHS=()
+    while IFS= read -r _owned_path; do
+      [[ -n "$_owned_path" ]] && CLEANUP_PATHS+=("$_owned_path")
+    done < <(_emit_loom_owned_dirty_paths "$LOOM_ROOT" "$TARGET_PATH")
 
-    if ! git -C "$TARGET_PATH" checkout -- . 2>/dev/null; then
-      warning "Failed to restore files from uninstall"
-      CLEANUP_FAILED=true
+    if [[ ${#CLEANUP_PATHS[@]} -gt 0 ]]; then
+      if ! git -C "$TARGET_PATH" restore --staged -- "${CLEANUP_PATHS[@]}" 2>/dev/null; then
+        warning "Failed to unstage changes from uninstall"
+        CLEANUP_FAILED=true
+      fi
+
+      if ! git -C "$TARGET_PATH" checkout -- "${CLEANUP_PATHS[@]}" 2>/dev/null; then
+        warning "Failed to restore files from uninstall"
+        CLEANUP_FAILED=true
+      fi
     fi
 
     # Also clean any untracked files left by the uninstall process
@@ -583,9 +610,10 @@ if [[ "$CLEAN_FIRST" == "true" ]]; then
     # that may contain custom project-specific commands not installed by Loom
     git -C "$TARGET_PATH" clean -fd .loom/ .codex/ .github/labels.yml 2>/dev/null || true
 
-    # Verify the working tree is clean
-    if ! git -C "$TARGET_PATH" diff --quiet 2>/dev/null || \
-       ! git -C "$TARGET_PATH" diff --staged --quiet 2>/dev/null; then
+    # Verify no Loom-owned path is still dirty. Scoped to the ownership set so
+    # legitimately-preserved sibling changes don't trip a false "not clean"
+    # warning (issue #3597).
+    if [[ -n "$(_emit_loom_owned_dirty_paths "$LOOM_ROOT" "$TARGET_PATH")" ]]; then
       CLEANUP_FAILED=true
     fi
 
@@ -604,13 +632,24 @@ if [[ "$CLEAN_FIRST" == "true" ]]; then
     fi
 
     # Restore stashed user changes
+    #
+    # Issue #3597: surface pop conflicts instead of silencing them with
+    # `2>/dev/null`. A conflicting pop (e.g. a Loom-managed file `init` also
+    # rewrote) previously hid the conflict and stranded the stash silently.
     if [[ "$STASHED_USER_CHANGES" == "true" ]]; then
       info "Restoring stashed user changes..."
-      if git -C "$TARGET_PATH" stash pop 2>/dev/null; then
+      if CLEAN_POP_OUTPUT="$(git -C "$TARGET_PATH" stash pop 2>&1)"; then
         success "User changes restored"
       else
+        CLEAN_STASH_REF="$(git -C "$TARGET_PATH" stash list 2>/dev/null | head -1 | cut -d: -f1)"
+        [[ -z "$CLEAN_STASH_REF" ]] && CLEAN_STASH_REF="stash@{0}"
         warning "Failed to restore stashed user changes automatically"
-        warning "Run 'git stash pop' in $TARGET_PATH to recover your changes"
+        echo ""
+        echo "  git stash pop reported:"
+        printf '%s\n' "$CLEAN_POP_OUTPUT" | sed 's/^/    /'
+        echo ""
+        echo "  Your changes are preserved in the stash ($CLEAN_STASH_REF)."
+        echo "  Recover with: cd $TARGET_PATH && git stash pop"
       fi
     fi
 

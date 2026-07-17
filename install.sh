@@ -618,14 +618,32 @@ elif [[ -d "$TARGET_PATH/.loom" ]]; then
   # first keeps a user's pre-existing staged/working changes from being caught
   # up in either step. The non-quick reinstall delegates to install-loom.sh,
   # which performs its own guarding, so it is intentionally left unstashed here.
+  #
+  # Issue #3597: scope the stash to Loom-owned paths. The original unscoped
+  # `git stash push` swept sibling installers' uncommitted tracked changes
+  # (.anvil/*, .claude/skills/repo/*, non-Loom CLAUDE.md sections, …) into the
+  # stash and left a half-old/half-new hybrid tree. Restrict the stash to the
+  # dirty ∩ (Loom ownership set + .gitignore) intersection so sibling changes
+  # are never touched. Empty intersection → no stash at all.
   REINSTALL_STASHED_USER_CHANGES=false
   if [[ "$INSTALL_TYPE" == "1" ]]; then
-    if ! git -C "$TARGET_PATH" diff --quiet 2>/dev/null || \
-       ! git -C "$TARGET_PATH" diff --staged --quiet 2>/dev/null; then
-      info "Stashing uncommitted user changes before reinstall..."
-      if git -C "$TARGET_PATH" stash push -m "loom-install: preserving user changes before --quick reinstall" 2>/dev/null; then
+    # shellcheck source=scripts/install/stash-scope.sh
+    source "$LOOM_ROOT/scripts/install/stash-scope.sh"
+    REINSTALL_OWNED_DIRTY=()
+    while IFS= read -r _owned_path; do
+      [[ -n "$_owned_path" ]] && REINSTALL_OWNED_DIRTY+=("$_owned_path")
+    done < <(_emit_loom_owned_dirty_paths "$LOOM_ROOT" "$TARGET_PATH")
+
+    if [[ ${#REINSTALL_OWNED_DIRTY[@]} -gt 0 ]]; then
+      info "Stashing uncommitted Loom-owned changes before reinstall..."
+      if git -C "$TARGET_PATH" stash push \
+           -m "loom-install: preserving user changes before --quick reinstall" \
+           -- "${REINSTALL_OWNED_DIRTY[@]}" 2>/dev/null; then
         REINSTALL_STASHED_USER_CHANGES=true
-        success "User changes stashed"
+        REINSTALL_STASH_REF="$(git -C "$TARGET_PATH" stash list 2>/dev/null | head -1)"
+        success "Loom-owned changes stashed → ${REINSTALL_STASH_REF:-stash@{0}}"
+        info "  Stashed ${#REINSTALL_OWNED_DIRTY[@]} Loom-owned path(s): ${REINSTALL_OWNED_DIRTY[*]}"
+        info "  Recover manually with: git -C \"$TARGET_PATH\" stash pop"
       else
         warning "Failed to stash user changes - continuing without stash"
         warning "Uncommitted changes may appear alongside the reinstall diff"
@@ -677,9 +695,20 @@ elif [[ -d "$TARGET_PATH/.loom" ]]; then
     # untracked-`??` entries instead of the real version-upgrade diff. Unstage
     # the uninstall's staged deletions so the working tree reflects only the
     # actual old→new file changes.
+    #
+    # Issue #3597: scope the unstage to Loom-owned paths so user-staged
+    # non-Loom changes (sibling installers, unrelated work) stay staged. The
+    # uninstall only stages Loom-managed paths (#3450), so the dirty ∩
+    # ownership intersection is exactly the set of staged deletions to undo.
     info "Reconciling git index after reinstall..."
-    git -C "$TARGET_PATH" restore --staged . 2>/dev/null || \
-      git -C "$TARGET_PATH" reset -q HEAD -- . 2>/dev/null || true
+    RECONCILE_PATHS=()
+    while IFS= read -r _owned_path; do
+      [[ -n "$_owned_path" ]] && RECONCILE_PATHS+=("$_owned_path")
+    done < <(_emit_loom_owned_dirty_paths "$LOOM_ROOT" "$TARGET_PATH")
+    if [[ ${#RECONCILE_PATHS[@]} -gt 0 ]]; then
+      git -C "$TARGET_PATH" restore --staged -- "${RECONCILE_PATHS[@]}" 2>/dev/null || \
+        git -C "$TARGET_PATH" reset -q HEAD -- "${RECONCILE_PATHS[@]}" 2>/dev/null || true
+    fi
 
     # Restore any user changes stashed before the uninstall (see above).
     #
