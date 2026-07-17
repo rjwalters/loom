@@ -633,6 +633,23 @@ elif [[ -d "$TARGET_PATH/.loom" ]]; then
     fi
   fi
 
+  # Issue #3598: snapshot the committed .loom/config.json before the chained
+  # uninstall deletes it. `config.json` is listed in uninstall-loom.sh's
+  # RUNTIME_ARTIFACTS and is removed from disk, but it is consumer configuration
+  # (e.g. a load-bearing `worktree.root` override), not a runtime artifact.
+  # Restoring the snapshot before `loom-daemon init` (below) lets the daemon's
+  # merge-aware config copy preserve consumer keys instead of regenerating the
+  # file from the template. Mirrors the #3588 .gitignore snapshot pattern.
+  # Standalone uninstall behavior is intentionally unchanged.
+  REINSTALL_CONFIG_SNAPSHOT=""
+  if [[ -f "$TARGET_PATH/.loom/config.json" ]]; then
+    REINSTALL_CONFIG_SNAPSHOT="$(mktemp 2>/dev/null || true)"
+    if [[ -n "$REINSTALL_CONFIG_SNAPSHOT" ]]; then
+      cp "$TARGET_PATH/.loom/config.json" "$REINSTALL_CONFIG_SNAPSHOT" 2>/dev/null || \
+        REINSTALL_CONFIG_SNAPSHOT=""
+    fi
+  fi
+
   # Uninstall existing installation (local mode, no separate PR)
   info "Uninstalling existing Loom installation..."
   "$LOOM_ROOT/scripts/uninstall-loom.sh" --yes --local "$TARGET_PATH" || \
@@ -659,9 +676,20 @@ elif [[ -d "$TARGET_PATH/.loom" ]]; then
     # fills CLAUDE.md correctly (issue #3502).
     prepare_loom_metadata_env "$LOOM_ROOT"
 
+    # Issue #3598: restore the snapshotted config.json before init so the
+    # daemon's merge-aware config copy sees the consumer's committed values
+    # (e.g. worktree.root) and preserves them in the merged result.
+    if [[ -n "$REINSTALL_CONFIG_SNAPSHOT" && -f "$REINSTALL_CONFIG_SNAPSHOT" ]]; then
+      mkdir -p "$TARGET_PATH/.loom"
+      cp "$REINSTALL_CONFIG_SNAPSHOT" "$TARGET_PATH/.loom/config.json" 2>/dev/null || true
+    fi
+
     # Run loom-daemon init
     "$LOOM_ROOT/target/release/loom-daemon" init --force --defaults "$LOOM_ROOT/defaults" "$TARGET_PATH" || \
       error "Installation failed"
+
+    # Clean up the config snapshot now that init has merged it into place.
+    [[ -n "$REINSTALL_CONFIG_SNAPSHOT" ]] && rm -f "$REINSTALL_CONFIG_SNAPSHOT" 2>/dev/null || true
 
     # Install hooks and CLI wrapper (not handled by loom-daemon init)
     install_hooks_and_cli "$LOOM_ROOT" "$TARGET_PATH"
