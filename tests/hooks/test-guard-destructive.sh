@@ -241,6 +241,31 @@ assert_ask() {
     fi
 }
 
+# Assert the guard asks AND the ask reason matches an extended regex.
+assert_ask_reason_matches() {
+    local description="$1"
+    local cmd="$2"
+    local pattern="$3"
+    local cwd="${4:-$REPO_ROOT}"
+    TOTAL=$((TOTAL + 1))
+
+    local output reason
+    output=$(run_guard "$cmd" "$cwd") || true
+    reason=$(echo "$output" | jq -r '.hookSpecificOutput.permissionDecisionReason // empty' 2>/dev/null)
+
+    if echo "$output" | jq -e '.hookSpecificOutput.permissionDecision == "ask"' >/dev/null 2>&1 && \
+       echo "$reason" | grep -qE "$pattern"; then
+        PASS=$((PASS + 1))
+        echo -e "  ${GREEN}PASS${NC}: $description"
+    else
+        FAIL=$((FAIL + 1))
+        echo -e "  ${RED}FAIL${NC}: $description"
+        echo -e "       Command: $cmd"
+        echo -e "       Expected: ask with reason matching /$pattern/"
+        echo -e "       Got: $output"
+    fi
+}
+
 # Assert the guard allows a command (no output, exit 0)
 assert_allow() {
     local description="$1"
@@ -552,43 +577,11 @@ assert_allow "Allow sky status (read-only)" \
 echo ""
 
 # =========================================================================
-echo -e "${YELLOW}--- pip install -e WORKTREE GUARD (issue #2495) ---${NC}"
+# NOTE: The pip-install-e worktree guard and the 'gh pr merge' redirect were
+# extracted into guard-loom-workflow.sh (issue #3604). Their assertions now live
+# in tests/hooks/test-guard-loom-workflow.sh. This suite covers only the generic
+# repository-hygiene guard.
 # =========================================================================
-
-# Should DENY editable installs when LOOM_WORKTREE_PATH is set
-assert_deny_in_worktree "Block pip install -e in worktree" \
-    "pip install -e ."
-
-assert_deny_in_worktree "Block pip install -e ./loom-tools in worktree" \
-    "pip install -e ./loom-tools"
-
-assert_deny_in_worktree "Block pip3 install -e in worktree" \
-    "pip3 install -e ."
-
-assert_deny_in_worktree "Block pip install --editable in worktree" \
-    "pip install --editable ."
-
-assert_deny_in_worktree "Block uv pip install -e in worktree" \
-    "uv pip install -e ./loom-tools"
-
-assert_deny_in_worktree "Block pip install -e with absolute path in worktree" \
-    "pip install -e /Users/dev/project/loom-tools"
-
-# Should ALLOW non-editable pip installs in worktree
-assert_allow_in_worktree "Allow pip install (non-editable) in worktree" \
-    "pip install pytest"
-
-assert_allow_in_worktree "Allow pip install -r requirements.txt in worktree" \
-    "pip install -r requirements.txt"
-
-# Should ALLOW editable installs outside worktrees (no LOOM_WORKTREE_PATH)
-assert_allow "Allow pip install -e outside worktree" \
-    "pip install -e ."
-
-assert_allow "Allow pip install -e ./loom-tools outside worktree" \
-    "pip install -e ./loom-tools"
-
-echo ""
 
 # =========================================================================
 echo -e "${YELLOW}--- SQL DDL/DML opt-out (guards.sqlDdl / LOOM_GUARD_SQL) ---${NC}"
@@ -691,6 +684,10 @@ assert_allow "Cloud: aws lambda list-functions is read-only (allow)" \
     "aws lambda list-functions"
 assert_allow "Cloud: aws ec2 get-console-output is read-only (allow)" \
     "aws ec2 get-console-output --instance-id i-1234"
+
+# --- Discoverability: the cloud ASK reason names the guards.cloudCli opt-out (#3604) ---
+assert_ask_reason_matches "Cloud: ask reason names guards.cloudCli opt-out (#3604)" \
+    "aws ec2 terminate-instances --instance-ids i-1234" "guards\.cloudCli"
 
 # --- Verb-narrowing: mutating aws subcommands still ask (default guard on) ---
 assert_ask "Cloud: aws ec2 run-instances asks" \

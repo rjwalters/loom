@@ -651,49 +651,18 @@ CLOUD_ASK_PATTERNS=(
 
 for pattern in "${CLOUD_ASK_PATTERNS[@]}"; do
     if echo "$COMMAND_NO_COMMENT" | grep -qE "$pattern" && cloud_guard_enabled; then
-        ask "Command requires confirmation: $COMMAND"
+        ask "Command requires confirmation: $COMMAND (set guards.cloudCli:false in .loom/config.json if this repo manages cloud infra as a first-class workflow)"
     fi
 done
 
 # =============================================================================
-# LOOM: Prefer merge-pr.sh over gh pr merge
+# NOTE: The two Loom-workflow-specific guards (the 'gh pr merge' → merge-pr.sh
+# redirect, and the 'pip install -e' worktree block keyed on LOOM_WORKTREE_PATH)
+# were extracted into guard-loom-workflow.sh (issue #3604). They are registered
+# as a separate PreToolUse/Bash hook and fire independently of this guard. This
+# file is the generic repository-hygiene guard, on its way to Repo Skills
+# (rjwalters/repo#13); the Loom-specific pair stays Loom-owned.
 # =============================================================================
-
-if echo "$COMMAND" | grep -qE 'gh\s+pr\s+merge'; then
-    # Resolve the merge-pr.sh path for the current repo context. Prefer an
-    # in-repo installed copy (./.loom/scripts/merge-pr.sh); fall back to the
-    # loom-checkout copy under defaults/scripts/ (via $LOOM_HOME) when the repo
-    # runs scripts directly from the checkout rather than an installed copy.
-    MERGE_SCRIPT="./.loom/scripts/merge-pr.sh"
-    if [[ -n "$REPO_ROOT" ]] && [[ ! -x "$REPO_ROOT/.loom/scripts/merge-pr.sh" ]]; then
-        if [[ -n "${LOOM_HOME:-}" ]] && [[ -x "$LOOM_HOME/defaults/scripts/merge-pr.sh" ]]; then
-            MERGE_SCRIPT="$LOOM_HOME/defaults/scripts/merge-pr.sh"
-        elif [[ -x "$REPO_ROOT/defaults/scripts/merge-pr.sh" ]]; then
-            MERGE_SCRIPT="$REPO_ROOT/defaults/scripts/merge-pr.sh"
-        fi
-    fi
-    deny "Use $MERGE_SCRIPT <PR_NUMBER> instead of 'gh pr merge'. The script merges via the GitHub API without local checkout, which avoids worktree errors."
-fi
-
-# =============================================================================
-# LOOM: Block pip install -e inside worktrees (issue #2495)
-#
-# Editable pip installs overwrite a global .pth file in site-packages.
-# When multiple builders run in parallel worktrees, each 'pip install -e .'
-# clobbers the .pth to point at its own worktree, causing all other Python
-# processes to import from the wrong source tree.
-#
-# PYTHONPATH is already set by agent-spawn.sh and _build_worktree_env()
-# so editable installs are unnecessary inside worktrees.
-# =============================================================================
-
-WORKTREE_PATH="${LOOM_WORKTREE_PATH:-}"
-if [[ -n "$WORKTREE_PATH" ]]; then
-    if echo "$COMMAND" | grep -qE '(pip|pip3|uv pip)\s+install\s+.*-e\s' || \
-       echo "$COMMAND" | grep -qE '(pip|pip3|uv pip)\s+install\s+.*--editable\s'; then
-        deny "BLOCKED: 'pip install -e' is not allowed inside worktrees. Editable installs overwrite the global .pth file, breaking parallel builders (see issue #2495). PYTHONPATH is already configured for this worktree — imports resolve correctly without editable installs."
-    fi
-fi
 
 # =============================================================================
 # ALLOW - Everything else passes through
