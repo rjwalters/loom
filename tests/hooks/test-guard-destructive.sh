@@ -803,6 +803,118 @@ done
 echo ""
 
 # =========================================================================
+echo -e "${YELLOW}--- Repo-scoped rm guard (guards.rmScope / LOOM_RM_SCOPE) (#3610) ---${NC}"
+# =========================================================================
+#
+# The guard ships with rmScope OFF: only catastrophic top-level targets deny,
+# every deeper subpath (in- OR out-of-repo) is allowed. Opt-in `repo` mode adds
+# an outside-repo deny with a built-in ephemeral allowlist (system temp dirs +
+# the Claude scratchpad). The 8-case matrix from the issue is asserted in BOTH
+# toggle states, plus worktree-root and env-override cases.
+#
+# NB: normalize_abs_path() is LEXICAL (no symlink resolution), so the allowlist
+# lists both /tmp and /private/tmp (and the /var/tmp, /var/folders pairs). These
+# temp-root cases pass in both toggle states — under OFF because a deep subpath
+# is always allowed, under repo because they are on the ephemeral allowlist.
+
+# ---- Matrix in the DEFAULT (off) state: unchanged permissive behaviour. ----
+# rmScope absent → off. Uses the real REPO_ROOT (loom checkout) as cwd.
+assert_allow "rmScope off: rm -f /tmp/x/foo.tsv allowed" \
+    "rm -f /tmp/x/foo.tsv" "$REPO_ROOT"
+assert_allow "rmScope off: rm -rf scratchpad path allowed" \
+    "rm -rf /private/tmp/claude-501/-Users-x/abc/scratchpad/z" "$REPO_ROOT"
+assert_allow "rmScope off: rm -rf \$TMPDIR /var/folders path allowed" \
+    "rm -rf /var/folders/ab/cd/T/tmp.123" "$REPO_ROOT"
+assert_deny "rmScope off: rm -rf bare /tmp still denied (top-level rule)" \
+    "rm -rf /tmp" "$REPO_ROOT"
+assert_deny "rmScope off: rm -rf / still denied (catastrophic rule)" \
+    "rm -rf /" "$REPO_ROOT"
+# The key backward-compat row: an outside-repo deep path is ALLOWED when off.
+assert_allow "rmScope off: rm -rf outside-repo path allowed (unchanged)" \
+    "rm -rf /opt/some-vendor/important" "$REPO_ROOT"
+assert_allow "rmScope off: rm -rf under repo root allowed" \
+    "rm -rf $REPO_ROOT/.loom/tmp/x" "$REPO_ROOT"
+assert_allow "rmScope off: rm -rf external worktree-root path allowed (deep path)" \
+    "rm -rf /Volumes/scratch/wt/foo/issue-5/x" "$REPO_ROOT"
+
+# Explicit guards.rmScope:"off" behaves identically to absent.
+RMSCOPE_OFF_REPO=$(make_sql_repo '{"guards":{"rmScope":"off"}}')
+assert_allow "rmScope config-off: outside-repo path allowed" \
+    "rm -rf /opt/some-vendor/important" "$RMSCOPE_OFF_REPO"
+assert_deny "rmScope config-off: bare /tmp still denied" \
+    "rm -rf /tmp" "$RMSCOPE_OFF_REPO"
+
+# ---- Matrix in the repo (on) state, driven by the env toggle. ----
+assert_allow_env "rmScope repo: rm -f /tmp/x/foo.tsv allowed (ephemeral)" \
+    "LOOM_RM_SCOPE=repo" "rm -f /tmp/x/foo.tsv" "$REPO_ROOT"
+assert_allow_env "rmScope repo: scratchpad path allowed (ephemeral)" \
+    "LOOM_RM_SCOPE=repo" "rm -rf /private/tmp/claude-501/-Users-x/abc/scratchpad/z" "$REPO_ROOT"
+assert_allow_env "rmScope repo: \$TMPDIR /var/folders path allowed (ephemeral)" \
+    "LOOM_RM_SCOPE=repo" "rm -rf /var/folders/ab/cd/T/tmp.123" "$REPO_ROOT"
+assert_deny_env "rmScope repo: bare /tmp denied (top-level rule)" \
+    "LOOM_RM_SCOPE=repo" "rm -rf /tmp" "$REPO_ROOT"
+assert_deny_env "rmScope repo: / denied (catastrophic rule)" \
+    "LOOM_RM_SCOPE=repo" "rm -rf /" "$REPO_ROOT"
+# The new row: an outside-repo deep path is now DENIED under repo mode.
+assert_deny_env "rmScope repo: outside-repo path denied (NEW)" \
+    "LOOM_RM_SCOPE=repo" "rm -rf /opt/some-vendor/important" "$REPO_ROOT"
+assert_deny_env "rmScope repo: outside-repo /Users path denied (NEW)" \
+    "LOOM_RM_SCOPE=repo" "rm -rf /Users/someone/important" "$REPO_ROOT"
+assert_allow_env "rmScope repo: under repo root allowed" \
+    "LOOM_RM_SCOPE=repo" "rm -rf $REPO_ROOT/.loom/tmp/x" "$REPO_ROOT"
+assert_allow_env "rmScope repo: relative subpath under repo allowed" \
+    "LOOM_RM_SCOPE=repo" "rm -rf build-artifacts/tmp/x" "$REPO_ROOT"
+
+# Prefix-boundary precision: /tmpfoo is NOT admitted by the /tmp/ allowlist
+# entry (the trailing slash prevents a name-prefix sibling from slipping in).
+assert_deny_env "rmScope repo: /tmpfoo/x denied (not the /tmp/ allowlist prefix)" \
+    "LOOM_RM_SCOPE=repo" "rm -rf /tmpfoo/x" "$REPO_ROOT"
+
+# ---- Worktree-root cases (configured external volume + env override). ----
+# Configured worktree.root in .loom/config.json admits its subtree. The temp
+# repo's basename namespaces the resolved root (mirrors loom_worktree_root()).
+RMSCOPE_WT_REPO=$(make_sql_repo '{"guards":{"rmScope":"repo"},"worktree":{"root":"/Volumes/scratch/loom-wt"}}')
+RMSCOPE_WT_BN=$(basename "$RMSCOPE_WT_REPO")
+assert_allow "rmScope repo: configured external worktree.root subtree allowed" \
+    "rm -rf /Volumes/scratch/loom-wt/$RMSCOPE_WT_BN/issue-5/foo" "$RMSCOPE_WT_REPO"
+assert_deny "rmScope repo: path outside configured worktree.root still denied" \
+    "rm -rf /Volumes/other/loom-wt/$RMSCOPE_WT_BN/issue-5/foo" "$RMSCOPE_WT_REPO"
+
+# LOOM_WORKTREE_ROOT env override wins over config default. Config enables
+# rmScope; the single env slot carries the worktree-root override.
+RMSCOPE_ENVWT_REPO=$(make_sql_repo '{"guards":{"rmScope":"repo"}}')
+RMSCOPE_ENVWT_BN=$(basename "$RMSCOPE_ENVWT_REPO")
+assert_allow_env "rmScope repo: LOOM_WORKTREE_ROOT env override admits external worktree" \
+    "LOOM_WORKTREE_ROOT=/Volumes/ext/wt" "rm -rf /Volumes/ext/wt/$RMSCOPE_ENVWT_BN/issue-9/x" "$RMSCOPE_ENVWT_REPO"
+
+# ---- Env-overrides-config for the toggle itself. ----
+RMSCOPE_ON_REPO=$(make_sql_repo '{"guards":{"rmScope":"repo"}}')
+# Config repo + no env → outside-repo denied.
+assert_deny "rmScope config-on: outside-repo path denied" \
+    "rm -rf /opt/some-vendor/important" "$RMSCOPE_ON_REPO"
+# LOOM_RM_SCOPE=off overrides config repo → back to permissive (outside allowed).
+assert_allow_env "rmScope: LOOM_RM_SCOPE=off overrides config repo (outside allowed)" \
+    "LOOM_RM_SCOPE=off" "rm -rf /opt/some-vendor/important" "$RMSCOPE_ON_REPO"
+
+# ---- Malformed config falls through to OFF (no behaviour change). ----
+RMSCOPE_BAD_REPO=$(make_sql_repo '{ this is not valid json ')
+assert_allow "rmScope malformed-config: outside-repo path allowed (falls through to off)" \
+    "rm -rf /opt/some-vendor/important" "$RMSCOPE_BAD_REPO"
+
+# ---- Repo mode must NOT weaken unrelated guards. ----
+assert_deny_env "rmScope repo: force-push to main still blocked" \
+    "LOOM_RM_SCOPE=repo" "git push --force origin main" "$REPO_ROOT"
+assert_deny_env "rmScope repo: gh repo delete still blocked" \
+    "LOOM_RM_SCOPE=repo" "gh repo delete myrepo --yes" "$REPO_ROOT"
+
+# Clean up rm-scope temp repos.
+for _rmscope_dir in "$RMSCOPE_OFF_REPO" "$RMSCOPE_WT_REPO" "$RMSCOPE_ENVWT_REPO" "$RMSCOPE_ON_REPO" "$RMSCOPE_BAD_REPO"; do
+    [[ -n "$_rmscope_dir" && "$_rmscope_dir" != "/" && -d "$_rmscope_dir/.loom" ]] && rm -rf "$_rmscope_dir"
+done
+
+echo ""
+
+# =========================================================================
 echo -e "${YELLOW}--- #3553 matching-precision: false positives now ALLOWED ---${NC}"
 # =========================================================================
 
