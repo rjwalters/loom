@@ -160,6 +160,79 @@ cloud_guard_enabled() {
     [[ "$_CLOUD_GUARD_CACHE" == "true" ]]
 }
 
+# =============================================================================
+# rm-scope repo mode toggle — default OFF (opt-in).
+#
+# By default this guard blocks only catastrophic rm targets (root, $HOME, and
+# bare top-level dirs) and ALLOWS every deeper subpath — including subpaths
+# OUTSIDE the repo (e.g. `rm -rf /Users/someone/important`). That permissive
+# default ships unchanged so existing installs see zero behaviour change.
+#
+# Opt-in `repo` mode (guards.rmScope:"repo" / LOOM_RM_SCOPE=repo) additionally
+# DENIES any rm target that is neither under the repo / worktree areas nor on a
+# built-in ephemeral allowlist (system temp dirs + the Claude scratchpad). The
+# catastrophic top-level deny stays unconditional in BOTH modes, so bare /tmp
+# and / are still blocked.
+#
+# Resolution order (highest precedence first):
+#   1. LOOM_RM_SCOPE env var (repo enables; off/0/no disables). Overrides config.
+#   2. .loom/config.json  ->  guards.rmScope == "repo"  (else off)
+#   3. Default: off (permissive, current behaviour)
+#
+# Mirrors sql_guard_enabled() / cloud_guard_enabled(): cached in
+# _RM_SCOPE_CACHE, invoked LAZILY only after a candidate rm target survives the
+# catastrophic check, so the jq config read never touches the hot path for
+# non-rm commands. The config read is best-effort: any parse failure falls
+# through to OFF (no behaviour change) and never trips the ERR trap.
+# =============================================================================
+_RM_SCOPE_CACHE=""
+rm_scope_repo_enabled() {
+    if [[ -z "$_RM_SCOPE_CACHE" ]]; then
+        local mode=off
+        if [[ -n "$REPO_ROOT" && -f "$REPO_ROOT/.loom/config.json" ]]; then
+            # Only an explicit guards.rmScope == "repo" enables the mode; any
+            # other value, a missing key, or malformed JSON stays OFF (the jq
+            # non-zero exit is caught by the `||` fallback).
+            mode=$(jq -r 'if .guards.rmScope == "repo" then "repo" else "off" end' "$REPO_ROOT/.loom/config.json" 2>/dev/null) || mode=off
+            [[ -n "$mode" ]] || mode=off
+        fi
+        # Env override wins over config.
+        case "${LOOM_RM_SCOPE:-}" in
+            repo)         mode=repo ;;
+            off|0|no)     mode=off ;;
+        esac
+        _RM_SCOPE_CACHE="$mode"
+    fi
+    [[ "$_RM_SCOPE_CACHE" == "repo" ]]
+}
+
+# Resolve the Loom worktree base dir for repo-scope checks. Mirrors the
+# precedence of loom_worktree_root() in defaults/scripts/lib/worktree-root.sh
+# (env -> config -> default), replicated inline so the hook stays
+# self-contained and best-effort: any failure falls back to the default in-repo
+# path and never fails the hook. Only called in repo mode, once per rm scan.
+resolve_worktree_root() {
+    local repo_root="$1"
+    [[ -z "$repo_root" ]] && return 0
+    # 1. Env override (highest priority); must be absolute.
+    if [[ -n "${LOOM_WORKTREE_ROOT:-}" && "$LOOM_WORKTREE_ROOT" == /* ]]; then
+        printf '%s/%s' "${LOOM_WORKTREE_ROOT%/}" "$(basename "$repo_root")"
+        return 0
+    fi
+    # 2. Config key .loom/config.json -> worktree.root (absolute only).
+    local config_file="$repo_root/.loom/config.json"
+    if [[ -f "$config_file" ]]; then
+        local cfg_root
+        cfg_root=$(jq -r '.worktree.root? // empty' "$config_file" 2>/dev/null) || cfg_root=""
+        if [[ -n "$cfg_root" && "$cfg_root" == /* ]]; then
+            printf '%s/%s' "${cfg_root%/}" "$(basename "$repo_root")"
+            return 0
+        fi
+    fi
+    # 3. Default — in-repo worktrees dir.
+    printf '%s/.loom/worktrees' "$repo_root"
+}
+
 # Helper: output a deny decision and exit
 deny() {
     local reason="$1"
@@ -537,6 +610,63 @@ if echo "$COMMAND" | grep -qE 'rm[[:space:]]+-[a-zA-Z]*[rf]'; then
                [[ -n "$HOME" && "$ABS_PATH" == "$HOME" ]] || \
                [[ "$ABS_PATH" =~ ^/[^/]+$ ]]; then
                 deny "BLOCKED: rm on protected system path: $ABS_PATH"
+            fi
+
+            # Opt-in repo-scoped strict mode (guards.rmScope:"repo" /
+            # LOOM_RM_SCOPE=repo). The catastrophic top-level deny above stays
+            # unconditional; here we additionally DENY any target that is
+            # neither under the repo / worktree areas nor on the built-in
+            # ephemeral allowlist. Default OFF preserves the permissive
+            # behaviour byte-for-byte (rm_scope_repo_enabled() returns false).
+            if rm_scope_repo_enabled; then
+                IN_SCOPE=false
+
+                # Repo + worktree areas. Prefix matches carry a trailing slash
+                # (or match the dir itself) so a sibling dir sharing a name
+                # prefix — e.g. "<repo>-sibling" vs "<repo>" — is NOT admitted.
+                if [[ -n "$REPO_ROOT" ]]; then
+                    if [[ "$ABS_PATH" == "$REPO_ROOT" || "$ABS_PATH" == "$REPO_ROOT"/* ]]; then
+                        IN_SCOPE=true
+                    fi
+                    # The default in-repo worktrees dir is always in scope, even
+                    # when an external worktree.root / LOOM_WORKTREE_ROOT is set.
+                    if [[ "$IN_SCOPE" == false ]] && \
+                       { [[ "$ABS_PATH" == "$REPO_ROOT/.loom/worktrees" || "$ABS_PATH" == "$REPO_ROOT/.loom/worktrees"/* ]]; }; then
+                        IN_SCOPE=true
+                    fi
+                    # Configured/overridden worktree root (external volumes).
+                    if [[ "$IN_SCOPE" == false ]]; then
+                        if [[ -z "${_WT_ROOT+x}" ]]; then
+                            _WT_ROOT=$(resolve_worktree_root "$REPO_ROOT")
+                        fi
+                        if [[ -n "$_WT_ROOT" ]] && \
+                           { [[ "$ABS_PATH" == "$_WT_ROOT" || "$ABS_PATH" == "$_WT_ROOT"/* ]]; }; then
+                            IN_SCOPE=true
+                        fi
+                    fi
+                fi
+
+                # Built-in ephemeral allowlist: system temp roots + the Claude
+                # scratchpad. normalize_abs_path() is LEXICAL — it does NOT
+                # resolve symlinks — so on macOS both the symlink form (/tmp,
+                # /var/tmp, /var/folders) AND its /private target must be listed.
+                # A bare temp root (/tmp, /private/tmp, …) is NOT matched here:
+                # those have no trailing component, so the catastrophic
+                # top-level deny above already handled bare /tmp, and a bare
+                # /private/tmp falls through to the out-of-scope deny.
+                if [[ "$IN_SCOPE" == false ]]; then
+                    case "$ABS_PATH" in
+                        /tmp/*|/private/tmp/*|\
+                        /var/tmp/*|/private/var/tmp/*|\
+                        /var/folders/*|/private/var/folders/*|\
+                        */claude-*/*/scratchpad/*)
+                            IN_SCOPE=true ;;
+                    esac
+                fi
+
+                if [[ "$IN_SCOPE" == false ]]; then
+                    deny "BLOCKED: rm target outside repo scope (LOOM_RM_SCOPE=repo): $ABS_PATH"
+                fi
             fi
         fi
     done

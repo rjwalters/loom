@@ -904,7 +904,7 @@ If setup fails, it's usually due to:
 
 Loom ships with two built-in Bash `PreToolUse` guard hooks, both registered under the `Bash` matcher and firing independently:
 
-- **`guard-destructive.sh`** — the generic repository-hygiene guard: catastrophic denies (`rm -rf /`, force-push to `main`, `gh repo delete`, fork bombs, curl-pipe-to-shell, cloud/SQL destruction), the segment-parsed lifecycle/cloud-CLI checks, and the `guards.sqlDdl` / `guards.cloudCli` toggle machinery. Nothing about this guard is Loom-specific; it is slated to move to Repo Skills (companion issue [rjwalters/repo#13](https://github.com/rjwalters/repo/issues/13)), which will own the generic half once it ships. Until then it keeps shipping and working in Loom exactly as before.
+- **`guard-destructive.sh`** — the generic repository-hygiene guard: catastrophic denies (`rm -rf /`, force-push to `main`, `gh repo delete`, fork bombs, curl-pipe-to-shell, cloud/SQL destruction), the segment-parsed lifecycle/cloud-CLI checks, and the `guards.sqlDdl` / `guards.cloudCli` / `guards.rmScope` toggle machinery. Nothing about this guard is Loom-specific; it is slated to move to Repo Skills (companion issue [rjwalters/repo#13](https://github.com/rjwalters/repo/issues/13)), which will own the generic half once it ships. Until then it keeps shipping and working in Loom exactly as before.
 - **`guard-loom-workflow.sh`** — the thin, Loom-workflow-specific guard (issue #3604): the `gh pr merge` → `merge-pr.sh` redirect and the `pip install -e` worktree block (keyed on `LOOM_WORKTREE_PATH`, issue #2495). These two guards are specific to the Loom worktree/merge workflow and stay Loom-owned.
 
 You can also add project-specific guards to protect read-only directories from accidental edits (see below).
@@ -977,6 +977,58 @@ LOOM_GUARD_CLOUD=0 aws ec2 terminate-instances --instance-ids i-1234
 
 # Force the cloud guard on for one command even when the repo opts out
 LOOM_GUARD_CLOUD=1 aws ec2 terminate-instances --instance-ids i-1234
+```
+
+### Repo-Scoped rm Guard (`guards.rmScope` / `LOOM_RM_SCOPE`)
+
+By default, `guard-destructive.sh` blocks only **catastrophic** `rm -rf` targets — root (`/`), the user's `$HOME`, and any bare top-level directory (`/tmp`, `/var`, `/etc`, …). Every deeper subpath is allowed, **including subpaths outside the repository** (e.g. `rm -rf /Users/someone/important`). This permissive default is intentional and ships unchanged.
+
+Repos that want a tighter blast radius can opt in to **`repo` mode**, which additionally denies any `rm -rf` target that is neither inside the repo/worktree areas nor on a built-in **ephemeral allowlist**. The catastrophic top-level deny stays active in both modes, so bare `/tmp` and `/` are always blocked.
+
+The rm-scope guard is **off by default**. It is resolved in this order (highest precedence first):
+
+1. **`LOOM_RM_SCOPE` env var** — `repo` enables repo mode; `off`/`0`/`no` (or unset) disables it. Overrides the config value.
+2. **`.loom/config.json`** — `guards.rmScope` (default absent = off). Set it to `"repo"` to enable:
+   ```json
+   {
+     "guards": {
+       "rmScope": "repo"
+     }
+   }
+   ```
+3. **Default** — off (current permissive behavior, byte-for-byte).
+
+The config read is best-effort: a missing, empty, or malformed `.loom/config.json` falls through to **off** (no behavior change) and never causes the hook to exit non-zero. Enabling repo mode does not weaken any other guard.
+
+**In-scope targets** (allowed under `repo` mode):
+
+- Anything under the **repo root** (resolved from the command's `cwd`).
+- Anything under the **worktree root** — resolved with the same precedence as `loom_worktree_root()`: `LOOM_WORKTREE_ROOT` env → `.loom/config.json → worktree.root` → the default `<repo>/.loom/worktrees`. This admits an external scratch volume (e.g. `worktree.root: "/Volumes/scratch/wt"`).
+- The **ephemeral allowlist**: system temp roots and the Claude scratchpad.
+
+**Ephemeral allowlist prefixes**. `normalize_abs_path()` is **lexical only** — it does **not** resolve symlinks — so on macOS each temp root is listed in **both** its symlink form and its `/private` target:
+
+| Symlink form | `/private` target |
+|--------------|-------------------|
+| `/tmp/…` | `/private/tmp/…` |
+| `/var/tmp/…` | `/private/var/tmp/…` |
+| `/var/folders/…` (`$TMPDIR`) | `/private/var/folders/…` |
+
+Plus the Claude scratchpad glob `*/claude-*/*/scratchpad/*`. A **bare** temp root (`/tmp`, `/private/tmp`, …) is never admitted here — bare `/tmp` is already caught by the catastrophic top-level deny, and prefix matches carry a trailing `/` so a name-prefix sibling like `/tmpfoo/x` is **not** admitted by the `/tmp/` entry.
+
+**Examples**:
+
+```bash
+# Opt in for a whole repo
+#   .loom/config.json  ->  { "guards": { "rmScope": "repo" } }
+
+# One-off: strict scope for a single command
+LOOM_RM_SCOPE=repo rm -rf /Users/someone/important   # DENIED (outside repo)
+LOOM_RM_SCOPE=repo rm -rf /tmp/build-cache/x          # allowed (ephemeral)
+LOOM_RM_SCOPE=repo rm -rf ./dist                      # allowed (under repo)
+
+# Env override wins over config — force OFF even when the repo opts in
+LOOM_RM_SCOPE=off rm -rf /Users/someone/scratch       # allowed (guard disabled)
 ```
 
 ### Protecting Read-Only Directories
