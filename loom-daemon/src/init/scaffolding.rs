@@ -48,10 +48,15 @@ pub const LOOM_SECTION_END: &str = "<!-- END LOOM ORCHESTRATION -->";
 
 /// The short pointer injected into root CLAUDE.md (between section markers).
 ///
-/// The full Loom guide is written to `.loom/CLAUDE.md` in the target repo.
-/// Claude Code auto-discovers `.loom/CLAUDE.md` when agents work in
-/// `.loom/worktrees/issue-N/` via ancestor directory traversal.
-pub const LOOM_ROOT_POINTER: &str = "This repository uses [Loom](https://github.com/rjwalters/loom) for AI-powered development orchestration. See `.loom/CLAUDE.md` for the full guide (roles, labels, worktrees, configuration).";
+/// This block is committed to the consumer repo, so its authoritative reference
+/// is the always-present Loom repository URL — never the install-generated
+/// `.loom/CLAUDE.md`, which may be gitignored or absent in a fresh clone / CI
+/// checkout (issue #3612). Loom additionally writes a locally-substituted copy
+/// of the full guide to `.loom/CLAUDE.md` at install time; Claude Code
+/// auto-discovers that local copy when agents work in `.loom/worktrees/issue-N/`
+/// via ancestor directory traversal, so the auto-discovery behaviour is
+/// unaffected by this wording.
+pub const LOOM_ROOT_POINTER: &str = "This repository uses [Loom](https://github.com/rjwalters/loom) for AI-powered development orchestration — see the Loom repository for the full guide (roles, labels, worktrees, configuration). When installed, Loom also writes a locally-substituted copy of that guide to `.loom/CLAUDE.md`.";
 
 /// Wrap Loom content in section markers
 pub fn wrap_loom_content(content: &str) -> String {
