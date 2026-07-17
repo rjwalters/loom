@@ -2235,6 +2235,73 @@ fi
 echo ""
 
 
+# Test 65: Reinstall preserves consumer config.json keys (worktree.root) (#3598)
+# A committed .loom/config.json carrying a `worktree.root` override must retain
+# that key when the merge-aware daemon init runs over an existing consumer file
+# (the reinstall path snapshots/restores config.json around the chained
+# uninstall so init's merge sees it). This exercises the REAL `loom-daemon init`
+# — the merge lives in loom-daemon::init::merge_config_file, which
+# simulate_loom_install's bare `cp` does not cover. Also asserts idempotency:
+# a second init leaves config.json byte-identical.
+echo "Test 65: Reinstall preserves consumer config.json worktree.root override (#3598)"
+DAEMON_BIN_65="$LOOM_ROOT/target/release/loom-daemon"
+if [[ ! -x "$DAEMON_BIN_65" ]]; then
+  warn "Skipping Test 65 — loom-daemon release binary not built at $DAEMON_BIN_65"
+else
+  CONFIG_MERGE_REPO="$TEST_DIR/config-merge-test"
+  create_temp_repo "$CONFIG_MERGE_REPO"
+
+  # Seed a committed consumer config.json with a load-bearing worktree.root
+  # override plus an unknown consumer key, before Loom is installed.
+  mkdir -p "$CONFIG_MERGE_REPO/.loom"
+  cat > "$CONFIG_MERGE_REPO/.loom/config.json" <<'CFG_EOF'
+{
+  "version": "2",
+  "worktree": { "root": "/Volumes/Stripe" },
+  "customConsumerKey": "keep-me"
+}
+CFG_EOF
+
+  if "$DAEMON_BIN_65" init --force --defaults "$LOOM_ROOT/defaults" "$CONFIG_MERGE_REPO" >/dev/null 2>&1; then
+    MERGED_CFG="$CONFIG_MERGE_REPO/.loom/config.json"
+
+    # The worktree.root override must survive the merge.
+    if grep -q '/Volumes/Stripe' "$MERGED_CFG"; then
+      pass "worktree.root override preserved through merge-aware init (#3598)"
+    else
+      fail "worktree.root override was dropped by init (#3598 regression)"
+    fi
+
+    # An unknown consumer key must survive too (deep merge, existing wins).
+    if grep -q 'customConsumerKey' "$MERGED_CFG"; then
+      pass "unknown consumer key preserved through merge-aware init (#3598)"
+    else
+      fail "unknown consumer key was dropped by init (#3598 regression)"
+    fi
+
+    # Newly shipped template keys must still be delivered on upgrade.
+    if grep -q 'health_monitoring' "$MERGED_CFG"; then
+      pass "template keys still delivered alongside preserved consumer keys (#3598)"
+    else
+      fail "template keys missing after merge (#3598)"
+    fi
+
+    # Idempotency: a second init must leave config.json byte-identical.
+    CFG_AFTER_FIRST="$(cat "$MERGED_CFG")"
+    "$DAEMON_BIN_65" init --force --defaults "$LOOM_ROOT/defaults" "$CONFIG_MERGE_REPO" >/dev/null 2>&1 || true
+    CFG_AFTER_SECOND="$(cat "$MERGED_CFG")"
+    if [[ "$CFG_AFTER_FIRST" == "$CFG_AFTER_SECOND" ]]; then
+      pass "config.json merge is idempotent across repeat reinstalls (#3598)"
+    else
+      fail "config.json changed on a second reinstall (non-idempotent merge, #3598)"
+    fi
+  else
+    fail "loom-daemon init failed against consumer repo with pre-existing config.json (#3598)"
+  fi
+fi
+echo ""
+
+
 # ==========================================================================
 # Summary
 # ==========================================================================
