@@ -738,6 +738,28 @@ elif [[ -d "$TARGET_PATH/.loom" ]]; then
         git -C "$TARGET_PATH" reset -q HEAD -- "${RECONCILE_PATHS[@]}" 2>/dev/null || true
     fi
 
+    # Issue #3611: reconcile GENERATED install-time artifacts that the ownership-
+    # scoped pass above misses. `.loom/install-metadata.json` is written by
+    # finalize_quick_install, NOT shipped in defaults/, so it is absent from the
+    # manifest-derived ownership set that scopes RECONCILE_PATHS. The chained
+    # uninstall staged its deletion (uninstall-loom.sh REMOVE_FILES → git add -A),
+    # and finalize then rewrote it on disk as an UNTRACKED file — leaving a
+    # `D` staged-deletion + `??` untracked pair. Committed as-is, that untracks
+    # the very file verify_install and the upgrade detector depend on. Explicitly
+    # unstage the staged deletion so the rewritten file reappears as a tracked
+    # modification (` M`), never `D`+`??`. Guarded by a staged-diff check so it is
+    # a no-op when the file was never staged for deletion. (`.loom/loom-source-path`
+    # has the same generated-at-install shape but is gitignored → untracked → no
+    # staged deletion, so it needs no reconcile; `.loom/config/skill-routes.json`
+    # ships in defaults/config and is already covered by RECONCILE_PATHS.)
+    for _generated_tracked in ".loom/install-metadata.json"; do
+      if git -C "$TARGET_PATH" diff --staged --name-only -- "$_generated_tracked" 2>/dev/null \
+           | grep -qxF "$_generated_tracked"; then
+        git -C "$TARGET_PATH" restore --staged -- "$_generated_tracked" 2>/dev/null || \
+          git -C "$TARGET_PATH" reset -q HEAD -- "$_generated_tracked" 2>/dev/null || true
+      fi
+    done
+
     # Restore any user changes stashed before the uninstall (see above).
     #
     # Issue #3588: the uninstall→init round-trip rewrites .gitignore
@@ -774,13 +796,28 @@ elif [[ -d "$TARGET_PATH/.loom" ]]; then
         fi
       fi
 
+      # Issue #3611: pop with `--index` so a caller's pre-existing staged/
+      # unstaged split is reproduced. A plain `git stash pop` re-applies EVERY
+      # stashed hunk to the working tree as *unstaged* — a caller who had a
+      # `.gitignore` edit STAGED before the reinstall got it back unstaged, and
+      # any careful partial staging in flight was silently flattened. `--index`
+      # reinstates the index tree the stash recorded at push time, so staged
+      # hunks come back staged and unstaged hunks stay unstaged. The `.gitignore`
+      # HEAD-reset above provides a clean 3-way base so the index restore lines
+      # up; `reapply_loom_gitignore_patterns` (below) then appends Loom ephemeral
+      # patterns to the WORKING TREE ONLY (never the staged copy — they are not
+      # the caller's change). `--index` is stricter than a plain pop: if it
+      # cannot reinstate the index cleanly (a genuine conflict) it fails, and we
+      # fall through to the conflict-surfacing branch below rather than silently
+      # degrading to an unstaged pop that would drop the staged split.
+      #
       # Capture the pop in an `if` condition so the assignment is exempt from
       # `set -e`. A plain top-level `VAR="$(cmd)"` assignment inherits the
       # command-substitution exit status, so a conflicting `git stash pop`
       # (non-zero) would trip `set -euo pipefail` on the assignment itself and
       # abort the installer before the conflict-surfacing branch below ever
       # runs (issue #3588 / PR review).
-      if REINSTALL_POP_OUTPUT="$(git -C "$TARGET_PATH" stash pop 2>&1)"; then
+      if REINSTALL_POP_OUTPUT="$(git -C "$TARGET_PATH" stash pop --index 2>&1)"; then
         REINSTALL_POP_STATUS=0
       else
         REINSTALL_POP_STATUS=$?
@@ -806,9 +843,12 @@ elif [[ -d "$TARGET_PATH/.loom" ]]; then
         [[ -z "$REINSTALL_STASH_REF" ]] && REINSTALL_STASH_REF="stash@{0}"
         warning "Failed to restore stashed user changes automatically"
         echo ""
-        echo "  git stash pop reported:"
+        echo "  git stash pop --index reported:"
         printf '%s\n' "$REINSTALL_POP_OUTPUT" | sed 's/^/    /'
         echo ""
+        echo "  Note: the restore preserves your original staged/unstaged split"
+        echo "  (git stash pop --index). That split could not be reproduced"
+        echo "  automatically here, so recover by hand to keep it intact."
         echo "  Your changes are preserved in the stash ($REINSTALL_STASH_REF)."
         echo "  A plain 'git stash pop' will conflict the same way, so recover by hand:"
         echo "    cd $TARGET_PATH"
