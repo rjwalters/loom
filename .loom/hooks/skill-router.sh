@@ -58,6 +58,18 @@ if [[ "$PROMPT" == /self* ]]; then
     exit 0
 fi
 
+# Skip harness-generated task-notification turns. These are not human input —
+# the harness re-runs UserPromptSubmit hooks on every background-task completion,
+# and re-injecting the agent table / re-routing on them is pure noise.
+# Match against the raw prompt with literal prefix/substring (no regex) so this
+# guard cannot itself false-positive on human text.
+case "$PROMPT" in
+    "[SYSTEM NOTIFICATION"*) exit 0 ;;
+esac
+if [[ "$PROMPT" == *"<task-notification>"* ]]; then
+    exit 0
+fi
+
 # =============================================================================
 # ROUTING CONFIG
 # =============================================================================
