@@ -48,10 +48,19 @@ header() {
   echo -e "${CYAN}$*${NC}"
 }
 
-# Install hooks and CLI wrapper that loom-daemon init doesn't handle
+# Install hooks and CLI wrapper that loom-daemon init doesn't handle.
+#
+# Issue #3625: an existing hook may be a downstream-tuned or forked copy — most
+# notably a customized guard-destructive.sh with a hand-tuned rm allowlist — so
+# it must NOT be silently clobbered on the quick-install/update path. Preserve
+# any existing .loom/hooks/<name> unless an explicit force overwrite is
+# requested (the caller passes "true", e.g. behind --clean). This mirrors the
+# preserve-unless-force behavior already in scripts/install-loom.sh:1099-1116,
+# which the quick path previously diverged from with an unconditional cp.
 install_hooks_and_cli() {
   local loom_root="$1"
   local target="$2"
+  local force="${3:-false}"
 
   # Install hooks
   if [[ -d "$loom_root/defaults/hooks" ]]; then
@@ -59,10 +68,14 @@ install_hooks_and_cli() {
     for hook_file in "$loom_root/defaults/hooks/"*.sh; do
       [[ -f "$hook_file" ]] || continue
       hook_name=$(basename "$hook_file")
-      cp "$hook_file" "$target/.loom/hooks/$hook_name"
-      chmod +x "$target/.loom/hooks/$hook_name"
+      if [[ -f "$target/.loom/hooks/$hook_name" ]] && [[ "$force" != "true" ]]; then
+        warning "Preserving existing hook: $hook_name (use --clean to overwrite)"
+      else
+        cp "$hook_file" "$target/.loom/hooks/$hook_name"
+        chmod +x "$target/.loom/hooks/$hook_name"
+        success "Installed hook: $hook_name"
+      fi
     done
-    success "Installed hooks"
   fi
 
   # Install CLI wrapper
@@ -1002,8 +1015,12 @@ case "$METHOD" in
         error "Installation failed"
     fi
 
-    # Install hooks and CLI wrapper (not handled by loom-daemon init)
-    install_hooks_and_cli "$LOOM_ROOT" "$TARGET_PATH"
+    # Install hooks and CLI wrapper (not handled by loom-daemon init).
+    # Force-overwrite existing hooks only under --clean (a deliberate fresh
+    # install); otherwise preserve a downstream-tuned hook (#3625).
+    _HOOK_FORCE=false
+    [[ "$FORCE_FLAG" == "--clean" ]] && _HOOK_FORCE=true
+    install_hooks_and_cli "$LOOM_ROOT" "$TARGET_PATH" "$_HOOK_FORCE"
     # Emit skill-routes.json, install-metadata.json, loom-source-path (#3502).
     finalize_quick_install "$LOOM_ROOT" "$TARGET_PATH"
     verify_install "$TARGET_PATH"
