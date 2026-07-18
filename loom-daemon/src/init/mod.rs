@@ -272,8 +272,14 @@ fn copy_single_file(
 /// consumer keys such as the documented `worktree.root` override every time the
 /// installer reran. This function instead:
 ///
-/// - **Destination missing** → exact template copy (fresh-install behavior,
-///   recorded as `added`). No consumer file exists to preserve.
+/// - **Destination missing** → the template is parsed and re-emitted through
+///   the same canonical `to_string_pretty` serialize path the merge branch
+///   uses (issue #3619), recorded as `added`. Routing the fresh install through
+///   serialization (rather than a raw `fs::copy` of the hand-formatted
+///   template) makes the on-disk file canonical from the very first install, so
+///   a later reinstall merge re-emits byte-identical output and config.json is
+///   never left dirty. (If the template is not valid JSON, falls back to a raw
+///   copy.)
 /// - **Destination is a valid JSON object** → deep-merge with the shipped
 ///   template as the base and the **existing consumer values winning** on
 ///   conflict; keys new in the template are added, unknown consumer keys at any
@@ -300,15 +306,40 @@ fn merge_config_file(
         return Ok(());
     }
 
-    // Fresh install: no existing consumer file → exact template copy.
+    let template_str = fs::read_to_string(&src)
+        .map_err(|e| format!("Failed to read defaults config.json: {e}"))?;
+
+    // Fresh install: no existing consumer file → write the template through the
+    // SAME canonical serialize path the reinstall merge uses (issue #3619). A
+    // bare `fs::copy` of the hand-formatted template produced bytes that a later
+    // merge's `to_string_pretty` output could never match, leaving config.json
+    // permanently dirty after the first reinstall. Serializing here makes the
+    // on-disk file canonical from the very first install, so any later merge
+    // re-emits byte-identical output. With serde_json's `preserve_order`
+    // feature, template key order is retained (keys are not alphabetized).
     if !dst.exists() {
-        fs::copy(&src, &dst).map_err(|e| format!("Failed to copy config.json: {e}"))?;
+        match serde_json::from_str::<Value>(&template_str) {
+            Ok(template_val) => {
+                let mut serialized = serde_json::to_string_pretty(&template_val)
+                    .map_err(|e| format!("Failed to serialize config.json: {e}"))?;
+                serialized.push('\n');
+                fs::write(&dst, serialized)
+                    .map_err(|e| format!("Failed to write config.json: {e}"))?;
+            }
+            Err(e) => {
+                // Template is invalid JSON — fall back to a raw copy rather than
+                // dropping the install. (The reinstall branch handles this too.)
+                eprintln!(
+                    "Warning: defaults/config.json is not valid JSON ({e}); \
+                     copying it verbatim to .loom/config.json"
+                );
+                fs::copy(&src, &dst).map_err(|e| format!("Failed to copy config.json: {e}"))?;
+            }
+        }
         report.added.push(report_name.to_string());
         return Ok(());
     }
 
-    let template_str = fs::read_to_string(&src)
-        .map_err(|e| format!("Failed to read defaults config.json: {e}"))?;
     let existing_str = fs::read_to_string(&dst)
         .map_err(|e| format!("Failed to read existing config.json: {e}"))?;
 
@@ -1829,6 +1860,69 @@ mod tests {
             report.added.contains(&".loom/config.json".to_string()),
             "fresh config.json should be reported added, got: {:?}",
             report.added
+        );
+    }
+
+    #[test]
+    fn test_config_fresh_install_and_reinstall_are_byte_identical() {
+        // Issue #3619: the fresh-install write path and the reinstall-merge
+        // write path must emit BYTE-IDENTICAL output for the same logical
+        // content. Before the fix, fresh install did a raw `fs::copy` of the
+        // hand-formatted template (semantic key order, inline arrays) while the
+        // reinstall merge re-serialized via `to_string_pretty` (expanded
+        // arrays), so the first reinstall reformatted config.json and left it
+        // permanently dirty. Now both paths serialize, so a fresh install
+        // followed by a reinstall is a byte-for-byte no-op.
+        let temp = TempDir::new().unwrap();
+        // A template exercising the two axes that used to diverge: an inline
+        // array (expanded by to_string_pretty) and multiple keys in a
+        // non-alphabetical semantic order (preserved by `preserve_order`).
+        let template = r#"{
+  "version": "2",
+  "offlineMode": false,
+  "reflection": {
+    "enabled": true,
+    "categories": ["bug", "enhancement", "documentation"]
+  },
+  "terminals": []
+}"#;
+        let (workspace, defaults) = setup_config_merge_repo(&temp, template);
+        let config_path = workspace.join(".loom").join("config.json");
+
+        // Fresh install (no existing .loom/config.json).
+        let first =
+            initialize_workspace(workspace.to_str().unwrap(), defaults.to_str().unwrap(), false)
+                .expect("fresh install");
+        assert!(
+            first.added.contains(&".loom/config.json".to_string()),
+            "fresh install should report config.json as added, got: {:?}",
+            first.added
+        );
+        let after_fresh = fs::read_to_string(&config_path).unwrap();
+
+        // Second run: now the file exists → the merge path runs. Its output
+        // must be byte-identical to the fresh-install output (the crux of
+        // #3619 — a reinstall over a freshly-installed config leaves it clean).
+        initialize_workspace(workspace.to_str().unwrap(), defaults.to_str().unwrap(), false)
+            .expect("reinstall merge");
+        let after_reinstall = fs::read_to_string(&config_path).unwrap();
+
+        assert_eq!(
+            after_fresh, after_reinstall,
+            "fresh-install and reinstall-merge output must be byte-identical (#3619)"
+        );
+
+        // Sanity: the serialized form is canonical (expanded array, trailing
+        // newline, template key order preserved by `preserve_order`).
+        assert!(
+            after_fresh.ends_with("}\n"),
+            "serialized config.json should end with a single trailing newline"
+        );
+        let version_pos = after_fresh.find("\"version\"").unwrap();
+        let offline_pos = after_fresh.find("\"offlineMode\"").unwrap();
+        assert!(
+            version_pos < offline_pos,
+            "preserve_order must retain template key order (version before offlineMode)"
         );
     }
 
