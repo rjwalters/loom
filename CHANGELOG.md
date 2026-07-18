@@ -7,6 +7,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.10.10] - 2026-07-18
+
+### Summary
+
+Patch release hardening installer idempotency across reinstall/upgrade paths and refining the destructive-command guards. The `--quick` reinstall and config-merge paths now round-trip byte-stably (`.gitignore`, `.loom/config.json`, install metadata, the committed `CLAUDE.md` pointer), so repeated installs no longer strand edits or clobber consumer keys. Guards gain an opt-in repo-scoped `rm` mode with an ephemeral allowlist and a dedicated Loom-workflow guard module, while cloud-delete ASK prompts narrow to mutating verbs. Broken docs links in the vendored templates are corrected.
+
+### Added
+
+- **Opt-in `guards.rmScope=repo` mode with ephemeral allowlist** — per-project setting scoping `rm` guarding to the repo; ships off by default (byte-for-byte compatible). (#3617)
+- **`cloudCli` toggle for cloud-delete guarding** — narrows the cloud ASK to mutating verbs and adds a per-project toggle; `ec2-terminate` downgraded from block to ask. (#3595)
+
+### Fixed
+
+- **Installer preserves an existing tuned guard hook on the quick-install path** — `install.sh` no longer unconditionally overwrites a consumer's customized hook on `--quick` reinstall, mirroring `install-loom.sh`'s preserve-unless-`--clean` semantics. (#3626)
+- **`.loom/config.json` merge is idempotent from first install** and preserves consumer keys on reinstall. (#3621, #3602)
+- **`--quick` reinstall no longer strands uncommitted `.gitignore` edits**; the install/uninstall round-trip is byte-idempotent. (#3589, #3591)
+- **`--quick` reinstall preserves the staged split on pop and reconciles `install-metadata.json`.** (#3618)
+- **Committed root `CLAUDE.md` pointer is self-sufficient.** (#3620)
+- **Legacy `.gitignore` migration is byte-stable** and orphan markers normalized. (#3594)
+- **`verify-install` scopes its manifest to Loom-owned files** and region-hashes `CLAUDE.md`. (#3603)
+- **Reinstall stash guard scoped to Loom-owned paths.** (#3601)
+- **Skill-router table gated on a route match and deduplicated per session**; machine-generated turns skipped, the methodology topic fallback anchored. (#3616, #3615)
+- **Broken `WORKFLOWS.md` link corrected in the `CONFIGURATION.md` copies**; the vendored `.claude/README.md` migration link is now absolute. (#3614, #3613)
+
+### Changed
+
+- **Loom-workflow guards extracted into `guard-loom-workflow.sh`.** (#3607)
+- **Role docs gain a partial-increment carve-out** so family/epic PRs don't auto-close their parent issue. (#3599)
+
 ## [0.10.9] - 2026-07-16
 
 ### Summary
