@@ -116,7 +116,7 @@ Once you're comfortable with the basics:
 ### Need help?
 
 - Read the [main documentation](../../README.md)
-- Check [WORKFLOWS.md](../../WORKFLOWS.md) for advanced patterns
+- Check [workflow documentation](../../docs/workflows.md) for advanced patterns
 - Open an issue on GitHub
 
 ## Learn More
@@ -125,6 +125,6 @@ This template demonstrates the core Loom workflow. To unlock the full power of A
 
 - **[Full-Stack Template](../full-stack/)** - Complete setup with Architect, Curator, Critic, and more
 - **[Custom Roles](../../defaults/roles/README.md)** - Create specialized agents for your workflow
-- **[Label Workflows](../../WORKFLOWS.md)** - Coordinate complex multi-agent tasks
+- **[Label Workflows](../../docs/workflows.md)** - Coordinate complex multi-agent tasks
 
 Happy coding with Loom! 🧵✨
