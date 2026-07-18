@@ -24,11 +24,15 @@ cd /path/to/your/repo
 /loom:sweep 42
 ```
 
-For multi-issue autonomous batches, start the spawn loop instead:
+For multiple issues in one session, pass them all to sweep:
 
 ```bash
-LOOM_USE_SPAWN_LOOP=1 ./.loom/scripts/spawn-loop.sh start
+# In Claude Code:
+/loom:sweep 42 43 44          # waves of parallel builders
+/loom:sweep all               # the whole open backlog
 ```
+
+For continuous multi-account batches, run the `loom-daemon` (Tier 2) and enqueue with `mcp__loom__dispatch_sweep` — one detached, token-rotated sweep per issue.
 
 ## How It Works
 
@@ -39,8 +43,8 @@ LOOM_USE_SPAWN_LOOP=1 ./.loom/scripts/spawn-loop.sh start
 └─────────────────────────────────────────────────────────────────┘
                               │
 ┌─────────────────────────────────────────────────────────────────┐
-│        Tier 2: Spawn loop + GitHub Actions cron                 │
-│  spawn-loop.sh claims ready issues, detaches per-issue sweeps   │
+│        Tier 2: loom-daemon + GitHub Actions cron                │
+│  loom-daemon dispatches per-issue sweeps (mcp__loom__*)         │
 │  .github/workflows/loom-*.yml runs support roles on cron        │
 └─────────────────────────────────────────────────────────────────┘
                               │
@@ -88,7 +92,7 @@ See [WORKFLOWS.md](docs/workflows.md) for complete label documentation.
 - Git worktree isolation per issue
 - Simple slash command: `/loom:sweep 42` runs a single issue end-to-end
 - MCP integration for programmatic control (19 tools)
-- Graceful shutdown: `touch .loom/stop-spawn-loop`
+- Crash-safe checkpoints: restart `/loom:sweep N` to resume from the last completed phase
 
 ## Forge Support
 
@@ -159,17 +163,19 @@ claude -p "/loom:sweep 42" --dangerously-skip-permissions
 
 Sweep is self-contained — there is no separate daemon to start. Checkpoints under `.loom/sweep-checkpoint/` survive crashes; restarting the sweep resumes from the last completed phase.
 
-### Multi-Issue Mode (spawn loop)
+### Multi-Issue Mode (loom-daemon, Tier 2)
 
-For autonomous batches that claim ready issues continuously:
+For autonomous multi-account batches, run the Rust `loom-daemon` and enqueue sweeps against it from any Claude Code session:
 
-```bash
-LOOM_USE_SPAWN_LOOP=1 ./.loom/scripts/spawn-loop.sh start
-./.loom/scripts/spawn-loop.sh status
-./.loom/scripts/spawn-loop.sh stop                  # or: touch .loom/stop-spawn-loop
+```text
+mcp__loom__dispatch_sweep    # detach one token-rotated sweep per issue
+mcp__loom__list_sweeps       # inspect running sweeps
+mcp__loom__cancel_sweep      # cancel a running sweep
 ```
 
-The spawn loop polls `loom:issue`, atomically claims ready items, and detaches one `/loom:sweep N` child per issue (up to `MAX_PARALLEL`, default 3). Each spawn picks its own OAuth token via `spawn-claude.sh` for multi-account rotation. The loop has no work-generation triggers — see the [GitHub Actions cron workflows](.github/workflows/) for periodic Champion / Curator / Judge / Auditor / Guide ticks (Phase 2a, opt-in per workflow).
+Each dispatched sweep runs in its own detached process and picks its own OAuth token via `spawn-claude.sh` for multi-account rotation. The daemon has no work-generation triggers — see the [GitHub Actions cron workflows](.github/workflows/) for periodic Champion / Curator / Judge / Auditor / Guide ticks (opt-in per workflow). See [`.loom/docs/daemon-reference.md`](.loom/docs/daemon-reference.md) for the full MCP surface.
+
+> The legacy `spawn-loop.sh` is **deprecated** and slated for deletion in v0.11.0 — use `loom-daemon` + `mcp__loom__dispatch_sweep` instead. See the [migration guide](docs/migration/v0.10.0-shepherd-deprecation.md).
 
 ### Individual Agent Commands
 
@@ -216,7 +222,7 @@ gh pr create --label "loom:review-requested"
 | Role | Purpose | Mode |
 |------|---------|------|
 | `/loom:sweep` | Single-issue lifecycle orchestration (Curator → Merge) | Per-issue |
-| `./.loom/scripts/spawn-loop.sh` | Multi-issue batch claimer (Tier 2) | Continuous, opt-in |
+| `loom-daemon` + `mcp__loom__dispatch_sweep` | Multi-issue detached dispatch (Tier 2) | Continuous, opt-in |
 | `/builder` | Implement features and fixes | Manual |
 | `/judge` | Review pull requests | Cron via GH Actions |
 | `/curator` | Enhance and organize issues | Cron via GH Actions |
