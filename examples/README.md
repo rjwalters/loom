@@ -106,7 +106,7 @@ Both templates use GitHub labels to coordinate work between agents:
 - `loom:reviewing` (amber) - Under active review
 - `loom:pr` (blue) - PR approved, ready to merge
 
-See [../WORKFLOWS.md](../WORKFLOWS.md) for complete workflow documentation.
+See [../docs/workflows.md](../docs/workflows.md) for complete workflow documentation.
 
 ## Troubleshooting
 
@@ -127,7 +127,7 @@ See [../WORKFLOWS.md](../WORKFLOWS.md) for complete workflow documentation.
 
 ## Next Steps
 
-- Read [../WORKFLOWS.md](../WORKFLOWS.md) for advanced multi-agent patterns
+- Read [../docs/workflows.md](../docs/workflows.md) for advanced multi-agent patterns
 - Explore [../defaults/roles/README.md](../defaults/roles/README.md) to create custom roles
 - Check [../CLAUDE.md](../CLAUDE.md) for development context
 

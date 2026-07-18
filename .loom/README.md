@@ -163,5 +163,5 @@ This allows teams to share agent roles and configurations while keeping runtime 
 
 - System roles: [../defaults/roles/](../defaults/roles/)
 - Role creation guide: [../defaults/roles/README.md](../defaults/roles/README.md)
-- Workflow guide: [../WORKFLOWS.md](../WORKFLOWS.md)
+- Workflow guide: [../docs/workflows.md](../docs/workflows.md)
 - Development guide: [../CLAUDE.md](../CLAUDE.md)
