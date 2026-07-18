@@ -6,7 +6,7 @@ edition = "2021"
 [dependencies]
 tokio = { workspace = true }
 serde = { workspace = true }
-serde_json = { workspace = true }
+serde_json = { workspace = true, features = ["preserve_order"] }
 anyhow = { workspace = true }
 log = "0.4"
 env_logger = "0.11"
