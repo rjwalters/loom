@@ -7,6 +7,63 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.10.9] - 2026-07-16
+
+### Summary
+
+Patch release hardening the destructive-command lifecycle guard against prose false-positives.
+
+### Fixed
+
+- **Lifecycle guard resolves the command word past `env NAME=value` assignments** so leading environment assignments no longer mask the guarded command. (#3587)
+- **Lifecycle and cloud-delete patterns are segment-parsed** to stop prose from triggering false-positive denials. (#3585)
+
+## [0.10.8] - 2026-07-15
+
+### Summary
+
+Patch release redefining `/sweep all` as an aggressive build-everything sentinel and fixing label creation on Quick installs.
+
+### Changed
+
+- **`/sweep all` redefined as an aggressive build-everything sentinel** — resolves the entire open backlog and drives each item toward a merged PR. (#3580)
+
+### Fixed
+
+- **Quick installs can create labels** — `sync-labels.sh` is now shipped in the install payload. (#3583)
+- **`.claude/skills` ignored for co-install hygiene.** (#3579)
+
+## [0.10.7] - 2026-07-15
+
+### Summary
+
+Patch release retiring the in-repo `/loom:release` skill in favor of the shared `/repo:release` command, expanding `/loom:sweep` with the `all` actionable-backlog sentinel and a resource-gated automatic wave-size default, and clearing a batch of worktree, hook, guard, and installer correctness bugs.
+
+### Added
+
+- **`/loom:sweep all` actionable-backlog sentinel** — resolves the open backlog and drives each issue through the lifecycle. (#3569)
+- **Resource-gated automatic wave-size default for `/loom:sweep`** — an omitted `--builders-per-wave` resolves to a backend- and disk-aware wave size. (#3567)
+- **Per-project opt-out for SQL DDL/DML guard blocking.** (#3562)
+- **Content-gated cleanup of the retired `release.md` stray** on install and daemon init. (#3575, #3577)
+
+### Fixed
+
+- **Guard false-positive denials reduced** by replacing unanchored substring matching. (#3564)
+- **Worktree default-branch detection** instead of hardcoding `origin/main`. (#3561)
+- **`.loom-managed` sentinel written on all worktree re-invocation paths.** (#3560)
+- **`worktree.sh --json` stdout kept pure via an fd-swap contract.** (#3556)
+- **PreToolUse guard decisions include the required `hookEventName`.** (#3559)
+- **`--quick` reinstall reconciles the index and scopes uninstall staging.** (#3557)
+- **`merge-pr.sh` stops passing the gh-cached `--no-cache` flag to plain `gh`.** (#3555)
+- **Dogfood: `.claude/commands` materialized as a real copy, not a symlink into `defaults/`.** (#3570)
+
+### Changed
+
+- **Retired `/loom:release` in favor of the repo's `/repo:release`.** (#3571)
+- **Added the `/loom:help` command** describing the installed Loom commands. (#3558)
+- **Recorded the LOOM-EXTENSION-POINT release-seams audit finding.** (#3574)
+- **Dependency maintenance** — bump the all-dependencies group (2 updates). (#3544)
+
 ## [0.10.6] - 2026-07-11
 
 ### Summary
