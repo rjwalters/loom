@@ -82,9 +82,9 @@ The previous architecture concentrated intelligence in a Python daemon brain (`d
 
 The emergent architecture distributes intelligence:
 
-- **Fault tolerance**: a crashed sweep child restarts from its checkpoint; the spawn loop re-queues it on the next tick; other sweeps are unaffected
+- **Fault tolerance**: a crashed sweep child restarts from its checkpoint on the next dispatch; other sweeps are unaffected
 - **Transparent state**: all state is visible in the forge — labels, comments, PR status; nothing is hidden in memory
-- **Independent evolution**: worker roles, sweep, spawn loop, and GH Actions workflows can change independently
+- **Independent evolution**: worker roles, sweep, the loom-daemon, and GH Actions workflows can change independently
 - **Horizontal scalability**: parallel sweeps run as separate processes; multi-account token rotation distributes load
 
 ---

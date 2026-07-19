@@ -403,6 +403,5 @@ In the end, all archetypes serve a single purpose: to transform the chaos of pos
 ---
 
 **See Also**:
-- [Role File Documentation](../defaults/roles/README.md)
+- [Role File Documentation](../../defaults/roles/README.md)
 - [Workflow Coordination](../workflows.md)
-- [Terminal Configuration](../docs/terminal-configuration.md)

@@ -270,7 +270,7 @@ Curator → Builder → Judge → Doctor (if needed) → Merge
 
 ### Overnight / long-running orchestration: keep the host awake (#3350)
 
-`/loom:sweep` and the spawn loop automatically run `./.loom/scripts/check-host-sleep.sh` at startup and warn when the host can sleep. This is **advisory only** — Loom never blocks on it. Heed the warning before walking away from a long run.
+`/loom:sweep` automatically runs `./.loom/scripts/check-host-sleep.sh` at startup and warns when the host can sleep. This is **advisory only** — Loom never blocks on it. Heed the warning before walking away from a long run.
 
 - **macOS:** user-idle sleep assertions (Amphetamine, `caffeinate -dimsu`, etc.) do **not** reliably defeat Maintenance Sleep on Apple Silicon. Use `sudo pmset -c sleep 0` for AC-only sleep disable, or flip your sleep manager's "allow system sleep when display is off" toggle to OFF.
 - **systemd Linux:** wrap the session in `systemd-inhibit --what=idle:sleep --who=loom --why=loom -- <cmd>`.
@@ -540,13 +540,13 @@ gh release create vX.Y.Z --title "vX.Y.Z" --notes "Release notes..."
 
 The script updates all 5 version-bearing files (`package.json`, `mcp-loom/package.json`, 2 `Cargo.toml` files (`loom-daemon`, `loom-api`), `CLAUDE.md`) plus `Cargo.lock`. The GitHub Actions release workflow (`.github/workflows/release.yml`) triggers on GitHub Release creation (`release: types: [created]`), NOT on tag push. You must create a GitHub Release via `gh release create` to trigger the build.
 
-## Migration: v0.10.0 shepherd/daemon deprecation (in progress)
+## Migration: v0.10.0 shepherd/daemon deprecation
 
 The orchestration-architecture migration (epic #3372) deleted the shepherd brain (`loom-tools/src/loom_tools/shepherd/`), the Python daemon brain (`loom-tools/src/loom_tools/daemon_v2/`), and the `/shepherd` slash command. The replacement is a two-surface architecture: `/loom:sweep` for in-session subagent dispatch (Tier 1) and the Rust `loom-daemon` binary for multi-account MCP-level dispatch (Tier 2). Epic #3449 rebuilt the daemon surface in phases A–D, all shipped on main. The completed phases:
 
 | Phase | Issue | What shipped | Status |
 |-------|-------|-----------|--------|
-| Phase 1 | #3374 | Minimal multi-account spawn loop (legacy — deprecated in Phase E of #3449) | shipped, deprecated |
+| Phase 1 | #3374 | Minimal multi-account spawn loop (legacy — deprecated in Phase E of #3449) | shipped (deprecated in Phase E, removed in v0.11.0) |
 | Phase 2a | #3375 | GitHub Actions workflows for support roles | shipped (disabled by default) |
 | Phase 2b | #3376 | Soft-deprecation warnings on deprecated entry points | shipped |
 | Phase 3 | #3378 | Deletion of shepherd brain, Python daemon brain, `/shepherd` skill | shipped |

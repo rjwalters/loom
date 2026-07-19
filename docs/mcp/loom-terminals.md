@@ -683,4 +683,4 @@ Common error types:
 ## See Also
 
 - [MCP Overview](./README.md) - Introduction to Loom MCP servers
-- [Loom Daemon IPC Protocol](../../loom-daemon/README.md) - Low-level IPC details
+- [Loom Daemon IPC Protocol](../../.loom/docs/daemon-reference.md) - Low-level IPC details

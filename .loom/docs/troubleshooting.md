@@ -162,7 +162,7 @@ claude -p "/loom:sweep 123" --dangerously-skip-permissions > /tmp/sweep-123.log 
 cat /tmp/sweep-123.log
 ```
 
-**Built-in log file** — when the spawn loop spawns a sweep child, it automatically tees all output to `.loom/logs/sweep-issue-N.log`. If output is invisible in your terminal, check this log file:
+**Built-in log file** — when a sweep child runs, it automatically tees all output to `.loom/logs/sweep-issue-N.log`. If output is invisible in your terminal, check this log file:
 
 ```bash
 cat .loom/logs/sweep-issue-123.log
