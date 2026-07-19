@@ -200,6 +200,6 @@ mcp__loom__trigger_force_start
 
 ## Debugging
 
-1. **Spawn-loop state inspection**: `cat .loom/spawn-loop-state.json | jq` and `cat .loom/state.json | jq`
-2. **Tail logs**: `tail -f ~/.loom/daemon.log` (Rust daemon) and `tail -f .loom/logs/spawn-loop.log` (spawn loop)
+1. **Running-sweep inspection**: `mcp__loom__list_sweeps` and `mcp__loom__get_sweep_status --sweep_id <id>` (the daemon holds sweep state in memory)
+2. **Tail logs**: `tail -f ~/.loom/daemon.log` (Rust daemon) and `tail -f .loom/logs/sweep-issue-<N>.log` (per-sweep logs, also tailable via `mcp__loom__tail_sweep_log`)
 3. **tmux sessions**: `tmux -L loom list-sessions`

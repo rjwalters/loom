@@ -2,7 +2,7 @@
 
 This repository uses **Loom** for AI-powered development orchestration.
 
-**Loom Version**: 0.10.10
+**Loom Version**: 0.11.0
 **Installation Date**: 2026-04-21
 
 ## What is Loom?
@@ -113,7 +113,7 @@ For full surface documentation — IPC request/response variants, event-bus inte
 
 > **Note**: `/loom:sweep` also supports a **PR-set mode** (Mode C, #3384) via `--prs <pr-number-list>` or NL phrases like "all open `loom:pr`" — drives Judge / Doctor → Judge / Merge from an existing open-PR set without re-running Curator or Builder. Mode C always uses subagent dispatch (see Stage -1 above).
 
-> **Legacy spawn loop**: `defaults/scripts/spawn-loop.sh` (Phase 1, #3374) is deprecated and emits a stderr warning on every invocation referencing #3449. It will be deleted in v0.11.0. Use `mcp__loom__dispatch_sweep` against `loom-daemon` instead. See [`docs/migration/v0.10.0-shepherd-deprecation.md`](docs/migration/v0.10.0-shepherd-deprecation.md).
+> **Legacy spawn loop (removed)**: `defaults/scripts/spawn-loop.sh` (Phase 1, #3374) was **removed in v0.11.0**. Use `mcp__loom__dispatch_sweep` against `loom-daemon` instead. See [`docs/migration/v0.10.0-shepherd-deprecation.md`](docs/migration/v0.10.0-shepherd-deprecation.md).
 
 ### 4. Scheduled Support Roles (opt-in)
 
@@ -312,7 +312,7 @@ The Rust `loom-daemon` binary is the load-bearing Tier 2 dispatch backend. It is
 
 **Scheduled support roles** run as separate GitHub Actions cron jobs — see `.github/workflows/loom-*.yml`. They have no persistent state on the Loom side; each tick is a fresh `claude -p "/<role>" --dangerously-skip-permissions` invocation.
 
-> **Legacy spawn-loop state**: the v0.9.x state file `.loom/spawn-loop-state.json` is still written by the deprecated `spawn-loop.sh` (scheduled for deletion in v0.11.0). The daemon does not consume it. Operators who need to observe running sweeps should call `mcp__loom__list_sweeps` against the daemon instead.
+> **Legacy spawn-loop state (obsolete)**: the v0.9.x state file `.loom/spawn-loop-state.json` was written by `spawn-loop.sh`, which was **removed in v0.11.0**. Nothing writes it anymore. Operators who need to observe running sweeps should call `mcp__loom__list_sweeps` against the daemon instead.
 
 ### Custom Roles
 
@@ -555,7 +555,7 @@ The orchestration-architecture migration (epic #3372) deleted the shepherd brain
 | #3449 Phase B | #3453 | `loom-daemon`: event bus (tokio broadcast), 6 frozen topics, `publish_event`, `subscribe_to_events` IPC | shipped |
 | #3449 Phase C | #3455 | MCP tools: `get_sweep_status`, `tail_sweep_log`, `subscribe_to_events`, `publish_event`, `cancel_sweep`, `tail_event_bus`; daemon-reference.md rewrite | shipped |
 | #3449 Phase D | #3454 | `/loom:sweep` Stage -1 backend detection (strict-AND daemon + pool probe) | shipped |
-| #3449 Phase E | #3456 | `spawn-loop.sh` deprecation warning + doc-fiction rewrite | this PR |
+| #3449 Phase E | #3456 | `spawn-loop.sh` deprecation warning + doc-fiction rewrite | shipped |
 
 **v1.0.0 is intentionally unscheduled.** Loom remains pre-1.0 while the architecture settles.
 
@@ -565,7 +565,7 @@ The orchestration-architecture migration (epic #3372) deleted the shepherd brain
 |---------|-------------|
 | `loom-daemon` Python CLI | Rust `loom-daemon` binary + `mcp__loom__dispatch_sweep` (+ GitHub Actions for support roles) |
 | `loom-shepherd` CLI / `/shepherd` slash command | `/loom:sweep <issue>` for the same per-issue lifecycle |
-| `defaults/scripts/spawn-loop.sh` (deprecation phase, deletion in v0.11.0) | `mcp__loom__dispatch_sweep` against `loom-daemon` |
+| `defaults/scripts/spawn-loop.sh` (removed in v0.11.0) | `mcp__loom__dispatch_sweep` against `loom-daemon` |
 
 Full migration narrative and per-CLI replacement table: [`docs/migration/v0.10.0-shepherd-deprecation.md`](docs/migration/v0.10.0-shepherd-deprecation.md).
 

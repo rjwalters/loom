@@ -224,7 +224,7 @@ When an agent crashes or is cancelled while building, issues can get stuck in `l
 
 ## Stuck Agent Detection
 
-`loom-stuck-detection` (post-v0.10.0) checks for stuck sweep children using `.loom/spawn-loop-state.json` task pids and `.loom/sweep-checkpoint/issue-<N>.json` checkpoint timestamps.
+`loom-stuck-detection` (post-v0.10.0) checks for stuck sweep children using the `loom-daemon` sweep registry (`mcp__loom__list_sweeps`) and `.loom/sweep-checkpoint/issue-<N>.json` checkpoint timestamps.
 
 ### Check for stuck agents
 
@@ -244,52 +244,37 @@ loom-stuck-detection check-issue 123
 | Indicator | Default Threshold | Description |
 |-----------|-------------------|-------------|
 | `stale_heartbeat` | 5 minutes | No checkpoint update for extended time |
-| `dead_pid` | (instant) | PID in spawn-loop-state.json is no longer alive |
+| `dead_pid` | (instant) | PID in the daemon sweep registry is no longer alive |
 | `error_spike` | 5 errors | Multiple errors in `.loom/logs/sweep-issue-N.log` |
 
 The pre-v0.10.0 indicators `missing_milestone:worktree_created` and `extended_work` were retired when the Python daemon brain (`daemon_v2/`) was removed — see [the migration guide § Per-CLI breaking changes](../../docs/migration/v0.10.0-shepherd-deprecation.md#per-cli-breaking-changes) for the field-level diff. The shell-level daemon surface (`./.loom/scripts/daemon.sh`) is preserved but does not write progress files, so milestone-based heuristics no longer apply.
 
-## Spawn-Loop Troubleshooting
+## Sweep Dispatch Troubleshooting
 
-The spawn loop replaces the historical daemon brain; orchestration state lives at `.loom/spawn-loop-state.json`.
+Multi-issue dispatch is driven by the Rust `loom-daemon` binary via `mcp__loom__dispatch_sweep`. The daemon holds the sweep registry, event bus, and reaper in memory — there is no on-disk orchestration state file to inspect. (The v0.9.x `spawn-loop.sh` and its `.loom/spawn-loop-state.json` state file were removed in v0.11.0.)
 
-### Check spawn-loop state
-
-```bash
-# View current spawn-loop state
-./.loom/scripts/spawn-loop.sh status
-
-# Or read the state file directly
-cat .loom/spawn-loop-state.json | jq
-
-# Check if loop is running
-test -f .loom/spawn-loop.pid && ps -p "$(cat .loom/spawn-loop.pid)" -o pid,etime,command
-
-# List active sweep children
-jq '.running[] | {issue, pid, started_at}' .loom/spawn-loop-state.json
-```
-
-### Graceful shutdown
+### Inspect running sweeps
 
 ```bash
-# Signal the spawn loop to stop accepting new work and drain in-flight children
-./.loom/scripts/spawn-loop.sh stop
-# or, equivalently:
-touch .loom/stop-spawn-loop
+# List all running sweeps in the daemon registry
+mcp__loom__list_sweeps
+
+# Inspect a specific sweep's state
+mcp__loom__get_sweep_status --sweep_id <id>
+
+# Tail a per-sweep log
+mcp__loom__tail_sweep_log --sweep_id <id>
+# (per-sweep logs also live at .loom/logs/sweep-issue-<N>.log)
 ```
 
-The loop honors `SHUTDOWN_GRACE_SEC` (default 300s) before SIGKILL'ing any remaining sweep children.
-
-### Force stop (use with caution)
+### Cancel a sweep
 
 ```bash
-# Remove stop signal if it was set but never picked up
-rm -f .loom/stop-spawn-loop
-
-# Hard-kill the loop process
-test -f .loom/spawn-loop.pid && kill -9 "$(cat .loom/spawn-loop.pid)" || true
-rm -f .loom/spawn-loop.pid
+# Cancel a running sweep (SIGTERM → grace → SIGKILL)
+mcp__loom__cancel_sweep --sweep_id <id>
 ```
+
+The daemon's reaper task detects dead PIDs (every 30s) and removes them from the registry, emitting `sweep.issue.*.exited` / `sweep.issue.*.crashed` events.
 
 ### Stuck sweep child
 
@@ -302,37 +287,37 @@ ls -la .loom/sweep-checkpoint/issue-123.json
 # Look at the child's log for errors
 tail -200 .loom/logs/sweep-issue-123.log
 
-# If you need to kill it manually:
-jq '.running[] | select(.issue==123) | .pid' .loom/spawn-loop-state.json | xargs -I{} kill {}
+# Cancel it through the daemon:
+mcp__loom__cancel_sweep --sweep_id <id>
 
-# The loop will detect the dead pid on the next tick and release the claim
-# (the checkpoint survives, so the issue will resume from its last completed phase
-# the next time the loop spawns it)
+# The checkpoint survives cancellation, so re-dispatching the issue resumes
+# from its last completed phase:
+mcp__loom__dispatch_sweep --issue 123
 ```
 
-### Spawn-loop is not picking up issues
+### Dispatch is not producing sweeps
 
-Issues need the `loom:issue` label (human-approved, ready for work) to be eligible. If the queue looks empty but the loop is idle, check:
+Issues need the `loom:issue` label (human-approved, ready for work) to be eligible for dispatch. If a dispatch isn't producing a sweep, check:
 
 ```bash
 # 1. Confirm there are ready issues
 gh issue list --label "loom:issue" --state open
 
-# 2. Confirm the claim locks aren't stale (a previous crash may have left lock dirs)
-ls -la .loom/locks/
+# 2. Confirm the daemon is reachable and running
+mcp__loom__list_sweeps
 
-# 3. Confirm the opt-in gate is set
-echo "LOOM_USE_SPAWN_LOOP=$LOOM_USE_SPAWN_LOOP"
+# 3. Confirm the multi-account token pool is bootstrapped (dispatch requires it)
+ls -la .loom/tokens/
 
-# 4. Look at recent loop activity
-tail -100 .loom/logs/spawn-loop.log
+# 4. Look at recent sweep activity on the event bus
+mcp__loom__tail_event_bus
 ```
 
-If `.loom/locks/issue-<N>/` exists for a closed/merged issue, remove it manually — the next tick will then claim that slot if a new ready issue lands.
+Note: the daemon does not poll the forge for `loom:issue` items — dispatch is operator-driven via `mcp__loom__dispatch_sweep`. To dispatch a ready issue, call `mcp__loom__dispatch_sweep --issue <N>` explicitly.
 
 ### Work generation (Architect / Hermit) not running
 
-**This is by design post-v0.10.0.** The spawn loop does not generate work — Architect and Hermit cadence is tracked under follow-up #3381. If you need new work generated automatically, run Architect/Hermit on a cron via the Phase 2a GitHub Actions pattern (`.github/workflows/loom-*.yml`); the existing five shipped workflows cover Champion / Curator / Judge / Auditor / Guide, but Architect and Hermit cron workflows are not yet shipped.
+**This is by design post-v0.10.0.** The daemon does not generate work — Architect and Hermit cadence is tracked under follow-up #3381. If you need new work generated automatically, run Architect/Hermit on a cron via the Phase 2a GitHub Actions pattern (`.github/workflows/loom-*.yml`); the existing five shipped workflows cover Champion / Curator / Judge / Auditor / Guide, but Architect and Hermit cron workflows are not yet shipped.
 
 For now, trigger them manually when the queue is empty:
 

@@ -212,7 +212,8 @@ Rejected. ADR-0009 said `daemon.sh` would "launch the spawn loop + GitHub
 Actions cron + token-rotated tmux panes." But: (a) GitHub Actions cron
 runs on GitHub's infrastructure, not via a local wrapper; (b)
 token-rotated tmux panes are an operator preference, not a Loom
-responsibility; and (c) `spawn-loop.sh` is being deprecated. The
+responsibility; and (c) `spawn-loop.sh` is being deprecated (and was
+subsequently removed in v0.11.0). The
 wrapper would have been a thin convenience layer over capabilities
 that mostly live elsewhere. The MCP surface is a more honest
 abstraction: it owns dispatch, observability, and lifecycle, with no

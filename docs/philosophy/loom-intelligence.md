@@ -11,7 +11,7 @@ Loom's "intelligence" does not live in a single brain. There is no central plann
 ```
 GitHub Actions cron schedules   — periodic support roles (Judge, Curator, Champion…)
            +
-  spawn-loop.sh                  — atomic issue claiming + /loom:sweep dispatch
+  loom-daemon dispatch           — operator-driven /loom:sweep dispatch (mcp__loom__dispatch_sweep)
            +
   /loom:sweep <issue>            — single-issue lifecycle (Curator → Builder → Judge → Doctor → Merge)
            +
@@ -42,13 +42,13 @@ Sweep is also stateless between issues. Its only persistent state is a checkpoin
 
 **Intelligence at this layer**: lifecycle orchestration. Sweep knows the correct order of operations, when to involve Doctor, and when to call Merge. This is the "workflow" layer — not a brain, but a well-defined protocol.
 
-### Layer 3: Spawn Loop (Multi-Issue Claiming)
+### Layer 3: loom-daemon Dispatch (Multi-Issue Batching)
 
-`./.loom/scripts/spawn-loop.sh` polls the forge for `loom:issue` items, atomically claims ready issues (using a `mkdir`-based lock to prevent double-claiming), and detaches one `claude -p "/loom:sweep N"` child per issue. Concurrency is bounded by `MAX_PARALLEL` (default 3).
+The Rust `loom-daemon` binary dispatches sweeps on demand. An operator (or MCP client) enqueues work with `mcp__loom__dispatch_sweep --issue N`, and the daemon detaches one `claude -p "/loom:sweep N"` child per issue with multi-account token rotation via `spawn-claude.sh`. It holds the sweep registry, event bus, and reaper task in memory.
 
-The spawn loop has no work-generation logic, no support-role triggers, no pipeline state. It is intentionally minimal. Its state file (`.loom/spawn-loop-state.json`) tracks only currently-running children — the forge is the source of truth for everything else.
+The daemon has no work-generation logic, no support-role triggers, no pipeline state, and it does not poll the forge — dispatch is operator-driven. It is intentionally minimal; the forge is the source of truth for everything else. (The v0.9.x `spawn-loop.sh` polling launcher and its `.loom/spawn-loop-state.json` state file were removed in v0.11.0.)
 
-**Intelligence at this layer**: parallelism and resource management. The spawn loop turns a FIFO queue of approved issues into concurrent, isolated, self-contained sweeps. Multi-account token rotation (`spawn-claude.sh`) distributes load across Claude OAuth accounts.
+**Intelligence at this layer**: parallelism and resource management. The daemon turns operator-enqueued approved issues into concurrent, isolated, self-contained sweeps. Multi-account token rotation (`spawn-claude.sh`) distributes load across Claude OAuth accounts.
 
 ### Layer 4: GitHub Actions Cron (Periodic Support Roles)
 

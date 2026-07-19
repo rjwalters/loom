@@ -224,7 +224,7 @@ The daemon **does not** poll the forge for ready issues, **does not** maintain a
 
 For the full surface — IPC request/response variants, event-bus internals, registry behaviour, reaper semantics — see [`.loom/docs/daemon-reference.md`](.loom/docs/daemon-reference.md).
 
-> **Legacy spawn loop deprecated**: `defaults/scripts/spawn-loop.sh` (Phase 1, #3374) is deprecated as of Phase E of #3449. It emits a stderr warning on every `start` / `status` / `stop` invocation and will be deleted in v0.11.0. Use `mcp__loom__dispatch_sweep` against `loom-daemon` instead. Suppress the warning with `LOOM_SUPPRESS_DEPRECATION=1` while you migrate. See [the migration guide](../docs/migration/v0.10.0-shepherd-deprecation.md).
+> **Legacy spawn loop (removed)**: `defaults/scripts/spawn-loop.sh` (Phase 1, #3374) was **removed in v0.11.0**. Use `mcp__loom__dispatch_sweep` against `loom-daemon` instead. See [the migration guide](../docs/migration/v0.10.0-shepherd-deprecation.md).
 
 ### Scheduled Support Roles (Phase 2a, opt-in)
 
@@ -659,7 +659,7 @@ See [`.loom/docs/daemon-reference.md`](.loom/docs/daemon-reference.md) for the w
 
 **Scheduled support roles** run as separate GitHub Actions cron jobs under `.github/workflows/loom-*.yml`. They have no persistent state on the Loom side; each tick is a fresh `claude -p "/<role>" --dangerously-skip-permissions` invocation.
 
-> **Legacy spawn-loop state**: the v0.9.x state file `.loom/spawn-loop-state.json` is still written by the deprecated `spawn-loop.sh` (scheduled for deletion in v0.11.0). The daemon does not consume it. Operators who need to observe running sweeps should call `mcp__loom__list_sweeps` against the daemon instead.
+> **Legacy spawn-loop state (obsolete)**: the v0.9.x state file `.loom/spawn-loop-state.json` was written by `spawn-loop.sh`, which was **removed in v0.11.0**. Nothing writes it anymore. Operators who need to observe running sweeps should call `mcp__loom__list_sweeps` against the daemon instead.
 
 ### Model Selection Strategy
 
@@ -1672,11 +1672,11 @@ Or run the setup script to generate `.mcp.json` automatically:
 
 ## Migration: v0.10.0 shepherd/daemon deprecation
 
-Loom's orchestration architecture migration (epic #3372) deleted the shepherd brain (`loom-tools/src/loom_tools/shepherd/`), the Python daemon brain (`loom-tools/src/loom_tools/daemon_v2/`), and the `/shepherd` slash command. Epic #3449 then rebuilt the **daemon surface as a Rust binary** (`loom-daemon`) that exposes MCP tools for dispatch, monitoring, and pub/sub eventing — phases A through D have all shipped on main; phase E (this work) deprecates the v0.9.x `defaults/scripts/spawn-loop.sh` interim implementation.
+Loom's orchestration architecture migration (epic #3372) deleted the shepherd brain (`loom-tools/src/loom_tools/shepherd/`), the Python daemon brain (`loom-tools/src/loom_tools/daemon_v2/`), and the `/shepherd` slash command. Epic #3449 then rebuilt the **daemon surface as a Rust binary** (`loom-daemon`) that exposes MCP tools for dispatch, monitoring, and pub/sub eventing — phases A through D have all shipped on main; phase E deprecated the v0.9.x `defaults/scripts/spawn-loop.sh` interim implementation, and **v0.11.0 removed it**.
 
 | Phase | Issue | What shipped | Status |
 |-------|-------|-----------|--------|
-| Phase 1 | #3374 | Minimal multi-account spawn loop (`spawn-loop.sh`) | shipped (deprecated in Phase E) |
+| Phase 1 | #3374 | Minimal multi-account spawn loop (`spawn-loop.sh`) | shipped (deprecated in Phase E, removed in v0.11.0) |
 | Phase 2a | #3375 | GitHub Actions workflows for support roles | shipped (disabled by default) |
 | Phase 2b | #3376 | Soft-deprecation warnings on deprecated entry points | shipped |
 | Phase 3 | #3378 | Deletion of shepherd brain, Python daemon brain, `/shepherd` skill | shipped |
@@ -1685,7 +1685,7 @@ Loom's orchestration architecture migration (epic #3372) deleted the shepherd br
 | #3449 Phase B | #3453 | `loom-daemon`: event bus (tokio broadcast), 6 frozen topics, `publish_event` / `subscribe_to_events` IPC | shipped |
 | #3449 Phase C | #3455 | MCP tools: `get_sweep_status`, `tail_sweep_log`, `subscribe_to_events`, `publish_event`, `cancel_sweep`, `tail_event_bus`; `.loom/docs/daemon-reference.md` rewrite | shipped |
 | #3449 Phase D | #3454 | `/loom:sweep` Stage -1 backend detection (strict-AND daemon + pool probe) | shipped |
-| #3449 Phase E | #3456 | `spawn-loop.sh` deprecation warning + operator-doc rewrite | this PR |
+| #3449 Phase E | #3456 | `spawn-loop.sh` deprecation warning + operator-doc rewrite | shipped |
 
 **v1.0.0 is intentionally unscheduled.** Loom remains pre-1.0 while the architecture settles. The migration guide filename `docs/migration/v0.10.0-shepherd-deprecation.md` is named for the release that ships the deletions.
 
@@ -1695,16 +1695,11 @@ Loom's orchestration architecture migration (epic #3372) deleted the shepherd br
 |---------|-------------|
 | `loom-daemon` (Python entry point) | Rust `loom-daemon` binary + `mcp__loom__dispatch_sweep` + GitHub Actions schedules |
 | `loom-shepherd` CLI / `/shepherd` slash command | `/loom:sweep <issue>` for the same per-issue lifecycle |
-
-**Deprecated entry points (still functional in v0.10.x, removed in v0.11.0)**:
-
-| Deprecated | Replacement | Warning |
-|------------|-------------|---------|
-| `defaults/scripts/spawn-loop.sh` | `mcp__loom__dispatch_sweep` against `loom-daemon` | Stderr banner on every invocation (Phase E of #3449); suppressible with `LOOM_SUPPRESS_DEPRECATION=1` |
+| `defaults/scripts/spawn-loop.sh` (deprecated throughout v0.10.x, **removed in v0.11.0**) | `mcp__loom__dispatch_sweep` against `loom-daemon` |
 
 ## Migrating off shepherd / spawn-loop (downstream consumers)
 
-If you installed Loom via `scripts/install-loom.sh` (or `install.sh`), the shepherd brain and Python daemon brain are already gone; the spawn-loop deprecation in this phase is your final migration step before v0.11.0 deletes it.
+If you installed Loom via `scripts/install-loom.sh` (or `install.sh`), the shepherd brain and Python daemon brain are already gone, and **v0.11.0 removed the spawn-loop interim implementation**; migrate any remaining spawn-loop automation to `mcp__loom__dispatch_sweep` against `loom-daemon`.
 
 ### What you can still rely on (v0.10.0)
 
@@ -1726,17 +1721,11 @@ These surfaces are **not** going away and are the supported replacements:
 
 | Deprecated surface | Status | What to do |
 |--------------------|--------|------------|
-| `defaults/scripts/spawn-loop.sh` | Deprecated in v0.10.x (Phase E of #3449), deletion in v0.11.0 | Migrate to `mcp__loom__dispatch_sweep` against `loom-daemon`. The script still works through v0.10.x but emits a stderr warning on every `start` / `status` / `stop` invocation. Suppress with `LOOM_SUPPRESS_DEPRECATION=1` if you need the noise gone during migration. |
+| `defaults/scripts/spawn-loop.sh` | **Removed in v0.11.0** (deprecated in v0.10.x, Phase E of #3449) | Migrate to `mcp__loom__dispatch_sweep` against `loom-daemon`. The script emitted a stderr deprecation warning throughout v0.10.x before removal. |
 | `loom-shepherd` Python CLI (already removed in v0.10.0) | Removed | Replace shell invocations with `claude -p "/loom:sweep <N>" --dangerously-skip-permissions`. The lifecycle phases are identical; checkpointing (#3373) is preserved. |
 | `/shepherd` slash command (already removed in v0.10.0) | Removed | Use `/loom:sweep <issue>` instead. |
 | `loom-shepherd` subagent (already removed in v0.10.0) | Removed | Stop dispatching to it from custom slash commands or hooks. |
 | `.loom/daemon-state.json` and `.loom/progress/shepherd-*.json` consumers | Producers removed | Replace reads with `mcp__loom__list_sweeps` / `mcp__loom__get_sweep_status` against the daemon, plus forge queries. See `docs/migration/daemon-state-consumers.md` for the per-consumer disposition. |
-
-**Suppression**: set `LOOM_SUPPRESS_DEPRECATION=1` to silence the deprecation warnings emitted from the deprecated shell entry points. Sphere installs and other downstream automation mid-migration can use this env var to keep their logs clean during the v0.10.x → v0.11.0 window.
-
-**Helpers**: the warning text is centralized in two places so removal in v0.11.0 is a single-PR sweep:
-
-- Shell: `defaults/scripts/spawn-loop.sh::_deprecation_warn()` — fires on every `start` / `status` / `stop` subcommand.
 
 ### Coordination and questions
 
