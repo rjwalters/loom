@@ -27,9 +27,9 @@ coordination point** for:
 
 It is **not** a work generator. It does not poll the forge for ready
 issues, it does not maintain a `shepherd-N` pool, and it does not run
-support roles on cron. Those responsibilities live in `spawn-loop.sh`
-(`./.loom/scripts/spawn-loop.sh`) and the GitHub Actions cron workflows
-(`.github/workflows/loom-*.yml`).
+support roles on cron. Those responsibilities live in
+`mcp__loom__dispatch_sweep` (operator-driven enqueue) and the GitHub
+Actions cron workflows (`.github/workflows/loom-*.yml`).
 
 ## Architecture (Phases A-C)
 
@@ -272,8 +272,8 @@ a Python brain that no longer exists. **None of that exists post-v0.10.0.**
 - The daemon **does not** generate work. Architect and Hermit cadence
   is out of scope and tracked under follow-up #3381.
 - The daemon **does not maintain a shepherd-N pool**. Each issue
-  detaches its own `claude -p "/loom:sweep N"` child; concurrency
-  bounds live in `spawn-loop.sh` (`MAX_PARALLEL`) or are operator-set
+  detaches its own `claude -p "/loom:sweep N"` child; concurrency is
+  bounded by the daemon's dispatch handling and is operator-controlled
   via separate `dispatch_sweep` MCP calls.
 - The daemon **does not track** `pipeline_state`, `warnings`,
   `completed_issues`, or `last_*_trigger`. The forge is the source of

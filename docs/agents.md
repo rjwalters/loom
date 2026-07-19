@@ -225,7 +225,7 @@ Hermit creates ──→ loom:hermit ──→ (human approves) ──→ loom:i
 ## Autonomous Operation
 
 Agents can run autonomously at configured intervals using either:
-1. **Spawn loop + GitHub Actions cron**: `./.loom/scripts/spawn-loop.sh` claims `loom:issue` items and spawns `/loom:sweep` children; `.github/workflows/loom-*.yml` run periodic support roles on cron schedules
+1. **`loom-daemon` dispatch + GitHub Actions cron**: `mcp__loom__dispatch_sweep` enqueues `/loom:sweep` children against the running Rust `loom-daemon` (operator-driven, multi-account); `.github/workflows/loom-*.yml` run periodic support roles on cron schedules
 2. **Manual Orchestration Mode**: Multiple Claude Code terminals with periodic commands
 
 ### Autonomous Agents
@@ -358,28 +358,30 @@ Every 15 minutes: Review issue backlog, update priorities and organization
 The autonomous responsibilities the daemon used to own are now split
 across two daemon-free mechanisms. They can be enabled independently.
 
-**1. Per-issue lifecycle: spawn loop launches `/loom:sweep <N>`**
+**1. Per-issue lifecycle: `loom-daemon` dispatches `/loom:sweep <N>`**
 
-`./.loom/scripts/spawn-loop.sh` is a minimal multi-account launcher
-that polls `loom:issue`, atomically claims ready issues, and detaches
-one `claude -p "/loom:sweep N"` child per issue. Each child runs the
-full Curator → Builder → Judge → Doctor → Merge lifecycle for one
-issue and exits. There is no shepherd pool, no `daemon-state.json`,
-no work-generation cooldowns — concurrency is bounded by
-`MAX_PARALLEL` (default `3`).
+The Rust `loom-daemon` binary is the multi-issue dispatch backend.
+Operators enqueue work with `mcp__loom__dispatch_sweep --issue <N>`,
+which detaches one `claude -p "/loom:sweep N"` child (with multi-account
+token rotation via `spawn-claude.sh`). Each child runs the full
+Curator → Builder → Judge → Doctor → Merge lifecycle for one issue and
+exits. There is no shepherd pool, no `daemon-state.json`, no
+work-generation cooldowns — the daemon does not poll the forge;
+dispatch is operator-driven.
 
 ```bash
-LOOM_USE_SPAWN_LOOP=1 ./.loom/scripts/spawn-loop.sh start  # opt-in gate required
-./.loom/scripts/spawn-loop.sh status
-./.loom/scripts/spawn-loop.sh stop                          # or: touch .loom/stop-spawn-loop
+mcp__loom__dispatch_sweep --issue 123   # enqueue a sweep for issue 123
+mcp__loom__list_sweeps                  # enumerate running sweeps
+mcp__loom__get_sweep_status --sweep_id <id>
+mcp__loom__cancel_sweep --sweep_id <id> # SIGTERM → grace → SIGKILL
 ```
 
-Tunables (env): `MAX_PARALLEL`, `POLL_INTERVAL` (seconds between polls,
-default `30`), `SHUTDOWN_GRACE_SEC` (default `300`). State lives in
-`.loom/spawn-loop-state.json`, logs in `.loom/logs/spawn-loop.log`,
-claim locks under `.loom/locks/issue-<N>/`. Sweep checkpoints
-(`.loom/sweep-checkpoint/issue-<N>.json`) survive crashes — a restarted
-sweep resumes from the last completed phase.
+Per-sweep logs live at `.loom/logs/sweep-issue-<N>.log` (tailable via
+`mcp__loom__tail_sweep_log`). Sweep checkpoints
+(`.loom/sweep-checkpoint/issue-<N>.json`) survive crashes — a re-dispatched
+sweep resumes from the last completed phase. (The v0.9.x `spawn-loop.sh`
+launcher and its `.loom/spawn-loop-state.json` state file were removed in
+v0.11.0.)
 
 **2. Periodic support roles: GitHub Actions cron**
 

@@ -7,11 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-> **Requires a MINOR version bump** — the rm-guard default change below is a behaviour change, not a bug fix.
+## [0.11.0] - 2026-07-18
+
+> **MINOR version bump** — the rm-guard default change below is a behaviour change, not a bug fix.
 
 ### Changed
 
 - **BREAKING (behaviour): `guards.rmScope` now defaults to `repo` instead of `off`** — `guard-destructive.sh` runs the repo-scoped `rm` guard by default: an outside-repo recursive `rm` (e.g. `rm -rf /Users/someone/important`) is now **denied** out of the box, while the `/tmp` + Claude-scratchpad ephemeral allowlist and in-repo/worktree paths stay allowed. The catastrophic top-level denies (bare `/tmp`, `/`, `$HOME`) are unchanged. This reverses #3617's "existing installs see zero behaviour change" guarantee as a deliberate, signed-off ADR decision (Option B). Consumers who relied on the old permissive default must opt out with `guards.rmScope: "off"` (synonym: `"permissive"`) in `.loom/config.json` or `LOOM_RM_SCOPE=off`. (#3628)
+
+### Removed
+
+- **Deprecated `defaults/scripts/spawn-loop.sh` and its deprecation-warning shims** (v0.11.0 deletion target of the #3372 / #3449 orchestration-architecture migration). The v0.9.x minimal multi-account spawn loop was soft-deprecated throughout v0.10.x with a stderr banner on every invocation; v0.11.0 deletes the script, its smoke test (`defaults/scripts/tests/test-spawn-loop.sh`), the now-orphaned centralized deprecation-warning helpers (`defaults/scripts/lib/deprecation.sh`, `loom-tools/src/loom_tools/common/deprecation.py` and its test), and the Rust doc-lint that pinned the deprecation banner in place (`loom-daemon/tests/spawn_loop_deprecation_doc_lint.rs`). The replacement is `mcp__loom__dispatch_sweep` against `loom-daemon`. See [`docs/migration/v0.10.0-shepherd-deprecation.md`](docs/migration/v0.10.0-shepherd-deprecation.md). (#3631)
 
 ## [0.10.10] - 2026-07-18
 

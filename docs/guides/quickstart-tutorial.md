@@ -341,15 +341,16 @@ cp defaults/roles/builder.md .loom/roles/my-custom-role.md
 
 See [defaults/roles/README.md](../../defaults/roles/README.md) for details.
 
-### Automate Beyond MOM (Spawn Loop, daemon.sh, GitHub Actions)
+### Automate Beyond MOM (loom-daemon dispatch, GitHub Actions)
 
 > **Heads up — the Python daemon brain is gone in v0.10.0; the shell-level
 > daemon surface is preserved.** The Python `loom-daemon` brain and the
 > `/loom` / `/loom --merge` slash commands were removed as part of the
 > shepherd/daemon deprecation epic (#3372). However,
 > `./.loom/scripts/daemon.sh` (start/stop/status) survives — it now drives
-> the spawn loop and (optionally) per-role panes in tmux, with multi-account
-> token rotation at the process-spawn boundary. The migration narrative —
+> the Rust `loom-daemon` and (optionally) per-role panes in tmux, with
+> multi-account token rotation at the process-spawn boundary. The migration
+> narrative —
 > including what each entry point maps to — lives at
 > [`docs/migration/v0.10.0-shepherd-deprecation.md`](../migration/v0.10.0-shepherd-deprecation.md).
 
@@ -357,30 +358,33 @@ Once comfortable with the manual MOM workflow above, you can move toward
 autonomous orchestration. There are two complementary execution surfaces,
 each suited to different runtime expectations.
 
-**1. Multi-issue spawn loop (Tier 2 — single-host batching)**
+**1. Multi-issue dispatch via `loom-daemon` (Tier 2 — single-host batching)**
 
-`./.loom/scripts/spawn-loop.sh` polls `loom:issue`, atomically claims
-ready issues, and detaches one `claude -p "/loom:sweep N"` process per
-issue. Each child runs the full Curator → Builder → Judge → Doctor →
-Merge lifecycle on its own. There is no shepherd pool to size, no
-`daemon-state.json` to tune — concurrency is bounded by `MAX_PARALLEL`
-(default `3`) and the spawn loop is intentionally minimal.
+The Rust `loom-daemon` binary dispatches sweeps on demand. Operators
+enqueue work with `mcp__loom__dispatch_sweep`, which detaches one
+`claude -p "/loom:sweep N"` process per issue. Each child runs the full
+Curator → Builder → Judge → Doctor → Merge lifecycle on its own. There
+is no shepherd pool to size and no `daemon-state.json` to tune — the
+daemon does not poll the forge; dispatch is operator-driven.
 
 ```bash
-# Opt-in gate is required (the loop refuses to start without it)
-LOOM_USE_SPAWN_LOOP=1 ./.loom/scripts/spawn-loop.sh start
+# Enqueue a sweep for a ready issue
+mcp__loom__dispatch_sweep --issue 123
 
 # Check what's running
-./.loom/scripts/spawn-loop.sh status
+mcp__loom__list_sweeps
+mcp__loom__get_sweep_status --sweep_id <id>
 
-# Graceful shutdown — finishes in-flight children, then exits
-./.loom/scripts/spawn-loop.sh stop   # or: touch .loom/stop-spawn-loop
+# Cancel a sweep (SIGTERM → grace → SIGKILL)
+mcp__loom__cancel_sweep --sweep_id <id>
 ```
 
-If you have a multi-account Claude token pool bootstrapped under
-`.loom/tokens/`, each spawn picks its own OAuth token via
+Dispatch requires a multi-account Claude token pool bootstrapped under
+`.loom/tokens/`; each spawn picks its own OAuth token via
 `spawn-claude.sh`. See the **Multi-Account Token Pool** section of
-`.loom/CLAUDE.md` for the rotation setup.
+`.loom/CLAUDE.md` for the rotation setup. (The v0.9.x `spawn-loop.sh`
+launcher was removed in v0.11.0 — use `mcp__loom__dispatch_sweep`
+instead.)
 
 **2. Scheduled support roles (Tier 2 — cron-driven, daemon-free)**
 
@@ -401,16 +405,16 @@ burn Actions minutes accidentally. To opt in:
 3. Optionally smoke-test via the Actions UI's **Run workflow** button
    (`workflow_dispatch`) before the next scheduled tick.
 
-The two tiers compose: spawn loop on your machine launches sweeps for
-ready issues; GitHub Actions cron drives the support roles that move
-issues and PRs between labels. Either can run on its own.
+The two tiers compose: `loom-daemon` dispatch on your machine launches
+sweeps for ready issues; GitHub Actions cron drives the support roles
+that move issues and PRs between labels. Either can run on its own.
 
-For the full reference (state-file schema, env tunables, opt-in
+For the full reference (MCP tool surface, env tunables, opt-in
 checklist, troubleshooting), see the
-[**Spawn-Loop Mode**](../../.loom/CLAUDE.md#3-spawn-loop-mode-phase-1-opt-in)
+[**Daemon Mode**](../../.loom/CLAUDE.md#3-daemon-mode-loom-daemon--mcp-tools)
 and
-[**Scheduled Support Roles**](../../.loom/CLAUDE.md#4-scheduled-support-roles-phase-2a-opt-in)
-sections of `.loom/CLAUDE.md`, and the deprecation stub at
+[**Scheduled Support Roles**](../../.loom/CLAUDE.md#4-scheduled-support-roles-opt-in)
+sections of `.loom/CLAUDE.md`, and the full daemon surface at
 [`.loom/docs/daemon-reference.md`](../../.loom/docs/daemon-reference.md).
 
 ---

@@ -175,7 +175,7 @@ mcp__loom__cancel_sweep      # cancel a running sweep
 
 Each dispatched sweep runs in its own detached process and picks its own OAuth token via `spawn-claude.sh` for multi-account rotation. The daemon has no work-generation triggers — see the [GitHub Actions cron workflows](.github/workflows/) for periodic Champion / Curator / Judge / Auditor / Guide ticks (opt-in per workflow). See [`.loom/docs/daemon-reference.md`](.loom/docs/daemon-reference.md) for the full MCP surface.
 
-> The legacy `spawn-loop.sh` is **deprecated** and slated for deletion in v0.11.0 — use `loom-daemon` + `mcp__loom__dispatch_sweep` instead. See the [migration guide](docs/migration/v0.10.0-shepherd-deprecation.md).
+> The legacy `spawn-loop.sh` was **removed in v0.11.0** — use `loom-daemon` + `mcp__loom__dispatch_sweep` instead. See the [migration guide](docs/migration/v0.10.0-shepherd-deprecation.md).
 
 ### Individual Agent Commands
 
