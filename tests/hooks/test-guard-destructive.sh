@@ -803,46 +803,70 @@ done
 echo ""
 
 # =========================================================================
-echo -e "${YELLOW}--- Repo-scoped rm guard (guards.rmScope / LOOM_RM_SCOPE) (#3610) ---${NC}"
+echo -e "${YELLOW}--- Repo-scoped rm guard (guards.rmScope / LOOM_RM_SCOPE) (#3610, #3628) ---${NC}"
 # =========================================================================
 #
-# The guard ships with rmScope OFF: only catastrophic top-level targets deny,
-# every deeper subpath (in- OR out-of-repo) is allowed. Opt-in `repo` mode adds
-# an outside-repo deny with a built-in ephemeral allowlist (system temp dirs +
-# the Claude scratchpad). The 8-case matrix from the issue is asserted in BOTH
-# toggle states, plus worktree-root and env-override cases.
+# As of #3628 (ADR Option B) the guard ships with rmScope REPO by default:
+# catastrophic top-level targets deny in every mode, AND an outside-repo deep
+# path is DENIED unless it is under the repo/worktree areas or on the built-in
+# ephemeral allowlist (system temp dirs + the Claude scratchpad). The legacy
+# permissive behaviour (allow every deeper subpath, including outside-repo) is
+# now an explicit opt-out via guards.rmScope:"off"/"permissive" or
+# LOOM_RM_SCOPE=off. The 8-case matrix from the issue is asserted in BOTH
+# states, plus worktree-root and env-override cases.
 #
 # NB: normalize_abs_path() is LEXICAL (no symlink resolution), so the allowlist
 # lists both /tmp and /private/tmp (and the /var/tmp, /var/folders pairs). These
 # temp-root cases pass in both toggle states — under OFF because a deep subpath
 # is always allowed, under repo because they are on the ephemeral allowlist.
 
-# ---- Matrix in the DEFAULT (off) state: unchanged permissive behaviour. ----
-# rmScope absent → off. Uses the real REPO_ROOT (loom checkout) as cwd.
-assert_allow "rmScope off: rm -f /tmp/x/foo.tsv allowed" \
+# ---- Matrix in the DEFAULT state: repo semantics (safe-by-default, #3628). ----
+# rmScope absent → repo. Uses the real REPO_ROOT (loom checkout) as cwd.
+assert_allow "rmScope default: rm -f /tmp/x/foo.tsv allowed (ephemeral)" \
     "rm -f /tmp/x/foo.tsv" "$REPO_ROOT"
-assert_allow "rmScope off: rm -rf scratchpad path allowed" \
+assert_allow "rmScope default: rm -rf scratchpad path allowed (ephemeral)" \
     "rm -rf /private/tmp/claude-501/-Users-x/abc/scratchpad/z" "$REPO_ROOT"
-assert_allow "rmScope off: rm -rf \$TMPDIR /var/folders path allowed" \
+assert_allow "rmScope default: rm -rf \$TMPDIR /var/folders path allowed (ephemeral)" \
     "rm -rf /var/folders/ab/cd/T/tmp.123" "$REPO_ROOT"
-assert_deny "rmScope off: rm -rf bare /tmp still denied (top-level rule)" \
+assert_deny "rmScope default: rm -rf bare /tmp still denied (top-level rule)" \
     "rm -rf /tmp" "$REPO_ROOT"
-assert_deny "rmScope off: rm -rf / still denied (catastrophic rule)" \
+assert_deny "rmScope default: rm -rf / still denied (catastrophic rule)" \
     "rm -rf /" "$REPO_ROOT"
-# The key backward-compat row: an outside-repo deep path is ALLOWED when off.
-assert_allow "rmScope off: rm -rf outside-repo path allowed (unchanged)" \
+# The key behaviour-change rows: outside-repo deep paths are now DENIED by default.
+assert_deny "rmScope default: rm -rf outside-repo /opt path denied (NEW default)" \
     "rm -rf /opt/some-vendor/important" "$REPO_ROOT"
-assert_allow "rmScope off: rm -rf under repo root allowed" \
+assert_deny "rmScope default: rm -rf outside-repo /Users path denied (NEW default)" \
+    "rm -rf /Users/someone/important" "$REPO_ROOT"
+assert_allow "rmScope default: rm -rf under repo root allowed" \
     "rm -rf $REPO_ROOT/.loom/tmp/x" "$REPO_ROOT"
-assert_allow "rmScope off: rm -rf external worktree-root path allowed (deep path)" \
-    "rm -rf /Volumes/scratch/wt/foo/issue-5/x" "$REPO_ROOT"
 
-# Explicit guards.rmScope:"off" behaves identically to absent.
+# ---- Explicit opt-out block: guards.rmScope:"off"/"permissive" restores the
+# ---- OLD permissive behaviour (outside-repo deep rm allowed again). ----
 RMSCOPE_OFF_REPO=$(make_sql_repo '{"guards":{"rmScope":"off"}}')
-assert_allow "rmScope config-off: outside-repo path allowed" \
+assert_allow "rmScope config-off: outside-repo path allowed again (opt-out)" \
     "rm -rf /opt/some-vendor/important" "$RMSCOPE_OFF_REPO"
-assert_deny "rmScope config-off: bare /tmp still denied" \
+assert_allow "rmScope config-off: outside-repo /Users path allowed again (opt-out)" \
+    "rm -rf /Users/someone/important" "$RMSCOPE_OFF_REPO"
+assert_deny "rmScope config-off: bare /tmp still denied (catastrophic rule holds)" \
     "rm -rf /tmp" "$RMSCOPE_OFF_REPO"
+assert_deny "rmScope config-off: / still denied (catastrophic rule holds)" \
+    "rm -rf /" "$RMSCOPE_OFF_REPO"
+
+# "permissive" is a recognized synonym for "off".
+RMSCOPE_PERM_REPO=$(make_sql_repo '{"guards":{"rmScope":"permissive"}}')
+assert_allow "rmScope config-permissive: outside-repo path allowed (synonym for off)" \
+    "rm -rf /opt/some-vendor/important" "$RMSCOPE_PERM_REPO"
+assert_deny "rmScope config-permissive: bare /tmp still denied" \
+    "rm -rf /tmp" "$RMSCOPE_PERM_REPO"
+
+# Env opt-out: LOOM_RM_SCOPE=off / permissive restore permissive behaviour even
+# with no config key present (default would otherwise be repo).
+assert_allow_env "rmScope env-off: outside-repo path allowed (env opt-out)" \
+    "LOOM_RM_SCOPE=off" "rm -rf /opt/some-vendor/important" "$REPO_ROOT"
+assert_allow_env "rmScope env-permissive: outside-repo path allowed (env synonym)" \
+    "LOOM_RM_SCOPE=permissive" "rm -rf /opt/some-vendor/important" "$REPO_ROOT"
+assert_deny_env "rmScope env-off: bare /tmp still denied (catastrophic rule holds)" \
+    "LOOM_RM_SCOPE=off" "rm -rf /tmp" "$REPO_ROOT"
 
 # ---- Matrix in the repo (on) state, driven by the env toggle. ----
 assert_allow_env "rmScope repo: rm -f /tmp/x/foo.tsv allowed (ephemeral)" \
@@ -896,10 +920,15 @@ assert_deny "rmScope config-on: outside-repo path denied" \
 assert_allow_env "rmScope: LOOM_RM_SCOPE=off overrides config repo (outside allowed)" \
     "LOOM_RM_SCOPE=off" "rm -rf /opt/some-vendor/important" "$RMSCOPE_ON_REPO"
 
-# ---- Malformed config falls through to OFF (no behaviour change). ----
+# ---- Malformed config falls through to REPO (the safe default, #3628). ----
+# The jq parse failure is caught by the `|| mode=repo` fallback, so a broken
+# config now resolves to repo — outside-repo deep rm is denied, not allowed.
 RMSCOPE_BAD_REPO=$(make_sql_repo '{ this is not valid json ')
-assert_allow "rmScope malformed-config: outside-repo path allowed (falls through to off)" \
+assert_deny "rmScope malformed-config: outside-repo path denied (falls through to repo)" \
     "rm -rf /opt/some-vendor/important" "$RMSCOPE_BAD_REPO"
+# The malformed config must still not trip the ERR trap or weaken other guards.
+assert_deny "rmScope malformed-config: bare /tmp still denied" \
+    "rm -rf /tmp" "$RMSCOPE_BAD_REPO"
 
 # ---- Repo mode must NOT weaken unrelated guards. ----
 assert_deny_env "rmScope repo: force-push to main still blocked" \

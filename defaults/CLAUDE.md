@@ -981,24 +981,24 @@ LOOM_GUARD_CLOUD=1 aws ec2 terminate-instances --instance-ids i-1234
 
 ### Repo-Scoped rm Guard (`guards.rmScope` / `LOOM_RM_SCOPE`)
 
-By default, `guard-destructive.sh` blocks only **catastrophic** `rm -rf` targets — root (`/`), the user's `$HOME`, and any bare top-level directory (`/tmp`, `/var`, `/etc`, …). Every deeper subpath is allowed, **including subpaths outside the repository** (e.g. `rm -rf /Users/someone/important`). This permissive default is intentional and ships unchanged.
+By default (as of #3628), `guard-destructive.sh` runs in **`repo` mode**: it blocks the **catastrophic** `rm -rf` targets — root (`/`), the user's `$HOME`, and any bare top-level directory (`/tmp`, `/var`, `/etc`, …) — **and** additionally denies any `rm -rf` target that is neither inside the repo/worktree areas nor on a built-in **ephemeral allowlist**. So an outside-repo deep path like `rm -rf /Users/someone/important` is **denied** out of the box. This is the safe-by-default behaviour (ADR Option B); it is a **behaviour change** from the pre-#3628 permissive default.
 
-Repos that want a tighter blast radius can opt in to **`repo` mode**, which additionally denies any `rm -rf` target that is neither inside the repo/worktree areas nor on a built-in **ephemeral allowlist**. The catastrophic top-level deny stays active in both modes, so bare `/tmp` and `/` are always blocked.
+Repos that need the old permissive behaviour — block only catastrophic targets and **allow** every deeper subpath, including subpaths outside the repository — can **opt out** to `off` (a.k.a. `permissive`) mode. The catastrophic top-level deny stays active in both modes, so bare `/tmp` and `/` are always blocked regardless.
 
-The rm-scope guard is **off by default**. It is resolved in this order (highest precedence first):
+The rm-scope guard is **repo (on) by default**. It is resolved in this order (highest precedence first):
 
-1. **`LOOM_RM_SCOPE` env var** — `repo` enables repo mode; `off`/`0`/`no` (or unset) disables it. Overrides the config value.
-2. **`.loom/config.json`** — `guards.rmScope` (default absent = off). Set it to `"repo"` to enable:
+1. **`LOOM_RM_SCOPE` env var** — `repo` forces repo mode; `off`/`0`/`no`/`permissive` forces the permissive opt-out; unset falls through to the config/default. Overrides the config value.
+2. **`.loom/config.json`** — `guards.rmScope`. An explicit `"off"` (or its synonym `"permissive"`) opts out to permissive mode; an absent key, any other value, or malformed JSON resolves to `"repo"` (the safe default):
    ```json
    {
      "guards": {
-       "rmScope": "repo"
+       "rmScope": "off"
      }
    }
    ```
-3. **Default** — off (current permissive behavior, byte-for-byte).
+3. **Default** — repo (safe-by-default, outside-repo deep `rm` denied).
 
-The config read is best-effort: a missing, empty, or malformed `.loom/config.json` falls through to **off** (no behavior change) and never causes the hook to exit non-zero. Enabling repo mode does not weaken any other guard.
+The config read is best-effort: a missing, empty, or malformed `.loom/config.json` falls through to **repo** (the safe default) and never causes the hook to exit non-zero. The permissive opt-out does not weaken any other guard — the catastrophic denies stay active.
 
 **In-scope targets** (allowed under `repo` mode):
 
@@ -1019,16 +1019,19 @@ Plus the Claude scratchpad glob `*/claude-*/*/scratchpad/*`. A **bare** temp roo
 **Examples**:
 
 ```bash
-# Opt in for a whole repo
-#   .loom/config.json  ->  { "guards": { "rmScope": "repo" } }
+# Default (repo mode) — no config needed:
+rm -rf /Users/someone/important   # DENIED (outside repo, safe default)
+rm -rf /tmp/build-cache/x         # allowed (ephemeral allowlist)
+rm -rf ./dist                     # allowed (under repo)
 
-# One-off: strict scope for a single command
-LOOM_RM_SCOPE=repo rm -rf /Users/someone/important   # DENIED (outside repo)
-LOOM_RM_SCOPE=repo rm -rf /tmp/build-cache/x          # allowed (ephemeral)
-LOOM_RM_SCOPE=repo rm -rf ./dist                      # allowed (under repo)
+# Opt out to the old permissive behaviour for a whole repo:
+#   .loom/config.json  ->  { "guards": { "rmScope": "off" } }        # or "permissive"
 
-# Env override wins over config — force OFF even when the repo opts in
-LOOM_RM_SCOPE=off rm -rf /Users/someone/scratch       # allowed (guard disabled)
+# One-off env opt-out — force permissive for a single command:
+LOOM_RM_SCOPE=off rm -rf /Users/someone/scratch       # allowed (permissive)
+
+# Force repo mode for one command even when the repo opts out:
+LOOM_RM_SCOPE=repo rm -rf /Users/someone/important    # DENIED (outside repo)
 ```
 
 ### Protecting Read-Only Directories

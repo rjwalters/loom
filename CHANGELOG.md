@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+> **Requires a MINOR version bump** — the rm-guard default change below is a behaviour change, not a bug fix.
+
+### Changed
+
+- **BREAKING (behaviour): `guards.rmScope` now defaults to `repo` instead of `off`** — `guard-destructive.sh` runs the repo-scoped `rm` guard by default: an outside-repo recursive `rm` (e.g. `rm -rf /Users/someone/important`) is now **denied** out of the box, while the `/tmp` + Claude-scratchpad ephemeral allowlist and in-repo/worktree paths stay allowed. The catastrophic top-level denies (bare `/tmp`, `/`, `$HOME`) are unchanged. This reverses #3617's "existing installs see zero behaviour change" guarantee as a deliberate, signed-off ADR decision (Option B). Consumers who relied on the old permissive default must opt out with `guards.rmScope: "off"` (synonym: `"permissive"`) in `.loom/config.json` or `LOOM_RM_SCOPE=off`. (#3628)
+
 ## [0.10.10] - 2026-07-18
 
 ### Summary
