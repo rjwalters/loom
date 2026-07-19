@@ -411,9 +411,9 @@ that move issues and PRs between labels. Either can run on its own.
 
 For the full reference (MCP tool surface, env tunables, opt-in
 checklist, troubleshooting), see the
-[**Daemon Mode**](../../.loom/CLAUDE.md#3-daemon-mode-loom-daemon--mcp-tools)
+[**Daemon Mode**](../../CLAUDE.md#3-daemon-mode-loom-daemon--mcp-tools)
 and
-[**Scheduled Support Roles**](../../.loom/CLAUDE.md#4-scheduled-support-roles-opt-in)
+[**Scheduled Support Roles**](../../CLAUDE.md#4-scheduled-support-roles-opt-in)
 sections of `.loom/CLAUDE.md`, and the full daemon surface at
 [`.loom/docs/daemon-reference.md`](../../.loom/docs/daemon-reference.md).
 

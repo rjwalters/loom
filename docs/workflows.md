@@ -17,7 +17,7 @@ In Loom, development follows an ancient pattern of archetypal forces working in 
 5. 🔧 **The Fixer heals → claims with `loom:treating``, addresses review feedback (`loom:changes-requested` → `loom:review-requested`)
 6. ⚖️ **The Reviewer** judges → maintains quality through discernment (`loom:pr`)
 
-*Like the Tarot's Major Arcana, each role is essential to the whole. See [Agent Archetypes](docs/philosophy/agent-archetypes.md) for the mystical framework.*
+*Like the Tarot's Major Arcana, each role is essential to the whole. See [Agent Archetypes](philosophy/agent-archetypes.md) for the mystical framework.*
 
 ### Color-coded Workflow
 
@@ -34,7 +34,7 @@ In Loom, development follows an ancient pattern of archetypal forces working in 
   - `loom:blocked` (Blocked, needs help)
   - `loom:urgent` (High priority)
 
-See [scripts/LABEL_WORKFLOW.md](scripts/LABEL_WORKFLOW.md) for detailed label state machine documentation.
+See [.github/labels.yml](../.github/labels.yml) for detailed label state machine documentation.
 
 ## Complete Feature Flow
 
@@ -90,7 +90,7 @@ This issue cannot proceed until all dependencies above are complete.
 - **Worker**: Verifies dependencies before claiming
 - Blocked issues get `loom:blocked` label
 
-See full dependency workflow in [scripts/LABEL_WORKFLOW.md](scripts/LABEL_WORKFLOW.md).
+See full dependency workflow in [.github/labels.yml](../.github/labels.yml).
 
 ## Agent Types Summary
 
@@ -421,10 +421,10 @@ For detailed workflows including:
 - Troubleshooting guides
 - Future enhancements
 
-See [scripts/LABEL_WORKFLOW.md](scripts/LABEL_WORKFLOW.md) for comprehensive documentation.
+See [.github/labels.yml](../.github/labels.yml) for comprehensive documentation.
 
 ---
 
-**For detailed agent workflows and command references, see [scripts/LABEL_WORKFLOW.md](scripts/LABEL_WORKFLOW.md).**
+**For detailed agent workflows and command references, see [.github/labels.yml](../.github/labels.yml).**
 
 Last updated: Issue #332 - Revised label state machine with human approval gate

@@ -493,4 +493,4 @@ When adding new MCP capabilities:
 - [MCP Protocol Specification](https://modelcontextprotocol.io/docs)
 - [Loom README](../../README.md) - Main project documentation
 - [CLAUDE.md](../../CLAUDE.md) - Development context for AI agents
-- [Daemon IPC Protocol](../../loom-daemon/README.md) - Low-level daemon communication
+- [Daemon IPC Protocol](../../.loom/docs/daemon-reference.md) - Low-level daemon communication
