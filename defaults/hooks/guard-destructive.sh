@@ -161,45 +161,54 @@ cloud_guard_enabled() {
 }
 
 # =============================================================================
-# rm-scope repo mode toggle — default OFF (opt-in).
+# rm-scope repo mode toggle — default REPO (safe-by-default; opt out to off).
 #
-# By default this guard blocks only catastrophic rm targets (root, $HOME, and
-# bare top-level dirs) and ALLOWS every deeper subpath — including subpaths
-# OUTSIDE the repo (e.g. `rm -rf /Users/someone/important`). That permissive
-# default ships unchanged so existing installs see zero behaviour change.
-#
-# Opt-in `repo` mode (guards.rmScope:"repo" / LOOM_RM_SCOPE=repo) additionally
+# As of issue #3628 (ADR Option B) this guard defaults to `repo` mode: it
 # DENIES any rm target that is neither under the repo / worktree areas nor on a
-# built-in ephemeral allowlist (system temp dirs + the Claude scratchpad). The
-# catastrophic top-level deny stays unconditional in BOTH modes, so bare /tmp
-# and / are still blocked.
+# built-in ephemeral allowlist (system temp dirs + the Claude scratchpad), in
+# addition to the catastrophic top-level deny. A zero-config install therefore
+# gets outside-repo rm protection out of the box (e.g. `rm -rf
+# /Users/someone/important` is DENIED).
+#
+# The legacy permissive behaviour — block only catastrophic rm targets (root,
+# $HOME, bare top-level dirs) and ALLOW every deeper subpath including subpaths
+# OUTSIDE the repo — is now an explicit opt-out: guards.rmScope:"off" (or the
+# synonym "permissive") / LOOM_RM_SCOPE=off. Consumers who relied on the old
+# permissive default must set one of those to restore it.
+#
+# The catastrophic top-level deny stays unconditional in BOTH modes, so bare
+# /tmp and / are still blocked regardless of rmScope.
 #
 # Resolution order (highest precedence first):
-#   1. LOOM_RM_SCOPE env var (repo enables; off/0/no disables). Overrides config.
-#   2. .loom/config.json  ->  guards.rmScope == "repo"  (else off)
-#   3. Default: off (permissive, current behaviour)
+#   1. LOOM_RM_SCOPE env var (repo enables; off/0/no/permissive disables).
+#      Overrides config. Absent → falls through to config/default.
+#   2. .loom/config.json  ->  guards.rmScope: "off"/"permissive" => off;
+#      absent key / any other value / malformed JSON => repo (the new default).
+#   3. Default: repo (safe-by-default, current behaviour after #3628)
 #
 # Mirrors sql_guard_enabled() / cloud_guard_enabled(): cached in
 # _RM_SCOPE_CACHE, invoked LAZILY only after a candidate rm target survives the
 # catastrophic check, so the jq config read never touches the hot path for
 # non-rm commands. The config read is best-effort: any parse failure falls
-# through to OFF (no behaviour change) and never trips the ERR trap.
+# through to REPO (the safe default) and never trips the ERR trap.
 # =============================================================================
 _RM_SCOPE_CACHE=""
 rm_scope_repo_enabled() {
     if [[ -z "$_RM_SCOPE_CACHE" ]]; then
-        local mode=off
+        local mode=repo
         if [[ -n "$REPO_ROOT" && -f "$REPO_ROOT/.loom/config.json" ]]; then
-            # Only an explicit guards.rmScope == "repo" enables the mode; any
-            # other value, a missing key, or malformed JSON stays OFF (the jq
-            # non-zero exit is caught by the `||` fallback).
-            mode=$(jq -r 'if .guards.rmScope == "repo" then "repo" else "off" end' "$REPO_ROOT/.loom/config.json" 2>/dev/null) || mode=off
-            [[ -n "$mode" ]] || mode=off
+            # Only an explicit guards.rmScope of "off" or "permissive" opts out
+            # to the legacy permissive behaviour; any other value, a missing
+            # key, or malformed JSON resolves to "repo" (the safe default — the
+            # jq non-zero exit on malformed JSON is caught by the `||`
+            # fallback, which also resolves to repo).
+            mode=$(jq -r 'if (.guards.rmScope == "off" or .guards.rmScope == "permissive") then "off" else "repo" end' "$REPO_ROOT/.loom/config.json" 2>/dev/null) || mode=repo
+            [[ -n "$mode" ]] || mode=repo
         fi
         # Env override wins over config.
         case "${LOOM_RM_SCOPE:-}" in
-            repo)         mode=repo ;;
-            off|0|no)     mode=off ;;
+            repo)                  mode=repo ;;
+            off|0|no|permissive)   mode=off ;;
         esac
         _RM_SCOPE_CACHE="$mode"
     fi
