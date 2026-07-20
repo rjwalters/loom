@@ -22,9 +22,11 @@ spawn loop tracks only the bare minimum needed to reap dead children and
 respect MAX_PARALLEL. Anything richer comes from the forge (`gh issue list`,
 `gh pr list`).
 
-The ``output_file`` field was added in Phase 3.1.4 (#3393) so ``loom-completions``
-can detect silent failures (AGENT_EXIT_CODE marker + mtime staleness) without
-re-deriving the spawn loop's per-issue log path convention.
+The ``output_file`` field was added in Phase 3.1.4 (#3393) so the (now-removed)
+``loom-completions`` CLI could detect silent failures (AGENT_EXIT_CODE marker +
+mtime staleness) without re-deriving the spawn loop's per-issue log path
+convention. ``loom-completions`` was deleted in v0.11.0 (#3633); the field is
+retained for backward-compatibility with existing state files.
 
 This module is part of the Phase 3 port (epic #3372, tracker #3378) and is
 read by ``loom-status`` and other operator CLIs.
@@ -49,9 +51,10 @@ class SpawnLoopTask:
     # ``checkpoint.sh``) backwards compatible. ``loom-stuck-detection`` (a
     # sibling port) will likely populate this.
     last_heartbeat: str | None = None
-    # Absolute path to the per-task output log written by ``spawn-loop.sh``
-    # (Phase 3.1.4, #3393). Consumed by ``loom-completions`` to detect
-    # silent failures (AGENT_EXIT_CODE markers + mtime staleness). Optional
+    # Absolute path to the per-task output log formerly written by the
+    # (deleted) ``spawn-loop.sh`` (Phase 3.1.4, #3393). Was consumed by the
+    # ``loom-completions`` CLI (removed in v0.11.0, #3633) to detect silent
+    # failures (AGENT_EXIT_CODE markers + mtime staleness). Optional; retained
     # for backward-compatibility with state files written before #3393.
     output_file: str | None = None
 
