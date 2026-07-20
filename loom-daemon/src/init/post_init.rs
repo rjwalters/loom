@@ -106,9 +106,11 @@ pub const EPHEMERAL_PATTERNS: &[&str] = &[
     ".loom/mcp-command.json",
     ".loom/activity.db",
     ".loom/claims/",
+    ".loom/locks/",
     ".loom/signals/",
     ".loom/status/",
     ".loom/retry-state/",
+    ".loom/sweep-checkpoint/",
     ".loom/diagnostics/",
     ".loom/guide-docs-state.json",
     ".loom/metrics_state.json",
@@ -309,6 +311,9 @@ mod tests {
         assert!(contents.contains(".loom/activity.db"));
         assert!(contents.contains(".loom/issue-failures.json"));
         assert!(contents.contains(".loom/usage-cache.json"));
+        // Runtime dirs added in #3635 — must appear exactly once
+        assert_eq!(contents.matches(".loom/sweep-checkpoint/").count(), 1);
+        assert_eq!(contents.matches(".loom/locks/").count(), 1);
         assert!(contents.contains("# Loom runtime state"));
 
         // Retired daemon-brain patterns must NOT be emitted (Phase 3.5, #3402)
@@ -360,6 +365,8 @@ mod tests {
         assert_eq!(contents.matches(".loom/spawn-loop-state.json").count(), 1);
         assert_eq!(contents.matches(".loom-in-use").count(), 1);
         assert_eq!(contents.matches(".loom/worktrees/").count(), 1);
+        assert_eq!(contents.matches(".loom/sweep-checkpoint/").count(), 1);
+        assert_eq!(contents.matches(".loom/locks/").count(), 1);
     }
 
     #[test]
@@ -389,9 +396,11 @@ mod tests {
             ".loom/mcp-command.json",
             ".loom/activity.db",
             ".loom/claims/",
+            ".loom/locks/",
             ".loom/signals/",
             ".loom/status/",
             ".loom/retry-state/",
+            ".loom/sweep-checkpoint/",
             ".loom/diagnostics/",
             ".loom/guide-docs-state.json",
             ".loom/metrics_state.json",
