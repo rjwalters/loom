@@ -21,7 +21,6 @@ import os
 import pathlib
 import subprocess
 import sys
-import threading
 import time
 from dataclasses import dataclass
 from loom_tools.agent_spawn import TMUX_SOCKET, kill_stuck_session, session_exists
@@ -157,52 +156,11 @@ def _run_loom_clean(
         log_warning("loom-clean execution failed")
 
 
-def _run_orphan_recovery(
-    repo_root: pathlib.Path,
-    *,
-    recover: bool = False,
-    verbose: bool = False,
-    run_background: bool = False,
-) -> None:
-    """Delegate to the Python orphan recovery module.
-
-    When ``run_background=True``, the recovery runs in a daemon thread so the
-    caller returns immediately.  This avoids blocking daemon startup when there
-    are many orphans (each requiring a GitHub API round-trip).  The thread is
-    marked as a daemon thread so it will not prevent process exit if the daemon
-    shuts down before recovery finishes.
-    """
-    def _do_recovery() -> None:
-        try:
-            from loom_tools.orphan_recovery import run_orphan_recovery
-
-            run_orphan_recovery(repo_root, recover=recover, verbose=verbose)
-        except ImportError:
-            # Fall back to the shell script
-            script = repo_root / "scripts" / "recover-orphaned-shepherds.sh"
-            if not script.exists():
-                script = repo_root / ".loom" / "scripts" / "recover-orphaned-shepherds.sh"
-            if script.exists() and os.access(script, os.X_OK):
-                cmd: list[str] = [str(script)]
-                if recover:
-                    cmd.append("--recover")
-                if verbose:
-                    cmd.append("--verbose")
-                try:
-                    subprocess.run(cmd, capture_output=True, timeout=60, cwd=repo_root)
-                except Exception:
-                    log_warning("Orphaned shepherd recovery failed")
-            else:
-                log_warning("Orphan recovery not available")
-        except Exception as exc:
-            log_warning(f"Background orphan recovery failed: {exc}")
-
-    if run_background:
-        thread = threading.Thread(target=_do_recovery, name="orphan-recovery", daemon=True)
-        thread.start()
-        log_info("Orphan recovery started in background (daemon will not wait for it)")
-    else:
-        _do_recovery()
+# NOTE (#3651): ``_run_orphan_recovery`` was removed here. It delegated to
+# ``orphan_recovery.run_orphan_recovery`` from a module that has no console
+# entry point and is superseded by ``cleanup.py`` — dead code, and a latent
+# tear-down hazard after the spawn-loop writer was deleted. Use
+# ``loom-recover-orphans`` (now fail-safe) or ``loom-clean`` instead.
 
 
 # ---------------------------------------------------------------------------
@@ -749,14 +707,12 @@ def handle_daemon_startup(
         log_info("Resetting failure counters (--fresh)...")
         _reset_failure_counters(repo_root, dry_run=dry_run)
 
-    # 3. Orphaned shepherd recovery.
-    log_info("Checking for orphaned shepherds from previous session...")
-    _run_orphan_recovery(
-        repo_root,
-        recover=not dry_run,
-        verbose=True,
-        run_background=not dry_run,
-    )
+    # 3. Orphaned-shepherd recovery was removed in issue #3651. This module has
+    #    no console entry point and is superseded by ``cleanup.py``; its call
+    #    into ``orphan_recovery.run_orphan_recovery`` was dead code and, post
+    #    spawn-loop deletion, a latent tear-down hazard for live sweeps. The
+    #    supported recovery paths are ``loom-recover-orphans`` (fail-safe) and
+    #    ``loom-clean``.
 
     # 4. Archive orphaned task outputs
     if config.archive_logs:

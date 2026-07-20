@@ -9,11 +9,31 @@ Detects and recovers orphaned state that occurs when:
 
 This module was ported in Phase 3.1.6 (epic #3372, tracker #3378, issue #3395).
 
-The sources of truth are:
+Liveness sources (issue #3651 — SAFETY-critical fail-safe)
+----------------------------------------------------------
 
-- ``.loom/spawn-loop-state.json::running`` (a flat list of live sweep tasks,
-  written by ``defaults/scripts/spawn-loop.sh`` — see
-  :mod:`loom_tools.models.spawn_loop_state`).
+``defaults/scripts/spawn-loop.sh`` was the historical writer of
+``.loom/spawn-loop-state.json::running`` (the live-sweep roster). It was
+deleted in v0.11.0, so **nothing writes that file anymore**. With no writer,
+the roster is always empty, and a naive cross-check would treat *every* open
+``loom:building`` issue — including live, in-flight sweeps — as an orphan and
+flip it back to ``loom:issue`` (possibly cleaning its worktree) mid-build.
+
+The fix is a **fail-safe** liveness model (:func:`gather_liveness_evidence`):
+
+- Liveness is derived from whatever authoritative sources actually exist:
+  the legacy state file (when present), a reachable ``loom-daemon`` registry
+  (best-effort), and per-issue worktree-lifetime locks under
+  ``.loom/locks/issue-<N>/``.
+- **The invariant: absent/unreadable liveness data ⇒ treat all building
+  issues as ALIVE (emit ZERO ``untracked_building`` orphans).** Absence of a
+  writer is *insufficient evidence* of orphanhood, not proof of it. We fail
+  toward preserving claims. Genuine-orphan cleanup is still handled by
+  ``loom-clean`` (lock-based revert) and the daemon reaper.
+
+The cross-check inputs are:
+
+- The liveness evidence above (roster + daemon + locks).
 - ``gh issue list --label loom:building`` (unchanged).
 
 Stuck-but-running detection lives in :mod:`loom_tools.stuck_detection` (2-min
@@ -45,7 +65,7 @@ from loom_tools.common.logging import log_error, log_info, log_success, log_warn
 from loom_tools.common.repo import find_repo_root
 from loom_tools.common.state import read_spawn_loop_state
 from loom_tools.common.time_utils import elapsed_seconds, format_duration, now_utc
-from loom_tools.models.spawn_loop_state import SpawnLoopState, SpawnLoopTask
+from loom_tools.models.spawn_loop_state import SpawnLoopState
 
 # Default heartbeat stale threshold (5 minutes for orphan recovery).
 # Intentionally higher than stuck_detection's 120s because orphan recovery
@@ -233,22 +253,146 @@ def _get_building_label_age(issue: int) -> int | None:
         return None
 
 
-def check_untracked_building(
+@dataclass
+class LivenessEvidence:
+    """Authoritative evidence of which sweeps are currently alive.
+
+    ``available`` is True when at least one authoritative liveness *source*
+    exists (a present state file, a reachable daemon registry, or one or more
+    ``.loom/locks/issue-<N>/`` locks). When it is False we have **no** evidence
+    either way, and the fail-safe (issue #3651) is to emit zero orphans.
+
+    ``live_issues`` is the union of issue numbers known to be alive across all
+    available sources. ``sources`` records which sources contributed, for
+    logging/observability.
+    """
+
+    available: bool = False
+    live_issues: set[int] = field(default_factory=set)
+    sources: list[str] = field(default_factory=list)
+
+
+def _locked_issue_numbers(repo_root: pathlib.Path) -> set[int]:
+    """Issue numbers with a live ``.loom/locks/issue-<N>/`` worktree lock.
+
+    These lock dirs are the ``mkdir``-atomic claim locks whose lifetime tracks
+    an in-flight worktree/sweep. A present lock is strong evidence the issue is
+    being actively worked. Missing/unreadable locks-dir yields an empty set.
+    """
+    locks_dir = repo_root / ".loom" / "locks"
+    if not locks_dir.is_dir():
+        return set()
+    out: set[int] = set()
+    try:
+        entries = list(locks_dir.iterdir())
+    except OSError:
+        return set()
+    for entry in entries:
+        if not entry.is_dir():
+            continue
+        name = entry.name
+        if not name.startswith("issue-"):
+            # Ignore non-issue locks (e.g. the repo-global ``worktree-add``
+            # lock created transiently by worktree.sh).
+            continue
+        try:
+            out.add(int(name[len("issue-") :]))
+        except ValueError:
+            continue
+    return out
+
+
+def _query_daemon_live_issues(repo_root: pathlib.Path) -> set[int] | None:
+    """Best-effort query of the ``loom-daemon`` sweep registry.
+
+    Returns the set of issue numbers with a live sweep in the daemon registry,
+    or ``None`` when the daemon is not reachable / no Python client is wired up
+    (the common case). The daemon is an **optional** secondary source — it is
+    never hard-required (issue #3651). Returning ``None`` means "daemon is not
+    a source right now", which is distinct from "daemon says nothing is live"
+    (an empty set).
+
+    A future follow-up may implement the IPC/MCP ``list_sweeps`` round-trip
+    here; today there is no Python IPC client, so this is a safe no-op stub.
+    """
+    return None
+
+
+def gather_liveness_evidence(
     spawn_loop_state: SpawnLoopState,
+    repo_root: pathlib.Path | None,
+) -> LivenessEvidence:
+    """Collect authoritative liveness evidence from all available sources.
+
+    Sources, unioned:
+
+    1. ``.loom/spawn-loop-state.json::running`` — legacy roster. Present only
+       when some writer exists (essentially never after v0.11.0).
+    2. ``loom-daemon`` registry via :func:`_query_daemon_live_issues` — optional,
+       best-effort; ``None`` means "not a source".
+    3. ``.loom/locks/issue-<N>/`` — per-issue worktree-lifetime locks.
+
+    ``available`` is True iff at least one of these sources is actually present.
+    When it is False the caller MUST NOT flag any building issue as orphaned.
+    """
+    live: set[int] = set()
+    sources: list[str] = []
+
+    if spawn_loop_state.present:
+        sources.append("spawn-loop-state.json")
+        live |= {task.issue for task in spawn_loop_state.running if task.issue}
+
+    if repo_root is not None:
+        daemon_issues = _query_daemon_live_issues(repo_root)
+        if daemon_issues is not None:
+            sources.append("loom-daemon")
+            live |= daemon_issues
+
+        locked = _locked_issue_numbers(repo_root)
+        if locked:
+            sources.append(".loom/locks")
+            live |= locked
+
+    return LivenessEvidence(
+        available=bool(sources),
+        live_issues=live,
+        sources=sources,
+    )
+
+
+def check_untracked_building(
+    evidence: LivenessEvidence,
     result: OrphanRecoveryResult,
     *,
     repo_root: pathlib.Path | None = None,
     label_grace_period: int = DEFAULT_LABEL_GRACE_PERIOD,
     verbose: bool = False,
 ) -> None:
-    """Find ``loom:building`` issues without an active spawn-loop task.
+    """Find ``loom:building`` issues that no live sweep is tracking.
 
-    Cross-references ``gh issue list --label loom:building`` against the
-    tracked issue set in ``.loom/spawn-loop-state.json::running``.  Issues
-    with a valid file-based claim are skipped (CLI-driven sweeps may hold
-    a claim without a spawn-loop entry).  Issues with a recently-applied
-    ``loom:building`` label are also skipped (label-age grace period).
+    Cross-references ``gh issue list --label loom:building`` against the live
+    issue set in *evidence* (roster + daemon + ``.loom/locks/``).  Issues with a
+    valid file-based claim are skipped (CLI-driven sweeps may hold a claim
+    without a lock).  Issues with a recently-applied ``loom:building`` label are
+    also skipped (label-age grace period).
+
+    **Fail-safe (issue #3651):** if *evidence* reports no authoritative liveness
+    source is available, this emits **zero** orphans — absence of a writer is
+    not proof of orphanhood, and tearing down a live sweep is the worst
+    possible outcome.
     """
+    # SAFETY GATE: with no authoritative liveness source we cannot distinguish
+    # a live sweep from an orphan, so we treat every building issue as ALIVE.
+    if not evidence.available:
+        log_warning(
+            "No authoritative liveness source available (no "
+            "spawn-loop-state.json, no reachable loom-daemon registry, no "
+            ".loom/locks/issue-<N>/ locks) — refusing to flag any loom:building "
+            "issue as orphaned (fail-safe: absent liveness data means treat "
+            "claims as ALIVE, not orphaned). See issue #3651."
+        )
+        return
+
     try:
         building_issues = gh_issue_list(labels=["loom:building"])
     except Exception as exc:
@@ -260,9 +404,7 @@ def check_untracked_building(
             log_info("No loom:building issues found")
         return
 
-    tracked_issues: set[int] = {
-        task.issue for task in spawn_loop_state.running if task.issue
-    }
+    tracked_issues: set[int] = evidence.live_issues
 
     for issue_data in building_issues:
         issue_num = issue_data.get("number", 0)
@@ -273,7 +415,10 @@ def check_untracked_building(
 
         if issue_num in tracked_issues:
             if verbose:
-                log_info(f"  OK: tracked in spawn-loop-state")
+                log_info(
+                    f"  OK: #{issue_num} tracked by live source "
+                    f"({', '.join(evidence.sources)})"
+                )
             continue
 
         # File-based claim check (primary protection, no API call).
@@ -669,17 +814,16 @@ def run_orphan_recovery(
 ) -> OrphanRecoveryResult:
     """Run all orphan detection phases and optionally recover.
 
-    Reads ``.loom/spawn-loop-state.json`` (Phase 1, #3374) and cross-checks
-    against ``gh issue list --label loom:building``.
+    Gathers authoritative liveness evidence (:func:`gather_liveness_evidence`)
+    and cross-checks it against ``gh issue list --label loom:building``. When no
+    liveness source is available the untracked-building check fails safe and
+    emits zero orphans (issue #3651).
 
-    Known invocation paths after Phase 3.1.6 (#3395):
+    Known invocation path:
 
     - CLI: ``./.loom/scripts/recover-orphaned-shepherds.sh [--recover]``
-      (script is a thin stub delegating here).
-    - Pre-Phase-3 daemon callers (``daemon_v2/iteration.py``,
-      ``daemon_cleanup.py``) still call ``run_orphan_recovery`` with the
-      same ``(repo_root, *, recover, verbose)`` signature; they retire as a
-      unit in Phase 3.3.
+      (script is a thin stub delegating here), also reachable from
+      ``/loom:sweep all`` aggressive mode.
 
     Returns an :class:`OrphanRecoveryResult` with all detected orphans and
     any recovery actions taken.
@@ -690,17 +834,27 @@ def run_orphan_recovery(
 
     spawn_loop_state = read_spawn_loop_state(repo_root)
 
-    if not spawn_loop_state.present and verbose:
-        log_info(
-            "No .loom/spawn-loop-state.json found — assuming no "
-            "spawn-loop tasks. Proceeding to forge cross-check only."
-        )
-        # An absent state file means "nothing tracked locally"; the forge
-        # cross-check still runs and may surface untracked-building orphans.
+    # Gather authoritative liveness evidence (roster + daemon + locks). When no
+    # source is available the untracked-building cross-check fails safe and
+    # emits zero orphans — see issue #3651.
+    evidence = gather_liveness_evidence(spawn_loop_state, repo_root)
 
-    # Phase A: cross-check loom:building issues against spawn-loop tasks.
+    if verbose:
+        if evidence.available:
+            log_info(
+                "Liveness sources: "
+                f"{', '.join(evidence.sources)} "
+                f"(live issues: {sorted(evidence.live_issues) or 'none'})"
+            )
+        else:
+            log_info(
+                "No authoritative liveness source found — untracked-building "
+                "cross-check will fail safe (emit zero orphans). See #3651."
+            )
+
+    # Phase A: cross-check loom:building issues against the live issue set.
     check_untracked_building(
-        spawn_loop_state,
+        evidence,
         result,
         repo_root=repo_root,
         label_grace_period=label_grace_period,
@@ -792,9 +946,13 @@ Recovery actions:
     reset_issue_label       - Swap loom:building -> loom:issue on issue
     cleanup_stale_worktree  - Remove stale worktree + branches (0 commits, no changes)
 
-Sources of truth:
-    .loom/spawn-loop-state.json           - Live spawn-loop tasks (Phase 1, #3374)
+Liveness sources (fail-safe, #3651):
+    .loom/spawn-loop-state.json           - Legacy roster (no writer post-v0.11.0)
+    loom-daemon registry                  - Optional, best-effort
+    .loom/locks/issue-<N>/                - Per-issue worktree-lifetime locks
     gh issue list --label loom:building   - Forge label cross-check
+  With NO authoritative liveness source, zero untracked_building orphans
+  are emitted (absent evidence => treat claims as ALIVE, not orphaned).
 
 Environment variables:
     LOOM_HEARTBEAT_STALE_THRESHOLD  Seconds before heartbeat is stale (default: 300)

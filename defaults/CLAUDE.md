@@ -1321,11 +1321,15 @@ loom-orphan-recovery --json
 - Adds recovery comments to affected issues
 - Removes stale lock dirs
 
-The daemon's 30-second reaper task usually catches this autonomously; `loom-orphan-recovery` is the manual cross-check.
+> **Fail-safe (#3651):** the untracked-building cross-check requires an authoritative liveness source (a present `.loom/spawn-loop-state.json`, a reachable `loom-daemon` registry, or `.loom/locks/issue-<N>/` locks). When **none** is available — e.g. after `spawn-loop.sh` was removed and no daemon is running — `loom-orphan-recovery` emits **zero** `untracked_building` orphans and recovers nothing. Absent liveness data means "treat every `loom:building` claim as ALIVE", never as orphaned. This prevents tearing down a live sweep that has been building for more than the label-grace window.
+
+The daemon's 30-second reaper task usually catches genuine orphans autonomously; `loom-orphan-recovery` is the manual cross-check.
 
 ### Stuck Agent Detection
 
-`loom-stuck-detection` checks for stuck sweep children by combining the daemon registry (via `mcp__loom__list_sweeps`) with `.loom/sweep-checkpoint/issue-<N>.json` checkpoint timestamps.
+`loom-stuck-detection` checks for stuck sweep children by reading per-task heartbeats in `.loom/spawn-loop-state.json::running[].last_heartbeat`.
+
+> **Note (post-v0.11.0):** `spawn-loop.sh` (the sole writer of `.loom/spawn-loop-state.json`) was deleted, so this file has no writer and `loom-stuck-detection` currently reports nothing — a safe no-op (report-only, never destructive). Repointing it to the `loom-daemon` registry (`mcp__loom__list_sweeps`) plus `.loom/sweep-checkpoint/issue-<N>.json` timestamps is a tracked follow-up (see `docs/migration/daemon-state-consumers.md`).
 
 **Check for stuck agents**:
 ```bash

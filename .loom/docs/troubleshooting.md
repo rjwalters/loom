@@ -224,7 +224,9 @@ When an agent crashes or is cancelled while building, issues can get stuck in `l
 
 ## Stuck Agent Detection
 
-`loom-stuck-detection` (post-v0.10.0) checks for stuck sweep children using the `loom-daemon` sweep registry (`mcp__loom__list_sweeps`) and `.loom/sweep-checkpoint/issue-<N>.json` checkpoint timestamps.
+`loom-stuck-detection` checks for stuck sweep children by reading the per-task heartbeats in `.loom/spawn-loop-state.json::running[].last_heartbeat`.
+
+> **Note (post-v0.11.0):** `spawn-loop.sh` — the only writer of `.loom/spawn-loop-state.json` — was deleted, so this file no longer has a writer. `loom-stuck-detection` therefore currently reports nothing (a safe no-op: it only reports, it never tears down work). Repointing it to the `loom-daemon` sweep registry (`mcp__loom__list_sweeps`) and `.loom/sweep-checkpoint/issue-<N>.json` timestamps is tracked as a follow-up (see `docs/migration/daemon-state-consumers.md`).
 
 ### Check for stuck agents
 
