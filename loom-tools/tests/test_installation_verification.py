@@ -29,7 +29,6 @@ EXPECTED_CLI_COMMANDS = [
     "loom-daemon-diagnostic",
     "loom-stuck-detection",
     "loom-claim",
-    "loom-check-completions",
     "loom-clean",
     "loom-worktree",
     "loom-cleanup",

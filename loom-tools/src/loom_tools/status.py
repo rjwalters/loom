@@ -342,15 +342,6 @@ def render_layer3_actions(
         lines.append(f"      {c.gray}(loom:curated is preserved to indicate curation status){c.reset}")
         lines.append("")
 
-    stop_loop = repo_root / ".loom" / "stop-spawn-loop"
-    lines.append(f"    {c.yellow}Spawn Loop Control:{c.reset}")
-    if stop_loop.exists():
-        lines.append(f"      - Cancel shutdown: {c.cyan}rm .loom/stop-spawn-loop{c.reset}")
-    else:
-        lines.append(f"      - Stop spawn loop: {c.cyan}touch .loom/stop-spawn-loop{c.reset}")
-    lines.append(f"      - View spawn loop state: {c.cyan}cat .loom/spawn-loop-state.json | jq{c.reset}")
-    lines.append("")
-
     # Stuck agent actions
     interventions_dir = repo_root / ".loom" / "interventions"
     if interventions_dir.is_dir() and any(interventions_dir.glob("*.json")):
@@ -562,17 +553,11 @@ EXAMPLES:
     # Get status as JSON for scripting
     loom-status --json | jq '.computed'
 
-FILES:
-    .loom/spawn-loop-state.json  Spawn loop state (#3374)
-    .loom/spawn-loop.pid         Spawn loop process ID
-    .loom/stop-spawn-loop        Spawn loop shutdown signal
-
 RELATED COMMANDS:
-    /loom                       Run the daemon (Layer 2, legacy)
-    ./.loom/scripts/spawn-loop.sh start    Run the spawn loop (Phase 1)
     /loom status                Equivalent to this script
-    touch .loom/stop-spawn-loop  Signal graceful spawn-loop shutdown
-    touch .loom/stop-daemon      Signal graceful daemon shutdown
+    /loom:sweep <issue>         Run a single-issue lifecycle
+    mcp__loom__dispatch_sweep   Dispatch a sweep against loom-daemon
+    touch .loom/stop-daemon     Signal graceful daemon shutdown
 """
 
 
