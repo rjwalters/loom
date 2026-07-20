@@ -1209,10 +1209,21 @@ echo ""
 for dir in "${REMOVE_DIRS[@]}"; do
   dir_path="$WORKTREE_ABS/$dir"
   if [[ -d "$dir_path" ]]; then
-    # Check if directory is empty (or only contains .DS_Store)
+    # Check if directory is empty (or only contains .DS_Store).
+    #
+    # Issue #3634: use `-mindepth 1` (any child) rather than `-type f` (regular
+    # files only). `-type f` does NOT count symlinks (type `l`) or sub-
+    # directories, so a directory whose only remaining content is a co-installed
+    # tool's symlink dir — e.g. Repo Skills' `.claude/commands/repo/` of
+    # symlinks — was judged "empty" and `rm -rf`'d, clobbering a foreign tool's
+    # install. `-mindepth 1 -not -name '.DS_Store'` counts symlinks, subdirs, and
+    # any other residual entry, so a directory still holding foreign content is
+    # correctly left alone. Genuinely-empty Loom-owned dirs still match (empty
+    # output) and are removed.
+    #
     # `-print -quit` (instead of piping to `head -1`) avoids SIGPIPE on `find`,
     # which under `set -o pipefail` would trip the EXIT trap and abort the script.
-    remaining=$(find "$dir_path" -type f -not -name '.DS_Store' -print -quit 2>/dev/null)
+    remaining=$(find "$dir_path" -mindepth 1 -not -name '.DS_Store' -print -quit 2>/dev/null)
     if [[ -z "$remaining" ]]; then
       rm -rf "$dir_path"
       REMOVED_LIST+=("$dir/ (empty directory)")
