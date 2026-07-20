@@ -3,10 +3,14 @@
 # Usage: ./install.sh [OPTIONS] [/path/to/target-repo]
 #
 # Options:
-#   -y, --yes    Non-interactive mode (skip confirmation prompts)
-#   --quick      Quick Install - direct install without GitHub workflow
-#   --full       Full Install - creates issue, worktree, and PR
-#   -h, --help   Show this help message
+#   -y, --yes                  Non-interactive mode (skip confirmation prompts)
+#   --quick                    Quick Install - direct install without GitHub workflow
+#   --full                     Full Install - creates issue, worktree, and PR
+#   --allow-non-main-source    Permit installing from a non-main / detached-HEAD Loom source
+#                              (forwarded to scripts/install-loom.sh)
+#   --allow-stale-target       Permit installing over a target whose Loom is newer/stale
+#                              (forwarded to scripts/install-loom.sh)
+#   -h, --help                 Show this help message
 #
 # Examples:
 #   ./install.sh --quick ~/projects/my-app
@@ -286,6 +290,11 @@ echo ""
 # Parse flags
 NON_INTERACTIVE=false
 INSTALL_TYPE=""
+# Source/target override flags accepted by scripts/install-loom.sh. The top-level
+# wrapper does not act on them (its source guard runs only in the delegated
+# installer), but it must accept and forward them so the flags it suggests
+# actually work. See issue #3650.
+SOURCE_OVERRIDE_FLAGS=()
 while [[ "${1:-}" == -* ]]; do
   case "$1" in
     -y|--yes)
@@ -310,19 +319,30 @@ while [[ "${1:-}" == -* ]]; do
       NON_INTERACTIVE=true  # --full implies non-interactive
       shift
       ;;
+    --allow-non-main-source|--allow-stale-target)
+      # Pass-through: accepted here so the wrapper's own suggestion works, then
+      # forwarded to scripts/install-loom.sh at the Full-Install delegation execs.
+      SOURCE_OVERRIDE_FLAGS+=("$1")
+      shift
+      ;;
     -h|--help)
       echo "Usage: ./install.sh [OPTIONS] [TARGET_PATH]"
       echo ""
       echo "Options:"
-      echo "  -y, --yes    Non-interactive mode (skip confirmation prompts)"
-      echo "  --quick      Quick Install - direct install without GitHub workflow"
-      echo "  --full       Full Install - creates issue, worktree, and PR"
-      echo "  -h, --help   Show this help message"
+      echo "  -y, --yes                  Non-interactive mode (skip confirmation prompts)"
+      echo "  --quick                    Quick Install - direct install without GitHub workflow"
+      echo "  --full                     Full Install - creates issue, worktree, and PR"
+      echo "  --allow-non-main-source    Permit installing from a non-main / detached-HEAD"
+      echo "                             Loom source (forwarded to scripts/install-loom.sh)"
+      echo "  --allow-stale-target       Permit installing over a newer/stale target"
+      echo "                             (forwarded to scripts/install-loom.sh)"
+      echo "  -h, --help                 Show this help message"
       echo ""
       echo "Examples:"
       echo "  ./install.sh --quick ~/projects/my-app"
       echo "  ./install.sh --full /path/to/team-project"
       echo "  ./install.sh -y ~/projects/my-app  # Non-interactive, defaults to quick install"
+      echo "  ./install.sh --yes --allow-non-main-source /path/to/target  # Install from a non-main source"
       exit 0
       ;;
     *)
@@ -885,7 +905,7 @@ elif [[ -d "$TARGET_PATH/.loom" ]]; then
   if [[ "$NON_INTERACTIVE" == true ]]; then
     INSTALL_FLAGS+=(--yes)
   fi
-  exec "$LOOM_ROOT/scripts/install-loom.sh" ${INSTALL_FLAGS[@]+"${INSTALL_FLAGS[@]}"} "$TARGET_PATH"
+  exec "$LOOM_ROOT/scripts/install-loom.sh" ${INSTALL_FLAGS[@]+"${INSTALL_FLAGS[@]}"} ${SOURCE_OVERRIDE_FLAGS[@]+"${SOURCE_OVERRIDE_FLAGS[@]}"} "$TARGET_PATH"
 else
   FORCE_FLAG=""
   SELF_INSTALL=false
@@ -1091,7 +1111,7 @@ case "$METHOD" in
     echo ""
 
     # Run the full installation workflow
-    exec "$LOOM_ROOT/scripts/install-loom.sh" $FORCE_FLAG "$TARGET_PATH"
+    exec "$LOOM_ROOT/scripts/install-loom.sh" $FORCE_FLAG ${SOURCE_OVERRIDE_FLAGS[@]+"${SOURCE_OVERRIDE_FLAGS[@]}"} "$TARGET_PATH"
     ;;
 esac
 

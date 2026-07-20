@@ -40,6 +40,7 @@ warn() {
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 LOOM_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 INSTALL_SCRIPT="$LOOM_ROOT/scripts/install-loom.sh"
+WRAPPER_SCRIPT="$LOOM_ROOT/install.sh"
 UNINSTALL_SCRIPT="$LOOM_ROOT/scripts/uninstall-loom.sh"
 DEFAULTS_DIR="$LOOM_ROOT/defaults"
 
@@ -1496,6 +1497,75 @@ if echo "$STDERR_45" | grep -q 'install\.sh'; then
   pass "flag-rejection stderr contains 'install.sh' hint text"
 else
   fail "flag-rejection stderr is missing 'install.sh' hint (stderr=$STDERR_45)"
+fi
+echo ""
+
+# ==========================================================================
+# Section 8b: Wrapper Pass-Through Flags (#3650)
+# ==========================================================================
+# The top-level install.sh wrapper previously rejected --allow-non-main-source
+# and --allow-stale-target with "Unknown flag" even though it suggested the
+# former in its own delegated installer, and its delegation execs forwarded
+# only --yes/$FORCE_FLAG. These tests verify the wrapper now accepts and
+# forwards the two source/target override flags that scripts/install-loom.sh
+# already honors.
+echo "--- Section 8b: Wrapper Pass-Through Flags (#3650) ---"
+echo ""
+
+# Test 48: install.sh --allow-non-main-source is NOT rejected as an unknown flag.
+# Trailing --help makes the parser exit 0 after accumulating the pass-through
+# flag, so no real install runs. A rejected flag would error before --help.
+echo "Test 48: install.sh accepts --allow-non-main-source (no 'Unknown flag')"
+OUT_48=$("$WRAPPER_SCRIPT" --allow-non-main-source --help 2>&1 || true)
+if echo "$OUT_48" | grep -q 'Unknown flag'; then
+  fail "install.sh rejected --allow-non-main-source (out=$OUT_48)"
+elif echo "$OUT_48" | grep -q 'Usage:'; then
+  pass "--allow-non-main-source accepted (parser reached --help)"
+else
+  fail "install.sh --allow-non-main-source produced unexpected output (out=$OUT_48)"
+fi
+echo ""
+
+# Test 49: install.sh --allow-stale-target is likewise accepted.
+echo "Test 49: install.sh accepts --allow-stale-target (no 'Unknown flag')"
+OUT_49=$("$WRAPPER_SCRIPT" --allow-stale-target --help 2>&1 || true)
+if echo "$OUT_49" | grep -q 'Unknown flag'; then
+  fail "install.sh rejected --allow-stale-target (out=$OUT_49)"
+elif echo "$OUT_49" | grep -q 'Usage:'; then
+  pass "--allow-stale-target accepted (parser reached --help)"
+else
+  fail "install.sh --allow-stale-target produced unexpected output (out=$OUT_49)"
+fi
+echo ""
+
+# Test 50: a genuinely unknown flag is still rejected by install.sh.
+echo "Test 50: install.sh still rejects a genuinely unknown flag"
+OUT_50=$("$WRAPPER_SCRIPT" --bogus /tmp/fakepath 2>&1 || true)
+if echo "$OUT_50" | grep -q 'Unknown flag: --bogus'; then
+  pass "--bogus rejected with 'Unknown flag: --bogus'"
+else
+  fail "install.sh should reject --bogus with 'Unknown flag' (out=$OUT_50)"
+fi
+echo ""
+
+# Test 51: install.sh --help documents the two pass-through flags.
+echo "Test 51: install.sh --help lists the pass-through flags"
+OUT_51=$("$WRAPPER_SCRIPT" --help 2>&1 || true)
+if echo "$OUT_51" | grep -q -- '--allow-non-main-source' && echo "$OUT_51" | grep -q -- '--allow-stale-target'; then
+  pass "--help documents --allow-non-main-source and --allow-stale-target"
+else
+  fail "install.sh --help is missing pass-through flag documentation (out=$OUT_51)"
+fi
+echo ""
+
+# Test 52: both Full-Install delegation execs forward the pass-through array so
+# the accepted flags actually reach scripts/install-loom.sh.
+echo "Test 52: install.sh forwards SOURCE_OVERRIDE_FLAGS at both delegation execs"
+FORWARD_COUNT=$(grep -c 'install-loom.sh".*SOURCE_OVERRIDE_FLAGS\[@\]' "$WRAPPER_SCRIPT" || true)
+if [[ "$FORWARD_COUNT" -eq 2 ]]; then
+  pass "both delegation execs forward SOURCE_OVERRIDE_FLAGS (count=$FORWARD_COUNT)"
+else
+  fail "expected 2 delegation execs forwarding SOURCE_OVERRIDE_FLAGS, found $FORWARD_COUNT"
 fi
 echo ""
 
