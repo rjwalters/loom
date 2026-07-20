@@ -1209,10 +1209,31 @@ echo ""
 for dir in "${REMOVE_DIRS[@]}"; do
   dir_path="$WORKTREE_ABS/$dir"
   if [[ -d "$dir_path" ]]; then
-    # Check if directory is empty (or only contains .DS_Store)
+    # Check if directory holds foreign content (files or symlinks), ignoring
+    # empty subdirectories and .DS_Store.
+    #
+    # Issue #3634: count files AND symlinks — `\( -type f -o -type l \)` — rather
+    # than `-type f` (regular files only) or `-mindepth 1` (any child).
+    #
+    # `-type f` alone does NOT count symlinks (type `l`), so a directory whose
+    # only remaining content is a co-installed tool's symlink dir — e.g. Repo
+    # Skills' `.claude/commands/repo/` of symlinks — was judged "empty" and
+    # `rm -rf`'d, clobbering a foreign tool's install (the original bug).
+    #
+    # `-mindepth 1` over-corrects: it counts empty subdirectories as content.
+    # `REMOVE_DIRS` is NOT strictly child-first (`.loom/scripts` precedes
+    # `.loom/scripts/cli`), so a parent dir gets checked while its still-empty
+    # child exists → deemed non-empty → left behind, orphaning real Loom cruft
+    # (regressing CI Test 29).
+    #
+    # `\( -type f -o -type l \)` is the right signal: files/symlinks are foreign
+    # content to PRESERVE, while empty dirs are Loom cruft to REMOVE. A foreign
+    # symlink dir keeps its symlink (found → preserved); a Loom dir holding only
+    # empty subdirs finds nothing → removed. Order-independent.
+    #
     # `-print -quit` (instead of piping to `head -1`) avoids SIGPIPE on `find`,
     # which under `set -o pipefail` would trip the EXIT trap and abort the script.
-    remaining=$(find "$dir_path" -type f -not -name '.DS_Store' -print -quit 2>/dev/null)
+    remaining=$(find "$dir_path" \( -type f -o -type l \) -not -name '.DS_Store' -print -quit 2>/dev/null)
     if [[ -z "$remaining" ]]; then
       rm -rf "$dir_path"
       REMOVED_LIST+=("$dir/ (empty directory)")
