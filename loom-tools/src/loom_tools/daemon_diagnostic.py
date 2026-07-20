@@ -316,7 +316,7 @@ def run_health_check() -> HealthReport:
     if not report.validation.valid:
         if report.validation.status == "missing":
             report.add_critical("Spawn-loop state file not found")
-            report.add_recommendation("Start the spawn loop with: LOOM_USE_SPAWN_LOOP=1 ./.loom/scripts/spawn-loop.sh start")
+            report.add_recommendation("Dispatch work via mcp__loom__dispatch_sweep against loom-daemon, or run /loom:sweep <issue>")
         elif report.validation.status in ("corrupt", "incomplete"):
             report.add_critical("Spawn-loop state file is corrupt or incomplete")
             report.add_recommendation("Delete .loom/spawn-loop-state.json and restart the spawn loop")
@@ -435,7 +435,7 @@ def format_human_output(report: HealthReport) -> str:
             lines.append(f"  Started: {report.daemon_started_at} ({time_ago(report.daemon_started_at)})")
     elif report.validation.status == "missing":
         lines.append("  CRITICAL: State file not found")
-        lines.append("  Start the spawn loop: LOOM_USE_SPAWN_LOOP=1 ./.loom/scripts/spawn-loop.sh start")
+        lines.append("  Dispatch work: mcp__loom__dispatch_sweep against loom-daemon, or /loom:sweep <issue>")
     elif report.validation.status in ("corrupt", "incomplete"):
         lines.append("  CRITICAL: State file is invalid")
         lines.append(f"  {report.validation.details}")
