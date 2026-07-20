@@ -459,6 +459,20 @@ assert_ask "Ask for git clean -fd" \
 assert_ask "Ask for git checkout ." \
     "git checkout ."
 
+# --- git read-tree without GIT_INDEX_FILE isolation (#3637) ---
+# A bare `git read-tree` empties the real staging index with no reflog trace.
+assert_ask "Ask for bare git read-tree (#3637)" \
+    "git read-tree"
+
+assert_ask "Ask for git read-tree with a tree-ish but no GIT_INDEX_FILE (#3637)" \
+    "git read-tree HEAD"
+
+assert_ask "Ask for git read-tree -m merge sim without isolation (#3637)" \
+    "git read-tree -m HEAD origin/main"
+
+assert_ask "Ask for git read-tree at the end of a compound command (#3637)" \
+    "git fetch origin && git read-tree origin/main"
+
 assert_ask "Ask for gh pr close" \
     "gh pr close 42"
 
@@ -573,6 +587,21 @@ assert_allow "Allow docker logs (read-only)" \
 
 assert_allow "Allow sky status (read-only)" \
     "sky status"
+
+# --- git read-tree isolated via GIT_INDEX_FILE is allowed (#3637) ---
+assert_allow "Allow GIT_INDEX_FILE-isolated git read-tree (#3637)" \
+    "GIT_INDEX_FILE=\$(mktemp) git read-tree HEAD"
+
+assert_allow "Allow GIT_INDEX_FILE-isolated git read-tree with explicit temp path (#3637)" \
+    "GIT_INDEX_FILE=/tmp/idx.\$\$ git read-tree origin/main"
+
+# --- the safe, index-free merge-preview alternative is never guarded (#3637) ---
+assert_allow "Allow git merge-tree --write-tree (safe merge preview, #3637)" \
+    "git merge-tree --write-tree origin/main feature/my-branch"
+
+# --- git commit-tree does not mutate the index and is not guarded (#3637) ---
+assert_allow "Allow git commit-tree (does not touch the index, #3637)" \
+    "git commit-tree abc123 -m 'msg'"
 
 echo ""
 

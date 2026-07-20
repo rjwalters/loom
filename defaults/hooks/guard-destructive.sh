@@ -746,6 +746,33 @@ for pattern in "${ASK_PATTERNS[@]}"; do
 done
 
 # =============================================================================
+# git read-tree WITHOUT an isolating GIT_INDEX_FILE assignment
+#
+# A bare `git read-tree` (no tree-ish, no isolated index) is equivalent to
+# `git read-tree --empty`: it clobbers the repository's REAL staging index,
+# turning every tracked file into a phantom staged deletion. The working tree
+# and HEAD are left untouched and NO reflog entry is written, so the corruption
+# is silent and near-invisible (issue #3637 — a judge ran one against the main
+# checkout during a merge simulation and emptied the live index).
+#
+# This is an ASK (not a deny) because it is generic git hygiene, not a Loom
+# workflow rule, and an isolated form is legitimate. It is kept narrow: the
+# safe, index-free path is `git merge-tree --write-tree <base> <branch>` for a
+# merge preview, or `GIT_INDEX_FILE=$(mktemp) git read-tree <tree>` when a
+# temporary index really is needed. Any command that carries a `GIT_INDEX_FILE=`
+# assignment is treated as isolated and passes through untouched.
+#
+# `git commit-tree` is intentionally NOT guarded here — it writes a commit
+# object from an existing tree and does not mutate the index.
+# =============================================================================
+if echo "$COMMAND_NO_COMMENT" | grep -qE '(^|[;&|(]|[[:space:]])git[[:space:]]+read-tree'; then
+    # Isolated form (GIT_INDEX_FILE=... git read-tree ...) is allowed.
+    if ! echo "$COMMAND_NO_COMMENT" | grep -qE 'GIT_INDEX_FILE='; then
+        ask "Command requires confirmation: $COMMAND (a bare 'git read-tree' empties the real staging index with no reflog trace; use 'git merge-tree --write-tree <base> <branch>' for a merge preview, or isolate with GIT_INDEX_FILE=\$(mktemp))"
+    fi
+fi
+
+# =============================================================================
 # CLOUD CLI ASK patterns — gated by the cloud CLI guard toggle
 #
 # Kept separate from ASK_PATTERNS so cloud-dev repos can opt out
