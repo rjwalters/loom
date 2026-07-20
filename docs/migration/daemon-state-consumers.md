@@ -35,6 +35,31 @@ The Tauri desktop app the issue speculated about does not exist in this repo. Th
 > (b) is a cross-session log (`issue-failures.json`, `recovery-events.json`) that already lives outside `daemon-state.json` and survives the deletion as-is.
 > If a per-consumer review later decides a minimal-compat shape *is* worth it, that's a follow-up issue per #3377's "Out of Scope" section.
 
+## Post-spawn-loop-deletion fail-safe dispositions (#3651)
+
+`spawn-loop.sh` — the only writer of `.loom/spawn-loop-state.json` — was removed
+in v0.11.0. With no writer the roster is permanently empty, which turned the two
+**destructive** `spawn-loop-state.json` consumers into false-orphan hazards:
+they would flip a live `loom:building` claim back to `loom:issue` (and possibly
+clean its worktree) mid-build. Issue #3651 makes both fail safe and records the
+disposition of every remaining consumer.
+
+| Consumer | Live? | Destructive? | Disposition (#3651) |
+|---|---|---|---|
+| `orphan_recovery.py` (`loom-recover-orphans`, `/loom:sweep all --recover`) | yes | yes | **FIXED.** Liveness repointed to `gather_liveness_evidence()` (present state file ∪ best-effort daemon registry ∪ `.loom/locks/issue-<N>/`). **Fail-safe:** with no authoritative source available, `check_untracked_building` emits **zero** `untracked_building` orphans. Absent evidence ⇒ treat claims as ALIVE. |
+| `clean.py::_revert_stale_building_labels_spawn_loop` (`loom-clean`) | yes | yes | **FIXED.** Same guard: no state file **and** no `.loom/locks/issue-<N>/` locks ⇒ revert nothing. |
+| `daemon_cleanup.py::_run_orphan_recovery` | no (no entry point; superseded by `cleanup.py`) | was yes | **REMOVED.** Dead orphan-recovery call path deleted; use `loom-recover-orphans` (now fail-safe) or `loom-clean`. |
+| `stuck_detection.py` (`loom-stuck-detection`) | yes | no (report only) | **Deferred (safe no-op today).** Still reads `.loom/spawn-loop-state.json::running[].last_heartbeat`; with no writer it reports nothing. Docs (`defaults/CLAUDE.md`, `.loom/docs/troubleshooting.md`) corrected to match code. Repoint to `mcp__loom__list_sweeps` + sweep-checkpoint timestamps is a follow-up. |
+| `status.py` (`loom-status`) | yes | no | **Deferred (safe no-op today).** Renders "spawn loop not present". Repoint is a follow-up. |
+| `health_monitor.py` (`loom-health-monitor`) | yes | no | **Deferred (safe no-op today).** `spawn_loop_present=False`. Repoint is a follow-up. |
+| `daemon_diagnostic.py` (`loom-daemon-diagnostic`) | yes | no | **Deferred (safe no-op today).** Reports daemon not running. Repoint is a follow-up. |
+| `SpawnLoopState` model / `read_spawn_loop_state` / `LoomPaths.spawn_loop_state_file` | infra | no | **Keep** until the last reader is repointed, then retire (follow-up). |
+
+The four deferred reporters are **report-only** — they never tear down work — so
+they do not gate the safety fix. Repointing them (and retiring the
+`SpawnLoopState` model + path) to `mcp__loom__list_sweeps` is the explicit
+follow-up to #3651.
+
 ## Method
 
 Codebase scans (as specified in the issue):

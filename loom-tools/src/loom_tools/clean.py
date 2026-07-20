@@ -987,7 +987,29 @@ def _revert_stale_building_labels_spawn_loop(
     :mod:`loom_tools.orphan_recovery` performs, scoped down for cleanup.
 
     Returns the number of labels reverted (0 for dry-run skip or no orphans).
+
+    Fail-safe (#3651): the historical writer of
+    ``.loom/spawn-loop-state.json`` (``spawn-loop.sh``) was deleted in v0.11.0.
+    With no writer, ``_active_spawn_loop_issues`` collapses to just the
+    ``.loom/locks/`` set. If there is **no** authoritative liveness source at
+    all — no state file AND no ``.loom/locks/issue-<N>/`` locks — we cannot
+    distinguish a live sweep from an orphan, so we refuse to revert any label.
+    Absent liveness data means treat claims as ALIVE, not orphaned.
     """
+    # SAFETY GATE: refuse to revert when we have no authoritative liveness
+    # evidence. Absent state file AND no per-issue locks would otherwise make
+    # every open loom:building issue look orphaned (see issue #3651).
+    state_present = read_spawn_loop_state(repo_root).present
+    locked_issues = _active_locked_issues(repo_root)
+    if not state_present and not locked_issues:
+        log_warning(
+            "  No authoritative liveness source (no spawn-loop-state.json, no "
+            ".loom/locks/issue-<N>/ locks) — skipping loom:building revert "
+            "(fail-safe: absent liveness data means treat claims as ALIVE, "
+            "not orphaned). See issue #3651."
+        )
+        return 0
+
     active = _active_spawn_loop_issues(repo_root)
     try:
         result = gh_run(

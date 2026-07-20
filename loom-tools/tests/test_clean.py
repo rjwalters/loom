@@ -448,3 +448,84 @@ class TestEvaluateAggressiveCandidateGate:
         )
         assert decision == DECISION_KEEP
         assert reason == "user_owned"
+
+
+# ---------------------------------------------------------------------------
+# _revert_stale_building_labels_spawn_loop — SAFETY fail-safe (#3651)
+# ---------------------------------------------------------------------------
+#
+# Sibling hazard to orphan_recovery: after spawn-loop.sh deletion nothing
+# writes .loom/spawn-loop-state.json, so the "active" set collapsed to just
+# .loom/locks/. With no locks either, EVERY open loom:building issue looked
+# orphaned and got flipped back to loom:issue. The guard: no authoritative
+# liveness source (no state file AND no locks) => revert nothing.
+
+
+class TestRevertStaleBuildingFailSafe:
+    """The no-writer regression for ``loom-clean``'s label-revert path."""
+
+    @staticmethod
+    def _make_repo(tmp_path: pathlib.Path) -> pathlib.Path:
+        (tmp_path / ".loom").mkdir(parents=True, exist_ok=True)
+        return tmp_path
+
+    @staticmethod
+    def _make_lock(repo: pathlib.Path, issue: int) -> None:
+        (repo / ".loom" / "locks" / f"issue-{issue}").mkdir(parents=True, exist_ok=True)
+
+    def test_no_liveness_source_reverts_nothing(self, tmp_path: pathlib.Path) -> None:
+        from loom_tools.clean import _revert_stale_building_labels_spawn_loop
+
+        repo = self._make_repo(tmp_path)  # no state file, no locks
+
+        # gh must not even be consulted — the guard returns before listing.
+        with mock.patch(
+            "loom_tools.clean.gh_run",
+            side_effect=AssertionError("gh_run must not be called (fail-safe)"),
+        ), mock.patch(
+            "loom_tools.clean.subprocess.run",
+            side_effect=AssertionError("no `gh issue edit` allowed"),
+        ):
+            reverted = _revert_stale_building_labels_spawn_loop(repo, dry_run=False)
+
+        assert reverted == 0
+
+    def test_active_lock_present_source_reverts_genuine_orphan(
+        self, tmp_path: pathlib.Path
+    ) -> None:
+        from loom_tools.clean import _revert_stale_building_labels_spawn_loop
+
+        repo = self._make_repo(tmp_path)
+        self._make_lock(repo, 999)  # a live sweep -> locks is an active source
+
+        edits: list[list[str]] = []
+
+        def _fake_subprocess_run(args, **kwargs):  # noqa: ANN001 - test stub
+            edits.append(list(args))
+            return _make_completed(returncode=0)
+
+        with mock.patch(
+            "loom_tools.clean.gh_run",
+            return_value=_make_completed(stdout="42\n", returncode=0),
+        ), mock.patch("loom_tools.clean.subprocess.run", _fake_subprocess_run):
+            reverted = _revert_stale_building_labels_spawn_loop(repo, dry_run=False)
+
+        assert reverted == 1
+        assert any(a[:3] == ["gh", "issue", "edit"] and "42" in a for a in edits)
+
+    def test_locked_issue_not_reverted(self, tmp_path: pathlib.Path) -> None:
+        from loom_tools.clean import _revert_stale_building_labels_spawn_loop
+
+        repo = self._make_repo(tmp_path)
+        self._make_lock(repo, 42)  # #42 itself is locked -> alive
+
+        with mock.patch(
+            "loom_tools.clean.gh_run",
+            return_value=_make_completed(stdout="42\n", returncode=0),
+        ), mock.patch(
+            "loom_tools.clean.subprocess.run",
+            side_effect=AssertionError("locked issue must not be reverted"),
+        ):
+            reverted = _revert_stale_building_labels_spawn_loop(repo, dry_run=False)
+
+        assert reverted == 0
