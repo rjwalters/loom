@@ -7,17 +7,49 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.11.0] - 2026-07-18
+## [0.11.0] - 2026-07-20
 
 > **MINOR version bump** — the rm-guard default change below is a behaviour change, not a bug fix.
+
+### Summary
+
+Minor release headlined by a **safe-by-default rm guard** (the `guards.rmScope` default flips `off`→`repo`) and the **deletion of the deprecated `spawn-loop.sh`**, completing the v0.10.0 orchestration-architecture migration. Also lands a batch of installer / worktree / guard hardening fixes, two safety fixes to the `/sweep` orchestration itself (fail-safe orphan recovery and intra-wave collision revalidation), and broad doc reconciliation.
 
 ### Changed
 
 - **BREAKING (behaviour): `guards.rmScope` now defaults to `repo` instead of `off`** — `guard-destructive.sh` runs the repo-scoped `rm` guard by default: an outside-repo recursive `rm` (e.g. `rm -rf /Users/someone/important`) is now **denied** out of the box, while the `/tmp` + Claude-scratchpad ephemeral allowlist and in-repo/worktree paths stay allowed. The catastrophic top-level denies (bare `/tmp`, `/`, `$HOME`) are unchanged. This reverses #3617's "existing installs see zero behaviour change" guarantee as a deliberate, signed-off ADR decision (Option B). Consumers who relied on the old permissive default must opt out with `guards.rmScope: "off"` (synonym: `"permissive"`) in `.loom/config.json` or `LOOM_RM_SCOPE=off`. (#3628)
+- **`/sweep` revalidates overlapping PRs within a wave before merging** — after each in-wave merge, a PR that touches files the just-merged PR changed is rebased onto the freshly-merged `main` and re-Judged (or Doctored) before it merges; a post-wave `buildGate`-against-`main` backstop catches semantic collisions across disjoint file paths. Prevents individually-green parallel-builder PRs from colliding and breaking `main`. (#3647)
+
+### Fixed
+
+- **Installer: worktree-safe git-repo detection** — `install.sh`, `scripts/install/validate-target.sh`, and `scripts/uninstall-loom.sh` no longer misdetect a linked git worktree (whose `.git` is a file, not a directory) as a non-repo and offer a destructive `git init`. (#3649)
+- **Installer: `--allow-non-main-source` / `--allow-stale-target` accepted and forwarded** — the top-level `install.sh` wrapper now accepts the override flags it previously suggested but rejected as "Unknown flag", and forwards them to the delegated installer. (#3650)
+- **Uninstall no longer clobbers co-installed tool symlinks** — the empty-directory cleanup counts symlinks and subdirs (`\( -type f -o -type l \)`), so a `.claude/` dir holding another tool's symlinks (e.g. Repo Skills) is preserved instead of `rm -rf`'d. (#3634)
+- **`worktree.sh` guards `core.hooksPath` on `.githooks/` existence** — no longer points git at a dangling hooks path in repos without a `.githooks/` directory. (#3638)
+- **Managed `.gitignore` block covers `.loom/sweep-checkpoint/` and `.loom/locks/`** runtime dirs, matching their sibling runtime paths. (#3635)
+- **`check-main-clean.sh` no longer false-positives on pre-existing working-tree changes** — the `/sweep` builder-contamination backstop now takes a baseline snapshot before the wave and flags only newly-introduced changes; the no-argument invocation stays byte-for-byte back-compatible. (#3648)
+- **Guard performance check is warn-not-fail** — the load-dependent ~200ms perf assertion in `test-guard-destructive.sh` no longer produces spurious CI failures; a hard gate remains opt-in via `LOOM_GUARD_PERF_STRICT=1` against an env-overridable `LOOM_GUARD_PERF_MAX_MS`. (#3653)
+- **Repointed remaining broken `WORKFLOWS.md` links** to `docs/workflows.md`. (#3627)
+
+### Security
+
+- **Judge tooling can no longer silently empty the main-checkout git index** — judge guidance now forbids index-mutating git plumbing (bare `git read-tree`, `git reset`) in the main checkout and prescribes the index-free `git merge-tree --write-tree` / `GIT_INDEX_FILE` isolation; a new `ask`-tier `guard-destructive.sh` pattern catches a bare `git read-tree`. Closes a footgun that left thousands of phantom staged deletions in the main worktree. (#3637)
+- **Fail-safe orphan recovery** — `orphan_recovery.py` (and the `loom-clean` sibling) now emit zero orphans when no authoritative liveness source is present, so a live `loom:building` claim can never be reclaimed mid-flight now that this release removes the `spawn-loop-state.json` writer. (#3651)
 
 ### Removed
 
 - **Deprecated `defaults/scripts/spawn-loop.sh` and its deprecation-warning shims** (v0.11.0 deletion target of the #3372 / #3449 orchestration-architecture migration). The v0.9.x minimal multi-account spawn loop was soft-deprecated throughout v0.10.x with a stderr banner on every invocation; v0.11.0 deletes the script, its smoke test (`defaults/scripts/tests/test-spawn-loop.sh`), the now-orphaned centralized deprecation-warning helpers (`defaults/scripts/lib/deprecation.sh`, `loom-tools/src/loom_tools/common/deprecation.py` and its test), and the Rust doc-lint that pinned the deprecation banner in place (`loom-daemon/tests/spawn_loop_deprecation_doc_lint.rs`). The replacement is `mcp__loom__dispatch_sweep` against `loom-daemon`. See [`docs/migration/v0.10.0-shepherd-deprecation.md`](docs/migration/v0.10.0-shepherd-deprecation.md). (#3631)
+- **Dead `loom-check-completions` CLI and stale `spawn-loop.sh` operator advice** — removed the no-op completions module (its only input was the now-unwritten spawn-loop state) and the runnable advice strings pointing operators at the deleted script. (#3633)
+- **Three orphaned scripts with no live callers** — `clean-log.sh`, `test-plan-metrics.sh`, and `enable-skill-routing.sh` (they otherwise shipped downstream as dead copies). (#3639)
+
+### Documentation
+
+- **README front door repointed off the deprecated spawn loop** to the current `loom-daemon` Tier 2 surface. (#3623)
+- **Reconciled stale spawn-loop / `daemon.sh` references** across `CLAUDE.md`, `defaults/CLAUDE.md`, `docs/agents.md`, `docs/philosophy/loom-intelligence.md`, the v0.10.0 migration guides, and `validate-toolchain.sh` / `check-host-sleep.sh` header comments; fixed several broken internal doc links (`LABEL_WORKFLOW.md`, `loom-daemon/README.md`, `.loom/CLAUDE.md` anchors). (#3636, #3652)
+
+### Dependencies
+
+- Bumped the cargo `all-dependencies` group (5 updates) and `actions/setup-node` 6→7. (#3640, #3641)
 
 ## [0.10.10] - 2026-07-18
 
