@@ -363,8 +363,8 @@ TARGET_PATH="$(cd "$TARGET_PATH" && pwd 2>/dev/null)" || \
 info "Target repository: $TARGET_PATH"
 echo ""
 
-# Check if it's a git repository
-if [[ ! -d "$TARGET_PATH/.git" ]]; then
+# Check if it's a git repository (worktree-safe: a linked worktree's .git is a file)
+if ! git -C "$TARGET_PATH" rev-parse --git-dir >/dev/null 2>&1; then
   warning "$TARGET_PATH is not a git repository."
   echo ""
   echo "Would you like to initialize git and optionally set up GitHub?"

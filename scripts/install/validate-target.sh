@@ -38,8 +38,8 @@ TARGET_PATH="$(cd "$TARGET_PATH" && pwd)" || error "Target path does not exist: 
 
 info "Validating target: $TARGET_PATH"
 
-# Check if target is a git repository
-if [[ ! -d "$TARGET_PATH/.git" ]]; then
+# Check if target is a git repository (worktree-safe: a linked worktree's .git is a file)
+if ! git -C "$TARGET_PATH" rev-parse --git-dir >/dev/null 2>&1; then
   error "Target is not a git repository: $TARGET_PATH"
 fi
 success "Git repository detected"
