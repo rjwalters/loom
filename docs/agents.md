@@ -342,16 +342,18 @@ Every 15 minutes: Review issue backlog, update priorities and organization
 
 ### Setting Up Autonomous Agents (post-v0.10.0)
 
-> **The Python `loom-daemon` brain was removed in v0.10.0; the shell-level
-> daemon surface is preserved.** Historical guidance like "start the
+> **The Python `loom-daemon` brain was removed in v0.10.0 and replaced by
+> the Rust `loom-daemon` binary.** Historical guidance like "start the
 > daemon, it manages roles on a schedule, and spawns shepherds per issue"
 > no longer matches the codebase — the Python brain, the shepherd pool,
 > and the `/shepherd` slash command were all deleted as part of the
-> shepherd/daemon deprecation epic (#3372). However,
-> `./.loom/scripts/daemon.sh` (start/stop/status) survives, re-implemented
-> as a tmux session launcher around the spawn loop + GitHub Actions cron +
-> token-rotated separate Claude Code sessions. For the breaking-change
-> inventory and per-CLI replacement table, see
+> shepherd/daemon deprecation epic (#3372). The Tier 2 surface today is the
+> Rust `loom-daemon` binary, which exposes MCP-level dispatch
+> (`mcp__loom__dispatch_sweep`, `mcp__loom__list_sweeps`,
+> `mcp__loom__cancel_sweep`, plus the event bus) for token-rotated
+> `/loom:sweep` children, alongside GitHub Actions cron for the periodic
+> support roles. For the breaking-change inventory and per-CLI replacement
+> table, see
 > [`docs/migration/v0.10.0-shepherd-deprecation.md`](migration/v0.10.0-shepherd-deprecation.md)
 > and [`.loom/docs/daemon-reference.md`](../.loom/docs/daemon-reference.md).
 
