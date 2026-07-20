@@ -899,6 +899,17 @@ For each wave `W` (partition of the issue list into chunks of up to `--builders-
 
 See `.claude/commands/loom/shepherd-lifecycle.md` for the canonical phase-by-phase reference, label state machine, and recovery procedures. The summary below tells you which skill to invoke at each phase; the lifecycle reference tells you what each phase does in detail.
 
+### 0. Snapshot the main-worktree baseline (once, before wave 1) (#3648)
+
+**Before dispatching the first wave's builders**, snapshot main's current working-tree state so the per-wave contamination backstop (step 4's `check-main-clean.sh`) can distinguish builder contamination from dirt that predated the sweep:
+
+```bash
+MAIN_CLEAN_BASELINE=".loom/sweep-checkpoint/main-clean-baseline.txt"
+./.loom/scripts/check-main-clean.sh --snapshot "$MAIN_CLEAN_BASELINE"
+```
+
+Capture this **once, before wave 1 — never per-wave**. The baseline must reflect the pre-sweep state so that if an early wave contaminates main and the dirt is not reverted, every later wave's backstop still flags it (a per-wave re-snapshot would silently absorb that contamination into the "pre-existing" set). The baseline path is a gitignored per-sweep-run transient (`.loom/sweep-checkpoint/` is already gitignored); its lifetime is this sweep invocation. If the snapshot step fails for any reason, proceed anyway — step 4's backstop falls back to the whole-status hard-fail when the baseline file is missing (fail-safe, never a silent pass).
+
 ### Checkpoint-driven resume (#3373)
 
 Sweep persists a per-issue phase checkpoint after each successful lifecycle phase so that a killed-and-relaunched sweep can pick up where it left off. The checkpoint is the **only** state required to resume — worktree preservation is handled by `worktree.sh`'s idempotency (re-running for an existing worktree is a no-op).
@@ -1026,10 +1037,12 @@ Each builder is responsible for:
 **Backstop: verify the main worktree is clean after the builders return (#3513).** A builder subagent runs without `LOOM_WORKTREE_PATH` injected, so the `guard-worktree-paths.sh` hook does not fire on this path. If a builder used repo-relative paths after a cwd reset, it may have written to the **main** worktree instead of its issue worktree. After the wave's builders return and before advancing any PR to Judge, run:
 
 ```bash
-./.loom/scripts/check-main-clean.sh   # exit 3 ⇒ main is dirty (builder contamination)
+./.loom/scripts/check-main-clean.sh --baseline "$MAIN_CLEAN_BASELINE"   # exit 3 ⇒ NEW main dirt (builder contamination)
 ```
 
-If it exits `3`, the main worktree carries uncommitted changes a builder left behind. Surface this loudly in the wave summary and do not advance the wave to Judge until the contamination is investigated and the stray changes reverted. This is a backstop only — the builder guidance (capture the absolute worktree path once, use absolute paths everywhere) is the primary defense.
+The `--baseline` argument points at the snapshot taken once at step 0 (before wave 1). With it, the check subtracts any dirt that predated the sweep and exits `3` **only** on changes that appeared after the snapshot — so pre-existing working-tree dirt (a regenerated lockfile, an operator scratch edit) no longer false-positives as contamination on every wave (#3648). If the baseline file is missing or unreadable, the check warns and falls back to the whole-status hard-fail (fail-safe).
+
+If it exits `3`, the main worktree carries **new** uncommitted changes a builder left behind. Surface this loudly in the wave summary and do not advance the wave to Judge until the contamination is investigated and the stray changes reverted. This is a backstop only — the builder guidance (capture the absolute worktree path once, use absolute paths everywhere) is the primary defense.
 
 **On successful PR creation**, write the `builder-done` checkpoint for that issue (record the PR number):
 ```bash
