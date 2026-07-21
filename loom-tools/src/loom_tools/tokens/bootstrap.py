@@ -1,10 +1,28 @@
-"""Bootstrap the multi-account OAuth token pool from ``.env``.
+"""Bootstrap the multi-account OAuth token pool from account sources.
 
 Reads numbered ``ACCOUNT_EMAIL_N`` / ``ACCOUNT_KEY_N`` / ``ACCOUNT_TOKEN_FILE_N``
 triples and materializes them as per-account ``.token`` files inside
 ``.loom/tokens/``. Writes an ``index.json`` manifest with sha256
-fingerprints (truncated to 8 chars) so drift between ``.env`` and on-disk
+fingerprints (truncated to 8 chars) so drift between the source and on-disk
 state can be detected without storing secret material.
+
+**Home-dir master + per-repo override (#3695).** Accounts are read from two
+sources and merged so a set of Claude accounts can be declared **once** and
+shared across every workspace instead of duplicating ``ACCOUNT_*_N`` triples
+into every repo's ``.env``:
+
+1. **Home master** — ``~/.loom/accounts.env`` (override with the
+   ``LOOM_ACCOUNTS_ENV`` env var; set it to ``""`` to disable the master).
+2. **Repo-local** — ``<repo>/.loom/accounts.env`` if present, else the legacy
+   ``<repo>/.env`` (override with ``--env`` / ``env_path``).
+
+The two sets are merged **by account email** (``ACCOUNT_EMAIL``): a repo-local
+entry whose email also appears in the master **overrides** it (e.g. to rotate
+a key), and a repo-local entry with a new email **adds** to the pool. Accounts
+present only in the master are inherited. To *exclude* a master account from a
+repo, use the ``.allowlist`` pin (``loom-tokens pin``) — the merge only ever
+adds/overrides, it never subtracts. A repo with only a legacy ``.env`` and no
+master behaves exactly as before this change.
 
 Lean-genius reference: ``scripts/agents/claude-wrapper.sh:46-66``. The
 bootstrap behaviour mirrors that shell snippet (strip surrounding quotes
@@ -19,6 +37,7 @@ import hashlib
 import json
 import os
 import re
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -40,9 +59,15 @@ _ENV_LINE_RE = re.compile(
 # end with .token (case-insensitive). Matches lean-genius conventions.
 _TOKEN_FILE_RE = re.compile(r"^[A-Za-z0-9._-]+\.token$")
 
-INDEX_VERSION = 1
+INDEX_VERSION = 2
 DIR_MODE = 0o700
 FILE_MODE = 0o600
+
+# Home-dir master accounts file (#3695). Shared across every workspace so the
+# account set is declared once. Override with LOOM_ACCOUNTS_ENV; set that to
+# the empty string to disable the master entirely.
+DEFAULT_HOME_ACCOUNTS_ENV = "~/.loom/accounts.env"
+HOME_ACCOUNTS_ENV_VAR = "LOOM_ACCOUNTS_ENV"
 
 
 # ---------------------------------------------------------------------------
@@ -105,6 +130,153 @@ def parse_env_accounts(env_path: Path) -> dict[int, dict[str, str]]:
 
 
 # ---------------------------------------------------------------------------
+# Source resolution + merge (home master over repo-local, #3695)
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class Account:
+    """A single validated account triple with its provenance.
+
+    ``source`` is one of ``"home"`` (only in the master), ``"repo"`` (only in
+    the repo-local source), or ``"repo-override"`` (email present in both; the
+    repo-local entry won).
+    """
+
+    email: str
+    key: str
+    file: str
+    source: str
+    index: int  # source index N, for reporting/ordering
+
+
+def default_home_accounts_env() -> Path | None:
+    """Resolve the home-dir master accounts file (#3695).
+
+    Precedence:
+        1. ``LOOM_ACCOUNTS_ENV`` env var — an explicit path (``~`` expanded).
+           The empty string (or all-whitespace) **disables** the master.
+        2. ``~/.loom/accounts.env`` (the default location).
+
+    Returns the resolved :class:`Path` (which may not exist on disk), or
+    ``None`` when the master has been explicitly disabled.
+    """
+    override = os.environ.get(HOME_ACCOUNTS_ENV_VAR)
+    if override is not None:
+        if not override.strip():
+            return None
+        return Path(override).expanduser()
+    return Path(DEFAULT_HOME_ACCOUNTS_ENV).expanduser()
+
+
+def resolve_repo_env(repo_root: Path, env_path: Path | None) -> Path:
+    """Resolve the repo-local accounts source path (#3695).
+
+    Precedence:
+        1. Explicit ``env_path`` (the ``--env`` flag) — used verbatim.
+        2. ``<repo>/.loom/accounts.env`` if it exists (the dedicated file).
+        3. ``<repo>/.env`` (legacy fallback — preserves pre-#3695 behaviour).
+
+    The returned path may not exist on disk (the legacy default is returned
+    even when absent so the caller can report it).
+    """
+    if env_path is not None:
+        return env_path
+    dedicated = repo_root / ".loom" / "accounts.env"
+    if dedicated.is_file():
+        return dedicated
+    return repo_root / ".env"
+
+
+def _assemble_valid_accounts(
+    accounts: dict[int, dict[str, str]],
+    source: str,
+) -> list[Account]:
+    """Validate parsed triples and return complete, safe :class:`Account`s.
+
+    Incomplete triples (missing email/key/file) and unsafe token filenames are
+    warned about and skipped — mirroring the pre-#3695 inline validation, now
+    factored out so both the home master and the repo-local source run it.
+    """
+    out: list[Account] = []
+    for n in sorted(accounts):
+        triple = accounts[n]
+        missing = [k for k in ("email", "key", "file") if not triple.get(k)]
+        if missing:
+            log_warning(
+                f"[{source}] ACCOUNT_*_{n}: incomplete triple "
+                f"(missing: {', '.join(sorted(missing))}); skipping."
+            )
+            continue
+        filename = triple["file"]
+        if not _TOKEN_FILE_RE.match(filename) or "/" in filename or "\\" in filename:
+            log_warning(
+                f"[{source}] ACCOUNT_TOKEN_FILE_{n}={filename!r}: "
+                f"unsafe filename; skipping."
+            )
+            continue
+        out.append(
+            Account(
+                email=triple["email"],
+                key=triple["key"],
+                file=filename,
+                source=source,
+                index=n,
+            )
+        )
+    return out
+
+
+def merge_accounts(
+    home: list[Account],
+    repo: list[Account],
+) -> list[Account]:
+    """Merge repo-local accounts **over** the home master, keyed by email.
+
+    Rules (#3695):
+        * An account whose email appears only in the master is inherited
+          (``source="home"``).
+        * An account whose email appears only in the repo-local source is
+          added (``source="repo"``).
+        * An email present in both: the repo-local entry wins and is tagged
+          ``source="repo-override"`` — it keeps the master's position in the
+          ordering but takes the repo's key/file/index.
+
+    Ordering is deterministic: master accounts first (in master index order),
+    then repo-only additions (in repo index order). Email comparison is
+    case-insensitive so ``User@x.com`` and ``user@x.com`` are the same account.
+    """
+
+    def key(acct: Account) -> str:
+        return acct.email.strip().lower()
+
+    merged: dict[str, Account] = {}
+    order: list[str] = []
+    for acct in home:
+        k = key(acct)
+        if k not in merged:
+            order.append(k)
+        merged[k] = acct  # last home entry for a dup email wins (stable)
+
+    for acct in repo:
+        k = key(acct)
+        if k in merged:
+            # Override in place, preserving position but recording provenance.
+            merged[k] = Account(
+                email=acct.email,
+                key=acct.key,
+                file=acct.file,
+                source="repo-override",
+                index=acct.index,
+            )
+        else:
+            order.append(k)
+            merged[k] = acct
+
+    return [merged[k] for k in order]
+
+
+# ---------------------------------------------------------------------------
 # Fingerprinting + manifest
 # ---------------------------------------------------------------------------
 
@@ -146,6 +318,11 @@ class BootstrapResult:
         self.dry_run: bool = False
         self.tokens_dir: Path | None = None
         self.index_path: Path | None = None
+        # #3695: where accounts were read from and the effective merged set.
+        self.home_env: Path | None = None
+        self.repo_env: Path | None = None
+        # Each entry: {"email", "name", "file", "source"}.
+        self.effective: list[dict[str, str]] = []
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -156,90 +333,133 @@ class BootstrapResult:
             "dry_run": self.dry_run,
             "tokens_dir": str(self.tokens_dir) if self.tokens_dir else None,
             "index_path": str(self.index_path) if self.index_path else None,
+            "home_env": str(self.home_env) if self.home_env else None,
+            "repo_env": str(self.repo_env) if self.repo_env else None,
+            "effective": [dict(a) for a in self.effective],
         }
+
+
+_HOME_UNSET = object()
 
 
 def bootstrap_tokens(
     repo_root: Path,
     *,
     env_path: Path | None = None,
+    home_env_path: Path | None | object = _HOME_UNSET,
     force: bool = False,
     dry_run: bool = False,
 ) -> BootstrapResult:
-    """Bootstrap ``.loom/tokens/`` from ``.env`` triples.
+    """Bootstrap ``.loom/tokens/`` from the merged account sources (#3695).
+
+    Reads the home-dir master (``~/.loom/accounts.env`` by default) and the
+    repo-local source (``<repo>/.loom/accounts.env`` if present, else the
+    legacy ``<repo>/.env``), merges them **by account email** with the
+    repo-local source overriding the master, and materializes the effective
+    set into ``.loom/tokens/``.
 
     Args:
         repo_root: Repository root (must contain ``.loom/``).
-        env_path: Optional override for the ``.env`` file. Defaults to
-            ``repo_root / ".env"``.
-        force: When ``True``, overwrite existing token files even if
-            their contents match ``.env`` (rewrites mode and timestamp).
-            When ``False`` (default), files whose fingerprint matches
-            ``.env`` are left alone.
-        dry_run: When ``True``, no files are written; the result lists
-            what *would* change.
+        env_path: Optional override for the repo-local source file. When
+            ``None`` (default) it is resolved by :func:`resolve_repo_env`.
+        home_env_path: Optional override for the home master. Omit to use the
+            default resolution (:func:`default_home_accounts_env`, honoring
+            ``LOOM_ACCOUNTS_ENV``); pass ``None`` to disable the master
+            entirely for this call; pass a :class:`Path` to point elsewhere.
+        force: When ``True``, overwrite existing token files even if their
+            contents match the source. When ``False`` (default), files whose
+            fingerprint matches are left alone.
+        dry_run: When ``True``, no files are written; the result lists what
+            *would* change (and the effective merged set with provenance).
 
     Returns:
-        :class:`BootstrapResult` summarising the operation.
+        :class:`BootstrapResult` summarising the operation. ``.effective``
+        lists the merged account set and where each account came from.
 
     Raises:
-        FileNotFoundError: If ``.env`` does not exist at ``env_path``.
+        FileNotFoundError: If **neither** the home master nor the repo-local
+            source exists on disk.
+        ValueError: If two effective accounts resolve to the same token
+            filename (they would clobber each other on disk).
     """
     paths = LoomPaths(repo_root)
     tokens_dir = paths.loom_dir / "tokens"
     index_path = tokens_dir / "index.json"
-    env_file = env_path if env_path is not None else (repo_root / ".env")
+
+    # Resolve the two sources. `home_env_path` uses a sentinel so an explicit
+    # None (disable) is distinguishable from an omitted argument (use default).
+    if home_env_path is _HOME_UNSET:
+        home_file = default_home_accounts_env()
+    else:
+        home_file = home_env_path  # type: ignore[assignment]
+    repo_file = resolve_repo_env(repo_root, env_path)
 
     result = BootstrapResult()
     result.dry_run = dry_run
     result.tokens_dir = tokens_dir
     result.index_path = index_path
+    result.home_env = home_file if (home_file and home_file.is_file()) else None
+    result.repo_env = repo_file if repo_file.is_file() else None
 
-    if not env_file.is_file():
-        raise FileNotFoundError(f".env not found at {env_file}")
-
-    accounts = parse_env_accounts(env_file)
-    if not accounts:
-        log_warning(
-            f"No ACCOUNT_*_N entries found in {env_file}; nothing to bootstrap."
+    home_present = bool(home_file and home_file.is_file())
+    repo_present = repo_file.is_file()
+    if not home_present and not repo_present:
+        raise FileNotFoundError(
+            "No account source found. Looked for a repo-local source at "
+            f"{repo_file} and a home master at "
+            f"{home_file if home_file else '(disabled)'}. "
+            "Declare accounts in one of them (see `loom-tokens bootstrap --help`)."
         )
-        return result
 
-    # Validate triples and build the work list, in stable order by N.
-    valid: list[tuple[int, str, str, str]] = []  # (n, email, key, filename)
-    for n in sorted(accounts):
-        triple = accounts[n]
-        missing = [k for k in ("email", "key", "file") if not triple.get(k)]
-        if missing:
-            log_warning(
-                f"ACCOUNT_*_{n}: incomplete triple "
-                f"(missing: {', '.join(sorted(missing))}); skipping."
-            )
-            continue
-        filename = triple["file"]
-        if not _TOKEN_FILE_RE.match(filename) or "/" in filename or "\\" in filename:
-            log_warning(
-                f"ACCOUNT_TOKEN_FILE_{n}={filename!r}: unsafe filename; skipping."
-            )
-            continue
-        valid.append((n, triple["email"], triple["key"], filename))
+    home_accounts: list[Account] = []
+    if home_present:
+        home_accounts = _assemble_valid_accounts(
+            parse_env_accounts(home_file), "home"  # type: ignore[arg-type]
+        )
+    repo_accounts: list[Account] = []
+    if repo_present:
+        repo_accounts = _assemble_valid_accounts(
+            parse_env_accounts(repo_file), "repo"
+        )
+
+    valid = merge_accounts(home_accounts, repo_accounts)
+
+    # Record the effective merged set (with provenance) for reporting even
+    # when nothing is written — bootstrap --dry-run consumes this.
+    result.effective = [
+        {
+            "email": a.email,
+            "name": _name_from_file(a.file),
+            "file": a.file,
+            "source": a.source,
+        }
+        for a in valid
+    ]
 
     if not valid:
+        srcs = ", ".join(
+            str(p) for p in (result.home_env, result.repo_env) if p
+        )
         log_warning(
-            f"No complete ACCOUNT_*_N triples in {env_file}; nothing to bootstrap."
+            f"No complete ACCOUNT_*_N triples in {srcs or 'the account source(s)'}; "
+            f"nothing to bootstrap."
         )
         return result
 
-    # Detect duplicate filenames (would otherwise clobber each other).
-    seen_files: dict[str, int] = {}
-    for n, _email, _key, filename in valid:
-        if filename in seen_files:
+    # Detect duplicate filenames (would otherwise clobber each other). This
+    # runs on the *merged* set, so a repo account reusing a master account's
+    # token filename under a different email is caught here.
+    seen_files: dict[str, Account] = {}
+    for acct in valid:
+        prior = seen_files.get(acct.file)
+        if prior is not None:
             log_error(
-                f"Duplicate ACCOUNT_TOKEN_FILE: {filename!r} appears for "
-                f"both _{seen_files[filename]} and _{n}; aborting."
+                f"Duplicate ACCOUNT_TOKEN_FILE: {acct.file!r} maps to both "
+                f"{prior.email!r} ({prior.source}) and {acct.email!r} "
+                f"({acct.source}); aborting."
             )
-            raise ValueError(f"duplicate token filename: {filename}")
-        seen_files[filename] = n
+            raise ValueError(f"duplicate token filename: {acct.file}")
+        seen_files[acct.file] = acct
 
     if not dry_run:
         tokens_dir.mkdir(parents=True, exist_ok=True)
@@ -250,7 +470,8 @@ def bootstrap_tokens(
             pass
 
     manifest_accounts: list[dict[str, object]] = []
-    for n, email, key, filename in valid:
+    for acct in valid:
+        n, email, key, filename = acct.index, acct.email, acct.key, acct.file
         token_path = tokens_dir / filename
         new_fp = fingerprint(key)
 
@@ -274,8 +495,8 @@ def bootstrap_tokens(
 
         if action == "drifted" and not force:
             log_warning(
-                f"DRIFT: {filename} on disk does not match .env "
-                f"(disk fp={existing_fp}, env fp={new_fp}); "
+                f"DRIFT: {filename} on disk does not match the account source "
+                f"(disk fp={existing_fp}, source fp={new_fp}); "
                 f"re-run with --force to overwrite."
             )
             result.drifted.append(filename)
@@ -287,6 +508,7 @@ def bootstrap_tokens(
                     "name": _name_from_file(filename),
                     "email": email,
                     "file": filename,
+                    "source": acct.source,
                     "key_fingerprint": existing_fp,
                     "drift": True,
                     "env_fingerprint": new_fp,
@@ -320,6 +542,7 @@ def bootstrap_tokens(
                 "name": _name_from_file(filename),
                 "email": email,
                 "file": filename,
+                "source": acct.source,
                 "key_fingerprint": new_fp,
             }
         )
@@ -349,7 +572,7 @@ def bootstrap_tokens(
     )
     if result.drifted and not force:
         log_warning(
-            f"{len(result.drifted)} token(s) drifted from .env; "
+            f"{len(result.drifted)} token(s) drifted from the account source; "
             f"re-run with --force to overwrite on-disk values."
         )
     elif result.written and not dry_run:
