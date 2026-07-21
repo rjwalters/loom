@@ -70,7 +70,7 @@ DEFAULT_HOME_ACCOUNTS_ENV = "~/.loom/accounts.env"
 HOME_ACCOUNTS_ENV_VAR = "LOOM_ACCOUNTS_ENV"
 
 # Characters stripped from an email local-part when deriving a token filename
-# (#3697): dots and hyphens, so ``r.j.walters`` -> ``rjwalters`` and
+# (#3697): dots and hyphens, so ``a.b.jones`` -> ``abjones`` and
 # ``agent-1`` -> ``agent1``, matching the established naming convention.
 _LOCAL_PART_STRIP_RE = re.compile(r"[.-]")
 # Any character outside the token-filename safe set is dropped as a final
@@ -89,13 +89,13 @@ def derive_token_filename(email: str) -> str:
 
     Examples::
 
-        robb@2amlogic.com        -> robb-2amlogic.token
-        r.j.walters@gmail.com    -> rjwalters-gmail.token
-        agent-1@2amlogic.com     -> agent1-2amlogic.token
+        alice@example.com        -> alice-example.token
+        a.b.jones@example.org    -> abjones-example.token
+        agent-1@example.com      -> agent1-example.token
 
     The result always matches :data:`_TOKEN_FILE_RE`. Two *distinct* emails
-    can still derive the same stem (e.g. ``rjwalters@gmail.com`` and
-    ``r.j.walters@gmail.com``); that true collision is caught by the existing
+    can still derive the same stem (e.g. ``ajones@example.com`` and
+    ``a.jones@example.com``); that true collision is caught by the existing
     duplicate-filename guard in :func:`bootstrap_tokens`, not silently merged.
     """
     local, sep, domain = email.strip().partition("@")

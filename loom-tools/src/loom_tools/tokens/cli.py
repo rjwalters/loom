@@ -52,7 +52,7 @@ def _build_parser() -> argparse.ArgumentParser:
             "Materialize .loom/tokens/ from ACCOUNT_*_N triples, merging the "
             "home master (~/.loom/accounts.env) with the repo-local source. "
             "ACCOUNT_TOKEN_FILE_N is optional: when omitted it is auto-derived "
-            "from ACCOUNT_EMAIL_N (e.g. robb@2amlogic.com -> robb-2amlogic.token)."
+            "from ACCOUNT_EMAIL_N (e.g. alice@example.com -> alice-example.token)."
         ),
     )
     bp.add_argument(

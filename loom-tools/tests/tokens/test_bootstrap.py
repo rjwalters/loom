@@ -648,11 +648,11 @@ class TestDeriveTokenFilename:
 
     def test_convention_examples(self) -> None:
         # Established naming convention (generic example domains).
-        assert derive_token_filename("robb@2amlogic.com") == "robb-2amlogic.token"
+        assert derive_token_filename("alice@example.com") == "alice-example.token"
         assert (
-            derive_token_filename("r.j.walters@gmail.com") == "rjwalters-gmail.token"
+            derive_token_filename("a.b.jones@example.org") == "abjones-example.token"
         )
-        assert derive_token_filename("agent-1@2amlogic.com") == "agent1-2amlogic.token"
+        assert derive_token_filename("agent-1@example.com") == "agent1-example.token"
 
     def test_result_always_passes_safety_regex(self) -> None:
         for email in (
@@ -672,8 +672,8 @@ class TestDeriveTokenFilename:
 
     def test_two_emails_can_collide_to_same_stem(self) -> None:
         # This is intentional: the duplicate-filename guard catches it.
-        assert derive_token_filename("rjwalters@gmail.com") == derive_token_filename(
-            "r.j.walters@gmail.com"
+        assert derive_token_filename("ajones@example.com") == derive_token_filename(
+            "a.jones@example.com"
         )
 
 
@@ -684,17 +684,17 @@ class TestBootstrapAutoDerive:
         # EMAIL + KEY only (claude-monitor-style) -> file derived.
         _write_env(
             mock_repo,
-            "ACCOUNT_EMAIL_1=robb@2amlogic.com\nACCOUNT_KEY_1=sk-1\n",
+            "ACCOUNT_EMAIL_1=alice@example.com\nACCOUNT_KEY_1=sk-1\n",
         )
         result = bootstrap_tokens(mock_repo)
-        assert result.written == ["robb-2amlogic.token"]
+        assert result.written == ["alice-example.token"]
         tokens_dir = mock_repo / ".loom" / "tokens"
-        assert (tokens_dir / "robb-2amlogic.token").read_text() == "sk-1"
+        assert (tokens_dir / "alice-example.token").read_text() == "sk-1"
 
     def test_explicit_file_still_wins(self, mock_repo: pathlib.Path) -> None:
         _write_env(
             mock_repo,
-            "ACCOUNT_EMAIL_1=robb@2amlogic.com\n"
+            "ACCOUNT_EMAIL_1=alice@example.com\n"
             "ACCOUNT_KEY_1=sk-1\n"
             "ACCOUNT_TOKEN_FILE_1=explicit.token\n",
         )
@@ -706,8 +706,8 @@ class TestBootstrapAutoDerive:
         # the existing duplicate-filename guard, not silently merged.
         _write_env(
             mock_repo,
-            "ACCOUNT_EMAIL_1=rjwalters@gmail.com\nACCOUNT_KEY_1=sk-1\n"
-            "ACCOUNT_EMAIL_2=r.j.walters@gmail.com\nACCOUNT_KEY_2=sk-2\n",
+            "ACCOUNT_EMAIL_1=ajones@example.com\nACCOUNT_KEY_1=sk-1\n"
+            "ACCOUNT_EMAIL_2=a.jones@example.com\nACCOUNT_KEY_2=sk-2\n",
         )
         with pytest.raises(ValueError, match="duplicate token filename"):
             bootstrap_tokens(mock_repo)
