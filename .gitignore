@@ -66,6 +66,7 @@ Thumbs.db
 .loom/usage-cache.json
 .loom/claude-config/
 .loom/tokens/
+.loom/accounts.env
 .loom/sweep-checkpoint/
 .loom/spawn-loop.pid
 .loom/spawn-loop-state.json

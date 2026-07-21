@@ -12,11 +12,15 @@ import pytest
 from loom_tools.common.repo import clear_repo_cache
 from loom_tools.tokens.bootstrap import (
     INDEX_VERSION,
+    Account,
     BootstrapResult,
     _strip_value,
     bootstrap_tokens,
+    default_home_accounts_env,
     fingerprint,
+    merge_accounts,
     parse_env_accounts,
+    resolve_repo_env,
 )
 from loom_tools.tokens.cli import main as cli_main
 
@@ -395,3 +399,240 @@ def test_bootstrap_result_to_dict_roundtrip() -> None:
     assert json.dumps(d)
     assert d["written"] == ["a.token"]
     assert d["dry_run"] is True
+    # #3695 fields present and JSON-safe.
+    assert d["effective"] == []
+    assert d["home_env"] is None
+    assert d["repo_env"] is None
+
+
+# ---------------------------------------------------------------------------
+# #3695: home-dir master + per-repo override
+# ---------------------------------------------------------------------------
+
+
+def _acct(email: str, key: str, file: str, source: str, index: int = 1) -> Account:
+    return Account(email=email, key=key, file=file, source=source, index=index)
+
+
+def _triple(i: int, email: str, key: str, file: str) -> str:
+    return (
+        f"ACCOUNT_EMAIL_{i}={email}\n"
+        f"ACCOUNT_KEY_{i}={key}\n"
+        f"ACCOUNT_TOKEN_FILE_{i}={file}\n"
+    )
+
+
+class TestHomeMasterResolution:
+    def test_default_is_home_loom(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.delenv("LOOM_ACCOUNTS_ENV", raising=False)
+        p = default_home_accounts_env()
+        assert p is not None
+        assert p.name == "accounts.env"
+        assert p.parent.name == ".loom"
+
+    def test_env_override(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("LOOM_ACCOUNTS_ENV", "/custom/accts.env")
+        assert default_home_accounts_env() == pathlib.Path("/custom/accts.env")
+
+    def test_empty_env_disables(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("LOOM_ACCOUNTS_ENV", "")
+        assert default_home_accounts_env() is None
+
+
+class TestRepoEnvResolution:
+    def test_explicit_env_wins(self, mock_repo: pathlib.Path) -> None:
+        explicit = mock_repo / "custom.env"
+        assert resolve_repo_env(mock_repo, explicit) == explicit
+
+    def test_dedicated_preferred_over_legacy(self, mock_repo: pathlib.Path) -> None:
+        (mock_repo / ".env").write_text("x\n")
+        dedicated = mock_repo / ".loom" / "accounts.env"
+        dedicated.write_text("y\n")
+        assert resolve_repo_env(mock_repo, None) == dedicated
+
+    def test_legacy_fallback(self, mock_repo: pathlib.Path) -> None:
+        # No dedicated file -> legacy .env path, even if it does not exist.
+        assert resolve_repo_env(mock_repo, None) == mock_repo / ".env"
+
+
+class TestMergeAccounts:
+    def test_home_only(self) -> None:
+        merged = merge_accounts([_acct("a@x", "k", "a.token", "home")], [])
+        assert [m.source for m in merged] == ["home"]
+
+    def test_repo_adds_new_email(self) -> None:
+        home = [_acct("a@x", "k1", "a.token", "home")]
+        repo = [_acct("b@x", "k2", "b.token", "repo")]
+        merged = merge_accounts(home, repo)
+        assert [(m.email, m.source) for m in merged] == [
+            ("a@x", "home"),
+            ("b@x", "repo"),
+        ]
+
+    def test_repo_overrides_same_email(self) -> None:
+        home = [_acct("a@x", "home-key", "a.token", "home")]
+        repo = [_acct("a@x", "repo-key", "a.token", "repo")]
+        merged = merge_accounts(home, repo)
+        assert len(merged) == 1
+        assert merged[0].source == "repo-override"
+        assert merged[0].key == "repo-key"
+
+    def test_override_is_case_insensitive_on_email(self) -> None:
+        home = [_acct("User@X.com", "hk", "a.token", "home")]
+        repo = [_acct("user@x.com", "rk", "a.token", "repo")]
+        merged = merge_accounts(home, repo)
+        assert len(merged) == 1
+        assert merged[0].key == "rk"
+
+    def test_ordering_home_first_then_repo(self) -> None:
+        home = [
+            _acct("a@x", "k", "a.token", "home", 1),
+            _acct("b@x", "k", "b.token", "home", 2),
+        ]
+        repo = [_acct("c@x", "k", "c.token", "repo", 1)]
+        merged = merge_accounts(home, repo)
+        assert [m.email for m in merged] == ["a@x", "b@x", "c@x"]
+
+
+class TestBootstrapMerge:
+    def _write_home(self, tmp_path: pathlib.Path, body: str) -> pathlib.Path:
+        home = tmp_path / "home-accounts.env"
+        home.write_text(body, encoding="utf-8")
+        return home
+
+    def test_home_master_materialized(self, mock_repo: pathlib.Path) -> None:
+        home = self._write_home(
+            mock_repo, _triple(1, "a@x", "sk-home-a", "alice.token")
+        )
+        # Repo has no source of its own — relies entirely on the master.
+        result = bootstrap_tokens(mock_repo, home_env_path=home)
+        tokens_dir = mock_repo / ".loom" / "tokens"
+        assert (tokens_dir / "alice.token").read_text() == "sk-home-a"
+        assert result.written == ["alice.token"]
+        assert result.effective == [
+            {
+                "email": "a@x",
+                "name": "alice",
+                "file": "alice.token",
+                "source": "home",
+            }
+        ]
+
+    def test_repo_overrides_master_key(self, mock_repo: pathlib.Path) -> None:
+        home = self._write_home(
+            mock_repo, _triple(1, "a@x", "sk-home", "alice.token")
+        )
+        _write_env(mock_repo, _triple(1, "a@x", "sk-repo", "alice.token"))
+        bootstrap_tokens(mock_repo, home_env_path=home)
+        tokens_dir = mock_repo / ".loom" / "tokens"
+        # Repo key wins for the shared email.
+        assert (tokens_dir / "alice.token").read_text() == "sk-repo"
+
+    def test_repo_adds_account_to_master(self, mock_repo: pathlib.Path) -> None:
+        home = self._write_home(
+            mock_repo, _triple(1, "a@x", "sk-home", "alice.token")
+        )
+        _write_env(mock_repo, _triple(1, "b@x", "sk-repo", "bob.token"))
+        result = bootstrap_tokens(mock_repo, home_env_path=home)
+        tokens_dir = mock_repo / ".loom" / "tokens"
+        assert (tokens_dir / "alice.token").read_text() == "sk-home"
+        assert (tokens_dir / "bob.token").read_text() == "sk-repo"
+        sources = {e["email"]: e["source"] for e in result.effective}
+        assert sources == {"a@x": "home", "b@x": "repo"}
+
+    def test_no_home_flag_ignores_master(self, mock_repo: pathlib.Path) -> None:
+        home = self._write_home(
+            mock_repo, _triple(1, "a@x", "sk-home", "alice.token")
+        )
+        _write_env(mock_repo, _triple(1, "b@x", "sk-repo", "bob.token"))
+        # Passing home_env_path=None disables the master for this call.
+        result = bootstrap_tokens(mock_repo, home_env_path=None)
+        assert result.written == ["bob.token"]
+        assert home  # keep ref; unused on this path
+
+    def test_neither_source_raises(self, mock_repo: pathlib.Path) -> None:
+        with pytest.raises(FileNotFoundError):
+            bootstrap_tokens(mock_repo, home_env_path=None)
+
+    def test_dedicated_repo_file_used(self, mock_repo: pathlib.Path) -> None:
+        (mock_repo / ".loom" / "accounts.env").write_text(
+            _triple(1, "a@x", "sk-dedicated", "alice.token"), encoding="utf-8"
+        )
+        # Legacy .env has a different key that must be ignored in favour of the
+        # dedicated file.
+        _write_env(mock_repo, _triple(1, "a@x", "sk-legacy", "alice.token"))
+        bootstrap_tokens(mock_repo, home_env_path=None)
+        assert (
+            mock_repo / ".loom" / "tokens" / "alice.token"
+        ).read_text() == "sk-dedicated"
+
+    def test_cross_source_duplicate_filename_aborts(
+        self, mock_repo: pathlib.Path
+    ) -> None:
+        home = self._write_home(
+            mock_repo, _triple(1, "a@x", "sk-home", "shared.token")
+        )
+        # Different email, same token filename -> collision on disk.
+        _write_env(mock_repo, _triple(1, "b@x", "sk-repo", "shared.token"))
+        with pytest.raises(ValueError, match="duplicate"):
+            bootstrap_tokens(mock_repo, home_env_path=home)
+
+    def test_env_var_master_resolution(
+        self, mock_repo: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        home = self._write_home(
+            mock_repo, _triple(1, "a@x", "sk-env", "alice.token")
+        )
+        monkeypatch.setenv("LOOM_ACCOUNTS_ENV", str(home))
+        # No explicit home_env_path -> default resolution reads LOOM_ACCOUNTS_ENV.
+        result = bootstrap_tokens(mock_repo)
+        assert result.written == ["alice.token"]
+
+    def test_manifest_records_source(self, mock_repo: pathlib.Path) -> None:
+        home = self._write_home(
+            mock_repo, _triple(1, "a@x", "sk-home", "alice.token")
+        )
+        _write_env(mock_repo, _triple(1, "b@x", "sk-repo", "bob.token"))
+        bootstrap_tokens(mock_repo, home_env_path=home)
+        idx = json.loads(
+            (mock_repo / ".loom" / "tokens" / "index.json").read_text()
+        )
+        by_email = {a["email"]: a["source"] for a in idx["accounts"]}
+        assert by_email == {"a@x": "home", "b@x": "repo"}
+
+
+class TestCliMerge:
+    def test_no_home_flag_via_cli(
+        self,
+        mock_repo: pathlib.Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        (mock_repo / "home.env").write_text(
+            _triple(1, "a@x", "sk-home", "alice.token"), encoding="utf-8"
+        )
+        _write_env(mock_repo, _triple(1, "b@x", "sk-repo", "bob.token"))
+        monkeypatch.setenv("LOOM_ACCOUNTS_ENV", str(mock_repo / "home.env"))
+        monkeypatch.chdir(mock_repo)
+        rc = cli_main(["bootstrap", "--no-home", "--json"])
+        assert rc == 0
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["written"] == ["bob.token"]
+
+    def test_effective_report_printed(
+        self,
+        mock_repo: pathlib.Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        (mock_repo / "home.env").write_text(
+            _triple(1, "a@x", "sk-home", "alice.token"), encoding="utf-8"
+        )
+        monkeypatch.setenv("LOOM_ACCOUNTS_ENV", str(mock_repo / "home.env"))
+        monkeypatch.chdir(mock_repo)
+        rc = cli_main(["bootstrap", "--dry-run"])
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert "Effective accounts" in out
+        assert "alice" in out
+        assert "home" in out

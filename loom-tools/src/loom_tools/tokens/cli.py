@@ -48,13 +48,33 @@ def _build_parser() -> argparse.ArgumentParser:
 
     bp = sub.add_parser(
         "bootstrap",
-        help="Materialize .loom/tokens/ from ACCOUNT_*_N triples in .env.",
+        help=(
+            "Materialize .loom/tokens/ from ACCOUNT_*_N triples, merging the "
+            "home master (~/.loom/accounts.env) with the repo-local source."
+        ),
     )
     bp.add_argument(
         "--env",
         type=Path,
         default=None,
-        help="Path to .env file (default: <repo-root>/.env).",
+        help=(
+            "Path to the repo-local account source (default: "
+            "<repo>/.loom/accounts.env if present, else <repo>/.env)."
+        ),
+    )
+    bp.add_argument(
+        "--home-env",
+        type=Path,
+        default=None,
+        help=(
+            "Path to the home-dir master account source (default: "
+            "$LOOM_ACCOUNTS_ENV or ~/.loom/accounts.env)."
+        ),
+    )
+    bp.add_argument(
+        "--no-home",
+        action="store_true",
+        help="Ignore the home master; bootstrap from the repo-local source only.",
     )
     bp.add_argument(
         "--force",
@@ -228,12 +248,21 @@ def _cmd_bootstrap(args: argparse.Namespace) -> int:
         log_error(str(exc))
         return 1
 
+    # `--no-home` disables the master (pass None); otherwise pass an explicit
+    # --home-env path, or fall through to the default resolution sentinel.
+    home_kwargs: dict[str, object] = {}
+    if args.no_home:
+        home_kwargs["home_env_path"] = None
+    elif args.home_env is not None:
+        home_kwargs["home_env_path"] = args.home_env
+
     try:
         result = bootstrap_tokens(
             repo_root,
             env_path=args.env,
             force=args.force,
             dry_run=args.dry_run,
+            **home_kwargs,
         )
     except FileNotFoundError as exc:
         log_error(str(exc))
@@ -244,12 +273,50 @@ def _cmd_bootstrap(args: argparse.Namespace) -> int:
 
     if args.emit_json:
         print(json.dumps(result.to_dict(), indent=2))
+    else:
+        _print_effective_accounts(result)
 
     # Treat unresolved drift (without --force) as a non-zero exit so CI
     # can detect divergence.
     if result.drifted and not args.force:
         return 2
     return 0
+
+
+# Human-readable label for each provenance tag from the merge (#3695).
+_SOURCE_LABEL = {
+    "home": "home",
+    "repo": "repo",
+    "repo-override": "repo (overrides home)",
+}
+
+
+def _print_effective_accounts(result: "object") -> None:
+    """Print the effective merged account set and where each came from.
+
+    Satisfies the #3695 acceptance criterion that ``bootstrap`` (and
+    ``--dry-run``) reports the effective set with provenance. Secrets are never
+    shown — only email, token filename, and source.
+    """
+    effective = getattr(result, "effective", []) or []
+    home_env = getattr(result, "home_env", None)
+    repo_env = getattr(result, "repo_env", None)
+
+    print("Account sources:")
+    print(f"  home: {home_env if home_env else '(none)'}")
+    print(f"  repo: {repo_env if repo_env else '(none)'}")
+
+    if not effective:
+        print("Effective accounts: (none)")
+        return
+
+    print(f"Effective accounts ({len(effective)}):")
+    width = max(len(a.get("name", "")) for a in effective)
+    for a in effective:
+        label = _SOURCE_LABEL.get(a.get("source", ""), a.get("source", ""))
+        name = a.get("name", "")
+        email = a.get("email", "")
+        print(f"  {name:<{width}}  {email}  [{label}]")
 
 
 def _cmd_check(args: argparse.Namespace) -> int:

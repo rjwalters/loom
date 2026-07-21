@@ -351,7 +351,7 @@ Settings applied: squash merge only (no merge commits/rebase), delete branches o
 
 ### Multi-Account Token Pool
 
-For environments that rotate among multiple Claude OAuth accounts, Loom can bootstrap a per-account token pool at `.loom/tokens/` from numbered triples in `.env`:
+For environments that rotate among multiple Claude OAuth accounts, Loom can bootstrap a per-account token pool at `.loom/tokens/` from numbered `ACCOUNT_EMAIL_N` / `ACCOUNT_KEY_N` / `ACCOUNT_TOKEN_FILE_N` triples:
 
 ```env
 ACCOUNT_EMAIL_1=user1@example.com
@@ -363,13 +363,32 @@ Run `loom-tokens bootstrap` to materialize the pool:
 
 ```bash
 loom-tokens bootstrap            # Idempotent — only writes new/missing tokens.
-loom-tokens bootstrap --dry-run  # Preview without writing.
-loom-tokens bootstrap --force    # Overwrite on-disk tokens that have drifted from .env.
+loom-tokens bootstrap --dry-run  # Preview + print the effective merged account set.
+loom-tokens bootstrap --force    # Overwrite on-disk tokens that have drifted from source.
 ```
 
-Each account becomes `.loom/tokens/<file>.token` (mode `0600`). An `index.json` manifest is written alongside with sha256 fingerprints (8 chars) for drift detection — **no secret material is stored in the manifest**. Numbering gaps are allowed; partial triples are skipped with a warning.
+Each account becomes `.loom/tokens/<file>.token` (mode `0600`). An `index.json` manifest is written alongside with sha256 fingerprints (8 chars) for drift detection plus each account's `source` (home/repo) — **no secret material is stored in the manifest**. Numbering gaps are allowed; partial triples are skipped with a warning.
 
 `.loom/tokens/` is gitignored. The pool is consumed by external rotation logic (e.g. a `claude-wrapper.sh` that picks the least-used token); only the bootstrap step is provided here.
+
+#### Home-dir master + per-repo override (#3695)
+
+Rather than re-declaring the same account triples in every repo's `.env`, declare them **once** in a home-dir master and let each workspace add or override on top of it:
+
+| Source | Default location | Override |
+|--------|------------------|----------|
+| **Home master** | `~/.loom/accounts.env` | `LOOM_ACCOUNTS_ENV` env var (`""` disables the master); `--home-env <path>` / `--no-home` on `bootstrap` |
+| **Repo-local** | `<repo>/.loom/accounts.env` if present, else legacy `<repo>/.env` | `--env <path>` on `bootstrap` |
+
+`loom-tokens bootstrap` reads both sources and **merges them by account email** (`ACCOUNT_EMAIL`), with the repo-local source winning:
+
+- An email present **only in the master** is inherited into the pool.
+- An email present **only in the repo** is added.
+- An email present in **both** → the repo entry overrides (e.g. to rotate a key or repoint the token file).
+
+To *exclude* a master account from one repo, pin the subset you want with `loom-tokens pin` — the merge only ever adds/overrides, never subtracts. The effective merged set (and where each account came from) is printed by `bootstrap` and `bootstrap --dry-run`. A repo with only a legacy `.env` and no master behaves exactly as before.
+
+> **Secrets**: both `~/.loom/accounts.env` and the repo-local `.loom/accounts.env` hold raw OAuth keys. The repo-local file and `.loom/tokens/` are gitignored (installer- and `loom-daemon init`–managed); keep the home master `0600` and outside any repo. A repo can rely entirely on the home master with no local account file at all.
 
 #### Account health probe + ranking
 
@@ -460,14 +479,17 @@ For Pro/Max plans, Loom supports rotating between multiple Claude Code OAuth tok
 
 ### Setup
 
-1. Add account credentials to `.env` at the workspace root:
+1. Declare account credentials once in the home-dir master `~/.loom/accounts.env` (shared across every workspace, #3695) — or per-repo in `<repo>/.loom/accounts.env` (falls back to legacy `<repo>/.env`):
    ```env
+   ACCOUNT_EMAIL_1=robb-personal@example.com
    ACCOUNT_KEY_1=sk-ant-oat01-...
    ACCOUNT_TOKEN_FILE_1=robb-personal.token
+   ACCOUNT_EMAIL_2=robb-work@example.com
    ACCOUNT_KEY_2=sk-ant-oat01-...
    ACCOUNT_TOKEN_FILE_2=robb-work.token
    ```
-2. Run `loom-tokens bootstrap` to materialize per-account `.token` files into `.loom/tokens/` (mode 0600, parent dir 0700). See issue #3234.
+   The home master and repo-local source are **merged by email**, with the repo overriding/adding (see "Home-dir master + per-repo override" above). Keep the master `0600` and outside any repo.
+2. Run `loom-tokens bootstrap` to materialize the merged set into per-account `.token` files in `.loom/tokens/` (mode 0600, parent dir 0700). See issues #3234, #3695.
 3. Spawn agents through `.loom/scripts/spawn-claude.sh` instead of invoking `claude` directly. The wrapper selects a token using a 3-tier algorithm (ranking → allowlist → random), exports `CLAUDE_CODE_OAUTH_TOKEN`, then `exec`s `claude` (or pass `--use-wrapper` to layer on top of `claude-wrapper.sh` for retry behavior).
 
 ### Selection algorithm (`loom_tools.tokens.select`)

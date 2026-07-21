@@ -119,6 +119,10 @@ pub const EPHEMERAL_PATTERNS: &[&str] = &[
     ".loom/metrics/",
     ".loom/usage-cache.json",
     ".loom/claude-config/",
+    // Secret-bearing token pool + repo-local account source (#3695). These
+    // hold OAuth keys and must never be committed.
+    ".loom/tokens/",
+    ".loom/accounts.env",
     ".loom/*.log",
     ".loom/*.sock",
     ".loom/logs/",
