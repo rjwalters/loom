@@ -1005,11 +1005,13 @@ For each issue `N` in the wave, before any role skill is invoked:
      2. **Non-closing cross-reference PRs (timeline, #3677).** PRs that reference `N` with a **non-closing** phrase (`Part of #N` / `Contributes to #N`, the #3599 partial-increment convention — see `defaults/roles/builder-pr.md`) never appear in `closedByPullRequestsReferences` by design, so probe the issue's timeline for `cross-referenced` events whose source is a PR:
         ```bash
         gh api "repos/OWNER/REPO/issues/N/timeline" --paginate \
-          --jq '[.[] | select(.event == "cross-referenced" and .source.issue.pull_request != null)
+          --jq '[.[] | select(.event == "cross-referenced"
+                              and .source.issue.pull_request != null
+                              and .source.issue.repository.full_name == "OWNER/REPO")
                  | {number: .source.issue.number, state: .source.issue.state}]
                 | unique_by(.number)'
         ```
-        This is GitHub's own reference parser (the same engine behind `closedByPullRequestsReferences`) surfacing **every** `#N` mention as a `cross-referenced` event, with `source.issue.pull_request` non-null when the referrer is a PR and `source.issue.state` giving its live state. Keep only entries whose `state == "open"` (lowercase — the timeline API returns lowercase issue/PR states, unlike the uppercase `closedByPullRequestsReferences` field). No local regex is involved; GitHub does the text parsing (the #3267 lesson: don't hand-roll what GitHub already parses).
+        This is GitHub's own reference parser (the same engine behind `closedByPullRequestsReferences`) surfacing **every** `#N` mention as a `cross-referenced` event, with `source.issue.pull_request` non-null when the referrer is a PR and `source.issue.state` giving its live state. Keep only entries whose `state == "open"` (lowercase — the timeline API returns lowercase issue/PR states, unlike the uppercase `closedByPullRequestsReferences` field). **Same-repo guard (required):** `cross-referenced` events include references from *other* repositories in a multi-repo ecosystem (e.g. a sibling repo's PR that mentions `OWNER/REPO#N`); the `.source.issue.repository.full_name == "OWNER/REPO"` filter (the field is reliably populated on every event) scopes the result to this repo so a foreign PR number is never misrouted to `gh pr view` below. This mirrors `closedByPullRequestsReferences`, which is inherently same-repo. No local regex is involved; GitHub does the text parsing (the #3267 lesson: don't hand-roll what GitHub already parses).
 
      **Union + filter.** Merge the two source lists and dedupe by PR number. For any PR discovered only via source 1, filter to `state == "OPEN"` (uppercase — `closedByPullRequestsReferences` includes MERGED and CLOSED PRs, which are not the duplicate-builder hazard); source 2 is already filtered to open. For each surviving open PR, fetch its labels for routing:
      ```bash
