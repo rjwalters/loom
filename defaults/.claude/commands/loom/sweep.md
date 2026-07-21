@@ -862,7 +862,7 @@ Apply exactly one of the three branches below, based on the PR's current label:
     ./.loom/scripts/sweep-checkpoint.sh write N judge-done --task-id "sweep-$$" --pr-number P
     ```
     Continue to **C2 (Merge)** for this PR.
-  - **Request changes** → PR labeled `loom:changes-requested` by Judge. Continue to **C1b (Doctor → Judge)** for this PR (single inline cycle, matching the issue-side cap).
+  - **Request changes** → PR labeled `loom:changes-requested` by Judge. Continue to **C1b (Doctor → Judge)** for this PR (inline Doctor → Judge cycle(s), up to `sweep.max_doctor_cycles`, matching the issue-side cap).
 
 #### C1b. `loom:changes-requested` → inline Doctor → Judge (up to `sweep.max_doctor_cycles` cycles)
 
@@ -1103,7 +1103,7 @@ WAVE_MERGED_FILES = {}                          # union of changed paths merged 
 for pr in wave_prs:
     judge(pr)                                   # may approve or request changes — against the PR's own pre-wave base
     if changes_requested:
-        doctor(pr)                              # one Doctor->Judge cycle (see step 6)
+        doctor(pr)                              # Doctor->Judge cycle(s), up to the cap (see step 6)
     if still_approved:
         revalidate_if_overlaps(pr, WAVE_MERGED_FILES)   # step 7 gate — re-judge / Doctor if pr shares a file with an already-merged sibling
         merge(pr)                               # step 7
