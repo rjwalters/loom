@@ -422,6 +422,62 @@ parse_force_ops() {
     }'
 }
 
+# Redact the quoted VALUES of known text-carrying flags (--body, -m/--message,
+# --title, --notes) so a dangerous-looking phrase quoted INSIDE such a value no
+# longer trips the raw ALWAYS_BLOCK_PATTERNS substring scan. Used ONLY to build
+# COMMAND_NO_LITERAL_TEXT for that one loop (mirrors the COMMAND_NO_COMMENT
+# precedent); every other scan keeps reading the raw command. This kills the
+# #3679 false positive where `gh pr comment --body "…git push --force origin
+# main…"` / `git commit -m "…"` hard-denied even though nothing executes.
+#
+# Safety floor preserved two ways:
+#   - `-c` is deliberately NOT a text-carrying flag, so `bash -c '<payload>'`
+#     is never redacted and its payload stays caught by the raw scan.
+#   - a quoted span is redacted ONLY when it carries no command-substitution or
+#     backtick opener (`$(` — which also subsumes the arithmetic `$((` — or a
+#     backtick). So a smuggling attempt like `git commit -m "$(git push --force
+#     origin main)"` is left intact and still hard-denies.
+# Each redacted span is replaced by a SAME-LENGTH placeholder so byte offsets of
+# the surrounding command are unchanged. Best-effort like COMMAND_NO_COMMENT:
+# it does not model backslash-escaped quotes, but since the result feeds only
+# the narrowing (never widening) catastrophic scan, the worst case is a raw
+# substring surviving — never a catastrophic block being skipped incorrectly.
+strip_literal_text() {
+    printf '%s' "$1" | awk '
+    BEGIN {
+        SQ = sprintf("%c", 39)   # single quote
+        DQ = sprintf("%c", 34)   # double quote
+        # boundary + text-carrying flag + optional (ws / = / ws) + quoted span
+        re = "(^|[ \t])(--message|--body|--notes|--title|-m)[ \t]*=?[ \t]*(" \
+             DQ "[^" DQ "]*" DQ "|" SQ "[^" SQ "]*" SQ ")"
+    }
+    {
+        s = $0
+        out = ""
+        while (match(s, re)) {
+            pre     = substr(s, 1, RSTART - 1)
+            matched = substr(s, RSTART, RLENGTH)
+            s       = substr(s, RSTART + RLENGTH)
+            # Locate the opening quote inside the matched span.
+            qpos = 0
+            for (i = 1; i <= length(matched); i++) {
+                c = substr(matched, i, 1)
+                if (c == DQ || c == SQ) { qpos = i; break }
+            }
+            head  = substr(matched, 1, qpos)                              # up to & incl. opening quote
+            qchar = substr(matched, qpos, 1)
+            inner = substr(matched, qpos + 1, length(matched) - qpos - 1) # between the quotes
+            # Redact ONLY provably inert text (no command substitution / backtick).
+            if (index(inner, "$(") == 0 && index(inner, "`") == 0) {
+                gsub(/./, "X", inner)
+            }
+            out = out pre head inner qchar
+        }
+        out = out s
+        printf "%s", out
+    }'
+}
+
 # Helper: output a deny decision and exit
 deny() {
     local reason="$1"
@@ -532,8 +588,22 @@ ALWAYS_BLOCK_PATTERNS=(
     # (#3584).
 )
 
+# Build a literal-text-redacted working copy ONLY for the catastrophic scan
+# below, so a force-push-to-main phrase quoted inside a --body/-m/--title/--notes
+# value no longer false-positives (#3679). The awk only runs when one of those
+# flags is actually present, keeping it off the hot path (mirrors the
+# COMMAND_NO_COMMENT `#`-present guard). `-c` is intentionally excluded so
+# `bash -c '<payload>'` payloads still reach the raw scan; spans carrying `$(` /
+# backtick are left intact so command-substitution smuggling still hard-denies.
+COMMAND_NO_LITERAL_TEXT="$COMMAND"
+if [[ "$COMMAND" == *"--body"* || "$COMMAND" == *"--message"* || \
+      "$COMMAND" == *"--title"* || "$COMMAND" == *"--notes"* || \
+      "$COMMAND" == *"-m"* ]]; then
+    COMMAND_NO_LITERAL_TEXT=$(strip_literal_text "$COMMAND")
+fi
+
 for pattern in "${ALWAYS_BLOCK_PATTERNS[@]}"; do
-    if echo "$COMMAND" | grep -qiE "$pattern"; then
+    if echo "$COMMAND_NO_LITERAL_TEXT" | grep -qiE "$pattern"; then
         deny "BLOCKED: Command matches dangerous pattern: $pattern"
     fi
 done
