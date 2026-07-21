@@ -7,6 +7,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.12.0] - 2026-07-21
+
+### Summary
+
+Minor release from two full autonomous `/loom:sweep all` passes over the backlog. Headlined by **guard ergonomics for autonomous agents** — a branch-aware `guards.forceScope` toggle, a read-only fast path that makes the per-Bash-call guard ~8× cheaper on obviously-safe commands, and an end to false denies on force-push strings merely *quoted* in PR-comment bodies — plus **sweep orchestration upgrades**: a configurable Doctor-cycle cap, a core-scaled default wave size, partial-increment (`Part of #N`) lifecycle correctness on both the label and probe sides, and a documented recovery rule for role subagents killed mid-phase by rate limits.
+
+### Added
+
+- **`guards.forceScope` — branch-aware force-operation guard toggle** (symmetric to `guards.rmScope`): `"all"` (shipped default, current behaviour), `"protected"` (ask only when the resolved push/reset target is a protected branch — every positional refspec is resolved, not just the first), or `"off"`. Branch resolution handles explicit refspecs (`+main`, `HEAD:main`), `git -C <path>`, and detached HEAD (→ ask); the main/master ALWAYS_BLOCK hard-denies stay unconditional in every mode. Lets autonomous agents rebase/amend their own working branches without interactive asks, replacing downstream hook forks. (#3674, #3676)
+- **Read-only fast path for `guard-destructive.sh`** (`guards.readOnlyFastPath`, default on; `LOOM_GUARD_READONLY_FASTPATH` env override; extend-only `guards.readOnlyFastPathExtra`): trivially read-only commands (`git status|log|diff|show`, `ls`, `grep`, `rg`, `gh … view|list`, `aws … describe*|get*|list*`) short-circuit to a silent zero-fork allow (~20ms vs ~156ms) before the full deny/ask gauntlet. Admission is purely structural — any chaining/piping/redirection/substitution metacharacter routes to the full path, so `git status && git push --force …` still denies; `cat`/`ssh` are deliberately excluded to preserve their existing carve-outs. (#3687, #3692)
+- **`/sweep`: configurable Doctor-cycle cap** — `sweep.max_doctor_cycles` in `.loom/config.json` (default 1, the historical single-cycle behaviour) generalizes the hardcoded Doctor→Judge cap, composing with the #3481 model-escalation ladder and checkpoint `attempt` bookkeeping; at the default cap the orchestrator may grant exactly one logged grace cycle when a second Judge rejection is a demonstrably *distinct* defect (forward progress) rather than same-defect thrash. (#3668, #3673)
+- **`/sweep`: core-scaled subagent-path auto wave size** — the in-session auto wave target scales `clamp(floor((cores-2)/4), 3, 6)` instead of a flat 3 (new `loom_detect_cores` / `loom_subagent_target_from_cores` helpers, `LOOM_CORES_OVERRIDE` for determinism); the explicit-override warning threshold moves N≥4 → N≥7. The #3289 one-level-deep nesting rule and the daemon path's target of 10 are unchanged — width scales, nesting never. (#3693, #3694)
+- **`/sweep`: mid-phase-death recovery rule** — when a role subagent dies mid-phase (rate limit, crash), the orchestrator re-verifies forge state (pushed commits, labels, comments) against the phase's expected exit state and completes only the missing steps, preferring resuming the same agent; rate-limit terminations get a distinct `rate-limited (resumed/unresumable)` status token in the sweep summaries. (#3683, #3691)
+
+### Fixed
+
+- **`install.sh --quick` no longer strands user changes when the update edits a co-edited file** — the #3588 HEAD-reset-then-reapply stash-restore pattern is generalized beyond `.gitignore` to every Loom-owned dirty file with a reapply strategy, including a block-aware `CLAUDE.md` marker-block splice; genuine in-block conflicts still surface with the specific conflicting file(s) named. (#3663, #3670)
+- **`merge-pr.sh --auto` handles UNSTABLE (checks-still-running) PRs** — instead of hard-failing on "Pull request is in unstable status", the script polls bounded by `LOOM_AUTO_MERGE_POLL_INTERVAL`/`LOOM_AUTO_MERGE_TIMEOUT`: required-check failures refuse immediately, pending checks wait, informational-only failures keep the #3486 immediate-merge path. (#3664, #3669)
+- **`merge-pr.sh` UNSTABLE poll no longer misreads a transient check-runs fetch failure as "resolved green"** — the fetch exit status is captured separately (one retry, then the bounded pending-wait path); the immediate-merge and unknown-gap branches are reachable only after a successful fetch. (#3678, #3685)
+- **`Part of #N` partial-increment PRs no longer orphan `loom:building`** — on merge of a non-closing partial-slice PR, `merge-pr.sh` verifies the referenced issue is still open and still claimed, then swaps `loom:building` → `loom:issue` with an audit comment, so the next sweep can pick up the remaining scope. Mutations are repo-scoped (`--repo "$REPO_NWO"`) to match the reads. (#3667, #3672; #3681, #3688)
+- **`/sweep` existing-PR probe now sees non-closing `Part of #N` PRs** — the pre-flight probe unions GitHub timeline `cross-referenced` events (same-repo, open PRs only) with `closedByPullRequestsReferences`, closing the duplicate-builder hazard for partial-slice PRs without reintroducing body-grep (#3267). (#3677, #3684)
+- **`guard-destructive.sh` no longer denies force-push strings quoted inside text-carrying flags** — quoted values of `--body`/`-m`/`--message`/`--title`/`--notes` are redacted (same-length placeholder) before the catastrophic substring scan, but never when the span contains `$(`/backtick, so command-substitution smuggling and `bash -c` payloads still deny. Judges can finally quote the commands they're reviewing. (#3679, #3686)
+- **Champion post-merge worktree cleanup no longer prints a duplicated path** — the two porcelain-parsing awk helpers in `merge-pr.sh` had the classic `exit`-triggers-`END` double-print; a `found`-flag guard makes each emit exactly one path. Cosmetic only — the `.loom-managed` safety sentinel was never affected. (#3671, #3675)
+- **`disk-headroom.sh` is sourceable under zsh** — `${BASH_SOURCE[0]:-$0}` replaces the bash-only idiom so `/sweep`'s Stage -1 wave-size resolution works from zsh sessions; `loom-tools.sh` hardened likewise, with a zsh regression test. (#3680, #3689)
+- **Loom-on-Loom dogfood drift eliminated structurally** — the installer's dogfood mode now materializes `.claude/commands/loom` as a *scoped symlink* into `defaults/.claude/commands/loom` (the parent `.claude/commands/` stays a real directory, so co-installed tools' namespaces are untouched — the #3565 hazard does not reapply). Stale dogfood copies caused a false bug report (#3665); the class is now impossible. (#3682, #3690)
+
+### Documentation
+
+- CLAUDE.md files gain a Custom Guard Hooks section covering the full guard-toggle catalog (`sqlDdl`, `cloudCli`, `rmScope`, `forceScope`, `readOnlyFastPath`); sweep.md's cap/wave-size/limitations prose reconciled with the new configurable defaults. (#3673, #3676, #3691, #3692, #3694)
+
 ## [0.11.0] - 2026-07-20
 
 > **MINOR version bump** — the rm-guard default change below is a behaviour change, not a bug fix.
