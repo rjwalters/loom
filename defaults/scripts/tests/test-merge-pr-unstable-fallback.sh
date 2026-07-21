@@ -557,6 +557,56 @@ assert_eq "unknown" "$result" "#3664: unknown gap (no failing, no pending, never
 result=$(_unstable_decision "$runs_failed" "Required Build" "false")
 assert_eq "refuse" "$result" "#3486 preserved: failing required check, nothing pending -> refuse"
 
+# --- Test the fetch-failure decision point (#3678) ---
+# The #3678 bug: a transient check-runs fetch failure mid-poll yields empty
+# JSON, which classifies as "no failing, no pending" -> the resolved-green
+# branch -> a premature immediate merge on a commit whose real check state is
+# unknown. The fix captures the fetch exit status separately and, on failure,
+# routes into the bounded pending-wait path BEFORE any empty-runs
+# classification runs. This mirror gates _unstable_decision on fetch success:
+# a failed fetch must always resolve to "wait", never reaching the (a)-(e)
+# empty-runs classification at all.
+echo ""
+echo "Testing UNSTABLE fetch-failure decision point (#3678)..."
+
+_unstable_decision_with_fetch() {
+    local runs="$1" required="$2" observed_pending="$3" fetch_ok="$4"
+    if [[ "$fetch_ok" != "true" ]]; then
+        # A failed fetch never reaches the empty-runs classification; it is
+        # treated as still-pending and re-polled (bounded by the deadline).
+        echo "wait"; return
+    fi
+    _unstable_decision "$runs" "$required" "$observed_pending"
+}
+
+# The exact bug scenario from PR #3669's Judge note: fetch fails AFTER a pending
+# check was observed. Must wait, NOT merge.
+result=$(_unstable_decision_with_fetch "$runs_green" "Required Build" "true" "false")
+assert_eq "wait" "$result" "#3678: fetch fails after observing pending -> wait (NOT premature merge)"
+
+# Fetch fails on the very first poll iteration (never observed pending). Must
+# wait, NOT hit the unknown-gap hard error — a fetch error is not a genuine
+# unknown gap.
+result=$(_unstable_decision_with_fetch "$runs_green" "Required Build" "false" "false")
+assert_eq "wait" "$result" "#3678: fetch fails on first iteration -> wait (NOT unknown-gap hard error)"
+
+# Regression guard: a SUCCESSFUL fetch of a genuinely empty rollup with no
+# observed pending still resolves to the unknown-gap hard error — the fix must
+# not over-widen so real unknown gaps get silently retried forever.
+result=$(_unstable_decision_with_fetch "$runs_green" "Required Build" "false" "true")
+assert_eq "unknown" "$result" "#3678: successful empty fetch, never pending -> unknown-gap preserved"
+
+# Regression guard: a SUCCESSFUL fetch of an empty rollup after observing
+# pending still resolves to merge — the #3664 resolved-green path is unchanged
+# for real (non-error) fetches.
+result=$(_unstable_decision_with_fetch "$runs_green" "Required Build" "true" "true")
+assert_eq "merge" "$result" "#3678: successful empty fetch after pending -> resolved-green merge preserved"
+
+# A failed fetch resolves to wait regardless of what the (ignored) runs payload
+# would otherwise classify as — even a would-be failing-required rollup.
+result=$(_unstable_decision_with_fetch "$runs_failed" "Required Build" "false" "false")
+assert_eq "wait" "$result" "#3678: fetch failure ignores stale/empty payload -> wait (no classification)"
+
 # --- Test the poll-window env-var wiring in merge-pr.sh (#3664) ---
 # The script reuses LOOM_AUTO_MERGE_POLL_INTERVAL / LOOM_AUTO_MERGE_TIMEOUT with
 # the same defaults as loom-auto-merge (30s / 600s). Assert the defaulting
@@ -589,6 +639,25 @@ if grep -q 'LOOM_AUTO_MERGE_TIMEOUT' "$MERGE_PR_SRC" && grep -q 'LOOM_AUTO_MERGE
 else
     TESTS_RUN=$((TESTS_RUN + 1)); TESTS_FAILED=$((TESTS_FAILED + 1))
     echo -e "  ${RED}FAIL${NC}: merge-pr.sh missing the LOOM_AUTO_MERGE_* poll-window env vars"
+fi
+
+# Assert the merge-pr.sh source captures the check-runs fetch exit status
+# separately (the core of the #3678 fix) rather than collapsing it to empty JSON.
+if grep -q '_UNSTABLE_FETCH_RC' "$MERGE_PR_SRC"; then
+    TESTS_RUN=$((TESTS_RUN + 1)); TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "  ${GREEN}PASS${NC}: merge-pr.sh captures the check-runs fetch exit status (_UNSTABLE_FETCH_RC)"
+else
+    TESTS_RUN=$((TESTS_RUN + 1)); TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "  ${RED}FAIL${NC}: merge-pr.sh missing the fetch-exit-status capture (#3678 regression)"
+fi
+# Assert the old exit-status-swallowing collapse is gone: the callsite must no
+# longer OR a failed check-runs fetch into a hardcoded empty-JSON literal.
+if grep -q "forge_get_check_runs .* || echo '{\"check_runs\":\[\]}'" "$MERGE_PR_SRC"; then
+    TESTS_RUN=$((TESTS_RUN + 1)); TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "  ${RED}FAIL${NC}: merge-pr.sh still collapses a failed check-runs fetch to empty JSON (#3678)"
+else
+    TESTS_RUN=$((TESTS_RUN + 1)); TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "  ${GREEN}PASS${NC}: merge-pr.sh no longer collapses a failed check-runs fetch to empty JSON"
 fi
 
 # --- Summary ---

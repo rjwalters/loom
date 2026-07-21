@@ -508,7 +508,40 @@ if [[ "$AUTO_MERGE" == "true" ]]; then
       _UNSTABLE_DEADLINE=$(( $(date +%s) + LOOM_AUTO_MERGE_TIMEOUT ))
 
       while true; do
-        _UNSTABLE_FAILING_RAW="$(forge_get_check_runs "$REPO_NWO" "$_UNSTABLE_HEAD_SHA" 2>/dev/null || echo '{"check_runs":[]}')"
+        # Fetch the check-runs rollup, capturing the helper's own exit status
+        # separately from the JSON payload. A transient fetch failure (network
+        # blip, 5xx, Gitea `return 1`) must NOT be collapsed into the same
+        # `{"check_runs":[]}` shape a legitimately empty rollup produces —
+        # doing so lets a fetch error masquerade as "no failing, no pending"
+        # and, once a pending check has been observed, take the resolved-green
+        # immediate-merge branch on a commit whose real check state is unknown
+        # (#3678). Retry once to absorb a single blip, then route a persistent
+        # failure into the SAME bounded pending-wait path used by branch (b)
+        # below so the LOOM_AUTO_MERGE_TIMEOUT bound still applies.
+        _UNSTABLE_FETCH_RC=0
+        _UNSTABLE_FAILING_RAW="$(forge_get_check_runs "$REPO_NWO" "$_UNSTABLE_HEAD_SHA" 2>/dev/null)" || _UNSTABLE_FETCH_RC=$?
+        if [[ "$_UNSTABLE_FETCH_RC" -ne 0 ]]; then
+          _UNSTABLE_FETCH_RC=0
+          _UNSTABLE_FAILING_RAW="$(forge_get_check_runs "$REPO_NWO" "$_UNSTABLE_HEAD_SHA" 2>/dev/null)" || _UNSTABLE_FETCH_RC=$?
+        fi
+        if [[ "$_UNSTABLE_FETCH_RC" -ne 0 ]]; then
+          # Fetch is failing (twice). Treat as still-pending and keep polling,
+          # reusing the (b) branch's merged-concurrently recheck + deadline
+          # guard so this never bypasses the bounded-wait/timeout semantics.
+          warning "Failed to fetch check-runs for PR #$PR_NUMBER (rc=$_UNSTABLE_FETCH_RC); treating as still-pending and continuing to poll"
+          _UNSTABLE_RECHECK_JSON="$(forge_get_pr_nocache "$REPO_NWO" "$PR_NUMBER" "$GH" 2>/dev/null || echo '{}')"
+          if [[ "$(echo "$_UNSTABLE_RECHECK_JSON" | jq -r '.merged // false')" == "true" ]]; then
+            warning "PR #$PR_NUMBER merged by another process while waiting for checks"
+            AUTO_MERGE_OK=true
+            break
+          fi
+          if [[ "$(date +%s)" -ge "$_UNSTABLE_DEADLINE" ]]; then
+            error "Timed out after ${LOOM_AUTO_MERGE_TIMEOUT}s waiting for check-runs to become fetchable for PR #$PR_NUMBER (last fetch rc=$_UNSTABLE_FETCH_RC). Re-run the merge once the forge API is healthy, or raise LOOM_AUTO_MERGE_TIMEOUT."
+          fi
+          info "PR #$PR_NUMBER is UNSTABLE: check-runs fetch failing (rc=$_UNSTABLE_FETCH_RC); waiting ${LOOM_AUTO_MERGE_POLL_INTERVAL}s for the forge API (timeout ${LOOM_AUTO_MERGE_TIMEOUT}s)..."
+          sleep "$LOOM_AUTO_MERGE_POLL_INTERVAL"
+          continue
+        fi
         # Names of failing check runs (terminal non-success conclusions).
         # Sort + uniq to dedupe re-runs with the same context.
         _UNSTABLE_FAILING="$(echo "$_UNSTABLE_FAILING_RAW" | \
@@ -603,7 +636,7 @@ if [[ "$AUTO_MERGE" == "true" ]]; then
         _UNSTABLE_FAILING _UNSTABLE_PENDING _UNSTABLE_REQUIRED \
         _UNSTABLE_INFORMATIONAL _UNSTABLE_OVERLAP _UNSTABLE_COUNT \
         _UNSTABLE_PENDING_COUNT _UNSTABLE_DEADLINE _UNSTABLE_RECHECK_JSON \
-        _UNSTABLE_LOOKUP_RC _UNSTABLE_OBSERVED_PENDING 2>/dev/null || true
+        _UNSTABLE_LOOKUP_RC _UNSTABLE_FETCH_RC _UNSTABLE_OBSERVED_PENDING 2>/dev/null || true
 
       if [[ "$_UNSTABLE_FALLBACK_TO_MERGE" == "true" ]]; then
         unset _UNSTABLE_FALLBACK_TO_MERGE
