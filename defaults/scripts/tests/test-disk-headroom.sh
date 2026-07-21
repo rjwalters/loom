@@ -63,12 +63,19 @@ assert_eq "$(wave daemon 10 6)" "3|disk" "daemon: 6GB free (per 2) clamps to 3 (
 # Floor-of-1: nearly full disk (free=1, per=2 -> 0) never returns 0.
 assert_eq "$(wave daemon 10 1)" "1|floor" "daemon: 1GB free floors to 1 (floor)"
 
-# --- Test 2: pure wave-size math (subagent cap = 3) ---
+# --- Test 2: pure wave-size math (subagent path, explicit cap) ---
 echo ""
-echo "Test 2: loom_wave_size_from_disk subagent path (cap 3)"
+echo "Test 2: loom_wave_size_from_disk subagent path (explicit LOOM_SUBAGENT_WAVE_CAP=3)"
 
-# Plentiful disk + candidates -> capped at 3 (the #3289-safe ceiling).
-assert_eq "$(wave subagent 20 100)" "3|target" "subagent: plentiful -> 3 (cap, NOT 10)"
+# These cases pin the explicit-cap behaviour of loom_wave_size_from_disk (its
+# signature and internals are UNCHANGED by #3693 — the core-scaling happens in
+# the caller, which resolves LOOM_SUBAGENT_WAVE_CAP before invoking). We set the
+# cap explicitly here so the assertions are deterministic regardless of the
+# host's actual core count.
+export LOOM_SUBAGENT_WAVE_CAP=3
+
+# Plentiful disk + candidates -> capped at 3 (the #3289-safe target).
+assert_eq "$(wave subagent 20 100)" "3|target" "subagent: plentiful -> 3 (explicit cap, NOT 10)"
 
 # Candidate-bound: 2 issues -> 2.
 assert_eq "$(wave subagent 2 100)" "2|candidates" "subagent: 2 candidates clamps to 2"
@@ -78,6 +85,11 @@ assert_eq "$(wave subagent 10 2)" "1|disk" "subagent: 2GB free (per 2) clamps to
 
 # Floor: free=0 -> 1.
 assert_eq "$(wave subagent 10 0)" "1|floor" "subagent: 0GB free floors to 1"
+
+# A higher explicit cap is honoured verbatim (proves the env value wins).
+assert_eq "$(LOOM_SUBAGENT_WAVE_CAP=6 wave subagent 20 100)" "6|target" "subagent: explicit cap 6 honoured -> 6 (target)"
+
+unset LOOM_SUBAGENT_WAVE_CAP
 
 # --- Test 3: PER_WORKTREE_GB env override ---
 echo ""
@@ -170,6 +182,51 @@ if command -v zsh >/dev/null 2>&1; then
 else
     echo "  SKIP: zsh not available on PATH — skipping zsh-sourcing regression test"
 fi
+
+# --- Test 8: loom_subagent_target_from_cores pure clamp (#3693) ---
+echo ""
+echo "Test 8: loom_subagent_target_from_cores = clamp(floor((cores-2)/4), 3, 6)"
+
+# Floor of 3 holds for small/shared hosts (raw < 3, incl. cores < 2).
+assert_eq "$(loom_subagent_target_from_cores 1)" "3" "cores=1 -> 3 (floor; raw would be <=0)"
+assert_eq "$(loom_subagent_target_from_cores 4)" "3" "cores=4 -> 3 (floor)"
+assert_eq "$(loom_subagent_target_from_cores 14)" "3" "cores=14 -> 3 (floor; raw=3)"
+assert_eq "$(loom_subagent_target_from_cores 16)" "3" "cores=16 -> 3 (floor; raw=3)"
+# Scaling band 3..6.
+assert_eq "$(loom_subagent_target_from_cores 20)" "4" "cores=20 -> 4 (raw=4)"
+assert_eq "$(loom_subagent_target_from_cores 22)" "5" "cores=22 -> 5 (raw=5)"
+assert_eq "$(loom_subagent_target_from_cores 24)" "5" "cores=24 -> 5 (raw=5)"
+assert_eq "$(loom_subagent_target_from_cores 28)" "6" "cores=28 -> 6 (raw=6, ceiling)"
+# Ceiling of 6 holds for very large hosts.
+assert_eq "$(loom_subagent_target_from_cores 64)" "6" "cores=64 -> 6 (ceiling)"
+assert_eq "$(loom_subagent_target_from_cores 100)" "6" "cores=100 -> 6 (ceiling)"
+
+# Non-integer input is rejected with a non-zero exit.
+if loom_subagent_target_from_cores "abc" >/dev/null 2>&1; then
+    fail "non-integer cores should return non-zero"
+else
+    pass "non-integer cores returns non-zero"
+fi
+
+# --- Test 9: loom_detect_cores portability + override (#3693) ---
+echo ""
+echo "Test 9: loom_detect_cores honors LOOM_CORES_OVERRIDE and returns a positive integer"
+
+# Deterministic path: override short-circuits all host probing.
+assert_eq "$(LOOM_CORES_OVERRIDE=7 loom_detect_cores)" "7" "LOOM_CORES_OVERRIDE=7 -> 7 (deterministic)"
+assert_eq "$(LOOM_CORES_OVERRIDE=28 loom_detect_cores)" "28" "LOOM_CORES_OVERRIDE=28 -> 28 (deterministic)"
+
+# Host-dependent smoke check: no override -> a positive integer.
+detected="$(loom_detect_cores)"
+if [[ "$detected" =~ ^[0-9]+$ && "$detected" -ge 1 ]]; then
+    pass "loom_detect_cores (no override) returns a positive integer ($detected)"
+else
+    fail "loom_detect_cores (no override) returned non-positive-integer '$detected'"
+fi
+
+# End-to-end: the documented composition prints the core-scaled default.
+assert_eq "$(LOOM_CORES_OVERRIDE=28 bash -c "source '$DISK_HEADROOM_LIB'; loom_subagent_target_from_cores \"\$(loom_detect_cores)\"")" "6" \
+    "composition: LOOM_CORES_OVERRIDE=28 -> target 6"
 
 # --- Summary ---
 echo ""
