@@ -173,10 +173,10 @@ reset_log
 PR_JSON='{"body":"Implements a slice.\n\nPart of #123"}'
 _reset_partial_increment_labels
 log="$(read_log)"
-assert_contains "$log" "issue edit 123 --remove-label loom:building --add-label loom:issue" \
-  "Part of #123 (open, building) -> swaps loom:building to loom:issue"
-assert_contains "$log" "issue comment 123" \
-  "Part of #123 -> posts an auditable comment"
+assert_contains "$log" "issue edit 123 --repo owner/repo --remove-label loom:building --add-label loom:issue" \
+  "Part of #123 (open, building) -> swaps loom:building to loom:issue (repo-scoped)"
+assert_contains "$log" "issue comment 123 --repo owner/repo" \
+  "Part of #123 -> posts an auditable comment (repo-scoped)"
 
 # T2: Closes #123 -> NOT a partial ref -> no mutation (existing behavior preserved).
 reset_log
@@ -206,17 +206,17 @@ assert_eq "" "$(read_log)" "Part of #888 (not loom:building) -> no-op, idempoten
 reset_log
 PR_JSON='{"body":"Contributes to #456"}'
 _reset_partial_increment_labels
-assert_contains "$(read_log)" "issue edit 456 --remove-label loom:building --add-label loom:issue" \
-  "Contributes to #456 (open, building) -> swaps to loom:issue"
+assert_contains "$(read_log)" "issue edit 456 --repo owner/repo --remove-label loom:building --add-label loom:issue" \
+  "Contributes to #456 (open, building) -> swaps to loom:issue (repo-scoped)"
 
 # T6: case-insensitive keyword + multiple refs -> both swapped.
 reset_log
 PR_JSON='{"body":"part of #123\ncontributes TO #456"}'
 _reset_partial_increment_labels
 log="$(read_log)"
-assert_contains "$log" "issue edit 123 --remove-label loom:building --add-label loom:issue" \
+assert_contains "$log" "issue edit 123 --repo owner/repo --remove-label loom:building --add-label loom:issue" \
   "Case-insensitive 'part of #123' matched"
-assert_contains "$log" "issue edit 456 --remove-label loom:building --add-label loom:issue" \
+assert_contains "$log" "issue edit 456 --repo owner/repo --remove-label loom:building --add-label loom:issue" \
   "Multiple refs: #456 also matched"
 
 # T7: reference target is actually a PR (has .pull_request) -> skip.
@@ -245,7 +245,7 @@ reset_log
 PR_JSON='{"body":"Closes #888\n\nPart of #123"}'
 _reset_partial_increment_labels
 log="$(read_log)"
-assert_contains "$log" "issue edit 123 --remove-label loom:building" \
+assert_contains "$log" "issue edit 123 --repo owner/repo --remove-label loom:building" \
   "Mixed body: Part of #123 is reset"
 assert_not_contains "$log" "issue edit 888" \
   "Mixed body: Closes #888 is NOT touched"
@@ -262,6 +262,8 @@ assert_contains "$src" "--remove-label \"loom:building\"" \
   "merge-pr.sh swaps loom:building"
 assert_contains "$src" "--add-label \"loom:issue\"" \
   "merge-pr.sh restores loom:issue"
+assert_contains "$src" "--repo \"\$REPO_NWO\"" \
+  "merge-pr.sh scopes the partial-increment mutations to REPO_NWO"
 
 # --- Summary ---
 echo ""
