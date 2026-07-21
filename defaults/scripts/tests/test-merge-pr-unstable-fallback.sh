@@ -432,6 +432,165 @@ else
     echo -e "  ${GREEN}PASS${NC}: 'is in unstable status' substring does NOT match CLEAN error"
 fi
 
+# --- Test the pending-vs-failing classification (#3664) ---
+# The UNSTABLE-fallback poll in merge-pr.sh derives two sets from the head-SHA
+# check-runs rollup: FAILING (terminal non-success conclusions) and PENDING
+# (status != "completed", i.e. queued/in_progress → conclusion still null).
+# These mirror the two jq filters used inside the poll body so the script stays
+# in lockstep with the test. The #3664 bug was that a rollup that is UNSTABLE
+# *solely* because required checks are still running has an empty FAILING set,
+# so the pre-#3664 code hit the "unknown gap" hard-error instead of waiting.
+echo ""
+echo "Testing pending-vs-failing check-run classification (#3664)..."
+
+# Mirror merge-pr.sh's _UNSTABLE_FAILING filter.
+_failing_names() {
+    echo "$1" | jq -r '[.check_runs[] | select(.conclusion == "failure" or .conclusion == "timed_out" or .conclusion == "cancelled" or .conclusion == "action_required") | .name] | unique | .[]' 2>/dev/null || true
+}
+# Mirror merge-pr.sh's _UNSTABLE_PENDING filter.
+_pending_names() {
+    echo "$1" | jq -r '[.check_runs[] | select(.status != "completed") | .name] | unique | .[]' 2>/dev/null || true
+}
+
+# A rollup that is UNSTABLE only because a required check is still running.
+runs_pending='{"check_runs":[
+  {"name":"Required Build","status":"in_progress","conclusion":null},
+  {"name":"Lint","status":"completed","conclusion":"success"}
+]}'
+assert_eq "" "$(_failing_names "$runs_pending")" "#3664: still-running rollup has NO failing checks (empty FAILING set)"
+assert_eq "Required Build" "$(_pending_names "$runs_pending")" "#3664: still-running rollup surfaces the in_progress check in PENDING"
+
+# A queued check is also pending.
+runs_queued='{"check_runs":[{"name":"Deploy Preview","status":"queued","conclusion":null}]}'
+assert_eq "" "$(_failing_names "$runs_queued")" "#3664: queued rollup has no failing checks"
+assert_eq "Deploy Preview" "$(_pending_names "$runs_queued")" "#3664: queued check appears in PENDING"
+
+# An all-green rollup has neither failing nor pending checks.
+runs_green='{"check_runs":[{"name":"Required Build","status":"completed","conclusion":"success"}]}'
+assert_eq "" "$(_failing_names "$runs_green")" "#3664: all-green rollup has no failing checks"
+assert_eq "" "$(_pending_names "$runs_green")" "#3664: all-green rollup has no pending checks"
+
+# A failed check is FAILING but not PENDING.
+runs_failed='{"check_runs":[{"name":"Required Build","status":"completed","conclusion":"failure"}]}'
+assert_eq "Required Build" "$(_failing_names "$runs_failed")" "#3664: failed check appears in FAILING"
+assert_eq "" "$(_pending_names "$runs_failed")" "#3664: failed (completed) check is NOT pending"
+
+# Mixed: one check failed, another still running → both sets populated.
+runs_mixed='{"check_runs":[
+  {"name":"Flaky Job","status":"completed","conclusion":"failure"},
+  {"name":"Required Build","status":"in_progress","conclusion":null}
+]}'
+assert_eq "Flaky Job" "$(_failing_names "$runs_mixed")" "#3664: mixed rollup surfaces the failed check in FAILING"
+assert_eq "Required Build" "$(_pending_names "$runs_mixed")" "#3664: mixed rollup surfaces the running check in PENDING"
+
+# --- Test the poll-decision precedence (#3664) ---
+# Mirror the branch order of the UNSTABLE-fallback poll body:
+#   (a) a failing REQUIRED check      -> "refuse"  (terminal, no wait)
+#   (b) any PENDING check             -> "wait"    (bounded poll)
+#   (c) failing INFORMATIONAL only,
+#       nothing pending               -> "merge"   (#3486 immediate-merge)
+#   (d) nothing failing, nothing
+#       pending, observed a pending   -> "merge"   (checks resolved green)
+#   (e) nothing failing, nothing
+#       pending, never saw pending    -> "unknown" (preserve #3486 hard-error)
+echo ""
+echo "Testing UNSTABLE poll-decision precedence (#3664)..."
+
+_unstable_decision() {
+    local runs="$1" required="$2" observed_pending="$3"
+    local failing pending informational overlap
+    failing=$(_failing_names "$runs")
+    pending=$(_pending_names "$runs")
+
+    if [[ -n "$failing" ]]; then
+        informational=$(comm -23 \
+          <(printf '%s\n' "$failing" | sort -u) \
+          <(printf '%s\n' "$required" | sort -u))
+        overlap=$(comm -12 \
+          <(printf '%s\n' "$failing" | sort -u) \
+          <(printf '%s\n' "$required" | sort -u))
+        if [[ -n "$overlap" ]]; then
+            echo "refuse"; return                       # (a)
+        fi
+        if [[ -z "$pending" ]]; then
+            echo "merge"; return                        # (c)
+        fi
+        # informational failures but checks still pending -> fall to wait
+    fi
+
+    if [[ -n "$pending" ]]; then
+        echo "wait"; return                             # (b)
+    fi
+
+    if [[ "$observed_pending" == "true" ]]; then
+        echo "merge"; return                            # (d)
+    fi
+    echo "unknown"                                       # (e)
+}
+
+# (b) The core #3664 case: required check still running, nothing failed -> wait.
+result=$(_unstable_decision "$runs_pending" "Required Build" "false")
+assert_eq "wait" "$result" "#3664: required check still running -> poll/wait (NOT hard error)"
+
+# (a) A required check has failed -> refuse immediately, even with a pending one.
+result=$(_unstable_decision "$runs_mixed" "Flaky Job" "false")
+assert_eq "refuse" "$result" "#3664: failed REQUIRED check -> refuse without waiting"
+
+# (b') Mixed where the failed check is informational and another is pending -> wait.
+result=$(_unstable_decision "$runs_mixed" "Required Build" "false")
+assert_eq "wait" "$result" "#3664: informational failure + pending required -> wait (do not merge yet)"
+
+# (c) #3486 preserved: informational failure, nothing pending -> immediate merge.
+runs_info_failed='{"check_runs":[{"name":"Informational Soak","status":"completed","conclusion":"failure"}]}'
+result=$(_unstable_decision "$runs_info_failed" "Required Build" "false")
+assert_eq "merge" "$result" "#3486 preserved: informational failure, nothing pending -> immediate merge"
+
+# (d) Checks we waited on all resolved green -> immediate merge.
+result=$(_unstable_decision "$runs_green" "Required Build" "true")
+assert_eq "merge" "$result" "#3664: pending checks resolved green -> immediate merge"
+
+# (e) Unknown gap preserved: nothing failing, nothing pending, never saw pending.
+result=$(_unstable_decision "$runs_green" "Required Build" "false")
+assert_eq "unknown" "$result" "#3664: unknown gap (no failing, no pending, never pending) -> preserve hard error"
+
+# (a') All failing checks required, nothing pending -> refuse (existing behavior).
+result=$(_unstable_decision "$runs_failed" "Required Build" "false")
+assert_eq "refuse" "$result" "#3486 preserved: failing required check, nothing pending -> refuse"
+
+# --- Test the poll-window env-var wiring in merge-pr.sh (#3664) ---
+# The script reuses LOOM_AUTO_MERGE_POLL_INTERVAL / LOOM_AUTO_MERGE_TIMEOUT with
+# the same defaults as loom-auto-merge (30s / 600s). Assert the defaulting
+# expressions the script uses resolve as expected.
+echo ""
+echo "Testing poll-window env-var defaults (#3664)..."
+
+unset LOOM_AUTO_MERGE_POLL_INTERVAL LOOM_AUTO_MERGE_TIMEOUT 2>/dev/null || true
+assert_eq "30" "${LOOM_AUTO_MERGE_POLL_INTERVAL:-30}" "#3664: poll interval defaults to 30s when unset"
+assert_eq "600" "${LOOM_AUTO_MERGE_TIMEOUT:-600}" "#3664: poll timeout defaults to 600s when unset"
+LOOM_AUTO_MERGE_POLL_INTERVAL=5
+LOOM_AUTO_MERGE_TIMEOUT=120
+assert_eq "5" "${LOOM_AUTO_MERGE_POLL_INTERVAL:-30}" "#3664: poll interval honors a caller override"
+assert_eq "120" "${LOOM_AUTO_MERGE_TIMEOUT:-600}" "#3664: poll timeout honors a caller override"
+unset LOOM_AUTO_MERGE_POLL_INTERVAL LOOM_AUTO_MERGE_TIMEOUT 2>/dev/null || true
+
+# Assert the merge-pr.sh source actually contains the pending-set filter and the
+# poll-window env vars, so a refactor that drops them fails this test.
+MERGE_PR_SRC="$HELPERS_DIR/merge-pr.sh"
+if grep -q 'select(.status != "completed")' "$MERGE_PR_SRC"; then
+    TESTS_RUN=$((TESTS_RUN + 1)); TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "  ${GREEN}PASS${NC}: merge-pr.sh computes the PENDING set (status != completed)"
+else
+    TESTS_RUN=$((TESTS_RUN + 1)); TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "  ${RED}FAIL${NC}: merge-pr.sh missing the PENDING-set filter"
+fi
+if grep -q 'LOOM_AUTO_MERGE_TIMEOUT' "$MERGE_PR_SRC" && grep -q 'LOOM_AUTO_MERGE_POLL_INTERVAL' "$MERGE_PR_SRC"; then
+    TESTS_RUN=$((TESTS_RUN + 1)); TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "  ${GREEN}PASS${NC}: merge-pr.sh wires the LOOM_AUTO_MERGE_* poll-window env vars"
+else
+    TESTS_RUN=$((TESTS_RUN + 1)); TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "  ${RED}FAIL${NC}: merge-pr.sh missing the LOOM_AUTO_MERGE_* poll-window env vars"
+fi
+
 # --- Summary ---
 echo ""
 echo "────────────────────────────────"

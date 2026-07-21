@@ -298,6 +298,13 @@ if [[ "$AUTO_MERGE" == "true" ]]; then
   MERGE_RETRY_DELAY=5
   AUTO_MERGE_OK=false
 
+  # Bounded poll window for the UNSTABLE-because-checks-are-still-running case
+  # (#3664). Reuses the same env-var names/semantics as the Gitea auto-merge
+  # poller (loom-tools/src/loom_tools/auto_merge.py) so both forges share
+  # configuration. Defaults match that CLI: 30s interval, 600s ceiling.
+  LOOM_AUTO_MERGE_POLL_INTERVAL="${LOOM_AUTO_MERGE_POLL_INTERVAL:-30}"
+  LOOM_AUTO_MERGE_TIMEOUT="${LOOM_AUTO_MERGE_TIMEOUT:-600}"
+
   for MERGE_ATTEMPT in $(seq 1 $MAX_MERGE_RETRIES); do
     AUTO_MERGE_OUTPUT=""
     # Prefer loom-auto-merge CLI (forge-agnostic, with poll-and-merge for Gitea)
@@ -350,17 +357,32 @@ if [[ "$AUTO_MERGE" == "true" ]]; then
     fi
 
     # PR is UNSTABLE — GitHub's enablePullRequestAutoMerge mutation rejects this
-    # state with "Pull request Pull request is in unstable status" when one or
-    # more rollup checks are red. The auto-merge call would deadlock indefinitely
-    # waiting for those checks to go green, but if every failing check is
-    # informational (NOT in branch protection's requiredStatusCheckContexts)
-    # the immediate-merge path would succeed. Detect that case and fall through;
-    # otherwise preserve the existing UNSTABLE refusal so we never bypass a
-    # genuinely required check. Sibling of the CLEAN-fallback above. See #3486.
+    # state with "Pull request Pull request is in unstable status". GitHub emits
+    # the SAME string whether the rollup is red (a check FAILED) or merely yellow
+    # (checks still QUEUED/IN_PROGRESS). We resolve the PR's head-SHA check-runs
+    # and distinguish, in precedence order:
+    #
+    #   (a) A required check has genuinely FAILED  -> refuse (terminal error),
+    #       without waiting out the pending timeout.
+    #   (b) A check is still QUEUED/IN_PROGRESS    -> the merge state will settle
+    #       (conclusion == null, so it never shows    on its own; poll until it
+    #       up as "failing"). This is the #3664       resolves to (a)/(c)/CLEAN,
+    #       "checks still running" case.               bounded by
+    #                                                   LOOM_AUTO_MERGE_TIMEOUT.
+    #   (c) Every FAILED check is informational    -> immediate-merge fallback
+    #       (NOT in branch protection) and nothing     (#3486, unchanged).
+    #       is pending.
+    #   (d) Nothing failed, nothing pending, and   -> genuine "unknown gap"
+    #       we never observed a pending check          (e.g. commit-status, not
+    #       (e.g. commit-status failures the           check-run, failures) ->
+    #       check-runs API omits).                     refuse (terminal),
+    #                                                   preserving the #3486
+    #                                                   defensive hard-error.
+    #
+    # Once the checks we waited on all pass, the PR is effectively CLEAN and we
+    # fall through to immediate merge (mirroring the CLEAN-fallback above).
+    # Sibling of the CLEAN-fallback above. See #3371, #3486, #3664.
     if echo "$AUTO_MERGE_OUTPUT" | grep -q "is in unstable status"; then
-      # Resolve the failing check names from the rollup against the PR's head
-      # SHA, then compute (failing_checks) \ (required_contexts). If the set
-      # difference equals failing_checks, every failure is informational.
       _UNSTABLE_HEAD_SHA="$(echo "$PR_JSON" | jq -r '.head.sha // empty')"
       _UNSTABLE_BASE_REF="$(echo "$PR_JSON" | jq -r '.base.ref // empty')"
       if [[ -z "$_UNSTABLE_HEAD_SHA" ]] || [[ -z "$_UNSTABLE_BASE_REF" ]]; then
@@ -369,61 +391,121 @@ if [[ "$AUTO_MERGE" == "true" ]]; then
         error "Failed to enable auto-merge for PR #$PR_NUMBER: $AUTO_MERGE_OUTPUT"
       fi
 
-      _UNSTABLE_FAILING_RAW="$(forge_get_check_runs "$REPO_NWO" "$_UNSTABLE_HEAD_SHA" 2>/dev/null || echo '{"check_runs":[]}')"
-      # Names of failing check runs (conclusion=failure OR conclusion=timed_out).
-      # Sort + uniq to dedupe re-runs with the same context.
-      _UNSTABLE_FAILING="$(echo "$_UNSTABLE_FAILING_RAW" | \
-        jq -r '[.check_runs[] | select(.conclusion == "failure" or .conclusion == "timed_out" or .conclusion == "cancelled" or .conclusion == "action_required") | .name] | unique | .[]' 2>/dev/null || true)"
+      _UNSTABLE_FALLBACK_TO_MERGE=false
+      _UNSTABLE_OBSERVED_PENDING=false
+      _UNSTABLE_DEADLINE=$(( $(date +%s) + LOOM_AUTO_MERGE_TIMEOUT ))
 
-      if [[ -z "$_UNSTABLE_FAILING" ]]; then
-        # No failing checks were enumerated — could be a transient API gap or
-        # commit-status (vs check-run) failures. Be safe and keep the existing
-        # error path.
+      while true; do
+        _UNSTABLE_FAILING_RAW="$(forge_get_check_runs "$REPO_NWO" "$_UNSTABLE_HEAD_SHA" 2>/dev/null || echo '{"check_runs":[]}')"
+        # Names of failing check runs (terminal non-success conclusions).
+        # Sort + uniq to dedupe re-runs with the same context.
+        _UNSTABLE_FAILING="$(echo "$_UNSTABLE_FAILING_RAW" | \
+          jq -r '[.check_runs[] | select(.conclusion == "failure" or .conclusion == "timed_out" or .conclusion == "cancelled" or .conclusion == "action_required") | .name] | unique | .[]' 2>/dev/null || true)"
+        # Names of checks that are still running (queued or in_progress → not
+        # yet completed, conclusion == null). These never appear in
+        # _UNSTABLE_FAILING; they are the #3664 "still running" case.
+        _UNSTABLE_PENDING="$(echo "$_UNSTABLE_FAILING_RAW" | \
+          jq -r '[.check_runs[] | select(.status != "completed") | .name] | unique | .[]' 2>/dev/null || true)"
+
+        if [[ -n "$_UNSTABLE_FAILING" ]]; then
+          # Some check FAILED — classify against branch protection. A nonzero
+          # exit from the helper signals a lookup failure (Gitea 5xx, network
+          # error, missing token, unknown forge) — fail closed and refuse.
+          _UNSTABLE_REQUIRED=""
+          _UNSTABLE_LOOKUP_RC=0
+          _UNSTABLE_REQUIRED="$(forge_get_required_status_check_contexts "$REPO_NWO" "$_UNSTABLE_BASE_REF" "$GH" 2>/dev/null)" || _UNSTABLE_LOOKUP_RC=$?
+          if [[ "$_UNSTABLE_LOOKUP_RC" -ne 0 ]]; then
+            warning "Failed to resolve required status checks for $_UNSTABLE_BASE_REF (rc=$_UNSTABLE_LOOKUP_RC); preserving UNSTABLE refusal"
+            error "Failed to enable auto-merge for PR #$PR_NUMBER: $AUTO_MERGE_OUTPUT"
+          fi
+
+          # Set difference: failing_checks \ required_contexts (informational)
+          # and failing_checks ∩ required_contexts (overlap).
+          _UNSTABLE_INFORMATIONAL="$(comm -23 \
+            <(printf '%s\n' "$_UNSTABLE_FAILING" | sort -u) \
+            <(printf '%s\n' "$_UNSTABLE_REQUIRED" | sort -u))"
+          _UNSTABLE_OVERLAP="$(comm -12 \
+            <(printf '%s\n' "$_UNSTABLE_FAILING" | sort -u) \
+            <(printf '%s\n' "$_UNSTABLE_REQUIRED" | sort -u))"
+
+          if [[ -n "$_UNSTABLE_OVERLAP" ]]; then
+            # (a) A branch-protection-required check has failed. The PR can
+            # never merge on this SHA — refuse now, without waiting on any
+            # still-pending checks.
+            error "Failed to enable auto-merge for PR #$PR_NUMBER: $AUTO_MERGE_OUTPUT"
+          fi
+
+          if [[ -z "$_UNSTABLE_PENDING" ]]; then
+            # (c) Every failing check is informational and nothing is pending.
+            # Log the names, then fall through to the synchronous-merge path.
+            _UNSTABLE_COUNT="$(printf '%s\n' "$_UNSTABLE_INFORMATIONAL" | wc -l | tr -d ' ')"
+            info "Falling back to immediate merge: ${_UNSTABLE_COUNT} informational check(s) failing (not in branch protection):"
+            printf '%s\n' "$_UNSTABLE_INFORMATIONAL" | while IFS= read -r _ctx; do
+              [[ -n "$_ctx" ]] && info "    - $_ctx"
+            done
+            _UNSTABLE_FALLBACK_TO_MERGE=true
+            break
+          fi
+          # Informational failures but other checks are still running — don't
+          # merge until everything settles. Fall through to the pending wait.
+        fi
+
+        if [[ -n "$_UNSTABLE_PENDING" ]]; then
+          # (b) Checks still running. Wait, bounded by LOOM_AUTO_MERGE_TIMEOUT.
+          _UNSTABLE_OBSERVED_PENDING=true
+
+          # A concurrent merger may have completed the PR while we waited.
+          _UNSTABLE_RECHECK_JSON="$(forge_get_pr_nocache "$REPO_NWO" "$PR_NUMBER" "$GH" 2>/dev/null || echo '{}')"
+          if [[ "$(echo "$_UNSTABLE_RECHECK_JSON" | jq -r '.merged // false')" == "true" ]]; then
+            warning "PR #$PR_NUMBER merged by another process while waiting for checks"
+            AUTO_MERGE_OK=true
+            break
+          fi
+
+          if [[ "$(date +%s)" -ge "$_UNSTABLE_DEADLINE" ]]; then
+            _UNSTABLE_PENDING_COUNT="$(printf '%s\n' "$_UNSTABLE_PENDING" | wc -l | tr -d ' ')"
+            error "Timed out after ${LOOM_AUTO_MERGE_TIMEOUT}s waiting for ${_UNSTABLE_PENDING_COUNT} pending check(s) on PR #$PR_NUMBER to complete (still queued/in_progress). Re-run the merge once CI settles, or raise LOOM_AUTO_MERGE_TIMEOUT."
+          fi
+
+          _UNSTABLE_PENDING_COUNT="$(printf '%s\n' "$_UNSTABLE_PENDING" | wc -l | tr -d ' ')"
+          info "PR #$PR_NUMBER is UNSTABLE: ${_UNSTABLE_PENDING_COUNT} check(s) still running; waiting ${LOOM_AUTO_MERGE_POLL_INTERVAL}s for CI (timeout ${LOOM_AUTO_MERGE_TIMEOUT}s)..."
+          sleep "$LOOM_AUTO_MERGE_POLL_INTERVAL"
+          continue
+        fi
+
+        # Nothing failing, nothing pending.
+        if [[ "$_UNSTABLE_OBSERVED_PENDING" == "true" ]]; then
+          # The checks we waited on all resolved green — the PR is now
+          # effectively CLEAN. Fall through to immediate merge.
+          info "PR #$PR_NUMBER checks resolved green; falling back to immediate merge"
+          _UNSTABLE_FALLBACK_TO_MERGE=true
+          break
+        fi
+        # (d) Never observed a pending check and none failed — a transient API
+        # gap or commit-status (vs check-run) failure the check-runs API omits.
+        # Be safe and keep the existing #3486 defensive error path.
         error "Failed to enable auto-merge for PR #$PR_NUMBER: $AUTO_MERGE_OUTPUT"
-      fi
+      done
 
-      # Required contexts on the merge-target branch. Empty output means there
-      # is no branch protection rule (or no required checks configured), so
-      # every failing check is informational. A nonzero exit from the helper
-      # signals a lookup failure (e.g. Gitea 5xx, network error, missing token,
-      # or an unknown forge) — fail closed and preserve the UNSTABLE refusal.
-      _UNSTABLE_REQUIRED=""
-      _UNSTABLE_LOOKUP_RC=0
-      _UNSTABLE_REQUIRED="$(forge_get_required_status_check_contexts "$REPO_NWO" "$_UNSTABLE_BASE_REF" "$GH" 2>/dev/null)" || _UNSTABLE_LOOKUP_RC=$?
-      if [[ "$_UNSTABLE_LOOKUP_RC" -ne 0 ]]; then
-        warning "Failed to resolve required status checks for $_UNSTABLE_BASE_REF (rc=$_UNSTABLE_LOOKUP_RC); preserving UNSTABLE refusal"
-        unset _UNSTABLE_LOOKUP_RC
-        error "Failed to enable auto-merge for PR #$PR_NUMBER: $AUTO_MERGE_OUTPUT"
-      fi
-      unset _UNSTABLE_LOOKUP_RC
+      unset _UNSTABLE_HEAD_SHA _UNSTABLE_BASE_REF _UNSTABLE_FAILING_RAW \
+        _UNSTABLE_FAILING _UNSTABLE_PENDING _UNSTABLE_REQUIRED \
+        _UNSTABLE_INFORMATIONAL _UNSTABLE_OVERLAP _UNSTABLE_COUNT \
+        _UNSTABLE_PENDING_COUNT _UNSTABLE_DEADLINE _UNSTABLE_RECHECK_JSON \
+        _UNSTABLE_LOOKUP_RC _UNSTABLE_OBSERVED_PENDING 2>/dev/null || true
 
-      # Compute set difference: failing_checks \ required_contexts.
-      # `comm -23 <failing> <required>` lists lines unique to failing.
-      _UNSTABLE_INFORMATIONAL="$(comm -23 \
-        <(printf '%s\n' "$_UNSTABLE_FAILING" | sort -u) \
-        <(printf '%s\n' "$_UNSTABLE_REQUIRED" | sort -u))"
-      _UNSTABLE_OVERLAP="$(comm -12 \
-        <(printf '%s\n' "$_UNSTABLE_FAILING" | sort -u) \
-        <(printf '%s\n' "$_UNSTABLE_REQUIRED" | sort -u))"
-
-      if [[ -z "$_UNSTABLE_OVERLAP" ]] && [[ -n "$_UNSTABLE_INFORMATIONAL" ]]; then
-        # Every failing check is informational. Log a clear INFO message
-        # naming them, then fall through to the synchronous-merge path.
-        _UNSTABLE_COUNT="$(printf '%s\n' "$_UNSTABLE_INFORMATIONAL" | wc -l | tr -d ' ')"
-        info "Falling back to immediate merge: ${_UNSTABLE_COUNT} informational check(s) failing (not in branch protection):"
-        printf '%s\n' "$_UNSTABLE_INFORMATIONAL" | while IFS= read -r _ctx; do
-          [[ -n "$_ctx" ]] && info "    - $_ctx"
-        done
+      if [[ "$_UNSTABLE_FALLBACK_TO_MERGE" == "true" ]]; then
+        unset _UNSTABLE_FALLBACK_TO_MERGE
         AUTO_MERGE=false      # let the synchronous-merge block below run
         AUTO_MERGE_OK=true    # bypass the post-loop "after N attempts" guard
-        unset _UNSTABLE_HEAD_SHA _UNSTABLE_BASE_REF _UNSTABLE_FAILING_RAW _UNSTABLE_FAILING _UNSTABLE_REQUIRED _UNSTABLE_INFORMATIONAL _UNSTABLE_OVERLAP _UNSTABLE_COUNT
+        break                 # exit the outer MERGE_ATTEMPT for-loop
+      fi
+      unset _UNSTABLE_FALLBACK_TO_MERGE
+
+      # The wait loop set AUTO_MERGE_OK=true only if the PR merged concurrently;
+      # break the outer loop to reach the shared cleanup block.
+      if [[ "$AUTO_MERGE_OK" == "true" ]]; then
         break
       fi
-
-      # At least one failing check IS branch-protection-required — preserve
-      # the existing UNSTABLE refusal so we never silently bypass a required
-      # gate. Fall through to the error path below.
-      unset _UNSTABLE_HEAD_SHA _UNSTABLE_BASE_REF _UNSTABLE_FAILING_RAW _UNSTABLE_FAILING _UNSTABLE_REQUIRED _UNSTABLE_INFORMATIONAL _UNSTABLE_OVERLAP
     fi
 
     # Other auto-merge errors — fail immediately (no retry would help)
