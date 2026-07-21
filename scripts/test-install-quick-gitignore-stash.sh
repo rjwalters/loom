@@ -1,7 +1,15 @@
 #!/usr/bin/env bash
-# Regression test for issues #3588 and #3611: `install.sh --quick` must not
-# strand or mangle a user's uncommitted changes across the uninstall→reinstall
-# stash/pop + index-reconcile cycle.
+# Regression test for issues #3588, #3611, and #3663: `install.sh --quick` must
+# not strand or mangle a user's uncommitted changes across the uninstall→
+# reinstall stash/pop + index-reconcile cycle.
+#
+# #3663 (Scenarios 11-16): the #3588 HEAD-reset-before-pop + reapply treatment
+# was hardcoded to `.gitignore`. When the update rewrites another Loom-owned
+# file the user has ALSO dirtied — canonically CLAUDE.md, whose Loom content is
+# a marker-delimited block with user content around it — the `stash pop --index`
+# base has moved and the pop conflicts, stranding the change in a stash with a
+# generic "recover by hand" message. The fix generalizes the reset+reapply to
+# CLAUDE.md (block-aware splice) and names the specific conflicting file(s).
 #
 # #3588: The uninstall→init round-trip rewrites .gitignore non-reversibly
 # (uninstall strips Loom patterns mid-block + collapses blanks; init re-appends
@@ -73,6 +81,31 @@ setup_repo() {
   git -C "$w" add -A
   git -C "$w" commit -qm "loom install" >/dev/null 2>&1
 }
+
+# Like setup_repo, but pre-seeds a user-authored CLAUDE.md (content that lives
+# OUTSIDE the Loom marker block) before the first install, so the installed
+# CLAUDE.md is a genuine mixed file: user content + a marker-delimited Loom
+# block. Commits the installed state as the baseline. Used by the #3663
+# scenarios.
+setup_repo_claude_md() {
+  local w="$1"
+  git init -q "$w"
+  git -C "$w" config user.email test@example.com
+  git -C "$w" config user.name "Test User"
+  printf 'node_modules/\n.loom/state.json\n' >"$w/.gitignore"
+  printf '# My Project\n\nUSER SECTION LINE\n' >"$w/CLAUDE.md"
+  echo "hello" >"$w/README.md"
+  git -C "$w" add -A
+  git -C "$w" commit -qm "init"
+  "$INSTALL_SCRIPT" -y --quick "$w" >/dev/null 2>&1
+  git -C "$w" add -A
+  git -C "$w" commit -qm "loom install" >/dev/null 2>&1
+}
+
+# A stable substring that appears INSIDE the generated Loom block (see the
+# scaffolding.rs root-CLAUDE.md content). Editing this line simulates an
+# in-block user edit.
+CLAUDE_INBLOCK_TOKEN="AI-powered development orchestration"
 
 echo "======================================"
 echo "Issue #3588: install.sh --quick .gitignore stash/pop"
@@ -406,6 +439,210 @@ if [[ "$(cat "$R10/.anvil/install-metadata.json")" == "anvil metadata" ]] && \
   pass "sibling non-Loom file contents untouched (#3611)"
 else
   fail "sibling non-Loom file contents mutated by reinstall (#3611)"
+fi
+echo ""
+
+echo "======================================"
+echo "Issue #3663: install.sh --quick CLAUDE.md stash/pop"
+echo "======================================"
+echo ""
+
+# --------------------------------------------------------------------------
+# Scenario 11 (primary #3663 repro): an uncommitted CLAUDE.md edit OUTSIDE the
+# Loom marker block survives the reinstall — no stranded stash, no generic
+# "recover by hand" message — and the Loom block is still present.
+# FAILS against the pre-fix code (CLAUDE.md got none of the .gitignore
+# HEAD-reset treatment, so the pop conflicted and stranded the change).
+# --------------------------------------------------------------------------
+R11="$TEST_DIR/claude-outside-edit"
+setup_repo_claude_md "$R11"
+perl -0pi -e 's/USER SECTION LINE/USER SECTION LINE EDITED/' "$R11/CLAUDE.md"
+R11_OUT="$TEST_DIR/claude-outside-out.txt"
+"$INSTALL_SCRIPT" -y --quick "$R11" >"$R11_OUT" 2>&1
+if grep -qxF "USER SECTION LINE EDITED" "$R11/CLAUDE.md"; then
+  pass "user CLAUDE.md edit (outside block) survives --quick reinstall (#3663)"
+else
+  fail "user CLAUDE.md edit stranded after --quick reinstall (#3663)"
+fi
+if [[ "$(git -C "$R11" stash list | wc -l | tr -d ' ')" == "0" ]]; then
+  pass "stash consumed after CLAUDE.md outside-block edit (#3663)"
+else
+  fail "stash not consumed — CLAUDE.md change left in stash (#3663)"
+fi
+if ! grep -q "recover by hand" "$R11_OUT"; then
+  pass "no generic 'recover by hand' message for outside-block edit (#3663)"
+else
+  fail "generic 'recover by hand' message printed for outside-block edit (#3663)"
+fi
+if grep -qF "<!-- BEGIN LOOM ORCHESTRATION -->" "$R11/CLAUDE.md" && \
+   grep -qF "<!-- END LOOM ORCHESTRATION -->" "$R11/CLAUDE.md"; then
+  pass "Loom marker block present after reinstall (#3663)"
+else
+  fail "Loom marker block missing after reinstall (#3663)"
+fi
+echo ""
+
+# --------------------------------------------------------------------------
+# Scenario 12 (block refresh): a stale line committed INSIDE the block is
+# refreshed away by the reinstall while an out-of-block user edit is preserved.
+# Proves the reapply splices the daemon's freshly written block (from the
+# post-init snapshot), not the old committed block.
+# --------------------------------------------------------------------------
+R12="$TEST_DIR/claude-block-refresh"
+setup_repo_claude_md "$R12"
+# Inject a stale line just after the BEGIN marker and commit it, so the
+# committed block diverges from what init regenerates.
+perl -0pi -e 's{(<!-- BEGIN LOOM ORCHESTRATION -->\n)}{${1}STALE BLOCK LINE TO BE REMOVED\n}' "$R12/CLAUDE.md"
+git -C "$R12" add -A
+git -C "$R12" commit -qm "stale in-block line" >/dev/null 2>&1
+# User edits OUTSIDE the block (uncommitted).
+perl -0pi -e 's/USER SECTION LINE/USER SECTION LINE EDITED/' "$R12/CLAUDE.md"
+"$INSTALL_SCRIPT" -y --quick "$R12" >/dev/null 2>&1
+if grep -qxF "USER SECTION LINE EDITED" "$R12/CLAUDE.md"; then
+  pass "outside-block edit preserved alongside block refresh (#3663)"
+else
+  fail "outside-block edit lost during block refresh (#3663)"
+fi
+if ! grep -qF "STALE BLOCK LINE TO BE REMOVED" "$R12/CLAUDE.md"; then
+  pass "stale in-block line refreshed away from post-init snapshot (#3663)"
+else
+  fail "stale in-block line survived — block not refreshed from snapshot (#3663)"
+fi
+if [[ "$(grep -cF '<!-- BEGIN LOOM ORCHESTRATION -->' "$R12/CLAUDE.md")" == "1" ]] && \
+   [[ "$(grep -cF '<!-- END LOOM ORCHESTRATION -->' "$R12/CLAUDE.md")" == "1" ]]; then
+  pass "exactly one well-formed marker block after refresh (#3663)"
+else
+  fail "marker block malformed after refresh (#3663)"
+fi
+echo ""
+
+# --------------------------------------------------------------------------
+# Scenario 13 (staged/unstaged split): stage part of a CLAUDE.md edit and leave
+# part unstaged; the split must survive the reinstall (pop --index property,
+# now that CLAUDE.md participates in the HEAD-reset path). The seeded file has
+# two user lines outside the block; we edit one staged and one unstaged.
+# --------------------------------------------------------------------------
+R13="$TEST_DIR/claude-staged-split"
+git init -q "$R13"
+git -C "$R13" config user.email test@example.com
+git -C "$R13" config user.name "Test User"
+printf 'node_modules/\n' >"$R13/.gitignore"
+printf '# My Project\n\nLINE ALPHA\nLINE BETA\n' >"$R13/CLAUDE.md"
+echo "hello" >"$R13/README.md"
+git -C "$R13" add -A
+git -C "$R13" commit -qm "init"
+"$INSTALL_SCRIPT" -y --quick "$R13" >/dev/null 2>&1
+git -C "$R13" add -A
+git -C "$R13" commit -qm "loom install" >/dev/null 2>&1
+perl -0pi -e 's/LINE ALPHA/LINE ALPHA STAGED/' "$R13/CLAUDE.md"
+git -C "$R13" add CLAUDE.md
+perl -0pi -e 's/LINE BETA/LINE BETA UNSTAGED/' "$R13/CLAUDE.md"
+"$INSTALL_SCRIPT" -y --quick "$R13" >/dev/null 2>&1
+if git -C "$R13" diff --staged CLAUDE.md | grep -qxF "+LINE ALPHA STAGED"; then
+  pass "staged CLAUDE.md hunk restored STILL STAGED (pop --index, #3663)"
+else
+  fail "staged CLAUDE.md hunk came back unstaged/lost (#3663)"
+fi
+if git -C "$R13" diff CLAUDE.md | grep -qxF "+LINE BETA UNSTAGED"; then
+  pass "unstaged CLAUDE.md hunk restored STILL UNSTAGED (#3663)"
+else
+  fail "unstaged CLAUDE.md hunk was spuriously staged/lost (#3663)"
+fi
+if [[ "$(git -C "$R13" stash list | wc -l | tr -d ' ')" == "0" ]]; then
+  pass "stash consumed after CLAUDE.md staged/unstaged split reinstall (#3663)"
+else
+  fail "stash not consumed after CLAUDE.md split reinstall (#3663)"
+fi
+echo ""
+
+# --------------------------------------------------------------------------
+# Scenario 14 (genuine in-block overlap): the user edits a line INSIDE the Loom
+# block that the reinstall ALSO rewrites (forced via a divergent committed
+# block). The reset+reapply must NOT silently clobber the edit — instead the
+# installer surfaces a clear conflict that NAMES CLAUDE.md, preserves the stash,
+# exits 0, and still prints the completion banner. The in-block edit stays
+# recoverable from the stash.
+# --------------------------------------------------------------------------
+R14="$TEST_DIR/claude-inblock-conflict"
+setup_repo_claude_md "$R14"
+# Commit a stale value on an in-block line so init's regen diverges from HEAD.
+perl -0pi -e "s/\\Q$CLAUDE_INBLOCK_TOKEN\\E/STALE COMMITTED BLOCK VALUE/g" "$R14/CLAUDE.md"
+git -C "$R14" add -A
+git -C "$R14" commit -qm "diverge in-block line" >/dev/null 2>&1
+# User makes an uncommitted edit to that SAME in-block line.
+perl -0pi -e 's/STALE COMMITTED BLOCK VALUE/USER IN-BLOCK EDIT/g' "$R14/CLAUDE.md"
+R14_OUT="$TEST_DIR/claude-inblock-out.txt"
+"$INSTALL_SCRIPT" -y --quick "$R14" >"$R14_OUT" 2>&1
+R14_EXIT=$?
+if [[ $R14_EXIT -eq 0 ]]; then
+  pass "in-block CLAUDE.md conflict: installer exits 0 (does not abort, #3663)"
+else
+  fail "in-block CLAUDE.md conflict: installer exited $R14_EXIT (#3663)"
+fi
+if grep -q "Conflicting file(s):.*CLAUDE.md" "$R14_OUT"; then
+  pass "in-block CLAUDE.md conflict: names CLAUDE.md (not generic, #3663)"
+else
+  fail "in-block CLAUDE.md conflict: did not name the conflicting file (#3663)"
+fi
+if [[ "$(git -C "$R14" stash list | wc -l | tr -d ' ')" != "0" ]]; then
+  pass "in-block CLAUDE.md conflict: stash preserved for recovery (#3663)"
+else
+  fail "in-block CLAUDE.md conflict: stash lost (edit unrecoverable, #3663)"
+fi
+if git -C "$R14" stash show -p 'stash@{0}' 2>/dev/null | grep -qF "USER IN-BLOCK EDIT"; then
+  pass "in-block CLAUDE.md conflict: user edit recoverable from stash (#3663)"
+else
+  fail "in-block CLAUDE.md conflict: user edit missing from stash (#3663)"
+fi
+if grep -q "Quick reinstallation complete" "$R14_OUT"; then
+  pass "in-block CLAUDE.md conflict: completion banner still printed (#3663)"
+else
+  fail "in-block CLAUDE.md conflict: completion banner missing (#3663)"
+fi
+echo ""
+
+# --------------------------------------------------------------------------
+# Scenario 15 (in-block edit, no divergence): when the reinstall does NOT change
+# the block content (common case), an in-block user edit applies cleanly with no
+# data loss and no stranded stash — the plain-pop 3-way merge succeeds because
+# only one side changed.
+# --------------------------------------------------------------------------
+R15="$TEST_DIR/claude-inblock-clean"
+setup_repo_claude_md "$R15"
+perl -0pi -e "s/\\Q$CLAUDE_INBLOCK_TOKEN\\E/MY HARMLESS IN-BLOCK EDIT/g" "$R15/CLAUDE.md"
+"$INSTALL_SCRIPT" -y --quick "$R15" >/dev/null 2>&1
+if grep -qF "MY HARMLESS IN-BLOCK EDIT" "$R15/CLAUDE.md"; then
+  pass "in-block edit (no divergence) preserved cleanly, no data loss (#3663)"
+else
+  fail "in-block edit (no divergence) lost after reinstall (#3663)"
+fi
+if [[ "$(git -C "$R15" stash list | wc -l | tr -d ' ')" == "0" ]]; then
+  pass "in-block edit (no divergence): stash consumed cleanly (#3663)"
+else
+  fail "in-block edit (no divergence): stash stranded (#3663)"
+fi
+echo ""
+
+# --------------------------------------------------------------------------
+# Scenario 16 (multiple dirty Loom-owned files): .gitignore AND CLAUDE.md are
+# both dirty (outside-block) in the same reinstall — both must restore cleanly
+# with no stranded stash.
+# --------------------------------------------------------------------------
+R16="$TEST_DIR/claude-and-gitignore"
+setup_repo_claude_md "$R16"
+echo "my-local-dir/" >>"$R16/.gitignore"
+perl -0pi -e 's/USER SECTION LINE/USER SECTION LINE EDITED/' "$R16/CLAUDE.md"
+"$INSTALL_SCRIPT" -y --quick "$R16" >/dev/null 2>&1
+if grep -qxF "my-local-dir/" "$R16/.gitignore" && \
+   grep -qxF "USER SECTION LINE EDITED" "$R16/CLAUDE.md"; then
+  pass "both .gitignore and CLAUDE.md edits restored in one reinstall (#3663)"
+else
+  fail "a simultaneously-dirty Loom-owned file was stranded (#3663)"
+fi
+if [[ "$(git -C "$R16" stash list | wc -l | tr -d ' ')" == "0" ]]; then
+  pass "stash consumed with multiple dirty Loom-owned files (#3663)"
+else
+  fail "stash stranded with multiple dirty Loom-owned files (#3663)"
 fi
 echo ""
 

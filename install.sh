@@ -276,6 +276,80 @@ reapply_loom_gitignore_patterns() {
   done <<<"$loom_lines"
 }
 
+# Issue #3663: re-apply the current Loom-owned CLAUDE.md marker block after a
+# --quick reinstall stash pop that was performed against a HEAD-reset CLAUDE.md.
+#
+# This generalizes the #3588 .gitignore treatment (HEAD-reset-before-pop, then
+# reapply) to CLAUDE.md, whose Loom content is a marker-delimited block
+# (`<!-- BEGIN LOOM ORCHESTRATION -->` … `<!-- END LOOM ORCHESTRATION -->`)
+# rather than a set of appended lines. The reinstall restores CLAUDE.md to its
+# committed HEAD state before popping so the user's stashed hunk applies cleanly
+# (see the pop block below). That reset reverts the Loom block to its old
+# committed content, so we splice the freshly written block back in here.
+#
+# We rebuild the file as: everything BEFORE the begin marker (from the popped
+# working copy — the user's restored content) + the block (begin…end inclusive)
+# taken from the post-init snapshot (the daemon's authoritative fresh block) +
+# everything AFTER the end marker (again from the popped working copy). Only the
+# delimited Loom region is replaced; every line the user's pop restored outside
+# the markers (e.g. their own `REPO-SKILLS` block) is left byte-for-byte intact.
+# Derived from the snapshot, never hard-coded, mirroring
+# reapply_loom_gitignore_patterns's "trust the daemon's output" property.
+# Idempotent: splicing an already-current block is a no-op. If either file lacks
+# both markers there is no delimited region to reconcile, so the popped file is
+# left as-is.
+reapply_loom_claude_md_block() {
+  local target_path="$1"
+  local postinit_snapshot="$2"
+  local claude_md="$target_path/CLAUDE.md"
+  local begin="<!-- BEGIN LOOM ORCHESTRATION -->"
+  local end="<!-- END LOOM ORCHESTRATION -->"
+
+  [[ -f "$postinit_snapshot" && -f "$claude_md" ]] || return 0
+
+  # Both the snapshot and the popped file must carry the marker block, else
+  # there is no delimited Loom region to splice — leave the popped file alone.
+  grep -qF "$begin" "$postinit_snapshot" && grep -qF "$end" "$postinit_snapshot" || return 0
+  grep -qF "$begin" "$claude_md" && grep -qF "$end" "$claude_md" || return 0
+
+  local tmp
+  tmp="$(mktemp 2>/dev/null || true)"
+  [[ -n "$tmp" ]] || return 0
+
+  # Pass 1 (snapshot): capture the begin…end block into `block`.
+  # Pass 2 (popped file): print user content up to begin, emit the captured
+  # block once, then resume printing user content after end.
+  if awk -v b="$begin" -v e="$end" '
+    FNR==NR {
+      if (index($0, b)) grab=1
+      if (grab) block = block $0 ORS
+      if (index($0, e)) grab=0
+      next
+    }
+    {
+      if (index($0, b)) { printf "%s", block; skip=1 }
+      if (!skip) print
+      if (index($0, e)) skip=0
+    }
+  ' "$postinit_snapshot" "$claude_md" >"$tmp" 2>/dev/null && [[ -s "$tmp" ]]; then
+    cat "$tmp" >"$claude_md" 2>/dev/null || true
+  fi
+  rm -f "$tmp" 2>/dev/null || true
+  return 0
+}
+
+# Issue #3663: emit the Loom marker block (begin…end inclusive) from stdin.
+# Used to decide whether a user's stashed CLAUDE.md edit lands INSIDE the Loom
+# block (in which case a HEAD-reset+reapply would clobber it) or entirely
+# outside it (safe to reset+reapply). Empty output means no block was found.
+_emit_loom_claude_block() {
+  awk '
+    index($0, "<!-- BEGIN LOOM ORCHESTRATION -->") { inblk=1 }
+    inblk { print }
+    index($0, "<!-- END LOOM ORCHESTRATION -->") { inblk=0 }
+  '
+}
+
 # Determine Loom repository root
 LOOM_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
@@ -813,21 +887,65 @@ elif [[ -d "$TARGET_PATH/.loom" ]]; then
     if [[ "$REINSTALL_STASHED_USER_CHANGES" == "true" ]]; then
       info "Restoring stashed user changes..."
 
-      # If .gitignore is tracked at HEAD, snapshot the post-init version (which
-      # carries the current Loom patterns) and reset the working copy to HEAD so
-      # the pop's 3-way base lines up with the committed context. Skip this for
-      # repos where .gitignore is untracked/newly created — there is no HEAD
-      # base to restore and the plain pop already applies cleanly.
-      REINSTALL_GITIGNORE_RESET=false
-      REINSTALL_GITIGNORE_POSTINIT=""
-      if git -C "$TARGET_PATH" cat-file -e HEAD:.gitignore 2>/dev/null; then
-        REINSTALL_GITIGNORE_POSTINIT="$(mktemp 2>/dev/null || true)"
-        if [[ -n "$REINSTALL_GITIGNORE_POSTINIT" ]] && \
-           cp "$TARGET_PATH/.gitignore" "$REINSTALL_GITIGNORE_POSTINIT" 2>/dev/null && \
-           git -C "$TARGET_PATH" checkout HEAD -- .gitignore 2>/dev/null; then
-          REINSTALL_GITIGNORE_RESET=true
+      # Issue #3663: generalize the #3588 .gitignore HEAD-reset-then-reapply to
+      # every Loom-owned dirty file that carries a well-defined Loom-vs-user
+      # split — today `.gitignore` (Loom patterns appended at EOF) and
+      # `CLAUDE.md` (a marker-delimited Loom block with user content around it).
+      # For each such path tracked at HEAD, snapshot the post-init on-disk
+      # version (which carries the freshly written Loom content) and reset the
+      # working copy to HEAD so the pop's 3-way base lines up with the committed
+      # context and the user's stashed hunk applies cleanly. After a successful
+      # pop we re-apply only the Loom portion from the snapshot (append for
+      # `.gitignore`, marker-block splice for `CLAUDE.md`), leaving everything
+      # the user's pop restored untouched.
+      #
+      # HEAD-reset is deliberately scoped to files with a reapply strategy. A
+      # fully Loom-owned file (a role `.md`, `config.json`) has no partial
+      # reapply, so resetting it would silently drop the reinstall's update —
+      # those fall through to a plain pop, which surfaces a genuine conflict
+      # (named below) instead of resetting-and-losing. Untracked/newly created
+      # files have no HEAD base to restore to and the plain pop already applies
+      # them cleanly, so they are skipped too.
+      REINSTALL_RESET_PATHS=()
+      REINSTALL_RESET_SNAPSHOTS=()
+      REINSTALL_RESET_STRATEGIES=()
+      for _owned_path in ${REINSTALL_OWNED_DIRTY[@]+"${REINSTALL_OWNED_DIRTY[@]}"}; do
+        _reset_strategy=""
+        case "$_owned_path" in
+          .gitignore) _reset_strategy="gitignore" ;;
+          CLAUDE.md)  _reset_strategy="claude_md" ;;
+          *) continue ;;
+        esac
+        git -C "$TARGET_PATH" cat-file -e "HEAD:$_owned_path" 2>/dev/null || continue
+
+        # Issue #3663: CLAUDE.md's reapply replaces the ENTIRE marker block, so
+        # the reset+reapply path is only safe when (a) HEAD already carries a
+        # Loom block to splice and (b) the user's stashed edits are OUTSIDE that
+        # block. When the user edited INSIDE the block, reset+reapply would
+        # silently clobber their in-block edit — so skip the reset and let the
+        # plain pop's 3-way merge surface a genuine conflict (named below),
+        # keeping the edit in the stash. When HEAD has no block at all, `init`'s
+        # freshly appended block already survives an out-of-block pop unchanged,
+        # so there is nothing to splice. Detect both by comparing the stashed
+        # (user) block region against HEAD's block region.
+        if [[ "$_reset_strategy" == "claude_md" ]]; then
+          _head_block="$(git -C "$TARGET_PATH" show HEAD:CLAUDE.md 2>/dev/null | _emit_loom_claude_block)" || true
+          [[ -n "$_head_block" ]] || continue
+          _stashed_block="$(git -C "$TARGET_PATH" show 'stash@{0}:CLAUDE.md' 2>/dev/null | _emit_loom_claude_block)" || true
+          [[ "$_stashed_block" == "$_head_block" ]] || continue
         fi
-      fi
+
+        _reset_snap="$(mktemp 2>/dev/null || true)"
+        [[ -n "$_reset_snap" ]] || continue
+        if cp "$TARGET_PATH/$_owned_path" "$_reset_snap" 2>/dev/null && \
+           git -C "$TARGET_PATH" checkout HEAD -- "$_owned_path" 2>/dev/null; then
+          REINSTALL_RESET_PATHS+=("$_owned_path")
+          REINSTALL_RESET_SNAPSHOTS+=("$_reset_snap")
+          REINSTALL_RESET_STRATEGIES+=("$_reset_strategy")
+        else
+          rm -f "$_reset_snap" 2>/dev/null || true
+        fi
+      done
 
       # Issue #3611: pop with `--index` so a caller's pre-existing staged/
       # unstaged split is reproduced. A plain `git stash pop` re-applies EVERY
@@ -857,25 +975,49 @@ elif [[ -d "$TARGET_PATH/.loom" ]]; then
       fi
 
       if [[ $REINSTALL_POP_STATUS -eq 0 ]]; then
-        # Pop succeeded. When we reset .gitignore to HEAD the user's hunk is now
-        # applied but the current Loom patterns are missing — re-append them.
-        if [[ "$REINSTALL_GITIGNORE_RESET" == "true" ]]; then
-          reapply_loom_gitignore_patterns "$TARGET_PATH" "$REINSTALL_GITIGNORE_POSTINIT"
-        fi
+        # Pop succeeded. Each file we reset to HEAD now carries the user's hunk
+        # but its OLD committed Loom content — re-apply the fresh Loom portion
+        # from that file's post-init snapshot (append for .gitignore, marker-
+        # block splice for CLAUDE.md).
+        _reset_i=0
+        while [[ $_reset_i -lt ${#REINSTALL_RESET_PATHS[@]} ]]; do
+          case "${REINSTALL_RESET_STRATEGIES[$_reset_i]}" in
+            gitignore)
+              reapply_loom_gitignore_patterns "$TARGET_PATH" "${REINSTALL_RESET_SNAPSHOTS[$_reset_i]}"
+              ;;
+            claude_md)
+              reapply_loom_claude_md_block "$TARGET_PATH" "${REINSTALL_RESET_SNAPSHOTS[$_reset_i]}"
+              ;;
+          esac
+          _reset_i=$((_reset_i + 1))
+        done
         success "User changes restored"
       else
-        # Genuine conflict (e.g. the user also edited a Loom-managed file that
-        # `init` rewrote). Roll .gitignore back to the post-init snapshot so the
-        # tree is not left half-reset, then surface the real conflict and a
+        # Genuine conflict (e.g. the user also edited the same lines a Loom-owned
+        # file that `init` rewrote occupies). Roll every reset file back to its
+        # post-init snapshot so the tree is not left half-reset, then surface the
+        # real conflict — naming the specific file(s) that conflicted — and a
         # concrete recovery path. Do NOT abort — the reinstall itself succeeded;
         # only the user-change restore needs manual attention.
-        if [[ "$REINSTALL_GITIGNORE_RESET" == "true" ]]; then
-          cp "$REINSTALL_GITIGNORE_POSTINIT" "$TARGET_PATH/.gitignore" 2>/dev/null || true
+        _reset_i=0
+        while [[ $_reset_i -lt ${#REINSTALL_RESET_PATHS[@]} ]]; do
+          cp "${REINSTALL_RESET_SNAPSHOTS[$_reset_i]}" \
+            "$TARGET_PATH/${REINSTALL_RESET_PATHS[$_reset_i]}" 2>/dev/null || true
+          _reset_i=$((_reset_i + 1))
+        done
+        # Issue #3663: name the file(s) that actually conflicted rather than a
+        # generic "recover by hand". Prefer git's own unmerged set; fall back to
+        # the guarded Loom-owned dirty set when git reports none.
+        REINSTALL_CONFLICT_FILES="$(git -C "$TARGET_PATH" diff --name-only --diff-filter=U 2>/dev/null | paste -sd' ' - 2>/dev/null || true)"
+        if [[ -z "$REINSTALL_CONFLICT_FILES" ]]; then
+          REINSTALL_CONFLICT_FILES="${REINSTALL_OWNED_DIRTY[*]-}"
         fi
         REINSTALL_STASH_REF="$(git -C "$TARGET_PATH" stash list 2>/dev/null | head -1 | cut -d: -f1)"
         [[ -z "$REINSTALL_STASH_REF" ]] && REINSTALL_STASH_REF="stash@{0}"
         warning "Failed to restore stashed user changes automatically"
         echo ""
+        [[ -n "$REINSTALL_CONFLICT_FILES" ]] && \
+          echo "  Conflicting file(s): $REINSTALL_CONFLICT_FILES" && echo ""
         echo "  git stash pop --index reported:"
         printf '%s\n' "$REINSTALL_POP_OUTPUT" | sed 's/^/    /'
         echo ""
@@ -890,7 +1032,11 @@ elif [[ -d "$TARGET_PATH/.loom" ]]; then
         echo "    git stash drop $REINSTALL_STASH_REF                 # once you've reconciled"
       fi
 
-      [[ -n "$REINSTALL_GITIGNORE_POSTINIT" ]] && rm -f "$REINSTALL_GITIGNORE_POSTINIT" 2>/dev/null || true
+      _reset_i=0
+      while [[ $_reset_i -lt ${#REINSTALL_RESET_SNAPSHOTS[@]} ]]; do
+        rm -f "${REINSTALL_RESET_SNAPSHOTS[$_reset_i]}" 2>/dev/null || true
+        _reset_i=$((_reset_i + 1))
+      done
     fi
 
     echo ""
