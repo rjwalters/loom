@@ -1413,9 +1413,134 @@ assert_deny "#3679 regression: chained 'force-push to main && echo done' still d
 echo ""
 
 # =========================================================================
+echo -e "${YELLOW}--- Read-only fast path (guards.readOnlyFastPath / LOOM_GUARD_READONLY_FASTPATH, #3687) ---${NC}"
+# =========================================================================
+
+# assert_allow_silent: allow AND zero stdout+stderr bytes. The fast path must
+# emit nothing at all on admission (no decision JSON, no log noise).
+assert_allow_silent() {
+    local description="$1"; local cmd="$2"; local cwd="${3:-$REPO_ROOT}"
+    TOTAL=$((TOTAL + 1))
+    local output; local exit_code=0
+    output=$(run_guard "$cmd" "$cwd") || exit_code=$?
+    if [[ $exit_code -eq 0 && -z "$output" ]]; then
+        PASS=$((PASS + 1)); echo -e "  ${GREEN}PASS${NC}: $description"
+    else
+        FAIL=$((FAIL + 1)); echo -e "  ${RED}FAIL${NC}: $description"
+        echo -e "       Command: $cmd"
+        echo -e "       Expected: allow with EMPTY output (exit 0, 0 bytes)"
+        echo -e "       Exit code: $exit_code  Output bytes: ${#output}"
+        echo -e "       Got: $output"
+    fi
+}
+
+# --- Admission + silence: every built-in allowlisted verb allows with 0 bytes ---
+assert_allow_silent "Fast path: git status admits silently" "git status"
+assert_allow_silent "Fast path: git log admits silently" "git log --oneline -5"
+assert_allow_silent "Fast path: git diff admits silently" "git diff HEAD"
+assert_allow_silent "Fast path: git show admits silently" "git show HEAD"
+assert_allow_silent "Fast path: ls admits silently" "ls -la"
+assert_allow_silent "Fast path: grep admits silently" "grep -n foo bar.txt"
+assert_allow_silent "Fast path: rg admits silently" "rg pattern src/"
+assert_allow_silent "Fast path: gh pr view admits silently" "gh pr view 12"
+assert_allow_silent "Fast path: gh issue list admits silently" "gh issue list --label loom:issue"
+assert_allow_silent "Fast path: aws ec2 describe-instances admits silently" "aws ec2 describe-instances"
+assert_allow_silent "Fast path: aws s3 ls admits silently" "aws s3 ls s3://bucket"
+assert_allow_silent "Fast path: aws lambda get-function admits silently" "aws lambda get-function --function-name f"
+
+# The two "default ON" observable assertions below only apply when the fast path
+# is not force-disabled via the ambient env var. Under a
+# `LOOM_GUARD_READONLY_FASTPATH=0 ./tests/...` full-suite run they are skipped so
+# the pre-existing cases still verify byte-for-byte (issue #3687 test plan #4).
+_FP_AMBIENT_ON=1
+case "${LOOM_GUARD_READONLY_FASTPATH:-}" in 0|false|no) _FP_AMBIENT_ON=0 ;; esac
+
+# --- Observable admission: fast path bypasses the SQL-DDL substring false-
+#     positive for a read-only grep. The DDL literal is assembled from shell
+#     fragments so this file's own source never carries a raw "DROP TABLE"
+#     (mirrors the force-push fragment convention used for the #3679 tests). ---
+_FP_DDL="DR""OP TA""BLE"
+if [[ "$_FP_AMBIENT_ON" == "1" ]]; then
+    assert_allow_silent "Fast path: read-only 'grep <ddl>' bypasses SQL-DDL false-positive (default on)" \
+        "grep '$_FP_DDL' schema.sql"
+fi
+
+# --- Security: compound / substitution / redirection / wrapper / non-bare forms
+#     are NOT eligible and keep their exact pre-existing verdict via the full
+#     path. False positives are the only danger, so these are the core gate. ---
+# && chain carrying a real force-push → ALWAYS_BLOCK still fires (deny).
+assert_deny "Fast path security: 'git status && <force-push main>' still denies" \
+    "git status && $_FP_MAIN"
+# ; chain carrying a real force-push → ALWAYS_BLOCK still fires (deny).
+assert_deny "Fast path security: 'git status ; <force-push main>' still denies" \
+    "git status ; $_FP_MAIN"
+# $(...) substitution: excluded char → full path; the inner catastrophic rm is
+# still caught by the ALWAYS_BLOCK raw scan (deny). The rm root target is
+# assembled from a fragment so this file's source carries no raw "rm -rf /".
+_FP_ROOT="/"
+assert_deny "Fast path security: 'git status \$(rm -rf /)' takes full path and denies" \
+    "git status \$(rm -rf $_FP_ROOT)"
+# Pipe: observable — same read-only grep, but the pipe disqualifies the fast
+# path so the full-path SQL-DDL check fires (deny), proving the excluded-char
+# guard truly routes to the full path rather than admitting.
+assert_deny "Fast path security: 'grep <ddl> | cat' pipe disqualifies fast path (SQL-DDL denies)" \
+    "grep '$_FP_DDL' x.sql | cat"
+# Wrapper: first token is bash (not an allowlist word) → not admitted. Observable
+# via the SQL grep the wrapper carries (full path denies).
+assert_deny "Fast path security: 'bash -c \"grep <ddl>\"' wrapper not admitted (SQL-DDL denies)" \
+    "bash -c \"grep '$_FP_DDL' x.sql\""
+# Non-bare git subcommand form: `git -C /p status` is not admitted; still allows
+# via the existing full path (verdict unchanged, just unoptimized).
+assert_allow "Fast path: 'git -C /tmp status' not fast-pathed, still allowed via full path" \
+    "git -C /tmp status"
+# cat is deliberately excluded: its existing .ssh ASK carve-out must still fire.
+assert_ask "Fast path: 'cat ~/.ssh/id_rsa' still asks (cat excluded from fast path)" \
+    "cat ~/.ssh/id_rsa"
+
+# --- Toggle off restores the full-path verdict byte-for-byte (env + config) ---
+assert_deny_env "Fast path off (env): 'grep <ddl>' takes full path and denies" \
+    "LOOM_GUARD_READONLY_FASTPATH=0" "grep '$_FP_DDL' schema.sql"
+FASTPATH_OFF_REPO=$(make_sql_repo '{"guards":{"readOnlyFastPath":false}}')
+assert_deny "Fast path off (config): 'grep <ddl>' takes full path and denies" \
+    "grep '$_FP_DDL' schema.sql" "$FASTPATH_OFF_REPO"
+# Env override wins over config (mirrors the sqlDdl/cloudCli precedent): env=1
+# forces the fast path ON even when the config disables it.
+assert_allow_env "Fast path: LOOM_GUARD_READONLY_FASTPATH=1 overrides config-off (allow)" \
+    "LOOM_GUARD_READONLY_FASTPATH=1" "grep '$_FP_DDL' schema.sql" "$FASTPATH_OFF_REPO"
+
+# --- Extend-only escape hatch: guards.readOnlyFastPathExtra admits a custom
+#     bare first-word command (full-generality bypass for that word). ---
+FASTPATH_EXTRA_REPO=$(make_sql_repo '{"guards":{"readOnlyFastPathExtra":["psql"]}}')
+# psql is not a built-in allowlist word; the extra list admits it, bypassing the
+# SQL-DDL check (allow). Demonstrates the escape hatch works. Skipped under an
+# ambient LOOM_GUARD_READONLY_FASTPATH=0 run (the env var would disable it).
+if [[ "$_FP_AMBIENT_ON" == "1" ]]; then
+    assert_allow "Fast path extra: 'psql <ddl>' admitted via readOnlyFastPathExtra (bypass)" \
+        "psql -c '$_FP_DDL'" "$FASTPATH_EXTRA_REPO"
+fi
+# A first word NOT in the extra list still takes the full path (SQL-DDL denies),
+# proving the extra list does not leak to arbitrary commands.
+assert_deny "Fast path extra: 'mysql <ddl>' (not listed) still denies via full path" \
+    "mysql -c '$_FP_DDL'" "$FASTPATH_EXTRA_REPO"
+
+# Clean up temp repos created in this section.
+for _fp_dir in "$FASTPATH_OFF_REPO" "$FASTPATH_EXTRA_REPO"; do
+    [[ -n "$_fp_dir" && "$_fp_dir" != "/" && -d "$_fp_dir/.loom" ]] && rm -rf "$_fp_dir"
+done
+
+echo ""
+
+# =========================================================================
 echo -e "${YELLOW}--- Performance check ---${NC}"
 # =========================================================================
 
+# NOTE (#3687): `git status` is now a read-only FAST-PATH command — with the
+# default toggle ON it exits after one bash-builtin structural test + one lazy
+# jq config read, skipping the ~37-fork deny/ask gauntlet and the git rev-parse
+# entirely. This benchmark command should therefore be dramatically cheaper than
+# the historical full-path average (~179ms measured pre-#3687 → ~1 jq read).
+# Export LOOM_GUARD_READONLY_FASTPATH=0 to benchmark the full-path cost instead.
+#
 # The measured average is dominated by 10 sequential guard process spawns
 # (shell + jq/python3 interpreter startup), which is a function of machine
 # load rather than guard-logic complexity. A hard cap therefore flakes under

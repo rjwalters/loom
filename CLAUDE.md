@@ -409,6 +409,34 @@ gh label sync --file .github/labels.yml  # Re-sync labels (GitHub only)
 # Cancel a running sweep: mcp__loom__cancel_sweep --sweep_id <id>
 ```
 
+## Custom Guard Hooks
+
+Loom ships Bash `PreToolUse` guard hooks (`defaults/hooks/guard-destructive.sh`) that block or ask on destructive commands. Several category toggles let a repo opt out of checks that are a category error for it — see `defaults/CLAUDE.md` → "Custom Guard Hooks" for the full catalog (`guards.sqlDdl`, `guards.cloudCli`, `guards.rmScope`, `guards.forceScope`). The read-only fast-path toggle is documented below.
+
+### Read-Only Fast-Path Guard Toggle (`guards.readOnlyFastPath` / `LOOM_GUARD_READONLY_FASTPATH`)
+
+`guard-destructive.sh` fires before **every** Bash tool call. In Bash-dense sessions almost every call is obviously read-only (`git status`, `ls`, `grep`, `aws … describe*`, `gh … list`), yet each otherwise runs the full deny/ask gauntlet (~37 `grep`/`awk`/`sed` forks plus a `git rev-parse`, ~179ms) before allowing. The read-only fast path (issue #3687) short-circuits that case to a **silent** `allow` (exit 0, zero output, no logging) via one bash-builtin structural test (zero forks) plus one lazy `jq` config read, running before the repo-root `git rev-parse` and every deny/ask array.
+
+The fast path is **on by default**, resolved highest-precedence first:
+
+1. **`LOOM_GUARD_READONLY_FASTPATH` env var** — `0`/`false`/`no` disables (full-path checking restored byte-for-byte); `1`/`true`/`yes` forces on. Overrides config.
+2. **`.loom/config.json` → `guards.readOnlyFastPath`** — default `true` when absent; set `false` to disable.
+3. **Default** — `true`.
+
+**Security**: the fast path is a guard bypass by construction, so admission is purely structural. A command is fast-pathed only when it contains **none** of `;` `&` `|` `<` `>` backtick `$(` newline (excludes chaining/piping/redirection/substitution) **and** its first token exactly matches the built-in allowlist: `git status|log|diff|show` (bare, no `git -C …`), `ls`, `grep`, `rg`, `gh <noun> view|list`, `aws <service> describe*|get*|list*`, `aws s3 ls`. Wrappers (`bash -c`, `eval`, `sudo …`, `env …`) are excluded automatically because their first token isn't allowlisted. So `git status && git push --force origin main` takes the full path and is still denied.
+
+**`cat` and `ssh` are deliberately excluded**: `cat` has an existing `.ssh`/`.aws/credentials` ASK carve-out a blanket fast-path would skip, and `ssh` wraps an opaque remote payload the catastrophic scan still covers.
+
+**Optional** `guards.readOnlyFastPathExtra` is an extend-only array of **literal first-word commands** added to the allowlist without hand-editing the installer-managed `.claude/settings.json`:
+
+```json
+{ "guards": { "readOnlyFastPath": true, "readOnlyFastPathExtra": ["jq", "wc"] } }
+```
+
+> **Warning**: each entry is a full-generality bypass for that command word (all arguments) — only add bare, argument-independent read-only utilities, never scripts or anything that could wrap a mutating call.
+
+Disabling the fast path never weakens any deny/ask rule; a missing/malformed `.loom/config.json` falls through to fast-path-ON.
+
 ## MCP Hooks
 
 Loom provides a unified MCP server (`mcp-loom`) for programmatic control. See the mcp-loom package README for full tool documentation.
