@@ -973,6 +973,138 @@ done
 echo ""
 
 # =========================================================================
+echo -e "${YELLOW}--- Force-op branch scope (guards.forceScope / LOOM_FORCE_SCOPE) (#3674) ---${NC}"
+# =========================================================================
+#
+# guards.forceScope controls branch-aware handling of git push --force / -f /
+# --force-with-lease and git reset --hard:
+#   "all"       (default) — every force op asks (byte-for-byte pre-#3674).
+#   "protected"           — ask only when the resolved target is a protected
+#                           branch (repo default / main / master) or the branch
+#                           identity is ambiguous (detached HEAD); own working
+#                           branches pass through.
+#   "off"                 — never ask/deny; the ALWAYS_BLOCK main/master
+#                           force-push hard-denies STILL apply.
+#
+# Fresh `git init` repos here default to main or master (git-version-dependent);
+# both are in the protected literal set, so default-branch cases work either way.
+# A LOOM_DEFAULT_BRANCH seam drives the non-main/master default-branch cases
+# (exercising resolve_default_branch(), not just the main/master literals).
+
+# Configure a small git repo with forceScope config + optional branch setup.
+git -c init.defaultBranch=master >/dev/null 2>&1 || true
+
+# ---- Default state (forceScope absent → "all"): existing behaviour preserved. ----
+FORCE_ALL_REPO=$(make_sql_repo '{"champion":{"auto_merge_max_lines":200}}')
+assert_ask "forceScope default(all): force-push to a working branch still asks" \
+    "git push --force origin feature/my-branch" "$FORCE_ALL_REPO"
+assert_ask "forceScope default(all): git reset --hard still asks" \
+    "git reset --hard HEAD~1" "$FORCE_ALL_REPO"
+assert_ask "forceScope default(all): force-with-lease still asks" \
+    "git push --force-with-lease origin feature/x" "$FORCE_ALL_REPO"
+
+# ---- protected mode: default-branch repo (checked-out branch is main/master). ----
+FORCE_PROT_DEFAULT=$(make_sql_repo '{"guards":{"forceScope":"protected"}}')
+# reset --hard while on the default branch → protected → ask.
+assert_ask "forceScope protected: reset --hard on default branch asks" \
+    "git reset --hard HEAD~1" "$FORCE_PROT_DEFAULT"
+# force-push resolving HEAD to the default branch → ask.
+assert_ask "forceScope protected: force-push HEAD (resolves to default branch) asks" \
+    "git push --force origin HEAD" "$FORCE_PROT_DEFAULT"
+# force-push to a non-default working branch → allow.
+assert_allow "forceScope protected: force-push to working branch allowed" \
+    "git push --force origin feature/my-branch" "$FORCE_PROT_DEFAULT"
+# force-push naming a bare ref with a leading '+' (stripped) → working branch allow.
+assert_allow "forceScope protected: force-push +feature/x (plus stripped) allowed" \
+    "git push -f origin +feature/x" "$FORCE_PROT_DEFAULT"
+# <src>:<dst> refspec targeting a working branch → allow.
+assert_allow "forceScope protected: force-push HEAD:feature/x refspec allowed" \
+    "git push --force origin HEAD:feature/x" "$FORCE_PROT_DEFAULT"
+
+# ---- protected mode with a non-main/master default branch (LOOM_DEFAULT_BRANCH). ----
+# Exercises resolve_default_branch() rather than the main/master literals.
+assert_ask_env "forceScope protected: force-push to configured default branch (develop) asks" \
+    "LOOM_DEFAULT_BRANCH=develop" "git push --force origin develop" "$FORCE_PROT_DEFAULT"
+assert_ask_env "forceScope protected: force-push HEAD:develop to default branch asks" \
+    "LOOM_DEFAULT_BRANCH=develop" "git push --force origin HEAD:develop" "$FORCE_PROT_DEFAULT"
+assert_ask_env "forceScope protected: force-push +develop (plus stripped) to default asks" \
+    "LOOM_DEFAULT_BRANCH=develop" "git push -f origin +develop" "$FORCE_PROT_DEFAULT"
+assert_allow_env "forceScope protected: force-push to feature/x when default=develop allowed" \
+    "LOOM_DEFAULT_BRANCH=develop" "git push --force origin feature/x" "$FORCE_PROT_DEFAULT"
+
+# ---- protected mode: working-branch repo (reset/push resolve to a feature branch). ----
+FORCE_PROT_FEATURE=$(make_sql_repo '{"guards":{"forceScope":"protected"}}')
+git -C "$FORCE_PROT_FEATURE" checkout -q -b feature/work 2>/dev/null || \
+    git -C "$FORCE_PROT_FEATURE" checkout -q -b feature/work
+assert_allow "forceScope protected: reset --hard on own working branch allowed" \
+    "git reset --hard HEAD~1" "$FORCE_PROT_FEATURE"
+assert_allow "forceScope protected: bare force-push (no refspec) on working branch allowed" \
+    "git push --force" "$FORCE_PROT_FEATURE"
+
+# ---- protected mode: detached HEAD → ambiguous → ask (never silently allow). ----
+FORCE_PROT_DETACHED=$(make_sql_repo '{"guards":{"forceScope":"protected"}}')
+git -C "$FORCE_PROT_DETACHED" -c user.email=t@t -c user.name=t commit -q --allow-empty -m init
+git -C "$FORCE_PROT_DETACHED" checkout -q --detach
+assert_ask "forceScope protected: reset --hard on detached HEAD asks (ambiguous)" \
+    "git reset --hard HEAD~1" "$FORCE_PROT_DETACHED"
+
+# ---- protected mode: git -C <other repo> resolves cwd from the -C argument. ----
+# Command runs with the hook cwd = default-branch repo, but -C points at the
+# feature-branch repo, so the target resolves to feature/work → allow. Without
+# -C the same command would resolve the default branch and ask.
+assert_allow "forceScope protected: git -C <feature-repo> reset --hard honors -C cwd" \
+    "git -C $FORCE_PROT_FEATURE reset --hard HEAD~1" "$FORCE_PROT_DEFAULT"
+
+# ---- off mode: force ops bypass entirely; main/master hard-deny still applies. ----
+FORCE_OFF_REPO=$(make_sql_repo '{"guards":{"forceScope":"off"}}')
+assert_allow "forceScope off: force-push to a non-protected branch bypassed" \
+    "git push --force origin develop" "$FORCE_OFF_REPO"
+assert_allow "forceScope off: reset --hard bypassed" \
+    "git reset --hard HEAD~1" "$FORCE_OFF_REPO"
+assert_deny "forceScope off: explicit force-push to main STILL hard-denied (ALWAYS_BLOCK)" \
+    "git push --force origin main" "$FORCE_OFF_REPO"
+assert_deny "forceScope off: explicit force-push to master STILL hard-denied (ALWAYS_BLOCK)" \
+    "git push -f origin master" "$FORCE_OFF_REPO"
+
+# ---- Env overrides config for the toggle itself. ----
+# LOOM_FORCE_SCOPE=all overrides config "protected" → ask even on a working branch.
+assert_ask_env "forceScope: LOOM_FORCE_SCOPE=all overrides config protected (working branch asks)" \
+    "LOOM_FORCE_SCOPE=all" "git push --force origin feature/my-branch" "$FORCE_PROT_DEFAULT"
+# LOOM_FORCE_SCOPE=off overrides config "protected" → allow even on default branch.
+assert_allow_env "forceScope: LOOM_FORCE_SCOPE=off overrides config protected (default branch allowed)" \
+    "LOOM_FORCE_SCOPE=off" "git reset --hard HEAD~1" "$FORCE_PROT_DEFAULT"
+# LOOM_FORCE_SCOPE=protected overrides a config "all" for a working branch → allow.
+assert_allow_env "forceScope: LOOM_FORCE_SCOPE=protected overrides config-absent all (working branch allowed)" \
+    "LOOM_FORCE_SCOPE=protected" "git push --force origin feature/x" "$FORCE_PROT_FEATURE"
+
+# ---- Malformed / out-of-range config falls through to "all" (asks). ----
+FORCE_BAD_REPO=$(make_sql_repo '{ this is not valid json ')
+assert_ask "forceScope malformed-config: falls through to all (force-push asks)" \
+    "git push --force origin feature/x" "$FORCE_BAD_REPO"
+FORCE_BOGUS_REPO=$(make_sql_repo '{"guards":{"forceScope":"bogus"}}')
+assert_ask "forceScope out-of-range value: falls through to all (reset asks)" \
+    "git reset --hard HEAD~1" "$FORCE_BOGUS_REPO"
+
+# ---- forceScope must NOT weaken unrelated guards, and main/master deny holds in every mode. ----
+assert_deny "forceScope protected: explicit force-push to main STILL hard-denied" \
+    "git push --force origin main" "$FORCE_PROT_DEFAULT"
+assert_deny_env "forceScope all(env): explicit force-with-lease to main STILL hard-denied" \
+    "LOOM_FORCE_SCOPE=all" "git push --force-with-lease origin main" "$FORCE_PROT_DEFAULT"
+assert_deny "forceScope protected: gh repo delete still blocked" \
+    "gh repo delete myrepo --yes" "$FORCE_PROT_DEFAULT"
+# A commit message merely MENTIONING --force / rm -rf is not a force op → allow.
+assert_allow "forceScope protected: commit message mentioning --force is not a force op" \
+    'git commit -m "document --force handling and rm -rf cleanup"' "$FORCE_PROT_DEFAULT"
+
+# Clean up force-scope temp repos.
+for _force_dir in "$FORCE_ALL_REPO" "$FORCE_PROT_DEFAULT" "$FORCE_PROT_FEATURE" \
+    "$FORCE_PROT_DETACHED" "$FORCE_OFF_REPO" "$FORCE_BAD_REPO" "$FORCE_BOGUS_REPO"; do
+    [[ -n "$_force_dir" && "$_force_dir" != "/" && -d "$_force_dir/.loom" ]] && rm -rf "$_force_dir"
+done
+
+echo ""
+
+# =========================================================================
 echo -e "${YELLOW}--- #3553 matching-precision: false positives now ALLOWED ---${NC}"
 # =========================================================================
 
