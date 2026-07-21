@@ -140,6 +140,37 @@ fi
 
 rm -rf "$STUBDIR" "$REPO" "$SCRATCH"
 
+# --- Test 7: disk-headroom.sh is sourceable directly under zsh (#3680) ---
+echo ""
+echo "Test 7: disk-headroom.sh sources cleanly under zsh (regression guard for #3680)"
+# The original bug: sweep.md's Stage -1 does `source ./.loom/scripts/lib/disk-headroom.sh`
+# directly into the invoking shell, which on macOS is frequently zsh. Under zsh
+# BASH_SOURCE is unset, so the bare `${BASH_SOURCE[0]}` resolved the sibling
+# worktree-root.sh against the CWD (repo root) instead of the lib dir, and the
+# source failed with "no such file or directory: .../worktree-root.sh". The fix
+# is the portable `${BASH_SOURCE[0]:-$0}` idiom. This test is itself executed
+# under bash (the harness shebang), so it must shell out to zsh explicitly to
+# exercise the reported path — that is exactly why the pre-existing tests above
+# (all run under bash) never caught the bug.
+if command -v zsh >/dev/null 2>&1; then
+    # Mirror sweep.md's invocation shape: cd into the dir that holds `lib/` and
+    # source via a leading-./ relative path. Here that dir is $SCRIPTS_DIR.
+    zsh_out="$(zsh -c "cd '$SCRIPTS_DIR' && source ./lib/disk-headroom.sh && echo OK" 2>&1)" || true
+    if [[ "$zsh_out" == *OK* ]]; then
+        pass "disk-headroom.sh sources cleanly under zsh (relative ./lib/ path)"
+    else
+        fail "disk-headroom.sh failed to source under zsh: $zsh_out"
+    fi
+
+    # Also exercise the functions post-source under zsh — proves the sibling
+    # worktree-root.sh loaded (loom_worktree_root_free_gb calls loom_worktree_root
+    # from it) and the pure math function works in a zsh interpreter.
+    zsh_math="$(zsh -c "cd '$SCRIPTS_DIR' && source ./lib/disk-headroom.sh && loom_wave_size_from_disk daemon 20 100 | tr '\n' '|'" 2>&1)" || true
+    assert_eq "$zsh_math" "10|target|" "loom_wave_size_from_disk works under zsh after sourcing"
+else
+    echo "  SKIP: zsh not available on PATH — skipping zsh-sourcing regression test"
+fi
+
 # --- Summary ---
 echo ""
 echo "Tests run: $TESTS_RUN, Passed: $TESTS_PASSED, Failed: $TESTS_FAILED"

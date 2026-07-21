@@ -41,7 +41,20 @@
 #   floor       — the math produced < 1 (e.g. a nearly full disk); floored to 1.
 
 # Resolve worktree-root.sh relative to this file so sourcing works from any cwd.
-_LOOM_DISK_HEADROOM_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+#
+# ${BASH_SOURCE[0]:-$0} is a bash+zsh-portable self-path idiom (#3680). This file
+# is unique among defaults/scripts/lib/*.sh in that sweep.md's Stage -1 sources it
+# DIRECTLY into the invoking shell (`source ./.loom/scripts/lib/disk-headroom.sh`),
+# which on macOS is often zsh (Claude Code's Bash tool runs zsh; zsh is also the
+# interactive default). Under zsh, BASH_SOURCE is unset, so bare ${BASH_SOURCE[0]}
+# -> "" and dirname "" -> ".", resolving worktree-root.sh against the shell's CWD
+# (repo root) instead of this lib dir — the source then fails. zsh sets $0 to the
+# sourced file's path, so the :-$0 fallback recovers it; bash keeps using
+# BASH_SOURCE[0] unchanged. Every other lib file is only sourced from within
+# bash-shebang'd scripts that are executed (not sourced into the top-level shell),
+# so BASH_SOURCE is always populated for them and they need no change. See the
+# audit table on #3680 for the full file-by-file disposition.
+_LOOM_DISK_HEADROOM_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
 # shellcheck source=./worktree-root.sh
 source "$_LOOM_DISK_HEADROOM_LIB_DIR/worktree-root.sh"
 
