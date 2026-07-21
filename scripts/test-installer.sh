@@ -2385,6 +2385,165 @@ echo ""
 
 
 # ==========================================================================
+# Dogfood commands scoped-symlink (issue #3682)
+# ==========================================================================
+# The dogfood block in install-loom.sh only fires when TARGET == LOOM_ROOT
+# (installing loom onto its own source repo), so the full installer cannot be
+# exercised against a temp repo. The symlink logic is extracted into
+# scripts/install/dogfood-commands.sh (`link_dogfood_commands`), which these
+# tests source and drive directly in an isolated sandbox.
+echo "=== Dogfood commands scoped-symlink (#3682) ==="
+
+DOGFOOD_HELPER="$LOOM_ROOT/scripts/install/dogfood-commands.sh"
+
+# Test 66: the helper exists and is sourceable.
+echo "Test 66: dogfood-commands.sh helper exists and defines link_dogfood_commands"
+if [[ -f "$DOGFOOD_HELPER" ]] && ( set +e; source "$DOGFOOD_HELPER"; declare -F link_dogfood_commands >/dev/null ); then
+  pass "link_dogfood_commands is defined by scripts/install/dogfood-commands.sh"
+else
+  fail "link_dogfood_commands not found in scripts/install/dogfood-commands.sh"
+fi
+
+# Test 67: install-loom.sh no longer materializes a COPY, and calls the linker.
+echo "Test 67: install-loom.sh uses the scoped symlink, not the old copy block"
+if grep -q 'link_dogfood_commands "\$TARGET_PATH"' "$INSTALL_SCRIPT" \
+   && ! grep -q 'Materialized .claude/commands/loom/ (real copy' "$INSTALL_SCRIPT"; then
+  pass "install-loom.sh calls link_dogfood_commands and dropped the copy-and-swap"
+else
+  fail "install-loom.sh still materializes a copy or does not call link_dogfood_commands"
+fi
+
+# Build an isolated sandbox that mimics a loom source repo: a defaults/ tree
+# plus a real .claude/commands/ destination dir.
+DOGFOOD_SANDBOX="$TEST_DIR/dogfood-sandbox"
+mkdir -p "$DOGFOOD_SANDBOX/defaults/.claude/commands/loom"
+echo "builder source of truth" > "$DOGFOOD_SANDBOX/defaults/.claude/commands/loom/builder.md"
+echo "judge source of truth" > "$DOGFOOD_SANDBOX/defaults/.claude/commands/loom/judge.md"
+
+# Drive the helper in a subshell so its fallback logging funcs don't leak.
+(
+  set +e
+  source "$DOGFOOD_HELPER"
+  link_dogfood_commands "$DOGFOOD_SANDBOX"
+) > /dev/null 2>&1
+
+CMD_LOOM_LINK="$DOGFOOD_SANDBOX/.claude/commands/loom"
+
+# Test 68: `.claude/commands/loom` is a symlink to the relative defaults path.
+echo "Test 68: .claude/commands/loom is a relative symlink into defaults/"
+if [[ -L "$CMD_LOOM_LINK" ]] && [[ "$(readlink "$CMD_LOOM_LINK")" == "../../defaults/.claude/commands/loom" ]]; then
+  pass ".claude/commands/loom -> ../../defaults/.claude/commands/loom"
+else
+  fail ".claude/commands/loom is not the expected relative symlink (got: $(readlink "$CMD_LOOM_LINK" 2>/dev/null || echo '<not a symlink>'))"
+fi
+
+# Test 69: `.claude/commands/` itself stays a REAL directory (not a symlink).
+echo "Test 69: .claude/commands parent stays a real directory"
+if [[ -d "$DOGFOOD_SANDBOX/.claude/commands" ]] && [[ ! -L "$DOGFOOD_SANDBOX/.claude/commands" ]]; then
+  pass ".claude/commands is a real directory (parent not symlinked)"
+else
+  fail ".claude/commands is missing or is itself a symlink"
+fi
+
+# Test 70: content resolves through the symlink to defaults/ (no drift possible).
+echo "Test 70: command content resolves through the symlink to defaults/"
+if [[ "$(cat "$CMD_LOOM_LINK/builder.md" 2>/dev/null)" == "builder source of truth" ]]; then
+  pass "reads through the symlink return the defaults/ source of truth"
+else
+  fail "content behind .claude/commands/loom/builder.md did not resolve to defaults/"
+fi
+
+# Test 71: #3565 safety — a co-installed tool writing a SIBLING namespace does
+# NOT pollute defaults/, and does NOT write through the loom symlink.
+echo "Test 71: sibling namespace write does not pollute defaults/ (#3565 safety)"
+mkdir -p "$DOGFOOD_SANDBOX/.claude/commands/repo"
+echo "repo lint command" > "$DOGFOOD_SANDBOX/.claude/commands/repo/lint.md"
+if [[ -f "$DOGFOOD_SANDBOX/.claude/commands/repo/lint.md" ]] \
+   && [[ ! -e "$DOGFOOD_SANDBOX/defaults/.claude/commands/repo" ]]; then
+  pass "sibling .claude/commands/repo/ is a real dir; defaults/ untouched"
+else
+  fail "sibling namespace leaked into defaults/ (#3565 regression)"
+fi
+
+# Test 72: idempotent — re-running leaves the symlink correct and unchanged.
+echo "Test 72: link_dogfood_commands is idempotent"
+(
+  set +e
+  source "$DOGFOOD_HELPER"
+  link_dogfood_commands "$DOGFOOD_SANDBOX"
+) > /dev/null 2>&1
+if [[ -L "$CMD_LOOM_LINK" ]] && [[ "$(readlink "$CMD_LOOM_LINK")" == "../../defaults/.claude/commands/loom" ]]; then
+  pass "second invocation keeps the symlink correct"
+else
+  fail "second invocation left the symlink in an unexpected state"
+fi
+
+# Test 73: replaces a pre-existing real (stale copy) directory with the symlink.
+echo "Test 73: a stale real copy is replaced by the symlink"
+DOGFOOD_SANDBOX2="$TEST_DIR/dogfood-sandbox2"
+mkdir -p "$DOGFOOD_SANDBOX2/defaults/.claude/commands/loom"
+echo "fresh builder" > "$DOGFOOD_SANDBOX2/defaults/.claude/commands/loom/builder.md"
+# Pre-seed a stale materialized copy (byte-different from defaults).
+mkdir -p "$DOGFOOD_SANDBOX2/.claude/commands/loom"
+echo "STALE builder copy" > "$DOGFOOD_SANDBOX2/.claude/commands/loom/builder.md"
+(
+  set +e
+  source "$DOGFOOD_HELPER"
+  link_dogfood_commands "$DOGFOOD_SANDBOX2"
+) > /dev/null 2>&1
+CMD_LOOM_LINK2="$DOGFOOD_SANDBOX2/.claude/commands/loom"
+if [[ -L "$CMD_LOOM_LINK2" ]] && [[ "$(cat "$CMD_LOOM_LINK2/builder.md")" == "fresh builder" ]]; then
+  pass "stale real copy replaced by symlink resolving to defaults/"
+else
+  fail "stale real copy was not replaced by the symlink"
+fi
+
+# Test 74: local-only files in the stale copy are preserved (not silently lost).
+echo "Test 74: refuses to clobber local-only files not present in defaults/"
+DOGFOOD_SANDBOX3="$TEST_DIR/dogfood-sandbox3"
+mkdir -p "$DOGFOOD_SANDBOX3/defaults/.claude/commands/loom"
+echo "builder" > "$DOGFOOD_SANDBOX3/defaults/.claude/commands/loom/builder.md"
+mkdir -p "$DOGFOOD_SANDBOX3/.claude/commands/loom"
+echo "builder" > "$DOGFOOD_SANDBOX3/.claude/commands/loom/builder.md"
+echo "local only" > "$DOGFOOD_SANDBOX3/.claude/commands/loom/local-only.md"
+(
+  set +e
+  source "$DOGFOOD_HELPER"
+  link_dogfood_commands "$DOGFOOD_SANDBOX3"
+) > /dev/null 2>&1
+CMD_LOOM_LINK3="$DOGFOOD_SANDBOX3/.claude/commands/loom"
+if [[ ! -L "$CMD_LOOM_LINK3" ]] && [[ -f "$CMD_LOOM_LINK3/local-only.md" ]]; then
+  pass "local-only file preserved; refused to replace with symlink"
+else
+  fail "local-only file lost or dir replaced despite local-only content"
+fi
+
+# Test 75: a legacy whole-dir .claude/commands symlink is removed and rebuilt.
+echo "Test 75: legacy whole-dir .claude/commands symlink is replaced"
+DOGFOOD_SANDBOX4="$TEST_DIR/dogfood-sandbox4"
+mkdir -p "$DOGFOOD_SANDBOX4/defaults/.claude/commands/loom"
+echo "builder" > "$DOGFOOD_SANDBOX4/defaults/.claude/commands/loom/builder.md"
+mkdir -p "$DOGFOOD_SANDBOX4/.claude"
+# Legacy: whole .claude/commands is a symlink into defaults/.claude/commands.
+mkdir -p "$DOGFOOD_SANDBOX4/defaults/.claude/commands"
+( cd "$DOGFOOD_SANDBOX4/.claude" && ln -s "../defaults/.claude/commands" commands )
+(
+  set +e
+  source "$DOGFOOD_HELPER"
+  link_dogfood_commands "$DOGFOOD_SANDBOX4"
+) > /dev/null 2>&1
+if [[ ! -L "$DOGFOOD_SANDBOX4/.claude/commands" ]] \
+   && [[ -d "$DOGFOOD_SANDBOX4/.claude/commands" ]] \
+   && [[ -L "$DOGFOOD_SANDBOX4/.claude/commands/loom" ]]; then
+  pass "legacy whole-dir symlink removed; parent real, loom/ symlinked"
+else
+  fail "legacy whole-dir .claude/commands symlink was not correctly replaced"
+fi
+
+echo ""
+
+
+# ==========================================================================
 # Summary
 # ==========================================================================
 echo "======================================"

@@ -95,7 +95,7 @@ while [[ $# -gt 0 ]]; do
       echo "                             the target (daemon running, recent state file, or"
       echo "                             active issue worktrees). Required to override the"
       echo "                             pre-flight active-session guard."
-      echo "  --dogfood                  Force dogfood mode: symlink .claude/agents -> ../defaults/.claude/agents"
+      echo "  --dogfood                  Force dogfood mode: symlink .claude/agents and .claude/commands/loom into defaults/"
       echo "                             (auto-detected when installing into the Loom source repo itself)"
       echo "  --no-dogfood               Disable dogfood mode even when installing into the Loom source repo"
       echo "  --allow-non-main-source    Proceed even if the Loom source checkout is not on a clean main"
@@ -167,6 +167,11 @@ header() {
 # installer (which has argv-parsing side effects).
 # shellcheck source=scripts/install/manifest.sh
 source "$LOOM_ROOT/scripts/install/manifest.sh"
+
+# Dogfood command-dir linker (issue #3682) — extracted so the test suite can
+# exercise the scoped-symlink logic without running the full installer.
+# shellcheck source=scripts/install/dogfood-commands.sh
+source "$LOOM_ROOT/scripts/install/dogfood-commands.sh"
 
 # Check the state of the Loom *source* checkout (the directory that contains
 # this script). We refuse to install from a feature branch, a stale main, or
@@ -1027,66 +1032,17 @@ if [[ "$DOGFOOD_MODE" == "true" ]]; then
   fi
   echo ""
 
-  # Dogfood mode (issue #3565): materialize loom's live `.claude/commands/loom/`
-  # as a real COPY of `defaults/.claude/commands/loom/`, NOT a symlink into
-  # `defaults/`.
-  #
-  # Why a copy and not a symlink (unlike .claude/agents above):
-  #   A symlink `.claude/commands -> ../defaults/.claude/commands` (or a
-  #   per-file symlink into defaults/) still redirects on-disk writes into the
-  #   shipped `defaults/` tree. A co-installed tool that writes
-  #   `.claude/commands/<ns>/foo.md` would therefore pollute loom's own
-  #   distribution artifact (this is exactly how it bit us — see #3565).
-  #   Materializing a REAL gitignored directory makes loom's live
-  #   `.claude/commands/` a pure destination like every consumer's: sibling
-  #   namespaces land harmlessly next to `loom/` and never touch `defaults/`.
-  #
-  # The command markdown carries no init-substituted placeholders
-  # ({{LOOM_VERSION}} etc.), so a plain copy is byte-identical to a consumer
-  # install — no template substitution needed for this layer.
-  #
-  # `.claude/commands` is gitignored in loom's own committed .gitignore (added
-  # in #3565), so this real directory is never staged by `git add -A`. The
-  # daemon's consumer `update_gitignore` list is intentionally NOT touched —
-  # consumer repos keep `.claude/commands/loom/` tracked.
-  info "Dogfood mode: materializing .claude/commands/loom copy in $TARGET_PATH..."
-  CMD_SRC="$TARGET_PATH/defaults/.claude/commands/loom"
-  CMD_LIVE_DIR="$TARGET_PATH/.claude/commands"
-  CMD_LIVE_LOOM="$CMD_LIVE_DIR/loom"
-
-  if [[ ! -d "$CMD_SRC" ]]; then
-    warning "Dogfood commands source does not exist: $CMD_SRC"
-    warning "Skipping .claude/commands materialization; commands may be missing or stale"
-  else
-    mkdir -p "$TARGET_PATH/.claude"
-
-    # If `.claude/commands` is still the legacy whole-dir symlink into
-    # defaults/, remove it so we can build a real destination directory in its
-    # place. Any sibling namespaces from co-installed tools already live in a
-    # real dir and are preserved.
-    if [[ -L "$CMD_LIVE_DIR" ]]; then
-      info "Removing legacy .claude/commands symlink -> $(readlink "$CMD_LIVE_DIR")"
-      rm -f "$CMD_LIVE_DIR"
-    fi
-    mkdir -p "$CMD_LIVE_DIR"
-
-    # Build the fresh copy in a temp dir on the same filesystem, then swap it
-    # into place with an atomic rename so an in-progress Claude Code session
-    # never observes a missing or half-written `.claude/commands/loom/`. Only
-    # the `loom/` subdir is swapped — sibling namespaces under
-    # `.claude/commands/` are untouched, and `.claude/commands/` itself is
-    # always present.
-    CMD_TMP="$(mktemp -d "$TARGET_PATH/.claude/.commands-bootstrap.XXXXXX")"
-    cp -R "$CMD_SRC/." "$CMD_TMP/loom-new"
-    if [[ -e "$CMD_LIVE_LOOM" || -L "$CMD_LIVE_LOOM" ]]; then
-      # Move the old copy aside first (brief; new content is byte-identical).
-      rm -rf "$CMD_TMP/loom-old"
-      mv "$CMD_LIVE_LOOM" "$CMD_TMP/loom-old"
-    fi
-    mv "$CMD_TMP/loom-new" "$CMD_LIVE_LOOM"
-    rm -rf "$CMD_TMP"
-    success "Materialized .claude/commands/loom/ (real copy of defaults/, gitignored)"
-  fi
+  # Dogfood mode (issue #3682): symlink loom's live `.claude/commands/loom/`
+  # to the shipped source-of-truth at `defaults/.claude/commands/loom/`, scoped
+  # to the `loom/` subdir only. A symlink cannot drift the way the previous
+  # copy (issue #3565) did — the stale copies produced a false bug report
+  # (#3665). Scoping the link to `loom/` keeps `.claude/commands/` itself a real
+  # directory, so #3565's failure mode (a co-installed tool writing a sibling
+  # namespace THROUGH a symlinked parent into loom's `defaults/` artifact) does
+  # not recur: no tool other than loom's own installer writes the `loom/`
+  # namespace. Full rationale lives in scripts/install/dogfood-commands.sh.
+  info "Dogfood mode: linking .claude/commands/loom -> defaults/ in $TARGET_PATH..."
+  link_dogfood_commands "$TARGET_PATH"
   echo ""
 fi
 
