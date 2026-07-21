@@ -276,6 +276,118 @@ fi
 info "Merging PR #$PR_NUMBER: $PR_TITLE"
 info "Branch: $PR_BRANCH"
 
+# ---------------------------------------------------------------------------
+# Partial-increment label reset (#3667).
+#
+# A PR that implements only a slice of a family/epic issue references it with a
+# NON-closing keyword — `Part of #N` / `Contributes to #N` (convention in
+# builder-pr.md) — deliberately so the issue survives the merge for further
+# work. GitHub never auto-closes such an issue, and the merge path otherwise
+# leaves `loom:building` orphaned on it: the #2838 "skip label cleanup on close"
+# decision only reasoned about the `Closes #N` auto-close case, where GitHub
+# closes the issue and stale labels on closed items are harmless. Nothing else
+# reclaims the label until a time-gated `/sweep all` stale-claim pass (>=2h),
+# and non-aggressive sweeps hard-skip the still-`loom:building` issue
+# indefinitely (issue #3667).
+#
+# Here — at the deterministic merge choke point — we swap each such still-open,
+# still-`loom:building` referenced issue back to `loom:issue`, mirroring
+# orphan_recovery.py's recover_issue() label-reset semantics (loom:building ->
+# loom:issue, i.e. return to the ready queue). No liveness check is needed: a
+# merge just happened on the PR that necessarily came from whoever held the
+# claim, so the current increment's work is provably done — a deterministic,
+# not heuristic, signal. Closing keywords (`Closes`/`Fixes`/`Resolves`) are NOT
+# matched — GitHub auto-closes those and the #2838 no-cleanup path stays
+# untouched.
+#
+# GitHub-only for v1 (guarded on FORGE_TYPE); merge-pr.sh already branches on
+# forge type elsewhere. Every step is best-effort and must never fail the merge.
+
+# Reset a single referenced issue's labels if — verified fresh at merge time —
+# it is still open and still carries loom:building. Idempotent: a no-op when the
+# issue is already closed, already lacks loom:building (e.g. re-claimed by a
+# second builder), or is actually a PR.
+_reset_one_partial_issue() {
+  local issue_num="$1"
+  local issue_json issue_state issue_labels
+
+  # Fresh (uncached) read so we see the label state AS OF the merge, not as of
+  # PR creation. Plain `gh api` is uncached; use it directly (not $GH, which may
+  # be gh-cached) to avoid a stale cached view masking a fresh re-claim.
+  issue_json="$(gh api "repos/$REPO_NWO/issues/$issue_num" 2>/dev/null || echo '{}')"
+
+  # The GitHub issues endpoint also returns PRs (a PR is an issue with a
+  # .pull_request member). Never mutate a PR that slipped through the regex.
+  if [[ "$(echo "$issue_json" | jq -r 'has("pull_request")')" == "true" ]]; then
+    return 0
+  fi
+
+  issue_state="$(echo "$issue_json" | jq -r '.state // ""')"
+  if [[ "$issue_state" != "open" ]]; then
+    info "Partial-increment reset: issue #$issue_num is not open (state='${issue_state:-unknown}') — skipping"
+    return 0
+  fi
+
+  issue_labels="$(echo "$issue_json" | jq -r '.labels[]?.name' 2>/dev/null || true)"
+  if ! printf '%s\n' "$issue_labels" | grep -qx 'loom:building'; then
+    info "Partial-increment reset: issue #$issue_num is not loom:building — skipping (idempotent)"
+    return 0
+  fi
+
+  info "Partial-increment reset: PR #$PR_NUMBER merged as a partial slice of #$issue_num; returning it to the ready queue"
+  if gh issue edit "$issue_num" \
+       --remove-label "loom:building" \
+       --add-label "loom:issue" >/dev/null 2>&1; then
+    success "Issue #$issue_num: loom:building -> loom:issue (partial increment; issue remains open)"
+    local ts comment
+    ts="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    comment="## Partial Increment Merged
+
+PR #$PR_NUMBER merged with a non-closing \`Part of\` / \`Contributes to\` reference, so this issue remains **open** for further work.
+
+**Action taken**:
+- Removed \`loom:building\` label
+- Added \`loom:issue\` label to return to the ready queue
+
+This issue is now available for the next increment (a subsequent \`/loom:sweep\` will treat it as ready rather than in-flight).
+
+---
+*Reset by merge-pr.sh (#3667) at $ts*"
+    gh issue comment "$issue_num" --body "$comment" >/dev/null 2>&1 || \
+      warning "Could not post partial-increment comment on issue #$issue_num (label swap still applied)"
+  else
+    warning "Could not reset labels on issue #$issue_num (partial increment) — may need manual 'gh issue edit'"
+  fi
+}
+
+# Parse the merged PR body for non-closing partial-increment references and
+# reset each referenced issue. Best-effort; returns 0 unconditionally.
+_reset_partial_increment_labels() {
+  [[ "$FORGE_TYPE" == "github" ]] || return 0
+
+  local pr_body
+  pr_body="$(echo "$PR_JSON" | jq -r '.body // ""')"
+  [[ -n "$pr_body" ]] || return 0
+
+  # Extract issue numbers referenced with a NON-closing partial-increment
+  # keyword: "Part of #N" / "Contributes to #N" (case-insensitive), deduped.
+  # grep -oiE emits e.g. "Part of #123"; a second grep strips to the number.
+  local refs
+  refs="$(printf '%s\n' "$pr_body" \
+    | grep -oiE '(Part of|Contributes to)[[:space:]]+#[0-9]+' \
+    | grep -oE '[0-9]+' \
+    | sort -u || true)"
+  [[ -n "$refs" ]] || return 0
+
+  local issue_num
+  while IFS= read -r issue_num; do
+    [[ -n "$issue_num" ]] || continue
+    _reset_one_partial_issue "$issue_num"
+  done <<< "$refs"
+
+  return 0
+}
+
 # Handle auto-merge mode
 #
 # The auto-merge path now mirrors the sync path's resilience patterns:
@@ -631,9 +743,23 @@ success "PR #$PR_NUMBER merged successfully"
 
 fi  # end synchronous-merge path (AUTO_MERGE != "true")
 
-# NOTE: Label cleanup on linked issues is intentionally skipped.
+# Partial-increment label reset (#3667). Runs only after a confirmed merge (both
+# the synchronous path above and the auto-merge server-side-completed fall-
+# through reach here; the auto-merge-queued and dry-run paths exit earlier).
+# Best-effort — never fails the merge. See the function definitions above.
+_reset_partial_increment_labels || true
+
+# NOTE: Label cleanup on linked issues is intentionally skipped for the
+# `Closes #N` / `Fixes #N` / `Resolves #N` auto-close case.
 # Labels on closed/merged items are harmless — all agents filter by open state.
 # See: https://github.com/rjwalters/loom/issues/2838
+#
+# EXCEPTION (#3667): non-closing `Part of #N` / `Contributes to #N` partial-
+# increment references leave the referenced issue OPEN after merge, so its
+# `loom:building` label would otherwise be orphaned. The
+# _reset_partial_increment_labels call above handles exactly that case by
+# swapping loom:building -> loom:issue on the still-open referenced issue. The
+# `Closes`-keyword path below is unchanged.
 #
 # NOTE: This script does NOT close linked issues. Issue auto-close is GitHub's
 # responsibility — GitHub's PR parser closes issues referenced via `Closes #N`,
