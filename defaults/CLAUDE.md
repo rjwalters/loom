@@ -1110,6 +1110,76 @@ LOOM_FORCE_SCOPE=protected git push --force origin feature/x   # allowed
 LOOM_FORCE_SCOPE=all git reset --hard HEAD~1   # ASK
 ```
 
+### Read-Only Fast-Path Guard Toggle (`guards.readOnlyFastPath` / `LOOM_GUARD_READONLY_FASTPATH`)
+
+`guard-destructive.sh` is a `PreToolUse`/`Bash` hook, so it fires before **every** Bash tool call. In Bash-dense sessions (remote ops, benchmark drivers) nearly every call is obviously read-only — `git status`, `ls`, `grep`, `aws … describe*`, `gh … list` — yet each one otherwise runs the full deny/ask gauntlet (~37 `grep`/`awk`/`sed` forks plus a `git rev-parse`, ~179ms measured) before falling through to `allow`.
+
+The read-only fast path (issue #3687) short-circuits that overwhelmingly-common case to a **silent** `allow` (exit 0, zero stdout/stderr, no logging) using a single bash-builtin structural test — zero forks — plus, only when that test passes, one lazy `jq` config read. It runs first, before the `git rev-parse` repo-root resolution and before any deny/ask array.
+
+The fast path is **on by default**. It is resolved in this order (highest precedence first):
+
+1. **`LOOM_GUARD_READONLY_FASTPATH` env var** — `0`/`false`/`no` disables the fast path (every command takes the full deny/ask path, byte-for-byte as before); `1`/`true`/`yes` forces it on. Overrides the config value.
+2. **`.loom/config.json`** — `guards.readOnlyFastPath` (default `true` when absent). Set it to `false` to disable:
+   ```json
+   {
+     "guards": {
+       "readOnlyFastPath": false
+     }
+   }
+   ```
+3. **Default** — `true` (fast path active).
+
+**Security — the fast path is a guard bypass by construction**, so admission is purely **structural** and conservative, never content-sensitive. A command is fast-pathed only when **all** of these hold (otherwise it falls through to the full path unchanged):
+
+- The raw command contains **none** of `;` `&` `|` `<` `>` backtick `$(` or a newline — this excludes all chaining, piping, redirection, and command substitution. So `git status && git push --force origin main`, `git status; rm -rf /`, and `git status $(rm -rf /)` all take the full path and are still denied.
+- The **first token** is an exact allowlist match (never a wrapper — `bash -c`, `sh -c`, `eval`, `xargs`, `env … git status`, `sudo git status` are all excluded because their first token isn't allowlisted):
+
+| First token | Admitted form |
+|-------------|---------------|
+| `git` | `git status` / `git log` / `git diff` / `git show` — **bare** subcommand only (so `git -C /path status` is not admitted) |
+| `ls`, `grep`, `rg` | any arguments |
+| `gh` | `gh <noun> view` / `gh <noun> list` (never `delete`/`close`/`archive`/…) |
+| `aws` | `aws <service> describe*` / `get*` / `list*`, and `aws s3 ls` |
+
+**`cat` and `ssh` are deliberately EXCLUDED** from the built-in list, even though they are read-only in spirit:
+
+- `cat` has a narrow existing `ASK` carve-out (`cat …/.ssh/…`, `cat …/.aws/credentials`); a blanket `cat` fast-path would silently skip it.
+- `ssh <host> '<cmd>'` wraps an **opaque remote command string** that the raw `ALWAYS_BLOCK` catastrophic scan still covers today; fast-pathing any `ssh …` would drop that coverage.
+
+**Optional extend-only escape hatch** — `guards.readOnlyFastPathExtra` is an array of **literal first-word commands** to add to the built-in list without hand-editing the Loom-managed `.claude/settings.json` (which the installer may overwrite). This directly answers "give operators a supported way to scope the matcher":
+
+```json
+{
+  "guards": {
+    "readOnlyFastPath": true,
+    "readOnlyFastPathExtra": ["jq", "wc"]
+  }
+}
+```
+
+> **Warning**: each word added here is a **guard bypass for that command word in full generality** (all arguments). Only add bare, argument-independent read-only utilities — never your own scripts or anything that could wrap a mutating call. Entries are matched as the literal first token only; no subcommand/verb parsing is applied to custom entries.
+
+The config read is best-effort and lazy: it happens only after a command has already passed the structural test, and any missing/empty/malformed `.loom/config.json` falls through to fast-path-ON. Disabling the fast path never weakens any deny/ask rule — it only makes the guard do its full work on every command again.
+
+**Examples**:
+
+```bash
+# Default: read-only commands are near-free and silent
+git status                     # fast-pathed (silent allow)
+aws ec2 describe-instances     # fast-pathed
+gh pr list                     # fast-pathed
+git status && git push --force origin main   # NOT fast-pathed → full path → DENIED
+
+# Disable the fast path for one command (restore full-path checking)
+LOOM_GUARD_READONLY_FASTPATH=0 git status
+
+# Persist the opt-out for a whole repo
+#   .loom/config.json  ->  { "guards": { "readOnlyFastPath": false } }
+
+# Extend the allowlist with a bare read-only utility
+#   .loom/config.json  ->  { "guards": { "readOnlyFastPathExtra": ["jq"] } }
+```
+
 ### Protecting Read-Only Directories
 
 Many projects have directories that should never be modified by agents (vendor code, generated files, external SDKs, process design kits). Loom provides a template hook for this.

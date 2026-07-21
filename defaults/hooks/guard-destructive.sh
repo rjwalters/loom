@@ -65,6 +65,198 @@ if [[ -z "$COMMAND" ]]; then
     exit 0
 fi
 
+# =============================================================================
+# READ-ONLY FAST PATH (issue #3687) — default ON.
+#
+# guard-destructive.sh is a PreToolUse/Bash hook, so it fires before EVERY Bash
+# tool call. In Bash-dense sessions (remote ops, benchmark drivers) the vast
+# majority of those calls are obviously read-only — `git status`, `ls`, `grep`,
+# `aws … describe*`, `gh … list` — yet each one still runs the full deny/ask
+# gauntlet (~37 grep/awk/sed forks + a git rev-parse, ~179ms measured). This
+# block short-circuits that overwhelmingly-common case to a silent `allow` with
+# a single bash-builtin structural test (zero forks) plus, only when that test
+# passes, one lazy `jq` config read.
+#
+# SECURITY: a fast path is a guard bypass by construction, so admission is
+# purely STRUCTURAL and conservative — never content-sensitive:
+#   1. Reject fast-path eligibility if the raw command contains ANY of
+#      ;  &  |  <  >  backtick  $(  or a newline. This kills chaining, piping,
+#      redirection, and command substitution (so `git status && <force-push>`,
+#      `git status; rm -rf /`, `git status $(rm -rf /)`, `git status > /etc/x`
+#      all fall through to the full path unchanged).
+#   2. Exact first-token (command-word) allowlist — never a wrapper. Because the
+#      allowlist is keyed on the literal first token, wrapper forms (`bash -c`,
+#      `sh -c`, `eval`, `xargs`, `env … git status`, `sudo git status`) are
+#      excluded automatically: their first token isn't allowlisted.
+#   3. Verb/subcommand exactness for multi-word tools, chosen to be provably
+#      disjoint from every existing deny/ask pattern:
+#        git status|log|diff|show  (bare — `git -C /p status` is NOT admitted)
+#        ls  grep  rg
+#        gh <noun> view|list       (never delete/close/archive/…)
+#        aws <service> describe*|get*|list*  and  aws s3 ls   (mirrors the
+#          verb-anchoring already in CLOUD_ASK_PATTERNS: those verbs are never
+#          mutating, so this only skips greps that were going to allow anyway)
+#   cat and ssh are DELIBERATELY EXCLUDED from the built-in list:
+#     - cat has a narrow existing ASK carve-out (cat …/.ssh/, cat …/.aws/
+#       credentials); a blanket cat fast-path would silently skip it.
+#     - ssh wraps an OPAQUE remote command string that the raw ALWAYS_BLOCK scan
+#       still covers today; fast-pathing any `ssh …` would drop that coverage.
+#
+# False NEGATIVES (declining eligibility) are always safe — they just fall
+# through to the correct, slower existing behavior. False POSITIVES are the only
+# danger, so the eligibility test stays maximally conservative.
+#
+# CONFIG-ORDERING CHOICE: this block runs BEFORE REPO_ROOT is resolved (the git
+# rev-parse subprocess below), on purpose — the structural test never needs the
+# repo root. Only the toggle/extra-list config read needs a config file, and it
+# is resolved LAZILY (only after structural admission already passed) by walking
+# up from CWD to the nearest .loom/config.json WITHOUT forking git
+# (fastpath_config_file). So a fast-pathed command pays: 1 bash-builtin test +
+# (only if eligible) 1 stat-walk + 1 jq read — never the git rev-parse, never a
+# deny/ask array, never a log write.
+#
+# Toggle: guards.readOnlyFastPath (default true) / LOOM_GUARD_READONLY_FASTPATH
+# env (0/false/no disables, 1/true/yes forces on; env wins). Optional
+# guards.readOnlyFastPathExtra is an EXTEND-ONLY array of literal first-word
+# commands (each entry is a full-generality bypass for that command word).
+# =============================================================================
+
+# Locate the nearest .loom/config.json by walking up from CWD, fork-free (no
+# git rev-parse). Cached. Best-effort: empty when none is found.
+_FASTPATH_CFG_FILE=""
+_FASTPATH_CFG_FILE_DONE=""
+fastpath_config_file() {
+    if [[ -z "$_FASTPATH_CFG_FILE_DONE" ]]; then
+        _FASTPATH_CFG_FILE_DONE=1
+        local d="$CWD"
+        if [[ -n "$d" && "$d" == /* ]]; then
+            while :; do
+                if [[ -f "$d/.loom/config.json" ]]; then
+                    _FASTPATH_CFG_FILE="$d/.loom/config.json"
+                    break
+                fi
+                [[ "$d" == "/" ]] && break
+                local parent="${d%/*}"
+                [[ -z "$parent" ]] && parent="/"
+                d="$parent"
+            done
+        fi
+    fi
+    printf '%s' "$_FASTPATH_CFG_FILE"
+}
+
+# Resolve the fast-path toggle (config + env), cached. Default true. Only ever
+# called after structural admission has already passed, so the jq read stays off
+# the hot path for commands that don't structurally qualify.
+_FASTPATH_ENABLED_CACHE=""
+fastpath_enabled() {
+    if [[ -z "$_FASTPATH_ENABLED_CACHE" ]]; then
+        local enabled=true cfg
+        cfg=$(fastpath_config_file)
+        if [[ -n "$cfg" ]]; then
+            # Only an explicit `false` disables; a missing key or malformed JSON
+            # (jq non-zero, caught by ||) stays ON — mirrors sql_guard_enabled().
+            enabled=$(jq -r 'if .guards.readOnlyFastPath == false then "false" else "true" end' "$cfg" 2>/dev/null) || enabled=true
+            [[ -n "$enabled" ]] || enabled=true
+        fi
+        # Env override wins over config.
+        case "${LOOM_GUARD_READONLY_FASTPATH:-}" in
+            0|false|no)  enabled=false ;;
+            1|true|yes)  enabled=true ;;
+        esac
+        _FASTPATH_ENABLED_CACHE="$enabled"
+    fi
+    [[ "$_FASTPATH_ENABLED_CACHE" == "true" ]]
+}
+
+# Shared structural pre-check: reject any chaining/piping/redirection/
+# substitution/newline. Pure bash builtins, zero forks.
+fastpath_structural_ok() {
+    case "$1" in
+        *';'*|*'&'*|*'|'*|*'<'*|*'>'*|*'`'*|*'$('*) return 1 ;;
+    esac
+    [[ "$1" == *$'\n'* ]] && return 1
+    return 0
+}
+
+# Built-in allowlist admission — bash-builtin regex/case only, zero forks.
+fastpath_builtin_admits() {
+    local cmd="$1"
+    fastpath_structural_ok "$cmd" || return 1
+    local -a t
+    read -ra t <<< "$cmd"
+    local n=${#t[@]}
+    (( n >= 1 )) || return 1
+    case "${t[0]}" in
+        ls|grep|rg)
+            return 0
+            ;;
+        git)
+            (( n >= 2 )) || return 1
+            case "${t[1]}" in
+                status|log|diff|show) return 0 ;;
+            esac
+            return 1
+            ;;
+        gh)
+            (( n >= 3 )) || return 1
+            case "${t[2]}" in
+                view|list) return 0 ;;
+            esac
+            return 1
+            ;;
+        aws)
+            (( n >= 3 )) || return 1
+            [[ "${t[1]}" == "s3" && "${t[2]}" == "ls" ]] && return 0
+            case "${t[2]}" in
+                describe*|get*|list*) return 0 ;;
+            esac
+            return 1
+            ;;
+    esac
+    return 1
+}
+
+# Optional extend-only escape hatch: guards.readOnlyFastPathExtra is an array of
+# literal first-word commands. Read lazily (only when the built-in list did not
+# admit) and cached. Each entry is a full-generality bypass for that word.
+_FASTPATH_EXTRA_CACHE=""
+_FASTPATH_EXTRA_DONE=""
+fastpath_extra_admits() {
+    local cmd="$1"
+    fastpath_structural_ok "$cmd" || return 1
+    local -a t
+    read -ra t <<< "$cmd"
+    (( ${#t[@]} >= 1 )) || return 1
+    local first="${t[0]}"
+    if [[ -z "$_FASTPATH_EXTRA_DONE" ]]; then
+        _FASTPATH_EXTRA_DONE=1
+        local cfg
+        cfg=$(fastpath_config_file)
+        if [[ -n "$cfg" ]]; then
+            _FASTPATH_EXTRA_CACHE=$(jq -r '(.guards.readOnlyFastPathExtra // []) | .[]' "$cfg" 2>/dev/null) || _FASTPATH_EXTRA_CACHE=""
+        fi
+    fi
+    [[ -n "$_FASTPATH_EXTRA_CACHE" ]] || return 1
+    local w
+    while IFS= read -r w; do
+        [[ -n "$w" && "$first" == "$w" ]] && return 0
+    done <<< "$_FASTPATH_EXTRA_CACHE"
+    return 1
+}
+
+# Fast-path dispatch. The env fast-disable check is first so a fully-disabled
+# feature stays entirely off the hot path (no structural test, no config read).
+_fastpath_env="${LOOM_GUARD_READONLY_FASTPATH:-}"
+if [[ "$_fastpath_env" != "0" && "$_fastpath_env" != "false" && "$_fastpath_env" != "no" ]]; then
+    if fastpath_builtin_admits "$COMMAND"; then
+        # Silent allow: no stdout/stderr, no log_hook_error, before REPO_ROOT.
+        fastpath_enabled && exit 0
+    elif fastpath_extra_admits "$COMMAND"; then
+        fastpath_enabled && exit 0
+    fi
+fi
+
 # Resolve repo root from cwd (handles worktree paths safely)
 REPO_ROOT=""
 if [[ -n "$CWD" ]] && [[ -d "$CWD" ]]; then
