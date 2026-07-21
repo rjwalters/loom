@@ -806,8 +806,8 @@ _worktree_branch_for() {
     awk -v p="$target_abs" '
       /^worktree / { wt=$2; br=""; next }
       /^branch /   { br=$2 }
-      /^$/         { if (wt == p && br != "") { sub(/^refs\/heads\//, "", br); print br; exit } }
-      END          { if (wt == p && br != "") { sub(/^refs\/heads\//, "", br); print br } }
+      /^$/         { if (wt == p && br != "" && !found) { sub(/^refs\/heads\//, "", br); print br; found=1; exit } }
+      END          { if (wt == p && br != "" && !found) { sub(/^refs\/heads\//, "", br); print br } }
     '
 }
 
@@ -820,8 +820,8 @@ _find_worktree_by_branch() {
     awk -v want="refs/heads/${want_branch}" '
       /^worktree / { wt=$2; br=""; next }
       /^branch /   { br=$2 }
-      /^$/         { if (br == want) { print wt; exit } }
-      END          { if (br == want) { print wt } }
+      /^$/         { if (br == want && !found) { print wt; found=1; exit } }
+      END          { if (br == want && !found) { print wt } }
     '
 }
 
