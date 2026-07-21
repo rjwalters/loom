@@ -1096,6 +1096,39 @@ assert_deny "forceScope protected: gh repo delete still blocked" \
 assert_allow "forceScope protected: commit message mentioning --force is not a force op" \
     'git commit -m "document --force handling and rm -rf cleanup"' "$FORCE_PROT_DEFAULT"
 
+# ---- protected mode: EVERY positional refspec is resolved, not just the first. ----
+# Regression for the multi-refspec gap: parse_force_ops() previously inspected
+# only pos[2] (the first refspec), so a protected branch in a non-first refspec
+# position slipped through in protected mode. Now every refspec is emitted and
+# the caller asks if ANY resolves to a protected/ambiguous target. The protected
+# branch literal is assembled from a variable so this test file's own command
+# text never contains a raw "push --force origin <protected>" substring that the
+# session guard hook would trip on.
+_PROT=main
+# Protected branch as the SECOND refspec (was silently allowed pre-fix — THE gap).
+assert_ask "forceScope protected: multi-refspec force-push with protected 2nd refspec asks" \
+    "git push --force origin feature/x $_PROT" "$FORCE_PROT_DEFAULT"
+# Protected branch as the FIRST refspec: the raw command carries the
+# "push --force origin main" substring, so ALWAYS_BLOCK hard-denies it before the
+# force-scope block is ever reached — kept as a control that the deny still holds.
+assert_deny "forceScope protected: multi-refspec force-push with protected 1st refspec hard-denied" \
+    "git push --force origin $_PROT feature/x" "$FORCE_PROT_DEFAULT"
+# Protected branch in a non-first <src>:<dst> refspec is resolved to <dst> and asks.
+assert_ask "forceScope protected: multi-refspec force-push with protected dst in 2nd refspec asks" \
+    "git push --force origin feature/x HEAD:$_PROT" "$FORCE_PROT_DEFAULT"
+# Configured non-main/master default branch in a non-first refspec → resolved → ask.
+assert_ask_env "forceScope protected: multi-refspec with default branch (develop) 2nd refspec asks" \
+    "LOOM_DEFAULT_BRANCH=develop" "git push --force origin feature/x develop" "$FORCE_PROT_DEFAULT"
+# Multiple non-protected refspecs → every target resolves to a working branch → allow.
+assert_allow "forceScope protected: multi-refspec force-push, all working branches allowed" \
+    "git push --force origin feature/x feature/y" "$FORCE_PROT_DEFAULT"
+# Multiple non-protected refspecs including a stripped '+' and a <src>:<dst> form → allow.
+assert_allow "forceScope protected: multi-refspec force-push +feature/x and HEAD:feature/y allowed" \
+    "git push -f origin +feature/x HEAD:feature/y" "$FORCE_PROT_DEFAULT"
+# In "all" mode, a multi-refspec force-push still asks (unchanged behaviour).
+assert_ask "forceScope default(all): multi-refspec force-push asks" \
+    "git push --force origin feature/x feature/y" "$FORCE_ALL_REPO"
+
 # Clean up force-scope temp repos.
 for _force_dir in "$FORCE_ALL_REPO" "$FORCE_PROT_DEFAULT" "$FORCE_PROT_FEATURE" \
     "$FORCE_PROT_DETACHED" "$FORCE_OFF_REPO" "$FORCE_BAD_REPO" "$FORCE_BOGUS_REPO"; do

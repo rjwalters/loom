@@ -343,7 +343,11 @@ resolve_default_branch() {
 #   - `git -C <path> ...` sets <cpath>; other pre-subcommand global options are
 #     skipped (`-c <k=v>` consumes its argument).
 #   - push: emitted only when a --force/-f/--force-with-lease flag is present.
-#     <target> is the destination branch parsed from the refspec —
+#     ONE line is emitted per positional refspec (pos[2], pos[3], …) after the
+#     remote — a multi-refspec push like `git push --force origin a b` emits a
+#     line for `a` AND `b`, so a protected branch in any refspec position (not
+#     just the first) reaches the caller's per-line check (#3674 follow-up).
+#     <target> is the destination branch parsed from each refspec —
 #       * `<src>:<dst>` form => <dst>
 #       * a bare ref        => the ref with a leading `+` stripped
 #       * `HEAD`, or no ref => the literal "@HEAD@" (resolve checked-out branch)
@@ -379,6 +383,11 @@ parse_force_ops() {
             if (subcmd == "push") {
                 force = 0
                 np = 0
+                # pos is a file-global awk array; clear it per segment
+                # (portable — split with an empty string empties the array) so
+                # refspecs from a prior segment cannot leak into this one now
+                # that we read every positional slot, not just pos[2].
+                split("", pos)
                 for (j = k+1; j <= m; j++) {
                     t = toks[j]
                     if (t == "--force" || t == "-f" || t == "--force-with-lease" || t ~ /^--force-with-lease=/) { force = 1; continue }
@@ -387,15 +396,23 @@ parse_force_ops() {
                     pos[np] = t
                 }
                 if (!force) continue
-                target = "@HEAD@"
-                if (np >= 2) {
-                    rs = pos[2]
-                    sub(/^\+/, "", rs)
-                    ci = index(rs, ":")
-                    if (ci > 0) rs = substr(rs, ci + 1)
-                    if (rs != "HEAD" && rs != "") target = rs
+                # pos[1] is the remote; pos[2..np] are refspecs. Emit ONE line per
+                # positional refspec so a protected branch in ANY refspec position
+                # (not just the first) reaches the per-line check in the caller. A
+                # bare push with no refspec (np < 2) resolves the checked-out branch.
+                if (np < 2) {
+                    print cpath SEP "@HEAD@"
+                } else {
+                    for (p = 2; p <= np; p++) {
+                        rs = pos[p]
+                        sub(/^\+/, "", rs)
+                        ci = index(rs, ":")
+                        if (ci > 0) rs = substr(rs, ci + 1)
+                        target = "@HEAD@"
+                        if (rs != "HEAD" && rs != "") target = rs
+                        print cpath SEP target
+                    }
                 }
-                print cpath SEP target
             } else if (subcmd == "reset") {
                 hard = 0
                 for (j = k+1; j <= m; j++) if (toks[j] == "--hard") hard = 1
