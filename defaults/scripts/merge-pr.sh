@@ -336,6 +336,7 @@ _reset_one_partial_issue() {
 
   info "Partial-increment reset: PR #$PR_NUMBER merged as a partial slice of #$issue_num; returning it to the ready queue"
   if gh issue edit "$issue_num" \
+       --repo "$REPO_NWO" \
        --remove-label "loom:building" \
        --add-label "loom:issue" >/dev/null 2>&1; then
     success "Issue #$issue_num: loom:building -> loom:issue (partial increment; issue remains open)"
@@ -353,7 +354,7 @@ This issue is now available for the next increment (a subsequent \`/loom:sweep\`
 
 ---
 *Reset by merge-pr.sh (#3667) at $ts*"
-    gh issue comment "$issue_num" --body "$comment" >/dev/null 2>&1 || \
+    gh issue comment "$issue_num" --repo "$REPO_NWO" --body "$comment" >/dev/null 2>&1 || \
       warning "Could not post partial-increment comment on issue #$issue_num (label swap still applied)"
   else
     warning "Could not reset labels on issue #$issue_num (partial increment) — may need manual 'gh issue edit'"
