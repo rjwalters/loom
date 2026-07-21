@@ -69,6 +69,44 @@ FILE_MODE = 0o600
 DEFAULT_HOME_ACCOUNTS_ENV = "~/.loom/accounts.env"
 HOME_ACCOUNTS_ENV_VAR = "LOOM_ACCOUNTS_ENV"
 
+# Characters stripped from an email local-part when deriving a token filename
+# (#3697): dots and hyphens, so ``r.j.walters`` -> ``rjwalters`` and
+# ``agent-1`` -> ``agent1``, matching the established naming convention.
+_LOCAL_PART_STRIP_RE = re.compile(r"[.-]")
+# Any character outside the token-filename safe set is dropped as a final
+# guard so the derived name always passes ``_TOKEN_FILE_RE``.
+_UNSAFE_FILENAME_CHAR_RE = re.compile(r"[^A-Za-z0-9._-]")
+
+
+def derive_token_filename(email: str) -> str:
+    """Derive a safe ``<name>.token`` filename from an account email (#3697).
+
+    Convention (stable so account identities don't churn):
+
+    * strip dots and hyphens from the local-part;
+    * append ``-<first-domain-label>``;
+    * lowercase, then drop any remaining unsafe character.
+
+    Examples::
+
+        robb@2amlogic.com        -> robb-2amlogic.token
+        r.j.walters@gmail.com    -> rjwalters-gmail.token
+        agent-1@2amlogic.com     -> agent1-2amlogic.token
+
+    The result always matches :data:`_TOKEN_FILE_RE`. Two *distinct* emails
+    can still derive the same stem (e.g. ``rjwalters@gmail.com`` and
+    ``r.j.walters@gmail.com``); that true collision is caught by the existing
+    duplicate-filename guard in :func:`bootstrap_tokens`, not silently merged.
+    """
+    local, sep, domain = email.strip().partition("@")
+    local_clean = _LOCAL_PART_STRIP_RE.sub("", local)
+    domain_label = domain.split(".")[0] if sep else ""
+    stem = f"{local_clean}-{domain_label}" if domain_label else local_clean
+    stem = _UNSAFE_FILENAME_CHAR_RE.sub("", stem.lower())
+    if not stem:
+        stem = "account"
+    return f"{stem}.token"
+
 
 # ---------------------------------------------------------------------------
 # .env parsing
@@ -201,6 +239,10 @@ def _assemble_valid_accounts(
     out: list[Account] = []
     for n in sorted(accounts):
         triple = accounts[n]
+        # Auto-derive the token filename from the email when omitted (#3697),
+        # so a claude-monitor-style EMAIL+KEY-only entry bootstraps directly.
+        if not triple.get("file") and triple.get("email"):
+            triple = {**triple, "file": derive_token_filename(triple["email"])}
         missing = [k for k in ("email", "key", "file") if not triple.get(k)]
         if missing:
             log_warning(

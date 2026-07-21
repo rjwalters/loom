@@ -435,9 +435,56 @@ def write_ranking_atomic(report: ProbeReport, ranking_path: Path) -> None:
 # ---------------------------------------------------------------------------
 
 
+def _run_monitor_check(
+    tokens_dir: Path,
+    *,
+    write_ranking: bool,
+) -> ProbeReport | None:
+    """Build a ProbeReport from claude-monitor's ``ranking.json`` (#3697).
+
+    Returns ``None`` when no usable, fresh monitor data is available (the
+    caller then probes under ``auto`` or emits nothing under ``monitor``).
+    When data is available and ``write_ranking`` is set, emits ``.ranking``
+    in the selector's pipe format via the monitor writer (byte-compatible
+    with what ``select.py:_read_ranking`` consumes).
+
+    Imported lazily to avoid an import cycle (``monitor`` imports
+    ``_STATUS_RANK`` from this module).
+    """
+    from loom_tools.tokens import monitor as monitor_mod
+
+    accounts = monitor_mod.build_monitor_accounts(tokens_dir)
+    if accounts is None:
+        return None
+
+    ranked_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    results = [
+        AccountResult(
+            name=a.name,
+            status=a.status or "available",
+            s5h_utilization=a.util_5h,
+            s7d_utilization=a.util_7d,
+        )
+        for a in accounts
+    ]
+    report = ProbeReport(ranked_at=ranked_at, accounts=results)
+
+    if write_ranking:
+        ranking_path = tokens_dir / ".ranking"
+        monitor_mod.write_monitor_ranking_atomic(accounts, ranking_path)
+        logger.info(
+            "wrote monitor-sourced ranking to %s (%d accounts)",
+            ranking_path,
+            len(accounts),
+        )
+
+    return report
+
+
 def run_check(
     tokens_dir: Path,
     *,
+    source: str = "probe",
     write_ranking: bool = False,
     probe_prompt: str = DEFAULT_PROBE_PROMPT,
     model: str = DEFAULT_PROBE_MODEL,
@@ -446,10 +493,39 @@ def run_check(
 ) -> ProbeReport:
     """Probe all accounts and (optionally) write ``.ranking``.
 
+    ``source`` selects where the ranking comes from (#3697):
+
+    * ``"probe"`` (default, unchanged) — live-probe rate-limit headers.
+    * ``"monitor"`` — consume claude-monitor's ``ranking.json`` only; do
+      **not** probe. Yields an empty report when no fresh monitor data is
+      available.
+    * ``"auto"`` — use claude-monitor when a fresh ``ranking.json`` is
+      present, else fall back to probing.
+
+    Under the ``monitor``/``auto`` branch, when ``write_ranking`` is set the
+    monitor-sourced ``.ranking`` is emitted in the selector's pipe format
+    (``name|status``) — the format ``select.py`` actually consumes.
+
     Probes are issued sequentially with 0.5-1.5s jitter between them
     (lean-genius pattern) when *stagger* is true. Tests can pass
     ``stagger=False`` to skip the sleep.
     """
+    if source in ("auto", "monitor"):
+        monitor_report = _run_monitor_check(
+            tokens_dir, write_ranking=write_ranking
+        )
+        if monitor_report is not None:
+            return monitor_report
+        if source == "monitor":
+            # monitor-only: no probe fallback. Return an empty report and
+            # leave any existing .ranking untouched.
+            logger.warning(
+                "check --source monitor: no fresh claude-monitor ranking.json; "
+                "nothing to rank (not probing)."
+            )
+            return build_report([])
+        # source == "auto": fall through to probing.
+
     pairs = discover_tokens(tokens_dir)
     if not pairs:
         logger.warning("no tokens found in %s", tokens_dir)
