@@ -50,7 +50,9 @@ def _build_parser() -> argparse.ArgumentParser:
         "bootstrap",
         help=(
             "Materialize .loom/tokens/ from ACCOUNT_*_N triples, merging the "
-            "home master (~/.loom/accounts.env) with the repo-local source."
+            "home master (~/.loom/accounts.env) with the repo-local source. "
+            "ACCOUNT_TOKEN_FILE_N is optional: when omitted it is auto-derived "
+            "from ACCOUNT_EMAIL_N (e.g. alice@example.com -> alice-example.token)."
         ),
     )
     bp.add_argument(
@@ -106,6 +108,18 @@ def _build_parser() -> argparse.ArgumentParser:
         help=(
             "Write .loom/tokens/.ranking atomically (consumed by the spawn "
             "wrapper, #3235)."
+        ),
+    )
+    cp.add_argument(
+        "--source",
+        choices=["auto", "monitor", "probe"],
+        default=None,
+        help=(
+            "Where to source the ranking (#3697): 'auto' (default) uses "
+            "claude-monitor's ~/.claude-monitor/ranking.json when present and "
+            "fresh, else probes; 'monitor' uses claude-monitor only (no "
+            "probe); 'probe' always live-probes (pre-#3697 behavior). "
+            "Overrides $LOOM_RANKING_SOURCE."
         ),
     )
     cp.add_argument(
@@ -319,6 +333,33 @@ def _print_effective_accounts(result: "object") -> None:
         print(f"  {name:<{width}}  {email}  [{label}]")
 
 
+# Environment override for the ranking source (#3697). The --source flag
+# takes precedence; this env is the fallback; 'auto' is the built-in default.
+_RANKING_SOURCE_VAR = "LOOM_RANKING_SOURCE"
+_VALID_RANKING_SOURCES = ("auto", "monitor", "probe")
+
+
+def _resolve_ranking_source(flag_value: str | None) -> str:
+    """Resolve the ranking source: flag > $LOOM_RANKING_SOURCE > 'auto'.
+
+    An invalid env value is ignored (with a warning) and treated as unset so
+    a typo never silently disables ranking.
+    """
+    if flag_value is not None:
+        return flag_value
+    env = os.environ.get(_RANKING_SOURCE_VAR)
+    if env is not None:
+        candidate = env.strip().lower()
+        if candidate in _VALID_RANKING_SOURCES:
+            return candidate
+        if candidate:
+            log_warning(
+                f"Ignoring invalid {_RANKING_SOURCE_VAR}={env!r}; "
+                f"expected one of {', '.join(_VALID_RANKING_SOURCES)}."
+            )
+    return "auto"
+
+
 def _cmd_check(args: argparse.Namespace) -> int:
     """Handle ``loom-tokens check``."""
     # Configure logging on stderr so --json stdout output is clean.
@@ -342,8 +383,11 @@ def _cmd_check(args: argparse.Namespace) -> int:
             return 1
         tokens_dir = repo_root / ".loom" / "tokens"
 
+    source = _resolve_ranking_source(args.source)
+
     report = run_check(
         tokens_dir,
+        source=source,
         write_ranking=args.ranking,
         probe_prompt=args.probe_prompt,
         stagger=not args.no_stagger,

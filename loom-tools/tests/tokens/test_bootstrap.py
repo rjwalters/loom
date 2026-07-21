@@ -14,9 +14,11 @@ from loom_tools.tokens.bootstrap import (
     INDEX_VERSION,
     Account,
     BootstrapResult,
+    _TOKEN_FILE_RE,
     _strip_value,
     bootstrap_tokens,
     default_home_accounts_env,
+    derive_token_filename,
     fingerprint,
     merge_accounts,
     parse_env_accounts,
@@ -250,20 +252,23 @@ class TestBootstrap:
         assert not tokens_dir.exists() or list(tokens_dir.iterdir()) == []
 
     def test_partial_triple_skipped(self, mock_repo: pathlib.Path) -> None:
+        # A triple missing a non-derivable field (the KEY) is still skipped.
+        # (Missing TOKEN_FILE is now auto-derived from the email, #3697 — see
+        # TestDeriveTokenFilename / test_token_file_auto_derived_from_email.)
         env_body = (
             "ACCOUNT_EMAIL_1=a@b.com\n"
             "ACCOUNT_KEY_1=sk-1\n"
             "ACCOUNT_TOKEN_FILE_1=a.token\n"
-            # _2 is missing TOKEN_FILE
+            # _2 is missing KEY (cannot be derived) -> skipped
             "ACCOUNT_EMAIL_2=c@d.com\n"
-            "ACCOUNT_KEY_2=sk-2\n"
+            "ACCOUNT_TOKEN_FILE_2=c.token\n"
         )
         _write_env(mock_repo, env_body)
         result = bootstrap_tokens(mock_repo)
         assert result.written == ["a.token"]
         # _2 was silently dropped (with a warning).
         tokens_dir = mock_repo / ".loom" / "tokens"
-        assert not (tokens_dir / "c@d.token").exists()
+        assert not (tokens_dir / "c.token").exists()
 
     def test_unsafe_filename_skipped(self, mock_repo: pathlib.Path) -> None:
         env_body = (
@@ -636,3 +641,119 @@ class TestCliMerge:
         assert "Effective accounts" in out
         assert "alice" in out
         assert "home" in out
+
+
+class TestDeriveTokenFilename:
+    """Auto-derive ACCOUNT_TOKEN_FILE_N from email when omitted (#3697)."""
+
+    def test_convention_examples(self) -> None:
+        # Established naming convention (generic example domains).
+        assert derive_token_filename("alice@example.com") == "alice-example.token"
+        assert (
+            derive_token_filename("a.b.jones@example.org") == "abjones-example.token"
+        )
+        assert derive_token_filename("agent-1@example.com") == "agent1-example.token"
+
+    def test_result_always_passes_safety_regex(self) -> None:
+        for email in (
+            "user@example.com",
+            "a.b.c@sub.example.co.uk",
+            "weird+tag@example.com",
+            "UPPER@Example.COM",
+            "n@d",
+        ):
+            derived = derive_token_filename(email)
+            assert _TOKEN_FILE_RE.match(derived), derived
+            assert "/" not in derived and "\\" not in derived
+
+    def test_no_at_sign_still_safe(self) -> None:
+        derived = derive_token_filename("localonly")
+        assert _TOKEN_FILE_RE.match(derived)
+
+    def test_two_emails_can_collide_to_same_stem(self) -> None:
+        # This is intentional: the duplicate-filename guard catches it.
+        assert derive_token_filename("ajones@example.com") == derive_token_filename(
+            "a.jones@example.com"
+        )
+
+
+class TestBootstrapAutoDerive:
+    def test_token_file_auto_derived_from_email(
+        self, mock_repo: pathlib.Path
+    ) -> None:
+        # EMAIL + KEY only (claude-monitor-style) -> file derived.
+        _write_env(
+            mock_repo,
+            "ACCOUNT_EMAIL_1=alice@example.com\nACCOUNT_KEY_1=sk-1\n",
+        )
+        result = bootstrap_tokens(mock_repo)
+        assert result.written == ["alice-example.token"]
+        tokens_dir = mock_repo / ".loom" / "tokens"
+        assert (tokens_dir / "alice-example.token").read_text() == "sk-1"
+
+    def test_explicit_file_still_wins(self, mock_repo: pathlib.Path) -> None:
+        _write_env(
+            mock_repo,
+            "ACCOUNT_EMAIL_1=alice@example.com\n"
+            "ACCOUNT_KEY_1=sk-1\n"
+            "ACCOUNT_TOKEN_FILE_1=explicit.token\n",
+        )
+        result = bootstrap_tokens(mock_repo)
+        assert result.written == ["explicit.token"]
+
+    def test_derived_collision_aborts(self, mock_repo: pathlib.Path) -> None:
+        # Two distinct emails that sanitize to the same stem must be caught by
+        # the existing duplicate-filename guard, not silently merged.
+        _write_env(
+            mock_repo,
+            "ACCOUNT_EMAIL_1=ajones@example.com\nACCOUNT_KEY_1=sk-1\n"
+            "ACCOUNT_EMAIL_2=a.jones@example.com\nACCOUNT_KEY_2=sk-2\n",
+        )
+        with pytest.raises(ValueError, match="duplicate token filename"):
+            bootstrap_tokens(mock_repo)
+
+
+class TestBackwardCompat3697:
+    """Absent claude-monitor, bootstrap behaves exactly as on #3695."""
+
+    def test_loom_accounts_env_still_honored(
+        self, mock_repo: pathlib.Path, tmp_path: pathlib.Path, monkeypatch
+    ) -> None:
+        master = tmp_path / "master-accounts.env"
+        master.write_text(
+            "ACCOUNT_EMAIL_1=home@example.com\n"
+            "ACCOUNT_KEY_1=hk\n"
+            "ACCOUNT_TOKEN_FILE_1=home.token\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("LOOM_ACCOUNTS_ENV", str(master))
+        result = bootstrap_tokens(mock_repo)
+        assert "home.token" in result.written
+        assert result.home_env == master
+
+    def test_empty_loom_accounts_env_disables_master(
+        self, mock_repo: pathlib.Path, monkeypatch
+    ) -> None:
+        monkeypatch.setenv("LOOM_ACCOUNTS_ENV", "")
+        _write_env(
+            mock_repo,
+            "ACCOUNT_EMAIL_1=a@example.com\n"
+            "ACCOUNT_KEY_1=sk-1\n"
+            "ACCOUNT_TOKEN_FILE_1=a.token\n",
+        )
+        result = bootstrap_tokens(mock_repo)
+        assert result.home_env is None
+        assert result.written == ["a.token"]
+
+    def test_existing_full_triple_setup_unchanged(
+        self, mock_repo: pathlib.Path
+    ) -> None:
+        # A config that bootstrapped fine pre-#3697 (full triples) is untouched.
+        _write_env(
+            mock_repo,
+            "ACCOUNT_EMAIL_1=a@example.com\n"
+            "ACCOUNT_KEY_1=sk-1\n"
+            "ACCOUNT_TOKEN_FILE_1=custom-a.token\n",
+        )
+        result = bootstrap_tokens(mock_repo)
+        assert result.written == ["custom-a.token"]

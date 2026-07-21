@@ -13,6 +13,7 @@ hitting the live API. Covers:
 from __future__ import annotations
 
 import json
+from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -34,6 +35,7 @@ from loom_tools.tokens.check import (
     run_check,
     write_ranking_atomic,
 )
+from loom_tools.tokens.select import select_token
 
 
 # ---------------------------------------------------------------------------
@@ -391,3 +393,167 @@ class TestRunCheck:
     def test_empty_pool_returns_empty_report(self, tmp_path: Path):
         report = run_check(tmp_path, write_ranking=False, stagger=False)
         assert report.accounts == []
+
+
+# ---------------------------------------------------------------------------
+# --source (claude-monitor ranking consumer, #3697)
+# ---------------------------------------------------------------------------
+
+
+def _fresh_iso() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _setup_pool(tmp_path: Path) -> tuple[Path, Path, Path]:
+    """Create a workspace with .loom/tokens/, index.json and .token files.
+
+    Returns (workspace, tokens_dir, monitor_dir).
+    """
+    workspace = tmp_path / "ws"
+    tokens_dir = workspace / ".loom" / "tokens"
+    tokens_dir.mkdir(parents=True)
+    for name in ("acct-a", "acct-b"):
+        (tokens_dir / f"{name}.token").write_text(
+            f"sk-ant-oat01-{name}", encoding="utf-8"
+        )
+    (tokens_dir / "index.json").write_text(
+        json.dumps(
+            {
+                "version": 2,
+                "accounts": [
+                    {"name": "acct-a", "email": "a@example.com", "file": "acct-a.token"},
+                    {"name": "acct-b", "email": "b@example.com", "file": "acct-b.token"},
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    monitor_dir = tmp_path / "cm"
+    monitor_dir.mkdir(parents=True)
+    return workspace, tokens_dir, monitor_dir
+
+
+def _write_monitor_ranking(monitor_dir: Path, accounts: list[dict], *, generated_at=None):
+    (monitor_dir / "ranking.json").write_text(
+        json.dumps(
+            {
+                "schema": 1,
+                "generated_at": generated_at or _fresh_iso(),
+                "accounts": accounts,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+
+class TestSourceMonitor:
+    def test_probe_source_never_touches_monitor(self, tmp_path: Path, monkeypatch):
+        """--source probe ignores claude-monitor and probes (unchanged path)."""
+        workspace, tokens_dir, monitor_dir = _setup_pool(tmp_path)
+        monkeypatch.setenv("LOOM_CLAUDE_MONITOR_DIR", str(monitor_dir))
+        _write_monitor_ranking(
+            monitor_dir,
+            [{"email": "a@example.com", "status": "available",
+              "utilization": {"5h": 0.1, "7d": 0.1}}],
+        )
+        with patch(
+            "requests.post",
+            return_value=_mock_response(200, _good_headers(s7d=0.20)),
+        ) as post:
+            run_check(
+                tokens_dir, source="probe", write_ranking=True, stagger=False
+            )
+        # It probed (network call made) and wrote JSON, not pipe.
+        assert post.called
+        data = json.loads((tokens_dir / ".ranking").read_text())
+        assert "accounts" in data
+
+    def test_monitor_source_writes_pipe_format(self, tmp_path: Path, monkeypatch):
+        workspace, tokens_dir, monitor_dir = _setup_pool(tmp_path)
+        monkeypatch.setenv("LOOM_CLAUDE_MONITOR_DIR", str(monitor_dir))
+        _write_monitor_ranking(
+            monitor_dir,
+            [
+                {"email": "b@example.com", "status": "available",
+                 "utilization": {"5h": 0.1, "7d": 0.9}},
+                {"email": "a@example.com", "status": "available",
+                 "utilization": {"5h": 0.1, "7d": 0.1}},
+            ],
+        )
+        with patch("requests.post") as post:
+            run_check(
+                tokens_dir, source="monitor", write_ranking=True, stagger=False
+            )
+        assert not post.called  # monitor path never probes
+        text = (tokens_dir / ".ranking").read_text()
+        # pipe format, ordered by util_7d ascending (a before b)
+        assert text == "acct-a|available\nacct-b|available\n"
+
+    def test_monitor_source_no_data_returns_empty_no_probe(
+        self, tmp_path: Path, monkeypatch
+    ):
+        workspace, tokens_dir, monitor_dir = _setup_pool(tmp_path)
+        monkeypatch.setenv("LOOM_CLAUDE_MONITOR_DIR", str(monitor_dir))
+        # No ranking.json in monitor_dir.
+        with patch("requests.post") as post:
+            report = run_check(
+                tokens_dir, source="monitor", write_ranking=True, stagger=False
+            )
+        assert not post.called
+        assert report.accounts == []
+        # No .ranking written (nothing to rank).
+        assert not (tokens_dir / ".ranking").exists()
+
+    def test_auto_uses_monitor_when_fresh(self, tmp_path: Path, monkeypatch):
+        workspace, tokens_dir, monitor_dir = _setup_pool(tmp_path)
+        monkeypatch.setenv("LOOM_CLAUDE_MONITOR_DIR", str(monitor_dir))
+        _write_monitor_ranking(
+            monitor_dir,
+            [{"email": "a@example.com", "status": "available",
+              "utilization": {"5h": 0.1, "7d": 0.1}}],
+        )
+        with patch("requests.post") as post:
+            run_check(tokens_dir, source="auto", write_ranking=True, stagger=False)
+        assert not post.called
+        text = (tokens_dir / ".ranking").read_text()
+        assert "acct-a|available" in text
+
+    def test_auto_falls_back_to_probe_when_absent(self, tmp_path: Path, monkeypatch):
+        workspace, tokens_dir, monitor_dir = _setup_pool(tmp_path)
+        # Point at an empty monitor dir (no ranking.json).
+        monkeypatch.setenv("LOOM_CLAUDE_MONITOR_DIR", str(monitor_dir))
+        with patch(
+            "requests.post",
+            return_value=_mock_response(200, _good_headers(s7d=0.20)),
+        ) as post:
+            run_check(tokens_dir, source="auto", write_ranking=True, stagger=False)
+        assert post.called  # fell back to probing
+        # Probe path writes JSON.
+        data = json.loads((tokens_dir / ".ranking").read_text())
+        assert "accounts" in data
+
+    def test_roundtrip_monitor_output_read_by_selector(
+        self, tmp_path: Path, monkeypatch
+    ):
+        """The .ranking emitted by the monitor path is consumed by select_token.
+
+        This is the format-of-record proof: select.py:_read_ranking parses
+        pipe-delimited name|status, so the monitor writer must emit that.
+        """
+        workspace, tokens_dir, monitor_dir = _setup_pool(tmp_path)
+        monkeypatch.setenv("LOOM_CLAUDE_MONITOR_DIR", str(monitor_dir))
+        # acct-b exhausted, acct-a available -> selector must pick acct-a.
+        _write_monitor_ranking(
+            monitor_dir,
+            [
+                {"email": "b@example.com", "status": "exhausted",
+                 "utilization": {"5h": 0.99, "7d": 0.99}},
+                {"email": "a@example.com", "status": "available",
+                 "utilization": {"5h": 0.1, "7d": 0.1}},
+            ],
+        )
+        run_check(tokens_dir, source="monitor", write_ranking=True, stagger=False)
+
+        selected = select_token(workspace)
+        assert selected.mode == "ranked"
+        assert selected.name == "acct-a"
