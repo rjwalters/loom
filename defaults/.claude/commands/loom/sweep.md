@@ -855,6 +855,7 @@ Apply exactly one of the three branches below, based on the PR's current label:
 
 - Load and follow the instructions in `.claude/commands/loom/judge.md` for this PR.
 - Dispatch `loom-judge` as a **single subagent Task** from this orchestrator session. Do **NOT** invoke `/shepherd` or `/judge` slash-commands as subagents — see "CRITICAL: One level deep" in the Execution Model.
+- If a previous Judge attempt for this PR died mid-flight without a fresh checkpoint (rate limit, crash), re-verify forge state and complete only the missing steps before re-dispatching — see "Mid-phase-death recovery" in the Wave Lifecycle (the rule is phase-generic; Mode C inherits it, same as the Doctor-cycle cap).
 - Expected exit states:
   - **Approve** → PR labeled `loom:pr` by Judge. If a closing-issue checkpoint is in scope, write `judge-done`:
     ```bash
@@ -870,6 +871,7 @@ If the PR entered the wave already labeled `loom:changes-requested` (e.g., from 
 
 - Load and follow the instructions in `.claude/commands/loom/doctor.md` for this PR.
 - Dispatch `loom-doctor` as a **single subagent Task** from this orchestrator session. Do **NOT** invoke `/shepherd` or `/doctor` slash-commands as subagents — see "CRITICAL: One level deep".
+- If a previous Doctor attempt for this PR died mid-flight without a fresh `doctor-done` checkpoint (rate limit, crash), re-verify forge state (pushed commit? already re-labeled `loom:review-requested`?) and complete only the missing steps rather than duplicating the pushed fix — see "Mid-phase-death recovery" in the Wave Lifecycle (inherited here, same as the Doctor-cycle cap).
 - **Model escalation (#3481)**: Mode C inherits the issue-side rule unchanged — this Doctor is dispatched because of a `loom:changes-requested` rejection, so resolve its model per "Model escalation on Judge rejection" in the Execution Model: pass `ladder[1]` from `sweep.escalation` (default ladder: `opus`) via the Task tool's `model` parameter, **unless** a tier-1/tier-2 pin applies (pins win) or escalation is disabled (`[]`/`false`).
 - Doctor addresses the judge feedback, commits the fixes, pushes, and re-labels the PR `loom:review-requested`.
 - If a closing-issue checkpoint is in scope, write `doctor-done` (with the attempt counter and the model the Doctor actually ran on — escalated or pinned, #3482) **before** the follow-up Judge:
@@ -925,11 +927,15 @@ When the entire PR list has been processed, print a per-PR summary:
   PR #200  → merged                                                                  [judged, merged]
   PR #201  → blocked (judge requested changes after doctor cycle exhausted)          [judged, doctor, judged]
   PR #202  → merged  (was already loom:pr; no judge or doctor)                       [merge-only]
+  PR #205  → merged  (rate-limited (resumed: doctor TOKEN_EXHAUSTED mid-phase — fix already pushed, re-labeled + re-judged))  [judged, doctor, judged, merged]
+  PR #206  → rate-limited (unresumable: judge TOKEN_EXPIRED mid-phase, human attention required)  [judged]
   PR #203  → skipped (no actionable label)                                           [pre-flight skip]
   PR #204  → skipped (PR already merged)                                             [pre-flight skip]
 
-Total: 2 merged, 1 blocked, 2 skipped.
+Total: 3 merged, 1 blocked, 2 skipped, 1 rate-limited (unresumable).
 ```
+
+`rate-limited (...)` here carries the same meaning as in the issue-set Summary Output (see "`rate-limited` vs `blocked`" there): the reason reuses `TOKEN_EXPIRED` / `TOKEN_EXHAUSTED` from `.loom/scripts/lib/classify-error.sh`, a `resumed:` outcome already succeeded via mid-phase-death recovery, and only an `unresumable:` outcome needs a human — distinct from `blocked (...)`, which means the work itself failed.
 
 ## Wave Lifecycle (Modes A and B only — issue-set)
 
@@ -962,6 +968,21 @@ Sweep persists a per-issue phase checkpoint after each successful lifecycle phas
 - **Scope limit (no mid-builder recovery)**: A kill during the Builder phase resumes at *builder start* — the worktree state and partial diff survive, but sweep does not inspect the diff or attempt to resume mid-edit. This is intentional per #3372/#3373.
 
 The skip rules per `phase` value are documented inline in each step below.
+
+#### Mid-phase-death recovery (rate limit or crash, issue #3683)
+
+A checkpoint is written only after a phase *completes* (see "Write timing"), so a subagent that is killed mid-phase — an account-level rate-limit kill (`TOKEN_EXPIRED` / `TOKEN_EXHAUSTED`, the same vocabulary `.loom/scripts/lib/classify-error.sh` uses), a crash, an API error, or any other abnormal termination — leaves **no fresh checkpoint** even though it may already have pushed a commit, moved a label, or posted a comment. When you resume a **Judge, Doctor, or Merge** phase whose subagent was not observed to exit cleanly and no new checkpoint was written for it, **do not assume no work happened, and do not blindly re-run the whole phase.**
+
+Instead, before re-dispatching anything for that phase, **re-verify the PR's actual forge state against that phase's already-documented "Expected exit state(s)"** (Judge: step 5's Approve / Request-changes bullets; Doctor: step 6's push → relabel → re-Judge sequence; Merge: step 7's merge-then-checkpoint-delete). Specifically check:
+
+- whether a **new commit** landed on the PR branch since the checkpoint's timestamp (`gh pr view <PR> --json commits`, or `git log <checkpoint-ts>..`),
+- whether the **PR label** already reflects a later state than the checkpoint implies (e.g. `loom:review-requested` after a Doctor, or `loom:pr` after a Judge approval), and
+- whether there are **PR comments** from the dead subagent describing work it already completed.
+
+Then **complete only the missing steps** to reach that phase's expected exit state — never redo steps that already landed. Example (the exact #3676 incident this rule is drawn from): a Doctor pushed its fix but was rate-limit-killed before re-labeling `loom:changes-requested` → `loom:review-requested` and handing back to Judge. The correct recovery is to re-label and re-run Judge — **not** to dispatch a fresh Doctor that would duplicate the already-pushed commit.
+
+- **Builder is exempt — unchanged.** This rule covers Judge / Doctor / Merge only. The Builder's "Scope limit (no mid-builder recovery)" above stands as-is: a Builder kill intentionally resumes from *builder start* and relies on `worktree.sh` idempotency for the builder to decide whether to commit / amend / discard its partial diff. Do not apply the forge-state-reverification rule to Builder.
+- **Should-prefer (optional): resume the same subagent when the parent survives.** When the **orchestrator's own session** is still alive and the dead phase's Task-tool subagent conversation is still resumable (e.g. via `SendMessage` back into that same subagent thread rather than a brand-new Task dispatch), prefer that path — the original subagent already knows exactly what it committed / pushed / labeled, which is strictly more context than a fresh subagent re-deriving intent from a partial diff. This is a preference, not a requirement: an account-level rate-limit kill often takes the whole process (parent included) down, in which case no resumable thread exists. The mandatory forge-state-reverification rule above must **never** depend on this being available.
 
 #### Stale-checkpoint cleanup
 
@@ -1134,6 +1155,7 @@ post_wave_integration_gate()                    # step 8 — buildGate-against-m
 
 - Load and follow the instructions in `.claude/commands/loom/judge.md` for the PR.
 - The judge uses `gh pr comment` (NOT `gh pr review --approve`) because GitHub's self-review API restriction applies — see `judge.md` for the full explanation.
+- **If a previous Judge attempt for this PR died mid-flight without writing a fresh checkpoint** (rate limit, crash), re-verify forge state and complete only the missing steps before re-dispatching — see "Mid-phase-death recovery" above.
 - Expected exit states per PR:
   - **Approve** → PR labeled `loom:pr`. Write the `judge-done` checkpoint for this issue (carrying the PR number), then continue to Merge (step 7) for this PR, then advance to the next PR in the wave.
     ```bash
@@ -1149,6 +1171,7 @@ post_wave_integration_gate()                    # step 8 — buildGate-against-m
 If Judge requests changes on PR `#X` mid-wave, run inline Doctor→Judge cycles for `#X` — **up to `sweep.max_doctor_cycles`** (default 1; see "Doctor-cycle cap" in the Execution Model) — before moving to the next PR's Judge:
 
 - Load and follow the instructions in `.claude/commands/loom/doctor.md` for PR `#X`.
+- **If a previous Doctor attempt for `#X` died mid-flight without writing a fresh `doctor-done` checkpoint** (rate limit, crash — the #3676 shape), re-verify forge state (pushed commit? already re-labeled `loom:review-requested`?) and complete only the missing steps rather than dispatching a fresh Doctor that would duplicate the pushed fix — see "Mid-phase-death recovery" above.
 - **Model escalation (#3481)**: this Doctor is dispatched because of a Judge rejection, so resolve its model per "Model escalation on Judge rejection" in the Execution Model — pass `ladder[min(attempt - 1, len - 1)]` from `sweep.escalation` (cycle 1 → `ladder[1]`, default `opus`) via the Task tool's `model` parameter, **unless** a tier-1/tier-2 pin applies (pins win) or escalation is disabled (`[]`/`false`).
 - Doctor addresses the judge's feedback, commits the fixes, and pushes.
 - **On successful Doctor completion**, write the `doctor-done` checkpoint for the issue (carrying the PR number, the attempt counter, and the model the Doctor actually ran on — escalated or pinned, #3482) **before** re-invoking Judge:
@@ -1194,6 +1217,8 @@ Use the dedicated merge script (CLAUDE.md "Merging PRs" mandate — never `gh pr
 
 The script merges via the forge API and cleans up the worktree. `--auto` enables GitHub's server-side auto-merge queue (queues the merge until required checks pass); on PRs that are already in `CLEAN` state (fast CI), the script transparently falls back to an immediate merge — see #3371.
 
+**If a previous Merge attempt for this PR died mid-flight without deleting the checkpoint** (rate limit, crash between `merge-pr.sh` success and the delete call), re-verify forge state first: if the PR is already **merged**, just delete the stale checkpoint — do **not** re-run the merge. See "Mid-phase-death recovery" above. (The step 1 stale-checkpoint cleanup is the belt-and-suspenders backstop for this.)
+
 **On successful merge** (script returns 0), add `#X`'s changed-file paths to `WAVE_MERGED_FILES` (so the next PR's overlap probe sees them), then delete the issue's sweep checkpoint:
 ```bash
 ./.loom/scripts/sweep-checkpoint.sh delete N
@@ -1228,14 +1253,18 @@ When the entire list has been processed, print a summary table that includes wav
   #125  → skipped (already in flight: loom:building)                     [wave 1]
   #126  → blocked (builder failed: build error)                          [wave 2]
   #127  → merged  (PR #459)                                              [wave 2]
+  #128  → merged  (PR #460; rate-limited (resumed: doctor TOKEN_EXHAUSTED mid-phase — fix already pushed, re-labeled + re-judged))  [wave 2]
+  #129  → rate-limited (unresumable: judge TOKEN_EXPIRED mid-phase, human attention required)  [wave 2]
   #199  → routed  (existing PR #200, judged in this wave)                [wave 2]
   #198  → merged  (existing PR #201, was loom:pr)                        [wave 2]
   #197  → skipped (multiple open PRs reference issue: #210, #211)        [wave 2]
 
-Total: 4 merged, 2 blocked, 2 skipped.
+Total: 5 merged, 2 blocked, 2 skipped, 1 rate-limited (unresumable).
 ```
 
 Wave annotation makes it easier to triage failures (e.g., "every issue in wave 2 failed → probably a base-branch problem, not the issues themselves").
+
+**`rate-limited` vs `blocked` (issue #3683).** These are semantically distinct — reuse the `TOKEN_EXPIRED` / `TOKEN_EXHAUSTED` vocabulary from `.loom/scripts/lib/classify-error.sh` for the reason. `blocked (...)` means the **work itself** failed (build error, doctor cycle exhausted) and a human must fix the actual problem. `rate-limited (...)` means only that a role subagent was killed by an account rate limit mid-phase, so an **extra orchestrator pass** was needed to reach the phase's expected exit state — it says nothing about work quality. A `rate-limited (resumed: <what completed>)` outcome already succeeded (the mid-phase-death recovery finished the missing steps); only a `rate-limited (unresumable: ...)` outcome — where the forge state cannot be recovered without human help — needs attention.
 
 ## Stop Conditions
 
