@@ -116,7 +116,7 @@ Combine flags as needed. Always pass `--state open` explicitly (Mode C operates 
 
 ### Optional flags
 
-- **`--builders-per-wave N`** — dispatch up to `N` builders in parallel per wave. When **omitted**, the wave size is `auto` — resolved at Stage -1 from the chosen backend and scratch-volume disk headroom (see "Resolve auto wave size"): the daemon detached-process path targets up to 10 concurrent sweeps, while the in-session subagent path stays at the #3289-safe ceiling of 3. When **present**, `N` must be an integer `>= 1` and the explicit value overrides auto entirely (operator wins). Honoured in Modes A and B (issue-side); **silently ignored in Mode C** (PR-set mode has no Builder phase — see Mode C validation rules above). Flag tokens are stripped before classification.
+- **`--builders-per-wave N`** — dispatch up to `N` builders in parallel per wave. When **omitted**, the wave size is `auto` — resolved at Stage -1 from the chosen backend and scratch-volume disk headroom (see "Resolve auto wave size"): the daemon detached-process path targets up to 10 concurrent sweeps, while the in-session subagent path core-scales within the #3289-safe `[3, 6]` band (`clamp(floor((cores-2)/4), 3, 6)`, #3693). When **present**, `N` must be an integer `>= 1` and the explicit value overrides auto entirely (operator wins). Honoured in Modes A and B (issue-side); **silently ignored in Mode C** (PR-set mode has no Builder phase — see Mode C validation rules above). Flag tokens are stripped before classification.
 - **`--dry-run`** — print the planned candidate list (with wave grouping) and EXIT without performing any mutation. Recognized as a bare flag token (no value). May appear anywhere in `$ARGUMENTS`. Default is off. Honoured in **all three** modes — stripped before classification along with other flags. Mode C dry-run prints the PR-set plan (per-PR routing) instead of the issue-set plan.
 - **`--prs`** — switch into Mode C (PR-set mode). Recognized as a bare flag token (no value). May appear anywhere in `$ARGUMENTS`. Default is off. When present, non-flag tokens are interpreted as **PR numbers** (numeric tokens) or as a **PR-list description** (NL tokens). When absent, an NL trigger phrase listed in the Mode C section can still select Mode C. See "Mode C" above for full semantics.
 - **`--no-daemon`** — force in-process subagent dispatch even when the daemon is running with a multi-account token pool. Recognized as a bare flag token (no value). May appear anywhere in `$ARGUMENTS`. Default is off. When present, **Stage -1 (Backend detection) skips the `PROBE_DAEMON` step entirely** and the skill always falls through to the existing Mode A/B/C subagent dispatch path. Honoured in **all three** modes — stripped before classification along with other flags. Use this when you want the predictable single-process behaviour even though daemon dispatch is available (e.g., debugging, demoing the subagent path, or running under a token configuration that you don't want shared with daemon-spawned sweeps). See "Stage -1: Backend detection" below.
@@ -206,7 +206,7 @@ Combine flags as needed. Always pass `--state open` explicitly (Mode C operates 
   - **Absent flag → `auto`.** When the operator did not pass `--builders-per-wave`, `BUILDERS_PER_WAVE=auto`; skip the integer validation below and resolve the concrete size at Stage -1 ("Resolve auto wave size"). The rules below apply **only** when an explicit value was passed — an explicit integer always overrides auto and is validated verbatim as before.
   - Parse `N` as an integer. Reject non-integer values with a clear error and EXIT.
   - Reject `N < 1` (including `0` and negative values) with: `Error: --builders-per-wave must be >= 1 (got: <N>)` and EXIT. Do **not** silently default to `1`.
-  - If `N > 3`, print a warning and continue: `WARNING: --builders-per-wave=<N> is unvalidated. N<=3 is recommended; N>=4 may exhaust context or hit rate limits. Proceeding at your own risk.`
+  - If `N > 6`, print a warning and continue: `WARNING: --builders-per-wave=<N> is unvalidated. N<=6 is recommended; N>=7 may exhaust context or hit rate limits. Proceeding at your own risk.`
   - If `N` exceeds the number of candidates at any wave, **silently clamp** to the candidate count for that wave. Do not warn, do not stall.
 - **`--no-daemon` validation:**
   - Bare flag, no value. If a value is supplied (`--no-daemon=true`, `--no-daemon something`), treat the `=value` form as an error and EXIT (`Error: --no-daemon takes no value`). The standalone-token form is the only accepted spelling.
@@ -217,13 +217,14 @@ Combine flags as needed. Always pass `--state open` explicitly (Mode C operates 
 
 | `N` | Status |
 |-----|--------|
-| `auto` | **Default** (flag omitted). Resolved at Stage -1 from the backend + scratch-volume disk headroom: daemon detached-process path targets up to 10; in-session subagent path caps at 3. Clamped by candidate count and disk, floor 1. See "Resolve auto wave size". |
+| `auto` | **Default** (flag omitted). Resolved at Stage -1 from the backend + scratch-volume disk headroom: daemon detached-process path targets up to 10; in-session subagent path **core-scales** in `[3, 6]` via `clamp(floor((cores-2)/4), 3, 6)` (#3693). Clamped by candidate count and disk, floor 1. See "Resolve auto wave size". |
 | `1` | Fully sequential (MVP-compatible). Explicit override of `auto`. |
 | `2` | **Recommended** explicit starting point for parallel subagent waves. |
-| `3` | Tested and validated. The #3289-safe ceiling for the **subagent** path. |
-| `>= 4` | Unvalidated **for the subagent path**. Warns at parse time. Operator discretion. |
+| `3` | Tested and validated. The #3289-safe **floor** for the **subagent** path — the default auto-resolved target now scales with cores up to 6. |
+| `4`–`6` | Evidence-supported for the **subagent** path on multi-core hosts (#3693); reached automatically by the core-scaled `auto` default. Operator discretion via explicit override. |
+| `>= 7` | Unvalidated **for the subagent path**. Warns at parse time. Operator discretion. |
 
-The subagent-path cap is **soft** — there is no hard upper bound and the warning is the only guard. It is capped at 3 because the subagent path dispatches builders one level deep and is bounded by the #3289 nested-dispatch stall (see "CRITICAL: One level deep"). High parallelism toward 10 is reached **only** via the daemon detached-process path (`mcp__loom__dispatch_sweep`), where each sweep is an isolated OS process — not a nested subagent — so #3289 does not apply. Never raise the subagent number toward 10; route through the daemon instead.
+The subagent-path target is **soft** — there is no hard upper bound and the warning is the only guard. Its auto default core-scales within `[3, 6]` (floor 3 on small/shared hosts, ceiling 6 on big ones). The `[3, 6]` band is a **width** decision: at one level deep, width is bounded by the harness concurrency cap (`min(16, cores-2)`), not by #3289. The #3289 nested-dispatch stall is specifically about parallel *grandchildren* (`parent → /shepherd → builder`), which `/sweep` never does — it dispatches builders directly, one level deep (see "CRITICAL: One level deep"). The ceiling stays 6 (not 8/10) because single-account rate-limit burn and orchestrator context-window pressure (every wave member's Task result is read back into the same session) both bind before #3289 does. High parallelism toward 10 is reached **only** via the daemon detached-process path (`mcp__loom__dispatch_sweep`), where each sweep is an isolated OS process — not a nested subagent. Never raise the subagent ceiling toward 10; route through the daemon instead.
 
 ## Examples
 
@@ -358,7 +359,7 @@ The subagent-path cap is **soft** — there is no hard upper bound and the warni
 
 `/sweep` processes the candidate list in **waves**:
 
-- **Mode A/B (issue-set)**: the candidate list is partitioned into waves of up to `N = --builders-per-wave` issues, where an omitted flag resolves to the Stage -1 auto wave size (see "Resolve auto wave size" — up to 10 on the daemon path, capped at 3 on the subagent path, disk-clamped). Issues are picked into waves in order. Within a wave, builders are dispatched in parallel; across waves, processing is sequential. Each wave fully settles (all builders → per-PR Judge → optional Doctor → merge) before the next wave starts.
+- **Mode A/B (issue-set)**: the candidate list is partitioned into waves of up to `N = --builders-per-wave` issues, where an omitted flag resolves to the Stage -1 auto wave size (see "Resolve auto wave size" — up to 10 on the daemon path, core-scaled within `[3, 6]` on the subagent path, disk-clamped). Issues are picked into waves in order. Within a wave, builders are dispatched in parallel; across waves, processing is sequential. Each wave fully settles (all builders → per-PR Judge → optional Doctor → merge) before the next wave starts.
 - **Mode C (PR-set)**: the candidate list is processed in **size-1 waves** (one PR per wave). `--builders-per-wave` is ignored because there is no Builder phase. Each PR is routed per its current label (Judge / Doctor→Judge / Merge — see "PR-set Wave Lifecycle" below) and fully settles before the next PR is touched. Sequential per-PR processing matches the load-bearing #3289 sequencing rule and parallels the issue-side "per-PR Judge is sequential within a wave" policy.
 
 ### CRITICAL: One level deep — never spawn `/shepherd` as a subagent
@@ -568,7 +569,13 @@ if [[ "$DECIDE" == use_daemon ]]; then
     # rotated token. NOT nested subagents, so #3289 does not apply — scale to 10.
     MECH=daemon;   MECHANISM="daemon detached-process"
 else  # use_subagent (no daemon, single-token pool, --no-daemon, or Mode C)
-    # In-session Task subagents, one level deep. Bounded by #3289 — cap 3.
+    # In-session Task subagents, one level deep. WIDTH is bounded by the harness
+    # concurrency cap (min(16, cores-2)), NOT by #3289 (which is a nesting rule,
+    # not a width rule). Core-scale the subagent target within [3, 6] via
+    # loom_subagent_target_from_cores (#3693); an operator-set LOOM_SUBAGENT_WAVE_CAP
+    # always wins (the `:=` only fills an unset/empty value).
+    : "${LOOM_SUBAGENT_WAVE_CAP:=$(loom_subagent_target_from_cores "$(loom_detect_cores)")}"
+    export LOOM_SUBAGENT_WAVE_CAP
     MECH=subagent; MECHANISM="in-session subagent"
 fi
 # The helper prints two lines: size on line 1, reason token on line 2.
@@ -576,20 +583,20 @@ mapfile -t _WS < <(loom_wave_size_from_disk "$MECH" "$CAND" "$FREE_GB")
 WAVE_SIZE="${_WS[0]}"; REASON="${_WS[1]}"
 ```
 
-`loom_wave_size_from_disk` prints two lines — the clamped size `K = min(target, floor(free_gb / LOOM_PER_WORKTREE_GB), CAND)` with a floor of 1 (never 0, even on a full disk) on line 1, and a machine reason token (`target` / `candidates` / `disk` / `floor`) on line 2. `LOOM_PER_WORKTREE_GB` defaults to a conservative 2 GB and is env-overridable for large-repo operators. The target is **10** for the daemon path and **3** for the subagent path.
+`loom_wave_size_from_disk` prints two lines — the clamped size `K = min(target, floor(free_gb / LOOM_PER_WORKTREE_GB), CAND)` with a floor of 1 (never 0, even on a full disk) on line 1, and a machine reason token (`target` / `candidates` / `disk` / `floor`) on line 2. `LOOM_PER_WORKTREE_GB` defaults to a conservative 2 GB and is env-overridable for large-repo operators. The target is **10** for the daemon path; for the subagent path it is the **core-scaled** `clamp(floor((cores-2)/4), 3, 6)` (#3693) — resolved into `LOOM_SUBAGENT_WAVE_CAP` just above via `loom_subagent_target_from_cores` / `loom_detect_cores`, floor 3 on small/shared hosts, ceiling 6 on big ones — and an operator-set `LOOM_SUBAGENT_WAVE_CAP` env value always overrides it.
 
 **Emit a one-line reason** so the operator understands any reduction. Map the reason token to a human sentence, adding the backend-specific context:
 
 | `DECIDE` / reason | One-line log |
 |-------------------|--------------|
 | `use_daemon`, `target` | `wave size 10, mechanism=daemon: daemon + multi-account pool → detached-process path (target 10)` |
-| `use_subagent`, `target`, daemon not reachable | `wave size 3, mechanism=subagent: daemon not reachable → subagent path (cap 3)` |
-| `use_subagent`, `target`, no pool | `wave size 3, mechanism=subagent: single-token pool → subagent path (cap 3)` |
+| `use_subagent`, `target`, daemon not reachable | `wave size K, mechanism=subagent: daemon not reachable → subagent path (core-scaled target K, floor 3, ceiling 6)` |
+| `use_subagent`, `target`, no pool | `wave size K, mechanism=subagent: single-token pool → subagent path (core-scaled target K, floor 3, ceiling 6)` |
 | any, `candidates` | `wave size K, mechanism=<m>: reduced to K (only K candidate issues)` |
 | any, `disk` | `wave size K, mechanism=<m>: reduced to K (only <FREE_GB> GB free on <worktree-root>)` |
 | any, `floor` | `wave size 1, mechanism=<m>: reduced to 1 (only <FREE_GB> GB free on <worktree-root>)` |
 
-The resolved `WAVE_SIZE` replaces `--builders-per-wave` everywhere the wave-partition consumers below reference it. On the **daemon path** `WAVE_SIZE` is the concurrency **target** the operator should expect (and that `--dry-run` reports) — the daemon runs each candidate as an independent detached process, so it is not a hard in-session partition. On the **subagent path** `WAVE_SIZE` is the literal wave partition size feeding the `min(...)` dispatch expression in the Wave Lifecycle. In both cases, **never raise the subagent number toward 10** — that is the #3289 line the daemon path exists to route around.
+The resolved `WAVE_SIZE` replaces `--builders-per-wave` everywhere the wave-partition consumers below reference it. On the **daemon path** `WAVE_SIZE` is the concurrency **target** the operator should expect (and that `--dry-run` reports) — the daemon runs each candidate as an independent detached process, so it is not a hard in-session partition. On the **subagent path** `WAVE_SIZE` is the literal wave partition size feeding the `min(...)` dispatch expression in the Wave Lifecycle. In both cases, **never raise the subagent ceiling toward 10** — the subagent auto default core-scales within `[3, 6]` (#3693), and true high parallelism toward 10 is the daemon path's job. (This is a width ceiling; the #3289 "one level deep" nesting rule is a separate, unchanged constraint the daemon path exists to route around.)
 
 ### The daemon-dispatch path (when `DECIDE = use_daemon`)
 
@@ -652,8 +659,9 @@ These are the AC #3 and AC #4 contracts, written for the operator.
 #   1. Stage -1 runs: PROBE_MODE=A, PROBE_DAEMON or PROBE_POOL is false.
 #   2. DECIDE = use_subagent.
 #   3. Skill continues to "0. Dry-run gate" → "Resolve auto wave size" → "Wave Lifecycle".
-#   4. Auto wave size resolves to the subagent path (cap 3, disk-clamped): both
-#      issues land in one wave of 2 (or fewer if the scratch volume is tight).
+#   4. Auto wave size resolves to the subagent path (core-scaled target in [3,6],
+#      candidate- and disk-clamped): both issues land in one wave of 2 (clamped
+#      to the candidate count, or fewer if the scratch volume is tight).
 #   5. Each issue runs Curator→Builder→Judge→Doctor→Merge in-session.
 #      (Pass an explicit --builders-per-wave 1 to force the old fully-sequential behaviour.)
 #   6. Skill exits when both issues have settled (potentially many minutes).
@@ -1095,7 +1103,7 @@ If `CHECKPOINT_PHASE` is `judge-done` or `doctor-done`, see the corresponding sk
 
 For issues without `builder-done`-or-later checkpoints, proceed with the normal Builder dispatch:
 
-Dispatch up to `min(resolved-wave-size, surviving-candidates-in-wave-needing-builder)` `loom-builder` subagents **in a single tool-call block** from this orchestrator session, where `resolved-wave-size` is the explicit `--builders-per-wave` value or, when the flag was omitted, the Stage -1 auto wave size ("Resolve auto wave size"). Note this Wave Lifecycle is the **subagent** path, so the auto size here is capped at 3 (#3289-safe) — the daemon path never runs this section (it dispatches detached processes and exits at Stage -1). **Do NOT invoke `/shepherd` as a subagent here** — see the "One level deep" rule in Execution Model above.
+Dispatch up to `min(resolved-wave-size, surviving-candidates-in-wave-needing-builder)` `loom-builder` subagents **in a single tool-call block** from this orchestrator session, where `resolved-wave-size` is the explicit `--builders-per-wave` value or, when the flag was omitted, the Stage -1 auto wave size ("Resolve auto wave size"). Note this Wave Lifecycle is the **subagent** path, so the auto size here is core-scaled within `[3, 6]` (#3289-safe floor 3, ceiling 6, #3693) — the daemon path never runs this section (it dispatches detached processes and exits at Stage -1). **Do NOT invoke `/shepherd` as a subagent here** — see the "One level deep" rule in Execution Model above.
 
 Each builder is responsible for:
 
@@ -1332,7 +1340,7 @@ The full `/sweep` design in #3298 includes many features that are intentionally 
 
 | Feature | Status | Notes |
 |---------|--------|-------|
-| Parallel waves (`--builders-per-wave N`) | **Implemented (#3316, auto default #3566)** | Omitted flag resolves to an auto wave size at Stage -1 (#3566): up to 10 on the daemon detached-process path, capped at 3 on the in-session subagent path. The N=3 soft cap is **subagent-path-specific** (the #3289 nested-dispatch ceiling — warns above on explicit override); the daemon path scales to 10 because each sweep is an isolated process, not a nested subagent. One level deep — no `/shepherd` subagent. Issue-side only; ignored in Mode C. |
+| Parallel waves (`--builders-per-wave N`) | **Implemented (#3316, auto default #3566, core-scaled #3693)** | Omitted flag resolves to an auto wave size at Stage -1 (#3566): up to 10 on the daemon detached-process path, core-scaled within `[3, 6]` (`clamp(floor((cores-2)/4), 3, 6)`, #3693) on the in-session subagent path. The `[3, 6]` band is **subagent-path-specific** (floor 3 is the #3289-safe validated minimum, ceiling 6 keeps a margin below single-account rate-limit burn and orchestrator context pressure — warns above only on explicit override `>= 7`); the daemon path scales to 10 because each sweep is an isolated process, not a nested subagent. This is a **width** knob — the #3289 "one level deep" nesting rule is unchanged: no `/shepherd` subagent. Issue-side only; ignored in Mode C. |
 | Natural-language selectors (label/author/title/time-window filters via NL description) | **Implemented (#3318)** | Mode B in Arguments. Out-of-band queries (body/diff inspection, file-touch filters) still trigger clarification. |
 | Build-everything sentinel (`/sweep all`) | **Implemented (#3568; aggressive whole-backlog redefinition)** | Bare, sole `all` token (case-insensitive) resolves **every** open issue via `gh issue list --state open` (no label filter) and aggressively drives each toward a merged PR: curates uncurated/`loom:triage`/`loom:curating` issues, reclaims stale `loom:building` claims (one-time `recover-orphaned-shepherds.sh --recover` pass + `updatedAt` staleness), probes `loom:blocked` for a cleared blocker, fans `loom:epic` out to its `loom:epic-phase` children, and routes existing open PRs to Judge/Doctor/Merge via the #3359 probe (which takes precedence). Only `loom:operator-only` is hard-skipped. `all --prs` resolves every open PR (Mode C C0 filters non-actionable). Mandatory confirmation gate; `--dry-run` / `--builders-per-wave` / `--no-daemon` compose unchanged (recovery pass skipped under `--dry-run`). Multi-token `all …` phrases still route to Mode B/C. |
 | `--dry-run` | **Implemented (#3319, extended in #3384)** | Prints the candidate plan (with wave grouping) and exits without mutating labels, worktrees, or PRs. Issue-set (Modes A/B) and PR-set (Mode C) output formats. |
