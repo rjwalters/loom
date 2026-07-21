@@ -904,7 +904,7 @@ If setup fails, it's usually due to:
 
 Loom ships with two built-in Bash `PreToolUse` guard hooks, both registered under the `Bash` matcher and firing independently:
 
-- **`guard-destructive.sh`** — the generic repository-hygiene guard: catastrophic denies (`rm -rf /`, force-push to `main`, `gh repo delete`, fork bombs, curl-pipe-to-shell, cloud/SQL destruction), the segment-parsed lifecycle/cloud-CLI checks, and the `guards.sqlDdl` / `guards.cloudCli` / `guards.rmScope` toggle machinery. Nothing about this guard is Loom-specific; it is slated to move to Repo Skills (companion issue [rjwalters/repo#13](https://github.com/rjwalters/repo/issues/13)), which will own the generic half once it ships. Until then it keeps shipping and working in Loom exactly as before.
+- **`guard-destructive.sh`** — the generic repository-hygiene guard: catastrophic denies (`rm -rf /`, force-push to `main`, `gh repo delete`, fork bombs, curl-pipe-to-shell, cloud/SQL destruction), the segment-parsed lifecycle/cloud-CLI checks, and the `guards.sqlDdl` / `guards.cloudCli` / `guards.rmScope` / `guards.forceScope` toggle machinery. Nothing about this guard is Loom-specific; it is slated to move to Repo Skills (companion issue [rjwalters/repo#13](https://github.com/rjwalters/repo/issues/13)), which will own the generic half once it ships. Until then it keeps shipping and working in Loom exactly as before.
 - **`guard-loom-workflow.sh`** — the thin, Loom-workflow-specific guard (issue #3604): the `gh pr merge` → `merge-pr.sh` redirect and the `pip install -e` worktree block (keyed on `LOOM_WORKTREE_PATH`, issue #2495). These two guards are specific to the Loom worktree/merge workflow and stay Loom-owned.
 
 You can also add project-specific guards to protect read-only directories from accidental edits (see below).
@@ -1032,6 +1032,82 @@ LOOM_RM_SCOPE=off rm -rf /Users/someone/scratch       # allowed (permissive)
 
 # Force repo mode for one command even when the repo opts out:
 LOOM_RM_SCOPE=repo rm -rf /Users/someone/important    # DENIED (outside repo)
+```
+
+### Force-Op Branch Scope Guard (`guards.forceScope` / `LOOM_FORCE_SCOPE`)
+
+By default `guard-destructive.sh` **asks** for confirmation on every `git push
+--force` / `-f` / `--force-with-lease` and `git reset --hard`, regardless of
+which branch is targeted. For an autonomous/background agent that cannot answer
+an interactive prompt, that stalls the agent on *routine* work — force-pushing or
+hard-resetting its own single-owner working branch is a normal part of the
+rebase/amend/reset workflow. The genuinely dangerous case is a force op against a
+**protected/shared branch** (`main`/`master` or the repo's default branch).
+
+`guards.forceScope` makes the ask branch-aware (symmetric to `guards.rmScope`):
+
+| `guards.forceScope` | Behavior |
+|---------------------|----------|
+| `"all"` (**default**) | Ask on every force op regardless of branch — current behaviour, preserved byte-for-byte. |
+| `"protected"` | Ask only when the resolved target is a **protected** branch (the repo default branch plus `main`/`master`), or the branch identity is ambiguous (detached HEAD). Force ops on the agent's own working branches pass through. Solves the autonomous-agent stall. |
+| `"off"` | Never ask/deny on force ops. |
+
+The shipped default is **`"all"`** — a zero-config install sees **no behaviour
+change**. Consumers who want the autonomous-friendly behaviour opt in explicitly
+(`guards.forceScope: "protected"` in `.loom/config.json`).
+
+**Protected set & branch resolution**:
+- Protected branches = the repo default branch (detected offline via
+  `refs/remotes/origin/HEAD`, mirroring `loom_default_branch()`, with a
+  `LOOM_DEFAULT_BRANCH` override) plus the literals `main` and `master`.
+- The target branch is resolved from the push refspec — `<src>:<dst>` → `<dst>`,
+  a bare ref → the ref with a leading `+` stripped, and `HEAD` / no refspec → the
+  **checked-out branch**. `git reset --hard` always resolves to the checked-out
+  branch. The checked-out branch is read at the command's effective cwd, honoring
+  a `git -C <path>` prefix, else the hook's `cwd`.
+- **Detached HEAD** (or any unresolved branch identity) is treated as ambiguous
+  and **asks** — it is never silently allowed.
+
+**Always-on hard denies are unaffected**. The unconditional force-push-to-main /
+force-push-to-master denies (the `ALWAYS_BLOCK` patterns) fire **in every mode,
+including `"off"`** — `forceScope` only ever downgrades the generic force-op
+*ask*, it never weakens a hard deny.
+
+The force-op guard is resolved in this order (highest precedence first):
+
+1. **`LOOM_FORCE_SCOPE` env var** (`all`/`protected`/`off`). Overrides config.
+2. **`.loom/config.json`** — `guards.forceScope`: `"protected"`/`"off"`; an
+   absent key, any other value, or malformed JSON resolves to `"all"`:
+   ```json
+   {
+     "guards": {
+       "forceScope": "protected"
+     }
+   }
+   ```
+3. **Default** — `"all"` (preserve current behaviour).
+
+The config read is best-effort: a missing, empty, or malformed `.loom/config.json`
+falls through to `"all"` and never causes the hook to exit non-zero.
+
+**Examples**:
+
+```bash
+# Default (all) — every force op asks, no config needed:
+git reset --hard HEAD~1                       # ASK
+git push --force origin feature/my-branch     # ASK
+
+# Opt in to branch-aware force ops for a whole repo:
+#   .loom/config.json  ->  { "guards": { "forceScope": "protected" } }
+git reset --hard HEAD~1                        # allowed (own working branch)
+git push --force origin feature/my-branch      # allowed (working branch)
+git push --force origin main                   # DENIED (ALWAYS_BLOCK, unaffected)
+
+# One-off env override — force branch-aware mode for a single command:
+LOOM_FORCE_SCOPE=protected git push --force origin feature/x   # allowed
+
+# Force the old always-ask behaviour even when the repo opts into protected:
+LOOM_FORCE_SCOPE=all git reset --hard HEAD~1   # ASK
 ```
 
 ### Protecting Read-Only Directories
