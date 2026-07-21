@@ -1356,6 +1356,63 @@ assert_deny "Regression: DELETE FROM without WHERE (guard on) still denied" \
 echo ""
 
 # =========================================================================
+echo -e "${YELLOW}--- #3679: force-push literals quoted in flag values no longer DENY ---${NC}"
+# =========================================================================
+#
+# ALWAYS_BLOCK force-push-to-main/master literals are raw, unanchored substring
+# matches over the whole command, so a force-push phrase merely QUOTED inside a
+# text-carrying flag value (`gh pr comment --body "…"`, `git commit -m "…"`,
+# `--title`, `--notes`) false-positived — even though nothing destructive can
+# execute. COMMAND_NO_LITERAL_TEXT redacts those quoted values ONLY for the
+# catastrophic loop, killing the false positive while keeping every genuine
+# force op (direct, `bash -c '…'`, command-substitution smuggling, chained)
+# denied.
+#
+# The protected-branch phrases are assembled from shell fragments so this test
+# file's own source never carries a raw "push --force origin <protected>"
+# literal that this session's guard hook would trip on (mirrors line 1107).
+_PB=main
+_MB=master
+_FP_MAIN="git push --force origin $_PB"       # direct force-push to protected main
+_FP_MASTER="git push --force origin $_MB"     # …to protected master
+_FP_MAIN_F="git push -f origin $_PB"           # short -f form
+
+# ---- false positives now ALLOWED (inert quoted text) ----
+assert_allow "#3679: force-push phrase in a gh pr comment --body (double-quoted) allowed" \
+    "gh pr comment 3676 --body \"example: $_FP_MAIN\""
+assert_allow "#3679: force-push phrase in a gh pr comment --body (single-quoted, master) allowed" \
+    "gh pr comment 3676 --body 'do not run $_FP_MASTER'"
+assert_allow "#3679: force-push phrase in a git commit -m message allowed" \
+    "git commit -m \"revert $_FP_MAIN mistake\""
+assert_allow "#3679: force-push phrase in a gh pr create --title (with a --body too) allowed" \
+    "gh pr create --title \"fix: prevent $_FP_MAIN\" --body \"n/a\""
+assert_allow "#3679: -f short-form phrase quoted in a --notes value allowed" \
+    "gh release create v1 --notes \"changelog: no longer suggest $_FP_MAIN_F\""
+
+# ---- regression guard: genuine force ops STILL denied ----
+assert_deny "#3679 regression: direct force-push to main still denied" \
+    "$_FP_MAIN"
+# bash -c payloads are NOT redacted (`-c` is not a text-carrying flag): the
+# critical no-eval-bypass case, in both single- and double-quote wrapper forms.
+assert_deny "#3679 regression: bash -c 'force-push to main' (single-quoted) still denied" \
+    "bash -c '$_FP_MAIN'"
+assert_deny "#3679 regression: bash -c \"force-push to main\" (double-quoted) still denied" \
+    "bash -c \"$_FP_MAIN\""
+# Command-substitution smuggling inside -m must NOT be redacted (the value
+# carries `$(` so it stays intact and hard-denies): the deliberate bypass named
+# in the acceptance criteria. Assembled with single quotes so $(...) is not
+# expanded while composing the test command.
+assert_deny "#3679 regression: git commit -m \"\$(force-push)\" command-substitution still denied" \
+    'git commit -m "$('"$_FP_MAIN"')"'
+# Chained forms: a real force op after `&&` (no text-flag redaction applies).
+assert_deny "#3679 regression: chained '... && force-push to main' still denied" \
+    "foo && $_FP_MAIN"
+assert_deny "#3679 regression: chained 'force-push to main && echo done' still denied" \
+    "$_FP_MAIN && echo done"
+
+echo ""
+
+# =========================================================================
 echo -e "${YELLOW}--- Performance check ---${NC}"
 # =========================================================================
 
