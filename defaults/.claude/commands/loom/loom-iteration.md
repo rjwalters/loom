@@ -4,13 +4,10 @@
 
 ## Execution
 
-Use the `/loom` skill or run directly:
-
-```bash
-./.loom/scripts/loom-daemon.sh {{ARGUMENTS}}
-```
-
-The Python daemon handles iteration logic internally in `loom_tools.daemon.iteration`.
+This skill is superseded. Use `/loom:sweep <issue>` for the single-issue
+lifecycle, or `mcp__loom__dispatch_sweep` against the Rust `loom-daemon` for
+multi-account dispatch. See `.loom/docs/daemon-reference.md` for the current
+daemon surface.
 
 ## Migration
 

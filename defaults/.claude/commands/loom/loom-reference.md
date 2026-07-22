@@ -4,7 +4,7 @@ This file contains detailed reference documentation for the Loom daemon. It is N
 
 For daemon execution:
 - `loom.md` - Skill that invokes the Python daemon
-- `.loom/scripts/loom-daemon.sh` - Shell wrapper for the daemon
+- `.loom/docs/daemon-reference.md` - Current daemon reference (Rust `loom-daemon` + `mcp__loom__dispatch_sweep`)
 - `loom-tools/src/loom_tools/daemon/` - Python daemon implementation
 
 ## State File Format
