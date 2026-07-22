@@ -236,11 +236,15 @@ if [[ -n "$WORKTREE_PATH_OVERRIDE" ]]; then
   fi
   _WT_ABS="$(cd "$WORKTREE_PATH_OVERRIDE" 2>/dev/null && pwd -P)" || \
     error "--worktree-path could not be resolved: $WORKTREE_PATH_OVERRIDE"
-  # Verify the path is actually a worktree of this repo. `git worktree list`
-  # prints absolute paths in column 1; awk on $1 is robust to trailing
-  # metadata columns. We compare against the resolved absolute path.
+  # Verify the path is actually a worktree of this repo. Each porcelain stanza
+  # begins with a literal `worktree ` prefix (9 chars) followed by the
+  # unquoted, unescaped absolute path — which may contain spaces. Parse the
+  # path with substr($0, 10), NOT $2/whitespace-split (which truncates at the
+  # first space). Caveat: a path containing a literal newline would still break
+  # this line-oriented parse; `--porcelain -z` (NUL-delimited) would be needed
+  # for full robustness, but spaces are the realistic failure mode (#3717).
   if ! git -C "$REPO_ROOT" worktree list --porcelain 2>/dev/null | \
-       awk -v p="$_WT_ABS" '/^worktree / { if ($2 == p) { found=1; exit } } END { exit !found }'; then
+       awk -v p="$_WT_ABS" '/^worktree / { if (substr($0, 10) == p) { found=1; exit } } END { exit !found }'; then
     error "--worktree-path is not a registered worktree of this repository: $WORKTREE_PATH_OVERRIDE (resolved: $_WT_ABS)"
   fi
   WORKTREE_PATH_OVERRIDE="$_WT_ABS"
@@ -836,9 +840,14 @@ fi
 _worktree_branch_for() {
   local target="$1" target_abs
   target_abs="$(cd "$target" 2>/dev/null && pwd -P)" || target_abs="$target"
+  # The `worktree ` path line (prefix = 9 chars) may contain spaces, so parse
+  # it with substr($0, 10) rather than $2 (which truncates at the first space).
+  # The `branch ` line is safe with $2 — git ref names cannot contain spaces.
+  # Caveat: a path with a literal newline would still break this line-oriented
+  # parse; `--porcelain -z` would be needed for full robustness (#3717).
   git -C "$REPO_ROOT" worktree list --porcelain 2>/dev/null | \
     awk -v p="$target_abs" '
-      /^worktree / { wt=$2; br=""; next }
+      /^worktree / { wt=substr($0, 10); br=""; next }
       /^branch /   { br=$2 }
       /^$/         { if (wt == p && br != "" && !found) { sub(/^refs\/heads\//, "", br); print br; found=1; exit } }
       END          { if (wt == p && br != "" && !found) { sub(/^refs\/heads\//, "", br); print br } }
@@ -851,8 +860,11 @@ _worktree_branch_for() {
 # error (e.g. not a git repo). Used by _remove_loom_worktree to hard-refuse
 # removing the primary checkout (#3710).
 _primary_worktree_path() {
+  # Parse the path via substr($0, 10) (strip the literal `worktree ` prefix, 9
+  # chars) so a primary checkout under a space-containing path is not truncated
+  # at the first space. Newline-in-path caveat: see _worktree_branch_for (#3717).
   git -C "$REPO_ROOT" worktree list --porcelain 2>/dev/null | \
-    awk '/^worktree / { print $2; exit }'
+    awk '/^worktree / { print substr($0, 10); exit }'
 }
 
 # Walk porcelain output for a worktree whose branch matches the given branch
@@ -860,9 +872,12 @@ _primary_worktree_path() {
 # bare entries (they have no `branch refs/heads/...` line).
 _find_worktree_by_branch() {
   local want_branch="$1"
+  # `worktree ` path parsed via substr($0, 10) (space-safe); `branch ` via $2
+  # (ref names cannot contain spaces). Newline-in-path caveat: see
+  # _worktree_branch_for (#3717).
   git -C "$REPO_ROOT" worktree list --porcelain 2>/dev/null | \
     awk -v want="refs/heads/${want_branch}" '
-      /^worktree / { wt=$2; br=""; next }
+      /^worktree / { wt=substr($0, 10); br=""; next }
       /^branch /   { br=$2 }
       /^$/         { if (br == want && !found) { print wt; found=1; exit } }
       END          { if (br == want && !found) { print wt } }
