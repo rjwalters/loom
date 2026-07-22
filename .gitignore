@@ -68,6 +68,7 @@ Thumbs.db
 .loom/tokens/
 .loom/accounts.env
 .loom/sweep-checkpoint/
+.loom/sweep-run/
 .loom/stats/
 .loom/CANARY
 .loom/spawn-loop.pid

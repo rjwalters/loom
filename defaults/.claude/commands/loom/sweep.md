@@ -577,9 +577,61 @@ The harvest parses each joined `agent-<id>.jsonl` transcript's `usage` blocks (i
 
 - **Do NOT write to `.loom/daemon-state.json`.** That file is owned by the standalone daemon. `/sweep` runs independently and must not race with the daemon on shepherd-slot bookkeeping. Reading `daemon-state.json` for situational awareness is fine; writing is not.
 
+## Sweep Run Identity + Peer-`/sweep` Detection (#3768)
+
+Before **any** other stage — including Backend detection (Stage -1), the dry-run gate, and all wave lifecycles — establish a **stable identity for this sweep invocation** and probe for a concurrently-running peer `/sweep`. This runs for **all modes (A, B, and C)** — it is *not* short-circuited by Mode C or `--no-daemon` (those only affect the Stage -1 backend probes below).
+
+This section exists because `/sweep` was originally hardened (#3373 checkpoints, #3648 baseline) assuming a single sweep instance per repo. Two concurrent `/sweep` runs in the same repo (observed live 2026-07-22) collided on shared run-state: they shared the single fixed main-clean baseline path (one clobbered the other's pre-sweep snapshot), and their checkpoints were indistinguishable because `task_id` was `sweep-$$` — the PID of each Bash *subshell*, which varies *within* a single sweep across tool calls, not a stable per-invocation id.
+
+### Step 0a: Generate the stable run id (once, at sweep start)
+
+Run this **exactly once**, before anything else:
+
+```bash
+RUN_ID=$(./.loom/scripts/sweep-run-registry.sh new)
+echo "sweep run id: $RUN_ID"
+```
+
+`sweep-run-registry.sh new` generates a portable (macOS/Linux, no `uuidgen`) run id combining a UTC timestamp + PID + random suffix (e.g. `sweep-20260722T231500Z-84213-a3f9c1`), and registers it under `.loom/sweep-run/<RUN_ID>.json` (gitignored) with a liveness PID (the orchestrator `$PPID`) for peer detection.
+
+**Treat the printed `RUN_ID` as a fixed literal for the entire rest of this sweep.** Thread it — as that literal string — into every `--task-id "$RUN_ID"` checkpoint write and into the main-clean baseline path below. Do **NOT** regenerate it per Bash tool call, and do **NOT** fall back to `sweep-$$` (that is the exact bug this fixes: `$$` is a fresh subshell PID on every tool call). If you ever lose track of the literal mid-sweep, recover it from the registry rather than minting a new one:
+
+```bash
+RUN_ID=$(./.loom/scripts/sweep-run-registry.sh list | awk -v p="$PPID" '$2==p {print $1; exit}')
+```
+
+At sweep completion (or abort), remove this run's registry entry:
+
+```bash
+./.loom/scripts/sweep-run-registry.sh cleanup "$RUN_ID"
+```
+
+This is best-effort cleanup — a dead run's entry is also pruned automatically by any later sweep's peer scan (dead-PID liveness check), so a crash that skips cleanup never leaves a permanent false-positive.
+
+### Step 0b: Peer-`/sweep` detection (loud, NON-BLOCKING)
+
+Immediately after registering, probe for other **live** `/sweep` runs in this repo and warn if any are found — never block, never auto-stop (mirroring the Daemon Coexistence contract):
+
+```bash
+PEERS=$(./.loom/scripts/sweep-run-registry.sh peers "$RUN_ID")
+if [[ -n "$PEERS" ]]; then
+  echo "⚠️  ANOTHER /sweep IS RUNNING IN THIS REPO:" >&2
+  echo "$PEERS" | while read -r rid pid ts; do
+    echo "       run $rid (pid $pid, started $ts)" >&2
+  done
+  echo "   Two concurrent sweeps merge into a moving default branch unaware of" >&2
+  echo "   each other. Per-issue loom:building claims still prevent double-builds," >&2
+  echo "   and each sweep now keys its own main-clean baseline + checkpoints by its" >&2
+  echo "   own RUN_ID, so they will not clobber each other's run-state — but you" >&2
+  echo "   should be aware both are advancing main. Proceeding (non-blocking)." >&2
+fi
+```
+
+The `peers` subcommand only reports runs whose recorded PID is still alive (`kill -0`); it prunes any dead-PID entry as a side effect, so a sweep killed with SIGKILL mid-run does not produce a false-positive warning forever. Empty output → no peer → the single-sweep case, no warning printed (byte-for-byte the prior behaviour). **Do not block, do not auto-stop the peer, do not abort** — the peer sweep is legitimate; this is situational awareness only. See "Coexistence (peer `/sweep` and legacy daemon)" for how this relates to the legacy daemon-PID check.
+
 ## Stage -1: Backend detection (Phase D of #3449)
 
-Before **any** other stage — including the dry-run gate and all wave lifecycles — decide whether to **delegate dispatch to the in-process loom-daemon** or **fall through to the existing in-process subagent dispatch**. This stage is prose for the LLM running this skill; it does not run a separate binary. Implementation is small, side-effect-free probes followed by a single routing decision.
+Before the dry-run gate and all wave lifecycles (but **after** Sweep Run Identity above), decide whether to **delegate dispatch to the in-process loom-daemon** or **fall through to the existing in-process subagent dispatch**. This stage is prose for the LLM running this skill; it does not run a separate binary. Implementation is small, side-effect-free probes followed by a single routing decision.
 
 This stage exists because Phase A of epic #3449 (#3452) shipped `mcp__loom__dispatch_sweep`, an MCP tool that queues a sweep on the daemon's spawn queue and returns immediately. When the daemon is reachable **and** a multi-account token pool is configured, dispatching to the daemon means each sweep runs in its own detached process with its own rotated OAuth token — load is balanced across accounts, and the orchestrator session exits sub-2-second after dispatch. When either precondition is missing, today's Mode A/B/C subagent path is the right choice — it works on a solo token, it doesn't depend on a running daemon, and it is the verified behaviour for the v0.9.x line.
 
@@ -819,7 +871,7 @@ These are the AC #3 and AC #4 contracts, written for the operator.
 - **Does not subscribe to the Phase B event bus.** Subscription is consumed by long-running monitors and the spawn loop, not by this skill. Phase D is dispatch-only.
 - **Does not retry probe failures.** Either probe returns within 500ms (or its natural latency) and is treated as authoritative; no retry, no backoff.
 - **Does not mutate any forge state** during the probes. `mcp__loom__list_sweeps` and the local pool checks are read-only. Even in the daemon path, mutation happens inside the daemon-side child sweep, not in this orchestrator session.
-- **Does not log to `.loom/daemon-state.json` or any daemon-owned state file.** Read-only access is fine for situational awareness; writes are forbidden (same constraint as the existing "Daemon Coexistence" section).
+- **Does not log to `.loom/daemon-state.json` or any daemon-owned state file.** Read-only access is fine for situational awareness; writes are forbidden (same constraint as the legacy-daemon subsection of "Coexistence (peer `/sweep` and legacy daemon)").
 
 ## 0. Dry-run gate (if `--dry-run`)
 
@@ -987,7 +1039,7 @@ Apply exactly one of the three branches below, based on the PR's current label:
   - **Approve** → PR labeled `loom:pr` by Judge. If a closing-issue checkpoint is in scope, write `judge-done`:
     ```bash
     # Append --model <resolved> when you passed a model param to the judge subagent (#3482).
-    ./.loom/scripts/sweep-checkpoint.sh write N judge-done --task-id "sweep-$$" --pr-number P
+    ./.loom/scripts/sweep-checkpoint.sh write N judge-done --task-id "$RUN_ID" --pr-number P
     ```
     Continue to **C2 (Merge)** for this PR.
   - **Request changes** → PR labeled `loom:changes-requested` by Judge. Continue to **C1b (Doctor → Judge)** for this PR (inline Doctor → Judge cycle(s), up to `sweep.max_doctor_cycles`, matching the issue-side cap).
@@ -1004,7 +1056,7 @@ If the PR entered the wave already labeled `loom:changes-requested` (e.g., from 
 - If a closing-issue checkpoint is in scope, write `doctor-done` (with the attempt counter and the model the Doctor actually ran on — escalated or pinned, #3482) **before** the follow-up Judge:
   ```bash
   # <attempt> is the cycle index + 1: 2 for the first Doctor cycle, 3 for the second, etc.
-  ./.loom/scripts/sweep-checkpoint.sh write N doctor-done --task-id "sweep-$$" --pr-number P --attempt <attempt> --model <doctor-model>
+  ./.loom/scripts/sweep-checkpoint.sh write N doctor-done --task-id "$RUN_ID" --pr-number P --attempt <attempt> --model <doctor-model>
   ```
 - Re-dispatch `loom-judge` for the PR (now `loom:review-requested` again).
 - Expected exit states:
@@ -1075,11 +1127,11 @@ See `.claude/commands/loom/shepherd-lifecycle.md` for the canonical phase-by-pha
 **Before dispatching the first wave's builders**, snapshot main's current working-tree state so the per-wave contamination backstop (step 4's `check-main-clean.sh`) can distinguish builder contamination from dirt that predated the sweep:
 
 ```bash
-MAIN_CLEAN_BASELINE=".loom/sweep-checkpoint/main-clean-baseline.txt"
+MAIN_CLEAN_BASELINE=".loom/sweep-checkpoint/main-clean-baseline-${RUN_ID}.txt"
 ./.loom/scripts/check-main-clean.sh --snapshot "$MAIN_CLEAN_BASELINE"
 ```
 
-Capture this **once, before wave 1 — never per-wave**. The baseline must reflect the pre-sweep state so that if an early wave contaminates main and the dirt is not reverted, every later wave's backstop still flags it (a per-wave re-snapshot would silently absorb that contamination into the "pre-existing" set). The baseline path is a gitignored per-sweep-run transient (`.loom/sweep-checkpoint/` is already gitignored); its lifetime is this sweep invocation. If the snapshot step fails for any reason, proceed anyway — step 4's backstop falls back to the whole-status hard-fail when the baseline file is missing (fail-safe, never a silent pass).
+Capture this **once, before wave 1 — never per-wave**. The baseline must reflect the pre-sweep state so that if an early wave contaminates main and the dirt is not reverted, every later wave's backstop still flags it (a per-wave re-snapshot would silently absorb that contamination into the "pre-existing" set). The baseline path is **keyed by this sweep's `RUN_ID`** (`main-clean-baseline-${RUN_ID}.txt`, not a fixed `main-clean-baseline.txt`) so that a **concurrent peer `/sweep` never reads or clobbers this run's baseline** (#3768): before the RUN_ID keying, a second sweep re-snapshotting the shared fixed path mid-run of the first could silently absorb real contamination into the "pre-existing" set. The path is a gitignored per-sweep-run transient (`.loom/sweep-checkpoint/` is already gitignored); its lifetime is this sweep invocation. `check-main-clean.sh` needs no change — it already accepts an arbitrary `--snapshot FILE` / `--baseline FILE` path; only this caller-side path construction is keyed by `RUN_ID`. If the snapshot step fails for any reason, proceed anyway — step 4's backstop falls back to the whole-status hard-fail when the baseline file is missing (fail-safe, never a silent pass).
 
 ### Checkpoint-driven resume (#3373)
 
@@ -1195,7 +1247,7 @@ For each surviving issue `N` in the wave:
 - **On successful completion** (curator ran, or curator-skip-because-already-curated), write the checkpoint:
   ```bash
   # Append --model <resolved> when you passed a model param to the curator subagent (#3482).
-  ./.loom/scripts/sweep-checkpoint.sh write N curator-done --task-id "sweep-$$"
+  ./.loom/scripts/sweep-checkpoint.sh write N curator-done --task-id "$RUN_ID"
   ```
 
 Curator runs sequentially per-issue within wave setup — it is cheap and does not benefit from parallelism here.
@@ -1252,7 +1304,7 @@ If it exits `3`, the main worktree carries **new** uncommitted changes a builder
 **On successful PR creation**, write the `builder-done` checkpoint for that issue (record the PR number):
 ```bash
 # Append --model <resolved> when you passed a model param to the builder subagent (#3482).
-./.loom/scripts/sweep-checkpoint.sh write N builder-done --task-id "sweep-$$" --pr-number <PR>
+./.loom/scripts/sweep-checkpoint.sh write N builder-done --task-id "$RUN_ID" --pr-number <PR>
 ```
 
 If the builder failed (no PR opened), do NOT write a checkpoint — leave the checkpoint at the previous phase (typically `curator-done`) so the next sweep retries the builder from scratch.
@@ -1331,7 +1383,7 @@ post_wave_integration_gate()                    # step 8 — buildGate-against-m
   - **Approve** → PR labeled `loom:pr`. Write the `judge-done` checkpoint for this issue (carrying the PR number), then continue to Merge (step 7) for this PR, then advance to the next PR in the wave.
     ```bash
     # Append --model <resolved> when you passed a model param to the judge subagent (#3482).
-    ./.loom/scripts/sweep-checkpoint.sh write N judge-done --task-id "sweep-$$" --pr-number <PR>
+    ./.loom/scripts/sweep-checkpoint.sh write N judge-done --task-id "$RUN_ID" --pr-number <PR>
     ```
   - **Request changes** → PR labeled `loom:changes-requested`. Continue to Doctor (step 6) **inline for this PR**, then re-judge, then merge or block. Do **not** write a `judge-done` checkpoint here — the PR is not yet approved, and a resume after a kill should re-enter Doctor, not skip Judge.
 
@@ -1348,7 +1400,7 @@ If Judge requests changes on PR `#X` mid-wave, run inline Doctor→Judge cycles 
 - **On successful Doctor completion**, write the `doctor-done` checkpoint for the issue (carrying the PR number, the attempt counter, and the model the Doctor actually ran on — escalated or pinned, #3482) **before** re-invoking Judge:
   ```bash
   # <attempt> is the cycle index + 1: 2 for the first Doctor cycle, 3 for the second, etc.
-  ./.loom/scripts/sweep-checkpoint.sh write N doctor-done --task-id "sweep-$$" --pr-number <PR> --attempt <attempt> --model <doctor-model>
+  ./.loom/scripts/sweep-checkpoint.sh write N doctor-done --task-id "$RUN_ID" --pr-number <PR> --attempt <attempt> --model <doctor-model>
   ```
   This way, if sweep is killed between Doctor and the follow-up Judge, the resume run will see `doctor-done` and re-enter at the Judge phase (step 5), not redo the Doctor work.
 - On completion, re-label the PR from `loom:changes-requested` back to `loom:review-requested` and **re-run the Judge phase** (step 5) for this PR.
@@ -1497,11 +1549,27 @@ This is advisory-only. The script always exits `0` and **must not block** the sw
 
 If the check warns, the operator should refresh local `main` (and re-sync installed copies if their install flow does so) before relying on stacked-dependency or auto-reconcile behavior mid-sweep.
 
-## Daemon Coexistence
+## Coexistence (peer `/sweep` and legacy daemon)
+
+`/sweep` coexists with two **distinct** kinds of other runner, detected by two **separate** mechanisms. Do not conflate them: "another `/sweep` is running" (peer detection, #3768) is not the same as "the legacy daemon is running" (daemon-PID check). Both warnings are **loud but non-blocking** — warn once, never auto-stop, never block.
+
+### Peer `/sweep` detection (#3768)
+
+The primary coexistence case in the current architecture is **another live `/sweep` invocation in the same repo**. This is handled at sweep start by "Sweep Run Identity + Peer-`/sweep` Detection" (Step 0b, above): `sweep-run-registry.sh peers "$RUN_ID"` lists other runs whose registered liveness PID is still alive (pruning dead-PID entries so a SIGKILL'd peer never warns forever), and a loud non-blocking warning fires when any are found.
+
+Two concurrent sweeps are now **run-state isolated**, not just label-isolated:
+
+- **Per-issue `loom:building` claims** (step 1 pre-flight) already prevent two sweeps from building the same issue — if a peer claimed an issue first, this sweep sees `loom:building` and skips. The existing-PR probe (#3359) is the complementary defense when a PR exists but the `loom:building` label was never set / since removed.
+- **Main-clean baseline** is keyed by `RUN_ID` (`main-clean-baseline-${RUN_ID}.txt`), so a peer sweep's `--snapshot` can never clobber this run's pre-sweep baseline (the #3648 contamination backstop stays correct under concurrency).
+- **Checkpoints** carry this run's `RUN_ID` as `task_id`, so a sweep can tell its own `.loom/sweep-checkpoint/issue-<N>.json` writes apart from a peer's.
+
+What remains a shared, un-isolated surface is the **default branch itself**: both sweeps merge into a moving `main`, unaware of each other's in-flight PRs. The peer warning exists so the operator knows that; isolating the merge target is out of scope for #3768 (stacking is #3759's concern).
+
+### Legacy daemon coexistence
 
 > **Note**: the legacy `./.loom/scripts/daemon.sh` was removed in #3432 and is not restored. The historical PID-file daemon (`.loom/daemon-loop.pid`) is not part of the current architecture; the check below is a defensive coexistence guard that fires only if such a process is somehow already running — normally a no-op. The Tier 2 dispatch backend is now the Rust `loom-daemon` binary (observed via `mcp__loom__list_sweeps`); the background agent-pool control surface is `.loom/bin/loom start|status|stop`.
 
-`/sweep` does not require the daemon and does not interact with `.loom/daemon-state.json` for writes. If a legacy daemon process is running, `/sweep` and the daemon may both try to claim the same `loom:issue` label.
+`/sweep` does not require the daemon and does not interact with `.loom/daemon-state.json` for writes. If a legacy daemon process is running, `/sweep` and the daemon may both try to claim the same `loom:issue` label. This is a **different** mechanism from peer-`/sweep` detection above — the daemon is identified by its own `.loom/daemon-loop.pid`, not by the `.loom/sweep-run/` registry.
 
 **Coexistence behavior:** before the first wave, check whether the daemon is running. If it is, warn the user once at the start of the sweep:
 
@@ -1514,9 +1582,7 @@ if [[ -n "$PID" ]] && kill -0 "$PID" 2>/dev/null; then
 fi
 ```
 
-Do not auto-stop the daemon. Do not block on this warning — proceed with the sweep.
-
-Per-issue, the pre-flight check (step 1) already detects `loom:building` and skips, which is the natural defense against races: if the daemon claimed an issue first, `/sweep` will see `loom:building` and skip. The existing-PR probe (#3359) is the complementary defense for the case where a human or prior shepherd opened a PR but the `loom:building` label was never set or has since been removed — sweep will route the existing PR to Judge/Merge rather than spawn a duplicate Builder.
+Do not auto-stop the daemon. Do not block on this warning — proceed with the sweep. The same dead-PID liveness pattern (`kill -0`) is used by peer-`/sweep` detection.
 
 ## Constraints
 
@@ -1545,6 +1611,7 @@ The full `/sweep` design in #3298 includes many features that are intentionally 
 | Checkpoint/resume after kill | **Implemented (#3373)** | Per-issue phase checkpoint at `.loom/sweep-checkpoint/issue-<N>.json`. Sweep reads on entry and skips completed phases. No mid-builder recovery — kill during Builder resumes at builder start, worktree preserved by `worktree.sh` idempotency. Mode C reuses the helper keyed by the PR's closing-issue number (`closingIssuesReferences`); PRs without a `Closes #N` reference run without checkpointing. |
 | PR-set mode (`--prs` flag and PR NL triggers; Judge/Doctor/Merge from current PR label) | **Implemented (#3384)** | Mode C. Skips Curator, Approval gate, Builder. Size-1 waves. `--builders-per-wave` ignored. Reuses issue-keyed checkpoint via `closingIssuesReferences`. |
 | Daemon backend detection (Stage -1) | **Implemented (#3454)** | Strict-AND between daemon reachability and multi-account pool. Mode C and `--no-daemon` short-circuit to subagent. No implicit auto-start. Dispatch-only — Phase D does not subscribe to the event bus. See "Stage -1: Backend detection". |
+| Concurrent-`/sweep` run-state isolation + peer detection | **Implemented (#3768)** | A stable per-sweep-run id (`sweep-run-registry.sh new`) is generated once at sweep start and threaded through all `--task-id` checkpoint writes and the main-clean baseline path (`main-clean-baseline-${RUN_ID}.txt`), so two concurrent sweeps no longer clobber each other's baseline or share an ambiguous `sweep-$$` `task_id`. Stage 0b adds a loud, NON-BLOCKING peer-`/sweep` warning via a dead-PID-pruned run registry (`.loom/sweep-run/`). Merge-target (default-branch) isolation is out of scope — that is #3759's stacking concern. See "Sweep Run Identity + Peer-`/sweep` Detection". |
 | `--max-waves` cap | Deferred | Operator-level brake on long sweeps. |
 | `--paused-merge` / `--no-judge` | Deferred | Merge-mode variants for trusted batches. |
 | `--include-blocked` (unblock pass) | Deferred | Currently `/sweep` skips `loom:blocked` issues outright. |
