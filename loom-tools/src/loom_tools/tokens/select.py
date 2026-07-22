@@ -1,8 +1,11 @@
 """Token selection algorithm — 3-tier priority.
 
 Selection order:
-    1. Ranking file (.ranking, <10 min old): pick first non-exhausted
-       account, skipping bad tokens.
+    1. Ranking file (.ranking, <10 min old): pick randomly among the top-N
+       non-exhausted/non-blocked accounts (default N=3, configurable via
+       ``LOOM_TOKEN_SPREAD_TOP_N`` / ``tokens.spreadTopN``; N=1 = greedy
+       first-eligible), skipping bad tokens. Spreading across the top-N
+       avoids concurrent spawners colliding on .ranking[0] (issue #3736).
     2. Allowlist file (.allowlist): random pick from allowed accounts.
     3. Random pick from all .token files.
 
@@ -30,6 +33,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
 
+from loom_tools.common.config import env_int
 from loom_tools.tokens.bad_tokens import is_bad
 
 # Ranking file is considered fresh for this many seconds.
@@ -37,6 +41,12 @@ _RANKING_FRESH_SECONDS = 600  # 10 min
 
 # Exit code when no token is available (matches sysexits.h EX_CONFIG)
 EX_CONFIG = 78
+
+# Default number of top-ranked eligible accounts to spread spawns across.
+# See issue #3736: picking only .ranking[0] deterministically collides
+# concurrent spawners (e.g. sibling daemons on a shared claude-monitor pool)
+# onto the single least-utilized account, tripping its session limit.
+_DEFAULT_SPREAD_TOP_N = 3
 
 
 class TokenSelectionError(Exception):
@@ -115,16 +125,82 @@ def _read_allowlist(allowlist_file: Path) -> list[str]:
     return out
 
 
+def _resolve_spread_top_n(workspace_path: Path) -> int:
+    """Resolve the top-N spread window for the ranked strategy.
+
+    Precedence (highest first), mirroring the nested-key + env-override
+    precedent in ``common/paths.py`` and ``common/gitea.py``:
+
+        1. ``LOOM_TOKEN_SPREAD_TOP_N`` env var.
+        2. ``.loom/config.json`` -> ``tokens.spreadTopN`` (soft-fail read).
+        3. Default (``_DEFAULT_SPREAD_TOP_N`` = 3).
+
+    Values are clamped to ``>= 1``. ``N == 1`` restores the historical greedy
+    first-eligible behavior exactly (back-compat escape hatch).
+    """
+    # 1. Env var override (highest precedence).
+    if os.environ.get("LOOM_TOKEN_SPREAD_TOP_N") is not None:
+        return max(1, env_int("LOOM_TOKEN_SPREAD_TOP_N", default=_DEFAULT_SPREAD_TOP_N))
+
+    # 2. Config key — .loom/config.json -> tokens.spreadTopN (soft-fail read).
+    config_n = _read_config_spread_top_n(workspace_path)
+    if config_n is not None:
+        return max(1, config_n)
+
+    # 3. Default.
+    return _DEFAULT_SPREAD_TOP_N
+
+
+def _read_config_spread_top_n(workspace_path: Path) -> int | None:
+    """Read ``.loom/config.json`` -> ``tokens.spreadTopN``, soft-failing to ``None``.
+
+    Missing file, parse error, missing key, or a non-int value all resolve to
+    ``None`` (never a hard error), mirroring the soft-fail config reads in
+    ``common/paths.py``.
+    """
+    # Imported lazily to keep this module import-safe (no I/O / heavy deps at
+    # import time — see module docstring).
+    from loom_tools.common.state import read_json_file
+
+    config_path = workspace_path / ".loom" / "config.json"
+    data = read_json_file(config_path, default={})
+    if not isinstance(data, dict):
+        return None
+    tokens_cfg = data.get("tokens")
+    if not isinstance(tokens_cfg, dict):
+        return None
+    value = tokens_cfg.get("spreadTopN")
+    # Reject bool (a subclass of int) and non-int values.
+    if isinstance(value, bool) or not isinstance(value, int):
+        return None
+    return value
+
+
 def _try_ranking(
     tokens_dir: Path,
     ranking_file: Path,
     workspace_path: Path,
     rng: random.Random,
 ) -> SelectedToken | None:
-    """Strategy 1: read .ranking, return first non-exhausted/non-blocked entry."""
+    """Strategy 1: read .ranking, pick randomly among the top-N eligible entries.
+
+    Historically this returned the *first* non-exhausted/non-blocked entry.
+    Because ``.ranking`` is ordered most-available-first, every concurrent
+    spawner reading a fresh ranking picked the identical account, serializing
+    load onto one account and tripping its session limit (issue #3736).
+
+    We now collect up to the top-N eligible ranked entries (skipping
+    exhausted/blocked/bad/missing/empty tokens, preserving ranking order) and
+    ``rng.choice`` among them, spreading concurrent spawners across the most
+    available accounts while still preferring healthy ones. N is resolved via
+    ``_resolve_spread_top_n``; ``N == 1`` restores the old greedy behavior.
+    """
     age = _file_age_seconds(ranking_file)
     if age is None or age >= _RANKING_FRESH_SECONDS:
         return None
+
+    top_n = _resolve_spread_top_n(workspace_path)
+    eligible: list[SelectedToken] = []
     for name, status in _read_ranking(ranking_file):
         if status in ("exhausted", "blocked"):
             continue
@@ -139,8 +215,15 @@ def _try_ranking(
             continue
         if not key:
             continue
-        return SelectedToken(name=name, file=token_file, key=key, mode="ranked")
-    return None
+        eligible.append(
+            SelectedToken(name=name, file=token_file, key=key, mode="ranked"),
+        )
+        if len(eligible) >= top_n:
+            break
+
+    if not eligible:
+        return None
+    return rng.choice(eligible)
 
 
 def _try_allowlist(
