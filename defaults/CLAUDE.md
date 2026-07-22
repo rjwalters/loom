@@ -1372,6 +1372,58 @@ LOOM_GUARD_READONLY_FASTPATH=0 git status
 #   .loom/config.json  ->  { "guards": { "readOnlyFastPathExtra": ["jq"] } }
 ```
 
+### Decision Telemetry Log (`guards.decisionLog` / `LOOM_GUARD_DECISION_LOG`)
+
+`guard-destructive.sh` can record every **deny** and **ask** decision to a JSONL decision log (issue #3771), separate from `hook-errors.log`, so guard-hook friction becomes **measurable** — which patterns fire, how often, and whether a precision fix (#3755/#3756/#3757) actually cut the false-positive rate. Without it, "we keep hitting the hooks" is unquantifiable.
+
+The log is **off by default** — enabling it writes a new persistent, cross-session artifact, so like the other opt-in data-collection features (transcript archival #3726, the model-cost experiment #3725) a zero-config install sees no new file and no behaviour change. It is resolved in this order (highest precedence first):
+
+1. **`LOOM_GUARD_DECISION_LOG` env var** — `1`/`true`/`yes`/`on` enables; `0`/`false`/`no`/`off` disables. Overrides the config value.
+2. **`.loom/config.json`** — `guards.decisionLog` (default `false` when absent). Set it to `true` to enable:
+   ```json
+   {
+     "guards": {
+       "decisionLog": true
+     }
+   }
+   ```
+3. **Default** — `false` (no decision log written).
+
+When enabled, each deny/ask appends **one JSON object per line** to `.loom/logs/guard-decisions.log` (`SCRIPT_DIR`-relative, mirroring `hook-errors.log`; override the path with `LOOM_GUARD_DECISION_LOG_FILE`). **Stable schema** (the contract downstream reader tooling in #3772 depends on — field names are load-bearing):
+
+```json
+{"ts":"2026-07-22T23:17:13Z","decision":"deny","pattern":"sql-ddl","tier":"catastrophic","command":"<redacted>"}
+```
+
+| Field | Meaning |
+|-------|---------|
+| `ts` | UTC timestamp (`date -u '+%Y-%m-%dT%H:%M:%SZ'`, same as `hook-errors.log`) |
+| `decision` | `deny` or `ask` |
+| `pattern` | a short, stable rule tag (e.g. `sql-ddl`, `rm-protected-path`, `force-op:protected`, `cloud-cli:<pattern>`) — **not** the full free-text reason |
+| `tier` | `catastrophic` for a deny, `ask` for an ask |
+| `command` | the command string, **redacted** via `strip_literal_text()` so no raw `--body`/`-m`/`--title`/`--notes`/`--comment` secret value is persisted |
+
+**`allow` decisions are never logged** — the #3687 read-only fast path's zero-overhead silent-allow stays silent, and allow-logging would swamp the log with the ~99% common case. Logging is **best-effort / fail-open**: the toggle is resolved lazily (only once a deny/ask is about to fire, so it never touches the fast path's hot path), and a log-write failure (permission denied, disk full, missing dir) never changes the deny/ask decision and never causes the hook to exit non-zero. `.loom/logs/` is gitignored.
+
+Summarize fires by rule (a fuller reader/aggregation CLI is #3772's scope):
+
+```bash
+jq -r '.pattern' .loom/logs/guard-decisions.log | sort | uniq -c | sort -rn
+```
+
+**Examples**:
+
+```bash
+# Enable for a single command (e.g. to capture one session's fires)
+LOOM_GUARD_DECISION_LOG=1 claude -p "/builder" --dangerously-skip-permissions
+
+# Persist for a whole repo
+#   .loom/config.json  ->  { "guards": { "decisionLog": true } }
+
+# Force off for one command even when the repo opts in
+LOOM_GUARD_DECISION_LOG=0 <command>
+```
+
 ### Protecting Read-Only Directories
 
 Many projects have directories that should never be modified by agents (vendor code, generated files, external SDKs, process design kits). Loom provides a template hook for this.
