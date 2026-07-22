@@ -393,6 +393,142 @@ _reset_partial_increment_labels() {
   return 0
 }
 
+# ---------------------------------------------------------------------------
+# Automated stacked-PR reconciliation on parent merge (#3747, stacked-PR v2,
+# item 1 of the v2 epic — the remaining five items stay deferred).
+#
+# When a stacked PARENT PR (branch feature/issue-<N>) squash-merges, any CHILD
+# PRs based on the parent branch still carry the parent's now-squashed pre-merge
+# commits. reconcile-stack.sh performs the git surgery — `git rebase --onto
+# <default> <parent-branch> <child-branch>`, `push --force-with-lease`, retarget
+# the child PR base to the default branch — that strips them. v1 (#3729) shipped
+# reconcile-stack.sh as a STANDALONE, operator-invoked script and deliberately
+# left merge-pr.sh untouched. This v2 slice fires it AUTOMATICALLY here — a
+# best-effort, GitHub-only step gated so it never races a live Builder that still
+# holds the child branch checked out.
+#
+# Discovery is via a LIVE forge query (`gh pr list --base <parent>`), NOT the
+# ephemeral loom-daemon SweepRegistry: terminal registry entries are
+# garbage-collected ~1h after transition and the registry only exists at all when
+# loom-daemon is running, but this function may run from Champion's cron or an
+# interactive /loom:sweep merge with no daemon present (see
+# .loom/docs/daemon-reference.md → "Stacked-PR dependency").
+#
+# Safe/unsafe split per child, gated on the child ISSUE's loom:building label
+# (fresh, uncached `gh api` read, mirroring _reset_one_partial_issue's freshness
+# discipline):
+#   - Safe   (child issue NOT loom:building): no live claim on the child, so
+#            invoke reconcile-stack.sh directly.
+#   - Unsafe (child issue still loom:building): a live Builder likely has the
+#            child branch checked out in its own worktree; an out-of-band rebase
+#            + force-with-lease would corrupt its in-progress work. Skip the
+#            auto-rebase and post a comment noting reconciliation is deferred
+#            until the Builder finishes (a later parent-merge-triggered pass, or
+#            a manual reconcile-stack.sh run, picks it up).
+#
+# Idempotent by construction: once a child's base is retargeted away from the
+# parent branch, `gh pr list --base <parent>` returns zero rows, so re-runs are
+# no-ops and nothing double-fires.
+#
+# Every step is best-effort and must NEVER change merge-pr.sh's exit code — the
+# parent merge already happened. Runs BEFORE branch deletion so the parent
+# branch ref still resolves as reconcile-stack.sh's rebase <upstream> argument.
+
+# Reconcile (or defer) one discovered child PR. Best-effort; returns 0.
+_reconcile_one_stacked_child() {
+  local child_pr="$1" child_branch="$2" parent_branch="$3"
+
+  # Derive the child ISSUE number from its head branch (feature/issue-<N>) so we
+  # can check its live claim label. A child branch that is not a feature/issue-N
+  # branch has no loom:building claim to race, so it is treated as safe.
+  local child_issue=""
+  if [[ "$child_branch" =~ ^feature/issue-([0-9]+)$ ]]; then
+    child_issue="${BASH_REMATCH[1]}"
+  fi
+
+  # Fresh (uncached) label read — mirrors _reset_one_partial_issue: use plain
+  # `gh api` (not $GH, which may be gh-cached) so a stale cached view cannot mask
+  # a live re-claim. A read failure is treated as "not building" (safe) since the
+  # reconcile itself is best-effort and force-with-lease still protects the branch.
+  local building="false"
+  if [[ -n "$child_issue" ]]; then
+    local issue_json issue_labels
+    issue_json="$(gh api "repos/$REPO_NWO/issues/$child_issue" 2>/dev/null || echo '{}')"
+    issue_labels="$(echo "$issue_json" | jq -r '.labels[]?.name' 2>/dev/null || true)"
+    if printf '%s\n' "$issue_labels" | grep -qx 'loom:building'; then
+      building="true"
+    fi
+  fi
+
+  if [[ "$building" == "true" ]]; then
+    # Unsafe: defer, do not rebase.
+    info "Stacked reconcile: child PR #$child_pr (issue #$child_issue) is still loom:building — deferring auto-rebase to avoid racing a live Builder"
+    local ts comment
+    ts="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    comment="## Stacked parent merged — reconciliation deferred
+
+Parent branch \`$parent_branch\` squash-merged, but this child's issue #$child_issue is still \`loom:building\` — a Builder likely has this branch checked out. Auto-reconciliation was **skipped** to avoid racing that in-progress work with an out-of-band \`git rebase --onto\` + \`push --force-with-lease\`.
+
+**What happens next**: once issue #$child_issue is no longer \`loom:building\`, a subsequent parent-merge-triggered pass will reconcile this PR automatically. You can also reconcile it by hand now (from a clean checkout, only once the Builder has finished):
+
+\`\`\`
+./.loom/scripts/reconcile-stack.sh $child_pr $parent_branch
+\`\`\`
+
+---
+*Deferred by merge-pr.sh (#3747) at $ts*"
+    gh pr comment "$child_pr" --repo "$REPO_NWO" --body "$comment" >/dev/null 2>&1 || \
+      warning "Could not post deferred-reconciliation comment on PR #$child_pr"
+    return 0
+  fi
+
+  # Safe: no live claim — run the existing reconcile script unmodified. Do NOT
+  # re-implement the rebase/force-with-lease/retarget logic inline.
+  info "Stacked reconcile: parent '$parent_branch' merged; reconciling child PR #$child_pr onto the default branch"
+  if "$SCRIPT_DIR/reconcile-stack.sh" "$child_pr" "$parent_branch"; then
+    success "Stacked reconcile: child PR #$child_pr reconciled onto the default branch"
+  else
+    warning "Stacked reconcile: reconcile-stack.sh failed for child PR #$child_pr (rebase conflict, rejected force-with-lease push, or retarget failure). The parent merge is unaffected — reconcile manually: ./.loom/scripts/reconcile-stack.sh $child_pr $parent_branch"
+  fi
+  return 0
+}
+
+# Discover open child PRs stacked on the just-merged parent branch and reconcile
+# (or defer) each. Best-effort; returns 0 unconditionally.
+_auto_reconcile_stacked_children() {
+  [[ "$FORGE_TYPE" == "github" ]] || return 0
+
+  # Only a parent PR on a feature/issue-<N> branch can have stacked children.
+  [[ "$PR_BRANCH" =~ ^feature/issue-([0-9]+)$ ]] || return 0
+
+  # Live forge discovery — NEVER the daemon registry. Plain `gh` (uncached) so we
+  # see child PRs as of the merge, not a cached list snapshot.
+  local children_json
+  children_json="$(gh pr list --repo "$REPO_NWO" --base "$PR_BRANCH" --state open \
+    --json number,headRefName 2>/dev/null || echo '[]')"
+  [[ -n "$children_json" ]] || return 0
+
+  local count
+  count="$(echo "$children_json" | jq 'length' 2>/dev/null || echo 0)"
+  [[ "$count" -gt 0 ]] || return 0
+
+  info "Stacked reconcile: found $count open child PR(s) based on '$PR_BRANCH'"
+
+  if [[ ! -x "$SCRIPT_DIR/reconcile-stack.sh" ]]; then
+    warning "Stacked reconcile: reconcile-stack.sh not found or not executable at $SCRIPT_DIR — skipping auto-reconciliation"
+    return 0
+  fi
+
+  local rows child_pr child_branch
+  rows="$(echo "$children_json" | jq -r '.[] | "\(.number)\t\(.headRefName)"' 2>/dev/null || true)"
+  while IFS=$'\t' read -r child_pr child_branch; do
+    [[ -n "$child_pr" ]] || continue
+    _reconcile_one_stacked_child "$child_pr" "$child_branch" "$PR_BRANCH"
+  done <<< "$rows"
+
+  return 0
+}
+
 # Handle auto-merge mode
 #
 # The auto-merge path now mirrors the sync path's resilience patterns:
@@ -825,6 +961,12 @@ fi  # end synchronous-merge path (AUTO_MERGE != "true")
 # through reach here; the auto-merge-queued and dry-run paths exit earlier).
 # Best-effort — never fails the merge. See the function definitions above.
 _reset_partial_increment_labels || true
+
+# Automated stacked-PR reconciliation (#3747, stacked-PR v2 item 1). Runs at the
+# same confirmed-merge choke point, and BEFORE branch deletion below so the
+# parent branch ref still resolves as reconcile-stack.sh's rebase <upstream>
+# argument. Best-effort — never fails the merge. See the function above.
+_auto_reconcile_stacked_children || true
 
 # NOTE: Label cleanup on linked issues is intentionally skipped for the
 # `Closes #N` / `Fixes #N` / `Resolves #N` auto-close case.
