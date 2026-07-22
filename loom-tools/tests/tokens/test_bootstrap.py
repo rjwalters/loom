@@ -17,6 +17,7 @@ from loom_tools.tokens.bootstrap import (
     _TOKEN_FILE_RE,
     _strip_value,
     bootstrap_tokens,
+    default_claude_monitor_accounts_env,
     default_home_accounts_env,
     derive_token_filename,
     fingerprint,
@@ -757,3 +758,332 @@ class TestBackwardCompat3697:
         )
         result = bootstrap_tokens(mock_repo)
         assert result.written == ["custom-a.token"]
+
+
+# ---------------------------------------------------------------------------
+# #3698: claude-monitor-first account sourcing (additive three-source merge)
+# ---------------------------------------------------------------------------
+
+
+def _pair(i: int, email: str, key: str) -> str:
+    """A claude-monitor-style EMAIL+KEY-only entry (no TOKEN_FILE)."""
+    return f"ACCOUNT_EMAIL_{i}={email}\nACCOUNT_KEY_{i}={key}\n"
+
+
+def _write_monitor(
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+    body: str,
+) -> pathlib.Path:
+    """Materialize a fixture ``~/.claude-monitor/accounts.env`` and point the
+    ``LOOM_CLAUDE_MONITOR_DIR`` override at it (the autouse conftest fixture
+    otherwise points it at a non-existent path so a real dir never leaks in)."""
+    mon_dir = tmp_path / "claude-monitor-home"
+    mon_dir.mkdir(exist_ok=True)
+    accounts = mon_dir / "accounts.env"
+    accounts.write_text(body, encoding="utf-8")
+    monkeypatch.setenv("LOOM_CLAUDE_MONITOR_DIR", str(mon_dir))
+    return accounts
+
+
+class TestClaudeMonitorResolver:
+    def test_default_dir_honors_env_override(
+        self, tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("LOOM_CLAUDE_MONITOR_DIR", str(tmp_path / "mon"))
+        p = default_claude_monitor_accounts_env()
+        assert p == tmp_path / "mon" / "accounts.env"
+
+    def test_default_dir_is_claude_monitor(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.delenv("LOOM_CLAUDE_MONITOR_DIR", raising=False)
+        p = default_claude_monitor_accounts_env()
+        assert p.name == "accounts.env"
+        assert p.parent.name == ".claude-monitor"
+
+
+class TestBackwardCompat3698:
+    """The safety arbiter: nothing that resolves today may break."""
+
+    def test_home_only_still_bootstraps(
+        self, mock_repo: pathlib.Path, tmp_path: pathlib.Path, monkeypatch
+    ) -> None:
+        # ARBITER TEST: only ~/.loom/accounts.env, NO claude-monitor file.
+        # A pure default-swap to claude-monitor would break this; the additive
+        # design must keep it working byte-for-byte.
+        master = tmp_path / "loom-accounts.env"
+        master.write_text(
+            _triple(1, "a@example.com", "hk-a", "alice.token")
+            + _triple(2, "b@example.com", "hk-b", "bob.token"),
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("LOOM_ACCOUNTS_ENV", str(master))
+        result = bootstrap_tokens(mock_repo)
+        assert sorted(result.written) == ["alice.token", "bob.token"]
+        assert result.monitor_env is None
+        assert result.home_env == master
+        tokens_dir = mock_repo / ".loom" / "tokens"
+        assert (tokens_dir / "alice.token").read_text() == "hk-a"
+        assert (tokens_dir / "bob.token").read_text() == "hk-b"
+        assert {e["source"] for e in result.effective} == {"home"}
+
+    def test_home_repo_merge_byte_for_byte_without_monitor(
+        self, mock_repo: pathlib.Path, tmp_path: pathlib.Path, monkeypatch
+    ) -> None:
+        # Absent the claude-monitor file, the home+repo merge is unchanged:
+        # repo still overrides home, repo-only adds, home-only inherits.
+        master = tmp_path / "loom-accounts.env"
+        master.write_text(
+            _triple(1, "shared@example.com", "home-key", "shared.token")
+            + _triple(2, "homeonly@example.com", "hk", "homeonly.token"),
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("LOOM_ACCOUNTS_ENV", str(master))
+        _write_env(
+            mock_repo,
+            _triple(1, "shared@example.com", "repo-key", "shared.token")
+            + _triple(2, "repoonly@example.com", "rk", "repoonly.token"),
+        )
+        result = bootstrap_tokens(mock_repo)
+        assert result.monitor_env is None
+        tokens_dir = mock_repo / ".loom" / "tokens"
+        # Repo key wins for the shared email (repo-override).
+        assert (tokens_dir / "shared.token").read_text() == "repo-key"
+        assert (tokens_dir / "homeonly.token").read_text() == "hk"
+        assert (tokens_dir / "repoonly.token").read_text() == "rk"
+        sources = {e["email"]: e["source"] for e in result.effective}
+        assert sources == {
+            "shared@example.com": "repo-override",
+            "homeonly@example.com": "home",
+            "repoonly@example.com": "repo",
+        }
+
+    def test_loom_accounts_env_empty_still_disables_master(
+        self, mock_repo: pathlib.Path, monkeypatch
+    ) -> None:
+        # LOOM_ACCOUNTS_ENV="" still disables the home master; the repo source
+        # alone bootstraps (no claude-monitor file present).
+        monkeypatch.setenv("LOOM_ACCOUNTS_ENV", "")
+        _write_env(mock_repo, _triple(1, "a@example.com", "sk-1", "a.token"))
+        result = bootstrap_tokens(mock_repo)
+        assert result.home_env is None
+        assert result.monitor_env is None
+        assert result.written == ["a.token"]
+
+
+class TestClaudeMonitorSourcing:
+    def test_monitor_only_no_dead_end(
+        self, mock_repo: pathlib.Path, tmp_path: pathlib.Path, monkeypatch
+    ) -> None:
+        # Only ~/.claude-monitor/accounts.env populated (EMAIL+KEY only), no
+        # home master, no repo triples -> every account materialized via
+        # auto-derive; no account-resolution dead-end.
+        monkeypatch.setenv("LOOM_ACCOUNTS_ENV", "")  # disable home master
+        mon = _write_monitor(
+            tmp_path,
+            monkeypatch,
+            _pair(1, "alice@example.com", "mk-a")
+            + _pair(2, "a.b.jones@example.org", "mk-j"),
+        )
+        result = bootstrap_tokens(mock_repo)
+        assert result.monitor_env == mon
+        assert result.home_env is None
+        tokens_dir = mock_repo / ".loom" / "tokens"
+        assert (tokens_dir / "alice-example.token").read_text() == "mk-a"
+        assert (tokens_dir / "abjones-example.token").read_text() == "mk-j"
+        assert {e["source"] for e in result.effective} == {"monitor"}
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="POSIX modes only")
+    def test_monitor_token_files_mode_0600(
+        self, mock_repo: pathlib.Path, tmp_path: pathlib.Path, monkeypatch
+    ) -> None:
+        monkeypatch.setenv("LOOM_ACCOUNTS_ENV", "")
+        _write_monitor(tmp_path, monkeypatch, _pair(1, "alice@example.com", "mk"))
+        bootstrap_tokens(mock_repo)
+        token_path = mock_repo / ".loom" / "tokens" / "alice-example.token"
+        assert os.stat(token_path).st_mode & 0o777 == 0o600
+
+    def test_monitor_overrides_repo(
+        self, mock_repo: pathlib.Path, tmp_path: pathlib.Path, monkeypatch
+    ) -> None:
+        # Same email in monitor and repo -> monitor key/file wins, provenance
+        # monitor-override; monitor-only adds; repo-only retained.
+        monkeypatch.setenv("LOOM_ACCOUNTS_ENV", "")
+        _write_monitor(
+            tmp_path,
+            monkeypatch,
+            _pair(1, "alice@example.com", "monitor-key")
+            + _pair(2, "monly@example.com", "mk-only"),
+        )
+        _write_env(
+            mock_repo,
+            _triple(1, "alice@example.com", "repo-key", "alice-example.token")
+            + _triple(2, "reponly@example.com", "rk", "reponly.token"),
+        )
+        result = bootstrap_tokens(mock_repo)
+        tokens_dir = mock_repo / ".loom" / "tokens"
+        # Monitor key wins on the shared email.
+        assert (tokens_dir / "alice-example.token").read_text() == "monitor-key"
+        assert (tokens_dir / "monly-example.token").read_text() == "mk-only"
+        assert (tokens_dir / "reponly.token").read_text() == "rk"
+        sources = {e["email"]: e["source"] for e in result.effective}
+        assert sources == {
+            "alice@example.com": "monitor-override",
+            "monly@example.com": "monitor",
+            "reponly@example.com": "repo",
+        }
+
+    def test_monitor_overrides_home(
+        self, mock_repo: pathlib.Path, tmp_path: pathlib.Path, monkeypatch
+    ) -> None:
+        # Precedence is claude-monitor > repo > home. An email in monitor and
+        # home resolves to the monitor key.
+        master = tmp_path / "loom-accounts.env"
+        master.write_text(
+            _triple(1, "alice@example.com", "home-key", "alice-example.token"),
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("LOOM_ACCOUNTS_ENV", str(master))
+        _write_monitor(
+            tmp_path, monkeypatch, _pair(1, "alice@example.com", "monitor-key")
+        )
+        result = bootstrap_tokens(mock_repo)
+        tokens_dir = mock_repo / ".loom" / "tokens"
+        assert (tokens_dir / "alice-example.token").read_text() == "monitor-key"
+        assert result.effective[0]["source"] == "monitor-override"
+
+    def test_monitor_no_home_flag_keeps_monitor(
+        self, mock_repo: pathlib.Path, tmp_path: pathlib.Path, monkeypatch
+    ) -> None:
+        # --no-home (home_env_path=None) disables the home master but the
+        # claude-monitor source is independent and still consulted.
+        master = tmp_path / "loom-accounts.env"
+        master.write_text(
+            _triple(1, "homeonly@example.com", "hk", "homeonly.token"),
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("LOOM_ACCOUNTS_ENV", str(master))
+        _write_monitor(
+            tmp_path, monkeypatch, _pair(1, "alice@example.com", "mk")
+        )
+        result = bootstrap_tokens(mock_repo, home_env_path=None)
+        assert result.home_env is None
+        assert result.monitor_env is not None
+        assert result.written == ["alice-example.token"]
+
+    def test_missing_monitor_dir_degrades_silently(
+        self, mock_repo: pathlib.Path, monkeypatch
+    ) -> None:
+        # LOOM_CLAUDE_MONITOR_DIR points at a non-existent dir (conftest
+        # default): no crash, no import — falls through to home+repo.
+        _write_env(mock_repo, _triple(1, "a@example.com", "sk-1", "a.token"))
+        result = bootstrap_tokens(mock_repo)
+        assert result.monitor_env is None
+        assert result.written == ["a.token"]
+
+    def test_monitor_index_records_provenance_no_secret(
+        self, mock_repo: pathlib.Path, tmp_path: pathlib.Path, monkeypatch
+    ) -> None:
+        monkeypatch.setenv("LOOM_ACCOUNTS_ENV", "")
+        _write_monitor(
+            tmp_path, monkeypatch, _pair(1, "alice@example.com", "mk-secret")
+        )
+        bootstrap_tokens(mock_repo)
+        idx = json.loads(
+            (mock_repo / ".loom" / "tokens" / "index.json").read_text()
+        )
+        entry = idx["accounts"][0]
+        assert entry["source"] == "monitor"
+        assert entry["email"] == "alice@example.com"
+        # Secret hygiene: only a fingerprint, never the key material.
+        assert "mk-secret" not in json.dumps(idx)
+        assert "key" not in entry
+        assert len(entry["key_fingerprint"]) == 8
+
+
+class TestMonitorIdentityContinuity:
+    """Monitor-derived stems must match existing index.json stems so the
+    .ranking / .bad_tokens history keyed on the account name stays attached."""
+
+    def test_derive_matches_established_stems(self) -> None:
+        # The names the selector keys on are the derived stems; a monitor
+        # account for the same email derives the same name.
+        assert derive_token_filename("alice@example.com") == "alice-example.token"
+        assert (
+            derive_token_filename("a.b.jones@example.org") == "abjones-example.token"
+        )
+        assert derive_token_filename("agent-1@example.com") == "agent1-example.token"
+
+    def test_monitor_stem_matches_prior_index_stem(
+        self, mock_repo: pathlib.Path, tmp_path: pathlib.Path, monkeypatch
+    ) -> None:
+        # Bootstrap once from the repo (auto-derive), record the index stem,
+        # then bootstrap again with the same email sourced from claude-monitor:
+        # the stem (account name) is identical, so history stays attached.
+        monkeypatch.setenv("LOOM_ACCOUNTS_ENV", "")
+        _write_env(mock_repo, _pair(1, "alice@example.com", "repo-key"))
+        bootstrap_tokens(mock_repo)
+        idx_before = json.loads(
+            (mock_repo / ".loom" / "tokens" / "index.json").read_text()
+        )
+        name_before = idx_before["accounts"][0]["name"]
+
+        _write_monitor(
+            tmp_path, monkeypatch, _pair(1, "alice@example.com", "monitor-key")
+        )
+        bootstrap_tokens(mock_repo)
+        idx_after = json.loads(
+            (mock_repo / ".loom" / "tokens" / "index.json").read_text()
+        )
+        name_after = idx_after["accounts"][0]["name"]
+        assert name_after == name_before == "alice-example"
+
+    def test_monitor_repo_overlap_collapses_not_duplicate_abort(
+        self, mock_repo: pathlib.Path, tmp_path: pathlib.Path, monkeypatch
+    ) -> None:
+        # Same email in monitor and repo derives the same filename; the merge
+        # collapses them to one account (override) — it must NOT trip the
+        # duplicate-filename guard.
+        monkeypatch.setenv("LOOM_ACCOUNTS_ENV", "")
+        _write_monitor(
+            tmp_path, monkeypatch, _pair(1, "alice@example.com", "monitor-key")
+        )
+        _write_env(mock_repo, _pair(1, "alice@example.com", "repo-key"))
+        result = bootstrap_tokens(mock_repo)  # must not raise ValueError
+        assert result.written == ["alice-example.token"]
+        tokens_dir = mock_repo / ".loom" / "tokens"
+        assert (tokens_dir / "alice-example.token").read_text() == "monitor-key"
+
+    def test_true_cross_source_collision_still_aborts(
+        self, mock_repo: pathlib.Path, tmp_path: pathlib.Path, monkeypatch
+    ) -> None:
+        # Distinct emails whose derived filenames collide is still a real
+        # clobber and must abort (guard runs on the merged set).
+        monkeypatch.setenv("LOOM_ACCOUNTS_ENV", "")
+        _write_monitor(
+            tmp_path, monkeypatch, _pair(1, "ajones@example.com", "mk")
+        )
+        _write_env(mock_repo, _pair(1, "a.jones@example.com", "rk"))
+        with pytest.raises(ValueError, match="duplicate token filename"):
+            bootstrap_tokens(mock_repo)
+
+
+class TestCliMonitorReporting:
+    def test_effective_report_shows_monitor_provenance(
+        self,
+        mock_repo: pathlib.Path,
+        tmp_path: pathlib.Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        monkeypatch.setenv("LOOM_ACCOUNTS_ENV", "")
+        _write_monitor(
+            tmp_path, monkeypatch, _pair(1, "alice@example.com", "mk")
+        )
+        monkeypatch.chdir(mock_repo)
+        rc = cli_main(["bootstrap", "--dry-run"])
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert "claude-monitor" in out
+        assert "alice" in out

@@ -9,7 +9,7 @@ The spawn loop writes a minimal state file with the following shape::
           "issue": 42,
           "pid": 12345,
           "started_at": "2026-06-02T16:15:00Z",
-          "token": "robb-personal",
+          "token": "agent-1-personal",
           "output_file": "/path/to/.loom/logs/sweep-issue-42.log"
         },
         ...
