@@ -271,6 +271,41 @@ def arm_model(arm: str) -> str:
     return ARM_MODEL.get(arm.upper().strip(), "")
 
 
+def _model_family(model: str | None) -> str | None:
+    """Normalize a model alias or pinned ID to its family (mirrors ``model_pricing``)."""
+    m = (model or "").lower()
+    if "claude-3-5-sonnet" in m or "claude-sonnet-4" in m or m == "sonnet":
+        return "sonnet"
+    if "claude-3-opus" in m or "claude-opus-4" in m or m == "opus":
+        return "opus"
+    if "claude-3-haiku" in m or m == "haiku":
+        return "haiku"
+    return None
+
+
+# Inverse of ``ARM_MODEL`` by model family.
+_MODEL_FAMILY_TO_ARM = {"opus": "A", "sonnet": "B"}
+
+
+def infer_arm_from_model(model: str | None) -> str | None:
+    """Map an observed Builder model to its inequality arm (opus->A, sonnet->B).
+
+    ``observe`` mode records the outcome-chain **without** forcing a model, so its
+    records carry ``arm=null`` (only ``experiment`` mode stamps A/B). Without this
+    inference every observe-mode record collapses into the single ``"?"`` bucket
+    and the harvest drops the per-record ``model`` — so a passive multi-day
+    observe sample could never populate the opus/sonnet split the #3718 inequality
+    needs. Since Arm A is *defined* as opus and Arm B as sonnet (``ARM_MODEL``), an
+    observe issue whose Builder ran opus is opus-first evidence (arm A) and one
+    that ran sonnet is sonnet-first evidence (arm B).
+
+    Returns ``None`` for any model that is not one of the two inequality arms
+    (haiku, an unrecognized ID, or ``None``) so such records stay in ``"?"``
+    rather than being mis-attributed.
+    """
+    return _MODEL_FAMILY_TO_ARM.get(_model_family(model) or "")
+
+
 # --------------------------------------------------------------------------- #
 # Durable stats store (atomic O_APPEND, one JSONL line per phase invocation)
 # --------------------------------------------------------------------------- #
@@ -555,9 +590,42 @@ def harvest(
     (via transcript join where available), merge-rate quality floor, and the
     derived per-issue mean cost that feeds the sonnet-first vs opus-first
     inequality.
+
+    Arm attribution per issue: the explicit ``experiment``-mode arm (A/B) wins
+    when present; otherwise (``observe`` mode records ``arm=null``) the arm is
+    inferred from the issue's observed Builder model (opus->A, sonnet->B) so a
+    passive observe sample is still opus/sonnet-attributed instead of collapsing
+    into a single ``"?"`` bucket. Issues whose Builder model is neither opus nor
+    sonnet (or unknown) stay under ``"?"``.
     """
     records = read_records(stats_file)
     transcript_map = build_transcript_map(archive_dir)
+
+    # Pass 1 — resolve each issue's effective arm. Prefer the explicit experiment
+    # arm (experiment mode stamps A/B on every phase record). Absent it, observe
+    # mode records carry arm=null, so infer the arm from the issue's Builder model
+    # (opus->A, sonnet->B) — otherwise a passive observe sample collapses into a
+    # single "?" bucket and the opus/sonnet split #3718 needs is lost. An issue's
+    # arm is resolved once and applied to all of its phase records so cost is not
+    # scattered across arms (e.g. an Arm B issue's escalated opus Doctor cycle
+    # still counts under B).
+    issue_explicit_arm: dict[int, str] = {}
+    issue_builder_model: dict[int, str | None] = {}
+    for rec in records:
+        issue = rec.get("issue")
+        if issue is None:
+            continue
+        issue = int(issue)
+        arm = rec.get("arm")
+        if arm and issue not in issue_explicit_arm:
+            issue_explicit_arm[issue] = str(arm).upper()
+        if (rec.get("role") or "").lower() == "builder" and issue not in issue_builder_model:
+            issue_builder_model[issue] = rec.get("model")
+
+    def _issue_arm(issue: int) -> str:
+        if issue in issue_explicit_arm:
+            return issue_explicit_arm[issue]
+        return infer_arm_from_model(issue_builder_model.get(issue)) or "?"
 
     # Per-issue outcome roll-up, keyed (arm, issue).
     issues: dict[tuple[str, int], dict[str, Any]] = {}
@@ -566,8 +634,8 @@ def harvest(
     fidelity_counts: dict[str, int] = {"transcript": 0, "sweep-aggregate-log": 0, "none": 0}
 
     for rec in records:
-        arm = rec.get("arm") or "?"
         issue = rec.get("issue")
+        arm = _issue_arm(int(issue)) if issue is not None else (rec.get("arm") or "?")
         phase = (rec.get("phase") or "").lower()
         role = (rec.get("role") or "").lower()
 

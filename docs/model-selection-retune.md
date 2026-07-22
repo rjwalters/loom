@@ -156,6 +156,113 @@ more is better, and a wider spread of issue difficulty makes `merge_rate` more
 trustworthy. Accumulating this sample is an **out-of-band, over-time activity** — it
 is deliberately **not** a Builder deliverable and must not be fabricated.
 
+### Runbook: accruing the observe-mode sample
+
+The `agent-metrics.sh --by-model` plumbing above reads the **activity DB**. A
+parallel, purpose-built collector — the `/loom:sweep` model-cost experiment
+(#3725/#3728) — writes a durable per-phase **outcome-chain** to
+`.loom/stats/sweep-model-stats.jsonl` (arm / model / attempt / Judge verdict /
+Doctor-cycle count / complexity) and harvests it into exactly the per-arm §2
+inequality inputs. This runbook is the copy-pasteable procedure for accruing that
+sample. See `defaults/CLAUDE.md` § "Model-Cost Experiment (canary A/B, #3725)" for
+the full behavior contract.
+
+> **This runbook is the *tooling*. The multi-day accrual run itself — turning on a
+> mode against real sweeps, waiting for the ≥~30-per-arm floor, harvesting a real
+> sample, and re-evaluating the §2 inequality — is a DEFERRED operator action, not
+> a Builder PR deliverable. Do not fabricate stats rows or a harvest report.**
+
+**Step 1 — choose a collection mode.** Tri-state `sweep.modelExperiment` /
+`LOOM_MODEL_EXPERIMENT` (env-over-config, string-valued like `guards.rmScope`):
+
+| Mode | What it collects | Fills both arms? |
+|------|------------------|------------------|
+| `observe` | Passive per-phase outcome-chain; **no model forcing, `arm=null`**. Safe anywhere. | **Only if the workspace itself already runs a mix of Builder models** (e.g. a `roleConfig.model` pin, or `sonnet` first attempts that escalate to `opus`). A stock `opus`-default workspace in `observe` only ever produces Arm A (opus) rows. |
+| `experiment` | Active A/B: Builder **forced** to the per-issue arm's model, complexity bump suppressed. **Canary-only.** | **Yes — deterministically balances A (opus) and B (sonnet).** This is the reliable way to fill both arms. |
+
+Because `observe` never forces a model, a default `opus` workspace cannot generate
+Arm B (sonnet) rows by observation alone — that is precisely why `experiment`
+(canary) mode exists. Harvest attributes an `observe` issue to an arm from its
+**observed Builder model** (opus⇒A, sonnet⇒B); rows whose Builder ran neither stay
+in the `?` bucket. So `observe` is the safe, always-on collector, but a *balanced*
+two-arm sample in a reasonable window generally needs `experiment` on a canary.
+
+**Step 2 — turn the mode on.** Per-invocation (env wins over config):
+
+```bash
+# Passive observe on any sweep (no behavior change; just records the outcome-chain):
+LOOM_MODEL_EXPERIMENT=observe claude -p "/loom:sweep 123" --dangerously-skip-permissions
+
+# Active A/B on a CANARY (must confirm the canary via an UNCOMMITTED signal, else
+# it loudly downgrades to observe):
+LOOM_MODEL_EXPERIMENT=experiment LOOM_MODEL_EXPERIMENT_CANARY=1 \
+  claude -p "/loom:sweep 123" --dangerously-skip-permissions
+```
+
+Or durably for a multi-day window via committed config (safe: the *mode* may live
+in config; it is inert without the uncommitted canary confirmation):
+
+```json
+// .loom/config.json
+{ "sweep": { "modelExperiment": "observe" } }
+```
+
+The canary confirmation must be **uncommitted** by design (#3731): either the
+`LOOM_MODEL_EXPERIMENT_CANARY=1` env var or the gitignored `.loom/CANARY` sentinel
+file (`touch .loom/CANARY`). The committed `sweep.modelExperimentCanary` flag is no
+longer accepted, and a git-tracked `.loom/CANARY` is refused.
+
+**Step 3 — no daemon-side config is needed.** `LOOM_MODEL_EXPERIMENT`,
+`LOOM_MODEL_EXPERIMENT_CANARY`, and `LOOM_TRANSCRIPT_ARCHIVE` propagate to
+daemon-dispatched detached sweep children (#3732), so a sweep launched via
+`mcp__loom__dispatch_sweep` inherits the mode from the daemon's environment — set
+the env (or the committed `sweep.modelExperiment`) once and every dispatched child
+records.
+
+**Step 4 — harvest periodically.** The harvest reader is reachable through the same
+`agent-metrics.sh` surface as `--by-model`, and directly via `sweep-experiment.sh`:
+
+```bash
+# Per-arm inequality inputs (first-pass rate, Doctor cycles, merge rate, cost):
+./.loom/scripts/agent-metrics.sh --model-experiment --archive-dir "$LOOM_TRANSCRIPT_ARCHIVE"
+# Equivalent direct entry point + JSON for scripted aggregation:
+./.loom/scripts/sweep-experiment.sh harvest --archive-dir "$LOOM_TRANSCRIPT_ARCHIVE" --format json
+```
+
+Passing `--archive-dir` (the #3726 transcript archive) upgrades cost from the
+best-effort sweep-aggregate estimate to **exact** per-role token cost — each
+harvested record carries a `token_fidelity` tag (`transcript` | `sweep-aggregate-log`
+| `none`) naming the source. Over a multi-day run, harvest on a cron so usage is
+extracted before `~/.claude/projects` is pruned (mirrors the `probe-tokens.sh` /
+`archive-transcripts.sh` cron pattern):
+
+```cron
+# Harvest every 30 minutes into a log:
+*/30 * * * * cd /path/to/repo && ./.loom/scripts/agent-metrics.sh --model-experiment \
+  --archive-dir "$LOOM_TRANSCRIPT_ARCHIVE" >> .loom/logs/model-experiment-harvest.log 2>&1
+```
+
+**Step 5 — read `n_issues` against the floor.** The harvest prints one row per arm:
+
+```
+  arm  model    issues  1st-pass  cycles  merge      cost$    $/issue
+  A    opus         31      87%    0.10    97%    ...       ...
+  B    sonnet       33      74%    0.55    96%    ...       ...
+```
+
+The sample is representative enough to evaluate the §2 inequality only when **both**
+arm A and arm B show `issues` (i.e. `n_issues`) ≥ ~30 (the "Minimum representative
+sample" floor above). Until then, `harvest` still runs cleanly — an empty or
+single-arm store reports `records: 0` / one arm and never crashes — but the
+`cost(sonnet_first) < cost(opus_first)` decision stays **unevaluable**, and the
+default remains `opus` (the Hard Rule at the top).
+
+**Step 6 (DEFERRED — operator, not this tooling PR).** Once both arms clear the
+floor, evaluate the §2 inequality against the harvested numbers and record a new
+dated entry in the Status log below — either another "keep opus" decision citing the
+now-non-empty sample, or, if conditions (1) and (2) both hold, open the separate
+gated flip PR per §5.
+
 ---
 
 ## 4. Plumbing verification (result)
@@ -234,6 +341,32 @@ here changes a default** unless it also cites a qualifying sample per Section 3.
   not a Builder code change. `observe` mode is the suggested follow-up mechanism for
   generating the `sonnet` vs `opus` data points a passive `opus`-only default can
   never produce on its own.
+
+- **2026-07-22 (#3750) — runbook + observe→harvest wiring shipped; still no data,
+  accrual DEFERRED.** Delivered the operator tooling to *make* the sample
+  collectable, not the sample itself:
+
+  - Added the "Runbook: accruing the observe-mode sample" procedure to §3 (turn on
+    `observe`/`experiment`, confirm the uncommitted canary, harvest on a cron via
+    `agent-metrics.sh --model-experiment`, read `n_issues` against the ≥~30-per-arm
+    floor).
+  - Fixed a genuine observe→harvest gap: a pure `observe`-mode store (every record
+    `arm=null`) previously collapsed into a single `?` bucket with `model=null`,
+    dropping each row's real Builder model — so the opus-vs-sonnet split was
+    unreadable. Harvest now infers an arm-null issue's arm from its observed Builder
+    model (opus⇒A, sonnet⇒B); explicit `experiment` arms are unchanged
+    (`loom-tools/src/loom_tools/sweep_experiment.py`, covered by new tests in
+    `loom-tools/tests/test_sweep_experiment.py`).
+
+  **Representative sample?** Still **no.** This entry ships tooling only and cites no
+  numbers — no real accrual run was performed and none was fabricated. The §2
+  inequality remains unevaluable until an operator accrues ≥~30 model-attributed
+  first attempts on **both** arms.
+
+  **Decision:** `defaults/roles/builder.json` `suggestedModel` remains `opus`. No
+  default changed. The multi-day accrual + harvest + §2 re-evaluation + any
+  opus→sonnet flip is the **deferred operator action** tracked by #3750, not closed
+  by its Builder PR.
 
 ---
 
