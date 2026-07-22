@@ -194,6 +194,47 @@ is introduced by this document. If a future gap appears (e.g. a graceful
 "no data yet" message instead of the raw missing-table error), prefer a dedicated
 follow-up issue over expanding the retune scope.
 
+### Status log
+
+Dated re-evaluations of the gate. Each entry records that the measurement plumbing
+was re-run, what it reported, and the resulting flip / no-flip decision. **No entry
+here changes a default** unless it also cites a qualifying sample per Section 3.
+
+- **2026-07-22 (#3718) — keep `opus`, no data yet.** Re-verified the full §3 gating
+  path against `origin/main`. All four by-model commands still surface the documented
+  *no-activity* case, not a defect:
+
+  ```text
+  $ .loom/scripts/agent-metrics.sh effectiveness --by-model
+  [ERROR] Failed to get metrics: no such table: quality_metrics
+  $ .loom/scripts/agent-metrics.sh effectiveness --by-model --role builder
+  [ERROR] Failed to get metrics: no such table: quality_metrics
+  $ .loom/scripts/agent-metrics.sh costs --by-model
+  [ERROR] Failed to get metrics: no such table: prompt_github
+  $ .loom/scripts/agent-metrics.sh effectiveness --by-model --format json
+  [ERROR] Failed to get metrics: no such table: quality_metrics
+  ```
+
+  The #3725/#3728 model-cost experiment harvest entry point
+  (`agent-metrics.sh --model-experiment`) resolves cleanly and reports zero records
+  (exit 0, `records: 0`, empty per-arm table) — the expected empty state, again not a
+  defect. Unit coverage stays green: `pytest loom-tools/tests/test_agent_metrics.py`
+  → 61 passed.
+
+  **Representative sample?** No. The gate requires ≥~30 model-attributed first
+  attempts per model arm for the Builder role (§3, "Minimum representative sample");
+  the DB has zero attributed rows for *any* arm (neither `sonnet` nor `opus`, not even
+  the `default` bucket). The `cost(sonnet_first) < cost(opus_first)` inequality (§2)
+  therefore cannot be evaluated.
+
+  **Decision:** `defaults/roles/builder.json` `suggestedModel` remains `opus`. No
+  default changed, preserving the Hard Rule at the top of this document. Accruing the
+  sample is out-of-band, over-time work (a multi-day `LOOM_MODEL_EXPERIMENT=observe`
+  or canary `experiment` campaign per `defaults/CLAUDE.md` § "Model-Cost Experiment"),
+  not a Builder code change. `observe` mode is the suggested follow-up mechanism for
+  generating the `sonnet` vs `opus` data points a passive `opus`-only default can
+  never produce on its own.
+
 ---
 
 ## 5. The flip is a separate, gated follow-up
