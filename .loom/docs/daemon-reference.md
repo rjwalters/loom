@@ -262,12 +262,13 @@ The reaper (`sweep_registry::spawn_reaper_task`) ticks every 30 seconds
 4. Garbage-collects terminal entries older than the retention window
    (default 1 hour).
 
-## Stacked-PR dependency (v1) — #3729
+## Stacked-PR dependency — #3729 (v1), #3747 (v2 item 1)
 
 Stacked-PR mode pipelines a genuine dependency: when issue B consumes issue
 A's output, B is built on `feature/issue-A` so B's Curator→Builder→Judge runs
-concurrently with A's review instead of serializing behind A's merge. **v1 is
-opt-in, daemon-`dispatch_sweep`-only, and linear-chains-only.**
+concurrently with A's review instead of serializing behind A's merge. **The
+dispatch surface is opt-in, daemon-`dispatch_sweep`-only, and
+linear-chains-only.**
 
 **Dispatch a chain** — N independent `dispatch_sweep` calls, each naming its
 immediate predecessor via `depends_on` (there is no multi-node planner):
@@ -293,13 +294,39 @@ stack surfaces to the operator and the child does not auto-progress. This is
 implemented via `SweepRegistry::children_of` + `block_children_of`. Auto-detach
 (rebasing an orphaned child onto the default branch) is **out of scope for v1**.
 
-**Reconciliation is a manual, scripted step (v1).** Because the repo
-squash-merges, after the parent squash-merges the child branch still carries
-the parent's pre-squash commits. After confirming the parent merged, the
-operator runs `./.loom/scripts/reconcile-stack.sh <child-pr> feature/issue-<parent>`
-(`git rebase --onto <default> <parent-branch> <child-branch>` +
-`--force-with-lease` + `gh pr edit --base <default>`). `merge-pr.sh` is **not**
-modified in v1 — no automatic reconciliation and no merge-ordering guard.
+**Reconciliation is triggered automatically on parent merge (v2 item 1,
+#3747).** Because the repo squash-merges, after the parent squash-merges the
+child branch still carries the parent's pre-squash commits. `merge-pr.sh` now
+fires reconciliation automatically at its post-merge choke point (alongside the
+partial-increment label reset, before branch deletion): it discovers open child
+PRs via a **live forge query** (`gh pr list --base feature/issue-<parent>` — not
+the daemon registry, whose terminal entries are GC'd ~1h after transition and
+which only exists when `loom-daemon` is running), then per child splits
+safe/unsafe on the child **issue's** `loom:building` label (fresh, uncached `gh
+api` read):
+
+- **Safe** (child issue not `loom:building`): invokes
+  `./.loom/scripts/reconcile-stack.sh <child-pr> feature/issue-<parent>`
+  (`git rebase --onto <default> <parent-branch> <child-branch>` +
+  `--force-with-lease` + `gh pr edit --base <default>`).
+- **Unsafe** (child issue still `loom:building`): a live Builder likely holds
+  the child branch checked out, so the auto-rebase is **skipped** and a comment
+  is posted on the child PR flagging deferred reconciliation. A later
+  parent-merge-triggered pass (once the issue is no longer `loom:building`), or
+  a manual run, picks it up.
+
+The whole step is **best-effort** — a reconciliation failure (rebase conflict,
+rejected force-with-lease, retarget failure) is logged as a warning and never
+changes `merge-pr.sh`'s exit code (the parent merge already happened). It is
+idempotent by construction: once a child's base is retargeted away from the
+parent branch, the `--base` query returns zero rows on any re-run.
+
+`reconcile-stack.sh` remains available for **manual** invocation — for the
+unsafe/deferred case once the Builder finishes, or for an operator who wants to
+reconcile ahead of a merge (`--dry-run` previews the git surgery). The
+**merge-ordering guard** (never merge a parent whose children haven't
+retargeted) and **rebase-on-parent-amend** remain **out of scope** (deferred
+items of the v2 epic #3747).
 
 ## Locks and lifecycle
 
