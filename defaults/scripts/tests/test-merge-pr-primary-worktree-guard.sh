@@ -55,8 +55,8 @@ echo "Test 1: merge-pr.sh source retains the #3710 primary-worktree guard"
 
 assert_grep '_primary_worktree_path\(\) \{' "$MERGE_PR" \
     "merge-pr.sh defines the _primary_worktree_path helper"
-assert_grep "awk '/\^worktree / \{ print \\\$2; exit \}'" "$MERGE_PR" \
-    "_primary_worktree_path takes the FIRST worktree entry (print; exit)"
+assert_grep "awk '/\^worktree / \{ print substr\(\\\$0, 10\); exit \}'" "$MERGE_PR" \
+    "_primary_worktree_path takes the FIRST worktree entry, space-safe (substr; exit)"
 assert_grep 'Refusing to remove the primary/main worktree' "$MERGE_PR" \
     "_remove_loom_worktree refuses when the target resolves to the primary"
 assert_grep 'primary_real="\$\(_primary_worktree_path\)"' "$MERGE_PR" \
@@ -192,6 +192,84 @@ if [[ $sec_rc -eq 0 ]] \
     pass "secondary managed worktree is removed (guard is surgical, not blanket)"
 else
     fail "secondary should be removed; rc=$sec_rc, dir_exists=$([[ -d "$SECONDARY" ]] && echo yes || echo no), out: $sec_out"
+fi
+
+# --- Test 4: space-in-path regression (#3717) ---
+# The porcelain `worktree <path>` line is unquoted/unescaped and may contain
+# spaces. Parsing with $2 (whitespace-split) truncates at the first space; the
+# fix parses via substr($0, 10) (strip the literal `worktree ` prefix). Assert
+# every porcelain-parsing helper resolves the FULL space-containing path, plus
+# the --worktree-path registered-worktree validation snippet.
+echo ""
+echo "Test 4: porcelain parsing preserves worktree paths containing spaces (#3717)"
+
+# Extract _find_worktree_by_branch too (used below); other bodies already eval'd.
+eval "$(extract_fn _find_worktree_by_branch "$MERGE_PR")"
+
+SP_ROOT="$TMP_ROOT/My Repos"     # <-- the space lives here
+SP_PRIMARY="$SP_ROOT/repo"
+mkdir -p "$SP_PRIMARY"
+git -C "$SP_PRIMARY" init -q
+git -C "$SP_PRIMARY" config user.email "test@example.com"
+git -C "$SP_PRIMARY" config user.name "Test"
+echo "hello" > "$SP_PRIMARY/README.md"
+git -C "$SP_PRIMARY" add -A
+git -C "$SP_PRIMARY" commit -q -m "initial"
+
+# A secondary worktree, also under a space-containing path.
+SP_SECONDARY="$SP_ROOT/wt/issue-3717"
+SP_BRANCH="feature/issue-3717"
+git -C "$SP_PRIMARY" worktree add -q -b "$SP_BRANCH" "$SP_SECONDARY" >/dev/null 2>&1
+
+# Resolve canonical (symlink-free) forms to compare against git's output.
+SP_PRIMARY_REAL="$(cd "$SP_PRIMARY" && pwd -P)"
+SP_SECONDARY_REAL="$(cd "$SP_SECONDARY" && pwd -P)"
+
+# Point the eval'd helpers at the space-containing primary.
+# shellcheck disable=SC2034
+REPO_ROOT="$SP_PRIMARY"
+
+# (a) _primary_worktree_path returns the FULL primary path (not truncated at
+#     "My").
+sp_primary="$(_primary_worktree_path)"
+if [[ "$sp_primary" == "$SP_PRIMARY_REAL" ]]; then
+    pass "_primary_worktree_path returns the full space-containing path"
+else
+    fail "_primary_worktree_path truncated: expected '$SP_PRIMARY_REAL', got '$sp_primary'"
+fi
+
+# (b) _find_worktree_by_branch returns the FULL secondary path.
+sp_found="$(_find_worktree_by_branch "$SP_BRANCH")"
+if [[ "$sp_found" == "$SP_SECONDARY_REAL" ]]; then
+    pass "_find_worktree_by_branch returns the full space-containing secondary path"
+else
+    fail "_find_worktree_by_branch truncated: expected '$SP_SECONDARY_REAL', got '$sp_found'"
+fi
+
+# (c) _worktree_branch_for resolves the correct branch short-name from the
+#     full space-containing path.
+sp_branch="$(_worktree_branch_for "$SP_SECONDARY_REAL")"
+if [[ "$sp_branch" == "$SP_BRANCH" ]]; then
+    pass "_worktree_branch_for resolves the branch from a space-containing path"
+else
+    fail "_worktree_branch_for failed on space path: expected '$SP_BRANCH', got '$sp_branch'"
+fi
+
+# (d) The --worktree-path registered-worktree validation snippet (the same awk
+#     used at merge-pr.sh:~242) must accept the full space-containing path.
+if git -C "$SP_PRIMARY" worktree list --porcelain 2>/dev/null | \
+     awk -v p="$SP_SECONDARY_REAL" '/^worktree / { if (substr($0, 10) == p) { found=1; exit } } END { exit !found }'; then
+    pass "--worktree-path validation accepts a registered space-containing worktree"
+else
+    fail "--worktree-path validation rejected a registered space-containing worktree"
+fi
+
+# (e) Negative control: an unregistered space path must still be rejected.
+if git -C "$SP_PRIMARY" worktree list --porcelain 2>/dev/null | \
+     awk -v p="$SP_ROOT/not a worktree" '/^worktree / { if (substr($0, 10) == p) { found=1; exit } } END { exit !found }'; then
+    fail "--worktree-path validation wrongly accepted an unregistered path"
+else
+    pass "--worktree-path validation still rejects an unregistered space-containing path"
 fi
 
 # --- Summary ---
