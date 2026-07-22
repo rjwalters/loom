@@ -458,12 +458,29 @@ If you need to clean up worktrees:
 # Convert a sparse worktree back to a full checkout
 ./.loom/scripts/worktree.sh 42 --full
 
+# Remove ONE managed worktree on demand (sanctioned single-worktree removal —
+# never call `git worktree remove` directly). Removes .loom/worktrees/issue-42
+# and deletes its local branch (safe `git branch -d`, refuses on unmerged
+# commits). Honors the .loom-managed sentinel (refuses user-provisioned
+# worktrees), is idempotent (clear no-op if absent), and prunes the git
+# worktree registration.
+./.loom/scripts/worktree.sh remove 42
+
+# Same, but keep the local feature branch
+./.loom/scripts/worktree.sh remove 42 --keep-branch
+
 # Check if you're in a worktree
 ./.loom/scripts/worktree.sh --check
 
 # Show help
 ./.loom/scripts/worktree.sh --help
 ```
+
+**Single vs. bulk removal**: `worktree.sh remove <N>` targets exactly one
+issue's managed worktree (e.g. a dead builder's stale checkout). `loom-clean`
+remains the bulk/stale-cleanup path across all closed issues (unchanged). Both
+are safe — you never need `git worktree remove` directly (which corrupts shell
+state when run from inside the worktree, per the warning above).
 
 **Sparse-Mode Notes**:
 - `--sparse` and `--full` are mutually exclusive
