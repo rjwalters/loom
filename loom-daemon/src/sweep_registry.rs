@@ -303,12 +303,20 @@ impl SweepRegistry {
     /// the argv (immediately after any `--model`). When `None` or empty, no
     /// `--effort` flag is emitted at all — the session default reasoning
     /// effort is preserved end-to-end.
+    ///
+    /// `depends_on` (issue #3729, stacked-PR v1): when `Some(N)`, the spawned
+    /// child receives `--depends-on <N>` appended to the argv (immediately
+    /// after any `--model` / `--effort`), instructing `/loom:sweep` to branch
+    /// its worktree/PR off `feature/issue-<N>`. When `None`, no
+    /// `--depends-on` flag is emitted — byte-for-byte unchanged behavior. A
+    /// single optional parent (not a list) makes diamonds unrepresentable.
     pub fn dispatch(
         &mut self,
         kind: &SweepKind,
         idempotency_key: Option<String>,
         model: Option<&str>,
         effort: Option<&str>,
+        depends_on: Option<u32>,
     ) -> Result<DispatchOutcome> {
         // 1. Idempotency dedup against Running entries.
         if let Some(ref key) = idempotency_key {
@@ -352,7 +360,7 @@ impl SweepRegistry {
         // 5. Compute the log path and spawn the child.
         let log_path = self.compute_log_path(issue_number);
         let (pid, token_name) = self
-            .spawn_child(issue_number, &log_path, &sweep_id, model, effort)
+            .spawn_child(issue_number, &log_path, &sweep_id, model, effort, depends_on)
             .context("failed to spawn sweep child")?;
 
         // 6. Record the entry. The model is carried on the registry entry
@@ -373,6 +381,7 @@ impl SweepRegistry {
             pr_number: None,
             model: model.filter(|m| !m.is_empty()).map(String::from),
             effort: effort.filter(|e| !e.is_empty()).map(String::from),
+            depends_on,
         };
         self.entries.insert(sweep_id.clone(), info);
 
@@ -514,6 +523,92 @@ impl SweepRegistry {
     }
 
     // ------------------------------------------------------------------------
+    // Stacked-PR block-the-subtree (issue #3729, v1 item 4)
+    // ------------------------------------------------------------------------
+
+    /// Return the issue numbers of every still-live (`Running`/`Pending`)
+    /// sweep whose `depends_on` names `parent`. Terminal children are
+    /// excluded — they no longer need blocking. Because `depends_on` is a
+    /// single optional parent, this only ever returns the *direct* children
+    /// of `parent` (a linear chain hop, never a diamond).
+    #[must_use]
+    pub fn children_of(&self, parent: u32) -> Vec<u32> {
+        self.entries
+            .values()
+            .filter(|info| {
+                matches!(info.state, SweepState::Running | SweepState::Pending)
+                    && info.depends_on == Some(parent)
+            })
+            .filter_map(|info| match &info.kind {
+                SweepKind::Issue(n) => Some(*n),
+                SweepKind::PrSet(_) => None,
+            })
+            .collect()
+    }
+
+    /// Block the subtree stacked on `parent` (issue #3729, v1 item 4).
+    ///
+    /// For each direct child of `parent` (see [`Self::children_of`]), emit a
+    /// `sweep.issue.{child}.blocker` event on the existing frozen event-bus
+    /// topic (#3453 — no new topic). This is the safety net that keeps a
+    /// stacked child from auto-progressing (opening/merging its PR) when its
+    /// parent ends in `loom:blocked`. Auto-detach (rebasing an orphaned child
+    /// onto `main`) is explicitly out of v1 scope — block-the-subtree is the
+    /// only cascade behavior.
+    ///
+    /// Returns the child issue numbers that were signalled. Emission is
+    /// best-effort (no subscribers ⇒ debug log only), mirroring the rest of
+    /// the reaper's event handling.
+    pub fn block_children_of(&self, parent: u32, reason: &str) -> Vec<u32> {
+        let children = self.children_of(parent);
+        for child in &children {
+            self.emit_event(Event::SweepBlocker {
+                issue: *child,
+                reason: reason.to_string(),
+                label_added: "loom:blocked".to_string(),
+            });
+        }
+        children
+    }
+
+    /// Best-effort check of whether `issue` currently carries the
+    /// `loom:blocked` label on the forge. Used by the reaper to decide
+    /// whether a terminated parent ended blocked (in which case its stacked
+    /// children must be blocked too) versus completing successfully.
+    ///
+    /// Returns `false` on any error, when label flips are skipped (test
+    /// fixtures), or when `gh` is unavailable — a conservative default that
+    /// never blocks a child on an unverifiable parent state.
+    fn issue_has_blocked_label(&self, issue: u32) -> bool {
+        if self.config.skip_label_flip {
+            return false;
+        }
+        let gh = self
+            .config
+            .gh_bin
+            .clone()
+            .unwrap_or_else(|| PathBuf::from("gh"));
+        let mut cmd = Command::new(&gh);
+        cmd.arg("issue")
+            .arg("view")
+            .arg(issue.to_string())
+            .arg("--json")
+            .arg("labels")
+            .arg("--jq")
+            .arg(r#"[.labels[].name] | index("loom:blocked") != null"#);
+        if let Ok(repo) = std::env::var("LOOM_REPO") {
+            cmd.arg("--repo").arg(repo);
+        }
+        cmd.stderr(Stdio::null());
+        match cmd.output() {
+            Ok(out) if out.status.success() => {
+                String::from_utf8_lossy(&out.stdout).trim() == "true"
+            }
+            _ => false,
+        }
+    }
+
+    // ------------------------------------------------------------------------
     // Spawn
     // ------------------------------------------------------------------------
 
@@ -530,6 +625,7 @@ impl SweepRegistry {
         sweep_id: &str,
         model: Option<&str>,
         effort: Option<&str>,
+        depends_on: Option<u32>,
     ) -> Result<(u32, String)> {
         let spawn_bin = self.config.resolve_spawn_bin()?;
 
@@ -584,6 +680,14 @@ impl SweepRegistry {
             if !e.is_empty() {
                 cmd.arg("--effort").arg(e);
             }
+        }
+        // Stacked-PR dependency (issue #3729, v1): when a parent issue is
+        // declared, append `--depends-on <N>` so `/loom:sweep` branches the
+        // child worktree/PR off `feature/issue-<N>` instead of the default
+        // branch. Absent the param, no flag is emitted (byte-for-byte
+        // unchanged). Mirrors the `--model` / `--effort` append-only contract.
+        if let Some(parent) = depends_on {
+            cmd.arg("--depends-on").arg(parent.to_string());
         }
         cmd.env("LOOM_TERMINAL_ID", format!("daemon-{sweep_id}"))
             // Always pin LOOM_WORKSPACE to the registry's configured root so
@@ -850,6 +954,26 @@ impl SweepRegistry {
                                 outcome: SweepOutcome::Exited,
                             });
                         }
+                        // Block-the-subtree (issue #3729, v1 item 4): if this
+                        // parent ended in `loom:blocked` and stacked children
+                        // still depend on it, signal each child's blocker on
+                        // the existing frozen topic so it does not
+                        // auto-progress. Cheap-guarded: we only consult the
+                        // forge label when direct children actually exist.
+                        let children = self.children_of(issue);
+                        if !children.is_empty() && self.issue_has_blocked_label(issue) {
+                            let reason = format!(
+                                "parent sweep #{issue} ended in loom:blocked; \
+                                 stacked child cannot auto-progress (block-the-subtree, #3729)"
+                            );
+                            for child in children {
+                                events_to_emit.push(Event::SweepBlocker {
+                                    issue: child,
+                                    reason: reason.clone(),
+                                    label_added: "loom:blocked".to_string(),
+                                });
+                            }
+                        }
                     } else {
                         if let Some(info) = self.entries.get_mut(&sweep_id) {
                             info.state = SweepState::Exited {
@@ -979,6 +1103,8 @@ impl SweepRegistry {
                         model: None,
                         // Effort is likewise unrecoverable from the lock (#3716).
                         effort: None,
+                        // depends_on is not recorded in the lock owner (#3729).
+                        depends_on: None,
                     },
                 );
                 admitted += 1;
@@ -1028,8 +1154,9 @@ impl SweepRegistry {
                         state: SweepState::Crashed { at: Utc::now() },
                         latest_phase: phase,
                         pr_number: None,
-                        model: None,  // not recoverable from a checkpoint-only entry
-                        effort: None, // not recoverable from a checkpoint-only entry
+                        model: None,      // not recoverable from a checkpoint-only entry
+                        effort: None,     // not recoverable from a checkpoint-only entry
+                        depends_on: None, // not recoverable from a checkpoint-only entry
                     },
                 );
                 admitted += 1;
@@ -1313,7 +1440,7 @@ exit 0
         let (mut registry, record_log) = fixture_registry(dir.path());
 
         let outcome = registry
-            .dispatch(&SweepKind::Issue(42), None, None, None)
+            .dispatch(&SweepKind::Issue(42), None, None, None, None)
             .expect("dispatch should succeed");
 
         assert!(outcome.was_new);
@@ -1377,7 +1504,7 @@ exit 0
         let (mut registry, record_log) = fixture_registry(dir.path());
 
         let outcome = registry
-            .dispatch(&SweepKind::Issue(43), None, Some("claude-sonnet-4-6"), None)
+            .dispatch(&SweepKind::Issue(43), None, Some("claude-sonnet-4-6"), None, None)
             .expect("dispatch should succeed");
 
         let needle = format!("LOOM_TERMINAL_ID=daemon-{}", outcome.sweep_id);
@@ -1409,7 +1536,7 @@ exit 0
         let (mut registry, record_log) = fixture_registry(dir.path());
 
         let outcome = registry
-            .dispatch(&SweepKind::Issue(44), None, Some(""), None)
+            .dispatch(&SweepKind::Issue(44), None, Some(""), None, None)
             .expect("dispatch should succeed");
 
         let needle = format!("LOOM_TERMINAL_ID=daemon-{}", outcome.sweep_id);
@@ -1439,7 +1566,7 @@ exit 0
         let (mut registry, record_log) = fixture_registry(dir.path());
 
         let outcome = registry
-            .dispatch(&SweepKind::Issue(45), None, None, Some("xhigh"))
+            .dispatch(&SweepKind::Issue(45), None, None, Some("xhigh"), None)
             .expect("dispatch should succeed");
 
         let needle = format!("LOOM_TERMINAL_ID=daemon-{}", outcome.sweep_id);
@@ -1470,7 +1597,7 @@ exit 0
         let (mut registry, record_log) = fixture_registry(dir.path());
 
         let outcome = registry
-            .dispatch(&SweepKind::Issue(46), None, Some("claude-sonnet-4-6"), Some("xhigh"))
+            .dispatch(&SweepKind::Issue(46), None, Some("claude-sonnet-4-6"), Some("xhigh"), None)
             .expect("dispatch should succeed");
 
         let needle = format!("LOOM_TERMINAL_ID=daemon-{}", outcome.sweep_id);
@@ -1497,7 +1624,7 @@ exit 0
         let (mut registry, record_log) = fixture_registry(dir.path());
 
         let outcome = registry
-            .dispatch(&SweepKind::Issue(47), None, None, Some(""))
+            .dispatch(&SweepKind::Issue(47), None, None, Some(""), None)
             .expect("dispatch should succeed");
 
         let needle = format!("LOOM_TERMINAL_ID=daemon-{}", outcome.sweep_id);
@@ -1516,6 +1643,171 @@ exit 0
             None,
             "empty effort must be recorded as None on the SweepInfo entry"
         );
+    }
+
+    /// Issue #3729 (stacked-PR v1): a `depends_on` dispatch param threads
+    /// through to the spawn command as an explicit `--depends-on <N>`
+    /// argument, mirroring `--model` / `--effort`. It is recorded on the
+    /// SweepInfo entry so the reaper can block the subtree on parent failure.
+    #[test]
+    #[serial]
+    fn dispatch_with_depends_on_appends_depends_on_arg() {
+        let dir = tempdir().unwrap();
+        let (mut registry, record_log) = fixture_registry(dir.path());
+
+        let outcome = registry
+            .dispatch(&SweepKind::Issue(50), None, None, None, Some(49))
+            .expect("dispatch should succeed");
+
+        let needle = format!("LOOM_TERMINAL_ID=daemon-{}", outcome.sweep_id);
+        assert!(
+            wait_for_contents(&record_log, &needle, 10000),
+            "fake spawn-claude.sh did not finish writing within 10s"
+        );
+        let recorded = std::fs::read_to_string(&record_log).unwrap();
+        assert!(
+            recorded.contains("argv: -p /loom:sweep 50 --depends-on 49"),
+            "expected --depends-on in argv; got: {recorded}"
+        );
+        assert_eq!(
+            registry.get(&outcome.sweep_id).unwrap().depends_on,
+            Some(49),
+            "dispatch depends_on must be recorded on the SweepInfo entry"
+        );
+    }
+
+    /// Issue #3729: absent `depends_on`, no `--depends-on` flag is emitted —
+    /// byte-for-byte unchanged behavior (opt-in, no default-path regression).
+    #[test]
+    #[serial]
+    fn dispatch_without_depends_on_emits_no_flag() {
+        let dir = tempdir().unwrap();
+        let (mut registry, record_log) = fixture_registry(dir.path());
+
+        let outcome = registry
+            .dispatch(&SweepKind::Issue(51), None, None, None, None)
+            .expect("dispatch should succeed");
+
+        let needle = format!("LOOM_TERMINAL_ID=daemon-{}", outcome.sweep_id);
+        assert!(
+            wait_for_contents(&record_log, &needle, 10000),
+            "fake spawn-claude.sh did not finish writing within 10s"
+        );
+        let recorded = std::fs::read_to_string(&record_log).unwrap();
+        assert!(
+            !recorded.contains("--depends-on"),
+            "depends_on=None must not emit --depends-on; got: {recorded}"
+        );
+        assert_eq!(
+            registry.get(&outcome.sweep_id).unwrap().depends_on,
+            None,
+            "depends_on=None must be recorded as None on the SweepInfo entry"
+        );
+    }
+
+    /// Issue #3729 (v1 item 4, block-the-subtree): `block_children_of` emits a
+    /// `sweep.issue.{child}.blocker` event for every live child whose
+    /// `depends_on` names the given parent — and nothing for unrelated sweeps.
+    #[tokio::test]
+    async fn block_children_of_emits_blocker_for_dependents_only() {
+        use crate::event_bus::EventBus;
+
+        let dir = tempdir().unwrap();
+        let (mut registry, _record_log) = fixture_registry(dir.path());
+        let bus = Arc::new(EventBus::new());
+        registry.set_event_bus(bus.clone());
+        let mut sub = bus.subscribe::<[&str; 0], &str>([]);
+
+        // Parent #60, a stacked child #61 (depends_on=60), and an unrelated
+        // independent sweep #62 (depends_on=None).
+        for (sid, issue, dep) in [
+            ("sweep-issue-60", 60u32, None),
+            ("sweep-issue-61", 61u32, Some(60u32)),
+            ("sweep-issue-62", 62u32, None),
+        ] {
+            registry.entries.insert(
+                sid.to_string(),
+                SweepInfo {
+                    sweep_id: sid.to_string(),
+                    kind: SweepKind::Issue(issue),
+                    pid: 2_147_483_640,
+                    token_name: "unknown".into(),
+                    log_path: registry.compute_log_path(issue),
+                    idempotency_key: None,
+                    started_at: Utc::now(),
+                    state: SweepState::Running,
+                    latest_phase: None,
+                    pr_number: None,
+                    model: None,
+                    effort: None,
+                    depends_on: dep,
+                },
+            );
+        }
+
+        let blocked = registry.block_children_of(60, "parent #60 blocked");
+        assert_eq!(blocked, vec![61], "only #61 depends on #60");
+
+        // Exactly one blocker event, for issue 61 on its .blocker topic.
+        let ev = sub.recv().await.unwrap();
+        match ev {
+            Event::SweepBlocker {
+                issue, label_added, ..
+            } => {
+                assert_eq!(issue, 61);
+                assert_eq!(label_added, "loom:blocked");
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+    }
+
+    /// Issue #3729: `children_of` only returns *live* direct children, and a
+    /// terminal child is excluded (it no longer needs blocking).
+    #[test]
+    #[serial]
+    fn children_of_returns_live_direct_children_only() {
+        let dir = tempdir().unwrap();
+        let (mut registry, _record_log) = fixture_registry(dir.path());
+
+        fn mk(issue: u32, dep: Option<u32>, state: SweepState) -> SweepInfo {
+            SweepInfo {
+                sweep_id: format!("s{issue}"),
+                kind: SweepKind::Issue(issue),
+                pid: 2_147_483_640,
+                token_name: "unknown".into(),
+                log_path: PathBuf::from(format!(".loom/logs/sweep-issue-{issue}.log")),
+                idempotency_key: None,
+                started_at: Utc::now(),
+                state,
+                latest_phase: None,
+                pr_number: None,
+                model: None,
+                effort: None,
+                depends_on: dep,
+            }
+        }
+        registry
+            .entries
+            .insert("s70".into(), mk(70, None, SweepState::Running));
+        registry
+            .entries
+            .insert("s71".into(), mk(71, Some(70), SweepState::Running));
+        // Terminal child — excluded.
+        registry.entries.insert(
+            "s72".into(),
+            mk(
+                72,
+                Some(70),
+                SweepState::Exited {
+                    code: None,
+                    at: Utc::now(),
+                },
+            ),
+        );
+
+        let mut kids = registry.children_of(70);
+        kids.sort_unstable();
+        assert_eq!(kids, vec![71], "only the live child #71 is returned");
     }
 
     /// Issue #3730: when the experiment-related env vars are set in the daemon
@@ -1537,7 +1829,7 @@ exit 0
         std::env::set_var("LOOM_TRANSCRIPT_ARCHIVE", "/tmp/loom-archive-3730");
 
         let outcome = registry
-            .dispatch(&SweepKind::Issue(48), None, None, None)
+            .dispatch(&SweepKind::Issue(48), None, None, None, None)
             .expect("dispatch should succeed");
 
         // Clean up the process env immediately so a failure below can't leak
@@ -1589,7 +1881,7 @@ exit 0
         let (mut registry, record_log) = fixture_registry(dir.path());
 
         let outcome = registry
-            .dispatch(&SweepKind::Issue(49), None, None, None)
+            .dispatch(&SweepKind::Issue(49), None, None, None, None)
             .expect("dispatch should succeed");
 
         let needle = format!("LOOM_TERMINAL_ID=daemon-{}", outcome.sweep_id);
@@ -1625,10 +1917,10 @@ exit 0
         let dir = tempdir().unwrap();
         let (mut registry, _record_log) = fixture_registry(dir.path());
 
-        let first = registry.dispatch(&SweepKind::Issue(7), None, None, None);
+        let first = registry.dispatch(&SweepKind::Issue(7), None, None, None, None);
         assert!(first.is_ok());
 
-        let second = registry.dispatch(&SweepKind::Issue(7), None, None, None);
+        let second = registry.dispatch(&SweepKind::Issue(7), None, None, None, None);
         assert!(second.is_err(), "second dispatch for issue #7 should fail (lock collision)");
         let err = second.unwrap_err().to_string();
         assert!(err.contains("lock collision"), "expected lock collision error; got: {err}");
@@ -1641,7 +1933,7 @@ exit 0
         let (mut registry, _record_log) = fixture_registry(dir.path());
 
         let first = registry
-            .dispatch(&SweepKind::Issue(99), Some("key-A".to_string()), None, None)
+            .dispatch(&SweepKind::Issue(99), Some("key-A".to_string()), None, None, None)
             .unwrap();
         assert!(first.was_new);
 
@@ -1649,7 +1941,7 @@ exit 0
         // Issue #99 is the same kind, but we don't need a different issue —
         // the dedup is purely on the idempotency key.
         let second = registry
-            .dispatch(&SweepKind::Issue(99), Some("key-A".to_string()), None, None)
+            .dispatch(&SweepKind::Issue(99), Some("key-A".to_string()), None, None, None)
             .unwrap();
         assert!(!second.was_new);
         assert_eq!(first.sweep_id, second.sweep_id);
@@ -1660,7 +1952,7 @@ exit 0
         let dir = tempdir().unwrap();
         let (mut registry, _record_log) = fixture_registry(dir.path());
 
-        let outcome = registry.dispatch(&SweepKind::PrSet(vec![1, 2, 3]), None, None, None);
+        let outcome = registry.dispatch(&SweepKind::PrSet(vec![1, 2, 3]), None, None, None, None);
         assert!(outcome.is_err());
         assert!(outcome
             .unwrap_err()
@@ -1675,7 +1967,7 @@ exit 0
 
         // Dispatch and then poke an entry into Exited state directly.
         let outcome = registry
-            .dispatch(&SweepKind::Issue(11), None, None, None)
+            .dispatch(&SweepKind::Issue(11), None, None, None, None)
             .unwrap();
         let entry = registry.entries.get_mut(&outcome.sweep_id).unwrap();
         entry.state = SweepState::Exited {
@@ -1732,6 +2024,7 @@ exit 0
                 pr_number: None,
                 model: None,
                 effort: None,
+                depends_on: None,
             },
         );
 
@@ -1803,6 +2096,7 @@ exit 0
                 pr_number: None,
                 model: None,
                 effort: None,
+                depends_on: None,
             },
         );
 
@@ -1856,6 +2150,7 @@ exit 0
                 pr_number: None,
                 model: None,
                 effort: None,
+                depends_on: None,
             },
         );
 
@@ -1891,6 +2186,7 @@ exit 0
                 pr_number: None,
                 model: None,
                 effort: None,
+                depends_on: None,
             },
         );
 
@@ -2052,7 +2348,7 @@ exit 0
         let mut registry = SweepRegistry::new(config);
 
         let outcome = registry
-            .dispatch(&SweepKind::Issue(123), None, None, None)
+            .dispatch(&SweepKind::Issue(123), None, None, None, None)
             .unwrap();
         assert!(outcome.was_new);
 
@@ -2089,6 +2385,7 @@ exit 0
             pr_number: Some(456),
             model: Some("claude-sonnet-4-6".to_string()),
             effort: Some("xhigh".to_string()),
+            depends_on: None,
         };
         let json = serde_json::to_value(vec![info]).unwrap();
         let expected = serde_json::json!([{
@@ -2197,6 +2494,7 @@ exit 0
                 pr_number: None,
                 model: None,
                 effort: None,
+                depends_on: None,
             },
         );
 
@@ -2235,6 +2533,7 @@ exit 0
                 pr_number: None,
                 model: None,
                 effort: None,
+                depends_on: None,
             },
         );
 
@@ -2295,6 +2594,7 @@ exit 0
                 pr_number: None,
                 model: None,
                 effort: None,
+                depends_on: None,
             },
         );
 
@@ -2333,6 +2633,7 @@ exit 0
                 pr_number: None,
                 model: None,
                 effort: None,
+                depends_on: None,
             },
         );
 
@@ -2389,6 +2690,7 @@ exit 0
                 pr_number: None,
                 model: None,
                 effort: None,
+                depends_on: None,
             },
         );
 
@@ -2442,6 +2744,7 @@ exit 0
                 pr_number: None,
                 model: None,
                 effort: None,
+                depends_on: None,
             },
         );
 

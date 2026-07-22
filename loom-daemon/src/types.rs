@@ -152,6 +152,17 @@ pub enum Request {
     /// `None` (or absent on the wire — `#[serde(default)]` keeps existing
     /// clients compatible) or empty, NO `--effort` flag is emitted and the
     /// session-default effort is preserved.
+    ///
+    /// `depends_on` (issue #3729, stacked-PR v1) optionally names the single
+    /// parent issue this sweep is stacked on. When `Some(N)`, the daemon
+    /// appends `--depends-on <N>` to the `/loom:sweep` argv (mirroring the
+    /// `--model` / `--effort` append-only, empty-means-unset contract), and
+    /// the spawned child branches its worktree/PR off `feature/issue-<N>`
+    /// instead of the default branch. When `None` (or absent on the wire —
+    /// `#[serde(default)]` keeps existing clients compatible), NO
+    /// `--depends-on` flag is emitted and behavior is byte-for-byte
+    /// unchanged. A single optional parent (not a `Vec`) makes diamonds /
+    /// multi-parent stacks structurally unrepresentable — see #3729 v1 scope.
     DispatchSweep {
         kind: SweepKind,
         idempotency_key: Option<String>,
@@ -159,6 +170,8 @@ pub enum Request {
         model: Option<String>,
         #[serde(default)]
         effort: Option<String>,
+        #[serde(default)]
+        depends_on: Option<u32>,
     },
     /// List tracked sweeps, optionally filtered by state.
     ListSweeps {
@@ -481,6 +494,16 @@ pub struct SweepInfo {
     /// `#[serde(default)]` keeps pre-#3716 wire data and clients compatible.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub effort: Option<String>,
+    /// Single parent issue this sweep is stacked on (issue #3729, stacked-PR
+    /// v1). Mirrors the `depends_on` param of `DispatchSweep`: `Some(N)` when
+    /// the sweep was dispatched with `--depends-on <N>` (so its worktree/PR
+    /// branches off `feature/issue-<N>`), `None` for an independent sweep.
+    /// The reaper uses this to block a stacked child's subtree when its
+    /// parent ends in `loom:blocked` (block-the-subtree, #3729 item 4).
+    /// A single optional parent makes diamonds structurally unrepresentable.
+    /// `#[serde(default)]` keeps pre-#3729 wire data and clients compatible.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub depends_on: Option<u32>,
 }
 
 // ========================================================================

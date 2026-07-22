@@ -436,6 +436,7 @@ This script helps AI agents safely create and manage git worktrees.
 Usage:
   pnpm worktree <issue-number>                          Create worktree for issue
   pnpm worktree <issue-number> <branch>                 Create worktree with custom branch
+  pnpm worktree <issue-number> --base <branch>          Branch off <branch> (stacked PR, #3729)
   pnpm worktree <issue-number> --sparse <paths...>      Cone-mode sparse checkout
   pnpm worktree <issue-number> --full                   Convert sparse worktree to full
   pnpm worktree --check                                 Check if in a worktree
@@ -451,6 +452,11 @@ Examples:
   pnpm worktree 42 fix-bug
     Creates: .loom/worktrees/issue-42
     Branch: feature/fix-bug
+
+  pnpm worktree 42 --base feature/issue-41
+    Creates: .loom/worktrees/issue-42
+    Branch: feature/issue-42, branched off feature/issue-41 instead of the
+    default branch (stacked-PR mode, #3729). Used by /loom:sweep --depends-on.
 
   pnpm worktree 42 --sparse src/lib defaults/scripts
     Creates a sparse worktree containing only the listed paths plus the
@@ -630,6 +636,11 @@ SPARSE_MODE=false
 FULL_MODE=false
 SPARSE_PATHS=()
 CUSTOM_BRANCH=""
+# Base-branch override (#3729, stacked-PR v1). When set via `--base <branch>`,
+# the new feature branch is created from (and stale worktrees reset to) that
+# branch instead of origin/$DEFAULT_BRANCH. `/loom:sweep --depends-on <parent>`
+# passes `--base feature/issue-<parent>` so the child stacks on the parent.
+BASE_BRANCH=""
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -645,6 +656,14 @@ while [[ $# -gt 0 ]]; do
         --full)
             FULL_MODE=true
             shift
+            ;;
+        --base)
+            BASE_BRANCH="$2"
+            if [[ -z "$BASE_BRANCH" ]]; then
+                print_error "--base requires a branch name"
+                exit 1
+            fi
+            shift 2
             ;;
         --*)
             print_error "Unknown flag: $1"
@@ -809,6 +828,38 @@ fi
 # Uses fetch-only to avoid conflicts with worktrees that have it checked out
 fetch_latest_main
 
+# ─── Base-branch resolution (#3729, stacked-PR v1) ──────────────────────────
+# By default a new feature branch is created from origin/$DEFAULT_BRANCH. When
+# --base <branch> is passed (e.g. `--base feature/issue-<parent>` from
+# /loom:sweep --depends-on), resolve a ref for that base and use it instead so
+# the child branch stacks on top of the parent's branch. Prefer the pushed
+# origin/<base>, fall back to a local <base>. Hard-fail if neither resolves —
+# an explicit base that can't be found is worse than silently branching off
+# main (which would un-stack the child).
+BASE_REF="origin/$DEFAULT_BRANCH"
+BASE_DISPLAY="$DEFAULT_BRANCH"
+if [[ -n "$BASE_BRANCH" ]]; then
+    git fetch origin "$BASE_BRANCH" 2>/dev/null || true
+    if git show-ref --verify --quiet "refs/remotes/origin/$BASE_BRANCH"; then
+        BASE_REF="origin/$BASE_BRANCH"
+        BASE_DISPLAY="origin/$BASE_BRANCH"
+    elif git show-ref --verify --quiet "refs/heads/$BASE_BRANCH"; then
+        BASE_REF="$BASE_BRANCH"
+        BASE_DISPLAY="$BASE_BRANCH"
+    else
+        if [[ "$JSON_OUTPUT" == "true" ]]; then
+            echo '{"success": false, "error": "base-branch-not-found", "baseBranch": "'"$BASE_BRANCH"'"}' >&3
+        else
+            print_error "Requested --base '$BASE_BRANCH' not found as origin/$BASE_BRANCH or a local branch."
+            echo "  Ensure the parent sweep has created/pushed feature/issue-<parent> before stacking a child on it."
+        fi
+        exit 1
+    fi
+    if [[ "$JSON_OUTPUT" != "true" ]]; then
+        print_info "Stacked worktree base: $BASE_DISPLAY (from --base $BASE_BRANCH)"
+    fi
+fi
+
 # Determine branch name
 if [[ -n "$CUSTOM_BRANCH" ]]; then
     BRANCH_NAME="feature/$CUSTOM_BRANCH"
@@ -882,9 +933,11 @@ if [[ -d "$WORKTREE_PATH" ]]; then
 
     # Check if it's registered with git
     if git worktree list | grep -q "$WORKTREE_PATH"; then
-        # Check if worktree is stale: no commits ahead of main and behind main
-        local_commits_ahead=$(git -C "$WORKTREE_PATH" rev-list --count "origin/$DEFAULT_BRANCH..HEAD" 2>/dev/null) || local_commits_ahead="0"
-        local_commits_behind=$(git -C "$WORKTREE_PATH" rev-list --count "HEAD..origin/$DEFAULT_BRANCH" 2>/dev/null) || local_commits_behind="0"
+        # Check if worktree is stale: no commits ahead of the base and behind it.
+        # For a stacked child (--base), staleness is measured against the parent
+        # branch (BASE_REF), not the default branch (#3729).
+        local_commits_ahead=$(git -C "$WORKTREE_PATH" rev-list --count "$BASE_REF..HEAD" 2>/dev/null) || local_commits_ahead="0"
+        local_commits_behind=$(git -C "$WORKTREE_PATH" rev-list --count "HEAD..$BASE_REF" 2>/dev/null) || local_commits_behind="0"
         local_uncommitted=$(git -C "$WORKTREE_PATH" status --porcelain 2>/dev/null) || local_uncommitted=""
 
         if [[ "$local_commits_ahead" -gt 0 || -n "$local_uncommitted" ]]; then
@@ -907,18 +960,18 @@ if [[ -d "$WORKTREE_PATH" ]]; then
             # Stale worktree: no commits ahead, no uncommitted changes
             # Reset in place instead of removing (avoids CWD corruption)
             if [[ "$JSON_OUTPUT" != "true" ]]; then
-                print_warning "Stale worktree detected (0 commits ahead, $local_commits_behind behind $DEFAULT_BRANCH, no uncommitted changes)"
-                print_info "Resetting worktree in place to origin/$DEFAULT_BRANCH..."
+                print_warning "Stale worktree detected (0 commits ahead, $local_commits_behind behind $BASE_DISPLAY, no uncommitted changes)"
+                print_info "Resetting worktree in place to $BASE_DISPLAY..."
             fi
 
             # Back-fill/refresh the Loom sentinel on both reset outcomes: the
             # worktree remains usable either way, so keep it cleanup-eligible
             # (#3548).
             write_loom_sentinel "$WORKTREE_PATH"
-            if git -C "$WORKTREE_PATH" fetch origin "$DEFAULT_BRANCH" 2>/dev/null && \
-               git -C "$WORKTREE_PATH" reset --hard "origin/$DEFAULT_BRANCH" 2>/dev/null; then
+            if git -C "$WORKTREE_PATH" fetch origin "${BASE_BRANCH:-$DEFAULT_BRANCH}" 2>/dev/null && \
+               git -C "$WORKTREE_PATH" reset --hard "$BASE_REF" 2>/dev/null; then
                 if [[ "$JSON_OUTPUT" != "true" ]]; then
-                    print_success "Stale worktree reset to origin/$DEFAULT_BRANCH"
+                    print_success "Stale worktree reset to $BASE_DISPLAY"
                     echo ""
                     print_info "To use this worktree: cd $WORKTREE_PATH"
                 fi
@@ -953,11 +1006,12 @@ if git show-ref --verify --quiet "refs/heads/$BRANCH_NAME"; then
 
     CREATE_ARGS=("$WORKTREE_PATH" "$BRANCH_NAME")
 else
-    # Create new branch from the default branch
+    # Create new branch from the base ref (origin/$DEFAULT_BRANCH by default, or
+    # the --base override for a stacked child — #3729).
     if [[ "$JSON_OUTPUT" != "true" ]]; then
-        print_info "Creating new branch from $DEFAULT_BRANCH"
+        print_info "Creating new branch from $BASE_DISPLAY"
     fi
-    CREATE_ARGS=("$WORKTREE_PATH" "-b" "$BRANCH_NAME" "origin/$DEFAULT_BRANCH")
+    CREATE_ARGS=("$WORKTREE_PATH" "-b" "$BRANCH_NAME" "$BASE_REF")
 fi
 
 # In sparse mode, defer file materialization until after we configure the cone.

@@ -136,6 +136,16 @@ Inputs:
   `spawn-claude.sh` argv. When omitted (or empty), NO `--model` flag is
   emitted and the child inherits the session/CLI default. The field is
   `#[serde(default)]` on the wire, so pre-#3477 clients remain compatible.
+- `depends_on` (optional, issue #3729 stacked-PR v1) — a **single** parent
+  issue number this sweep is stacked on. Forwarded to the child as
+  `--depends-on <N>` (mirroring the `--model`/`--effort` append-only,
+  empty-means-unset contract), instructing `/loom:sweep` to branch the child
+  worktree/PR off `feature/issue-<N>` instead of the default branch. When
+  omitted, NO `--depends-on` flag is emitted (byte-for-byte unchanged). A
+  single optional parent (not a list) makes diamonds / multi-parent stacks
+  structurally unrepresentable — see "Stacked-PR dependency (v1)" below. The
+  field is `#[serde(default)]` on the wire, so pre-#3729 clients remain
+  compatible.
 
 ### `list_sweeps` (Phase A)
 
@@ -251,6 +261,45 @@ The reaper (`sweep_registry::spawn_reaper_task`) ticks every 30 seconds
      a global `sweep.global.completed` event.
 4. Garbage-collects terminal entries older than the retention window
    (default 1 hour).
+
+## Stacked-PR dependency (v1) — #3729
+
+Stacked-PR mode pipelines a genuine dependency: when issue B consumes issue
+A's output, B is built on `feature/issue-A` so B's Curator→Builder→Judge runs
+concurrently with A's review instead of serializing behind A's merge. **v1 is
+opt-in, daemon-`dispatch_sweep`-only, and linear-chains-only.**
+
+**Dispatch a chain** — N independent `dispatch_sweep` calls, each naming its
+immediate predecessor via `depends_on` (there is no multi-node planner):
+
+```text
+dispatch_sweep  kind={"Issue": A}                    # parent (independent)
+dispatch_sweep  kind={"Issue": B}  depends_on=A      # child stacked on A
+dispatch_sweep  kind={"Issue": C}  depends_on=B      # A→B→C linear chain
+```
+
+The daemon forwards `depends_on` to the child as `--depends-on <parent>`; the
+child's Builder branches its worktree off `feature/issue-<parent>` (via
+`worktree.sh --base`) and opens its PR with `--base feature/issue-<parent>`.
+`depends_on` is `Option<u32>` — a **single** optional parent — so diamonds /
+multi-parent stacks are structurally unrepresentable (no runtime rejection
+needed). It is recorded on the `SweepInfo` entry for observability.
+
+**Block-the-subtree on parent failure (reaper).** When a parent sweep reaches
+a terminal state and its issue carries `loom:blocked`, the reaper emits
+`sweep.issue.{child}.blocker` on the existing frozen topic (#3453 — no new
+topic) for every live child whose `depends_on` names that parent, so the stuck
+stack surfaces to the operator and the child does not auto-progress. This is
+implemented via `SweepRegistry::children_of` + `block_children_of`. Auto-detach
+(rebasing an orphaned child onto the default branch) is **out of scope for v1**.
+
+**Reconciliation is a manual, scripted step (v1).** Because the repo
+squash-merges, after the parent squash-merges the child branch still carries
+the parent's pre-squash commits. After confirming the parent merged, the
+operator runs `./.loom/scripts/reconcile-stack.sh <child-pr> feature/issue-<parent>`
+(`git rebase --onto <default> <parent-branch> <child-branch>` +
+`--force-with-lease` + `gh pr edit --base <default>`). `merge-pr.sh` is **not**
+modified in v1 — no automatic reconciliation and no merge-ordering guard.
 
 ## Locks and lifecycle
 
