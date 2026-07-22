@@ -527,6 +527,82 @@ resolve_default_branch() {
     return 0
 }
 
+# =============================================================================
+# QUOTE-AWARE COMMAND SEGMENTATION (#3755)
+#
+# The three segment parsers below (parse_force_ops, lifecycle_or_cloud_reason,
+# extract_rm_targets) split a command string on the shell separators ; | & && ||
+# to find each simple command's command word. The historical split was a naive
+#   gsub(/&&|\|\||[;|&]/, "\n")
+# over the raw string, which has NO lexer — so a `|`-alternation INSIDE a quoted
+# argument (e.g. `grep -E "lifecycle|halt|poweroff"`) was split as if it were a
+# real pipe, manufacturing a phantom segment whose command word is the bare word
+# `halt` and hard-denying a completely read-only command.
+#
+# `qsplit()` replaces that gsub: it walks the string tracking single-/double-quote
+# state and emits a newline for a separator ONLY when it is OUTSIDE a quoted span.
+# A quoted span is treated as inert (its separators are preserved as literal
+# text) ONLY when it carries no command substitution — no `$(` and no backtick —
+# mirroring strip_literal_text()'s #3679 safety floor: a smuggled
+# `"$(a|halt)"` keeps its separators ACTIVE so the genuine protection is intact.
+# The token VALUES are preserved verbatim (unlike a redaction approach), so
+# extract_rm_targets still sees the real `rm` targets. Best-effort like
+# strip_literal_text(): backslash-escaped quotes and an unterminated quote fall
+# back to the old separator-active behaviour, never widening a deny into an allow.
+#
+# Shared as a single awk source string so the three parsers cannot drift.
+# =============================================================================
+_QSPLIT_AWK='
+function qsplit(s,   out, n, i, c, j, qc, ci, inner, SQ, DQ) {
+    SQ = sprintf("%c", 39)   # single quote
+    DQ = sprintf("%c", 34)   # double quote
+    out = ""
+    n = length(s)
+    i = 1
+    while (i <= n) {
+        c = substr(s, i, 1)
+        if (c == DQ || c == SQ) {
+            qc = c
+            ci = 0
+            for (j = i + 1; j <= n; j++) {
+                if (substr(s, j, 1) == qc) { ci = j; break }
+            }
+            if (ci == 0) {
+                # Unterminated quote: fall back to separator-active processing so
+                # a stray quote never suppresses a real split (never widen a deny).
+                out = out c
+                i++
+                continue
+            }
+            inner = substr(s, i + 1, ci - i - 1)
+            if (index(inner, "$(") == 0 && index(inner, "`") == 0) {
+                # Inert quoted span: copy verbatim, separators inside are literal.
+                out = out substr(s, i, ci - i + 1)
+                i = ci + 1
+                continue
+            }
+            # Span carries command substitution: keep separators ACTIVE (copy the
+            # opening quote and keep walking char-by-char so a `|` inside splits).
+            out = out c
+            i++
+            continue
+        }
+        if (c == ";") { out = out "\n"; i++; continue }
+        if (c == "&") {
+            if (i < n && substr(s, i + 1, 1) == "&") { out = out "\n"; i += 2; continue }
+            out = out "\n"; i++; continue
+        }
+        if (c == "|") {
+            if (i < n && substr(s, i + 1, 1) == "|") { out = out "\n"; i += 2; continue }
+            out = out "\n"; i++; continue
+        }
+        out = out c
+        i++
+    }
+    return out
+}
+'
+
 # Parse force-op segments out of a command, emitting one TAB-separated
 # "<cpath>\t<target>" line per genuine git force-push / hard-reset. Portable awk
 # only (mirrors extract_rm_targets / lifecycle_or_cloud_reason segment parsing):
@@ -546,11 +622,11 @@ resolve_default_branch() {
 #   - reset --hard: always emitted with <target> = "@HEAD@".
 # The caller resolves "@HEAD@" to the checked-out branch and applies the mode.
 parse_force_ops() {
-    printf '%s' "$1" | awk '
+    printf '%s' "$1" | awk "$_QSPLIT_AWK"'
     BEGIN { SEP = sprintf("%c", 31) }  # US (unit separator) — non-whitespace so
                                        # bash read does not trim an empty cpath.
     {
-        gsub(/&&|\|\||[;|&]/, "\n")
+        $0 = qsplit($0)   # quote-aware segmentation (#3755)
         n = split($0, segs, "\n")
         for (i = 1; i <= n; i++) {
             seg = segs[i]
@@ -845,9 +921,9 @@ fi
 lifecycle_or_cloud_reason() {
     # Emit a deny reason (one per line) for every segment whose command word is a
     # system-lifecycle command or an az/gcloud delete. Portable awk only.
-    printf '%s' "$1" | awk '
+    printf '%s' "$1" | awk "$_QSPLIT_AWK"'
     {
-        gsub(/&&|\|\||[;|&]/, "\n")
+        $0 = qsplit($0)   # quote-aware segmentation (#3755)
         n = split($0, segs, "\n")
         for (i = 1; i <= n; i++) {
             seg = segs[i]
@@ -941,9 +1017,9 @@ extract_rm_targets() {
     # Emit one rm-target token per line for every local `rm -r/-f` invocation.
     # Portable awk only (no GNU/BSD-specific escapes); replaces the shell
     # separators with newlines, then inspects each simple command.
-    printf '%s' "$1" | awk '
+    printf '%s' "$1" | awk "$_QSPLIT_AWK"'
     {
-        gsub(/&&|\|\||[;|&]/, "\n")
+        $0 = qsplit($0)   # quote-aware segmentation (#3755)
         n = split($0, segs, "\n")
         for (i = 1; i <= n; i++) {
             seg = segs[i]

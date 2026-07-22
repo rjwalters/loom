@@ -1255,6 +1255,60 @@ assert_deny "Regression (#3586): 'env -u NAME reboot' skips two-token -u flag" \
 echo ""
 
 # =========================================================================
+echo -e "${YELLOW}--- #3755 quote-aware command segmentation ---${NC}"
+# =========================================================================
+
+# The segment splitters in lifecycle_or_cloud_reason(), extract_rm_targets(),
+# and parse_force_ops() previously split the command on shell metacharacters
+# (; | & && ||) WITHOUT honoring quoting, so a `|`-alternation INSIDE a quoted
+# argument became a phantom pipe: the token after it was read as a command word
+# and a completely read-only command was HARD-DENIED. qsplit() makes the split
+# quote-aware. A quoted `|`-alternation containing a lifecycle word must ALLOW.
+#
+# NOTE: the reliable reproducer is a 4-way alternation where the lifecycle word
+# is NOT adjacent to the closing quote (see the curator note on #3755) — the old
+# code's exact command-word equality accidentally spared the case where the
+# closing quote glued onto the target word, so that form is not a valid probe.
+assert_allow "#3755: read-only grep with quoted lifecycle alternation is allowed" \
+    'grep -E "lifecycle|halt|poweroff|init 0" file'
+assert_allow "#3755: grep with quoted 'poweroff|halt' alternation is allowed" \
+    'grep -E "poweroff|halt|reboot|shutdown" somefile'
+assert_allow "#3755: single-quoted jq alternation '.a|.b' is allowed" \
+    "jq '.a|.b' file.json"
+assert_allow "#3755: awk -F'|' field separator is allowed" \
+    "awk -F'|' '{print \$1}' data.txt"
+assert_allow "#3755: sed 's/a|b/x/' with quoted pipe is allowed" \
+    "sed 's/a|b/x/' data.txt"
+assert_allow "#3755: quoted 'az delete|gcloud delete' alternation is allowed" \
+    'grep -E "az delete|gcloud delete" infra.log'
+
+# The genuine protections MUST remain intact — a REAL separator outside quotes
+# still segments, so the lifecycle/cloud/rm command word is still found.
+assert_deny "#3755: 'sync && halt' (real && outside quotes) still denied" \
+    "sync && halt"
+assert_deny "#3755: 'foo | halt' (real pipe outside quotes) still denied" \
+    "foo | halt"
+assert_deny "#3755: 'foo; poweroff' (real semicolon) still denied" \
+    "foo; poweroff"
+assert_deny "#3755: 'env FOO=bar halt' still denied after quote-aware split" \
+    "env FOO=bar halt"
+assert_deny "#3755: standalone 'halt' still denied" \
+    "halt"
+assert_deny "#3755: 'az group delete' command word still denied" \
+    "az group delete my-rg --yes"
+# Safety floor mirror of strip_literal_text() (#3679): a quoted span carrying a
+# command substitution keeps its separators ACTIVE, so a smuggled lifecycle word
+# inside $(...) is still segmented and denied exactly as before this change.
+assert_deny "#3755: quoted \$(x|halt ) command substitution still denied" \
+    'grep -E "$(x|halt )" file'
+# extract_rm_targets keeps the REAL target tokens: a genuine rm -rf outside
+# quotes still denies (quote-awareness never suppresses a real rm target).
+assert_deny "#3755: real 'foo | rm -rf /' (rm after real pipe) still denied" \
+    "foo | rm -rf /"
+
+echo ""
+
+# =========================================================================
 echo -e "${YELLOW}--- #3553 regression guard: catastrophic commands STILL deny ---${NC}"
 # =========================================================================
 
