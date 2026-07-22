@@ -39,9 +39,10 @@ import argparse
 import json
 import os
 import pathlib
+import subprocess
 import sys
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Callable
 
 # --------------------------------------------------------------------------- #
 # Constants
@@ -49,6 +50,11 @@ from typing import Any
 
 VALID_MODES = ("off", "observe", "experiment")
 _TRUTHY = {"1", "true", "yes", "on"}
+
+# Gitignored, repo-local sentinel that confirms a canary WITHOUT travelling in a
+# committed config (issue #3731). Its confirmation power comes precisely from
+# being uncommitted — a git-tracked copy is refused (see ``evaluate_canary``).
+CANARY_SENTINEL = ".loom/CANARY"
 
 # Arm -> forced Builder model. Arm A is opus-first, Arm B is sonnet-first.
 ARM_MODEL = {"A": "opus", "B": "sonnet"}
@@ -117,23 +123,100 @@ def resolve_raw_mode(
     return "off", warnings
 
 
-def canary_confirmed(env: dict[str, str], config: dict[str, Any]) -> bool:
-    """Has the operator explicitly confirmed this target is a canary?
+def _sentinel_is_tracked(path: pathlib.Path) -> bool:
+    """Best-effort: is ``path`` tracked by git in its repo? Any error -> ``False``.
 
-    ``LOOM_MODEL_EXPERIMENT_CANARY`` env (truthy) wins over
-    ``sweep.modelExperimentCanary`` config (bool).
+    A canary sentinel that is committed defeats the whole point of #3731 (it would
+    propagate with the repo exactly like the retired ``sweep.modelExperimentCanary``
+    config did), so a tracked sentinel is refused as a confirmation source.
     """
+    try:
+        result = subprocess.run(
+            ["git", "ls-files", "--error-unmatch", "--", path.name],
+            cwd=str(path.parent) if str(path.parent) else None,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+        return result.returncode == 0
+    except (OSError, ValueError):
+        return False
+
+
+def evaluate_canary(
+    env: dict[str, str],
+    *,
+    sentinel_path: str | os.PathLike[str] | None = None,
+    is_tracked: Callable[[pathlib.Path], bool] | None = None,
+) -> tuple[bool, str | None, list[str]]:
+    """Evaluate canary confirmation from an UNCOMMITTED signal only (#3731).
+
+    Returns ``(confirmed, source, warnings)`` where ``source`` is ``"env"`` |
+    ``"sentinel"`` | ``None``.
+
+    Confirmation is accepted ONLY from a signal that cannot travel with a copied,
+    committed ``.loom/config.json``:
+
+    * ``(a)`` the ``LOOM_MODEL_EXPERIMENT_CANARY`` env var (truthy), or
+    * ``(b)`` a **gitignored** sentinel file (``.loom/CANARY``) present on disk.
+
+    The committed ``sweep.modelExperimentCanary`` config flag is **no longer**
+    accepted — it was the accidental-production-fire vector (a config carrying both
+    the mode and the confirmation propagates to prod via ``defaults/``). If the
+    sentinel is git-TRACKED it is refused (with a warning): a committed sentinel is
+    just the config-propagation vector by another name.
+    """
+    warnings: list[str] = []
+
     raw = env.get("LOOM_MODEL_EXPERIMENT_CANARY")
-    if raw is not None and raw.strip() != "":
-        return raw.strip().lower() in _TRUTHY
-    sweep = config.get("sweep")
-    if isinstance(sweep, dict):
-        return sweep.get("modelExperimentCanary") is True
-    return False
+    if raw is not None and raw.strip() != "" and raw.strip().lower() in _TRUTHY:
+        return True, "env", warnings
+
+    path = (
+        pathlib.Path(sentinel_path)
+        if sentinel_path is not None
+        else pathlib.Path(CANARY_SENTINEL)
+    )
+    if path.exists():
+        tracked_fn = is_tracked if is_tracked is not None else _sentinel_is_tracked
+        if tracked_fn(path):
+            warnings.append(
+                f"canary sentinel {path} is TRACKED by git — refusing it as a "
+                "confirmation source. A committed sentinel defeats the "
+                "uncommitted-signal guardrail (#3731); gitignore it and run "
+                f"`git rm --cached {path}`."
+            )
+        else:
+            return True, "sentinel", warnings
+
+    return False, None, warnings
+
+
+def canary_confirmed(
+    env: dict[str, str],
+    config: dict[str, Any] | None = None,
+    *,
+    sentinel_path: str | os.PathLike[str] | None = None,
+    is_tracked: Callable[[pathlib.Path], bool] | None = None,
+) -> bool:
+    """Has the operator confirmed this target is a canary via an UNCOMMITTED signal?
+
+    Thin boolean wrapper over :func:`evaluate_canary`. The ``config`` argument is
+    accepted for backward compatibility but is **ignored** — committed config is no
+    longer an accepted confirmation source (#3731).
+    """
+    confirmed, _source, _warnings = evaluate_canary(
+        env, sentinel_path=sentinel_path, is_tracked=is_tracked
+    )
+    return confirmed
 
 
 def resolve_effective_mode(
-    env: dict[str, str], config: dict[str, Any]
+    env: dict[str, str],
+    config: dict[str, Any],
+    *,
+    sentinel_path: str | os.PathLike[str] | None = None,
+    is_tracked: Callable[[pathlib.Path], bool] | None = None,
 ) -> tuple[str, list[str]]:
     """Resolve mode AND apply the canary guardrail.
 
@@ -141,16 +224,24 @@ def resolve_effective_mode(
     the complexity bump), so it is honored only on a confirmed canary. On any
     other target it is loudly downgraded to ``observe`` (safe anywhere) rather
     than refused outright — the measurement still accrues, just without the
-    model-forcing behavior change.
+    model-forcing behavior change. Confirmation must come from an UNCOMMITTED
+    signal (#3731); committed ``sweep.modelExperimentCanary`` is inert.
     """
     mode, warnings = resolve_raw_mode(env, config)
-    if mode == "experiment" and not canary_confirmed(env, config):
-        warnings.append(
-            "experiment mode requested on a NON-CANARY target — downgrading to "
-            "'observe' (no model forcing). Set LOOM_MODEL_EXPERIMENT_CANARY=1 (or "
-            "sweep.modelExperimentCanary=true) to confirm this is a canary."
+    if mode == "experiment":
+        confirmed, _source, canary_warnings = evaluate_canary(
+            env, sentinel_path=sentinel_path, is_tracked=is_tracked
         )
-        mode = "observe"
+        warnings.extend(canary_warnings)
+        if not confirmed:
+            warnings.append(
+                "experiment mode requested on a NON-CANARY target — downgrading to "
+                "'observe' (no model forcing). Confirm a canary via an UNCOMMITTED "
+                "signal: export LOOM_MODEL_EXPERIMENT_CANARY=1 or create the "
+                "gitignored sentinel .loom/CANARY. (Committed "
+                "sweep.modelExperimentCanary is no longer accepted — #3731.)"
+            )
+            mode = "observe"
     return mode, warnings
 
 
@@ -609,17 +700,36 @@ def format_harvest_text(report: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
-def format_banner(mode: str, issue: int, arm: str | None, model: str | None) -> str:
+_CANARY_SOURCE_LABEL = {
+    "env": "env var LOOM_MODEL_EXPERIMENT_CANARY",
+    "sentinel": f"gitignored sentinel {CANARY_SENTINEL}",
+}
+
+
+def format_banner(
+    mode: str,
+    issue: int,
+    arm: str | None,
+    model: str | None,
+    canary_source: str | None = None,
+) -> str:
     bar = "=" * 72
     lines = [bar]
     if mode == "experiment":
         lines.append(f"  LOOM MODEL EXPERIMENT — mode=EXPERIMENT  issue #{issue}")
         lines.append(f"  ARM {arm}  ->  Builder model forced to '{model}'")
         lines.append("  (tier-2.5 complexity bump SUPPRESSED for the forced arm)")
+        src = _CANARY_SOURCE_LABEL.get(canary_source or "", "unknown source")
+        lines.append(f"  CANARY confirmed via {src}.")
         lines.append("  CANARY-ONLY. Stats -> .loom/stats/sweep-model-stats.jsonl")
     elif mode == "observe":
         lines.append(f"  LOOM MODEL EXPERIMENT — mode=OBSERVE  issue #{issue}")
         lines.append("  Passive measurement only — no model forcing, no arm.")
+        if canary_source == "unconfirmed":
+            lines.append(
+                "  (experiment requested but canary UNCONFIRMED — no uncommitted "
+                "signal; downgraded.)"
+            )
         lines.append("  Stats -> .loom/stats/sweep-model-stats.jsonl")
     else:
         lines.append(f"  LOOM MODEL EXPERIMENT — mode=OFF  issue #{issue}")
@@ -662,15 +772,22 @@ def _cmd_assign_arm(args: argparse.Namespace) -> int:
 
 
 def _cmd_banner(args: argparse.Namespace) -> int:
+    env = dict(os.environ)
     config = load_config(args.config)
-    mode, warnings = resolve_effective_mode(dict(os.environ), config)
+    raw_mode, _raw_warnings = resolve_raw_mode(env, config)
+    mode, warnings = resolve_effective_mode(env, config)
     for w in warnings:
         _warn(w)
     arm = model = None
+    canary_source: str | None = None
     if mode == "experiment":
         arm = assign_arm(args.issue, args.complexity)
         model = arm_model(arm)
-    print(format_banner(mode, args.issue, arm, model))
+        _confirmed, canary_source, _cw = evaluate_canary(env)
+    elif raw_mode == "experiment":
+        # Requested experiment but downgraded to observe — canary unconfirmed.
+        canary_source = "unconfirmed"
+    print(format_banner(mode, args.issue, arm, model, canary_source))
     return 0
 
 

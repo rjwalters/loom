@@ -847,10 +847,17 @@ sweep re-lands the same arm. In `experiment` mode the tier-2.5 complexity bump i
 `complex`-marked issue on Arm B stays sonnet and the A/B is not confounded.
 
 **Guardrails:** off by default; `observe` safe anywhere; `experiment` refuses to
-run on a non-canary target and loudly downgrades to `observe` unless
-`LOOM_MODEL_EXPERIMENT_CANARY=1` (or `sweep.modelExperimentCanary: true`) confirms
-a canary. A loud startup banner names the active mode and, in `experiment`, the
-arm assigned to each issue. `.loom/stats/` is gitignored.
+run on a non-canary target and loudly downgrades to `observe` unless an
+**uncommitted** signal confirms a canary — the `LOOM_MODEL_EXPERIMENT_CANARY=1`
+env var or the gitignored `.loom/CANARY` sentinel file. The confirmation must be
+uncommitted **by design** (#3731): the committed `sweep.modelExperimentCanary`
+config flag is **no longer** an accepted confirmation (it would propagate with a
+copied config via `defaults/`, firing experiment on production). A git-tracked
+`.loom/CANARY` is likewise refused. The `sweep.modelExperiment` *mode* may still
+live in committed config — it is inert without the uncommitted confirmation. A
+loud startup banner names the active mode, the canary confirmation source, and,
+in `experiment`, the arm assigned to each issue. `.loom/stats/` and `.loom/CANARY`
+are gitignored.
 
 **Harvesting the evidence:**
 

@@ -69,6 +69,7 @@ Thumbs.db
 .loom/accounts.env
 .loom/sweep-checkpoint/
 .loom/stats/
+.loom/CANARY
 .loom/spawn-loop.pid
 .loom/spawn-loop-state.json
 .loom/stop-spawn-loop

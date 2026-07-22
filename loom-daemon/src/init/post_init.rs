@@ -123,6 +123,9 @@ pub const EPHEMERAL_PATTERNS: &[&str] = &[
     // hold OAuth keys and must never be committed.
     ".loom/tokens/",
     ".loom/accounts.env",
+    // Uncommitted canary confirmation sentinel (#3731). Its guardrail power comes
+    // from being uncommitted, so it must never be tracked.
+    ".loom/CANARY",
     ".loom/*.log",
     ".loom/*.sock",
     ".loom/logs/",
