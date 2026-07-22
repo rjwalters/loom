@@ -18,6 +18,8 @@ from loom_tools.common.claude_config import (
     _resolve_state_file,
     cleanup_agent_config_dir,
     cleanup_all_agent_config_dirs,
+    resolve_claude_base_dir,
+    resolve_projects_dir,
     setup_agent_config_dir,
     validate_agent_config_dir,
 )
@@ -955,3 +957,41 @@ class TestCleanupAllAgentConfigDirs:
         count = cleanup_all_agent_config_dirs(mock_repo)
         assert count == 1
         assert not config_dir.exists()
+
+
+class TestResolveProjectsDir:
+    """Tests for the CLAUDE_CONFIG_DIR-aware base/projects resolvers (#3726)."""
+
+    def test_base_defaults_to_home_claude(
+        self, tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
+        fake_home = tmp_path / "home"
+        monkeypatch.setattr(pathlib.Path, "home", staticmethod(lambda: fake_home))
+        assert resolve_claude_base_dir() == fake_home / ".claude"
+        assert resolve_projects_dir() == fake_home / ".claude" / "projects"
+
+    def test_base_honours_claude_config_dir_override(
+        self, tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        override = tmp_path / ".loom" / "claude-config" / "builder-1"
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(override))
+        assert resolve_claude_base_dir() == override
+        # HARD AC (#3726 CORRECTION 2): projects/ resolves under the override,
+        # NOT ~/.claude/projects.
+        assert resolve_projects_dir() == override / "projects"
+
+    def test_override_expands_user(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", "~/isolated")
+        assert resolve_claude_base_dir() == pathlib.Path.home() / "isolated"
+
+    def test_empty_override_falls_back_to_home(
+        self, tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # An empty string is falsy — treat as unset.
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", "")
+        fake_home = tmp_path / "home"
+        monkeypatch.setattr(pathlib.Path, "home", staticmethod(lambda: fake_home))
+        assert resolve_claude_base_dir() == fake_home / ".claude"

@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import os
 import shutil
 import subprocess
 from pathlib import Path
@@ -20,6 +21,42 @@ from pathlib import Path
 from loom_tools.common.paths import LoomPaths
 
 log = logging.getLogger(__name__)
+
+
+def resolve_claude_base_dir() -> Path:
+    """Resolve the Claude Code base config directory, CLAUDE_CONFIG_DIR-aware.
+
+    Claude Code stores session state (including ``projects/``) under
+    ``$CLAUDE_CONFIG_DIR`` when that variable is set, otherwise under
+    ``~/.claude``.  Per-agent isolation (``setup_agent_config_dir``) sets
+    ``CLAUDE_CONFIG_DIR`` to ``.loom/claude-config/<agent>/``, so any code
+    that needs to *find* an agent's transcripts must honour the override
+    rather than hard-coding ``~/.claude``.
+
+    Returns:
+        The base config directory (``$CLAUDE_CONFIG_DIR`` or ``~/.claude``),
+        with ``~`` expanded.
+    """
+    override = os.environ.get("CLAUDE_CONFIG_DIR")
+    if override:
+        return Path(override).expanduser()
+    return Path.home() / ".claude"
+
+
+def resolve_projects_dir() -> Path:
+    """Resolve the ``projects/`` transcript root, CLAUDE_CONFIG_DIR-aware.
+
+    ``projects`` is a per-agent *mutable* directory (see ``_MUTABLE_DIRS``):
+    an isolated ``CLAUDE_CONFIG_DIR`` gets a fresh ``projects/`` rather than a
+    symlink back to ``~/.claude/projects``.  The transcript-archival tooling
+    (issue #3726) and the #3725 cost harvest both resolve their source through
+    this helper so they never look in the wrong tree.
+
+    Returns:
+        ``<base>/projects`` where ``<base>`` comes from
+        :func:`resolve_claude_base_dir`.
+    """
+    return resolve_claude_base_dir() / "projects"
 
 # Shared config files to symlink from ~/.claude/ (read-only)
 # Note: mcp.json / .mcp.json are intentionally excluded — they are
