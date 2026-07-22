@@ -32,7 +32,6 @@ partial file is ever visible mid-write).
 
 from __future__ import annotations
 
-import json
 import logging
 import random
 import time
@@ -416,8 +415,25 @@ def build_report(results: Iterable[AccountResult]) -> ProbeReport:
     return ProbeReport(ranked_at=ranked_at, accounts=sorted_results)
 
 
+def format_ranking_lines(report: ProbeReport) -> str:
+    """Serialize a probe report to the selector's ``name|status`` format.
+
+    This is the format ``select.py:_read_ranking`` consumes (pipe-delimited
+    ``name|status``, one account per line, already ordered by
+    :func:`build_report`). A trailing newline is included so the file ends
+    cleanly; an empty report yields an empty string.
+    """
+    lines = [f"{a.name}|{a.status}" for a in report.accounts]
+    return "\n".join(lines) + ("\n" if lines else "")
+
+
 def write_ranking_atomic(report: ProbeReport, ranking_path: Path) -> None:
-    """Write *report* to *ranking_path* atomically.
+    """Write *report* to *ranking_path* atomically in the selector's format.
+
+    Emits the pipe-delimited ``name|status`` format that
+    ``select.py:_read_ranking`` consumes — byte-compatible with the monitor
+    path's ``write_monitor_ranking_atomic`` — so a probe-written ``.ranking``
+    drives tier-1 (ranking-based) selection identically to any other source.
 
     Writes to ``<path>.tmp`` in the same directory (so the rename is on
     the same filesystem and uses ``rename(2)``), then ``Path.replace``s
@@ -426,7 +442,7 @@ def write_ranking_atomic(report: ProbeReport, ranking_path: Path) -> None:
     """
     ranking_path.parent.mkdir(parents=True, exist_ok=True)
     tmp = ranking_path.with_suffix(ranking_path.suffix + ".tmp")
-    tmp.write_text(json.dumps(report.to_dict(), indent=2) + "\n")
+    tmp.write_text(format_ranking_lines(report))
     tmp.replace(ranking_path)
 
 

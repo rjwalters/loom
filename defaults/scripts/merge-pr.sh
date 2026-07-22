@@ -845,6 +845,16 @@ _worktree_branch_for() {
     '
 }
 
+# Print the absolute path of the PRIMARY (main) worktree — the FIRST `worktree`
+# entry of `git worktree list --porcelain`. Git always lists the main working
+# tree first, so `exit` after the first match is correct. Prints nothing on
+# error (e.g. not a git repo). Used by _remove_loom_worktree to hard-refuse
+# removing the primary checkout (#3710).
+_primary_worktree_path() {
+  git -C "$REPO_ROOT" worktree list --porcelain 2>/dev/null | \
+    awk '/^worktree / { print $2; exit }'
+}
+
 # Walk porcelain output for a worktree whose branch matches the given branch
 # short-name. Prints the worktree absolute path or nothing. Skips detached /
 # bare entries (they have no `branch refs/heads/...` line).
@@ -891,6 +901,29 @@ _remove_loom_worktree() {
     info "No worktree found at $worktree_path"
     return 0
   fi
+  # Resolve to a canonical absolute path once; reused for both the primary-
+  # worktree guard immediately below and the "is our CWD inside it?" check
+  # further down.
+  local worktree_real
+  worktree_real="$(cd "$worktree_path" 2>/dev/null && pwd -P || echo "$worktree_path")"
+  # Hard guard (#3710): NEVER attempt to remove the primary/main worktree — the
+  # FIRST entry of `git worktree list --porcelain` — regardless of a
+  # .loom-managed sentinel, the checked-out branch, --worktree-path, or a
+  # customized worktree.root. This is the single choke point for all three
+  # removal call-sites (default issue/pr path, --worktree-path override, and the
+  # non-standard-path discovery fallback). Without it, a repo whose primary
+  # checkout (a) sits at a non-standard path relative to a customized
+  # worktree.root, (b) carries a .loom-managed sentinel, and (c) has the PR
+  # branch checked out will reach `git worktree remove` on the main working
+  # tree: git fails safe ("Could not remove worktree"), but the attempt is a
+  # logic error and emits a misleading Removing/Could-not-remove pair. Refuse
+  # here, before any sentinel or CWD handling.
+  local primary_real
+  primary_real="$(_primary_worktree_path)"
+  if [[ -n "$primary_real" ]] && [[ "$worktree_real" == "$primary_real" ]]; then
+    warning "Refusing to remove the primary/main worktree at $worktree_real (never removable regardless of .loom-managed sentinel, branch, or worktree.root)"
+    return 0
+  fi
   if [[ "$allow_unmanaged" != "true" ]] && [[ ! -f "$worktree_path/.loom-managed" ]]; then
     warning "Worktree at $worktree_path lacks .loom-managed sentinel — refusing to remove (user-owned)"
     return 0
@@ -906,9 +939,9 @@ _remove_loom_worktree() {
     attached_branch="$(_worktree_branch_for "$worktree_path")"
   fi
   # If our shell is inside the worktree we're removing, hop out first.
-  local current_dir worktree_real in_worktree=false
+  # ($worktree_real was already resolved above for the primary-worktree guard.)
+  local current_dir in_worktree=false
   current_dir="$(pwd -P 2>/dev/null || pwd)"
-  worktree_real="$(cd "$worktree_path" 2>/dev/null && pwd -P || echo "$worktree_path")"
   if [[ "$current_dir" == "$worktree_real"* ]]; then
     in_worktree=true
     cd "$REPO_ROOT"
