@@ -674,8 +674,8 @@ def _cmd_unblock(args: argparse.Namespace) -> int:
             )
         else:
             log_info(
-                f"No matching entries removed (use --all-reasons to drop "
-                f"non-auth entries too).",
+                "No matching entries removed (use --all-reasons to drop "
+                "non-auth entries too).",
             )
     return 0
 
