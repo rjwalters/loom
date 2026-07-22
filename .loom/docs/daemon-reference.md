@@ -323,10 +323,21 @@ parent branch, the `--base` query returns zero rows on any re-run.
 
 `reconcile-stack.sh` remains available for **manual** invocation — for the
 unsafe/deferred case once the Builder finishes, or for an operator who wants to
-reconcile ahead of a merge (`--dry-run` previews the git surgery). The
-**merge-ordering guard** (never merge a parent whose children haven't
-retargeted) and **rebase-on-parent-amend** remain **out of scope** (deferred
-items of the v2 epic #3747).
+reconcile ahead of a merge (`--dry-run` previews the git surgery).
+
+A **pre-merge merge-ordering guard** shipped as v2 item 2 (#3747): because
+`delete_branch_on_merge:true` deletes `feature/issue-<parent>` synchronously
+during the merge API call — before the post-merge reconcile pass above can run —
+`merge-pr.sh` now runs a guard *before* both merge paths that discovers open
+child PRs (same `gh pr list --base feature/issue-<parent> --state open` query)
+and by default **hard-blocks the merge** (`exit 1`, naming the child PR(s) + the
+`reconcile-stack.sh` unblock command) rather than let the parent merge race the
+branch deletion. It keys purely on "does an open child PR still target this
+branch" (not the child's `loom:building` label). `--allow-stacked-children`
+bypasses it; `--dry-run` reports the would-be block without exiting 1.
+**Rebase-on-parent-amend**, **dependency auto-detection**, **diamonds /
+multi-parent**, and **auto-detach** remain **out of scope** (deferred items of
+the v2 epic #3747).
 
 ## Locks and lifecycle
 

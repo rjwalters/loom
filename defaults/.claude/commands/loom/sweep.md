@@ -1261,7 +1261,7 @@ If the builder failed (no PR opened), do NOT write a checkpoint — leave the ch
 
 **Mid-builder kill semantics (#3373).** If sweep is killed during the Builder phase, the next invocation will see `CHECKPOINT_PHASE == "curator-done"` (no `builder-done` was written), so the Builder dispatches again from scratch. The worktree from the killed run is preserved by `worktree.sh`'s idempotency — `./.loom/scripts/worktree.sh N` is a no-op if `.loom/worktrees/issue-N` already exists. The builder re-enters the worktree, sees the partial diff, and decides whether to commit / amend / discard. **Sweep itself does not introspect the partial diff** — that's the builder's job.
 
-### Stacked dependency (auto-reconciliation on parent merge) — #3729 (v1), #3747 (v2 item 1)
+### Stacked dependency (auto-reconciliation on parent merge) — #3729 (v1), #3747 (v2 items 1 & 2)
 
 Stacked-PR mode pipelines a genuine dependency: when issue B consumes issue A's output (schema, file, manifest), B is built on `feature/issue-A` so B's lifecycle runs concurrently with A's review instead of serializing behind A's merge. **The dispatch surface is opt-in, daemon-`dispatch_sweep`-only, and linear-chains-only.**
 
@@ -1287,6 +1287,8 @@ The daemon forwards `depends_on` to the child as `--depends-on <parent>`; the ch
 
 The step is **best-effort** — a reconciliation failure never fails the parent merge — and idempotent (once a child's base is retargeted away from the parent branch, the query returns zero rows).
 
+**Pre-merge merge-ordering guard now ships too (v2 item 2, #3747).** Item 1's reconciliation runs *after* the parent has already merged, and the repo setting Loom itself recommends (`delete_branch_on_merge:true`, applied by `setup-repository-settings.sh`) makes GitHub delete `feature/issue-<parent>` **synchronously during the merge API call** — before the post-merge reconcile pass runs, and once the ref is gone `reconcile-stack.sh`'s `git rebase --onto <default> <parent-branch>` can no longer resolve `<parent-branch>`. So item 1 could race and *lose* against the repo's own settings. To close that race, `merge-pr.sh` now runs a **pre-merge guard** (before both the auto-merge and synchronous-merge paths) that discovers open child PRs with the same live-forge query (`gh pr list --base feature/issue-<parent> --state open`) and, by default, **hard-blocks the merge** (`exit 1`, naming the blocking child PR number(s) and the `reconcile-stack.sh` unblock command) rather than letting the parent merge create the race. This is a normal, recoverable failure — Champion's cron retries it next tick, exactly like any other merge-blocking condition. Unlike item 1's post-merge pass, the guard keys **purely on "does an open child PR still target this branch"** — never on the child's `loom:building` label, since a "safe" child is just as exposed to branch deletion as an "unsafe" one. Pass **`--allow-stacked-children`** to `merge-pr.sh` to bypass the guard once you have manually reconciled/verified the children (operator asserts responsibility, mirroring `--worktree-path`); `--dry-run` still runs the guard and reports the would-be block without exiting 1.
+
 `reconcile-stack.sh` remains available for **manual** invocation — for the unsafe/deferred case once the Builder finishes, or to reconcile ahead of a merge (`--dry-run` previews the surgery):
 
 ```bash
@@ -1296,7 +1298,7 @@ The step is **best-effort** — a reconciliation failure never fails the parent 
 #   gh pr edit <child-pr> --base <default-branch>
 ```
 
-**Deferred (v2 epic #3747, not yet implemented):** a **merge-ordering guard** (block merging a parent whose children haven't retargeted) and **rebase-on-parent-amend** (if the parent branch is amended by Doctor after a child branched off it, the child is not auto-rebased — rebase it manually if needed).
+**Deferred (v2 epic #3747, not yet implemented):** **rebase-on-parent-amend** (if the parent branch is amended by Doctor after a child branched off it, the child is not auto-rebased — rebase it manually if needed), **dependency auto-detection**, **diamonds / multi-parent**, and **auto-detach**. (The **merge-ordering guard** shipped as v2 item 2 — see above.)
 
 ### 5. Judge phase (sequential per PR within the wave)
 
