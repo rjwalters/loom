@@ -24,6 +24,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 WORKFLOW_JS="${SCRIPT_DIR}/judge-fanout-workflow.js"
+CORPUS_RUNNER="${SCRIPT_DIR}/judge-fanout-corpus-runner.sh"
 
 FLAG="${LOOM_JUDGE_FANOUT_EXPERIMENT:-}"
 
@@ -73,18 +74,39 @@ else
   fi
 fi
 
+# Syntax-check the measurement-harness scaffold too (#3748). It is a normal bash
+# script (unlike the workflow VM body), so a plain `bash -n` parse suffices.
+if [[ -f "${CORPUS_RUNNER}" ]]; then
+  if bash -n "${CORPUS_RUNNER}"; then
+    echo "judge-fanout-experiment: corpus-runner scaffold syntax OK (parsed, not executed)." >&2
+  else
+    echo "judge-fanout-experiment: ERROR — corpus-runner scaffold failed to parse." >&2
+    exit 1
+  fi
+fi
+
 cat >&2 <<'GUIDE'
 
-To run the (deferred) live prototype — from a TOP-LEVEL Claude Code session only:
-  1. Copy judge-fanout-workflow.js into a discovered workflows/ directory
+To run the (deferred) live measurement — from a TOP-LEVEL Claude Code session only:
+  1. Build the per-PR args + an empty results table with the harness scaffold:
+       ./judge-fanout-corpus-runner.sh --out /tmp/jf 3721:merged 3699:rejected ...
+     It shells out to `gh pr diff` (read-only) and writes pr-<N>.args.json plus
+     results.md. It does NOT invoke the Workflow tool (that would need a second
+     nesting level, #3289).
+  2. Copy judge-fanout-workflow.js into a discovered workflows/ directory
      (user or project settings), OR invoke it directly with the Workflow tool:
        Workflow({ scriptPath: "<abs path to judge-fanout-workflow.js>",
-                  args: { pr: <N>, diff: "<unified diff text>" } })
-  2. Do this from a top-level session (NOT a subagent), so the workflow's
-     agent()/parallel() calls are the first nesting level (#3289-safe).
-  3. Compare its verdict/findings against today's single-pass Judge on a fixed
-     3-5 PR corpus (precision / recall / latency / token cost). Record RAW
-     results — do not fabricate numbers.
+                  args: <contents of pr-<N>.args.json> })
+     Do this from a top-level session (NOT a subagent), so the workflow's
+     agent()/parallel() calls are the first nesting level (#3289-safe). Never
+     drive it from a `fable` session — the No-Fable-Judge invariant (#3702)
+     applies to the fan-out reviewers.
+  3. Record verdict / findings / droppedUnverified + measured latency + token
+     cost into results.md (template: judge-fanout-results-template.md), and
+     compare against today's single-pass Judge. Record RAW results — do not
+     fabricate numbers.
+
+  Full procedure: docs/research/judge-fanout-measurement-runbook.md
 
 This script intentionally stops here: it does NOT dispatch a live judge run.
 GUIDE
