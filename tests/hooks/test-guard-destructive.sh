@@ -482,6 +482,41 @@ assert_ask "Ask for gh issue close" \
 assert_ask "Ask for gh release delete" \
     "gh release delete v1.0"
 
+# --- #3756: ask-tier command-position anchoring + literal-text redaction ---
+# The ASK_PATTERNS loop used to grep bare, unanchored substrings against a copy
+# that was only comment-stripped (never literal-redacted), so an ask-phrase that
+# merely appeared inside another command's quoted argument or a text-carrying
+# flag value fired a spurious confirmation prompt. Anchoring each entry to a
+# command boundary + reading a comment-stripped AND flag-value-redacted copy
+# fixes the false asks below while every genuine ask still fires.
+
+# Anchoring: the phrase is inside a quoted NON-flag argument, preceded by `"`
+# (not a real command boundary) — no longer asks.
+assert_allow "#3756: ask-phrase inside a quoted jq payload no longer asks" \
+    "jq -n '{cmd:\"gh issue close 123\"}'"
+
+# Redaction: the phrase lives only inside a --body value of an UNRELATED command
+# (command word is 'gh pr comment', not an ask pattern) — no longer asks.
+assert_allow "#3756: ask-phrase inside a redacted --body value (no real ask cmd) no longer asks" \
+    "gh pr comment 5 --body \"notes: gh issue close 123 was a mistake\""
+
+# Redaction extended to --comment (#3756): 'gh issue reopen' is NOT an ask
+# pattern, and the phrase lives only inside its --comment value, preceded by a
+# space (so anchoring alone would still match) — redaction makes it not ask.
+assert_allow "#3756: ask-phrase inside a redacted --comment value (no real ask cmd) no longer asks" \
+    "gh issue reopen 5 --comment \"reverting the gh issue close 123 fix\""
+
+# A GENUINE leading ask command still asks even when it carries a --comment whose
+# value also mentions the phrase: the redaction suppresses the redundant second
+# match, but the real leading 'gh issue close' legitimately still asks.
+assert_ask "#3756: genuine leading gh issue close with a --comment still asks" \
+    "gh issue close 5 --comment \"restored the old gh issue close behavior\""
+
+# A separator-preceded genuine ask command still asks (the anchor's `[;&|]`
+# alternative covers `&&`-chained commands).
+assert_ask "#3756: chained 'git status && gh issue close' still asks" \
+    "git status && gh issue close 5"
+
 # aws s3 ls is read-only — verb-narrowed cloud ASK patterns no longer prompt (#3593).
 assert_allow "Allow aws s3 ls (read-only, #3593)" \
     "aws s3 ls"
