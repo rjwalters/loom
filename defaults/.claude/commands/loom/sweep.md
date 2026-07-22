@@ -120,10 +120,11 @@ Combine flags as needed. Always pass `--state open` explicitly (Mode C operates 
 - **`--dry-run`** — print the planned candidate list (with wave grouping) and EXIT without performing any mutation. Recognized as a bare flag token (no value). May appear anywhere in `$ARGUMENTS`. Default is off. Honoured in **all three** modes — stripped before classification along with other flags. Mode C dry-run prints the PR-set plan (per-PR routing) instead of the issue-set plan.
 - **`--prs`** — switch into Mode C (PR-set mode). Recognized as a bare flag token (no value). May appear anywhere in `$ARGUMENTS`. Default is off. When present, non-flag tokens are interpreted as **PR numbers** (numeric tokens) or as a **PR-list description** (NL tokens). When absent, an NL trigger phrase listed in the Mode C section can still select Mode C. See "Mode C" above for full semantics.
 - **`--no-daemon`** — force in-process subagent dispatch even when the daemon is running with a multi-account token pool. Recognized as a bare flag token (no value). May appear anywhere in `$ARGUMENTS`. Default is off. When present, **Stage -1 (Backend detection) skips the `PROBE_DAEMON` step entirely** and the skill always falls through to the existing Mode A/B/C subagent dispatch path. Honoured in **all three** modes — stripped before classification along with other flags. Use this when you want the predictable single-process behaviour even though daemon dispatch is available (e.g., debugging, demoing the subagent path, or running under a token configuration that you don't want shared with daemon-spawned sweeps). See "Stage -1: Backend detection" below.
+- **`--depends-on <parent>`** — stacked-PR mode (issue #3729, v1). Declares that this sweep's issue is stacked on the single parent issue `<parent>`: the Builder branches its worktree off `feature/issue-<parent>` (not the default branch) and opens its PR with `--base feature/issue-<parent>`, so the child's Curator→Builder→Judge can run **concurrently** with the parent's review. Takes **one value** (a positive integer parent issue number) — this is the sole, authoritative dependency source (no `Depends on #A` body parsing in v1). A single optional parent makes diamonds / multi-parent stacks unrepresentable. Recognized anywhere in `$ARGUMENTS` as `--depends-on N`; strip it (and its value) before classification and store `DEPENDS_ON=N`. Default **unset** — absent the flag, behavior is byte-for-byte unchanged (branches off the default branch as always). Intended for **daemon `dispatch_sweep`-only** use (`mcp__loom__dispatch_sweep` with `depends_on`); the wave lifecycle does **not** auto-detect or auto-create stacks. See "Stacked dependency (v1, manual reconciliation)" below. **Reconciliation after the parent squash-merges is a manual, scripted step** (`./.loom/scripts/reconcile-stack.sh`) — `merge-pr.sh` is not modified in v1.
 
 ### Validation rules
 
-- Recognize `--dry-run`, `--prs`, `--no-daemon`, and `--builders-per-wave N` as flag tokens anywhere in `$ARGUMENTS`, strip them from the candidate list before validation, and store them as flags / parameters (`DRY_RUN=true|false`, `PRS_MODE=true|false`, `NO_DAEMON=true|false`, `BUILDERS_PER_WAVE=N`). When `--builders-per-wave` is **absent**, set the sentinel `BUILDERS_PER_WAVE=auto` (not `1`) — Stage -1 resolves the concrete wave size from the backend + disk headroom. An explicit integer is stored verbatim and overrides auto.
+- Recognize `--dry-run`, `--prs`, `--no-daemon`, `--builders-per-wave N`, and `--depends-on N` as flag tokens anywhere in `$ARGUMENTS`, strip them from the candidate list before validation, and store them as flags / parameters (`DRY_RUN=true|false`, `PRS_MODE=true|false`, `NO_DAEMON=true|false`, `BUILDERS_PER_WAVE=N`, `DEPENDS_ON=N|unset`). When `--builders-per-wave` is **absent**, set the sentinel `BUILDERS_PER_WAVE=auto` (not `1`) — Stage -1 resolves the concrete wave size from the backend + disk headroom. An explicit integer is stored verbatim and overrides auto. `--depends-on N` consumes its following token as the parent issue number (a positive integer); reject a missing/non-numeric value with `Error: --depends-on requires a positive integer parent issue number` and EXIT. When absent, `DEPENDS_ON` is unset (no base override — default-branch behavior).
 - At least one candidate (numeric token or NL description) must be supplied. If `$ARGUMENTS` (after stripping flag tokens) is empty, display:
   ```
   Usage: /sweep <issue-number> [<issue-number> ...] [--builders-per-wave N] [--dry-run] [--no-daemon]
@@ -1229,6 +1230,11 @@ Each builder is responsible for:
 - Pushing the branch and opening a PR labeled `loom:review-requested`.
 - Closing references: `Closes #N` in the PR body.
 
+**Stacked-dependency gated path (`--depends-on`, #3729 v1).** This gate fires **only** when `DEPENDS_ON` is set (from `--depends-on <parent>`); when it is unset the two steps below are byte-for-byte the default behavior. When `DEPENDS_ON=<parent>` is set, the builder for the sweep's issue must:
+  - Create its worktree branched off the parent's branch: `./.loom/scripts/worktree.sh N --base feature/issue-<parent>` (instead of the bare `./.loom/scripts/worktree.sh N`). `worktree.sh` resolves `feature/issue-<parent>` from `origin/feature/issue-<parent>` (or a local branch), so the parent sweep must have created/pushed its branch first; if the base cannot be resolved, `worktree.sh` hard-fails rather than silently branching off the default branch.
+  - Open its PR against the parent branch: `gh pr create --base feature/issue-<parent> --label "loom:review-requested" --body "Closes #N ..."` (instead of the default base). The PR remains stacked on the parent until the operator reconciles it (see "Stacked dependency (v1, manual reconciliation)").
+  This is a single-issue, daemon-`dispatch_sweep`-only path (the daemon forwards `depends_on` as `--depends-on`). The wave lifecycle does not auto-create stacks — only an explicitly `--depends-on`-flagged invocation stacks.
+
 **Await all builders in the wave** before proceeding to Judge. Collect each builder's PR number (or failure marker).
 
 **Backstop: verify the main worktree is clean after the builders return (#3513).** A builder subagent runs without `LOOM_WORKTREE_PATH` injected, so the `guard-worktree-paths.sh` hook does not fire on this path. If a builder used repo-relative paths after a cwd reset, it may have written to the **main** worktree instead of its issue worktree. After the wave's builders return and before advancing any PR to Judge, run:
@@ -1252,6 +1258,36 @@ If the builder failed (no PR opened), do NOT write a checkpoint — leave the ch
 **Per-builder failure isolation.** If builder for issue `#A` fails to open a PR (build error, test failure, unrecoverable conflict, etc.), log it and **continue** with the other builders' PRs in this wave. The failed issue is recorded as `blocked (builder failed)` in the summary. Do NOT abort the wave. Do NOT skip Judge for the other PRs.
 
 **Mid-builder kill semantics (#3373).** If sweep is killed during the Builder phase, the next invocation will see `CHECKPOINT_PHASE == "curator-done"` (no `builder-done` was written), so the Builder dispatches again from scratch. The worktree from the killed run is preserved by `worktree.sh`'s idempotency — `./.loom/scripts/worktree.sh N` is a no-op if `.loom/worktrees/issue-N` already exists. The builder re-enters the worktree, sees the partial diff, and decides whether to commit / amend / discard. **Sweep itself does not introspect the partial diff** — that's the builder's job.
+
+### Stacked dependency (v1, manual reconciliation) — #3729
+
+Stacked-PR mode pipelines a genuine dependency: when issue B consumes issue A's output (schema, file, manifest), B is built on `feature/issue-A` so B's lifecycle runs concurrently with A's review instead of serializing behind A's merge. **v1 is opt-in, daemon-`dispatch_sweep`-only, and linear-chains-only.**
+
+**How to dispatch a chain.** A chain is N independent `dispatch_sweep` calls, each naming its immediate predecessor — there is no multi-node planner:
+
+```text
+# Parent A (independent):
+mcp__loom__dispatch_sweep  kind={"Issue": A}
+# Child B stacked on A:
+mcp__loom__dispatch_sweep  kind={"Issue": B}  depends_on=A
+# Grandchild C stacked on B (A→B→C works because each hop names only its parent):
+mcp__loom__dispatch_sweep  kind={"Issue": C}  depends_on=B
+```
+
+The daemon forwards `depends_on` to the child as `--depends-on <parent>`; the child's Builder branches off `feature/issue-<parent>` and opens its PR with `--base feature/issue-<parent>` (see the gated path in the Builder phase above). A single optional parent makes diamonds / multi-parent stacks **unrepresentable** — there is no rejection logic because the type itself forbids them.
+
+**Block-the-subtree on parent failure (daemon-side, #3729 item 4).** If the parent sweep ends in `loom:blocked` (Doctor-cycle budget exhausted, or an operator cancel), the daemon's reaper does **not** let a child whose `depends_on` names that parent auto-progress: it publishes `sweep.issue.{child}.blocker` on the existing frozen topic (no new topic) so the stuck stack surfaces to the operator. Auto-detach (rebasing an orphaned child onto the default branch) is **not** implemented in v1 — block-the-subtree is the only cascade behavior.
+
+**Reconciliation is a manual, scripted step (v1).** The repo squash-merges, so after the parent squash-merges to the default branch as one commit, the child branch still carries the parent's original pre-squash commits. **After confirming the parent has squash-merged**, the operator runs:
+
+```bash
+./.loom/scripts/reconcile-stack.sh <child-pr> feature/issue-<parent>
+# = git rebase --onto <default-branch> feature/issue-<parent> <child-branch>
+#   git push --force-with-lease
+#   gh pr edit <child-pr> --base <default-branch>
+```
+
+This replays only the child's own commits onto the default branch (stripping the parent's now-squashed commits) and retargets the PR base. `merge-pr.sh` is **not** modified in v1: there is no automatic reconciliation and no merge-ordering guard — the operator is responsible for not merging a parent while an un-reconciled child PR still points at its branch. **Known v1 limitation:** if the parent branch is amended by Doctor after a child branched off it, the child is not auto-rebased — rebase it manually if needed.
 
 ### 5. Judge phase (sequential per PR within the wave)
 

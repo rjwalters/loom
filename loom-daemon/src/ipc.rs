@@ -770,11 +770,18 @@ fn handle_request(
             idempotency_key,
             model,
             effort,
+            depends_on,
         } => {
             let mut sr = sweep_registry
                 .lock()
                 .expect("Sweep registry mutex poisoned");
-            match sr.dispatch(&kind, idempotency_key, model.as_deref(), effort.as_deref()) {
+            match sr.dispatch(
+                &kind,
+                idempotency_key,
+                model.as_deref(),
+                effort.as_deref(),
+                depends_on,
+            ) {
                 Ok(outcome) => Response::SweepDispatched {
                     sweep_id: outcome.sweep_id,
                     pid: outcome.pid,
@@ -1122,6 +1129,7 @@ exit 0
                 idempotency_key: None,
                 model: None,
                 effort: None,
+                depends_on: None,
             },
             &tm,
             &db,
@@ -1166,6 +1174,7 @@ exit 0
                 idempotency_key: None,
                 model: None,
                 effort: None,
+                depends_on: None,
             },
             &tm,
             &db,
@@ -1198,6 +1207,7 @@ exit 0
                 idempotency_key,
                 model,
                 effort,
+                depends_on: _,
             } => {
                 assert!(matches!(kind, SweepKind::Issue(42)));
                 assert!(idempotency_key.is_none());
@@ -1215,6 +1225,7 @@ exit 0
             idempotency_key: Some("key-B".to_string()),
             model: Some("claude-sonnet-4-6".to_string()),
             effort: None,
+            depends_on: None,
         };
         let json = serde_json::to_string(&request).expect("serialize");
         let back: Request = serde_json::from_str(&json).expect("deserialize");
@@ -1224,6 +1235,7 @@ exit 0
                 idempotency_key,
                 model,
                 effort,
+                depends_on: _,
             } => {
                 assert!(matches!(kind, SweepKind::Issue(7)));
                 assert_eq!(idempotency_key.as_deref(), Some("key-B"));
@@ -1241,6 +1253,7 @@ exit 0
             idempotency_key: None,
             model: None,
             effort: None,
+            depends_on: None,
         };
         let json = serde_json::to_string(&request).expect("serialize");
         let back: Request = serde_json::from_str(&json).expect("deserialize");
@@ -1275,6 +1288,7 @@ exit 0
             idempotency_key: Some("key-E".to_string()),
             model: Some("claude-sonnet-4-6".to_string()),
             effort: Some("xhigh".to_string()),
+            depends_on: None,
         };
         let json = serde_json::to_string(&request).expect("serialize");
         let back: Request = serde_json::from_str(&json).expect("deserialize");
@@ -1294,6 +1308,7 @@ exit 0
             idempotency_key: None,
             model: None,
             effort: Some(String::new()),
+            depends_on: None,
         };
         let json = serde_json::to_string(&request).expect("serialize");
         let back: Request = serde_json::from_str(&json).expect("deserialize");
@@ -1302,6 +1317,42 @@ exit 0
             // to None happens spawn-side (registry) exactly like `model`.
             Request::DispatchSweep { effort, .. } => {
                 assert_eq!(effort.as_deref(), Some(""));
+            }
+            other => panic!("Expected DispatchSweep, got: {other:?}"),
+        }
+    }
+
+    // ===== DispatchSweep serde compat for `depends_on` (Issue #3729) =====
+
+    /// A wire payload WITHOUT the `depends_on` field (the pre-#3729 client
+    /// shape) must deserialize with `depends_on == None` — `#[serde(default)]`
+    /// keeps existing clients compatible.
+    #[test]
+    fn test_dispatch_sweep_deserializes_without_depends_on_field() {
+        let json = r#"{"type":"DispatchSweep","payload":{"kind":{"type":"Issue","value":42},"idempotency_key":null,"model":"claude-sonnet-4-6","effort":"xhigh"}}"#;
+        let request: Request = serde_json::from_str(json).expect("pre-#3729 payload must parse");
+        match request {
+            Request::DispatchSweep { depends_on, .. } => {
+                assert!(depends_on.is_none(), "absent depends_on must default to None");
+            }
+            other => panic!("Expected DispatchSweep, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_dispatch_sweep_serde_round_trip_with_depends_on() {
+        let request = Request::DispatchSweep {
+            kind: SweepKind::Issue(3725),
+            idempotency_key: None,
+            model: None,
+            effort: None,
+            depends_on: Some(3726),
+        };
+        let json = serde_json::to_string(&request).expect("serialize");
+        let back: Request = serde_json::from_str(&json).expect("deserialize");
+        match back {
+            Request::DispatchSweep { depends_on, .. } => {
+                assert_eq!(depends_on, Some(3726));
             }
             other => panic!("Expected DispatchSweep, got: {other:?}"),
         }
@@ -1428,6 +1479,7 @@ exit 0
                 idempotency_key: None,
                 model: None,
                 effort: None,
+                depends_on: None,
             },
             &tm,
             &db,

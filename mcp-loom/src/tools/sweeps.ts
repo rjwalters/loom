@@ -83,6 +83,12 @@ export interface SweepInfo {
    * child inherited the session-default effort; render as "default".
    */
   effort?: string;
+  /**
+   * Single parent issue this sweep is stacked on (issue #3729, stacked-PR
+   * v1). Absent/undefined means an independent sweep; when set, the child
+   * branched its worktree/PR off `feature/issue-<depends_on>`.
+   */
+  depends_on?: number;
 }
 
 interface DispatchResponse {
@@ -233,6 +239,7 @@ async function dispatchSweep(args: {
   idempotency_key?: string;
   model?: string;
   effort?: string;
+  depends_on?: number;
 }): Promise<{ success: true; result: DispatchResponse["payload"] } | { success: false; error: string }> {
   try {
     const response = (await sendDaemonRequest({
@@ -248,6 +255,11 @@ async function dispatchSweep(args: {
         // `null` (the default) means the daemon emits NO --effort flag and
         // the spawned child inherits the session-default effort.
         effort: args.effort ?? null,
+        // Issue #3729 (stacked-PR v1): optional single parent issue. `null`
+        // (the default) means the daemon emits NO --depends-on flag and the
+        // child branches off the default branch as usual. When set, the child
+        // branches its worktree/PR off `feature/issue-<depends_on>`.
+        depends_on: args.depends_on ?? null,
       },
     })) as DaemonResponse;
 
@@ -471,6 +483,18 @@ export const sweepTools: Tool[] = [
             "Omit (or pass an empty string) to preserve the session-default " +
             "effort (no --effort flag is emitted at all). Level validation " +
             "is owned by the `claude` CLI, not the daemon.",
+        },
+        depends_on: {
+          type: "number",
+          description:
+            "Optional single parent issue number this sweep is stacked on " +
+            "(issue #3729, stacked-PR v1). When set, the daemon appends " +
+            "`--depends-on <N>` to the `/loom:sweep` argv so the child " +
+            "branches its worktree/PR off `feature/issue-<N>` instead of the " +
+            "default branch, and the reaper blocks the child's subtree if the " +
+            "parent ends in `loom:blocked`. A single optional parent (not a " +
+            "list) makes diamonds / multi-parent stacks unrepresentable. Omit " +
+            "for an independent sweep (no --depends-on flag is emitted).",
         },
       },
       required: ["kind"],
@@ -762,8 +786,23 @@ export async function handleSweepTool(
         typeof args?.effort === "string" && args.effort.length > 0
           ? (args.effort as string)
           : undefined;
+      // Issue #3729 (stacked-PR v1): optional single parent issue. Only a
+      // positive integer is forwarded; anything else is treated as unset so
+      // the daemon never receives a spurious `--depends-on`.
+      const dependsOn =
+        typeof args?.depends_on === "number" &&
+        Number.isInteger(args.depends_on) &&
+        args.depends_on > 0
+          ? (args.depends_on as number)
+          : undefined;
 
-      const result = await dispatchSweep({ kind: normalized, idempotency_key: idempotencyKey, model, effort });
+      const result = await dispatchSweep({
+        kind: normalized,
+        idempotency_key: idempotencyKey,
+        model,
+        effort,
+        depends_on: dependsOn,
+      });
       if (!result.success) {
         return [
           {
