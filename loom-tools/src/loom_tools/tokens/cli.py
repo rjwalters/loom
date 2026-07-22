@@ -49,8 +49,10 @@ def _build_parser() -> argparse.ArgumentParser:
     bp = sub.add_parser(
         "bootstrap",
         help=(
-            "Materialize .loom/tokens/ from ACCOUNT_*_N triples, merging the "
-            "home master (~/.loom/accounts.env) with the repo-local source. "
+            "Materialize .loom/tokens/ from ACCOUNT_*_N triples, merging three "
+            "sources by email with precedence claude-monitor "
+            "(~/.claude-monitor/accounts.env, primary) > repo-local > home "
+            "master (~/.loom/accounts.env, still-read fallback). "
             "ACCOUNT_TOKEN_FILE_N is optional: when omitted it is auto-derived "
             "from ACCOUNT_EMAIL_N (e.g. alice@example.com -> alice-example.token)."
         ),
@@ -70,7 +72,9 @@ def _build_parser() -> argparse.ArgumentParser:
         default=None,
         help=(
             "Path to the home-dir master account source (default: "
-            "$LOOM_ACCOUNTS_ENV or ~/.loom/accounts.env)."
+            "$LOOM_ACCOUNTS_ENV or ~/.loom/accounts.env). This is a still-read "
+            "fallback below the claude-monitor master (~/.claude-monitor/"
+            "accounts.env), which is always consulted when present."
         ),
     )
     bp.add_argument(
@@ -297,11 +301,13 @@ def _cmd_bootstrap(args: argparse.Namespace) -> int:
     return 0
 
 
-# Human-readable label for each provenance tag from the merge (#3695).
+# Human-readable label for each provenance tag from the merge (#3695, #3698).
 _SOURCE_LABEL = {
     "home": "home",
     "repo": "repo",
     "repo-override": "repo (overrides home)",
+    "monitor": "claude-monitor",
+    "monitor-override": "claude-monitor (overrides repo/home)",
 }
 
 
@@ -313,10 +319,12 @@ def _print_effective_accounts(result: "object") -> None:
     shown — only email, token filename, and source.
     """
     effective = getattr(result, "effective", []) or []
+    monitor_env = getattr(result, "monitor_env", None)
     home_env = getattr(result, "home_env", None)
     repo_env = getattr(result, "repo_env", None)
 
     print("Account sources:")
+    print(f"  claude-monitor: {monitor_env if monitor_env else '(none)'}")
     print(f"  home: {home_env if home_env else '(none)'}")
     print(f"  repo: {repo_env if repo_env else '(none)'}")
 
