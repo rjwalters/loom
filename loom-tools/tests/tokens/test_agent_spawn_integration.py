@@ -163,15 +163,27 @@ class TestSpawnAgentTokenInjection:
             with patch(
                 "loom_tools.agent_spawn._is_claude_running", return_value=True
             ):
-                with patch.dict(os.environ, env or {}, clear=False):
-                    spawn_agent(
-                        role="builder",
-                        name="test-agent",
-                        args="",
-                        worktree="",
-                        repo_root=mock_repo,
-                        verify_timeout=2,
-                    )
+                # Stub the bypass-permissions modal poll.  Otherwise
+                # spawn_agent drives the real _auto_accept_bypass_prompt loop,
+                # which polls the (mocked, always-empty) pane for up to
+                # DEFAULT_BYPASS_POLL_TIMEOUT (15s) of real time.sleep per
+                # test — three of these serialized read as a hang under a
+                # short wall-clock cap (see issue #3749).  We only assert on
+                # the send-keys command line, which is emitted before this
+                # poll, so stubbing it out is behavior-preserving here.
+                with patch(
+                    "loom_tools.agent_spawn._auto_accept_bypass_prompt",
+                    return_value=True,
+                ):
+                    with patch.dict(os.environ, env or {}, clear=False):
+                        spawn_agent(
+                            role="builder",
+                            name="test-agent",
+                            args="",
+                            worktree="",
+                            repo_root=mock_repo,
+                            verify_timeout=2,
+                        )
         return captured
 
     def _find_send_keys_cmd(self, calls: list[list[str]]) -> str:

@@ -132,7 +132,10 @@ class TestValidateRole:
         assert validate_role("builder", mock_repo) is True
 
     def test_role_in_claude_commands(self, mock_repo: pathlib.Path) -> None:
-        commands_dir = mock_repo / ".claude" / "commands"
+        # Role commands live under the `/loom:<role>` namespace since #3348/#3352:
+        # validate_role() resolves `.claude/commands/loom/<role>.md`, not the
+        # pre-rename `.claude/commands/<role>.md`.  See issue #3749.
+        commands_dir = mock_repo / ".claude" / "commands" / "loom"
         commands_dir.mkdir(parents=True)
         (commands_dir / "custom.md").write_text("# Custom role")
         assert validate_role("custom", mock_repo) is True
