@@ -769,11 +769,12 @@ fn handle_request(
             kind,
             idempotency_key,
             model,
+            effort,
         } => {
             let mut sr = sweep_registry
                 .lock()
                 .expect("Sweep registry mutex poisoned");
-            match sr.dispatch(&kind, idempotency_key, model.as_deref()) {
+            match sr.dispatch(&kind, idempotency_key, model.as_deref(), effort.as_deref()) {
                 Ok(outcome) => Response::SweepDispatched {
                     sweep_id: outcome.sweep_id,
                     pid: outcome.pid,
@@ -1120,6 +1121,7 @@ exit 0
                 kind: SweepKind::Issue(2024),
                 idempotency_key: None,
                 model: None,
+                effort: None,
             },
             &tm,
             &db,
@@ -1163,6 +1165,7 @@ exit 0
                 kind: SweepKind::PrSet(vec![100, 200]),
                 idempotency_key: None,
                 model: None,
+                effort: None,
             },
             &tm,
             &db,
@@ -1194,10 +1197,12 @@ exit 0
                 kind,
                 idempotency_key,
                 model,
+                effort,
             } => {
                 assert!(matches!(kind, SweepKind::Issue(42)));
                 assert!(idempotency_key.is_none());
                 assert!(model.is_none(), "absent model field must default to None");
+                assert!(effort.is_none(), "absent effort field must default to None");
             }
             other => panic!("Expected DispatchSweep, got: {other:?}"),
         }
@@ -1209,6 +1214,7 @@ exit 0
             kind: SweepKind::Issue(7),
             idempotency_key: Some("key-B".to_string()),
             model: Some("claude-sonnet-4-6".to_string()),
+            effort: None,
         };
         let json = serde_json::to_string(&request).expect("serialize");
         let back: Request = serde_json::from_str(&json).expect("deserialize");
@@ -1217,10 +1223,12 @@ exit 0
                 kind,
                 idempotency_key,
                 model,
+                effort,
             } => {
                 assert!(matches!(kind, SweepKind::Issue(7)));
                 assert_eq!(idempotency_key.as_deref(), Some("key-B"));
                 assert_eq!(model.as_deref(), Some("claude-sonnet-4-6"));
+                assert!(effort.is_none());
             }
             other => panic!("Expected DispatchSweep, got: {other:?}"),
         }
@@ -1232,11 +1240,69 @@ exit 0
             kind: SweepKind::Issue(8),
             idempotency_key: None,
             model: None,
+            effort: None,
         };
         let json = serde_json::to_string(&request).expect("serialize");
         let back: Request = serde_json::from_str(&json).expect("deserialize");
         match back {
             Request::DispatchSweep { model, .. } => assert!(model.is_none()),
+            other => panic!("Expected DispatchSweep, got: {other:?}"),
+        }
+    }
+
+    // ===== DispatchSweep serde compat for `effort` (Issue #3716) =====
+
+    /// A wire payload WITHOUT the `effort` field (the pre-#3716 client shape)
+    /// must deserialize with `effort == None` — `#[serde(default)]` keeps
+    /// existing clients compatible.
+    #[test]
+    fn test_dispatch_sweep_deserializes_without_effort_field() {
+        let json = r#"{"type":"DispatchSweep","payload":{"kind":{"type":"Issue","value":42},"idempotency_key":null,"model":"claude-sonnet-4-6"}}"#;
+        let request: Request = serde_json::from_str(json).expect("pre-#3716 payload must parse");
+        match request {
+            Request::DispatchSweep { model, effort, .. } => {
+                assert_eq!(model.as_deref(), Some("claude-sonnet-4-6"));
+                assert!(effort.is_none(), "absent effort field must default to None");
+            }
+            other => panic!("Expected DispatchSweep, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_dispatch_sweep_serde_round_trip_with_effort() {
+        let request = Request::DispatchSweep {
+            kind: SweepKind::Issue(9),
+            idempotency_key: Some("key-E".to_string()),
+            model: Some("claude-sonnet-4-6".to_string()),
+            effort: Some("xhigh".to_string()),
+        };
+        let json = serde_json::to_string(&request).expect("serialize");
+        let back: Request = serde_json::from_str(&json).expect("deserialize");
+        match back {
+            Request::DispatchSweep { model, effort, .. } => {
+                assert_eq!(model.as_deref(), Some("claude-sonnet-4-6"));
+                assert_eq!(effort.as_deref(), Some("xhigh"));
+            }
+            other => panic!("Expected DispatchSweep, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_dispatch_sweep_serde_round_trip_with_empty_effort() {
+        let request = Request::DispatchSweep {
+            kind: SweepKind::Issue(10),
+            idempotency_key: None,
+            model: None,
+            effort: Some(String::new()),
+        };
+        let json = serde_json::to_string(&request).expect("serialize");
+        let back: Request = serde_json::from_str(&json).expect("deserialize");
+        match back {
+            // Empty string round-trips as-is at the wire layer; normalization
+            // to None happens spawn-side (registry) exactly like `model`.
+            Request::DispatchSweep { effort, .. } => {
+                assert_eq!(effort.as_deref(), Some(""));
+            }
             other => panic!("Expected DispatchSweep, got: {other:?}"),
         }
     }
@@ -1361,6 +1427,7 @@ exit 0
                 kind: SweepKind::Issue(444),
                 idempotency_key: None,
                 model: None,
+                effort: None,
             },
             &tm,
             &db,
