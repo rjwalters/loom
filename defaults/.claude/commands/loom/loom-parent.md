@@ -4,13 +4,12 @@
 
 ## Execution
 
-Use the `/loom` skill or run directly:
+This skill is superseded. Use `/loom:sweep <issue>` for the single-issue
+lifecycle, or `mcp__loom__dispatch_sweep` against the Rust `loom-daemon` for
+multi-account dispatch. See `.loom/docs/daemon-reference.md` for the current
+daemon surface.
 
-```bash
-./.loom/scripts/loom-daemon.sh {{ARGUMENTS}}
-```
-
-The Python daemon handles all orchestration internally:
+The historical Python daemon handled all orchestration internally:
 - Main event loop
 - Iteration logic
 - Shepherd spawning
@@ -22,6 +21,6 @@ The Python daemon handles all orchestration internally:
 The two-tier LLM architecture (parent/iteration) has been replaced with a deterministic Python implementation:
 
 - **Old**: `/loom` -> `loom-parent.md` -> Task() -> `loom-iteration.md`
-- **New**: `/loom` -> `loom-daemon.sh` -> `loom-daemon` (Python CLI)
+- **New**: `/loom:sweep <issue>` (Tier 1) or `mcp__loom__dispatch_sweep` -> Rust `loom-daemon` (Tier 2)
 
 See `loom-tools/src/loom_tools/daemon/` for the implementation.
