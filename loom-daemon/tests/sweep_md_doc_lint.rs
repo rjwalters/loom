@@ -132,6 +132,11 @@ fn sweep_md_includes_sample_wire_payloads() {
 
 /// #3702: the `model@effort` rung grammar and the `fable` top rung are
 /// documented, with the effort graceful-degradation contract.
+///
+/// #3705: the prose now also documents the effort *passthrough* happy path
+/// (the `claude` CLI / `spawn-claude.sh` `LOOM_EFFORT` → `--effort` surface)
+/// alongside the Task-tool graceful-degradation fallback. Both halves of the
+/// contract are pinned so a future edit can't silently drop either one.
 #[test]
 fn sweep_md_documents_effort_rung_grammar_and_fable() {
     let content = read_sweep_md();
@@ -144,6 +149,10 @@ fn sweep_md_documents_effort_rung_grammar_and_fable() {
         "sonnet → sonnet@xhigh → opus → fable",
         // Graceful degradation when per-dispatch effort plumbing is absent.
         "grammar ships either way",
+        // #3705: the effort passthrough happy path (CLI/process/daemon), not
+        // only degradation — effort IS carried where the surface exposes it.
+        "effort IS passed through",
+        "LOOM_EFFORT",
         // The fable top rung.
         "fable",
     ];

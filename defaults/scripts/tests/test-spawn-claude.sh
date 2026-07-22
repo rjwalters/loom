@@ -311,6 +311,103 @@ assert_contains "spawn-claude: model=default" "$output" \
     "structured model=default log line emitted for empty LOOM_MODEL (#3482)"
 
 # ============================================================
+# Section 4: effort selection (issue #3705)
+#
+# Mirrors the model precedence chain for the `claude --effort <level>`
+# session knob, all observable cases:
+#   1. LOOM_EFFORT alone produces --effort in the exec'd args
+#   2. explicit --effort arg beats LOOM_EFFORT env
+#   3. --effort=value form also beats LOOM_EFFORT env
+#   4. no env + no arg produces NO --effort at all (session default
+#      preserved — the zero-behavior-change acceptance criterion)
+#   5. empty LOOM_EFFORT is treated as unset — no --effort emitted
+# ============================================================
+
+echo ""
+echo "Testing spawn-claude.sh effort selection (#3705)..."
+
+# Case 1: LOOM_EFFORT env produces --effort in args
+output=$(LOOM_WORKSPACE="$TEST_WS" PATH="$STUB_DIR:$PATH" \
+    LOOM_EFFORT="xhigh" \
+    "$SCRIPTS_DIR/spawn-claude.sh" -p "ping" 2>&1 || true)
+assert_contains "stub-claude args=-p ping --effort xhigh" "$output" \
+    "LOOM_EFFORT env injects --effort into claude args"
+assert_contains "spawn-claude: effort=xhigh (from LOOM_EFFORT)" "$output" \
+    "structured effort log line emitted for LOOM_EFFORT case (#3705)"
+
+# Case 2: explicit --effort arg wins over LOOM_EFFORT env
+output=$(LOOM_WORKSPACE="$TEST_WS" PATH="$STUB_DIR:$PATH" \
+    LOOM_EFFORT="xhigh" \
+    "$SCRIPTS_DIR/spawn-claude.sh" -p "ping" --effort high 2>&1 || true)
+assert_contains "stub-claude args=-p ping --effort high" "$output" \
+    "explicit --effort arg wins over LOOM_EFFORT env"
+assert_contains "spawn-claude: effort=high (from --effort arg)" "$output" \
+    "structured effort log line emitted for explicit --effort arg case (#3705)"
+TESTS_RUN=$((TESTS_RUN + 1))
+if [[ "$output" != *"--effort xhigh"* ]]; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "  ${GREEN}PASS${NC}: LOOM_EFFORT value is not injected when explicit --effort present"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "  ${RED}FAIL${NC}: LOOM_EFFORT value is not injected when explicit --effort present"
+    echo "    In: '$output'"
+fi
+
+# Case 3: --effort=value form also suppresses LOOM_EFFORT injection
+output=$(LOOM_WORKSPACE="$TEST_WS" PATH="$STUB_DIR:$PATH" \
+    LOOM_EFFORT="xhigh" \
+    "$SCRIPTS_DIR/spawn-claude.sh" -p "ping" --effort=high 2>&1 || true)
+assert_contains "stub-claude args=-p ping --effort=high" "$output" \
+    "--effort=value form wins over LOOM_EFFORT env"
+assert_contains "spawn-claude: effort=high (from --effort arg)" "$output" \
+    "structured effort log line emitted for --effort=value form (#3705)"
+TESTS_RUN=$((TESTS_RUN + 1))
+if [[ "$output" != *"--effort xhigh"* ]]; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "  ${GREEN}PASS${NC}: --effort=value suppresses LOOM_EFFORT injection"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "  ${RED}FAIL${NC}: --effort=value suppresses LOOM_EFFORT injection"
+    echo "    In: '$output'"
+fi
+
+# Case 4 (zero-behavior-change criterion): no env + no arg => no --effort
+output=$(LOOM_WORKSPACE="$TEST_WS" PATH="$STUB_DIR:$PATH" \
+    "$SCRIPTS_DIR/spawn-claude.sh" -p "ping" 2>&1 || true)
+TESTS_RUN=$((TESTS_RUN + 1))
+if [[ "$output" == *"stub-claude args=-p ping"* && "$output" != *"--effort"* ]]; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "  ${GREEN}PASS${NC}: no LOOM_EFFORT + no --effort arg emits NO --effort (session default preserved)"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "  ${RED}FAIL${NC}: no LOOM_EFFORT + no --effort arg emits NO --effort (session default preserved)"
+    echo "    In: '$output'"
+fi
+TESTS_RUN=$((TESTS_RUN + 1))
+if [[ "$output" != *"spawn-claude: effort="* ]]; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "  ${GREEN}PASS${NC}: no effort log line emitted when nothing configured (#3705)"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "  ${RED}FAIL${NC}: no effort log line emitted when nothing configured (#3705)"
+    echo "    In: '$output'"
+fi
+
+# Case 5: empty LOOM_EFFORT is treated as unset — no --effort emitted
+output=$(LOOM_WORKSPACE="$TEST_WS" PATH="$STUB_DIR:$PATH" \
+    LOOM_EFFORT="" \
+    "$SCRIPTS_DIR/spawn-claude.sh" -p "ping" 2>&1 || true)
+TESTS_RUN=$((TESTS_RUN + 1))
+if [[ "$output" == *"stub-claude args=-p ping"* && "$output" != *"--effort"* ]]; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "  ${GREEN}PASS${NC}: empty LOOM_EFFORT emits NO --effort"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "  ${RED}FAIL${NC}: empty LOOM_EFFORT emits NO --effort"
+    echo "    In: '$output'"
+fi
+
+# ============================================================
 # Summary
 # ============================================================
 
