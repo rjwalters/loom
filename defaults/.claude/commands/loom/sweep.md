@@ -1478,6 +1478,23 @@ This is advisory-only. The script always exits `0` and **must not block** the sw
 
 If the user is running an overnight sweep, they should heed the warning before walking away.
 
+## Main Branch Freshness (#3770)
+
+During a long sweep, other PRs can merge to `origin`'s default branch. Because the installed `.loom/scripts/` and `.loom/hooks/` copies are synced from `defaults/` at install time, a local default branch that has drifted behind `origin` means the session may be executing **stale orchestration scripts** that silently lack recently-merged logic. This actually happened (#3770): during a 2026-07-22 sweep, `worktree.sh --base` (#3742) and `merge-pr.sh` auto-reconcile (#3752) were absent from the copies the session was running even though both had merged to `origin/main` — a running sweep had no signal it was behind.
+
+**Before the first wave**, run the main-freshness check and surface its output to the user (same timing and sibling role as the Host Sleep Readiness check above):
+
+```bash
+./.loom/scripts/check-main-freshness.sh
+```
+
+This is advisory-only. The script always exits `0` and **must not block** the sweep — proceed regardless of what it prints. It is strictly **read-only**: it never runs `git pull` / `git merge` / `git reset` and never auto-reconciles. It does a bounded `git fetch` of the default branch (degrading gracefully to the last-known ref when offline), then compares the local default branch against `origin/<default-branch>`:
+
+- **Behind by N commits:** prints a bordered warning to stderr noting that installed `.loom/scripts/` / `.loom/hooks/` copies may be stale, with the remediation `git merge --ff-only origin/<default-branch>`. When it can resolve both trees it also best-effort notes any installed script/hook whose content differs from its `defaults/` counterpart.
+- **Up to date:** prints nothing to stderr; a one-line stdout confirmation (suppressible with `--quiet`, matching `check-host-sleep.sh`).
+
+If the check warns, the operator should refresh local `main` (and re-sync installed copies if their install flow does so) before relying on stacked-dependency or auto-reconcile behavior mid-sweep.
+
 ## Daemon Coexistence
 
 > **Note**: the legacy `./.loom/scripts/daemon.sh` was removed in #3432 and is not restored. The historical PID-file daemon (`.loom/daemon-loop.pid`) is not part of the current architecture; the check below is a defensive coexistence guard that fires only if such a process is somehow already running — normally a no-op. The Tier 2 dispatch backend is now the Rust `loom-daemon` binary (observed via `mcp__loom__list_sweeps`); the background agent-pool control surface is `.loom/bin/loom start|status|stop`.
