@@ -18,10 +18,11 @@ triples into every repo's ``.env``. In **precedence order, highest first**:
    the email (see :func:`derive_token_filename`). This is a **soft dependency**:
    pure file detection, no import of any claude-monitor package. This is now the
    *primary* home source.
-2. **Home master (#3695)** — ``~/.loom/accounts.env`` (override with the
-   ``LOOM_ACCOUNTS_ENV`` env var; set it to ``""`` to disable the master).
-   Demoted from top default by #3698 to a **still-read fallback** — never
-   removed as a capability.
+2. **Home master (#3695)** — **opt-in only** (#3704). Consulted only when the
+   ``LOOM_ACCOUNTS_ENV`` env var points at a file (conventionally
+   ``~/.loom/accounts.env``); set it to ``""`` to disable, leave it unset and
+   the home master is **not auto-read** (no default location). Retired as a
+   default source by #3704 — the capability survives via the explicit override.
 3. **Repo-local** — ``<repo>/.loom/accounts.env`` if present, else the legacy
    ``<repo>/.env`` (override with ``--env`` / ``env_path``).
 
@@ -76,9 +77,10 @@ INDEX_VERSION = 2
 DIR_MODE = 0o700
 FILE_MODE = 0o600
 
-# Home-dir master accounts file (#3695). Shared across every workspace so the
-# account set is declared once. Override with LOOM_ACCOUNTS_ENV; set that to
-# the empty string to disable the master entirely.
+# Home-dir master accounts file (#3695). The *conventional* opt-in location an
+# operator can point LOOM_ACCOUNTS_ENV at; it is **no longer a default source**
+# (#3704 retired the auto-read). The home master is consulted only when
+# LOOM_ACCOUNTS_ENV is set to a non-empty path (see default_home_accounts_env).
 DEFAULT_HOME_ACCOUNTS_ENV = "~/.loom/accounts.env"
 HOME_ACCOUNTS_ENV_VAR = "LOOM_ACCOUNTS_ENV"
 
@@ -215,22 +217,26 @@ class Account:
 
 
 def default_home_accounts_env() -> Path | None:
-    """Resolve the home-dir master accounts file (#3695).
+    """Resolve the home-dir master accounts file (#3695, retired as default #3704).
 
     Precedence:
         1. ``LOOM_ACCOUNTS_ENV`` env var — an explicit path (``~`` expanded).
            The empty string (or all-whitespace) **disables** the master.
-        2. ``~/.loom/accounts.env`` (the default location).
+        2. Unset — returns ``None``. The home master is **opt-in only**: it is
+           no longer auto-read from a default location (#3704). Point
+           ``LOOM_ACCOUNTS_ENV`` at a file (conventionally
+           ``~/.loom/accounts.env``, :data:`DEFAULT_HOME_ACCOUNTS_ENV`) to
+           enable it.
 
     Returns the resolved :class:`Path` (which may not exist on disk), or
-    ``None`` when the master has been explicitly disabled.
+    ``None`` when the master is disabled or has not been explicitly opted in.
     """
     override = os.environ.get(HOME_ACCOUNTS_ENV_VAR)
     if override is not None:
         if not override.strip():
             return None
         return Path(override).expanduser()
-    return Path(DEFAULT_HOME_ACCOUNTS_ENV).expanduser()
+    return None
 
 
 def default_claude_monitor_accounts_env() -> Path:
@@ -448,8 +454,9 @@ def bootstrap_tokens(
     * the claude-monitor master (``~/.claude-monitor/accounts.env`` when present,
       #3698) — highest precedence, EMAIL+KEY-only entries auto-derive their
       token filename;
-    * the home-dir master (``~/.loom/accounts.env`` by default, #3695) — still
-      read as a fallback, honoring ``LOOM_ACCOUNTS_ENV``;
+    * the home-dir master (#3695) — **opt-in only** (#3704), read only when
+      ``LOOM_ACCOUNTS_ENV`` points at a file (conventionally
+      ``~/.loom/accounts.env``); not auto-read from a default location;
     * the repo-local source (``<repo>/.loom/accounts.env`` if present, else the
       legacy ``<repo>/.env``).
 

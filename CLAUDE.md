@@ -371,24 +371,27 @@ Each account becomes `.loom/tokens/<file>.token` (mode `0600`). An `index.json` 
 
 `.loom/tokens/` is gitignored. The pool is consumed by external rotation logic (e.g. a `claude-wrapper.sh` that picks the least-used token); only the bootstrap step is provided here.
 
-#### Home-dir master + per-repo override (#3695)
+#### Account sources: claude-monitor-first + per-repo (#3695, #3698, #3704)
 
-Rather than re-declaring the same account triples in every repo's `.env`, declare them **once** in a home-dir master and let each workspace add or override on top of it:
+Rather than re-declaring the same account triples in every repo's `.env`, declare them **once** in the shared claude-monitor master and let each workspace add or override on top of it. Sources are merged by account email in precedence order:
 
 | Source | Default location | Override |
 |--------|------------------|----------|
-| **Home master** | `~/.loom/accounts.env` | `LOOM_ACCOUNTS_ENV` env var (`""` disables the master); `--home-env <path>` / `--no-home` on `bootstrap` |
+| **claude-monitor master** (primary) | `~/.claude-monitor/accounts.env` | `LOOM_CLAUDE_MONITOR_DIR` env var (directory) |
 | **Repo-local** | `<repo>/.loom/accounts.env` if present, else legacy `<repo>/.env` | `--env <path>` on `bootstrap` |
+| **Home master** (opt-in only, #3704) | *no default location* — read **only** when explicitly pointed at | `LOOM_ACCOUNTS_ENV` env var (a path enables it, `""` disables); `--home-env <path>` / `--no-home` on `bootstrap` |
 
-`loom-tokens bootstrap` reads both sources and **merges them by account email** (`ACCOUNT_EMAIL`), with the repo-local source winning:
+**Default resolution is claude-monitor → repo `.env`.** The `~/.loom/accounts.env` home master is **no longer auto-read** (#3704 retired the default location): it is consulted only when an operator opts in via `LOOM_ACCOUNTS_ENV=<path>` (conventionally `~/.loom/accounts.env`) or `--home-env <path>`. This retires the default *location*, not the *capability*.
 
-- An email present **only in the master** is inherited into the pool.
-- An email present **only in the repo** is added.
-- An email present in **both** → the repo entry overrides (e.g. to rotate a key or repoint the token file).
+`loom-tokens bootstrap` reads the available sources and **merges them by account email** (`ACCOUNT_EMAIL`), with the higher-precedence source winning:
 
-To *exclude* a master account from one repo, pin the subset you want with `loom-tokens pin` — the merge only ever adds/overrides, never subtracts. The effective merged set (and where each account came from) is printed by `bootstrap` and `bootstrap --dry-run`. A repo with only a legacy `.env` and no master behaves exactly as before.
+- An email present **only in a lower-precedence source** is inherited into the pool.
+- An email present **only in a higher-precedence source** is added.
+- An email present in **both** → the higher-precedence entry overrides (e.g. to rotate a key or repoint the token file).
 
-> **Secrets**: both `~/.loom/accounts.env` and the repo-local `.loom/accounts.env` hold raw OAuth keys. The repo-local file and `.loom/tokens/` are gitignored (installer- and `loom-daemon init`–managed); keep the home master `0600` and outside any repo. A repo can rely entirely on the home master with no local account file at all.
+To *exclude* an inherited account from one repo, pin the subset you want with `loom-tokens pin` — the merge only ever adds/overrides, never subtracts. The effective merged set (and where each account came from) is printed by `bootstrap` and `bootstrap --dry-run`. A repo with only a legacy `.env` and no other source behaves exactly as before.
+
+> **Secrets**: `~/.claude-monitor/accounts.env`, the opt-in `~/.loom/accounts.env`, and the repo-local `.loom/accounts.env` all hold raw OAuth keys. The repo-local file and `.loom/tokens/` are gitignored (installer- and `loom-daemon init`–managed); keep any home-level master `0600` and outside any repo. A repo can rely entirely on the claude-monitor master with no local account file at all.
 
 #### Account health probe + ranking
 
@@ -479,16 +482,16 @@ For Pro/Max plans, Loom supports rotating between multiple Claude Code OAuth tok
 
 ### Setup
 
-1. Declare account credentials once in the home-dir master `~/.loom/accounts.env` (shared across every workspace, #3695) — or per-repo in `<repo>/.loom/accounts.env` (falls back to legacy `<repo>/.env`):
+1. Declare account credentials in a default source — the shared claude-monitor master `~/.claude-monitor/accounts.env` (primary) or per-repo in `<repo>/.loom/accounts.env` (falls back to legacy `<repo>/.env`). The `~/.loom/accounts.env` home master is **opt-in only** since #3704 (no longer auto-read); point `LOOM_ACCOUNTS_ENV=~/.loom/accounts.env` (or `--home-env <path>`) at it to enable:
    ```env
-   ACCOUNT_EMAIL_1=robb-personal@example.com
+   ACCOUNT_EMAIL_1=account-one@example.com
    ACCOUNT_KEY_1=sk-ant-oat01-...
-   ACCOUNT_TOKEN_FILE_1=robb-personal.token
-   ACCOUNT_EMAIL_2=robb-work@example.com
+   ACCOUNT_TOKEN_FILE_1=account-one.token
+   ACCOUNT_EMAIL_2=account-two@example.com
    ACCOUNT_KEY_2=sk-ant-oat01-...
-   ACCOUNT_TOKEN_FILE_2=robb-work.token
+   ACCOUNT_TOKEN_FILE_2=account-two.token
    ```
-   The home master and repo-local source are **merged by email**, with the repo overriding/adding (see "Home-dir master + per-repo override" above). Keep the master `0600` and outside any repo.
+   The claude-monitor, repo-local, and (opt-in) home sources are **merged by email**, with the higher-precedence source overriding/adding (see "Account sources: claude-monitor-first + per-repo" above). Keep any home-level master `0600` and outside any repo.
 2. Run `loom-tokens bootstrap` to materialize the merged set into per-account `.token` files in `.loom/tokens/` (mode 0600, parent dir 0700). See issues #3234, #3695.
 3. Spawn agents through `.loom/scripts/spawn-claude.sh` instead of invoking `claude` directly. The wrapper selects a token using a 3-tier algorithm (ranking → allowlist → random), exports `CLAUDE_CODE_OAUTH_TOKEN`, then `exec`s `claude` (or pass `--use-wrapper` to layer on top of `claude-wrapper.sh` for retry behavior).
 
