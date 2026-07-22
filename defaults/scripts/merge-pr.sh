@@ -636,6 +636,42 @@ if [[ "$AUTO_MERGE" == "true" ]]; then
     fi
     unset _NRC_RECHECK_JSON _NRC_BASE_REF _NRC_MERGEABLE _NRC_REQUIRED _NRC_LOOKUP_RC 2>/dev/null || true
 
+    # Repo-level "Allow auto-merge" disabled fallback (#3763). When the
+    # repository's "Allow auto-merge" setting is OFF, GitHub rejects the
+    # enablePullRequestAutoMerge mutation outright with
+    # "Auto merge is not allowed for this repository". Unlike the CLEAN/UNSTABLE
+    # rejections below (which describe the PR's own mergeStateStatus), this is a
+    # STATIC, repo-level condition — no amount of polling or branch-updating will
+    # change it. It also matches NEITHER the "is in clean status" NOR the
+    # "is in unstable status" grep below, so before #3763 it fell through to the
+    # generic terminal error at the bottom of this loop even when the PR was
+    # immediately mergeable (the observed failure: a CLEAN, Judge-approved PR
+    # aborting instead of merging).
+    #
+    # A single re-check of the PR's mergeability decides the outcome: if the PR
+    # is already immediately mergeable (.mergeable == true), a synchronous merge
+    # is exactly equivalent to the server-side auto-merge the caller requested,
+    # so flip to the immediate-merge path. If it is NOT mergeable, preserve the
+    # terminal error rather than silently bypassing a genuine merge blocker. We
+    # re-fetch PR state fresh (uncached) because REST `.mergeable` is null until
+    # GitHub computes it — the initial fetch may predate that. No poll loop is
+    # needed here (unlike the UNSTABLE fallback): the condition is repo-static.
+    if echo "$AUTO_MERGE_OUTPUT" | grep -q "Auto merge is not allowed for this repository"; then
+      _AMD_RECHECK_JSON="$(forge_get_pr_nocache "$REPO_NWO" "$PR_NUMBER" "$GH" 2>/dev/null || echo '{}')"
+      _AMD_MERGEABLE="$(echo "$_AMD_RECHECK_JSON" | jq -r '.mergeable // empty')"
+      if [[ "$_AMD_MERGEABLE" == "true" ]]; then
+        info "PR #$PR_NUMBER: repo-level auto-merge is disabled but PR is mergeable; falling back to immediate merge"
+        unset _AMD_RECHECK_JSON _AMD_MERGEABLE 2>/dev/null || true
+        AUTO_MERGE=false      # let the synchronous-merge block below run
+        AUTO_MERGE_OK=true    # bypass the post-loop "after N attempts" guard
+        break
+      fi
+      unset _AMD_RECHECK_JSON _AMD_MERGEABLE 2>/dev/null || true
+      # Not immediately mergeable — preserve the terminal error (do NOT bypass a
+      # genuine merge blocker just because auto-merge happens to be disabled).
+      error "Failed to enable auto-merge for PR #$PR_NUMBER: $AUTO_MERGE_OUTPUT"
+    fi
+
     # PR is already CLEAN — GitHub's enablePullRequestAutoMerge mutation rejects
     # this state with "Pull request Pull request is in clean status" (the
     # doubled-word prefix is from GitHub's GraphQL error formatter). Match on
