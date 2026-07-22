@@ -76,6 +76,21 @@ pub const WORKSPACE_ENV: &str = "LOOM_WORKSPACE";
 /// "recently exited sweeps should still show up in `list_sweeps`".
 pub const TERMINAL_RETENTION_SECS: i64 = 3600;
 
+/// Issue #3730: experiment-related env vars forwarded to the detached sweep
+/// child via an EXPLICIT ALLOWLIST (never a blanket env_clear/copy). Byte-exact
+/// names verified against `loom_tools/sweep_experiment.py` (`LOOM_MODEL_EXPERIMENT`,
+/// `LOOM_MODEL_EXPERIMENT_CANARY`) and `.loom/scripts/archive-transcripts.sh`
+/// (`LOOM_TRANSCRIPT_ARCHIVE`). Forwarding these makes env-based experiment
+/// enablement reliable regardless of how the daemon itself was launched — an
+/// operator can export them right before dispatching and have them reach the
+/// child. Each is forwarded only when set to a non-empty value (see
+/// `spawn_child`), so the spawn is a no-op when none are set.
+pub const EXPERIMENT_ENV_ALLOWLIST: &[&str] = &[
+    "LOOM_MODEL_EXPERIMENT",
+    "LOOM_MODEL_EXPERIMENT_CANARY",
+    "LOOM_TRANSCRIPT_ARCHIVE",
+];
+
 // ============================================================================
 // Registry
 // ============================================================================
@@ -576,9 +591,35 @@ impl SweepRegistry {
             // the daemon thinks the workspace is — never inheriting an
             // ambient value that might point elsewhere.
             .env(WORKSPACE_ENV, &self.config.workspace_root)
+            // Issue #3730: pin the child's cwd to the resolved workspace root
+            // so the child's relative `.loom/config.json` read
+            // (loom_tools/sweep_experiment.py) and archive-transcripts.sh's
+            // cwd-slug resolve deterministically, rather than depending on the
+            // daemon's own cwd happening to be the workspace root.
+            .current_dir(&self.config.workspace_root)
             .stdin(Stdio::null())
             .stdout(Stdio::from(log_file))
             .stderr(Stdio::from(log_clone));
+
+        // Issue #3730: explicitly forward the experiment-related env vars to
+        // the detached child via an EXPLICIT ALLOWLIST — never a blanket
+        // env_clear/copy. Without this, `LOOM_MODEL_EXPERIMENT` /
+        // `LOOM_MODEL_EXPERIMENT_CANARY` / `LOOM_TRANSCRIPT_ARCHIVE` only reach
+        // the child if the daemon *itself* was launched with them; an operator
+        // exporting them before dispatching would get a silent no-effect.
+        //
+        // `var_os` guards each name: an UNSET var is not forwarded, and an
+        // empty-string value is not forwarded either (no empty-string
+        // forwarding — mirrors the archiver / experiment-parser treatment of
+        // empty as "unset"). This keeps the spawn a byte-for-byte no-op when
+        // none of the vars are set.
+        for name in EXPERIMENT_ENV_ALLOWLIST {
+            if let Some(val) = std::env::var_os(name) {
+                if !val.is_empty() {
+                    cmd.env(name, val);
+                }
+            }
+        }
 
         let child = cmd
             .spawn()
@@ -1222,8 +1263,12 @@ mod tests {
 {{
   printf 'argv: %s\n' "$*"
   printf 'CLAUDE_CODE_OAUTH_TOKEN=%s\n' "${{CLAUDE_CODE_OAUTH_TOKEN:-unset}}"
-  printf 'LOOM_TERMINAL_ID=%s\n' "${{LOOM_TERMINAL_ID:-unset}}"
   printf 'LOOM_WORKSPACE=%s\n' "${{LOOM_WORKSPACE:-unset}}"
+  printf 'PWD=%s\n' "$(pwd -P)"
+  printf 'LOOM_MODEL_EXPERIMENT=%s\n' "${{LOOM_MODEL_EXPERIMENT:-unset}}"
+  printf 'LOOM_MODEL_EXPERIMENT_CANARY=%s\n' "${{LOOM_MODEL_EXPERIMENT_CANARY:-unset}}"
+  printf 'LOOM_TRANSCRIPT_ARCHIVE=%s\n' "${{LOOM_TRANSCRIPT_ARCHIVE:-unset}}"
+  printf 'LOOM_TERMINAL_ID=%s\n' "${{LOOM_TERMINAL_ID:-unset}}"
 }} >> "{rec}" 2>&1
 exit 0
 "#,
@@ -1470,6 +1515,107 @@ exit 0
             registry.get(&outcome.sweep_id).unwrap().effort,
             None,
             "empty effort must be recorded as None on the SweepInfo entry"
+        );
+    }
+
+    /// Issue #3730: when the experiment-related env vars are set in the daemon
+    /// process, `spawn_child` forwards them (via the explicit allowlist) to the
+    /// detached child, and pins the child's cwd to the workspace root.
+    #[test]
+    #[serial]
+    fn dispatch_forwards_experiment_env_and_sets_cwd() {
+        let dir = tempdir().unwrap();
+        // Canonicalize because the fixture records `pwd -P` (symlink-resolved),
+        // while tempdir() on macOS lives under a /var -> /private/var symlink.
+        let expected_cwd = std::fs::canonicalize(dir.path()).unwrap();
+        let (mut registry, record_log) = fixture_registry(dir.path());
+
+        // Export the experiment vars into the daemon (test) process env just
+        // before dispatch — this is exactly the operator scenario #3730 fixes.
+        std::env::set_var("LOOM_MODEL_EXPERIMENT", "canary");
+        std::env::set_var("LOOM_MODEL_EXPERIMENT_CANARY", "1");
+        std::env::set_var("LOOM_TRANSCRIPT_ARCHIVE", "/tmp/loom-archive-3730");
+
+        let outcome = registry
+            .dispatch(&SweepKind::Issue(48), None, None, None)
+            .expect("dispatch should succeed");
+
+        // Clean up the process env immediately so a failure below can't leak
+        // into sibling #[serial] tests.
+        std::env::remove_var("LOOM_MODEL_EXPERIMENT");
+        std::env::remove_var("LOOM_MODEL_EXPERIMENT_CANARY");
+        std::env::remove_var("LOOM_TRANSCRIPT_ARCHIVE");
+
+        let needle = format!("LOOM_TERMINAL_ID=daemon-{}", outcome.sweep_id);
+        assert!(
+            wait_for_contents(&record_log, &needle, 10000),
+            "fake spawn-claude.sh did not finish writing within 10s"
+        );
+        let recorded = std::fs::read_to_string(&record_log).unwrap();
+        assert!(
+            recorded.contains("LOOM_MODEL_EXPERIMENT=canary"),
+            "expected LOOM_MODEL_EXPERIMENT forwarded to child; got: {recorded}"
+        );
+        assert!(
+            recorded.contains("LOOM_MODEL_EXPERIMENT_CANARY=1"),
+            "expected LOOM_MODEL_EXPERIMENT_CANARY forwarded to child; got: {recorded}"
+        );
+        assert!(
+            recorded.contains("LOOM_TRANSCRIPT_ARCHIVE=/tmp/loom-archive-3730"),
+            "expected LOOM_TRANSCRIPT_ARCHIVE forwarded to child; got: {recorded}"
+        );
+        assert!(
+            recorded.contains(&format!("PWD={}", expected_cwd.display())),
+            "expected child cwd pinned to workspace root {}; got: {recorded}",
+            expected_cwd.display()
+        );
+    }
+
+    /// Issue #3730 no-op criterion: when none of the experiment env vars are
+    /// set in the daemon process, `spawn_child` does NOT forward them to the
+    /// child (the child observes them as unset). The cwd is still pinned to
+    /// the workspace root regardless.
+    #[test]
+    #[serial]
+    fn dispatch_does_not_forward_unset_experiment_env() {
+        // Ensure a clean slate — a leaked value from another test would make
+        // this a false pass.
+        std::env::remove_var("LOOM_MODEL_EXPERIMENT");
+        std::env::remove_var("LOOM_MODEL_EXPERIMENT_CANARY");
+        std::env::remove_var("LOOM_TRANSCRIPT_ARCHIVE");
+
+        let dir = tempdir().unwrap();
+        let expected_cwd = std::fs::canonicalize(dir.path()).unwrap();
+        let (mut registry, record_log) = fixture_registry(dir.path());
+
+        let outcome = registry
+            .dispatch(&SweepKind::Issue(49), None, None, None)
+            .expect("dispatch should succeed");
+
+        let needle = format!("LOOM_TERMINAL_ID=daemon-{}", outcome.sweep_id);
+        assert!(
+            wait_for_contents(&record_log, &needle, 10000),
+            "fake spawn-claude.sh did not finish writing within 10s"
+        );
+        let recorded = std::fs::read_to_string(&record_log).unwrap();
+        // The fixture prints `<VAR>=unset` when the child sees the var unset.
+        assert!(
+            recorded.contains("LOOM_MODEL_EXPERIMENT=unset"),
+            "unset LOOM_MODEL_EXPERIMENT must not be forwarded; got: {recorded}"
+        );
+        assert!(
+            recorded.contains("LOOM_MODEL_EXPERIMENT_CANARY=unset"),
+            "unset LOOM_MODEL_EXPERIMENT_CANARY must not be forwarded; got: {recorded}"
+        );
+        assert!(
+            recorded.contains("LOOM_TRANSCRIPT_ARCHIVE=unset"),
+            "unset LOOM_TRANSCRIPT_ARCHIVE must not be forwarded; got: {recorded}"
+        );
+        // cwd is pinned unconditionally.
+        assert!(
+            recorded.contains(&format!("PWD={}", expected_cwd.display())),
+            "expected child cwd pinned to workspace root {}; got: {recorded}",
+            expected_cwd.display()
         );
     }
 
