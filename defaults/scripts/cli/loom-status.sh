@@ -7,11 +7,16 @@
 #   loom status --help            Show help
 #
 # Reports the tmux agent pool spawned by `loom start`:
-#   - Running `loom-*` tmux sessions on the `loom` socket (with pane PID).
+#   - Running `loom-*` tmux sessions on the `loom` socket (with pane PID and
+#     uptime derived from tmux #{session_created}).
 #   - Cross-references each session against .loom/config.json .terminals[]
 #     to report terminal id, name, and role file.
-#   - Flags agents configured in .loom/config.json that are NOT running,
+#   - Prints a `tmux -L loom kill-session` recovery command for any unmanaged
+#     session (present on the socket but not in config).
+#   - Flags agents configured in .loom/config.json that are NOT running (in red),
 #     so a crashed / never-started agent is easy to spot.
+#   - Shows a work-queue summary (open loom:issue / loom:review-requested /
+#     loom:pr counts) when `gh` is available on a GitHub forge.
 #
 # Exits 0 whether or not any agents are running (an empty pool is not an error).
 
@@ -81,9 +86,13 @@ ${YELLOW}USAGE:${NC}
 ${YELLOW}OUTPUT:${NC}
     Running agents are the ${CYAN}loom-*${NC} tmux sessions on the ${CYAN}loom${NC} socket
     spawned by 'loom start'. Each is cross-referenced against
-    .loom/config.json .terminals[] to show its id, name, and role file.
+    .loom/config.json .terminals[] to show its id, name, role file, and
+    uptime. Unmanaged sessions (on the socket but absent from config) are
+    printed with their exact 'tmux -L loom kill-session' recovery command.
     Agents present in the config but not currently running are listed
-    separately so a crashed or never-started agent is easy to spot.
+    separately in ${RED}red${NC} so a crashed or never-started agent is easy to spot.
+    A Work Queue summary (open ${CYAN}loom:issue${NC} / ${CYAN}loom:review-requested${NC} /
+    ${CYAN}loom:pr${NC} counts) is shown when 'gh' is available on a GitHub forge.
 
 ${YELLOW}EXIT STATUS:${NC}
     Always 0 when the workspace resolves — an empty pool is not an error.
@@ -108,6 +117,71 @@ session_pid() {
     local session_name="$1"
     tmux -L "$TMUX_SOCKET" list-panes -t "$session_name" -F "#{pane_pid}" 2>/dev/null \
         | head -1 || true
+}
+
+# Session creation epoch (seconds); empty if unavailable
+session_created() {
+    local session_name="$1"
+    tmux -L "$TMUX_SOCKET" display-message -t "$session_name" -p "#{session_created}" 2>/dev/null \
+        | head -1 || true
+}
+
+# Uptime in whole seconds for a session; empty if creation time unavailable
+session_uptime_seconds() {
+    local session_name="$1"
+    local created now
+    created=$(session_created "$session_name")
+    [[ "$created" =~ ^[0-9]+$ ]] || return 0
+    now=$(date +%s)
+    local secs=$(( now - created ))
+    (( secs < 0 )) && secs=0
+    echo "$secs"
+}
+
+# Format a whole-second duration compactly (e.g. 4h32m, 3d4h, 45s)
+format_duration() {
+    local secs="$1"
+    [[ "$secs" =~ ^[0-9]+$ ]] || { echo "unknown"; return 0; }
+    local d=$(( secs / 86400 ))
+    local h=$(( (secs % 86400) / 3600 ))
+    local m=$(( (secs % 3600) / 60 ))
+    if (( d > 0 )); then
+        echo "${d}d${h}h"
+    elif (( h > 0 )); then
+        echo "${h}h${m}m"
+    elif (( m > 0 )); then
+        echo "${m}m"
+    else
+        echo "${secs}s"
+    fi
+}
+
+# Count open issues/PRs carrying a label. Echoes an integer on success;
+# returns non-zero (and echoes nothing) when gh is unavailable, unauthenticated,
+# or the forge is not GitHub — callers omit the work-queue rather than error.
+# $1 = issue|pr, $2 = label
+count_label() {
+    local kind="$1" label="$2" n
+    command -v gh &>/dev/null || return 1
+    n=$(gh "$kind" list --label "$label" --state open --json number --jq 'length' 2>/dev/null) || return 1
+    [[ "$n" =~ ^[0-9]+$ ]] || return 1
+    echo "$n"
+}
+
+# Build the work-queue object as compact JSON, or "null" when gh/label counts
+# are unavailable (gh missing, unauthenticated, or a non-GitHub forge). Never
+# errors — a missing forge just yields null so the section is omitted.
+work_queue_json() {
+    command -v jq &>/dev/null || { echo "null"; return 0; }
+    local issue rr pr
+    issue=$(count_label issue "loom:issue") || { echo "null"; return 0; }
+    rr=$(count_label pr "loom:review-requested") || { echo "null"; return 0; }
+    pr=$(count_label pr "loom:pr") || { echo "null"; return 0; }
+    jq -nc \
+        --argjson issue "$issue" \
+        --argjson review_requested "$rr" \
+        --argjson pr "$pr" \
+        '{"loom:issue":$issue, "loom:review-requested":$review_requested, "loom:pr":$pr}'
 }
 
 # Read the configured terminals as compact JSON array (or "[]")
@@ -136,10 +210,11 @@ emit_json() {
         while IFS= read -r session; do
             [[ -z "$session" ]] && continue
             local id="${session#loom-}"
-            local pid
+            local pid uptime
             pid=$(session_pid "$session")
-            rows+=$(jq -nc --arg session "$session" --arg id "$id" --arg pid "$pid" \
-                '{session:$session, id:$id, pid:($pid|select(.!="")|tonumber?)}')
+            uptime=$(session_uptime_seconds "$session")
+            rows+=$(jq -nc --arg session "$session" --arg id "$id" --arg pid "$pid" --arg uptime "$uptime" \
+                '{session:$session, id:$id, pid:($pid|select(.!="")|tonumber?), uptime_seconds:($uptime|select(.!="")|tonumber?)}')
             rows+=$'\n'
         done <<< "$running"
         running_json=$(printf '%s' "$rows" | jq -sc '.')
@@ -148,9 +223,13 @@ emit_json() {
     local terminals
     terminals=$(read_terminals)
 
+    local work_queue_json
+    work_queue_json=$(work_queue_json)
+
     jq -nc \
         --argjson running "$running_json" \
         --argjson terminals "$terminals" \
+        --argjson work_queue "$work_queue_json" \
         '
         ($running | map(.id)) as $running_ids
         | {
@@ -163,6 +242,7 @@ emit_json() {
                     role: ($t.roleConfig.roleFile // null),
                     session: $r.session,
                     pid: $r.pid,
+                    uptime_seconds: $r.uptime_seconds,
                     status: "running"
                   }
               )),
@@ -175,7 +255,8 @@ emit_json() {
                   })),
             unmanaged: ($running | map(select(.id as $rid
                 | ($terminals | map(.id) | index($rid)) | not))
-                | map({session: .session, id: .id, pid: .pid, status: "unmanaged"}))
+                | map({session: .session, id: .id, pid: .pid, uptime_seconds: .uptime_seconds, status: "unmanaged"})),
+            work_queue: $work_queue
           }'
 }
 
@@ -220,11 +301,17 @@ emit_human() {
     else
         echo -e "${GREEN}Running agents (${#running_ids[@]}):${NC}"
         echo ""
-        local session id name role pid
+        local session id name role pid uptime uptime_str
         while IFS= read -r session; do
             [[ -z "$session" ]] && continue
             id="${session#loom-}"
             pid=$(session_pid "$session")
+            uptime=$(session_uptime_seconds "$session")
+            if [[ -n "$uptime" ]]; then
+                uptime_str=$(format_duration "$uptime")
+            else
+                uptime_str="unknown"
+            fi
             name=""
             role=""
             if [[ "$terminal_count" -gt 0 ]]; then
@@ -234,12 +321,17 @@ emit_human() {
                     '.[] | select(.id == $id) | (.roleConfig.roleFile // "")' 2>/dev/null | head -1)
             fi
             if [[ -n "$name" ]]; then
-                echo -e "  ${GREEN}●${NC} ${BOLD}$id${NC} ($name)"
+                echo -e "  ${GREEN}●${NC} ${BOLD}$id${NC} ($name)   ${GRAY}up ${uptime_str}${NC}"
             else
-                echo -e "  ${GREEN}●${NC} ${BOLD}$id${NC} ${GRAY}(not in config — unmanaged)${NC}"
+                echo -e "  ${GREEN}●${NC} ${BOLD}$id${NC} ${YELLOW}(not in config — unmanaged)${NC}   ${GRAY}up ${uptime_str}${NC}"
             fi
             echo -e "      session: ${CYAN}$session${NC}   pid: ${CYAN}${pid:-unknown}${NC}"
             [[ -n "$role" ]] && echo -e "      role:    ${CYAN}$role${NC}"
+            # For unmanaged sessions (present on the socket but absent from
+            # config), print the exact recovery command to tear it down.
+            if [[ -z "$name" ]]; then
+                echo -e "      ${YELLOW}recover:${NC} ${CYAN}tmux -L $TMUX_SOCKET kill-session -t $session${NC}"
+            fi
         done <<< "$running"
     fi
 
@@ -252,13 +344,33 @@ emit_human() {
                 | "\(.id)\t\((.name // .id))\t\((.roleConfig.roleFile // ""))"' 2>/dev/null || true)
         if [[ -n "$stopped" ]]; then
             echo ""
-            echo -e "${YELLOW}Configured but not running:${NC}"
+            # Escalated to RED (was advisory yellow): a configured agent that is
+            # not running should be impossible to miss. NOTE: until a
+            # supervisory layer ships a `scaled_to_zero` marker (Proposal 3,
+            # deferred), this bucket cannot distinguish "crashed" from
+            # "intentionally not started" — both render identically here.
+            echo -e "${RED}${BOLD}Configured but not running:${NC}"
             echo ""
             while IFS=$'\t' read -r sid sname srole; do
                 [[ -z "$sid" ]] && continue
-                echo -e "  ${GRAY}○${NC} ${BOLD}$sid${NC} ($sname)${srole:+   role: $srole}"
+                echo -e "  ${RED}○${NC} ${BOLD}$sid${NC} ($sname)${srole:+   role: $srole}"
             done <<< "$stopped"
         fi
+    fi
+
+    # Work-queue depth section (open issue/PR counts by label). Omitted
+    # entirely — never an error — when gh is unavailable or the forge is not
+    # GitHub, so the script still exits 0 on any forge.
+    local wq
+    wq=$(work_queue_json)
+    if [[ -n "$wq" && "$wq" != "null" ]]; then
+        local wq_issue wq_rr wq_pr
+        wq_issue=$(echo "$wq" | jq -r '."loom:issue"' 2>/dev/null)
+        wq_rr=$(echo "$wq" | jq -r '."loom:review-requested"' 2>/dev/null)
+        wq_pr=$(echo "$wq" | jq -r '."loom:pr"' 2>/dev/null)
+        echo ""
+        echo -e "${BOLD}Work Queue:${NC}"
+        echo -e "  ${CYAN}loom:issue${NC} ${wq_issue}   ${CYAN}loom:review-requested${NC} ${wq_rr}   ${CYAN}loom:pr${NC} ${wq_pr}"
     fi
 
     echo ""
