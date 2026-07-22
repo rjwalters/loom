@@ -218,6 +218,37 @@ fn sweep_md_references_dispatch_sweep_mcp_tool() {
     );
 }
 
+/// Regression (#3765): assert the Stage -1 "Resolve auto wave size"
+/// snippet does NOT use `mapfile`, a bash-4.0+ builtin that is
+/// unavailable in macOS's default `/bin/bash` 3.2. The snippet must
+/// capture `loom_wave_size_from_disk`'s two-line stdout with a
+/// bash-3.2-portable pattern instead. This guards against
+/// reintroduction of any bash-4-only builtin into a documented recipe
+/// operators copy-paste into their default shell.
+#[test]
+fn sweep_md_stage_minus_one_wave_size_snippet_is_bash_3_2_portable() {
+    let content = read_sweep_md();
+    assert!(
+        content.contains("loom_wave_size_from_disk"),
+        "sweep.md is missing the `loom_wave_size_from_disk` wave-size \
+         resolution snippet — #3765 regression guard cannot anchor to it"
+    );
+    // Guard against the *invocation* form of the bash-4.0+ array-read
+    // builtins (`mapfile -…` / `readarray -…`). A prose mention of the
+    // word "mapfile" in an explanatory comment is fine — only executable
+    // reintroduction is the regression.
+    for bad in ["mapfile -", "readarray -"] {
+        assert!(
+            !content.contains(bad),
+            "sweep.md reintroduced `{bad}…` — a bash-4.0+ builtin \
+             unavailable in macOS's default /bin/bash 3.2 (#3765). \
+             Capture the helper's two-line stdout with a bash-3.2- \
+             portable pattern instead (e.g. command substitution + \
+             `sed -n '1p'` / `sed -n '2p'`)."
+        );
+    }
+}
+
 /// AC #1: assert the Limitations table records the Stage -1 row as
 /// Implemented (#3454). This is the operator-visible status flip that
 /// signals Phase D shipped.
