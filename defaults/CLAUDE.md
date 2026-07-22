@@ -1053,7 +1053,7 @@ If setup fails, it's usually due to:
 
 Loom ships with two built-in Bash `PreToolUse` guard hooks, both registered under the `Bash` matcher and firing independently:
 
-- **`guard-destructive.sh`** — the generic repository-hygiene guard: catastrophic denies (`rm -rf /`, force-push to `main`, `gh repo delete`, fork bombs, curl-pipe-to-shell, cloud/SQL destruction), the segment-parsed lifecycle/cloud-CLI checks, and the `guards.sqlDdl` / `guards.cloudCli` / `guards.rmScope` / `guards.forceScope` toggle machinery. Nothing about this guard is Loom-specific; it is slated to move to Repo Skills (companion issue [rjwalters/repo#13](https://github.com/rjwalters/repo/issues/13)), which will own the generic half once it ships. Until then it keeps shipping and working in Loom exactly as before.
+- **`guard-destructive.sh`** — the generic repository-hygiene guard: catastrophic denies (`rm -rf /`, force-push to `main`, `gh repo delete`, fork bombs, curl-pipe-to-shell, cloud/SQL destruction), the segment-parsed lifecycle/cloud-CLI checks, and the `guards.sqlDdl` / `guards.cloudCli` / `guards.reversibleGh` / `guards.rmScope` / `guards.forceScope` toggle machinery. Nothing about this guard is Loom-specific; it is slated to move to Repo Skills (companion issue [rjwalters/repo#13](https://github.com/rjwalters/repo/issues/13)), which will own the generic half once it ships. Until then it keeps shipping and working in Loom exactly as before.
 - **`guard-loom-workflow.sh`** — the thin, Loom-workflow-specific guard (issue #3604): the `gh pr merge` → `merge-pr.sh` redirect and the `pip install -e` worktree block (keyed on `LOOM_WORKTREE_PATH`, issue #2495). These two guards are specific to the Loom worktree/merge workflow and stay Loom-owned.
 
 You can also add project-specific guards to protect read-only directories from accidental edits (see below).
@@ -1126,6 +1126,49 @@ LOOM_GUARD_CLOUD=0 aws ec2 terminate-instances --instance-ids i-1234
 
 # Force the cloud guard on for one command even when the repo opts out
 LOOM_GUARD_CLOUD=1 aws ec2 terminate-instances --instance-ids i-1234
+```
+
+### Reversible-GitHub Ask Opt-In (`guards.reversibleGh` / `LOOM_GUARD_REVERSIBLE_GH`)
+
+`guard-destructive.sh` scopes its ask tier to **irreversibility** (#3757): a guard whose purpose is preventing catastrophic, hard-to-undo mistakes should not add confirmation friction to operations that are trivially reversed. The **reversible** GitHub state changes — `gh pr close` (undo: `gh pr reopen`), `gh issue close` (undo: `gh issue reopen`), and `gh label delete` (undo: recreate, or one `gh label sync` in a repo with `labels.yml`) — therefore **do not prompt by default**. An autonomous agent that closes its own issue/PR as part of a normal lifecycle no longer stalls on a confirmation prompt (or, in a headless run with no approver, blocks entirely).
+
+The genuinely hard-to-reverse operations stay in the ungated ask tier and are **not** affected by this toggle: `gh release delete` (deletes published artifacts/tags), and `git clean -fd` / `git checkout .` / `git restore .` (untracked / uncommitted loss). The full catastrophic deny suite (`rm -rf /`, force-push to `main`, `gh repo delete`, …) is likewise unaffected.
+
+A repo that *wants* the confirmation back on the reversible GitHub ops can **opt in**. Unlike `guards.sqlDdl` / `guards.cloudCli` (which default **on** and are opted **out**), this toggle has **inverse polarity**: it defaults **off** and is opted **in**, because enabling it *adds* friction rather than removing it.
+
+The reversible-GitHub ask is **off by default**. It is resolved in this order (highest precedence first):
+
+1. **`LOOM_GUARD_REVERSIBLE_GH` env var** — `1`/`true`/`yes` enables the ask on `gh pr close` / `gh issue close` / `gh label delete`; `0`/`false`/`no` forces it off. Overrides the config value.
+2. **`.loom/config.json`** — `guards.reversibleGh` (default `false` when absent). Set it to `true` to opt in:
+   ```json
+   {
+     "guards": {
+       "reversibleGh": true
+     }
+   }
+   ```
+3. **Default** — `false` (no ask; the reversible GitHub ops pass through).
+
+The config read is best-effort: a missing, empty, or malformed `.loom/config.json` falls through to guard-**off** (the default) and never causes the hook to exit non-zero. Only the three reversible GitHub ASK patterns are affected — opting in does not touch `gh release delete`, the `git clean`/`checkout`/`restore` asks, or any deny.
+
+**Examples**:
+
+```bash
+# Default (off) — reversible GitHub ops pass through without a prompt:
+gh pr close 42          # allowed (undo: gh pr reopen 42)
+gh issue close 100      # allowed (undo: gh issue reopen 100)
+gh label delete stale   # allowed (undo: recreate the label)
+gh release delete v1.0  # STILL asks (not gated — deletes published artifacts)
+
+# Opt in to the confirmation for a whole repo:
+#   .loom/config.json  ->  { "guards": { "reversibleGh": true } }
+gh issue close 100      # ASK
+
+# Opt in for a single command:
+LOOM_GUARD_REVERSIBLE_GH=1 gh pr close 42       # ASK
+
+# Force off for one command even when the repo opts in:
+LOOM_GUARD_REVERSIBLE_GH=0 gh issue close 100   # allowed
 ```
 
 ### Repo-Scoped rm Guard (`guards.rmScope` / `LOOM_RM_SCOPE`)

@@ -353,6 +353,60 @@ cloud_guard_enabled() {
 }
 
 # =============================================================================
+# Reversible-GitHub ask toggle — default OFF (opt-IN; inverse polarity, #3757).
+#
+# `gh pr close`, `gh issue close`, and `gh label delete` change shared state but
+# are trivially reversible — `gh pr reopen`, `gh issue reopen`, and recreating a
+# label (a repo with labels.yml restores in one `gh label sync`). A guard whose
+# purpose is preventing irreversible loss should not add confirmation friction to
+# these: an autonomous agent that closes its own issue/PR as part of a normal
+# lifecycle would otherwise stall on a prompt (or, headless, block entirely). So
+# they are NO LONGER in the ungated ASK_PATTERNS array; a repo that still wants
+# the confirmation can opt IN here. The genuinely hard-to-reverse ops
+# (`gh release delete` — published artifacts/tags; `git clean -fd` / `git
+# checkout .` / `git restore .` — untracked/uncommitted loss) STAY in the ungated
+# ask tier and are unaffected by this toggle.
+#
+# This is the INVERSE polarity of sql_guard_enabled()/cloud_guard_enabled():
+# those default ON (guard active) and are opted OUT; this one defaults OFF (no
+# ask) and is opted IN — because enabling it ADDS friction rather than removing
+# it. So the default and the absent-key resolution are `false`, not `true`.
+#
+# Resolution order (highest precedence first):
+#   1. LOOM_GUARD_REVERSIBLE_GH env var (1/true/yes enables the ask,
+#      0/false/no forces it off)
+#   2. .loom/config.json  ->  guards.reversibleGh  (default false when absent)
+#   3. Default: false (no ask)
+#
+# Mirrors cloud_guard_enabled()'s lazy/cached shape: cached in
+# _REVERSIBLE_GH_GUARD_CACHE, invoked LAZILY only after a reversible-gh pattern
+# has already matched so the jq config read never touches the hot path for the
+# common (non-matching) case. The config read is best-effort: any parse failure
+# falls through to guard-OFF (the default), never blocking.
+# =============================================================================
+_REVERSIBLE_GH_GUARD_CACHE=""
+reversible_gh_guard_enabled() {
+    if [[ -z "$_REVERSIBLE_GH_GUARD_CACHE" ]]; then
+        local enabled=false
+        if [[ -n "$REPO_ROOT" && -f "$REPO_ROOT/.loom/config.json" ]]; then
+            # jq // is alternative-on-null, not default-on-missing, so use
+            # if/then/else to treat only an explicit `true` as enabled (a
+            # missing guards.reversibleGh key stays off). On malformed JSON jq
+            # exits non-zero and the `||` fallback restores the guard-OFF default.
+            enabled=$(jq -r 'if .guards.reversibleGh == true then "true" else "false" end' "$REPO_ROOT/.loom/config.json" 2>/dev/null) || enabled=false
+            [[ -n "$enabled" ]] || enabled=false
+        fi
+        # Env override wins over config.
+        case "${LOOM_GUARD_REVERSIBLE_GH:-}" in
+            0|false|no)  enabled=false ;;
+            1|true|yes)  enabled=true ;;
+        esac
+        _REVERSIBLE_GH_GUARD_CACHE="$enabled"
+    fi
+    [[ "$_REVERSIBLE_GH_GUARD_CACHE" == "true" ]]
+}
+
+# =============================================================================
 # rm-scope repo mode toggle — default REPO (safe-by-default; opt out to off).
 #
 # As of issue #3628 (ADR Option B) this guard defaults to `repo` mode: it
@@ -1327,11 +1381,13 @@ ASK_PATTERNS=(
     '(^|[;&|[:space:]])git checkout \.'
     '(^|[;&|[:space:]])git restore \.'
 
-    # GitHub operations that modify shared state
-    '(^|[;&|[:space:]])gh pr close'
-    '(^|[;&|[:space:]])gh issue close'
+    # GitHub operations that are genuinely hard to reverse. `gh release delete`
+    # removes published artifacts/tags — it STAYS an ungated ask. The reversible
+    # GitHub state changes (`gh pr close`, `gh issue close`, `gh label delete`)
+    # were REMOVED from this array (#3757): they are trivially undone (gh pr
+    # reopen / gh issue reopen / recreate the label) and are only asked for when
+    # a repo opts IN via guards.reversibleGh (REVERSIBLE_GH_ASK_PATTERNS below).
     '(^|[;&|[:space:]])gh release delete'
-    '(^|[;&|[:space:]])gh label delete'
 
     # NOTE: cloud CLI (aws) + docker ASK patterns are NOT in this ungated array.
     # They live in CLOUD_ASK_PATTERNS below, gated by cloud_guard_enabled() so
@@ -1362,6 +1418,35 @@ ASK_PATTERNS=(
 for pattern in "${ASK_PATTERNS[@]}"; do
     if echo "$COMMAND_ASK_SCAN" | grep -qE "$pattern"; then
         ask "Command requires confirmation: $COMMAND"
+    fi
+done
+
+# =============================================================================
+# REVERSIBLE-GITHUB ASK patterns — gated by the reversible-gh guard toggle (#3757)
+#
+# Kept OUT of the ungated ASK_PATTERNS array (mirroring the CLOUD_ASK_PATTERNS
+# split) because these GitHub state changes are trivially reversible and should
+# NOT prompt by default — an autonomous agent closing its own issue/PR as part of
+# a normal lifecycle would otherwise stall. reversible_gh_guard_enabled() defaults
+# OFF and is consulted only AFTER a pattern matches, so the config read stays off
+# the hot path for non-matching commands (mirrors the SQL DDL / cloud blocks).
+#
+# These entries are anchored (#3756) and scanned against COMMAND_ASK_SCAN — the
+# comment-stripped, literal-text-redacted ask working copy — exactly as they were
+# while living in ASK_PATTERNS, so #3756's redaction still applies when the toggle
+# is opted IN (an ask-phrase quoted inside a --body/--comment value does not
+# false-ask). `gh release delete` deliberately stays in the ungated ASK_PATTERNS
+# above (hard to reverse) and is NOT gated here.
+# =============================================================================
+REVERSIBLE_GH_ASK_PATTERNS=(
+    '(^|[;&|[:space:]])gh pr close'
+    '(^|[;&|[:space:]])gh issue close'
+    '(^|[;&|[:space:]])gh label delete'
+)
+
+for pattern in "${REVERSIBLE_GH_ASK_PATTERNS[@]}"; do
+    if echo "$COMMAND_ASK_SCAN" | grep -qE "$pattern" && reversible_gh_guard_enabled; then
+        ask "Command requires confirmation: $COMMAND (set guards.reversibleGh:true in .loom/config.json to keep this ask; it is off by default because the op is trivially reversible)"
     fi
 done
 

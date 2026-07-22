@@ -473,11 +473,20 @@ assert_ask "Ask for git read-tree -m merge sim without isolation (#3637)" \
 assert_ask "Ask for git read-tree at the end of a compound command (#3637)" \
     "git fetch origin && git read-tree origin/main"
 
-assert_ask "Ask for gh pr close" \
+# --- #3757: reversible GitHub state changes no longer ask by default ---
+# gh pr close / gh issue close / gh label delete are trivially reversible
+# (gh pr reopen / gh issue reopen / recreate the label), so they are NOT in the
+# ungated ask tier anymore — they only ask when a repo opts IN via
+# guards.reversibleGh (covered in the toggle block below). gh release delete
+# stays a default ask (deletes published artifacts/tags — hard to reverse).
+assert_allow "#3757: gh pr close no longer asks by default (reversible)" \
     "gh pr close 42"
 
-assert_ask "Ask for gh issue close" \
+assert_allow "#3757: gh issue close no longer asks by default (reversible)" \
     "gh issue close 100"
+
+assert_allow "#3757: gh label delete no longer asks by default (reversible)" \
+    "gh label delete needs-triage"
 
 assert_ask "Ask for gh release delete" \
     "gh release delete v1.0"
@@ -508,14 +517,18 @@ assert_allow "#3756: ask-phrase inside a redacted --comment value (no real ask c
 
 # A GENUINE leading ask command still asks even when it carries a --comment whose
 # value also mentions the phrase: the redaction suppresses the redundant second
-# match, but the real leading 'gh issue close' legitimately still asks.
-assert_ask "#3756: genuine leading gh issue close with a --comment still asks" \
-    "gh issue close 5 --comment \"restored the old gh issue close behavior\""
+# match, but the real leading 'gh issue close' legitimately still asks — but only
+# when the reversible-gh ask is opted IN (#3757 moved gh issue close behind
+# guards.reversibleGh, off by default), so this #3756 anchoring case is exercised
+# with the toggle forced on.
+assert_ask_env "#3756/#3757: genuine leading gh issue close with --comment asks when opted in" \
+    "LOOM_GUARD_REVERSIBLE_GH=1" "gh issue close 5 --comment \"restored the old gh issue close behavior\""
 
 # A separator-preceded genuine ask command still asks (the anchor's `[;&|]`
-# alternative covers `&&`-chained commands).
-assert_ask "#3756: chained 'git status && gh issue close' still asks" \
-    "git status && gh issue close 5"
+# alternative covers `&&`-chained commands) — again exercised with the
+# reversible-gh toggle opted in (#3757).
+assert_ask_env "#3756/#3757: chained 'git status && gh issue close' asks when opted in" \
+    "LOOM_GUARD_REVERSIBLE_GH=1" "git status && gh issue close 5"
 
 # aws s3 ls is read-only — verb-narrowed cloud ASK patterns no longer prompt (#3593).
 assert_allow "Allow aws s3 ls (read-only, #3593)" \
@@ -862,6 +875,67 @@ assert_deny_env "Cloud config-off: force-push to main still blocked" \
 # Clean up cloud temp repos.
 for _cloud_dir in "$CLOUD_OFF_REPO" "$CLOUD_ON_REPO" "$CLOUD_ABSENT_REPO" "$CLOUD_BAD_REPO"; do
     [[ -n "$_cloud_dir" && "$_cloud_dir" != "/" && -d "$_cloud_dir/.loom" ]] && rm -rf "$_cloud_dir"
+done
+
+echo ""
+
+# =========================================================================
+echo -e "${YELLOW}--- Reversible-GitHub ask opt-in (guards.reversibleGh / LOOM_GUARD_REVERSIBLE_GH) (#3757) ---${NC}"
+# =========================================================================
+#
+# INVERSE polarity of guards.sqlDdl/cloudCli: default OFF (no ask), opted IN.
+# gh pr close / gh issue close / gh label delete do not ask by default; they ask
+# only when the toggle is enabled. gh release delete is NOT gated by this toggle
+# and always asks. Resolution: LOOM_GUARD_REVERSIBLE_GH env > guards.reversibleGh
+# config > default false. Reuse make_sql_repo (it only writes .loom/config.json).
+REVGH_ON_REPO=$(make_sql_repo '{"guards":{"reversibleGh":true}}')
+REVGH_OFF_REPO=$(make_sql_repo '{"guards":{"reversibleGh":false}}')
+REVGH_ABSENT_REPO=$(make_sql_repo '{"champion":{"auto_merge_max_lines":200}}')
+REVGH_BAD_REPO=$(make_sql_repo '{ not valid json ')
+
+# --- Default OFF: absent key / explicit false / malformed JSON => no ask ---
+assert_allow_env "reversibleGh absent key: gh pr close allowed (default off)" \
+    "" "gh pr close 42" "$REVGH_ABSENT_REPO"
+assert_allow_env "reversibleGh absent key: gh issue close allowed (default off)" \
+    "" "gh issue close 100" "$REVGH_ABSENT_REPO"
+assert_allow_env "reversibleGh absent key: gh label delete allowed (default off)" \
+    "" "gh label delete needs-triage" "$REVGH_ABSENT_REPO"
+assert_allow_env "reversibleGh:false config: gh issue close allowed" \
+    "" "gh issue close 100" "$REVGH_OFF_REPO"
+assert_allow_env "reversibleGh malformed JSON: gh issue close allowed (fails safe to off)" \
+    "" "gh issue close 100" "$REVGH_BAD_REPO"
+
+# --- Config ON: guards.reversibleGh:true opts the ask back in ---
+assert_ask_env "reversibleGh:true config: gh pr close asks" \
+    "" "gh pr close 42" "$REVGH_ON_REPO"
+assert_ask_env "reversibleGh:true config: gh issue close asks" \
+    "" "gh issue close 100" "$REVGH_ON_REPO"
+assert_ask_env "reversibleGh:true config: gh label delete asks" \
+    "" "gh label delete needs-triage" "$REVGH_ON_REPO"
+
+# --- Env override wins over config (mirrors sqlDdl/cloudCli precedent) ---
+assert_ask_env "LOOM_GUARD_REVERSIBLE_GH=1 overrides config-off: gh issue close asks" \
+    "LOOM_GUARD_REVERSIBLE_GH=1" "gh issue close 100" "$REVGH_OFF_REPO"
+assert_allow_env "LOOM_GUARD_REVERSIBLE_GH=0 overrides config-on: gh issue close allowed" \
+    "LOOM_GUARD_REVERSIBLE_GH=0" "gh issue close 100" "$REVGH_ON_REPO"
+
+# --- gh release delete is NOT gated by this toggle: always asks ---
+assert_ask_env "reversibleGh off: gh release delete STILL asks (not gated)" \
+    "" "gh release delete v1.0" "$REVGH_OFF_REPO"
+assert_ask_env "LOOM_GUARD_REVERSIBLE_GH=0: gh release delete STILL asks (not gated)" \
+    "LOOM_GUARD_REVERSIBLE_GH=0" "gh release delete v1.0" "$REVGH_ON_REPO"
+
+# --- Toggle off must NOT weaken unrelated guards ---
+assert_ask_env "reversibleGh off: git clean -fd STILL asks (kept in ungated ask tier)" \
+    "LOOM_GUARD_REVERSIBLE_GH=0" "git clean -fd" "$REVGH_OFF_REPO"
+assert_deny_env "reversibleGh off: rm -rf / still blocked" \
+    "LOOM_GUARD_REVERSIBLE_GH=0" "rm -rf /" "$REVGH_OFF_REPO"
+assert_deny_env "reversibleGh off: force-push to main still blocked" \
+    "LOOM_GUARD_REVERSIBLE_GH=0" "git push --force origin main" "$REVGH_OFF_REPO"
+
+# Clean up reversible-gh temp repos.
+for _revgh_dir in "$REVGH_ON_REPO" "$REVGH_OFF_REPO" "$REVGH_ABSENT_REPO" "$REVGH_BAD_REPO"; do
+    [[ -n "$_revgh_dir" && "$_revgh_dir" != "/" && -d "$_revgh_dir/.loom" ]] && rm -rf "$_revgh_dir"
 done
 
 echo ""
