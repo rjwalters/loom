@@ -298,7 +298,11 @@ class TestVerifyInstallScript:
             data = json.loads(manifest.read_text())
             assert "version" in data
             assert "files" in data
-            assert data["version"] == 1
+            # verify-install.sh `generate` emits manifest schema v2 since
+            # #3600 (install-metadata-driven file list + Loom-block region
+            # hashing).  This assertion tracked the retired v1 schema.
+            # See issue #3749.
+            assert data["version"] == 2
 
 
 class TestPyprojectConfiguration:

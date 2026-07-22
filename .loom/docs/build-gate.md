@@ -100,6 +100,50 @@ The gate is **opt-in**. Repos with no `buildGate` block in `.loom/config.json` s
 }
 ```
 
+### This repo's configuration (polyglot backstop)
+
+Loom's own `.loom/config.json` points `buildGate.command` at a committed
+wrapper script rather than a single-language one-liner, because this repo is
+polyglot (Rust + Python + bash) and no single build tool covers it:
+
+```json
+{
+  "buildGate": {
+    "enabled": true,
+    "command": "bash .loom/scripts/build-gate.sh",
+    "realChangeGlobs": ["*.rs", "*.toml", "Cargo.lock", "*.py", "*.sh"],
+    "timeoutSeconds": 600
+  }
+}
+```
+
+The wrapper lives at [`defaults/scripts/build-gate.sh`](../scripts/build-gate.sh)
+(the installer-template source of truth; `.loom/scripts/build-gate.sh` resolves
+to it via the `.loom/scripts -> ../defaults/scripts` symlink). It runs three
+stages in order under `set -euo pipefail`, aborting on the first non-zero exit:
+
+1. `cargo test --workspace` — the Rust crates (`loom-daemon`, `loom-api`).
+2. `uv run pytest tests/ -q` in `loom-tools/`, scoped with
+   `--ignore=tests/integration` (live-network/credentials e2e) and
+   `--ignore=tests/tokens/test_agent_spawn_integration.py` (a slow real-time
+   modal-poll integration file). `uv run` is used so `loom_tools` is importable
+   from the project venv.
+3. `bash scripts/test-installer.sh` — the 131-case bash installer suite.
+
+**`mcp-loom` (TypeScript) is intentionally excluded** from the gate: it needs
+`npm install`/`npm ci` in a fresh worktree (no guaranteed warm `node_modules`),
+which would add unpredictable latency to a gate that also runs once per PR. CI
+(`.github/workflows/ci.yml`) still gates the `mcp-loom` build. `timeoutSeconds:
+600` gives ~2x headroom over the measured ~210s warm-cache total to absorb a
+cold `target/` in a fresh worktree.
+
+Beyond the per-wave step-8 gate, this same command runs after **every** builder
+exit (the "Post-Builder Quality Gate" above), so it is deliberately kept fast
+and free of network/npm dependencies. This is a repo-specific,
+self-hosting-only config; `defaults/config.json` (the generic install template)
+ships with no `buildGate` block. See issue
+[#3749](https://github.com/rjwalters/loom/issues/3749).
+
 ## Failure semantics
 
 A gate failure is **not** the same as a builder failure: the issue is automatically re-queued (`loom:issue`) and a future builder can take a fresh attempt. The `PhaseResult.data` block carries:
