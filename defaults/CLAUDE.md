@@ -743,6 +743,76 @@ The ladder is configured in `.loom/config.json`:
 }
 ```
 
+### Session Transcript Archival (opt-in, #3726)
+
+Claude Code writes a full JSONL transcript for every session — and a per-subagent
+transcript for every Builder / Judge / Doctor Task — under
+`${CLAUDE_CONFIG_DIR:-$HOME/.claude}/projects/<cwd-slug>/`. These are the
+ground-truth record of what each agent did and what it cost (per-message `usage`
++ `model`), but they live only on the local box and are subject to Claude Code's
+own pruning. `archive-transcripts.sh` copies them to a durable location so a
+multi-day canary run can be audited / cost-harvested after the fact (serves the
+#3725 per-role cost harvest — the archived index is its `agent-<id>` join key).
+
+**Off by default. Zero behavior change unless you turn it on.** Enable via env or
+config (env-over-config precedence, matching the `guards.rmScope` string pattern):
+
+```bash
+# env wins over config; a path enables, ""/off/0/no/disabled forces off:
+LOOM_TRANSCRIPT_ARCHIVE=/Volumes/scratch/loom-transcripts \
+  ./.loom/scripts/archive-transcripts.sh
+```
+
+```json
+// .loom/config.json — new top-level "loom" block:
+{ "loom": { "transcriptArchive": { "enabled": true, "dir": "/Volumes/scratch/loom-transcripts" } } }
+```
+
+**Layout at destination** — `<dir>/<repo>/<date>/<session-uuid>/`:
+
+```
+<session-uuid>.jsonl                       the session's own transcript
+<session-uuid>/subagents/agent-*.jsonl     per-subagent transcripts
+<session-uuid>/subagents/agent-*.meta.json role+issue sidecars (copied verbatim)
+<session-uuid>/tool-results/…              large tool outputs
+index.json                                 agent-id-keyed join index (schema loom.transcript-index/v1)
+```
+
+The `index.json` is keyed by `agent-<id>` with one row per subagent; **role and
+issue are read from the existing `agent-*.meta.json` sidecars** (not re-derived),
+and the archiver adds only the loom-side context the sidecar lacks (repo, sweep
+issue, model, start/end ts, and `arm`/`attempt` when a model experiment is active).
+
+**Base path is `CLAUDE_CONFIG_DIR`-aware** — the archiver never hard-codes
+`~/.claude`. Per-agent isolated config dirs (`.loom/claude-config/<agent>/`) get a
+fresh `projects/`, so the copier resolves its source through
+`${CLAUDE_CONFIG_DIR:-$HOME/.claude}/projects` (mirrors
+`loom_tools.common.claude_config.resolve_projects_dir()`).
+
+**When it runs**: cron-friendly periodic sync (the durability backstop — the
+session's own top-level `<uuid>.jsonl` is still being appended while the session
+runs, so only a periodic + at-exit sync reliably captures the tail), plus a
+completion-time invocation from `/loom:sweep`. Idempotent (size + mtime skip), so
+re-runs copy nothing new. Cron example:
+
+```cron
+*/15 * * * * cd /path/to/repo && ./.loom/scripts/archive-transcripts.sh >> .loom/logs/archive-transcripts.log 2>&1
+```
+
+> **Guardrails — transcripts can contain secrets.** A transcript is full tool I/O
+> and may include `.env` contents or token values that scrolled through a shell.
+> The archiver treats the destination as sensitive, exactly like `.loom/tokens/`
+> and `accounts.env`: created **mode `0700`**, files **`0600`**; if the destination
+> is **inside a git repo it MUST be gitignored** or the archiver **refuses** (it
+> will not copy secret-bearing transcripts into a tracked tree); and it prints a
+> **loud one-line banner naming the destination** whenever archival is enabled.
+> As with the token pool, **you (the operator) own the security of the archive
+> location** — put it outside any repo, or gitignore it.
+
+**Out of scope (v1)**: remote / object-storage backends (`s3://`, `gcs://`,
+rsync-to-remote) are an explicit follow-on — v1 is a local filesystem destination
+only.
+
 ### Custom Roles
 
 Create custom roles by adding files to `.loom/roles/`:
