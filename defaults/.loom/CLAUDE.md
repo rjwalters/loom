@@ -73,6 +73,13 @@ The legacy `./loom.sh` wrapper (and `.loom/scripts/start-daemon.sh` /
 `stop-daemon.sh`) are thin shims that now delegate to these `.loom/bin/loom`
 subcommands, kept only for backwards compatibility.
 
+**Safe to run from inside a Claude Code session.** `.loom/bin/loom start` spawns
+each agent with `tmux new-session -d` on a dedicated `-L loom` socket. `tmux
+new-session -d` reparents the new pane's process to the (pre-existing, detached)
+tmux server rather than to the invoking shell, so an agent started from within a
+Claude Code session is never a descendant of that session and survives its exit.
+There is no need to launch the pool from a separate external terminal.
+
 **When to use the agent pool**:
 - Running several standing role agents (builder / judge / curator …) in the background
 - Hands-off orchestration on a dedicated host
