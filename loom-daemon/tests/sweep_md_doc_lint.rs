@@ -216,3 +216,87 @@ fn sweep_md_asserts_no_fable_judge_invariant() {
          (#3702): `Judge model resolution can never resolve to `fable`...`"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Issue #3725 — model-cost experiment mode. The tri-state setting, the two-arm
+// A/B, the resume-safe stratified assignment, the tier-2.5 suppression, the
+// durable store, the exact-cost harvest, and the canary guardrail are all prose
+// contracts the sweep orchestrator interprets — pin the load-bearing strings so
+// a future edit can't silently drop them.
+// ---------------------------------------------------------------------------
+
+/// #3725: the tri-state experiment setting + env override are documented with
+/// the string-valued guard precedence, and the two arms are named.
+#[test]
+fn sweep_md_documents_model_experiment_mode() {
+    let content = read_sweep_md();
+    let required: &[&str] = &[
+        "### Model-cost experiment mode",
+        "sweep.modelExperiment",
+        "LOOM_MODEL_EXPERIMENT",
+        // Tri-state values.
+        "`off` | `observe` | `experiment`",
+        // Two arms mapping onto #3718's inequality.
+        "Arm A = opus-first",
+        "Arm B = sonnet-first + escalate",
+        // Deterministic, resume-safe, stratified assignment.
+        "Deterministic, resume-safe, stratified assignment",
+        // The durable, gitignored store.
+        ".loom/stats/sweep-model-stats.jsonl",
+        // The agent-id join key into #3726's index.
+        "agent-id` join key",
+        "loom.transcript-index/v1",
+    ];
+    for needle in required {
+        assert!(
+            content.contains(needle),
+            "sweep.md is missing #3725 experiment-mode prose `{needle}` — \
+             update sweep.md or this test if the change is intentional"
+        );
+    }
+}
+
+/// #3725 (hard AC): in `experiment` mode the forced arm SUPPRESSES the tier-2.5
+/// complexity bump so Arm B stays sonnet on `complex`-marked issues.
+#[test]
+fn sweep_md_documents_experiment_tier_2_5_suppression() {
+    let content = read_sweep_md();
+    assert!(
+        content.contains("Experiment-mode suppression (issue #3725)"),
+        "sweep.md must document the tier-2.5 suppression note (#3725 hard AC)"
+    );
+    assert!(
+        content.contains("SUPPRESSES this tier-2.5 bump"),
+        "sweep.md must state the forced arm suppresses the tier-2.5 bump (#3725)"
+    );
+    assert!(
+        content.contains("only as the stratification key"),
+        "sweep.md must state the marker is used only as the stratification key \
+         while an arm is forced (#3725)"
+    );
+}
+
+/// #3725: the canary guardrail and the exact-per-role-cost harvest are pinned.
+#[test]
+fn sweep_md_documents_experiment_guardrail_and_harvest() {
+    let content = read_sweep_md();
+    let required: &[&str] = &[
+        // Canary-only guardrail + explicit opt-in.
+        "canary-only",
+        "LOOM_MODEL_EXPERIMENT_CANARY=1",
+        // Harvest surface.
+        "--model-experiment",
+        // Exact cache-aware cost via transcript usage.
+        "cache-aware",
+        "cache_read_input_tokens",
+        // token_fidelity ladder.
+        "token_fidelity",
+    ];
+    for needle in required {
+        assert!(
+            content.contains(needle),
+            "sweep.md is missing #3725 guardrail/harvest prose `{needle}` — \
+             update sweep.md or this test if the change is intentional"
+        );
+    }
+}
