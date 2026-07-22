@@ -86,12 +86,68 @@ def test_experiment_honored_with_env_canary():
     assert mode == "experiment"
 
 
-def test_experiment_honored_with_config_canary():
+def test_committed_config_canary_no_longer_confirms():
+    # #3731 BEHAVIOR CHANGE: committed sweep.modelExperimentCanary is the exact
+    # accidental-production-fire vector (it propagates with a copied config), so it
+    # is NO LONGER an accepted confirmation. Experiment now downgrades to observe.
     config = {"sweep": {"modelExperimentCanary": True}}
-    mode, _ = se.resolve_effective_mode(
+    mode, warns = se.resolve_effective_mode(
         {"LOOM_MODEL_EXPERIMENT": "experiment"}, config
     )
+    assert mode == "observe"
+    assert any("NON-CANARY" in w for w in warns)
+
+
+def test_experiment_honored_with_sentinel(tmp_path):
+    # (b) A gitignored sentinel file confirms the canary.
+    sentinel = tmp_path / ".loom" / "CANARY"
+    sentinel.parent.mkdir(parents=True)
+    sentinel.write_text("")
+    mode, warns = se.resolve_effective_mode(
+        {"LOOM_MODEL_EXPERIMENT": "experiment"},
+        {},
+        sentinel_path=str(sentinel),
+        is_tracked=lambda _p: False,
+    )
     assert mode == "experiment"
+    assert warns == []
+
+
+def test_tracked_sentinel_is_refused_and_downgrades(tmp_path):
+    # A git-TRACKED sentinel defeats the purpose (it propagates like committed
+    # config), so it is refused with a warning and experiment downgrades to observe.
+    sentinel = tmp_path / ".loom" / "CANARY"
+    sentinel.parent.mkdir(parents=True)
+    sentinel.write_text("")
+    mode, warns = se.resolve_effective_mode(
+        {"LOOM_MODEL_EXPERIMENT": "experiment"},
+        {},
+        sentinel_path=str(sentinel),
+        is_tracked=lambda _p: True,
+    )
+    assert mode == "observe"
+    assert any("TRACKED" in w for w in warns)
+    assert any("NON-CANARY" in w for w in warns)
+
+
+def test_evaluate_canary_reports_source():
+    confirmed, source, warns = se.evaluate_canary(
+        {"LOOM_MODEL_EXPERIMENT_CANARY": "yes"}
+    )
+    assert confirmed is True
+    assert source == "env"
+    assert warns == []
+
+
+def test_canary_confirmed_ignores_committed_config(tmp_path):
+    # Committed config is not consulted; with no uncommitted signal -> unconfirmed.
+    missing = tmp_path / ".loom" / "CANARY"
+    assert (
+        se.canary_confirmed(
+            {}, {"sweep": {"modelExperimentCanary": True}}, sentinel_path=str(missing)
+        )
+        is False
+    )
 
 
 def test_observe_is_safe_anywhere_no_guardrail():
