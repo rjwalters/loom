@@ -1471,9 +1471,9 @@ If the user is running an overnight sweep, they should heed the warning before w
 
 ## Daemon Coexistence
 
-> **Stop-gap note (epic #3449, stop-gap #3451)**: `./.loom/scripts/daemon.sh` does not currently exist on `origin/main` (deleted in #3432, rebuild in flight under epic #3449). The PID-file check below is a defensive coexistence guard that fires only if a daemon process is already running — it's a no-op in v0.9.x. The `./.loom/scripts/daemon.sh stop` instruction in the warning text is forward-looking until the rebuild lands.
+> **Note**: the legacy `./.loom/scripts/daemon.sh` was removed in #3432 and is not restored. The historical PID-file daemon (`.loom/daemon-loop.pid`) is not part of the current architecture; the check below is a defensive coexistence guard that fires only if such a process is somehow already running — normally a no-op. The Tier 2 dispatch backend is now the Rust `loom-daemon` binary (observed via `mcp__loom__list_sweeps`); the background agent-pool control surface is `.loom/bin/loom start|status|stop`.
 
-`/sweep` does not require the daemon and does not interact with `.loom/daemon-state.json` for writes. If the daemon is running, `/sweep` and the daemon may both try to claim the same `loom:issue` label.
+`/sweep` does not require the daemon and does not interact with `.loom/daemon-state.json` for writes. If a legacy daemon process is running, `/sweep` and the daemon may both try to claim the same `loom:issue` label.
 
 **Coexistence behavior:** before the first wave, check whether the daemon is running. If it is, warn the user once at the start of the sweep:
 
@@ -1481,8 +1481,8 @@ If the user is running an overnight sweep, they should heed the warning before w
 PID=$(cat .loom/daemon-loop.pid 2>/dev/null)
 if [[ -n "$PID" ]] && kill -0 "$PID" 2>/dev/null; then
   echo "⚠️  Loom daemon is running (PID $PID). /sweep will race with the daemon"
-  echo "   for issues in the loom:issue queue. Consider stopping the daemon first:"
-  echo "       ./.loom/scripts/daemon.sh stop"
+  echo "   for issues in the loom:issue queue. Consider stopping the pool first:"
+  echo "       ./.loom/bin/loom stop"
 fi
 ```
 

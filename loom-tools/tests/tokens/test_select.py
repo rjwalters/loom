@@ -180,11 +180,14 @@ def test_allowlist_with_no_existing_tokens_falls_through_to_random(tmp_path):
 # ---------- ranking tier ----------
 
 
-def test_ranking_picks_first_unblocked(tmp_path):
+def test_ranking_picks_among_top_n_eligible(tmp_path):
+    # Default N=3 spreads across eligible ranked entries (a is exhausted, so
+    # b and c are the top-2 eligible). See issue #3736.
     workspace = _make_workspace(tmp_path, {"a": "ka", "b": "kb", "c": "kc"})
     _write_ranking(workspace, ["a|exhausted", "b|", "c|"])
-    sel = select_token(workspace)
-    assert sel.name == "b"
+    sel = select_token(workspace, rng=random.Random(0))
+    assert sel.name in ("b", "c")
+    assert sel.name != "a"  # never the exhausted account
     assert sel.mode == "ranked"
 
 
@@ -233,6 +236,104 @@ def test_ranking_falls_through_when_all_exhausted(tmp_path):
     # Falls through past tier 1 (all exhausted), past tier 2 (no allowlist),
     # to tier 3 (random).
     assert sel.mode == "random"
+
+
+# ---------- ranking spread (issue #3736) ----------
+
+
+def test_ranking_spreads_across_top_n_with_varying_seeds(tmp_path, monkeypatch):
+    """Varying rng seeds must select different accounts among the top-N.
+
+    This is the anti-collision property: concurrent spawners (each with an
+    independent rng) should NOT deterministically land on .ranking[0].
+    """
+    monkeypatch.delenv("LOOM_TOKEN_SPREAD_TOP_N", raising=False)
+    workspace = _make_workspace(
+        tmp_path, {"a": "ka", "b": "kb", "c": "kc", "d": "kd", "e": "ke"},
+    )
+    # All available; ranking order a,b,c,d,e. Default N=3 => window {a,b,c}.
+    _write_ranking(workspace, ["a|", "b|", "c|", "d|", "e|"])
+    top_n = {"a", "b", "c"}
+    chosen: set[str] = set()
+    for seed in range(50):
+        sel = select_token(workspace, rng=random.Random(seed))
+        assert sel.mode == "ranked"
+        assert sel.name in top_n  # never spills past the top-N window
+        chosen.add(sel.name)
+    # More than one distinct account is selected across seeds (spread), and
+    # entries below the window (d, e) are never chosen.
+    assert len(chosen) > 1
+    assert chosen <= top_n
+
+
+def test_ranking_n1_restores_greedy_first_eligible(tmp_path, monkeypatch):
+    """N=1 (env override) exactly restores the historical greedy behavior."""
+    monkeypatch.setenv("LOOM_TOKEN_SPREAD_TOP_N", "1")
+    workspace = _make_workspace(tmp_path, {"a": "ka", "b": "kb", "c": "kc"})
+    _write_ranking(workspace, ["a|exhausted", "b|", "c|"])
+    # First eligible entry is b — deterministic regardless of seed.
+    for seed in range(25):
+        sel = select_token(workspace, rng=random.Random(seed))
+        assert sel.name == "b"
+        assert sel.mode == "ranked"
+
+
+def test_ranking_spread_config_key(tmp_path, monkeypatch):
+    """.loom/config.json -> tokens.spreadTopN is honored when env is unset."""
+    monkeypatch.delenv("LOOM_TOKEN_SPREAD_TOP_N", raising=False)
+    workspace = _make_workspace(tmp_path, {"a": "ka", "b": "kb", "c": "kc"})
+    _write_ranking(workspace, ["a|", "b|", "c|"])
+    config_path = workspace / ".loom" / "config.json"
+    config_path.write_text(json.dumps({"tokens": {"spreadTopN": 1}}), encoding="utf-8")
+    # spreadTopN=1 => greedy first eligible (a), deterministic across seeds.
+    for seed in range(10):
+        sel = select_token(workspace, rng=random.Random(seed))
+        assert sel.name == "a"
+
+    # env var overrides the config key.
+    monkeypatch.setenv("LOOM_TOKEN_SPREAD_TOP_N", "3")
+    chosen = {
+        select_token(workspace, rng=random.Random(seed)).name for seed in range(50)
+    }
+    assert len(chosen) > 1
+
+
+def test_ranking_spread_skips_interleaved_exhausted_blocked(tmp_path, monkeypatch):
+    """Exhausted/blocked entries interleaved in the ranking are never chosen.
+
+    The top-N window is filled from the *eligible* entries only, preserving
+    ranking order and skipping exhausted/blocked/bad tokens.
+    """
+    monkeypatch.delenv("LOOM_TOKEN_SPREAD_TOP_N", raising=False)
+    workspace = _make_workspace(
+        tmp_path,
+        {"a": "ka", "b": "kb", "c": "kc", "d": "kd", "e": "ke"},
+    )
+    # Interleaved: a exhausted, b ok, c blocked, d ok, e ok.
+    # Eligible order: b, d, e. Default N=3 => window {b, d, e}.
+    _write_ranking(workspace, ["a|exhausted", "b|", "c|blocked", "d|", "e|"])
+    window = {"b", "d", "e"}
+    chosen: set[str] = set()
+    for seed in range(50):
+        sel = select_token(workspace, rng=random.Random(seed))
+        assert sel.mode == "ranked"
+        assert sel.name in window
+        assert sel.name not in ("a", "c")  # never exhausted/blocked
+        chosen.add(sel.name)
+    assert len(chosen) > 1
+
+
+def test_ranking_spread_skips_bad_in_window(tmp_path, monkeypatch):
+    """A bad token is excluded from the top-N window entirely."""
+    monkeypatch.delenv("LOOM_TOKEN_SPREAD_TOP_N", raising=False)
+    workspace = _make_workspace(tmp_path, {"a": "ka", "b": "kb", "c": "kc"})
+    _write_ranking(workspace, ["a|", "b|", "c|"])
+    bad_file = workspace / ".loom" / "tokens" / ".bad_tokens"
+    bad_file.write_text("2026-01-01T00:00:00Z a expired\n", encoding="utf-8")
+    for seed in range(25):
+        sel = select_token(workspace, rng=random.Random(seed))
+        assert sel.name in ("b", "c")
+        assert sel.name != "a"
 
 
 # ---------- CLI ----------

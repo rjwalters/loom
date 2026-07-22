@@ -47,26 +47,39 @@ Use Claude Code terminals with specialized roles for hands-on development coordi
 # Enhances unlabeled issues, marks as loom:ready
 ```
 
-### 2. Daemon Mode
+### 2. Agent Pool (`.loom/bin/loom`)
 
-Run the Loom daemon for fully autonomous system orchestration.
-
-**Setup**:
-```bash
-./.loom/scripts/daemon.sh start   # auto-build enabled (default)
-```
+Spawn and manage a background pool of autonomous agents (tmux sessions) from
+`.loom/config.json`. The canonical control surface is the `.loom/bin/loom` CLI:
 
 ```bash
-/loom           # Activate daemon orchestration (daemon must be started first)
-/loom --merge   # Aggressive autonomous development
+./.loom/bin/loom start    # Spawn the agent pool from .loom/config.json
+./.loom/bin/loom status   # Show running agents (+ configured-but-stopped)
+./.loom/bin/loom stop     # Graceful shutdown of the pool
 ```
 
-**When to use Daemon Mode**:
-- Production-scale development
-- Fully autonomous agent workflows
-- Hands-off orchestration
+**Common commands**:
 
-**Graceful shutdown**: `./.loom/scripts/daemon.sh stop` (or `touch .loom/stop-daemon`)
+| Command | Purpose |
+|---------|---------|
+| `./.loom/bin/loom start` | Start all configured agents (`--only <role>` to filter, `--dry-run` to preview) |
+| `./.loom/bin/loom status` | List running `loom-*` tmux sessions with id / name / role, plus any configured agent that is not running (`--json` for machine-readable output) |
+| `./.loom/bin/loom stop` | Graceful shutdown (`--force` to kill immediately, `<agent>` to stop one) |
+| `./.loom/bin/loom attach <id>` | Attach to a running agent's tmux session |
+| `./.loom/bin/loom logs <id>` | Tail an agent's output |
+| `./.loom/bin/loom help` | Full command list; `./.loom/bin/loom <cmd> --help` for per-command help |
+
+The legacy `./loom.sh` wrapper (and `.loom/scripts/start-daemon.sh` /
+`stop-daemon.sh`) are thin shims that now delegate to these `.loom/bin/loom`
+subcommands, kept only for backwards compatibility.
+
+**When to use the agent pool**:
+- Running several standing role agents (builder / judge / curator …) in the background
+- Hands-off orchestration on a dedicated host
+
+> For single-issue lifecycle orchestration prefer `/loom:sweep <issue>` (Tier 1),
+> and for multi-account autonomous dispatch use the Rust `loom-daemon` binary via
+> `mcp__loom__dispatch_sweep` (Tier 2).
 
 ## Agent Roles
 
