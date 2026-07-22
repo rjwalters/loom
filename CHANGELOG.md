@@ -7,6 +7,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.13.0] - 2026-07-22
+
+### Summary
+
+Minor release headlined by the **model-cost experiment infrastructure** — the tooling to answer the opus→sonnet Builder-default question with real, balanced canary data: a tri-state `sweep.modelExperiment` mode with deterministic A/B arm assignment, opt-in durable session-transcript archival, exact per-role cache-aware cost harvesting, and a production-safety guardrail that requires an *uncommitted* canary confirmation. Also lands **effort-aware escalation** (the `model@effort` rung grammar plus `LOOM_EFFORT`/daemon-dispatch effort plumbing), a batch of **`merge-pr.sh` hardening** fixes, and **multi-account token sourcing** (claude-monitor-first three-source merge).
+
+### Added
+
+- **`/sweep`: experiment-mode model-cost instrumentation** — tri-state `sweep.modelExperiment` (`off`/`observe`/`experiment`) + `LOOM_MODEL_EXPERIMENT` env, deterministic resume-safe per-issue A/B arm assignment (Arm A opus-first vs Arm B sonnet-first + escalate-on-Judge-rejection) stratified by the curator complexity marker, tier-2.5 complexity-bump suppression on Arm B, a durable gitignored `.loom/stats/sweep-model-stats.jsonl` outcome-chain store, and an `agent-metrics.sh --model-experiment` harvest computing exact per-role cache-aware cost from subagent-transcript `usage` blocks. Canary-only (guarded, off by default). (#3725, #3728)
+- **Opt-in session-transcript archival** — `loom.transcriptArchive` / `LOOM_TRANSCRIPT_ARCHIVE` copies session + subagent transcripts to a durable location with a per-session `agent-<id>` manifest join key, `CLAUDE_CONFIG_DIR`-aware base resolution, and `0700`/`0600` + gitignore-or-refuse guardrails. The retention substrate for the cost harvest and general audit. (#3726, #3727)
+- **Effort-aware escalation ladder** — `model@effort` rung grammar for `sweep.escalation` (e.g. `"sonnet@xhigh"`), a top `fable` rung with refusal-aware fallback, a Curator complexity marker, and graceful degradation when per-dispatch effort plumbing is unavailable. (#3702, #3703)
+- **`LOOM_EFFORT` → `claude --effort` passthrough** on `spawn-claude.sh`, and **per-dispatch effort through `mcp__loom__dispatch_sweep`** — the daemon forwards an optional `effort` to the spawned child mirroring the `--model` plumbing. (#3705, #3715; #3716, #3722)
+- **`fix(daemon)`: experiment env + workspace cwd propagated to detached sweep children** — `spawn_child` forwards an explicit allowlist (`LOOM_MODEL_EXPERIMENT`, `LOOM_MODEL_EXPERIMENT_CANARY`, `LOOM_TRANSCRIPT_ARCHIVE`) and pins `current_dir` to the workspace root, so env-based experiment enablement reaches the canary path. (#3730, #3732)
+- **Multi-account token sourcing** — a claude-monitor-first additive three-source account merge (claude-monitor master → repo-local → opt-in home master), an optional claude-monitor ranking consumer with email-derived token files, and a home-dir master account pool with per-repo override. (#3695, #3696; #3697, #3699; #3700)
+
+### Changed
+
+- **`~/.loom/accounts.env` retired as a default account source** — it is no longer auto-read; consult it only via explicit `LOOM_ACCOUNTS_ENV=<path>` / `--home-env`. Default resolution is now claude-monitor master → repo-local `.env`. (#3704, #3708)
+- **Experiment-mode canary confirmation must come from an uncommitted signal** — committed `sweep.modelExperimentCanary` config is no longer accepted; confirmation requires the `LOOM_MODEL_EXPERIMENT_CANARY` env var or a gitignored `.loom/CANARY` sentinel, closing the accidental-production-fire vector (a copied config can never confirm canary status). Fail-safe downgrade to `observe` preserved. (#3731, #3733)
+
+### Fixed
+
+- **`merge-pr.sh --auto` falls back to immediate merge when a repo has no required status checks** — a self-gating no-required-checks fallback (empty required-context set + `mergeable`) precedes the CLEAN/UNSTABLE greps, preserving the #3664 required-check gating by construction. (#3720, #3724)
+- **`merge-pr.sh` never removes the primary/main worktree** — a guard at the single `_remove_loom_worktree` funnel refuses to remove the first `git worktree list --porcelain` entry regardless of `.loom-managed` sentinel, branch, or `worktree.root`. (#3710, #3714)
+- **`merge-pr.sh` worktree porcelain parsing is space-safe** — all four `awk '$2'` sites strip the literal `worktree ` prefix (`substr`) so worktree paths containing spaces are preserved; `branch` ref lines keep `$2`. (#3721)
+- **Probe-path `.ranking` emits the pipe format the selector reads** — `check.py::write_ranking_atomic` now writes the `name|status` format `select.py::_read_ranking` consumes (matching the monitor path), so probe-based tier-1 token selection is no longer inert. (#3709, #3713)
+- **`/sweep` builder cwd-reset contamination backstop locked in** — a regression test exercises the `check-main-clean.sh --baseline` detection for a tracked/staged stray write, with hardened step-4 prose; the env-injection prevention path is documented as mechanically impossible on the Task-subagent path. (#3719, #3723)
+- Dropped extraneous f-string prefixes in `_cmd_unblock` (F541). (#3701)
+
+### Documentation
+
+- **Only Builders parallelize; issue-creating agents (architect/curator/champion) must be serialized** — documented across the sweep/architect/curator/champion skills to prevent the `gh issue create` number-race cross-contamination. (#3707, #3711)
+- **Measurement-gated cheap-first model retune procedure** — `docs/model-selection-retune.md` captures the decision inequality and `agent-metrics.sh --by-model` gating that must be satisfied before any `suggestedModel` default flip (no shipped defaults changed). (#3706, #3712)
+
 ## [0.12.0] - 2026-07-21
 
 ### Summary
