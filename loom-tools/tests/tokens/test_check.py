@@ -300,9 +300,8 @@ class TestRanking:
         target = tmp_path / "tokens" / ".ranking"
         write_ranking_atomic(report, target)
         assert target.exists()
-        data = json.loads(target.read_text())
-        assert data["accounts"][0]["name"] == "a-1"
-        assert data["ranked_at"] == "2026-05-03T00:00:00Z"
+        # Pipe format (name|status) — the format select.py:_read_ranking consumes.
+        assert target.read_text() == "a-1|available\n"
 
     def test_atomic_write_no_partial_file(self, tmp_path: Path):
         # Verify that the temp file is renamed (no stray .tmp left behind on
@@ -321,8 +320,7 @@ class TestRanking:
             accounts=[AccountResult("new", "available")],
         )
         write_ranking_atomic(report, target)
-        data = json.loads(target.read_text())
-        assert data["accounts"][0]["name"] == "new"
+        assert target.read_text() == "new|available\n"
 
 
 # ---------------------------------------------------------------------------
@@ -346,8 +344,13 @@ class TestRunCheck:
         assert names_status["agent-1"] == "available"
         assert names_status["agent-bad"] == "blocked"
 
-        ranking = json.loads((tmp_path / ".ranking").read_text())
-        assert {a["name"] for a in ranking["accounts"]} == {"agent-1", "agent-bad"}
+        # Pipe format (name|status) — parse names back out of the .ranking.
+        ranking_names = {
+            line.split("|", 1)[0]
+            for line in (tmp_path / ".ranking").read_text().splitlines()
+            if line
+        }
+        assert ranking_names == {"agent-1", "agent-bad"}
 
     def test_one_failure_does_not_kill_run(self, tmp_path: Path):
         # Tokens are probed in sorted-name order (a-good, z-bad).
@@ -463,10 +466,11 @@ class TestSourceMonitor:
             run_check(
                 tokens_dir, source="probe", write_ranking=True, stagger=False
             )
-        # It probed (network call made) and wrote JSON, not pipe.
+        # It probed (network call made) and wrote the selector's pipe format.
         assert post.called
-        data = json.loads((tokens_dir / ".ranking").read_text())
-        assert "accounts" in data
+        text = (tokens_dir / ".ranking").read_text()
+        assert "|" in text
+        assert text.startswith("acct-")
 
     def test_monitor_source_writes_pipe_format(self, tmp_path: Path, monkeypatch):
         workspace, tokens_dir, monitor_dir = _setup_pool(tmp_path)
@@ -528,9 +532,10 @@ class TestSourceMonitor:
         ) as post:
             run_check(tokens_dir, source="auto", write_ranking=True, stagger=False)
         assert post.called  # fell back to probing
-        # Probe path writes JSON.
-        data = json.loads((tokens_dir / ".ranking").read_text())
-        assert "accounts" in data
+        # Probe path writes the selector's pipe format.
+        text = (tokens_dir / ".ranking").read_text()
+        assert "|" in text
+        assert text.startswith("acct-")
 
     def test_roundtrip_monitor_output_read_by_selector(
         self, tmp_path: Path, monkeypatch
@@ -553,6 +558,40 @@ class TestSourceMonitor:
             ],
         )
         run_check(tokens_dir, source="monitor", write_ranking=True, stagger=False)
+
+        selected = select_token(workspace)
+        assert selected.mode == "ranked"
+        assert selected.name == "acct-a"
+
+    def test_roundtrip_probe_output_read_by_selector(
+        self, tmp_path: Path, monkeypatch
+    ):
+        """The .ranking emitted by the PROBE path is consumed by select_token.
+
+        Mirrors test_roundtrip_monitor_output_read_by_selector for the probe
+        path (#3709). check.write_ranking_atomic must emit the pipe-delimited
+        name|status format that select.py:_read_ranking parses; if it wrote
+        JSON, tier-1 (ranking-based) selection would be inert and the selector
+        would fall through to allowlist/random.
+        """
+        workspace, tokens_dir, _monitor_dir = _setup_pool(tmp_path)
+
+        # discover_tokens probes in sorted name order (acct-a, then acct-b).
+        # acct-a available (low 7d), acct-b exhausted (high 7d) -> the sorted
+        # ranking lists acct-a first, so the selector must pick acct-a.
+        responses = [
+            _mock_response(200, _good_headers(s7d=0.10)),  # acct-a available
+            _mock_response(200, _good_headers(s7d=0.99)),  # acct-b exhausted
+        ]
+        with patch("requests.post", side_effect=responses):
+            run_check(
+                tokens_dir, source="probe", write_ranking=True, stagger=False
+            )
+
+        # Sanity: the probe wrote the selector's pipe format, not JSON.
+        assert (tokens_dir / ".ranking").read_text() == (
+            "acct-a|available\nacct-b|exhausted\n"
+        )
 
         selected = select_token(workspace)
         assert selected.mode == "ranked"
