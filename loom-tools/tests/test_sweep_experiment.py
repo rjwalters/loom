@@ -203,6 +203,22 @@ def test_unknown_complexity_normalizes_to_routine():
     assert se.assign_arm(10, "") == se.assign_arm(10, None)
 
 
+def test_infer_arm_from_model_maps_opus_a_sonnet_b():
+    # Aliases and pinned IDs both resolve to the same inequality arm.
+    assert se.infer_arm_from_model("opus") == "A"
+    assert se.infer_arm_from_model("claude-opus-4-8") == "A"
+    assert se.infer_arm_from_model("sonnet") == "B"
+    assert se.infer_arm_from_model("claude-sonnet-4-6") == "B"
+
+
+def test_infer_arm_from_model_unknown_is_none():
+    # Non-inequality models stay unattributed ("?" bucket), never mis-mapped.
+    assert se.infer_arm_from_model("haiku") is None
+    assert se.infer_arm_from_model("gpt-4") is None
+    assert se.infer_arm_from_model(None) is None
+    assert se.infer_arm_from_model("") is None
+
+
 # --------------------------------------------------------------------------- #
 # Pricing + transcript usage
 # --------------------------------------------------------------------------- #
@@ -393,6 +409,100 @@ def test_harvest_aggregation(tmp_path):
     assert b["merge_rate"] == 0.0
     # best-effort cost: 5000/1e3*0.003 + 800/1e3*0.015
     assert b["total_cost_usd"] == pytest.approx(0.027)
+
+
+def test_harvest_observe_mode_attributes_by_model_end_to_end(tmp_path):
+    """End-to-end observe->harvest wiring (#3750).
+
+    A pure ``observe``-mode sample carries ``arm=null`` on every record (only
+    ``experiment`` mode stamps A/B). This exercises the full record -> append ->
+    harvest chain and asserts the harvest still splits the sample into the
+    opus(A) / sonnet(B) inequality buckets from the observed Builder model — the
+    behavior the operator runbook relies on. A synthetic transcript-index fixture
+    confirms the harvest reader consumes it for exact per-arm cost.
+    """
+    archive = _make_archive(tmp_path)  # provides agent-bld1 (opus) transcript
+    stats = tmp_path / "observe-stats.jsonl"
+    sf = str(stats)
+
+    # Issue 300 — observe mode, Builder ran opus (arm intentionally omitted), joins
+    # the transcript fixture for exact cost; first-attempt judge pass; merged.
+    se.append_record(se.build_record(issue=300, phase="builder", role="builder",
+                                     model="opus", mode="observe",
+                                     agent_id="agent-bld1"), sf)
+    se.append_record(se.build_record(issue=300, phase="judge", role="judge",
+                                     mode="observe", attempt=1,
+                                     judge_verdict="pass"), sf)
+    se.append_record(se.build_record(issue=300, phase="merge", role="merge",
+                                     mode="observe"), sf)
+    # Issue 301 — observe mode, Builder ran sonnet; first-attempt judge reject then
+    # one doctor cycle; not merged.
+    se.append_record(se.build_record(issue=301, phase="builder", role="builder",
+                                     model="sonnet", mode="observe"), sf)
+    se.append_record(se.build_record(issue=301, phase="judge", role="judge",
+                                     mode="observe", attempt=1,
+                                     judge_verdict="changes"), sf)
+    se.append_record(se.build_record(issue=301, phase="doctor", role="doctor",
+                                     mode="observe", attempt=2), sf)
+
+    report = se.harvest(sf, str(archive))
+    arms = {a["arm"]: a for a in report["arms"]}
+
+    # Both inequality arms populated purely from observe-mode (arm-null) rows.
+    assert set(arms) == {"A", "B"}
+    assert arms["A"]["model"] == "opus"
+    assert arms["A"]["n_issues"] == 1
+    assert arms["A"]["first_attempt_pass_rate"] == 1.0
+    assert arms["A"]["merge_rate"] == 1.0
+    # Exact cost joined from the transcript fixture (not zero / not "none").
+    assert report["token_fidelity_counts"]["transcript"] == 1
+    assert arms["A"]["total_cost_usd"] > 0.0
+
+    assert arms["B"]["model"] == "sonnet"
+    assert arms["B"]["n_issues"] == 1
+    assert arms["B"]["first_attempt_pass_rate"] == 0.0
+    assert arms["B"]["mean_doctor_cycles"] == 1.0
+    assert arms["B"]["merge_rate"] == 0.0
+
+
+def test_harvest_explicit_arm_beats_model_inference(tmp_path):
+    """Experiment-mode explicit arm wins over the observed model (no regression).
+
+    An issue explicitly assigned Arm B (sonnet-first) whose escalated Doctor cycle
+    ran opus must stay entirely under B — the explicit arm is authoritative and
+    the opus Doctor record must not leak into an inferred Arm A bucket.
+    """
+    stats = tmp_path / "exp-stats.jsonl"
+    sf = str(stats)
+    se.append_record(se.build_record(issue=400, phase="builder", role="builder",
+                                     model="sonnet", mode="experiment", arm="B"), sf)
+    se.append_record(se.build_record(issue=400, phase="judge", role="judge",
+                                     mode="experiment", arm="B", attempt=1,
+                                     judge_verdict="changes"), sf)
+    # Escalated Doctor runs opus but is still Arm B evidence.
+    se.append_record(se.build_record(issue=400, phase="doctor", role="doctor",
+                                     model="opus", mode="experiment", arm="B",
+                                     attempt=2), sf)
+
+    report = se.harvest(sf, None)
+    arms = {a["arm"]: a for a in report["arms"]}
+    assert set(arms) == {"B"}
+    assert arms["B"]["n_issues"] == 1
+    assert arms["B"]["mean_doctor_cycles"] == 1.0
+
+
+def test_harvest_unknown_model_stays_in_question_bucket(tmp_path):
+    """Observe rows whose Builder model isn't opus/sonnet are not mis-attributed."""
+    stats = tmp_path / "haiku-stats.jsonl"
+    sf = str(stats)
+    se.append_record(se.build_record(issue=500, phase="builder", role="builder",
+                                     model="haiku", mode="observe"), sf)
+    se.append_record(se.build_record(issue=500, phase="judge", role="judge",
+                                     mode="observe", attempt=1,
+                                     judge_verdict="pass"), sf)
+    report = se.harvest(sf, None)
+    arms = {a["arm"]: a for a in report["arms"]}
+    assert set(arms) == {"?"}
 
 
 def test_harvest_empty_store_does_not_crash(tmp_path):
