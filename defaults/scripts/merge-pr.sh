@@ -461,6 +461,45 @@ if [[ "$AUTO_MERGE" == "true" ]]; then
       fi
     fi
 
+    # No-required-checks fallback (#3720). When the repo defines ZERO required
+    # status checks, GitHub's enablePullRequestAutoMerge mutation is rejected
+    # outright — there is nothing to queue the merge behind. The rejection
+    # string for that case matches NEITHER the "is in clean status" NOR the
+    # "is in unstable status" grep below, so it previously fell through to the
+    # generic terminal error at the bottom of this loop (issue #3720: docs-only
+    # PRs #4400/#4399 were UNSTABLE from non-required pending jobs and could not
+    # enable auto-merge, yet a plain synchronous merge succeeded because they
+    # were MERGEABLE).
+    #
+    # This fallback is deliberately STRING-INDEPENDENT (it never inspects
+    # AUTO_MERGE_OUTPUT) and self-gating: it fires only when
+    #   (1) the base branch has NO required status check contexts, AND
+    #   (2) the PR is mergeable (.mergeable == true).
+    # In that case an immediate synchronous merge is exactly equivalent to a
+    # server-side auto-merge — there is no required check to wait for. It
+    # preserves the #3664/#3486/#3678 required-check gating BY CONSTRUCTION:
+    # with ANY required check present, the contexts list is non-empty and this
+    # branch is skipped, leaving the UNSTABLE classifier below in charge. A
+    # lookup failure (nonzero exit) fails closed (skip → preserve existing
+    # behavior). We re-fetch PR state fresh because REST `.mergeable` is null
+    # until GitHub computes it — the initial fetch may predate that.
+    _NRC_RECHECK_JSON="$(forge_get_pr_nocache "$REPO_NWO" "$PR_NUMBER" "$GH" 2>/dev/null || echo '{}')"
+    _NRC_BASE_REF="$(echo "$_NRC_RECHECK_JSON" | jq -r '.base.ref // empty')"
+    _NRC_MERGEABLE="$(echo "$_NRC_RECHECK_JSON" | jq -r '.mergeable // empty')"
+    if [[ -n "$_NRC_BASE_REF" ]] && [[ "$_NRC_MERGEABLE" == "true" ]]; then
+      _NRC_REQUIRED=""
+      _NRC_LOOKUP_RC=0
+      _NRC_REQUIRED="$(forge_get_required_status_check_contexts "$REPO_NWO" "$_NRC_BASE_REF" "$GH" 2>/dev/null)" || _NRC_LOOKUP_RC=$?
+      if [[ "$_NRC_LOOKUP_RC" -eq 0 ]] && [[ -z "$_NRC_REQUIRED" ]]; then
+        info "PR #$PR_NUMBER: repo has no required status checks and PR is mergeable; falling back to immediate merge"
+        unset _NRC_RECHECK_JSON _NRC_BASE_REF _NRC_MERGEABLE _NRC_REQUIRED _NRC_LOOKUP_RC 2>/dev/null || true
+        AUTO_MERGE=false      # let the synchronous-merge block below run
+        AUTO_MERGE_OK=true    # bypass the post-loop "after N attempts" guard
+        break
+      fi
+    fi
+    unset _NRC_RECHECK_JSON _NRC_BASE_REF _NRC_MERGEABLE _NRC_REQUIRED _NRC_LOOKUP_RC 2>/dev/null || true
+
     # PR is already CLEAN — GitHub's enablePullRequestAutoMerge mutation rejects
     # this state with "Pull request Pull request is in clean status" (the
     # doubled-word prefix is from GitHub's GraphQL error formatter). Match on
