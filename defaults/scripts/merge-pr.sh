@@ -18,6 +18,11 @@
 #                          commits — Git's own safety check).
 #   --dry-run              Show what would happen without merging
 #   --auto                 Enable auto-merge instead of immediate merge
+#   --allow-stacked-children
+#                          Bypass the pre-merge merge-ordering guard when the
+#                          parent branch (feature/issue-N) still has open
+#                          stacked child PRs targeting it (operator asserts the
+#                          children are already reconciled). See #3747 item 2.
 #
 # By default, the local worktree is cleaned up after a successful merge.
 # Pass --no-cleanup-worktree to skip this (e.g., when other terminals may
@@ -77,6 +82,17 @@ Options:
                          (Git refuses on unmerged commits).
   --dry-run              Show what would happen without merging
   --auto                 Enable auto-merge instead of immediate merge
+  --allow-stacked-children
+                         Bypass the pre-merge merge-ordering guard. That guard
+                         hard-blocks merging a stacked PARENT PR (branch
+                         feature/issue-N) while it still has open stacked CHILD
+                         PRs targeting its branch, because the repo's
+                         delete_branch_on_merge setting would delete the parent
+                         branch synchronously during the merge and leave the
+                         children unable to rebase onto it (see #3747 item 2).
+                         Pass this flag only after you have manually reconciled
+                         (or verified) the children — the operator asserts
+                         responsibility, mirroring --worktree-path.
   -h, --help             Show this help and exit
 
 By default, the local worktree is cleaned up after a successful merge.
@@ -194,6 +210,7 @@ CLEANUP_WORKTREE=true
 DRY_RUN=false
 AUTO_MERGE=false
 WORKTREE_PATH_OVERRIDE=""
+ALLOW_STACKED_CHILDREN=false
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -211,6 +228,7 @@ while [[ $# -gt 0 ]]; do
       ;;
     --dry-run) DRY_RUN=true; shift ;;
     --auto) AUTO_MERGE=true; shift ;;
+    --allow-stacked-children) ALLOW_STACKED_CHILDREN=true; shift ;;
     -*)  error "Unknown option: $1" ;;
     *)
       if [[ -z "$PR_NUMBER" ]]; then
@@ -223,7 +241,7 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-[[ -z "$PR_NUMBER" ]] && error "Usage: merge-pr.sh <pr-number> [--no-cleanup-worktree] [--worktree-path <dir>] [--dry-run] [--auto]"
+[[ -z "$PR_NUMBER" ]] && error "Usage: merge-pr.sh <pr-number> [--no-cleanup-worktree] [--worktree-path <dir>] [--dry-run] [--auto] [--allow-stacked-children]"
 [[ "$PR_NUMBER" =~ ^[0-9]+$ ]] || error "PR number must be numeric: $PR_NUMBER"
 
 # Validate --worktree-path early (before any network calls) so bad input
@@ -276,6 +294,89 @@ fi
 if [[ "$PR_STATE" == "closed" ]]; then
   error "PR #$PR_NUMBER is closed (not merged)"
 fi
+
+# ---------------------------------------------------------------------------
+# Pre-merge merge-ordering guard (#3747, stacked-PR v2 item 2).
+#
+# Runs BEFORE both the auto-merge and synchronous-merge paths (that is why it is
+# defined and invoked here, above the "Merging PR" line — not next to item 1's
+# POST-merge _auto_reconcile_stacked_children at the bottom of the merge flow).
+#
+# The race it closes: when a stacked PARENT PR (branch feature/issue-<N>)
+# squash-merges, item 1's post-merge _auto_reconcile_stacked_children rebases any
+# open CHILD PRs off the now-squashed parent branch onto the default branch. That
+# rebase (reconcile-stack.sh's `git rebase --onto <default> <parent-branch>
+# <child-branch>`) needs <parent-branch> to still resolve as a ref. But Loom's own
+# recommended repo setting — delete_branch_on_merge:true, applied by
+# setup-repository-settings.sh — makes GitHub delete feature/issue-<parent>
+# SYNCHRONOUSLY as part of the merge API call itself, before merge-pr.sh even
+# reaches the "merged successfully" log line, let alone the post-merge reconcile
+# step. Once the ref is gone a fresh fetch won't see it and the rebase's <upstream>
+# fails to resolve. Item 1's post-merge pass can therefore race and LOSE against
+# the repo's own settings. This guard refuses to let the parent merge happen at
+# all while that race exists.
+#
+# This is orthogonal to item 1's loom:building safe/unsafe split: a "safe" child
+# is just as exposed to branch deletion as an "unsafe" one, so the guard keys
+# PURELY on "does an open child PR still target this branch", never on the child's
+# label. Discovery reuses item 1's live-forge-query shape (`gh pr list --base
+# <parent> --state open`), NOT the ephemeral daemon registry.
+#
+# Default is a hard block (error, exit 1) — a normal, recoverable failure that
+# Champion's cron retries next tick, exactly like every other merge-blocking
+# condition in this file. --allow-stacked-children bypasses it (operator asserts
+# the children are reconciled). --dry-run still runs the guard and REPORTS the
+# would-be block, but honors the dry-run contract (never exits 1).
+_check_no_open_stacked_children() {
+  # Only GitHub, and only a parent PR on a feature/issue-<N> branch, can have
+  # stacked children — identical guard conditions to
+  # _auto_reconcile_stacked_children. No-op (byte-for-byte unchanged behavior)
+  # otherwise.
+  [[ "$FORGE_TYPE" == "github" ]] || return 0
+  [[ "$PR_BRANCH" =~ ^feature/issue-([0-9]+)$ ]] || return 0
+
+  # Live forge discovery — NEVER the daemon registry. Same call/shape item 1
+  # already makes; plain `gh` (uncached) so we see child PRs as of right now.
+  local children_json count child_list
+  children_json="$(gh pr list --repo "$REPO_NWO" --base "$PR_BRANCH" --state open \
+    --json number,headRefName 2>/dev/null || echo '[]')"
+  [[ -n "$children_json" ]] || return 0
+  count="$(echo "$children_json" | jq 'length' 2>/dev/null || echo 0)"
+  [[ "$count" -gt 0 ]] || return 0
+
+  # Comma-separated "#N" list for the operator-facing message.
+  child_list="$(echo "$children_json" \
+    | jq -r '[.[].number | "#" + tostring] | join(", ")' 2>/dev/null || echo '')"
+
+  # Operator opt-in bypass (mirrors the --worktree-path sentinel-bypass precedent):
+  # the operator asserts responsibility for having reconciled/verified the children.
+  if [[ "$ALLOW_STACKED_CHILDREN" == "true" ]]; then
+    warning "Merge-ordering guard: --allow-stacked-children set; proceeding despite $count open stacked child PR(s) ($child_list) targeting '$PR_BRANCH' (operator asserts they are reconciled)"
+    return 0
+  fi
+
+  local msg
+  msg="Merge blocked: PR #$PR_NUMBER's branch '$PR_BRANCH' still has $count open stacked child PR(s) ($child_list) targeting it.
+
+Merging now would race the repo's delete_branch_on_merge setting: GitHub deletes '$PR_BRANCH' synchronously during the merge, before the child PR(s) can be rebased/retargeted onto the default branch — leaving reconcile-stack.sh's rebase unable to resolve the parent branch ref (#3747 item 2).
+
+Reconcile each child first (from a clean checkout), then re-run this merge:
+  ./.loom/scripts/reconcile-stack.sh <child-pr> $PR_BRANCH
+
+Or, if you have already verified/reconciled them, re-run with --allow-stacked-children to bypass this guard."
+
+  # --dry-run still runs the guard and reports the would-be outcome, but honors
+  # the dry-run contract (dry-run always exits 0). A real run hard-blocks.
+  if [[ "$DRY_RUN" == "true" ]]; then
+    warning "[dry-run] Would BLOCK merge of PR #$PR_NUMBER: $count open stacked child PR(s) ($child_list) still target '$PR_BRANCH'. Re-run with --allow-stacked-children to override, or reconcile the children first."
+    return 0
+  fi
+
+  error "$msg"
+}
+
+# Invoke the guard before either merge path attempts the actual merge API call.
+_check_no_open_stacked_children
 
 info "Merging PR #$PR_NUMBER: $PR_TITLE"
 info "Branch: $PR_BRANCH"
