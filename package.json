@@ -1,6 +1,6 @@
 {
   "name": "loom",
-  "version": "0.12.0",
+  "version": "0.13.0",
   "description": "AI-powered development orchestration: a CLI + daemon that coordinates AI development workers using git worktrees and a forge (GitHub or Gitea) as the coordination layer.",
   "type": "module",
   "scripts": {
