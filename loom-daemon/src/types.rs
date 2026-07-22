@@ -143,11 +143,22 @@ pub enum Request {
     /// When `None` (or absent on the wire — `#[serde(default)]` keeps
     /// existing clients compatible), NO `--model` flag is emitted and the
     /// session/CLI default is preserved.
+    ///
+    /// `effort` (issue #3716) mirrors `model` exactly: it optionally selects
+    /// the reasoning-effort level (`low|medium|high|xhigh|max`) for the
+    /// spawned child. When `Some` and non-empty, the daemon appends
+    /// `--effort <level>` to the `spawn-claude.sh` invocation (the
+    /// highest-precedence tier, beating any ambient `LOOM_EFFORT`). When
+    /// `None` (or absent on the wire — `#[serde(default)]` keeps existing
+    /// clients compatible) or empty, NO `--effort` flag is emitted and the
+    /// session-default effort is preserved.
     DispatchSweep {
         kind: SweepKind,
         idempotency_key: Option<String>,
         #[serde(default)]
         model: Option<String>,
+        #[serde(default)]
+        effort: Option<String>,
     },
     /// List tracked sweeps, optionally filtered by state.
     ListSweeps {
@@ -462,6 +473,14 @@ pub struct SweepInfo {
     /// clients compatible.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    /// Reasoning-effort level requested at dispatch time (issue #3716).
+    /// Mirrors the `effort` param of `DispatchSweep`: `Some(level)` when an
+    /// explicit non-empty effort was supplied, `None` otherwise — consumers
+    /// should render `None` as "default" (the child inherited the
+    /// session-default effort; no `--effort` flag was emitted).
+    /// `#[serde(default)]` keeps pre-#3716 wire data and clients compatible.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort: Option<String>,
 }
 
 // ========================================================================

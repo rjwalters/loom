@@ -282,11 +282,18 @@ impl SweepRegistry {
     /// receives `--model <value>` appended to the `spawn-claude.sh` argv.
     /// When `None`, no `--model` flag is emitted at all — the session/CLI
     /// default is preserved end-to-end.
+    ///
+    /// `effort` (issue #3716): mirrors `model` exactly. When `Some` and
+    /// non-empty, the spawned child receives `--effort <level>` appended to
+    /// the argv (immediately after any `--model`). When `None` or empty, no
+    /// `--effort` flag is emitted at all — the session default reasoning
+    /// effort is preserved end-to-end.
     pub fn dispatch(
         &mut self,
         kind: &SweepKind,
         idempotency_key: Option<String>,
         model: Option<&str>,
+        effort: Option<&str>,
     ) -> Result<DispatchOutcome> {
         // 1. Idempotency dedup against Running entries.
         if let Some(ref key) = idempotency_key {
@@ -330,7 +337,7 @@ impl SweepRegistry {
         // 5. Compute the log path and spawn the child.
         let log_path = self.compute_log_path(issue_number);
         let (pid, token_name) = self
-            .spawn_child(issue_number, &log_path, &sweep_id, model)
+            .spawn_child(issue_number, &log_path, &sweep_id, model, effort)
             .context("failed to spawn sweep child")?;
 
         // 6. Record the entry. The model is carried on the registry entry
@@ -350,6 +357,7 @@ impl SweepRegistry {
             latest_phase: None,
             pr_number: None,
             model: model.filter(|m| !m.is_empty()).map(String::from),
+            effort: effort.filter(|e| !e.is_empty()).map(String::from),
         };
         self.entries.insert(sweep_id.clone(), info);
 
@@ -506,6 +514,7 @@ impl SweepRegistry {
         log_path: &Path,
         sweep_id: &str,
         model: Option<&str>,
+        effort: Option<&str>,
     ) -> Result<(u32, String)> {
         let spawn_bin = self.config.resolve_spawn_bin()?;
 
@@ -549,6 +558,16 @@ impl SweepRegistry {
         if let Some(m) = model {
             if !m.is_empty() {
                 cmd.arg("--model").arg(m);
+            }
+        }
+        // Reasoning-effort selection (issue #3716): the dispatch-param tier,
+        // mirroring `--model` exactly. Appended as an explicit `--effort` arg
+        // (which beats any ambient LOOM_EFFORT env inside spawn-claude.sh).
+        // Empty strings are treated as unset — `--effort ""` must never be
+        // emitted, so the session-default effort is preserved end-to-end.
+        if let Some(e) = effort {
+            if !e.is_empty() {
+                cmd.arg("--effort").arg(e);
             }
         }
         cmd.env("LOOM_TERMINAL_ID", format!("daemon-{sweep_id}"))
@@ -917,6 +936,8 @@ impl SweepRegistry {
                         // Lock owner.json does not record the model; the
                         // dispatching daemon instance is gone (#3482).
                         model: None,
+                        // Effort is likewise unrecoverable from the lock (#3716).
+                        effort: None,
                     },
                 );
                 admitted += 1;
@@ -966,7 +987,8 @@ impl SweepRegistry {
                         state: SweepState::Crashed { at: Utc::now() },
                         latest_phase: phase,
                         pr_number: None,
-                        model: None, // not recoverable from a checkpoint-only entry
+                        model: None,  // not recoverable from a checkpoint-only entry
+                        effort: None, // not recoverable from a checkpoint-only entry
                     },
                 );
                 admitted += 1;
@@ -1246,7 +1268,7 @@ exit 0
         let (mut registry, record_log) = fixture_registry(dir.path());
 
         let outcome = registry
-            .dispatch(&SweepKind::Issue(42), None, None)
+            .dispatch(&SweepKind::Issue(42), None, None, None)
             .expect("dispatch should succeed");
 
         assert!(outcome.was_new);
@@ -1285,8 +1307,16 @@ exit 0
             !recorded.contains("--model"),
             "model=None must not emit --model; got: {recorded}"
         );
+        // Issue #3716: with effort=None the spawned command must likewise NOT
+        // receive a --effort flag at all (byte-for-byte unchanged default).
+        assert!(
+            !recorded.contains("--effort"),
+            "effort=None must not emit --effort; got: {recorded}"
+        );
         // #3482: model=None dispatches record no model on the entry.
         assert_eq!(registry.get(&outcome.sweep_id).unwrap().model, None);
+        // #3716: effort=None dispatches record no effort on the entry.
+        assert_eq!(registry.get(&outcome.sweep_id).unwrap().effort, None);
 
         // The lock dir should exist while Running.
         let lock = dir.path().join(".loom").join("locks").join("issue-42");
@@ -1302,7 +1332,7 @@ exit 0
         let (mut registry, record_log) = fixture_registry(dir.path());
 
         let outcome = registry
-            .dispatch(&SweepKind::Issue(43), None, Some("claude-sonnet-4-6"))
+            .dispatch(&SweepKind::Issue(43), None, Some("claude-sonnet-4-6"), None)
             .expect("dispatch should succeed");
 
         let needle = format!("LOOM_TERMINAL_ID=daemon-{}", outcome.sweep_id);
@@ -1334,7 +1364,7 @@ exit 0
         let (mut registry, record_log) = fixture_registry(dir.path());
 
         let outcome = registry
-            .dispatch(&SweepKind::Issue(44), None, Some(""))
+            .dispatch(&SweepKind::Issue(44), None, Some(""), None)
             .expect("dispatch should succeed");
 
         let needle = format!("LOOM_TERMINAL_ID=daemon-{}", outcome.sweep_id);
@@ -1355,16 +1385,104 @@ exit 0
         );
     }
 
+    /// Issue #3716: an `effort` dispatch param threads through to the spawn
+    /// command as an explicit `--effort <level>` argument, mirroring `--model`.
+    #[test]
+    #[serial]
+    fn dispatch_with_effort_appends_effort_arg() {
+        let dir = tempdir().unwrap();
+        let (mut registry, record_log) = fixture_registry(dir.path());
+
+        let outcome = registry
+            .dispatch(&SweepKind::Issue(45), None, None, Some("xhigh"))
+            .expect("dispatch should succeed");
+
+        let needle = format!("LOOM_TERMINAL_ID=daemon-{}", outcome.sweep_id);
+        assert!(
+            wait_for_contents(&record_log, &needle, 10000),
+            "fake spawn-claude.sh did not finish writing within 10s"
+        );
+        let recorded = std::fs::read_to_string(&record_log).unwrap();
+        assert!(
+            recorded.contains("argv: -p /loom:sweep 45 --effort xhigh"),
+            "expected --effort in argv; got: {recorded}"
+        );
+        // The dispatch effort is carried on the registry entry so
+        // list_sweeps / get_sweep_status report it (mirrors #3482 for model).
+        assert_eq!(
+            registry.get(&outcome.sweep_id).unwrap().effort.as_deref(),
+            Some("xhigh"),
+            "dispatch effort must be recorded on the SweepInfo entry"
+        );
+    }
+
+    /// Issue #3716: `model` + `effort` both set emit both flags, in the
+    /// order `--model <m> --effort <e>` (effort appended right after model).
+    #[test]
+    #[serial]
+    fn dispatch_with_model_and_effort_appends_both_args() {
+        let dir = tempdir().unwrap();
+        let (mut registry, record_log) = fixture_registry(dir.path());
+
+        let outcome = registry
+            .dispatch(&SweepKind::Issue(46), None, Some("claude-sonnet-4-6"), Some("xhigh"))
+            .expect("dispatch should succeed");
+
+        let needle = format!("LOOM_TERMINAL_ID=daemon-{}", outcome.sweep_id);
+        assert!(
+            wait_for_contents(&record_log, &needle, 10000),
+            "fake spawn-claude.sh did not finish writing within 10s"
+        );
+        let recorded = std::fs::read_to_string(&record_log).unwrap();
+        assert!(
+            recorded.contains("argv: -p /loom:sweep 46 --model claude-sonnet-4-6 --effort xhigh"),
+            "expected --model then --effort in argv; got: {recorded}"
+        );
+        let entry = registry.get(&outcome.sweep_id).unwrap();
+        assert_eq!(entry.model.as_deref(), Some("claude-sonnet-4-6"));
+        assert_eq!(entry.effort.as_deref(), Some("xhigh"));
+    }
+
+    /// Issue #3716: an empty-string effort is treated as unset — `--effort ""`
+    /// must never be emitted (no flag at all, not an empty flag).
+    #[test]
+    #[serial]
+    fn dispatch_with_empty_effort_emits_no_effort_flag() {
+        let dir = tempdir().unwrap();
+        let (mut registry, record_log) = fixture_registry(dir.path());
+
+        let outcome = registry
+            .dispatch(&SweepKind::Issue(47), None, None, Some(""))
+            .expect("dispatch should succeed");
+
+        let needle = format!("LOOM_TERMINAL_ID=daemon-{}", outcome.sweep_id);
+        assert!(
+            wait_for_contents(&record_log, &needle, 10000),
+            "fake spawn-claude.sh did not finish writing within 10s"
+        );
+        let recorded = std::fs::read_to_string(&record_log).unwrap();
+        assert!(
+            !recorded.contains("--effort"),
+            "empty effort must not emit --effort; got: {recorded}"
+        );
+        // Empty-string effort normalizes to None on the entry too.
+        assert_eq!(
+            registry.get(&outcome.sweep_id).unwrap().effort,
+            None,
+            "empty effort must be recorded as None on the SweepInfo entry"
+        );
+    }
+
     #[test]
     #[serial]
     fn dispatch_lock_collision_rejected() {
         let dir = tempdir().unwrap();
         let (mut registry, _record_log) = fixture_registry(dir.path());
 
-        let first = registry.dispatch(&SweepKind::Issue(7), None, None);
+        let first = registry.dispatch(&SweepKind::Issue(7), None, None, None);
         assert!(first.is_ok());
 
-        let second = registry.dispatch(&SweepKind::Issue(7), None, None);
+        let second = registry.dispatch(&SweepKind::Issue(7), None, None, None);
         assert!(second.is_err(), "second dispatch for issue #7 should fail (lock collision)");
         let err = second.unwrap_err().to_string();
         assert!(err.contains("lock collision"), "expected lock collision error; got: {err}");
@@ -1377,7 +1495,7 @@ exit 0
         let (mut registry, _record_log) = fixture_registry(dir.path());
 
         let first = registry
-            .dispatch(&SweepKind::Issue(99), Some("key-A".to_string()), None)
+            .dispatch(&SweepKind::Issue(99), Some("key-A".to_string()), None, None)
             .unwrap();
         assert!(first.was_new);
 
@@ -1385,7 +1503,7 @@ exit 0
         // Issue #99 is the same kind, but we don't need a different issue —
         // the dedup is purely on the idempotency key.
         let second = registry
-            .dispatch(&SweepKind::Issue(99), Some("key-A".to_string()), None)
+            .dispatch(&SweepKind::Issue(99), Some("key-A".to_string()), None, None)
             .unwrap();
         assert!(!second.was_new);
         assert_eq!(first.sweep_id, second.sweep_id);
@@ -1396,7 +1514,7 @@ exit 0
         let dir = tempdir().unwrap();
         let (mut registry, _record_log) = fixture_registry(dir.path());
 
-        let outcome = registry.dispatch(&SweepKind::PrSet(vec![1, 2, 3]), None, None);
+        let outcome = registry.dispatch(&SweepKind::PrSet(vec![1, 2, 3]), None, None, None);
         assert!(outcome.is_err());
         assert!(outcome
             .unwrap_err()
@@ -1411,7 +1529,7 @@ exit 0
 
         // Dispatch and then poke an entry into Exited state directly.
         let outcome = registry
-            .dispatch(&SweepKind::Issue(11), None, None)
+            .dispatch(&SweepKind::Issue(11), None, None, None)
             .unwrap();
         let entry = registry.entries.get_mut(&outcome.sweep_id).unwrap();
         entry.state = SweepState::Exited {
@@ -1467,6 +1585,7 @@ exit 0
                 latest_phase: None,
                 pr_number: None,
                 model: None,
+                effort: None,
             },
         );
 
@@ -1537,6 +1656,7 @@ exit 0
                 latest_phase: None,
                 pr_number: None,
                 model: None,
+                effort: None,
             },
         );
 
@@ -1589,6 +1709,7 @@ exit 0
                 latest_phase: None,
                 pr_number: None,
                 model: None,
+                effort: None,
             },
         );
 
@@ -1623,6 +1744,7 @@ exit 0
                 latest_phase: None,
                 pr_number: None,
                 model: None,
+                effort: None,
             },
         );
 
@@ -1784,7 +1906,7 @@ exit 0
         let mut registry = SweepRegistry::new(config);
 
         let outcome = registry
-            .dispatch(&SweepKind::Issue(123), None, None)
+            .dispatch(&SweepKind::Issue(123), None, None, None)
             .unwrap();
         assert!(outcome.was_new);
 
@@ -1820,6 +1942,7 @@ exit 0
             latest_phase: Some("builder".to_string()),
             pr_number: Some(456),
             model: Some("claude-sonnet-4-6".to_string()),
+            effort: Some("xhigh".to_string()),
         };
         let json = serde_json::to_value(vec![info]).unwrap();
         let expected = serde_json::json!([{
@@ -1834,6 +1957,7 @@ exit 0
             "latest_phase": "builder",
             "pr_number": 456,
             "model": "claude-sonnet-4-6",
+            "effort": "xhigh",
         }]);
         assert_eq!(
             json, expected,
@@ -1855,10 +1979,18 @@ exit 0
         let legacy: SweepInfo =
             serde_json::from_value(legacy_json).expect("legacy SweepInfo without model must parse");
         assert_eq!(legacy.model, None);
+        // Pre-#3716 JSON also lacks the `effort` field — it must default to
+        // None (#[serde(default)]) and be omitted on re-serialization
+        // (skip_serializing_if).
+        assert_eq!(legacy.effort, None);
         let reserialized = serde_json::to_value(&legacy).unwrap();
         assert!(
             reserialized.get("model").is_none(),
             "model=None must be omitted from serialized SweepInfo"
+        );
+        assert!(
+            reserialized.get("effort").is_none(),
+            "effort=None must be omitted from serialized SweepInfo"
         );
 
         // Also pin the variant shapes for Exited and Crashed.
@@ -1918,6 +2050,7 @@ exit 0
                 latest_phase: Some("builder".into()),
                 pr_number: None,
                 model: None,
+                effort: None,
             },
         );
 
@@ -1955,6 +2088,7 @@ exit 0
                 latest_phase: None,
                 pr_number: None,
                 model: None,
+                effort: None,
             },
         );
 
@@ -2014,6 +2148,7 @@ exit 0
                 latest_phase: None,
                 pr_number: None,
                 model: None,
+                effort: None,
             },
         );
 
@@ -2051,6 +2186,7 @@ exit 0
                 latest_phase: None,
                 pr_number: None,
                 model: None,
+                effort: None,
             },
         );
 
@@ -2106,6 +2242,7 @@ exit 0
                 latest_phase: None,
                 pr_number: None,
                 model: None,
+                effort: None,
             },
         );
 
@@ -2158,6 +2295,7 @@ exit 0
                 latest_phase: None,
                 pr_number: None,
                 model: None,
+                effort: None,
             },
         );
 

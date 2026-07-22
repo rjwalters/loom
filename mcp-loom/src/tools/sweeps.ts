@@ -77,6 +77,12 @@ export interface SweepInfo {
    * inherited the session/CLI default; render as "default".
    */
   model?: string;
+  /**
+   * Reasoning-effort level requested at dispatch (issue #3716). Mirrors
+   * `model`: absent/undefined means no explicit effort was supplied — the
+   * child inherited the session-default effort; render as "default".
+   */
+  effort?: string;
 }
 
 interface DispatchResponse {
@@ -226,6 +232,7 @@ async function dispatchSweep(args: {
   kind: SweepKind;
   idempotency_key?: string;
   model?: string;
+  effort?: string;
 }): Promise<{ success: true; result: DispatchResponse["payload"] } | { success: false; error: string }> {
   try {
     const response = (await sendDaemonRequest({
@@ -237,6 +244,10 @@ async function dispatchSweep(args: {
         // default) means the daemon emits NO --model flag and the spawned
         // child inherits the session/CLI default.
         model: args.model ?? null,
+        // Issue #3716: optional reasoning-effort override, mirroring `model`.
+        // `null` (the default) means the daemon emits NO --effort flag and
+        // the spawned child inherits the session-default effort.
+        effort: args.effort ?? null,
       },
     })) as DaemonResponse;
 
@@ -449,6 +460,17 @@ export const sweepTools: Tool[] = [
             "`roleConfig.model` > role `suggestedModel` > session default. " +
             "Omit to preserve the session/CLI default (no --model flag is " +
             "emitted at all).",
+        },
+        effort: {
+          type: "string",
+          description:
+            "Optional reasoning-effort level for the spawned sweep child " +
+            "(issue #3716), e.g. `low|medium|high|xhigh|max`. Mirrors " +
+            "`model`: forwarded to the child as `--effort <level>` (the " +
+            "highest-precedence tier, beating any ambient LOOM_EFFORT). " +
+            "Omit (or pass an empty string) to preserve the session-default " +
+            "effort (no --effort flag is emitted at all). Level validation " +
+            "is owned by the `claude` CLI, not the daemon.",
         },
       },
       required: ["kind"],
@@ -669,6 +691,8 @@ function formatSweepLine(info: SweepInfo): string {
     `  Token:      ${info.token_name}`,
     // Issue #3482 (Phase 3a): absent model renders as "default".
     `  Model:      ${info.model ?? "default"}`,
+    // Issue #3716: absent effort renders as "default".
+    `  Effort:     ${info.effort ?? "default"}`,
     `  Log:        ${info.log_path}`,
     `  Started:    ${info.started_at}`,
   ];
@@ -731,8 +755,15 @@ export async function handleSweepTool(
         typeof args?.model === "string" && args.model.length > 0
           ? (args.model as string)
           : undefined;
+      // Issue #3716: optional reasoning-effort override, mirroring `model`.
+      // Empty strings are treated as unset so the daemon never receives
+      // `--effort ""`.
+      const effort =
+        typeof args?.effort === "string" && args.effort.length > 0
+          ? (args.effort as string)
+          : undefined;
 
-      const result = await dispatchSweep({ kind: normalized, idempotency_key: idempotencyKey, model });
+      const result = await dispatchSweep({ kind: normalized, idempotency_key: idempotencyKey, model, effort });
       if (!result.success) {
         return [
           {
@@ -749,6 +780,9 @@ export async function handleSweepTool(
         // is attributable from the dispatch transcript alone. "default"
         // means no --model flag was emitted (session/CLI default).
         `Model:      ${model ?? "default"}`,
+        // Issue #3716: echo the dispatched effort alongside the model.
+        // "default" means no --effort flag was emitted (session default).
+        `Effort:     ${effort ?? "default"}`,
         `Log:        ${result.result.log_path}`,
       ].join("\n");
       return [
