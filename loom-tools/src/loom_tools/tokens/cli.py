@@ -49,12 +49,14 @@ def _build_parser() -> argparse.ArgumentParser:
     bp = sub.add_parser(
         "bootstrap",
         help=(
-            "Materialize .loom/tokens/ from ACCOUNT_*_N triples, merging three "
-            "sources by email with precedence claude-monitor "
-            "(~/.claude-monitor/accounts.env, primary) > repo-local > home "
-            "master (~/.loom/accounts.env, still-read fallback). "
-            "ACCOUNT_TOKEN_FILE_N is optional: when omitted it is auto-derived "
-            "from ACCOUNT_EMAIL_N (e.g. alice@example.com -> alice-example.token)."
+            "Materialize .loom/tokens/ from ACCOUNT_*_N triples, merging by "
+            "email with precedence claude-monitor "
+            "(~/.claude-monitor/accounts.env, primary) > repo-local. The home "
+            "master (~/.loom/accounts.env) is opt-in only: it is read solely "
+            "when $LOOM_ACCOUNTS_ENV (or --home-env) points at it, never by "
+            "default. ACCOUNT_TOKEN_FILE_N is optional: when omitted it is "
+            "auto-derived from ACCOUNT_EMAIL_N (e.g. alice@example.com -> "
+            "alice-example.token)."
         ),
     )
     bp.add_argument(
@@ -71,10 +73,12 @@ def _build_parser() -> argparse.ArgumentParser:
         type=Path,
         default=None,
         help=(
-            "Path to the home-dir master account source (default: "
-            "$LOOM_ACCOUNTS_ENV or ~/.loom/accounts.env). This is a still-read "
-            "fallback below the claude-monitor master (~/.claude-monitor/"
-            "accounts.env), which is always consulted when present."
+            "Path to the home-dir master account source. Opt-in only: with no "
+            "flag, the home master is read only when $LOOM_ACCOUNTS_ENV points "
+            "at a file (it is not consulted otherwise; there is no default "
+            "location). It sits below the claude-monitor master "
+            "(~/.claude-monitor/accounts.env), which is always consulted when "
+            "present."
         ),
     )
     bp.add_argument(

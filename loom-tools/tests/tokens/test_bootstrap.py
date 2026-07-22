@@ -429,16 +429,29 @@ def _triple(i: int, email: str, key: str, file: str) -> str:
 
 
 class TestHomeMasterResolution:
-    def test_default_is_home_loom(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    def test_default_unset_returns_none(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # #3704: the home master is no longer auto-read from a default
+        # location. Unset LOOM_ACCOUNTS_ENV resolves to None (opt-in only).
         monkeypatch.delenv("LOOM_ACCOUNTS_ENV", raising=False)
-        p = default_home_accounts_env()
-        assert p is not None
-        assert p.name == "accounts.env"
-        assert p.parent.name == ".loom"
+        assert default_home_accounts_env() is None
 
     def test_env_override(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv("LOOM_ACCOUNTS_ENV", "/custom/accts.env")
         assert default_home_accounts_env() == pathlib.Path("/custom/accts.env")
+
+    def test_env_override_can_point_at_home_loom(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Capability retained (#3704): an operator can still opt the ~/.loom
+        # home master back in by pointing LOOM_ACCOUNTS_ENV at it.
+        monkeypatch.setenv("LOOM_ACCOUNTS_ENV", "~/.loom/accounts.env")
+        p = default_home_accounts_env()
+        assert p is not None
+        assert p.name == "accounts.env"
+        assert p.parent.name == ".loom"
+        assert "~" not in str(p)  # ~ was expanded
 
     def test_empty_env_disables(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv("LOOM_ACCOUNTS_ENV", "")
@@ -758,6 +771,113 @@ class TestBackwardCompat3697:
         )
         result = bootstrap_tokens(mock_repo)
         assert result.written == ["custom-a.token"]
+
+
+class TestHomeMasterRetired3704:
+    """#3704: the ~/.loom home master is no longer a default source.
+
+    It is read only when ``LOOM_ACCOUNTS_ENV`` (or ``--home-env``) points at
+    it; an unset var no longer auto-reads a default location. The capability is
+    retained (location retired, not the capability), and the repo-``.env``-only
+    path is byte-for-byte backward compatible.
+    """
+
+    def _write_home(self, tmp_path: pathlib.Path, body: str) -> pathlib.Path:
+        home = tmp_path / "home-accounts.env"
+        home.write_text(body, encoding="utf-8")
+        return home
+
+    def test_home_master_not_auto_read_when_unset(
+        self,
+        mock_repo: pathlib.Path,
+        tmp_path: pathlib.Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        # A populated home master exists on disk, but with LOOM_ACCOUNTS_ENV
+        # unset (and no claude-monitor) it must NOT be auto-read (#3704).
+        self._write_home(
+            tmp_path, _triple(1, "home@example.com", "sk-home", "home.token")
+        )
+        _write_env(
+            mock_repo, _triple(1, "repo@example.com", "sk-repo", "repo.token")
+        )
+        monkeypatch.delenv("LOOM_ACCOUNTS_ENV", raising=False)
+        result = bootstrap_tokens(mock_repo)
+        assert result.home_env is None
+        assert result.monitor_env is None
+        assert result.written == ["repo.token"]
+        emails = {e["email"] for e in result.effective}
+        assert emails == {"repo@example.com"}
+        assert all(e["source"] == "repo" for e in result.effective)
+
+    def test_same_file_read_when_env_points_at_it(
+        self,
+        mock_repo: pathlib.Path,
+        tmp_path: pathlib.Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        # Arbiter: the very same home fixture that was ignored above IS read
+        # when LOOM_ACCOUNTS_ENV points at it — capability retained (#3704).
+        home = self._write_home(
+            tmp_path, _triple(1, "home@example.com", "sk-home", "home.token")
+        )
+        _write_env(
+            mock_repo, _triple(1, "repo@example.com", "sk-repo", "repo.token")
+        )
+        monkeypatch.setenv("LOOM_ACCOUNTS_ENV", str(home))
+        result = bootstrap_tokens(mock_repo)
+        assert result.home_env == home
+        assert "home.token" in result.written
+        emails = {e["email"] for e in result.effective}
+        assert emails == {"home@example.com", "repo@example.com"}
+
+    def test_soft_dependency_falls_back_to_repo_not_home(
+        self,
+        mock_repo: pathlib.Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        # No claude-monitor file and no LOOM_ACCOUNTS_ENV -> resolution falls
+        # back to the repo .env, NOT to ~/.loom/accounts.env (#3704).
+        _write_env(
+            mock_repo,
+            _triple(1, "a@example.com", "sk-a", "a.token")
+            + _triple(2, "b@example.com", "sk-b", "b.token"),
+        )
+        monkeypatch.delenv("LOOM_ACCOUNTS_ENV", raising=False)
+        result = bootstrap_tokens(mock_repo)
+        assert result.home_env is None
+        assert result.monitor_env is None
+        assert set(result.written) == {"a.token", "b.token"}
+        assert all(e["source"] == "repo" for e in result.effective)
+
+    def test_repo_env_only_backward_compatible(
+        self,
+        mock_repo: pathlib.Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        # Backward-compat: repo-.env-only setup (no claude-monitor, unset
+        # LOOM_ACCOUNTS_ENV) resolves exactly as today.
+        _write_env(
+            mock_repo, _triple(1, "a@example.com", "sk-1", "custom-a.token")
+        )
+        monkeypatch.delenv("LOOM_ACCOUNTS_ENV", raising=False)
+        result = bootstrap_tokens(mock_repo)
+        assert result.written == ["custom-a.token"]
+        assert result.home_env is None
+        assert (
+            mock_repo / ".loom" / "tokens" / "custom-a.token"
+        ).read_text() == "sk-1"
+
+    def test_all_sources_absent_raises(
+        self,
+        mock_repo: pathlib.Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        # No claude-monitor, no repo source, unset LOOM_ACCOUNTS_ENV -> the home
+        # master is not auto-read, so every source is absent -> FileNotFoundError.
+        monkeypatch.delenv("LOOM_ACCOUNTS_ENV", raising=False)
+        with pytest.raises(FileNotFoundError):
+            bootstrap_tokens(mock_repo)
 
 
 # ---------------------------------------------------------------------------
