@@ -444,6 +444,19 @@ fi
 - Estimate complexity and effort when helpful
 - Break down large features into phased deliverables
 
+### Complexity routing marker (`<!-- loom:complexity=complex -->`, issue #3702)
+
+When your enhancement pass judges an issue to be **genuinely complex** — long-horizon implementation, deep cross-cutting reasoning, or high blast radius (not merely "a bit of work") — you MAY emit a single machine-readable marker into the curated issue body so the sweep orchestrator routes the Builder to a more capable model:
+
+```html
+<!-- loom:complexity=complex -->
+```
+
+- **Format**: an HTML comment (invisible in rendered Markdown, trivially greppable). Values are `routine` | `complex`. Put it in your enhancement section (e.g. near the Problem Statement). **Absent marker ⇒ `routine`** — most issues need no marker.
+- **What it does**: at Builder dispatch the sweep skill reads it as precedence **tier 2.5** (between tiers 2 and 3) and bumps the Builder's role-default model up **exactly one tier** — `sonnet → opus`. See `sweep.md` → "Tier 2.5 — Curator complexity marker".
+- **Hard bounds** (the router's authority is deliberately bounded): **one bump maximum, never to `fable`, and never a label.** Emitting `complex` cannot reach the top (frontier) model — that is reserved for the objective escalation ladder on Judge rejection or an explicit operator param. A `roleConfig.model` pin or explicit dispatch param (tiers 1–2) still overrides the marker.
+- **Use sparingly.** A miscalibrated `complex` only spends one tier of extra cost and the Judge gate still corrects any miss; but marking everything `complex` defeats the cheap-first default. Emit it only when the complexity is real. Do **not** emit `<!-- loom:complexity=routine -->` explicitly — an absent marker already means routine.
+
 ## Where to Add Enhancements
 
 **Use a hybrid approach** based on issue quality:

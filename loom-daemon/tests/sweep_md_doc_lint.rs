@@ -119,3 +119,91 @@ fn sweep_md_includes_sample_wire_payloads() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// Issue #3702 — model-assignment strategy: rung grammar, complexity marker,
+// refusal fallback, and the no-Fable-Judge invariant.
+//
+// The ladder, precedence chain, `model@effort` grammar, and tier-2.5 marker
+// are PROSE CONTRACTS the sweep orchestrator (an LLM subagent) interprets at
+// dispatch time — there is no parser to unit-test. These string assertions
+// pin the contract so a future edit can't silently drop it.
+// ---------------------------------------------------------------------------
+
+/// #3702: the `model@effort` rung grammar and the `fable` top rung are
+/// documented, with the effort graceful-degradation contract.
+#[test]
+fn sweep_md_documents_effort_rung_grammar_and_fable() {
+    let content = read_sweep_md();
+    let required: &[&str] = &[
+        // Rung grammar: bare alias vs alias@effort.
+        "alias@effort",
+        "sonnet@xhigh",
+        "(model=sonnet, effort=xhigh)",
+        // Effort-before-model escalation ordering.
+        "sonnet → sonnet@xhigh → opus → fable",
+        // Graceful degradation when per-dispatch effort plumbing is absent.
+        "grammar ships either way",
+        // The fable top rung.
+        "fable",
+    ];
+    for needle in required {
+        assert!(
+            content.contains(needle),
+            "sweep.md is missing #3702 rung-grammar/fable prose `{needle}` — \
+             update sweep.md or this test if the change is intentional"
+        );
+    }
+}
+
+/// #3702: the Curator complexity marker is documented as precedence tier 2.5
+/// with its one-bump/never-fable/never-a-label bounds.
+#[test]
+fn sweep_md_documents_complexity_marker_tier() {
+    let content = read_sweep_md();
+    let required: &[&str] = &[
+        "<!-- loom:complexity=complex -->",
+        "Tier 2.5 — Curator complexity marker",
+        "sonnet → opus",
+        "One bump maximum, and never to",
+    ];
+    for needle in required {
+        assert!(
+            content.contains(needle),
+            "sweep.md is missing #3702 complexity-marker prose `{needle}` — \
+             update sweep.md or this test if the change is intentional"
+        );
+    }
+}
+
+/// #3702: a `MODEL_REFUSAL` at a fable rung drops one rung down WITHOUT
+/// consuming a Doctor cycle.
+#[test]
+fn sweep_md_documents_refusal_fallback() {
+    let content = read_sweep_md();
+    assert!(
+        content.contains("MODEL_REFUSAL"),
+        "sweep.md must reference the `MODEL_REFUSAL` class (#3702 refusal fallback)"
+    );
+    assert!(
+        content.contains("without consuming a Doctor cycle"),
+        "sweep.md must state the refusal fallback re-dispatches without \
+         consuming a Doctor cycle (#3702)"
+    );
+    assert!(
+        content.contains("fable → opus"),
+        "sweep.md must document the fable→opus one-rung-down refusal fallback (#3702)"
+    );
+}
+
+/// #3702: the hard invariant that Judge model resolution can never resolve to
+/// `fable`, regardless of ladder contents or any marker.
+#[test]
+fn sweep_md_asserts_no_fable_judge_invariant() {
+    let content = read_sweep_md();
+    assert!(
+        content.contains("Judge model resolution can never resolve to"),
+        "sweep.md must state the no-Fable-Judge hard invariant verbatim \
+         (#3702): `Judge model resolution can never resolve to `fable`...`"
+    );
+}
