@@ -691,12 +691,16 @@ parse_force_ops() {
 }
 
 # Redact the quoted VALUES of known text-carrying flags (--body, -m/--message,
-# --title, --notes) so a dangerous-looking phrase quoted INSIDE such a value no
-# longer trips the raw ALWAYS_BLOCK_PATTERNS substring scan. Used ONLY to build
-# COMMAND_NO_LITERAL_TEXT for that one loop (mirrors the COMMAND_NO_COMMENT
-# precedent); every other scan keeps reading the raw command. This kills the
-# #3679 false positive where `gh pr comment --body "…git push --force origin
-# main…"` / `git commit -m "…"` hard-denied even though nothing executes.
+# --title, --notes, --comment) so a dangerous-looking phrase quoted INSIDE such a
+# value no longer trips the raw ALWAYS_BLOCK_PATTERNS substring scan (catastrophic
+# tier) or the ASK_PATTERNS scan (ask tier, #3756). Used ONLY to build the
+# literal-redacted working copies for those two loops (mirrors the
+# COMMAND_NO_COMMENT precedent); every other scan keeps reading the raw command.
+# This kills the #3679 false positive where `gh pr comment --body "…git push
+# --force origin main…"` / `git commit -m "…"` hard-denied even though nothing
+# executes, and (#3756) the analogous ask-tier false ask where an ask-phrase like
+# `gh issue close` quoted inside a `--comment`/`--body` value prompted for
+# confirmation despite no such command actually being run.
 #
 # Safety floor preserved two ways:
 #   - `-c` is deliberately NOT a text-carrying flag, so `bash -c '<payload>'`
@@ -716,7 +720,7 @@ strip_literal_text() {
         SQ = sprintf("%c", 39)   # single quote
         DQ = sprintf("%c", 34)   # double quote
         # boundary + text-carrying flag + optional (ws / = / ws) + quoted span
-        re = "(^|[ \t])(--message|--body|--notes|--title|-m)[ \t]*=?[ \t]*(" \
+        re = "(^|[ \t])(--message|--body|--notes|--title|--comment|-m)[ \t]*=?[ \t]*(" \
              DQ "[^" DQ "]*" DQ "|" SQ "[^" SQ "]*" SQ ")"
     }
     {
@@ -857,16 +861,17 @@ ALWAYS_BLOCK_PATTERNS=(
 )
 
 # Build a literal-text-redacted working copy ONLY for the catastrophic scan
-# below, so a force-push-to-main phrase quoted inside a --body/-m/--title/--notes
-# value no longer false-positives (#3679). The awk only runs when one of those
-# flags is actually present, keeping it off the hot path (mirrors the
-# COMMAND_NO_COMMENT `#`-present guard). `-c` is intentionally excluded so
-# `bash -c '<payload>'` payloads still reach the raw scan; spans carrying `$(` /
-# backtick are left intact so command-substitution smuggling still hard-denies.
+# below, so a force-push-to-main phrase quoted inside a
+# --body/-m/--title/--notes/--comment value no longer false-positives (#3679,
+# --comment added #3756). The awk only runs when one of those flags is actually
+# present, keeping it off the hot path (mirrors the COMMAND_NO_COMMENT
+# `#`-present guard). `-c` is intentionally excluded so `bash -c '<payload>'`
+# payloads still reach the raw scan; spans carrying `$(` / backtick are left
+# intact so command-substitution smuggling still hard-denies.
 COMMAND_NO_LITERAL_TEXT="$COMMAND"
 if [[ "$COMMAND" == *"--body"* || "$COMMAND" == *"--message"* || \
       "$COMMAND" == *"--title"* || "$COMMAND" == *"--notes"* || \
-      "$COMMAND" == *"-m"* ]]; then
+      "$COMMAND" == *"--comment"* || "$COMMAND" == *"-m"* ]]; then
     COMMAND_NO_LITERAL_TEXT=$(strip_literal_text "$COMMAND")
 fi
 
@@ -894,6 +899,27 @@ if [[ "$COMMAND" == *"#"* ]]; then
     COMMAND_NO_COMMENT=$(printf '%s\n' "$COMMAND" | sed -E 's/(^|[[:space:]])#.*$//')
 else
     COMMAND_NO_COMMENT="$COMMAND"
+fi
+
+# =============================================================================
+# ASK-TIER WORKING COPY (#3756) — comment-stripped AND literal-text redacted.
+#
+# The ASK_PATTERNS loop below needs BOTH narrowings the catastrophic tier's two
+# copies provide separately: COMMAND_NO_COMMENT's `#`-comment stripping AND
+# strip_literal_text()'s quoted-flag-value redaction (the #3679 fix the ask tier
+# never received). Building the ask copy from COMMAND_NO_COMMENT (not raw
+# $COMMAND) preserves the comment-stripping the ask tier already relied on, then
+# redacts --body/-m/--title/--notes/--comment values so an ask-phrase quoted
+# inside such a value (e.g. `gh pr comment --body "…gh issue close…"`) no longer
+# false-asks. The strip only runs when a text-carrying flag is present, keeping
+# it off the hot path. Never feeds the catastrophic scan (that keeps reading the
+# raw command), so this can only NARROW an ask, never miss a hard deny.
+# =============================================================================
+COMMAND_ASK_SCAN="$COMMAND_NO_COMMENT"
+if [[ "$COMMAND_NO_COMMENT" == *"--body"* || "$COMMAND_NO_COMMENT" == *"--message"* || \
+      "$COMMAND_NO_COMMENT" == *"--title"* || "$COMMAND_NO_COMMENT" == *"--notes"* || \
+      "$COMMAND_NO_COMMENT" == *"--comment"* || "$COMMAND_NO_COMMENT" == *"-m"* ]]; then
+    COMMAND_ASK_SCAN=$(strip_literal_text "$COMMAND_NO_COMMENT")
 fi
 
 # =============================================================================
@@ -1283,44 +1309,58 @@ ASK_PATTERNS=(
     # autonomous agent can force-push / hard-reset its own working branch without
     # a stall while protected-branch force ops still ask. git clean / checkout .
     # / restore . stay here — they are not force ops and have no branch scope.
-    'git clean -fd'
-    'git checkout \.'
-    'git restore \.'
+    #
+    # COMMAND-POSITION ANCHORING (#3756): every entry is prefixed with
+    # `(^|[;&|[:space:]])`, mirroring ALWAYS_BLOCK_PATTERNS's `gh repo delete`
+    # anchor (#3553), so the phrase only fires at start-of-command or after a
+    # shell separator — an ask-phrase that merely appears inside another
+    # command's quoted argument (e.g. `jq -n '{cmd:"gh issue close 123"}'`, the
+    # phrase preceded by `"`) no longer false-asks. Entries whose command is a
+    # multi-word phrase (`kubectl rollout restart`, `git checkout \.`) are
+    # anchored at the FIRST token only — the phrase's leading command word — per
+    # the `gh repo delete` precedent. (Like the catastrophic tier, this anchor
+    # cannot distinguish a real separator from a whitespace INSIDE a quoted
+    # string, so a mid-quote prose mention such as `echo "… gh pr close …"` still
+    # matches on its leading space — an accepted limitation shared with the
+    # ALWAYS_BLOCK tier; command-word segment classification is #3757's scope.)
+    '(^|[;&|[:space:]])git clean -fd'
+    '(^|[;&|[:space:]])git checkout \.'
+    '(^|[;&|[:space:]])git restore \.'
 
     # GitHub operations that modify shared state
-    'gh pr close'
-    'gh issue close'
-    'gh release delete'
-    'gh label delete'
+    '(^|[;&|[:space:]])gh pr close'
+    '(^|[;&|[:space:]])gh issue close'
+    '(^|[;&|[:space:]])gh release delete'
+    '(^|[;&|[:space:]])gh label delete'
 
     # NOTE: cloud CLI (aws) + docker ASK patterns are NOT in this ungated array.
     # They live in CLOUD_ASK_PATTERNS below, gated by cloud_guard_enabled() so
     # cloud-dev repos can opt down (LOOM_GUARD_CLOUD=0 / guards.cloudCli:false).
 
     # Service management
-    'systemctl restart'
-    'systemctl stop'
-    'systemctl disable'
+    '(^|[;&|[:space:]])systemctl restart'
+    '(^|[;&|[:space:]])systemctl stop'
+    '(^|[;&|[:space:]])systemctl disable'
 
     # Kubernetes operations
-    'kubectl delete'
-    'kubectl rollout restart'
-    'kubectl drain'
+    '(^|[;&|[:space:]])kubectl delete'
+    '(^|[;&|[:space:]])kubectl rollout restart'
+    '(^|[;&|[:space:]])kubectl drain'
 
     # SkyPilot infrastructure
-    'sky down'
-    'sky stop'
+    '(^|[;&|[:space:]])sky down'
+    '(^|[;&|[:space:]])sky stop'
 
     # Credential exposure
-    'printenv.*SECRET'
-    'printenv.*TOKEN'
-    'printenv.*KEY'
-    'cat.*/\.ssh/'
-    'cat.*/\.aws/credentials'
+    '(^|[;&|[:space:]])printenv.*SECRET'
+    '(^|[;&|[:space:]])printenv.*TOKEN'
+    '(^|[;&|[:space:]])printenv.*KEY'
+    '(^|[;&|[:space:]])cat.*/\.ssh/'
+    '(^|[;&|[:space:]])cat.*/\.aws/credentials'
 )
 
 for pattern in "${ASK_PATTERNS[@]}"; do
-    if echo "$COMMAND_NO_COMMENT" | grep -qE "$pattern"; then
+    if echo "$COMMAND_ASK_SCAN" | grep -qE "$pattern"; then
         ask "Command requires confirmation: $COMMAND"
     fi
 done
