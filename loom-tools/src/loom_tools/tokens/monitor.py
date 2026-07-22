@@ -18,9 +18,9 @@ Two separate surfaces are never mixed (secrets vs usage data):
 **Format-of-record.** The spawn-time selector (``select.py:_read_ranking``)
 parses pipe-delimited ``name|status`` lines. This module emits exactly that
 format so a monitor-sourced ``.ranking`` is consumed by the selector
-identically to any other. (The probe path's ``write_ranking_atomic`` currently
-serializes JSON — a latent producer/consumer discrepancy that predates this
-feature; reconciling the probe path is intentionally out of scope here.)
+identically to any other. The probe path's ``check.write_ranking_atomic``
+emits the same pipe format (reconciled in #3709), so both producers are
+byte-compatible with the selector.
 
 **Ordering policy stays Loom's.** claude-monitor is a thin numbers provider;
 we sort by ``(status_rank, util_7d, util_5h)`` using the existing
