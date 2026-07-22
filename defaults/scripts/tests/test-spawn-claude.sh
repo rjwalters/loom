@@ -134,6 +134,31 @@ assert_eq "CWD_DELETED" "$result" "cwd deleted -> CWD_DELETED"
 result=$(classify_error "" 2)
 assert_eq "RECOVERABLE" "$result" "unknown exit=2 -> RECOVERABLE"
 
+# --- MODEL_REFUSAL vectors (issue #3702) ---
+# A model safety-classifier refusal (stop_reason "refusal") on a non-zero-exit
+# run classifies as MODEL_REFUSAL — a routing error the sweep orchestrator
+# handles by dropping one ladder rung without consuming a Doctor cycle.
+
+# Vector #19: JSON-shaped stop_reason refusal + exit=1 → MODEL_REFUSAL
+result=$(classify_error '{"type":"message","stop_reason":"refusal"}' 1)
+assert_eq "MODEL_REFUSAL" "$result" 'stop_reason:"refusal" + exit=1 -> MODEL_REFUSAL'
+
+# Vector #20: spaced stop_reason = refusal + exit=1 → MODEL_REFUSAL
+result=$(classify_error "turn ended: stop_reason: refusal (safety)" 1)
+assert_eq "MODEL_REFUSAL" "$result" "spaced stop_reason refusal + exit=1 -> MODEL_REFUSAL"
+
+# Vector #21 (REGRESSION, #3233): clean exit (exit 0) whose output merely
+# contains the word "refusal" is STILL SUCCESS — exit-code-first ordering wins
+# over any substring, including the new refusal match.
+result=$(classify_error '{"stop_reason":"refusal"}' 0)
+assert_eq "SUCCESS" "$result" 'exit=0 with stop_reason:"refusal" is SUCCESS (#3233 exit-code-first)'
+
+# Vector #22: plain word "refusal" without a stop_reason on exit=1 is NOT a
+# refusal classification — the match is anchored to the stop_reason key, so an
+# unrelated failure mentioning the word falls through to the catch-all.
+result=$(classify_error "connection reset; will not retry (refusal to reconnect)" 1)
+assert_eq "RECOVERABLE" "$result" "bare 'refusal' word (no stop_reason) + exit=1 -> RECOVERABLE"
+
 # ============================================================
 # Section 2: spawn-claude.sh dispatch (with stub `claude`)
 # ============================================================
