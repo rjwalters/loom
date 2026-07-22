@@ -68,6 +68,7 @@ Thumbs.db
 .loom/tokens/
 .loom/accounts.env
 .loom/sweep-checkpoint/
+.loom/stats/
 .loom/spawn-loop.pid
 .loom/spawn-loop-state.json
 .loom/stop-spawn-loop
