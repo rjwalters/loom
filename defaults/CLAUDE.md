@@ -710,6 +710,12 @@ The ladder is configured in `.loom/config.json`:
 | Guide | `sonnet` | Triage is systematic |
 | Driver | `sonnet` | General-purpose default |
 
+> **Retuning these defaults is measurement-gated.** Whether to flip a role's
+> default `opus → sonnet` ("cheap-first") is decided by measured data, not edited
+> blind — see [`docs/model-selection-retune.md`](../docs/model-selection-retune.md)
+> for the decision inequality and the `agent-metrics.sh --by-model` (#3482) gating
+> procedure. Builder is the only real candidate; no default has been flipped.
+
 **Valid model values**: aliases (`haiku`, `sonnet`, `opus`) or pinned model IDs (e.g., `claude-sonnet-4-6`).
 
 - **haiku**: Fast, cheap - for simple status checks and monitoring
