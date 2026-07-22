@@ -1381,7 +1381,7 @@ Loom provides an opt-in methodology injection hook that automatically injects pr
    mkdir -p .loom/context/roles .loom/context/topics
    ```
 
-2. Add a universal context file (injected on every prompt):
+2. Add a universal context file (injected once per session by default):
    ```bash
    cat > .loom/context/universal.md << 'EOF'
    # Project Rules
@@ -1398,7 +1398,7 @@ Loom provides an opt-in methodology injection hook that automatically injects pr
 ```
 .loom/context/
 ├── config.json              # Optional configuration
-├── universal.md             # Injected on every prompt
+├── universal.md             # Injected once per session by default
 ├── roles/
 │   ├── builder.md           # Injected when LOOM_ROLE=builder
 │   ├── judge.md             # Injected when LOOM_ROLE=judge
@@ -1410,7 +1410,7 @@ Loom provides an opt-in methodology injection hook that automatically injects pr
     └── ...
 ```
 
-**Universal context** (`universal.md`): Always injected when the context directory exists. Use for project-wide rules and conventions.
+**Universal context** (`universal.md`): Injected when the context directory exists — **once per session by default** (`universal_frequency: "session"`), so the project-wide rules ride along on the first prompt of a session and are deduped on subsequent turns. Set `universal_frequency: "always"` to restore per-prompt injection. Use for project-wide rules and conventions.
 
 **Role context** (`roles/<role>.md`): Injected when the `LOOM_ROLE` environment variable matches the filename, or when a slash command (e.g., `/builder`) is detected in the prompt. Role names are case-insensitive.
 
@@ -1425,6 +1425,7 @@ Create `.loom/context/config.json` to customize behavior:
   "max_context_chars": 8000,
   "enabled": true,
   "inject_universal": true,
+  "universal_frequency": "session",
   "inject_role": true,
   "inject_topics": true
 }
@@ -1434,22 +1435,46 @@ Create `.loom/context/config.json` to customize behavior:
 |-----------|---------|-------------|
 | `max_context_chars` | 8000 | Maximum total characters injected (prevents overwhelming the context window) |
 | `enabled` | true | Set to false to disable injection without removing files |
-| `inject_universal` | true | Whether to inject `universal.md` |
+| `inject_universal` | true | Whether to inject `universal.md` at all (on/off master switch) |
+| `universal_frequency` | `"session"` | How often `universal.md` is injected: `"session"` (once per session — default) or `"always"` (every matching prompt, legacy behavior). Any missing/malformed value falls back to `"session"`. |
 | `inject_role` | true | Whether to inject role-specific context |
 | `inject_topics` | true | Whether to inject topic-matched context |
+
+> **Behavior-change note (#3758)**: `universal_frequency` defaults to `"session"`,
+> a deliberate flip from the historical always-inject behavior. Any repo that
+> already opted into `.loom/context/` **without** setting this key now gets
+> `universal.md` **once per session** instead of on every prompt. This mirrors the
+> precedent set by #3609 for `skill-router.sh` (which likewise dropped per-prompt
+> injection with no back-compat shim). To keep the old every-prompt behavior, set
+> `"universal_frequency": "always"`. The once-per-session dedup uses a session-keyed
+> marker at `.loom/logs/methodology-inject-seen/<sanitized-session-id>` (its own
+> namespace, parallel to `skill-router.sh`'s `skill-router-seen/`); a missing/empty
+> `session_id` on stdin degrades gracefully to per-turn injection. Role and topic
+> injection are unaffected — they still fire on every matching turn.
 
 ### How It Works
 
 The `methodology-inject.sh` hook runs as a `UserPromptSubmit` hook alongside `skill-router.sh`. On each prompt:
 
 1. Checks for `.loom/context/` directory -- exits silently if absent
-2. Reads `universal.md` if present
+2. Reads `universal.md` if present, **once per session** by default (`universal_frequency`) — deduped via a session-keyed marker, exactly like `skill-router.sh`'s #3609 routing-table dedup
 3. Detects the active role via `LOOM_ROLE` env var or prompt slash command
 4. Scans `topics/` files, matching prompt against filename or sidecar `.pattern` regex
 5. Concatenates matching content, capped at `max_context_chars`
 6. Returns the collected context as `additionalContext`
 
 The hook follows the same error-handling patterns as other Loom hooks: it never exits non-zero, logs errors to `.loom/logs/hook-errors.log`, and fails silently on any unexpected error.
+
+### UserPromptSubmit Hooks: Opt-In Triggers and Disabling
+
+Both `UserPromptSubmit` hooks are **opt-in by config presence** and do nothing until you add their config. Each has a one-line off switch:
+
+| Hook | Opt-in trigger | One-line disable |
+|------|----------------|------------------|
+| `methodology-inject.sh` | Presence of the `.loom/context/` directory | Delete/rename `.loom/context/`, or set `"enabled": false` in `.loom/context/config.json`, or remove the hook's entry from the `UserPromptSubmit` array in `.claude/settings.json` |
+| `skill-router.sh` | Presence of `.loom/config/skill-routes.json` | Delete `.loom/config/skill-routes.json`, or remove the hook's entry from the `UserPromptSubmit` array in `.claude/settings.json` |
+
+`skill-router.sh` is already conservative (issue #3609): it emits nothing on non-matching turns, and appends its agent routing table at most once per session (session-keyed dedup, degrading gracefully when `session_id` is missing). `methodology-inject.sh` now mirrors that once-per-session discipline for `universal.md` (see `universal_frequency` above). Neither hook blocks a prompt or exits non-zero; both fail silently on any error.
 
 ### Example Context Files
 
