@@ -696,8 +696,10 @@ else  # use_subagent (no daemon, single-token pool, --no-daemon, or Mode C)
     MECH=subagent; MECHANISM="in-session subagent"
 fi
 # The helper prints two lines: size on line 1, reason token on line 2.
-mapfile -t _WS < <(loom_wave_size_from_disk "$MECH" "$CAND" "$FREE_GB")
-WAVE_SIZE="${_WS[0]}"; REASON="${_WS[1]}"
+# Capture both without `mapfile` (a bash-4.0+ builtin) so this works under
+# macOS's default /bin/bash 3.2: grab stdout once, then split by line.
+_WS_OUT="$(loom_wave_size_from_disk "$MECH" "$CAND" "$FREE_GB")"
+WAVE_SIZE="$(sed -n '1p' <<<"$_WS_OUT")"; REASON="$(sed -n '2p' <<<"$_WS_OUT")"
 ```
 
 `loom_wave_size_from_disk` prints two lines — the clamped size `K = min(target, floor(free_gb / LOOM_PER_WORKTREE_GB), CAND)` with a floor of 1 (never 0, even on a full disk) on line 1, and a machine reason token (`target` / `candidates` / `disk` / `floor`) on line 2. `LOOM_PER_WORKTREE_GB` defaults to a conservative 2 GB and is env-overridable for large-repo operators. The target is **10** for the daemon path; for the subagent path it is the **core-scaled** `clamp(floor((cores-2)/4), 3, 6)` (#3693) — resolved into `LOOM_SUBAGENT_WAVE_CAP` just above via `loom_subagent_target_from_cores` / `loom_detect_cores`, floor 3 on small/shared hosts, ceiling 6 on big ones — and an operator-set `LOOM_SUBAGENT_WAVE_CAP` env value always overrides it.
