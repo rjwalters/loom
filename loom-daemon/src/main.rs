@@ -260,7 +260,8 @@ async fn main() -> Result<()> {
                 let source = epic_supervisor::forge::GhEpicSource::new();
                 let dispatcher =
                     epic_supervisor::forge::SpawnDispatcher::new(spawn_bin, sweep_registry.clone());
-                let supervisor = EpicSupervisor::new(source, dispatcher, IssueCreationMutex::new());
+                let supervisor = EpicSupervisor::new(source, dispatcher, IssueCreationMutex::new())
+                    .with_event_bus(event_bus.clone());
                 let interval = epic_supervisor::resolve_supervisor_interval();
                 match epic_supervisor::spawn_supervisor_thread(supervisor, interval) {
                     Ok(handle) => {

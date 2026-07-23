@@ -101,6 +101,15 @@ issue** — the v0.10.0 set is intentionally frozen.
 | `sweep.issue.{N}.crashed` | Daemon reaper                   | `{checkpoint_phase}` |
 | `sweep.global.dispatch`   | Daemon                          | `{sweep_id, kind}` |
 | `sweep.global.completed`  | Daemon                          | `{sweep_id, outcome}` |
+| `epic.issue.{N}.decompose` | Epic supervisor (#3842)        | `{epic, action, state}` |
+| `epic.issue.{N}.expand`    | Epic supervisor (#3842)        | `{epic, action, state}` |
+| `epic.issue.{N}.join`      | Epic supervisor (#3842)        | `{epic, action, state}` |
+| `epic.issue.{N}.close`     | Epic supervisor (#3842)        | `{epic, action, state}` |
+
+The four `epic.issue.{N}.*` topics were authorized by **#3873** (epic #3842
+Phase 4) and are documented in full under [Epic supervisor](#epic-supervisor-3842)
+below. They ride the same in-memory bus as the sweep topics and are tailable via
+`subscribe_to_events` / `tail_event_bus`.
 
 In addition, the bus internally emits:
 
@@ -348,6 +357,105 @@ issue is still `loom:building` with a comment. Doctor invokes it as a documented
 best-effort step after pushing to a `feature/issue-<N>` branch. **Dependency
 auto-detection**, **diamonds / multi-parent**, and **auto-detach** remain **out
 of scope** (deferred items of the v2 epic #3747).
+
+## Epic supervisor (#3842)
+
+The **epic supervisor** (epic #3842) drives every open `loom:epic` issue
+through a fork-join lifecycle autonomously. It runs as an opt-in loop on a
+**dedicated OS thread** with its own current-thread Tokio runtime (`#3872`) —
+never `tokio::spawn` on the shared daemon runtime — because each transition can
+block on a minutes-long role process (`Command::status()`) while holding the
+#3707 issue-creation mutex. Keeping that blocking call off the shared runtime
+preserves the responsiveness of the event bus, reaper, sweep registry, and IPC
+listener.
+
+Enable it with `LOOM_EPIC_SUPERVISOR=1` (unset/false-y = OFF). Tunables:
+`LOOM_EPIC_SUPERVISOR_INTERVAL_SECS` (default 300) and
+`LOOM_EPIC_INFLIGHT_TTL_SECS` (default 900).
+
+### Derived-state model
+
+Rather than mint new GitHub labels per phase, all five supervisor states ride
+the single `loom:epic` label and are **derived** — computed each tick from two
+already-visible facts: the number of `### Phase` sections in the epic body, and
+the open/closed status of the epic's `loom:epic-phase` children. The five states
+(implemented as `EpicState` in
+[`loom-daemon/src/epic_state.rs`](../../loom-daemon/src/epic_state.rs)) mirror
+the `derived=True` epic lane of the authoritative Python model
+([`loom-tools/src/loom_tools/state_machine.py`](../../loom-tools/src/loom_tools/state_machine.py),
+#3841):
+
+| Derived state | Condition | Enabled transition |
+|---------------|-----------|--------------------|
+| `epic:needs_decomp` | body has `< 2` `### Phase` sections | **decompose** — Architect enriches the body in place (no PR) |
+| `epic:designed` | `≥ 2` phases, no `epic-phase` children yet | **expand** — Champion materializes phase-1 children (under the #3707 mutex) |
+| `epic:active` | a current-phase child is open | per-child `/loom:sweep` dispatch (`BuildChildren`) |
+| `epic:phase_join` | current phase's children all closed, more phases remain | **join** — Champion materializes phase N+1 children (mutex + barrier-gated) |
+| `epic:done` | all phases' children closed, no phases remain | **close** — Champion closes the epic (terminal) |
+
+### Transition table + phase-join barrier
+
+The five intra-lane edges among the derived states — the "epic transition
+table" — are declared explicitly in `epic_state::epic_transition_table()`:
+
+```text
+epic:needs_decomp → epic:designed    (Champion, creates_issues)   [decompose]
+epic:designed     → epic:active      (Champion)                   [expand]
+epic:active       → epic:phase_join  (Supervisor, barrier)        [fork-join]
+epic:phase_join   → epic:active      (Supervisor, barrier)        [join/advance]
+epic:phase_join   → epic:done        (Supervisor, barrier)        [close]
+```
+
+Every edge touching `epic:phase_join` is a **phase-boundary edge** and declares
+a non-empty fork-join barrier
+([`loom-daemon/src/phase_join.rs`](../../loom-daemon/src/phase_join.rs)): the
+barrier holds — degrading the plan to a no-op — until every child of the current
+phase is closed, so phase N+1 (or epic close) never fires while a current-phase
+child is still open.
+
+The lane-*entry* edge `new → epic:needs_decomp` (an Architect filing a
+`loom:epic` proposal) is **not** part of the supervisor's table — the supervisor
+begins its lifecycle at `epic:needs_decomp`.
+
+**Conformance.** The Rust transition table is asserted faithful to the Python
+model by
+[`loom-daemon/tests/epic_conformance.rs`](../../loom-daemon/tests/epic_conformance.rs),
+which **derives** its expectation by invoking
+`python3 -m loom_tools.state_machine --json` and comparing the emitted epic
+sub-graph (states, edges, roles, barriers, `creates_issues`) against the Rust
+table — rather than hardcoding a mirrored copy that would silently drift. The
+test skips gracefully when `python3` is unavailable.
+
+### #3707 issue-creation mutex
+
+The two issue-creating expand bursts (`decompose`'s downstream and both
+`expand`/`join` Champion dispatches that run `gh issue create`) are serialized
+through the global **#3707 issue-creation mutex**
+([`loom-daemon/src/issue_creation_mutex.rs`](../../loom-daemon/src/issue_creation_mutex.rs)).
+The supervisor holds the async guard across the whole (spawn-and-wait) dispatch
+so a burst never interleaves with any other issue-creating burst anywhere in the
+daemon. All epic expands share the single `CHAMPION_EPIC_DECOMP` serialization
+identity.
+
+### Event topics
+
+Each of the four singleton action-class transitions publishes an
+`epic.issue.{N}.{action}` event on the shared event bus when it fires, so the
+supervisor's decisions are tailable via `subscribe_to_events` /
+`tail_event_bus`:
+
+| Topic | Fires from | Payload |
+|-------|-----------|---------|
+| `epic.issue.{N}.decompose` | `epic:needs_decomp` | `{epic, action: "decompose", state: "epic:needs_decomp"}` |
+| `epic.issue.{N}.expand`    | `epic:designed`     | `{epic, action: "expand", state: "epic:designed"}` |
+| `epic.issue.{N}.join`      | `epic:phase_join`   | `{epic, action: "join", state: "epic:phase_join"}` |
+| `epic.issue.{N}.close`     | `epic:done`         | `{epic, action: "close", state: "epic:done"}` |
+
+The `BuildChildren` transition (per-child `/loom:sweep` dispatch) has **no**
+epic-action topic — those dispatches already surface on the frozen
+`sweep.global.dispatch` topic. Subscribe to `epic.issue` to receive every
+epic-supervisor action across all epics, or `epic.issue.{N}` for one epic
+(segment-aligned prefix match, same routing rule as the sweep topics).
 
 ## Locks and lifecycle
 

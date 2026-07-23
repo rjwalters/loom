@@ -256,6 +256,47 @@ def test_render_mermaid_is_state_diagram_grouped_by_lane():
     assert "s_merged --> [*]" in out
 
 
+def test_render_json_emits_states_and_transitions():
+    """render_json() emits the full graph with every model field.
+
+    This is the machine-readable export the Rust loom-daemon conformance test
+    (#3873) parses; it must expose states + transitions with their lane, label,
+    role, barrier, and creates_issues fields.
+    """
+    import json
+
+    data = json.loads(canonical().render_json())
+    assert set(data) == {"states", "transitions"}
+
+    # Every state carries the model fields.
+    for s in data["states"]:
+        assert set(s) == {"id", "lane", "label", "entry", "terminal", "derived"}
+
+    # The epic sub-graph: exactly five derived states, all on lane "epic".
+    epic_states = [s for s in data["states"] if s["lane"] == "epic"]
+    assert {s["id"] for s in epic_states} == {
+        "epic:needs_decomp",
+        "epic:designed",
+        "epic:active",
+        "epic:phase_join",
+        "epic:done",
+    }
+    assert all(s["derived"] for s in epic_states)
+    assert [s["id"] for s in epic_states if s["terminal"]] == ["epic:done"]
+
+    # Every transition carries the model fields; phase-boundary edges declare a
+    # non-empty barrier.
+    for t in data["transitions"]:
+        assert set(t) == {"src", "dst", "role", "guard", "creates_issues", "barrier"}
+    boundary = [
+        t
+        for t in data["transitions"]
+        if PHASE_JOIN_STATE in (t["src"], t["dst"])
+    ]
+    assert len(boundary) == 3
+    assert all(t["barrier"] for t in boundary)
+
+
 def _repo_root() -> Path:
     # test file: <root>/loom-tools/tests/test_state_machine.py
     return Path(__file__).resolve().parents[2]

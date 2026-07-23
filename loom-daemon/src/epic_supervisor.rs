@@ -72,8 +72,10 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 
 use crate::epic_state::{count_phase_sections, derive_epic_state, EpicState, PhaseChild};
+use crate::event_bus::EventBus;
 use crate::issue_creation_mutex::{IssueCreationMutex, CHAMPION_EPIC_DECOMP};
 use crate::phase_join::{barrier_admits, PhaseBoundary};
+use crate::types::{EpicActionClass, Event};
 
 // ============================================================================
 // Constants
@@ -235,6 +237,26 @@ impl EpicTransition {
     #[must_use]
     pub fn is_noop(&self) -> bool {
         matches!(self, EpicTransition::Noop)
+    }
+}
+
+impl TransitionKind {
+    /// The event-bus [`EpicActionClass`] this transition emits when fired, or
+    /// `None` for transitions with no action-class topic.
+    ///
+    /// The four singleton lifecycle transitions each map to one action class
+    /// (decompose / expand / join / close). [`BuildChildren`](Self::BuildChildren)
+    /// and [`Noop`](Self::Noop) have none — per-child sweeps already surface on
+    /// `sweep.global.dispatch`, and a no-op fires nothing.
+    #[must_use]
+    pub fn action_class(self) -> Option<EpicActionClass> {
+        match self {
+            TransitionKind::DesignInPlace => Some(EpicActionClass::Decompose),
+            TransitionKind::ExpandFirstPhase => Some(EpicActionClass::Expand),
+            TransitionKind::AdvancePhase => Some(EpicActionClass::Join),
+            TransitionKind::CloseEpic => Some(EpicActionClass::Close),
+            TransitionKind::BuildChildren | TransitionKind::Noop => None,
+        }
     }
 }
 
@@ -433,6 +455,9 @@ pub struct EpicSupervisor<S: EpicSource, D: EpicDispatcher> {
     /// process lifetime (globally unique across epics).
     dispatched_children: HashSet<u32>,
     inflight_ttl: Duration,
+    /// Optional event bus for publishing epic-action topics (#3873). When
+    /// absent the supervisor runs silently (unit-test / no-observability path).
+    bus: Option<Arc<EventBus>>,
 }
 
 impl<S: EpicSource, D: EpicDispatcher> EpicSupervisor<S, D> {
@@ -447,6 +472,7 @@ impl<S: EpicSource, D: EpicDispatcher> EpicSupervisor<S, D> {
             in_flight: HashMap::new(),
             dispatched_children: HashSet::new(),
             inflight_ttl: resolve_inflight_ttl(),
+            bus: None,
         }
     }
 
@@ -454,6 +480,14 @@ impl<S: EpicSource, D: EpicDispatcher> EpicSupervisor<S, D> {
     #[must_use]
     pub fn with_inflight_ttl(mut self, ttl: Duration) -> Self {
         self.inflight_ttl = ttl;
+        self
+    }
+
+    /// Attach an event bus so fired action-class transitions publish
+    /// `epic.issue.{N}.{action}` events (#3873). Builder-style; returns `self`.
+    #[must_use]
+    pub fn with_event_bus(mut self, bus: Arc<EventBus>) -> Self {
+        self.bus = Some(bus);
         self
     }
 
@@ -597,11 +631,32 @@ impl<S: EpicSource, D: EpicDispatcher> EpicSupervisor<S, D> {
                     },
                 );
                 report.roles_dispatched += 1;
+                self.emit_action(epic, kind);
             }
             Err(e) => {
                 report.errors += 1;
                 log::warn!("epic_supervisor: {} dispatch for epic #{epic} failed: {e}", shape.role);
             }
+        }
+    }
+
+    /// Publish an `epic.issue.{epic}.{action}` event for a just-fired singleton
+    /// transition, when the transition maps to an [`EpicActionClass`] and a bus
+    /// is attached. Best-effort — a missing bus or absent subscribers is not an
+    /// error (mirrors the sweep-registry publish convention).
+    fn emit_action(&self, epic: u32, kind: TransitionKind) {
+        let (Some(bus), Some(action)) = (self.bus.as_ref(), kind.action_class()) else {
+            return;
+        };
+        let event = Event::EpicAction {
+            epic,
+            action,
+            state: action.source_state_id().to_string(),
+        };
+        let topic = event.topic();
+        match bus.publish(event) {
+            Ok(n) => log::debug!("event_bus: published {topic} to {n} subscriber(s)"),
+            Err(_) => log::debug!("event_bus: published {topic} (no subscribers)"),
         }
     }
 
@@ -1337,6 +1392,125 @@ mod tests {
         let (_epic, shape) = &sup.dispatcher.roles[0];
         assert_eq!(shape.role, "Champion");
         assert!(shape.prompt.contains("Close epic"));
+    }
+
+    // ===================================================================
+    // Event-bus action topics (#3873)
+    // ===================================================================
+
+    #[test]
+    fn test_transition_kind_action_class_mapping() {
+        assert_eq!(TransitionKind::DesignInPlace.action_class(), Some(EpicActionClass::Decompose));
+        assert_eq!(TransitionKind::ExpandFirstPhase.action_class(), Some(EpicActionClass::Expand));
+        assert_eq!(TransitionKind::AdvancePhase.action_class(), Some(EpicActionClass::Join));
+        assert_eq!(TransitionKind::CloseEpic.action_class(), Some(EpicActionClass::Close));
+        // BuildChildren is covered by sweep.global.dispatch; Noop fires nothing.
+        assert_eq!(TransitionKind::BuildChildren.action_class(), None);
+        assert_eq!(TransitionKind::Noop.action_class(), None);
+    }
+
+    #[tokio::test]
+    async fn test_tick_publishes_decompose_event() {
+        let bus = Arc::new(EventBus::new());
+        let mut sub = bus.subscribe(["epic.issue"]);
+        let mut sup = supervisor(vec![EpicSnapshot::new(1, "flat body", vec![], vec![])])
+            .with_event_bus(bus.clone());
+
+        let _ = sup.tick().await.unwrap();
+
+        let event = sub.try_recv().expect("a decompose event was published");
+        assert_eq!(event.topic(), "epic.issue.1.decompose");
+        match event {
+            Event::EpicAction {
+                epic,
+                action,
+                state,
+            } => {
+                assert_eq!(epic, 1);
+                assert_eq!(action, EpicActionClass::Decompose);
+                assert_eq!(state, "epic:needs_decomp");
+            }
+            other => panic!("expected EpicAction, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_tick_publishes_expand_and_close_events() {
+        // designed → expand
+        let bus = Arc::new(EventBus::new());
+        let mut sub = bus.subscribe::<[&str; 0], &str>([]);
+        let mut sup = supervisor(vec![EpicSnapshot::new(2, body_with_phases(3), vec![], vec![])])
+            .with_event_bus(bus.clone());
+        let _ = sup.tick().await.unwrap();
+        assert_eq!(sub.try_recv().unwrap().topic(), "epic.issue.2.expand");
+
+        // done → close
+        let bus2 = Arc::new(EventBus::new());
+        let mut sub2 = bus2.subscribe::<[&str; 0], &str>([]);
+        let mut sup2 = supervisor(vec![EpicSnapshot::new(
+            6,
+            body_with_phases(2),
+            vec![closed(1), closed(2)],
+            vec![],
+        )])
+        .with_event_bus(bus2.clone());
+        let _ = sup2.tick().await.unwrap();
+        assert_eq!(sub2.try_recv().unwrap().topic(), "epic.issue.6.close");
+    }
+
+    #[tokio::test]
+    async fn test_tick_publishes_join_event() {
+        let bus = Arc::new(EventBus::new());
+        let mut sub = bus.subscribe(["epic.issue.5.join"]);
+        let mut sup = supervisor(vec![EpicSnapshot::new(
+            5,
+            body_with_phases(3),
+            vec![closed(1)],
+            vec![],
+        )])
+        .with_event_bus(bus.clone());
+
+        let _ = sup.tick().await.unwrap();
+
+        let event = sub.try_recv().expect("a join event was published");
+        assert_eq!(event.topic(), "epic.issue.5.join");
+        match event {
+            Event::EpicAction { action, state, .. } => {
+                assert_eq!(action, EpicActionClass::Join);
+                assert_eq!(state, "epic:phase_join");
+            }
+            other => panic!("expected EpicAction, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_build_children_publishes_no_epic_action_event() {
+        // active → BuildChildren must NOT emit an epic.issue.*.{action} event;
+        // per-child sweeps surface on sweep.global.dispatch instead.
+        let bus = Arc::new(EventBus::new());
+        let mut sub = bus.subscribe(["epic.issue"]);
+        let mut sup = supervisor(vec![EpicSnapshot::new(
+            3,
+            body_with_phases(3),
+            vec![open(1)],
+            vec![301],
+        )])
+        .with_event_bus(bus.clone());
+
+        let report = sup.tick().await.unwrap();
+        assert_eq!(report.sweeps_dispatched, 1);
+        assert!(
+            matches!(sub.try_recv(), Err(crate::event_bus::RecvError::Empty)),
+            "BuildChildren must not publish an epic-action event"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_no_bus_is_silent_and_still_dispatches() {
+        // Without an attached bus the supervisor still dispatches normally.
+        let mut sup = supervisor(vec![EpicSnapshot::new(1, "flat body", vec![], vec![])]);
+        let report = sup.tick().await.unwrap();
+        assert_eq!(report.roles_dispatched, 1);
     }
 
     // ===================================================================

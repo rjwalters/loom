@@ -27,12 +27,18 @@
 //! | `sweep.issue.{N}.crashed` | Daemon reaper | `{checkpoint_phase}` |
 //! | `sweep.global.dispatch`   | Daemon | `{sweep_id, kind}` |
 //! | `sweep.global.completed`  | Daemon | `{sweep_id, outcome}` |
+//! | `epic.issue.{N}.decompose` | Epic supervisor | `{epic, action, state}` |
+//! | `epic.issue.{N}.expand`    | Epic supervisor | `{epic, action, state}` |
+//! | `epic.issue.{N}.join`      | Epic supervisor | `{epic, action, state}` |
+//! | `epic.issue.{N}.close`     | Epic supervisor | `{epic, action, state}` |
 //!
 //! New topics require a follow-up issue — the taxonomy is intentionally
-//! pinned. The bus accepts arbitrary topic strings (`publish` does not
-//! reject unknown topics) so the publisher side stays open for future
-//! extension, but the documented taxonomy is the contract subscribers
-//! should rely on for v0.10.0.
+//! pinned. The four `epic.issue.{N}.*` topics were authorized by **#3873**
+//! (epic #3842 Phase 4) for the epic supervisor's action classes
+//! (decompose / expand / join / close). The bus accepts arbitrary topic
+//! strings (`publish` does not reject unknown topics) so the publisher side
+//! stays open for future extension, but the documented taxonomy is the
+//! contract subscribers should rely on.
 
 use crate::types::Event;
 
