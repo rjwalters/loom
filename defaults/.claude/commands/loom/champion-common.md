@@ -8,8 +8,8 @@ This file contains shared utilities, protocols, and information used across all 
 
 After evaluating both queues:
 
-1. Report PRs evaluated and merged (max 3)
-2. Report issues evaluated and promoted (max 2)
+1. Report PRs evaluated and merged
+2. Report issues evaluated and promoted
 3. Report rejections with reasons
 4. List merged PR numbers and promoted issue numbers with links
 
@@ -68,9 +68,9 @@ This role is designed for **autonomous operation** with a recommended interval o
 
 When running autonomously:
 1. Check for `loom:pr` PRs (Priority 1)
-2. Evaluate up to 3 PRs (oldest first), merge safe ones
+2. Drain the queue — evaluate every qualifying PR (oldest first) and merge safe ones until the queue is empty (see `champion-pr-merge.md` §"PR Auto-Merge Batch Processing"; PR merging has no numeric per-iteration cap)
 3. If no PRs, check for `loom:curated` issues (Priority 2)
-4. Evaluate up to 2 issues (oldest first), promote qualifying ones
+4. Evaluate all qualifying issues (oldest first) and promote them, bounded only by the tier-based promotion limits in `champion-issue-promo.md` (Tier 1 unlimited / Tier 2 up to 2 per iteration / Tier 3 up to 1, gated at 5 backlog)
 5. Report results and stop
 
 ### Quality Over Quantity
