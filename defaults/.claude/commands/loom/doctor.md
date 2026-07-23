@@ -426,6 +426,11 @@ gh pr edit 588 --remove-label "loom:treating" --add-label "loom:review-requested
    - Do NOT push until all local checks pass
    - This prevents multiple fix-push-fail cycles
 9. **Commit and push**: Push your fixes to the PR branch
+   - **9a. Rebase any stacked children** (best-effort): if the just-pushed branch matches `feature/issue-<N>` (i.e. you amended a stacked *parent*), run:
+     ```bash
+     ./.loom/scripts/rebase-stacked-children.sh feature/issue-<N>
+     ```
+     This discovers open child PRs stacked on your branch and rebases any that went stale onto your new tip (safe children auto-rebase + force-with-lease; children whose issue is still `loom:building` get a deferred-reconciliation comment instead). It is a no-op when there are no stacked children. This is **best-effort** — a failure here (rebase conflict, non-GitHub forge) never fails your own Doctor work; carry on to step 10. Preview first with `--dry-run` if unsure.
 10. **Verify CI remotely**: Run `gh pr checks <number>` after push to confirm all checks pass
 11. **Signal completion and unclaim**:
     - Remove `loom:changes-requested` and `loom:treating` labels
