@@ -2099,8 +2099,7 @@ WARNING: Never run `lake build` inside Docker - causes memory corruption.
         // hooks key should be removed entirely since nothing remains
         assert!(
             settings.get("hooks").is_none(),
-            "hooks key should be removed when empty, got: {:?}",
-            settings
+            "hooks key should be removed when empty, got: {settings:?}"
         );
     }
 

@@ -1107,12 +1107,14 @@ mod tests {
     use crate::types::{SweepKind, SweepState};
     use tempfile::tempdir;
 
-    fn setup_test_context() -> (
+    type TestContext = (
         Arc<Mutex<TerminalManager>>,
         Arc<Mutex<ActivityDb>>,
         Arc<Mutex<SweepRegistry>>,
         Arc<EventBus>,
-    ) {
+    );
+
+    fn setup_test_context() -> TestContext {
         let tm = Arc::new(Mutex::new(TerminalManager::new()));
         let dir = tempdir().unwrap();
         let db_path = dir.path().join("test_activity.db");
