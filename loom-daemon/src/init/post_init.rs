@@ -89,9 +89,19 @@ const GITIGNORE_BLOCK_HEADER: &str = "# Loom runtime state (don't commit these)"
 /// state files (`daemon-state.json`, archived `[0-9][0-9]-daemon-state.json`,
 /// `progress/`, `stuck-history.json`, `alerts.json`, `health-metrics.json`)
 /// and added `spawn-loop-state.json` for the Phase 1 spawn loop (#3374).
+///
+/// #3778: closed the drift where this installer-managed list had fallen behind
+/// the source `.gitignore`, so a consumer repo's re-synced loom-managed block
+/// still omitted several Loom-owned transient paths — added `.loom-managed`,
+/// `.loom/exit-codes/`, `.loom/sweep-run/`, `.loom/stats/`, `.loom/spawn-loop.pid`,
+/// and `.loom/stop-spawn-loop`. The marker-delimited block is refreshed in place
+/// on every `update_gitignore`, so re-running the installer re-syncs consumers.
 pub const EPHEMERAL_PATTERNS: &[&str] = &[
     ".loom-in-use",
     ".loom-checkpoint",
+    // Worktree sentinel dropped by worktree.sh into each issue worktree; must be
+    // ignored so a builder's `git add -A` doesn't sweep it into a commit (#3778).
+    ".loom-managed",
     ".loom/.daemon.pid",
     ".loom/.daemon.log",
     ".loom/daemon.sock",
@@ -99,6 +109,8 @@ pub const EPHEMERAL_PATTERNS: &[&str] = &[
     ".loom/daemon-metrics.json",
     ".loom/loom-source-path",
     ".loom/spawn-loop-state.json",
+    ".loom/spawn-loop.pid",
+    ".loom/stop-spawn-loop",
     ".loom/issue-failures.json",
     ".loom/interventions/",
     ".loom/worktrees/",
@@ -110,7 +122,10 @@ pub const EPHEMERAL_PATTERNS: &[&str] = &[
     ".loom/signals/",
     ".loom/status/",
     ".loom/retry-state/",
+    ".loom/exit-codes/",
     ".loom/sweep-checkpoint/",
+    ".loom/sweep-run/",
+    ".loom/stats/",
     ".loom/diagnostics/",
     ".loom/guide-docs-state.json",
     ".loom/metrics_state.json",
@@ -322,6 +337,16 @@ mod tests {
         assert_eq!(contents.matches(".loom/sweep-checkpoint/").count(), 1);
         assert_eq!(contents.matches(".loom/locks/").count(), 1);
         assert!(contents.contains("# Loom runtime state"));
+
+        // #3778: patterns that had drifted out of this installer-managed list
+        // relative to the source .gitignore — a consumer re-sync must now emit
+        // them so Loom-owned transient state never surfaces as untracked dirt.
+        assert!(contents.contains(".loom-managed"));
+        assert!(contents.contains(".loom/exit-codes/"));
+        assert!(contents.contains(".loom/sweep-run/"));
+        assert!(contents.contains(".loom/stats/"));
+        assert!(contents.contains(".loom/spawn-loop.pid"));
+        assert!(contents.contains(".loom/stop-spawn-loop"));
 
         // Retired daemon-brain patterns must NOT be emitted (Phase 3.5, #3402)
         assert!(!contents.contains(".loom/daemon-state.json"));
