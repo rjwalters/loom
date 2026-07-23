@@ -195,24 +195,32 @@ echo "PASS: Recently updated ($HOURS_AGO hours ago)"
 
 **Rationale**: Ensures PR reflects recent state of main branch and hasn't gone stale. In force mode, allows older PRs to merge since aggressive development may queue up PRs faster than they can be merged.
 
+**On failure**: a stale PR is handled by the dedicated stale-PR policy (see "PR Rejection Workflow → Stale PR"), not the transient-failure path — it is commented once (idempotently) and routed out of the queue via `loom:pr` → `loom:changes-requested` so it reaches Doctor rather than being re-commented every cron tick.
+
 ### 6. CI Status Check
 - [ ] If CI checks exist, all checks must be passing
 - [ ] If no CI checks exist, this criterion passes automatically
 
 **Verification command**:
 ```bash
-# Get all CI checks
-CHECKS=$(gh pr checks <number> --json name,conclusion,status 2>&1)
+# Get all CI checks. `gh pr checks --json` exposes `bucket` (the rolled-up
+# pass/fail/pending/skipping/cancel state) and `name` — there is NO `conclusion`
+# or `status` field (those were invalid and made this gate silently vacuous).
+# Capture stdout ONLY: when a PR has no checks, gh prints "no checks reported..."
+# to STDERR and exits non-zero with EMPTY stdout, so an empty result is the
+# robust no-checks signal (do not grep error text).
+CHECKS=$(gh pr checks <number> --json bucket,name 2>/dev/null)
 
-# Handle case where no checks exist
-if echo "$CHECKS" | grep -q "no checks reported"; then
+# Handle case where no checks exist (empty stdout, or an empty JSON array)
+if [ -z "$CHECKS" ] || [ "$(echo "$CHECKS" | jq 'length')" = "0" ]; then
   echo "PASS: No CI checks required"
   exit 0
 fi
 
-# Parse checks
-FAILING_CHECKS=$(echo "$CHECKS" | jq -r '.[] | select(.conclusion != "SUCCESS" and .conclusion != null) | .name')
-PENDING_CHECKS=$(echo "$CHECKS" | jq -r '.[] | select(.status == "IN_PROGRESS" or .status == "QUEUED") | .name')
+# Parse checks by bucket. Buckets: pass, fail, pending, skipping, cancel.
+# `fail`/`cancel` block the merge; `pending` defers; `pass`/`skipping` are OK.
+FAILING_CHECKS=$(echo "$CHECKS" | jq -r '.[] | select(.bucket == "fail" or .bucket == "cancel") | .name')
+PENDING_CHECKS=$(echo "$CHECKS" | jq -r '.[] | select(.bucket == "pending") | .name')
 
 # Check for failing checks
 if [ -n "$FAILING_CHECKS" ]; then
@@ -232,10 +240,10 @@ echo "PASS: All CI checks passing"
 ```
 
 **Edge cases handled**:
-- **No CI checks**: Passes (allows merge)
-- **Pending checks**: Skips (waits for completion)
-- **Failed checks**: Fails (blocks merge)
-- **Mixed state**: Fails if any check is not SUCCESS
+- **No CI checks**: Passes (allows merge) — detected via empty stdout, not error text
+- **Pending checks**: Skips (waits for completion) — `bucket == "pending"`
+- **Failed checks**: Fails (blocks merge) — `bucket == "fail"` or `"cancel"`
+- **Skipped checks**: Passes — `bucket == "skipping"` is not a failure
 
 **Rationale**: Only merge when all automated checks pass or no checks are configured
 
@@ -285,9 +293,9 @@ UPDATED_TS=$(date -j -f "%Y-%m-%dT%H:%M:%SZ" "$UPDATED_AT" +%s 2>/dev/null || \
 NOW_TS=$(date +%s)
 HOURS_AGO=$(( (NOW_TS - UPDATED_TS) / 3600 ))
 
-# Check CI status
-CHECKS=$(gh pr checks "$PR_NUMBER" --json name,conclusion,status 2>&1)
-if echo "$CHECKS" | grep -q "no checks reported"; then
+# Check CI status (empty stdout = no checks; see criterion #6 above)
+CHECKS=$(gh pr checks "$PR_NUMBER" --json bucket,name 2>/dev/null)
+if [ -z "$CHECKS" ] || [ "$(echo "$CHECKS" | jq 'length')" = "0" ]; then
   CI_STATUS="No CI checks required"
 else
   CI_STATUS="All CI checks passing"
@@ -456,13 +464,20 @@ TODOS_RAW=$(gh pr diff "$PR_NUMBER" 2>/dev/null | awk '
   }
   /^@@/ {
     # Parse hunk header for line number: @@ -old,count +new,count @@
-    match($0, /\+([0-9]+)/, arr)
-    line_num = arr[1]
+    # POSIX awk: 2-arg match() sets RSTART/RLENGTH (the gawk-only 3-arg
+    # match($0, re, arr) form errors on BSD awk / macOS). Capture the "+<n>"
+    # token, then strip the leading "+" with substr().
+    if (match($0, /\+[0-9]+/)) {
+      line_num = substr($0, RSTART + 1, RLENGTH - 1)
+    }
     in_hunk = 1
   }
   in_hunk && /^\+[^+]/ {
     # Added line (not the +++ header)
-    if (/\b(TODO|FIXME|HACK|XXX|FUTURE):/) {
+    # POSIX-portable word boundary: BSD awk (macOS) does NOT support the gawk-only
+    # \b escape, so `/\b(TODO...):/` silently matches nothing there. Anchor on
+    # start-of-string-or-non-word-char instead so this fires on BSD awk too.
+    if ($0 ~ /(^|[^A-Za-z0-9_])(TODO|FIXME|HACK|XXX|FUTURE):/) {
       # Extract the comment text after the pattern
       line = $0
       sub(/^\+/, "", line)
@@ -648,13 +663,17 @@ else
   FORCE_MARKER=""
 fi
 
-# Create the issue
+# Create the issue.
+# NOTE: `gh issue create` does NOT support --json/--jq (only `gh issue view`
+# and `gh issue list` do). On success it prints the new issue's URL to stdout
+# (e.g. https://github.com/<owner>/<repo>/issues/<N>); parse the trailing
+# number from that URL.
 ISSUE_TITLE="${FORCE_MARKER}Follow-on: Work identified in PR #$PR_NUMBER"
-NEW_ISSUE=$(gh issue create \
+NEW_ISSUE_URL=$(gh issue create \
   --title "$ISSUE_TITLE" \
   --body "$ISSUE_BODY" \
-  --label "$ISSUE_LABEL" \
-  --json number --jq '.number')
+  --label "$ISSUE_LABEL")
+NEW_ISSUE=$(echo "$NEW_ISSUE_URL" | grep -oE '[0-9]+$')
 
 if [ -n "$NEW_ISSUE" ]; then
   echo "Created follow-on issue #$NEW_ISSUE with label $ISSUE_LABEL"
@@ -694,7 +713,11 @@ fi
 
 ## PR Rejection Workflow
 
-If ANY safety criterion fails, do NOT merge. Instead, add a comment explaining why:
+If ANY safety criterion fails, do NOT merge. How the failure is handled depends on whether it is **transient** (clears on its own or on the next push — pending CI, conflicts being resolved, `UNKNOWN` mergeability) or **terminal** (the PR has gone stale and cannot clear without a rebase).
+
+### Transient failures — keep `loom:pr`, retry next tick
+
+Add a comment explaining why, and **keep the `loom:pr` label** so the PR is re-evaluated on the next Champion tick once the blocking condition clears:
 
 ```bash
 gh pr comment <number> --body "**Champion: Cannot Auto-Merge**
@@ -707,13 +730,43 @@ This PR cannot be automatically merged due to the following:
 - <SPECIFIC_ACTION_1>
 - <SPECIFIC_ACTION_2>
 
-Keeping \`loom:pr\` label. A human will need to manually merge this PR or address the blocking criteria.
+Keeping \`loom:pr\` label. Champion will retry on the next tick once the blocking condition clears.
 
 ---
 *Automated by Champion role*"
 ```
 
-**Do NOT remove the `loom:pr` label** - let the human decide whether to merge or close.
+**Do NOT remove the `loom:pr` label for transient failures** — the next tick retries automatically.
+
+### Stale PR (recency check failed) — comment once, route to Doctor
+
+A stale PR (>24h normal / >72h force mode) will never clear on its own, and under the 10-minute cron a bare "keep the label + comment" loop would re-comment on the same PR **every tick forever**. Instead, **comment once (idempotently)** and **swap `loom:pr` → `loom:changes-requested`** so the PR leaves the auto-merge queue and is picked up by Doctor for a rebase/refresh. This is the single, authoritative stale-PR policy — `champion-reference.md` Edge Case 5 defers to it.
+
+```bash
+PR_NUMBER=<number>
+STALE_MARKER="<!-- champion:stale-pr-notice -->"
+
+# Idempotency guard: only comment + relabel once. If a prior tick already
+# posted the stale notice, do nothing (prevents per-tick comment spam).
+if gh pr view "$PR_NUMBER" --json comments --jq '.comments[].body' | grep -qF "$STALE_MARKER"; then
+  echo "Stale-PR notice already posted for #$PR_NUMBER — skipping"
+else
+  gh pr comment "$PR_NUMBER" --body "$STALE_MARKER
+**Champion: PR Is Stale**
+
+This PR has not been updated within the recency window (24h normal / 72h force mode), so it has been routed out of the auto-merge queue for a rebase/refresh.
+
+**Next steps:**
+- Rebase onto the latest \`main\` and resolve any drift
+- Re-request Judge review to return it to the auto-merge queue
+
+---
+*Automated by Champion role*"
+  # Route to Doctor: leave the auto-merge queue.
+  gh pr edit "$PR_NUMBER" --remove-label "loom:pr" --add-label "loom:changes-requested"
+  echo "Routed stale PR #$PR_NUMBER to Doctor (loom:pr → loom:changes-requested)"
+fi
+```
 
 ---
 
