@@ -691,7 +691,7 @@ gh issue close <number> --reason "not planned"
 gh issue edit <number> --remove-label "loom:building"
 ```
 
-> **Under `/loom:sweep` orchestration**, prefer the `.no-changes-needed` marker (see "Signaling No Changes Needed" below) and let orchestration finalize the lifecycle — a Builder subagent closing the issue out from under the orchestrator can race it. Write the marker with your rationale and exit; the direct `gh issue close` path above is for **manual Builder runs** where you own the whole lifecycle.
+> **Under `/loom:sweep` orchestration**, prefer the `.no-changes-needed` marker (see "Signaling No Changes Needed" above) and let orchestration finalize the lifecycle — a Builder subagent closing the issue out from under the orchestrator can race it. Write the marker with your rationale and exit; the direct `gh issue close` path above is for **manual Builder runs** where you own the whole lifecycle.
 
 **When to rescope** (the core is worth keeping, but not as filed):
 - Correct the scope by editing the body / adding a comment, then implement the corrected scope in your PR.
