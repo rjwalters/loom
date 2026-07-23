@@ -41,7 +41,7 @@ use crate::event_bus::EventBus;
 use crate::types::{Event, SweepId, SweepInfo, SweepKind, SweepOutcome, SweepState};
 
 use anyhow::{anyhow, Context, Result};
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 #[cfg(unix)]
@@ -860,7 +860,56 @@ impl SweepRegistry {
     /// against unknown sweep IDs return `Err`. Calls against already-
     /// terminal sweeps return `Ok` with `was_running = false` — cancel
     /// is idempotent so monitor-tool retries don't surface as errors.
+    ///
+    /// This is the **synchronous, self-contained** composition of the
+    /// [`begin_cancel`](Self::begin_cancel) → [`poll_cancel`](Self::poll_cancel)
+    /// → [`finish_cancel`](Self::finish_cancel) split. It holds `&mut self`
+    /// (and therefore, when the registry lives behind a `Mutex`, the lock)
+    /// for the entire grace window, so callers that must not freeze other
+    /// registry access during the poll should orchestrate the three steps
+    /// themselves and release the lock across the sleep (see the non-blocking
+    /// IPC handler for `CancelSweep`, Issue #3807). Kept for direct callers
+    /// and unit tests where lock contention is irrelevant.
     pub fn cancel(&mut self, sweep_id: &str, grace: Duration) -> Result<CancelOutcome> {
+        let (pid, kind, started_at) = match self.begin_cancel(sweep_id)? {
+            BeginCancel::AlreadyTerminal(outcome) => return Ok(outcome),
+            BeginCancel::Signalled {
+                pid,
+                kind,
+                started_at,
+            } => (pid, kind, started_at),
+        };
+
+        // Poll for exit up to the grace window (100ms cadence, matching the
+        // spawn-loop's shutdown-grace polling). Blocking sleep is fine here —
+        // this path holds `&mut self` throughout by design.
+        let poll_interval = Duration::from_millis(100);
+        let deadline = std::time::Instant::now() + grace;
+        let mut exited_within_grace = self.poll_cancel(sweep_id, pid);
+        while !exited_within_grace && std::time::Instant::now() < deadline {
+            std::thread::sleep(poll_interval);
+            exited_within_grace = self.poll_cancel(sweep_id, pid);
+        }
+
+        Ok(self.finish_cancel(sweep_id, pid, &kind, started_at, exited_within_grace))
+    }
+
+    /// First, lock-scoped step of a split cancel (Issue #3807): read the
+    /// target's pid/kind/liveness and, when it is still running, deliver
+    /// SIGTERM to its process GROUP (Issue #3800). Returns quickly — it does
+    /// **no** blocking poll — so the caller can release the registry lock
+    /// before entering the (potentially multi-second) grace window.
+    ///
+    /// SIGTERM (signal 15) is sent to the whole process group via `kill(2)`
+    /// directly rather than spawning `kill(1)` so the path is identical on
+    /// macOS + Linux and doesn't depend on `PATH`. `signal_sweep` falls back
+    /// to single-PID delivery for entries with no retained handle.
+    ///
+    /// - Unknown sweep IDs return `Err`.
+    /// - Already-terminal sweeps return [`BeginCancel::AlreadyTerminal`] with
+    ///   an idempotent `was_running = false` outcome (no signal, no state
+    ///   change) — cancel-from-monitor retries stay idempotent.
+    pub fn begin_cancel(&mut self, sweep_id: &str) -> Result<BeginCancel> {
         let (pid, kind, was_running, started_at) = {
             let info = self
                 .entries
@@ -871,22 +920,14 @@ impl SweepRegistry {
         };
 
         if !was_running {
-            // Already terminal — nothing to signal. Return success so
-            // duplicate cancel-from-monitor requests stay idempotent.
-            return Ok(CancelOutcome {
+            return Ok(BeginCancel::AlreadyTerminal(CancelOutcome {
                 sweep_id: sweep_id.to_string(),
                 pid,
                 sigkill_sent: false,
                 was_running: false,
-            });
+            }));
         }
 
-        // Step 1: SIGTERM (signal 15) to the sweep's process GROUP (Issue
-        // #3800) so the `claude` child AND its tool/MCP subprocess subtree are
-        // reached — not just the tracked leader PID. We send via `kill(2)`
-        // directly rather than spawning `kill(1)` so the path is identical on
-        // macOS + Linux and we don't depend on `PATH`. `signal_sweep` falls
-        // back to single-PID delivery for entries with no retained handle.
         let term_sent = self.signal_sweep(sweep_id, pid, 15);
         if !term_sent {
             log::warn!(
@@ -895,21 +936,39 @@ impl SweepRegistry {
             );
         }
 
-        // Step 2: poll for exit up to the grace window. We poll every
-        // 100ms (matches the spawn-loop's shutdown-grace polling
-        // cadence). The poll loop is a blocking sleep — acceptable for
-        // an IPC handler since cancel is a low-frequency operator action.
-        // `poll_liveness` reaps the child (no zombie, Issue #3801) the moment
-        // it observes the exit via the retained handle's `try_wait()`.
-        let poll_interval = Duration::from_millis(100);
-        let deadline = std::time::Instant::now() + grace;
-        let (mut exited_within_grace, _) = self.poll_liveness(sweep_id, pid);
-        while !exited_within_grace && std::time::Instant::now() < deadline {
-            std::thread::sleep(poll_interval);
-            exited_within_grace = self.poll_liveness(sweep_id, pid).0;
-        }
+        Ok(BeginCancel::Signalled {
+            pid,
+            kind,
+            started_at,
+        })
+    }
 
-        // Step 3: SIGKILL the group if still alive.
+    /// One lock-scoped liveness poll for an in-progress cancel (Issue #3807).
+    /// Returns `true` once the child has exited, reaping it via the retained
+    /// `Child` handle so no `<defunct>` zombie survives (Issue #3801). The
+    /// caller invokes this under a brief lock between *unlocked* sleep
+    /// intervals, so the grace window never holds the registry mutex.
+    pub fn poll_cancel(&mut self, sweep_id: &str, pid: u32) -> bool {
+        self.poll_liveness(sweep_id, pid).0
+    }
+
+    /// Final, lock-scoped step of a split cancel (Issue #3807): SIGKILL the
+    /// process group if the child did not exit within grace, reap the retained
+    /// handle (Issue #3801), transition the entry to `Exited{code: None}`,
+    /// release the per-issue lock, and emit the same lifecycle events a clean
+    /// exit would (`sweep.issue.{N}.exited` + `sweep.global.completed`).
+    ///
+    /// `exited_within_grace` is the terminal result of the caller's poll loop.
+    /// Returns the [`CancelOutcome`] for the (running) sweep.
+    pub fn finish_cancel(
+        &mut self,
+        sweep_id: &str,
+        pid: u32,
+        kind: &SweepKind,
+        started_at: DateTime<Utc>,
+        exited_within_grace: bool,
+    ) -> CancelOutcome {
+        // SIGKILL the group if still alive.
         let sigkill_sent = if exited_within_grace {
             false
         } else {
@@ -920,13 +979,13 @@ impl SweepRegistry {
             true
         };
 
-        // Step 3b: reap the retained handle so the killed leader does not
-        // linger as a `<defunct>` zombie under the daemon PID (Issue #3801).
-        // A no-op when the exit was already reaped in the poll loop above, or
-        // when no handle is retained (reconstructed / test-injected entry).
+        // Reap the retained handle so the killed leader does not linger as a
+        // `<defunct>` zombie under the daemon PID (Issue #3801). A no-op when
+        // the exit was already reaped in the poll loop above, or when no
+        // handle is retained (reconstructed / test-injected entry).
         let _ = self.reap_handle(sweep_id);
 
-        // Step 4: transition state, release lock, emit events.
+        // Transition state, release lock, emit events.
         let now = Utc::now();
         let duration_sec = (now - started_at).num_seconds();
         if let Some(info) = self.entries.get_mut(sweep_id) {
@@ -935,7 +994,7 @@ impl SweepRegistry {
                 at: now,
             };
         }
-        if let SweepKind::Issue(issue) = &kind {
+        if let SweepKind::Issue(issue) = kind {
             let _ = self.release_lock(*issue);
             self.emit_event(Event::SweepExited {
                 issue: *issue,
@@ -948,12 +1007,12 @@ impl SweepRegistry {
             outcome: SweepOutcome::Exited,
         });
 
-        Ok(CancelOutcome {
+        CancelOutcome {
             sweep_id: sweep_id.to_string(),
             pid,
             sigkill_sent,
             was_running: true,
-        })
+        }
     }
 
     /// Read the last `lines` lines from a sweep's log file.
@@ -1301,6 +1360,29 @@ pub struct DispatchOutcome {
     /// `false` when the dispatch was an idempotency hit on an existing
     /// `Running` entry.
     pub was_new: bool,
+}
+
+/// Result of the lock-scoped [`begin_cancel`](SweepRegistry::begin_cancel)
+/// step of a split cancel (Issue #3807).
+///
+/// Splitting `cancel` into begin → poll → finish lets the IPC handler run the
+/// grace poll/sleep window WITHOUT holding the registry mutex, so concurrent
+/// `ListSweeps` / `GetSweepStatus` / `DispatchSweep` for other sweeps are not
+/// blocked for the (potentially multi-second) grace duration.
+#[derive(Debug, Clone)]
+pub enum BeginCancel {
+    /// The sweep was already terminal — nothing was signalled. Carries the
+    /// idempotent [`CancelOutcome`] (`was_running = false`) to return directly.
+    AlreadyTerminal(CancelOutcome),
+    /// SIGTERM has been delivered to the sweep's process group. The caller must
+    /// now poll for exit (unlocked) via
+    /// [`poll_cancel`](SweepRegistry::poll_cancel) and then call
+    /// [`finish_cancel`](SweepRegistry::finish_cancel).
+    Signalled {
+        pid: u32,
+        kind: SweepKind,
+        started_at: DateTime<Utc>,
+    },
 }
 
 /// Result of a `cancel` call (Issue #3455, Phase C).
@@ -2925,6 +3007,139 @@ exit 0
 
         let info = registry.get(&sweep_id).unwrap();
         assert!(matches!(info.state, SweepState::Exited { .. }));
+    }
+
+    /// Issue #3807 core AC: the SIGTERM → grace-poll → SIGKILL escalation must
+    /// NOT hold the registry lock for the full grace window. We drive the split
+    /// `begin_cancel` → `poll_cancel` (unlocked sleeps between polls) →
+    /// `finish_cancel` orchestration on one thread against a real trap-TERM
+    /// child (forced to run the FULL grace before escalating), and assert a
+    /// concurrent `get_status` on a DIFFERENT sweep returns PROMPTLY — well
+    /// under the grace window — rather than blocking for it. With the old
+    /// `cancel(&mut self)` (lock held throughout) the concurrent read would
+    /// block for the entire grace.
+    #[test]
+    fn split_cancel_does_not_hold_lock_across_grace_window() {
+        use std::sync::{Arc, Mutex};
+        use std::thread;
+
+        let dir = tempdir().unwrap();
+        let (registry, _record_log) = fixture_registry(dir.path());
+        let registry = Arc::new(Mutex::new(registry));
+
+        // A real child that traps (ignores) SIGTERM and sleeps, so the cancel
+        // is forced to poll for the full grace before escalating to SIGKILL.
+        let mut child = Command::new("bash")
+            .arg("-c")
+            .arg("trap '' TERM; sleep 30")
+            .spawn()
+            .expect("spawn fixture child");
+        let target_pid = child.id();
+        // Give bash a moment to install the trap before we TERM it.
+        thread::sleep(Duration::from_millis(100));
+
+        let target = "sweep-cancel-target".to_string();
+        let other = "sweep-concurrent-reader".to_string();
+        {
+            let mut reg = registry.lock().unwrap();
+            let target_log = reg.compute_log_path(880);
+            let other_log = reg.compute_log_path(881);
+            reg.entries.insert(
+                target.clone(),
+                SweepInfo {
+                    sweep_id: target.clone(),
+                    kind: SweepKind::Issue(880),
+                    pid: target_pid,
+                    token_name: "unknown".into(),
+                    log_path: target_log,
+                    idempotency_key: None,
+                    started_at: Utc::now(),
+                    state: SweepState::Running,
+                    latest_phase: None,
+                    pr_number: None,
+                    model: None,
+                    effort: None,
+                    depends_on: None,
+                },
+            );
+            reg.entries.insert(
+                other.clone(),
+                SweepInfo {
+                    sweep_id: other.clone(),
+                    kind: SweepKind::Issue(881),
+                    pid: 2_147_483_640, // ~i32::MAX, harmless dead pid
+                    token_name: "unknown".into(),
+                    log_path: other_log,
+                    idempotency_key: None,
+                    started_at: Utc::now(),
+                    state: SweepState::Running,
+                    latest_phase: None,
+                    pr_number: None,
+                    model: None,
+                    effort: None,
+                    depends_on: None,
+                },
+            );
+        }
+
+        // 1s grace: long enough that a lock held throughout would clearly
+        // block the concurrent read for ~1s, short enough to keep the test fast.
+        let grace = Duration::from_millis(1000);
+
+        // Thread A: run the split orchestration (mirrors the IPC handler),
+        // releasing the mutex between the 100ms poll sleeps.
+        let reg_a = Arc::clone(&registry);
+        let target_a = target.clone();
+        let canceller = thread::spawn(move || {
+            let (pid, kind, started_at) =
+                match reg_a.lock().unwrap().begin_cancel(&target_a).unwrap() {
+                    BeginCancel::Signalled {
+                        pid,
+                        kind,
+                        started_at,
+                    } => (pid, kind, started_at),
+                    BeginCancel::AlreadyTerminal(_) => panic!("target should be running"),
+                };
+            let deadline = std::time::Instant::now() + grace;
+            let mut exited = reg_a.lock().unwrap().poll_cancel(&target_a, pid);
+            while !exited && std::time::Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(100));
+                exited = reg_a.lock().unwrap().poll_cancel(&target_a, pid);
+            }
+            reg_a
+                .lock()
+                .unwrap()
+                .finish_cancel(&target_a, pid, &kind, started_at, exited)
+        });
+
+        // Let thread A send SIGTERM and enter the (unlocked) poll loop.
+        thread::sleep(Duration::from_millis(150));
+
+        // Concurrent read on the OTHER sweep: must return well under the grace
+        // window because the poll loop releases the mutex between polls.
+        let start = std::time::Instant::now();
+        let info = registry.lock().unwrap().get_status(&other);
+        let elapsed = start.elapsed();
+        assert!(info.is_some(), "other sweep should still be queryable");
+        assert!(
+            elapsed < Duration::from_millis(400),
+            "concurrent get_status blocked for {elapsed:?} — the registry mutex \
+             was held across the grace window (grace was {grace:?})"
+        );
+
+        let outcome = canceller.join().expect("cancel thread panicked");
+        assert!(outcome.was_running);
+        assert!(
+            outcome.sigkill_sent,
+            "trap-TERM child should have survived SIGTERM and escalated to SIGKILL"
+        );
+
+        // Reap the zombie so the PID leaves the process table.
+        let exit_status = child.wait().expect("wait on cancelled child");
+        assert!(!exit_status.success(), "child should not have exited cleanly after SIGKILL");
+
+        let final_state = registry.lock().unwrap().get(&target).unwrap().state.clone();
+        assert!(matches!(final_state, SweepState::Exited { .. }));
     }
 
     #[test]

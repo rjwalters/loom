@@ -4,7 +4,7 @@ use crate::event_bus::EventBus;
 use crate::forge_parser::parse_forge_events;
 use crate::git_parser;
 use crate::git_utils;
-use crate::sweep_registry::SweepRegistry;
+use crate::sweep_registry::{BeginCancel, SweepRegistry};
 use crate::terminal::TerminalManager;
 use crate::types::{Event, Request, Response};
 use anyhow::Result;
@@ -204,6 +204,30 @@ async fn handle_client(
             break;
         }
 
+        // CancelSweep is handled here rather than in the synchronous
+        // `handle_request` dispatcher (Issue #3807): its SIGTERM → grace-poll
+        // → SIGKILL escalation must NOT hold the registry mutex across the
+        // (possibly multi-second) grace window, or it would freeze every
+        // other IPC request (ListSweeps / GetSweepStatus / DispatchSweep).
+        // The async handler below re-acquires the lock only for the brief
+        // begin / poll / finish steps and `await`s the sleep unlocked.
+        if let Request::CancelSweep {
+            sweep_id,
+            grace_secs,
+        } = request
+        {
+            let response = cancel_sweep_nonblocking(
+                &sweep_registry,
+                &sweep_id,
+                Duration::from_secs(grace_secs),
+            )
+            .await;
+            let response_json = serde_json::to_string(&response)?;
+            writer.write_all(response_json.as_bytes()).await?;
+            writer.write_all(b"\n").await?;
+            continue;
+        }
+
         let response =
             handle_request(request, &terminal_manager, &activity_db, &sweep_registry, &event_bus);
 
@@ -264,6 +288,98 @@ async fn stream_events(
         }
     }
     Ok(())
+}
+
+/// Cancel a sweep WITHOUT holding the registry mutex across the grace
+/// poll/sleep window (Issue #3807).
+///
+/// The blocking `SweepRegistry::cancel` holds `&mut self` — and therefore the
+/// `Mutex<SweepRegistry>` — for the whole SIGTERM → grace-poll → SIGKILL
+/// escalation, so a `grace_secs = 30` cancel would freeze every other IPC
+/// request (ListSweeps / GetSweepStatus / DispatchSweep) for up to 30s. This
+/// async orchestration instead re-acquires the lock only for three brief,
+/// non-blocking steps:
+///
+/// 1. `begin_cancel` — read pid/kind/liveness + SIGTERM the process group.
+/// 2. `poll_cancel` — one liveness poll (reaps on exit, #3801), once per tick.
+/// 3. `finish_cancel` — SIGKILL decision + reap + terminal transition + events.
+///
+/// The 100ms sleep between polls runs UNLOCKED via `tokio::time::sleep`, so the
+/// registry mutex is free for other clients for the entire grace window. The
+/// synchronous `SweepCancelled` response contract (`sigkill_sent`, `was_running`,
+/// `pid`) is preserved — the caller still gets a completed-cancel ack.
+// Allow expect_used: a poisoned registry mutex means another thread panicked
+// while holding the lock — unrecoverable, so we crash (same policy as
+// `handle_request`).
+#[allow(clippy::expect_used)]
+async fn cancel_sweep_nonblocking(
+    sweep_registry: &Arc<Mutex<SweepRegistry>>,
+    sweep_id: &str,
+    grace: Duration,
+) -> Response {
+    // Step 1: begin (lock-scoped). Read state + SIGTERM, then release.
+    let began = {
+        let mut sr = sweep_registry
+            .lock()
+            .expect("Sweep registry mutex poisoned");
+        sr.begin_cancel(sweep_id)
+    };
+    let (pid, kind, started_at) = match began {
+        Ok(BeginCancel::AlreadyTerminal(outcome)) => {
+            return Response::SweepCancelled {
+                sweep_id: outcome.sweep_id,
+                pid: outcome.pid,
+                sigkill_sent: outcome.sigkill_sent,
+                was_running: outcome.was_running,
+            };
+        }
+        Ok(BeginCancel::Signalled {
+            pid,
+            kind,
+            started_at,
+        }) => (pid, kind, started_at),
+        Err(e) => {
+            return Response::Error {
+                message: format!("cancel_sweep failed: {e}"),
+            };
+        }
+    };
+
+    // Step 2: poll for exit up to the grace window. Each poll takes the lock
+    // only briefly; the sleep between polls is awaited UNLOCKED so concurrent
+    // IPC requests are serviced promptly.
+    let poll_interval = Duration::from_millis(100);
+    let deadline = tokio::time::Instant::now() + grace;
+    let mut exited_within_grace = {
+        let mut sr = sweep_registry
+            .lock()
+            .expect("Sweep registry mutex poisoned");
+        sr.poll_cancel(sweep_id, pid)
+    };
+    while !exited_within_grace && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(poll_interval).await;
+        exited_within_grace = {
+            let mut sr = sweep_registry
+                .lock()
+                .expect("Sweep registry mutex poisoned");
+            sr.poll_cancel(sweep_id, pid)
+        };
+    }
+
+    // Step 3: finish (lock-scoped). SIGKILL decision + reap + terminal
+    // transition + event emission.
+    let outcome = {
+        let mut sr = sweep_registry
+            .lock()
+            .expect("Sweep registry mutex poisoned");
+        sr.finish_cancel(sweep_id, pid, &kind, started_at, exited_within_grace)
+    };
+    Response::SweepCancelled {
+        sweep_id: outcome.sweep_id,
+        pid: outcome.pid,
+        sigkill_sent: outcome.sigkill_sent,
+        was_running: outcome.was_running,
+    }
 }
 
 // Allow expect_used because mutex poisoning is a panic-level error that indicates
@@ -919,6 +1035,12 @@ fn handle_request(
             sweep_id,
             grace_secs,
         } => {
+            // Production traffic never reaches this arm: `handle_client`
+            // intercepts `CancelSweep` and services it via the non-blocking
+            // async `cancel_sweep_nonblocking` (Issue #3807) so the grace
+            // window does not hold the registry mutex. This synchronous
+            // fallback (holding the lock across the full grace) remains for
+            // direct/unit-test callers where lock contention is irrelevant.
             let mut sr = sweep_registry
                 .lock()
                 .expect("Sweep registry mutex poisoned");
