@@ -1664,6 +1664,13 @@ assert_deny "Fast path security: 'find … -delete' is NOT fast-pathed (#3772)" 
     "find . -iname '$_FP_DDL' -delete"
 assert_deny "Fast path security: 'find … -exec' is NOT fast-pathed (#3772)" \
     "find . -iname '$_FP_DDL' -exec rm {} \\;"
+# -fls is a FILE-WRITING action-primary (the -ls-format sibling of -fprint*):
+# `find … -fls FILE` truncates/overwrites FILE with the listing on both GNU and
+# BSD/macOS find. It must disqualify fast-path eligibility exactly like its
+# -fprint* siblings — a silent fast-path allow here would bypass every deny/ask
+# check and violate the read-only invariant.
+assert_deny "Fast path security: 'find … -fls' is NOT fast-pathed (#3772)" \
+    "find . -iname '$_FP_DDL' -fls out.txt"
 
 # --- Security: compound / substitution / redirection / wrapper / non-bare forms
 #     are NOT eligible and keep their exact pre-existing verdict via the full

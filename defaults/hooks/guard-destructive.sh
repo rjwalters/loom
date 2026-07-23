@@ -171,7 +171,7 @@ fi
 #          mutation surface at all, #3772)
 #        find                      (admitted for any args EXCEPT when a dangerous
 #          action-primary is present: -delete, -exec, -execdir, -ok, -okdir,
-#          -fprint, -fprint0, -fprintf. Any of those disqualifies eligibility
+#          -fls, -fprint, -fprint0, -fprintf. Any of those disqualifies eligibility
 #          and falls through to the full path — structural, not content-scanned,
 #          so a future `find -delete` deny rule is never silently bypassed, #3772)
 #        gh <noun> view|list       (never delete/close/archive/…)
@@ -291,7 +291,7 @@ fastpath_builtin_admits() {
             local i
             for (( i = 1; i < n; i++ )); do
                 case "${t[i]}" in
-                    -delete|-exec|-execdir|-ok|-okdir|-fprint|-fprint0|-fprintf)
+                    -delete|-exec|-execdir|-ok|-okdir|-fls|-fprint|-fprint0|-fprintf)
                         return 1
                         ;;
                 esac
