@@ -6,8 +6,8 @@ calls skip these tokens.
 
 The file is shared across concurrent bash and Python writers. We coordinate
 with a sibling ``.bad_tokens.lock`` directory, created via ``mkdir`` (POSIX
-atomic). ``flock`` is intentionally not used because it is unavailable on
-stock macOS.
+atomic) — see ``loom_tools.tokens._locking.MkdirLock``. ``flock`` is
+intentionally not used because it is unavailable on stock macOS.
 
 File format (one entry per line):
     <ISO8601 UTC timestamp> <token_name> <reason words...>
@@ -19,63 +19,10 @@ collide.
 from __future__ import annotations
 
 import re
-import time
 from datetime import datetime, timezone
 from pathlib import Path
 
-# Lock parameters
-_LOCK_TIMEOUT_SECONDS = 5.0
-_LOCK_POLL_INTERVAL = 0.1
-_STALE_LOCK_THRESHOLD_SECONDS = 30.0
-
-
-class _MkdirLock:
-    """Context manager wrapping a directory-as-lock.
-
-    Acquires by creating ``lock_path``. Times out after _LOCK_TIMEOUT_SECONDS.
-    Cleans up stale locks (older than _STALE_LOCK_THRESHOLD_SECONDS) before
-    giving up.
-
-    Always releases the lock on ``__exit__`` (via rmdir). If the lock was
-    never acquired (timeout), ``__exit__`` is a no-op.
-    """
-
-    def __init__(self, lock_path: Path):
-        self._lock_path = lock_path
-        self._acquired = False
-
-    def __enter__(self) -> "_MkdirLock":
-        deadline = time.monotonic() + _LOCK_TIMEOUT_SECONDS
-        while time.monotonic() < deadline:
-            try:
-                self._lock_path.mkdir(parents=False, exist_ok=False)
-                self._acquired = True
-                return self
-            except FileExistsError:
-                # Stale-lock cleanup
-                try:
-                    age = time.time() - self._lock_path.stat().st_mtime
-                    if age > _STALE_LOCK_THRESHOLD_SECONDS:
-                        try:
-                            self._lock_path.rmdir()
-                        except OSError:
-                            pass
-                except FileNotFoundError:
-                    # Lock vanished between checks; loop and retry mkdir
-                    continue
-                time.sleep(_LOCK_POLL_INTERVAL)
-        raise TimeoutError(
-            f"Could not acquire bad_tokens lock at {self._lock_path} "
-            f"within {_LOCK_TIMEOUT_SECONDS}s"
-        )
-
-    def __exit__(self, exc_type, exc_val, exc_tb) -> None:
-        if self._acquired:
-            try:
-                self._lock_path.rmdir()
-            except OSError:
-                # Lock already gone — log-friendly silent
-                pass
+from loom_tools.tokens._locking import MkdirLock as _MkdirLock
 
 
 def _bad_tokens_path(tokens_dir: Path) -> Path:

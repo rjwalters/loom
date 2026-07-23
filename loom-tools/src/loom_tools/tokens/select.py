@@ -1,11 +1,14 @@
 """Token selection algorithm — 3-tier priority.
 
 Selection order:
-    1. Ranking file (.ranking, <10 min old): pick randomly among the top-N
-       non-exhausted/non-blocked accounts (default N=3, configurable via
-       ``LOOM_TOKEN_SPREAD_TOP_N`` / ``tokens.spreadTopN``; N=1 = greedy
-       first-eligible), skipping bad tokens. Spreading across the top-N
-       avoids concurrent spawners colliding on .ranking[0] (issue #3736).
+    1. Ranking file (.ranking, <10 min old): rotate one-per-account across the
+       available (non-exhausted/non-blocked/non-bad) ranked accounts using a
+       persistent rotation cursor, so a burst of N concurrent dispatches spreads
+       across ``min(N, available)`` distinct accounts rather than stacking on the
+       single best-ranked (issue #3909, superseding the earlier random top-N
+       spread of #3736). The rotation window spans *all* available accounts by
+       default; ``LOOM_TOKEN_SPREAD_TOP_N`` / ``tokens.spreadTopN`` optionally
+       caps it to the top-N most-available (N=1 = greedy first-eligible).
     2. Allowlist file (.allowlist): random pick from allowed accounts.
     3. Random pick from all .token files.
 
@@ -45,6 +48,7 @@ from typing import Iterable
 
 from loom_tools.common.config import env_int
 from loom_tools.tokens.bad_tokens import is_bad
+from loom_tools.tokens.rotation import next_rotation_index
 
 # Ranking file is considered fresh for this many seconds.
 _RANKING_FRESH_SECONDS = 600  # 10 min
@@ -52,11 +56,14 @@ _RANKING_FRESH_SECONDS = 600  # 10 min
 # Exit code when no token is available (matches sysexits.h EX_CONFIG)
 EX_CONFIG = 78
 
-# Default number of top-ranked eligible accounts to spread spawns across.
-# See issue #3736: picking only .ranking[0] deterministically collides
-# concurrent spawners (e.g. sibling daemons on a shared claude-monitor pool)
-# onto the single least-utilized account, tripping its session limit.
-_DEFAULT_SPREAD_TOP_N = 3
+# Rotation window cap for the ranked tier. ``None`` (the default) means "rotate
+# across *all* available accounts" — issue #3909: distributing concurrent
+# dispatches one-per-account across every available account (not just a top-N
+# slice) is what lets the pool run at full speed and drain evenly. A positive
+# ``LOOM_TOKEN_SPREAD_TOP_N`` / ``tokens.spreadTopN`` optionally caps the window
+# to the top-N most-available accounts (N=1 = greedy first-eligible, the
+# historical behavior); a value <= 0 also means unbounded.
+_DEFAULT_SPREAD_TOP_N: int | None = None
 
 
 class TokenSelectionError(Exception):
@@ -135,29 +142,32 @@ def _read_allowlist(allowlist_file: Path) -> list[str]:
     return out
 
 
-def _resolve_spread_top_n(workspace_path: Path) -> int:
-    """Resolve the top-N spread window for the ranked strategy.
+def _resolve_spread_top_n(workspace_path: Path) -> int | None:
+    """Resolve the rotation-window cap for the ranked strategy.
 
     Precedence (highest first), mirroring the nested-key + env-override
     precedent in ``common/paths.py`` and ``common/gitea.py``:
 
         1. ``LOOM_TOKEN_SPREAD_TOP_N`` env var.
         2. ``.loom/config.json`` -> ``tokens.spreadTopN`` (soft-fail read).
-        3. Default (``_DEFAULT_SPREAD_TOP_N`` = 3).
+        3. Default (``_DEFAULT_SPREAD_TOP_N`` = ``None`` = unbounded).
 
-    Values are clamped to ``>= 1``. ``N == 1`` restores the historical greedy
-    first-eligible behavior exactly (back-compat escape hatch).
+    Returns the positive cap, or ``None`` meaning "rotate across all available
+    accounts" (issue #3909). A configured value ``<= 0`` also means unbounded.
+    ``N == 1`` restores the historical greedy first-eligible behavior exactly
+    (back-compat escape hatch).
     """
     # 1. Env var override (highest precedence).
     if os.environ.get("LOOM_TOKEN_SPREAD_TOP_N") is not None:
-        return max(1, env_int("LOOM_TOKEN_SPREAD_TOP_N", default=_DEFAULT_SPREAD_TOP_N))
+        n = env_int("LOOM_TOKEN_SPREAD_TOP_N", default=0)
+        return n if n >= 1 else None
 
     # 2. Config key — .loom/config.json -> tokens.spreadTopN (soft-fail read).
     config_n = _read_config_spread_top_n(workspace_path)
     if config_n is not None:
-        return max(1, config_n)
+        return config_n if config_n >= 1 else None
 
-    # 3. Default.
+    # 3. Default (unbounded).
     return _DEFAULT_SPREAD_TOP_N
 
 
@@ -192,24 +202,28 @@ def _try_ranking(
     workspace_path: Path,
     rng: random.Random,
 ) -> SelectedToken | None:
-    """Strategy 1: read .ranking, pick randomly among the top-N eligible entries.
+    """Strategy 1: read .ranking, rotate one-per-account across eligible entries.
 
-    Historically this returned the *first* non-exhausted/non-blocked entry.
-    Because ``.ranking`` is ordered most-available-first, every concurrent
-    spawner reading a fresh ranking picked the identical account, serializing
-    load onto one account and tripping its session limit (issue #3736).
+    Historically this returned the *first* non-exhausted/non-blocked entry, so
+    every concurrent spawner reading a fresh ranking picked the identical
+    account, serializing load onto one account (issue #3736). #3736 mitigated
+    this with a random pick among the top-N; but a burst of N concurrent
+    dispatches still stacked several onto the same account, exhausting its 5h
+    limit while others idled (issue #3909).
 
-    We now collect up to the top-N eligible ranked entries (skipping
-    exhausted/blocked/bad/missing/empty tokens, preserving ranking order) and
-    ``rng.choice`` among them, spreading concurrent spawners across the most
-    available accounts while still preferring healthy ones. N is resolved via
-    ``_resolve_spread_top_n``; ``N == 1`` restores the old greedy behavior.
+    We now collect the eligible ranked entries (skipping exhausted/blocked/bad/
+    missing/empty tokens, preserving most-available-first ranking order) and
+    select via a persistent rotation cursor, so consecutive selections — whether
+    sequential or concurrent — round-robin one-per-account across all available
+    accounts, in rotating order. The window spans every eligible account by
+    default; ``_resolve_spread_top_n`` optionally caps it to the top-N
+    most-available (``N == 1`` restores the greedy first-eligible behavior).
     """
     age = _file_age_seconds(ranking_file)
     if age is None or age >= _RANKING_FRESH_SECONDS:
         return None
 
-    top_n = _resolve_spread_top_n(workspace_path)
+    cap = _resolve_spread_top_n(workspace_path)
     eligible: list[SelectedToken] = []
     for name, status in _read_ranking(ranking_file):
         if status in ("exhausted", "blocked"):
@@ -228,12 +242,13 @@ def _try_ranking(
         eligible.append(
             SelectedToken(name=name, file=token_file, key=key, mode="ranked"),
         )
-        if len(eligible) >= top_n:
+        if cap is not None and len(eligible) >= cap:
             break
 
     if not eligible:
         return None
-    return rng.choice(eligible)
+    index = next_rotation_index(tokens_dir, len(eligible), rng)
+    return eligible[index]
 
 
 def _stale_ranking_exclusions(ranking_file: Path) -> set[str]:
