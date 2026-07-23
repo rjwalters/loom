@@ -444,11 +444,29 @@ pub fn build_daemon_status(
     let disk_headroom = crate::disk_headroom::disk_headroom_limit(&workspace_root);
     let wf_config = crate::work_finder::read_work_finder_config(&workspace_root);
     let configured_max = crate::work_finder::resolve_max_concurrent_with_config(&wf_config);
+
+    // Token-capacity backpressure (#3902): back the token axis off from the flat
+    // pool count toward the count of *healthy* accounts read from the rotation
+    // ranking. When no ranking exists, `token_axis_limit` == the raw pool size,
+    // so the dynamic cap is byte-for-byte the pre-#3902 value.
+    let ranking = crate::capacity::read_ranking(&workspace_root);
+    let token_axis_limit = ranking.as_ref().map_or(token_pool_size, |r| r.available);
     let dynamic_cap = crate::work_finder::resolve_dynamic_max_concurrent(
-        token_pool_size,
+        token_axis_limit,
         disk_headroom,
         configured_max,
     );
+    let token_bound = token_axis_limit <= disk_headroom && token_axis_limit <= configured_max;
+    let capacity = crate::types::CapacityReport {
+        ranking_present: ranking.is_some(),
+        total_accounts: ranking.as_ref().map_or(token_pool_size, |r| r.total),
+        healthy_accounts: ranking.as_ref().map_or(token_pool_size, |r| r.available),
+        exhausted_accounts: ranking
+            .as_ref()
+            .map_or(0, crate::capacity::RankingSnapshot::unhealthy),
+        token_axis_limit,
+        token_bound,
+    };
 
     DaemonStatusReport {
         in_flight,
@@ -457,6 +475,7 @@ pub fn build_daemon_status(
         configured_max,
         dynamic_cap,
         main_health_gate_halted: main_health_state.is_halted(),
+        capacity,
     }
 }
 
@@ -1891,8 +1910,16 @@ exit 0
             token_pool_size: 4,
             disk_headroom: 10,
             configured_max: 5,
-            dynamic_cap: 4,
+            dynamic_cap: 3,
             main_health_gate_halted: true,
+            capacity: crate::types::CapacityReport {
+                ranking_present: true,
+                total_accounts: 4,
+                healthy_accounts: 3,
+                exhausted_accounts: 1,
+                token_axis_limit: 3,
+                token_bound: true,
+            },
         };
         let resp = Response::DaemonStatus(report);
         let json = serde_json::to_string(&resp).expect("serialize response");
@@ -1902,12 +1929,30 @@ exit 0
                 assert_eq!(r.token_pool_size, 4);
                 assert_eq!(r.disk_headroom, 10);
                 assert_eq!(r.configured_max, 5);
-                assert_eq!(r.dynamic_cap, 4);
+                assert_eq!(r.dynamic_cap, 3);
                 assert!(r.main_health_gate_halted);
                 assert!(r.in_flight.is_empty());
+                assert!(r.capacity.ranking_present);
+                assert_eq!(r.capacity.healthy_accounts, 3);
+                assert_eq!(r.capacity.exhausted_accounts, 1);
+                assert_eq!(r.capacity.token_axis_limit, 3);
+                assert!(r.capacity.token_bound);
             }
             other => panic!("Expected DaemonStatus, got: {other:?}"),
         }
+    }
+
+    /// A pre-#3902 `DaemonStatus` JSON payload (no `capacity` field) still
+    /// deserializes — `#[serde(default)]` fills the capacity section.
+    #[test]
+    fn test_daemon_status_backward_compat_missing_capacity() {
+        let legacy = r#"{"in_flight":[],"token_pool_size":2,"disk_headroom":9,"configured_max":3,"dynamic_cap":2,"main_health_gate_halted":false}"#;
+        let report: DaemonStatusReport =
+            serde_json::from_str(legacy).expect("legacy payload deserializes");
+        assert_eq!(report.token_pool_size, 2);
+        assert!(!report.capacity.ranking_present);
+        assert_eq!(report.capacity.healthy_accounts, 0);
+        assert!(!report.capacity.token_bound);
     }
 
     /// `build_daemon_status` reflects the shared main-health halt flag and lists

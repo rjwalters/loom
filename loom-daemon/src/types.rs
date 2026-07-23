@@ -563,6 +563,38 @@ pub struct DaemonStatusReport {
     /// dispatch (in-flight sweeps keep running); `false` means dispatch is
     /// allowed. Always `false` when the gate loop is not enabled.
     pub main_health_gate_halted: bool,
+    /// Token-capacity backpressure snapshot (#3902): account health derived from
+    /// the rotation ranking (`.loom/tokens/.ranking`) and whether the token axis
+    /// is the binding constraint on the dynamic cap. `#[serde(default)]` keeps
+    /// pre-#3902 wire data / older clients compatible.
+    #[serde(default)]
+    pub capacity: CapacityReport,
+}
+
+/// The token-capacity section of [`DaemonStatusReport`] (#3902).
+///
+/// Derived from the rotation ranking file (`.loom/tokens/.ranking`) — a fast
+/// filesystem read, no network probe. When no ranking exists (`ranking_present`
+/// is `false`) the health counts are zero and `token_axis_limit` equals the raw
+/// token-pool size (byte-for-byte the pre-#3902 dynamic-cap basis).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CapacityReport {
+    /// Whether a ranking file was found and parsed. `false` ⇒ the other fields
+    /// fall back to the raw pool (no probe data).
+    pub ranking_present: bool,
+    /// Total accounts listed in the ranking (or the raw pool size when absent).
+    pub total_accounts: usize,
+    /// Healthy (`available`) accounts — the dispatchable set.
+    pub healthy_accounts: usize,
+    /// Unhealthy (exhausted / rate-limited / blocked) accounts.
+    pub exhausted_accounts: usize,
+    /// The health-adjusted token-axis concurrency limit: `healthy_accounts` when
+    /// a ranking exists, else the raw token-pool size. This is what the work
+    /// finder now feeds into the dynamic cap in place of the flat pool count.
+    pub token_axis_limit: usize,
+    /// Whether the token axis is the binding (minimum) constraint on the dynamic
+    /// cap — i.e. tokens, not disk or the operator ceiling, are the bottleneck.
+    pub token_bound: bool,
 }
 
 // ========================================================================
@@ -625,6 +657,29 @@ pub enum Event {
         /// observability so subscribers see the source state directly.
         state: String,
     },
+    /// `daemon.capacity.advisory` — the autonomous work finder crossed (or
+    /// cleared) a token-capacity pressure threshold. Published by the work-finder
+    /// loop on **state change only** (entered/left the token-bound state), never
+    /// every tick. Authorized by #3902 (epic #3809). Advisory only — it never
+    /// blocks dispatch; it tells the operator when to add accounts / API credits.
+    CapacityAdvisory {
+        /// True when entering the pressured state; false on recovery.
+        pressured: bool,
+        /// Issues queued (deferred) behind the token-bound cap at the transition.
+        queued: usize,
+        /// Healthy (`available`) accounts at the transition.
+        healthy_accounts: usize,
+        /// Unhealthy (exhausted / rate-limited / blocked) accounts.
+        exhausted_accounts: usize,
+        /// Total accounts in the rotation ranking at the transition.
+        total_accounts: usize,
+        /// Estimated minutes to drain the backlog at current healthy capacity;
+        /// omitted when no healthy account exists (cannot drain yet).
+        #[serde(skip_serializing_if = "Option::is_none")]
+        estimated_drain_minutes: Option<u64>,
+        /// Operator-facing advisory message naming the concrete levers.
+        message: String,
+    },
     /// Synthetic event signalling that the subscription fell behind the
     /// publisher. The number of events dropped is reported in `skipped`.
     /// Matches `tokio::sync::broadcast::Receiver::Lagged` semantics.
@@ -652,6 +707,7 @@ impl Event {
     /// | `SweepGlobalDispatch {..}` | `sweep.global.dispatch` |
     /// | `SweepGlobalCompleted {..}` | `sweep.global.completed` |
     /// | `EpicAction {epic, action, ..}` | `epic.issue.{epic}.{action}` |
+    /// | `CapacityAdvisory {..}` | `daemon.capacity.advisory` |
     /// | `TopicLag {..}` | `sweep.system.topic_lag` |
     /// | `Generic {topic, ..}` | the explicit topic string |
     #[must_use]
@@ -666,6 +722,7 @@ impl Event {
             Self::EpicAction { epic, action, .. } => {
                 format!("epic.issue.{epic}.{}", action.as_str())
             }
+            Self::CapacityAdvisory { .. } => "daemon.capacity.advisory".to_string(),
             Self::TopicLag { .. } => "sweep.system.topic_lag".to_string(),
             Self::Generic { topic, .. } => topic.clone(),
         }

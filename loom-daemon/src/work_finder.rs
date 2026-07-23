@@ -79,9 +79,12 @@ use std::time::Duration;
 
 use anyhow::Result;
 
+use crate::capacity::{self, CapacityAdvisory};
 use crate::disk_headroom::disk_headroom_limit;
+use crate::event_bus::EventBus;
 use crate::main_health_gate::MainHealthState;
 use crate::tokens::token_pool_size;
+use crate::types::Event;
 
 // ============================================================================
 // Constants
@@ -522,6 +525,7 @@ pub fn spawn_work_finder_task<S, D>(
     workspace_root: PathBuf,
     configured_max: usize,
     health_state: Arc<MainHealthState>,
+    event_bus: Arc<EventBus>,
 ) -> tokio::task::JoinHandle<()>
 where
     S: WorkSource + Send + 'static,
@@ -529,7 +533,7 @@ where
 {
     log::info!(
         "work_finder: starting loop (interval={}s, configured_max={configured_max}, \
-         dynamic cap = min(pool, disk, configured_max))",
+         dynamic cap = min(healthy tokens, disk, configured_max))",
         interval.as_secs()
     );
     tokio::spawn(async move {
@@ -539,18 +543,27 @@ where
         // Track the halt state across ticks so we log the halt/resume edges
         // once per halted period, not once per skipped tick.
         let mut was_halted = false;
+        // Token-capacity pressure state (#3902), tracked across ticks so the
+        // add-capacity advisory / recovery fires only on state change, never
+        // every tick.
+        let mut was_pressured = false;
         loop {
             ticker.tick().await;
             // Reactive main-health backstop (Phase C, #3812): skip all dispatch
             // while the gate reports a red `main`.
             let halted = health_state.is_halted();
-            // Recompute the dynamic cap from live inputs every tick (Phase B).
+            // Recompute the dynamic cap from live inputs every tick (Phase B),
+            // now with token-capacity backpressure (#3902): the token axis is the
+            // count of *healthy* accounts from the ranking, not the flat pool.
             let pool_size = token_pool_size(&workspace_root);
+            let ranking = capacity::read_ranking(&workspace_root);
+            let token_limit = ranking.as_ref().map_or(pool_size, |r| r.available);
             let disk = disk_headroom_limit(&workspace_root);
-            let max_concurrent = resolve_dynamic_max_concurrent(pool_size, disk, configured_max);
+            let max_concurrent = resolve_dynamic_max_concurrent(token_limit, disk, configured_max);
             log::debug!(
-                "work_finder: dynamic cap = {max_concurrent} (pool={pool_size}, disk={disk}, \
-                 configured_max={configured_max}, halted={halted})"
+                "work_finder: dynamic cap = {max_concurrent} (pool={pool_size}, \
+                 healthy_tokens={token_limit}, disk={disk}, configured_max={configured_max}, \
+                 halted={halted})"
             );
             match tick(&mut source, &mut dispatcher, max_concurrent, halted) {
                 Ok(report) => {
@@ -567,8 +580,9 @@ where
                     if report.dispatched > 0 || report.errors > 0 {
                         log::info!(
                             "work_finder: tick — cap {max_concurrent} (pool={pool_size}, \
-                             disk={disk}, ceiling={configured_max}); {} seen, {} dispatched, \
-                             {} labeled-skip, {} in-flight-skip, {} deferred, {} error(s)",
+                             healthy={token_limit}, disk={disk}, ceiling={configured_max}); \
+                             {} seen, {} dispatched, {} labeled-skip, {} in-flight-skip, \
+                             {} deferred, {} error(s)",
                             report.seen,
                             report.dispatched,
                             report.skipped_labeled,
@@ -577,6 +591,22 @@ where
                             report.errors
                         );
                     }
+                    // Token-capacity advisory (#3902) — surface on state change.
+                    // Skip while halted: a red-main halt defers everything, so the
+                    // token axis is not the (relevant) bottleneck this tick.
+                    if !report.halted {
+                        let assessment = capacity::assess_pressure(
+                            ranking.as_ref(),
+                            pool_size,
+                            token_limit,
+                            disk,
+                            configured_max,
+                            report.deferred_capacity,
+                            capacity::DEFAULT_ADVISORY_MIN_QUEUED,
+                        );
+                        was_pressured =
+                            emit_capacity_transition(&event_bus, was_pressured, &assessment);
+                    }
                 }
                 Err(e) => {
                     log::warn!("work_finder: tick failed to list ready issues: {e}");
@@ -584,6 +614,52 @@ where
             }
         }
     })
+}
+
+/// Emit the add-capacity advisory / recovery on a token-pressure **state
+/// change** and return the new pressured state. A no-op (returns `was_pressured`
+/// unchanged) when the state is stable, so the operator sees one advisory on the
+/// way in and one recovery on the way out — never a per-tick stream (#3902).
+///
+/// Each transition is surfaced on all three operator channels required by the
+/// issue: the daemon log, the `daemon.capacity.advisory` event-bus topic, and —
+/// via the recomputed [`crate::types::CapacityReport`] — the daemon status view.
+fn emit_capacity_transition(
+    event_bus: &Arc<EventBus>,
+    was_pressured: bool,
+    assessment: &capacity::PressureAssessment,
+) -> bool {
+    if assessment.pressured && !was_pressured {
+        let advisory = CapacityAdvisory::pressure(assessment);
+        log::warn!("work_finder: {}", advisory.message);
+        publish_capacity_advisory(event_bus, &advisory);
+        true
+    } else if !assessment.pressured && was_pressured {
+        let advisory = CapacityAdvisory::recovery(assessment);
+        log::info!("work_finder: {}", advisory.message);
+        publish_capacity_advisory(event_bus, &advisory);
+        false
+    } else {
+        was_pressured
+    }
+}
+
+/// Publish a [`CapacityAdvisory`] on the `daemon.capacity.advisory` topic.
+/// Fire-and-forget: a `NoSubscribers` result is logged at debug and ignored
+/// (matching the daemon's other publish sites).
+fn publish_capacity_advisory(event_bus: &Arc<EventBus>, advisory: &CapacityAdvisory) {
+    let event = Event::CapacityAdvisory {
+        pressured: advisory.pressured,
+        queued: advisory.queued,
+        healthy_accounts: advisory.healthy_accounts,
+        exhausted_accounts: advisory.exhausted_accounts,
+        total_accounts: advisory.total_accounts,
+        estimated_drain_minutes: advisory.estimated_drain_minutes,
+        message: advisory.message.clone(),
+    };
+    if let Err(e) = event_bus.publish(event) {
+        log::debug!("work_finder: capacity advisory not delivered: {e}");
+    }
 }
 
 // ============================================================================
@@ -1316,5 +1392,138 @@ mod tests {
         std::env::set_var(WORK_FINDER_MAX_CONCURRENT_ENV, "nope");
         assert_eq!(resolve_max_concurrent_with_config(&cfg), 8);
         std::env::remove_var(WORK_FINDER_MAX_CONCURRENT_ENV);
+    }
+
+    // ===================================================================
+    // Token-capacity advisory transitions (#3902)
+    // ===================================================================
+
+    fn pressured_assessment() -> capacity::PressureAssessment {
+        // token_limit 1 < disk 10, ceiling 10; 12 deferred ⇒ token-bound + pressured.
+        let snap = capacity::RankingSnapshot {
+            total: 7,
+            available: 1,
+            exhausted: 6,
+            ..capacity::RankingSnapshot::default()
+        };
+        capacity::assess_pressure(
+            Some(&snap),
+            7,
+            1,
+            10,
+            10,
+            12,
+            capacity::DEFAULT_ADVISORY_MIN_QUEUED,
+        )
+    }
+
+    fn calm_assessment() -> capacity::PressureAssessment {
+        // Nothing deferred ⇒ not pressured (healthy pool).
+        let snap = capacity::RankingSnapshot {
+            total: 7,
+            available: 7,
+            ..capacity::RankingSnapshot::default()
+        };
+        capacity::assess_pressure(
+            Some(&snap),
+            7,
+            7,
+            10,
+            10,
+            0,
+            capacity::DEFAULT_ADVISORY_MIN_QUEUED,
+        )
+    }
+
+    #[test]
+    fn transition_enters_pressure_and_publishes_advisory() {
+        let bus = Arc::new(EventBus::new());
+        let mut sub = bus.subscribe(["daemon.capacity.advisory"]);
+        let a = pressured_assessment();
+        assert!(a.pressured);
+
+        // Not previously pressured ⇒ transition fires, returns true.
+        let now = emit_capacity_transition(&bus, false, &a);
+        assert!(now, "entered pressured state");
+
+        match sub.try_recv().expect("an advisory event was published") {
+            Event::CapacityAdvisory {
+                pressured,
+                queued,
+                healthy_accounts,
+                message,
+                ..
+            } => {
+                assert!(pressured);
+                assert_eq!(queued, 12);
+                assert_eq!(healthy_accounts, 1);
+                assert!(message.contains("loom-tokens bootstrap"));
+            }
+            other => panic!("expected CapacityAdvisory, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn transition_is_deduplicated_while_pressure_persists() {
+        let bus = Arc::new(EventBus::new());
+        let mut sub = bus.subscribe(["daemon.capacity.advisory"]);
+        let a = pressured_assessment();
+
+        // Already pressured ⇒ no new event, state stays true.
+        let now = emit_capacity_transition(&bus, true, &a);
+        assert!(now);
+        assert!(
+            matches!(sub.try_recv(), Err(crate::event_bus::RecvError::Empty)),
+            "no duplicate advisory while pressure persists"
+        );
+    }
+
+    #[test]
+    fn transition_recovers_and_publishes_symmetric_event() {
+        let bus = Arc::new(EventBus::new());
+        let mut sub = bus.subscribe(["daemon.capacity.advisory"]);
+        let calm = calm_assessment();
+
+        // Was pressured, now calm ⇒ recovery event, state returns to false.
+        let now = emit_capacity_transition(&bus, true, &calm);
+        assert!(!now, "left pressured state");
+
+        match sub.try_recv().expect("a recovery event was published") {
+            Event::CapacityAdvisory {
+                pressured, message, ..
+            } => {
+                assert!(!pressured);
+                assert!(message.contains("restored"));
+            }
+            other => panic!("expected CapacityAdvisory recovery, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn transition_stays_calm_when_never_pressured() {
+        let bus = Arc::new(EventBus::new());
+        let mut sub = bus.subscribe(["daemon.capacity.advisory"]);
+        let calm = calm_assessment();
+
+        let now = emit_capacity_transition(&bus, false, &calm);
+        assert!(!now);
+        assert!(
+            matches!(sub.try_recv(), Err(crate::event_bus::RecvError::Empty)),
+            "no event when staying calm"
+        );
+    }
+
+    #[test]
+    fn capacity_advisory_event_topic() {
+        let ev = Event::CapacityAdvisory {
+            pressured: true,
+            queued: 3,
+            healthy_accounts: 1,
+            exhausted_accounts: 6,
+            total_accounts: 7,
+            estimated_drain_minutes: Some(90),
+            message: "x".to_string(),
+        };
+        assert_eq!(ev.topic(), "daemon.capacity.advisory");
     }
 }

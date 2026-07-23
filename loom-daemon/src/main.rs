@@ -381,6 +381,7 @@ async fn main() -> Result<()> {
             sweep_workspace.clone(),
             configured_max,
             main_health_state.clone(),
+            event_bus.clone(),
         ))
     } else {
         log::debug!("work_finder: disabled (set LOOM_WORK_FINDER=1 to enable)");
@@ -885,6 +886,14 @@ fn print_status_json(
             "configured_max": report.configured_max,
             "effective": report.dynamic_cap,
         },
+        "capacity": {
+            "ranking_present": report.capacity.ranking_present,
+            "total_accounts": report.capacity.total_accounts,
+            "healthy_accounts": report.capacity.healthy_accounts,
+            "exhausted_accounts": report.capacity.exhausted_accounts,
+            "token_axis_limit": report.capacity.token_axis_limit,
+            "token_bound": report.capacity.token_bound,
+        },
         "main_health_gate": {
             "halted": report.main_health_gate_halted,
         },
@@ -919,9 +928,41 @@ fn print_status_human(report: &DaemonStatusReport, token_usage: Option<&serde_js
 
     println!("\nDynamic concurrency cap: {}", report.dynamic_cap);
     println!(
-        "  = min(token pool {}, disk headroom {}, configured max {})",
-        report.token_pool_size, report.disk_headroom, report.configured_max
+        "  = min(healthy tokens {}, disk headroom {}, configured max {})",
+        report.capacity.token_axis_limit, report.disk_headroom, report.configured_max
     );
+
+    // Token-capacity backpressure section (#3902).
+    let cap = &report.capacity;
+    println!("\nToken capacity:");
+    if cap.ranking_present {
+        println!(
+            "  {}/{} accounts healthy, {} exhausted/near-ceiling (from .loom/tokens/.ranking)",
+            cap.healthy_accounts, cap.total_accounts, cap.exhausted_accounts
+        );
+        if cap.token_bound {
+            if cap.healthy_accounts == 0 {
+                println!(
+                    "  token-bound: NO healthy accounts — new dispatch deferred until capacity \
+                     returns. Add accounts (~/.claude-monitor/accounts.env + `loom-tokens \
+                     bootstrap`) or buy API credits, then `loom-tokens check --ranking`."
+                );
+            } else {
+                println!(
+                    "  token-bound: tokens are the binding constraint on throughput. Add accounts \
+                     or API credits to dispatch more concurrently."
+                );
+            }
+        } else {
+            println!("  not token-bound (tokens are not the current bottleneck)");
+        }
+    } else {
+        println!(
+            "  (no ranking — run `loom-tokens check --ranking`; token pool size {} used as the \
+             health basis)",
+            report.token_pool_size
+        );
+    }
 
     let gate = if report.main_health_gate_halted {
         "HALTED (main is red — new dispatch paused; in-flight sweeps keep running)"
