@@ -329,13 +329,13 @@ STALE_THRESHOLD_HOURS=2       # Hours before no-PR issue is stale
 STALE_WITH_PR_HOURS=24        # Hours before stale-PR issue is flagged
 
 # Run manually to check status
-./.loom/scripts/stale-building-check.sh --verbose
+loom-recover-orphans --verbose
 
-# Auto-recover (run by daemon)
-./.loom/scripts/stale-building-check.sh --recover
+# Auto-recover orphaned loom:building issues
+loom-recover-orphans --recover
 
 # JSON output for integration
-./.loom/scripts/stale-building-check.sh --json
+loom-recover-orphans --json
 ```
 
 ## Session Rotation
