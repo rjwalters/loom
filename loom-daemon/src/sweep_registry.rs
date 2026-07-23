@@ -44,8 +44,10 @@ use anyhow::{anyhow, Context, Result};
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -195,6 +197,25 @@ struct LockOwner {
 pub struct SweepRegistry {
     config: SweepRegistryConfig,
     entries: BTreeMap<SweepId, SweepInfo>,
+    /// Retained `Child` handles for sweeps this daemon instance spawned
+    /// (Issue #3801). Keyed by `sweep_id`.
+    ///
+    /// The handle is kept — rather than dropped at spawn — so the reaper
+    /// (and `cancel`) can `try_wait()` / `wait()` the child, which reaps
+    /// the OS-level process (no `<defunct>` zombie under the daemon PID)
+    /// AND yields the real exit status. `kill(pid, 0)` alone is proven
+    /// insufficient: a terminated-but-unreaped child is a zombie whose PID
+    /// is still allocated, so `kill(pid, 0)` reports it alive forever and
+    /// the registry stays stuck `Running`.
+    ///
+    /// Reconstructed entries (from a prior daemon, see [`reconstruct`]) have
+    /// no handle here — we never spawned them — so their liveness falls
+    /// back to the `kill(pid, 0)` probe. Those entries are already admitted
+    /// as terminal (`Crashed`) or point at the previous daemon's PID, so the
+    /// fallback is correct for them.
+    ///
+    /// [`reconstruct`]: SweepRegistry::reconstruct
+    children: BTreeMap<SweepId, Child>,
     /// Optional event bus for lifecycle events (Issue #3453, Phase B).
     /// When `None`, the registry behaves identically to Phase A — bus
     /// emission is best-effort and never blocks core dispatch/reaper
@@ -212,6 +233,7 @@ impl SweepRegistry {
         Self {
             config,
             entries: BTreeMap::new(),
+            children: BTreeMap::new(),
             bus: None,
         }
     }
@@ -222,6 +244,7 @@ impl SweepRegistry {
         Self {
             config,
             entries: BTreeMap::new(),
+            children: BTreeMap::new(),
             bus: Some(bus),
         }
     }
@@ -359,9 +382,12 @@ impl SweepRegistry {
 
         // 5. Compute the log path and spawn the child.
         let log_path = self.compute_log_path(issue_number);
-        let (pid, token_name) = self
+        let (child, token_name) = self
             .spawn_child(issue_number, &log_path, &sweep_id, model, effort, depends_on)
             .context("failed to spawn sweep child")?;
+        let pid = child.id();
+        // Retain the handle so the reaper can `try_wait()` it (Issue #3801).
+        self.children.insert(sweep_id.clone(), child);
 
         // 6. Record the entry. The model is carried on the registry entry
         //    (#3482, Phase 3a observability) so `list_sweeps` /
@@ -626,7 +652,7 @@ impl SweepRegistry {
         model: Option<&str>,
         effort: Option<&str>,
         depends_on: Option<u32>,
-    ) -> Result<(u32, String)> {
+    ) -> Result<(Child, String)> {
         let spawn_bin = self.config.resolve_spawn_bin()?;
 
         // Ensure log dir exists.
@@ -705,6 +731,19 @@ impl SweepRegistry {
             .stdout(Stdio::from(log_file))
             .stderr(Stdio::from(log_clone));
 
+        // Issue #3800: put the sweep child in its OWN process group
+        // (`setpgid(0, 0)` runs post-fork/pre-exec via `process_group(0)`,
+        // stable since Rust 1.64). spawn-claude.sh ends in `exec claude`, so
+        // the tracked PID becomes the `claude` process itself AND the leader
+        // of a fresh group. `claude` forks real OS subprocesses for tool
+        // execution (Bash-tool commands, MCP servers, git clones, …); those
+        // descendants inherit this group. Making the child a group leader lets
+        // `cancel()` signal the WHOLE group (`kill(-pgid, sig)`) so the entire
+        // sweep subtree is torn down — instead of leaving orphans behind when
+        // only the top-level PID is signalled.
+        #[cfg(unix)]
+        cmd.process_group(0);
+
         // Issue #3730: explicitly forward the experiment-related env vars to
         // the detached child via an EXPLICIT ALLOWLIST — never a blanket
         // env_clear/copy. Without this, `LOOM_MODEL_EXPERIMENT` /
@@ -728,14 +767,14 @@ impl SweepRegistry {
         let child = cmd
             .spawn()
             .with_context(|| format!("failed to spawn {} -p '{}'", spawn_bin.display(), prompt))?;
-        let pid = child.id();
-        // We do NOT wait on the child — detach by dropping the handle. The
-        // reaper detects exit via `kill(pid, 0)`. spawn-claude.sh internally
-        // selects a token; we record "unknown" here because the wrapper's
-        // selection is logged to the per-sweep log, not exposed on stdout.
-        std::mem::drop(child);
-
-        Ok((pid, "unknown".to_string()))
+        // Issue #3801: we RETAIN the `Child` handle (returned to `dispatch`,
+        // which stores it in `self.children`) instead of dropping it. The
+        // reaper `try_wait()`s it each tick so an exited child is reaped
+        // (no `<defunct>` zombie) and the registry transitions to a terminal
+        // state with the real exit status. spawn-claude.sh internally selects
+        // a token; we record "unknown" here because the wrapper's selection is
+        // logged to the per-sweep log, not exposed on stdout.
+        Ok((child, "unknown".to_string()))
     }
 
     // ------------------------------------------------------------------------
@@ -750,10 +789,68 @@ impl SweepRegistry {
         self.entries.get(sweep_id).cloned()
     }
 
+    /// Signal a sweep's process. When this daemon still owns a retained
+    /// `Child` handle for `sweep_id` (i.e. we spawned it into its own process
+    /// group via `process_group(0)`), the signal is delivered to the WHOLE
+    /// process group (`kill(-pgid, sig)`, and the leader's pgid == its pid)
+    /// so the entire `claude` subprocess subtree is reached (Issue #3800).
+    /// Reconstructed entries with no handle fall back to single-PID delivery.
+    fn signal_sweep(&self, sweep_id: &str, pid: u32, sig: i32) -> bool {
+        if self.children.contains_key(sweep_id) {
+            send_group_signal(pid, sig)
+        } else {
+            send_signal(pid, sig)
+        }
+    }
+
+    /// Determine whether a sweep's child has terminated, reaping it when it
+    /// has. Prefers the retained `Child` handle: `try_wait()` reaps an exited
+    /// child (no zombie) and yields the real exit status. Falls back to the
+    /// `kill(pid, 0)` liveness probe for reconstructed entries with no handle.
+    ///
+    /// Returns `(is_dead, exit_code)`. On a handle-observed exit the handle is
+    /// removed from `self.children`; `exit_code` is `None` when the child was
+    /// terminated by a signal (no clean code) or when liveness came from the
+    /// fallback probe.
+    fn poll_liveness(&mut self, sweep_id: &str, pid: u32) -> (bool, Option<i32>) {
+        if let Some(child) = self.children.get_mut(sweep_id) {
+            match child.try_wait() {
+                Ok(Some(status)) => {
+                    let code = status.code();
+                    self.children.remove(sweep_id);
+                    (true, code)
+                }
+                Ok(None) => (false, None),
+                Err(e) => {
+                    log::warn!("sweep_registry: try_wait for {sweep_id} (pid {pid}) failed: {e}");
+                    let dead = !is_pid_alive(pid);
+                    if dead {
+                        self.children.remove(sweep_id);
+                    }
+                    (dead, None)
+                }
+            }
+        } else {
+            (!is_pid_alive(pid), None)
+        }
+    }
+
+    /// Reap the retained `Child` handle for `sweep_id`, blocking briefly until
+    /// it exits. Called after `cancel` has SIGKILL'd (or observed the exit of)
+    /// the child so the OS-level zombie is reclaimed under the daemon PID.
+    /// No-op when no handle is retained (reconstructed / test-injected entry).
+    fn reap_handle(&mut self, sweep_id: &str) -> Option<std::process::ExitStatus> {
+        self.children.remove(sweep_id).and_then(|mut child| {
+            // Bounded: we only reach here once the child has exited or has
+            // just been SIGKILL'd, so `wait()` returns promptly.
+            child.wait().ok()
+        })
+    }
+
     /// Cancel a running sweep.
     ///
-    /// Sends SIGTERM, waits up to `grace` for the child to exit (polled
-    /// via `kill(pid, 0)`), then SIGKILL if still alive. On any path the
+    /// Sends SIGTERM to the sweep's process group, waits up to `grace` for the
+    /// child to exit, then SIGKILL to the group if still alive. On any path the
     /// registry entry is transitioned to `Exited{code: None, at: now}`
     /// and the per-issue lock is released. Emits the same lifecycle
     /// events the reaper would emit on a clean exit
@@ -784,10 +881,13 @@ impl SweepRegistry {
             });
         }
 
-        // Step 1: SIGTERM (signal 15). We send via `kill(2)` directly
-        // rather than spawning `kill(1)` so the path is identical on
-        // macOS + Linux and we don't depend on `PATH`.
-        let term_sent = send_signal(pid, 15);
+        // Step 1: SIGTERM (signal 15) to the sweep's process GROUP (Issue
+        // #3800) so the `claude` child AND its tool/MCP subprocess subtree are
+        // reached — not just the tracked leader PID. We send via `kill(2)`
+        // directly rather than spawning `kill(1)` so the path is identical on
+        // macOS + Linux and we don't depend on `PATH`. `signal_sweep` falls
+        // back to single-PID delivery for entries with no retained handle.
+        let term_sent = self.signal_sweep(sweep_id, pid, 15);
         if !term_sent {
             log::warn!(
                 "cancel_sweep: SIGTERM to pid {pid} for sweep {sweep_id} failed \
@@ -799,24 +899,32 @@ impl SweepRegistry {
         // 100ms (matches the spawn-loop's shutdown-grace polling
         // cadence). The poll loop is a blocking sleep — acceptable for
         // an IPC handler since cancel is a low-frequency operator action.
+        // `poll_liveness` reaps the child (no zombie, Issue #3801) the moment
+        // it observes the exit via the retained handle's `try_wait()`.
         let poll_interval = Duration::from_millis(100);
         let deadline = std::time::Instant::now() + grace;
-        let mut exited_within_grace = !is_pid_alive(pid);
+        let (mut exited_within_grace, _) = self.poll_liveness(sweep_id, pid);
         while !exited_within_grace && std::time::Instant::now() < deadline {
             std::thread::sleep(poll_interval);
-            exited_within_grace = !is_pid_alive(pid);
+            exited_within_grace = self.poll_liveness(sweep_id, pid).0;
         }
 
-        // Step 3: SIGKILL if still alive.
+        // Step 3: SIGKILL the group if still alive.
         let sigkill_sent = if exited_within_grace {
             false
         } else {
-            let killed = send_signal(pid, 9);
+            let killed = self.signal_sweep(sweep_id, pid, 9);
             if !killed {
                 log::warn!("cancel_sweep: SIGKILL to pid {pid} also failed");
             }
             true
         };
+
+        // Step 3b: reap the retained handle so the killed leader does not
+        // linger as a `<defunct>` zombie under the daemon PID (Issue #3801).
+        // A no-op when the exit was already reaped in the poll loop above, or
+        // when no handle is retained (reconstructed / test-injected entry).
+        let _ = self.reap_handle(sweep_id);
 
         // Step 4: transition state, release lock, emit events.
         let now = Utc::now();
@@ -883,6 +991,7 @@ impl SweepRegistry {
     ///   (which also re-arms the `loom:issue` label).
     /// - `sweep.global.completed` on every terminal transition, regardless
     ///   of which per-issue event also fired.
+    #[allow(clippy::too_many_lines)]
     pub fn reap_once(&mut self) -> usize {
         let mut changes = 0usize;
 
@@ -902,8 +1011,16 @@ impl SweepRegistry {
         let mut events_to_emit: Vec<Event> = Vec::new();
 
         for (sweep_id, pid, state, kind, started_at) in candidates {
-            match state {
-                SweepState::Running | SweepState::Pending if !is_pid_alive(pid) => {
+            if !matches!(state, SweepState::Running | SweepState::Pending) {
+                continue;
+            }
+            // Liveness via the retained `Child` handle when we own it: this
+            // `try_wait()`s the child, reaping any zombie (Issue #3801) and
+            // yielding the real exit code. Reconstructed entries with no
+            // handle fall back to the `kill(pid, 0)` probe.
+            let (is_dead, exit_code) = self.poll_liveness(&sweep_id, pid);
+            if is_dead {
+                {
                     changes += 1;
                     let issue = match &kind {
                         SweepKind::Issue(n) => Some(*n),
@@ -940,13 +1057,13 @@ impl SweepRegistry {
                         } else {
                             if let Some(info) = self.entries.get_mut(&sweep_id) {
                                 info.state = SweepState::Exited {
-                                    code: None,
+                                    code: exit_code,
                                     at: now,
                                 };
                             }
                             events_to_emit.push(Event::SweepExited {
                                 issue,
-                                exit_code: None,
+                                exit_code,
                                 duration_sec,
                             });
                             events_to_emit.push(Event::SweepGlobalCompleted {
@@ -977,7 +1094,7 @@ impl SweepRegistry {
                     } else {
                         if let Some(info) = self.entries.get_mut(&sweep_id) {
                             info.state = SweepState::Exited {
-                                code: None,
+                                code: exit_code,
                                 at: now,
                             };
                         }
@@ -991,7 +1108,6 @@ impl SweepRegistry {
                         });
                     }
                 }
-                _ => {}
             }
         }
 
@@ -1017,6 +1133,10 @@ impl SweepRegistry {
             .collect();
         for id in to_drop {
             self.entries.remove(&id);
+            // Defensive: a terminal entry should have had its handle reaped in
+            // `poll_liveness` already, but drop any lingering handle so a
+            // GC'd sweep never leaks a `Child` (Issue #3801).
+            let _ = self.children.remove(&id);
             changes += 1;
         }
         changes
@@ -1330,6 +1450,34 @@ fn send_signal(_pid: u32, _sig: i32) -> bool {
     false
 }
 
+/// Send a signal to the entire process GROUP led by `pgid` (Issue #3800).
+///
+/// POSIX `kill(-pgid, sig)` delivers `sig` to every process in the group
+/// `pgid`. Because sweep children are spawned as group leaders
+/// (`process_group(0)` → `setpgid(0, 0)`), a child's pgid equals its own PID,
+/// so passing the tracked child PID here reaches the child AND every
+/// descendant it forked (Bash-tool commands, MCP servers, git clones, …) —
+/// tearing down the whole subtree instead of orphaning it.
+///
+/// Returns `true` on success. `pgid == 0` is rejected: `kill(0, sig)` targets
+/// the *caller's* group (the daemon itself), which would be catastrophic.
+#[cfg(unix)]
+fn send_group_signal(pgid: u32, sig: i32) -> bool {
+    if pgid == 0 {
+        return false;
+    }
+    let Ok(pgid_t): Result<i32, _> = pgid.try_into() else {
+        return false;
+    };
+    // Negative target = process group. See kill(2).
+    libc_kill(-pgid_t, sig) == 0
+}
+
+#[cfg(not(unix))]
+fn send_group_signal(_pgid: u32, _sig: i32) -> bool {
+    false
+}
+
 /// Read the last `n` lines of a file. Returns an empty vec when the
 /// file is empty; returns an error when the file does not exist (so the
 /// caller can distinguish "no log yet" from "log gone").
@@ -1431,6 +1579,69 @@ exit 0
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
         false
+    }
+
+    /// Poll `.loom/scripts/spawn-claude.sh` fixture installation: write a
+    /// custom script body + exec bit into `workspace` and return a registry
+    /// configured to spawn it. Used by the child-process-lifecycle tests
+    /// (#3800/#3801) which need a long-lived / tree-forking child rather than
+    /// the record-and-exit fake in `fixture_registry`.
+    fn lifecycle_registry(workspace: &Path, script_body: &str) -> SweepRegistry {
+        let scripts_dir = workspace.join(".loom").join("scripts");
+        std::fs::create_dir_all(&scripts_dir).unwrap();
+        let fake_bin = scripts_dir.join("spawn-claude.sh");
+        std::fs::write(&fake_bin, script_body).unwrap();
+        let mut perms = std::fs::metadata(&fake_bin).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&fake_bin, perms).unwrap();
+        if let Ok(f) = std::fs::File::open(&fake_bin) {
+            let _ = f.sync_all();
+        }
+        let mut config = SweepRegistryConfig::new(workspace.to_path_buf());
+        config.spawn_bin = Some(fake_bin);
+        config.skip_label_flip = true;
+        SweepRegistry::new(config)
+    }
+
+    /// Poll until `pid` becomes alive (via `kill(pid, 0)`), up to
+    /// `timeout_ms`. Returns true once alive, false on timeout.
+    fn wait_until_alive(pid: u32, timeout_ms: u64) -> bool {
+        let start = std::time::Instant::now();
+        while start.elapsed().as_millis() < u128::from(timeout_ms) {
+            if is_pid_alive(pid) {
+                return true;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        is_pid_alive(pid)
+    }
+
+    /// Poll until `pid` is no longer alive (via `kill(pid, 0)`), up to
+    /// `timeout_ms`. Returns the final liveness (false = dead = success).
+    fn wait_until_dead(pid: u32, timeout_ms: u64) -> bool {
+        let start = std::time::Instant::now();
+        while start.elapsed().as_millis() < u128::from(timeout_ms) {
+            if !is_pid_alive(pid) {
+                return true;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+        !is_pid_alive(pid)
+    }
+
+    /// Read a PID written to `path` by a fixture child, polling until a
+    /// parseable integer appears (or timeout). Returns `None` on timeout.
+    fn read_pid_file(path: &Path, timeout_ms: u64) -> Option<u32> {
+        let start = std::time::Instant::now();
+        while start.elapsed().as_millis() < u128::from(timeout_ms) {
+            if let Ok(s) = std::fs::read_to_string(path) {
+                if let Ok(p) = s.trim().parse::<u32>() {
+                    return Some(p);
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+        None
     }
 
     #[test]
@@ -2776,5 +2987,115 @@ exit 0
             assert!(saw_exited);
             assert!(saw_completed);
         });
+    }
+
+    /// Issue #3800: `cancel()` must tear down the WHOLE process tree, not just
+    /// the tracked leader PID. We dispatch a fixture whose leader forks a
+    /// backgrounded grandchild (both in the leader's process group, thanks to
+    /// `dispatch()`'s `process_group(0)`), then cancel and assert BOTH the
+    /// leader and the grandchild are gone within the grace window. A
+    /// single-PID kill would orphan the backgrounded grandchild — this test
+    /// fails without the group-kill fix.
+    #[test]
+    #[serial]
+    fn cancel_terminates_whole_process_group_including_grandchild() {
+        let dir = tempdir().unwrap();
+        let workspace = dir.path();
+        let gc_pidfile = workspace.join("grandchild.pid");
+
+        // Leader (= group leader after process_group(0)) forks a background
+        // grandchild that sleeps, records its PID, then blocks in a foreground
+        // sleep. All three processes share the leader's process group.
+        let script = format!(
+            "#!/usr/bin/env bash\nsleep 300 &\necho \"$!\" > \"{gc}\"\nsleep 300\n",
+            gc = gc_pidfile.display()
+        );
+        let mut registry = lifecycle_registry(workspace, &script);
+
+        let outcome = registry
+            .dispatch(&SweepKind::Issue(4242), None, None, None, None)
+            .expect("dispatch should succeed");
+        let leader_pid = outcome.pid;
+        let sweep_id = outcome.sweep_id.clone();
+
+        let gc_pid = read_pid_file(&gc_pidfile, 5000).expect("grandchild pid should be recorded");
+        assert!(is_pid_alive(leader_pid), "leader should be running post-dispatch");
+        assert!(is_pid_alive(gc_pid), "grandchild should be running post-dispatch");
+        assert_ne!(leader_pid, gc_pid);
+
+        // None of the processes trap SIGTERM, so a group SIGTERM tears the
+        // whole tree down inside the grace window (no SIGKILL escalation).
+        let cancel = registry
+            .cancel(&sweep_id, Duration::from_secs(3))
+            .expect("cancel should succeed");
+        assert!(cancel.was_running);
+
+        // The ENTIRE tree must be gone. The grandchild assertion is the crux:
+        // it proves the signal reached the whole process group (#3800), not
+        // just the tracked leader PID.
+        assert!(wait_until_dead(leader_pid, 3000), "leader still alive after cancel");
+        assert!(
+            wait_until_dead(gc_pid, 3000),
+            "grandchild survived cancel — group-kill did not reach it (single-PID regression)"
+        );
+
+        let info = registry.get(&sweep_id).unwrap();
+        assert!(matches!(info.state, SweepState::Exited { .. }));
+    }
+
+    /// Issue #3801: a child killed OUT OF BAND (operator `kill -KILL`, not via
+    /// `cancel()`) must be reaped by the reaper — no `<defunct>` zombie — and
+    /// the registry entry must transition out of `Running`. Without the
+    /// retained-`Child`-handle `try_wait()`, the killed leader becomes a
+    /// zombie whose `kill(pid, 0)` still reports alive, so `reap_once()` would
+    /// leave the entry stuck `Running` forever.
+    #[test]
+    #[serial]
+    fn reaper_reaps_out_of_band_killed_child_and_transitions_state() {
+        let dir = tempdir().unwrap();
+        let workspace = dir.path();
+
+        let mut registry = lifecycle_registry(workspace, "#!/usr/bin/env bash\nsleep 300\n");
+
+        let outcome = registry
+            .dispatch(&SweepKind::Issue(5151), None, None, None, None)
+            .expect("dispatch should succeed");
+        let pid = outcome.pid;
+        let sweep_id = outcome.sweep_id.clone();
+
+        // Let the child start.
+        assert!(wait_until_alive(pid, 3000), "child should have started");
+        assert!(matches!(registry.get(&sweep_id).unwrap().state, SweepState::Running));
+
+        // Kill out of band: SIGKILL the leader PID directly (mimics an
+        // operator `kill -KILL <pid>`), bypassing cancel(). The leader is now
+        // a zombie under the daemon (test) PID until we wait() it.
+        assert!(send_signal(pid, 9), "SIGKILL to live child should succeed");
+
+        // Drive reaper ticks. The retained handle's try_wait() reaps the
+        // zombie and observes the exit, transitioning the entry to terminal.
+        let mut transitioned = false;
+        for _ in 0..80 {
+            registry.reap_once();
+            match registry.get(&sweep_id).map(|i| i.state.clone()) {
+                Some(SweepState::Running | SweepState::Pending) => {}
+                _ => {
+                    transitioned = true;
+                    break;
+                }
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        assert!(
+            transitioned,
+            "reaper did not transition the out-of-band-killed sweep out of Running"
+        );
+
+        // No zombie: because try_wait() reaped the child, kill(pid, 0) now
+        // fails (the PID is no longer in the process table).
+        assert!(
+            wait_until_dead(pid, 2000),
+            "killed child left a <defunct> zombie — reaper did not wait() it"
+        );
     }
 }
