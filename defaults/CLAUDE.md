@@ -1621,6 +1621,25 @@ If you want to invoke the check manually:
 ./.loom/scripts/check-host-sleep.sh --quiet # stderr warning only, no stdout line
 ```
 
+**Keeping installed `.loom/` copies fresh after a pull (#3770 detect → #3777 resync)**:
+
+The installed `.loom/hooks/` and `.loom/scripts/` copies the harness actually executes are synced from `defaults/` **at install time**. A `git pull` that merges a hook/script fix updates `defaults/` but **not** the installed copies — so a session can run stale hooks/scripts indefinitely until they are re-synced.
+
+This is a **detect → fix** pair:
+
+- **Detect (#3770)** — `check-main-freshness.sh` (run at `/loom:sweep` startup) warns, non-blocking, when local `main` is behind `origin/main` and flags any installed file that differs from its `defaults/` counterpart. It never pulls, merges, or resets.
+- **Fix (#3777)** — `resync-installed.sh` refreshes the installed `.loom/hooks/*` and `.loom/scripts/*` from `defaults/`. Idempotent (no-op when in sync), reports per-file `updated`/`created`/`unchanged`/`skipped`, and only touches files that exist in `defaults/` (repo-specific hooks with no `defaults/` counterpart are left alone).
+
+The intended flow is **"freshness warning says you're stale → run resync"**:
+
+```bash
+git merge --ff-only origin/main                  # bring defaults/ current
+./.loom/scripts/resync-installed.sh --dry-run    # preview (exits 2 when drift found)
+./.loom/scripts/resync-installed.sh              # apply
+```
+
+Pin an intentional per-repo customization by listing its relative path (e.g. `hooks/guard-destructive.sh`), one per line, in `.loom/resync-ignore` — matching files are reported `skipped` and never overwritten. A full `loom-daemon init` / installer run performs the equivalent recursive copy, so a normal reinstall also keeps the copies current.
+
 **Merging PRs from worktrees**:
 
 Use `merge-pr.sh` instead of `gh pr merge` to avoid worktree checkout errors:

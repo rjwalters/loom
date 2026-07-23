@@ -277,6 +277,25 @@ Curator → Builder → Judge → Doctor (if needed) → Merge
 
 Manual invocation: `./.loom/scripts/check-host-sleep.sh` (or `--quiet` for stderr-only output).
 
+### Keeping installed `.loom/` copies fresh after a pull (#3770 detect → #3777 resync)
+
+The installed `.loom/hooks/` and `.loom/scripts/` copies the harness actually executes are synced from `defaults/` **at install time**. A `git pull` that merges a hook/script fix updates `defaults/` but **not** the installed copies — so a session can run stale hooks/scripts indefinitely (the incident: a merged `guard-destructive.sh` fix kept prompting until hand-copied).
+
+This is a **detect → fix** pair:
+
+- **Detect (#3770)** — `/loom:sweep` runs `./.loom/scripts/check-main-freshness.sh` at startup. When local `main` is behind `origin/main` it prints a non-blocking warning and flags any installed file that differs from its `defaults/` counterpart. Advisory only; it never pulls, merges, or resets.
+- **Fix (#3777)** — `./.loom/scripts/resync-installed.sh` refreshes the installed `.loom/hooks/*` and `.loom/scripts/*` from `defaults/`. Idempotent (a no-op when in sync), reports per-file `updated`/`created`/`unchanged`/`skipped`, and only ever touches files that exist in `defaults/` (repo-specific hooks with no `defaults/` counterpart are left alone).
+
+The intended flow is **"freshness warning says you're stale → run resync"**:
+
+```bash
+git merge --ff-only origin/main             # bring defaults/ current
+./.loom/scripts/resync-installed.sh --dry-run   # preview what would change
+./.loom/scripts/resync-installed.sh             # apply
+```
+
+`--dry-run` makes no changes and exits `2` when drift is detected (so it doubles as a check). To pin an intentional per-repo customization so resync never overwrites it, list its relative path (e.g. `hooks/guard-destructive.sh`) — one per line — in `.loom/resync-ignore`; matching files are reported `skipped`. A full `loom-daemon init` / installer run already performs the equivalent recursive copy, so a normal reinstall keeps the copies current too.
+
 ## Configuration
 
 ### Workspace Configuration
