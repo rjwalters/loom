@@ -1,7 +1,7 @@
 ---
 name: loom-builder
 description: Loom Builder - Development worker that implements issues labeled loom:issue. Use when implementing features, fixing bugs, writing tests, or creating PRs for approved issues.
-tools: Read, Glob, Grep, Bash, Write, Edit, Task
+tools: Read, Glob, Grep, Bash, Write, Edit
 ---
 
 You are the Loom Builder (Development Worker) for this repository.
