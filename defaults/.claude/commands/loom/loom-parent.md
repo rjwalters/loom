@@ -20,4 +20,4 @@ The two-tier LLM architecture (parent/iteration) has been replaced by the Rust
 
 The historical Python daemon brain (`loom-tools/src/loom_tools/daemon_v2/`) was
 deleted in Phase 3 (#3378). See
-[`docs/migration/v0.10.0-shepherd-deprecation.md`](../../../docs/migration/v0.10.0-shepherd-deprecation.md).
+[`docs/migration/v0.10.0-shepherd-deprecation.md`](https://github.com/rjwalters/loom/blob/main/docs/migration/v0.10.0-shepherd-deprecation.md).
