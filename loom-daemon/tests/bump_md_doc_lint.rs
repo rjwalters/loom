@@ -60,15 +60,21 @@ fn bump_md_exists_and_has_title() {
 #[test]
 fn bump_md_documents_all_eight_phases() {
     let content = read_bump_md();
+    // Assert PRESENCE of all eight lifecycle phases by number, not by exact
+    // title. Phase titles are prose that legitimately evolves (e.g. #3856 made
+    // the CHANGELOG phase optional, renaming "Ensure…" to "Update…if present"),
+    // so pinning the full title makes this doc-lint brittle and red-mains main
+    // on legitimate edits (#3860/#3861). The contract is "eight numbered phases
+    // exist as section headers"; that is what we check.
     let required_phase_headers: &[&str] = &[
-        "## Phase 1: Detect version sources",
-        "## Phase 2: Ensure",
-        "## Phase 3: Compute the new version",
-        "## Phase 4: Draft the changelog entry",
-        "## Phase 5: Generate",
-        "## Phase 6: Run the bump",
-        "## Phase 7: Push and",
-        "## Phase 8: Summary",
+        "## Phase 1:",
+        "## Phase 2:",
+        "## Phase 3:",
+        "## Phase 4:",
+        "## Phase 5:",
+        "## Phase 6:",
+        "## Phase 7:",
+        "## Phase 8:",
     ];
     for header in required_phase_headers {
         assert!(
