@@ -2,6 +2,15 @@
 # These labels coordinate the Loom AI agent workflow
 # Sync with: .loom/scripts/sync-labels.sh (from the installed repo root)
 # Or manually: gh label create/edit commands
+#
+# SOURCE OF TRUTH / PARITY CONTRACT (#3896):
+#   .github/labels.yml (this repo's live label registry) and
+#   defaults/.github/labels.yml (the installer template copied into fresh
+#   installs) are kept BYTE-IDENTICAL. A fresh install must ship exactly the
+#   label set Loom itself uses, so there are NO intentional differences between
+#   the two files. Edit ONE file, then mirror the change to the other so they
+#   match exactly. CI enforces parity via defaults/scripts/check-labels-drift.sh
+#   (installer-tests job) — the build fails on any drift.
 
 # Core Workflow States
 - name: loom:triage
@@ -111,13 +120,6 @@
   description: Issue is part of an epic phase (references parent epic)
   color: "8B5CF6"  # violet-500 - lighter variant for child issues
 
-# External Contribution Labels
-# Not part of the loom: workflow. Builders MUST skip issues carrying this label
-# (see builder.md "Ignore External Issues") — they need maintainer triage first.
-- name: external
-  description: External contribution requiring manual triage
-  color: "6B7280"  # gray-500 - neutral, non-loom-workflow marker
-
 # Tier Labels (Goal Alignment)
 - name: tier:goal-advancing
   description: Directly implements a milestone deliverable or unblocks goal work
@@ -132,6 +134,9 @@
   color: "D4C5F9"  # purple - lower priority
 
 # External Contribution Gate
+# Not part of the loom: workflow. Builders MUST skip issues carrying this label
+# (see builder.md "Ignore External Issues") — a non-collaborator submission needs
+# maintainer approval before Curator/Builder process it.
 - name: external
   description: "Submitted by a non-collaborator; requires maintainer approval before Curator/Builder process it. Applied by: humans only."
   color: "E5E7EB"  # gray-200 - external/hold marker
