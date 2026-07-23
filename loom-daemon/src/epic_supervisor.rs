@@ -74,6 +74,7 @@ use anyhow::{Context, Result};
 use crate::epic_state::{count_phase_sections, derive_epic_state, EpicState, PhaseChild};
 use crate::event_bus::EventBus;
 use crate::issue_creation_mutex::{IssueCreationMutex, CHAMPION_EPIC_DECOMP};
+use crate::main_health_gate::MainHealthState;
 use crate::phase_join::{barrier_admits, PhaseBoundary};
 use crate::types::{EpicActionClass, Event};
 
@@ -440,6 +441,11 @@ pub struct TickReport {
     pub noop: usize,
     /// Dispatch attempts that returned an error (logged, non-fatal).
     pub errors: usize,
+    /// Whether this tick was skipped wholesale because the reactive main-health
+    /// gate (#3812) reports a red `main` — no epics listed, nothing dispatched
+    /// (#3885). Mirrors the work-finder's halt behavior so a red `main` stops
+    /// **all** autonomous dispatch, not just work-finder sweeps.
+    pub halted: bool,
 }
 
 /// The Phase 3 supervisor engine: iterates open epics, plans the one enabled
@@ -458,6 +464,11 @@ pub struct EpicSupervisor<S: EpicSource, D: EpicDispatcher> {
     /// Optional event bus for publishing epic-action topics (#3873). When
     /// absent the supervisor runs silently (unit-test / no-observability path).
     bus: Option<Arc<EventBus>>,
+    /// Optional reactive main-health halt flag (#3812) shared with the gate loop
+    /// and work-finder. When set and halted, [`tick`](Self::tick) dispatches
+    /// **nothing** — a red `main` stops epic-child dispatch too (#3885). Absent
+    /// (the default / test path) means the supervisor is never gated.
+    health_state: Option<Arc<MainHealthState>>,
 }
 
 impl<S: EpicSource, D: EpicDispatcher> EpicSupervisor<S, D> {
@@ -473,6 +484,7 @@ impl<S: EpicSource, D: EpicDispatcher> EpicSupervisor<S, D> {
             dispatched_children: HashSet::new(),
             inflight_ttl: resolve_inflight_ttl(),
             bus: None,
+            health_state: None,
         }
     }
 
@@ -480,6 +492,15 @@ impl<S: EpicSource, D: EpicDispatcher> EpicSupervisor<S, D> {
     #[must_use]
     pub fn with_inflight_ttl(mut self, ttl: Duration) -> Self {
         self.inflight_ttl = ttl;
+        self
+    }
+
+    /// Attach the reactive main-health halt flag (#3812) so that while `main` is
+    /// red the supervisor dispatches nothing (#3885). Builder-style; returns
+    /// `self`.
+    #[must_use]
+    pub fn with_health_gate(mut self, health_state: Arc<MainHealthState>) -> Self {
+        self.health_state = Some(health_state);
         self
     }
 
@@ -498,6 +519,22 @@ impl<S: EpicSource, D: EpicDispatcher> EpicSupervisor<S, D> {
     /// [`TickReport::errors`] rather than aborting the tick — one wedged epic
     /// must not starve the rest. A failure to *list* epics aborts the tick.
     pub async fn tick(&mut self) -> Result<TickReport> {
+        // Reactive main-health backstop (#3812 → #3885): while `main` is red,
+        // dispatch nothing. Skip the whole tick — including the forge list — so a
+        // halt never advances an epic, exactly as the work-finder skips dispatch.
+        // Existing in-flight sweeps are untouched (halting only stops making a
+        // red `main` worse); a green run clears the flag and the next tick
+        // resumes normally.
+        if self.health_state.as_ref().is_some_and(|s| s.is_halted()) {
+            log::warn!(
+                "epic_supervisor: main-health gate halted — skipping tick (no epic dispatch while main is red)"
+            );
+            return Ok(TickReport {
+                halted: true,
+                ..TickReport::default()
+            });
+        }
+
         let epics = self.source.list_open_epics()?;
         let mut report = TickReport {
             epics_seen: epics.len(),
@@ -1336,6 +1373,56 @@ mod tests {
         assert_eq!(*epic, 1);
         assert_eq!(shape.role, "Architect");
         assert!(!shape.produces_pr);
+    }
+
+    // ===================================================================
+    // Main-health halt gate (#3885) — a red `main` stops epic dispatch too
+    // ===================================================================
+
+    #[tokio::test]
+    async fn test_tick_skips_all_dispatch_while_main_halted() {
+        let health = Arc::new(MainHealthState::new());
+        health.set_halted(true);
+        // An epic that WOULD dispatch an Architect enrich if not halted.
+        let mut sup = supervisor(vec![EpicSnapshot::new(1, "flat body", vec![], vec![])])
+            .with_health_gate(health.clone());
+
+        let report = sup.tick().await.unwrap();
+        assert!(report.halted, "tick must report halted");
+        assert_eq!(report.epics_seen, 0, "halted tick must not even list epics");
+        assert_eq!(report.roles_dispatched, 0);
+        assert_eq!(report.sweeps_dispatched, 0);
+        assert!(sup.dispatcher.roles.is_empty(), "no role dispatched while halted");
+        assert!(sup.dispatcher.sweeps.is_empty(), "no sweep dispatched while halted");
+    }
+
+    #[tokio::test]
+    async fn test_tick_resumes_dispatch_after_halt_clears() {
+        let health = Arc::new(MainHealthState::new());
+        health.set_halted(true);
+        let mut sup = supervisor(vec![EpicSnapshot::new(1, "flat body", vec![], vec![])])
+            .with_health_gate(health.clone());
+
+        // Halted ⇒ nothing dispatched.
+        let r1 = sup.tick().await.unwrap();
+        assert!(r1.halted);
+        assert_eq!(sup.dispatcher.roles.len(), 0);
+
+        // Clear the halt ⇒ the next tick dispatches normally.
+        health.set_halted(false);
+        let r2 = sup.tick().await.unwrap();
+        assert!(!r2.halted);
+        assert_eq!(r2.roles_dispatched, 1);
+        assert_eq!(sup.dispatcher.roles.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_tick_without_health_gate_is_never_halted() {
+        // No health gate attached (the default) ⇒ dispatch as before, zero change.
+        let mut sup = supervisor(vec![EpicSnapshot::new(1, "flat body", vec![], vec![])]);
+        let report = sup.tick().await.unwrap();
+        assert!(!report.halted);
+        assert_eq!(report.roles_dispatched, 1);
     }
 
     #[tokio::test]

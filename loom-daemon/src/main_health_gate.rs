@@ -216,6 +216,13 @@ pub enum GateOutcome {
     /// `buildGate.command` failed (non-zero exit, timeout, or spawn error).
     /// `detail` is a human-readable reason + a tail of captured output.
     Red { detail: String },
+    /// The gate did **not** run because the workspace could not be prepared to
+    /// reflect `origin/main` (dirty tree, not on `main`, a failed `git` step, or
+    /// a `git fetch` failure). `reason` explains why. A skipped run is
+    /// **indeterminate** — it deliberately leaves the halt flag unchanged rather
+    /// than greenwashing a stale checkout or spuriously halting on unrelated
+    /// local state (Issue #3885).
+    Skipped { reason: String },
 }
 
 impl GateOutcome {
@@ -227,18 +234,34 @@ impl GateOutcome {
         }
     }
 
+    /// Convenience constructor for a skipped (indeterminate) outcome.
+    #[must_use]
+    pub fn skipped(reason: impl Into<String>) -> Self {
+        Self::Skipped {
+            reason: reason.into(),
+        }
+    }
+
     /// True when the run was green.
     #[must_use]
     pub fn is_green(&self) -> bool {
         matches!(self, Self::Green)
     }
 
-    /// The red-detail string, or empty for a green outcome.
+    /// True when the run was skipped (indeterminate — did not execute the gate
+    /// command).
+    #[must_use]
+    pub fn is_skipped(&self) -> bool {
+        matches!(self, Self::Skipped { .. })
+    }
+
+    /// The red-detail / skip-reason string, or empty for a green outcome.
     #[must_use]
     pub fn detail(&self) -> &str {
         match self {
             Self::Green => "",
             Self::Red { detail } => detail,
+            Self::Skipped { reason } => reason,
         }
     }
 }
@@ -254,31 +277,181 @@ pub trait GateRunner {
     fn run_gate(&mut self) -> GateOutcome;
 }
 
-/// The concrete [`GateRunner`]: shells out to `buildGate.command` (via `sh -c`)
-/// against `main`, honoring `buildGate.timeoutSeconds`.
+/// The concrete [`GateRunner`]: syncs the workspace to `origin/main`, then shells
+/// out to `buildGate.command` (via `sh -c`) against that freshly-synced tree,
+/// honoring `buildGate.timeoutSeconds`.
 ///
-/// The command runs in `repo_root` — the daemon's workspace, which is a `main`
-/// checkout. This module is the reactive backstop for autonomous dispatch, so
-/// it verifies `main` as the daemon sees it; it deliberately does not provision
-/// a throwaway worktree (extra complexity for no safety gain in the daemon's own
-/// checkout).
+/// The command runs in `repo_root` — the daemon's workspace, nominally a `main`
+/// checkout. Autonomous merges land via the forge API (`merge-pr.sh`), which
+/// advances `origin/main` on the **remote** but never the daemon's local `main`
+/// checkout. Without a sync step the gate would repeatedly test a stale snapshot:
+/// a breaking merge never enters the tree it builds (missed catch), or operator
+/// edits / a stray branch turn it red on unrelated state (false halt). So before
+/// each run [`prepare_workspace_to_origin_main`] fast-forwards the checkout to
+/// `origin/main` — but only when it is on `main` and clean; a dirty tree or a
+/// failed `git` step yields a [`GateOutcome::Skipped`] that leaves the halt flag
+/// untouched rather than clobbering operator edits or acting on stale state
+/// (Issue #3885).
+///
+/// Sync can be disabled with [`without_sync`](Self::without_sync) (used by unit
+/// tests that exercise command classification against a scratch dir).
 pub struct CommandGateRunner {
     config: BuildGateConfig,
     repo_root: PathBuf,
+    /// Whether to sync `repo_root` to `origin/main` before each run. `true` in
+    /// production (via [`new`](Self::new)); tests opt out with
+    /// [`without_sync`](Self::without_sync).
+    sync: bool,
 }
 
 impl CommandGateRunner {
-    /// Construct a runner for `config`, executing in `repo_root`.
+    /// Construct a runner for `config`, executing in `repo_root`. Workspace sync
+    /// to `origin/main` is **on** — the production default.
     #[must_use]
     pub fn new(config: BuildGateConfig, repo_root: PathBuf) -> Self {
-        Self { config, repo_root }
+        Self {
+            config,
+            repo_root,
+            sync: true,
+        }
+    }
+
+    /// Disable the pre-run `origin/main` sync. Intended for tests that run the
+    /// gate command against a non-repo scratch directory; production always syncs.
+    #[must_use]
+    pub fn without_sync(mut self) -> Self {
+        self.sync = false;
+        self
     }
 }
 
 impl GateRunner for CommandGateRunner {
     fn run_gate(&mut self) -> GateOutcome {
+        if self.sync {
+            if let PrepOutcome::Skip { reason } = prepare_workspace_to_origin_main(&self.repo_root)
+            {
+                return GateOutcome::skipped(reason);
+            }
+        }
         run_command_with_timeout(&self.config.command, &self.repo_root, self.config.timeout)
     }
+}
+
+// ============================================================================
+// Workspace preparation — sync to origin/main before a gate run (#3885)
+// ============================================================================
+
+/// The remote the gate syncs its checkout from.
+const GATE_REMOTE: &str = "origin";
+
+/// The branch the gate builds against.
+const GATE_BRANCH: &str = "main";
+
+/// The result of preparing the workspace to reflect `origin/main`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PrepOutcome {
+    /// The workspace is on `main`, clean, and now fast-forwarded to
+    /// `origin/main` — the gate command may run against a fresh tree.
+    Ready,
+    /// The workspace could **not** be safely synced (dirty tree, not on `main`,
+    /// or a failed `git` step). `reason` explains why; the caller should skip
+    /// the gate run and leave the halt flag unchanged.
+    Skip { reason: String },
+}
+
+/// Run a `git` subcommand in `repo_root`, returning `Ok((stdout, stderr))` on a
+/// zero exit or `Err(reason)` describing the failure (spawn error or non-zero
+/// exit with captured stderr). Trims trailing whitespace from captured streams.
+fn run_git(repo_root: &Path, args: &[&str]) -> std::result::Result<(String, String), String> {
+    let output = Command::new("git")
+        .args(args)
+        .current_dir(repo_root)
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|e| format!("failed to spawn `git {}`: {e}", args.join(" ")))?;
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    if output.status.success() {
+        Ok((stdout, stderr))
+    } else {
+        Err(format!(
+            "`git {}` exited with {}{}",
+            args.join(" "),
+            output.status,
+            if stderr.is_empty() {
+                String::new()
+            } else {
+                format!(": {stderr}")
+            }
+        ))
+    }
+}
+
+/// Prepare `repo_root` to reflect `origin/main` before a gate run.
+///
+/// The hybrid safe policy from Issue #3885:
+/// 1. **Verify on `main`.** A detached HEAD or a different branch ⇒ `Skip`
+///    (never silently reset an operator's checked-out branch).
+/// 2. **Verify clean.** Any tracked/untracked local change ⇒ `Skip` (a hard
+///    reset would clobber operator edits).
+/// 3. **Fetch** `origin main`. A fetch failure (offline, transient) ⇒ `Skip`
+///    (better indeterminate than greenwashing a stale tree).
+/// 4. **Hard-reset** to `origin/main` so the gate builds exactly what the remote
+///    `main` now is. Only reached when the tree is on `main` and clean, so the
+///    reset only ever fast-forwards the daemon's own `main` checkout.
+///
+/// A `Skip` leaves the halt flag untouched (see [`apply_gate_outcome`]).
+#[must_use]
+pub fn prepare_workspace_to_origin_main(repo_root: &Path) -> PrepOutcome {
+    // 1. On `main`?
+    let branch = match run_git(repo_root, &["rev-parse", "--abbrev-ref", "HEAD"]) {
+        Ok((out, _)) => out,
+        Err(e) => {
+            return PrepOutcome::Skip {
+                reason: format!("could not determine current branch ({e})"),
+            };
+        }
+    };
+    if branch != GATE_BRANCH {
+        return PrepOutcome::Skip {
+            reason: format!(
+                "workspace is on '{branch}', not '{GATE_BRANCH}' — skipping gate (will not reset an operator branch)"
+            ),
+        };
+    }
+
+    // 2. Clean tree? `git status --porcelain` emits one line per change.
+    match run_git(repo_root, &["status", "--porcelain"]) {
+        Ok((out, _)) => {
+            if !out.is_empty() {
+                return PrepOutcome::Skip {
+                    reason: "workspace has local changes — skipping gate (will not hard-reset over operator edits)".to_string(),
+                };
+            }
+        }
+        Err(e) => {
+            return PrepOutcome::Skip {
+                reason: format!("could not check workspace cleanliness ({e})"),
+            };
+        }
+    }
+
+    // 3. Fetch origin/main.
+    if let Err(e) = run_git(repo_root, &["fetch", GATE_REMOTE, GATE_BRANCH]) {
+        return PrepOutcome::Skip {
+            reason: format!("`git fetch {GATE_REMOTE} {GATE_BRANCH}` failed ({e}) — skipping gate rather than testing a stale checkout"),
+        };
+    }
+
+    // 4. Hard-reset to the freshly-fetched origin/main.
+    let remote_ref = format!("{GATE_REMOTE}/{GATE_BRANCH}");
+    if let Err(e) = run_git(repo_root, &["reset", "--hard", &remote_ref]) {
+        return PrepOutcome::Skip {
+            reason: format!("`git reset --hard {remote_ref}` failed ({e})"),
+        };
+    }
+
+    PrepOutcome::Ready
 }
 
 /// Run `command` (via `sh -c`) in `cwd`, killing it if it exceeds `timeout`.
@@ -393,13 +566,18 @@ pub enum HealthTransition {
     Recovered,
     /// Green → Green: healthy, no change.
     RemainedHealthy,
+    /// The gate was skipped (indeterminate) — the halt flag is left exactly as
+    /// it was, so a skip neither halts nor resumes dispatch (#3885).
+    Skipped,
 }
 
 /// Apply a gate `outcome` to the shared `state`, returning the transition.
 ///
 /// Atomic `swap` makes the read-modify-write safe against a concurrent
 /// work-finder read (which only ever *loads*). This is the single point that
-/// mutates the halt flag.
+/// mutates the halt flag. A [`GateOutcome::Skipped`] is a no-op: it never
+/// touches the flag, so the previous halt/green decision persists until a run
+/// actually completes.
 #[must_use]
 pub fn apply_gate_outcome(state: &MainHealthState, outcome: &GateOutcome) -> HealthTransition {
     match outcome {
@@ -419,6 +597,7 @@ pub fn apply_gate_outcome(state: &MainHealthState, outcome: &GateOutcome) -> Hea
                 HealthTransition::EnteredHalt
             }
         }
+        GateOutcome::Skipped { .. } => HealthTransition::Skipped,
     }
 }
 
@@ -439,6 +618,10 @@ fn log_transition(transition: HealthTransition, outcome: &GateOutcome) {
         HealthTransition::RemainedHealthy => {
             log::debug!("main_health_gate: main green — dispatch unaffected");
         }
+        HealthTransition::Skipped => log::warn!(
+            "main_health_gate: gate run SKIPPED — {} (halt state unchanged)",
+            outcome.detail()
+        ),
     }
 }
 
@@ -573,6 +756,12 @@ where
     log::info!("main_health_gate: starting loop (interval={}s)", interval.as_secs());
     tokio::spawn(async move {
         let mut ticker = tokio::time::interval(interval);
+        // A gate run can exceed the cadence interval (a `buildGate` build may take
+        // minutes). Without this, `interval`'s default `Burst` behavior would fire
+        // the missed ticks back-to-back, churning rebuild after rebuild with no
+        // gap. `Delay` measures the next interval from when the previous run
+        // finished, so a slow build never triggers a rebuild storm (#3885).
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         // First tick fires immediately; skip it so we don't churn at boot.
         ticker.tick().await;
         loop {
@@ -794,7 +983,7 @@ mod tests {
             command: "exit 0".to_string(),
             timeout: Duration::from_secs(30),
         };
-        let mut runner = CommandGateRunner::new(cfg, std::env::temp_dir());
+        let mut runner = CommandGateRunner::new(cfg, std::env::temp_dir()).without_sync();
         assert_eq!(runner.run_gate(), GateOutcome::Green);
     }
 
@@ -804,7 +993,7 @@ mod tests {
             command: "echo build-failed-marker >&2; exit 1".to_string(),
             timeout: Duration::from_secs(30),
         };
-        let mut runner = CommandGateRunner::new(cfg, std::env::temp_dir());
+        let mut runner = CommandGateRunner::new(cfg, std::env::temp_dir()).without_sync();
         let outcome = runner.run_gate();
         assert!(!outcome.is_green());
         assert!(
@@ -820,7 +1009,7 @@ mod tests {
             command: "sleep 10".to_string(),
             timeout: Duration::from_secs(1),
         };
-        let mut runner = CommandGateRunner::new(cfg, std::env::temp_dir());
+        let mut runner = CommandGateRunner::new(cfg, std::env::temp_dir()).without_sync();
         let outcome = runner.run_gate();
         assert!(!outcome.is_green());
         assert!(
@@ -828,6 +1017,254 @@ mod tests {
             "timeout detail expected, got: {}",
             outcome.detail()
         );
+    }
+
+    // ===================================================================
+    // Workspace preparation — sync to origin/main before a gate run (#3885)
+    // ===================================================================
+
+    /// Run `git <args>` in `dir`, asserting success. Test-only helper for
+    /// building throwaway repos.
+    fn git(dir: &Path, args: &[&str]) {
+        let status = Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .unwrap();
+        assert!(status.success(), "git {args:?} failed in {}", dir.display());
+    }
+
+    /// Create an `origin` bare repo with an initial `main` commit and a working
+    /// clone checked out on `main`. Returns `(origin_dir, clone_dir)` — both
+    /// `TempDir` guards so they live for the test's duration.
+    fn make_origin_and_clone() -> (tempfile::TempDir, tempfile::TempDir) {
+        let origin = tempfile::tempdir().unwrap();
+        // A bare origin we can fetch from and push to.
+        git(origin.path(), &["init", "--bare", "--initial-branch=main"]);
+
+        // Seed it via a scratch clone so origin has a real `main` commit.
+        let seed = tempfile::tempdir().unwrap();
+        git(seed.path(), &["init", "--initial-branch=main"]);
+        git(seed.path(), &["config", "user.email", "t@t.t"]);
+        git(seed.path(), &["config", "user.name", "t"]);
+        std::fs::write(seed.path().join("file.txt"), "v1\n").unwrap();
+        git(seed.path(), &["add", "."]);
+        git(seed.path(), &["commit", "-m", "initial"]);
+        git(seed.path(), &["remote", "add", "origin", origin.path().to_str().unwrap()]);
+        git(seed.path(), &["push", "origin", "main"]);
+
+        // The workspace under test: a fresh clone on `main`.
+        let clone = tempfile::tempdir().unwrap();
+        git(
+            clone.path(),
+            &[
+                "clone",
+                origin.path().to_str().unwrap(),
+                clone.path().to_str().unwrap(),
+            ],
+        );
+        git(clone.path(), &["config", "user.email", "t@t.t"]);
+        git(clone.path(), &["config", "user.name", "t"]);
+        (origin, clone)
+    }
+
+    /// Push a new commit to `origin/main` from a scratch clone, so a workspace
+    /// that has not fetched is now behind.
+    fn advance_origin_main(origin: &Path) {
+        let scratch = tempfile::tempdir().unwrap();
+        git(
+            scratch.path(),
+            &[
+                "clone",
+                origin.to_str().unwrap(),
+                scratch.path().to_str().unwrap(),
+            ],
+        );
+        git(scratch.path(), &["config", "user.email", "t@t.t"]);
+        git(scratch.path(), &["config", "user.name", "t"]);
+        std::fs::write(scratch.path().join("file.txt"), "v2\n").unwrap();
+        git(scratch.path(), &["add", "."]);
+        git(scratch.path(), &["commit", "-m", "advance main"]);
+        git(scratch.path(), &["push", "origin", "main"]);
+    }
+
+    fn head_commit(dir: &Path) -> String {
+        String::from_utf8(
+            Command::new("git")
+                .args(["rev-parse", "HEAD"])
+                .current_dir(dir)
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap()
+        .trim()
+        .to_string()
+    }
+
+    #[test]
+    fn test_prepare_fast_forwards_stale_main_to_origin() {
+        let (origin, clone) = make_origin_and_clone();
+        let before = head_commit(clone.path());
+        // Remote main advances; the local clone is now behind (never fetched).
+        advance_origin_main(origin.path());
+        assert_eq!(head_commit(clone.path()), before, "clone still stale pre-prep");
+
+        let outcome = prepare_workspace_to_origin_main(clone.path());
+        assert_eq!(outcome, PrepOutcome::Ready);
+        assert_ne!(
+            head_commit(clone.path()),
+            before,
+            "prepare must fast-forward the workspace to the advanced origin/main"
+        );
+    }
+
+    #[test]
+    fn test_prepare_skips_dirty_workspace() {
+        let (_origin, clone) = make_origin_and_clone();
+        // A tracked-file edit makes the tree dirty.
+        std::fs::write(clone.path().join("file.txt"), "operator edit\n").unwrap();
+        let outcome = prepare_workspace_to_origin_main(clone.path());
+        match outcome {
+            PrepOutcome::Skip { reason } => assert!(
+                reason.contains("local changes"),
+                "expected dirty-skip reason, got: {reason}"
+            ),
+            other => panic!("expected Skip on dirty tree, got {other:?}"),
+        }
+        // The operator edit must NOT have been reset away.
+        assert_eq!(
+            std::fs::read_to_string(clone.path().join("file.txt")).unwrap(),
+            "operator edit\n",
+            "a dirty workspace must never be hard-reset"
+        );
+    }
+
+    #[test]
+    fn test_prepare_skips_untracked_file() {
+        let (_origin, clone) = make_origin_and_clone();
+        std::fs::write(clone.path().join("scratch.tmp"), "junk\n").unwrap();
+        let outcome = prepare_workspace_to_origin_main(clone.path());
+        assert!(
+            matches!(outcome, PrepOutcome::Skip { .. }),
+            "an untracked file must skip (porcelain reports it), got {outcome:?}"
+        );
+    }
+
+    #[test]
+    fn test_prepare_skips_when_not_on_main() {
+        let (_origin, clone) = make_origin_and_clone();
+        git(clone.path(), &["checkout", "-b", "feature/x"]);
+        let outcome = prepare_workspace_to_origin_main(clone.path());
+        match outcome {
+            PrepOutcome::Skip { reason } => assert!(
+                reason.contains("feature/x") && reason.contains("not 'main'"),
+                "expected not-on-main reason, got: {reason}"
+            ),
+            other => panic!("expected Skip off main, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_prepare_skips_non_git_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let outcome = prepare_workspace_to_origin_main(tmp.path());
+        assert!(
+            matches!(outcome, PrepOutcome::Skip { .. }),
+            "a non-git dir cannot determine a branch and must skip, got {outcome:?}"
+        );
+    }
+
+    #[test]
+    fn test_prepare_skips_when_fetch_fails_offline() {
+        // A repo whose `origin` points nowhere: on main + clean, but fetch fails.
+        let repo = tempfile::tempdir().unwrap();
+        git(repo.path(), &["init", "--initial-branch=main"]);
+        git(repo.path(), &["config", "user.email", "t@t.t"]);
+        git(repo.path(), &["config", "user.name", "t"]);
+        std::fs::write(repo.path().join("f.txt"), "x\n").unwrap();
+        git(repo.path(), &["add", "."]);
+        git(repo.path(), &["commit", "-m", "c"]);
+        git(
+            repo.path(),
+            &[
+                "remote",
+                "add",
+                "origin",
+                "/nonexistent/loom-gate-no-such-remote.git",
+            ],
+        );
+        let outcome = prepare_workspace_to_origin_main(repo.path());
+        match outcome {
+            PrepOutcome::Skip { reason } => {
+                assert!(reason.contains("fetch"), "expected fetch-failure reason, got: {reason}")
+            }
+            other => panic!("expected Skip on fetch failure, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_command_runner_returns_skipped_when_prep_skips() {
+        // Sync ON (production default) against a non-repo dir ⇒ prep skips ⇒ the
+        // gate command is NOT run and the outcome is Skipped.
+        let cfg = BuildGateConfig {
+            command: "exit 1".to_string(), // would be red if it ran
+            timeout: Duration::from_secs(5),
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        let mut runner = CommandGateRunner::new(cfg, tmp.path().to_path_buf());
+        let outcome = runner.run_gate();
+        assert!(
+            outcome.is_skipped(),
+            "prep skip must short-circuit before running the command, got {outcome:?}"
+        );
+    }
+
+    #[test]
+    fn test_command_runner_runs_gate_after_successful_prep() {
+        // Sync ON against a real on-main clean clone ⇒ prep Ready ⇒ command runs.
+        let (_origin, clone) = make_origin_and_clone();
+        let cfg = BuildGateConfig {
+            command: "exit 0".to_string(),
+            timeout: Duration::from_secs(30),
+        };
+        let mut runner = CommandGateRunner::new(cfg, clone.path().to_path_buf());
+        assert_eq!(runner.run_gate(), GateOutcome::Green);
+    }
+
+    // ===================================================================
+    // Skipped outcome + transition (#3885)
+    // ===================================================================
+
+    #[test]
+    fn test_skipped_outcome_leaves_halt_flag_unchanged() {
+        // From halted: a skip must NOT clear the halt.
+        let state = MainHealthState::new();
+        state.set_halted(true);
+        assert_eq!(
+            apply_gate_outcome(&state, &GateOutcome::skipped("dirty")),
+            HealthTransition::Skipped
+        );
+        assert!(state.is_halted(), "skip must not clear an existing halt");
+
+        // From green: a skip must NOT halt.
+        let state = MainHealthState::new();
+        assert_eq!(
+            apply_gate_outcome(&state, &GateOutcome::skipped("offline")),
+            HealthTransition::Skipped
+        );
+        assert!(!state.is_halted(), "skip must not spuriously halt");
+    }
+
+    #[test]
+    fn test_skipped_outcome_helpers() {
+        let s = GateOutcome::skipped("because reasons");
+        assert!(s.is_skipped());
+        assert!(!s.is_green());
+        assert_eq!(s.detail(), "because reasons");
     }
 
     // ===================================================================
