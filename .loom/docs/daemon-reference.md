@@ -457,6 +457,60 @@ epic-action topic — those dispatches already surface on the frozen
 epic-supervisor action across all epics, or `epic.issue.{N}` for one epic
 (segment-aligned prefix match, same routing rule as the sweep topics).
 
+## Autonomous work finder (#3810)
+
+The **work finder** (Phase A of epic #3809,
+[`loom-daemon/src/work_finder.rs`](../../loom-daemon/src/work_finder.rs)) is the
+daemon-native poller that turns a human-approved `loom:issue` into a dispatched
+build **without an operator** — restoring the one capability the deleted v0.10.0
+shepherd brain had that the daemon rebuild never replaced. It is **opt-in and
+off by default**: unset `LOOM_WORK_FINDER` and the daemon's behavior is
+byte-for-byte unchanged (the only sweep entry point remains the explicit
+`DispatchSweep` IPC request).
+
+Unlike the epic supervisor, the work finder runs as a plain `tokio::spawn`
+interval task on the **shared daemon runtime** (the same footing as the reaper),
+not a dedicated OS thread. Every call into `SweepRegistry::dispatch()` returns
+promptly (fire-and-forget child spawn), so the loop never parks a runtime worker
+in a long blocking call — the OS-thread machinery the epic supervisor needs for
+its minutes-long spawn-and-wait role dispatches is unnecessary here.
+
+Each tick:
+
+1. Queries the forge for ready work — `gh issue list --label loom:issue --state
+   open --limit 200 --json number,labels` (honoring `LOOM_REPO` for `--repo`).
+2. Filters out issues that are **already in flight** (a live `Running` /
+   `Pending` entry in the sweep registry — the authoritative dedup, robust to
+   `loom:issue → loom:building` label-flip lag) or that defensively carry any
+   skip label (`loom:building` / `loom:blocked` / `loom:operator-only`).
+3. Dispatches the remainder through the existing `SweepRegistry::dispatch()`
+   path — up to a **fixed** max-concurrency cap counted against the current live
+   sweep occupancy. `dispatch()` already flips `loom:issue → loom:building`,
+   acquires the per-issue `mkdir`-atomic claim lock, and spawns the
+   rotated-token child, so the finder reimplements none of the race guard. Each
+   dispatch uses a `workfinder-<issue>` idempotency key, making a re-dispatch of
+   an already-running issue a no-op.
+
+The loop is **idempotent** (an issue already in the registry is never
+re-dispatched) and **fail-safe**: a forge-query error aborts only that tick
+(logged, retried next tick) and a single dispatch error is logged and counted,
+never crashing the daemon. Dispatches surface on the frozen
+`sweep.global.dispatch` topic (emitted inside `dispatch()`); the finder adds no
+new event topics.
+
+Enable it with `LOOM_WORK_FINDER=1` (unset/false-y = OFF). Tunables:
+`LOOM_WORK_FINDER_INTERVAL_SECS` (default 60 — tighter than the epic
+supervisor's 300s so the `loom:issue` backlog drains promptly) and
+`LOOM_WORK_FINDER_MAX_CONCURRENT` (default 3 — the fixed MVP cap; dynamic
+scaling is deferred to Phase B). A zero or unparseable value for either tunable
+falls back to its default.
+
+> **Scope note**: the work finder dispatches **already-approved** `loom:issue`
+> items; it does **not** generate new work. Architect/Hermit work-generation
+> cadence remains out of scope (follow-up #3381). So "the daemon does not
+> generate work" below still holds — the finder only closes the gap between an
+> approved issue and its build.
+
 ## Locks and lifecycle
 
 Each dispatched sweep acquires a directory lock under

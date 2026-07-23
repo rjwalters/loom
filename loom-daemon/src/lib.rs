@@ -28,6 +28,7 @@ pub mod role_validation;
 pub mod sweep_registry;
 pub mod terminal;
 pub mod types;
+pub mod work_finder;
 pub mod worktree_root;
 
 use std::collections::HashSet;
