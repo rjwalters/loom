@@ -2590,6 +2590,45 @@ fi
 echo ""
 
 # ==========================================================================
+# Test: check-labels-drift.sh (root vs defaults labels.yml parity, #3896)
+# ==========================================================================
+echo "Test: check-labels-drift.sh detects drift and passes the in-sync real tree"
+DRIFT_LINT="$DEFAULTS_DIR/scripts/check-labels-drift.sh"
+if [[ ! -x "$DRIFT_LINT" ]]; then
+  fail "check-labels-drift.sh missing or not executable"
+else
+  # (a) The real tree ships the two labels.yml copies byte-identical.
+  if bash "$DRIFT_LINT" "$LOOM_ROOT" >/dev/null 2>&1; then
+    pass "check-labels-drift passes against the real (in-sync) tree"
+  else
+    fail "check-labels-drift flagged the real tree (labels.yml copies should match)"
+  fi
+
+  # (b) A fixture whose defaults/ copy is missing a label must fail.
+  DRIFT_FIX="$(mktemp -d)"
+  mkdir -p "$DRIFT_FIX/.github" "$DRIFT_FIX/defaults/.github"
+  cp "$LOOM_ROOT/.github/labels.yml" "$DRIFT_FIX/.github/labels.yml"
+  grep -v 'loom:auditor-capability-request' "$LOOM_ROOT/.github/labels.yml" \
+    > "$DRIFT_FIX/defaults/.github/labels.yml"
+  DRIFT_OUT="$(bash "$DRIFT_LINT" "$DRIFT_FIX" 2>&1)" && DRIFT_RC=0 || DRIFT_RC=$?
+  if [[ "$DRIFT_RC" -ne 0 ]] && echo "$DRIFT_OUT" | grep -q "drifted"; then
+    pass "check-labels-drift fails (exit $DRIFT_RC) when the copies diverge"
+  else
+    fail "check-labels-drift did not catch the injected drift (rc=$DRIFT_RC)"
+  fi
+
+  # (c) The same fixture with identical copies must pass.
+  cp "$LOOM_ROOT/.github/labels.yml" "$DRIFT_FIX/defaults/.github/labels.yml"
+  if bash "$DRIFT_LINT" "$DRIFT_FIX" >/dev/null 2>&1; then
+    pass "check-labels-drift passes when the two copies are identical"
+  else
+    fail "check-labels-drift false-positived on identical copies"
+  fi
+  rm -rf "$DRIFT_FIX"
+fi
+echo ""
+
+# ==========================================================================
 # Summary
 # ==========================================================================
 echo "======================================"

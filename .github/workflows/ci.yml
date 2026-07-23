@@ -93,5 +93,7 @@ jobs:
       - uses: actions/checkout@v7
       - name: Check role prompts reference only real labels (#3786)
         run: bash defaults/scripts/check-phantom-labels.sh
+      - name: Check labels.yml copies are in sync (#3896)
+        run: bash defaults/scripts/check-labels-drift.sh
       - name: Run installer tests
         run: bash scripts/test-installer.sh

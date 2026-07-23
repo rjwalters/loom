@@ -26,10 +26,11 @@
 # `/loom:sweep` command) does not trip the check.
 #
 # Registry: the UNION of label names in `<root>/.github/labels.yml` and
-# `<root>/defaults/.github/labels.yml`. The union is used deliberately — the two
-# files have drifted (the installer template is a subset of the repo copy), and
-# reconciling them is out of scope for #3786; a label defined in either file is
-# real, and a phantom label is absent from BOTH.
+# `<root>/defaults/.github/labels.yml`. A label defined in either file is real,
+# and a phantom label is absent from BOTH. As of #3896 the two files are kept
+# BYTE-IDENTICAL (enforced by defaults/scripts/check-labels-drift.sh), so the
+# union now equals either file on its own; it is retained here defensively so
+# this lint stays correct even if the two copies transiently diverge.
 #
 # Usage:
 #   check-phantom-labels.sh [ROOT]
