@@ -63,7 +63,7 @@ Both worktree paths get a `.loom-managed` sentinel and are auto-cleaned by `merg
 - **Do NOT refactor code** you encounter while investigating (e.g., converting sync to async, modernizing patterns)
 - **Do NOT "improve" files** that are unrelated to the specific failure you are fixing
 - **Do NOT change test infrastructure** (imports, fixtures, patterns) beyond what is needed for the fix
-- **Do NOT fix pre-existing issues** unrelated to the current failure — signal them as pre-existing (exit code 5) instead
+- **Do NOT fix pre-existing issues** unrelated to the current failure — leave them alone and note them in a PR comment instead
 
 ### Scope Verification
 
@@ -86,160 +86,30 @@ Check for an argument passed via the slash command:
 
 **Arguments**: `$ARGUMENTS`
 
-### Test Fix Mode (from Shepherd)
+### PR Fix Mode
 
-If arguments contain `--test-fix <issue>` (e.g., `--test-fix 123` or `--test-fix 123 --context /path/to/context.json`):
-1. This is a **test failure recovery** invoked by the Shepherd
-2. You are working in the issue worktree (already checked out)
-3. Your ONLY job is to fix the failing tests described in the context
-4. **Read the context file first** if `--context <path>` is provided:
-   ```bash
-   cat <path>
-   ```
-   The context file (`.loom-test-failure-context.json`) contains:
-   - `test_command`: The test command that was run
-   - `test_output_tail`: Last 50 lines of test output showing what failed
-   - `test_summary`: Parsed test summary (e.g., "3 failed, 12 passed")
-   - `changed_files`: Files the builder modified (your scope)
-   - `failure_message`: Human-readable failure description
-
-5. **Run the failing test to see full output** — the context file's `test_output_tail` may not include the full traceback. Re-run the test to see everything:
-   ```bash
-   # Run the exact test command from the context to see full output
-   <test_command from context>
-   ```
-
-6. **Diagnose using the patterns below** — identify which failure pattern applies and follow the corresponding fix strategy.
-
-7. **CRITICAL RULES for test fix mode:**
-   - Fix ONLY the specific test failures described in the context
-   - Do NOT make changes to files outside the `changed_files` list unless a test failure directly requires it
-   - Do NOT make opportunistic improvements, refactoring, or unrelated fixes
-   - If test failures are in code you didn't change, check if your changes broke them
-   - If failures are pre-existing and unrelated to the builder's changes, document this and exit
-   - Run the test command from the context to verify your fix works
-
-8. After fixing, commit and proceed normally
-
-### Test Failure Diagnostic Patterns
-
-When diagnosing test failures in test-fix mode, identify which pattern applies and follow the corresponding strategy. **Start with pattern recognition, not guesswork.**
-
-#### Pattern 1: Assertion Value Mismatch (Most Common)
-
-**How to recognize** — pytest output shows expected vs actual values:
-```
-AssertionError: expected call not found.
-Expected: func(arg1, param='old_value')
-Actual: func(arg1, param='new_value')
-```
-Or:
-```
-E       assert 'old_value' == 'new_value'
-E         - new_value
-E         + old_value
-```
-Or `assert_called_once_with` / `assert_called_with` / `assert_any_call` showing different parameter values.
-
-**Fix strategy:**
-1. Find the test file and line number from the traceback
-2. Read the failing test assertion
-3. Read the **implementation** (the production code) to confirm what value it actually produces
-4. **Update the test** to match the implementation — the builder changed the implementation intentionally, so the test expectation is stale
-5. Verify the fix: re-run the test command
-
-**Example:**
-```python
-# Test says (STALE):
-mock_func.assert_called_once_with(failure_label="loom:failed:judge", quiet=True)
-
-# Implementation now passes:
-mock_func(failure_label="loom:blocked", quiet=True)
-
-# Fix: Update test to match implementation
-mock_func.assert_called_once_with(failure_label="loom:blocked", quiet=True)
-```
-
-**Key principle:** When the builder changed implementation behavior and the test asserts old behavior, the test is wrong — not the implementation. Update the test assertion.
-
-#### Pattern 2: Missing Import or Attribute
-
-**How to recognize:**
-```
-ImportError: cannot import name 'OldName' from 'module'
-AttributeError: module 'X' has no attribute 'Y'
-NameError: name 'X' is not defined
-```
-
-**Fix strategy:**
-1. Check if the builder renamed/moved the symbol
-2. Update the import or reference in the test to use the new name/location
-
-#### Pattern 3: Mock Setup Mismatch
-
-**How to recognize:**
-```
-AttributeError: <MagicMock ...> does not have the attribute 'new_method'
-TypeError: func() got an unexpected keyword argument 'new_param'
-```
-
-**Fix strategy:**
-1. The builder added/changed a method or parameter in the implementation
-2. Update mock setup (e.g., add `spec=`, update `return_value`, add new mock attributes)
-
-#### Pattern 4: Structural Change (New/Removed Fields)
-
-**How to recognize:**
-```
-KeyError: 'new_field'
-TypeError: __init__() got an unexpected keyword argument 'new_field'
-ValidationError: field required
-```
-
-**Fix strategy:**
-1. Check what fields/parameters the builder added or removed
-2. Update test data fixtures, factory functions, or constructor calls to match
-
-#### General Diagnostic Checklist
-
-If none of the patterns above match clearly:
-1. **Read the full traceback** — identify the exact file and line
-2. **Read the test code** at that line
-3. **Read the implementation code** the test is exercising
-4. **Compare**: What does the test expect? What does the implementation do?
-5. **Fix the gap** — align the test with the implementation
-
-### Standard PR Fix Mode
-
-If a number is provided without `--test-fix` (e.g., `/doctor 123` or `/doctor 123 --context /path/to/context.json`):
+If a number is provided (e.g., `/doctor 123`):
 1. Treat that number as the target **PR** to fix
 2. **Skip** the "Finding Work" section entirely
 3. Claim the PR: `gh pr edit <number> --add-label "loom:treating"`
-4. **Read the context file first** if `--context <path>` is provided (see below)
-5. Proceed directly to fixing that PR
+4. Proceed directly to fixing that PR
 
-**Structured judge feedback context** (when `--context <path>` is provided):
-
-When invoked by the Shepherd after a judge rejection, a context file is written to help you understand exactly what the judge found wrong. **Read it before reading PR comments** — it provides a concise, structured view of the judge's feedback:
+**How judge feedback reaches you.** When `/loom:sweep` dispatches a Doctor after a
+Judge rejection, the feedback lives in the PR itself — the Judge's review comments
+plus the `loom:changes-requested` label. Read it with:
 
 ```bash
-cat <path>
+gh pr view <pr> --comments
 ```
 
-The context file (`.loom-judge-feedback.json`) contains:
-- `pr_number`: The PR being fixed
-- `issue`: The issue number
-- `context_type`: Always `"judge_feedback"` for this mode
-- `judge_comments`: List of the judge's most recent comments, each with:
-  - `body`: The full comment text (look for specific file paths, line numbers, and what to change)
-  - `author`: Who wrote the comment
-  - `created_at`: When the comment was posted
+Focus on the Judge's most recent comments: look for specific file paths, line
+numbers, and what to change, then make the targeted fix before doing anything else.
 
-**How to use the context:**
-1. Read `judge_comments` to understand what the judge requested
-2. Identify specific files and lines mentioned in the feedback
-3. Make the targeted fix before doing anything else
-4. Use `gh pr view <pr> --comments` for additional context if the structured feedback is insufficient
+> **Note**: there is no `--test-fix` flag, no `--context` argument, and no
+> structured JSON feedback file dropped in the worktree. Those were part of the
+> Shepherd's test-fix protocol, which was removed in v0.10.0. `/loom:sweep` now
+> communicates with Doctor entirely through the PR's comments and labels — always
+> read the live feedback with `gh pr view <pr> --comments`.
 
 If no argument is provided, use the normal "Finding Work" workflow below.
 
@@ -251,8 +121,10 @@ Doctors prioritize work in the following order:
 
 **Find approved PRs with merge conflicts that aren't already claimed:**
 ```bash
-gh pr list --label="loom:pr" --state=open --search "is:open conflicts:>0" --json number,title,labels \
-  | jq -r '.[] | select(.labels | all(.name != "loom:treating")) | "#\(.number): \(.title)"'
+# GitHub search has no `conflicts:` qualifier, so ask the API for each PR's
+# mergeability and filter on CONFLICTING locally.
+gh pr list --label="loom:pr" --state=open --json number,title,labels,mergeable \
+  | jq -r '.[] | select(.mergeable == "CONFLICTING") | select(.labels | all(.name != "loom:treating")) | "#\(.number): \(.title)"'
 ```
 
 **Why highest priority?**
@@ -272,13 +144,14 @@ gh pr list --label="loom:changes-requested" --state=open --json number,title,lab
 
 **Find PRs with merge conflicts (any label):**
 ```bash
-gh pr list --state=open --search "is:open conflicts:>0"
+gh pr list --state=open --json number,title,mergeable \
+  | jq -r '.[] | select(.mergeable == "CONFLICTING") | "#\(.number): \(.title)"'
 ```
 
 **Find all open PRs:**
 ```bash
 # Check primary queues first
-PRIORITY_1=$(gh pr list --label="loom:pr" --state=open --search "is:open conflicts:>0" --json number | jq 'length')
+PRIORITY_1=$(gh pr list --label="loom:pr" --state=open --json number,mergeable | jq '[.[] | select(.mergeable == "CONFLICTING")] | length')
 PRIORITY_2=$(gh pr list --label="loom:changes-requested" --state=open --json number | jq 'length')
 
 if [ "$PRIORITY_1" -eq 0 ] && [ "$PRIORITY_2" -eq 0 ]; then
@@ -303,8 +176,9 @@ if [ "$PRIORITY_1" -eq 0 ] && [ "$PRIORITY_2" -eq 0 ]; then
       cd ".loom/worktrees/pr-$UNLABELED_PR"
     fi
 
-    # Check for merge conflicts
-    if git merge-tree origin/main | grep -q "^+<<<<<<<"; then
+    # Check for merge conflicts (ask the forge; `git merge-tree origin/main`
+    # alone is not a valid invocation — it needs the base + two commits).
+    if [ "$(gh pr view "$UNLABELED_PR" --json mergeable --jq '.mergeable')" = "CONFLICTING" ]; then
       # Resolve conflicts
       git fetch origin main
       git rebase origin/main
@@ -326,7 +200,7 @@ Doctor iteration starts
     ↓
 Search Priority 1 (loom:pr + conflicts)
     ↓
-    ├─→ Found? → Fix conflicts, update labels
+    ├─→ Found? → Fix conflicts, KEEP loom:pr (see "Label Ownership" below)
     │
     └─→ None found
             ↓
@@ -443,7 +317,7 @@ gh pr edit 588 --remove-label "loom:treating" --add-label "loom:review-requested
 
 ### Why Check CI First?
 
-During shepherd orchestration, Doctors often required 3+ separate passes because they fixed one failure at a time:
+In past orchestration runs, Doctors often required 3+ separate passes because they fixed one failure at a time:
 - Round 1: Fixed Rust test only
 - Round 2: Fixed TypeScript error only
 - Round 3: Finally fixed all 21 remaining frontend tests
@@ -689,7 +563,8 @@ gh pr list --label="loom:changes-requested" --state=open --json number,title,lab
   | jq -r '.[] | select(.labels | all(.name != "loom:treating")) | "#\(.number): \(.title)"'
 
 # Find PRs with merge conflicts
-gh pr list --state=open --search "is:open conflicts:>0"
+gh pr list --state=open --json number,title,mergeable \
+  | jq -r '.[] | select(.mergeable == "CONFLICTING") | "#\(.number): \(.title)"'
 
 # Claim the PR before starting work
 gh pr edit 42 --add-label "loom:treating"
@@ -767,6 +642,38 @@ gh pr checks 42
 ```
 
 **Important**: Always use `--force-with-lease` instead of `--force` to avoid overwriting others' work.
+
+#### Which labels to touch after a conflict-only fix
+
+The label transition depends on **which queue the PR came from**:
+
+- **A judge-approved PR (`loom:pr`) that you rebased for conflicts only** — **keep
+  `loom:pr` intact.** The Judge already approved the code; a pure conflict rebase
+  does not invalidate that approval, and dropping `loom:pr` (or routing it through
+  `loom:changes-requested` → `loom:review-requested`) would revoke the approval and
+  force a needless full re-review, un-blocking nothing. Remove only your own
+  `loom:treating` claim, add the `<!-- loom:conflict-only -->` marker comment (see
+  below) so the Judge can fast-track if it wants to re-verify, and leave `loom:pr`
+  for Champion to merge.
+- **A PR from the `loom:changes-requested` queue** — after addressing the feedback,
+  transition `loom:changes-requested` → `loom:review-requested` as usual (this hands
+  the PR back to the Judge). This is the standard feedback cycle and is unchanged.
+
+#### Label Ownership (Doctor-domain conflict/CI labels)
+
+`.github/labels.yml` defines two status labels that describe the exact failure
+states Doctor exists to clear:
+
+| Label | Meaning | Doctor's action |
+|-------|---------|-----------------|
+| `loom:merge-conflict` | PR has merge conflicts requiring resolution | **Remove it once you have rebased and the conflicts are resolved** (the PR is no longer conflicting). Apply it if you triage a conflicted PR you cannot immediately fix. |
+| `loom:ci-failure` | PR has failing CI checks | **Remove it once CI is green again** after your fix. Apply it if you are flagging a PR whose CI is red and leaving it for a follow-up. |
+
+These are informational status flags, not queue gates — the primary Doctor queues
+are still `loom:pr` (conflicts) and `loom:changes-requested` (feedback). Keep them
+accurate: they should reflect the PR's **current** state, so clear them the moment
+the underlying problem is gone, and never leave a stale `loom:merge-conflict` /
+`loom:ci-failure` on a PR you have just made mergeable.
 
 ### Signaling Conflict-Only Resolution (Fast-Track Review)
 
@@ -934,37 +841,22 @@ Keep it brief (3-6 words) and descriptive:
 
 ## Pre-existing Failures
 
-When working on test failures during shepherd orchestration, you may discover that the failures are **pre-existing** — they existed before the builder's changes and are unrelated to the current issue. In this case, you should signal this explicitly rather than making no changes.
+While fixing a PR you may find that some CI failures are **pre-existing** — they
+existed on `main` before the PR's changes and are unrelated to it. Do not expand
+scope to chase them, and do not silently ignore them either.
 
-### When to Signal Pre-existing Failures
+Handle a pre-existing failure like this:
+1. Confirm it is genuinely pre-existing — it would still fail with the PR's changes
+   reverted (e.g. reproduce it on `origin/main`).
+2. Fix only what is in scope for this PR's feedback.
+3. Leave a PR comment documenting the pre-existing failure so the Judge and Champion
+   have context, and (if it is worth tracking) create a separate issue with
+   `loom:triage` + `loom:urgent` and link it from the comment.
 
-Signal pre-existing failures when ALL of these conditions are true:
-1. You've been asked to fix test failures (not PR review feedback)
-2. After analysis, you determine the failures are NOT caused by the builder's changes
-3. The failures would exist even if the builder's changes were reverted
-4. Fixing the failures is outside the scope of the current issue
-
-### How to Signal
-
-Use the special exit code **5** to explicitly communicate that failures are pre-existing:
-
-```bash
-# After determining failures are pre-existing, exit with code 5
-exit 5
-```
-
-### Benefits of Explicit Signaling
-
-- **Faster pipeline**: Shepherd immediately continues to PR creation
-- **Clear audit trail**: Logs show "Doctor determined failures are pre-existing (exit code 5)"
-- **Better observability**: Explicit signal vs. inferred from no commits
-- **Reduced ambiguity**: No guessing whether Doctor attempted a fix or decided not to
-
-### What NOT to Do
-
-- **Don't exit 5 if you made any commits** — the shepherd will verify and may fail
-- **Don't exit 5 for failures you could reasonably fix** — only for truly unrelated issues
-- **Don't exit 5 for PR review feedback** — this is only for test failure recovery
+> **Note**: there is no exit-code-5 "pre-existing" signal. That was part of the
+> Shepherd's test-fix protocol, removed in v0.10.0 — nothing downstream interprets
+> a Doctor exit code today. `/loom:sweep` reads the PR state (labels, comments, CI),
+> not a process exit code, so communicate through PR comments and labels instead.
 
 ## Completion
 
