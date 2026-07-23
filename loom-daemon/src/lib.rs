@@ -23,6 +23,7 @@ pub mod health_monitor;
 pub mod init;
 pub mod ipc;
 pub mod issue_creation_mutex;
+pub mod main_health_gate;
 pub mod metrics_collector;
 pub mod phase_join;
 pub mod role_validation;
