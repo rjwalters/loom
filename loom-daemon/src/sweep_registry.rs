@@ -99,6 +99,99 @@ pub const EXPERIMENT_ENV_ALLOWLIST: &[&str] = &[
     "LOOM_TRANSCRIPT_ARCHIVE",
 ];
 
+/// Issue #3802: fallback `token_name` recorded when `spawn-claude.sh`'s
+/// account selection cannot be captured (e.g. the `LOOM_SPAWN_NO_EXPORT`
+/// bypass path, where the caller pre-exported `CLAUDE_CODE_OAUTH_TOKEN` and no
+/// account is selected at all — nothing to report, not a bug).
+pub const UNKNOWN_TOKEN_NAME: &str = "unknown";
+
+/// Issue #3802: the marker substring `spawn-claude.sh` logs immediately after
+/// selecting an OAuth account — `spawn-claude: using OAuth account '<name>'
+/// (mode=<mode>)` (see `defaults/scripts/spawn-claude.sh`). The daemon already
+/// captures the child's stderr into the per-sweep log, so `spawn_child` reads
+/// the log back and extracts `<name>` from the text following this marker. The
+/// account name itself carries no ANSI colour codes (only the timestamp prefix
+/// does), so a plain substring scan is sufficient — no ANSI stripping needed.
+const TOKEN_NAME_LOG_MARKER: &str = "using OAuth account '";
+
+/// Issue #3802: how long `spawn_child` polls the per-sweep log for the
+/// `TOKEN_NAME_LOG_MARKER` line before giving up and recording
+/// `UNKNOWN_TOKEN_NAME`. `spawn-claude.sh` selects and logs the account early
+/// (well before it `exec`s `claude`), so the line normally appears within a
+/// second. The poll also short-circuits the moment the child exits without
+/// having logged a selection (keeps no-selection fixtures fast), so this full
+/// window is only ever waited out in the pathological "child alive but never
+/// logged" case — capture then degrades gracefully to `UNKNOWN_TOKEN_NAME`
+/// and never blocks or fails dispatch.
+const TOKEN_NAME_CAPTURE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Issue #3802: poll cadence for the `TOKEN_NAME_LOG_MARKER` scan.
+const TOKEN_NAME_CAPTURE_POLL_INTERVAL: Duration = Duration::from_millis(25);
+
+// ============================================================================
+// Token-name capture (Issue #3802)
+// ============================================================================
+
+/// Extract the OAuth account name `spawn-claude.sh` logged, from the per-sweep
+/// log `contents`, scanning only the region at/after this dispatch's header
+/// (`header_anchor`, e.g. `sweep_id=<id>`). Returns `None` when the marker /
+/// closing quote isn't present yet or the captured name is empty. Anchoring to
+/// the current header avoids picking up a stale selection line left by a
+/// previous dispatch in the same reused per-issue log.
+fn parse_token_name_after(contents: &str, header_anchor: &str) -> Option<String> {
+    // Use the LAST header occurrence: reruns append a fresh header, and the
+    // current child logs its selection after the most recent one.
+    let region_start = contents.rfind(header_anchor)?;
+    let region = &contents[region_start..];
+    let marker_at = region.find(TOKEN_NAME_LOG_MARKER)? + TOKEN_NAME_LOG_MARKER.len();
+    let after = &region[marker_at..];
+    let close = after.find('\'')?;
+    let name = &after[..close];
+    if name.is_empty() {
+        None
+    } else {
+        Some(name.to_string())
+    }
+}
+
+/// Poll `log_path` for the account-selection marker until it appears, the
+/// child exits, or `TOKEN_NAME_CAPTURE_TIMEOUT` elapses.
+///
+/// Returns the captured account name, or `UNKNOWN_TOKEN_NAME` when no
+/// selection was logged (the `LOOM_SPAWN_NO_EXPORT` bypass, a timeout, or a
+/// child that exited before logging). Never blocks longer than the timeout and
+/// never fails dispatch.
+///
+/// The `try_wait` early-exit keeps no-selection cases fast (a fixture that
+/// exits without logging is detected immediately rather than waiting out the
+/// full window). `try_wait` caches the exit status, so the reaper's later
+/// `try_wait` on the same handle still observes the exit.
+fn poll_token_name(child: &mut Child, log_path: &Path, header_anchor: &str) -> String {
+    let deadline = std::time::Instant::now() + TOKEN_NAME_CAPTURE_TIMEOUT;
+    loop {
+        if let Ok(contents) = std::fs::read_to_string(log_path) {
+            if let Some(name) = parse_token_name_after(&contents, header_anchor) {
+                return name;
+            }
+        }
+        // If the child has already exited without logging a selection, the
+        // line will never appear — do a final read (covers a log flushed right
+        // before exit) and stop, rather than waiting out the timeout.
+        if matches!(child.try_wait(), Ok(Some(_))) {
+            if let Ok(contents) = std::fs::read_to_string(log_path) {
+                if let Some(name) = parse_token_name_after(&contents, header_anchor) {
+                    return name;
+                }
+            }
+            return UNKNOWN_TOKEN_NAME.to_string();
+        }
+        if std::time::Instant::now() >= deadline {
+            return UNKNOWN_TOKEN_NAME.to_string();
+        }
+        std::thread::sleep(TOKEN_NAME_CAPTURE_POLL_INTERVAL);
+    }
+}
+
 // ============================================================================
 // Registry
 // ============================================================================
@@ -817,17 +910,29 @@ impl SweepRegistry {
             }
         }
 
-        let child = cmd
+        let mut child = cmd
             .spawn()
             .with_context(|| format!("failed to spawn {} -p '{}'", spawn_bin.display(), prompt))?;
         // Issue #3801: we RETAIN the `Child` handle (returned to `dispatch`,
         // which stores it in `self.children`) instead of dropping it. The
         // reaper `try_wait()`s it each tick so an exited child is reaped
         // (no `<defunct>` zombie) and the registry transitions to a terminal
-        // state with the real exit status. spawn-claude.sh internally selects
-        // a token; we record "unknown" here because the wrapper's selection is
-        // logged to the per-sweep log, not exposed on stdout.
-        Ok((child, "unknown".to_string()))
+        // state with the real exit status.
+        //
+        // Issue #3802: capture which OAuth account `spawn-claude.sh` selected
+        // for this sweep so `list_sweeps` / `get_sweep_status` can report it
+        // (an observability gap for a multi-account pool otherwise). The
+        // wrapper's selection is logged (not exposed on stdout), and the
+        // child's stderr is already captured into the per-sweep log above, so
+        // we poll that log for the `using OAuth account '<name>'` marker. The
+        // scan is anchored to THIS dispatch's header line (`sweep_id=<id>`,
+        // written above) so a stale line from a previous dispatch appended to
+        // the same per-issue log is never mistaken for the current selection.
+        // Falls back to `UNKNOWN_TOKEN_NAME` on timeout / no-selection — never
+        // blocks or fails dispatch.
+        let header_anchor = format!("sweep_id={sweep_id}");
+        let token_name = poll_token_name(&mut child, log_path, &header_anchor);
+        Ok((child, token_name))
     }
 
     // ------------------------------------------------------------------------
@@ -2787,6 +2892,118 @@ exit 0
         assert!(
             recorded.contains(".loom/tokens/agent-1.token"),
             "expected TOKEN_SOURCE to point at .loom/tokens/; got: {recorded}"
+        );
+    }
+
+    // ------------------------------------------------------------------------
+    // Issue #3802: capture spawn-claude's selected account into token_name.
+    // ------------------------------------------------------------------------
+
+    #[test]
+    fn parse_token_name_after_extracts_selected_account() {
+        let log = "\
+==== loom-daemon dispatch: 2026-07-23T00:00:00Z sweep_id=sweep-issue-3780-abc issue=3780 ====
+\u{1b}[0;34m[2026-07-23T00:00:01Z]\u{1b}[0m spawn-claude: using OAuth account 'agent3-2amlogic' (mode=random)
+";
+        assert_eq!(
+            parse_token_name_after(log, "sweep_id=sweep-issue-3780-abc").as_deref(),
+            Some("agent3-2amlogic"),
+        );
+    }
+
+    #[test]
+    fn parse_token_name_after_ignores_stale_line_before_current_header() {
+        // A previous dispatch's selection line, then this dispatch's header
+        // with NO selection line yet: must NOT return the stale name.
+        let log = "\
+==== loom-daemon dispatch: old sweep_id=sweep-issue-3780-OLD issue=3780 ====
+spawn-claude: using OAuth account 'stale-account' (mode=random)
+==== loom-daemon dispatch: new sweep_id=sweep-issue-3780-NEW issue=3780 ====
+";
+        assert_eq!(parse_token_name_after(log, "sweep_id=sweep-issue-3780-NEW"), None,);
+        // Once the current child logs, the current selection wins.
+        let log2 =
+            format!("{log}spawn-claude: using OAuth account 'fresh-account' (mode=ranking)\n");
+        assert_eq!(
+            parse_token_name_after(&log2, "sweep_id=sweep-issue-3780-NEW").as_deref(),
+            Some("fresh-account"),
+        );
+    }
+
+    #[test]
+    fn parse_token_name_after_none_when_marker_absent_or_empty() {
+        // No marker at all.
+        assert_eq!(parse_token_name_after("no selection here", "sweep_id=x"), None);
+        // Header present but no marker.
+        assert_eq!(
+            parse_token_name_after("sweep_id=x issue=1 ====\nsome other line\n", "sweep_id=x"),
+            None,
+        );
+        // Empty account name is treated as "nothing to report".
+        assert_eq!(
+            parse_token_name_after("sweep_id=x using OAuth account '' (mode=random)", "sweep_id=x"),
+            None,
+        );
+    }
+
+    /// End-to-end: a dispatched sweep whose (fake) `spawn-claude.sh` logs the
+    /// `using OAuth account '<name>'` line records that account as the registry
+    /// `token_name` — reported by both `DispatchOutcome` and the stored
+    /// `SweepInfo` (which `list_sweeps` / `get_sweep_status` read from). This
+    /// closes the "always unknown" gap (issue #3802). Mirrors the live-dispatch
+    /// finding: issue #3780 selected account `agent3-2amlogic`.
+    #[test]
+    #[serial]
+    fn dispatch_captures_selected_account_into_token_name() {
+        let dir = tempdir().unwrap();
+        // A fake wrapper that logs the selection to stderr exactly as the real
+        // spawn-claude.sh does, then lingers briefly (mimicking `exec claude`,
+        // which keeps running long after the selection is logged). The daemon
+        // already captures this stderr into the per-sweep log.
+        let script = "#!/usr/bin/env bash\n\
+set -euo pipefail\n\
+echo \"spawn-claude: using OAuth account 'agent3-2amlogic' (mode=random)\" >&2\n\
+sleep 0.5\n\
+exit 0\n";
+        let mut registry = lifecycle_registry(dir.path(), script);
+
+        let outcome = registry
+            .dispatch(&SweepKind::Issue(3780), None, None, None, None)
+            .unwrap();
+        assert!(outcome.was_new);
+        assert_eq!(
+            outcome.token_name, "agent3-2amlogic",
+            "DispatchOutcome should carry the selected account, not 'unknown'"
+        );
+
+        let info = registry
+            .get_status(&outcome.sweep_id)
+            .expect("dispatched sweep should be in the registry");
+        assert_eq!(
+            info.token_name, "agent3-2amlogic",
+            "stored SweepInfo (what list_sweeps/get_sweep_status report) should \
+             carry the selected account"
+        );
+    }
+
+    /// The `LOOM_SPAWN_NO_EXPORT` bypass path selects no account, so nothing is
+    /// logged — `token_name` must remain `unknown` (not a regression, the
+    /// expected "nothing to report" case). Verified here with a fixture that
+    /// exits without logging a selection: the `try_wait` early-exit means this
+    /// resolves promptly rather than waiting out the capture timeout.
+    #[test]
+    #[serial]
+    fn dispatch_token_name_unknown_when_no_selection_logged() {
+        let dir = tempdir().unwrap();
+        let script = "#!/usr/bin/env bash\nset -euo pipefail\nexit 0\n";
+        let mut registry = lifecycle_registry(dir.path(), script);
+
+        let outcome = registry
+            .dispatch(&SweepKind::Issue(4242), None, None, None, None)
+            .unwrap();
+        assert_eq!(
+            outcome.token_name, UNKNOWN_TOKEN_NAME,
+            "no selection logged => token_name stays 'unknown'"
         );
     }
 
