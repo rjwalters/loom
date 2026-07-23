@@ -566,6 +566,12 @@ concurrency ceiling 5" and share it with the team:
     },
     "mainHealthGate": {
       "enabled": true
+    },
+    "dispatchStaggerMs": 2000,
+    "watchdog": {
+      "enabled": true,
+      "timeoutSecs": 120,
+      "intervalSecs": 30
     }
   }
 }
@@ -585,6 +591,24 @@ exactly like `main_health_gate::read_build_gate_config`.
 | `autonomous.workFinder.intervalSecs` | `LOOM_WORK_FINDER_INTERVAL_SECS` | `60` | Zero/invalid → default |
 | `autonomous.workFinder.maxConcurrent` | `LOOM_WORK_FINDER_MAX_CONCURRENT` | `3` | Operator **ceiling**, not a fixed target |
 | `autonomous.mainHealthGate.enabled` | `LOOM_MAIN_HEALTH_GATE` | `false` | Gate loop on/off |
+| `autonomous.dispatchStaggerMs` | `LOOM_SWEEP_DISPATCH_STAGGER_MS` | `2000` | Min gap between consecutive child spawns (#3887). `0` disables |
+| `autonomous.watchdog.enabled` | `LOOM_SWEEP_WATCHDOG` | `true` | Startup watchdog on/off (#3887) |
+| `autonomous.watchdog.timeoutSecs` | `LOOM_SWEEP_WATCHDOG_TIMEOUT_SECS` | `120` | No-progress window before auto-restart |
+| `autonomous.watchdog.intervalSecs` | `LOOM_SWEEP_WATCHDOG_INTERVAL_SECS` | `30` | Watchdog probe cadence |
+
+**Startup-race mitigation (#3887).** Rapid back-to-back dispatch (the work
+finder draining a backlog in one tick) could wedge some `claude` children at
+startup in a 0-HTTPS MCP-init race: the sweep log showed only the spawn header,
+no worktree was created, and the issue never left `loom:building`. Two layers
+now guard against it: the **dispatch stagger** spaces consecutive child spawns
+out of the simultaneous-startup window (prevention), and the **startup
+watchdog** probes each running sweep for progress (worktree created / checkpoint
+written / log output past the spawn header) and auto-cancels + re-dispatches —
+**exactly once, bounded, never a loop** — any sweep hung with no progress past
+`timeoutSecs`. Both the auto-cancel and the retry log loudly and reuse the
+frozen `sweep.issue.{N}.exited` / `sweep.global.completed` / `sweep.global.dispatch`
+topics (no new event topics). The watchdog defaults **on**; disable it with
+`LOOM_SWEEP_WATCHDOG=0` or `autonomous.watchdog.enabled = false`.
 
 The **gate's behavior** (which command runs against `main`, its timeout) still
 comes from the separate top-level `buildGate` block (#3749); `autonomous.mainHealthGate`

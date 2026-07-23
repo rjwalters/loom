@@ -55,7 +55,7 @@ use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 // ============================================================================
 // Constants
@@ -127,6 +127,168 @@ const TOKEN_NAME_CAPTURE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Issue #3802: poll cadence for the `TOKEN_NAME_LOG_MARKER` scan.
 const TOKEN_NAME_CAPTURE_POLL_INTERVAL: Duration = Duration::from_millis(25);
+
+// ----------------------------------------------------------------------------
+// Startup-race mitigation: dispatch stagger + watchdog (Issue #3887)
+// ----------------------------------------------------------------------------
+//
+// # Root cause (0-HTTPS MCP-init race)
+//
+// When `loom-daemon` dispatches several sweeps back-to-back (the autonomous
+// work-finder drains a `loom:issue` backlog in a single tick), each spawned
+// `claude -p "/loom:sweep N"` child immediately forks its own `mcp-loom` node
+// child and performs the MCP stdio handshake plus Claude Code's local startup
+// (config + keychain read) BEFORE its first API call. When many of those
+// startups run *simultaneously* (all within ~1s), some children wedge in that
+// pre-API phase: the sweep log shows only the spawn header + the
+// `spawn-claude: using OAuth account` line, no worktree is ever created, the
+// process sits at ~0% CPU with **zero** open HTTPS connections, and the issue
+// never leaves `loom:building`. Re-dispatching the same issue as a fresh
+// process reliably clears it — the smoking gun that it is a *startup* race, not
+// a rate-limit or a bad token.
+//
+// The token-selection files (`.loom/tokens/.ranking` / `.bad_tokens` /
+// `index.json`) are NOT the culprit: `select.py` only *reads* them at spawn
+// time (concurrent reads are safe), and the one writer path (`.bad_tokens`)
+// is already `mkdir`-lock guarded and atomic. A read race would mis-select a
+// token, never hang — and the hang is observed *after* the account line is
+// already logged. The contention is the simultaneous MCP-init / local-startup
+// itself.
+//
+// # Two-layer mitigation
+//
+// 1. **Dispatch stagger (prevention)** — the registry serializes child
+//    startups by enforcing a minimum wall-clock gap between consecutive
+//    `spawn`s (`apply_dispatch_stagger`). Spacing the spawns out of the
+//    simultaneous window is what actually prevents the race; a burst of K
+//    dispatches becomes K spawns spaced `stagger` apart instead of K
+//    near-simultaneous ones.
+// 2. **Startup watchdog (self-heal backstop)** — a background task probes each
+//    running sweep for *progress* (worktree created / checkpoint written / log
+//    output past the spawn header). A sweep that shows none within
+//    `timeout` (default 120s) is auto-cancelled and re-dispatched **exactly
+//    once** (bounded — never a loop), so a hang that slips past the stagger
+//    self-heals instead of silently wedging an issue.
+
+/// Default minimum wall-clock gap the registry enforces between consecutive
+/// child spawns (Issue #3887). Chosen to comfortably exceed the
+/// simultaneous-startup window in which the MCP-init race is observed (~1s)
+/// while adding only a small, bounded latency to a burst dispatch.
+pub const DEFAULT_DISPATCH_STAGGER_MS: u64 = 2000;
+
+/// Env var overriding the dispatch stagger, in milliseconds. `0` disables the
+/// stagger entirely (spawns are not spaced). Precedence: env > config > default.
+pub const DISPATCH_STAGGER_ENV: &str = "LOOM_SWEEP_DISPATCH_STAGGER_MS";
+
+/// Env var toggling the startup watchdog (Issue #3887). `0`/`false`/`no`/`off`
+/// disables; `1`/`true`/`yes`/`on` forces on. Overrides config.
+pub const WATCHDOG_ENABLE_ENV: &str = "LOOM_SWEEP_WATCHDOG";
+
+/// Env var overriding the watchdog no-progress timeout, in seconds.
+pub const WATCHDOG_TIMEOUT_ENV: &str = "LOOM_SWEEP_WATCHDOG_TIMEOUT_SECS";
+
+/// Env var overriding the watchdog probe interval, in seconds.
+pub const WATCHDOG_INTERVAL_ENV: &str = "LOOM_SWEEP_WATCHDOG_INTERVAL_SECS";
+
+/// Default watchdog no-progress timeout: a sweep that has created no worktree,
+/// written no checkpoint, and produced no log output past the spawn header
+/// within this window is treated as hung. Generous enough that a healthy sweep
+/// (which emits Curator-phase output well inside two minutes) never trips it.
+pub const DEFAULT_WATCHDOG_TIMEOUT_SECS: u64 = 120;
+
+/// Default watchdog probe interval — matches the reaper cadence.
+pub const DEFAULT_WATCHDOG_INTERVAL_SECS: u64 = 30;
+
+/// Grace period the watchdog gives a hung child to exit after SIGTERM before
+/// escalating to SIGKILL, when it auto-cancels for re-dispatch.
+const WATCHDOG_CANCEL_GRACE: Duration = Duration::from_secs(3);
+
+/// The dispatch-header marker `spawn_child` writes before each spawn. Reused by
+/// the watchdog's progress probe to anchor its scan to the current dispatch.
+const DISPATCH_HEADER_MARKER: &str = "==== loom-daemon dispatch:";
+
+/// Compute how long a spawn must wait so that consecutive spawns are separated
+/// by at least `stagger` (Issue #3887). Pure function of the last spawn instant,
+/// the configured gap, and the current instant — unit-tested in isolation.
+///
+/// Returns `Duration::ZERO` when the stagger is disabled (zero), when no prior
+/// spawn has happened, or when at least `stagger` has already elapsed.
+#[must_use]
+pub fn stagger_wait(last_spawn_at: Option<Instant>, stagger: Duration, now: Instant) -> Duration {
+    if stagger.is_zero() {
+        return Duration::ZERO;
+    }
+    match last_spawn_at {
+        None => Duration::ZERO,
+        Some(last) => {
+            let elapsed = now.saturating_duration_since(last);
+            stagger.checked_sub(elapsed).unwrap_or(Duration::ZERO)
+        }
+    }
+}
+
+/// The watchdog's per-sweep decision (Issue #3887). Pure state machine —
+/// [`watchdog_decision`] maps `(elapsed, timeout, made_progress,
+/// already_retried)` onto exactly one of these.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WatchdogDecision {
+    /// The sweep is making progress, or is still inside the grace window —
+    /// leave it alone.
+    Healthy,
+    /// No progress past the deadline and this issue has not been auto-restarted
+    /// yet — cancel it and re-dispatch once.
+    Restart,
+    /// No progress past the deadline but this issue was already auto-restarted
+    /// once — give up (bounded: never loop). Left for the operator.
+    GiveUp,
+}
+
+/// Pure watchdog state machine (Issue #3887).
+///
+/// - Any observed progress ⇒ [`WatchdogDecision::Healthy`] (regardless of
+///   elapsed time), so a slow-but-live sweep is never disturbed.
+/// - Still inside the timeout window ⇒ `Healthy`.
+/// - Past the timeout with no progress and not yet retried ⇒
+///   [`WatchdogDecision::Restart`].
+/// - Past the timeout with no progress and already retried ⇒
+///   [`WatchdogDecision::GiveUp`] — the retry is bounded to exactly one.
+#[must_use]
+pub fn watchdog_decision(
+    elapsed: Duration,
+    timeout: Duration,
+    made_progress: bool,
+    already_retried: bool,
+) -> WatchdogDecision {
+    if made_progress || elapsed < timeout {
+        WatchdogDecision::Healthy
+    } else if already_retried {
+        WatchdogDecision::GiveUp
+    } else {
+        WatchdogDecision::Restart
+    }
+}
+
+/// Decide, from a sweep log's contents, whether the child has produced any
+/// output *past* the daemon spawn header + `spawn-claude.sh` wrapper lines —
+/// i.e. whether Claude Code itself has started doing work (Issue #3887).
+///
+/// A hung child's log region (after the most recent dispatch header) contains
+/// only the header itself and `spawn-claude:`-prefixed wrapper lines (the
+/// account/model/effort selection). Any other non-blank line means the child
+/// got past local startup / MCP-init and is making progress. Anchoring to the
+/// LAST dispatch header ensures a previous run's output in a reused per-issue
+/// log is never counted as this dispatch's progress.
+#[must_use]
+pub fn log_has_progress(contents: &str) -> bool {
+    let region = match contents.rfind(DISPATCH_HEADER_MARKER) {
+        Some(i) => &contents[i..],
+        None => contents,
+    };
+    region.lines().any(|line| {
+        let t = line.trim();
+        !t.is_empty() && !t.contains("loom-daemon dispatch:") && !t.contains("spawn-claude:")
+    })
+}
 
 // ============================================================================
 // Token-name capture (Issue #3802)
@@ -320,6 +482,22 @@ pub struct SweepRegistry {
     /// emission is best-effort and never blocks core dispatch/reaper
     /// progress.
     bus: Option<Arc<EventBus>>,
+    /// Minimum wall-clock gap enforced between consecutive child spawns to
+    /// avoid the simultaneous-startup MCP-init race (Issue #3887). Defaults to
+    /// `Duration::ZERO` (no stagger — byte-for-byte the pre-#3887 behavior and
+    /// zero added latency in tests); `main.rs` sets the resolved
+    /// env > config > default value on the production registry.
+    dispatch_stagger: Duration,
+    /// Instant of the most recent child spawn, used with `dispatch_stagger` to
+    /// compute the stagger wait (Issue #3887). `None` until the first spawn.
+    last_spawn_at: Option<Instant>,
+    /// Issues the watchdog has already auto-restarted once (Issue #3887). The
+    /// re-dispatch is bounded to a single attempt per issue — a second hang
+    /// resolves to [`WatchdogDecision::GiveUp`], never another restart.
+    watchdog_retried: HashSet<u32>,
+    /// Issues the watchdog has already logged a give-up for, so the loud
+    /// give-up warning fires once per issue rather than every tick.
+    watchdog_gaveup: HashSet<u32>,
 }
 
 impl SweepRegistry {
@@ -334,6 +512,10 @@ impl SweepRegistry {
             entries: BTreeMap::new(),
             children: BTreeMap::new(),
             bus: None,
+            dispatch_stagger: Duration::ZERO,
+            last_spawn_at: None,
+            watchdog_retried: HashSet::new(),
+            watchdog_gaveup: HashSet::new(),
         }
     }
 
@@ -345,6 +527,10 @@ impl SweepRegistry {
             entries: BTreeMap::new(),
             children: BTreeMap::new(),
             bus: Some(bus),
+            dispatch_stagger: Duration::ZERO,
+            last_spawn_at: None,
+            watchdog_retried: HashSet::new(),
+            watchdog_gaveup: HashSet::new(),
         }
     }
 
@@ -353,6 +539,19 @@ impl SweepRegistry {
     /// the registry separately, then wire them together at startup.
     pub fn set_event_bus(&mut self, bus: Arc<EventBus>) {
         self.bus = Some(bus);
+    }
+
+    /// Set the minimum wall-clock gap enforced between consecutive child spawns
+    /// (Issue #3887). `main.rs` calls this once at startup with the resolved
+    /// env > config > default value. `Duration::ZERO` disables the stagger.
+    pub fn set_dispatch_stagger(&mut self, stagger: Duration) {
+        self.dispatch_stagger = stagger;
+    }
+
+    /// Read-only accessor for the configured dispatch stagger (Issue #3887).
+    #[must_use]
+    pub fn dispatch_stagger(&self) -> Duration {
+        self.dispatch_stagger
     }
 
     /// Read-only accessor for the event bus, if any. Exposed so external
@@ -480,6 +679,15 @@ impl SweepRegistry {
         }
 
         // 5. Compute the log path and spawn the child.
+        //
+        // Serialize concurrent child startups (Issue #3887): enforce a minimum
+        // wall-clock gap since the previous spawn so a burst of back-to-back
+        // dispatches does not launch many `claude`/`mcp-loom` startups in the
+        // same ~1s window (the 0-HTTPS MCP-init race). `dispatch` holds the
+        // registry mutex here, so the brief stagger sleep also serializes the
+        // contended startup step across concurrent dispatch callers. A zero
+        // stagger (the default outside production / in tests) is a no-op.
+        self.apply_dispatch_stagger();
         let log_path = self.compute_log_path(issue_number);
         let (child, token_name) = self
             .spawn_child(issue_number, &log_path, &sweep_id, model, effort, depends_on)
@@ -788,6 +996,23 @@ impl SweepRegistry {
         self.config
             .logs_dir()
             .join(format!("sweep-issue-{issue}.log"))
+    }
+
+    /// Enforce the configured dispatch stagger (Issue #3887): if less than
+    /// `dispatch_stagger` has elapsed since the previous spawn, sleep the
+    /// remainder, then record now as the latest spawn instant. A zero stagger
+    /// is a no-op. Called under the registry mutex from `dispatch`, so it also
+    /// serializes concurrent dispatch callers past the contended startup step.
+    fn apply_dispatch_stagger(&mut self) {
+        let wait = stagger_wait(self.last_spawn_at, self.dispatch_stagger, Instant::now());
+        if !wait.is_zero() {
+            log::debug!(
+                "sweep_registry: staggering spawn by {}ms to avoid startup race (#3887)",
+                wait.as_millis()
+            );
+            std::thread::sleep(wait);
+        }
+        self.last_spawn_at = Some(Instant::now());
     }
 
     fn spawn_child(
@@ -1433,6 +1658,163 @@ impl SweepRegistry {
     }
 
     // ------------------------------------------------------------------------
+    // Startup watchdog (Issue #3887)
+    // ------------------------------------------------------------------------
+
+    /// Probe whether a daemon-dispatched sweep has made any startup progress
+    /// (Issue #3887). Progress = the sweep got past the pre-API local-startup /
+    /// MCP-init phase, evidenced by ANY of:
+    ///
+    /// - a worktree at `.loom/worktrees/issue-<N>` (Builder-phase artifact),
+    /// - a checkpoint at `.loom/sweep-checkpoint/issue-<N>.json` (a phase
+    ///   completed), or
+    /// - log output past the spawn header + `spawn-claude.sh` wrapper lines
+    ///   ([`log_has_progress`]).
+    ///
+    /// A hung child exhibits none of these: no worktree, no checkpoint, and a
+    /// log containing only the dispatch header and the account-selection line.
+    fn sweep_made_progress(&self, issue: u32, log_path: &Path) -> bool {
+        let worktree = self
+            .config
+            .workspace_root
+            .join(".loom")
+            .join("worktrees")
+            .join(format!("issue-{issue}"));
+        if worktree.exists() {
+            return true;
+        }
+        let checkpoint = self
+            .config
+            .checkpoint_dir()
+            .join(format!("issue-{issue}.json"));
+        if checkpoint.exists() {
+            return true;
+        }
+        matches!(std::fs::read_to_string(log_path), Ok(c) if log_has_progress(&c))
+    }
+
+    /// Run one watchdog tick (Issue #3887): for each running daemon-dispatched
+    /// Issue sweep, apply the [`watchdog_decision`] state machine and, on
+    /// [`WatchdogDecision::Restart`], auto-cancel the hung child and
+    /// re-dispatch the issue **exactly once** (bounded — a second hang resolves
+    /// to [`WatchdogDecision::GiveUp`] and is left for the operator).
+    ///
+    /// Both the auto-cancel and the retry log loudly. No new event topics are
+    /// introduced: the cancel reuses the frozen
+    /// `sweep.issue.{N}.exited` / `sweep.global.completed` emission from
+    /// [`finish_cancel`], and the re-dispatch reuses `sweep.global.dispatch`
+    /// from [`dispatch`]. Returns the number of sweeps restarted this tick.
+    ///
+    /// Only sweeps this daemon instance actually spawned (a retained `Child`
+    /// handle exists) are eligible — a reconstructed entry from a prior daemon
+    /// has no handle to cancel and is left to the reaper.
+    pub fn watchdog_once(&mut self, timeout: Duration) -> usize {
+        let now = Utc::now();
+        // Snapshot eligible candidates first so we can mutate below.
+        let candidates: Vec<(SweepId, u32, PathBuf, Duration)> = self
+            .entries
+            .iter()
+            .filter(|(id, info)| {
+                matches!(info.state, SweepState::Running | SweepState::Pending)
+                    && matches!(info.kind, SweepKind::Issue(_))
+                    // Only sweeps we spawned (own the Child handle) are cancelable.
+                    && self.children.contains_key(*id)
+            })
+            .filter_map(|(id, info)| {
+                let SweepKind::Issue(issue) = info.kind else {
+                    return None;
+                };
+                let elapsed = (now - info.started_at).to_std().unwrap_or(Duration::ZERO);
+                Some((id.clone(), issue, info.log_path.clone(), elapsed))
+            })
+            .collect();
+
+        let mut restarts = 0usize;
+        for (sweep_id, issue, log_path, elapsed) in candidates {
+            let made_progress = self.sweep_made_progress(issue, &log_path);
+            let already_retried = self.watchdog_retried.contains(&issue);
+            match watchdog_decision(elapsed, timeout, made_progress, already_retried) {
+                WatchdogDecision::Healthy => {}
+                WatchdogDecision::GiveUp => {
+                    // Bounded: already retried once. Log once per issue.
+                    if self.watchdog_gaveup.insert(issue) {
+                        log::error!(
+                            "watchdog: sweep for issue #{issue} ({sweep_id}) is still stuck \
+                             {}s after an auto-restart — giving up (bounded to one retry). \
+                             Operator intervention needed (cancel + re-dispatch, or investigate \
+                             the MCP-init hang).",
+                            elapsed.as_secs()
+                        );
+                    }
+                }
+                WatchdogDecision::Restart => {
+                    log::warn!(
+                        "watchdog: sweep for issue #{issue} ({sweep_id}) made no progress in \
+                         {}s (no worktree/checkpoint, log stuck at the spawn header) — \
+                         auto-cancelling and re-dispatching once (#3887).",
+                        elapsed.as_secs()
+                    );
+                    // Capture re-dispatch params from the hung entry BEFORE
+                    // cancel mutates it.
+                    let (model, effort, depends_on, idempotency_key) = self
+                        .entries
+                        .get(&sweep_id)
+                        .map(|i| {
+                            (
+                                i.model.clone(),
+                                i.effort.clone(),
+                                i.depends_on,
+                                i.idempotency_key.clone(),
+                            )
+                        })
+                        .unwrap_or((None, None, None, None));
+
+                    // Mark retried BEFORE acting so any error path still counts
+                    // the single allowed attempt (never loops).
+                    self.watchdog_retried.insert(issue);
+
+                    // Cancel the hung child (SIGTERM → grace → SIGKILL). This
+                    // releases the per-issue lock and restores loom:building ->
+                    // loom:issue (finish_cancel's orphaned-claim recovery), so
+                    // the re-dispatch below can re-acquire cleanly.
+                    if let Err(e) = self.cancel(&sweep_id, WATCHDOG_CANCEL_GRACE) {
+                        log::error!(
+                            "watchdog: auto-cancel of hung sweep {sweep_id} (issue #{issue}) \
+                             failed: {e}"
+                        );
+                        continue;
+                    }
+
+                    match self.dispatch(
+                        &SweepKind::Issue(issue),
+                        idempotency_key,
+                        model.as_deref(),
+                        effort.as_deref(),
+                        depends_on,
+                    ) {
+                        Ok(outcome) => {
+                            restarts += 1;
+                            log::warn!(
+                                "watchdog: re-dispatched issue #{issue} as {} (pid {}) after \
+                                 startup hang (#3887).",
+                                outcome.sweep_id,
+                                outcome.pid
+                            );
+                        }
+                        Err(e) => {
+                            log::error!(
+                                "watchdog: re-dispatch of issue #{issue} after hang failed: {e} \
+                                 (issue left recoverable — its claim was already restored)."
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        restarts
+    }
+
+    // ------------------------------------------------------------------------
     // Reconstruction
     // ------------------------------------------------------------------------
 
@@ -1721,6 +2103,158 @@ pub fn spawn_reaper_task(registry: Arc<Mutex<SweepRegistry>>) -> tokio::task::Jo
                 log::info!(
                     "sweep_registry: reaper changed {changed} entr{}",
                     if changed == 1 { "y" } else { "ies" }
+                );
+            }
+        }
+    })
+}
+
+// ============================================================================
+// Startup-race config resolution + watchdog task (Issue #3887)
+// ============================================================================
+
+/// The subset of `.loom/config.json → autonomous` this module consumes for the
+/// startup-race mitigation (Issue #3887). Each field is `Option` so an absent
+/// key falls through to the env-var / built-in-default resolution — precedence
+/// **env > config > default** for every knob, matching
+/// [`crate::work_finder::WorkFinderConfig`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct StartupRaceConfig {
+    /// `autonomous.dispatchStaggerMs` — min gap between spawns, in ms. A value
+    /// of `0` is honored (disables the stagger).
+    pub dispatch_stagger_ms: Option<u64>,
+    /// `autonomous.watchdog.enabled` — whether to run the watchdog task.
+    pub watchdog_enabled: Option<bool>,
+    /// `autonomous.watchdog.timeoutSecs` — no-progress timeout, in seconds
+    /// (zero/invalid dropped to `None`).
+    pub watchdog_timeout_secs: Option<u64>,
+    /// `autonomous.watchdog.intervalSecs` — probe interval, in seconds
+    /// (zero/invalid dropped to `None`).
+    pub watchdog_interval_secs: Option<u64>,
+}
+
+/// Read `.loom/config.json → autonomous` for the startup-race knobs (Issue
+/// #3887), soft-failing every field to `None` on a missing file, malformed
+/// JSON, or an absent `autonomous` block. Mirrors
+/// [`crate::work_finder::read_work_finder_config`].
+#[must_use]
+pub fn read_startup_race_config(repo_root: &Path) -> StartupRaceConfig {
+    let config_path = repo_root.join(".loom").join("config.json");
+    let Ok(config_str) = std::fs::read_to_string(&config_path) else {
+        return StartupRaceConfig::default();
+    };
+    let Ok(config) = serde_json::from_str::<serde_json::Value>(&config_str) else {
+        log::warn!("sweep_registry: could not parse config at {}", config_path.display());
+        return StartupRaceConfig::default();
+    };
+    let Some(auto) = config.get("autonomous") else {
+        return StartupRaceConfig::default();
+    };
+    let watchdog = auto.get("watchdog");
+    StartupRaceConfig {
+        // A stagger of 0 is a meaningful "disable" value, so it is NOT filtered
+        // out here (unlike interval/timeout where 0 is nonsensical).
+        dispatch_stagger_ms: auto
+            .get("dispatchStaggerMs")
+            .and_then(serde_json::Value::as_u64),
+        watchdog_enabled: watchdog
+            .and_then(|w| w.get("enabled"))
+            .and_then(serde_json::Value::as_bool),
+        watchdog_timeout_secs: watchdog
+            .and_then(|w| w.get("timeoutSecs"))
+            .and_then(serde_json::Value::as_u64)
+            .filter(|&s| s > 0),
+        watchdog_interval_secs: watchdog
+            .and_then(|w| w.get("intervalSecs"))
+            .and_then(serde_json::Value::as_u64)
+            .filter(|&s| s > 0),
+    }
+}
+
+/// Resolve the dispatch stagger with precedence **env > config > default**
+/// (Issue #3887). A `0` (from either env or config) disables the stagger.
+#[must_use]
+pub fn resolve_dispatch_stagger(config: &StartupRaceConfig) -> Duration {
+    let ms = std::env::var(DISPATCH_STAGGER_ENV)
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .or(config.dispatch_stagger_ms)
+        .unwrap_or(DEFAULT_DISPATCH_STAGGER_MS);
+    Duration::from_millis(ms)
+}
+
+/// Resolve whether the watchdog runs, precedence **env > config >
+/// default(true)** (Issue #3887). The watchdog defaults **on** — it is a
+/// self-healing backstop with a generous timeout and a bounded single retry —
+/// but can be disabled entirely via env or config.
+#[must_use]
+pub fn resolve_watchdog_enabled(config: &StartupRaceConfig) -> bool {
+    if let Ok(v) = std::env::var(WATCHDOG_ENABLE_ENV) {
+        return matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on");
+    }
+    config.watchdog_enabled.unwrap_or(true)
+}
+
+/// Resolve the watchdog no-progress timeout, precedence **env > config >
+/// default** (Issue #3887).
+#[must_use]
+pub fn resolve_watchdog_timeout(config: &StartupRaceConfig) -> Duration {
+    let secs = std::env::var(WATCHDOG_TIMEOUT_ENV)
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|&s| s > 0)
+        .or(config.watchdog_timeout_secs)
+        .unwrap_or(DEFAULT_WATCHDOG_TIMEOUT_SECS);
+    Duration::from_secs(secs)
+}
+
+/// Resolve the watchdog probe interval, precedence **env > config > default**
+/// (Issue #3887).
+#[must_use]
+pub fn resolve_watchdog_interval(config: &StartupRaceConfig) -> Duration {
+    let secs = std::env::var(WATCHDOG_INTERVAL_ENV)
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|&s| s > 0)
+        .or(config.watchdog_interval_secs)
+        .unwrap_or(DEFAULT_WATCHDOG_INTERVAL_SECS);
+    Duration::from_secs(secs)
+}
+
+/// Spawn the startup watchdog task (Issue #3887). Every `interval`, it probes
+/// each running daemon-dispatched sweep for progress and auto-cancels +
+/// re-dispatches (once, bounded) any that have hung past `timeout`. Mirrors
+/// [`spawn_reaper_task`]: brief lock per tick, never held across the sleep.
+pub fn spawn_watchdog_task(
+    registry: Arc<Mutex<SweepRegistry>>,
+    timeout: Duration,
+    interval: Duration,
+) -> tokio::task::JoinHandle<()> {
+    log::info!(
+        "sweep_registry: starting startup watchdog (interval={}s, timeout={}s) (#3887)",
+        interval.as_secs(),
+        timeout.as_secs()
+    );
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(interval);
+        // First tick fires immediately; skip it so we don't act at boot before
+        // any sweep has had a chance to start.
+        ticker.tick().await;
+        loop {
+            ticker.tick().await;
+            let restarted = {
+                match registry.lock() {
+                    Ok(mut r) => r.watchdog_once(timeout),
+                    Err(poisoned) => {
+                        log::error!("sweep_registry: watchdog mutex poisoned ({poisoned:?})");
+                        return;
+                    }
+                }
+            };
+            if restarted > 0 {
+                log::warn!(
+                    "sweep_registry: watchdog auto-restarted {restarted} hung sweep{} (#3887)",
+                    if restarted == 1 { "" } else { "s" }
                 );
             }
         }
@@ -4046,5 +4580,417 @@ exit 0\n";
             wait_until_dead(pid, 2000),
             "killed child left a <defunct> zombie — reaper did not wait() it"
         );
+    }
+
+    // ===================================================================
+    // Startup-race mitigation: stagger + watchdog (Issue #3887)
+    // ===================================================================
+
+    // --- stagger_wait pure function ---
+
+    #[test]
+    fn stagger_wait_zero_stagger_never_waits() {
+        let now = Instant::now();
+        assert_eq!(stagger_wait(None, Duration::ZERO, now), Duration::ZERO);
+        assert_eq!(
+            stagger_wait(Some(now), Duration::ZERO, now + Duration::from_secs(1)),
+            Duration::ZERO
+        );
+    }
+
+    #[test]
+    fn stagger_wait_no_prior_spawn_never_waits() {
+        let now = Instant::now();
+        assert_eq!(stagger_wait(None, Duration::from_secs(2), now), Duration::ZERO);
+    }
+
+    #[test]
+    fn stagger_wait_returns_remaining_gap() {
+        let base = Instant::now();
+        let stagger = Duration::from_millis(2000);
+        // 500ms elapsed since the last spawn ⇒ 1500ms still to wait.
+        let now = base + Duration::from_millis(500);
+        assert_eq!(stagger_wait(Some(base), stagger, now), Duration::from_millis(1500));
+    }
+
+    #[test]
+    fn stagger_wait_elapsed_past_stagger_is_zero() {
+        let base = Instant::now();
+        let stagger = Duration::from_millis(2000);
+        // 3s elapsed ⇒ the full gap has passed, no wait.
+        let now = base + Duration::from_millis(3000);
+        assert_eq!(stagger_wait(Some(base), stagger, now), Duration::ZERO);
+    }
+
+    // --- watchdog_decision state machine ---
+
+    #[test]
+    fn watchdog_decision_progress_is_always_healthy() {
+        // Progress observed ⇒ Healthy regardless of elapsed / retried.
+        let t = Duration::from_secs(120);
+        assert_eq!(
+            watchdog_decision(Duration::from_secs(9999), t, true, false),
+            WatchdogDecision::Healthy
+        );
+        assert_eq!(
+            watchdog_decision(Duration::from_secs(9999), t, true, true),
+            WatchdogDecision::Healthy
+        );
+    }
+
+    #[test]
+    fn watchdog_decision_within_timeout_is_healthy() {
+        let t = Duration::from_secs(120);
+        assert_eq!(
+            watchdog_decision(Duration::from_secs(119), t, false, false),
+            WatchdogDecision::Healthy
+        );
+    }
+
+    #[test]
+    fn watchdog_decision_hung_first_time_restarts() {
+        let t = Duration::from_secs(120);
+        assert_eq!(
+            watchdog_decision(Duration::from_secs(121), t, false, false),
+            WatchdogDecision::Restart
+        );
+    }
+
+    #[test]
+    fn watchdog_decision_hung_after_retry_gives_up() {
+        // Bounded: a second hang past the timeout does not restart again.
+        let t = Duration::from_secs(120);
+        assert_eq!(
+            watchdog_decision(Duration::from_secs(500), t, false, true),
+            WatchdogDecision::GiveUp
+        );
+    }
+
+    // --- log_has_progress probe ---
+
+    #[test]
+    fn log_has_progress_false_for_header_and_wrapper_only() {
+        // The hung case: only the daemon header + spawn-claude wrapper lines.
+        let log = "\n==== loom-daemon dispatch: 2026-07-23T00:00:00Z sweep_id=sweep-issue-1-1 issue=1 ====\n\
+                   [2026-07-23T00:00:01Z] spawn-claude: model=default\n\
+                   [2026-07-23T00:00:01Z] spawn-claude: using OAuth account 'agent-2' (mode=ranked)\n";
+        assert!(!log_has_progress(log));
+    }
+
+    #[test]
+    fn log_has_progress_true_when_claude_emits_output() {
+        let log = "\n==== loom-daemon dispatch: 2026-07-23T00:00:00Z sweep_id=sweep-issue-1-1 issue=1 ====\n\
+                   [2026-07-23T00:00:01Z] spawn-claude: using OAuth account 'agent-2' (mode=ranked)\n\
+                   Stage 0: resolving backend...\n";
+        assert!(log_has_progress(log));
+    }
+
+    #[test]
+    fn log_has_progress_anchors_to_last_dispatch() {
+        // A prior run produced output; the CURRENT dispatch (after the last
+        // header) has none ⇒ no progress for this dispatch.
+        let log = "==== loom-daemon dispatch: t1 sweep_id=a issue=1 ====\n\
+                   Curator done\n\
+                   ==== loom-daemon dispatch: t2 sweep_id=b issue=1 ====\n\
+                   [ts] spawn-claude: using OAuth account 'x' (mode=random)\n";
+        assert!(!log_has_progress(log));
+    }
+
+    #[test]
+    fn log_has_progress_empty_log_is_false() {
+        assert!(!log_has_progress(""));
+    }
+
+    // --- sweep_made_progress: filesystem probes ---
+
+    #[test]
+    fn sweep_made_progress_worktree_and_checkpoint_and_log() {
+        let tmp = tempdir().unwrap();
+        let ws = tmp.path();
+        let (reg, _rec) = fixture_registry(ws);
+        let log = ws.join("sweep.log");
+
+        // Nothing yet ⇒ no progress.
+        std::fs::write(&log, "==== loom-daemon dispatch: t sweep_id=s issue=7 ====\n[ts] spawn-claude: using OAuth account 'x' (mode=random)\n").unwrap();
+        assert!(!reg.sweep_made_progress(7, &log));
+
+        // A worktree ⇒ progress.
+        let wt = ws.join(".loom").join("worktrees").join("issue-7");
+        std::fs::create_dir_all(&wt).unwrap();
+        assert!(reg.sweep_made_progress(7, &log));
+        std::fs::remove_dir_all(&wt).unwrap();
+        assert!(!reg.sweep_made_progress(7, &log));
+
+        // A checkpoint ⇒ progress.
+        let cp_dir = ws.join(".loom").join("sweep-checkpoint");
+        std::fs::create_dir_all(&cp_dir).unwrap();
+        std::fs::write(cp_dir.join("issue-7.json"), "{}").unwrap();
+        assert!(reg.sweep_made_progress(7, &log));
+        std::fs::remove_file(cp_dir.join("issue-7.json")).unwrap();
+        assert!(!reg.sweep_made_progress(7, &log));
+
+        // Log output past the header ⇒ progress.
+        std::fs::write(
+            &log,
+            "==== loom-daemon dispatch: t sweep_id=s issue=7 ====\nBuilder: writing code\n",
+        )
+        .unwrap();
+        assert!(reg.sweep_made_progress(7, &log));
+    }
+
+    // --- set/get dispatch stagger ---
+
+    #[test]
+    fn dispatch_stagger_setter_roundtrips() {
+        let tmp = tempdir().unwrap();
+        let (mut reg, _rec) = fixture_registry(tmp.path());
+        assert_eq!(reg.dispatch_stagger(), Duration::ZERO, "default is zero");
+        reg.set_dispatch_stagger(Duration::from_millis(1500));
+        assert_eq!(reg.dispatch_stagger(), Duration::from_millis(1500));
+    }
+
+    #[test]
+    fn dispatch_applies_configured_stagger_between_spawns() {
+        // With a small stagger, two back-to-back dispatches are spaced by at
+        // least the stagger (the second waits out the gap in `dispatch`).
+        let tmp = tempdir().unwrap();
+        let (mut reg, rec) = fixture_registry(tmp.path());
+        reg.set_dispatch_stagger(Duration::from_millis(400));
+
+        let start = Instant::now();
+        reg.dispatch(&SweepKind::Issue(8001), None, None, None, None)
+            .unwrap();
+        reg.dispatch(&SweepKind::Issue(8002), None, None, None, None)
+            .unwrap();
+        let elapsed = start.elapsed();
+
+        assert!(
+            elapsed >= Duration::from_millis(400),
+            "second dispatch should have waited out the stagger; elapsed={elapsed:?}"
+        );
+        // Both fake children ran.
+        assert!(wait_for_contents(&rec, "issue=8002", 5000) || rec.exists());
+    }
+
+    // --- watchdog_once: bounded auto-restart end-to-end ---
+
+    /// A hung-child fixture: emits the account-selection line quickly (so
+    /// token-name capture returns fast) then sleeps, producing NO progress
+    /// (no worktree/checkpoint, log stuck at the spawn header).
+    fn hung_child_registry(ws: &Path) -> SweepRegistry {
+        let body = "#!/usr/bin/env bash\n\
+                    echo \"spawn-claude: using OAuth account 'faketok' (mode=random)\"\n\
+                    sleep 30\n";
+        lifecycle_registry(ws, body)
+    }
+
+    /// Backdate a running entry's `started_at` so the watchdog sees it as past
+    /// the no-progress timeout.
+    fn backdate(reg: &mut SweepRegistry, sweep_id: &str, secs: i64) {
+        if let Some(info) = reg.entries.get_mut(sweep_id) {
+            info.started_at = Utc::now() - chrono::Duration::seconds(secs);
+        }
+    }
+
+    fn running_issue_sweep_id(reg: &SweepRegistry, issue: u32) -> Option<String> {
+        reg.entries
+            .values()
+            .find(|i| {
+                matches!(i.state, SweepState::Running | SweepState::Pending)
+                    && matches!(i.kind, SweepKind::Issue(n) if n == issue)
+            })
+            .map(|i| i.sweep_id.clone())
+    }
+
+    #[test]
+    fn watchdog_restarts_hung_sweep_once_then_gives_up() {
+        let tmp = tempdir().unwrap();
+        let ws = tmp.path();
+        let mut reg = hung_child_registry(ws);
+
+        // 1. Dispatch a hung sweep for issue 4242.
+        let out = reg
+            .dispatch(&SweepKind::Issue(4242), None, None, None, None)
+            .unwrap();
+        assert!(wait_until_alive(out.pid, 5000), "hung fixture child should start");
+        let first_id = out.sweep_id.clone();
+
+        // 2. Healthy while inside the timeout window.
+        assert_eq!(
+            reg.watchdog_once(Duration::from_secs(120)),
+            0,
+            "a fresh sweep is not disturbed"
+        );
+
+        // 3. Backdate so it looks hung, then run the watchdog.
+        backdate(&mut reg, &first_id, 600);
+        let restarts = reg.watchdog_once(Duration::from_secs(60));
+        assert_eq!(restarts, 1, "the hung sweep is auto-restarted once");
+        assert!(reg.watchdog_retried.contains(&4242), "issue marked retried (bounded)");
+
+        // A fresh Running sweep now exists for the issue (the re-dispatch).
+        // Note: `generate_sweep_id` is second-granular, so within this fast
+        // test the re-dispatched id may coincide with the original — in
+        // production the watchdog fires ≥120s later, so ids differ. Either way,
+        // the registry holds exactly one Running entry for the issue again.
+        let _ = first_id;
+        let second_id =
+            running_issue_sweep_id(&reg, 4242).expect("a fresh sweep was re-dispatched");
+
+        // 4. Backdate the NEW sweep too; the watchdog must NOT restart again
+        //    (bounded) — it gives up instead.
+        backdate(&mut reg, &second_id, 600);
+        let restarts2 = reg.watchdog_once(Duration::from_secs(60));
+        assert_eq!(restarts2, 0, "bounded: never a second auto-restart");
+        assert!(reg.watchdog_gaveup.contains(&4242), "give-up recorded for the issue");
+        // The second sweep is still running (left for the operator).
+        assert!(running_issue_sweep_id(&reg, 4242).is_some());
+
+        // Cleanup: cancel the lingering hung child.
+        if let Some(id) = running_issue_sweep_id(&reg, 4242) {
+            let _ = reg.cancel(&id, Duration::from_secs(2));
+        }
+    }
+
+    #[test]
+    fn watchdog_leaves_progressing_sweep_alone() {
+        let tmp = tempdir().unwrap();
+        let ws = tmp.path();
+        let mut reg = hung_child_registry(ws);
+
+        let out = reg
+            .dispatch(&SweepKind::Issue(4343), None, None, None, None)
+            .unwrap();
+        assert!(wait_until_alive(out.pid, 5000));
+
+        // Simulate progress: create a worktree for the issue.
+        let wt = ws.join(".loom").join("worktrees").join("issue-4343");
+        std::fs::create_dir_all(&wt).unwrap();
+
+        // Even backdated well past the timeout, an issue with a worktree is
+        // never restarted.
+        backdate(&mut reg, &out.sweep_id, 9999);
+        assert_eq!(reg.watchdog_once(Duration::from_secs(10)), 0);
+        assert!(!reg.watchdog_retried.contains(&4343));
+
+        // Cleanup.
+        let _ = reg.cancel(&out.sweep_id, Duration::from_secs(2));
+    }
+
+    // --- config resolution: env > config > default ---
+
+    fn write_cfg(dir: &Path, body: &str) {
+        let loom = dir.join(".loom");
+        std::fs::create_dir_all(&loom).unwrap();
+        std::fs::write(loom.join("config.json"), body).unwrap();
+    }
+
+    #[test]
+    fn startup_race_config_missing_is_all_none() {
+        let tmp = tempdir().unwrap();
+        assert_eq!(read_startup_race_config(tmp.path()), StartupRaceConfig::default());
+    }
+
+    #[test]
+    fn startup_race_config_full_block_parsed() {
+        let tmp = tempdir().unwrap();
+        write_cfg(
+            tmp.path(),
+            r#"{"autonomous":{"dispatchStaggerMs":3000,"watchdog":{"enabled":false,"timeoutSecs":90,"intervalSecs":15}}}"#,
+        );
+        assert_eq!(
+            read_startup_race_config(tmp.path()),
+            StartupRaceConfig {
+                dispatch_stagger_ms: Some(3000),
+                watchdog_enabled: Some(false),
+                watchdog_timeout_secs: Some(90),
+                watchdog_interval_secs: Some(15),
+            }
+        );
+    }
+
+    #[test]
+    fn startup_race_config_zero_stagger_is_honored() {
+        // A 0 stagger is a real "disable" value and must be preserved (unlike
+        // the interval/timeout fields where 0 is dropped to None).
+        let tmp = tempdir().unwrap();
+        write_cfg(tmp.path(), r#"{"autonomous":{"dispatchStaggerMs":0}}"#);
+        assert_eq!(read_startup_race_config(tmp.path()).dispatch_stagger_ms, Some(0));
+    }
+
+    #[test]
+    #[serial]
+    fn resolve_dispatch_stagger_precedence() {
+        std::env::remove_var(DISPATCH_STAGGER_ENV);
+        // Default when nothing set.
+        assert_eq!(
+            resolve_dispatch_stagger(&StartupRaceConfig::default()),
+            Duration::from_millis(DEFAULT_DISPATCH_STAGGER_MS)
+        );
+        // Config used when env unset.
+        let cfg = StartupRaceConfig {
+            dispatch_stagger_ms: Some(500),
+            ..Default::default()
+        };
+        assert_eq!(resolve_dispatch_stagger(&cfg), Duration::from_millis(500));
+        // Env overrides config.
+        std::env::set_var(DISPATCH_STAGGER_ENV, "750");
+        assert_eq!(resolve_dispatch_stagger(&cfg), Duration::from_millis(750));
+        // Env 0 disables (overriding a non-zero config).
+        std::env::set_var(DISPATCH_STAGGER_ENV, "0");
+        assert_eq!(resolve_dispatch_stagger(&cfg), Duration::ZERO);
+        std::env::remove_var(DISPATCH_STAGGER_ENV);
+    }
+
+    #[test]
+    #[serial]
+    fn resolve_watchdog_enabled_precedence() {
+        std::env::remove_var(WATCHDOG_ENABLE_ENV);
+        // Default ON (self-healing backstop).
+        assert!(resolve_watchdog_enabled(&StartupRaceConfig::default()));
+        // Config can disable.
+        let off = StartupRaceConfig {
+            watchdog_enabled: Some(false),
+            ..Default::default()
+        };
+        assert!(!resolve_watchdog_enabled(&off));
+        // Env overrides config in both directions.
+        std::env::set_var(WATCHDOG_ENABLE_ENV, "1");
+        assert!(resolve_watchdog_enabled(&off));
+        std::env::set_var(WATCHDOG_ENABLE_ENV, "0");
+        let on = StartupRaceConfig {
+            watchdog_enabled: Some(true),
+            ..Default::default()
+        };
+        assert!(!resolve_watchdog_enabled(&on));
+        std::env::remove_var(WATCHDOG_ENABLE_ENV);
+    }
+
+    #[test]
+    #[serial]
+    fn resolve_watchdog_timeout_and_interval_precedence() {
+        std::env::remove_var(WATCHDOG_TIMEOUT_ENV);
+        std::env::remove_var(WATCHDOG_INTERVAL_ENV);
+        assert_eq!(
+            resolve_watchdog_timeout(&StartupRaceConfig::default()),
+            Duration::from_secs(DEFAULT_WATCHDOG_TIMEOUT_SECS)
+        );
+        assert_eq!(
+            resolve_watchdog_interval(&StartupRaceConfig::default()),
+            Duration::from_secs(DEFAULT_WATCHDOG_INTERVAL_SECS)
+        );
+        let cfg = StartupRaceConfig {
+            watchdog_timeout_secs: Some(200),
+            watchdog_interval_secs: Some(45),
+            ..Default::default()
+        };
+        assert_eq!(resolve_watchdog_timeout(&cfg), Duration::from_secs(200));
+        assert_eq!(resolve_watchdog_interval(&cfg), Duration::from_secs(45));
+        std::env::set_var(WATCHDOG_TIMEOUT_ENV, "77");
+        std::env::set_var(WATCHDOG_INTERVAL_ENV, "11");
+        assert_eq!(resolve_watchdog_timeout(&cfg), Duration::from_secs(77));
+        assert_eq!(resolve_watchdog_interval(&cfg), Duration::from_secs(11));
+        std::env::remove_var(WATCHDOG_TIMEOUT_ENV);
+        std::env::remove_var(WATCHDOG_INTERVAL_ENV);
     }
 }
