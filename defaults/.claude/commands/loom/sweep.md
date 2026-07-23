@@ -714,20 +714,23 @@ Both checks are cheap, local, and side-effect-free. The configured-pool count mi
 TOKEN_FILE_COUNT=$(ls .loom/tokens/*.token 2>/dev/null | wc -l | tr -d ' ')
 
 # Repo-local (mirrors bootstrap.py: .loom/accounts.env if present, else legacy .env)
+# NOTE: `grep -c` prints `0` AND exits non-zero on an existing-but-empty file, so a
+# `|| echo 0` fallback would emit a two-line "0\n0" and abort the arithmetic below under
+# bash 3.2. Use `|| true` + `${var:-0}` so an existing-empty source yields exactly `0`.
 if [[ -f .loom/accounts.env ]]; then
-  REPO_KEY_COUNT=$(grep -c '^ACCOUNT_KEY_' .loom/accounts.env 2>/dev/null || echo 0)
+  REPO_KEY_COUNT=$(grep -c '^ACCOUNT_KEY_' .loom/accounts.env 2>/dev/null || true); REPO_KEY_COUNT=${REPO_KEY_COUNT:-0}
 else
-  REPO_KEY_COUNT=$(grep -c '^ACCOUNT_KEY_' .env 2>/dev/null || echo 0)
+  REPO_KEY_COUNT=$(grep -c '^ACCOUNT_KEY_' .env 2>/dev/null || true); REPO_KEY_COUNT=${REPO_KEY_COUNT:-0}
 fi
 
 # claude-monitor master (primary source per CLAUDE.md; LOOM_CLAUDE_MONITOR_DIR override)
 MONITOR_DIR="${LOOM_CLAUDE_MONITOR_DIR:-$HOME/.claude-monitor}"
-MONITOR_KEY_COUNT=$(grep -c '^ACCOUNT_KEY_' "$MONITOR_DIR/accounts.env" 2>/dev/null || echo 0)
+MONITOR_KEY_COUNT=$(grep -c '^ACCOUNT_KEY_' "$MONITOR_DIR/accounts.env" 2>/dev/null || true); MONITOR_KEY_COUNT=${MONITOR_KEY_COUNT:-0}
 
 # Opt-in home master — only consulted when LOOM_ACCOUNTS_ENV is set and non-empty (per #3704)
 HOME_KEY_COUNT=0
 if [[ -n "${LOOM_ACCOUNTS_ENV:-}" ]]; then
-  HOME_KEY_COUNT=$(grep -c '^ACCOUNT_KEY_' "$LOOM_ACCOUNTS_ENV" 2>/dev/null || echo 0)
+  HOME_KEY_COUNT=$(grep -c '^ACCOUNT_KEY_' "$LOOM_ACCOUNTS_ENV" 2>/dev/null || true); HOME_KEY_COUNT=${HOME_KEY_COUNT:-0}
 fi
 
 ENV_KEY_COUNT=$(( REPO_KEY_COUNT + MONITOR_KEY_COUNT + HOME_KEY_COUNT ))
