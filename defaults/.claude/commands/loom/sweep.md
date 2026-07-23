@@ -653,6 +653,7 @@ PROBE_POOL:
 DECIDE:
   if Mode C: use_subagent()
   elif --no-daemon: use_subagent()
+  elif LOOM_SWEEP_CLAIM_OWNED is set: use_subagent()   # daemon-owned child — skip re-probe entirely (#3829)
   elif PROBE_DAEMON AND PROBE_POOL: use_daemon()
   else: use_subagent()
 ```
@@ -661,8 +662,9 @@ The precedence is deliberate:
 
 1. **Mode C → subagent** (always, regardless of daemon/pool state). The daemon's dispatch surface is **issue-keyed only** in v0.10.0 (`mcp__loom__dispatch_sweep --kind '{"Issue":N}'`); PR-set dispatch is an explicit non-goal of the parent epic and is not on the v0.10.0 roadmap. PR-set sweeps therefore route to the existing in-process subagent path, which already supports Mode C end-to-end.
 2. **`--no-daemon` → subagent** (operator opt-out, after Mode C but before any probes). When this flag is present, do not even attempt the `PROBE_DAEMON` Ping — saves a 500ms ceiling and produces predictable behaviour for debug/demo/scripted runs.
-3. **`PROBE_DAEMON ∧ PROBE_POOL → daemon`** (the only way to land on the daemon path). **Strict AND**: both probes must succeed. Either missing → fallthrough.
-4. **Else → subagent** (the universal fallthrough, equivalent to v0.9.x behaviour).
+3. **`LOOM_SWEEP_CLAIM_OWNED` set → subagent** (daemon-owned child self-detection, #3829 — after `--no-daemon`, still **before** any probes). This env var is exported **only** into a child that `loom-daemon` itself dispatched (`SweepRegistry::dispatch` → `spawn_child`, `sweep_registry.rs`), carrying the issue number the daemon already claimed on this child's behalf (same marker the "1. Per-issue pre-flight" self-claim exception from #3823 consumes one stage later). A daemon-dispatched child is **by construction** running in the exact environment that makes `PROBE_DAEMON ∧ PROBE_POOL` true — a live daemon plus a multi-account pool, since that is *why* it was dispatched there — so without this rule it would always land on `use_daemon` and issue a **circular** MCP round-trip back into the very daemon that spawned it (`mcp__loom__list_sweeps`, or worse a self-re-dispatch of its own issue number). In headless `claude -p` mode there is no operator to interrupt a stuck tool call and Stage -1's "500ms timeout" is LLM-directed prose, not a mechanically-enforced transport guard, so that round-trip can hang the whole session idle before it ever reaches the Builder phase. The child is already the daemon's work — it must run the lifecycle **itself**, in-process, exactly like `--no-daemon`. This short-circuit removes the entire class of hang. Mirrors `--no-daemon`: do not even attempt the `PROBE_DAEMON` Ping.
+4. **`PROBE_DAEMON ∧ PROBE_POOL → daemon`** (the only way to land on the daemon path). **Strict AND**: both probes must succeed. Either missing → fallthrough.
+5. **Else → subagent** (the universal fallthrough, equivalent to v0.9.x behaviour).
 
 ### The three probes
 
@@ -684,8 +686,10 @@ A successful response (any well-formed `EventStream`/sweep-list payload, includi
 ```text
 PROBE_DAEMON pseudocode (LLM-directed):
 
-  if NO_DAEMON:
+  if NO_DAEMON or LOOM_SWEEP_CLAIM_OWNED is set:
       PROBE_DAEMON = false   # short-circuit; do not even issue the call
+                             # (LOOM_SWEEP_CLAIM_OWNED: daemon-owned child, #3829 —
+                             #  re-probing the spawning daemon is circular)
   else:
       try:
           response = mcp__loom__list_sweeps(timeout_ms=500)
@@ -738,7 +742,7 @@ if [[ "$DECIDE" == use_daemon ]]; then
     # Detached-process path: each sweep is its own OS process with its own
     # rotated token. NOT nested subagents, so #3289 does not apply — scale to 10.
     MECH=daemon;   MECHANISM="daemon detached-process"
-else  # use_subagent (no daemon, single-token pool, --no-daemon, or Mode C)
+else  # use_subagent (no daemon, single-token pool, --no-daemon, daemon-owned child, or Mode C)
     # In-session Task subagents, one level deep. WIDTH is bounded by the harness
     # concurrency cap (min(16, cores-2)), NOT by #3289 (which is a nesting rule,
     # not a width rule). Core-scale the subagent target within [3, 6] via
@@ -800,7 +804,7 @@ The daemon enqueues the sweep, returns a sweep ID, and the skill logs the dispat
 
 ### The subagent fallthrough (when `DECIDE = use_subagent`)
 
-Otherwise — `DECIDE` is `use_subagent` for **any** of the reasons above (Mode C, `--no-daemon`, daemon unreachable, no pool, or any probe error) — **continue to "0. Dry-run gate" below and run the existing Mode A/B/C lifecycle in-process exactly as today**. This is the v0.9.x behaviour, unchanged. The skill prose from "0. Dry-run gate" onward is the canonical subagent path.
+Otherwise — `DECIDE` is `use_subagent` for **any** of the reasons above (Mode C, `--no-daemon`, `LOOM_SWEEP_CLAIM_OWNED` set (daemon-owned child, #3829), daemon unreachable, no pool, or any probe error) — **continue to "0. Dry-run gate" below and run the existing Mode A/B/C lifecycle in-process exactly as today**. This is the v0.9.x behaviour, unchanged. The skill prose from "0. Dry-run gate" onward is the canonical subagent path.
 
 No behaviour change for solo-token operators: their `PROBE_POOL` returns `false`, the `DECIDE` lands on `use_subagent`, and the rest of the skill runs as it always has.
 
@@ -873,6 +877,28 @@ These are the AC #3 and AC #4 contracts, written for the operator.
 #   3. Skill continues to "0. Dry-run gate" → "PR-set Wave Lifecycle" → ... exactly as today.
 ```
 
+**Daemon-owned child (`LOOM_SWEEP_CLAIM_OWNED` set, #3829):**
+
+```bash
+# Preconditions: this session is itself a child that loom-daemon dispatched, so
+#   LOOM_SWEEP_CLAIM_OWNED=<N> is exported into its environment (by
+#   SweepRegistry::dispatch → spawn_child). The daemon and multi-account pool are
+#   therefore reachable BY CONSTRUCTION — but this child must NOT re-dispatch.
+
+# (the daemon internally runs, for the issue it claimed:)
+#   LOOM_SWEEP_CLAIM_OWNED=123 claude -p "/loom:sweep 123" --dangerously-skip-permissions
+
+# Expected:
+#   1. Stage -1 sees LOOM_SWEEP_CLAIM_OWNED is set → PROBE_DAEMON skipped entirely
+#      (never issues mcp__loom__list_sweeps back into the spawning daemon).
+#   2. DECIDE = use_subagent regardless of daemon/pool reachability.
+#   3. Skill continues to "0. Dry-run gate" → "Wave Lifecycle" → runs the full
+#      Curator→Builder→Judge→Doctor→Merge lifecycle IN-PROCESS, exactly like --no-daemon.
+#   4. No circular re-dispatch of its own issue number; no idle-hang on a stuck
+#      MCP round-trip. This is the #3829 fix — every daemon-dispatched child
+#      progresses to build rather than stalling in Stage -1.
+```
+
 ### What Stage -1 does NOT do
 
 - **Does not auto-start the daemon** if the pool exists but the daemon is unreachable. Auto-start is operator policy, not skill policy.
@@ -881,6 +907,7 @@ These are the AC #3 and AC #4 contracts, written for the operator.
 - **Does not retry probe failures.** Either probe returns within 500ms (or its natural latency) and is treated as authoritative; no retry, no backoff.
 - **Does not mutate any forge state** during the probes. `mcp__loom__list_sweeps` and the local pool checks are read-only. Even in the daemon path, mutation happens inside the daemon-side child sweep, not in this orchestrator session.
 - **Does not log to `.loom/daemon-state.json` or any daemon-owned state file.** Read-only access is fine for situational awareness; writes are forbidden (same constraint as the legacy-daemon subsection of "Coexistence (peer `/sweep` and legacy daemon)").
+- **Does not re-probe or re-dispatch to the daemon when it is itself a daemon-dispatched child (#3829).** If `LOOM_SWEEP_CLAIM_OWNED` is set, the child is already the daemon's work — the `DECIDE` tree short-circuits to `use_subagent()` **before** `PROBE_DAEMON` runs, so no `mcp__loom__list_sweeps` (and no `mcp__loom__dispatch_sweep` of its own issue) is ever issued back into the spawning daemon. Re-probing/re-dispatching there is circular by construction and, in a headless `-p` session with no operator to interrupt a stuck tool call, was the cause of the idle-hang this rule removes.
 
 ## 0. Dry-run gate (if `--dry-run`)
 
@@ -1664,7 +1691,7 @@ The full `/sweep` design in #3298 includes many features that are intentionally 
 | `loom:operator-only` enforcement | **Implemented (#3360)** | Pre-flight skips issues with `loom:operator-only` (human action required: credentials, infra, hardware). Champion `--merge` mode also refuses to auto-promote them. |
 | Checkpoint/resume after kill | **Implemented (#3373)** | Per-issue phase checkpoint at `.loom/sweep-checkpoint/issue-<N>.json`. Sweep reads on entry and skips completed phases. No mid-builder recovery — kill during Builder resumes at builder start, worktree preserved by `worktree.sh` idempotency. Mode C reuses the helper keyed by the PR's closing-issue number (`closingIssuesReferences`); PRs without a `Closes #N` reference run without checkpointing. |
 | PR-set mode (`--prs` flag and PR NL triggers; Judge/Doctor/Merge from current PR label) | **Implemented (#3384)** | Mode C. Skips Curator, Approval gate, Builder. Size-1 waves. `--builders-per-wave` ignored. Reuses issue-keyed checkpoint via `closingIssuesReferences`. |
-| Daemon backend detection (Stage -1) | **Implemented (#3454)** | Strict-AND between daemon reachability and multi-account pool. Mode C and `--no-daemon` short-circuit to subagent. No implicit auto-start. Dispatch-only — Phase D does not subscribe to the event bus. See "Stage -1: Backend detection". |
+| Daemon backend detection (Stage -1) | **Implemented (#3454, daemon-owned-child short-circuit #3829)** | Strict-AND between daemon reachability and multi-account pool. Mode C, `--no-daemon`, and a daemon-dispatched child (`LOOM_SWEEP_CLAIM_OWNED` set, #3829) short-circuit to subagent — the last **before** any probe, so a daemon child never re-probes/re-dispatches the daemon that spawned it (the circular-round-trip idle-hang fix). No implicit auto-start. Dispatch-only — Phase D does not subscribe to the event bus. See "Stage -1: Backend detection". |
 | Concurrent-`/sweep` run-state isolation + peer detection | **Implemented (#3768)** | A stable per-sweep-run id (`sweep-run-registry.sh new`) is generated once at sweep start and threaded through all `--task-id` checkpoint writes and the main-clean baseline path (`main-clean-baseline-${RUN_ID}.txt`), so two concurrent sweeps no longer clobber each other's baseline or share an ambiguous `sweep-$$` `task_id`. Stage 0b adds a loud, NON-BLOCKING peer-`/sweep` warning via a dead-PID-pruned run registry (`.loom/sweep-run/`). Merge-target (default-branch) isolation is out of scope — that is #3759's stacking concern. See "Sweep Run Identity + Peer-`/sweep` Detection". |
 | `--max-waves` cap | Deferred | Operator-level brake on long sweeps. |
 | `--paused-merge` / `--no-judge` | Deferred | Merge-mode variants for trusted batches. |
