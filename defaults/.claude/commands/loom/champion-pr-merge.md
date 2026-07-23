@@ -217,8 +217,6 @@ echo "PASS: All CI checks passing"
 
 **Rationale**: Only merge when all automated checks pass or no checks are configured
 
-**Rationale**: Allows humans to prevent auto-merge by adding this label.
-
 ---
 
 ## Auto-Merge Workflow
