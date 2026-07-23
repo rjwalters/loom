@@ -54,6 +54,27 @@ git -C "$WORKTREE_ABS" diff --cached --name-only \
   || echo "OK: no Loom runtime markers staged"
 ```
 
+**No unrelated lockfile / workspace-config hunks.** A dependency install can mutate
+files outside your scope. In particular, **pnpm's build-approval prompt persists
+`onlyBuiltDependencies` / `ignoredBuiltDependencies` into `pnpm-workspace.yaml`**
+(older pnpm: into `package.json`) the first time `pnpm install` builds a package with
+an install script — an out-of-scope hunk a careless commit will ship. Defend against it:
+
+- Run installs **non-interactively** so the prompt never mutates config —
+  `CI=true pnpm install` (CI mode skips the build-approval prompt entirely). npm/yarn
+  installs can likewise touch `package-lock.json` / `yarn.lock`.
+- **After any install**, check for stray config/lockfile edits and revert unrelated hunks
+  before staging:
+
+  ```bash
+  git -C "$WORKTREE_ABS" status --short -- pnpm-workspace.yaml pnpm-lock.yaml package.json package-lock.json yarn.lock
+  # revert any hunk your issue did not intentionally change:
+  git -C "$WORKTREE_ABS" checkout -- pnpm-workspace.yaml   # (or the specific file)
+  ```
+
+  A genuinely needed lockfile bump (you added/updated a dependency on purpose) is in
+  scope — keep it; revert only the incidental install-prompt churn.
+
 ### What To Do When You Notice Unrelated Problems
 
 If you discover issues in files you're reading:
