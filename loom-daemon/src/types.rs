@@ -235,6 +235,19 @@ pub enum Request {
         /// arrives in the request.
         grace_secs: u64,
     },
+    // ========================================================================
+    // Autonomous Daemon Status (Issue #3891 — follow-up to #3813 Phase D)
+    // ========================================================================
+    /// Request the daemon's autonomous-mode operability snapshot: the live
+    /// in-flight sweeps, the three dynamic-cap inputs (token-pool size, disk
+    /// headroom, configured ceiling) plus their `min` cap, and the reactive
+    /// main-health-gate halt state.
+    ///
+    /// Per-token usage is deliberately NOT part of this response — probing each
+    /// account for rate-limit headers is a slow network call that would block
+    /// the IPC handler, so the `loom-daemon status` CLI shells out to
+    /// `loom-tokens check --json` client-side (mirroring `probe-tokens.sh`).
+    DaemonStatus,
     Shutdown,
 }
 
@@ -354,6 +367,12 @@ pub enum Response {
         sigkill_sent: bool,
         was_running: bool,
     },
+    // ========================================================================
+    // Autonomous Daemon Status (Issue #3891 — follow-up to #3813 Phase D)
+    // ========================================================================
+    /// Result of a `DaemonStatus` request — the autonomous-mode operability
+    /// snapshot rendered by `loom-daemon status`.
+    DaemonStatus(DaemonStatusReport),
     /// Legacy error response (deprecated, use `StructuredError` for new code)
     /// Kept for backwards compatibility with existing frontends
     Error {
@@ -504,6 +523,46 @@ pub struct SweepInfo {
     /// `#[serde(default)]` keeps pre-#3729 wire data and clients compatible.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub depends_on: Option<u32>,
+}
+
+// ========================================================================
+// Autonomous Daemon Status Types (Issue #3891 — follow-up to #3813 Phase D)
+// ========================================================================
+
+/// The autonomous-mode operability snapshot returned by `Request::DaemonStatus`
+/// and rendered by the `loom-daemon status` CLI subcommand.
+///
+/// This mirrors, at the daemon-native level, what the tmux-pool `loom status`
+/// shows for the terminal pool (#3735 precedent): what work is live and what
+/// the concurrency ceiling currently is. The per-token usage table the CLI also
+/// prints is NOT included here — it is a slow per-account network probe the CLI
+/// collects client-side via `loom-tokens check --json` (mirroring
+/// `probe-tokens.sh`), so the IPC handler stays fast.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DaemonStatusReport {
+    /// Sweeps in a non-terminal state (`Pending` / `Running`) at snapshot time.
+    /// The full `SweepInfo` is carried so the CLI can render issue numbers,
+    /// PIDs, token account, and latest phase without a second round-trip.
+    pub in_flight: Vec<SweepInfo>,
+    /// Dynamic-cap input 1: size of the multi-account token pool
+    /// (`.loom/tokens/*.token`), the hard ceiling on concurrent sweeps
+    /// (never over-subscribe an OAuth account). Via [`crate::tokens::token_pool_size`].
+    pub token_pool_size: usize,
+    /// Dynamic-cap input 2: how many worktrees the scratch volume can hold at
+    /// `LOOM_PER_WORKTREE_GB` each. Via [`crate::disk_headroom::disk_headroom_limit`].
+    pub disk_headroom: usize,
+    /// Dynamic-cap input 3: the configured operator ceiling
+    /// (`autonomous.workFinder.maxConcurrent` / `LOOM_WORK_FINDER_MAX_CONCURRENT`).
+    pub configured_max: usize,
+    /// The effective dynamic concurrency cap — `min` of the three inputs above
+    /// (`resolve_dynamic_max_concurrent`). This is the total-occupancy ceiling
+    /// the work finder recomputes every tick.
+    pub dynamic_cap: usize,
+    /// Whether autonomous dispatch is currently halted by the reactive
+    /// main-health gate (#3812). `true` means a red `main` has paused new
+    /// dispatch (in-flight sweeps keep running); `false` means dispatch is
+    /// allowed. Always `false` when the gate loop is not enabled.
+    pub main_health_gate_halted: bool,
 }
 
 // ========================================================================
