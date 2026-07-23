@@ -382,6 +382,14 @@ Agents coordinate work through forge labels (GitHub or Gitea). This enables auto
 - **`loom:blocked`**: Implementation blocked, needs help or clarification
 - **`loom:urgent`**: Critical issue requiring immediate attention
 
+### Issues Are Suggestions (Role Autonomy)
+
+Filed issues are the *input queue*, not mandates. In autonomous mode the **Curator, Builder, and Judge** have standing authority to **close** or **rescope** an issue — with a stated rationale — when building it is not the best outcome (obsolete, duplicate/already covered, low value vs. cost, wrong approach, better split/merged). This is what keeps the auto-picked-up backlog healthy rather than "build whatever is filed". Full mechanism + guardrails live in each role prompt's "Issues Are Suggestions — Close or Rescope With Rationale" section (`.loom/roles/curator.md`, `builder.md`, `judge.md`). The rules in brief:
+
+- **Comment the rationale BEFORE closing**, then `gh issue close <N> --reason "not planned"`. A closed issue leaves the queue automatically (the work-finder only polls *open* `loom:issue` items), so it is not re-picked-up.
+- **Rescope** instead of closing when the core is worth keeping: edit the body / split / relabel, and **remove `loom:issue`** if the labels no longer reflect an approved scope (drop back to `loom:triage`/`loom:curated`) so it is not re-dispatched with a stale scope.
+- **Never close an issue that encodes a still-pending human decision** — route it to `loom:blocked` or `loom:operator-only` with a comment instead. Never invent new labels.
+
 ## Git Worktree Workflow
 
 Loom uses git worktrees to isolate agent work on issues.

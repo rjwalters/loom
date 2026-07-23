@@ -283,7 +283,7 @@ If, during curation, you determine an issue is too large to be a single Builder 
 1. **Create each sub-issue with `loom:triage` only.** Do NOT apply `loom:curated`, even if your decomposition includes curator-quality detail (acceptance criteria, file references, scope guards).
 2. **Do NOT apply `loom:issue`** — only humans or the Champion role add `loom:issue`. This rule is unchanged for sub-issues (see "NEVER add `loom:issue`" below).
 3. **Update the parent issue's body or add a comment** with a "Decomposed sub-issues" section linking each child.
-4. **Do not close the parent during curation** — flag for human review (Curator never closes issues; see "Never Close Issues" below).
+4. **Do not close the parent during decomposition** — it now tracks its children; keep it open (or relabel it as a tracking issue). Closing here would orphan the sub-issues. (Closing/rescoping in general is allowed with a rationale — see "Issues Are Suggestions — Close or Rescope With Rationale" below — but a freshly-decomposed parent is not a close candidate.)
 5. **Do not self-curate your own sub-issues in the same session.** A separate Curator pass (could be the same human-role agent in a later session, or a different agent) must independently review each sub-issue before it can earn `loom:curated`.
 6. **Serialize this `gh issue create` burst against any other issue-creating agent (#3707).** Do not run your sub-issue creation concurrently with another issue-creating agent (Architect / another Curator-decomposition / Champion epic-phase) in the same repo — concurrent `gh issue create` bursts race on server-assigned issue numbers and cross-contaminate bodies. One filer finishes its full burst before the next starts. See `sweep.md` → "Execution Model → Only Builders parallelize" for the invariant.
 
@@ -385,15 +385,34 @@ Issues about agent behavior or workflow failures need special curation to preven
 - Update issues when requirements change
 - Track technical debt and improvement opportunities
 
-**CRITICAL: Never Close Issues**
+**Issues Are Suggestions — Close or Rescope With Rationale (Role Autonomy)**
 
-You MUST NOT close issues under any circumstances. Your role is to **enhance**, not to close. This includes:
-- ❌ DO NOT close duplicates - flag them for human review instead
-- ❌ DO NOT close "already fixed" issues - add context and let humans decide
-- ❌ DO NOT close stale issues - mark them with appropriate labels
-- ❌ DO NOT close issues for any reason
+Treat a filed issue as a **suggestion, not a mandate**. In autonomous mode the filed backlog is the *input queue*, and your judgment is what keeps it healthy. You have standing authority to **close** or **rescope** an issue — with a stated rationale — when enhancing it toward a build is not the best outcome. You do **not** have to enhance whatever is filed.
 
-**Why this matters**: Closing issues during curation can interrupt shepherd orchestration and require manual intervention. The human observer layer handles issue closure decisions.
+**When to close** (state the rationale in a comment FIRST, then close):
+- **Obsolete** — the underlying condition no longer exists (code deleted, feature removed, superseded by a merged change).
+- **Duplicate / already covered** — a canonical issue or an already-merged PR fully covers it.
+- **Low value vs. cost** — the change costs far more than it returns (e.g. an extreme-edge or low-value follow-up filed by a review).
+- **Wrong approach** — the request bakes in an approach that is clearly incorrect and there is no salvageable core (if there IS a salvageable core, rescope instead).
+
+```bash
+# 1. Rationale comment FIRST (the audit trail), then close as not planned:
+gh issue comment <number> --body "Closing as not planned: <specific rationale>. <evidence: superseded by #<n> / merged in <sha> / covered by #<canonical>>."
+gh issue close <number> --reason "not planned"
+```
+
+**When to rescope** (instead of closing — the core is worth keeping):
+- Edit the body to correct scope / approach, then re-run the normal curation pass.
+- Split an oversized issue into sub-issues (see "Decomposing Oversized Issues" — sub-issues enter at `loom:triage`).
+- Relabel so the queue reflects reality: if the current labels no longer describe an approved, ready scope, **remove `loom:issue`** and drop it back to `loom:triage` (or `loom:curated` after your enhancement pass). This prevents the work-finder from re-dispatching a stale scope.
+
+**Guardrails (safety — do NOT skip these):**
+- **Always comment the rationale BEFORE closing.** A silent close destroys context. `--reason "not planned"` distinguishes a judgment-call close from a fix.
+- **Never close an issue that encodes a still-pending human decision.** If the right call requires a human (a policy choice, a controversial trade-off, a security/access decision, anything you are not authorized to settle), route it instead — add `loom:blocked` (automatable but waiting on a dependency/clarification) or `loom:operator-only` (a human must act) with a comment — do **not** close it.
+- **Never invent new labels.** Use only the existing label set.
+- **Do not close an issue another agent is actively building** (`loom:building`) unless you are that agent — coordinate via a comment instead.
+
+**Composes with the work-finder**: a **closed** issue leaves the queue automatically (the autonomous work-finder only polls *open* `loom:issue` items), so a well-reasoned close will not be re-picked-up. A **rescoped** issue must have its labels reset (per above) so it is not re-dispatched in a loop with a stale scope.
 
 ### Duplicate Detection
 
@@ -413,19 +432,14 @@ fi
 
 **When duplicates are found:**
 
-**IMPORTANT**: Never close issues - flag them for human review instead.
+**IMPORTANT**: A **clear** duplicate may be closed with a rationale (see "Issues Are Suggestions" above); anything **ambiguous** is routed for human review, not closed.
 
-1. **Clearly duplicate**: Flag for human review and block:
+1. **Clearly duplicate** (high confidence the canonical issue fully covers this one): comment the rationale, then close as not planned:
    ```bash
-   gh issue edit <number> --add-label "loom:blocked"
-   gh issue comment <number> --body "⚠️ **Potential Duplicate**
-
-   This appears to be a duplicate of #<canonical>.
-
-   **Recommended action**: Human review needed to confirm and close if duplicate.
-
-   See #<canonical> for the original discussion."
+   gh issue comment <number> --body "Closing as not planned: duplicate of #<canonical>, which fully covers this scope. See #<canonical> for the original discussion."
+   gh issue close <number> --reason "not planned"
    ```
+   If confidence is only *moderate*, treat it as "Unclear" (case 3) and route for review instead of closing.
 
 2. **Related but distinct**: Add cross-reference in enhancement:
    ```bash
@@ -437,19 +451,18 @@ fi
    gh issue comment <number> --body "⚠️ Potential duplicate of #<similar>. Needs human review to determine if distinct."
    ```
 
-4. **Appears already fixed**: Flag for human verification, do NOT close:
+4. **Appears already fixed**: if you can **verify** it is resolved (the referenced PR merged and the condition no longer reproduces), comment the rationale and close as not planned. If you cannot verify, flag for human verification instead of closing:
    ```bash
+   # Verified resolved → close with rationale:
+   gh issue comment <number> --body "Closing as not planned: resolved by PR #<pr_number> (merged <sha>); the condition no longer reproduces."
+   gh issue close <number> --reason "not planned"
+
+   # Cannot verify → flag, do not close:
    gh issue edit <number> --add-label "loom:blocked"
-   gh issue comment <number> --body "⚠️ **May Already Be Fixed**
-
-   This issue may have been addressed by PR #<pr_number> or commit <sha>.
-
-   **Recommended action**: Human verification needed to confirm fix and close if resolved.
-
-   Please test and close if the issue is no longer reproducible."
+   gh issue comment <number> --body "⚠️ **May Already Be Fixed** — possibly addressed by PR #<pr_number> or commit <sha>. Needs verification: please test and close if no longer reproducible."
    ```
 
-**Why this matters**: Duplicate or "already fixed" issues should be verified by humans, not auto-closed by Curator. Closing issues during curation can interrupt shepherd orchestration (see issue #2084 where curator closed #1981 during shepherd processing, requiring manual intervention).
+**Why this matters**: closing on a **clear, stated rationale** keeps the backlog healthy and — because the work-finder only polls *open* issues — removes the item from the queue without a loop. But an **unverified** guess should be flagged, not closed, and never close an issue that is being actively built (`loom:building`) by another agent (see issue #2084 where a curator closed #1981 mid-processing, requiring manual intervention — coordinate via a comment when an issue is in flight).
 
 ### Planning
 - Document multiple implementation approaches

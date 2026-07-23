@@ -152,7 +152,7 @@ Before decomposing an issue into sub-issues:
    ```
 
 4. **Compare findings to issue requirements**:
-   - **Fully implemented** -> Mark `loom:blocked` with an "already implemented" comment citing the evidence (files/lines/tests); a human closes it. Do NOT close the issue yourself and do NOT create duplicate sub-issues.
+   - **Fully implemented** (verified — you can cite files/lines/tests) -> this is the "Already covered" close case from `builder.md` → "Issues Are Suggestions". Comment the evidence as your rationale, then **close the issue** (`gh issue close <N> --reason "not planned"`); do NOT create duplicate sub-issues. **Under `/loom:sweep` orchestration**, prefer the `.no-changes-needed` marker instead of closing directly so orchestration finalizes the lifecycle (see `builder.md` → "Signaling No Changes Needed"). If the "already implemented" call is **ambiguous** (you cannot fully verify, or it hides a still-pending human decision), do NOT close — route it to `loom:blocked` with a comment per the guardrails.
    - **Partially implemented** -> Create sub-issues only for missing parts
    - **Not implemented** -> Proceed with decomposition as planned
 
@@ -164,7 +164,7 @@ Large issue requiring decomposition
 1. AUDIT: Search codebase for existing implementations
 |
 2. ASSESS:
-   |-- Fully implemented? -> Mark loom:blocked with evidence (a human closes it)
+   |-- Fully implemented (verified)? -> Close with evidence as rationale ("Already covered"); under /loom:sweep use the .no-changes-needed marker. Ambiguous -> loom:blocked with a comment.
    |-- Partially implemented? -> Create sub-issues for gaps only
    +-- Not implemented? -> Proceed with decomposition
 |
@@ -195,8 +195,10 @@ $ find . -name "*_test*" | xargs grep -l constraint
 # Audit shows: All features fully implemented with tests
 
 # Step 4: Decision
-# -> Mark issue #341 loom:blocked with an "already implemented" comment citing the
-#    evidence above (a human closes it — builders never close issues)
+# -> Comment the evidence above as the rationale, then CLOSE issue #341 as
+#    "Already covered" (gh issue close 341 --reason "not planned"). Under
+#    /loom:sweep, write a .no-changes-needed marker instead and let orchestration
+#    finalize. If the "already implemented" call is ambiguous, use loom:blocked + a comment.
 # -> Do NOT create sub-issues (would be duplicates)
 # -> Create separate issue for actual gaps: "Add SQLSTATE codes to constraint errors"
 ```
@@ -329,11 +331,15 @@ EOF
 )"
 ```
 
-**Step 3: Mark Parent Blocked (never close it yourself)**
+**Step 3: Mark Parent Blocked (don't close a decomposition-parent yourself)**
 
 Record the decomposition in a comment, then move the parent to `loom:blocked`. A
-human closes the parent once the children are filed and curated — builders never
-close issues themselves.
+freshly-decomposed **parent** is a tracking issue for its children, so it is **not**
+a close candidate — a human (or Curator, per `curator.md` item 4) closes it once the
+children are filed and curated. This is the decomposition-parent exception, not a
+blanket rule: for a **non-parent** issue you verify is already implemented, close it
+with a rationale per `builder.md` → "Issues Are Suggestions" (or the `.no-changes-needed`
+marker under `/loom:sweep`).
 
 ```bash
 gh issue comment <parent-number> --body "$(cat <<'EOF'
