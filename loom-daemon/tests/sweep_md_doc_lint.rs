@@ -187,15 +187,18 @@ fn sweep_md_documents_effort_rung_grammar_and_fable() {
     }
 
     // PROSE (structural): the Task-tool graceful-degradation half (#3705) must
-    // stay documented, but its wording ("grammar ships either way", "degrades
-    // cleanly to bare sonnet") legitimately gets edited. Anchor on the stable
-    // verb stem `degrade` (matches degrade/degrades/degraded/degradation) so a
-    // reword survives while deleting the whole fallback discussion still fails.
+    // stay documented. Anchor on the section-local fragment `degrades cleanly to
+    // bare` (#3879) rather than a bare `degrade` stem: `degrade` also appears in
+    // unrelated `merge-pr.sh --auto` prose, so a bare-stem anchor would still
+    // pass on incidental matches even if the effort-degradation paragraph were
+    // deleted (violating #3877 AC3). This fragment is unique to that paragraph
+    // while staying prose-tolerant (the surrounding sentence can still be
+    // reworded).
     assert!(
-        content.contains("degrade"),
+        content.contains("degrades cleanly to bare"),
         "sweep.md must document the Task-tool effort graceful-degradation \
-         fallback (#3705) — anchored structurally on the `degrade` stem, not on \
-         an exact sentence"
+         fallback (#3705) — anchored on the section-local fragment `degrades \
+         cleanly to bare`, unique to that paragraph (#3879)"
     );
 }
 
