@@ -11,6 +11,7 @@
 #![allow(clippy::missing_panics_doc)]
 
 pub mod activity;
+pub mod epic_state;
 pub mod errors;
 pub mod event_bus;
 pub mod forge_parser;
