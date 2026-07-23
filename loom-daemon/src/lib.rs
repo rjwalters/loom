@@ -12,6 +12,7 @@
 
 pub mod activity;
 pub mod epic_state;
+pub mod epic_supervisor;
 pub mod errors;
 pub mod event_bus;
 pub mod forge_parser;
