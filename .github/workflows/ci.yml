@@ -91,5 +91,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
+      - name: Check role prompts reference only real labels (#3786)
+        run: bash defaults/scripts/check-phantom-labels.sh
       - name: Run installer tests
         run: bash scripts/test-installer.sh

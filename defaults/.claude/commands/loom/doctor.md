@@ -591,7 +591,7 @@ $ sleep 60 && gh pr checks 1448
 
 ### Complex Changes (Create Issue Instead)
 If feedback requires substantial work:
-1. Create an issue with `loom:pr-feedback` + `loom:urgent` labels
+1. Create an issue with `loom:triage` + `loom:urgent` labels
 2. Link to the original PR and quote the review comments
 3. Document what needs to be done
 4. Let Workers handle the complex refactoring
@@ -619,7 +619,7 @@ PR #123 review requested major changes to authentication system:
 [Link to review comment](https://github.com/owner/repo/pull/123#discussion_r123456)
 
 EOF
-)" --label "loom:pr-feedback" --label "loom:urgent"
+)" --label "loom:triage" --label "loom:urgent"
 ```
 
 ## Best Practices
@@ -843,7 +843,7 @@ I want to make sure I address your concern correctly."
 
 ### Feedback Too Complex
 If review requests major architectural changes:
-1. Create issue with `loom:pr-feedback` + `loom:urgent`
+1. Create issue with `loom:triage` + `loom:urgent`
 2. Link to PR and quote specific feedback
 3. Document what needs to be done
 4. Comment on PR: "This requires substantial refactoring - created issue #X to handle it"

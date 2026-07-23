@@ -120,15 +120,15 @@ fi
 
 ---
 
-### Edge Case 7: PR with `loom:manual-merge` Added Mid-Evaluation
+### Edge Case 7: PR with `loom:pr` Removed Mid-Evaluation
 
-**Scenario**: Human adds `loom:manual-merge` label while Champion is evaluating the PR.
+**Scenario**: Human removes the `loom:pr` label (or adds `loom:changes-requested`) to hold a PR while Champion is evaluating it.
 
-**Handling**: Label check (#1) runs first, catches override immediately.
+**Handling**: Label check (#1) runs first, catches the missing `loom:pr` immediately.
 
-**Decision**: **Skip immediately** - respect human override.
+**Decision**: **Skip immediately** - a PR without `loom:pr` is not a merge candidate.
 
-**Rationale**: Champion re-fetches labels at start of each evaluation, race condition window is minimal.
+**Rationale**: Champion re-fetches labels at start of each evaluation, so the human hold takes effect on the next evaluation; the race-condition window is minimal.
 
 ---
 
@@ -300,7 +300,7 @@ gh issue create --title "Follow-on: Work identified in PR #$PR_NUMBER" --label "
 | Merge conflicts | Fail | Comment and skip |
 | Stale PR (>24h) | Route to Doctor | Comment once (idempotent marker), swap `loom:pr` → `loom:changes-requested` |
 | Test-only changes | Allow | Standard criteria apply |
-| Manual-merge override | Skip | Respect human decision |
+| Human holds PR (removes `loom:pr`) | Skip | Not a merge candidate without `loom:pr` |
 | Multiple linked issues | Allow | Verify all closed |
 | Mixed-state CI | Fail on `fail`/`cancel` | `pending` defers; `skipping` is OK |
 | Unknown critical file | Miss | Needs pattern update |
@@ -317,7 +317,7 @@ gh issue create --title "Follow-on: Work identified in PR #$PR_NUMBER" --label "
 
 This file previously carried a second, full copy of the end-to-end merge script. That duplicate diverged from `champion-pr-merge.md` over time (it lacked Step 5.5 Follow-on Issue Creation and repeated the same bugs — invalid `gh pr checks --json` fields, etc.), forcing every fix to be applied twice. It has been removed to eliminate the drift (issue #3781).
 
-For the authoritative, end-to-end implementation — the 7 safety criteria, the pre-merge comment, the squash merge via `merge-pr.sh`, linked-issue closure verification, dependent-issue unblocking, and Step 5.5 Follow-on Issue Creation — see **`champion-pr-merge.md`**. The edge cases and decision matrix above remain here as the reference for non-standard situations; they describe *behavior*, and defer to `champion-pr-merge.md` for the *script*.
+For the authoritative, end-to-end implementation — the 6 safety criteria, the pre-merge comment, the squash merge via `merge-pr.sh`, linked-issue closure verification, dependent-issue unblocking, and Step 5.5 Follow-on Issue Creation — see **`champion-pr-merge.md`**. The edge cases and decision matrix above remain here as the reference for non-standard situations; they describe *behavior*, and defer to `champion-pr-merge.md` for the *script*.
 
 ---
 

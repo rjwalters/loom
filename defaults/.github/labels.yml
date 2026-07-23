@@ -90,3 +90,8 @@
 - name: tier:maintenance
   description: Cleanup, refactoring, or improvements not tied to current goals
   color: "D4C5F9"  # purple - lower priority
+
+# External Contribution Gate
+- name: external
+  description: "Submitted by a non-collaborator; requires maintainer approval before Curator/Builder process it"
+  color: "E5E7EB"  # gray-200 - external/hold marker

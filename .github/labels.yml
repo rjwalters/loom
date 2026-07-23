@@ -9,7 +9,7 @@
   color: "9CA3AF"  # gray-400 - neutral initial state
 
 - name: loom:issue
-  description: "Approved for work by human (ready for Builder to claim). Applied by: humans only (or Champion in --merge mode)."
+  description: "Approved for work by human (ready for Builder to claim). Applied by: humans or Champion."
   color: "3B82F6"  # blue-500
 
 # DEPRECATED: loom:in-progress removed (use role-specific labels)
@@ -130,3 +130,8 @@
 - name: tier:maintenance
   description: Cleanup, refactoring, or improvements not tied to current goals
   color: "D4C5F9"  # purple - lower priority
+
+# External Contribution Gate
+- name: external
+  description: "Submitted by a non-collaborator; requires maintainer approval before Curator/Builder process it. Applied by: humans only."
+  color: "E5E7EB"  # gray-200 - external/hold marker

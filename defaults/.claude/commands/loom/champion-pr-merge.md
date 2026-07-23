@@ -14,11 +14,10 @@ The Champion acts as the final step in the PR pipeline, merging PRs that have pa
 
 ## Safety Criteria
 
-For each `loom:pr` PR, verify ALL 7 safety criteria. If ANY criterion fails, do NOT merge.
+For each `loom:pr` PR, verify ALL 6 safety criteria. If ANY criterion fails, do NOT merge.
 
 ### 1. Label Check
 - [ ] PR has `loom:pr` label (Judge approval)
-- [ ] PR does NOT have `loom:manual-merge` label (human override)
 
 **Verification command**:
 ```bash
@@ -31,16 +30,10 @@ if ! echo "$LABELS" | grep -q "loom:pr"; then
   exit 1
 fi
 
-# Check for manual-merge override
-if echo "$LABELS" | grep -q "loom:manual-merge"; then
-  echo "SKIP: Has loom:manual-merge label (human override)"
-  exit 1
-fi
-
 echo "PASS: Label check"
 ```
 
-**Rationale**: Only merge PRs explicitly approved by Judge, respect human override
+**Rationale**: Only merge PRs explicitly approved by Judge. A human holds a PR by removing its `loom:pr` label (or adding `loom:changes-requested`), which fails this check.
 
 ### 2. Size Check
 - [ ] Total lines changed <= configured limit (additions + deletions)
@@ -224,32 +217,13 @@ echo "PASS: All CI checks passing"
 
 **Rationale**: Only merge when all automated checks pass or no checks are configured
 
-### 7. Human Override Check
-- [ ] PR does NOT have `loom:manual-merge` label
-
-**Verification command**:
-```bash
-# This check is already covered in criterion #1 (Label Check)
-# Included here for completeness - see Label Check for implementation
-
-# Quick standalone check if needed:
-if gh pr view <number> --json labels --jq -e '.labels[] | select(.name == "loom:manual-merge")' > /dev/null 2>&1; then
-  echo "SKIP: Has loom:manual-merge label (human override)"
-  exit 1
-fi
-
-echo "PASS: No manual-merge override"
-```
-
-**Rationale**: Allows humans to prevent auto-merge by adding this label.
-
 ---
 
 ## Auto-Merge Workflow
 
 ### Step 1: Verify Safety Criteria
 
-For each candidate PR, check ALL 7 criteria in order. If any criterion fails, skip to rejection workflow.
+For each candidate PR, check ALL 6 criteria in order. If any criterion fails, skip to rejection workflow.
 
 ### Step 2: Add Pre-Merge Comment
 
@@ -290,7 +264,6 @@ This PR meets all safety criteria for automatic merging:
 - No merge conflicts
 - Updated recently ($HOURS_AGO hours ago)
 - $CI_STATUS
-- No manual-merge override
 
 **Proceeding with squash merge...** If this was merged in error, you can revert with:
 \`git revert <commit-sha>\`
