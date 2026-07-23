@@ -1159,7 +1159,7 @@ Use the dedicated merge script (CLAUDE.md "Merging PRs" mandate — never `gh pr
 ./.loom/scripts/merge-pr.sh P --auto
 ```
 
-The script merges via the forge API and cleans up the worktree. `--auto` enables GitHub's server-side auto-merge queue (queues the merge until required checks pass); on PRs that are already in `CLEAN` state, the script transparently falls back to an immediate merge — see #3371.
+The script merges via the forge API and cleans up the worktree. `--auto` enables GitHub's server-side auto-merge queue (queues the merge until required checks pass); on PRs that are already in `CLEAN` state, the script transparently falls back to an immediate merge — see #3371. **On a repo with GitHub auto-merge disabled** (`allow_auto_merge:false`), `merge-pr.sh` now detects the setting up front and degrades `--auto` gracefully to wait-for-checks-then-merge (immediate if already CLEAN) instead of failing (#3820) — so you can pass `--auto` uniformly regardless of the repo's auto-merge setting; no per-repo branching is needed here.
 
 **On successful merge** (script returns 0):
 - If a closing-issue checkpoint is in scope, delete it:
@@ -1552,7 +1552,7 @@ Use the dedicated merge script (CLAUDE.md "Merging PRs" mandate — never `gh pr
 ./.loom/scripts/merge-pr.sh <PR_NUMBER> --auto
 ```
 
-The script merges via the forge API and cleans up the worktree. `--auto` enables GitHub's server-side auto-merge queue (queues the merge until required checks pass); on PRs that are already in `CLEAN` state (fast CI), the script transparently falls back to an immediate merge — see #3371.
+The script merges via the forge API and cleans up the worktree. `--auto` enables GitHub's server-side auto-merge queue (queues the merge until required checks pass); on PRs that are already in `CLEAN` state (fast CI), the script transparently falls back to an immediate merge — see #3371. **On a repo with GitHub auto-merge disabled** (`allow_auto_merge:false`), `merge-pr.sh` now detects the setting up front and degrades `--auto` gracefully to wait-for-checks-then-merge (immediate if already CLEAN) instead of failing (#3820) — so `--auto` is safe to pass uniformly here regardless of the repo's auto-merge setting; no per-repo branching is needed.
 
 **If a previous Merge attempt for this PR died mid-flight without deleting the checkpoint** (rate limit, crash between `merge-pr.sh` success and the delete call), re-verify forge state first: if the PR is already **merged**, just delete the stale checkpoint — do **not** re-run the merge. See "Mid-phase-death recovery" above. (The step 1 stale-checkpoint cleanup is the belt-and-suspenders backstop for this.)
 

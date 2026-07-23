@@ -17,7 +17,11 @@
 #                          branch via `git branch -d` (refuses on unmerged
 #                          commits — Git's own safety check).
 #   --dry-run              Show what would happen without merging
-#   --auto                 Enable auto-merge instead of immediate merge
+#   --auto                 Enable auto-merge instead of immediate merge. On a
+#                          repo with GitHub auto-merge disabled
+#                          (allow_auto_merge:false) this degrades gracefully to
+#                          wait-for-checks-then-merge (immediate if CLEAN)
+#                          instead of failing (#3820).
 #   --allow-stacked-children
 #                          Bypass the pre-merge merge-ordering guard when the
 #                          parent branch (feature/issue-N) still has open
@@ -81,7 +85,11 @@ Options:
                          the matching local branch via 'git branch -d'
                          (Git refuses on unmerged commits).
   --dry-run              Show what would happen without merging
-  --auto                 Enable auto-merge instead of immediate merge
+  --auto                 Enable auto-merge instead of immediate merge. When the
+                         repository has GitHub auto-merge disabled
+                         (allow_auto_merge:false), this is detected up front and
+                         degrades gracefully to wait-for-checks-then-merge
+                         (immediate if already CLEAN) rather than failing (#3820).
   --allow-stacked-children
                          Bypass the pre-merge merge-ordering guard. That guard
                          hard-blocks merging a stacked PARENT PR (branch
@@ -136,7 +144,8 @@ Examples:
     Shows what would happen without merging
 
   ./.loom/scripts/merge-pr.sh 123 --auto
-    Enables auto-merge instead of merging immediately
+    Enables auto-merge instead of merging immediately (on a repo with
+    auto-merge disabled, waits for checks then merges synchronously)
 
   ./.loom/scripts/merge-pr.sh 123 --no-cleanup-worktree
     Merges PR but leaves the local worktree in place
@@ -630,6 +639,130 @@ _auto_reconcile_stacked_children() {
   return 0
 }
 
+# ---------------------------------------------------------------------------
+# Repo-level "Allow auto-merge" disabled — proactive wait-then-merge (#3820).
+#
+# When the repository's GitHub "Allow auto-merge" setting is OFF
+# (`gh api repos/{nwo} --jq .allow_auto_merge` == false), the server-side
+# auto-merge queue can NEVER be enabled — enablePullRequestAutoMerge is rejected
+# regardless of PR state. The reactive #3763 fallback catches that post-mutation
+# rejection, but only degrades gracefully when the PR is ALREADY immediately
+# mergeable; when auto-merge is disabled AND the PR is not yet CLEAN (checks
+# still running / .mergeable not yet computed), #3763's mergeability recheck sees
+# `.mergeable != true` and preserves the terminal error, so the PR never merges
+# (the reported failure on a repo with allow_auto_merge:false).
+#
+# This function is entered PROACTIVELY from the repo-setting probe below (so we
+# never attempt the doomed mutation at all) and degrades `--auto` to
+# "wait-for-checks-then-merge, or immediate merge if already CLEAN": it polls the
+# head-SHA check-runs (bounded by LOOM_AUTO_MERGE_TIMEOUT, same knobs as the
+# UNSTABLE fallback) until they settle, then returns 0 so the caller flips to the
+# synchronous-merge path. Unlike the UNSTABLE branch it also handles the
+# already-CLEAN case (nothing failing, nothing pending) by returning 0 for an
+# immediate merge rather than hitting that branch's defensive "unknown gap" error.
+#
+# Contract:
+#   - returns 0  → safe to proceed to the synchronous-merge path (caller flips
+#                  AUTO_MERGE=false). Also returned if the PR merged concurrently
+#                  while waiting (the synchronous path's own race-detection then
+#                  no-ops cleanly).
+#   - calls error() (exit 1) → a required status check failed, or the wait timed
+#                  out. A normal recoverable failure Champion's cron retries.
+# GitHub-only by construction (only invoked when the GitHub-only probe returns
+# "false"). Requires LOOM_AUTO_MERGE_POLL_INTERVAL / LOOM_AUTO_MERGE_TIMEOUT set.
+_wait_for_checks_then_sync_merge() {
+  local head_sha base_ref
+  head_sha="$(echo "$PR_JSON" | jq -r '.head.sha // empty')"
+  base_ref="$(echo "$PR_JSON" | jq -r '.base.ref // empty')"
+
+  # Without the head SHA we cannot reason about checks — proceed to the
+  # synchronous merge, which will itself reject if a required check blocks it.
+  if [[ -z "$head_sha" ]]; then
+    info "PR #$PR_NUMBER: head SHA unavailable; proceeding directly to synchronous merge"
+    return 0
+  fi
+
+  local deadline
+  deadline=$(( $(date +%s) + LOOM_AUTO_MERGE_TIMEOUT ))
+
+  while true; do
+    # A concurrent merger may have completed the PR while we waited.
+    local recheck_json
+    recheck_json="$(forge_get_pr_nocache "$REPO_NWO" "$PR_NUMBER" "$GH" 2>/dev/null || echo '{}')"
+    if [[ "$(echo "$recheck_json" | jq -r '.merged // false')" == "true" ]]; then
+      warning "PR #$PR_NUMBER merged by another process while waiting for checks"
+      return 0
+    fi
+
+    # Fetch the check-runs rollup for the head SHA. Retry once to absorb a blip,
+    # then treat a persistent fetch failure as still-pending (bounded wait),
+    # mirroring the UNSTABLE fallback's #3678 discipline.
+    local fetch_rc=0 runs_raw
+    runs_raw="$(forge_get_check_runs "$REPO_NWO" "$head_sha" 2>/dev/null)" || fetch_rc=$?
+    if [[ "$fetch_rc" -ne 0 ]]; then
+      fetch_rc=0
+      runs_raw="$(forge_get_check_runs "$REPO_NWO" "$head_sha" 2>/dev/null)" || fetch_rc=$?
+    fi
+    if [[ "$fetch_rc" -ne 0 ]]; then
+      if [[ "$(date +%s)" -ge "$deadline" ]]; then
+        error "Timed out after ${LOOM_AUTO_MERGE_TIMEOUT}s waiting for check-runs to become fetchable for PR #$PR_NUMBER (repo has auto-merge disabled). Re-run once the forge API is healthy, or raise LOOM_AUTO_MERGE_TIMEOUT."
+      fi
+      warning "Failed to fetch check-runs for PR #$PR_NUMBER (rc=$fetch_rc); treating as still-pending and continuing to poll"
+      sleep "$LOOM_AUTO_MERGE_POLL_INTERVAL"
+      continue
+    fi
+
+    # Failing (terminal non-success) and pending (not yet completed) check names.
+    local failing pending
+    failing="$(echo "$runs_raw" | \
+      jq -r '[.check_runs[] | select(.conclusion == "failure" or .conclusion == "timed_out" or .conclusion == "cancelled" or .conclusion == "action_required") | .name] | unique | .[]' 2>/dev/null || true)"
+    pending="$(echo "$runs_raw" | \
+      jq -r '[.check_runs[] | select(.status != "completed") | .name] | unique | .[]' 2>/dev/null || true)"
+
+    if [[ -n "$failing" ]]; then
+      # A check failed — classify against branch protection. A required failing
+      # check can never merge on this SHA; refuse now. A lookup failure fails
+      # closed (refuse), mirroring the UNSTABLE fallback.
+      local required lookup_rc=0
+      required="$(forge_get_required_status_check_contexts "$REPO_NWO" "$base_ref" "$GH" 2>/dev/null)" || lookup_rc=$?
+      if [[ "$lookup_rc" -ne 0 ]]; then
+        error "Failed to resolve required status checks for $base_ref (rc=$lookup_rc); refusing to merge PR #$PR_NUMBER with failing check(s) while auto-merge is disabled"
+      fi
+      local overlap
+      overlap="$(comm -12 \
+        <(printf '%s\n' "$failing" | sort -u) \
+        <(printf '%s\n' "$required" | sort -u))"
+      if [[ -n "$overlap" ]]; then
+        error "Cannot merge PR #$PR_NUMBER: a required status check has failed ($(printf '%s' "$overlap" | tr '\n' ' ')). Fix the check and re-run the merge."
+      fi
+      if [[ -z "$pending" ]]; then
+        # Only informational (non-required) checks failing and nothing pending →
+        # a synchronous merge is safe (matches the UNSTABLE #3486 fallback).
+        info "PR #$PR_NUMBER: only informational (non-required) check(s) failing; proceeding to synchronous merge"
+        return 0
+      fi
+      # Informational failures but other checks still running — fall through to
+      # the pending wait below.
+    fi
+
+    if [[ -n "$pending" ]]; then
+      if [[ "$(date +%s)" -ge "$deadline" ]]; then
+        local n; n="$(printf '%s\n' "$pending" | wc -l | tr -d ' ')"
+        error "Timed out after ${LOOM_AUTO_MERGE_TIMEOUT}s waiting for ${n} pending check(s) on PR #$PR_NUMBER to complete (repo has auto-merge disabled). Re-run once CI settles, or raise LOOM_AUTO_MERGE_TIMEOUT."
+      fi
+      local n; n="$(printf '%s\n' "$pending" | wc -l | tr -d ' ')"
+      info "PR #$PR_NUMBER: ${n} check(s) still running (repo auto-merge disabled); waiting ${LOOM_AUTO_MERGE_POLL_INTERVAL}s for CI (timeout ${LOOM_AUTO_MERGE_TIMEOUT}s)..."
+      sleep "$LOOM_AUTO_MERGE_POLL_INTERVAL"
+      continue
+    fi
+
+    # Nothing failing (or only informational), nothing pending → effectively
+    # CLEAN. Proceed to the synchronous merge.
+    info "PR #$PR_NUMBER: checks settled (repo auto-merge disabled); proceeding to synchronous merge"
+    return 0
+  done
+}
+
 # Handle auto-merge mode
 #
 # The auto-merge path now mirrors the sync path's resilience patterns:
@@ -643,8 +776,27 @@ _auto_reconcile_stacked_children() {
 #
 # See issue #3279.
 if [[ "$AUTO_MERGE" == "true" ]]; then
+  # Bounded poll window for the UNSTABLE-because-checks-are-still-running case
+  # (#3664). Reuses the same env-var names/semantics as the Gitea auto-merge
+  # poller (loom-tools/src/loom_tools/auto_merge.py) so both forges share
+  # configuration. Defaults match that CLI: 30s interval, 600s ceiling.
+  # (Also consumed by the #3820 auto-merge-disabled wait path below.)
+  LOOM_AUTO_MERGE_POLL_INTERVAL="${LOOM_AUTO_MERGE_POLL_INTERVAL:-30}"
+  LOOM_AUTO_MERGE_TIMEOUT="${LOOM_AUTO_MERGE_TIMEOUT:-600}"
+
+  # Proactive repo-level "Allow auto-merge" probe (#3820). Read the setting once
+  # (GitHub only; Gitea and any probe failure return "unknown", preserving
+  # existing behavior fail-safe). When it is explicitly disabled, the server-side
+  # auto-merge queue can never be enabled, so skip the doomed mutation entirely
+  # and degrade `--auto` to wait-for-checks-then-merge (immediate if CLEAN).
+  REPO_AUTO_MERGE_ALLOWED="$(forge_check_auto_merge_allowed "$REPO_NWO" "$GH" 2>/dev/null || echo unknown)"
+
   if [[ "$DRY_RUN" == "true" ]]; then
-    info "[dry-run] Would enable auto-merge for PR #$PR_NUMBER"
+    if [[ "$REPO_AUTO_MERGE_ALLOWED" == "false" ]]; then
+      info "[dry-run] Repository 'Allow auto-merge' is disabled; would wait for checks then merge PR #$PR_NUMBER synchronously (immediate if already CLEAN)"
+    else
+      info "[dry-run] Would enable auto-merge for PR #$PR_NUMBER"
+    fi
     exit 0
   fi
 
@@ -652,14 +804,22 @@ if [[ "$AUTO_MERGE" == "true" ]]; then
   MERGE_RETRY_DELAY=5
   AUTO_MERGE_OK=false
 
-  # Bounded poll window for the UNSTABLE-because-checks-are-still-running case
-  # (#3664). Reuses the same env-var names/semantics as the Gitea auto-merge
-  # poller (loom-tools/src/loom_tools/auto_merge.py) so both forges share
-  # configuration. Defaults match that CLI: 30s interval, 600s ceiling.
-  LOOM_AUTO_MERGE_POLL_INTERVAL="${LOOM_AUTO_MERGE_POLL_INTERVAL:-30}"
-  LOOM_AUTO_MERGE_TIMEOUT="${LOOM_AUTO_MERGE_TIMEOUT:-600}"
+  # #3820: repo has auto-merge disabled → wait for checks, then fall through to
+  # the synchronous-merge path instead of attempting the enable mutation. The
+  # wait function either returns 0 (proceed) or error()s out terminally. Setting
+  # AUTO_MERGE_OK=true lets the post-loop "after N attempts" guard pass; the loop
+  # itself is short-circuited by the AUTO_MERGE guard on its first iteration.
+  if [[ "$REPO_AUTO_MERGE_ALLOWED" == "false" ]]; then
+    info "PR #$PR_NUMBER: repository 'Allow auto-merge' is disabled; --auto will wait for checks then merge synchronously (immediate if already CLEAN)"
+    _wait_for_checks_then_sync_merge
+    AUTO_MERGE=false
+    AUTO_MERGE_OK=true
+  fi
 
   for MERGE_ATTEMPT in $(seq 1 $MAX_MERGE_RETRIES); do
+    # #3820: when the repo-level probe already converted --auto to a synchronous
+    # merge (AUTO_MERGE flipped false above), do NOT attempt the enable mutation.
+    [[ "$AUTO_MERGE" == "true" ]] || break
     AUTO_MERGE_OUTPUT=""
     # Prefer loom-auto-merge CLI (forge-agnostic, with poll-and-merge for Gitea)
     if command -v loom-auto-merge &>/dev/null; then

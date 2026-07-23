@@ -250,6 +250,117 @@ else
     echo -e "  ${RED}FAIL${NC}: #3763 fallback must precede the clean/unstable greps (amd=$_amd_line clean=$_clean_line)"
 fi
 
+# ===========================================================================
+# #3820: PROACTIVE repo-level "Allow auto-merge" probe + wait-then-merge.
+#
+# The reactive #3763 fallback above only degrades gracefully when the PR is
+# ALREADY immediately mergeable. When a repo has auto-merge disabled AND the PR
+# is not yet CLEAN (checks still running / .mergeable not yet computed), #3763
+# preserves the terminal error and the PR never merges. #3820 detects the repo
+# setting up front (gh api repos/{nwo} --jq .allow_auto_merge) and, when
+# disabled, converts --auto into wait-for-checks-then-merge (immediate if CLEAN).
+# ===========================================================================
+FORGE_HELPERS_SRC="$HELPERS_DIR/lib/forge-helpers.sh"
+
+echo ""
+echo "Testing the #3820 forge_check_auto_merge_allowed probe helper..."
+
+# Source the helper library so we can exercise forge_check_auto_merge_allowed
+# directly with a stubbed gh command (no network).
+# shellcheck source=/dev/null
+source "$FORGE_HELPERS_SRC"
+
+# GitHub + setting disabled -> "false".
+FORGE_TYPE="github"
+_stub_gh_false() { echo "false"; }
+assert_eq "false" "$(forge_check_auto_merge_allowed owner/repo _stub_gh_false)" \
+  "#3820: GitHub repo with allow_auto_merge:false -> 'false'"
+
+# GitHub + setting enabled -> "true".
+_stub_gh_true() { echo "true"; }
+assert_eq "true" "$(forge_check_auto_merge_allowed owner/repo _stub_gh_true)" \
+  "#3820: GitHub repo with allow_auto_merge:true -> 'true'"
+
+# GitHub + probe failure (nonzero exit) -> "unknown" (fail-safe).
+_stub_gh_fail() { return 1; }
+assert_eq "unknown" "$(forge_check_auto_merge_allowed owner/repo _stub_gh_fail)" \
+  "#3820: GitHub probe failure -> 'unknown' (preserve existing behavior)"
+
+# GitHub + unexpected value (e.g. null) -> "unknown".
+_stub_gh_null() { echo "null"; }
+assert_eq "unknown" "$(forge_check_auto_merge_allowed owner/repo _stub_gh_null)" \
+  "#3820: GitHub probe returns non-boolean -> 'unknown'"
+
+# Gitea -> "unknown" (probe is GitHub-only; Gitea behavior preserved).
+FORGE_TYPE="gitea"
+assert_eq "unknown" "$(forge_check_auto_merge_allowed owner/repo _stub_gh_true)" \
+  "#3820: Gitea repo -> 'unknown' (probe scoped to GitHub, Gitea unperturbed)"
+# FORGE_TYPE is read by the sourced forge-helpers.sh functions (dynamic use).
+# shellcheck disable=SC2034
+FORGE_TYPE="github"
+
+# --- Assert merge-pr.sh source wires the #3820 proactive path ---
+echo ""
+echo "Testing merge-pr.sh source wiring (#3820)..."
+
+if grep -q 'REPO_AUTO_MERGE_ALLOWED="\$(forge_check_auto_merge_allowed' "$MERGE_PR_SRC"; then
+    TESTS_RUN=$((TESTS_RUN + 1)); TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "  ${GREEN}PASS${NC}: merge-pr.sh probes the repo setting via forge_check_auto_merge_allowed"
+else
+    TESTS_RUN=$((TESTS_RUN + 1)); TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "  ${RED}FAIL${NC}: merge-pr.sh missing the #3820 forge_check_auto_merge_allowed probe"
+fi
+
+# The probe result must gate a conversion to the synchronous-merge wait path.
+if grep -q '\[\[ "\$REPO_AUTO_MERGE_ALLOWED" == "false" \]\]' "$MERGE_PR_SRC"; then
+    TESTS_RUN=$((TESTS_RUN + 1)); TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "  ${GREEN}PASS${NC}: merge-pr.sh branches on REPO_AUTO_MERGE_ALLOWED == false"
+else
+    TESTS_RUN=$((TESTS_RUN + 1)); TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "  ${RED}FAIL${NC}: merge-pr.sh missing the disabled-repo branch (#3820)"
+fi
+
+if grep -q '_wait_for_checks_then_sync_merge' "$MERGE_PR_SRC"; then
+    TESTS_RUN=$((TESTS_RUN + 1)); TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "  ${GREEN}PASS${NC}: merge-pr.sh defines/invokes _wait_for_checks_then_sync_merge (#3820)"
+else
+    TESTS_RUN=$((TESTS_RUN + 1)); TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "  ${RED}FAIL${NC}: merge-pr.sh missing _wait_for_checks_then_sync_merge (#3820)"
+fi
+
+# The retry loop must be short-circuited on its first iteration when the probe
+# already flipped AUTO_MERGE=false — otherwise it would attempt the doomed
+# enablePullRequestAutoMerge mutation.
+if grep -q '\[\[ "\$AUTO_MERGE" == "true" \]\] || break' "$MERGE_PR_SRC"; then
+    TESTS_RUN=$((TESTS_RUN + 1)); TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "  ${GREEN}PASS${NC}: retry loop breaks immediately when --auto was converted to synchronous merge"
+else
+    TESTS_RUN=$((TESTS_RUN + 1)); TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "  ${RED}FAIL${NC}: merge-pr.sh missing the AUTO_MERGE loop guard (#3820)"
+fi
+
+# The disabled-repo branch must set AUTO_MERGE_OK=true so the post-loop
+# "after N attempts" guard passes when the loop is short-circuited.
+_amd3820_block="$(awk '/#3820: repo has auto-merge disabled/{f=1} f; /for MERGE_ATTEMPT in/{exit}' "$MERGE_PR_SRC")"
+if echo "$_amd3820_block" | grep -q 'AUTO_MERGE=false' && echo "$_amd3820_block" | grep -q 'AUTO_MERGE_OK=true'; then
+    TESTS_RUN=$((TESTS_RUN + 1)); TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "  ${GREEN}PASS${NC}: #3820 branch flips AUTO_MERGE=false / AUTO_MERGE_OK=true"
+else
+    TESTS_RUN=$((TESTS_RUN + 1)); TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "  ${RED}FAIL${NC}: #3820 branch must set AUTO_MERGE=false and AUTO_MERGE_OK=true"
+fi
+
+# The probe helper must be GitHub-scoped (guard on FORGE_TYPE) so Gitea is
+# unperturbed.
+if grep -q 'forge_check_auto_merge_allowed()' "$FORGE_HELPERS_SRC" && \
+   awk '/forge_check_auto_merge_allowed\(\)/{f=1} f && /FORGE_TYPE" != "github"/{print; exit}' "$FORGE_HELPERS_SRC" | grep -q github; then
+    TESTS_RUN=$((TESTS_RUN + 1)); TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "  ${GREEN}PASS${NC}: forge_check_auto_merge_allowed is GitHub-scoped (Gitea returns 'unknown')"
+else
+    TESTS_RUN=$((TESTS_RUN + 1)); TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "  ${RED}FAIL${NC}: forge_check_auto_merge_allowed must guard on FORGE_TYPE == github"
+fi
+
 # --- Summary ---
 echo ""
 echo "────────────────────────────────"
