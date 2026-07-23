@@ -251,7 +251,7 @@ Root cause verification (for process/behavior issues):
 - [ ] If documentation-only: justified why docs will change behavior this time
 
 Local verification:
-- [ ] `pnpm check:ci` passes (or equivalent)
+- [ ] The project's check command passes (see `buildGate.command` in `.loom/config.json`, or the repo's documented CI command, e.g. `pnpm check:ci`)
 - [ ] Relevant tests pass
 - [ ] Each criterion has explicit verification (not "I think it works")
 ```
@@ -314,14 +314,14 @@ cargo fmt --all -- --check
 
 1. **Defense in depth** - Pre-commit hooks can fail silently in worktrees or with PATH issues
 2. **Early feedback** - Catch errors immediately instead of after CI failure
-3. **Save a Doctor cycle** - `pnpm check:ci` includes compilation; catching it early avoids a fix cycle
+3. **Save a Doctor cycle** - the project's check command (`buildGate.command` in `.loom/config.json`, e.g. `pnpm check:ci`) includes compilation; catching it early avoids a fix cycle
 4. **Async pitfalls** - Common Rust async errors (e.g., holding `MutexGuard` across `.await`) are only caught by the compiler, not by reading code
 
 **Add to your pre-PR checklist when modifying Rust:**
 
 ```markdown
 Local verification:
-- [ ] `pnpm check:ci` passes
+- [ ] The project's check command passes (`buildGate.command` in `.loom/config.json`, e.g. `pnpm check:ci`)
 - [ ] `cargo check` returns 0 (Rust files only)
 - [ ] `cargo clippy` returns 0 (Rust files only)
 - [ ] `cargo fmt --all -- --check` returns 0 (Rust files only)
@@ -593,7 +593,7 @@ When creating a PR, verify:
 3. PR description references the issue: `Closes #X` for a full implementation, or `Part of #X` for a declared partial increment (not "Issue #X" or "Addresses #X") — same reference in the commit message
 4. Issue number is correct
 5. PR has `loom:review-requested` label
-6. All CI checks pass (`pnpm check:ci` locally)
+6. All CI checks pass locally (the project's check command — `buildGate.command` in `.loom/config.json`, e.g. `pnpm check:ci`)
 7. PR description includes verification table for each criterion
 8. Tests added/updated as needed
 

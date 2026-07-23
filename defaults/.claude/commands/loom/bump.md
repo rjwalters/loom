@@ -1,6 +1,6 @@
 # Version Bump + Tag (generic)
 
-You are bumping the version of {{workspace}} — a **generic project**, not necessarily Loom itself.
+You are bumping the version of this repository — a **generic project**, not necessarily Loom itself.
 
 ## When to use this skill
 

@@ -75,7 +75,7 @@ To create a custom role:
 ```markdown
 # My Custom Role
 
-You are a specialist in {{workspace}} repository...
+You are a specialist in this repository...
 
 ## Your Role
 - Primary responsibility
@@ -118,7 +118,12 @@ Worker completion is detected automatically through **phase contracts** - the or
 
 ### Template Variables
 
-- `{{workspace}}` - Replaced with the absolute path to the workspace directory
+Role prompts are written as plain language ("this repository") rather than
+templated paths. Install-time substitution is limited to the `CLAUDE.md`
+placeholders handled by the installer (`{{REPO_OWNER}}`, `{{REPO_NAME}}`,
+`{{LOOM_VERSION}}`, `{{LOOM_COMMIT}}`, `{{INSTALL_DATE}}`); the `.claude/`
+role and agent files are copied verbatim, with no substitution pass. Do not
+add unimplemented placeholders such as `{{workspace}}` to role files.
 
 ## Default vs Workspace Roles
 

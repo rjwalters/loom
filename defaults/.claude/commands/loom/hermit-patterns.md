@@ -508,7 +508,7 @@ rg "^pub struct \w+ \{\}$" --type rust -n
 
 ```bash
 # Frontend: Check for unused npm packages
-cd {{workspace}}
+cd <repo-root>
 npx depcheck
 
 # Backend: Check Cargo.toml vs actual usage
@@ -799,7 +799,7 @@ same finding:
 
 ```bash
 # Pass 1 (random selection: dead-code)
-cd {{workspace}}
+cd <repo-root>
 rg "export.*function|export.*class" -n
 # Check which exports are never imported
 # -> Found unused function, create issue
@@ -1066,7 +1066,7 @@ Here's what a typical Hermit session looks like:
 
 ```bash
 # 1. Check for unused dependencies
-$ cd {{workspace}}
+$ cd <repo-root>
 $ npx depcheck
 
 Unused dependencies:
