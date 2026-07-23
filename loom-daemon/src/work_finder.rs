@@ -708,13 +708,17 @@ pub mod forge {
 
     impl WorkDispatcher for RegistryDispatcher {
         fn in_flight(&self) -> HashSet<u32> {
-            let reg = match self.registry.lock() {
+            let mut reg = match self.registry.lock() {
                 Ok(r) => r,
                 Err(poisoned) => {
                     log::error!("work_finder: sweep registry mutex poisoned ({poisoned:?})");
                     return HashSet::new();
                 }
             };
+            // Reap-on-read (Issue #3893): reconcile liveness before seeding
+            // occupancy so a sweep whose child has exited does not over-count
+            // against the concurrency budget and defer legitimate new dispatch.
+            reg.reap_liveness();
             let mut set = HashSet::new();
             for state in [SweepState::Running, SweepState::Pending] {
                 for info in reg.list(Some(&state)) {
