@@ -31,11 +31,15 @@
 //! | `epic.issue.{N}.expand`    | Epic supervisor | `{epic, action, state}` |
 //! | `epic.issue.{N}.join`      | Epic supervisor | `{epic, action, state}` |
 //! | `epic.issue.{N}.close`     | Epic supervisor | `{epic, action, state}` |
+//! | `daemon.capacity.advisory` | Work finder | `{pressured, queued, healthy_accounts, exhausted_accounts, total_accounts, estimated_drain_minutes?, message}` |
 //!
 //! New topics require a follow-up issue — the taxonomy is intentionally
 //! pinned. The four `epic.issue.{N}.*` topics were authorized by **#3873**
 //! (epic #3842 Phase 4) for the epic supervisor's action classes
-//! (decompose / expand / join / close). The bus accepts arbitrary topic
+//! (decompose / expand / join / close). The `daemon.capacity.advisory` topic
+//! was authorized by **#3902** (epic #3809) for the work finder's
+//! token-capacity backpressure advisory (fired on pressure state change). The
+//! bus accepts arbitrary topic
 //! strings (`publish` does not reject unknown topics) so the publisher side
 //! stays open for future extension, but the documented taxonomy is the
 //! contract subscribers should rely on.

@@ -11,6 +11,7 @@
 #![allow(clippy::missing_panics_doc)]
 
 pub mod activity;
+pub mod capacity;
 pub mod disk_headroom;
 pub mod epic_state;
 pub mod epic_supervisor;

@@ -112,10 +112,16 @@ issue** — the v0.10.0 set is intentionally frozen.
 | `epic.issue.{N}.expand`    | Epic supervisor (#3842)        | `{epic, action, state}` |
 | `epic.issue.{N}.join`      | Epic supervisor (#3842)        | `{epic, action, state}` |
 | `epic.issue.{N}.close`     | Epic supervisor (#3842)        | `{epic, action, state}` |
+| `daemon.capacity.advisory` | Work finder (#3902)            | `{pressured, queued, healthy_accounts, exhausted_accounts, total_accounts, estimated_drain_minutes?, message}` |
 
 The four `epic.issue.{N}.*` topics were authorized by **#3873** (epic #3842
 Phase 4) and are documented in full under [Epic supervisor](#epic-supervisor-3842)
-below. They ride the same in-memory bus as the sweep topics and are tailable via
+below. The `daemon.capacity.advisory` topic was authorized by **#3902** (epic
+#3809): the autonomous work finder publishes it on a token-capacity **pressure
+state change** (entered/left the token-bound state), never every tick, so the
+operator gets one add-capacity advisory on the way in and one recovery on the way
+out. See [Token-capacity backpressure](#token-capacity-backpressure-3902) below.
+They ride the same in-memory bus as the sweep topics and are tailable via
 `subscribe_to_events` / `tail_event_bus`.
 
 In addition, the bus internally emits:
@@ -505,7 +511,7 @@ The concurrency cap is **not** a fixed value resolved once at startup. Every
 tick the finder recomputes
 
 ```
-dynamic_cap = min(token-pool size, disk headroom, configured ceiling)
+dynamic_cap = min(healthy-token count, disk headroom, configured ceiling)
 ```
 
 from three live inputs, so pool/disk/backlog changes are honored without a
@@ -513,7 +519,7 @@ daemon restart:
 
 | Input | Source | Bound it enforces |
 |-------|--------|-------------------|
-| **token-pool size** | count of `*.token` files in `{workspace}/.loom/tokens/` (`tokens::token_pool_size`) | never over-subscribe a rotated OAuth account — one live sweep per usable account |
+| **healthy-token count** | `available` accounts in `{workspace}/.loom/tokens/.ranking` (`capacity::token_axis_limit`), falling back to the `*.token` count (`tokens::token_pool_size`) when no ranking exists | never over-subscribe a rotated OAuth account, and never dispatch to an exhausted/blocked one (#3902) — one live sweep per **healthy** account |
 | **disk headroom** | `floor(free_gb / LOOM_PER_WORKTREE_GB)` on the worktree-root volume (`disk_headroom::disk_headroom_limit`, a Rust port of `disk-headroom.sh` that shells to `df -Pk`) | never provision more worktrees than the scratch volume can hold |
 | **configured ceiling** | `LOOM_WORK_FINDER_MAX_CONCURRENT` (repurposed from Phase A's fixed target into an operator ceiling) | hard operator upper bound regardless of pool/disk headroom |
 
@@ -549,6 +555,48 @@ unparseable value for any of these falls back to its default.
 > cadence remains out of scope (follow-up #3381). So "the daemon does not
 > generate work" below still holds — the finder only closes the gap between an
 > approved issue and its build.
+
+### Token-capacity backpressure (#3902)
+
+At scale, rotation accounts hit their 5h/7d rate limits and go `exhausted`.
+Dispatching to an exhausted account produces startup hangs / mid-build deaths, so
+the finder treats a genuine token limit as a **capacity signal** — slow down,
+alert, recover — all automatic and non-blocking:
+
+1. **Slow down (backpressure).** The token axis of the dynamic cap is the count
+   of **healthy** (`available`) accounts read from `.loom/tokens/.ranking`
+   (`capacity::token_axis_limit`), not the flat `*.token` count. When accounts go
+   exhausted the cap backs off toward the healthy count; when *every* account is
+   exhausted it drops to 0 and the finder **defers** the queue rather than
+   hammering an exhausted account. A single healthy account is the throughput
+   **floor**, never a halt. When no `.ranking` file exists (no probe has run) the
+   axis falls back to the raw pool size — byte-for-byte the pre-#3902 behavior.
+2. **Alert (add capacity).** When the token axis is the *binding* constraint
+   (≤ disk and ≤ ceiling) and work is queued behind it, the finder is
+   *token-bound*. On the **state change** into that state it emits an
+   add-capacity advisory naming concrete levers — add accounts to
+   `~/.claude-monitor/accounts.env` + `loom-tokens bootstrap`, or buy API
+   credits, then `loom-tokens check --ranking` — with the current numbers
+   (queued count, healthy/total accounts, exhausted count, estimated drain time
+   at current capacity). The advisory surfaces on **three** channels: the daemon
+   log (`warn`), the `daemon.capacity.advisory` event-bus topic, and the
+   `capacity` section of `loom-daemon status`. It is **deduplicated** — one
+   advisory on entry, one recovery on exit, never per-tick spam. Advisory only;
+   it never blocks dispatch.
+3. **Recover.** The finder re-reads the ranking every tick (bounded cadence = the
+   tick interval), so as accounts reset to `available` the cap ramps back up and
+   the queued `loom:issue` backlog drains automatically — no manual intervention.
+   A symmetric recovery line/event fires on the way out of the pressured state.
+
+The `estimated_drain_minutes` figure is a coarse `ceil(queued / healthy) ×
+NOMINAL_SWEEP_MINUTES` (30 min nominal) aid, not a precise SLA — the daemon does
+not track live per-sweep durations here. Near-ceiling granularity is limited to
+the `.ranking` discrete status word (`exhausted` is already ≥ 0.95 utilization);
+a finer sub-exhausted (≥ 0.90) bucket would read the richer `loom-tokens check
+--json` utilization and is a tracked follow-up. Even rotation/staggering of
+dispatches across the available account set (so 5h/7d windows reset in a
+staggered pattern) lives in the spawn-time selector (`loom_tools.tokens.select`),
+not the daemon, and is a separate follow-up.
 
 ## Operability — config, start/stop, E2E (Phase D, #3813)
 
