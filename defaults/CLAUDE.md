@@ -687,11 +687,20 @@ See [`.loom/docs/daemon-reference.md`](.loom/docs/daemon-reference.md) for the w
 Start/stop the **raw daemon process** (distinct from the tmux `.loom/bin/loom start|stop` pool) with dedicated wrappers that run the advisory host-sleep check (#3350), write a PID file (`.loom/.daemon.pid`), surface the singleton-guard refusal (#3806), and shut down cleanly on **SIGTERM** (not just Ctrl-C/SIGINT):
 
 ```bash
-./.loom/scripts/cli/loom-daemon-start.sh               # work finder + health gate, backgrounded
-./.loom/scripts/cli/loom-daemon-start.sh --from-config # enable strictly per .loom/config.json → autonomous
-./.loom/scripts/cli/loom-daemon-start.sh --no-work-finder   # gate only
-./.loom/scripts/cli/loom-daemon-stop.sh                # SIGTERM → grace → SIGKILL (--force for immediate)
+./.loom/scripts/cli/loom-daemon-start.sh                # FLAGS-OFF reliability daemon (both loops off, backgrounded)
+./.loom/scripts/cli/loom-daemon-start.sh --work-finder  # opt in: autonomous work finder
+./.loom/scripts/cli/loom-daemon-start.sh --health-gate  # opt in: main-health gate
+./.loom/scripts/cli/loom-daemon-start.sh --from-config  # enable strictly per .loom/config.json → autonomous
+./.loom/scripts/cli/loom-daemon-stop.sh                 # SIGTERM → grace → SIGKILL (--force for immediate)
 ```
+
+> **Default is FLAGS-OFF (#3911).** A bare `loom-daemon-start.sh` starts a
+> reliability daemon with **both autonomous loops OFF** — it does **not**
+> auto-dispatch sweeps — matching the ecosystem-wide opt-in / default-off
+> contract (`LOOM_WORK_FINDER` unset ⇒ off, `LOOM_MAIN_HEALTH_GATE` unset ⇒ off,
+> precedence env > config > default). Enable autonomy explicitly with
+> `--work-finder` / `--health-gate`, or hand control to committed config with
+> `--from-config`.
 
 **Shutdown decision**: a clean stop leaves in-flight `/loom:sweep` children **running** — they are independent detached processes that survive a daemon restart by design (killing the dispatcher must not kill dispatched work); the registry reconciles them on the next start. Use `mcp__loom__cancel_sweep` against a running daemon to actively cancel a sweep before stopping. The full config table, start/stop flags, and a scripted end-to-end acceptance playbook are in [`.loom/docs/daemon-reference.md`](.loom/docs/daemon-reference.md) §Operability and [`docs/autonomous-mode-e2e.md`](../docs/autonomous-mode-e2e.md).
 

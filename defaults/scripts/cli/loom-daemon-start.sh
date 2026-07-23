@@ -12,17 +12,26 @@
 # It:
 #   - locates the loom-daemon binary,
 #   - runs the (advisory, never-blocking) host-sleep check (#3350),
-#   - enables autonomous mode (work finder + health gate) via env by default,
-#     or leaves it to .loom/config.json -> autonomous with --from-config,
+#   - starts a plain reliability daemon with BOTH autonomous loops OFF by
+#     default (matching the ecosystem-wide opt-in / default-off contract:
+#     LOOM_WORK_FINDER unset => off, LOOM_MAIN_HEALTH_GATE unset => off). Opt in
+#     explicitly with --work-finder / --health-gate, or hand control to
+#     .loom/config.json -> autonomous with --from-config (#3911),
 #   - backgrounds the daemon and writes a PID file (.loom/.daemon.pid),
 #   - surfaces the singleton-guard refusal (#3806) legibly instead of leaving a
 #     silently-exited background process.
 #
+# Default is FLAGS-OFF: a bare `loom-daemon-start.sh` does NOT auto-dispatch
+# sweeps. This is a deliberate safe default — enable autonomy explicitly.
+#
 # Usage:
-#   ./.loom/scripts/cli/loom-daemon-start.sh                 Start autonomous mode
+#   ./.loom/scripts/cli/loom-daemon-start.sh                 Reliability daemon (both loops OFF)
+#   ./.loom/scripts/cli/loom-daemon-start.sh --work-finder   Enable the autonomous work finder
+#   ./.loom/scripts/cli/loom-daemon-start.sh --health-gate   Enable the main-health gate
+#   ./.loom/scripts/cli/loom-daemon-start.sh --work-finder --health-gate   Both loops ON
 #   ./.loom/scripts/cli/loom-daemon-start.sh --from-config   Enable per .loom/config.json only
-#   ./.loom/scripts/cli/loom-daemon-start.sh --no-work-finder    Health gate only
-#   ./.loom/scripts/cli/loom-daemon-start.sh --no-health-gate    Work finder only
+#   ./.loom/scripts/cli/loom-daemon-start.sh --no-work-finder    Force work finder OFF (explicit)
+#   ./.loom/scripts/cli/loom-daemon-start.sh --no-health-gate    Force health gate OFF (explicit)
 #   ./.loom/scripts/cli/loom-daemon-start.sh --foreground    Run in the foreground (no PID file)
 #   ./.loom/scripts/cli/loom-daemon-start.sh --help
 #
@@ -48,7 +57,9 @@ warn() { echo -e "${YELLOW}$*${NC}" >&2; }
 ok()   { echo -e "${GREEN}$*${NC}"; }
 
 show_help() {
-    sed -n '2,40p' "$0" | sed 's/^# \{0,1\}//'
+    # Print the leading comment banner (line 2 through the last comment line
+    # before `set -uo pipefail`), stripping the leading "# ".
+    awk 'NR>=2 { if ($0 !~ /^#/) exit; sub(/^# ?/, ""); print }' "$0"
 }
 
 # ---------- repo root ----------
@@ -88,15 +99,20 @@ locate_daemon_bin() {
 }
 
 # ---------- args ----------
+# Default is FLAGS-OFF (#3911): both autonomous loops default OFF, matching the
+# ecosystem-wide opt-in / default-off contract. Opt in with --work-finder /
+# --health-gate, or hand control to config with --from-config.
 FROM_CONFIG=false
 FOREGROUND=false
-WANT_WORK_FINDER=true
-WANT_HEALTH_GATE=true
+WANT_WORK_FINDER=false
+WANT_HEALTH_GATE=false
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --help|-h) show_help; exit 0 ;;
         --from-config) FROM_CONFIG=true; shift ;;
         --foreground|--fg) FOREGROUND=true; shift ;;
+        --work-finder) WANT_WORK_FINDER=true; shift ;;
+        --health-gate) WANT_HEALTH_GATE=true; shift ;;
         --no-work-finder) WANT_WORK_FINDER=false; shift ;;
         --no-health-gate) WANT_HEALTH_GATE=false; shift ;;
         *) err "Unknown option '$1'"; echo "Use --help for usage" >&2; exit 1 ;;
@@ -142,9 +158,11 @@ fi
 
 # ---------- autonomous-mode env ----------
 # Precedence: an already-exported env var is always respected. Otherwise the
-# default is to enable both loops (the whole point of starting the daemon),
-# unless --from-config was passed (then leave them unset so .loom/config.json ->
-# autonomous drives) or a --no-* opt-out forces the var to 0.
+# default is FLAGS-OFF (#3911) — a plain start is a reliability daemon with both
+# autonomous loops OFF, matching the ecosystem-wide opt-in / default-off contract
+# (LOOM_WORK_FINDER unset => off, LOOM_MAIN_HEALTH_GATE unset => off). Opt in with
+# --work-finder / --health-gate (force the var to 1), or pass --from-config to
+# leave both unset so .loom/config.json -> autonomous drives.
 export LOOM_WORKSPACE="${LOOM_WORKSPACE:-$REPO_ROOT}"
 
 # ---------- guard-hook autonomy defaults (#3898) ----------
@@ -168,17 +186,24 @@ export LOOM_FORCE_SCOPE="${LOOM_FORCE_SCOPE:-protected}"
 if [[ "$FROM_CONFIG" == "true" ]]; then
     echo -e "${BOLD}Autonomous mode: driven by .loom/config.json -> autonomous (env not forced)${NC}"
 else
-    if [[ "$WANT_WORK_FINDER" == "false" ]]; then
-        export LOOM_WORK_FINDER=0
-    elif [[ -z "${LOOM_WORK_FINDER:-}" ]]; then
-        export LOOM_WORK_FINDER=1
+    # An already-exported env var always wins. Otherwise --work-finder /
+    # --health-gate force the loop ON (=1); the default (flags off) forces it
+    # OFF (=0), so a plain start is a reliability daemon that never auto-dispatches.
+    if [[ "$WANT_WORK_FINDER" == "true" ]]; then
+        export LOOM_WORK_FINDER="${LOOM_WORK_FINDER:-1}"
+    else
+        export LOOM_WORK_FINDER="${LOOM_WORK_FINDER:-0}"
     fi
-    if [[ "$WANT_HEALTH_GATE" == "false" ]]; then
-        export LOOM_MAIN_HEALTH_GATE=0
-    elif [[ -z "${LOOM_MAIN_HEALTH_GATE:-}" ]]; then
-        export LOOM_MAIN_HEALTH_GATE=1
+    if [[ "$WANT_HEALTH_GATE" == "true" ]]; then
+        export LOOM_MAIN_HEALTH_GATE="${LOOM_MAIN_HEALTH_GATE:-1}"
+    else
+        export LOOM_MAIN_HEALTH_GATE="${LOOM_MAIN_HEALTH_GATE:-0}"
     fi
-    echo -e "${BOLD}Autonomous mode:${NC} work_finder=${LOOM_WORK_FINDER:-config} main_health_gate=${LOOM_MAIN_HEALTH_GATE:-config}"
+    if [[ "$LOOM_WORK_FINDER" == "0" && "$LOOM_MAIN_HEALTH_GATE" == "0" ]]; then
+        echo -e "${BOLD}Reliability daemon:${NC} work_finder=off main_health_gate=off (both loops OFF; opt in with --work-finder / --health-gate / --from-config)"
+    else
+        echo -e "${BOLD}Autonomous mode:${NC} work_finder=${LOOM_WORK_FINDER} main_health_gate=${LOOM_MAIN_HEALTH_GATE}"
+    fi
 fi
 
 echo "Daemon binary: $DAEMON_BIN"

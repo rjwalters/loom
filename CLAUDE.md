@@ -342,10 +342,20 @@ The Rust `loom-daemon` binary is the load-bearing Tier 2 dispatch backend. It is
 Start/stop the **raw daemon process** (distinct from the tmux `loom start|stop` pool) with dedicated wrappers that run the advisory host-sleep check, write a PID file (`.loom/.daemon.pid`), surface the singleton-guard refusal, and shut down cleanly on **SIGTERM** (not just Ctrl-C):
 
 ```bash
-./.loom/scripts/cli/loom-daemon-start.sh              # work finder + health gate, backgrounded
-./.loom/scripts/cli/loom-daemon-start.sh --from-config # enable strictly per .loom/config.json
-./.loom/scripts/cli/loom-daemon-stop.sh               # SIGTERM → grace → SIGKILL
+./.loom/scripts/cli/loom-daemon-start.sh                # FLAGS-OFF reliability daemon (both loops off, backgrounded)
+./.loom/scripts/cli/loom-daemon-start.sh --work-finder  # opt in: autonomous work finder
+./.loom/scripts/cli/loom-daemon-start.sh --health-gate  # opt in: main-health gate
+./.loom/scripts/cli/loom-daemon-start.sh --from-config  # enable strictly per .loom/config.json
+./.loom/scripts/cli/loom-daemon-stop.sh                 # SIGTERM → grace → SIGKILL
 ```
+
+> **Default is FLAGS-OFF (#3911).** A bare `loom-daemon-start.sh` starts a
+> reliability daemon with **both autonomous loops OFF** — it does **not**
+> auto-dispatch sweeps — matching the ecosystem-wide opt-in / default-off
+> contract (`LOOM_WORK_FINDER` unset ⇒ off, `LOOM_MAIN_HEALTH_GATE` unset ⇒ off,
+> precedence env > config > default). Enable autonomy explicitly with
+> `--work-finder` / `--health-gate`, or hand control to committed config with
+> `--from-config`.
 
 A clean stop leaves in-flight `/loom:sweep` children **running** (they survive a daemon restart by design; use `mcp__loom__cancel_sweep` to actively cancel). The full config table, start/stop flags, and a scripted end-to-end acceptance playbook are in [`.loom/docs/daemon-reference.md`](.loom/docs/daemon-reference.md) §Operability and [`docs/autonomous-mode-e2e.md`](docs/autonomous-mode-e2e.md).
 

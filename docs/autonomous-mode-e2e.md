@@ -53,8 +53,9 @@ Add the `autonomous` block to `.loom/config.json` (see
 
 ```bash
 ./.loom/scripts/cli/loom-daemon-start.sh --from-config
-# or force the loops on regardless of config:
-./.loom/scripts/cli/loom-daemon-start.sh
+# or force the loops on regardless of config (a bare start is FLAGS-OFF, #3911,
+# so opt in explicitly — it does NOT enable autonomy on its own):
+./.loom/scripts/cli/loom-daemon-start.sh --work-finder --health-gate
 ```
 
 Confirm the work finder is ticking:
