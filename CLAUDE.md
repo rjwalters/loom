@@ -107,7 +107,10 @@ The Rust `loom-daemon` binary is the Tier 2 dispatch backend. It exposes a Unix-
 
 **`/loom:sweep` backend detection (Stage -1, Phase D #3454)**: the skill probes whether the daemon is reachable (a Ping over the IPC socket with a 500ms timeout) AND whether a multi-account token pool exists (`.loom/tokens/` contains ≥ 2 `ACCOUNT_KEY_*` entries). **Strict AND** — either probe failing falls through to in-process subagent dispatch (the existing Mode A/B/C lifecycle). Mode C (`--prs`) always uses subagent dispatch; the daemon does not handle PR-set dispatch in v0.10.0. The `--no-daemon` flag forces subagent dispatch unconditionally.
 
-The daemon itself is **not** a work generator. It does not poll the forge for `loom:issue` items; it does not maintain a `shepherd-N` pool; it does not drive support roles on cron. Those responsibilities live in `mcp__loom__dispatch_sweep` (operator-driven enqueue) and the GitHub Actions cron workflows.
+**By default the daemon is not a work generator** — with no autonomous config it does not poll the forge for `loom:issue` items, does not maintain a `shepherd-N` pool, and does not drive support roles on cron; work arrives only via `mcp__loom__dispatch_sweep` (operator-driven enqueue) and the GitHub Actions cron workflows. As of epics #3809 and #3842 the daemon *can* generate and dispatch its own work when **explicitly opted in** — both surfaces are default-off:
+
+- **Autonomous work finder** (#3810, `LOOM_WORK_FINDER` / `autonomous.workFinder`): polls the forge for open, already-approved `loom:issue` items and auto-dispatches sweeps, with work-driven concurrency bounded by `min(available work, healthy tokens, free disk, maxConcurrent)` (#3811) and a reactive main-health backstop (#3812, `LOOM_MAIN_HEALTH_GATE` / `autonomous.mainHealthGate`) that halts dispatch when `main` goes red. Enable/tune from the `autonomous` block in `.loom/config.json` (precedence **env > config > default**) and manage the raw process with `loom-daemon-start.sh` / `loom-daemon-stop.sh` — see [Autonomous work finder](.loom/docs/daemon-reference.md#autonomous-work-finder-3810) and §Operability, plus "Daemon Configuration (Tier 2)" below.
+- **Epic supervisor** (#3842): drives every open `loom:epic` issue through a derived-state fork-join model with a phase-join barrier, serializing child-issue creation behind the #3707 issue-creation mutex on a dedicated off-runtime OS thread — see [Epic supervisor](.loom/docs/daemon-reference.md#epic-supervisor-3842).
 
 For full surface documentation — IPC request/response variants, event-bus internals, registry behaviour, reaper semantics — see [`.loom/docs/daemon-reference.md`](.loom/docs/daemon-reference.md).
 
@@ -325,7 +328,7 @@ Configuration stored in `.loom/config.json` (committed to git for team sharing):
 
 The Rust `loom-daemon` binary is the load-bearing Tier 2 dispatch backend. It is a single long-lived process that holds the sweep registry, the event bus, and the reaper task in memory — there is no on-disk state file the operator needs to touch. See [`.loom/docs/daemon-reference.md`](.loom/docs/daemon-reference.md) for the full surface and [`docs/migration/v0.10.0-shepherd-deprecation.md`](docs/migration/v0.10.0-shepherd-deprecation.md) for the migration narrative away from the legacy Python brain.
 
-**Autonomous mode (config + start/stop, #3813)**: the daemon's autonomous work finder (#3810) and reactive main-health gate (#3812) can be enabled and tuned entirely from committed config — an `autonomous` block in `.loom/config.json` — with env vars still overriding for a single run (precedence **env > config > default**; an absent block is byte-for-byte the pre-#3813 env-only behavior):
+**Autonomous mode (config + start/stop, #3813)**: the daemon's autonomous work finder (#3810, `LOOM_WORK_FINDER`) and reactive main-health gate (#3812, `LOOM_MAIN_HEALTH_GATE`) can be enabled and tuned entirely from committed config — an `autonomous` block in `.loom/config.json` — with env vars still overriding for a single run (precedence **env > config > default**; an absent block is byte-for-byte the pre-#3813 env-only behavior):
 
 ```json
 {
@@ -345,6 +348,8 @@ Start/stop the **raw daemon process** (distinct from the tmux `loom start|stop` 
 ```
 
 A clean stop leaves in-flight `/loom:sweep` children **running** (they survive a daemon restart by design; use `mcp__loom__cancel_sweep` to actively cancel). The full config table, start/stop flags, and a scripted end-to-end acceptance playbook are in [`.loom/docs/daemon-reference.md`](.loom/docs/daemon-reference.md) §Operability and [`docs/autonomous-mode-e2e.md`](docs/autonomous-mode-e2e.md).
+
+**Epic supervisor (#3842)**: separately from the work finder, when enabled the daemon runs a [derived-state epic supervisor](.loom/docs/daemon-reference.md#epic-supervisor-3842) that drives every open `loom:epic` issue through a fork-join lifecycle (decompose → expand → phase-join barrier → close), scheduling phase dispatches and serializing all child-issue creation behind the #3707 issue-creation mutex. It runs on a dedicated off-runtime OS thread (not a `tokio::spawn`) precisely because the mutex-guarded issue-creation calls block; see [Epic supervisor](.loom/docs/daemon-reference.md#epic-supervisor-3842) for the transition table and event topics.
 
 **Per-sweep logs** live at `.loom/logs/sweep-issue-<N>.log` and are tailable via `mcp__loom__tail_sweep_log`.
 

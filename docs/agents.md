@@ -368,8 +368,10 @@ which detaches one `claude -p "/loom:sweep N"` child (with multi-account
 token rotation via `spawn-claude.sh`). Each child runs the full
 Curator → Builder → Judge → Doctor → Merge lifecycle for one issue and
 exits. There is no shepherd pool, no `daemon-state.json`, no
-work-generation cooldowns — the daemon does not poll the forge;
-dispatch is operator-driven.
+work-generation cooldowns — by default the daemon does not poll the
+forge; dispatch is operator-driven. (An opt-in, default-off autonomous
+work finder (#3810) can poll open `loom:issue` items and auto-dispatch
+sweeps when explicitly enabled.)
 
 ```bash
 mcp__loom__dispatch_sweep --issue 123   # enqueue a sweep for issue 123

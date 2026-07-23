@@ -25,11 +25,18 @@ coordination point** for:
 - **Reaping** dead PIDs (every 30s) to maintain registry liveness and
   emit `sweep.issue.*.exited` / `sweep.issue.*.crashed` events.
 
-It is **not** a work generator. It does not poll the forge for ready
-issues, it does not maintain a `shepherd-N` pool, and it does not run
-support roles on cron. Those responsibilities live in
-`mcp__loom__dispatch_sweep` (operator-driven enqueue) and the GitHub
-Actions cron workflows (`.github/workflows/loom-*.yml`).
+**By default it is not a work generator.** With no autonomous config it
+does not poll the forge for ready issues, it does not maintain a
+`shepherd-N` pool, and it does not run support roles on cron — those
+responsibilities live in `mcp__loom__dispatch_sweep` (operator-driven
+enqueue) and the GitHub Actions cron workflows
+(`.github/workflows/loom-*.yml`). Two **opt-in, default-off** surfaces
+(epics #3809 and #3842) let the daemon generate and dispatch its own work
+when explicitly enabled: the [autonomous work
+finder](#autonomous-work-finder-3810) polls open `loom:issue` items and
+auto-dispatches sweeps, and the [epic supervisor](#epic-supervisor-3842)
+drives `loom:epic` fork-joins. See [Operability](#operability--config-startstop-e2e-phase-d-3813)
+for enabling and tuning them.
 
 ## Architecture (Phases A-C)
 

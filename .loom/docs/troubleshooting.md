@@ -341,7 +341,7 @@ ls -la .loom/tokens/
 mcp__loom__tail_event_bus
 ```
 
-Note: the daemon does not poll the forge for `loom:issue` items — dispatch is operator-driven via `mcp__loom__dispatch_sweep`. To dispatch a ready issue, call `mcp__loom__dispatch_sweep --issue <N>` explicitly.
+Note: by default the daemon does not poll the forge for `loom:issue` items — dispatch is operator-driven via `mcp__loom__dispatch_sweep`. To dispatch a ready issue, call `mcp__loom__dispatch_sweep --issue <N>` explicitly. (The opt-in autonomous work finder (#3810, `LOOM_WORK_FINDER` / `autonomous.workFinder`, default-off) *does* poll and auto-dispatch open `loom:issue` items when enabled — see [daemon-reference.md](daemon-reference.md#autonomous-work-finder-3810).)
 
 ### Work generation (Architect / Hermit) not running
 
