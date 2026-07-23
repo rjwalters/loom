@@ -73,7 +73,7 @@
 //! supervisor's OS-thread machinery.
 
 use std::collections::HashSet;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -317,7 +317,9 @@ pub fn tick(
 /// Whether the work-finder loop is enabled, per [`WORK_FINDER_ENABLE_ENV`].
 ///
 /// Off by default (opt-in) — parsing mirrors
-/// [`crate::epic_supervisor::supervisor_enabled`].
+/// [`crate::epic_supervisor::supervisor_enabled`]. This is the **env-only**
+/// primitive; the config-aware entry point the daemon actually uses is
+/// [`resolve_enabled`] (precedence env > config > default).
 #[must_use]
 pub fn enabled() -> bool {
     std::env::var(WORK_FINDER_ENABLE_ENV).is_ok_and(|v| {
@@ -325,15 +327,30 @@ pub fn enabled() -> bool {
     })
 }
 
+/// Env override for the tick interval — `None` when unset, zero, or
+/// unparseable (a zero-interval busy loop is never useful).
+fn env_interval_secs() -> Option<u64> {
+    std::env::var(WORK_FINDER_INTERVAL_ENV)
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|&s| s > 0)
+}
+
+/// Env override for the max-concurrency ceiling — `None` when unset, zero, or
+/// unparseable (a zero cap would dispatch nothing, defeating the loop).
+fn env_max_concurrent() -> Option<usize> {
+    std::env::var(WORK_FINDER_MAX_CONCURRENT_ENV)
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|&n| n > 0)
+}
+
 /// Resolve the tick interval from [`WORK_FINDER_INTERVAL_ENV`], falling back to
 /// [`DEFAULT_WORK_FINDER_INTERVAL_SECS`]. A zero or unparseable value falls back
 /// to the default (a zero-interval busy loop is never useful).
 #[must_use]
 pub fn resolve_interval() -> Duration {
-    std::env::var(WORK_FINDER_INTERVAL_ENV)
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-        .filter(|&s| s > 0)
+    env_interval_secs()
         .map_or_else(|| Duration::from_secs(DEFAULT_WORK_FINDER_INTERVAL_SECS), Duration::from_secs)
 }
 
@@ -343,10 +360,103 @@ pub fn resolve_interval() -> Duration {
 /// back to the default (a zero cap would dispatch nothing, defeating the loop).
 #[must_use]
 pub fn resolve_max_concurrent() -> usize {
-    std::env::var(WORK_FINDER_MAX_CONCURRENT_ENV)
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
-        .filter(|&n| n > 0)
+    env_max_concurrent().unwrap_or(DEFAULT_WORK_FINDER_MAX_CONCURRENT)
+}
+
+// ============================================================================
+// Config-file configuration (.loom/config.json → autonomous.workFinder)
+// ============================================================================
+
+/// The subset of `.loom/config.json → autonomous.workFinder` this module
+/// consumes. Each field is `Option` so an absent key falls through to the
+/// env-var / built-in-default resolution — the precedence is **env > config >
+/// default** for every knob.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct WorkFinderConfig {
+    /// `autonomous.workFinder.enabled` — whether to run the loop at all.
+    pub enabled: Option<bool>,
+    /// `autonomous.workFinder.intervalSecs` — tick interval in seconds
+    /// (a zero/invalid value is dropped to `None`).
+    pub interval_secs: Option<u64>,
+    /// `autonomous.workFinder.maxConcurrent` — the operator concurrency ceiling
+    /// (a zero/invalid value is dropped to `None`).
+    pub max_concurrent: Option<usize>,
+}
+
+/// Read `.loom/config.json → autonomous.workFinder`, soft-failing every field
+/// to `None` (env/default resolution) on any of: missing file, malformed JSON,
+/// or a missing `autonomous` / `workFinder` block.
+///
+/// Mirrors the soft-fail contract of
+/// [`crate::main_health_gate::read_build_gate_config`] — a repo with no
+/// `autonomous` block gets zero behavior change (env-only, exactly like today).
+/// A zero or non-integer `intervalSecs` / `maxConcurrent` is treated as absent
+/// so it falls through to the built-in default rather than a useless value.
+#[must_use]
+pub fn read_work_finder_config(repo_root: &Path) -> WorkFinderConfig {
+    let config_path = repo_root.join(".loom").join("config.json");
+
+    let config_str = match std::fs::read_to_string(&config_path) {
+        Ok(s) => s,
+        Err(e) => {
+            log::debug!("work_finder: could not read config at {}: {e}", config_path.display());
+            return WorkFinderConfig::default();
+        }
+    };
+
+    let config: serde_json::Value = match serde_json::from_str(&config_str) {
+        Ok(v) => v,
+        Err(e) => {
+            log::warn!("work_finder: could not parse config at {}: {e}", config_path.display());
+            return WorkFinderConfig::default();
+        }
+    };
+
+    let Some(wf) = config.get("autonomous").and_then(|a| a.get("workFinder")) else {
+        return WorkFinderConfig::default();
+    };
+
+    WorkFinderConfig {
+        enabled: wf.get("enabled").and_then(serde_json::Value::as_bool),
+        interval_secs: wf
+            .get("intervalSecs")
+            .and_then(serde_json::Value::as_u64)
+            .filter(|&s| s > 0),
+        max_concurrent: wf
+            .get("maxConcurrent")
+            .and_then(serde_json::Value::as_u64)
+            .filter(|&n| n > 0)
+            .and_then(|n| usize::try_from(n).ok()),
+    }
+}
+
+/// Resolve whether the loop is enabled with precedence **env > config >
+/// default(false)**. When [`WORK_FINDER_ENABLE_ENV`] is *set* (to any value) it
+/// decides (truthy enables, anything else disables); when unset the config
+/// `enabled` flag decides; absent config leaves it off (opt-in, zero behavior
+/// change).
+#[must_use]
+pub fn resolve_enabled(config: &WorkFinderConfig) -> bool {
+    if let Ok(v) = std::env::var(WORK_FINDER_ENABLE_ENV) {
+        return matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on");
+    }
+    config.enabled.unwrap_or(false)
+}
+
+/// Resolve the tick interval with precedence **env > config > default**.
+#[must_use]
+pub fn resolve_interval_with_config(config: &WorkFinderConfig) -> Duration {
+    env_interval_secs()
+        .or(config.interval_secs)
+        .map_or_else(|| Duration::from_secs(DEFAULT_WORK_FINDER_INTERVAL_SECS), Duration::from_secs)
+}
+
+/// Resolve the max-concurrency ceiling with precedence **env > config >
+/// default**.
+#[must_use]
+pub fn resolve_max_concurrent_with_config(config: &WorkFinderConfig) -> usize {
+    env_max_concurrent()
+        .or(config.max_concurrent)
         .unwrap_or(DEFAULT_WORK_FINDER_MAX_CONCURRENT)
 }
 
@@ -1035,5 +1145,176 @@ mod tests {
         let report = tick(&mut source, &mut disp, cap, false).unwrap();
         assert_eq!(report, TickReport::default(), "empty backlog ⇒ zero activity");
         assert!(disp.dispatched.is_empty());
+    }
+
+    // ===================================================================
+    // Config-file surface — read_work_finder_config soft-fail (#3813)
+    // ===================================================================
+
+    fn write_config(dir: &Path, body: &str) {
+        let loom_dir = dir.join(".loom");
+        std::fs::create_dir_all(&loom_dir).unwrap();
+        std::fs::write(loom_dir.join("config.json"), body).unwrap();
+    }
+
+    #[test]
+    fn test_config_missing_file_is_all_none() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert_eq!(read_work_finder_config(tmp.path()), WorkFinderConfig::default());
+    }
+
+    #[test]
+    fn test_config_malformed_json_is_all_none() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_config(tmp.path(), "{not valid json");
+        assert_eq!(read_work_finder_config(tmp.path()), WorkFinderConfig::default());
+    }
+
+    #[test]
+    fn test_config_missing_autonomous_block_is_all_none() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_config(tmp.path(), r#"{"terminals": []}"#);
+        assert_eq!(read_work_finder_config(tmp.path()), WorkFinderConfig::default());
+    }
+
+    #[test]
+    fn test_config_missing_work_finder_block_is_all_none() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_config(tmp.path(), r#"{"autonomous": {"mainHealthGate": {"enabled": true}}}"#);
+        assert_eq!(read_work_finder_config(tmp.path()), WorkFinderConfig::default());
+    }
+
+    #[test]
+    fn test_config_full_block_is_parsed() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_config(
+            tmp.path(),
+            r#"{"autonomous": {"workFinder": {"enabled": true, "intervalSecs": 90, "maxConcurrent": 5}}}"#,
+        );
+        assert_eq!(
+            read_work_finder_config(tmp.path()),
+            WorkFinderConfig {
+                enabled: Some(true),
+                interval_secs: Some(90),
+                max_concurrent: Some(5),
+            }
+        );
+    }
+
+    #[test]
+    fn test_config_enabled_false_is_disabled_flag() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_config(tmp.path(), r#"{"autonomous": {"workFinder": {"enabled": false}}}"#);
+        let cfg = read_work_finder_config(tmp.path());
+        assert_eq!(cfg.enabled, Some(false));
+        assert_eq!(cfg.interval_secs, None);
+        assert_eq!(cfg.max_concurrent, None);
+    }
+
+    #[test]
+    fn test_config_zero_interval_and_max_drop_to_none() {
+        // A zero interval/max in config is treated as absent so it falls through
+        // to the built-in default rather than a useless value.
+        let tmp = tempfile::tempdir().unwrap();
+        write_config(
+            tmp.path(),
+            r#"{"autonomous": {"workFinder": {"enabled": true, "intervalSecs": 0, "maxConcurrent": 0}}}"#,
+        );
+        let cfg = read_work_finder_config(tmp.path());
+        assert_eq!(cfg.enabled, Some(true));
+        assert_eq!(cfg.interval_secs, None);
+        assert_eq!(cfg.max_concurrent, None);
+    }
+
+    // ===================================================================
+    // Config-file surface — resolve_* precedence env > config > default (#3813)
+    // ===================================================================
+
+    #[test]
+    #[serial]
+    fn test_resolve_enabled_precedence() {
+        std::env::remove_var(WORK_FINDER_ENABLE_ENV);
+
+        // Absent config + unset env ⇒ default off (zero behavior change).
+        assert!(!resolve_enabled(&WorkFinderConfig::default()));
+
+        // Config alone enables when env is unset.
+        let on = WorkFinderConfig {
+            enabled: Some(true),
+            ..Default::default()
+        };
+        assert!(resolve_enabled(&on));
+        let off = WorkFinderConfig {
+            enabled: Some(false),
+            ..Default::default()
+        };
+        assert!(!resolve_enabled(&off));
+
+        // Env overrides config in both directions.
+        std::env::set_var(WORK_FINDER_ENABLE_ENV, "1");
+        assert!(resolve_enabled(&off), "env truthy overrides config=false");
+        std::env::set_var(WORK_FINDER_ENABLE_ENV, "0");
+        assert!(!resolve_enabled(&on), "env falsy overrides config=true");
+        std::env::remove_var(WORK_FINDER_ENABLE_ENV);
+    }
+
+    #[test]
+    #[serial]
+    fn test_resolve_interval_with_config_precedence() {
+        std::env::remove_var(WORK_FINDER_INTERVAL_ENV);
+
+        // Default when neither env nor config set.
+        assert_eq!(
+            resolve_interval_with_config(&WorkFinderConfig::default()),
+            Duration::from_secs(DEFAULT_WORK_FINDER_INTERVAL_SECS)
+        );
+
+        // Config used when env unset.
+        let cfg = WorkFinderConfig {
+            interval_secs: Some(120),
+            ..Default::default()
+        };
+        assert_eq!(resolve_interval_with_config(&cfg), Duration::from_secs(120));
+
+        // Env overrides config.
+        std::env::set_var(WORK_FINDER_INTERVAL_ENV, "45");
+        assert_eq!(resolve_interval_with_config(&cfg), Duration::from_secs(45));
+
+        // A zero/garbage env value is ignored; config still wins over default.
+        std::env::set_var(WORK_FINDER_INTERVAL_ENV, "0");
+        assert_eq!(resolve_interval_with_config(&cfg), Duration::from_secs(120));
+        std::env::set_var(WORK_FINDER_INTERVAL_ENV, "nope");
+        assert_eq!(resolve_interval_with_config(&cfg), Duration::from_secs(120));
+        std::env::remove_var(WORK_FINDER_INTERVAL_ENV);
+    }
+
+    #[test]
+    #[serial]
+    fn test_resolve_max_concurrent_with_config_precedence() {
+        std::env::remove_var(WORK_FINDER_MAX_CONCURRENT_ENV);
+
+        // Default when neither env nor config set.
+        assert_eq!(
+            resolve_max_concurrent_with_config(&WorkFinderConfig::default()),
+            DEFAULT_WORK_FINDER_MAX_CONCURRENT
+        );
+
+        // Config used when env unset.
+        let cfg = WorkFinderConfig {
+            max_concurrent: Some(8),
+            ..Default::default()
+        };
+        assert_eq!(resolve_max_concurrent_with_config(&cfg), 8);
+
+        // Env overrides config.
+        std::env::set_var(WORK_FINDER_MAX_CONCURRENT_ENV, "2");
+        assert_eq!(resolve_max_concurrent_with_config(&cfg), 2);
+
+        // A zero/garbage env value is ignored; config still wins over default.
+        std::env::set_var(WORK_FINDER_MAX_CONCURRENT_ENV, "0");
+        assert_eq!(resolve_max_concurrent_with_config(&cfg), 8);
+        std::env::set_var(WORK_FINDER_MAX_CONCURRENT_ENV, "nope");
+        assert_eq!(resolve_max_concurrent_with_config(&cfg), 8);
+        std::env::remove_var(WORK_FINDER_MAX_CONCURRENT_ENV);
     }
 }
