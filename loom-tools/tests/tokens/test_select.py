@@ -306,32 +306,46 @@ def test_ranking_falls_through_when_all_exhausted(tmp_path):
     assert sel.mode == "random"
 
 
-# ---------- ranking spread (issue #3736) ----------
+# ---------- ranking spread (issue #3736 / rotation #3909) ----------
 
 
-def test_ranking_spreads_across_top_n_with_varying_seeds(tmp_path, monkeypatch):
-    """Varying rng seeds must select different accounts among the top-N.
+def test_ranking_default_rotates_across_all_available(tmp_path, monkeypatch):
+    """Default (unbounded) window rotates one-per-account across ALL available.
 
-    This is the anti-collision property: concurrent spawners (each with an
-    independent rng) should NOT deterministically land on .ranking[0].
+    Issue #3909: the ranked tier no longer caps the spread to a top-N slice by
+    default — consecutive selections round-robin across every available account
+    so the pool drains evenly instead of stacking on the best-ranked few.
     """
     monkeypatch.delenv("LOOM_TOKEN_SPREAD_TOP_N", raising=False)
     workspace = _make_workspace(
         tmp_path, {"a": "ka", "b": "kb", "c": "kc", "d": "kd", "e": "ke"},
     )
-    # All available; ranking order a,b,c,d,e. Default N=3 => window {a,b,c}.
     _write_ranking(workspace, ["a|", "b|", "c|", "d|", "e|"])
-    top_n = {"a", "b", "c"}
-    chosen: set[str] = set()
-    for seed in range(50):
-        sel = select_token(workspace, rng=random.Random(seed))
+    all_accounts = {"a", "b", "c", "d", "e"}
+    chosen: list[str] = []
+    for _ in range(10):
+        sel = select_token(workspace, rng=random.Random(0))
         assert sel.mode == "ranked"
-        assert sel.name in top_n  # never spills past the top-N window
+        chosen.append(sel.name)
+    # Every available account is reached (no top-N slice leaves d/e idle).
+    assert set(chosen) == all_accounts
+
+
+def test_ranking_explicit_cap_limits_window(tmp_path, monkeypatch):
+    """An explicit spreadTopN cap still restricts rotation to the top-N window."""
+    monkeypatch.setenv("LOOM_TOKEN_SPREAD_TOP_N", "3")
+    workspace = _make_workspace(
+        tmp_path, {"a": "ka", "b": "kb", "c": "kc", "d": "kd", "e": "ke"},
+    )
+    _write_ranking(workspace, ["a|", "b|", "c|", "d|", "e|"])
+    window = {"a", "b", "c"}
+    chosen: set[str] = set()
+    for _ in range(20):
+        sel = select_token(workspace, rng=random.Random(0))
+        assert sel.mode == "ranked"
+        assert sel.name in window  # never spills past the top-N window
         chosen.add(sel.name)
-    # More than one distinct account is selected across seeds (spread), and
-    # entries below the window (d, e) are never chosen.
-    assert len(chosen) > 1
-    assert chosen <= top_n
+    assert chosen == window  # rotation reaches every account in the window
 
 
 def test_ranking_n1_restores_greedy_first_eligible(tmp_path, monkeypatch):
@@ -402,6 +416,80 @@ def test_ranking_spread_skips_bad_in_window(tmp_path, monkeypatch):
         sel = select_token(workspace, rng=random.Random(seed))
         assert sel.name in ("b", "c")
         assert sel.name != "a"
+
+
+# ---------- concurrent-dispatch distribution (issue #3909) ----------
+
+
+@pytest.mark.parametrize(
+    ("m_available", "n_dispatches"),
+    [(5, 3), (5, 5), (3, 5), (1, 4)],
+)
+def test_concurrent_dispatch_uses_min_n_m_distinct(
+    tmp_path, monkeypatch, m_available, n_dispatches
+):
+    """N sequential selections over M available accounts use min(N,M) distinct.
+
+    Models a burst of N concurrent dispatches sharing the rotation cursor: they
+    fan out one-per-account across the available pool rather than stacking.
+    """
+    monkeypatch.delenv("LOOM_TOKEN_SPREAD_TOP_N", raising=False)
+    names = [chr(ord("a") + i) for i in range(m_available)]
+    workspace = _make_workspace(tmp_path, {n: f"k{n}" for n in names})
+    _write_ranking(workspace, [f"{n}|" for n in names])
+    chosen = [
+        select_token(workspace, rng=random.Random(0)).name
+        for _ in range(n_dispatches)
+    ]
+    assert len(set(chosen)) == min(n_dispatches, m_available)
+
+
+def test_ranking_rotation_not_always_same_first(tmp_path, monkeypatch):
+    """The first pick rotates across cycles / pools (not always .ranking[0]).
+
+    Fresh pools seeded from different rngs must not all start on the same
+    best-ranked account — the anti-stacking property of #3909.
+    """
+    monkeypatch.delenv("LOOM_TOKEN_SPREAD_TOP_N", raising=False)
+    firsts: set[str] = set()
+    for seed in range(25):
+        ws = _make_workspace(
+            tmp_path / f"pool-{seed}",
+            {"a": "ka", "b": "kb", "c": "kc", "d": "kd"},
+        )
+        _write_ranking(ws, ["a|", "b|", "c|", "d|"])
+        firsts.add(select_token(ws, rng=random.Random(seed)).name)
+    assert len(firsts) > 1
+
+
+def test_ranking_rotation_drains_evenly_over_cycles(tmp_path, monkeypatch):
+    """Over 2 full cycles each available account is used exactly twice."""
+    monkeypatch.delenv("LOOM_TOKEN_SPREAD_TOP_N", raising=False)
+    workspace = _make_workspace(tmp_path, {"a": "ka", "b": "kb", "c": "kc"})
+    _write_ranking(workspace, ["a|", "b|", "c|"])
+    counts: dict[str, int] = {"a": 0, "b": 0, "c": 0}
+    for _ in range(6):  # 2 cycles over 3 accounts
+        counts[select_token(workspace, rng=random.Random(0)).name] += 1
+    assert counts == {"a": 2, "b": 2, "c": 2}
+
+
+def test_ranking_rotation_skips_exhausted_and_never_stalls(tmp_path, monkeypatch):
+    """Rotation only spans available accounts and always returns while >=1 free.
+
+    Preserves #3900 (skip exhausted/blocked) and the #3907 floor (never stall
+    while at least one account has capacity).
+    """
+    monkeypatch.delenv("LOOM_TOKEN_SPREAD_TOP_N", raising=False)
+    workspace = _make_workspace(
+        tmp_path, {"a": "ka", "b": "kb", "c": "kc", "d": "kd"},
+    )
+    # Only b and d are available; a exhausted, c blocked.
+    _write_ranking(workspace, ["a|exhausted", "b|", "c|blocked", "d|"])
+    chosen = [
+        select_token(workspace, rng=random.Random(0)).name for _ in range(8)
+    ]
+    assert set(chosen) == {"b", "d"}  # rotates across exactly the available two
+    assert "a" not in chosen and "c" not in chosen
 
 
 # ---------- CLI ----------
