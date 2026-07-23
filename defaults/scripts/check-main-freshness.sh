@@ -153,7 +153,9 @@ warn "${YELLOW}orchestration scripts that silently lack recently-merged logic.${
 warn ""
 warn "${BOLD}Remediation (read-only advisory — this script never pulls for you):${NC}"
 warn "      ${BOLD}git merge --ff-only ${REMOTE_REF}${NC}"
-warn "  then re-sync the installed copies if your install flow does so."
+warn "  then refresh the installed .loom/ copies from defaults/ (#3777):"
+warn "      ${BOLD}./.loom/scripts/resync-installed.sh${NC}"
+warn "  (preview first with ${BOLD}--dry-run${NC}; it only touches files present in defaults/)."
 warn ""
 
 # ---------- stretch goal: best-effort installed-vs-defaults drift note ----------
