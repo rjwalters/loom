@@ -256,9 +256,9 @@ fn sweep_md_stage_minus_one_wave_size_snippet_is_bash_3_2_portable() {
 fn sweep_md_limitations_table_records_stage_minus_one_implemented() {
     let content = read_sweep_md();
     assert!(
-        content.contains("Daemon backend detection") && content.contains("Implemented (#3454)"),
+        content.contains("Daemon backend detection") && content.contains("Implemented (#3454"),
         "sweep.md Limitations table is missing the `Daemon backend \
-         detection | Implemented (#3454)` row — #3454 AC #1 requires \
-         the operator-visible status flip"
+         detection | Implemented (#3454...` row — #3454 AC #1 requires \
+         the operator-visible status flip (tolerates appended issue refs, e.g. #3829)"
     );
 }
