@@ -268,6 +268,106 @@ pub fn watchdog_decision(
     }
 }
 
+// ----------------------------------------------------------------------------
+// Mid-build-death watchdog (Issue #3895)
+// ----------------------------------------------------------------------------
+//
+// The startup watchdog (#3887/#3892) catches a sweep that shows NO progress
+// past the spawn header (no worktree / no checkpoint / no log-past-header) and
+// re-dispatches it once. But a *different* liveness failure slips past it: a
+// sweep that got well into the Builder phase (created its worktree, made file
+// edits) and then its child process DIED — the canonical cause being a token
+// exhausting mid-run. Because `sweep_made_progress` returns `true` the instant
+// a worktree exists, the startup watchdog correctly leaves such a sweep alone —
+// so it does NOT rescue a sweep that HAD progress and then crashed, leaving the
+// issue silently reverted to `loom:issue` with a dirty, uncommitted worktree
+// and no PR. In autonomous mode this wedges the issue indefinitely.
+//
+// The mid-build-death watchdog is the complementary backstop. It scans the
+// entries the reaper has already transitioned to a TERMINAL state (`Exited` /
+// `Crashed`) for the "made progress then died" signature — an Issue sweep that
+// produced no PR and whose worktree exists and is dirty — cleans the worktree
+// and re-dispatches it exactly once (bounded, reusing the same retry-cap
+// philosophy as #3892). A pre-flight token-health gate reads `.ranking` and
+// defers the re-dispatch when the whole pool is exhausted, so a mid-run
+// exhaustion is less likely to recur.
+
+/// The mid-build-death watchdog's per-sweep decision (Issue #3895). Pure state
+/// machine — [`midbuild_decision`] maps `(worktree_dirty, produced_pr,
+/// already_retried)` onto exactly one of these.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MidbuildDecision {
+    /// Not a mid-build death (no dirty worktree, or a PR was produced) — leave
+    /// the terminal entry alone.
+    Healthy,
+    /// A dead sweep with a dirty worktree and no PR that has not been recovered
+    /// yet — clean the worktree and re-dispatch once.
+    Recover,
+    /// A dead sweep matching the signature but already recovered once — give up
+    /// (bounded: never loop). Left for the operator.
+    GiveUp,
+}
+
+/// Pure mid-build-death state machine (Issue #3895).
+///
+/// - No dirty worktree, or the sweep already produced a PR ⇒
+///   [`MidbuildDecision::Healthy`] (nothing to recover).
+/// - Dirty worktree + no PR + not yet recovered ⇒ [`MidbuildDecision::Recover`].
+/// - Dirty worktree + no PR + already recovered ⇒ [`MidbuildDecision::GiveUp`]
+///   — the recovery is bounded to exactly one re-dispatch per issue.
+#[must_use]
+pub fn midbuild_decision(
+    worktree_dirty: bool,
+    produced_pr: bool,
+    already_retried: bool,
+) -> MidbuildDecision {
+    if !worktree_dirty || produced_pr {
+        MidbuildDecision::Healthy
+    } else if already_retried {
+        MidbuildDecision::GiveUp
+    } else {
+        MidbuildDecision::Recover
+    }
+}
+
+/// Decide, from a `.loom/tokens/.ranking` file's contents, whether the token
+/// pool still has capacity to (re-)dispatch (Issue #3895). The ranking is
+/// pipe-delimited `name|status` lines (refreshed by `loom-tokens check
+/// --ranking`); an account is *healthy* when its status is neither `exhausted`
+/// nor `blocked`.
+///
+/// Returns `true` (pool has capacity — proceed) when EITHER at least one account
+/// is healthy OR there are no parseable `name|status` entries at all (an empty
+/// or malformed ranking degrades gracefully to current behavior — the spawn-time
+/// selector makes its own choice). Returns `false` only when there is at least
+/// one entry and EVERY entry is `exhausted`/`blocked`, so re-dispatching would
+/// just exhaust again mid-run.
+#[must_use]
+pub fn ranking_has_capacity(contents: &str) -> bool {
+    let mut saw_entry = false;
+    let mut saw_healthy = false;
+    for line in contents.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let Some((name, status)) = line.split_once('|') else {
+            continue;
+        };
+        if name.trim().is_empty() {
+            continue;
+        }
+        saw_entry = true;
+        let status = status.trim().to_ascii_lowercase();
+        if status != "exhausted" && status != "blocked" {
+            saw_healthy = true;
+        }
+    }
+    // No parseable entries ⇒ degrade to "proceed". Otherwise require a healthy
+    // account.
+    !saw_entry || saw_healthy
+}
+
 /// Decide, from a sweep log's contents, whether the child has produced any
 /// output *past* the daemon spawn header + `spawn-claude.sh` wrapper lines —
 /// i.e. whether Claude Code itself has started doing work (Issue #3887).
@@ -498,6 +598,14 @@ pub struct SweepRegistry {
     /// Issues the watchdog has already logged a give-up for, so the loud
     /// give-up warning fires once per issue rather than every tick.
     watchdog_gaveup: HashSet<u32>,
+    /// Issues the mid-build-death watchdog has already recovered once (Issue
+    /// #3895). Distinct from `watchdog_retried` (startup-hang, no progress):
+    /// this bounds the "made progress then the child died" recovery to a
+    /// single re-dispatch per issue.
+    midbuild_retried: HashSet<u32>,
+    /// Issues the mid-build-death watchdog has already logged a give-up for
+    /// (Issue #3895), so the loud give-up warning fires once per issue.
+    midbuild_gaveup: HashSet<u32>,
 }
 
 impl SweepRegistry {
@@ -516,6 +624,8 @@ impl SweepRegistry {
             last_spawn_at: None,
             watchdog_retried: HashSet::new(),
             watchdog_gaveup: HashSet::new(),
+            midbuild_retried: HashSet::new(),
+            midbuild_gaveup: HashSet::new(),
         }
     }
 
@@ -531,6 +641,8 @@ impl SweepRegistry {
             last_spawn_at: None,
             watchdog_retried: HashSet::new(),
             watchdog_gaveup: HashSet::new(),
+            midbuild_retried: HashSet::new(),
+            midbuild_gaveup: HashSet::new(),
         }
     }
 
@@ -1815,6 +1927,256 @@ impl SweepRegistry {
     }
 
     // ------------------------------------------------------------------------
+    // Mid-build-death watchdog (Issue #3895)
+    // ------------------------------------------------------------------------
+
+    /// Absolute path to a sweep's issue worktree (`.loom/worktrees/issue-<N>`).
+    #[must_use]
+    fn worktree_path(&self, issue: u32) -> PathBuf {
+        self.config
+            .workspace_root
+            .join(".loom")
+            .join("worktrees")
+            .join(format!("issue-{issue}"))
+    }
+
+    /// Whether issue `N`'s worktree exists AND has uncommitted changes (Issue
+    /// #3895) — the "made build progress then died" signal. Runs
+    /// `git -C <worktree> status --porcelain`; a non-empty output means dirty.
+    ///
+    /// Degrades to `false` (not a recovery candidate) when the worktree is
+    /// absent, `git` is unavailable, or the command fails — we never treat an
+    /// unprobeable worktree as recoverable.
+    fn worktree_dirty(&self, issue: u32) -> bool {
+        let wt = self.worktree_path(issue);
+        if !wt.exists() {
+            return false;
+        }
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(&wt)
+            .arg("status")
+            .arg("--porcelain")
+            .arg("--untracked-files=all")
+            .output();
+        match output {
+            Ok(o) if o.status.success() => !o.stdout.iter().all(u8::is_ascii_whitespace),
+            _ => false,
+        }
+    }
+
+    /// Discard a mid-build-death worktree's uncommitted changes so the
+    /// re-dispatched sweep resumes from a clean checkout (Issue #3895): a
+    /// `git reset --hard` followed by `git clean -fd`. Best-effort — any commits
+    /// the dead sweep managed to make are preserved (only the dirty working tree
+    /// and untracked files are dropped).
+    fn clean_worktree(&self, issue: u32) -> Result<()> {
+        let wt = self.worktree_path(issue);
+        if !wt.exists() {
+            return Ok(());
+        }
+        let reset = Command::new("git")
+            .arg("-C")
+            .arg(&wt)
+            .arg("reset")
+            .arg("--hard")
+            .output()
+            .with_context(|| format!("git reset --hard in {}", wt.display()))?;
+        if !reset.status.success() {
+            return Err(anyhow!(
+                "git reset --hard failed in {}: {}",
+                wt.display(),
+                String::from_utf8_lossy(&reset.stderr).trim()
+            ));
+        }
+        let clean = Command::new("git")
+            .arg("-C")
+            .arg(&wt)
+            .arg("clean")
+            .arg("-fd")
+            .output()
+            .with_context(|| format!("git clean -fd in {}", wt.display()))?;
+        if !clean.status.success() {
+            return Err(anyhow!(
+                "git clean -fd failed in {}: {}",
+                wt.display(),
+                String::from_utf8_lossy(&clean.stderr).trim()
+            ));
+        }
+        Ok(())
+    }
+
+    /// Pre-flight token-health gate (Issue #3895): whether the token pool still
+    /// has capacity to (re-)dispatch, per `.loom/tokens/.ranking`. Reads the
+    /// ranking file and delegates to [`ranking_has_capacity`]. A missing /
+    /// unreadable ranking degrades to `true` (proceed) — matching current
+    /// behavior where the spawn-time selector makes its own choice.
+    fn token_pool_has_capacity(&self) -> bool {
+        let ranking = self
+            .config
+            .workspace_root
+            .join(".loom")
+            .join("tokens")
+            .join(".ranking");
+        match std::fs::read_to_string(&ranking) {
+            Ok(contents) => ranking_has_capacity(&contents),
+            Err(_) => true,
+        }
+    }
+
+    /// Whether an active (Running/Pending) sweep already exists for `issue` —
+    /// used to avoid racing a re-dispatch the work-finder may have already
+    /// issued after the reaper restored `loom:issue` (Issue #3895).
+    fn issue_has_active_sweep(&self, issue: u32) -> bool {
+        self.entries.values().any(|i| {
+            matches!(i.kind, SweepKind::Issue(n) if n == issue)
+                && matches!(i.state, SweepState::Running | SweepState::Pending)
+        })
+    }
+
+    /// Run one mid-build-death watchdog tick (Issue #3895): for each sweep the
+    /// reaper has already transitioned to a TERMINAL state (`Exited`/`Crashed`)
+    /// whose child died mid-build — an Issue sweep that produced no PR and left
+    /// a dirty worktree — clean the worktree and re-dispatch the issue **exactly
+    /// once** (bounded; a second mid-build death resolves to
+    /// [`MidbuildDecision::GiveUp`] and is left for the operator).
+    ///
+    /// A pre-flight token-health gate ([`token_pool_has_capacity`]) defers the
+    /// re-dispatch (without consuming the single retry) when the whole pool is
+    /// `exhausted`/`blocked`, so a mid-run exhaustion is less likely to recur.
+    ///
+    /// No new event topics are introduced (the taxonomy is frozen): the
+    /// re-dispatch reuses `sweep.global.dispatch` from [`dispatch`], and a
+    /// bounded give-up / a pool-exhausted defer surface on the existing frozen
+    /// `sweep.issue.{N}.crashed` topic. Returns the number of sweeps
+    /// re-dispatched this tick.
+    ///
+    /// [`token_pool_has_capacity`]: SweepRegistry::token_pool_has_capacity
+    pub fn midbuild_watchdog_once(&mut self) -> usize {
+        // Snapshot terminal Issue candidates that produced no PR.
+        let candidates: Vec<(SweepId, u32)> = self
+            .entries
+            .iter()
+            .filter(|(_, info)| {
+                info.state.is_terminal()
+                    && matches!(info.kind, SweepKind::Issue(_))
+                    && info.pr_number.is_none()
+            })
+            .filter_map(|(id, info)| match info.kind {
+                SweepKind::Issue(issue) => Some((id.clone(), issue)),
+                SweepKind::PrSet(_) => None,
+            })
+            .collect();
+
+        let mut recovered = 0usize;
+        for (sweep_id, issue) in candidates {
+            // Don't race a re-dispatch the work-finder may already have issued
+            // after the reaper restored loom:issue.
+            if self.issue_has_active_sweep(issue) {
+                continue;
+            }
+            let dirty = self.worktree_dirty(issue);
+            let already_retried = self.midbuild_retried.contains(&issue);
+            match midbuild_decision(dirty, false, already_retried) {
+                MidbuildDecision::Healthy => {}
+                MidbuildDecision::GiveUp => {
+                    if self.midbuild_gaveup.insert(issue) {
+                        log::error!(
+                            "midbuild-watchdog: issue #{issue} ({sweep_id}) died mid-build again \
+                             after an auto-recovery — giving up (bounded to one recovery). \
+                             Operator intervention needed (inspect the dirty worktree at \
+                             .loom/worktrees/issue-{issue}, then clean + re-dispatch)."
+                        );
+                        self.emit_event(Event::SweepCrashed {
+                            issue,
+                            checkpoint_phase: None,
+                        });
+                    }
+                }
+                MidbuildDecision::Recover => {
+                    // Pre-flight token-health gate: if the whole pool is
+                    // exhausted/blocked, defer WITHOUT consuming the single
+                    // retry — re-dispatching now would just exhaust again.
+                    if !self.token_pool_has_capacity() {
+                        if self.midbuild_gaveup.insert(issue) {
+                            log::error!(
+                                "midbuild-watchdog: issue #{issue} ({sweep_id}) died mid-build \
+                                 (dirty worktree, no PR) but every token account is \
+                                 exhausted/blocked — deferring re-dispatch until the pool \
+                                 recovers (#3895)."
+                            );
+                            self.emit_event(Event::SweepCrashed {
+                                issue,
+                                checkpoint_phase: None,
+                            });
+                        }
+                        continue;
+                    }
+                    // A transient defer may have logged a give-up earlier; clear
+                    // it so a later genuine give-up still logs once.
+                    self.midbuild_gaveup.remove(&issue);
+
+                    log::warn!(
+                        "midbuild-watchdog: issue #{issue} ({sweep_id}) died mid-build with a \
+                         dirty worktree and no PR — cleaning the worktree and re-dispatching once \
+                         (#3895)."
+                    );
+
+                    // Capture re-dispatch params from the dead entry.
+                    let (model, effort, depends_on) = self
+                        .entries
+                        .get(&sweep_id)
+                        .map(|i| (i.model.clone(), i.effort.clone(), i.depends_on))
+                        .unwrap_or((None, None, None));
+
+                    // Mark recovered BEFORE acting so any error path still counts
+                    // the single allowed attempt (never loops).
+                    self.midbuild_retried.insert(issue);
+
+                    // Discard the dirty working tree so the resumed sweep starts
+                    // clean (commits, if any, are preserved).
+                    if let Err(e) = self.clean_worktree(issue) {
+                        log::warn!(
+                            "midbuild-watchdog: failed to clean worktree for issue #{issue} \
+                             (continuing re-dispatch anyway): {e}"
+                        );
+                    }
+                    // Defensive: the reaper releases the lock on death, but a
+                    // reconstructed entry may not have — ensure it's free so the
+                    // re-dispatch can re-acquire cleanly.
+                    let _ = self.release_lock(issue);
+
+                    match self.dispatch(
+                        &SweepKind::Issue(issue),
+                        None,
+                        model.as_deref(),
+                        effort.as_deref(),
+                        depends_on,
+                    ) {
+                        Ok(outcome) => {
+                            recovered += 1;
+                            log::warn!(
+                                "midbuild-watchdog: re-dispatched issue #{issue} as {} (pid {}) \
+                                 after a mid-build death (#3895).",
+                                outcome.sweep_id,
+                                outcome.pid
+                            );
+                        }
+                        Err(e) => {
+                            log::error!(
+                                "midbuild-watchdog: re-dispatch of issue #{issue} after a \
+                                 mid-build death failed: {e} (issue left recoverable — its claim \
+                                 was already restored by the reaper)."
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        recovered
+    }
+
+    // ------------------------------------------------------------------------
     // Reconstruction
     // ------------------------------------------------------------------------
 
@@ -2221,10 +2583,14 @@ pub fn resolve_watchdog_interval(config: &StartupRaceConfig) -> Duration {
     Duration::from_secs(secs)
 }
 
-/// Spawn the startup watchdog task (Issue #3887). Every `interval`, it probes
+/// Spawn the watchdog task (Issue #3887 + #3895). Every `interval`, it runs two
+/// liveness backstops in one tick: the **startup-hang watchdog** (#3887) probes
 /// each running daemon-dispatched sweep for progress and auto-cancels +
-/// re-dispatches (once, bounded) any that have hung past `timeout`. Mirrors
-/// [`spawn_reaper_task`]: brief lock per tick, never held across the sleep.
+/// re-dispatches (once, bounded) any that have hung past `timeout`; the
+/// **mid-build-death watchdog** (#3895) scans terminal entries for a sweep that
+/// made Builder progress then died (dirty worktree, no PR) and cleans +
+/// re-dispatches it (once, bounded). Mirrors [`spawn_reaper_task`]: brief lock
+/// per tick, never held across the sleep.
 pub fn spawn_watchdog_task(
     registry: Arc<Mutex<SweepRegistry>>,
     timeout: Duration,
@@ -2242,9 +2608,13 @@ pub fn spawn_watchdog_task(
         ticker.tick().await;
         loop {
             ticker.tick().await;
-            let restarted = {
+            // Same tick runs both liveness backstops: the startup-hang watchdog
+            // (#3887, no progress) and the mid-build-death watchdog (#3895, made
+            // progress then the child died). Both hold the registry lock only
+            // briefly, never across the sleep.
+            let (restarted, recovered) = {
                 match registry.lock() {
-                    Ok(mut r) => r.watchdog_once(timeout),
+                    Ok(mut r) => (r.watchdog_once(timeout), r.midbuild_watchdog_once()),
                     Err(poisoned) => {
                         log::error!("sweep_registry: watchdog mutex poisoned ({poisoned:?})");
                         return;
@@ -2255,6 +2625,12 @@ pub fn spawn_watchdog_task(
                 log::warn!(
                     "sweep_registry: watchdog auto-restarted {restarted} hung sweep{} (#3887)",
                     if restarted == 1 { "" } else { "s" }
+                );
+            }
+            if recovered > 0 {
+                log::warn!(
+                    "sweep_registry: watchdog recovered {recovered} mid-build-death sweep{} (#3895)",
+                    if recovered == 1 { "" } else { "s" }
                 );
             }
         }
@@ -4736,6 +5112,302 @@ exit 0\n";
         )
         .unwrap();
         assert!(reg.sweep_made_progress(7, &log));
+    }
+
+    // ===================================================================
+    // Mid-build-death watchdog (Issue #3895)
+    // ===================================================================
+
+    // --- midbuild_decision pure state machine ---
+
+    #[test]
+    fn midbuild_decision_no_dirty_worktree_is_healthy() {
+        // No dirty worktree ⇒ nothing to recover, regardless of retry state.
+        assert_eq!(midbuild_decision(false, false, false), MidbuildDecision::Healthy);
+        assert_eq!(midbuild_decision(false, false, true), MidbuildDecision::Healthy);
+    }
+
+    #[test]
+    fn midbuild_decision_produced_pr_is_healthy() {
+        // A dead sweep that produced a PR is a completed Builder, not a
+        // mid-build death — never recovered even with a dirty worktree.
+        assert_eq!(midbuild_decision(true, true, false), MidbuildDecision::Healthy);
+    }
+
+    #[test]
+    fn midbuild_decision_dirty_no_pr_first_time_recovers() {
+        assert_eq!(midbuild_decision(true, false, false), MidbuildDecision::Recover);
+    }
+
+    #[test]
+    fn midbuild_decision_dirty_no_pr_after_retry_gives_up() {
+        // Bounded: a second mid-build death gives up (never loops).
+        assert_eq!(midbuild_decision(true, false, true), MidbuildDecision::GiveUp);
+    }
+
+    // --- ranking_has_capacity token-health gate ---
+
+    #[test]
+    fn ranking_has_capacity_missing_or_empty_degrades_to_proceed() {
+        assert!(ranking_has_capacity(""), "empty ranking degrades to proceed");
+        assert!(ranking_has_capacity("   \n  \n"), "all-blank ranking degrades to proceed");
+        assert!(
+            ranking_has_capacity("garbage-with-no-pipe\nmore garbage"),
+            "unparseable ranking degrades to proceed"
+        );
+    }
+
+    #[test]
+    fn ranking_has_capacity_at_least_one_healthy_is_true() {
+        assert!(ranking_has_capacity("a|available\nb|exhausted\nc|blocked"));
+        // rate_limited is transient (not exhausted/blocked) ⇒ still eligible,
+        // matching the spawn-time selector's "first non-exhausted/non-blocked".
+        assert!(ranking_has_capacity("a|rate_limited"));
+    }
+
+    #[test]
+    fn ranking_has_capacity_all_exhausted_or_blocked_is_false() {
+        assert!(!ranking_has_capacity("a|exhausted\nb|blocked"));
+        // Case-insensitive on the status token.
+        assert!(!ranking_has_capacity("a|EXHAUSTED\nb|Blocked"));
+        // A blank-name line is skipped; the remaining entry is exhausted.
+        assert!(!ranking_has_capacity("|available\na|exhausted"));
+    }
+
+    // --- worktree_dirty / clean_worktree filesystem probes ---
+
+    /// Create a git repo at `.loom/worktrees/issue-<N>` with one commit plus an
+    /// untracked file, so `worktree_dirty` reports it dirty. Returns the path.
+    fn make_dirty_git_worktree(ws: &Path, issue: u32) -> PathBuf {
+        let wt = ws
+            .join(".loom")
+            .join("worktrees")
+            .join(format!("issue-{issue}"));
+        std::fs::create_dir_all(&wt).unwrap();
+        let git = |args: &[&str]| {
+            let out = Command::new("git")
+                .arg("-C")
+                .arg(&wt)
+                .args(args)
+                .env("GIT_AUTHOR_NAME", "t")
+                .env("GIT_AUTHOR_EMAIL", "t@t")
+                .env("GIT_COMMITTER_NAME", "t")
+                .env("GIT_COMMITTER_EMAIL", "t@t")
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        git(&["init", "-q"]);
+        std::fs::write(wt.join("committed.txt"), "base\n").unwrap();
+        git(&["add", "-A"]);
+        git(&["commit", "-q", "-m", "base"]);
+        // Now dirty it with an untracked file (mimics mid-build edits).
+        std::fs::write(wt.join("dirty.txt"), "uncommitted mid-build edit\n").unwrap();
+        wt
+    }
+
+    /// Insert a terminal (`Exited`) Issue entry directly, mimicking the state
+    /// the reaper leaves after a dead child is reaped.
+    fn insert_terminal_issue(reg: &mut SweepRegistry, sid: &str, issue: u32, pr: Option<i32>) {
+        reg.entries.insert(
+            sid.to_string(),
+            SweepInfo {
+                sweep_id: sid.to_string(),
+                kind: SweepKind::Issue(issue),
+                pid: 2_147_483_640,
+                token_name: "unknown".into(),
+                log_path: reg.compute_log_path(issue),
+                idempotency_key: None,
+                started_at: Utc::now(),
+                state: SweepState::Exited {
+                    code: None,
+                    at: Utc::now(),
+                },
+                latest_phase: None,
+                pr_number: pr,
+                model: None,
+                effort: None,
+                depends_on: None,
+            },
+        );
+    }
+
+    #[test]
+    fn worktree_dirty_and_clean_roundtrip() {
+        let tmp = tempdir().unwrap();
+        let ws = tmp.path();
+        let (reg, _rec) = fixture_registry(ws);
+
+        // No worktree ⇒ not dirty.
+        assert!(!reg.worktree_dirty(70));
+
+        // A worktree with an untracked file ⇒ dirty.
+        make_dirty_git_worktree(ws, 70);
+        assert!(reg.worktree_dirty(70));
+
+        // Cleaning discards the untracked edit; the committed file survives.
+        reg.clean_worktree(70).unwrap();
+        assert!(!reg.worktree_dirty(70), "clean_worktree cleared the dirty state");
+        assert!(ws.join(".loom/worktrees/issue-70/committed.txt").exists());
+        assert!(!ws.join(".loom/worktrees/issue-70/dirty.txt").exists());
+    }
+
+    // --- midbuild_watchdog_once: detection + bounded recovery ---
+
+    #[test]
+    fn midbuild_recovers_dead_sweep_with_dirty_worktree_once() {
+        let tmp = tempdir().unwrap();
+        let ws = tmp.path();
+        let (mut reg, rec) = fixture_registry(ws);
+
+        // A sweep that got into the Builder phase (dirty worktree) then its
+        // child died (terminal Exited) without producing a PR.
+        make_dirty_git_worktree(ws, 6001);
+        insert_terminal_issue(&mut reg, "sweep-issue-6001-dead", 6001, None);
+
+        // Detected + recovered: worktree cleaned, issue re-dispatched once.
+        let recovered = reg.midbuild_watchdog_once();
+        assert_eq!(recovered, 1, "mid-build death detected and re-dispatched");
+        assert!(reg.midbuild_retried.contains(&6001), "issue marked recovered (bounded)");
+
+        // Worktree was cleaned before the re-dispatch.
+        assert!(!ws.join(".loom/worktrees/issue-6001/dirty.txt").exists());
+        assert!(ws.join(".loom/worktrees/issue-6001/committed.txt").exists());
+
+        // A fresh sweep child actually ran, and an active entry now exists.
+        assert!(
+            wait_for_contents(&rec, "/loom:sweep 6001", 5000),
+            "fake spawn ran for the re-dispatch"
+        );
+        assert!(reg.issue_has_active_sweep(6001), "a fresh sweep is now active for the issue");
+    }
+
+    #[test]
+    fn midbuild_recovery_is_bounded_to_one() {
+        let tmp = tempdir().unwrap();
+        let ws = tmp.path();
+        let (mut reg, _rec) = fixture_registry(ws);
+
+        // The issue already used its single recovery; the re-dispatched sweep
+        // ALSO died mid-build (dirty worktree, terminal, no PR).
+        make_dirty_git_worktree(ws, 6002);
+        insert_terminal_issue(&mut reg, "sweep-issue-6002-dead2", 6002, None);
+        reg.midbuild_retried.insert(6002);
+
+        let recovered = reg.midbuild_watchdog_once();
+        assert_eq!(recovered, 0, "bounded: a second mid-build death is not re-dispatched");
+        assert!(reg.midbuild_gaveup.contains(&6002), "give-up recorded for the operator");
+        // The worktree is left intact for operator inspection (not cleaned).
+        assert!(ws.join(".loom/worktrees/issue-6002/dirty.txt").exists());
+    }
+
+    #[test]
+    fn midbuild_skips_sweep_that_produced_a_pr() {
+        let tmp = tempdir().unwrap();
+        let ws = tmp.path();
+        let (mut reg, _rec) = fixture_registry(ws);
+
+        // A dead sweep with a dirty worktree BUT a PR recorded is a completed
+        // Builder, not a mid-build death — never recovered.
+        make_dirty_git_worktree(ws, 6004);
+        insert_terminal_issue(&mut reg, "sweep-issue-6004-pr", 6004, Some(4321));
+
+        assert_eq!(reg.midbuild_watchdog_once(), 0, "a sweep that produced a PR is not recovered");
+        assert!(!reg.midbuild_retried.contains(&6004));
+    }
+
+    #[test]
+    fn midbuild_leaves_clean_worktree_alone() {
+        let tmp = tempdir().unwrap();
+        let ws = tmp.path();
+        let (mut reg, _rec) = fixture_registry(ws);
+
+        // A dead sweep whose worktree exists but is CLEAN (committed, no
+        // uncommitted edits) is not a "dirty mid-build death" and is left alone.
+        let wt = make_dirty_git_worktree(ws, 6005);
+        std::fs::remove_file(wt.join("dirty.txt")).unwrap();
+        assert!(!reg.worktree_dirty(6005), "precondition: worktree is clean");
+        insert_terminal_issue(&mut reg, "sweep-issue-6005-clean", 6005, None);
+
+        assert_eq!(reg.midbuild_watchdog_once(), 0, "a clean worktree is not recovered");
+        assert!(!reg.midbuild_retried.contains(&6005));
+    }
+
+    #[test]
+    fn midbuild_token_gate_defers_when_pool_exhausted_then_proceeds() {
+        let tmp = tempdir().unwrap();
+        let ws = tmp.path();
+        let (mut reg, _rec) = fixture_registry(ws);
+
+        make_dirty_git_worktree(ws, 6003);
+        insert_terminal_issue(&mut reg, "sweep-issue-6003-dead", 6003, None);
+
+        // Every account exhausted/blocked ⇒ the pre-flight gate defers WITHOUT
+        // consuming the single retry.
+        let tokens = ws.join(".loom").join("tokens");
+        std::fs::create_dir_all(&tokens).unwrap();
+        std::fs::write(tokens.join(".ranking"), "agent-1|exhausted\nagent-2|blocked\n").unwrap();
+
+        assert_eq!(
+            reg.midbuild_watchdog_once(),
+            0,
+            "token gate defers re-dispatch when every account is exhausted/blocked"
+        );
+        assert!(
+            !reg.midbuild_retried.contains(&6003),
+            "a deferral must NOT consume the single recovery"
+        );
+        // The dirty worktree is untouched while deferred.
+        assert!(ws.join(".loom/worktrees/issue-6003/dirty.txt").exists());
+
+        // Once a healthy account appears, recovery proceeds on the next tick.
+        std::fs::write(tokens.join(".ranking"), "agent-1|exhausted\nagent-2|available\n").unwrap();
+        assert_eq!(
+            reg.midbuild_watchdog_once(),
+            1,
+            "recovery proceeds once a healthy account is available"
+        );
+        assert!(reg.midbuild_retried.contains(&6003));
+        assert!(
+            !ws.join(".loom/worktrees/issue-6003/dirty.txt").exists(),
+            "worktree cleaned on recovery"
+        );
+    }
+
+    #[test]
+    fn midbuild_ignores_running_sweeps() {
+        let tmp = tempdir().unwrap();
+        let ws = tmp.path();
+        let (mut reg, _rec) = fixture_registry(ws);
+
+        // A still-Running sweep (not terminal) is never a mid-build-death
+        // candidate, even with a dirty worktree.
+        make_dirty_git_worktree(ws, 6006);
+        reg.entries.insert(
+            "sweep-issue-6006-live".to_string(),
+            SweepInfo {
+                sweep_id: "sweep-issue-6006-live".to_string(),
+                kind: SweepKind::Issue(6006),
+                pid: 2_147_483_640,
+                token_name: "unknown".into(),
+                log_path: reg.compute_log_path(6006),
+                idempotency_key: None,
+                started_at: Utc::now(),
+                state: SweepState::Running,
+                latest_phase: None,
+                pr_number: None,
+                model: None,
+                effort: None,
+                depends_on: None,
+            },
+        );
+
+        assert_eq!(reg.midbuild_watchdog_once(), 0, "a Running sweep is not a mid-build death");
+        assert!(!reg.midbuild_retried.contains(&6006));
     }
 
     // --- set/get dispatch stagger ---
