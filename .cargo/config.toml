@@ -6,37 +6,56 @@
 # Set RUSTFLAGS="-D warnings" in CI to enforce this
 
 [target.'cfg(all())']
-# Default clippy lints for all targets
+# Clippy lint config for all targets.
+#
+# IMPORTANT (#3837): this block is kept in *exact sync* with the clippy
+# invocation in `.github/workflows/ci.yml` (the `backend-lint-and-check`
+# job), which runs:
+#
+#   cargo clippy --package loom-daemon --package loom-api -- -D warnings \
+#     -A clippy::cast_precision_loss -A clippy::cast_possible_truncation \
+#     -A clippy::cast_sign_loss -A clippy::too_many_lines -A clippy::panic \
+#     -A clippy::unwrap_used -A clippy::nonminimal_bool \
+#     -A clippy::redundant_closure -A clippy::redundant_closure_for_method_calls \
+#     -A clippy::format_push_string -A clippy::uninlined_format_args
+#
+# Mirroring CI's allow-list here means a bare local `cargo clippy` reproduces
+# CI's pass/fail — no more "is this failure mine or pre-existing?" (#3828).
+#
+# We intentionally do NOT enable `clippy::pedantic`: CI never enforced it, and
+# enabling it locally surfaced a large class of lints CI allows (casts,
+# too_many_lines, redundant closures, uninlined format args, …), reliably
+# red-ing bare local clippy while CI stayed green. `-D clippy::all` (below)
+# minus CI's allow-list is exactly CI's effective clippy lint set.
+#
+# Residual, documented divergence: CI passes `-D warnings`, which also promotes
+# *rustc* warnings (e.g. `dead_code`, `unused_variables`) to hard errors. We
+# keep those at `-W` here so ordinary local `cargo build`/`cargo test` stay
+# dev-friendly (a warning during iteration doesn't abort the build). The clippy
+# *lint selection* — the source of the #3828 confusion — is identical.
 rustflags = [
-    # Deny clippy lints that indicate bugs or poor practices
+    # Deny the default clippy lint set (correctness + suspicious + style +
+    # complexity + perf). CI denies the same set via `-D warnings`.
     "-D", "clippy::all",
-    "-D", "clippy::correctness",
-    "-D", "clippy::suspicious",
-    "-D", "clippy::complexity",
 
-    # Warn on pedantic lints (can be noisy but helpful)
-    "-W", "clippy::pedantic",
+    # CI allow-list — MUST stay identical to .github/workflows/ci.yml.
+    # These lints live inside `clippy::all`/pedantic; CI allows them, so we
+    # allow them too (a later `-A` overrides the earlier `-D clippy::all`).
+    "-A", "clippy::cast_precision_loss",
+    "-A", "clippy::cast_possible_truncation",
+    "-A", "clippy::cast_sign_loss",
+    "-A", "clippy::too_many_lines",
+    "-A", "clippy::panic",
+    "-A", "clippy::unwrap_used",
+    "-A", "clippy::nonminimal_bool",
+    "-A", "clippy::redundant_closure",
+    "-A", "clippy::redundant_closure_for_method_calls",
+    "-A", "clippy::format_push_string",
+    "-A", "clippy::uninlined_format_args",
 
-    # Warn on performance issues
-    "-W", "clippy::perf",
-
-    # Warn on style issues
-    "-W", "clippy::style",
-
-    # Specific lints we want to enforce
-    "-W", "clippy::unwrap_used",
-    "-W", "clippy::expect_used",
-    "-W", "clippy::panic",
-    "-W", "clippy::todo",
-    "-W", "clippy::unimplemented",
-
-    # Warn on dead code (unused functions, variables, etc.)
+    # Warn (not deny) on dead code so it surfaces locally without aborting
+    # iterative builds. CI's `-D warnings` denies it — see the note above.
     "-W", "dead_code",
-
-    # Allow some pedantic lints that are too noisy
-    "-A", "clippy::missing_errors_doc",
-    "-A", "clippy::missing_panics_doc",
-    "-A", "clippy::module_name_repetitions",
 ]
 
 [target.aarch64-apple-darwin]

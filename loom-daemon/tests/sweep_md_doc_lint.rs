@@ -262,8 +262,12 @@ fn sweep_md_documents_model_experiment_mode() {
 fn sweep_md_documents_experiment_tier_2_5_suppression() {
     let content = read_sweep_md();
     assert!(
-        content.contains("Experiment-mode suppression (issue #3725)"),
-        "sweep.md must document the tier-2.5 suppression note (#3725 hard AC)"
+        // Prefix match (no closing paren) tolerates appended issue refs, e.g.
+        // a future edit turning `(issue #3725)` into `(issue #3725, #NNNN)`.
+        // See #3833/#3837 for why exact-paren literals red main on doc edits.
+        content.contains("Experiment-mode suppression (issue #3725"),
+        "sweep.md must document the tier-2.5 suppression note (#3725 hard AC; \
+         tolerates appended issue refs)"
     );
     assert!(
         content.contains("SUPPRESSES this tier-2.5 bump"),
