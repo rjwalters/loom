@@ -2544,6 +2544,52 @@ echo ""
 
 
 # ==========================================================================
+# Test: check-phantom-labels.sh (role prompts reference only real labels, #3786)
+# ==========================================================================
+echo "Test: check-phantom-labels.sh detects phantom labels and passes the real tree"
+PHANTOM_LINT="$DEFAULTS_DIR/scripts/check-phantom-labels.sh"
+if [[ ! -x "$PHANTOM_LINT" ]]; then
+  fail "check-phantom-labels.sh missing or not executable"
+else
+  # (a) The real defaults/ tree must be clean.
+  if bash "$PHANTOM_LINT" "$LOOM_ROOT" >/dev/null 2>&1; then
+    pass "check-phantom-labels passes against the real defaults/ tree"
+  else
+    fail "check-phantom-labels flagged the real defaults/ tree (should be clean)"
+  fi
+
+  # (b) A fixture with an injected phantom label in application context must fail.
+  PHANTOM_FIX="$(mktemp -d)"
+  mkdir -p "$PHANTOM_FIX/.github" "$PHANTOM_FIX/defaults/.github" "$PHANTOM_FIX/defaults/roles"
+  printf -- '- name: loom:issue\n  color: "3B82F6"\n' > "$PHANTOM_FIX/.github/labels.yml"
+  printf -- '- name: loom:issue\n  color: "3B82F6"\n' > "$PHANTOM_FIX/defaults/.github/labels.yml"
+  printf 'Do this: gh issue edit 1 --add-label "loom:ghost-label"\n' > "$PHANTOM_FIX/defaults/roles/x.md"
+  PHANTOM_OUT="$(bash "$PHANTOM_LINT" "$PHANTOM_FIX" 2>&1)" && PHANTOM_RC=0 || PHANTOM_RC=$?
+  if [[ "$PHANTOM_RC" -ne 0 ]] && echo "$PHANTOM_OUT" | grep -q "loom:ghost-label"; then
+    pass "check-phantom-labels fails (exit $PHANTOM_RC) and names the injected phantom label"
+  else
+    fail "check-phantom-labels did not catch the injected phantom label (rc=$PHANTOM_RC)"
+  fi
+
+  # (c) The same fixture with a real label in application context must pass —
+  #     the /loom:sweep command name and a prose-only label mention (each on a
+  #     line WITHOUT a label-application flag) are structurally ignored, so
+  #     neither false-positives even though they are not in the fixture registry.
+  {
+    printf 'Run /loom:sweep for the full lifecycle.\n'
+    printf 'Mind the `loom:curating` label, which prevents Curator overlap.\n'
+    printf 'Then apply the real label: gh issue edit 1 --add-label "loom:issue"\n'
+  } > "$PHANTOM_FIX/defaults/roles/x.md"
+  if bash "$PHANTOM_LINT" "$PHANTOM_FIX" >/dev/null 2>&1; then
+    pass "check-phantom-labels passes on a real label and ignores /loom:sweep + prose"
+  else
+    fail "check-phantom-labels false-positived on a real label or command name"
+  fi
+  rm -rf "$PHANTOM_FIX"
+fi
+echo ""
+
+# ==========================================================================
 # Summary
 # ==========================================================================
 echo "======================================"

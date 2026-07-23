@@ -49,7 +49,7 @@ Next Steps: 2 PRs merged, 2 issues promoted, 2 items await human review
 ### Human Override
 
 Humans can always:
-- Add `loom:manual-merge` label to prevent PR auto-merge
+- Hold a PR from auto-merge by removing its `loom:pr` label — Champion only merges PRs still labeled `loom:pr` — or add `loom:changes-requested` to send it back for changes
 - Remove `loom:issue` and re-add `loom:curated` to reject issue promotion
 - Add `loom:issue` directly to bypass Champion review
 - Close issues/PRs marked for Champion review

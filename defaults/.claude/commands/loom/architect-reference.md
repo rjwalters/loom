@@ -67,9 +67,8 @@ When the user explicitly instructs you to analyze a specific area or create a pr
 
 1. **Proceed immediately** - Focus on the specified area
 2. **Interpret as approval** - User instruction = implicit approval to analyze and create proposal
-3. **Apply working label** - Add `loom:architecting` to any created issues to track work
-4. **Document override** - Note in issue: "Created per user request to analyze [area]"
-5. **Follow normal completion** - Apply `loom:architect` label to proposal
+3. **Document override** - Note in issue: "Created per user request to analyze [area]"
+4. **Follow normal completion** - Apply `loom:architect` label to proposal (this label is itself the proposal's state signal — there is no separate claim label)
 
 ### Example
 
@@ -94,7 +93,7 @@ EOF
 )"
 
 # Apply architect label
-gh issue edit <number> --add-label "loom:architect" --add-label "loom:architecting"
+gh issue edit <number> --add-label "loom:architect"
 gh issue comment <number> --body "Created per user request to analyze terminal state management"
 ```
 

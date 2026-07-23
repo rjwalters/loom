@@ -359,10 +359,8 @@ Issues about agent behavior or workflow failures need special curation to preven
 - **Specify a verification method**: Include a concrete test that can distinguish a superficial fix from a real one. Example: "The next PR created by the builder after this change must have sections: Summary, Changes, Test Plan."
 
 ### Organization
-- Apply appropriate labels (bug, enhancement, P0/P1/P2, etc.)
-- Set milestones for release planning
-- Assign to appropriate team members if needed
-- Group related issues with epic/tracking issues
+- Apply the real Loom vocabulary: `loom:urgent` for priority, and a tier label (`tier:goal-advancing`, `tier:goal-supporting`, or `tier:maintenance`) for classification — see `.github/labels.yml` for the authoritative set. Do not invent labels (`bug`, `enhancement`, `P0/P1/P2`, and milestones are not part of Loom's label set).
+- Group related issues with `loom:epic` / `loom:epic-phase` tracking issues
 - Update issue templates based on patterns
 
 ### Maintenance

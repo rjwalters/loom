@@ -23,6 +23,6 @@ Follow the complete role definition in `.loom/roles/doctor.md` for:
   - Resolve conflicts
   - Force push with lease
 - For complex changes requiring substantial refactoring:
-  - Create an issue with `loom:pr-feedback` + `loom:urgent` labels instead
+  - Create an issue with `loom:triage` + `loom:urgent` labels instead
 
 Return PRs to review-ready state efficiently.

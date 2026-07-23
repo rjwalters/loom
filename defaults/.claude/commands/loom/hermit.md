@@ -460,9 +460,8 @@ When the user explicitly instructs you to analyze a specific area for simplifica
 **Behavior**:
 1. **Proceed immediately** - Focus on the specified area
 2. **Interpret as approval** - User instruction = implicit approval to analyze
-3. **Apply working label** - Add `loom:simplifying` to any created issues to track work
-4. **Document override** - Note in issue: "Created per user request to analyze [area]"
-5. **Follow normal completion** - Apply `loom:hermit` label to proposal
+3. **Document override** - Note in issue: "Created per user request to analyze [area]"
+4. **Follow normal completion** - Apply `loom:hermit` label to proposal (this label is itself the proposal's state signal — there is no separate claim label)
 
 **When NOT to Override**:
 - When user says "find bloat" or "scan codebase" -> Use autonomous workflow

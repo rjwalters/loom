@@ -17,11 +17,9 @@ Follow the complete role definition in `.loom/roles/auditor.md` for:
   4. Verify it works as claimed in the PR description
   5. Test edge cases mentioned in the issue
 - If audit passes:
-  - Add `loom:audited` label
-  - Comment with audit results and verification steps
+  - Comment with audit results and verification steps (there is no "audit passed" label — a clean comment is the signal)
 - If audit fails:
-  - Add `loom:audit-failed` label
-  - Create a bug issue with reproduction steps
-  - Reference the original PR
+  - Create a bug issue with reproduction steps, labeled `loom:auditor`
+  - Reference the original PR in the bug issue and in a comment on the PR
 
 Trust but verify - claims without runtime validation are just assumptions.
