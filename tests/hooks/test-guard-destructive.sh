@@ -1793,25 +1793,33 @@ assert_deny_env "#3898: force-push to main still HARD-DENIES in protected mode" 
 assert_deny_env "#3898: force-push to master still HARD-DENIES in protected mode" \
     "LOOM_FORCE_SCOPE=protected" "git push -f origin master"
 
-# Own working-branch force ops pass through (no stall) in protected mode. The
-# checked-out branch of REPO_ROOT is a feature branch, not a protected branch.
+# Own working-branch force ops pass through (no stall) in protected mode. Pin to a
+# SYNTHETIC feature-branch fixture repo rather than REPO_ROOT (#3913): a bare
+# `git reset --hard` resolves the *checked-out* branch of the cwd, so using
+# REPO_ROOT made this assertion checkout-branch-sensitive — it spuriously failed
+# when the test was run from a checkout that happened to be on `main`/`master`
+# (where a hard-reset correctly stays protected → ASK). The fixture is always on
+# `feature/work`, making the assertion checkout-independent.
+FS_FEATURE_REPO=$(make_sql_repo '{"guards":{"forceScope":"protected"}}')
+git -C "$FS_FEATURE_REPO" checkout -q -b feature/work 2>/dev/null || \
+    git -C "$FS_FEATURE_REPO" checkout -q -b feature/work
 assert_allow_env "#3898: hard-reset on own working branch is allowed in protected mode" \
-    "LOOM_FORCE_SCOPE=protected" "git reset --hard HEAD~1"
+    "LOOM_FORCE_SCOPE=protected" "git reset --hard HEAD~1" "$FS_FEATURE_REPO"
 
 assert_allow_env "#3898: force-push to a non-protected branch is allowed in protected mode" \
-    "LOOM_FORCE_SCOPE=protected" "git push --force origin feature/some-work"
+    "LOOM_FORCE_SCOPE=protected" "git push --force origin feature/some-work" "$FS_FEATURE_REPO"
 
-# Default (all) mode still ASKS on own-branch force ops (byte-for-byte behaviour).
-TOTAL=$((TOTAL + 1))
-_fs_out=$(run_guard "git reset --hard HEAD~1" "$REPO_ROOT") || true
-if echo "$_fs_out" | jq -e '.hookSpecificOutput.permissionDecision == "ask"' >/dev/null 2>&1; then
-    PASS=$((PASS + 1))
-    echo -e "  ${GREEN}PASS${NC}: #3898: default (all) mode still ASKS on own-branch hard-reset"
-else
-    FAIL=$((FAIL + 1))
-    echo -e "  ${RED}FAIL${NC}: #3898: default (all) mode still ASKS on own-branch hard-reset"
-    echo -e "       Got: $_fs_out"
-fi
+# "all" mode still ASKS on own-branch force ops regardless of branch. Force the
+# mode explicitly via env and pin cwd to the synthetic feature-branch fixture
+# (#3913): the previous form relied on an env-absent `run_guard` against
+# REPO_ROOT, which was doubly environment-sensitive — an ambient LOOM_FORCE_SCOPE
+# (e.g. the `protected` autonomous-daemon default, #3898) overrode the intended
+# "all" resolution, and the outcome then depended on REPO_ROOT's checked-out
+# branch. Forcing LOOM_FORCE_SCOPE=all against a fixture that is always on a
+# feature branch proves the intended property (all-mode asks even on a
+# non-protected branch) independent of ambient env and the runner's checkout.
+assert_ask_env "#3898: all mode still ASKS on own-branch hard-reset (branch-independent)" \
+    "LOOM_FORCE_SCOPE=all" "git reset --hard HEAD~1" "$FS_FEATURE_REPO"
 
 echo ""
 
