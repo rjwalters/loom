@@ -88,7 +88,7 @@ pub fn parse_forge_events(output: &str, forge_host: &str) -> Vec<ParsedForgeEven
     // Matches: https://{forge_host}/owner/repo/pull/456  (GitHub)
     // Matches: https://{forge_host}/owner/repo/pulls/456 (Gitea)
     let escaped_host = regex::escape(forge_host);
-    let url_pattern = format!(r"https://{}/[^/]+/[^/]+/(issues|pulls?)/(\d+)", escaped_host);
+    let url_pattern = format!(r"https://{escaped_host}/[^/]+/[^/]+/(issues|pulls?)/(\d+)");
     if let Ok(url_re) = Regex::new(&url_pattern) {
         for cap in url_re.captures_iter(output) {
             if let (Some(type_match), Some(number_match)) = (cap.get(1), cap.get(2)) {
