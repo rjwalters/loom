@@ -1657,6 +1657,25 @@ impl SweepRegistry {
         changes
     }
 
+    /// Promptly reconcile sweep liveness on a **read path** (Issue #3893).
+    ///
+    /// `ListSweeps` / `GetSweepStatus` / the work-finder occupancy seed call
+    /// this before reading, so a caller never observes a sweep as `Running`
+    /// after its child has already exited. Before #3893 the only path out of
+    /// `Running` was the 30s [`reap_once`](Self::reap_once) timer, so a read
+    /// taken between a child's exit and the next tick over-reported active work
+    /// (the registry accumulated stale `Running` entries across a burst of
+    /// merges). Reap-on-read bounds that staleness window to the read itself.
+    ///
+    /// This performs exactly the same liveness `try_wait` + terminal transition
+    /// (and best-effort event/label side effects) the background timer does; on
+    /// a steady-state read with no newly-exited children it is just one cheap
+    /// `try_wait` per running entry and no side effects. Returns the number of
+    /// entries reaped.
+    pub fn reap_liveness(&mut self) -> usize {
+        self.reap_once()
+    }
+
     // ------------------------------------------------------------------------
     // Startup watchdog (Issue #3887)
     // ------------------------------------------------------------------------
@@ -4579,6 +4598,56 @@ exit 0\n";
         assert!(
             wait_until_dead(pid, 2000),
             "killed child left a <defunct> zombie — reaper did not wait() it"
+        );
+    }
+
+    /// Issue #3893: a read path (`reap_liveness`, wired into `ListSweeps` /
+    /// `GetSweepStatus` / the work-finder occupancy seed) must transition a
+    /// sweep whose child has already exited out of `Running` promptly —
+    /// bounded to seconds — WITHOUT waiting for the 30s reaper timer. This is
+    /// the regression that made `list_sweeps` over-report active work across a
+    /// burst of merges.
+    #[test]
+    #[serial]
+    fn read_path_reaps_exited_child_out_of_running_promptly() {
+        let dir = tempdir().unwrap();
+        let workspace = dir.path();
+
+        // A fake spawn that exits immediately: mirrors a sweep whose lifecycle
+        // has completed (PR merged) and whose process has already exited.
+        let mut registry = lifecycle_registry(workspace, "#!/usr/bin/env bash\nexit 0\n");
+
+        let outcome = registry
+            .dispatch(&SweepKind::Issue(4242), None, None, None, None)
+            .expect("dispatch should succeed");
+        let sweep_id = outcome.sweep_id.clone();
+
+        // Reap-on-read reconciles liveness via the retained handle's
+        // `try_wait()`. Bound the loop to ~2s to prove "prompt" — a healthy
+        // implementation transitions on the first reconcile once the child has
+        // exited (`try_wait` reaps the zombie and yields the exit status).
+        let mut still_running = true;
+        for _ in 0..80 {
+            registry.reap_liveness();
+            let running = registry.list(Some(&SweepState::Running));
+            if !running.iter().any(|i| i.sweep_id == sweep_id) {
+                still_running = false;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        assert!(
+            !still_running,
+            "exited child still reported Running after a read-path reconcile (#3893)"
+        );
+        assert!(
+            matches!(registry.get(&sweep_id).unwrap().state, SweepState::Exited { .. }),
+            "exited child should have transitioned to terminal Exited state"
+        );
+        // And it should no longer count as in-flight for occupancy accounting.
+        assert!(
+            registry.list(Some(&SweepState::Running)).is_empty(),
+            "no sweep should remain Running after the exited child was reaped"
         );
     }
 

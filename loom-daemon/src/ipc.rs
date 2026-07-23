@@ -1075,9 +1075,13 @@ fn handle_request(
         }
 
         Request::ListSweeps { state_filter } => {
-            let sr = sweep_registry
+            let mut sr = sweep_registry
                 .lock()
                 .expect("Sweep registry mutex poisoned");
+            // Reap-on-read (Issue #3893): reconcile liveness before listing so a
+            // sweep whose child has already exited is never reported `Running`
+            // just because the 30s reaper timer has not ticked yet.
+            sr.reap_liveness();
             let sweeps = sr.list(state_filter.as_ref());
             Response::SweepList { sweeps }
         }
@@ -1086,9 +1090,12 @@ fn handle_request(
         // Sweep Monitoring Handlers (Issue #3455 — Phase C of #3449)
         // ====================================================================
         Request::GetSweepStatus { sweep_id } => {
-            let sr = sweep_registry
+            let mut sr = sweep_registry
                 .lock()
                 .expect("Sweep registry mutex poisoned");
+            // Reap-on-read (Issue #3893): reconcile liveness so a status query
+            // reflects a child that has exited rather than a stale `Running`.
+            sr.reap_liveness();
             let info = sr.get_status(&sweep_id);
             Response::SweepStatus { info }
         }
@@ -1196,7 +1203,7 @@ mod tests {
     use super::*;
     use crate::activity::ActivityDb;
     use crate::sweep_registry::{SweepRegistry, SweepRegistryConfig};
-    use crate::types::{SweepKind, SweepState};
+    use crate::types::SweepKind;
     use tempfile::tempdir;
 
     type TestContext = (
@@ -1453,13 +1460,21 @@ exit 0
             other => panic!("Expected SweepDispatched, got: {other:?}"),
         }
 
-        // Follow-up ListSweeps should see the new entry.
+        // Follow-up ListSweeps should see the new entry. The fake spawn exits
+        // immediately, so reap-on-read (Issue #3893) promptly reconciles the
+        // entry to a terminal `Exited` state rather than over-reporting it as
+        // `Running` — the entry is still listed, just no longer stale-Running.
         let response =
             handle_request(Request::ListSweeps { state_filter: None }, &tm, &db, &sr, &bus);
         match response {
             Response::SweepList { sweeps } => {
                 assert_eq!(sweeps.len(), 1);
-                assert!(matches!(sweeps[0].state, SweepState::Running));
+                assert!(
+                    sweeps[0].state.is_terminal(),
+                    "reap-on-read should have transitioned the exited fake child \
+                     out of Running (#3893); got {:?}",
+                    sweeps[0].state
+                );
             }
             other => panic!("Expected SweepList, got: {other:?}"),
         }
