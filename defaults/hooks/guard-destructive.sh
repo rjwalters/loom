@@ -927,12 +927,27 @@ strip_literal_text() {
     BEGIN {
         SQ = sprintf("%c", 39)   # single quote
         DQ = sprintf("%c", 34)   # double quote
-        # boundary + text-carrying flag + optional (ws / = / ws) + quoted span
-        re = "(^|[ \t])(--message|--body|--notes|--title|--comment|-m)[ \t]*=?[ \t]*(" \
+        # boundary + text-carrying flag + optional (ws / = / ws) + quoted span.
+        # The leading boundary class includes a newline so a `--body` that begins
+        # a continuation line is still recognized; the quoted-span classes
+        # ([^"]* / [^'"'"']*) already match a newline, so a MULTI-LINE quoted
+        # value is captured as one span once the whole command is slurped below.
+        re = "(^|[ \t\n])(--message|--body|--notes|--title|--comment|-m)[ \t]*=?[ \t]*(" \
              DQ "[^" DQ "]*" DQ "|" SQ "[^" SQ "]*" SQ ")"
+        buf = ""
     }
-    {
-        s = $0
+    # MULTI-LINE REDACTION (#3898): slurp the whole (possibly multi-line) command
+    # into one buffer, preserving embedded newlines, then redact ONCE in END so a
+    # quoted flag value that spans several lines is treated as a single inert
+    # span. The old per-line ($0) processing split a multi-line `gh issue create
+    # --body "…"` body at each newline, leaving a dangerous phrase quoted on an
+    # interior line un-redacted — which then tripped the catastrophic scan on
+    # documentation text that merely MENTIONS a dangerous command (the meta
+    # false-positive that blocked filing #3898). Single-line input is
+    # byte-for-byte identical to the previous behaviour.
+    { buf = buf (NR > 1 ? "\n" : "") $0 }
+    END {
+        s = buf
         out = ""
         while (match(s, re)) {
             pre     = substr(s, 1, RSTART - 1)
@@ -948,6 +963,9 @@ strip_literal_text() {
             qchar = substr(matched, qpos, 1)
             inner = substr(matched, qpos + 1, length(matched) - qpos - 1) # between the quotes
             # Redact ONLY provably inert text (no command substitution / backtick).
+            # gsub(/./) leaves embedded newlines untouched (awk `.` never matches a
+            # newline), so a multi-line span stays SAME-LENGTH and byte offsets of
+            # the surrounding command are preserved.
             if (index(inner, "$(") == 0 && index(inner, "`") == 0) {
                 gsub(/./, "X", inner)
             }

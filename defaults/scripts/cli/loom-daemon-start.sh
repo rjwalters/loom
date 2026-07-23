@@ -147,6 +147,24 @@ fi
 # autonomous drives) or a --no-* opt-out forces the var to 0.
 export LOOM_WORKSPACE="${LOOM_WORKSPACE:-$REPO_ROOT}"
 
+# ---------- guard-hook autonomy defaults (#3898) ----------
+# The daemon dispatches headless /loom:sweep children under
+# --dangerously-skip-permissions, where a guard ASK has no human to answer it
+# and therefore BLOCKS — a silent stall. So autonomous runs get two guard
+# defaults, both env-overridable (an already-exported value always wins):
+#   * LOOM_GUARD_DECISION_LOG=1 — capture every guard DENY/ASK to
+#     .loom/logs/guard-decisions.log so the standing per-trigger review policy
+#     (see CLAUDE.md → "Autonomous guard defaults") can dedup by pattern and
+#     file one issue per distinct trigger. Off by default outside autonomous
+#     mode; here we opt it on so the feedback loop actually has data.
+#   * LOOM_FORCE_SCOPE=protected — allow an agent to force-push / hard-reset its
+#     OWN working branch without a stall, while force-push to a protected branch
+#     (main/master/default) stays a hard DENY via ALWAYS_BLOCK_PATTERNS. This is
+#     the Loom-recommended force-scope for autonomous repos.
+# Children inherit these through the daemon's process environment.
+export LOOM_GUARD_DECISION_LOG="${LOOM_GUARD_DECISION_LOG:-1}"
+export LOOM_FORCE_SCOPE="${LOOM_FORCE_SCOPE:-protected}"
+
 if [[ "$FROM_CONFIG" == "true" ]]; then
     echo -e "${BOLD}Autonomous mode: driven by .loom/config.json -> autonomous (env not forced)${NC}"
 else
