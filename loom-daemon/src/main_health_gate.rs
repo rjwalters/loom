@@ -396,9 +396,15 @@ fn run_git(repo_root: &Path, args: &[&str]) -> std::result::Result<(String, Stri
 ///    reset would clobber operator edits).
 /// 3. **Fetch** `origin main`. A fetch failure (offline, transient) ⇒ `Skip`
 ///    (better indeterminate than greenwashing a stale tree).
-/// 4. **Hard-reset** to `origin/main` so the gate builds exactly what the remote
-///    `main` now is. Only reached when the tree is on `main` and clean, so the
-///    reset only ever fast-forwards the daemon's own `main` checkout.
+/// 4. **Verify not ahead** of `origin/main`. A clean local `main` that carries
+///    commits `origin/main` lacks ⇒ `Skip` — the hard reset would discard those
+///    local-only commits (reflog-recoverable, but still). Extreme edge for a
+///    daemon workspace that should only ever fast-forward its own `main`, but
+///    worth guarding against a data-losing reset (Issue #3912).
+/// 5. **Hard-reset** to `origin/main` so the gate builds exactly what the remote
+///    `main` now is. Only reached when the tree is on `main`, clean, and not
+///    ahead, so the reset only ever fast-forwards the daemon's own `main`
+///    checkout.
 ///
 /// A `Skip` leaves the halt flag untouched (see [`apply_gate_outcome`]).
 #[must_use]
@@ -443,8 +449,29 @@ pub fn prepare_workspace_to_origin_main(repo_root: &Path) -> PrepOutcome {
         };
     }
 
-    // 4. Hard-reset to the freshly-fetched origin/main.
     let remote_ref = format!("{GATE_REMOTE}/{GATE_BRANCH}");
+
+    // 4. Not ahead of the freshly-fetched origin/main? A non-zero count of
+    // commits reachable from HEAD but not `origin/main` means a hard reset would
+    // discard local-only commits — skip rather than lose them (Issue #3912).
+    match run_git(repo_root, &["rev-list", "--count", &format!("{remote_ref}..HEAD")]) {
+        Ok((out, _)) => {
+            if out != "0" {
+                return PrepOutcome::Skip {
+                    reason: format!(
+                        "workspace '{GATE_BRANCH}' is {out} commit(s) ahead of {remote_ref} — skipping gate (will not hard-reset away local-only commits)"
+                    ),
+                };
+            }
+        }
+        Err(e) => {
+            return PrepOutcome::Skip {
+                reason: format!("could not compare workspace to {remote_ref} ({e})"),
+            };
+        }
+    }
+
+    // 5. Hard-reset to the freshly-fetched origin/main.
     if let Err(e) = run_git(repo_root, &["reset", "--hard", &remote_ref]) {
         return PrepOutcome::Skip {
             reason: format!("`git reset --hard {remote_ref}` failed ({e})"),
@@ -1119,6 +1146,30 @@ mod tests {
             head_commit(clone.path()),
             before,
             "prepare must fast-forward the workspace to the advanced origin/main"
+        );
+    }
+
+    #[test]
+    fn test_prepare_skips_when_local_main_ahead_of_origin() {
+        let (_origin, clone) = make_origin_and_clone();
+        // A clean local `main` that carries a commit origin/main lacks.
+        std::fs::write(clone.path().join("local.txt"), "local-only\n").unwrap();
+        git(clone.path(), &["add", "."]);
+        git(clone.path(), &["commit", "-m", "local-only commit"]);
+        let ahead = head_commit(clone.path());
+
+        let outcome = prepare_workspace_to_origin_main(clone.path());
+        match outcome {
+            PrepOutcome::Skip { reason } => {
+                assert!(reason.contains("ahead"), "expected ahead-of-origin reason, got: {reason}")
+            }
+            other => panic!("expected Skip when local main is ahead, got {other:?}"),
+        }
+        // The local-only commit must NOT have been reset away.
+        assert_eq!(
+            head_commit(clone.path()),
+            ahead,
+            "a local main ahead of origin must never be hard-reset away"
         );
     }
 
