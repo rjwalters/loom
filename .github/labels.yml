@@ -111,6 +111,13 @@
   description: Issue is part of an epic phase (references parent epic)
   color: "8B5CF6"  # violet-500 - lighter variant for child issues
 
+# External Contribution Labels
+# Not part of the loom: workflow. Builders MUST skip issues carrying this label
+# (see builder.md "Ignore External Issues") — they need maintainer triage first.
+- name: external
+  description: External contribution requiring manual triage
+  color: "6B7280"  # gray-500 - neutral, non-loom-workflow marker
+
 # Tier Labels (Goal Alignment)
 - name: tier:goal-advancing
   description: Directly implements a milestone deliverable or unblocks goal work
