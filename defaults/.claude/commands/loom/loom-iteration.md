@@ -23,4 +23,4 @@ Rust `loom-daemon` binary's MCP surface (`mcp__loom__dispatch_sweep`,
 `mcp__loom__list_sweeps`, `mcp__loom__subscribe_to_events`,
 `mcp__loom__cancel_sweep`, …). The historical Python daemon brain
 (`loom-tools/src/loom_tools/daemon_v2/`) was deleted in Phase 3 (#3378). See
-[`docs/migration/v0.10.0-shepherd-deprecation.md`](../../../docs/migration/v0.10.0-shepherd-deprecation.md).
+[`docs/migration/v0.10.0-shepherd-deprecation.md`](https://github.com/rjwalters/loom/blob/main/docs/migration/v0.10.0-shepherd-deprecation.md).
