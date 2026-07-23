@@ -1,7 +1,9 @@
 use loom_daemon::activity::{self, ActivityDb, StatsQueries};
+use loom_daemon::epic_supervisor::{self, EpicSupervisor};
 use loom_daemon::event_bus::EventBus;
 use loom_daemon::health_monitor;
 use loom_daemon::ipc::IpcServer;
+use loom_daemon::issue_creation_mutex::IssueCreationMutex;
 use loom_daemon::metrics_collector;
 use loom_daemon::role_validation;
 use loom_daemon::sweep_registry::{self, SweepRegistry, SweepRegistryConfig};
@@ -241,6 +243,52 @@ async fn main() -> Result<()> {
     let sweep_registry = Arc::new(Mutex::new(sweep));
     let _reaper_handle = sweep_registry::spawn_reaper_task(sweep_registry.clone());
 
+    // Epic supervisor loop (Issue #3872 — Phase 4 of epic #3842). Opt-in via
+    // `LOOM_EPIC_SUPERVISOR`. The loop drives every open `loom:epic` issue
+    // through its fork-join lifecycle by dispatching the enabled role each tick.
+    //
+    // It runs on a DEDICATED OS THREAD with its own current-thread runtime —
+    // NOT `tokio::spawn` on this shared daemon runtime — because the concrete
+    // `SpawnDispatcher::dispatch_role` is spawn-and-wait (`Command::status()`
+    // blocks for the full lifetime of each Architect/Champion process, holding
+    // the #3707 issue-creation mutex across the burst). Keeping that blocking
+    // call off the shared runtime preserves the responsiveness of the event
+    // bus, reaper, sweep registry, and IPC listener while a role process runs.
+    let supervisor_handle = if epic_supervisor::supervisor_enabled() {
+        match SweepRegistryConfig::new(sweep_workspace.clone()).resolve_spawn_bin() {
+            Ok(spawn_bin) => {
+                let source = epic_supervisor::forge::GhEpicSource::new();
+                let dispatcher =
+                    epic_supervisor::forge::SpawnDispatcher::new(spawn_bin, sweep_registry.clone());
+                let supervisor = EpicSupervisor::new(source, dispatcher, IssueCreationMutex::new());
+                let interval = epic_supervisor::resolve_supervisor_interval();
+                match epic_supervisor::spawn_supervisor_thread(supervisor, interval) {
+                    Ok(handle) => {
+                        log::info!("epic_supervisor: enabled (interval={}s)", interval.as_secs());
+                        Some(handle)
+                    }
+                    Err(e) => {
+                        log::error!("epic_supervisor: failed to start loop thread: {e}");
+                        None
+                    }
+                }
+            }
+            Err(e) => {
+                log::warn!("epic_supervisor: enabled but spawn binary unavailable: {e}");
+                None
+            }
+        }
+    } else {
+        log::debug!("epic_supervisor: disabled (set LOOM_EPIC_SUPERVISOR=1 to enable)");
+        None
+    };
+    // Shared shutdown flag so the signal handler can stop the loop cleanly.
+    let supervisor_shutdown = supervisor_handle
+        .as_ref()
+        .map(epic_supervisor::SupervisorHandle::shutdown_token);
+    // Keep the handle alive for the daemon's lifetime; its Drop signals stop.
+    let _supervisor_handle = supervisor_handle;
+
     // Start IPC server
     let server = IpcServer::new(socket_path.clone(), tm, activity_db, sweep_registry, event_bus);
 
@@ -250,6 +298,10 @@ async fn main() -> Result<()> {
         match tokio::signal::ctrl_c().await {
             Ok(()) => {
                 log::info!("Received shutdown signal, cleaning up...");
+                // Signal the off-runtime epic supervisor loop to stop.
+                if let Some(flag) = &supervisor_shutdown {
+                    flag.store(true, std::sync::atomic::Ordering::Relaxed);
+                }
                 let _ = tokio::fs::remove_file(&socket_path_clone).await;
                 log::info!("Socket cleaned up, exiting");
                 std::process::exit(0);
