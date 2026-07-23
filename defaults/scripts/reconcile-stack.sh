@@ -122,15 +122,53 @@ info "Rebase target (default branch): $DEFAULT_BRANCH"
 # Best-effort advisory: has the parent branch squash-merged? If origin still has
 # the parent branch, the operator likely hasn't merged it yet — warn but do not
 # block (the operator asserts they've confirmed the merge).
+#
+# Query the remote LIVE (git ls-remote) rather than trusting the local
+# remote-tracking ref: with delete-branch-on-merge the parent branch is deleted
+# on the remote the instant it squash-merges, but the local
+# refs/remotes/origin/<parent> can linger stale until a prune — a plain
+# `git show-ref` of that stale ref then false-warns on every post-merge
+# reconcile (#3776). ls-remote asks the actual remote, so a stale local ref
+# never produces a spurious warning. A network/ls-remote failure simply skips
+# the advisory (it was only ever advisory).
 git fetch origin "$DEFAULT_BRANCH" 2>/dev/null || true
-if git show-ref --verify --quiet "refs/remotes/origin/$PARENT_BRANCH" 2>/dev/null; then
+if git ls-remote --exit-code --heads origin "refs/heads/$PARENT_BRANCH" >/dev/null 2>&1; then
     warn "origin/$PARENT_BRANCH still exists — confirm the parent PR has squash-merged before reconciling."
     warn "(delete-branch-on-merge normally removes it once the parent merges.)"
 fi
 
-# Refuse on a dirty working tree — a rebase would fail confusingly.
-if [[ -n "$(git status --porcelain 2>/dev/null)" ]]; then
-    err "Working tree is dirty. Commit, stash, or discard changes before reconciling."
+# Locate the worktree (if any) that holds the child branch checked out. A Loom
+# child branch is ALWAYS checked out in its own managed worktree
+# (.loom/worktrees/issue-<child>), and git refuses to rebase a branch that is
+# checked out in another worktree (`fatal: '<branch>' is already used by
+# worktree at ...`) — so running the rebase from the main worktree can never
+# work for a live Loom stack (#3776). Detect that worktree via
+# `git worktree list --porcelain` and run the rebase/push INSIDE it. When no
+# worktree holds the branch (e.g. it was already removed), fall back to the
+# in-place rebase, which checks the branch out in the current worktree — the
+# original v1 behaviour, unchanged.
+CHILD_WORKTREE=""
+_wt=""
+while IFS= read -r _line; do
+    case "$_line" in
+        "worktree "*) _wt="${_line#worktree }" ;;
+        "branch refs/heads/$CHILD_BRANCH") CHILD_WORKTREE="$_wt" ;;
+    esac
+done < <(git worktree list --porcelain 2>/dev/null || true)
+
+# GIT_C is the git invocation used for the branch-mutating steps (rebase, push).
+# Inside the child worktree when one exists, else the current worktree.
+if [[ -n "$CHILD_WORKTREE" ]]; then
+    info "Child branch $CHILD_BRANCH is checked out in worktree: $CHILD_WORKTREE — running the rebase there."
+    GIT_C=(git -C "$CHILD_WORKTREE")
+else
+    GIT_C=(git)
+fi
+
+# Refuse on a dirty working tree — a rebase would fail confusingly. Check the
+# tree the rebase will actually run in (the child worktree when one exists).
+if [[ -n "$("${GIT_C[@]}" status --porcelain 2>/dev/null)" ]]; then
+    err "Working tree is dirty${CHILD_WORKTREE:+ (worktree: $CHILD_WORKTREE)}. Commit, stash, or discard changes before reconciling."
     exit 1
 fi
 
@@ -143,9 +181,10 @@ run() {
 }
 
 # 1. Replay ONLY the child's own commits onto the default branch, stripping the
-#    parent's now-squashed pre-merge commits.
+#    parent's now-squashed pre-merge commits. Runs inside the child worktree when
+#    one holds the branch (so git does not reject the checked-out branch).
 info "Step 1/3: rebase --onto $DEFAULT_BRANCH $PARENT_BRANCH $CHILD_BRANCH"
-if ! run git rebase --onto "$DEFAULT_BRANCH" "$PARENT_BRANCH" "$CHILD_BRANCH"; then
+if ! run "${GIT_C[@]}" rebase --onto "$DEFAULT_BRANCH" "$PARENT_BRANCH" "$CHILD_BRANCH"; then
     err "Rebase failed (likely a conflict). Resolve it, then re-run this script or finish manually:"
     echo "    git rebase --continue   # after resolving" >&2
     echo "    git push --force-with-lease" >&2
@@ -154,9 +193,10 @@ if ! run git rebase --onto "$DEFAULT_BRANCH" "$PARENT_BRANCH" "$CHILD_BRANCH"; t
 fi
 
 # 2. Publish the rewritten child branch. --force-with-lease (never bare --force)
-#    so a concurrent push aborts rather than clobbers.
+#    so a concurrent push aborts rather than clobbers. Pushed from the same
+#    worktree the rebase ran in, so the current branch there is the child branch.
 info "Step 2/3: push --force-with-lease"
-if ! run git push --force-with-lease; then
+if ! run "${GIT_C[@]}" push --force-with-lease; then
     err "Force-with-lease push was rejected (someone else pushed to $CHILD_BRANCH). Fetch, review, and retry."
     exit 2
 fi
