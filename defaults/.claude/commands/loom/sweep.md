@@ -4,7 +4,7 @@ Process an explicit list of issues — **or an explicit/NL-described set of open
 
 > **Scope.** This skill accepts either an explicit list of issue numbers, a natural-language description of which issues to process, **or an explicit/NL-described list of open PRs** (Mode C, the "back half" of the lifecycle: Judge → Doctor → Merge per PR's current label). Runs the appropriate lifecycle in waves. Supports `--dry-run` to preview the plan without mutations. Other knobs sketched in #3298 are **deliberately deferred** — see "Limitations" below.
 >
-> If you need fully autonomous orchestration with work generation, use `/loom`. If you need a single-issue lifecycle, use `/shepherd <N>`. `/sweep` exists for the in-between case: "I have these N issues (or PRs), run them in this session, without spinning up a daemon."
+> If you need multi-account autonomous dispatch across many issues, use `/loom:loom` (it drives the `loom-daemon`). `/loom:sweep` is itself the single-issue lifecycle, and also covers the in-between case: "I have these N issues (or PRs), run them in this session, without spinning up a daemon."
 
 ## Arguments
 
@@ -12,7 +12,7 @@ Process an explicit list of issues — **or an explicit/NL-described set of open
 
 `$ARGUMENTS` is interpreted in one of **three modes** (A/B/C), chosen by inspection of the non-flag tokens and the presence of a `--prs` flag — plus a dedicated **build-everything sentinel** for the bare, sole token `all`. Before classifying, **strip all recognized flag tokens** (`--builders-per-wave N`, `--dry-run`, `--prs`, `--no-daemon`) from the token list — flags are honoured in their respective modes.
 
-**`/sweep all` (the build-everything sentinel).** When the non-flag token list is exactly `["all"]` (case-insensitive), `/sweep` takes a dedicated, deterministic path that resolves the **entire open backlog** — every open issue, regardless of its current label — via a single fixed `gh issue list` query (no Mode B NL translation), then aggressively promotes and drives each toward a merged PR. This is the **fast/sloppy "just build everything" command**: uncurated issues get curated and promoted, stale `loom:building` claims are reclaimed, `loom:blocked` issues are probed for whether their blocker has cleared, `loom:epic` containers fan out to their `loom:epic-phase` children, and issues that already have an open PR are driven through Judge / Doctor → Merge. The only issues it skips outright are `loom:operator-only` (genuinely need a human — credentials, hardware, infra). The resolved set is handed to the same confirmation gate and wave machinery every other mode uses. `/sweep all --prs` resolves the open **PR** set and drives Mode C. Only the bare, sole `all` token triggers this; `all open loom:issue items` and every other multi-token `all …` phrase still route to Mode B (or Mode C for PR phrases) exactly as before. See "Build-everything sentinel (`all`)" and "Aggressive candidate taxonomy" under Validation rules.
+**`/loom:sweep all` (the build-everything sentinel).** When the non-flag token list is exactly `["all"]` (case-insensitive), `/loom:sweep` takes a dedicated, deterministic path that resolves the **entire open backlog** — every open issue, regardless of its current label — via a single fixed `gh issue list` query (no Mode B NL translation), then aggressively promotes and drives each toward a merged PR. This is the **fast/sloppy "just build everything" command**: uncurated issues get curated and promoted, stale `loom:building` claims are reclaimed, `loom:blocked` issues are probed for whether their blocker has cleared, `loom:epic` containers fan out to their `loom:epic-phase` children, and issues that already have an open PR are driven through Judge / Doctor → Merge. The only issues it skips outright are `loom:operator-only` (genuinely need a human — credentials, hardware, infra). The resolved set is handed to the same confirmation gate and wave machinery every other mode uses. `/loom:sweep all --prs` resolves the open **PR** set and drives Mode C. Only the bare, sole `all` token triggers this; `all open loom:issue items` and every other multi-token `all …` phrase still route to Mode B (or Mode C for PR phrases) exactly as before. See "Build-everything sentinel (`all`)" and "Aggressive candidate taxonomy" under Validation rules.
 
 **Mode selection summary** (full rules below):
 
@@ -27,7 +27,7 @@ Process an explicit list of issues — **or an explicit/NL-described set of open
 
 ### Mode A — Explicit numeric list (fast path, regression guard)
 
-If **every** whitespace-separated non-flag token matches the regex `^#?\d+$` (a positive integer with an optional leading `#`), treat the arguments as today's explicit issue list. **No LLM interpretation, no extra `gh` calls.** This is the MVP behaviour and must remain bit-for-bit compatible — `/sweep 123 456` and `/sweep #123 #456` continue to work exactly as before.
+If **every** whitespace-separated non-flag token matches the regex `^#?\d+$` (a positive integer with an optional leading `#`), treat the arguments as today's explicit issue list. **No LLM interpretation, no extra `gh` calls.** This is the MVP behaviour and must remain bit-for-bit compatible — `/loom:sweep 123 456` and `/loom:sweep #123 #456` continue to work exactly as before.
 
 ### Mode B — Natural-language interpretation
 
@@ -49,7 +49,7 @@ Otherwise, treat `$ARGUMENTS` as an English description of which open issues to 
 
 Combine flags as needed. Always pass `--state open` explicitly (default) unless the user asks for closed issues. Default to `--limit 100` rather than the `gh` default of `30` to avoid silent truncation (see edge case below).
 
-**Mixed mode is supported.** `/sweep #3310 #3312 and any other loom:issue with 'docs' in the title` should be interpreted as the union of `{3310, 3312}` and the `gh issue list --label loom:issue --search "docs in:title"` result. Because the tokens contain non-numeric words, this falls into Mode B and the orchestrator handles the union.
+**Mixed mode is supported.** `/loom:sweep #3310 #3312 and any other loom:issue with 'docs' in the title` should be interpreted as the union of `{3310, 3312}` and the `gh issue list --label loom:issue --search "docs in:title"` result. Because the tokens contain non-numeric words, this falls into Mode B and the orchestrator handles the union.
 
 **Unknown-label guard.** Loom never invents labels (CLAUDE.md "Never create new GitHub labels" — that rule is about label *creation* via `gh label create`, which is separate from validating that a label the user already named actually exists on the repo). To validate label tokens in the user's description, query the **live repo label set** as the source of truth:
 
@@ -57,7 +57,7 @@ Combine flags as needed. Always pass `--state open` explicitly (default) unless 
 gh label list -R <repo> --limit 200 --json name --jq '.[].name'
 ```
 
-Run this query **once at the start of Mode B label-token validation** and reuse the result for every subsequent token check within the same `/sweep` invocation (at most one `gh label list` call per invocation, regardless of how many label tokens appear in the description). Pass `--limit 200` explicitly (do not rely on `gh`'s default of 30, matching the explicit-limit convention used elsewhere in this skill for `gh issue list`). Scope the query to the repo currently being swept.
+Run this query **once at the start of Mode B label-token validation** and reuse the result for every subsequent token check within the same `/loom:sweep` invocation (at most one `gh label list` call per invocation, regardless of how many label tokens appear in the description). Pass `--limit 200` explicitly (do not rely on `gh`'s default of 30, matching the explicit-limit convention used elsewhere in this skill for `gh issue list`). Scope the query to the repo currently being swept.
 
 If a label token in the description is not in the repo's actual label set, **do not** silently fabricate a `--label <name>` filter — ask the user to clarify which existing label they meant, or supply explicit issue numbers.
 
@@ -69,8 +69,8 @@ When the user wants to drive a known set of open PRs through Judge / Doctor / Me
 
 **Mode C entry triggers** (any of these select Mode C):
 
-1. **Explicit flag with explicit list**: the user passes `--prs` **and** every non-flag token matches `^#?\d+$`. Tokens are interpreted as **PR numbers** (not issue numbers). Example: `/sweep --prs 100 101 102`.
-2. **Explicit flag with NL description**: the user passes `--prs` **and** at least one non-flag token is non-numeric. The orchestrator translates the description into one or more `gh pr list` invocations (NOT `gh issue list`) — see the PR-side translation guide below. Example: `/sweep --prs all open loom:pr`.
+1. **Explicit flag with explicit list**: the user passes `--prs` **and** every non-flag token matches `^#?\d+$`. Tokens are interpreted as **PR numbers** (not issue numbers). Example: `/loom:sweep --prs 100 101 102`.
+2. **Explicit flag with NL description**: the user passes `--prs` **and** at least one non-flag token is non-numeric. The orchestrator translates the description into one or more `gh pr list` invocations (NOT `gh issue list`) — see the PR-side translation guide below. Example: `/loom:sweep --prs all open loom:pr`.
 3. **NL trigger without `--prs`**: the user's description **clearly** indicates PRs ("PRs", "pull requests", "review-requested PRs", "all open `loom:pr`", "merge-ready PRs", etc.) — see the NL trigger list below. The orchestrator infers Mode C and proceeds as if `--prs` had been passed. If the description is ambiguous between issues and PRs, ask for clarification rather than guess.
 
 **PR-side NL trigger phrases** (any of these in the description selects Mode C, even without `--prs`):
@@ -83,7 +83,7 @@ When the user wants to drive a known set of open PRs through Judge / Doctor / Me
 - `judge-pending PRs`, `judge-ready PRs`
 - `pending review`
 
-When uncertain whether the description means issues or PRs (e.g., `/sweep all loom:review-requested` — the label only applies to PRs but the user did not say "PRs"), ask for clarification rather than infer.
+When uncertain whether the description means issues or PRs (e.g., `/loom:sweep all loom:review-requested` — the label only applies to PRs but the user did not say "PRs"), ask for clarification rather than infer.
 
 **PR-side translation guide — common NL fragments to `gh pr list` flags** (verified against `gh` v2):
 
@@ -104,8 +104,8 @@ Combine flags as needed. Always pass `--state open` explicitly (Mode C operates 
 - `--prs` strips from the token list before classification, exactly like `--builders-per-wave N`, `--dry-run`, and `--no-daemon`.
 - Numeric tokens (after stripping `--prs`): same `^#?\d+$` regex as Mode A. Strip leading `#`, parse as positive integers, deduplicate (preserve first-seen order). Reject any token that fails to parse, with a clear error citing the offending token, and EXIT.
 - NL tokens (after stripping `--prs`): translate to one or more `gh pr list` invocations per the guide above. Run the command, deduplicate the resulting PR list, and **display the candidate set to the user before spawning any agents**. Await confirmation. If the user declines, EXIT cleanly.
-- **`--builders-per-wave N` is silently ignored in Mode C**. The Builder phase is skipped wholesale for PR-set mode; per-PR Judge is sequential within a wave (matching the existing issue-side wave policy). If the user passes both `--prs` and `--builders-per-wave N`, print a one-line note that the flag has no effect in Mode C and proceed without it. Mode C waves are size-1 by default — one PR settles fully (Judge → optional Doctor → optional Merge) before the next PR is touched. This may relax in a future issue; today it preserves the load-bearing #3289 sequencing rule.
-- Mixed Mode C and Mode A/B is **not** supported in this skill — if the user wants to sweep some issues and some PRs in one invocation, ask them to run two `/sweep` calls (one for each mode). Implementing PR/issue mixing would require routing logic for the cross product of (issue-state × PR-state); cleanly out of scope.
+- **`--builders-per-wave N` is silently ignored in Mode C**. The Builder phase is skipped wholesale for PR-set mode; per-PR Judge is sequential within a wave (matching the existing issue-side wave policy). If the user passes both `--prs` and `--builders-per-wave N`, print a one-line note that the flag has no effect in Mode C and proceed without it. Mode C waves are size-1 by default — one PR settles fully (Judge → optional Doctor → optional Merge) before the next PR is touched. This may relax in a future issue; today it is size-1 because parallel Judge/Doctor across PRs is unbenchmarked and every wave member's Task result is read back into this same orchestrator session (context-window pressure). This is a **width** choice — it is **not** the #3289 rule, which is about nested (grandchild) dispatch depth, not wave width.
+- Mixed Mode C and Mode A/B is **not** supported in this skill — if the user wants to sweep some issues and some PRs in one invocation, ask them to run two `/loom:sweep` calls (one for each mode). Implementing PR/issue mixing would require routing logic for the cross product of (issue-state × PR-state); cleanly out of scope.
 
 ### Edge cases (prose rules, applied in either mode but mostly relevant to Mode B)
 
@@ -121,20 +121,20 @@ Combine flags as needed. Always pass `--state open` explicitly (Mode C operates 
 - **`--prs`** — switch into Mode C (PR-set mode). Recognized as a bare flag token (no value). May appear anywhere in `$ARGUMENTS`. Default is off. When present, non-flag tokens are interpreted as **PR numbers** (numeric tokens) or as a **PR-list description** (NL tokens). When absent, an NL trigger phrase listed in the Mode C section can still select Mode C. See "Mode C" above for full semantics.
 - **`--no-daemon`** — force in-process subagent dispatch even when the daemon is running with a multi-account token pool. Recognized as a bare flag token (no value). May appear anywhere in `$ARGUMENTS`. Default is off. When present, **Stage -1 (Backend detection) skips the `PROBE_DAEMON` step entirely** and the skill always falls through to the existing Mode A/B/C subagent dispatch path. Honoured in **all three** modes — stripped before classification along with other flags. Use this when you want the predictable single-process behaviour even though daemon dispatch is available (e.g., debugging, demoing the subagent path, or running under a token configuration that you don't want shared with daemon-spawned sweeps). See "Stage -1: Backend detection" below.
 - **`--depends-on <parent>`** — stacked-PR mode (issue #3729, v1). Declares that this sweep's issue is stacked on the single parent issue `<parent>`: the Builder branches its worktree off `feature/issue-<parent>` (not the default branch) and opens its PR with `--base feature/issue-<parent>`, so the child's Curator→Builder→Judge can run **concurrently** with the parent's review. Takes **one value** (a positive integer parent issue number) — this is the sole, authoritative *operator-declared* dependency source (no `Depends on #A` body parsing unless `--auto-stack` is passed, see below). A single optional parent makes diamonds / multi-parent stacks unrepresentable. Recognized anywhere in `$ARGUMENTS` as `--depends-on N`; strip it (and its value) before classification and store `DEPENDS_ON=N`. Default **unset** — absent the flag, behavior is byte-for-byte unchanged (branches off the default branch as always). Intended for **daemon `dispatch_sweep`-only** use (`mcp__loom__dispatch_sweep` with `depends_on`); absent `--auto-stack`, the wave lifecycle does **not** auto-detect or auto-create stacks. See "Stacked dependency (auto-reconciliation on parent merge)" below. **Reconciliation after the parent squash-merges now fires automatically** from `merge-pr.sh` (#3747 v2 item 1) — a best-effort, live-forge-discovered pass that reconciles safe children and defers the ones whose issue is still `loom:building`; `./.loom/scripts/reconcile-stack.sh` remains available for manual/deferred runs.
-- **`--auto-stack`** — opt-in auto-election of same-candidate-set stacking (issue #3759, v1). A bare flag (no value); default **off**. When present in Modes A/B (issue-set), the Stage 0 candidate survey additionally reads each candidate's issue `body` and detects **same-candidate-set** dependency edges declared in body text (`Depends on #A` / `Requires #A`) — see "Auto-stack detection and wave ordering (`--auto-stack`, #3759)". A detected edge is honored **only when `#A` is also a member of this sweep invocation's own deduplicated candidate list**; a `Depends on #A` naming an issue outside the set is left completely untouched (it flows through existing `loom:blocked` handling, unaffected). This generalizes the single-value `--depends-on` mechanics to a **per-issue** `DEPENDS_ON[N]` map: each child branches its worktree off `feature/issue-<parent>` and opens its PR with `--base feature/issue-<parent>`, exactly as a manually-dispatched `--depends-on` chain, and reconciliation on parent merge fires automatically (unchanged, #3747/#3752). **Absent the flag, behavior is byte-for-byte unchanged** (no body read, no edge detection, no wave reordering, no prompt). **No-op in Mode C** (PR-set mode has no Builder phase to stack — the flag is silently ignored, like `--builders-per-wave`). Scope is deliberately narrow: edges are **linear, single-parent** (no diamonds/multi-parent), **same-sweep only** (cross-`/sweep` coordination is #3768's concern), and inferred from the **authoritative body-text signal only** — file-overlap-heuristic detection is explicitly out of scope (#3729 rejected file paths as a topology signal; the reactive #3647 in-wave overlap gate stays the backstop for accidental collisions). Recognized anywhere in `$ARGUMENTS`; strip it before classification and store `AUTO_STACK=true|false`.
+- **`--auto-stack`** — opt-in auto-election of same-candidate-set stacking (issue #3759, v1). A bare flag (no value); default **off**. When present in Modes A/B (issue-set), the Stage 0 candidate survey additionally reads each candidate's issue `body` and detects **same-candidate-set** dependency edges declared in body text (`Depends on #A` / `Requires #A`) — see "Auto-stack detection and wave ordering (`--auto-stack`, #3759)". A detected edge is honored **only when `#A` is also a member of this sweep invocation's own deduplicated candidate list**; a `Depends on #A` naming an issue outside the set is left completely untouched (it flows through existing `loom:blocked` handling, unaffected). This generalizes the single-value `--depends-on` mechanics to a **per-issue** `DEPENDS_ON[N]` map: each child branches its worktree off `feature/issue-<parent>` and opens its PR with `--base feature/issue-<parent>`, exactly as a manually-dispatched `--depends-on` chain, and reconciliation on parent merge fires automatically (unchanged, #3747/#3752). **Absent the flag, behavior is byte-for-byte unchanged** (no body read, no edge detection, no wave reordering, no prompt). **No-op in Mode C** (PR-set mode has no Builder phase to stack — the flag is silently ignored, like `--builders-per-wave`). Scope is deliberately narrow: edges are **linear, single-parent** (no diamonds/multi-parent), **same-sweep only** (cross-`/loom:sweep` coordination is #3768's concern), and inferred from the **authoritative body-text signal only** — file-overlap-heuristic detection is explicitly out of scope (#3729 rejected file paths as a topology signal; the reactive #3647 in-wave overlap gate stays the backstop for accidental collisions). Recognized anywhere in `$ARGUMENTS`; strip it before classification and store `AUTO_STACK=true|false`.
 
 ### Validation rules
 
 - Recognize `--dry-run`, `--prs`, `--no-daemon`, `--builders-per-wave N`, `--depends-on N`, and `--auto-stack` as flag tokens anywhere in `$ARGUMENTS`, strip them from the candidate list before validation, and store them as flags / parameters (`DRY_RUN=true|false`, `PRS_MODE=true|false`, `NO_DAEMON=true|false`, `BUILDERS_PER_WAVE=N`, `DEPENDS_ON=N|unset`, `AUTO_STACK=true|false`). When `--builders-per-wave` is **absent**, set the sentinel `BUILDERS_PER_WAVE=auto` (not `1`) — Stage -1 resolves the concrete wave size from the backend + disk headroom. An explicit integer is stored verbatim and overrides auto. `--depends-on N` consumes its following token as the parent issue number (a positive integer); reject a missing/non-numeric value with `Error: --depends-on requires a positive integer parent issue number` and EXIT. When absent, `DEPENDS_ON` is unset (no base override — default-branch behavior). `--auto-stack` is a bare flag (consumes no value); default `AUTO_STACK=false`. It applies to Modes A/B only — in Mode C it is silently ignored (no Builder phase to stack). `--auto-stack` and a single-issue `--depends-on N` may both be present: `--depends-on` seeds `DEPENDS_ON[N]` for its named issue and auto-stack detection fills in the rest of the map; a detected edge never overrides an explicit `--depends-on` for the same issue.
 - At least one candidate (numeric token or NL description) must be supplied. If `$ARGUMENTS` (after stripping flag tokens) is empty, display:
   ```
-  Usage: /sweep <issue-number> [<issue-number> ...] [--builders-per-wave N] [--dry-run] [--no-daemon]
-         /sweep <natural-language description>     [--builders-per-wave N] [--dry-run] [--no-daemon]
-         /sweep all                                [--builders-per-wave N] [--dry-run] [--no-daemon]   # build everything (whole open backlog)
-         /sweep all --prs                          [--dry-run]                                         # every open PR (Mode C)
-         /sweep --prs <pr-number> [<pr-number> ...] [--dry-run]
-         /sweep --prs <natural-language PR description> [--dry-run]
-         /sweep <natural-language PR description>       [--dry-run]   # PR NL triggers select Mode C
+  Usage: /loom:sweep <issue-number> [<issue-number> ...] [--builders-per-wave N] [--dry-run] [--no-daemon]
+         /loom:sweep <natural-language description>     [--builders-per-wave N] [--dry-run] [--no-daemon]
+         /loom:sweep all                                [--builders-per-wave N] [--dry-run] [--no-daemon]   # build everything (whole open backlog)
+         /loom:sweep all --prs                          [--dry-run]                                         # every open PR (Mode C)
+         /loom:sweep --prs <pr-number> [<pr-number> ...] [--dry-run]
+         /loom:sweep --prs <natural-language PR description> [--dry-run]
+         /loom:sweep <natural-language PR description>       [--dry-run]   # PR NL triggers select Mode C
 
   See #3298, #3384, #3454, and #3568 for the full design.
   ```
@@ -226,22 +226,22 @@ Combine flags as needed. Always pass `--state open` explicitly (Mode C operates 
 | `4`–`6` | Evidence-supported for the **subagent** path on multi-core hosts (#3693); reached automatically by the core-scaled `auto` default. Operator discretion via explicit override. |
 | `>= 7` | Unvalidated **for the subagent path**. Warns at parse time. Operator discretion. |
 
-The subagent-path target is **soft** — there is no hard upper bound and the warning is the only guard. Its auto default core-scales within `[3, 6]` (floor 3 on small/shared hosts, ceiling 6 on big ones). The `[3, 6]` band is a **width** decision: at one level deep, width is bounded by the harness concurrency cap (`min(16, cores-2)`), not by #3289. The #3289 nested-dispatch stall is specifically about parallel *grandchildren* (`parent → /shepherd → builder`), which `/sweep` never does — it dispatches builders directly, one level deep (see "CRITICAL: One level deep"). The ceiling stays 6 (not 8/10) because single-account rate-limit burn and orchestrator context-window pressure (every wave member's Task result is read back into the same session) both bind before #3289 does. High parallelism toward 10 is reached **only** via the daemon detached-process path (`mcp__loom__dispatch_sweep`), where each sweep is an isolated OS process — not a nested subagent. Never raise the subagent ceiling toward 10; route through the daemon instead.
+The subagent-path target is **soft** — there is no hard upper bound and the warning is the only guard. Its auto default core-scales within `[3, 6]` (floor 3 on small/shared hosts, ceiling 6 on big ones). The `[3, 6]` band is a **width** decision: at one level deep, width is bounded by the harness concurrency cap (`min(16, cores-2)`), not by #3289. The #3289 nested-dispatch stall is specifically about parallel *grandchildren* (`parent → nested /loom:sweep → builder`), which `/loom:sweep` never does — it dispatches builders directly, one level deep (see "CRITICAL: One level deep"). The ceiling stays 6 (not 8/10) because single-account rate-limit burn and orchestrator context-window pressure (every wave member's Task result is read back into the same session) both bind before #3289 does. High parallelism toward 10 is reached **only** via the daemon detached-process path (`mcp__loom__dispatch_sweep`), where each sweep is an isolated OS process — not a nested subagent. Never raise the subagent ceiling toward 10; route through the daemon instead.
 
 ## Examples
 
 ### Mode A — Explicit numeric list (fast path)
 
 ```bash
-/sweep 123                                    # Sequential lifecycle for issue 123
-/sweep 123 456 789                            # Sequential lifecycle for three issues
-/sweep #1083 #1080                            # Leading # is allowed
-/sweep 123 456 789 --builders-per-wave 2      # Two builders per wave (recommended)
-/sweep 1 2 3 4 5 6 --builders-per-wave 3      # Three builders per wave (validated)
-/sweep 1 2 --builders-per-wave 5              # Silently clamps to 2 (candidate count)
-/sweep 123 456 789 --dry-run                  # Print plan and EXIT without mutating
-/sweep 1 2 3 4 5 --dry-run --builders-per-wave 2  # Preview with wave grouping
-/sweep 123 456 --no-daemon                    # Force in-process subagent dispatch even when daemon is up (#3454)
+/loom:sweep 123                                    # Sequential lifecycle for issue 123
+/loom:sweep 123 456 789                            # Sequential lifecycle for three issues
+/loom:sweep #1083 #1080                            # Leading # is allowed
+/loom:sweep 123 456 789 --builders-per-wave 2      # Two builders per wave (recommended)
+/loom:sweep 1 2 3 4 5 6 --builders-per-wave 3      # Three builders per wave (validated)
+/loom:sweep 1 2 --builders-per-wave 5              # Silently clamps to 2 (candidate count)
+/loom:sweep 123 456 789 --dry-run                  # Print plan and EXIT without mutating
+/loom:sweep 1 2 3 4 5 --dry-run --builders-per-wave 2  # Preview with wave grouping
+/loom:sweep 123 456 --no-daemon                    # Force in-process subagent dispatch even when daemon is up (#3454)
 ```
 
 ### Build everything — the `all` sentinel
@@ -254,69 +254,69 @@ The subagent-path target is **soft** — there is no hard upper bound and the wa
 # and driving any existing open PR through Judge / Doctor → Merge. Only
 # loom:operator-only issues are hard-skipped. Displays the resolved plan and
 # awaits confirmation before dispatching.
-/sweep all
+/loom:sweep all
 
 # Case-insensitive — ALL / All also trigger the sentinel
-/sweep ALL
+/loom:sweep ALL
 
 # Preview the whole-backlog plan (per-issue action + wave grouping) without mutating
-/sweep all --dry-run
+/loom:sweep all --dry-run
 
 # Same aggressive set, two builders per wave
-/sweep all --builders-per-wave 2
+/loom:sweep all --builders-per-wave 2
 
 # Every open PR, driven through Judge / Doctor → Merge per its current label (Mode C)
-/sweep all --prs
-/sweep all --prs --dry-run
+/loom:sweep all --prs
+/loom:sweep all --prs --dry-run
 
 # NOT the sentinel — >1 non-flag token, still routes to Mode B exactly as before
-/sweep all open loom:issue items
-/sweep all my agent-filed loom:issue items --builders-per-wave 2
+/loom:sweep all open loom:issue items
+/loom:sweep all my agent-filed loom:issue items --builders-per-wave 2
 ```
 
 ### Mode B — Natural-language description
 
 ```bash
 # Label filter — translates to: gh issue list --label loom:curated --state open --limit 100
-/sweep all loom:curated issues
+/loom:sweep all loom:curated issues
 
 # Compound label + author + time filter — translates to:
 #   gh issue list --label loom:curated --author rjwalters \
 #                 --search "created:>=2026-05-17" --state open --limit 100
-/sweep all loom:curated issues filed by rjwalters in the last week
+/loom:sweep all loom:curated issues filed by rjwalters in the last week
 
 # Title search on a label-filtered set — translates to:
 #   gh issue list --label loom:issue --search "docs in:title" --state open --limit 100
-/sweep loom:issue items with 'docs' in the title
+/loom:sweep loom:issue items with 'docs' in the title
 
 # "My" → --author @me (Loom files but does not self-assign):
-/sweep all my agent-filed loom:issue items --builders-per-wave 2
+/loom:sweep all my agent-filed loom:issue items --builders-per-wave 2
 
 # Mixed mode — union of explicit numbers AND an NL-derived set:
-/sweep #3310 #3312 and any other loom:issue with 'docs' in the title
+/loom:sweep #3310 #3312 and any other loom:issue with 'docs' in the title
 
 # Dry-run a NL-derived candidate set before committing to side effects:
-/sweep all loom:curated issues --dry-run
+/loom:sweep all loom:curated issues --dry-run
 ```
 
 ### Clarification triggers (Mode B asks before spawning)
 
 ```bash
 # Ambiguous time window — asks "what duration do you mean?"
-/sweep recent loom:issue items
+/loom:sweep recent loom:issue items
 
 # Out-of-band query — gh issue list cannot inspect file paths in the diff
-/sweep issues labeled loom:issue except the ones touching loom-daemon
+/loom:sweep issues labeled loom:issue except the ones touching loom-daemon
 
 # Unknown label — 'bug' is not in the repo's label set (from `gh label list`); ask which label was meant
-/sweep all my agent-filed bugs that aren't blocked
+/loom:sweep all my agent-filed bugs that aren't blocked
 
 # Pure nonsense — no derivable candidate set
-/sweep nonsense gibberish
+/loom:sweep nonsense gibberish
 
 # Ambiguous between Mode B (issues) and Mode C (PRs) — loom:review-requested
 # is PR-only but the description does not say "PRs". Ask which was meant.
-/sweep all loom:review-requested
+/loom:sweep all loom:review-requested
 ```
 
 ### Mode C — PR-set mode (explicit `--prs` flag)
@@ -324,23 +324,23 @@ The subagent-path target is **soft** — there is no hard upper bound and the wa
 ```bash
 # Explicit numeric PR list — each PR routed by its current label
 # (review-requested → Judge, changes-requested → Doctor→Judge, loom:pr → Merge)
-/sweep --prs 100 101 102
+/loom:sweep --prs 100 101 102
 
 # Leading # is allowed
-/sweep --prs #100 #101 #102
+/loom:sweep --prs #100 #101 #102
 
-# Single PR, equivalent to /shepherd-style back-half-only handling for that PR
-/sweep --prs 100
+# Single PR — back-half-only handling (Judge → Doctor → Merge) for that PR
+/loom:sweep --prs 100
 
 # Dry-run a PR-set plan — prints per-PR action plan and EXITs without mutating
-/sweep --prs 100 101 102 --dry-run
+/loom:sweep --prs 100 101 102 --dry-run
 
 # NL description with explicit flag — translates to: gh pr list --label loom:pr --state open --limit 100
-/sweep --prs all open loom:pr
+/loom:sweep --prs all open loom:pr
 
 # Compound filter — translates to:
 #   gh pr list --label loom:review-requested --author @me --state open --limit 100
-/sweep --prs all my review-requested PRs
+/loom:sweep --prs all my review-requested PRs
 ```
 
 ### Mode C — PR-set mode (NL trigger, no flag)
@@ -348,25 +348,25 @@ The subagent-path target is **soft** — there is no hard upper bound and the wa
 ```bash
 # "PRs" in the description selects Mode C even without --prs:
 # translates to: gh pr list --label loom:pr --state open --limit 100
-/sweep all open loom:pr PRs
+/loom:sweep all open loom:pr PRs
 
 # "pull requests" also triggers Mode C:
-/sweep all loom:review-requested pull requests
+/loom:sweep all loom:review-requested pull requests
 
 # "merge-ready PRs" triggers Mode C:
-/sweep all merge-ready PRs
+/loom:sweep all merge-ready PRs
 ```
 
 ## Execution Model
 
-`/sweep` processes the candidate list in **waves**:
+`/loom:sweep` processes the candidate list in **waves**:
 
 - **Mode A/B (issue-set)**: the candidate list is partitioned into waves of up to `N = --builders-per-wave` issues, where an omitted flag resolves to the Stage -1 auto wave size (see "Resolve auto wave size" — up to 10 on the daemon path, core-scaled within `[3, 6]` on the subagent path, disk-clamped). Issues are picked into waves in order. Within a wave, builders are dispatched in parallel; across waves, processing is sequential. Each wave fully settles (all builders → per-PR Judge → optional Doctor → merge) before the next wave starts.
-- **Mode C (PR-set)**: the candidate list is processed in **size-1 waves** (one PR per wave). `--builders-per-wave` is ignored because there is no Builder phase. Each PR is routed per its current label (Judge / Doctor→Judge / Merge — see "PR-set Wave Lifecycle" below) and fully settles before the next PR is touched. Sequential per-PR processing matches the load-bearing #3289 sequencing rule and parallels the issue-side "per-PR Judge is sequential within a wave" policy.
+- **Mode C (PR-set)**: the candidate list is processed in **size-1 waves** (one PR per wave). `--builders-per-wave` is ignored because there is no Builder phase. Each PR is routed per its current label (Judge / Doctor→Judge / Merge — see "PR-set Wave Lifecycle" below) and fully settles before the next PR is touched. Sequential per-PR processing is a **width** choice — parallel Judge/Doctor across PRs is unbenchmarked and every wave member's Task result is read back into this orchestrator session (context pressure) — and parallels the issue-side "per-PR Judge is sequential within a wave" policy. It is **not** the #3289 rule, which governs nested (grandchild) dispatch depth, not wave width.
 
 ### CRITICAL: Only Builders parallelize — issue-creating roles must be serialized (issue #3707)
 
-**Waves parallelize Builders only.** The reason a wave can safely fan out `N` agents at once is that each Builder works in an isolated git worktree and produces **exactly one PR at the end** — no shared mutable forge state is touched mid-run, so two concurrent Builders never collide. `/sweep` itself only ever dispatches Builders (plus per-issue Curator/Judge/Doctor, which run **sequentially within a wave**), so today's wave loop is safe by construction.
+**Waves parallelize Builders only.** The reason a wave can safely fan out `N` agents at once is that each Builder works in an isolated git worktree and produces **exactly one PR at the end** — no shared mutable forge state is touched mid-run, so two concurrent Builders never collide. `/loom:sweep` itself only ever dispatches Builders (plus per-issue Curator/Judge/Doctor, which run **sequentially within a wave**), so today's wave loop is safe by construction.
 
 **Never dispatch two or more issue-creating agents concurrently.** Agents that **create issues** — Architect proposals, Curator oversized-issue decomposition, Champion epic-phase creation — mutate the forge's **shared, server-assigned issue-number space** with no client-side coordination, transaction, or idempotency key. When two such agents run `gh issue create` bursts at the same time they **race on issue numbers and cross-contaminate bodies** (one epic's title paired with another's body), and any recovery/retry loop that PATCHes-by-title amplifies the damage by winning every write race against the other still-active filer. This is not hypothetical: it was observed 2026-07-21 on a 4-wide wave (1 builder + 3 architects) — 2 duplicate issues, 3 with mismatched title/body, and a corrupted roadmap comment, all needing manual reconciliation (#3707).
 
@@ -374,9 +374,9 @@ Concrete rules for anyone extending this skill or hand-driving a wave:
 
 - **Do NOT construct a mixed wave** that places any issue-creating role (Architect / Curator-decomposition / Champion epic-phase) alongside Builders — or alongside another issue-creating agent. That exact `1 builder + 3 architects` shape is the footgun this section forbids.
 - **Serialize issue-creating agents**: one must finish its entire `gh issue create` burst before the next starts. A recovery/retry loop must never run against a still-active concurrent filer. **"Serialize" here means awaited-to-completion, not merely dispatched-with-a-sync-flag** — see "Subagent dispatch is async-only" below (#3822).
-- Parallel **Builders** remain safe and are the only role `/sweep` fans out — this is unchanged.
+- Parallel **Builders** remain safe and are the only role `/loom:sweep` fans out — this is unchanged.
 
-Heavier mitigations (a per-wave issue-filing lock, an epic-scoped idempotency UUID + post-create reconciliation, or a serialized issue-filing sub-phase inside `/sweep`) are **deferred, out-of-scope follow-ups** to this documentation guardrail — build them only if serialization-by-convention proves insufficient in practice (#3707).
+Heavier mitigations (a per-wave issue-filing lock, an epic-scoped idempotency UUID + post-create reconciliation, or a serialized issue-filing sub-phase inside `/loom:sweep`) are **deferred, out-of-scope follow-ups** to this documentation guardrail — build them only if serialization-by-convention proves insufficient in practice (#3707).
 
 ### CRITICAL: Subagent dispatch is async-only — you MUST block explicitly (issue #3822)
 
@@ -390,15 +390,15 @@ Therefore, at **every** dispatch site where this skill sequences one phase after
 
 **"Serialized" therefore means awaited-to-completion, not merely dispatched-with-a-sync-flag.** The #3707 rule above depends on this: serializing issue-creating agents is only safe if each is explicitly awaited to completion before the next is dispatched — a `run_in_background: false` that the harness ignores would silently overlap them.
 
-### CRITICAL: One level deep — never spawn `/shepherd` as a subagent
+### CRITICAL: One level deep — never spawn a nested orchestrator (`/loom:sweep`) as a subagent
 
-`/sweep` dispatches `loom-builder`, `loom-judge`, and `loom-doctor` subagents **directly from this orchestrator session** in a single tool-call block. This is **one level deep** and is empirically safe for `N` up to at least 3.
+`/loom:sweep` dispatches `loom-builder`, `loom-judge`, and `loom-doctor` subagents **directly from this orchestrator session** in a single tool-call block. This is **one level deep** and is empirically safe for `N` up to at least 3.
 
-**Do NOT, under any circumstances, dispatch `/shepherd` as a subagent from `/sweep`.** That would be two levels deep (parent Claude → `/shepherd` Task → builder/judge Task) and triggers the parallel-shepherd stall hazard tracked in #3289 (stream-pump dies on parallel grandchildren). The wave loop in this skill is the architectural answer to that race — preserve it.
+**Do NOT, under any circumstances, dispatch a nested orchestrator skill (`/loom:sweep`) as a subagent from `/loom:sweep`.** That would be two levels deep (parent Claude → `/loom:sweep` Task → builder/judge Task) and triggers the nested-dispatch stall hazard tracked in #3289 (stream-pump dies on parallel grandchildren). The wave loop in this skill is the architectural answer to that race — preserve it.
 
-Concretely, when this skill says "dispatch builders for the wave", that means: in a single tool-call block, invoke `loom-builder` once per issue in the wave (e.g., three parallel `Task` calls if `N=3`). It does **not** mean invoke `/shepherd` three times.
+Concretely, when this skill says "dispatch builders for the wave", that means: in a single tool-call block, invoke `loom-builder` once per issue in the wave (e.g., three parallel `Task` calls if `N=3`). It does **not** mean invoke `/loom:sweep` three times.
 
-If a future maintainer is tempted to "simplify" by replacing the wave-loop with parallel `/shepherd` calls: don't. Read #3289, then read this section again.
+If a future maintainer is tempted to "simplify" by replacing the wave-loop with parallel `/loom:sweep` calls: don't. Read #3289, then read this section again.
 
 ### Model selection for subagent dispatch (issue #3477, Phase 1)
 
@@ -588,13 +588,13 @@ The harvest parses each joined `agent-<id>.jsonl` transcript's `usage` blocks (i
 
 ### Other constraints
 
-- **Do NOT write to `.loom/daemon-state.json`.** That file is owned by the standalone daemon. `/sweep` runs independently and must not race with the daemon on shepherd-slot bookkeeping. Reading `daemon-state.json` for situational awareness is fine; writing is not.
+- **Do NOT write to `.loom/daemon-state.json`.** That file is owned by the standalone daemon. `/loom:sweep` runs independently and must not race with the daemon on shepherd-slot bookkeeping. Reading `daemon-state.json` for situational awareness is fine; writing is not.
 
-## Sweep Run Identity + Peer-`/sweep` Detection (#3768)
+## Sweep Run Identity + Peer-`/loom:sweep` Detection (#3768)
 
-Before **any** other stage — including Backend detection (Stage -1), the dry-run gate, and all wave lifecycles — establish a **stable identity for this sweep invocation** and probe for a concurrently-running peer `/sweep`. This runs for **all modes (A, B, and C)** — it is *not* short-circuited by Mode C or `--no-daemon` (those only affect the Stage -1 backend probes below).
+Before **any** other stage — including Backend detection (Stage -1), the dry-run gate, and all wave lifecycles — establish a **stable identity for this sweep invocation** and probe for a concurrently-running peer `/loom:sweep`. This runs for **all modes (A, B, and C)** — it is *not* short-circuited by Mode C or `--no-daemon` (those only affect the Stage -1 backend probes below).
 
-This section exists because `/sweep` was originally hardened (#3373 checkpoints, #3648 baseline) assuming a single sweep instance per repo. Two concurrent `/sweep` runs in the same repo (observed live 2026-07-22) collided on shared run-state: they shared the single fixed main-clean baseline path (one clobbered the other's pre-sweep snapshot), and their checkpoints were indistinguishable because `task_id` was `sweep-$$` — the PID of each Bash *subshell*, which varies *within* a single sweep across tool calls, not a stable per-invocation id.
+This section exists because `/loom:sweep` was originally hardened (#3373 checkpoints, #3648 baseline) assuming a single sweep instance per repo. Two concurrent `/loom:sweep` runs in the same repo (observed live 2026-07-22) collided on shared run-state: they shared the single fixed main-clean baseline path (one clobbered the other's pre-sweep snapshot), and their checkpoints were indistinguishable because `task_id` was `sweep-$$` — the PID of each Bash *subshell*, which varies *within* a single sweep across tool calls, not a stable per-invocation id.
 
 ### Step 0a: Generate the stable run id (once, at sweep start)
 
@@ -621,14 +621,14 @@ At sweep completion (or abort), remove this run's registry entry:
 
 This is best-effort cleanup — a dead run's entry is also pruned automatically by any later sweep's peer scan (dead-PID liveness check), so a crash that skips cleanup never leaves a permanent false-positive.
 
-### Step 0b: Peer-`/sweep` detection (loud, NON-BLOCKING)
+### Step 0b: Peer-`/loom:sweep` detection (loud, NON-BLOCKING)
 
-Immediately after registering, probe for other **live** `/sweep` runs in this repo and warn if any are found — never block, never auto-stop (mirroring the Daemon Coexistence contract):
+Immediately after registering, probe for other **live** `/loom:sweep` runs in this repo and warn if any are found — never block, never auto-stop (mirroring the Daemon Coexistence contract):
 
 ```bash
 PEERS=$(./.loom/scripts/sweep-run-registry.sh peers "$RUN_ID")
 if [[ -n "$PEERS" ]]; then
-  echo "⚠️  ANOTHER /sweep IS RUNNING IN THIS REPO:" >&2
+  echo "⚠️  ANOTHER /loom:sweep IS RUNNING IN THIS REPO:" >&2
   echo "$PEERS" | while read -r rid pid ts; do
     echo "       run $rid (pid $pid, started $ts)" >&2
   done
@@ -640,7 +640,7 @@ if [[ -n "$PEERS" ]]; then
 fi
 ```
 
-The `peers` subcommand only reports runs whose recorded PID is still alive (`kill -0`); it prunes any dead-PID entry as a side effect, so a sweep killed with SIGKILL mid-run does not produce a false-positive warning forever. Empty output → no peer → the single-sweep case, no warning printed (byte-for-byte the prior behaviour). **Do not block, do not auto-stop the peer, do not abort** — the peer sweep is legitimate; this is situational awareness only. See "Coexistence (peer `/sweep` and legacy daemon)" for how this relates to the legacy daemon-PID check.
+The `peers` subcommand only reports runs whose recorded PID is still alive (`kill -0`); it prunes any dead-PID entry as a side effect, so a sweep killed with SIGKILL mid-run does not produce a false-positive warning forever. Empty output → no peer → the single-sweep case, no warning printed (byte-for-byte the prior behaviour). **Do not block, do not auto-stop the peer, do not abort** — the peer sweep is legitimate; this is situational awareness only. See "Coexistence (peer `/loom:sweep` and legacy daemon)" for how this relates to the legacy daemon-PID check.
 
 ## Stage -1: Backend detection (Phase D of #3449)
 
@@ -949,7 +949,7 @@ These are the AC #3 and AC #4 contracts, written for the operator.
 - **Does not subscribe to the Phase B event bus.** Subscription is consumed by long-running monitors and the spawn loop, not by this skill. Phase D is dispatch-only.
 - **Does not retry probe failures.** Either probe returns within 500ms (or its natural latency) and is treated as authoritative; no retry, no backoff.
 - **Does not mutate any forge state** during the probes. `mcp__loom__list_sweeps` and the local pool checks are read-only. Even in the daemon path, mutation happens inside the daemon-side child sweep, not in this orchestrator session.
-- **Does not log to `.loom/daemon-state.json` or any daemon-owned state file.** Read-only access is fine for situational awareness; writes are forbidden (same constraint as the legacy-daemon subsection of "Coexistence (peer `/sweep` and legacy daemon)").
+- **Does not log to `.loom/daemon-state.json` or any daemon-owned state file.** Read-only access is fine for situational awareness; writes are forbidden (same constraint as the legacy-daemon subsection of "Coexistence (peer `/loom:sweep` and legacy daemon)").
 - **Does not re-probe or re-dispatch to the daemon when it is itself a daemon-dispatched child (#3829).** If `LOOM_SWEEP_CLAIM_OWNED` is set, the child is already the daemon's work — the `DECIDE` tree short-circuits to `use_subagent()` **before** `PROBE_DAEMON` runs, so no `mcp__loom__list_sweeps` (and no `mcp__loom__dispatch_sweep` of its own issue) is ever issued back into the spawning daemon. Re-probing/re-dispatching there is circular by construction and, in a headless `-p` session with no operator to interrupt a stuck tool call, was the cause of the idle-hang this rule removes.
 
 ## 0. Dry-run gate (if `--dry-run`)
@@ -977,7 +977,7 @@ If `--dry-run` was supplied, **this stage runs before any mutation** and EXITs a
 **Issue-set output spec** (Modes A and B; minimum useful — do **not** add token-pool selection or agent dispatch internals):
 
 ```
-/sweep --dry-run plan: M candidate(s) across W wave(s) (wave size 10, auto; mechanism=daemon detached-process)
+/loom:sweep --dry-run plan: M candidate(s) across W wave(s) (wave size 10, auto; mechanism=daemon detached-process)
   Wave sizing: daemon + multi-account pool → detached-process path (target 10)
 
   Wave 1:
@@ -1030,7 +1030,7 @@ Each stacked child's per-candidate action then reads e.g. `→ would build (stac
 **PR-set output spec** (Mode C):
 
 ```
-/sweep --prs --dry-run plan: M candidate(s) across M wave(s) (PR-set mode, --builders-per-wave ignored)
+/loom:sweep --prs --dry-run plan: M candidate(s) across M wave(s) (PR-set mode, --builders-per-wave ignored)
 
   Wave 1:
     PR #200  "Add foo widget"                labels: loom:review-requested        → would Judge
@@ -1078,7 +1078,7 @@ LABELS_BEFORE=$(gh pr view P --json labels --jq '[.labels[].name]|sort')   # Mod
 ISSUE_LABELS_BEFORE=$(gh issue view N --json labels --jq '[.labels[].name]|sort')  # Modes A/B
 PRS_BEFORE=$(gh pr list --state open --json number --jq '[.[].number]|sort')
 WORKTREES_BEFORE=$(ls .loom/worktrees/ 2>/dev/null | wc -l)
-# Run: /sweep --dry-run ...   (any mode)
+# Run: /loom:sweep --dry-run ...   (any mode)
 # All three (or four, for Mode C) must be unchanged after the dry-run returns.
 ```
 
@@ -1126,7 +1126,7 @@ Apply exactly one of the three branches below, based on the PR's current label:
 #### C1a. `loom:review-requested` → Judge phase only
 
 - Load and follow the instructions in `.claude/commands/loom/judge.md` for this PR.
-- Dispatch `loom-judge` as a **single subagent Task** from this orchestrator session. Do **NOT** invoke `/shepherd` or `/judge` slash-commands as subagents — see "CRITICAL: One level deep" in the Execution Model.
+- Dispatch `loom-judge` as a **single subagent Task** from this orchestrator session. Do **NOT** invoke `/loom:sweep` or `/judge` slash-commands as subagents — see "CRITICAL: One level deep" in the Execution Model.
 - If a previous Judge attempt for this PR died mid-flight without a fresh checkpoint (rate limit, crash), re-verify forge state and complete only the missing steps before re-dispatching — see "Mid-phase-death recovery" in the Wave Lifecycle (the rule is phase-generic; Mode C inherits it, same as the Doctor-cycle cap).
 - Expected exit states:
   - **Approve** → PR labeled `loom:pr` by Judge. If a closing-issue checkpoint is in scope, write `judge-done`:
@@ -1142,7 +1142,7 @@ Apply exactly one of the three branches below, based on the PR's current label:
 If the PR entered the wave already labeled `loom:changes-requested` (e.g., from a previous Judge run), or just transitioned there from C1a, run inline Doctor → Judge cycles for this PR — **up to `sweep.max_doctor_cycles`** (default 1; see "Doctor-cycle cap" in the Execution Model):
 
 - Load and follow the instructions in `.claude/commands/loom/doctor.md` for this PR.
-- Dispatch `loom-doctor` as a **single subagent Task** from this orchestrator session. Do **NOT** invoke `/shepherd` or `/doctor` slash-commands as subagents — see "CRITICAL: One level deep".
+- Dispatch `loom-doctor` as a **single subagent Task** from this orchestrator session. Do **NOT** invoke `/loom:sweep` or `/doctor` slash-commands as subagents — see "CRITICAL: One level deep".
 - If a previous Doctor attempt for this PR died mid-flight without a fresh `doctor-done` checkpoint (rate limit, crash), re-verify forge state (pushed commit? already re-labeled `loom:review-requested`?) and complete only the missing steps rather than duplicating the pushed fix — see "Mid-phase-death recovery" in the Wave Lifecycle (inherited here, same as the Doctor-cycle cap).
 - **Model escalation (#3481)**: Mode C inherits the issue-side rule unchanged — this Doctor is dispatched because of a `loom:changes-requested` rejection, so resolve its model per "Model escalation on Judge rejection" in the Execution Model: pass `ladder[1]` from `sweep.escalation` (default ladder: `opus`) via the Task tool's `model` parameter, **unless** a tier-1/tier-2 pin applies (pins win) or escalation is disabled (`[]`/`false`).
 - Doctor addresses the judge feedback, commits the fixes, pushes, and re-labels the PR `loom:review-requested`.
@@ -1194,7 +1194,7 @@ Mode C waves are size-1, so "wave settled" is synonymous with "this PR reached a
 When the entire PR list has been processed, print a per-PR summary:
 
 ```
-/sweep --prs complete. Processed M PR(s):
+/loom:sweep --prs complete. Processed M PR(s):
 
   PR #200  → merged                                                                  [judged, merged]
   PR #201  → blocked (judge requested changes after doctor cycle exhausted)          [judged, doctor, judged]
@@ -1211,11 +1211,11 @@ Total: 3 merged, 1 blocked, 2 skipped, 1 rate-limited (unresumable).
 
 ## Wave Lifecycle (Modes A and B only — issue-set)
 
-For each wave `W` (partition of the issue list into chunks of up to `--builders-per-wave` candidates, processed in given order), execute the full lifecycle below. **All stages are mandatory** for every issue — do not skip any stage (CLAUDE.md "Shepherd Lifecycle (MANDATORY)"). This section applies to Modes A and B only — Mode C uses the shorter "PR-set Wave Lifecycle" section above.
+For each wave `W` (partition of the issue list into chunks of up to `--builders-per-wave` candidates, processed in given order), execute the full lifecycle below. **All stages are mandatory** for every issue — do not skip any stage (CLAUDE.md "Sweep Lifecycle (MANDATORY)"). This section applies to Modes A and B only — Mode C uses the shorter "PR-set Wave Lifecycle" section above.
 
 > **Auto-stack pre-partition pass (only when `AUTO_STACK=true`, #3759).** Before partitioning the candidate list into waves, run the detection + edge-resolution + topological-ordering pass in "Auto-stack detection and wave ordering (`--auto-stack`, #3759)": read each candidate's `body` (one added field on the per-issue `gh issue view` already issued at pre-flight step 1), resolve same-candidate-set `Depends on #A` / `Requires #A` edges into the per-issue `DEPENDS_ON[N]` map, reorder so every parent's wave is at or before its child's wave, and — if ≥1 edge survived — print the "Detected stacking pairs" block and (Mode A) prompt for confirmation. When zero edges survive (or the flag is absent), partition proceeds on the original input order exactly as today. The per-issue `DEPENDS_ON[N]` map then feeds the Builder-phase gated path below.
 
-See `.claude/commands/loom/shepherd-lifecycle.md` for the canonical phase-by-phase reference, label state machine, and recovery procedures. The summary below tells you which skill to invoke at each phase; the lifecycle reference tells you what each phase does in detail.
+The numbered phases below (Curator → Builder → Judge → Doctor → Merge) are the canonical phase-by-phase reference for this skill — including the label state machine and mid-phase-death recovery procedures. Each phase step tells you which subagent to dispatch and what forge state it should leave behind.
 
 ### 0. Snapshot the main-worktree baseline (once, before wave 1) (#3648)
 
@@ -1226,7 +1226,7 @@ MAIN_CLEAN_BASELINE=".loom/sweep-checkpoint/main-clean-baseline-${RUN_ID}.txt"
 ./.loom/scripts/check-main-clean.sh --snapshot "$MAIN_CLEAN_BASELINE"
 ```
 
-Capture this **once, before wave 1 — never per-wave**. The baseline must reflect the pre-sweep state so that if an early wave contaminates main and the dirt is not reverted, every later wave's backstop still flags it (a per-wave re-snapshot would silently absorb that contamination into the "pre-existing" set). The baseline path is **keyed by this sweep's `RUN_ID`** (`main-clean-baseline-${RUN_ID}.txt`, not a fixed `main-clean-baseline.txt`) so that a **concurrent peer `/sweep` never reads or clobbers this run's baseline** (#3768): before the RUN_ID keying, a second sweep re-snapshotting the shared fixed path mid-run of the first could silently absorb real contamination into the "pre-existing" set. The path is a per-sweep-run transient under `.loom/sweep-checkpoint/` whose lifetime is this sweep invocation. `.loom/sweep-checkpoint/` is gitignored in a current install, but a consumer repo's installed loom-managed `.gitignore` block can drift and omit it — so rather than depend on the consumer's `.gitignore` being up to date, `check-main-clean.sh` also excludes `.loom/sweep-checkpoint/` (and the other Loom-owned transient state paths) internally (#3778), so a stale consumer `.gitignore` no longer false-positives the backstop on it. `check-main-clean.sh` needs no change — it already accepts an arbitrary `--snapshot FILE` / `--baseline FILE` path; only this caller-side path construction is keyed by `RUN_ID`. If the snapshot step fails for any reason, proceed anyway — step 4's backstop falls back to the whole-status hard-fail when the baseline file is missing (fail-safe, never a silent pass).
+Capture this **once, before wave 1 — never per-wave**. The baseline must reflect the pre-sweep state so that if an early wave contaminates main and the dirt is not reverted, every later wave's backstop still flags it (a per-wave re-snapshot would silently absorb that contamination into the "pre-existing" set). The baseline path is **keyed by this sweep's `RUN_ID`** (`main-clean-baseline-${RUN_ID}.txt`, not a fixed `main-clean-baseline.txt`) so that a **concurrent peer `/loom:sweep` never reads or clobbers this run's baseline** (#3768): before the RUN_ID keying, a second sweep re-snapshotting the shared fixed path mid-run of the first could silently absorb real contamination into the "pre-existing" set. The path is a per-sweep-run transient under `.loom/sweep-checkpoint/` whose lifetime is this sweep invocation. `.loom/sweep-checkpoint/` is gitignored in a current install, but a consumer repo's installed loom-managed `.gitignore` block can drift and omit it — so rather than depend on the consumer's `.gitignore` being up to date, `check-main-clean.sh` also excludes `.loom/sweep-checkpoint/` (and the other Loom-owned transient state paths) internally (#3778), so a stale consumer `.gitignore` no longer false-positives the backstop on it. `check-main-clean.sh` needs no change — it already accepts an arbitrary `--snapshot FILE` / `--baseline FILE` path; only this caller-side path construction is keyed by `RUN_ID`. If the snapshot step fails for any reason, proceed anyway — step 4's backstop falls back to the whole-status hard-fail when the baseline file is missing (fail-safe, never a silent pass).
 
 ### Checkpoint-driven resume (#3373)
 
@@ -1369,7 +1369,7 @@ If `CHECKPOINT_PHASE` is `judge-done` or `doctor-done`, see the corresponding sk
 
 For issues without `builder-done`-or-later checkpoints, proceed with the normal Builder dispatch:
 
-Dispatch up to `min(resolved-wave-size, surviving-candidates-in-wave-needing-builder)` `loom-builder` subagents **in a single tool-call block** from this orchestrator session, where `resolved-wave-size` is the explicit `--builders-per-wave` value or, when the flag was omitted, the Stage -1 auto wave size ("Resolve auto wave size"). Note this Wave Lifecycle is the **subagent** path, so the auto size here is core-scaled within `[3, 6]` (#3289-safe floor 3, ceiling 6, #3693) — the daemon path never runs this section (it dispatches detached processes and exits at Stage -1). **Do NOT invoke `/shepherd` as a subagent here** — see the "One level deep" rule in Execution Model above.
+Dispatch up to `min(resolved-wave-size, surviving-candidates-in-wave-needing-builder)` `loom-builder` subagents **in a single tool-call block** from this orchestrator session, where `resolved-wave-size` is the explicit `--builders-per-wave` value or, when the flag was omitted, the Stage -1 auto wave size ("Resolve auto wave size"). Note this Wave Lifecycle is the **subagent** path, so the auto size here is core-scaled within `[3, 6]` (#3289-safe floor 3, ceiling 6, #3693) — the daemon path never runs this section (it dispatches detached processes and exits at Stage -1). **Do NOT invoke `/loom:sweep` as a subagent here** — see the "One level deep" rule in Execution Model above.
 
 Each builder is responsible for:
 
@@ -1448,7 +1448,7 @@ The step is **best-effort** — a reconciliation failure never fails the parent 
 
 **Rebase-on-parent-amend now ships too (v2 item 3, #3747).** Items 1 and 2 both handle the *parent-merge* moment; item 3 closes the far more common *pre-merge* case: while a stacked parent's PR (`feature/issue-<parent>`) is still open under review and Doctor amends the parent branch (interactive rewrite or additive commits + force-with-lease), any child that branched off the parent's *pre-amend* tip goes silently stale. The standalone `./.loom/scripts/rebase-stacked-children.sh feature/issue-<parent>` discovers open child PRs with the same live-forge query (`gh pr list --base feature/issue-<parent> --state open`), detects staleness per child via `git merge-base --is-ancestor origin/<parent> origin/<child>` (up-to-date children are skipped), and reuses item 1's safe/unsafe split on the child **issue's** `loom:building` label: safe stale children are rebased onto the parent's current tip (`git rebase origin/<parent> <child>` + `git push --force-with-lease`, **base NOT retargeted** — the child stays stacked on the parent), while unsafe children (issue still `loom:building`) get a deferred-rebase comment instead. It is manual-first (like v1's `reconcile-stack.sh`): **Doctor runs it as a documented workflow step 9a** after pushing to a `feature/issue-<N>` branch (see `doctor.md`), best-effort — a failure never fails the Doctor's own work. `--dry-run` previews the per-child outcome.
 
-**Deferred (v2 epic #3747, not yet implemented):** **dependency auto-detection** (broader cross-reference union-probe form — the narrower same-`/sweep`-candidate-set case already ships as `--auto-stack`, #3759; see the section below), **diamonds / multi-parent**, and **auto-detach**. (The **merge-ordering guard** shipped as v2 item 2, and **rebase-on-parent-amend** as v2 item 3 — see above.)
+**Deferred (v2 epic #3747, not yet implemented):** **dependency auto-detection** (broader cross-reference union-probe form — the narrower same-`/loom:sweep`-candidate-set case already ships as `--auto-stack`, #3759; see the section below), **diamonds / multi-parent**, and **auto-detach**. (The **merge-ordering guard** shipped as v2 item 2, and **rebase-on-parent-amend** as v2 item 3 — see above.)
 
 ### Auto-stack detection and wave ordering (`--auto-stack`, #3759)
 
@@ -1476,7 +1476,7 @@ A matched `#A` becomes a **stacking edge only when `#A` is also a member of this
 
 **6. Operator confirmation — reuse the existing gate.** When `--auto-stack` finds ≥1 edge, the "Detected stacking pairs" block (see the Stage 0 dry-run output spec) is printed as part of the same candidate-set display Mode B / `--dry-run` already show before awaiting confirmation. **Mode A** (explicit numeric list, today's no-prompt fast path) gains a confirmation prompt **only when `--auto-stack` actually found ≥1 edge** — a zero-edge `--auto-stack` run on Mode A stays prompt-free (identical to the flag being absent). Declining exits cleanly, matching every other gate in this skill. Mode B already prompts, so this adds only the stacking block to its existing display.
 
-**Explicitly out of scope for v1** (do not attempt here): file-overlap-heuristic auto-detection (#3729 rejected file paths as a topology signal — the reactive #3647 in-wave overlap-and-revalidate gate stays the backstop for *accidental* same-file collisions this feature doesn't stack); diamonds / multi-parent stacks; cross-`/sweep` coordination (two independently-running sweeps stacking each other's candidates is #3768's scope — this feature only ever stacks within one sweep invocation's own resolved candidate set); `Part of #A` / `Blocked by #A` timeline cross-reference detection; and any change to `merge-pr.sh` / `reconcile-stack.sh` / `worktree.sh` (reconciliation is reused unchanged).
+**Explicitly out of scope for v1** (do not attempt here): file-overlap-heuristic auto-detection (#3729 rejected file paths as a topology signal — the reactive #3647 in-wave overlap-and-revalidate gate stays the backstop for *accidental* same-file collisions this feature doesn't stack); diamonds / multi-parent stacks; cross-`/loom:sweep` coordination (two independently-running sweeps stacking each other's candidates is #3768's scope — this feature only ever stacks within one sweep invocation's own resolved candidate set); `Part of #A` / `Blocked by #A` timeline cross-reference detection; and any change to `merge-pr.sh` / `reconcile-stack.sh` / `worktree.sh` (reconciliation is reused unchanged).
 
 ### 5. Judge phase (sequential per PR within the wave)
 
@@ -1595,7 +1595,7 @@ Once the gate has passed (or is not configured), advance to the next wave. Do no
 When the entire list has been processed, print a summary table that includes wave membership for each issue:
 
 ```
-/sweep complete. Processed M issue(s) across W wave(s):
+/loom:sweep complete. Processed M issue(s) across W wave(s):
 
   #123  → merged  (PR #456)                                              [wave 1]
   #124  → blocked (judge requested changes, doctor cycle exhausted)      [wave 1]
@@ -1675,13 +1675,13 @@ This is advisory-only. The script always exits `0` and **must not block** the sw
 
 If the check warns, the operator should refresh local `main` (and re-sync installed copies if their install flow does so) before relying on stacked-dependency or auto-reconcile behavior mid-sweep.
 
-## Coexistence (peer `/sweep` and legacy daemon)
+## Coexistence (peer `/loom:sweep` and legacy daemon)
 
-`/sweep` coexists with two **distinct** kinds of other runner, detected by two **separate** mechanisms. Do not conflate them: "another `/sweep` is running" (peer detection, #3768) is not the same as "the legacy daemon is running" (daemon-PID check). Both warnings are **loud but non-blocking** — warn once, never auto-stop, never block.
+`/loom:sweep` coexists with two **distinct** kinds of other runner, detected by two **separate** mechanisms. Do not conflate them: "another `/loom:sweep` is running" (peer detection, #3768) is not the same as "the legacy daemon is running" (daemon-PID check). Both warnings are **loud but non-blocking** — warn once, never auto-stop, never block.
 
-### Peer `/sweep` detection (#3768)
+### Peer `/loom:sweep` detection (#3768)
 
-The primary coexistence case in the current architecture is **another live `/sweep` invocation in the same repo**. This is handled at sweep start by "Sweep Run Identity + Peer-`/sweep` Detection" (Step 0b, above): `sweep-run-registry.sh peers "$RUN_ID"` lists other runs whose registered liveness PID is still alive (pruning dead-PID entries so a SIGKILL'd peer never warns forever), and a loud non-blocking warning fires when any are found.
+The primary coexistence case in the current architecture is **another live `/loom:sweep` invocation in the same repo**. This is handled at sweep start by "Sweep Run Identity + Peer-`/loom:sweep` Detection" (Step 0b, above): `sweep-run-registry.sh peers "$RUN_ID"` lists other runs whose registered liveness PID is still alive (pruning dead-PID entries so a SIGKILL'd peer never warns forever), and a loud non-blocking warning fires when any are found.
 
 Two concurrent sweeps are now **run-state isolated**, not just label-isolated:
 
@@ -1695,24 +1695,24 @@ What remains a shared, un-isolated surface is the **default branch itself**: bot
 
 > **Note**: the legacy `./.loom/scripts/daemon.sh` was removed in #3432 and is not restored. The historical PID-file daemon (`.loom/daemon-loop.pid`) is not part of the current architecture; the check below is a defensive coexistence guard that fires only if such a process is somehow already running — normally a no-op. The Tier 2 dispatch backend is now the Rust `loom-daemon` binary (observed via `mcp__loom__list_sweeps`); the background agent-pool control surface is `.loom/bin/loom start|status|stop`.
 
-`/sweep` does not require the daemon and does not interact with `.loom/daemon-state.json` for writes. If a legacy daemon process is running, `/sweep` and the daemon may both try to claim the same `loom:issue` label. This is a **different** mechanism from peer-`/sweep` detection above — the daemon is identified by its own `.loom/daemon-loop.pid`, not by the `.loom/sweep-run/` registry.
+`/loom:sweep` does not require the daemon and does not interact with `.loom/daemon-state.json` for writes. If a legacy daemon process is running, `/loom:sweep` and the daemon may both try to claim the same `loom:issue` label. This is a **different** mechanism from peer-`/loom:sweep` detection above — the daemon is identified by its own `.loom/daemon-loop.pid`, not by the `.loom/sweep-run/` registry.
 
 **Coexistence behavior:** before the first wave, check whether the daemon is running. If it is, warn the user once at the start of the sweep:
 
 ```bash
 PID=$(cat .loom/daemon-loop.pid 2>/dev/null)
 if [[ -n "$PID" ]] && kill -0 "$PID" 2>/dev/null; then
-  echo "⚠️  Loom daemon is running (PID $PID). /sweep will race with the daemon"
+  echo "⚠️  Loom daemon is running (PID $PID). /loom:sweep will race with the daemon"
   echo "   for issues in the loom:issue queue. Consider stopping the pool first:"
   echo "       ./.loom/bin/loom stop"
 fi
 ```
 
-Do not auto-stop the daemon. Do not block on this warning — proceed with the sweep. The same dead-PID liveness pattern (`kill -0`) is used by peer-`/sweep` detection.
+Do not auto-stop the daemon. Do not block on this warning — proceed with the sweep. The same dead-PID liveness pattern (`kill -0`) is used by peer-`/loom:sweep` detection.
 
 ## Constraints
 
-- **Wave model, one level deep.** When `--builders-per-wave > 1` (Modes A/B only), dispatch `loom-builder` / `loom-judge` / `loom-doctor` subagents **directly from this orchestrator session** in a single tool-call block. In Mode C, dispatch `loom-judge` and `loom-doctor` as **single subagent Tasks** per PR (size-1 waves). **Never invoke `/shepherd`, `/judge`, or `/doctor` as a subagent from `/sweep`** — that is the two-levels-deep pattern that triggers the #3289 stall. See "CRITICAL: One level deep" in the Execution Model.
+- **Wave model, one level deep.** When `--builders-per-wave > 1` (Modes A/B only), dispatch `loom-builder` / `loom-judge` / `loom-doctor` subagents **directly from this orchestrator session** in a single tool-call block. In Mode C, dispatch `loom-judge` and `loom-doctor` as **single subagent Tasks** per PR (size-1 waves). **Never invoke `/loom:sweep`, `/judge`, or `/doctor` as a subagent from `/loom:sweep`** — that is the two-levels-deep pattern that triggers the #3289 stall. See "CRITICAL: One level deep" in the Execution Model.
 - **Per-PR Judge is sequential within a wave.** Builders parallelize (Modes A/B); judges do not. Mode C inherits this: PRs are processed one per size-1 wave. Don't parallelize judges or PRs without a separate design pass.
 - **Configurable Doctor→Judge cycle cap per PR (`sweep.max_doctor_cycles`, default 1).** Inline within the wave (Modes A/B issue-side and Mode C PR-side both enforce this). If Judge still requests changes after the configured number of Doctor passes, the PR is blocked — do not retry indefinitely. At the default cap of 1, the orchestrator may grant one extra bounded cycle when the second rejection is a demonstrably distinct defect (logged, single-use, never on an operator-raised cap) — see "Doctor-cycle cap".
 - **Mode C skips Curator, Approval gate, and Builder.** These phases already ran (the PR exists). Re-running them would be incorrect.
@@ -1724,23 +1724,23 @@ Do not auto-stop the daemon. Do not block on this warning — proceed with the s
 
 ## Limitations (Deferred for Follow-up Issues)
 
-The full `/sweep` design in #3298 includes many features that are intentionally **not** part of this skill yet. Each of these is a candidate follow-up issue:
+The full `/loom:sweep` design in #3298 includes many features that are intentionally **not** part of this skill yet. Each of these is a candidate follow-up issue:
 
 | Feature | Status | Notes |
 |---------|--------|-------|
-| Parallel waves (`--builders-per-wave N`) | **Implemented (#3316, auto default #3566, core-scaled #3693)** | Omitted flag resolves to an auto wave size at Stage -1 (#3566): up to 10 on the daemon detached-process path, core-scaled within `[3, 6]` (`clamp(floor((cores-2)/4), 3, 6)`, #3693) on the in-session subagent path. The `[3, 6]` band is **subagent-path-specific** (floor 3 is the #3289-safe validated minimum, ceiling 6 keeps a margin below single-account rate-limit burn and orchestrator context pressure — warns above only on explicit override `>= 7`); the daemon path scales to 10 because each sweep is an isolated process, not a nested subagent. This is a **width** knob — the #3289 "one level deep" nesting rule is unchanged: no `/shepherd` subagent. Issue-side only; ignored in Mode C. |
+| Parallel waves (`--builders-per-wave N`) | **Implemented (#3316, auto default #3566, core-scaled #3693)** | Omitted flag resolves to an auto wave size at Stage -1 (#3566): up to 10 on the daemon detached-process path, core-scaled within `[3, 6]` (`clamp(floor((cores-2)/4), 3, 6)`, #3693) on the in-session subagent path. The `[3, 6]` band is **subagent-path-specific** (floor 3 is the #3289-safe validated minimum, ceiling 6 keeps a margin below single-account rate-limit burn and orchestrator context pressure — warns above only on explicit override `>= 7`); the daemon path scales to 10 because each sweep is an isolated process, not a nested subagent. This is a **width** knob — the #3289 "one level deep" nesting rule is unchanged: no nested `/loom:sweep` subagent. Issue-side only; ignored in Mode C. |
 | Natural-language selectors (label/author/title/time-window filters via NL description) | **Implemented (#3318)** | Mode B in Arguments. Out-of-band queries (body/diff inspection, file-touch filters) still trigger clarification. |
-| Build-everything sentinel (`/sweep all`) | **Implemented (#3568; aggressive whole-backlog redefinition)** | Bare, sole `all` token (case-insensitive) resolves **every** open issue via `gh issue list --state open` (no label filter) and aggressively drives each toward a merged PR: curates uncurated/`loom:triage`/`loom:curating` issues, reclaims stale `loom:building` claims (one-time `recover-orphaned-shepherds.sh --recover` pass + `updatedAt` staleness), probes `loom:blocked` for a cleared blocker, fans `loom:epic` out to its `loom:epic-phase` children, and routes existing open PRs to Judge/Doctor/Merge via the #3359 probe (which takes precedence). Only `loom:operator-only` is hard-skipped. `all --prs` resolves every open PR (Mode C C0 filters non-actionable). Mandatory confirmation gate; `--dry-run` / `--builders-per-wave` / `--no-daemon` compose unchanged (recovery pass skipped under `--dry-run`). Multi-token `all …` phrases still route to Mode B/C. |
+| Build-everything sentinel (`/loom:sweep all`) | **Implemented (#3568; aggressive whole-backlog redefinition)** | Bare, sole `all` token (case-insensitive) resolves **every** open issue via `gh issue list --state open` (no label filter) and aggressively drives each toward a merged PR: curates uncurated/`loom:triage`/`loom:curating` issues, reclaims stale `loom:building` claims (one-time `recover-orphaned-shepherds.sh --recover` pass + `updatedAt` staleness), probes `loom:blocked` for a cleared blocker, fans `loom:epic` out to its `loom:epic-phase` children, and routes existing open PRs to Judge/Doctor/Merge via the #3359 probe (which takes precedence). Only `loom:operator-only` is hard-skipped. `all --prs` resolves every open PR (Mode C C0 filters non-actionable). Mandatory confirmation gate; `--dry-run` / `--builders-per-wave` / `--no-daemon` compose unchanged (recovery pass skipped under `--dry-run`). Multi-token `all …` phrases still route to Mode B/C. |
 | `--dry-run` | **Implemented (#3319, extended in #3384)** | Prints the candidate plan (with wave grouping) and exits without mutating labels, worktrees, or PRs. Issue-set (Modes A/B) and PR-set (Mode C) output formats. |
 | Existing-PR detection in pre-flight | **Implemented (#3359, #3677)** | Pre-flight probes the union of `closedByPullRequestsReferences` (closing-keyword PRs) **and** timeline `cross-referenced` open-PR events (non-closing `Part of #N` / `Contributes to #N` PRs); routes existing open linked PRs to Judge (or Merge if already `loom:pr`) instead of dispatching a duplicate Builder. Multi-PR ambiguity skips with a log. |
 | `loom:operator-only` enforcement | **Implemented (#3360)** | Pre-flight skips issues with `loom:operator-only` (human action required: credentials, infra, hardware). Champion `--merge` mode also refuses to auto-promote them. |
 | Checkpoint/resume after kill | **Implemented (#3373)** | Per-issue phase checkpoint at `.loom/sweep-checkpoint/issue-<N>.json`. Sweep reads on entry and skips completed phases. No mid-builder recovery — kill during Builder resumes at builder start, worktree preserved by `worktree.sh` idempotency. Mode C reuses the helper keyed by the PR's closing-issue number (`closingIssuesReferences`); PRs without a `Closes #N` reference run without checkpointing. |
 | PR-set mode (`--prs` flag and PR NL triggers; Judge/Doctor/Merge from current PR label) | **Implemented (#3384)** | Mode C. Skips Curator, Approval gate, Builder. Size-1 waves. `--builders-per-wave` ignored. Reuses issue-keyed checkpoint via `closingIssuesReferences`. |
 | Daemon backend detection (Stage -1) | **Implemented (#3454, daemon-owned-child short-circuit #3829)** | Strict-AND between daemon reachability and multi-account pool. Mode C, `--no-daemon`, and a daemon-dispatched child (`LOOM_SWEEP_CLAIM_OWNED` set, #3829) short-circuit to subagent — the last **before** any probe, so a daemon child never re-probes/re-dispatches the daemon that spawned it (the circular-round-trip idle-hang fix). No implicit auto-start. Dispatch-only — Phase D does not subscribe to the event bus. See "Stage -1: Backend detection". |
-| Concurrent-`/sweep` run-state isolation + peer detection | **Implemented (#3768)** | A stable per-sweep-run id (`sweep-run-registry.sh new`) is generated once at sweep start and threaded through all `--task-id` checkpoint writes and the main-clean baseline path (`main-clean-baseline-${RUN_ID}.txt`), so two concurrent sweeps no longer clobber each other's baseline or share an ambiguous `sweep-$$` `task_id`. Stage 0b adds a loud, NON-BLOCKING peer-`/sweep` warning via a dead-PID-pruned run registry (`.loom/sweep-run/`). Merge-target (default-branch) isolation is out of scope — that is #3759's stacking concern. See "Sweep Run Identity + Peer-`/sweep` Detection". |
+| Concurrent-`/loom:sweep` run-state isolation + peer detection | **Implemented (#3768)** | A stable per-sweep-run id (`sweep-run-registry.sh new`) is generated once at sweep start and threaded through all `--task-id` checkpoint writes and the main-clean baseline path (`main-clean-baseline-${RUN_ID}.txt`), so two concurrent sweeps no longer clobber each other's baseline or share an ambiguous `sweep-$$` `task_id`. Stage 0b adds a loud, NON-BLOCKING peer-`/loom:sweep` warning via a dead-PID-pruned run registry (`.loom/sweep-run/`). Merge-target (default-branch) isolation is out of scope — that is #3759's stacking concern. See "Sweep Run Identity + Peer-`/loom:sweep` Detection". |
 | `--max-waves` cap | Deferred | Operator-level brake on long sweeps. |
 | `--paused-merge` / `--no-judge` | Deferred | Merge-mode variants for trusted batches. |
-| `--include-blocked` (unblock pass) | Deferred | Currently `/sweep` skips `loom:blocked` issues outright. |
+| `--include-blocked` (unblock pass) | Deferred | Currently `/loom:sweep` skips `loom:blocked` issues outright. |
 | `--curator-also` (parallel curators on `loom:triage`) | Deferred | Parallel triage is a separate orchestration question. |
 | Config-driven defaults (`.loom/config.json` keys `sweep.*`) | **Partially implemented** | `sweep.escalation` (#3481, model ladder) and `sweep.max_doctor_cycles` (#3668, Doctor-cycle cap, default 1) are live and read at lifecycle-entry time. Other `sweep.*` knobs (e.g. `--max-waves` persistence) remain deferred. |
 | Disk-pressure *gate* on auto wave size | **Implemented (#3566)** | Stage -1 resolves the auto wave size against free space on the **worktree-root filesystem** (via `loom_worktree_root`, so it measures the dedicated scratch volume when `LOOM_WORKTREE_ROOT` / `worktree.root` is set — #3539/#3541), clamping the target down and logging the reason. `LOOM_PER_WORKTREE_GB` (default 2) is the per-worktree estimate. |
@@ -1748,14 +1748,14 @@ The full `/sweep` design in #3298 includes many features that are intentionally 
 | Doctor-cycle counting across PRs | Deferred | The per-PR cap is now configurable (`sweep.max_doctor_cycles`, #3668, default 1) with a default-cap distinct-defect grace cycle, enforced inline. A *cross-PR aggregate* cycle budget (e.g. "at most K total Doctor cycles across a whole sweep") is still deferred. |
 | Parallel Judges within a wave | Deferred | Sequential per-PR Judge today; needs benchmarking before parallelizing. Mode C is also strictly sequential per PR (size-1 waves). |
 | Parallel PRs in Mode C | Deferred | Mode C uses size-1 waves. Multi-PR-per-wave is feasible (one judge per PR in parallel) but inherits the same #3289 risk that gated parallel issue-side Judges. |
-| Mixed-mode invocations (some issues + some PRs in one `/sweep`) | Won't fix (split into two calls) | Routing logic for the cross product of issue-state × PR-state is complex; cleaner to require two invocations. |
+| Mixed-mode invocations (some issues + some PRs in one `/loom:sweep`) | Won't fix (split into two calls) | Routing logic for the cross product of issue-state × PR-state is complex; cleaner to require two invocations. |
 | Multi-closing-issue PRs (PR with `Closes #N` + `Closes #M`) | Partial — runs without checkpoint | Mode C logs all closing issues and proceeds with Judge/Doctor/Merge but skips checkpointing for the PR. Multi-key checkpoint variant is a follow-up. |
 | PRs without `Closes #N` references | Partial — runs without checkpoint | Mode C logs a warning and processes the PR without checkpointing. Judge/Doctor/Merge are idempotent at the GitHub-state level so re-running on the next sweep is safe. |
 | Cross-wave backfill on pre-flight skips | Won't fix | Intentionally clean wave boundaries — see step 1 of the Wave Lifecycle. |
 | Intra-wave collision guard (overlapping PRs off a shared base) | **Implemented (#3647)** | Step 7 runs a read-only file-path overlap probe before each in-wave merge; overlapping PRs are updated onto the just-merged `main` and re-Judged (or Doctor→re-Judge on `DIRTY`) before merging, disjoint PRs keep the fast path. Step 8 adds a post-wave `buildGate.command`-against-`main` integration gate — the load-bearing backstop for cross-file semantic coupling (source-vs-test) that path-overlap cannot see; halts the sweep on a red `main`. Symbol/AST-level overlap detection is out of scope. |
 | Spinoff-issue filing for out-of-scope discoveries | Deferred | Build it once we have richer summary output to surface them cleanly. |
 | Daemon `pipeline_state` situational awareness reads | Deferred | Skill only warns when the daemon is running. |
-| Top-level vs namespaced naming (`/sweep` vs `/loom:sweep`) | Open question | Ships as `/sweep` per the original task brief; rename later if convention favors `/loom:sweep`. See #3298 open question #1. |
+| Top-level vs namespaced naming (`/loom:sweep` vs `/loom:sweep`) | **Resolved** | Ships as the namespaced `/loom:sweep` (and `/loom:loom` for the daemon operator), matching CLAUDE.md and `help.md`. Originally #3298 open question #1. |
 
 For the full design discussion (including the open questions raised by the curator), see issue #3298.
 
@@ -1836,7 +1836,7 @@ Long-running monitors subscribe with a single `Request::SubscribeEvents { topics
 {"type": "SubscribeEvents", "payload": {"topics": ["sweep.issue.123", "sweep.global.completed"]}}
 ```
 
-The sweep child itself does **not** subscribe — it only publishes. Subscription is consumed by the spawn loop, the operator-facing monitoring tools slated for Phase C (#3454), and any custom MCP-bridged tool an operator wires up.
+The sweep child itself does **not** subscribe — it only publishes. Subscription is consumed by the operator-facing monitoring tools that shipped in Phase C (#3455) and any custom MCP-bridged tool an operator wires up.
 
 ### Failure modes (publisher side)
 
@@ -1846,9 +1846,9 @@ The sweep child itself does **not** subscribe — it only publishes. Subscriptio
 
 ### Out-of-scope for Phase B
 
-These are deferred to Phase C (#3454) and Phase D follow-ups — do **not** implement them in the sweep skill:
+These live in the daemon, not the sweep skill — do **not** implement them in the sweep skill. The operator-facing MCP tools shipped in Phase C (#3455); the rest are frozen non-goals:
 
-- Operator-facing MCP tools (`get_sweep_status`, `subscribe_to_events`, `tail_event_bus`) — Phase C.
+- Operator-facing MCP tools (`get_sweep_status`, `subscribe_to_events`, `tail_event_bus`) — daemon-side, shipped in Phase C (#3455).
 - New topics beyond the six listed — frozen for v0.10.0 per epic #3449; file a follow-up issue if you "need" one.
 - Distributed bus / cross-daemon coordination — explicit non-goal (single broker, in-process).
 - Persistent event log or replay — explicit non-goal (transient bus).
@@ -1856,7 +1856,7 @@ These are deferred to Phase C (#3454) and Phase D follow-ups — do **not** impl
 
 ## Reference Documentation
 
-- **Shepherd lifecycle**: `.claude/commands/loom/shepherd-lifecycle.md` — canonical per-issue lifecycle.
+- **Per-issue lifecycle**: the "Wave Lifecycle (Modes A and B only — issue-set)" section of this skill — canonical phase-by-phase reference (Curator → Builder → Judge → Doctor → Merge).
 - **Builder skill**: `.claude/commands/loom/builder.md`
 - **Judge skill**: `.claude/commands/loom/judge.md`
 - **Doctor skill**: `.claude/commands/loom/doctor.md`
@@ -1866,7 +1866,7 @@ These are deferred to Phase C (#3454) and Phase D follow-ups — do **not** impl
 - **Sweep checkpoint helper**: `./.loom/scripts/sweep-checkpoint.sh` — read/write/delete per-issue phase checkpoints for resume after kill (#3373). Mode C reuses this via the PR's closing-issue number when available.
 - **Original proposal & open questions**: issue #3298
 - **PR-set mode (Mode C) design**: issue #3384
-- **Parallel-shepherd stall hazard**: issue #3289
+- **Nested-dispatch stall hazard**: issue #3289
 - **Checkpoint/resume design**: issue #3373 (Phase 0 of #3372 shepherd/daemon deprecation epic)
 - **Daemon backend detection (Stage -1)**: issue #3454 (Phase D of #3449 daemon rebuild epic)
 - **Daemon dispatch MCP tool (`mcp__loom__dispatch_sweep`)**: issue #3452 (Phase A of #3449)
