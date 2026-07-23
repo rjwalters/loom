@@ -24,6 +24,22 @@
 //! - The 500ms timeout for the daemon Ping probe is documented (AC #2
 //!   — the implicit-fallback semantics).
 //!
+//! ---------------------------------------------------------------------------
+//! Assertion classification (#3877 — prose vs. contract)
+//! ---------------------------------------------------------------------------
+//! Every `contains()` assertion below is tagged PROSE or CONTRACT:
+//!
+//! - **PROSE** — a section title / wording that legitimately gets edited.
+//!   These assert STRUCTURE/PRESENCE (heading number, tolerant any-of
+//!   phrasings) rather than exact wording. Two prior red-main incidents
+//!   (#3830→#3834, #3856→#3863) came from pinned prose titles, so a rename
+//!   that keeps the section must NOT fail CI — only a deletion should.
+//! - **CONTRACT** — a stable identifier that MUST NOT drift: the decision-tree
+//!   probe/keyword tokens, the `PROBE_DAEMON AND PROBE_POOL` strict-AND marker,
+//!   the `500ms` timeout, the `mcp__loom__dispatch_sweep` tool name, the
+//!   `--no-daemon` flag, issue-number refs. These stay EXACT — their exactness
+//!   is their value.
+//!
 //! If the markdown structure intentionally changes (e.g. a follow-up
 //! issue revises the decision tree), update this test together with the
 //! markdown so the doc-lint stays in sync with the contract.
@@ -48,15 +64,21 @@ fn read_sweep_md() -> String {
     })
 }
 
-/// AC #1: assert the `## Stage -1: Backend detection` section header
-/// is present.
+/// AC #1: assert the Stage -1 section header is present.
 #[test]
 fn sweep_md_has_stage_minus_one_section() {
     let content = read_sweep_md();
+    // PROSE (structural): the stage is identified by its NUMBER (`-1`), which
+    // is the stable anchor; the "Backend detection …" title text is prose that
+    // can be reworded (cf. #3830→#3834 for a sweep-section rename that
+    // red-mained on a pinned title). Assert `## Stage -1:` — the heading exists
+    // by number — not the full title. A deletion of the stage removes the
+    // heading and still fails this check.
     assert!(
-        content.contains("## Stage -1: Backend detection"),
-        "expected `## Stage -1: Backend detection` section in sweep.md — \
-         the Phase D backend-detection stage is required by #3454 AC #1"
+        content.contains("## Stage -1:"),
+        "expected a `## Stage -1:` section header in sweep.md — the Phase D \
+         backend-detection stage is required by #3454 AC #1 (asserted by stage \
+         number, not by exact title wording)"
     );
 }
 
@@ -67,6 +89,9 @@ fn sweep_md_has_stage_minus_one_section() {
 #[test]
 fn sweep_md_decision_tree_documents_all_probes() {
     let content = read_sweep_md();
+    // CONTRACT: the four decision-tree identifiers are pseudocode tokens the
+    // Stage -1 spec pins verbatim. A rename here is a real spec/markdown drift,
+    // not an editorial edit — keep EXACT.
     let required_identifiers: &[&str] = &["PROBE_MODE", "PROBE_DAEMON", "PROBE_POOL", "DECIDE"];
     for id in required_identifiers {
         assert!(
@@ -86,7 +111,9 @@ fn sweep_md_decision_tree_documents_all_probes() {
 fn sweep_md_documents_strict_and_precedence() {
     let content = read_sweep_md();
 
-    // The literal decision-tree precedence string from the issue body.
+    // CONTRACT: the literal `PROBE_DAEMON AND PROBE_POOL` conjunction is the
+    // strict-AND logic marker. Keep EXACT — this is the negative guard that
+    // fails if the AND is ever relaxed to an OR / auto-start form.
     assert!(
         content.contains("PROBE_DAEMON AND PROBE_POOL"),
         "sweep.md is missing the literal `PROBE_DAEMON AND PROBE_POOL` \
@@ -94,9 +121,10 @@ fn sweep_md_documents_strict_and_precedence() {
          (no implicit auto-start, no `OR` fallback to daemon-without-pool)"
     );
 
-    // The prose explanation that either probe failing → subagent.
-    // Allow any of several equivalent phrasings to survive editorial
-    // changes, but require at least one.
+    // PROSE (structural / tolerant): the plain-English explanation that either
+    // probe failing → subagent is wording that legitimately gets edited. Accept
+    // any of several equivalent phrasings so an editorial reword survives, but
+    // require at least one so a deletion of the explanation still fails.
     let strict_and_phrases: &[&str] = &[
         "Strict AND",
         "strict AND",
@@ -121,6 +149,9 @@ fn sweep_md_documents_strict_and_precedence() {
 #[test]
 fn sweep_md_documents_mode_c_short_circuit() {
     let content = read_sweep_md();
+    // CONTRACT: `if Mode C: use_subagent()` is a literal decision-tree
+    // pseudocode line; the Mode-C-before-probe ordering is the contract. Keep
+    // EXACT.
     assert!(
         content.contains("if Mode C: use_subagent()"),
         "sweep.md is missing the literal `if Mode C: use_subagent()` \
@@ -135,10 +166,10 @@ fn sweep_md_documents_mode_c_short_circuit() {
 fn sweep_md_documents_no_daemon_flag() {
     let content = read_sweep_md();
 
-    // The flag itself must appear at least three times: once in the
-    // optional-flags list, once in the validation rules, and at least
-    // once in the new stage section (and the decision tree). Three is
-    // a lower bound; the real count is higher.
+    // CONTRACT: `--no-daemon` is a stable CLI flag name. The >= 3 occurrence
+    // floor is a structural presence check (optional-flags list + validation
+    // rules + Stage -1 section) that fails if the flag is dropped from any of
+    // its documented sites. Keep the flag name EXACT.
     let occurrences = content.matches("--no-daemon").count();
     assert!(
         occurrences >= 3,
@@ -148,8 +179,10 @@ fn sweep_md_documents_no_daemon_flag() {
          Stage -1 section (lower bound: 3 occurrences)"
     );
 
-    // The decision-tree line must mention --no-daemon as a short-circuit
-    // ahead of the daemon probe.
+    // CONTRACT (tolerant across pseudocode spellings): the decision-tree line
+    // must document `--no-daemon` as a short-circuit ahead of the daemon probe.
+    // The flag + `PROBE_DAEMON skipped` markers are the contract; the exact
+    // `elif` spelling may vary, so accept the documented variants.
     assert!(
         content.contains("elif --no-daemon: use_subagent()")
             || content.contains("elif NO_DAEMON: use_subagent()")
@@ -167,6 +200,8 @@ fn sweep_md_documents_no_daemon_flag() {
 #[test]
 fn sweep_md_documents_500ms_daemon_probe_timeout() {
     let content = read_sweep_md();
+    // CONTRACT: `500ms` is a numeric timeout value — the implicit-fallback
+    // semantic depends on the exact figure. Keep EXACT.
     assert!(
         content.contains("500ms"),
         "sweep.md is missing the `500ms` daemon probe timeout — \
@@ -183,7 +218,9 @@ fn sweep_md_documents_500ms_daemon_probe_timeout() {
 fn sweep_md_documents_smoke_test_recipes() {
     let content = read_sweep_md();
 
-    // Sub-2-second exit expectation (AC #3 documented expectation).
+    // PROSE (structural / tolerant): the sub-2-second exit expectation is
+    // wording; accept the documented spellings so a reword survives while a
+    // deletion of the expectation still fails.
     assert!(
         content.contains("< 2 seconds")
             || content.contains("sub-2-second")
@@ -192,7 +229,10 @@ fn sweep_md_documents_smoke_test_recipes() {
          daemon path — #3454 AC #3 requires this be documented"
     );
 
-    // Daemon-off / single-token fallthrough (AC #4).
+    // CONTRACT + tolerant prose: `PROBE_POOL` is a contract identifier that must
+    // be named in the fallthrough recipe; the single-token phrasing beside it is
+    // wording, so accept the documented variants. Together they fail if the
+    // daemon-off / solo-token recipe is deleted.
     assert!(
         content.contains("PROBE_POOL")
             && (content.contains("single-token")
@@ -210,6 +250,8 @@ fn sweep_md_documents_smoke_test_recipes() {
 #[test]
 fn sweep_md_references_dispatch_sweep_mcp_tool() {
     let content = read_sweep_md();
+    // CONTRACT: `mcp__loom__dispatch_sweep` is the exact MCP tool name (Phase A
+    // wire protocol). Keep EXACT.
     assert!(
         content.contains("mcp__loom__dispatch_sweep"),
         "sweep.md is missing the `mcp__loom__dispatch_sweep` MCP tool \
@@ -228,15 +270,17 @@ fn sweep_md_references_dispatch_sweep_mcp_tool() {
 #[test]
 fn sweep_md_stage_minus_one_wave_size_snippet_is_bash_3_2_portable() {
     let content = read_sweep_md();
+    // CONTRACT: `loom_wave_size_from_disk` is the exact helper name the
+    // regression guard anchors to. Keep EXACT.
     assert!(
         content.contains("loom_wave_size_from_disk"),
         "sweep.md is missing the `loom_wave_size_from_disk` wave-size \
          resolution snippet — #3765 regression guard cannot anchor to it"
     );
-    // Guard against the *invocation* form of the bash-4.0+ array-read
-    // builtins (`mapfile -…` / `readarray -…`). A prose mention of the
-    // word "mapfile" in an explanatory comment is fine — only executable
-    // reintroduction is the regression.
+    // CONTRACT (negative): guard against the *invocation* form of the bash-4.0+
+    // array-read builtins (`mapfile -…` / `readarray -…`). A prose mention of
+    // the word "mapfile" in an explanatory comment is fine — only executable
+    // reintroduction is the regression, so we pin the invocation token exactly.
     for bad in ["mapfile -", "readarray -"] {
         assert!(
             !content.contains(bad),
@@ -255,6 +299,11 @@ fn sweep_md_stage_minus_one_wave_size_snippet_is_bash_3_2_portable() {
 #[test]
 fn sweep_md_limitations_table_records_stage_minus_one_implemented() {
     let content = read_sweep_md();
+    // CONTRACT (prefix-tolerant): the `Implemented (#3454` status + issue ref is
+    // the operator-visible contract; the prefix match (no closing paren)
+    // tolerates appended issue refs (e.g. `(#3454, #3829)`) per #3833/#3837
+    // while still failing if the status flip is reverted. `Daemon backend
+    // detection` is the stable row label.
     assert!(
         content.contains("Daemon backend detection") && content.contains("Implemented (#3454"),
         "sweep.md Limitations table is missing the `Daemon backend \
