@@ -8,6 +8,7 @@ use loom_daemon::metrics_collector;
 use loom_daemon::role_validation;
 use loom_daemon::sweep_registry::{self, SweepRegistry, SweepRegistryConfig};
 use loom_daemon::terminal::TerminalManager;
+use loom_daemon::work_finder;
 use loom_daemon::{extract_configured_terminal_ids, rotate_log_file};
 
 use anyhow::{anyhow, Result};
@@ -289,6 +290,35 @@ async fn main() -> Result<()> {
         .map(epic_supervisor::SupervisorHandle::shutdown_token);
     // Keep the handle alive for the daemon's lifetime; its Drop signals stop.
     let _supervisor_handle = supervisor_handle;
+
+    // Autonomous work-finder loop (Issue #3810 — Phase A of epic #3809). Opt-in
+    // via `LOOM_WORK_FINDER`. Each tick queries the forge for open `loom:issue`
+    // items and dispatches up to a fixed concurrency cap through the same
+    // `SweepRegistry::dispatch()` path the IPC `DispatchSweep` request uses.
+    //
+    // Unlike the epic supervisor above, this runs as a plain `tokio::spawn`
+    // interval task on the shared daemon runtime (like the reaper): every call
+    // into `dispatch()` returns promptly (fire-and-forget child spawn), so the
+    // finder never parks a runtime worker in a long blocking call.
+    let _work_finder_handle = if work_finder::enabled() {
+        let source = work_finder::GhWorkSource::new();
+        let dispatcher = work_finder::RegistryDispatcher::new(sweep_registry.clone());
+        let interval = work_finder::resolve_interval();
+        let max_concurrent = work_finder::resolve_max_concurrent();
+        log::info!(
+            "work_finder: enabled (interval={}s, max_concurrent={max_concurrent})",
+            interval.as_secs()
+        );
+        Some(work_finder::spawn_work_finder_task(
+            source,
+            dispatcher,
+            interval,
+            max_concurrent,
+        ))
+    } else {
+        log::debug!("work_finder: disabled (set LOOM_WORK_FINDER=1 to enable)");
+        None
+    };
 
     // Start IPC server
     let server = IpcServer::new(socket_path.clone(), tm, activity_db, sweep_registry, event_bus);
