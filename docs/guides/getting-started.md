@@ -362,6 +362,43 @@ Loom automatically updates `.gitignore` with ephemeral patterns:
 - ❌ `.loom/*.log` - Log files
 - ❌ `.loom/*.sock` - Unix socket files
 
+### Local (uncommitted) install mode (`--local`)
+
+By default the installer commits the Loom implementation (`.loom/`,
+`.claude/commands/loom/`, `.claude/agents/loom-*.md`, hooks) into the consumer
+repo. If you would rather use Loom in a repo **without** publishing/duplicating
+that implementation in the repo's history, run the installer in local mode:
+
+```bash
+./scripts/install-loom.sh --local /path/to/your/repo            # print untrack commands
+./scripts/install-loom.sh --local --untrack /path/to/your/repo  # also run them
+```
+
+`--local` (alias `--gitignore`) does **not** run the full copy-into-worktree +
+PR install. Instead it appends a Loom-managed, marker-delimited block to the
+target repo's `.gitignore` (idempotent — re-running refreshes it in place):
+
+```gitignore
+# >>> loom-local install (do not edit) >>>
+# Loom implementation files — installed via 'install-loom.sh --local', not committed to this repo (#3836)
+/.loom/
+/.claude/commands/loom/
+/.claude/agents/loom-*.md
+/.loom-local/
+# <<< loom-local install <<<
+```
+
+Because `.gitignore` alone will not stop tracking files that are already
+committed, local mode also detects any of those paths that git currently tracks
+and prints the exact `git rm -r --cached …` commands to untrack them. Pass
+`--untrack` to run those commands automatically (they stage deletions from the
+index; the files stay on disk — commit to finalize).
+
+> **Note:** local mode intentionally leaves genuinely project-specific config
+> tracked — `.github/labels.yml` is not under any ignored path. `.loom/config.json`
+> lives under the ignored `/.loom/` tree; relocating shared project config under a
+> future `.loom-project/` is left to a follow-up increment.
+
 ## Verifying Your Setup
 
 After installation, verify everything is working correctly:

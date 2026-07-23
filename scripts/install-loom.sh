@@ -43,6 +43,8 @@ DOGFOOD_MODE=""  # "" (auto-detect), "true" (forced), "false" (forced off)
 ALLOW_NON_MAIN_SOURCE=false
 ALLOW_STALE_TARGET=false
 SKIP_TARGET_CI=false  # When true, install PR carries `[skip ci]` (issue #3333)
+LOCAL_MODE=false      # --local/--gitignore: keep Loom impl out of repo history (#3836)
+UNTRACK=false         # --untrack: run the git rm --cached commands (#3836)
 TARGET_PATH=""
 
 while [[ $# -gt 0 ]]; do
@@ -83,6 +85,14 @@ while [[ $# -gt 0 ]]; do
       SKIP_TARGET_CI=true
       shift
       ;;
+    --local|--gitignore)
+      LOCAL_MODE=true
+      shift
+      ;;
+    --untrack)
+      UNTRACK=true
+      shift
+      ;;
     -h|--help)
       echo "Usage: $0 [OPTIONS] /path/to/target-repo"
       echo ""
@@ -106,6 +116,16 @@ while [[ $# -gt 0 ]]; do
       echo "                             target repository's CI does not run on the install PR. Use only when"
       echo "                             the target's required-checks rulesets do not depend on CI completing"
       echo "                             (the universal GitHub-native skip directive)."
+      echo "  --local, --gitignore       Local (uncommitted) mode: instead of the full copy-into-worktree +"
+      echo "                             PR install, append a Loom-managed block of the installed"
+      echo "                             implementation paths (.loom/, .claude/commands/loom/,"
+      echo "                             .claude/agents/loom-*.md, .loom-local/) to the target repo's"
+      echo "                             .gitignore (idempotent) so the Loom files are never committed. If any"
+      echo "                             of those paths are already tracked, the exact 'git rm -r --cached'"
+      echo "                             commands to untrack them are printed. Does NOT run loom-daemon init."
+      echo "  --untrack                  With --local: actually run the 'git rm -r --cached' untrack commands"
+      echo "                             (staged as deletions; files stay on disk) instead of just printing"
+      echo "                             them. No effect without --local."
       echo "  -h, --help                 Show this help message"
       echo ""
       echo "Default install PR markers (always on — see .loom/docs/ci-integration.md after install):"
@@ -299,6 +319,85 @@ fi
 
 # Export for sub-scripts
 export NON_INTERACTIVE
+
+# --untrack is meaningless without --local (it modifies which files the local-mode
+# untrack step acts on). Fail loudly rather than silently ignoring it.
+if [[ "$UNTRACK" == "true" ]] && [[ "$LOCAL_MODE" != "true" ]]; then
+  error "--untrack requires --local (it controls the local-mode untrack step)"
+fi
+
+# ============================================================================
+# LOCAL MODE (--local / --gitignore) short-circuit (issue #3836)
+# ============================================================================
+# In local mode we deliberately do NOT run the full copy-into-worktree + PR
+# install. Instead we keep the installed Loom implementation out of the consumer
+# repo's git history:
+#   1. Append a Loom-managed block of the implementation paths to the target's
+#      .gitignore (idempotent — re-running refreshes the block in place).
+#   2. For any of those paths that are already tracked, print the exact
+#      `git rm -r --cached` commands to untrack them (gitignore alone does not
+#      stop tracking already-committed files), or run them when --untrack is set.
+#
+# This is a self-contained operation that runs BEFORE the source-state guard and
+# every heavy dependency/build step: no daemon build, no worktree, no PR. The
+# default committed-install path is completely unchanged unless --local is passed.
+if [[ "$LOCAL_MODE" == "true" ]]; then
+  # shellcheck source=scripts/install/local-mode.sh
+  source "$LOOM_ROOT/scripts/install/local-mode.sh"
+
+  LOCAL_TARGET="$(cd "$TARGET_PATH" 2>/dev/null && pwd)" || \
+    error "Target path does not exist: $TARGET_PATH"
+  if ! git -C "$LOCAL_TARGET" rev-parse --git-dir >/dev/null 2>&1; then
+    error "Target path is not a git repository: $LOCAL_TARGET"
+  fi
+
+  # Resolve to the main worktree root so .gitignore lands at the repo root, not
+  # inside a linked worktree.
+  LOCAL_MAIN_WT=$(git -C "$LOCAL_TARGET" worktree list --porcelain 2>/dev/null | head -4 | grep -m1 '^worktree ' | cut -d' ' -f2- || true)
+  if [[ -n "$LOCAL_MAIN_WT" ]] && [[ "$LOCAL_TARGET" != "$LOCAL_MAIN_WT" ]]; then
+    info "Target is inside a worktree; resolving to main repository root: $LOCAL_MAIN_WT"
+    LOCAL_TARGET="$LOCAL_MAIN_WT"
+  fi
+
+  header "Loom Local Mode (gitignore + untrack)"
+  echo ""
+  info "Target: $LOCAL_TARGET"
+  echo ""
+
+  if loom_local_apply_gitignore "$LOCAL_TARGET"; then
+    success "Wrote Loom-managed local-mode block to .gitignore (idempotent)"
+  else
+    error "Failed to update .gitignore in $LOCAL_TARGET"
+  fi
+  echo ""
+
+  # Collect the implementation paths git still tracks (bash 3.2: no mapfile).
+  LOCAL_TRACKED=()
+  while IFS= read -r _tracked_path; do
+    [[ -n "$_tracked_path" ]] && LOCAL_TRACKED+=("$_tracked_path")
+  done < <(loom_local_tracked_paths "$LOCAL_TARGET")
+
+  if [[ ${#LOCAL_TRACKED[@]} -eq 0 ]]; then
+    success "No installed Loom implementation paths are tracked — nothing to untrack"
+  elif [[ "$UNTRACK" == "true" ]]; then
+    info "Untracking ${#LOCAL_TRACKED[@]} Loom implementation path(s)..."
+    loom_local_run_untrack "$LOCAL_TARGET"
+    success "Untracked Loom implementation paths (staged as deletions — commit to finalize)"
+    info "The files remain on disk; only their git tracking was removed."
+  else
+    warning "These installed Loom implementation paths are still tracked:"
+    printf '    %s\n' "${LOCAL_TRACKED[@]}"
+    echo ""
+    info "Run these commands to untrack them (or re-run with --untrack):"
+    loom_local_untrack_commands "$LOCAL_TARGET" | sed 's/^/    /'
+  fi
+  echo ""
+  success "Local mode complete"
+
+  # Disable the error/cleanup trap and exit cleanly — no worktree was created.
+  trap - EXIT SIGINT SIGTERM
+  exit 0
+fi
 
 # Source-state guard (#3327): before doing any heavy work, verify that the
 # Loom source checkout is on a clean main. Refuse / prompt / continue based
