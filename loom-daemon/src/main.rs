@@ -284,7 +284,24 @@ async fn main() -> Result<()> {
     let _watchdog_handle = if sweep_registry::resolve_watchdog_enabled(&startup_race_config) {
         let timeout = sweep_registry::resolve_watchdog_timeout(&startup_race_config);
         let interval = sweep_registry::resolve_watchdog_interval(&startup_race_config);
-        Some(sweep_registry::spawn_watchdog_task(sweep_registry.clone(), timeout, interval))
+        // Review-phase stall watchdog (Issue #3910): a third backstop, resolved
+        // independently (env > config > default, defaults on) and threaded into
+        // the same tick. `None` disables it without touching the startup
+        // watchdog. It catches a still-running sweep wedged in a hung
+        // Judge/Doctor subagent (log silent past the stall timeout).
+        let review_stall_timeout =
+            if sweep_registry::resolve_review_stall_enabled(&startup_race_config) {
+                Some(sweep_registry::resolve_review_stall_timeout(&startup_race_config))
+            } else {
+                log::info!("sweep_registry: review-phase stall watchdog disabled (#3910)");
+                None
+            };
+        Some(sweep_registry::spawn_watchdog_task(
+            sweep_registry.clone(),
+            timeout,
+            interval,
+            review_stall_timeout,
+        ))
     } else {
         log::info!("sweep_registry: startup watchdog disabled (#3887)");
         None

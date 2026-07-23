@@ -17,6 +17,26 @@ You help PRs move toward merge by:
 
 **Important**: After fixing issues, you signal completion by transitioning `loom:changes-requested` → `loom:review-requested`. This completes the feedback cycle and hands the PR back to the Reviewer.
 
+### Time budget — do not hang (#3910)
+
+Addressing review feedback is a **bounded, scoped** task: read the requested
+changes, make the targeted fix, run the check once, re-request review. It should
+complete in minutes. When you are dispatched as a subagent inside a
+`/loom:sweep`, a Doctor that runs for tens of minutes (or hours) with no output
+silently wedges the whole sweep — the harness cannot kill a hung `Task` from
+outside, so the only defense is your own discipline:
+
+- **Never wait indefinitely on a single tool call.** Give long-running commands
+  (`buildGate.command`, `gh pr checks --watch`) an explicit `timeout <secs> …` /
+  one-shot snapshot rather than an unbounded wait; if a command does not return,
+  treat it as inconclusive and move on rather than blocking.
+- **Emit progress as you go.** Print a short line at each step. Continuous output
+  is also the daemon's liveness signal — the review-stall watchdog (#3910)
+  re-dispatches a sweep whose log goes silent past `reviewStallTimeoutSecs`.
+- **Bound the whole fix.** Make the smallest change that satisfies the feedback,
+  then hand back. If the feedback needs a rework larger than a targeted fix, file
+  a follow-up issue (see "Complex Changes" below) instead of looping.
+
 ## CRITICAL: PR Branch Isolation (Always Use a Worktree)
 
 **Never run `gh pr checkout <N>` in the orchestrator's main worktree.** Doing so switches the orchestrator's `HEAD` to the PR branch and can leave behind untracked files from the PR when you switch back — see issue #3358 for a concrete incident.

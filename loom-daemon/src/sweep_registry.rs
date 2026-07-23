@@ -203,6 +203,27 @@ pub const DEFAULT_WATCHDOG_INTERVAL_SECS: u64 = 30;
 /// escalating to SIGKILL, when it auto-cancels for re-dispatch.
 const WATCHDOG_CANCEL_GRACE: Duration = Duration::from_secs(3);
 
+/// Env var toggling the review-phase stall watchdog (Issue #3910).
+/// `0`/`false`/`no`/`off` disables; `1`/`true`/`yes`/`on` forces on. Overrides
+/// config. Distinct from `LOOM_SWEEP_WATCHDOG` (the #3887 startup watchdog) so a
+/// repo can run one backstop without the other.
+pub const REVIEW_STALL_ENABLE_ENV: &str = "LOOM_SWEEP_REVIEW_STALL";
+
+/// Env var overriding the review-phase stall timeout (log-silence window), in
+/// seconds.
+pub const REVIEW_STALL_TIMEOUT_ENV: &str = "LOOM_SWEEP_REVIEW_STALL_TIMEOUT_SECS";
+
+/// Default review-phase stall timeout (45 min of zero log output). A sweep that
+/// has already made startup progress (worktree/checkpoint exists) but whose log
+/// file has not been appended to within this window is treated as wedged in a
+/// hung role subagent — the canonical case (#3910) is a Judge/Doctor Task that
+/// runs 49–66 min (multi-hour in the worst observations) emitting **zero output
+/// until the very end**. The threshold is on *log silence*, not total runtime,
+/// so it sits far above a healthy Judge (100–380s) or a chatty Builder (which
+/// flushes tool output continuously): a live sweep resets its idle clock on
+/// every line it writes and is never disturbed.
+pub const DEFAULT_REVIEW_STALL_TIMEOUT_SECS: u64 = 2700;
+
 /// The dispatch-header marker `spawn_child` writes before each spawn. Reused by
 /// the watchdog's progress probe to anchor its scan to the current dispatch.
 const DISPATCH_HEADER_MARKER: &str = "==== loom-daemon dispatch:";
@@ -260,6 +281,35 @@ pub fn watchdog_decision(
     already_retried: bool,
 ) -> WatchdogDecision {
     if made_progress || elapsed < timeout {
+        WatchdogDecision::Healthy
+    } else if already_retried {
+        WatchdogDecision::GiveUp
+    } else {
+        WatchdogDecision::Restart
+    }
+}
+
+/// Pure review-phase stall state machine (Issue #3910). Reuses
+/// [`WatchdogDecision`] (`Healthy`/`Restart`/`GiveUp`) but keys off **log
+/// silence** rather than total-runtime-with-no-progress: `log_idle` is how long
+/// the sweep's log file has gone un-appended.
+///
+/// - Log written within the timeout window ⇒ [`WatchdogDecision::Healthy`]
+///   (the sweep is alive and emitting output — a slow-but-live Judge/Builder is
+///   never disturbed).
+/// - Silent past the timeout and not yet restarted ⇒
+///   [`WatchdogDecision::Restart`] — cancel + re-dispatch once (the sweep
+///   resumes from its checkpoint, so a hung Judge/Doctor is re-run, not rebuilt).
+/// - Silent past the timeout but already restarted ⇒
+///   [`WatchdogDecision::GiveUp`] — bounded to exactly one retry; left for the
+///   operator.
+#[must_use]
+pub fn review_stall_decision(
+    log_idle: Duration,
+    timeout: Duration,
+    already_retried: bool,
+) -> WatchdogDecision {
+    if log_idle < timeout {
         WatchdogDecision::Healthy
     } else if already_retried {
         WatchdogDecision::GiveUp
@@ -606,6 +656,14 @@ pub struct SweepRegistry {
     /// Issues the mid-build-death watchdog has already logged a give-up for
     /// (Issue #3895), so the loud give-up warning fires once per issue.
     midbuild_gaveup: HashSet<u32>,
+    /// Issues the review-phase stall watchdog has already restarted once (Issue
+    /// #3910). Bounds the "log went silent mid-review (hung Judge/Doctor)"
+    /// recovery to a single re-dispatch per issue — a second stall resolves to
+    /// [`WatchdogDecision::GiveUp`], never another restart.
+    review_stall_retried: HashSet<u32>,
+    /// Issues the review-phase stall watchdog has already logged a give-up for
+    /// (Issue #3910), so the loud give-up warning fires once per issue.
+    review_stall_gaveup: HashSet<u32>,
 }
 
 impl SweepRegistry {
@@ -626,6 +684,8 @@ impl SweepRegistry {
             watchdog_gaveup: HashSet::new(),
             midbuild_retried: HashSet::new(),
             midbuild_gaveup: HashSet::new(),
+            review_stall_retried: HashSet::new(),
+            review_stall_gaveup: HashSet::new(),
         }
     }
 
@@ -643,6 +703,8 @@ impl SweepRegistry {
             watchdog_gaveup: HashSet::new(),
             midbuild_retried: HashSet::new(),
             midbuild_gaveup: HashSet::new(),
+            review_stall_retried: HashSet::new(),
+            review_stall_gaveup: HashSet::new(),
         }
     }
 
@@ -2196,6 +2258,171 @@ impl SweepRegistry {
     }
 
     // ------------------------------------------------------------------------
+    // Review-phase stall watchdog (Issue #3910)
+    // ------------------------------------------------------------------------
+
+    /// How long a sweep's log file has gone un-appended (its "log silence").
+    ///
+    /// The daemon redirects each child's stdout/stderr to `log_path` in append
+    /// mode, so every line a live sweep emits bumps the file's mtime. A sweep
+    /// wedged in a hung role subagent (Judge/Doctor) produces **zero output**
+    /// (#3910), so its log mtime stops advancing — this idle duration is the
+    /// stall signal.
+    ///
+    /// Returns `None` when the file is missing or its mtime is unreadable / in
+    /// the future (clock skew) — callers treat `None` as "cannot assess, leave
+    /// alone", never as a stall.
+    fn log_idle(&self, log_path: &Path) -> Option<Duration> {
+        let modified = std::fs::metadata(log_path).ok()?.modified().ok()?;
+        // `elapsed()` errors if `modified` is in the future (clock skew) — map
+        // that to None so we never mistake skew for a stall.
+        modified.elapsed().ok()
+    }
+
+    /// Run one review-phase stall watchdog tick (Issue #3910): for each running
+    /// daemon-dispatched Issue sweep that has already made startup progress
+    /// (past the #3887 startup watchdog's remit) but whose log file has gone
+    /// silent past `timeout`, auto-cancel the wedged child and re-dispatch the
+    /// issue **exactly once** (bounded — a second stall resolves to
+    /// [`WatchdogDecision::GiveUp`] and is surfaced for the operator).
+    ///
+    /// This is the third liveness backstop, complementary to the startup-hang
+    /// (#3887, *no* progress at all) and mid-build-death (#3895, made progress
+    /// then the child *died*) watchdogs. It covers the remaining gap: a sweep
+    /// that is **still alive** but stuck in a hung Judge/Doctor subagent — the
+    /// canonical multi-hour hang from #3910. The re-dispatched sweep resumes
+    /// from its checkpoint, so the review phase is re-run, not the whole build.
+    ///
+    /// Gated to sweeps past startup ([`sweep_made_progress`]) so it never
+    /// double-acts with the startup watchdog on the same tick. No new event
+    /// topics: the cancel reuses `sweep.issue.{N}.exited` / `sweep.global.
+    /// completed` from [`finish_cancel`], the re-dispatch reuses
+    /// `sweep.global.dispatch`, and a bounded give-up surfaces on the existing
+    /// frozen `sweep.issue.{N}.crashed` topic. Returns the number of sweeps
+    /// restarted this tick.
+    ///
+    /// [`sweep_made_progress`]: SweepRegistry::sweep_made_progress
+    pub fn review_stall_watchdog_once(&mut self, timeout: Duration) -> usize {
+        // Snapshot eligible candidates first so we can mutate below (mirrors
+        // `watchdog_once`).
+        let candidates: Vec<(SweepId, u32, PathBuf)> = self
+            .entries
+            .iter()
+            .filter(|(id, info)| {
+                matches!(info.state, SweepState::Running | SweepState::Pending)
+                    && matches!(info.kind, SweepKind::Issue(_))
+                    // Only sweeps we spawned (own the Child handle) are cancelable.
+                    && self.children.contains_key(*id)
+            })
+            .filter_map(|(id, info)| match info.kind {
+                SweepKind::Issue(issue) => Some((id.clone(), issue, info.log_path.clone())),
+                SweepKind::PrSet(_) => None,
+            })
+            .collect();
+
+        let mut restarts = 0usize;
+        for (sweep_id, issue, log_path) in candidates {
+            // Gate to sweeps past startup: a sweep that has made NO progress is
+            // the #3887 startup watchdog's job, not ours. This keeps the two
+            // backstops disjoint on any given tick.
+            if !self.sweep_made_progress(issue, &log_path) {
+                continue;
+            }
+            // No readable mtime ⇒ cannot assess ⇒ leave alone.
+            let Some(idle) = self.log_idle(&log_path) else {
+                continue;
+            };
+            let already_retried = self.review_stall_retried.contains(&issue);
+            match review_stall_decision(idle, timeout, already_retried) {
+                WatchdogDecision::Healthy => {}
+                WatchdogDecision::GiveUp => {
+                    if self.review_stall_gaveup.insert(issue) {
+                        log::error!(
+                            "review-stall-watchdog: sweep for issue #{issue} ({sweep_id}) stalled \
+                             again (log silent {}s) after an auto-restart — giving up (bounded to \
+                             one retry). Operator intervention needed: the review phase \
+                             (Judge/Doctor) appears wedged; inspect \
+                             .loom/logs/sweep-issue-{issue}.log, then cancel + re-dispatch (#3910).",
+                            idle.as_secs()
+                        );
+                        self.emit_event(Event::SweepCrashed {
+                            issue,
+                            checkpoint_phase: None,
+                        });
+                    }
+                }
+                WatchdogDecision::Restart => {
+                    log::warn!(
+                        "review-stall-watchdog: sweep for issue #{issue} ({sweep_id}) produced no \
+                         log output in {}s despite making startup progress — its review phase \
+                         (Judge/Doctor) looks hung; auto-cancelling and re-dispatching once. The \
+                         re-dispatch resumes from the sweep checkpoint (#3910).",
+                        idle.as_secs()
+                    );
+                    // Capture re-dispatch params from the wedged entry BEFORE
+                    // cancel mutates it.
+                    let (model, effort, depends_on, idempotency_key) = self
+                        .entries
+                        .get(&sweep_id)
+                        .map(|i| {
+                            (
+                                i.model.clone(),
+                                i.effort.clone(),
+                                i.depends_on,
+                                i.idempotency_key.clone(),
+                            )
+                        })
+                        .unwrap_or((None, None, None, None));
+
+                    // Mark retried BEFORE acting so any error path still counts
+                    // the single allowed attempt (never loops).
+                    self.review_stall_retried.insert(issue);
+                    // A prior give-up log (if any) is now stale; clear it so a
+                    // later genuine give-up still logs once.
+                    self.review_stall_gaveup.remove(&issue);
+
+                    // Cancel the wedged child (SIGTERM → grace → SIGKILL). This
+                    // releases the per-issue lock and restores loom:building ->
+                    // loom:issue, so the re-dispatch can re-acquire cleanly.
+                    if let Err(e) = self.cancel(&sweep_id, WATCHDOG_CANCEL_GRACE) {
+                        log::error!(
+                            "review-stall-watchdog: auto-cancel of stalled sweep {sweep_id} \
+                             (issue #{issue}) failed: {e}"
+                        );
+                        continue;
+                    }
+
+                    match self.dispatch(
+                        &SweepKind::Issue(issue),
+                        idempotency_key,
+                        model.as_deref(),
+                        effort.as_deref(),
+                        depends_on,
+                    ) {
+                        Ok(outcome) => {
+                            restarts += 1;
+                            log::warn!(
+                                "review-stall-watchdog: re-dispatched issue #{issue} as {} (pid \
+                                 {}) after a review-phase stall (#3910).",
+                                outcome.sweep_id,
+                                outcome.pid
+                            );
+                        }
+                        Err(e) => {
+                            log::error!(
+                                "review-stall-watchdog: re-dispatch of issue #{issue} after a \
+                                 stall failed: {e} (issue left recoverable — its claim was already \
+                                 restored)."
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        restarts
+    }
+
+    // ------------------------------------------------------------------------
     // Reconstruction
     // ------------------------------------------------------------------------
 
@@ -2512,6 +2739,13 @@ pub struct StartupRaceConfig {
     /// `autonomous.watchdog.intervalSecs` — probe interval, in seconds
     /// (zero/invalid dropped to `None`).
     pub watchdog_interval_secs: Option<u64>,
+    /// `autonomous.watchdog.reviewStall` — whether to run the review-phase
+    /// stall watchdog (Issue #3910).
+    pub review_stall_enabled: Option<bool>,
+    /// `autonomous.watchdog.reviewStallTimeoutSecs` — log-silence timeout for
+    /// the review-phase stall watchdog, in seconds (zero/invalid dropped to
+    /// `None`).
+    pub review_stall_timeout_secs: Option<u64>,
 }
 
 /// Read `.loom/config.json → autonomous` for the startup-race knobs (Issue
@@ -2547,6 +2781,13 @@ pub fn read_startup_race_config(repo_root: &Path) -> StartupRaceConfig {
             .filter(|&s| s > 0),
         watchdog_interval_secs: watchdog
             .and_then(|w| w.get("intervalSecs"))
+            .and_then(serde_json::Value::as_u64)
+            .filter(|&s| s > 0),
+        review_stall_enabled: watchdog
+            .and_then(|w| w.get("reviewStall"))
+            .and_then(serde_json::Value::as_bool),
+        review_stall_timeout_secs: watchdog
+            .and_then(|w| w.get("reviewStallTimeoutSecs"))
             .and_then(serde_json::Value::as_u64)
             .filter(|&s| s > 0),
     }
@@ -2602,23 +2843,57 @@ pub fn resolve_watchdog_interval(config: &StartupRaceConfig) -> Duration {
     Duration::from_secs(secs)
 }
 
-/// Spawn the watchdog task (Issue #3887 + #3895). Every `interval`, it runs two
-/// liveness backstops in one tick: the **startup-hang watchdog** (#3887) probes
-/// each running daemon-dispatched sweep for progress and auto-cancels +
-/// re-dispatches (once, bounded) any that have hung past `timeout`; the
-/// **mid-build-death watchdog** (#3895) scans terminal entries for a sweep that
-/// made Builder progress then died (dirty worktree, no PR) and cleans +
-/// re-dispatches it (once, bounded). Mirrors [`spawn_reaper_task`]: brief lock
-/// per tick, never held across the sleep.
+/// Resolve whether the review-phase stall watchdog runs, precedence **env >
+/// config > default(true)** (Issue #3910). Defaults **on** — a self-healing
+/// backstop with a generous 45-minute log-silence timeout and a bounded single
+/// retry — but can be disabled via `LOOM_SWEEP_REVIEW_STALL=0` or
+/// `autonomous.watchdog.reviewStall = false`.
+#[must_use]
+pub fn resolve_review_stall_enabled(config: &StartupRaceConfig) -> bool {
+    if let Ok(v) = std::env::var(REVIEW_STALL_ENABLE_ENV) {
+        return matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on");
+    }
+    config.review_stall_enabled.unwrap_or(true)
+}
+
+/// Resolve the review-phase stall (log-silence) timeout, precedence **env >
+/// config > default** (Issue #3910).
+#[must_use]
+pub fn resolve_review_stall_timeout(config: &StartupRaceConfig) -> Duration {
+    let secs = std::env::var(REVIEW_STALL_TIMEOUT_ENV)
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|&s| s > 0)
+        .or(config.review_stall_timeout_secs)
+        .unwrap_or(DEFAULT_REVIEW_STALL_TIMEOUT_SECS);
+    Duration::from_secs(secs)
+}
+
+/// Spawn the watchdog task (Issue #3887 + #3895 + #3910). Every `interval`, it
+/// runs three liveness backstops in one tick: the **startup-hang watchdog**
+/// (#3887) probes each running daemon-dispatched sweep for progress and
+/// auto-cancels + re-dispatches (once, bounded) any that have hung past
+/// `timeout`; the **mid-build-death watchdog** (#3895) scans terminal entries
+/// for a sweep that made Builder progress then died (dirty worktree, no PR) and
+/// cleans + re-dispatches it (once, bounded); the **review-phase stall
+/// watchdog** (#3910, when `review_stall_timeout` is `Some`) cancels +
+/// re-dispatches (once, bounded) any still-running sweep past startup whose log
+/// has gone silent past that timeout — the hung-Judge/Doctor case. Mirrors
+/// [`spawn_reaper_task`]: brief lock per tick, never held across the sleep.
 pub fn spawn_watchdog_task(
     registry: Arc<Mutex<SweepRegistry>>,
     timeout: Duration,
     interval: Duration,
+    review_stall_timeout: Option<Duration>,
 ) -> tokio::task::JoinHandle<()> {
     log::info!(
-        "sweep_registry: starting startup watchdog (interval={}s, timeout={}s) (#3887)",
+        "sweep_registry: starting startup watchdog (interval={}s, timeout={}s) (#3887); \
+         review-stall watchdog {} (#3910)",
         interval.as_secs(),
-        timeout.as_secs()
+        timeout.as_secs(),
+        review_stall_timeout
+            .map(|t| format!("enabled (timeout={}s)", t.as_secs()))
+            .unwrap_or_else(|| "disabled".to_string())
     );
     tokio::spawn(async move {
         let mut ticker = tokio::time::interval(interval);
@@ -2627,13 +2902,20 @@ pub fn spawn_watchdog_task(
         ticker.tick().await;
         loop {
             ticker.tick().await;
-            // Same tick runs both liveness backstops: the startup-hang watchdog
-            // (#3887, no progress) and the mid-build-death watchdog (#3895, made
-            // progress then the child died). Both hold the registry lock only
-            // briefly, never across the sleep.
-            let (restarted, recovered) = {
+            // Same tick runs all three liveness backstops: the startup-hang
+            // watchdog (#3887, no progress), the mid-build-death watchdog
+            // (#3895, made progress then the child died), and the review-phase
+            // stall watchdog (#3910, alive but log-silent mid-review). All hold
+            // the registry lock only briefly, never across the sleep.
+            let (restarted, recovered, unstalled) = {
                 match registry.lock() {
-                    Ok(mut r) => (r.watchdog_once(timeout), r.midbuild_watchdog_once()),
+                    Ok(mut r) => {
+                        let restarted = r.watchdog_once(timeout);
+                        let recovered = r.midbuild_watchdog_once();
+                        let unstalled =
+                            review_stall_timeout.map_or(0, |t| r.review_stall_watchdog_once(t));
+                        (restarted, recovered, unstalled)
+                    }
                     Err(poisoned) => {
                         log::error!("sweep_registry: watchdog mutex poisoned ({poisoned:?})");
                         return;
@@ -2650,6 +2932,12 @@ pub fn spawn_watchdog_task(
                 log::warn!(
                     "sweep_registry: watchdog recovered {recovered} mid-build-death sweep{} (#3895)",
                     if recovered == 1 { "" } else { "s" }
+                );
+            }
+            if unstalled > 0 {
+                log::warn!(
+                    "sweep_registry: watchdog re-dispatched {unstalled} review-stalled sweep{} (#3910)",
+                    if unstalled == 1 { "" } else { "s" }
                 );
             }
         }
@@ -5637,7 +5925,7 @@ exit 0\n";
         let tmp = tempdir().unwrap();
         write_cfg(
             tmp.path(),
-            r#"{"autonomous":{"dispatchStaggerMs":3000,"watchdog":{"enabled":false,"timeoutSecs":90,"intervalSecs":15}}}"#,
+            r#"{"autonomous":{"dispatchStaggerMs":3000,"watchdog":{"enabled":false,"timeoutSecs":90,"intervalSecs":15,"reviewStall":false,"reviewStallTimeoutSecs":1800}}}"#,
         );
         assert_eq!(
             read_startup_race_config(tmp.path()),
@@ -5646,6 +5934,8 @@ exit 0\n";
                 watchdog_enabled: Some(false),
                 watchdog_timeout_secs: Some(90),
                 watchdog_interval_secs: Some(15),
+                review_stall_enabled: Some(false),
+                review_stall_timeout_secs: Some(1800),
             }
         );
     }
@@ -5733,5 +6023,181 @@ exit 0\n";
         assert_eq!(resolve_watchdog_interval(&cfg), Duration::from_secs(11));
         std::env::remove_var(WATCHDOG_TIMEOUT_ENV);
         std::env::remove_var(WATCHDOG_INTERVAL_ENV);
+    }
+
+    // ===================================================================
+    // Review-phase stall watchdog (Issue #3910)
+    // ===================================================================
+
+    // --- review_stall_decision pure state machine ---
+
+    #[test]
+    fn review_stall_decision_within_timeout_is_healthy() {
+        let t = Duration::from_secs(2700);
+        // Log written recently ⇒ alive ⇒ Healthy, regardless of retry state.
+        assert_eq!(
+            review_stall_decision(Duration::from_secs(120), t, false),
+            WatchdogDecision::Healthy
+        );
+        assert_eq!(
+            review_stall_decision(Duration::from_secs(2699), t, true),
+            WatchdogDecision::Healthy
+        );
+    }
+
+    #[test]
+    fn review_stall_decision_silent_first_time_restarts() {
+        let t = Duration::from_secs(2700);
+        assert_eq!(
+            review_stall_decision(Duration::from_secs(2701), t, false),
+            WatchdogDecision::Restart
+        );
+    }
+
+    #[test]
+    fn review_stall_decision_silent_after_retry_gives_up() {
+        // Bounded: a second stall past the timeout does not restart again.
+        let t = Duration::from_secs(2700);
+        assert_eq!(
+            review_stall_decision(Duration::from_secs(9999), t, true),
+            WatchdogDecision::GiveUp
+        );
+    }
+
+    // --- log_idle filesystem probe ---
+
+    #[test]
+    fn log_idle_none_for_missing_some_for_present() {
+        let tmp = tempdir().unwrap();
+        let ws = tmp.path();
+        let (reg, _rec) = fixture_registry(ws);
+
+        // Missing file ⇒ None (cannot assess).
+        let missing = ws.join("nope.log");
+        assert!(reg.log_idle(&missing).is_none());
+
+        // A freshly written file ⇒ Some, and its idle is tiny.
+        let present = ws.join("sweep.log");
+        std::fs::write(&present, "hello\n").unwrap();
+        let idle = reg
+            .log_idle(&present)
+            .expect("present file has a readable mtime");
+        assert!(idle < Duration::from_secs(60), "a just-written log is not idle: {idle:?}");
+    }
+
+    // --- resolve_review_stall_* precedence ---
+
+    #[test]
+    #[serial]
+    fn resolve_review_stall_enabled_precedence() {
+        std::env::remove_var(REVIEW_STALL_ENABLE_ENV);
+        // Default ON (self-healing backstop).
+        assert!(resolve_review_stall_enabled(&StartupRaceConfig::default()));
+        // Config can disable.
+        let off = StartupRaceConfig {
+            review_stall_enabled: Some(false),
+            ..Default::default()
+        };
+        assert!(!resolve_review_stall_enabled(&off));
+        // Env overrides config in both directions.
+        std::env::set_var(REVIEW_STALL_ENABLE_ENV, "1");
+        assert!(resolve_review_stall_enabled(&off));
+        std::env::set_var(REVIEW_STALL_ENABLE_ENV, "0");
+        let on = StartupRaceConfig {
+            review_stall_enabled: Some(true),
+            ..Default::default()
+        };
+        assert!(!resolve_review_stall_enabled(&on));
+        std::env::remove_var(REVIEW_STALL_ENABLE_ENV);
+    }
+
+    #[test]
+    #[serial]
+    fn resolve_review_stall_timeout_precedence() {
+        std::env::remove_var(REVIEW_STALL_TIMEOUT_ENV);
+        assert_eq!(
+            resolve_review_stall_timeout(&StartupRaceConfig::default()),
+            Duration::from_secs(DEFAULT_REVIEW_STALL_TIMEOUT_SECS)
+        );
+        let cfg = StartupRaceConfig {
+            review_stall_timeout_secs: Some(1800),
+            ..Default::default()
+        };
+        assert_eq!(resolve_review_stall_timeout(&cfg), Duration::from_secs(1800));
+        std::env::set_var(REVIEW_STALL_TIMEOUT_ENV, "600");
+        assert_eq!(resolve_review_stall_timeout(&cfg), Duration::from_secs(600));
+        // A zero/invalid env value is dropped, falling back to config.
+        std::env::set_var(REVIEW_STALL_TIMEOUT_ENV, "0");
+        assert_eq!(resolve_review_stall_timeout(&cfg), Duration::from_secs(1800));
+        std::env::remove_var(REVIEW_STALL_TIMEOUT_ENV);
+    }
+
+    // --- review_stall_watchdog_once: bounded auto-restart end-to-end ---
+
+    #[test]
+    fn review_stall_watchdog_ignores_prestartup_sweep() {
+        let tmp = tempdir().unwrap();
+        let ws = tmp.path();
+        let mut reg = hung_child_registry(ws);
+
+        let out = reg
+            .dispatch(&SweepKind::Issue(5150), None, None, None, None)
+            .unwrap();
+        assert!(wait_until_alive(out.pid, 5000));
+
+        // No worktree/checkpoint yet ⇒ NOT past startup ⇒ the review-stall
+        // watchdog leaves it entirely to the #3887 startup watchdog, even with a
+        // zero timeout that would otherwise force a stall.
+        assert_eq!(reg.review_stall_watchdog_once(Duration::ZERO), 0);
+        assert!(!reg.review_stall_retried.contains(&5150));
+
+        let _ = reg.cancel(&out.sweep_id, Duration::from_secs(2));
+    }
+
+    #[test]
+    fn review_stall_watchdog_restarts_stalled_sweep_once_then_gives_up() {
+        let tmp = tempdir().unwrap();
+        let ws = tmp.path();
+        let mut reg = hung_child_registry(ws);
+
+        // 1. Dispatch a sweep for issue 5252 and mark it past startup by
+        //    creating its worktree (the review-stall watchdog only acts on
+        //    sweeps that already made progress).
+        let out = reg
+            .dispatch(&SweepKind::Issue(5252), None, None, None, None)
+            .unwrap();
+        assert!(wait_until_alive(out.pid, 5000), "fixture child should start");
+        let wt = ws.join(".loom").join("worktrees").join("issue-5252");
+        std::fs::create_dir_all(&wt).unwrap();
+
+        // 2. With a generous timeout the freshly-written log is NOT idle ⇒ the
+        //    sweep is healthy and untouched.
+        assert_eq!(
+            reg.review_stall_watchdog_once(Duration::from_secs(3600)),
+            0,
+            "a sweep still emitting log output is not disturbed"
+        );
+
+        // 3. A zero timeout forces the stall verdict (any log idle >= 0) ⇒ the
+        //    wedged sweep is auto-cancelled and re-dispatched exactly once.
+        let restarts = reg.review_stall_watchdog_once(Duration::ZERO);
+        assert_eq!(restarts, 1, "the stalled sweep is auto-restarted once");
+        assert!(reg.review_stall_retried.contains(&5252), "issue marked retried (bounded)");
+        let second_id =
+            running_issue_sweep_id(&reg, 5252).expect("a fresh sweep was re-dispatched");
+
+        // 4. The re-dispatched sweep still has a worktree (past startup) and a
+        //    fresh log; a zero timeout stalls it again, but the watchdog is
+        //    bounded — it gives up instead of restarting a second time.
+        let restarts2 = reg.review_stall_watchdog_once(Duration::ZERO);
+        assert_eq!(restarts2, 0, "bounded: never a second auto-restart");
+        assert!(reg.review_stall_gaveup.contains(&5252), "give-up recorded for the issue");
+        assert!(
+            running_issue_sweep_id(&reg, 5252).is_some(),
+            "the sweep is left running for the operator"
+        );
+
+        // Cleanup: cancel the lingering child.
+        let _ = reg.cancel(&second_id, Duration::from_secs(2));
     }
 }
