@@ -626,7 +626,9 @@ concurrency ceiling 5" and share it with the team:
     "watchdog": {
       "enabled": true,
       "timeoutSecs": 120,
-      "intervalSecs": 30
+      "intervalSecs": 30,
+      "reviewStall": true,
+      "reviewStallTimeoutSecs": 2700
     }
   }
 }
@@ -647,9 +649,11 @@ exactly like `main_health_gate::read_build_gate_config`.
 | `autonomous.workFinder.maxConcurrent` | `LOOM_WORK_FINDER_MAX_CONCURRENT` | `3` | Operator **ceiling**, not a fixed target |
 | `autonomous.mainHealthGate.enabled` | `LOOM_MAIN_HEALTH_GATE` | `false` | Gate loop on/off |
 | `autonomous.dispatchStaggerMs` | `LOOM_SWEEP_DISPATCH_STAGGER_MS` | `2000` | Min gap between consecutive child spawns (#3887). `0` disables |
-| `autonomous.watchdog.enabled` | `LOOM_SWEEP_WATCHDOG` | `true` | Startup watchdog on/off (#3887) |
+| `autonomous.watchdog.enabled` | `LOOM_SWEEP_WATCHDOG` | `true` | Startup watchdog on/off (#3887). Also the master switch for the tick — mid-build-death (#3895) + review-stall (#3910) run in the same task |
 | `autonomous.watchdog.timeoutSecs` | `LOOM_SWEEP_WATCHDOG_TIMEOUT_SECS` | `120` | No-progress window before auto-restart |
-| `autonomous.watchdog.intervalSecs` | `LOOM_SWEEP_WATCHDOG_INTERVAL_SECS` | `30` | Watchdog probe cadence |
+| `autonomous.watchdog.intervalSecs` | `LOOM_SWEEP_WATCHDOG_INTERVAL_SECS` | `30` | Watchdog probe cadence (shared by all three backstops) |
+| `autonomous.watchdog.reviewStall` | `LOOM_SWEEP_REVIEW_STALL` | `true` | Review-phase stall watchdog on/off (#3910) |
+| `autonomous.watchdog.reviewStallTimeoutSecs` | `LOOM_SWEEP_REVIEW_STALL_TIMEOUT_SECS` | `2700` | Log-silence window before a hung Judge/Doctor sweep is re-dispatched |
 
 **Startup-race mitigation (#3887).** Rapid back-to-back dispatch (the work
 finder draining a backlog in one tick) could wedge some `claude` children at
@@ -664,6 +668,38 @@ written / log output past the spawn header) and auto-cancels + re-dispatches —
 frozen `sweep.issue.{N}.exited` / `sweep.global.completed` / `sweep.global.dispatch`
 topics (no new event topics). The watchdog defaults **on**; disable it with
 `LOOM_SWEEP_WATCHDOG=0` or `autonomous.watchdog.enabled = false`.
+
+**Review-phase stall watchdog (#3910).** The startup watchdog rescues a sweep
+that shows *no* progress, and the mid-build-death watchdog (#3895) rescues one
+that made progress then *died*. Neither covers a sweep that is **still alive**
+but wedged in a hung role subagent — the observed failure was a `/loom:sweep`'s
+internal Judge or Doctor `Task` running **49–66 minutes (multi-hour in the worst
+cases) emitting zero output until the very end**, silently blocking the sweep's
+back half with no self-heal. The third backstop, running in the same watchdog
+tick, closes that gap: for each still-running daemon-dispatched sweep that has
+already made startup progress, it measures **log silence** (how long the
+per-sweep log file's mtime has gone un-advanced — a live sweep flushes tool
+output continuously, a hung one does not) and, past `reviewStallTimeoutSecs`
+(default 45 min), auto-cancels the wedged child and re-dispatches the issue
+**exactly once, bounded, never a loop**. The re-dispatch resumes from the sweep
+checkpoint, so the hung review phase is re-run — not the whole build. A second
+stall resolves to give-up and surfaces on the frozen `sweep.issue.{N}.crashed`
+topic (no new event topics). Gated to sweeps past startup so it never
+double-acts with the startup watchdog on the same tick. Defaults **on**; disable
+with `LOOM_SWEEP_REVIEW_STALL=0` or `autonomous.watchdog.reviewStall = false`.
+
+> **Root cause & scope (#3910).** The stall is a *harness-side* artifact — a
+> role subagent (`loom-judge`/`loom-doctor`) dispatched via the Claude Code
+> `Task` tool that hangs on an opaque long-running / wedged tool call, producing
+> no output until it eventually returns (or the sweep is killed). The
+> **subagent-path** orchestrator (in-session `/loom:sweep`) cannot bound this
+> from outside: it blocks awaiting each subagent's `TaskOutput` and the harness
+> exposes no per-`Task` timeout or kill (see the "async-only dispatch" note in
+> `sweep.md`), so the only in-session mitigation is prompt-level time-budget
+> discipline in the role prompts. This watchdog is the **daemon-path** backstop
+> — it works precisely because a daemon-dispatched sweep is an isolated OS
+> process whose log file is observable and whose PID is cancelable, which the
+> in-session `Task` is not.
 
 The **gate's behavior** (which command runs against `main`, its timeout) still
 comes from the separate top-level `buildGate` block (#3749); `autonomous.mainHealthGate`
