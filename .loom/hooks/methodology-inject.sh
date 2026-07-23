@@ -180,6 +180,12 @@ if [[ "$INJECT_UNIVERSAL" == "true" ]] && [[ -f "${CONTEXT_DIR}/universal.md" ]]
         SESSION_KEY=$(printf '%s' "$SESSION_ID" | tr -c 'A-Za-z0-9._-' '_')
         SEEN_DIR="${MAIN_ROOT}/.loom/logs/methodology-inject-seen"
         SEEN_MARKER="${SEEN_DIR}/${SESSION_KEY}"
+        # Opportunistic best-effort prune (#3793): every session adds one marker
+        # here and nothing else prunes them, so a busy orchestration repo would
+        # accumulate stale empty files without bound. Drop markers older than 7
+        # days on hook entry. Fail-open — any error (missing dir, permission)
+        # never fails the hook and never changes the dedup decision below.
+        find "$SEEN_DIR" -type f -mtime +7 -delete 2>/dev/null || true
         if [[ -f "$SEEN_MARKER" ]]; then
             INCLUDE_UNIVERSAL=0
         else
@@ -202,17 +208,22 @@ if [[ "$INJECT_ROLE" == "true" ]]; then
 
     # Fallback: detect role from prompt preamble (slash commands)
     if [[ -z "$ROLE" ]]; then
+        # Match both the unnamespaced (/builder) and namespaced (/loom:builder)
+        # forms for every role (#3793). Claude Code 2.1+ requires the namespaced
+        # /loom:<role> form for subdirectory commands (#3345), so an interactive
+        # `/loom:builder 123` must inject builder context too. /loom:sweep has no
+        # unnamespaced counterpart (sweep.md was always namespace-only).
         case "$PROMPT" in
-            /builder*) ROLE="builder" ;;
-            /judge*)   ROLE="judge" ;;
-            /curator*) ROLE="curator" ;;
-            /doctor*)  ROLE="doctor" ;;
-            /architect*) ROLE="architect" ;;
-            /hermit*)  ROLE="hermit" ;;
-            /champion*) ROLE="champion" ;;
-            /guide*)   ROLE="guide" ;;
-            /auditor*) ROLE="auditor" ;;
-            /loom:sweep*) ROLE="sweep" ;;
+            /builder*|/loom:builder*)     ROLE="builder" ;;
+            /judge*|/loom:judge*)         ROLE="judge" ;;
+            /curator*|/loom:curator*)     ROLE="curator" ;;
+            /doctor*|/loom:doctor*)       ROLE="doctor" ;;
+            /architect*|/loom:architect*) ROLE="architect" ;;
+            /hermit*|/loom:hermit*)       ROLE="hermit" ;;
+            /champion*|/loom:champion*)   ROLE="champion" ;;
+            /guide*|/loom:guide*)         ROLE="guide" ;;
+            /auditor*|/loom:auditor*)     ROLE="auditor" ;;
+            /loom:sweep*)                 ROLE="sweep" ;;
         esac
     fi
 

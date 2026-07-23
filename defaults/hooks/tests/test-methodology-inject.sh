@@ -230,6 +230,68 @@ for probe in "the weather is nice today here" "please implement the feature now"
     fi
 done
 
+# --- Namespaced /loom:<role> detection (#3793) ------------------------------
+# Role commands live at .claude/commands/loom/<role>.md and Claude Code 2.1+
+# requires the namespaced /loom:<role> form for subdirectory commands (#3345).
+# The prompt-preamble fallback must set ROLE for BOTH /builder and /loom:builder.
+# Detection only fires when LOOM_ROLE is UNSET, so run these with LOOM_ROLE
+# explicitly cleared (env -u) so an inherited LOOM_ROLE never masks the fallback.
+setup_context
+printf '# Judge Role\nMARKER_ROLE_JUDGE\n' > "$CONTEXT_DIR/roles/judge.md"
+printf '# Auditor Role\nMARKER_ROLE_AUDITOR\n' > "$CONTEXT_DIR/roles/auditor.md"
+
+run_hook_norole() {
+    local prompt="$1" session="${2:-}"
+    local output exit_code=0
+    output=$(cd "$TMPROOT" && make_input "$prompt" "$session" | env -u LOOM_ROLE "$HOOK" 2>/dev/null) || exit_code=$?
+    if [[ "$exit_code" -ne 0 ]]; then echo "__NONZERO_EXIT__:$exit_code"; return 0; fi
+    if [[ -n "$output" ]] && ! echo "$output" | jq empty 2>/dev/null; then echo "__INVALID_JSON__"; return 0; fi
+    echo "$output"
+}
+
+reset_markers
+outNS1=$(run_hook_norole "/loom:builder 123" "sess-ns-1")
+assert_contains "namespaced /loom:builder -> builder role injected" "$(context_of "$outNS1")" "MARKER_ROLE_BUILDER"
+
+reset_markers
+outNS2=$(run_hook_norole "/loom:judge review this pr" "sess-ns-2")
+assert_contains "namespaced /loom:judge -> judge role injected" "$(context_of "$outNS2")" "MARKER_ROLE_JUDGE"
+
+reset_markers
+outNS3=$(run_hook_norole "/loom:auditor check main branch" "sess-ns-3")
+assert_contains "namespaced /loom:auditor -> auditor role injected" "$(context_of "$outNS3")" "MARKER_ROLE_AUDITOR"
+
+# Regression: the pre-existing unnamespaced forms still resolve unchanged.
+reset_markers
+outUN1=$(run_hook_norole "/builder 123" "sess-un-1")
+assert_contains "unnamespaced /builder -> builder role still injected" "$(context_of "$outUN1")" "MARKER_ROLE_BUILDER"
+
+reset_markers
+outUN2=$(run_hook_norole "/judge review this pr" "sess-un-2")
+assert_contains "unnamespaced /judge -> judge role still injected" "$(context_of "$outUN2")" "MARKER_ROLE_JUDGE"
+
+# --- Session-marker dir pruning (#3793) -------------------------------------
+# Stale markers (>7d) are pruned opportunistically on hook entry; fresh markers
+# survive. The prune runs inside the session-dedup branch (universal.md present,
+# session_id supplied, universal_frequency != always).
+setup_context
+reset_markers
+SEEN_DIR_M="$TMPROOT/.loom/logs/methodology-inject-seen"
+mkdir -p "$SEEN_DIR_M"
+touch -t 202001010000 "$SEEN_DIR_M/stale-old-session"   # ~2020 -> older than 7d
+touch "$SEEN_DIR_M/fresh-session"                        # now -> within 7d
+run_hook "trigger a prune pass here now" "sess-prune-m" >/dev/null
+if [[ ! -e "$SEEN_DIR_M/stale-old-session" ]]; then
+    pass "methodology: stale (>7d) marker pruned on hook entry"
+else
+    fail "methodology: stale (>7d) marker pruned on hook entry"
+fi
+if [[ -e "$SEEN_DIR_M/fresh-session" ]]; then
+    pass "methodology: fresh marker survives prune"
+else
+    fail "methodology: fresh marker survives prune"
+fi
+
 # --- defaults/ vs .loom/ sync -----------------------------------------------
 DEPLOY_HOOK="$REPO_ROOT/.loom/hooks/methodology-inject.sh"
 if [[ -f "$DEPLOY_HOOK" ]] && diff -q "$SRC_HOOK" "$DEPLOY_HOOK" >/dev/null 2>&1; then
