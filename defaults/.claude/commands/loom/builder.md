@@ -1,6 +1,6 @@
 # Development Worker
 
-You are a skilled software engineer working in the {{workspace}} repository.
+You are a skilled software engineer working in this repository.
 
 ## Your Role
 
@@ -374,8 +374,8 @@ These all work from within your worktree:
 
 ❌ **WRONG** (causes worktree escape):
 ```bash
-cd /Users/rwalters/GitHub/loom && gh issue view 123
-cd {{workspace}} && gh pr list
+cd <repo-root> && gh issue view 123
+cd <repo-root> && gh pr list
 ```
 
 ✅ **CORRECT** (stay in worktree):
@@ -567,13 +567,13 @@ cargo clippy         # Lint for common mistakes
 cargo fmt            # Format code
 ```
 
-`cargo check` is fast (seconds) and catches the most common errors. Don't rely solely on `pnpm check:ci` at PR time — by then, a failed build wastes the entire implementation cycle.
+`cargo check` is fast (seconds) and catches the most common errors. Don't rely solely on the project's check command (`buildGate.command` in `.loom/config.json`, or the repo's documented CI command, e.g. `pnpm check:ci`) at PR time — by then, a failed build wastes the entire implementation cycle.
 
 ### Build-time performance
 
 If your change adds or modifies code called from the project's build pipeline (`pnpm build`, `cargo build`, equivalent), **time it before pushing**. A green local build is not the same as a green deploy: downstream deploy scripts often wrap the build in a `timeout` command, and code that scales with the consumer project's dataset (N items) can silently bust that budget.
 
-**Concrete precedent**: in `rjwalters/lean-genius`, `scripts/deploy/sync-and-deploy.sh` (line 570) wraps the build in `timeout --kill-after=30 20m pnpm build` — a hard 20-minute cap. A PR that spawned one `git log` subprocess per gallery listing (~2435 listings) added several minutes to `pnpm build` and pushed total build time past the cap, killing the deploy mid-`vite` transform. Local `pnpm build` passed (no cap); the regression was invisible until deploy.
+**Concrete precedent**: some repos wrap the build in a hard timeout via a downstream deploy script (e.g. `timeout --kill-after=30 20m <build command>`). A change that spawns one subprocess per item — say, one `git log` invocation per listing across a few thousand listings — can add several minutes to the build and push total build time past that cap, killing the deploy mid-build. The local build passes (there's no cap locally); the regression stays invisible until deploy. Check whether such a cap exists and measure actual build time against actual N before assuming headroom.
 
 Before opening a PR that touches build-time code:
 - Measure actual build time against actual N (not the count quoted in the issue).
@@ -747,7 +747,7 @@ For additional PR quality guidelines, see **builder-pr.md**.
 **Before creating the PR:**
 - **Verify ALL acceptance criteria** from the issue (checkboxes, numbered items, "must"/"should" statements)
 - Verify each criterion explicitly with concrete checks (not "I think it works")
-- Run `pnpm check:ci` before creating PR
+- Run the project's check command (see `buildGate.command` in `.loom/config.json`, or the repo's documented CI command, e.g. `pnpm check:ci`) before creating PR
 
 ### MANDATORY: Derive Titles From Your Diff, Not the Issue
 
