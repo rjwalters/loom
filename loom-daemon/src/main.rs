@@ -9,6 +9,7 @@ use loom_daemon::metrics_collector;
 use loom_daemon::role_validation;
 use loom_daemon::sweep_registry::{self, SweepRegistry, SweepRegistryConfig};
 use loom_daemon::terminal::TerminalManager;
+use loom_daemon::types::{DaemonStatusReport, Request, Response, SweepKind};
 use loom_daemon::work_finder;
 use loom_daemon::{extract_configured_terminal_ids, rotate_log_file};
 
@@ -16,9 +17,12 @@ use anyhow::{anyhow, Result};
 use clap::{Parser, Subcommand};
 use std::fs;
 use std::io::Write;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::net::UnixStream;
 
 /// Loom daemon - terminal multiplexing and workspace orchestration
 #[derive(Parser)]
@@ -84,6 +88,17 @@ enum Commands {
         format: String,
     },
 
+    /// Show the running daemon's autonomous-mode status: in-flight sweeps, the
+    /// three dynamic-cap inputs (token-pool size, disk headroom, configured
+    /// ceiling) plus their `min` cap, the main-health-gate halt state, and
+    /// per-token usage. Connects to the running daemon over its Unix socket
+    /// (Issue #3891 — follow-up to #3813 Phase D).
+    Status {
+        /// Emit machine-readable JSON instead of the human-readable table.
+        #[arg(long)]
+        json: bool,
+    },
+
     /// Validate role configuration completeness
     Validate {
         /// Workspace directory containing .loom/config.json
@@ -110,7 +125,12 @@ async fn main() -> Result<()> {
 
     // Handle CLI commands (init mode)
     if let Some(command) = cli.command {
-        return handle_cli_command(command);
+        return match command {
+            // `status` connects to the running daemon over its Unix socket, so
+            // it needs the async runtime (unlike the other sync subcommands).
+            Commands::Status { json } => handle_status_command(json).await,
+            other => handle_cli_command(other),
+        };
     }
 
     // Setup logging to ~/.loom/daemon.log
@@ -411,8 +431,17 @@ async fn main() -> Result<()> {
         None
     };
 
-    // Start IPC server
-    let server = IpcServer::new(socket_path.clone(), tm, activity_db, sweep_registry, event_bus);
+    // Start IPC server. `main_health_state` is threaded in so the `DaemonStatus`
+    // request (#3891) can report the reactive main-health-gate halt flag — the
+    // same `Arc` the work-finder and gate loop share above.
+    let server = IpcServer::new(
+        socket_path.clone(),
+        tm,
+        activity_db,
+        sweep_registry,
+        event_bus,
+        main_health_state.clone(),
+    );
 
     // Setup signal handler for graceful shutdown. We listen for BOTH SIGINT
     // (Ctrl-C, interactive) and SIGTERM (`kill <pid>`, the default signal a
@@ -546,6 +575,11 @@ fn handle_cli_command(command: Commands) -> Result<()> {
             weekly,
             format,
         } => handle_stats_command(role.as_deref(), issue, weekly, &format),
+        Commands::Status { .. } => {
+            // Routed directly in `main()` (it needs the async runtime for the
+            // socket round-trip), never dispatched through this sync handler.
+            unreachable!("Status is handled in main() before handle_cli_command")
+        }
         Commands::Init {
             workspace,
             defaults,
@@ -719,6 +753,235 @@ fn handle_cli_command(command: Commands) -> Result<()> {
                 }
             }
         }
+    }
+}
+
+/// Resolve the daemon's IPC socket path exactly as the running daemon does in
+/// `main()`: honour `LOOM_SOCKET_PATH` (test override) first, else
+/// `~/.loom/loom-daemon.sock`.
+fn resolve_socket_path() -> Result<PathBuf> {
+    if let Ok(path) = std::env::var("LOOM_SOCKET_PATH") {
+        return Ok(PathBuf::from(path));
+    }
+    let loom_dir = dirs::home_dir()
+        .ok_or_else(|| anyhow!("No home directory"))?
+        .join(".loom");
+    Ok(loom_dir.join("loom-daemon.sock"))
+}
+
+/// Connect to the running daemon over its Unix socket, send a single
+/// `DaemonStatus` request, and return the parsed report (Issue #3891).
+///
+/// Both the connect and the round-trip are individually bounded so an
+/// unresponsive/wedged daemon cannot hang the CLI. Errors when the daemon is
+/// unreachable (socket absent / not listening) or the response is malformed.
+async fn query_daemon_status(socket_path: &Path) -> Result<DaemonStatusReport> {
+    const TIMEOUT: Duration = Duration::from_secs(5);
+
+    let stream = tokio::time::timeout(TIMEOUT, UnixStream::connect(socket_path))
+        .await
+        .map_err(|_| anyhow!("connect timed out after {}s", TIMEOUT.as_secs()))?
+        .map_err(|e| anyhow!("connect failed: {e}"))?;
+    let (reader, mut writer) = stream.into_split();
+
+    let roundtrip = async move {
+        let request_json = serde_json::to_string(&Request::DaemonStatus)?;
+        writer.write_all(request_json.as_bytes()).await?;
+        writer.write_all(b"\n").await?;
+        writer.flush().await?;
+
+        let mut lines = BufReader::new(reader).lines();
+        let line = lines
+            .next_line()
+            .await?
+            .ok_or_else(|| anyhow!("daemon closed the connection without responding"))?;
+        let response: Response = serde_json::from_str(&line)?;
+        match response {
+            Response::DaemonStatus(report) => Ok(report),
+            Response::Error { message } => Err(anyhow!("daemon error: {message}")),
+            other => Err(anyhow!("unexpected response: {other:?}")),
+        }
+    };
+
+    tokio::time::timeout(TIMEOUT, roundtrip)
+        .await
+        .map_err(|_| anyhow!("status round-trip timed out after {}s", TIMEOUT.as_secs()))?
+}
+
+/// Collect per-token usage by shelling out to `loom-tokens check --json`,
+/// mirroring `probe-tokens.sh`: prefer the `loom-tokens` binary on PATH, else
+/// fall back to `python3 -m loom_tools.cli.loom_tokens`. Best-effort — returns
+/// `None` on any failure (binary absent, non-zero exit, unparseable output) so
+/// the status view still renders without the usage table.
+fn collect_token_usage() -> Option<serde_json::Value> {
+    let attempts: [(&str, &[&str]); 2] = [
+        ("loom-tokens", &["check", "--json"]),
+        ("python3", &["-m", "loom_tools.cli.loom_tokens", "check", "--json"]),
+    ];
+    for (bin, args) in attempts {
+        let Ok(output) = Command::new(bin).args(args).output() else {
+            continue;
+        };
+        if !output.status.success() {
+            continue;
+        }
+        if let Ok(value) = serde_json::from_slice::<serde_json::Value>(&output.stdout) {
+            return Some(value);
+        }
+    }
+    None
+}
+
+/// Handle the `status` subcommand — render the running daemon's autonomous-mode
+/// operability snapshot (Issue #3891). Fetches the daemon-native part over IPC
+/// and layers on the client-side per-token usage probe.
+async fn handle_status_command(json: bool) -> Result<()> {
+    let socket_path = resolve_socket_path()?;
+
+    let report = match query_daemon_status(&socket_path).await {
+        Ok(report) => report,
+        Err(e) => {
+            if json {
+                let err = serde_json::json!({
+                    "error": format!(
+                        "could not reach loom-daemon at {}: {e}",
+                        socket_path.display()
+                    ),
+                });
+                println!("{}", serde_json::to_string_pretty(&err)?);
+            } else {
+                eprintln!("Could not reach loom-daemon at {}: {e}", socket_path.display());
+                eprintln!();
+                eprintln!("Is the daemon running? Start it with:");
+                eprintln!("  ./.loom/scripts/cli/loom-daemon-start.sh");
+            }
+            std::process::exit(1);
+        }
+    };
+
+    // Per-token usage is a slow per-account network probe the daemon deliberately
+    // does NOT perform inside the IPC handler; collect it client-side here.
+    let token_usage = collect_token_usage();
+
+    if json {
+        print_status_json(&report, token_usage.as_ref())?;
+    } else {
+        print_status_human(&report, token_usage.as_ref());
+    }
+    Ok(())
+}
+
+/// Emit the combined status (daemon report + per-token usage) as JSON.
+fn print_status_json(
+    report: &DaemonStatusReport,
+    token_usage: Option<&serde_json::Value>,
+) -> Result<()> {
+    let combined = serde_json::json!({
+        "in_flight_count": report.in_flight.len(),
+        "in_flight": report.in_flight,
+        "dynamic_cap": {
+            "token_pool_size": report.token_pool_size,
+            "disk_headroom": report.disk_headroom,
+            "configured_max": report.configured_max,
+            "effective": report.dynamic_cap,
+        },
+        "main_health_gate": {
+            "halted": report.main_health_gate_halted,
+        },
+        "token_usage": token_usage,
+    });
+    println!("{}", serde_json::to_string_pretty(&combined)?);
+    Ok(())
+}
+
+/// Emit the combined status as a human-readable table.
+fn print_status_human(report: &DaemonStatusReport, token_usage: Option<&serde_json::Value>) {
+    println!("\n=== Loom Autonomous Daemon Status ===\n");
+
+    println!("In-flight sweeps: {}", report.in_flight.len());
+    if report.in_flight.is_empty() {
+        println!("  (none)");
+    } else {
+        println!("  {:<30} {:>7} {:>8}  {:<20} PHASE", "SWEEP", "ISSUE", "PID", "TOKEN");
+        println!("  {:-<75}", "");
+        for s in &report.in_flight {
+            let issue = match &s.kind {
+                SweepKind::Issue(n) => format!("#{n}"),
+                SweepKind::PrSet(_) => "prs".to_string(),
+            };
+            let phase = s.latest_phase.as_deref().unwrap_or("-");
+            println!(
+                "  {:<30} {:>7} {:>8}  {:<20} {}",
+                s.sweep_id, issue, s.pid, s.token_name, phase
+            );
+        }
+    }
+
+    println!("\nDynamic concurrency cap: {}", report.dynamic_cap);
+    println!(
+        "  = min(token pool {}, disk headroom {}, configured max {})",
+        report.token_pool_size, report.disk_headroom, report.configured_max
+    );
+
+    let gate = if report.main_health_gate_halted {
+        "HALTED (main is red — new dispatch paused; in-flight sweeps keep running)"
+    } else {
+        "clear (dispatch allowed)"
+    };
+    println!("\nMain-health gate: {gate}");
+
+    println!("\nPer-token usage:");
+    match token_usage {
+        Some(value) => print_token_usage_table(value),
+        None => println!(
+            "  (unavailable — `loom-tokens check --json` failed or the token pool is not bootstrapped)"
+        ),
+    }
+    println!();
+}
+
+/// Render the `loom-tokens check --json` report (`{ "accounts": [ { name,
+/// status, 5h_utilization, 7d_utilization, 7d_reset } ] }`) as a small table.
+/// Falls back to pretty-printed JSON if the shape is unexpected.
+fn print_token_usage_table(value: &serde_json::Value) {
+    let Some(accounts) = value.get("accounts").and_then(serde_json::Value::as_array) else {
+        // Unexpected shape — surface the raw JSON rather than dropping it.
+        if let Ok(pretty) = serde_json::to_string_pretty(value) {
+            for line in pretty.lines() {
+                println!("  {line}");
+            }
+        }
+        return;
+    };
+
+    if accounts.is_empty() {
+        println!("  (no accounts probed)");
+        return;
+    }
+
+    println!("  {:<22} {:<14} {:>8} {:>8}", "ACCOUNT", "STATUS", "5h", "7d");
+    println!("  {:-<54}", "");
+    for acct in accounts {
+        let name = acct
+            .get("name")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("?");
+        let status = acct
+            .get("status")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("?");
+        let fmt_pct = |key: &str| {
+            acct.get(key)
+                .and_then(serde_json::Value::as_f64)
+                .map_or_else(|| "-".to_string(), |u| format!("{:.0}%", u * 100.0))
+        };
+        println!(
+            "  {:<22} {:<14} {:>8} {:>8}",
+            name,
+            status,
+            fmt_pct("5h_utilization"),
+            fmt_pct("7d_utilization")
+        );
     }
 }
 

@@ -4,9 +4,10 @@ use crate::event_bus::EventBus;
 use crate::forge_parser::parse_forge_events;
 use crate::git_parser;
 use crate::git_utils;
+use crate::main_health_gate::MainHealthState;
 use crate::sweep_registry::{BeginCancel, SweepRegistry};
 use crate::terminal::TerminalManager;
-use crate::types::{Event, Request, Response};
+use crate::types::{DaemonStatusReport, Event, Request, Response};
 use anyhow::Result;
 use chrono::Utc;
 use std::path::{Path, PathBuf};
@@ -100,6 +101,10 @@ pub struct IpcServer {
     activity_db: Arc<Mutex<ActivityDb>>,
     sweep_registry: Arc<Mutex<SweepRegistry>>,
     event_bus: Arc<EventBus>,
+    /// Shared reactive main-health halt flag (#3812). Threaded into the IPC
+    /// server so the `DaemonStatus` request (#3891) can report the current
+    /// halt state — the same `Arc` the work-finder and gate loop share.
+    main_health_state: Arc<MainHealthState>,
 }
 
 impl IpcServer {
@@ -109,6 +114,7 @@ impl IpcServer {
         activity_db: Arc<Mutex<ActivityDb>>,
         sweep_registry: Arc<Mutex<SweepRegistry>>,
         event_bus: Arc<EventBus>,
+        main_health_state: Arc<MainHealthState>,
     ) -> Self {
         Self {
             socket_path,
@@ -116,6 +122,7 @@ impl IpcServer {
             activity_db,
             sweep_registry,
             event_bus,
+            main_health_state,
         }
     }
 
@@ -149,8 +156,9 @@ impl IpcServer {
                     let db = self.activity_db.clone();
                     let sr = self.sweep_registry.clone();
                     let bus = self.event_bus.clone();
+                    let health = self.main_health_state.clone();
                     tokio::spawn(async move {
-                        if let Err(e) = handle_client(stream, tm, db, sr, bus).await {
+                        if let Err(e) = handle_client(stream, tm, db, sr, bus, health).await {
                             log::error!("Client error: {e}");
                         }
                     });
@@ -169,6 +177,7 @@ async fn handle_client(
     activity_db: Arc<Mutex<ActivityDb>>,
     sweep_registry: Arc<Mutex<SweepRegistry>>,
     event_bus: Arc<EventBus>,
+    main_health_state: Arc<MainHealthState>,
 ) -> Result<()> {
     let (reader, mut writer) = stream.into_split();
     let mut lines = BufReader::new(reader).lines();
@@ -222,6 +231,21 @@ async fn handle_client(
                 Duration::from_secs(grace_secs),
             )
             .await;
+            let response_json = serde_json::to_string(&response)?;
+            writer.write_all(response_json.as_bytes()).await?;
+            writer.write_all(b"\n").await?;
+            continue;
+        }
+
+        // DaemonStatus (Issue #3891) is handled here rather than in the
+        // synchronous `handle_request` dispatcher because it reads the
+        // `main_health_state` halt flag, which the dispatcher does not receive.
+        // The report is cheap to build (a registry snapshot + a few pure
+        // filesystem reads for the dynamic-cap inputs); per-token usage is left
+        // to the CLI (a slow network probe) so this handler never blocks.
+        if let Request::DaemonStatus = request {
+            let report = build_daemon_status(&sweep_registry, &main_health_state);
+            let response = Response::DaemonStatus(report);
             let response_json = serde_json::to_string(&response)?;
             writer.write_all(response_json.as_bytes()).await?;
             writer.write_all(b"\n").await?;
@@ -379,6 +403,60 @@ async fn cancel_sweep_nonblocking(
         pid: outcome.pid,
         sigkill_sent: outcome.sigkill_sent,
         was_running: outcome.was_running,
+    }
+}
+
+/// Build the autonomous-mode operability snapshot for a `DaemonStatus` request
+/// (Issue #3891 — follow-up to #3813 Phase D).
+///
+/// Combines a live registry snapshot (in-flight = non-terminal sweeps) with the
+/// three dynamic-cap inputs recomputed from the workspace (token-pool size, disk
+/// headroom, configured ceiling) and the shared main-health-gate halt flag. The
+/// `min` of the three inputs is the effective dynamic cap the work finder would
+/// use on its next tick.
+///
+/// Per-token usage is intentionally excluded — probing each account for
+/// rate-limit headers is a slow network call the CLI performs client-side (via
+/// `loom-tokens check --json`), so this handler stays non-blocking.
+// Allow expect_used: a poisoned registry mutex means another thread panicked
+// while holding the lock — unrecoverable, so we crash (same policy as
+// `handle_request`).
+#[allow(clippy::expect_used)]
+pub fn build_daemon_status(
+    sweep_registry: &Arc<Mutex<SweepRegistry>>,
+    main_health_state: &MainHealthState,
+) -> DaemonStatusReport {
+    let (in_flight, workspace_root) = {
+        let sr = sweep_registry
+            .lock()
+            .expect("Sweep registry mutex poisoned");
+        // In-flight = sweeps still live (Pending / Running). Terminal sweeps
+        // (Exited / Crashed) linger in the registry but are not "in flight".
+        let in_flight = sr
+            .list(None)
+            .into_iter()
+            .filter(|info| !info.state.is_terminal())
+            .collect();
+        (in_flight, sr.config().workspace_root.clone())
+    };
+
+    let token_pool_size = crate::tokens::token_pool_size(&workspace_root);
+    let disk_headroom = crate::disk_headroom::disk_headroom_limit(&workspace_root);
+    let wf_config = crate::work_finder::read_work_finder_config(&workspace_root);
+    let configured_max = crate::work_finder::resolve_max_concurrent_with_config(&wf_config);
+    let dynamic_cap = crate::work_finder::resolve_dynamic_max_concurrent(
+        token_pool_size,
+        disk_headroom,
+        configured_max,
+    );
+
+    DaemonStatusReport {
+        in_flight,
+        token_pool_size,
+        disk_headroom,
+        configured_max,
+        dynamic_cap,
+        main_health_gate_halted: main_health_state.is_halted(),
     }
 }
 
@@ -1091,6 +1169,20 @@ fn handle_request(
             }
         }
 
+        Request::DaemonStatus => {
+            // DaemonStatus is intercepted in `handle_client` before it reaches
+            // this dispatcher because it needs the `main_health_state` halt flag
+            // (Issue #3891), which this synchronous dispatcher does not receive.
+            // Reaching this arm means the intercept was removed — fail loud so
+            // the mis-route is visible rather than silently returning a wrong
+            // (halt-unaware) report.
+            Response::Error {
+                message: "internal: DaemonStatus must be handled by build_daemon_status in \
+                          handle_client, not handle_request"
+                    .to_string(),
+            }
+        }
+
         Request::Shutdown => {
             log::info!("Shutdown requested");
             std::process::exit(0);
@@ -1777,6 +1869,96 @@ exit 0
 
         assert!(socket_has_live_listener(&sock).await);
         server.abort();
+    }
+
+    // ===== Autonomous daemon status (Issue #3891) =====
+
+    /// `Request::DaemonStatus` / `Response::DaemonStatus` must survive a serde
+    /// round-trip over the wire (pattern: the existing Ping/Pong probe + the
+    /// dispatch serde round-trips).
+    #[test]
+    fn test_daemon_status_request_response_round_trip() {
+        // Request: unit variant, `{"type":"DaemonStatus"}`.
+        let req = Request::DaemonStatus;
+        let json = serde_json::to_string(&req).expect("serialize request");
+        assert_eq!(json, r#"{"type":"DaemonStatus"}"#);
+        let back: Request = serde_json::from_str(&json).expect("deserialize request");
+        assert!(matches!(back, Request::DaemonStatus));
+
+        // Response: carries the full report.
+        let report = DaemonStatusReport {
+            in_flight: vec![],
+            token_pool_size: 4,
+            disk_headroom: 10,
+            configured_max: 5,
+            dynamic_cap: 4,
+            main_health_gate_halted: true,
+        };
+        let resp = Response::DaemonStatus(report);
+        let json = serde_json::to_string(&resp).expect("serialize response");
+        let back: Response = serde_json::from_str(&json).expect("deserialize response");
+        match back {
+            Response::DaemonStatus(r) => {
+                assert_eq!(r.token_pool_size, 4);
+                assert_eq!(r.disk_headroom, 10);
+                assert_eq!(r.configured_max, 5);
+                assert_eq!(r.dynamic_cap, 4);
+                assert!(r.main_health_gate_halted);
+                assert!(r.in_flight.is_empty());
+            }
+            other => panic!("Expected DaemonStatus, got: {other:?}"),
+        }
+    }
+
+    /// `build_daemon_status` reflects the shared main-health halt flag and lists
+    /// a live dispatched sweep as in-flight.
+    #[test]
+    #[serial_test::serial]
+    fn test_build_daemon_status_reports_halt_and_in_flight() {
+        use crate::main_health_gate::MainHealthState;
+
+        let (sr, _dir, _rec) = setup_sweep_registry_in_tempdir();
+
+        // Fresh state: not halted, no sweeps.
+        let health = MainHealthState::new();
+        let report = build_daemon_status(&sr, &health);
+        assert!(!report.main_health_gate_halted);
+        assert!(report.in_flight.is_empty());
+        // The tempdir has no `.loom/tokens/`, so the pool + dynamic cap are 0.
+        assert_eq!(report.token_pool_size, 0);
+        assert_eq!(report.dynamic_cap, 0);
+
+        // Dispatch a sweep -> it should show up as in-flight (Running).
+        {
+            let mut reg = sr.lock().unwrap();
+            reg.dispatch(&crate::types::SweepKind::Issue(3891), None, None, None, None)
+                .expect("dispatch");
+        }
+        let report = build_daemon_status(&sr, &health);
+        assert_eq!(report.in_flight.len(), 1);
+        assert!(matches!(report.in_flight[0].kind, crate::types::SweepKind::Issue(3891)));
+
+        // Flip the halt flag -> the report tracks it.
+        health.set_halted(true);
+        let report = build_daemon_status(&sr, &health);
+        assert!(report.main_health_gate_halted);
+    }
+
+    /// If `DaemonStatus` ever reaches the synchronous dispatcher (it is meant to
+    /// be intercepted in `handle_client`), it returns a loud Error sentinel.
+    #[test]
+    fn test_handle_request_daemon_status_short_circuits_to_error() {
+        let (tm, db, sr, bus) = setup_test_context();
+        let response = handle_request(Request::DaemonStatus, &tm, &db, &sr, &bus);
+        match response {
+            Response::Error { message } => {
+                assert!(
+                    message.contains("DaemonStatus must be handled by build_daemon_status"),
+                    "expected internal-bug error message; got: {message}"
+                );
+            }
+            other => panic!("Expected Error sentinel, got: {other:?}"),
+        }
     }
 
     #[test]
