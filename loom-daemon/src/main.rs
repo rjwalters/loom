@@ -290,6 +290,13 @@ async fn main() -> Result<()> {
         None
     };
 
+    // Shared reactive main-health halt flag (Issue #3812 — Phase C of epic
+    // #3809). Constructed here — before both the epic supervisor and the
+    // work-finder — so it can be threaded into both dispatch paths. When the gate
+    // loop (below) is disabled nothing ever flips it, so neither the supervisor
+    // nor the work-finder is ever halted (zero behavior change with the gate off).
+    let main_health_state = Arc::new(main_health_gate::MainHealthState::new());
+
     // Epic supervisor loop (Issue #3872 — Phase 4 of epic #3842). Opt-in via
     // `LOOM_EPIC_SUPERVISOR`. The loop drives every open `loom:epic` issue
     // through its fork-join lifecycle by dispatching the enabled role each tick.
@@ -308,7 +315,8 @@ async fn main() -> Result<()> {
                 let dispatcher =
                     epic_supervisor::forge::SpawnDispatcher::new(spawn_bin, sweep_registry.clone());
                 let supervisor = EpicSupervisor::new(source, dispatcher, IssueCreationMutex::new())
-                    .with_event_bus(event_bus.clone());
+                    .with_event_bus(event_bus.clone())
+                    .with_health_gate(main_health_state.clone());
                 let interval = epic_supervisor::resolve_supervisor_interval();
                 match epic_supervisor::spawn_supervisor_thread(supervisor, interval) {
                     Ok(handle) => {
@@ -351,13 +359,9 @@ async fn main() -> Result<()> {
     // interval task on the shared daemon runtime (like the reaper): every call
     // into `dispatch()` returns promptly (fire-and-forget child spawn), so the
     // finder never parks a runtime worker in a long blocking call.
-    // Shared reactive main-health halt flag (Issue #3812 — Phase C of epic
-    // #3809). Always constructed so it can be threaded into the work-finder;
-    // when the gate loop below is disabled nothing ever flips it, so the
-    // work-finder is never halted (zero behavior change with the gate off).
-    let main_health_state = Arc::new(main_health_gate::MainHealthState::new());
-
-    // Config surface (#3813): `.loom/config.json → autonomous.workFinder` lets a
+    // The shared reactive main-health halt flag (`main_health_state`) is
+    // constructed above (before the epic supervisor) so both dispatch paths share
+    // it. Config surface (#3813): `.loom/config.json → autonomous.workFinder` lets a
     // repo enable/tune the loop from committed config with zero env vars, while
     // an operator env var still overrides for a single run (precedence env >
     // config > default). An absent `autonomous` block is byte-for-byte the

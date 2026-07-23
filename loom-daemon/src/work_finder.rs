@@ -538,6 +538,10 @@ where
     );
     tokio::spawn(async move {
         let mut ticker = tokio::time::interval(interval);
+        // If a tick's work (disk probe + dispatch) overruns the interval, measure
+        // the next interval from when it finished rather than firing the missed
+        // ticks back-to-back (#3885). Matches the main-health gate loop.
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         // First tick fires immediately; skip it so we don't churn at boot.
         ticker.tick().await;
         // Track the halt state across ticks so we log the halt/resume edges
