@@ -528,7 +528,8 @@ never crashing the daemon. Dispatches surface on the frozen
 `sweep.global.dispatch` topic (emitted inside `dispatch()`); the finder adds no
 new event topics.
 
-Enable it with `LOOM_WORK_FINDER=1` (unset/false-y = OFF). Tunables:
+Enable it with `LOOM_WORK_FINDER=1` (unset/false-y = OFF) **or** from committed
+config (`autonomous.workFinder.enabled`, see "Operability" below). Tunables:
 `LOOM_WORK_FINDER_INTERVAL_SECS` (default 60 — tighter than the epic
 supervisor's 300s so the `loom:issue` backlog drains promptly),
 `LOOM_WORK_FINDER_MAX_CONCURRENT` (default 3 — the operator **ceiling** in the
@@ -541,6 +542,109 @@ unparseable value for any of these falls back to its default.
 > cadence remains out of scope (follow-up #3381). So "the daemon does not
 > generate work" below still holds — the finder only closes the gap between an
 > approved issue and its build.
+
+## Operability — config, start/stop, E2E (Phase D, #3813)
+
+Phases A–C built the autonomous *engine* (work finder, dynamic concurrency,
+main-health gate) as env-var-only surfaces. Phase D (#3813) adds the
+operator-facing layer: a committed config surface, safe start/stop wrappers for
+the raw daemon process, and a documented end-to-end acceptance playbook.
+
+### Config surface (`.loom/config.json → autonomous`)
+
+Autonomous mode can be enabled and tuned entirely from committed config — no env
+vars required — so a repo can declare "this workspace runs autonomous mode with
+concurrency ceiling 5" and share it with the team:
+
+```json
+{
+  "autonomous": {
+    "workFinder": {
+      "enabled": true,
+      "intervalSecs": 60,
+      "maxConcurrent": 5
+    },
+    "mainHealthGate": {
+      "enabled": true
+    }
+  }
+}
+```
+
+**Precedence is `env var > config value > built-in default` for every knob.** An
+operator env var still overrides the committed config for a single run
+(`LOOM_WORK_FINDER=0 loom-daemon` disables the loop even if config enables it).
+An **absent `autonomous` block is byte-for-byte identical to the pre-#3813
+env-only behavior** — the config read soft-fails (missing file / malformed JSON /
+missing block all resolve to "no config value → fall through to env/default"),
+exactly like `main_health_gate::read_build_gate_config`.
+
+| Config key | Env override | Default | Notes |
+|------------|--------------|---------|-------|
+| `autonomous.workFinder.enabled` | `LOOM_WORK_FINDER` | `false` | Master on/off for the finder loop |
+| `autonomous.workFinder.intervalSecs` | `LOOM_WORK_FINDER_INTERVAL_SECS` | `60` | Zero/invalid → default |
+| `autonomous.workFinder.maxConcurrent` | `LOOM_WORK_FINDER_MAX_CONCURRENT` | `3` | Operator **ceiling**, not a fixed target |
+| `autonomous.mainHealthGate.enabled` | `LOOM_MAIN_HEALTH_GATE` | `false` | Gate loop on/off |
+
+The **gate's behavior** (which command runs against `main`, its timeout) still
+comes from the separate top-level `buildGate` block (#3749); `autonomous.mainHealthGate`
+is purely the on/off surface, so Phase C's already-tested `buildGate` semantics
+are untouched. `LOOM_MAIN_HEALTH_GATE` remains the master override; the config
+key just lets a repo turn the gate on without exporting an env var.
+
+### Safe start / stop (raw daemon process)
+
+`.loom/bin/loom start|stop` manage the **tmux Manual-Orchestration-Mode pool** —
+a different process model from the `loom-daemon` binary that hosts the
+work-finder / health-gate loops. Two dedicated wrappers manage the raw daemon
+process:
+
+```bash
+# Bring up autonomous mode (work finder + health gate) as a backgrounded process:
+./.loom/scripts/cli/loom-daemon-start.sh
+
+# Enable strictly per .loom/config.json → autonomous (no env forcing):
+./.loom/scripts/cli/loom-daemon-start.sh --from-config
+
+# Selective / foreground variants:
+./.loom/scripts/cli/loom-daemon-start.sh --no-work-finder   # gate only
+./.loom/scripts/cli/loom-daemon-start.sh --no-health-gate   # finder only
+./.loom/scripts/cli/loom-daemon-start.sh --foreground       # run attached, no PID file
+
+# Clean shutdown:
+./.loom/scripts/cli/loom-daemon-stop.sh            # SIGTERM → grace → SIGKILL
+./.loom/scripts/cli/loom-daemon-stop.sh --force    # immediate SIGKILL
+```
+
+`loom-daemon-start.sh`:
+- locates the `loom-daemon` binary (`LOOM_DAEMON_BIN` → `PATH` → `target/{release,debug}`),
+- runs the **advisory** host-sleep check (`check-host-sleep.sh`, #3350) — never blocks the start,
+- backgrounds the daemon and writes a PID file at `.loom/.daemon.pid` (gitignored),
+- refuses a second start when the PID file points at a live process, and surfaces
+  the daemon's own **singleton-guard** refusal (#3806) — if the backgrounded
+  process exits immediately it prints the startup-log tail instead of leaving a
+  silently-dead process.
+
+`loom-daemon-stop.sh` sends **SIGTERM** (not just Ctrl-C/SIGINT — the daemon now
+handles both, #3813), waits `LOOM_DAEMON_STOP_GRACE_SECS` (default 10s), then
+escalates to SIGKILL.
+
+**Shutdown decision — sweeps survive, they are not drained.** A clean daemon stop
+removes the Unix socket and exits, but **does not cancel in-flight `/loom:sweep`
+children**. Those are independent detached processes that survive a daemon
+restart by design — killing the dispatcher must not kill dispatched work — and
+the registry reconciles their state on the next start (`SweepRegistry::reconstruct`
+re-admits live-lock owners). To actively cancel a sweep, use
+`mcp__loom__cancel_sweep` against a running daemon *before* stopping it.
+
+### End-to-end acceptance playbook
+
+The goal state — "file a `loom:triage` issue, watch it build" with zero operator
+dispatch — is validated by the E2E playbook at
+[`docs/autonomous-mode-e2e.md`](../../docs/autonomous-mode-e2e.md): it walks a
+throwaway issue from `loom:triage` → Curator → `loom:issue` → work-finder
+dispatch → PR → merge, with a scripted label-transition assertion, and confirms
+the operator only ever created the issue.
 
 ## Locks and lifecycle
 

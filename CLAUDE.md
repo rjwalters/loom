@@ -325,6 +325,27 @@ Configuration stored in `.loom/config.json` (committed to git for team sharing):
 
 The Rust `loom-daemon` binary is the load-bearing Tier 2 dispatch backend. It is a single long-lived process that holds the sweep registry, the event bus, and the reaper task in memory — there is no on-disk state file the operator needs to touch. See [`.loom/docs/daemon-reference.md`](.loom/docs/daemon-reference.md) for the full surface and [`docs/migration/v0.10.0-shepherd-deprecation.md`](docs/migration/v0.10.0-shepherd-deprecation.md) for the migration narrative away from the legacy Python brain.
 
+**Autonomous mode (config + start/stop, #3813)**: the daemon's autonomous work finder (#3810) and reactive main-health gate (#3812) can be enabled and tuned entirely from committed config — an `autonomous` block in `.loom/config.json` — with env vars still overriding for a single run (precedence **env > config > default**; an absent block is byte-for-byte the pre-#3813 env-only behavior):
+
+```json
+{
+  "autonomous": {
+    "workFinder": { "enabled": true, "intervalSecs": 60, "maxConcurrent": 5 },
+    "mainHealthGate": { "enabled": true }
+  }
+}
+```
+
+Start/stop the **raw daemon process** (distinct from the tmux `loom start|stop` pool) with dedicated wrappers that run the advisory host-sleep check, write a PID file (`.loom/.daemon.pid`), surface the singleton-guard refusal, and shut down cleanly on **SIGTERM** (not just Ctrl-C):
+
+```bash
+./.loom/scripts/cli/loom-daemon-start.sh              # work finder + health gate, backgrounded
+./.loom/scripts/cli/loom-daemon-start.sh --from-config # enable strictly per .loom/config.json
+./.loom/scripts/cli/loom-daemon-stop.sh               # SIGTERM → grace → SIGKILL
+```
+
+A clean stop leaves in-flight `/loom:sweep` children **running** (they survive a daemon restart by design; use `mcp__loom__cancel_sweep` to actively cancel). The full config table, start/stop flags, and a scripted end-to-end acceptance playbook are in [`.loom/docs/daemon-reference.md`](.loom/docs/daemon-reference.md) §Operability and [`docs/autonomous-mode-e2e.md`](docs/autonomous-mode-e2e.md).
+
 **Per-sweep logs** live at `.loom/logs/sweep-issue-<N>.log` and are tailable via `mcp__loom__tail_sweep_log`.
 
 **Sweep checkpoints** (`.loom/sweep-checkpoint/issue-<N>.json`, gitignored): when a sweep child crashes mid-flight, the checkpoint records the last completed phase. On the next dispatch the sweep skill resumes from that phase. The exact schema is owned by the sweep skill (#3373).

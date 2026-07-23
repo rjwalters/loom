@@ -312,11 +312,18 @@ async fn main() -> Result<()> {
     // work-finder is never halted (zero behavior change with the gate off).
     let main_health_state = Arc::new(main_health_gate::MainHealthState::new());
 
-    let _work_finder_handle = if work_finder::enabled() {
+    // Config surface (#3813): `.loom/config.json → autonomous.workFinder` lets a
+    // repo enable/tune the loop from committed config with zero env vars, while
+    // an operator env var still overrides for a single run (precedence env >
+    // config > default). An absent `autonomous` block is byte-for-byte the
+    // env-only behavior shipped in Phases A/B.
+    let work_finder_config = work_finder::read_work_finder_config(&sweep_workspace);
+
+    let _work_finder_handle = if work_finder::resolve_enabled(&work_finder_config) {
         let source = work_finder::GhWorkSource::new();
         let dispatcher = work_finder::RegistryDispatcher::new(sweep_registry.clone());
-        let interval = work_finder::resolve_interval();
-        let configured_max = work_finder::resolve_max_concurrent();
+        let interval = work_finder::resolve_interval_with_config(&work_finder_config);
+        let configured_max = work_finder::resolve_max_concurrent_with_config(&work_finder_config);
         log::info!(
             "work_finder: enabled (interval={}s, configured_max={configured_max}, \
              dynamic cap = min(pool, disk, configured_max))",
@@ -342,7 +349,13 @@ async fn main() -> Result<()> {
     // dispatching new sweeps until a green run clears it. The gate command runs
     // on a blocking thread (it may take minutes), so a plain `tokio::spawn`
     // interval task on the shared runtime is correct (like the reaper).
-    let _main_health_gate_handle = if main_health_gate::enabled() {
+    // Config surface (#3813): `autonomous.mainHealthGate.enabled` can enable the
+    // gate from committed config; `LOOM_MAIN_HEALTH_GATE` remains the master
+    // on/off override (precedence env > config > default). The gate's *behavior*
+    // (command, timeout) still comes from the separate `buildGate` block, so
+    // Phase C's tested semantics are unchanged.
+    let autonomous_gate_config = main_health_gate::read_autonomous_gate_config(&sweep_workspace);
+    let _main_health_gate_handle = if main_health_gate::resolve_enabled(&autonomous_gate_config) {
         match main_health_gate::read_build_gate_config(&sweep_workspace) {
             Some(gate_config) => {
                 let interval = main_health_gate::resolve_interval();
@@ -369,37 +382,82 @@ async fn main() -> Result<()> {
             }
         }
     } else {
-        log::debug!("main_health_gate: disabled (set LOOM_MAIN_HEALTH_GATE=1 + a buildGate config to enable)");
+        log::debug!("main_health_gate: disabled (set LOOM_MAIN_HEALTH_GATE=1 or autonomous.mainHealthGate.enabled=true + a buildGate config to enable)");
         None
     };
 
     // Start IPC server
     let server = IpcServer::new(socket_path.clone(), tm, activity_db, sweep_registry, event_bus);
 
-    // Setup signal handler for graceful shutdown
+    // Setup signal handler for graceful shutdown. We listen for BOTH SIGINT
+    // (Ctrl-C, interactive) and SIGTERM (`kill <pid>`, the default signal a
+    // backgrounded daemon receives from `loom-daemon-stop.sh` — #3813). Either
+    // one removes the socket and exits cleanly so a subsequent start does not
+    // trip the singleton guard on a stale socket.
+    //
+    // In-flight `/loom:sweep` children are NOT cancelled on shutdown — they are
+    // independent detached processes and survive a daemon restart by design
+    // (killing the dispatcher must not kill dispatched work). This is the
+    // documented "survive, don't drain" decision (see daemon-reference.md).
     let socket_path_clone = socket_path.clone();
     tokio::spawn(async move {
-        match tokio::signal::ctrl_c().await {
-            Ok(()) => {
-                log::info!("Received shutdown signal, cleaning up...");
-                // Signal the off-runtime epic supervisor loop to stop.
-                if let Some(flag) = &supervisor_shutdown {
-                    flag.store(true, std::sync::atomic::Ordering::Relaxed);
-                }
-                let _ = tokio::fs::remove_file(&socket_path_clone).await;
-                log::info!("Socket cleaned up, exiting");
-                std::process::exit(0);
-            }
-            Err(err) => {
-                log::error!("Unable to listen for shutdown signal: {err}");
-            }
+        let signal_name = wait_for_shutdown_signal().await;
+        log::info!("Received {signal_name}, cleaning up...");
+        // Signal the off-runtime epic supervisor loop to stop.
+        if let Some(flag) = &supervisor_shutdown {
+            flag.store(true, std::sync::atomic::Ordering::Relaxed);
         }
+        let _ = tokio::fs::remove_file(&socket_path_clone).await;
+        log::info!("Socket cleaned up, exiting");
+        std::process::exit(0);
     });
 
     log::info!("Loom daemon starting...");
     server.run().await?;
 
     Ok(())
+}
+
+/// Await either SIGINT (Ctrl-C) or, on Unix, SIGTERM (`kill <pid>`), returning a
+/// short human-readable name for whichever fired first. On non-Unix platforms
+/// only Ctrl-C is available. Introduced in #3813 so a backgrounded daemon shut
+/// down via `kill` (SIGTERM) cleans up its socket exactly like an interactive
+/// Ctrl-C, rather than being torn down by the default SIGTERM disposition with
+/// the socket left behind.
+async fn wait_for_shutdown_signal() -> &'static str {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        // If a signal stream cannot be installed, fall back to Ctrl-C only
+        // rather than aborting shutdown handling entirely.
+        match signal(SignalKind::terminate()) {
+            Ok(mut sigterm) => {
+                tokio::select! {
+                    r = tokio::signal::ctrl_c() => {
+                        if let Err(err) = r {
+                            log::error!("Unable to listen for Ctrl-C: {err}");
+                        }
+                        "SIGINT (Ctrl-C)"
+                    }
+                    _ = sigterm.recv() => "SIGTERM",
+                }
+            }
+            Err(err) => {
+                log::error!("Unable to install SIGTERM handler ({err}); listening for Ctrl-C only");
+                if let Err(err) = tokio::signal::ctrl_c().await {
+                    log::error!("Unable to listen for Ctrl-C: {err}");
+                }
+                "SIGINT (Ctrl-C)"
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        if let Err(err) = tokio::signal::ctrl_c().await {
+            log::error!("Unable to listen for Ctrl-C: {err}");
+        }
+        "SIGINT (Ctrl-C)"
+    }
 }
 
 fn check_tmux_installed() -> Result<()> {

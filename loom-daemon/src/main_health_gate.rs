@@ -448,12 +448,88 @@ fn log_transition(transition: HealthTransition, outcome: &GateOutcome) {
 
 /// Whether the main-health gate loop is enabled, per
 /// [`MAIN_HEALTH_GATE_ENABLE_ENV`]. Off by default (opt-in); parsing mirrors
-/// [`crate::work_finder::enabled`].
+/// [`crate::work_finder::enabled`]. This is the **env-only** primitive; the
+/// config-aware entry point the daemon uses is [`resolve_enabled`] (precedence
+/// env > config > default).
 #[must_use]
 pub fn enabled() -> bool {
     std::env::var(MAIN_HEALTH_GATE_ENABLE_ENV).is_ok_and(|v| {
         matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on")
     })
+}
+
+/// The subset of `.loom/config.json → autonomous.mainHealthGate` this module
+/// consumes. Today it carries only the enablement flag; future tuning knobs
+/// (cadence, timeout) can be added here without touching the call site.
+///
+/// The gate's *behavior* (which command runs against `main`, its timeout) still
+/// comes from the separate `buildGate` block via [`read_build_gate_config`] —
+/// `autonomous.mainHealthGate` is purely the on/off (and future tuning) surface,
+/// so Phase C's already-tested `buildGate` semantics are untouched.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AutonomousGateConfig {
+    /// `autonomous.mainHealthGate.enabled` — whether to run the gate loop.
+    /// `None` when the key is absent (falls through to env / default).
+    pub enabled: Option<bool>,
+}
+
+/// Read `.loom/config.json → autonomous.mainHealthGate`, soft-failing to an
+/// all-`None` config on any of: missing file, malformed JSON, or a missing
+/// `autonomous` / `mainHealthGate` block. Mirrors [`read_build_gate_config`]'s
+/// soft-fail contract — a repo with no `autonomous` block gets zero behavior
+/// change (env-only enablement, exactly like Phase C shipped).
+#[must_use]
+pub fn read_autonomous_gate_config(repo_root: &Path) -> AutonomousGateConfig {
+    let config_path = repo_root.join(".loom").join("config.json");
+
+    let config_str = match std::fs::read_to_string(&config_path) {
+        Ok(s) => s,
+        Err(e) => {
+            log::debug!(
+                "main_health_gate: could not read config at {}: {e}",
+                config_path.display()
+            );
+            return AutonomousGateConfig::default();
+        }
+    };
+
+    let config: serde_json::Value = match serde_json::from_str(&config_str) {
+        Ok(v) => v,
+        Err(e) => {
+            log::warn!(
+                "main_health_gate: could not parse config at {}: {e}",
+                config_path.display()
+            );
+            return AutonomousGateConfig::default();
+        }
+    };
+
+    let Some(gate) = config
+        .get("autonomous")
+        .and_then(|a| a.get("mainHealthGate"))
+    else {
+        return AutonomousGateConfig::default();
+    };
+
+    AutonomousGateConfig {
+        enabled: gate.get("enabled").and_then(serde_json::Value::as_bool),
+    }
+}
+
+/// Resolve whether the gate loop is enabled with precedence **env > config >
+/// default(false)**. When [`MAIN_HEALTH_GATE_ENABLE_ENV`] is *set* (to any
+/// value) it decides (truthy enables, anything else disables); when unset the
+/// config `enabled` flag decides; absent config leaves it off.
+///
+/// Keeping `LOOM_MAIN_HEALTH_GATE` as the master on/off preserves Phase C's
+/// opt-in contract byte-for-byte when no `autonomous` block is present, while
+/// letting a repo enable the gate entirely from committed config.
+#[must_use]
+pub fn resolve_enabled(config: &AutonomousGateConfig) -> bool {
+    if let Ok(v) = std::env::var(MAIN_HEALTH_GATE_ENABLE_ENV) {
+        return matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on");
+    }
+    config.enabled.unwrap_or(false)
 }
 
 /// Resolve the gate cadence from [`MAIN_HEALTH_GATE_INTERVAL_ENV`], falling back
@@ -794,5 +870,76 @@ mod tests {
         std::env::set_var(MAIN_HEALTH_GATE_INTERVAL_ENV, "garbage");
         assert_eq!(resolve_interval(), Duration::from_secs(DEFAULT_MAIN_HEALTH_GATE_INTERVAL_SECS));
         std::env::remove_var(MAIN_HEALTH_GATE_INTERVAL_ENV);
+    }
+
+    // ===================================================================
+    // Autonomous config surface — autonomous.mainHealthGate (#3813)
+    // ===================================================================
+
+    #[test]
+    fn test_autonomous_config_missing_file_is_none() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert_eq!(read_autonomous_gate_config(tmp.path()), AutonomousGateConfig::default());
+    }
+
+    #[test]
+    fn test_autonomous_config_malformed_json_is_none() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_config(tmp.path(), "{not valid json");
+        assert_eq!(read_autonomous_gate_config(tmp.path()), AutonomousGateConfig::default());
+    }
+
+    #[test]
+    fn test_autonomous_config_missing_block_is_none() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_config(tmp.path(), r#"{"autonomous": {"workFinder": {"enabled": true}}}"#);
+        assert_eq!(read_autonomous_gate_config(tmp.path()), AutonomousGateConfig::default());
+    }
+
+    #[test]
+    fn test_autonomous_config_enabled_true_and_false() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_config(tmp.path(), r#"{"autonomous": {"mainHealthGate": {"enabled": true}}}"#);
+        assert_eq!(
+            read_autonomous_gate_config(tmp.path()),
+            AutonomousGateConfig {
+                enabled: Some(true)
+            }
+        );
+        write_config(tmp.path(), r#"{"autonomous": {"mainHealthGate": {"enabled": false}}}"#);
+        assert_eq!(
+            read_autonomous_gate_config(tmp.path()),
+            AutonomousGateConfig {
+                enabled: Some(false)
+            }
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn test_resolve_enabled_precedence() {
+        std::env::remove_var(MAIN_HEALTH_GATE_ENABLE_ENV);
+
+        // Absent config + unset env ⇒ default off (Phase C opt-in preserved).
+        assert!(!resolve_enabled(&AutonomousGateConfig::default()));
+
+        // Config alone enables/disables when env is unset.
+        assert!(resolve_enabled(&AutonomousGateConfig {
+            enabled: Some(true)
+        }));
+        assert!(!resolve_enabled(&AutonomousGateConfig {
+            enabled: Some(false)
+        }));
+
+        // Env overrides config in both directions (env is the master switch).
+        std::env::set_var(MAIN_HEALTH_GATE_ENABLE_ENV, "1");
+        assert!(resolve_enabled(&AutonomousGateConfig {
+            enabled: Some(false)
+        }));
+        std::env::set_var(MAIN_HEALTH_GATE_ENABLE_ENV, "0");
+        assert!(!resolve_enabled(&AutonomousGateConfig {
+            enabled: Some(true)
+        }));
+        std::env::remove_var(MAIN_HEALTH_GATE_ENABLE_ENV);
     }
 }
