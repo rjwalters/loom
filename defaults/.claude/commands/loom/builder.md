@@ -674,14 +674,36 @@ Without a comment, the next attempt starts from scratch with zero context. The c
 - Don't leave a vague comment like "couldn't figure it out" — be specific about what you investigated
 - Don't skip the `loom:blocked` label — the comment is supplemental, not a replacement
 
-### CRITICAL: Never Close Issues
+### Issues Are Suggestions — Close or Rescope With Rationale (Role Autonomy)
 
-You MUST NOT close issues under any circumstances. Issues should only close via PR auto-close (`Closes #N` in the PR body). This includes:
-- DO NOT close issues you believe "don't need changes" — add label `loom:blocked` with a comment explaining why, then exit
-- DO NOT close duplicates — flag them for human review instead
-- DO NOT close issues for any reason — only GitHub's PR auto-close mechanism should close issues
+Treat the issue you claimed as a **suggestion, not a mandate**. The normal, overwhelmingly-common path is still: implement it and let GitHub auto-close it via `Closes #N` in the PR body. But you are **not** obligated to build whatever is filed. When, after investigating, you judge that building it is not the best outcome, you have standing authority to **close** it (with a rationale) or **rescope** it — rather than forcing a low-value or wrong PR.
 
-**Why this matters**: Closing an issue manually destroys a legitimate feature request and bypasses the PR review pipeline. Sweep phase validation will detect this and reopen the issue, but the interruption to sweep orchestration and loss of builder context is already done.
+**When to close directly** (state the rationale in a comment FIRST, then close — no PR needed):
+- **Obsolete** — the condition no longer exists (code/feature already gone; nothing to change).
+- **Already covered** — a merged PR or another issue already delivers it (a genuine "no changes needed").
+- **Low value vs. cost** — an extreme-edge or trivial follow-up whose cost dwarfs its return.
+- **Wrong approach with no salvageable core** — the request bakes in an incorrect approach and there is nothing worth keeping (if there IS a salvageable core, rescope instead).
+
+```bash
+# Rationale comment FIRST (the breadcrumb), then close, then release the claim:
+gh issue comment <number> --body "Closing as not planned: <specific rationale>. <evidence: already delivered by #<n> / condition gone as of <sha> / …>."
+gh issue close <number> --reason "not planned"
+gh issue edit <number> --remove-label "loom:building"
+```
+
+> **Under `/loom:sweep` orchestration**, prefer the `.no-changes-needed` marker (see "Signaling No Changes Needed" below) and let orchestration finalize the lifecycle — a Builder subagent closing the issue out from under the orchestrator can race it. Write the marker with your rationale and exit; the direct `gh issue close` path above is for **manual Builder runs** where you own the whole lifecycle.
+
+**When to rescope** (the core is worth keeping, but not as filed):
+- Correct the scope by editing the body / adding a comment, then implement the corrected scope in your PR.
+- If it is genuinely too large or should be split, decompose it (see Complexity Assessment / `builder-complexity.md`) and relabel so the queue reflects reality — **remove `loom:issue`** if the current labels no longer describe an approved, ready scope, dropping it back to `loom:triage`.
+
+**Guardrails (safety — do NOT skip these):**
+- **Always comment the rationale BEFORE closing.** A silent close destroys context and looks like an escape. `--reason "not planned"` marks it a judgment call, not a fix.
+- **Never close an issue that encodes a still-pending human decision.** If the right call needs a human (policy, a controversial trade-off, security/access, anything you are not authorized to settle), do **not** close — add `loom:blocked` (waiting on a dependency/clarification) or `loom:operator-only` (a human must act) with a comment, then exit. This is the atomic transition described in "CRITICAL: Label Discipline".
+- **"Don't need changes" is now closeable with evidence** — but only when you can point to *why* (already delivered by #N, condition gone). If you are unsure, `loom:blocked` + comment, do not close on a hunch.
+- **Never invent new labels.** Use only the existing label set.
+
+**Composes with the work-finder**: a **closed** issue leaves the queue automatically (the autonomous work-finder only polls *open* `loom:issue` items), so a well-reasoned close is not re-picked-up. A **rescoped** issue must have its labels reset so it is not re-dispatched in a loop with a stale scope.
 
 ## Complexity Assessment
 
