@@ -65,9 +65,11 @@
 //!    deduplicated per child issue number.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 
 use crate::epic_state::{count_phase_sections, derive_epic_state, EpicState, PhaseChild};
 use crate::issue_creation_mutex::{IssueCreationMutex, CHAMPION_EPIC_DECOMP};
@@ -87,6 +89,22 @@ pub const DEFAULT_INFLIGHT_TTL_SECS: u64 = 900;
 /// Environment variable overriding [`DEFAULT_INFLIGHT_TTL_SECS`]. Follows the
 /// `LOOM_*` convention used elsewhere in the daemon.
 pub const INFLIGHT_TTL_ENV: &str = "LOOM_EPIC_INFLIGHT_TTL_SECS";
+
+/// Environment variable enabling the epic supervisor loop (Phase 4, #3872).
+///
+/// The supervisor is **opt-in** — unset or a false-y value keeps it OFF —
+/// because the loop autonomously dispatches roles that spawn Architect /
+/// Champion processes and create GitHub issues. Set to `1` / `true` / `yes` /
+/// `on` to enable.
+pub const SUPERVISOR_ENABLE_ENV: &str = "LOOM_EPIC_SUPERVISOR";
+
+/// Environment variable overriding the supervisor tick interval (seconds).
+pub const SUPERVISOR_INTERVAL_ENV: &str = "LOOM_EPIC_SUPERVISOR_INTERVAL_SECS";
+
+/// Default supervisor tick interval. Epics advance on the order of minutes
+/// (each transition spawns a role process), so a 5-minute cadence is ample and
+/// keeps forge query volume low.
+pub const DEFAULT_SUPERVISOR_INTERVAL_SECS: u64 = 300;
 
 // ============================================================================
 // Fetched epic facts
@@ -632,6 +650,194 @@ fn resolve_inflight_ttl() -> Duration {
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
         .map_or_else(|| Duration::from_secs(DEFAULT_INFLIGHT_TTL_SECS), Duration::from_secs)
+}
+
+// ============================================================================
+// Runtime wiring — the supervisor loop runs OFF the async runtime (#3872)
+// ============================================================================
+//
+// # Why a dedicated OS thread (Phase 4, #3872)
+//
+// [`EpicSupervisor::tick`] is an `async fn` for one reason: the two
+// issue-creating expand paths acquire the #3707 [`IssueCreationMutex`]
+// (a `tokio::sync::Mutex`) and hold the guard across the dispatch so the
+// `gh issue create` burst is serialized. But the concrete
+// [`forge::SpawnDispatcher::dispatch_role`] is **spawn-and-wait**: it calls
+// `Command::status()`, blocking the calling thread until the Architect /
+// Champion process exits — potentially minutes. That spawn-and-wait is
+// deliberate and correct (the mutex *must* stay held until the burst finishes),
+// so the only question is *where* the blocking call runs.
+//
+// A naive `tokio::spawn(async move { loop { sup.tick().await; ... } })` on the
+// shared daemon runtime would park a worker thread inside that blocking
+// `Command::status()` for the whole role-process lifetime. On the daemon's
+// multi-threaded runtime that starves a worker; on a current-thread runtime it
+// would freeze the event bus, reaper, sweep registry, and IPC listener for
+// minutes.
+//
+// So the loop runs on its **own dedicated OS thread** with a private
+// current-thread Tokio runtime. `tick()` still `.await`s the tokio mutex there
+// (tokio mutexes are runtime-agnostic — the shared daemon-global handle works
+// across runtimes), but every blocking `Command::status()` happens on this one
+// thread. The shared daemon runtime never sees the block and stays fully
+// responsive.
+
+/// Whether the epic supervisor loop is enabled, per [`SUPERVISOR_ENABLE_ENV`].
+///
+/// Off by default (opt-in) — see [`SUPERVISOR_ENABLE_ENV`].
+#[must_use]
+pub fn supervisor_enabled() -> bool {
+    std::env::var(SUPERVISOR_ENABLE_ENV).is_ok_and(|v| {
+        matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on")
+    })
+}
+
+/// Resolve the supervisor tick interval from [`SUPERVISOR_INTERVAL_ENV`],
+/// falling back to [`DEFAULT_SUPERVISOR_INTERVAL_SECS`]. A zero or unparseable
+/// value falls back to the default (a zero-interval busy loop is never useful).
+#[must_use]
+pub fn resolve_supervisor_interval() -> Duration {
+    std::env::var(SUPERVISOR_INTERVAL_ENV)
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|&s| s > 0)
+        .map_or_else(|| Duration::from_secs(DEFAULT_SUPERVISOR_INTERVAL_SECS), Duration::from_secs)
+}
+
+/// Handle to a running supervisor loop thread.
+///
+/// The loop runs on a dedicated OS thread (see the module-level rationale). The
+/// handle owns a shared shutdown flag: [`shutdown`](Self::shutdown) signals the
+/// loop to stop at the next interval boundary and joins the thread. Dropping
+/// the handle without calling `shutdown` signals the flag but does **not** join
+/// (a tick may be blocked in a minutes-long role process; the OS reaps the
+/// thread on process exit, matching how every other daemon subsystem — reaper,
+/// event bus, IPC — is torn down by `process::exit`).
+pub struct SupervisorHandle {
+    shutdown: Arc<AtomicBool>,
+    join: Option<std::thread::JoinHandle<()>>,
+}
+
+impl SupervisorHandle {
+    /// A clone of the shutdown flag, so another subsystem (e.g. the daemon's
+    /// signal handler) can request a graceful stop without owning the handle.
+    #[must_use]
+    pub fn shutdown_token(&self) -> Arc<AtomicBool> {
+        self.shutdown.clone()
+    }
+
+    /// True until a stop has been requested (via [`shutdown`](Self::shutdown)
+    /// or the shared [`shutdown_token`](Self::shutdown_token)).
+    #[must_use]
+    pub fn is_running(&self) -> bool {
+        !self.shutdown.load(Ordering::Relaxed)
+    }
+
+    /// Signal the loop to stop and join the thread. Idempotent. Blocks until
+    /// the current in-flight tick returns, so a caller on the async runtime
+    /// should avoid calling this while a role dispatch may be in flight.
+    pub fn shutdown(&mut self) {
+        self.shutdown.store(true, Ordering::Relaxed);
+        if let Some(handle) = self.join.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+impl Drop for SupervisorHandle {
+    fn drop(&mut self) {
+        // Request stop but do NOT join here — a tick may be blocked in a
+        // long-running role process, and process exit reaps the thread anyway.
+        self.shutdown.store(true, Ordering::Relaxed);
+    }
+}
+
+/// Sleep for `total`, waking early (within `CHUNK`) once `shutdown` is set, so
+/// a stop request between ticks is honored promptly rather than after a full
+/// interval.
+fn sleep_interruptible(total: Duration, shutdown: &AtomicBool) {
+    const CHUNK: Duration = Duration::from_millis(250);
+    let mut remaining = total;
+    while remaining > Duration::ZERO {
+        if shutdown.load(Ordering::Relaxed) {
+            return;
+        }
+        let nap = remaining.min(CHUNK);
+        std::thread::sleep(nap);
+        remaining = remaining.saturating_sub(nap);
+    }
+}
+
+/// Spawn the supervisor loop on a dedicated OS thread and return its
+/// [`SupervisorHandle`].
+///
+/// The thread builds a private current-thread Tokio runtime and, every
+/// `interval`, `block_on`s [`EpicSupervisor::tick`]. Because the blocking
+/// spawn-and-wait dispatch executes on this thread's runtime — never the shared
+/// daemon runtime — a minutes-long role process cannot starve the daemon's
+/// event bus, reaper, sweep registry, or IPC listener (#3872).
+///
+/// # Errors
+///
+/// Returns an error if the OS thread cannot be spawned.
+pub fn spawn_supervisor_thread<S, D>(
+    mut supervisor: EpicSupervisor<S, D>,
+    interval: Duration,
+) -> Result<SupervisorHandle>
+where
+    S: EpicSource + Send + 'static,
+    D: EpicDispatcher + Send + 'static,
+{
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let shutdown_thread = shutdown.clone();
+    let join = std::thread::Builder::new()
+        .name("loom-epic-supervisor".to_string())
+        .spawn(move || {
+            // Private current-thread runtime: `tick()` awaits the tokio
+            // IssueCreationMutex, but the blocking Command::status() inside a
+            // dispatch runs here, off the shared daemon runtime (#3872).
+            let rt = match tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            {
+                Ok(rt) => rt,
+                Err(e) => {
+                    log::error!("epic_supervisor: failed to build loop runtime: {e}");
+                    return;
+                }
+            };
+            log::info!("epic_supervisor: loop started (interval={}s)", interval.as_secs());
+            while !shutdown_thread.load(Ordering::Relaxed) {
+                match rt.block_on(supervisor.tick()) {
+                    Ok(report) => {
+                        if report.roles_dispatched > 0
+                            || report.sweeps_dispatched > 0
+                            || report.errors > 0
+                        {
+                            log::info!(
+                                "epic_supervisor: tick — {} epic(s) seen, {} role(s), \
+                                 {} sweep(s), {} skipped, {} error(s)",
+                                report.epics_seen,
+                                report.roles_dispatched,
+                                report.sweeps_dispatched,
+                                report.skipped_in_flight,
+                                report.errors
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        log::warn!("epic_supervisor: tick failed to list epics: {e}");
+                    }
+                }
+                sleep_interruptible(interval, &shutdown_thread);
+            }
+            log::info!("epic_supervisor: loop stopped");
+        })
+        .context("failed to spawn epic supervisor thread")?;
+    Ok(SupervisorHandle {
+        shutdown,
+        join: Some(join),
+    })
 }
 
 // ============================================================================
@@ -1316,5 +1522,160 @@ mod tests {
         // A fresh supervisor with an explicit override honors it.
         let sup = supervisor(vec![]).with_inflight_ttl(Duration::from_secs(1234));
         assert_eq!(sup.inflight_ttl, Duration::from_secs(1234));
+    }
+
+    // ===================================================================
+    // Phase 4 (#3872): runtime wiring — off-runtime supervisor loop thread
+    // ===================================================================
+
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::{Arc, Mutex};
+
+    use serial_test::serial;
+
+    /// A `Send` source that always yields the same fixed epics — usable from
+    /// the dedicated supervisor thread (unlike the non-`Send`-shared
+    /// `FixedSource`, this one is self-contained).
+    struct SharedSource {
+        epics: Vec<EpicSnapshot>,
+    }
+    impl EpicSource for SharedSource {
+        fn list_open_epics(&mut self) -> Result<Vec<EpicSnapshot>> {
+            Ok(self.epics.clone())
+        }
+    }
+
+    /// A `Send` dispatcher recording dispatch counts into shared atomics so a
+    /// test can observe progress of the loop running on another thread.
+    struct CountingDispatcher {
+        roles: Arc<AtomicUsize>,
+        sweeps: Arc<AtomicUsize>,
+        /// The thread id the blocking dispatch actually ran on — proves the
+        /// dispatch executes off the caller's thread.
+        dispatch_thread: Arc<Mutex<Option<std::thread::ThreadId>>>,
+    }
+    impl EpicDispatcher for CountingDispatcher {
+        fn dispatch_role(&mut self, _epic: u32, _shape: &DispatchShape) -> Result<()> {
+            *self.dispatch_thread.lock().unwrap() = Some(std::thread::current().id());
+            self.roles.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+        fn dispatch_sweep(&mut self, _epic: u32, _child: u32) -> Result<()> {
+            self.sweeps.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    /// Block up to `deadline` for `cond` to hold, polling briefly.
+    fn wait_until(deadline: Duration, mut cond: impl FnMut() -> bool) -> bool {
+        let start = Instant::now();
+        while start.elapsed() < deadline {
+            if cond() {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        cond()
+    }
+
+    #[test]
+    fn test_spawn_supervisor_thread_ticks_then_shuts_down() {
+        let roles = Arc::new(AtomicUsize::new(0));
+        let sweeps = Arc::new(AtomicUsize::new(0));
+        let dispatch_thread = Arc::new(Mutex::new(None));
+        let dispatcher = CountingDispatcher {
+            roles: roles.clone(),
+            sweeps: sweeps.clone(),
+            dispatch_thread: dispatch_thread.clone(),
+        };
+        // A single needs_decomp epic: the first tick dispatches the Architect
+        // enrich, subsequent ticks dedup (in-flight), so `roles` settles at 1.
+        let source = SharedSource {
+            epics: vec![EpicSnapshot::new(1, "flat body", vec![], vec![])],
+        };
+        let sup = EpicSupervisor::new(source, dispatcher, IssueCreationMutex::new());
+
+        let caller_thread = std::thread::current().id();
+        let mut handle = spawn_supervisor_thread(sup, Duration::from_millis(20)).unwrap();
+        assert!(handle.is_running());
+
+        // The loop should dispatch the singleton architect transition promptly.
+        assert!(
+            wait_until(Duration::from_secs(5), || roles.load(Ordering::SeqCst) >= 1),
+            "supervisor loop never dispatched"
+        );
+
+        handle.shutdown();
+        assert!(!handle.is_running(), "handle reports stopped after shutdown");
+
+        // Exactly one role dispatched (idempotent dedup across the many ticks
+        // that ran before shutdown); no sweeps for a needs_decomp epic.
+        assert_eq!(roles.load(Ordering::SeqCst), 1, "singleton dedup held across ticks");
+        assert_eq!(sweeps.load(Ordering::SeqCst), 0);
+
+        // The blocking dispatch ran on the dedicated supervisor thread, NOT the
+        // test's (caller's) thread — the core #3872 guarantee.
+        let ran_on = dispatch_thread
+            .lock()
+            .unwrap()
+            .expect("dispatch recorded a thread");
+        assert_ne!(ran_on, caller_thread, "dispatch must run off the caller thread");
+    }
+
+    #[test]
+    fn test_supervisor_handle_shutdown_is_idempotent() {
+        let source = SharedSource { epics: vec![] };
+        let sup =
+            EpicSupervisor::new(source, RecordingDispatcher::default(), IssueCreationMutex::new());
+        let mut handle = spawn_supervisor_thread(sup, Duration::from_millis(20)).unwrap();
+        let token = handle.shutdown_token();
+        // An external subsystem (e.g. the signal handler) can request stop via
+        // the shared token.
+        token.store(true, Ordering::Relaxed);
+        assert!(!handle.is_running());
+        handle.shutdown();
+        handle.shutdown(); // second call is a no-op (already joined)
+        assert!(!handle.is_running());
+    }
+
+    #[test]
+    #[serial]
+    fn test_supervisor_enable_gating() {
+        std::env::remove_var(SUPERVISOR_ENABLE_ENV);
+        assert!(!supervisor_enabled(), "off by default (opt-in)");
+        for truthy in ["1", "true", "TRUE", "yes", "on", " on "] {
+            std::env::set_var(SUPERVISOR_ENABLE_ENV, truthy);
+            assert!(supervisor_enabled(), "'{truthy}' enables");
+        }
+        for falsy in ["0", "false", "no", "off", "nonsense", ""] {
+            std::env::set_var(SUPERVISOR_ENABLE_ENV, falsy);
+            assert!(!supervisor_enabled(), "'{falsy}' stays disabled");
+        }
+        std::env::remove_var(SUPERVISOR_ENABLE_ENV);
+    }
+
+    #[test]
+    #[serial]
+    fn test_resolve_supervisor_interval_default_and_override() {
+        assert_eq!(DEFAULT_SUPERVISOR_INTERVAL_SECS, 300);
+        std::env::remove_var(SUPERVISOR_INTERVAL_ENV);
+        assert_eq!(
+            resolve_supervisor_interval(),
+            Duration::from_secs(DEFAULT_SUPERVISOR_INTERVAL_SECS)
+        );
+        std::env::set_var(SUPERVISOR_INTERVAL_ENV, "45");
+        assert_eq!(resolve_supervisor_interval(), Duration::from_secs(45));
+        // Zero / garbage fall back to the default (no busy loop).
+        std::env::set_var(SUPERVISOR_INTERVAL_ENV, "0");
+        assert_eq!(
+            resolve_supervisor_interval(),
+            Duration::from_secs(DEFAULT_SUPERVISOR_INTERVAL_SECS)
+        );
+        std::env::set_var(SUPERVISOR_INTERVAL_ENV, "notanumber");
+        assert_eq!(
+            resolve_supervisor_interval(),
+            Duration::from_secs(DEFAULT_SUPERVISOR_INTERVAL_SECS)
+        );
+        std::env::remove_var(SUPERVISOR_INTERVAL_ENV);
     }
 }
