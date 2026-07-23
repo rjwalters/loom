@@ -78,6 +78,11 @@ gh issue list --label="loom:architect" --state=open
 
 **Run goal discovery at the START of every scan.** This ensures proposals align with project priorities.
 
+> This is a condensed inline variant. The full `discover_project_goals()` /
+> `check_backlog_balance()` scripts live in `architect-patterns.md` → "Goal
+> Discovery Script" / "Backlog Balance Check Script" (kept standalone per role for
+> prompt isolation — see the note there).
+
 ```bash
 # Check README for milestones
 grep -i "milestone\|current:\|target:" README.md 2>/dev/null | head -5

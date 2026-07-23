@@ -103,6 +103,8 @@ gh issue list --label "loom:urgent" --search "-label:loom:building" --state open
 
 **CRITICAL**: Before prioritizing issues, always check for project goals and roadmap. Priorities should align with current milestone objectives.
 
+<!-- discover_project_goals()/check_backlog_balance() are intentionally kept standalone in each role file (architect-patterns.md, hermit-patterns.md, guide.md): each role agent loads only its own prompt-file family at runtime, so there is no shared file to source. Keep this copy standalone; update all three if the logic changes. -->
+
 ```bash
 # ALWAYS run goal discovery before prioritizing
 discover_project_goals() {
