@@ -264,7 +264,7 @@ Curator → Builder → Judge → Doctor (if needed) → Merge
 
 ### Curator Workflow
 
-1. Find unlabeled issues: `gh issue list --label="!loom:issue,!loom:building,!loom:architect,!loom:hermit,!loom:curated,!loom:curating"`
+1. Find unlabeled issues: `gh issue list --search "-label:loom:issue -label:loom:building -label:loom:architect -label:loom:hermit -label:loom:curated -label:loom:curating" --state open` (gh ANDs `--label` values and has no `!`/`,` negation syntax, so a `--label="!loom:issue,..."` filter matches a literal label no issue carries and always returns empty; use `-label:` search terms instead)
 2. Enhance issue with technical details
 3. Mark curated: `gh issue edit 42 --add-label "loom:curated"`
 
@@ -426,7 +426,7 @@ See `.loom/docs/troubleshooting.md` for detailed troubleshooting including:
 
 ```bash
 loom-clean --force                       # Clean stale worktrees/branches
-./.loom/scripts/stale-building-check.sh --recover  # Recover stuck issues
+loom-recover-orphans --recover           # Recover orphaned loom:building issues
 gh label sync --file .github/labels.yml  # Re-sync labels (GitHub only)
 # Cancel a running sweep: mcp__loom__cancel_sweep --sweep_id <id>
 ```

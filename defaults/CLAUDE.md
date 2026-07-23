@@ -573,9 +573,12 @@ Curator → Builder → Judge → Doctor (if needed) → Merge
 
 ### As a Curator (Autonomous or Manual)
 
-1. **Find unlabeled issues**:
+1. **Find unlabeled issues** (gh ANDs `--label` values and has no `!`/`,`
+   negation syntax — a `--label="!loom:issue,..."` filter matches a literal
+   label no issue carries and always returns empty. Exclude labels with
+   `-label:` search terms instead):
    ```bash
-   gh issue list --label="!loom:issue,!loom:building,!loom:architect,!loom:hermit,!loom:curated,!loom:curating"
+   gh issue list --search "-label:loom:issue -label:loom:building -label:loom:architect -label:loom:hermit -label:loom:curated -label:loom:curating" --state open
    ```
 
 2. **Enhance issue**:
@@ -1708,31 +1711,11 @@ which claude
 
 **Orphaned issues stuck in loom:building state**:
 
-When an agent crashes or is cancelled while building, issues can get stuck in `loom:building` state without a PR. Use the stale-building-check script to detect and recover these:
-
-```bash
-# Check for stale building issues (dry run)
-./.loom/scripts/stale-building-check.sh
-
-# Show detailed progress
-./.loom/scripts/stale-building-check.sh --verbose
-
-# Auto-recover stale issues (resets to loom:issue)
-./.loom/scripts/stale-building-check.sh --recover
-
-# JSON output for automation
-./.loom/scripts/stale-building-check.sh --json
-```
+When an agent crashes or is cancelled while building, issues can get stuck in `loom:building` state without a PR. Recover them with the orphan-recovery tool documented immediately below (there is no `stale-building-check.sh` script — the historical script was never ported; use `loom-recover-orphans` / the `loom-orphan-recovery` guidance that follows).
 
 **Configuration via environment**:
 - `STALE_THRESHOLD_HOURS=2` - Hours before issue without PR is considered stale
 - `STALE_WITH_PR_HOURS=24` - Hours before issue with stale PR is flagged
-
-**What it does**:
-- Finds issues with `loom:building` label that have been stuck
-- Checks if there's an associated PR (by branch name or body reference)
-- Issues without PRs older than threshold are flagged/recovered
-- Issues with stale PRs are flagged but not auto-recovered (need manual review)
 
 **Orphaned task recovery (daemon dispatch crashes)**:
 
