@@ -1425,7 +1425,7 @@ LOOM_GUARD_READONLY_FASTPATH=0 git status
 
 ### Decision Telemetry Log (`guards.decisionLog` / `LOOM_GUARD_DECISION_LOG`)
 
-`guard-destructive.sh` can record every **deny** and **ask** decision to a JSONL decision log (issue #3771), separate from `hook-errors.log`, so guard-hook friction becomes **measurable** — which patterns fire, how often, and whether a precision fix (#3755/#3756/#3757) actually cut the false-positive rate. Without it, "we keep hitting the hooks" is unquantifiable.
+`guard-destructive.sh` **and** `guard-loom-workflow.sh` can record every **deny** and **ask** decision to a JSONL decision log (issue #3771, extended to the Loom-workflow guard in #3898), separate from `hook-errors.log`, so guard-hook friction becomes **measurable** — which patterns fire, how often, and whether a precision fix (#3755/#3756/#3757/#3898) actually cut the false-positive rate. Without it, "we keep hitting the hooks" is unquantifiable. Both guards share the **same log file, schema, and stable rule tags**, so a single reader aggregates fires across both (`guard-loom-workflow.sh`'s two denies carry the tags `loom:gh-pr-merge-redirect` and `loom:pip-install-editable-worktree`).
 
 The log is **off by default** — enabling it writes a new persistent, cross-session artifact, so like the other opt-in data-collection features (transcript archival #3726, the model-cost experiment #3725) a zero-config install sees no new file and no behaviour change. It is resolved in this order (highest precedence first):
 
@@ -1474,6 +1474,32 @@ LOOM_GUARD_DECISION_LOG=1 claude -p "/builder" --dangerously-skip-permissions
 # Force off for one command even when the repo opts in
 LOOM_GUARD_DECISION_LOG=0 <command>
 ```
+
+### Autonomous Guard Defaults + Standing Per-Trigger Review Policy (#3898)
+
+A headless sweep runs under `--dangerously-skip-permissions`, where the guard `PreToolUse` hooks **fire** but an **ASK decision has no human to answer it — so it blocks**, functionally a silent deny. Every guard ASK therefore stalls autonomous work. To converge the guard toward *dangerous-only* without ever weakening a genuine safety rule, autonomous mode combines two guard defaults with a standing feedback loop.
+
+**Autonomous guard defaults** — set by `./.loom/scripts/cli/loom-daemon-start.sh` (each env-overridable; an already-exported value always wins), inherited by every dispatched `/loom:sweep` child:
+
+| Env var | Autonomous default | Why |
+|---------|--------------------|-----|
+| `LOOM_GUARD_DECISION_LOG` | `1` (on) | Capture every DENY/ASK so the review loop below has data. |
+| `LOOM_FORCE_SCOPE` | `protected` | Let an agent force-push / hard-reset its **own** working branch without a stall; force-push to `main`/`master`/default stays a **hard DENY** via `ALWAYS_BLOCK_PATTERNS`. |
+
+`guards.forceScope: "protected"` is the **Loom-recommended default for autonomous repos** — set it in committed `.loom/config.json` for repos that run the daemon, or rely on the start-script env default. The shipped hook default remains `"all"` (byte-for-byte unchanged for non-autonomous installs).
+
+**Standing per-trigger review policy** — a periodic support role (the **Auditor**, see `.loom/roles/auditor.md`) tails `.loom/logs/guard-decisions.log`, dedups by `pattern`, and files **one issue per distinct trigger** observed in autonomous runs, proposing to either (a) **allowlist / refine** the guard for the in-scope op or (b) **confirm it stays flagged**. Over time this converges the guard to dangerous-only. The dedup + summarize one-liner:
+
+```bash
+jq -r '.pattern' .loom/logs/guard-decisions.log | sort | uniq -c | sort -rn
+```
+
+New issues from this policy enter through normal intake (`loom:triage` → Curator → Champion/human approval); the review role never self-applies `loom:issue`.
+
+**First refinement pass (#3898):**
+- `guards.forceScope:"protected"` recommended for autonomous repos (above).
+- The catastrophic scan no longer false-positives on **documentation text** — a dangerous command merely *mentioned* inside a multi-line `--body`/`-m`/`--title`/`--notes`/`--comment` value (e.g. `gh issue create --body "…"`) is redacted as a single span and does **not** deny, while a genuinely dangerous command, or a command-substitution `$(…)` smuggled inside such a value, still DENIES.
+- `git checkout .` / `git restore .` / `git clean -fd` **stay ASK** (evaluated, kept flagged): they irreversibly discard uncommitted/untracked work, so the standing policy files a per-trigger issue rather than blanket-allowlisting them. A repo that wants them to pass headless can add the command word to an allowlist per its own risk decision.
 
 ### Protecting Read-Only Directories
 

@@ -1738,6 +1738,84 @@ done
 echo ""
 
 # =========================================================================
+echo -e "${YELLOW}--- Multi-line documentation-text false positive (#3898) ---${NC}"
+# =========================================================================
+#
+# strip_literal_text() now slurps the WHOLE (possibly multi-line) command before
+# redacting, so a dangerous phrase quoted inside a MULTI-LINE --body value (e.g.
+# an issue body that merely MENTIONS a recursive-force-remove) is redacted as one
+# span and no longer trips the catastrophic scan. Genuinely dangerous commands
+# (and command-substitution smuggling inside such a value) must still DENY.
+
+# Danger phrase assembled at runtime so this very test file never contains the
+# literal string a naive scan of the harness's own Bash call would flag.
+_DANGER="rm -r""f /"
+
+# The demonstrated meta false-positive: a multi-line issue body mentioning the
+# danger must be ALLOWED (this is the case that blocked filing #3898).
+assert_allow "#3898: multi-line --body mentioning a dangerous command is allowed" \
+    "$(printf 'gh issue create --title x --body "Context line\nprose about %s obliterating root\ntrailing line"' "$_DANGER")"
+
+# A single-line body was already allowed (#3679) — regression guard.
+assert_allow "#3898: single-line --body mentioning a dangerous command is allowed" \
+    "gh issue create --body \"docs mention $_DANGER here\""
+
+# SAFETY FLOOR: a real dangerous command is NOT inside a text-carrying flag and
+# must still DENY (multi-line slurp must not swallow actual commands).
+assert_deny "#3898: a real dangerous command still denies" \
+    "$_DANGER"
+
+# SAFETY FLOOR: command substitution inside a multi-line --body keeps the span
+# ACTIVE (not redacted) so a smuggled dangerous command still DENIES.
+assert_deny "#3898: command-substitution inside a multi-line --body still denies" \
+    "$(printf 'gh issue create --body "safe intro\nwrap $(%s)\ntrailing"' "$_DANGER")"
+
+# A multi-line body mentioning a force-push-to-main phrase is likewise allowed.
+assert_allow "#3898: multi-line --body mentioning force-push-to-main is allowed" \
+    "$(printf 'gh pr comment 1 --body "note line one\ndo not run git push --force origin main\nline three"')"
+
+echo ""
+
+# =========================================================================
+echo -e "${YELLOW}--- forceScope=protected autonomous default (#3898 / #3674) ---${NC}"
+# =========================================================================
+#
+# guards.forceScope:"protected" (the Loom-recommended autonomous default) lets an
+# agent force-push / hard-reset its OWN working branch without a stall, while a
+# force op targeting a protected branch (main/master/default) must still be
+# flagged. The unconditional main/master force-push HARD DENY (ALWAYS_BLOCK) is
+# NOT weakened by protected mode.
+
+# Force-push to main HARD-DENIES in protected mode (ALWAYS_BLOCK, unaffected).
+assert_deny_env "#3898: force-push to main still HARD-DENIES in protected mode" \
+    "LOOM_FORCE_SCOPE=protected" "git push --force origin main"
+
+assert_deny_env "#3898: force-push to master still HARD-DENIES in protected mode" \
+    "LOOM_FORCE_SCOPE=protected" "git push -f origin master"
+
+# Own working-branch force ops pass through (no stall) in protected mode. The
+# checked-out branch of REPO_ROOT is a feature branch, not a protected branch.
+assert_allow_env "#3898: hard-reset on own working branch is allowed in protected mode" \
+    "LOOM_FORCE_SCOPE=protected" "git reset --hard HEAD~1"
+
+assert_allow_env "#3898: force-push to a non-protected branch is allowed in protected mode" \
+    "LOOM_FORCE_SCOPE=protected" "git push --force origin feature/some-work"
+
+# Default (all) mode still ASKS on own-branch force ops (byte-for-byte behaviour).
+TOTAL=$((TOTAL + 1))
+_fs_out=$(run_guard "git reset --hard HEAD~1" "$REPO_ROOT") || true
+if echo "$_fs_out" | jq -e '.hookSpecificOutput.permissionDecision == "ask"' >/dev/null 2>&1; then
+    PASS=$((PASS + 1))
+    echo -e "  ${GREEN}PASS${NC}: #3898: default (all) mode still ASKS on own-branch hard-reset"
+else
+    FAIL=$((FAIL + 1))
+    echo -e "  ${RED}FAIL${NC}: #3898: default (all) mode still ASKS on own-branch hard-reset"
+    echo -e "       Got: $_fs_out"
+fi
+
+echo ""
+
+# =========================================================================
 echo -e "${YELLOW}--- Decision telemetry log (#3771) ---${NC}"
 # =========================================================================
 #

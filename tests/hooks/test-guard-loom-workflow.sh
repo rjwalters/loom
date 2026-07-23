@@ -299,6 +299,99 @@ fi
 echo ""
 
 # =========================================================================
+echo -e "${YELLOW}--- Decision telemetry log (#3898) ---${NC}"
+# =========================================================================
+#
+# guard-loom-workflow.sh appends one JSONL record per DENY to the SAME decision
+# log guard-destructive.sh writes (.loom/logs/guard-decisions.log by default),
+# gated by guards.decisionLog / LOOM_GUARD_DECISION_LOG (default OFF). The record
+# schema is the STABLE contract shared with guard-destructive.sh:
+#   {"ts","decision":"deny","pattern":"<tag>","tier":"catastrophic","command"}.
+# The LOOM_GUARD_DECISION_LOG_FILE test seam overrides the write path.
+
+DLW_DIR="$(mktemp -d)"
+DLW_LOG="$DLW_DIR/guard-decisions.log"
+
+dlw_assert() {
+    TOTAL=$((TOTAL + 1))
+    if [[ "$2" -eq 0 ]]; then
+        PASS=$((PASS + 1))
+        echo -e "  ${GREEN}PASS${NC}: $1"
+    else
+        FAIL=$((FAIL + 1))
+        echo -e "  ${RED}FAIL${NC}: $1"
+        [[ -n "${3:-}" ]] && echo -e "       ${3}"
+    fi
+}
+
+# (a) gh pr merge deny writes decision=deny, tier=catastrophic, stable tag.
+rm -f "$DLW_LOG"
+make_input "gh pr merge 123" "$REPO_ROOT" | \
+    env LOOM_GUARD_DECISION_LOG=1 LOOM_GUARD_DECISION_LOG_FILE="$DLW_LOG" "$GUARD" >/dev/null 2>&1 || true
+_dlw_rec="$(tail -1 "$DLW_LOG" 2>/dev/null)"
+if [[ -f "$DLW_LOG" ]] && \
+   [[ "$(printf '%s' "$_dlw_rec" | jq -r '.decision' 2>/dev/null)" == "deny" ]] && \
+   [[ "$(printf '%s' "$_dlw_rec" | jq -r '.tier' 2>/dev/null)" == "catastrophic" ]] && \
+   [[ "$(printf '%s' "$_dlw_rec" | jq -r '.pattern' 2>/dev/null)" == "loom:gh-pr-merge-redirect" ]] && \
+   [[ -n "$(printf '%s' "$_dlw_rec" | jq -r '.ts' 2>/dev/null)" ]] && \
+   [[ -n "$(printf '%s' "$_dlw_rec" | jq -r '.command' 2>/dev/null)" ]]; then
+    dlw_assert "gh pr merge deny logs a JSONL record (tag=loom:gh-pr-merge-redirect)" 0
+else
+    dlw_assert "gh pr merge deny logs a JSONL record (tag=loom:gh-pr-merge-redirect)" 1 "record: ${_dlw_rec:-<none>}"
+fi
+
+# (b) pip install -e worktree deny writes its own stable tag.
+rm -f "$DLW_LOG"
+LOOM_WORKTREE_PATH="$REPO_ROOT" make_input "pip install -e ." "$REPO_ROOT" | \
+    env LOOM_WORKTREE_PATH="$REPO_ROOT" LOOM_GUARD_DECISION_LOG=1 LOOM_GUARD_DECISION_LOG_FILE="$DLW_LOG" "$GUARD" >/dev/null 2>&1 || true
+_dlw_rec="$(tail -1 "$DLW_LOG" 2>/dev/null)"
+if [[ -f "$DLW_LOG" ]] && \
+   [[ "$(printf '%s' "$_dlw_rec" | jq -r '.pattern' 2>/dev/null)" == "loom:pip-install-editable-worktree" ]]; then
+    dlw_assert "pip install -e worktree deny logs tag=loom:pip-install-editable-worktree" 0
+else
+    dlw_assert "pip install -e worktree deny logs tag=loom:pip-install-editable-worktree" 1 "record: ${_dlw_rec:-<none>}"
+fi
+
+# (c) Toggle default OFF (no env, non-repo cwd so config can't flip it on):
+# no decision record is written even though the command denies.
+_dlw_norepo="$(mktemp -d)"
+rm -f "$DLW_LOG"
+make_input "gh pr merge 123" "$_dlw_norepo" | \
+    env LOOM_GUARD_DECISION_LOG_FILE="$DLW_LOG" "$GUARD" >/dev/null 2>&1 || true
+if [[ ! -f "$DLW_LOG" ]]; then
+    dlw_assert "toggle default OFF: deny writes NO decision record" 0
+else
+    dlw_assert "toggle default OFF: deny writes NO decision record" 1 "unexpected: $(cat "$DLW_LOG")"
+fi
+rm -rf "$_dlw_norepo"
+
+# (d) An allow-only command writes NO record even with the toggle on.
+rm -f "$DLW_LOG"
+make_input "git status" "$REPO_ROOT" | \
+    env LOOM_GUARD_DECISION_LOG=1 LOOM_GUARD_DECISION_LOG_FILE="$DLW_LOG" "$GUARD" >/dev/null 2>&1 || true
+if [[ ! -f "$DLW_LOG" ]] || [[ "$(wc -l < "$DLW_LOG" 2>/dev/null || echo 0)" -eq 0 ]]; then
+    dlw_assert "allow-only command writes NO decision record (toggle on)" 0
+else
+    dlw_assert "allow-only command writes NO decision record (toggle on)" 1 "unexpected: $(cat "$DLW_LOG")"
+fi
+
+# (e) Fail-open: an unwritable decision-log path never changes the deny and never
+# causes a non-zero exit.
+_dlw_out=""; _dlw_rc=0
+_dlw_out="$(make_input "gh pr merge 123" "$REPO_ROOT" | \
+    env LOOM_GUARD_DECISION_LOG=1 LOOM_GUARD_DECISION_LOG_FILE="/nonexistent-dir-3898/a/b/decisions.log" "$GUARD" 2>/dev/null)" || _dlw_rc=$?
+if [[ "$_dlw_rc" -eq 0 ]] && \
+   [[ "$(printf '%s' "$_dlw_out" | jq -r '.hookSpecificOutput.permissionDecision' 2>/dev/null)" == "deny" ]]; then
+    dlw_assert "fail-open: unwritable decision log still denies and exits 0" 0
+else
+    dlw_assert "fail-open: unwritable decision log still denies and exits 0" 1 "rc=$_dlw_rc out=$_dlw_out"
+fi
+
+[[ -n "$DLW_DIR" && "$DLW_DIR" != "/" && -d "$DLW_DIR" ]] && rm -rf "$DLW_DIR"
+
+echo ""
+
+# =========================================================================
 # Summary
 # =========================================================================
 

@@ -368,6 +368,29 @@ When reporting validation results, include any identified capability gaps:
 **Capability Requests Created**: #1234, #1235
 ```
 
+## Guard-Decision Telemetry Review (Standing Policy, #3898)
+
+Autonomous runs enable guard decision logging (`LOOM_GUARD_DECISION_LOG=1`, set by `loom-daemon-start.sh`). Every guard `DENY`/`ASK` that fires during headless work — where an ASK has no human to answer it and therefore **blocks** — is appended to `.loom/logs/guard-decisions.log`. As part of your periodic tick, review this log and file **one issue per distinct trigger** so the guard converges toward *dangerous-only* without ever weakening a real safety rule.
+
+**Why this is the Auditor's job:** you already validate the health of the integrated autonomous system and file well-formed issues from what you observe. Guard-hook friction is exactly such an observation — it silently stalls autonomous work.
+
+**Workflow (run each tick, only if the log exists and is non-empty):**
+
+```bash
+# 1. Dedup + rank the triggers that fired since you last looked.
+jq -r '.pattern' .loom/logs/guard-decisions.log | sort | uniq -c | sort -rn
+
+# 2. For each DISTINCT pattern, inspect a representative (redacted) command:
+jq -c 'select(.pattern == "<pattern>")' .loom/logs/guard-decisions.log | tail -3
+```
+
+**For each distinct trigger, file ONE issue** (dedup against existing open issues first with `./.loom/scripts/check-duplicate.sh`) proposing one of two outcomes:
+
+- **Allowlist / refine** — the op is safe, in-scope, routine autonomous work (e.g. an own-branch force-op, a scoped cleanup). Propose the specific guard refinement (a new toggle, a scope narrowing, an allowlist entry).
+- **Keep flagged** — the op is genuinely dangerous or irreversible (recursive-force-remove of root/`$HOME`/out-of-repo, force-push to `main`/`master`, `gh repo delete`/`archive`, fork bomb, pipe-curl-to-shell, cloud destruction, secrets exfil, or the uncommitted-loss `git checkout .`/`git restore .`/`git clean -fd` family). Confirm the guard should stand; close the loop so the same trigger is not re-filed.
+
+**Label discipline:** file these as normal issues that enter through intake (`loom:triage`) or as `loom:auditor` proposals for Champion evaluation — **never self-apply `loom:issue`** (only humans/Champion approve work). The genuinely-dangerous set MUST remain `DENY`/`ASK`; the standing policy only ever refines *false positives*, never relaxes a real safety floor.
+
 ## Decision Framework
 
 ### When to Report
