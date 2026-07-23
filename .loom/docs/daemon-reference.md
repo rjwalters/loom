@@ -623,6 +623,42 @@ is purely the on/off surface, so Phase C's already-tested `buildGate` semantics
 are untouched. `LOOM_MAIN_HEALTH_GATE` remains the master override; the config
 key just lets a repo turn the gate on without exporting an env var.
 
+### Prerequisite: a fresh token ranking (#3894)
+
+**When you run autonomous mode against a multi-account token pool, keep
+`.loom/tokens/.ranking` fresh — a periodic `probe-tokens.sh --ranking` is a
+required part of the setup, not an optional nicety.** The spawn-time selector
+(`loom_tools.tokens.select`) is 3-tier — ranking → allowlist → random — and the
+ranking file is only considered fresh for **10 minutes**. When it is absent or
+stale, tier-1 declines and selection falls to the lower tiers. The work finder
+dispatches in bursts, so a stale ranking means the daemon can steadily hand out
+accounts a recent probe already flagged `exhausted`/`blocked`, whose sweeps then
+wedge at startup (spawn header logged, no worktree, ~0% CPU) — the exact failure
+the startup watchdog (#3887) then has to self-heal, one hang at a time.
+
+Two things now keep this from wedging a burst of issues:
+
+- **Wire the probe on a `<10`-min cadence.** Add a cron entry so the ranking is
+  always fresh under the daemon's dispatch rate:
+
+  ```cron
+  */5 * * * * cd /path/to/repo && ./.loom/scripts/probe-tokens.sh --ranking >> .loom/logs/probe-tokens.log 2>&1
+  ```
+
+  (Use `*/5`, comfortably inside the 10-minute freshness window, rather than the
+  `*/10` boundary case from the single-key example.) One-shot before a run:
+  `loom-tokens check --ranking`.
+
+- **Stale-ranking fail-safe (selector-side, #3894).** Even without a fresh
+  probe, a stale-but-present `.ranking` is no longer discarded. The selector
+  treats its `exhausted`/`blocked` entries as an **advisory exclusion set** for
+  the allowlist and random tiers, so it stops degrading to fully-random
+  selection into known-exhausted accounts. If those exclusions would empty the
+  pool (a stale "everything exhausted" ranking), selection retries ignoring them
+  so a live pool never hard-fails on stale advice. This is a safety net, **not**
+  a replacement for the probe cron — a stale ranking still can't see an account
+  that recovered, so keep it fresh.
+
 ### Safe start / stop (raw daemon process)
 
 `.loom/bin/loom start|stop` manage the **tmux Manual-Orchestration-Mode pool** —

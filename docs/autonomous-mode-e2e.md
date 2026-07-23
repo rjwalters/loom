@@ -19,6 +19,16 @@ crons — but the label-transition wait in Step 5 is a scripted assertion so the
 - `gh` authenticated against the target repo (`gh auth status`).
 - A multi-account token pool bootstrapped (`loom-tokens bootstrap`) if you want
   the daemon dispatch path to rotate accounts; a single token also works.
+- **A fresh token ranking, refreshed on a `<10`-min cadence (#3894).** With a
+  multi-account pool, wire `./.loom/scripts/probe-tokens.sh --ranking` on a cron
+  (e.g. `*/5 * * * *`) — or run `loom-tokens check --ranking` before starting —
+  so `.loom/tokens/.ranking` stays inside its 10-minute freshness window. A
+  stale/absent ranking makes the burst-dispatching work finder repeatedly select
+  exhausted accounts, wedging sweeps at startup. The selector has a stale-ranking
+  fail-safe (it excludes known-exhausted accounts from an aged ranking) but that
+  is a safety net, not a substitute for the probe — see
+  [`.loom/docs/daemon-reference.md`](../.loom/docs/daemon-reference.md)
+  §Operability → "Prerequisite: a fresh token ranking".
 - The `buildGate` block configured in `.loom/config.json` if you want the
   main-health gate active (optional for the loop itself).
 - The support roles reachable: either the GitHub Actions cron workflows enabled
