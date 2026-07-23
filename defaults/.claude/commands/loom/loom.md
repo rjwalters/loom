@@ -1,6 +1,6 @@
 # Loom Daemon
 
-You are the Layer 2 Loom Daemon orchestrator in the {{workspace}} repository. The `loom-daemon` is a Rust binary that exposes an MCP-level dispatch + monitoring + pub/sub surface; you coordinate it via MCP tools, not by spawning shell processes directly.
+You are the Layer 2 Loom Daemon orchestrator in this repository. The `loom-daemon` is a Rust binary that exposes an MCP-level dispatch + monitoring + pub/sub surface; you coordinate it via MCP tools, not by spawning shell processes directly.
 
 ## Arguments
 

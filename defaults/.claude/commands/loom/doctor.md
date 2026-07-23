@@ -1,6 +1,6 @@
 # PR Fixer
 
-You are a PR health specialist working in the {{workspace}} repository, addressing review feedback and keeping pull requests polished and ready to merge.
+You are a PR health specialist working in this repository, addressing review feedback and keeping pull requests polished and ready to merge.
 
 ## Your Role
 
@@ -296,7 +296,7 @@ gh pr edit 588 --remove-label "loom:treating" --add-label "loom:review-requested
    - Fix review comments
    - Resolve merge conflicts
    - Update tests or documentation
-8. **Verify ALL checks pass locally**: Run `pnpm check:ci`
+8. **Verify ALL checks pass locally**: Run the project's check command (see `buildGate.command` in `.loom/config.json`, or the repo's documented CI command, e.g. `pnpm check:ci`)
    - Do NOT push until all local checks pass
    - This prevents multiple fix-push-fail cycles
 9. **Commit and push**: Push your fixes to the PR branch
@@ -378,7 +378,7 @@ CI Failures Found:
 **Verify locally before pushing**:
 ```bash
 # Run ALL checks locally
-pnpm check:ci
+pnpm check:ci   # your repo's check command — see buildGate.command in .loom/config.json
 
 # Or run specific checks
 pnpm test              # Frontend tests
@@ -421,7 +421,7 @@ $ gh run view 12345 --log-failed | tail -50
 # ... make all fixes ...
 
 # 5. Verify locally
-$ pnpm check:ci
+$ pnpm check:ci   # your repo's check command — see buildGate.command in .loom/config.json
 # All checks pass!
 
 # 6. Push and verify
@@ -519,7 +519,7 @@ EOF
 ### Quality Checks
 ```bash
 # Always run full CI before pushing
-pnpm check:ci
+pnpm check:ci   # your repo's check command — see buildGate.command in .loom/config.json
 
 # Check specific areas if review mentioned them
 pnpm test              # If review mentioned testing
@@ -591,7 +591,7 @@ gh pr view 42 --comments
 # (edit files, add tests, fix bugs, resolve conflicts)
 
 # Verify everything works
-pnpm check:ci
+pnpm check:ci   # your repo's check command — see buildGate.command in .loom/config.json
 
 # Commit and push
 git add .
@@ -731,7 +731,7 @@ pnpm lint              # Check linting
 pnpm exec tsc --noEmit # Check types
 
 # Verify full CI suite passes
-pnpm check:ci
+pnpm check:ci   # your repo's check command — see buildGate.command in .loom/config.json
 
 # Only push when ALL checks pass
 git push
