@@ -373,10 +373,22 @@ The subagent-path target is **soft** — there is no hard upper bound and the wa
 Concrete rules for anyone extending this skill or hand-driving a wave:
 
 - **Do NOT construct a mixed wave** that places any issue-creating role (Architect / Curator-decomposition / Champion epic-phase) alongside Builders — or alongside another issue-creating agent. That exact `1 builder + 3 architects` shape is the footgun this section forbids.
-- **Serialize issue-creating agents**: one must finish its entire `gh issue create` burst before the next starts. A recovery/retry loop must never run against a still-active concurrent filer.
+- **Serialize issue-creating agents**: one must finish its entire `gh issue create` burst before the next starts. A recovery/retry loop must never run against a still-active concurrent filer. **"Serialize" here means awaited-to-completion, not merely dispatched-with-a-sync-flag** — see "Subagent dispatch is async-only" below (#3822).
 - Parallel **Builders** remain safe and are the only role `/sweep` fans out — this is unchanged.
 
 Heavier mitigations (a per-wave issue-filing lock, an epic-scoped idempotency UUID + post-create reconciliation, or a serialized issue-filing sub-phase inside `/sweep`) are **deferred, out-of-scope follow-ups** to this documentation guardrail — build them only if serialization-by-convention proves insufficient in practice (#3707).
+
+### CRITICAL: Subagent dispatch is async-only — you MUST block explicitly (issue #3822)
+
+**The harness may launch every Agent/Task subagent asynchronously regardless of the dispatch flags.** In particular, `run_in_background: false` is **not** a guarantee of synchronous return — it has been observed ignored, with the agent launched async anyway (2026-07-23, Claude Code harness). An orchestrator that trusts a sync-flag and proceeds immediately can start a downstream serialized phase before the upstream agent has finished — e.g. begin Judge before builders finish, or overlap two issue-creating agents (the exact #3707 race this skill forbids).
+
+Therefore, at **every** dispatch site where this skill sequences one phase after another, the orchestrator **MUST explicitly await each subagent's completion** — block on its `TaskOutput` / completion notification — before advancing. Do not rely on any dispatch flag to enforce ordering. Concretely, this makes the skill's sequencing rules load-bearing on an explicit await, not on the harness:
+
+- **Sequential Curator per issue** (step 2) — await each Curator before the next.
+- **"Await all builders before Judge"** (step 4) — collect every builder's `TaskOutput` before any Judge dispatch.
+- **Sequential per-PR Judge / Doctor within a wave** (steps 5–6) — await each PR's Judge (and its Doctor→Judge cycle) before the next PR's Judge.
+
+**"Serialized" therefore means awaited-to-completion, not merely dispatched-with-a-sync-flag.** The #3707 rule above depends on this: serializing issue-creating agents is only safe if each is explicitly awaited to completion before the next is dispatched — a `run_in_background: false` that the harness ignores would silently overlap them.
 
 ### CRITICAL: One level deep — never spawn `/shepherd` as a subagent
 
@@ -1333,7 +1345,7 @@ For each surviving issue `N` in the wave:
   ./.loom/scripts/sweep-checkpoint.sh write N curator-done --task-id "$RUN_ID"
   ```
 
-Curator runs sequentially per-issue within wave setup — it is cheap and does not benefit from parallelism here.
+Curator runs sequentially per-issue within wave setup — it is cheap and does not benefit from parallelism here. **Await each Curator's completion explicitly** (blocking `TaskOutput`) before advancing — the harness may launch the subagent async even with `run_in_background: false`, so the sequencing here depends on an explicit await, not the dispatch flag (see "Subagent dispatch is async-only", #3822).
 
 ### 3. Approval gate (per-issue)
 
@@ -1373,7 +1385,7 @@ Each builder is responsible for:
   The **only** thing `--auto-stack` changes here is how `DEPENDS_ON[N]` is *sourced* — the `worktree.sh --base` / `gh pr create --base` mechanics are untouched. Two sources feed the map: (a) an explicit single-issue `--depends-on <parent>` (unchanged, typically a daemon `dispatch_sweep` forwarding `depends_on` as `--depends-on`), and (b) an auto-stack-detected same-candidate-set edge (see "Auto-stack detection and wave ordering"). Absent both, the wave lifecycle does not auto-create stacks.
   **Same-wave parent/child.** When the topological ordering placed a parent and its child in the **same** wave, the child's Builder branches off `feature/issue-<parent>` even though the parent's Builder is running concurrently in that wave — `worktree.sh --base` resolves the parent branch as soon as the parent Builder has pushed it. The child does **not** branch off the shared pre-wave `main` snapshot its unstacked wave-mates use.
 
-**Await all builders in the wave** before proceeding to Judge. Collect each builder's PR number (or failure marker).
+**Await all builders in the wave** before proceeding to Judge. Collect each builder's PR number (or failure marker). This await is **mandatory and explicit** — block on every builder's `TaskOutput` / completion notification. The harness may launch each Task async regardless of `run_in_background: false`, so proceeding to Judge on a dispatch flag alone can start Judge before builders finish; the "await all builders before Judge" rule is enforced by this explicit block, not by any dispatch flag (see "Subagent dispatch is async-only", #3822).
 
 **Backstop: verify the main worktree is clean after the builders return (#3513).** A builder subagent runs without `LOOM_WORKTREE_PATH` injected, so the `guard-worktree-paths.sh` hook does not fire on this path. If a builder used repo-relative paths after a cwd reset, it may have written to the **main** worktree instead of its issue worktree. After the wave's builders return and before advancing any PR to Judge, run:
 
@@ -1468,7 +1480,7 @@ A matched `#A` becomes a **stacking edge only when `#A` is also a member of this
 
 ### 5. Judge phase (sequential per PR within the wave)
 
-For each PR in the wave (including PRs whose Builder just ran *and* PRs routed in via a `builder-done` checkpoint), in the order the builders completed (or any deterministic order — wave-internal ordering is not load-bearing), run the Judge phase sequentially:
+For each PR in the wave (including PRs whose Builder just ran *and* PRs routed in via a `builder-done` checkpoint), in the order the builders completed (or any deterministic order — wave-internal ordering is not load-bearing), run the Judge phase sequentially. **"Sequentially" means await each Judge's completion explicitly** (blocking `TaskOutput`) — and, when Judge requests changes, await the inline Doctor→Judge cycle (step 6) — before dispatching the next PR's Judge. The harness may launch each Judge/Doctor Task async regardless of `run_in_background: false`, so this per-PR ordering is enforced by an explicit await, never by a dispatch flag (see "Subagent dispatch is async-only", #3822):
 
 ```
 WAVE_MERGED_FILES = {}                          # union of changed paths merged so far this wave (#3647)
@@ -1521,7 +1533,7 @@ If Judge requests changes on PR `#X` mid-wave, run inline Doctor→Judge cycles 
 - **Cap: up to `sweep.max_doctor_cycles` Doctor→Judge cycles per PR (default 1).** If Judge still requests changes after the configured number of Doctor passes, mark this PR as blocked (`PR #X blocked: doctor cycle exhausted after <k> Doctor→Judge round(s); human attention required`), log the reason, and proceed to the next PR in the wave (do NOT block the wave on it).
 - **Distinct-defect exception (default cap only).** When `max_doctor_cycles` is at its default of 1 and the second Judge rejection is a demonstrably distinct defect from the first (forward progress, not the same disagreement re-litigated), you MAY grant **exactly one** additional bounded Doctor→Judge cycle before blocking — single-use per PR, never composing with an operator-raised cap. Emit the required log line naming the distinction (`PR #X: granted one extra Doctor cycle — second rejection is a distinct defect (<short reason>)`). Same-defect or ambiguous rejections still block immediately. See "Doctor-cycle cap" for the full rule.
 
-The Doctor cycle for `#X` does **not** block other PRs in the wave — but because Judge runs sequentially per-PR within the wave, the next PR's Judge waits for `#X`'s Doctor→Judge cycle to settle before it starts. This is the intended sequencing.
+The Doctor cycle for `#X` does **not** block other PRs in the wave — but because Judge runs sequentially per-PR within the wave, the next PR's Judge waits for `#X`'s Doctor→Judge cycle to settle before it starts. This is the intended sequencing. "Waits for … to settle" means **await the Doctor Task's completion explicitly** (blocking `TaskOutput`) and then await the re-run Judge — the harness may launch the Doctor async regardless of `run_in_background: false`, so this ordering is enforced by an explicit await, not a dispatch flag (see "Subagent dispatch is async-only", #3822).
 
 ### 7. Merge (per PR)
 
