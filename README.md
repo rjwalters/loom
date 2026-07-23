@@ -68,6 +68,84 @@ For continuous multi-account batches, run the `loom-daemon` (Tier 2) and enqueue
 
 See [WORKFLOWS.md](docs/workflows.md) for complete label documentation.
 
+## Loom State Machine
+
+Loom coordinates its agents entirely through labels. The full label graph — four
+lanes (issue, PR, proposal, epic supervisor), the role that fires each edge, and
+the epic fork-join barriers — is modeled as an **executable specification** in
+[`loom-tools/src/loom_tools/state_machine.py`](loom-tools/src/loom_tools/state_machine.py).
+A CI test (`loom-tools/tests/test_state_machine.py`) validates the graph for
+reachability, dead-ends, label conflation, autonomy gaps, and barrier hygiene,
+and keeps the diagram below in sync with the model.
+
+The five `epic:*` states are **derived** — they all ride the single `loom:epic`
+label and are computed by the daemon-native epic supervisor, so no new labels
+are minted. Edges marked "creates issues" are the ones the #3707 issue-filing
+mutex must serialize.
+
+> Regenerate this diagram with `python -m loom_tools.state_machine --mermaid`.
+
+```mermaid
+stateDiagram-v2
+    state "Issue lane" as lane_issue {
+        s_new : new
+        s_loom_triage : loom:triage
+        s_loom_curating : loom:curating
+        s_loom_curated : loom:curated
+        s_loom_issue : loom:issue
+        s_loom_building : loom:building
+        s_closed : closed
+    }
+    state "PR lane" as lane_pr {
+        s_loom_review_requested : loom:review-requested
+        s_loom_changes_requested : loom:changes-requested
+        s_loom_pr : loom:pr
+        s_merged : merged
+    }
+    state "Proposal lane" as lane_proposal {
+        s_loom_architect : loom:architect
+        s_loom_hermit : loom:hermit
+        s_loom_auditor : loom:auditor
+    }
+    state "Epic supervisor lane (derived — loom:epic)" as lane_epic {
+        s_epic_needs_decomp : epic:needs_decomp
+        s_epic_designed : epic:designed
+        s_epic_active : epic:active
+        s_epic_phase_join : epic:phase_join
+        s_epic_done : epic:done
+    }
+    [*] --> s_new
+    s_new --> s_loom_triage : Human
+    s_loom_triage --> s_loom_curating : Curator
+    s_loom_curating --> s_loom_curated : Curator
+    s_loom_curated --> s_loom_issue : Human
+    s_loom_issue --> s_loom_building : Builder
+    s_loom_building --> s_loom_review_requested : Builder
+    s_loom_building --> s_closed : Champion
+    s_loom_review_requested --> s_loom_pr : Judge
+    s_loom_review_requested --> s_loom_changes_requested : Judge
+    s_loom_changes_requested --> s_loom_review_requested : Doctor
+    s_loom_pr --> s_merged : Champion
+    s_new --> s_loom_architect : Architect · creates issues
+    s_new --> s_loom_hermit : Hermit · creates issues
+    s_new --> s_loom_auditor : Auditor · creates issues
+    s_loom_architect --> s_loom_issue : Champion
+    s_loom_architect --> s_closed : Champion
+    s_loom_hermit --> s_loom_issue : Champion
+    s_loom_hermit --> s_closed : Champion
+    s_loom_auditor --> s_loom_issue : Champion
+    s_loom_auditor --> s_closed : Champion
+    s_new --> s_epic_needs_decomp : Architect
+    s_epic_needs_decomp --> s_epic_designed : Champion · creates issues
+    s_epic_designed --> s_epic_active : Champion
+    s_epic_active --> s_epic_phase_join : Supervisor · barrier: fork-join: current phase complete
+    s_epic_phase_join --> s_epic_active : Supervisor · barrier: advance: dispatch next phase
+    s_epic_phase_join --> s_epic_done : Supervisor · barrier: join: all phases complete
+    s_closed --> [*]
+    s_merged --> [*]
+    s_epic_done --> [*]
+```
+
 ## Features
 
 **Autonomous Orchestration**
