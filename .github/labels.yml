@@ -56,7 +56,7 @@
   color: "DC2626"  # red-600 - indicates broken state
 
 - name: loom:pr
-  description: "PR approved by Judge, ready for human to merge. Applied by: Judge."
+  description: "PR approved by Judge, ready for Champion auto-merge. Applied by: Judge."
   color: "3B82F6"  # blue-500
 
 # Agent Proposal Labels
