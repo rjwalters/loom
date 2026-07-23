@@ -414,6 +414,9 @@ mod tests {
         let expected = [
             ".loom-in-use",
             ".loom-checkpoint",
+            // #3838: the worktree sentinel worktree.sh drops into each issue
+            // worktree must be ignored, else a builder's `git add -A` commits it.
+            ".loom-managed",
             ".loom/.daemon.pid",
             ".loom/.daemon.log",
             ".loom/daemon.sock",
