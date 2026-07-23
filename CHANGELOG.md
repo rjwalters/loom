@@ -7,6 +7,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.14.0] - 2026-07-23
+
+### Summary
+
+Major release headlined by **fully autonomous daemon mode** — label an issue and the daemon builds it in the background. The `loom-daemon` gains a forge-polling work-finder, work-driven concurrency scaling, a reactive main-health backstop, and operability controls (epic #3809), plus a **daemon-native epic supervisor** that drives `loom:epic` fork-joins conformant to an executable state-machine spec (epic #3842) — all **opt-in / default-off**. Backed by **token-capacity backpressure** (slow-down / alert / auto-recover), **self-healing dispatch** (2s stagger + startup watchdog + mid-build recovery), and token-ranking robustness. Also lands **stacked-PR mode**, an **executable state-machine spec** of the Loom label graph, installer **`--local` mode**, **guard-hook autonomy**, and **doc-lint robustness**. 88 commits since v0.13.0.
+
+### Added
+
+- **Autonomous daemon (epic #3809)** — the daemon can generate and drive its own work, opt-in:
+  - Forge-polling **work-finder** (`LOOM_WORK_FINDER=1`) that auto-dispatches sweeps for open `loom:issue` items, with registry-dedup + idempotency-key + atomic-claim-lock protection against double-dispatch (Phase A, #3880).
+  - **Work-driven concurrency scaling** bounded by `min(healthy tokens, disk headroom, configured max)`, fails-closed, no thrash (Phase B, #3881).
+  - Reactive **main-health backstop** — runs `buildGate` against `origin/main`, halts new dispatch on red (never auto-reverts, never kills in-flight), panic-safe (`LOOM_MAIN_HEALTH_GATE=1`) (Phase C, #3883).
+  - **Operability** — config surface, safe SIGINT/SIGTERM start/stop scripts, E2E playbook (Phase D, #3890).
+  - **Daemon-native status view** — `loom-daemon status` + IPC `DaemonStatus` (in-flight sweeps, dynamic cap, health-gate, capacity) (#3899).
+- **Daemon-native epic supervisor (epic #3842)** — drives `loom:epic` fork-joins (`LOOM_EPIC_SUPERVISOR=1`): derived-state computation (#3852), global issue-creation mutex + phase-join barrier (#3867), supervisor loop on a dedicated off-runtime thread (#3870, #3875), and a conformance test that parses the Python state-machine model + event topics (#3876).
+- **Token-capacity backpressure** (#3907) — slow down toward the healthy-account count, advise adding capacity, auto-recover as 5h/7d limits reset; never stalls while ≥1 account has capacity.
+- **Self-healing dispatch** — 2s dispatch stagger + startup watchdog that auto-recovers a hung spawn once (#3892); mid-build death detection + bounded recovery (#3903); reaper reap-on-read so `ListSweeps`/status don't over-report `Running` (#3905).
+- **Token-ranking robustness** — a stale ranking is advisory and still skips `exhausted`/`blocked` accounts instead of falling back to fully-random selection (#3900).
+- **Stacked-PR mode** — operator `--depends-on` dispatch (#3742), auto-reconcile children on parent merge (#3752), pre-merge merge-ordering guard (#3794), rebase-on-parent-amend (#3849).
+- **Executable state-machine spec** of the Loom label graph in `loom-tools`, with README diagram + CI conformance guard (#3844).
+- **Installer `--local`/`--gitignore` mode** to keep installed Loom files uncommitted in consumer repos (#3839), and **`resync-installed.sh`** to refresh `.loom/` from `defaults/` after a pull (#3851).
+- **Guard-hook autonomy** — deny/ask decision logging, `forceScope:protected` (own-branch force-push allowed; main/master stays hard-deny), doc-text false-positive fix (#3908); read-only fast-path broadened (jq/wc/head/tail/test/find) (#3798).
+
+### Fixed
+
+- **Doc-lint robustness** — de-brittled the sweep/bump doc-lint tests (prose asserted structurally, contract identifiers kept exact) so legitimate doc edits stop red-manning `main` (#3878, #3834, #3863).
+- **labels.yml drift** between root and `defaults/` reconciled + CI drift check added (#3904).
+- 39 fixes total across daemon, sweep, guards, and docs.
+
 ## [0.13.0] - 2026-07-22
 
 ### Summary
