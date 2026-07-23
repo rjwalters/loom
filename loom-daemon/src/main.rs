@@ -242,8 +242,33 @@ async fn main() -> Result<()> {
         ),
         Err(e) => log::warn!("sweep_registry: reconstruction failed: {e}"),
     }
+
+    // Startup-race mitigation (Issue #3887): resolve the dispatch stagger + the
+    // watchdog knobs from `.loom/config.json → autonomous` with env override
+    // (precedence env > config > default). The stagger serializes back-to-back
+    // child startups so a burst dispatch does not trip the 0-HTTPS MCP-init
+    // race; the watchdog is the self-healing backstop for any hang that slips
+    // past it.
+    let startup_race_config = sweep_registry::read_startup_race_config(&sweep_workspace);
+    let dispatch_stagger = sweep_registry::resolve_dispatch_stagger(&startup_race_config);
+    sweep.set_dispatch_stagger(dispatch_stagger);
+    log::info!("sweep_registry: dispatch stagger = {}ms (#3887)", dispatch_stagger.as_millis());
+
     let sweep_registry = Arc::new(Mutex::new(sweep));
     let _reaper_handle = sweep_registry::spawn_reaper_task(sweep_registry.clone());
+
+    // Startup watchdog (Issue #3887): auto-cancel + re-dispatch (once, bounded)
+    // any daemon-dispatched sweep that hangs at startup with no progress. On by
+    // default; disable with LOOM_SWEEP_WATCHDOG=0 or
+    // `autonomous.watchdog.enabled = false`.
+    let _watchdog_handle = if sweep_registry::resolve_watchdog_enabled(&startup_race_config) {
+        let timeout = sweep_registry::resolve_watchdog_timeout(&startup_race_config);
+        let interval = sweep_registry::resolve_watchdog_interval(&startup_race_config);
+        Some(sweep_registry::spawn_watchdog_task(sweep_registry.clone(), timeout, interval))
+    } else {
+        log::info!("sweep_registry: startup watchdog disabled (#3887)");
+        None
+    };
 
     // Epic supervisor loop (Issue #3872 — Phase 4 of epic #3842). Opt-in via
     // `LOOM_EPIC_SUPERVISOR`. The loop drives every open `loom:epic` issue
