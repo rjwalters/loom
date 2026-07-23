@@ -174,7 +174,22 @@ async fn handle_client(
     let mut lines = BufReader::new(reader).lines();
 
     while let Some(line) = lines.next_line().await? {
-        let request: Request = serde_json::from_str(&line)?;
+        // Parse the incoming frame. A malformed payload (garbage JSON, a
+        // missing required field, or an unknown `type` tag) is a per-request
+        // protocol error, NOT a fatal connection error: emit a structured
+        // error frame naming the serde failure and keep the connection usable
+        // for subsequent requests rather than silently dropping the socket.
+        let request: Request = match serde_json::from_str(&line) {
+            Ok(request) => request,
+            Err(parse_err) => {
+                let response =
+                    Response::StructuredError(DaemonError::ipc_parse_error(&line, &parse_err));
+                let response_json = serde_json::to_string(&response)?;
+                writer.write_all(response_json.as_bytes()).await?;
+                writer.write_all(b"\n").await?;
+                continue;
+            }
+        };
         log::debug!("Request: {request:?}");
 
         // SubscribeEvents is the only structurally-different request: it

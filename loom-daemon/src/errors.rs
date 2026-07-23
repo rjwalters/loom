@@ -356,6 +356,31 @@ impl DaemonError {
         .with_details(serde_json::json!({ "path": path }))
     }
 
+    // IPC errors
+    /// Creates an "IPC request parse failure" error.
+    ///
+    /// Raised when an incoming line on the IPC socket cannot be deserialized
+    /// into a [`crate::types::Request`] — covers garbage JSON, a missing
+    /// required field, and an unknown `type` tag alike (all three fail at the
+    /// single `serde_json::from_str::<Request>` call). `serde_json::Error`'s
+    /// `Display` already names the offending field/variant (e.g.
+    /// `missing field \`grace_secs\``, `unknown variant \`Nonsense\``), so we
+    /// surface it verbatim in the message.
+    ///
+    /// Marked non-recoverable: retrying the exact same malformed bytes will
+    /// fail identically, so the client must correct the payload rather than
+    /// retry blindly.
+    #[must_use]
+    pub fn ipc_parse_error(raw: &str, source_err: &serde_json::Error) -> Self {
+        Self::new(
+            ErrorDomain::Ipc,
+            ErrorCode::IPC_PROTOCOL_ERROR,
+            format!("failed to parse request: {source_err}"),
+        )
+        .recoverable(false)
+        .with_details(serde_json::json!({ "raw": raw }))
+    }
+
     // Internal errors
     /// Creates a "mutex poisoned" error
     #[must_use]
