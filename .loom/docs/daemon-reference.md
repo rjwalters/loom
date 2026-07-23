@@ -335,9 +335,19 @@ and by default **hard-blocks the merge** (`exit 1`, naming the child PR(s) + the
 branch deletion. It keys purely on "does an open child PR still target this
 branch" (not the child's `loom:building` label). `--allow-stacked-children`
 bypasses it; `--dry-run` reports the would-be block without exiting 1.
-**Rebase-on-parent-amend**, **dependency auto-detection**, **diamonds /
-multi-parent**, and **auto-detach** remain **out of scope** (deferred items of
-the v2 epic #3747).
+
+**Rebase-on-parent-amend** shipped as v2 item 3 (#3747): the standalone
+`./.loom/scripts/rebase-stacked-children.sh feature/issue-<parent>` handles the
+*pre-merge* case where Doctor amends a still-open stacked parent branch and a
+child that branched off its pre-amend tip goes stale. It discovers open child
+PRs with the same `gh pr list --base feature/issue-<parent> --state open` query,
+detects staleness via `git merge-base --is-ancestor`, and rebases safe stale
+children onto the parent's current tip (`git rebase` + `push --force-with-lease`,
+base **not** retargeted — the child stays stacked), deferring children whose
+issue is still `loom:building` with a comment. Doctor invokes it as a documented
+best-effort step after pushing to a `feature/issue-<N>` branch. **Dependency
+auto-detection**, **diamonds / multi-parent**, and **auto-detach** remain **out
+of scope** (deferred items of the v2 epic #3747).
 
 ## Locks and lifecycle
 
