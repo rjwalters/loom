@@ -35,12 +35,85 @@
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd 2>/dev/null || echo ".")"
 HOOK_ERROR_LOG="${SCRIPT_DIR}/../logs/hook-errors.log"
 
+# Decision telemetry log (issue #3771) — a SEPARATE JSONL file from
+# HOOK_ERROR_LOG. At runtime SCRIPT_DIR is the installed hook's own directory
+# (.loom/hooks/), so this resolves to .loom/logs/guard-decisions.log in a real
+# install. LOOM_GUARD_DECISION_LOG_FILE overrides the path (a test seam; also
+# lets an operator point the log elsewhere). Off by default — see
+# decision_log_enabled() below.
+DECISION_LOG="${LOOM_GUARD_DECISION_LOG_FILE:-${SCRIPT_DIR}/../logs/guard-decisions.log}"
+
 # Log a diagnostic error message (best-effort, never fails the script)
 log_hook_error() {
     local msg="$1"
     # Ensure log directory exists
     mkdir -p "$(dirname "$HOOK_ERROR_LOG")" 2>/dev/null || true
     echo "[$(date -u '+%Y-%m-%dT%H:%M:%SZ')] [guard-destructive] $msg" >> "$HOOK_ERROR_LOG" 2>/dev/null || true
+}
+
+# =============================================================================
+# DECISION TELEMETRY (issue #3771) — one JSONL record per deny/ask decision.
+#
+# Append a machine-readable record to DECISION_LOG each time the guard denies or
+# asks, so false-positive friction becomes measurable (which patterns fire, how
+# often, before/after a precision fix). Deliberately does NOT log `allow`: the
+# #3687 read-only fast path's zero-overhead silent-allow must stay silent, and
+# allow-logging would swamp the log with the ~99% common case.
+#
+# STABLE SCHEMA (the contract #3772's reader/aggregation tooling stacks on — do
+# NOT rename fields without considering that dependency), one JSON object per
+# line:
+#   {"ts":"<UTC>","decision":"deny"|"ask","pattern":"<tag>",
+#    "tier":"catastrophic"|"ask","command":"<redacted>"}
+#     ts       — UTC timestamp, same format as log_hook_error's date -u call.
+#     decision — "deny" or "ask".
+#     pattern  — a short, stable rule tag (NOT the full free-text reason). For
+#                the pattern-array loops it is the matched pattern; the non-loop
+#                sites pass a static tag (e.g. "sql-ddl", "rm-protected-path").
+#     tier     — "catastrophic" for deny, "ask" for ask.
+#     command  — the command string, REDACTED via strip_literal_text() so no raw
+#                --body/-m/--title/--notes/--comment secret value is persisted.
+#
+# Best-effort like log_hook_error: gated by the lazy decision_log_enabled()
+# toggle, and a log-write failure (permission denied, disk full, missing dir)
+# NEVER changes the deny/ask decision and NEVER causes a non-zero exit. Callers
+# invoke it as `log_guard_decision ... || true` so it can never trip the ERR
+# trap.
+#
+# One-liner to summarize fires by pattern (AC — full tooling is #3772):
+#   jq -r '.pattern' .loom/logs/guard-decisions.log | sort | uniq -c | sort -rn
+# =============================================================================
+log_guard_decision() {
+    # Args: <decision> <tier> <pattern-tag>. The command is read from the global
+    # $COMMAND and redacted here. Returns 0 unconditionally.
+    decision_log_enabled || return 0
+    local decision="$1" tier="$2" tag="${3:-$1}"
+    local ts redacted line
+    ts=$(date -u '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null) || ts=""
+    # Redact quoted --body/-m/--title/--notes/--comment values (same redactor the
+    # pattern-matching tiers use) so no raw secret text is persisted to a log that
+    # aggregates across sessions. Fall back to raw only if redaction produced
+    # nothing (awk unavailable) — impossible in practice since jq is required and
+    # awk is used throughout.
+    redacted=$(strip_literal_text "$COMMAND" 2>/dev/null) || redacted=""
+    [[ -n "$redacted" ]] || redacted="$COMMAND"
+    # Build the JSONL record with jq so all escaping is correct. If jq fails,
+    # skip the write entirely rather than hand-roll a line that might mis-escape.
+    line=$(jq -cn \
+        --arg ts "$ts" \
+        --arg decision "$decision" \
+        --arg pattern "$tag" \
+        --arg tier "$tier" \
+        --arg command "$redacted" \
+        '{ts:$ts, decision:$decision, pattern:$pattern, tier:$tier, command:$command}' \
+        2>/dev/null) || return 0
+    [[ -n "$line" ]] || return 0
+    mkdir -p "$(dirname "$DECISION_LOG")" 2>/dev/null || true
+    # Group the append so a FAILED >> redirection (unwritable/nonexistent dir)
+    # has its bash-level error caught by the group's stderr redirect too — a bare
+    # `>> "$f" 2>/dev/null` does not suppress the redirection-open error itself.
+    { printf '%s\n' "$line" >> "$DECISION_LOG"; } 2>/dev/null || true
+    return 0
 }
 
 # Top-level error trap: on ANY unexpected error, output valid JSON "allow"
@@ -404,6 +477,53 @@ reversible_gh_guard_enabled() {
         _REVERSIBLE_GH_GUARD_CACHE="$enabled"
     fi
     [[ "$_REVERSIBLE_GH_GUARD_CACHE" == "true" ]]
+}
+
+# =============================================================================
+# Decision-telemetry toggle — default OFF (opt-IN; inverse polarity, #3771).
+#
+# The deny/ask decision log (log_guard_decision() near the top of this file) is
+# OFF by default: it writes a new persistent, cross-session artifact of redacted
+# commands, so — mirroring the other opt-in data-collection features in Loom
+# (transcript archival #3726, the model-cost experiment #3725) — a zero-config
+# install sees NO new file and NO behaviour change. An operator enables it to
+# measure guard-hook friction.
+#
+# Same INVERSE polarity as reversible_gh_guard_enabled(): defaults false, the
+# absent-key resolution is false, and only an explicit `true` (config) or a
+# truthy env value enables it.
+#
+# Resolution order (highest precedence first):
+#   1. LOOM_GUARD_DECISION_LOG env var (1/true/yes/on enables; 0/false/no/off
+#      disables). Overrides config.
+#   2. .loom/config.json  ->  guards.decisionLog  (default false when absent).
+#   3. Default: false (no decision log written).
+#
+# Resolved LAZILY and cached in _DECISION_LOG_CACHE, invoked only from inside
+# log_guard_decision() (i.e. only once a deny/ask is about to fire), exactly like
+# the other toggles — so the config read NEVER touches the hot path for the ~99%
+# of commands that neither deny nor ask, and in particular never runs on the
+# #3687 read-only fast path (which exits before any deny/ask). The config read is
+# best-effort: any parse failure falls through to guard-OFF (the default).
+# =============================================================================
+_DECISION_LOG_CACHE=""
+decision_log_enabled() {
+    if [[ -z "$_DECISION_LOG_CACHE" ]]; then
+        local enabled=false
+        if [[ -n "$REPO_ROOT" && -f "$REPO_ROOT/.loom/config.json" ]]; then
+            # Only an explicit `true` enables; a missing key or malformed JSON
+            # (jq non-zero, caught by ||) stays OFF — inverse of sql_guard_enabled().
+            enabled=$(jq -r 'if .guards.decisionLog == true then "true" else "false" end' "$REPO_ROOT/.loom/config.json" 2>/dev/null) || enabled=false
+            [[ -n "$enabled" ]] || enabled=false
+        fi
+        # Env override wins over config.
+        case "${LOOM_GUARD_DECISION_LOG:-}" in
+            0|false|no|off)   enabled=false ;;
+            1|true|yes|on)    enabled=true ;;
+        esac
+        _DECISION_LOG_CACHE="$enabled"
+    fi
+    [[ "$_DECISION_LOG_CACHE" == "true" ]]
 }
 
 # =============================================================================
@@ -805,8 +925,17 @@ strip_literal_text() {
 }
 
 # Helper: output a deny decision and exit
+#
+# Optional second arg is a short, STABLE rule tag (issue #3771) recorded as the
+# decision log's `pattern` field; it defaults to "deny" (a function-name-derived
+# fallback) so this stays backward-compatible with call sites that don't pass
+# one. Telemetry is emitted BEFORE the JSON decision so a logging hiccup can
+# never suppress the deny, and the `|| true` guarantees it never trips the ERR
+# trap. Deny is always the "catastrophic" tier.
 deny() {
     local reason="$1"
+    local tag="${2:-deny}"
+    log_guard_decision "deny" "catastrophic" "$tag" || true
     if jq -n --arg reason "$reason" '{
         hookSpecificOutput: {
             hookEventName: "PreToolUse",
@@ -824,8 +953,14 @@ deny() {
 }
 
 # Helper: output an ask decision and exit
+#
+# Same optional rule-tag convention as deny() (issue #3771); defaults to "ask".
+# Ask is always the "ask" tier. Telemetry is best-effort and emitted before the
+# JSON decision.
 ask() {
     local reason="$1"
+    local tag="${2:-ask}"
+    log_guard_decision "ask" "ask" "$tag" || true
     if jq -n --arg reason "$reason" '{
         hookSpecificOutput: {
             hookEventName: "PreToolUse",
@@ -931,7 +1066,7 @@ fi
 
 for pattern in "${ALWAYS_BLOCK_PATTERNS[@]}"; do
     if echo "$COMMAND_NO_LITERAL_TEXT" | grep -qiE "$pattern"; then
-        deny "BLOCKED: Command matches dangerous pattern: $pattern"
+        deny "BLOCKED: Command matches dangerous pattern: $pattern" "catastrophic:$pattern"
     fi
 done
 
@@ -1054,7 +1189,7 @@ lifecycle_or_cloud_reason() {
 
 _LIFECYCLE_REASON=$(lifecycle_or_cloud_reason "$COMMAND_NO_COMMENT" | head -1)
 if [[ -n "$_LIFECYCLE_REASON" ]]; then
-    deny "BLOCKED: $_LIFECYCLE_REASON"
+    deny "BLOCKED: $_LIFECYCLE_REASON" "lifecycle-or-cloud-delete"
 fi
 
 # =============================================================================
@@ -1069,7 +1204,7 @@ fi
 SQL_DDL_PATTERN='DROP DATABASE|DROP TABLE|DROP SCHEMA|TRUNCATE TABLE'
 if echo "$COMMAND_NO_COMMENT" | grep -qiE "$SQL_DDL_PATTERN" && sql_guard_enabled; then
     matched=$(echo "$COMMAND_NO_COMMENT" | grep -oiE "$SQL_DDL_PATTERN" | head -1)
-    deny "BLOCKED: Command matches dangerous pattern: ${matched:-SQL DDL statement}"
+    deny "BLOCKED: Command matches dangerous pattern: ${matched:-SQL DDL statement}" "sql-ddl"
 fi
 
 # =============================================================================
@@ -1216,7 +1351,7 @@ if echo "$COMMAND" | grep -qE 'rm[[:space:]]+-[a-zA-Z]*[rf]'; then
             if [[ "$ABS_PATH" == "/" ]] || \
                [[ -n "$HOME" && "$ABS_PATH" == "$HOME" ]] || \
                [[ "$ABS_PATH" =~ ^/[^/]+$ ]]; then
-                deny "BLOCKED: rm on protected system path: $ABS_PATH"
+                deny "BLOCKED: rm on protected system path: $ABS_PATH" "rm-protected-path"
             fi
 
             # Opt-in repo-scoped strict mode (guards.rmScope:"repo" /
@@ -1272,7 +1407,7 @@ if echo "$COMMAND" | grep -qE 'rm[[:space:]]+-[a-zA-Z]*[rf]'; then
                 fi
 
                 if [[ "$IN_SCOPE" == false ]]; then
-                    deny "BLOCKED: rm target outside repo scope (LOOM_RM_SCOPE=repo): $ABS_PATH"
+                    deny "BLOCKED: rm target outside repo scope (LOOM_RM_SCOPE=repo): $ABS_PATH" "rm-scope-outside-repo"
                 fi
             fi
         fi
@@ -1289,7 +1424,7 @@ fi
 # path for non-SQL commands.
 if echo "$COMMAND_NO_COMMENT" | grep -qiE 'DELETE[[:space:]]+FROM[[:space:]]+' && \
    ! echo "$COMMAND_NO_COMMENT" | grep -qiE 'WHERE[[:space:]]+'; then
-    sql_guard_enabled && deny "BLOCKED: DELETE FROM without WHERE clause"
+    sql_guard_enabled && deny "BLOCKED: DELETE FROM without WHERE clause" "sql-delete-no-where"
 fi
 
 # =============================================================================
@@ -1319,7 +1454,7 @@ if [[ "$COMMAND_NO_COMMENT" == *git* ]] && \
         if [[ -n "$_FORCE_OPS" ]]; then
             if [[ "$_FORCE_MODE" == "all" ]]; then
                 # Preserve pre-#3674 behaviour byte-for-byte: any force op asks.
-                ask "Command requires confirmation: $COMMAND"
+                ask "Command requires confirmation: $COMMAND" "force-op:all"
             fi
             # "protected" mode: ask only for protected-branch or ambiguous
             # targets; allow own working branches. resolve_default_branch() plus
@@ -1336,14 +1471,14 @@ if [[ "$COMMAND_NO_COMMENT" == *git* ]] && \
                     if [[ -z "$_fbranch" ]]; then
                         # Detached HEAD / unresolved identity is ambiguous — ask,
                         # never silently allow (fail toward asking).
-                        ask "Command requires confirmation: $COMMAND (force operation on a detached or unresolved branch)"
+                        ask "Command requires confirmation: $COMMAND (force operation on a detached or unresolved branch)" "force-op:detached"
                     fi
                     _ftarget="$_fbranch"
                 fi
                 _fdefault=$(resolve_default_branch "$_fcwd")
                 if [[ "$_ftarget" == "main" || "$_ftarget" == "master" ]] || \
                    { [[ -n "$_fdefault" && "$_ftarget" == "$_fdefault" ]]; }; then
-                    ask "Command requires confirmation: $COMMAND (force operation targets protected branch '$_ftarget')"
+                    ask "Command requires confirmation: $COMMAND (force operation targets protected branch '$_ftarget')" "force-op:protected"
                 fi
             done <<< "$_FORCE_OPS"
             # No protected/ambiguous target matched — fall through to allow.
@@ -1417,7 +1552,7 @@ ASK_PATTERNS=(
 
 for pattern in "${ASK_PATTERNS[@]}"; do
     if echo "$COMMAND_ASK_SCAN" | grep -qE "$pattern"; then
-        ask "Command requires confirmation: $COMMAND"
+        ask "Command requires confirmation: $COMMAND" "ask:$pattern"
     fi
 done
 
@@ -1446,7 +1581,7 @@ REVERSIBLE_GH_ASK_PATTERNS=(
 
 for pattern in "${REVERSIBLE_GH_ASK_PATTERNS[@]}"; do
     if echo "$COMMAND_ASK_SCAN" | grep -qE "$pattern" && reversible_gh_guard_enabled; then
-        ask "Command requires confirmation: $COMMAND (set guards.reversibleGh:true in .loom/config.json to keep this ask; it is off by default because the op is trivially reversible)"
+        ask "Command requires confirmation: $COMMAND (set guards.reversibleGh:true in .loom/config.json to keep this ask; it is off by default because the op is trivially reversible)" "reversible-gh:$pattern"
     fi
 done
 
@@ -1473,7 +1608,7 @@ done
 if echo "$COMMAND_NO_COMMENT" | grep -qE '(^|[;&|(]|[[:space:]])git[[:space:]]+read-tree'; then
     # Isolated form (GIT_INDEX_FILE=... git read-tree ...) is allowed.
     if ! echo "$COMMAND_NO_COMMENT" | grep -qE 'GIT_INDEX_FILE='; then
-        ask "Command requires confirmation: $COMMAND (a bare 'git read-tree' empties the real staging index with no reflog trace; use 'git merge-tree --write-tree <base> <branch>' for a merge preview, or isolate with GIT_INDEX_FILE=\$(mktemp))"
+        ask "Command requires confirmation: $COMMAND (a bare 'git read-tree' empties the real staging index with no reflog trace; use 'git merge-tree --write-tree <base> <branch>' for a merge preview, or isolate with GIT_INDEX_FILE=\$(mktemp))" "git-read-tree"
     fi
 fi
 
@@ -1522,7 +1657,7 @@ CLOUD_ASK_PATTERNS=(
 
 for pattern in "${CLOUD_ASK_PATTERNS[@]}"; do
     if echo "$COMMAND_NO_COMMENT" | grep -qE "$pattern" && cloud_guard_enabled; then
-        ask "Command requires confirmation: $COMMAND (set guards.cloudCli:false in .loom/config.json if this repo manages cloud infra as a first-class workflow)"
+        ask "Command requires confirmation: $COMMAND (set guards.cloudCli:false in .loom/config.json if this repo manages cloud infra as a first-class workflow)" "cloud-cli:$pattern"
     fi
 done
 
