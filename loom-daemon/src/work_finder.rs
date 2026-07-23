@@ -74,11 +74,13 @@
 
 use std::collections::HashSet;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Result;
 
 use crate::disk_headroom::disk_headroom_limit;
+use crate::main_health_gate::MainHealthState;
 use crate::tokens::token_pool_size;
 
 // ============================================================================
@@ -221,6 +223,10 @@ pub struct TickReport {
     pub deferred_capacity: usize,
     /// Dispatch attempts that returned an error (logged, non-fatal).
     pub errors: usize,
+    /// True when this tick dispatched nothing because the main-health gate
+    /// (Phase C, #3812) had halted dispatch (`main` was red). `seen` still
+    /// reflects the backlog depth; `dispatched` is always 0 in this case.
+    pub halted: bool,
 }
 
 /// Run one work-finder tick: fetch ready issues, filter, and dispatch up to the
@@ -231,6 +237,14 @@ pub struct TickReport {
 /// `occupancy < max_concurrent`, incrementing occupancy per new dispatch so a
 /// single tick never overshoots the cap.
 ///
+/// # Reactive main-health halt (Phase C, #3812)
+///
+/// When `halted` is `true` the main-health gate has observed a red `main`, so
+/// this tick dispatches **zero** new issues (existing in-flight sweeps are never
+/// touched) and returns early with [`TickReport::halted`] set. `seen` still
+/// reflects the backlog so the loop can log "backlog is N but halted." The
+/// caller resumes normally once a green gate run clears the flag.
+///
 /// # Errors
 ///
 /// Propagates a source (`list_ready_issues`) error so the caller can log it and
@@ -240,12 +254,19 @@ pub fn tick(
     source: &mut impl WorkSource,
     dispatcher: &mut impl WorkDispatcher,
     max_concurrent: usize,
+    halted: bool,
 ) -> Result<TickReport> {
     let ready = source.list_ready_issues()?;
     let mut report = TickReport {
         seen: ready.len(),
         ..TickReport::default()
     };
+
+    // Reactive backstop: a red `main` halts all new dispatch this tick.
+    if halted {
+        report.halted = true;
+        return Ok(report);
+    }
 
     let in_flight = dispatcher.in_flight();
     let mut occupancy = in_flight.len();
@@ -390,6 +411,7 @@ pub fn spawn_work_finder_task<S, D>(
     interval: Duration,
     workspace_root: PathBuf,
     configured_max: usize,
+    health_state: Arc<MainHealthState>,
 ) -> tokio::task::JoinHandle<()>
 where
     S: WorkSource + Send + 'static,
@@ -404,18 +426,34 @@ where
         let mut ticker = tokio::time::interval(interval);
         // First tick fires immediately; skip it so we don't churn at boot.
         ticker.tick().await;
+        // Track the halt state across ticks so we log the halt/resume edges
+        // once per halted period, not once per skipped tick.
+        let mut was_halted = false;
         loop {
             ticker.tick().await;
+            // Reactive main-health backstop (Phase C, #3812): skip all dispatch
+            // while the gate reports a red `main`.
+            let halted = health_state.is_halted();
             // Recompute the dynamic cap from live inputs every tick (Phase B).
             let pool_size = token_pool_size(&workspace_root);
             let disk = disk_headroom_limit(&workspace_root);
             let max_concurrent = resolve_dynamic_max_concurrent(pool_size, disk, configured_max);
             log::debug!(
                 "work_finder: dynamic cap = {max_concurrent} (pool={pool_size}, disk={disk}, \
-                 configured_max={configured_max})"
+                 configured_max={configured_max}, halted={halted})"
             );
-            match tick(&mut source, &mut dispatcher, max_concurrent) {
+            match tick(&mut source, &mut dispatcher, max_concurrent, halted) {
                 Ok(report) => {
+                    if report.halted && !was_halted {
+                        log::warn!(
+                            "work_finder: main-health gate halted dispatch — {} ready issue(s) \
+                             held until main is green again",
+                            report.seen
+                        );
+                    } else if !report.halted && was_halted {
+                        log::info!("work_finder: main-health gate cleared — resuming dispatch");
+                    }
+                    was_halted = report.halted;
                     if report.dispatched > 0 || report.errors > 0 {
                         log::info!(
                             "work_finder: tick — cap {max_concurrent} (pool={pool_size}, \
@@ -663,7 +701,7 @@ mod tests {
         // N=5 ready issues, cap K=2 → exactly 2 dispatched this tick, 3 deferred.
         let mut source = FakeSource::once((1..=5).map(issue).collect());
         let mut disp = RecordingDispatcher::default();
-        let report = tick(&mut source, &mut disp, 2).unwrap();
+        let report = tick(&mut source, &mut disp, 2, false).unwrap();
 
         assert_eq!(report.seen, 5);
         assert_eq!(report.dispatched, 2);
@@ -676,7 +714,7 @@ mod tests {
     fn test_tick_all_dispatched_when_under_cap() {
         let mut source = FakeSource::once((1..=3).map(issue).collect());
         let mut disp = RecordingDispatcher::default();
-        let report = tick(&mut source, &mut disp, 10).unwrap();
+        let report = tick(&mut source, &mut disp, 10, false).unwrap();
 
         assert_eq!(report.dispatched, 3);
         assert_eq!(report.deferred_capacity, 0);
@@ -691,7 +729,7 @@ mod tests {
             in_flight: HashSet::from([100, 101]),
             ..Default::default()
         };
-        let report = tick(&mut source, &mut disp, 3).unwrap();
+        let report = tick(&mut source, &mut disp, 3, false).unwrap();
 
         assert_eq!(report.dispatched, 1);
         assert_eq!(report.deferred_capacity, 3);
@@ -707,7 +745,7 @@ mod tests {
             in_flight: HashSet::from([7]),
             ..Default::default()
         };
-        let report = tick(&mut source, &mut disp, 10).unwrap();
+        let report = tick(&mut source, &mut disp, 10, false).unwrap();
 
         assert_eq!(report.skipped_in_flight, 1);
         assert_eq!(report.dispatched, 1);
@@ -724,7 +762,7 @@ mod tests {
             issue(4),
         ]);
         let mut disp = RecordingDispatcher::default();
-        let report = tick(&mut source, &mut disp, 10).unwrap();
+        let report = tick(&mut source, &mut disp, 10, false).unwrap();
 
         assert_eq!(report.skipped_labeled, 3);
         assert_eq!(report.dispatched, 1);
@@ -741,7 +779,7 @@ mod tests {
             ..Default::default()
         };
         // Cap of 2: #1 is a no-op (frees its slot), so #2 AND #3 still dispatch.
-        let report = tick(&mut source, &mut disp, 2).unwrap();
+        let report = tick(&mut source, &mut disp, 2, false).unwrap();
 
         assert_eq!(report.dispatched, 2, "only #2 and #3 are new dispatches");
         assert_eq!(report.skipped_in_flight, 1, "#1 was an idempotency no-op");
@@ -757,7 +795,7 @@ mod tests {
             fail_issues: HashSet::from([2]),
             ..Default::default()
         };
-        let report = tick(&mut source, &mut disp, 10).unwrap();
+        let report = tick(&mut source, &mut disp, 10, false).unwrap();
 
         assert_eq!(report.dispatched, 2);
         assert_eq!(report.errors, 1);
@@ -774,11 +812,11 @@ mod tests {
         let mut source = FakeSource { results };
         let mut disp = RecordingDispatcher::default();
 
-        let first = tick(&mut source, &mut disp, 10);
+        let first = tick(&mut source, &mut disp, 10, false);
         assert!(first.is_err(), "source error propagates out of the tick");
         assert_eq!(disp.dispatched.len(), 0, "no dispatch on the erroring tick");
 
-        let second = tick(&mut source, &mut disp, 10).unwrap();
+        let second = tick(&mut source, &mut disp, 10, false).unwrap();
         assert_eq!(second.dispatched, 2, "the next tick proceeds normally");
         assert_eq!(disp.dispatched, vec![1, 2]);
     }
@@ -787,9 +825,49 @@ mod tests {
     fn test_tick_empty_ready_is_noop() {
         let mut source = FakeSource::once(vec![]);
         let mut disp = RecordingDispatcher::default();
-        let report = tick(&mut source, &mut disp, 10).unwrap();
+        let report = tick(&mut source, &mut disp, 10, false).unwrap();
         assert_eq!(report, TickReport::default());
         assert!(disp.dispatched.is_empty());
+    }
+
+    // ===================================================================
+    // tick — reactive main-health halt (Phase C, #3812)
+    // ===================================================================
+
+    #[test]
+    fn test_tick_halted_dispatches_zero_with_backlog() {
+        // A red `main` (halted=true) dispatches nothing even with ample capacity
+        // and a full backlog; existing in-flight sweeps are untouched.
+        let mut source = FakeSource::once((1..=5).map(issue).collect());
+        let mut disp = RecordingDispatcher {
+            in_flight: HashSet::from([100, 101]),
+            ..Default::default()
+        };
+        let report = tick(&mut source, &mut disp, 10, true).unwrap();
+
+        assert!(report.halted, "report must flag the halt");
+        assert_eq!(report.seen, 5, "backlog is still observed");
+        assert_eq!(report.dispatched, 0, "zero dispatch while halted");
+        assert_eq!(report.deferred_capacity, 0);
+        assert!(disp.dispatched.is_empty(), "no sweeps started while halted");
+    }
+
+    #[test]
+    fn test_tick_resumes_dispatch_once_halt_cleared() {
+        // Same source shape: halted ⇒ zero, then not halted ⇒ dispatches.
+        let mut source = FakeSource::once((1..=3).map(issue).collect());
+        let mut disp = RecordingDispatcher::default();
+        let halted = tick(&mut source, &mut disp, 10, true).unwrap();
+        assert!(halted.halted);
+        assert_eq!(halted.dispatched, 0);
+        assert!(disp.dispatched.is_empty());
+
+        // Next tick with the halt cleared dispatches normally.
+        let mut source = FakeSource::once((1..=3).map(issue).collect());
+        let resumed = tick(&mut source, &mut disp, 10, false).unwrap();
+        assert!(!resumed.halted);
+        assert_eq!(resumed.dispatched, 3);
+        assert_eq!(disp.dispatched, vec![1, 2, 3]);
     }
 
     // ===================================================================
@@ -913,7 +991,7 @@ mod tests {
         assert_eq!(cap, 0);
         let mut source = FakeSource::once((1..=3).map(issue).collect());
         let mut disp = RecordingDispatcher::default();
-        let report = tick(&mut source, &mut disp, cap).unwrap();
+        let report = tick(&mut source, &mut disp, cap, false).unwrap();
         assert_eq!(report.dispatched, 0);
         assert_eq!(report.deferred_capacity, 3);
         assert!(disp.dispatched.is_empty());
@@ -934,14 +1012,14 @@ mod tests {
         // Backlog 2 (< cap): all 2 dispatch, nothing deferred.
         let mut source = FakeSource::once((1..=2).map(issue).collect());
         let mut disp = RecordingDispatcher::default();
-        let report = tick(&mut source, &mut disp, cap).unwrap();
+        let report = tick(&mut source, &mut disp, cap, false).unwrap();
         assert_eq!(report.dispatched, 2, "backlog 2 < cap 4 ⇒ 2 dispatched");
         assert_eq!(report.deferred_capacity, 0);
 
         // Backlog 6 (> cap): scales up to the cap (4), defers the surplus (2).
         let mut source = FakeSource::once((10..=15).map(issue).collect());
         let mut disp = RecordingDispatcher::default();
-        let report = tick(&mut source, &mut disp, cap).unwrap();
+        let report = tick(&mut source, &mut disp, cap, false).unwrap();
         assert_eq!(report.dispatched, 4, "backlog 6 > cap 4 ⇒ scaled up to cap");
         assert_eq!(report.deferred_capacity, 2);
     }
@@ -954,7 +1032,7 @@ mod tests {
         assert_eq!(cap, 5);
         let mut source = FakeSource::once(vec![]);
         let mut disp = RecordingDispatcher::default();
-        let report = tick(&mut source, &mut disp, cap).unwrap();
+        let report = tick(&mut source, &mut disp, cap, false).unwrap();
         assert_eq!(report, TickReport::default(), "empty backlog ⇒ zero activity");
         assert!(disp.dispatched.is_empty());
     }

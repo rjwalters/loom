@@ -4,6 +4,7 @@ use loom_daemon::event_bus::EventBus;
 use loom_daemon::health_monitor;
 use loom_daemon::ipc::IpcServer;
 use loom_daemon::issue_creation_mutex::IssueCreationMutex;
+use loom_daemon::main_health_gate;
 use loom_daemon::metrics_collector;
 use loom_daemon::role_validation;
 use loom_daemon::sweep_registry::{self, SweepRegistry, SweepRegistryConfig};
@@ -305,6 +306,12 @@ async fn main() -> Result<()> {
     // interval task on the shared daemon runtime (like the reaper): every call
     // into `dispatch()` returns promptly (fire-and-forget child spawn), so the
     // finder never parks a runtime worker in a long blocking call.
+    // Shared reactive main-health halt flag (Issue #3812 — Phase C of epic
+    // #3809). Always constructed so it can be threaded into the work-finder;
+    // when the gate loop below is disabled nothing ever flips it, so the
+    // work-finder is never halted (zero behavior change with the gate off).
+    let main_health_state = Arc::new(main_health_gate::MainHealthState::new());
+
     let _work_finder_handle = if work_finder::enabled() {
         let source = work_finder::GhWorkSource::new();
         let dispatcher = work_finder::RegistryDispatcher::new(sweep_registry.clone());
@@ -321,9 +328,48 @@ async fn main() -> Result<()> {
             interval,
             sweep_workspace.clone(),
             configured_max,
+            main_health_state.clone(),
         ))
     } else {
         log::debug!("work_finder: disabled (set LOOM_WORK_FINDER=1 to enable)");
+        None
+    };
+
+    // Reactive main-health backstop loop (Issue #3812 — Phase C of epic #3809).
+    // Opt-in via `LOOM_MAIN_HEALTH_GATE` AND a `buildGate` block in
+    // `.loom/config.json`. On a red `main` (a non-zero `buildGate.command`) it
+    // sets `main_health_state` halted, which stops the work-finder above from
+    // dispatching new sweeps until a green run clears it. The gate command runs
+    // on a blocking thread (it may take minutes), so a plain `tokio::spawn`
+    // interval task on the shared runtime is correct (like the reaper).
+    let _main_health_gate_handle = if main_health_gate::enabled() {
+        match main_health_gate::read_build_gate_config(&sweep_workspace) {
+            Some(gate_config) => {
+                let interval = main_health_gate::resolve_interval();
+                log::info!(
+                    "main_health_gate: enabled (interval={}s, command={:?}, timeout={}s)",
+                    interval.as_secs(),
+                    gate_config.command,
+                    gate_config.timeout.as_secs()
+                );
+                let runner =
+                    main_health_gate::CommandGateRunner::new(gate_config, sweep_workspace.clone());
+                Some(main_health_gate::spawn_main_health_gate_task(
+                    runner,
+                    main_health_state.clone(),
+                    interval,
+                ))
+            }
+            None => {
+                log::warn!(
+                    "main_health_gate: LOOM_MAIN_HEALTH_GATE is set but no usable buildGate \
+                     config in .loom/config.json (missing/disabled/empty command) — gate inactive"
+                );
+                None
+            }
+        }
+    } else {
+        log::debug!("main_health_gate: disabled (set LOOM_MAIN_HEALTH_GATE=1 + a buildGate config to enable)");
         None
     };
 
