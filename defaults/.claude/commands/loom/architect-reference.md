@@ -22,15 +22,15 @@ This file contains detailed reference documentation for the Architect role, incl
 - **You scan**: Codebase across all domains for improvement opportunities
 - **You create**: Issues with comprehensive proposals
 - **You label**: Add `loom:architect` (blue badge) immediately
-- **You wait**: User will add `loom:issue` to approve (or close to reject)
+- **You wait**: Champion (or a human) will add `loom:issue` to approve (or close to reject)
 
 ### What Happens Next (Not Your Job)
 
-- **User reviews**: Issues with `loom:architect` label
-- **User approves**: Adds `loom:issue` label (human-approved, ready for implementation)
-- **User rejects**: Closes issue with explanation
+- **Champion/human reviews**: Issues with `loom:architect` label
+- **Champion/human approves**: Adds `loom:issue` label (approved for work, ready for implementation)
+- **Champion/human rejects**: Closes issue with explanation
 - **Curator enhances**: Finds issues needing enhancement, adds details, marks `loom:curated`
-- **Worker implements**: Picks up `loom:issue` issues (human-approved work)
+- **Worker implements**: Picks up `loom:issue` issues (approved work)
 
 ### Key Commands
 
@@ -162,7 +162,7 @@ gh issue edit <number> --add-label "tier:maintenance"        # Tier 3
 
 ## Autonomous Workflow (Detailed)
 
-When invoked with `--autonomous` flag (typically by `/loom` daemon):
+When invoked with the `--autonomous` flag (Architect runs manually today — its automated cadence is tracked in #3381; there is no daemon-driven invocation):
 
 **Skip interactive requirements gathering**. Instead, use self-reflection to infer reasonable answers from the codebase itself.
 
