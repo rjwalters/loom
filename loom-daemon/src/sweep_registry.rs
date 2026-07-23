@@ -34,7 +34,13 @@
 //! Recovery on restart relies on:
 //!
 //! - Live process detection (`kill(pid, 0)`).
-//! - Sweep checkpoints under `.loom/sweep-checkpoint/issue-<N>.json` (#3373).
+//! - Sweep checkpoints under `.loom/sweep-checkpoint/issue-<N>.json` (#3373),
+//!   but **only for daemon-owned sweeps**: `.loom/sweep-checkpoint/` is shared
+//!   with the in-session `/loom:sweep` path, so a checkpoint is recovered only
+//!   when a daemon-owned lock (`.loom/locks/issue-<N>/`, written exclusively by
+//!   `dispatch`) also existed for that issue. This keeps the daemon from
+//!   ingesting phantom entries for in-session sweeps it never dispatched
+//!   (#3808). See [`SweepRegistry::reconstruct`].
 //! - Forge labels (`loom:issue` vs `loom:building`).
 
 use crate::event_bus::EventBus;
@@ -43,7 +49,7 @@ use crate::types::{Event, SweepId, SweepInfo, SweepKind, SweepOutcome, SweepStat
 use anyhow::{anyhow, Context, Result};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -389,6 +395,20 @@ impl SweepRegistry {
         // Retain the handle so the reaper can `try_wait()` it (Issue #3801).
         self.children.insert(sweep_id.clone(), child);
 
+        // Record the spawned child's PID in the lock (Issue #3808). The lock's
+        // owner.json is written provisionally at `acquire_lock` time with the
+        // daemon's own PID (the child does not exist yet), but the value that
+        // matters for post-restart reconstruction is the *child's* PID: the
+        // daemon PID is gone after any restart, so keeping it would make even a
+        // still-live daemon-dispatched child look stale in `reconstruct()`'s
+        // lock pass. Rewrite `owner_pid` now that the child exists.
+        if let Err(e) = self.record_child_pid_in_lock(issue_number, pid) {
+            log::warn!(
+                "failed to record child pid {pid} in lock for issue #{issue_number} \
+                 (reconstruct may treat it as stale after a daemon restart): {e}"
+            );
+        }
+
         // 6. Record the entry. The model is carried on the registry entry
         //    (#3482, Phase 3a observability) so `list_sweeps` /
         //    `get_sweep_status` can report which model a sweep runs. Empty
@@ -464,6 +484,11 @@ impl SweepRegistry {
             Ok(()) => {
                 let owner = LockOwner {
                     issue,
+                    // Provisional: the child does not exist yet. `dispatch`
+                    // rewrites this with the spawned child's PID via
+                    // `record_child_pid_in_lock` once the child is running
+                    // (Issue #3808), so `reconstruct()` can recognise a live
+                    // daemon sweep after a restart.
                     owner_pid: std::process::id(),
                     acquired_at: Utc::now().to_rfc3339(),
                     sweep_id: sweep_id.to_string(),
@@ -482,6 +507,34 @@ impl SweepRegistry {
                 Err(anyhow!("failed to acquire lock for issue #{issue} at {}: {e}", lock.display()))
             }
         }
+    }
+
+    /// Rewrite the lock's `owner.json` so `owner_pid` records the spawned
+    /// sweep child's PID rather than the daemon's own PID (Issue #3808).
+    ///
+    /// `acquire_lock` runs *before* the child is spawned, so it can only
+    /// stamp `std::process::id()` (the daemon) provisionally. After a real
+    /// daemon restart that PID is gone by definition, which previously made
+    /// `reconstruct()`'s lock pass treat every daemon-dispatched sweep as
+    /// stale — dropping the lock and (before #3808) synthesizing a spurious
+    /// `Crashed` entry even for a child that was still alive. Storing the
+    /// child PID lets the lock pass admit a genuinely-live child as `Running`
+    /// across a restart. The rest of the owner record is preserved.
+    fn record_child_pid_in_lock(&self, issue: u32, child_pid: u32) -> Result<()> {
+        let owner_path = self
+            .config
+            .locks_dir()
+            .join(format!("issue-{issue}"))
+            .join("owner.json");
+        let existing = std::fs::read_to_string(&owner_path)
+            .with_context(|| format!("read lock owner {}", owner_path.display()))?;
+        let mut owner: LockOwner =
+            serde_json::from_str(&existing).context("parse lock owner.json")?;
+        owner.owner_pid = child_pid;
+        let owner_json = serde_json::to_string_pretty(&owner).context("serialize lock owner")?;
+        std::fs::write(&owner_path, owner_json)
+            .with_context(|| format!("write lock owner {}", owner_path.display()))?;
+        Ok(())
     }
 
     /// Release the lock dir for an issue (idempotent).
@@ -1214,13 +1267,32 @@ impl SweepRegistry {
     ///    flight even if the lock is gone.
     ///
     /// This is best-effort: locks whose `owner_pid` is dead are released
-    /// (they're stale); locks whose owner is live are admitted as `Running`;
-    /// checkpoints without a corresponding lock are admitted as `Crashed`
-    /// so a subsequent dispatch will re-run them via the checkpoint resume.
+    /// (they're stale); locks whose owner is live are admitted as `Running`.
+    ///
+    /// # Daemon ownership of checkpoints (Issue #3808)
+    ///
+    /// `.loom/sweep-checkpoint/` is written by the shared `/loom:sweep` skill
+    /// regardless of how the run was launched — an in-session (subagent-path)
+    /// sweep writes checkpoints there just like a daemon-dispatched detached
+    /// child does. A checkpoint file alone therefore does **not** imply the
+    /// daemon owns the sweep. The daemon-ownership signal is the **lock**: only
+    /// `dispatch` writes `.loom/locks/issue-<N>/`, and in-session sweeps never
+    /// touch it. So the checkpoint pass synthesizes a `Crashed` recovery entry
+    /// only for issues that had a daemon-owned lock whose owner PID is now dead
+    /// (a genuine daemon-owned sweep whose process is gone). Checkpoints with
+    /// no lock — in-session `/loom:sweep` runs the daemon never dispatched —
+    /// are skipped, so the daemon no longer ingests phantom entries for sweeps
+    /// it does not own. Genuine daemon-crash recovery is preserved because the
+    /// lock survives a daemon crash (it is only removed on clean release).
     #[allow(clippy::too_many_lines)]
     pub fn reconstruct(&mut self) -> Result<usize> {
         let locks_dir = self.config.locks_dir();
         let mut admitted = 0usize;
+        // Issues that had a daemon-owned lock whose owner PID is now dead.
+        // These are the only issues whose checkpoints the checkpoint pass may
+        // recover as `Crashed` (Issue #3808) — the lock is the daemon-ownership
+        // signal that a bare checkpoint file lacks.
+        let mut daemon_owned_dead: HashSet<u32> = HashSet::new();
 
         if locks_dir.exists() {
             for entry in std::fs::read_dir(&locks_dir)? {
@@ -1255,9 +1327,13 @@ impl SweepRegistry {
                     continue;
                 };
                 if !is_pid_alive(owner.owner_pid) {
-                    // Stale lock: owner is dead. Drop the lock and continue;
-                    // checkpoint reconstruction below will admit a Crashed
-                    // entry if appropriate.
+                    // Stale lock: the daemon-dispatched child's PID (recorded
+                    // by `record_child_pid_in_lock`, #3808) is dead. This lock
+                    // is the daemon's own crash-surviving evidence that it
+                    // dispatched this issue, so record the issue — the
+                    // checkpoint pass may recover it as `Crashed` — then drop
+                    // the stale lock and continue.
+                    daemon_owned_dead.insert(issue);
                     let _ = std::fs::remove_dir_all(&path);
                     continue;
                 }
@@ -1290,8 +1366,10 @@ impl SweepRegistry {
             }
         }
 
-        // Checkpoints without a live lock -> Crashed entries (so list_sweeps
-        // shows them; the next dispatch will resume via the sweep skill).
+        // Checkpoints for daemon-owned sweeps whose process is gone -> Crashed
+        // entries (so list_sweeps shows them; the next dispatch resumes via the
+        // sweep skill). Gated on daemon ownership (Issue #3808): a checkpoint
+        // is only recovered when a daemon-owned lock existed for its issue.
         let checkpoint_dir = self.config.checkpoint_dir();
         if checkpoint_dir.exists() {
             for entry in std::fs::read_dir(&checkpoint_dir)? {
@@ -1316,6 +1394,17 @@ impl SweepRegistry {
                         && matches!(info.kind, SweepKind::Issue(n) if n == issue)
                 });
                 if already_running {
+                    continue;
+                }
+                // Issue #3808: only recover a checkpoint when the daemon has
+                // independent evidence it dispatched this issue — a daemon-owned
+                // lock existed for it (captured in the lock pass above). A bare
+                // checkpoint file does NOT imply daemon ownership because the
+                // shared /loom:sweep skill writes `.loom/sweep-checkpoint/`
+                // regardless of launch mechanism. In-session sweeps never write
+                // a lock, so their checkpoints are skipped here — no phantom
+                // daemon registry entry.
+                if !daemon_owned_dead.contains(&issue) {
                     continue;
                 }
                 let sweep_id = format!("sweep-issue-{issue}-recovered-{}", Utc::now().timestamp());
@@ -2538,20 +2627,63 @@ exit 0
         assert!(registry.get("sweep-issue-78-stale").is_none());
     }
 
+    /// Issue #3808: a checkpoint with no corresponding daemon-owned lock is an
+    /// in-session `/loom:sweep` run the daemon never dispatched. `reconstruct`
+    /// must NOT synthesize a phantom `Crashed` entry for it. (Replaces the old
+    /// `reconstruct_admits_orphan_checkpoints_as_crashed`, which locked in the
+    /// pre-#3808 overly-broad behavior.)
     #[test]
-    fn reconstruct_admits_orphan_checkpoints_as_crashed() {
+    fn reconstruct_skips_in_session_checkpoints_without_lock() {
         let dir = tempdir().unwrap();
         let (mut registry, _record_log) = fixture_registry(dir.path());
 
         let cp_dir = registry.config.checkpoint_dir();
         std::fs::create_dir_all(&cp_dir).unwrap();
+        // In-session checkpoint: no lock dir was ever written for it.
         std::fs::write(cp_dir.join("issue-91.json"), r#"{"phase":"judge","issue":91}"#).unwrap();
 
         let admitted = registry.reconstruct().unwrap();
-        assert!(admitted >= 1);
+        assert_eq!(admitted, 0, "in-session checkpoint must not be recovered");
+        let crashed = registry.list(Some(&SweepState::Crashed { at: Utc::now() }));
+        assert!(crashed.is_empty(), "no phantom Crashed entry for issue 91");
+        assert!(registry.list(None).is_empty(), "registry must be empty");
+    }
+
+    /// Issue #3808: genuine daemon-crash recovery is preserved. A checkpoint
+    /// whose issue had a daemon-owned lock with a now-dead owner PID (the
+    /// daemon dispatched it, then crashed along with its child) IS recovered as
+    /// a `Crashed` entry so the next dispatch resumes it.
+    #[test]
+    fn reconstruct_recovers_daemon_owned_checkpoint() {
+        let dir = tempdir().unwrap();
+        let (mut registry, _record_log) = fixture_registry(dir.path());
+
+        // Daemon-owned lock with a dead owner PID (crashed daemon + child).
+        let locks = registry.config.locks_dir();
+        std::fs::create_dir_all(&locks).unwrap();
+        let lock = locks.join("issue-91");
+        std::fs::create_dir(&lock).unwrap();
+        let owner = LockOwner {
+            issue: 91,
+            owner_pid: 2_147_483_640, // dead
+            acquired_at: Utc::now().to_rfc3339(),
+            sweep_id: "sweep-issue-91-daemon".to_string(),
+        };
+        std::fs::write(lock.join("owner.json"), serde_json::to_string_pretty(&owner).unwrap())
+            .unwrap();
+
+        // Matching checkpoint written by the (now-gone) daemon-dispatched child.
+        let cp_dir = registry.config.checkpoint_dir();
+        std::fs::create_dir_all(&cp_dir).unwrap();
+        std::fs::write(cp_dir.join("issue-91.json"), r#"{"phase":"judge","issue":91}"#).unwrap();
+
+        let admitted = registry.reconstruct().unwrap();
+        assert!(admitted >= 1, "daemon-owned checkpoint must be recovered");
         let crashed = registry.list(Some(&SweepState::Crashed { at: Utc::now() }));
         assert_eq!(crashed.len(), 1);
         assert_eq!(crashed[0].latest_phase.as_deref(), Some("judge"));
+        // The stale daemon lock is cleaned up as part of recovery.
+        assert!(!lock.exists(), "stale daemon lock should be removed");
     }
 
     #[test]
