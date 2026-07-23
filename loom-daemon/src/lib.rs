@@ -11,6 +11,7 @@
 #![allow(clippy::missing_panics_doc)]
 
 pub mod activity;
+pub mod disk_headroom;
 pub mod epic_state;
 pub mod epic_supervisor;
 pub mod errors;
@@ -27,6 +28,7 @@ pub mod phase_join;
 pub mod role_validation;
 pub mod sweep_registry;
 pub mod terminal;
+pub mod tokens;
 pub mod types;
 pub mod work_finder;
 pub mod worktree_root;

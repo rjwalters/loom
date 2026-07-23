@@ -484,12 +484,42 @@ Each tick:
    `loom:issue → loom:building` label-flip lag) or that defensively carry any
    skip label (`loom:building` / `loom:blocked` / `loom:operator-only`).
 3. Dispatches the remainder through the existing `SweepRegistry::dispatch()`
-   path — up to a **fixed** max-concurrency cap counted against the current live
-   sweep occupancy. `dispatch()` already flips `loom:issue → loom:building`,
-   acquires the per-issue `mkdir`-atomic claim lock, and spawns the
-   rotated-token child, so the finder reimplements none of the race guard. Each
-   dispatch uses a `workfinder-<issue>` idempotency key, making a re-dispatch of
-   an already-running issue a no-op.
+   path — up to a **work-driven dynamic cap** (Phase B, #3811) recomputed every
+   tick and counted against the current live sweep occupancy. `dispatch()`
+   already flips `loom:issue → loom:building`, acquires the per-issue
+   `mkdir`-atomic claim lock, and spawns the rotated-token child, so the finder
+   reimplements none of the race guard. Each dispatch uses a
+   `workfinder-<issue>` idempotency key, making a re-dispatch of an
+   already-running issue a no-op.
+
+### Dynamic concurrency scaling (Phase B, #3811)
+
+The concurrency cap is **not** a fixed value resolved once at startup. Every
+tick the finder recomputes
+
+```
+dynamic_cap = min(token-pool size, disk headroom, configured ceiling)
+```
+
+from three live inputs, so pool/disk/backlog changes are honored without a
+daemon restart:
+
+| Input | Source | Bound it enforces |
+|-------|--------|-------------------|
+| **token-pool size** | count of `*.token` files in `{workspace}/.loom/tokens/` (`tokens::token_pool_size`) | never over-subscribe a rotated OAuth account — one live sweep per usable account |
+| **disk headroom** | `floor(free_gb / LOOM_PER_WORKTREE_GB)` on the worktree-root volume (`disk_headroom::disk_headroom_limit`, a Rust port of `disk-headroom.sh` that shells to `df -Pk`) | never provision more worktrees than the scratch volume can hold |
+| **configured ceiling** | `LOOM_WORK_FINDER_MAX_CONCURRENT` (repurposed from Phase A's fixed target into an operator ceiling) | hard operator upper bound regardless of pool/disk headroom |
+
+The **effective** per-tick concurrency is then `min(dynamic_cap, backlog_depth)`:
+`tick()` iterates the ready `loom:issue` rows and stops at the cap, so
+concurrency **scales up** as the backlog grows and drains to **zero** dispatches
+when the queue is empty (no capacity is pre-reserved and no idle workers are
+spawned). A token pool of 0 (rotation not bootstrapped) yields a cap of 0 —
+the finder dispatches nothing, matching `spawn-claude.sh`'s `EX_CONFIG`
+hard-fail on a missing pool. The `df` probe runs once per tick and is negligible
+on the 60s default interval. Bad-token-aware pool counting (subtracting
+`.bad_tokens` entries) is a tracked follow-up; the first pass counts `*.token`
+files.
 
 The loop is **idempotent** (an issue already in the registry is never
 re-dispatched) and **fail-safe**: a forge-query error aborts only that tick
@@ -500,10 +530,11 @@ new event topics.
 
 Enable it with `LOOM_WORK_FINDER=1` (unset/false-y = OFF). Tunables:
 `LOOM_WORK_FINDER_INTERVAL_SECS` (default 60 — tighter than the epic
-supervisor's 300s so the `loom:issue` backlog drains promptly) and
-`LOOM_WORK_FINDER_MAX_CONCURRENT` (default 3 — the fixed MVP cap; dynamic
-scaling is deferred to Phase B). A zero or unparseable value for either tunable
-falls back to its default.
+supervisor's 300s so the `loom:issue` backlog drains promptly),
+`LOOM_WORK_FINDER_MAX_CONCURRENT` (default 3 — the operator **ceiling** in the
+dynamic policy above, not a fixed target), and `LOOM_PER_WORKTREE_GB` (default 2
+— the per-worktree disk estimate the disk-headroom bound divides by). A zero or
+unparseable value for any of these falls back to its default.
 
 > **Scope note**: the work finder dispatches **already-approved** `loom:issue`
 > items; it does **not** generate new work. Architect/Hermit work-generation
