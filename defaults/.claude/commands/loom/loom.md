@@ -576,12 +576,12 @@ loom-clean --deep       # Also remove build artifacts
 
 **Issue stuck in `loom:building`:**
 ```bash
-./.loom/scripts/stale-building-check.sh --recover
+loom-recover-orphans --recover
 ```
 
 **Orphaned sweeps after daemon crash:**
 ```bash
-loom-orphan-recovery --recover
+loom-recover-orphans --recover
 ```
 
 **Labels out of sync:**
