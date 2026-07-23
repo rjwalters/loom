@@ -11,6 +11,16 @@ Selection order:
 
 In all tiers, tokens marked bad (via bad_tokens.is_bad) are skipped.
 
+Stale-ranking fail-safe (issue #3894): when ``.ranking`` exists but is older
+than the freshness window, tier-1 declines — but rather than discarding the
+ranking entirely and degrading to *fully-random* selection into accounts a
+recent probe already flagged ``exhausted``/``blocked`` (which wedges sweeps at
+startup), the stale ranking's exhausted/blocked entries are carried forward as
+an **advisory exclusion set** applied to the allowlist and random tiers. If the
+exclusions would empty the pool (e.g. a stale "everything exhausted" ranking),
+selection retries ignoring them so a live pool can never hard-fail on stale
+advice.
+
 This module is import-safe: no I/O occurs at import time. Both the daemon
 (via ``import``) and the bash wrapper (via ``python3 -m``) call
 ``select_token`` from concurrent processes.
@@ -226,18 +236,48 @@ def _try_ranking(
     return rng.choice(eligible)
 
 
+def _stale_ranking_exclusions(ranking_file: Path) -> set[str]:
+    """Advisory exclusion set sourced from a *stale* ``.ranking`` (issue #3894).
+
+    When ``.ranking`` is older than the freshness window, tier-1 (``_try_ranking``)
+    declines and selection would otherwise degrade to fully-random — repeatedly
+    handing out accounts a recent probe already flagged ``exhausted``/``blocked``,
+    wedging sweeps at startup. Rather than discard the stale ranking, treat its
+    exhausted/blocked entries as an advisory exclusion set for the lower tiers.
+
+    Returns an empty set when the ranking is fresh (tier-1 owns that case) or
+    missing/unreadable — so callers get exclusions *only* in the stale-but-present
+    window, and the pre-#3894 behavior is preserved everywhere else.
+    """
+    age = _file_age_seconds(ranking_file)
+    if age is None or age < _RANKING_FRESH_SECONDS:
+        return set()
+    return {
+        name
+        for name, status in _read_ranking(ranking_file)
+        if status in ("exhausted", "blocked")
+    }
+
+
 def _try_allowlist(
     tokens_dir: Path,
     allowlist_file: Path,
     workspace_path: Path,
     rng: random.Random,
+    exclude: frozenset[str] | set[str] = frozenset(),
 ) -> SelectedToken | None:
-    """Strategy 2: random pick from allowlist."""
+    """Strategy 2: random pick from allowlist.
+
+    ``exclude`` is an advisory set of account names to skip (stale-ranking
+    exhausted/blocked entries, issue #3894).
+    """
     if not allowlist_file.is_file():
         return None
     names = _read_allowlist(allowlist_file)
     eligible: list[Path] = []
     for name in names:
+        if name in exclude:
+            continue
         token_file = tokens_dir / f"{name}.token"
         if token_file.is_file() and not is_bad(workspace_path, name):
             eligible.append(token_file)
@@ -264,10 +304,17 @@ def _try_random(
     tokens_dir: Path,
     workspace_path: Path,
     rng: random.Random,
+    exclude: frozenset[str] | set[str] = frozenset(),
 ) -> SelectedToken | None:
-    """Strategy 3: random pick from all tokens."""
+    """Strategy 3: random pick from all tokens.
+
+    ``exclude`` is an advisory set of account names to skip (stale-ranking
+    exhausted/blocked entries, issue #3894).
+    """
     candidates = [
-        p for p in _list_token_files(tokens_dir) if not is_bad(workspace_path, p.stem)
+        p
+        for p in _list_token_files(tokens_dir)
+        if not is_bad(workspace_path, p.stem) and p.stem not in exclude
     ]
     if not candidates:
         return None
@@ -336,13 +383,33 @@ def select_token(
     if selected is not None:
         return selected
 
-    selected = _try_allowlist(tokens_dir, allowlist_file, workspace_path, rng)
+    # Tier-1 declined: .ranking is absent or stale. If a stale ranking exists,
+    # carry its exhausted/blocked entries forward as an advisory exclusion set
+    # so the lower tiers don't degrade to random selection into known-bad
+    # accounts (issue #3894). A fresh/missing ranking yields no exclusions.
+    exclude = _stale_ranking_exclusions(ranking_file)
+
+    selected = _try_allowlist(
+        tokens_dir, allowlist_file, workspace_path, rng, exclude=exclude,
+    )
     if selected is not None:
         return selected
 
-    selected = _try_random(tokens_dir, workspace_path, rng)
+    selected = _try_random(tokens_dir, workspace_path, rng, exclude=exclude)
     if selected is not None:
         return selected
+
+    # Fail-safe: the advisory exclusions emptied the pool (e.g. a stale
+    # "everything exhausted" ranking). Retry ignoring them so a live pool can
+    # never hard-fail on stale advice — better to spawn into a possibly-tired
+    # account than to refuse all work.
+    if exclude:
+        selected = _try_allowlist(tokens_dir, allowlist_file, workspace_path, rng)
+        if selected is not None:
+            return selected
+        selected = _try_random(tokens_dir, workspace_path, rng)
+        if selected is not None:
+            return selected
 
     raise EmptyTokenPoolError(
         f"All {len(all_tokens)} tokens in {tokens_dir} are marked bad or empty. "

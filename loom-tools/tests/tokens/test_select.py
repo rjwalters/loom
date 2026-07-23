@@ -219,6 +219,74 @@ def test_stale_ranking_falls_through_to_random(tmp_path):
     assert sel.mode == "random"
 
 
+def _write_stale_ranking(workspace: Path, lines: list[str], age_secs: float) -> None:
+    """Write .ranking and backdate its mtime by *age_secs* seconds."""
+    rfile = workspace / ".loom" / "tokens" / ".ranking"
+    rfile.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    old = time.time() - age_secs
+    os.utime(rfile, (old, old))
+
+
+def test_stale_ranking_excludes_exhausted_from_random(tmp_path):
+    """A stale .ranking still excludes exhausted accounts from the random tier.
+
+    Regression for issue #3894: without this, an absent/stale ranking degraded
+    to fully-random selection and repeatedly handed out the exhausted account,
+    wedging sweeps at startup.
+    """
+    workspace = _make_workspace(tmp_path, {"tired": "kt", "fresh": "kf"})
+    # 11 minutes old — past the freshness window — with `tired` exhausted.
+    _write_stale_ranking(workspace, ["tired|exhausted", "fresh|"], 11 * 60)
+    for seed in range(30):
+        sel = select_token(workspace, rng=random.Random(seed))
+        assert sel.name == "fresh"  # never the exhausted account
+        assert sel.mode == "random"  # tier-1 declined (stale)
+
+
+def test_stale_ranking_excludes_blocked_from_random(tmp_path):
+    workspace = _make_workspace(tmp_path, {"blk": "kb", "ok": "ko"})
+    _write_stale_ranking(workspace, ["blk|blocked", "ok|"], 20 * 60)
+    for seed in range(20):
+        sel = select_token(workspace, rng=random.Random(seed))
+        assert sel.name == "ok"
+        assert sel.mode == "random"
+
+
+def test_stale_ranking_excludes_exhausted_from_allowlist(tmp_path):
+    """Stale-ranking exclusions also apply to the allowlist tier."""
+    workspace = _make_workspace(tmp_path, {"tired": "kt", "fresh": "kf"})
+    _write_allowlist(workspace, ["tired", "fresh"])
+    _write_stale_ranking(workspace, ["tired|exhausted", "fresh|"], 11 * 60)
+    for seed in range(20):
+        sel = select_token(workspace, rng=random.Random(seed))
+        assert sel.name == "fresh"
+        assert sel.mode == "allowlist"
+
+
+def test_stale_ranking_all_exhausted_falls_back_rather_than_hard_fail(tmp_path):
+    """A stale 'everything exhausted' ranking must not hard-fail a live pool.
+
+    The advisory exclusions empty the pool, so selection retries ignoring them
+    — returning a (possibly tired) token rather than raising EmptyTokenPoolError.
+    """
+    workspace = _make_workspace(tmp_path, {"a": "ka", "b": "kb"})
+    _write_stale_ranking(workspace, ["a|exhausted", "b|exhausted"], 30 * 60)
+    sel = select_token(workspace, rng=random.Random(0))
+    assert sel.name in ("a", "b")
+    assert sel.mode == "random"
+
+
+def test_stale_ranking_without_status_still_random_over_all(tmp_path):
+    """A stale ranking with no exhausted/blocked entries excludes nothing."""
+    workspace = _make_workspace(tmp_path, {"a": "ka", "b": "kb"})
+    _write_stale_ranking(workspace, ["a|", "b|"], 11 * 60)
+    chosen = {
+        select_token(workspace, rng=random.Random(seed)).name for seed in range(30)
+    }
+    # No exclusions => both accounts reachable via the random tier.
+    assert chosen == {"a", "b"}
+
+
 def test_ranking_with_comments_and_blank_lines(tmp_path):
     workspace = _make_workspace(tmp_path, {"a": "ka", "b": "kb"})
     _write_ranking(
