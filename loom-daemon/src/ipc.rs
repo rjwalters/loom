@@ -9,12 +9,67 @@ use crate::terminal::TerminalManager;
 use crate::types::{Event, Request, Response};
 use anyhow::Result;
 use chrono::Utc;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 use tokio::fs;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
+
+/// Bound on the singleton-guard liveness probe (#3806). Both the connect and
+/// the `Ping`/`Pong` roundtrip are individually capped at this duration so a
+/// hung or unresponsive peer can never stall daemon startup.
+const LIVENESS_PROBE_TIMEOUT: Duration = Duration::from_millis(500);
+
+/// Returns `true` if a live `loom-daemon` is currently listening on
+/// `socket_path` and actively servicing requests.
+///
+/// The probe connects to the socket and performs a `Ping`/`Pong` roundtrip:
+///
+/// - A connect failure (`ECONNREFUSED`, `ENOENT`, `ENOTSOCK`, permission
+///   error, …) means the socket is absent or stale — the file may linger from
+///   a crashed daemon but nothing is listening — so it is safe to remove and
+///   rebind. Returns `false`.
+/// - A successful connect **and** a `Pong` reply confirms a live daemon owns
+///   the socket. Returns `true`; the caller must refuse to start rather than
+///   unlink the path out from under the incumbent.
+///
+/// A connect that succeeds but never yields a `Pong` within
+/// `LIVENESS_PROBE_TIMEOUT` (e.g. an accept loop wedged before it services
+/// requests, or a non-daemon process squatting the path) is treated as "not a
+/// live, responsive daemon" and returns `false` — refusing to ever reclaim
+/// such a socket would be worse than rebinding it.
+async fn socket_has_live_listener(socket_path: &Path) -> bool {
+    let stream = match tokio::time::timeout(
+        LIVENESS_PROBE_TIMEOUT,
+        UnixStream::connect(socket_path),
+    )
+    .await
+    {
+        Ok(Ok(stream)) => stream,
+        // Connect refused/absent, or the connect itself timed out — not a
+        // live listener.
+        _ => return false,
+    };
+
+    let probe = async move {
+        let (reader, mut writer) = stream.into_split();
+        // Reuse the canonical Ping request shape so the probe stays in sync
+        // with the wire protocol.
+        let request_json = serde_json::to_string(&Request::Ping).ok()?;
+        writer.write_all(request_json.as_bytes()).await.ok()?;
+        writer.write_all(b"\n").await.ok()?;
+        writer.flush().await.ok()?;
+
+        let mut lines = BufReader::new(reader).lines();
+        let line = lines.next_line().await.ok()??;
+        let response: Response = serde_json::from_str(&line).ok()?;
+        Some(matches!(response, Response::Pong))
+    };
+
+    matches!(tokio::time::timeout(LIVENESS_PROBE_TIMEOUT, probe).await, Ok(Some(true)))
+}
 
 /// Get the current git branch for a given directory
 /// Returns None if not in a git repository or if the command fails
@@ -65,7 +120,23 @@ impl IpcServer {
     }
 
     pub async fn run(&self) -> Result<()> {
-        // Remove old socket
+        // Singleton guard (#3806): before touching the socket, probe whether a
+        // live daemon is already listening on it. Starting a second daemon used
+        // to unconditionally `remove_file` + rebind, silently orphaning the
+        // incumbent (still running, still holding its children, but with its
+        // socket unlinked). Refuse to start in that case; only a genuinely
+        // stale/absent socket is removed and rebound below.
+        if socket_has_live_listener(&self.socket_path).await {
+            anyhow::bail!(
+                "another loom-daemon is already listening on {} — refusing to start. \
+                 If you intended to replace it, stop the running daemon first \
+                 (e.g. `kill <pid>` or its shutdown path) and retry.",
+                self.socket_path.display()
+            );
+        }
+
+        // Remove old socket (best-effort; only reached when no live listener
+        // answered the probe above, i.e. the file is stale or absent).
         let _ = fs::remove_file(&self.socket_path).await;
 
         let listener = UnixListener::bind(&self.socket_path)?;
@@ -1508,6 +1579,65 @@ exit 0
             }
             other => panic!("Expected SweepStatus, got: {other:?}"),
         }
+    }
+
+    // ===== Singleton guard liveness probe (Issue #3806) =====
+
+    #[tokio::test]
+    async fn test_socket_has_live_listener_absent_path() {
+        // A path that doesn't exist at all → not live.
+        let dir = tempdir().unwrap();
+        let missing = dir.path().join("nope.sock");
+        assert!(!socket_has_live_listener(&missing).await);
+    }
+
+    #[tokio::test]
+    async fn test_socket_has_live_listener_stale_file() {
+        // A regular file at the socket path (a crashed daemon's leftover) has
+        // nothing listening behind it → not live, safe to remove/rebind.
+        let dir = tempdir().unwrap();
+        let stale = dir.path().join("stale.sock");
+        std::fs::write(&stale, b"").unwrap();
+        assert!(!socket_has_live_listener(&stale).await);
+    }
+
+    #[tokio::test]
+    async fn test_socket_has_live_listener_non_daemon_listener() {
+        // A bound UnixListener that never answers Ping (no accept/respond loop)
+        // must be treated as NOT a live, responsive daemon so startup can still
+        // recover rather than wedging forever.
+        let dir = tempdir().unwrap();
+        let sock = dir.path().join("silent.sock");
+        let _listener = UnixListener::bind(&sock).unwrap();
+        // We never accept()/respond, so the Ping/Pong roundtrip times out.
+        assert!(!socket_has_live_listener(&sock).await);
+    }
+
+    #[tokio::test]
+    async fn test_socket_has_live_listener_true_for_ponging_daemon() {
+        // Stand up a minimal accept loop that answers Ping with Pong, exactly
+        // like the real IPC server, and confirm the probe reports it live.
+        let dir = tempdir().unwrap();
+        let sock = dir.path().join("live.sock");
+        let listener = UnixListener::bind(&sock).unwrap();
+
+        let server = tokio::spawn(async move {
+            if let Ok((stream, _)) = listener.accept().await {
+                let (reader, mut writer) = stream.into_split();
+                let mut lines = BufReader::new(reader).lines();
+                if let Ok(Some(line)) = lines.next_line().await {
+                    if let Ok(Request::Ping) = serde_json::from_str::<Request>(&line) {
+                        let json = serde_json::to_string(&Response::Pong).unwrap();
+                        let _ = writer.write_all(json.as_bytes()).await;
+                        let _ = writer.write_all(b"\n").await;
+                        let _ = writer.flush().await;
+                    }
+                }
+            }
+        });
+
+        assert!(socket_has_live_listener(&sock).await);
+        server.abort();
     }
 
     #[test]
