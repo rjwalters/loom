@@ -255,6 +255,32 @@ The pre-v0.10.0 indicators `missing_milestone:worktree_created` and `extended_wo
 
 Multi-issue dispatch is driven by the Rust `loom-daemon` binary via `mcp__loom__dispatch_sweep`. The daemon holds the sweep registry, event bus, and reaper in memory — there is no on-disk orchestration state file to inspect. (The v0.9.x `spawn-loop.sh` and its `.loom/spawn-loop-state.json` state file were removed in v0.11.0.)
 
+### Sweep MCP tools missing (stale dist bundle)
+
+**Symptom**: `mcp__loom__dispatch_sweep`, `mcp__loom__list_sweeps`, `mcp__loom__get_sweep_status`, `mcp__loom__tail_sweep_log`, `mcp__loom__cancel_sweep`, `mcp__loom__publish_event`, `mcp__loom__subscribe_to_events`, or `mcp__loom__tail_event_bus` are **not offered** in a live session — `/loom:sweep`'s Stage -1 daemon probe can't reach them even though `loom-daemon` is running.
+
+**Cause**: the MCP client loads the **built bundle** `mcp-loom/dist/index.js`, never the TypeScript source. `dist/` is gitignored, so a checkout that predates the sweep tools (Phase A #3452 / Phase C #3455) keeps serving an old bundle. The source (`mcp-loom/src/index.ts` → `sweepTools`) is correct; the on-disk artifact is stale (#3803).
+
+**Diagnose**:
+
+```bash
+# 0 means the sweep tools are absent from the built bundle -> stale
+grep -c dispatch_sweep mcp-loom/dist/index.js
+
+# Compare build vs source timestamps
+ls -la mcp-loom/dist/index.js
+find mcp-loom/src -type f -newer mcp-loom/dist/index.js   # any output => dist is stale
+```
+
+**Fix** — rebuild, then **reconnect**:
+
+```bash
+cd mcp-loom && npm install && npm run build
+grep -c dispatch_sweep dist/index.js   # should now be > 0
+```
+
+`scripts/setup-mcp.sh` now auto-rebuilds when `dist/index.js` is missing **or** older than any file under `mcp-loom/src/` (#3803), so `./scripts/setup-mcp.sh` is the safe one-shot path. Rebuilding the bundle does **not** refresh an already-running session — an MCP client caches its tool list at connect time, so you must **restart the Claude Code session** (or respawn the `loom` MCP subprocess) for the new tools to appear. See [`mcp-loom/README.md`](../../mcp-loom/README.md#rebuilding-after-source-changes-reconnect-required) for the full rebuild + reconnect procedure and a raw `tools/list` verification snippet.
+
 ### Inspect running sweeps
 
 ```bash
