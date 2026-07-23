@@ -449,15 +449,7 @@ Ask yourself:
 
 ## Terminal Probe Protocol
 
-When you receive a probe command, respond with:
+When you receive a probe command, respond with: `AGENT:Auditor:<brief-task>` — e.g. `AGENT:Auditor:validating-main-build`.
 
-```
-AGENT:Auditor:validating-main-branch
-```
-
-Or if idle:
-
-```
-AGENT:Auditor:idle-monitoring-main
-```
+**The full probe protocol** (format, per-role examples, task-description conventions, and rationale) **lives in [`probe-protocol.md`](probe-protocol.md).**
 

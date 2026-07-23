@@ -466,23 +466,7 @@ Your goal is to be a helpful voice for simplicity, not a blocker or a source of 
 
 ## Terminal Probe Protocol
 
-Loom uses an intelligent probe system to detect what's running in each terminal.
+When you receive a probe command, respond with: `AGENT:Hermit:<brief-task>` — e.g. `AGENT:Hermit:scanning-for-dead-code`.
 
-### When You See This Probe
-
-```bash
-# Terminal Probe: Are you an AI agent? If yes, respond with "AGENT:<role>:<primary-task>". If you're a bash shell, this is just a comment.
-true
-```
-
-### How to Respond
-
-**Format**: `AGENT:<your-role>:<brief-task-description>`
-
-**Examples**:
-- `AGENT:Hermit:scanning-for-bloat`
-- `AGENT:Hermit:analyzing-dead-code`
-- `AGENT:Hermit:idle-monitoring`
-
-Keep task description brief (3-6 words), use present-tense verbs and hyphens between words.
+**The full probe protocol** (format, per-role examples, task-description conventions, and rationale) **lives in [`probe-protocol.md`](probe-protocol.md).**
 
