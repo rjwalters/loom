@@ -445,15 +445,17 @@ The fast path is **on by default**, resolved highest-precedence first:
 2. **`.loom/config.json` → `guards.readOnlyFastPath`** — default `true` when absent; set `false` to disable.
 3. **Default** — `true`.
 
-**Security**: the fast path is a guard bypass by construction, so admission is purely structural. A command is fast-pathed only when it contains **none** of `;` `&` `|` `<` `>` backtick `$(` newline (excludes chaining/piping/redirection/substitution) **and** its first token exactly matches the built-in allowlist: `git status|log|diff|show` (bare, no `git -C …`), `ls`, `grep`, `rg`, `gh <noun> view|list`, `aws <service> describe*|get*|list*`, `aws s3 ls`. Wrappers (`bash -c`, `eval`, `sudo …`, `env …`) are excluded automatically because their first token isn't allowlisted. So `git status && git push --force origin main` takes the full path and is still denied.
+**Security**: the fast path is a guard bypass by construction, so admission is purely structural. A command is fast-pathed only when it contains **none** of `;` `&` `|` `<` `>` backtick `$(` newline (excludes chaining/piping/redirection/substitution) **and** its first token exactly matches the built-in allowlist: `git status|log|diff|show` (bare, no `git -C …`), `ls`, `grep`, `rg`, `jq`, `wc`, `head`, `tail`, `test`, `[`, `[[` (any args), `find` (any args **except** a dangerous action-primary — `-delete`/`-exec`/`-execdir`/`-ok`/`-okdir`/`-fls`/`-fprint`/`-fprint0`/`-fprintf` — which routes it to the full path, #3772), `gh <noun> view|list`, `aws <service> describe*|get*|list*`, `aws s3 ls`. Wrappers (`bash -c`, `eval`, `sudo …`, `env …`) are excluded automatically because their first token isn't allowlisted. So `git status && git push --force origin main` takes the full path and is still denied.
 
 **`cat` and `ssh` are deliberately excluded**: `cat` has an existing `.ssh`/`.aws/credentials` ASK carve-out a blanket fast-path would skip, and `ssh` wraps an opaque remote payload the catastrophic scan still covers.
 
 **Optional** `guards.readOnlyFastPathExtra` is an extend-only array of **literal first-word commands** added to the allowlist without hand-editing the installer-managed `.claude/settings.json`:
 
 ```json
-{ "guards": { "readOnlyFastPath": true, "readOnlyFastPathExtra": ["jq", "wc"] } }
+{ "guards": { "readOnlyFastPath": true, "readOnlyFastPathExtra": ["psql"] } }
 ```
+
+> **Note**: `jq`/`wc` (and `head`/`tail`/`test`/`find`) are part of the built-in default allowlist as of #3772 — `readOnlyFastPathExtra` is now only for a genuinely-custom bare read-only word.
 
 > **Warning**: each entry is a full-generality bypass for that command word (all arguments) — only add bare, argument-independent read-only utilities, never scripts or anything that could wrap a mutating call.
 

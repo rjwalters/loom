@@ -1610,6 +1610,15 @@ assert_allow_silent "Fast path: gh issue list admits silently" "gh issue list --
 assert_allow_silent "Fast path: aws ec2 describe-instances admits silently" "aws ec2 describe-instances"
 assert_allow_silent "Fast path: aws s3 ls admits silently" "aws s3 ls s3://bucket"
 assert_allow_silent "Fast path: aws lambda get-function admits silently" "aws lambda get-function --function-name f"
+# --- #3772: broadened default allowlist verbs admit read-only invocations ---
+assert_allow_silent "Fast path: jq admits silently (#3772)" "jq -n '.'"
+assert_allow_silent "Fast path: wc admits silently (#3772)" "wc -l file.txt"
+assert_allow_silent "Fast path: head admits silently (#3772)" "head -n5 file.txt"
+assert_allow_silent "Fast path: tail admits silently (#3772)" "tail -n5 file.txt"
+assert_allow_silent "Fast path: test admits silently (#3772)" "test -f file.txt"
+assert_allow_silent "Fast path: [ admits silently (#3772)" "[ -f file.txt ]"
+assert_allow_silent "Fast path: [[ admits silently (#3772)" "[[ -f file.txt ]]"
+assert_allow_silent "Fast path: find (no action primary) admits silently (#3772)" "find . -name '*.sh'"
 
 # The two "default ON" observable assertions below only apply when the fast path
 # is not force-disabled via the ambient env var. Under a
@@ -1626,7 +1635,42 @@ _FP_DDL="DR""OP TA""BLE"
 if [[ "$_FP_AMBIENT_ON" == "1" ]]; then
     assert_allow_silent "Fast path: read-only 'grep <ddl>' bypasses SQL-DDL false-positive (default on)" \
         "grep '$_FP_DDL' schema.sql"
+    # --- #3772: observable-admission proof for the broadened verbs. Each carries
+    #     the DDL literal as an argument (guard-scanned, never executed). A bare
+    #     silent-allow can't distinguish "fast-pathed" from "fell through to the
+    #     full path and allowed anyway", but the full path would `ask` on this
+    #     content, so a silent allow proves the fast path decided the outcome. ---
+    assert_allow_silent "Fast path: 'jq <ddl arg>' bypasses SQL-DDL false-positive (#3772)" \
+        "jq -n --arg s '$_FP_DDL' '.'"
+    assert_allow_silent "Fast path: 'wc <ddl arg>' bypasses SQL-DDL false-positive (#3772)" \
+        "wc -l '$_FP_DDL'"
+    assert_allow_silent "Fast path: 'head <ddl arg>' bypasses SQL-DDL false-positive (#3772)" \
+        "head -n1 '$_FP_DDL'"
+    assert_allow_silent "Fast path: 'tail <ddl arg>' bypasses SQL-DDL false-positive (#3772)" \
+        "tail -n1 '$_FP_DDL'"
+    assert_allow_silent "Fast path: 'test <ddl arg>' bypasses SQL-DDL false-positive (#3772)" \
+        "test '$_FP_DDL' = x"
+    assert_allow_silent "Fast path: 'find -iname <ddl arg>' bypasses SQL-DDL false-positive (#3772)" \
+        "find . -iname '$_FP_DDL'"
 fi
+
+# --- #3772: find's dangerous action-primaries are structurally excluded. Using
+#     the same DDL-content harness makes the assertion falsifiable: -delete /
+#     -exec disqualify fast-path eligibility, so the command falls through to the
+#     full path where the SQL-DDL deny pattern still fires on the DDL argument.
+#     (assert_deny holds regardless of the ambient fast-path toggle, mirroring
+#     the 'grep <ddl> | cat' full-path deny above.) ---
+assert_deny "Fast path security: 'find … -delete' is NOT fast-pathed (#3772)" \
+    "find . -iname '$_FP_DDL' -delete"
+assert_deny "Fast path security: 'find … -exec' is NOT fast-pathed (#3772)" \
+    "find . -iname '$_FP_DDL' -exec rm {} \\;"
+# -fls is a FILE-WRITING action-primary (the -ls-format sibling of -fprint*):
+# `find … -fls FILE` truncates/overwrites FILE with the listing on both GNU and
+# BSD/macOS find. It must disqualify fast-path eligibility exactly like its
+# -fprint* siblings — a silent fast-path allow here would bypass every deny/ask
+# check and violate the read-only invariant.
+assert_deny "Fast path security: 'find … -fls' is NOT fast-pathed (#3772)" \
+    "find . -iname '$_FP_DDL' -fls out.txt"
 
 # --- Security: compound / substitution / redirection / wrapper / non-bare forms
 #     are NOT eligible and keep their exact pre-existing verdict via the full

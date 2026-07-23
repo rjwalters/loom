@@ -165,6 +165,15 @@ fi
 #      disjoint from every existing deny/ask pattern:
 #        git status|log|diff|show  (bare — `git -C /p status` is NOT admitted)
 #        ls  grep  rg
+#        jq  wc  head  tail        (pure read-only text/JSON filters — none has
+#          an in-place-mutation flag, so any args are admitted, #3772)
+#        test  [  [[               (boolean file/string test builtins — no
+#          mutation surface at all, #3772)
+#        find                      (admitted for any args EXCEPT when a dangerous
+#          action-primary is present: -delete, -exec, -execdir, -ok, -okdir,
+#          -fls, -fprint, -fprint0, -fprintf. Any of those disqualifies eligibility
+#          and falls through to the full path — structural, not content-scanned,
+#          so a future `find -delete` deny rule is never silently bypassed, #3772)
 #        gh <noun> view|list       (never delete/close/archive/…)
 #        aws <service> describe*|get*|list*  and  aws s3 ls   (mirrors the
 #          verb-anchoring already in CLOUD_ASK_PATTERNS: those verbs are never
@@ -262,6 +271,31 @@ fastpath_builtin_admits() {
     (( n >= 1 )) || return 1
     case "${t[0]}" in
         ls|grep|rg)
+            return 0
+            ;;
+        jq|wc|head|tail)
+            # Pure read-only text/JSON filters. None writes files or takes an
+            # in-place-mutation flag (jq has no `-i`; wc/head/tail never mutate),
+            # so any arguments are admitted with no sub-form check.
+            return 0
+            ;;
+        test|'['|'[[')
+            # Boolean file/string test builtins — no mutation surface at all.
+            return 0
+            ;;
+        find)
+            # find is read-only UNLESS a dangerous action-primary is present.
+            # Structurally exclude the write/delete/exec primaries: if ANY token
+            # exactly matches one, decline eligibility (fall through to the full
+            # path). Pure bash-builtin string compares, zero forks.
+            local i
+            for (( i = 1; i < n; i++ )); do
+                case "${t[i]}" in
+                    -delete|-exec|-execdir|-ok|-okdir|-fls|-fprint|-fprint0|-fprintf)
+                        return 1
+                        ;;
+                esac
+            done
             return 0
             ;;
         git)

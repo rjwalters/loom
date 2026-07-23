@@ -1347,6 +1347,9 @@ The fast path is **on by default**. It is resolved in this order (highest preced
 |-------------|---------------|
 | `git` | `git status` / `git log` / `git diff` / `git show` — **bare** subcommand only (so `git -C /path status` is not admitted) |
 | `ls`, `grep`, `rg` | any arguments |
+| `jq`, `wc`, `head`, `tail` | any arguments (pure read-only text/JSON filters — none has an in-place-mutation flag) |
+| `test`, `[`, `[[` | any arguments (boolean file/string test builtins — no mutation surface) |
+| `find` | any arguments **except** those containing a dangerous action-primary — `-delete`, `-exec`, `-execdir`, `-ok`, `-okdir`, `-fls`, `-fprint`, `-fprint0`, `-fprintf` — which structurally disqualify the command and route it to the full path |
 | `gh` | `gh <noun> view` / `gh <noun> list` (never `delete`/`close`/`archive`/…) |
 | `aws` | `aws <service> describe*` / `get*` / `list*`, and `aws s3 ls` |
 
@@ -1361,10 +1364,12 @@ The fast path is **on by default**. It is resolved in this order (highest preced
 {
   "guards": {
     "readOnlyFastPath": true,
-    "readOnlyFastPathExtra": ["jq", "wc"]
+    "readOnlyFastPathExtra": ["psql"]
   }
 }
 ```
+
+> **Note**: `jq` and `wc` used to be the canonical example entries here, but as of #3772 they are part of the **built-in default** allowlist above — adding them via `readOnlyFastPathExtra` is now redundant. Use this escape hatch only for a genuinely-custom bare read-only command word (e.g. a site-specific query tool).
 
 > **Warning**: each word added here is a **guard bypass for that command word in full generality** (all arguments). Only add bare, argument-independent read-only utilities — never your own scripts or anything that could wrap a mutating call. Entries are matched as the literal first token only; no subcommand/verb parsing is applied to custom entries.
 
@@ -1385,8 +1390,9 @@ LOOM_GUARD_READONLY_FASTPATH=0 git status
 # Persist the opt-out for a whole repo
 #   .loom/config.json  ->  { "guards": { "readOnlyFastPath": false } }
 
-# Extend the allowlist with a bare read-only utility
-#   .loom/config.json  ->  { "guards": { "readOnlyFastPathExtra": ["jq"] } }
+# Extend the allowlist with a bare read-only utility (jq/wc/head/tail/find/test
+# are already built-in as of #3772 — use this for a genuinely-custom word):
+#   .loom/config.json  ->  { "guards": { "readOnlyFastPathExtra": ["psql"] } }
 ```
 
 ### Decision Telemetry Log (`guards.decisionLog` / `LOOM_GUARD_DECISION_LOG`)
