@@ -861,7 +861,34 @@ impl SweepRegistry {
         if let Some(parent) = depends_on {
             cmd.arg("--depends-on").arg(parent.to_string());
         }
+        // Unattended-permissions flag (issue #3824): a daemon-dispatched child
+        // is a detached, non-interactive `claude -p` process — there is no
+        // human to answer a permission prompt, so any tool call needing
+        // approval (`.loom/` writes, `sweep-run-registry.sh`, the
+        // `mcp__loom__list_sweeps` daemon probe) auto-denies and stalls the
+        // build. Append `--dangerously-skip-permissions` so the child runs
+        // non-interactively with hooks still firing — mirroring the established
+        // unattended cron pattern (`.github/workflows/loom-*.yml`, which spawn
+        // `claude -p "/<role>" --dangerously-skip-permissions`). Scoped to this
+        // daemon-only dispatch path; `spawn-claude.sh` stays a generic
+        // pass-through and never adds a permission flag of its own. Appended
+        // AFTER `--model`/`--effort`/`--depends-on` so the positional argv
+        // contract for those flags is unchanged.
+        cmd.arg("--dangerously-skip-permissions");
         cmd.env("LOOM_TERMINAL_ID", format!("daemon-{sweep_id}"))
+            // Claim-ownership marker (issue #3823): `dispatch()` flips
+            // loom:issue -> loom:building on the forge BEFORE this child is
+            // spawned (step 4, for immediate external visibility of the claim).
+            // Without a signal, the child's own `/loom:sweep` pre-flight would
+            // read that label and skip issue N as "already being built by
+            // someone else" — self-skipping the daemon's OWN claim, so no
+            // worktree, no build, no PR. Export the issue number this sweep
+            // owns so the child's pre-flight recognises an existing
+            // loom:building as ITS OWN daemon claim and proceeds to build.
+            // Scoped to daemon-dispatched children only: an operator-run
+            // `/loom:sweep N` never sets this env var, so the manual-terminal
+            // skip rule (honor any loom:building) is unchanged.
+            .env("LOOM_SWEEP_CLAIM_OWNED", issue.to_string())
             // Always pin LOOM_WORKSPACE to the registry's configured root so
             // spawn-claude.sh resolves `.loom/tokens/` from the same place
             // the daemon thinks the workspace is — never inheriting an
@@ -1272,6 +1299,29 @@ impl SweepRegistry {
                                 outcome: SweepOutcome::Crashed,
                             });
                         } else {
+                            // Orphaned-claim recovery (issue #3823b): a
+                            // daemon-owned sweep that exits cleanly WITHOUT a
+                            // checkpoint never reached the Builder phase — the
+                            // canonical case is a self-skip / no-work exit. Its
+                            // pre-dispatch loom:building claim (set at
+                            // `dispatch()` step 4) would otherwise stay orphaned
+                            // on the forge forever, because the Crashed branch
+                            // above is the ONLY place the reaper restored the
+                            // label and it fires only when a checkpoint exists.
+                            // Restore loom:building -> loom:issue so the issue
+                            // is automatically recoverable (no manual
+                            // `restore_label_to_ready` reclaim) — but only when
+                            // this sweep produced no PR, so we never yank the
+                            // label out from under an in-flight PR's issue
+                            // should `pr_number` ever be recorded on the entry.
+                            let produced_pr = self
+                                .entries
+                                .get(&sweep_id)
+                                .and_then(|info| info.pr_number)
+                                .is_some();
+                            if !self.config.skip_label_flip && !produced_pr {
+                                let _ = self.restore_label_to_ready(issue);
+                            }
                             if let Some(info) = self.entries.get_mut(&sweep_id) {
                                 info.state = SweepState::Exited {
                                     code: exit_code,
@@ -1819,6 +1869,7 @@ mod tests {
   printf 'LOOM_MODEL_EXPERIMENT=%s\n' "${{LOOM_MODEL_EXPERIMENT:-unset}}"
   printf 'LOOM_MODEL_EXPERIMENT_CANARY=%s\n' "${{LOOM_MODEL_EXPERIMENT_CANARY:-unset}}"
   printf 'LOOM_TRANSCRIPT_ARCHIVE=%s\n' "${{LOOM_TRANSCRIPT_ARCHIVE:-unset}}"
+  printf 'LOOM_SWEEP_CLAIM_OWNED=%s\n' "${{LOOM_SWEEP_CLAIM_OWNED:-unset}}"
   printf 'LOOM_TERMINAL_ID=%s\n' "${{LOOM_TERMINAL_ID:-unset}}"
 }} >> "{rec}" 2>&1
 exit 0
@@ -1980,6 +2031,67 @@ exit 0
         // The lock dir should exist while Running.
         let lock = dir.path().join(".loom").join("locks").join("issue-42");
         assert!(lock.exists(), "expected lock dir at {}", lock.display());
+
+        // Issue #3824: every daemon-dispatched child must carry
+        // --dangerously-skip-permissions (unattended, non-interactive).
+        assert!(
+            recorded.contains("--dangerously-skip-permissions"),
+            "expected --dangerously-skip-permissions in argv; got: {recorded}"
+        );
+    }
+
+    /// Issue #3824: `spawn_child` unconditionally appends
+    /// `--dangerously-skip-permissions` to the child argv so a detached,
+    /// non-interactive `claude -p` sweep never stalls on a permission prompt.
+    /// With no model/effort/depends-on the flag is the sole trailing arg,
+    /// appended AFTER any of those (verified by the exact positional form).
+    #[test]
+    #[serial]
+    fn dispatch_appends_dangerously_skip_permissions() {
+        let dir = tempdir().unwrap();
+        let (mut registry, record_log) = fixture_registry(dir.path());
+
+        let outcome = registry
+            .dispatch(&SweepKind::Issue(4242), None, None, None, None)
+            .expect("dispatch should succeed");
+
+        let needle = format!("LOOM_TERMINAL_ID=daemon-{}", outcome.sweep_id);
+        assert!(
+            wait_for_contents(&record_log, &needle, 10000),
+            "fake spawn-claude.sh did not finish writing within 10s"
+        );
+        let recorded = std::fs::read_to_string(&record_log).unwrap();
+        assert!(
+            recorded.contains("argv: -p /loom:sweep 4242 --dangerously-skip-permissions"),
+            "expected --dangerously-skip-permissions appended after the prompt; got: {recorded}"
+        );
+    }
+
+    /// Issue #3823 (Option A): `spawn_child` exports the claim-ownership
+    /// marker `LOOM_SWEEP_CLAIM_OWNED=<issue>` into the dispatched child so its
+    /// `/loom:sweep` pre-flight recognises the daemon's own pre-dispatch
+    /// loom:building flip as its OWN claim (and proceeds to build) rather than
+    /// self-skipping. The value is exactly the dispatched issue number.
+    #[test]
+    #[serial]
+    fn dispatch_exports_claim_ownership_marker() {
+        let dir = tempdir().unwrap();
+        let (mut registry, record_log) = fixture_registry(dir.path());
+
+        let outcome = registry
+            .dispatch(&SweepKind::Issue(4243), None, None, None, None)
+            .expect("dispatch should succeed");
+
+        let needle = format!("LOOM_TERMINAL_ID=daemon-{}", outcome.sweep_id);
+        assert!(
+            wait_for_contents(&record_log, &needle, 10000),
+            "fake spawn-claude.sh did not finish writing within 10s"
+        );
+        let recorded = std::fs::read_to_string(&record_log).unwrap();
+        assert!(
+            recorded.contains("LOOM_SWEEP_CLAIM_OWNED=4243"),
+            "expected claim-ownership marker for issue 4243; got: {recorded}"
+        );
     }
 
     /// Issue #3477 (Phase 1): a `model` dispatch param threads through to
@@ -2645,6 +2757,70 @@ exit 0
         assert!(changed >= 1);
         let info = registry.get(&sweep_id).unwrap();
         assert!(matches!(info.state, SweepState::Exited { .. }));
+    }
+
+    /// Issue #3823b: orphaned-claim recovery. A daemon-owned sweep that exits
+    /// cleanly with NO checkpoint (the self-skip / no-work case) must have its
+    /// pre-dispatch loom:building claim restored to loom:issue by the reaper —
+    /// otherwise the claim is orphaned and needs manual reclamation (the exact
+    /// dogfood symptom). Point `gh_bin` at a fake recorder with the real label
+    /// path enabled (`skip_label_flip = false`) and assert the restore fired.
+    #[test]
+    fn reap_restores_label_for_orphaned_clean_exit_without_pr() {
+        let dir = tempdir().unwrap();
+        let gh_log = dir.path().join("gh-invocations.log");
+        // Fake gh: record the space-joined argv and exit 0.
+        let fake_gh = dir.path().join("fake-gh.sh");
+        let script = format!(
+            "#!/usr/bin/env bash\nprintf '%s\\n' \"$*\" >> \"{}\"\nexit 0\n",
+            gh_log.display()
+        );
+        std::fs::write(&fake_gh, &script).unwrap();
+        let mut perms = std::fs::metadata(&fake_gh).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&fake_gh, perms).unwrap();
+        if let Ok(f) = std::fs::File::open(&fake_gh) {
+            let _ = f.sync_all();
+        }
+
+        let mut config = SweepRegistryConfig::new(dir.path().to_path_buf());
+        config.gh_bin = Some(fake_gh);
+        config.skip_label_flip = false; // exercise the real restore path
+        let mut registry = SweepRegistry::new(config);
+
+        let sweep_id = "sweep-issue-77-test".to_string();
+        registry.entries.insert(
+            sweep_id.clone(),
+            SweepInfo {
+                sweep_id: sweep_id.clone(),
+                kind: SweepKind::Issue(77),
+                pid: 2_147_483_640, // ~i32::MAX, almost certainly dead
+                token_name: "unknown".into(),
+                log_path: registry.compute_log_path(77),
+                idempotency_key: None,
+                started_at: Utc::now(),
+                state: SweepState::Running,
+                latest_phase: None,
+                pr_number: None, // no PR produced -> recoverable claim
+                model: None,
+                effort: None,
+                depends_on: None,
+            },
+        );
+
+        // No checkpoint file exists -> Exited branch -> orphaned-claim recovery.
+        let changed = registry.reap_once();
+        assert!(changed >= 1);
+
+        let info = registry.get(&sweep_id).unwrap();
+        assert!(matches!(info.state, SweepState::Exited { .. }));
+
+        let gh_calls = std::fs::read_to_string(&gh_log).unwrap_or_default();
+        assert!(
+            gh_calls.contains("issue edit 77 --remove-label loom:building --add-label loom:issue"),
+            "expected reaper to restore loom:building -> loom:issue for an orphaned \
+             clean exit without a PR; got gh invocations: {gh_calls:?}"
+        );
     }
 
     #[test]
