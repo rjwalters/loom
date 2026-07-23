@@ -1170,6 +1170,16 @@ impl SweepRegistry {
         // handle is retained (reconstructed / test-injected entry).
         let _ = self.reap_handle(sweep_id);
 
+        // Read `pr_number` BEFORE mutating terminal state so the
+        // orphaned-claim gate below sees the pre-cancel value (the state
+        // mutation doesn't touch `pr_number`, but reading first keeps the
+        // borrow sequencing clean and the intent explicit).
+        let produced_pr = self
+            .entries
+            .get(sweep_id)
+            .and_then(|info| info.pr_number)
+            .is_some();
+
         // Transition state, release lock, emit events.
         let now = Utc::now();
         let duration_sec = (now - started_at).num_seconds();
@@ -1181,6 +1191,19 @@ impl SweepRegistry {
         }
         if let SweepKind::Issue(issue) = kind {
             let _ = self.release_lock(*issue);
+            // Orphaned-claim recovery on cancel (issue #3827): a cancelled
+            // daemon-owned Issue sweep that never opened a PR still holds its
+            // pre-dispatch loom:building claim (set at `dispatch()` step 4).
+            // Unlike `reap_once()`'s clean-exit branch (#3823b), `finish_cancel`
+            // historically never restored the label, so cancelling stranded the
+            // issue in loom:building. Restore loom:building -> loom:issue so the
+            // issue is automatically recoverable — but only when this sweep
+            // produced no PR, so we never yank the label out from under an
+            // in-flight PR's issue. Gated on `!skip_label_flip`, mirroring the
+            // reaper path. `SweepKind::PrSet` cancels never reach here.
+            if !self.config.skip_label_flip && !produced_pr {
+                let _ = self.restore_label_to_ready(*issue);
+            }
             self.emit_event(Event::SweepExited {
                 issue: *issue,
                 exit_code: None,
@@ -2820,6 +2843,192 @@ exit 0
             gh_calls.contains("issue edit 77 --remove-label loom:building --add-label loom:issue"),
             "expected reaper to restore loom:building -> loom:issue for an orphaned \
              clean exit without a PR; got gh invocations: {gh_calls:?}"
+        );
+    }
+
+    /// Issue #3827: a cancelled daemon-owned Issue sweep that never opened a
+    /// PR must have its pre-dispatch loom:building claim restored to loom:issue
+    /// by `finish_cancel` — mirroring the reaper's clean-exit recovery (#3823b).
+    /// Otherwise cancelling a daemon-owned sweep strands the issue in
+    /// loom:building forever (the live repro: #3780/#3785).
+    #[test]
+    fn cancel_restores_label_when_no_pr_produced() {
+        let dir = tempdir().unwrap();
+        let gh_log = dir.path().join("gh-invocations.log");
+        let fake_gh = dir.path().join("fake-gh.sh");
+        let script = format!(
+            "#!/usr/bin/env bash\nprintf '%s\\n' \"$*\" >> \"{}\"\nexit 0\n",
+            gh_log.display()
+        );
+        std::fs::write(&fake_gh, &script).unwrap();
+        let mut perms = std::fs::metadata(&fake_gh).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&fake_gh, perms).unwrap();
+        if let Ok(f) = std::fs::File::open(&fake_gh) {
+            let _ = f.sync_all();
+        }
+
+        let mut config = SweepRegistryConfig::new(dir.path().to_path_buf());
+        config.gh_bin = Some(fake_gh);
+        config.skip_label_flip = false; // exercise the real restore path
+        let mut registry = SweepRegistry::new(config);
+
+        let kind = SweepKind::Issue(88);
+        let started_at = Utc::now();
+        let sweep_id = "sweep-issue-88-test".to_string();
+        registry.entries.insert(
+            sweep_id.clone(),
+            SweepInfo {
+                sweep_id: sweep_id.clone(),
+                kind: kind.clone(),
+                pid: 2_147_483_640, // ~i32::MAX, almost certainly dead
+                token_name: "unknown".into(),
+                log_path: registry.compute_log_path(88),
+                idempotency_key: None,
+                started_at,
+                state: SweepState::Running,
+                latest_phase: None,
+                pr_number: None, // no PR produced -> recoverable claim
+                model: None,
+                effort: None,
+                depends_on: None,
+            },
+        );
+
+        // exited_within_grace = true: no SIGKILL, straight to terminal path.
+        let outcome = registry.finish_cancel(&sweep_id, 2_147_483_640, &kind, started_at, true);
+        assert!(outcome.was_running);
+
+        let info = registry.get(&sweep_id).unwrap();
+        assert!(matches!(info.state, SweepState::Exited { .. }));
+
+        let gh_calls = std::fs::read_to_string(&gh_log).unwrap_or_default();
+        assert!(
+            gh_calls.contains("issue edit 88 --remove-label loom:building --add-label loom:issue"),
+            "expected finish_cancel to restore loom:building -> loom:issue for a \
+             cancelled sweep without a PR; got gh invocations: {gh_calls:?}"
+        );
+    }
+
+    /// Issue #3827: a cancelled sweep that DID open a PR (`pr_number` set) must
+    /// NOT have its label reset — that would yank loom:building out from under
+    /// an in-flight PR's issue and undo real progress.
+    #[test]
+    fn cancel_does_not_restore_label_when_pr_produced() {
+        let dir = tempdir().unwrap();
+        let gh_log = dir.path().join("gh-invocations.log");
+        let fake_gh = dir.path().join("fake-gh.sh");
+        let script = format!(
+            "#!/usr/bin/env bash\nprintf '%s\\n' \"$*\" >> \"{}\"\nexit 0\n",
+            gh_log.display()
+        );
+        std::fs::write(&fake_gh, &script).unwrap();
+        let mut perms = std::fs::metadata(&fake_gh).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&fake_gh, perms).unwrap();
+        if let Ok(f) = std::fs::File::open(&fake_gh) {
+            let _ = f.sync_all();
+        }
+
+        let mut config = SweepRegistryConfig::new(dir.path().to_path_buf());
+        config.gh_bin = Some(fake_gh);
+        config.skip_label_flip = false; // real restore path enabled but must not fire
+        let mut registry = SweepRegistry::new(config);
+
+        let kind = SweepKind::Issue(99);
+        let started_at = Utc::now();
+        let sweep_id = "sweep-issue-99-test".to_string();
+        registry.entries.insert(
+            sweep_id.clone(),
+            SweepInfo {
+                sweep_id: sweep_id.clone(),
+                kind: kind.clone(),
+                pid: 2_147_483_640,
+                token_name: "unknown".into(),
+                log_path: registry.compute_log_path(99),
+                idempotency_key: None,
+                started_at,
+                state: SweepState::Running,
+                latest_phase: None,
+                pr_number: Some(456), // PR opened -> must NOT reset the label
+                model: None,
+                effort: None,
+                depends_on: None,
+            },
+        );
+
+        let outcome = registry.finish_cancel(&sweep_id, 2_147_483_640, &kind, started_at, true);
+        assert!(outcome.was_running);
+
+        let info = registry.get(&sweep_id).unwrap();
+        assert!(matches!(info.state, SweepState::Exited { .. }));
+
+        let gh_calls = std::fs::read_to_string(&gh_log).unwrap_or_default();
+        assert!(
+            !gh_calls.contains("--remove-label loom:building"),
+            "expected finish_cancel to NOT restore the label when a PR was \
+             produced; got gh invocations: {gh_calls:?}"
+        );
+    }
+
+    /// Issue #3827: `SweepKind::PrSet` cancels must be unaffected — the
+    /// `if let SweepKind::Issue` scoping already excludes them, so no
+    /// `restore_label_to_ready` call is ever attempted.
+    #[test]
+    fn cancel_prset_does_not_restore_label() {
+        let dir = tempdir().unwrap();
+        let gh_log = dir.path().join("gh-invocations.log");
+        let fake_gh = dir.path().join("fake-gh.sh");
+        let script = format!(
+            "#!/usr/bin/env bash\nprintf '%s\\n' \"$*\" >> \"{}\"\nexit 0\n",
+            gh_log.display()
+        );
+        std::fs::write(&fake_gh, &script).unwrap();
+        let mut perms = std::fs::metadata(&fake_gh).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&fake_gh, perms).unwrap();
+        if let Ok(f) = std::fs::File::open(&fake_gh) {
+            let _ = f.sync_all();
+        }
+
+        let mut config = SweepRegistryConfig::new(dir.path().to_path_buf());
+        config.gh_bin = Some(fake_gh);
+        config.skip_label_flip = false;
+        let mut registry = SweepRegistry::new(config);
+
+        let kind = SweepKind::PrSet(vec![101, 102]);
+        let started_at = Utc::now();
+        let sweep_id = "sweep-prset-test".to_string();
+        registry.entries.insert(
+            sweep_id.clone(),
+            SweepInfo {
+                sweep_id: sweep_id.clone(),
+                kind: kind.clone(),
+                pid: 2_147_483_640,
+                token_name: "unknown".into(),
+                log_path: registry.compute_log_path(0),
+                idempotency_key: None,
+                started_at,
+                state: SweepState::Running,
+                latest_phase: None,
+                pr_number: None,
+                model: None,
+                effort: None,
+                depends_on: None,
+            },
+        );
+
+        let outcome = registry.finish_cancel(&sweep_id, 2_147_483_640, &kind, started_at, true);
+        assert!(outcome.was_running);
+
+        let info = registry.get(&sweep_id).unwrap();
+        assert!(matches!(info.state, SweepState::Exited { .. }));
+
+        let gh_calls = std::fs::read_to_string(&gh_log).unwrap_or_default();
+        assert!(
+            !gh_calls.contains("--remove-label loom:building"),
+            "expected finish_cancel to NOT touch labels for a PrSet cancel; \
+             got gh invocations: {gh_calls:?}"
         );
     }
 
