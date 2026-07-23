@@ -715,15 +715,23 @@ work-finder / health-gate loops. Two dedicated wrappers manage the raw daemon
 process:
 
 ```bash
-# Bring up autonomous mode (work finder + health gate) as a backgrounded process:
+# Plain start = FLAGS-OFF reliability daemon: BOTH autonomous loops OFF, no
+# auto-dispatch. This is the safe default (#3911), consistent with the
+# ecosystem-wide opt-in / default-off contract (LOOM_WORK_FINDER unset => off,
+# LOOM_MAIN_HEALTH_GATE unset => off, precedence env > config > default):
 ./.loom/scripts/cli/loom-daemon-start.sh
+
+# Opt in to autonomous loops explicitly:
+./.loom/scripts/cli/loom-daemon-start.sh --work-finder   # work finder on
+./.loom/scripts/cli/loom-daemon-start.sh --health-gate   # main-health gate on
+./.loom/scripts/cli/loom-daemon-start.sh --work-finder --health-gate   # both on
 
 # Enable strictly per .loom/config.json → autonomous (no env forcing):
 ./.loom/scripts/cli/loom-daemon-start.sh --from-config
 
-# Selective / foreground variants:
-./.loom/scripts/cli/loom-daemon-start.sh --no-work-finder   # gate only
-./.loom/scripts/cli/loom-daemon-start.sh --no-health-gate   # finder only
+# Explicit-off / foreground variants:
+./.loom/scripts/cli/loom-daemon-start.sh --no-work-finder   # force finder off (explicit; same as default)
+./.loom/scripts/cli/loom-daemon-start.sh --no-health-gate   # force gate off (explicit; same as default)
 ./.loom/scripts/cli/loom-daemon-start.sh --foreground       # run attached, no PID file
 
 # Clean shutdown:
@@ -732,6 +740,13 @@ process:
 ```
 
 `loom-daemon-start.sh`:
+- **defaults FLAGS-OFF (#3911)**: a bare invocation exports `LOOM_WORK_FINDER=0`
+  and `LOOM_MAIN_HEALTH_GATE=0`, so a plain start is a **reliability daemon** that
+  does **not** auto-dispatch sweeps — consistent with the ecosystem-wide opt-in /
+  default-off contract. An already-exported env var always wins; `--work-finder`
+  / `--health-gate` force the respective loop on; `--from-config` leaves both
+  unset so `.loom/config.json → autonomous` drives (precedence env > config >
+  default),
 - locates the `loom-daemon` binary (`LOOM_DAEMON_BIN` → `PATH` → `target/{release,debug}`),
 - runs the **advisory** host-sleep check (`check-host-sleep.sh`, #3350) — never blocks the start,
 - backgrounds the daemon and writes a PID file at `.loom/.daemon.pid` (gitignored),
