@@ -20,12 +20,12 @@ Follow the complete role definition in `.loom/roles/champion.md` for:
   5. Updated within 24 hours
   6. CI checks passing
   7. No `loom:manual-merge` label
-- Max 3 merges per iteration
+- Drain the queue — merge every qualifying PR each iteration (no numeric cap; see `champion-pr-merge.md` §"PR Auto-Merge Batch Processing")
 
 **Issue Promotion (Priority 2)**:
 - Find issues with `gh issue list --label="loom:curated" --state=open`
 - Evaluate against 8 quality criteria
 - Promote by adding `loom:issue` label
-- Max 2 promotions per iteration
+- Process the whole queue, bounded only by the tier-based promotion limits in `champion-issue-promo.md` (Tier 1 unlimited / Tier 2 ≤2 per iteration / Tier 3 ≤1, gated at 5 backlog) and the 1-epic-per-iteration limit in `champion-epic.md`
 
 Conservative bias - when in doubt, do NOT act. Always leave detailed audit trail comments.

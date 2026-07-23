@@ -46,7 +46,6 @@ echo "PASS: Label check"
 - [ ] Total lines changed <= configured limit (additions + deletions)
 - [ ] **Default limit**: 200 lines (configurable via `.loom/config.json` `champion.auto_merge_max_lines`)
 - [ ] **`loom:auto-merge-ok` label**: Size limit is waived (applied by Judge or human to signal large PR is safe)
-- [ ] **Force mode**: Size limit is waived
 
 **Verification command**:
 ```bash
@@ -56,37 +55,29 @@ ADDITIONS=$(echo "$PR_DATA" | jq -r '.additions')
 DELETIONS=$(echo "$PR_DATA" | jq -r '.deletions')
 TOTAL=$((ADDITIONS + DELETIONS))
 
-# Check force mode
-FORCE_MODE=$(cat .loom/daemon-state.json 2>/dev/null | jq -r '.force_mode // false')
+# Check for loom:auto-merge-ok label override
+HAS_AUTO_MERGE_OK=$(gh pr view <number> --json labels --jq '[.labels[].name] | any(. == "loom:auto-merge-ok")')
 
-if [ "$FORCE_MODE" = "true" ]; then
-  echo "PASS: Size check waived in force mode ($TOTAL lines)"
+if [ "$HAS_AUTO_MERGE_OK" = "true" ]; then
+  echo "PASS: Size check waived by loom:auto-merge-ok label ($TOTAL lines)"
 else
-  # Check for loom:auto-merge-ok label override
-  HAS_AUTO_MERGE_OK=$(gh pr view <number> --json labels --jq '[.labels[].name] | any(. == "loom:auto-merge-ok")')
+  # Read configurable size limit from .loom/config.json (default: 200)
+  SIZE_LIMIT=$(jq -r '.champion.auto_merge_max_lines // 200' .loom/config.json 2>/dev/null || echo 200)
 
-  if [ "$HAS_AUTO_MERGE_OK" = "true" ]; then
-    echo "PASS: Size check waived by loom:auto-merge-ok label ($TOTAL lines)"
-  else
-    # Read configurable size limit from .loom/config.json (default: 200)
-    SIZE_LIMIT=$(jq -r '.champion.auto_merge_max_lines // 200' .loom/config.json 2>/dev/null || echo 200)
-
-    if [ "$TOTAL" -gt "$SIZE_LIMIT" ]; then
-      echo "FAIL: Too large ($TOTAL lines, limit is $SIZE_LIMIT)"
-      exit 1
-    fi
-    echo "PASS: Size check ($TOTAL lines, limit is $SIZE_LIMIT)"
+  if [ "$TOTAL" -gt "$SIZE_LIMIT" ]; then
+    echo "FAIL: Too large ($TOTAL lines, limit is $SIZE_LIMIT)"
+    exit 1
   fi
+  echo "PASS: Size check ($TOTAL lines, limit is $SIZE_LIMIT)"
 fi
 ```
 
-**Rationale**: Small PRs are easier to revert if problems arise. The size limit is configurable via `.loom/config.json` to allow teams to tune the risk/autonomy tradeoff. The `loom:auto-merge-ok` label provides a per-PR escape hatch for large but safe PRs. In force mode, trust Judge review for all changes.
+**Rationale**: Small PRs are easier to revert if problems arise. The size limit is configurable via `.loom/config.json` to allow teams to tune the risk/autonomy tradeoff. The `loom:auto-merge-ok` label provides a per-PR escape hatch for large but safe PRs.
 
 ### 3. Critical File Exclusion Check
 - [ ] No changes to critical configuration or infrastructure files
-- [ ] **Force mode**: Critical file check is waived (trust Judge review)
 
-**Critical file patterns** (do NOT auto-merge if PR modifies any of these - normal mode only):
+**Critical file patterns** (do NOT auto-merge if PR modifies any of these):
 - `Cargo.toml` - root dependency changes
 - `loom-daemon/Cargo.toml` - daemon dependency changes
 - `loom-api/Cargo.toml` - api dependency changes
@@ -97,41 +88,34 @@ fi
 
 **Verification command**:
 ```bash
-# Check force mode first
-FORCE_MODE=$(cat .loom/daemon-state.json 2>/dev/null | jq -r '.force_mode // false')
+# Get all changed files
+FILES=$(gh pr view <number> --json files --jq -r '.files[].path')
 
-if [ "$FORCE_MODE" = "true" ]; then
-  echo "PASS: Critical file check waived in force mode"
-else
-  # Get all changed files (normal mode)
-  FILES=$(gh pr view <number> --json files --jq -r '.files[].path')
+# Define critical patterns (extend as needed)
+CRITICAL_PATTERNS=(
+  "Cargo.toml"
+  "loom-daemon/Cargo.toml"
+  "loom-api/Cargo.toml"
+  "package.json"
+  ".github/workflows/"
+  ".sql"
+  "migration"
+)
 
-  # Define critical patterns (extend as needed)
-  CRITICAL_PATTERNS=(
-    "Cargo.toml"
-    "loom-daemon/Cargo.toml"
-    "loom-api/Cargo.toml"
-    "package.json"
-    ".github/workflows/"
-    ".sql"
-    "migration"
-  )
-
-  # Check each file against patterns
-  for file in $FILES; do
-    for pattern in "${CRITICAL_PATTERNS[@]}"; do
-      if [[ "$file" == *"$pattern"* ]]; then
-        echo "FAIL: Critical file modified: $file"
-        exit 1
-      fi
-    done
+# Check each file against patterns
+for file in $FILES; do
+  for pattern in "${CRITICAL_PATTERNS[@]}"; do
+    if [[ "$file" == *"$pattern"* ]]; then
+      echo "FAIL: Critical file modified: $file"
+      exit 1
+    fi
   done
+done
 
-  echo "PASS: No critical files modified"
-fi
+echo "PASS: No critical files modified"
 ```
 
-**Rationale**: Changes to these files require careful human review due to high impact. In force mode, trust Judge review for critical file changes.
+**Rationale**: Changes to these files require careful human review due to high impact.
 
 ### 4. Merge Conflict Check
 - [ ] PR is mergeable (no conflicts with base branch)
@@ -158,8 +142,7 @@ echo "PASS: No merge conflicts"
 **Rationale**: Conflicting PRs require human resolution before merging
 
 ### 5. Recency Check
-- [ ] PR updated within last 24 hours (normal mode)
-- [ ] **Force mode**: Extended to 72 hours
+- [ ] PR updated within last 24 hours
 
 **Verification command**:
 ```bash
@@ -176,13 +159,7 @@ NOW_TS=$(date +%s)
 # Calculate hours since update
 HOURS_AGO=$(( (NOW_TS - UPDATED_TS) / 3600 ))
 
-# Check force mode for extended window
-FORCE_MODE=$(cat .loom/daemon-state.json 2>/dev/null | jq -r '.force_mode // false')
-if [ "$FORCE_MODE" = "true" ]; then
-  RECENCY_LIMIT=72
-else
-  RECENCY_LIMIT=24
-fi
+RECENCY_LIMIT=24
 
 # Check if within recency limit
 if [ "$HOURS_AGO" -gt "$RECENCY_LIMIT" ]; then
@@ -193,7 +170,7 @@ fi
 echo "PASS: Recently updated ($HOURS_AGO hours ago)"
 ```
 
-**Rationale**: Ensures PR reflects recent state of main branch and hasn't gone stale. In force mode, allows older PRs to merge since aggressive development may queue up PRs faster than they can be merged.
+**Rationale**: Ensures PR reflects recent state of main branch and hasn't gone stale.
 
 **On failure**: a stale PR is handled by the dedicated stale-PR policy (see "PR Rejection Workflow → Stale PR"), not the transient-failure path — it is commented once (idempotently) and routed out of the queue via `loom:pr` → `loom:changes-requested` so it reaches Doctor rather than being re-commented every cron tick.
 
@@ -447,9 +424,6 @@ ORIGINAL_ISSUE=$2  # The issue this PR closed (may be empty)
 
 echo "Scanning PR #$PR_NUMBER for follow-on work indicators..."
 
-# Check force mode for label selection
-FORCE_MODE=$(cat .loom/daemon-state.json 2>/dev/null | jq -r '.force_mode // false')
-
 # ============================================
 # Stage 1: Extract TODO/FIXME from Diff
 # ============================================
@@ -654,21 +628,15 @@ ISSUE_BODY="${ISSUE_BODY}## Acceptance Criteria
 ---
 *Auto-generated by Champion from PR #$PR_NUMBER*"
 
-# Select label based on force mode
-if [ "$FORCE_MODE" = "true" ]; then
-  ISSUE_LABEL="loom:issue"
-  FORCE_MARKER="[force-mode] "
-else
-  ISSUE_LABEL="loom:curated"
-  FORCE_MARKER=""
-fi
+# Follow-on issues go to the Champion evaluation queue.
+ISSUE_LABEL="loom:curated"
 
 # Create the issue.
 # NOTE: `gh issue create` does NOT support --json/--jq (only `gh issue view`
 # and `gh issue list` do). On success it prints the new issue's URL to stdout
 # (e.g. https://github.com/<owner>/<repo>/issues/<N>); parse the trailing
 # number from that URL.
-ISSUE_TITLE="${FORCE_MARKER}Follow-on: Work identified in PR #$PR_NUMBER"
+ISSUE_TITLE="Follow-on: Work identified in PR #$PR_NUMBER"
 NEW_ISSUE_URL=$(gh issue create \
   --title "$ISSUE_TITLE" \
   --body "$ISSUE_BODY" \
@@ -705,9 +673,7 @@ fi
 | TODOs with review notes | < 3 TODOs, has notes | Skip (too noisy) |
 | Minimal indicators | < 3 TODOs, no sections | Skip |
 
-**Force Mode Behavior**:
-- Normal mode: Create with `loom:curated` (goes to Champion evaluation queue)
-- Force mode: Create with `loom:issue` (goes directly to Builder queue)
+**Follow-on Issue Labeling**: Follow-on issues are created with `loom:curated` (goes to the Champion evaluation queue).
 
 ---
 
@@ -740,7 +706,7 @@ Keeping \`loom:pr\` label. Champion will retry on the next tick once the blockin
 
 ### Stale PR (recency check failed) — comment once, route to Doctor
 
-A stale PR (>24h normal / >72h force mode) will never clear on its own, and under the 10-minute cron a bare "keep the label + comment" loop would re-comment on the same PR **every tick forever**. Instead, **comment once (idempotently)** and **swap `loom:pr` → `loom:changes-requested`** so the PR leaves the auto-merge queue and is picked up by Doctor for a rebase/refresh. This is the single, authoritative stale-PR policy — `champion-reference.md` Edge Case 5 defers to it.
+A stale PR (>24h) will never clear on its own, and under the 10-minute cron a bare "keep the label + comment" loop would re-comment on the same PR **every tick forever**. Instead, **comment once (idempotently)** and **swap `loom:pr` → `loom:changes-requested`** so the PR leaves the auto-merge queue and is picked up by Doctor for a rebase/refresh. This is the single, authoritative stale-PR policy — `champion-reference.md` Edge Case 5 defers to it.
 
 ```bash
 PR_NUMBER=<number>
@@ -754,7 +720,7 @@ else
   gh pr comment "$PR_NUMBER" --body "$STALE_MARKER
 **Champion: PR Is Stale**
 
-This PR has not been updated within the recency window (24h normal / 72h force mode), so it has been routed out of the auto-merge queue for a rebase/refresh.
+This PR has not been updated within the recency window (24h), so it has been routed out of the auto-merge queue for a rebase/refresh.
 
 **Next steps:**
 - Rebase onto the latest \`main\` and resolve any drift
@@ -805,42 +771,6 @@ This PR met all safety criteria but the merge operation failed. A human will nee
 
 ---
 *Automated by Champion role*"
-```
-
----
-
-## Force Mode PR Merging
-
-**In force mode, Champion relaxes PR auto-merge criteria** for aggressive autonomous development:
-
-| Criterion | Normal Mode | Force Mode |
-|-----------|-------------|------------|
-| Size limit | <= configured limit (default 200, see `champion.auto_merge_max_lines` in `.loom/config.json`; waived by `loom:auto-merge-ok` label) | **No limit** (trust Judge review) |
-| Critical files | Block `Cargo.toml`, `package.json`, etc. | **Allow all** (trust Judge review) |
-| Recency | Updated within 24h | Updated within **72h** |
-| CI status | All checks must pass | All checks must pass (unchanged) |
-| Merge conflicts | Block if conflicting | Block if conflicting (unchanged) |
-| Manual override | Respect `loom:manual-merge` | Respect `loom:manual-merge` (unchanged) |
-
-**Rationale**: In force mode, the Judge has already reviewed the PR. Champion's role is to merge quickly, not to second-guess the review. Essential safety checks (CI, conflicts, manual override) remain.
-
-**Force mode PR merge comment**:
-```bash
-gh pr comment "$PR_NUMBER" --body "$(cat <<EOF
-**[force-mode] Champion Auto-Merge**
-
-This PR has been auto-merged in force mode. Relaxed criteria:
-- Size limit: waived (was $TOTAL_LINES lines)
-- Critical files: waived
-- Trust: Judge review + passing CI
-
-**Merged via squash.** If this was merged in error:
-\`git revert <commit-sha>\`
-
----
-*Automated by Champion role (force mode)*
-EOF
-)"
 ```
 
 ---

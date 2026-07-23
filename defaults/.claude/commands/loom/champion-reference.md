@@ -279,9 +279,7 @@ gh issue create --title "Follow-on: Work identified in PR #$PR_NUMBER" --label "
 | Standard TODOs | 3+ | Create consolidated |
 | Below threshold | < 3 TODOs, no sections | Skip |
 
-**Force Mode Behavior**:
-- Normal mode: Create with `loom:curated` label (goes to Champion evaluation)
-- Force mode: Create with `loom:issue` label (goes directly to Builder queue)
+**Follow-on Issue Labeling**: Follow-on issues are created with the `loom:curated` label (goes to Champion evaluation).
 
 **Edge Cases Within Follow-on**:
 
@@ -289,7 +287,6 @@ gh issue create --title "Follow-on: Work identified in PR #$PR_NUMBER" --label "
 2. **TODO without colon**: Pattern requires `TODO:` not just `TODO` to avoid false positives
 3. **Multi-line TODOs**: Only first line captured, truncated at 200 chars
 4. **Duplicate follow-on issue exists**: Search before creation, skip if found
-5. **Force mode with no daemon state file**: Fall back to `loom:curated` label
 
 ---
 
@@ -356,9 +353,6 @@ gh pr view <number> --json state,mergeable,statusCheckRollup
 
 # View linked issues (uses GitHub's authoritative parser; `Updates #N` is excluded)
 gh pr view <number> --json closingIssuesReferences --jq '.closingIssuesReferences[].number'
-
-# Check daemon state
-cat .loom/daemon-state.json | jq '.force_mode'
 
 # List blocked issues
 gh issue list --label "loom:blocked" --state open

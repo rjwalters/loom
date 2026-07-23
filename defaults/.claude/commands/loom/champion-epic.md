@@ -218,35 +218,6 @@ Epics generate multiple issues, so limit epic approvals to prevent overwhelming 
 
 ---
 
-## Force Mode Epic Behavior
-
-In force mode, epics are evaluated with relaxed criteria:
-- Skip detailed criteria checking
-- Auto-approve if epic has at least 2 phases and clear issue list
-- Create Phase 1 issues immediately
-- Add `[force-mode]` prefix to all comments
-
-```bash
-if [ "$FORCE_MODE" = "true" ]; then
-    # Minimal epic validation
-    BODY=$(gh issue view "$epic" --json body --jq '.body')
-    HAS_PHASES=$(echo "$BODY" | grep -c "### Phase")
-
-    if [ "$HAS_PHASES" -ge 2 ]; then
-        # Auto-approve and create Phase 1 issues
-        create_phase_issues "$epic" 1
-        gh issue comment "$epic" --body "**[force-mode] Epic Auto-Approved**
-
-Phase 1 issues created. Epic will progress automatically.
-
----
-*Automated by Champion role (force mode)*"
-    fi
-fi
-```
-
----
-
 ## Return to Main Champion File
 
 After completing epic evaluation work, return to the main champion.md file for completion reporting.
