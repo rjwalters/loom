@@ -555,6 +555,17 @@ pub enum Event {
         sweep_id: SweepId,
         outcome: SweepOutcome,
     },
+    /// `epic.issue.{N}.{action}` — the epic supervisor (#3842) fired one of its
+    /// four action-class transitions for epic `{N}`. Published by the epic
+    /// supervisor loop; authorized by #3873 (epic #3842 Phase 4).
+    EpicAction {
+        epic: u32,
+        action: EpicActionClass,
+        /// The derived epic state the action fired from (e.g.
+        /// `"epic:needs_decomp"`). Redundant with `action` but carried for
+        /// observability so subscribers see the source state directly.
+        state: String,
+    },
     /// Synthetic event signalling that the subscription fell behind the
     /// publisher. The number of events dropped is reported in `skipped`.
     /// Matches `tokio::sync::broadcast::Receiver::Lagged` semantics.
@@ -581,6 +592,7 @@ impl Event {
     /// | `SweepCrashed {issue, ..}` | `sweep.issue.{issue}.crashed` |
     /// | `SweepGlobalDispatch {..}` | `sweep.global.dispatch` |
     /// | `SweepGlobalCompleted {..}` | `sweep.global.completed` |
+    /// | `EpicAction {epic, action, ..}` | `epic.issue.{epic}.{action}` |
     /// | `TopicLag {..}` | `sweep.system.topic_lag` |
     /// | `Generic {topic, ..}` | the explicit topic string |
     #[must_use]
@@ -592,8 +604,63 @@ impl Event {
             Self::SweepCrashed { issue, .. } => format!("sweep.issue.{issue}.crashed"),
             Self::SweepGlobalDispatch { .. } => "sweep.global.dispatch".to_string(),
             Self::SweepGlobalCompleted { .. } => "sweep.global.completed".to_string(),
+            Self::EpicAction { epic, action, .. } => {
+                format!("epic.issue.{epic}.{}", action.as_str())
+            }
             Self::TopicLag { .. } => "sweep.system.topic_lag".to_string(),
             Self::Generic { topic, .. } => topic.clone(),
+        }
+    }
+}
+
+/// The four action classes the epic supervisor emits on the event bus, one per
+/// singleton lifecycle transition (epic #3842 Phase 4, #3873).
+///
+/// | Variant | Fires from | Supervisor transition |
+/// |---------|-----------|-----------------------|
+/// | [`Decompose`](Self::Decompose) | `epic:needs_decomp` | Architect enriches the epic body with `### Phase` structure |
+/// | [`Expand`](Self::Expand)       | `epic:designed`     | Champion materializes the first phase's children |
+/// | [`Join`](Self::Join)           | `epic:phase_join`   | Champion advances: materializes phase N+1's children (barrier-gated) |
+/// | [`Close`](Self::Close)         | `epic:done`         | Champion closes the completed epic |
+///
+/// The `BuildChildren` transition (per-child `/loom:sweep` dispatch) is **not**
+/// an action class here — those dispatches already surface on the frozen
+/// `sweep.global.dispatch` topic.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum EpicActionClass {
+    /// Decompose an undecomposed epic (`epic:needs_decomp` → `epic:designed`).
+    Decompose,
+    /// Expand the first phase's children (`epic:designed` → `epic:active`).
+    Expand,
+    /// Fork-join advance to the next phase (`epic:phase_join` → `epic:active`).
+    Join,
+    /// Close a completed epic (`epic:done`).
+    Close,
+}
+
+impl EpicActionClass {
+    /// The lower-case topic segment for this action, e.g. `"decompose"`. Used to
+    /// build the `epic.issue.{N}.{action}` topic string.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Decompose => "decompose",
+            Self::Expand => "expand",
+            Self::Join => "join",
+            Self::Close => "close",
+        }
+    }
+
+    /// The derived epic state id this action fires from (e.g.
+    /// `"epic:needs_decomp"` for [`Decompose`](Self::Decompose)).
+    #[must_use]
+    pub fn source_state_id(self) -> &'static str {
+        match self {
+            Self::Decompose => "epic:needs_decomp",
+            Self::Expand => "epic:designed",
+            Self::Join => "epic:phase_join",
+            Self::Close => "epic:done",
         }
     }
 }

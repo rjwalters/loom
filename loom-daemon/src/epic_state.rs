@@ -107,6 +107,110 @@ impl std::fmt::Display for EpicState {
     }
 }
 
+/// A directed edge in the epic-supervisor transition table.
+///
+/// This is the **Rust side** of the epic sub-graph — the transitions among the
+/// five derived [`EpicState`]s that the supervisor loop drives. It exists as an
+/// explicit, inspectable artifact (rather than only implicitly inside
+/// `plan_epic_transition`) so it can be documented and, crucially,
+/// **conformance-checked** against the authoritative Python model in
+/// `loom-tools/src/loom_tools/state_machine.py` (epic #3842 Phase 4, #3873).
+///
+/// Only intra-lane edges are modelled — both [`src`](Self::src) and
+/// [`dst`](Self::dst) are `epic:*` derived state ids. The lane-*entry* edge
+/// (`new → epic:needs_decomp`, the Architect filing a `loom:epic` proposal) is
+/// deliberately excluded: it is not a supervisor transition, and the supervisor
+/// begins its lifecycle at [`EpicState::NeedsDecomp`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EpicEdge {
+    /// Source state id (an `epic:*` derived state).
+    pub src: &'static str,
+    /// Destination state id (an `epic:*` derived state).
+    pub dst: &'static str,
+    /// The role that fires the edge, matching the Python model's `Role` value
+    /// (e.g. `"Champion"`, `"Supervisor"`).
+    pub role: &'static str,
+    /// The fork-join barrier description on phase-boundary edges (any edge
+    /// touching `epic:phase_join`), or `""` for non-boundary edges. Matches the
+    /// Python model's `Transition.barrier` string exactly.
+    pub barrier: &'static str,
+    /// Whether firing this edge runs `gh issue create` — the set the #3707
+    /// issue-creation mutex serializes. Matches the Python `creates_issues` flag.
+    pub creates_issues: bool,
+}
+
+/// The epic-supervisor transition table: the five edges among the five derived
+/// [`EpicState`]s.
+///
+/// Faithful to the epic sub-graph of the Python state-machine model (#3841) —
+/// same edges, roles, barriers, and `creates_issues` flags. The conformance
+/// test (`loom-daemon/tests/epic_conformance.rs`) derives its expectation by
+/// parsing the Python model and asserts this table matches it, so drift between
+/// the two representations is caught mechanically rather than by hand.
+///
+/// The edges (matching `plan_epic_transition` + `barrier_admits`):
+///
+/// ```text
+/// epic:needs_decomp → epic:designed    (Champion, creates_issues)   [decompose]
+/// epic:designed     → epic:active      (Champion)                   [expand]
+/// epic:active       → epic:phase_join  (Supervisor, barrier)        [fork-join]
+/// epic:phase_join   → epic:active      (Supervisor, barrier)        [join/advance]
+/// epic:phase_join   → epic:done        (Supervisor, barrier)        [close]
+/// ```
+#[must_use]
+pub fn epic_transition_table() -> [EpicEdge; 5] {
+    [
+        EpicEdge {
+            src: "epic:needs_decomp",
+            dst: "epic:designed",
+            role: "Champion",
+            barrier: "",
+            creates_issues: true,
+        },
+        EpicEdge {
+            src: "epic:designed",
+            dst: "epic:active",
+            role: "Champion",
+            barrier: "",
+            creates_issues: false,
+        },
+        EpicEdge {
+            src: "epic:active",
+            dst: "epic:phase_join",
+            role: "Supervisor",
+            barrier: "fork-join: current phase complete",
+            creates_issues: false,
+        },
+        EpicEdge {
+            src: "epic:phase_join",
+            dst: "epic:active",
+            role: "Supervisor",
+            barrier: "advance: dispatch next phase",
+            creates_issues: false,
+        },
+        EpicEdge {
+            src: "epic:phase_join",
+            dst: "epic:done",
+            role: "Supervisor",
+            barrier: "join: all phases complete",
+            creates_issues: false,
+        },
+    ]
+}
+
+/// All five derived epic state ids, in lifecycle order. Mirrors the `EpicState`
+/// variants and the Python model's `lane == epic` states.
+#[must_use]
+pub fn epic_state_ids() -> [&'static str; 5] {
+    [
+        EpicState::NeedsDecomp.as_state_id(),
+        EpicState::Designed.as_state_id(),
+        EpicState::Active.as_state_id(),
+        EpicState::PhaseJoin.as_state_id(),
+        EpicState::Done.as_state_id(),
+    ]
+}
+
 /// A materialized `loom:epic-phase` child of an epic, reduced to the two facts
 /// the derived-state computation needs: which phase it belongs to, and whether
 /// it is still open.
@@ -368,6 +472,65 @@ details
         assert_eq!(EpicState::Active.as_state_id(), "epic:active");
         assert_eq!(EpicState::PhaseJoin.as_state_id(), "epic:phase_join");
         assert_eq!(EpicState::Done.as_state_id(), "epic:done");
+    }
+
+    // ===== epic transition table (conformance artifact, #3873) =====
+
+    #[test]
+    fn test_epic_state_ids_matches_variants() {
+        assert_eq!(
+            epic_state_ids(),
+            [
+                "epic:needs_decomp",
+                "epic:designed",
+                "epic:active",
+                "epic:phase_join",
+                "epic:done",
+            ]
+        );
+    }
+
+    #[test]
+    fn test_epic_transition_table_shape() {
+        let table = epic_transition_table();
+        assert_eq!(table.len(), 5);
+
+        // Every edge's endpoints are known derived epic states.
+        let ids: std::collections::HashSet<&str> = epic_state_ids().into_iter().collect();
+        for e in &table {
+            assert!(ids.contains(e.src), "unknown src {}", e.src);
+            assert!(ids.contains(e.dst), "unknown dst {}", e.dst);
+        }
+
+        // Exactly one issue-creating edge (needs_decomp → designed).
+        let creators: Vec<_> = table.iter().filter(|e| e.creates_issues).collect();
+        assert_eq!(creators.len(), 1);
+        assert_eq!(creators[0].src, "epic:needs_decomp");
+        assert_eq!(creators[0].dst, "epic:designed");
+
+        // Exactly three phase-boundary (barrier) edges — every edge touching
+        // epic:phase_join declares a non-empty barrier.
+        let boundary: Vec<_> = table
+            .iter()
+            .filter(|e| e.src == "epic:phase_join" || e.dst == "epic:phase_join")
+            .collect();
+        assert_eq!(boundary.len(), 3);
+        for e in boundary {
+            assert!(!e.barrier.is_empty(), "boundary edge {}->{} needs a barrier", e.src, e.dst);
+        }
+
+        // Non-boundary edges carry no barrier.
+        for e in &table {
+            let touches_join = e.src == "epic:phase_join" || e.dst == "epic:phase_join";
+            if !touches_join {
+                assert!(
+                    e.barrier.is_empty(),
+                    "non-boundary edge {}->{} must have no barrier",
+                    e.src,
+                    e.dst
+                );
+            }
+        }
     }
 
     #[test]

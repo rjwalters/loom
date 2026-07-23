@@ -315,6 +315,50 @@ class StateMachine:
 
     # -- rendering ---------------------------------------------------------
 
+    def render_json(self) -> str:
+        """Serialize the full graph (states + transitions) as JSON.
+
+        This is the machine-readable export the Rust loom-daemon conformance
+        test (#3873, epic #3842 Phase 4) parses to derive its expectation of the
+        epic sub-graph — states, edges, and per-edge barriers — rather than
+        hardcoding a mirrored copy that would silently drift from this
+        authoritative model.
+
+        The payload is stable: an object with ``states`` and ``transitions``
+        arrays, each element carrying every model field. Consumers filter to a
+        lane (e.g. ``lane == "epic"``) themselves.
+        """
+        import json
+
+        return json.dumps(
+            {
+                "states": [
+                    {
+                        "id": s.id,
+                        "lane": s.lane.value,
+                        "label": s.label,
+                        "entry": s.entry,
+                        "terminal": s.terminal,
+                        "derived": s.derived,
+                    }
+                    for s in self.states
+                ],
+                "transitions": [
+                    {
+                        "src": t.src,
+                        "dst": t.dst,
+                        "role": t.role.value,
+                        "guard": t.guard,
+                        "creates_issues": t.creates_issues,
+                        "barrier": t.barrier,
+                    }
+                    for t in self.transitions
+                ],
+            },
+            indent=2,
+            sort_keys=True,
+        )
+
     def render_mermaid(self) -> str:
         """Render the graph as a Mermaid ``stateDiagram-v2`` grouped by lane."""
         by_id = self.by_id()
@@ -486,9 +530,18 @@ def main(argv: Optional[list[str]] = None) -> int:
         action="store_true",
         help="emit the graph as a Mermaid stateDiagram-v2 grouped by lane",
     )
+    parser.add_argument(
+        "--json",
+        action="store_true",
+        help="emit the graph (states + transitions) as JSON for conformance checks",
+    )
     args = parser.parse_args(argv)
 
     machine = canonical()
+
+    if args.json:
+        print(machine.render_json())
+        return 0
 
     if args.mermaid:
         print(machine.render_mermaid())
