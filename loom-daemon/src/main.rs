@@ -291,10 +291,15 @@ async fn main() -> Result<()> {
     // Keep the handle alive for the daemon's lifetime; its Drop signals stop.
     let _supervisor_handle = supervisor_handle;
 
-    // Autonomous work-finder loop (Issue #3810 — Phase A of epic #3809). Opt-in
-    // via `LOOM_WORK_FINDER`. Each tick queries the forge for open `loom:issue`
-    // items and dispatches up to a fixed concurrency cap through the same
+    // Autonomous work-finder loop (Issue #3810 — Phase A of epic #3809; dynamic
+    // concurrency scaling added in #3811 — Phase B). Opt-in via
+    // `LOOM_WORK_FINDER`. Each tick queries the forge for open `loom:issue`
+    // items and dispatches up to a **work-driven** cap — recomputed every tick as
+    // `min(token-pool size, disk headroom, configured_max)` — through the same
     // `SweepRegistry::dispatch()` path the IPC `DispatchSweep` request uses.
+    // `LOOM_WORK_FINDER_MAX_CONCURRENT` is repurposed (Phase A → B) from a fixed
+    // target into the operator ceiling; the cap also never exceeds the token-pool
+    // size (no account over-subscription) nor the scratch-volume disk headroom.
     //
     // Unlike the epic supervisor above, this runs as a plain `tokio::spawn`
     // interval task on the shared daemon runtime (like the reaper): every call
@@ -304,16 +309,18 @@ async fn main() -> Result<()> {
         let source = work_finder::GhWorkSource::new();
         let dispatcher = work_finder::RegistryDispatcher::new(sweep_registry.clone());
         let interval = work_finder::resolve_interval();
-        let max_concurrent = work_finder::resolve_max_concurrent();
+        let configured_max = work_finder::resolve_max_concurrent();
         log::info!(
-            "work_finder: enabled (interval={}s, max_concurrent={max_concurrent})",
+            "work_finder: enabled (interval={}s, configured_max={configured_max}, \
+             dynamic cap = min(pool, disk, configured_max))",
             interval.as_secs()
         );
         Some(work_finder::spawn_work_finder_task(
             source,
             dispatcher,
             interval,
-            max_concurrent,
+            sweep_workspace.clone(),
+            configured_max,
         ))
     } else {
         log::debug!("work_finder: disabled (set LOOM_WORK_FINDER=1 to enable)");
