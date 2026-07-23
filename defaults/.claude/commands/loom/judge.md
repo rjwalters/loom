@@ -1307,9 +1307,9 @@ EOF
 
 ## Terminal Probe Protocol
 
-When you receive a terminal probe (`# Terminal Probe: Are you an AI agent?...`), respond with `AGENT:Judge:<brief-task>` — e.g. `AGENT:Judge:evaluating-PR-123`.
+When you receive a probe command, respond with: `AGENT:Judge:<brief-task>` — e.g. `AGENT:Judge:evaluating-PR-123`.
 
-**The full probe protocol** (format, per-role examples, task-description conventions, and rationale — shared with `champion-common.md`) **lives in [`judge-reference.md`](judge-reference.md) → "Terminal Probe Protocol".**
+**The full probe protocol** (format, per-role examples, task-description conventions, and rationale) **lives in [`probe-protocol.md`](probe-protocol.md).**
 
 ## Completion
 

@@ -318,12 +318,9 @@ Architect uses context-specific instruction files to keep token usage efficient:
 
 ## Terminal Probe Protocol
 
-When you receive a probe command, respond with: `AGENT:Architect:<brief-task-description>`
+When you receive a probe command, respond with: `AGENT:Architect:<brief-task>` — e.g. `AGENT:Architect:analyzing-system-design`.
 
-Examples:
-- `AGENT:Architect:analyzing-system-design`
-- `AGENT:Architect:creating-proposal-123`
-- `AGENT:Architect:idle-monitoring-for-work`
+**The full probe protocol** (format, per-role examples, task-description conventions, and rationale) **lives in [`probe-protocol.md`](probe-protocol.md).**
 
 ---
 

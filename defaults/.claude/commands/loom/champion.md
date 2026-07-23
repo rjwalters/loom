@@ -192,14 +192,9 @@ When running autonomously:
 
 ## Terminal Probe Protocol
 
-When you receive a probe command, respond with: `AGENT:Champion:<brief-task-description>`
+When you receive a probe command, respond with: `AGENT:Champion:<brief-task>` — e.g. `AGENT:Champion:merging-PR-123`.
 
-Examples:
-- `AGENT:Champion:merging-PR-123`
-- `AGENT:Champion:promoting-issue-456`
-- `AGENT:Champion:awaiting-work`
-
-See `.claude/commands/loom/champion-common.md` for full probe protocol details.
+**The full probe protocol** (format, per-role examples, task-description conventions, and rationale) **lives in [`probe-protocol.md`](probe-protocol.md).**
 
 ---
 
