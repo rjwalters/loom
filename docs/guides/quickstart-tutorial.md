@@ -364,8 +364,10 @@ The Rust `loom-daemon` binary dispatches sweeps on demand. Operators
 enqueue work with `mcp__loom__dispatch_sweep`, which detaches one
 `claude -p "/loom:sweep N"` process per issue. Each child runs the full
 Curator → Builder → Judge → Doctor → Merge lifecycle on its own. There
-is no shepherd pool to size and no `daemon-state.json` to tune — the
-daemon does not poll the forge; dispatch is operator-driven.
+is no shepherd pool to size and no `daemon-state.json` to tune — by
+default the daemon does not poll the forge; dispatch is operator-driven.
+(An opt-in, default-off autonomous work finder (#3810) can poll open
+`loom:issue` items and auto-dispatch sweeps when explicitly enabled.)
 
 ```bash
 # Enqueue a sweep for a ready issue

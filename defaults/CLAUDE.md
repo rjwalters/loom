@@ -673,7 +673,7 @@ See [`.loom/docs/daemon-reference.md`](.loom/docs/daemon-reference.md) for the w
 | `.loom/logs/sweep-issue-<N>.log` | Per-issue child output (tailable via `mcp__loom__tail_sweep_log`) |
 | `.loom/sweep-checkpoint/issue-<N>.json` | Crash-resume checkpoint (#3373); sweep skill reads it on entry |
 
-**Autonomous mode (config + start/stop, #3813)**: the daemon's autonomous work finder (#3810) and reactive main-health gate (#3812) can be enabled and tuned entirely from committed config — an `autonomous` block in `.loom/config.json` — with env vars still overriding for a single run (precedence **env > config > default**; an absent block is byte-for-byte the pre-#3813 env-only behavior):
+**Autonomous mode (config + start/stop, #3813)**: the daemon's autonomous work finder (#3810, `LOOM_WORK_FINDER`) and reactive main-health gate (#3812, `LOOM_MAIN_HEALTH_GATE`) can be enabled and tuned entirely from committed config — an `autonomous` block in `.loom/config.json` — with env vars still overriding for a single run (precedence **env > config > default**; an absent block is byte-for-byte the pre-#3813 env-only behavior):
 
 ```json
 {
@@ -695,7 +695,10 @@ Start/stop the **raw daemon process** (distinct from the tmux `.loom/bin/loom st
 
 **Shutdown decision**: a clean stop leaves in-flight `/loom:sweep` children **running** — they are independent detached processes that survive a daemon restart by design (killing the dispatcher must not kill dispatched work); the registry reconciles them on the next start. Use `mcp__loom__cancel_sweep` against a running daemon to actively cancel a sweep before stopping. The full config table, start/stop flags, and a scripted end-to-end acceptance playbook are in [`.loom/docs/daemon-reference.md`](.loom/docs/daemon-reference.md) §Operability and [`docs/autonomous-mode-e2e.md`](../docs/autonomous-mode-e2e.md).
 
-**Issue selection** is operator-driven via `mcp__loom__dispatch_sweep` — the daemon does not autonomously claim items from the `loom:issue` queue. (The `/loom:sweep` skill is the typical caller; Stage -1 backend detection picks an issue and dispatches it when both daemon and pool probes succeed.) The autonomous work finder (above, opt-in) is the exception: when enabled it *does* claim open `loom:issue` items and dispatch them.
+**Issue selection**: by default the daemon is **not a work generator** — it does not autonomously claim items from the `loom:issue` queue; work is operator-driven via `mcp__loom__dispatch_sweep`. (The `/loom:sweep` skill is the typical caller; Stage -1 backend detection picks an issue and dispatches it when both daemon and pool probes succeed.) As of epics #3809 and #3842 that default can be **opted out of** — both autonomous surfaces are default-off:
+
+- The autonomous **work finder** (above, `LOOM_WORK_FINDER` / `autonomous.workFinder`), when enabled, *does* poll the forge for open, already-approved `loom:issue` items and dispatch them, with work-driven concurrency bounded by `min(available work, healthy tokens, free disk, maxConcurrent)` (#3811) and a reactive main-health backstop (#3812, `LOOM_MAIN_HEALTH_GATE`) that halts dispatch when `main` goes red. See [Autonomous work finder](.loom/docs/daemon-reference.md#autonomous-work-finder-3810).
+- The **epic supervisor** (#3842), when enabled, drives every open `loom:epic` issue through a derived-state fork-join lifecycle (decompose → expand → phase-join barrier → close), serializing child-issue creation behind the #3707 issue-creation mutex on a dedicated off-runtime OS thread. See [Epic supervisor](.loom/docs/daemon-reference.md#epic-supervisor-3842).
 
 **Sweep checkpoints** (`.loom/sweep-checkpoint/issue-<N>.json`, gitignored) — the per-issue checkpoint format is owned by the sweep skill (#3373). When a sweep child crashes, the next dispatch reads the checkpoint and skips already-completed phases.
 

@@ -46,7 +46,7 @@ Sweep is also stateless between issues. Its only persistent state is a checkpoin
 
 The Rust `loom-daemon` binary dispatches sweeps on demand. An operator (or MCP client) enqueues work with `mcp__loom__dispatch_sweep --issue N`, and the daemon detaches one `claude -p "/loom:sweep N"` child per issue with multi-account token rotation via `spawn-claude.sh`. It holds the sweep registry, event bus, and reaper task in memory.
 
-The daemon has no work-generation logic, no support-role triggers, no pipeline state, and it does not poll the forge — dispatch is operator-driven. It is intentionally minimal; the forge is the source of truth for everything else. (The v0.9.x `spawn-loop.sh` polling launcher and its `.loom/spawn-loop-state.json` state file were removed in v0.11.0.)
+By default the daemon has no support-role triggers, no pipeline state, and does not poll the forge — dispatch is operator-driven. It is intentionally minimal; the forge is the source of truth for everything else. (Two opt-in, default-off surfaces added later — the autonomous work finder (#3810) and the epic supervisor (#3842) — let the daemon poll and dispatch its own work when explicitly enabled, without changing the minimal default.) (The v0.9.x `spawn-loop.sh` polling launcher and its `.loom/spawn-loop-state.json` state file were removed in v0.11.0.)
 
 **Intelligence at this layer**: parallelism and resource management. The daemon turns operator-enqueued approved issues into concurrent, isolated, self-contained sweeps. Multi-account token rotation (`spawn-claude.sh`) distributes load across Claude OAuth accounts.
 
