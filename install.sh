@@ -353,6 +353,13 @@ _emit_loom_claude_block() {
 # Determine Loom repository root
 LOOM_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
+# Machine-level loom-daemon provisioning helper (#3922). Sourced so the Quick
+# Install path (which runs `loom-daemon init` directly, without delegating to
+# scripts/install-loom.sh) can also drop the built binary on PATH. The Full
+# Install path `exec`s scripts/install-loom.sh, which sources this helper itself.
+# shellcheck source=scripts/install/provision-daemon.sh
+source "$LOOM_ROOT/scripts/install/provision-daemon.sh"
+
 # Show banner
 echo ""
 header "╔═══════════════════════════════════════════════════════════╗"
@@ -822,6 +829,10 @@ elif [[ -d "$TARGET_PATH/.loom" ]]; then
     finalize_quick_install "$LOOM_ROOT" "$TARGET_PATH"
     verify_install "$TARGET_PATH"
 
+    # Provision a machine-level loom-daemon binary (#3922) so the consumer's
+    # loom-daemon-start.sh resolves it via `command -v loom-daemon` post-install.
+    provision_machine_daemon "$LOOM_ROOT/target/release/loom-daemon" || true
+
     # Issue #3545: reconcile the git index after the uninstall→reinstall cycle.
     # The chained uninstall staged the deletion of every prior Loom file (now
     # scoped to Loom-managed paths — see scripts/uninstall-loom.sh), then
@@ -1190,6 +1201,10 @@ case "$METHOD" in
     # Emit skill-routes.json, install-metadata.json, loom-source-path (#3502).
     finalize_quick_install "$LOOM_ROOT" "$TARGET_PATH"
     verify_install "$TARGET_PATH"
+
+    # Provision a machine-level loom-daemon binary (#3922) so the consumer's
+    # loom-daemon-start.sh resolves it via `command -v loom-daemon` post-install.
+    provision_machine_daemon "$LOOM_ROOT/target/release/loom-daemon" || true
 
     echo ""
     success "Quick installation complete!"

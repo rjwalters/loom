@@ -188,6 +188,12 @@ header() {
 # shellcheck source=scripts/install/manifest.sh
 source "$LOOM_ROOT/scripts/install/manifest.sh"
 
+# Source the machine-level loom-daemon provisioning helper (#3922). Kept in its
+# own file so the test suite can exercise it without sourcing the full
+# installer.
+# shellcheck source=scripts/install/provision-daemon.sh
+source "$LOOM_ROOT/scripts/install/provision-daemon.sh"
+
 # Dogfood command-dir linker (issue #3682) — extracted so the test suite can
 # exercise the scoped-symlink logic without running the full installer.
 # shellcheck source=scripts/install/dogfood-commands.sh
@@ -1053,6 +1059,16 @@ success "loom-daemon binary ready"
 # post-hoc when an install regression is reported (issue #3287).
 DAEMON_VERSION=$("$LOOM_ROOT/target/release/loom-daemon" --version 2>/dev/null || echo "(unknown)")
 info "loom-daemon binary: $DAEMON_VERSION"
+
+# Provision a machine-level loom-daemon binary for the consumer (issue #3922).
+# The consumer repo ships loom-daemon-start.sh but no binary; install the
+# freshly-built one to ~/.local/bin (on PATH) so `command -v loom-daemon`
+# resolves it post-install with no manual steps. Best-effort: a soft failure
+# (e.g. ~/.local/bin unwritable) is logged but never aborts the install — the
+# consumer can still point LOOM_DAEMON_BIN at the source build.
+info "Provisioning machine-level loom-daemon binary..."
+provision_machine_daemon "$LOOM_ROOT/target/release/loom-daemon" || \
+  warning "Machine-level loom-daemon not provisioned (see note above); autonomous daemon mode needs LOOM_DAEMON_BIN or a binary on PATH."
 
 # Run loom-daemon init in the worktree
 cd "$TARGET_PATH/$WORKTREE_PATH"
