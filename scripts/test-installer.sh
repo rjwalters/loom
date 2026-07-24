@@ -2629,6 +2629,46 @@ fi
 echo ""
 
 # ==========================================================================
+# Test: install-loom.sh guidance points at shipped script paths (#3923)
+#
+# The post-install "Next Steps" and the active-session refusal guidance name
+# script paths the user is told to run. The historical ./.loom/scripts/daemon.sh
+# was removed in #3432; guidance must reference only surfaces that actually ship
+# in defaults/. This smoke check extracts every ./.loom/... path named in the
+# installer's user-facing output and asserts it maps to a real file in defaults/.
+# ==========================================================================
+echo "Test: install-loom.sh guidance names only shipped ./.loom/ script paths"
+GUIDANCE_MISSING=""
+# Pull the ./.loom/... tokens the installer prints in echo/error guidance lines.
+GUIDANCE_PATHS=$(grep -oE '\./\.loom/[A-Za-z0-9._/-]+' "$INSTALL_SCRIPT" \
+  "$LOOM_ROOT/scripts/install/create-pr.sh" | sed 's/^[^:]*://' | sort -u)
+for gp in $GUIDANCE_PATHS; do
+  # Strip the leading ./ and map the installed path back to its defaults/ source:
+  #   .loom/bin/loom       -> defaults/.loom/bin/loom
+  #   .loom/scripts/foo.sh -> defaults/scripts/foo.sh
+  rel="${gp#./}"
+  case "$rel" in
+    .loom/bin/*)     src="$DEFAULTS_DIR/$rel" ;;          # defaults/.loom/bin/loom
+    .loom/scripts/*) src="$DEFAULTS_DIR/${rel#.loom/}" ;; # defaults/scripts/...
+    *)               src="$DEFAULTS_DIR/${rel#.loom/}" ;;
+  esac
+  if [[ ! -e "$src" ]]; then
+    GUIDANCE_MISSING="$GUIDANCE_MISSING\n  $gp -> $src (not shipped)"
+  fi
+done
+# Belt-and-suspenders: the removed daemon.sh must never reappear in guidance.
+if grep -qE '\./\.loom/scripts/daemon\.sh' "$INSTALL_SCRIPT" \
+  "$LOOM_ROOT/scripts/install/create-pr.sh"; then
+  GUIDANCE_MISSING="$GUIDANCE_MISSING\n  ./.loom/scripts/daemon.sh referenced (removed in #3432)"
+fi
+if [[ -z "$GUIDANCE_MISSING" ]]; then
+  pass "all ./.loom/ paths in install guidance exist in defaults/"
+else
+  fail "install guidance references non-shipped paths:$(echo -e "$GUIDANCE_MISSING")"
+fi
+echo ""
+
+# ==========================================================================
 # Summary
 # ==========================================================================
 echo "======================================"

@@ -270,7 +270,7 @@ Synced Loom workflow labels via \`.github/labels.yml\`
 
 After merging:
 1. Use \`/builder\`, \`/judge\`, etc. commands in Claude Code
-2. Or run \`./.loom/scripts/daemon.sh start\` to launch the daemon for autonomous orchestration
+2. Or run \`./.loom/scripts/cli/loom-daemon-start.sh\` to launch the daemon for autonomous orchestration
 
 See \`CLAUDE.md\` for complete usage details.
 

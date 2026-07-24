@@ -343,14 +343,15 @@ See [defaults/roles/README.md](../../defaults/roles/README.md) for details.
 
 ### Automate Beyond MOM (loom-daemon dispatch, GitHub Actions)
 
-> **Heads up — the Python daemon brain is gone in v0.10.0; the shell-level
-> daemon surface is preserved.** The Python `loom-daemon` brain and the
-> `/loom` / `/loom --merge` slash commands were removed as part of the
-> shepherd/daemon deprecation epic (#3372). However,
-> `./.loom/scripts/daemon.sh` (start/stop/status) survives — it now drives
-> the Rust `loom-daemon` and (optionally) per-role panes in tmux, with
-> multi-account token rotation at the process-spawn boundary. The migration
-> narrative —
+> **Heads up — the Python daemon brain is gone in v0.10.0; the Rust
+> `loom-daemon` is the autonomous surface.** The Python `loom-daemon` brain
+> and the `/loom` / `/loom --merge` slash commands were removed as part of the
+> shepherd/daemon deprecation epic (#3372). The historical
+> `./.loom/scripts/daemon.sh` wrapper was removed in #3432; start/stop the
+> autonomous Rust daemon with `./.loom/scripts/cli/loom-daemon-start.sh` /
+> `loom-daemon-stop.sh`, and drive the tmux agent pool with
+> `./.loom/bin/loom start|status|stop` — both with multi-account token
+> rotation at the process-spawn boundary. The migration narrative —
 > including what each entry point maps to — lives at
 > [`docs/migration/v0.10.0-shepherd-deprecation.md`](../migration/v0.10.0-shepherd-deprecation.md).
 
