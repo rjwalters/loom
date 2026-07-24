@@ -710,6 +710,19 @@ Start/stop the **raw daemon process** (distinct from the tmux `.loom/bin/loom st
 > `--work-finder` / `--health-gate`, or hand control to committed config with
 > `--from-config`.
 
+**Daemon binary prerequisite (#3922)**: `loom-daemon-start.sh` needs a runnable
+`loom-daemon` binary. It resolves one via, in order: the `LOOM_DAEMON_BIN` env
+var → `command -v loom-daemon` (PATH) → an in-repo `target/release/loom-daemon`
+build. The Loom installer provisions this for you — it installs the freshly-built
+binary to `~/.local/bin/loom-daemon` (a machine-level, install-once-per-machine
+location shared across every repo Loom is installed into) so `command -v
+loom-daemon` resolves it with **no manual steps**. If the installer warned that
+`~/.local/bin` is not on your `PATH`, add it (`export
+PATH="$HOME/.local/bin:$PATH"` in `~/.zshrc` / `~/.bashrc`) — otherwise point
+`LOOM_DAEMON_BIN` at any built `loom-daemon`. Verify with `command -v loom-daemon
+&& loom-daemon --version`; the provisioned binary version matches your installed
+Loom version.
+
 **Shutdown decision**: a clean stop leaves in-flight `/loom:sweep` children **running** — they are independent detached processes that survive a daemon restart by design (killing the dispatcher must not kill dispatched work); the registry reconciles them on the next start. Use `mcp__loom__cancel_sweep` against a running daemon to actively cancel a sweep before stopping. The full config table, start/stop flags, and a scripted end-to-end acceptance playbook are in [`.loom/docs/daemon-reference.md`](.loom/docs/daemon-reference.md) §Operability and [`docs/autonomous-mode-e2e.md`](../docs/autonomous-mode-e2e.md).
 
 **Issue selection**: by default the daemon is **not a work generator** — it does not autonomously claim items from the `loom:issue` queue; work is operator-driven via `mcp__loom__dispatch_sweep`. (The `/loom:sweep` skill is the typical caller; Stage -1 backend detection picks an issue and dispatches it when both daemon and pool probes succeed.) As of epics #3809 and #3842 that default can be **opted out of** — both autonomous surfaces are default-off:
