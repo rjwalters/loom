@@ -589,7 +589,8 @@ if [[ -x "$ACTIVE_SESSION_CHECK" ]]; then
       error "Refusing to install: an active Loom session was detected in the target.
 
 To proceed:
-  • Stop the running daemon:   cd '$TARGET_PATH' && ./.loom/scripts/daemon.sh stop
+  • Stop the autonomous daemon: cd '$TARGET_PATH' && ./.loom/scripts/cli/loom-daemon-stop.sh
+  • Stop the tmux agent pool:   cd '$TARGET_PATH' && ./.loom/bin/loom stop
   • Wait for in-flight builders to finish, OR
   • Pass --allow-active-session to override this guard (use with caution).
 
@@ -1975,7 +1976,7 @@ case "$MERGE_STATUS" in
     echo "    Then use /builder, /judge, or other role commands"
     echo ""
     echo "  Daemon Mode (autonomous orchestration):"
-    echo "    cd $TARGET_PATH && ./.loom/scripts/daemon.sh start"
+    echo "    cd $TARGET_PATH && ./.loom/scripts/cli/loom-daemon-start.sh"
     echo "    Then in Claude Code: /loom"
     ;;
   auto)
@@ -1990,7 +1991,7 @@ case "$MERGE_STATUS" in
     echo "    Then use /builder, /judge, or other role commands"
     echo ""
     echo "  Daemon Mode (autonomous orchestration):"
-    echo "    cd $TARGET_PATH && ./.loom/scripts/daemon.sh start"
+    echo "    cd $TARGET_PATH && ./.loom/scripts/cli/loom-daemon-start.sh"
     echo "    Then in Claude Code: /loom"
     ;;
   *)
@@ -2001,7 +2002,7 @@ case "$MERGE_STATUS" in
     echo "       cd $TARGET_PATH && claude"
     echo "       Then use /builder, /judge, or other role commands"
     echo "     Daemon Mode (autonomous orchestration):"
-    echo "       cd $TARGET_PATH && ./.loom/scripts/daemon.sh start"
+    echo "       cd $TARGET_PATH && ./.loom/scripts/cli/loom-daemon-start.sh"
     echo "       Then in Claude Code: /loom"
     ;;
 esac
