@@ -99,6 +99,16 @@ enum Commands {
         json: bool,
     },
 
+    /// Manage the machine-level workspace registry (`~/.loom/workspaces.json`):
+    /// the set of repos the one-per-machine daemon manages (Issue #3926 — phase
+    /// 1 of #3835). Operates directly on the registry file, so it works whether
+    /// or not the daemon is running; a running daemon re-reads the file on its
+    /// next tick (hot-apply).
+    Workspace {
+        #[command(subcommand)]
+        action: WorkspaceAction,
+    },
+
     /// Validate role configuration completeness
     Validate {
         /// Workspace directory containing .loom/config.json
@@ -116,6 +126,33 @@ enum Commands {
         /// Show verbose output including configured roles
         #[arg(long, short)]
         verbose: bool,
+    },
+}
+
+/// Sub-actions for `loom-daemon workspace`.
+#[derive(Subcommand)]
+enum WorkspaceAction {
+    /// Register a repo as a managed workspace.
+    Add {
+        /// Path to the repo root (relative or absolute; normalized on store).
+        #[arg(value_name = "PATH")]
+        path: String,
+
+        /// Optional per-repo config overrides as a JSON object string.
+        #[arg(long, value_name = "JSON")]
+        config_overrides: Option<String>,
+    },
+    /// Deregister a managed workspace by root.
+    Remove {
+        /// Path to the repo root (normalized the same way as `add`).
+        #[arg(value_name = "PATH")]
+        path: String,
+    },
+    /// List the managed workspaces.
+    List {
+        /// Emit machine-readable JSON instead of the human-readable table.
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -597,6 +634,7 @@ fn handle_cli_command(command: Commands) -> Result<()> {
             weekly,
             format,
         } => handle_stats_command(role.as_deref(), issue, weekly, &format),
+        Commands::Workspace { action } => handle_workspace_command(action),
         Commands::Status { .. } => {
             // Routed directly in `main()` (it needs the async runtime for the
             // socket round-trip), never dispatched through this sync handler.
@@ -1207,6 +1245,85 @@ fn print_agent_effectiveness(agent: &activity::AgentEffectiveness) {
     println!("  Average Cost:       ${:.4}", agent.avg_cost);
     println!("  Average Duration:   {:.1}s", agent.avg_duration_sec);
     println!();
+}
+
+/// Handle the `workspace` subcommand — mutate/inspect the machine-level
+/// workspace registry (`~/.loom/workspaces.json`) directly on the filesystem.
+/// This runs whether or not the daemon is up; a running daemon re-reads the
+/// same file on its next tick (hot-apply), and its `RegisterWorkspace` /
+/// `DeregisterWorkspace` / `ListWorkspaces` IPC handlers touch the same file.
+fn handle_workspace_command(action: WorkspaceAction) -> Result<()> {
+    use loom_daemon::workspace_registry::{AddOutcome, WorkspaceRegistry};
+
+    let path = loom_daemon::workspace_registry::default_registry_path()?;
+
+    match action {
+        WorkspaceAction::Add {
+            path: repo_path,
+            config_overrides,
+        } => {
+            let overrides = match config_overrides {
+                Some(raw) => Some(
+                    serde_json::from_str::<serde_json::Value>(&raw)
+                        .map_err(|e| anyhow!("--config-overrides is not valid JSON: {e}"))?,
+                ),
+                None => None,
+            };
+            let mut registry = WorkspaceRegistry::load(&path)?;
+            match registry.add(std::path::Path::new(&repo_path), overrides)? {
+                AddOutcome::AlreadyPresent { canonical } => {
+                    println!("Already registered: {}", canonical.display());
+                }
+                AddOutcome::Added {
+                    canonical,
+                    looks_like_workspace,
+                } => {
+                    registry.save(&path)?;
+                    println!("Registered workspace: {}", canonical.display());
+                    if !looks_like_workspace {
+                        eprintln!(
+                            "  warning: {} has no .git or .loom — register it anyway, but confirm \
+                             it is a Loom-managed repo (run `loom-daemon init` there if not).",
+                            canonical.display()
+                        );
+                    }
+                }
+            }
+            Ok(())
+        }
+        WorkspaceAction::Remove { path: repo_path } => {
+            let mut registry = WorkspaceRegistry::load(&path)?;
+            if registry.remove(std::path::Path::new(&repo_path)) {
+                registry.save(&path)?;
+                println!("Deregistered workspace: {repo_path}");
+            } else {
+                println!("Not registered (no-op): {repo_path}");
+            }
+            Ok(())
+        }
+        WorkspaceAction::List { json } => {
+            let registry = WorkspaceRegistry::load(&path)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&registry)?);
+            } else if registry.workspaces.is_empty() {
+                println!("No managed workspaces registered.");
+                println!("Registry file: {}", path.display());
+                println!("\nAdd one with:  loom-daemon workspace add <repo-path>");
+            } else {
+                println!("Managed workspaces ({}):", registry.workspaces.len());
+                println!("Registry file: {}\n", path.display());
+                for ws in &registry.workspaces {
+                    let overrides = if ws.config_overrides.is_some() {
+                        " (has config overrides)"
+                    } else {
+                        ""
+                    };
+                    println!("  {}{overrides}", ws.root.display());
+                }
+            }
+            Ok(())
+        }
+    }
 }
 
 fn handle_validate_command(

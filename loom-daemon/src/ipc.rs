@@ -1209,10 +1209,130 @@ fn handle_request(
             }
         }
 
+        // ====================================================================
+        // Workspace Registry Handlers (Issue #3926 — phase 1 of #3835)
+        // ====================================================================
+        Request::RegisterWorkspace {
+            root,
+            config_overrides,
+        } => handle_register_workspace(&root, config_overrides),
+
+        Request::DeregisterWorkspace { root } => handle_deregister_workspace(&root),
+
+        Request::ListWorkspaces => handle_list_workspaces(),
+
         Request::Shutdown => {
             log::info!("Shutdown requested");
             std::process::exit(0);
         }
+    }
+}
+
+/// Load, mutate, and persist the machine-level workspace registry for a
+/// `RegisterWorkspace` request. Both the CLI and this IPC handler operate on the
+/// same `~/.loom/workspaces.json` file, so an edit through either surface is
+/// visible to the other (hot-apply).
+fn handle_register_workspace(root: &str, config_overrides: Option<serde_json::Value>) -> Response {
+    use crate::workspace_registry::{default_registry_path, AddOutcome, WorkspaceRegistry};
+
+    let path = match default_registry_path() {
+        Ok(p) => p,
+        Err(e) => {
+            return Response::Error {
+                message: format!("register_workspace: {e}"),
+            }
+        }
+    };
+    let mut registry = match WorkspaceRegistry::load(&path) {
+        Ok(r) => r,
+        Err(e) => {
+            return Response::Error {
+                message: format!("register_workspace: load failed: {e}"),
+            }
+        }
+    };
+    match registry.add(Path::new(root), config_overrides) {
+        Ok(AddOutcome::AlreadyPresent { canonical }) => Response::WorkspaceRegistered {
+            root: canonical,
+            already_present: true,
+            looks_like_workspace: true,
+        },
+        Ok(AddOutcome::Added {
+            canonical,
+            looks_like_workspace,
+        }) => {
+            if let Err(e) = registry.save(&path) {
+                return Response::Error {
+                    message: format!("register_workspace: save failed: {e}"),
+                };
+            }
+            Response::WorkspaceRegistered {
+                root: canonical,
+                already_present: false,
+                looks_like_workspace,
+            }
+        }
+        Err(e) => Response::Error {
+            message: format!("register_workspace: {e}"),
+        },
+    }
+}
+
+/// Load, mutate, and persist the workspace registry for a `DeregisterWorkspace`
+/// request.
+fn handle_deregister_workspace(root: &str) -> Response {
+    use crate::workspace_registry::{default_registry_path, normalize_path, WorkspaceRegistry};
+
+    let path = match default_registry_path() {
+        Ok(p) => p,
+        Err(e) => {
+            return Response::Error {
+                message: format!("deregister_workspace: {e}"),
+            }
+        }
+    };
+    let mut registry = match WorkspaceRegistry::load(&path) {
+        Ok(r) => r,
+        Err(e) => {
+            return Response::Error {
+                message: format!("deregister_workspace: load failed: {e}"),
+            }
+        }
+    };
+    let canonical = normalize_path(Path::new(root));
+    let was_present = registry.remove(Path::new(root));
+    if was_present {
+        if let Err(e) = registry.save(&path) {
+            return Response::Error {
+                message: format!("deregister_workspace: save failed: {e}"),
+            };
+        }
+    }
+    Response::WorkspaceDeregistered {
+        root: canonical,
+        was_present,
+    }
+}
+
+/// Load and return the workspace registry for a `ListWorkspaces` request.
+fn handle_list_workspaces() -> Response {
+    use crate::workspace_registry::{default_registry_path, WorkspaceRegistry};
+
+    let path = match default_registry_path() {
+        Ok(p) => p,
+        Err(e) => {
+            return Response::Error {
+                message: format!("list_workspaces: {e}"),
+            }
+        }
+    };
+    match WorkspaceRegistry::load(&path) {
+        Ok(registry) => Response::WorkspaceList {
+            workspaces: registry.workspaces,
+        },
+        Err(e) => Response::Error {
+            message: format!("list_workspaces: load failed: {e}"),
+        },
     }
 }
 
@@ -2045,5 +2165,113 @@ exit 0
             }
             other => panic!("Expected Error sentinel, got: {other:?}"),
         }
+    }
+
+    // ===== Workspace Registry (Issue #3926) =====
+
+    /// End-to-end exercise of the Register / List / Deregister IPC handlers
+    /// against a temp registry file (via `LOOM_WORKSPACES_PATH`). Serialized
+    /// because it mutates the process env that resolves the registry path.
+    #[test]
+    #[serial_test::serial]
+    fn test_workspace_registry_ipc_roundtrip() {
+        let (tm, db, sr, bus) = setup_test_context();
+        let dir = tempdir().unwrap();
+        let registry_path = dir.path().join("workspaces.json");
+        let repo = dir.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let canonical = std::fs::canonicalize(&repo).unwrap();
+
+        std::env::set_var("LOOM_WORKSPACES_PATH", &registry_path);
+
+        // Empty registry: list returns no workspaces.
+        let response = handle_request(Request::ListWorkspaces, &tm, &db, &sr, &bus);
+        match response {
+            Response::WorkspaceList { workspaces } => assert!(workspaces.is_empty()),
+            other => panic!("Expected WorkspaceList, got: {other:?}"),
+        }
+
+        // Register.
+        let response = handle_request(
+            Request::RegisterWorkspace {
+                root: repo.to_string_lossy().into_owned(),
+                config_overrides: None,
+            },
+            &tm,
+            &db,
+            &sr,
+            &bus,
+        );
+        match response {
+            Response::WorkspaceRegistered {
+                root,
+                already_present,
+                ..
+            } => {
+                assert_eq!(root, canonical);
+                assert!(!already_present);
+            }
+            other => panic!("Expected WorkspaceRegistered, got: {other:?}"),
+        }
+
+        // Re-register is idempotent (already_present = true).
+        let response = handle_request(
+            Request::RegisterWorkspace {
+                root: repo.to_string_lossy().into_owned(),
+                config_overrides: None,
+            },
+            &tm,
+            &db,
+            &sr,
+            &bus,
+        );
+        match response {
+            Response::WorkspaceRegistered {
+                already_present, ..
+            } => assert!(already_present),
+            other => panic!("Expected WorkspaceRegistered, got: {other:?}"),
+        }
+
+        // List now shows exactly one.
+        let response = handle_request(Request::ListWorkspaces, &tm, &db, &sr, &bus);
+        match response {
+            Response::WorkspaceList { workspaces } => {
+                assert_eq!(workspaces.len(), 1);
+                assert_eq!(workspaces[0].root, canonical);
+            }
+            other => panic!("Expected WorkspaceList, got: {other:?}"),
+        }
+
+        // Deregister.
+        let response = handle_request(
+            Request::DeregisterWorkspace {
+                root: repo.to_string_lossy().into_owned(),
+            },
+            &tm,
+            &db,
+            &sr,
+            &bus,
+        );
+        match response {
+            Response::WorkspaceDeregistered { was_present, .. } => assert!(was_present),
+            other => panic!("Expected WorkspaceDeregistered, got: {other:?}"),
+        }
+
+        // Deregister again is a no-op success.
+        let response = handle_request(
+            Request::DeregisterWorkspace {
+                root: repo.to_string_lossy().into_owned(),
+            },
+            &tm,
+            &db,
+            &sr,
+            &bus,
+        );
+        match response {
+            Response::WorkspaceDeregistered { was_present, .. } => assert!(!was_present),
+            other => panic!("Expected WorkspaceDeregistered, got: {other:?}"),
+        }
+
+        std::env::remove_var("LOOM_WORKSPACES_PATH");
     }
 }
