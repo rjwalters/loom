@@ -248,6 +248,31 @@ pub enum Request {
     /// the IPC handler, so the `loom-daemon status` CLI shells out to
     /// `loom-tokens check --json` client-side (mirroring `probe-tokens.sh`).
     DaemonStatus,
+    // ========================================================================
+    // Workspace Registry Requests (Issue #3926 — phase 1 of #3835)
+    // ========================================================================
+    /// Register a repo as a managed workspace in the machine-level registry
+    /// (`~/.loom/workspaces.json`). `root` is any path to the repo root; the
+    /// daemon normalizes it (canonicalize/absolutize) before storing, so
+    /// relative or symlinked paths dedup correctly. Idempotent — re-registering
+    /// an already-present workspace is a no-op success.
+    ///
+    /// `config_overrides` is stored verbatim as opaque JSON (per-repo config
+    /// overrides). It is only applied on a genuine insert; a re-register does
+    /// not overwrite existing overrides.
+    RegisterWorkspace {
+        root: String,
+        #[serde(default)]
+        config_overrides: Option<serde_json::Value>,
+    },
+    /// Deregister a managed workspace by root. Normalized the same way as
+    /// [`Request::RegisterWorkspace`]. Removing an absent workspace is a no-op
+    /// success (`was_present: false`).
+    DeregisterWorkspace {
+        root: String,
+    },
+    /// List the managed workspaces in the machine-level registry.
+    ListWorkspaces,
     Shutdown,
 }
 
@@ -373,6 +398,29 @@ pub enum Response {
     /// Result of a `DaemonStatus` request — the autonomous-mode operability
     /// snapshot rendered by `loom-daemon status`.
     DaemonStatus(DaemonStatusReport),
+    // ========================================================================
+    // Workspace Registry Responses (Issue #3926 — phase 1 of #3835)
+    // ========================================================================
+    /// Result of a `RegisterWorkspace` request. `root` is the normalized root
+    /// actually stored; `already_present` is `true` when the workspace was
+    /// already registered (no-op).
+    WorkspaceRegistered {
+        root: PathBuf,
+        already_present: bool,
+        /// Whether the directory looks like a Loom-managed repo (has `.git`
+        /// and/or `.loom`) — a soft advisory, not a rejection.
+        looks_like_workspace: bool,
+    },
+    /// Result of a `DeregisterWorkspace` request. `was_present` is `false` when
+    /// no matching workspace was registered (no-op success).
+    WorkspaceDeregistered {
+        root: PathBuf,
+        was_present: bool,
+    },
+    /// Result of a `ListWorkspaces` request.
+    WorkspaceList {
+        workspaces: Vec<crate::workspace_registry::Workspace>,
+    },
     /// Legacy error response (deprecated, use `StructuredError` for new code)
     /// Kept for backwards compatibility with existing frontends
     Error {
