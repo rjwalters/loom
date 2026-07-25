@@ -79,6 +79,14 @@ pub const SPAWN_BIN_ENV: &str = "LOOM_SWEEP_SPAWN_BIN";
 /// registry. Falls back to `LOOM_WORKSPACE`, then current dir.
 pub const WORKSPACE_ENV: &str = "LOOM_WORKSPACE";
 
+/// Issue #3943: print-mode background-task wait ceiling (milliseconds). A
+/// daemon-spawned sweep child is a headless `claude -p` session; in print mode
+/// the harness reaps still-running background tasks (the sweep's Builder/Judge
+/// subagents) after a 600s ceiling. `spawn_child` pins this to `0` (no cap) on
+/// the child env so a long role phase runs to completion instead of being
+/// killed mid-build.
+pub const BG_WAIT_CEILING_ENV: &str = "CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS";
+
 /// Retention window after a sweep terminates before it is garbage-collected
 /// from the in-memory map. One hour matches the operator intuition that
 /// "recently exited sweeps should still show up in `list_sweeps`".
@@ -1317,6 +1325,17 @@ impl SweepRegistry {
             // the daemon thinks the workspace is — never inheriting an
             // ambient value that might point elsewhere.
             .env(WORKSPACE_ENV, &self.config.workspace_root)
+            // Issue #3943: the child is a headless `claude -p "/loom:sweep N"`
+            // session. In print mode the Claude Code harness terminates
+            // still-running background tasks — the sweep's dispatched
+            // Builder/Judge subagents — after a 600s ceiling and exits the
+            // session, killing any role phase that runs >10 minutes mid-build
+            // and causing loom:building<->loom:issue label ping-pong. Disable
+            // the ceiling (0 = no cap) explicitly on the child env so a long
+            // Builder/Judge phase runs to completion. `spawn-claude.sh` also
+            // sets this (belt-and-suspenders), but we pin it here too so the
+            // daemon dispatch path does not depend on the wrapper doing it.
+            .env(BG_WAIT_CEILING_ENV, "0")
             // Issue #3730: pin the child's cwd to the resolved workspace root
             // so the child's relative `.loom/config.json` read
             // (loom_tools/sweep_experiment.py) and archive-transcripts.sh's
@@ -3151,6 +3170,7 @@ mod tests {
   printf 'LOOM_TRANSCRIPT_ARCHIVE=%s\n' "${{LOOM_TRANSCRIPT_ARCHIVE:-unset}}"
   printf 'LOOM_SWEEP_CLAIM_OWNED=%s\n' "${{LOOM_SWEEP_CLAIM_OWNED:-unset}}"
   printf 'LOOM_TERMINAL_ID=%s\n' "${{LOOM_TERMINAL_ID:-unset}}"
+  printf 'CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS=%s\n' "${{CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS:-unset}}"
 }} >> "{rec}" 2>&1
 exit 0
 "#,
@@ -3371,6 +3391,34 @@ exit 0
         assert!(
             recorded.contains("LOOM_SWEEP_CLAIM_OWNED=4243"),
             "expected claim-ownership marker for issue 4243; got: {recorded}"
+        );
+    }
+
+    /// Issue #3943: `spawn_child` pins
+    /// `CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS=0` on the dispatched child env so
+    /// the print-mode harness does not reap the sweep's long-running
+    /// Builder/Judge background subagents at the 600s ceiling (which caused
+    /// loom:building<->loom:issue label ping-pong). The value is exactly "0"
+    /// (no cap).
+    #[test]
+    #[serial]
+    fn dispatch_disables_print_bg_wait_ceiling() {
+        let dir = tempdir().unwrap();
+        let (mut registry, record_log) = fixture_registry(dir.path());
+
+        let outcome = registry
+            .dispatch(&SweepKind::Issue(4244), None, None, None, None)
+            .expect("dispatch should succeed");
+
+        let needle = format!("LOOM_TERMINAL_ID=daemon-{}", outcome.sweep_id);
+        assert!(
+            wait_for_contents(&record_log, &needle, 10000),
+            "fake spawn-claude.sh did not finish writing within 10s"
+        );
+        let recorded = std::fs::read_to_string(&record_log).unwrap();
+        assert!(
+            recorded.contains("CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS=0"),
+            "expected print-mode bg-wait ceiling disabled (=0); got: {recorded}"
         );
     }
 

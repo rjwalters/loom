@@ -217,6 +217,7 @@ cat > "$STUB_DIR/claude" <<'STUB'
 #!/usr/bin/env bash
 echo "stub-claude got token=${CLAUDE_CODE_OAUTH_TOKEN}"
 echo "stub-claude args=$*"
+echo "stub-claude ceiling=${CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS:-unset}"
 exit 0
 STUB
 chmod +x "$STUB_DIR/claude"
@@ -230,6 +231,20 @@ assert_contains "stub-claude args=-p ping" "$output" \
     "spawn-claude passes args through to claude"
 assert_contains "OAuth account 'alpha'" "$output" \
     "spawn-claude logs the chosen account"
+
+# Test: spawn-claude disables the print-mode background-task wait ceiling
+# (issue #3943) so a daemon-dispatched sweep child's long-running Builder/Judge
+# subagents are not reaped at the 600s ceiling. Default = 0 (no cap).
+assert_contains "stub-claude ceiling=0" "$output" \
+    "spawn-claude exports CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS=0 by default (#3943)"
+
+# Test: an operator-set CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS is PRESERVED
+# (the `:=` default-assignment idiom only fills an unset/empty value).
+output=$(LOOM_WORKSPACE="$TEST_WS" PATH="$STUB_DIR:$PATH" \
+    CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS="120000" \
+    "$SCRIPTS_DIR/spawn-claude.sh" -p "ping" 2>&1 || true)
+assert_contains "stub-claude ceiling=120000" "$output" \
+    "spawn-claude preserves an operator-set wait ceiling (#3943)"
 
 # Test: explicit CLAUDE_CODE_OAUTH_TOKEN bypasses selection
 output=$(LOOM_WORKSPACE="$TEST_WS" PATH="$STUB_DIR:$PATH" \
