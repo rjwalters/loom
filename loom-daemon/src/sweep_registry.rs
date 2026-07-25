@@ -1050,6 +1050,12 @@ impl SweepRegistry {
             .arg("loom:issue")
             .arg("--add-label")
             .arg("loom:building");
+        // Run in the registry's own workspace so the issue number resolves
+        // against *this* repo, not the daemon process's cwd repo. Without this
+        // a multi-workspace daemon (#3928) flips labels against the wrong repo
+        // (`GraphQL: Could not resolve to an issue ...`) — see #3937. The
+        // process-global LOOM_REPO override still wins when set.
+        cmd.current_dir(&self.config.workspace_root);
         if let Ok(repo) = std::env::var("LOOM_REPO") {
             cmd.arg("--repo").arg(repo);
         }
@@ -1078,6 +1084,10 @@ impl SweepRegistry {
             .arg("loom:building")
             .arg("--add-label")
             .arg("loom:issue");
+        // Scope the restore to the registry's workspace so the crash-path label
+        // recovery resolves against the right repo in a multi-workspace daemon
+        // (#3937). LOOM_REPO still overrides when set.
+        cmd.current_dir(&self.config.workspace_root);
         if let Ok(repo) = std::env::var("LOOM_REPO") {
             cmd.arg("--repo").arg(repo);
         }
@@ -1161,6 +1171,9 @@ impl SweepRegistry {
             .arg("labels")
             .arg("--jq")
             .arg(r#"[.labels[].name] | index("loom:blocked") != null"#);
+        // Scope the blocked-label probe to the registry's workspace so it
+        // resolves against the right repo in a multi-workspace daemon (#3937).
+        cmd.current_dir(&self.config.workspace_root);
         if let Ok(repo) = std::env::var("LOOM_REPO") {
             cmd.arg("--repo").arg(repo);
         }
@@ -4159,6 +4172,80 @@ exit 0
             gh_calls.contains("issue edit 88 --remove-label loom:building --add-label loom:issue"),
             "expected finish_cancel to restore loom:building -> loom:issue for a \
              cancelled sweep without a PR; got gh invocations: {gh_calls:?}"
+        );
+    }
+
+    /// Issue #3937: in a multi-workspace daemon (process cwd = the *default*
+    /// repo), the registry's forge label flips must run in the registry's own
+    /// `workspace_root`. Otherwise a non-default workspace's issue number
+    /// resolves against the daemon's cwd repo and the claim silently fails
+    /// (`GraphQL: Could not resolve to an issue ...`). Point a fake `gh` at a
+    /// recorder that captures its own cwd (`pwd -P`) and assert both the flip
+    /// and the restore executed in the registry root — not the process cwd.
+    ///
+    /// The fake `gh` recorder lives outside `registry_root`, and the process
+    /// cwd is left untouched (this crate's tests run in parallel; mutating the
+    /// global cwd would race). The `current_dir` fix makes the recorded cwd
+    /// equal to `workspace_root` regardless of where the process itself sits,
+    /// which is exactly the invariant under test.
+    #[test]
+    fn label_flips_run_in_registry_workspace_root() {
+        // `recorder` stands in for the daemon process's cwd repo; the flips
+        // must NOT resolve here. `registry_root` is the non-default workspace.
+        let recorder = tempdir().unwrap();
+        let registry_root = tempdir().unwrap();
+
+        let gh_log = recorder.path().join("gh-invocations.log");
+        let cwd_log = recorder.path().join("gh-cwd.log");
+        let fake_gh = recorder.path().join("fake-gh.sh");
+        let script = format!(
+            "#!/usr/bin/env bash\npwd -P >> \"{}\"\nprintf '%s\\n' \"$*\" >> \"{}\"\nexit 0\n",
+            cwd_log.display(),
+            gh_log.display()
+        );
+        std::fs::write(&fake_gh, &script).unwrap();
+        let mut perms = std::fs::metadata(&fake_gh).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&fake_gh, perms).unwrap();
+        if let Ok(f) = std::fs::File::open(&fake_gh) {
+            let _ = f.sync_all();
+        }
+
+        let mut config = SweepRegistryConfig::new(registry_root.path().to_path_buf());
+        config.gh_bin = Some(fake_gh);
+        config.skip_label_flip = false; // exercise the real gh path
+        let registry = SweepRegistry::new(config);
+
+        // Issue number that only exists in the non-default repo (mirrors the
+        // live #6199 symptom): the flip must still target registry_root.
+        registry.flip_label_to_building(6199).unwrap();
+        registry.restore_label_to_ready(6199).unwrap();
+
+        let want = std::fs::canonicalize(registry_root.path()).unwrap();
+        let recorded = std::fs::read_to_string(&cwd_log).unwrap_or_default();
+        let cwds: Vec<_> = recorded.lines().filter(|l| !l.is_empty()).collect();
+        assert_eq!(
+            cwds.len(),
+            2,
+            "expected both flip + restore to invoke gh once each; got cwds: {cwds:?}"
+        );
+        for cwd in &cwds {
+            let got = std::fs::canonicalize(cwd).unwrap();
+            assert_eq!(
+                got,
+                want,
+                "gh label flip must run in the registry workspace_root ({}), not the \
+                 recorder/process cwd ({}); recorded cwd: {cwd}",
+                want.display(),
+                recorder.path().display(),
+            );
+        }
+
+        let gh_calls = std::fs::read_to_string(&gh_log).unwrap_or_default();
+        assert!(
+            gh_calls
+                .contains("issue edit 6199 --remove-label loom:issue --add-label loom:building"),
+            "expected the flip-to-building call; got: {gh_calls:?}"
         );
     }
 
