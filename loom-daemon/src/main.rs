@@ -1193,7 +1193,10 @@ fn print_status_human(report: &DaemonStatusReport, token_usage: Option<&serde_js
     // the common single-workspace case this is one line for the daemon's own
     // workspace; with `loom-daemon workspace add <path>` it lists every managed
     // repo, its in-flight count, and its own gate state.
-    println!("\nManaged repos: {} (priority: lower = higher dispatch priority)", report.per_repo.len());
+    println!(
+        "\nManaged repos: {} (priority: lower = higher dispatch priority)",
+        report.per_repo.len()
+    );
     if report.per_repo.is_empty() {
         println!("  (none)");
     } else {
@@ -1462,7 +1465,11 @@ fn handle_workspace_command(action: WorkspaceAction) -> Result<()> {
                 None => None,
             };
             let mut registry = WorkspaceRegistry::load(&path)?;
-            match registry.add_with_priority(std::path::Path::new(&repo_path), overrides, priority)? {
+            match registry.add_with_priority(
+                std::path::Path::new(&repo_path),
+                overrides,
+                priority,
+            )? {
                 AddOutcome::AlreadyPresent { canonical } => {
                     println!("Already registered: {}", canonical.display());
                     println!(
@@ -1476,10 +1483,7 @@ fn handle_workspace_command(action: WorkspaceAction) -> Result<()> {
                     looks_like_workspace,
                 } => {
                     registry.save(&path)?;
-                    println!(
-                        "Registered workspace: {} (priority {priority})",
-                        canonical.display()
-                    );
+                    println!("Registered workspace: {} (priority {priority})", canonical.display());
                     if !looks_like_workspace {
                         eprintln!(
                             "  warning: {} has no .git or .loom — register it anyway, but confirm \
@@ -1534,7 +1538,11 @@ fn handle_workspace_command(action: WorkspaceAction) -> Result<()> {
                 // Display in dispatch-priority order (#3946) — the same order the
                 // autonomous loops drain — without mutating stored insertion order.
                 let mut ordered: Vec<&_> = registry.workspaces.iter().collect();
-                ordered.sort_by(|a, b| a.priority.cmp(&b.priority).then_with(|| a.root.cmp(&b.root)));
+                ordered.sort_by(|a, b| {
+                    a.priority
+                        .cmp(&b.priority)
+                        .then_with(|| a.root.cmp(&b.root))
+                });
                 for ws in ordered {
                     let overrides = if ws.config_overrides.is_some() {
                         " (has config overrides)"

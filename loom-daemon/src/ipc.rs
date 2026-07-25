@@ -494,7 +494,11 @@ pub fn build_daemon_status(
     // Present the per-repo breakdown in dispatch-priority order (#3946) — the
     // same order the autonomous loops drain — so the highest-priority repos are
     // listed first. Stable within a tier (tiebreak on root path) for determinism.
-    per_repo.sort_by(|a, b| a.priority.cmp(&b.priority).then_with(|| a.root.cmp(&b.root)));
+    per_repo.sort_by(|a, b| {
+        a.priority
+            .cmp(&b.priority)
+            .then_with(|| a.root.cmp(&b.root))
+    });
 
     // Dynamic-cap inputs are *machine-level* (one token pool, one scratch
     // volume), so they are computed once from the daemon's primary workspace —

@@ -594,10 +594,7 @@ mod tests {
     #[test]
     fn priority_of_unregistered_root_is_default() {
         let reg = WorkspaceRegistry::default();
-        assert_eq!(
-            reg.priority_of(Path::new("/not/registered")),
-            DEFAULT_WORKSPACE_PRIORITY
-        );
+        assert_eq!(reg.priority_of(Path::new("/not/registered")), DEFAULT_WORKSPACE_PRIORITY);
     }
 
     #[test]

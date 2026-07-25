@@ -507,7 +507,10 @@ pub fn tick_multi<S: WorkSource, D: WorkDispatcher>(
         }
 
         let in_flight = &in_flights[idx];
-        let workspace_priority = priorities.get(idx).copied().unwrap_or(DEFAULT_WORKSPACE_PRIORITY);
+        let workspace_priority = priorities
+            .get(idx)
+            .copied()
+            .unwrap_or(DEFAULT_WORKSPACE_PRIORITY);
 
         for item in ready {
             if item.is_skipped() {
@@ -1506,7 +1509,7 @@ mod tests {
         // Empty-registry equivalence: one workspace behaves exactly like tick().
         let mut multi =
             vec![(FakeSource::once((1..=3).map(issue).collect()), RecordingDispatcher::default())];
-        let report = tick_multi(&mut multi, &[],10, &[false]);
+        let report = tick_multi(&mut multi, &[], 10, &[false]);
         assert_eq!(report.seen, 3);
         assert_eq!(report.dispatched, 3);
         assert_eq!(report.deferred_capacity, 0);
@@ -1521,7 +1524,7 @@ mod tests {
             (FakeSource::once(vec![issue(1), issue(2)]), RecordingDispatcher::default()),
             (FakeSource::once(vec![issue(10), issue(11)]), RecordingDispatcher::default()),
         ];
-        let report = tick_multi(&mut multi, &[],10, &[false, false]);
+        let report = tick_multi(&mut multi, &[], 10, &[false, false]);
         assert_eq!(report.seen, 4);
         assert_eq!(report.dispatched, 4);
         assert_eq!(multi[0].1.dispatched, vec![1, 2], "workspace 0 dispatches its own issues");
@@ -1537,7 +1540,7 @@ mod tests {
             (FakeSource::once((1..=5).map(issue).collect()), RecordingDispatcher::default()),
             (FakeSource::once((10..=14).map(issue).collect()), RecordingDispatcher::default()),
         ];
-        let report = tick_multi(&mut multi, &[],3, &[false, false]);
+        let report = tick_multi(&mut multi, &[], 3, &[false, false]);
         let total: usize = multi.iter().map(|(_, d)| d.dispatched.len()).sum();
         assert_eq!(report.dispatched, 3, "combined dispatch never exceeds the global cap");
         assert_eq!(total, 3, "sum of per-workspace dispatches equals the global cap");
@@ -1564,7 +1567,7 @@ mod tests {
                 },
             ),
         ];
-        let report = tick_multi(&mut multi, &[],4, &[false, false]);
+        let report = tick_multi(&mut multi, &[], 4, &[false, false]);
         assert_eq!(report.dispatched, 1, "3 in-flight + cap 4 ⇒ 1 free slot globally");
         assert_eq!(report.deferred_capacity, 3);
         // The single free slot goes to the first workspace's first ready issue.
@@ -1581,7 +1584,7 @@ mod tests {
             (err_source("bad auth for repo B"), RecordingDispatcher::default()),
             (FakeSource::once(vec![issue(30)]), RecordingDispatcher::default()),
         ];
-        let report = tick_multi(&mut multi, &[],10, &[false, false, false]);
+        let report = tick_multi(&mut multi, &[], 10, &[false, false, false]);
         assert_eq!(report.errors, 1, "the failing workspace is counted, not fatal");
         assert_eq!(report.dispatched, 3, "the two healthy workspaces still dispatch");
         assert_eq!(multi[0].1.dispatched, vec![1, 2]);
@@ -1595,7 +1598,7 @@ mod tests {
             (FakeSource::once((1..=3).map(issue).collect()), RecordingDispatcher::default()),
             (FakeSource::once((10..=12).map(issue).collect()), RecordingDispatcher::default()),
         ];
-        let report = tick_multi(&mut multi, &[],10, &[true, true]);
+        let report = tick_multi(&mut multi, &[], 10, &[true, true]);
         assert!(report.halted);
         assert_eq!(report.seen, 6, "backlog across both workspaces is still observed");
         assert_eq!(report.dispatched, 0, "zero dispatch while halted");
@@ -1605,7 +1608,7 @@ mod tests {
     #[test]
     fn test_tick_multi_empty_workspace_set_is_noop() {
         let mut multi: Vec<(FakeSource, RecordingDispatcher)> = vec![];
-        let report = tick_multi(&mut multi, &[],10, &[]);
+        let report = tick_multi(&mut multi, &[], 10, &[]);
         assert_eq!(report, TickReport::default());
     }
 
@@ -1618,7 +1621,7 @@ mod tests {
             (FakeSource::once(vec![issue(1), issue(2)]), RecordingDispatcher::default()),
             (FakeSource::once(vec![issue(10), issue(11)]), RecordingDispatcher::default()),
         ];
-        let report = tick_multi(&mut multi, &[],10, &[true, false]);
+        let report = tick_multi(&mut multi, &[], 10, &[true, false]);
         assert!(report.halted, "report.halted is set when any repo was gated");
         assert_eq!(report.seen, 4, "both repos' backlogs are observed");
         assert_eq!(report.dispatched, 2, "only repo B dispatched");
@@ -1634,7 +1637,7 @@ mod tests {
             (FakeSource::once(vec![issue(1), issue(2)]), RecordingDispatcher::default()),
             (FakeSource::once(vec![issue(10), issue(11)]), RecordingDispatcher::default()),
         ];
-        let report = tick_multi(&mut multi, &[],10, &[false, true]);
+        let report = tick_multi(&mut multi, &[], 10, &[false, true]);
         assert!(report.halted, "a gated sibling still sets report.halted");
         assert_eq!(report.dispatched, 2, "only repo A dispatched");
         assert_eq!(multi[0].1.dispatched, vec![1, 2], "green repo A dispatched its backlog");
@@ -1656,7 +1659,7 @@ mod tests {
             ),
             (FakeSource::once(vec![issue(10), issue(11)]), RecordingDispatcher::default()),
         ];
-        let report = tick_multi(&mut multi, &[],3, &[true, false]);
+        let report = tick_multi(&mut multi, &[], 3, &[true, false]);
         assert!(report.halted);
         assert_eq!(report.dispatched, 0, "occupancy already at cap from red repo's in-flight");
         assert_eq!(report.deferred_capacity, 2, "repo B's 2 ready issues deferred by the budget");
@@ -1670,7 +1673,7 @@ mod tests {
             (FakeSource::once(vec![issue(1)]), RecordingDispatcher::default()),
             (FakeSource::once(vec![issue(10)]), RecordingDispatcher::default()),
         ];
-        let report = tick_multi(&mut multi, &[],10, &[false, false]);
+        let report = tick_multi(&mut multi, &[], 10, &[false, false]);
         assert!(!report.halted);
         assert_eq!(report.dispatched, 2);
     }
@@ -1683,7 +1686,7 @@ mod tests {
             (FakeSource::once(vec![issue(1)]), RecordingDispatcher::default()),
             (FakeSource::once(vec![issue(10)]), RecordingDispatcher::default()),
         ];
-        let report = tick_multi(&mut multi, &[],10, &[true]);
+        let report = tick_multi(&mut multi, &[], 10, &[true]);
         assert!(report.halted);
         assert_eq!(report.dispatched, 1, "workspace 1 (no halt entry) still dispatches");
         assert!(multi[0].1.dispatched.is_empty());
