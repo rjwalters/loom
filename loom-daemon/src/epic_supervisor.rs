@@ -65,6 +65,7 @@
 //!    deduplicated per child issue number.
 
 use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -76,7 +77,10 @@ use crate::event_bus::EventBus;
 use crate::issue_creation_mutex::{IssueCreationMutex, CHAMPION_EPIC_DECOMP};
 use crate::main_health_gate::MainHealthState;
 use crate::phase_join::{barrier_admits, PhaseBoundary};
+use crate::sweep_registry::SweepRegistryConfig;
 use crate::types::{EpicActionClass, Event};
+use crate::workspace_pool::WorkspacePool;
+use crate::workspace_registry::WorkspaceRegistry;
 
 // ============================================================================
 // Constants
@@ -744,6 +748,45 @@ fn resolve_inflight_ttl() -> Duration {
         .map_or_else(|| Duration::from_secs(DEFAULT_INFLIGHT_TTL_SECS), Duration::from_secs)
 }
 
+/// Run one **multi-workspace** supervisor tick across N supervisors — one per
+/// registered workspace (#3928) — isolating per-workspace errors.
+///
+/// Mirrors [`crate::work_finder::tick_multi`]: a failure to *list* epics for one
+/// workspace (bad auth, deleted remote, forge outage) is logged and counted in
+/// the aggregate [`TickReport::errors`], then the loop **continues** to the next
+/// workspace — one repo's failure never blocks the others. Each supervisor's own
+/// per-epic dispatch-error isolation (already in [`EpicSupervisor::tick`]) is
+/// preserved; this layer adds the *cross-workspace* isolation.
+///
+/// Unlike the work-finder there is no shared concurrency budget here — the epic
+/// supervisor dispatches at most one singleton transition per epic per tick and
+/// deduplicates sweeps per child, so no global cap is needed.
+pub async fn tick_multi<S: EpicSource, D: EpicDispatcher>(
+    supervisors: &mut [EpicSupervisor<S, D>],
+) -> TickReport {
+    let mut agg = TickReport::default();
+    for supervisor in supervisors.iter_mut() {
+        match supervisor.tick().await {
+            Ok(report) => {
+                agg.epics_seen += report.epics_seen;
+                agg.roles_dispatched += report.roles_dispatched;
+                agg.sweeps_dispatched += report.sweeps_dispatched;
+                agg.skipped_in_flight += report.skipped_in_flight;
+                agg.noop += report.noop;
+                agg.errors += report.errors;
+                agg.halted |= report.halted;
+            }
+            Err(e) => {
+                // Per-workspace isolation: a list failure for one repo is logged
+                // and counted, the other workspaces still tick this same round.
+                agg.errors += 1;
+                log::warn!("epic_supervisor: a workspace tick failed to list epics: {e}");
+            }
+        }
+    }
+    agg
+}
+
 // ============================================================================
 // Runtime wiring — the supervisor loop runs OFF the async runtime (#3872)
 // ============================================================================
@@ -932,6 +975,147 @@ where
     })
 }
 
+/// Spawn the **multi-workspace** epic supervisor loop (#3928) on a dedicated OS
+/// thread and return its [`SupervisorHandle`].
+///
+/// This is the multi-repo replacement for [`spawn_supervisor_thread`]. Like the
+/// single-workspace loop it runs on its own OS thread with a private
+/// current-thread runtime (the concrete [`forge::SpawnDispatcher`] is
+/// spawn-and-wait and holds the #3707 mutex across a minutes-long role process —
+/// see the module rationale). The multi-repo additions:
+///
+/// - Each tick re-reads the machine-level [`WorkspaceRegistry`] and resolves
+///   [`effective_roots`](WorkspaceRegistry::effective_roots) against
+///   `fallback_root`, so `workspace add|remove` is hot-applied.
+/// - One [`EpicSupervisor`] is lazily built and **cached** per root (preserving
+///   its per-epic in-flight ledger across ticks). Each is scoped to its repo via
+///   [`forge::GhEpicSource::for_root`] and dispatches through that root's own
+///   [`SweepRegistry`](crate::sweep_registry::SweepRegistry) from the shared
+///   [`WorkspacePool`], with a **per-workspace** [`IssueCreationMutex`] (the
+///   #3707 hazard is repo-scoped, so a per-repo mutex is correct — see the issue
+///   notes).
+/// - [`tick_multi`] runs all cached supervisors with cross-workspace error
+///   isolation.
+///
+/// The event bus is shared; the `epic.issue.{N}.*` topics remain issue-keyed
+/// (frozen taxonomy) — the same documented cross-repo collision limitation as
+/// the work-finder, deferred to phase c (#3929).
+///
+/// # Errors
+///
+/// Returns an error if the OS thread cannot be spawned.
+pub fn spawn_multi_supervisor_thread(
+    pool: Arc<WorkspacePool>,
+    fallback_root: PathBuf,
+    event_bus: Arc<EventBus>,
+    health_state: Arc<MainHealthState>,
+    interval: Duration,
+) -> Result<SupervisorHandle> {
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let shutdown_thread = shutdown.clone();
+    let join = std::thread::Builder::new()
+        .name("loom-epic-supervisor".to_string())
+        .spawn(move || {
+            let rt = match tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            {
+                Ok(rt) => rt,
+                Err(e) => {
+                    log::error!("epic_supervisor: failed to build loop runtime: {e}");
+                    return;
+                }
+            };
+            log::info!(
+                "epic_supervisor: multi-workspace loop started (interval={}s)",
+                interval.as_secs()
+            );
+
+            // Parallel vectors keyed by workspace root: one cached supervisor per
+            // root, preserving each supervisor's per-epic ledger across ticks.
+            let mut roots: Vec<PathBuf> = Vec::new();
+            let mut supervisors: Vec<EpicSupervisor<forge::GhEpicSource, forge::SpawnDispatcher>> =
+                Vec::new();
+
+            while !shutdown_thread.load(Ordering::Relaxed) {
+                // Resolve the current workspace set fresh each tick (hot-apply).
+                let current = WorkspaceRegistry::load_default()
+                    .unwrap_or_else(|e| {
+                        log::warn!(
+                            "epic_supervisor: could not load workspace registry ({e}); using cwd"
+                        );
+                        WorkspaceRegistry::default()
+                    })
+                    .effective_roots(&fallback_root);
+
+                // Drop cached supervisors whose workspace was deregistered.
+                let mut i = 0;
+                while i < roots.len() {
+                    if current.contains(&roots[i]) {
+                        i += 1;
+                    } else {
+                        log::info!(
+                            "epic_supervisor: dropping deregistered workspace {}",
+                            roots[i].display()
+                        );
+                        roots.remove(i);
+                        supervisors.remove(i);
+                    }
+                }
+
+                // Provision supervisors for newly-registered workspaces.
+                for root in &current {
+                    if roots.contains(root) {
+                        continue;
+                    }
+                    match SweepRegistryConfig::new(root.clone()).resolve_spawn_bin() {
+                        Ok(spawn_bin) => {
+                            let registry = pool.get_or_provision(root);
+                            let source = forge::GhEpicSource::for_root(root);
+                            let dispatcher = forge::SpawnDispatcher::new(spawn_bin, registry);
+                            let supervisor =
+                                EpicSupervisor::new(source, dispatcher, IssueCreationMutex::new())
+                                    .with_event_bus(event_bus.clone())
+                                    .with_health_gate(health_state.clone());
+                            roots.push(root.clone());
+                            supervisors.push(supervisor);
+                            log::info!("epic_supervisor: watching workspace {}", root.display());
+                        }
+                        Err(e) => {
+                            log::warn!(
+                                "epic_supervisor: skipping workspace {} this tick — spawn binary \
+                                 unavailable: {e}",
+                                root.display()
+                            );
+                        }
+                    }
+                }
+
+                let report = rt.block_on(tick_multi(&mut supervisors));
+                if report.roles_dispatched > 0 || report.sweeps_dispatched > 0 || report.errors > 0
+                {
+                    log::info!(
+                        "epic_supervisor: tick — {} workspace(s), {} epic(s) seen, {} role(s), \
+                         {} sweep(s), {} skipped, {} error(s)",
+                        supervisors.len(),
+                        report.epics_seen,
+                        report.roles_dispatched,
+                        report.sweeps_dispatched,
+                        report.skipped_in_flight,
+                        report.errors
+                    );
+                }
+                sleep_interruptible(interval, &shutdown_thread);
+            }
+            log::info!("epic_supervisor: multi-workspace loop stopped");
+        })
+        .context("failed to spawn epic supervisor thread")?;
+    Ok(SupervisorHandle {
+        shutdown,
+        join: Some(join),
+    })
+}
+
 // ============================================================================
 // Concrete runtime adapters (forge-backed source + spawn dispatcher)
 // ============================================================================
@@ -1006,6 +1190,11 @@ pub mod forge {
     pub struct GhEpicSource {
         gh_bin: PathBuf,
         repo: Option<String>,
+        /// Working directory the `gh` queries run in. When set (multi-workspace
+        /// fan-out, #3928) `gh` auto-detects the repo from that root's git
+        /// remote, so each registered workspace is scanned against its own repo.
+        /// `None` keeps today's behavior (inherit the daemon's cwd).
+        cwd: Option<PathBuf>,
     }
 
     impl GhEpicSource {
@@ -1016,6 +1205,22 @@ pub mod forge {
             Self {
                 gh_bin: PathBuf::from("gh"),
                 repo: std::env::var("LOOM_REPO").ok(),
+                cwd: None,
+            }
+        }
+
+        /// Construct a source scoped to a specific workspace `root` (#3928): the
+        /// `gh` queries run with `current_dir(root)` so they target that repo's
+        /// own remote. `LOOM_REPO`, when set, is still honored as a machine-global
+        /// `--repo` override (preserving the single-workspace behavior); in a
+        /// genuine multi-repo deployment it is left unset so each root's cwd
+        /// selects its repo.
+        #[must_use]
+        pub fn for_root(root: &std::path::Path) -> Self {
+            Self {
+                gh_bin: PathBuf::from("gh"),
+                repo: std::env::var("LOOM_REPO").ok(),
+                cwd: Some(root.to_path_buf()),
             }
         }
 
@@ -1040,6 +1245,9 @@ pub mod forge {
                 .arg("number,body,state,labels");
             if let Some(ref repo) = self.repo {
                 cmd.arg("--repo").arg(repo);
+            }
+            if let Some(ref cwd) = self.cwd {
+                cmd.current_dir(cwd);
             }
             cmd.stderr(Stdio::piped());
             let out = cmd
@@ -1769,6 +1977,90 @@ mod tests {
         let snap = EpicSnapshot::new(5, body_with_phases(3), vec![open(2), closed(1)], vec![]);
         assert_eq!(snap.state(), EpicState::Active);
         assert_eq!(plan_epic_transition(&snap), EpicTransition::Noop);
+    }
+
+    // ===================================================================
+    // tick_multi — multi-workspace fan-out (#3928)
+    // ===================================================================
+
+    /// A source that either yields fixed epics or fails the list — lets a
+    /// `tick_multi` slice stay a single concrete type while exercising the
+    /// one-workspace-errors-others-proceed path.
+    struct MultiSource {
+        epics: Vec<EpicSnapshot>,
+        fail: bool,
+    }
+    impl EpicSource for MultiSource {
+        fn list_open_epics(&mut self) -> Result<Vec<EpicSnapshot>> {
+            if self.fail {
+                anyhow::bail!("forced list failure");
+            }
+            Ok(self.epics.clone())
+        }
+    }
+
+    fn multi_supervisor(
+        epics: Vec<EpicSnapshot>,
+        fail: bool,
+    ) -> EpicSupervisor<MultiSource, RecordingDispatcher> {
+        EpicSupervisor::new(
+            MultiSource { epics, fail },
+            RecordingDispatcher::default(),
+            IssueCreationMutex::new(),
+        )
+    }
+
+    #[tokio::test]
+    async fn test_tick_multi_single_workspace_matches_single_tick() {
+        // Empty-registry equivalence: one workspace behaves like a lone tick().
+        let mut sups = vec![multi_supervisor(
+            vec![EpicSnapshot::new(1, "flat body", vec![], vec![])],
+            false,
+        )];
+        let report = tick_multi(&mut sups).await;
+        assert_eq!(report.epics_seen, 1);
+        assert_eq!(report.roles_dispatched, 1, "the lone epic gets its Architect enrich");
+        assert_eq!(report.errors, 0);
+        assert_eq!(sups[0].dispatcher.roles.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_tick_multi_fans_out_across_workspaces() {
+        // Two workspaces each with a needs_decomp epic ⇒ each dispatches its own
+        // Architect enrich; the aggregate report sums both.
+        let mut sups = vec![
+            multi_supervisor(vec![EpicSnapshot::new(1, "flat body", vec![], vec![])], false),
+            multi_supervisor(vec![EpicSnapshot::new(2, "flat body", vec![], vec![])], false),
+        ];
+        let report = tick_multi(&mut sups).await;
+        assert_eq!(report.epics_seen, 2);
+        assert_eq!(report.roles_dispatched, 2, "both workspaces dispatch");
+        // Each supervisor dispatched for its OWN epic number, not the other's.
+        assert_eq!(sups[0].dispatcher.roles[0].0, 1);
+        assert_eq!(sups[1].dispatcher.roles[0].0, 2);
+    }
+
+    #[tokio::test]
+    async fn test_tick_multi_one_workspace_errors_others_proceed() {
+        // Middle workspace's list fails; the other two still tick and dispatch.
+        let mut sups = vec![
+            multi_supervisor(vec![EpicSnapshot::new(1, "flat body", vec![], vec![])], false),
+            multi_supervisor(vec![EpicSnapshot::new(2, "flat body", vec![], vec![])], true),
+            multi_supervisor(vec![EpicSnapshot::new(3, "flat body", vec![], vec![])], false),
+        ];
+        let report = tick_multi(&mut sups).await;
+        assert_eq!(report.errors, 1, "the failing workspace is counted, not fatal");
+        assert_eq!(report.roles_dispatched, 2, "the two healthy workspaces still dispatch");
+        assert_eq!(sups[0].dispatcher.roles.len(), 1);
+        assert!(sups[1].dispatcher.roles.is_empty(), "the erroring workspace dispatched nothing");
+        assert_eq!(sups[2].dispatcher.roles.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_tick_multi_empty_set_is_noop() {
+        let mut sups: Vec<EpicSupervisor<MultiSource, RecordingDispatcher>> = vec![];
+        let report = tick_multi(&mut sups).await;
+        assert_eq!(report, TickReport::default());
     }
 
     // ===================================================================
