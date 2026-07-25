@@ -328,6 +328,51 @@ the in-memory tracking + reaper go away, so the sweep finishes normally but its
 terminal state becomes unobservable via IPC after the deregister — an accepted
 consequence of an explicit operator `workspace remove`.
 
+## Token pool provisioning for managed repos (#3938)
+
+The multi-workspace work finder measures the token pool **once per tick from the
+daemon's primary workspace** (`fallback_root`) and uses it as the single global
+concurrency budget — token accounts are a *machine-level* resource, so the cap is
+never replicated per repo. But each dispatched sweep runs `spawn-claude.sh` with
+its `current_dir` set to **its own** repo root, and `spawn-claude.sh` resolves the
+token pool from that repo. A freshly-installed **consumer repo has no
+`.loom/tokens/` of its own** — only the primary workspace was bootstrapped — so
+every cross-repo dispatch used to hard-fail instantly with `EX_CONFIG`
+("Run `loom-tokens bootstrap` …"), burning a dispatch slot per tick on children
+that died in ~2s.
+
+**Fix — a shared machine-level pool with a per-repo fallback.** Token selection
+and *all* pool-state bookkeeping resolve the effective pool directory as:
+
+1. the **per-repo** pool `<repo>/.loom/tokens/` when it holds `*.token` files
+   (unchanged for the primary workspace);
+2. else the **shared** machine-level pool `~/.loom/tokens/` (override
+   `LOOM_SHARED_TOKENS_DIR`; set it empty to disable the fallback);
+3. else the per-repo path (so a truly-unbootstrapped repo still surfaces a clear
+   "run bootstrap" error).
+
+Crucially, the **state files** (`.bad_tokens`, `.failure_counts`, `.ranking`,
+`.allowlist`) are read/written in *whichever pool directory was selected* — so a
+consumer repo dispatching against the shared pool shares one `.bad_tokens` /
+`.ranking` truth with every other repo. Pool state is **never forked per repo**,
+which is what keeps the token-capacity backpressure accounting (#3907/#3930)
+consistent. The Rust `token_pool_size` (the dynamic-cap input) applies the same
+per-repo→shared resolution, so the daemon's concurrency ceiling matches what the
+spawn path can actually pick.
+
+**Provisioning a managed-repo pool.** Bootstrap the shared pool once per machine:
+
+```bash
+loom-tokens bootstrap --shared      # writes ~/.loom/tokens (override LOOM_SHARED_TOKENS_DIR)
+loom-tokens check --ranking         # ranks the effective pool (shared when no per-repo pool)
+```
+
+Every consumer repo the daemon dispatches into then falls back to that one pool —
+no per-repo `loom-tokens bootstrap` required. A repo that *wants* its own isolated
+pool can still `loom-tokens bootstrap` locally; the per-repo pool always wins.
+Selection sources (`~/.claude-monitor/accounts.env`, repo-local `.env`) are
+unchanged — `--shared` only redirects the *destination* of the materialized pool.
+
 ## Per-repo status breakdown + per-repo main-health gate (#3930 — phase d)
 
 Phase d is the final phase of the multi-repo daemon (#3926/#3835). Phases b/c

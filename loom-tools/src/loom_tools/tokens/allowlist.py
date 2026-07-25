@@ -36,6 +36,7 @@ from pathlib import Path
 # Reuse the lock primitive from bad_tokens — same constraints (mkdir-only,
 # no flock on stock macOS) and same workspace.
 from loom_tools.tokens.bad_tokens import _MkdirLock
+from loom_tools.tokens.paths import resolve_tokens_dir
 
 
 class AllowlistError(Exception):
@@ -55,7 +56,10 @@ class UnknownAccountError(AllowlistError):
 
 
 def _tokens_dir(workspace: Path | str) -> Path:
-    return Path(workspace) / ".loom" / "tokens"
+    # Resolve the effective pool dir (per-repo, else shared machine-level pool)
+    # so ``.allowlist`` lives beside the selected ``*.token`` files and is never
+    # forked per repo (issue #3938).
+    return resolve_tokens_dir(workspace)
 
 
 def _allowlist_path(workspace: Path | str) -> Path:

@@ -41,12 +41,16 @@ from pathlib import Path
 
 # Reuse the lock primitive from bad_tokens (mkdir-only, macOS-safe).
 from loom_tools.tokens.bad_tokens import _MkdirLock
+from loom_tools.tokens.paths import resolve_tokens_dir
 
 DEFAULT_THRESHOLD = 5
 
 
 def _tokens_dir(workspace: Path | str) -> Path:
-    return Path(workspace) / ".loom" / "tokens"
+    # Resolve the effective pool dir (per-repo, else shared machine-level pool)
+    # so ``.failure_counts`` lives beside the selected ``*.token`` files and is
+    # never forked per repo (issue #3938).
+    return resolve_tokens_dir(workspace)
 
 
 def _state_path(workspace: Path | str) -> Path:

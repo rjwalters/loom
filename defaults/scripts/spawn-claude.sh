@@ -15,14 +15,28 @@
 # the wrapper.
 #
 # Behavior on missing tokens:
-#   When `.loom/tokens/` is absent, empty, or all tokens are bad, this script
+#   Token selection resolves the effective pool (issue #3938): the per-repo
+#   pool at `<repo>/.loom/tokens/` when it holds `*.token` files, else the
+#   shared machine-level pool at `~/.loom/tokens/` (override
+#   `LOOM_SHARED_TOKENS_DIR`; set it empty to disable the fallback). This lets a
+#   consumer repo the daemon dispatches into — which has no pool of its own —
+#   spawn against the shared pool instead of hard-failing. All pool STATE
+#   (`.bad_tokens`/`.ranking`/`.allowlist`/`.failure_counts`) lives in whichever
+#   pool was selected, so it is never forked per repo.
+#   When NEITHER pool exists/has tokens (or all tokens are bad), this script
 #   exits 78 (EX_CONFIG) with a message instructing the user to run
-#   `loom-tokens bootstrap`. It does NOT silently fall back to keychain.
+#   `loom-tokens bootstrap` (or `loom-tokens bootstrap --shared` for the
+#   machine-level pool). It does NOT silently fall back to keychain.
 #
 # Worktree handling:
 #   When invoked from a git worktree, the script resolves the canonical repo
 #   root via `git rev-parse --git-common-dir` and looks up `.loom/tokens/`
 #   there — never in the worktree's path.
+#
+# Env vars (pool location):
+#   LOOM_SHARED_TOKENS_DIR  Shared machine-level pool location. Non-empty path
+#                           overrides the `~/.loom/tokens` default; an empty
+#                           value disables the shared fallback (per-repo only).
 #
 # Usage:
 #   .loom/scripts/spawn-claude.sh -p "your prompt"
@@ -271,8 +285,11 @@ PY
         log_error "Token selection failed:"
         cat "$_selection_stderr_file" >&2 || true
         rm -f "$_selection_stderr_file"
-        log_error "Run 'loom-tokens bootstrap' to populate .loom/tokens/, or"
-        log_error "use 'loom-tokens unblock <name>' if .bad_tokens is the cause."
+        log_error "Run 'loom-tokens bootstrap' to populate <repo>/.loom/tokens/,"
+        log_error "or 'loom-tokens bootstrap --shared' for the machine-level pool"
+        log_error "(~/.loom/tokens, override LOOM_SHARED_TOKENS_DIR) that consumer"
+        log_error "repos fall back to. Use 'loom-tokens unblock <name>' if"
+        log_error ".bad_tokens is the cause."
         log_error "Spawn-claude refuses to auto-clear .bad_tokens — that's"
         log_error "intentional: an empty pool indicates a real auth problem."
         log_error "Set CLAUDE_CODE_OAUTH_TOKEN explicitly to bypass selection."

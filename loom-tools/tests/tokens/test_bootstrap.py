@@ -387,6 +387,39 @@ class TestCli:
         rc = cli_main(["bootstrap"])
         assert rc == 1
 
+    def test_bootstrap_shared_writes_machine_level_pool(
+        self,
+        mock_repo: pathlib.Path,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: pathlib.Path,
+    ) -> None:
+        """`--shared` materializes the pool in LOOM_SHARED_TOKENS_DIR, not repo."""
+        _make_env(mock_repo, 2)
+        shared = tmp_path / "machine-pool"
+        monkeypatch.setenv("LOOM_SHARED_TOKENS_DIR", str(shared))
+        monkeypatch.chdir(mock_repo)
+
+        rc = cli_main(["bootstrap", "--shared"])
+        assert rc == 0
+        # Tokens land in the shared pool...
+        assert (shared / "user1.token").is_file()
+        assert (shared / "user2.token").is_file()
+        assert (shared / "index.json").is_file()
+        # ...and NOT in the repo-local pool.
+        assert not (mock_repo / ".loom" / "tokens" / "user1.token").exists()
+
+    def test_bootstrap_shared_disabled_returns_1(
+        self,
+        mock_repo: pathlib.Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """`--shared` with the shared pool disabled is a config error."""
+        _make_env(mock_repo, 1)
+        monkeypatch.setenv("LOOM_SHARED_TOKENS_DIR", "")
+        monkeypatch.chdir(mock_repo)
+        rc = cli_main(["bootstrap", "--shared"])
+        assert rc == 1
+
 
 # ---------------------------------------------------------------------------
 # Result struct

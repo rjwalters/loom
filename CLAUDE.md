@@ -582,9 +582,13 @@ The `classify_error <output> <exit_code>` function returns one of `SUCCESS`, `TI
 
 When invoked from a worktree, `spawn-claude.sh` resolves the canonical repo root via `git rev-parse --git-common-dir` and locates `.loom/tokens/` there — never in the worktree's path. This avoids each worktree maintaining its own bad-tokens list.
 
+### Shared machine-level pool fallback (#3938)
+
+Token selection resolves the effective pool as: the **per-repo** pool `<repo>/.loom/tokens/` when it holds `*.token` files, else the **shared machine-level pool** `~/.loom/tokens/` (override `LOOM_SHARED_TOKENS_DIR`; set it empty to disable the fallback). This lets a consumer repo the daemon dispatches into — which has no pool of its own — spawn against the shared pool instead of hard-failing with `EX_CONFIG`. Crucially, the pool **state** files (`.bad_tokens`, `.failure_counts`, `.ranking`, `.allowlist`) are read/written in whichever pool was selected, so state is **never forked per repo** (token-capacity backpressure sees one truth). Provision the shared pool once per machine with `loom-tokens bootstrap --shared` (destination-only; account sources are unchanged). See `.loom/docs/daemon-reference.md` → "Token pool provisioning for managed repos".
+
 ### Hard-fail on missing pool
 
-`spawn-claude.sh` exits `78` (`EX_CONFIG`) with a message instructing the user to run `loom-tokens bootstrap` when `.loom/tokens/` is absent or all tokens are bad. It does **not** silently fall back to keychain — that path belongs in `loom-daemon` (#3236), and only when token rotation has not been configured at all.
+`spawn-claude.sh` exits `78` (`EX_CONFIG`) with a message instructing the user to run `loom-tokens bootstrap` (or `loom-tokens bootstrap --shared` for the machine-level pool) when **neither** the per-repo nor the shared pool has usable tokens (absent, empty, or all bad). It does **not** silently fall back to keychain — that path belongs in `loom-daemon` (#3236), and only when token rotation has not been configured at all.
 
 ### Operator CLI (`loom-tokens pin/unpin/unblock`)
 

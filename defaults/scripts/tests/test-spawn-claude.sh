@@ -238,22 +238,56 @@ output=$(LOOM_WORKSPACE="$TEST_WS" PATH="$STUB_DIR:$PATH" \
 assert_contains "stub-claude got token=caller-supplied" "$output" \
     "explicit CLAUDE_CODE_OAUTH_TOKEN is preserved"
 
-# Test: missing tokens dir → exit 78 with helpful message
+# Test: missing tokens dir → exit 78 with helpful message.
+# LOOM_SHARED_TOKENS_DIR="" disables the #3938 shared-pool fallback so this
+# case deterministically hard-fails regardless of the host's ~/.loom/tokens.
 EMPTY_WS="$(mktemp -d)"
-output=$(LOOM_WORKSPACE="$EMPTY_WS" PATH="$STUB_DIR:$PATH" \
+output=$(LOOM_WORKSPACE="$EMPTY_WS" LOOM_SHARED_TOKENS_DIR="" \
+    PATH="$STUB_DIR:$PATH" \
     "$SCRIPTS_DIR/spawn-claude.sh" -p "ping" 2>&1 || true)
 exit_code=$?
 assert_contains "loom-tokens bootstrap" "$output" \
     "empty pool error mentions 'loom-tokens bootstrap'"
 rm -rf "$EMPTY_WS"
 
-# Test that spawn-claude.sh exits 78 on missing tokens
+# Test that spawn-claude.sh exits 78 on missing tokens (shared fallback off).
 set +e
-LOOM_WORKSPACE="$(mktemp -d)" PATH="$STUB_DIR:$PATH" \
+LOOM_WORKSPACE="$(mktemp -d)" LOOM_SHARED_TOKENS_DIR="" PATH="$STUB_DIR:$PATH" \
     "$SCRIPTS_DIR/spawn-claude.sh" -p "ping" >/dev/null 2>&1
 exit_code=$?
 set -e
 assert_eq "78" "$exit_code" "missing tokens exits 78 (EX_CONFIG)"
+
+# Test: consumer repo with NO per-repo pool falls back to the shared
+# machine-level pool (issue #3938) instead of hard-failing.
+#
+# Pin LOOM_PACKAGE_PATH at the repo-under-test's loom_tools so the assertion
+# exercises THIS checkout's selector, not any host-level editable install /
+# canary LOOM_PACKAGE_PATH the dev environment may export.
+REPO_PKG="$(cd "$SCRIPTS_DIR/../../loom-tools/src" 2>/dev/null && pwd || echo "")"
+CONSUMER_WS="$(mktemp -d)"
+SHARED_POOL="$(mktemp -d)"
+echo -n "fake-token-shared" > "$SHARED_POOL/shared-acct.token"
+chmod 600 "$SHARED_POOL/shared-acct.token"
+output=$(LOOM_WORKSPACE="$CONSUMER_WS" LOOM_SHARED_TOKENS_DIR="$SHARED_POOL" \
+    LOOM_PACKAGE_PATH="$REPO_PKG" PATH="$STUB_DIR:$PATH" \
+    "$SCRIPTS_DIR/spawn-claude.sh" -p "ping" 2>&1 || true)
+assert_contains "stub-claude got token=fake-token-shared" "$output" \
+    "spawn-claude falls back to shared pool for a repo with no pool (#3938)"
+assert_contains "OAuth account 'shared-acct'" "$output" \
+    "spawn-claude logs the shared-pool account (#3938)"
+# State must land in the shared pool, never forked into the consumer repo.
+LOOM_SHARED_TOKENS_DIR="$SHARED_POOL" PYTHONPATH="$REPO_PKG" \
+    python3 -c "
+from loom_tools.tokens.bad_tokens import mark_bad
+mark_bad('$CONSUMER_WS', 'shared-acct', 'test')
+" 2>/dev/null || true
+if [[ -f "$SHARED_POOL/.bad_tokens" && ! -f "$CONSUMER_WS/.loom/tokens/.bad_tokens" ]]; then
+    assert_eq "ok" "ok" "shared-pool .bad_tokens written to shared dir, not consumer repo (#3938)"
+else
+    assert_eq "ok" "fail" "shared-pool .bad_tokens written to shared dir, not consumer repo (#3938)"
+fi
+rm -rf "$CONSUMER_WS" "$SHARED_POOL"
 
 # ============================================================
 # Section 3: model selection (issue #3477, Phase 1)

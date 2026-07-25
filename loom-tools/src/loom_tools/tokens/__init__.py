@@ -40,6 +40,10 @@ from loom_tools.tokens.allowlist import (
 )
 from loom_tools.tokens.bad_tokens import cleanup_bad_tokens, is_bad, mark_bad
 from loom_tools.tokens.bootstrap import bootstrap_tokens
+from loom_tools.tokens.paths import (
+    resolve_tokens_dir,
+    shared_tokens_dir,
+)
 from loom_tools.tokens.failure_counts import (
     DEFAULT_THRESHOLD,
     record_failure,
@@ -73,7 +77,9 @@ __all__ = [
     "record_success",
     "remove_from_allowlist",
     "reset_all",
+    "resolve_tokens_dir",
     "select_token",
+    "shared_tokens_dir",
     "threshold_reached",
     "write_allowlist",
 ]

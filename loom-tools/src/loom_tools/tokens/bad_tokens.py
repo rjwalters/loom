@@ -23,6 +23,17 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from loom_tools.tokens._locking import MkdirLock as _MkdirLock
+from loom_tools.tokens.paths import resolve_tokens_dir
+
+
+def _tokens_dir(workspace_path: Path | str) -> Path:
+    """Resolve the effective pool dir (per-repo, else shared) — issue #3938.
+
+    Routing every bad-token read/write through the shared resolver keeps the
+    ``.bad_tokens`` state file beside the ``*.token`` files that selection
+    actually picks, so it never forks between the per-repo and shared pools.
+    """
+    return resolve_tokens_dir(workspace_path)
 
 
 def _bad_tokens_path(tokens_dir: Path) -> Path:
@@ -58,7 +69,7 @@ def mark_bad(workspace_path: Path | str, token_name: str, reason: str) -> None:
         FileNotFoundError: If ``.loom/tokens/`` does not exist.
     """
     workspace_path = Path(workspace_path)
-    tokens_dir = workspace_path / ".loom" / "tokens"
+    tokens_dir = _tokens_dir(workspace_path)
     if not tokens_dir.is_dir():
         raise FileNotFoundError(f"Tokens dir does not exist: {tokens_dir}")
 
@@ -83,7 +94,7 @@ def is_bad(workspace_path: Path | str, token_name: str) -> bool:
         token_name: Token basename to look up.
     """
     workspace_path = Path(workspace_path)
-    bad_file = _bad_tokens_path(workspace_path / ".loom" / "tokens")
+    bad_file = _bad_tokens_path(_tokens_dir(workspace_path))
     if not bad_file.is_file():
         return False
     try:
@@ -107,7 +118,7 @@ def cleanup_bad_tokens(
         Number of entries retained after pruning.
     """
     workspace_path = Path(workspace_path)
-    tokens_dir = workspace_path / ".loom" / "tokens"
+    tokens_dir = _tokens_dir(workspace_path)
     bad_file = _bad_tokens_path(tokens_dir)
     if not bad_file.is_file():
         return 0

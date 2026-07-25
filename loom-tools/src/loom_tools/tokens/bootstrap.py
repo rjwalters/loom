@@ -444,6 +444,7 @@ def bootstrap_tokens(
     home_env_path: Path | None | object = _HOME_UNSET,
     force: bool = False,
     dry_run: bool = False,
+    tokens_dir: Path | None = None,
 ) -> BootstrapResult:
     """Bootstrap ``.loom/tokens/`` from the merged account sources (#3695, #3698).
 
@@ -476,6 +477,13 @@ def bootstrap_tokens(
             fingerprint matches are left alone.
         dry_run: When ``True``, no files are written; the result lists what
             *would* change (and the effective merged set with provenance).
+        tokens_dir: Optional override for the *destination* pool directory. When
+            ``None`` (default) the pool is written to ``<repo>/.loom/tokens``
+            (unchanged behavior). Pass a directory (e.g. the shared
+            machine-level pool ``~/.loom/tokens``) to materialize a pool shared
+            across every repo the daemon dispatches into (issue #3938). Only the
+            write target changes; account *sources* are resolved exactly as
+            before.
 
     Returns:
         :class:`BootstrapResult` summarising the operation. ``.effective``
@@ -488,7 +496,10 @@ def bootstrap_tokens(
             filename (they would clobber each other on disk).
     """
     paths = LoomPaths(repo_root)
-    tokens_dir = paths.loom_dir / "tokens"
+    # Destination pool dir: the repo-local pool by default, or an explicit
+    # override (e.g. the shared machine-level pool for `--shared`, issue #3938).
+    if tokens_dir is None:
+        tokens_dir = paths.loom_dir / "tokens"
     index_path = tokens_dir / "index.json"
 
     # Resolve the sources. `home_env_path` uses a sentinel so an explicit
