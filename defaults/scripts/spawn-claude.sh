@@ -326,6 +326,19 @@ PY
     log_info "spawn-claude: using OAuth account '$_name' (mode=$_mode)"
 fi
 
+# --- Print-mode background-task wait ceiling (issue #3943) ---
+# When the daemon spawns a sweep child as a headless `claude -p "/loom:sweep N"`
+# session, the Claude Code harness (print mode) terminates still-running
+# background tasks — the sweep's dispatched Builder/Judge subagents — after a
+# 600s ceiling and exits the session. Any role phase taking >10 minutes is
+# killed mid-build, causing loom:building<->loom:issue label ping-pong. Disable
+# the ceiling (0 = no cap) so long-running phases run to completion. This is
+# harmless for interactive use (no background-task reaping there). Use the
+# `:=` default-assignment idiom so an operator override — e.g. a non-zero
+# ceiling exported in the environment — is preserved.
+: "${CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS:=0}"
+export CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS
+
 # --- Dispatch ---
 if [[ "$USE_WRAPPER" == "true" ]]; then
     _wrapper="${WORKSPACE}/.loom/scripts/claude-wrapper.sh"
