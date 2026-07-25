@@ -943,11 +943,112 @@ async fn handle_status_command(json: bool) -> Result<()> {
     Ok(())
 }
 
+/// The capacity figures the whole status view shares, resolved from a single
+/// source so the summary, the healthy-tokens cap input, and the per-token table
+/// never contradict each other (issue #3936).
+///
+/// Preference order:
+/// 1. **fresh probe** — when a client-side `loom-tokens check --json` succeeded
+///    (the *same* data that renders the per-token table), the health counts are
+///    derived from it via [`loom_daemon::capacity::summarize_probe`], applying
+///    the near-ceiling threshold uniformly. This is the accurate *current*
+///    capacity and matches the table row-for-row.
+/// 2. **daemon ranking** — when no fresh probe is available but the daemon
+///    reported a parsed `.loom/tokens/.ranking`, fall back to its snapshot.
+/// 3. **raw pool** — no probe and no ranking: the pre-#3902 flat pool basis.
+struct ResolvedCapacity {
+    /// Where the figures came from — one of `"probe"`, `"ranking"`, `"pool"`.
+    source: &'static str,
+    /// Whether any account-health data (probe or ranking) was available.
+    ranking_present: bool,
+    total: usize,
+    healthy: usize,
+    exhausted: usize,
+    /// Health-adjusted token axis (healthy accounts, or the raw pool as a
+    /// fallback) — the "healthy tokens" input to the dynamic concurrency cap.
+    token_axis_limit: usize,
+    /// The effective dynamic cap consistent with `token_axis_limit`:
+    /// `min(token_axis_limit, disk_headroom, configured_max)`.
+    effective_cap: usize,
+    /// Whether the token axis is the binding (minimum) constraint.
+    token_bound: bool,
+}
+
+/// Resolve the shared capacity figures for a status render (#3936). Prefers the
+/// fresh client-side probe over the daemon's possibly-stale ranking snapshot so
+/// the summary count, the cap's healthy-tokens input, and the per-token table
+/// all agree.
+fn resolve_capacity(
+    report: &DaemonStatusReport,
+    token_usage: Option<&serde_json::Value>,
+) -> ResolvedCapacity {
+    // Tier 1: fresh probe — the same source as the per-token table.
+    if let Some(usage) = token_usage {
+        if let Some(accounts) = usage.get("accounts").and_then(serde_json::Value::as_array) {
+            let pairs: Vec<(&str, Option<f64>)> = accounts
+                .iter()
+                .map(|a| {
+                    let status = a
+                        .get("status")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("?");
+                    let util_7d = a.get("7d_utilization").and_then(serde_json::Value::as_f64);
+                    (status, util_7d)
+                })
+                .collect();
+            let cap = loom_daemon::capacity::summarize_probe(pairs.iter().copied());
+            let token_axis_limit = cap.healthy;
+            let effective_cap = token_axis_limit
+                .min(report.disk_headroom)
+                .min(report.configured_max);
+            let token_bound = token_axis_limit <= report.disk_headroom
+                && token_axis_limit <= report.configured_max;
+            return ResolvedCapacity {
+                source: "probe",
+                ranking_present: true,
+                total: cap.total,
+                healthy: cap.healthy,
+                exhausted: cap.exhausted,
+                token_axis_limit,
+                effective_cap,
+                token_bound,
+            };
+        }
+    }
+
+    // Tier 2: daemon-reported ranking snapshot.
+    if report.capacity.ranking_present {
+        return ResolvedCapacity {
+            source: "ranking",
+            ranking_present: true,
+            total: report.capacity.total_accounts,
+            healthy: report.capacity.healthy_accounts,
+            exhausted: report.capacity.exhausted_accounts,
+            token_axis_limit: report.capacity.token_axis_limit,
+            effective_cap: report.dynamic_cap,
+            token_bound: report.capacity.token_bound,
+        };
+    }
+
+    // Tier 3: no probe, no ranking — raw pool basis (pre-#3902 behavior).
+    ResolvedCapacity {
+        source: "pool",
+        ranking_present: false,
+        total: report.token_pool_size,
+        healthy: 0,
+        exhausted: 0,
+        token_axis_limit: report.token_pool_size,
+        effective_cap: report.dynamic_cap,
+        token_bound: report.capacity.token_bound,
+    }
+}
+
 /// Emit the combined status (daemon report + per-token usage) as JSON.
 fn print_status_json(
     report: &DaemonStatusReport,
     token_usage: Option<&serde_json::Value>,
 ) -> Result<()> {
+    let rc = resolve_capacity(report, token_usage);
     let combined = serde_json::json!({
         "in_flight_count": report.in_flight.len(),
         "in_flight": report.in_flight,
@@ -955,15 +1056,16 @@ fn print_status_json(
             "token_pool_size": report.token_pool_size,
             "disk_headroom": report.disk_headroom,
             "configured_max": report.configured_max,
-            "effective": report.dynamic_cap,
+            "effective": rc.effective_cap,
         },
         "capacity": {
-            "ranking_present": report.capacity.ranking_present,
-            "total_accounts": report.capacity.total_accounts,
-            "healthy_accounts": report.capacity.healthy_accounts,
-            "exhausted_accounts": report.capacity.exhausted_accounts,
-            "token_axis_limit": report.capacity.token_axis_limit,
-            "token_bound": report.capacity.token_bound,
+            "source": rc.source,
+            "ranking_present": rc.ranking_present,
+            "total_accounts": rc.total,
+            "healthy_accounts": rc.healthy,
+            "exhausted_accounts": rc.exhausted,
+            "token_axis_limit": rc.token_axis_limit,
+            "token_bound": rc.token_bound,
         },
         "main_health_gate": {
             "halted": report.main_health_gate_halted,
@@ -1003,22 +1105,44 @@ fn print_status_human(report: &DaemonStatusReport, token_usage: Option<&serde_js
         }
     }
 
-    println!("\nDynamic concurrency cap: {}", report.dynamic_cap);
+    // Capacity figures resolved from a single source (fresh probe when
+    // available, else the daemon's ranking snapshot) so the cap's healthy-tokens
+    // input, the Token-capacity summary, and the Per-token table all agree (#3936).
+    let rc = resolve_capacity(report, token_usage);
+
+    println!("\nDynamic concurrency cap: {}", rc.effective_cap);
     println!(
         "  = min(healthy tokens {}, disk headroom {}, configured max {})",
-        report.capacity.token_axis_limit, report.disk_headroom, report.configured_max
+        rc.token_axis_limit, report.disk_headroom, report.configured_max
     );
 
-    // Token-capacity backpressure section (#3902).
-    let cap = &report.capacity;
+    // Token-capacity backpressure section (#3902, source-unified in #3936).
     println!("\nToken capacity:");
-    if cap.ranking_present {
+    if rc.ranking_present {
+        let src = if rc.source == "probe" {
+            "live probe: loom-tokens check --json"
+        } else {
+            "from .loom/tokens/.ranking"
+        };
         println!(
-            "  {}/{} accounts healthy, {} exhausted/near-ceiling (from .loom/tokens/.ranking)",
-            cap.healthy_accounts, cap.total_accounts, cap.exhausted_accounts
+            "  {}/{} accounts healthy, {} exhausted/near-ceiling ({src})",
+            rc.healthy, rc.total, rc.exhausted
         );
-        if cap.token_bound {
-            if cap.healthy_accounts == 0 {
+        // When a fresh probe disagrees with the daemon's ranking-based cap, the
+        // ranking is stale — the daemon may still be dispatching against the old
+        // (higher) count. Surface it so the operator re-probes (#3936).
+        if rc.source == "probe"
+            && report.capacity.ranking_present
+            && report.capacity.healthy_accounts != rc.healthy
+        {
+            println!(
+                "  note: daemon dispatch cap still uses a stale .ranking ({} healthy); \
+                 refresh it with `loom-tokens check --ranking`.",
+                report.capacity.healthy_accounts
+            );
+        }
+        if rc.token_bound {
+            if rc.healthy == 0 {
                 println!(
                     "  token-bound: NO healthy accounts — new dispatch deferred until capacity \
                      returns. Add accounts (~/.claude-monitor/accounts.env + `loom-tokens \
@@ -1104,10 +1228,16 @@ fn print_token_usage_table(value: &serde_json::Value) {
             .get("name")
             .and_then(serde_json::Value::as_str)
             .unwrap_or("?");
-        let status = acct
+        let raw_status = acct
             .get("status")
             .and_then(serde_json::Value::as_str)
             .unwrap_or("?");
+        let util_7d = acct
+            .get("7d_utilization")
+            .and_then(serde_json::Value::as_f64);
+        // Apply the same near-ceiling override the summary uses so a 99%-7d
+        // `available` row never renders `available` here (#3936).
+        let status = loom_daemon::capacity::effective_probe_status(raw_status, util_7d);
         let fmt_pct = |key: &str| {
             acct.get(key)
                 .and_then(serde_json::Value::as_f64)
