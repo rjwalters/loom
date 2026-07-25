@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.15.0] - 2026-07-24
+
+### Summary
+
+Minor release headlined by **multi-repo daemon support** — one `loom-daemon` per machine now manages many repos (epic #3835, #3926 phases a–d): a machine-level workspace registry with CLI + IPC surface, work-finder + epic-supervisor fan-out across all registered workspaces, `(repo, issue)`-aware sweep visibility over IPC/MCP, and a per-repo status breakdown with a per-repo main-health gate. Also lands sweep detect-and-warn for out-of-set dependency references and consumer-install fixes for the machine-level daemon binary.
+
+### Added
+
+- **Machine-level workspace registry** (#3926 phase a, #3931) — `~/.loom/workspaces.json` with `loom-daemon workspace add|remove|list` CLI + IPC surface and `WorkspaceRegistry::effective_roots()` (empty registry ⇒ the daemon's own cwd workspace, unchanged).
+- **Multi-repo work-finder + epic supervisor** (#3928, #3932) — both autonomous loops fan out over every registered workspace via a new `WorkspacePool` (one `SweepRegistry` per repo root; unified in-flight dedup + reaper), dispatching each sweep into the correct repo's working tree, with a **single global concurrency budget** (occupancy summed across repos) and per-repo error isolation; workspace `add`/`remove` is hot-applied each tick.
+- **`(repo, issue)`-aware sweep visibility** (#3929, #3933) — optional `workspace_root` on the five sweep IPC/MCP tools (`dispatch_sweep`, `list_sweeps`, `get_sweep_status`, `tail_sweep_log`, `cancel_sweep`; omitted ⇒ today's default-workspace behavior), a `repo` field on `SweepInfo` and the four `sweep.issue.{N}.*` event payloads (frozen topic strings untouched), and `WorkspacePool::evict()` wired to workspace deregistration (reaper aborted, default workspace guarded).
+- **Per-repo status breakdown + per-repo main-health gate** (#3930, #3934) — `loom-daemon status` enumerates all managed repos (`DaemonStatusReport.per_repo`: workspaces, in-flight per repo, per-repo gate state), and the main-health gate evaluates each registered repo's `main` independently so a red repo halts only its own dispatch (its in-flight sweeps still count against the shared global budget). Opt-in semantics unchanged (`LOOM_MAIN_HEALTH_GATE` / `autonomous.mainHealthGate`, env > config > default).
+- **Sweep: detect-and-warn for out-of-set dependency references** (#3747 v2 item 4, #3927) — advisory warnings when a candidate's body declares `Depends on`/`Requires`/`Part of` against an open issue outside the sweep's candidate set; detection-only, never auto-expands the set.
+
+### Fixed
+
+- **Consumer installs provision the machine-level `loom-daemon` binary** (#3922, #3925) — autonomous daemon mode can start post-install in consumer repos.
+- **Post-install guidance names shipped daemon surfaces** (#3923, #3924) — no longer points at the removed `daemon.sh`.
+
 ## [0.14.0] - 2026-07-23
 
 ### Summary
