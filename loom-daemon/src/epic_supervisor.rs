@@ -1336,11 +1336,31 @@ pub mod forge {
 
     impl EpicDispatcher for SpawnDispatcher {
         fn dispatch_role(&mut self, epic: u32, shape: &DispatchShape) -> Result<()> {
+            // Autonomous dispatch model (issue #3944): pin an EXPLICIT,
+            // non-premium model so this auto-dispatched role process never
+            // inherits the operator's interactive CLI default. Resolved from the
+            // registry's workspace root (`autonomous.model` config > shipped
+            // default); no per-dispatch override tier here.
+            let repo_root = {
+                let reg = self
+                    .registry
+                    .lock()
+                    .map_err(|e| anyhow!("sweep registry mutex poisoned: {e}"))?;
+                reg.config().workspace_root.clone()
+            };
+            let (model, source) = crate::sweep_registry::resolve_dispatch_model(&repo_root, None);
+            log::info!(
+                "epic_supervisor: dispatching {} for epic #{epic} with model={model} (source={})",
+                shape.role,
+                source.as_str()
+            );
             // Spawn-and-wait: the burst must complete before we return so the
             // supervisor's #3707 guard genuinely serializes it.
             let mut cmd = Command::new(&self.spawn_bin);
             cmd.arg("-p")
                 .arg(&shape.prompt)
+                .arg("--model")
+                .arg(&model)
                 .arg("--dangerously-skip-permissions")
                 .stdin(Stdio::null())
                 .stdout(Stdio::null())
@@ -1366,10 +1386,21 @@ pub mod forge {
                 .registry
                 .lock()
                 .map_err(|e| anyhow!("sweep registry mutex poisoned: {e}"))?;
+            // Autonomous dispatch model (issue #3944): resolve an EXPLICIT
+            // non-premium model (`autonomous.model` config > shipped default) so
+            // the epic child never inherits the operator's interactive CLI
+            // default. No per-dispatch override tier here.
+            let repo_root = reg.config().workspace_root.clone();
+            let (model, source) = crate::sweep_registry::resolve_dispatch_model(&repo_root, None);
+            log::info!(
+                "epic_supervisor: dispatching child #{child} for epic #{_epic} with \
+                 model={model} (source={})",
+                source.as_str()
+            );
             // Idempotency key + the registry's claim lock make a re-dispatch of
             // an already-running child a no-op.
             let key = format!("epic-child-{child}");
-            reg.dispatch(&SweepKind::Issue(child), Some(key), None, None, None)
+            reg.dispatch(&SweepKind::Issue(child), Some(key), Some(&model), None, None)
                 .map(|_| ())
         }
     }

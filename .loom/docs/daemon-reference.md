@@ -793,6 +793,7 @@ concurrency ceiling 5" and share it with the team:
 ```json
 {
   "autonomous": {
+    "model": "sonnet",
     "workFinder": {
       "enabled": true,
       "intervalSecs": 60,
@@ -823,6 +824,7 @@ exactly like `main_health_gate::read_build_gate_config`.
 
 | Config key | Env override | Default | Notes |
 |------------|--------------|---------|-------|
+| `autonomous.model` | *(per-dispatch `dispatch_sweep` `model` param)* | `sonnet` | Model pinned on **every** daemon-dispatched child (work-finder, epic supervisor, and `dispatch_sweep` when its `model` param is absent). See below (#3944) |
 | `autonomous.workFinder.enabled` | `LOOM_WORK_FINDER` | `false` | Master on/off for the finder loop |
 | `autonomous.workFinder.intervalSecs` | `LOOM_WORK_FINDER_INTERVAL_SECS` | `60` | Zero/invalid → default |
 | `autonomous.workFinder.maxConcurrent` | `LOOM_WORK_FINDER_MAX_CONCURRENT` | `3` | Operator **ceiling**, not a fixed target |
@@ -833,6 +835,30 @@ exactly like `main_health_gate::read_build_gate_config`.
 | `autonomous.watchdog.intervalSecs` | `LOOM_SWEEP_WATCHDOG_INTERVAL_SECS` | `30` | Watchdog probe cadence (shared by all three backstops) |
 | `autonomous.watchdog.reviewStall` | `LOOM_SWEEP_REVIEW_STALL` | `true` | Review-phase stall watchdog on/off (#3910) |
 | `autonomous.watchdog.reviewStallTimeoutSecs` | `LOOM_SWEEP_REVIEW_STALL_TIMEOUT_SECS` | `2700` | Log-silence window before a hung Judge/Doctor sweep is re-dispatched |
+
+**Autonomous dispatch model (`autonomous.model`, #3944).** A daemon-dispatched
+child is a headless `claude -p "/loom:sweep N"` process. Without an explicit
+`--model`, it inherits whatever model the operator last configured in their
+**interactive** CLI — which on the v0.15.0 canary was a premium tier that meters
+premium usage credits and hard-failed every spawn with "out of usage credits". To
+stop an autonomous fleet from ever silently inheriting a premium interactive
+default, the daemon now pins an explicit model on **every** auto-dispatch
+(work-finder sweeps, epic-supervisor role/child dispatches) and on
+`dispatch_sweep` when its `model` param is absent. The resolved model is chosen by
+this precedence, highest first:
+
+1. **`dispatch_sweep` `model` param** — an explicit per-dispatch request always
+   wins (unchanged from #3477).
+2. **`autonomous.model`** in `.loom/config.json` — the per-repo default for all
+   autonomous dispatch.
+3. **Shipped default `sonnet`** — a deliberately **non-premium** tier (fast +
+   cost-appropriate for the bulk of build work). Never a premium tier.
+
+Empty/whitespace values are treated as unset at every tier. The resolved model
+and the tier that supplied it are named in the daemon dispatch log line
+(`… model=<m> (source=param|config|default)`), and the model is forwarded to the
+child via the existing `--model` plumbing (#3705). Set `autonomous.model` to
+`opus` (or any valid model id) to raise the autonomous default per-repo.
 
 **Startup-race mitigation (#3887).** Rapid back-to-back dispatch (the work
 finder draining a backlog in one tick) could wedge some `claude` children at
