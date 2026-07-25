@@ -33,6 +33,7 @@ pub mod terminal;
 pub mod tokens;
 pub mod types;
 pub mod work_finder;
+pub mod workspace_pool;
 pub mod workspace_registry;
 pub mod worktree_root;
 

@@ -85,6 +85,8 @@ use crate::event_bus::EventBus;
 use crate::main_health_gate::MainHealthState;
 use crate::tokens::token_pool_size;
 use crate::types::Event;
+use crate::workspace_pool::WorkspacePool;
+use crate::workspace_registry::WorkspaceRegistry;
 
 // ============================================================================
 // Constants
@@ -311,6 +313,107 @@ pub fn tick(
     }
 
     Ok(report)
+}
+
+/// Run one **multi-workspace** work-finder tick across N `(source, dispatcher)`
+/// pairs — one per registered workspace (#3928) — sharing a **single global**
+/// concurrency budget.
+///
+/// This is the multi-repo generalization of [`tick`]. Three properties are
+/// load-bearing (and directly map to the issue's acceptance criteria):
+///
+/// 1. **Single global budget.** The occupancy seed is the *sum* of every
+///    dispatcher's in-flight sweeps, and `occupancy` is incremented across
+///    workspace boundaries, so the combined dispatches of all workspaces in one
+///    tick never exceed `max_concurrent`. The token pool and scratch volume the
+///    cap protects are machine-level, so the budget must be shared, not
+///    replicated per repo.
+/// 2. **Per-workspace error isolation.** A source (`list_ready_issues`) failure
+///    for one workspace is logged and counted in [`TickReport::errors`], then the
+///    loop **continues** to the next workspace — one repo's bad auth / deleted
+///    remote / forge outage never blocks the others.
+/// 3. **Empty-registry equivalence.** With a single workspace (the empty-registry
+///    fallback), this reduces to the same schedule [`tick`] produces, so wiring
+///    it in for N=1 preserves the pre-#3928 behavior.
+///
+/// Unlike [`tick`], a source error is **not** propagated (there is no single
+/// caller to retry — the other workspaces must still run); it is folded into the
+/// returned [`TickReport`].
+pub fn tick_multi<S: WorkSource, D: WorkDispatcher>(
+    workspaces: &mut [(S, D)],
+    max_concurrent: usize,
+    halted: bool,
+) -> TickReport {
+    let mut report = TickReport::default();
+
+    // Snapshot per-workspace in-flight sets *first* (immutable borrow) so the
+    // global occupancy seed is the sum across all workspaces before any dispatch.
+    let in_flights: Vec<HashSet<u32>> = workspaces.iter().map(|(_, d)| d.in_flight()).collect();
+    let mut occupancy: usize = in_flights.iter().map(HashSet::len).sum();
+
+    // Reactive backstop: a red `main` halts all new dispatch this tick. We still
+    // poll each source so `seen` reflects the combined backlog for logging.
+    if halted {
+        report.halted = true;
+        for (source, _) in workspaces.iter_mut() {
+            match source.list_ready_issues() {
+                Ok(items) => report.seen += items.len(),
+                Err(e) => {
+                    report.errors += 1;
+                    log::warn!("work_finder: (halted) listing ready issues failed: {e}");
+                }
+            }
+        }
+        return report;
+    }
+
+    for (idx, (source, dispatcher)) in workspaces.iter_mut().enumerate() {
+        let ready = match source.list_ready_issues() {
+            Ok(r) => r,
+            Err(e) => {
+                // Per-workspace isolation: log, count, and move on — the other
+                // workspaces are still polled and dispatched this same tick.
+                report.errors += 1;
+                log::warn!("work_finder: listing ready issues for workspace #{idx} failed: {e}");
+                continue;
+            }
+        };
+        report.seen += ready.len();
+        let in_flight = &in_flights[idx];
+
+        for item in ready {
+            if item.is_skipped() {
+                report.skipped_labeled += 1;
+                continue;
+            }
+            if in_flight.contains(&item.number) {
+                report.skipped_in_flight += 1;
+                continue;
+            }
+            // Shared global cap across all workspaces — defer once the combined
+            // occupancy hits the budget, regardless of which workspace still has
+            // ready items.
+            if occupancy >= max_concurrent {
+                report.deferred_capacity += 1;
+                continue;
+            }
+            match dispatcher.dispatch(item.number) {
+                Ok(true) => {
+                    report.dispatched += 1;
+                    occupancy += 1;
+                }
+                Ok(false) => {
+                    report.skipped_in_flight += 1;
+                }
+                Err(e) => {
+                    report.errors += 1;
+                    log::warn!("work_finder: dispatch for issue #{} failed: {e}", item.number);
+                }
+            }
+        }
+    }
+
+    report
 }
 
 // ============================================================================
@@ -620,6 +723,140 @@ where
     })
 }
 
+/// Spawn the **multi-workspace** work-finder loop (#3928) on the shared daemon
+/// runtime.
+///
+/// This is the multi-repo replacement for [`spawn_work_finder_task`]. Every
+/// tick it:
+///
+/// 1. Re-reads the machine-level [`WorkspaceRegistry`] and resolves
+///    [`effective_roots`](WorkspaceRegistry::effective_roots) against
+///    `fallback_root` — an **empty** registry yields `vec![fallback_root]`
+///    (today's single-workspace behavior); a populated one yields the registered
+///    roots. Re-reading each tick means `loom-daemon workspace add|remove` is
+///    hot-applied without a daemon restart.
+/// 2. Builds one `(GhWorkSource, RegistryDispatcher)` pair per root — the source
+///    scoped to that repo via [`GhWorkSource::for_root`], the dispatcher over
+///    that root's own [`SweepRegistry`](crate::sweep_registry::SweepRegistry)
+///    from the shared [`WorkspacePool`] (so each sweep spawns with `current_dir`
+///    set to its own repo root, and `.loom/locks` / `.loom/logs` /
+///    `.loom/sweep-checkpoint` are correctly scoped).
+/// 3. Runs one [`tick_multi`] with the **single global** dynamic cap.
+///
+/// The dynamic cap inputs (token pool, disk headroom) are **machine-level**
+/// resources, so they are probed once per tick from `fallback_root` (the
+/// daemon's primary workspace) and the resulting cap is a single global budget
+/// shared across every workspace — never replicated per repo.
+///
+/// # Known limitation (documented tradeoff, deferred to phase c #3929)
+///
+/// The event-bus `sweep.issue.{N}.*` topics are keyed by issue number only
+/// (frozen taxonomy). Two repos that each have an open issue #N publish on the
+/// same topic string. This is an accepted, documented limitation for phase b;
+/// the `(repo, issue)` key that disambiguates them is phase c (#3929). No new
+/// topic shape is introduced here (CLAUDE.md: "New topics require a follow-up
+/// issue").
+pub fn spawn_multi_work_finder_task(
+    pool: Arc<WorkspacePool>,
+    fallback_root: PathBuf,
+    interval: Duration,
+    configured_max: usize,
+    health_state: Arc<MainHealthState>,
+    event_bus: Arc<EventBus>,
+) -> tokio::task::JoinHandle<()> {
+    log::info!(
+        "work_finder: starting multi-workspace loop (interval={}s, configured_max={configured_max}, \
+         dynamic cap = min(healthy tokens, disk, configured_max), global across workspaces)",
+        interval.as_secs()
+    );
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(interval);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        // First tick fires immediately; skip it so we don't churn at boot.
+        ticker.tick().await;
+        let mut was_halted = false;
+        let mut was_pressured = false;
+        loop {
+            ticker.tick().await;
+            let halted = health_state.is_halted();
+
+            // Dynamic cap from live *machine-level* inputs (one token pool, one
+            // scratch volume) probed from the daemon's primary workspace.
+            let pool_size = token_pool_size(&fallback_root);
+            let ranking = capacity::read_ranking(&fallback_root);
+            let token_limit = ranking.as_ref().map_or(pool_size, |r| r.available);
+            let disk = disk_headroom_limit(&fallback_root);
+            let max_concurrent = resolve_dynamic_max_concurrent(token_limit, disk, configured_max);
+
+            // Resolve the current set of workspaces fresh each tick so registry
+            // edits are hot-applied.
+            let roots = WorkspaceRegistry::load_default()
+                .unwrap_or_else(|e| {
+                    log::warn!("work_finder: could not load workspace registry ({e}); using cwd");
+                    WorkspaceRegistry::default()
+                })
+                .effective_roots(&fallback_root);
+
+            let mut pairs: Vec<(GhWorkSource, RegistryDispatcher)> = roots
+                .iter()
+                .map(|root| {
+                    let registry = pool.get_or_provision(root);
+                    (GhWorkSource::for_root(root), RegistryDispatcher::new(registry))
+                })
+                .collect();
+
+            log::debug!(
+                "work_finder: dynamic cap = {max_concurrent} (pool={pool_size}, \
+                 healthy_tokens={token_limit}, disk={disk}, configured_max={configured_max}, \
+                 halted={halted}, workspaces={})",
+                pairs.len()
+            );
+
+            let report = tick_multi(&mut pairs, max_concurrent, halted);
+
+            if report.halted && !was_halted {
+                log::warn!(
+                    "work_finder: main-health gate halted dispatch — {} ready issue(s) held \
+                     until main is green again",
+                    report.seen
+                );
+            } else if !report.halted && was_halted {
+                log::info!("work_finder: main-health gate cleared — resuming dispatch");
+            }
+            was_halted = report.halted;
+
+            if report.dispatched > 0 || report.errors > 0 {
+                log::info!(
+                    "work_finder: tick — cap {max_concurrent} (pool={pool_size}, \
+                     healthy={token_limit}, disk={disk}, ceiling={configured_max}); {} workspace(s), \
+                     {} seen, {} dispatched, {} labeled-skip, {} in-flight-skip, {} deferred, \
+                     {} error(s)",
+                    pairs.len(),
+                    report.seen,
+                    report.dispatched,
+                    report.skipped_labeled,
+                    report.skipped_in_flight,
+                    report.deferred_capacity,
+                    report.errors
+                );
+            }
+
+            if !report.halted {
+                let assessment = capacity::assess_pressure(
+                    ranking.as_ref(),
+                    pool_size,
+                    token_limit,
+                    disk,
+                    configured_max,
+                    report.deferred_capacity,
+                    capacity::DEFAULT_ADVISORY_MIN_QUEUED,
+                );
+                was_pressured = emit_capacity_transition(&event_bus, was_pressured, &assessment);
+            }
+        }
+    })
+}
+
 /// Emit the add-capacity advisory / recovery on a token-pressure **state
 /// change** and return the new pressured state. A no-op (returns `was_pressured`
 /// unchanged) when the state is stable, so the operator sees one advisory on the
@@ -684,7 +921,7 @@ pub mod forge {
     use anyhow::{anyhow, Context, Result};
     use serde::Deserialize;
     use std::collections::HashSet;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use std::process::{Command, Stdio};
     use std::sync::{Arc, Mutex};
 
@@ -706,6 +943,12 @@ pub mod forge {
     pub struct GhWorkSource {
         gh_bin: PathBuf,
         repo: Option<String>,
+        /// Working directory the `gh` query runs in. When set (multi-workspace
+        /// fan-out, #3928) `gh` auto-detects the repo from that root's git
+        /// remote, so each registered workspace is polled against its own repo
+        /// without a single machine-global `LOOM_REPO`. `None` keeps today's
+        /// behavior (inherit the daemon's cwd).
+        cwd: Option<PathBuf>,
     }
 
     impl GhWorkSource {
@@ -716,6 +959,22 @@ pub mod forge {
             Self {
                 gh_bin: PathBuf::from("gh"),
                 repo: std::env::var("LOOM_REPO").ok(),
+                cwd: None,
+            }
+        }
+
+        /// Construct a source scoped to a specific workspace `root` (#3928): the
+        /// `gh` query runs with `current_dir(root)` so it targets that repo's own
+        /// remote. `LOOM_REPO`, when set, is still honored as a machine-global
+        /// `--repo` override (preserving the single-workspace behavior
+        /// byte-for-byte); in a genuine multi-repo deployment it is left unset so
+        /// each root's cwd selects its repo.
+        #[must_use]
+        pub fn for_root(root: &Path) -> Self {
+            Self {
+                gh_bin: PathBuf::from("gh"),
+                repo: std::env::var("LOOM_REPO").ok(),
+                cwd: Some(root.to_path_buf()),
             }
         }
 
@@ -748,6 +1007,9 @@ pub mod forge {
                 .arg("number,labels");
             if let Some(ref repo) = self.repo {
                 cmd.arg("--repo").arg(repo);
+            }
+            if let Some(ref cwd) = self.cwd {
+                cmd.current_dir(cwd);
             }
             cmd.stderr(Stdio::piped());
             let out = cmd
@@ -1062,6 +1324,124 @@ mod tests {
         assert!(!resumed.halted);
         assert_eq!(resumed.dispatched, 3);
         assert_eq!(disp.dispatched, vec![1, 2, 3]);
+    }
+
+    // ===================================================================
+    // tick_multi — multi-workspace fan-out (#3928)
+    // ===================================================================
+
+    fn err_source(msg: &'static str) -> FakeSource {
+        let mut results = std::collections::VecDeque::new();
+        results.push_back(Err(anyhow::anyhow!(msg)));
+        FakeSource { results }
+    }
+
+    #[test]
+    fn test_tick_multi_single_workspace_matches_single_tick() {
+        // Empty-registry equivalence: one workspace behaves exactly like tick().
+        let mut multi =
+            vec![(FakeSource::once((1..=3).map(issue).collect()), RecordingDispatcher::default())];
+        let report = tick_multi(&mut multi, 10, false);
+        assert_eq!(report.seen, 3);
+        assert_eq!(report.dispatched, 3);
+        assert_eq!(report.deferred_capacity, 0);
+        assert_eq!(multi[0].1.dispatched, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn test_tick_multi_routes_to_correct_workspace() {
+        // Two workspaces, each with its own ready set — dispatch must route to
+        // the matching dispatcher, not aggregate onto one.
+        let mut multi = vec![
+            (FakeSource::once(vec![issue(1), issue(2)]), RecordingDispatcher::default()),
+            (FakeSource::once(vec![issue(10), issue(11)]), RecordingDispatcher::default()),
+        ];
+        let report = tick_multi(&mut multi, 10, false);
+        assert_eq!(report.seen, 4);
+        assert_eq!(report.dispatched, 4);
+        assert_eq!(multi[0].1.dispatched, vec![1, 2], "workspace 0 dispatches its own issues");
+        assert_eq!(multi[1].1.dispatched, vec![10, 11], "workspace 1 dispatches its own issues");
+    }
+
+    #[test]
+    fn test_tick_multi_shared_global_cap_across_workspaces() {
+        // Cap 3 shared across TWO workspaces each holding 5 ready issues: the
+        // COMBINED dispatch count is exactly 3, never 3-per-workspace (the token
+        // pool / scratch volume are machine-level, so the budget is global).
+        let mut multi = vec![
+            (FakeSource::once((1..=5).map(issue).collect()), RecordingDispatcher::default()),
+            (FakeSource::once((10..=14).map(issue).collect()), RecordingDispatcher::default()),
+        ];
+        let report = tick_multi(&mut multi, 3, false);
+        let total: usize = multi.iter().map(|(_, d)| d.dispatched.len()).sum();
+        assert_eq!(report.dispatched, 3, "combined dispatch never exceeds the global cap");
+        assert_eq!(total, 3, "sum of per-workspace dispatches equals the global cap");
+        assert_eq!(report.deferred_capacity, 7, "the remaining 7 are deferred");
+    }
+
+    #[test]
+    fn test_tick_multi_existing_occupancy_is_summed_globally() {
+        // Workspace 0 already has 2 in-flight, workspace 1 has 1 in-flight;
+        // global occupancy is 3, cap is 4 ⇒ only 1 free slot across both.
+        let mut multi = vec![
+            (
+                FakeSource::once(vec![issue(1), issue(2)]),
+                RecordingDispatcher {
+                    in_flight: HashSet::from([100, 101]),
+                    ..Default::default()
+                },
+            ),
+            (
+                FakeSource::once(vec![issue(10), issue(11)]),
+                RecordingDispatcher {
+                    in_flight: HashSet::from([200]),
+                    ..Default::default()
+                },
+            ),
+        ];
+        let report = tick_multi(&mut multi, 4, false);
+        assert_eq!(report.dispatched, 1, "3 in-flight + cap 4 ⇒ 1 free slot globally");
+        assert_eq!(report.deferred_capacity, 3);
+        // The single free slot goes to the first workspace's first ready issue.
+        assert_eq!(multi[0].1.dispatched, vec![1]);
+        assert!(multi[1].1.dispatched.is_empty());
+    }
+
+    #[test]
+    fn test_tick_multi_one_workspace_errors_others_proceed() {
+        // Workspace 1's forge query fails; workspaces 0 and 2 must still be
+        // polled and dispatched in the same tick (per-repo error isolation).
+        let mut multi = vec![
+            (FakeSource::once(vec![issue(1), issue(2)]), RecordingDispatcher::default()),
+            (err_source("bad auth for repo B"), RecordingDispatcher::default()),
+            (FakeSource::once(vec![issue(30)]), RecordingDispatcher::default()),
+        ];
+        let report = tick_multi(&mut multi, 10, false);
+        assert_eq!(report.errors, 1, "the failing workspace is counted, not fatal");
+        assert_eq!(report.dispatched, 3, "the two healthy workspaces still dispatch");
+        assert_eq!(multi[0].1.dispatched, vec![1, 2]);
+        assert!(multi[1].1.dispatched.is_empty(), "the erroring workspace dispatched nothing");
+        assert_eq!(multi[2].1.dispatched, vec![30]);
+    }
+
+    #[test]
+    fn test_tick_multi_halted_dispatches_zero_across_workspaces() {
+        let mut multi = vec![
+            (FakeSource::once((1..=3).map(issue).collect()), RecordingDispatcher::default()),
+            (FakeSource::once((10..=12).map(issue).collect()), RecordingDispatcher::default()),
+        ];
+        let report = tick_multi(&mut multi, 10, true);
+        assert!(report.halted);
+        assert_eq!(report.seen, 6, "backlog across both workspaces is still observed");
+        assert_eq!(report.dispatched, 0, "zero dispatch while halted");
+        assert!(multi.iter().all(|(_, d)| d.dispatched.is_empty()));
+    }
+
+    #[test]
+    fn test_tick_multi_empty_workspace_set_is_noop() {
+        let mut multi: Vec<(FakeSource, RecordingDispatcher)> = vec![];
+        let report = tick_multi(&mut multi, 10, false);
+        assert_eq!(report, TickReport::default());
     }
 
     // ===================================================================

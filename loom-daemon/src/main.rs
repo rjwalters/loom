@@ -1,9 +1,8 @@
 use loom_daemon::activity::{self, ActivityDb, StatsQueries};
-use loom_daemon::epic_supervisor::{self, EpicSupervisor};
+use loom_daemon::epic_supervisor;
 use loom_daemon::event_bus::EventBus;
 use loom_daemon::health_monitor;
 use loom_daemon::ipc::IpcServer;
-use loom_daemon::issue_creation_mutex::IssueCreationMutex;
 use loom_daemon::main_health_gate;
 use loom_daemon::metrics_collector;
 use loom_daemon::role_validation;
@@ -11,6 +10,7 @@ use loom_daemon::sweep_registry::{self, SweepRegistry, SweepRegistryConfig};
 use loom_daemon::terminal::TerminalManager;
 use loom_daemon::types::{DaemonStatusReport, Request, Response, SweepKind};
 use loom_daemon::work_finder;
+use loom_daemon::workspace_pool::WorkspacePool;
 use loom_daemon::{extract_configured_terminal_ids, rotate_log_file};
 
 use anyhow::{anyhow, Result};
@@ -314,6 +314,19 @@ async fn main() -> Result<()> {
     let sweep_registry = Arc::new(Mutex::new(sweep));
     let _reaper_handle = sweep_registry::spawn_reaper_task(sweep_registry.clone());
 
+    // Multi-workspace sweep-registry pool (Issue #3928 — phase b of #3835/#3926).
+    // Both autonomous loops (work-finder + epic supervisor) share ONE pool so a
+    // given repo has exactly one `SweepRegistry` instance — unifying in-flight
+    // dedup and the reaper across both loops. The pool captures a handle to this
+    // shared daemon runtime so every provisioned registry's reaper runs here even
+    // when a workspace is first touched from the epic supervisor's OS thread. The
+    // default workspace is *seeded* with the registry constructed above (also used
+    // by the IPC `DispatchSweep` path), so the empty-registry case reuses it
+    // byte-for-byte rather than building a second instance.
+    let workspace_pool =
+        Arc::new(WorkspacePool::new(event_bus.clone(), tokio::runtime::Handle::current()));
+    workspace_pool.seed(sweep_workspace.clone(), sweep_registry.clone());
+
     // Startup watchdog (Issue #3887): auto-cancel + re-dispatch (once, bounded)
     // any daemon-dispatched sweep that hangs at startup with no progress. On by
     // default; disable with LOOM_SWEEP_WATCHDOG=0 or
@@ -362,29 +375,29 @@ async fn main() -> Result<()> {
     // the #3707 issue-creation mutex across the burst). Keeping that blocking
     // call off the shared runtime preserves the responsiveness of the event
     // bus, reaper, sweep registry, and IPC listener while a role process runs.
+    // Multi-workspace fan-out (#3928): the supervisor loop resolves
+    // `effective_roots()` each tick and drives one `EpicSupervisor` per registered
+    // workspace (empty registry ⇒ the single `sweep_workspace`, byte-for-byte).
+    // Per-root spawn-binary resolution now happens inside the loop thread, so no
+    // single up-front `resolve_spawn_bin()` gate is needed here.
     let supervisor_handle = if epic_supervisor::supervisor_enabled() {
-        match SweepRegistryConfig::new(sweep_workspace.clone()).resolve_spawn_bin() {
-            Ok(spawn_bin) => {
-                let source = epic_supervisor::forge::GhEpicSource::new();
-                let dispatcher =
-                    epic_supervisor::forge::SpawnDispatcher::new(spawn_bin, sweep_registry.clone());
-                let supervisor = EpicSupervisor::new(source, dispatcher, IssueCreationMutex::new())
-                    .with_event_bus(event_bus.clone())
-                    .with_health_gate(main_health_state.clone());
-                let interval = epic_supervisor::resolve_supervisor_interval();
-                match epic_supervisor::spawn_supervisor_thread(supervisor, interval) {
-                    Ok(handle) => {
-                        log::info!("epic_supervisor: enabled (interval={}s)", interval.as_secs());
-                        Some(handle)
-                    }
-                    Err(e) => {
-                        log::error!("epic_supervisor: failed to start loop thread: {e}");
-                        None
-                    }
-                }
+        let interval = epic_supervisor::resolve_supervisor_interval();
+        match epic_supervisor::spawn_multi_supervisor_thread(
+            workspace_pool.clone(),
+            sweep_workspace.clone(),
+            event_bus.clone(),
+            main_health_state.clone(),
+            interval,
+        ) {
+            Ok(handle) => {
+                log::info!(
+                    "epic_supervisor: enabled (multi-workspace, interval={}s)",
+                    interval.as_secs()
+                );
+                Some(handle)
             }
             Err(e) => {
-                log::warn!("epic_supervisor: enabled but spawn binary unavailable: {e}");
+                log::error!("epic_supervisor: failed to start loop thread: {e}");
                 None
             }
         }
@@ -423,20 +436,20 @@ async fn main() -> Result<()> {
     let work_finder_config = work_finder::read_work_finder_config(&sweep_workspace);
 
     let _work_finder_handle = if work_finder::resolve_enabled(&work_finder_config) {
-        let source = work_finder::GhWorkSource::new();
-        let dispatcher = work_finder::RegistryDispatcher::new(sweep_registry.clone());
         let interval = work_finder::resolve_interval_with_config(&work_finder_config);
         let configured_max = work_finder::resolve_max_concurrent_with_config(&work_finder_config);
         log::info!(
-            "work_finder: enabled (interval={}s, configured_max={configured_max}, \
-             dynamic cap = min(pool, disk, configured_max))",
+            "work_finder: enabled (multi-workspace, interval={}s, configured_max={configured_max}, \
+             dynamic cap = min(pool, disk, configured_max), global across workspaces)",
             interval.as_secs()
         );
-        Some(work_finder::spawn_work_finder_task(
-            source,
-            dispatcher,
-            interval,
+        // Multi-workspace fan-out (#3928): re-reads `effective_roots()` each tick
+        // and dispatches into each registered repo's own working tree via the
+        // shared `workspace_pool`. Empty registry ⇒ the single `sweep_workspace`.
+        Some(work_finder::spawn_multi_work_finder_task(
+            workspace_pool.clone(),
             sweep_workspace.clone(),
+            interval,
             configured_max,
             main_health_state.clone(),
             event_bus.clone(),
