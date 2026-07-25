@@ -82,7 +82,7 @@ use anyhow::Result;
 use crate::capacity::{self, CapacityAdvisory};
 use crate::disk_headroom::disk_headroom_limit;
 use crate::event_bus::EventBus;
-use crate::main_health_gate::MainHealthState;
+use crate::main_health_gate::{MainHealthState, WorkspaceHealthStates};
 use crate::tokens::token_pool_size;
 use crate::types::Event;
 use crate::workspace_pool::WorkspacePool;
@@ -336,13 +336,26 @@ pub fn tick(
 ///    fallback), this reduces to the same schedule [`tick`] produces, so wiring
 ///    it in for N=1 preserves the pre-#3928 behavior.
 ///
+/// # Per-repo main-health gate (#3930)
+///
+/// `halted` is a slice **parallel to `workspaces`**: `halted[i] == true` means
+/// repo `i`'s `main` is currently red, so its own dispatch loop is skipped this
+/// tick while sibling repos keep dispatching against the shared global budget. A
+/// halted workspace's backlog is still polled and accumulated into
+/// [`TickReport::seen`] (mirroring the pre-#3930 aggregate-log behavior), and its
+/// in-flight sweeps still seed the shared occupancy (they are never touched). A
+/// missing entry (`halted.len() < workspaces.len()`) defaults to *not halted*.
+/// [`TickReport::halted`] is set when **any** workspace was gated this tick — in
+/// the single-workspace (empty-registry) case this reduces to the pre-#3930
+/// single-flag semantics byte-for-byte.
+///
 /// Unlike [`tick`], a source error is **not** propagated (there is no single
 /// caller to retry — the other workspaces must still run); it is folded into the
 /// returned [`TickReport`].
 pub fn tick_multi<S: WorkSource, D: WorkDispatcher>(
     workspaces: &mut [(S, D)],
     max_concurrent: usize,
-    halted: bool,
+    halted: &[bool],
 ) -> TickReport {
     let mut report = TickReport::default();
 
@@ -351,21 +364,9 @@ pub fn tick_multi<S: WorkSource, D: WorkDispatcher>(
     let in_flights: Vec<HashSet<u32>> = workspaces.iter().map(|(_, d)| d.in_flight()).collect();
     let mut occupancy: usize = in_flights.iter().map(HashSet::len).sum();
 
-    // Reactive backstop: a red `main` halts all new dispatch this tick. We still
-    // poll each source so `seen` reflects the combined backlog for logging.
-    if halted {
-        report.halted = true;
-        for (source, _) in workspaces.iter_mut() {
-            match source.list_ready_issues() {
-                Ok(items) => report.seen += items.len(),
-                Err(e) => {
-                    report.errors += 1;
-                    log::warn!("work_finder: (halted) listing ready issues failed: {e}");
-                }
-            }
-        }
-        return report;
-    }
+    // Whether any workspace was gated this tick — folds down to the pre-#3930
+    // single-flag semantics for a single (empty-registry) workspace.
+    let mut any_halted = false;
 
     for (idx, (source, dispatcher)) in workspaces.iter_mut().enumerate() {
         let ready = match source.list_ready_issues() {
@@ -379,6 +380,16 @@ pub fn tick_multi<S: WorkSource, D: WorkDispatcher>(
             }
         };
         report.seen += ready.len();
+
+        // Per-repo main-health gate (#3930): a red repo skips only its own
+        // dispatch loop this tick. `seen` above still reflects its backlog so the
+        // caller can log "backlog is N but halted"; its in-flight sweeps stay in
+        // the global occupancy seed and are never touched.
+        if halted.get(idx).copied().unwrap_or(false) {
+            any_halted = true;
+            continue;
+        }
+
         let in_flight = &in_flights[idx];
 
         for item in ready {
@@ -413,6 +424,7 @@ pub fn tick_multi<S: WorkSource, D: WorkDispatcher>(
         }
     }
 
+    report.halted = any_halted;
     report
 }
 
@@ -761,7 +773,7 @@ pub fn spawn_multi_work_finder_task(
     fallback_root: PathBuf,
     interval: Duration,
     configured_max: usize,
-    health_state: Arc<MainHealthState>,
+    health_states: Arc<WorkspaceHealthStates>,
     event_bus: Arc<EventBus>,
 ) -> tokio::task::JoinHandle<()> {
     log::info!(
@@ -778,7 +790,6 @@ pub fn spawn_multi_work_finder_task(
         let mut was_pressured = false;
         loop {
             ticker.tick().await;
-            let halted = health_state.is_halted();
 
             // Dynamic cap from live *machine-level* inputs (one token pool, one
             // scratch volume) probed from the daemon's primary workspace.
@@ -797,6 +808,11 @@ pub fn spawn_multi_work_finder_task(
                 })
                 .effective_roots(&fallback_root);
 
+            // Per-repo main-health halt (#3930): look up each root's own gate
+            // state, parallel to `pairs`. A red repo halts only its own dispatch.
+            let halted: Vec<bool> = roots.iter().map(|r| health_states.is_halted(r)).collect();
+            let any_halted = halted.iter().any(|&h| h);
+
             let mut pairs: Vec<(GhWorkSource, RegistryDispatcher)> = roots
                 .iter()
                 .map(|root| {
@@ -808,17 +824,18 @@ pub fn spawn_multi_work_finder_task(
             log::debug!(
                 "work_finder: dynamic cap = {max_concurrent} (pool={pool_size}, \
                  healthy_tokens={token_limit}, disk={disk}, configured_max={configured_max}, \
-                 halted={halted}, workspaces={})",
+                 any_halted={any_halted}, workspaces={})",
                 pairs.len()
             );
 
-            let report = tick_multi(&mut pairs, max_concurrent, halted);
+            let report = tick_multi(&mut pairs, max_concurrent, &halted);
 
             if report.halted && !was_halted {
                 log::warn!(
-                    "work_finder: main-health gate halted dispatch — {} ready issue(s) held \
-                     until main is green again",
-                    report.seen
+                    "work_finder: main-health gate halted dispatch for {} of {} repo(s) — \
+                     their ready issues held until their main is green again",
+                    halted.iter().filter(|&&h| h).count(),
+                    halted.len()
                 );
             } else if !report.halted && was_halted {
                 log::info!("work_finder: main-health gate cleared — resuming dispatch");
@@ -1341,7 +1358,7 @@ mod tests {
         // Empty-registry equivalence: one workspace behaves exactly like tick().
         let mut multi =
             vec![(FakeSource::once((1..=3).map(issue).collect()), RecordingDispatcher::default())];
-        let report = tick_multi(&mut multi, 10, false);
+        let report = tick_multi(&mut multi, 10, &[false]);
         assert_eq!(report.seen, 3);
         assert_eq!(report.dispatched, 3);
         assert_eq!(report.deferred_capacity, 0);
@@ -1356,7 +1373,7 @@ mod tests {
             (FakeSource::once(vec![issue(1), issue(2)]), RecordingDispatcher::default()),
             (FakeSource::once(vec![issue(10), issue(11)]), RecordingDispatcher::default()),
         ];
-        let report = tick_multi(&mut multi, 10, false);
+        let report = tick_multi(&mut multi, 10, &[false, false]);
         assert_eq!(report.seen, 4);
         assert_eq!(report.dispatched, 4);
         assert_eq!(multi[0].1.dispatched, vec![1, 2], "workspace 0 dispatches its own issues");
@@ -1372,7 +1389,7 @@ mod tests {
             (FakeSource::once((1..=5).map(issue).collect()), RecordingDispatcher::default()),
             (FakeSource::once((10..=14).map(issue).collect()), RecordingDispatcher::default()),
         ];
-        let report = tick_multi(&mut multi, 3, false);
+        let report = tick_multi(&mut multi, 3, &[false, false]);
         let total: usize = multi.iter().map(|(_, d)| d.dispatched.len()).sum();
         assert_eq!(report.dispatched, 3, "combined dispatch never exceeds the global cap");
         assert_eq!(total, 3, "sum of per-workspace dispatches equals the global cap");
@@ -1399,7 +1416,7 @@ mod tests {
                 },
             ),
         ];
-        let report = tick_multi(&mut multi, 4, false);
+        let report = tick_multi(&mut multi, 4, &[false, false]);
         assert_eq!(report.dispatched, 1, "3 in-flight + cap 4 ⇒ 1 free slot globally");
         assert_eq!(report.deferred_capacity, 3);
         // The single free slot goes to the first workspace's first ready issue.
@@ -1416,7 +1433,7 @@ mod tests {
             (err_source("bad auth for repo B"), RecordingDispatcher::default()),
             (FakeSource::once(vec![issue(30)]), RecordingDispatcher::default()),
         ];
-        let report = tick_multi(&mut multi, 10, false);
+        let report = tick_multi(&mut multi, 10, &[false, false, false]);
         assert_eq!(report.errors, 1, "the failing workspace is counted, not fatal");
         assert_eq!(report.dispatched, 3, "the two healthy workspaces still dispatch");
         assert_eq!(multi[0].1.dispatched, vec![1, 2]);
@@ -1430,7 +1447,7 @@ mod tests {
             (FakeSource::once((1..=3).map(issue).collect()), RecordingDispatcher::default()),
             (FakeSource::once((10..=12).map(issue).collect()), RecordingDispatcher::default()),
         ];
-        let report = tick_multi(&mut multi, 10, true);
+        let report = tick_multi(&mut multi, 10, &[true, true]);
         assert!(report.halted);
         assert_eq!(report.seen, 6, "backlog across both workspaces is still observed");
         assert_eq!(report.dispatched, 0, "zero dispatch while halted");
@@ -1440,8 +1457,89 @@ mod tests {
     #[test]
     fn test_tick_multi_empty_workspace_set_is_noop() {
         let mut multi: Vec<(FakeSource, RecordingDispatcher)> = vec![];
-        let report = tick_multi(&mut multi, 10, false);
+        let report = tick_multi(&mut multi, 10, &[]);
         assert_eq!(report, TickReport::default());
+    }
+
+    #[test]
+    fn test_tick_multi_per_repo_gate_red_repo_halts_only_itself() {
+        // Per-repo main-health gate (#3930): repo A (index 0) is red, repo B
+        // (index 1) is green. A dispatches NOTHING; B still dispatches its full
+        // backlog. A's backlog is still counted in `seen` for logging.
+        let mut multi = vec![
+            (FakeSource::once(vec![issue(1), issue(2)]), RecordingDispatcher::default()),
+            (FakeSource::once(vec![issue(10), issue(11)]), RecordingDispatcher::default()),
+        ];
+        let report = tick_multi(&mut multi, 10, &[true, false]);
+        assert!(report.halted, "report.halted is set when any repo was gated");
+        assert_eq!(report.seen, 4, "both repos' backlogs are observed");
+        assert_eq!(report.dispatched, 2, "only repo B dispatched");
+        assert!(multi[0].1.dispatched.is_empty(), "red repo A dispatched nothing");
+        assert_eq!(multi[1].1.dispatched, vec![10, 11], "green repo B dispatched its backlog");
+    }
+
+    #[test]
+    fn test_tick_multi_per_repo_gate_other_repo_red_does_not_halt_us() {
+        // Mirror image: repo A (index 0) is green, repo B (index 1) is red. A
+        // dispatches; B does not. A red repo never halts a sibling.
+        let mut multi = vec![
+            (FakeSource::once(vec![issue(1), issue(2)]), RecordingDispatcher::default()),
+            (FakeSource::once(vec![issue(10), issue(11)]), RecordingDispatcher::default()),
+        ];
+        let report = tick_multi(&mut multi, 10, &[false, true]);
+        assert!(report.halted, "a gated sibling still sets report.halted");
+        assert_eq!(report.dispatched, 2, "only repo A dispatched");
+        assert_eq!(multi[0].1.dispatched, vec![1, 2], "green repo A dispatched its backlog");
+        assert!(multi[1].1.dispatched.is_empty(), "red repo B dispatched nothing");
+    }
+
+    #[test]
+    fn test_tick_multi_red_repo_in_flight_still_seeds_global_occupancy() {
+        // A red repo's in-flight sweeps are never touched and still count toward
+        // the shared global budget: repo A (red) has 3 in-flight, cap is 3, so the
+        // green repo B gets ZERO free slots this tick even though A itself skips.
+        let mut multi = vec![
+            (
+                FakeSource::once(vec![issue(1)]),
+                RecordingDispatcher {
+                    in_flight: HashSet::from([100, 101, 102]),
+                    ..Default::default()
+                },
+            ),
+            (FakeSource::once(vec![issue(10), issue(11)]), RecordingDispatcher::default()),
+        ];
+        let report = tick_multi(&mut multi, 3, &[true, false]);
+        assert!(report.halted);
+        assert_eq!(report.dispatched, 0, "occupancy already at cap from red repo's in-flight");
+        assert_eq!(report.deferred_capacity, 2, "repo B's 2 ready issues deferred by the budget");
+        assert!(multi.iter().all(|(_, d)| d.dispatched.is_empty()));
+    }
+
+    #[test]
+    fn test_tick_multi_none_halted_is_not_reported_halted() {
+        // No repo gated ⇒ report.halted is false (reduces to pre-#3930 semantics).
+        let mut multi = vec![
+            (FakeSource::once(vec![issue(1)]), RecordingDispatcher::default()),
+            (FakeSource::once(vec![issue(10)]), RecordingDispatcher::default()),
+        ];
+        let report = tick_multi(&mut multi, 10, &[false, false]);
+        assert!(!report.halted);
+        assert_eq!(report.dispatched, 2);
+    }
+
+    #[test]
+    fn test_tick_multi_missing_halt_entry_defaults_not_halted() {
+        // A short `halted` slice (fewer entries than workspaces) treats the
+        // unspecified workspaces as not halted rather than panicking.
+        let mut multi = vec![
+            (FakeSource::once(vec![issue(1)]), RecordingDispatcher::default()),
+            (FakeSource::once(vec![issue(10)]), RecordingDispatcher::default()),
+        ];
+        let report = tick_multi(&mut multi, 10, &[true]);
+        assert!(report.halted);
+        assert_eq!(report.dispatched, 1, "workspace 1 (no halt entry) still dispatches");
+        assert!(multi[0].1.dispatched.is_empty());
+        assert_eq!(multi[1].1.dispatched, vec![10]);
     }
 
     // ===================================================================

@@ -75,7 +75,7 @@ use anyhow::{Context, Result};
 use crate::epic_state::{count_phase_sections, derive_epic_state, EpicState, PhaseChild};
 use crate::event_bus::EventBus;
 use crate::issue_creation_mutex::{IssueCreationMutex, CHAMPION_EPIC_DECOMP};
-use crate::main_health_gate::MainHealthState;
+use crate::main_health_gate::{MainHealthState, WorkspaceHealthStates};
 use crate::phase_join::{barrier_admits, PhaseBoundary};
 use crate::sweep_registry::SweepRegistryConfig;
 use crate::types::{EpicActionClass, Event};
@@ -1008,7 +1008,7 @@ pub fn spawn_multi_supervisor_thread(
     pool: Arc<WorkspacePool>,
     fallback_root: PathBuf,
     event_bus: Arc<EventBus>,
-    health_state: Arc<MainHealthState>,
+    health_states: Arc<WorkspaceHealthStates>,
     interval: Duration,
 ) -> Result<SupervisorHandle> {
     let shutdown = Arc::new(AtomicBool::new(false));
@@ -1073,10 +1073,13 @@ pub fn spawn_multi_supervisor_thread(
                             let registry = pool.get_or_provision(root);
                             let source = forge::GhEpicSource::for_root(root);
                             let dispatcher = forge::SpawnDispatcher::new(spawn_bin, registry);
+                            // Per-repo main-health gate (#3930): each root gets
+                            // its own halt state, so a red `main` in repo A halts
+                            // only A's epic dispatch, never the siblings'.
                             let supervisor =
                                 EpicSupervisor::new(source, dispatcher, IssueCreationMutex::new())
                                     .with_event_bus(event_bus.clone())
-                                    .with_health_gate(health_state.clone());
+                                    .with_health_gate(health_states.get_or_create(root));
                             roots.push(root.clone());
                             supervisors.push(supervisor);
                             log::info!("epic_supervisor: watching workspace {}", root.display());
