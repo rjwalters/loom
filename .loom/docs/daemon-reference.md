@@ -102,10 +102,10 @@ issue** — the v0.10.0 set is intentionally frozen.
 
 | Topic | Publisher | Payload |
 |-------|-----------|---------|
-| `sweep.issue.{N}.phase`   | Sweep child via `publish_event` | `{phase, pr_number?}` |
-| `sweep.issue.{N}.blocker` | Sweep child                     | `{reason, label_added}` |
-| `sweep.issue.{N}.exited`  | Daemon reaper (or `cancel_sweep`) | `{exit_code, duration_sec}` |
-| `sweep.issue.{N}.crashed` | Daemon reaper                   | `{checkpoint_phase}` |
+| `sweep.issue.{N}.phase`   | Sweep child via `publish_event` | `{phase, pr_number?, repo?}` |
+| `sweep.issue.{N}.blocker` | Sweep child                     | `{reason, label_added, repo?}` |
+| `sweep.issue.{N}.exited`  | Daemon reaper (or `cancel_sweep`) | `{exit_code, duration_sec, repo?}` |
+| `sweep.issue.{N}.crashed` | Daemon reaper                   | `{checkpoint_phase, repo?}` |
 | `sweep.global.dispatch`   | Daemon                          | `{sweep_id, kind}` |
 | `sweep.global.completed`  | Daemon                          | `{sweep_id, outcome}` |
 | `epic.issue.{N}.decompose` | Epic supervisor (#3842)        | `{epic, action, state}` |
@@ -123,6 +123,20 @@ operator gets one add-capacity advisory on the way in and one recovery on the wa
 out. See [Token-capacity backpressure](#token-capacity-backpressure-3902) below.
 They ride the same in-memory bus as the sweep topics and are tailable via
 `subscribe_to_events` / `tail_event_bus`.
+
+The four `sweep.issue.{N}.*` payloads gained an additive **`repo`** field in
+**#3929** (`(repo, issue)`-aware sweep visibility, phase c of #3926). The bus is
+shared across every managed repo, and the topic string is issue-scoped only —
+two managed repos can each dispatch a sweep for issue #42 onto the *identical*
+`sweep.issue.42.phase` topic. `repo` carries the owning registry's
+`workspace_root`, so a multi-repo-aware subscriber can disambiguate them after
+matching the topic. **The topic strings are unchanged** — `repo` lives in the
+payload only, so existing single-repo subscribers that filter on `sweep.issue`
+or `sweep.issue.{N}` route byte-for-byte identically and simply ignore the new
+field. The daemon stamps `repo` centrally when it emits each event; a sweep
+child that already knows its repo (via `publish_event`) may supply it and will
+not be overwritten. `sweep.global.*` events are unchanged — they already carry a
+unique `sweep_id`.
 
 In addition, the bus internally emits:
 
@@ -168,6 +182,12 @@ Inputs:
   structurally unrepresentable — see "Stacked-PR dependency (v1)" below. The
   field is `#[serde(default)]` on the wire, so pre-#3729 clients remain
   compatible.
+- `workspace_root` (optional, issue #3929) — target managed-workspace root.
+  When omitted, the sweep is dispatched into the daemon's **default** workspace
+  (byte-for-byte unchanged). When set to a registered repo root, the daemon
+  resolves that repo's sweep registry via the `WorkspacePool` and dispatches into
+  its working tree — the way to dispatch into a managed repo other than the
+  default when two repos share issue numbers. `#[serde(default)]` on the wire.
 
 ### `list_sweeps` (Phase A)
 
@@ -177,6 +197,19 @@ Terminal entries are garbage-collected ~1h after the transition.
 Inputs:
 - `state_filter` (optional) — one of `Pending`, `Running`, `Exited`,
   `Crashed`.
+- `workspace_root` (optional, issue #3929) — target managed-workspace root.
+  Omit to list the default workspace's sweeps (unchanged). Set to a registered
+  repo root to list the sweeps tracked by that repo's registry — the way to
+  observe sweeps the daemon autonomously dispatched into a non-default managed
+  repo. Each returned `SweepInfo` also carries a `repo` field naming its owner,
+  so a response is self-describing even without filtering. Cross-repo
+  aggregation in a single call is deferred to phase d (#3930). `#[serde(default)]`
+  on the wire.
+
+The same optional `workspace_root` input (default = default workspace, unchanged)
+is accepted by `get_sweep_status`, `tail_sweep_log`, and `cancel_sweep` — so a
+sweep the daemon dispatched into a non-default managed repo can be inspected,
+tailed, and cancelled by naming its repo root (#3929).
 
 ### `publish_event` (Phase B)
 
@@ -261,10 +294,39 @@ The sweep registry (`loom-daemon/src/sweep_registry.rs`) holds a
 - `latest_phase` (optional) — most-recent phase advertised via
   checkpoint.
 - `pr_number` (optional, reserved).
+- `repo` (optional, issue #3929) — the owning managed-workspace root
+  (`config.workspace_root`), stamped at dispatch/reconstruct time so a
+  `list_sweeps` / `get_sweep_status` response disambiguates two managed repos'
+  identically-numbered issues. `#[serde(default, skip_serializing_if = "Option::is_none")]`,
+  so pre-#3929 wire data and clients remain compatible.
 
 The wire shape is pinned by `sweep_info_schema_snapshot` in
 `sweep_registry.rs` — a change to the JSON shape requires deliberate
 test update.
+
+## Per-workspace registry pool (`WorkspacePool`, #3928/#3929)
+
+`loom-daemon/src/workspace_pool.rs` holds **one independent `SweepRegistry` per
+registered repo root**, keyed by `PathBuf`, so every path a registry computes
+(`.loom/locks/issue-<N>`, `.loom/logs/`, `.loom/sweep-checkpoint/`, and the
+spawned child's `current_dir`) is namespaced per repo — two repos each with issue
+#42 never collide. The default workspace's registry is **seeded** into the pool
+(shared with the IPC `dispatch_sweep` path); the autonomous work-finder and epic
+supervisor provision the other managed repos' registries on demand
+(`get_or_provision`). The IPC handler resolves a request's target registry from
+the pool when the request carries an explicit `workspace_root` (#3929), so all
+per-repo registries are observable/addressable via `list_sweeps` /
+`get_sweep_status` / `tail_sweep_log` / `cancel_sweep` / `dispatch_sweep`.
+
+**Eviction on `workspace remove` (#3929)**: `DeregisterWorkspace` (the
+`workspace remove` CLI) calls `WorkspacePool::evict`, which drops the pooled
+registry and **aborts its background reaper task** so it does not leak. The
+**seeded default workspace is guarded** — it is owned by `main` and keeps serving
+default-workspace IPC requests, so evicting it is a no-op. A live sweep child in
+an evicted registry is **not** killed and its lock/log files are untouched; only
+the in-memory tracking + reaper go away, so the sweep finishes normally but its
+terminal state becomes unobservable via IPC after the deregister — an accepted
+consequence of an explicit operator `workspace remove`.
 
 ## Reaper task
 

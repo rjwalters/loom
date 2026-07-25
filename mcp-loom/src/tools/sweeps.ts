@@ -89,6 +89,12 @@ export interface SweepInfo {
    * branched its worktree/PR off `feature/issue-<depends_on>`.
    */
   depends_on?: number;
+  /**
+   * Owning managed-workspace root (issue #3929). Two managed repos can each
+   * have an issue #42; this field disambiguates repo A's sweep from repo B's.
+   * Absent/undefined on pre-#3929 entries.
+   */
+  repo?: string;
 }
 
 interface DispatchResponse {
@@ -184,6 +190,17 @@ function isStateTag(s: string): s is SweepState["state"] {
   return s === "Pending" || s === "Running" || s === "Exited" || s === "Crashed";
 }
 
+/**
+ * Extract an optional `workspace_root` tool argument (issue #3929). Empty
+ * strings are treated as unset so the daemon receives `null` (default
+ * workspace) rather than a spurious empty root.
+ */
+function extractWorkspaceRoot(args?: Record<string, unknown>): string | undefined {
+  return typeof args?.workspace_root === "string" && args.workspace_root.length > 0
+    ? (args.workspace_root as string)
+    : undefined;
+}
+
 function buildStateFilter(stateArg: unknown): SweepState | null {
   if (typeof stateArg !== "string" || stateArg.length === 0) return null;
   if (!isStateTag(stateArg)) {
@@ -240,6 +257,7 @@ async function dispatchSweep(args: {
   model?: string;
   effort?: string;
   depends_on?: number;
+  workspace_root?: string;
 }): Promise<{ success: true; result: DispatchResponse["payload"] } | { success: false; error: string }> {
   try {
     const response = (await sendDaemonRequest({
@@ -260,6 +278,10 @@ async function dispatchSweep(args: {
         // child branches off the default branch as usual. When set, the child
         // branches its worktree/PR off `feature/issue-<depends_on>`.
         depends_on: args.depends_on ?? null,
+        // Issue #3929: optional target managed-workspace root. `null` (the
+        // default) dispatches into the daemon's default workspace, exactly as
+        // before; a value routes the sweep into that managed repo's registry.
+        workspace_root: args.workspace_root ?? null,
       },
     })) as DaemonResponse;
 
@@ -277,12 +299,16 @@ async function dispatchSweep(args: {
 
 async function listSweeps(args: {
   state_filter?: SweepState | null;
+  workspace_root?: string;
 }): Promise<{ success: true; sweeps: SweepInfo[] } | { success: false; error: string }> {
   try {
     const response = (await sendDaemonRequest({
       type: "ListSweeps",
       payload: {
         state_filter: args.state_filter ?? null,
+        // Issue #3929: optional target managed-workspace root. `null` lists the
+        // default workspace's sweeps, exactly as before.
+        workspace_root: args.workspace_root ?? null,
       },
     })) as DaemonResponse;
 
@@ -304,11 +330,12 @@ async function listSweeps(args: {
 
 async function getSweepStatus(args: {
   sweep_id: string;
+  workspace_root?: string;
 }): Promise<{ success: true; info: SweepInfo | null } | { success: false; error: string }> {
   try {
     const response = (await sendDaemonRequest({
       type: "GetSweepStatus",
-      payload: { sweep_id: args.sweep_id },
+      payload: { sweep_id: args.sweep_id, workspace_root: args.workspace_root ?? null },
     })) as DaemonResponse;
 
     if (response.type === "SweepStatus") {
@@ -324,6 +351,7 @@ async function getSweepStatus(args: {
 async function tailSweepLog(args: {
   sweep_id: string;
   lines: number;
+  workspace_root?: string;
 }): Promise<
   | { success: true; payload: SweepLogTailResponse["payload"] }
   | { success: false; error: string }
@@ -331,7 +359,7 @@ async function tailSweepLog(args: {
   try {
     const response = (await sendDaemonRequest({
       type: "TailSweepLog",
-      payload: { sweep_id: args.sweep_id, lines: args.lines },
+      payload: { sweep_id: args.sweep_id, lines: args.lines, workspace_root: args.workspace_root ?? null },
     })) as DaemonResponse;
 
     if (response.type === "SweepLogTail") {
@@ -347,6 +375,7 @@ async function tailSweepLog(args: {
 async function cancelSweep(args: {
   sweep_id: string;
   grace_secs: number;
+  workspace_root?: string;
 }): Promise<
   | { success: true; payload: SweepCancelledResponse["payload"] }
   | { success: false; error: string }
@@ -354,7 +383,7 @@ async function cancelSweep(args: {
   try {
     const response = (await sendDaemonRequest({
       type: "CancelSweep",
-      payload: { sweep_id: args.sweep_id, grace_secs: args.grace_secs },
+      payload: { sweep_id: args.sweep_id, grace_secs: args.grace_secs, workspace_root: args.workspace_root ?? null },
     })) as DaemonResponse;
 
     if (response.type === "SweepCancelled") {
@@ -496,6 +525,16 @@ export const sweepTools: Tool[] = [
             "list) makes diamonds / multi-parent stacks unrepresentable. Omit " +
             "for an independent sweep (no --depends-on flag is emitted).",
         },
+        workspace_root: {
+          type: "string",
+          description:
+            "Optional target managed-workspace root (issue #3929). Omit to " +
+            "dispatch into the daemon's default workspace (unchanged behavior). " +
+            "Provide a registered repo root to dispatch the sweep into that " +
+            "repo's working tree / sweep registry — required to address a " +
+            "managed repo other than the default when two repos share issue " +
+            "numbers.",
+        },
       },
       required: ["kind"],
     },
@@ -517,6 +556,16 @@ export const sweepTools: Tool[] = [
           enum: ["Pending", "Running", "Exited", "Crashed"],
           description:
             "Optional lifecycle state filter. Omit to list all tracked sweeps.",
+        },
+        workspace_root: {
+          type: "string",
+          description:
+            "Optional target managed-workspace root (issue #3929). Omit to " +
+            "list the default workspace's sweeps (unchanged behavior). Provide " +
+            "a registered repo root to list the sweeps tracked by that repo's " +
+            "registry — the way to observe sweeps the daemon autonomously " +
+            "dispatched into a managed repo other than the default. Each " +
+            "returned SweepInfo also carries a `repo` field naming its owner.",
         },
       },
     },
@@ -544,6 +593,14 @@ export const sweepTools: Tool[] = [
             "SweepInfo. Defaults to 10. The bus is in-memory and transient " +
             "— this is a best-effort recent-history sample, not a replay log.",
         },
+        workspace_root: {
+          type: "string",
+          description:
+            "Optional target managed-workspace root (issue #3929). Omit to " +
+            "look the sweep up in the default workspace (unchanged behavior). " +
+            "Provide a registered repo root to resolve the sweep against that " +
+            "repo's registry.",
+        },
       },
       required: ["sweep_id"],
     },
@@ -566,6 +623,14 @@ export const sweepTools: Tool[] = [
         lines: {
           type: "number",
           description: "Number of trailing lines to return. Defaults to 100.",
+        },
+        workspace_root: {
+          type: "string",
+          description:
+            "Optional target managed-workspace root (issue #3929). Omit to " +
+            "resolve the log against the default workspace (unchanged " +
+            "behavior). Provide a registered repo root to resolve it against " +
+            "that repo's registry.",
         },
       },
       required: ["sweep_id"],
@@ -662,6 +727,15 @@ export const sweepTools: Tool[] = [
             "of 0 escalates to SIGKILL immediately after the first poll " +
             "iteration (~100ms).",
         },
+        workspace_root: {
+          type: "string",
+          description:
+            "Optional target managed-workspace root (issue #3929). Omit to " +
+            "cancel a sweep tracked by the default workspace (unchanged " +
+            "behavior). Provide a registered repo root to cancel a sweep " +
+            "tracked by that repo's registry — required to cancel a sweep the " +
+            "daemon autonomously dispatched into a non-default managed repo.",
+        },
       },
       required: ["sweep_id"],
     },
@@ -723,6 +797,9 @@ function formatSweepLine(info: SweepInfo): string {
   if (info.latest_phase) parts.push(`  Phase:      ${info.latest_phase}`);
   if (info.pr_number !== undefined && info.pr_number !== null)
     parts.push(`  PR:         #${info.pr_number}`);
+  // Issue #3929: name the owning managed-workspace root when present so two
+  // repos' identically-numbered issues are distinguishable in the listing.
+  if (info.repo) parts.push(`  Repo:       ${info.repo}`);
   if (info.idempotency_key)
     parts.push(`  Idem. key:  ${info.idempotency_key}`);
   return parts.join("\n");
@@ -802,6 +879,7 @@ export async function handleSweepTool(
         model,
         effort,
         depends_on: dependsOn,
+        workspace_root: extractWorkspaceRoot(args),
       });
       if (!result.success) {
         return [
@@ -836,7 +914,10 @@ export async function handleSweepTool(
       const stateArg = args?.state_filter;
       const stateFilter = stateArg === undefined ? null : buildStateFilter(stateArg);
 
-      const result = await listSweeps({ state_filter: stateFilter });
+      const result = await listSweeps({
+        state_filter: stateFilter,
+        workspace_root: extractWorkspaceRoot(args),
+      });
       if (!result.success) {
         return [
           {
@@ -880,7 +961,10 @@ export async function handleSweepTool(
           ? Math.max(0, Math.floor(recentEventsArg))
           : 10;
 
-      const statusResult = await getSweepStatus({ sweep_id: sweepId });
+      const statusResult = await getSweepStatus({
+        sweep_id: sweepId,
+        workspace_root: extractWorkspaceRoot(args),
+      });
       if (!statusResult.success) {
         return [
           {
@@ -957,7 +1041,11 @@ export async function handleSweepTool(
           ? Math.max(0, Math.floor(linesArg))
           : 100;
 
-      const result = await tailSweepLog({ sweep_id: sweepId, lines });
+      const result = await tailSweepLog({
+        sweep_id: sweepId,
+        lines,
+        workspace_root: extractWorkspaceRoot(args),
+      });
       if (!result.success) {
         return [
           {
@@ -1088,7 +1176,11 @@ export async function handleSweepTool(
           ? Math.floor(graceArg)
           : 30;
 
-      const result = await cancelSweep({ sweep_id: sweepId, grace_secs: graceSecs });
+      const result = await cancelSweep({
+        sweep_id: sweepId,
+        grace_secs: graceSecs,
+        workspace_root: extractWorkspaceRoot(args),
+      });
       if (!result.success) {
         return [
           {

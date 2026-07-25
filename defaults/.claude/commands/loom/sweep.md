@@ -1805,14 +1805,16 @@ The following six topics are the **entire** event vocabulary for v0.10.0. New to
 
 | Topic | Publisher | Payload (JSON) |
 |-------|-----------|----------------|
-| `sweep.issue.{N}.phase` | Sweep child via `PublishEvent` | `{"phase": "<phase-name>", "pr_number": <int or null>}` |
-| `sweep.issue.{N}.blocker` | Sweep child | `{"reason": "<short-text>", "label_added": "<label>"}` |
-| `sweep.issue.{N}.exited` | Daemon reaper | `{"exit_code": <int or null>, "duration_sec": <int>}` |
-| `sweep.issue.{N}.crashed` | Daemon reaper | `{"checkpoint_phase": "<phase-name or null>"}` |
+| `sweep.issue.{N}.phase` | Sweep child via `PublishEvent` | `{"phase": "<phase-name>", "pr_number": <int or null>, "repo": "<workspace-root>"?}` |
+| `sweep.issue.{N}.blocker` | Sweep child | `{"reason": "<short-text>", "label_added": "<label>", "repo": "<workspace-root>"?}` |
+| `sweep.issue.{N}.exited` | Daemon reaper | `{"exit_code": <int or null>, "duration_sec": <int>, "repo": "<workspace-root>"?}` |
+| `sweep.issue.{N}.crashed` | Daemon reaper | `{"checkpoint_phase": "<phase-name or null>", "repo": "<workspace-root>"?}` |
 | `sweep.global.dispatch` | Daemon | `{"sweep_id": "<id>", "kind": {"type": "Issue", "value": <N>}}` |
 | `sweep.global.completed` | Daemon | `{"sweep_id": "<id>", "outcome": "exited" | "crashed"}` |
 
 `{N}` is the issue number (a positive integer). Phase names match the sweep-checkpoint schema (#3373): `curator`, `builder`, `judge`, `doctor`, `merge`, etc.
+
+**`repo` field (optional, #3929)**: the four `sweep.issue.{N}.*` payloads carry an additive `repo` field naming the owning managed-workspace root, so a subscriber on the shared bus can disambiguate two managed repos that each dispatched a sweep for issue #N (the topic string is issue-scoped only). The **daemon stamps `repo` automatically** on the events it emits (`exited` / `crashed`). For the **child-published** `phase` / `blocker` events, include `repo` in the payload sourced from the `LOOM_WORKSPACE` env var the daemon exports to the sweep child at dispatch (e.g. `{"phase": "builder", "pr_number": 501, "repo": "$LOOM_WORKSPACE"}`). `repo` is optional and backward-compatible — omitting it is byte-for-byte the pre-#3929 behavior, and single-repo subscribers ignore it.
 
 ### How to publish — IPC contract
 

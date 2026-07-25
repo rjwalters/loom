@@ -903,6 +903,10 @@ impl SweepRegistry {
             model: model.filter(|m| !m.is_empty()).map(String::from),
             effort: effort.filter(|e| !e.is_empty()).map(String::from),
             depends_on,
+            // Stamp the owning workspace root (#3929) so list_sweeps /
+            // get_sweep_status responses disambiguate this repo's issue #N from
+            // another managed repo's identically-numbered issue.
+            repo: Some(self.config.workspace_root.display().to_string()),
         };
         self.entries.insert(sweep_id.clone(), info);
 
@@ -925,7 +929,13 @@ impl SweepRegistry {
 
     /// Internal helper: publish an event on the attached bus (if any).
     /// Best-effort — logs a debug line if no subscribers are listening.
-    fn emit_event(&self, event: Event) {
+    ///
+    /// Sweep-scoped events are stamped with this registry's owning workspace
+    /// root (Issue #3929) so multi-repo subscribers can disambiguate two managed
+    /// repos' issue #N — the topic string is unchanged; `repo` lives in the
+    /// payload only.
+    fn emit_event(&self, mut event: Event) {
+        event.set_repo_if_absent(&self.config.workspace_root.display().to_string());
         if let Some(ref bus) = self.bus {
             let topic = event.topic();
             match bus.publish(event) {
@@ -1120,6 +1130,7 @@ impl SweepRegistry {
                 issue: *child,
                 reason: reason.to_string(),
                 label_added: "loom:blocked".to_string(),
+                repo: None, // stamped by emit_event (#3929)
             });
         }
         children
@@ -1607,6 +1618,7 @@ impl SweepRegistry {
                 issue: *issue,
                 exit_code: None,
                 duration_sec,
+                repo: None, // stamped by emit_event (#3929)
             });
         }
         self.emit_event(Event::SweepGlobalCompleted {
@@ -1715,6 +1727,7 @@ impl SweepRegistry {
                             events_to_emit.push(Event::SweepCrashed {
                                 issue,
                                 checkpoint_phase,
+                                repo: None, // stamped by emit_event (#3929)
                             });
                             events_to_emit.push(Event::SweepGlobalCompleted {
                                 sweep_id: sweep_id.clone(),
@@ -1754,6 +1767,7 @@ impl SweepRegistry {
                                 issue,
                                 exit_code,
                                 duration_sec,
+                                repo: None, // stamped by emit_event (#3929)
                             });
                             events_to_emit.push(Event::SweepGlobalCompleted {
                                 sweep_id: sweep_id.clone(),
@@ -1777,6 +1791,7 @@ impl SweepRegistry {
                                     issue: child,
                                     reason: reason.clone(),
                                     label_added: "loom:blocked".to_string(),
+                                    repo: None, // stamped by emit_event (#3929)
                                 });
                             }
                         }
@@ -2171,6 +2186,7 @@ impl SweepRegistry {
                         self.emit_event(Event::SweepCrashed {
                             issue,
                             checkpoint_phase: None,
+                            repo: None, // stamped by emit_event (#3929)
                         });
                     }
                 }
@@ -2189,6 +2205,7 @@ impl SweepRegistry {
                             self.emit_event(Event::SweepCrashed {
                                 issue,
                                 checkpoint_phase: None,
+                                repo: None, // stamped by emit_event (#3929)
                             });
                         }
                         continue;
@@ -2348,6 +2365,7 @@ impl SweepRegistry {
                         self.emit_event(Event::SweepCrashed {
                             issue,
                             checkpoint_phase: None,
+                            repo: None, // stamped by emit_event (#3929)
                         });
                     }
                 }
@@ -2508,6 +2526,7 @@ impl SweepRegistry {
                 let log_path = self.compute_log_path(issue);
                 let started_at = chrono::DateTime::parse_from_rfc3339(&owner.acquired_at)
                     .map_or_else(|_| Utc::now(), |t| t.with_timezone(&Utc));
+                let repo = Some(self.config.workspace_root.display().to_string());
                 self.entries.insert(
                     owner.sweep_id.clone(),
                     SweepInfo {
@@ -2528,6 +2547,9 @@ impl SweepRegistry {
                         effort: None,
                         // depends_on is not recorded in the lock owner (#3729).
                         depends_on: None,
+                        // Owning workspace root, stamped for multi-repo
+                        // disambiguation (#3929).
+                        repo,
                     },
                 );
                 admitted += 1;
@@ -2577,6 +2599,8 @@ impl SweepRegistry {
                 }
                 let sweep_id = format!("sweep-issue-{issue}-recovered-{}", Utc::now().timestamp());
                 let phase = read_checkpoint_phase(&path);
+                let log_path = self.compute_log_path(issue);
+                let repo = Some(self.config.workspace_root.display().to_string());
                 self.entries.insert(
                     sweep_id.clone(),
                     SweepInfo {
@@ -2584,7 +2608,7 @@ impl SweepRegistry {
                         kind: SweepKind::Issue(issue),
                         pid: 0, // unknown — owner is gone
                         token_name: "unknown".to_string(),
-                        log_path: self.compute_log_path(issue),
+                        log_path,
                         idempotency_key: None,
                         started_at: Utc::now(),
                         state: SweepState::Crashed { at: Utc::now() },
@@ -2593,6 +2617,9 @@ impl SweepRegistry {
                         model: None,      // not recoverable from a checkpoint-only entry
                         effort: None,     // not recoverable from a checkpoint-only entry
                         depends_on: None, // not recoverable from a checkpoint-only entry
+                        // Owning workspace root, stamped for multi-repo
+                        // disambiguation (#3929).
+                        repo,
                     },
                 );
                 admitted += 1;
@@ -3580,6 +3607,7 @@ exit 0
                     model: None,
                     effort: None,
                     depends_on: dep,
+                    repo: None,
                 },
             );
         }
@@ -3623,6 +3651,7 @@ exit 0
                 model: None,
                 effort: None,
                 depends_on: dep,
+                repo: None,
             }
         }
         registry
@@ -3864,6 +3893,7 @@ exit 0
                 model: None,
                 effort: None,
                 depends_on: None,
+                repo: None,
             },
         );
 
@@ -3879,6 +3909,7 @@ exit 0
                 Event::SweepCrashed {
                     issue,
                     checkpoint_phase,
+                    ..
                 } => {
                     assert_eq!(issue, 55);
                     assert_eq!(checkpoint_phase.as_deref(), Some("doctor"));
@@ -3936,6 +3967,7 @@ exit 0
                 model: None,
                 effort: None,
                 depends_on: None,
+                repo: None,
             },
         );
 
@@ -3990,6 +4022,7 @@ exit 0
                 model: None,
                 effort: None,
                 depends_on: None,
+                repo: None,
             },
         );
 
@@ -4045,6 +4078,7 @@ exit 0
                 model: None,
                 effort: None,
                 depends_on: None,
+                repo: None,
             },
         );
 
@@ -4109,6 +4143,7 @@ exit 0
                 model: None,
                 effort: None,
                 depends_on: None,
+                repo: None,
             },
         );
 
@@ -4171,6 +4206,7 @@ exit 0
                 model: None,
                 effort: None,
                 depends_on: None,
+                repo: None,
             },
         );
 
@@ -4232,6 +4268,7 @@ exit 0
                 model: None,
                 effort: None,
                 depends_on: None,
+                repo: None,
             },
         );
 
@@ -4276,6 +4313,7 @@ exit 0
                 model: None,
                 effort: None,
                 depends_on: None,
+                repo: None,
             },
         );
 
@@ -4630,6 +4668,7 @@ exit 0\n";
             model: Some("claude-sonnet-4-6".to_string()),
             effort: Some("xhigh".to_string()),
             depends_on: None,
+            repo: None,
         };
         let json = serde_json::to_value(vec![info]).unwrap();
         let expected = serde_json::json!([{
@@ -4739,6 +4778,7 @@ exit 0\n";
                 model: None,
                 effort: None,
                 depends_on: None,
+                repo: None,
             },
         );
 
@@ -4778,6 +4818,7 @@ exit 0\n";
                 model: None,
                 effort: None,
                 depends_on: None,
+                repo: None,
             },
         );
 
@@ -4839,6 +4880,7 @@ exit 0\n";
                 model: None,
                 effort: None,
                 depends_on: None,
+                repo: None,
             },
         );
 
@@ -4878,6 +4920,7 @@ exit 0\n";
                 model: None,
                 effort: None,
                 depends_on: None,
+                repo: None,
             },
         );
 
@@ -4935,6 +4978,7 @@ exit 0\n";
                 model: None,
                 effort: None,
                 depends_on: None,
+                repo: None,
             },
         );
 
@@ -5011,6 +5055,7 @@ exit 0\n";
                     model: None,
                     effort: None,
                     depends_on: None,
+                    repo: None,
                 },
             );
             reg.entries.insert(
@@ -5029,6 +5074,7 @@ exit 0\n";
                     model: None,
                     effort: None,
                     depends_on: None,
+                    repo: None,
                 },
             );
         }
@@ -5122,6 +5168,7 @@ exit 0\n";
                 model: None,
                 effort: None,
                 depends_on: None,
+                repo: None,
             },
         );
 
@@ -5589,6 +5636,7 @@ exit 0\n";
                 model: None,
                 effort: None,
                 depends_on: None,
+                repo: None,
             },
         );
     }
@@ -5760,6 +5808,7 @@ exit 0\n";
                 model: None,
                 effort: None,
                 depends_on: None,
+                repo: None,
             },
         );
 

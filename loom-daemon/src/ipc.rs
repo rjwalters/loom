@@ -8,6 +8,7 @@ use crate::main_health_gate::MainHealthState;
 use crate::sweep_registry::{BeginCancel, SweepRegistry};
 use crate::terminal::TerminalManager;
 use crate::types::{DaemonStatusReport, Event, Request, Response};
+use crate::workspace_pool::WorkspacePool;
 use anyhow::Result;
 use chrono::Utc;
 use std::path::{Path, PathBuf};
@@ -105,6 +106,13 @@ pub struct IpcServer {
     /// server so the `DaemonStatus` request (#3891) can report the current
     /// halt state — the same `Arc` the work-finder and gate loop share.
     main_health_state: Arc<MainHealthState>,
+    /// The per-workspace sweep-registry pool (#3929). The default workspace's
+    /// registry is seeded into it, and the autonomous loops provision the other
+    /// managed repos' registries on demand. Threaded into the IPC handler so a
+    /// request carrying an explicit `workspace_root` can observe/address a sweep
+    /// in a managed repo other than the default workspace, and so
+    /// `DeregisterWorkspace` can evict the in-memory entry.
+    workspace_pool: Arc<WorkspacePool>,
 }
 
 impl IpcServer {
@@ -115,6 +123,7 @@ impl IpcServer {
         sweep_registry: Arc<Mutex<SweepRegistry>>,
         event_bus: Arc<EventBus>,
         main_health_state: Arc<MainHealthState>,
+        workspace_pool: Arc<WorkspacePool>,
     ) -> Self {
         Self {
             socket_path,
@@ -123,6 +132,7 @@ impl IpcServer {
             sweep_registry,
             event_bus,
             main_health_state,
+            workspace_pool,
         }
     }
 
@@ -157,8 +167,9 @@ impl IpcServer {
                     let sr = self.sweep_registry.clone();
                     let bus = self.event_bus.clone();
                     let health = self.main_health_state.clone();
+                    let pool = self.workspace_pool.clone();
                     tokio::spawn(async move {
-                        if let Err(e) = handle_client(stream, tm, db, sr, bus, health).await {
+                        if let Err(e) = handle_client(stream, tm, db, sr, bus, health, pool).await {
                             log::error!("Client error: {e}");
                         }
                     });
@@ -178,6 +189,7 @@ async fn handle_client(
     sweep_registry: Arc<Mutex<SweepRegistry>>,
     event_bus: Arc<EventBus>,
     main_health_state: Arc<MainHealthState>,
+    workspace_pool: Arc<WorkspacePool>,
 ) -> Result<()> {
     let (reader, mut writer) = stream.into_split();
     let mut lines = BufReader::new(reader).lines();
@@ -223,14 +235,13 @@ async fn handle_client(
         if let Request::CancelSweep {
             sweep_id,
             grace_secs,
+            workspace_root,
         } = request
         {
-            let response = cancel_sweep_nonblocking(
-                &sweep_registry,
-                &sweep_id,
-                Duration::from_secs(grace_secs),
-            )
-            .await;
+            let target =
+                resolve_registry(&sweep_registry, &workspace_pool, workspace_root.as_deref());
+            let response =
+                cancel_sweep_nonblocking(&target, &sweep_id, Duration::from_secs(grace_secs)).await;
             let response_json = serde_json::to_string(&response)?;
             writer.write_all(response_json.as_bytes()).await?;
             writer.write_all(b"\n").await?;
@@ -252,8 +263,14 @@ async fn handle_client(
             continue;
         }
 
-        let response =
-            handle_request(request, &terminal_manager, &activity_db, &sweep_registry, &event_bus);
+        let response = handle_request(
+            request,
+            &terminal_manager,
+            &activity_db,
+            &sweep_registry,
+            &event_bus,
+            &workspace_pool,
+        );
 
         let response_json = serde_json::to_string(&response)?;
         writer.write_all(response_json.as_bytes()).await?;
@@ -482,6 +499,29 @@ pub fn build_daemon_status(
 // Allow expect_used because mutex poisoning is a panic-level error that indicates
 // a thread panicked while holding the lock. This is not recoverable and should crash.
 // Allow too_many_lines because this is a central request dispatcher that handles all IPC commands.
+/// Resolve which per-repo [`SweepRegistry`] a sweep request targets (Issue
+/// #3929). When `workspace_root` is `Some(non-empty)`, the root is normalized
+/// (canonicalize/absolutize — matching how `WorkspaceRegistry::add` and the
+/// autonomous loops key the pool) and the pool provisions/returns that repo's
+/// registry. When `None`/empty, the daemon's default-workspace registry is
+/// returned, preserving pre-#3929 single-repo behavior byte-for-byte.
+///
+/// A `Some(root)` that equals the seeded default workspace root resolves back to
+/// the same shared default registry (the pool returns the seeded instance).
+fn resolve_registry(
+    default: &Arc<Mutex<SweepRegistry>>,
+    workspace_pool: &Arc<WorkspacePool>,
+    workspace_root: Option<&str>,
+) -> Arc<Mutex<SweepRegistry>> {
+    match workspace_root {
+        Some(root) if !root.trim().is_empty() => {
+            let normalized = crate::workspace_registry::normalize_path(Path::new(root));
+            workspace_pool.get_or_provision(&normalized)
+        }
+        _ => default.clone(),
+    }
+}
+
 #[allow(clippy::expect_used, clippy::too_many_lines)]
 fn handle_request(
     request: Request,
@@ -489,6 +529,7 @@ fn handle_request(
     activity_db: &Arc<Mutex<ActivityDb>>,
     sweep_registry: &Arc<Mutex<SweepRegistry>>,
     event_bus: &Arc<EventBus>,
+    workspace_pool: &Arc<WorkspacePool>,
 ) -> Response {
     match request {
         Request::Ping => Response::Pong,
@@ -1070,10 +1111,11 @@ fn handle_request(
             model,
             effort,
             depends_on,
+            workspace_root,
         } => {
-            let mut sr = sweep_registry
-                .lock()
-                .expect("Sweep registry mutex poisoned");
+            let target =
+                resolve_registry(sweep_registry, workspace_pool, workspace_root.as_deref());
+            let mut sr = target.lock().expect("Sweep registry mutex poisoned");
             match sr.dispatch(
                 &kind,
                 idempotency_key,
@@ -1093,10 +1135,13 @@ fn handle_request(
             }
         }
 
-        Request::ListSweeps { state_filter } => {
-            let mut sr = sweep_registry
-                .lock()
-                .expect("Sweep registry mutex poisoned");
+        Request::ListSweeps {
+            state_filter,
+            workspace_root,
+        } => {
+            let target =
+                resolve_registry(sweep_registry, workspace_pool, workspace_root.as_deref());
+            let mut sr = target.lock().expect("Sweep registry mutex poisoned");
             // Reap-on-read (Issue #3893): reconcile liveness before listing so a
             // sweep whose child has already exited is never reported `Running`
             // just because the 30s reaper timer has not ticked yet.
@@ -1108,10 +1153,13 @@ fn handle_request(
         // ====================================================================
         // Sweep Monitoring Handlers (Issue #3455 — Phase C of #3449)
         // ====================================================================
-        Request::GetSweepStatus { sweep_id } => {
-            let mut sr = sweep_registry
-                .lock()
-                .expect("Sweep registry mutex poisoned");
+        Request::GetSweepStatus {
+            sweep_id,
+            workspace_root,
+        } => {
+            let target =
+                resolve_registry(sweep_registry, workspace_pool, workspace_root.as_deref());
+            let mut sr = target.lock().expect("Sweep registry mutex poisoned");
             // Reap-on-read (Issue #3893): reconcile liveness so a status query
             // reflects a child that has exited rather than a stale `Running`.
             sr.reap_liveness();
@@ -1119,10 +1167,14 @@ fn handle_request(
             Response::SweepStatus { info }
         }
 
-        Request::TailSweepLog { sweep_id, lines } => {
-            let sr = sweep_registry
-                .lock()
-                .expect("Sweep registry mutex poisoned");
+        Request::TailSweepLog {
+            sweep_id,
+            lines,
+            workspace_root,
+        } => {
+            let target =
+                resolve_registry(sweep_registry, workspace_pool, workspace_root.as_deref());
+            let sr = target.lock().expect("Sweep registry mutex poisoned");
             match sr.tail_log(&sweep_id, lines) {
                 Ok((log_path, lines)) => Response::SweepLogTail {
                     sweep_id,
@@ -1138,6 +1190,7 @@ fn handle_request(
         Request::CancelSweep {
             sweep_id,
             grace_secs,
+            workspace_root,
         } => {
             // Production traffic never reaches this arm: `handle_client`
             // intercepts `CancelSweep` and services it via the non-blocking
@@ -1145,9 +1198,9 @@ fn handle_request(
             // window does not hold the registry mutex. This synchronous
             // fallback (holding the lock across the full grace) remains for
             // direct/unit-test callers where lock contention is irrelevant.
-            let mut sr = sweep_registry
-                .lock()
-                .expect("Sweep registry mutex poisoned");
+            let target =
+                resolve_registry(sweep_registry, workspace_pool, workspace_root.as_deref());
+            let mut sr = target.lock().expect("Sweep registry mutex poisoned");
             match sr.cancel(&sweep_id, std::time::Duration::from_secs(grace_secs)) {
                 Ok(outcome) => Response::SweepCancelled {
                     sweep_id: outcome.sweep_id,
@@ -1217,7 +1270,7 @@ fn handle_request(
             config_overrides,
         } => handle_register_workspace(&root, config_overrides),
 
-        Request::DeregisterWorkspace { root } => handle_deregister_workspace(&root),
+        Request::DeregisterWorkspace { root } => handle_deregister_workspace(&root, workspace_pool),
 
         Request::ListWorkspaces => handle_list_workspaces(),
 
@@ -1279,8 +1332,12 @@ fn handle_register_workspace(root: &str, config_overrides: Option<serde_json::Va
 }
 
 /// Load, mutate, and persist the workspace registry for a `DeregisterWorkspace`
-/// request.
-fn handle_deregister_workspace(root: &str) -> Response {
+/// request, then evict the deregistered repo's in-memory sweep registry from the
+/// [`WorkspacePool`] (Issue #3929) so its background reaper stops and it does not
+/// leak. The seeded default workspace is guarded inside [`WorkspacePool::evict`]
+/// (a no-op there), and a live sweep child is never killed — only the in-memory
+/// tracking goes away.
+fn handle_deregister_workspace(root: &str, workspace_pool: &Arc<WorkspacePool>) -> Response {
     use crate::workspace_registry::{default_registry_path, normalize_path, WorkspaceRegistry};
 
     let path = match default_registry_path() {
@@ -1307,6 +1364,16 @@ fn handle_deregister_workspace(root: &str) -> Response {
                 message: format!("deregister_workspace: save failed: {e}"),
             };
         }
+    }
+    // Evict the in-memory pool entry (best-effort, idempotent). The pool keys on
+    // the same normalized root the registry stores, and guards the seeded
+    // default workspace internally.
+    let evicted = workspace_pool.evict(&canonical);
+    if evicted {
+        log::info!(
+            "deregister_workspace: evicted pooled sweep registry for {}",
+            canonical.display()
+        );
     }
     Response::WorkspaceDeregistered {
         root: canonical,
@@ -1352,6 +1419,24 @@ mod tests {
         Arc<EventBus>,
     );
 
+    /// A process-wide leaked runtime handle so [`WorkspacePool`]s can be built in
+    /// synchronous `#[test]` cases (Issue #3929). Reapers spawned onto it during
+    /// provisioning are harmless in tests.
+    fn test_runtime_handle() -> tokio::runtime::Handle {
+        use std::sync::OnceLock;
+        static RT: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
+        RT.get_or_init(|| tokio::runtime::Runtime::new().unwrap())
+            .handle()
+            .clone()
+    }
+
+    /// A [`WorkspacePool`] for `handle_request` tests (Issue #3929). The
+    /// default-workspace (`workspace_root: None`) paths these tests exercise
+    /// never provision, so no task is actually spawned.
+    fn test_pool() -> Arc<WorkspacePool> {
+        Arc::new(WorkspacePool::new(Arc::new(EventBus::new()), test_runtime_handle()))
+    }
+
     fn setup_test_context() -> TestContext {
         let tm = Arc::new(Mutex::new(TerminalManager::new()));
         let dir = tempdir().unwrap();
@@ -1374,7 +1459,7 @@ mod tests {
     #[test]
     fn test_handle_request_ping() {
         let (tm, db, sr, bus) = setup_test_context();
-        let response = handle_request(Request::Ping, &tm, &db, &sr, &bus);
+        let response = handle_request(Request::Ping, &tm, &db, &sr, &bus, &test_pool());
         assert!(matches!(response, Response::Pong));
     }
 
@@ -1385,7 +1470,7 @@ mod tests {
         let (tm, db, sr, bus) = setup_test_context();
         // Set LOOM_NO_RESTORE to prevent tmux restore attempts
         std::env::set_var("LOOM_NO_RESTORE", "1");
-        let response = handle_request(Request::ListTerminals, &tm, &db, &sr, &bus);
+        let response = handle_request(Request::ListTerminals, &tm, &db, &sr, &bus, &test_pool());
         std::env::remove_var("LOOM_NO_RESTORE");
         match response {
             Response::TerminalList { terminals } => {
@@ -1408,6 +1493,7 @@ mod tests {
             &db,
             &sr,
             &bus,
+            &test_pool(),
         );
         match response {
             Response::CurrentCommit { commit } => {
@@ -1431,6 +1517,7 @@ mod tests {
             &db,
             &sr,
             &bus,
+            &test_pool(),
         );
         match response {
             Response::TerminalActivity { entries } => {
@@ -1445,7 +1532,7 @@ mod tests {
     #[test]
     fn test_handle_request_get_all_claims_empty() {
         let (tm, db, sr, bus) = setup_test_context();
-        let response = handle_request(Request::GetAllClaims, &tm, &db, &sr, &bus);
+        let response = handle_request(Request::GetAllClaims, &tm, &db, &sr, &bus, &test_pool());
         match response {
             Response::Claims(claims) => {
                 assert!(claims.is_empty());
@@ -1467,6 +1554,7 @@ mod tests {
             &db,
             &sr,
             &bus,
+            &test_pool(),
         );
         match response {
             Response::ClaimsSummary(summary) => {
@@ -1491,6 +1579,7 @@ mod tests {
             &db,
             &sr,
             &bus,
+            &test_pool(),
         );
         match response {
             Response::GitChangesCaptured {
@@ -1555,14 +1644,144 @@ exit 0
     fn test_handle_request_list_sweeps_empty() {
         let (tm, db, _, bus) = setup_test_context();
         let (sr, _dir, _rec) = setup_sweep_registry_in_tempdir();
-        let response =
-            handle_request(Request::ListSweeps { state_filter: None }, &tm, &db, &sr, &bus);
+        let response = handle_request(
+            Request::ListSweeps {
+                state_filter: None,
+                workspace_root: None,
+            },
+            &tm,
+            &db,
+            &sr,
+            &bus,
+            &test_pool(),
+        );
         match response {
             Response::SweepList { sweeps } => {
                 assert!(sweeps.is_empty());
             }
             other => panic!("Expected SweepList, got: {other:?}"),
         }
+    }
+
+    /// Issue #3929: a request carrying an explicit `workspace_root` routes to
+    /// that repo's registry (via the pool), not the default workspace — and the
+    /// returned `SweepInfo` carries the owning `repo`. Omitting `workspace_root`
+    /// preserves default-workspace-only behavior (regression guard).
+    #[test]
+    #[serial_test::serial]
+    fn test_sweep_requests_route_to_explicit_workspace_root() {
+        let (tm, db, _, bus) = setup_test_context();
+
+        // Default workspace (repo A) and a second managed repo (repo B), each a
+        // fixture registry with a fake spawn bin + skip_label_flip.
+        let (sr_default, dir_a, _rec_a) = setup_sweep_registry_in_tempdir();
+        let (sr_b, dir_b, _rec_b) = setup_sweep_registry_in_tempdir();
+        let root_a = crate::workspace_registry::normalize_path(dir_a.path());
+        let root_b = crate::workspace_registry::normalize_path(dir_b.path());
+
+        // A pool seeded with both registries (mirrors main's seed of the default
+        // workspace, plus repo B provisioned by the autonomous loops).
+        let pool = Arc::new(WorkspacePool::new(Arc::new(EventBus::new()), test_runtime_handle()));
+        pool.seed(root_a, sr_default.clone());
+        pool.seed(root_b.clone(), sr_b.clone());
+
+        // Dispatch issue #42 into repo B explicitly.
+        let dispatched = handle_request(
+            Request::DispatchSweep {
+                kind: SweepKind::Issue(42),
+                idempotency_key: None,
+                model: None,
+                effort: None,
+                depends_on: None,
+                workspace_root: Some(dir_b.path().to_string_lossy().into_owned()),
+            },
+            &tm,
+            &db,
+            &sr_default,
+            &bus,
+            &pool,
+        );
+        let sweep_id = match dispatched {
+            Response::SweepDispatched { sweep_id, .. } => sweep_id,
+            other => panic!("Expected SweepDispatched, got: {other:?}"),
+        };
+
+        // repo B's registry sees the sweep, and its SweepInfo.repo names repo B.
+        let listed_b = handle_request(
+            Request::ListSweeps {
+                state_filter: None,
+                workspace_root: Some(dir_b.path().to_string_lossy().into_owned()),
+            },
+            &tm,
+            &db,
+            &sr_default,
+            &bus,
+            &pool,
+        );
+        match listed_b {
+            Response::SweepList { sweeps } => {
+                assert_eq!(sweeps.len(), 1, "repo B registry should hold the sweep");
+                assert_eq!(
+                    sweeps[0].repo.as_deref(),
+                    Some(dir_b.path().display().to_string().as_str()),
+                    "SweepInfo.repo must name the owning workspace root"
+                );
+            }
+            other => panic!("Expected SweepList, got: {other:?}"),
+        }
+
+        // The default workspace (workspace_root: None) must NOT see repo B's
+        // sweep — this is the identity guarantee (two repos' issue #42 differ).
+        let listed_default = handle_request(
+            Request::ListSweeps {
+                state_filter: None,
+                workspace_root: None,
+            },
+            &tm,
+            &db,
+            &sr_default,
+            &bus,
+            &pool,
+        );
+        match listed_default {
+            Response::SweepList { sweeps } => {
+                assert!(sweeps.is_empty(), "default workspace must not see repo B's sweep");
+            }
+            other => panic!("Expected SweepList, got: {other:?}"),
+        }
+
+        // GetSweepStatus is likewise workspace-scoped: found in repo B, absent
+        // from the default workspace.
+        let status_b = handle_request(
+            Request::GetSweepStatus {
+                sweep_id: sweep_id.clone(),
+                workspace_root: Some(dir_b.path().to_string_lossy().into_owned()),
+            },
+            &tm,
+            &db,
+            &sr_default,
+            &bus,
+            &pool,
+        );
+        assert!(
+            matches!(status_b, Response::SweepStatus { info: Some(_) }),
+            "sweep is observable via repo B's registry"
+        );
+        let status_default = handle_request(
+            Request::GetSweepStatus {
+                sweep_id,
+                workspace_root: None,
+            },
+            &tm,
+            &db,
+            &sr_default,
+            &bus,
+            &pool,
+        );
+        assert!(
+            matches!(status_default, Response::SweepStatus { info: None }),
+            "sweep is NOT observable via the default workspace"
+        );
     }
 
     #[test]
@@ -1578,11 +1797,13 @@ exit 0
                 model: None,
                 effort: None,
                 depends_on: None,
+                workspace_root: None,
             },
             &tm,
             &db,
             &sr,
             &bus,
+            &test_pool(),
         );
         match response {
             Response::SweepDispatched {
@@ -1603,8 +1824,17 @@ exit 0
         // immediately, so reap-on-read (Issue #3893) promptly reconciles the
         // entry to a terminal `Exited` state rather than over-reporting it as
         // `Running` — the entry is still listed, just no longer stale-Running.
-        let response =
-            handle_request(Request::ListSweeps { state_filter: None }, &tm, &db, &sr, &bus);
+        let response = handle_request(
+            Request::ListSweeps {
+                state_filter: None,
+                workspace_root: None,
+            },
+            &tm,
+            &db,
+            &sr,
+            &bus,
+            &test_pool(),
+        );
         match response {
             Response::SweepList { sweeps } => {
                 assert_eq!(sweeps.len(), 1);
@@ -1631,11 +1861,13 @@ exit 0
                 model: None,
                 effort: None,
                 depends_on: None,
+                workspace_root: None,
             },
             &tm,
             &db,
             &sr,
             &bus,
+            &test_pool(),
         );
         match response {
             Response::Error { message } => {
@@ -1664,6 +1896,7 @@ exit 0
                 model,
                 effort,
                 depends_on: _,
+                workspace_root: _,
             } => {
                 assert!(matches!(kind, SweepKind::Issue(42)));
                 assert!(idempotency_key.is_none());
@@ -1682,6 +1915,7 @@ exit 0
             model: Some("claude-sonnet-4-6".to_string()),
             effort: None,
             depends_on: None,
+            workspace_root: None,
         };
         let json = serde_json::to_string(&request).expect("serialize");
         let back: Request = serde_json::from_str(&json).expect("deserialize");
@@ -1692,6 +1926,7 @@ exit 0
                 model,
                 effort,
                 depends_on: _,
+                workspace_root: _,
             } => {
                 assert!(matches!(kind, SweepKind::Issue(7)));
                 assert_eq!(idempotency_key.as_deref(), Some("key-B"));
@@ -1710,6 +1945,7 @@ exit 0
             model: None,
             effort: None,
             depends_on: None,
+            workspace_root: None,
         };
         let json = serde_json::to_string(&request).expect("serialize");
         let back: Request = serde_json::from_str(&json).expect("deserialize");
@@ -1745,6 +1981,7 @@ exit 0
             model: Some("claude-sonnet-4-6".to_string()),
             effort: Some("xhigh".to_string()),
             depends_on: None,
+            workspace_root: None,
         };
         let json = serde_json::to_string(&request).expect("serialize");
         let back: Request = serde_json::from_str(&json).expect("deserialize");
@@ -1765,6 +2002,7 @@ exit 0
             model: None,
             effort: Some(String::new()),
             depends_on: None,
+            workspace_root: None,
         };
         let json = serde_json::to_string(&request).expect("serialize");
         let back: Request = serde_json::from_str(&json).expect("deserialize");
@@ -1803,6 +2041,7 @@ exit 0
             model: None,
             effort: None,
             depends_on: Some(3726),
+            workspace_root: None,
         };
         let json = serde_json::to_string(&request).expect("serialize");
         let back: Request = serde_json::from_str(&json).expect("deserialize");
@@ -1830,6 +2069,7 @@ exit 0
             &db,
             &sr,
             &bus,
+            &test_pool(),
         );
 
         match response {
@@ -1860,11 +2100,13 @@ exit 0
         let response = handle_request(
             Request::GetSweepStatus {
                 sweep_id: "no-such-sweep".to_string(),
+                workspace_root: None,
             },
             &tm,
             &db,
             &sr,
             &bus,
+            &test_pool(),
         );
         match response {
             Response::SweepStatus { info } => assert!(info.is_none()),
@@ -1880,11 +2122,13 @@ exit 0
             Request::TailSweepLog {
                 sweep_id: "no-such-sweep".to_string(),
                 lines: 10,
+                workspace_root: None,
             },
             &tm,
             &db,
             &sr,
             &bus,
+            &test_pool(),
         );
         match response {
             Response::Error { message } => {
@@ -1905,11 +2149,13 @@ exit 0
             Request::CancelSweep {
                 sweep_id: "no-such-sweep".to_string(),
                 grace_secs: 1,
+                workspace_root: None,
             },
             &tm,
             &db,
             &sr,
             &bus,
+            &test_pool(),
         );
         match response {
             Response::Error { message } => {
@@ -1936,11 +2182,13 @@ exit 0
                 model: None,
                 effort: None,
                 depends_on: None,
+                workspace_root: None,
             },
             &tm,
             &db,
             &sr,
             &bus,
+            &test_pool(),
         );
         let sweep_id = match dispatched {
             Response::SweepDispatched { sweep_id, .. } => sweep_id,
@@ -1950,11 +2198,13 @@ exit 0
         let response = handle_request(
             Request::GetSweepStatus {
                 sweep_id: sweep_id.clone(),
+                workspace_root: None,
             },
             &tm,
             &db,
             &sr,
             &bus,
+            &test_pool(),
         );
         match response {
             Response::SweepStatus { info } => {
@@ -2129,7 +2379,7 @@ exit 0
     #[test]
     fn test_handle_request_daemon_status_short_circuits_to_error() {
         let (tm, db, sr, bus) = setup_test_context();
-        let response = handle_request(Request::DaemonStatus, &tm, &db, &sr, &bus);
+        let response = handle_request(Request::DaemonStatus, &tm, &db, &sr, &bus, &test_pool());
         match response {
             Response::Error { message } => {
                 assert!(
@@ -2155,6 +2405,7 @@ exit 0
             &db,
             &sr,
             &bus,
+            &test_pool(),
         );
         match response {
             Response::Error { message } => {
@@ -2185,7 +2436,7 @@ exit 0
         std::env::set_var("LOOM_WORKSPACES_PATH", &registry_path);
 
         // Empty registry: list returns no workspaces.
-        let response = handle_request(Request::ListWorkspaces, &tm, &db, &sr, &bus);
+        let response = handle_request(Request::ListWorkspaces, &tm, &db, &sr, &bus, &test_pool());
         match response {
             Response::WorkspaceList { workspaces } => assert!(workspaces.is_empty()),
             other => panic!("Expected WorkspaceList, got: {other:?}"),
@@ -2201,6 +2452,7 @@ exit 0
             &db,
             &sr,
             &bus,
+            &test_pool(),
         );
         match response {
             Response::WorkspaceRegistered {
@@ -2224,6 +2476,7 @@ exit 0
             &db,
             &sr,
             &bus,
+            &test_pool(),
         );
         match response {
             Response::WorkspaceRegistered {
@@ -2233,7 +2486,7 @@ exit 0
         }
 
         // List now shows exactly one.
-        let response = handle_request(Request::ListWorkspaces, &tm, &db, &sr, &bus);
+        let response = handle_request(Request::ListWorkspaces, &tm, &db, &sr, &bus, &test_pool());
         match response {
             Response::WorkspaceList { workspaces } => {
                 assert_eq!(workspaces.len(), 1);
@@ -2251,6 +2504,7 @@ exit 0
             &db,
             &sr,
             &bus,
+            &test_pool(),
         );
         match response {
             Response::WorkspaceDeregistered { was_present, .. } => assert!(was_present),
@@ -2266,6 +2520,7 @@ exit 0
             &db,
             &sr,
             &bus,
+            &test_pool(),
         );
         match response {
             Response::WorkspaceDeregistered { was_present, .. } => assert!(!was_present),
