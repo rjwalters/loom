@@ -177,6 +177,94 @@ pub fn read_ranking(workspace_root: &Path) -> Option<RankingSnapshot> {
     }
 }
 
+// ============================================================================
+// Fresh-probe capacity (issue #3936)
+// ============================================================================
+
+/// Near-ceiling 7d-utilization threshold: an account at or above this fraction
+/// is treated as exhausted/near-ceiling and **never** counted healthy, mirroring
+/// `loom-tokens`' `EXHAUSTED_THRESHOLD` (`check.py`). Kept here so the daemon's
+/// status view applies the *same* threshold the probe uses when it assigns the
+/// discrete status word — closing the #3936 gap where a `99%`-7d account whose
+/// status word said `available` was still counted healthy.
+pub const NEAR_CEILING_THRESHOLD: f64 = 0.95;
+
+/// Decide whether a single probed account is healthy under the unified rule.
+///
+/// An account is healthy **only** when its probe status word is `available`
+/// *and* its 7d utilization is below [`NEAR_CEILING_THRESHOLD`]. The utilization
+/// override is what fixes #3936: a stale or monitor-sourced `available` status
+/// on an account that has actually reached the 7d ceiling (e.g. `99%`) is
+/// treated as unhealthy anyway, so the summary count and the per-token table can
+/// never disagree about it.
+#[must_use]
+pub fn probe_account_healthy(status: &str, util_7d: Option<f64>) -> bool {
+    if let Some(u) = util_7d {
+        if u >= NEAR_CEILING_THRESHOLD {
+            return false;
+        }
+    }
+    status.trim() == "available"
+}
+
+/// The status word to *display* for an account, applying the same near-ceiling
+/// override as [`probe_account_healthy`]. An `available` account at/above the
+/// 7d ceiling renders as `exhausted` so the per-token table never shows a row
+/// that contradicts the healthy count (#3936). Every other status word is
+/// passed through unchanged.
+#[must_use]
+pub fn effective_probe_status(status: &str, util_7d: Option<f64>) -> String {
+    let trimmed = status.trim();
+    if trimmed == "available" {
+        if let Some(u) = util_7d {
+            if u >= NEAR_CEILING_THRESHOLD {
+                return "exhausted".to_string();
+            }
+        }
+    }
+    trimmed.to_string()
+}
+
+/// Aggregate healthy/exhausted counts derived from a fresh `loom-tokens check
+/// --json` probe, applying [`probe_account_healthy`] uniformly.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ProbeCapacity {
+    /// Total accounts in the probe.
+    pub total: usize,
+    /// Accounts healthy under the unified rule (available AND below ceiling).
+    pub healthy: usize,
+    /// Accounts not healthy — `total - healthy`.
+    pub exhausted: usize,
+}
+
+/// Summarize a fresh probe into a [`ProbeCapacity`].
+///
+/// Each item is the account's `(status_word, 7d_utilization)` as read from the
+/// `loom-tokens check --json` accounts array. This is the single source of truth
+/// the status view uses for the capacity summary, the healthy-tokens cap input,
+/// and (via [`effective_probe_status`]) the per-token table — so all three are
+/// computed from the same source and the same threshold and cannot contradict
+/// each other (#3936, acceptance criterion 1).
+#[must_use]
+pub fn summarize_probe<'a, I>(accounts: I) -> ProbeCapacity
+where
+    I: IntoIterator<Item = (&'a str, Option<f64>)>,
+{
+    let mut total = 0usize;
+    let mut healthy = 0usize;
+    for (status, util_7d) in accounts {
+        total += 1;
+        if probe_account_healthy(status, util_7d) {
+            healthy += 1;
+        }
+    }
+    ProbeCapacity {
+        total,
+        healthy,
+        exhausted: total - healthy,
+    }
+}
+
 /// The health-adjusted token-axis concurrency limit.
 ///
 /// When ranking data exists, this is the count of `available` accounts — the
@@ -601,5 +689,110 @@ mod tests {
         assert_eq!(format_minutes(90), "1h 30m");
         assert_eq!(format_minutes(120), "2h");
         assert_eq!(format_minutes(0), "0m");
+    }
+
+    // ------------------------------------------------------------------
+    // Fresh-probe capacity (issue #3936)
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn probe_account_healthy_applies_near_ceiling_override() {
+        // A genuinely-available account below the ceiling is healthy.
+        assert!(probe_account_healthy("available", Some(0.10)));
+        assert!(probe_account_healthy("available", Some(0.94)));
+        assert!(probe_account_healthy("available", None));
+        // At/above the 95% near-ceiling threshold it is NEVER healthy, even
+        // though the probe's status word still says `available` (#3936).
+        assert!(!probe_account_healthy("available", Some(0.95)));
+        assert!(!probe_account_healthy("available", Some(0.99)));
+        assert!(!probe_account_healthy("available", Some(1.00)));
+        // Non-`available` status words are never healthy regardless of util.
+        assert!(!probe_account_healthy("exhausted", Some(0.10)));
+        assert!(!probe_account_healthy("rate_limited", Some(0.10)));
+        assert!(!probe_account_healthy("blocked", None));
+        assert!(!probe_account_healthy("error", None));
+        // Whitespace tolerance.
+        assert!(probe_account_healthy(" available ", Some(0.10)));
+    }
+
+    #[test]
+    fn effective_probe_status_corrects_near_ceiling_available() {
+        // The 99%-7d `available` row renders as `exhausted` so the table never
+        // contradicts the healthy count (#3936: agent3-2amlogic at 99%).
+        assert_eq!(effective_probe_status("available", Some(0.99)), "exhausted");
+        assert_eq!(effective_probe_status("available", Some(0.95)), "exhausted");
+        // Below the ceiling it stays `available`.
+        assert_eq!(effective_probe_status("available", Some(0.50)), "available");
+        assert_eq!(effective_probe_status("available", None), "available");
+        // Other status words pass through untouched.
+        assert_eq!(effective_probe_status("exhausted", Some(1.0)), "exhausted");
+        assert_eq!(effective_probe_status("rate_limited", None), "rate_limited");
+        assert_eq!(effective_probe_status("blocked", None), "blocked");
+    }
+
+    #[test]
+    fn summarize_probe_mixed_pool_is_self_consistent() {
+        // A mixed pool: some available-and-low, one near-ceiling `available`
+        // (the #3936 mislabel), some exhausted, one rate_limited. This mirrors
+        // the live incident (2 truly available, 5 not) and asserts the summary
+        // agrees with a table rendered from the SAME source + threshold.
+        let accounts: Vec<(&str, Option<f64>)> = vec![
+            ("available", Some(0.10)),    // healthy
+            ("available", Some(0.42)),    // healthy
+            ("available", Some(0.99)),    // near-ceiling mislabel -> NOT healthy
+            ("exhausted", Some(1.00)),    // not healthy
+            ("exhausted", Some(1.00)),    // not healthy
+            ("exhausted", Some(0.97)),    // not healthy
+            ("rate_limited", Some(0.30)), // not healthy
+        ];
+
+        let cap = summarize_probe(accounts.iter().copied());
+        assert_eq!(cap.total, 7);
+        assert_eq!(cap.healthy, 2, "only the two below-ceiling `available` rows");
+        assert_eq!(cap.exhausted, 5);
+        assert_eq!(cap.healthy + cap.exhausted, cap.total);
+
+        // Table/summary consistency: the number of rows the table renders as an
+        // effective `available` status must equal the summary's healthy count,
+        // and NO row shows `available` while being counted unhealthy (#3936).
+        let table_available = accounts
+            .iter()
+            .filter(|(s, u)| effective_probe_status(s, *u) == "available")
+            .count();
+        assert_eq!(
+            table_available, cap.healthy,
+            "per-token table `available` rows must match the healthy summary count"
+        );
+        for (s, u) in &accounts {
+            let shown = effective_probe_status(s, *u);
+            if shown == "available" {
+                assert!(
+                    probe_account_healthy(s, *u),
+                    "a row shown `available` must be counted healthy"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn summarize_probe_empty_is_zero() {
+        let cap = summarize_probe(std::iter::empty());
+        assert_eq!(cap, ProbeCapacity::default());
+        assert_eq!(cap.total, 0);
+        assert_eq!(cap.healthy, 0);
+        assert_eq!(cap.exhausted, 0);
+    }
+
+    #[test]
+    fn summarize_probe_all_healthy_and_all_exhausted() {
+        let all_ok: Vec<(&str, Option<f64>)> =
+            vec![("available", Some(0.1)), ("available", Some(0.2))];
+        let cap = summarize_probe(all_ok.iter().copied());
+        assert_eq!((cap.total, cap.healthy, cap.exhausted), (2, 2, 0));
+
+        let all_bad: Vec<(&str, Option<f64>)> =
+            vec![("exhausted", Some(1.0)), ("available", Some(0.96))];
+        let cap = summarize_probe(all_bad.iter().copied());
+        assert_eq!((cap.total, cap.healthy, cap.exhausted), (2, 0, 2));
     }
 }
