@@ -92,6 +92,88 @@ pub const BG_WAIT_CEILING_ENV: &str = "CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS";
 /// "recently exited sweeps should still show up in `list_sweeps`".
 pub const TERMINAL_RETENTION_SECS: i64 = 3600;
 
+/// Issue #3944: the shipped default model for **autonomous / daemon-dispatched**
+/// sweep children when neither an explicit dispatch `model` param nor an
+/// `autonomous.model` config value is present.
+///
+/// This is deliberately a **non-premium tier**. Without it, a daemon-dispatched
+/// child (`claude -p "/loom:sweep N"`) emits **no** `--model` flag and inherits
+/// whatever model the operator last configured interactively — on the v0.15.0
+/// canary that was a premium tier (Fable 5) which meters premium usage credits
+/// and hard-failed every spawn with "out of usage credits". An autonomous fleet
+/// must never silently inherit a premium interactive default, so daemon dispatch
+/// always pins an explicit, cost-appropriate model. `sonnet` is chosen as the
+/// sane default (fast + cheap for the bulk of build work); override per-repo via
+/// `autonomous.model` in `.loom/config.json`, or per-dispatch via the
+/// `dispatch_sweep` `model` param.
+pub const DEFAULT_DISPATCH_MODEL: &str = "sonnet";
+
+/// Issue #3944: which tier of the dispatch-model precedence chain supplied the
+/// resolved model. Surfaced in the daemon dispatch log line so an operator can
+/// tell *why* a child is running a given model.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModelSource {
+    /// An explicit `dispatch_sweep` `model` param (highest precedence).
+    Param,
+    /// `autonomous.model` in `.loom/config.json`.
+    Config,
+    /// The shipped [`DEFAULT_DISPATCH_MODEL`] fallback (never a premium tier).
+    Default,
+}
+
+impl ModelSource {
+    /// A stable lower-case label for logging (`param` / `config` / `default`).
+    #[must_use]
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ModelSource::Param => "param",
+            ModelSource::Config => "config",
+            ModelSource::Default => "default",
+        }
+    }
+}
+
+/// Read `autonomous.model` from `<repo_root>/.loom/config.json`, soft-failing to
+/// `None` on any error (missing file, malformed JSON, absent `autonomous` /
+/// `model` key, empty/whitespace string). Mirrors the soft-fail contract of the
+/// other `autonomous.*` config readers (`work_finder::read_work_finder_config`,
+/// `main_health_gate::read_autonomous_gate_config`).
+#[must_use]
+pub fn read_autonomous_model(repo_root: &Path) -> Option<String> {
+    let path = repo_root.join(".loom").join("config.json");
+    let contents = std::fs::read_to_string(&path).ok()?;
+    let config: serde_json::Value = serde_json::from_str(&contents).ok()?;
+    config
+        .get("autonomous")?
+        .get("model")?
+        .as_str()
+        .map(str::trim)
+        .filter(|m| !m.is_empty())
+        .map(String::from)
+}
+
+/// Issue #3944: resolve the model a daemon-dispatched child should run with,
+/// per the precedence **explicit dispatch `model` param > `autonomous.model` in
+/// `.loom/config.json` > shipped [`DEFAULT_DISPATCH_MODEL`]**. Empty/whitespace
+/// strings are treated as unset at every tier. Returns the resolved model plus
+/// the [`ModelSource`] that supplied it (for the dispatch log line).
+///
+/// All autonomous dispatch paths (work-finder, epic supervisor) resolve with
+/// `explicit = None` so they never fall through to the CLI-inherited default;
+/// `dispatch_sweep` passes its optional `model` param as `explicit` so an
+/// explicit request still wins, and an absent one still lands on the shipped
+/// default rather than the operator's interactive CLI default.
+#[must_use]
+pub fn resolve_dispatch_model(repo_root: &Path, explicit: Option<&str>) -> (String, ModelSource) {
+    if let Some(m) = explicit.map(str::trim).filter(|m| !m.is_empty()) {
+        return (m.to_string(), ModelSource::Param);
+    }
+    if let Some(m) = read_autonomous_model(repo_root) {
+        return (m, ModelSource::Config);
+    }
+    (DEFAULT_DISPATCH_MODEL.to_string(), ModelSource::Default)
+}
+
 /// Issue #3730: experiment-related env vars forwarded to the detached sweep
 /// child via an EXPLICIT ALLOWLIST (never a blanket env_clear/copy). Byte-exact
 /// names verified against `loom_tools/sweep_experiment.py` (`LOOM_MODEL_EXPERIMENT`,
@@ -3482,6 +3564,93 @@ exit 0
             None,
             "empty model must be recorded as None on the SweepInfo entry"
         );
+    }
+
+    // ========================================================================
+    // Issue #3944 — dispatch-model resolution (precedence + source)
+    // ========================================================================
+
+    /// Write a `.loom/config.json` under `root` with the given JSON body.
+    fn write_config(root: &Path, body: &str) {
+        let loom = root.join(".loom");
+        std::fs::create_dir_all(&loom).unwrap();
+        std::fs::write(loom.join("config.json"), body).unwrap();
+    }
+
+    /// With no `.loom/config.json` and no explicit param, resolution falls back
+    /// to the shipped non-premium default — NOT the CLI-inherited default.
+    #[test]
+    fn resolve_dispatch_model_falls_back_to_shipped_default() {
+        let dir = tempdir().unwrap();
+        let (model, source) = resolve_dispatch_model(dir.path(), None);
+        assert_eq!(model, DEFAULT_DISPATCH_MODEL);
+        assert_eq!(model, "sonnet", "shipped default must be a non-premium tier");
+        assert_eq!(source, ModelSource::Default);
+    }
+
+    /// `autonomous.model` in config wins over the shipped default when no
+    /// explicit param is supplied.
+    #[test]
+    fn resolve_dispatch_model_reads_autonomous_config() {
+        let dir = tempdir().unwrap();
+        write_config(dir.path(), r#"{"autonomous": {"model": "opus"}}"#);
+        let (model, source) = resolve_dispatch_model(dir.path(), None);
+        assert_eq!(model, "opus");
+        assert_eq!(source, ModelSource::Config);
+    }
+
+    /// An explicit dispatch `model` param wins over both config and the default
+    /// (the `dispatch_sweep` highest-precedence tier).
+    #[test]
+    fn resolve_dispatch_model_explicit_param_wins() {
+        let dir = tempdir().unwrap();
+        write_config(dir.path(), r#"{"autonomous": {"model": "opus"}}"#);
+        let (model, source) = resolve_dispatch_model(dir.path(), Some("claude-sonnet-4-6"));
+        assert_eq!(model, "claude-sonnet-4-6");
+        assert_eq!(source, ModelSource::Param);
+    }
+
+    /// Empty/whitespace values are treated as unset at every tier: an empty
+    /// explicit param falls through to config, and an empty config value falls
+    /// through to the shipped default.
+    #[test]
+    fn resolve_dispatch_model_treats_blank_as_unset() {
+        let dir = tempdir().unwrap();
+        // Empty explicit param + populated config → config wins.
+        write_config(dir.path(), r#"{"autonomous": {"model": "opus"}}"#);
+        let (model, source) = resolve_dispatch_model(dir.path(), Some("   "));
+        assert_eq!(model, "opus");
+        assert_eq!(source, ModelSource::Config);
+
+        // Blank config value → shipped default.
+        let dir2 = tempdir().unwrap();
+        write_config(dir2.path(), r#"{"autonomous": {"model": "  "}}"#);
+        let (model2, source2) = resolve_dispatch_model(dir2.path(), None);
+        assert_eq!(model2, DEFAULT_DISPATCH_MODEL);
+        assert_eq!(source2, ModelSource::Default);
+    }
+
+    /// A config with an `autonomous` block but no `model` key soft-falls to the
+    /// shipped default (no panic, no error).
+    #[test]
+    fn resolve_dispatch_model_absent_model_key_uses_default() {
+        let dir = tempdir().unwrap();
+        write_config(dir.path(), r#"{"autonomous": {"workFinder": {"enabled": true}}}"#);
+        assert_eq!(read_autonomous_model(dir.path()), None);
+        let (model, source) = resolve_dispatch_model(dir.path(), None);
+        assert_eq!(model, DEFAULT_DISPATCH_MODEL);
+        assert_eq!(source, ModelSource::Default);
+    }
+
+    /// Malformed JSON soft-fails to `None` (and thus the shipped default) rather
+    /// than propagating an error.
+    #[test]
+    fn resolve_dispatch_model_malformed_config_soft_fails() {
+        let dir = tempdir().unwrap();
+        write_config(dir.path(), "{ this is not valid json");
+        assert_eq!(read_autonomous_model(dir.path()), None);
+        let (model, _) = resolve_dispatch_model(dir.path(), None);
+        assert_eq!(model, DEFAULT_DISPATCH_MODEL);
     }
 
     /// Issue #3716: an `effort` dispatch param threads through to the spawn

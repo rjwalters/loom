@@ -1158,10 +1158,24 @@ fn handle_request(
             let target =
                 resolve_registry(sweep_registry, workspace_pool, workspace_root.as_deref());
             let mut sr = target.lock().expect("Sweep registry mutex poisoned");
+            // Model resolution (issue #3944): an explicit `model` param still
+            // wins, but an ABSENT one falls back to `autonomous.model` in
+            // `.loom/config.json` and then the shipped non-premium default —
+            // never the operator's interactive CLI default. This mirrors the
+            // autonomous work-finder / epic-supervisor dispatch paths so every
+            // daemon-dispatched child is pinned to an explicit model.
+            let repo_root = sr.config().workspace_root.clone();
+            let (resolved_model, model_source) =
+                crate::sweep_registry::resolve_dispatch_model(&repo_root, model.as_deref());
+            log::info!(
+                "dispatch_sweep: {:?} with model={resolved_model} (source={})",
+                kind,
+                model_source.as_str()
+            );
             match sr.dispatch(
                 &kind,
                 idempotency_key,
-                model.as_deref(),
+                Some(&resolved_model),
                 effort.as_deref(),
                 depends_on,
             ) {

@@ -1094,11 +1094,24 @@ pub mod forge {
                 .registry
                 .lock()
                 .map_err(|e| anyhow!("sweep registry mutex poisoned: {e}"))?;
+            // Autonomous dispatch model (issue #3944): resolve an EXPLICIT model
+            // (`autonomous.model` config > shipped non-premium default) so the
+            // spawned child never silently inherits the operator's interactive
+            // CLI default (which may be a premium tier that burns usage credits).
+            // No dispatch-param tier here — the work finder has no per-issue
+            // override — so `explicit = None`.
+            let repo_root = reg.config().workspace_root.clone();
+            let (model, source) = crate::sweep_registry::resolve_dispatch_model(&repo_root, None);
+            log::info!(
+                "work_finder: dispatching issue #{issue} with model={model} (source={})",
+                source.as_str()
+            );
             // Idempotency key + the registry's claim lock make a re-dispatch of
             // an already-running issue a no-op (`was_new = false`) or a loud
             // lock-collision error.
             let key = format!("workfinder-{issue}");
-            let outcome = reg.dispatch(&SweepKind::Issue(issue), Some(key), None, None, None)?;
+            let outcome =
+                reg.dispatch(&SweepKind::Issue(issue), Some(key), Some(&model), None, None)?;
             Ok(outcome.was_new)
         }
     }
