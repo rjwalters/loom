@@ -328,6 +328,78 @@ the in-memory tracking + reaper go away, so the sweep finishes normally but its
 terminal state becomes unobservable via IPC after the deregister — an accepted
 consequence of an explicit operator `workspace remove`.
 
+## Per-repo status breakdown + per-repo main-health gate (#3930 — phase d)
+
+Phase d is the final phase of the multi-repo daemon (#3926/#3835). Phases b/c
+already delivered the single global concurrency budget, per-workspace error
+isolation, and `(repo, issue)`-aware IPC/events. Phase d closes the two remaining
+gaps: making `loom-daemon status` see *every* managed repo, and making the
+reactive main-health gate **per-repo** instead of one flag gating all repos.
+
+### Per-repo status breakdown (AC1)
+
+`build_daemon_status` (`ipc.rs`) enumerates
+`WorkspaceRegistry::effective_roots(&fallback_root)` (an **empty** registry ⇒ the
+single daemon workspace, byte-for-byte the pre-#3930 view) and reads each root's
+own registry from the `WorkspacePool` (`get_or_provision`). It returns:
+
+- `DaemonStatusReport.in_flight` — now the **union** of non-terminal sweeps across
+  every registered repo, so a sweep the autonomous loops dispatched into a
+  non-default managed repo is finally visible in `loom-daemon status`.
+- `DaemonStatusReport.per_repo: Vec<RepoStatus>` — one entry per root with `root`,
+  `in_flight_count`, and `health_gate_halted`. Additive + `#[serde(default)]`, so
+  pre-#3930 JSON consumers round-trip unchanged (an absent `per_repo` deserializes
+  to an empty vec).
+
+`loom-daemon status` prints a **Managed repos** section (root, in-flight count,
+gate state); `loom-daemon status --json` adds the `per_repo` array. The
+dynamic-cap inputs (token pool, disk headroom, configured ceiling) remain computed
+once from the daemon's primary workspace — they are *machine-level* resources, so
+they stay a single global figure, not per-repo. `resolve_registry` (the
+per-request `workspace_root` targeting used by `dispatch_sweep` / `list_sweeps` /
+etc.) is unchanged: the cross-repo aggregation is a read-only snapshot for
+`DaemonStatus` only. A merged `list_sweeps` across all repos without an explicit
+`workspace_root` remains a deferred follow-up.
+
+### Per-repo main-health gate (AC2)
+
+The reactive gate was single-repo, single-flag: one `MainHealthState` driven by
+one gate check against the daemon's own workspace, applied uniformly to every
+registered repo's dispatch (a red `main` in one repo halted all repos; a red
+`main` in any *other* registered repo was never even checked). Phase d replaces
+the single flag with `WorkspaceHealthStates` — a `HashMap<PathBuf,
+Arc<MainHealthState>>` keyed by normalized root (mirroring `WorkspacePool`'s
+keying) — and adds `spawn_multi_main_health_gate_task`, which each cycle:
+
+1. Re-reads `effective_roots(&fallback_root)` (hot-applies `workspace add|remove`).
+2. Runs **one gate check per registered root**, resolving that root's own
+   enablement (`autonomous.mainHealthGate.enabled`, env > config > default) and
+   its own `buildGate` block — no new config schema. A root that is
+   disabled / has no `buildGate` block is treated as **always-green** (its halt
+   flag is cleared and no command runs). Gates run **sequentially** per tick, so
+   several minutes-long per-repo builds firing together never contend (each
+   `CommandGateRunner` already isolates its own `origin/main` sync + uuid temp
+   file).
+3. Applies each outcome to that root's own `MainHealthState`.
+
+`work_finder::tick_multi` now takes a `halted: &[bool]` slice parallel to the
+workspaces, so a **red repo skips only its own dispatch loop** (its backlog is
+still counted in `seen` for logging, and its in-flight sweeps still seed the
+shared global occupancy) while sibling repos keep dispatching. The epic supervisor
+likewise attaches each cached per-repo supervisor to that root's own
+`MainHealthState`. `DaemonStatusReport.main_health_gate_halted` keeps its pre-#3930
+meaning (the daemon's own primary workspace); per-repo halt lives in
+`per_repo[].health_gate_halted`.
+
+**Empty-registry equivalence**: with a single workspace exactly one root is ever
+keyed, so both the status view and the gate cadence/halt semantics reduce to the
+pre-#3930 single-workspace behavior byte-for-byte. Enablement is still opt-in
+(`LOOM_MAIN_HEALTH_GATE` / `autonomous.mainHealthGate`, precedence env > config >
+default); the startup master switch reads the daemon's own workspace config, so
+enabling the gate for a genuine multi-repo deployment is done with the machine-
+global `LOOM_MAIN_HEALTH_GATE=1` env var (each repo's own `buildGate` block then
+decides whether it actually gates).
+
 ## Reaper task
 
 The reaper (`sweep_registry::spawn_reaper_task`) ticks every 30 seconds

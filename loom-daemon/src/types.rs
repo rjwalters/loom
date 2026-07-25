@@ -656,6 +656,35 @@ pub struct DaemonStatusReport {
     /// pre-#3902 wire data / older clients compatible.
     #[serde(default)]
     pub capacity: CapacityReport,
+    /// Per-repo breakdown across every registered managed workspace (Issue #3930
+    /// — phase d of #3835/#3926). One entry per [`crate::workspace_registry::WorkspaceRegistry::effective_roots`]
+    /// root: its in-flight sweep count and per-repo main-health-gate halt state.
+    /// The top-level [`Self::in_flight`] is the **union** across these repos, so a
+    /// sweep the autonomous loops dispatched into a non-default repo is now
+    /// visible in `loom-daemon status`. In the common single-workspace case this
+    /// is a single entry for the daemon's own workspace. `#[serde(default)]` keeps
+    /// pre-#3930 wire data / older clients compatible (an empty vec).
+    #[serde(default)]
+    pub per_repo: Vec<RepoStatus>,
+}
+
+/// One registered managed-workspace's status line in [`DaemonStatusReport`]
+/// (Issue #3930). The daemon enumerates every
+/// [`crate::workspace_registry::WorkspaceRegistry::effective_roots`] root for the
+/// per-repo breakdown so sweeps dispatched into any managed repo — not just the
+/// daemon's own default workspace — are observable in `loom-daemon status`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RepoStatus {
+    /// The normalized workspace root this line describes.
+    pub root: PathBuf,
+    /// Count of non-terminal (`Pending` / `Running`) sweeps live in this repo's
+    /// own [`crate::sweep_registry::SweepRegistry`] at snapshot time.
+    pub in_flight_count: usize,
+    /// Whether this repo's dispatch is currently halted by the per-repo reactive
+    /// main-health gate (#3930). A red `main` in this repo halts only this repo's
+    /// dispatch, never the siblings'. Always `false` for a repo whose gate is
+    /// disabled / has no `buildGate` block, or when the gate loop is off.
+    pub health_gate_halted: bool,
 }
 
 /// The token-capacity section of [`DaemonStatusReport`] (#3902).

@@ -42,11 +42,14 @@
 //! has no home for a non-sweep-triggered health event — a follow-up issue would
 //! be required to add one).
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+
+use crate::workspace_registry::WorkspaceRegistry;
 
 // ============================================================================
 // Constants
@@ -121,6 +124,87 @@ impl MainHealthState {
 impl Default for MainHealthState {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// Per-workspace halt state for the multi-repo main-health gate (Issue #3930 —
+/// phase d of #3835/#3926).
+///
+/// Phase c (#3929) made dispatch `(repo, issue)`-aware; phase d makes the
+/// **reactive main-health gate per-repo** too: each registered repo's `main` is
+/// evaluated independently, and a red repo halts only *its own* dispatch, never
+/// the others. Before this, a single [`MainHealthState`] driven by one gate
+/// check against the daemon's own workspace gated *every* registered repo
+/// uniformly.
+///
+/// This wrapper holds one [`MainHealthState`] per normalized root, mirroring
+/// [`crate::workspace_pool::WorkspacePool`]'s `HashMap<PathBuf, _>` keying. It is
+/// shared (as an `Arc`) between the multi-workspace gate loop (writer), the
+/// multi-workspace work-finder / epic supervisor (readers), and the IPC
+/// `DaemonStatus` per-repo breakdown (reader).
+///
+/// **Empty-registry equivalence**: with a single workspace (the empty-registry
+/// fallback), exactly one root is ever keyed, so this reduces to the single
+/// `MainHealthState` behavior byte-for-byte. A root that has never been gated
+/// (no map entry) reports **not halted** — a repo with no `buildGate` block
+/// simply never gates (soft-fail, unchanged contract).
+#[derive(Default)]
+pub struct WorkspaceHealthStates {
+    inner: Mutex<HashMap<PathBuf, Arc<MainHealthState>>>,
+}
+
+impl WorkspaceHealthStates {
+    /// An empty per-workspace halt map.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            inner: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Return `root`'s [`MainHealthState`], creating a fresh (not-halted) one on
+    /// first access. The returned `Arc` is shared, so the gate loop (writer) and
+    /// the work-finder / status readers all observe the same flag.
+    pub fn get_or_create(&self, root: &Path) -> Arc<MainHealthState> {
+        let mut map = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        map.entry(root.to_path_buf())
+            .or_insert_with(|| Arc::new(MainHealthState::new()))
+            .clone()
+    }
+
+    /// Whether `root`'s dispatch is currently halted. A never-seen root is
+    /// treated as green (not halted) — no gate has run against it.
+    #[must_use]
+    pub fn is_halted(&self, root: &Path) -> bool {
+        let map = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        map.get(root).is_some_and(|s| s.is_halted())
+    }
+
+    /// Directly set `root`'s halt flag (creating its state if absent). Primarily
+    /// for tests / explicit control, and for the gate loop to clear a
+    /// disabled/absent-`buildGate` repo to green.
+    pub fn set_halted(&self, root: &Path, halted: bool) {
+        self.get_or_create(root).set_halted(halted);
+    }
+
+    /// Snapshot of `(root → halted)` for every root the gate has observed —
+    /// consumed by the daemon-status per-repo breakdown (#3930). Roots never
+    /// gated are absent (a reader treats an absent root as green).
+    #[must_use]
+    pub fn snapshot(&self) -> HashMap<PathBuf, bool> {
+        let map = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        map.iter()
+            .map(|(k, v)| (k.clone(), v.is_halted()))
+            .collect()
     }
 }
 
@@ -820,6 +904,131 @@ where
     })
 }
 
+/// Log a health transition (root-aware variant, #3930) at a severity matching
+/// its significance, naming which repo's `main` the gate evaluated.
+fn log_transition_for_root(root: &Path, transition: HealthTransition, outcome: &GateOutcome) {
+    let r = root.display();
+    match transition {
+        HealthTransition::EnteredHalt => log::error!(
+            "main_health_gate: {r} main is RED — HALTING autonomous dispatch for this repo. {}",
+            outcome.detail()
+        ),
+        HealthTransition::RemainedHalted => log::warn!(
+            "main_health_gate: {r} main still RED — dispatch for this repo remains halted. {}",
+            outcome.detail()
+        ),
+        HealthTransition::Recovered => log::info!(
+            "main_health_gate: {r} main GREEN again — RESUMING dispatch for this repo on the next work-finder tick"
+        ),
+        HealthTransition::RemainedHealthy => {
+            log::debug!("main_health_gate: {r} main green — dispatch unaffected");
+        }
+        HealthTransition::Skipped => log::warn!(
+            "main_health_gate: {r} gate run SKIPPED — {} (halt state unchanged)",
+            outcome.detail()
+        ),
+    }
+}
+
+/// Spawn the **multi-workspace** main-health gate loop (Issue #3930) on the
+/// shared daemon runtime and return its task handle.
+///
+/// This is the multi-repo replacement for [`spawn_main_health_gate_task`]. Every
+/// `interval` it re-reads [`WorkspaceRegistry::effective_roots`] against
+/// `fallback_root` (an **empty** registry ⇒ the single `fallback_root`,
+/// byte-for-byte the pre-#3930 single-workspace behavior) and runs **one gate
+/// check per registered root**, applying each outcome to that root's own
+/// [`MainHealthState`] in `health_states`. A red repo halts only its own
+/// dispatch; sibling repos keep dispatching.
+///
+/// Per-root enablement is resolved from each repo's own `.loom/config.json`
+/// (`autonomous.mainHealthGate.enabled` via [`resolve_enabled`], precedence
+/// env > config > default) plus a usable `buildGate` block
+/// ([`read_build_gate_config`]). A root that is disabled / has no `buildGate`
+/// block is treated as **always-green** — its halt flag is cleared and no gate
+/// command runs for it (soft-fail, unchanged contract). No new config schema is
+/// introduced: the per-root `buildGate` / `autonomous.mainHealthGate` blocks are
+/// exactly the ones phase C already reads.
+///
+/// Gates run **sequentially** per tick (not concurrently) so several minutes-long
+/// per-repo builds firing on the same tick never contend — each
+/// [`CommandGateRunner`] already isolates its own `origin/main` sync and uuid
+/// temp output file, so there is no shared mutable state to leak across repos.
+pub fn spawn_multi_main_health_gate_task(
+    health_states: Arc<WorkspaceHealthStates>,
+    fallback_root: PathBuf,
+    interval: Duration,
+) -> tokio::task::JoinHandle<()> {
+    log::info!(
+        "main_health_gate: starting multi-workspace loop (interval={}s)",
+        interval.as_secs()
+    );
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(interval);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        // First tick fires immediately; skip it so we don't churn at boot.
+        ticker.tick().await;
+        loop {
+            ticker.tick().await;
+
+            // Resolve the current workspace set fresh each tick so registry edits
+            // (`workspace add|remove`) are hot-applied without a daemon restart.
+            let roots = WorkspaceRegistry::load_default()
+                .unwrap_or_else(|e| {
+                    log::warn!(
+                        "main_health_gate: could not load workspace registry ({e}); using fallback"
+                    );
+                    WorkspaceRegistry::default()
+                })
+                .effective_roots(&fallback_root);
+
+            for root in roots {
+                // Per-root enablement (env > config > default). The env master
+                // switch, when set, applies to every root uniformly; when unset,
+                // each repo's own config decides.
+                if !resolve_enabled(&read_autonomous_gate_config(&root)) {
+                    // Disabled ⇒ always green for this repo (clear any stale halt).
+                    health_states.set_halted(&root, false);
+                    continue;
+                }
+                let Some(gate_config) = read_build_gate_config(&root) else {
+                    log::debug!(
+                        "main_health_gate: {} enabled but no usable buildGate config — treating as green",
+                        root.display()
+                    );
+                    health_states.set_halted(&root, false);
+                    continue;
+                };
+
+                let state = health_states.get_or_create(&root);
+                let root_for_task = root.clone();
+                // Run the (potentially minutes-long) gate off the runtime.
+                let joined = tokio::task::spawn_blocking(move || {
+                    let mut runner = CommandGateRunner::new(gate_config, root_for_task);
+                    runner.run_gate()
+                })
+                .await;
+                match joined {
+                    Ok(outcome) => {
+                        let transition = apply_gate_outcome(&state, &outcome);
+                        log_transition_for_root(&root, transition, &outcome);
+                    }
+                    Err(e) => {
+                        // The blocking task panicked; clear this repo's halt so a
+                        // panic never wedges it permanently halted, and continue to
+                        // the other repos (one bad gate must not stop the loop).
+                        log::error!(
+                            "main_health_gate: gate run task for {} panicked ({e}); clearing its halt",
+                            root.display()
+                        );
+                        state.set_halted(false);
+                    }
+                }
+            }
+        }
+    })
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
@@ -920,6 +1129,57 @@ mod tests {
     fn test_default_state_not_halted() {
         assert!(!MainHealthState::new().is_halted());
         assert!(!MainHealthState::default().is_halted());
+    }
+
+    // ===================================================================
+    // Per-workspace halt state (#3930)
+    // ===================================================================
+
+    #[test]
+    fn test_workspace_health_states_unknown_root_not_halted() {
+        let states = WorkspaceHealthStates::new();
+        assert!(!states.is_halted(Path::new("/repo/never-seen")));
+        assert!(states.snapshot().is_empty());
+    }
+
+    #[test]
+    fn test_workspace_health_states_are_per_root_independent() {
+        // Red repo A must not mark repo B halted (the core AC2 property).
+        let states = WorkspaceHealthStates::new();
+        let a = Path::new("/repo/a");
+        let b = Path::new("/repo/b");
+        states.set_halted(a, true);
+        assert!(states.is_halted(a), "repo A is halted");
+        assert!(!states.is_halted(b), "repo B is unaffected by A's halt");
+
+        // Clearing A does not touch B, and setting B does not touch A.
+        states.set_halted(b, true);
+        states.set_halted(a, false);
+        assert!(!states.is_halted(a));
+        assert!(states.is_halted(b));
+    }
+
+    #[test]
+    fn test_workspace_health_states_get_or_create_shares_arc() {
+        let states = WorkspaceHealthStates::new();
+        let root = Path::new("/repo/a");
+        let s1 = states.get_or_create(root);
+        s1.set_halted(true);
+        // A second get_or_create returns the same shared state (the flag persists).
+        let s2 = states.get_or_create(root);
+        assert!(s2.is_halted());
+        assert!(states.is_halted(root));
+    }
+
+    #[test]
+    fn test_workspace_health_states_snapshot_lists_seen_roots() {
+        let states = WorkspaceHealthStates::new();
+        states.set_halted(Path::new("/repo/a"), true);
+        states.set_halted(Path::new("/repo/b"), false);
+        let snap = states.snapshot();
+        assert_eq!(snap.len(), 2);
+        assert_eq!(snap.get(Path::new("/repo/a")), Some(&true));
+        assert_eq!(snap.get(Path::new("/repo/b")), Some(&false));
     }
 
     #[test]

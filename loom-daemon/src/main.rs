@@ -362,7 +362,12 @@ async fn main() -> Result<()> {
     // work-finder — so it can be threaded into both dispatch paths. When the gate
     // loop (below) is disabled nothing ever flips it, so neither the supervisor
     // nor the work-finder is ever halted (zero behavior change with the gate off).
-    let main_health_state = Arc::new(main_health_gate::MainHealthState::new());
+    // Per-repo halt state (#3930): one `MainHealthState` per registered repo,
+    // keyed by normalized root, so a red `main` in one managed repo halts only
+    // that repo's dispatch — never the siblings'. With an empty registry (the
+    // common single-workspace case) exactly one root is keyed, reducing to the
+    // pre-#3930 single-flag behavior byte-for-byte.
+    let workspace_health_states = Arc::new(main_health_gate::WorkspaceHealthStates::new());
 
     // Epic supervisor loop (Issue #3872 — Phase 4 of epic #3842). Opt-in via
     // `LOOM_EPIC_SUPERVISOR`. The loop drives every open `loom:epic` issue
@@ -386,7 +391,7 @@ async fn main() -> Result<()> {
             workspace_pool.clone(),
             sweep_workspace.clone(),
             event_bus.clone(),
-            main_health_state.clone(),
+            workspace_health_states.clone(),
             interval,
         ) {
             Ok(handle) => {
@@ -451,7 +456,7 @@ async fn main() -> Result<()> {
             sweep_workspace.clone(),
             interval,
             configured_max,
-            main_health_state.clone(),
+            workspace_health_states.clone(),
             event_bus.clone(),
         ))
     } else {
@@ -471,49 +476,42 @@ async fn main() -> Result<()> {
     // on/off override (precedence env > config > default). The gate's *behavior*
     // (command, timeout) still comes from the separate `buildGate` block, so
     // Phase C's tested semantics are unchanged.
+    // Multi-workspace fan-out (#3930): the gate loop re-reads `effective_roots()`
+    // each cycle and runs one gate check per registered root, writing into that
+    // root's own `MainHealthState` in `workspace_health_states`. A red repo halts
+    // only its own dispatch. Per-root enablement + `buildGate` config are read
+    // from each repo's own `.loom/config.json` inside the loop, so no single
+    // up-front buildGate resolution is needed. The startup master switch is still
+    // the daemon's own workspace config (env > config), mirroring how the
+    // work-finder / epic-supervisor loops are gated at startup by `sweep_workspace`.
     let autonomous_gate_config = main_health_gate::read_autonomous_gate_config(&sweep_workspace);
     let _main_health_gate_handle = if main_health_gate::resolve_enabled(&autonomous_gate_config) {
-        match main_health_gate::read_build_gate_config(&sweep_workspace) {
-            Some(gate_config) => {
-                let interval = main_health_gate::resolve_interval();
-                log::info!(
-                    "main_health_gate: enabled (interval={}s, command={:?}, timeout={}s)",
-                    interval.as_secs(),
-                    gate_config.command,
-                    gate_config.timeout.as_secs()
-                );
-                let runner =
-                    main_health_gate::CommandGateRunner::new(gate_config, sweep_workspace.clone());
-                Some(main_health_gate::spawn_main_health_gate_task(
-                    runner,
-                    main_health_state.clone(),
-                    interval,
-                ))
-            }
-            None => {
-                log::warn!(
-                    "main_health_gate: LOOM_MAIN_HEALTH_GATE is set but no usable buildGate \
-                     config in .loom/config.json (missing/disabled/empty command) — gate inactive"
-                );
-                None
-            }
-        }
+        let interval = main_health_gate::resolve_interval();
+        log::info!("main_health_gate: enabled (multi-workspace, interval={}s)", interval.as_secs());
+        Some(main_health_gate::spawn_multi_main_health_gate_task(
+            workspace_health_states.clone(),
+            sweep_workspace.clone(),
+            interval,
+        ))
     } else {
         log::debug!("main_health_gate: disabled (set LOOM_MAIN_HEALTH_GATE=1 or autonomous.mainHealthGate.enabled=true + a buildGate config to enable)");
         None
     };
 
-    // Start IPC server. `main_health_state` is threaded in so the `DaemonStatus`
-    // request (#3891) can report the reactive main-health-gate halt flag — the
-    // same `Arc` the work-finder and gate loop share above.
+    // Start IPC server. `workspace_health_states` is threaded in so the
+    // `DaemonStatus` request can report each registered repo's own halt state
+    // (#3930), and `sweep_workspace` is the `effective_roots` fallback for the
+    // per-repo status breakdown — the same values the work-finder and gate loop
+    // share above.
     let server = IpcServer::new(
         socket_path.clone(),
         tm,
         activity_db,
         sweep_registry,
         event_bus,
-        main_health_state.clone(),
+        workspace_health_states.clone(),
         workspace_pool.clone(),
+        sweep_workspace.clone(),
     );
 
     // Setup signal handler for graceful shutdown. We listen for BOTH SIGINT
@@ -970,6 +968,12 @@ fn print_status_json(
         "main_health_gate": {
             "halted": report.main_health_gate_halted,
         },
+        // Per-repo breakdown across every registered managed workspace (#3930).
+        "per_repo": report.per_repo.iter().map(|r| serde_json::json!({
+            "root": r.root,
+            "in_flight_count": r.in_flight_count,
+            "health_gate_halted": r.health_gate_halted,
+        })).collect::<Vec<_>>(),
         "token_usage": token_usage,
     });
     println!("{}", serde_json::to_string_pretty(&combined)?);
@@ -1043,6 +1047,26 @@ fn print_status_human(report: &DaemonStatusReport, token_usage: Option<&serde_js
         "clear (dispatch allowed)"
     };
     println!("\nMain-health gate: {gate}");
+
+    // Per-repo breakdown across every registered managed workspace (#3930). In
+    // the common single-workspace case this is one line for the daemon's own
+    // workspace; with `loom-daemon workspace add <path>` it lists every managed
+    // repo, its in-flight count, and its own gate state.
+    println!("\nManaged repos: {}", report.per_repo.len());
+    if report.per_repo.is_empty() {
+        println!("  (none)");
+    } else {
+        println!("  {:>9}  {:<7}  REPO", "IN-FLIGHT", "GATE");
+        println!("  {:-<60}", "");
+        for r in &report.per_repo {
+            let gate = if r.health_gate_halted {
+                "HALTED"
+            } else {
+                "clear"
+            };
+            println!("  {:>9}  {:<7}  {}", r.in_flight_count, gate, r.root.display());
+        }
+    }
 
     println!("\nPer-token usage:");
     match token_usage {

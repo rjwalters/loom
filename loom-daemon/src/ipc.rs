@@ -4,11 +4,12 @@ use crate::event_bus::EventBus;
 use crate::forge_parser::parse_forge_events;
 use crate::git_parser;
 use crate::git_utils;
-use crate::main_health_gate::MainHealthState;
+use crate::main_health_gate::WorkspaceHealthStates;
 use crate::sweep_registry::{BeginCancel, SweepRegistry};
 use crate::terminal::TerminalManager;
 use crate::types::{DaemonStatusReport, Event, Request, Response};
 use crate::workspace_pool::WorkspacePool;
+use crate::workspace_registry::WorkspaceRegistry;
 use anyhow::Result;
 use chrono::Utc;
 use std::path::{Path, PathBuf};
@@ -102,10 +103,11 @@ pub struct IpcServer {
     activity_db: Arc<Mutex<ActivityDb>>,
     sweep_registry: Arc<Mutex<SweepRegistry>>,
     event_bus: Arc<EventBus>,
-    /// Shared reactive main-health halt flag (#3812). Threaded into the IPC
-    /// server so the `DaemonStatus` request (#3891) can report the current
-    /// halt state — the same `Arc` the work-finder and gate loop share.
-    main_health_state: Arc<MainHealthState>,
+    /// Per-workspace reactive main-health halt state (#3930, was a single
+    /// `MainHealthState` in #3812). Threaded into the IPC server so the
+    /// `DaemonStatus` request can report each registered repo's own halt state —
+    /// the same `Arc` the multi-workspace work-finder and gate loop share.
+    health_states: Arc<WorkspaceHealthStates>,
     /// The per-workspace sweep-registry pool (#3929). The default workspace's
     /// registry is seeded into it, and the autonomous loops provision the other
     /// managed repos' registries on demand. Threaded into the IPC handler so a
@@ -113,17 +115,24 @@ pub struct IpcServer {
     /// in a managed repo other than the default workspace, and so
     /// `DeregisterWorkspace` can evict the in-memory entry.
     workspace_pool: Arc<WorkspacePool>,
+    /// The daemon's primary workspace root (`sweep_workspace`), used as the
+    /// `effective_roots` fallback when the machine-level workspace registry is
+    /// empty (#3930). In the common single-workspace case this is the only root
+    /// the `DaemonStatus` per-repo breakdown enumerates.
+    fallback_root: PathBuf,
 }
 
 impl IpcServer {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         socket_path: PathBuf,
         terminal_manager: Arc<Mutex<TerminalManager>>,
         activity_db: Arc<Mutex<ActivityDb>>,
         sweep_registry: Arc<Mutex<SweepRegistry>>,
         event_bus: Arc<EventBus>,
-        main_health_state: Arc<MainHealthState>,
+        health_states: Arc<WorkspaceHealthStates>,
         workspace_pool: Arc<WorkspacePool>,
+        fallback_root: PathBuf,
     ) -> Self {
         Self {
             socket_path,
@@ -131,8 +140,9 @@ impl IpcServer {
             activity_db,
             sweep_registry,
             event_bus,
-            main_health_state,
+            health_states,
             workspace_pool,
+            fallback_root,
         }
     }
 
@@ -166,10 +176,13 @@ impl IpcServer {
                     let db = self.activity_db.clone();
                     let sr = self.sweep_registry.clone();
                     let bus = self.event_bus.clone();
-                    let health = self.main_health_state.clone();
+                    let health = self.health_states.clone();
                     let pool = self.workspace_pool.clone();
+                    let fallback = self.fallback_root.clone();
                     tokio::spawn(async move {
-                        if let Err(e) = handle_client(stream, tm, db, sr, bus, health, pool).await {
+                        if let Err(e) =
+                            handle_client(stream, tm, db, sr, bus, health, pool, fallback).await
+                        {
                             log::error!("Client error: {e}");
                         }
                     });
@@ -182,14 +195,16 @@ impl IpcServer {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_client(
     stream: UnixStream,
     terminal_manager: Arc<Mutex<TerminalManager>>,
     activity_db: Arc<Mutex<ActivityDb>>,
     sweep_registry: Arc<Mutex<SweepRegistry>>,
     event_bus: Arc<EventBus>,
-    main_health_state: Arc<MainHealthState>,
+    health_states: Arc<WorkspaceHealthStates>,
     workspace_pool: Arc<WorkspacePool>,
+    fallback_root: PathBuf,
 ) -> Result<()> {
     let (reader, mut writer) = stream.into_split();
     let mut lines = BufReader::new(reader).lines();
@@ -249,13 +264,13 @@ async fn handle_client(
         }
 
         // DaemonStatus (Issue #3891) is handled here rather than in the
-        // synchronous `handle_request` dispatcher because it reads the
-        // `main_health_state` halt flag, which the dispatcher does not receive.
-        // The report is cheap to build (a registry snapshot + a few pure
+        // synchronous `handle_request` dispatcher because it reads the per-repo
+        // `health_states` halt flags, which the dispatcher does not receive.
+        // The report is cheap to build (per-repo registry snapshots + a few pure
         // filesystem reads for the dynamic-cap inputs); per-token usage is left
         // to the CLI (a slow network probe) so this handler never blocks.
         if let Request::DaemonStatus = request {
-            let report = build_daemon_status(&sweep_registry, &main_health_state);
+            let report = build_daemon_status(&workspace_pool, &health_states, &fallback_root);
             let response = Response::DaemonStatus(report);
             let response_json = serde_json::to_string(&response)?;
             writer.write_all(response_json.as_bytes()).await?;
@@ -440,33 +455,57 @@ async fn cancel_sweep_nonblocking(
 // `handle_request`).
 #[allow(clippy::expect_used)]
 pub fn build_daemon_status(
-    sweep_registry: &Arc<Mutex<SweepRegistry>>,
-    main_health_state: &MainHealthState,
+    workspace_pool: &Arc<WorkspacePool>,
+    health_states: &WorkspaceHealthStates,
+    fallback_root: &Path,
 ) -> DaemonStatusReport {
-    let (in_flight, workspace_root) = {
-        let sr = sweep_registry
-            .lock()
-            .expect("Sweep registry mutex poisoned");
-        // In-flight = sweeps still live (Pending / Running). Terminal sweeps
-        // (Exited / Crashed) linger in the registry but are not "in flight".
-        let in_flight = sr
-            .list(None)
-            .into_iter()
-            .filter(|info| !info.state.is_terminal())
-            .collect();
-        (in_flight, sr.config().workspace_root.clone())
-    };
+    // Enumerate every registered managed workspace (Issue #3930). An empty
+    // registry yields `[fallback_root]`, so the common single-workspace case is
+    // byte-for-byte the pre-#3930 behavior (one root — the daemon's own).
+    let roots = WorkspaceRegistry::load_default()
+        .unwrap_or_default()
+        .effective_roots(fallback_root);
 
-    let token_pool_size = crate::tokens::token_pool_size(&workspace_root);
-    let disk_headroom = crate::disk_headroom::disk_headroom_limit(&workspace_root);
-    let wf_config = crate::work_finder::read_work_finder_config(&workspace_root);
+    // Per-repo breakdown + the union of in-flight sweeps across every repo. Each
+    // root reads its own registry from the pool (the fallback/default root
+    // resolves to the seeded default registry, so a single-workspace daemon reads
+    // exactly the same registry it did pre-#3930).
+    let mut in_flight: Vec<crate::types::SweepInfo> = Vec::new();
+    let mut per_repo: Vec<crate::types::RepoStatus> = Vec::with_capacity(roots.len());
+    for root in &roots {
+        let registry = workspace_pool.get_or_provision(root);
+        let live: Vec<crate::types::SweepInfo> = {
+            let sr = registry.lock().expect("Sweep registry mutex poisoned");
+            // In-flight = sweeps still live (Pending / Running). Terminal sweeps
+            // (Exited / Crashed) linger in the registry but are not "in flight".
+            sr.list(None)
+                .into_iter()
+                .filter(|info| !info.state.is_terminal())
+                .collect()
+        };
+        per_repo.push(crate::types::RepoStatus {
+            root: root.clone(),
+            in_flight_count: live.len(),
+            health_gate_halted: health_states.is_halted(root),
+        });
+        in_flight.extend(live);
+    }
+
+    // Dynamic-cap inputs are *machine-level* (one token pool, one scratch
+    // volume), so they are computed once from the daemon's primary workspace —
+    // the same basis as pre-#3930 (which read them from the default registry's
+    // `workspace_root`, i.e. `fallback_root`).
+    let workspace_root = fallback_root;
+    let token_pool_size = crate::tokens::token_pool_size(workspace_root);
+    let disk_headroom = crate::disk_headroom::disk_headroom_limit(workspace_root);
+    let wf_config = crate::work_finder::read_work_finder_config(workspace_root);
     let configured_max = crate::work_finder::resolve_max_concurrent_with_config(&wf_config);
 
     // Token-capacity backpressure (#3902): back the token axis off from the flat
     // pool count toward the count of *healthy* accounts read from the rotation
     // ranking. When no ranking exists, `token_axis_limit` == the raw pool size,
     // so the dynamic cap is byte-for-byte the pre-#3902 value.
-    let ranking = crate::capacity::read_ranking(&workspace_root);
+    let ranking = crate::capacity::read_ranking(workspace_root);
     let token_axis_limit = ranking.as_ref().map_or(token_pool_size, |r| r.available);
     let dynamic_cap = crate::work_finder::resolve_dynamic_max_concurrent(
         token_axis_limit,
@@ -491,8 +530,11 @@ pub fn build_daemon_status(
         disk_headroom,
         configured_max,
         dynamic_cap,
-        main_health_gate_halted: main_health_state.is_halted(),
+        // Top-level halt preserves its pre-#3930 single-workspace meaning: the
+        // daemon's own primary workspace. Per-repo halt is in `per_repo`.
+        main_health_gate_halted: health_states.is_halted(fallback_root),
         capacity,
+        per_repo,
     }
 }
 
@@ -2305,6 +2347,11 @@ exit 0
                 token_axis_limit: 3,
                 token_bound: true,
             },
+            per_repo: vec![crate::types::RepoStatus {
+                root: std::path::PathBuf::from("/repo/a"),
+                in_flight_count: 0,
+                health_gate_halted: true,
+            }],
         };
         let resp = Response::DaemonStatus(report);
         let json = serde_json::to_string(&resp).expect("serialize response");
@@ -2322,13 +2369,17 @@ exit 0
                 assert_eq!(r.capacity.exhausted_accounts, 1);
                 assert_eq!(r.capacity.token_axis_limit, 3);
                 assert!(r.capacity.token_bound);
+                assert_eq!(r.per_repo.len(), 1);
+                assert_eq!(r.per_repo[0].in_flight_count, 0);
+                assert!(r.per_repo[0].health_gate_halted);
             }
             other => panic!("Expected DaemonStatus, got: {other:?}"),
         }
     }
 
-    /// A pre-#3902 `DaemonStatus` JSON payload (no `capacity` field) still
-    /// deserializes — `#[serde(default)]` fills the capacity section.
+    /// A pre-#3902 `DaemonStatus` JSON payload (no `capacity` field, no
+    /// `per_repo` field) still deserializes — `#[serde(default)]` fills the
+    /// capacity section and leaves `per_repo` empty (pre-#3930 compat).
     #[test]
     fn test_daemon_status_backward_compat_missing_capacity() {
         let legacy = r#"{"in_flight":[],"token_pool_size":2,"disk_headroom":9,"configured_max":3,"dynamic_cap":2,"main_health_gate_halted":false}"#;
@@ -2338,25 +2389,44 @@ exit 0
         assert!(!report.capacity.ranking_present);
         assert_eq!(report.capacity.healthy_accounts, 0);
         assert!(!report.capacity.token_bound);
+        assert!(report.per_repo.is_empty(), "absent per_repo defaults to empty");
     }
 
-    /// `build_daemon_status` reflects the shared main-health halt flag and lists
-    /// a live dispatched sweep as in-flight.
+    /// `build_daemon_status` reflects the per-repo main-health halt flag and
+    /// lists a live dispatched sweep as in-flight. Single-workspace case (empty
+    /// registry): exactly one `per_repo` entry for the daemon's own workspace,
+    /// byte-for-byte the pre-#3930 top-level behavior.
     #[test]
     #[serial_test::serial]
     fn test_build_daemon_status_reports_halt_and_in_flight() {
-        use crate::main_health_gate::MainHealthState;
+        use crate::main_health_gate::WorkspaceHealthStates;
+        use crate::workspace_registry::REGISTRY_PATH_ENV;
 
-        let (sr, _dir, _rec) = setup_sweep_registry_in_tempdir();
+        let (sr, dir, _rec) = setup_sweep_registry_in_tempdir();
+        let root = dir.path().to_path_buf();
+
+        // Point the workspace registry at a nonexistent file so effective_roots
+        // falls back to [root] (single-workspace equivalence).
+        let empty_reg = dir.path().join("no-such-workspaces.json");
+        std::env::set_var(REGISTRY_PATH_ENV, &empty_reg);
+
+        // Seed the pool with the default registry keyed at `root`.
+        let pool = Arc::new(WorkspacePool::new(Arc::new(EventBus::new()), test_runtime_handle()));
+        pool.seed(root.clone(), sr.clone());
+        let health = WorkspaceHealthStates::new();
 
         // Fresh state: not halted, no sweeps.
-        let health = MainHealthState::new();
-        let report = build_daemon_status(&sr, &health);
+        let report = build_daemon_status(&pool, &health, &root);
         assert!(!report.main_health_gate_halted);
         assert!(report.in_flight.is_empty());
         // The tempdir has no `.loom/tokens/`, so the pool + dynamic cap are 0.
         assert_eq!(report.token_pool_size, 0);
         assert_eq!(report.dynamic_cap, 0);
+        // Per-repo breakdown: exactly one entry for the single workspace.
+        assert_eq!(report.per_repo.len(), 1);
+        assert_eq!(report.per_repo[0].root, root);
+        assert_eq!(report.per_repo[0].in_flight_count, 0);
+        assert!(!report.per_repo[0].health_gate_halted);
 
         // Dispatch a sweep -> it should show up as in-flight (Running).
         {
@@ -2364,14 +2434,84 @@ exit 0
             reg.dispatch(&crate::types::SweepKind::Issue(3891), None, None, None, None)
                 .expect("dispatch");
         }
-        let report = build_daemon_status(&sr, &health);
+        let report = build_daemon_status(&pool, &health, &root);
         assert_eq!(report.in_flight.len(), 1);
         assert!(matches!(report.in_flight[0].kind, crate::types::SweepKind::Issue(3891)));
+        assert_eq!(report.per_repo[0].in_flight_count, 1);
 
-        // Flip the halt flag -> the report tracks it.
-        health.set_halted(true);
-        let report = build_daemon_status(&sr, &health);
+        // Flip the halt flag for this root -> the report tracks it (top-level and
+        // per-repo).
+        health.set_halted(&root, true);
+        let report = build_daemon_status(&pool, &health, &root);
         assert!(report.main_health_gate_halted);
+        assert!(report.per_repo[0].health_gate_halted);
+
+        std::env::remove_var(REGISTRY_PATH_ENV);
+    }
+
+    /// `build_daemon_status` with two registered workspaces returns one `per_repo`
+    /// entry per root with correct in-flight counts (a sweep dispatched into a
+    /// non-default repo is now visible) and independent per-repo halt state
+    /// (Issue #3930 — a red repo B does not mark repo A halted).
+    #[test]
+    #[serial_test::serial]
+    fn test_build_daemon_status_multi_workspace_per_repo_breakdown() {
+        use crate::main_health_gate::WorkspaceHealthStates;
+        use crate::workspace_registry::{normalize_path, WorkspaceRegistry, REGISTRY_PATH_ENV};
+
+        let (sr_a, dir_a, _rec_a) = setup_sweep_registry_in_tempdir();
+        let (sr_b, dir_b, _rec_b) = setup_sweep_registry_in_tempdir();
+        let root_a = dir_a.path().to_path_buf();
+        let root_b = dir_b.path().to_path_buf();
+
+        // A registry listing BOTH managed repos (roots stored canonicalized).
+        let reg_path = dir_a.path().join("workspaces.json");
+        let mut reg = WorkspaceRegistry::default();
+        reg.add(&root_a, None).unwrap();
+        reg.add(&root_b, None).unwrap();
+        reg.save(&reg_path).unwrap();
+        std::env::set_var(REGISTRY_PATH_ENV, &reg_path);
+
+        // Seed the pool with both registries under their normalized (canonical)
+        // roots — the same key `effective_roots` returns.
+        let canon_a = normalize_path(&root_a);
+        let canon_b = normalize_path(&root_b);
+        let pool = Arc::new(WorkspacePool::new(Arc::new(EventBus::new()), test_runtime_handle()));
+        pool.seed(canon_a.clone(), sr_a.clone());
+        pool.seed(canon_b.clone(), sr_b.clone());
+
+        let health = WorkspaceHealthStates::new();
+        // Repo B is red; repo A green — independently.
+        health.set_halted(&canon_b, true);
+
+        // Dispatch a sweep into repo A only.
+        {
+            let mut reg = sr_a.lock().unwrap();
+            reg.dispatch(&crate::types::SweepKind::Issue(42), None, None, None, None)
+                .expect("dispatch");
+        }
+
+        let report = build_daemon_status(&pool, &health, &root_a);
+        assert_eq!(report.per_repo.len(), 2, "both managed repos are listed");
+        // Union of in-flight across repos = repo A's single sweep.
+        assert_eq!(report.in_flight.len(), 1);
+
+        let a = report
+            .per_repo
+            .iter()
+            .find(|r| r.root == canon_a)
+            .expect("repo A present");
+        let b = report
+            .per_repo
+            .iter()
+            .find(|r| r.root == canon_b)
+            .expect("repo B present");
+        assert_eq!(a.in_flight_count, 1, "repo A has the dispatched sweep");
+        assert!(!a.health_gate_halted, "repo A is green");
+        assert_eq!(b.in_flight_count, 0, "repo B has no sweeps");
+        assert!(b.health_gate_halted, "repo B is red, independently of A");
+
+        std::env::remove_var(REGISTRY_PATH_ENV);
     }
 
     /// If `DaemonStatus` ever reaches the synchronous dispatcher (it is meant to
