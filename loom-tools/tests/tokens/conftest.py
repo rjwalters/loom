@@ -27,6 +27,12 @@ def _isolate_home_master(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
       at a non-existent tmp path so a developer's or CI runner's real
       ``~/.claude-monitor`` is never consulted. Tests that exercise the
       integration override this with their own ``monkeypatch.setenv``.
+    * ``LOOM_SHARED_TOKENS_DIR`` points the #3938 shared-pool fallback at a
+      non-existent tmp path so a developer's or CI runner's real
+      ``~/.loom/tokens`` never leaks into a test that expects an empty pool.
+      Tests that exercise the shared fallback override this with their own
+      ``monkeypatch.setenv`` pointing at a materialized pool.
     """
     monkeypatch.setenv("LOOM_ACCOUNTS_ENV", "")
     monkeypatch.setenv("LOOM_CLAUDE_MONITOR_DIR", str(tmp_path / "no-claude-monitor"))
+    monkeypatch.setenv("LOOM_SHARED_TOKENS_DIR", str(tmp_path / "no-shared-tokens"))

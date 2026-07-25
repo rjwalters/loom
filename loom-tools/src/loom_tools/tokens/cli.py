@@ -32,6 +32,7 @@ from loom_tools.common.repo import find_repo_root
 from loom_tools.tokens import allowlist as allowlist_mod
 from loom_tools.tokens import failure_counts
 from loom_tools.tokens.bootstrap import bootstrap_tokens
+from loom_tools.tokens.paths import resolve_tokens_dir, shared_tokens_dir
 from loom_tools.tokens.check import (
     DEFAULT_PROBE_PROMPT,
     format_table,
@@ -85,6 +86,17 @@ def _build_parser() -> argparse.ArgumentParser:
         "--no-home",
         action="store_true",
         help="Ignore the home master; bootstrap from the repo-local source only.",
+    )
+    bp.add_argument(
+        "--shared",
+        action="store_true",
+        help=(
+            "Materialize the SHARED machine-level pool at ~/.loom/tokens "
+            "(override with $LOOM_SHARED_TOKENS_DIR) instead of the repo-local "
+            "<repo>/.loom/tokens. Selection falls back to this pool when a "
+            "consumer repo has no pool of its own (issue #3938), so one "
+            "bootstrap serves every repo the daemon dispatches into."
+        ),
     )
     bp.add_argument(
         "--force",
@@ -278,6 +290,22 @@ def _cmd_bootstrap(args: argparse.Namespace) -> int:
     elif args.home_env is not None:
         home_kwargs["home_env_path"] = args.home_env
 
+    # `--shared` redirects the destination pool to the machine-level location
+    # (issue #3938). Only the write target changes; account sources are
+    # unchanged. Refuse when the operator has disabled the shared pool.
+    shared_kwargs: dict[str, object] = {}
+    if getattr(args, "shared", False):
+        shared_dir = shared_tokens_dir()
+        if shared_dir is None:
+            log_error(
+                "--shared requested but the shared pool is disabled "
+                "(LOOM_SHARED_TOKENS_DIR is empty). Unset it or point it at a "
+                "directory.",
+            )
+            return 1
+        shared_kwargs["tokens_dir"] = shared_dir
+        log_info(f"Bootstrapping the shared machine-level pool at {shared_dir}")
+
     try:
         result = bootstrap_tokens(
             repo_root,
@@ -285,6 +313,7 @@ def _cmd_bootstrap(args: argparse.Namespace) -> int:
             force=args.force,
             dry_run=args.dry_run,
             **home_kwargs,
+            **shared_kwargs,
         )
     except FileNotFoundError as exc:
         log_error(str(exc))
@@ -393,7 +422,10 @@ def _cmd_check(args: argparse.Namespace) -> int:
         except FileNotFoundError as exc:
             log_error(str(exc))
             return 1
-        tokens_dir = repo_root / ".loom" / "tokens"
+        # Rank the pool selection actually uses: per-repo when present, else the
+        # shared machine-level pool (issue #3938), so `.ranking` is written
+        # beside the tokens the spawn wrapper will pick.
+        tokens_dir = resolve_tokens_dir(repo_root)
 
     source = _resolve_ranking_source(args.source)
 
@@ -608,8 +640,11 @@ def _cmd_unblock(args: argparse.Namespace) -> int:
         log_error("`unblock` requires at least one account name.")
         return 1
 
-    bad_file = workspace / ".loom" / "tokens" / ".bad_tokens"
-    lock_path = workspace / ".loom" / "tokens" / ".bad_tokens.lock"
+    # Operate on the effective pool (per-repo, else shared) so unblock clears
+    # the same .bad_tokens selection consults (issue #3938).
+    _tokens_dir = resolve_tokens_dir(workspace)
+    bad_file = _tokens_dir / ".bad_tokens"
+    lock_path = _tokens_dir / ".bad_tokens.lock"
 
     # Reuse the bad_tokens lock to coordinate with concurrent appenders.
     from loom_tools.tokens.bad_tokens import _MkdirLock

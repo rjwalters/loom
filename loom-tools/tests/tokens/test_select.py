@@ -573,3 +573,68 @@ def test_cli_empty_pool_exits_78(tmp_path):
     )
     assert result.returncode == EX_CONFIG
     assert "loom-tokens bootstrap" in result.stderr
+
+
+# ---------- shared machine-level pool fallback (issue #3938) ----------
+
+
+def _make_shared_pool(tmp_path: Path, accounts: dict[str, str]) -> Path:
+    """Materialize a shared machine-level pool (flat dir, not <repo>/.loom)."""
+    shared = tmp_path / "shared-pool"
+    shared.mkdir(parents=True)
+    for name, key in accounts.items():
+        (shared / f"{name}.token").write_text(key, encoding="utf-8")
+    return shared
+
+
+def test_falls_back_to_shared_pool_when_repo_has_none(tmp_path, monkeypatch):
+    """A consumer repo with no per-repo pool selects from the shared pool."""
+    repo = tmp_path / "consumer"
+    repo.mkdir()
+    shared = _make_shared_pool(tmp_path, {"shared-a": "key-shared-a"})
+    monkeypatch.setenv("LOOM_SHARED_TOKENS_DIR", str(shared))
+
+    sel = select_token(repo)
+    assert sel.name == "shared-a"
+    assert sel.key == "key-shared-a"
+    assert sel.file == shared / "shared-a.token"
+
+
+def test_per_repo_pool_wins_over_shared(tmp_path, monkeypatch):
+    repo = _make_workspace(tmp_path, {"repo-a": "key-repo-a"})
+    shared = _make_shared_pool(tmp_path, {"shared-a": "key-shared-a"})
+    monkeypatch.setenv("LOOM_SHARED_TOKENS_DIR", str(shared))
+
+    sel = select_token(repo)
+    assert sel.name == "repo-a"
+
+
+def test_shared_pool_bad_tokens_written_in_shared_dir(tmp_path, monkeypatch):
+    """State (.bad_tokens) is written in the SELECTED pool dir, never forked."""
+    from loom_tools.tokens.bad_tokens import is_bad, mark_bad
+
+    repo = tmp_path / "consumer"
+    repo.mkdir()
+    shared = _make_shared_pool(tmp_path, {"shared-a": "k-a", "shared-b": "k-b"})
+    monkeypatch.setenv("LOOM_SHARED_TOKENS_DIR", str(shared))
+
+    mark_bad(repo, "shared-a", "expired")
+
+    # Written into the shared pool, NOT into <repo>/.loom/tokens.
+    assert (shared / ".bad_tokens").is_file()
+    assert not (repo / ".loom" / "tokens" / ".bad_tokens").exists()
+    # And selection sees the same truth: shared-a is skipped.
+    assert is_bad(repo, "shared-a") is True
+    sel = select_token(repo)
+    assert sel.name == "shared-b"
+
+
+def test_shared_disabled_still_hard_fails(tmp_path, monkeypatch):
+    """With the shared fallback disabled, a repo-less pool still hard-fails."""
+    repo = tmp_path / "consumer"
+    repo.mkdir()
+    _make_shared_pool(tmp_path, {"shared-a": "k-a"})  # exists but ignored
+    monkeypatch.setenv("LOOM_SHARED_TOKENS_DIR", "")
+
+    with pytest.raises(EmptyTokenPoolError):
+        select_token(repo)

@@ -48,6 +48,7 @@ from typing import Iterable
 
 from loom_tools.common.config import env_int
 from loom_tools.tokens.bad_tokens import is_bad
+from loom_tools.tokens.paths import resolve_tokens_dir, shared_tokens_dir
 from loom_tools.tokens.rotation import next_rotation_index
 
 # Ranking file is considered fresh for this many seconds.
@@ -82,6 +83,18 @@ class SelectedToken:
     file: Path  # absolute path to .token file
     key: str  # token contents (whitespace-stripped)
     mode: str  # "ranked" | "allowlist" | "random"
+
+
+def _shared_pool_hint() -> str:
+    """Return a parenthetical naming the shared pool that was also checked.
+
+    Empty when the shared fallback is disabled (``LOOM_SHARED_TOKENS_DIR=``),
+    so the error message stays accurate in both configurations (issue #3938).
+    """
+    shared = shared_tokens_dir()
+    if shared is None:
+        return ""
+    return f" (shared machine-level pool {shared} also checked)"
 
 
 def _read_token_file(token_path: Path) -> str:
@@ -374,18 +387,27 @@ def select_token(
             run ``loom-tokens bootstrap`` — never silently falls back.
     """
     workspace_path = Path(workspace_path)
-    tokens_dir = workspace_path / ".loom" / "tokens"
+    # Resolve the effective pool dir (issue #3938): the per-repo pool when it
+    # holds tokens, else the shared machine-level pool (~/.loom/tokens, override
+    # LOOM_SHARED_TOKENS_DIR), else the per-repo path for a sensible error. All
+    # pool-state files (.bad_tokens/.ranking/.allowlist/.failure_counts) are
+    # keyed off this same resolution, so they never fork per repo.
+    tokens_dir = resolve_tokens_dir(workspace_path)
 
     if not tokens_dir.is_dir():
         raise EmptyTokenPoolError(
-            f"Token directory does not exist: {tokens_dir}. "
-            f"Run `loom-tokens bootstrap` to populate it.",
+            f"Token directory does not exist: {tokens_dir}"
+            f"{_shared_pool_hint()}. "
+            f"Run `loom-tokens bootstrap` to populate it "
+            f"(or `loom-tokens bootstrap --shared` for the machine-level pool).",
         )
 
     all_tokens = _list_token_files(tokens_dir)
     if not all_tokens:
         raise EmptyTokenPoolError(
-            f"No .token files in {tokens_dir}. Run `loom-tokens bootstrap`.",
+            f"No .token files in {tokens_dir}{_shared_pool_hint()}. "
+            f"Run `loom-tokens bootstrap` "
+            f"(or `loom-tokens bootstrap --shared` for the machine-level pool).",
         )
 
     if rng is None:
