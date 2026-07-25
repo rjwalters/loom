@@ -172,10 +172,25 @@ pub enum Request {
         effort: Option<String>,
         #[serde(default)]
         depends_on: Option<u32>,
+        /// Target managed-workspace root (Issue #3929). When `Some(root)`, the
+        /// daemon resolves the per-repo sweep registry for that root via the
+        /// [`WorkspacePool`](crate::workspace_pool::WorkspacePool) — so a sweep
+        /// can be dispatched into a managed repo other than the daemon's default
+        /// workspace. When `None` (or absent on the wire — `#[serde(default)]`
+        /// keeps existing clients byte-for-byte compatible), the default
+        /// workspace registry is used, exactly as before.
+        #[serde(default)]
+        workspace_root: Option<String>,
     },
     /// List tracked sweeps, optionally filtered by state.
     ListSweeps {
         state_filter: Option<SweepState>,
+        /// Target managed-workspace root (Issue #3929). `Some(root)` lists the
+        /// sweeps tracked by that repo's registry; `None` (or absent) preserves
+        /// the default-workspace-only behavior. Cross-repo aggregation in a
+        /// single call is deferred to phase d (#3930).
+        #[serde(default)]
+        workspace_root: Option<String>,
     },
     // ========================================================================
     // Event Bus Requests (Issue #3453 — Phase B of #3449)
@@ -217,6 +232,11 @@ pub enum Request {
     /// this as `get_sweep_status` in the MCP layer.
     GetSweepStatus {
         sweep_id: SweepId,
+        /// Target managed-workspace root (Issue #3929). `Some(root)` looks the
+        /// sweep up in that repo's registry; `None` (or absent) uses the default
+        /// workspace, exactly as before.
+        #[serde(default)]
+        workspace_root: Option<String>,
     },
     /// Read the last `lines` lines from a sweep's per-sweep log file.
     /// Resolved relative to the registry's workspace root. Used by the
@@ -224,6 +244,11 @@ pub enum Request {
     TailSweepLog {
         sweep_id: SweepId,
         lines: usize,
+        /// Target managed-workspace root (Issue #3929). `Some(root)` resolves the
+        /// log against that repo's registry; `None` (or absent) uses the default
+        /// workspace, exactly as before.
+        #[serde(default)]
+        workspace_root: Option<String>,
     },
     /// Cancel a running sweep: send SIGTERM, wait the grace window, then
     /// SIGKILL if still alive. Transitions the registry entry from
@@ -234,6 +259,11 @@ pub enum Request {
         /// chosen by the MCP layer; the daemon honours whatever value
         /// arrives in the request.
         grace_secs: u64,
+        /// Target managed-workspace root (Issue #3929). `Some(root)` cancels a
+        /// sweep tracked by that repo's registry; `None` (or absent) uses the
+        /// default workspace, exactly as before.
+        #[serde(default)]
+        workspace_root: Option<String>,
     },
     // ========================================================================
     // Autonomous Daemon Status (Issue #3891 — follow-up to #3813 Phase D)
@@ -571,6 +601,15 @@ pub struct SweepInfo {
     /// `#[serde(default)]` keeps pre-#3729 wire data and clients compatible.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub depends_on: Option<u32>,
+    /// The managed-workspace root that owns this sweep (Issue #3929). Populated
+    /// from the owning registry's `config.workspace_root` so a `list_sweeps` /
+    /// `get_sweep_status` response is self-describing: two managed repos can each
+    /// have an issue #42, and this field disambiguates repo A's sweep from repo
+    /// B's. `None` on internally-constructed entries that have not yet been
+    /// stamped; `#[serde(default)]` keeps pre-#3929 wire data and clients
+    /// compatible.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repo: Option<String>,
 }
 
 // ========================================================================
@@ -667,12 +706,23 @@ pub enum Event {
         phase: String,
         #[serde(skip_serializing_if = "Option::is_none")]
         pr_number: Option<i32>,
+        /// Owning managed-workspace root (Issue #3929). Stamped by the emitting
+        /// registry from `config.workspace_root` so a subscriber that matches
+        /// the shared `sweep.issue.{N}.phase` topic can disambiguate two managed
+        /// repos' issue #N. Additive/backward-compatible — the topic string is
+        /// unchanged; the field lives in the payload only. `#[serde(default)]`
+        /// keeps pre-#3929 subscribers/wire data compatible.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        repo: Option<String>,
     },
     /// `sweep.issue.{N}.blocker` — sweep child encountered a blocker.
     SweepBlocker {
         issue: u32,
         reason: String,
         label_added: String,
+        /// Owning managed-workspace root (Issue #3929). See [`Self::SweepPhase`].
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        repo: Option<String>,
     },
     /// `sweep.issue.{N}.exited` — reaper detected clean exit.
     SweepExited {
@@ -680,12 +730,18 @@ pub enum Event {
         #[serde(skip_serializing_if = "Option::is_none")]
         exit_code: Option<i32>,
         duration_sec: i64,
+        /// Owning managed-workspace root (Issue #3929). See [`Self::SweepPhase`].
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        repo: Option<String>,
     },
     /// `sweep.issue.{N}.crashed` — reaper detected dead pid + checkpoint.
     SweepCrashed {
         issue: u32,
         #[serde(skip_serializing_if = "Option::is_none")]
         checkpoint_phase: Option<String>,
+        /// Owning managed-workspace root (Issue #3929). See [`Self::SweepPhase`].
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        repo: Option<String>,
     },
     /// `sweep.global.dispatch` — daemon dispatched a new sweep.
     SweepGlobalDispatch { sweep_id: SweepId, kind: SweepKind },
@@ -758,6 +814,12 @@ impl Event {
     /// | `CapacityAdvisory {..}` | `daemon.capacity.advisory` |
     /// | `TopicLag {..}` | `sweep.system.topic_lag` |
     /// | `Generic {topic, ..}` | the explicit topic string |
+    ///
+    /// The four `SweepPhase` / `SweepBlocker` / `SweepExited` / `SweepCrashed`
+    /// variants also carry a `repo` payload field (Issue #3929) so a subscriber
+    /// on the shared `sweep.issue.{N}.*` bus can disambiguate two managed repos'
+    /// issue #N. The topic **strings are unchanged** — `repo` lives in the
+    /// payload only, so existing single-repo subscribers route identically.
     #[must_use]
     pub fn topic(&self) -> String {
         match self {
@@ -773,6 +835,29 @@ impl Event {
             Self::CapacityAdvisory { .. } => "daemon.capacity.advisory".to_string(),
             Self::TopicLag { .. } => "sweep.system.topic_lag".to_string(),
             Self::Generic { topic, .. } => topic.clone(),
+        }
+    }
+
+    /// Stamp the owning managed-workspace `repo` into the sweep-scoped event
+    /// variants (Issue #3929), but only when the field is still absent — a
+    /// caller that already knows the repo (e.g. a `PublishEvent` payload from a
+    /// sweep child running in a specific workspace) is never overwritten.
+    ///
+    /// Non-sweep-scoped variants (`SweepGlobalDispatch` / `SweepGlobalCompleted`
+    /// already carry a unique `sweep_id`; `EpicAction`; `CapacityAdvisory`;
+    /// `TopicLag`; `Generic`) are left untouched. Called centrally from
+    /// `SweepRegistry::emit_event` so every emitted sweep event is stamped with
+    /// its registry's `workspace_root` without touching each construction site.
+    pub fn set_repo_if_absent(&mut self, repo: &str) {
+        let slot = match self {
+            Self::SweepPhase { repo, .. }
+            | Self::SweepBlocker { repo, .. }
+            | Self::SweepExited { repo, .. }
+            | Self::SweepCrashed { repo, .. } => repo,
+            _ => return,
+        };
+        if slot.is_none() {
+            *slot = Some(repo.to_string());
         }
     }
 }
@@ -839,4 +924,144 @@ impl EpicActionClass {
 pub enum SweepOutcome {
     Exited,
     Crashed,
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+
+    // ---- Issue #3929: event `repo` payload field is additive; topic unchanged ----
+
+    #[test]
+    fn sweep_scoped_event_topics_are_unchanged_by_repo_field() {
+        // The topic string format is frozen; adding `repo` to the payload must
+        // not shift any topic segment.
+        let phase = Event::SweepPhase {
+            issue: 42,
+            phase: "builder".to_string(),
+            pr_number: None,
+            repo: Some("/repos/a".to_string()),
+        };
+        assert_eq!(phase.topic(), "sweep.issue.42.phase");
+
+        let blocker = Event::SweepBlocker {
+            issue: 42,
+            reason: "x".to_string(),
+            label_added: "loom:blocked".to_string(),
+            repo: Some("/repos/b".to_string()),
+        };
+        assert_eq!(blocker.topic(), "sweep.issue.42.blocker");
+
+        let exited = Event::SweepExited {
+            issue: 7,
+            exit_code: Some(0),
+            duration_sec: 5,
+            repo: None,
+        };
+        assert_eq!(exited.topic(), "sweep.issue.7.exited");
+
+        let crashed = Event::SweepCrashed {
+            issue: 7,
+            checkpoint_phase: Some("doctor".to_string()),
+            repo: Some("/repos/c".to_string()),
+        };
+        assert_eq!(crashed.topic(), "sweep.issue.7.crashed");
+    }
+
+    #[test]
+    fn event_repo_round_trips_through_serde() {
+        let ev = Event::SweepPhase {
+            issue: 99,
+            phase: "judge".to_string(),
+            pr_number: Some(1234),
+            repo: Some("/repos/alpha".to_string()),
+        };
+        let json = serde_json::to_string(&ev).unwrap();
+        assert!(json.contains("\"repo\":\"/repos/alpha\""));
+        let back: Event = serde_json::from_str(&json).unwrap();
+        match back {
+            Event::SweepPhase { issue, repo, .. } => {
+                assert_eq!(issue, 99);
+                assert_eq!(repo.as_deref(), Some("/repos/alpha"));
+            }
+            other => panic!("expected SweepPhase, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn event_repo_defaults_to_none_for_pre_3929_wire_data() {
+        // A payload emitted before #3929 has no `repo` key; it must still parse,
+        // with `repo` defaulting to None (backward-compatible subscribers).
+        let json = r#"{"type":"SweepPhase","issue":5,"phase":"builder"}"#;
+        let ev: Event = serde_json::from_str(json).unwrap();
+        match ev {
+            Event::SweepPhase {
+                issue,
+                repo,
+                pr_number,
+                ..
+            } => {
+                assert_eq!(issue, 5);
+                assert!(repo.is_none());
+                assert!(pr_number.is_none());
+            }
+            other => panic!("expected SweepPhase, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn set_repo_if_absent_stamps_only_when_empty_and_only_sweep_scoped() {
+        // Stamps when absent.
+        let mut ev = Event::SweepExited {
+            issue: 1,
+            exit_code: None,
+            duration_sec: 0,
+            repo: None,
+        };
+        ev.set_repo_if_absent("/repos/x");
+        match &ev {
+            Event::SweepExited { repo, .. } => assert_eq!(repo.as_deref(), Some("/repos/x")),
+            other => panic!("unexpected {other:?}"),
+        }
+        // Does not overwrite an already-known repo.
+        ev.set_repo_if_absent("/repos/y");
+        match &ev {
+            Event::SweepExited { repo, .. } => assert_eq!(repo.as_deref(), Some("/repos/x")),
+            other => panic!("unexpected {other:?}"),
+        }
+        // Leaves non-sweep-scoped variants untouched (no panic, no field).
+        let mut global = Event::SweepGlobalCompleted {
+            sweep_id: "s1".to_string(),
+            outcome: SweepOutcome::Exited,
+        };
+        global.set_repo_if_absent("/repos/z"); // no-op, must not panic
+        assert_eq!(global.topic(), "sweep.global.completed");
+    }
+
+    // ---- Issue #3929: SweepInfo `repo` field is additive/backward-compatible ----
+
+    #[test]
+    fn sweep_info_repo_round_trips_and_defaults_to_none() {
+        let json = r#"{
+            "sweep_id":"s1",
+            "kind":{"type":"Issue","value":42},
+            "pid":1234,
+            "token_name":"agent-1.token",
+            "log_path":".loom/logs/sweep-issue-42.log",
+            "started_at":"2026-07-24T00:00:00Z",
+            "state":{"state":"Running"}
+        }"#;
+        // Pre-#3929 wire data (no `repo`) parses with repo == None.
+        let info: SweepInfo = serde_json::from_str(json).unwrap();
+        assert!(info.repo.is_none());
+
+        // Round-trip with repo populated.
+        let mut info = info;
+        info.repo = Some("/repos/beta".to_string());
+        let round = serde_json::to_string(&info).unwrap();
+        assert!(round.contains("\"repo\":\"/repos/beta\""));
+        let back: SweepInfo = serde_json::from_str(&round).unwrap();
+        assert_eq!(back.repo.as_deref(), Some("/repos/beta"));
+    }
 }

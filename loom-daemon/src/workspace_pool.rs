@@ -31,12 +31,16 @@
 //! pool captures a [`tokio::runtime::Handle`] to the shared runtime at
 //! construction and enters it (`Handle::enter`) around the reaper spawn.
 //!
-//! # Scope (phase b)
+//! # Eviction (phase c, #3929)
 //!
-//! Registry **eviction** on `workspace remove` and `(repo, issue)`-keyed
-//! namespacing are explicitly deferred to phase c (#3929). A deregistered
-//! workspace's registry + reaper linger harmlessly (the loops simply stop
-//! iterating it, since they only fan out over the *current* `effective_roots`).
+//! [`WorkspacePool::evict`] removes a provisioned registry when its workspace is
+//! deregistered (`workspace remove` / [`Request::DeregisterWorkspace`]), aborting
+//! its background reaper task so it does not leak for the daemon's lifetime. The
+//! **seeded default workspace** is guarded — its registry + reaper are owned by
+//! `main` and continue serving default-workspace IPC requests, so `evict` is a
+//! no-op for it (identified by `_reaper: None`).
+//!
+//! [`Request::DeregisterWorkspace`]: crate::types::Request::DeregisterWorkspace
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -146,6 +150,51 @@ impl WorkspacePool {
         arc
     }
 
+    /// Evict the provisioned registry for `root`, aborting its background reaper
+    /// task so it does not leak (Issue #3929). Called from the
+    /// [`Request::DeregisterWorkspace`](crate::types::Request::DeregisterWorkspace)
+    /// handler so `workspace remove` also drops the in-memory pool entry.
+    ///
+    /// Returns `true` when an entry was removed, `false` when `root` was not
+    /// pooled **or** was the seeded default workspace (which `main` owns — its
+    /// reaper must never be aborted from this path, since the daemon keeps
+    /// serving default-workspace IPC requests). The default-workspace guard is
+    /// structural: seeded entries carry `_reaper: None`.
+    ///
+    /// A live sweep child in the evicted registry is **not** killed — only the
+    /// in-memory tracking + reaper go away. The child keeps running and its lock
+    /// / log files are untouched; its terminal state simply becomes unobservable
+    /// via IPC after eviction (an accepted consequence of an explicit operator
+    /// `workspace remove`).
+    ///
+    /// Dropping a bare [`tokio::task::JoinHandle`] only *detaches* the task —
+    /// it does **not** cancel it — so we `.abort()` explicitly before dropping.
+    pub fn evict(&self, root: &Path) -> bool {
+        let mut map = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Guard the seeded default workspace: it has no owned reaper here
+        // (`_reaper: None`) and `main` continues to serve its IPC requests.
+        if map.get(root).is_some_and(|p| p._reaper.is_none()) {
+            log::debug!(
+                "workspace_pool: refusing to evict seeded default workspace {}",
+                root.display()
+            );
+            return false;
+        }
+        match map.remove(root) {
+            Some(pooled) => {
+                if let Some(reaper) = pooled._reaper {
+                    reaper.abort();
+                }
+                log::info!("workspace_pool: evicted sweep registry for {}", root.display());
+                true
+            }
+            None => false,
+        }
+    }
+
     /// Number of registries currently cached (test/observability aid).
     #[must_use]
     pub fn len(&self) -> usize {
@@ -220,5 +269,54 @@ mod tests {
         let pool = pool();
         assert!(pool.is_empty());
         assert_eq!(pool.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn evict_removes_provisioned_root_and_reprovisions_fresh() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        let pool = pool();
+
+        let first = pool.get_or_provision(&root);
+        assert_eq!(pool.len(), 1);
+
+        assert!(pool.evict(&root), "evicting a provisioned root returns true");
+        assert_eq!(pool.len(), 0);
+        assert!(pool.is_empty());
+
+        // A subsequent get_or_provision re-provisions a *new* registry instance
+        // (not the evicted Arc).
+        let second = pool.get_or_provision(&root);
+        assert!(!Arc::ptr_eq(&first, &second), "re-provisioned registry is a new instance");
+        assert_eq!(pool.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn evict_absent_root_is_false() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        let pool = pool();
+        assert!(!pool.evict(&root), "evicting a never-provisioned root is a no-op false");
+        assert_eq!(pool.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn evict_seeded_default_workspace_is_rejected() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        let pool = pool();
+
+        let seeded =
+            Arc::new(Mutex::new(SweepRegistry::new(SweepRegistryConfig::new(root.clone()))));
+        pool.seed(root.clone(), seeded.clone());
+        assert_eq!(pool.len(), 1);
+
+        // The seeded default workspace is owned by `main`; evicting it here must
+        // be a no-op so its reaper/IPC lifecycle is never disturbed.
+        assert!(!pool.evict(&root), "seeded default workspace is not evictable");
+        assert_eq!(pool.len(), 1, "seeded entry survives the evict attempt");
+
+        let got = pool.get_or_provision(&root);
+        assert!(Arc::ptr_eq(&got, &seeded), "seeded instance is still the pooled one");
     }
 }

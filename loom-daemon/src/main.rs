@@ -513,6 +513,7 @@ async fn main() -> Result<()> {
         sweep_registry,
         event_bus,
         main_health_state.clone(),
+        workspace_pool.clone(),
     );
 
     // Setup signal handler for graceful shutdown. We listen for BOTH SIGINT

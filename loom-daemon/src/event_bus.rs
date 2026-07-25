@@ -350,6 +350,7 @@ mod tests {
             issue,
             phase: phase.to_string(),
             pr_number: None,
+            repo: None,
         }
     }
 
@@ -437,6 +438,7 @@ mod tests {
                 issue,
                 phase,
                 pr_number: _,
+                repo: _,
             } => {
                 assert_eq!(issue, 123);
                 assert_eq!(phase, "builder");
@@ -492,6 +494,7 @@ mod tests {
             issue: 42,
             exit_code: Some(0),
             duration_sec: 12,
+            repo: None,
         });
         let _ = bus.publish_generic("sweep.global.dispatch", json!({"sweep_id": "x"}));
 
