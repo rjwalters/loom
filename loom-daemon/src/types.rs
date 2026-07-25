@@ -677,6 +677,13 @@ pub struct DaemonStatusReport {
 pub struct RepoStatus {
     /// The normalized workspace root this line describes.
     pub root: PathBuf,
+    /// This repo's cross-repo dispatch priority tier (Issue #3946): lower = higher
+    /// priority, default [`crate::workspace_registry::DEFAULT_WORKSPACE_PRIORITY`].
+    /// Surfaced so `loom-daemon status` shows which repos the autonomous loops
+    /// drain first. `#[serde(default)]` keeps pre-#3946 wire data compatible (an
+    /// absent field parses as the default tier).
+    #[serde(default = "crate::workspace_registry::default_priority")]
+    pub priority: u32,
     /// Count of non-terminal (`Pending` / `Running`) sweeps live in this repo's
     /// own [`crate::sweep_registry::SweepRegistry`] at snapshot time.
     pub in_flight_count: usize,

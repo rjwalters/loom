@@ -132,6 +132,13 @@ pub const DEFAULT_WORK_FINDER_MAX_CONCURRENT: usize = 3;
 /// label cache can be briefly stale, so the finder checks defensively.
 pub const SKIP_LABELS: &[&str] = &["loom:building", "loom:blocked", "loom:operator-only"];
 
+/// Label that promotes an issue ahead of its non-urgent siblings **within the
+/// same workspace-priority tier** (Issue #3946). Detection is best-effort: if no
+/// issue in a deployment carries this label the ordering reduces to
+/// (workspace priority, age) with no behavior change, so this never depends on
+/// the label being defined in a given repo's `.github/labels.yml`.
+pub const URGENT_LABEL: &str = "loom:urgent";
+
 // ============================================================================
 // Fetched work facts
 // ============================================================================
@@ -148,13 +155,34 @@ pub struct WorkItem {
     pub number: u32,
     /// The labels currently on the issue.
     pub labels: Vec<String>,
+    /// The issue's creation timestamp (`gh`'s `createdAt`, an ISO-8601 string),
+    /// used for age ordering (#3946). ISO-8601 sorts chronologically as a plain
+    /// string, so oldest-first is `created_at` ascending. `None` (older `gh`
+    /// output / a synthetic item) sorts *after* any dated item and falls back to
+    /// the issue number as a monotonic-with-creation age proxy.
+    pub created_at: Option<String>,
 }
 
 impl WorkItem {
-    /// Convenience constructor.
+    /// Convenience constructor (no creation timestamp — the item sorts by number
+    /// as its age proxy).
     #[must_use]
     pub fn new(number: u32, labels: Vec<String>) -> Self {
-        Self { number, labels }
+        Self {
+            number,
+            labels,
+            created_at: None,
+        }
+    }
+
+    /// Constructor carrying the issue's `createdAt` timestamp for age ordering.
+    #[must_use]
+    pub fn with_created_at(number: u32, labels: Vec<String>, created_at: Option<String>) -> Self {
+        Self {
+            number,
+            labels,
+            created_at,
+        }
     }
 
     /// True when the issue carries any [`SKIP_LABELS`] entry.
@@ -163,6 +191,69 @@ impl WorkItem {
         self.labels
             .iter()
             .any(|l| SKIP_LABELS.contains(&l.as_str()))
+    }
+
+    /// True when the issue carries the [`URGENT_LABEL`] (#3946) — it dispatches
+    /// ahead of non-urgent siblings in the same workspace-priority tier.
+    #[must_use]
+    pub fn is_urgent(&self) -> bool {
+        self.labels.iter().any(|l| l == URGENT_LABEL)
+    }
+}
+
+/// A dispatch candidate tagged with the cross-repo ordering keys (#3946): its
+/// workspace's priority tier, urgency, age, and the workspace index used to
+/// route the eventual `dispatch()` back to the owning workspace. Built by
+/// [`tick_multi`] after the per-workspace skip-label / in-flight filtering, then
+/// globally sorted by [`candidate_cmp`] before the shared concurrency budget is
+/// filled.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PriorityCandidate {
+    /// The owning workspace's index in the `workspaces` slice (dispatch routing).
+    pub workspace_idx: usize,
+    /// The owning workspace's priority tier (lower = higher priority).
+    pub workspace_priority: u32,
+    /// Whether the issue carries [`URGENT_LABEL`].
+    pub urgent: bool,
+    /// The issue's creation timestamp for age ordering (oldest-first).
+    pub created_at: Option<String>,
+    /// The issue number (dispatch target + final deterministic tiebreak).
+    pub number: u32,
+}
+
+/// Total ordering over dispatch candidates (#3946): **(workspace priority asc,
+/// `loom:urgent` first, issue age asc/oldest-first, issue number asc)**.
+///
+/// - Workspace priority ascending puts higher-priority tiers (lower numbers)
+///   first, so a tool repo pinned to `0` drains before a product repo at the
+///   default `100` regardless of how deep or old the product backlog is.
+/// - Within a tier, urgent issues (`loom:urgent`) come before non-urgent ones.
+/// - Then oldest-first by `createdAt`: a dated issue sorts before an undated one
+///   (`Some < None`); two undated issues fall through to the number tiebreak.
+/// - The issue number is the final tiebreak so the order is fully deterministic
+///   (and, since numbers are monotonic with creation, a sane age proxy when
+///   `createdAt` is unavailable).
+#[must_use]
+pub fn candidate_cmp(a: &PriorityCandidate, b: &PriorityCandidate) -> std::cmp::Ordering {
+    a.workspace_priority
+        .cmp(&b.workspace_priority)
+        // `urgent` true should sort first: reverse the bool compare (true > false).
+        .then_with(|| b.urgent.cmp(&a.urgent))
+        .then_with(|| cmp_created_at(&a.created_at, &b.created_at))
+        .then_with(|| a.number.cmp(&b.number))
+}
+
+/// Oldest-first ordering over optional `createdAt` timestamps: a dated issue
+/// (`Some`) sorts before an undated one (`None`); two dated issues compare
+/// lexically (ISO-8601 ⇒ chronological); two undated issues are equal (the
+/// caller's number tiebreak decides).
+fn cmp_created_at(a: &Option<String>, b: &Option<String>) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    match (a, b) {
+        (Some(x), Some(y)) => x.cmp(y),
+        (Some(_), None) => Ordering::Less,
+        (None, Some(_)) => Ordering::Greater,
+        (None, None) => Ordering::Equal,
     }
 }
 
@@ -352,11 +443,31 @@ pub fn tick(
 /// Unlike [`tick`], a source error is **not** propagated (there is no single
 /// caller to retry — the other workspaces must still run); it is folded into the
 /// returned [`TickReport`].
+///
+/// # Cross-repo priority ordering (#3946)
+///
+/// `priorities` is a slice **parallel to `workspaces`**: `priorities[i]` is
+/// workspace `i`'s dispatch tier (lower = higher priority; a missing entry
+/// defaults to [`crate::workspace_registry::DEFAULT_WORKSPACE_PRIORITY`]).
+/// Rather than dispatching each workspace's backlog in registration order, this
+/// gathers every eligible candidate across all workspaces into one queue, sorts
+/// it by [`candidate_cmp`] — **(workspace priority asc, `loom:urgent` first,
+/// issue age asc, number asc)** — and then fills the single shared concurrency
+/// budget in that global order. So a deep, old product-repo backlog never
+/// starves a small higher-priority tool repo: the tool repo's candidates are
+/// dispatched first even though the product repo has older / more work. The
+/// cap/budget mechanics are unchanged — this only orders the queue.
+///
+/// Strict priority is intentional (v1): a permanently-full higher tier starves
+/// lower tiers. Fairness reservations are an explicit follow-up.
 pub fn tick_multi<S: WorkSource, D: WorkDispatcher>(
     workspaces: &mut [(S, D)],
+    priorities: &[u32],
     max_concurrent: usize,
     halted: &[bool],
 ) -> TickReport {
+    use crate::workspace_registry::DEFAULT_WORKSPACE_PRIORITY;
+
     let mut report = TickReport::default();
 
     // Snapshot per-workspace in-flight sets *first* (immutable borrow) so the
@@ -368,7 +479,12 @@ pub fn tick_multi<S: WorkSource, D: WorkDispatcher>(
     // single-flag semantics for a single (empty-registry) workspace.
     let mut any_halted = false;
 
-    for (idx, (source, dispatcher)) in workspaces.iter_mut().enumerate() {
+    // Pass 1 (mutable source reads): gather every eligible candidate across all
+    // workspaces, applying the per-workspace skip-label / in-flight filters and
+    // the per-repo halt gate. Nothing is dispatched yet — ordering must be
+    // decided globally, so dispatch happens in pass 2 after the sort.
+    let mut candidates: Vec<PriorityCandidate> = Vec::new();
+    for (idx, (source, _)) in workspaces.iter_mut().enumerate() {
         let ready = match source.list_ready_issues() {
             Ok(r) => r,
             Err(e) => {
@@ -391,6 +507,7 @@ pub fn tick_multi<S: WorkSource, D: WorkDispatcher>(
         }
 
         let in_flight = &in_flights[idx];
+        let workspace_priority = priorities.get(idx).copied().unwrap_or(DEFAULT_WORKSPACE_PRIORITY);
 
         for item in ready {
             if item.is_skipped() {
@@ -401,25 +518,42 @@ pub fn tick_multi<S: WorkSource, D: WorkDispatcher>(
                 report.skipped_in_flight += 1;
                 continue;
             }
-            // Shared global cap across all workspaces — defer once the combined
-            // occupancy hits the budget, regardless of which workspace still has
-            // ready items.
-            if occupancy >= max_concurrent {
-                report.deferred_capacity += 1;
-                continue;
+            candidates.push(PriorityCandidate {
+                workspace_idx: idx,
+                workspace_priority,
+                urgent: item.is_urgent(),
+                created_at: item.created_at,
+                number: item.number,
+            });
+        }
+    }
+
+    // Global priority sort (#3946): (workspace priority, urgent, age, number).
+    candidates.sort_by(candidate_cmp);
+
+    // Pass 2 (mutable dispatcher calls): fill the single shared concurrency
+    // budget in the sorted global order, routing each candidate back to its
+    // owning workspace's dispatcher.
+    for cand in candidates {
+        // Shared global cap across all workspaces — defer once the combined
+        // occupancy hits the budget, regardless of which workspace still has
+        // ready items.
+        if occupancy >= max_concurrent {
+            report.deferred_capacity += 1;
+            continue;
+        }
+        let dispatcher = &mut workspaces[cand.workspace_idx].1;
+        match dispatcher.dispatch(cand.number) {
+            Ok(true) => {
+                report.dispatched += 1;
+                occupancy += 1;
             }
-            match dispatcher.dispatch(item.number) {
-                Ok(true) => {
-                    report.dispatched += 1;
-                    occupancy += 1;
-                }
-                Ok(false) => {
-                    report.skipped_in_flight += 1;
-                }
-                Err(e) => {
-                    report.errors += 1;
-                    log::warn!("work_finder: dispatch for issue #{} failed: {e}", item.number);
-                }
+            Ok(false) => {
+                report.skipped_in_flight += 1;
+            }
+            Err(e) => {
+                report.errors += 1;
+                log::warn!("work_finder: dispatch for issue #{} failed: {e}", cand.number);
             }
         }
     }
@@ -800,13 +934,16 @@ pub fn spawn_multi_work_finder_task(
             let max_concurrent = resolve_dynamic_max_concurrent(token_limit, disk, configured_max);
 
             // Resolve the current set of workspaces fresh each tick so registry
-            // edits are hot-applied.
-            let roots = WorkspaceRegistry::load_default()
-                .unwrap_or_else(|e| {
-                    log::warn!("work_finder: could not load workspace registry ({e}); using cwd");
-                    WorkspaceRegistry::default()
-                })
-                .effective_roots(&fallback_root);
+            // edits (add / remove / set-priority) are hot-applied.
+            let registry = WorkspaceRegistry::load_default().unwrap_or_else(|e| {
+                log::warn!("work_finder: could not load workspace registry ({e}); using cwd");
+                WorkspaceRegistry::default()
+            });
+            let roots = registry.effective_roots(&fallback_root);
+
+            // Per-repo priority tiers (#3946), parallel to `pairs`: lower = higher
+            // priority. The empty-registry cwd fallback resolves to the default.
+            let priorities: Vec<u32> = roots.iter().map(|r| registry.priority_of(r)).collect();
 
             // Per-repo main-health halt (#3930): look up each root's own gate
             // state, parallel to `pairs`. A red repo halts only its own dispatch.
@@ -824,11 +961,11 @@ pub fn spawn_multi_work_finder_task(
             log::debug!(
                 "work_finder: dynamic cap = {max_concurrent} (pool={pool_size}, \
                  healthy_tokens={token_limit}, disk={disk}, configured_max={configured_max}, \
-                 any_halted={any_halted}, workspaces={})",
+                 any_halted={any_halted}, workspaces={}, priorities={priorities:?})",
                 pairs.len()
             );
 
-            let report = tick_multi(&mut pairs, max_concurrent, &halted);
+            let report = tick_multi(&mut pairs, &priorities, max_concurrent, &halted);
 
             if report.halted && !was_halted {
                 log::warn!(
@@ -942,12 +1079,17 @@ pub mod forge {
     use std::process::{Command, Stdio};
     use std::sync::{Arc, Mutex};
 
-    /// Minimal `gh issue list --json number,labels` row.
+    /// Minimal `gh issue list --json number,labels,createdAt` row.
     #[derive(Debug, Deserialize)]
     struct GhIssue {
         number: u32,
         #[serde(default)]
         labels: Vec<GhLabel>,
+        /// Issue creation timestamp for age ordering (#3946). `#[serde(default)]`
+        /// tolerates older `gh` output that omits it (the item then sorts by
+        /// number as its age proxy).
+        #[serde(rename = "createdAt", default)]
+        created_at: Option<String>,
     }
 
     #[derive(Debug, Deserialize)]
@@ -1021,7 +1163,7 @@ pub mod forge {
                 .arg("--limit")
                 .arg("200")
                 .arg("--json")
-                .arg("number,labels");
+                .arg("number,labels,createdAt");
             if let Some(ref repo) = self.repo {
                 cmd.arg("--repo").arg(repo);
             }
@@ -1042,7 +1184,13 @@ pub mod forge {
                 serde_json::from_slice(&out.stdout).context("parse gh issue list JSON")?;
             Ok(rows
                 .into_iter()
-                .map(|r| WorkItem::new(r.number, r.labels.into_iter().map(|l| l.name).collect()))
+                .map(|r| {
+                    WorkItem::with_created_at(
+                        r.number,
+                        r.labels.into_iter().map(|l| l.name).collect(),
+                        r.created_at,
+                    )
+                })
                 .collect())
         }
     }
@@ -1358,7 +1506,7 @@ mod tests {
         // Empty-registry equivalence: one workspace behaves exactly like tick().
         let mut multi =
             vec![(FakeSource::once((1..=3).map(issue).collect()), RecordingDispatcher::default())];
-        let report = tick_multi(&mut multi, 10, &[false]);
+        let report = tick_multi(&mut multi, &[],10, &[false]);
         assert_eq!(report.seen, 3);
         assert_eq!(report.dispatched, 3);
         assert_eq!(report.deferred_capacity, 0);
@@ -1373,7 +1521,7 @@ mod tests {
             (FakeSource::once(vec![issue(1), issue(2)]), RecordingDispatcher::default()),
             (FakeSource::once(vec![issue(10), issue(11)]), RecordingDispatcher::default()),
         ];
-        let report = tick_multi(&mut multi, 10, &[false, false]);
+        let report = tick_multi(&mut multi, &[],10, &[false, false]);
         assert_eq!(report.seen, 4);
         assert_eq!(report.dispatched, 4);
         assert_eq!(multi[0].1.dispatched, vec![1, 2], "workspace 0 dispatches its own issues");
@@ -1389,7 +1537,7 @@ mod tests {
             (FakeSource::once((1..=5).map(issue).collect()), RecordingDispatcher::default()),
             (FakeSource::once((10..=14).map(issue).collect()), RecordingDispatcher::default()),
         ];
-        let report = tick_multi(&mut multi, 3, &[false, false]);
+        let report = tick_multi(&mut multi, &[],3, &[false, false]);
         let total: usize = multi.iter().map(|(_, d)| d.dispatched.len()).sum();
         assert_eq!(report.dispatched, 3, "combined dispatch never exceeds the global cap");
         assert_eq!(total, 3, "sum of per-workspace dispatches equals the global cap");
@@ -1416,7 +1564,7 @@ mod tests {
                 },
             ),
         ];
-        let report = tick_multi(&mut multi, 4, &[false, false]);
+        let report = tick_multi(&mut multi, &[],4, &[false, false]);
         assert_eq!(report.dispatched, 1, "3 in-flight + cap 4 ⇒ 1 free slot globally");
         assert_eq!(report.deferred_capacity, 3);
         // The single free slot goes to the first workspace's first ready issue.
@@ -1433,7 +1581,7 @@ mod tests {
             (err_source("bad auth for repo B"), RecordingDispatcher::default()),
             (FakeSource::once(vec![issue(30)]), RecordingDispatcher::default()),
         ];
-        let report = tick_multi(&mut multi, 10, &[false, false, false]);
+        let report = tick_multi(&mut multi, &[],10, &[false, false, false]);
         assert_eq!(report.errors, 1, "the failing workspace is counted, not fatal");
         assert_eq!(report.dispatched, 3, "the two healthy workspaces still dispatch");
         assert_eq!(multi[0].1.dispatched, vec![1, 2]);
@@ -1447,7 +1595,7 @@ mod tests {
             (FakeSource::once((1..=3).map(issue).collect()), RecordingDispatcher::default()),
             (FakeSource::once((10..=12).map(issue).collect()), RecordingDispatcher::default()),
         ];
-        let report = tick_multi(&mut multi, 10, &[true, true]);
+        let report = tick_multi(&mut multi, &[],10, &[true, true]);
         assert!(report.halted);
         assert_eq!(report.seen, 6, "backlog across both workspaces is still observed");
         assert_eq!(report.dispatched, 0, "zero dispatch while halted");
@@ -1457,7 +1605,7 @@ mod tests {
     #[test]
     fn test_tick_multi_empty_workspace_set_is_noop() {
         let mut multi: Vec<(FakeSource, RecordingDispatcher)> = vec![];
-        let report = tick_multi(&mut multi, 10, &[]);
+        let report = tick_multi(&mut multi, &[],10, &[]);
         assert_eq!(report, TickReport::default());
     }
 
@@ -1470,7 +1618,7 @@ mod tests {
             (FakeSource::once(vec![issue(1), issue(2)]), RecordingDispatcher::default()),
             (FakeSource::once(vec![issue(10), issue(11)]), RecordingDispatcher::default()),
         ];
-        let report = tick_multi(&mut multi, 10, &[true, false]);
+        let report = tick_multi(&mut multi, &[],10, &[true, false]);
         assert!(report.halted, "report.halted is set when any repo was gated");
         assert_eq!(report.seen, 4, "both repos' backlogs are observed");
         assert_eq!(report.dispatched, 2, "only repo B dispatched");
@@ -1486,7 +1634,7 @@ mod tests {
             (FakeSource::once(vec![issue(1), issue(2)]), RecordingDispatcher::default()),
             (FakeSource::once(vec![issue(10), issue(11)]), RecordingDispatcher::default()),
         ];
-        let report = tick_multi(&mut multi, 10, &[false, true]);
+        let report = tick_multi(&mut multi, &[],10, &[false, true]);
         assert!(report.halted, "a gated sibling still sets report.halted");
         assert_eq!(report.dispatched, 2, "only repo A dispatched");
         assert_eq!(multi[0].1.dispatched, vec![1, 2], "green repo A dispatched its backlog");
@@ -1508,7 +1656,7 @@ mod tests {
             ),
             (FakeSource::once(vec![issue(10), issue(11)]), RecordingDispatcher::default()),
         ];
-        let report = tick_multi(&mut multi, 3, &[true, false]);
+        let report = tick_multi(&mut multi, &[],3, &[true, false]);
         assert!(report.halted);
         assert_eq!(report.dispatched, 0, "occupancy already at cap from red repo's in-flight");
         assert_eq!(report.deferred_capacity, 2, "repo B's 2 ready issues deferred by the budget");
@@ -1522,7 +1670,7 @@ mod tests {
             (FakeSource::once(vec![issue(1)]), RecordingDispatcher::default()),
             (FakeSource::once(vec![issue(10)]), RecordingDispatcher::default()),
         ];
-        let report = tick_multi(&mut multi, 10, &[false, false]);
+        let report = tick_multi(&mut multi, &[],10, &[false, false]);
         assert!(!report.halted);
         assert_eq!(report.dispatched, 2);
     }
@@ -1535,7 +1683,7 @@ mod tests {
             (FakeSource::once(vec![issue(1)]), RecordingDispatcher::default()),
             (FakeSource::once(vec![issue(10)]), RecordingDispatcher::default()),
         ];
-        let report = tick_multi(&mut multi, 10, &[true]);
+        let report = tick_multi(&mut multi, &[],10, &[true]);
         assert!(report.halted);
         assert_eq!(report.dispatched, 1, "workspace 1 (no halt entry) still dispatches");
         assert!(multi[0].1.dispatched.is_empty());
@@ -1543,8 +1691,159 @@ mod tests {
     }
 
     // ===================================================================
+    // tick_multi — cross-repo priority ordering (#3946)
+    // ===================================================================
+
+    fn issue_at(n: u32, created_at: &str) -> WorkItem {
+        WorkItem::with_created_at(n, vec!["loom:issue".into()], Some(created_at.to_string()))
+    }
+
+    fn urgent_issue(n: u32) -> WorkItem {
+        WorkItem::new(n, vec!["loom:issue".into(), URGENT_LABEL.into()])
+    }
+
+    #[test]
+    fn test_tick_multi_higher_priority_repo_dispatches_first_under_cap() {
+        // ACCEPTANCE (#3946): the LOWER-priority repo (index 0, priority 100) has
+        // OLDER and MORE candidates than the HIGHER-priority repo (index 1,
+        // priority 0). Under a global cap of 2, the higher-priority repo's
+        // candidates MUST dispatch first anyway — a deep/old product backlog
+        // never starves a small high-priority tool repo.
+        let mut multi = vec![
+            (
+                // Low-priority repo: 4 candidates, all OLDER (2023 timestamps).
+                FakeSource::once(vec![
+                    issue_at(1, "2023-01-01T00:00:00Z"),
+                    issue_at(2, "2023-01-02T00:00:00Z"),
+                    issue_at(3, "2023-01-03T00:00:00Z"),
+                    issue_at(4, "2023-01-04T00:00:00Z"),
+                ]),
+                RecordingDispatcher::default(),
+            ),
+            (
+                // High-priority repo: 2 candidates, both NEWER (2025 timestamps).
+                FakeSource::once(vec![
+                    issue_at(50, "2025-01-01T00:00:00Z"),
+                    issue_at(51, "2025-01-02T00:00:00Z"),
+                ]),
+                RecordingDispatcher::default(),
+            ),
+        ];
+        // priorities parallel to workspaces: repo 0 = 100 (low), repo 1 = 0 (high).
+        let report = tick_multi(&mut multi, &[100, 0], 2, &[false, false]);
+
+        assert_eq!(report.dispatched, 2, "the global cap of 2 is filled");
+        assert_eq!(report.deferred_capacity, 4, "the low-priority repo's 4 are deferred");
+        assert!(
+            multi[0].1.dispatched.is_empty(),
+            "the low-priority repo dispatches NOTHING despite older/more candidates"
+        );
+        assert_eq!(
+            multi[1].1.dispatched,
+            vec![50, 51],
+            "the high-priority repo's candidates dispatch first"
+        );
+    }
+
+    #[test]
+    fn test_tick_multi_urgent_beats_older_within_same_tier() {
+        // Within one workspace-priority tier, `loom:urgent` sorts ahead of an
+        // older / lower-numbered non-urgent sibling. Cap 1 ⇒ only the urgent one.
+        let mut multi = vec![(
+            FakeSource::once(vec![
+                issue_at(1, "2023-01-01T00:00:00Z"), // older, non-urgent
+                urgent_issue(9),                     // newer, urgent
+            ]),
+            RecordingDispatcher::default(),
+        )];
+        let report = tick_multi(&mut multi, &[100], 1, &[false]);
+        assert_eq!(report.dispatched, 1);
+        assert_eq!(
+            multi[0].1.dispatched,
+            vec![9],
+            "the urgent issue outranks the older non-urgent one in the same tier"
+        );
+    }
+
+    #[test]
+    fn test_tick_multi_oldest_first_within_same_tier_and_urgency() {
+        // Same tier, neither urgent: oldest-first by createdAt. Cap 1 ⇒ the
+        // oldest (#7, 2022) dispatches before the newer (#2, 2024).
+        let mut multi = vec![(
+            FakeSource::once(vec![
+                issue_at(2, "2024-06-01T00:00:00Z"),
+                issue_at(7, "2022-06-01T00:00:00Z"),
+            ]),
+            RecordingDispatcher::default(),
+        )];
+        let report = tick_multi(&mut multi, &[100], 1, &[false]);
+        assert_eq!(report.dispatched, 1);
+        assert_eq!(multi[0].1.dispatched, vec![7], "the older issue dispatches first");
+    }
+
+    #[test]
+    fn test_tick_multi_missing_priority_entry_defaults() {
+        // A short `priorities` slice (fewer entries than workspaces) treats the
+        // unspecified workspaces as the default tier rather than panicking. With
+        // both at the default, ordering reduces to age/number.
+        let mut multi = vec![
+            (FakeSource::once(vec![issue(1)]), RecordingDispatcher::default()),
+            (FakeSource::once(vec![issue(10)]), RecordingDispatcher::default()),
+        ];
+        let report = tick_multi(&mut multi, &[], 10, &[false, false]);
+        assert_eq!(report.dispatched, 2);
+        assert_eq!(multi[0].1.dispatched, vec![1]);
+        assert_eq!(multi[1].1.dispatched, vec![10]);
+    }
+
+    #[test]
+    fn test_candidate_cmp_ordering() {
+        use std::cmp::Ordering;
+        let mk = |idx, prio, urgent, created: Option<&str>, num| PriorityCandidate {
+            workspace_idx: idx,
+            workspace_priority: prio,
+            urgent,
+            created_at: created.map(str::to_string),
+            number: num,
+        };
+
+        // Priority dominates everything else: prio 0 (urgent=false, newer) still
+        // beats prio 100 (urgent=true, older).
+        let high = mk(0, 0, false, Some("2025-01-01T00:00:00Z"), 999);
+        let low = mk(1, 100, true, Some("2000-01-01T00:00:00Z"), 1);
+        assert_eq!(candidate_cmp(&high, &low), Ordering::Less);
+
+        // Same tier: urgent before non-urgent.
+        let u = mk(0, 100, true, Some("2025-01-01T00:00:00Z"), 50);
+        let n = mk(0, 100, false, Some("2000-01-01T00:00:00Z"), 1);
+        assert_eq!(candidate_cmp(&u, &n), Ordering::Less);
+
+        // Same tier + same urgency: oldest-first.
+        let old = mk(0, 100, false, Some("2020-01-01T00:00:00Z"), 80);
+        let new = mk(0, 100, false, Some("2024-01-01T00:00:00Z"), 2);
+        assert_eq!(candidate_cmp(&old, &new), Ordering::Less);
+
+        // A dated issue sorts before an undated one (Some < None).
+        let dated = mk(0, 100, false, Some("2024-01-01T00:00:00Z"), 5);
+        let undated = mk(0, 100, false, None, 4);
+        assert_eq!(candidate_cmp(&dated, &undated), Ordering::Less);
+
+        // Fully-tied keys fall through to the number tiebreak (lower first).
+        let a = mk(0, 100, false, None, 3);
+        let b = mk(0, 100, false, None, 8);
+        assert_eq!(candidate_cmp(&a, &b), Ordering::Less);
+    }
+
+    // ===================================================================
     // WorkItem
     // ===================================================================
+
+    #[test]
+    fn test_work_item_is_urgent() {
+        assert!(!issue(1).is_urgent());
+        assert!(urgent_issue(1).is_urgent());
+        assert!(WorkItem::new(1, vec!["loom:issue".into(), "loom:urgent".into()]).is_urgent());
+    }
 
     #[test]
     fn test_work_item_is_skipped() {

@@ -41,12 +41,33 @@ pub const REGISTRY_PATH_ENV: &str = "LOOM_WORKSPACES_PATH";
 /// loader tolerates a missing/older `version` for forward compatibility.
 pub const REGISTRY_VERSION: u32 = 1;
 
+/// Default per-workspace dispatch priority (Issue #3946). Lower = higher
+/// priority. An entry with no explicit `priority` — including every pre-#3946
+/// registry file — parses as this value, so existing registries are unaffected
+/// (all repos share one tier and ordering reduces to the pre-#3946 behavior).
+pub const DEFAULT_WORKSPACE_PRIORITY: u32 = 100;
+
+/// serde `default` provider for [`Workspace::priority`] / [`crate::types::RepoStatus`].
+#[must_use]
+pub fn default_priority() -> u32 {
+    DEFAULT_WORKSPACE_PRIORITY
+}
+
 /// A single managed workspace (repo) entry.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Workspace {
     /// Absolute, normalized repo root. This is the canonical key — two entries
     /// with the same `root` are deduplicated on `add`.
     pub root: PathBuf,
+    /// Cross-repo dispatch priority tier (Issue #3946): **lower = higher
+    /// priority**, default [`DEFAULT_WORKSPACE_PRIORITY`] (100). The autonomous
+    /// work-finder and epic supervisor order candidates by this ascending, so a
+    /// tool repo pinned to `0` outranks a product repo left at the default. A
+    /// missing `priority` — including every pre-#3946 registry file — parses as
+    /// the default via `#[serde(default)]`, keeping old registries byte-for-byte
+    /// compatible.
+    #[serde(default = "default_priority")]
+    pub priority: u32,
     /// Optional per-repo config overrides, stored verbatim as opaque JSON.
     /// Phase 1 persists and round-trips these but does not interpret them;
     /// later phases layer them over the repo's `.loom/config.json`.
@@ -194,17 +215,33 @@ impl WorkspaceRegistry {
         self.workspaces.iter().any(|w| w.root == canonical)
     }
 
-    /// Register a workspace. Normalizes `root`, validates it exists and is a
-    /// directory, and deduplicates on the normalized path. Idempotent: a
-    /// re-register returns [`AddOutcome::AlreadyPresent`] without mutating.
-    ///
-    /// `config_overrides` is stored verbatim (only applied on a genuine insert;
-    /// a re-register does not overwrite existing overrides — remove then re-add
-    /// to change them).
+    /// Register a workspace at the default priority
+    /// ([`DEFAULT_WORKSPACE_PRIORITY`]). Thin wrapper over
+    /// [`add_with_priority`](Self::add_with_priority) preserving the pre-#3946
+    /// signature for existing callers.
     pub fn add(
         &mut self,
         root: &Path,
         config_overrides: Option<serde_json::Value>,
+    ) -> Result<AddOutcome> {
+        self.add_with_priority(root, config_overrides, DEFAULT_WORKSPACE_PRIORITY)
+    }
+
+    /// Register a workspace with an explicit dispatch `priority` (Issue #3946;
+    /// lower = higher priority). Normalizes `root`, validates it exists and is a
+    /// directory, and deduplicates on the normalized path. Idempotent: a
+    /// re-register returns [`AddOutcome::AlreadyPresent`] without mutating (use
+    /// [`set_priority`](Self::set_priority) to change an already-registered
+    /// repo's tier).
+    ///
+    /// `config_overrides` is stored verbatim (only applied on a genuine insert;
+    /// a re-register does not overwrite existing overrides — remove then re-add
+    /// to change them).
+    pub fn add_with_priority(
+        &mut self,
+        root: &Path,
+        config_overrides: Option<serde_json::Value>,
+        priority: u32,
     ) -> Result<AddOutcome> {
         let canonical = normalize_path(root);
 
@@ -221,12 +258,40 @@ impl WorkspaceRegistry {
         let looks_like = looks_like_workspace(&canonical);
         self.workspaces.push(Workspace {
             root: canonical.clone(),
+            priority,
             config_overrides,
         });
         Ok(AddOutcome::Added {
             canonical,
             looks_like_workspace: looks_like,
         })
+    }
+
+    /// Set the dispatch priority of an already-registered workspace (Issue
+    /// #3946). Normalizes `root` and updates the matching entry's `priority`,
+    /// returning `true` when an entry was updated, `false` when no matching
+    /// workspace is registered (a no-op — the caller reports it).
+    pub fn set_priority(&mut self, root: &Path, priority: u32) -> bool {
+        let canonical = normalize_path(root);
+        if let Some(ws) = self.workspaces.iter_mut().find(|w| w.root == canonical) {
+            ws.priority = priority;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// The dispatch priority of the workspace whose normalized root is exactly
+    /// `root` (Issue #3946). `root` is expected to already be normalized — the
+    /// roots returned by [`effective_roots`](Self::effective_roots) /
+    /// [`roots`](Self::roots) are. A root not present in the registry (e.g. the
+    /// empty-registry cwd fallback) resolves to [`DEFAULT_WORKSPACE_PRIORITY`].
+    #[must_use]
+    pub fn priority_of(&self, root: &Path) -> u32 {
+        self.workspaces
+            .iter()
+            .find(|w| w.root == root)
+            .map_or(DEFAULT_WORKSPACE_PRIORITY, |w| w.priority)
     }
 
     /// Deregister a workspace by root. Normalizes `root` and removes the
@@ -407,6 +472,7 @@ mod tests {
         let mut reg = WorkspaceRegistry::default();
         reg.workspaces.push(Workspace {
             root: canonical.clone(),
+            priority: DEFAULT_WORKSPACE_PRIORITY,
             config_overrides: None,
         });
 
@@ -495,5 +561,100 @@ mod tests {
         std::fs::write(&path, r#"{ "workspaces": [] }"#).unwrap();
         let reg = WorkspaceRegistry::load(&path).unwrap();
         assert_eq!(reg.version, REGISTRY_VERSION);
+    }
+
+    // ===================================================================
+    // Priority tiers (#3946)
+    // ===================================================================
+
+    #[test]
+    fn add_defaults_to_default_priority() {
+        let dir = tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+
+        let mut reg = WorkspaceRegistry::default();
+        reg.add(&repo, None).unwrap();
+        assert_eq!(reg.workspaces[0].priority, DEFAULT_WORKSPACE_PRIORITY);
+    }
+
+    #[test]
+    fn add_with_priority_stores_and_looks_up() {
+        let dir = tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let canonical = std::fs::canonicalize(&repo).unwrap();
+
+        let mut reg = WorkspaceRegistry::default();
+        reg.add_with_priority(&repo, None, 0).unwrap();
+        assert_eq!(reg.workspaces[0].priority, 0);
+        assert_eq!(reg.priority_of(&canonical), 0);
+    }
+
+    #[test]
+    fn priority_of_unregistered_root_is_default() {
+        let reg = WorkspaceRegistry::default();
+        assert_eq!(
+            reg.priority_of(Path::new("/not/registered")),
+            DEFAULT_WORKSPACE_PRIORITY
+        );
+    }
+
+    #[test]
+    fn set_priority_updates_existing_and_reports_missing() {
+        let dir = tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let canonical = std::fs::canonicalize(&repo).unwrap();
+
+        let mut reg = WorkspaceRegistry::default();
+        reg.add(&repo, None).unwrap();
+        assert!(reg.set_priority(&repo, 1), "updating a present entry returns true");
+        assert_eq!(reg.priority_of(&canonical), 1);
+
+        assert!(
+            !reg.set_priority(Path::new("/absent"), 5),
+            "updating an absent entry returns false"
+        );
+    }
+
+    #[test]
+    fn priority_survives_save_load_roundtrip() {
+        let dir = tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let path = dir.path().join("workspaces.json");
+
+        let mut reg = WorkspaceRegistry::default();
+        reg.add_with_priority(&repo, None, 3).unwrap();
+        reg.save(&path).unwrap();
+
+        let loaded = WorkspaceRegistry::load(&path).unwrap();
+        assert_eq!(loaded.workspaces[0].priority, 3);
+        assert_eq!(loaded, reg);
+    }
+
+    #[test]
+    fn legacy_entry_without_priority_parses_as_default() {
+        // Backward compatibility (#3946 acceptance): a pre-#3946 registry file
+        // whose workspace object has NO `priority` key must load as the default
+        // priority, not fail to parse.
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("workspaces.json");
+        let repo = dir.path().join("legacy-repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let root_json = serde_json::to_string(&repo).unwrap();
+        std::fs::write(
+            &path,
+            format!(r#"{{ "version": 1, "workspaces": [ {{ "root": {root_json} }} ] }}"#),
+        )
+        .unwrap();
+
+        let reg = WorkspaceRegistry::load(&path).unwrap();
+        assert_eq!(reg.workspaces.len(), 1);
+        assert_eq!(
+            reg.workspaces[0].priority, DEFAULT_WORKSPACE_PRIORITY,
+            "an entry with no `priority` parses as the default (backward compat)"
+        );
     }
 }
