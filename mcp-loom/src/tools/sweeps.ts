@@ -20,7 +20,36 @@
  */
 
 import type { Tool } from "@modelcontextprotocol/sdk/types.js";
-import { sendDaemonRequest, sendDaemonStreamRequest } from "../shared/daemon.js";
+import {
+  resolveDaemonIpcTimeoutMs,
+  sendDaemonRequest,
+  sendDaemonStreamRequest,
+} from "../shared/daemon.js";
+
+// ============================================================================
+// Per-call IPC timeouts (issue #3945)
+// ============================================================================
+//
+// Most unary calls (publish_event, list_sweeps, get_sweep_status,
+// tail_sweep_log) are immediate acks and use the small default bound in
+// `sendDaemonRequest`. Two calls legitimately take longer than an immediate
+// ack and pass an explicit wider timeout so the bounded-timeout fix does not
+// regress them:
+//
+//   - dispatch_sweep: the daemon spawns the sweep child (token selection +
+//     spawn-claude.sh) while holding the registry mutex before it acks.
+//   - cancel_sweep: the daemon blocks for the SIGTERM -> grace -> SIGKILL
+//     window (grace_secs, default 30) before returning the completed-cancel
+//     ack.
+//
+// Each still resolves to a bounded value — never the ~1800s hang — and honors
+// a higher `LOOM_DAEMON_IPC_TIMEOUT_MS` env override via `Math.max`.
+
+/** Wider bound for `dispatch_sweep`'s spawn-under-mutex ack. */
+const DISPATCH_TIMEOUT_MS = 30_000;
+
+/** Fixed headroom added on top of a cancel's grace window. */
+const CANCEL_TIMEOUT_BUFFER_MS = 30_000;
 
 // ============================================================================
 // Wire types
@@ -283,7 +312,7 @@ async function dispatchSweep(args: {
         // before; a value routes the sweep into that managed repo's registry.
         workspace_root: args.workspace_root ?? null,
       },
-    })) as DaemonResponse;
+    }, Math.max(DISPATCH_TIMEOUT_MS, resolveDaemonIpcTimeoutMs()))) as DaemonResponse;
 
     if (response.type === "SweepDispatched") {
       const payload = (response as DispatchResponse).payload;
@@ -381,10 +410,16 @@ async function cancelSweep(args: {
   | { success: false; error: string }
 > {
   try {
-    const response = (await sendDaemonRequest({
-      type: "CancelSweep",
-      payload: { sweep_id: args.sweep_id, grace_secs: args.grace_secs, workspace_root: args.workspace_root ?? null },
-    })) as DaemonResponse;
+    const response = (await sendDaemonRequest(
+      {
+        type: "CancelSweep",
+        payload: { sweep_id: args.sweep_id, grace_secs: args.grace_secs, workspace_root: args.workspace_root ?? null },
+      },
+      Math.max(
+        args.grace_secs * 1000 + CANCEL_TIMEOUT_BUFFER_MS,
+        resolveDaemonIpcTimeoutMs()
+      )
+    )) as DaemonResponse;
 
     if (response.type === "SweepCancelled") {
       return { success: true, payload: (response as SweepCancelledResponse).payload };

@@ -10,6 +10,7 @@
     "build": "tsc --noEmit && rm -rf dist && node esbuild.config.js",
     "build:bundle": "rm -rf dist && node esbuild.config.js",
     "typecheck": "tsc --noEmit",
+    "verify:daemon-timeout": "node scripts/verify-daemon-timeout.mjs",
     "watch": "tsc --watch --noEmit"
   },
   "dependencies": {
@@ -20,5 +21,8 @@
     "@types/node": "^22.18.10",
     "esbuild": "^0.27.3",
     "typescript": "^5.9.3"
+  },
+  "allowScripts": {
+    "esbuild@0.27.3": true
   }
 }
