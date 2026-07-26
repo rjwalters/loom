@@ -493,6 +493,7 @@ pub fn build_daemon_status(
             in_flight_count: live.len(),
             health_gate_halted: health_states.is_halted(root),
             quarantined_issues,
+            health_gate_not_evaluated: health_states.is_skipped(root),
         });
         in_flight.extend(live);
     }
@@ -555,6 +556,7 @@ pub fn build_daemon_status(
         // Top-level halt preserves its pre-#3930 single-workspace meaning: the
         // daemon's own primary workspace. Per-repo halt is in `per_repo`.
         main_health_gate_halted: health_states.is_halted(fallback_root),
+        main_health_gate_not_evaluated: health_states.is_skipped(fallback_root),
         capacity,
         per_repo,
     }
@@ -2458,6 +2460,7 @@ exit 0
             per_token_concurrency: 2,
             dynamic_cap: 3,
             main_health_gate_halted: true,
+            main_health_gate_not_evaluated: false,
             capacity: crate::types::CapacityReport {
                 ranking_present: true,
                 total_accounts: 4,
@@ -2472,6 +2475,7 @@ exit 0
                 in_flight_count: 0,
                 health_gate_halted: true,
                 quarantined_issues: vec![101, 202],
+                health_gate_not_evaluated: false,
             }],
         };
         let resp = Response::DaemonStatus(report);
@@ -2484,6 +2488,7 @@ exit 0
                 assert_eq!(r.configured_max, 5);
                 assert_eq!(r.dynamic_cap, 3);
                 assert!(r.main_health_gate_halted);
+                assert!(!r.main_health_gate_not_evaluated);
                 assert!(r.in_flight.is_empty());
                 assert!(r.capacity.ranking_present);
                 assert_eq!(r.capacity.healthy_accounts, 3);
@@ -2493,6 +2498,7 @@ exit 0
                 assert_eq!(r.per_repo.len(), 1);
                 assert_eq!(r.per_repo[0].in_flight_count, 0);
                 assert!(r.per_repo[0].health_gate_halted);
+                assert!(!r.per_repo[0].health_gate_not_evaluated);
             }
             other => panic!("Expected DaemonStatus, got: {other:?}"),
         }
@@ -2511,6 +2517,10 @@ exit 0
         assert_eq!(report.capacity.healthy_accounts, 0);
         assert!(!report.capacity.token_bound);
         assert!(report.per_repo.is_empty(), "absent per_repo defaults to empty");
+        assert!(
+            !report.main_health_gate_not_evaluated,
+            "absent main_health_gate_not_evaluated (#3950) defaults to false"
+        );
     }
 
     /// `build_daemon_status` reflects the per-repo main-health halt flag and
@@ -2572,6 +2582,21 @@ exit 0
         let report = build_daemon_status(&pool, &health, &root);
         assert!(report.main_health_gate_halted);
         assert!(report.per_repo[0].health_gate_halted);
+        assert!(!report.main_health_gate_not_evaluated, "no skip has happened yet");
+
+        // A skip (dirty tree) is independent of halt (#3950 AC3): it leaves any
+        // prior halt untouched but surfaces its own "not evaluated" flag, so
+        // "halted (red main)" and "not evaluated (dirty tree)" can both be
+        // true — a prior red run's halt persisting while a later tick can't
+        // even evaluate because the tree went dirty.
+        health
+            .get_or_create(&root)
+            .note_gate_tick(true, std::time::Duration::from_secs(3600));
+        let report = build_daemon_status(&pool, &health, &root);
+        assert!(report.main_health_gate_halted, "prior halt persists through a skip");
+        assert!(report.main_health_gate_not_evaluated, "skip surfaces as not-evaluated");
+        assert!(report.per_repo[0].health_gate_halted);
+        assert!(report.per_repo[0].health_gate_not_evaluated);
 
         match prev_shared {
             Some(v) => std::env::set_var("LOOM_SHARED_TOKENS_DIR", v),

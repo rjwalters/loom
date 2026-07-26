@@ -1227,6 +1227,11 @@ fn print_status_json(
         },
         "main_health_gate": {
             "halted": report.main_health_gate_halted,
+            // "Not evaluated" (dirty tree) is distinct from "halted" (red
+            // main) — #3950 AC3. Both can be true at once: a prior halt from
+            // a genuinely red run persists untouched while a later tick can't
+            // even evaluate because the tree went dirty.
+            "not_evaluated": report.main_health_gate_not_evaluated,
         },
         // Per-repo breakdown across every registered managed workspace (#3930).
         "per_repo": report.per_repo.iter().map(|r| serde_json::json!({
@@ -1234,6 +1239,7 @@ fn print_status_json(
             "priority": r.priority,
             "in_flight_count": r.in_flight_count,
             "health_gate_halted": r.health_gate_halted,
+            "health_gate_not_evaluated": r.health_gate_not_evaluated,
         })).collect::<Vec<_>>(),
         "token_usage": token_usage,
     });
@@ -1329,10 +1335,19 @@ fn print_status_human(report: &DaemonStatusReport, token_usage: Option<&serde_js
         );
     }
 
-    let gate = if report.main_health_gate_halted {
-        "HALTED (main is red — new dispatch paused; in-flight sweeps keep running)"
-    } else {
-        "clear (dispatch allowed)"
+    // "Halted" (a completed gate run found main red) and "not evaluated" (the
+    // gate skipped this tick because the tree is dirty) are distinct states
+    // that can co-occur (#3950 AC3): a prior halt persists untouched while a
+    // dirty tree blocks the *next* evaluation.
+    let gate = match (report.main_health_gate_halted, report.main_health_gate_not_evaluated) {
+        (true, true) => {
+            "HALTED (main is red — new dispatch paused) + NOT EVALUATED (workspace tree is dirty — the gate cannot currently confirm main is still red, or check for recovery)"
+        }
+        (true, false) => "HALTED (main is red — new dispatch paused; in-flight sweeps keep running)",
+        (false, true) => {
+            "not evaluated (workspace tree is dirty — the gate is skipping runs rather than resetting over local changes; dispatch is NOT halted by this)"
+        }
+        (false, false) => "clear (dispatch allowed)",
     };
     println!("\nMain-health gate: {gate}");
 
@@ -1347,16 +1362,19 @@ fn print_status_human(report: &DaemonStatusReport, token_usage: Option<&serde_js
     if report.per_repo.is_empty() {
         println!("  (none)");
     } else {
-        println!("  {:>4}  {:>9}  {:<7}  REPO", "PRIO", "IN-FLIGHT", "GATE");
+        println!("  {:>4}  {:>9}  {:<13}  REPO", "PRIO", "IN-FLIGHT", "GATE");
         println!("  {:-<60}", "");
         for r in &report.per_repo {
-            let gate = if r.health_gate_halted {
-                "HALTED"
-            } else {
-                "clear"
+            // Same halted/not-evaluated distinction as the top-level summary
+            // above, condensed for the table column (#3950 AC3).
+            let gate = match (r.health_gate_halted, r.health_gate_not_evaluated) {
+                (true, true) => "HALTED+DIRTY",
+                (true, false) => "HALTED",
+                (false, true) => "not-evaluated",
+                (false, false) => "clear",
             };
             println!(
-                "  {:>4}  {:>9}  {:<7}  {}",
+                "  {:>4}  {:>9}  {:<13}  {}",
                 r.priority,
                 r.in_flight_count,
                 gate,
