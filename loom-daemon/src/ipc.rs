@@ -2424,6 +2424,12 @@ exit 0
         let empty_reg = dir.path().join("no-such-workspaces.json");
         std::env::set_var(REGISTRY_PATH_ENV, &empty_reg);
 
+        // Disable the shared machine-level pool fallback (#3940) so the
+        // token-pool assertions see only the tempdir workspace, not the
+        // host's real ~/.loom/tokens (empty value = operator opt-out).
+        let prev_shared = std::env::var("LOOM_SHARED_TOKENS_DIR").ok();
+        std::env::set_var("LOOM_SHARED_TOKENS_DIR", "");
+
         // Seed the pool with the default registry keyed at `root`.
         let pool = Arc::new(WorkspacePool::new(Arc::new(EventBus::new()), test_runtime_handle()));
         pool.seed(root.clone(), sr.clone());
@@ -2460,6 +2466,10 @@ exit 0
         assert!(report.main_health_gate_halted);
         assert!(report.per_repo[0].health_gate_halted);
 
+        match prev_shared {
+            Some(v) => std::env::set_var("LOOM_SHARED_TOKENS_DIR", v),
+            None => std::env::remove_var("LOOM_SHARED_TOKENS_DIR"),
+        }
         std::env::remove_var(REGISTRY_PATH_ENV);
     }
 
