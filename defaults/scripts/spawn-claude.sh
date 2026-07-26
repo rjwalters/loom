@@ -231,6 +231,14 @@ fi
 #   2. Script-relative: .loom/scripts/spawn-claude.sh -> ../../loom-tools/src
 #      (matches the loom repo layout regardless of WORKSPACE override).
 #   3. $WORKSPACE/loom-tools/src.
+#
+# Tiers 2/3 only resolve inside an actual loom checkout — a CONSUMER repo's
+# installed .loom/scripts/spawn-claude.sh has no loom-tools/ sibling, so
+# tier 1 is load-bearing there. Issue #3949: `loom-daemon`'s `spawn_child`
+# (loom-daemon/src/sweep_registry.rs::resolve_package_path_env) now sets
+# LOOM_PACKAGE_PATH automatically on every daemon-dispatched child — derived
+# from the loom checkout the running daemon binary was built from — so this
+# no longer needs to be exported manually before starting the daemon.
 _script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 _script_relative_pkg="$(cd "$_script_dir/../../loom-tools/src" 2>/dev/null && pwd || echo "")"
 PACKAGE_PATH="${LOOM_PACKAGE_PATH:-$_script_relative_pkg}"
