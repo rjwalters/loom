@@ -240,6 +240,13 @@ fn collect_and_store_events(config: &MetricsConfig) -> Result<usize> {
 
     let conn = Connection::open(&config.db_path).context("Failed to open activity database")?;
 
+    // Self-initialize the activity DB schema on every open. `init_schema` is
+    // idempotent (CREATE TABLE/INDEX IF NOT EXISTS), so this is a cheap no-op
+    // once the schema exists. Without this, a fresh install (or a collector
+    // pointed at a DB file whose migrations never ran) hits recurring
+    // "no such table" errors every collection interval (#3951).
+    crate::activity::init_schema(&conn).context("Failed to initialize activity database schema")?;
+
     let mut total_events = 0;
 
     // Collect PRs
@@ -445,6 +452,13 @@ fn insert_github_event(
 }
 
 /// Attempt to correlate a GitHub event with agent activity
+///
+/// Correlates against `agent_metrics` (aliased here as "activity" for the
+/// GitHub-events domain) — the table `github_events.activity_id` actually has
+/// a foreign key to. An earlier version of this query targeted a table named
+/// `agent_activity`, which was never part of the schema (see #3951); the
+/// nearest-timestamp match uses `COALESCE(completed_at, started_at)` since
+/// `agent_metrics` has no single `timestamp` column.
 fn correlate_with_activity(
     conn: &Connection,
     _pr_number: Option<i64>,
@@ -455,9 +469,9 @@ fn correlate_with_activity(
     if let Some(issue_num) = issue_number {
         let activity_id = conn
             .query_row(
-                "SELECT id FROM agent_activity
-                 WHERE issue_number = ?1
-                 ORDER BY ABS(julianday(timestamp) - julianday(?2))
+                "SELECT id FROM agent_metrics
+                 WHERE github_issue = ?1
+                 ORDER BY ABS(julianday(COALESCE(completed_at, started_at)) - julianday(?2))
                  LIMIT 1",
                 params![issue_num, event_time],
                 |row| row.get(0),
@@ -475,10 +489,10 @@ fn correlate_with_activity(
     // Strategy 3: Match by timestamp proximity (within 1 hour)
     let activity_id = conn
         .query_row(
-            "SELECT id FROM agent_activity
-             WHERE ABS(julianday(timestamp) - julianday(?1)) < (1.0/24.0)
-             AND outcome = 'success'
-             ORDER BY ABS(julianday(timestamp) - julianday(?1))
+            "SELECT id FROM agent_metrics
+             WHERE ABS(julianday(COALESCE(completed_at, started_at)) - julianday(?1)) < (1.0/24.0)
+             AND status = 'success'
+             ORDER BY ABS(julianday(COALESCE(completed_at, started_at)) - julianday(?1))
              LIMIT 1",
             params![event_time],
             |row| row.get(0),
@@ -626,31 +640,26 @@ mod tests {
 
     // ===== insert_github_event tests =====
 
+    /// Build a test DB via the real `init_schema` (not a hand-rolled mini
+    /// schema) so these tests exercise the same self-initialization path
+    /// production code takes, and stay in sync with the real column names
+    /// (regression coverage for #3951).
     fn create_test_db() -> Connection {
         let conn = Connection::open_in_memory().unwrap();
-        conn.execute_batch(
-            r"
-            CREATE TABLE github_events (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                activity_id INTEGER,
-                event_type TEXT NOT NULL,
-                event_time TEXT NOT NULL,
-                pr_number INTEGER,
-                issue_number INTEGER,
-                commit_sha TEXT,
-                author TEXT
-            );
+        crate::activity::init_schema(&conn).unwrap();
+        conn
+    }
 
-            CREATE TABLE agent_activity (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                issue_number INTEGER,
-                timestamp DATETIME,
-                outcome TEXT
-            );
-            ",
+    /// Insert a minimal `agent_metrics` row for correlation tests.
+    fn insert_test_activity(conn: &Connection, issue_number: i64, timestamp: &str, status: &str) {
+        conn.execute(
+            "INSERT INTO agent_metrics (
+                terminal_id, agent_role, agent_system, github_issue,
+                started_at, completed_at, status
+            ) VALUES ('terminal-1', 'builder', 'claude', ?1, ?2, ?2, ?3)",
+            params![issue_number, timestamp, status],
         )
         .unwrap();
-        conn
     }
 
     #[test]
@@ -720,11 +729,7 @@ mod tests {
         let conn = create_test_db();
 
         // Insert an activity record to correlate with
-        conn.execute(
-            "INSERT INTO agent_activity (issue_number, timestamp, outcome) VALUES (?1, ?2, ?3)",
-            params![100, "2026-01-15T12:00:00Z", "success"],
-        )
-        .unwrap();
+        insert_test_activity(&conn, 100, "2026-01-15T12:00:00Z", "success");
 
         // Insert event for same issue
         let inserted = insert_github_event(
@@ -748,5 +753,80 @@ mod tests {
             )
             .unwrap();
         assert!(activity_id.is_some());
+    }
+
+    // ===== Regression tests for #3951 =====
+    //
+    // The collector previously opened the activity DB with a bare
+    // `Connection::open` and never ran schema initialization, so a fresh
+    // install (or any DB file whose migrations never ran) hit a recurring
+    // "no such table: agent_activity" ERROR every collection interval.
+    // `correlate_with_activity` also queried a table (`agent_activity`) that
+    // was never part of the real schema at all — the correct table is
+    // `agent_metrics` (see the FK on `github_events.activity_id`).
+
+    #[test]
+    fn test_insert_github_event_on_freshly_initialized_db_does_not_error() {
+        // A DB that has only ever seen `init_schema` (i.e. no prior agent
+        // activity rows) must not produce a "no such table" error when an
+        // event is inserted and correlation is attempted.
+        let conn = create_test_db();
+
+        let inserted = insert_github_event(
+            &conn,
+            "issue_closed",
+            "2026-01-15T12:00:00Z",
+            None,
+            Some(999),
+            None,
+            "testuser",
+        );
+
+        assert!(
+            inserted.is_ok(),
+            "insert_github_event should not error on a freshly-initialized DB: {inserted:?}"
+        );
+        assert!(inserted.unwrap());
+    }
+
+    #[test]
+    fn test_collect_and_store_events_self_initializes_schema_on_fresh_db_path() {
+        // Simulates the real collector path: open a `Connection` against a
+        // brand-new file (no prior schema at all — the exact scenario from
+        // the bug report) and confirm the same self-init call the collector
+        // makes leaves the DB queryable without a "no such table" error.
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("activity.db");
+        assert!(!db_path.exists());
+
+        let conn = Connection::open(&db_path).unwrap();
+        crate::activity::init_schema(&conn).unwrap();
+
+        // Both tables the collector touches must now exist and be queryable.
+        let github_events_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM github_events", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(github_events_count, 0);
+
+        let agent_metrics_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM agent_metrics", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(agent_metrics_count, 0);
+
+        // And correlation (which used to reference a nonexistent
+        // `agent_activity` table) succeeds without error.
+        let activity_id =
+            correlate_with_activity(&conn, None, Some(1), "2026-01-15T12:00:00Z").unwrap();
+        assert!(activity_id.is_none());
+    }
+
+    #[test]
+    fn test_correlate_with_activity_on_freshly_initialized_db_returns_none() {
+        // No agent activity rows exist yet; correlation must return `Ok(None)`
+        // rather than erroring on a missing table.
+        let conn = create_test_db();
+        let result = correlate_with_activity(&conn, Some(1), Some(1), "2026-01-15T12:00:00Z");
+        assert!(result.is_ok());
+        assert!(result.unwrap().is_none());
     }
 }
