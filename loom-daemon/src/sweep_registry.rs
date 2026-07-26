@@ -42,8 +42,17 @@
 //!   ingesting phantom entries for in-session sweeps it never dispatched
 //!   (#3808). See [`SweepRegistry::reconstruct`].
 //! - Forge labels (`loom:issue` vs `loom:building`).
+//!
+//! One exception (Issue #3953): `dispatch` also writes a minimal
+//! `{repo, issue, pid, started_at}` liveness record to the machine-level
+//! [`crate::sweep_journal`] (`~/.loom/sweeps.json`). This is NOT sweep state
+//! in the sense above — it carries no phase/status/log-path information, only
+//! what `loom-recover-orphans` needs to tell a live claim from a dead one
+//! after a daemon restart wipes this in-memory registry. See
+//! [`crate::claim_reconciliation`] for the startup consumer.
 
 use crate::event_bus::EventBus;
+use crate::sweep_journal;
 use crate::types::{Event, SweepId, SweepInfo, SweepKind, SweepOutcome, SweepState};
 
 use anyhow::{anyhow, Context, Result};
@@ -758,6 +767,12 @@ pub struct SweepRegistryConfig {
     /// When `true`, skip the actual label flip via `gh`. Used by unit tests
     /// that don't have GitHub credentials.
     pub skip_label_flip: bool,
+    /// Override the machine-level sweep journal path (Issue #3953). Defaults
+    /// to [`sweep_journal::default_journal_path`] (`~/.loom/sweeps.json`,
+    /// env-overridable via `LOOM_SWEEPS_JOURNAL_PATH`). Tests set this to a
+    /// tempdir path so `dispatch`/reap never touch the real machine-level
+    /// file.
+    pub journal_path: Option<PathBuf>,
 }
 
 impl SweepRegistryConfig {
@@ -769,7 +784,17 @@ impl SweepRegistryConfig {
             spawn_bin: None,
             gh_bin: None,
             skip_label_flip: false,
+            journal_path: None,
         }
+    }
+
+    /// Resolve the sweep journal path: `journal_path` explicit override, else
+    /// [`sweep_journal::default_journal_path`].
+    pub fn resolve_journal_path(&self) -> Result<PathBuf> {
+        if let Some(ref p) = self.journal_path {
+            return Ok(p.clone());
+        }
+        sweep_journal::default_journal_path()
     }
 
     /// Resolve the spawn binary, preferring (in order):
@@ -1234,6 +1259,31 @@ impl SweepRegistry {
         };
         self.entries.insert(sweep_id.clone(), info);
 
+        // 6b. Persist a liveness record to the machine-level sweep journal
+        // (`~/.loom/sweeps.json`, Issue #3953). Unlike the in-memory entry
+        // above, this file survives a daemon restart, giving
+        // `loom-recover-orphans` an authoritative liveness source even when
+        // this registry has just been recreated empty. Best-effort — a
+        // journal-write hiccup must never fail dispatch.
+        match self.config.resolve_journal_path() {
+            Ok(journal_path) => {
+                if let Err(e) = sweep_journal::record_sweep_at(
+                    &journal_path,
+                    &self.config.workspace_root.display().to_string(),
+                    issue_number,
+                    pid,
+                    Utc::now(),
+                ) {
+                    log::warn!(
+                        "sweep_journal: failed to record sweep for issue #{issue_number}: {e}"
+                    );
+                }
+            }
+            Err(e) => log::warn!(
+                "sweep_journal: cannot resolve journal path for issue #{issue_number}: {e}"
+            ),
+        }
+
         // 7. Emit `sweep.global.dispatch` (best-effort — never block
         //    dispatch progress on the bus). If no subscribers are
         //    listening, the bus returns NoSubscribers; log at debug.
@@ -1354,6 +1404,27 @@ impl SweepRegistry {
                 .with_context(|| format!("failed to remove lock dir {}", lock.display()))?;
         }
         Ok(())
+    }
+
+    /// Best-effort removal of this registry's sweep-journal entry for
+    /// `issue` (Issue #3953). Never load-bearing — a missed removal is pruned
+    /// the next time anything touches the journal — so failures are logged
+    /// at `debug` and swallowed rather than propagated.
+    fn journal_remove_best_effort(&self, issue: u32) {
+        let journal_path = match self.config.resolve_journal_path() {
+            Ok(p) => p,
+            Err(e) => {
+                log::debug!("sweep_journal: cannot resolve journal path for #{issue}: {e}");
+                return;
+            }
+        };
+        if let Err(e) = sweep_journal::remove_sweep_at(
+            &journal_path,
+            &self.config.workspace_root.display().to_string(),
+            issue,
+        ) {
+            log::debug!("sweep_journal: failed to remove entry for #{issue}: {e}");
+        }
     }
 
     // ------------------------------------------------------------------------
@@ -2141,6 +2212,9 @@ impl SweepRegistry {
         }
         if let SweepKind::Issue(issue) = kind {
             let _ = self.release_lock(*issue);
+            // Best-effort tidy-up of the machine-level liveness journal
+            // (#3953) — this cancelled sweep no longer exists.
+            self.journal_remove_best_effort(*issue);
             // Orphaned-claim recovery on cancel (issue #3827): a cancelled
             // daemon-owned Issue sweep that never opened a PR still holds its
             // pre-dispatch loom:building claim (set at `dispatch()` step 4).
@@ -2254,6 +2328,13 @@ impl SweepRegistry {
                     // Release lock and decide between Exited vs Crashed.
                     if let Some(issue) = issue {
                         let _ = self.release_lock(issue);
+                        // Best-effort tidy-up of the machine-level liveness
+                        // journal (#3953): the reaper just confirmed this
+                        // PID is dead, so drop its entry now rather than
+                        // waiting for the next prune-on-read. Not
+                        // load-bearing — a missed removal is pruned on the
+                        // next journal touch — but keeps the file small.
+                        self.journal_remove_best_effort(issue);
                         let checkpoint = self
                             .config
                             .checkpoint_dir()
@@ -3648,8 +3729,12 @@ pub fn spawn_watchdog_task(
 /// Liveness probe via `kill(pid, 0)`. Returns true when the signal would
 /// be deliverable (i.e. the process exists and is owned by us). PID 0 is
 /// always treated as dead.
+///
+/// `pub(crate)` so [`crate::sweep_journal`] and [`crate::claim_reconciliation`]
+/// can reuse the exact same probe the reaper uses (Issue #3953) rather than
+/// duplicating the `kill(pid, 0)` dance.
 #[cfg(unix)]
-fn is_pid_alive(pid: u32) -> bool {
+pub(crate) fn is_pid_alive(pid: u32) -> bool {
     if pid == 0 {
         return false;
     }
@@ -3663,7 +3748,7 @@ fn is_pid_alive(pid: u32) -> bool {
 }
 
 #[cfg(not(unix))]
-fn is_pid_alive(_pid: u32) -> bool {
+pub(crate) fn is_pid_alive(_pid: u32) -> bool {
     // Non-unix platforms are not supported targets for Loom; assume alive
     // so the test suite can run without a hard panic.
     true
@@ -3829,6 +3914,9 @@ exit 0
         let mut config = SweepRegistryConfig::new(workspace.to_path_buf());
         config.spawn_bin = Some(fake_bin);
         config.skip_label_flip = true;
+        // Confine the #3953 sweep journal to this test's tempdir — never the
+        // real machine-level `~/.loom/sweeps.json`.
+        config.journal_path = Some(workspace.join("test-sweeps-journal.json"));
         (SweepRegistry::new(config), record_log)
     }
 
@@ -3866,6 +3954,7 @@ exit 0
         let mut config = SweepRegistryConfig::new(workspace.to_path_buf());
         config.spawn_bin = Some(fake_bin);
         config.skip_label_flip = true;
+        config.journal_path = Some(workspace.join("test-sweeps-journal.json"));
         SweepRegistry::new(config)
     }
 
@@ -3977,6 +4066,54 @@ exit 0
             recorded.contains("--dangerously-skip-permissions"),
             "expected --dangerously-skip-permissions in argv; got: {recorded}"
         );
+    }
+
+    /// Issue #3953: `dispatch` persists a liveness record to the sweep
+    /// journal (repo/issue/pid/started_at), and the reaper's dead-PID path
+    /// removes it once the child is confirmed dead — end-to-end wiring,
+    /// not just the `sweep_journal` module's own unit tests.
+    #[test]
+    fn dispatch_and_reap_wire_the_sweep_journal() {
+        let dir = tempdir().unwrap();
+        let (mut registry, _record_log) = fixture_registry(dir.path());
+        let journal_path = registry.config().journal_path.clone().unwrap();
+
+        let outcome = registry
+            .dispatch(&SweepKind::Issue(4600), None, None, None, None)
+            .expect("dispatch should succeed");
+
+        let journal = crate::sweep_journal::load(&journal_path);
+        let repo = dir.path().display().to_string();
+        let entry = crate::sweep_journal::find(&journal, &repo, 4600)
+            .expect("dispatch should have recorded a journal entry for #4600");
+        assert_eq!(entry.pid, outcome.pid);
+
+        // The fixture's fake spawn-claude.sh exits immediately, so the pid is
+        // dead almost immediately; wait for the reaper's dead-PID path.
+        let dead = wait_for_condition(10_000, || !is_pid_alive(outcome.pid));
+        assert!(dead, "fixture child did not exit within 10s");
+
+        registry.reap_once();
+
+        let journal = crate::sweep_journal::load(&journal_path);
+        assert!(
+            crate::sweep_journal::find(&journal, &repo, 4600).is_none(),
+            "reap_once should have removed the dead sweep's journal entry"
+        );
+    }
+
+    /// Poll until `condition` returns true or `timeout_ms` elapses. Mirrors
+    /// `wait_for_contents` but for an arbitrary predicate (used by the
+    /// journal wiring test above to wait for the fixture child's PID to die).
+    fn wait_for_condition(timeout_ms: u64, mut condition: impl FnMut() -> bool) -> bool {
+        let start = std::time::Instant::now();
+        while start.elapsed().as_millis() < u128::from(timeout_ms) {
+            if condition() {
+                return true;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        false
     }
 
     /// Issue #3824: `spawn_child` unconditionally appends
@@ -5784,6 +5921,7 @@ exit 0
         let mut config = SweepRegistryConfig::new(workspace.to_path_buf());
         config.spawn_bin = Some(fake_bin);
         config.skip_label_flip = true;
+        config.journal_path = Some(workspace.join("test-sweeps-journal.json"));
         let mut registry = SweepRegistry::new(config);
 
         let outcome = registry

@@ -36,6 +36,39 @@ The cross-check inputs are:
 - The liveness evidence above (roster + daemon + locks).
 - ``gh issue list --label loom:building`` (unchanged).
 
+Machine-level sweep journal (issue #3953)
+------------------------------------------
+
+The daemon registry probe above (:func:`_query_daemon_live_issues`) is a
+best-effort stub precisely because the daemon's sweep registry is
+**in-memory** -- a restart (rate-limit kill, the print-mode ceiling, an
+operator upgrade) wipes it clean, and immediately after a restart the
+daemon has *nothing* to say either way. Two canary incidents hit exactly
+this gap: sweeps died, their issues stayed at ``loom:building``, and this
+tool found no authoritative source at all and (correctly, per the fail-safe
+above) refused to touch anything -- an operator had to hand-flip labels.
+
+``loom-daemon``'s ``SweepRegistry::dispatch`` now persists a minimal
+``{repo, issue, pid, started_at}`` record to a machine-level journal at
+``~/.loom/sweeps.json`` (the Rust ``sweep_journal`` module) every time it
+spawns a sweep child. Unlike the in-memory registry, this **file** survives
+a restart, so :func:`gather_liveness_evidence` reads it as a fourth source:
+
+- A journal entry with a **dead** recorded PID is unconditional proof this
+  claim's sweep is gone -- it is NOT added to ``live_issues``, so it falls
+  through to the untracked-building check exactly like a claim the roster
+  says nothing about (subject to the existing label-age grace period).
+- A journal entry with a **live** recorded PID is unconditional proof of
+  life -- added to ``live_issues``, so the claim is always skipped.
+- The **absence** of a journal entry for a `loom:building` issue, when the
+  journal file itself is present (so it IS a contributing source), is
+  treated more conservatively than a dead-PID entry: the journal only
+  covers *daemon-dispatched* sweeps, so "no entry" might mean a live
+  **manual** ``/loom:sweep`` session the daemon was never told about. Such
+  a claim needs to be stale for ``LOOM_STALE_BUILDING_HOURS`` (default 4h,
+  see :func:`_get_stale_building_hours`) -- much longer than the default
+  10-minute label-age grace period -- before it is treated as orphaned.
+
 Stuck-but-running detection lives in :mod:`loom_tools.stuck_detection` (2-min
 heartbeat).  This module's heartbeat threshold is intentionally higher
 (5 minutes by default) because orphan recovery is post-crash cleanup, not
@@ -83,6 +116,21 @@ DEFAULT_LABEL_GRACE_PERIOD = 600
 # If an "## Orphan Recovery" comment was posted within this window,
 # skip posting another to avoid duplicate noise (see issue #2658).
 ORPHAN_COMMENT_DEDUP_SECONDS = 300
+
+# Env var overriding the "no journal record at all" staleness threshold, in
+# HOURS (issue #3953). Only consulted when the sweep journal is itself a
+# contributing evidence source (see `gather_liveness_evidence`) -- a
+# `loom:building` issue with a journal entry uses the (much shorter)
+# `DEFAULT_LABEL_GRACE_PERIOD` instead, since a recorded-dead PID is
+# unconditional proof, whereas "no record" only means the daemon's journal
+# was never told about this claim (it may be a live manual sweep).
+LOOM_STALE_BUILDING_HOURS_ENV = "LOOM_STALE_BUILDING_HOURS"
+DEFAULT_STALE_BUILDING_HOURS = 4.0
+
+# Env var overriding the machine-level sweep journal path (issue #3953).
+# Mirrors `loom_daemon::sweep_journal::JOURNAL_PATH_ENV` (Rust) so both
+# surfaces resolve to the same file by default.
+LOOM_SWEEPS_JOURNAL_PATH_ENV = "LOOM_SWEEPS_JOURNAL_PATH"
 
 
 @dataclass
@@ -175,6 +223,24 @@ def _get_label_grace_period() -> int:
     return DEFAULT_LABEL_GRACE_PERIOD
 
 
+def _get_stale_building_hours() -> float:
+    """Get the no-journal-record staleness threshold (hours) from env or default.
+
+    A non-positive or unparseable override falls back to
+    :data:`DEFAULT_STALE_BUILDING_HOURS` (mirrors
+    ``loom_daemon::claim_reconciliation::resolve_stale_hours`` in Rust).
+    """
+    env_val = os.environ.get(LOOM_STALE_BUILDING_HOURS_ENV)
+    if env_val is not None:
+        try:
+            hours = float(env_val)
+            if hours > 0:
+                return hours
+        except ValueError:
+            pass
+    return DEFAULT_STALE_BUILDING_HOURS
+
+
 def _pid_alive(pid: int) -> bool:
     """Return True if *pid* is a live process.
 
@@ -258,18 +324,29 @@ class LivenessEvidence:
     """Authoritative evidence of which sweeps are currently alive.
 
     ``available`` is True when at least one authoritative liveness *source*
-    exists (a present state file, a reachable daemon registry, or one or more
-    ``.loom/locks/issue-<N>/`` locks). When it is False we have **no** evidence
-    either way, and the fail-safe (issue #3651) is to emit zero orphans.
+    exists (a present state file, a reachable daemon registry, the sweep
+    journal, or one or more ``.loom/locks/issue-<N>/`` locks). When it is
+    False we have **no** evidence either way, and the fail-safe (issue #3651)
+    is to emit zero orphans.
 
     ``live_issues`` is the union of issue numbers known to be alive across all
     available sources. ``sources`` records which sources contributed, for
     logging/observability.
+
+    ``journal_present``/``journal_issues`` (issue #3953) carry extra detail
+    specifically about the machine-level sweep journal: whether the journal
+    file exists at all, and which issue numbers have *any* entry for this repo
+    (dead or alive -- a subset of ``live_issues`` is the alive ones).
+    :func:`check_untracked_building` uses these to pick a stricter staleness
+    threshold for a claim the journal has *never heard of* than for one it can
+    prove is dead.
     """
 
     available: bool = False
     live_issues: set[int] = field(default_factory=set)
     sources: list[str] = field(default_factory=list)
+    journal_present: bool = False
+    journal_issues: set[int] = field(default_factory=set)
 
 
 def _locked_issue_numbers(repo_root: pathlib.Path) -> set[int]:
@@ -318,6 +395,81 @@ def _query_daemon_live_issues(repo_root: pathlib.Path) -> set[int] | None:
     return None
 
 
+@dataclass
+class _JournalEntry:
+    """One entry from the machine-level sweep journal (issue #3953)."""
+
+    repo: str
+    issue: int
+    pid: int
+
+
+def _default_journal_path() -> pathlib.Path:
+    """Resolve the sweep journal path: env override, else ``~/.loom/sweeps.json``.
+
+    Mirrors ``loom_daemon::sweep_journal::default_journal_path`` (Rust) so
+    both surfaces read the exact same file by default.
+    """
+    env_val = os.environ.get(LOOM_SWEEPS_JOURNAL_PATH_ENV)
+    if env_val:
+        return pathlib.Path(env_val)
+    return pathlib.Path.home() / ".loom" / "sweeps.json"
+
+
+def _load_journal_entries(path: pathlib.Path) -> list[_JournalEntry]:
+    """Load and parse the sweep journal. Tolerant: missing/corrupt -> ``[]``.
+
+    Never raises -- a garbled or absent journal must never crash orphan
+    recovery; it degrades to "no journal evidence" (mirrors the Rust-side
+    ``sweep_journal::load``'s tolerant-corrupt-file behavior, issue #3651's
+    fail-safe philosophy applied to this new source).
+    """
+    try:
+        raw = path.read_text()
+    except OSError:
+        return []
+    if not raw.strip():
+        return []
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        log_warning(f"sweep journal at {path} is corrupt (invalid JSON) — treating as empty")
+        return []
+    if not isinstance(data, dict):
+        return []
+    entries: list[_JournalEntry] = []
+    for row in data.get("entries", []) or []:
+        try:
+            entries.append(
+                _JournalEntry(
+                    repo=str(row["repo"]),
+                    issue=int(row["issue"]),
+                    pid=int(row["pid"]),
+                )
+            )
+        except (KeyError, TypeError, ValueError):
+            # Skip a malformed row rather than discarding the whole journal.
+            continue
+    return entries
+
+
+def _journal_repo_matches(entry_repo: str, repo_root: pathlib.Path) -> bool:
+    """Whether a journal entry's ``repo`` string identifies ``repo_root``.
+
+    The daemon stamps ``repo`` as ``workspace_root.display().to_string()``
+    (Rust) — an exact string match is the fast, common-case path (this repo
+    checkout and the daemon's workspace_root agree byte-for-byte). Falls back
+    to a resolved-path comparison so an equivalent-but-differently-formatted
+    path (e.g. a trailing slash) still matches.
+    """
+    if entry_repo == str(repo_root):
+        return True
+    try:
+        return pathlib.Path(entry_repo).resolve() == repo_root.resolve()
+    except OSError:
+        return False
+
+
 def gather_liveness_evidence(
     spawn_loop_state: SpawnLoopState,
     repo_root: pathlib.Path | None,
@@ -331,12 +483,19 @@ def gather_liveness_evidence(
     2. ``loom-daemon`` registry via :func:`_query_daemon_live_issues` — optional,
        best-effort; ``None`` means "not a source".
     3. ``.loom/locks/issue-<N>/`` — per-issue worktree-lifetime locks.
+    4. The machine-level sweep journal (``~/.loom/sweeps.json``, issue #3953)
+       — survives a daemon restart, unlike source 2. A dead recorded PID is
+       proof of death (not added to ``live_issues``); a live recorded PID is
+       proof of life (added). See :attr:`LivenessEvidence.journal_present` /
+       :attr:`LivenessEvidence.journal_issues` for the "no record at all" case.
 
     ``available`` is True iff at least one of these sources is actually present.
     When it is False the caller MUST NOT flag any building issue as orphaned.
     """
     live: set[int] = set()
     sources: list[str] = []
+    journal_present = False
+    journal_issues: set[int] = set()
 
     if spawn_loop_state.present:
         sources.append("spawn-loop-state.json")
@@ -353,10 +512,23 @@ def gather_liveness_evidence(
             sources.append(".loom/locks")
             live |= locked
 
+        journal_path = _default_journal_path()
+        if journal_path.exists():
+            journal_present = True
+            sources.append("sweep-journal")
+            for entry in _load_journal_entries(journal_path):
+                if not _journal_repo_matches(entry.repo, repo_root):
+                    continue
+                journal_issues.add(entry.issue)
+                if _pid_alive(entry.pid):
+                    live.add(entry.issue)
+
     return LivenessEvidence(
         available=bool(sources),
         live_issues=live,
         sources=sources,
+        journal_present=journal_present,
+        journal_issues=journal_issues,
     )
 
 
@@ -371,10 +543,19 @@ def check_untracked_building(
     """Find ``loom:building`` issues that no live sweep is tracking.
 
     Cross-references ``gh issue list --label loom:building`` against the live
-    issue set in *evidence* (roster + daemon + ``.loom/locks/``).  Issues with a
-    valid file-based claim are skipped (CLI-driven sweeps may hold a claim
-    without a lock).  Issues with a recently-applied ``loom:building`` label are
-    also skipped (label-age grace period).
+    issue set in *evidence* (roster + daemon + ``.loom/locks/`` + the sweep
+    journal).  Issues with a valid file-based claim are skipped (CLI-driven
+    sweeps may hold a claim without a lock).
+
+    **Staleness threshold (issue #3953):** a claim with a **dead** sweep-journal
+    entry (the strongest possible evidence — a recorded PID that is provably
+    gone) uses the standard, short *label_grace_period*. A claim with **no**
+    journal entry at all — when the journal is itself a contributing source —
+    uses the much longer ``LOOM_STALE_BUILDING_HOURS`` threshold instead,
+    since "no entry" might mean a live manual ``/loom:sweep`` the daemon was
+    never told about, not a dead one. When the journal is not a source at all
+    (e.g. it has never been written on this machine), every claim falls back
+    to *label_grace_period* — byte-for-byte pre-#3953 behavior.
 
     **Fail-safe (issue #3651):** if *evidence* reports no authoritative liveness
     source is available, this emits **zero** orphans — absence of a writer is
@@ -441,31 +622,47 @@ def check_untracked_building(
                 f"for #{issue_num} (this may cause false positives)"
             )
 
-        # Label-age grace period: skip issues where loom:building was
-        # applied recently.  Protects newly-claimed issues from premature
-        # orphan recovery before claims or heartbeats are established.
-        if label_grace_period > 0:
+        # Select the staleness threshold + reason (#3953): a journal entry for
+        # this issue is unconditional dead-PID proof (it would have been in
+        # `tracked_issues`/skipped above if the recorded PID were alive), so
+        # the standard short grace period applies. No entry at all — only
+        # when the journal is itself a contributing source — requires the
+        # much longer no-record threshold instead (see docstring).
+        has_journal_entry = issue_num in evidence.journal_issues
+        if evidence.journal_present and not has_journal_entry:
+            threshold_seconds = _get_stale_building_hours() * 3600
+            reason = "no_journal_record_stale"
+        else:
+            threshold_seconds = float(label_grace_period)
+            reason = "journal_pid_dead" if has_journal_entry else "no_spawn_loop_entry"
+
+        # Staleness gate: skip issues that haven't been in loom:building long
+        # enough yet under the selected threshold. Protects newly-claimed
+        # issues from premature orphan recovery before claims/heartbeats are
+        # established (short threshold) or before a no-journal-record claim
+        # has had a fair chance to prove itself alive (long threshold).
+        if threshold_seconds > 0:
             label_age = _get_building_label_age(issue_num)
-            if label_age is not None and label_age < label_grace_period:
+            if label_age is not None and label_age < threshold_seconds:
                 if verbose:
                     log_info(
                         f"  SKIPPED: #{issue_num} label loom:building "
-                        f"applied {label_age}s ago (grace period: "
-                        f"{label_grace_period}s)"
+                        f"applied {label_age}s ago (threshold: "
+                        f"{threshold_seconds:.0f}s, reason if stale: {reason})"
                     )
                 continue
 
         if verbose:
             log_warning(
                 f"  ORPHANED: #{issue_num} has loom:building "
-                "but no active spawn-loop task"
+                f"but no active spawn-loop task (reason: {reason})"
             )
         result.orphaned.append(
             OrphanEntry(
                 type="untracked_building",
                 issue=issue_num,
                 title=issue_title,
-                reason="no_spawn_loop_entry",
+                reason=reason,
             )
         )
 
@@ -834,9 +1031,9 @@ def run_orphan_recovery(
 
     spawn_loop_state = read_spawn_loop_state(repo_root)
 
-    # Gather authoritative liveness evidence (roster + daemon + locks). When no
-    # source is available the untracked-building cross-check fails safe and
-    # emits zero orphans — see issue #3651.
+    # Gather authoritative liveness evidence (roster + daemon + locks + the
+    # #3953 sweep journal). When no source is available the untracked-building
+    # cross-check fails safe and emits zero orphans — see issue #3651.
     evidence = gather_liveness_evidence(spawn_loop_state, repo_root)
 
     if verbose:
@@ -950,6 +1147,8 @@ Liveness sources (fail-safe, #3651):
     .loom/spawn-loop-state.json           - Legacy roster (no writer post-v0.11.0)
     loom-daemon registry                  - Optional, best-effort
     .loom/locks/issue-<N>/                - Per-issue worktree-lifetime locks
+    ~/.loom/sweeps.json                   - Machine-level sweep journal (#3953),
+                                             survives a daemon restart
     gh issue list --label loom:building   - Forge label cross-check
   With NO authoritative liveness source, zero untracked_building orphans
   are emitted (absent evidence => treat claims as ALIVE, not orphaned).
@@ -957,6 +1156,10 @@ Liveness sources (fail-safe, #3651):
 Environment variables:
     LOOM_HEARTBEAT_STALE_THRESHOLD  Seconds before heartbeat is stale (default: 300)
     LOOM_LABEL_GRACE_PERIOD         Seconds to skip recently-labeled issues (default: 600)
+    LOOM_STALE_BUILDING_HOURS       Hours before a claim with NO sweep-journal entry
+                                    is treated as orphaned (default: 4.0)
+    LOOM_SWEEPS_JOURNAL_PATH        Override the sweep journal path (default:
+                                    ~/.loom/sweeps.json)
 """,
     )
 
