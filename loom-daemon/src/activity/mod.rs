@@ -70,6 +70,11 @@ pub use models::{
 // Re-export the database struct
 pub use db::ActivityDb;
 
+// Re-export schema initialization so callers that need a raw `rusqlite::Connection`
+// (e.g. the GitHub metrics collector) can self-initialize the activity DB schema
+// without routing through `ActivityDb`.
+pub use schema::init_schema;
+
 // Re-export resource usage parsing and cost calculation
 // Used internally by db.rs for terminal output parsing
 // Note: db.rs accesses these via super::resource_usage, so these re-exports
