@@ -1709,8 +1709,9 @@ mod tests {
     // ===== Sweep registry IPC handlers (Issue #3452) =====
 
     /// Build a SweepRegistry that won't actually launch real children.
-    /// The fixture spawn binary writes its argv to a sibling log and exits
-    /// immediately (same pattern as the sweep_registry unit tests).
+    /// The fixture spawn binary writes its argv AND a handful of env vars
+    /// (notably `LOOM_SWEEP_CLAIM_OWNED`, Issue #3823/#3967) to a sibling log
+    /// and exits immediately (same pattern as the sweep_registry unit tests).
     fn setup_sweep_registry_in_tempdir(
     ) -> (Arc<Mutex<SweepRegistry>>, tempfile::TempDir, std::path::PathBuf) {
         use std::os::unix::fs::PermissionsExt;
@@ -1721,7 +1722,10 @@ mod tests {
         let record_log = dir.path().join("ipc-fake-spawn.log");
         let script = format!(
             r#"#!/usr/bin/env bash
-echo "argv: $*" >> "{rec}"
+{{
+  echo "argv: $*"
+  printf 'LOOM_SWEEP_CLAIM_OWNED=%s\n' "${{LOOM_SWEEP_CLAIM_OWNED:-unset}}"
+}} >> "{rec}"
 exit 0
 "#,
             rec = record_log.display()
@@ -1948,6 +1952,63 @@ exit 0
             }
             other => panic!("Expected SweepList, got: {other:?}"),
         }
+    }
+
+    /// Issue #3967: reproduce the reported daemon-dispatched sweep self-skip at
+    /// the **IPC dispatch-path level** — through `handle_request` itself, not
+    /// `SweepRegistry::dispatch()` called directly (the existing
+    /// `dispatch_exports_claim_ownership_marker` unit test in
+    /// `sweep_registry.rs` covers that narrower scope). `handle_request`'s
+    /// `Request::DispatchSweep` arm is the exact server-side code both the
+    /// `loom-daemon dispatch <issue>` operator CLI (#3952) and the MCP
+    /// `dispatch_sweep` tool round-trip into over the Unix socket — so a
+    /// regression here would have caught the incident regardless of which of
+    /// those two client surfaces initiated the request. Asserts the spawned
+    /// child's env carries `LOOM_SWEEP_CLAIM_OWNED=<issue>` end-to-end.
+    #[test]
+    #[serial_test::serial]
+    fn test_handle_request_dispatch_sweep_exports_claim_ownership_marker() {
+        let (tm, db, _, bus) = setup_test_context();
+        let (sr, _dir, record_log) = setup_sweep_registry_in_tempdir();
+
+        let response = handle_request(
+            Request::DispatchSweep {
+                kind: SweepKind::Issue(3964),
+                idempotency_key: None,
+                model: None,
+                effort: None,
+                depends_on: None,
+                workspace_root: None,
+            },
+            &tm,
+            &db,
+            &sr,
+            &bus,
+            &test_pool(),
+        );
+        assert!(
+            matches!(response, Response::SweepDispatched { .. }),
+            "expected SweepDispatched, got: {response:?}"
+        );
+
+        // The fake spawn-claude.sh exits immediately; give it a brief window
+        // to flush its record log rather than racing the write.
+        let start = std::time::Instant::now();
+        let mut recorded = String::new();
+        while start.elapsed().as_millis() < 5000 {
+            if let Ok(s) = std::fs::read_to_string(&record_log) {
+                if s.contains("LOOM_SWEEP_CLAIM_OWNED=") {
+                    recorded = s;
+                    break;
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(
+            recorded.contains("LOOM_SWEEP_CLAIM_OWNED=3964"),
+            "expected the daemon-owned-child self-claim marker to reach the \
+             spawned child via the IPC DispatchSweep handler; got: {recorded:?}"
+        );
     }
 
     #[test]
