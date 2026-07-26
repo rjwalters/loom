@@ -131,6 +131,10 @@ impl WorkspacePool {
         }
         let startup = sweep_registry::read_startup_race_config(root);
         registry.set_dispatch_stagger(sweep_registry::resolve_dispatch_stagger(&startup));
+        // Insta-crash quarantine (#3939): resolve env > config > default for this
+        // workspace so the reaper quarantines a repeatedly-insta-crashing issue
+        // instead of letting it be re-dispatched every tick.
+        registry.set_quarantine_config(sweep_registry::resolve_quarantine_config(root));
 
         let arc = Arc::new(Mutex::new(registry));
         // Spawn the reaper on the shared daemon runtime regardless of which

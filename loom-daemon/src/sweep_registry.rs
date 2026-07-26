@@ -49,7 +49,7 @@ use crate::types::{Event, SweepId, SweepInfo, SweepKind, SweepOutcome, SweepStat
 use anyhow::{anyhow, Context, Result};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -375,6 +375,91 @@ pub const DEFAULT_REVIEW_STALL_TIMEOUT_SECS: u64 = 2700;
 /// The dispatch-header marker `spawn_child` writes before each spawn. Reused by
 /// the watchdog's progress probe to anchor its scan to the current dispatch.
 const DISPATCH_HEADER_MARKER: &str = "==== loom-daemon dispatch:";
+
+// ============================================================================
+// Insta-crash quarantine (Issue #3939)
+// ============================================================================
+//
+// The startup watchdog (#3887) and the mid-build-death watchdog (#3895) rescue a
+// *hung* or *mid-build-dead* child. Neither covers the **insta-crash**: a sweep
+// whose child dies within seconds of spawn (e.g. a missing token pool / selector
+// import failure, #3938) is reaped, its `loom:building` claim restored to
+// `loom:issue`, and it simply re-qualifies on the next work-finder poll — so the
+// same broken issue is re-dispatched every tick, occupying a global concurrency
+// slot forever and starving healthy work in other repos.
+//
+// The quarantine backstop closes that gap. The reaper counts *consecutive*
+// insta-crashes per issue — a terminal transition that (a) wrote no phase
+// checkpoint (never reached real work) and (b) happened within
+// [`DEFAULT_QUARANTINE_INSTA_CRASH_SECS`] of dispatch. After
+// [`DEFAULT_QUARANTINE_THRESHOLD`] consecutive insta-crashes the issue is
+// quarantined: the work finder skips it (in-memory, so no forge round-trip is
+// required for the load-bearing behavior) until a TTL
+// ([`DEFAULT_QUARANTINE_TTL_SECS`]) elapses. A terminal outcome that *did* make
+// progress (checkpoint present) or that was a clean/slow exit resets the counter,
+// so a genuine one-off failure never accretes toward quarantine.
+
+/// Env var toggling insta-crash quarantine (Issue #3939). `0`/`false`/`no`/`off`
+/// disables; `1`/`true`/`yes`/`on` forces on. Overrides config. Defaults ON — it
+/// is a safety backstop against a broken workspace starving the shared queue.
+pub const QUARANTINE_ENABLE_ENV: &str = "LOOM_WORK_FINDER_QUARANTINE";
+
+/// Env var overriding the consecutive-insta-crash threshold at which an issue is
+/// quarantined. A zero/invalid value falls through to config/default.
+pub const QUARANTINE_THRESHOLD_ENV: &str = "LOOM_WORK_FINDER_QUARANTINE_THRESHOLD";
+
+/// Env var overriding the quarantine TTL, in seconds. A zero/invalid value falls
+/// through to config/default.
+pub const QUARANTINE_TTL_ENV: &str = "LOOM_WORK_FINDER_QUARANTINE_TTL_SECS";
+
+/// Env var overriding the insta-crash window, in seconds: a checkpoint-less
+/// terminal transition within this wall-clock window of dispatch counts as an
+/// insta-crash. A zero/invalid value falls through to config/default.
+pub const QUARANTINE_INSTA_CRASH_ENV: &str = "LOOM_WORK_FINDER_QUARANTINE_INSTA_CRASH_SECS";
+
+/// Default consecutive-insta-crash threshold before quarantine (#3939).
+pub const DEFAULT_QUARANTINE_THRESHOLD: u32 = 3;
+
+/// Default quarantine TTL: a quarantined issue is auto-released after this window
+/// so a transient breakage (e.g. a token pool that was re-provisioned) recovers
+/// without operator action (#3939).
+pub const DEFAULT_QUARANTINE_TTL_SECS: u64 = 3600;
+
+/// Default insta-crash window (#3939): a checkpoint-less terminal transition
+/// within this many seconds of dispatch counts toward the insta-crash tally. A
+/// real build that reaches even the Curator checkpoint, or a slow death past this
+/// window, is a *different* failure mode (handled by the mid-build watchdog) and
+/// never counts here.
+pub const DEFAULT_QUARANTINE_INSTA_CRASH_SECS: i64 = 60;
+
+/// Resolved insta-crash-quarantine parameters (Issue #3939), set on the registry
+/// at construction so [`SweepRegistry::reap_once`] can enforce them without a
+/// per-tick config read. Defaults mirror the shipped constants (enabled — it is a
+/// safety backstop).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct QuarantineConfig {
+    /// Whether insta-crash quarantine is active. When `false` the reaper neither
+    /// counts insta-crashes nor quarantines (byte-for-byte the pre-#3939 path).
+    pub enabled: bool,
+    /// Consecutive insta-crashes before an issue is quarantined.
+    pub threshold: u32,
+    /// How long a quarantine entry persists before auto-release.
+    pub ttl: Duration,
+    /// The insta-crash wall-clock window: a checkpoint-less terminal transition
+    /// within this many seconds of dispatch counts as an insta-crash.
+    pub insta_crash_secs: i64,
+}
+
+impl Default for QuarantineConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            threshold: DEFAULT_QUARANTINE_THRESHOLD,
+            ttl: Duration::from_secs(DEFAULT_QUARANTINE_TTL_SECS),
+            insta_crash_secs: DEFAULT_QUARANTINE_INSTA_CRASH_SECS,
+        }
+    }
+}
 
 /// Compute how long a spawn must wait so that consecutive spawns are separated
 /// by at least `stagger` (Issue #3887). Pure function of the last spawn instant,
@@ -812,6 +897,20 @@ pub struct SweepRegistry {
     /// Issues the review-phase stall watchdog has already logged a give-up for
     /// (Issue #3910), so the loud give-up warning fires once per issue.
     review_stall_gaveup: HashSet<u32>,
+    /// Insta-crash quarantine parameters (Issue #3939). `main.rs` /
+    /// [`crate::workspace_pool::WorkspacePool`] set the resolved env > config >
+    /// default value; the [`QuarantineConfig::default`] is the shipped-on default.
+    quarantine_config: QuarantineConfig,
+    /// Consecutive insta-crash counts per issue (Issue #3939). Incremented by the
+    /// reaper on a checkpoint-less death inside the insta-crash window; reset to
+    /// zero on any terminal outcome that made real progress or exited cleanly.
+    insta_crash_counts: HashMap<u32, u32>,
+    /// Currently-quarantined issues → the instant they were quarantined (Issue
+    /// #3939). The work finder skips these until the entry ages past
+    /// [`QuarantineConfig::ttl`], at which point [`reap_once`](Self::reap_once)
+    /// releases it. Keyed by issue number; since each registry is scoped to one
+    /// workspace root, this is effectively a `(workspace, issue)` key.
+    quarantined: HashMap<u32, DateTime<Utc>>,
 }
 
 impl SweepRegistry {
@@ -834,6 +933,9 @@ impl SweepRegistry {
             midbuild_gaveup: HashSet::new(),
             review_stall_retried: HashSet::new(),
             review_stall_gaveup: HashSet::new(),
+            quarantine_config: QuarantineConfig::default(),
+            insta_crash_counts: HashMap::new(),
+            quarantined: HashMap::new(),
         }
     }
 
@@ -853,6 +955,9 @@ impl SweepRegistry {
             midbuild_gaveup: HashSet::new(),
             review_stall_retried: HashSet::new(),
             review_stall_gaveup: HashSet::new(),
+            quarantine_config: QuarantineConfig::default(),
+            insta_crash_counts: HashMap::new(),
+            quarantined: HashMap::new(),
         }
     }
 
@@ -874,6 +979,77 @@ impl SweepRegistry {
     #[must_use]
     pub fn dispatch_stagger(&self) -> Duration {
         self.dispatch_stagger
+    }
+
+    /// Set the insta-crash quarantine parameters (Issue #3939). `main.rs` and the
+    /// workspace pool call this once at provision time with the resolved
+    /// env > config > default value.
+    pub fn set_quarantine_config(&mut self, config: QuarantineConfig) {
+        self.quarantine_config = config;
+    }
+
+    /// Read-only accessor for the quarantine parameters (Issue #3939).
+    #[must_use]
+    pub fn quarantine_config(&self) -> QuarantineConfig {
+        self.quarantine_config
+    }
+
+    /// The set of issue numbers currently quarantined for insta-crashing (Issue
+    /// #3939). Consumed by the work finder to skip re-dispatch. TTL expiry is
+    /// applied by [`reap_once`](Self::reap_once) (which the work-finder's
+    /// `in_flight()` read path already calls via `reap_liveness`), so this is a
+    /// plain read of the pruned map.
+    #[must_use]
+    pub fn quarantined_issues(&self) -> HashSet<u32> {
+        self.quarantined.keys().copied().collect()
+    }
+
+    /// Sorted view of the currently-quarantined issues (Issue #3939), for the
+    /// `loom-daemon status` per-repo breakdown.
+    #[must_use]
+    pub fn quarantined_issues_sorted(&self) -> Vec<u32> {
+        let mut v: Vec<u32> = self.quarantined.keys().copied().collect();
+        v.sort_unstable();
+        v
+    }
+
+    /// Test/inspection helper: the current consecutive-insta-crash count for an
+    /// issue (Issue #3939). `0` when the issue has no recorded insta-crashes.
+    #[must_use]
+    pub fn insta_crash_count(&self, issue: u32) -> u32 {
+        self.insta_crash_counts.get(&issue).copied().unwrap_or(0)
+    }
+
+    /// Whether `issue` is currently quarantined (Issue #3939).
+    #[must_use]
+    pub fn is_quarantined(&self, issue: u32) -> bool {
+        self.quarantined.contains_key(&issue)
+    }
+
+    /// Manually clear an issue's quarantine + insta-crash tally (Issue #3939),
+    /// the operator-action release path (reachable via the `ClearQuarantine` IPC
+    /// request / `loom-daemon quarantine clear <issue>` CLI). Returns `true` when
+    /// an entry existed. When an entry is actually cleared, a best-effort forge
+    /// label restore re-arms `loom:issue` (mirroring [`expire_quarantine`]), so
+    /// the operator command both releases the in-memory pause and re-enters the
+    /// issue into the work-finder queue — the label flip alone never sufficed.
+    pub fn clear_quarantine(&mut self, issue: u32) -> bool {
+        self.insta_crash_counts.remove(&issue);
+        let was_quarantined = self.quarantined.remove(&issue).is_some();
+        if was_quarantined {
+            self.release_quarantine_label(issue);
+        }
+        was_quarantined
+    }
+
+    /// Test-only helper: seed an in-memory quarantine entry for `issue` so
+    /// cross-module tests (e.g. the IPC dispatcher in `ipc.rs`) can exercise the
+    /// `ClearQuarantine` path without driving the full insta-crash accrual.
+    #[cfg(test)]
+    pub fn seed_quarantine_for_test(&mut self, issue: u32) {
+        self.quarantined.insert(issue, Utc::now());
+        self.insta_crash_counts
+            .insert(issue, self.quarantine_config.threshold);
     }
 
     /// Read-only accessor for the event bus, if any. Exposed so external
@@ -1242,6 +1418,185 @@ impl SweepRegistry {
         cmd.stdout(Stdio::null()).stderr(Stdio::piped());
         let _ = cmd.output()?; // best-effort during reap
         Ok(())
+    }
+
+    // ------------------------------------------------------------------------
+    // Insta-crash quarantine (Issue #3939)
+    // ------------------------------------------------------------------------
+
+    /// Record a terminal sweep outcome against the insta-crash tally (#3939).
+    ///
+    /// `insta_crash` is `true` only when the reaper classified the death as a
+    /// true insta-crash: a checkpoint-less, non-clean exit inside the insta-crash
+    /// window. In that case the per-issue consecutive counter is incremented and,
+    /// on reaching [`QuarantineConfig::threshold`], the issue is quarantined
+    /// (skipped by the work finder until the TTL). Any other outcome — real
+    /// progress (checkpoint present) or a clean/slow exit — resets the counter, so
+    /// only *consecutive* insta-crashes accrue toward quarantine.
+    ///
+    /// A no-op when quarantine is disabled ([`QuarantineConfig::enabled`] is
+    /// `false`), preserving the pre-#3939 behavior byte-for-byte.
+    fn record_terminal_outcome(&mut self, issue: u32, insta_crash: bool) {
+        if !self.quarantine_config.enabled {
+            return;
+        }
+        if !insta_crash {
+            // Progress or a clean/slow exit breaks the consecutive run. Leave any
+            // existing quarantine entry untouched — a quarantined issue is never
+            // dispatched, so it cannot reach here; this only clears the runway for
+            // an issue that has NOT yet been quarantined.
+            self.insta_crash_counts.remove(&issue);
+            return;
+        }
+        let count = self
+            .insta_crash_counts
+            .entry(issue)
+            .and_modify(|c| *c += 1)
+            .or_insert(1);
+        let count = *count;
+        if count >= self.quarantine_config.threshold && !self.quarantined.contains_key(&issue) {
+            self.quarantined.insert(issue, Utc::now());
+            log::warn!(
+                "sweep_registry: issue #{issue} QUARANTINED after {count} consecutive \
+                 insta-crashes (each <{}s with no checkpoint) — pausing re-dispatch for {}s so it \
+                 stops starving the shared queue (#3939). Clear via operator action or wait for \
+                 the TTL.",
+                self.quarantine_config.insta_crash_secs,
+                self.quarantine_config.ttl.as_secs()
+            );
+            self.apply_quarantine_label(issue, count);
+        } else {
+            log::info!(
+                "sweep_registry: issue #{issue} insta-crashed ({count}/{} consecutive, <{}s, no \
+                 checkpoint) (#3939)",
+                self.quarantine_config.threshold,
+                self.quarantine_config.insta_crash_secs
+            );
+        }
+    }
+
+    /// Release any quarantine entries older than the configured TTL (#3939).
+    /// Called at the top of each [`reap_once`](Self::reap_once). Cheap
+    /// early-return when nothing is quarantined. On release the insta-crash tally
+    /// is cleared too, so the issue re-qualifies with a fresh runway, and a
+    /// best-effort forge label restore re-arms `loom:issue`.
+    fn expire_quarantine(&mut self) {
+        if self.quarantined.is_empty() {
+            return;
+        }
+        let ttl_secs = i64::try_from(self.quarantine_config.ttl.as_secs()).unwrap_or(i64::MAX);
+        let now = Utc::now();
+        let expired: Vec<u32> = self
+            .quarantined
+            .iter()
+            .filter(|(_, at)| (now - **at).num_seconds() >= ttl_secs)
+            .map(|(issue, _)| *issue)
+            .collect();
+        for issue in expired {
+            self.quarantined.remove(&issue);
+            self.insta_crash_counts.remove(&issue);
+            log::info!(
+                "sweep_registry: issue #{issue} quarantine expired after {ttl_secs}s — eligible \
+                 for re-dispatch again (#3939)"
+            );
+            self.release_quarantine_label(issue);
+        }
+    }
+
+    /// Best-effort forge mutation on quarantine (#3939): add `loom:blocked`,
+    /// remove `loom:issue`, and post an explanatory comment so the pause is
+    /// visible to a human on the forge — not just in the daemon log. Skipped
+    /// entirely when label flips are disabled (test fixtures / `skip_label_flip`).
+    /// Every step is best-effort: a `gh` failure is logged at debug and never
+    /// affects the load-bearing in-memory quarantine.
+    fn apply_quarantine_label(&self, issue: u32, count: u32) {
+        if self.config.skip_label_flip {
+            return;
+        }
+        let gh = self
+            .config
+            .gh_bin
+            .clone()
+            .unwrap_or_else(|| PathBuf::from("gh"));
+
+        let mut edit = Command::new(&gh);
+        edit.arg("issue")
+            .arg("edit")
+            .arg(issue.to_string())
+            .arg("--add-label")
+            .arg("loom:blocked")
+            .arg("--remove-label")
+            .arg("loom:issue");
+        edit.current_dir(&self.config.workspace_root);
+        if let Ok(repo) = std::env::var("LOOM_REPO") {
+            edit.arg("--repo").arg(repo);
+        }
+        edit.stdout(Stdio::null()).stderr(Stdio::piped());
+        if let Err(e) = edit.output() {
+            log::debug!("sweep_registry: quarantine label edit for #{issue} failed: {e}");
+        }
+
+        let body = format!(
+            "Auto-quarantined by loom-daemon (#3939): this issue's sweep insta-crashed {count} \
+             times in a row — each child died within {secs}s of dispatch without writing a phase \
+             checkpoint, which almost always means an environment/configuration failure (e.g. a \
+             missing token pool, #3938) rather than a problem with the issue itself. Re-dispatch \
+             is paused so it stops occupying a global concurrency slot and starving other work. \
+             Once the underlying cause is fixed, clear the quarantine with `loom-daemon \
+             quarantine clear {issue}` (this releases the in-memory pause AND restores \
+             `loom:issue`), or simply wait for the {ttl}s TTL to auto-release it. Note: manually \
+             flipping `loom:blocked` -> `loom:issue` on the forge does NOT release the daemon's \
+             in-memory quarantine on its own — the work finder skips it until the CLI clear or the \
+             TTL fires.",
+            secs = self.quarantine_config.insta_crash_secs,
+            ttl = self.quarantine_config.ttl.as_secs(),
+        );
+        let mut comment = Command::new(&gh);
+        comment
+            .arg("issue")
+            .arg("comment")
+            .arg(issue.to_string())
+            .arg("--body")
+            .arg(body);
+        comment.current_dir(&self.config.workspace_root);
+        if let Ok(repo) = std::env::var("LOOM_REPO") {
+            comment.arg("--repo").arg(repo);
+        }
+        comment.stdout(Stdio::null()).stderr(Stdio::piped());
+        if let Err(e) = comment.output() {
+            log::debug!("sweep_registry: quarantine comment for #{issue} failed: {e}");
+        }
+    }
+
+    /// Best-effort forge mutation on quarantine expiry (#3939): remove
+    /// `loom:blocked` and re-add `loom:issue` so an auto-released issue re-enters
+    /// the work-finder queue. The mirror of [`apply_quarantine_label`]. Skipped
+    /// when label flips are disabled; a `gh` failure is logged at debug only.
+    fn release_quarantine_label(&self, issue: u32) {
+        if self.config.skip_label_flip {
+            return;
+        }
+        let gh = self
+            .config
+            .gh_bin
+            .clone()
+            .unwrap_or_else(|| PathBuf::from("gh"));
+        let mut edit = Command::new(&gh);
+        edit.arg("issue")
+            .arg("edit")
+            .arg(issue.to_string())
+            .arg("--remove-label")
+            .arg("loom:blocked")
+            .arg("--add-label")
+            .arg("loom:issue");
+        edit.current_dir(&self.config.workspace_root);
+        if let Ok(repo) = std::env::var("LOOM_REPO") {
+            edit.arg("--repo").arg(repo);
+        }
+        edit.stdout(Stdio::null()).stderr(Stdio::piped());
+        if let Err(e) = edit.output() {
+            log::debug!("sweep_registry: quarantine-release label edit for #{issue} failed: {e}");
+        }
     }
 
     // ------------------------------------------------------------------------
@@ -1858,6 +2213,11 @@ impl SweepRegistry {
     pub fn reap_once(&mut self) -> usize {
         let mut changes = 0usize;
 
+        // Insta-crash quarantine TTL (#3939): release any issue whose quarantine
+        // has aged past the configured window before this tick's work. Cheap
+        // early-return when nothing is quarantined.
+        self.expire_quarantine();
+
         // Snapshot keys + pids first so we can borrow mutably below.
         // Capture started_at so we can compute durations for Exited events.
         let candidates: Vec<(SweepId, u32, SweepState, SweepKind, chrono::DateTime<Utc>)> = self
@@ -1918,6 +2278,13 @@ impl SweepRegistry {
                                 sweep_id: sweep_id.clone(),
                                 outcome: SweepOutcome::Crashed,
                             });
+                            // Insta-crash quarantine (#3939): a checkpoint exists,
+                            // so this sweep reached real work — the mid-build-death
+                            // watchdog (#3895) owns this failure mode, and it is
+                            // explicitly NOT an insta-crash. Reset the consecutive
+                            // tally so a genuine mid-build death never accretes
+                            // toward quarantine.
+                            self.record_terminal_outcome(issue, false);
                         } else {
                             // Orphaned-claim recovery (issue #3823b): a
                             // daemon-owned sweep that exits cleanly WITHOUT a
@@ -1958,6 +2325,18 @@ impl SweepRegistry {
                                 sweep_id: sweep_id.clone(),
                                 outcome: SweepOutcome::Exited,
                             });
+                            // Insta-crash quarantine (#3939): a checkpoint-less
+                            // death inside the insta-crash window that did NOT
+                            // exit cleanly (exit_code != 0, or an unknown
+                            // signal-death) never reached real work — the #3938
+                            // "missing token pool / import failure" case. Count it
+                            // toward quarantine. A clean exit (code 0 — the
+                            // legitimate self-skip / no-work path) or a slow death
+                            // past the window resets the tally instead.
+                            let insta_crash = duration_sec
+                                < self.quarantine_config.insta_crash_secs
+                                && exit_code != Some(0);
+                            self.record_terminal_outcome(issue, insta_crash);
                         }
                         // Block-the-subtree (issue #3729, v1 item 4): if this
                         // parent ended in `loom:blocked` and stacked children
@@ -3079,6 +3458,112 @@ pub fn resolve_review_stall_timeout(config: &StartupRaceConfig) -> Duration {
         .or(config.review_stall_timeout_secs)
         .unwrap_or(DEFAULT_REVIEW_STALL_TIMEOUT_SECS);
     Duration::from_secs(secs)
+}
+
+// ============================================================================
+// Insta-crash quarantine config resolution (Issue #3939)
+// ============================================================================
+
+/// The subset of `.loom/config.json → autonomous.workFinder.quarantine` this
+/// module consumes (Issue #3939). Each field is `Option` so an absent key falls
+/// through to the env-var / built-in-default resolution — precedence
+/// **env > config > default** for every knob, matching the rest of the module.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct QuarantineFileConfig {
+    /// `autonomous.workFinder.quarantine.enabled` — whether quarantine runs.
+    pub enabled: Option<bool>,
+    /// `autonomous.workFinder.quarantine.threshold` — consecutive insta-crashes
+    /// before quarantine (zero/invalid dropped to `None`).
+    pub threshold: Option<u32>,
+    /// `autonomous.workFinder.quarantine.ttlSecs` — quarantine TTL, in seconds
+    /// (zero/invalid dropped to `None`).
+    pub ttl_secs: Option<u64>,
+    /// `autonomous.workFinder.quarantine.instaCrashSecs` — insta-crash window, in
+    /// seconds (zero/invalid dropped to `None`).
+    pub insta_crash_secs: Option<u64>,
+}
+
+/// Read `.loom/config.json → autonomous.workFinder.quarantine` (Issue #3939),
+/// soft-failing every field to `None` on a missing file, malformed JSON, or an
+/// absent `autonomous` / `workFinder` / `quarantine` block. Mirrors
+/// [`read_startup_race_config`].
+#[must_use]
+pub fn read_quarantine_file_config(repo_root: &Path) -> QuarantineFileConfig {
+    let config_path = repo_root.join(".loom").join("config.json");
+    let Ok(config_str) = std::fs::read_to_string(&config_path) else {
+        return QuarantineFileConfig::default();
+    };
+    let Ok(config) = serde_json::from_str::<serde_json::Value>(&config_str) else {
+        log::warn!("sweep_registry: could not parse config at {}", config_path.display());
+        return QuarantineFileConfig::default();
+    };
+    let block = config
+        .get("autonomous")
+        .and_then(|a| a.get("workFinder"))
+        .and_then(|w| w.get("quarantine"));
+    let Some(q) = block else {
+        return QuarantineFileConfig::default();
+    };
+    QuarantineFileConfig {
+        enabled: q.get("enabled").and_then(serde_json::Value::as_bool),
+        threshold: q
+            .get("threshold")
+            .and_then(serde_json::Value::as_u64)
+            .filter(|&n| n > 0)
+            .and_then(|n| u32::try_from(n).ok()),
+        ttl_secs: q
+            .get("ttlSecs")
+            .and_then(serde_json::Value::as_u64)
+            .filter(|&s| s > 0),
+        insta_crash_secs: q
+            .get("instaCrashSecs")
+            .and_then(serde_json::Value::as_u64)
+            .filter(|&s| s > 0),
+    }
+}
+
+/// Resolve the full [`QuarantineConfig`] for `repo_root` with precedence
+/// **env > config > default** for every knob (Issue #3939). Reads the file
+/// config internally, then layers env overrides on top, then the shipped
+/// defaults. Enabled defaults **on** — it is a safety backstop.
+#[must_use]
+pub fn resolve_quarantine_config(repo_root: &Path) -> QuarantineConfig {
+    let file = read_quarantine_file_config(repo_root);
+
+    let enabled = if let Ok(v) = std::env::var(QUARANTINE_ENABLE_ENV) {
+        matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on")
+    } else {
+        file.enabled.unwrap_or(true)
+    };
+
+    let threshold = std::env::var(QUARANTINE_THRESHOLD_ENV)
+        .ok()
+        .and_then(|v| v.trim().parse::<u32>().ok())
+        .filter(|&n| n > 0)
+        .or(file.threshold)
+        .unwrap_or(DEFAULT_QUARANTINE_THRESHOLD);
+
+    let ttl_secs = std::env::var(QUARANTINE_TTL_ENV)
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|&s| s > 0)
+        .or(file.ttl_secs)
+        .unwrap_or(DEFAULT_QUARANTINE_TTL_SECS);
+
+    let insta_crash_secs = std::env::var(QUARANTINE_INSTA_CRASH_ENV)
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|&s| s > 0)
+        .or(file.insta_crash_secs)
+        .and_then(|s| i64::try_from(s).ok())
+        .unwrap_or(DEFAULT_QUARANTINE_INSTA_CRASH_SECS);
+
+    QuarantineConfig {
+        enabled,
+        threshold,
+        ttl: Duration::from_secs(ttl_secs),
+        insta_crash_secs,
+    }
 }
 
 /// Spawn the watchdog task (Issue #3887 + #3895 + #3910). Every `interval`, it
@@ -4410,6 +4895,336 @@ exit 0
         assert!(changed >= 1);
         let info = registry.get(&sweep_id).unwrap();
         assert!(matches!(info.state, SweepState::Exited { .. }));
+    }
+
+    // ------------------------------------------------------------------------
+    // Insta-crash quarantine (Issue #3939)
+    // ------------------------------------------------------------------------
+
+    /// Insert a fresh `Running` entry for `issue` with a guaranteed-dead PID and
+    /// `started_at` at `now` (so the reaper classifies its death as within the
+    /// insta-crash window). Returns the synthetic sweep_id.
+    fn insert_dead_running(registry: &mut SweepRegistry, issue: u32, seq: u32) -> String {
+        let sweep_id = format!("sweep-issue-{issue}-{seq}");
+        registry.entries.insert(
+            sweep_id.clone(),
+            SweepInfo {
+                sweep_id: sweep_id.clone(),
+                kind: SweepKind::Issue(issue),
+                pid: 2_147_483_640, // ~i32::MAX, almost certainly dead
+                token_name: "unknown".into(),
+                log_path: registry.compute_log_path(issue),
+                idempotency_key: None,
+                started_at: Utc::now(),
+                state: SweepState::Running,
+                latest_phase: None,
+                pr_number: None,
+                model: None,
+                effort: None,
+                depends_on: None,
+                repo: None,
+            },
+        );
+        sweep_id
+    }
+
+    /// AC #1: the consecutive-insta-crash counter increments and, at the
+    /// threshold, quarantines. Exercises `record_terminal_outcome` directly so
+    /// the classification (which depends on a real child's exit code) is not in
+    /// the way of the counter/threshold logic.
+    #[test]
+    fn record_terminal_outcome_counts_then_quarantines_at_threshold() {
+        let dir = tempdir().unwrap();
+        let (mut registry, _record_log) = fixture_registry(dir.path());
+        // Default config: threshold 3.
+        assert_eq!(registry.quarantine_config().threshold, 3);
+
+        registry.record_terminal_outcome(7, true);
+        assert_eq!(registry.insta_crash_count(7), 1);
+        assert!(!registry.is_quarantined(7));
+
+        registry.record_terminal_outcome(7, true);
+        assert_eq!(registry.insta_crash_count(7), 2);
+        assert!(!registry.is_quarantined(7));
+
+        registry.record_terminal_outcome(7, true);
+        assert_eq!(registry.insta_crash_count(7), 3);
+        assert!(registry.is_quarantined(7), "3rd consecutive insta-crash quarantines");
+    }
+
+    /// AC #1: a non-insta terminal outcome (real progress / clean exit) resets
+    /// the consecutive tally, so only *consecutive* insta-crashes accrue.
+    #[test]
+    fn record_terminal_outcome_resets_run_on_progress() {
+        let dir = tempdir().unwrap();
+        let (mut registry, _record_log) = fixture_registry(dir.path());
+
+        registry.record_terminal_outcome(8, true);
+        registry.record_terminal_outcome(8, true);
+        assert_eq!(registry.insta_crash_count(8), 2);
+
+        // Real progress / clean exit breaks the streak.
+        registry.record_terminal_outcome(8, false);
+        assert_eq!(registry.insta_crash_count(8), 0);
+        assert!(!registry.is_quarantined(8));
+
+        // A subsequent insta-crash starts the count over — one is not enough.
+        registry.record_terminal_outcome(8, true);
+        assert_eq!(registry.insta_crash_count(8), 1);
+        assert!(!registry.is_quarantined(8));
+    }
+
+    /// Disabled quarantine (config `enabled=false`) is a total no-op: no counting,
+    /// no quarantine — byte-for-byte the pre-#3939 path.
+    #[test]
+    fn record_terminal_outcome_noop_when_disabled() {
+        let dir = tempdir().unwrap();
+        let (mut registry, _record_log) = fixture_registry(dir.path());
+        registry.set_quarantine_config(QuarantineConfig {
+            enabled: false,
+            ..QuarantineConfig::default()
+        });
+        for _ in 0..5 {
+            registry.record_terminal_outcome(9, true);
+        }
+        assert_eq!(registry.insta_crash_count(9), 0);
+        assert!(!registry.is_quarantined(9));
+    }
+
+    /// AC #1 (end-to-end via the reaper): three consecutive checkpoint-less quick
+    /// deaths — re-dispatched each time — drive the issue into quarantine. The
+    /// dead-PID kill-probe yields no exit code, which the reaper treats as a
+    /// non-clean death inside the insta-crash window (the #3938 case).
+    #[test]
+    fn reaper_quarantines_after_consecutive_insta_crashes() {
+        let dir = tempdir().unwrap();
+        let (mut registry, _record_log) = fixture_registry(dir.path());
+
+        for seq in 0..3 {
+            insert_dead_running(&mut registry, 42, seq);
+            registry.reap_once();
+        }
+        assert!(registry.is_quarantined(42), "issue #42 quarantined after 3 insta-crashes");
+        assert!(
+            registry.quarantined_issues().contains(&42),
+            "quarantined set exposes #42 to the work finder"
+        );
+        assert_eq!(registry.quarantined_issues_sorted(), vec![42]);
+    }
+
+    /// AC #1: a death WITH a checkpoint (real work happened) is NOT an
+    /// insta-crash — it is the mid-build-death watchdog's remit (#3895) — so it
+    /// never counts toward quarantine.
+    #[test]
+    fn reaper_checkpoint_death_does_not_count_as_insta_crash() {
+        let dir = tempdir().unwrap();
+        let (mut registry, _record_log) = fixture_registry(dir.path());
+
+        let cp_dir = registry.config.checkpoint_dir();
+        std::fs::create_dir_all(&cp_dir).unwrap();
+        std::fs::write(cp_dir.join("issue-43.json"), r#"{"phase":"builder","issue":43}"#).unwrap();
+
+        for seq in 0..5 {
+            insert_dead_running(&mut registry, 43, seq);
+            registry.reap_once();
+        }
+        assert_eq!(registry.insta_crash_count(43), 0, "checkpoint deaths never count");
+        assert!(!registry.is_quarantined(43), "a mid-build death is not quarantined");
+    }
+
+    /// AC #4: a quarantine entry auto-releases once it ages past the TTL, and the
+    /// insta-crash tally is cleared so the issue re-qualifies with a fresh runway.
+    #[test]
+    fn quarantine_expires_after_ttl() {
+        let dir = tempdir().unwrap();
+        let (mut registry, _record_log) = fixture_registry(dir.path());
+        registry.set_quarantine_config(QuarantineConfig {
+            ttl: Duration::from_secs(3600),
+            ..QuarantineConfig::default()
+        });
+
+        // Quarantine #44 with a timestamp two hours in the past (past the 1h TTL).
+        registry
+            .quarantined
+            .insert(44, Utc::now() - chrono::Duration::seconds(7200));
+        registry.insta_crash_counts.insert(44, 3);
+        assert!(registry.is_quarantined(44));
+
+        // reap_once runs expire_quarantine at the top of the tick.
+        registry.reap_once();
+        assert!(!registry.is_quarantined(44), "aged-out quarantine is released");
+        assert_eq!(registry.insta_crash_count(44), 0, "tally cleared on release");
+    }
+
+    /// AC #4: a quarantine entry within its TTL is NOT released early.
+    #[test]
+    fn quarantine_within_ttl_is_retained() {
+        let dir = tempdir().unwrap();
+        let (mut registry, _record_log) = fixture_registry(dir.path());
+        registry.set_quarantine_config(QuarantineConfig {
+            ttl: Duration::from_secs(3600),
+            ..QuarantineConfig::default()
+        });
+
+        // Quarantined 10s ago — well inside the 1h TTL.
+        registry
+            .quarantined
+            .insert(45, Utc::now() - chrono::Duration::seconds(10));
+        registry.reap_once();
+        assert!(registry.is_quarantined(45), "a fresh quarantine survives the TTL check");
+    }
+
+    /// AC #2/#4: the operator-action release path clears both the quarantine and
+    /// the insta-crash tally.
+    #[test]
+    fn clear_quarantine_releases_entry() {
+        let dir = tempdir().unwrap();
+        let (mut registry, _record_log) = fixture_registry(dir.path());
+        registry.quarantined.insert(46, Utc::now());
+        registry.insta_crash_counts.insert(46, 3);
+
+        assert!(registry.clear_quarantine(46), "returns true when an entry existed");
+        assert!(!registry.is_quarantined(46));
+        assert_eq!(registry.insta_crash_count(46), 0);
+        assert!(!registry.clear_quarantine(46), "idempotent: false when nothing to clear");
+    }
+
+    /// The operator-action release path (`clear_quarantine`) must restore
+    /// `loom:issue` on the forge — the whole point of the #3960 fix is that
+    /// clearing the in-memory quarantine ALSO re-arms the label, so the manual
+    /// path is not a dead-end that leaves the issue stuck in `loom:blocked`.
+    #[test]
+    fn clear_quarantine_restores_forge_label() {
+        let dir = tempdir().unwrap();
+        let gh_log = dir.path().join("gh-invocations.log");
+        let fake_gh = dir.path().join("fake-gh.sh");
+        let script = format!(
+            "#!/usr/bin/env bash\nprintf '%s\\n' \"$*\" >> \"{}\"\nexit 0\n",
+            gh_log.display()
+        );
+        std::fs::write(&fake_gh, &script).unwrap();
+        let mut perms = std::fs::metadata(&fake_gh).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&fake_gh, perms).unwrap();
+        if let Ok(f) = std::fs::File::open(&fake_gh) {
+            let _ = f.sync_all();
+        }
+
+        let mut config = SweepRegistryConfig::new(dir.path().to_path_buf());
+        config.gh_bin = Some(fake_gh);
+        config.skip_label_flip = false; // exercise the real restore path
+        let mut registry = SweepRegistry::new(config);
+        registry.quarantined.insert(52, Utc::now());
+        registry.insta_crash_counts.insert(52, 3);
+
+        assert!(registry.clear_quarantine(52));
+        assert!(!registry.is_quarantined(52));
+
+        let gh_calls = std::fs::read_to_string(&gh_log).unwrap_or_default();
+        assert!(
+            gh_calls.contains("issue edit 52 --remove-label loom:blocked --add-label loom:issue"),
+            "expected clear_quarantine to restore loom:blocked -> loom:issue; got: {gh_calls:?}"
+        );
+    }
+
+    /// A no-op clear (issue not quarantined) must NOT touch the forge — no
+    /// stray label edit for an issue that was never blocked.
+    #[test]
+    fn clear_quarantine_noop_skips_forge_label() {
+        let dir = tempdir().unwrap();
+        let gh_log = dir.path().join("gh-invocations.log");
+        let fake_gh = dir.path().join("fake-gh.sh");
+        let script = format!(
+            "#!/usr/bin/env bash\nprintf '%s\\n' \"$*\" >> \"{}\"\nexit 0\n",
+            gh_log.display()
+        );
+        std::fs::write(&fake_gh, &script).unwrap();
+        let mut perms = std::fs::metadata(&fake_gh).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&fake_gh, perms).unwrap();
+
+        let mut config = SweepRegistryConfig::new(dir.path().to_path_buf());
+        config.gh_bin = Some(fake_gh);
+        config.skip_label_flip = false;
+        let mut registry = SweepRegistry::new(config);
+
+        assert!(!registry.clear_quarantine(999), "no-op when not quarantined");
+        let gh_calls = std::fs::read_to_string(&gh_log).unwrap_or_default();
+        assert!(
+            gh_calls.is_empty(),
+            "expected no forge call for a no-op clear; got: {gh_calls:?}"
+        );
+    }
+
+    /// Config resolution honors precedence env > config > default (#3939).
+    #[test]
+    #[serial]
+    fn resolve_quarantine_config_env_overrides() {
+        let dir = tempdir().unwrap();
+        // No file, no env → shipped defaults (enabled, threshold 3).
+        let base = resolve_quarantine_config(dir.path());
+        assert!(base.enabled);
+        assert_eq!(base.threshold, DEFAULT_QUARANTINE_THRESHOLD);
+        assert_eq!(base.insta_crash_secs, DEFAULT_QUARANTINE_INSTA_CRASH_SECS);
+
+        std::env::set_var(QUARANTINE_THRESHOLD_ENV, "5");
+        std::env::set_var(QUARANTINE_TTL_ENV, "120");
+        std::env::set_var(QUARANTINE_INSTA_CRASH_ENV, "30");
+        std::env::set_var(QUARANTINE_ENABLE_ENV, "off");
+        let resolved = resolve_quarantine_config(dir.path());
+        std::env::remove_var(QUARANTINE_THRESHOLD_ENV);
+        std::env::remove_var(QUARANTINE_TTL_ENV);
+        std::env::remove_var(QUARANTINE_INSTA_CRASH_ENV);
+        std::env::remove_var(QUARANTINE_ENABLE_ENV);
+
+        assert!(!resolved.enabled, "LOOM_WORK_FINDER_QUARANTINE=off disables");
+        assert_eq!(resolved.threshold, 5);
+        assert_eq!(resolved.ttl, Duration::from_secs(120));
+        assert_eq!(resolved.insta_crash_secs, 30);
+    }
+
+    /// Config-file parsing of `autonomous.workFinder.quarantine` (#3939).
+    #[test]
+    #[serial]
+    fn read_quarantine_file_config_parses_block() {
+        // Ensure env does not shadow the file values for the resolve assertion.
+        std::env::remove_var(QUARANTINE_THRESHOLD_ENV);
+        std::env::remove_var(QUARANTINE_TTL_ENV);
+        std::env::remove_var(QUARANTINE_INSTA_CRASH_ENV);
+        std::env::remove_var(QUARANTINE_ENABLE_ENV);
+
+        let dir = tempdir().unwrap();
+        let loom = dir.path().join(".loom");
+        std::fs::create_dir_all(&loom).unwrap();
+        std::fs::write(
+            loom.join("config.json"),
+            r#"{"autonomous":{"workFinder":{"quarantine":{"enabled":true,"threshold":4,"ttlSecs":900,"instaCrashSecs":45}}}}"#,
+        )
+        .unwrap();
+
+        let file = read_quarantine_file_config(dir.path());
+        assert_eq!(file.enabled, Some(true));
+        assert_eq!(file.threshold, Some(4));
+        assert_eq!(file.ttl_secs, Some(900));
+        assert_eq!(file.insta_crash_secs, Some(45));
+
+        // And the full resolver folds them in (no env set).
+        let resolved = resolve_quarantine_config(dir.path());
+        assert_eq!(resolved.threshold, 4);
+        assert_eq!(resolved.ttl, Duration::from_secs(900));
+        assert_eq!(resolved.insta_crash_secs, 45);
+    }
+
+    /// A missing `quarantine` block yields all-`None` (env/default resolution) —
+    /// zero behavior change for repos that never configure it.
+    #[test]
+    fn read_quarantine_file_config_absent_block_is_none() {
+        let dir = tempdir().unwrap();
+        let loom = dir.path().join(".loom");
+        std::fs::create_dir_all(&loom).unwrap();
+        std::fs::write(loom.join("config.json"), r#"{"autonomous":{"workFinder":{}}}"#).unwrap();
+        let file = read_quarantine_file_config(dir.path());
+        assert_eq!(file, QuarantineFileConfig::default());
     }
 
     /// Issue #3823b: orphaned-claim recovery. A daemon-owned sweep that exits

@@ -109,6 +109,15 @@ enum Commands {
         action: WorkspaceAction,
     },
 
+    /// Manage insta-crash quarantines (Issue #3939): the in-memory pauses the
+    /// daemon applies to issues whose sweeps insta-crash repeatedly. Connects to
+    /// the running daemon over its Unix socket, since the quarantine state lives
+    /// in the daemon's memory (not on disk).
+    Quarantine {
+        #[command(subcommand)]
+        action: QuarantineAction,
+    },
+
     /// Validate role configuration completeness
     Validate {
         /// Workspace directory containing .loom/config.json
@@ -172,6 +181,26 @@ enum WorkspaceAction {
     },
 }
 
+/// Sub-actions for `loom-daemon quarantine`.
+#[derive(Subcommand)]
+enum QuarantineAction {
+    /// Clear an issue's insta-crash quarantine (Issue #3939): release the
+    /// daemon's in-memory pause + insta-crash tally so the work finder
+    /// re-qualifies it immediately (instead of waiting for the TTL) and restore
+    /// `loom:issue` on the forge. Idempotent — clearing a non-quarantined issue
+    /// is a no-op success.
+    Clear {
+        /// The issue number whose quarantine to clear.
+        #[arg(value_name = "ISSUE")]
+        issue: u32,
+
+        /// Target managed-workspace root (Issue #3929). Omit to use the daemon's
+        /// default workspace.
+        #[arg(long, value_name = "PATH")]
+        workspace_root: Option<String>,
+    },
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -182,6 +211,9 @@ async fn main() -> Result<()> {
             // `status` connects to the running daemon over its Unix socket, so
             // it needs the async runtime (unlike the other sync subcommands).
             Commands::Status { json } => handle_status_command(json).await,
+            // `quarantine` connects to the running daemon over its Unix socket
+            // (the quarantine state is in-memory), so it needs the async runtime.
+            Commands::Quarantine { action } => handle_quarantine_command(action).await,
             other => handle_cli_command(other),
         };
     }
@@ -326,6 +358,19 @@ async fn main() -> Result<()> {
     let dispatch_stagger = sweep_registry::resolve_dispatch_stagger(&startup_race_config);
     sweep.set_dispatch_stagger(dispatch_stagger);
     log::info!("sweep_registry: dispatch stagger = {}ms (#3887)", dispatch_stagger.as_millis());
+
+    // Insta-crash quarantine (#3939): resolve env > config > default for the
+    // default workspace so the reaper quarantines a repeatedly-insta-crashing
+    // issue instead of letting the work finder re-dispatch it every tick.
+    let quarantine_config = sweep_registry::resolve_quarantine_config(&sweep_workspace);
+    sweep.set_quarantine_config(quarantine_config);
+    log::info!(
+        "sweep_registry: insta-crash quarantine {} (threshold={}, ttl={}s, insta-crash<{}s) (#3939)",
+        if quarantine_config.enabled { "enabled" } else { "disabled" },
+        quarantine_config.threshold,
+        quarantine_config.ttl.as_secs(),
+        quarantine_config.insta_crash_secs
+    );
 
     let sweep_registry = Arc::new(Mutex::new(sweep));
     let _reaper_handle = sweep_registry::spawn_reaper_task(sweep_registry.clone());
@@ -671,6 +716,11 @@ fn handle_cli_command(command: Commands) -> Result<()> {
             // socket round-trip), never dispatched through this sync handler.
             unreachable!("Status is handled in main() before handle_cli_command")
         }
+        Commands::Quarantine { .. } => {
+            // Routed directly in `main()` (it needs the async runtime for the
+            // socket round-trip), never dispatched through this sync handler.
+            unreachable!("Quarantine is handled in main() before handle_cli_command")
+        }
         Commands::Init {
             workspace,
             defaults,
@@ -897,6 +947,89 @@ async fn query_daemon_status(socket_path: &Path) -> Result<DaemonStatusReport> {
     tokio::time::timeout(TIMEOUT, roundtrip)
         .await
         .map_err(|_| anyhow!("status round-trip timed out after {}s", TIMEOUT.as_secs()))?
+}
+
+/// Handle the `quarantine` subcommand (Issue #3939). Connects to the running
+/// daemon over its Unix socket and dispatches the requested action. The
+/// quarantine state is in the daemon's memory, so — unlike `workspace` — this
+/// cannot operate on a file when the daemon is down.
+async fn handle_quarantine_command(action: QuarantineAction) -> Result<()> {
+    let socket_path = resolve_socket_path()?;
+    match action {
+        QuarantineAction::Clear {
+            issue,
+            workspace_root,
+        } => {
+            let request = Request::ClearQuarantine {
+                issue,
+                workspace_root,
+            };
+            match query_daemon(&socket_path, &request).await {
+                Ok(Response::QuarantineCleared {
+                    issue,
+                    was_quarantined,
+                }) => {
+                    if was_quarantined {
+                        println!(
+                            "Cleared quarantine for issue #{issue} — it will re-qualify for \
+                             dispatch and `loom:issue` has been restored on the forge."
+                        );
+                    } else {
+                        println!("Issue #{issue} was not quarantined — nothing to clear (no-op).");
+                    }
+                    Ok(())
+                }
+                Ok(Response::Error { message }) => {
+                    eprintln!("Daemon error: {message}");
+                    std::process::exit(1);
+                }
+                Ok(other) => {
+                    eprintln!("Unexpected response from daemon: {other:?}");
+                    std::process::exit(1);
+                }
+                Err(e) => {
+                    eprintln!("Could not reach loom-daemon at {}: {e}", socket_path.display());
+                    eprintln!();
+                    eprintln!("Is the daemon running? Start it with:");
+                    eprintln!("  ./.loom/scripts/cli/loom-daemon-start.sh");
+                    std::process::exit(1);
+                }
+            }
+        }
+    }
+}
+
+/// Connect to the running daemon over its Unix socket, send a single `request`,
+/// and return the parsed `Response`. Both the connect and the round-trip are
+/// individually bounded so an unresponsive/wedged daemon cannot hang the CLI.
+/// Mirrors `query_daemon_status` but for arbitrary single-frame requests.
+async fn query_daemon(socket_path: &Path, request: &Request) -> Result<Response> {
+    const TIMEOUT: Duration = Duration::from_secs(5);
+
+    let stream = tokio::time::timeout(TIMEOUT, UnixStream::connect(socket_path))
+        .await
+        .map_err(|_| anyhow!("connect timed out after {}s", TIMEOUT.as_secs()))?
+        .map_err(|e| anyhow!("connect failed: {e}"))?;
+    let (reader, mut writer) = stream.into_split();
+
+    let request_json = serde_json::to_string(request)?;
+    let roundtrip = async move {
+        writer.write_all(request_json.as_bytes()).await?;
+        writer.write_all(b"\n").await?;
+        writer.flush().await?;
+
+        let mut lines = BufReader::new(reader).lines();
+        let line = lines
+            .next_line()
+            .await?
+            .ok_or_else(|| anyhow!("daemon closed the connection without responding"))?;
+        let response: Response = serde_json::from_str(&line)?;
+        Ok::<Response, anyhow::Error>(response)
+    };
+
+    tokio::time::timeout(TIMEOUT, roundtrip)
+        .await
+        .map_err(|_| anyhow!("round-trip timed out after {}s", TIMEOUT.as_secs()))?
 }
 
 /// Collect per-token usage by shelling out to `loom-tokens check --json`,
@@ -1229,6 +1362,18 @@ fn print_status_human(report: &DaemonStatusReport, token_usage: Option<&serde_js
                 gate,
                 r.root.display()
             );
+            // Insta-crash quarantine (#3939): list the issues this repo is
+            // currently refusing to re-dispatch so a stalled-but-nonempty backlog
+            // is explained. Auto-releases on a TTL (or `loom:blocked` removal).
+            if !r.quarantined_issues.is_empty() {
+                let list = r
+                    .quarantined_issues
+                    .iter()
+                    .map(|n| format!("#{n}"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                println!("        quarantined (insta-crash, #3939): {list}");
+            }
         }
     }
 

@@ -473,20 +473,26 @@ pub fn build_daemon_status(
     let mut per_repo: Vec<crate::types::RepoStatus> = Vec::with_capacity(roots.len());
     for root in &roots {
         let registry = workspace_pool.get_or_provision(root);
-        let live: Vec<crate::types::SweepInfo> = {
+        let (live, quarantined_issues): (Vec<crate::types::SweepInfo>, Vec<u32>) = {
             let sr = registry.lock().expect("Sweep registry mutex poisoned");
             // In-flight = sweeps still live (Pending / Running). Terminal sweeps
             // (Exited / Crashed) linger in the registry but are not "in flight".
-            sr.list(None)
+            let live = sr
+                .list(None)
                 .into_iter()
                 .filter(|info| !info.state.is_terminal())
-                .collect()
+                .collect();
+            // Insta-crash quarantine (#3939): surface which issues this repo is
+            // currently refusing to re-dispatch, so a repo with a visible backlog
+            // that is dispatching nothing is explained.
+            (live, sr.quarantined_issues_sorted())
         };
         per_repo.push(crate::types::RepoStatus {
             root: root.clone(),
             priority: workspace_registry.priority_of(root),
             in_flight_count: live.len(),
             health_gate_halted: health_states.is_halted(root),
+            quarantined_issues,
         });
         in_flight.extend(live);
     }
@@ -1283,6 +1289,24 @@ fn handle_request(
                 Err(e) => Response::Error {
                     message: format!("cancel_sweep failed: {e}"),
                 },
+            }
+        }
+
+        Request::ClearQuarantine {
+            issue,
+            workspace_root,
+        } => {
+            // Operator-reachable insta-crash-quarantine release (Issue #3939).
+            // Clears the daemon's in-memory quarantine + insta-crash tally for
+            // `issue` (and restores `loom:issue` on the forge) so the work
+            // finder re-qualifies it immediately instead of waiting for the TTL.
+            let target =
+                resolve_registry(sweep_registry, workspace_pool, workspace_root.as_deref());
+            let mut sr = target.lock().expect("Sweep registry mutex poisoned");
+            let was_quarantined = sr.clear_quarantine(issue);
+            Response::QuarantineCleared {
+                issue,
+                was_quarantined,
             }
         }
 
@@ -2214,6 +2238,70 @@ exit 0
     }
 
     #[test]
+    fn test_handle_request_clear_quarantine_noop() {
+        // Issue #3939/#3960: clearing an issue that is not quarantined is an
+        // idempotent no-op success routed through the full IPC dispatcher.
+        let (tm, db, _, bus) = setup_test_context();
+        let (sr, _dir, _rec) = setup_sweep_registry_in_tempdir();
+        let response = handle_request(
+            Request::ClearQuarantine {
+                issue: 4242,
+                workspace_root: None,
+            },
+            &tm,
+            &db,
+            &sr,
+            &bus,
+            &test_pool(),
+        );
+        match response {
+            Response::QuarantineCleared {
+                issue,
+                was_quarantined,
+            } => {
+                assert_eq!(issue, 4242);
+                assert!(!was_quarantined, "no entry existed -> false");
+            }
+            other => panic!("Expected QuarantineCleared, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_handle_request_clear_quarantine_clears_existing() {
+        // Seed a quarantine directly, then clear it via the IPC dispatcher and
+        // assert the in-memory state was released (was_quarantined: true).
+        let (tm, db, _, bus) = setup_test_context();
+        let (sr, _dir, _rec) = setup_sweep_registry_in_tempdir();
+        {
+            let mut reg = sr.lock().unwrap();
+            reg.seed_quarantine_for_test(808);
+            assert!(reg.is_quarantined(808));
+        }
+        let response = handle_request(
+            Request::ClearQuarantine {
+                issue: 808,
+                workspace_root: None,
+            },
+            &tm,
+            &db,
+            &sr,
+            &bus,
+            &test_pool(),
+        );
+        match response {
+            Response::QuarantineCleared {
+                issue,
+                was_quarantined,
+            } => {
+                assert_eq!(issue, 808);
+                assert!(was_quarantined, "seeded entry existed -> true");
+            }
+            other => panic!("Expected QuarantineCleared, got: {other:?}"),
+        }
+        assert!(!sr.lock().unwrap().is_quarantined(808));
+    }
+
+    #[test]
     fn test_handle_request_cancel_sweep_unknown_returns_error() {
         let (tm, db, _, bus) = setup_test_context();
         let (sr, _dir, _rec) = setup_sweep_registry_in_tempdir();
@@ -2383,6 +2471,7 @@ exit 0
                 priority: 100,
                 in_flight_count: 0,
                 health_gate_halted: true,
+                quarantined_issues: vec![101, 202],
             }],
         };
         let resp = Response::DaemonStatus(report);
