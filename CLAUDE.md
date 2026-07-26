@@ -109,7 +109,7 @@ The Rust `loom-daemon` binary is the Tier 2 dispatch backend. It exposes a Unix-
 
 **By default the daemon is not a work generator** — with no autonomous config it does not poll the forge for `loom:issue` items, does not maintain a `shepherd-N` pool, and does not drive support roles on cron; work arrives only via `mcp__loom__dispatch_sweep` (operator-driven enqueue) and the GitHub Actions cron workflows. As of epics #3809 and #3842 the daemon *can* generate and dispatch its own work when **explicitly opted in** — both surfaces are default-off:
 
-- **Autonomous work finder** (#3810, `LOOM_WORK_FINDER` / `autonomous.workFinder`): polls the forge for open, already-approved `loom:issue` items and auto-dispatches sweeps, with work-driven concurrency bounded by `min(available work, healthy tokens, free disk, maxConcurrent)` (#3811) and a reactive main-health backstop (#3812, `LOOM_MAIN_HEALTH_GATE` / `autonomous.mainHealthGate`) that halts dispatch when `main` goes red. Enable/tune from the `autonomous` block in `.loom/config.json` (precedence **env > config > default**) and manage the raw process with `loom-daemon-start.sh` / `loom-daemon-stop.sh` — see [Autonomous work finder](.loom/docs/daemon-reference.md#autonomous-work-finder-3810) and §Operability, plus "Daemon Configuration (Tier 2)" below.
+- **Autonomous work finder** (#3810, `LOOM_WORK_FINDER` / `autonomous.workFinder`): polls the forge for open, already-approved `loom:issue` items and auto-dispatches sweeps, with work-driven concurrency bounded by `min(available work, healthy tokens × perTokenConcurrency, free disk, maxConcurrent)` (#3811, per-token factor #3947 — default 2, `LOOM_PER_TOKEN_CONCURRENCY` / `autonomous.perTokenConcurrency`) and a reactive main-health backstop (#3812, `LOOM_MAIN_HEALTH_GATE` / `autonomous.mainHealthGate`) that halts dispatch when `main` goes red. Enable/tune from the `autonomous` block in `.loom/config.json` (precedence **env > config > default**) and manage the raw process with `loom-daemon-start.sh` / `loom-daemon-stop.sh` — see [Autonomous work finder](.loom/docs/daemon-reference.md#autonomous-work-finder-3810) and §Operability, plus "Daemon Configuration (Tier 2)" below.
 - **Epic supervisor** (#3842): drives every open `loom:epic` issue through a derived-state fork-join model with a phase-join barrier, serializing child-issue creation behind the #3707 issue-creation mutex on a dedicated off-runtime OS thread — see [Epic supervisor](.loom/docs/daemon-reference.md#epic-supervisor-3842).
 
 For full surface documentation — IPC request/response variants, event-bus internals, registry behaviour, reaper semantics — see [`.loom/docs/daemon-reference.md`](.loom/docs/daemon-reference.md).
@@ -341,6 +341,7 @@ The Rust `loom-daemon` binary is the load-bearing Tier 2 dispatch backend. It is
 ```json
 {
   "autonomous": {
+    "perTokenConcurrency": 2,
     "workFinder": { "enabled": true, "intervalSecs": 60, "maxConcurrent": 5 },
     "mainHealthGate": { "enabled": true }
   }

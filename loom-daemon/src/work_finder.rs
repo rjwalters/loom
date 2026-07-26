@@ -124,6 +124,23 @@ pub const WORK_FINDER_MAX_CONCURRENT_ENV: &str = "LOOM_WORK_FINDER_MAX_CONCURREN
 /// fixed target.
 pub const DEFAULT_WORK_FINDER_MAX_CONCURRENT: usize = 3;
 
+/// Environment variable setting the **per-token concurrency factor** (#3947).
+///
+/// The dynamic cap's token axis is `healthy_tokens × per_token_concurrency`, not
+/// the old implicit `healthy_tokens × 1`. A plan limit is a utilization-window
+/// token bucket (not a session count), so a single healthy account can run
+/// several concurrent sessions; this factor is how many. Precedence is the
+/// standard **env > config (`autonomous.perTokenConcurrency`) > default**. A
+/// zero / unparseable value is ignored (falls through to config/default).
+pub const PER_TOKEN_CONCURRENCY_ENV: &str = "LOOM_PER_TOKEN_CONCURRENCY";
+
+/// Default per-token concurrency factor (#3947). `2` — a conservative amount of
+/// session-window stacking that roughly doubles throughput off a small healthy
+/// set without pushing a single account near its concurrent-session ceiling. The
+/// #3909 rotating spread still fills distinct accounts first, so stacking only
+/// kicks in when concurrency demand exceeds the healthy-account count.
+pub const DEFAULT_PER_TOKEN_CONCURRENCY: usize = 2;
+
 /// Labels that disqualify an issue from dispatch even if it still appears in
 /// the `loom:issue`-filtered listing.
 ///
@@ -636,6 +653,11 @@ pub struct WorkFinderConfig {
     /// `autonomous.workFinder.maxConcurrent` — the operator concurrency ceiling
     /// (a zero/invalid value is dropped to `None`).
     pub max_concurrent: Option<usize>,
+    /// `autonomous.perTokenConcurrency` — how many concurrent sweeps to allow per
+    /// *healthy* token in the dynamic cap (#3947). Note this lives at the
+    /// `autonomous` level (not under `workFinder`), so it is read even when no
+    /// `workFinder` block is present. A zero/invalid value is dropped to `None`.
+    pub per_token_concurrency: Option<usize>,
 }
 
 /// Read `.loom/config.json → autonomous.workFinder`, soft-failing every field
@@ -667,21 +689,36 @@ pub fn read_work_finder_config(repo_root: &Path) -> WorkFinderConfig {
         }
     };
 
-    let Some(wf) = config.get("autonomous").and_then(|a| a.get("workFinder")) else {
+    let Some(autonomous) = config.get("autonomous") else {
         return WorkFinderConfig::default();
     };
 
+    // `perTokenConcurrency` lives at the `autonomous` level (#3947), so it is
+    // read even when the `workFinder` block is absent.
+    let per_token_concurrency = autonomous
+        .get("perTokenConcurrency")
+        .and_then(serde_json::Value::as_u64)
+        .filter(|&n| n > 0)
+        .and_then(|n| usize::try_from(n).ok());
+
+    // The `workFinder` sub-block is optional; each field independently falls
+    // through to `None` (env/default resolution) when absent.
+    let wf = autonomous.get("workFinder");
+
     WorkFinderConfig {
-        enabled: wf.get("enabled").and_then(serde_json::Value::as_bool),
+        enabled: wf
+            .and_then(|w| w.get("enabled"))
+            .and_then(serde_json::Value::as_bool),
         interval_secs: wf
-            .get("intervalSecs")
+            .and_then(|w| w.get("intervalSecs"))
             .and_then(serde_json::Value::as_u64)
             .filter(|&s| s > 0),
         max_concurrent: wf
-            .get("maxConcurrent")
+            .and_then(|w| w.get("maxConcurrent"))
             .and_then(serde_json::Value::as_u64)
             .filter(|&n| n > 0)
             .and_then(|n| usize::try_from(n).ok()),
+        per_token_concurrency,
     }
 }
 
@@ -715,8 +752,31 @@ pub fn resolve_max_concurrent_with_config(config: &WorkFinderConfig) -> usize {
         .unwrap_or(DEFAULT_WORK_FINDER_MAX_CONCURRENT)
 }
 
-/// Compute the **work-driven dynamic concurrency cap** (Phase B, #3811):
-/// `min(pool_size, disk_headroom, configured_max)`.
+/// Env override for the per-token concurrency factor — `None` when unset, zero,
+/// or unparseable (a zero factor would multiply the token axis to nothing).
+fn env_per_token_concurrency() -> Option<usize> {
+    std::env::var(PER_TOKEN_CONCURRENCY_ENV)
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|&n| n > 0)
+}
+
+/// Resolve the per-token concurrency factor with precedence **env > config >
+/// default** (#3947). Mirrors [`resolve_max_concurrent_with_config`]: the env
+/// var ([`PER_TOKEN_CONCURRENCY_ENV`]) wins, then
+/// `autonomous.perTokenConcurrency`, then [`DEFAULT_PER_TOKEN_CONCURRENCY`]. A
+/// zero/unparseable value at any layer is treated as absent so it never
+/// collapses the token axis to zero.
+#[must_use]
+pub fn resolve_per_token_concurrency(config: &WorkFinderConfig) -> usize {
+    env_per_token_concurrency()
+        .or(config.per_token_concurrency)
+        .unwrap_or(DEFAULT_PER_TOKEN_CONCURRENCY)
+}
+
+/// Compute the **work-driven dynamic concurrency cap** (Phase B, #3811;
+/// per-token concurrency factor added in #3947):
+/// `min(token_limit × per_token_concurrency, disk_headroom, configured_max)`.
 ///
 /// This is the total-concurrency ceiling for the loop, recomputed every tick
 /// from live inputs. It deliberately does **not** fold in the backlog depth:
@@ -727,25 +787,39 @@ pub fn resolve_max_concurrent_with_config(config: &WorkFinderConfig) -> usize {
 /// `loom:building` sweeps that are **not** in the ready backlog. Folding backlog
 /// into the cap here would under-utilize the pool whenever prior-tick sweeps are
 /// still running (a smaller "new work" number would cap total occupancy below
-/// the pool/disk ceiling). Keeping the cap as `min(pool, disk, configured)` and
-/// letting `tick` apply the backlog bound is what makes concurrency scale up
-/// with the backlog and drain to zero when it empties.
+/// the pool/disk ceiling). Keeping the cap as `min(token×factor, disk,
+/// configured)` and letting `tick` apply the backlog bound is what makes
+/// concurrency scale up with the backlog and drain to zero when it empties.
 ///
-/// The three bounds map directly to the resource each protects:
-/// - `pool_size` — never over-subscribe a rotated OAuth account (one live sweep
-///   per `.loom/tokens/*.token`).
+/// The bounds map directly to the resource each protects:
+/// - `token_limit` — the count of *healthy* accounts (or the raw pool when no
+///   ranking exists). **Multiplied by `per_token_concurrency`** (#3947): a plan
+///   limit is a utilization-window token bucket, not a session count, so one
+///   healthy account can comfortably run several concurrent sessions. Before
+///   #3947 the implicit factor was `1` (one sweep per account), which collapsed
+///   the whole fleet to cap 1 when 6/7 accounts were at their weekly ceiling
+///   even though the single healthy account had ample session-window headroom.
 /// - `disk_headroom` — never provision more worktrees than the scratch volume
 ///   can hold at `LOOM_PER_WORKTREE_GB` each.
 /// - `configured_max` — the operator ceiling
 ///   (`LOOM_WORK_FINDER_MAX_CONCURRENT`), a hard upper bound regardless of how
-///   much pool/disk headroom exists.
+///   much token/disk headroom exists.
+///
+/// `per_token_concurrency` is clamped to a floor of `1` so a mis-set `0`
+/// degrades to the pre-#3947 one-sweep-per-account behavior rather than
+/// dispatching nothing. `token_limit × factor` uses a saturating multiply so a
+/// pathological product can never wrap.
 #[must_use]
 pub fn resolve_dynamic_max_concurrent(
-    pool_size: usize,
+    token_limit: usize,
+    per_token_concurrency: usize,
     disk_headroom: usize,
     configured_max: usize,
 ) -> usize {
-    pool_size.min(disk_headroom).min(configured_max)
+    token_limit
+        .saturating_mul(per_token_concurrency.max(1))
+        .min(disk_headroom)
+        .min(configured_max)
 }
 
 // ============================================================================
@@ -770,12 +844,16 @@ pub fn resolve_dynamic_max_concurrent(
 /// the same footing as the reaper task
 /// ([`crate::sweep_registry::spawn_reaper_task`]). The per-tick disk probe shells
 /// out to `df` briefly, which is negligible on the 60s default interval.
+#[allow(clippy::too_many_arguments)] // dynamic-cap inputs + shared state; the
+                                     // multi-workspace variant ([`spawn_multi_work_finder_task`]) is the production
+                                     // path, this single-workspace form is retained for reference/tests.
 pub fn spawn_work_finder_task<S, D>(
     mut source: S,
     mut dispatcher: D,
     interval: Duration,
     workspace_root: PathBuf,
     configured_max: usize,
+    per_token_concurrency: usize,
     health_state: Arc<MainHealthState>,
     event_bus: Arc<EventBus>,
 ) -> tokio::task::JoinHandle<()>
@@ -785,7 +863,8 @@ where
 {
     log::info!(
         "work_finder: starting loop (interval={}s, configured_max={configured_max}, \
-         dynamic cap = min(healthy tokens, disk, configured_max))",
+         per_token_concurrency={per_token_concurrency}, \
+         dynamic cap = min(healthy tokens × per-token, disk, configured_max))",
         interval.as_secs()
     );
     tokio::spawn(async move {
@@ -815,11 +894,16 @@ where
             let ranking = capacity::read_ranking(&workspace_root);
             let token_limit = ranking.as_ref().map_or(pool_size, |r| r.available);
             let disk = disk_headroom_limit(&workspace_root);
-            let max_concurrent = resolve_dynamic_max_concurrent(token_limit, disk, configured_max);
+            let max_concurrent = resolve_dynamic_max_concurrent(
+                token_limit,
+                per_token_concurrency,
+                disk,
+                configured_max,
+            );
             log::debug!(
                 "work_finder: dynamic cap = {max_concurrent} (pool={pool_size}, \
-                 healthy_tokens={token_limit}, disk={disk}, configured_max={configured_max}, \
-                 halted={halted})"
+                 healthy_tokens={token_limit}, per_token={per_token_concurrency}, disk={disk}, \
+                 configured_max={configured_max}, halted={halted})"
             );
             match tick(&mut source, &mut dispatcher, max_concurrent, halted) {
                 Ok(report) => {
@@ -836,7 +920,8 @@ where
                     if report.dispatched > 0 || report.errors > 0 {
                         log::info!(
                             "work_finder: tick — cap {max_concurrent} (pool={pool_size}, \
-                             healthy={token_limit}, disk={disk}, ceiling={configured_max}); \
+                             healthy={token_limit}, per_token={per_token_concurrency}, disk={disk}, \
+                             ceiling={configured_max}); \
                              {} seen, {} dispatched, {} labeled-skip, {} in-flight-skip, \
                              {} deferred, {} error(s)",
                             report.seen,
@@ -910,12 +995,14 @@ pub fn spawn_multi_work_finder_task(
     fallback_root: PathBuf,
     interval: Duration,
     configured_max: usize,
+    per_token_concurrency: usize,
     health_states: Arc<WorkspaceHealthStates>,
     event_bus: Arc<EventBus>,
 ) -> tokio::task::JoinHandle<()> {
     log::info!(
         "work_finder: starting multi-workspace loop (interval={}s, configured_max={configured_max}, \
-         dynamic cap = min(healthy tokens, disk, configured_max), global across workspaces)",
+         per_token_concurrency={per_token_concurrency}, \
+         dynamic cap = min(healthy tokens × per-token, disk, configured_max), global across workspaces)",
         interval.as_secs()
     );
     tokio::spawn(async move {
@@ -934,7 +1021,12 @@ pub fn spawn_multi_work_finder_task(
             let ranking = capacity::read_ranking(&fallback_root);
             let token_limit = ranking.as_ref().map_or(pool_size, |r| r.available);
             let disk = disk_headroom_limit(&fallback_root);
-            let max_concurrent = resolve_dynamic_max_concurrent(token_limit, disk, configured_max);
+            let max_concurrent = resolve_dynamic_max_concurrent(
+                token_limit,
+                per_token_concurrency,
+                disk,
+                configured_max,
+            );
 
             // Resolve the current set of workspaces fresh each tick so registry
             // edits (add / remove / set-priority) are hot-applied.
@@ -963,8 +1055,9 @@ pub fn spawn_multi_work_finder_task(
 
             log::debug!(
                 "work_finder: dynamic cap = {max_concurrent} (pool={pool_size}, \
-                 healthy_tokens={token_limit}, disk={disk}, configured_max={configured_max}, \
-                 any_halted={any_halted}, workspaces={}, priorities={priorities:?})",
+                 healthy_tokens={token_limit}, per_token={per_token_concurrency}, disk={disk}, \
+                 configured_max={configured_max}, any_halted={any_halted}, workspaces={}, \
+                 priorities={priorities:?})",
                 pairs.len()
             );
 
@@ -985,7 +1078,8 @@ pub fn spawn_multi_work_finder_task(
             if report.dispatched > 0 || report.errors > 0 {
                 log::info!(
                     "work_finder: tick — cap {max_concurrent} (pool={pool_size}, \
-                     healthy={token_limit}, disk={disk}, ceiling={configured_max}); {} workspace(s), \
+                     healthy={token_limit}, per_token={per_token_concurrency}, disk={disk}, \
+                     ceiling={configured_max}); {} workspace(s), \
                      {} seen, {} dispatched, {} labeled-skip, {} in-flight-skip, {} deferred, \
                      {} error(s)",
                     pairs.len(),
@@ -1936,25 +2030,26 @@ mod tests {
     }
 
     // ===================================================================
-    // resolve_dynamic_max_concurrent — Phase B work-driven policy (#3811)
+    // resolve_dynamic_max_concurrent — Phase B work-driven policy (#3811),
+    // per-token concurrency factor (#3947)
     // ===================================================================
 
     #[test]
     fn test_dynamic_cap_is_min_of_three_inputs() {
-        // Never exceeds any of the three bounds.
-        assert_eq!(resolve_dynamic_max_concurrent(10, 10, 10), 10);
-        assert_eq!(resolve_dynamic_max_concurrent(2, 9, 9), 2, "pool binds");
-        assert_eq!(resolve_dynamic_max_concurrent(9, 3, 9), 3, "disk binds");
-        assert_eq!(resolve_dynamic_max_concurrent(9, 9, 4), 4, "ceiling binds");
+        // Never exceeds any of the three bounds (factor 1 = pre-#3947 semantics).
+        assert_eq!(resolve_dynamic_max_concurrent(10, 1, 10, 10), 10);
+        assert_eq!(resolve_dynamic_max_concurrent(2, 1, 9, 9), 2, "token axis binds");
+        assert_eq!(resolve_dynamic_max_concurrent(9, 1, 3, 9), 3, "disk binds");
+        assert_eq!(resolve_dynamic_max_concurrent(9, 1, 9, 4), 4, "ceiling binds");
     }
 
     #[test]
     fn test_dynamic_cap_pool_size_bound_never_over_subscribes() {
-        // With a large disk headroom and ceiling, the token-pool size is the
-        // hard bound — the cap never exceeds the number of usable accounts.
+        // With a large disk headroom and ceiling and factor 1, the token-pool
+        // size is the hard bound — the cap never exceeds the number of accounts.
         for pool in 0..=5 {
             assert_eq!(
-                resolve_dynamic_max_concurrent(pool, 100, 100),
+                resolve_dynamic_max_concurrent(pool, 1, 100, 100),
                 pool,
                 "cap must equal pool size {pool} when disk/ceiling are larger"
             );
@@ -1964,17 +2059,19 @@ mod tests {
     #[test]
     fn test_dynamic_cap_disk_headroom_bound() {
         // A nearly-full scratch volume (disk headroom 1) caps concurrency at 1
-        // even with a big pool and high ceiling.
-        assert_eq!(resolve_dynamic_max_concurrent(8, 1, 8), 1);
+        // even with a big pool, high ceiling, AND a big per-token factor (#3947):
+        // stacking never provisions more worktrees than the disk can hold.
+        assert_eq!(resolve_dynamic_max_concurrent(8, 4, 1, 8), 1);
         // A full volume (0 headroom) drops the cap to 0 — dispatch nothing.
-        assert_eq!(resolve_dynamic_max_concurrent(8, 0, 8), 0);
+        assert_eq!(resolve_dynamic_max_concurrent(8, 4, 0, 8), 0);
     }
 
     #[test]
     fn test_dynamic_cap_zero_pool_dispatches_nothing() {
-        // No usable tokens ⇒ cap 0 ⇒ a subsequent tick dispatches nothing (the
-        // spawn path would hard-fail EX_CONFIG anyway).
-        let cap = resolve_dynamic_max_concurrent(0, 10, 10);
+        // No usable tokens ⇒ cap 0 regardless of the factor (0 × N = 0) ⇒ a
+        // subsequent tick dispatches nothing (the spawn path would hard-fail
+        // EX_CONFIG anyway).
+        let cap = resolve_dynamic_max_concurrent(0, 2, 10, 10);
         assert_eq!(cap, 0);
         let mut source = FakeSource::once((1..=3).map(issue).collect());
         let mut disp = RecordingDispatcher::default();
@@ -1984,16 +2081,52 @@ mod tests {
         assert!(disp.dispatched.is_empty());
     }
 
+    #[test]
+    fn test_dynamic_cap_per_token_factor_multiplies_token_axis() {
+        // #3947 core: the token axis is `healthy × per-token`, not `healthy × 1`.
+        // 3 healthy accounts × factor 2 = 6, bounded only by disk/ceiling.
+        assert_eq!(resolve_dynamic_max_concurrent(3, 2, 100, 100), 6);
+        // 2 healthy × factor 3 = 6.
+        assert_eq!(resolve_dynamic_max_concurrent(2, 3, 100, 100), 6);
+        // The product is still clamped by disk and the operator ceiling.
+        assert_eq!(resolve_dynamic_max_concurrent(3, 2, 4, 100), 4, "disk clamps the product");
+        assert_eq!(resolve_dynamic_max_concurrent(3, 2, 100, 5), 5, "ceiling clamps the product");
+    }
+
+    #[test]
+    fn test_dynamic_cap_one_healthy_account_factor_two_dispatches_two() {
+        // The load-bearing #3947 scenario (6/7 accounts at their weekly ceiling):
+        // ONE healthy account with factor 2 must allow TWO concurrent sweeps —
+        // the pre-#3947 implicit 1:1 cap would have collapsed this to 1.
+        let cap = resolve_dynamic_max_concurrent(1, 2, 120, 3);
+        assert_eq!(cap, 2, "1 healthy × per-token 2 = 2 (disk 120, ceiling 3 don't bind)");
+
+        // And that cap actually dispatches 2 (not 1) against a 2-deep backlog.
+        let mut source = FakeSource::once((1..=2).map(issue).collect());
+        let mut disp = RecordingDispatcher::default();
+        let report = tick(&mut source, &mut disp, cap, false).unwrap();
+        assert_eq!(report.dispatched, 2, "1-healthy/factor-2 dispatches 2 concurrent sweeps");
+        assert_eq!(report.deferred_capacity, 0);
+        assert_eq!(disp.dispatched.len(), 2);
+    }
+
+    #[test]
+    fn test_dynamic_cap_zero_factor_degrades_to_one() {
+        // A mis-set factor 0 must NOT collapse the cap to zero — it degrades to
+        // the pre-#3947 one-sweep-per-account behavior (floor of 1).
+        assert_eq!(resolve_dynamic_max_concurrent(4, 0, 100, 100), 4);
+    }
+
     // ===================================================================
     // Dynamic cap composed with tick — scale-up / scale-to-zero (#3811)
     // ===================================================================
 
     #[test]
     fn test_scale_up_with_growing_backlog_bounded_by_dynamic_cap() {
-        // Fixed resources: pool=4, disk=10, ceiling=10 ⇒ dynamic cap 4. As the
-        // backlog grows tick-over-tick, effective concurrency scales up but is
-        // bounded by the cap (min(cap, backlog)).
-        let cap = resolve_dynamic_max_concurrent(4, 10, 10);
+        // Fixed resources: pool=4, factor=1, disk=10, ceiling=10 ⇒ dynamic cap 4.
+        // As the backlog grows tick-over-tick, effective concurrency scales up
+        // but is bounded by the cap (min(cap, backlog)).
+        let cap = resolve_dynamic_max_concurrent(4, 1, 10, 10);
         assert_eq!(cap, 4);
 
         // Backlog 2 (< cap): all 2 dispatch, nothing deferred.
@@ -2015,7 +2148,7 @@ mod tests {
     fn test_scale_to_zero_on_empty_backlog() {
         // Even with ample resources (cap 5), an empty backlog dispatches nothing
         // — no capacity is pre-reserved and no idle workers are spawned.
-        let cap = resolve_dynamic_max_concurrent(5, 5, 5);
+        let cap = resolve_dynamic_max_concurrent(5, 1, 5, 5);
         assert_eq!(cap, 5);
         let mut source = FakeSource::once(vec![]);
         let mut disp = RecordingDispatcher::default();
@@ -2066,7 +2199,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         write_config(
             tmp.path(),
-            r#"{"autonomous": {"workFinder": {"enabled": true, "intervalSecs": 90, "maxConcurrent": 5}}}"#,
+            r#"{"autonomous": {"perTokenConcurrency": 4, "workFinder": {"enabled": true, "intervalSecs": 90, "maxConcurrent": 5}}}"#,
         );
         assert_eq!(
             read_work_finder_config(tmp.path()),
@@ -2074,8 +2207,30 @@ mod tests {
                 enabled: Some(true),
                 interval_secs: Some(90),
                 max_concurrent: Some(5),
+                per_token_concurrency: Some(4),
             }
         );
+    }
+
+    #[test]
+    fn test_config_per_token_concurrency_read_without_work_finder_block() {
+        // `perTokenConcurrency` lives at the `autonomous` level (#3947), so it is
+        // read even when the `workFinder` sub-block is absent.
+        let tmp = tempfile::tempdir().unwrap();
+        write_config(tmp.path(), r#"{"autonomous": {"perTokenConcurrency": 3}}"#);
+        let cfg = read_work_finder_config(tmp.path());
+        assert_eq!(cfg.per_token_concurrency, Some(3));
+        assert_eq!(cfg.enabled, None);
+        assert_eq!(cfg.max_concurrent, None);
+    }
+
+    #[test]
+    fn test_config_zero_per_token_concurrency_drops_to_none() {
+        // A zero factor in config is treated as absent so it falls through to
+        // env/default rather than collapsing the token axis to zero.
+        let tmp = tempfile::tempdir().unwrap();
+        write_config(tmp.path(), r#"{"autonomous": {"perTokenConcurrency": 0}}"#);
+        assert_eq!(read_work_finder_config(tmp.path()).per_token_concurrency, None);
     }
 
     #[test]
@@ -2193,6 +2348,37 @@ mod tests {
         std::env::set_var(WORK_FINDER_MAX_CONCURRENT_ENV, "nope");
         assert_eq!(resolve_max_concurrent_with_config(&cfg), 8);
         std::env::remove_var(WORK_FINDER_MAX_CONCURRENT_ENV);
+    }
+
+    #[test]
+    #[serial]
+    fn test_resolve_per_token_concurrency_precedence() {
+        std::env::remove_var(PER_TOKEN_CONCURRENCY_ENV);
+
+        // Default (2) when neither env nor config set.
+        assert_eq!(
+            resolve_per_token_concurrency(&WorkFinderConfig::default()),
+            DEFAULT_PER_TOKEN_CONCURRENCY
+        );
+        assert_eq!(DEFAULT_PER_TOKEN_CONCURRENCY, 2);
+
+        // Config used when env unset.
+        let cfg = WorkFinderConfig {
+            per_token_concurrency: Some(4),
+            ..Default::default()
+        };
+        assert_eq!(resolve_per_token_concurrency(&cfg), 4);
+
+        // Env overrides config.
+        std::env::set_var(PER_TOKEN_CONCURRENCY_ENV, "3");
+        assert_eq!(resolve_per_token_concurrency(&cfg), 3);
+
+        // A zero/garbage env value is ignored; config still wins over default.
+        std::env::set_var(PER_TOKEN_CONCURRENCY_ENV, "0");
+        assert_eq!(resolve_per_token_concurrency(&cfg), 4);
+        std::env::set_var(PER_TOKEN_CONCURRENCY_ENV, "nope");
+        assert_eq!(resolve_per_token_concurrency(&cfg), 4);
+        std::env::remove_var(PER_TOKEN_CONCURRENCY_ENV);
     }
 
     // ===================================================================

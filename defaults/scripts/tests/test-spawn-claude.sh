@@ -194,6 +194,38 @@ assert_eq "SUCCESS" "$result" "exit=0 mentioning 'hit your session limit' is SUC
 result=$(classify_error "The plan was out of extra usage headroom last week." 0)
 assert_eq "SUCCESS" "$result" "exit=0 mentioning 'out of extra usage' is SUCCESS (#3233/#3738)"
 
+# --- SESSION_LIMIT vectors (issue #3947) ---
+# A concurrent-session-limit fault is a capacity signal (per-token stacking), NOT
+# quota exhaustion, so it classifies distinctly as SESSION_LIMIT and callers must
+# NOT mark the token bad. Checked BEFORE TOKEN_EXHAUSTED so the "session limit"
+# substring is not swallowed by the exhaustion regex.
+
+# Vector #30: explicit concurrent session limit → SESSION_LIMIT
+result=$(classify_error "Error: you have reached your concurrent session limit" 1)
+assert_eq "SESSION_LIMIT" "$result" "concurrent session limit -> SESSION_LIMIT (#3947)"
+
+# Vector #31: "maximum number of concurrent sessions" → SESSION_LIMIT
+result=$(classify_error "maximum number of concurrent sessions reached" 1)
+assert_eq "SESSION_LIMIT" "$result" "maximum number of concurrent sessions -> SESSION_LIMIT (#3947)"
+
+# Vector #32: "too many concurrent" → SESSION_LIMIT
+result=$(classify_error "429: too many concurrent requests for this account" 1)
+assert_eq "SESSION_LIMIT" "$result" "too many concurrent -> SESSION_LIMIT (#3947)"
+
+# Vector #33: "another session is already running" → SESSION_LIMIT
+result=$(classify_error "another session is already active for this token" 1)
+assert_eq "SESSION_LIMIT" "$result" "another session already active -> SESSION_LIMIT (#3947)"
+
+# Vector #34 (DISAMBIGUATION): a WEEKLY "session limit" (no concurrency wording)
+# stays TOKEN_EXHAUSTED — the capacity classifier must not steal quota faults.
+result=$(classify_error "You've hit your session limit · resets 4pm" 1)
+assert_eq "TOKEN_EXHAUSTED" "$result" "weekly 'session limit' stays TOKEN_EXHAUSTED (#3947 disambiguation)"
+
+# Vector #35 (REGRESSION, #3233): exit-0 output mentioning concurrent sessions in
+# prose is STILL SUCCESS — exit-code-first ordering wins over the new pattern.
+result=$(classify_error "Note: agents pause on a concurrent session limit." 0)
+assert_eq "SUCCESS" "$result" "exit=0 mentioning 'concurrent session' is SUCCESS (#3233/#3947)"
+
 # ============================================================
 # Section 2: spawn-claude.sh dispatch (with stub `claude`)
 # ============================================================

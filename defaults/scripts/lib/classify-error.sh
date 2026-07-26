@@ -9,6 +9,16 @@
 #       CWD_DELETED     — working directory was removed
 #       TOKEN_EXPIRED   — 401 / OAuth token expired (skip this token)
 #       TOKEN_EXHAUSTED — quota/weekly limit hit (rotate)
+#       SESSION_LIMIT   — concurrent-session-limit fault (issue #3947): the
+#                         account is NOT out of quota, it just cannot start
+#                         another *simultaneous* session right now (a capacity
+#                         fault from per-token session stacking). Callers must
+#                         re-select a different account and retry WITHOUT
+#                         marking the token bad — poisoning .bad_tokens for a
+#                         transient concurrency limit would wrongly shrink the
+#                         healthy pool. Classified BEFORE TOKEN_EXHAUSTED so the
+#                         "session limit" wording is not swallowed by the
+#                         weekly/usage-limit regex.
 #       MODEL_REFUSAL   — model safety classifier refused the turn
 #                         (stop_reason "refusal" on a non-zero-exit run);
 #                         a routing error, not a quality signal — the sweep
@@ -71,6 +81,19 @@ classify_error() {
     # Token expired (401 auth error) — this specific token is bad
     if echo "$output" | grep -qiE "401[^a-z]*authentication_error|OAuth token has expired|token has expired"; then
         echo "TOKEN_EXPIRED"
+        return
+    fi
+
+    # Concurrent-session-limit fault (issue #3947) — the account is healthy but
+    # cannot start another SIMULTANEOUS session right now. This is a capacity
+    # signal from per-token session stacking, NOT quota exhaustion, so it is
+    # classified distinctly and callers must NOT mark the token bad. Checked
+    # BEFORE TOKEN_EXHAUSTED because "concurrent session limit" contains the
+    # substring "session limit" that the exhaustion regex below also matches;
+    # the concurrency-specific wording ("concurrent", "simultaneous", "already
+    # running") disambiguates a capacity fault from a weekly/usage limit.
+    if echo "$output" | grep -qiE "concurrent (session|sessions|request)|maximum number of concurrent|too many concurrent|simultaneous session|another session is (already )?(active|running)"; then
+        echo "SESSION_LIMIT"
         return
     fi
 
