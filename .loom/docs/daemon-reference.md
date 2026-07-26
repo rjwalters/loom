@@ -873,7 +873,13 @@ concurrency ceiling 5" and share it with the team:
     "workFinder": {
       "enabled": true,
       "intervalSecs": 60,
-      "maxConcurrent": 5
+      "maxConcurrent": 5,
+      "quarantine": {
+        "enabled": true,
+        "threshold": 3,
+        "ttlSecs": 3600,
+        "instaCrashSecs": 60
+      }
     },
     "mainHealthGate": {
       "enabled": true
@@ -904,6 +910,10 @@ exactly like `main_health_gate::read_build_gate_config`.
 | `autonomous.workFinder.enabled` | `LOOM_WORK_FINDER` | `false` | Master on/off for the finder loop |
 | `autonomous.workFinder.intervalSecs` | `LOOM_WORK_FINDER_INTERVAL_SECS` | `60` | Zero/invalid → default |
 | `autonomous.workFinder.maxConcurrent` | `LOOM_WORK_FINDER_MAX_CONCURRENT` | `3` | Operator **ceiling**, not a fixed target |
+| `autonomous.workFinder.quarantine.enabled` | `LOOM_WORK_FINDER_QUARANTINE` | `true` | Insta-crash quarantine on/off (#3939). A safety backstop — defaults on |
+| `autonomous.workFinder.quarantine.threshold` | `LOOM_WORK_FINDER_QUARANTINE_THRESHOLD` | `3` | Consecutive insta-crashes before an issue is quarantined. Zero/invalid → default |
+| `autonomous.workFinder.quarantine.ttlSecs` | `LOOM_WORK_FINDER_QUARANTINE_TTL_SECS` | `3600` | How long a quarantine entry persists before auto-release. Zero/invalid → default |
+| `autonomous.workFinder.quarantine.instaCrashSecs` | `LOOM_WORK_FINDER_QUARANTINE_INSTA_CRASH_SECS` | `60` | Checkpoint-less death within this window of dispatch counts as an insta-crash. Zero/invalid → default |
 | `autonomous.perTokenConcurrency` | `LOOM_PER_TOKEN_CONCURRENCY` | `2` | Concurrent sweeps **per healthy token** in the cap (#3947). Zero/invalid → default; clamped to a floor of 1 |
 | `autonomous.mainHealthGate.enabled` | `LOOM_MAIN_HEALTH_GATE` | `false` | Gate loop on/off |
 | `autonomous.dispatchStaggerMs` | `LOOM_SWEEP_DISPATCH_STAGGER_MS` | `2000` | Min gap between consecutive child spawns (#3887). `0` disables |
@@ -988,6 +998,30 @@ comes from the separate top-level `buildGate` block (#3749); `autonomous.mainHea
 is purely the on/off surface, so Phase C's already-tested `buildGate` semantics
 are untouched. `LOOM_MAIN_HEALTH_GATE` remains the master override; the config
 key just lets a repo turn the gate on without exporting an env var.
+
+**Insta-crash quarantine (#3939).** The startup watchdog (#3887) and mid-build-death
+watchdog (#3895) both rescue a sweep that made *some* observable progress before
+dying. Neither covers the **insta-crash**: a child that dies within seconds of
+spawn — e.g. a missing token pool or a selector import failure (#3938) — is
+reaped, its `loom:building` claim restored to `loom:issue`, and the issue simply
+re-qualifies on the very next work-finder tick. Left unchecked this occupies a
+global concurrency slot forever and starves healthy candidates in other repos.
+The reaper now counts **consecutive** insta-crashes per issue — a terminal
+transition that wrote no phase checkpoint (never reached real work) and landed
+within `instaCrashSecs` of dispatch. A death *with* a checkpoint, or a clean/slow
+exit, resets the tally, so a genuine one-off failure never accretes toward
+quarantine. After `threshold` consecutive insta-crashes the issue is
+**quarantined**: the work finder skips it in-memory (no forge round-trip needed
+for the load-bearing behavior) and, best-effort, flips the forge labels
+(`loom:issue` → `loom:blocked`) with an explanatory comment so the pause is also
+visible to a human. Quarantine is visible per-repo in `loom-daemon status`
+(`quarantined (insta-crash, #3939): #123, #456`) and auto-releases after `ttlSecs`
+(or via `loom:blocked` removal) — a transient breakage (e.g. a re-provisioned
+token pool) recovers without operator action. In `tick_multi`, a quarantined
+candidate is dropped **before** the global slot-fill pass, so a workspace whose
+only candidates are quarantined never reserves a shared dispatch slot — healthy
+sibling work in other repos gets it instead. Defaults **on**; disable with
+`LOOM_WORK_FINDER_QUARANTINE=0` or `autonomous.workFinder.quarantine.enabled = false`.
 
 ### Prerequisite: a fresh token ranking (#3894)
 

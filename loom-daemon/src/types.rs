@@ -702,6 +702,14 @@ pub struct RepoStatus {
     /// dispatch, never the siblings'. Always `false` for a repo whose gate is
     /// disabled / has no `buildGate` block, or when the gate loop is off.
     pub health_gate_halted: bool,
+    /// Issue numbers currently quarantined for repeated insta-crashing in this
+    /// repo (Issue #3939), sorted ascending. The work finder skips these until
+    /// their TTL elapses (or an operator clears them), so this surfaces *why* a
+    /// repo with a visible backlog is dispatching nothing. Empty in the common
+    /// case. `#[serde(default)]` keeps pre-#3939 wire data / older clients
+    /// compatible (an absent field parses as an empty vec).
+    #[serde(default)]
+    pub quarantined_issues: Vec<u32>,
 }
 
 /// The token-capacity section of [`DaemonStatusReport`] (#3902).

@@ -305,6 +305,18 @@ pub trait WorkDispatcher {
     /// `Pending`) sweep — the authoritative "already in-flight" view.
     fn in_flight(&self) -> HashSet<u32>;
 
+    /// The set of issue numbers currently **quarantined** for repeated
+    /// insta-crashing (Issue #3939). The finder skips these entirely — they are
+    /// filtered out of the candidate list *before* the concurrency budget is
+    /// filled, so a workspace whose only candidates are quarantined never
+    /// reserves a shared dispatch slot (no cross-repo starvation).
+    ///
+    /// Defaults to empty so a dispatcher that does not model quarantine (e.g. a
+    /// test fake) opts out with zero boilerplate.
+    fn quarantined(&self) -> HashSet<u32> {
+        HashSet::new()
+    }
+
     /// Dispatch a build sweep for `issue`. Returns `true` when a **new** sweep
     /// was started, `false` when the dispatch was an idempotency no-op (a sweep
     /// with the same key was already running).
@@ -334,6 +346,10 @@ pub struct TickReport {
     pub skipped_in_flight: usize,
     /// Issues deferred to a future tick because the concurrency cap was reached.
     pub deferred_capacity: usize,
+    /// Issues skipped because they are quarantined for repeated insta-crashing
+    /// (Issue #3939). Filtered out before the concurrency budget is allocated, so
+    /// a quarantined candidate never consumes a shared dispatch slot.
+    pub skipped_quarantined: usize,
     /// Dispatch attempts that returned an error (logged, non-fatal).
     pub errors: usize,
     /// True when this tick dispatched nothing because the main-health gate
@@ -382,6 +398,7 @@ pub fn tick(
     }
 
     let in_flight = dispatcher.in_flight();
+    let quarantined = dispatcher.quarantined();
     let mut occupancy = in_flight.len();
 
     for item in ready {
@@ -393,6 +410,13 @@ pub fn tick(
         // 2. Authoritative in-flight dedup against the registry.
         if in_flight.contains(&item.number) {
             report.skipped_in_flight += 1;
+            continue;
+        }
+        // 2b. Insta-crash quarantine (#3939): skip a repeatedly-insta-crashing
+        //     issue rather than re-dispatching it every tick. Checked before the
+        //     capacity gate so a quarantined issue never consumes a slot.
+        if quarantined.contains(&item.number) {
+            report.skipped_quarantined += 1;
             continue;
         }
         // 3. Fixed concurrency cap — defer the rest to a future tick.
@@ -492,6 +516,13 @@ pub fn tick_multi<S: WorkSource, D: WorkDispatcher>(
     let in_flights: Vec<HashSet<u32>> = workspaces.iter().map(|(_, d)| d.in_flight()).collect();
     let mut occupancy: usize = in_flights.iter().map(HashSet::len).sum();
 
+    // Snapshot each workspace's quarantined set (#3939) alongside its in-flight
+    // set. Quarantined candidates are dropped in pass 1 *before* the global sort
+    // and slot fill, so a workspace whose only candidates are quarantined never
+    // reserves a shared dispatch slot — its slots go to healthy sibling work.
+    let quarantined_sets: Vec<HashSet<u32>> =
+        workspaces.iter().map(|(_, d)| d.quarantined()).collect();
+
     // Whether any workspace was gated this tick — folds down to the pre-#3930
     // single-flag semantics for a single (empty-registry) workspace.
     let mut any_halted = false;
@@ -536,6 +567,12 @@ pub fn tick_multi<S: WorkSource, D: WorkDispatcher>(
             }
             if in_flight.contains(&item.number) {
                 report.skipped_in_flight += 1;
+                continue;
+            }
+            // Insta-crash quarantine (#3939): drop before the candidate ever
+            // enters the global queue, so it consumes no shared slot.
+            if quarantined_sets[idx].contains(&item.number) {
+                report.skipped_quarantined += 1;
                 continue;
             }
             candidates.push(PriorityCandidate {
@@ -917,17 +954,19 @@ where
                         log::info!("work_finder: main-health gate cleared — resuming dispatch");
                     }
                     was_halted = report.halted;
-                    if report.dispatched > 0 || report.errors > 0 {
+                    if report.dispatched > 0 || report.errors > 0 || report.skipped_quarantined > 0
+                    {
                         log::info!(
                             "work_finder: tick — cap {max_concurrent} (pool={pool_size}, \
                              healthy={token_limit}, per_token={per_token_concurrency}, disk={disk}, \
                              ceiling={configured_max}); \
                              {} seen, {} dispatched, {} labeled-skip, {} in-flight-skip, \
-                             {} deferred, {} error(s)",
+                             {} quarantine-skip, {} deferred, {} error(s)",
                             report.seen,
                             report.dispatched,
                             report.skipped_labeled,
                             report.skipped_in_flight,
+                            report.skipped_quarantined,
                             report.deferred_capacity,
                             report.errors
                         );
@@ -1075,18 +1114,19 @@ pub fn spawn_multi_work_finder_task(
             }
             was_halted = report.halted;
 
-            if report.dispatched > 0 || report.errors > 0 {
+            if report.dispatched > 0 || report.errors > 0 || report.skipped_quarantined > 0 {
                 log::info!(
                     "work_finder: tick — cap {max_concurrent} (pool={pool_size}, \
                      healthy={token_limit}, per_token={per_token_concurrency}, disk={disk}, \
                      ceiling={configured_max}); {} workspace(s), \
-                     {} seen, {} dispatched, {} labeled-skip, {} in-flight-skip, {} deferred, \
-                     {} error(s)",
+                     {} seen, {} dispatched, {} labeled-skip, {} in-flight-skip, \
+                     {} quarantine-skip, {} deferred, {} error(s)",
                     pairs.len(),
                     report.seen,
                     report.dispatched,
                     report.skipped_labeled,
                     report.skipped_in_flight,
+                    report.skipped_quarantined,
                     report.deferred_capacity,
                     report.errors
                 );
@@ -1334,6 +1374,16 @@ pub mod forge {
             set
         }
 
+        fn quarantined(&self) -> HashSet<u32> {
+            match self.registry.lock() {
+                Ok(reg) => reg.quarantined_issues(),
+                Err(poisoned) => {
+                    log::error!("work_finder: sweep registry mutex poisoned ({poisoned:?})");
+                    HashSet::new()
+                }
+            }
+        }
+
         fn dispatch(&mut self, issue: u32) -> Result<bool> {
             let mut reg = self
                 .registry
@@ -1404,11 +1454,16 @@ mod tests {
         noop_issues: HashSet<u32>,
         /// Issue numbers whose dispatch should error.
         fail_issues: HashSet<u32>,
+        /// Issue numbers this dispatcher reports as quarantined (Issue #3939).
+        quarantined: HashSet<u32>,
     }
 
     impl WorkDispatcher for RecordingDispatcher {
         fn in_flight(&self) -> HashSet<u32> {
             self.in_flight.clone()
+        }
+        fn quarantined(&self) -> HashSet<u32> {
+            self.quarantined.clone()
         }
         fn dispatch(&mut self, issue: u32) -> Result<bool> {
             if self.fail_issues.contains(&issue) {
@@ -1498,6 +1553,64 @@ mod tests {
         assert_eq!(report.skipped_labeled, 3);
         assert_eq!(report.dispatched, 1);
         assert_eq!(disp.dispatched, vec![4]);
+    }
+
+    #[test]
+    fn test_tick_skips_quarantined_issue() {
+        // Insta-crash quarantine (#3939): a quarantined issue is skipped — never
+        // dispatched — and counted in `skipped_quarantined`, while its healthy
+        // siblings dispatch normally.
+        let mut source = FakeSource::once(vec![issue(1), issue(2), issue(3)]);
+        let mut disp = RecordingDispatcher {
+            quarantined: HashSet::from([2]),
+            ..Default::default()
+        };
+        let report = tick(&mut source, &mut disp, 10, false).unwrap();
+
+        assert_eq!(report.skipped_quarantined, 1, "#2 is quarantined");
+        assert_eq!(report.dispatched, 2, "#1 and #3 still dispatch");
+        assert_eq!(disp.dispatched, vec![1, 3], "#2 never dispatched");
+    }
+
+    #[test]
+    fn test_tick_quarantined_does_not_consume_capacity_slot() {
+        // The quarantine skip happens BEFORE the capacity gate, so a quarantined
+        // issue never reserves a slot: with cap 1 and #1 quarantined, #2 gets the
+        // slot rather than the tick deferring #2 behind a wasted #1 dispatch.
+        let mut source = FakeSource::once(vec![issue(1), issue(2)]);
+        let mut disp = RecordingDispatcher {
+            quarantined: HashSet::from([1]),
+            ..Default::default()
+        };
+        let report = tick(&mut source, &mut disp, 1, false).unwrap();
+
+        assert_eq!(report.skipped_quarantined, 1);
+        assert_eq!(report.dispatched, 1);
+        assert_eq!(disp.dispatched, vec![2], "the single slot goes to the healthy #2");
+    }
+
+    #[test]
+    fn test_tick_multi_quarantined_workspace_does_not_starve_sibling() {
+        // AC #3 (#3939): workspace A's only candidate is quarantined; workspace B
+        // has a healthy candidate. With a shared cap of 1, B's issue MUST be
+        // dispatched — a quarantined candidate never reserves the shared slot, so
+        // healthy sibling work is not starved.
+        let mut multi = vec![
+            (
+                FakeSource::once(vec![issue(1)]),
+                RecordingDispatcher {
+                    quarantined: HashSet::from([1]),
+                    ..Default::default()
+                },
+            ),
+            (FakeSource::once(vec![issue(10)]), RecordingDispatcher::default()),
+        ];
+        let report = tick_multi(&mut multi, &[], 1, &[false, false]);
+
+        assert_eq!(report.skipped_quarantined, 1, "workspace A's #1 is quarantined");
+        assert_eq!(report.dispatched, 1);
+        assert!(multi[0].1.dispatched.is_empty(), "quarantined workspace dispatches nothing");
+        assert_eq!(multi[1].1.dispatched, vec![10], "healthy sibling gets the shared slot");
     }
 
     #[test]

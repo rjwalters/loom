@@ -473,20 +473,26 @@ pub fn build_daemon_status(
     let mut per_repo: Vec<crate::types::RepoStatus> = Vec::with_capacity(roots.len());
     for root in &roots {
         let registry = workspace_pool.get_or_provision(root);
-        let live: Vec<crate::types::SweepInfo> = {
+        let (live, quarantined_issues): (Vec<crate::types::SweepInfo>, Vec<u32>) = {
             let sr = registry.lock().expect("Sweep registry mutex poisoned");
             // In-flight = sweeps still live (Pending / Running). Terminal sweeps
             // (Exited / Crashed) linger in the registry but are not "in flight".
-            sr.list(None)
+            let live = sr
+                .list(None)
                 .into_iter()
                 .filter(|info| !info.state.is_terminal())
-                .collect()
+                .collect();
+            // Insta-crash quarantine (#3939): surface which issues this repo is
+            // currently refusing to re-dispatch, so a repo with a visible backlog
+            // that is dispatching nothing is explained.
+            (live, sr.quarantined_issues_sorted())
         };
         per_repo.push(crate::types::RepoStatus {
             root: root.clone(),
             priority: workspace_registry.priority_of(root),
             in_flight_count: live.len(),
             health_gate_halted: health_states.is_halted(root),
+            quarantined_issues,
         });
         in_flight.extend(live);
     }
@@ -2383,6 +2389,7 @@ exit 0
                 priority: 100,
                 in_flight_count: 0,
                 health_gate_halted: true,
+                quarantined_issues: vec![101, 202],
             }],
         };
         let resp = Response::DaemonStatus(report);

@@ -327,6 +327,19 @@ async fn main() -> Result<()> {
     sweep.set_dispatch_stagger(dispatch_stagger);
     log::info!("sweep_registry: dispatch stagger = {}ms (#3887)", dispatch_stagger.as_millis());
 
+    // Insta-crash quarantine (#3939): resolve env > config > default for the
+    // default workspace so the reaper quarantines a repeatedly-insta-crashing
+    // issue instead of letting the work finder re-dispatch it every tick.
+    let quarantine_config = sweep_registry::resolve_quarantine_config(&sweep_workspace);
+    sweep.set_quarantine_config(quarantine_config);
+    log::info!(
+        "sweep_registry: insta-crash quarantine {} (threshold={}, ttl={}s, insta-crash<{}s) (#3939)",
+        if quarantine_config.enabled { "enabled" } else { "disabled" },
+        quarantine_config.threshold,
+        quarantine_config.ttl.as_secs(),
+        quarantine_config.insta_crash_secs
+    );
+
     let sweep_registry = Arc::new(Mutex::new(sweep));
     let _reaper_handle = sweep_registry::spawn_reaper_task(sweep_registry.clone());
 
@@ -1229,6 +1242,18 @@ fn print_status_human(report: &DaemonStatusReport, token_usage: Option<&serde_js
                 gate,
                 r.root.display()
             );
+            // Insta-crash quarantine (#3939): list the issues this repo is
+            // currently refusing to re-dispatch so a stalled-but-nonempty backlog
+            // is explained. Auto-releases on a TTL (or `loom:blocked` removal).
+            if !r.quarantined_issues.is_empty() {
+                let list = r
+                    .quarantined_issues
+                    .iter()
+                    .map(|n| format!("#{n}"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                println!("        quarantined (insta-crash, #3939): {list}");
+            }
         }
     }
 
