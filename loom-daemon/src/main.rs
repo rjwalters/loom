@@ -118,6 +118,42 @@ enum Commands {
         action: QuarantineAction,
     },
 
+    /// Dispatch a `/loom:sweep <issue>` via the running daemon (Issue #3952): a
+    /// first-class, non-MCP operator entry point over the same IPC `DispatchSweep`
+    /// request the `mcp__loom__dispatch_sweep` tool uses. Registry tracking, the
+    /// `loom:issue → loom:building` claim flip, and event publishing all come for
+    /// free — this is the resilient replacement for the hand-rolled
+    /// `LOOM_SWEEP_CLAIM_OWNED=<N>` + `spawn-claude.sh -p "/loom:sweep N"` pattern.
+    ///
+    /// Applies a bounded client-side ack timeout: if the daemon does not respond
+    /// within a few seconds the command exits nonzero with a clear error instead
+    /// of hanging (motivated by the 1800s MCP wedge in #3945).
+    Dispatch {
+        /// The issue number to dispatch a sweep for.
+        #[arg(value_name = "ISSUE")]
+        issue: u32,
+
+        /// Target managed-workspace root (Issue #3929 plumbing). Omit to dispatch
+        /// into the daemon's default workspace.
+        #[arg(long, value_name = "PATH")]
+        workspace: Option<String>,
+
+        /// Pin the spawned child to an explicit model (e.g. `sonnet`, `opus`).
+        /// Omit to let the daemon resolve `autonomous.model` / the shipped default.
+        #[arg(long, value_name = "M")]
+        model: Option<String>,
+
+        /// Reasoning-effort override forwarded to the spawned child.
+        #[arg(long, value_name = "E")]
+        effort: Option<String>,
+
+        /// Single parent issue for a stacked sweep (Issue #3729): the child
+        /// branches its worktree/PR off `feature/issue-<P>` instead of the default
+        /// branch.
+        #[arg(long, value_name = "P")]
+        depends_on: Option<u32>,
+    },
+
     /// Validate role configuration completeness
     Validate {
         /// Workspace directory containing .loom/config.json
@@ -214,6 +250,15 @@ async fn main() -> Result<()> {
             // `quarantine` connects to the running daemon over its Unix socket
             // (the quarantine state is in-memory), so it needs the async runtime.
             Commands::Quarantine { action } => handle_quarantine_command(action).await,
+            // `dispatch` connects to the running daemon over its Unix socket to
+            // enqueue a sweep (Issue #3952), so it needs the async runtime.
+            Commands::Dispatch {
+                issue,
+                workspace,
+                model,
+                effort,
+                depends_on,
+            } => handle_dispatch_command(issue, workspace, model, effort, depends_on).await,
             other => handle_cli_command(other),
         };
     }
@@ -721,6 +766,11 @@ fn handle_cli_command(command: Commands) -> Result<()> {
             // socket round-trip), never dispatched through this sync handler.
             unreachable!("Quarantine is handled in main() before handle_cli_command")
         }
+        Commands::Dispatch { .. } => {
+            // Routed directly in `main()` (it needs the async runtime for the
+            // socket round-trip), never dispatched through this sync handler.
+            unreachable!("Dispatch is handled in main() before handle_cli_command")
+        }
         Commands::Init {
             workspace,
             defaults,
@@ -1004,11 +1054,21 @@ async fn handle_quarantine_command(action: QuarantineAction) -> Result<()> {
 /// individually bounded so an unresponsive/wedged daemon cannot hang the CLI.
 /// Mirrors `query_daemon_status` but for arbitrary single-frame requests.
 async fn query_daemon(socket_path: &Path, request: &Request) -> Result<Response> {
-    const TIMEOUT: Duration = Duration::from_secs(5);
+    query_daemon_bounded(socket_path, request, Duration::from_secs(5)).await
+}
 
-    let stream = tokio::time::timeout(TIMEOUT, UnixStream::connect(socket_path))
+/// Like [`query_daemon`] but with a caller-supplied bound on both the connect
+/// and the round-trip (Issue #3952). Extracted so the `dispatch` subcommand can
+/// name its own ack budget and so the timeout path is unit-testable against a
+/// deliberately-unresponsive fake socket without a multi-second wait.
+async fn query_daemon_bounded(
+    socket_path: &Path,
+    request: &Request,
+    timeout: Duration,
+) -> Result<Response> {
+    let stream = tokio::time::timeout(timeout, UnixStream::connect(socket_path))
         .await
-        .map_err(|_| anyhow!("connect timed out after {}s", TIMEOUT.as_secs()))?
+        .map_err(|_| anyhow!("connect timed out after {}s", timeout.as_secs()))?
         .map_err(|e| anyhow!("connect failed: {e}"))?;
     let (reader, mut writer) = stream.into_split();
 
@@ -1027,9 +1087,142 @@ async fn query_daemon(socket_path: &Path, request: &Request) -> Result<Response>
         Ok::<Response, anyhow::Error>(response)
     };
 
-    tokio::time::timeout(TIMEOUT, roundtrip)
+    tokio::time::timeout(timeout, roundtrip)
         .await
-        .map_err(|_| anyhow!("round-trip timed out after {}s", TIMEOUT.as_secs()))?
+        .map_err(|_| anyhow!("round-trip timed out after {}s", timeout.as_secs()))?
+}
+
+/// Default bounded ack budget for the `dispatch` subcommand (Issue #3952).
+///
+/// Dispatch is emphatically **not** an immediate ack: `SweepRegistry::dispatch()`
+/// runs synchronously before replying, and its own documented internal budget for
+/// a legitimate, successful dispatch is comfortably multi-second. It flips the
+/// label via a blocking `gh issue edit` network round-trip, applies up to a 2s
+/// dispatch stagger (`DEFAULT_DISPATCH_STAGGER_MS`) under concurrent dispatch,
+/// and polls up to 5s (`TOKEN_NAME_CAPTURE_TIMEOUT`) for the child's account
+/// name (an explicitly anticipated graceful-degradation window) before falling
+/// back to `UNKNOWN_TOKEN_NAME`. A 5s client bound had essentially zero headroom
+/// over that and would false-fail on a real success. We therefore mirror
+/// `mcp-loom`'s `DISPATCH_TIMEOUT_MS` (`mcp-loom/src/tools/sweeps.ts`) of 30s for
+/// the identical underlying IPC call: real margin over the worst case, while
+/// still a bounded, finite value that never reproduces the ~1800s wedge of
+/// #3945. On expiry the CLI exits nonzero with a clear "is loom-daemon running?"
+/// message.
+const DISPATCH_ACK_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Env override for the dispatch ack budget, sharing the exact name
+/// `mcp-loom` uses (`LOOM_DAEMON_IPC_TIMEOUT_MS`) so a single operator-facing
+/// convention tunes the client-side IPC timeout across both surfaces.
+const DAEMON_IPC_TIMEOUT_ENV: &str = "LOOM_DAEMON_IPC_TIMEOUT_MS";
+
+/// Resolve the effective dispatch ack timeout.
+///
+/// Mirrors `mcp-loom`'s `Math.max(DISPATCH_TIMEOUT_MS, resolveDaemonIpcTimeoutMs())`
+/// semantics for `dispatch_sweep`: a positive-integer-millisecond
+/// `LOOM_DAEMON_IPC_TIMEOUT_MS` can only ever *raise* the bound above the 30s
+/// floor (for a slow forge / heavily-loaded daemon), never lower it — lowering
+/// it would reintroduce exactly the false-"did not ack" negative this widening
+/// fixes. An absent, empty, non-numeric, zero, or negative value falls back to
+/// the {@link DISPATCH_ACK_TIMEOUT} floor.
+fn resolve_dispatch_ack_timeout() -> Duration {
+    if let Ok(raw) = std::env::var(DAEMON_IPC_TIMEOUT_ENV) {
+        if let Ok(ms) = raw.trim().parse::<u64>() {
+            if ms > 0 {
+                return Duration::from_millis(ms).max(DISPATCH_ACK_TIMEOUT);
+            }
+        }
+    }
+    DISPATCH_ACK_TIMEOUT
+}
+
+/// Build the `DispatchSweep` IPC request from the `dispatch` subcommand's args
+/// (Issue #3952). Pure and side-effect-free so flag plumbing
+/// (`--workspace`/`--model`/`--effort`/`--depends-on`) is unit-testable without
+/// a socket. Mirrors the field mapping the `mcp__loom__dispatch_sweep` tool uses
+/// so both operator surfaces enqueue byte-for-byte-equivalent requests.
+fn build_dispatch_request(
+    issue: u32,
+    workspace: Option<String>,
+    model: Option<String>,
+    effort: Option<String>,
+    depends_on: Option<u32>,
+) -> Request {
+    Request::DispatchSweep {
+        kind: SweepKind::Issue(issue),
+        // The daemon derives its own idempotency key from the issue when this is
+        // absent; an operator dispatching by hand has no key to supply.
+        idempotency_key: None,
+        model,
+        effort,
+        depends_on,
+        workspace_root: workspace,
+    }
+}
+
+/// Handle the `dispatch` subcommand (Issue #3952). Connects to the running
+/// daemon over its Unix socket and enqueues a sweep via the same `DispatchSweep`
+/// request the MCP `dispatch_sweep` tool uses — but with a bounded client-side
+/// ack timeout so a wedged daemon can never hang the CLI (the #3945 failure
+/// mode). On success prints the sweep id + per-sweep log path and exits 0.
+async fn handle_dispatch_command(
+    issue: u32,
+    workspace: Option<String>,
+    model: Option<String>,
+    effort: Option<String>,
+    depends_on: Option<u32>,
+) -> Result<()> {
+    let socket_path = resolve_socket_path()?;
+    let request = build_dispatch_request(issue, workspace, model, effort, depends_on);
+    let ack_timeout = resolve_dispatch_ack_timeout();
+
+    match query_daemon_bounded(&socket_path, &request, ack_timeout).await {
+        Ok(Response::SweepDispatched {
+            sweep_id,
+            pid,
+            token_name,
+            log_path,
+        }) => {
+            println!("Dispatched sweep for issue #{issue}");
+            println!("  sweep id:  {sweep_id}");
+            println!("  pid:       {pid}");
+            // Surface a degraded token-name capture distinctly: the daemon fell
+            // back to `UNKNOWN_TOKEN_NAME` because the child hadn't logged its
+            // account-selection line within the capture window — a hint the
+            // dispatch was slow on the daemon side, not that it failed.
+            if token_name == sweep_registry::UNKNOWN_TOKEN_NAME {
+                println!("  token:     {token_name} (account not captured before ack — slow child startup)");
+            } else {
+                println!("  token:     {token_name}");
+            }
+            println!("  log path:  {}", log_path.display());
+            println!();
+            println!("Tail the sweep log with:");
+            println!("  tail -f {}", log_path.display());
+            Ok(())
+        }
+        Ok(Response::Error { message }) => {
+            eprintln!("Daemon rejected the dispatch: {message}");
+            std::process::exit(1);
+        }
+        Ok(Response::StructuredError(err)) => {
+            eprintln!("Daemon rejected the dispatch: {}", err.message);
+            std::process::exit(1);
+        }
+        Ok(other) => {
+            eprintln!("Unexpected response from daemon: {other:?}");
+            std::process::exit(1);
+        }
+        Err(e) => {
+            eprintln!(
+                "Daemon did not ack the dispatch within {}s ({e}) — is loom-daemon running?",
+                ack_timeout.as_secs()
+            );
+            eprintln!();
+            eprintln!("Start it with:");
+            eprintln!("  ./.loom/scripts/cli/loom-daemon-start.sh");
+            std::process::exit(1);
+        }
+    }
 }
 
 /// Collect per-token usage by shelling out to `loom-tokens check --json`,
@@ -1796,4 +1989,296 @@ fn handle_validate_command(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod dispatch_tests {
+    //! Tests for the `loom-daemon dispatch` subcommand (Issue #3952): flag
+    //! plumbing into the `DispatchSweep` IPC request, a successful round-trip
+    //! against a fake daemon, and the bounded-timeout path against a
+    //! deliberately-unresponsive socket (the #3945 wedge must never hang).
+    use super::{
+        build_dispatch_request, query_daemon_bounded, resolve_dispatch_ack_timeout,
+        DAEMON_IPC_TIMEOUT_ENV, DISPATCH_ACK_TIMEOUT,
+    };
+    use loom_daemon::types::{Request, Response, SweepKind};
+    use serial_test::serial;
+    use std::time::Duration;
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    use tokio::net::UnixListener;
+
+    /// `build_dispatch_request` maps every flag into the right `DispatchSweep`
+    /// field — the core plumbing acceptance criterion.
+    #[test]
+    fn build_dispatch_request_plumbs_all_flags() {
+        let request = build_dispatch_request(
+            3952,
+            Some("/some/repo".to_string()),
+            Some("sonnet".to_string()),
+            Some("high".to_string()),
+            Some(3945),
+        );
+        match request {
+            Request::DispatchSweep {
+                kind,
+                idempotency_key,
+                model,
+                effort,
+                depends_on,
+                workspace_root,
+            } => {
+                assert_eq!(kind, SweepKind::Issue(3952));
+                assert_eq!(idempotency_key, None);
+                assert_eq!(model.as_deref(), Some("sonnet"));
+                assert_eq!(effort.as_deref(), Some("high"));
+                assert_eq!(depends_on, Some(3945));
+                assert_eq!(workspace_root.as_deref(), Some("/some/repo"));
+            }
+            other => panic!("expected DispatchSweep, got {other:?}"),
+        }
+    }
+
+    /// With no optional flags the request carries only the issue kind and leaves
+    /// every override `None`, so the daemon applies its own defaults.
+    #[test]
+    fn build_dispatch_request_defaults_are_none() {
+        let request = build_dispatch_request(42, None, None, None, None);
+        match request {
+            Request::DispatchSweep {
+                kind,
+                model,
+                effort,
+                depends_on,
+                workspace_root,
+                ..
+            } => {
+                assert_eq!(kind, SweepKind::Issue(42));
+                assert!(model.is_none());
+                assert!(effort.is_none());
+                assert!(depends_on.is_none());
+                assert!(workspace_root.is_none());
+            }
+            other => panic!("expected DispatchSweep, got {other:?}"),
+        }
+    }
+
+    /// A fake daemon that accepts one connection, verifies the received request
+    /// is the expected `DispatchSweep`, and replies with `SweepDispatched`. This
+    /// exercises the full client round-trip: request serialization + flag
+    /// plumbing on the wire + response parsing.
+    #[tokio::test]
+    async fn round_trip_parses_dispatched_response_and_forwards_flags() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let socket_path = dir.path().join("daemon.sock");
+        let listener = UnixListener::bind(&socket_path).expect("bind");
+
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept");
+            let (reader, mut writer) = stream.into_split();
+            let mut lines = BufReader::new(reader).lines();
+            let line = lines.next_line().await.expect("read").expect("line");
+            let request: Request = serde_json::from_str(&line).expect("parse request");
+            // Assert the flags arrived intact on the wire.
+            match request {
+                Request::DispatchSweep {
+                    kind,
+                    model,
+                    effort,
+                    depends_on,
+                    workspace_root,
+                    ..
+                } => {
+                    assert_eq!(kind, SweepKind::Issue(3952));
+                    assert_eq!(model.as_deref(), Some("sonnet"));
+                    assert_eq!(effort.as_deref(), Some("high"));
+                    assert_eq!(depends_on, Some(3945));
+                    assert_eq!(workspace_root.as_deref(), Some("/repo"));
+                }
+                other => panic!("expected DispatchSweep, got {other:?}"),
+            }
+            let response = Response::SweepDispatched {
+                sweep_id: "sweep-abc".to_string(),
+                pid: 12345,
+                token_name: "agent-2.token".to_string(),
+                log_path: std::path::PathBuf::from(".loom/logs/sweep-issue-3952.log"),
+            };
+            let json = serde_json::to_string(&response).expect("serialize");
+            writer.write_all(json.as_bytes()).await.expect("write");
+            writer.write_all(b"\n").await.expect("newline");
+            writer.flush().await.expect("flush");
+        });
+
+        let request = build_dispatch_request(
+            3952,
+            Some("/repo".to_string()),
+            Some("sonnet".to_string()),
+            Some("high".to_string()),
+            Some(3945),
+        );
+        let response = query_daemon_bounded(&socket_path, &request, Duration::from_secs(5))
+            .await
+            .expect("round-trip ok");
+
+        match response {
+            Response::SweepDispatched {
+                sweep_id,
+                pid,
+                token_name,
+                log_path,
+            } => {
+                assert_eq!(sweep_id, "sweep-abc");
+                assert_eq!(pid, 12345);
+                assert_eq!(token_name, "agent-2.token");
+                assert_eq!(log_path, std::path::PathBuf::from(".loom/logs/sweep-issue-3952.log"));
+            }
+            other => panic!("expected SweepDispatched, got {other:?}"),
+        }
+
+        server.await.expect("server task");
+    }
+
+    /// An unresponsive daemon — accepts the connection but never replies —
+    /// must trip the bounded round-trip timeout rather than hang (the #3945
+    /// failure mode). The client returns an `Err` well before any 1800s wedge.
+    #[tokio::test]
+    async fn unresponsive_socket_times_out() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let socket_path = dir.path().join("daemon.sock");
+        let listener = UnixListener::bind(&socket_path).expect("bind");
+
+        // Accept the connection but deliberately never write a response, holding
+        // the stream open so the client's read blocks until its own timeout.
+        let server = tokio::spawn(async move {
+            let (_stream, _) = listener.accept().await.expect("accept");
+            tokio::time::sleep(Duration::from_secs(30)).await;
+        });
+
+        let request = build_dispatch_request(3952, None, None, None, None);
+        let started = std::time::Instant::now();
+        let result = query_daemon_bounded(&socket_path, &request, Duration::from_millis(200)).await;
+        let elapsed = started.elapsed();
+
+        assert!(result.is_err(), "expected a timeout error, got {result:?}");
+        let msg = result.unwrap_err().to_string();
+        assert!(msg.contains("timed out"), "error should mention the timeout, got: {msg}");
+        // It must return promptly (well under a second), never hang.
+        assert!(elapsed < Duration::from_secs(2), "timeout took too long: {elapsed:?}");
+
+        server.abort();
+    }
+
+    /// A missing socket (no daemon listening at all) surfaces a connect error
+    /// promptly — the operator's "is the daemon running?" case.
+    #[tokio::test]
+    async fn absent_socket_errors_fast() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let socket_path = dir.path().join("nonexistent.sock");
+
+        let request = build_dispatch_request(3952, None, None, None, None);
+        let result = query_daemon_bounded(&socket_path, &request, Duration::from_millis(500)).await;
+
+        assert!(result.is_err(), "expected a connect error, got {result:?}");
+    }
+
+    /// The documented middle case (issue #3952 review): a **legitimate, slow**
+    /// dispatch. The daemon does real synchronous work before acking — a
+    /// `gh issue edit` label flip, up to a 2s dispatch stagger, and up to a 5s
+    /// token-name capture window — so a successful ack can land well past the
+    /// old hardcoded 5s client bound. This fake daemon sleeps *past* that old
+    /// 5s bound before replying `SweepDispatched`, and the CLI's real default
+    /// budget ([`DISPATCH_ACK_TIMEOUT`], 30s) must still parse it as the success
+    /// it is — never misreport a real dispatch as "did not ack". Neither the
+    /// instant-ack round-trip nor the permanently-unresponsive stub exercises
+    /// this path.
+    #[tokio::test]
+    async fn slow_but_legitimate_ack_succeeds() {
+        // Sleep beyond the *old* 5s hardcoded bound so this test would have
+        // false-failed before the widening, proving the regression is fixed.
+        const SLOW_ACK: Duration = Duration::from_millis(5_500);
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let socket_path = dir.path().join("daemon.sock");
+        let listener = UnixListener::bind(&socket_path).expect("bind");
+
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept");
+            let (reader, mut writer) = stream.into_split();
+            let mut lines = BufReader::new(reader).lines();
+            let _ = lines.next_line().await.expect("read").expect("line");
+            // Model the daemon's synchronous pre-ack work (label flip + stagger +
+            // token-name poll) taking longer than the retired 5s client bound.
+            tokio::time::sleep(SLOW_ACK).await;
+            let response = Response::SweepDispatched {
+                sweep_id: "sweep-slow".to_string(),
+                pid: 4242,
+                token_name: "agent-1.token".to_string(),
+                log_path: std::path::PathBuf::from(".loom/logs/sweep-issue-3952.log"),
+            };
+            let json = serde_json::to_string(&response).expect("serialize");
+            writer.write_all(json.as_bytes()).await.expect("write");
+            writer.write_all(b"\n").await.expect("newline");
+            writer.flush().await.expect("flush");
+        });
+
+        let request = build_dispatch_request(3952, None, None, None, None);
+        let started = std::time::Instant::now();
+        // Use the CLI's real default budget — the exact value a plain
+        // `loom-daemon dispatch` resolves to with no env override.
+        let result = query_daemon_bounded(&socket_path, &request, DISPATCH_ACK_TIMEOUT).await;
+        let elapsed = started.elapsed();
+
+        match result {
+            Ok(Response::SweepDispatched { sweep_id, .. }) => {
+                assert_eq!(sweep_id, "sweep-slow");
+            }
+            other => panic!("expected a slow-but-successful SweepDispatched, got {other:?}"),
+        }
+        // The daemon genuinely took longer than the retired 5s bound — this
+        // asserts the test exercised the slow path rather than acking instantly.
+        assert!(
+            elapsed >= Duration::from_secs(5),
+            "slow-ack test should have waited past the old 5s bound, took: {elapsed:?}"
+        );
+
+        server.await.expect("server task");
+    }
+
+    /// The 30s floor is the default when the override env var is absent — real
+    /// headroom over the daemon's documented worst-case internal dispatch budget.
+    #[test]
+    #[serial]
+    fn resolve_dispatch_ack_timeout_defaults_to_floor() {
+        std::env::remove_var(DAEMON_IPC_TIMEOUT_ENV);
+        assert_eq!(resolve_dispatch_ack_timeout(), DISPATCH_ACK_TIMEOUT);
+        assert_eq!(DISPATCH_ACK_TIMEOUT, Duration::from_secs(30));
+    }
+
+    /// `LOOM_DAEMON_IPC_TIMEOUT_MS` mirrors `mcp-loom`'s `Math.max` semantics:
+    /// it can only *raise* the bound above the 30s floor (never lower it, which
+    /// would reintroduce the false-negative), and any invalid / non-positive
+    /// value falls back to the floor. A single test owns this env var so its
+    /// mutation never races a parallel reader.
+    #[test]
+    #[serial]
+    fn resolve_dispatch_ack_timeout_env_raises_only() {
+        // Above the floor → raised.
+        std::env::set_var(DAEMON_IPC_TIMEOUT_ENV, "60000");
+        assert_eq!(resolve_dispatch_ack_timeout(), Duration::from_secs(60));
+
+        // Below the floor → clamped up to the 30s floor (never lowered).
+        std::env::set_var(DAEMON_IPC_TIMEOUT_ENV, "1000");
+        assert_eq!(resolve_dispatch_ack_timeout(), DISPATCH_ACK_TIMEOUT);
+
+        // Zero / negative / non-numeric / empty → floor.
+        for bad in ["0", "-5", "garbage", "", "  "] {
+            std::env::set_var(DAEMON_IPC_TIMEOUT_ENV, bad);
+            assert_eq!(
+                resolve_dispatch_ack_timeout(),
+                DISPATCH_ACK_TIMEOUT,
+                "value {bad:?} should fall back to the floor"
+            );
+        }
+
+        std::env::remove_var(DAEMON_IPC_TIMEOUT_ENV);
+    }
 }
