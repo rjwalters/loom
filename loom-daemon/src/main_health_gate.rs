@@ -81,6 +81,13 @@ const GATE_POLL_INTERVAL: Duration = Duration::from_millis(200);
 /// line (the *tail* is kept — the failing assertion is usually last).
 const MAX_OUTPUT_TAIL_BYTES: usize = 4096;
 
+/// Throttle interval for the repeated "gate run SKIPPED" log line (#3950
+/// AC2). A dirty workspace logs once immediately on the clean→dirty
+/// transition, then at most once per this interval while it stays dirty —
+/// down from logging on *every* ~30s tick (2,000+ lines/day observed on the
+/// canary host from a single stuck-dirty repo).
+const SKIP_WARN_THROTTLE: Duration = Duration::from_secs(3600);
+
 // ============================================================================
 // Shared halt state
 // ============================================================================
@@ -95,6 +102,20 @@ const MAX_OUTPUT_TAIL_BYTES: usize = 4096;
 pub struct MainHealthState {
     /// Whether autonomous dispatch is currently halted due to a red `main`.
     halted: AtomicBool,
+    /// Whether the most recent gate tick was `Skipped` (indeterminate — the
+    /// workspace tree had unexpected dirt and the gate did not run at all).
+    /// Tracked separately from `halted` so status can distinguish "not
+    /// evaluated (dirty tree)" from "halted (red main)" (#3950 AC3): the two
+    /// can even both be `true` at once (main was red before the tree went
+    /// dirty; dispatch remains halted from that prior red run while
+    /// evaluation is now skipped). `false` for a fresh state and after any
+    /// completed (non-skip) tick.
+    skipped: AtomicBool,
+    /// Throttle bookkeeping for the skip-warn log line (#3950 AC2): the
+    /// instant the warning was last emitted for the *current* dirty streak.
+    /// Reset to `None` whenever a tick is not skipped, so the next dirty
+    /// streak logs immediately again on its first tick.
+    last_skip_warn: Mutex<Option<Instant>>,
 }
 
 impl MainHealthState {
@@ -106,6 +127,8 @@ impl MainHealthState {
     pub fn new() -> Self {
         Self {
             halted: AtomicBool::new(false),
+            skipped: AtomicBool::new(false),
+            last_skip_warn: Mutex::new(None),
         }
     }
 
@@ -118,6 +141,38 @@ impl MainHealthState {
     /// Set the halt flag directly (primarily for tests / explicit control).
     pub fn set_halted(&self, halted: bool) {
         self.halted.store(halted, Ordering::SeqCst);
+    }
+
+    /// Whether the most recent gate tick was `Skipped` (dirty tree) — see the
+    /// field doc on [`Self::skipped`].
+    #[must_use]
+    pub fn is_skipped(&self) -> bool {
+        self.skipped.load(Ordering::SeqCst)
+    }
+
+    /// Record this tick's skip/non-skip outcome and report whether the
+    /// skip-warn log line should fire now (#3950 AC2): `true` exactly once on
+    /// a not-skipped -> skipped transition, then at most once per `throttle`
+    /// while the tree remains dirty. Always `false` when `is_skip` is
+    /// `false`, which also clears the throttle timer so the next dirty streak
+    /// warns immediately again. Call this exactly once per tick, alongside
+    /// [`apply_gate_outcome`].
+    pub fn note_gate_tick(&self, is_skip: bool, throttle: Duration) -> bool {
+        let was_skipped = self.skipped.swap(is_skip, Ordering::SeqCst);
+        let mut last = self
+            .last_skip_warn
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !is_skip {
+            *last = None;
+            return false;
+        }
+        let now = Instant::now();
+        let should_warn = !was_skipped || last.is_none_or(|t| now.duration_since(t) >= throttle);
+        if should_warn {
+            *last = Some(now);
+        }
+        should_warn
     }
 }
 
@@ -184,6 +239,18 @@ impl WorkspaceHealthStates {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         map.get(root).is_some_and(|s| s.is_halted())
+    }
+
+    /// Whether `root`'s most recent gate tick was `Skipped` (dirty tree —
+    /// "not evaluated", #3950 AC3). A never-seen root reports `false` — no
+    /// gate has run against it.
+    #[must_use]
+    pub fn is_skipped(&self, root: &Path) -> bool {
+        let map = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        map.get(root).is_some_and(|s| s.is_skipped())
     }
 
     /// Directly set `root`'s halt flag (creating its state if absent). Primarily
@@ -422,6 +489,93 @@ impl GateRunner for CommandGateRunner {
 }
 
 // ============================================================================
+// Dirty-tree ignore list (#3778 transient paths + build-artifact lockfiles,
+// #3950)
+// ============================================================================
+
+/// Loom-owned transient state path prefixes the gate's dirty-tree check
+/// ignores when deciding whether the workspace is safe to sync/reset before a
+/// run (#3950). Mirrors `.loom/scripts/check-main-clean.sh`'s
+/// `LOOM_OWNED_PREFIXES` — kept in sync manually since one lives in bash and
+/// the other in Rust, but both exist to solve the same #3778 problem: Loom's
+/// own runtime bookkeeping showing up as "dirty" and false-positiving a check
+/// that exists to protect *real* operator edits. A prefix ending in `/`
+/// matches a directory subtree; the others match an exact path.
+const LOOM_OWNED_PREFIXES: &[&str] = &[
+    ".loom/sweep-checkpoint/",
+    ".loom/sweep-run/",
+    ".loom/tokens/",
+    ".loom/accounts.env",
+    ".loom/exit-codes/",
+    ".loom/stats/",
+    ".loom/CANARY",
+    ".loom/spawn-loop.pid",
+    ".loom/spawn-loop-state.json",
+    ".loom/stop-spawn-loop",
+    ".loom/locks/",
+    ".loom/logs/",
+    ".loom/worktrees/",
+    ".loom-managed",
+];
+
+/// Common regenerable lockfile basenames (#3950): a package manager can
+/// rewrite one of these with no dependency change (formatting/ordering churn
+/// from a `buildGate.command` step like `pnpm install`), leaving tracked-file
+/// dirt that would otherwise wedge the dirty-tree check indefinitely — the
+/// reported symptom was a lone modified `mcp-loom/package-lock.json`
+/// disabling the gate for the whole repo, every tick, forever (a hard reset
+/// would have discarded it, but the check refused to run one). Matched by
+/// exact basename anywhere in the tree: a small, well-known, documented set,
+/// not a repo-specific hardcode.
+const BUILD_ARTIFACT_LOCKFILE_BASENAMES: &[&str] = &[
+    "package-lock.json",
+    "pnpm-lock.yaml",
+    "yarn.lock",
+    "Cargo.lock",
+    "uv.lock",
+];
+
+/// Whether `path` (a repo-relative path from `git status --porcelain`) is
+/// ignorable dirt for the gate's dirty-tree check — either a Loom-owned
+/// transient path ([`LOOM_OWNED_PREFIXES`]) or a common regenerable lockfile
+/// ([`BUILD_ARTIFACT_LOCKFILE_BASENAMES`]). Ignorable dirt is dirt a hard
+/// reset to `origin/main` safely discards (it is either untracked Loom
+/// runtime state or a tracked file whose content the reset will overwrite
+/// anyway) — never a reason to skip the sync step.
+fn is_ignorable_dirt(path: &str) -> bool {
+    let loom_owned = LOOM_OWNED_PREFIXES.iter().any(|prefix| {
+        if prefix.ends_with('/') {
+            path.starts_with(prefix)
+        } else {
+            path == *prefix
+        }
+    });
+    if loom_owned {
+        return true;
+    }
+    let basename = path.rsplit('/').next().unwrap_or(path);
+    BUILD_ARTIFACT_LOCKFILE_BASENAMES.contains(&basename)
+}
+
+/// Parse `git status --porcelain` v1 `output` and return the lines that are
+/// **not** ignorable dirt ([`is_ignorable_dirt`]) — the lines that must still
+/// be treated as "the workspace is dirty" for the gate's sync-before-run
+/// check. Rename lines (`R  old -> new`) are keyed on the new path. Empty
+/// lines are dropped.
+fn non_ignorable_dirt(output: &str) -> Vec<&str> {
+    output
+        .lines()
+        .filter(|line| !line.is_empty())
+        .filter(|line| {
+            let path = line.get(3..).unwrap_or("");
+            let path = path.rsplit(" -> ").next().unwrap_or(path);
+            let path = path.trim_matches('"');
+            !is_ignorable_dirt(path)
+        })
+        .collect()
+}
+
+// ============================================================================
 // Workspace preparation — sync to origin/main before a gate run (#3885)
 // ============================================================================
 
@@ -471,6 +625,39 @@ fn run_git(repo_root: &Path, args: &[&str]) -> std::result::Result<(String, Stri
     }
 }
 
+/// Run `git status --porcelain` in `repo_root` and return its **raw** stdout,
+/// trimmed only of *trailing* whitespace. Unlike [`run_git`] (whose blanket
+/// `.trim()` is fine for its single-value call sites), the porcelain v1
+/// format is column-sensitive: the very first status line can legitimately
+/// start with a space (e.g. `" M file"` — unstaged modification of a tracked
+/// file), and [`run_git`]'s leading-whitespace trim would eat that space and
+/// misalign every downstream column-offset parse ([`non_ignorable_dirt`],
+/// #3950). Trailing trim is still safe — trailing whitespace never carries
+/// meaning in porcelain output.
+fn git_status_porcelain(repo_root: &Path) -> std::result::Result<String, String> {
+    let output = Command::new("git")
+        .args(["status", "--porcelain"])
+        .current_dir(repo_root)
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|e| format!("failed to spawn `git status --porcelain`: {e}"))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        return Err(format!(
+            "`git status --porcelain` exited with {}{}",
+            output.status,
+            if stderr.is_empty() {
+                String::new()
+            } else {
+                format!(": {stderr}")
+            }
+        ));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout)
+        .trim_end()
+        .to_string())
+}
+
 /// Prepare `repo_root` to reflect `origin/main` before a gate run.
 ///
 /// The hybrid safe policy from Issue #3885:
@@ -510,12 +697,20 @@ pub fn prepare_workspace_to_origin_main(repo_root: &Path) -> PrepOutcome {
         };
     }
 
-    // 2. Clean tree? `git status --porcelain` emits one line per change.
-    match run_git(repo_root, &["status", "--porcelain"]) {
-        Ok((out, _)) => {
-            if !out.is_empty() {
+    // 2. Clean tree? `git status --porcelain` emits one line per change. Lines
+    // that are ignorable dirt (#3950 — Loom-owned transient paths / common
+    // regenerable lockfiles, see `non_ignorable_dirt`) are excluded from this
+    // decision: they are known-regenerable noise a hard reset safely
+    // discards, not operator edits worth protecting.
+    match git_status_porcelain(repo_root) {
+        Ok(out) => {
+            let unexpected = non_ignorable_dirt(&out);
+            if !unexpected.is_empty() {
                 return PrepOutcome::Skip {
-                    reason: "workspace has local changes — skipping gate (will not hard-reset over operator edits)".to_string(),
+                    reason: format!(
+                        "workspace has local changes — skipping gate (will not hard-reset over operator edits): {}",
+                        unexpected.join(", ")
+                    ),
                 };
             }
         }
@@ -712,6 +907,29 @@ pub fn apply_gate_outcome(state: &MainHealthState, outcome: &GateOutcome) -> Hea
     }
 }
 
+/// Apply `outcome` to `state`, then render it via `log_fn` — throttling the
+/// repeated "gate run SKIPPED" line to at most once per [`SKIP_WARN_THROTTLE`]
+/// after its first (not-skipped -> skipped) occurrence (#3950 AC2). Every
+/// other transition (green/red, and the clean->dirty transition itself) logs
+/// unthrottled via `log_fn` exactly as before. `log_fn` renders the actual
+/// `HealthTransition`/`GateOutcome` pair — the single- vs multi-workspace
+/// loops pass different renderers (the latter also names the repo root).
+fn apply_and_log<F>(state: &MainHealthState, outcome: &GateOutcome, log_fn: F)
+where
+    F: Fn(HealthTransition, &GateOutcome),
+{
+    let transition = apply_gate_outcome(state, outcome);
+    let should_warn = state.note_gate_tick(outcome.is_skipped(), SKIP_WARN_THROTTLE);
+    if matches!(transition, HealthTransition::Skipped) && !should_warn {
+        log::debug!(
+            "main_health_gate: gate run SKIPPED (throttled) — {} (halt state unchanged)",
+            outcome.detail()
+        );
+        return;
+    }
+    log_fn(transition, outcome);
+}
+
 /// Log a health transition at a severity matching its significance.
 fn log_transition(transition: HealthTransition, outcome: &GateOutcome) {
     match transition {
@@ -895,11 +1113,11 @@ where
                     // in a permanently-halted state, then stop the loop.
                     log::error!("main_health_gate: gate run task panicked ({e}); clearing halt and stopping loop");
                     health_state.set_halted(false);
+                    health_state.note_gate_tick(false, SKIP_WARN_THROTTLE);
                     return;
                 }
             };
-            let transition = apply_gate_outcome(&health_state, &outcome);
-            log_transition(transition, &outcome);
+            apply_and_log(&health_state, &outcome, log_transition);
         }
     })
 }
@@ -987,8 +1205,11 @@ pub fn spawn_multi_main_health_gate_task(
                 // switch, when set, applies to every root uniformly; when unset,
                 // each repo's own config decides.
                 if !resolve_enabled(&read_autonomous_gate_config(&root)) {
-                    // Disabled ⇒ always green for this repo (clear any stale halt).
-                    health_states.set_halted(&root, false);
+                    // Disabled ⇒ always green for this repo (clear any stale halt
+                    // and any stale skip/dirty state).
+                    let state = health_states.get_or_create(&root);
+                    state.set_halted(false);
+                    state.note_gate_tick(false, SKIP_WARN_THROTTLE);
                     continue;
                 }
                 let Some(gate_config) = read_build_gate_config(&root) else {
@@ -996,7 +1217,9 @@ pub fn spawn_multi_main_health_gate_task(
                         "main_health_gate: {} enabled but no usable buildGate config — treating as green",
                         root.display()
                     );
-                    health_states.set_halted(&root, false);
+                    let state = health_states.get_or_create(&root);
+                    state.set_halted(false);
+                    state.note_gate_tick(false, SKIP_WARN_THROTTLE);
                     continue;
                 };
 
@@ -1010,8 +1233,10 @@ pub fn spawn_multi_main_health_gate_task(
                 .await;
                 match joined {
                     Ok(outcome) => {
-                        let transition = apply_gate_outcome(&state, &outcome);
-                        log_transition_for_root(&root, transition, &outcome);
+                        let root_for_log = root.clone();
+                        apply_and_log(&state, &outcome, move |transition, outcome| {
+                            log_transition_for_root(&root_for_log, transition, outcome);
+                        });
                     }
                     Err(e) => {
                         // The blocking task panicked; clear this repo's halt so a
@@ -1022,6 +1247,7 @@ pub fn spawn_multi_main_health_gate_task(
                             root.display()
                         );
                         state.set_halted(false);
+                        state.note_gate_tick(false, SKIP_WARN_THROTTLE);
                     }
                 }
             }
@@ -1465,6 +1691,155 @@ mod tests {
         );
     }
 
+    // ===================================================================
+    // Ignore-list: Loom-owned transient paths + build-artifact lockfiles
+    // (#3950 AC1) — the dirty-tree check must not block on these.
+    // ===================================================================
+
+    #[test]
+    fn test_is_ignorable_dirt_loom_owned_prefixes() {
+        assert!(is_ignorable_dirt(".loom/logs/sweep-issue-1.log"));
+        assert!(is_ignorable_dirt(".loom/worktrees/issue-42/foo.rs"));
+        assert!(is_ignorable_dirt(".loom/tokens/agent-1.token"));
+        assert!(is_ignorable_dirt(".loom/sweep-checkpoint/issue-1.json"));
+        assert!(is_ignorable_dirt(".loom/accounts.env"));
+        assert!(is_ignorable_dirt(".loom-managed"));
+    }
+
+    #[test]
+    fn test_is_ignorable_dirt_lockfile_basenames() {
+        assert!(is_ignorable_dirt("mcp-loom/package-lock.json"));
+        assert!(is_ignorable_dirt("package-lock.json"));
+        assert!(is_ignorable_dirt("some/nested/dir/Cargo.lock"));
+        assert!(is_ignorable_dirt("pnpm-lock.yaml"));
+    }
+
+    #[test]
+    fn test_is_ignorable_dirt_rejects_unknown_paths() {
+        // A genuine operator edit outside both lists must never be ignored.
+        assert!(!is_ignorable_dirt("src/main.rs"));
+        assert!(!is_ignorable_dirt("scratch.tmp"));
+        // A path that merely starts with ".loom" but isn't one of the listed
+        // transient subtrees (e.g. a hypothetical ".loom/config.json" edit)
+        // must NOT be ignored — only the explicitly listed prefixes count.
+        assert!(!is_ignorable_dirt(".loom/config.json"));
+    }
+
+    #[test]
+    fn test_non_ignorable_dirt_filters_porcelain_lines() {
+        let status = "?? .loom/logs/foo.log\n M mcp-loom/package-lock.json\n M src/main.rs\n";
+        let remaining = non_ignorable_dirt(status);
+        assert_eq!(remaining, vec![" M src/main.rs"]);
+    }
+
+    #[test]
+    fn test_non_ignorable_dirt_empty_when_all_ignorable() {
+        let status = "?? .loom/logs/foo.log\n M package-lock.json\n";
+        assert!(non_ignorable_dirt(status).is_empty());
+    }
+
+    /// AC1(a): a workspace with ONLY Loom-owned transient paths dirty must NOT
+    /// block the gate (prep proceeds to sync/reset, not Skip).
+    #[test]
+    fn test_prepare_ignores_loom_owned_transient_dirt() {
+        let (_origin, clone) = make_origin_and_clone();
+        // Realistic repo shape: `.loom/config.json` is a tracked, committed
+        // file (every installed Loom repo has one) — so `.loom/` itself is
+        // never a wholly-untracked directory that `git status --porcelain`
+        // could collapse into one opaque `?? .loom/` line. Without this,
+        // `.loom/logs/...` below would report as `?? .loom/` (the whole
+        // subtree), which no single ignore-list prefix matches.
+        std::fs::create_dir_all(clone.path().join(".loom")).unwrap();
+        std::fs::write(clone.path().join(".loom/config.json"), "{}\n").unwrap();
+        Command::new("git")
+            .args(["add", ".loom/config.json"])
+            .current_dir(clone.path())
+            .status()
+            .unwrap();
+        Command::new("git")
+            .args(["commit", "-m", "add .loom/config.json"])
+            .current_dir(clone.path())
+            .status()
+            .unwrap();
+        // Push so this commit is on `origin/main` too — otherwise the clone
+        // would be (correctly) skipped as "ahead of origin" by step 4,
+        // unrelated to the dirty-tree behavior this test targets.
+        Command::new("git")
+            .args(["push", "origin", "main"])
+            .current_dir(clone.path())
+            .status()
+            .unwrap();
+
+        std::fs::create_dir_all(clone.path().join(".loom/logs")).unwrap();
+        std::fs::write(clone.path().join(".loom/logs/sweep-issue-1.log"), "log\n").unwrap();
+        let outcome = prepare_workspace_to_origin_main(clone.path());
+        assert_eq!(
+            outcome,
+            PrepOutcome::Ready,
+            "only Loom-owned transient dirt must not block the gate, got {outcome:?}"
+        );
+    }
+
+    /// AC1(a) variant: a modified build-artifact lockfile alone must not block
+    /// the gate either (the reported symptom — a lone modified
+    /// `mcp-loom/package-lock.json`).
+    #[test]
+    fn test_prepare_ignores_lockfile_only_dirt() {
+        let (_origin, clone) = make_origin_and_clone();
+        std::fs::write(clone.path().join("package-lock.json"), "{}\n").unwrap();
+        Command::new("git")
+            .args(["add", "package-lock.json"])
+            .current_dir(clone.path())
+            .status()
+            .unwrap();
+        Command::new("git")
+            .args(["commit", "-m", "add lockfile"])
+            .current_dir(clone.path())
+            .status()
+            .unwrap();
+        // Push so the lockfile-add commit is on `origin/main` too — otherwise
+        // the clone would be (correctly) skipped as "ahead of origin" by step
+        // 4, unrelated to the dirty-tree behavior this test targets.
+        Command::new("git")
+            .args(["push", "origin", "main"])
+            .current_dir(clone.path())
+            .status()
+            .unwrap();
+        // Now mutate it — a benign build-side-effect regen, no real change.
+        std::fs::write(clone.path().join("package-lock.json"), "{ \"regen\": true }\n").unwrap();
+        let outcome = prepare_workspace_to_origin_main(clone.path());
+        assert_eq!(
+            outcome,
+            PrepOutcome::Ready,
+            "a lone modified lockfile must not block the gate, got {outcome:?}"
+        );
+    }
+
+    /// AC1(b): a genuine unexpected dirty file — alongside otherwise-ignorable
+    /// dirt — must still cause a skip.
+    #[test]
+    fn test_prepare_still_skips_on_unexpected_dirt_alongside_ignorable() {
+        let (_origin, clone) = make_origin_and_clone();
+        std::fs::create_dir_all(clone.path().join(".loom/logs")).unwrap();
+        std::fs::write(clone.path().join(".loom/logs/sweep-issue-1.log"), "log\n").unwrap();
+        // A genuine operator edit — not on either ignore list.
+        std::fs::write(clone.path().join("file.txt"), "operator edit\n").unwrap();
+        let outcome = prepare_workspace_to_origin_main(clone.path());
+        match outcome {
+            PrepOutcome::Skip { reason } => {
+                assert!(
+                    reason.contains("file.txt"),
+                    "skip reason should name the unexpected file, got: {reason}"
+                );
+                assert!(
+                    !reason.contains(".loom/logs"),
+                    "skip reason should not blame the ignorable Loom-owned path, got: {reason}"
+                );
+            }
+            other => panic!("expected Skip on genuine unexpected dirt, got {other:?}"),
+        }
+    }
+
     #[test]
     fn test_prepare_skips_when_not_on_main() {
         let (_origin, clone) = make_origin_and_clone();
@@ -1568,6 +1943,86 @@ mod tests {
             HealthTransition::Skipped
         );
         assert!(!state.is_halted(), "skip must not spuriously halt");
+    }
+
+    // ===================================================================
+    // Skip-warn throttling (#3950 AC2 / AC3): once per clean->dirty
+    // transition, then throttled while the tree stays dirty; `is_skipped()`
+    // tracks the "not evaluated" status surfaced to `loom-daemon status`.
+    // ===================================================================
+
+    #[test]
+    fn test_note_gate_tick_warns_once_on_transition_then_throttles() {
+        let state = MainHealthState::new();
+        let throttle = Duration::from_secs(3600);
+
+        // First dirty tick: clean -> dirty transition, must warn.
+        assert!(state.note_gate_tick(true, throttle));
+        assert!(state.is_skipped(), "status must reflect the skip");
+
+        // Still dirty, well within the throttle window: must NOT warn again.
+        assert!(!state.note_gate_tick(true, throttle));
+        assert!(!state.note_gate_tick(true, throttle));
+        assert!(state.is_skipped(), "still not-evaluated while throttled");
+    }
+
+    #[test]
+    fn test_note_gate_tick_warns_again_after_throttle_elapses() {
+        let state = MainHealthState::new();
+        // A throttle of ~0 means "always past the window" on the very next tick.
+        let tiny_throttle = Duration::from_millis(1);
+
+        assert!(state.note_gate_tick(true, tiny_throttle), "first tick always warns");
+        std::thread::sleep(Duration::from_millis(5));
+        assert!(
+            state.note_gate_tick(true, tiny_throttle),
+            "a second dirty tick past the throttle window must warn again"
+        );
+    }
+
+    #[test]
+    fn test_note_gate_tick_clears_on_recovery_and_rewarns_on_next_dirty_streak() {
+        let state = MainHealthState::new();
+        let throttle = Duration::from_secs(3600);
+
+        assert!(state.note_gate_tick(true, throttle));
+        assert!(!state.note_gate_tick(true, throttle), "throttled mid-streak");
+
+        // Tree becomes clean again (a completed Green/Red tick) — clears skip
+        // status and the throttle timer.
+        assert!(!state.note_gate_tick(false, throttle));
+        assert!(!state.is_skipped(), "no longer skipped after a completed tick");
+
+        // A NEW dirty streak must warn immediately again, not stay throttled
+        // from the previous streak.
+        assert!(
+            state.note_gate_tick(true, throttle),
+            "a fresh dirty streak must warn on its first tick"
+        );
+    }
+
+    #[test]
+    fn test_note_gate_tick_never_warns_when_not_skipped() {
+        let state = MainHealthState::new();
+        assert!(!state.note_gate_tick(false, Duration::from_secs(3600)));
+        assert!(!state.is_skipped());
+    }
+
+    #[test]
+    fn test_workspace_health_states_is_skipped_tracks_per_root() {
+        let states = WorkspaceHealthStates::new();
+        let root = Path::new("/repo/a");
+        // Never-seen root: not skipped.
+        assert!(!states.is_skipped(root));
+
+        states
+            .get_or_create(root)
+            .note_gate_tick(true, Duration::from_secs(3600));
+        assert!(states.is_skipped(root));
+        assert!(
+            !states.is_skipped(Path::new("/repo/b")),
+            "a sibling root's skip state is independent"
+        );
     }
 
     #[test]

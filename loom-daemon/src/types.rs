@@ -682,6 +682,16 @@ pub struct DaemonStatusReport {
     /// dispatch (in-flight sweeps keep running); `false` means dispatch is
     /// allowed. Always `false` when the gate loop is not enabled.
     pub main_health_gate_halted: bool,
+    /// Whether the gate's most recent tick for this workspace was `Skipped`
+    /// rather than a completed Green/Red run — "not evaluated (dirty tree)",
+    /// distinguished from `main_health_gate_halted`'s "halted (red main)"
+    /// (#3950 AC3). The two are independent: a skip leaves any prior halt
+    /// flag exactly as it was, so both can be `true` at once (main was red
+    /// before the tree went dirty). Always `false` when the gate loop is not
+    /// enabled or has never run. `#[serde(default)]` keeps pre-#3950 wire
+    /// data / older clients compatible.
+    #[serde(default)]
+    pub main_health_gate_not_evaluated: bool,
     /// Token-capacity backpressure snapshot (#3902): account health derived from
     /// the rotation ranking (`.loom/tokens/.ranking`) and whether the token axis
     /// is the binding constraint on the dynamic cap. `#[serde(default)]` keeps
@@ -732,6 +742,14 @@ pub struct RepoStatus {
     /// compatible (an absent field parses as an empty vec).
     #[serde(default)]
     pub quarantined_issues: Vec<u32>,
+    /// Whether this repo's most recent gate tick was `Skipped` — "not
+    /// evaluated (dirty tree)", distinguished from `health_gate_halted`'s
+    /// "halted (red main)" (#3950 AC3). See the field doc on
+    /// [`DaemonStatusReport::main_health_gate_not_evaluated`] for the
+    /// independence of the two flags. `#[serde(default)]` keeps pre-#3950
+    /// wire data compatible.
+    #[serde(default)]
+    pub health_gate_not_evaluated: bool,
 }
 
 /// The token-capacity section of [`DaemonStatusReport`] (#3902).
