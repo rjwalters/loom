@@ -189,6 +189,64 @@ pub const EXPERIMENT_ENV_ALLOWLIST: &[&str] = &[
     "LOOM_TRANSCRIPT_ARCHIVE",
 ];
 
+/// Issue #3949: env var `spawn-claude.sh` checks FIRST when locating the
+/// `loom_tools` Python package source (before its own script-relative and
+/// `$WORKSPACE`-relative fallbacks). Those fallbacks only resolve inside an
+/// actual loom checkout, so a daemon dispatch into a **consumer repo** (one
+/// with no loom checkout of its own, e.g. the #3938 shared-pool scenario)
+/// hard-fails token selection with `ModuleNotFoundError: No module named
+/// 'loom_tools'` unless an operator manually exports this on the daemon's
+/// own environment before starting it (the pre-#3949 interim workaround).
+pub const PACKAGE_PATH_ENV: &str = "LOOM_PACKAGE_PATH";
+
+/// Issue #3949: the loom-daemon crate's own directory in the source tree it
+/// was COMPILED from, baked in at compile time via `CARGO_MANIFEST_DIR`. This
+/// is a build-time constant (not a runtime env lookup), so it survives the
+/// compiled binary being copied elsewhere (e.g. `~/.local/bin/loom-daemon`,
+/// issue #3922) as long as the source checkout it was built from is still
+/// present on the same machine — the normal case for an operator who built
+/// (or `install.sh`-installed) `loom-daemon` locally.
+const BUILD_MANIFEST_DIR: &str = env!("CARGO_MANIFEST_DIR");
+
+/// Resolve the `LOOM_PACKAGE_PATH` value `spawn_child` should forward to a
+/// dispatched sweep child, in precedence order:
+///
+/// 1. `LOOM_PACKAGE_PATH` already set in the DAEMON's own ambient
+///    environment — an explicit operator override (mirrors the pre-#3949
+///    interim workaround of exporting it before `loom-daemon-start.sh`, and
+///    the general explicit-allowlist-forwarding pattern used for
+///    [`EXPERIMENT_ENV_ALLOWLIST`]). Always wins when non-empty.
+/// 2. Derived from the loom checkout this binary was compiled from
+///    (`<BUILD_MANIFEST_DIR>/../loom-tools/src`), but ONLY when that
+///    directory still exists on this machine AND actually contains
+///    `loom_tools/tokens` — the same validity check `spawn-claude.sh` itself
+///    applies to its own script-relative candidate. This is what lets a
+///    consumer-repo dispatch (#3938) resolve token selection with **zero**
+///    manual configuration.
+/// 3. `None` — `spawn_child` sets nothing, and the dispatched
+///    `spawn-claude.sh` falls back to its own pre-#3949 resolution order
+///    unchanged (a byte-for-byte no-op, e.g. for a daemon built from a
+///    stripped release tarball with no `loom-tools` sibling directory).
+#[must_use]
+pub fn resolve_package_path_env() -> Option<String> {
+    if let Ok(val) = std::env::var(PACKAGE_PATH_ENV) {
+        if !val.trim().is_empty() {
+            return Some(val);
+        }
+    }
+    let candidate = Path::new(BUILD_MANIFEST_DIR)
+        .join("..")
+        .join("loom-tools")
+        .join("src");
+    if !candidate.join("loom_tools").join("tokens").is_dir() {
+        return None;
+    }
+    // Best-effort canonicalize for a tidy absolute path; fall back to the
+    // (still-valid, just non-canonical) joined candidate on failure.
+    let resolved = candidate.canonicalize().unwrap_or(candidate);
+    Some(resolved.display().to_string())
+}
+
 /// Issue #3802: fallback `token_name` recorded when `spawn-claude.sh`'s
 /// account selection cannot be captured (e.g. the `LOOM_SPAWN_NO_EXPORT`
 /// bypass path, where the caller pre-exported `CLAUDE_CODE_OAUTH_TOKEN` and no
@@ -1459,6 +1517,19 @@ impl SweepRegistry {
                     cmd.env(name, val);
                 }
             }
+        }
+
+        // Issue #3949: resolve and forward LOOM_PACKAGE_PATH so a
+        // dispatched `spawn-claude.sh` can locate the `loom_tools` Python
+        // package even when the dispatch target is a consumer repo with no
+        // loom checkout of its own (the #3938 shared-pool scenario). A
+        // consumer repo's installed `.loom/scripts/spawn-claude.sh` has no
+        // `../../loom-tools/src` sibling to fall back on, so without this
+        // the child hard-fails token selection with `ModuleNotFoundError`
+        // unless an operator manually exported this var before starting the
+        // daemon. See `resolve_package_path_env` for the full precedence.
+        if let Some(pkg_path) = resolve_package_path_env() {
+            cmd.env(PACKAGE_PATH_ENV, pkg_path);
         }
 
         let mut child = cmd
@@ -3253,6 +3324,7 @@ mod tests {
   printf 'LOOM_SWEEP_CLAIM_OWNED=%s\n' "${{LOOM_SWEEP_CLAIM_OWNED:-unset}}"
   printf 'LOOM_TERMINAL_ID=%s\n' "${{LOOM_TERMINAL_ID:-unset}}"
   printf 'CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS=%s\n' "${{CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS:-unset}}"
+  printf 'LOOM_PACKAGE_PATH=%s\n' "${{LOOM_PACKAGE_PATH:-unset}}"
 }} >> "{rec}" 2>&1
 exit 0
 "#,
@@ -3501,6 +3573,84 @@ exit 0
         assert!(
             recorded.contains("CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS=0"),
             "expected print-mode bg-wait ceiling disabled (=0); got: {recorded}"
+        );
+    }
+
+    /// Issue #3949 unit coverage of the resolution order itself (does not go
+    /// through a full dispatch): with no ambient `LOOM_PACKAGE_PATH` set on
+    /// the test process, `resolve_package_path_env` must derive the real
+    /// monorepo's `loom-tools/src` from `CARGO_MANIFEST_DIR` — this is the
+    /// exact zero-config path that fixes a consumer-repo dispatch (#3938)
+    /// with no operator action required.
+    #[test]
+    #[serial]
+    fn resolve_package_path_env_derives_from_build_tree_when_unset() {
+        std::env::remove_var(PACKAGE_PATH_ENV);
+
+        let resolved = resolve_package_path_env()
+            .expect("expected a derived LOOM_PACKAGE_PATH in this monorepo checkout");
+        let resolved_path = Path::new(&resolved);
+        assert!(
+            resolved_path.join("loom_tools").join("tokens").is_dir(),
+            "derived path must contain loom_tools/tokens; got: {resolved}"
+        );
+        assert!(
+            resolved_path.ends_with(Path::new("loom-tools").join("src")),
+            "derived path should end in loom-tools/src; got: {resolved}"
+        );
+    }
+
+    /// Issue #3949: an operator-set `LOOM_PACKAGE_PATH` on the daemon's own
+    /// ambient environment always wins over the build-tree-derived fallback
+    /// — this is the highest-precedence tier, matching the pre-#3949 interim
+    /// workaround of exporting it before `loom-daemon-start.sh`.
+    #[test]
+    #[serial]
+    fn resolve_package_path_env_prefers_ambient_override() {
+        std::env::set_var(PACKAGE_PATH_ENV, "/tmp/custom-loom-tools-src-3949");
+
+        let resolved = resolve_package_path_env();
+
+        std::env::remove_var(PACKAGE_PATH_ENV);
+
+        assert_eq!(
+            resolved.as_deref(),
+            Some("/tmp/custom-loom-tools-src-3949"),
+            "an ambient LOOM_PACKAGE_PATH override must be forwarded verbatim"
+        );
+    }
+
+    /// Issue #3949 end-to-end: `spawn_child` forwards the derived
+    /// `LOOM_PACKAGE_PATH` to the dispatched child even when the daemon's own
+    /// environment never set it — the acceptance-criteria scenario (a
+    /// consumer repo with no loom checkout and no `LOOM_PACKAGE_PATH` env
+    /// still selects a token successfully, because the daemon fills in the
+    /// package path on its behalf).
+    #[test]
+    #[serial]
+    fn dispatch_forwards_derived_package_path_when_unset() {
+        std::env::remove_var(PACKAGE_PATH_ENV);
+
+        let dir = tempdir().unwrap();
+        let (mut registry, record_log) = fixture_registry(dir.path());
+
+        let outcome = registry
+            .dispatch(&SweepKind::Issue(4245), None, None, None, None)
+            .expect("dispatch should succeed");
+
+        let needle = format!("LOOM_TERMINAL_ID=daemon-{}", outcome.sweep_id);
+        assert!(
+            wait_for_contents(&record_log, &needle, 10000),
+            "fake spawn-claude.sh did not finish writing within 10s"
+        );
+        let recorded = std::fs::read_to_string(&record_log).unwrap();
+        assert!(
+            !recorded.contains("LOOM_PACKAGE_PATH=unset"),
+            "expected a derived LOOM_PACKAGE_PATH forwarded to the child; got: {recorded}"
+        );
+        assert!(
+            recorded.contains("LOOM_PACKAGE_PATH=") && recorded.contains("loom-tools/src"),
+            "expected LOOM_PACKAGE_PATH to point at loom-tools/src; got: {recorded}"
         );
     }
 
