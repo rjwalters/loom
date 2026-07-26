@@ -555,12 +555,32 @@ matched on `headSha`:
 - CI **green** on that SHA → downgraded to `contradicted-by-forge-ci`
   (UNEVALUATED); logged loudly, **does not halt**.
 - CI **red** on that SHA → corroborated; still VERIFIED_RED, still halts.
-- CI **unknown** (no completed run yet, `gh` missing/unauthenticated, probe
-  timeout > 30s) → fail safe: still VERIFIED_RED, still halts.
+- CI **unknown** → fail safe: still VERIFIED_RED, still halts.
 
-Only *positive* contrary evidence ever relaxes a halt. Corroboration is on by
-default and can be disabled with `LOOM_GATE_CI_CORROBORATION=0` (for repos with no
-forge CI or no `gh`); it is only probed on a local red, never on a green run.
+Only *positive* contrary evidence ever relaxes a halt, so "green" is the hardest
+verdict to reach and everything short of an unambiguous all-clear degrades to
+**unknown**:
+
+| Runs for the evaluated SHA | Verdict |
+|---|---|
+| any `failure` / `timed_out` / `startup_failure` | red |
+| any run not yet `completed` (`queued`, `in_progress`, …) | unknown — CI has not judged the commit yet |
+| any `cancelled` / `action_required` / `stale` / unrecognized conclusion | unknown — the workflow reached no verdict about the code |
+| at least one `success`, every other run `skipped` / `neutral` | **green** |
+| no run for the SHA, unparseable output, `gh` missing/unauthenticated, probe timeout > 30s | unknown |
+
+**Absence of failure is not success.** Requiring at least one genuine `success`
+*and* no outstanding or indeterminate sibling run closes two ways a
+"saw any completed run ⇒ green" reducer reads green on non-evidence: a
+`cancel-in-progress: true` concurrency group leaves superseded runs at
+`completed/cancelled` **forever** (a permanent false green for that commit), and a
+fast bookkeeping workflow that finishes minutes before the real build would
+otherwise vouch for the commit on its own. Neither case needs the probe to know
+*which* workflow "counts", so no workflow name is hard-coded.
+
+Corroboration is on by default and can be disabled with
+`LOOM_GATE_CI_CORROBORATION=0` (for repos with no forge CI or no `gh`); it is only
+probed on a local red, never on a green run.
 
 ### One shared halt state
 

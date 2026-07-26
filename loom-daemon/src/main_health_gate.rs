@@ -664,6 +664,11 @@ pub const GATE_CI_CORROBORATION_ENV: &str = "LOOM_GATE_CI_CORROBORATION";
 const CI_PROBE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// How many recent `main` runs to scan for the evaluated SHA.
+///
+/// At 3-4 workflows per commit this is roughly 8-10 commits of `main` history.
+/// On a fast merge cadence the evaluated SHA can age out of the window before a
+/// long gate command finishes — which yields [`CiVerdict::Unknown`] and keeps the
+/// halt, so the tradeoff fails safe.
 const CI_PROBE_RUN_LIMIT: usize = 30;
 
 /// Whether forge-CI corroboration is enabled (default **on**, per
@@ -730,33 +735,88 @@ impl ForgeCiStatus for GhForgeCi {
 /// Parse `gh run list --json headSha,status,conclusion,workflowName` output and
 /// reduce the runs for `sha` to a single [`CiVerdict`].
 ///
-/// Only **completed** runs count. Any `failure` / `timed_out` / `startup_failure`
-/// conclusion makes the commit red; otherwise, at least one completed run makes
-/// it green. No completed run for `sha` (or unparseable output) is `Unknown` —
-/// never a silent "green".
+/// The reduction is deliberately **asymmetric**, because only positive contrary
+/// evidence may ever relax a halt (#3974 AC4). `Success` is the hardest verdict
+/// to reach; anything short of an unambiguous all-clear degrades to `Unknown`,
+/// which keeps the local red standing:
+///
+/// | Runs for `sha` | Verdict |
+/// |---|---|
+/// | any `failure` / `timed_out` / `startup_failure` | `Failure` |
+/// | any run not yet `completed` (`queued`, `in_progress`, …) | `Unknown` — CI has not judged the commit yet |
+/// | any `cancelled` / `action_required` / `stale` / unrecognized conclusion | `Unknown` — the workflow reached no verdict about the code |
+/// | at least one `success`, every other run `skipped` / `neutral` | `Success` |
+/// | none of the above (no runs for `sha`, unparseable output) | `Unknown` |
+///
+/// **Absence of failure is not success.** A commit is green only when some
+/// workflow actually concluded `success` *and* no sibling workflow for the same
+/// commit is still outstanding or indeterminate. This closes two fail-open paths
+/// that a "saw any completed run" reducer has:
+///
+/// 1. `cancel-in-progress: true` concurrency groups leave superseded runs at
+///    `completed/cancelled` **forever**, which would otherwise read as green in
+///    perpetuity for that commit.
+/// 2. A fast bookkeeping workflow (line counters, labelers) finishing minutes
+///    before the real build would otherwise vouch for the commit on its own.
+///
+/// Requiring every sibling run to have reached a definitive verdict handles both
+/// without hard-coding which workflow "counts" — see the PR discussion on #3974.
 fn parse_gh_run_list(stdout: &str, sha: &str) -> CiVerdict {
     let Ok(runs) = serde_json::from_str::<Vec<serde_json::Value>>(stdout) else {
         log::debug!("main_health_gate: could not parse `gh run list` output");
         return CiVerdict::Unknown;
     };
-    let mut saw_completed = false;
+    let mut saw_success = false;
+    // The first run that reached no verdict about the code, for diagnostics.
+    let mut indeterminate: Option<String> = None;
     for run in runs {
-        if run.get("headSha").and_then(serde_json::Value::as_str) != Some(sha) {
+        let field = |k: &str| run.get(k).and_then(serde_json::Value::as_str);
+        if field("headSha") != Some(sha) {
             continue;
         }
-        if run.get("status").and_then(serde_json::Value::as_str) != Some("completed") {
+        let workflow = field("workflowName").unwrap_or("<unnamed workflow>");
+        let status = field("status").unwrap_or("<no status>");
+        if status != "completed" {
+            // CI has not judged this commit yet — not evidence in either
+            // direction, and specifically not evidence *for* the commit.
+            indeterminate.get_or_insert_with(|| format!("{workflow} is {status}"));
             continue;
         }
-        saw_completed = true;
-        if let Some("failure" | "timed_out" | "startup_failure") =
-            run.get("conclusion").and_then(serde_json::Value::as_str)
-        {
-            return CiVerdict::Failure;
+        match field("conclusion") {
+            Some("failure" | "timed_out" | "startup_failure") => {
+                log::debug!(
+                    "main_health_gate: forge CI red on {sha} — {workflow} concluded \
+                     {}",
+                    field("conclusion").unwrap_or("failure")
+                );
+                return CiVerdict::Failure;
+            }
+            Some("success") => saw_success = true,
+            // Definitive "did not apply": a path/branch filter skipped the run,
+            // or the workflow deliberately declined to judge. Neither vouches
+            // for the commit nor leaves a verdict outstanding.
+            Some("skipped" | "neutral") => {}
+            // `cancelled` (superseded by a concurrency group), `action_required`
+            // (waiting on a human), `stale`, or anything GitHub adds later: the
+            // workflow was interrupted before it could judge the code.
+            other => {
+                let conclusion = other.unwrap_or("<none>");
+                indeterminate.get_or_insert_with(|| format!("{workflow} concluded {conclusion}"));
+            }
         }
     }
-    if saw_completed {
+    if let Some(reason) = indeterminate {
+        log::debug!(
+            "main_health_gate: forge CI verdict for {sha} is indeterminate ({reason}) — \
+             treating as unknown, the local result stands"
+        );
+        return CiVerdict::Unknown;
+    }
+    if saw_success {
         CiVerdict::Success
     } else {
+        // No run for `sha` at all, or every run was skipped/neutral. Either way
+        // nothing positively vouches for the commit.
         CiVerdict::Unknown
     }
 }
@@ -2445,6 +2505,91 @@ mod tests {
         // Empty / unparseable output ⇒ unknown.
         assert_eq!(parse_gh_run_list("[]", &sha), CiVerdict::Unknown);
         assert_eq!(parse_gh_run_list("not json", &sha), CiVerdict::Unknown);
+    }
+
+    /// Only *positive* contrary evidence may relax a halt (#3974 AC4). These are
+    /// the shapes that a "saw any completed run ⇒ green" reducer read as green
+    /// even though no workflow ever concluded the commit was good.
+    #[test]
+    fn test_parse_gh_run_list_non_evidence_is_never_success() {
+        let sha = "c".repeat(40);
+
+        // 1. `cancel-in-progress: true` supersedes the previous commit's CI run,
+        //    which then sits at completed/cancelled FOREVER. Not a statement
+        //    about the code — and crucially not a permanent green.
+        let json = format!(
+            r#"[{{"headSha":"{sha}","status":"completed","conclusion":"cancelled","workflowName":"CI"}}]"#
+        );
+        assert_eq!(parse_gh_run_list(&json, &sha), CiVerdict::Unknown);
+
+        // Cancelled CI alongside a completed-success bookkeeping workflow: still
+        // unknown. The success does not paper over the missing CI verdict.
+        let json = format!(
+            r#"[{{"headSha":"{sha}","status":"completed","conclusion":"cancelled","workflowName":"CI"}},
+                {{"headSha":"{sha}","status":"completed","conclusion":"success","workflowName":"Lines of Code"}}]"#
+        );
+        assert_eq!(parse_gh_run_list(&json, &sha), CiVerdict::Unknown);
+
+        // 2. The ~100s window after every push where the fast bookkeeping
+        //    workflow has finished but CI is still running.
+        let json = format!(
+            r#"[{{"headSha":"{sha}","status":"in_progress","conclusion":null,"workflowName":"CI"}},
+                {{"headSha":"{sha}","status":"completed","conclusion":"success","workflowName":"Lines of Code"}}]"#
+        );
+        assert_eq!(parse_gh_run_list(&json, &sha), CiVerdict::Unknown);
+
+        // Queued counts the same as in-progress: not yet a verdict.
+        let json = format!(
+            r#"[{{"headSha":"{sha}","status":"queued","conclusion":null,"workflowName":"CI"}},
+                {{"headSha":"{sha}","status":"completed","conclusion":"success","workflowName":"Lines of Code"}}]"#
+        );
+        assert_eq!(parse_gh_run_list(&json, &sha), CiVerdict::Unknown);
+
+        // `action_required` (awaiting a human) and `stale` are likewise not
+        // statements about the code.
+        for conclusion in ["action_required", "stale"] {
+            let json = format!(
+                r#"[{{"headSha":"{sha}","status":"completed","conclusion":"{conclusion}","workflowName":"CI"}},
+                    {{"headSha":"{sha}","status":"completed","conclusion":"success","workflowName":"Lines of Code"}}]"#
+            );
+            assert_eq!(
+                parse_gh_run_list(&json, &sha),
+                CiVerdict::Unknown,
+                "conclusion {conclusion:?} must not vouch for the commit"
+            );
+        }
+
+        // An unrecognized future conclusion degrades to unknown, not to green.
+        let json = format!(
+            r#"[{{"headSha":"{sha}","status":"completed","conclusion":"some_new_thing","workflowName":"CI"}},
+                {{"headSha":"{sha}","status":"completed","conclusion":"success","workflowName":"CI"}}]"#
+        );
+        assert_eq!(parse_gh_run_list(&json, &sha), CiVerdict::Unknown);
+
+        // Absence of failure is not success: every run skipped ⇒ nothing
+        // positively vouches for the commit.
+        let json = format!(
+            r#"[{{"headSha":"{sha}","status":"completed","conclusion":"skipped","workflowName":"CI"}}]"#
+        );
+        assert_eq!(parse_gh_run_list(&json, &sha), CiVerdict::Unknown);
+
+        // A real failure still wins over any indeterminate sibling — a halt may
+        // always be *established*, it just may not be relaxed on non-evidence.
+        let json = format!(
+            r#"[{{"headSha":"{sha}","status":"in_progress","conclusion":null,"workflowName":"Lint"}},
+                {{"headSha":"{sha}","status":"completed","conclusion":"cancelled","workflowName":"Lines of Code"}},
+                {{"headSha":"{sha}","status":"completed","conclusion":"failure","workflowName":"CI"}}]"#
+        );
+        assert_eq!(parse_gh_run_list(&json, &sha), CiVerdict::Failure);
+
+        // And the genuine all-clear still reads green: every workflow for the
+        // commit reached a verdict, at least one of them `success`.
+        let json = format!(
+            r#"[{{"headSha":"{sha}","status":"completed","conclusion":"success","workflowName":"CI"}},
+                {{"headSha":"{sha}","status":"completed","conclusion":"success","workflowName":"Lines of Code"}},
+                {{"headSha":"{sha}","status":"completed","conclusion":"skipped","workflowName":"Release"}}]"#
+        );
+        assert_eq!(parse_gh_run_list(&json, &sha), CiVerdict::Success);
     }
 
     // ===================================================================
