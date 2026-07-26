@@ -213,12 +213,21 @@ loom-daemon dispatch 3952 --depends-on 3945        # stacked-PR child (#3729)
 | `--effort <E>` | `effort` | reasoning-effort override (#3716) |
 | `--depends-on <P>` | `depends_on` | single parent issue; child branches off `feature/issue-<P>` (#3729) |
 
-**Bounded ack timeout (never hangs).** The CLI waits at most **5s** for the
-daemon to ack the dispatch. On expiry it exits **nonzero** with a clear
-`Daemon did not ack the dispatch within 5s (...) — is loom-daemon running?`
-message rather than blocking. This is the whole point of the command: the MCP
-`dispatch_sweep` path once wedged for **1800s** (#3945), and hand-rolling the
-dispatch bypassed the registry entirely.
+**Bounded ack timeout (never hangs).** The CLI waits at most **30s** for the
+daemon to ack the dispatch, then exits **nonzero** with a clear
+`Daemon did not ack the dispatch within 30s (...) — is loom-daemon running?`
+message rather than blocking. The 30s default mirrors the `mcp__loom__dispatch_sweep`
+tool's own `DISPATCH_TIMEOUT_MS` for the identical IPC call, and exists because
+`SweepRegistry::dispatch()` does real synchronous work *before* it acks — a
+blocking `gh issue edit` label flip, up to a 2s dispatch stagger, and up to a 5s
+token-name capture window — so a legitimate, successful dispatch can take several
+seconds to ack. A tighter bound (the original 5s) would false-report those real
+successes as `did not ack`. Operators on a slow forge or a heavily-loaded daemon
+can *raise* the bound with `LOOM_DAEMON_IPC_TIMEOUT_MS=<ms>` (the same env var
+`mcp-loom` honors); it only ever raises above the 30s floor, never lowers it (a
+lower value would reintroduce the false negative). The timeout is always a
+bounded, finite value: the MCP `dispatch_sweep` path once wedged for **1800s**
+(#3945), and this command must never reproduce that hang.
 
 **Replaces the hand-rolled pattern.** Before #3952 the only non-MCP alternative
 was to reproduce the daemon's dispatch by hand — flip the label, export
