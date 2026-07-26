@@ -209,15 +209,29 @@ async fn get_metrics_summary(
     let conn = state.get_connection()?;
     let time_range = &params.time_range;
 
-    // Calculate date filter based on time range
-    let date_filter = match time_range.as_str() {
-        "today" => "date(timestamp) = date('now')",
-        "week" => "date(timestamp) >= date('now', '-7 days')",
-        "month" => "date(timestamp) >= date('now', '-30 days')",
+    // Calculate date filters based on time range. `agent_metrics` has no
+    // single `timestamp` column (it tracks `started_at`/`completed_at`
+    // separately), and `github_events` uses `event_time` rather than
+    // `timestamp` — so each table needs its own filter expression rather
+    // than reusing one literal `timestamp` column name across tables.
+    let metrics_date_filter = match time_range.as_str() {
+        "today" => "date(COALESCE(completed_at, started_at)) = date('now')",
+        "week" => "date(COALESCE(completed_at, started_at)) >= date('now', '-7 days')",
+        "month" => "date(COALESCE(completed_at, started_at)) >= date('now', '-30 days')",
+        _ => "1=1", // all time
+    };
+    let events_date_filter = match time_range.as_str() {
+        "today" => "date(event_time) = date('now')",
+        "week" => "date(event_time) >= date('now', '-7 days')",
+        "month" => "date(event_time) >= date('now', '-30 days')",
         _ => "1=1", // all time
     };
 
-    // Query agent activity metrics
+    // Query agent activity metrics. Targets `agent_metrics` — the real
+    // production table (see `loom-daemon/src/activity/schema.rs`). An
+    // earlier version of this query targeted a table named `agent_activity`,
+    // which was never part of the schema (see #3964, mirroring #3951/#3963
+    // in loom-daemon's metrics collector).
     let sql = format!(
         r"
         SELECT
@@ -225,11 +239,11 @@ async fn get_metrics_summary(
             COALESCE(SUM(COALESCE(total_tokens, 0)), 0) as total_tokens,
             COALESCE(SUM(COALESCE(total_tokens, 0) * 0.00001), 0) as total_cost,
             CASE WHEN COUNT(*) > 0
-                THEN CAST(SUM(CASE WHEN outcome = 'success' THEN 1 ELSE 0 END) AS REAL) / COUNT(*)
+                THEN CAST(SUM(CASE WHEN status = 'success' THEN 1 ELSE 0 END) AS REAL) / COUNT(*)
                 ELSE 0
             END as success_rate
-        FROM agent_activity
-        WHERE {date_filter}
+        FROM agent_metrics
+        WHERE {metrics_date_filter}
         "
     );
 
@@ -244,7 +258,7 @@ async fn get_metrics_summary(
             COALESCE(SUM(CASE WHEN event_type = 'pr_created' THEN 1 ELSE 0 END), 0) as prs_created,
             COALESCE(SUM(CASE WHEN event_type = 'issue_closed' THEN 1 ELSE 0 END), 0) as issues_closed
         FROM github_events
-        WHERE {date_filter}
+        WHERE {events_date_filter}
         "
     );
 
@@ -269,27 +283,31 @@ async fn get_metrics_by_role(
     let conn = state.get_connection()?;
     let time_range = &params.time_range;
 
+    // See the comment in `get_metrics_summary` — `agent_metrics` has no
+    // single `timestamp` column.
     let date_filter = match time_range.as_str() {
-        "today" => "date(timestamp) = date('now')",
-        "week" => "date(timestamp) >= date('now', '-7 days')",
-        "month" => "date(timestamp) >= date('now', '-30 days')",
+        "today" => "date(COALESCE(completed_at, started_at)) = date('now')",
+        "week" => "date(COALESCE(completed_at, started_at)) >= date('now', '-7 days')",
+        "month" => "date(COALESCE(completed_at, started_at)) >= date('now', '-30 days')",
         _ => "1=1",
     };
 
+    // Targets `agent_metrics` (real production table); `agent_role` is the
+    // actual column name (not `role`). See #3964.
     let sql = format!(
         r"
         SELECT
-            role,
+            agent_role as role,
             COUNT(*) as prompt_count,
             COALESCE(SUM(COALESCE(total_tokens, 0)), 0) as total_tokens,
             COALESCE(SUM(COALESCE(total_tokens, 0) * 0.00001), 0) as total_cost,
             CASE WHEN COUNT(*) > 0
-                THEN CAST(SUM(CASE WHEN outcome = 'success' THEN 1 ELSE 0 END) AS REAL) / COUNT(*)
+                THEN CAST(SUM(CASE WHEN status = 'success' THEN 1 ELSE 0 END) AS REAL) / COUNT(*)
                 ELSE 0
             END as success_rate
-        FROM agent_activity
+        FROM agent_metrics
         WHERE {date_filter}
-        GROUP BY role
+        GROUP BY agent_role
         ORDER BY prompt_count DESC
         "
     );
@@ -699,39 +717,33 @@ mod tests {
     use tempfile::TempDir;
     use tower::ServiceExt;
 
+    /// Builds the test fixture on the real production schema
+    /// (`loom_daemon::activity::init_schema`) rather than a hand-rolled
+    /// mini schema, so unit tests track schema drift instead of masking it
+    /// — see #3964 (same root cause as #3951/#3963: the old fixture defined
+    /// a table named `agent_activity` that never existed in production).
     fn setup_test_db(dir: &TempDir) -> Connection {
         let loom_dir = dir.path().join(".loom");
         std::fs::create_dir_all(&loom_dir).unwrap();
         let db_path = loom_dir.join("activity.db");
         let conn = Connection::open(&db_path).unwrap();
 
-        // Create minimal schema
+        loom_daemon::activity::init_schema(&conn).unwrap();
+
+        // Insert test data into the real `agent_metrics` table.
         conn.execute(
-            "CREATE TABLE agent_activity (
-                id INTEGER PRIMARY KEY,
-                timestamp TEXT NOT NULL,
-                role TEXT NOT NULL,
-                outcome TEXT NOT NULL,
-                total_tokens INTEGER
-            )",
+            "INSERT INTO agent_metrics
+                (terminal_id, agent_role, agent_system, started_at, completed_at, status, total_tokens)
+             VALUES ('terminal-1', 'builder', 'claude', datetime('now'), datetime('now'), 'success', 1000)",
             [],
         )
         .unwrap();
 
+        // Insert test data into `github_events` (real column is `event_time`,
+        // not `timestamp`).
         conn.execute(
-            "CREATE TABLE github_events (
-                id INTEGER PRIMARY KEY,
-                timestamp TEXT NOT NULL,
-                event_type TEXT NOT NULL
-            )",
-            [],
-        )
-        .unwrap();
-
-        // Insert test data
-        conn.execute(
-            "INSERT INTO agent_activity (timestamp, role, outcome, total_tokens)
-             VALUES (datetime('now'), 'builder', 'success', 1000)",
+            "INSERT INTO github_events (event_type, event_time)
+             VALUES ('pr_created', datetime('now'))",
             [],
         )
         .unwrap();
@@ -779,6 +791,48 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::OK);
+
+        // Regression check for #3964: this must actually query the real
+        // `agent_metrics` / `github_events` tables and return the seeded
+        // row rather than erroring on a nonexistent `agent_activity` table.
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let metrics: AgentMetrics = serde_json::from_slice(&body).unwrap();
+        assert_eq!(metrics.prompt_count, 1);
+        assert_eq!(metrics.total_tokens, 1000);
+        assert!((metrics.success_rate - 1.0).abs() < f64::EPSILON);
+        assert_eq!(metrics.prs_created, 1);
+    }
+
+    #[tokio::test]
+    async fn test_metrics_by_role() {
+        let dir = TempDir::new().unwrap();
+        setup_test_db(&dir);
+
+        let state = AppState::new(dir.path().to_path_buf());
+        let app = create_router(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/metrics/roles?time_range=all")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let roles: Vec<RoleMetrics> = serde_json::from_slice(&body).unwrap();
+        assert_eq!(roles.len(), 1);
+        assert_eq!(roles[0].role, "builder");
+        assert_eq!(roles[0].prompt_count, 1);
+        assert_eq!(roles[0].total_tokens, 1000);
     }
 
     #[tokio::test]
