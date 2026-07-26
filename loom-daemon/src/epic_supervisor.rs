@@ -1039,14 +1039,13 @@ pub fn spawn_multi_supervisor_thread(
 
             while !shutdown_thread.load(Ordering::Relaxed) {
                 // Resolve the current workspace set fresh each tick (hot-apply).
-                let current = WorkspaceRegistry::load_default()
-                    .unwrap_or_else(|e| {
-                        log::warn!(
-                            "epic_supervisor: could not load workspace registry ({e}); using cwd"
-                        );
-                        WorkspaceRegistry::default()
-                    })
-                    .effective_roots(&fallback_root);
+                let registry = WorkspaceRegistry::load_default().unwrap_or_else(|e| {
+                    log::warn!(
+                        "epic_supervisor: could not load workspace registry ({e}); using cwd"
+                    );
+                    WorkspaceRegistry::default()
+                });
+                let current = registry.effective_roots(&fallback_root);
 
                 // Drop cached supervisors whose workspace was deregistered.
                 let mut i = 0;
@@ -1091,6 +1090,23 @@ pub fn spawn_multi_supervisor_thread(
                                 root.display()
                             );
                         }
+                    }
+                }
+
+                // Cross-repo priority ordering (#3946): reorder the parallel
+                // `roots` / `supervisors` vectors by workspace priority (lower =
+                // higher priority) before ticking, so higher-tier repos' epics
+                // are advanced/dispatched ahead of lower-tier ones. The sort is
+                // stable, so repos sharing a tier keep their provisioning order,
+                // and each supervisor's per-epic ledger moves with it (ownership
+                // is transferred through the drain/collect below).
+                if supervisors.len() > 1 {
+                    let mut paired: Vec<(PathBuf, EpicSupervisor<_, _>)> =
+                        roots.drain(..).zip(supervisors.drain(..)).collect();
+                    paired.sort_by_key(|(root, _)| registry.priority_of(root));
+                    for (root, supervisor) in paired {
+                        roots.push(root);
+                        supervisors.push(supervisor);
                     }
                 }
 

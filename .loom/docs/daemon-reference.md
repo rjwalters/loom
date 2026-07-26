@@ -445,6 +445,51 @@ enabling the gate for a genuine multi-repo deployment is done with the machine-
 global `LOOM_MAIN_HEALTH_GATE=1` env var (each repo's own `buildGate` block then
 decides whether it actually gates).
 
+## Per-workspace priority tiers (#3946)
+
+By default the multi-repo work-finder and epic supervisor iterate
+`effective_roots()` in **registration order**, so a deep product-repo backlog can
+starve the tool repos whose fixes compound. Priority tiers add cross-repo dispatch
+ordering:
+
+- **Registry schema** — each `~/.loom/workspaces.json` entry gains an optional
+  `priority` integer (`Workspace.priority`, `loom-daemon/src/workspace_registry.rs`):
+  **lower = higher priority**, default `100`
+  (`DEFAULT_WORKSPACE_PRIORITY`). Fully backward compatible — an entry with no
+  `priority` (every pre-#3946 file) deserializes as `100` via `#[serde(default)]`,
+  so an all-default registry orders exactly as before.
+
+- **CLI** —
+  - `loom-daemon workspace add <path> --priority N` registers a repo in tier `N`
+    (default `100`).
+  - `loom-daemon workspace set-priority <path> N` retiers an already-registered
+    repo.
+  - `loom-daemon workspace list` prints a `PRIO` column, sorted highest-priority
+    first (mutation order on disk is preserved).
+
+- **Work-finder ordering** — `work_finder::tick_multi` now takes a
+  `priorities: &[u32]` slice parallel to the workspaces. Instead of dispatching
+  each repo's backlog in registration order, it gathers **every** eligible
+  candidate across all workspaces into one queue, sorts it by `candidate_cmp` —
+  **(workspace priority asc, `loom:urgent` first, issue age asc/oldest-first,
+  issue number asc)** — and fills the single shared concurrency budget in that
+  global order. The cap/budget mechanics (#3811/#3930) are unchanged; this only
+  orders the queue. `createdAt` is added to the `gh issue list --json` fields for
+  the age key.
+
+- **Epic supervisor** — `spawn_multi_supervisor_thread` reorders its cached
+  per-repo supervisors by workspace priority each tick (stable within a tier) before
+  `tick_multi`, so higher-tier epics advance/dispatch first.
+
+- **Status** — `RepoStatus.priority` is surfaced in the `loom-daemon status`
+  **Managed repos** table (a `PRIO` column) and the `--json` `per_repo[].priority`
+  field, with the breakdown sorted highest-priority first.
+
+**Starvation stance (v1):** strict priority is intentional — tool repos are small
+queues that drain fast. A permanently-full higher tier **will** starve lower tiers;
+fairness knobs (per-tier slot reservations) and cross-repo dependency awareness are
+explicit follow-ups, deferred until observed to matter.
+
 ## Reaper task
 
 The reaper (`sweep_registry::spawn_reaper_task`) ticks every 30 seconds

@@ -462,9 +462,8 @@ pub fn build_daemon_status(
     // Enumerate every registered managed workspace (Issue #3930). An empty
     // registry yields `[fallback_root]`, so the common single-workspace case is
     // byte-for-byte the pre-#3930 behavior (one root — the daemon's own).
-    let roots = WorkspaceRegistry::load_default()
-        .unwrap_or_default()
-        .effective_roots(fallback_root);
+    let workspace_registry = WorkspaceRegistry::load_default().unwrap_or_default();
+    let roots = workspace_registry.effective_roots(fallback_root);
 
     // Per-repo breakdown + the union of in-flight sweeps across every repo. Each
     // root reads its own registry from the pool (the fallback/default root
@@ -485,11 +484,21 @@ pub fn build_daemon_status(
         };
         per_repo.push(crate::types::RepoStatus {
             root: root.clone(),
+            priority: workspace_registry.priority_of(root),
             in_flight_count: live.len(),
             health_gate_halted: health_states.is_halted(root),
         });
         in_flight.extend(live);
     }
+
+    // Present the per-repo breakdown in dispatch-priority order (#3946) — the
+    // same order the autonomous loops drain — so the highest-priority repos are
+    // listed first. Stable within a tier (tiebreak on root path) for determinism.
+    per_repo.sort_by(|a, b| {
+        a.priority
+            .cmp(&b.priority)
+            .then_with(|| a.root.cmp(&b.root))
+    });
 
     // Dynamic-cap inputs are *machine-level* (one token pool, one scratch
     // volume), so they are computed once from the daemon's primary workspace —
@@ -2363,6 +2372,7 @@ exit 0
             },
             per_repo: vec![crate::types::RepoStatus {
                 root: std::path::PathBuf::from("/repo/a"),
+                priority: 100,
                 in_flight_count: 0,
                 health_gate_halted: true,
             }],
