@@ -493,7 +493,10 @@ pub fn build_daemon_status(
             in_flight_count: live.len(),
             health_gate_halted: health_states.is_halted(root),
             quarantined_issues,
-            health_gate_not_evaluated: health_states.is_skipped(root),
+            health_gate_not_evaluated: health_states.is_unevaluated(root),
+            // Name the actual failure class (#3974 AC2) rather than letting the
+            // renderer assume "dirty tree" for every unevaluated tick.
+            health_gate_not_evaluated_reason: health_states.unevaluated_summary(root),
         });
         in_flight.extend(live);
     }
@@ -556,7 +559,8 @@ pub fn build_daemon_status(
         // Top-level halt preserves its pre-#3930 single-workspace meaning: the
         // daemon's own primary workspace. Per-repo halt is in `per_repo`.
         main_health_gate_halted: health_states.is_halted(fallback_root),
-        main_health_gate_not_evaluated: health_states.is_skipped(fallback_root),
+        main_health_gate_not_evaluated: health_states.is_unevaluated(fallback_root),
+        main_health_gate_not_evaluated_reason: health_states.unevaluated_summary(fallback_root),
         capacity,
         per_repo,
     }
@@ -2525,6 +2529,7 @@ exit 0
             dynamic_cap: 3,
             main_health_gate_halted: true,
             main_health_gate_not_evaluated: false,
+            main_health_gate_not_evaluated_reason: None,
             capacity: crate::types::CapacityReport {
                 ranking_present: true,
                 total_accounts: 4,
@@ -2540,6 +2545,7 @@ exit 0
                 health_gate_halted: true,
                 quarantined_issues: vec![101, 202],
                 health_gate_not_evaluated: false,
+                health_gate_not_evaluated_reason: None,
             }],
         };
         let resp = Response::DaemonStatus(report);
@@ -2653,14 +2659,32 @@ exit 0
         // "halted (red main)" and "not evaluated (dirty tree)" can both be
         // true — a prior red run's halt persisting while a later tick can't
         // even evaluate because the tree went dirty.
-        health
-            .get_or_create(&root)
-            .note_gate_tick(true, std::time::Duration::from_secs(3600));
+        health.get_or_create(&root).note_gate_tick(
+            Some((
+                crate::main_health_gate::UnevaluatedClass::DirtyTree,
+                "operator edit in src/main.rs",
+            )),
+            std::time::Duration::from_secs(3600),
+        );
         let report = build_daemon_status(&pool, &health, &root);
         assert!(report.main_health_gate_halted, "prior halt persists through a skip");
         assert!(report.main_health_gate_not_evaluated, "skip surfaces as not-evaluated");
         assert!(report.per_repo[0].health_gate_halted);
         assert!(report.per_repo[0].health_gate_not_evaluated);
+        // #3974 AC2: the report names the actual failure class + detail rather
+        // than leaving the renderer to assume "workspace tree is dirty".
+        let reason = report
+            .main_health_gate_not_evaluated_reason
+            .as_deref()
+            .expect("not-evaluated reason recorded");
+        assert!(reason.starts_with("dirty-tree: "), "got: {reason}");
+        assert!(reason.contains("src/main.rs"), "got: {reason}");
+        assert_eq!(
+            report.per_repo[0]
+                .health_gate_not_evaluated_reason
+                .as_deref(),
+            Some(reason)
+        );
 
         match prev_shared {
             Some(v) => std::env::set_var("LOOM_SHARED_TOKENS_DIR", v),

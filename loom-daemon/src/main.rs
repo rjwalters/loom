@@ -1470,11 +1470,13 @@ fn print_status_json(
         },
         "main_health_gate": {
             "halted": report.main_health_gate_halted,
-            // "Not evaluated" (dirty tree) is distinct from "halted" (red
-            // main) — #3950 AC3. Both can be true at once: a prior halt from
-            // a genuinely red run persists untouched while a later tick can't
-            // even evaluate because the tree went dirty.
+            // "Not evaluated" is distinct from "halted" (verified-red main) —
+            // #3950 AC3. Both can be true at once: a prior halt from a
+            // genuinely red run persists untouched while a later tick can't
+            // even evaluate (dirty tree, timeout, missing tool, broken `git`).
             "not_evaluated": report.main_health_gate_not_evaluated,
+            // Which failure class actually blocked evaluation (#3974 AC2).
+            "not_evaluated_reason": report.main_health_gate_not_evaluated_reason,
         },
         // Per-repo breakdown across every registered managed workspace (#3930).
         "per_repo": report.per_repo.iter().map(|r| serde_json::json!({
@@ -1483,11 +1485,40 @@ fn print_status_json(
             "in_flight_count": r.in_flight_count,
             "health_gate_halted": r.health_gate_halted,
             "health_gate_not_evaluated": r.health_gate_not_evaluated,
+            "health_gate_not_evaluated_reason": r.health_gate_not_evaluated_reason,
         })).collect::<Vec<_>>(),
         "token_usage": token_usage,
     });
     println!("{}", serde_json::to_string_pretty(&combined)?);
     Ok(())
+}
+
+/// Render the main-health gate summary line for `loom-daemon status`.
+///
+/// `halted` means a gate run **completed** and found `main` verified-red — the
+/// only state that pauses dispatch. `not_evaluated` means the most recent tick
+/// could not produce a verdict at all; `reason` (`"<class>: <detail>"`, #3974
+/// AC2) names *why*. Before #3974 this line asserted "workspace tree is dirty"
+/// for every skip, which reported a clean tree as dirty whenever the real cause
+/// was a timeout, a missing build tool, or a broken `git`.
+fn format_gate_status(halted: bool, not_evaluated: bool, reason: Option<&str>) -> String {
+    let cause =
+        reason.map_or_else(|| "cause unrecorded".to_string(), std::string::ToString::to_string);
+    match (halted, not_evaluated) {
+        (true, true) => format!(
+            "HALTED (main verified red — new dispatch paused) + NOT EVALUATED ({cause}) — \
+             the gate cannot currently confirm main is still red, or check for recovery"
+        ),
+        (true, false) => {
+            "HALTED (main verified red — new dispatch paused; in-flight sweeps keep running)"
+                .to_string()
+        }
+        (false, true) => format!(
+            "not evaluated ({cause}) — the gate could not run, which is NOT evidence about \
+             main; dispatch is NOT halted by this"
+        ),
+        (false, false) => "clear (dispatch allowed)".to_string(),
+    }
 }
 
 /// Emit the combined status as a human-readable table.
@@ -1578,20 +1609,18 @@ fn print_status_human(report: &DaemonStatusReport, token_usage: Option<&serde_js
         );
     }
 
-    // "Halted" (a completed gate run found main red) and "not evaluated" (the
-    // gate skipped this tick because the tree is dirty) are distinct states
-    // that can co-occur (#3950 AC3): a prior halt persists untouched while a
-    // dirty tree blocks the *next* evaluation.
-    let gate = match (report.main_health_gate_halted, report.main_health_gate_not_evaluated) {
-        (true, true) => {
-            "HALTED (main is red — new dispatch paused) + NOT EVALUATED (workspace tree is dirty — the gate cannot currently confirm main is still red, or check for recovery)"
-        }
-        (true, false) => "HALTED (main is red — new dispatch paused; in-flight sweeps keep running)",
-        (false, true) => {
-            "not evaluated (workspace tree is dirty — the gate is skipping runs rather than resetting over local changes; dispatch is NOT halted by this)"
-        }
-        (false, false) => "clear (dispatch allowed)",
-    };
+    // "Halted" (a completed gate run found main verified-red) and "not
+    // evaluated" (the gate could not run this tick) are distinct states that can
+    // co-occur (#3950 AC3): a prior halt persists untouched while an
+    // environmental failure blocks the *next* evaluation. The not-evaluated
+    // cause is reported verbatim from the gate (#3974 AC2) — pre-#3974 this
+    // line hard-coded "workspace tree is dirty" for every skip, which
+    // misreported timeouts / missing tools / broken `git` as a dirty tree.
+    let gate = format_gate_status(
+        report.main_health_gate_halted,
+        report.main_health_gate_not_evaluated,
+        report.main_health_gate_not_evaluated_reason.as_deref(),
+    );
     println!("\nMain-health gate: {gate}");
 
     // Per-repo breakdown across every registered managed workspace (#3930). In
@@ -1611,7 +1640,7 @@ fn print_status_human(report: &DaemonStatusReport, token_usage: Option<&serde_js
             // Same halted/not-evaluated distinction as the top-level summary
             // above, condensed for the table column (#3950 AC3).
             let gate = match (r.health_gate_halted, r.health_gate_not_evaluated) {
-                (true, true) => "HALTED+DIRTY",
+                (true, true) => "HALTED+UNEVAL",
                 (true, false) => "HALTED",
                 (false, true) => "not-evaluated",
                 (false, false) => "clear",
@@ -1623,6 +1652,11 @@ fn print_status_human(report: &DaemonStatusReport, token_usage: Option<&serde_js
                 gate,
                 r.root.display()
             );
+            // Name the failure class behind a not-evaluated repo (#3974 AC2) so
+            // the operator can tell "dirty tree" from "cargo not on PATH".
+            if let Some(reason) = &r.health_gate_not_evaluated_reason {
+                println!("        gate not evaluated — {reason}");
+            }
             // Insta-crash quarantine (#3939): list the issues this repo is
             // currently refusing to re-dispatch so a stalled-but-nonempty backlog
             // is explained. Auto-releases on a TTL (or `loom:blocked` removal).
@@ -2048,8 +2082,8 @@ mod dispatch_tests {
     //! against a fake daemon, and the bounded-timeout path against a
     //! deliberately-unresponsive socket (the #3945 wedge must never hang).
     use super::{
-        build_dispatch_request, query_daemon_bounded, resolve_dispatch_ack_timeout,
-        DAEMON_IPC_TIMEOUT_ENV, DISPATCH_ACK_TIMEOUT,
+        build_dispatch_request, format_gate_status, query_daemon_bounded,
+        resolve_dispatch_ack_timeout, DAEMON_IPC_TIMEOUT_ENV, DISPATCH_ACK_TIMEOUT,
     };
     use loom_daemon::types::{Request, Response, SweepKind};
     use serial_test::serial;
@@ -2330,5 +2364,51 @@ mod dispatch_tests {
         }
 
         std::env::remove_var(DAEMON_IPC_TIMEOUT_ENV);
+    }
+
+    // ===================================================================
+    // Main-health gate status line (#3950 AC3 shape, #3974 AC2 cause)
+    // ===================================================================
+
+    #[test]
+    fn format_gate_status_names_the_actual_not_evaluated_cause() {
+        // Pre-#3974 this line asserted "workspace tree is dirty" for EVERY
+        // skip, so a `git fetch` failure on a completely clean tree was
+        // reported as a dirty tree. The cause is now passed through verbatim.
+        let s = format_gate_status(
+            false,
+            true,
+            Some("git-failure: `git -C /repo fetch origin main` failed (exit 128)"),
+        );
+        assert!(s.contains("git-failure"), "got: {s}");
+        assert!(s.contains("exit 128"), "got: {s}");
+        assert!(!s.contains("dirty"), "must not assume a dirty tree: {s}");
+        assert!(s.contains("NOT evidence about"), "got: {s}");
+        assert!(s.contains("NOT halted"), "an unevaluated gate does not halt: {s}");
+
+        // A dirty tree still reads as a dirty tree — because the gate said so.
+        let s = format_gate_status(false, true, Some("dirty-tree: [ M src/main.rs]"));
+        assert!(s.contains("dirty-tree"), "got: {s}");
+        assert!(s.contains("src/main.rs"), "got: {s}");
+    }
+
+    #[test]
+    fn format_gate_status_covers_all_four_states() {
+        assert_eq!(format_gate_status(false, false, None), "clear (dispatch allowed)");
+
+        let halted = format_gate_status(true, false, None);
+        assert!(halted.starts_with("HALTED"), "got: {halted}");
+        assert!(halted.contains("verified red"), "got: {halted}");
+
+        // Both at once: a prior verified-red halt persists while the next tick
+        // cannot evaluate.
+        let both = format_gate_status(true, true, Some("timeout: gate command timed out"));
+        assert!(both.contains("HALTED"), "got: {both}");
+        assert!(both.contains("NOT EVALUATED"), "got: {both}");
+        assert!(both.contains("timeout"), "got: {both}");
+
+        // A missing cause degrades gracefully rather than inventing one.
+        let no_cause = format_gate_status(false, true, None);
+        assert!(no_cause.contains("cause unrecorded"), "got: {no_cause}");
     }
 }

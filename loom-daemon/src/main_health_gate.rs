@@ -11,12 +11,49 @@
 //! # What it does
 //!
 //! On a configurable cadence the gate runs the repo's configured
-//! `buildGate.command` (schema shipped in #3749) against `main`. On a **red**
-//! run (non-zero exit or timeout) it sets a shared halt flag; the
-//! [`crate::work_finder`] loop consults that flag and dispatches **zero** new
-//! sweeps while halted (existing in-flight sweeps are never killed — halting
-//! only stops making a red `main` worse). The next **green** run clears the
-//! flag and dispatch resumes on the following work-finder tick.
+//! `buildGate.command` (schema shipped in #3749) against `main`. On a
+//! **verified-red** run — the command *ran to completion* and reported failure
+//! — it sets a shared halt flag; the [`crate::work_finder`] loop consults that
+//! flag and dispatches **zero** new sweeps while halted (existing in-flight
+//! sweeps are never killed — halting only stops making a red `main` worse). The
+//! next **green** run clears the flag and dispatch resumes on the following
+//! work-finder tick.
+//!
+//! # "Could not run" is not evidence about `main` (#3974)
+//!
+//! A gate run that never completed — a timeout, `sh` reporting exit 127 because
+//! a build tool is not on the daemon's `PATH`, a spawn failure, a broken
+//! process tree that kills `git fetch` — tells you **nothing** about `main`'s
+//! health. Treating those as red converts every environmental hiccup into a
+//! total dispatch outage, and for the repo that contains the gate's own source
+//! into a bootstrap deadlock: the daemon cannot dispatch the fix for the thing
+//! that is broken. So every outcome is classified as exactly one of:
+//!
+//! | Outcome | Meaning | Effect on dispatch |
+//! |---------|---------|--------------------|
+//! | [`GateOutcome::Green`] | ran to completion, checks passed | clears any halt |
+//! | [`GateOutcome::Red`] (VERIFIED_RED) | ran to completion, checks failed | **halts** |
+//! | [`GateOutcome::Unevaluated`] (UNEVALUATED) | did not run to completion | **preserves the previous verdict**, logs loudly with the failure class |
+//!
+//! The discriminator is deliberately narrow so a genuinely failing build still
+//! halts: only timeouts, exit 126/127, signal deaths, spawn/IO errors, and the
+//! pre-run workspace-preparation failures are UNEVALUATED. Any other non-zero
+//! exit is a command that ran and reported failure — trusted as VERIFIED_RED.
+//!
+//! # Forge-CI corroboration (#3974 AC4)
+//!
+//! One more case looks exactly like VERIFIED_RED from the exit code but is not
+//! evidence about the commit: a local run that fails **because of this host**.
+//! Observed on the incident host — six `integration_basic` tests assert
+//! `tmux_session_exists(...)` and fail because the host's tmux server is dead,
+//! while `.github/workflows/ci.yml` runs the identical `cargo test --workspace`
+//! on the same commit and passes. The local gate measures *this host*; forge CI
+//! measures *the commit*. So a completed-and-failed run is cross-checked against
+//! the forge's CI conclusion for the exact `origin/main` SHA the gate evaluated;
+//! a **green** CI on that SHA downgrades the outcome to UNEVALUATED
+//! ([`UnevaluatedClass::ContradictedByForgeCi`]) instead of halting. CI red or
+//! unavailable keeps the halt — only positive contrary evidence relaxes it. See
+//! [`CommandGateRunner`].
 //!
 //! # Shape (mirrors [`crate::work_finder`])
 //!
@@ -81,12 +118,21 @@ const GATE_POLL_INTERVAL: Duration = Duration::from_millis(200);
 /// line (the *tail* is kept — the failing assertion is usually last).
 const MAX_OUTPUT_TAIL_BYTES: usize = 4096;
 
-/// Throttle interval for the repeated "gate run SKIPPED" log line (#3950
-/// AC2). A dirty workspace logs once immediately on the clean→dirty
-/// transition, then at most once per this interval while it stays dirty —
-/// down from logging on *every* ~30s tick (2,000+ lines/day observed on the
-/// canary host from a single stuck-dirty repo).
+/// Throttle interval for the repeated "gate run UNEVALUATED" log line (#3950
+/// AC2). An unevaluable workspace logs once immediately on the
+/// evaluated→unevaluated transition, then at most once per this interval while
+/// it stays unevaluable — down from logging on *every* ~30s tick (2,000+
+/// lines/day observed on the canary host from a single stuck-dirty repo). A
+/// **change of failure class** (#3974) also re-warns immediately, so a repo
+/// that flips from `dirty-tree` to `timeout` to `command-not-executable` is
+/// never silently throttled behind the first class it hit.
 const SKIP_WARN_THROTTLE: Duration = Duration::from_secs(3600);
+
+/// Max characters of an UNEVALUATED reason retained for the `loom-daemon
+/// status` surface (#3974 AC2). The full reason (which can embed a multi-KB
+/// output tail) still goes to the daemon log; the status line only needs
+/// enough to name what actually happened.
+const MAX_STATUS_REASON_CHARS: usize = 240;
 
 // ============================================================================
 // Shared halt state
@@ -100,22 +146,36 @@ const SKIP_WARN_THROTTLE: Duration = Duration::from_secs(3600);
 /// work-finder tick with no mutex. `halted == true` means "a `buildGate` run
 /// against `main` most recently failed — do not dispatch new work."
 pub struct MainHealthState {
-    /// Whether autonomous dispatch is currently halted due to a red `main`.
+    /// Whether autonomous dispatch is currently halted due to a **verified-red**
+    /// `main` — a gate command that ran to completion and reported failure.
     halted: AtomicBool,
-    /// Whether the most recent gate tick was `Skipped` (indeterminate — the
-    /// workspace tree had unexpected dirt and the gate did not run at all).
-    /// Tracked separately from `halted` so status can distinguish "not
-    /// evaluated (dirty tree)" from "halted (red main)" (#3950 AC3): the two
-    /// can even both be `true` at once (main was red before the tree went
-    /// dirty; dispatch remains halted from that prior red run while
-    /// evaluation is now skipped). `false` for a fresh state and after any
-    /// completed (non-skip) tick.
-    skipped: AtomicBool,
-    /// Throttle bookkeeping for the skip-warn log line (#3950 AC2): the
-    /// instant the warning was last emitted for the *current* dirty streak.
-    /// Reset to `None` whenever a tick is not skipped, so the next dirty
-    /// streak logs immediately again on its first tick.
-    last_skip_warn: Mutex<Option<Instant>>,
+    /// Whether the most recent gate tick was [`GateOutcome::Unevaluated`] (the
+    /// gate could not produce a verdict — dirty tree, timeout, missing tool,
+    /// failed `git` step, …). Tracked separately from `halted` so status can
+    /// distinguish "not evaluated" from "halted (red main)" (#3950 AC3): the
+    /// two can even both be `true` at once (main was verified red before the
+    /// environment broke; dispatch remains halted from that prior red run
+    /// while evaluation is now impossible). `false` for a fresh state and
+    /// after any completed (Green/Red) tick.
+    unevaluated: AtomicBool,
+    /// Throttle + diagnosis bookkeeping for the UNEVALUATED log line and the
+    /// `loom-daemon status` surface — see [`UnevaluatedTrack`].
+    track: Mutex<UnevaluatedTrack>,
+}
+
+/// Bookkeeping for the current UNEVALUATED streak: when its warning was last
+/// emitted (throttle, #3950 AC2) and *what* the last failure actually was
+/// (#3974 AC2 — so status names the real class instead of always claiming a
+/// dirty tree).
+#[derive(Debug, Default)]
+struct UnevaluatedTrack {
+    /// The instant the warning was last emitted for the *current* streak.
+    /// Reset to `None` whenever a tick is evaluated, so the next streak logs
+    /// immediately again on its first tick.
+    last_warn: Option<Instant>,
+    /// The most recent UNEVALUATED class + reason, or `None` after any
+    /// completed (Green/Red) tick.
+    detail: Option<(UnevaluatedClass, String)>,
 }
 
 impl MainHealthState {
@@ -127,8 +187,8 @@ impl MainHealthState {
     pub fn new() -> Self {
         Self {
             halted: AtomicBool::new(false),
-            skipped: AtomicBool::new(false),
-            last_skip_warn: Mutex::new(None),
+            unevaluated: AtomicBool::new(false),
+            track: Mutex::new(UnevaluatedTrack::default()),
         }
     }
 
@@ -143,37 +203,87 @@ impl MainHealthState {
         self.halted.store(halted, Ordering::SeqCst);
     }
 
-    /// Whether the most recent gate tick was `Skipped` (dirty tree) — see the
-    /// field doc on [`Self::skipped`].
+    /// Whether the most recent gate tick was [`GateOutcome::Unevaluated`] — see
+    /// the field doc on [`Self::unevaluated`].
     #[must_use]
-    pub fn is_skipped(&self) -> bool {
-        self.skipped.load(Ordering::SeqCst)
+    pub fn is_unevaluated(&self) -> bool {
+        self.unevaluated.load(Ordering::SeqCst)
     }
 
-    /// Record this tick's skip/non-skip outcome and report whether the
-    /// skip-warn log line should fire now (#3950 AC2): `true` exactly once on
-    /// a not-skipped -> skipped transition, then at most once per `throttle`
-    /// while the tree remains dirty. Always `false` when `is_skip` is
-    /// `false`, which also clears the throttle timer so the next dirty streak
-    /// warns immediately again. Call this exactly once per tick, alongside
-    /// [`apply_gate_outcome`].
-    pub fn note_gate_tick(&self, is_skip: bool, throttle: Duration) -> bool {
-        let was_skipped = self.skipped.swap(is_skip, Ordering::SeqCst);
-        let mut last = self
-            .last_skip_warn
+    /// The class of the most recent UNEVALUATED tick, or `None` after a
+    /// completed (Green/Red) tick.
+    #[must_use]
+    pub fn unevaluated_class(&self) -> Option<UnevaluatedClass> {
+        self.track
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .detail
+            .as_ref()
+            .map(|(class, _)| *class)
+    }
+
+    /// A short `"<class>: <reason>"` summary of the most recent UNEVALUATED
+    /// tick for the `loom-daemon status` surface (#3974 AC2), truncated to
+    /// [`MAX_STATUS_REASON_CHARS`]. `None` after a completed (Green/Red) tick.
+    #[must_use]
+    pub fn unevaluated_summary(&self) -> Option<String> {
+        let track = self
+            .track
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if !is_skip {
-            *last = None;
+        let (class, reason) = track.detail.as_ref()?;
+        Some(format!("{class}: {}", truncate_chars(reason, MAX_STATUS_REASON_CHARS)))
+    }
+
+    /// Record this tick's evaluated/unevaluated outcome and report whether the
+    /// UNEVALUATED log line should fire now (#3950 AC2, #3974): `true` exactly
+    /// once on an evaluated -> unevaluated transition, again whenever the
+    /// failure **class changes** mid-streak (#3974 — a repo that flips from
+    /// `dirty-tree` to `timeout` must not stay silent behind the first class),
+    /// then at most once per `throttle` while the same class persists. Always
+    /// `false` when `unevaluated` is `None`, which also clears the throttle
+    /// timer and the stored detail so the next streak warns immediately again.
+    /// Call this exactly once per tick, alongside [`apply_gate_outcome`].
+    pub fn note_gate_tick(
+        &self,
+        unevaluated: Option<(UnevaluatedClass, &str)>,
+        throttle: Duration,
+    ) -> bool {
+        let was_unevaluated = self
+            .unevaluated
+            .swap(unevaluated.is_some(), Ordering::SeqCst);
+        let mut track = self
+            .track
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some((class, reason)) = unevaluated else {
+            track.last_warn = None;
+            track.detail = None;
             return false;
-        }
+        };
+        let class_changed = track.detail.as_ref().is_none_or(|(c, _)| *c != class);
         let now = Instant::now();
-        let should_warn = !was_skipped || last.is_none_or(|t| now.duration_since(t) >= throttle);
+        let should_warn = !was_unevaluated
+            || class_changed
+            || track
+                .last_warn
+                .is_none_or(|t| now.duration_since(t) >= throttle);
+        track.detail = Some((class, reason.to_string()));
         if should_warn {
-            *last = Some(now);
+            track.last_warn = Some(now);
         }
         should_warn
     }
+}
+
+/// Truncate `s` to at most `max` **characters** (never splitting a UTF-8
+/// boundary), appending an ellipsis marker when anything was dropped.
+fn truncate_chars(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s.to_string();
+    }
+    let head: String = s.chars().take(max).collect();
+    format!("{head}…")
 }
 
 impl Default for MainHealthState {
@@ -241,16 +351,30 @@ impl WorkspaceHealthStates {
         map.get(root).is_some_and(|s| s.is_halted())
     }
 
-    /// Whether `root`'s most recent gate tick was `Skipped` (dirty tree —
-    /// "not evaluated", #3950 AC3). A never-seen root reports `false` — no
+    /// Whether `root`'s most recent gate tick was [`GateOutcome::Unevaluated`]
+    /// ("not evaluated", #3950 AC3). A never-seen root reports `false` — no
     /// gate has run against it.
     #[must_use]
-    pub fn is_skipped(&self, root: &Path) -> bool {
+    pub fn is_unevaluated(&self, root: &Path) -> bool {
         let map = self
             .inner
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        map.get(root).is_some_and(|s| s.is_skipped())
+        map.get(root).is_some_and(|s| s.is_unevaluated())
+    }
+
+    /// A short `"<class>: <reason>"` summary of `root`'s most recent
+    /// UNEVALUATED tick (#3974 AC2), or `None` when its last tick completed
+    /// (Green/Red) or it has never been gated. Consumed by the daemon-status
+    /// surface so it names the *actual* failure instead of always reporting a
+    /// dirty tree.
+    #[must_use]
+    pub fn unevaluated_summary(&self, root: &Path) -> Option<String> {
+        let map = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        map.get(root).and_then(|s| s.unevaluated_summary())
     }
 
     /// Directly set `root`'s halt flag (creating its state if absent). Primarily
@@ -359,25 +483,102 @@ pub fn read_build_gate_config(repo_root: &Path) -> Option<BuildGateConfig> {
 // Gate outcome + runner
 // ============================================================================
 
+/// Why a gate run produced **no verdict** about `main` (#3974).
+///
+/// Every variant means the same thing for the dispatch decision — *the gate did
+/// not run to completion, so it learned nothing about `main`* — and therefore
+/// leaves the previous verdict untouched. The class exists so the log line and
+/// `loom-daemon status` can name the **actual** failure instead of reporting a
+/// generic (and, pre-#3974, frequently wrong) "workspace tree is dirty".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnevaluatedClass {
+    /// The workspace had non-ignorable local changes, so it was never synced to
+    /// `origin/main` and the gate did not run (protects operator edits, #3885).
+    DirtyTree,
+    /// The workspace was on a branch other than `main` (or a detached HEAD).
+    NotOnMain,
+    /// The workspace's local `main` carried commits `origin/main` lacks, so the
+    /// pre-run hard reset was refused (#3912).
+    LocalAhead,
+    /// A `git` step of the pre-run workspace preparation failed — `rev-parse`,
+    /// `status`, `fetch`, `rev-list`, or `reset`. Includes the environmental
+    /// class that motivated #3974: a broken process tree where `git fetch`
+    /// exits 128 with "No user exists for uid …".
+    GitFailure,
+    /// The gate command exceeded `buildGate.timeoutSeconds` and was killed.
+    Timeout,
+    /// The gate command could not be executed: `sh` reported 127 (command not
+    /// found — e.g. `cargo` missing from the daemon's `PATH`) or 126 (found but
+    /// not executable).
+    NotExecutable,
+    /// The gate command was terminated by a signal rather than exiting on its
+    /// own (e.g. an OOM kill on a contended host).
+    KilledBySignal,
+    /// The gate command could not be spawned at all, or an I/O error occurred
+    /// while capturing its output / polling for completion.
+    SpawnFailure,
+    /// The gate command ran to completion and **failed**, but the forge's CI is
+    /// green on the very commit it evaluated (#3974 AC4). The two disagree
+    /// because they measure different things — CI measures the commit, the local
+    /// run measures this host — so the local failure is host-environmental and
+    /// is not evidence about `main`.
+    ContradictedByForgeCi,
+}
+
+impl UnevaluatedClass {
+    /// A short, stable, log/status-friendly name for this class.
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::DirtyTree => "dirty-tree",
+            Self::NotOnMain => "not-on-main",
+            Self::LocalAhead => "local-ahead",
+            Self::GitFailure => "git-failure",
+            Self::Timeout => "timeout",
+            Self::NotExecutable => "command-not-executable",
+            Self::KilledBySignal => "killed-by-signal",
+            Self::SpawnFailure => "spawn-failure",
+            Self::ContradictedByForgeCi => "contradicted-by-forge-ci",
+        }
+    }
+}
+
+impl std::fmt::Display for UnevaluatedClass {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.label())
+    }
+}
+
 /// The result of one gate run.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GateOutcome {
     /// `buildGate.command` exited 0 — `main` is healthy.
     Green,
-    /// `buildGate.command` failed (non-zero exit, timeout, or spawn error).
-    /// `detail` is a human-readable reason + a tail of captured output.
+    /// **VERIFIED_RED**: `buildGate.command` ran to completion and reported
+    /// failure (a non-zero exit that is not one of the "could not run" codes —
+    /// see [`UnevaluatedClass`]). `detail` is a human-readable reason + a tail
+    /// of captured output. This — and only this — halts autonomous dispatch.
     Red { detail: String },
-    /// The gate did **not** run because the workspace could not be prepared to
-    /// reflect `origin/main` (dirty tree, not on `main`, a failed `git` step, or
-    /// a `git fetch` failure). `reason` explains why. A skipped run is
-    /// **indeterminate** — it deliberately leaves the halt flag unchanged rather
-    /// than greenwashing a stale checkout or spuriously halting on unrelated
-    /// local state (Issue #3885).
-    Skipped { reason: String },
+    /// **UNEVALUATED**: the gate produced no verdict about `main`, either
+    /// because the workspace could not be prepared to reflect `origin/main`
+    /// (dirty tree, not on `main`, a failed `git` step — Issue #3885) or
+    /// because the gate command itself never ran to completion (timeout, exit
+    /// 126/127, signal death, spawn error — Issue #3974). `class` names the
+    /// failure and `reason` explains it.
+    ///
+    /// An unevaluated run is **indeterminate**: it deliberately leaves the halt
+    /// flag exactly as it was rather than greenwashing a stale checkout or
+    /// spuriously halting on the gate's own infrastructure failing.
+    Unevaluated {
+        /// Which "could not run" case this was.
+        class: UnevaluatedClass,
+        /// Human-readable explanation (paths, exit status, output tail).
+        reason: String,
+    },
 }
 
 impl GateOutcome {
-    /// Convenience constructor for a red outcome.
+    /// Convenience constructor for a verified-red outcome.
     #[must_use]
     pub fn red(detail: impl Into<String>) -> Self {
         Self::Red {
@@ -385,10 +586,11 @@ impl GateOutcome {
         }
     }
 
-    /// Convenience constructor for a skipped (indeterminate) outcome.
+    /// Convenience constructor for an unevaluated (indeterminate) outcome.
     #[must_use]
-    pub fn skipped(reason: impl Into<String>) -> Self {
-        Self::Skipped {
+    pub fn unevaluated(class: UnevaluatedClass, reason: impl Into<String>) -> Self {
+        Self::Unevaluated {
+            class,
             reason: reason.into(),
         }
     }
@@ -399,20 +601,36 @@ impl GateOutcome {
         matches!(self, Self::Green)
     }
 
-    /// True when the run was skipped (indeterminate — did not execute the gate
-    /// command).
+    /// True when the run produced no verdict (did not run to completion).
     #[must_use]
-    pub fn is_skipped(&self) -> bool {
-        matches!(self, Self::Skipped { .. })
+    pub fn is_unevaluated(&self) -> bool {
+        matches!(self, Self::Unevaluated { .. })
     }
 
-    /// The red-detail / skip-reason string, or empty for a green outcome.
+    /// True only for a **verified**-red run — the one outcome that halts
+    /// dispatch.
+    #[must_use]
+    pub fn is_verified_red(&self) -> bool {
+        matches!(self, Self::Red { .. })
+    }
+
+    /// The failure class of an unevaluated run, or `None` for Green/Red.
+    #[must_use]
+    pub fn unevaluated_class(&self) -> Option<UnevaluatedClass> {
+        match self {
+            Self::Unevaluated { class, .. } => Some(*class),
+            _ => None,
+        }
+    }
+
+    /// The red-detail / unevaluated-reason string, or empty for a green
+    /// outcome.
     #[must_use]
     pub fn detail(&self) -> &str {
         match self {
             Self::Green => "",
             Self::Red { detail } => detail,
-            Self::Skipped { reason } => reason,
+            Self::Unevaluated { reason, .. } => reason,
         }
     }
 }
@@ -424,8 +642,172 @@ impl GateOutcome {
 /// [`crate::work_finder::WorkDispatcher`] make `tick` testable.
 pub trait GateRunner {
     /// Run the gate once and return its classified outcome. Never errors — a
-    /// spawn failure or timeout is itself a [`GateOutcome::Red`].
+    /// spawn failure or timeout is a [`GateOutcome::Unevaluated`] (the gate
+    /// could not run, which says nothing about `main`), **not** a
+    /// [`GateOutcome::Red`] (#3974).
     fn run_gate(&mut self) -> GateOutcome;
+}
+
+// ============================================================================
+// Forge-CI corroboration of a local red (#3974 AC4)
+// ============================================================================
+
+/// Environment variable disabling the forge-CI corroboration of a local red
+/// (#3974 AC4). Corroboration is **on** by default — it can only ever *relax* a
+/// halt, and only on positive contrary evidence — so this exists as an operator
+/// kill switch (`0`/`false`/`no`/`off`) for repos with no forge CI or no `gh`.
+pub const GATE_CI_CORROBORATION_ENV: &str = "LOOM_GATE_CI_CORROBORATION";
+
+/// How long to wait for the forge-CI probe before giving up (and keeping the
+/// local verdict). Deliberately short: this runs inside the gate tick, and an
+/// unavailable answer is the safe answer.
+const CI_PROBE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// How many recent `main` runs to scan for the evaluated SHA.
+const CI_PROBE_RUN_LIMIT: usize = 30;
+
+/// Whether forge-CI corroboration is enabled (default **on**, per
+/// [`GATE_CI_CORROBORATION_ENV`]).
+#[must_use]
+pub fn ci_corroboration_enabled() -> bool {
+    std::env::var(GATE_CI_CORROBORATION_ENV).map_or(true, |v| {
+        !matches!(v.trim().to_ascii_lowercase().as_str(), "0" | "false" | "no" | "off")
+    })
+}
+
+/// The forge's CI conclusion for one commit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CiVerdict {
+    /// Every completed CI run for the commit succeeded (or was skipped/neutral).
+    Success,
+    /// At least one completed CI run for the commit failed / timed out.
+    Failure,
+    /// No answer: no completed run for that commit yet, or the probe itself
+    /// failed (`gh` missing, unauthenticated, offline, timed out).
+    Unknown,
+}
+
+/// Source of the forge's CI conclusion for a commit — abstracted behind a trait
+/// so [`CommandGateRunner`]'s corroboration logic is testable without network,
+/// `gh`, or credentials (mirroring [`GateRunner`] itself).
+pub trait ForgeCiStatus {
+    /// The forge's CI conclusion for `sha` in the repo checked out at
+    /// `repo_root`. Never errors — an unanswerable probe is
+    /// [`CiVerdict::Unknown`].
+    fn conclusion_for(&self, repo_root: &Path, sha: &str) -> CiVerdict;
+}
+
+/// The concrete [`ForgeCiStatus`]: `gh run list --branch main --json …`,
+/// executed in the repo root so `gh` resolves the repository from its git
+/// remote. Conclusions are matched on `headSha`, so a run for a *different*
+/// commit can never corroborate (or contradict) this one.
+pub struct GhForgeCi;
+
+impl ForgeCiStatus for GhForgeCi {
+    fn conclusion_for(&self, repo_root: &Path, sha: &str) -> CiVerdict {
+        let limit = CI_PROBE_RUN_LIMIT.to_string();
+        let args = [
+            "run",
+            "list",
+            "--branch",
+            GATE_BRANCH,
+            "--limit",
+            limit.as_str(),
+            "--json",
+            "headSha,status,conclusion,workflowName",
+        ];
+        let stdout = match run_capture_with_timeout("gh", &args, repo_root, CI_PROBE_TIMEOUT) {
+            Ok(s) => s,
+            Err(e) => {
+                log::debug!("main_health_gate: forge CI probe unavailable ({e})");
+                return CiVerdict::Unknown;
+            }
+        };
+        parse_gh_run_list(&stdout, sha)
+    }
+}
+
+/// Parse `gh run list --json headSha,status,conclusion,workflowName` output and
+/// reduce the runs for `sha` to a single [`CiVerdict`].
+///
+/// Only **completed** runs count. Any `failure` / `timed_out` / `startup_failure`
+/// conclusion makes the commit red; otherwise, at least one completed run makes
+/// it green. No completed run for `sha` (or unparseable output) is `Unknown` —
+/// never a silent "green".
+fn parse_gh_run_list(stdout: &str, sha: &str) -> CiVerdict {
+    let Ok(runs) = serde_json::from_str::<Vec<serde_json::Value>>(stdout) else {
+        log::debug!("main_health_gate: could not parse `gh run list` output");
+        return CiVerdict::Unknown;
+    };
+    let mut saw_completed = false;
+    for run in runs {
+        if run.get("headSha").and_then(serde_json::Value::as_str) != Some(sha) {
+            continue;
+        }
+        if run.get("status").and_then(serde_json::Value::as_str) != Some("completed") {
+            continue;
+        }
+        saw_completed = true;
+        if let Some("failure" | "timed_out" | "startup_failure") =
+            run.get("conclusion").and_then(serde_json::Value::as_str)
+        {
+            return CiVerdict::Failure;
+        }
+    }
+    if saw_completed {
+        CiVerdict::Success
+    } else {
+        CiVerdict::Unknown
+    }
+}
+
+/// Run `program args…` in `cwd`, capturing stdout, killing it after `timeout`.
+///
+/// stdout goes to a temp file rather than a pipe for the same reason the gate
+/// command's does (no pipe-buffer deadlock while polling); stderr is discarded.
+fn run_capture_with_timeout(
+    program: &str,
+    args: &[&str],
+    cwd: &Path,
+    timeout: Duration,
+) -> std::result::Result<String, String> {
+    let log_path =
+        std::env::temp_dir().join(format!("loom-gate-ci-probe-{}.json", uuid::Uuid::new_v4()));
+    let out_file = std::fs::File::create(&log_path)
+        .map_err(|e| format!("could not create probe output file: {e}"))?;
+    let mut child = Command::new(program)
+        .args(args)
+        .current_dir(cwd)
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(out_file))
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|e| {
+            let _ = std::fs::remove_file(&log_path);
+            format!("could not spawn `{program}`: {e}")
+        })?;
+
+    let start = Instant::now();
+    let result = loop {
+        match child.try_wait() {
+            Ok(Some(status)) if status.success() => {
+                break std::fs::read_to_string(&log_path)
+                    .map_err(|e| format!("could not read probe output: {e}"));
+            }
+            Ok(Some(status)) => break Err(format!("`{program}` exited with {status}")),
+            Ok(None) => {
+                if start.elapsed() >= timeout {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    break Err(format!("`{program}` timed out after {}s", timeout.as_secs()));
+                }
+                std::thread::sleep(GATE_POLL_INTERVAL);
+            }
+            Err(e) => break Err(format!("could not poll `{program}`: {e}")),
+        }
+    };
+    let _ = std::fs::remove_file(&log_path);
+    result
 }
 
 /// The concrete [`GateRunner`]: syncs the workspace to `origin/main`, then shells
@@ -440,12 +822,32 @@ pub trait GateRunner {
 /// edits / a stray branch turn it red on unrelated state (false halt). So before
 /// each run [`prepare_workspace_to_origin_main`] fast-forwards the checkout to
 /// `origin/main` — but only when it is on `main` and clean; a dirty tree or a
-/// failed `git` step yields a [`GateOutcome::Skipped`] that leaves the halt flag
-/// untouched rather than clobbering operator edits or acting on stale state
+/// failed `git` step yields a [`GateOutcome::Unevaluated`] that leaves the halt
+/// flag untouched rather than clobbering operator edits or acting on stale state
 /// (Issue #3885).
 ///
 /// Sync can be disabled with [`without_sync`](Self::without_sync) (used by unit
 /// tests that exercise command classification against a scratch dir).
+///
+/// # Forge-CI corroboration of a local red (#3974 AC4)
+///
+/// A completed-and-failed local run is only evidence about `main` if the local
+/// run measures the *commit* rather than *this host*. Observed on the incident
+/// host: six `integration_basic` tests assert `tmux_session_exists(...)` and
+/// fail because the host's tmux server is dead, while `.github/workflows/ci.yml`
+/// runs the identical `cargo test --workspace` and passes. Exit-code inspection
+/// alone cannot tell that apart from a real regression.
+///
+/// So when the local command completes and fails, the runner asks the forge for
+/// its CI conclusion on the **same** `origin/main` SHA the gate just evaluated:
+///
+/// - CI **green** on that SHA ⇒ the divergence is host-environmental. The
+///   outcome is downgraded to [`UnevaluatedClass::ContradictedByForgeCi`], logged
+///   loudly, and dispatch is **not** halted.
+/// - CI **red** on that SHA ⇒ corroborated; still VERIFIED_RED, still halts.
+/// - CI **unknown** (no completed run yet, `gh` unavailable/unauthenticated, a
+///   probe timeout) ⇒ fail safe: still VERIFIED_RED, still halts. The local
+///   result is only ever overridden by *positive* contrary evidence.
 pub struct CommandGateRunner {
     config: BuildGateConfig,
     repo_root: PathBuf,
@@ -453,6 +855,9 @@ pub struct CommandGateRunner {
     /// production (via [`new`](Self::new)); tests opt out with
     /// [`without_sync`](Self::without_sync).
     sync: bool,
+    /// Forge-CI corroboration source for a local red (#3974 AC4). Defaults to
+    /// [`GhForgeCi`]; tests substitute a scripted fake.
+    ci: Box<dyn ForgeCiStatus + Send>,
 }
 
 impl CommandGateRunner {
@@ -464,6 +869,7 @@ impl CommandGateRunner {
             config,
             repo_root,
             sync: true,
+            ci: Box::new(GhForgeCi),
         }
     }
 
@@ -474,17 +880,77 @@ impl CommandGateRunner {
         self.sync = false;
         self
     }
+
+    /// Substitute the forge-CI corroboration source (#3974 AC4). Intended for
+    /// tests; production uses [`GhForgeCi`].
+    #[must_use]
+    pub fn with_ci_status(mut self, ci: Box<dyn ForgeCiStatus + Send>) -> Self {
+        self.ci = ci;
+        self
+    }
+
+    /// Cross-check a completed-and-failed local run against the forge's CI
+    /// conclusion for the same evaluated commit — see the type-level docs.
+    fn corroborate_red(&self, evaluated_sha: Option<&str>, detail: String) -> GateOutcome {
+        if !ci_corroboration_enabled() {
+            return GateOutcome::red(detail);
+        }
+        // No SHA ⇒ we cannot ask about "the same commit" (sync disabled, or
+        // `git rev-parse` failed). Fail safe: keep the local verdict.
+        let Some(sha) = evaluated_sha else {
+            return GateOutcome::red(detail);
+        };
+        match self.ci.conclusion_for(&self.repo_root, sha) {
+            CiVerdict::Success => GateOutcome::unevaluated(
+                UnevaluatedClass::ContradictedByForgeCi,
+                format!(
+                    "local gate FAILED but forge CI is GREEN on the very commit it evaluated ({sha}) — \
+                     the local run is measuring THIS HOST, not the commit, so it is not evidence \
+                     about main (dispatch not halted). Investigate the host: the local failure was: {detail}"
+                ),
+            ),
+            CiVerdict::Failure => GateOutcome::red(format!(
+                "{detail}; corroborated — forge CI is also red on the evaluated commit {sha}"
+            )),
+            CiVerdict::Unknown => GateOutcome::red(format!(
+                "{detail}; forge CI conclusion for the evaluated commit {sha} is unavailable, \
+                 so the local result stands"
+            )),
+        }
+    }
 }
 
 impl GateRunner for CommandGateRunner {
     fn run_gate(&mut self) -> GateOutcome {
+        let mut evaluated_sha = None;
         if self.sync {
-            if let PrepOutcome::Skip { reason } = prepare_workspace_to_origin_main(&self.repo_root)
-            {
-                return GateOutcome::skipped(reason);
+            match prepare_workspace_to_origin_main(&self.repo_root) {
+                PrepOutcome::Skip { class, reason } => {
+                    return GateOutcome::unevaluated(class, reason);
+                }
+                // Post-sync HEAD *is* `origin/main`, so this is exactly the
+                // commit the gate command is about to build (#3974 AC4).
+                PrepOutcome::Ready => evaluated_sha = resolve_head_sha(&self.repo_root),
             }
         }
-        run_command_with_timeout(&self.config.command, &self.repo_root, self.config.timeout)
+        let outcome =
+            run_command_with_timeout(&self.config.command, &self.repo_root, self.config.timeout);
+        match outcome {
+            GateOutcome::Red { detail } => self.corroborate_red(evaluated_sha.as_deref(), detail),
+            other => other,
+        }
+    }
+}
+
+/// Resolve `repo_root`'s current HEAD commit SHA, or `None` when `git` fails.
+fn resolve_head_sha(repo_root: &Path) -> Option<String> {
+    match run_git(repo_root, &["rev-parse", "HEAD"]) {
+        Ok((sha, _)) if !sha.is_empty() => Some(sha),
+        Ok(_) => None,
+        Err(e) => {
+            log::debug!("main_health_gate: could not resolve HEAD of {}: {e}", repo_root.display());
+            None
+        }
     }
 }
 
@@ -592,9 +1058,15 @@ pub enum PrepOutcome {
     /// `origin/main` — the gate command may run against a fresh tree.
     Ready,
     /// The workspace could **not** be safely synced (dirty tree, not on `main`,
-    /// or a failed `git` step). `reason` explains why; the caller should skip
-    /// the gate run and leave the halt flag unchanged.
-    Skip { reason: String },
+    /// or a failed `git` step). `class` names which case this was (#3974) and
+    /// `reason` explains why; the caller should skip the gate run and leave the
+    /// halt flag unchanged.
+    Skip {
+        /// Which "could not run" case blocked preparation.
+        class: UnevaluatedClass,
+        /// Human-readable explanation, naming the offending paths / `git` error.
+        reason: String,
+    },
 }
 
 /// Run a `git` subcommand in `repo_root`, returning `Ok((stdout, stderr))` on a
@@ -685,14 +1157,20 @@ pub fn prepare_workspace_to_origin_main(repo_root: &Path) -> PrepOutcome {
         Ok((out, _)) => out,
         Err(e) => {
             return PrepOutcome::Skip {
-                reason: format!("could not determine current branch ({e})"),
+                class: UnevaluatedClass::GitFailure,
+                reason: format!(
+                    "could not determine current branch of {} ({e})",
+                    repo_root.display()
+                ),
             };
         }
     };
     if branch != GATE_BRANCH {
         return PrepOutcome::Skip {
+            class: UnevaluatedClass::NotOnMain,
             reason: format!(
-                "workspace is on '{branch}', not '{GATE_BRANCH}' — skipping gate (will not reset an operator branch)"
+                "workspace {} is on '{branch}', not '{GATE_BRANCH}' — skipping gate (will not reset an operator branch)",
+                repo_root.display()
             ),
         };
     }
@@ -706,17 +1184,24 @@ pub fn prepare_workspace_to_origin_main(repo_root: &Path) -> PrepOutcome {
         Ok(out) => {
             let unexpected = non_ignorable_dirt(&out);
             if !unexpected.is_empty() {
+                // Name the exact `git status --porcelain` lines, and the root
+                // they were read from, so the claim is checkable against
+                // `git -C <root> status --porcelain` by hand (#3974 AC2).
                 return PrepOutcome::Skip {
+                    class: UnevaluatedClass::DirtyTree,
                     reason: format!(
-                        "workspace has local changes — skipping gate (will not hard-reset over operator edits): {}",
-                        unexpected.join(", ")
+                        "`git -C {} status --porcelain` reports {} non-ignorable change(s) — skipping gate (will not hard-reset over operator edits): [{}]",
+                        repo_root.display(),
+                        unexpected.len(),
+                        unexpected.join(" | ")
                     ),
                 };
             }
         }
         Err(e) => {
             return PrepOutcome::Skip {
-                reason: format!("could not check workspace cleanliness ({e})"),
+                class: UnevaluatedClass::GitFailure,
+                reason: format!("could not check cleanliness of {} ({e})", repo_root.display()),
             };
         }
     }
@@ -724,7 +1209,11 @@ pub fn prepare_workspace_to_origin_main(repo_root: &Path) -> PrepOutcome {
     // 3. Fetch origin/main.
     if let Err(e) = run_git(repo_root, &["fetch", GATE_REMOTE, GATE_BRANCH]) {
         return PrepOutcome::Skip {
-            reason: format!("`git fetch {GATE_REMOTE} {GATE_BRANCH}` failed ({e}) — skipping gate rather than testing a stale checkout"),
+            class: UnevaluatedClass::GitFailure,
+            reason: format!(
+                "`git -C {} fetch {GATE_REMOTE} {GATE_BRANCH}` failed ({e}) — skipping gate rather than testing a stale checkout",
+                repo_root.display()
+            ),
         };
     }
 
@@ -737,15 +1226,18 @@ pub fn prepare_workspace_to_origin_main(repo_root: &Path) -> PrepOutcome {
         Ok((out, _)) => {
             if out != "0" {
                 return PrepOutcome::Skip {
+                    class: UnevaluatedClass::LocalAhead,
                     reason: format!(
-                        "workspace '{GATE_BRANCH}' is {out} commit(s) ahead of {remote_ref} — skipping gate (will not hard-reset away local-only commits)"
+                        "workspace {} '{GATE_BRANCH}' is {out} commit(s) ahead of {remote_ref} — skipping gate (will not hard-reset away local-only commits)",
+                        repo_root.display()
                     ),
                 };
             }
         }
         Err(e) => {
             return PrepOutcome::Skip {
-                reason: format!("could not compare workspace to {remote_ref} ({e})"),
+                class: UnevaluatedClass::GitFailure,
+                reason: format!("could not compare {} to {remote_ref} ({e})", repo_root.display()),
             };
         }
     }
@@ -753,18 +1245,89 @@ pub fn prepare_workspace_to_origin_main(repo_root: &Path) -> PrepOutcome {
     // 5. Hard-reset to the freshly-fetched origin/main.
     if let Err(e) = run_git(repo_root, &["reset", "--hard", &remote_ref]) {
         return PrepOutcome::Skip {
-            reason: format!("`git reset --hard {remote_ref}` failed ({e})"),
+            class: UnevaluatedClass::GitFailure,
+            reason: format!(
+                "`git -C {} reset --hard {remote_ref}` failed ({e})",
+                repo_root.display()
+            ),
         };
     }
 
     PrepOutcome::Ready
 }
 
+/// Shell exit status for "command not found" (`sh` convention).
+const EXIT_COMMAND_NOT_FOUND: i32 = 127;
+
+/// Shell exit status for "found but not executable" (`sh` convention).
+const EXIT_COMMAND_NOT_EXECUTABLE: i32 = 126;
+
+/// `sh`-reported exit statuses for a child killed by `SIGKILL` / `SIGTERM`
+/// (`128 + signo`). A build tool essentially never *chooses* these as a real
+/// exit status, whereas an OOM kill or an operator/​supervisor `kill` on a
+/// contended host produces them routinely — and neither is a statement about
+/// `main` (#3974).
+const EXIT_SIGKILL: i32 = 137;
+const EXIT_SIGTERM: i32 = 143;
+
+/// Classify a **completed** non-zero gate-command exit as VERIFIED_RED (the
+/// command ran and reported failure — trust it) or UNEVALUATED (the command
+/// could not run — learn nothing), per #3974.
+///
+/// The UNEVALUATED set is deliberately narrow so a genuinely failing build
+/// still halts dispatch: only the `sh` "could not execute" statuses
+/// (127/126), signal deaths (a `None` exit code, or `sh`'s `128 + signo`
+/// rendering of `SIGKILL`/`SIGTERM`) qualify. Everything else — including
+/// `cargo`'s 101 for a failing test — is a command that ran to completion and
+/// reported failure.
+fn classify_failed_exit(
+    command: &str,
+    status: &std::process::ExitStatus,
+    tail: &str,
+) -> GateOutcome {
+    let tail = format_tail(tail);
+    match status.code() {
+        Some(EXIT_COMMAND_NOT_FOUND) => GateOutcome::unevaluated(
+            UnevaluatedClass::NotExecutable,
+            format!(
+                "gate command '{command}' exited 127 (command not found — a tool the gate needs is not on the daemon's PATH); main was NOT evaluated{tail}"
+            ),
+        ),
+        Some(EXIT_COMMAND_NOT_EXECUTABLE) => GateOutcome::unevaluated(
+            UnevaluatedClass::NotExecutable,
+            format!(
+                "gate command '{command}' exited 126 (found but not executable); main was NOT evaluated{tail}"
+            ),
+        ),
+        Some(code @ (EXIT_SIGKILL | EXIT_SIGTERM)) => GateOutcome::unevaluated(
+            UnevaluatedClass::KilledBySignal,
+            format!(
+                "gate command '{command}' was killed by a signal (exit {code}); main was NOT evaluated{tail}"
+            ),
+        ),
+        None => GateOutcome::unevaluated(
+            UnevaluatedClass::KilledBySignal,
+            format!(
+                "gate command '{command}' was terminated by a signal ({status}); main was NOT evaluated{tail}"
+            ),
+        ),
+        Some(_) => GateOutcome::red(format!(
+            "gate command '{command}' ran to completion and exited with {status}{tail}"
+        )),
+    }
+}
+
 /// Run `command` (via `sh -c`) in `cwd`, killing it if it exceeds `timeout`.
 ///
 /// Child stdout+stderr are redirected to a single temp file (not a pipe) so a
 /// chatty build can never dead-lock us on a full pipe buffer while we poll for
-/// completion. The tail of that file is folded into the red-detail string.
+/// completion. The tail of that file is folded into the outcome detail string.
+///
+/// Only a command that **ran to completion** and exited non-zero yields
+/// [`GateOutcome::Red`]. Every failure of the harness itself — the output file,
+/// the spawn, the poll, the timeout — yields [`GateOutcome::Unevaluated`]
+/// (#3974): those say nothing about `main`, and halting on them turns an
+/// environmental hiccup into a total dispatch outage.
 fn run_command_with_timeout(command: &str, cwd: &Path, timeout: Duration) -> GateOutcome {
     use std::fs::File;
 
@@ -773,17 +1336,23 @@ fn run_command_with_timeout(command: &str, cwd: &Path, timeout: Duration) -> Gat
     let out_file = match File::create(&log_path) {
         Ok(f) => f,
         Err(e) => {
-            return GateOutcome::red(format!(
-                "failed to create gate output file {}: {e}",
-                log_path.display()
-            ));
+            return GateOutcome::unevaluated(
+                UnevaluatedClass::SpawnFailure,
+                format!(
+                    "failed to create gate output file {}: {e}; main was NOT evaluated",
+                    log_path.display()
+                ),
+            );
         }
     };
     let err_file = match out_file.try_clone() {
         Ok(f) => f,
         Err(e) => {
             let _ = std::fs::remove_file(&log_path);
-            return GateOutcome::red(format!("failed to clone gate output file handle: {e}"));
+            return GateOutcome::unevaluated(
+                UnevaluatedClass::SpawnFailure,
+                format!("failed to clone gate output file handle: {e}; main was NOT evaluated"),
+            );
         }
     };
 
@@ -799,7 +1368,10 @@ fn run_command_with_timeout(command: &str, cwd: &Path, timeout: Duration) -> Gat
         Ok(c) => c,
         Err(e) => {
             let _ = std::fs::remove_file(&log_path);
-            return GateOutcome::red(format!("failed to spawn gate command '{command}': {e}"));
+            return GateOutcome::unevaluated(
+                UnevaluatedClass::SpawnFailure,
+                format!("failed to spawn gate command '{command}': {e}; main was NOT evaluated"),
+            );
         }
     };
 
@@ -811,26 +1383,29 @@ fn run_command_with_timeout(command: &str, cwd: &Path, timeout: Duration) -> Gat
                     break GateOutcome::Green;
                 }
                 let tail = read_output_tail(&log_path);
-                break GateOutcome::red(format!(
-                    "gate command '{command}' exited with {status}{}",
-                    format_tail(&tail)
-                ));
+                break classify_failed_exit(command, &status, &tail);
             }
             Ok(None) => {
                 if start.elapsed() >= timeout {
                     let _ = child.kill();
                     let _ = child.wait();
                     let tail = read_output_tail(&log_path);
-                    break GateOutcome::red(format!(
-                        "gate command '{command}' timed out after {}s{}",
-                        timeout.as_secs(),
-                        format_tail(&tail)
-                    ));
+                    break GateOutcome::unevaluated(
+                        UnevaluatedClass::Timeout,
+                        format!(
+                            "gate command '{command}' timed out after {}s and was killed; main was NOT evaluated{}",
+                            timeout.as_secs(),
+                            format_tail(&tail)
+                        ),
+                    );
                 }
                 std::thread::sleep(GATE_POLL_INTERVAL);
             }
             Err(e) => {
-                break GateOutcome::red(format!("failed to poll gate command '{command}': {e}"));
+                break GateOutcome::unevaluated(
+                    UnevaluatedClass::SpawnFailure,
+                    format!("failed to poll gate command '{command}': {e}; main was NOT evaluated"),
+                );
             }
         }
     };
@@ -872,18 +1447,24 @@ pub enum HealthTransition {
     Recovered,
     /// Green → Green: healthy, no change.
     RemainedHealthy,
-    /// The gate was skipped (indeterminate) — the halt flag is left exactly as
-    /// it was, so a skip neither halts nor resumes dispatch (#3885).
-    Skipped,
+    /// The gate produced no verdict (UNEVALUATED) — the halt flag is left
+    /// exactly as it was, so it neither halts nor resumes dispatch (#3885,
+    /// #3974).
+    Unevaluated,
 }
 
 /// Apply a gate `outcome` to the shared `state`, returning the transition.
 ///
 /// Atomic `swap` makes the read-modify-write safe against a concurrent
 /// work-finder read (which only ever *loads*). This is the single point that
-/// mutates the halt flag. A [`GateOutcome::Skipped`] is a no-op: it never
-/// touches the flag, so the previous halt/green decision persists until a run
-/// actually completes.
+/// mutates the halt flag.
+///
+/// **Only a [`GateOutcome::Red`] halts** — i.e. only a gate command that ran to
+/// completion and reported failure (#3974). A [`GateOutcome::Unevaluated`] is a
+/// no-op: it never touches the flag, so the previous verdict persists until a
+/// run actually completes. This is what keeps an environmental failure of the
+/// gate itself (timeout, missing tool, broken process tree) from being recorded
+/// as evidence that `main` is broken.
 #[must_use]
 pub fn apply_gate_outcome(state: &MainHealthState, outcome: &GateOutcome) -> HealthTransition {
     match outcome {
@@ -903,42 +1484,62 @@ pub fn apply_gate_outcome(state: &MainHealthState, outcome: &GateOutcome) -> Hea
                 HealthTransition::EnteredHalt
             }
         }
-        GateOutcome::Skipped { .. } => HealthTransition::Skipped,
+        GateOutcome::Unevaluated { .. } => HealthTransition::Unevaluated,
+    }
+}
+
+/// How the current verdict reads in a log line, for an UNEVALUATED tick that
+/// left it untouched.
+fn verdict_phrase(halted: bool) -> &'static str {
+    if halted {
+        "dispatch REMAINS HALTED from the previous verified-red run"
+    } else {
+        "dispatch remains ALLOWED (no previous verified-red run)"
     }
 }
 
 /// Apply `outcome` to `state`, then render it via `log_fn` — throttling the
-/// repeated "gate run SKIPPED" line to at most once per [`SKIP_WARN_THROTTLE`]
-/// after its first (not-skipped -> skipped) occurrence (#3950 AC2). Every
-/// other transition (green/red, and the clean->dirty transition itself) logs
-/// unthrottled via `log_fn` exactly as before. `log_fn` renders the actual
-/// `HealthTransition`/`GateOutcome` pair — the single- vs multi-workspace
-/// loops pass different renderers (the latter also names the repo root).
+/// repeated "gate run UNEVALUATED" line to at most once per
+/// [`SKIP_WARN_THROTTLE`] after its first (evaluated -> unevaluated) occurrence
+/// and after any change of failure class (#3950 AC2, #3974). Every other
+/// transition (green/red) logs unthrottled via `log_fn` exactly as before.
+/// `log_fn` renders the actual `HealthTransition`/`GateOutcome` pair plus the
+/// (unchanged) halt verdict — the single- vs multi-workspace loops pass
+/// different renderers (the latter also names the repo root).
 fn apply_and_log<F>(state: &MainHealthState, outcome: &GateOutcome, log_fn: F)
 where
-    F: Fn(HealthTransition, &GateOutcome),
+    F: Fn(HealthTransition, &GateOutcome, bool),
 {
     let transition = apply_gate_outcome(state, outcome);
-    let should_warn = state.note_gate_tick(outcome.is_skipped(), SKIP_WARN_THROTTLE);
-    if matches!(transition, HealthTransition::Skipped) && !should_warn {
+    let unevaluated = match outcome {
+        GateOutcome::Unevaluated { class, reason } => Some((*class, reason.as_str())),
+        _ => None,
+    };
+    let should_warn = state.note_gate_tick(unevaluated, SKIP_WARN_THROTTLE);
+    let halted = state.is_halted();
+    if matches!(transition, HealthTransition::Unevaluated) && !should_warn {
         log::debug!(
-            "main_health_gate: gate run SKIPPED (throttled) — {} (halt state unchanged)",
-            outcome.detail()
+            "main_health_gate: gate run UNEVALUATED (throttled) [{}] — {} ({})",
+            outcome
+                .unevaluated_class()
+                .map_or("unknown", UnevaluatedClass::label),
+            outcome.detail(),
+            verdict_phrase(halted)
         );
         return;
     }
-    log_fn(transition, outcome);
+    log_fn(transition, outcome, halted);
 }
 
 /// Log a health transition at a severity matching its significance.
-fn log_transition(transition: HealthTransition, outcome: &GateOutcome) {
+fn log_transition(transition: HealthTransition, outcome: &GateOutcome, halted: bool) {
     match transition {
         HealthTransition::EnteredHalt => log::error!(
-            "main_health_gate: main is RED — HALTING autonomous dispatch. {}",
+            "main_health_gate: main is VERIFIED RED — HALTING autonomous dispatch. {}",
             outcome.detail()
         ),
         HealthTransition::RemainedHalted => log::warn!(
-            "main_health_gate: main still RED — dispatch remains halted. {}",
+            "main_health_gate: main still VERIFIED RED — dispatch remains halted. {}",
             outcome.detail()
         ),
         HealthTransition::Recovered => log::info!(
@@ -947,9 +1548,14 @@ fn log_transition(transition: HealthTransition, outcome: &GateOutcome) {
         HealthTransition::RemainedHealthy => {
             log::debug!("main_health_gate: main green — dispatch unaffected");
         }
-        HealthTransition::Skipped => log::warn!(
-            "main_health_gate: gate run SKIPPED — {} (halt state unchanged)",
-            outcome.detail()
+        // Loud, and explicit that this is NOT a statement about main (#3974).
+        HealthTransition::Unevaluated => log::warn!(
+            "main_health_gate: gate run UNEVALUATED [{}] — {} — this is a failure of the GATE, not evidence about main; {}",
+            outcome
+                .unevaluated_class()
+                .map_or("unknown", UnevaluatedClass::label),
+            outcome.detail(),
+            verdict_phrase(halted)
         ),
     }
 }
@@ -1113,7 +1719,7 @@ where
                     // in a permanently-halted state, then stop the loop.
                     log::error!("main_health_gate: gate run task panicked ({e}); clearing halt and stopping loop");
                     health_state.set_halted(false);
-                    health_state.note_gate_tick(false, SKIP_WARN_THROTTLE);
+                    health_state.note_gate_tick(None, SKIP_WARN_THROTTLE);
                     return;
                 }
             };
@@ -1124,15 +1730,20 @@ where
 
 /// Log a health transition (root-aware variant, #3930) at a severity matching
 /// its significance, naming which repo's `main` the gate evaluated.
-fn log_transition_for_root(root: &Path, transition: HealthTransition, outcome: &GateOutcome) {
+fn log_transition_for_root(
+    root: &Path,
+    transition: HealthTransition,
+    outcome: &GateOutcome,
+    halted: bool,
+) {
     let r = root.display();
     match transition {
         HealthTransition::EnteredHalt => log::error!(
-            "main_health_gate: {r} main is RED — HALTING autonomous dispatch for this repo. {}",
+            "main_health_gate: {r} main is VERIFIED RED — HALTING autonomous dispatch for this repo. {}",
             outcome.detail()
         ),
         HealthTransition::RemainedHalted => log::warn!(
-            "main_health_gate: {r} main still RED — dispatch for this repo remains halted. {}",
+            "main_health_gate: {r} main still VERIFIED RED — dispatch for this repo remains halted. {}",
             outcome.detail()
         ),
         HealthTransition::Recovered => log::info!(
@@ -1141,9 +1752,13 @@ fn log_transition_for_root(root: &Path, transition: HealthTransition, outcome: &
         HealthTransition::RemainedHealthy => {
             log::debug!("main_health_gate: {r} main green — dispatch unaffected");
         }
-        HealthTransition::Skipped => log::warn!(
-            "main_health_gate: {r} gate run SKIPPED — {} (halt state unchanged)",
-            outcome.detail()
+        HealthTransition::Unevaluated => log::warn!(
+            "main_health_gate: {r} gate run UNEVALUATED [{}] — {} — this is a failure of the GATE, not evidence about main; {}",
+            outcome
+                .unevaluated_class()
+                .map_or("unknown", UnevaluatedClass::label),
+            outcome.detail(),
+            verdict_phrase(halted)
         ),
     }
 }
@@ -1209,7 +1824,7 @@ pub fn spawn_multi_main_health_gate_task(
                     // and any stale skip/dirty state).
                     let state = health_states.get_or_create(&root);
                     state.set_halted(false);
-                    state.note_gate_tick(false, SKIP_WARN_THROTTLE);
+                    state.note_gate_tick(None, SKIP_WARN_THROTTLE);
                     continue;
                 }
                 let Some(gate_config) = read_build_gate_config(&root) else {
@@ -1219,7 +1834,7 @@ pub fn spawn_multi_main_health_gate_task(
                     );
                     let state = health_states.get_or_create(&root);
                     state.set_halted(false);
-                    state.note_gate_tick(false, SKIP_WARN_THROTTLE);
+                    state.note_gate_tick(None, SKIP_WARN_THROTTLE);
                     continue;
                 };
 
@@ -1234,8 +1849,8 @@ pub fn spawn_multi_main_health_gate_task(
                 match joined {
                     Ok(outcome) => {
                         let root_for_log = root.clone();
-                        apply_and_log(&state, &outcome, move |transition, outcome| {
-                            log_transition_for_root(&root_for_log, transition, outcome);
+                        apply_and_log(&state, &outcome, move |transition, outcome, halted| {
+                            log_transition_for_root(&root_for_log, transition, outcome, halted);
                         });
                     }
                     Err(e) => {
@@ -1247,7 +1862,7 @@ pub fn spawn_multi_main_health_gate_task(
                             root.display()
                         );
                         state.set_halted(false);
-                        state.note_gate_tick(false, SKIP_WARN_THROTTLE);
+                        state.note_gate_tick(None, SKIP_WARN_THROTTLE);
                     }
                 }
             }
@@ -1261,6 +1876,20 @@ mod tests {
     use super::*;
     use serial_test::serial;
     use std::collections::VecDeque;
+
+    /// Every [`UnevaluatedClass`], so the "must not halt" and label-uniqueness
+    /// invariants are checked exhaustively as classes are added.
+    const ALL_UNEVALUATED_CLASSES: [UnevaluatedClass; 9] = [
+        UnevaluatedClass::DirtyTree,
+        UnevaluatedClass::NotOnMain,
+        UnevaluatedClass::LocalAhead,
+        UnevaluatedClass::GitFailure,
+        UnevaluatedClass::Timeout,
+        UnevaluatedClass::NotExecutable,
+        UnevaluatedClass::KilledBySignal,
+        UnevaluatedClass::SpawnFailure,
+        UnevaluatedClass::ContradictedByForgeCi,
+    ];
 
     fn write_config(dir: &Path, body: &str) {
         let loom_dir = dir.join(".loom");
@@ -1510,14 +2139,27 @@ mod tests {
         let outcome = runner.run_gate();
         assert!(!outcome.is_green());
         assert!(
+            outcome.is_verified_red(),
+            "a command that ran and exited 1 is VERIFIED_RED, got {outcome:?}"
+        );
+        assert!(
             outcome.detail().contains("build-failed-marker"),
             "red detail should include captured output, got: {}",
             outcome.detail()
         );
     }
 
+    // ===================================================================
+    // VERIFIED_RED vs UNEVALUATED classification (#3974)
+    //
+    // The incident: with `origin/main` green on GitHub CI the whole time, a
+    // 600s timeout, a `cargo`-not-on-PATH exit 127, and a broken-process-tree
+    // `git fetch` failure were each recorded as "main still RED" and halted
+    // tier-0 dispatch. None of those is a statement about main.
+    // ===================================================================
+
     #[test]
-    fn test_command_runner_red_on_timeout() {
+    fn test_command_runner_timeout_is_unevaluated_not_red() {
         let cfg = BuildGateConfig {
             command: "sleep 10".to_string(),
             timeout: Duration::from_secs(1),
@@ -1526,10 +2168,283 @@ mod tests {
         let outcome = runner.run_gate();
         assert!(!outcome.is_green());
         assert!(
+            !outcome.is_verified_red(),
+            "a timeout must NOT be verified-red — the gate never finished, so it \
+             learned nothing about main; got {outcome:?}"
+        );
+        assert_eq!(outcome.unevaluated_class(), Some(UnevaluatedClass::Timeout));
+        assert!(
             outcome.detail().contains("timed out"),
             "timeout detail expected, got: {}",
             outcome.detail()
         );
+    }
+
+    #[test]
+    fn test_command_runner_exit_127_is_unevaluated_not_red() {
+        // Exit 127 = `sh` could not find the command (the incident's
+        // "cargo not on PATH after a launchd migration").
+        let cfg = BuildGateConfig {
+            command: "loom-no-such-command-3974 --version".to_string(),
+            timeout: Duration::from_secs(30),
+        };
+        let mut runner = CommandGateRunner::new(cfg, std::env::temp_dir()).without_sync();
+        let outcome = runner.run_gate();
+        assert!(
+            !outcome.is_verified_red(),
+            "a command that could not be executed must NOT halt dispatch, got {outcome:?}"
+        );
+        assert_eq!(outcome.unevaluated_class(), Some(UnevaluatedClass::NotExecutable));
+    }
+
+    #[test]
+    fn test_command_runner_exit_126_is_unevaluated_not_red() {
+        // Exit 126 = found but not executable.
+        let tmp = tempfile::tempdir().unwrap();
+        let script = tmp.path().join("not-executable.sh");
+        std::fs::write(&script, "#!/bin/sh\nexit 0\n").unwrap();
+        let cfg = BuildGateConfig {
+            command: script.display().to_string(),
+            timeout: Duration::from_secs(30),
+        };
+        let mut runner = CommandGateRunner::new(cfg, std::env::temp_dir()).without_sync();
+        let outcome = runner.run_gate();
+        assert!(!outcome.is_verified_red(), "got {outcome:?}");
+        assert_eq!(outcome.unevaluated_class(), Some(UnevaluatedClass::NotExecutable));
+    }
+
+    #[test]
+    fn test_command_runner_signal_death_is_unevaluated_not_red() {
+        // An OOM/`kill -9` of the build (exit 137 as `sh` reports it) is an
+        // environmental failure, not a failing build.
+        let cfg = BuildGateConfig {
+            command: "kill -9 $$".to_string(),
+            timeout: Duration::from_secs(30),
+        };
+        let mut runner = CommandGateRunner::new(cfg, std::env::temp_dir()).without_sync();
+        let outcome = runner.run_gate();
+        assert!(!outcome.is_verified_red(), "got {outcome:?}");
+        assert_eq!(outcome.unevaluated_class(), Some(UnevaluatedClass::KilledBySignal));
+    }
+
+    #[test]
+    fn test_command_runner_cargo_style_failure_is_still_verified_red() {
+        // Guard against overcorrection: `cargo test` exits 101 on a genuinely
+        // failing test. That command ran to completion and reported failure, so
+        // it must still halt dispatch.
+        let cfg = BuildGateConfig {
+            command: "echo 'test result: FAILED'; exit 101".to_string(),
+            timeout: Duration::from_secs(30),
+        };
+        let mut runner = CommandGateRunner::new(cfg, std::env::temp_dir()).without_sync();
+        let outcome = runner.run_gate();
+        assert!(
+            outcome.is_verified_red(),
+            "a completed non-zero exit must remain verified-red, got {outcome:?}"
+        );
+
+        // …and it must actually halt.
+        let state = MainHealthState::new();
+        assert_eq!(apply_gate_outcome(&state, &outcome), HealthTransition::EnteredHalt);
+        assert!(state.is_halted());
+    }
+
+    #[test]
+    fn test_unevaluated_outcomes_never_halt_dispatch() {
+        // AC1: each environmental failure class must leave a green verdict
+        // green (no spurious halt) — the bootstrap-deadlock fix.
+        for class in ALL_UNEVALUATED_CLASSES {
+            let state = MainHealthState::new();
+            let outcome = GateOutcome::unevaluated(class, "environmental failure");
+            assert_eq!(
+                apply_gate_outcome(&state, &outcome),
+                HealthTransition::Unevaluated,
+                "{class} must be unevaluated"
+            );
+            assert!(
+                !state.is_halted(),
+                "{class} must not halt dispatch — the gate did not run, so it is not \
+                 evidence about main"
+            );
+        }
+    }
+
+    #[test]
+    fn test_unevaluated_class_labels_are_distinct() {
+        let mut labels: Vec<&str> = ALL_UNEVALUATED_CLASSES.iter().map(|c| c.label()).collect();
+        labels.sort_unstable();
+        let count = labels.len();
+        labels.dedup();
+        assert_eq!(labels.len(), count, "every class needs a distinct label");
+        // Display renders the label (used verbatim in logs and status).
+        assert_eq!(UnevaluatedClass::Timeout.to_string(), "timeout");
+    }
+
+    // ===================================================================
+    // Forge-CI corroboration of a local red (#3974 AC4)
+    //
+    // The local gate measures THIS HOST; forge CI measures the COMMIT. On the
+    // incident host six `integration_basic` tests assert `tmux_session_exists`
+    // and fail because the tmux server is dead, while CI runs the identical
+    // `cargo test --workspace` and passes.
+    // ===================================================================
+
+    /// A scripted [`ForgeCiStatus`] returning a fixed verdict, recording the
+    /// SHA it was asked about.
+    struct FakeCi {
+        verdict: CiVerdict,
+        asked: Arc<Mutex<Vec<String>>>,
+    }
+    impl ForgeCiStatus for FakeCi {
+        fn conclusion_for(&self, _repo_root: &Path, sha: &str) -> CiVerdict {
+            self.asked
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(sha.to_string());
+            self.verdict
+        }
+    }
+
+    fn run_gate_with_ci(command: &str, verdict: CiVerdict) -> (GateOutcome, Vec<String>) {
+        let (_origin, clone) = make_origin_and_clone();
+        let asked = Arc::new(Mutex::new(Vec::new()));
+        let cfg = BuildGateConfig {
+            command: command.to_string(),
+            timeout: Duration::from_secs(30),
+        };
+        let mut runner = CommandGateRunner::new(cfg, clone.path().to_path_buf()).with_ci_status(
+            Box::new(FakeCi {
+                verdict,
+                asked: Arc::clone(&asked),
+            }),
+        );
+        let outcome = runner.run_gate();
+        let asked = asked
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        (outcome, asked)
+    }
+
+    #[test]
+    #[serial]
+    fn test_local_red_contradicted_by_green_forge_ci_does_not_halt() {
+        std::env::remove_var(GATE_CI_CORROBORATION_ENV);
+        let (outcome, asked) =
+            run_gate_with_ci("echo 'tmux_session_exists failed'; exit 101", CiVerdict::Success);
+        assert!(
+            !outcome.is_verified_red(),
+            "a local failure that CI contradicts on the same commit must not halt, got {outcome:?}"
+        );
+        assert_eq!(outcome.unevaluated_class(), Some(UnevaluatedClass::ContradictedByForgeCi));
+        assert_eq!(asked.len(), 1, "CI is consulted exactly once, for the evaluated SHA");
+        assert_eq!(asked[0].len(), 40, "asked about a full commit SHA: {:?}", asked[0]);
+        assert!(
+            outcome.detail().contains(&asked[0]),
+            "the divergence must name the commit, got: {}",
+            outcome.detail()
+        );
+
+        // And it must leave the halt flag untouched.
+        let state = MainHealthState::new();
+        assert_eq!(apply_gate_outcome(&state, &outcome), HealthTransition::Unevaluated);
+        assert!(!state.is_halted());
+    }
+
+    #[test]
+    #[serial]
+    fn test_local_red_corroborated_by_red_forge_ci_still_halts() {
+        std::env::remove_var(GATE_CI_CORROBORATION_ENV);
+        let (outcome, _) = run_gate_with_ci("exit 1", CiVerdict::Failure);
+        assert!(
+            outcome.is_verified_red(),
+            "CI agreeing keeps the red — a genuinely broken main must still halt"
+        );
+        assert!(outcome.detail().contains("corroborated"), "got: {}", outcome.detail());
+    }
+
+    #[test]
+    #[serial]
+    fn test_local_red_with_unknown_forge_ci_still_halts() {
+        // Fail safe: only *positive* contrary evidence relaxes a halt.
+        std::env::remove_var(GATE_CI_CORROBORATION_ENV);
+        let (outcome, _) = run_gate_with_ci("exit 1", CiVerdict::Unknown);
+        assert!(outcome.is_verified_red(), "got {outcome:?}");
+        assert!(outcome.detail().contains("unavailable"), "got: {}", outcome.detail());
+    }
+
+    #[test]
+    #[serial]
+    fn test_green_local_run_never_consults_forge_ci() {
+        std::env::remove_var(GATE_CI_CORROBORATION_ENV);
+        let (outcome, asked) = run_gate_with_ci("exit 0", CiVerdict::Failure);
+        assert_eq!(outcome, GateOutcome::Green, "a green local run is authoritative");
+        assert!(asked.is_empty(), "CI must not be probed on a green run");
+    }
+
+    #[test]
+    #[serial]
+    fn test_ci_corroboration_kill_switch_keeps_local_red() {
+        std::env::set_var(GATE_CI_CORROBORATION_ENV, "0");
+        let (outcome, asked) = run_gate_with_ci("exit 1", CiVerdict::Success);
+        std::env::remove_var(GATE_CI_CORROBORATION_ENV);
+        assert!(
+            outcome.is_verified_red(),
+            "with corroboration disabled the local red stands, got {outcome:?}"
+        );
+        assert!(asked.is_empty(), "disabled corroboration must not probe the forge");
+    }
+
+    #[test]
+    #[serial]
+    fn test_ci_corroboration_enabled_by_default_and_env_parsing() {
+        std::env::remove_var(GATE_CI_CORROBORATION_ENV);
+        assert!(ci_corroboration_enabled(), "unset ⇒ on");
+        for v in ["0", "false", "no", "off", "OFF", " No "] {
+            std::env::set_var(GATE_CI_CORROBORATION_ENV, v);
+            assert!(!ci_corroboration_enabled(), "{v:?} should disable");
+        }
+        for v in ["1", "true", "yes", "on", "anything-else"] {
+            std::env::set_var(GATE_CI_CORROBORATION_ENV, v);
+            assert!(ci_corroboration_enabled(), "{v:?} should keep it enabled");
+        }
+        std::env::remove_var(GATE_CI_CORROBORATION_ENV);
+    }
+
+    #[test]
+    fn test_parse_gh_run_list_verdicts() {
+        let sha = "a".repeat(40);
+        let other = "b".repeat(40);
+
+        // All completed runs for the SHA succeeded ⇒ green.
+        let json = format!(
+            r#"[{{"headSha":"{sha}","status":"completed","conclusion":"success","workflowName":"CI"}},
+                {{"headSha":"{sha}","status":"completed","conclusion":"skipped","workflowName":"LOC"}}]"#
+        );
+        assert_eq!(parse_gh_run_list(&json, &sha), CiVerdict::Success);
+
+        // Any completed failure for the SHA ⇒ red.
+        let json = format!(
+            r#"[{{"headSha":"{sha}","status":"completed","conclusion":"success","workflowName":"CI"}},
+                {{"headSha":"{sha}","status":"completed","conclusion":"failure","workflowName":"Sec"}}]"#
+        );
+        assert_eq!(parse_gh_run_list(&json, &sha), CiVerdict::Failure);
+
+        // Only in-progress runs for the SHA ⇒ unknown (never a silent green).
+        let json = format!(
+            r#"[{{"headSha":"{sha}","status":"in_progress","conclusion":null,"workflowName":"CI"}}]"#
+        );
+        assert_eq!(parse_gh_run_list(&json, &sha), CiVerdict::Unknown);
+
+        // A green run for a DIFFERENT commit must never vouch for this one.
+        let json = format!(
+            r#"[{{"headSha":"{other}","status":"completed","conclusion":"success","workflowName":"CI"}}]"#
+        );
+        assert_eq!(parse_gh_run_list(&json, &sha), CiVerdict::Unknown);
+
+        // Empty / unparseable output ⇒ unknown.
+        assert_eq!(parse_gh_run_list("[]", &sha), CiVerdict::Unknown);
+        assert_eq!(parse_gh_run_list("not json", &sha), CiVerdict::Unknown);
     }
 
     // ===================================================================
@@ -1646,8 +2561,9 @@ mod tests {
 
         let outcome = prepare_workspace_to_origin_main(clone.path());
         match outcome {
-            PrepOutcome::Skip { reason } => {
-                assert!(reason.contains("ahead"), "expected ahead-of-origin reason, got: {reason}")
+            PrepOutcome::Skip { class, reason } => {
+                assert_eq!(class, UnevaluatedClass::LocalAhead);
+                assert!(reason.contains("ahead"), "expected ahead-of-origin reason, got: {reason}");
             }
             other => panic!("expected Skip when local main is ahead, got {other:?}"),
         }
@@ -1666,10 +2582,23 @@ mod tests {
         std::fs::write(clone.path().join("file.txt"), "operator edit\n").unwrap();
         let outcome = prepare_workspace_to_origin_main(clone.path());
         match outcome {
-            PrepOutcome::Skip { reason } => assert!(
-                reason.contains("local changes"),
-                "expected dirty-skip reason, got: {reason}"
-            ),
+            PrepOutcome::Skip { class, reason } => {
+                assert_eq!(class, UnevaluatedClass::DirtyTree);
+                // #3974 AC2: the reason must name the root it inspected and the
+                // exact porcelain line(s), so the claim is checkable by hand.
+                assert!(
+                    reason.contains("status --porcelain"),
+                    "dirty reason should cite the command it ran, got: {reason}"
+                );
+                assert!(
+                    reason.contains(&clone.path().display().to_string()),
+                    "dirty reason should name the root it inspected, got: {reason}"
+                );
+                assert!(
+                    reason.contains("file.txt"),
+                    "dirty reason should name the offending path, got: {reason}"
+                );
+            }
             other => panic!("expected Skip on dirty tree, got {other:?}"),
         }
         // The operator edit must NOT have been reset away.
@@ -1826,7 +2755,8 @@ mod tests {
         std::fs::write(clone.path().join("file.txt"), "operator edit\n").unwrap();
         let outcome = prepare_workspace_to_origin_main(clone.path());
         match outcome {
-            PrepOutcome::Skip { reason } => {
+            PrepOutcome::Skip { class, reason } => {
+                assert_eq!(class, UnevaluatedClass::DirtyTree);
                 assert!(
                     reason.contains("file.txt"),
                     "skip reason should name the unexpected file, got: {reason}"
@@ -1846,10 +2776,13 @@ mod tests {
         git(clone.path(), &["checkout", "-b", "feature/x"]);
         let outcome = prepare_workspace_to_origin_main(clone.path());
         match outcome {
-            PrepOutcome::Skip { reason } => assert!(
-                reason.contains("feature/x") && reason.contains("not 'main'"),
-                "expected not-on-main reason, got: {reason}"
-            ),
+            PrepOutcome::Skip { class, reason } => {
+                assert_eq!(class, UnevaluatedClass::NotOnMain);
+                assert!(
+                    reason.contains("feature/x") && reason.contains("not 'main'"),
+                    "expected not-on-main reason, got: {reason}"
+                );
+            }
             other => panic!("expected Skip off main, got {other:?}"),
         }
     }
@@ -1885,17 +2818,22 @@ mod tests {
         );
         let outcome = prepare_workspace_to_origin_main(repo.path());
         match outcome {
-            PrepOutcome::Skip { reason } => {
-                assert!(reason.contains("fetch"), "expected fetch-failure reason, got: {reason}")
+            PrepOutcome::Skip { class, reason } => {
+                assert_eq!(
+                    class,
+                    UnevaluatedClass::GitFailure,
+                    "a failed `git fetch` is a gate-infrastructure failure, not a red main (#3974)"
+                );
+                assert!(reason.contains("fetch"), "expected fetch-failure reason, got: {reason}");
             }
             other => panic!("expected Skip on fetch failure, got {other:?}"),
         }
     }
 
     #[test]
-    fn test_command_runner_returns_skipped_when_prep_skips() {
+    fn test_command_runner_returns_unevaluated_when_prep_skips() {
         // Sync ON (production default) against a non-repo dir ⇒ prep skips ⇒ the
-        // gate command is NOT run and the outcome is Skipped.
+        // gate command is NOT run and the outcome is Unevaluated.
         let cfg = BuildGateConfig {
             command: "exit 1".to_string(), // would be red if it ran
             timeout: Duration::from_secs(5),
@@ -1904,7 +2842,7 @@ mod tests {
         let mut runner = CommandGateRunner::new(cfg, tmp.path().to_path_buf());
         let outcome = runner.run_gate();
         assert!(
-            outcome.is_skipped(),
+            outcome.is_unevaluated(),
             "prep skip must short-circuit before running the command, got {outcome:?}"
         );
     }
@@ -1922,48 +2860,55 @@ mod tests {
     }
 
     // ===================================================================
-    // Skipped outcome + transition (#3885)
+    // Unevaluated outcome + transition (#3885, reclassified in #3974)
     // ===================================================================
 
+    /// A dirty-tree helper matching the pre-#3974 `skipped(reason)` shape.
+    fn dirty(reason: &str) -> GateOutcome {
+        GateOutcome::unevaluated(UnevaluatedClass::DirtyTree, reason)
+    }
+
     #[test]
-    fn test_skipped_outcome_leaves_halt_flag_unchanged() {
-        // From halted: a skip must NOT clear the halt.
+    fn test_unevaluated_outcome_leaves_halt_flag_unchanged() {
+        // From halted: an unevaluated tick must NOT clear the halt.
         let state = MainHealthState::new();
         state.set_halted(true);
-        assert_eq!(
-            apply_gate_outcome(&state, &GateOutcome::skipped("dirty")),
-            HealthTransition::Skipped
-        );
-        assert!(state.is_halted(), "skip must not clear an existing halt");
+        assert_eq!(apply_gate_outcome(&state, &dirty("dirty")), HealthTransition::Unevaluated);
+        assert!(state.is_halted(), "unevaluated must not clear an existing halt");
 
-        // From green: a skip must NOT halt.
+        // From green: an unevaluated tick must NOT halt.
         let state = MainHealthState::new();
         assert_eq!(
-            apply_gate_outcome(&state, &GateOutcome::skipped("offline")),
-            HealthTransition::Skipped
+            apply_gate_outcome(
+                &state,
+                &GateOutcome::unevaluated(UnevaluatedClass::GitFailure, "offline")
+            ),
+            HealthTransition::Unevaluated
         );
-        assert!(!state.is_halted(), "skip must not spuriously halt");
+        assert!(!state.is_halted(), "unevaluated must not spuriously halt");
     }
 
     // ===================================================================
-    // Skip-warn throttling (#3950 AC2 / AC3): once per clean->dirty
-    // transition, then throttled while the tree stays dirty; `is_skipped()`
-    // tracks the "not evaluated" status surfaced to `loom-daemon status`.
+    // Unevaluated-warn throttling (#3950 AC2 / AC3, extended in #3974):
+    // once per evaluated->unevaluated transition, once more on any change of
+    // failure class, then throttled; `is_unevaluated()` + the stored class
+    // back the "not evaluated" status surfaced to `loom-daemon status`.
     // ===================================================================
 
     #[test]
     fn test_note_gate_tick_warns_once_on_transition_then_throttles() {
         let state = MainHealthState::new();
         let throttle = Duration::from_secs(3600);
+        let d = Some((UnevaluatedClass::DirtyTree, "dirty"));
 
         // First dirty tick: clean -> dirty transition, must warn.
-        assert!(state.note_gate_tick(true, throttle));
-        assert!(state.is_skipped(), "status must reflect the skip");
+        assert!(state.note_gate_tick(d, throttle));
+        assert!(state.is_unevaluated(), "status must reflect the skip");
 
         // Still dirty, well within the throttle window: must NOT warn again.
-        assert!(!state.note_gate_tick(true, throttle));
-        assert!(!state.note_gate_tick(true, throttle));
-        assert!(state.is_skipped(), "still not-evaluated while throttled");
+        assert!(!state.note_gate_tick(d, throttle));
+        assert!(!state.note_gate_tick(d, throttle));
+        assert!(state.is_unevaluated(), "still not-evaluated while throttled");
     }
 
     #[test]
@@ -1971,65 +2916,118 @@ mod tests {
         let state = MainHealthState::new();
         // A throttle of ~0 means "always past the window" on the very next tick.
         let tiny_throttle = Duration::from_millis(1);
+        let d = Some((UnevaluatedClass::DirtyTree, "dirty"));
 
-        assert!(state.note_gate_tick(true, tiny_throttle), "first tick always warns");
+        assert!(state.note_gate_tick(d, tiny_throttle), "first tick always warns");
         std::thread::sleep(Duration::from_millis(5));
         assert!(
-            state.note_gate_tick(true, tiny_throttle),
+            state.note_gate_tick(d, tiny_throttle),
             "a second dirty tick past the throttle window must warn again"
         );
+    }
+
+    #[test]
+    fn test_note_gate_tick_rewarns_immediately_on_class_change() {
+        // #3974: the incident rotated through timeout / exit-101 / exit-127 /
+        // git-fetch failure. A new failure class must never be swallowed by the
+        // previous class's throttle window.
+        let state = MainHealthState::new();
+        let throttle = Duration::from_secs(3600);
+
+        assert!(state.note_gate_tick(Some((UnevaluatedClass::DirtyTree, "dirty")), throttle));
+        assert!(!state.note_gate_tick(Some((UnevaluatedClass::DirtyTree, "dirty")), throttle));
+        assert!(
+            state.note_gate_tick(Some((UnevaluatedClass::Timeout, "timed out")), throttle),
+            "a different failure class must warn immediately, not stay throttled"
+        );
+        assert_eq!(state.unevaluated_class(), Some(UnevaluatedClass::Timeout));
     }
 
     #[test]
     fn test_note_gate_tick_clears_on_recovery_and_rewarns_on_next_dirty_streak() {
         let state = MainHealthState::new();
         let throttle = Duration::from_secs(3600);
+        let d = Some((UnevaluatedClass::DirtyTree, "dirty"));
 
-        assert!(state.note_gate_tick(true, throttle));
-        assert!(!state.note_gate_tick(true, throttle), "throttled mid-streak");
+        assert!(state.note_gate_tick(d, throttle));
+        assert!(!state.note_gate_tick(d, throttle), "throttled mid-streak");
 
         // Tree becomes clean again (a completed Green/Red tick) — clears skip
-        // status and the throttle timer.
-        assert!(!state.note_gate_tick(false, throttle));
-        assert!(!state.is_skipped(), "no longer skipped after a completed tick");
+        // status, the stored detail, and the throttle timer.
+        assert!(!state.note_gate_tick(None, throttle));
+        assert!(!state.is_unevaluated(), "no longer skipped after a completed tick");
+        assert_eq!(state.unevaluated_class(), None);
+        assert_eq!(state.unevaluated_summary(), None);
 
         // A NEW dirty streak must warn immediately again, not stay throttled
         // from the previous streak.
         assert!(
-            state.note_gate_tick(true, throttle),
+            state.note_gate_tick(d, throttle),
             "a fresh dirty streak must warn on its first tick"
         );
     }
 
     #[test]
-    fn test_note_gate_tick_never_warns_when_not_skipped() {
+    fn test_note_gate_tick_never_warns_when_evaluated() {
         let state = MainHealthState::new();
-        assert!(!state.note_gate_tick(false, Duration::from_secs(3600)));
-        assert!(!state.is_skipped());
+        assert!(!state.note_gate_tick(None, Duration::from_secs(3600)));
+        assert!(!state.is_unevaluated());
     }
 
     #[test]
-    fn test_workspace_health_states_is_skipped_tracks_per_root() {
+    fn test_unevaluated_summary_names_class_and_reason() {
+        // #3974 AC2: status must be able to name the *actual* failure rather
+        // than always claiming the workspace tree is dirty.
+        let state = MainHealthState::new();
+        state.note_gate_tick(
+            Some((UnevaluatedClass::GitFailure, "`git fetch origin main` failed")),
+            Duration::from_secs(3600),
+        );
+        let summary = state.unevaluated_summary().unwrap();
+        assert!(summary.starts_with("git-failure: "), "got: {summary}");
+        assert!(summary.contains("git fetch origin main"), "got: {summary}");
+    }
+
+    #[test]
+    fn test_unevaluated_summary_truncates_long_reasons() {
+        let state = MainHealthState::new();
+        let long = "x".repeat(MAX_STATUS_REASON_CHARS * 3);
+        state.note_gate_tick(Some((UnevaluatedClass::Timeout, &long)), Duration::from_secs(3600));
+        let summary = state.unevaluated_summary().unwrap();
+        assert!(
+            summary.chars().count() <= MAX_STATUS_REASON_CHARS + 32,
+            "status reason must stay short, got {} chars",
+            summary.chars().count()
+        );
+        assert!(summary.ends_with('…'), "truncation marker expected, got: {summary}");
+    }
+
+    #[test]
+    fn test_workspace_health_states_is_unevaluated_tracks_per_root() {
         let states = WorkspaceHealthStates::new();
         let root = Path::new("/repo/a");
         // Never-seen root: not skipped.
-        assert!(!states.is_skipped(root));
+        assert!(!states.is_unevaluated(root));
+        assert_eq!(states.unevaluated_summary(root), None);
 
         states
             .get_or_create(root)
-            .note_gate_tick(true, Duration::from_secs(3600));
-        assert!(states.is_skipped(root));
+            .note_gate_tick(Some((UnevaluatedClass::Timeout, "slow")), Duration::from_secs(3600));
+        assert!(states.is_unevaluated(root));
+        assert_eq!(states.unevaluated_summary(root), Some("timeout: slow".to_string()));
         assert!(
-            !states.is_skipped(Path::new("/repo/b")),
+            !states.is_unevaluated(Path::new("/repo/b")),
             "a sibling root's skip state is independent"
         );
     }
 
     #[test]
-    fn test_skipped_outcome_helpers() {
-        let s = GateOutcome::skipped("because reasons");
-        assert!(s.is_skipped());
+    fn test_unevaluated_outcome_helpers() {
+        let s = GateOutcome::unevaluated(UnevaluatedClass::DirtyTree, "because reasons");
+        assert!(s.is_unevaluated());
         assert!(!s.is_green());
+        assert!(!s.is_verified_red());
+        assert_eq!(s.unevaluated_class(), Some(UnevaluatedClass::DirtyTree));
         assert_eq!(s.detail(), "because reasons");
     }
 

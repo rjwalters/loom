@@ -352,9 +352,15 @@ pub struct TickReport {
     pub skipped_quarantined: usize,
     /// Dispatch attempts that returned an error (logged, non-fatal).
     pub errors: usize,
-    /// True when this tick dispatched nothing because the main-health gate
-    /// (Phase C, #3812) had halted dispatch (`main` was red). `seen` still
-    /// reflects the backlog depth; `dispatched` is always 0 in this case.
+    /// True when at least one workspace was gated this tick because the
+    /// main-health gate (Phase C, #3812) had halted its dispatch (`main` was
+    /// **verified** red — see [`crate::main_health_gate::GateOutcome`]). `seen`
+    /// still reflects the backlog depth of the halted repo(s).
+    ///
+    /// Derived directly from the shared
+    /// [`WorkspaceHealthStates`](crate::main_health_gate::WorkspaceHealthStates)
+    /// flags the gate writes (#3974 AC3), so this can never disagree with what
+    /// the gate loop reports — including when a repo's forge query fails.
     pub halted: bool,
 }
 
@@ -523,9 +529,20 @@ pub fn tick_multi<S: WorkSource, D: WorkDispatcher>(
     let quarantined_sets: Vec<HashSet<u32>> =
         workspaces.iter().map(|(_, d)| d.quarantined()).collect();
 
-    // Whether any workspace was gated this tick — folds down to the pre-#3930
-    // single-flag semantics for a single (empty-registry) workspace.
-    let mut any_halted = false;
+    // Whether any workspace was gated this tick, derived **directly from the
+    // shared per-repo halt flags** rather than accumulated as a side effect of
+    // the candidate-gathering loop (#3974 AC3).
+    //
+    // The loop below `continue`s on a `list_ready_issues` error *before* it
+    // reaches the halt check, so the old accumulate-in-loop form reported
+    // `halted = false` for a repo that was in fact halted whenever the forge
+    // query failed. During the 2026-07-26 incident `gh` was dead in the
+    // daemon's process tree, so the listing failed every tick and the finder
+    // logged "main-health gate cleared — resuming dispatch" in the same window
+    // the gate was logging "still RED". Reading the flags directly means the
+    // two loops can never disagree: this is the same `WorkspaceHealthStates`
+    // the gate writes.
+    let any_halted = halted.iter().take(workspaces.len()).any(|&h| h);
 
     // Pass 1 (mutable source reads): gather every eligible candidate across all
     // workspaces, applying the per-workspace skip-label / in-flight filters and
@@ -550,7 +567,6 @@ pub fn tick_multi<S: WorkSource, D: WorkDispatcher>(
         // caller can log "backlog is N but halted"; its in-flight sweeps stay in
         // the global occupancy seed and are never touched.
         if halted.get(idx).copied().unwrap_or(false) {
-            any_halted = true;
             continue;
         }
 
@@ -1971,6 +1987,47 @@ exit 0
         let report = tick_multi(&mut multi, &[], 10, &[false, false]);
         assert!(!report.halted);
         assert_eq!(report.dispatched, 2);
+    }
+
+    #[test]
+    fn test_tick_multi_halt_survives_a_failing_forge_query() {
+        // #3974 AC3: `report.halted` must be derived from the shared halt flags
+        // the gate writes, never accumulated as a side effect of the
+        // candidate-gathering loop. In the incident `gh` was dead in the
+        // daemon's process tree, so `list_ready_issues` errored *before* the
+        // loop reached its halt check — the finder then logged "main-health gate
+        // cleared — resuming dispatch" in the same window the gate was logging
+        // "still RED".
+        let mut multi =
+            vec![(err_source("gh: No user exists for uid 501"), RecordingDispatcher::default())];
+        let report = tick_multi(&mut multi, &[], 10, &[true]);
+        assert_eq!(report.errors, 1, "the forge query failed");
+        assert!(
+            report.halted,
+            "a halted repo must still report halted when its forge query fails — \
+             otherwise work_finder and main_health_gate disagree"
+        );
+        assert!(multi[0].1.dispatched.is_empty());
+    }
+
+    #[test]
+    fn test_tick_multi_halt_reported_even_when_repo_has_no_backlog() {
+        // Same derivation property with an empty (rather than failing) source:
+        // "halted" is a property of the gate state, not of what the tick saw.
+        let mut multi = vec![(FakeSource::once(vec![]), RecordingDispatcher::default())];
+        let report = tick_multi(&mut multi, &[], 10, &[true]);
+        assert_eq!(report.seen, 0);
+        assert!(report.halted, "halt is derived from the shared flag, not from the backlog");
+    }
+
+    #[test]
+    fn test_tick_multi_extra_halt_entries_are_ignored() {
+        // A `halted` slice longer than the workspace list (a stale snapshot)
+        // must not manufacture a halt for workspaces that do not exist.
+        let mut multi = vec![(FakeSource::once(vec![issue(1)]), RecordingDispatcher::default())];
+        let report = tick_multi(&mut multi, &[], 10, &[false, true, true]);
+        assert!(!report.halted, "only the present workspaces' flags count");
+        assert_eq!(report.dispatched, 1);
     }
 
     #[test]
