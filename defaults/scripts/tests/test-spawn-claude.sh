@@ -278,6 +278,25 @@ output=$(LOOM_WORKSPACE="$TEST_WS" PATH="$STUB_DIR:$PATH" \
 assert_contains "stub-claude ceiling=120000" "$output" \
     "spawn-claude preserves an operator-set wait ceiling (#3943)"
 
+# Test: the daemon self-claim marker's presence/value is always logged (Issue
+# #3967) — with the var unset, an interactive/manual invocation logs "unset".
+# Explicitly unset it first: this test suite may itself be running inside a
+# daemon-dispatched `/loom:sweep` session, which would otherwise leak an
+# ambient `LOOM_SWEEP_CLAIM_OWNED` into the subshell and false-fail this case.
+output=$(env -u LOOM_SWEEP_CLAIM_OWNED LOOM_WORKSPACE="$TEST_WS" PATH="$STUB_DIR:$PATH" \
+    "$SCRIPTS_DIR/spawn-claude.sh" -p "ping" 2>&1 || true)
+assert_contains "spawn-claude: LOOM_SWEEP_CLAIM_OWNED=unset" "$output" \
+    "spawn-claude logs LOOM_SWEEP_CLAIM_OWNED=unset when not daemon-dispatched (#3967)"
+
+# Test: with the var set (simulating a daemon-dispatched child, #3823), the
+# same log line echoes the exact issue number — the diagnostic this issue's
+# acceptance criteria calls for, straight from the per-sweep log.
+output=$(LOOM_WORKSPACE="$TEST_WS" PATH="$STUB_DIR:$PATH" \
+    LOOM_SWEEP_CLAIM_OWNED="3964" \
+    "$SCRIPTS_DIR/spawn-claude.sh" -p "ping" 2>&1 || true)
+assert_contains "spawn-claude: LOOM_SWEEP_CLAIM_OWNED=3964" "$output" \
+    "spawn-claude logs the daemon self-claim marker's value when set (#3967)"
+
 # Test: explicit CLAUDE_CODE_OAUTH_TOKEN bypasses selection
 output=$(LOOM_WORKSPACE="$TEST_WS" PATH="$STUB_DIR:$PATH" \
     CLAUDE_CODE_OAUTH_TOKEN="caller-supplied" \

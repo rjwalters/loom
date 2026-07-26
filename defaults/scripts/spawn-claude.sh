@@ -108,6 +108,21 @@ _resolve_workspace() {
 WORKSPACE="$(_resolve_workspace)"
 PYTHON="${LOOM_PYTHON:-python3}"
 
+# --- Daemon self-claim marker visibility (Issue #3823, observability #3967) ---
+# `loom-daemon`'s `SweepRegistry::spawn_child` exports
+# `LOOM_SWEEP_CLAIM_OWNED=<issue>` into a daemon-dispatched child so its
+# `/loom:sweep` pre-flight recognises the daemon's own pre-dispatch
+# `loom:issue -> loom:building` label flip as ITS OWN claim rather than
+# self-skipping the issue as "another worker is in flight" (the #3967
+# incident). Log the marker's presence/value here — unconditionally, on
+# every spawn, whether daemon-dispatched or not — so a future occurrence is
+# diagnosable straight from `.loom/logs/sweep-issue-<N>.log` without needing
+# to reproduce the dispatch: this line, plus the `spawn-claude:` prefix, is
+# already captured by `spawn_child`'s per-sweep log redirection, so any gap
+# between the Rust `Command::env()` call and what this script's own
+# environment actually sees is now directly observable instead of inferred.
+log_info "spawn-claude: LOOM_SWEEP_CLAIM_OWNED=${LOOM_SWEEP_CLAIM_OWNED:-unset}"
+
 # --- Argument parsing ---
 USE_WRAPPER=false
 PASSTHROUGH_ARGS=()

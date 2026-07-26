@@ -1479,6 +1479,81 @@ mod tests {
     }
 
     // ===================================================================
+    // RegistryDispatcher — production dispatch-path regression (Issue #3967)
+    // ===================================================================
+
+    /// Build a real `SweepRegistry` (not the `RecordingDispatcher` test
+    /// fake) backed by a fixture spawn binary that records its env to a
+    /// sibling log and exits immediately — same pattern used by the
+    /// `sweep_registry.rs` and `ipc.rs` fixtures.
+    fn setup_registry_dispatcher_in_tempdir(
+    ) -> (RegistryDispatcher, tempfile::TempDir, std::path::PathBuf) {
+        use crate::sweep_registry::{SweepRegistry, SweepRegistryConfig};
+        use std::os::unix::fs::PermissionsExt;
+        use std::sync::Mutex;
+
+        let dir = tempfile::tempdir().unwrap();
+        let scripts_dir = dir.path().join(".loom").join("scripts");
+        std::fs::create_dir_all(&scripts_dir).unwrap();
+        let fake_bin = scripts_dir.join("spawn-claude.sh");
+        let record_log = dir.path().join("workfinder-fake-spawn.log");
+        let script = format!(
+            r#"#!/usr/bin/env bash
+printf 'LOOM_SWEEP_CLAIM_OWNED=%s\n' "${{LOOM_SWEEP_CLAIM_OWNED:-unset}}" >> "{rec}"
+exit 0
+"#,
+            rec = record_log.display()
+        );
+        std::fs::write(&fake_bin, script).unwrap();
+        let mut perms = std::fs::metadata(&fake_bin).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&fake_bin, perms).unwrap();
+
+        let mut config = SweepRegistryConfig::new(dir.path().to_path_buf());
+        config.spawn_bin = Some(fake_bin);
+        config.skip_label_flip = true;
+        config.journal_path = Some(dir.path().join("test-sweeps-journal.json"));
+        let registry = Arc::new(Mutex::new(SweepRegistry::new(config)));
+        (RegistryDispatcher::new(registry), dir, record_log)
+    }
+
+    /// Issue #3967: the autonomous work finder's real dispatch path
+    /// (`RegistryDispatcher`, the `WorkDispatcher` impl wired into
+    /// production — as opposed to the `RecordingDispatcher` test fake used
+    /// by every `tick`/`tick_multi` test above) must export
+    /// `LOOM_SWEEP_CLAIM_OWNED=<issue>` into the spawned child exactly like
+    /// the IPC `DispatchSweep` path (`ipc.rs`) and the CLI `dispatch`
+    /// subcommand (`main.rs`) do. `RegistryDispatcher::dispatch` forwards to
+    /// `SweepRegistry::dispatch` → `spawn_child`, so this closes the
+    /// dispatch-path-level regression coverage across all three daemon
+    /// dispatch entry points.
+    #[test]
+    #[serial]
+    fn test_registry_dispatcher_exports_claim_ownership_marker() {
+        let (mut dispatcher, _dir, record_log) = setup_registry_dispatcher_in_tempdir();
+
+        let was_new = dispatcher.dispatch(3964).expect("dispatch should succeed");
+        assert!(was_new, "expected a fresh dispatch, not an idempotency no-op");
+
+        let start = std::time::Instant::now();
+        let mut recorded = String::new();
+        while start.elapsed().as_millis() < 5000 {
+            if let Ok(s) = std::fs::read_to_string(&record_log) {
+                if s.contains("LOOM_SWEEP_CLAIM_OWNED=") {
+                    recorded = s;
+                    break;
+                }
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            recorded.contains("LOOM_SWEEP_CLAIM_OWNED=3964"),
+            "expected the work-finder's production RegistryDispatcher to export \
+             the daemon-owned-child self-claim marker; got: {recorded:?}"
+        );
+    }
+
+    // ===================================================================
     // tick — dispatch scheduling
     // ===================================================================
 
