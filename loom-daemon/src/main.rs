@@ -1,4 +1,5 @@
 use loom_daemon::activity::{self, ActivityDb, StatsQueries};
+use loom_daemon::claim_reconciliation;
 use loom_daemon::epic_supervisor;
 use loom_daemon::event_bus::EventBus;
 use loom_daemon::health_monitor;
@@ -391,6 +392,55 @@ async fn main() -> Result<()> {
             if n == 1 { "y" } else { "ies" }
         ),
         Err(e) => log::warn!("sweep_registry: reconstruction failed: {e}"),
+    }
+
+    // Stale-`loom:building`-claim reconciliation across every managed
+    // workspace (Issue #3953). `sweep.reconstruct()` above only recovers
+    // entries this registry itself owns evidence for (locks/checkpoints); it
+    // has nothing to say about a claim left behind by a sweep that died
+    // between the previous daemon's exit and this one's start (rate-limit
+    // kill, print-mode ceiling, an operator upgrade — the daemon-restart
+    // gap where `loom-recover-orphans` used to find *no* authoritative
+    // liveness source at all and refuse to reclaim anything, #3651).
+    //
+    // The machine-level sweep journal (`~/.loom/sweeps.json`, written by
+    // every `dispatch()` — see `sweep_journal`) is that liveness source, and
+    // it survives exactly the restart that wipes this in-memory registry.
+    // This pass is a bounded, logged, best-effort startup sweep over every
+    // `effective_roots()` workspace (empty registry ⇒ just this one). It
+    // never blocks daemon startup — a `gh` hiccup in one repo is logged and
+    // skipped, and the remaining repos are still reconciled.
+    if claim_reconciliation::reconciliation_enabled() {
+        let workspace_registry =
+            loom_daemon::workspace_registry::WorkspaceRegistry::load_default().unwrap_or_default();
+        let roots = workspace_registry.effective_roots(&sweep_workspace);
+        let gh_bin = std::path::PathBuf::from("gh");
+        let mut total_checked = 0usize;
+        let mut total_reclaimed = 0usize;
+        for root in &roots {
+            let (checked, reclaimed) =
+                claim_reconciliation::forge::reconcile_workspace(&gh_bin, root);
+            total_checked += checked;
+            total_reclaimed += reclaimed;
+        }
+        if total_reclaimed > 0 {
+            log::info!(
+                "claim_reconciliation: startup pass checked {total_checked} loom:building \
+                 issue(s) across {} workspace(s), reclaimed {total_reclaimed} stale claim(s) (#3953)",
+                roots.len()
+            );
+        } else {
+            log::debug!(
+                "claim_reconciliation: startup pass checked {total_checked} loom:building \
+                 issue(s) across {} workspace(s), nothing to reclaim",
+                roots.len()
+            );
+        }
+    } else {
+        log::info!(
+            "claim_reconciliation: startup pass disabled ({}=0)",
+            claim_reconciliation::RECONCILE_ENABLED_ENV
+        );
     }
 
     // Startup-race mitigation (Issue #3887): resolve the dispatch stagger + the

@@ -1734,6 +1734,9 @@ exit 0
         let mut config = SweepRegistryConfig::new(dir.path().to_path_buf());
         config.spawn_bin = Some(fake_bin);
         config.skip_label_flip = true;
+        // Confine the #3953 sweep journal to this test's tempdir — never the
+        // real machine-level `~/.loom/sweeps.json`.
+        config.journal_path = Some(dir.path().join("test-sweeps-journal.json"));
         let sr = Arc::new(Mutex::new(SweepRegistry::new(config)));
         (sr, dir, record_log)
     }

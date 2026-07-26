@@ -12,6 +12,7 @@
 
 pub mod activity;
 pub mod capacity;
+pub mod claim_reconciliation;
 pub mod disk_headroom;
 pub mod epic_state;
 pub mod epic_supervisor;
@@ -28,6 +29,7 @@ pub mod main_health_gate;
 pub mod metrics_collector;
 pub mod phase_join;
 pub mod role_validation;
+pub mod sweep_journal;
 pub mod sweep_registry;
 pub mod terminal;
 pub mod tokens;

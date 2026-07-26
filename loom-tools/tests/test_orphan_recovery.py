@@ -20,8 +20,11 @@ Test map to acceptance criteria:
 
 from __future__ import annotations
 
+import json
 import pathlib
 from unittest import mock
+
+import pytest
 
 from loom_tools import orphan_recovery
 from loom_tools.models.spawn_loop_state import SpawnLoopState, SpawnLoopTask
@@ -33,6 +36,31 @@ from loom_tools.orphan_recovery import (
     gather_liveness_evidence,
     run_orphan_recovery,
 )
+
+
+@pytest.fixture(autouse=True)
+def _isolated_journal_path(tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch) -> pathlib.Path:
+    """Make the #3953 sweep-journal read hermetic for every test in this module.
+
+    ``gather_liveness_evidence`` resolves the journal path via
+    ``_default_journal_path()``, which defaults to the REAL
+    ``~/.loom/sweeps.json`` on the machine running the suite. Without this
+    fixture, a test's outcome (e.g. ``evidence.available``) would depend on
+    whether that file happens to exist on whoever's machine runs the tests.
+
+    Rather than replacing ``_default_journal_path`` itself (which would also
+    defeat a test of its own env-var-override logic), this patches
+    ``pathlib.Path.home()`` to a fresh, per-test fake home directory and
+    clears ``LOOM_SWEEPS_JOURNAL_PATH`` — so ``_default_journal_path()`` runs
+    its REAL resolution logic and lands on a path that is absent by default.
+    Tests that want journal-present behavior write to this same path
+    explicitly via :func:`_write_journal`.
+    """
+    fake_home = tmp_path / "fake-home"
+    fake_home.mkdir(parents=True, exist_ok=True)
+    monkeypatch.delenv("LOOM_SWEEPS_JOURNAL_PATH", raising=False)
+    monkeypatch.setattr(pathlib.Path, "home", lambda: fake_home)
+    return fake_home / ".loom" / "sweeps.json"
 
 
 # ---------------------------------------------------------------------------
@@ -49,6 +77,12 @@ def _make_repo(tmp_path: pathlib.Path) -> pathlib.Path:
 def _make_lock(repo_root: pathlib.Path, issue: int) -> None:
     """Create a ``.loom/locks/issue-<N>/`` worktree-lifetime lock dir."""
     (repo_root / ".loom" / "locks" / f"issue-{issue}").mkdir(parents=True, exist_ok=True)
+
+
+def _write_journal(journal_path: pathlib.Path, entries: list[dict]) -> None:
+    """Write a minimal sweep-journal file at ``journal_path``."""
+    journal_path.parent.mkdir(parents=True, exist_ok=True)
+    journal_path.write_text(json.dumps({"version": 1, "entries": entries}))
 
 
 class _GhRecorder:
@@ -319,3 +353,263 @@ def test_stale_heartbeat_path_unaffected(tmp_path: pathlib.Path) -> None:
     stale = [o for o in result.orphaned if o.type == "stale_heartbeat"]
     assert len(stale) == 1
     assert stale[0].issue == 77
+
+
+# ---------------------------------------------------------------------------
+# Machine-level sweep journal (issue #3953)
+# ---------------------------------------------------------------------------
+#
+# The journal gives orphan recovery an authoritative liveness source that
+# SURVIVES a daemon restart (unlike the in-memory registry `_query_daemon_live_
+# issues` merely stubs). These tests cover: (1) `gather_liveness_evidence`
+# reading the journal correctly, and (2) the end-to-end `run_orphan_recovery`
+# staleness-threshold selection it drives in `check_untracked_building`.
+
+
+def test_gather_liveness_journal_absent_file_is_not_a_source(
+    tmp_path: pathlib.Path,
+) -> None:
+    """No journal file at all -> not a source, byte-for-byte pre-#3953 behavior."""
+    repo = _make_repo(tmp_path)
+    evidence = gather_liveness_evidence(SpawnLoopState.absent(), repo)
+    assert evidence.available is False
+    assert evidence.journal_present is False
+    assert evidence.journal_issues == set()
+
+
+def test_gather_liveness_journal_present_dead_pid_is_source_not_live(
+    tmp_path: pathlib.Path, _isolated_journal_path: pathlib.Path,
+) -> None:
+    """A journal entry with a dead PID makes the journal a source, but the
+    issue is NOT added to `live_issues` (it's the strongest orphan evidence,
+    not liveness evidence)."""
+    repo = _make_repo(tmp_path)
+    _write_journal(_isolated_journal_path, [{"repo": str(repo), "issue": 42, "pid": 999999}])
+
+    with mock.patch.object(orphan_recovery, "_pid_alive", return_value=False):
+        evidence = gather_liveness_evidence(SpawnLoopState.absent(), repo)
+
+    assert evidence.available is True
+    assert "sweep-journal" in evidence.sources
+    assert evidence.journal_present is True
+    assert evidence.journal_issues == {42}
+    assert 42 not in evidence.live_issues
+
+
+def test_gather_liveness_journal_present_live_pid_is_live(
+    tmp_path: pathlib.Path, _isolated_journal_path: pathlib.Path,
+) -> None:
+    """A journal entry with a LIVE PID is proof of life: added to `live_issues`."""
+    repo = _make_repo(tmp_path)
+    _write_journal(_isolated_journal_path, [{"repo": str(repo), "issue": 42, "pid": 1}])
+
+    with mock.patch.object(orphan_recovery, "_pid_alive", return_value=True):
+        evidence = gather_liveness_evidence(SpawnLoopState.absent(), repo)
+
+    assert evidence.available is True
+    assert evidence.journal_issues == {42}
+    assert 42 in evidence.live_issues
+
+
+def test_gather_liveness_journal_entry_scoped_to_repo(
+    tmp_path: pathlib.Path, _isolated_journal_path: pathlib.Path,
+) -> None:
+    """An entry for a DIFFERENT repo must not leak into this repo's evidence."""
+    repo = _make_repo(tmp_path)
+    other_repo = tmp_path.parent / "some-other-repo"
+    _write_journal(_isolated_journal_path, [{"repo": str(other_repo), "issue": 42, "pid": 1}])
+
+    with mock.patch.object(orphan_recovery, "_pid_alive", return_value=True):
+        evidence = gather_liveness_evidence(SpawnLoopState.absent(), repo)
+
+    # The journal file exists (this repo's directory), so it IS a source, but
+    # it has no entry scoped to *this* repo.
+    assert evidence.journal_present is True
+    assert evidence.journal_issues == set()
+    assert 42 not in evidence.live_issues
+
+
+def test_gather_liveness_journal_corrupt_file_degrades_to_absent_entries(
+    tmp_path: pathlib.Path, _isolated_journal_path: pathlib.Path,
+) -> None:
+    """A corrupt journal file must not crash -- it degrades to zero entries.
+
+    The file's mere *presence* still marks the journal as a contributing
+    source (mirrors `sweep_journal::load`'s tolerant-corrupt-file behavior on
+    the Rust side): a corrupt journal is not proof of anything, so no entries
+    are read from it, but its presence is not silently ignored either.
+    """
+    repo = _make_repo(tmp_path)
+    _isolated_journal_path.parent.mkdir(parents=True, exist_ok=True)
+    _isolated_journal_path.write_text("{ not json")
+
+    evidence = gather_liveness_evidence(SpawnLoopState.absent(), repo)
+
+    assert evidence.journal_present is True
+    assert evidence.journal_issues == set()
+
+
+def test_journal_dead_pid_claim_is_recoverable(
+    tmp_path: pathlib.Path, _isolated_journal_path: pathlib.Path,
+) -> None:
+    """AC #3953: a claim whose recorded PID is dead IS reclaimable (subject to
+    the standard, short label-age grace period -- not the long no-record one).
+    """
+    repo = _make_repo(tmp_path)
+    _write_journal(_isolated_journal_path, [{"repo": str(repo), "issue": 42, "pid": 999999}])
+    gh = _GhRecorder(allow_edit=True)
+
+    with mock.patch.object(
+        orphan_recovery, "_pid_alive", return_value=False,
+    ), mock.patch.object(
+        orphan_recovery, "gh_issue_list",
+        return_value=[{"number": 42, "title": "dead sweep after daemon restart"}],
+    ), mock.patch.object(
+        orphan_recovery, "_get_building_label_age", return_value=700,  # > grace(600), well under 4h
+    ), mock.patch.object(
+        orphan_recovery, "has_valid_claim", return_value=False,
+    ), mock.patch.object(
+        orphan_recovery, "_has_recent_orphan_comment", return_value=False,
+    ), mock.patch.object(orphan_recovery, "gh_run", gh):
+        result = run_orphan_recovery(repo, recover=True, verbose=True)
+
+    assert result.total_orphaned == 1
+    assert result.orphaned[0].reason == "journal_pid_dead"
+    assert "42" in gh.edited_issues
+
+
+def test_journal_live_pid_claim_still_refuses(
+    tmp_path: pathlib.Path, _isolated_journal_path: pathlib.Path,
+) -> None:
+    """AC #3953: still refuses to reclaim when the record shows a live PID —
+    even with a very old label."""
+    repo = _make_repo(tmp_path)
+    _write_journal(_isolated_journal_path, [{"repo": str(repo), "issue": 42, "pid": 1}])
+    gh = _GhRecorder(allow_edit=False)
+
+    with mock.patch.object(
+        orphan_recovery, "_pid_alive", return_value=True,
+    ), mock.patch.object(
+        orphan_recovery, "gh_issue_list",
+        return_value=[{"number": 42, "title": "long-running live sweep"}],
+    ), mock.patch.object(
+        orphan_recovery, "_get_building_label_age", return_value=99999,
+    ), mock.patch.object(
+        orphan_recovery, "has_valid_claim", return_value=False,
+    ), mock.patch.object(orphan_recovery, "gh_run", gh):
+        result = run_orphan_recovery(repo, recover=True, verbose=True)
+
+    assert result.total_orphaned == 0
+    assert gh.edited_issues == []
+
+
+def test_journal_no_record_within_stale_hours_is_not_recovered(
+    tmp_path: pathlib.Path, _isolated_journal_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No journal entry at all, journal IS a source (has an entry for another
+    issue): must NOT reclaim before LOOM_STALE_BUILDING_HOURS, even though the
+    label is already past the (much shorter) default grace period."""
+    repo = _make_repo(tmp_path)
+    _write_journal(_isolated_journal_path, [{"repo": str(repo), "issue": 999, "pid": 1}])
+    monkeypatch.setenv("LOOM_STALE_BUILDING_HOURS", "4")
+    gh = _GhRecorder(allow_edit=False)
+
+    with mock.patch.object(
+        orphan_recovery, "_pid_alive", return_value=True,
+    ), mock.patch.object(
+        orphan_recovery, "gh_issue_list",
+        return_value=[{"number": 42, "title": "no journal entry, not stale enough yet"}],
+    ), mock.patch.object(
+        orphan_recovery, "_get_building_label_age", return_value=3600,  # 1h: > 600s grace, < 4h
+    ), mock.patch.object(
+        orphan_recovery, "has_valid_claim", return_value=False,
+    ), mock.patch.object(orphan_recovery, "gh_run", gh):
+        result = run_orphan_recovery(repo, recover=True, verbose=True)
+
+    assert result.total_orphaned == 0
+    assert gh.edited_issues == []
+
+
+def test_journal_no_record_past_stale_hours_is_recovered(
+    tmp_path: pathlib.Path, _isolated_journal_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Same setup, but past LOOM_STALE_BUILDING_HOURS -> now reclaimable."""
+    repo = _make_repo(tmp_path)
+    _write_journal(_isolated_journal_path, [{"repo": str(repo), "issue": 999, "pid": 1}])
+    monkeypatch.setenv("LOOM_STALE_BUILDING_HOURS", "4")
+    gh = _GhRecorder(allow_edit=True)
+
+    with mock.patch.object(
+        orphan_recovery, "_pid_alive", return_value=True,
+    ), mock.patch.object(
+        orphan_recovery, "gh_issue_list",
+        return_value=[{"number": 42, "title": "no journal entry, now stale"}],
+    ), mock.patch.object(
+        orphan_recovery, "_get_building_label_age", return_value=20000,  # > 4h
+    ), mock.patch.object(
+        orphan_recovery, "has_valid_claim", return_value=False,
+    ), mock.patch.object(
+        orphan_recovery, "_has_recent_orphan_comment", return_value=False,
+    ), mock.patch.object(orphan_recovery, "gh_run", gh):
+        result = run_orphan_recovery(repo, recover=True, verbose=True)
+
+    assert result.total_orphaned == 1
+    assert result.orphaned[0].reason == "no_journal_record_stale"
+    assert "42" in gh.edited_issues
+
+
+def test_journal_absent_falls_back_to_label_grace_period(
+    tmp_path: pathlib.Path,
+) -> None:
+    """No journal file at all (only a lock-based source): unaffected by
+    #3953 -- the standard label_grace_period alone governs, matching
+    pre-#3953 behavior exactly."""
+    repo = _make_repo(tmp_path)
+    _make_lock(repo, 999)  # unrelated active source
+    gh = _GhRecorder(allow_edit=True)
+
+    with mock.patch.object(
+        orphan_recovery, "gh_issue_list",
+        return_value=[{"number": 42, "title": "no journal at all"}],
+    ), mock.patch.object(
+        orphan_recovery, "_get_building_label_age", return_value=700,  # > grace(600s)
+    ), mock.patch.object(
+        orphan_recovery, "has_valid_claim", return_value=False,
+    ), mock.patch.object(
+        orphan_recovery, "_has_recent_orphan_comment", return_value=False,
+    ), mock.patch.object(orphan_recovery, "gh_run", gh):
+        result = run_orphan_recovery(repo, recover=True, verbose=True)
+
+    assert result.total_orphaned == 1
+    assert result.orphaned[0].reason == "no_spawn_loop_entry"
+    assert "42" in gh.edited_issues
+
+
+def test_get_stale_building_hours_default_and_override(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("LOOM_STALE_BUILDING_HOURS", raising=False)
+    assert orphan_recovery._get_stale_building_hours() == orphan_recovery.DEFAULT_STALE_BUILDING_HOURS
+
+    monkeypatch.setenv("LOOM_STALE_BUILDING_HOURS", "2.5")
+    assert orphan_recovery._get_stale_building_hours() == 2.5
+
+    # Non-positive / unparseable falls back to the default.
+    monkeypatch.setenv("LOOM_STALE_BUILDING_HOURS", "0")
+    assert orphan_recovery._get_stale_building_hours() == orphan_recovery.DEFAULT_STALE_BUILDING_HOURS
+    monkeypatch.setenv("LOOM_STALE_BUILDING_HOURS", "garbage")
+    assert orphan_recovery._get_stale_building_hours() == orphan_recovery.DEFAULT_STALE_BUILDING_HOURS
+
+
+def test_default_journal_path_env_override(monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path) -> None:
+    custom = tmp_path / "custom-sweeps.json"
+    monkeypatch.setenv("LOOM_SWEEPS_JOURNAL_PATH", str(custom))
+    assert orphan_recovery._default_journal_path() == custom
+    monkeypatch.delenv("LOOM_SWEEPS_JOURNAL_PATH", raising=False)
+
+
+def test_journal_repo_matches_exact_and_resolved(tmp_path: pathlib.Path) -> None:
+    repo = _make_repo(tmp_path)
+    assert orphan_recovery._journal_repo_matches(str(repo), repo) is True
+    assert orphan_recovery._journal_repo_matches(str(repo) + "/", repo) is True
+    assert orphan_recovery._journal_repo_matches("/some/other/repo", repo) is False
