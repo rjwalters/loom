@@ -1016,8 +1016,14 @@ for the load-bearing behavior) and, best-effort, flips the forge labels
 (`loom:issue` → `loom:blocked`) with an explanatory comment so the pause is also
 visible to a human. Quarantine is visible per-repo in `loom-daemon status`
 (`quarantined (insta-crash, #3939): #123, #456`) and auto-releases after `ttlSecs`
-(or via `loom:blocked` removal) — a transient breakage (e.g. a re-provisioned
-token pool) recovers without operator action. In `tick_multi`, a quarantined
+— a transient breakage (e.g. a re-provisioned token pool) recovers without
+operator action. To release a quarantine **immediately** (rather than waiting for
+the TTL), run `loom-daemon quarantine clear <issue>`: it clears the daemon's
+in-memory quarantine + insta-crash tally over IPC AND restores `loom:issue` on
+the forge, so the issue re-qualifies on the next tick. **Note:** the in-memory
+quarantine is the load-bearing state — manually flipping `loom:blocked` →
+`loom:issue` on the forge alone does **not** release it (the work finder skips
+the issue until the CLI clear or the TTL fires). In `tick_multi`, a quarantined
 candidate is dropped **before** the global slot-fill pass, so a workspace whose
 only candidates are quarantined never reserves a shared dispatch slot — healthy
 sibling work in other repos gets it instead. Defaults **on**; disable with

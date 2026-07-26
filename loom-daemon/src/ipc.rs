@@ -1292,6 +1292,24 @@ fn handle_request(
             }
         }
 
+        Request::ClearQuarantine {
+            issue,
+            workspace_root,
+        } => {
+            // Operator-reachable insta-crash-quarantine release (Issue #3939).
+            // Clears the daemon's in-memory quarantine + insta-crash tally for
+            // `issue` (and restores `loom:issue` on the forge) so the work
+            // finder re-qualifies it immediately instead of waiting for the TTL.
+            let target =
+                resolve_registry(sweep_registry, workspace_pool, workspace_root.as_deref());
+            let mut sr = target.lock().expect("Sweep registry mutex poisoned");
+            let was_quarantined = sr.clear_quarantine(issue);
+            Response::QuarantineCleared {
+                issue,
+                was_quarantined,
+            }
+        }
+
         // ====================================================================
         // Event Bus Handlers (Issue #3453 — Phase B of #3449)
         // ====================================================================
@@ -2217,6 +2235,70 @@ exit 0
             }
             other => panic!("Expected Error, got: {other:?}"),
         }
+    }
+
+    #[test]
+    fn test_handle_request_clear_quarantine_noop() {
+        // Issue #3939/#3960: clearing an issue that is not quarantined is an
+        // idempotent no-op success routed through the full IPC dispatcher.
+        let (tm, db, _, bus) = setup_test_context();
+        let (sr, _dir, _rec) = setup_sweep_registry_in_tempdir();
+        let response = handle_request(
+            Request::ClearQuarantine {
+                issue: 4242,
+                workspace_root: None,
+            },
+            &tm,
+            &db,
+            &sr,
+            &bus,
+            &test_pool(),
+        );
+        match response {
+            Response::QuarantineCleared {
+                issue,
+                was_quarantined,
+            } => {
+                assert_eq!(issue, 4242);
+                assert!(!was_quarantined, "no entry existed -> false");
+            }
+            other => panic!("Expected QuarantineCleared, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_handle_request_clear_quarantine_clears_existing() {
+        // Seed a quarantine directly, then clear it via the IPC dispatcher and
+        // assert the in-memory state was released (was_quarantined: true).
+        let (tm, db, _, bus) = setup_test_context();
+        let (sr, _dir, _rec) = setup_sweep_registry_in_tempdir();
+        {
+            let mut reg = sr.lock().unwrap();
+            reg.seed_quarantine_for_test(808);
+            assert!(reg.is_quarantined(808));
+        }
+        let response = handle_request(
+            Request::ClearQuarantine {
+                issue: 808,
+                workspace_root: None,
+            },
+            &tm,
+            &db,
+            &sr,
+            &bus,
+            &test_pool(),
+        );
+        match response {
+            Response::QuarantineCleared {
+                issue,
+                was_quarantined,
+            } => {
+                assert_eq!(issue, 808);
+                assert!(was_quarantined, "seeded entry existed -> true");
+            }
+            other => panic!("Expected QuarantineCleared, got: {other:?}"),
+        }
+        assert!(!sr.lock().unwrap().is_quarantined(808));
     }
 
     #[test]

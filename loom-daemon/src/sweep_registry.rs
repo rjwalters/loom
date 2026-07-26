@@ -969,10 +969,29 @@ impl SweepRegistry {
     }
 
     /// Manually clear an issue's quarantine + insta-crash tally (Issue #3939),
-    /// the operator-action release path. Returns `true` when an entry existed.
+    /// the operator-action release path (reachable via the `ClearQuarantine` IPC
+    /// request / `loom-daemon quarantine clear <issue>` CLI). Returns `true` when
+    /// an entry existed. When an entry is actually cleared, a best-effort forge
+    /// label restore re-arms `loom:issue` (mirroring [`expire_quarantine`]), so
+    /// the operator command both releases the in-memory pause and re-enters the
+    /// issue into the work-finder queue — the label flip alone never sufficed.
     pub fn clear_quarantine(&mut self, issue: u32) -> bool {
         self.insta_crash_counts.remove(&issue);
-        self.quarantined.remove(&issue).is_some()
+        let was_quarantined = self.quarantined.remove(&issue).is_some();
+        if was_quarantined {
+            self.release_quarantine_label(issue);
+        }
+        was_quarantined
+    }
+
+    /// Test-only helper: seed an in-memory quarantine entry for `issue` so
+    /// cross-module tests (e.g. the IPC dispatcher in `ipc.rs`) can exercise the
+    /// `ClearQuarantine` path without driving the full insta-crash accrual.
+    #[cfg(test)]
+    pub fn seed_quarantine_for_test(&mut self, issue: u32) {
+        self.quarantined.insert(issue, Utc::now());
+        self.insta_crash_counts
+            .insert(issue, self.quarantine_config.threshold);
     }
 
     /// Read-only accessor for the event bus, if any. Exposed so external
@@ -1461,12 +1480,18 @@ impl SweepRegistry {
 
         let body = format!(
             "Auto-quarantined by loom-daemon (#3939): this issue's sweep insta-crashed {count} \
-             times in a row — each child died within {}s of dispatch without writing a phase \
+             times in a row — each child died within {secs}s of dispatch without writing a phase \
              checkpoint, which almost always means an environment/configuration failure (e.g. a \
              missing token pool, #3938) rather than a problem with the issue itself. Re-dispatch \
              is paused so it stops occupying a global concurrency slot and starving other work. \
-             Once the underlying cause is fixed, remove `loom:blocked` and re-add `loom:issue`.",
-            self.quarantine_config.insta_crash_secs
+             Once the underlying cause is fixed, clear the quarantine with `loom-daemon \
+             quarantine clear {issue}` (this releases the in-memory pause AND restores \
+             `loom:issue`), or simply wait for the {ttl}s TTL to auto-release it. Note: manually \
+             flipping `loom:blocked` -> `loom:issue` on the forge does NOT release the daemon's \
+             in-memory quarantine on its own — the work finder skips it until the CLI clear or the \
+             TTL fires.",
+            secs = self.quarantine_config.insta_crash_secs,
+            ttl = self.quarantine_config.ttl.as_secs(),
         );
         let mut comment = Command::new(&gh);
         comment
@@ -4912,6 +4937,73 @@ exit 0
         assert!(!registry.is_quarantined(46));
         assert_eq!(registry.insta_crash_count(46), 0);
         assert!(!registry.clear_quarantine(46), "idempotent: false when nothing to clear");
+    }
+
+    /// The operator-action release path (`clear_quarantine`) must restore
+    /// `loom:issue` on the forge — the whole point of the #3960 fix is that
+    /// clearing the in-memory quarantine ALSO re-arms the label, so the manual
+    /// path is not a dead-end that leaves the issue stuck in `loom:blocked`.
+    #[test]
+    fn clear_quarantine_restores_forge_label() {
+        let dir = tempdir().unwrap();
+        let gh_log = dir.path().join("gh-invocations.log");
+        let fake_gh = dir.path().join("fake-gh.sh");
+        let script = format!(
+            "#!/usr/bin/env bash\nprintf '%s\\n' \"$*\" >> \"{}\"\nexit 0\n",
+            gh_log.display()
+        );
+        std::fs::write(&fake_gh, &script).unwrap();
+        let mut perms = std::fs::metadata(&fake_gh).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&fake_gh, perms).unwrap();
+        if let Ok(f) = std::fs::File::open(&fake_gh) {
+            let _ = f.sync_all();
+        }
+
+        let mut config = SweepRegistryConfig::new(dir.path().to_path_buf());
+        config.gh_bin = Some(fake_gh);
+        config.skip_label_flip = false; // exercise the real restore path
+        let mut registry = SweepRegistry::new(config);
+        registry.quarantined.insert(52, Utc::now());
+        registry.insta_crash_counts.insert(52, 3);
+
+        assert!(registry.clear_quarantine(52));
+        assert!(!registry.is_quarantined(52));
+
+        let gh_calls = std::fs::read_to_string(&gh_log).unwrap_or_default();
+        assert!(
+            gh_calls.contains("issue edit 52 --remove-label loom:blocked --add-label loom:issue"),
+            "expected clear_quarantine to restore loom:blocked -> loom:issue; got: {gh_calls:?}"
+        );
+    }
+
+    /// A no-op clear (issue not quarantined) must NOT touch the forge — no
+    /// stray label edit for an issue that was never blocked.
+    #[test]
+    fn clear_quarantine_noop_skips_forge_label() {
+        let dir = tempdir().unwrap();
+        let gh_log = dir.path().join("gh-invocations.log");
+        let fake_gh = dir.path().join("fake-gh.sh");
+        let script = format!(
+            "#!/usr/bin/env bash\nprintf '%s\\n' \"$*\" >> \"{}\"\nexit 0\n",
+            gh_log.display()
+        );
+        std::fs::write(&fake_gh, &script).unwrap();
+        let mut perms = std::fs::metadata(&fake_gh).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&fake_gh, perms).unwrap();
+
+        let mut config = SweepRegistryConfig::new(dir.path().to_path_buf());
+        config.gh_bin = Some(fake_gh);
+        config.skip_label_flip = false;
+        let mut registry = SweepRegistry::new(config);
+
+        assert!(!registry.clear_quarantine(999), "no-op when not quarantined");
+        let gh_calls = std::fs::read_to_string(&gh_log).unwrap_or_default();
+        assert!(
+            gh_calls.is_empty(),
+            "expected no forge call for a no-op clear; got: {gh_calls:?}"
+        );
     }
 
     /// Config resolution honors precedence env > config > default (#3939).
