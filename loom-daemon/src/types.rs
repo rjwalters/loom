@@ -641,7 +641,17 @@ pub struct DaemonStatusReport {
     /// Dynamic-cap input 3: the configured operator ceiling
     /// (`autonomous.workFinder.maxConcurrent` / `LOOM_WORK_FINDER_MAX_CONCURRENT`).
     pub configured_max: usize,
-    /// The effective dynamic concurrency cap — `min` of the three inputs above
+    /// The per-token concurrency factor (#3947): how many concurrent sweeps the
+    /// dynamic cap allows per *healthy* token. The token axis of the cap is
+    /// `healthy_tokens × per_token_concurrency`, not the old implicit
+    /// `× 1`. Resolved with precedence env (`LOOM_PER_TOKEN_CONCURRENCY`) >
+    /// config (`autonomous.perTokenConcurrency`) > default (2).
+    /// `#[serde(default)]` keeps pre-#3947 wire data / older clients compatible
+    /// (an absent field parses as `0`; the status renderer treats `< 1` as `1`).
+    #[serde(default)]
+    pub per_token_concurrency: usize,
+    /// The effective dynamic concurrency cap —
+    /// `min(token_axis × per_token_concurrency, disk_headroom, configured_max)`
     /// (`resolve_dynamic_max_concurrent`). This is the total-occupancy ceiling
     /// the work finder recomputes every tick.
     pub dynamic_cap: usize,

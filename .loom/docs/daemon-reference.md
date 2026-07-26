@@ -735,17 +735,45 @@ The concurrency cap is **not** a fixed value resolved once at startup. Every
 tick the finder recomputes
 
 ```
-dynamic_cap = min(healthy-token count, disk headroom, configured ceiling)
+dynamic_cap = min(healthy-token count × per-token concurrency, disk headroom, configured ceiling)
 ```
 
-from three live inputs, so pool/disk/backlog changes are honored without a
-daemon restart:
+from live inputs, so pool/disk/backlog changes are honored without a daemon
+restart:
 
 | Input | Source | Bound it enforces |
 |-------|--------|-------------------|
-| **healthy-token count** | `available` accounts in `{workspace}/.loom/tokens/.ranking` (`capacity::token_axis_limit`), falling back to the `*.token` count (`tokens::token_pool_size`) when no ranking exists | never over-subscribe a rotated OAuth account, and never dispatch to an exhausted/blocked one (#3902) — one live sweep per **healthy** account |
+| **healthy-token count** | `available` accounts in `{workspace}/.loom/tokens/.ranking` (`capacity::token_axis_limit`), falling back to the `*.token` count (`tokens::token_pool_size`) when no ranking exists | the count of accounts safe to dispatch to — never dispatch to an exhausted/blocked one (#3902) |
+| **per-token concurrency** | `LOOM_PER_TOKEN_CONCURRENCY` / `autonomous.perTokenConcurrency`, default **2** (#3947) | how many concurrent sweeps to allow **per healthy account**. A plan limit is a utilization-window token bucket, not a session count, so one healthy account can run several concurrent sessions. Before #3947 the implicit factor was `1` (one sweep per account), which collapsed the whole fleet to cap 1 when 6/7 accounts were at their weekly ceiling even though the single healthy account had ample session-window headroom |
 | **disk headroom** | `floor(free_gb / LOOM_PER_WORKTREE_GB)` on the worktree-root volume (`disk_headroom::disk_headroom_limit`, a Rust port of `disk-headroom.sh` that shells to `df -Pk`) | never provision more worktrees than the scratch volume can hold |
-| **configured ceiling** | `LOOM_WORK_FINDER_MAX_CONCURRENT` (repurposed from Phase A's fixed target into an operator ceiling) | hard operator upper bound regardless of pool/disk headroom |
+| **configured ceiling** | `LOOM_WORK_FINDER_MAX_CONCURRENT` (repurposed from Phase A's fixed target into an operator ceiling) | hard operator upper bound regardless of token/disk headroom |
+
+**Per-token concurrency factor (#3947).** The token axis is `healthy × factor`,
+not `healthy × 1`. The factor is resolved with the standard precedence **env
+(`LOOM_PER_TOKEN_CONCURRENCY`) > config (`autonomous.perTokenConcurrency`) >
+default (2)**; a zero/unparseable value at any layer is ignored, and the cap
+formula additionally clamps the factor to a floor of `1` so a mis-set `0` degrades
+to the pre-#3947 one-sweep-per-account behavior rather than dispatching nothing.
+Bounded **stacking**, not a 1:1 hard limit, is the correct response to a healthy
+account with session-window headroom — the #3909 rotating selection spread still
+fills **distinct** accounts first (via the persistent `.rotation_cursor`), only
+stacking multiple sweeps on one account when concurrency demand exceeds the
+healthy-account count. The `loom-daemon status` view spells the arithmetic out,
+e.g. `= min(healthy 1 × per-token 2 = 2, disk headroom 120, configured max 3)`.
+
+**Session-limit fault handling (#3947).** Stacking can occasionally trip a
+**concurrent-session-limit** fault on a token (the account is healthy but cannot
+start another *simultaneous* session right now). This is a **capacity** signal,
+not quota exhaustion, so `classify-error.sh` classifies it distinctly as
+`SESSION_LIMIT` (checked *before* `TOKEN_EXHAUSTED` so the "session limit" wording
+is not swallowed by the exhaustion regex). `claude-wrapper.sh` responds by
+re-selecting a **different** account and retrying **without** appending the
+current token to `.bad_tokens` — a capacity fault must never poison the healthy
+pool. Re-selection advances the rotation cursor so a healthy sibling is preferred,
+which backs off stacking for the saturated account; a bounded
+`LOOM_MAX_SESSION_LIMIT_RETRIES` (default 10) guards a fully-saturated pool from
+spinning, after which it falls through to normal transient backoff (still without
+marking the token bad).
 
 The **effective** per-tick concurrency is then `min(dynamic_cap, backlog_depth)`:
 `tick()` iterates the ready `loom:issue` rows and stops at the cap, so
@@ -770,8 +798,10 @@ config (`autonomous.workFinder.enabled`, see "Operability" below). Tunables:
 `LOOM_WORK_FINDER_INTERVAL_SECS` (default 60 — tighter than the epic
 supervisor's 300s so the `loom:issue` backlog drains promptly),
 `LOOM_WORK_FINDER_MAX_CONCURRENT` (default 3 — the operator **ceiling** in the
-dynamic policy above, not a fixed target), and `LOOM_PER_WORKTREE_GB` (default 2
-— the per-worktree disk estimate the disk-headroom bound divides by). A zero or
+dynamic policy above, not a fixed target), `LOOM_PER_TOKEN_CONCURRENCY` (default 2
+— the per-healthy-token concurrency factor of the cap, #3947), and
+`LOOM_PER_WORKTREE_GB` (default 2 — the per-worktree disk estimate the
+disk-headroom bound divides by). A zero or
 unparseable value for any of these falls back to its default.
 
 > **Scope note**: the work finder dispatches **already-approved** `loom:issue`
@@ -839,6 +869,7 @@ concurrency ceiling 5" and share it with the team:
 {
   "autonomous": {
     "model": "sonnet",
+    "perTokenConcurrency": 2,
     "workFinder": {
       "enabled": true,
       "intervalSecs": 60,
@@ -873,6 +904,7 @@ exactly like `main_health_gate::read_build_gate_config`.
 | `autonomous.workFinder.enabled` | `LOOM_WORK_FINDER` | `false` | Master on/off for the finder loop |
 | `autonomous.workFinder.intervalSecs` | `LOOM_WORK_FINDER_INTERVAL_SECS` | `60` | Zero/invalid → default |
 | `autonomous.workFinder.maxConcurrent` | `LOOM_WORK_FINDER_MAX_CONCURRENT` | `3` | Operator **ceiling**, not a fixed target |
+| `autonomous.perTokenConcurrency` | `LOOM_PER_TOKEN_CONCURRENCY` | `2` | Concurrent sweeps **per healthy token** in the cap (#3947). Zero/invalid → default; clamped to a floor of 1 |
 | `autonomous.mainHealthGate.enabled` | `LOOM_MAIN_HEALTH_GATE` | `false` | Gate loop on/off |
 | `autonomous.dispatchStaggerMs` | `LOOM_SWEEP_DISPATCH_STAGGER_MS` | `2000` | Min gap between consecutive child spawns (#3887). `0` disables |
 | `autonomous.watchdog.enabled` | `LOOM_SWEEP_WATCHDOG` | `true` | Startup watchdog on/off (#3887). Also the master switch for the tick — mid-build-death (#3895) + review-stall (#3910) run in the same task |

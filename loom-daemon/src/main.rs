@@ -459,9 +459,11 @@ async fn main() -> Result<()> {
     let _work_finder_handle = if work_finder::resolve_enabled(&work_finder_config) {
         let interval = work_finder::resolve_interval_with_config(&work_finder_config);
         let configured_max = work_finder::resolve_max_concurrent_with_config(&work_finder_config);
+        let per_token_concurrency = work_finder::resolve_per_token_concurrency(&work_finder_config);
         log::info!(
             "work_finder: enabled (multi-workspace, interval={}s, configured_max={configured_max}, \
-             dynamic cap = min(pool, disk, configured_max), global across workspaces)",
+             per_token_concurrency={per_token_concurrency}, \
+             dynamic cap = min(healthy tokens × per-token, disk, configured_max), global across workspaces)",
             interval.as_secs()
         );
         // Multi-workspace fan-out (#3928): re-reads `effective_roots()` each tick
@@ -472,6 +474,7 @@ async fn main() -> Result<()> {
             sweep_workspace.clone(),
             interval,
             configured_max,
+            per_token_concurrency,
             workspace_health_states.clone(),
             event_bus.clone(),
         ))
@@ -1014,11 +1017,15 @@ fn resolve_capacity(
                 .collect();
             let cap = loom_daemon::capacity::summarize_probe(pairs.iter().copied());
             let token_axis_limit = cap.healthy;
-            let effective_cap = token_axis_limit
+            // The token axis of the cap is `healthy × per-token` (#3947); treat a
+            // pre-#3947 wire `0` as the effective floor of 1.
+            let factor = report.per_token_concurrency.max(1);
+            let token_axis_effective = token_axis_limit.saturating_mul(factor);
+            let effective_cap = token_axis_effective
                 .min(report.disk_headroom)
                 .min(report.configured_max);
-            let token_bound = token_axis_limit <= report.disk_headroom
-                && token_axis_limit <= report.configured_max;
+            let token_bound = token_axis_effective <= report.disk_headroom
+                && token_axis_effective <= report.configured_max;
             return ResolvedCapacity {
                 source: "probe",
                 ranking_present: true,
@@ -1072,6 +1079,8 @@ fn print_status_json(
             "token_pool_size": report.token_pool_size,
             "disk_headroom": report.disk_headroom,
             "configured_max": report.configured_max,
+            "per_token_concurrency": report.per_token_concurrency.max(1),
+            "token_axis_effective": rc.token_axis_limit.saturating_mul(report.per_token_concurrency.max(1)),
             "effective": rc.effective_cap,
         },
         "capacity": {
@@ -1127,10 +1136,15 @@ fn print_status_human(report: &DaemonStatusReport, token_usage: Option<&serde_js
     // input, the Token-capacity summary, and the Per-token table all agree (#3936).
     let rc = resolve_capacity(report, token_usage);
 
+    let factor = report.per_token_concurrency.max(1);
     println!("\nDynamic concurrency cap: {}", rc.effective_cap);
     println!(
-        "  = min(healthy tokens {}, disk headroom {}, configured max {})",
-        rc.token_axis_limit, report.disk_headroom, report.configured_max
+        "  = min(healthy {} × per-token {} = {}, disk headroom {}, configured max {})",
+        rc.token_axis_limit,
+        factor,
+        rc.token_axis_limit.saturating_mul(factor),
+        report.disk_headroom,
+        report.configured_max
     );
 
     // Token-capacity backpressure section (#3902, source-unified in #3936).

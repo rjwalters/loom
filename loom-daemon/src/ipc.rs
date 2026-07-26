@@ -509,6 +509,7 @@ pub fn build_daemon_status(
     let disk_headroom = crate::disk_headroom::disk_headroom_limit(workspace_root);
     let wf_config = crate::work_finder::read_work_finder_config(workspace_root);
     let configured_max = crate::work_finder::resolve_max_concurrent_with_config(&wf_config);
+    let per_token_concurrency = crate::work_finder::resolve_per_token_concurrency(&wf_config);
 
     // Token-capacity backpressure (#3902): back the token axis off from the flat
     // pool count toward the count of *healthy* accounts read from the rotation
@@ -518,10 +519,15 @@ pub fn build_daemon_status(
     let token_axis_limit = ranking.as_ref().map_or(token_pool_size, |r| r.available);
     let dynamic_cap = crate::work_finder::resolve_dynamic_max_concurrent(
         token_axis_limit,
+        per_token_concurrency,
         disk_headroom,
         configured_max,
     );
-    let token_bound = token_axis_limit <= disk_headroom && token_axis_limit <= configured_max;
+    // The token axis of the cap is `healthy × per-token` (#3947), so it is the
+    // binding constraint only when that *product* is the minimum.
+    let token_axis_effective = token_axis_limit.saturating_mul(per_token_concurrency.max(1));
+    let token_bound =
+        token_axis_effective <= disk_headroom && token_axis_effective <= configured_max;
     let capacity = crate::types::CapacityReport {
         ranking_present: ranking.is_some(),
         total_accounts: ranking.as_ref().map_or(token_pool_size, |r| r.total),
@@ -538,6 +544,7 @@ pub fn build_daemon_status(
         token_pool_size,
         disk_headroom,
         configured_max,
+        per_token_concurrency,
         dynamic_cap,
         // Top-level halt preserves its pre-#3930 single-workspace meaning: the
         // daemon's own primary workspace. Per-repo halt is in `per_repo`.
@@ -2360,6 +2367,7 @@ exit 0
             token_pool_size: 4,
             disk_headroom: 10,
             configured_max: 5,
+            per_token_concurrency: 2,
             dynamic_cap: 3,
             main_health_gate_halted: true,
             capacity: crate::types::CapacityReport {

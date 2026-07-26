@@ -686,6 +686,7 @@ See [`.loom/docs/daemon-reference.md`](.loom/docs/daemon-reference.md) for the w
 ```json
 {
   "autonomous": {
+    "perTokenConcurrency": 2,
     "workFinder": { "enabled": true, "intervalSecs": 60, "maxConcurrent": 5 },
     "mainHealthGate": { "enabled": true }
   }
@@ -727,7 +728,7 @@ Loom version.
 
 **Issue selection**: by default the daemon is **not a work generator** — it does not autonomously claim items from the `loom:issue` queue; work is operator-driven via `mcp__loom__dispatch_sweep`. (The `/loom:sweep` skill is the typical caller; Stage -1 backend detection picks an issue and dispatches it when both daemon and pool probes succeed.) As of epics #3809 and #3842 that default can be **opted out of** — both autonomous surfaces are default-off:
 
-- The autonomous **work finder** (above, `LOOM_WORK_FINDER` / `autonomous.workFinder`), when enabled, *does* poll the forge for open, already-approved `loom:issue` items and dispatch them, with work-driven concurrency bounded by `min(available work, healthy tokens, free disk, maxConcurrent)` (#3811) and a reactive main-health backstop (#3812, `LOOM_MAIN_HEALTH_GATE`) that halts dispatch when `main` goes red. See [Autonomous work finder](.loom/docs/daemon-reference.md#autonomous-work-finder-3810).
+- The autonomous **work finder** (above, `LOOM_WORK_FINDER` / `autonomous.workFinder`), when enabled, *does* poll the forge for open, already-approved `loom:issue` items and dispatch them, with work-driven concurrency bounded by `min(available work, healthy tokens × perTokenConcurrency, free disk, maxConcurrent)` (#3811, per-token factor #3947 — default 2, `LOOM_PER_TOKEN_CONCURRENCY` / `autonomous.perTokenConcurrency`) and a reactive main-health backstop (#3812, `LOOM_MAIN_HEALTH_GATE`) that halts dispatch when `main` goes red. See [Autonomous work finder](.loom/docs/daemon-reference.md#autonomous-work-finder-3810).
 - The **epic supervisor** (#3842), when enabled, drives every open `loom:epic` issue through a derived-state fork-join lifecycle (decompose → expand → phase-join barrier → close), serializing child-issue creation behind the #3707 issue-creation mutex on a dedicated off-runtime OS thread. See [Epic supervisor](.loom/docs/daemon-reference.md#epic-supervisor-3842).
 
 **Multi-repo workspace registry + priority tiers**: the one-per-machine daemon manages a set of repos listed in `~/.loom/workspaces.json`, edited with `loom-daemon workspace add|remove|list` (hot-applied — a running daemon re-reads the file each tick). Each entry carries an optional `priority` integer (**lower = higher priority**, default `100`; a pre-#3946 entry with no `priority` parses as `100`), set via `loom-daemon workspace add <path> --priority N` or `loom-daemon workspace set-priority <path> N` (#3946). The autonomous work-finder and epic supervisor order dispatch across repos by **(workspace priority asc, `loom:urgent` first, issue age asc)** and fill the single shared concurrency budget in that order, so higher-priority tool repos drain before a deep product/canary backlog. Strict priority is intentional (v1) — a permanently-full higher tier starves lower tiers; `loom-daemon status` shows each repo's tier. See [Per-workspace priority tiers](.loom/docs/daemon-reference.md#per-workspace-priority-tiers-3946).

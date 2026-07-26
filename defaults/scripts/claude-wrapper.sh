@@ -900,6 +900,59 @@ is_account_exhaustion() {
         | grep -qiE "hit your (limit|session limit|weekly limit)|hit\.your\.limit|monthly usage limit|out of extra usage"
 }
 
+# Return 0 if the captured output indicates a concurrent-session-limit fault
+# (#3947): the active account is healthy but cannot start another simultaneous
+# session right now. This is a capacity signal from per-token session stacking,
+# NOT quota exhaustion — the caller re-selects a different account WITHOUT
+# marking the current one bad. Defers to the shared classifier's distinct
+# SESSION_LIMIT category, with an inline regex fallback if the lib wasn't sourced.
+is_account_session_limit() {
+    local output="$1"
+    local exit_code="${2:-1}"
+
+    if declare -F classify_error >/dev/null 2>&1; then
+        [[ "$(classify_error "${output}" "${exit_code}")" == "SESSION_LIMIT" ]]
+        return
+    fi
+    [[ "${exit_code}" -ne 0 ]] && echo "${output}" \
+        | grep -qiE "concurrent (session|sessions|request)|maximum number of concurrent|too many concurrent|simultaneous session|another session is (already )?(active|running)"
+}
+
+# Re-select a DIFFERENT rotation account WITHOUT marking the current one bad
+# (#3947). Used for concurrent-session-limit faults: the account isn't broken,
+# it just can't take another simultaneous session, so we spread to a sibling and
+# retry. Advances the rotation cursor (loom_tools.tokens.select) so a healthy
+# sibling is preferred over re-picking the saturated account. Returns 0 when a
+# new token was exported, 1 when selection yielded nothing.
+reselect_account_no_mark() {
+    local ws pkg
+    ws="$(_resolve_token_workspace)"
+    pkg="$(_resolve_package_path "${ws}")"
+
+    local sel_json _sel_rc
+    set +e
+    sel_json="$(PYTHONPATH="${pkg}${PYTHONPATH:+:$PYTHONPATH}" \
+        "${LOOM_PYTHON}" -m loom_tools.tokens.select --workspace "${ws}" --json 2>/dev/null)"
+    _sel_rc=$?
+    set -e
+    if [[ ${_sel_rc} -ne 0 || -z "${sel_json}" ]]; then
+        return 1
+    fi
+
+    local new_key new_name
+    new_key="$(printf '%s' "${sel_json}" | "${LOOM_PYTHON}" -c 'import json,sys; print(json.load(sys.stdin)["key"])' 2>/dev/null || echo "")"
+    new_name="$(printf '%s' "${sel_json}" | "${LOOM_PYTHON}" -c 'import json,sys; print(json.load(sys.stdin)["name"])' 2>/dev/null || echo "")"
+    if [[ -z "${new_key}" ]]; then
+        return 1
+    fi
+
+    export CLAUDE_CODE_OAUTH_TOKEN="${new_key}"
+    ACTIVE_TOKEN_NAME="${new_name}"
+    export LOOM_TOKEN_NAME="${new_name}"
+    log_info "Re-selected OAuth account → '${new_name}' after concurrent-session limit (token NOT marked bad)"
+    return 0
+}
+
 # Echo a short human phrase describing why the account was considered
 # exhausted (used as the .bad_tokens reason string).
 _exhaustion_phrase() {
@@ -1445,6 +1498,13 @@ run_with_retry() {
     # bad, so re-selection could otherwise keep returning it forever.
     local rotations=0
     local max_rotations="${LOOM_MAX_ACCOUNT_ROTATIONS:-20}"
+    # Concurrent-session-limit bookkeeping (#3947). Distinct from account
+    # rotation: a session-limit fault is a *capacity* signal (the account is
+    # healthy but cannot start another simultaneous session), so we re-select a
+    # DIFFERENT account WITHOUT marking the current one bad and retry. Bounded by
+    # its own cap so a fully-saturated pool doesn't spin forever.
+    local session_limit_retries=0
+    local max_session_limit_retries="${LOOM_MAX_SESSION_LIMIT_RETRIES:-10}"
 
     # Recover CWD if it was deleted before we started
     if ! recover_cwd; then
@@ -1629,6 +1689,31 @@ run_with_retry() {
         fi
 
         log_warn "Claude CLI exited with code ${exit_code}"
+
+        # Concurrent-session-limit fault (#3947) → the active account is healthy
+        # but cannot start another simultaneous session. Re-select a DIFFERENT
+        # account WITHOUT marking this one bad (a capacity fault must not poison
+        # .bad_tokens and shrink the healthy pool) and retry the SAME attempt.
+        # Checked BEFORE is_account_exhaustion so the "session limit" wording is
+        # handled as a capacity signal, not quota exhaustion. Bounded by its own
+        # cap; when exhausted it falls through to the transient-backoff path
+        # (which retries on the next tick without poisoning the token).
+        if is_account_session_limit "${output}" "${exit_code}"; then
+            session_limit_retries=$((session_limit_retries + 1))
+            if [[ "${session_limit_retries}" -le "${max_session_limit_retries}" ]]; then
+                log_warn "Concurrent-session limit hit on '${ACTIVE_TOKEN_NAME:-?}' — backing off stacking for this account and re-selecting (attempt ${attempt}/${MAX_RETRIES} NOT consumed)"
+                if reselect_account_no_mark; then
+                    write_retry_state "running" "${attempt}"
+                    # Brief backoff so a different account's session frees up /
+                    # the cursor spreads load before retrying the same attempt.
+                    sleep "${LOOM_SESSION_LIMIT_BACKOFF:-5}"
+                    continue
+                fi
+                log_warn "Concurrent-session limit hit but re-selection found no alternate account — falling through to transient backoff"
+            else
+                log_warn "Concurrent-session-limit retry cap (${max_session_limit_retries}) reached — falling through to transient backoff (token still NOT marked bad)"
+            fi
+        fi
 
         # Account exhaustion (session / weekly / usage limit) → rotate to a
         # different account and retry WITHOUT consuming a MAX_RETRIES attempt
