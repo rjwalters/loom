@@ -502,6 +502,101 @@ enabling the gate for a genuine multi-repo deployment is done with the machine-
 global `LOOM_MAIN_HEALTH_GATE=1` env var (each repo's own `buildGate` block then
 decides whether it actually gates).
 
+## Gate verdicts: VERIFIED_RED vs UNEVALUATED (#3974)
+
+A safety gate that fails closed on **its own** infrastructure failures converts
+every environmental hiccup into a total dispatch outage — and, for the repo that
+contains the gate's own source, into a bootstrap deadlock where the daemon cannot
+dispatch the fix for the thing that is broken. Before #3974 *any* non-zero gate
+exit (including a timeout, `sh` exit 127 because `cargo` was not on the daemon's
+`PATH`, or a spawn failure) was recorded as "main is RED — HALTING".
+
+Every gate run now resolves to exactly one of three outcomes
+(`main_health_gate::GateOutcome`):
+
+| Outcome | Meaning | Effect on dispatch |
+|---------|---------|--------------------|
+| `Green` | command ran to completion, exit 0 | clears any halt |
+| `Red` (**VERIFIED_RED**) | command **ran to completion** and reported failure | **halts** this repo's dispatch |
+| `Unevaluated` (**UNEVALUATED**) | the gate produced no verdict | **preserves** the previous verdict; logs loudly with the class |
+
+`UnevaluatedClass` names why, and is surfaced in the daemon log and in
+`loom-daemon status`:
+
+| Class | Trigger |
+|-------|---------|
+| `dirty-tree` | non-ignorable local changes; the workspace was never synced |
+| `not-on-main` | workspace is on another branch / detached HEAD |
+| `local-ahead` | local `main` carries commits `origin/main` lacks (#3912) |
+| `git-failure` | a `git` step failed (`rev-parse` / `status` / `fetch` / `rev-list` / `reset`) |
+| `timeout` | the gate command exceeded `buildGate.timeoutSeconds` |
+| `command-not-executable` | `sh` exit 127 (not found) or 126 (not executable) |
+| `killed-by-signal` | terminated by a signal (e.g. an OOM kill) |
+| `spawn-failure` | could not spawn the command, or an I/O error while capturing output |
+| `contradicted-by-forge-ci` | ran and failed locally, but forge CI is green on the same commit (below) |
+
+The discriminator is deliberately narrow so a genuinely failing build still halts:
+**any other non-zero exit is trusted as VERIFIED_RED** — `cargo test`'s 101 for a
+failing test still halts dispatch.
+
+### Forge-CI corroboration of a local red
+
+A local run can also fail *because of the host it runs on*: on the incident host
+six `integration_basic` tests assert `tmux_session_exists(...)` and fail because
+the tmux server is dead, while `.github/workflows/ci.yml` runs the identical
+`cargo test --workspace` on the same commit and passes. The local gate measures
+**this host**; forge CI measures **the commit**.
+
+So a completed-and-failed run is cross-checked against the forge's CI conclusion
+for the exact `origin/main` SHA the gate evaluated (post-sync `HEAD`), via
+`gh run list --branch main --json headSha,status,conclusion,workflowName`
+matched on `headSha`:
+
+- CI **green** on that SHA → downgraded to `contradicted-by-forge-ci`
+  (UNEVALUATED); logged loudly, **does not halt**.
+- CI **red** on that SHA → corroborated; still VERIFIED_RED, still halts.
+- CI **unknown** → fail safe: still VERIFIED_RED, still halts.
+
+Only *positive* contrary evidence ever relaxes a halt, so "green" is the hardest
+verdict to reach and everything short of an unambiguous all-clear degrades to
+**unknown**:
+
+| Runs for the evaluated SHA | Verdict |
+|---|---|
+| any `failure` / `timed_out` / `startup_failure` | red |
+| any run not yet `completed` (`queued`, `in_progress`, …) | unknown — CI has not judged the commit yet |
+| any `cancelled` / `action_required` / `stale` / unrecognized conclusion | unknown — the workflow reached no verdict about the code |
+| at least one `success`, every other run `skipped` / `neutral` | **green** |
+| no run for the SHA, unparseable output, `gh` missing/unauthenticated, probe timeout > 30s | unknown |
+
+**Absence of failure is not success.** Requiring at least one genuine `success`
+*and* no outstanding or indeterminate sibling run closes two ways a
+"saw any completed run ⇒ green" reducer reads green on non-evidence: a
+`cancel-in-progress: true` concurrency group leaves superseded runs at
+`completed/cancelled` **forever** (a permanent false green for that commit), and a
+fast bookkeeping workflow that finishes minutes before the real build would
+otherwise vouch for the commit on its own. Neither case needs the probe to know
+*which* workflow "counts", so no workflow name is hard-coded.
+
+Corroboration is on by default and can be disabled with
+`LOOM_GATE_CI_CORROBORATION=0` (for repos with no forge CI or no `gh`); it is only
+probed on a local red, never on a green run.
+
+### One shared halt state
+
+`work_finder::tick_multi` derives `TickReport.halted` **directly** from the
+`WorkspaceHealthStates` flags the gate writes, rather than accumulating it inside
+the candidate-gathering loop. Previously a `list_ready_issues` error short-circuited
+the loop *before* its halt check, so a repo whose forge query failed reported
+`halted = false` — the incident's `work_finder: main-health gate cleared —
+resuming dispatch` logged in the same window the gate logged `still RED`. The two
+loops now read one source of truth and cannot disagree.
+
+`loom-daemon status` reports the not-evaluated **cause** verbatim
+(`main_health_gate.not_evaluated_reason`, `per_repo[].health_gate_not_evaluated_reason`)
+instead of the pre-#3974 hard-coded "workspace tree is dirty", which misreported
+timeouts, missing tools, and `git fetch` failures on a clean tree as a dirty tree.
+
 ## Per-workspace priority tiers (#3946)
 
 By default the multi-repo work-finder and epic supervisor iterate
