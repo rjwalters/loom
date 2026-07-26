@@ -895,6 +895,7 @@ version = "0.15.0"
 dependencies = [
  "anyhow",
  "axum",
+ "loom-daemon",
  "rusqlite",
  "serde",
  "serde_json",
