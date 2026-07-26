@@ -189,6 +189,54 @@ Inputs:
   its working tree — the way to dispatch into a managed repo other than the
   default when two repos share issue numbers. `#[serde(default)]` on the wire.
 
+#### `loom-daemon dispatch <issue>` — operator CLI (Issue #3952)
+
+`loom-daemon dispatch <issue>` is the **non-MCP** operator entry point onto the
+same `DispatchSweep` IPC request the `dispatch_sweep` MCP tool uses. It is a thin
+client: connect to the daemon socket, send one `DispatchSweep` frame, print the
+returned `sweep_id` + per-sweep log path, exit `0`. Because it flows through the
+registry, the `loom:issue → loom:building` claim flip, in-flight tracking, the
+reaper, and event publishing all come for free — exactly like the MCP path.
+
+```bash
+loom-daemon dispatch 3952                          # dispatch into the default workspace
+loom-daemon dispatch 3952 --workspace /path/to/repo # target a registered managed repo (#3929)
+loom-daemon dispatch 3952 --model sonnet --effort high
+loom-daemon dispatch 3952 --depends-on 3945        # stacked-PR child (#3729)
+```
+
+| Flag | Maps to `DispatchSweep` field | Notes |
+|------|-------------------------------|-------|
+| `<issue>` (positional) | `kind = {"Issue": N}` | required |
+| `--workspace <PATH>` | `workspace_root` | target a registered repo other than the default (#3929) |
+| `--model <M>` | `model` | omit to let the daemon resolve `autonomous.model` / the shipped default (#3944) |
+| `--effort <E>` | `effort` | reasoning-effort override (#3716) |
+| `--depends-on <P>` | `depends_on` | single parent issue; child branches off `feature/issue-<P>` (#3729) |
+
+**Bounded ack timeout (never hangs).** The CLI waits at most **5s** for the
+daemon to ack the dispatch. On expiry it exits **nonzero** with a clear
+`Daemon did not ack the dispatch within 5s (...) — is loom-daemon running?`
+message rather than blocking. This is the whole point of the command: the MCP
+`dispatch_sweep` path once wedged for **1800s** (#3945), and hand-rolling the
+dispatch bypassed the registry entirely.
+
+**Replaces the hand-rolled pattern.** Before #3952 the only non-MCP alternative
+was to reproduce the daemon's dispatch by hand — flip the label, export
+`LOOM_SWEEP_CLAIM_OWNED=<N>` plus `LOOM_MODEL` and workaround envs, and invoke
+`spawn-claude.sh -p "/loom:sweep N"` directly:
+
+```bash
+# DEPRECATED — do NOT do this. Bypasses the registry (no in-flight tracking,
+# no reaper, no status visibility) and a claim-marker mismatch makes the child
+# skip its own issue.
+gh issue edit 3952 --remove-label loom:issue --add-label loom:building
+LOOM_SWEEP_CLAIM_OWNED=3952 LOOM_MODEL=sonnet \
+  ./.loom/scripts/spawn-claude.sh -p "/loom:sweep 3952"
+```
+
+Use `loom-daemon dispatch 3952` instead — it performs the claim flip, registry
+tracking, and event publishing for you, with the bounded timeout as a safety net.
+
 ### `list_sweeps` (Phase A)
 
 Return all tracked sweeps, optionally filtered by lifecycle state.
