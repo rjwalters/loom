@@ -2038,7 +2038,21 @@ impl SweepRegistry {
             .with_context(|| format!("failed to open log {}", log_path.display()))?;
         let log_clone = log_file.try_clone()?;
 
-        let prompt = format!("/loom:sweep {issue}");
+        // Daemon self-claim marker, positional form (issue #4111): embed
+        // `--claim-owned <N>` INSIDE the `-p` prompt text so it becomes part of
+        // the `/loom:sweep` skill's own `$ARGUMENTS`, exactly like every other
+        // skill-consumed flag (`--dry-run`, `--no-daemon`, `--depends-on`,
+        // `--auto-stack`). It MUST NOT be appended as a sibling `cmd.arg()`:
+        // `spawn-claude.sh` forwards every non-wrapper token verbatim to the
+        // real `claude` CLI (`exec claude "$@"`), and `--claim-owned` is not a
+        // `claude` CLI flag — a sibling arg makes `claude` exit 1
+        // (`error: unknown option '--claim-owned'`) before any session starts,
+        // turning every daemon dispatch into an immediate crash. Only text
+        // inside the single `-p "<prompt>"` string ever reaches the skill's
+        // pre-flight. The env var (`LOOM_SWEEP_CLAIM_OWNED`, set below) is kept
+        // unchanged for backward compatibility (#3823/#3967). Unconditional on
+        // every daemon dispatch — every dispatch claims exactly one issue.
+        let prompt = format!("/loom:sweep {issue} --claim-owned {issue}");
         let mut cmd = Command::new(&spawn_bin);
         cmd.arg("-p").arg(&prompt);
         // Model selection (issue #3477, Phase 1): the dispatch-param tier of
@@ -2068,22 +2082,8 @@ impl SweepRegistry {
         if let Some(parent) = depends_on {
             cmd.arg("--depends-on").arg(parent.to_string());
         }
-        // Daemon self-claim marker, positional form (issue #4111): in addition
-        // to the LOOM_SWEEP_CLAIM_OWNED env var below (kept for backward
-        // compatibility — spawn-claude.sh logs it and it is asserted by the
-        // #3967 producer tests), pass the SAME ownership fact positionally as
-        // part of this child's own argv via `--claim-owned <N>`. #4111 is a
-        // daemon-dispatched child that reliably reasoned about loom:building
-        // label timing / PID tables / `loom-daemon status` output and
-        // self-skipped its own claim WITHOUT ever consulting the env var — a
-        // flag baked into the invocation's own text is in the model's context
-        // by construction, an ambient env var is not something the model has
-        // any standing reason to introspect. Mirrors the `--depends-on`
-        // append-only convention (#3729): always emitted for a daemon
-        // dispatch (unlike --model/--effort/--depends-on, this is never
-        // conditionally absent — every daemon dispatch claims exactly one
-        // issue).
-        cmd.arg("--claim-owned").arg(issue.to_string());
+        // (Daemon self-claim marker `--claim-owned <N>` is embedded in the
+        // `-p` prompt text above, not appended as a sibling arg — see #4111.)
         // Unattended-permissions flag (issue #3824): a daemon-dispatched child
         // is a detached, non-interactive `claude -p` process — there is no
         // human to answer a permission prompt, so any tool call needing
@@ -2095,8 +2095,8 @@ impl SweepRegistry {
         // `claude -p "/<role>" --dangerously-skip-permissions`). Scoped to this
         // daemon-only dispatch path; `spawn-claude.sh` stays a generic
         // pass-through and never adds a permission flag of its own. Appended
-        // AFTER `--model`/`--effort`/`--depends-on`/`--claim-owned` so the
-        // positional argv contract for those flags is unchanged.
+        // AFTER `--model`/`--effort`/`--depends-on` (and the prompt-embedded
+        // `--claim-owned`) so the positional argv contract is unchanged.
         cmd.arg("--dangerously-skip-permissions");
         cmd.env("LOOM_TERMINAL_ID", format!("daemon-{sweep_id}"))
             // Claim-ownership marker (issue #3823): `dispatch()` flips
@@ -4152,6 +4152,13 @@ mod tests {
 # Test fixture: record dispatch args + selected env into a log.
 {{
   printf 'argv: %s\n' "$*"
+  # Also record each argv TOKEN on its own line (issue #4111): `$*` flattens a
+  # single `-p "<prompt with spaces>"` arg into space-joined text that is
+  # indistinguishable from sibling args, which is exactly why a sibling
+  # `--claim-owned` (rejected by the real `claude` CLI) slipped past the
+  # `$*`-substring tests. A per-token record lets a test assert the flag lands
+  # INSIDE the `-p` prompt value, not as its own argv token.
+  for tok in "$@"; do printf 'arg: %s\n' "$tok"; done
   printf 'CLAUDE_CODE_OAUTH_TOKEN=%s\n' "${{CLAUDE_CODE_OAUTH_TOKEN:-unset}}"
   printf 'LOOM_WORKSPACE=%s\n' "${{LOOM_WORKSPACE:-unset}}"
   printf 'PWD=%s\n' "$(pwd -P)"
@@ -4493,6 +4500,25 @@ exit 0
             recorded.contains("argv: -p /loom:sweep 4246 --claim-owned 4246"),
             "expected --claim-owned 4246 in argv immediately after the prompt; got: {recorded}"
         );
+        // Regression for the #4120 review: `--claim-owned` MUST be embedded in
+        // the `-p` prompt string, NOT appended as a sibling argv token. The
+        // real `claude` CLI rejects `--claim-owned` as an unknown option and
+        // exits 1 if it arrives as its own token; only text inside the single
+        // `-p "<prompt>"` value reaches the `/loom:sweep` skill's `$ARGUMENTS`.
+        // The fixture records each argv token on its own `arg: ` line, so we
+        // can assert the flag is part of the prompt VALUE (one token that also
+        // carries `/loom:sweep`) and NOT a standalone `arg: --claim-owned`
+        // token — the `$*`-substring assertion above cannot tell these apart
+        // (which is precisely how the original sibling-arg bug slipped through).
+        assert!(
+            recorded.contains("arg: /loom:sweep 4246 --claim-owned 4246"),
+            "expected --claim-owned inside the single -p prompt token; got: {recorded}"
+        );
+        assert!(
+            !recorded.contains("arg: --claim-owned"),
+            "--claim-owned must NOT be a standalone argv token (the real claude CLI \
+             rejects it as an unknown option); got: {recorded}"
+        );
         // Belt-and-suspenders: the env var must still be present too (#3823
         // backward compatibility, per #4111's explicit guidance to keep it).
         assert!(
@@ -4690,7 +4716,7 @@ exit 0
         let needle = format!("LOOM_TERMINAL_ID=daemon-{}", outcome.sweep_id);
         let recorded = assert_child_wrote(&record_log, &needle);
         assert!(
-            recorded.contains("argv: -p /loom:sweep 43 --model claude-sonnet-4-6"),
+            recorded.contains("argv: -p /loom:sweep 43 --claim-owned 43 --model claude-sonnet-4-6"),
             "expected --model in argv; got: {recorded}"
         );
         // #3482 (Phase 3a): the dispatch model is carried on the registry
@@ -5007,7 +5033,7 @@ exit 0
         let needle = format!("LOOM_TERMINAL_ID=daemon-{}", outcome.sweep_id);
         let recorded = assert_child_wrote(&record_log, &needle);
         assert!(
-            recorded.contains("argv: -p /loom:sweep 45 --effort xhigh"),
+            recorded.contains("argv: -p /loom:sweep 45 --claim-owned 45 --effort xhigh"),
             "expected --effort in argv; got: {recorded}"
         );
         // The dispatch effort is carried on the registry entry so
@@ -5034,7 +5060,9 @@ exit 0
         let needle = format!("LOOM_TERMINAL_ID=daemon-{}", outcome.sweep_id);
         let recorded = assert_child_wrote(&record_log, &needle);
         assert!(
-            recorded.contains("argv: -p /loom:sweep 46 --model claude-sonnet-4-6 --effort xhigh"),
+            recorded.contains(
+                "argv: -p /loom:sweep 46 --claim-owned 46 --model claude-sonnet-4-6 --effort xhigh"
+            ),
             "expected --model then --effort in argv; got: {recorded}"
         );
         let entry = registry.get(&outcome.sweep_id).unwrap();
@@ -5085,7 +5113,7 @@ exit 0
         let needle = format!("LOOM_TERMINAL_ID=daemon-{}", outcome.sweep_id);
         let recorded = assert_child_wrote(&record_log, &needle);
         assert!(
-            recorded.contains("argv: -p /loom:sweep 50 --depends-on 49"),
+            recorded.contains("argv: -p /loom:sweep 50 --claim-owned 50 --depends-on 49"),
             "expected --depends-on in argv; got: {recorded}"
         );
         assert_eq!(

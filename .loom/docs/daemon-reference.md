@@ -237,12 +237,14 @@ was to reproduce the daemon's dispatch by hand — flip the label, export
 ```bash
 # DEPRECATED — do NOT do this. Bypasses the registry (no in-flight tracking,
 # no reaper, no status visibility), and — even carrying both the correct env
-# var AND the `--claim-owned N` argv flag `SweepRegistry::dispatch` itself
-# emits (#4111) — is fragile to reproduce by hand; a mismatched/missing claim
-# marker on either channel makes the child skip its own issue.
+# var AND the prompt-embedded `--claim-owned N` marker `SweepRegistry::dispatch`
+# itself emits (#4111; embedded in the -p prompt text, NOT a sibling claude arg,
+# which the real claude CLI would reject — #4120) — is fragile to reproduce by
+# hand; a mismatched/missing claim marker on either channel makes the child skip
+# its own issue.
 gh issue edit 3952 --remove-label loom:issue --add-label loom:building
 LOOM_SWEEP_CLAIM_OWNED=3952 LOOM_MODEL=sonnet \
-  ./.loom/scripts/spawn-claude.sh -p "/loom:sweep 3952" --claim-owned 3952
+  ./.loom/scripts/spawn-claude.sh -p "/loom:sweep 3952 --claim-owned 3952"
 ```
 
 Use `loom-daemon dispatch 3952` instead — it performs the claim flip, registry
