@@ -643,6 +643,43 @@ queues that drain fast. A permanently-full higher tier **will** starve lower tie
 fairness knobs (per-tier slot reservations) and cross-repo dependency awareness are
 explicit follow-ups, deferred until observed to matter.
 
+## Forge-side pipeline snapshot (`status --pipeline`, #3977)
+
+`loom-daemon status` shows the *dispatch*-side picture (in-flight sweeps, the
+dynamic cap, token health, per-repo priority/gate state — see the two sections
+above), but none of that answers "how is the work actually progressing?" —
+that requires forge queries the daemon's IPC handler deliberately does not
+make (the `DaemonStatus` round-trip stays a fast, network-free read). The
+`--pipeline` flag adds a client-side, opt-in forge-side pipeline snapshot per
+managed repo, fetched *after* the IPC round-trip completes:
+
+- **Counts** — for each root in `report.per_repo` (already priority-ordered):
+  open `loom:issue` (queued), open `loom:building` (claimed), open PRs by
+  `loom:review-requested` / `loom:changes-requested` / `loom:pr`, and PRs
+  merged in the last 24h (`gh pr list --state merged --search
+  "merged:>=<24h-ago RFC3339>"`).
+- **Module** — `loom_daemon::pipeline_snapshot`: `PipelineSource` is the forge
+  abstraction (mirrors `work_finder::WorkSource` / `GhWorkSource`),
+  `GhPipelineSource` is the `gh`-backed implementation (six `gh` invocations
+  per repo, `current_dir(root)` so `gh` auto-detects that repo's own remote —
+  same convention as `GhWorkSource::for_root`), and
+  `collect_pipeline_snapshots` fans the per-repo fetch out onto Tokio's
+  blocking-thread pool so N managed repos cost roughly one repo's worth of
+  wall-clock latency.
+- **Resilience** — every count is fetched and allowed to fail independently;
+  a failed metric renders as `?` (`RepoPipelineSnapshot::error` names the
+  first failure) without blocking the other metrics for that repo or any
+  sibling repo's snapshot — the same per-workspace error-isolation rule the
+  work-finder's `tick_multi` already applies to dispatch.
+- **Output** — `loom-daemon status --pipeline` adds a "Forge pipeline" table
+  below the existing "Managed repos" table (same row order); `--json
+  --pipeline` adds a `pipeline` array (`null` when `--pipeline` was not
+  passed, so a consumer can distinguish "not requested" from "requested but
+  empty"). Terminal-friendly and safe to `watch -n 60`.
+- **Why opt-in** — six `gh` calls per managed repo is too slow to bundle into
+  the default view (which is used for frequent, low-latency operator checks);
+  `--pipeline` trades that latency for the queue-depth picture on demand.
+
 ## Reaper task
 
 The reaper (`sweep_registry::spawn_reaper_task`) ticks every 30 seconds

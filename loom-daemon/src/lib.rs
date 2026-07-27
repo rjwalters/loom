@@ -29,6 +29,7 @@ pub mod issue_creation_mutex;
 pub mod main_health_gate;
 pub mod metrics_collector;
 pub mod phase_join;
+pub mod pipeline_snapshot;
 pub mod role_validation;
 pub mod self_update;
 pub mod sweep_journal;
