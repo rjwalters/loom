@@ -120,6 +120,33 @@ async function main() {
       rejectedErr.message.includes("PublishEvent"),
     rejectedErr && rejectedErr.message
   );
+
+  // Issue #3973: the incident was specifically a `ListSweeps` handler that
+  // blocked forever (a wedged daemon reap-on-read). Assert the SAME bounded
+  // transport rejects a hung ListSweeps and names that request kind — a
+  // handler that sleeps forever must produce a bridge timeout, not a hang.
+  const lsStarted = Date.now();
+  let lsErr = null;
+  try {
+    await sendDaemonRequest({ type: "ListSweeps", payload: { state_filter: null } }, TIMEOUT);
+  } catch (e) {
+    lsErr = e;
+  }
+  const lsElapsed = Date.now() - lsStarted;
+  check("ListSweeps rejected (did not hang)", lsErr !== null);
+  check(
+    "ListSweeps rejected within bounded window",
+    lsElapsed < TIMEOUT + 600,
+    `elapsed=${lsElapsed}ms`
+  );
+  check(
+    "ListSweeps error names timeout + request type",
+    !!lsErr &&
+      /did not respond within \d+ms/.test(lsErr.message) &&
+      lsErr.message.includes("ListSweeps"),
+    lsErr && lsErr.message
+  );
+
   for (const s of heldSockets) s.destroy();
   await closeServer(hangServer);
 
