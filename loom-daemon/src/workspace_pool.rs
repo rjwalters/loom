@@ -193,6 +193,25 @@ impl WorkspacePool {
         }
         match map.remove(root) {
             Some(pooled) => {
+                // Release any outstanding quarantine labels before the
+                // registry's reaper (the only thing that would otherwise
+                // retry a failed release) is aborted (Issue #4110) — without
+                // this, an evicted workspace's quarantined issues sit at
+                // `loom:blocked` until the *next* full daemon restart's
+                // startup reconciliation pass
+                // ([`crate::quarantine_reconciliation`]).
+                let flushed = pooled
+                    .registry
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .flush_quarantines_for_eviction();
+                if flushed > 0 {
+                    log::info!(
+                        "workspace_pool: flushed {flushed} quarantine release(s) for {} before \
+                         eviction (#4110)",
+                        root.display()
+                    );
+                }
                 if let Some(reaper) = pooled._reaper {
                     reaper.abort();
                 }

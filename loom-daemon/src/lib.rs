@@ -32,6 +32,7 @@ pub mod main_health_gate;
 pub mod metrics_collector;
 pub mod phase_join;
 pub mod pipeline_snapshot;
+pub mod quarantine_reconciliation;
 pub mod role_runner;
 pub mod role_validation;
 pub mod self_update;

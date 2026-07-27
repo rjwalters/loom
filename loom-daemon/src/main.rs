@@ -7,6 +7,7 @@ use loom_daemon::health_monitor;
 use loom_daemon::ipc::IpcServer;
 use loom_daemon::main_health_gate;
 use loom_daemon::metrics_collector;
+use loom_daemon::quarantine_reconciliation;
 use loom_daemon::role_runner;
 use loom_daemon::role_validation;
 use loom_daemon::self_update;
@@ -661,6 +662,50 @@ async fn main() -> Result<()> {
         log::info!(
             "claim_reconciliation: startup pass disabled ({}=0)",
             claim_reconciliation::RECONCILE_ENABLED_ENV
+        );
+    }
+
+    // Stranded-quarantine reconciliation across every managed workspace
+    // (Issue #4110). The insta-crash quarantine (#3939) is memory-only, so a
+    // restart drops the in-memory pause while the `loom:blocked` label it
+    // applied survives on the forge — with nothing left to release it, the
+    // issue is permanently invisible to the work finder. This pass scans
+    // every registered workspace's open `loom:blocked` issues and releases
+    // the ones carrying a daemon-authored quarantine comment back to
+    // `loom:issue`; a human's manual `loom:blocked` (no such comment) is
+    // never touched. Reuses the same `workspace_registry` roots resolved
+    // above for claim reconciliation.
+    if quarantine_reconciliation::reconciliation_enabled() {
+        let workspace_registry =
+            loom_daemon::workspace_registry::WorkspaceRegistry::load_default().unwrap_or_default();
+        let roots = workspace_registry.effective_roots(&sweep_workspace);
+        let gh_bin = std::path::PathBuf::from("gh");
+        let mut total_checked = 0usize;
+        let mut total_released = 0usize;
+        for root in &roots {
+            let (checked, released) =
+                quarantine_reconciliation::forge::reconcile_workspace(&gh_bin, root);
+            total_checked += checked;
+            total_released += released;
+        }
+        if total_released > 0 {
+            log::info!(
+                "quarantine_reconciliation: startup pass checked {total_checked} loom:blocked \
+                 issue(s) across {} workspace(s), released {total_released} stranded \
+                 quarantine(s) (#4110)",
+                roots.len()
+            );
+        } else {
+            log::debug!(
+                "quarantine_reconciliation: startup pass checked {total_checked} loom:blocked \
+                 issue(s) across {} workspace(s), nothing to release",
+                roots.len()
+            );
+        }
+    } else {
+        log::info!(
+            "quarantine_reconciliation: startup pass disabled ({}=0)",
+            quarantine_reconciliation::RECONCILE_ENABLED_ENV
         );
     }
 
