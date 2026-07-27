@@ -914,6 +914,13 @@ mod tests {
         }
     }
 
+    /// Issue #4044: these tests wait on a genuine `spawn_blocking` OS thread
+    /// (not process exec), but a saturated host scheduler can still starve
+    /// that thread past a short deadline — a false red, not a code fault.
+    /// The polling helpers below return the instant the condition is met, so
+    /// a generous ceiling costs nothing on a healthy host.
+    const SCHEDULER_WAIT: Duration = Duration::from_secs(90);
+
     /// Poll `calls` (real wall-clock time — `refresh()` runs on a genuine
     /// `spawn_blocking` OS thread, so a paused tokio clock can't stand in for
     /// waiting on it) until it reaches `target`, or panic after `timeout`.
@@ -948,8 +955,8 @@ mod tests {
         // OS thread completing).
         let handle = spawn_token_ranking_refresh_task(runner, Duration::from_millis(20));
 
-        wait_for_calls(&calls, 1, Duration::from_secs(2)).await;
-        wait_for_calls(&calls, 3, Duration::from_secs(2)).await;
+        wait_for_calls(&calls, 1, SCHEDULER_WAIT).await;
+        wait_for_calls(&calls, 3, SCHEDULER_WAIT).await;
 
         handle.abort();
     }
@@ -965,7 +972,7 @@ mod tests {
         let handle = spawn_token_ranking_refresh_task(PanicOnceRunner, Duration::from_millis(20));
         // The loop should observe the panicked blocking task and return
         // (rather than hang or propagate the panic to the caller).
-        let result = tokio::time::timeout(Duration::from_secs(5), handle).await;
+        let result = tokio::time::timeout(SCHEDULER_WAIT, handle).await;
         assert!(result.is_ok(), "loop task should finish (not hang) after the runner panics");
     }
 }
