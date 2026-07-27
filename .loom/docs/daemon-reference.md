@@ -2062,6 +2062,35 @@ is installed to the machine-level location via
 convention `loom-daemon-start.sh` already resolves through `command -v
 loom-daemon`.
 
+**Self-verifying rebuild → provision (a roll can never silently ship nothing,
+#4053)**: the rebuild → provision path proves it produced what it claims, so a
+successful-looking run can no longer install a stale binary:
+
+- **Built-commit verification (before provisioning).** After `cargo build
+  --release`, the script asserts the freshly-built binary's embedded commit
+  (parsed from `--version`) equals the source `HEAD` it was built from. On
+  mismatch it **fails loudly and does not provision** — a build that succeeds
+  yet bakes in the wrong commit is a build-system defect (historically a
+  `build.rs` `cargo:rerun-if-changed` watch-set bug that missed HEAD movement),
+  not a compile failure, and retrying cannot fix it. **Exit code `4`**,
+  distinguishable from a compile failure (`1`). The underlying `build.rs`
+  watch set is now correct-by-construction via `git rev-parse --git-path`
+  (resolving `HEAD`, the current branch's ref, and `packed-refs`), so it tracks
+  HEAD movement in the main checkout, a **linked worktree** (`.git` is a file —
+  every Builder's environment), a detached HEAD, and a packed-refs repo alike.
+- **Post-provision verification (after provisioning).** The script then asserts
+  the **destination** binary's `--version` is the expected build — for both the
+  `LOOM_DAEMON_BIN` override path and the machine-level
+  `provision_machine_daemon` path. This is the direct answer to "reports success
+  while shipping nothing": the `--version`-equality short-circuit in
+  `provision-daemon.sh` is retained (it is correct once the rebuild is correct)
+  but can no longer produce a silent no-op on a real roll — `provision_machine_daemon`
+  exports the destination it wrote to (`PROVISIONED_DAEMON_BIN`, set even on the
+  short-circuit path) so the caller can verify it. A destination that is not the
+  expected build, or a provisioning step that reports failure, now **exits
+  non-zero** (`5` for a destination mismatch) instead of the pre-#4053 soft
+  warn that left the exit code at `0`.
+
 **Read-only "update available" surface (`loom-daemon --status`)**: separately
 from the update script, `loom-daemon --status` / `--status --json` now prints
 a purely local, read-only self-update line — the same built-commit-vs-source-HEAD
