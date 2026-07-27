@@ -438,7 +438,12 @@ else
 fi
 
 echo "Stopping loom-daemon..."
-if ! "$STOP_SCRIPT"; then
+# --restarting preserves the autonomy-desired marker + watchdog across this
+# internal stop (#4011): a self-update is NOT operator intent to stop, so the
+# detector must NOT be disarmed — otherwise every self-update would silently turn
+# off the very autonomy-loss detection this issue adds (the exact bug class it
+# fixes). The subsequent start re-writes the marker and re-provisions the watchdog.
+if ! "$STOP_SCRIPT" --restarting; then
     err "loom-daemon-stop.sh failed — NOT starting the new binary on top of a still-running old one."
     exit 1
 fi

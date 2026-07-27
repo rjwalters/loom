@@ -263,6 +263,78 @@ else
     echo "  (skipping LOOM_DAEMON_LAUNCHD symmetry test — not Darwin)"
 fi
 
+# ---------- autonomy-desired marker lifecycle (#4011) ----------
+# Every case pins LOOM_AUTONOMY_MARKER into WORKDIR so it can NEVER touch the
+# operator's real ~/.loom/autonomy-desired.
+MARKER="$WORKDIR/.loom/autonomy-desired"
+
+# 4011-a. Operator stop on the "nothing to stop" path REMOVES the marker.
+mkdir -p "$WORKDIR/.loom"
+printf 'started_at=x\nlaunchd_label=%s\n' "$FAKE_LABEL" > "$MARKER"
+( cd "$WORKDIR" && LOOM_LAUNCHD_LABEL="$FAKE_LABEL" LOOM_AUTONOMY_MARKER="$MARKER" \
+    bash "$STOP_SCRIPT" >/dev/null 2>&1 )
+TESTS_RUN=$((TESTS_RUN + 1))
+if [[ ! -f "$MARKER" ]]; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} operator stop removes the autonomy-desired marker (nothing-to-stop path)"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} operator stop removes the autonomy-desired marker (nothing-to-stop path)"
+fi
+
+# 4011-b. --restarting PRESERVES the marker (the update.sh self-update path).
+printf 'started_at=x\nlaunchd_label=%s\n' "$FAKE_LABEL" > "$MARKER"
+( cd "$WORKDIR" && LOOM_LAUNCHD_LABEL="$FAKE_LABEL" LOOM_AUTONOMY_MARKER="$MARKER" \
+    bash "$STOP_SCRIPT" --restarting >/dev/null 2>&1 )
+TESTS_RUN=$((TESTS_RUN + 1))
+if [[ -f "$MARKER" ]]; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} --restarting preserves the marker (self-update never disarms the detector)"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} --restarting preserves the marker (self-update never disarms the detector)"
+fi
+
+# 4011-c. LOOM_DAEMON_STOP_KEEP_INTENT=1 is the env equivalent of --restarting.
+printf 'started_at=x\n' > "$MARKER"
+( cd "$WORKDIR" && LOOM_LAUNCHD_LABEL="$FAKE_LABEL" LOOM_AUTONOMY_MARKER="$MARKER" \
+    LOOM_DAEMON_STOP_KEEP_INTENT=1 bash "$STOP_SCRIPT" >/dev/null 2>&1 )
+TESTS_RUN=$((TESTS_RUN + 1))
+if [[ -f "$MARKER" ]]; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} LOOM_DAEMON_STOP_KEEP_INTENT=1 preserves the marker"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} LOOM_DAEMON_STOP_KEEP_INTENT=1 preserves the marker"
+fi
+
+# 4011-d. Operator stop of a LIVE pid also removes the marker (SIGTERM path).
+printf 'started_at=x\n' > "$MARKER"
+( sleep 30 & echo $! > "$WORKDIR/.loom/.daemon.pid" )
+live_pid=$(cat "$WORKDIR/.loom/.daemon.pid")
+( cd "$WORKDIR" && LOOM_LAUNCHD_LABEL="$FAKE_LABEL" LOOM_AUTONOMY_MARKER="$MARKER" \
+    LOOM_DAEMON_STOP_GRACE_SECS=2 bash "$STOP_SCRIPT" >/dev/null 2>&1 )
+kill -9 "$live_pid" 2>/dev/null || true
+TESTS_RUN=$((TESTS_RUN + 1))
+if [[ ! -f "$MARKER" ]]; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} operator stop of a live daemon also clears the marker"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} operator stop of a live daemon also clears the marker"
+fi
+
+# 4011-e. --help documents the marker + --restarting.
+help_out2=$(bash "$STOP_SCRIPT" --help 2>/dev/null)
+TESTS_RUN=$((TESTS_RUN + 1))
+if echo "$help_out2" | grep -q 'restarting' && echo "$help_out2" | grep -qi 'autonomy-desired'; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} --help documents --restarting and the autonomy-desired marker"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} --help documents --restarting and the autonomy-desired marker"
+fi
+
 # ---------- summary ----------
 # Final suite-level decoy guard (#4078): nothing above should have killed the
 # by-name-matchable decoy spawned at suite start.

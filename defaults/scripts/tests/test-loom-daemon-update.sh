@@ -151,6 +151,14 @@ MINIMAL_PATH="/usr/bin:/bin:/usr/sbin:/sbin"
 
 BASE_WORKDIR="$(mktemp -d)"
 
+# #4011: isolate the autonomy-desired marker + watchdog label suite-wide so a
+# restart path that reaches the real loom-daemon-start.sh can never write the
+# operator's real ~/.loom/autonomy-desired or provision the real
+# com.rjwalters.loom-daemon-watchdog LaunchAgent. Both are exported so every
+# sub-invocation (each cd'd into its own W* dir) inherits them.
+export LOOM_AUTONOMY_MARKER="$BASE_WORKDIR/autonomy-desired"
+export LOOM_WATCHDOG_LABEL="${LOOM_LAUNCHD_LABEL}-watchdog"
+
 # Suite-level decoy (#4078): a process whose argv ends in `/loom-daemon`, which
 # the stop script's label-blind `pgrep -f '(^|/)loom-daemon$'` fallback would
 # match. The whole update suite runs under a scratch LOOM_LAUNCHD_LABEL and
