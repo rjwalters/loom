@@ -70,8 +70,12 @@ STARTUP_GRACE_PERIOD="${LOOM_STARTUP_GRACE_PERIOD:-20}"
 
 # Terminal identification for stop signals
 TERMINAL_ID="${LOOM_TERMINAL_ID:-}"
-# Note: WORKSPACE may fail if CWD is invalid at startup - recover_cwd handles this
-WORKSPACE="${LOOM_WORKSPACE:-$(pwd 2>/dev/null || echo "$HOME")}"
+# Note: WORKSPACE may fail if CWD is invalid at startup - recover_cwd handles this.
+# Fallback is /tmp, NOT $HOME (issue #3980): $HOME is outside the daemon's TCC-safe
+# working-set contract (workspace roots + .loom + .claude* + /private/tmp) and
+# landing a spawned `claude` child there triggers macOS folder-access prompts for
+# Desktop/Documents/Downloads/Photos/Music/iCloud on an unsigned launchd binary.
+WORKSPACE="${LOOM_WORKSPACE:-$(pwd 2>/dev/null || echo "/tmp")}"
 
 # Python interpreter + active-account tracking for account rotation (#3738).
 LOOM_PYTHON="${LOOM_PYTHON:-python3}"
@@ -266,6 +270,15 @@ clear_retry_state() {
 # Recover from deleted working directory
 # This handles the case where the agent's worktree is deleted while it's running
 # (e.g., by loom-clean, merge-pr.sh, or agent-destroy.sh)
+#
+# NOTE (issue #3980): $HOME is deliberately NOT a recovery target. The daemon's
+# TCC-safe working-set contract is workspace roots + .loom + .claude* +
+# /private/tmp — $HOME is outside it. Landing a spawned `claude` child (and any
+# subsequent relative-path tool calls it makes) in $HOME risks macOS folder-access
+# prompts for Desktop/Documents/Downloads/Photos/Music/iCloud under launchd, where
+# the daemon is its own TCC-responsible process (unlike the old nohup-from-terminal
+# model, which silently inherited the terminal app's grants). /tmp is TCC-safe and
+# serves the same "always exists, always cd-able" purpose.
 recover_cwd() {
     # Check if current directory is still valid
     if pwd &>/dev/null 2>&1; then
@@ -291,13 +304,7 @@ recover_cwd() {
         fi
     fi
 
-    # Last resort: home directory
-    if cd "$HOME" 2>/dev/null; then
-        log_warn "Recovered to HOME (worktree likely removed): $HOME"
-        return 0
-    fi
-
-    # Absolute last resort: /tmp
+    # Last resort: /tmp (TCC-safe; see NOTE above — never $HOME)
     if cd /tmp 2>/dev/null; then
         log_warn "Recovered to /tmp (all other recovery paths failed)"
         return 0

@@ -1412,6 +1412,86 @@ after migration reported `13 seen, 3 dispatched, 0 error(s)`.
   failure mode, since it doesn't reproduce on Linux, but available as a
   belt-and-suspenders option.
 
+### macOS TCC hygiene under launchd (#3980)
+
+**Why launchd changed the TCC picture.** Under the pre-#3972 nohup model, the
+daemon inherited whatever TCC (Transparency, Consent, and Control) grants the
+launching terminal app already had — so folder-access prompts, if any, belonged
+to Terminal.app/iTerm/Claude Code, not to `loom-daemon`. As a `gui/<uid>`
+LaunchAgent (see above), the daemon is its **own** TCC-responsible process:
+any touch of a protected location (`~/Desktop`, `~/Documents`, `~/Downloads`,
+`~/Pictures` (Photos), `~/Music` (Media & Apple Music),
+`~/Library/Mobile Documents` (iCloud Drive), network/removable volumes, …) by
+the daemon **or any sweep child it spawns** now prompts fresh, once per
+protected category. One operator report saw ~10 prompts in a single session,
+including Photos / Media & Apple Music / iCloud — evidence of something
+enumerating the top level of `$HOME` itself rather than touching those folders
+individually (macOS bundles the per-category checks into one burst when a
+process lists `$HOME`'s immediate contents).
+
+**The daemon's legitimate working set never needs a protected folder.** Audited
+surfaces — the daemon core (Rust) and `.loom/scripts/*` — only ever touch
+`~/GitHub/*` (or wherever a workspace lives), `~/.loom`, `~/.claude*`, and
+`/private/tmp`; disk-headroom checks use `df -Pk <workspace>`, not a directory
+walk. `defaults/scripts/claude-wrapper.sh`'s crash-recovery path
+(`recover_cwd()`, used when a worktree is deleted out from under a running
+sweep child, e.g. by `loom-clean` or `merge-pr.sh`) previously fell back to
+`cd "$HOME"` as a last resort before `/tmp` — landing a respawned `claude`
+child in `$HOME` risked exactly the kind of out-of-bounds enumeration described
+above. Fixed in #3980: both the last-resort `cd` and the script's initial
+`WORKSPACE` fallback (when `pwd` fails at wrapper startup) now go straight to
+`/tmp`, which is on the TCC-safe allowlist and serves the same "always exists,
+always cd-able" purpose. `$HOME` is no longer a reachable recovery target
+anywhere in the wrapper.
+
+**Sweep children's working-set contract.** Every `/loom:sweep`-dispatched
+child (Curator/Builder/Judge/Doctor/Champion subagents, and any test suite or
+tool subprocess they invoke) is expected to stay within: the workspace root
+it was dispatched into, `.loom/` (worktrees, logs, tokens, checkpoints),
+`.claude*` config dirs, and `$TMPDIR`/`/private/tmp` scratch space. Recursive
+scans that escape this contract — `find ~`, `du -sh ~`, `grep -r` rooted at
+`$HOME`, a script that `cd`'d to the wrong place before globbing, a test suite
+that writes fixtures to `~/Documents` instead of a tmpdir, or a tool that
+resolves an iCloud-synced path — are **out-of-scope defects**, not ambient
+behavior to route around with a broader macOS grant. If you write a role
+prompt, hook, or test fixture, scope its filesystem footprint to this
+contract explicitly rather than relying on `$HOME`-relative expansion.
+
+**What to click when macOS prompts.** **Deny is always safe.** The daemon's
+and sweep children's legitimate working set contains no protected folder, so a
+genuine prompt means something reached outside the contract — denying it may
+surface a sweep-child failure (a file-not-found / permission-denied on the
+out-of-bounds path), which is the **diagnostic signal**, not a bug to route
+around. Use that failure to identify and fix the offending script/tool per the
+contract above, the same way any other out-of-scope access would be fixed.
+
+**Why Full Disk Access is never the right answer.** FDA (or per-category
+Allow) is not the fix even as a convenience, for two independent reasons: (1)
+it papers over a real out-of-scope access instead of fixing it, and (2) it
+doesn't survive the deployment model. TCC identity is keyed to the binary's
+code signature (or, for an ad-hoc/unsigned binary, its cdhash), and
+`loom-daemon` is rebuilt from source on every `loom-daemon-update.sh` self-update
+roll (#3968) — each rebuild produces a **new** cdhash, so any grant attached to
+the previous build silently evaporates. Chasing that with FDA produces a
+recurring popup storm *and* a standing over-grant that provides no lasting
+benefit. If a grant is ever clicked by mistake, walk it back at System
+Settings → Privacy & Security → \<category\> (Photos / Media & Apple Music /
+Files and Folders / …) → remove `loom-daemon` — the next self-update rebuild
+would have revoked it anyway via the cdhash change, so removing it manually
+just does that sooner.
+
+**Ad-hoc code signing (follow-up, not in #3980's scope).** A stable
+ad-hoc signature (`codesign -s - --identifier com.rjwalters.loom-daemon`,
+applied at build time) would let an *intentional*, narrowly-scoped future TCC
+grant survive a rebuild that doesn't change the binary's identifier — useful
+if a legitimate future daemon capability needs one specific protected
+category. Wiring that into the `cargo build --release` / `loom-daemon-update.sh`
+provisioning path is real but separable infrastructure work (build-script
+changes, verifying `codesign` behavior across the self-update rebuild path,
+deciding whether the identifier needs to be stable across machines) and is
+intentionally left as a follow-up (#4016) rather than bundled into this
+issue's audit + working-set-contract + crash-recovery fix.
+
 ### Self-update (rebuild + provision + restart, #3968)
 
 The daemon's self-repair loop can file **and fix** its own defects — proven
