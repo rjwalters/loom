@@ -20,9 +20,12 @@
 //!    binding constraint *and* work is queued behind it, and
 //!    [`CapacityAdvisory::message`] builds an operator advisory naming the
 //!    concrete levers (add accounts + `loom-tokens bootstrap`, or buy API
-//!    credits, then `loom-tokens check --ranking`). The advisory surfaces on the
-//!    daemon status view, the event bus (`daemon.capacity.advisory`), and the
-//!    log — deduplicated to fire only on **state change**.
+//!    credits, then `loom-tokens check --ranking`; when accounts are `blocked`
+//!    on revoked tokens — where `bootstrap --force` cannot recover — the
+//!    advisory instead points at `loom-tokens import-from-monitor --force`).
+//!    The advisory surfaces on the daemon status view, the event bus
+//!    (`daemon.capacity.advisory`), and the log — deduplicated to fire only on
+//!    **state change**.
 //! 3. **Recover** — the finder re-reads the ranking every tick (bounded cadence
 //!    = the tick interval), so as accounts reset to `available` the limit ramps
 //!    back up and the backlog drains automatically, with a symmetric recovery
@@ -415,7 +418,9 @@ impl CapacityAdvisory {
             "token capacity: {queued} issue(s) queued; {healthy}/{total} accounts healthy, \
              {exhausted} exhausted/near-ceiling; est. ~{drain} to drain at current capacity. \
              Add accounts to ~/.claude-monitor/accounts.env then `loom-tokens bootstrap`, or buy \
-             API credits, then re-probe with `loom-tokens check --ranking`.",
+             API credits, then re-probe with `loom-tokens check --ranking`. If accounts are \
+             'blocked' on revoked tokens, 'bootstrap --force' cannot recover — run \
+             'loom-tokens import-from-monitor --force && loom-tokens check --ranking'.",
             queued = a.queued,
             healthy = a.healthy_accounts,
             total = a.total_accounts,
@@ -685,6 +690,7 @@ mod tests {
         assert!(adv.message.contains("loom-tokens check --ranking"));
         assert!(adv.message.contains("API credits"));
         assert!(adv.message.contains("12 issue"));
+        assert!(adv.message.contains("import-from-monitor"));
     }
 
     #[test]

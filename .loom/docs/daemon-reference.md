@@ -420,6 +420,13 @@ spawn path can actually pick.
 **Provisioning a managed-repo pool.** Bootstrap the shared pool once per machine:
 
 ```bash
+# Preferred on a host running claude-monitor — reads the live credential store
+# (~/.claude-monitor/usage.db -> oauth_credentials, opened mode=ro), so no
+# accounts.env is needed on this machine at all:
+loom-tokens import-from-monitor --shared   # writes ~/.loom/tokens (override LOOM_SHARED_TOKENS_DIR)
+loom-tokens check --ranking                # ranks the effective pool (shared when no per-repo pool)
+
+# Without claude-monitor — materialize from the accounts.env snapshot instead:
 loom-tokens bootstrap --shared      # writes ~/.loom/tokens (override LOOM_SHARED_TOKENS_DIR)
 loom-tokens check --ranking         # ranks the effective pool (shared when no per-repo pool)
 ```
@@ -428,7 +435,16 @@ Every consumer repo the daemon dispatches into then falls back to that one pool 
 no per-repo `loom-tokens bootstrap` required. A repo that *wants* its own isolated
 pool can still `loom-tokens bootstrap` locally; the per-repo pool always wins.
 Selection sources (`~/.claude-monitor/accounts.env`, repo-local `.env`) are
-unchanged — `--shared` only redirects the *destination* of the materialized pool.
+unchanged for `bootstrap` — `--shared` only redirects the *destination* of the
+materialized pool. `import-from-monitor` bypasses `accounts.env` entirely and
+takes claude-monitor as authoritative for pool membership (use `loom-tokens pin`
+to restrict which accounts the selector may pick). If accounts later go
+`blocked` on revoked tokens, `bootstrap --force` cannot recover — the
+`accounts.env` snapshot is itself what went stale — run
+`loom-tokens import-from-monitor --force && loom-tokens check --ranking`
+instead; without `--force` a rolled token is reported as drift and left alone,
+and the command exits `2`. See "Importing live tokens from claude-monitor" in
+the root `CLAUDE.md` for the full behavior.
 
 ## Per-repo status breakdown + per-repo main-health gate (#3930 — phase d)
 
@@ -1220,13 +1236,16 @@ alert, recover — all automatic and non-blocking:
    *token-bound*. On the **state change** into that state it emits an
    add-capacity advisory naming concrete levers — add accounts to
    `~/.claude-monitor/accounts.env` + `loom-tokens bootstrap`, or buy API
-   credits, then `loom-tokens check --ranking` — with the current numbers
-   (queued count, healthy/total accounts, exhausted count, estimated drain time
-   at current capacity). The advisory surfaces on **three** channels: the daemon
-   log (`warn`), the `daemon.capacity.advisory` event-bus topic, and the
-   `capacity` section of `loom-daemon status`. It is **deduplicated** — one
-   advisory on entry, one recovery on exit, never per-tick spam. Advisory only;
-   it never blocks dispatch.
+   credits, then re-probe with `loom-tokens check --ranking` — with the current
+   numbers (queued count, healthy/total accounts, exhausted count, estimated
+   drain time at current capacity). If accounts are `blocked` on revoked tokens,
+   `bootstrap --force` cannot recover — the advisory also names
+   `loom-tokens import-from-monitor --force && loom-tokens check --ranking` as
+   the recovery lever for that case. The advisory surfaces on **three**
+   channels: the daemon log (`warn`), the `daemon.capacity.advisory` event-bus
+   topic, and the `capacity` section of `loom-daemon status`. It is
+   **deduplicated** — one advisory on entry, one recovery on exit, never
+   per-tick spam. Advisory only; it never blocks dispatch.
 3. **Recover.** The finder re-reads the ranking every tick (bounded cadence = the
    tick interval), so as accounts reset to `available` the cap ramps back up and
    the queued `loom:issue` backlog drains automatically — no manual intervention.
