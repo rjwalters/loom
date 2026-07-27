@@ -1358,12 +1358,12 @@ When you receive a probe command, respond with: `AGENT:Judge:<brief-task>` — e
 
 **After completing an evaluation, stop or continue based on how you were invoked:**
 
-### Manual invocation (via `/judge` or `/judge <number>`)
+### Manual invocation (via `/loom:judge` or `/loom:judge <number>`)
 
 After completing **one** PR evaluation (PR labeled `loom:pr` or `loom:changes-requested`):
 - **Stop immediately** — do not search for additional PRs
 - Report a brief summary of what was evaluated and the outcome
-- The user can run `/judge` again if they want to evaluate another PR
+- The user can run `/loom:judge` again if they want to evaluate another PR
 
 If no work was found (no PRs with `loom:review-requested`), report that and stop.
 

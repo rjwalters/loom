@@ -374,8 +374,8 @@ Note: by default the daemon does not poll the forge for `loom:issue` items — d
 For now, trigger them manually when the queue is empty:
 
 ```bash
-claude -p "/architect" --dangerously-skip-permissions
-claude -p "/hermit"    --dangerously-skip-permissions
+claude -p "/loom:architect" --dangerously-skip-permissions
+claude -p "/loom:hermit"    --dangerously-skip-permissions
 ```
 
 ## Overnight / long-running orchestration

@@ -64,7 +64,7 @@ The Curator role enhances issues with implementation details, acceptance criteri
 Open a new terminal and start Claude Code with the Curator role:
 
 ```bash
-claude code "/curator"
+claude code "/loom:curator"
 ```
 
 **What this does:** Loads the Curator role definition from `.loom/roles/curator.md` and provides context about issue curation workflow.
@@ -123,7 +123,7 @@ Now we'll implement the feature as a Builder.
 In a new terminal (or the same one after exiting Curator):
 
 ```bash
-claude code "/builder"
+claude code "/loom:builder"
 ```
 
 ### Claim the Issue
@@ -209,7 +209,7 @@ The Judge role performs thorough code reviews.
 ### Launch Judge Terminal
 
 ```bash
-claude code "/judge"
+claude code "/loom:judge"
 ```
 
 ### Find and Review the PR
@@ -323,10 +323,10 @@ Congratulations! You've completed your first Loom workflow. You now know:
 
 Try these other roles:
 
-- **`/architect`** - Create architectural proposals and design documents
-- **`/hermit`** - Identify code bloat and suggest simplifications
-- **`/doctor`** - Fix bugs and maintain existing PRs
-- **`/guide`** - Prioritize and organize the issue backlog
+- **`/loom:architect`** - Create architectural proposals and design documents
+- **`/loom:hermit`** - Identify code bloat and suggest simplifications
+- **`/loom:doctor`** - Fix bugs and maintain existing PRs
+- **`/loom:guide`** - Prioritize and organize the issue backlog
 
 ### Customize Roles
 

@@ -93,9 +93,9 @@ If the crons are not enabled, trigger the roles manually (still zero
 issue-editing by you):
 
 ```bash
-claude -p "/curator"  --dangerously-skip-permissions
-claude -p "/champion" --dangerously-skip-permissions   # promotes loom:curated → loom:issue, later auto-merges
-claude -p "/judge"    --dangerously-skip-permissions
+claude -p "/loom:curator"  --dangerously-skip-permissions
+claude -p "/loom:champion" --dangerously-skip-permissions   # promotes loom:curated → loom:issue, later auto-merges
+claude -p "/loom:judge"    --dangerously-skip-permissions
 ```
 
 ## Step 5 — Scripted assertion: wait for the label sequence

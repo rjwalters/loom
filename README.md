@@ -156,9 +156,9 @@ stateDiagram-v2
 
 **Quality Gates**
 - Acceptance criteria verification before PR creation
-- Automated code review with `/judge`
-- PR conflict resolution with `/doctor`
-- Main branch validation with `/auditor`
+- Automated code review with `/loom:judge`
+- PR conflict resolution with `/loom:doctor`
+- Main branch validation with `/loom:auditor`
 
 **Forge-Agnostic**
 - Works with GitHub and Gitea out of the box
@@ -301,14 +301,14 @@ gh pr create --label "loom:review-requested"
 |------|---------|------|
 | `/loom:sweep` | Single-issue lifecycle orchestration (Curator → Merge) | Per-issue |
 | `loom-daemon` + `mcp__loom__dispatch_sweep` | Multi-issue detached dispatch (Tier 2) | Continuous, opt-in |
-| `/builder` | Implement features and fixes | Manual |
-| `/judge` | Review pull requests | Cron via GH Actions |
-| `/curator` | Enhance and organize issues | Cron via GH Actions |
-| `/architect` | Create architectural proposals | Manual (cadence #3381) |
-| `/hermit` | Identify simplification opportunities | Manual (cadence #3381) |
-| `/doctor` | Fix PR feedback and conflicts | Manual |
-| `/champion` | Evaluate proposals, auto-merge PRs | Cron via GH Actions |
-| `/auditor` | Validate main branch builds | Cron via GH Actions |
+| `/loom:builder` | Implement features and fixes | Manual |
+| `/loom:judge` | Review pull requests | Cron via GH Actions |
+| `/loom:curator` | Enhance and organize issues | Cron via GH Actions |
+| `/loom:architect` | Create architectural proposals | Manual (cadence #3381) |
+| `/loom:hermit` | Identify simplification opportunities | Manual (cadence #3381) |
+| `/loom:doctor` | Fix PR feedback and conflicts | Manual |
+| `/loom:champion` | Evaluate proposals, auto-merge PRs | Cron via GH Actions |
+| `/loom:auditor` | Validate main branch builds | Cron via GH Actions |
 
 ## Development
 

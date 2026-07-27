@@ -291,15 +291,15 @@ Loom has three layers of roles:
 
 | Command | Role | What it does |
 |---------|------|-------------|
-| `/builder` | Builder | Implements features/fixes from `loom:issue` issues, creates PRs |
-| `/judge` | Judge | Reviews PRs with `loom:review-requested`, approves or requests changes |
-| `/curator` | Curator | Enhances issues with implementation guidance, marks `loom:curated` |
-| `/doctor` | Doctor | Fixes PR feedback, resolves merge conflicts |
-| `/champion` | Champion | Evaluates proposals, auto-merges approved PRs |
-| `/architect` | Architect | Creates architectural proposals for new features |
-| `/hermit` | Hermit | Identifies code simplification opportunities |
-| `/guide` | Guide | Prioritizes and triages the issue backlog |
-| `/auditor` | Auditor | Validates main branch builds and catches regressions |
+| `/loom:builder` | Builder | Implements features/fixes from `loom:issue` issues, creates PRs |
+| `/loom:judge` | Judge | Reviews PRs with `loom:review-requested`, approves or requests changes |
+| `/loom:curator` | Curator | Enhances issues with implementation guidance, marks `loom:curated` |
+| `/loom:doctor` | Doctor | Fixes PR feedback, resolves merge conflicts |
+| `/loom:champion` | Champion | Evaluates proposals, auto-merges approved PRs |
+| `/loom:architect` | Architect | Creates architectural proposals for new features |
+| `/loom:hermit` | Hermit | Identifies code simplification opportunities |
+| `/loom:guide` | Guide | Prioritizes and triages the issue backlog |
+| `/loom:auditor` | Auditor | Validates main branch builds and catches regressions |
 | `/driver` | Driver | Plain shell for ad-hoc commands |
 | `/imagine` | Bootstrapper | Bootstrap new projects with Loom |
 
