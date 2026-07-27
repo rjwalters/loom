@@ -72,11 +72,24 @@ build concurrency, which is the moment the term exists to guard against.
 
 ### 4. Apply
 
-Set the measured value (env overrides config overrides the `2.0` default):
+Set the measured value with precedence **env > `.loom/config.json` >
+default** (#4032) — pick whichever durability you want:
 
 ```bash
+# Ephemeral (this shell's daemon runs only): env wins over any committed config.
 export LOOM_EST_CORES_PER_SWEEP=<measured>
 # then restart the daemon, or bake it into the daemon's environment
+
+# Durable, shared with the team, and survives loom-daemon-start.sh re-rendering
+# the plist on every start (unlike an env var, which only persists as long as
+# every start exports it):
+```
+```json
+{
+  "autonomous": {
+    "estCoresPerSweep": <measured>
+  }
+}
 ```
 
 Cross-check against `loom-daemon status`, whose `cpu headroom` line now reports
@@ -86,6 +99,9 @@ the measured idle fraction and consumed-core estimate feeding the term.
 
 - **`LOOM_CPU_UTILIZATION_TARGET`** (default `0.75`) is a policy knob — the
   fraction of cores you are *willing* to dedicate to sweeps — not a measurement.
-  Leave headroom for the OS, the daemon, and the build-gate's own `cargo`.
-- Exposing these two knobs via `.loom/config.json` (`autonomous.*`) instead of
-  env-only is tracked separately in #4032.
+  Leave headroom for the OS, the daemon, and the build-gate's own `cargo`. It
+  has the same committed-config counterpart, `autonomous.cpuUtilizationTarget`.
+- Both knobs are resolved **once at daemon startup**, single-root (not
+  per-workspace) — see the `autonomous.*` config surface in
+  [`.loom/docs/daemon-reference.md`](../.loom/docs/daemon-reference.md)
+  (#4032).

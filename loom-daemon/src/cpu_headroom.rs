@@ -97,11 +97,33 @@ use std::time::{Duration, Instant};
 use std::process::{Command, Stdio};
 
 // ============================================================================
-// Configuration (env-only, mirrors `LOOM_PER_WORKTREE_GB` in disk_headroom)
+// Configuration (env > config > default — #4032)
 // ============================================================================
+//
+// Both knobs resolve **env > `.loom/config.json` → `autonomous.*` > default**,
+// matching every other autonomous-dispatch knob (`workFinder`,
+// `mainHealthGate`, `perTokenConcurrency`, `tokenRankingRefresh`,
+// `roleRunner`). Resolution is single-root and startup-time — read once from
+// the daemon's primary workspace via [`crate::work_finder::WorkFinderConfig`]
+// and threaded through as plain `f64`s — exactly like
+// [`crate::work_finder::resolve_per_token_concurrency`], not per-workspace
+// (the dynamic cap is one global number per tick; see
+// `crate::work_finder::spawn_multi_work_finder_task`'s module docs).
+//
+// `LOOM_PER_WORKTREE_GB` in [`crate::disk_headroom`] deliberately does **not**
+// get the same treatment here (#4032 decision, recorded rather than
+// implemented): it has a second, independent Bash-side reader
+// (`defaults/scripts/lib/disk-headroom.sh`, consumed by `/loom:sweep` Stage -1
+// wave sizing). Migrating only the Rust side would make the same env var honor
+// `.loom/config.json` on the daemon path while silently ignoring it on the
+// sweep path — a worse, divergent state than today's consistent env-only
+// behavior. Moving both means wiring the Bash `config-resolver.sh` into
+// `disk-headroom.sh` too, which is a separate, larger change. File a follow-up
+// if that cost is judged worth paying.
 
 /// Environment variable overriding the fraction of logical CPUs the dynamic
-/// cap is willing to dedicate to sweep work.
+/// cap is willing to dedicate to sweep work. Wins over
+/// `autonomous.cpuUtilizationTarget`.
 pub const UTILIZATION_TARGET_ENV: &str = "LOOM_CPU_UTILIZATION_TARGET";
 
 /// Default CPU utilization target: 75% of logical cores. Leaves headroom for
@@ -111,37 +133,80 @@ pub const UTILIZATION_TARGET_ENV: &str = "LOOM_CPU_UTILIZATION_TARGET";
 pub const DEFAULT_UTILIZATION_TARGET: f64 = 0.75;
 
 /// Environment variable overriding the estimated CPU cores a single
-/// concurrent sweep consumes while its build/test step is running.
+/// concurrent sweep consumes while its build/test step is running. Wins over
+/// `autonomous.estCoresPerSweep`.
 pub const EST_CORES_PER_SWEEP_ENV: &str = "LOOM_EST_CORES_PER_SWEEP";
 
 /// Default estimated cores per sweep. `cargo build`/`clippy` parallelize
 /// rustc codegen across multiple cores; `2.0` is a conservative estimate for
-/// a Rust-heavy repo like this one (not a hard measurement — tunable via
-/// [`EST_CORES_PER_SWEEP_ENV`] per repo/host).
+/// a Rust-heavy repo like this one (per #4031's measurement, this is now the
+/// calibrated figure for the primary host rather than an un-measured guess —
+/// still tunable per repo/host via [`EST_CORES_PER_SWEEP_ENV`] or
+/// `autonomous.estCoresPerSweep`).
 pub const DEFAULT_EST_CORES_PER_SWEEP: f64 = 2.0;
 
-/// Resolve [`UTILIZATION_TARGET_ENV`], falling back to
-/// [`DEFAULT_UTILIZATION_TARGET`] when unset, unparseable, or outside `(0,
-/// 1]` (a value of `0` would collapse capacity to nothing; a value `> 1`
-/// would claim more than the whole host).
-#[must_use]
-pub fn utilization_target() -> f64 {
+/// Env override for [`UTILIZATION_TARGET_ENV`] — `None` when unset,
+/// unparseable, or outside `(0, 1]` (a value of `0` would collapse capacity to
+/// nothing; a value `> 1` would claim more than the whole host).
+fn env_utilization_target() -> Option<f64> {
     std::env::var(UTILIZATION_TARGET_ENV)
         .ok()
         .and_then(|v| v.trim().parse::<f64>().ok())
         .filter(|f| *f > 0.0 && *f <= 1.0)
-        .unwrap_or(DEFAULT_UTILIZATION_TARGET)
 }
 
-/// Resolve [`EST_CORES_PER_SWEEP_ENV`], falling back to
-/// [`DEFAULT_EST_CORES_PER_SWEEP`] when unset, unparseable, or `<= 0`.
-#[must_use]
-pub fn est_cores_per_sweep() -> f64 {
+/// Env override for [`EST_CORES_PER_SWEEP_ENV`] — `None` when unset,
+/// unparseable, or `<= 0`.
+fn env_est_cores_per_sweep() -> Option<f64> {
     std::env::var(EST_CORES_PER_SWEEP_ENV)
         .ok()
         .and_then(|v| v.trim().parse::<f64>().ok())
         .filter(|f| *f > 0.0)
+}
+
+/// Resolve the CPU utilization target with precedence **env > config >
+/// default**. `config` is the already-range-filtered
+/// `autonomous.cpuUtilizationTarget` value from
+/// [`crate::work_finder::read_work_finder_config`] (`None` when absent,
+/// malformed, or out of `(0, 1]`).
+#[must_use]
+pub fn resolve_utilization_target(config: Option<f64>) -> f64 {
+    env_utilization_target()
+        .or(config)
+        .unwrap_or(DEFAULT_UTILIZATION_TARGET)
+}
+
+/// Resolve the estimated cores-per-sweep with precedence **env > config >
+/// default**. `config` is the already-range-filtered
+/// `autonomous.estCoresPerSweep` value from
+/// [`crate::work_finder::read_work_finder_config`] (`None` when absent,
+/// malformed, or `<= 0`).
+#[must_use]
+pub fn resolve_est_cores_per_sweep(config: Option<f64>) -> f64 {
+    env_est_cores_per_sweep()
+        .or(config)
         .unwrap_or(DEFAULT_EST_CORES_PER_SWEEP)
+}
+
+/// Resolve [`UTILIZATION_TARGET_ENV`] alone, falling back to
+/// [`DEFAULT_UTILIZATION_TARGET`] when unset, unparseable, or outside `(0,
+/// 1]`. Env-only convenience wrapper around [`resolve_utilization_target`]
+/// for callers with no config value in hand (e.g. ad-hoc tooling); production
+/// call sites resolve config too and should call [`resolve_utilization_target`]
+/// directly.
+#[must_use]
+pub fn utilization_target() -> f64 {
+    resolve_utilization_target(None)
+}
+
+/// Resolve [`EST_CORES_PER_SWEEP_ENV`] alone, falling back to
+/// [`DEFAULT_EST_CORES_PER_SWEEP`] when unset, unparseable, or `<= 0`.
+/// Env-only convenience wrapper around [`resolve_est_cores_per_sweep`] for
+/// callers with no config value in hand; production call sites resolve
+/// config too and should call [`resolve_est_cores_per_sweep`] directly.
+#[must_use]
+pub fn est_cores_per_sweep() -> f64 {
+    resolve_est_cores_per_sweep(None)
 }
 
 // ============================================================================
@@ -488,11 +553,21 @@ pub struct CpuHeadroomSnapshot {
 }
 
 /// Build a [`CpuHeadroomSnapshot`] from the memoized idle fraction, a fresh
-/// load-average read, and the env-configured knobs. **Never blocks** — safe on
-/// the tokio runtime and from the synchronous status path. Pre-warm the idle
-/// cache with `spawn_blocking(refresh_cpu_util_cache)` for a fresh measurement.
+/// load-average read, and the resolved knobs. **Never blocks** — safe on the
+/// tokio runtime and from the synchronous status path. Pre-warm the idle
+/// cache with `spawn_blocking(refresh_cpu_util_cache)` for a fresh
+/// measurement.
+///
+/// `utilization_target` / `est_cores_per_sweep` are the already-resolved
+/// (env > config > default, #4032) values — callers get these from
+/// [`resolve_utilization_target`] / [`resolve_est_cores_per_sweep`] fed by
+/// [`crate::work_finder::read_work_finder_config`], resolved once at startup
+/// (or, in `ipc.rs`, freshly per status request against the same config path).
 #[must_use]
-pub fn cpu_headroom_snapshot() -> CpuHeadroomSnapshot {
+pub fn cpu_headroom_snapshot(
+    utilization_target: f64,
+    est_cores_per_sweep: f64,
+) -> CpuHeadroomSnapshot {
     let logical_cpus = logical_cpu_count();
     let idle_fraction = cached_cpu_idle_fraction();
     let loadavg_1m = read_loadavg_1m();
@@ -500,8 +575,8 @@ pub fn cpu_headroom_snapshot() -> CpuHeadroomSnapshot {
         logical_cpus,
         idle_fraction,
         loadavg_1m,
-        utilization_target(),
-        est_cores_per_sweep(),
+        utilization_target,
+        est_cores_per_sweep,
     );
     CpuHeadroomSnapshot {
         logical_cpus,
@@ -514,18 +589,21 @@ pub fn cpu_headroom_snapshot() -> CpuHeadroomSnapshot {
 /// Resolve the CPU headroom term end-to-end from live host inputs, refreshing
 /// the memoized idle-fraction sample first.
 ///
+/// `utilization_target` / `est_cores_per_sweep` are the already-resolved
+/// (env > config > default, #4032) values — see [`cpu_headroom_snapshot`].
+///
 /// **May block** (~1s on macOS via `iostat`; fast, non-sleeping on Linux). The
 /// async work-finder loops call this through `spawn_blocking` so the macOS
 /// sampling window never blocks a tokio runtime worker.
 #[must_use]
-pub fn cpu_headroom_limit() -> usize {
+pub fn cpu_headroom_limit(utilization_target: f64, est_cores_per_sweep: f64) -> usize {
     refresh_cpu_util_cache();
     cpu_headroom(
         logical_cpu_count(),
         cached_cpu_idle_fraction(),
         read_loadavg_1m(),
-        utilization_target(),
-        est_cores_per_sweep(),
+        utilization_target,
+        est_cores_per_sweep,
     )
 }
 
@@ -724,7 +802,7 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
-    // env resolution
+    // env-only resolution (no config value in hand)
     // ------------------------------------------------------------------
 
     #[test]
@@ -766,6 +844,66 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
+    // resolve_utilization_target / resolve_est_cores_per_sweep — env > config
+    // > default precedence (#4032)
+    // ------------------------------------------------------------------
+
+    #[test]
+    #[serial]
+    fn resolve_utilization_target_precedence() {
+        std::env::remove_var(UTILIZATION_TARGET_ENV);
+
+        // Both unset -> built-in default.
+        assert!(
+            (resolve_utilization_target(None) - DEFAULT_UTILIZATION_TARGET).abs() < f64::EPSILON
+        );
+
+        // Config set, env unset -> config wins.
+        assert!((resolve_utilization_target(Some(0.6)) - 0.6).abs() < f64::EPSILON);
+
+        // Env set, config set -> env wins.
+        std::env::set_var(UTILIZATION_TARGET_ENV, "0.5");
+        assert!((resolve_utilization_target(Some(0.6)) - 0.5).abs() < f64::EPSILON);
+
+        // Env set, config unset -> env still wins.
+        assert!((resolve_utilization_target(None) - 0.5).abs() < f64::EPSILON);
+
+        std::env::remove_var(UTILIZATION_TARGET_ENV);
+    }
+
+    #[test]
+    #[serial]
+    fn resolve_est_cores_per_sweep_precedence() {
+        std::env::remove_var(EST_CORES_PER_SWEEP_ENV);
+
+        // Both unset -> built-in default.
+        assert!(
+            (resolve_est_cores_per_sweep(None) - DEFAULT_EST_CORES_PER_SWEEP).abs() < f64::EPSILON
+        );
+
+        // Config set, env unset -> config wins.
+        assert!((resolve_est_cores_per_sweep(Some(4.0)) - 4.0).abs() < f64::EPSILON);
+
+        // Env set, config set -> env wins.
+        std::env::set_var(EST_CORES_PER_SWEEP_ENV, "1.0");
+        assert!((resolve_est_cores_per_sweep(Some(4.0)) - 1.0).abs() < f64::EPSILON);
+
+        // Env set, config unset -> env still wins.
+        assert!((resolve_est_cores_per_sweep(None) - 1.0).abs() < f64::EPSILON);
+
+        std::env::remove_var(EST_CORES_PER_SWEEP_ENV);
+    }
+
+    // Range validation of the config value (`(0, 1]` for utilization target,
+    // `> 0` for cores-per-sweep) is applied at the config-read layer in
+    // `read_work_finder_config` (see `work_finder.rs` tests
+    // `test_config_out_of_range_cpu_utilization_target_drops_to_none` and
+    // `test_config_out_of_range_est_cores_per_sweep_drops_to_none`), not here —
+    // `resolve_utilization_target` / `resolve_est_cores_per_sweep` trust the
+    // `Option<f64>` they are handed is already filtered, exactly like
+    // `resolve_per_token_concurrency` trusts `WorkFinderConfig`.
+
+    // ------------------------------------------------------------------
     // logical_cpu_count — smoke test
     // ------------------------------------------------------------------
 
@@ -784,6 +922,6 @@ mod tests {
     fn cpu_headroom_limit_returns_at_least_one() {
         // Whatever this CI/dev host's load looks like, the policy floor
         // guarantees at least 1.
-        assert!(cpu_headroom_limit() >= 1);
+        assert!(cpu_headroom_limit(DEFAULT_UTILIZATION_TARGET, DEFAULT_EST_CORES_PER_SWEEP) >= 1);
     }
 }
