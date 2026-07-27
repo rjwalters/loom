@@ -21,8 +21,13 @@ succeeds on plain API keys).
 Status assignment:
 
 * ``available`` — utilizations < 95 percent
-* ``exhausted`` — 7d_utilization >= 0.95
-* ``rate_limited`` — current 429 (transient, distinct from exhausted)
+* ``exhausted`` — 7d_utilization >= 0.95 (checked on **both** the 2xx and
+  429 response paths, issue #3988 — a weekly-exhausted account very often
+  answers the probe with 429 rather than 200, and previously only the 2xx
+  path applied this test, so such accounts were mislabelled
+  ``rate_limited`` and stayed eligible for selection forever)
+* ``rate_limited`` — current 429 with 7d_utilization below the exhausted
+  threshold (a genuine transient rate limit, distinct from exhaustion)
 * ``blocked`` — 401 auth failure or token listed in ``.bad_tokens``
 
 The CLI command writes ``.loom/tokens/.ranking`` atomically when
@@ -287,6 +292,18 @@ def _build_headers(token: str) -> dict[str, str]:
     return base
 
 
+def _status_from_utilization(s7d_util: float | None, *, default: str) -> str:
+    """Return ``"exhausted"`` when *s7d_util* clears the threshold, else *default*.
+
+    Shared by both the 2xx and 429 probe-response branches (issue #3988) so
+    the ``EXHAUSTED_THRESHOLD`` test is applied uniformly regardless of which
+    HTTP status the probe happened to receive.
+    """
+    if s7d_util is not None and s7d_util >= EXHAUSTED_THRESHOLD:
+        return "exhausted"
+    return default
+
+
 def probe_account(
     name: str,
     token: str,
@@ -337,11 +354,18 @@ def probe_account(
         return AccountResult(name=name, status="blocked", error="auth_401")
 
     if code == 429:
-        # Even a 429 may include rate-limit headers; capture them.
+        # Even a 429 may include rate-limit headers; capture them. A weekly-
+        # exhausted account frequently answers with 429 (not 200), so the
+        # exhausted-threshold test must apply here too (issue #3988) — else
+        # such accounts are mislabelled "rate_limited" forever and the
+        # selector keeps rotating dispatches into a dead account.
         parsed = parse_rate_limit_headers(resp.headers)
+        status = _status_from_utilization(
+            parsed["7d_utilization"], default="rate_limited"
+        )
         return AccountResult(
             name=name,
-            status="rate_limited",
+            status=status,
             s5h_utilization=parsed["5h_utilization"],
             s7d_utilization=parsed["7d_utilization"],
             s7d_reset=parsed["7d_reset"],
@@ -366,11 +390,7 @@ def probe_account(
 
     parsed = parse_rate_limit_headers(resp.headers)
     s7d_util = parsed["7d_utilization"]
-
-    if s7d_util is not None and s7d_util >= EXHAUSTED_THRESHOLD:
-        status = "exhausted"
-    else:
-        status = "available"
+    status = _status_from_utilization(s7d_util, default="available")
 
     return AccountResult(
         name=name,

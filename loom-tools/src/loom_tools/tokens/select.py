@@ -231,32 +231,50 @@ def _try_ranking(
     accounts, in rotating order. The window spans every eligible account by
     default; ``_resolve_spread_top_n`` optionally caps it to the top-N
     most-available (``N == 1`` restores the greedy first-eligible behavior).
+
+    Defense in depth (issue #3988): ``rate_limited`` is a weaker signal than
+    ``available`` (a probe that hit 429 without clearing the exhausted
+    threshold, i.e. a genuine transient rate limit *or* a status the
+    classifier hasn't yet promoted). Prefer excluding ``rate_limited``
+    entries entirely while the pool still has at least one non-rate_limited
+    account; only fall back to including them when they are all that is
+    left, so a fully rate-limited pool can still dispatch rather than
+    hard-failing.
     """
     age = _file_age_seconds(ranking_file)
     if age is None or age >= _RANKING_FRESH_SECONDS:
         return None
 
     cap = _resolve_spread_top_n(workspace_path)
-    eligible: list[SelectedToken] = []
-    for name, status in _read_ranking(ranking_file):
-        if status in ("exhausted", "blocked"):
-            continue
-        token_file = tokens_dir / f"{name}.token"
-        if not token_file.is_file():
-            continue
-        if is_bad(workspace_path, name):
-            continue
-        try:
-            key = _read_token_file(token_file)
-        except OSError:
-            continue
-        if not key:
-            continue
-        eligible.append(
-            SelectedToken(name=name, file=token_file, key=key, mode="ranked"),
-        )
-        if cap is not None and len(eligible) >= cap:
-            break
+
+    def _collect(*, skip_rate_limited: bool) -> list[SelectedToken]:
+        out: list[SelectedToken] = []
+        for name, status in _read_ranking(ranking_file):
+            if status in ("exhausted", "blocked"):
+                continue
+            if skip_rate_limited and status == "rate_limited":
+                continue
+            token_file = tokens_dir / f"{name}.token"
+            if not token_file.is_file():
+                continue
+            if is_bad(workspace_path, name):
+                continue
+            try:
+                key = _read_token_file(token_file)
+            except OSError:
+                continue
+            if not key:
+                continue
+            out.append(
+                SelectedToken(name=name, file=token_file, key=key, mode="ranked"),
+            )
+            if cap is not None and len(out) >= cap:
+                break
+        return out
+
+    eligible = _collect(skip_rate_limited=True)
+    if not eligible:
+        eligible = _collect(skip_rate_limited=False)
 
     if not eligible:
         return None
@@ -272,6 +290,10 @@ def _stale_ranking_exclusions(ranking_file: Path) -> set[str]:
     handing out accounts a recent probe already flagged ``exhausted``/``blocked``,
     wedging sweeps at startup. Rather than discard the stale ranking, treat its
     exhausted/blocked entries as an advisory exclusion set for the lower tiers.
+    ``rate_limited`` is included too (issue #3988, same defense-in-depth
+    rationale as ``_try_ranking``) — the caller's existing fail-safe already
+    retries without exclusions if they would empty the pool, so this can only
+    ever prefer a healthier account, never hard-fail one.
 
     Returns an empty set when the ranking is fresh (tier-1 owns that case) or
     missing/unreadable — so callers get exclusions *only* in the stale-but-present
@@ -283,7 +305,7 @@ def _stale_ranking_exclusions(ranking_file: Path) -> set[str]:
     return {
         name
         for name, status in _read_ranking(ranking_file)
-        if status in ("exhausted", "blocked")
+        if status in ("exhausted", "blocked", "rate_limited")
     }
 
 
