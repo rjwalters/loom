@@ -37,6 +37,7 @@ from loom_tools.tokens import failure_counts
 from loom_tools.tokens.bootstrap import bootstrap_tokens
 from loom_tools.tokens.monitor_db import (
     MonitorDbUnavailable,
+    MonitorImportResult,
     import_from_monitor,
     monitor_db_path,
 )
@@ -448,22 +449,22 @@ def _cmd_import_from_monitor(args: argparse.Namespace) -> int:
     return 0
 
 
-def _print_monitor_import(result: "object") -> None:
+def _print_monitor_import(result: MonitorImportResult) -> None:
     """Print the imported account set. Secrets are never shown."""
-    db_path = getattr(result, "db_path", None) or monitor_db_path()
-    effective = getattr(result, "effective", []) or []
-    pruned = getattr(result, "pruned", []) or []
+    db_path = result.db_path or monitor_db_path()
+    effective = result.effective
+    pruned = result.pruned
 
     print(f"claude-monitor store: {db_path}")
-    print(f"Destination pool: {getattr(result, 'tokens_dir', None)}")
+    print(f"Destination pool: {result.tokens_dir}")
 
     if not effective:
         print("Active accounts: (none)")
         return
 
-    written = set(getattr(result, "written", []) or [])
-    unchanged = set(getattr(result, "unchanged", []) or [])
-    drifted = set(getattr(result, "drifted", []) or [])
+    written = set(result.written)
+    unchanged = set(result.unchanged)
+    drifted = set(result.drifted)
 
     print(f"Active accounts ({len(effective)}):")
     for acct in effective:

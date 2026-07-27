@@ -47,6 +47,7 @@ import logging
 import os
 import re
 import sqlite3
+import urllib.parse
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -108,6 +109,26 @@ def monitor_db_path(monitor_dir: Path | None = None) -> Path:
     return base / MONITOR_DB_NAME
 
 
+def _read_only_uri(path: Path) -> str:
+    """Build the ``mode=ro`` SQLite URI for *path*.
+
+    The path is percent-encoded before interpolation. Without this, a ``?`` or
+    ``#`` anywhere in the path terminates the URI early and the ``mode=ro``
+    query parameter is silently dropped — the connection then opens
+    **read-write** against claude-monitor's live database (#4029). ``%`` fares
+    even worse: the unencoded form fails to open a database that is present and
+    readable.
+
+    ``urllib.parse.quote`` (default ``safe='/'``) encodes ``?``, ``#``, ``%``,
+    and spaces while leaving the path separators intact. Unlike
+    :meth:`pathlib.Path.as_uri` it has no absolute-path precondition, so a
+    relative ``LOOM_CLAUDE_MONITOR_DIR`` still yields a usable URI (resolved
+    against the cwd, as the unencoded form was) rather than raising
+    ``ValueError``.
+    """
+    return f"file:{urllib.parse.quote(str(path))}?mode=ro"
+
+
 def _email_from_label(label: str) -> str | None:
     """Recover an email from a credential label, or None if it isn't one.
 
@@ -159,8 +180,9 @@ def read_monitor_credentials(
         )
 
     # Read-only URI: this database belongs to claude-monitor. We never write,
-    # migrate, or take a write lock on it.
-    uri = f"file:{path}?mode=ro"
+    # migrate, or take a write lock on it. The path is percent-encoded so a
+    # '?' or '#' in it cannot silently void the mode=ro guarantee (#4029).
+    uri = _read_only_uri(path)
     try:
         conn = sqlite3.connect(uri, uri=True, timeout=_SQLITE_TIMEOUT_SECONDS)
     except sqlite3.Error as exc:
@@ -179,10 +201,17 @@ def read_monitor_credentials(
             """
         ).fetchall()
     except sqlite3.Error as exc:
-        # A missing table (older claude-monitor) lands here as OperationalError.
+        # A missing oauth_credentials table (older claude-monitor) lands here as
+        # an OperationalError whose message names the missing table — only then
+        # is the "predates the credential store" hint correct. Any other
+        # sqlite3.Error (e.g. a hot WAL missing its -shm sidecar, a corrupt
+        # file) reaches the same branch, and attributing it to a missing table
+        # would send the reader down the wrong path.
+        hint = ""
+        if isinstance(exc, sqlite3.OperationalError) and "no such table" in str(exc):
+            hint = " This claude-monitor may predate the credential store."
         raise MonitorDbUnavailable(
-            f"Could not read oauth_credentials from {path}: {exc}. "
-            "This claude-monitor may predate the credential store."
+            f"Could not read oauth_credentials from {path}: {exc}.{hint}"
         ) from exc
     finally:
         conn.close()

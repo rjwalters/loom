@@ -16,6 +16,7 @@ from pathlib import Path
 
 import pytest
 
+from loom_tools.tokens import monitor_db as monitor_db_mod
 from loom_tools.tokens.cli import main
 from loom_tools.tokens.monitor_db import (
     MonitorDbUnavailable,
@@ -211,6 +212,133 @@ def test_database_is_not_modified(monitor_db: Path) -> None:
 def test_monitor_db_path_honors_env(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("LOOM_CLAUDE_MONITOR_DIR", "/custom/monitor")
     assert monitor_db_path() == Path("/custom/monitor/usage.db")
+
+
+# --------------------------------------------------------------------------
+# Read-only URI construction — #4029
+#
+# A '?' or '#' in the path terminates the URI early and silently drops the
+# mode=ro query parameter, so the connection opens read-WRITE against another
+# tool's live database. The regression is that the pre-fix tests only asserted
+# the open succeeded (which it did, dangerously), not that the handle is
+# genuinely read-only.
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("dirname", ["q?dir", "h#ash", "pct%20", "sp ace"])
+def test_special_char_path_opens_and_is_read_only(
+    tmp_path: Path, dirname: str
+) -> None:
+    """A path with URI-special characters must still open read-only.
+
+    Asserts both halves the old tests missed: the store opens (so mode=ro is not
+    lost in the ``%`` direction, which fails the open outright), AND a write
+    attempt raises — i.e. mode=ro survived rather than being silently dropped.
+    """
+    db = make_monitor_db(
+        tmp_path / dirname / "usage.db",
+        [{"label": "x@example.com", "email": "x@example.com", "token": "tok"}],
+    )
+
+    # (a) opens via the module and returns the credential
+    creds = read_monitor_credentials(db)
+    assert [c.email for c in creds] == ["x@example.com"]
+
+    # (b) the connection the module builds is genuinely read-only: a write
+    # attempt must raise, proving mode=ro was not silently dropped.
+    conn = sqlite3.connect(monitor_db_mod._read_only_uri(db), uri=True)
+    try:
+        with pytest.raises(sqlite3.OperationalError):
+            conn.execute("CREATE TABLE z (y)")
+    finally:
+        conn.close()
+
+
+def test_relative_monitor_dir_does_not_raise_value_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A relative LOOM_CLAUDE_MONITOR_DIR must not escape as a bare ValueError.
+
+    ``monitor_db_path()`` does not absolutize (``claude_monitor_dir()`` only
+    ``expanduser()``s), so a relative override reaches URI construction. The fix
+    must surface as success or ``MonitorDbUnavailable`` — never ``ValueError``
+    (which ``Path.as_uri()`` would raise on a relative path).
+    """
+    monkeypatch.chdir(tmp_path)
+    make_monitor_db(
+        tmp_path / "rel" / "usage.db",
+        [{"label": "x@example.com", "email": "x@example.com", "token": "tok"}],
+    )
+    monkeypatch.setenv("LOOM_CLAUDE_MONITOR_DIR", "rel")
+
+    creds = read_monitor_credentials()
+    assert [c.email for c in creds] == ["x@example.com"]
+
+
+def test_percent_in_path_opens_where_it_failed_before(tmp_path: Path) -> None:
+    """A '%' in the path was a hard open failure pre-fix; now it opens."""
+    db = make_monitor_db(
+        tmp_path / "pct%dir" / "usage.db",
+        [{"label": "x@example.com", "email": "x@example.com", "token": "tok"}],
+    )
+    assert [c.email for c in read_monitor_credentials(db)] == ["x@example.com"]
+
+
+# --------------------------------------------------------------------------
+# SELECT error hint narrowing — #4029 fold-in item 1
+# --------------------------------------------------------------------------
+
+
+def test_missing_table_keeps_predate_hint(tmp_path: Path) -> None:
+    """A missing oauth_credentials table still earns the "predate" hint."""
+    db = tmp_path / "usage.db"
+    conn = sqlite3.connect(db)
+    conn.execute("CREATE TABLE unrelated (id INTEGER)")
+    conn.commit()
+    conn.close()
+    with pytest.raises(
+        MonitorDbUnavailable, match="predate the credential store"
+    ):
+        read_monitor_credentials(db)
+
+
+def test_non_missing_table_error_omits_predate_hint(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A non-missing-table sqlite3.Error must not claim a missing table.
+
+    Represents the hot-WAL-without-shm family: a real ``OperationalError`` on
+    the SELECT whose cause is not a missing table. The narrowed handler must
+    surface the underlying error without the misleading "predate" hint.
+    """
+    db = make_monitor_db(
+        tmp_path / "usage.db",
+        [{"label": "x@example.com", "email": "x@example.com", "token": "tok"}],
+    )
+
+    real_connect = sqlite3.connect
+
+    class _BoomOnExecute:
+        def __init__(self, inner: sqlite3.Connection) -> None:
+            self._inner = inner
+
+        def execute(self, *args: object, **kwargs: object) -> object:
+            raise sqlite3.OperationalError("database is locked")
+
+        def close(self) -> None:
+            self._inner.close()
+
+    def fake_connect(*args: object, **kwargs: object) -> object:
+        return _BoomOnExecute(real_connect(*args, **kwargs))
+
+    monkeypatch.setattr(monitor_db_mod.sqlite3, "connect", fake_connect)
+
+    with pytest.raises(MonitorDbUnavailable) as excinfo:
+        read_monitor_credentials(db)
+
+    message = str(excinfo.value)
+    assert "database is locked" in message
+    assert "predate the credential store" not in message
 
 
 # --------------------------------------------------------------------------
