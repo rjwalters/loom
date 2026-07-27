@@ -174,13 +174,96 @@ pub fn read_autonomous_model(repo_root: &Path) -> Option<String> {
 /// default rather than the operator's interactive CLI default.
 #[must_use]
 pub fn resolve_dispatch_model(repo_root: &Path, explicit: Option<&str>) -> (String, ModelSource) {
-    if let Some(m) = explicit.map(str::trim).filter(|m| !m.is_empty()) {
-        return (m.to_string(), ModelSource::Param);
+    let (model, source) = if let Some(m) = explicit.map(str::trim).filter(|m| !m.is_empty()) {
+        (m.to_string(), ModelSource::Param)
+    } else if let Some(m) = read_autonomous_model(repo_root) {
+        (m, ModelSource::Config)
+    } else {
+        (DEFAULT_DISPATCH_MODEL.to_string(), ModelSource::Default)
+    };
+    // Issue #3982: resolve the logical tier/alias to the concrete model ID before
+    // it goes on the wire. This is the daemon's half of the single indirection
+    // point shared with `sweep.md` (via `resolve-model.sh`) and `loom_tools`
+    // (`model_tiers`): every consumer keeps naming `opus`, and exactly one place
+    // decides that `opus` means `claude-opus-5` (the CLI's own `opus` alias still
+    // resolves to a gen-4 model). Applied at ALL tiers so an operator's
+    // `autonomous.model = "opus"` (or an explicit `--model opus`) also reaches
+    // Opus 5; the shipped default `sonnet` is not pinned and passes through.
+    (resolve_model_alias(repo_root, &model), source)
+}
+
+/// Issue #3982: the shipped logical-tier → pinned model-ID default map. Pins ONLY
+/// tiers whose bare CLI alias resolves to a stale generation — today just
+/// `opus → claude-opus-5`. `sonnet`/`fable` are intentionally absent: the CLI
+/// already resolves them to the current generation, so they pass through
+/// unchanged and track future generations with no edit here. Overridable per-repo
+/// via `.loom/config.json` → `sweep.modelAliases`. Kept byte-identical to the
+/// Python default in `loom_tools/model_tiers.py::_DEFAULT_TIER_ALIASES`.
+const DEFAULT_TIER_ALIASES: &[(&str, &str)] = &[("opus", "claude-opus-5")];
+
+/// Read the `sweep.modelAliases` override map from `<repo_root>/.loom/config.json`,
+/// soft-failing to an empty map on any error (missing file, malformed JSON, absent
+/// key, non-object value). Blank keys/values are dropped. Mirrors the soft-fail
+/// contract of [`read_autonomous_model`] and `model_tiers._config_overrides`.
+#[must_use]
+pub fn read_model_aliases(repo_root: &Path) -> BTreeMap<String, String> {
+    let mut out = BTreeMap::new();
+    let path = repo_root.join(".loom").join("config.json");
+    let Ok(contents) = std::fs::read_to_string(&path) else {
+        return out;
+    };
+    let Ok(config) = serde_json::from_str::<serde_json::Value>(&contents) else {
+        return out;
+    };
+    let Some(aliases) = config
+        .get("sweep")
+        .and_then(|s| s.get("modelAliases"))
+        .and_then(serde_json::Value::as_object)
+    else {
+        return out;
+    };
+    for (key, val) in aliases {
+        let key = key.trim().to_lowercase();
+        if key.is_empty() {
+            continue;
+        }
+        if let Some(v) = val.as_str().map(str::trim).filter(|v| !v.is_empty()) {
+            out.insert(key, v.to_string());
+        }
     }
-    if let Some(m) = read_autonomous_model(repo_root) {
-        return (m, ModelSource::Config);
+    out
+}
+
+/// Issue #3982: resolve a logical model tier/alias to the concrete model ID to
+/// dispatch, applying the shipped [`DEFAULT_TIER_ALIASES`] map overlaid with the
+/// per-repo `sweep.modelAliases` override. Preserves any `@effort` suffix
+/// (`opus@xhigh` → `claude-opus-5@xhigh`). Unknown aliases and pinned IDs
+/// (`claude-sonnet-4-6`) pass through unchanged.
+#[must_use]
+pub fn resolve_model_alias(repo_root: &Path, model: &str) -> String {
+    if model.is_empty() {
+        return String::new();
     }
-    (DEFAULT_DISPATCH_MODEL.to_string(), ModelSource::Default)
+    let (base, effort) = match model.split_once('@') {
+        Some((b, e)) => (b, Some(e)),
+        None => (model, None),
+    };
+    let key = base.trim().to_lowercase();
+    let overrides = read_model_aliases(repo_root);
+    let resolved = overrides
+        .get(&key)
+        .map(String::as_str)
+        .or_else(|| {
+            DEFAULT_TIER_ALIASES
+                .iter()
+                .find(|(k, _)| *k == key)
+                .map(|(_, v)| *v)
+        })
+        .unwrap_or(base.trim());
+    match effort {
+        Some(e) => format!("{resolved}@{e}"),
+        None => resolved.to_string(),
+    }
 }
 
 /// Issue #3730: experiment-related env vars forwarded to the detached sweep
@@ -4505,13 +4588,15 @@ exit 0
     }
 
     /// `autonomous.model` in config wins over the shipped default when no
-    /// explicit param is supplied.
+    /// explicit param is supplied. The resolved value is passed through the
+    /// #3982 tier map, so a logical `opus` reaches `claude-opus-5` on the wire
+    /// while the source stays `Config`.
     #[test]
     fn resolve_dispatch_model_reads_autonomous_config() {
         let dir = tempdir().unwrap();
         write_config(dir.path(), r#"{"autonomous": {"model": "opus"}}"#);
         let (model, source) = resolve_dispatch_model(dir.path(), None);
-        assert_eq!(model, "opus");
+        assert_eq!(model, "claude-opus-5");
         assert_eq!(source, ModelSource::Config);
     }
 
@@ -4532,10 +4617,11 @@ exit 0
     #[test]
     fn resolve_dispatch_model_treats_blank_as_unset() {
         let dir = tempdir().unwrap();
-        // Empty explicit param + populated config → config wins.
+        // Empty explicit param + populated config → config wins (and `opus`
+        // resolves through the #3982 tier map to `claude-opus-5`).
         write_config(dir.path(), r#"{"autonomous": {"model": "opus"}}"#);
         let (model, source) = resolve_dispatch_model(dir.path(), Some("   "));
-        assert_eq!(model, "opus");
+        assert_eq!(model, "claude-opus-5");
         assert_eq!(source, ModelSource::Config);
 
         // Blank config value → shipped default.
@@ -4567,6 +4653,105 @@ exit 0
         assert_eq!(read_autonomous_model(dir.path()), None);
         let (model, _) = resolve_dispatch_model(dir.path(), None);
         assert_eq!(model, DEFAULT_DISPATCH_MODEL);
+    }
+
+    // --- Issue #3982: logical-tier → concrete-ID resolution --------------- //
+
+    /// The shipped default map pins the stale `opus` alias to gen-5 while leaving
+    /// current-generation aliases and pinned IDs untouched (passthrough).
+    #[test]
+    fn resolve_model_alias_pins_opus_and_passes_through_rest() {
+        let dir = tempdir().unwrap(); // no config → shipped defaults only
+        assert_eq!(resolve_model_alias(dir.path(), "opus"), "claude-opus-5");
+        // sonnet/fable are NOT pinned — the CLI resolves them to gen-5 already.
+        assert_eq!(resolve_model_alias(dir.path(), "sonnet"), "sonnet");
+        assert_eq!(resolve_model_alias(dir.path(), "fable"), "fable");
+        // A pinned ID is never rewritten.
+        assert_eq!(resolve_model_alias(dir.path(), "claude-sonnet-4-6"), "claude-sonnet-4-6");
+        // An unknown alias passes through unchanged.
+        assert_eq!(resolve_model_alias(dir.path(), "mystery"), "mystery");
+        // Empty stays empty.
+        assert_eq!(resolve_model_alias(dir.path(), ""), "");
+    }
+
+    /// The `model@effort` suffix is preserved across resolution.
+    #[test]
+    fn resolve_model_alias_preserves_effort_suffix() {
+        let dir = tempdir().unwrap();
+        assert_eq!(resolve_model_alias(dir.path(), "opus@xhigh"), "claude-opus-5@xhigh");
+        // Passthrough model keeps its effort too.
+        assert_eq!(resolve_model_alias(dir.path(), "sonnet@xhigh"), "sonnet@xhigh");
+    }
+
+    /// A `sweep.modelAliases` block repoints a tier without a code change, and
+    /// can drop the shipped pin by mapping the alias back to itself.
+    #[test]
+    fn resolve_model_alias_honors_config_override() {
+        // Repoint opus to a hypothetical next generation.
+        let dir = tempdir().unwrap();
+        write_config(dir.path(), r#"{"sweep": {"modelAliases": {"opus": "claude-opus-6"}}}"#);
+        assert_eq!(resolve_model_alias(dir.path(), "opus"), "claude-opus-6");
+
+        // Drop the pin: map opus back to the bare alias (CLI resolves it).
+        let dir2 = tempdir().unwrap();
+        write_config(dir2.path(), r#"{"sweep": {"modelAliases": {"opus": "opus"}}}"#);
+        assert_eq!(resolve_model_alias(dir2.path(), "opus"), "opus");
+
+        // Malformed config soft-falls to the shipped default map.
+        let dir3 = tempdir().unwrap();
+        write_config(dir3.path(), "{ not json");
+        assert_eq!(resolve_model_alias(dir3.path(), "opus"), "claude-opus-5");
+    }
+
+    /// Ladder monotonicity: no rung of the shipped escalation ladder resolves to
+    /// an older generation than the rung below it. This is the regression guard
+    /// for #3982 — before the fix, `opus` resolved to a gen-4 model, one below
+    /// the `sonnet@xhigh` rung beneath it. The generation each bare alias
+    /// resolves to on the wire is the probed table (sonnet/fable → 5, and the
+    /// unfixed `opus` alias → 4); the tier map lifts `opus` to gen-5.
+    #[test]
+    fn resolve_model_alias_ladder_is_monotonic() {
+        let dir = tempdir().unwrap();
+        // Probed alias generations (mirrors model_tiers._ALIAS_GENERATION).
+        fn alias_generation(alias: &str) -> u32 {
+            match alias {
+                "sonnet" | "fable" | "haiku" => 5,
+                "opus" => 4, // the unfixed CLI alias — the bug
+                other => panic!("unexpected bare alias in ladder: {other}"),
+            }
+        }
+        fn generation_of(dir: &Path, rung: &str) -> u32 {
+            let resolved = resolve_model_alias(dir, rung);
+            let base = resolved.split('@').next().unwrap();
+            // Pinned ID `claude-<family>-<gen>[-...]` → parse the generation.
+            if let Some(rest) = base.strip_prefix("claude-") {
+                let mut parts = rest.split('-');
+                let first = parts.next().unwrap_or("");
+                // `claude-opus-5` → family then gen; `claude-3-5-sonnet` → gen first.
+                if let Ok(g) = first.parse::<u32>() {
+                    return g;
+                }
+                if let Some(g) = parts.next().and_then(|p| p.parse::<u32>().ok()) {
+                    return g;
+                }
+            }
+            // A bare alias that passed through unmapped.
+            alias_generation(base)
+        }
+
+        let ladder = ["sonnet", "sonnet@xhigh", "opus", "fable"];
+        let gens: Vec<u32> = ladder
+            .iter()
+            .map(|r| generation_of(dir.path(), r))
+            .collect();
+        for pair in gens.windows(2) {
+            assert!(
+                pair[1] >= pair[0],
+                "escalation ladder is non-monotonic: {ladder:?} resolved to generations {gens:?}"
+            );
+        }
+        // And specifically the previously-broken rung is now gen-5.
+        assert_eq!(generation_of(dir.path(), "opus"), 5);
     }
 
     /// Issue #3716: an `effort` dispatch param threads through to the spawn

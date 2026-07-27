@@ -368,6 +368,36 @@ here changes a default** unless it also cites a qualifying sample per Section 3.
   opus→sonnet flip is the **deferred operator action** tracked by #3750, not closed
   by its Builder PR.
 
+- **2026-07-27 (#3982) — the `opus` tier now resolves to Opus 5; prior Arm A
+  evidence is NOT comparable to post-change samples.** The logical `opus` rung was
+  resolving to a **previous-generation** model on the wire (`claude-opus-4-8`)
+  while `sonnet`/`fable` resolved to gen-5, so the escalation ladder
+  `sonnet → sonnet@xhigh → opus → fable` was non-monotonic and **Arm A of the
+  #3718 model-cost experiment ("opus-first") was measuring a previous-generation
+  model against a current-generation Arm B**. #3982 introduces a single logical
+  tier → concrete-ID indirection point (`loom_tools/model_tiers.py`,
+  `defaults/scripts/resolve-model.sh`, and `sweep_registry::resolve_dispatch_model`,
+  configurable via `.loom/config.json` → `sweep.modelAliases`) that pins the stale
+  `opus` tier to `claude-opus-5` while leaving `sonnet`/`fable` untouched.
+  `ARM_MODEL` still reads `{"A": "opus", "B": "sonnet"}`; Arm A is now resolved to
+  `claude-opus-5` at dispatch (`assign-arm --resolve`).
+
+  **Consequence for the gate:** any Arm A samples gathered **before 2026-07-27**
+  were run on Opus 4.8 and must **not** be pooled with post-change Arm A samples,
+  which run on Opus 5 — they measure different models. Because #3981 made pricing
+  and family attribution generation-agnostic (both `claude-opus-4-8` and
+  `claude-opus-5` price and attribute as the `opus` family / Arm A), the harvest
+  cannot distinguish the two by arm label alone; the **collection-date cutoff is
+  the discriminator.** Any future §2 re-evaluation must draw its ≥~30 Arm A
+  first-attempts from post-2026-07-27 sweeps only.
+
+  **Representative sample?** No — this entry ships the resolution fix and records
+  the generation change; it cites no numbers and accrues no sample.
+
+  **Decision:** `defaults/roles/builder.json` `suggestedModel` remains `opus` (the
+  alias, now resolving to Opus 5). No default flipped. Arm B and
+  `DEFAULT_DISPATCH_MODEL` (`sonnet`) are unchanged — Sonnet remains the workhorse.
+
 ---
 
 ## 5. The flip is a separate, gated follow-up

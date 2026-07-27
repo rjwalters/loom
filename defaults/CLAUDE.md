@@ -808,6 +808,23 @@ The ladder is configured in `.loom/config.json`:
 
 **Aliases vs pinned IDs**: shipped role JSONs use aliases so defaults stay sensible across model releases with zero maintenance. The GitHub Actions cron workflows (`.github/workflows/loom-*.yml`) are the exception — they pin exact IDs because scheduled support roles are predictable, cost-sensitive load and a stale pin is visible and cheap to bump in the consuming repo.
 
+> **Logical-tier resolution (`sweep.modelAliases`, issue #3982).** A logical alias
+> is not always current on the wire: the bare `opus` alias still resolves to a
+> **previous-generation** model (`claude-opus-4-8`) while `sonnet`/`fable` resolve
+> to the current generation, which would make the escalation ladder
+> `sonnet → sonnet@xhigh → opus → fable` step *down* a generation at the `opus`
+> rung. So every consumer keeps naming `opus` and a **single indirection point**
+> maps the logical tier to the concrete ID the dispatch should use — the
+> `/loom:sweep` skill via `./.loom/scripts/resolve-model.sh`, `loom_tools` via
+> `model_tiers`, and `loom-daemon` via `resolve_dispatch_model`. The shipped map
+> pins only the stale tier (`opus → claude-opus-5`); `sonnet`/`fable` and pinned
+> IDs pass through unchanged. Repoint or drop a pin per-repo with an additive
+> `.loom/config.json` → `sweep.modelAliases` object (no code change):
+>
+> ```json
+> { "sweep": { "modelAliases": { "opus": "claude-opus-5" } } }
+> ```
+
 **Workspace override example** (`.loom/config.json`):
 
 ```json
