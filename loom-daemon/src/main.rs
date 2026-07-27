@@ -190,6 +190,21 @@ enum Commands {
     /// 3 will call after a rebuild — it does nothing on its own.
     Restart,
 
+    /// Manage the multi-account OAuth token pool at `.loom/tokens/` (Issue
+    /// #4082, Phase 1 of epic #4081 "eliminate Python from Loom"). Native
+    /// Rust port of the hot-path subset of `loom_tools.tokens` — the 3-tier
+    /// selection algorithm and the operator-facing pin/unpin/unblock
+    /// bookkeeping CLI. This is a pure addition in this phase: no existing
+    /// caller (`spawn-claude.sh`, `probe-tokens.sh`) has been switched over
+    /// yet, and `bootstrap`/`check`/`import-from-monitor` remain
+    /// Python-only (deferred to a follow-up issue — see
+    /// `loom-daemon/src/tokens_pool/mod.rs`). Purely file-based; does not
+    /// require a running daemon.
+    Tokens {
+        #[command(subcommand)]
+        action: TokensAction,
+    },
+
     /// Validate role configuration completeness
     Validate {
         /// Workspace directory containing .loom/config.json
@@ -311,6 +326,98 @@ enum QuarantineAction {
         /// default workspace.
         #[arg(long, value_name = "PATH")]
         workspace_root: Option<String>,
+    },
+}
+
+/// Sub-actions for `loom-daemon tokens`.
+#[derive(Subcommand)]
+enum TokensAction {
+    /// Select an OAuth token from the pool using the 3-tier algorithm
+    /// (ranking -> allowlist -> random), skipping bad-marked tokens at every
+    /// tier. Mirrors `python3 -m loom_tools.tokens.select`.
+    Select {
+        /// Repo root containing `.loom/tokens/` (the canonical main-checkout
+        /// root when called from a worktree — no upward `.git` walk).
+        #[arg(long, value_name = "PATH", default_value = ".")]
+        workspace: String,
+
+        /// Emit `export CLAUDE_CODE_OAUTH_TOKEN=...` shell lines instead of
+        /// JSON.
+        #[arg(long)]
+        export: bool,
+
+        /// Omit the secret key from output (safe inspection).
+        #[arg(long)]
+        no_key: bool,
+    },
+
+    /// Manage the `.allowlist` file constraining which accounts `select` may
+    /// pick.
+    Pin {
+        #[command(subcommand)]
+        action: PinAction,
+
+        /// Repo root containing `.loom/tokens/`.
+        #[arg(long, value_name = "PATH", default_value = ".", global = true)]
+        workspace: String,
+    },
+
+    /// Clear the allowlist (all accounts become eligible).
+    Unpin {
+        /// Repo root containing `.loom/tokens/`.
+        #[arg(long, value_name = "PATH", default_value = ".")]
+        workspace: String,
+
+        /// Emit a JSON status instead of a human message.
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Remove auth-reason entries for the given accounts from `.bad_tokens`
+    /// (e.g. after re-authenticating).
+    Unblock {
+        /// Account names to unblock (exact match).
+        #[arg(required = true, value_name = "NAME")]
+        names: Vec<String>,
+
+        /// Repo root containing `.loom/tokens/`.
+        #[arg(long, value_name = "PATH", default_value = ".")]
+        workspace: String,
+
+        /// Also drop non-auth entries (TTL-style, exhausted/expired).
+        /// Default is auth-reason only.
+        #[arg(long)]
+        all_reasons: bool,
+
+        /// Emit JSON status.
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+/// Sub-actions for `loom-daemon tokens pin`.
+#[derive(Subcommand)]
+enum PinAction {
+    /// Replace the allowlist with exactly the given accounts.
+    Set {
+        #[arg(required = true, value_name = "NAME")]
+        names: Vec<String>,
+    },
+    /// Add account(s) to the existing allowlist.
+    Add {
+        #[arg(required = true, value_name = "NAME")]
+        names: Vec<String>,
+    },
+    /// Remove account(s) from the allowlist.
+    Remove {
+        #[arg(required = true, value_name = "NAME")]
+        names: Vec<String>,
+    },
+    /// Show the current allowlist and all available accounts.
+    Status {
+        /// Emit JSON instead of a human table.
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -1134,6 +1241,7 @@ fn handle_cli_command(command: Commands) -> Result<()> {
             format,
         } => handle_stats_command(role.as_deref(), issue, weekly, &format),
         Commands::Workspace { action } => handle_workspace_command(action),
+        Commands::Tokens { action } => handle_tokens_command(action),
         Commands::Status { .. } => {
             // Routed directly in `main()` (it needs the async runtime for the
             // socket round-trip), never dispatched through this sync handler.
@@ -2806,6 +2914,270 @@ fn handle_workspace_command(action: WorkspaceAction) -> Result<()> {
                         ""
                     };
                     println!("  {:>4}  {}{overrides}", ws.priority, ws.root.display());
+                }
+            }
+            Ok(())
+        }
+    }
+}
+
+/// Resolve the `--workspace` flag to an absolute path. No upward `.git`
+/// walk (unlike Python's `find_repo_root()`) — a deliberate Phase-1
+/// simplification since this CLI has no existing callers yet; pass the
+/// canonical repo root explicitly (as `spawn-claude.sh` already resolves via
+/// `git rev-parse --git-common-dir` for the Python selector).
+fn resolve_tokens_workspace(workspace: &str) -> Result<PathBuf> {
+    let p = Path::new(workspace);
+    if p.is_absolute() {
+        Ok(p.to_path_buf())
+    } else {
+        Ok(std::env::current_dir()?.join(p))
+    }
+}
+
+/// Handle `loom-daemon tokens <select|pin|unpin|unblock>` (Issue #4082,
+/// Phase 1 of epic #4081). Purely file-based — does not require a running
+/// daemon. See `loom-daemon/src/tokens_pool/mod.rs` for the ported subset
+/// and what is deliberately deferred.
+fn handle_tokens_command(action: TokensAction) -> Result<()> {
+    use loom_daemon::tokens_pool::{allowlist, bad_tokens, failure_counts, select};
+
+    match action {
+        TokensAction::Select {
+            workspace,
+            export,
+            no_key,
+        } => {
+            let ws = resolve_tokens_workspace(&workspace)?;
+            match select::select_token(&ws, None) {
+                Ok(sel) => {
+                    if export {
+                        if no_key {
+                            println!(
+                                "# selected={} mode={} file={}",
+                                sel.name,
+                                sel.mode,
+                                sel.file.display()
+                            );
+                        } else {
+                            // Tokens are base64/hex-like and never contain a
+                            // single quote in practice; this is a simple
+                            // wrap, not a full Python repr() escape (no
+                            // caller consumes --export in this phase — see
+                            // module docs).
+                            println!("export CLAUDE_CODE_OAUTH_TOKEN='{}'", sel.key);
+                            println!(
+                                "# selected={} mode={} file={}",
+                                sel.name,
+                                sel.mode,
+                                sel.file.display()
+                            );
+                        }
+                    } else {
+                        let mut obj = serde_json::Map::new();
+                        obj.insert("name".to_string(), serde_json::Value::String(sel.name));
+                        obj.insert(
+                            "file".to_string(),
+                            serde_json::Value::String(sel.file.display().to_string()),
+                        );
+                        obj.insert(
+                            "mode".to_string(),
+                            serde_json::Value::String(sel.mode.to_string()),
+                        );
+                        if !no_key {
+                            obj.insert("key".to_string(), serde_json::Value::String(sel.key));
+                        }
+                        println!("{}", serde_json::Value::Object(obj));
+                    }
+                    Ok(())
+                }
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    std::process::exit(select::EX_CONFIG);
+                }
+            }
+        }
+
+        TokensAction::Pin { action, workspace } => {
+            let ws = resolve_tokens_workspace(&workspace)?;
+            handle_pin_action(action, &ws)
+        }
+
+        TokensAction::Unpin { workspace, json } => {
+            let ws = resolve_tokens_workspace(&workspace)?;
+            let had_file = allowlist::clear_allowlist(&ws).map_err(|e| anyhow!(e))?;
+            let _ = failure_counts::reset_all(&ws);
+            if json {
+                println!("{}", serde_json::json!({ "cleared": had_file }));
+            } else if had_file {
+                println!("Allowlist cleared. All accounts are eligible.");
+            } else {
+                println!("No allowlist was active.");
+            }
+            Ok(())
+        }
+
+        TokensAction::Unblock {
+            names,
+            workspace,
+            all_reasons,
+            json,
+        } => {
+            let ws = resolve_tokens_workspace(&workspace)?;
+
+            let available = allowlist::list_accounts(&ws);
+            let available_set: std::collections::HashSet<&str> =
+                available.iter().map(String::as_str).collect();
+            let mut validated: Vec<String> = Vec::new();
+            for raw in &names {
+                let name = raw.trim();
+                if name.is_empty() {
+                    continue;
+                }
+                if !available_set.contains(name) {
+                    let avail = if available.is_empty() {
+                        "(none)".to_string()
+                    } else {
+                        available.join(", ")
+                    };
+                    eprintln!("Unknown account '{name}'. Available: {avail}");
+                    std::process::exit(2);
+                }
+                validated.push(name.to_string());
+            }
+            if validated.is_empty() {
+                eprintln!("`unblock` requires at least one account name.");
+                std::process::exit(1);
+            }
+
+            let (removed, kept) =
+                bad_tokens::unblock(&ws, &validated, all_reasons).map_err(|e| anyhow!(e))?;
+            for name in &validated {
+                let _ = failure_counts::record_success(&ws, name);
+            }
+
+            if json {
+                println!("{}", serde_json::json!({ "removed": removed, "kept": kept }));
+            } else if removed > 0 {
+                let plural = if removed == 1 { "y" } else { "ies" };
+                println!("Removed {removed} bad-token entr{plural} for: {}", validated.join(", "));
+            } else {
+                println!(
+                    "No matching entries removed (use --all-reasons to drop non-auth entries \
+                     too)."
+                );
+            }
+            Ok(())
+        }
+    }
+}
+
+/// Handle `loom-daemon tokens pin <set|add|remove|status>`.
+fn handle_pin_action(action: PinAction, ws: &Path) -> Result<()> {
+    use loom_daemon::tokens_pool::{allowlist, failure_counts};
+
+    match action {
+        PinAction::Set { names } => match allowlist::write_allowlist(ws, &names) {
+            Ok(written) => {
+                let _ = failure_counts::reset_all(ws);
+                if written.is_empty() {
+                    println!("Allowlist cleared (no names resolved). All accounts are eligible.");
+                } else {
+                    println!(
+                        "Allowlist set to {} account(s): {}",
+                        written.len(),
+                        written.join(", ")
+                    );
+                }
+                Ok(())
+            }
+            Err(allowlist::AllowlistError::Unknown(e)) => {
+                eprintln!("{e}");
+                std::process::exit(2);
+            }
+            Err(allowlist::AllowlistError::Io(e)) => {
+                eprintln!("{e}");
+                std::process::exit(1);
+            }
+        },
+
+        PinAction::Add { names } => match allowlist::add_to_allowlist(ws, &names) {
+            Ok((added, skipped)) => {
+                let _ = failure_counts::reset_all(ws);
+                if !added.is_empty() {
+                    println!("Added {} account(s): {}", added.len(), added.join(", "));
+                }
+                if !skipped.is_empty() {
+                    println!("Already present: {}", skipped.join(", "));
+                }
+                Ok(())
+            }
+            Err(allowlist::AllowlistError::Unknown(e)) => {
+                eprintln!("{e}");
+                std::process::exit(2);
+            }
+            Err(allowlist::AllowlistError::Io(e)) => {
+                eprintln!("{e}");
+                std::process::exit(1);
+            }
+        },
+
+        PinAction::Remove { names } => match allowlist::remove_from_allowlist(ws, &names) {
+            Ok((removed, skipped)) => {
+                let _ = failure_counts::reset_all(ws);
+                if !removed.is_empty() {
+                    println!("Removed {} account(s): {}", removed.len(), removed.join(", "));
+                }
+                if !skipped.is_empty() {
+                    println!("Not in allowlist: {}", skipped.join(", "));
+                }
+                Ok(())
+            }
+            Err(allowlist::AllowlistError::Unknown(e)) => {
+                eprintln!("{e}");
+                std::process::exit(2);
+            }
+            Err(allowlist::AllowlistError::Io(e)) => {
+                eprintln!("{e}");
+                std::process::exit(1);
+            }
+        },
+
+        PinAction::Status { json } => {
+            let all_accounts = allowlist::list_accounts(ws);
+            let active = allowlist::read_allowlist(ws);
+            if json {
+                let payload = serde_json::json!({
+                    "allowlist_active": !active.is_empty(),
+                    "allowlist": active,
+                    "accounts": all_accounts,
+                });
+                println!("{payload}");
+                return Ok(());
+            }
+            if active.is_empty() {
+                println!("No allowlist active — all accounts are eligible.");
+            } else {
+                println!("Allowlist active ({} account(s)):", active.len());
+                for name in &active {
+                    println!("  * {name}");
+                }
+            }
+            if all_accounts.is_empty() {
+                println!();
+                eprintln!("No .token files found. Run `loom-tokens bootstrap` first.");
+            } else {
+                println!();
+                println!("Available accounts ({}):", all_accounts.len());
+                let active_set: std::collections::HashSet<&str> =
+                    active.iter().map(String::as_str).collect();
+                for name in &all_accounts {
+                    let mark = if active_set.contains(name.as_str()) {
+                        "*"
+                    } else {
+                        " "
+                    };
+                    println!("  {mark} {name}");
                 }
             }
             Ok(())
