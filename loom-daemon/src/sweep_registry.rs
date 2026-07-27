@@ -4040,6 +4040,29 @@ exit 0
 
     /// Wait until `path` exists AND contains `needle`. Returns true on
     /// success, false on timeout.
+    /// Generous wall-clock budget for waiting on a fixture child that normally
+    /// completes near-instantly (writes its record file / exits). The build
+    /// gate historically ran the workspace suite at ~100% duty cycle (#3984),
+    /// and under that self-inflicted CPU starvation a fixture child that
+    /// "exits immediately" could still miss a 5–10s deadline purely because it
+    /// was never scheduled — reddening the gate for a host-load reason, not a
+    /// code regression (#3985). A 60s budget is orders of magnitude over the
+    /// real completion time on an idle host, so it never slows a green run,
+    /// but it absorbs even severe scheduler contention. Prefer bumping this
+    /// (or restructuring to await a signal) over tightening it.
+    ///
+    /// NOTE: on macOS, spawning the fixture child execs a *freshly written*
+    /// `spawn-claude.sh`, which Gatekeeper (`syspolicyd`/`amfid`) must assess
+    /// before the first exec — and that assessment can stall for tens of
+    /// seconds when a background AV/backup (Backblaze, XProtect) has the
+    /// security daemons pegged. That is a host condition, not a code fault, so
+    /// the budget is set well above the worst stall observed in the wild
+    /// (#3985). Because every caller *polls* and returns the instant the
+    /// condition is met, a large budget costs nothing on a healthy host — it
+    /// only widens the tolerance before a genuinely stuck child is declared
+    /// failed.
+    const FIXTURE_CHILD_WAIT_MS: u64 = 120_000;
+
     fn wait_for_contents(path: &Path, needle: &str, timeout_ms: u64) -> bool {
         let start = std::time::Instant::now();
         while start.elapsed().as_millis() < u128::from(timeout_ms) {
@@ -4207,9 +4230,11 @@ exit 0
         assert_eq!(entry.pid, outcome.pid);
 
         // The fixture's fake spawn-claude.sh exits immediately, so the pid is
-        // dead almost immediately; wait for the reaper's dead-PID path.
-        let dead = wait_for_condition(10_000, || !is_pid_alive(outcome.pid));
-        assert!(dead, "fixture child did not exit within 10s");
+        // dead almost immediately; wait for the reaper's dead-PID path. The
+        // budget is deliberately generous (#3985) so host CPU starvation — not
+        // a code fault — can never redden this via a missed deadline.
+        let dead = wait_for_condition(FIXTURE_CHILD_WAIT_MS, || !is_pid_alive(outcome.pid));
+        assert!(dead, "fixture child did not exit within the wait budget");
 
         registry.reap_once();
 
@@ -4380,8 +4405,9 @@ exit 0
 
         let needle = format!("LOOM_TERMINAL_ID=daemon-{}", outcome.sweep_id);
         assert!(
-            wait_for_contents(&record_log, &needle, 10000),
-            "fake spawn-claude.sh did not finish writing within 10s"
+            // Generous budget (#3985): a busy host must not turn this red.
+            wait_for_contents(&record_log, &needle, FIXTURE_CHILD_WAIT_MS),
+            "fake spawn-claude.sh did not finish writing within the wait budget"
         );
         let recorded = std::fs::read_to_string(&record_log).unwrap();
         assert!(
@@ -7491,8 +7517,10 @@ exit 0\n";
             elapsed >= Duration::from_millis(400),
             "second dispatch should have waited out the stagger; elapsed={elapsed:?}"
         );
-        // Both fake children ran.
-        assert!(wait_for_contents(&rec, "issue=8002", 5000) || rec.exists());
+        // Both fake children ran. Generous budget (#3985): under host CPU
+        // starvation the children can be slow to be scheduled onto the record
+        // log, so a tight 5s bound made this red for a host-load reason.
+        assert!(wait_for_contents(&rec, "issue=8002", FIXTURE_CHILD_WAIT_MS) || rec.exists());
     }
 
     // --- watchdog_once: bounded auto-restart end-to-end ---

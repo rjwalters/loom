@@ -398,6 +398,38 @@ pub fn tmux_server_running() -> bool {
         .unwrap_or(false)
 }
 
+/// Probe whether tmux is actually *usable* on this host (issue #3985).
+///
+/// Returns `true` only when the `tmux` binary is present AND a server can be
+/// started on the dedicated `-L loom` socket — i.e. a throwaway detached
+/// session can be created and torn down. This is stronger than
+/// [`tmux_server_running`] (which only checks whether a server is *already*
+/// up): the terminal integration tests need to *create* sessions, so what
+/// matters is whether tmux can fork a server at all, not whether one already
+/// exists.
+///
+/// The point is to let host-dependent terminal tests **skip cleanly** on a
+/// machine without a working tmux (no binary, dead server, unwritable
+/// `/tmp/tmux-*` socket dir) instead of reddening the shared build gate. CI —
+/// which controls its environment and always has a working tmux — still
+/// exercises every one of these paths, so coverage is unchanged where it
+/// matters. See `.loom/docs/build-gate.md` (§"Local gate vs. CI").
+#[allow(dead_code)]
+pub fn tmux_available() -> bool {
+    let probe = format!("loom-{}-tmuxprobe", *TEST_PREFIX);
+    // `new-session -d` (detached) with the default shell forks a server on the
+    // loom socket if one isn't already running. Success => tmux is usable.
+    let started = Command::new("tmux")
+        .args(["-L", "loom", "new-session", "-d", "-s", &probe])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+    if started {
+        kill_tmux_session(&probe);
+    }
+    started
+}
+
 /// Helper: Capture terminal output using tmux capture-pane
 ///
 /// Uses tmux's built-in capture mechanism to read the terminal's pane content.
