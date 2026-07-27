@@ -776,6 +776,18 @@ pub trait GateRunner {
 /// kill switch (`0`/`false`/`no`/`off`) for repos with no forge CI or no `gh`.
 pub const GATE_CI_CORROBORATION_ENV: &str = "LOOM_GATE_CI_CORROBORATION";
 
+/// Environment variable naming the forge workflow that must have concluded
+/// `success` for a commit before forge-CI corroboration will vouch for it
+/// (#3987). **Unset by default** — absent, corroboration keeps the #3986
+/// unanimity rule byte-for-byte. When set (env overrides
+/// `autonomous.mainHealthGate.ciWorkflow`), the named workflow must have a
+/// `completed`/`success` run for the evaluated SHA or the verdict degrades to
+/// [`CiVerdict::Unknown`]. This closes the residual gap where a repo whose real
+/// verification workflow is `paths`-filtered out of a commit — so it produces
+/// **no run at all** — could have a fast bookkeeping workflow (line counter,
+/// labeler) vouch for the commit on its own. See the module docs.
+pub const GATE_CI_WORKFLOW_ENV: &str = "LOOM_GATE_CI_WORKFLOW";
+
 /// How long to wait for the forge-CI probe before giving up (and keeping the
 /// local verdict). Deliberately short: this runs inside the gate tick, and an
 /// unavailable answer is the safe answer.
@@ -824,7 +836,26 @@ pub trait ForgeCiStatus {
 /// executed in the repo root so `gh` resolves the repository from its git
 /// remote. Conclusions are matched on `headSha`, so a run for a *different*
 /// commit can never corroborate (or contradict) this one.
-pub struct GhForgeCi;
+///
+/// An optional `ci_workflow` name (#3987, resolved env > config > `None` in
+/// [`CommandGateRunner::new`]) is threaded into [`parse_gh_run_list`]: when set,
+/// that workflow must have concluded `success` for the SHA or the verdict
+/// degrades to [`CiVerdict::Unknown`]. Absent, behavior is unchanged.
+pub struct GhForgeCi {
+    /// The workflow name that must have concluded `success`, or `None` for the
+    /// unnamed (unanimity-only) behavior. See [`GATE_CI_WORKFLOW_ENV`].
+    ci_workflow: Option<String>,
+}
+
+impl GhForgeCi {
+    /// Construct a `gh`-backed forge-CI probe. Pass `None` for the unnamed
+    /// (unanimity-only) behavior, or a workflow name to additionally require
+    /// that workflow to have concluded `success` (#3987).
+    #[must_use]
+    pub fn new(ci_workflow: Option<String>) -> Self {
+        Self { ci_workflow }
+    }
+}
 
 impl ForgeCiStatus for GhForgeCi {
     fn conclusion_for(&self, repo_root: &Path, sha: &str) -> CiVerdict {
@@ -846,7 +877,7 @@ impl ForgeCiStatus for GhForgeCi {
                 return CiVerdict::Unknown;
             }
         };
-        parse_gh_run_list(&stdout, sha)
+        parse_gh_run_list(&stdout, sha, self.ci_workflow.as_deref())
     }
 }
 
@@ -879,7 +910,34 @@ impl ForgeCiStatus for GhForgeCi {
 ///
 /// Requiring every sibling run to have reached a definitive verdict handles both
 /// without hard-coding which workflow "counts" — see the PR discussion on #3974.
-fn parse_gh_run_list(stdout: &str, sha: &str) -> CiVerdict {
+///
+/// # Optional named verification workflow (#3987)
+///
+/// The unanimity rule above reasons only over *runs that exist*. A workflow that
+/// a `paths` / `paths-ignore` filter excluded from a commit produces **no run at
+/// all** — not a `skipped` run — so it is invisible to the reducer. In a repo
+/// where only a fast bookkeeping workflow (line counter, labeler) runs and
+/// succeeds for such a commit, every run is `completed`/`success` and the reducer
+/// returns `Success` for a commit the real build never judged.
+///
+/// When `ci_workflow` is `Some(name)` that gap is closed by layering **one extra
+/// requirement on top of** — never a relaxation of — the unanimity rule: the
+/// named workflow must itself have a `completed`/`success` run for `sha`.
+///
+/// | `ci_workflow` = `Some(name)`, runs for `sha` | Verdict |
+/// |---|---|
+/// | named workflow `completed`/`success`, unanimity otherwise satisfied | `Success` |
+/// | named workflow has **no run at all** | `Unknown` *(the gap closure)* |
+/// | named workflow `skipped` / `neutral` | `Unknown` (a required workflow that declined did not verify the commit) |
+/// | any run `failure` / `timed_out` / `startup_failure` | `Failure` (unchanged, still checked first) |
+///
+/// When `ci_workflow` is `None`, behavior is byte-for-byte the unanimity rule.
+/// A configured name that appears for **no** SHA anywhere in the probe window is
+/// almost certainly a typo (it would silently pin the gate to permanent
+/// `Unknown`), so it is surfaced with a `log::warn!` naming both the configured
+/// value and the workflow names actually observed — while still failing safe to
+/// `Unknown`.
+fn parse_gh_run_list(stdout: &str, sha: &str, ci_workflow: Option<&str>) -> CiVerdict {
     let Ok(runs) = serde_json::from_str::<Vec<serde_json::Value>>(stdout) else {
         log::debug!("main_health_gate: could not parse `gh run list` output");
         return CiVerdict::Unknown;
@@ -887,12 +945,20 @@ fn parse_gh_run_list(stdout: &str, sha: &str) -> CiVerdict {
     let mut saw_success = false;
     // The first run that reached no verdict about the code, for diagnostics.
     let mut indeterminate: Option<String> = None;
-    for run in runs {
+    // #3987: whether the configured verification workflow itself reached
+    // `completed`/`success` for `sha` (only meaningful when `ci_workflow` is set).
+    let mut named_workflow_success = false;
+    // Every workflow name observed anywhere in the probe window (any SHA), for
+    // the misconfiguration warning below.
+    let mut observed_workflows: std::collections::BTreeSet<String> =
+        std::collections::BTreeSet::new();
+    for run in &runs {
         let field = |k: &str| run.get(k).and_then(serde_json::Value::as_str);
+        let workflow = field("workflowName").unwrap_or("<unnamed workflow>");
+        observed_workflows.insert(workflow.to_string());
         if field("headSha") != Some(sha) {
             continue;
         }
-        let workflow = field("workflowName").unwrap_or("<unnamed workflow>");
         let status = field("status").unwrap_or("<no status>");
         if status != "completed" {
             // CI has not judged this commit yet — not evidence in either
@@ -909,7 +975,12 @@ fn parse_gh_run_list(stdout: &str, sha: &str) -> CiVerdict {
                 );
                 return CiVerdict::Failure;
             }
-            Some("success") => saw_success = true,
+            Some("success") => {
+                saw_success = true;
+                if ci_workflow == Some(workflow) {
+                    named_workflow_success = true;
+                }
+            }
             // Definitive "did not apply": a path/branch filter skipped the run,
             // or the workflow deliberately declined to judge. Neither vouches
             // for the commit nor leaves a verdict outstanding.
@@ -923,6 +994,26 @@ fn parse_gh_run_list(stdout: &str, sha: &str) -> CiVerdict {
             }
         }
     }
+    // #3987 misconfiguration guardrail: a configured name matching no workflow
+    // anywhere in the window would otherwise silently pin the gate to permanent
+    // `Unknown` (recreating #3974 for that repo). Make the cause visible; still
+    // return the (fail-safe) computed verdict.
+    if let Some(name) = ci_workflow {
+        if !observed_workflows.iter().any(|w| w == name) {
+            log::warn!(
+                "main_health_gate: configured ci_workflow {name:?} (LOOM_GATE_CI_WORKFLOW / \
+                 autonomous.mainHealthGate.ciWorkflow) matched no workflow in the last {} runs on \
+                 {GATE_BRANCH} — observed: [{}]. Forge-CI corroboration will never vouch for a \
+                 commit; verify the name against `gh run list`.",
+                CI_PROBE_RUN_LIMIT,
+                observed_workflows
+                    .iter()
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+        }
+    }
     if let Some(reason) = indeterminate {
         log::debug!(
             "main_health_gate: forge CI verdict for {sha} is indeterminate ({reason}) — \
@@ -931,7 +1022,14 @@ fn parse_gh_run_list(stdout: &str, sha: &str) -> CiVerdict {
         return CiVerdict::Unknown;
     }
     if saw_success {
-        CiVerdict::Success
+        // #3987: with a verification workflow configured, that specific workflow
+        // must itself have concluded `success` — otherwise the commit was vouched
+        // for only by bookkeeping workflows (or the named one skipped/declined),
+        // which is not evidence the real build judged the commit.
+        match ci_workflow {
+            Some(_) if !named_workflow_success => CiVerdict::Unknown,
+            _ => CiVerdict::Success,
+        }
     } else {
         // No run for `sha` at all, or every run was skipped/neutral. Either way
         // nothing positively vouches for the commit.
@@ -1043,11 +1141,15 @@ impl CommandGateRunner {
     /// to `origin/main` is **on** — the production default.
     #[must_use]
     pub fn new(config: BuildGateConfig, repo_root: PathBuf) -> Self {
+        // #3987: resolve the optional verification-workflow name (env > config >
+        // None) from the same repo root the gate runs against, so all existing
+        // call sites and the `run_gate_tick` signature stay untouched.
+        let ci_workflow = resolve_ci_workflow(&repo_root);
         Self {
             config,
             repo_root,
             sync: true,
-            ci: Box::new(GhForgeCi),
+            ci: Box::new(GhForgeCi::new(ci_workflow)),
         }
     }
 
@@ -1994,18 +2096,25 @@ pub fn enabled() -> bool {
 }
 
 /// The subset of `.loom/config.json → autonomous.mainHealthGate` this module
-/// consumes. Today it carries only the enablement flag; future tuning knobs
-/// (cadence, timeout) can be added here without touching the call site.
+/// consumes: the loop's on/off flag and the optional named forge verification
+/// workflow (#3987). Further tuning knobs (cadence, timeout) can still be added
+/// here without touching the call site.
 ///
 /// The gate's *behavior* (which command runs against `main`, its timeout) still
 /// comes from the separate `buildGate` block via [`read_build_gate_config`] —
-/// `autonomous.mainHealthGate` is purely the on/off (and future tuning) surface,
-/// so Phase C's already-tested `buildGate` semantics are untouched.
+/// `autonomous.mainHealthGate` is purely the on/off (plus forge-CI
+/// corroboration tuning) surface, so Phase C's already-tested `buildGate`
+/// semantics are untouched.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct AutonomousGateConfig {
     /// `autonomous.mainHealthGate.enabled` — whether to run the gate loop.
     /// `None` when the key is absent (falls through to env / default).
     pub enabled: Option<bool>,
+    /// `autonomous.mainHealthGate.ciWorkflow` (#3987) — the forge workflow that
+    /// must have concluded `success` for a commit before forge-CI corroboration
+    /// will vouch for it. `None` when the key is absent, empty, or whitespace
+    /// (falls through to env / the unnamed unanimity-only behavior).
+    pub ci_workflow: Option<String>,
 }
 
 /// Read `.loom/config.json → autonomous.mainHealthGate`, soft-failing to an
@@ -2048,7 +2157,31 @@ pub fn read_autonomous_gate_config(repo_root: &Path) -> AutonomousGateConfig {
 
     AutonomousGateConfig {
         enabled: gate.get("enabled").and_then(serde_json::Value::as_bool),
+        // #3987: empty / whitespace-only ⇒ `None` (treated as unset).
+        ci_workflow: gate
+            .get("ciWorkflow")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string),
     }
+}
+
+/// Resolve the optional forge verification-workflow name for `repo_root` with
+/// precedence **env > config > default(None)** (#3987), mirroring
+/// [`resolve_enabled`]. [`GATE_CI_WORKFLOW_ENV`] wins when set to a non-empty
+/// (trimmed) value; an empty/whitespace-only env value falls through to
+/// `autonomous.mainHealthGate.ciWorkflow`; absent both ⇒ `None`, which keeps the
+/// #3986 unanimity rule byte-for-byte.
+#[must_use]
+pub fn resolve_ci_workflow(repo_root: &Path) -> Option<String> {
+    if let Ok(v) = std::env::var(GATE_CI_WORKFLOW_ENV) {
+        let trimmed = v.trim();
+        if !trimmed.is_empty() {
+            return Some(trimmed.to_string());
+        }
+    }
+    read_autonomous_gate_config(repo_root).ci_workflow
 }
 
 /// Resolve whether the gate loop is enabled with precedence **env > config >
@@ -2857,30 +2990,30 @@ mod tests {
             r#"[{{"headSha":"{sha}","status":"completed","conclusion":"success","workflowName":"CI"}},
                 {{"headSha":"{sha}","status":"completed","conclusion":"skipped","workflowName":"LOC"}}]"#
         );
-        assert_eq!(parse_gh_run_list(&json, &sha), CiVerdict::Success);
+        assert_eq!(parse_gh_run_list(&json, &sha, None), CiVerdict::Success);
 
         // Any completed failure for the SHA ⇒ red.
         let json = format!(
             r#"[{{"headSha":"{sha}","status":"completed","conclusion":"success","workflowName":"CI"}},
                 {{"headSha":"{sha}","status":"completed","conclusion":"failure","workflowName":"Sec"}}]"#
         );
-        assert_eq!(parse_gh_run_list(&json, &sha), CiVerdict::Failure);
+        assert_eq!(parse_gh_run_list(&json, &sha, None), CiVerdict::Failure);
 
         // Only in-progress runs for the SHA ⇒ unknown (never a silent green).
         let json = format!(
             r#"[{{"headSha":"{sha}","status":"in_progress","conclusion":null,"workflowName":"CI"}}]"#
         );
-        assert_eq!(parse_gh_run_list(&json, &sha), CiVerdict::Unknown);
+        assert_eq!(parse_gh_run_list(&json, &sha, None), CiVerdict::Unknown);
 
         // A green run for a DIFFERENT commit must never vouch for this one.
         let json = format!(
             r#"[{{"headSha":"{other}","status":"completed","conclusion":"success","workflowName":"CI"}}]"#
         );
-        assert_eq!(parse_gh_run_list(&json, &sha), CiVerdict::Unknown);
+        assert_eq!(parse_gh_run_list(&json, &sha, None), CiVerdict::Unknown);
 
         // Empty / unparseable output ⇒ unknown.
-        assert_eq!(parse_gh_run_list("[]", &sha), CiVerdict::Unknown);
-        assert_eq!(parse_gh_run_list("not json", &sha), CiVerdict::Unknown);
+        assert_eq!(parse_gh_run_list("[]", &sha, None), CiVerdict::Unknown);
+        assert_eq!(parse_gh_run_list("not json", &sha, None), CiVerdict::Unknown);
     }
 
     /// Only *positive* contrary evidence may relax a halt (#3974 AC4). These are
@@ -2896,7 +3029,7 @@ mod tests {
         let json = format!(
             r#"[{{"headSha":"{sha}","status":"completed","conclusion":"cancelled","workflowName":"CI"}}]"#
         );
-        assert_eq!(parse_gh_run_list(&json, &sha), CiVerdict::Unknown);
+        assert_eq!(parse_gh_run_list(&json, &sha, None), CiVerdict::Unknown);
 
         // Cancelled CI alongside a completed-success bookkeeping workflow: still
         // unknown. The success does not paper over the missing CI verdict.
@@ -2904,7 +3037,7 @@ mod tests {
             r#"[{{"headSha":"{sha}","status":"completed","conclusion":"cancelled","workflowName":"CI"}},
                 {{"headSha":"{sha}","status":"completed","conclusion":"success","workflowName":"Lines of Code"}}]"#
         );
-        assert_eq!(parse_gh_run_list(&json, &sha), CiVerdict::Unknown);
+        assert_eq!(parse_gh_run_list(&json, &sha, None), CiVerdict::Unknown);
 
         // 2. The ~100s window after every push where the fast bookkeeping
         //    workflow has finished but CI is still running.
@@ -2912,14 +3045,14 @@ mod tests {
             r#"[{{"headSha":"{sha}","status":"in_progress","conclusion":null,"workflowName":"CI"}},
                 {{"headSha":"{sha}","status":"completed","conclusion":"success","workflowName":"Lines of Code"}}]"#
         );
-        assert_eq!(parse_gh_run_list(&json, &sha), CiVerdict::Unknown);
+        assert_eq!(parse_gh_run_list(&json, &sha, None), CiVerdict::Unknown);
 
         // Queued counts the same as in-progress: not yet a verdict.
         let json = format!(
             r#"[{{"headSha":"{sha}","status":"queued","conclusion":null,"workflowName":"CI"}},
                 {{"headSha":"{sha}","status":"completed","conclusion":"success","workflowName":"Lines of Code"}}]"#
         );
-        assert_eq!(parse_gh_run_list(&json, &sha), CiVerdict::Unknown);
+        assert_eq!(parse_gh_run_list(&json, &sha, None), CiVerdict::Unknown);
 
         // `action_required` (awaiting a human) and `stale` are likewise not
         // statements about the code.
@@ -2929,7 +3062,7 @@ mod tests {
                     {{"headSha":"{sha}","status":"completed","conclusion":"success","workflowName":"Lines of Code"}}]"#
             );
             assert_eq!(
-                parse_gh_run_list(&json, &sha),
+                parse_gh_run_list(&json, &sha, None),
                 CiVerdict::Unknown,
                 "conclusion {conclusion:?} must not vouch for the commit"
             );
@@ -2940,14 +3073,14 @@ mod tests {
             r#"[{{"headSha":"{sha}","status":"completed","conclusion":"some_new_thing","workflowName":"CI"}},
                 {{"headSha":"{sha}","status":"completed","conclusion":"success","workflowName":"CI"}}]"#
         );
-        assert_eq!(parse_gh_run_list(&json, &sha), CiVerdict::Unknown);
+        assert_eq!(parse_gh_run_list(&json, &sha, None), CiVerdict::Unknown);
 
         // Absence of failure is not success: every run skipped ⇒ nothing
         // positively vouches for the commit.
         let json = format!(
             r#"[{{"headSha":"{sha}","status":"completed","conclusion":"skipped","workflowName":"CI"}}]"#
         );
-        assert_eq!(parse_gh_run_list(&json, &sha), CiVerdict::Unknown);
+        assert_eq!(parse_gh_run_list(&json, &sha, None), CiVerdict::Unknown);
 
         // A real failure still wins over any indeterminate sibling — a halt may
         // always be *established*, it just may not be relaxed on non-evidence.
@@ -2956,7 +3089,7 @@ mod tests {
                 {{"headSha":"{sha}","status":"completed","conclusion":"cancelled","workflowName":"Lines of Code"}},
                 {{"headSha":"{sha}","status":"completed","conclusion":"failure","workflowName":"CI"}}]"#
         );
-        assert_eq!(parse_gh_run_list(&json, &sha), CiVerdict::Failure);
+        assert_eq!(parse_gh_run_list(&json, &sha, None), CiVerdict::Failure);
 
         // And the genuine all-clear still reads green: every workflow for the
         // commit reached a verdict, at least one of them `success`.
@@ -2965,7 +3098,91 @@ mod tests {
                 {{"headSha":"{sha}","status":"completed","conclusion":"success","workflowName":"Lines of Code"}},
                 {{"headSha":"{sha}","status":"completed","conclusion":"skipped","workflowName":"Release"}}]"#
         );
-        assert_eq!(parse_gh_run_list(&json, &sha), CiVerdict::Success);
+        assert_eq!(parse_gh_run_list(&json, &sha, None), CiVerdict::Success);
+    }
+
+    /// #3987: with a named verification workflow configured, that workflow must
+    /// itself have concluded `success` for the SHA — a bookkeeping workflow
+    /// succeeding on its own may not vouch for a commit whose real build never
+    /// ran (`paths`-filtered away, so it produced no run at all).
+    #[test]
+    fn test_parse_gh_run_list_named_workflow() {
+        let sha = "d".repeat(40);
+
+        // Regression for this issue: only a bookkeeping `success`, no `CI` run at
+        // all for the SHA. Unnamed ⇒ Success (today's behavior); named "CI" ⇒
+        // Unknown, because the workflow that verifies the code never judged it.
+        let bookkeeping_only = format!(
+            r#"[{{"headSha":"{sha}","status":"completed","conclusion":"success","workflowName":"Lines of Code"}}]"#
+        );
+        assert_eq!(parse_gh_run_list(&bookkeeping_only, &sha, None), CiVerdict::Success);
+        assert_eq!(
+            parse_gh_run_list(&bookkeeping_only, &sha, Some("CI")),
+            CiVerdict::Unknown,
+            "no CI run for the SHA must not be vouched for by a bookkeeping success"
+        );
+
+        // The named workflow completed/success (unanimity otherwise satisfied) ⇒
+        // Success: the corroboration path stays reachable (preserves #3986/#3974).
+        let ci_success = format!(
+            r#"[{{"headSha":"{sha}","status":"completed","conclusion":"success","workflowName":"CI"}},
+                {{"headSha":"{sha}","status":"completed","conclusion":"success","workflowName":"Lines of Code"}}]"#
+        );
+        assert_eq!(parse_gh_run_list(&ci_success, &sha, Some("CI")), CiVerdict::Success);
+
+        // Named workflow `skipped` alongside a bookkeeping success ⇒ Unknown (a
+        // required workflow that declined to run did not verify the commit). Note
+        // this differs from the unnamed case, where the same fixture is Success.
+        let ci_skipped = format!(
+            r#"[{{"headSha":"{sha}","status":"completed","conclusion":"skipped","workflowName":"CI"}},
+                {{"headSha":"{sha}","status":"completed","conclusion":"success","workflowName":"Lines of Code"}}]"#
+        );
+        assert_eq!(parse_gh_run_list(&ci_skipped, &sha, None), CiVerdict::Success);
+        assert_eq!(parse_gh_run_list(&ci_skipped, &sha, Some("CI")), CiVerdict::Unknown);
+
+        // A `failure` on any run still yields Failure, configured or not — a halt
+        // may always be established, only never relaxed on non-evidence.
+        let ci_failure = format!(
+            r#"[{{"headSha":"{sha}","status":"completed","conclusion":"failure","workflowName":"CI"}},
+                {{"headSha":"{sha}","status":"completed","conclusion":"success","workflowName":"Lines of Code"}}]"#
+        );
+        assert_eq!(parse_gh_run_list(&ci_failure, &sha, None), CiVerdict::Failure);
+        assert_eq!(parse_gh_run_list(&ci_failure, &sha, Some("CI")), CiVerdict::Failure);
+
+        // A configured name matching no workflow anywhere in the window ⇒ Unknown
+        // (fail safe) and exercises the misconfiguration `warn!` path.
+        assert_eq!(
+            parse_gh_run_list(&bookkeeping_only, &sha, Some("Typo Workflow")),
+            CiVerdict::Unknown
+        );
+
+        // Matching is exact on `workflowName` (case-sensitive): a near-miss name
+        // is treated as "no run for the named workflow".
+        assert_eq!(parse_gh_run_list(&ci_success, &sha, Some("ci")), CiVerdict::Unknown);
+    }
+
+    /// #3987 Finding-1 guard: real captured `gh run list` output for this repo —
+    /// where `Shell Script Linting` is `paths`-filtered and appears for only one
+    /// of several SHAs — must yield `Success` for a green SHA **both** unnamed and
+    /// with `ciWorkflow: "CI"`, i.e. the low-frequency workflow must not perturb
+    /// any verdict.
+    #[test]
+    fn test_parse_gh_run_list_real_data_fixture() {
+        let green = "1111111111111111111111111111111111111111";
+        let older = "2222222222222222222222222222222222222222";
+        // The green SHA has CI + two other no-filter workflows all green; the
+        // paths-filtered `Shell Script Linting` only ever ran on an older SHA.
+        let json = format!(
+            r#"[
+                {{"headSha":"{green}","status":"completed","conclusion":"success","workflowName":"CI"}},
+                {{"headSha":"{green}","status":"completed","conclusion":"success","workflowName":"Lines of Code"}},
+                {{"headSha":"{green}","status":"completed","conclusion":"success","workflowName":"Security Scan"}},
+                {{"headSha":"{older}","status":"completed","conclusion":"success","workflowName":"CI"}},
+                {{"headSha":"{older}","status":"completed","conclusion":"success","workflowName":"Shell Script Linting"}}
+            ]"#
+        );
+        assert_eq!(parse_gh_run_list(&json, green, None), CiVerdict::Success);
+        assert_eq!(parse_gh_run_list(&json, green, Some("CI")), CiVerdict::Success);
     }
 
     // ===================================================================
@@ -3892,16 +4109,76 @@ mod tests {
         assert_eq!(
             read_autonomous_gate_config(tmp.path()),
             AutonomousGateConfig {
-                enabled: Some(true)
+                enabled: Some(true),
+                ci_workflow: None,
             }
         );
         write_config(tmp.path(), r#"{"autonomous": {"mainHealthGate": {"enabled": false}}}"#);
         assert_eq!(
             read_autonomous_gate_config(tmp.path()),
             AutonomousGateConfig {
-                enabled: Some(false)
+                enabled: Some(false),
+                ci_workflow: None,
             }
         );
+    }
+
+    // ===================================================================
+    // #3987 — optional named forge verification workflow
+    // ===================================================================
+
+    #[test]
+    fn test_autonomous_config_ci_workflow_parsed() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_config(
+            tmp.path(),
+            r#"{"autonomous": {"mainHealthGate": {"enabled": true, "ciWorkflow": "CI"}}}"#,
+        );
+        assert_eq!(
+            read_autonomous_gate_config(tmp.path()),
+            AutonomousGateConfig {
+                enabled: Some(true),
+                ci_workflow: Some("CI".to_string()),
+            }
+        );
+    }
+
+    #[test]
+    fn test_autonomous_config_ci_workflow_empty_and_whitespace_is_none() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Empty string ⇒ treated as unset.
+        write_config(tmp.path(), r#"{"autonomous": {"mainHealthGate": {"ciWorkflow": ""}}}"#);
+        assert_eq!(read_autonomous_gate_config(tmp.path()).ci_workflow, None);
+        // Whitespace-only ⇒ trimmed away ⇒ unset.
+        write_config(tmp.path(), r#"{"autonomous": {"mainHealthGate": {"ciWorkflow": "   "}}}"#);
+        assert_eq!(read_autonomous_gate_config(tmp.path()).ci_workflow, None);
+        // Leading/trailing whitespace on a real value is trimmed.
+        write_config(tmp.path(), r#"{"autonomous": {"mainHealthGate": {"ciWorkflow": "  CI  "}}}"#);
+        assert_eq!(read_autonomous_gate_config(tmp.path()).ci_workflow, Some("CI".to_string()));
+    }
+
+    #[test]
+    #[serial]
+    fn test_resolve_ci_workflow_precedence() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::env::remove_var(GATE_CI_WORKFLOW_ENV);
+
+        // No env, no config ⇒ None (unanimity-only behavior preserved).
+        assert_eq!(resolve_ci_workflow(tmp.path()), None);
+
+        // Config alone is used when env is unset.
+        write_config(tmp.path(), r#"{"autonomous": {"mainHealthGate": {"ciWorkflow": "Build"}}}"#);
+        assert_eq!(resolve_ci_workflow(tmp.path()), Some("Build".to_string()));
+
+        // Env overrides config.
+        std::env::set_var(GATE_CI_WORKFLOW_ENV, "CI");
+        assert_eq!(resolve_ci_workflow(tmp.path()), Some("CI".to_string()));
+
+        // Empty/whitespace env falls through to config.
+        std::env::set_var(GATE_CI_WORKFLOW_ENV, "   ");
+        assert_eq!(resolve_ci_workflow(tmp.path()), Some("Build".to_string()));
+
+        std::env::remove_var(GATE_CI_WORKFLOW_ENV);
     }
 
     #[test]
@@ -3914,20 +4191,24 @@ mod tests {
 
         // Config alone enables/disables when env is unset.
         assert!(resolve_enabled(&AutonomousGateConfig {
-            enabled: Some(true)
+            enabled: Some(true),
+            ..Default::default()
         }));
         assert!(!resolve_enabled(&AutonomousGateConfig {
-            enabled: Some(false)
+            enabled: Some(false),
+            ..Default::default()
         }));
 
         // Env overrides config in both directions (env is the master switch).
         std::env::set_var(MAIN_HEALTH_GATE_ENABLE_ENV, "1");
         assert!(resolve_enabled(&AutonomousGateConfig {
-            enabled: Some(false)
+            enabled: Some(false),
+            ..Default::default()
         }));
         std::env::set_var(MAIN_HEALTH_GATE_ENABLE_ENV, "0");
         assert!(!resolve_enabled(&AutonomousGateConfig {
-            enabled: Some(true)
+            enabled: Some(true),
+            ..Default::default()
         }));
         std::env::remove_var(MAIN_HEALTH_GATE_ENABLE_ENV);
     }

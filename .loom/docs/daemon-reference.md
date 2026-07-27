@@ -579,6 +579,47 @@ fast bookkeeping workflow that finishes minutes before the real build would
 otherwise vouch for the commit on its own. Neither case needs the probe to know
 *which* workflow "counts", so no workflow name is hard-coded.
 
+#### Optional named verification workflow (`LOOM_GATE_CI_WORKFLOW`, #3987)
+
+The unanimity rule above reasons only over *runs that exist*. A workflow a
+`paths` / `paths-ignore` filter excluded from a commit produces **no run at all**
+(not a `skipped` run), so it is invisible to the reducer. In a **consumer repo**
+whose real verification workflow is `paths`-filtered off a commit while only a
+fast bookkeeping workflow (line counter, labeler) runs and succeeds, every run is
+`completed`/`success` and the reducer above returns `green` for a commit the real
+build never judged — relaxing a local red on non-evidence. (Not reachable in this
+repo: `.github/workflows/ci.yml` has no `paths` filter, so a `CI` run exists for
+every `main` commit.)
+
+The optional `ciWorkflow` knob closes that gap by naming the workflow that
+*counts*. It is **unset by default** — absent, behavior is byte-for-byte the
+unanimity rule above, so no repo silently changes. Resolution mirrors
+`LOOM_MAIN_HEALTH_GATE`, precedence **env > config > default(None)**:
+
+1. `LOOM_GATE_CI_WORKFLOW` env var (empty / whitespace-only ⇒ falls through), or
+2. `.loom/config.json` → `autonomous.mainHealthGate.ciWorkflow` (string; empty /
+   whitespace ⇒ unset), or
+3. absent ⇒ the unanimity rule, unchanged.
+
+When a name **is** configured it layers **one additional requirement on top of**
+— never a relaxation of — the unanimity rule: the named workflow must itself have
+concluded `success` for the SHA. Matching is **exact and case-sensitive** on
+`workflowName`.
+
+| `ciWorkflow` set, runs for the evaluated SHA | Verdict |
+|---|---|
+| named workflow `completed`/`success`, unanimity otherwise satisfied | **green** |
+| named workflow has **no run at all** | unknown — *the gap closure* |
+| named workflow `skipped` / `neutral` | unknown (a required workflow that declined did not verify the commit — differs from the unnamed case, where `skipped` does not block green) |
+| any run `failure` / `timed_out` / `startup_failure` | red (unchanged, still checked first) |
+
+**Misconfiguration guardrail.** A typo'd name would otherwise pin the gate to
+permanent `unknown` (silently recreating #3974 for that repo). When a configured
+name appears for **no** SHA anywhere in the probe window, the probe emits a
+`log::warn!` naming the configured value and the workflow names actually
+observed, then still returns `unknown` (fail safe) — so the cause is visible in
+`~/.loom/daemon.log`.
+
 Corroboration is on by default and can be disabled with
 `LOOM_GATE_CI_CORROBORATION=0` (for repos with no forge CI or no `gh`); it is only
 probed on a local red, never on a green run.
@@ -1275,6 +1316,7 @@ exactly like `main_health_gate::read_build_gate_config`.
 | `autonomous.workFinder.quarantine.instaCrashSecs` | `LOOM_WORK_FINDER_QUARANTINE_INSTA_CRASH_SECS` | `60` | Checkpoint-less death within this window of dispatch counts as an insta-crash. Zero/invalid → default |
 | `autonomous.perTokenConcurrency` | `LOOM_PER_TOKEN_CONCURRENCY` | `2` | Concurrent sweeps **per healthy token** in the cap (#3947). Zero/invalid → default; clamped to a floor of 1 |
 | `autonomous.mainHealthGate.enabled` | `LOOM_MAIN_HEALTH_GATE` | `false` | Gate loop on/off |
+| `autonomous.mainHealthGate.ciWorkflow` | `LOOM_GATE_CI_WORKFLOW` | *(unset)* | Forge workflow that must itself conclude `success` for forge-CI corroboration to vouch for a commit (#3987). Empty/whitespace → unset. Absent → today's unanimity rule, unchanged. See [Optional named verification workflow](#optional-named-verification-workflow-loom_gate_ci_workflow-3987) |
 | `autonomous.roleRunner.enabled` | `LOOM_ROLE_RUNNER` | `false` | Periodic standalone support-role runner on/off (#4015) |
 | `autonomous.roleRunner.roles` | *(config only)* | all 5 roles | Subset of `champion`/`curator`/`judge`/`auditor`/`guide` to dispatch; explicit empty array runs none |
 | `autonomous.roleRunner.intervalSecs` | `LOOM_ROLE_RUNNER_INTERVAL_SECS` | per-role built-in (5–15 min) | Uniform override applied to every enabled role's cadence |

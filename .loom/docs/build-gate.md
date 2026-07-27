@@ -53,6 +53,12 @@ The gate is **opt-in**. Repos with no `buildGate` block in `.loom/config.json` s
 | `realChangeGlobs` | array of strings | _(default exclusions)_ | Positive globs. A changed file must match at least one to count as "real." When omitted, every changed file counts unless it matches one of the default scratch exclusions: `.loom-*`, `*.log`, `.no-changes-needed`. |
 | `timeoutSeconds` | integer | `600` | Timeout for the `command` run. |
 
+> **Not a `buildGate` key:** the daemon-side main-health gate's optional forge
+> verification-workflow name (`autonomous.mainHealthGate.ciWorkflow` /
+> `LOOM_GATE_CI_WORKFLOW`, #3987) lives under `autonomous.mainHealthGate`, **not**
+> here. `buildGate` is the builder-side worktree quality gate; it has no business
+> knowing about forge CI. See [Optional named verification workflow](daemon-reference.md#optional-named-verification-workflow-loom_gate_ci_workflow-3987).
+
 ## Examples
 
 ### Rust workspace
