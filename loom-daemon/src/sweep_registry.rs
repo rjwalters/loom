@@ -574,6 +574,13 @@ pub const DEFAULT_QUARANTINE_TTL_SECS: u64 = 3600;
 /// never counts here.
 pub const DEFAULT_QUARANTINE_INSTA_CRASH_SECS: i64 = 60;
 
+/// Marker substring embedded in every quarantine comment body posted by
+/// [`SweepRegistry::apply_quarantine_label`] (Issue #3939). Used by
+/// [`crate::quarantine_reconciliation`] (Issue #4110) to distinguish a
+/// daemon-applied `loom:blocked` from one a human deliberately applied by
+/// hand — only the former is safe to auto-release at startup.
+pub const QUARANTINE_COMMENT_MARKER: &str = "Auto-quarantined by loom-daemon (#3939)";
+
 /// Resolved insta-crash-quarantine parameters (Issue #3939), set on the registry
 /// at construction so [`SweepRegistry::reap_once`] can enforce them without a
 /// per-tick config read. Defaults mirror the shipped constants (enabled — it is a
@@ -1132,6 +1139,16 @@ pub struct SweepRegistry {
     /// releases it. Keyed by issue number; since each registry is scoped to one
     /// workspace root, this is effectively a `(workspace, issue)` key.
     quarantined: HashMap<u32, DateTime<Utc>>,
+    /// Issues whose `loom:blocked` -> `loom:issue` label restore failed at
+    /// least once (Issue #4110): [`release_quarantine_label`](Self::release_quarantine_label)
+    /// is a best-effort `gh` call, and a transient failure must not silently
+    /// strand the issue at `loom:blocked` forever — the in-memory quarantine
+    /// state is already gone by the time the label edit runs, so this set is
+    /// the only remaining record that a retry is owed. [`reap_once`](Self::reap_once)
+    /// retries every entry here on each tick until the flip succeeds (or the
+    /// operator fixes the forge state by hand, at which point the retried
+    /// `gh issue edit` is a harmless idempotent no-op).
+    pending_quarantine_release: HashSet<u32>,
     /// Whether cross-host dispatch-collision detection is enabled (Issue #4085,
     /// Phase 0 of #4028). When `true`, [`dispatch`](Self::dispatch) issues a
     /// pre-flip `gh issue view --json labels` read and classifies whether a peer
@@ -1216,6 +1233,7 @@ impl SweepRegistry {
             quarantine_config: QuarantineConfig::default(),
             insta_crash_counts: HashMap::new(),
             quarantined: HashMap::new(),
+            pending_quarantine_release: HashSet::new(),
             detect_collisions: false,
             collision_count: 0,
         }
@@ -1241,6 +1259,7 @@ impl SweepRegistry {
             quarantine_config: QuarantineConfig::default(),
             insta_crash_counts: HashMap::new(),
             quarantined: HashMap::new(),
+            pending_quarantine_release: HashSet::new(),
             detect_collisions: false,
             collision_count: 0,
         }
@@ -1341,11 +1360,17 @@ impl SweepRegistry {
     /// label restore re-arms `loom:issue` (mirroring [`expire_quarantine`]), so
     /// the operator command both releases the in-memory pause and re-enters the
     /// issue into the work-finder queue — the label flip alone never sufficed.
+    ///
+    /// A failed label restore (Issue #4110) does NOT make this return `false` —
+    /// the in-memory quarantine genuinely was cleared — but the issue is added
+    /// to [`pending_quarantine_release`](Self::pending_quarantine_release_issues)
+    /// so the background reaper keeps retrying the flip until it succeeds,
+    /// instead of leaving the issue permanently stranded at `loom:blocked`.
     pub fn clear_quarantine(&mut self, issue: u32) -> bool {
         self.insta_crash_counts.remove(&issue);
         let was_quarantined = self.quarantined.remove(&issue).is_some();
         if was_quarantined {
-            self.release_quarantine_label(issue);
+            self.attempt_quarantine_release(issue);
         }
         was_quarantined
     }
@@ -1358,6 +1383,14 @@ impl SweepRegistry {
         self.quarantined.insert(issue, Utc::now());
         self.insta_crash_counts
             .insert(issue, self.quarantine_config.threshold);
+    }
+
+    /// Issues currently awaiting a retried `loom:blocked` -> `loom:issue` label
+    /// restore after at least one failed attempt (Issue #4110). Exposed for
+    /// tests and `loom-daemon status`-style diagnostics.
+    #[must_use]
+    pub fn pending_quarantine_release_issues(&self) -> HashSet<u32> {
+        self.pending_quarantine_release.clone()
     }
 
     /// Read-only accessor for the event bus, if any. Exposed so external
@@ -2014,7 +2047,9 @@ impl SweepRegistry {
     /// Called at the top of each [`reap_once`](Self::reap_once). Cheap
     /// early-return when nothing is quarantined. On release the insta-crash tally
     /// is cleared too, so the issue re-qualifies with a fresh runway, and a
-    /// best-effort forge label restore re-arms `loom:issue`.
+    /// best-effort forge label restore re-arms `loom:issue` — retried on
+    /// subsequent ticks via [`pending_quarantine_release`](Self::pending_quarantine_release_issues)
+    /// if the first attempt fails (Issue #4110).
     fn expire_quarantine(&mut self) {
         if self.quarantined.is_empty() {
             return;
@@ -2034,8 +2069,76 @@ impl SweepRegistry {
                 "sweep_registry: issue #{issue} quarantine expired after {ttl_secs}s — eligible \
                  for re-dispatch again (#3939)"
             );
-            self.release_quarantine_label(issue);
+            self.attempt_quarantine_release(issue);
         }
+    }
+
+    /// Retry every issue in [`pending_quarantine_release`](Self::pending_quarantine_release_issues)
+    /// (Issue #4110). Called every [`reap_once`](Self::reap_once) tick, right
+    /// after [`expire_quarantine`](Self::expire_quarantine): a previously
+    /// failed `loom:blocked` -> `loom:issue` restore (transient `gh` failure or
+    /// timeout, #3973) is retried here until it succeeds, instead of leaving
+    /// the issue permanently stranded. Cheap early-return when nothing is
+    /// pending. Idempotent — re-running the flip on an issue that a human
+    /// already restored by hand is a harmless no-op `gh` call.
+    fn retry_pending_quarantine_releases(&mut self) {
+        if self.pending_quarantine_release.is_empty() {
+            return;
+        }
+        let pending: Vec<u32> = self.pending_quarantine_release.iter().copied().collect();
+        for issue in pending {
+            self.attempt_quarantine_release(issue);
+        }
+    }
+
+    /// Attempt the `loom:blocked` -> `loom:issue` label restore for `issue`
+    /// (Issue #4110). On success, clears any pending-retry record. On
+    /// failure, records `issue` in [`pending_quarantine_release`](Self::pending_quarantine_release_issues)
+    /// (if not already there) and logs at `warn` — a silent strand is the
+    /// defect this exists to prevent, so the failure must be visible above
+    /// the default log level.
+    fn attempt_quarantine_release(&mut self, issue: u32) {
+        if self.release_quarantine_label(issue) {
+            self.pending_quarantine_release.remove(&issue);
+        } else {
+            let first_attempt = self.pending_quarantine_release.insert(issue);
+            log::warn!(
+                "sweep_registry: quarantine release for #{issue} failed — `loom:blocked` may \
+                 remain stranded on the forge; retrying on the next reaper tick (#4110){}",
+                if first_attempt {
+                    ""
+                } else {
+                    " (repeated failure)"
+                }
+            );
+        }
+    }
+
+    /// Best-effort release of every currently-quarantined issue's
+    /// `loom:blocked` label before this registry is dropped (Issue #4110).
+    /// Workspace eviction ([`crate::workspace_pool::WorkspacePool::evict`])
+    /// discards this registry's in-memory state, including any live
+    /// quarantine and its reaper — so without this, an evicted workspace's
+    /// quarantined issues would sit at `loom:blocked` until the *next* full
+    /// daemon restart triggers the startup reconciliation pass
+    /// ([`crate::quarantine_reconciliation`]). Each release here is a single
+    /// best-effort attempt (no in-registry retry survives past eviction,
+    /// since the reaper that would drive it is gone); a failure is logged at
+    /// `warn` and left for the reconciliation pass to pick up at the next
+    /// restart. Returns the number of quarantines flushed (attempted).
+    pub fn flush_quarantines_for_eviction(&mut self) -> usize {
+        let issues: Vec<u32> = self.quarantined.keys().copied().collect();
+        for issue in &issues {
+            self.quarantined.remove(issue);
+            self.insta_crash_counts.remove(issue);
+            if !self.release_quarantine_label(*issue) {
+                log::warn!(
+                    "sweep_registry: eviction release for #{issue} failed — `loom:blocked` may \
+                     remain stranded until the next daemon-restart reconciliation pass (#4110)"
+                );
+            }
+        }
+        issues.len()
     }
 
     /// Best-effort forge mutation on quarantine (#3939): add `loom:blocked`,
@@ -2079,17 +2182,18 @@ impl SweepRegistry {
         }
 
         let body = format!(
-            "Auto-quarantined by loom-daemon (#3939): this issue's sweep insta-crashed {count} \
+            "{marker}: this issue's sweep insta-crashed {count} \
              times in a row — each child died within {secs}s of dispatch without writing a phase \
              checkpoint, which almost always means an environment/configuration failure (e.g. a \
              missing token pool, #3938) rather than a problem with the issue itself. Re-dispatch \
              is paused so it stops occupying a global concurrency slot and starving other work. \
              Once the underlying cause is fixed, clear the quarantine with `loom-daemon \
-             quarantine clear {issue}` (this releases the in-memory pause AND restores \
-             `loom:issue`), or simply wait for the {ttl}s TTL to auto-release it. Note: manually \
-             flipping `loom:blocked` -> `loom:issue` on the forge does NOT release the daemon's \
-             in-memory quarantine on its own — the work finder skips it until the CLI clear or the \
-             TTL fires.",
+             quarantine clear {issue}`, or simply wait for the {ttl}s TTL — both paths release the \
+             in-memory pause AND restore `loom:issue` (#4110). Note: manually flipping \
+             `loom:blocked` -> `loom:issue` on the forge does NOT release the daemon's in-memory \
+             quarantine on its own — the work finder skips it until the CLI clear or the TTL \
+             fires.",
+            marker = QUARANTINE_COMMENT_MARKER,
             secs = self.quarantine_config.insta_crash_secs,
             ttl = self.quarantine_config.ttl.as_secs(),
         );
@@ -2114,13 +2218,24 @@ impl SweepRegistry {
         }
     }
 
-    /// Best-effort forge mutation on quarantine expiry (#3939): remove
-    /// `loom:blocked` and re-add `loom:issue` so an auto-released issue re-enters
-    /// the work-finder queue. The mirror of [`apply_quarantine_label`]. Skipped
-    /// when label flips are disabled; a `gh` failure is logged at debug only.
-    fn release_quarantine_label(&self, issue: u32) {
+    /// Best-effort forge mutation on quarantine expiry/clear (#3939): remove
+    /// `loom:blocked` and re-add `loom:issue` so a released issue re-enters the
+    /// work-finder queue. The mirror of [`apply_quarantine_label`]. Skipped
+    /// (returns `true` — a no-op success) when label flips are disabled.
+    ///
+    /// Returns `true` on a confirmed successful flip, `false` otherwise
+    /// (Issue #4110: previously this returned `()` and treated a completed-but-
+    /// failed `gh` invocation — non-zero exit — identically to success, which is
+    /// the root cause of the observed strand: the in-memory quarantine was
+    /// already dropped by the caller before this ran, so a swallowed failure
+    /// left `loom:blocked` on the forge with nothing left to retry it). Callers
+    /// use the return value to decide whether to retry
+    /// ([`attempt_quarantine_release`](Self::attempt_quarantine_release)).
+    /// Every failure is logged at `warn` (was `debug`) — a silent strand is
+    /// exactly the defect this exists to prevent.
+    fn release_quarantine_label(&self, issue: u32) -> bool {
         if self.config.skip_label_flip {
-            return;
+            return true;
         }
         let gh = self
             .config
@@ -2143,16 +2258,28 @@ impl SweepRegistry {
         // `ListSweeps` / `GetSweepStatus` read path.
         let timeout = reap_gh_timeout();
         match output_with_timeout(edit, timeout) {
-            Ok(Some(_)) => {}
-            Ok(None) => log::debug!(
-                "sweep_registry: quarantine-release label edit for #{issue} exceeded {}s, \
-                 killed (#3973)",
-                timeout.as_secs()
-            ),
+            Ok(Some(output)) if output.status.success() => true,
+            Ok(Some(output)) => {
+                log::warn!(
+                    "sweep_registry: quarantine-release label edit for #{issue} exited {:?}: {}",
+                    output.status.code(),
+                    String::from_utf8_lossy(&output.stderr).trim()
+                );
+                false
+            }
+            Ok(None) => {
+                log::warn!(
+                    "sweep_registry: quarantine-release label edit for #{issue} exceeded {}s, \
+                     killed (#3973)",
+                    timeout.as_secs()
+                );
+                false
+            }
             Err(e) => {
-                log::debug!(
+                log::warn!(
                     "sweep_registry: quarantine-release label edit for #{issue} failed: {e}"
-                )
+                );
+                false
             }
         }
     }
@@ -2790,6 +2917,9 @@ impl SweepRegistry {
         // has aged past the configured window before this tick's work. Cheap
         // early-return when nothing is quarantined.
         self.expire_quarantine();
+        // Retry any previously-failed quarantine label restores (Issue #4110).
+        // Cheap early-return when nothing is pending.
+        self.retry_pending_quarantine_releases();
 
         // Snapshot keys + pids first so we can borrow mutably below.
         // Capture started_at so we can compute durations for Exited events.
@@ -6080,6 +6210,167 @@ exit 0
         assert!(
             gh_calls.is_empty(),
             "expected no forge call for a no-op clear; got: {gh_calls:?}"
+        );
+    }
+
+    // ------------------------------------------------------------------------
+    // Durable quarantine release (Issue #4110)
+    // ------------------------------------------------------------------------
+
+    /// TTL-driven release now performs the *real* `gh` label-flip argv.
+    /// Previously the quarantine test suite only ever exercised
+    /// `expire_quarantine` via `fixture_registry`, which sets
+    /// `skip_label_flip = true` — so no test asserted what argv the release
+    /// path actually sends to `gh`. Also confirms a subsequent tick with
+    /// nothing pending makes no further `gh` calls at all (idempotence: a
+    /// released issue is not repeatedly re-flipped).
+    #[test]
+    fn quarantine_expiry_flips_real_forge_label_via_argv() {
+        let dir = tempdir().unwrap();
+        let gh_log = dir.path().join("gh-invocations.log");
+        let fake_gh = install_fake_gh(dir.path(), &gh_log, "", 0);
+
+        let mut config = SweepRegistryConfig::new(dir.path().to_path_buf());
+        config.gh_bin = Some(fake_gh);
+        config.skip_label_flip = false; // exercise the real release path
+        let mut registry = SweepRegistry::new(config);
+        registry.set_quarantine_config(QuarantineConfig {
+            ttl: Duration::from_secs(3600),
+            ..QuarantineConfig::default()
+        });
+        registry
+            .quarantined
+            .insert(60, Utc::now() - chrono::Duration::seconds(7200));
+        registry.insta_crash_counts.insert(60, 3);
+
+        registry.reap_once();
+
+        assert!(!registry.is_quarantined(60));
+        assert!(
+            registry.pending_quarantine_release_issues().is_empty(),
+            "a successful flip leaves nothing pending"
+        );
+        let gh_calls = std::fs::read_to_string(&gh_log).unwrap_or_default();
+        assert!(
+            gh_calls.contains("issue edit 60 --remove-label loom:blocked --add-label loom:issue"),
+            "expected TTL expiry to send the real label-flip argv; got: {gh_calls:?}"
+        );
+
+        // A later tick with nothing quarantined/pending must not re-invoke gh.
+        registry.reap_once();
+        let gh_calls_after = std::fs::read_to_string(&gh_log).unwrap_or_default();
+        assert_eq!(gh_calls, gh_calls_after, "no further gh calls once nothing is pending");
+    }
+
+    /// A `gh` failure during release must NOT permanently strand the issue:
+    /// the entry is retained in the pending-release set and retried until it
+    /// succeeds (Issue #4110). Previously `expire_quarantine` dropped the
+    /// in-memory entry unconditionally and `release_quarantine_label`
+    /// swallowed any failure at `debug`, so a single transient `gh` hiccup
+    /// permanently stranded `loom:blocked` with nothing left in memory to
+    /// retry it — reproducing the exact reported end state (`quarantine
+    /// clear` -> "was not quarantined", forge still `loom:blocked`).
+    ///
+    /// The fake `gh` fails its first two invocations (a counter file tracks
+    /// remaining failures) — enough to survive both the `expire_quarantine`
+    /// attempt AND the same-tick `retry_pending_quarantine_releases` pass —
+    /// so the first `reap_once` tick genuinely ends with the issue still
+    /// pending, and only the second tick's retry succeeds.
+    #[test]
+    fn quarantine_release_retries_after_gh_failure_then_succeeds() {
+        let dir = tempdir().unwrap();
+        let gh_log = dir.path().join("gh-invocations.log");
+        let fail_counter = dir.path().join("fails-remaining");
+        std::fs::write(&fail_counter, "2").unwrap();
+        let fake_gh = dir.path().join("fake-gh.sh");
+        let script = format!(
+            "#!/usr/bin/env bash\nprintf '%s\\n' \"$*\" >> \"{log}\"\ncount=$(cat \"{counter}\" \
+             2>/dev/null || echo 0)\nif [ \"$count\" -gt 0 ]; then\n  echo $((count - 1)) > \
+             \"{counter}\"\n  exit 1\nfi\nexit 0\n",
+            log = gh_log.display(),
+            counter = fail_counter.display(),
+        );
+        std::fs::write(&fake_gh, &script).unwrap();
+        let mut perms = std::fs::metadata(&fake_gh).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&fake_gh, perms).unwrap();
+        if let Ok(f) = std::fs::File::open(&fake_gh) {
+            let _ = f.sync_all();
+        }
+
+        let mut config = SweepRegistryConfig::new(dir.path().to_path_buf());
+        config.gh_bin = Some(fake_gh);
+        config.skip_label_flip = false;
+        let mut registry = SweepRegistry::new(config);
+        registry.set_quarantine_config(QuarantineConfig {
+            ttl: Duration::from_secs(3600),
+            ..QuarantineConfig::default()
+        });
+        registry
+            .quarantined
+            .insert(61, Utc::now() - chrono::Duration::seconds(7200));
+        registry.insta_crash_counts.insert(61, 3);
+
+        // First tick: both the `expire_quarantine` attempt and the same-tick
+        // `retry_pending_quarantine_releases` pass hit the fake gh's two
+        // scripted failures. The in-memory quarantine is still gone
+        // (`expire_quarantine` drops it before attempting the release), but
+        // the issue must NOT be silently stranded — it lands in the
+        // pending-retry set instead.
+        registry.reap_once();
+        assert!(
+            !registry.is_quarantined(61),
+            "quarantine memory clears regardless of flip outcome"
+        );
+        assert!(
+            registry.pending_quarantine_release_issues().contains(&61),
+            "a failed release must be retried, not dropped"
+        );
+
+        // Second tick: the fake gh's failure budget is exhausted, so the
+        // retry succeeds and clears the pending entry.
+        registry.reap_once();
+        assert!(
+            registry.pending_quarantine_release_issues().is_empty(),
+            "a successful retry clears the pending-release record"
+        );
+
+        let gh_calls = std::fs::read_to_string(&gh_log).unwrap_or_default();
+        assert_eq!(
+            gh_calls
+                .matches("issue edit 61 --remove-label loom:blocked --add-label loom:issue")
+                .count(),
+            3,
+            "expected three attempts: two scripted failures then the successful retry; got: \
+             {gh_calls:?}"
+        );
+    }
+
+    /// Eviction (Issue #4110): a workspace's live quarantines are released
+    /// before the pool drops the registry, instead of silently vanishing with
+    /// the reaper that would otherwise have retried them.
+    #[test]
+    fn flush_quarantines_for_eviction_releases_and_clears_state() {
+        let dir = tempdir().unwrap();
+        let gh_log = dir.path().join("gh-invocations.log");
+        let fake_gh = install_fake_gh(dir.path(), &gh_log, "", 0);
+
+        let mut config = SweepRegistryConfig::new(dir.path().to_path_buf());
+        config.gh_bin = Some(fake_gh);
+        config.skip_label_flip = false;
+        let mut registry = SweepRegistry::new(config);
+        registry.quarantined.insert(62, Utc::now());
+        registry.insta_crash_counts.insert(62, 3);
+
+        let flushed = registry.flush_quarantines_for_eviction();
+        assert_eq!(flushed, 1);
+        assert!(!registry.is_quarantined(62));
+        assert_eq!(registry.insta_crash_count(62), 0);
+
+        let gh_calls = std::fs::read_to_string(&gh_log).unwrap_or_default();
+        assert!(
+            gh_calls.contains("issue edit 62 --remove-label loom:blocked --add-label loom:issue"),
+            "expected eviction to flush the real label-flip argv; got: {gh_calls:?}"
         );
     }
 
