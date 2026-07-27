@@ -434,6 +434,174 @@ class BootstrapResult:
         }
 
 
+@dataclass
+class MaterializeOutcome:
+    """Per-file disposition from :func:`materialize_accounts`."""
+
+    written: list[str]
+    unchanged: list[str]
+    drifted: list[str]
+    # Manifest rows for ``index.json`` (never contains secret material).
+    manifest_accounts: list[dict[str, object]]
+
+
+def materialize_accounts(
+    accounts: list[Account],
+    tokens_dir: Path,
+    *,
+    force: bool = False,
+    dry_run: bool = False,
+) -> MaterializeOutcome:
+    """Write each account's key to ``<tokens_dir>/<file>`` and build manifest rows.
+
+    Extracted from :func:`bootstrap_tokens` so the claude-monitor DB importer
+    (#4006) materializes pools through the *same* writer: identical atomic
+    write-then-rename, identical ``0600``/``0700`` modes, identical
+    fingerprint-based drift detection, identical ``index.json`` rows. A second
+    hand-rolled writer would be free to drift from this one on exactly the
+    security-relevant details.
+
+    Drift (an on-disk token whose fingerprint differs from the source) is
+    reported and **skipped** unless ``force`` — the operator is told to re-run
+    with ``--force`` rather than having a hand-edited token silently clobbered.
+
+    Args:
+        accounts: Effective account set; ``file`` values must already be unique
+            (the caller checks, since it owns the error message).
+        tokens_dir: Destination pool directory (created when not ``dry_run``).
+        force: Overwrite tokens whose fingerprint differs from the source.
+        dry_run: Compute dispositions without writing anything.
+
+    Returns:
+        :class:`MaterializeOutcome` — filenames bucketed by disposition plus
+        the manifest rows to hand to :func:`write_index`.
+    """
+    if not dry_run:
+        tokens_dir.mkdir(parents=True, exist_ok=True)
+        # Tighten directory mode (best-effort; ignore on FS without chmod).
+        try:
+            os.chmod(tokens_dir, DIR_MODE)
+        except OSError:
+            pass
+
+    written: list[str] = []
+    unchanged: list[str] = []
+    drifted: list[str] = []
+    manifest_accounts: list[dict[str, object]] = []
+
+    for acct in accounts:
+        n, email, key, filename = acct.index, acct.email, acct.key, acct.file
+        token_path = tokens_dir / filename
+        new_fp = fingerprint(key)
+
+        existing_fp: str | None = None
+        if token_path.exists():
+            try:
+                existing = token_path.read_text(encoding="utf-8")
+            except OSError as exc:
+                log_warning(f"Could not read {token_path}: {exc}; will rewrite.")
+                existing = None  # type: ignore[assignment]
+            if existing is not None:
+                existing_fp = fingerprint(existing.rstrip("\n"))
+
+        action: str
+        if existing_fp is None:
+            action = "written"
+        elif existing_fp == new_fp:
+            action = "unchanged" if not force else "written"
+        else:
+            action = "drifted"
+
+        if action == "drifted" and not force:
+            log_warning(
+                f"DRIFT: {filename} on disk does not match the account source "
+                f"(disk fp={existing_fp}, source fp={new_fp}); "
+                f"re-run with --force to overwrite."
+            )
+            drifted.append(filename)
+            # Still record current on-disk fingerprint in manifest so
+            # operators can see it.
+            manifest_accounts.append(
+                {
+                    "env_index": n,
+                    "name": _name_from_file(filename),
+                    "email": email,
+                    "file": filename,
+                    "source": acct.source,
+                    "key_fingerprint": existing_fp,
+                    "drift": True,
+                    "env_fingerprint": new_fp,
+                }
+            )
+            continue
+
+        if action == "unchanged":
+            unchanged.append(filename)
+        else:
+            # written (new file or force-overwrite)
+            if not dry_run:
+                # Write atomically: temp file + rename.
+                tmp = token_path.with_suffix(token_path.suffix + ".tmp")
+                tmp.write_text(key, encoding="utf-8")
+                try:
+                    os.chmod(tmp, FILE_MODE)
+                except OSError:
+                    pass
+                os.replace(tmp, token_path)
+                # Re-apply mode in case `replace` reset it on some FS.
+                try:
+                    os.chmod(token_path, FILE_MODE)
+                except OSError:
+                    pass
+            written.append(filename)
+
+        manifest_accounts.append(
+            {
+                "env_index": n,
+                "name": _name_from_file(filename),
+                "email": email,
+                "file": filename,
+                "source": acct.source,
+                "key_fingerprint": new_fp,
+            }
+        )
+
+    return MaterializeOutcome(
+        written=written,
+        unchanged=unchanged,
+        drifted=drifted,
+        manifest_accounts=manifest_accounts,
+    )
+
+
+def write_index(
+    manifest_accounts: list[dict[str, object]],
+    index_path: Path,
+    *,
+    dry_run: bool = False,
+) -> None:
+    """Atomically write the ``index.json`` manifest beside the pool.
+
+    The manifest carries only email / filename / source / 8-char fingerprint —
+    :func:`fingerprint` guarantees no secret material lands here.
+    """
+    manifest = {
+        "version": INDEX_VERSION,
+        "generated_at": _now_iso(),
+        "accounts": manifest_accounts,
+    }
+    if dry_run:
+        return
+    # Confirm dir exists (e.g. dry_run was False but no files written).
+    index_path.parent.mkdir(parents=True, exist_ok=True)
+    index_tmp = index_path.with_suffix(index_path.suffix + ".tmp")
+    index_tmp.write_text(
+        json.dumps(manifest, indent=2, sort_keys=False) + "\n",
+        encoding="utf-8",
+    )
+    os.replace(index_tmp, index_path)
+
+
 _HOME_UNSET = object()
 
 
@@ -598,107 +766,14 @@ def bootstrap_tokens(
             raise ValueError(f"duplicate token filename: {acct.file}")
         seen_files[acct.file] = acct
 
-    if not dry_run:
-        tokens_dir.mkdir(parents=True, exist_ok=True)
-        # Tighten directory mode (best-effort; ignore on FS without chmod).
-        try:
-            os.chmod(tokens_dir, DIR_MODE)
-        except OSError:
-            pass
+    outcome = materialize_accounts(
+        valid, tokens_dir, force=force, dry_run=dry_run
+    )
+    result.written.extend(outcome.written)
+    result.unchanged.extend(outcome.unchanged)
+    result.drifted.extend(outcome.drifted)
 
-    manifest_accounts: list[dict[str, object]] = []
-    for acct in valid:
-        n, email, key, filename = acct.index, acct.email, acct.key, acct.file
-        token_path = tokens_dir / filename
-        new_fp = fingerprint(key)
-
-        existing_fp: str | None = None
-        if token_path.exists():
-            try:
-                existing = token_path.read_text(encoding="utf-8")
-            except OSError as exc:
-                log_warning(f"Could not read {token_path}: {exc}; will rewrite.")
-                existing = None  # type: ignore[assignment]
-            if existing is not None:
-                existing_fp = fingerprint(existing.rstrip("\n"))
-
-        action: str
-        if existing_fp is None:
-            action = "written"
-        elif existing_fp == new_fp:
-            action = "unchanged" if not force else "written"
-        else:
-            action = "drifted"
-
-        if action == "drifted" and not force:
-            log_warning(
-                f"DRIFT: {filename} on disk does not match the account source "
-                f"(disk fp={existing_fp}, source fp={new_fp}); "
-                f"re-run with --force to overwrite."
-            )
-            result.drifted.append(filename)
-            # Still record current on-disk fingerprint in manifest so
-            # operators can see it.
-            manifest_accounts.append(
-                {
-                    "env_index": n,
-                    "name": _name_from_file(filename),
-                    "email": email,
-                    "file": filename,
-                    "source": acct.source,
-                    "key_fingerprint": existing_fp,
-                    "drift": True,
-                    "env_fingerprint": new_fp,
-                }
-            )
-            continue
-
-        if action == "unchanged":
-            result.unchanged.append(filename)
-        else:
-            # written (new file or force-overwrite)
-            if not dry_run:
-                # Write atomically: temp file + rename.
-                tmp = token_path.with_suffix(token_path.suffix + ".tmp")
-                tmp.write_text(key, encoding="utf-8")
-                try:
-                    os.chmod(tmp, FILE_MODE)
-                except OSError:
-                    pass
-                os.replace(tmp, token_path)
-                # Re-apply mode in case `replace` reset it on some FS.
-                try:
-                    os.chmod(token_path, FILE_MODE)
-                except OSError:
-                    pass
-            result.written.append(filename)
-
-        manifest_accounts.append(
-            {
-                "env_index": n,
-                "name": _name_from_file(filename),
-                "email": email,
-                "file": filename,
-                "source": acct.source,
-                "key_fingerprint": new_fp,
-            }
-        )
-
-    # Write the manifest.
-    manifest = {
-        "version": INDEX_VERSION,
-        "generated_at": _now_iso(),
-        "accounts": manifest_accounts,
-    }
-    if not dry_run:
-        # Confirm dir exists (e.g. dry_run was False but no files written).
-        tokens_dir.mkdir(parents=True, exist_ok=True)
-        index_tmp = index_path.with_suffix(index_path.suffix + ".tmp")
-        index_tmp.write_text(
-            json.dumps(manifest, indent=2, sort_keys=False) + "\n",
-            encoding="utf-8",
-        )
-        os.replace(index_tmp, index_path)
+    write_index(outcome.manifest_accounts, index_path, dry_run=dry_run)
 
     log_info(
         f"bootstrap: written={len(result.written)} "

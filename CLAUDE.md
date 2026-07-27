@@ -459,6 +459,42 @@ To *exclude* an inherited account from one repo, pin the subset you want with `l
 
 > **Secrets**: `~/.claude-monitor/accounts.env`, the opt-in `~/.loom/accounts.env`, and the repo-local `.loom/accounts.env` all hold raw OAuth keys. The repo-local file and `.loom/tokens/` are gitignored (installer- and `loom-daemon init`–managed); keep any home-level master `0600` and outside any repo. A repo can rely entirely on the claude-monitor master with no local account file at all.
 
+#### Importing live tokens from claude-monitor (#4006)
+
+`accounts.env` is a **snapshot** — a file someone wrote by hand at some point. claude-monitor keeps the **live** credentials in its SQLite store (`~/.claude-monitor/usage.db` → `oauth_credentials`) and refreshes them as accounts are re-authenticated. The two drift, and the drift is silent and total:
+
+```text
+401 {"type":"authentication_error","message":"OAuth access token has been revoked."}
+```
+
+When that happens to every account at once, `loom-tokens check` reports all accounts `blocked`, the daemon's dynamic concurrency cap collapses to `min(healthy 0 × per-token N, …) = 0`, and dispatch stops entirely. Crucially **`bootstrap --force` does not fix it** — it faithfully rewrites the same revoked tokens, because the snapshot itself is what went stale.
+
+`loom-tokens import-from-monitor` reads the live store directly and is **the standard way to populate a new host's pool** (it replaces hand-copying a pool between machines):
+
+```bash
+loom-tokens import-from-monitor                  # into <repo>/.loom/tokens
+loom-tokens import-from-monitor --shared         # into the machine-level pool (#3938)
+loom-tokens import-from-monitor --force          # apply ROLLED tokens (see below)
+loom-tokens import-from-monitor --dry-run        # preview
+loom-tokens import-from-monitor --prune          # drop accounts the monitor no longer reports
+```
+
+**`--force` is what applies a token roll.** Every rolled token legitimately differs from what is on disk, so without `--force` each one is reported as drift and left alone — deliberately, so a hand-pinned token is never silently clobbered. The command exits `2` when drift was found and not applied, so a script can detect "pool is still stale". After importing, refresh the ranking so the daemon sees the recovered capacity:
+
+```bash
+loom-tokens import-from-monitor --force && loom-tokens check --ranking
+```
+
+Behavior notes:
+
+- **Read-only** on `usage.db` (opened `mode=ro`) — the store belongs to claude-monitor; Loom never writes or migrates it.
+- Only `is_active = 1` rows are imported; `expires_at` is **not** used as a filter (observed rows carry stale timestamps while still authenticating — health comes from `loom-tokens check`).
+- Token filenames use the same derivation as `bootstrap` (`robb@2amlogic.com` → `robb-2amlogic.token`), so an account keeps one identity across both paths and re-importing overwrites in place.
+- Idempotent: unchanged tokens are left untouched. `index.json` records `source: monitor-db` (distinct from the `monitor` snapshot) and, as always, fingerprints only — never secret material.
+- `--prune` removes only `*.token` files; pool state (`.ranking`, `.bad_tokens`, `.failure_counts`, `.allowlist`) is never touched.
+- The importer takes **claude-monitor as authoritative for pool membership**, so it imports every active account — including any that `accounts.env` omitted. Use `loom-tokens pin` to restrict which accounts the selector may actually pick.
+- Absent claude-monitor, an absent `usage.db`, or an older schema without `oauth_credentials` all exit `1` with a message naming the path tried.
+
 #### Account health probe + ranking
 
 Once bootstrapped, `loom-tokens check` probes each account for current rate-limit headers and (optionally) writes a JSON ranking that the spawn-time selector can consume:
@@ -563,6 +599,8 @@ For Pro/Max plans, Loom supports rotating between multiple Claude Code OAuth tok
    ```
    The claude-monitor, repo-local, and (opt-in) home sources are **merged by email**, with the higher-precedence source overriding/adding (see "Account sources: claude-monitor-first + per-repo" above). Keep any home-level master `0600` and outside any repo.
 2. Run `loom-tokens bootstrap` to materialize the merged set into per-account `.token` files in `.loom/tokens/` (mode 0600, parent dir 0700). See issues #3234, #3695.
+
+   **If claude-monitor runs on this host, prefer `loom-tokens import-from-monitor`** — it reads claude-monitor's live credential store instead of the `accounts.env` snapshot, so a new host needs no account file of its own and a token roll is picked up automatically (add `--force` to apply rolled tokens). See "Importing live tokens from claude-monitor" above.
 3. Spawn agents through `.loom/scripts/spawn-claude.sh` instead of invoking `claude` directly. The wrapper selects a token using a 3-tier algorithm (ranking → allowlist → random), exports `CLAUDE_CODE_OAUTH_TOKEN`, then `exec`s `claude` (or pass `--use-wrapper` to layer on top of `claude-wrapper.sh` for retry behavior).
 
 ### Selection algorithm (`loom_tools.tokens.select`)

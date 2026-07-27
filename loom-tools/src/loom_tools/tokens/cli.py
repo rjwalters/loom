@@ -11,6 +11,9 @@ Subcommands:
   which accounts the spawn-time selector is allowed to pick.
 * ``unblock`` (#3238) — clear ``auth``-reason entries from
   ``.bad_tokens`` so the named accounts become eligible again.
+* ``import-from-monitor`` (#4006) — materialize the pool from
+  claude-monitor's **live** credential store (``usage.db``) rather than the
+  ``accounts.env`` snapshot, which goes stale whenever accounts are rolled.
 
 Additional subcommands (status, ranking sync, etc.) can be added later
 without breaking the top-level surface — the dispatch table mirrors
@@ -32,6 +35,11 @@ from loom_tools.common.repo import find_repo_root
 from loom_tools.tokens import allowlist as allowlist_mod
 from loom_tools.tokens import failure_counts
 from loom_tools.tokens.bootstrap import bootstrap_tokens
+from loom_tools.tokens.monitor_db import (
+    MonitorDbUnavailable,
+    import_from_monitor,
+    monitor_db_path,
+)
 from loom_tools.tokens.paths import resolve_tokens_dir, shared_tokens_dir
 from loom_tools.tokens.check import (
     DEFAULT_PROBE_PROMPT,
@@ -109,6 +117,62 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Report what would change without writing any files.",
     )
     bp.add_argument(
+        "--json",
+        dest="emit_json",
+        action="store_true",
+        help="Emit a JSON summary on stdout (in addition to log lines).",
+    )
+
+    ip = sub.add_parser(
+        "import-from-monitor",
+        help=(
+            "Materialize the pool from claude-monitor's LIVE credential store "
+            "(~/.claude-monitor/usage.db) instead of the accounts.env "
+            "snapshot. Use this after rolling accounts: the snapshot keeps the "
+            "old (now revoked) tokens, so `bootstrap --force` would rewrite "
+            "them unchanged."
+        ),
+    )
+    ip.add_argument(
+        "--shared",
+        action="store_true",
+        help=(
+            "Import into the SHARED machine-level pool at ~/.loom/tokens "
+            "(override with $LOOM_SHARED_TOKENS_DIR) instead of the repo-local "
+            "<repo>/.loom/tokens."
+        ),
+    )
+    ip.add_argument(
+        "--db",
+        type=Path,
+        default=None,
+        help=(
+            "Path to claude-monitor's usage.db (default: <claude-monitor "
+            "dir>/usage.db, honoring $LOOM_CLAUDE_MONITOR_DIR)."
+        ),
+    )
+    ip.add_argument(
+        "--force",
+        action="store_true",
+        help=(
+            "Overwrite on-disk tokens that differ from the store. Required to "
+            "apply rolled tokens, since every rolled token differs by design."
+        ),
+    )
+    ip.add_argument(
+        "--prune",
+        action="store_true",
+        help=(
+            "Delete *.token files for accounts claude-monitor no longer "
+            "reports active (pool state files are never touched)."
+        ),
+    )
+    ip.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Report what would change without writing any files.",
+    )
+    ip.add_argument(
         "--json",
         dest="emit_json",
         action="store_true",
@@ -261,6 +325,8 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "bootstrap":
         return _cmd_bootstrap(args)
+    if args.command == "import-from-monitor":
+        return _cmd_import_from_monitor(args)
     if args.command == "check":
         return _cmd_check(args)
     if args.command == "pin":
@@ -332,6 +398,88 @@ def _cmd_bootstrap(args: argparse.Namespace) -> int:
     if result.drifted and not args.force:
         return 2
     return 0
+
+
+def _cmd_import_from_monitor(args: argparse.Namespace) -> int:
+    """Import the pool from claude-monitor's live credential store (#4006)."""
+    # Destination: the shared machine-level pool, or this repo's pool.
+    if getattr(args, "shared", False):
+        tokens_dir = shared_tokens_dir()
+        if tokens_dir is None:
+            log_error(
+                "--shared requested but the shared pool is disabled "
+                "(LOOM_SHARED_TOKENS_DIR is empty). Unset it or point it at a "
+                "directory.",
+            )
+            return 1
+        log_info(f"Importing into the shared machine-level pool at {tokens_dir}")
+    else:
+        try:
+            repo_root = find_repo_root()
+        except FileNotFoundError as exc:
+            log_error(str(exc))
+            return 1
+        tokens_dir = repo_root / ".loom" / "tokens"
+
+    try:
+        result = import_from_monitor(
+            tokens_dir,
+            db_path=args.db,
+            force=args.force,
+            dry_run=args.dry_run,
+            prune=args.prune,
+        )
+    except MonitorDbUnavailable as exc:
+        log_error(str(exc))
+        return 1
+    except ValueError as exc:
+        log_error(str(exc))
+        return 1
+
+    if args.emit_json:
+        print(json.dumps(result.to_dict(), indent=2))
+    else:
+        _print_monitor_import(result)
+
+    # Unresolved drift without --force is the "rolled tokens not applied" case;
+    # exit non-zero so a script notices the pool is still stale.
+    if result.drifted and not args.force:
+        return 2
+    return 0
+
+
+def _print_monitor_import(result: "object") -> None:
+    """Print the imported account set. Secrets are never shown."""
+    db_path = getattr(result, "db_path", None) or monitor_db_path()
+    effective = getattr(result, "effective", []) or []
+    pruned = getattr(result, "pruned", []) or []
+
+    print(f"claude-monitor store: {db_path}")
+    print(f"Destination pool: {getattr(result, 'tokens_dir', None)}")
+
+    if not effective:
+        print("Active accounts: (none)")
+        return
+
+    written = set(getattr(result, "written", []) or [])
+    unchanged = set(getattr(result, "unchanged", []) or [])
+    drifted = set(getattr(result, "drifted", []) or [])
+
+    print(f"Active accounts ({len(effective)}):")
+    for acct in effective:
+        filename = acct.get("file", "")
+        if filename in written:
+            disposition = "written"
+        elif filename in unchanged:
+            disposition = "unchanged"
+        elif filename in drifted:
+            disposition = "DRIFT (use --force)"
+        else:
+            disposition = "-"
+        print(f"  {acct.get('name', ''):<26} {acct.get('email', ''):<34} {disposition}")
+
+    if pruned:
+        print(f"Pruned ({len(pruned)}): {', '.join(pruned)}")
 
 
 # Human-readable label for each provenance tag from the merge (#3695, #3698).
