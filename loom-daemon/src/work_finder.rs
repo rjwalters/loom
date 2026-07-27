@@ -965,8 +965,14 @@ where
             let ranking = capacity::read_ranking(&workspace_root);
             let token_limit = ranking.as_ref().map_or(pool_size, |r| r.available);
             let disk = disk_headroom_limit(&workspace_root);
-            // CPU/load headroom (#3978): the term the pre-#3978 formula lacked.
-            let cpu = cpu_headroom_limit();
+            // CPU headroom (#3978; measured-idle signal #4031): the term the
+            // pre-#3978 formula lacked. `cpu_headroom_limit()` refreshes the
+            // memoized idle sample, which sleeps ~1s on macOS (`iostat`), so it
+            // is moved off the runtime via `spawn_blocking`; a join error falls
+            // back to the policy floor of 1 (soft backoff, never a hard halt).
+            let cpu = tokio::task::spawn_blocking(cpu_headroom_limit)
+                .await
+                .unwrap_or(1);
             let max_concurrent = resolve_dynamic_max_concurrent(
                 token_limit,
                 per_token_concurrency,
@@ -1098,9 +1104,14 @@ pub fn spawn_multi_work_finder_task(
             let ranking = capacity::read_ranking(&fallback_root);
             let token_limit = ranking.as_ref().map_or(pool_size, |r| r.available);
             let disk = disk_headroom_limit(&fallback_root);
-            // CPU/load headroom (#3978) — also a machine-level resource, probed
-            // once per tick and shared across every workspace.
-            let cpu = cpu_headroom_limit();
+            // CPU headroom (#3978; measured-idle signal #4031) — also a
+            // machine-level resource, probed once per tick and shared across
+            // every workspace. Moved off the runtime via `spawn_blocking` since
+            // the macOS `iostat` refresh sleeps ~1s; a join error falls back to
+            // the policy floor of 1.
+            let cpu = tokio::task::spawn_blocking(cpu_headroom_limit)
+                .await
+                .unwrap_or(1);
             let max_concurrent = resolve_dynamic_max_concurrent(
                 token_limit,
                 per_token_concurrency,

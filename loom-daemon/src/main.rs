@@ -1888,15 +1888,23 @@ fn print_status_json(
     let combined = serde_json::json!({
         "in_flight_count": report.in_flight.len(),
         "in_flight": report.in_flight,
+        // "Currently binding" vs "smallest ceiling" (#4031): the cap only binds
+        // once in-flight reaches it. `false` ⇒ the limiter is work availability,
+        // not any resource term, so scripted consumers don't misread the
+        // token/CPU ceiling as a bottleneck at low occupancy.
+        "capacity_bound": report.capacity_bound,
         "dynamic_cap": {
             "token_pool_size": report.token_pool_size,
             "disk_headroom": report.disk_headroom,
-            // CPU/load headroom term (#3978) — see the field docs on
-            // `DaemonStatusReport::cpu_headroom` for the pre-#3978 `0` ⇒
-            // "field absent" wire-compat convention.
+            // CPU headroom term (#3978; measured-idle signal #4031) — see the
+            // field docs on `DaemonStatusReport::cpu_headroom` for the pre-#3978
+            // `0` ⇒ "field absent" wire-compat convention.
             "cpu_headroom": report.cpu_headroom,
             "logical_cpus": report.logical_cpus,
             "loadavg_1m": report.loadavg_1m,
+            // Measured CPU idle fraction (#4031), the signal that replaced
+            // loadavg as the source of consumed cores. `null` until sampled.
+            "cpu_idle_fraction": report.cpu_idle_fraction,
             "configured_max": report.configured_max,
             "per_token_concurrency": report.per_token_concurrency.max(1),
             "token_axis_effective": rc.token_axis_limit.saturating_mul(report.per_token_concurrency.max(1)),
@@ -2159,26 +2167,45 @@ fn print_status_human(
         report.cpu_headroom,
         report.configured_max
     );
-    // CPU/load headroom detail (#3978 AC4: "status shows current
-    // loadavg/CPU headroom next to disk headroom"). `cpu_headroom == 0` with
-    // `logical_cpus == 0` means an older daemon (pre-#3978) never sent these
-    // fields — nothing to show.
+    // CPU headroom detail (#3978 AC4; measured-idle signal #4031). The signal
+    // chain is measured idle → loadavg → static capacity, so the line names
+    // which signal actually fed the term. `logical_cpus == 0` means an older
+    // daemon (pre-#3978) never sent these fields — nothing to show.
     if report.logical_cpus > 0 {
-        match report.loadavg_1m {
-            Some(load) => println!(
-                "  cpu headroom: {} concurrent-sweep slot(s) ({} logical cores, 1m loadavg {load:.2})",
-                report.cpu_headroom, report.logical_cpus
+        let basis = match (report.cpu_idle_fraction, report.loadavg_1m) {
+            // Preferred: measured CPU consumption (#4031). Show consumed cores so
+            // the operator can see the term is tracking real usage, not loadavg.
+            (Some(idle), _) => {
+                let consumed = report.logical_cpus as f64 * (1.0 - idle.clamp(0.0, 1.0));
+                format!(
+                    "{} logical cores, {:.0}% idle measured (≈{:.1} cores consumed)",
+                    report.logical_cpus,
+                    idle * 100.0,
+                    consumed
+                )
+            }
+            // Fallback: 1-minute load average (#3978 behavior) until an idle
+            // sample exists (e.g. the first Linux cross-tick delta not yet taken).
+            (None, Some(load)) => format!(
+                "{} logical cores, 1m loadavg {load:.2} (no idle sample yet — loadavg fallback)",
+                report.logical_cpus
             ),
-            None => println!(
-                "  cpu headroom: {} concurrent-sweep slot(s) ({} logical cores, loadavg \
-                 unavailable on this platform — static capacity only)",
-                report.cpu_headroom, report.logical_cpus
+            // Static capacity only: no CPU signal at all on this platform.
+            (None, None) => format!(
+                "{} logical cores, no CPU signal on this platform — static capacity only",
+                report.logical_cpus
             ),
-        }
+        };
+        println!("  cpu headroom: {} concurrent-sweep slot(s) ({basis})", report.cpu_headroom);
     }
 
     // Token-capacity backpressure section (#3902, source-unified in #3936).
     println!("\nToken capacity:");
+    // "Currently binding" vs "smallest ceiling" (#4031): the dynamic cap is the
+    // minimum of several ceilings, but a ceiling only *binds* once in-flight
+    // occupancy reaches it. Below the cap the limiter is work availability, not
+    // any resource term — so the token-bound diagnosis below is gated on this.
+    let capacity_bound = report.in_flight.len() >= rc.effective_cap;
     if rc.ranking_present {
         let src = if rc.source == "probe" {
             "live probe: loom-tokens check --json"
@@ -2202,7 +2229,18 @@ fn print_status_human(
                 report.capacity.healthy_accounts
             );
         }
-        if rc.token_bound {
+        if !capacity_bound {
+            // In-flight is below the cap: nothing is binding. Naming tokens (or
+            // any resource) as "the bottleneck" here is the #4031 defect — at,
+            // say, 1 in-flight against a cap of 7 the limiter is simply how much
+            // ready work exists. Suppress the token-bound diagnosis.
+            println!(
+                "  not capacity-bound ({} in flight, cap {} — the limiter is work availability, \
+                 not tokens/disk/CPU)",
+                report.in_flight.len(),
+                rc.effective_cap
+            );
+        } else if rc.token_bound {
             if rc.healthy == 0 {
                 println!(
                     "  token-bound: NO healthy accounts — new dispatch deferred until capacity \
@@ -2224,6 +2262,14 @@ fn print_status_human(
              health basis)",
             report.token_pool_size
         );
+        if !capacity_bound {
+            println!(
+                "  not capacity-bound ({} in flight, cap {} — the limiter is work availability, \
+                 not tokens/disk/CPU)",
+                report.in_flight.len(),
+                rc.effective_cap
+            );
+        }
     }
 
     // "Halted" (a completed gate run found main verified-red) and "not

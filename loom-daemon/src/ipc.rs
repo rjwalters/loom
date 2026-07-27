@@ -270,6 +270,13 @@ async fn handle_client(
         // filesystem reads for the dynamic-cap inputs); per-token usage is left
         // to the CLI (a slow network probe) so this handler never blocks.
         if let Request::DaemonStatus = request {
+            // Pre-warm the memoized CPU idle-fraction sample off the runtime
+            // (#4031): the macOS `iostat` read sleeps ~1s, so it must never run
+            // inline on a tokio worker. `build_daemon_status` then reads the
+            // freshly-cached value without blocking. A memoized-fresh sample
+            // (within the TTL) makes this a no-op. `spawn_blocking` join errors
+            // are non-fatal — the status falls back to the last cached value.
+            let _ = tokio::task::spawn_blocking(crate::cpu_headroom::refresh_cpu_util_cache).await;
             let report = build_daemon_status(&workspace_pool, &health_states, &fallback_root);
             let response = Response::DaemonStatus(report);
             let response_json = serde_json::to_string(&response)?;
@@ -521,16 +528,15 @@ pub fn build_daemon_status(
     let workspace_root = fallback_root;
     let token_pool_size = crate::tokens::token_pool_size(workspace_root);
     let disk_headroom = crate::disk_headroom::disk_headroom_limit(workspace_root);
-    // CPU/load headroom (#3978) — a host-level resource (not per-repo), read
-    // fresh on every status request just like disk headroom.
-    let logical_cpus = crate::cpu_headroom::logical_cpu_count();
-    let loadavg_1m = crate::cpu_headroom::read_loadavg_1m();
-    let cpu_headroom = crate::cpu_headroom::cpu_headroom(
-        logical_cpus,
-        loadavg_1m,
-        crate::cpu_headroom::utilization_target(),
-        crate::cpu_headroom::est_cores_per_sweep(),
-    );
+    // CPU headroom (#3978, measured-idle signal #4031) — a host-level resource
+    // (not per-repo). The snapshot reads the memoized idle fraction (never
+    // blocks; the caller pre-warms it via `spawn_blocking(refresh_cpu_util_cache)`
+    // before invoking `build_daemon_status`) plus a fast fresh loadavg read.
+    let cpu_snapshot = crate::cpu_headroom::cpu_headroom_snapshot();
+    let logical_cpus = cpu_snapshot.logical_cpus;
+    let loadavg_1m = cpu_snapshot.loadavg_1m;
+    let cpu_idle_fraction = cpu_snapshot.idle_fraction;
+    let cpu_headroom = cpu_snapshot.cpu_headroom;
     let wf_config = crate::work_finder::read_work_finder_config(workspace_root);
     let configured_max = crate::work_finder::resolve_max_concurrent_with_config(&wf_config);
     let per_token_concurrency = crate::work_finder::resolve_per_token_concurrency(&wf_config);
@@ -555,6 +561,11 @@ pub fn build_daemon_status(
     let token_bound = token_axis_effective <= disk_headroom
         && token_axis_effective <= cpu_headroom
         && token_axis_effective <= configured_max;
+    // "Currently binding" vs "smallest ceiling" (#4031): the dynamic cap is the
+    // minimum of several ceilings, but a ceiling only *binds* once in-flight
+    // occupancy reaches it. Below the cap the limiter is work availability, not
+    // any resource term — so gate the token-bound diagnosis on real occupancy.
+    let capacity_bound = in_flight.len() >= dynamic_cap;
     let capacity = crate::types::CapacityReport {
         ranking_present: ranking.is_some(),
         total_accounts: ranking.as_ref().map_or(token_pool_size, |r| r.total),
@@ -573,6 +584,8 @@ pub fn build_daemon_status(
         cpu_headroom,
         logical_cpus,
         loadavg_1m,
+        cpu_idle_fraction,
+        capacity_bound,
         configured_max,
         per_token_concurrency,
         dynamic_cap,
@@ -2658,6 +2671,8 @@ exit 0
             cpu_headroom: 6,
             logical_cpus: 8,
             loadavg_1m: Some(1.25),
+            cpu_idle_fraction: Some(0.90),
+            capacity_bound: false,
             configured_max: 5,
             per_token_concurrency: 2,
             dynamic_cap: 3,
@@ -2696,6 +2711,8 @@ exit 0
                 assert_eq!(r.cpu_headroom, 6);
                 assert_eq!(r.logical_cpus, 8);
                 assert_eq!(r.loadavg_1m, Some(1.25));
+                assert_eq!(r.cpu_idle_fraction, Some(0.90));
+                assert!(!r.capacity_bound);
                 assert_eq!(r.configured_max, 5);
                 assert_eq!(r.dynamic_cap, 3);
                 assert!(r.main_health_gate_halted);
@@ -2751,6 +2768,76 @@ exit 0
             report.main_health_gate_verdict_at, None,
             "absent main_health_gate_verdict_at (#4012) defaults to None (reads as pending)"
         );
+        // Absent pre-#4031 fields default rather than failing to parse: no
+        // measured idle fraction, and "not capacity-bound".
+        assert_eq!(report.cpu_idle_fraction, None);
+        assert!(!report.capacity_bound);
+    }
+
+    /// `build_daemon_status` sets `capacity_bound` only when in-flight occupancy
+    /// has actually reached the dynamic cap (#4031) — the "currently binding" vs
+    /// "smallest ceiling" distinction. With a real token pool (cap > 0) and no
+    /// in-flight sweeps, the cap is a ceiling but is NOT binding.
+    #[test]
+    #[serial_test::serial]
+    fn test_build_daemon_status_capacity_bound_tracks_occupancy() {
+        use crate::main_health_gate::WorkspaceHealthStates;
+        use crate::workspace_registry::REGISTRY_PATH_ENV;
+
+        let (sr, dir, _rec) = setup_sweep_registry_in_tempdir();
+        let root = dir.path().to_path_buf();
+        let empty_reg = dir.path().join("no-such-workspaces.json");
+        std::env::set_var(REGISTRY_PATH_ENV, &empty_reg);
+        let prev_shared = std::env::var("LOOM_SHARED_TOKENS_DIR").ok();
+        std::env::set_var("LOOM_SHARED_TOKENS_DIR", "");
+
+        // Provision a two-token pool so the dynamic cap is > 0 (a real ceiling).
+        let tokens_dir = root.join(".loom").join("tokens");
+        std::fs::create_dir_all(&tokens_dir).unwrap();
+        std::fs::write(tokens_dir.join("acct-a.token"), "sk-ant-oat01-a").unwrap();
+        std::fs::write(tokens_dir.join("acct-b.token"), "sk-ant-oat01-b").unwrap();
+
+        let pool = Arc::new(WorkspacePool::new(Arc::new(EventBus::new()), test_runtime_handle()));
+        pool.seed(root.clone(), sr.clone());
+        let health = WorkspaceHealthStates::new();
+
+        // No sweeps in flight, cap > 0 ⇒ the cap is a ceiling but NOT binding.
+        let report = build_daemon_status(&pool, &health, &root);
+        assert!(report.dynamic_cap > 0, "two tokens should yield a positive cap");
+        assert!(report.in_flight.is_empty());
+        assert!(
+            !report.capacity_bound,
+            "0 in-flight against cap {} must not be capacity-bound",
+            report.dynamic_cap
+        );
+
+        // Fill the cap: dispatch sweeps until in-flight reaches the cap.
+        let cap = report.dynamic_cap;
+        {
+            let mut reg = sr.lock().unwrap();
+            for i in 0..cap {
+                reg.dispatch(
+                    &crate::types::SweepKind::Issue(4031 + i as u32),
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+                .expect("dispatch");
+            }
+        }
+        let report = build_daemon_status(&pool, &health, &root);
+        assert_eq!(report.in_flight.len(), cap);
+        assert!(
+            report.capacity_bound,
+            "{cap} in-flight against cap {cap} must be capacity-bound",
+        );
+
+        if let Some(v) = prev_shared {
+            std::env::set_var("LOOM_SHARED_TOKENS_DIR", v);
+        } else {
+            std::env::remove_var("LOOM_SHARED_TOKENS_DIR");
+        }
     }
 
     /// `build_daemon_status` reflects the per-repo main-health halt flag and

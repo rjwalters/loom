@@ -19,31 +19,64 @@
 //!    of cores this host is willing to dedicate to sweep work (leaving
 //!    headroom for the OS, the daemon itself, and the build-gate's own
 //!    `cargo` invocations), and
-//! 2. **current load** — the 1-minute load average, subtracted from that
-//!    capacity so a host that is *already* busy (someone else's build, a
-//!    live sweep mid-compile) backs the term off reactively, not just from a
-//!    static core count.
+//! 2. **current CPU consumption** — `logical_cpus × (1 − idle_fraction)`,
+//!    the number of cores actually being *consumed* right now, subtracted
+//!    from that capacity so a host that is already busy (someone else's
+//!    build, a live sweep mid-compile) backs the term off reactively.
 //!
 //! Dividing the resulting headroom by an estimated per-sweep core cost
 //! (`est_cores_per_sweep` — a `cargo build`/`clippy` invocation typically
 //! parallelizes across several cores via rustc codegen units) yields how many
 //! more concurrent sweeps the host can start right now.
 //!
+//! # Why measured idle fraction, not the load average (#4031)
+//!
+//! The original #3978 term used the **1-minute load average** as a stand-in
+//! for consumed cores. On macOS that overstates consumption by ~1.5×: an
+//! observed idle-but-loaded host showed `load1m ≈ 6–7` alongside 76–86% CPU
+//! idle on 28 cores — only ~4–7 cores actually consumed. Load average counts
+//! threads in the runnable **and** uninterruptible-sleep states, and this
+//! daemon's workload is dominated by `claude` sessions **blocked on network
+//! I/O**, which inflate load without consuming a core. That pointed the
+//! feedback loop the wrong way: more concurrent sweeps → more blocked `claude`
+//! processes → higher load average → *lower* concurrency cap, even while the
+//! CPU sat idle. This module now derives `consumed_cores` from a **measured
+//! idle fraction** (actual CPU consumption), per-platform, and keeps the load
+//! average only as a fail-open fallback.
+//!
 //! # Why shell out / read `/proc` instead of a `sysinfo`-style crate
 //!
 //! Matches the precedent set by [`crate::disk_headroom`] (shell out to `df`)
 //! and [`crate::worktree_root`]: no new crate dependency, OS-native data
 //! sources kept small and directly testable via pure parsing functions
-//! ([`parse_proc_loadavg`], [`parse_macos_loadavg`]) split from the I/O.
-//! Logical CPU count uses `std::thread::available_parallelism` (stdlib, no
-//! dependency at all).
+//! ([`parse_proc_loadavg`], [`parse_macos_loadavg`], [`parse_proc_stat_cpu`],
+//! [`parse_iostat_cpu`]) split from the I/O. Logical CPU count uses
+//! `std::thread::available_parallelism` (stdlib, no dependency at all).
+//!
+//! ## Per-platform idle measurement, and the blocking-call hazard
+//!
+//! - **Linux** deltas two reads of the aggregate `cpu` line in `/proc/stat`
+//!   (`idle + iowait` vs total). The previous cumulative sample is memoized in
+//!   a process-global cache and deltaed **across ticks**, so nothing ever
+//!   sleeps.
+//! - **macOS** shells to `iostat -c 2 -w 1 -n 0`: the **second** data line is
+//!   a genuine 1-second delta (the first is cumulative since boot and must not
+//!   be used), `id` is idle %. That 1-second wait would block a tokio runtime
+//!   worker if called inline from a `ticker.tick().await` loop, so the read is
+//!   moved to `spawn_blocking` at the call sites and its result is **memoized**
+//!   behind a short TTL ([`CPU_UTIL_MEMO_TTL`]). The memoized cache is shared
+//!   by the work-finder loops and the synchronous `ipc.rs` status path, so a
+//!   status request and a work-finder tick never each pay the full second.
 //!
 //! # Fail-open, not fail-closed
 //!
-//! A load-average read failure (unsupported platform, missing `sysctl`,
-//! unreadable `/proc/loadavg`) returns `None` and this module falls back to
-//! the **static** capacity term (no load subtracted) rather than treating the
-//! read failure as "host fully loaded". This mirrors
+//! The signal chain is **measured idle fraction → 1-minute load average →
+//! static capacity**, each stage falling forward to the next when its input is
+//! unavailable. An unreadable utilization signal (no `/proc/stat`, missing
+//! `iostat`, unsupported platform, or simply no delta sampled yet) falls back
+//! to the load average (#3978's behavior); an unreadable load average in turn
+//! falls back to the **static** capacity term (no consumption subtracted)
+//! rather than treating the read failure as "host fully loaded". This mirrors
 //! [`crate::capacity::token_axis_limit`]'s policy of falling back to the
 //! optimistic basis (the raw pool) when no ranking data exists — the absence
 //! of a signal is not evidence of unhealthiness. The term itself is floored
@@ -54,9 +87,12 @@
 //! floor to zero (genuine "no room"/"no healthy accounts" signals); CPU is
 //! deliberately a soft backoff, not a hard gate.
 
-// `Command`/`Stdio` back only the macOS `sysctl` read path — cfg-gated so a
-// Linux build (which reads `/proc/loadavg` directly, no subprocess) doesn't
-// warn on an unused import under `-D warnings`.
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
+
+// `Command`/`Stdio` back only the macOS `sysctl` / `iostat` read paths —
+// cfg-gated so a Linux build (which reads `/proc/*` directly, no subprocess)
+// doesn't warn on an unused import under `-D warnings`.
 #[cfg(target_os = "macos")]
 use std::process::{Command, Stdio};
 
@@ -177,44 +213,316 @@ pub fn read_loadavg_1m() -> Option<f64> {
 }
 
 // ============================================================================
+// CPU utilization — measured idle fraction (#4031), OS-specific read, pure parse
+// ============================================================================
+
+/// A cumulative CPU-time sample from Linux `/proc/stat`'s aggregate `cpu`
+/// line. Deltaed against a previous sample to derive the idle fraction over
+/// the interval between two reads (no sleep required — see [`CpuUtilState`]).
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProcStatCpu {
+    /// Idle jiffies (`idle + iowait`) accumulated since boot.
+    pub idle: u64,
+    /// Total jiffies across every state accumulated since boot.
+    pub total: u64,
+}
+
+#[cfg(target_os = "linux")]
+impl ProcStatCpu {
+    /// The idle fraction over the interval `prev → self`, or `None` when the
+    /// total-jiffies delta is zero (two reads too close together / counter
+    /// reset). `saturating_sub` guards a wrapped/reset counter from panicking.
+    #[must_use]
+    pub fn idle_fraction_since(&self, prev: &ProcStatCpu) -> Option<f64> {
+        let total_delta = self.total.saturating_sub(prev.total);
+        if total_delta == 0 {
+            return None;
+        }
+        let idle_delta = self.idle.saturating_sub(prev.idle);
+        Some(idle_delta as f64 / total_delta as f64)
+    }
+}
+
+/// Parse the aggregate `cpu` line from Linux `/proc/stat` contents into a
+/// cumulative [`ProcStatCpu`] sample. The line is
+/// `"cpu  user nice system idle iowait irq softirq steal guest guest_nice"`
+/// (jiffies since boot); idle counts `idle + iowait`, total sums every field.
+/// Returns `None` when no aggregate `cpu ` line is present or it is malformed.
+#[cfg(target_os = "linux")]
+#[must_use]
+pub fn parse_proc_stat_cpu(contents: &str) -> Option<ProcStatCpu> {
+    // The aggregate line is the one whose first token is exactly "cpu" (the
+    // per-core lines are "cpu0", "cpu1", … and must be skipped).
+    let line = contents
+        .lines()
+        .find(|l| l.split_whitespace().next() == Some("cpu"))?;
+    let fields: Vec<u64> = line
+        .split_whitespace()
+        .skip(1)
+        .map(str::parse::<u64>)
+        .collect::<Result<Vec<_>, _>>()
+        .ok()?;
+    // Need at least user..iowait (indices 0..=4) to compute idle+iowait.
+    if fields.len() < 5 {
+        return None;
+    }
+    let idle = fields[3] + fields[4]; // idle + iowait
+    let total: u64 = fields.iter().sum();
+    Some(ProcStatCpu { idle, total })
+}
+
+/// Parse the idle fraction (`0.0..=1.0`) from macOS `iostat -c 2 -w 1 -n 0`
+/// output. Two CPU data lines are emitted: the **first** is cumulative since
+/// boot and must be ignored; the **second** is a genuine 1-second delta. Each
+/// data line's trailing six columns are `us sy id 1m 5m 15m`, so `id` (idle %)
+/// is the fourth-from-last field — a position that holds whether or not disk
+/// columns precede it. Returns `None` on malformed input or fewer than two
+/// data lines.
+#[must_use]
+pub fn parse_iostat_cpu(output: &str) -> Option<f64> {
+    let mut data_lines = output.lines().filter_map(|line| {
+        let tokens: Vec<&str> = line.split_whitespace().collect();
+        if tokens.len() < 6 {
+            return None;
+        }
+        // A data line's last six columns (`us sy id 1m 5m 15m`) are all numeric;
+        // header lines ("us sy id", "cpu    load average") are not.
+        let tail = &tokens[tokens.len() - 6..];
+        if tail.iter().all(|t| t.parse::<f64>().is_ok()) {
+            tokens[tokens.len() - 4].parse::<f64>().ok()
+        } else {
+            None
+        }
+    });
+    // Discard the since-boot cumulative line; use the 1-second delta line.
+    data_lines.next()?;
+    let idle_percent = data_lines.next()?;
+    if (0.0..=100.0).contains(&idle_percent) {
+        Some(idle_percent / 100.0)
+    } else {
+        None
+    }
+}
+
+/// Read the aggregate `/proc/stat` CPU sample on Linux.
+#[cfg(target_os = "linux")]
+#[must_use]
+fn read_proc_stat_cpu() -> Option<ProcStatCpu> {
+    let contents = std::fs::read_to_string("/proc/stat").ok()?;
+    parse_proc_stat_cpu(&contents)
+}
+
+/// Read the current idle fraction on macOS via `iostat -c 2 -w 1 -n 0`.
+///
+/// **Blocks for ~1 second** (the sampling window). Callers on the tokio
+/// runtime MUST route this through `spawn_blocking` + the memoized cache
+/// ([`refresh_cpu_util_cache`]); never call it inline from an async task.
+#[cfg(target_os = "macos")]
+#[must_use]
+fn read_iostat_idle_fraction() -> Option<f64> {
+    let output = Command::new("iostat")
+        .args(["-c", "2", "-w", "1", "-n", "0"])
+        .stderr(Stdio::null())
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    parse_iostat_cpu(&String::from_utf8_lossy(&output.stdout))
+}
+
+// ============================================================================
+// Memoized utilization cache (#4031)
+// ============================================================================
+
+/// TTL for the memoized idle-fraction sample. A read that would sleep (macOS
+/// `iostat`) is taken at most once per this window; within it, both a status
+/// request and a work-finder tick reuse the cached value. Also bounds how
+/// often the Linux cross-tick `/proc/stat` delta is re-sampled.
+pub const CPU_UTIL_MEMO_TTL: Duration = Duration::from_secs(10);
+
+/// Process-global memoized CPU-utilization state.
+struct CpuUtilState {
+    /// Last successfully measured idle fraction (`0.0..=1.0`), or `None` until
+    /// one has been computed (falls back to loadavg meanwhile).
+    idle_fraction: Option<f64>,
+    /// When the cache was last refreshed (success or attempt), for the TTL gate.
+    updated_at: Option<Instant>,
+    /// Linux only: the previous cumulative `/proc/stat` sample, deltaed across
+    /// refreshes to derive `idle_fraction` without ever sleeping.
+    #[cfg(target_os = "linux")]
+    prev: Option<ProcStatCpu>,
+}
+
+impl CpuUtilState {
+    const fn new() -> Self {
+        CpuUtilState {
+            idle_fraction: None,
+            updated_at: None,
+            #[cfg(target_os = "linux")]
+            prev: None,
+        }
+    }
+}
+
+static CPU_UTIL_STATE: Mutex<CpuUtilState> = Mutex::new(CpuUtilState::new());
+
+/// Refresh the memoized idle-fraction sample.
+///
+/// A no-op when a sample is younger than [`CPU_UTIL_MEMO_TTL`] (this is the
+/// memoization that keeps a burst of status requests + work-finder ticks from
+/// each paying the macOS 1-second `iostat`). Otherwise:
+///
+/// - **Linux** reads `/proc/stat` and deltas it against the previous cached
+///   sample (no sleep). The first refresh only seeds the previous sample — the
+///   idle fraction stays `None` (loadavg fallback) until a second refresh has a
+///   delta to compute.
+/// - **macOS** runs `iostat` (~1s wall) and caches the parsed idle fraction.
+///
+/// **Blocks on macOS.** Call from `spawn_blocking`, never inline on the tokio
+/// runtime. Cheap and non-sleeping on Linux, but still routed through
+/// `spawn_blocking` at the async call sites for symmetry.
+pub fn refresh_cpu_util_cache() {
+    let mut st = CPU_UTIL_STATE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(at) = st.updated_at {
+        if at.elapsed() < CPU_UTIL_MEMO_TTL {
+            return;
+        }
+    }
+    #[cfg(target_os = "linux")]
+    {
+        if let Some(cur) = read_proc_stat_cpu() {
+            if let Some(prev) = st.prev {
+                if let Some(frac) = cur.idle_fraction_since(&prev) {
+                    st.idle_fraction = Some(frac);
+                }
+            }
+            st.prev = Some(cur);
+            st.updated_at = Some(Instant::now());
+        }
+    }
+    #[cfg(target_os = "macos")]
+    {
+        if let Some(frac) = read_iostat_idle_fraction() {
+            st.idle_fraction = Some(frac);
+        }
+        st.updated_at = Some(Instant::now());
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        st.updated_at = Some(Instant::now());
+    }
+}
+
+/// The last memoized idle fraction, or `None` when none has been sampled yet.
+/// Never blocks — a pure cache read, safe on the tokio runtime and from the
+/// synchronous `ipc.rs` status path.
+#[must_use]
+pub fn cached_cpu_idle_fraction() -> Option<f64> {
+    CPU_UTIL_STATE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .idle_fraction
+}
+
+// ============================================================================
 // The pure headroom term
 // ============================================================================
 
-/// Compute the CPU/load headroom concurrency term.
+/// Compute the CPU headroom concurrency term.
 ///
 /// `capacity = ncpu × utilization_target` is the number of cores this host is
-/// willing to dedicate to sweep work. When a current 1-minute load average is
-/// available it is subtracted from that capacity (floored at `0.0` — an
-/// already-saturated host contributes no headroom rather than going
-/// negative); when unavailable, the term falls back to the static capacity
-/// unadjusted (fail-open — see module docs). The resulting headroom divided
-/// by `est_cores_per_sweep` gives how many additional concurrent sweeps the
-/// host can currently absorb, floored to a minimum of `1` so a single noisy
-/// or mis-calibrated CPU reading can never by itself wedge the dynamic cap to
+/// willing to dedicate to sweep work. From it we subtract the cores currently
+/// **consumed**, resolved via the fail-open chain (see module docs):
+///
+/// 1. a measured `idle_fraction` → `consumed = ncpu × (1 − idle_fraction)`
+///    (actual CPU consumption — the #4031 fix), else
+/// 2. the 1-minute `loadavg_1m` as a proxy (#3978's behavior), else
+/// 3. nothing — the static capacity, unadjusted.
+///
+/// The consumption is floored at `0.0` (an already-saturated host contributes
+/// no headroom rather than going negative). The resulting headroom divided by
+/// `est_cores_per_sweep` gives how many additional concurrent sweeps the host
+/// can currently absorb, floored to a minimum of `1` so a single noisy or
+/// mis-calibrated CPU reading can never by itself wedge the dynamic cap to
 /// zero (mirrors the token axis's "never a halt" floor, #3902).
 #[must_use]
 pub fn cpu_headroom(
     ncpu: usize,
+    idle_fraction: Option<f64>,
     loadavg_1m: Option<f64>,
     utilization_target: f64,
     est_cores_per_sweep: f64,
 ) -> usize {
     let capacity = ncpu as f64 * utilization_target;
-    let available = loadavg_1m.map_or(capacity, |load| (capacity - load).max(0.0));
+    // Prefer the measured idle fraction; fall back to load average; else no
+    // consumption term at all (static capacity).
+    let consumed = match idle_fraction {
+        Some(idle) => Some(ncpu as f64 * (1.0 - idle.clamp(0.0, 1.0))),
+        None => loadavg_1m,
+    };
+    let available = consumed.map_or(capacity, |c| (capacity - c).max(0.0));
     let term = (available / est_cores_per_sweep.max(f64::MIN_POSITIVE)).floor();
-    // NaN/negative-infinity can't occur here (both operands are finite and
+    // NaN/negative-infinity can't occur here (all operands are finite and
     // `est_cores_per_sweep` is clamped away from 0), but `max(1.0)` also
     // guards the float→usize cast below against any residual edge case.
     term.max(1.0) as usize
 }
 
-/// Resolve the CPU/load headroom term end-to-end from live host inputs
-/// ([`logical_cpu_count`], [`read_loadavg_1m`]) and env-configured knobs
-/// ([`utilization_target`], [`est_cores_per_sweep`]).
+/// A point-in-time snapshot of the inputs feeding [`cpu_headroom`], for the
+/// status surface (`ipc.rs` / `loom-daemon status`). Reads the memoized idle
+/// fraction (no blocking) plus a fresh, fast load-average read.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CpuHeadroomSnapshot {
+    /// Host logical CPU count.
+    pub logical_cpus: usize,
+    /// Measured idle fraction (`0.0..=1.0`) if one has been sampled, else `None`.
+    pub idle_fraction: Option<f64>,
+    /// Current 1-minute load average if available, else `None`.
+    pub loadavg_1m: Option<f64>,
+    /// The resulting headroom term (concurrent-sweep slots).
+    pub cpu_headroom: usize,
+}
+
+/// Build a [`CpuHeadroomSnapshot`] from the memoized idle fraction, a fresh
+/// load-average read, and the env-configured knobs. **Never blocks** — safe on
+/// the tokio runtime and from the synchronous status path. Pre-warm the idle
+/// cache with `spawn_blocking(refresh_cpu_util_cache)` for a fresh measurement.
+#[must_use]
+pub fn cpu_headroom_snapshot() -> CpuHeadroomSnapshot {
+    let logical_cpus = logical_cpu_count();
+    let idle_fraction = cached_cpu_idle_fraction();
+    let loadavg_1m = read_loadavg_1m();
+    let cpu_headroom = cpu_headroom(
+        logical_cpus,
+        idle_fraction,
+        loadavg_1m,
+        utilization_target(),
+        est_cores_per_sweep(),
+    );
+    CpuHeadroomSnapshot {
+        logical_cpus,
+        idle_fraction,
+        loadavg_1m,
+        cpu_headroom,
+    }
+}
+
+/// Resolve the CPU headroom term end-to-end from live host inputs, refreshing
+/// the memoized idle-fraction sample first.
+///
+/// **May block** (~1s on macOS via `iostat`; fast, non-sleeping on Linux). The
+/// async work-finder loops call this through `spawn_blocking` so the macOS
+/// sampling window never blocks a tokio runtime worker.
 #[must_use]
 pub fn cpu_headroom_limit() -> usize {
+    refresh_cpu_util_cache();
     cpu_headroom(
         logical_cpu_count(),
+        cached_cpu_idle_fraction(),
         read_loadavg_1m(),
         utilization_target(),
         est_cores_per_sweep(),
@@ -261,50 +569,158 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
-    // cpu_headroom — pure math
+    // parse_proc_stat_cpu (Linux)
+    // ------------------------------------------------------------------
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn parse_proc_stat_cpu_sums_total_and_idle_plus_iowait() {
+        // cpu  user nice system idle iowait irq softirq steal guest guest_nice
+        let s = "cpu  100 20 30 700 40 5 5 0 0 0\ncpu0 50 10 15 350 20 2 3 0 0 0\n";
+        let sample = parse_proc_stat_cpu(s).unwrap();
+        assert_eq!(sample.idle, 740, "idle = idle 700 + iowait 40");
+        assert_eq!(sample.total, 100 + 20 + 30 + 700 + 40 + 5 + 5);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn parse_proc_stat_cpu_skips_per_core_lines_and_rejects_malformed() {
+        // A leading per-core line must not be mistaken for the aggregate.
+        let s = "cpu0 1 2 3 4 5\ncpu 10 20 30 40 50\n";
+        assert_eq!(parse_proc_stat_cpu(s).unwrap().idle, 90); // idle 40 + iowait 50
+        assert_eq!(parse_proc_stat_cpu(""), None);
+        assert_eq!(parse_proc_stat_cpu("intr 1 2 3\n"), None, "no aggregate cpu line");
+        assert_eq!(parse_proc_stat_cpu("cpu 1 2\n"), None, "too few fields for idle+iowait");
+        assert_eq!(parse_proc_stat_cpu("cpu a b c d e\n"), None, "non-numeric fields");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn proc_stat_idle_fraction_over_interval() {
+        let prev = ProcStatCpu {
+            idle: 700,
+            total: 1000,
+        };
+        // Over the interval, total advanced 100 jiffies, idle 80 → 80% idle.
+        let cur = ProcStatCpu {
+            idle: 780,
+            total: 1100,
+        };
+        let frac = cur.idle_fraction_since(&prev).unwrap();
+        assert!((frac - 0.80).abs() < 1e-9, "got {frac}");
+        // Zero total delta (or a reset counter) yields None, not a divide-by-zero.
+        assert_eq!(cur.idle_fraction_since(&cur), None);
+    }
+
+    // ------------------------------------------------------------------
+    // parse_iostat_cpu (macOS) — must use the SECOND (delta) data line
     // ------------------------------------------------------------------
 
     #[test]
-    fn cpu_headroom_static_capacity_when_no_load_reading() {
-        // 8 cores, 75% target, no load reading -> capacity 6.0 / 2.0 cores per
-        // sweep = 3.
-        assert_eq!(cpu_headroom(8, None, 0.75, 2.0), 3);
+    fn parse_iostat_cpu_uses_second_delta_line_not_first_since_boot() {
+        // `iostat -c 2 -w 1 -n 0`: header, then a since-boot line (id 83) and a
+        // 1-second delta line (id 50). Using the first line would report 0.83 —
+        // this test FAILS if the parser reads the since-boot line.
+        let out = "      cpu    load average\n \
+                   us sy id   1m   5m   15m\n  \
+                    8  9 83  3.37 4.02 4.64\n \
+                   40 10 50  3.40 4.02 4.64\n";
+        let idle = parse_iostat_cpu(out).unwrap();
+        assert!((idle - 0.50).abs() < 1e-9, "must use the delta line (id 50), got {idle}");
     }
 
     #[test]
-    fn cpu_headroom_subtracts_current_load() {
-        // 8 cores, 75% target -> capacity 6.0. Load 4.0 already in use ->
-        // 2.0 available / 2.0 per sweep = 1.
-        assert_eq!(cpu_headroom(8, Some(4.0), 0.75, 2.0), 1);
+    fn parse_iostat_cpu_tolerates_leading_disk_columns() {
+        // Without `-n 0`, disk columns precede the CPU columns. `id` is still the
+        // fourth-from-last field, so parsing from the right is disk-count-agnostic.
+        let out = "              disk0       cpu    load average\n    \
+                   KB/t  tps  MB/s  us sy id   1m   5m   15m\n   \
+                   13.45 4312 56.62   8  9 83  2.99 4.02 4.66\n   \
+                   45.53  857 38.09   5  2 93  3.07 4.02 4.66\n";
+        let idle = parse_iostat_cpu(out).unwrap();
+        assert!((idle - 0.93).abs() < 1e-9, "got {idle}");
     }
 
     #[test]
-    fn cpu_headroom_floors_at_one_when_load_exceeds_capacity() {
-        // Host already saturated (load 20 on an 8-core/75% = 6.0 capacity
-        // host) -> available would go negative, clamped to 0, but the term
-        // itself floors at 1 (soft backoff, never a hard halt).
-        assert_eq!(cpu_headroom(8, Some(20.0), 0.75, 2.0), 1);
+    fn parse_iostat_cpu_malformed_is_none() {
+        assert_eq!(parse_iostat_cpu(""), None);
+        assert_eq!(
+            parse_iostat_cpu("cpu load average\nus sy id 1m 5m 15m\n"),
+            None,
+            "no data lines"
+        );
+        // Only one data line (no delta line to use).
+        assert_eq!(parse_iostat_cpu("us sy id 1m 5m 15m\n8 9 83 3.0 4.0 4.6\n"), None);
+    }
+
+    // ------------------------------------------------------------------
+    // cpu_headroom — pure math (signature: ncpu, idle, loadavg, target, est)
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn cpu_headroom_static_capacity_when_no_signal_at_all() {
+        // 8 cores, 75% target, no idle + no load reading -> capacity 6.0 / 2.0
+        // cores per sweep = 3.
+        assert_eq!(cpu_headroom(8, None, None, 0.75, 2.0), 3);
+    }
+
+    #[test]
+    fn cpu_headroom_subtracts_current_load_when_no_idle_measurement() {
+        // 8 cores, 75% target -> capacity 6.0. No idle measurement; load 4.0 in
+        // use -> 2.0 available / 2.0 per sweep = 1 (the #3978 fallback path).
+        assert_eq!(cpu_headroom(8, None, Some(4.0), 0.75, 2.0), 1);
+    }
+
+    #[test]
+    fn cpu_headroom_prefers_measured_idle_over_loadavg() {
+        // The #4031 core: 28 cores, 75% target -> capacity 21.0. 85% idle means
+        // consumed = 28 × 0.15 = 4.2 cores; loadavg reads an inflated 6.0. The
+        // term must reflect the idle reading (21 - 4.2 = 16.8 / 2.0 = 8), NOT the
+        // load reading (21 - 6.0 = 15.0 / 2.0 = 7).
+        assert_eq!(cpu_headroom(28, Some(0.85), Some(6.0), 0.75, 2.0), 8);
+        // And it must ignore loadavg entirely when idle is present.
+        assert_eq!(
+            cpu_headroom(28, Some(0.85), None, 0.75, 2.0),
+            cpu_headroom(28, Some(0.85), Some(999.0), 0.75, 2.0),
+            "loadavg must not influence the term once a measured idle exists"
+        );
+    }
+
+    #[test]
+    fn cpu_headroom_floors_at_one_under_a_saturated_idle_reading() {
+        // 0% idle on an 8-core/75% host -> consumed 8.0 > capacity 6.0 ->
+        // available clamps to 0, but the term floors at 1 (soft backoff).
+        assert_eq!(cpu_headroom(8, Some(0.0), None, 0.75, 2.0), 1);
+        // Same floor via the loadavg path when load exceeds capacity.
+        assert_eq!(cpu_headroom(8, None, Some(20.0), 0.75, 2.0), 1);
     }
 
     #[test]
     fn cpu_headroom_scales_with_more_cores() {
-        // 32 cores, 75% target, no load -> 24.0 / 2.0 = 12.
-        assert_eq!(cpu_headroom(32, None, 0.75, 2.0), 12);
+        // 32 cores, 75% target, no signal -> 24.0 / 2.0 = 12.
+        assert_eq!(cpu_headroom(32, None, None, 0.75, 2.0), 12);
     }
 
     #[test]
     fn cpu_headroom_never_zero_even_on_a_single_core_host() {
         // 1 core, 75% target -> capacity 0.75, / 2.0 per sweep = 0.375 ->
-        // floors to 0 mathematically, but the `max(1.0)` policy floor kicks
-        // in.
-        assert_eq!(cpu_headroom(1, None, 0.75, 2.0), 1);
+        // floors to 0 mathematically, but the `max(1.0)` policy floor kicks in.
+        assert_eq!(cpu_headroom(1, None, None, 0.75, 2.0), 1);
     }
 
     #[test]
     fn cpu_headroom_est_cores_per_sweep_scales_the_denominator() {
         // 16 cores, 100% target -> capacity 16.0. A heavier 4.0-cores-per-
         // sweep estimate -> 4.
-        assert_eq!(cpu_headroom(16, None, 1.0, 4.0), 4);
+        assert_eq!(cpu_headroom(16, None, None, 1.0, 4.0), 4);
+    }
+
+    #[test]
+    fn cpu_headroom_idle_fraction_is_clamped() {
+        // A nonsense idle fraction > 1 or < 0 can't push consumed negative /
+        // above ncpu enough to break the term (defensive clamp).
+        assert_eq!(cpu_headroom(8, Some(1.5), None, 0.75, 2.0), 3, "idle>1 clamps to full idle");
+        assert_eq!(cpu_headroom(8, Some(-0.5), None, 0.75, 2.0), 1, "idle<0 clamps to fully busy");
     }
 
     // ------------------------------------------------------------------
