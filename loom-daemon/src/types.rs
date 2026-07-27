@@ -762,7 +762,12 @@ pub struct DaemonStatusReport {
     /// Whether autonomous dispatch is currently halted by the reactive
     /// main-health gate (#3812). `true` means a red `main` has paused new
     /// dispatch (in-flight sweeps keep running); `false` means dispatch is
-    /// allowed. Always `false` when the gate loop is not enabled.
+    /// allowed — which covers three distinct conditions the gate loop cannot
+    /// tell apart from this flag alone: the gate is disabled, the gate is
+    /// enabled but has not completed a first evaluation yet ("pending"), or
+    /// the gate's last completed run verified `main` green ("clear"). See
+    /// [`Self::main_health_gate_enabled`] and [`Self::main_health_gate_verdict_at`]
+    /// (#4012) for the fields that disambiguate those three.
     pub main_health_gate_halted: bool,
     /// Whether the gate's most recent tick for this workspace was
     /// `Unevaluated` rather than a completed Green/Red run — "not evaluated",
@@ -783,6 +788,32 @@ pub struct DaemonStatusReport {
     /// `#[serde(default)]` keeps pre-#3974 wire data compatible.
     #[serde(default)]
     pub main_health_gate_not_evaluated_reason: Option<String>,
+    /// Whether the reactive main-health gate is actually enabled for this
+    /// workspace root (#4012) — `resolve_enabled(..)` **and** a usable
+    /// `buildGate` block, so a root that is nominally `enabled: true` but has
+    /// no command configured (the gate loop treats that as always-green,
+    /// `main_health_gate.rs`) also reports `Some(false)` here. `Some(true)` /
+    /// `Some(false)` are resolved daemon-side (reading the daemon's own
+    /// environment and `.loom/config.json`, never the CLI client's); `None`
+    /// only for a pre-#4012 wire payload that never reported this field.
+    /// Deliberately `Option<bool>` rather than `bool`: a legacy payload
+    /// deserializing a missing `bool` field defaults to `false`, which would
+    /// misreport an older, perfectly healthy daemon as "gate disabled" —
+    /// `None` honestly means "unknown, older daemon" instead. `#[serde(default)]`
+    /// keeps pre-#4012 wire data compatible.
+    #[serde(default)]
+    pub main_health_gate_enabled: Option<bool>,
+    /// Wall-clock time of the most recent **completed** (Green/Red) gate
+    /// verdict for this workspace root (#4012), or `None` when no verdict has
+    /// landed yet this daemon process — the disambiguator between "pending"
+    /// (enabled, no verdict yet) and "clear" (verified green), and the
+    /// recency evidence a `clear` reading otherwise lacks. Stamped only on a
+    /// completed run, never on the #3984 SHA-memo skip path (a skip proves
+    /// nothing new). `#[serde(default)]` keeps pre-#4012 wire data compatible
+    /// (an absent field parses as `None`, which reads as "pending" — the
+    /// conservative choice for data an older daemon never populated).
+    #[serde(default)]
+    pub main_health_gate_verdict_at: Option<DateTime<Utc>>,
     /// Token-capacity backpressure snapshot (#3902): account health derived from
     /// the rotation ranking (`.loom/tokens/.ranking`) and whether the token axis
     /// is the binding constraint on the dynamic cap. `#[serde(default)]` keeps
@@ -846,6 +877,18 @@ pub struct RepoStatus {
     /// [`DaemonStatusReport::main_health_gate_not_evaluated_reason`].
     #[serde(default)]
     pub health_gate_not_evaluated_reason: Option<String>,
+    /// Whether this repo's gate is actually enabled (#4012). See
+    /// [`DaemonStatusReport::main_health_gate_enabled`] for the `Option<bool>`
+    /// rationale and the "enabled but no usable `buildGate` block ⇒ `false`"
+    /// rule. `#[serde(default)]` keeps pre-#4012 wire data compatible.
+    #[serde(default)]
+    pub health_gate_enabled: Option<bool>,
+    /// Wall-clock time of this repo's most recent completed gate verdict
+    /// (#4012), or `None` before the first one this process. See
+    /// [`DaemonStatusReport::main_health_gate_verdict_at`]. `#[serde(default)]`
+    /// keeps pre-#4012 wire data compatible.
+    #[serde(default)]
+    pub health_gate_verdict_at: Option<DateTime<Utc>>,
 }
 
 /// The token-capacity section of [`DaemonStatusReport`] (#3902).
