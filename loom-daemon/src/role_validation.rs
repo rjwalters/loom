@@ -140,8 +140,21 @@ struct RoleConfig {
 /// Parses the config and extracts role names from terminal configurations.
 /// Role names are derived from roleFile values (e.g., "judge.md" -> "judge").
 pub fn extract_roles_from_config(config_json: &str) -> Result<Vec<String>, String> {
-    let config: LoomConfig =
+    let config: serde_json::Value =
         serde_json::from_str(config_json).map_err(|e| format!("Failed to parse config: {e}"))?;
+    extract_roles_from_value(&config)
+}
+
+/// Extract role names from an already-resolved config `Value` (#4059).
+///
+/// The `Value`-based sibling of [`extract_roles_from_config`]: the validate
+/// command now resolves the effective config through the tier chain
+/// (`config_resolver::resolve_effective_config`) and hands the resulting
+/// `serde_json::Value` here directly, rather than round-tripping through a file
+/// read + string parse.
+pub fn extract_roles_from_value(config: &serde_json::Value) -> Result<Vec<String>, String> {
+    let config: LoomConfig = serde_json::from_value(config.clone())
+        .map_err(|e| format!("Failed to parse config: {e}"))?;
 
     let mut roles = Vec::new();
 
@@ -185,18 +198,47 @@ pub fn validate_role_completeness(config_json: &str, mode: ValidationMode) -> Va
         };
     }
 
-    let configured_roles = match extract_roles_from_config(config_json) {
-        Ok(roles) => roles,
-        Err(e) => {
-            return ValidationResult {
-                valid: false,
-                configured_roles: Vec::new(),
-                warnings: Vec::new(),
-                errors: vec![e],
-            };
-        }
-    };
+    match extract_roles_from_config(config_json) {
+        Ok(roles) => check_role_dependencies(roles),
+        Err(e) => ValidationResult {
+            valid: false,
+            configured_roles: Vec::new(),
+            warnings: Vec::new(),
+            errors: vec![e],
+        },
+    }
+}
 
+/// Validate role completeness from an already-resolved config `Value` (#4059).
+///
+/// The `Value`-based entry point used by `handle_validate_command` after it
+/// resolves the effective config through the tier chain. Behaviorally identical
+/// to [`validate_role_completeness`]; it just skips the file-read + string-parse
+/// round-trip.
+#[must_use]
+pub fn validate_from_config(config: &serde_json::Value, mode: ValidationMode) -> ValidationResult {
+    if mode == ValidationMode::Ignore {
+        return ValidationResult {
+            valid: true,
+            configured_roles: Vec::new(),
+            warnings: Vec::new(),
+            errors: Vec::new(),
+        };
+    }
+
+    match extract_roles_from_value(config) {
+        Ok(roles) => check_role_dependencies(roles),
+        Err(e) => ValidationResult {
+            valid: false,
+            configured_roles: Vec::new(),
+            warnings: Vec::new(),
+            errors: vec![e],
+        },
+    }
+}
+
+/// Shared dependency-satisfaction check over an extracted role set.
+fn check_role_dependencies(configured_roles: Vec<String>) -> ValidationResult {
     let role_set: HashSet<&str> = configured_roles.iter().map(String::as_str).collect();
     let mut warnings = Vec::new();
 
@@ -221,7 +263,10 @@ pub fn validate_role_completeness(config_json: &str, mode: ValidationMode) -> Va
 
 /// Validate role completeness from a config file path
 ///
-/// Convenience function that reads the config file and validates it.
+/// Convenience function that reads the config file and validates it. Retained
+/// as a thin wrapper for backward compatibility (#4059); the production
+/// validate command now resolves through the config tier chain and calls
+/// [`validate_from_config`] instead.
 pub fn validate_from_file(
     config_path: &std::path::Path,
     mode: ValidationMode,
@@ -359,6 +404,62 @@ mod tests {
         assert!(result.valid);
         assert!(result.configured_roles.is_empty());
         assert!(result.warnings.is_empty());
+    }
+
+    /// #4059: `validate_from_config` accepts an already-resolved `Value` and is
+    /// behaviorally identical to the string-based path.
+    #[test]
+    fn test_validate_from_config_value() {
+        let config = serde_json::json!({
+            "terminals": [
+                {"roleConfig": {"roleFile": "judge.md"}},
+                {"roleConfig": {"roleFile": "champion.md"}},
+            ]
+        });
+        let result = validate_from_config(&config, ValidationMode::Warn);
+        assert!(result.valid);
+        // judge and champion both depend on doctor, which is absent.
+        assert!(!result.warnings.is_empty());
+    }
+
+    /// #4059 end-to-end (minus `process::exit`): a repo whose terminals come
+    /// ONLY from `.loom-project/project.json` resolves through the tier chain
+    /// and validates successfully. The private/shared defaults tier is disabled
+    /// for hermeticity.
+    #[test]
+    #[serial_test::serial]
+    fn test_validate_from_project_tier_only() {
+        std::env::set_var(crate::config_resolver::PRIVATE_DEFAULTS_ENV, "");
+        let dir = tempfile::tempdir().unwrap();
+        let project_dir = dir.path().join(".loom-project");
+        std::fs::create_dir_all(&project_dir).unwrap();
+        std::fs::write(
+            project_dir.join("project.json"),
+            r#"{"terminals": [
+                {"roleConfig": {"roleFile": "judge.md"}},
+                {"roleConfig": {"roleFile": "doctor.md"}}
+            ]}"#,
+        )
+        .unwrap();
+        // No legacy .loom/config.json exists.
+        assert!(!dir.path().join(".loom").join("config.json").exists());
+
+        let config = crate::config_resolver::resolve_effective_config(dir.path());
+        std::env::remove_var(crate::config_resolver::PRIVATE_DEFAULTS_ENV);
+
+        // The precondition the validate command retargets to.
+        let has_terminals = config
+            .get("terminals")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|arr| !arr.is_empty());
+        assert!(
+            has_terminals,
+            "terminals from project tier must satisfy the validate precondition"
+        );
+
+        let result = validate_from_config(&config, ValidationMode::Warn);
+        assert!(result.valid);
+        assert_eq!(result.configured_roles, vec!["doctor", "judge"]);
     }
 
     #[test]

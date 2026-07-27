@@ -82,28 +82,27 @@ pub fn rotate_log_file(log_path: &Path, max_size: u64, max_files: usize) -> anyh
     Ok(())
 }
 
-/// Extract configured terminal IDs from workspace config.json.
+/// Extract configured terminal IDs from workspace config.
 ///
-/// Reads the workspace's `.loom/config.json` and extracts the `id` field from
-/// each terminal entry. Returns None if config file doesn't exist or can't be parsed.
+/// Resolves the workspace's effective config through the tier chain
+/// (`config_resolver::resolve_effective_config`: private/shared defaults →
+/// legacy `.loom/config.json` → `.loom-project/project.json` →
+/// `.loom-local/local.json`) and extracts the `id` field from each terminal
+/// entry. Returns `None` when no tier supplies a non-empty `terminals` array —
+/// the empty-set-⇒-`None` contract is preserved (#4059).
+///
+/// **Diagnostic note (#4059, Finding 3):** the previous direct-read
+/// implementation emitted a function-local `log::warn!` for a malformed
+/// `.loom/config.json`. That warn is not lost: `config_resolver`'s
+/// `soft_read_json_object` still emits a `log::warn!` when a tier's JSON fails
+/// to parse. A malformed config therefore collapses to `{}` at the resolver
+/// layer (so it now reaches the "no terminals" branch here rather than a
+/// dedicated parse-error branch), but the operator still sees a warning — it
+/// just names the resolver tier rather than this call site. This diagnosability
+/// change is accepted deliberately; the observable `None` contract is unchanged
+/// and the existing invalid-JSON test guards the collapsed path.
 pub fn extract_configured_terminal_ids(workspace: &Path) -> Option<HashSet<String>> {
-    let config_path = workspace.join(".loom").join("config.json");
-
-    let config_str = match fs::read_to_string(&config_path) {
-        Ok(s) => s,
-        Err(e) => {
-            log::debug!("Could not read config at {}: {e}", config_path.display());
-            return None;
-        }
-    };
-
-    let config: serde_json::Value = match serde_json::from_str(&config_str) {
-        Ok(v) => v,
-        Err(e) => {
-            log::warn!("Could not parse config at {}: {e}", config_path.display());
-            return None;
-        }
-    };
+    let config = config_resolver::resolve_effective_config(workspace);
 
     let terminals = config.get("terminals")?.as_array()?;
 
@@ -113,11 +112,15 @@ pub fn extract_configured_terminal_ids(workspace: &Path) -> Option<HashSet<Strin
         .collect();
 
     if ids.is_empty() {
-        log::debug!("No terminal IDs found in config");
+        log::debug!("No terminal IDs found in resolved config for {}", workspace.display());
         return None;
     }
 
-    log::info!("Loaded {} configured terminal IDs from {}", ids.len(), config_path.display());
+    log::info!(
+        "Loaded {} configured terminal IDs from resolved config for {}",
+        ids.len(),
+        workspace.display()
+    );
 
     Some(ids)
 }
@@ -232,6 +235,49 @@ mod tests {
         fs::write(loom_dir.join("config.json"), r#"{"terminals": []}"#).unwrap();
 
         let result = extract_configured_terminal_ids(dir.path());
+        assert!(result.is_none());
+    }
+
+    /// #4059: terminals supplied ONLY by the `.loom-project/project.json`
+    /// tier (no legacy `.loom/config.json` at all) are discovered through the
+    /// resolver. The private/shared defaults tier is disabled for hermeticity.
+    #[test]
+    #[serial_test::serial]
+    fn test_extract_terminal_ids_from_project_tier_only() {
+        std::env::set_var(crate::config_resolver::PRIVATE_DEFAULTS_ENV, "");
+        let dir = tempdir().unwrap();
+        let project_dir = dir.path().join(".loom-project");
+        fs::create_dir_all(&project_dir).unwrap();
+        fs::write(
+            project_dir.join("project.json"),
+            r#"{"terminals": [{"id": "terminal-1"}, {"id": "terminal-2"}]}"#,
+        )
+        .unwrap();
+        // No .loom/config.json exists.
+        assert!(!dir.path().join(".loom").join("config.json").exists());
+
+        let result = extract_configured_terminal_ids(dir.path());
+        std::env::remove_var(crate::config_resolver::PRIVATE_DEFAULTS_ENV);
+
+        let ids = result.expect("terminals from project tier should be discovered");
+        assert_eq!(ids.len(), 2);
+        assert!(ids.contains("terminal-1"));
+        assert!(ids.contains("terminal-2"));
+    }
+
+    /// #4059: an empty `terminals` array in the project tier still yields
+    /// `None`, preserving the empty-set-⇒-`None` contract across tiers.
+    #[test]
+    #[serial_test::serial]
+    fn test_extract_terminal_ids_empty_terminals_project_tier() {
+        std::env::set_var(crate::config_resolver::PRIVATE_DEFAULTS_ENV, "");
+        let dir = tempdir().unwrap();
+        let project_dir = dir.path().join(".loom-project");
+        fs::create_dir_all(&project_dir).unwrap();
+        fs::write(project_dir.join("project.json"), r#"{"terminals": []}"#).unwrap();
+
+        let result = extract_configured_terminal_ids(dir.path());
+        std::env::remove_var(crate::config_resolver::PRIVATE_DEFAULTS_ENV);
         assert!(result.is_none());
     }
 
