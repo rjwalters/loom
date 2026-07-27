@@ -128,6 +128,13 @@ const MAX_OUTPUT_TAIL_BYTES: usize = 4096;
 /// never silently throttled behind the first class it hit.
 const SKIP_WARN_THROTTLE: Duration = Duration::from_secs(3600);
 
+/// Cap on the exponential backoff applied after consecutive UNEVALUATED
+/// (indeterminate) gate runs (#3984 AC3) — a gate that cannot finish
+/// (timeout, broken `PATH`, dead process tree) must not busy-loop retrying
+/// immediately and contending with in-flight sweeps for cores, but also must
+/// not go silent forever once the environment recovers.
+pub const MAX_GATE_INDETERMINATE_BACKOFF: Duration = Duration::from_secs(3600);
+
 /// Max characters of an UNEVALUATED reason retained for the `loom-daemon
 /// status` surface (#3974 AC2). The full reason (which can embed a multi-KB
 /// output tail) still goes to the daemon log; the status line only needs
@@ -161,6 +168,30 @@ pub struct MainHealthState {
     /// Throttle + diagnosis bookkeeping for the UNEVALUATED log line and the
     /// `loom-daemon status` surface — see [`UnevaluatedTrack`].
     track: Mutex<UnevaluatedTrack>,
+    /// SHA-memoization + indeterminate-run backoff bookkeeping (#3984) — see
+    /// [`GateMemo`].
+    gate_memo: Mutex<GateMemo>,
+}
+
+/// Bookkeeping for #3984: the SHA of the last **determinate** (Green/Red)
+/// gate evaluation — or of the last commit reviewed and found to touch no
+/// `realChangeGlobs` path — plus exponential backoff after a run that
+/// produced no verdict at all (UNEVALUATED: timeout, missing tool, broken
+/// process tree, …).
+#[derive(Debug, Default)]
+struct GateMemo {
+    /// The `origin/main` commit the gate has most recently either (a) run
+    /// against and reached a determinate Green/Red verdict for, or (b)
+    /// reviewed via `realChangeGlobs` and found to contain no path worth a
+    /// re-run. `None` before the first successful evaluation.
+    last_evaluated_sha: Option<String>,
+    /// The instant before which the gate must not attempt another run,
+    /// following a run that produced no verdict. `None` when not backing off.
+    backoff_until: Option<Instant>,
+    /// Consecutive UNEVALUATED runs since the last determinate one — drives
+    /// the exponential backoff growth. Reset to 0 whenever the SHA memo
+    /// advances.
+    consecutive_indeterminate: u32,
 }
 
 /// Bookkeeping for the current UNEVALUATED streak: when its warning was last
@@ -189,6 +220,7 @@ impl MainHealthState {
             halted: AtomicBool::new(false),
             unevaluated: AtomicBool::new(false),
             track: Mutex::new(UnevaluatedTrack::default()),
+            gate_memo: Mutex::new(GateMemo::default()),
         }
     }
 
@@ -273,6 +305,68 @@ impl MainHealthState {
             track.last_warn = Some(now);
         }
         should_warn
+    }
+
+    // ===================================================================
+    // SHA memoization + indeterminate-run backoff (#3984)
+    // ===================================================================
+
+    /// The `origin/main` SHA of the last determinate evaluation (or
+    /// glob-reviewed no-op), or `None` before the first one.
+    #[must_use]
+    pub fn gate_last_evaluated_sha(&self) -> Option<String> {
+        self.gate_memo
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .last_evaluated_sha
+            .clone()
+    }
+
+    /// Record that the gate has settled the question for `sha` — either by
+    /// running the command and reaching a Green/Red verdict, or by reviewing
+    /// the diff since the previous evaluated SHA and finding no
+    /// `realChangeGlobs` match. Clears any indeterminate-run backoff, since
+    /// this is by definition not an indeterminate outcome.
+    pub fn record_gate_evaluated_sha(&self, sha: &str) {
+        let mut memo = self
+            .gate_memo
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        memo.last_evaluated_sha = Some(sha.to_string());
+        memo.backoff_until = None;
+        memo.consecutive_indeterminate = 0;
+    }
+
+    /// Whether the gate is currently backing off after one or more
+    /// consecutive UNEVALUATED runs and must not attempt another run yet.
+    #[must_use]
+    pub fn gate_backoff_active(&self, now: Instant) -> bool {
+        self.gate_memo
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .backoff_until
+            .is_some_and(|until| now < until)
+    }
+
+    /// Record one more consecutive UNEVALUATED run and extend the backoff
+    /// window exponentially: `min_backoff * 2^(consecutive - 1)`, capped at
+    /// `max_backoff`. `min_backoff` is typically the gate's own
+    /// `buildGate.timeoutSeconds` — after a run that used the *entire*
+    /// timeout without producing a verdict, waiting less than that timeout
+    /// before retrying guarantees another overlapping/contending run before
+    /// the first ever gets to prove anything (the #3984 doom loop).
+    pub fn record_gate_indeterminate_backoff(&self, min_backoff: Duration, max_backoff: Duration) {
+        let mut memo = self
+            .gate_memo
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        memo.consecutive_indeterminate = memo.consecutive_indeterminate.saturating_add(1);
+        // Cap the shift so this can never overflow — 2^20 is already far
+        // beyond `max_backoff` for any sane config.
+        let shift = memo.consecutive_indeterminate.saturating_sub(1).min(20);
+        let multiplier = 1u32.checked_shl(shift).unwrap_or(u32::MAX);
+        let backoff = min_backoff.saturating_mul(multiplier).min(max_backoff);
+        memo.backoff_until = Some(Instant::now() + backoff);
     }
 }
 
@@ -404,12 +498,21 @@ impl WorkspaceHealthStates {
 // ============================================================================
 
 /// The subset of the `.loom/config.json` `buildGate` block this module consumes.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct BuildGateConfig {
     /// The command to run against `main` (executed via `sh -c`).
     pub command: String,
     /// Timeout for a single gate run.
     pub timeout: Duration,
+    /// `buildGate.realChangeGlobs` (#3984): when non-empty, a `main` move
+    /// that touches none of these glob patterns does not warrant re-running
+    /// the (expensive) gate command — the previous verdict stands. Patterns
+    /// with no `/` match by basename anywhere in the tree (`*.rs` matches
+    /// `loom-daemon/src/main.rs`); patterns containing `/` match the full
+    /// repo-relative path. Empty (the default, and the value for any config
+    /// that omits the key) means "any `main` move is a real change" — the
+    /// pre-#3984 behavior once the SHA has actually changed.
+    pub real_change_globs: Vec<String>,
 }
 
 /// Read `.loom/config.json` → `buildGate`, soft-failing to `None` (gate
@@ -473,9 +576,24 @@ pub fn read_build_gate_config(repo_root: &Path) -> Option<BuildGateConfig> {
         .filter(|&s| s > 0)
         .unwrap_or(DEFAULT_BUILD_GATE_TIMEOUT_SECS);
 
+    // #3984: `realChangeGlobs` — malformed/non-string entries are dropped
+    // rather than failing the whole config (soft-fail contract).
+    let real_change_globs = gate
+        .get("realChangeGlobs")
+        .and_then(serde_json::Value::as_array)
+        .map(|globs| {
+            globs
+                .iter()
+                .filter_map(serde_json::Value::as_str)
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+
     Some(BuildGateConfig {
         command: command.to_string(),
         timeout: Duration::from_secs(timeout_secs),
+        real_change_globs,
     })
 }
 
@@ -1012,6 +1130,245 @@ fn resolve_head_sha(repo_root: &Path) -> Option<String> {
             None
         }
     }
+}
+
+// ============================================================================
+// SHA memoization + `realChangeGlobs` + indeterminate-run backoff (#3984)
+//
+// #3984 observed a self-sustaining doom loop: `realChangeGlobs` was declared
+// in shipped config but never read anywhere, so the gate re-ran its full
+// (potentially minutes-long) command every cadence tick regardless of
+// whether `origin/main` had moved at all. Under host contention the run
+// timed out, the timeout was UNEVALUATED (correctly, per #3974) and left the
+// previous halt verdict standing — but the very next tick fired again almost
+// immediately (the cadence interval is far shorter than the build timeout),
+// so the gate never got a quiet window to actually finish.
+//
+// [`decide_gate_run`] is the pure decision function: given the last
+// determinately-evaluated SHA, the current `origin/main` SHA, and the
+// configured globs, does the (expensive) command need to run again at all?
+// [`run_gate_tick`] wires that decision, [`MainHealthState`]'s SHA/backoff
+// memo, and [`CommandGateRunner`] together into the one entry point
+// [`spawn_multi_main_health_gate_task`] calls per root per cadence tick.
+// ============================================================================
+
+/// Whether the (expensive) gate command needs to run again.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GateRunDecision {
+    /// `main` has not moved since the last determinate evaluation, or it
+    /// moved but the diff touches no `realChangeGlobs` path — the previous
+    /// verdict stands and the command must NOT run again.
+    Skip,
+    /// The command must run: no prior determinate evaluation exists, `main`
+    /// moved and no globs are configured (any movement counts), the diff
+    /// touches a matching path, or the diff could not be computed (fail
+    /// safe — an uncomputable diff must never be mistaken for "no change").
+    Run,
+}
+
+/// Decide whether the gate command needs to run again, given the SHA
+/// `origin/main` currently points at and the config's `realChangeGlobs`
+/// (#3984). Pure aside from the `git diff` it shells out to when a
+/// glob-filtered re-check is actually needed — the common "main hasn't moved
+/// at all" case (`last_evaluated_sha == current_sha`) never touches `git`
+/// beyond what the caller already resolved.
+#[must_use]
+pub fn decide_gate_run(
+    last_evaluated_sha: Option<&str>,
+    current_sha: &str,
+    globs: &[String],
+    repo_root: &Path,
+) -> GateRunDecision {
+    let Some(last) = last_evaluated_sha else {
+        return GateRunDecision::Run; // no baseline yet — must evaluate
+    };
+    if last == current_sha {
+        return GateRunDecision::Skip; // main has not moved at all
+    }
+    if globs.is_empty() {
+        return GateRunDecision::Run; // no filter configured — any movement counts
+    }
+    match diff_touches_globs(repo_root, last, current_sha, globs) {
+        Some(true) | None => GateRunDecision::Run,
+        Some(false) => GateRunDecision::Skip,
+    }
+}
+
+/// Cheaply resolve the commit `origin/main` currently points at via
+/// `git ls-remote` — no local fetch, no working-tree mutation, safe to call
+/// regardless of the workspace's branch or cleanliness. Used to short-circuit
+/// the gate command before paying for [`prepare_workspace_to_origin_main`]'s
+/// fetch+reset at all. `None` on any failure (offline, no such remote, `git`
+/// missing) — callers must fail safe and treat that as "must run".
+fn resolve_remote_main_sha(repo_root: &Path) -> Option<String> {
+    let output = Command::new("git")
+        .args(["ls-remote", GATE_REMOTE, GATE_BRANCH])
+        .current_dir(repo_root)
+        .stdin(Stdio::null())
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let sha = stdout.split_whitespace().next()?;
+    if sha.is_empty() {
+        None
+    } else {
+        Some(sha.to_string())
+    }
+}
+
+/// Whether the diff between `from_sha` and `to_sha` in `repo_root` touches at
+/// least one path matching `globs` ([`glob_matches`]). `None` when the diff
+/// itself could not be computed (missing object, `git` failure) — callers
+/// must fail safe and run the gate rather than risk hiding a real change
+/// behind an uncomputable diff.
+fn diff_touches_globs(
+    repo_root: &Path,
+    from_sha: &str,
+    to_sha: &str,
+    globs: &[String],
+) -> Option<bool> {
+    // Make sure the local repo actually has both commits to diff — a cheap,
+    // idempotent fetch. The caller already knows `main` moved, so this is not
+    // extra work beyond what a real run would have paid anyway.
+    let _ = Command::new("git")
+        .args(["fetch", GATE_REMOTE, GATE_BRANCH])
+        .current_dir(repo_root)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+    let output = Command::new("git")
+        .args(["diff", "--name-only", &format!("{from_sha}..{to_sha}")])
+        .current_dir(repo_root)
+        .stdin(Stdio::null())
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let changed: Vec<&str> = stdout.lines().filter(|l| !l.is_empty()).collect();
+    Some(
+        changed
+            .iter()
+            .any(|path| globs.iter().any(|g| glob_matches(g, path))),
+    )
+}
+
+/// Whether `path` (a repo-relative path, `/`-separated) matches glob `pattern`
+/// (`*` = any run of characters, `?` = exactly one character; no other glob
+/// syntax is supported — deliberately minimal, matching the shipped
+/// `realChangeGlobs` examples `*.rs` / `*.toml` / `Cargo.lock` / `*.py` /
+/// `*.sh`). A pattern containing no `/` matches by **basename** anywhere in
+/// the tree (so `*.rs` matches `loom-daemon/src/main.rs`); a pattern
+/// containing `/` matches the full path.
+fn glob_matches(pattern: &str, path: &str) -> bool {
+    let candidate = if pattern.contains('/') {
+        path
+    } else {
+        path.rsplit('/').next().unwrap_or(path)
+    };
+    glob_match_chars(pattern, candidate)
+}
+
+/// Classic greedy `*`/`?` wildcard matcher (anchored — the whole `text` must
+/// match the whole `pattern`).
+fn glob_match_chars(pattern: &str, text: &str) -> bool {
+    let p: Vec<char> = pattern.chars().collect();
+    let t: Vec<char> = text.chars().collect();
+    let (mut pi, mut ti) = (0usize, 0usize);
+    let mut star_idx: Option<usize> = None;
+    let mut match_idx = 0usize;
+    while ti < t.len() {
+        if pi < p.len() && (p[pi] == '?' || p[pi] == t[ti]) {
+            pi += 1;
+            ti += 1;
+        } else if pi < p.len() && p[pi] == '*' {
+            star_idx = Some(pi);
+            match_idx = ti;
+            pi += 1;
+        } else if let Some(si) = star_idx {
+            pi = si + 1;
+            match_idx += 1;
+            ti = match_idx;
+        } else {
+            return false;
+        }
+    }
+    while pi < p.len() && p[pi] == '*' {
+        pi += 1;
+    }
+    pi == p.len()
+}
+
+/// One gate "tick" for a single root (#3984): decides whether the (expensive)
+/// command needs to run at all given `state`'s SHA memo + `config`'s
+/// `realChangeGlobs`, and — separately — whether the gate is still backing
+/// off after a run that produced no verdict. Runs the command (via a fresh
+/// [`CommandGateRunner`]) only when needed, and updates `state`'s memo
+/// accordingly.
+///
+/// Returns `None` when the tick was skipped entirely (backoff, or "no real
+/// change") — the halt flag is left exactly as it was and there is nothing to
+/// log as a transition. Returns `Some(outcome)` when the command actually
+/// ran (or [`prepare_workspace_to_origin_main`] itself short-circuited it),
+/// for the caller to [`apply_and_log`] as before.
+///
+/// Synchronous (git + subprocess I/O) by design, mirroring
+/// [`CommandGateRunner::run_gate`] — [`spawn_multi_main_health_gate_task`]
+/// runs it inside `spawn_blocking`, and it is directly unit-testable without
+/// a tokio runtime.
+#[must_use]
+pub fn run_gate_tick(
+    state: &MainHealthState,
+    config: &BuildGateConfig,
+    repo_root: &Path,
+) -> Option<GateOutcome> {
+    if state.gate_backoff_active(Instant::now()) {
+        log::debug!(
+            "main_health_gate: {} gate is backing off after an indeterminate run — skipping this tick",
+            repo_root.display()
+        );
+        return None;
+    }
+
+    let current_sha = resolve_remote_main_sha(repo_root);
+    if let Some(sha) = current_sha.as_deref() {
+        let last = state.gate_last_evaluated_sha();
+        if decide_gate_run(last.as_deref(), sha, &config.real_change_globs, repo_root)
+            == GateRunDecision::Skip
+        {
+            log::debug!(
+                "main_health_gate: {} skipping gate command — no real change since {} ({sha})",
+                repo_root.display(),
+                last.as_deref().unwrap_or("<none>")
+            );
+            state.record_gate_evaluated_sha(sha);
+            return None;
+        }
+    }
+
+    let mut runner = CommandGateRunner::new(config.clone(), repo_root.to_path_buf());
+    let outcome = runner.run_gate();
+    match &outcome {
+        GateOutcome::Green | GateOutcome::Red { .. } => {
+            // Prefer the cheaply-resolved SHA; fall back to the workspace's
+            // post-sync HEAD (the runner itself resolves this internally for
+            // forge-CI corroboration, but does not expose it — re-deriving it
+            // here is one more cheap `rev-parse`).
+            let sha = current_sha.or_else(|| resolve_head_sha(repo_root));
+            if let Some(sha) = sha {
+                state.record_gate_evaluated_sha(&sha);
+            }
+        }
+        GateOutcome::Unevaluated { .. } => {
+            state.record_gate_indeterminate_backoff(config.timeout, MAX_GATE_INDETERMINATE_BACKOFF);
+        }
+    }
+    Some(outcome)
 }
 
 // ============================================================================
@@ -1899,19 +2256,30 @@ pub fn spawn_multi_main_health_gate_task(
                 };
 
                 let state = health_states.get_or_create(&root);
+                let state_for_task = state.clone();
                 let root_for_task = root.clone();
                 // Run the (potentially minutes-long) gate off the runtime.
+                // `run_gate_tick` (#3984) short-circuits before the expensive
+                // command when `origin/main` has not moved (or moved but
+                // touched no `realChangeGlobs` path) since the last
+                // determinate evaluation, and backs off after a run that
+                // produced no verdict rather than retrying immediately.
                 let joined = tokio::task::spawn_blocking(move || {
-                    let mut runner = CommandGateRunner::new(gate_config, root_for_task);
-                    runner.run_gate()
+                    run_gate_tick(&state_for_task, &gate_config, &root_for_task)
                 })
                 .await;
                 match joined {
-                    Ok(outcome) => {
+                    Ok(Some(outcome)) => {
                         let root_for_log = root.clone();
                         apply_and_log(&state, &outcome, move |transition, outcome, halted| {
                             log_transition_for_root(&root_for_log, transition, outcome, halted);
                         });
+                    }
+                    Ok(None) => {
+                        // Skipped this tick (#3984: backoff, or no real
+                        // change since the last determinate evaluation) —
+                        // the halt flag is left exactly as it was, so there
+                        // is nothing to log as a transition.
                     }
                     Err(e) => {
                         // The blocking task panicked; clear this repo's halt so a
@@ -2184,6 +2552,7 @@ mod tests {
         let cfg = BuildGateConfig {
             command: "exit 0".to_string(),
             timeout: Duration::from_secs(30),
+            ..Default::default()
         };
         let mut runner = CommandGateRunner::new(cfg, std::env::temp_dir()).without_sync();
         assert_eq!(runner.run_gate(), GateOutcome::Green);
@@ -2194,6 +2563,7 @@ mod tests {
         let cfg = BuildGateConfig {
             command: "echo build-failed-marker >&2; exit 1".to_string(),
             timeout: Duration::from_secs(30),
+            ..Default::default()
         };
         let mut runner = CommandGateRunner::new(cfg, std::env::temp_dir()).without_sync();
         let outcome = runner.run_gate();
@@ -2223,6 +2593,7 @@ mod tests {
         let cfg = BuildGateConfig {
             command: "sleep 10".to_string(),
             timeout: Duration::from_secs(1),
+            ..Default::default()
         };
         let mut runner = CommandGateRunner::new(cfg, std::env::temp_dir()).without_sync();
         let outcome = runner.run_gate();
@@ -2247,6 +2618,7 @@ mod tests {
         let cfg = BuildGateConfig {
             command: "loom-no-such-command-3974 --version".to_string(),
             timeout: Duration::from_secs(30),
+            ..Default::default()
         };
         let mut runner = CommandGateRunner::new(cfg, std::env::temp_dir()).without_sync();
         let outcome = runner.run_gate();
@@ -2266,6 +2638,7 @@ mod tests {
         let cfg = BuildGateConfig {
             command: script.display().to_string(),
             timeout: Duration::from_secs(30),
+            ..Default::default()
         };
         let mut runner = CommandGateRunner::new(cfg, std::env::temp_dir()).without_sync();
         let outcome = runner.run_gate();
@@ -2280,6 +2653,7 @@ mod tests {
         let cfg = BuildGateConfig {
             command: "kill -9 $$".to_string(),
             timeout: Duration::from_secs(30),
+            ..Default::default()
         };
         let mut runner = CommandGateRunner::new(cfg, std::env::temp_dir()).without_sync();
         let outcome = runner.run_gate();
@@ -2295,6 +2669,7 @@ mod tests {
         let cfg = BuildGateConfig {
             command: "echo 'test result: FAILED'; exit 101".to_string(),
             timeout: Duration::from_secs(30),
+            ..Default::default()
         };
         let mut runner = CommandGateRunner::new(cfg, std::env::temp_dir()).without_sync();
         let outcome = runner.run_gate();
@@ -2371,6 +2746,7 @@ mod tests {
         let cfg = BuildGateConfig {
             command: command.to_string(),
             timeout: Duration::from_secs(30),
+            ..Default::default()
         };
         let mut runner = CommandGateRunner::new(cfg, clone.path().to_path_buf()).with_ci_status(
             Box::new(FakeCi {
@@ -2982,6 +3358,7 @@ mod tests {
         let cfg = BuildGateConfig {
             command: "exit 1".to_string(), // would be red if it ran
             timeout: Duration::from_secs(5),
+            ..Default::default()
         };
         let tmp = tempfile::tempdir().unwrap();
         let mut runner = CommandGateRunner::new(cfg, tmp.path().to_path_buf());
@@ -2999,9 +3376,275 @@ mod tests {
         let cfg = BuildGateConfig {
             command: "exit 0".to_string(),
             timeout: Duration::from_secs(30),
+            ..Default::default()
         };
         let mut runner = CommandGateRunner::new(cfg, clone.path().to_path_buf());
         assert_eq!(runner.run_gate(), GateOutcome::Green);
+    }
+
+    // ===================================================================
+    // SHA memoization + `realChangeGlobs` + indeterminate-run backoff
+    // (#3984) — the doom loop was: the gate re-ran the full (potentially
+    // minutes-long) command every cadence tick regardless of whether
+    // `origin/main` had actually moved.
+    // ===================================================================
+
+    /// Push a commit that writes `filename` with `contents` to `origin/main`
+    /// from a scratch clone (mirrors [`advance_origin_main`] but lets tests
+    /// control the changed path, for `realChangeGlobs` matching).
+    fn push_file_change(origin: &Path, filename: &str, contents: &str) {
+        let scratch = tempfile::tempdir().unwrap();
+        git(
+            scratch.path(),
+            &[
+                "clone",
+                origin.to_str().unwrap(),
+                scratch.path().to_str().unwrap(),
+            ],
+        );
+        git(scratch.path(), &["config", "user.email", "t@t.t"]);
+        git(scratch.path(), &["config", "user.name", "t"]);
+        let path = scratch.path().join(filename);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        std::fs::write(&path, contents).unwrap();
+        git(scratch.path(), &["add", "."]);
+        git(scratch.path(), &["commit", "-m", &format!("touch {filename}")]);
+        git(scratch.path(), &["push", "origin", "main"]);
+    }
+
+    #[test]
+    fn test_glob_matches_basename_and_full_path() {
+        assert!(glob_matches("*.rs", "loom-daemon/src/main.rs"));
+        assert!(glob_matches("*.rs", "main.rs"));
+        assert!(!glob_matches("*.rs", "main.py"));
+        assert!(glob_matches("Cargo.lock", "Cargo.lock"));
+        assert!(glob_matches("Cargo.lock", "loom-daemon/Cargo.lock"));
+        assert!(!glob_matches("Cargo.lock", "Cargo.toml"));
+        // A pattern containing '/' matches the full path, not just basename.
+        assert!(glob_matches("src/*.rs", "src/main.rs"));
+        assert!(!glob_matches("src/*.rs", "other/main.rs"));
+    }
+
+    #[test]
+    fn test_decide_gate_run_no_baseline_must_run() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert_eq!(
+            decide_gate_run(None, "deadbeef", &[], tmp.path()),
+            GateRunDecision::Run,
+            "no prior determinate evaluation ⇒ must run"
+        );
+    }
+
+    #[test]
+    fn test_decide_gate_run_unchanged_sha_skips_even_with_globs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let globs = vec!["*.rs".to_string()];
+        assert_eq!(
+            decide_gate_run(Some("abc123"), "abc123", &globs, tmp.path()),
+            GateRunDecision::Skip,
+            "identical SHA means no diff at all — must skip regardless of globs"
+        );
+    }
+
+    #[test]
+    fn test_decide_gate_run_changed_sha_no_globs_must_run() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert_eq!(
+            decide_gate_run(Some("abc123"), "def456", &[], tmp.path()),
+            GateRunDecision::Run,
+            "no realChangeGlobs configured ⇒ any movement counts as real"
+        );
+    }
+
+    #[test]
+    fn test_decide_gate_run_changed_sha_glob_diff_matches() {
+        let (origin, clone) = make_origin_and_clone();
+        let before = head_commit(clone.path());
+        push_file_change(origin.path(), "src/lib.rs", "fn x() {}\n");
+        // Fetch so the clone's local git has the new commit object available
+        // for the diff — mirrors what `resolve_remote_main_sha` + the
+        // subsequent fetch inside `diff_touches_globs` do in production.
+        git(clone.path(), &["fetch", "origin", "main"]);
+        let after = String::from_utf8(
+            Command::new("git")
+                .args(["rev-parse", "origin/main"])
+                .current_dir(clone.path())
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap()
+        .trim()
+        .to_string();
+        let globs = vec!["*.rs".to_string()];
+        assert_eq!(
+            decide_gate_run(Some(&before), &after, &globs, clone.path()),
+            GateRunDecision::Run,
+            "the diff touches a *.rs path — must run"
+        );
+    }
+
+    #[test]
+    fn test_decide_gate_run_changed_sha_glob_diff_does_not_match() {
+        let (origin, clone) = make_origin_and_clone();
+        let before = head_commit(clone.path());
+        push_file_change(origin.path(), "README.md", "docs only\n");
+        git(clone.path(), &["fetch", "origin", "main"]);
+        let after = String::from_utf8(
+            Command::new("git")
+                .args(["rev-parse", "origin/main"])
+                .current_dir(clone.path())
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap()
+        .trim()
+        .to_string();
+        let globs = vec!["*.rs".to_string(), "*.toml".to_string()];
+        assert_eq!(
+            decide_gate_run(Some(&before), &after, &globs, clone.path()),
+            GateRunDecision::Skip,
+            "the diff touches only README.md — no configured glob matches, must skip"
+        );
+    }
+
+    #[test]
+    fn test_main_health_state_gate_backoff_grows_and_clears() {
+        let state = MainHealthState::new();
+        let now = Instant::now();
+        assert!(!state.gate_backoff_active(now), "fresh state is never backing off");
+
+        let min = Duration::from_secs(60);
+        let max = Duration::from_secs(3600);
+        state.record_gate_indeterminate_backoff(min, max);
+        assert!(
+            state.gate_backoff_active(Instant::now()),
+            "one indeterminate run must start a backoff window"
+        );
+
+        // A determinate evaluation clears the backoff outright.
+        state.record_gate_evaluated_sha("abc123");
+        assert!(
+            !state.gate_backoff_active(Instant::now()),
+            "a determinate evaluation must clear any standing backoff"
+        );
+        assert_eq!(state.gate_last_evaluated_sha(), Some("abc123".to_string()));
+    }
+
+    #[test]
+    fn test_run_gate_tick_skips_second_run_for_unchanged_sha() {
+        // The core #3984 regression: with `origin/main` unchanged between two
+        // ticks, the second tick must NOT spawn the gate command again.
+        let (_origin, clone) = make_origin_and_clone();
+        let marker = tempfile::tempdir().unwrap();
+        let marker_file = marker.path().join("invocations.txt");
+        let cfg = BuildGateConfig {
+            command: format!("echo run >> {}", marker_file.display()),
+            timeout: Duration::from_secs(30),
+            ..Default::default()
+        };
+        let state = MainHealthState::new();
+
+        let first = run_gate_tick(&state, &cfg, clone.path());
+        assert_eq!(first, Some(GateOutcome::Green), "first tick must run and be green");
+        let invocations_after_first = std::fs::read_to_string(&marker_file)
+            .unwrap_or_default()
+            .lines()
+            .count();
+        assert_eq!(invocations_after_first, 1, "the command must have run exactly once");
+
+        let second = run_gate_tick(&state, &cfg, clone.path());
+        assert_eq!(
+            second, None,
+            "unchanged origin/main must skip the second tick entirely (no outcome to apply)"
+        );
+        let invocations_after_second = std::fs::read_to_string(&marker_file)
+            .unwrap_or_default()
+            .lines()
+            .count();
+        assert_eq!(
+            invocations_after_second, 1,
+            "no second gate command must be spawned for an unchanged SHA"
+        );
+    }
+
+    #[test]
+    fn test_run_gate_tick_runs_again_after_main_advances() {
+        let (origin, clone) = make_origin_and_clone();
+        let marker = tempfile::tempdir().unwrap();
+        let marker_file = marker.path().join("invocations.txt");
+        let cfg = BuildGateConfig {
+            command: format!("echo run >> {}", marker_file.display()),
+            timeout: Duration::from_secs(30),
+            ..Default::default()
+        };
+        let state = MainHealthState::new();
+
+        assert_eq!(run_gate_tick(&state, &cfg, clone.path()), Some(GateOutcome::Green));
+        assert_eq!(
+            std::fs::read_to_string(&marker_file)
+                .unwrap_or_default()
+                .lines()
+                .count(),
+            1
+        );
+
+        // main moves — the next tick must run again.
+        advance_origin_main(origin.path());
+        assert_eq!(run_gate_tick(&state, &cfg, clone.path()), Some(GateOutcome::Green));
+        assert_eq!(
+            std::fs::read_to_string(&marker_file)
+                .unwrap_or_default()
+                .lines()
+                .count(),
+            2,
+            "a real change to origin/main must trigger another run"
+        );
+    }
+
+    #[test]
+    fn test_run_gate_tick_skips_while_backing_off_after_timeout() {
+        let (_origin, clone) = make_origin_and_clone();
+        let marker = tempfile::tempdir().unwrap();
+        let marker_file = marker.path().join("invocations.txt");
+        let cfg = BuildGateConfig {
+            command: format!("echo run >> {} && sleep 5", marker_file.display()),
+            timeout: Duration::from_millis(200),
+            ..Default::default()
+        };
+        let state = MainHealthState::new();
+
+        let first = run_gate_tick(&state, &cfg, clone.path());
+        assert!(
+            matches!(first, Some(GateOutcome::Unevaluated { .. })),
+            "a timeout must be UNEVALUATED, got {first:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&marker_file)
+                .unwrap_or_default()
+                .lines()
+                .count(),
+            1
+        );
+
+        // Immediately retrying (well within the backoff window derived from
+        // the 200ms timeout) must be skipped — no second spawn.
+        let second = run_gate_tick(&state, &cfg, clone.path());
+        assert_eq!(
+            second, None,
+            "an indeterminate run must trigger backoff, not an immediate retry"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&marker_file)
+                .unwrap_or_default()
+                .lines()
+                .count(),
+            1,
+            "no second gate command must be spawned while backing off"
+        );
     }
 
     // ===================================================================
