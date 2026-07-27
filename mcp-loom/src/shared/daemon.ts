@@ -131,6 +131,12 @@ export async function sendDaemonRequest(
       if (settled) return;
       settled = true;
       clearTimer();
+      // Close the socket once we have our answer. The real daemon holds the
+      // connection open by design (a persistent per-connection read loop, see
+      // loom-daemon/src/ipc.rs `handle_client`), so we must send EOF ourselves
+      // for the daemon's `next_line()` to reap the connection — otherwise a
+      // half-open connection accumulates on the daemon per unary call.
+      if (!socket.destroyed) socket.destroy();
       resolve(value);
     };
     const settleReject = (error: Error) => {
@@ -141,11 +147,31 @@ export async function sendDaemonRequest(
       reject(error);
     };
 
+    // Settle on the FIRST complete newline-delimited response frame, mirroring
+    // the framing `sendDaemonStreamRequest` and the Rust CLI (main.rs:1477)
+    // already use. The daemon writes one `\n`-terminated JSON response per
+    // request line and then keeps the socket open for reuse — it never closes
+    // after answering — so waiting for `end` here would hang forever against
+    // the real daemon even though the response is already in `buffer` (#4043).
     socket.on("data", (data) => {
+      if (settled) return;
       buffer += data.toString();
+      const nl = buffer.indexOf("\n");
+      if (nl === -1) return; // frame not complete yet
+      const line = buffer.slice(0, nl);
+      try {
+        const response = JSON.parse(line);
+        settleResolve(response);
+      } catch (error) {
+        settleReject(new Error(`Failed to parse daemon response: ${error}`));
+      }
     });
 
+    // Fallback for a peer that closes after responding without a trailing
+    // newline (e.g. a close-after-respond stub server). The real daemon never
+    // reaches here; the `data` handler settles first.
     socket.on("end", () => {
+      if (settled) return;
       try {
         const response = JSON.parse(buffer);
         settleResolve(response);

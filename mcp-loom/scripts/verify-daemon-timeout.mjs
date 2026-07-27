@@ -12,6 +12,11 @@
  *   2. Happy case — server writes a JSON response frame then ends. Assert the
  *      call RESOLVES quickly and the timer was cleared (no regression to the
  *      fast path used by dispatch_sweep / list_sweeps / publish_event).
+ *   3. Real-daemon case — server writes a newline-delimited JSON response frame
+ *      and then KEEPS THE CONNECTION OPEN (never calls end/destroy), modeling
+ *      the real loom-daemon's persistent per-connection read loop. Assert the
+ *      call RESOLVES on the first frame without depending on connection close.
+ *      This case fails against a transport that settles only on `end` (#4043).
  *
  * Run: node scripts/verify-daemon-timeout.mjs   (from the mcp-loom dir)
  *
@@ -173,6 +178,49 @@ async function main() {
   check("resolved with expected payload", !!okResp && okResp.type === "EventPublished");
   check("resolved fast (timer cleared, no hang)", okElapsed < 1000, `elapsed=${okElapsed}ms`);
   await closeServer(okServer);
+
+  // ---- Case 3: real-daemon path (respond with a frame, never close) ----
+  // Models loom-daemon/src/ipc.rs `handle_client`: one `\n`-delimited response
+  // frame per request line, then the connection stays open for reuse. This is
+  // the regression guard for #4043 — a transport that settles only on the
+  // socket's `end` event hangs here (the server never ends) and this case
+  // FAILS, exactly reproducing the reported 1800s hang.
+  console.log("real-daemon path (respond then keep open)");
+  const heldReplySockets = [];
+  const persistentServer = await startStubServer(sockPath, (sock) => {
+    heldReplySockets.push(sock);
+    sock.on("data", () => {
+      // Answer with a newline-delimited frame, then deliberately do NOT
+      // end/destroy — the real daemon holds the connection open.
+      sock.write(JSON.stringify({ type: "SweepList", payload: { sweeps: [] } }));
+      sock.write("\n");
+    });
+  });
+
+  const persistentStart = Date.now();
+  let persistentResp = null;
+  let persistentErr = null;
+  try {
+    // A generous timeout so a FAILURE here is a genuine hang (settle-on-end
+    // regression), not a too-tight bound.
+    persistentResp = await sendDaemonRequest({ type: "ListSweeps", payload: { state_filter: null } }, 2000);
+  } catch (e) {
+    persistentErr = e;
+  }
+  const persistentElapsed = Date.now() - persistentStart;
+  check("resolved without waiting for close", persistentErr === null, persistentErr && persistentErr.message);
+  check(
+    "resolved with expected payload (first frame)",
+    !!persistentResp && persistentResp.type === "SweepList",
+    persistentResp && JSON.stringify(persistentResp)
+  );
+  check(
+    "resolved fast against a never-closing peer",
+    persistentElapsed < 1000,
+    `elapsed=${persistentElapsed}ms`
+  );
+  for (const s of heldReplySockets) s.destroy();
+  await closeServer(persistentServer);
 
   // Give the process a beat to confirm no lingering timer keeps it alive
   // (a leaked setTimeout would delay exit by the full timeout window).
