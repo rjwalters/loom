@@ -271,3 +271,192 @@ def _loom_tools_src() -> str:
     root = _find_repo_root()
     assert root is not None
     return str(root / "loom-tools" / "src")
+
+
+# ---------------------------------------------------------------------------
+# check --source monitor: the claude-monitor ranking consumer (#4094).
+#
+# The live-probe path is not cross-checked here because making the hardcoded
+# Anthropic endpoint injectable would require modifying the (read-only this
+# phase) Python `check.py`. Instead we exercise the fully deterministic,
+# network-free `--source monitor` path, which drives the SAME `.ranking`
+# writer format the probe path uses — so byte-identity of the monitor-sourced
+# `.ranking` transitively validates the shared writer. The live-probe status
+# branches are covered by Rust unit tests in `tokens_pool::check` (stub
+# transport) mirroring `loom-tools/tests/tokens/test_check.py`.
+# ---------------------------------------------------------------------------
+
+import datetime  # noqa: E402
+
+
+def _fresh_generated_at() -> str:
+    return datetime.datetime.now(datetime.timezone.utc).strftime(
+        "%Y-%m-%dT%H:%M:%SZ"
+    )
+
+
+def _seed_monitor_pool(workspace: Path, index_accounts: list[dict]) -> Path:
+    """Seed `<workspace>/.loom/tokens/` with `*.token` files and an index.json
+    manifest (name+email per account). Returns the workspace."""
+    d = workspace / ".loom" / "tokens"
+    d.mkdir(parents=True, exist_ok=True)
+    for acct in index_accounts:
+        (d / f"{acct['name']}.token").write_text(
+            f"sk-ant-oat01-fake-{acct['name']}", encoding="utf-8"
+        )
+    (d / "index.json").write_text(
+        json.dumps({"version": 2, "accounts": index_accounts}), encoding="utf-8"
+    )
+    return workspace
+
+
+def _write_ranking_json(monitor_dir: Path, generated_at: str, accounts: list[dict]):
+    monitor_dir.mkdir(parents=True, exist_ok=True)
+    (monitor_dir / "ranking.json").write_text(
+        json.dumps(
+            {"schema": 1, "generated_at": generated_at, "accounts": accounts}
+        ),
+        encoding="utf-8",
+    )
+
+
+def _run_python_check(tokens_dir: Path, monitor_dir: Path, *extra: str):
+    return subprocess.run(
+        ["python3", "-m", "loom_tools.tokens.cli", "check", *extra],
+        capture_output=True,
+        text=True,
+        check=False,
+        env={
+            **os.environ,
+            "PYTHONPATH": _loom_tools_src(),
+            "LOOM_TOKENS_DIR": str(tokens_dir),
+            "LOOM_CLAUDE_MONITOR_DIR": str(monitor_dir),
+            "LOOM_SHARED_TOKENS_DIR": "",
+        },
+    )
+
+
+def _run_rust_check(workspace: Path, monitor_dir: Path, *extra: str):
+    assert DAEMON_BIN is not None
+    return subprocess.run(
+        [str(DAEMON_BIN), "tokens", "check", "--workspace", str(workspace), *extra],
+        capture_output=True,
+        text=True,
+        check=False,
+        env={
+            **os.environ,
+            "LOOM_CLAUDE_MONITOR_DIR": str(monitor_dir),
+            "LOOM_SHARED_TOKENS_DIR": "",
+        },
+    )
+
+
+def test_check_monitor_source_ranking_byte_identical(tmp_path):
+    index_accounts = [
+        {"name": "acct-a", "email": "a@example.com"},
+        {"name": "acct-b", "email": "b@example.com"},
+        {"name": "acct-c", "email": "c@example.com"},
+    ]
+    py_ws = _seed_monitor_pool(tmp_path / "py", index_accounts)
+    rust_ws = _seed_monitor_pool(tmp_path / "rust", index_accounts)
+    monitor_dir = tmp_path / "monitor"
+    _write_ranking_json(
+        monitor_dir,
+        _fresh_generated_at(),
+        [
+            {"email": "b@example.com", "status": "available",
+             "utilization": {"7d": 0.80, "5h": 0.10}},
+            {"email": "a@example.com", "status": "available",
+             "utilization": {"7d": 0.20, "5h": 0.10}},
+            {"email": "c@example.com", "status": "rate_limited",
+             "utilization": {"7d": 0.10, "5h": 0.90}},
+        ],
+    )
+
+    py = _run_python_check(
+        py_ws / ".loom" / "tokens", monitor_dir, "--source", "monitor", "--ranking"
+    )
+    assert py.returncode == 0, py.stderr
+    rust = _run_rust_check(rust_ws, monitor_dir, "--source", "monitor", "--ranking")
+    assert rust.returncode == 0, rust.stderr
+
+    py_ranking = (py_ws / ".loom" / "tokens" / ".ranking").read_text(encoding="utf-8")
+    rust_ranking = (rust_ws / ".loom" / "tokens" / ".ranking").read_text(
+        encoding="utf-8"
+    )
+    # Ordered by (status_rank, util_7d, util_5h): a (0.20) < b (0.80) < c (rl).
+    assert py_ranking == rust_ranking == "acct-a|available\nacct-b|available\nacct-c|rate_limited\n"
+
+    # The Python selector consumes the Rust-written .ranking: it picks a
+    # healthy (available) account, never the rate_limited one, via the ranked
+    # tier. (Which of the two available accounts wins is a random/spread tier
+    # decision, so assert membership, not a single name.)
+    sel = py_select_token(rust_ws)
+    assert sel.name in {"acct-a", "acct-b"}
+    assert sel.mode == "ranked"
+
+
+def test_check_monitor_source_manifest_only_account_has_empty_status(tmp_path):
+    index_accounts = [
+        {"name": "acct-a", "email": "a@example.com"},
+        {"name": "acct-z", "email": "z@example.com"},
+    ]
+    py_ws = _seed_monitor_pool(tmp_path / "py", index_accounts)
+    rust_ws = _seed_monitor_pool(tmp_path / "rust", index_accounts)
+    monitor_dir = tmp_path / "monitor"
+    # Only acct-a is mentioned by the monitor; acct-z is manifest-only.
+    _write_ranking_json(
+        monitor_dir,
+        _fresh_generated_at(),
+        [{"email": "a@example.com", "status": "available",
+          "utilization": {"7d": 0.50}}],
+    )
+
+    py = _run_python_check(
+        py_ws / ".loom" / "tokens", monitor_dir, "--source", "monitor", "--ranking"
+    )
+    assert py.returncode == 0, py.stderr
+    rust = _run_rust_check(rust_ws, monitor_dir, "--source", "monitor", "--ranking")
+    assert rust.returncode == 0, rust.stderr
+
+    py_ranking = (py_ws / ".loom" / "tokens" / ".ranking").read_text(encoding="utf-8")
+    rust_ranking = (rust_ws / ".loom" / "tokens" / ".ranking").read_text(
+        encoding="utf-8"
+    )
+    # acct-z keeps its RAW empty status in the file (sorts last, rank 99).
+    assert py_ranking == rust_ranking == "acct-a|available\nacct-z|\n"
+
+
+def test_check_monitor_source_no_fresh_data_leaves_ranking_untouched(tmp_path):
+    index_accounts = [{"name": "acct-a", "email": "a@example.com"}]
+    py_ws = _seed_monitor_pool(tmp_path / "py", index_accounts)
+    rust_ws = _seed_monitor_pool(tmp_path / "rust", index_accounts)
+    monitor_dir = tmp_path / "monitor"
+    # STALE ranking.json (>600s old) -> no fresh data.
+    stale = (
+        datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(hours=2)
+    ).strftime("%Y-%m-%dT%H:%M:%SZ")
+    _write_ranking_json(
+        monitor_dir, stale,
+        [{"email": "a@example.com", "status": "available"}],
+    )
+
+    # Pre-seed a distinctive existing .ranking in both pools.
+    sentinel = "preexisting|available\n"
+    (py_ws / ".loom" / "tokens" / ".ranking").write_text(sentinel, encoding="utf-8")
+    (rust_ws / ".loom" / "tokens" / ".ranking").write_text(sentinel, encoding="utf-8")
+
+    py = _run_python_check(
+        py_ws / ".loom" / "tokens", monitor_dir, "--source", "monitor", "--ranking"
+    )
+    assert py.returncode == 0, py.stderr
+    rust = _run_rust_check(rust_ws, monitor_dir, "--source", "monitor", "--ranking")
+    assert rust.returncode == 0, rust.stderr
+
+    # Both leave the existing .ranking byte-unchanged (empty report, no write).
+    assert (py_ws / ".loom" / "tokens" / ".ranking").read_text(
+        encoding="utf-8"
+    ) == sentinel
+    assert (rust_ws / ".loom" / "tokens" / ".ranking").read_text(
+        encoding="utf-8"
+    ) == sentinel
