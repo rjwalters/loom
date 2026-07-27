@@ -40,13 +40,25 @@
 # the inverted-#4011 silent-success hole where a failed bootout could leave a
 # relaunched daemon dispatching while the script reported success.
 #
+# Autonomy-desired marker (#4011): a normal operator stop is INTENT to stop, so
+# it removes the durable `autonomy-desired` marker loom-daemon-start.sh wrote and
+# boots out the watchdog LaunchAgent — after that the watchdog correctly stays
+# silent (no daemon is expected). But the internal stop that
+# loom-daemon-update.sh performs is NOT operator intent to stop; it is a restart,
+# so update.sh passes --restarting (or LOOM_DAEMON_STOP_KEEP_INTENT=1) and this
+# script PRESERVES the marker + watchdog. Inferring restart-vs-stop would be
+# wrong (every self-update would silently disarm the detector — the exact bug
+# class #4011 fixes), so it must be an explicit signal.
+#
 # Usage:
-#   ./.loom/scripts/cli/loom-daemon-stop.sh            Graceful stop (SIGTERM -> SIGKILL)
-#   ./.loom/scripts/cli/loom-daemon-stop.sh --force    Skip the grace window (SIGKILL)
+#   ./.loom/scripts/cli/loom-daemon-stop.sh              Graceful stop (SIGTERM -> SIGKILL); clears the autonomy-desired marker
+#   ./.loom/scripts/cli/loom-daemon-stop.sh --force      Skip the grace window (SIGKILL)
+#   ./.loom/scripts/cli/loom-daemon-stop.sh --restarting Restart (update.sh): PRESERVE the marker + watchdog
 #   ./.loom/scripts/cli/loom-daemon-stop.sh --help
 #
 # Environment:
 #   LOOM_DAEMON_STOP_GRACE_SECS   Grace window before SIGKILL (default 10)
+#   LOOM_DAEMON_STOP_KEEP_INTENT  1/true/yes: preserve the autonomy-desired marker + watchdog (same as --restarting)
 #   LOOM_LAUNCHD_LABEL            macOS only: the LaunchAgent label to bootout (default com.rjwalters.loom-daemon)
 #   LOOM_DAEMON_LAUNCHD           macOS only: 0/false/no disables ALL launchd interaction
 #                                 (lookup + bootout), symmetric with loom-daemon-start.sh.
@@ -92,10 +104,17 @@ find_repo_root() {
 }
 
 FORCE=false
+# Preserve the autonomy-desired marker + watchdog across this stop? True for a
+# restart (update.sh), false for an operator stop. Env or --restarting.
+KEEP_INTENT=false
+if [[ "${LOOM_DAEMON_STOP_KEEP_INTENT:-}" =~ ^(1|true|yes|on)$ ]]; then
+    KEEP_INTENT=true
+fi
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --help|-h) show_help; exit 0 ;;
         --force|-f) FORCE=true; shift ;;
+        --restarting) KEEP_INTENT=true; shift ;;
         *) err "Unknown option '$1'"; echo "Use --help for usage" >&2; exit 1 ;;
     esac
 done
@@ -108,6 +127,27 @@ fi
 
 PID_FILE="$REPO_ROOT/.loom/.daemon.pid"
 GRACE_SECS="${LOOM_DAEMON_STOP_GRACE_SECS:-10}"
+
+# ---------- autonomy-desired marker + watchdog (#4011) ----------
+SOCKET_PATH="${LOOM_SOCKET_PATH:-$HOME/.loom/loom-daemon.sock}"
+LOOM_DIR="$(dirname "$SOCKET_PATH")"
+INTENT_MARKER="${LOOM_AUTONOMY_MARKER:-$LOOM_DIR/autonomy-desired}"
+
+# Remove the operator-intent marker and bump out the watchdog LaunchAgent. Only
+# called on an operator-initiated stop (NOT a --restarting update.sh stop). After
+# this the watchdog sees no marker and correctly stays silent — no false page on
+# a deliberate stop. Best-effort; failures never change the stop's exit status.
+teardown_autonomy_intent() {
+    rm -f "$INTENT_MARKER" 2>/dev/null || true
+    local wd_label wd_service
+    wd_label="${LOOM_WATCHDOG_LABEL:-${LAUNCHD_LABEL}-watchdog}"
+    wd_service="gui/$(id -u)/${wd_label}"
+    if [[ "$USE_LAUNCHD" == "true" ]] && command -v launchctl >/dev/null 2>&1; then
+        if launchctl print "$wd_service" >/dev/null 2>&1; then
+            launchctl bootout "$wd_service" >/dev/null 2>&1 || true
+        fi
+    fi
+}
 
 # ---------- launchd plumbing (macOS, #3972) ----------
 IS_DARWIN=false
@@ -184,6 +224,9 @@ if [[ -z "$pid" ]] || ! kill -0 "$pid" 2>/dev/null; then
     warn "No running loom-daemon found (nothing to stop)."
     rm -f "$PID_FILE"
     launchd_bootout_if_loaded
+    if [[ "$KEEP_INTENT" != "true" ]]; then
+        teardown_autonomy_intent
+    fi
     exit 0
 fi
 
@@ -236,6 +279,14 @@ if launchd_job_loaded; then
 fi
 
 rm -f "$PID_FILE"
-ok "loom-daemon stopped (pid $pid)."
+# Operator stop ⇒ clear the autonomy-desired marker + watchdog so the detector
+# stays silent (no daemon is expected). A --restarting stop (update.sh) preserves
+# both so a self-update never silently disarms the detector (#4011).
+if [[ "$KEEP_INTENT" != "true" ]]; then
+    teardown_autonomy_intent
+    ok "loom-daemon stopped (pid $pid). Autonomy-desired marker cleared."
+else
+    ok "loom-daemon stopped (pid $pid). Autonomy-desired marker preserved (restart in progress)."
+fi
 echo "In-flight sweeps (if any) were left running by design; the next start reconciles them."
 exit 0

@@ -117,7 +117,17 @@ cat > "$BG_FAKE_BIN" <<'EOF'
 sleep 5
 EOF
 chmod +x "$BG_FAKE_BIN"
-( cd "$WORKDIR" && env -u LOOM_WORK_FINDER -u LOOM_MAIN_HEALTH_GATE LOOM_DAEMON_BIN="$BG_FAKE_BIN" bash "$START_SCRIPT" --no-launchd >/dev/null 2>&1 )
+# LOOM_AUTONOMY_MARKER + LOOM_SOCKET_PATH pin the #4011 autonomy-desired marker
+# and heartbeat path into WORKDIR so a real start never writes the operator's
+# real ~/.loom/autonomy-desired. LOOM_WATCHDOG_LABEL is a scratch label so even
+# if the watchdog script were resolvable here, provisioning could not touch the
+# real com.rjwalters.loom-daemon-watchdog LaunchAgent.
+( cd "$WORKDIR" && env -u LOOM_WORK_FINDER -u LOOM_MAIN_HEALTH_GATE \
+    LOOM_DAEMON_BIN="$BG_FAKE_BIN" \
+    LOOM_SOCKET_PATH="$WORKDIR/.loom/loom-daemon.sock" \
+    LOOM_AUTONOMY_MARKER="$WORKDIR/.loom/autonomy-desired" \
+    LOOM_WATCHDOG_LABEL="com.example.loom-sandbox-$$-watchdog" \
+    bash "$START_SCRIPT" --no-launchd >/dev/null 2>&1 )
 bg_rc=$?
 assert_eq "0" "$bg_rc" "bare (zero-arg) background start exits 0 (no unbound-variable crash, #3968)"
 TESTS_RUN=$((TESTS_RUN + 1))
@@ -128,6 +138,19 @@ else
     TESTS_FAILED=$((TESTS_FAILED + 1))
     echo -e "${RED}✗${NC} bare start persists an EMPTY .loom/.daemon.flags (no autonomy flags to record)"
 fi
+# #4011: a successful start writes the durable autonomy-desired intent marker
+# (into the isolated WORKDIR location pinned above — never the real ~/.loom).
+TESTS_RUN=$((TESTS_RUN + 1))
+if [[ -f "$WORKDIR/.loom/autonomy-desired" ]] \
+    && grep -q '^heartbeat_file=' "$WORKDIR/.loom/autonomy-desired" \
+    && grep -q '^use_launchd=false' "$WORKDIR/.loom/autonomy-desired"; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} bare start writes the autonomy-desired marker with heartbeat + liveness fields (#4011)"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} bare start writes the autonomy-desired marker with heartbeat + liveness fields (#4011)"
+fi
+
 # Clean up the background daemon this test started.
 if [[ -f "$WORKDIR/.loom/.daemon.pid" ]]; then
     kill "$(cat "$WORKDIR/.loom/.daemon.pid" 2>/dev/null)" 2>/dev/null || true

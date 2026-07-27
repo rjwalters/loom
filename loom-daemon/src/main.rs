@@ -1,5 +1,6 @@
 use loom_daemon::activity::{self, ActivityDb, StatsQueries};
 use loom_daemon::claim_reconciliation;
+use loom_daemon::daemon_heartbeat;
 use loom_daemon::epic_supervisor;
 use loom_daemon::event_bus::EventBus;
 use loom_daemon::health_monitor;
@@ -894,6 +895,31 @@ async fn main() -> Result<()> {
             );
             None
         };
+
+    // Declared-cadence liveness heartbeat (Issue #4011): the daemon touches
+    // `<loom_dir>/daemon.heartbeat` on a fixed cadence so a host-side watchdog
+    // (`loom-daemon-watchdog.sh`, a second StartInterval launchd job) can detect
+    // "a daemon should be running but isn't" WITHOUT talking to the daemon — a
+    // dead daemon cannot report its own death, so the reporter must live outside
+    // this process. Default-ON like the token-ranking refresh / watch-monitor
+    // loops (it only writes a small bookkeeping file with no dispatch side
+    // effect); opt out with `LOOM_DAEMON_HEARTBEAT=0` /
+    // `autonomous.heartbeat.enabled=false`. We deliberately do NOT reuse the
+    // token-ranking `.ranking` mtime as an accidental heartbeat: that is a
+    // config-disableable side effect, so a detector keyed to it would silently
+    // stop working when that loop is turned off.
+    let heartbeat_config = daemon_heartbeat::read_heartbeat_config(&sweep_workspace);
+    let _heartbeat_handle = if daemon_heartbeat::resolve_enabled(&heartbeat_config) {
+        let interval = daemon_heartbeat::resolve_interval(&heartbeat_config);
+        log::info!("daemon_heartbeat: enabled (interval={}s)", interval.as_secs());
+        daemon_heartbeat::spawn_heartbeat_task(interval)
+    } else {
+        log::debug!(
+            "daemon_heartbeat: disabled (set LOOM_DAEMON_HEARTBEAT=1 or \
+             autonomous.heartbeat.enabled=true to opt in)"
+        );
+        None
+    };
 
     // Autonomous periodic support-role runner (Issue #4015): dispatches the
     // standalone support roles (Champion, Curator, Judge, Auditor, Guide)

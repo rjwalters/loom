@@ -1375,6 +1375,10 @@ concurrency ceiling 5" and share it with the team:
       "intervalSecs": 120,
       "expirySecs": 86400
     },
+    "heartbeat": {
+      "enabled": true,
+      "intervalSecs": 60
+    },
     "dispatchStaggerMs": 2000,
     "watchdog": {
       "enabled": true,
@@ -1882,6 +1886,89 @@ depending on `bootout` timing. `loom-daemon-stop.sh` also re-verifies (scoped to
 its launchd label) that no daemon is still alive after the stop and exits non-zero
 if one is, closing the silent-success hole where a failed bootout could leave a
 relaunched daemon dispatching.
+
+### Autonomy-loss watchdog + heartbeat (#4011)
+
+**The failure this closes.** On 2026-07-26 the `loom-daemon` launchd job took a
+SIGTERM two seconds after starting and was left `bootout`-ed (unloaded) from
+launchd. Autonomous dispatch silently stopped, and **nothing surfaced it** — no
+log line, no forge signal, no notification. It was discovered hours later only
+because someone happened to run `loom-daemon status` by hand. `loom-daemon
+status` is a *pull*, and that pull is exactly the thing that didn't happen.
+
+The fix is a *host-side* detector that lives **outside** the daemon process — a
+dead daemon cannot report its own death (which is why #3971's in-daemon watch
+loop is not reusable as the reporter). It has three cooperating parts:
+
+1. **Durable autonomy-desired marker** (`<loom_dir>/autonomy-desired`).
+   `loom-daemon-start.sh` writes it on a successful start; **only** an
+   operator-initiated `loom-daemon-stop.sh` removes it. Its lifetime is
+   **operator intent**, not process liveness — deliberately, because both of the
+   "obvious" markers (the pid file, the loaded launchd job) are destroyed by the
+   very stop path that causes an outage, so a detector built on them could not
+   tell a deliberately-stopped daemon from a silently-dead one. The marker
+   records the paths + label the watchdog needs (heartbeat file, cadence,
+   pid file, launchd label, `use_launchd`).
+
+2. **Declared-cadence heartbeat** (`<loom_dir>/daemon.heartbeat`, `loom-daemon/src/daemon_heartbeat.rs`).
+   The running daemon rewrites it every `intervalSecs` (default 60s). This is an
+   *explicit* liveness contract, chosen over piggybacking on the token-ranking
+   `.ranking` mtime (#3969) — that is a config-disableable side effect, so a
+   detector keyed to it would silently stop working when someone turned that loop
+   off. Default-on (read-only, no dispatch side effect); opt out with
+   `LOOM_DAEMON_HEARTBEAT=0` / `autonomous.heartbeat.enabled=false`.
+
+3. **Host-side watchdog** (`loom-daemon-watchdog.sh`), the payload of a **second
+   launchd job** (`<daemon-label>-watchdog`) that `loom-daemon-start.sh`
+   provisions on macOS with a `StartInterval` cadence (default 300s). Each run
+   compares intent (marker present?) against reality (daemon loaded + alive?
+   heartbeat fresh?) and, on divergence, appends a loud line to
+   `<loom_dir>/logs/daemon-watchdog.log` and stderr (which launchd captures).
+
+| File | Env override | Config key | Default |
+|------|--------------|-----------|---------|
+| heartbeat cadence | `LOOM_DAEMON_HEARTBEAT_INTERVAL_SECS` | `autonomous.heartbeat.intervalSecs` | `60` |
+| heartbeat on/off | `LOOM_DAEMON_HEARTBEAT` | `autonomous.heartbeat.enabled` | `true` (on) |
+| watchdog interval | `LOOM_WATCHDOG_INTERVAL_SECS` | — | `300` |
+| staleness threshold | `LOOM_DAEMON_HEARTBEAT_STALE_SECS` | — | `max(5 × cadence, 300)` |
+
+**Why `StartInterval`, not a resident process or `KeepAlive`.** The reporter must
+itself be supervised, but a long-lived resident watchdog just moves the
+who-watches-the-watchdog problem up a level (it too can crash and stay dead). A
+`StartInterval` job owns no long-lived process: launchd re-runs it every interval
+regardless of how the last run exited, so it structurally cannot
+crash-and-stay-dead. `KeepAlive` is deliberately **not** set — it would busy-loop
+a short-lived job. The watchdog exit code (`0` healthy / no daemon expected, `1`
+divergence) is for testability + a human running it by hand; a `StartInterval`
+job's exit code does not affect relaunch.
+
+**Decision matrix** (marker present ⇒ a daemon is expected):
+
+| Reality | Watchdog |
+|---------|----------|
+| daemon alive, heartbeat fresh | silent (OK) |
+| daemon alive, heartbeat **stale** | **report** — daemon may be wedged |
+| daemon alive, no heartbeat file | silent (liveness-only; heartbeat disabled or not yet written) |
+| daemon **not loaded/alive** | **report** — the #4011 outage |
+| marker **absent** | silent — deliberate stop, no false page |
+
+**Marker lifetime across a self-update.** `loom-daemon-update.sh` performs an
+internal stop→start, which is a **restart**, not operator intent to stop — so it
+passes `loom-daemon-stop.sh --restarting` (equivalently
+`LOOM_DAEMON_STOP_KEEP_INTENT=1`), which **preserves** the marker + watchdog. This
+is load-bearing: inferring restart-vs-stop would mean every self-update silently
+disarms the detector — the exact bug class #4011 fixes — so it is an explicit
+signal, never an inference. The subsequent start re-writes the marker and
+re-provisions the watchdog.
+
+**Platform + isolation.** The scheduled watchdog is a launchd job, so on Linux /
+the `--no-launchd` nohup path there is no host-side checker provisioned — the
+marker + heartbeat are still written, and `loom-daemon-watchdog.sh` can be run by
+hand or wired to a cron / systemd timer to consume them. `<loom_dir>` is the
+parent of `LOOM_SOCKET_PATH` (else `~/.loom`), so pointing `LOOM_SOCKET_PATH` at a
+tempdir isolates the marker + heartbeat there too — which is how the lifecycle
+tests avoid ever touching the operator's real `~/.loom`. A forge-side reporting
+channel is an explicit follow-up (out of scope for #4011).
 
 ### macOS session-bootstrap hazard (#3972)
 
