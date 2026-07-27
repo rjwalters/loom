@@ -176,11 +176,44 @@ class RecoveryEntry:
 
 
 @dataclass
+class WatchedEntry:
+    """A ``loom:building`` issue that was inspected but is not (yet) flagged
+    as orphaned because it hasn't cleared the applicable staleness threshold.
+
+    Recorded by :func:`check_untracked_building` every time the staleness
+    gate skips a candidate -- so an operator running the tool, even *without*
+    ``--verbose``, can see exactly which claims were seen and why they were
+    excluded, instead of the exclusion being silent (issue #3975: two of
+    three genuinely-dead claims were silently skipped with no visible trace
+    in the default, non-verbose output).
+    """
+
+    issue: int
+    title: str | None
+    reason: str  # journal_pid_dead | no_spawn_loop_entry | no_journal_record_stale
+    age_seconds: int | None
+    threshold_seconds: float
+
+    def to_dict(self) -> dict[str, Any]:
+        d: dict[str, Any] = {
+            "issue": self.issue,
+            "reason": self.reason,
+            "threshold_seconds": self.threshold_seconds,
+        }
+        if self.title is not None:
+            d["title"] = self.title
+        if self.age_seconds is not None:
+            d["age_seconds"] = self.age_seconds
+        return d
+
+
+@dataclass
 class OrphanRecoveryResult:
     """Result of orphan detection and recovery."""
 
     orphaned: list[OrphanEntry] = field(default_factory=list)
     recovered: list[RecoveryEntry] = field(default_factory=list)
+    watched: list[WatchedEntry] = field(default_factory=list)
     recover_mode: bool = False
 
     @property
@@ -191,12 +224,18 @@ class OrphanRecoveryResult:
     def total_recovered(self) -> int:
         return len(self.recovered)
 
+    @property
+    def total_watched(self) -> int:
+        return len(self.watched)
+
     def to_dict(self) -> dict[str, Any]:
         return {
             "orphaned": [o.to_dict() for o in self.orphaned],
             "recovered": [r.to_dict() for r in self.recovered],
+            "watched": [w.to_dict() for w in self.watched],
             "total_orphaned": self.total_orphaned,
             "total_recovered": self.total_recovered,
+            "total_watched": self.total_watched,
             "recover_mode": self.recover_mode,
         }
 
@@ -650,6 +689,20 @@ def check_untracked_building(
                         f"applied {label_age}s ago (threshold: "
                         f"{threshold_seconds:.0f}s, reason if stale: {reason})"
                     )
+                # Always record the skip -- issue #3975: this used to be
+                # visible only with --verbose, so an operator running the
+                # default (non-verbose) invocation had no trace that a claim
+                # was seen and excluded. `result.watched` makes every
+                # staleness-gated skip visible in both human and JSON output.
+                result.watched.append(
+                    WatchedEntry(
+                        issue=issue_num,
+                        title=issue_title,
+                        reason=reason,
+                        age_seconds=label_age,
+                        threshold_seconds=threshold_seconds,
+                    )
+                )
                 continue
 
         if verbose:
@@ -1121,6 +1174,24 @@ def format_result_human(result: OrphanRecoveryResult) -> str:
             lines.append("")
             lines.append("Run with --recover to fix these issues")
 
+    # Always surface watched (seen-but-not-yet-stale) claims, even in the
+    # zero-orphan case and without --verbose -- issue #3975: a claim excluded
+    # by the staleness gate must never be silent.
+    if result.watched:
+        lines.append("")
+        lines.append(
+            f"{result.total_watched} claim(s) seen but not yet stale enough to reclaim:"
+        )
+        for w in result.watched:
+            age_str = format_duration(w.age_seconds or 0)
+            threshold_str = format_duration(int(w.threshold_seconds))
+            remaining = max(0, int(w.threshold_seconds) - (w.age_seconds or 0))
+            lines.append(
+                f"  [watched] #{w.issue}: {w.title or 'no title'} -- "
+                f"skipped ({w.reason}): label age {age_str}, "
+                f"threshold {threshold_str}, eligible in {format_duration(remaining)}"
+            )
+
     return "\n".join(lines)
 
 
@@ -1138,6 +1209,13 @@ Exit codes:
 Orphan types:
     untracked_building  - Issue has loom:building but no spawn-loop task
     stale_heartbeat     - Spawn-loop task heartbeat is stale and pid is dead
+
+Watched claims (issue #3975):
+    A loom:building issue the staleness gate skipped (label age below the
+    applicable threshold) is never silently dropped -- it is always listed
+    as a "watched" entry, in both human and --json output, with the reason
+    and the remaining time before it becomes eligible. This is distinct
+    from an orphan: a watched claim MAY still be alive.
 
 Recovery actions:
     reset_issue_label       - Swap loom:building -> loom:issue on issue
