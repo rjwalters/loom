@@ -67,12 +67,6 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --workspace
-      # TEMPORARY (#4038): measure the serial-vs-parallel split inside the
-      # loom-daemon lib test binary's ~126.8s wall-clock. Removed before merge.
-      - name: "TEMP #4038: loom-daemon lib tests, default parallelism"
-        run: time cargo test --package loom-daemon --lib
-      - name: "TEMP #4038: loom-daemon lib tests, --test-threads=1"
-        run: time cargo test --package loom-daemon --lib -- --test-threads=1
 
   mcp-build:
     name: MCP Server Build
