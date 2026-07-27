@@ -108,13 +108,16 @@ fi
 #    one line and exits immediately, which the start script's own liveness
 #    check would correctly treat as a startup failure — not what this test
 #    is exercising).
+#    --no-launchd forces the legacy nohup path even on a Darwin test runner —
+#    this test exercises the flags-persistence array guard, not launchd
+#    (#3972), and must never mutate the real machine's LaunchAgents.
 BG_FAKE_BIN="$WORKDIR/fake-loom-daemon-bg"
 cat > "$BG_FAKE_BIN" <<'EOF'
 #!/usr/bin/env bash
 sleep 5
 EOF
 chmod +x "$BG_FAKE_BIN"
-( cd "$WORKDIR" && env -u LOOM_WORK_FINDER -u LOOM_MAIN_HEALTH_GATE LOOM_DAEMON_BIN="$BG_FAKE_BIN" bash "$START_SCRIPT" >/dev/null 2>&1 )
+( cd "$WORKDIR" && env -u LOOM_WORK_FINDER -u LOOM_MAIN_HEALTH_GATE LOOM_DAEMON_BIN="$BG_FAKE_BIN" bash "$START_SCRIPT" --no-launchd >/dev/null 2>&1 )
 bg_rc=$?
 assert_eq "0" "$bg_rc" "bare (zero-arg) background start exits 0 (no unbound-variable crash, #3968)"
 TESTS_RUN=$((TESTS_RUN + 1))

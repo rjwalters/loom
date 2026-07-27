@@ -18,6 +18,17 @@
 #   the reaper reconciles their state on the next start. To actively cancel a
 #   sweep, use `mcp__loom__cancel_sweep` against a running daemon before stopping.
 #
+# macOS launchd counterpart (#3972): when loom-daemon-start.sh loaded the
+# daemon as a `gui/<uid>` LaunchAgent, this script ALSO unloads the launchd
+# job definition (`launchctl bootout`) after the process is confirmed dead —
+# not just kills the pid. This matters because the generated plist sets
+# RunAtLoad=true (mirroring the validated incident-fix plist), so leaving the
+# definition loaded would silently relaunch the daemon at the next login/boot
+# even though the operator explicitly stopped it. The pid-kill sequence itself
+# is unchanged (SIGTERM -> grace -> SIGKILL, sent directly to the resolved
+# pid) — launchd does not auto-respawn on a plain exit (KeepAlive=false), so
+# killing the process first is always safe.
+#
 # Usage:
 #   ./.loom/scripts/cli/loom-daemon-stop.sh            Graceful stop (SIGTERM -> SIGKILL)
 #   ./.loom/scripts/cli/loom-daemon-stop.sh --force    Skip the grace window (SIGKILL)
@@ -25,6 +36,7 @@
 #
 # Environment:
 #   LOOM_DAEMON_STOP_GRACE_SECS   Grace window before SIGKILL (default 10)
+#   LOOM_LAUNCHD_LABEL            macOS only: the LaunchAgent label to bootout (default com.rjwalters.loom-daemon)
 #
 # Exit codes:
 #   0  daemon stopped (or was not running)
@@ -41,7 +53,12 @@ err()  { echo -e "${RED}$*${NC}" >&2; }
 warn() { echo -e "${YELLOW}$*${NC}" >&2; }
 ok()   { echo -e "${GREEN}$*${NC}"; }
 
-show_help() { sed -n '2,35p' "$0" | sed 's/^# \{0,1\}//'; }
+show_help() {
+    # Print the leading comment banner (line 2 through the last comment line
+    # before `set -uo pipefail`), stripping the leading "# ". Same pattern as
+    # loom-daemon-start.sh's show_help -- robust to the banner growing.
+    awk 'NR>=2 { if ($0 !~ /^#/) exit; sub(/^# ?/, ""); print }' "$0"
+}
 
 find_repo_root() {
     local dir="$PWD"
@@ -76,13 +93,46 @@ fi
 PID_FILE="$REPO_ROOT/.loom/.daemon.pid"
 GRACE_SECS="${LOOM_DAEMON_STOP_GRACE_SECS:-10}"
 
-# Resolve the target pid: prefer the PID file, else best-effort pgrep.
+# ---------- launchd plumbing (macOS, #3972) ----------
+IS_DARWIN=false
+[[ "$(uname -s)" == "Darwin" ]] && IS_DARWIN=true
+LAUNCHD_LABEL="${LOOM_LAUNCHD_LABEL:-com.rjwalters.loom-daemon}"
+LAUNCHD_SERVICE="gui/$(id -u)/${LAUNCHD_LABEL}"
+
+launchd_job_loaded() {
+    [[ "$IS_DARWIN" == "true" ]] || return 1
+    command -v launchctl >/dev/null 2>&1 || return 1
+    launchctl print "$LAUNCHD_SERVICE" >/dev/null 2>&1
+}
+
+launchd_job_pid() {
+    launchctl print "$LAUNCHD_SERVICE" 2>/dev/null | awk -F'= ' '/^[[:space:]]*pid = /{gsub(/[^0-9]/, "", $2); print $2; exit}'
+}
+
+# Unload the launchd job definition so it does NOT silently relaunch at the
+# next login/boot (the generated plist sets RunAtLoad=true). Idempotent and
+# best-effort -- a job that was never loaded (or already unloaded) is a no-op.
+launchd_bootout_if_loaded() {
+    if launchd_job_loaded; then
+        launchctl bootout "$LAUNCHD_SERVICE" >/dev/null 2>&1 || true
+    fi
+}
+
+# Resolve the target pid: prefer the PID file, else a launchd lookup (Darwin),
+# else best-effort pgrep.
 pid=""
 if [[ -f "$PID_FILE" ]]; then
     pid=$(cat "$PID_FILE" 2>/dev/null || true)
 fi
 if [[ -z "$pid" ]] || ! kill -0 "$pid" 2>/dev/null; then
-    # PID file missing/stale — fall back to a process match (best effort).
+    # PID file missing/stale — try the launchd job (macOS) before falling
+    # back to a process-name match.
+    if launchd_job_loaded; then
+        launchd_pid=$(launchd_job_pid)
+        [[ -n "$launchd_pid" ]] && pid="$launchd_pid"
+    fi
+fi
+if [[ -z "$pid" ]] || ! kill -0 "$pid" 2>/dev/null; then
     if command -v pgrep >/dev/null 2>&1; then
         pid=$(pgrep -f '(^|/)loom-daemon$' 2>/dev/null | head -n1 || true)
     fi
@@ -91,6 +141,7 @@ fi
 if [[ -z "$pid" ]] || ! kill -0 "$pid" 2>/dev/null; then
     warn "No running loom-daemon found (nothing to stop)."
     rm -f "$PID_FILE"
+    launchd_bootout_if_loaded
     exit 0
 fi
 
@@ -117,6 +168,11 @@ if kill -0 "$pid" 2>/dev/null; then
     err "Failed to stop loom-daemon (pid $pid)."
     exit 1
 fi
+
+# Unload the launchd job definition (macOS, #3972) now that the process is
+# confirmed dead -- RunAtLoad=true on the generated plist means leaving it
+# loaded would silently relaunch the daemon at the next login/boot.
+launchd_bootout_if_loaded
 
 rm -f "$PID_FILE"
 ok "loom-daemon stopped (pid $pid)."

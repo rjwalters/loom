@@ -17,6 +17,9 @@
 #     LOOM_WORK_FINDER unset => off, LOOM_MAIN_HEALTH_GATE unset => off). Opt in
 #     explicitly with --work-finder / --health-gate, or hand control to
 #     .loom/config.json -> autonomous with --from-config (#3911),
+#   - on macOS, backgrounds the daemon as a `gui/<uid>` LaunchAgent (#3972) so
+#     it survives the launching session's death instead of a plain `nohup ...
+#     &`; on Linux it stays a plain nohup background job,
 #   - backgrounds the daemon and writes a PID file (.loom/.daemon.pid),
 #   - persists the resolved invocation flags to .loom/.daemon.flags so
 #     `loom-daemon-update.sh` (#3968) can restart with EXACTLY the same
@@ -27,6 +30,18 @@
 # Default is FLAGS-OFF: a bare `loom-daemon-start.sh` does NOT auto-dispatch
 # sweeps. This is a deliberate safe default — enable autonomy explicitly.
 #
+# macOS session-bootstrap hazard (#3972): a plain `nohup "$DAEMON_BIN" &`
+# leaves the process wired into the LAUNCHING SESSION's Mach bootstrap
+# namespace. When that session dies (a Claude Code session crash, a closed
+# terminal, a dropped SSH connection) the daemon and every child it spawns
+# start failing XPC lookups to trustd (cert verification -- `gh` TLS errors)
+# and opendirectoryd (`getpwuid` -- "No user exists for uid N" from `git`),
+# with NO crash and no obvious log signal beyond those downstream errors. This
+# is why "start it from a terminal that might die" is unsafe on macOS. This
+# script defaults to loading the daemon as a `launchd` LaunchAgent on Darwin
+# specifically to avoid that failure mode; see --no-launchd below for the
+# escape hatch and daemon-reference.md Operability for the incident writeup.
+#
 # Usage:
 #   ./.loom/scripts/cli/loom-daemon-start.sh                 Reliability daemon (both loops OFF)
 #   ./.loom/scripts/cli/loom-daemon-start.sh --work-finder   Enable the autonomous work finder
@@ -36,12 +51,16 @@
 #   ./.loom/scripts/cli/loom-daemon-start.sh --no-work-finder    Force work finder OFF (explicit)
 #   ./.loom/scripts/cli/loom-daemon-start.sh --no-health-gate    Force health gate OFF (explicit)
 #   ./.loom/scripts/cli/loom-daemon-start.sh --foreground    Run in the foreground (no PID file)
+#   ./.loom/scripts/cli/loom-daemon-start.sh --no-launchd    macOS only: use legacy nohup instead of a LaunchAgent
+#   ./.loom/scripts/cli/loom-daemon-start.sh --print-plist   Print the LaunchAgent plist that WOULD be installed and exit (no side effects)
 #   ./.loom/scripts/cli/loom-daemon-start.sh --help
 #
 # Environment:
 #   LOOM_DAEMON_BIN     Path to the loom-daemon binary (else auto-detected)
 #   LOOM_SOCKET_PATH    Override the daemon socket (default ~/.loom/loom-daemon.sock)
 #   LOOM_WORK_FINDER / LOOM_MAIN_HEALTH_GATE  Respected when already exported
+#   LOOM_DAEMON_LAUNCHD  macOS only: 0/false/no forces the legacy nohup path (same as --no-launchd)
+#   LOOM_LAUNCHD_LABEL   macOS only: override the LaunchAgent label (default com.rjwalters.loom-daemon)
 #
 # Exit codes:
 #   0  daemon started (or already running)
@@ -101,6 +120,74 @@ locate_daemon_bin() {
     echo ""
 }
 
+# ---------- launchd plist rendering (#3972) ----------
+# Pure string rendering -- safe to call on ANY platform (used by
+# --print-plist for inspection/testing). The actual `launchctl` invocation
+# that consumes this plist is gated to Darwin separately, below.
+xml_escape() {
+    local s="$1"
+    s="${s//&/&amp;}"
+    s="${s//</&lt;}"
+    s="${s//>/&gt;}"
+    printf '%s' "$s"
+}
+
+resolve_launchd_label() {
+    echo "${LOOM_LAUNCHD_LABEL:-com.rjwalters.loom-daemon}"
+}
+
+# render_launchd_plist <label> <daemon_bin> <workdir> <log_path>
+# Prints the LaunchAgent plist XML to stdout. Mirrors the hand-written plist
+# that validated the #3972 fix during the incident
+# (~/Library/LaunchAgents/com.rjwalters.loom-daemon.plist): RunAtLoad=true
+# (the daemon also comes back after a reboot/re-login, not just a session
+# death -- strictly more durable than the pre-#3972 nohup contract, which
+# didn't survive a reboot either) and KeepAlive=false (launchd does not
+# auto-respawn a crashed daemon; that stays the reaper/operator's job, same as
+# before). Lifecycle (first start / explicit stop) is still entirely
+# operator-driven via loom-daemon-start.sh / loom-daemon-stop.sh -- bootout on
+# stop unloads the definition so it does NOT come back at the next login. The
+# PATH is the CURRENT PATH plus a fallback set (~/.local/bin, ~/.cargo/bin,
+# Homebrew, standard bin dirs) so `gh`, `git`, `cargo`, and `python3` resolve
+# inside the LaunchAgent's minimal launchd environment even if the interactive
+# shell's PATH customizations aren't present there. Every already-exported
+# LOOM_* / GH_TOKEN / GITEA_TOKEN / FORGE_TOKEN var is forwarded verbatim so
+# the launchd job sees EXACTLY the autonomy flags and auth this invocation
+# resolved -- never wider, never narrower (#3972 AC: "preserves the current
+# flag semantics").
+render_launchd_plist() {
+    local label="$1" bin="$2" workdir="$3" log_path="$4"
+    local plist_path_value="${PATH}:${HOME}/.local/bin:${HOME}/.cargo/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+
+    local env_entries=""
+    env_entries+="        <key>PATH</key>\n        <string>$(xml_escape "$plist_path_value")</string>\n"
+    env_entries+="        <key>HOME</key>\n        <string>$(xml_escape "$HOME")</string>\n"
+
+    local line key value
+    while IFS= read -r line; do
+        [[ -z "$line" ]] && continue
+        key="${line%%=*}"
+        value="${line#*=}"
+        env_entries+="        <key>$(xml_escape "$key")</key>\n        <string>$(xml_escape "$value")</string>\n"
+    done < <(env | grep -E '^(LOOM_[A-Za-z0-9_]*|GH_TOKEN|GITEA_TOKEN|FORGE_TOKEN)=' || true)
+
+    printf '<?xml version="1.0" encoding="UTF-8"?>\n'
+    printf '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n'
+    printf '<plist version="1.0">\n<dict>\n'
+    printf '    <key>Label</key>\n    <string>%s</string>\n' "$(xml_escape "$label")"
+    printf '    <key>ProgramArguments</key>\n    <array>\n        <string>%s</string>\n    </array>\n' "$(xml_escape "$bin")"
+    printf '    <key>WorkingDirectory</key>\n    <string>%s</string>\n' "$(xml_escape "$workdir")"
+    printf '    <key>EnvironmentVariables</key>\n    <dict>\n'
+    printf '%b' "$env_entries"
+    printf '    </dict>\n'
+    printf '    <key>RunAtLoad</key>\n    <true/>\n'
+    printf '    <key>KeepAlive</key>\n    <false/>\n'
+    printf '    <key>ProcessType</key>\n    <string>Background</string>\n'
+    printf '    <key>StandardOutPath</key>\n    <string>%s</string>\n' "$(xml_escape "$log_path")"
+    printf '    <key>StandardErrorPath</key>\n    <string>%s</string>\n' "$(xml_escape "$log_path")"
+    printf '</dict>\n</plist>\n'
+}
+
 # ---------- args ----------
 # Capture the raw invocation args before the parsing loop consumes "$@" — used
 # below to persist exactly what was passed (Issue #3968: `loom-daemon-update.sh`
@@ -115,6 +202,8 @@ FROM_CONFIG=false
 FOREGROUND=false
 WANT_WORK_FINDER=false
 WANT_HEALTH_GATE=false
+NO_LAUNCHD=false
+PRINT_PLIST=false
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --help|-h) show_help; exit 0 ;;
@@ -124,6 +213,8 @@ while [[ $# -gt 0 ]]; do
         --health-gate) WANT_HEALTH_GATE=true; shift ;;
         --no-work-finder) WANT_WORK_FINDER=false; shift ;;
         --no-health-gate) WANT_HEALTH_GATE=false; shift ;;
+        --no-launchd) NO_LAUNCHD=true; shift ;;
+        --print-plist) PRINT_PLIST=true; shift ;;
         *) err "Unknown option '$1'"; echo "Use --help for usage" >&2; exit 1 ;;
     esac
 done
@@ -233,7 +324,7 @@ FLAGS_FILE="$REPO_ROOT/.loom/.daemon.flags"
 if [[ "${#ORIGINAL_ARGS[@]}" -gt 0 ]]; then
     for _flag_arg in "${ORIGINAL_ARGS[@]}"; do
         case "$_flag_arg" in
-            --foreground|--fg|--help|-h) continue ;;
+            --foreground|--fg|--help|-h|--no-launchd|--print-plist) continue ;;
             *) echo "$_flag_arg" >> "$FLAGS_FILE" ;;
         esac
     done
@@ -250,8 +341,110 @@ if [[ "$FOREGROUND" == "true" ]]; then
     exec "$DAEMON_BIN"
 fi
 
+# ---------- platform detection (#3972) ----------
+IS_DARWIN=false
+[[ "$(uname -s)" == "Darwin" ]] && IS_DARWIN=true
+
+USE_LAUNCHD=false
+if [[ "$IS_DARWIN" == "true" ]]; then
+    USE_LAUNCHD=true
+    if [[ "${LOOM_DAEMON_LAUNCHD:-}" =~ ^(0|false|no)$ ]]; then
+        USE_LAUNCHD=false
+    fi
+fi
+[[ "$NO_LAUNCHD" == "true" ]] && USE_LAUNCHD=false
+
+# ---------- --print-plist: pure inspection, no side effects ----------
+if [[ "$PRINT_PLIST" == "true" ]]; then
+    render_launchd_plist "$(resolve_launchd_label)" "$DAEMON_BIN" "$REPO_ROOT" "$START_LOG"
+    exit 0
+fi
+
 # ---------- background + PID file ----------
 : > "$START_LOG"
+
+if [[ "$USE_LAUNCHD" == "true" ]] && ! command -v launchctl >/dev/null 2>&1; then
+    warn "launchctl not found despite running on Darwin -- falling back to nohup."
+    USE_LAUNCHD=false
+fi
+
+if [[ "$USE_LAUNCHD" == "true" ]]; then
+    # ---------- macOS: launchd LaunchAgent (#3972) ----------
+    # A plain `nohup ... &` stays in the LAUNCHING SESSION's Mach bootstrap
+    # namespace; when that session dies, trustd/opendirectoryd XPC lookups
+    # start failing for the daemon and every child it spawns (gh TLS errors,
+    # "No user exists for uid N" from git) with no crash and no obvious log
+    # signal. Loading as a `gui/<uid>` LaunchAgent keeps the daemon in the
+    # user's durable GUI bootstrap domain instead, independent of whichever
+    # terminal/session launched it. See daemon-reference.md Operability for
+    # the incident writeup. Escape hatch: --no-launchd / LOOM_DAEMON_LAUNCHD=0.
+    LAUNCHD_LABEL=$(resolve_launchd_label)
+    LAUNCHD_UID=$(id -u)
+    LAUNCHD_DOMAIN="gui/${LAUNCHD_UID}"
+    LAUNCHD_SERVICE="${LAUNCHD_DOMAIN}/${LAUNCHD_LABEL}"
+    PLIST_DIR="$HOME/Library/LaunchAgents"
+    PLIST_FILE="$PLIST_DIR/${LAUNCHD_LABEL}.plist"
+    mkdir -p "$PLIST_DIR"
+
+    render_launchd_plist "$LAUNCHD_LABEL" "$DAEMON_BIN" "$REPO_ROOT" "$START_LOG" > "$PLIST_FILE"
+
+    echo "Launchd label:  $LAUNCHD_LABEL"
+    echo "Launchd plist:  $PLIST_FILE"
+
+    # Reload with the freshly-rendered plist every time -- a job left loaded
+    # from a prior invocation (possibly with different flags/env) must not
+    # silently keep running its OLD definition.
+    if launchctl print "$LAUNCHD_SERVICE" >/dev/null 2>&1; then
+        launchctl bootout "$LAUNCHD_SERVICE" >/dev/null 2>&1 || true
+    fi
+
+    BOOTSTRAP_ERR="$START_LOG.bootstrap-err"
+    if ! launchctl bootstrap "$LAUNCHD_DOMAIN" "$PLIST_FILE" 2>"$BOOTSTRAP_ERR"; then
+        err "launchctl bootstrap failed for $LAUNCHD_SERVICE:"
+        cat "$BOOTSTRAP_ERR" >&2 2>/dev/null || true
+        rm -f "$BOOTSTRAP_ERR"
+        exit 1
+    fi
+    rm -f "$BOOTSTRAP_ERR"
+
+    # RunAtLoad=true means bootstrap alone would already start it, but we
+    # kickstart -k explicitly anyway so THIS invocation deterministically wins
+    # (the -k kill-first semantics guarantee a fresh process picking up the
+    # plist we just wrote, rather than racing launchd's own RunAtLoad timing).
+    KICKSTART_ERR="$START_LOG.kickstart-err"
+    if ! launchctl kickstart -k "$LAUNCHD_SERVICE" 2>"$KICKSTART_ERR"; then
+        err "launchctl kickstart failed for $LAUNCHD_SERVICE:"
+        cat "$KICKSTART_ERR" >&2 2>/dev/null || true
+        rm -f "$KICKSTART_ERR"
+        exit 1
+    fi
+    rm -f "$KICKSTART_ERR"
+
+    # Give it a moment to either bind the socket or trip the singleton guard.
+    sleep 2
+
+    daemon_pid=$(launchctl print "$LAUNCHD_SERVICE" 2>/dev/null | awk -F'= ' '/^[[:space:]]*pid = /{gsub(/[^0-9]/, "", $2); print $2; exit}')
+
+    if [[ -z "$daemon_pid" ]] || ! kill -0 "$daemon_pid" 2>/dev/null; then
+        err "loom-daemon did not stay running under launchd ($LAUNCHD_SERVICE)."
+        if [[ -s "$START_LOG" ]]; then
+            echo "----- startup output ($START_LOG) -----" >&2
+            tail -n 20 "$START_LOG" >&2
+            echo "---------------------------------------" >&2
+        fi
+        warn "If another daemon is already listening on the socket, stop it first"
+        warn "(./.loom/scripts/cli/loom-daemon-stop.sh) and retry."
+        exit 1
+    fi
+
+    echo "$daemon_pid" > "$PID_FILE"
+    ok "loom-daemon started under launchd (pid $daemon_pid, label $LAUNCHD_LABEL)."
+    echo "PID file: $PID_FILE"
+    echo "Stop with: ./.loom/scripts/cli/loom-daemon-stop.sh"
+    exit 0
+fi
+
+# ---------- Linux (or --no-launchd): plain nohup background job ----------
 nohup "$DAEMON_BIN" >> "$START_LOG" 2>&1 &
 daemon_pid=$!
 
