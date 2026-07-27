@@ -24,6 +24,13 @@
 
 set -uo pipefail
 
+# Force the legacy nohup path everywhere in this suite (#3972): the restart
+# flow below exercises the REAL loom-daemon-start.sh / loom-daemon-stop.sh
+# (not a mock), and this test must NEVER touch the real machine's
+# ~/Library/LaunchAgents/ -- which may hold an actual production
+# com.rjwalters.loom-daemon LaunchAgent under the exact same default label.
+export LOOM_DAEMON_LAUNCHD=0
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CLI_DIR="$(cd "$SCRIPT_DIR/../cli" && pwd)"
 UPDATE_SCRIPT="$CLI_DIR/loom-daemon-update.sh"

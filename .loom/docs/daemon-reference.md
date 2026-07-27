@@ -1311,6 +1311,9 @@ process:
   default),
 - locates the `loom-daemon` binary (`LOOM_DAEMON_BIN` → `PATH` → `target/{release,debug}`),
 - runs the **advisory** host-sleep check (`check-host-sleep.sh`, #3350) — never blocks the start,
+- **on macOS, backgrounds the daemon as a `gui/<uid>` LaunchAgent** instead of a
+  plain `nohup … &` (#3972 — see "macOS session-bootstrap hazard" below); on
+  Linux it stays a plain nohup background job,
 - backgrounds the daemon and writes a PID file at `.loom/.daemon.pid` (gitignored),
 - refuses a second start when the PID file points at a live process, and surfaces
   the daemon's own **singleton-guard** refusal (#3806) — if the backgrounded
@@ -1319,7 +1322,8 @@ process:
 
 `loom-daemon-stop.sh` sends **SIGTERM** (not just Ctrl-C/SIGINT — the daemon now
 handles both, #3813), waits `LOOM_DAEMON_STOP_GRACE_SECS` (default 10s), then
-escalates to SIGKILL.
+escalates to SIGKILL. On macOS it additionally `launchctl bootout`s the
+LaunchAgent job definition once the process is confirmed dead (see below).
 
 **Shutdown decision — sweeps survive, they are not drained.** A clean daemon stop
 removes the Unix socket and exits, but **does not cancel in-flight `/loom:sweep`
@@ -1328,6 +1332,85 @@ restart by design — killing the dispatcher must not kill dispatched work — a
 the registry reconciles their state on the next start (`SweepRegistry::reconstruct`
 re-admits live-lock owners). To actively cancel a sweep, use
 `mcp__loom__cancel_sweep` against a running daemon *before* stopping it.
+
+### macOS session-bootstrap hazard (#3972)
+
+**Incident (2026-07-26).** The daemon was started at 21:48 via
+`loom-daemon-start.sh` from inside a Claude Code session. That session crashed
+at 02:49. From the very next work-finder tick (02:50:21), **every** `gh` call
+in the daemon's process tree failed with `tls: failed to verify certificate:
+x509: OSStatus -26276` and `git fetch` failed with `No user exists for uid 501`
+— while the identical commands worked perfectly from any fresh shell. The
+daemon ran blind for ~35 minutes: the work finder saw 0 issues (4 errors/tick),
+the main-health gate went RED on purely environmental failures, and in-flight
+sweep children couldn't reach the forge either.
+
+**Root cause.** The pre-#3972 `loom-daemon-start.sh` detached the process with
+a plain `nohup "$DAEMON_BIN" … &`. `nohup` makes the process immune to
+`SIGHUP`, but it does **not** move the process out of the *launching session's*
+Mach bootstrap namespace — the process stays registered under whichever
+terminal/Claude-Code-session/SSH-connection Mach service happened to spawn it.
+When that session's context is torn down, XPC lookups the daemon (and every
+child it spawns) depend on start failing with no crash and no obvious log
+signal:
+
+- **`trustd`** (certificate verification) — the underlying cause of the `gh`
+  TLS/OSStatus errors, since Go's Darwin certificate verifier round-trips
+  through `trustd` via XPC.
+- **`opendirectoryd`** (`getpwuid`) — the underlying cause of git's
+  "No user exists for uid N", since `git` resolves the current user via
+  `getpwuid()`, which is backed by `opendirectoryd` on macOS.
+
+This is why **"start it from a terminal that might die" is unsafe on macOS**.
+Linux does not have this failure mode — a systemd user session (or a plain
+`nohup` under `init`) does not tie a background process's XPC-equivalent
+identity to the shell that spawned it.
+
+**Fix.** `loom-daemon-start.sh` now generates a `launchd` LaunchAgent plist and
+loads it with `launchctl bootstrap gui/<uid>` instead of `nohup`-backgrounding
+in-process (Darwin only — Linux is unaffected and keeps the plain nohup path).
+This was validated during the incident itself: relaunching the identical
+binary as a launchd agent immediately restored `gh`/`git` — the first tick
+after migration reported `13 seen, 3 dispatched, 0 error(s)`.
+
+- **Plist location & label**: `~/Library/LaunchAgents/com.rjwalters.loom-daemon.plist`
+  (override the label with `LOOM_LAUNCHD_LABEL`). Regenerated and reloaded
+  (`bootout` the old definition, then a fresh `bootstrap` + `kickstart -k`) on
+  **every** start, so a later invocation's flags/env always win over a stale
+  loaded definition.
+- **Environment forwarding**: the plist's `PATH` is the current `PATH` plus a
+  fallback set (`~/.local/bin`, `~/.cargo/bin`, Homebrew, standard bin dirs) so
+  `gh`, `git`, `cargo`, and `python3` resolve even inside launchd's minimal
+  environment. Every already-exported `LOOM_*` / `GH_TOKEN` / `GITEA_TOKEN` /
+  `FORGE_TOKEN` var is forwarded verbatim, so the FLAGS-OFF / `--work-finder` /
+  `--health-gate` / `--from-config` semantics are preserved exactly — the
+  launchd job never sees a wider or narrower autonomy configuration than a
+  plain nohup start would have resolved.
+- **`RunAtLoad=true` / `KeepAlive=false`**: mirrors the hand-written plist that
+  validated this fix during the incident. `RunAtLoad=true` means the daemon
+  also survives a reboot/re-login, not just the death of one particular
+  session — strictly *more* durable than the pre-#3972 nohup contract (which
+  didn't survive a reboot either). `KeepAlive=false` means launchd does **not**
+  auto-respawn a crashed daemon; that responsibility stays with the reaper /
+  operator, unchanged from before. `loom-daemon-stop.sh` `bootout`s the loaded
+  definition after confirming the process is dead, specifically so an explicit
+  stop is honored at the next login too (otherwise `RunAtLoad=true` would
+  silently relaunch it).
+- **Escape hatch**: `--no-launchd` (or `LOOM_DAEMON_LAUNCHD=0`) forces the
+  legacy nohup path even on Darwin — e.g. for a sandboxed/headless macOS runner
+  with no GUI login session where `gui/<uid>` may not resolve.
+- **Inspection without side effects**: `--print-plist` renders the exact plist
+  XML this invocation would install and exits — no `launchctl` call, no file
+  write to `~/Library/LaunchAgents`. Useful for auditing exactly what
+  environment/flags a given invocation would forward.
+- **Linux**: unaffected — `nohup` stays the mechanism, since a systemd user
+  session doesn't tie process identity to the spawning shell the way macOS's
+  Mach bootstrap does. Operators who want equivalent extra hardening on Linux
+  (e.g. surviving a `systemd --user` session teardown in an unusual setup) can
+  optionally wrap the start in `systemd-run --user --scope
+  ./.loom/scripts/cli/loom-daemon-start.sh` — not required for the documented
+  failure mode, since it doesn't reproduce on Linux, but available as a
+  belt-and-suspenders option.
 
 ### Self-update (rebuild + provision + restart, #3968)
 
