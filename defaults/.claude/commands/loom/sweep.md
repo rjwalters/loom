@@ -1701,6 +1701,19 @@ This is advisory-only. The script always exits `0` and **must not block** the sw
 
 If the check warns, the operator should refresh local `main` (and re-sync installed copies if their install flow does so) before relying on stacked-dependency or auto-reconcile behavior mid-sweep.
 
+## Sweep Child Working-Set Contract (#3980)
+
+Every dispatched child of a sweep — Curator/Builder/Judge/Doctor/Champion subagents, and any test suite or tool subprocess they invoke — is expected to stay within a fixed filesystem working set:
+
+- the **workspace root** it was dispatched into (the repo checkout or its issue worktree under `.loom/worktrees/issue-<N>`),
+- **`.loom/`** (worktrees, logs, tokens, checkpoints),
+- **`.claude*`** config directories, and
+- **`$TMPDIR` / `/private/tmp`** scratch space.
+
+This matters most on macOS running the daemon as a launchd LaunchAgent (#3972): unlike the legacy nohup model, a launchd job is its own TCC-responsible process, so any child that reaches outside this contract into a protected folder (`~/Desktop`, `~/Documents`, `~/Downloads`, `~/Pictures`, `~/Music`, `~/Library/Mobile Documents`/iCloud, …) triggers a fresh macOS permission prompt — see [`.loom/docs/daemon-reference.md` § "macOS TCC hygiene under launchd"](../../../.loom/docs/daemon-reference.md#macos-tcc-hygiene-under-launchd-3980) for the full incident, the fix already applied to `claude-wrapper.sh`'s crash-recovery path, and why Full Disk Access is never the right remediation.
+
+Recursive scans that escape this contract — `find ~`, `du -sh ~`, `grep -r` rooted at `$HOME`, a script that `cd`'d to the wrong place before globbing, a test suite writing fixtures to `~/Documents` instead of a tmpdir, a tool resolving an iCloud-synced path — are **out-of-scope defects** in the offending role prompt, hook, or test fixture, not ambient behavior. If a sweep child needs scratch space, it should stay under the workspace root or `$TMPDIR`, never under a bare `$HOME`-relative path.
+
 ## Coexistence (peer `/loom:sweep` and legacy daemon)
 
 `/loom:sweep` coexists with two **distinct** kinds of other runner, detected by two **separate** mechanisms. Do not conflate them: "another `/loom:sweep` is running" (peer detection, #3768) is not the same as "the legacy daemon is running" (daemon-PID check). Both warnings are **loud but non-blocking** — warn once, never auto-stop, never block.
