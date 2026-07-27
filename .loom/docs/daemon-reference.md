@@ -1277,6 +1277,77 @@ the registry reconciles their state on the next start (`SweepRegistry::reconstru
 re-admits live-lock owners). To actively cancel a sweep, use
 `mcp__loom__cancel_sweep` against a running daemon *before* stopping it.
 
+### Self-update (rebuild + provision + restart, #3968)
+
+The daemon's self-repair loop can file **and fix** its own defects — proven
+during the 2026-07-25/26 canary rollout, which produced 16 self-filed daemon
+fixes — but every merged fix historically only took effect after an operator
+manually rebuilt the Rust binary, reprovisioned it, and restarted the process.
+`loom-daemon-update.sh` is the single operator command that closes that gap:
+
+```bash
+./.loom/scripts/cli/loom-daemon-update.sh              # detect, rebuild if stale, provision, restart (preserving flags)
+./.loom/scripts/cli/loom-daemon-update.sh --check       # detect only; exit 0 (up to date) / 3 (update available); no writes
+./.loom/scripts/cli/loom-daemon-update.sh --dry-run     # print the plan without building/provisioning/restarting
+./.loom/scripts/cli/loom-daemon-update.sh --force       # rebuild + provision + restart even if already up to date
+./.loom/scripts/cli/loom-daemon-update.sh --no-restart  # rebuild + provision only; leave the running daemon untouched
+```
+
+**Staleness detection** is primary-local, zero-network: it compares the git
+commit **baked into** the currently-resolved `loom-daemon` binary (embedded at
+build time via `build.rs` → `LOOM_DAEMON_GIT_COMMIT`, the same value folded
+into `loom-daemon --version`) against the **local source tree's** current
+`HEAD` short commit — directly answering "would rebuilding right now produce a
+different binary?". Separately, and purely **advisory** (it never gates the
+rebuild decision), the script bounded-fetches `origin/<default-branch>` and
+warns when local `HEAD` itself is behind, mirroring
+`check-main-freshness.sh`'s pattern — so a cron-scheduled run distinguishes
+"you're current with local HEAD" from "local HEAD is itself stale".
+
+**Flag preservation (the FLAGS-OFF/opt-in contract, never widened)**:
+`loom-daemon-start.sh` now persists its resolved invocation flags to
+`.loom/.daemon.flags` (gitignored, one flag per line) on every start attempt —
+`--foreground`/`--help` are filtered out (script-only, not autonomy state);
+`--from-config`, `--work-finder`, `--health-gate`, `--no-work-finder`,
+`--no-health-gate` are kept verbatim. `loom-daemon-update.sh` reads this file
+and replays it **exactly** on restart — a daemon started bare (FLAGS-OFF)
+restarts bare; a daemon started `--work-finder` restarts `--work-finder`,
+never gaining `--health-gate` it didn't have. A missing flags file (a daemon
+started before #3968, or manually) falls back to a bare FLAGS-OFF restart
+rather than guessing, with a loud warning.
+
+**A daemon that was NOT running is never started.** If `.loom/.daemon.pid`
+has no live process at update time, the script rebuilds and provisions but
+prints "was not running — nothing to restart" and stops — it never widens the
+system state by starting autonomy (or anything) that wasn't already running.
+Combined with the "in-flight sweeps survive a stop" shutdown decision above,
+a rebuild-and-restart window never kills active dispatched work and never
+silently upgrades a stopped daemon into a running one.
+
+**Provisioning** targets wherever the resolved binary lives: an explicit
+`LOOM_DAEMON_BIN` override is provisioned in place; otherwise the fresh binary
+is installed to the machine-level location via
+`scripts/install/provision-daemon.sh`'s `provision_machine_daemon` (default
+`~/.local/bin/loom-daemon`, override `LOOM_DAEMON_BIN_DIR`) — the same
+convention `loom-daemon-start.sh` already resolves through `command -v
+loom-daemon`.
+
+**Read-only "update available" surface (`loom-daemon --status`)**: separately
+from the update script, `loom-daemon --status` / `--status --json` now prints
+a purely local, read-only self-update line — the same built-commit-vs-source-HEAD
+comparison, computed in-process (`self_update::check()`) with at most one `git
+rev-parse` subprocess and zero network calls. It never triggers a rebuild or
+restart on its own; it is advisory-only, matching the required "no auto-restart
+without opt-in" contract. Example:
+
+```
+Self-update: built from ab12cd3 — UPDATE AVAILABLE (source checkout HEAD is de45f67); run `./.loom/scripts/cli/loom-daemon-update.sh` to rebuild + provision + restart
+```
+
+`loom-daemon-update.sh` requires an actual Loom source checkout
+(`loom-daemon/Cargo.toml` must exist) — it rebuilds from source and refuses to
+run against a binary-only / release-tarball install.
+
 ### End-to-end acceptance playbook
 
 The goal state — "file a `loom:triage` issue, watch it build" with zero operator

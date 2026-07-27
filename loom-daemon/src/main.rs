@@ -7,6 +7,7 @@ use loom_daemon::ipc::IpcServer;
 use loom_daemon::main_health_gate;
 use loom_daemon::metrics_collector;
 use loom_daemon::role_validation;
+use loom_daemon::self_update;
 use loom_daemon::sweep_registry::{self, SweepRegistry, SweepRegistryConfig};
 use loom_daemon::terminal::TerminalManager;
 use loom_daemon::types::{DaemonStatusReport, Request, Response, SweepKind};
@@ -1330,10 +1331,17 @@ async fn handle_status_command(json: bool) -> Result<()> {
     // does NOT perform inside the IPC handler; collect it client-side here.
     let token_usage = collect_token_usage();
 
+    // Self-update staleness (#3968): purely local, read-only — compares the
+    // commit baked into THIS `loom-daemon --status` binary against the source
+    // checkout's current HEAD, when that checkout is still on this machine.
+    // Advisory only; never triggers a rebuild or restart (see
+    // `.loom/scripts/cli/loom-daemon-update.sh` for the opt-in update flow).
+    let update = self_update::check();
+
     if json {
-        print_status_json(&report, token_usage.as_ref())?;
+        print_status_json(&report, token_usage.as_ref(), &update)?;
     } else {
-        print_status_human(&report, token_usage.as_ref());
+        print_status_human(&report, token_usage.as_ref(), &update);
     }
     Ok(())
 }
@@ -1446,6 +1454,7 @@ fn resolve_capacity(
 fn print_status_json(
     report: &DaemonStatusReport,
     token_usage: Option<&serde_json::Value>,
+    update: &self_update::SelfUpdateStatus,
 ) -> Result<()> {
     let rc = resolve_capacity(report, token_usage);
     let combined = serde_json::json!({
@@ -1488,6 +1497,13 @@ fn print_status_json(
             "health_gate_not_evaluated_reason": r.health_gate_not_evaluated_reason,
         })).collect::<Vec<_>>(),
         "token_usage": token_usage,
+        // Self-update staleness (#3968) — read-only, local-only comparison of
+        // this binary's baked-in commit vs. the source checkout's HEAD.
+        "self_update": {
+            "built_commit": update.built_commit,
+            "source_commit": update.source_commit,
+            "update_available": update.update_available,
+        },
     });
     println!("{}", serde_json::to_string_pretty(&combined)?);
     Ok(())
@@ -1522,7 +1538,11 @@ fn format_gate_status(halted: bool, not_evaluated: bool, reason: Option<&str>) -
 }
 
 /// Emit the combined status as a human-readable table.
-fn print_status_human(report: &DaemonStatusReport, token_usage: Option<&serde_json::Value>) {
+fn print_status_human(
+    report: &DaemonStatusReport,
+    token_usage: Option<&serde_json::Value>,
+    update: &self_update::SelfUpdateStatus,
+) {
     println!("\n=== Loom Autonomous Daemon Status ===\n");
 
     println!("In-flight sweeps: {}", report.in_flight.len());
@@ -1679,6 +1699,19 @@ fn print_status_human(report: &DaemonStatusReport, token_usage: Option<&serde_js
             "  (unavailable — `loom-tokens check --json` failed or the token pool is not bootstrapped)"
         ),
     }
+
+    // Self-update staleness (#3968) — read-only, local-only. Never implies an
+    // auto-restart; run `.loom/scripts/cli/loom-daemon-update.sh` to act on it.
+    print!("\nSelf-update: built from {}", update.built_commit);
+    match (update.source_commit.as_deref(), update.update_available) {
+        (Some(source), Some(true)) => println!(
+            " — UPDATE AVAILABLE (source checkout HEAD is {source}); run \
+             `./.loom/scripts/cli/loom-daemon-update.sh` to rebuild + provision + restart"
+        ),
+        (Some(source), Some(false)) => println!(" — up to date with source HEAD ({source})"),
+        _ => println!(" (source checkout not found on this machine; staleness unknown)"),
+    }
+
     println!();
 }
 

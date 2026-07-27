@@ -29,6 +29,7 @@ pub mod main_health_gate;
 pub mod metrics_collector;
 pub mod phase_join;
 pub mod role_validation;
+pub mod self_update;
 pub mod sweep_journal;
 pub mod sweep_registry;
 pub mod terminal;
