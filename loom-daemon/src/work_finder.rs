@@ -743,25 +743,8 @@ pub struct WorkFinderConfig {
 /// so it falls through to the built-in default rather than a useless value.
 #[must_use]
 pub fn read_work_finder_config(repo_root: &Path) -> WorkFinderConfig {
-    let config_path = repo_root.join(".loom").join("config.json");
-
-    let config_str = match std::fs::read_to_string(&config_path) {
-        Ok(s) => s,
-        Err(e) => {
-            log::debug!("work_finder: could not read config at {}: {e}", config_path.display());
-            return WorkFinderConfig::default();
-        }
-    };
-
-    let config: serde_json::Value = match serde_json::from_str(&config_str) {
-        Ok(v) => v,
-        Err(e) => {
-            log::warn!("work_finder: could not parse config at {}: {e}", config_path.display());
-            return WorkFinderConfig::default();
-        }
-    };
-
-    let Some(autonomous) = config.get("autonomous") else {
+    let effective = crate::config_resolver::resolve_effective_config(repo_root);
+    let Some(autonomous) = crate::config_resolver::get_path(&effective, "autonomous") else {
         return WorkFinderConfig::default();
     };
 
@@ -2721,6 +2704,70 @@ exit 0
         assert_eq!(cfg.enabled, Some(true));
         assert_eq!(cfg.interval_secs, None);
         assert_eq!(cfg.max_concurrent, None);
+    }
+
+    // ===================================================================
+    // config_resolver migration (#4058) — tier precedence
+    // ===================================================================
+
+    fn write_project_config(dir: &Path, body: &str) {
+        let full = dir.join(crate::config_resolver::PROJECT_CONFIG_REL);
+        std::fs::create_dir_all(full.parent().unwrap()).unwrap();
+        std::fs::write(full, body).unwrap();
+    }
+
+    fn write_local_config(dir: &Path, body: &str) {
+        let full = dir.join(crate::config_resolver::LOCAL_CONFIG_REL);
+        std::fs::create_dir_all(full.parent().unwrap()).unwrap();
+        std::fs::write(full, body).unwrap();
+    }
+
+    #[test]
+    #[serial(loom_config_env)]
+    fn test_config_project_tier_only_is_honored_like_legacy() {
+        std::env::set_var(crate::config_resolver::PRIVATE_DEFAULTS_ENV, "");
+        let tmp = tempfile::tempdir().unwrap();
+        write_project_config(
+            tmp.path(),
+            r#"{"autonomous": {"perTokenConcurrency": 4, "workFinder": {"enabled": true, "maxConcurrent": 5}}}"#,
+        );
+        let cfg = read_work_finder_config(tmp.path());
+        std::env::remove_var(crate::config_resolver::PRIVATE_DEFAULTS_ENV);
+        assert_eq!(cfg.enabled, Some(true));
+        assert_eq!(cfg.max_concurrent, Some(5));
+        assert_eq!(cfg.per_token_concurrency, Some(4));
+    }
+
+    #[test]
+    #[serial(loom_config_env)]
+    fn test_config_project_tier_overrides_legacy_overlap_and_supplies_non_overlap() {
+        std::env::set_var(crate::config_resolver::PRIVATE_DEFAULTS_ENV, "");
+        let tmp = tempfile::tempdir().unwrap();
+        write_config(
+            tmp.path(),
+            r#"{"autonomous": {"workFinder": {"enabled": true, "maxConcurrent": 5, "intervalSecs": 60}}}"#,
+        );
+        write_project_config(tmp.path(), r#"{"autonomous": {"workFinder": {"maxConcurrent": 9}}}"#);
+        let cfg = read_work_finder_config(tmp.path());
+        std::env::remove_var(crate::config_resolver::PRIVATE_DEFAULTS_ENV);
+        // Overlapping `maxConcurrent` -> project tier wins.
+        assert_eq!(cfg.max_concurrent, Some(9));
+        // Non-overlapping keys still supplied by the legacy tier.
+        assert_eq!(cfg.enabled, Some(true));
+        assert_eq!(cfg.interval_secs, Some(60));
+    }
+
+    #[test]
+    #[serial(loom_config_env)]
+    fn test_config_local_tier_overrides_legacy_and_project() {
+        std::env::set_var(crate::config_resolver::PRIVATE_DEFAULTS_ENV, "");
+        let tmp = tempfile::tempdir().unwrap();
+        write_config(tmp.path(), r#"{"autonomous": {"workFinder": {"maxConcurrent": 5}}}"#);
+        write_project_config(tmp.path(), r#"{"autonomous": {"workFinder": {"maxConcurrent": 9}}}"#);
+        write_local_config(tmp.path(), r#"{"autonomous": {"workFinder": {"maxConcurrent": 2}}}"#);
+        let cfg = read_work_finder_config(tmp.path());
+        std::env::remove_var(crate::config_resolver::PRIVATE_DEFAULTS_ENV);
+        assert_eq!(cfg.max_concurrent, Some(2));
     }
 
     // ===================================================================

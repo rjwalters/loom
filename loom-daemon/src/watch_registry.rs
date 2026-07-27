@@ -731,19 +731,9 @@ pub struct WatchMonitorConfig {
 /// [`crate::token_ranking_refresh::read_token_ranking_refresh_config`]).
 #[must_use]
 pub fn read_watch_monitor_config(repo_root: &Path) -> WatchMonitorConfig {
-    let config_path = repo_root.join(".loom").join("config.json");
-    let config_str = match std::fs::read_to_string(&config_path) {
-        Ok(s) => s,
-        Err(_) => return WatchMonitorConfig::default(),
-    };
-    let config: serde_json::Value = match serde_json::from_str(&config_str) {
-        Ok(v) => v,
-        Err(e) => {
-            log::warn!("watch_registry: could not parse config at {}: {e}", config_path.display());
-            return WatchMonitorConfig::default();
-        }
-    };
-    let Some(block) = config.get("autonomous").and_then(|a| a.get("watchMonitor")) else {
+    let effective = crate::config_resolver::resolve_effective_config(repo_root);
+    let Some(block) = crate::config_resolver::get_path(&effective, "autonomous.watchMonitor")
+    else {
         return WatchMonitorConfig::default();
     };
     WatchMonitorConfig {
@@ -1154,6 +1144,95 @@ mod tests {
                 expiry_secs: Some(0),
             }
         );
+    }
+
+    // ===================================================================
+    // config_resolver migration (#4058) — tier precedence
+    // ===================================================================
+
+    fn write_project_config(root: &Path, contents: &str) {
+        let full = root.join(crate::config_resolver::PROJECT_CONFIG_REL);
+        std::fs::create_dir_all(full.parent().unwrap()).unwrap();
+        std::fs::write(full, contents).unwrap();
+    }
+
+    fn write_local_config(root: &Path, contents: &str) {
+        let full = root.join(crate::config_resolver::LOCAL_CONFIG_REL);
+        std::fs::create_dir_all(full.parent().unwrap()).unwrap();
+        std::fs::write(full, contents).unwrap();
+    }
+
+    #[test]
+    #[serial(loom_config_env)]
+    fn config_project_tier_only_is_honored_like_legacy() {
+        std::env::set_var(crate::config_resolver::PRIVATE_DEFAULTS_ENV, "");
+        let dir = tempdir().unwrap();
+        write_project_config(
+            dir.path(),
+            r#"{"autonomous":{"watchMonitor":{"enabled":false,"intervalSecs":60,"expirySecs":0}}}"#,
+        );
+        let cfg = read_watch_monitor_config(dir.path());
+        std::env::remove_var(crate::config_resolver::PRIVATE_DEFAULTS_ENV);
+        assert_eq!(
+            cfg,
+            WatchMonitorConfig {
+                enabled: Some(false),
+                interval_secs: Some(60),
+                expiry_secs: Some(0),
+            }
+        );
+    }
+
+    #[test]
+    #[serial(loom_config_env)]
+    fn config_project_tier_overrides_legacy_overlap_and_supplies_non_overlap() {
+        std::env::set_var(crate::config_resolver::PRIVATE_DEFAULTS_ENV, "");
+        let dir = tempdir().unwrap();
+        write_config(
+            dir.path(),
+            r#"{"autonomous":{"watchMonitor":{"enabled":true,"intervalSecs":60}}}"#,
+        );
+        write_project_config(dir.path(), r#"{"autonomous":{"watchMonitor":{"intervalSecs":15}}}"#);
+        let cfg = read_watch_monitor_config(dir.path());
+        std::env::remove_var(crate::config_resolver::PRIVATE_DEFAULTS_ENV);
+        // Overlapping `intervalSecs` -> project tier wins.
+        assert_eq!(cfg.interval_secs, Some(15));
+        // Non-overlapping `enabled` still supplied by legacy tier.
+        assert_eq!(cfg.enabled, Some(true));
+    }
+
+    #[test]
+    #[serial(loom_config_env)]
+    fn config_local_tier_overrides_legacy_and_project() {
+        std::env::set_var(crate::config_resolver::PRIVATE_DEFAULTS_ENV, "");
+        let dir = tempdir().unwrap();
+        write_config(dir.path(), r#"{"autonomous":{"watchMonitor":{"intervalSecs":60}}}"#);
+        write_project_config(dir.path(), r#"{"autonomous":{"watchMonitor":{"intervalSecs":30}}}"#);
+        write_local_config(dir.path(), r#"{"autonomous":{"watchMonitor":{"intervalSecs":5}}}"#);
+        let cfg = read_watch_monitor_config(dir.path());
+        std::env::remove_var(crate::config_resolver::PRIVATE_DEFAULTS_ENV);
+        assert_eq!(cfg.interval_secs, Some(5));
+    }
+
+    /// Regression (#4058): `expirySecs: 0` set only at the project tier must
+    /// still be read as `Some(0)` ("disable expiry"), not dropped to `None`
+    /// like a zero `intervalSecs` would be. `resolve_expiry` itself (which
+    /// turns `Some(0)` into a zero `Duration`) is unmodified by this
+    /// migration and already covered by `resolve_expiry_zero_is_honored`
+    /// above — this test isolates the tier-migrated read path and
+    /// deliberately avoids touching `WATCH_MONITOR_EXPIRY_ENV` (that test
+    /// mutates it under the crate-wide unkeyed `#[serial]` lock, which does
+    /// not mutually exclude against this test's keyed
+    /// `#[serial(loom_config_env)]` lock).
+    #[test]
+    #[serial(loom_config_env)]
+    fn config_project_tier_expiry_secs_zero_is_meaningful() {
+        std::env::set_var(crate::config_resolver::PRIVATE_DEFAULTS_ENV, "");
+        let dir = tempdir().unwrap();
+        write_project_config(dir.path(), r#"{"autonomous":{"watchMonitor":{"expirySecs":0}}}"#);
+        let cfg = read_watch_monitor_config(dir.path());
+        std::env::remove_var(crate::config_resolver::PRIVATE_DEFAULTS_ENV);
+        assert_eq!(cfg.expiry_secs, Some(0));
     }
 
     #[test]

@@ -149,12 +149,8 @@ impl ModelSource {
 /// `main_health_gate::read_autonomous_gate_config`).
 #[must_use]
 pub fn read_autonomous_model(repo_root: &Path) -> Option<String> {
-    let path = repo_root.join(".loom").join("config.json");
-    let contents = std::fs::read_to_string(&path).ok()?;
-    let config: serde_json::Value = serde_json::from_str(&contents).ok()?;
-    config
-        .get("autonomous")?
-        .get("model")?
+    let effective = crate::config_resolver::resolve_effective_config(repo_root);
+    crate::config_resolver::get_path(&effective, "autonomous.model")?
         .as_str()
         .map(str::trim)
         .filter(|m| !m.is_empty())
@@ -3643,15 +3639,8 @@ pub struct StartupRaceConfig {
 /// [`crate::work_finder::read_work_finder_config`].
 #[must_use]
 pub fn read_startup_race_config(repo_root: &Path) -> StartupRaceConfig {
-    let config_path = repo_root.join(".loom").join("config.json");
-    let Ok(config_str) = std::fs::read_to_string(&config_path) else {
-        return StartupRaceConfig::default();
-    };
-    let Ok(config) = serde_json::from_str::<serde_json::Value>(&config_str) else {
-        log::warn!("sweep_registry: could not parse config at {}", config_path.display());
-        return StartupRaceConfig::default();
-    };
-    let Some(auto) = config.get("autonomous") else {
+    let effective = crate::config_resolver::resolve_effective_config(repo_root);
+    let Some(auto) = crate::config_resolver::get_path(&effective, "autonomous") else {
         return StartupRaceConfig::default();
     };
     let watchdog = auto.get("watchdog");
@@ -3787,19 +3776,9 @@ pub struct QuarantineFileConfig {
 /// [`read_startup_race_config`].
 #[must_use]
 pub fn read_quarantine_file_config(repo_root: &Path) -> QuarantineFileConfig {
-    let config_path = repo_root.join(".loom").join("config.json");
-    let Ok(config_str) = std::fs::read_to_string(&config_path) else {
-        return QuarantineFileConfig::default();
-    };
-    let Ok(config) = serde_json::from_str::<serde_json::Value>(&config_str) else {
-        log::warn!("sweep_registry: could not parse config at {}", config_path.display());
-        return QuarantineFileConfig::default();
-    };
-    let block = config
-        .get("autonomous")
-        .and_then(|a| a.get("workFinder"))
-        .and_then(|w| w.get("quarantine"));
-    let Some(q) = block else {
+    let effective = crate::config_resolver::resolve_effective_config(repo_root);
+    let Some(q) = crate::config_resolver::get_path(&effective, "autonomous.workFinder.quarantine")
+    else {
         return QuarantineFileConfig::default();
     };
     QuarantineFileConfig {
@@ -4701,6 +4680,37 @@ exit 0
         assert_eq!(read_autonomous_model(dir.path()), None);
         let (model, _) = resolve_dispatch_model(dir.path(), None);
         assert_eq!(model, DEFAULT_DISPATCH_MODEL);
+    }
+
+    // --- config_resolver migration (#4058) — tier precedence -------------- //
+
+    fn write_project_model_config(dir: &Path, body: &str) {
+        let full = dir.join(crate::config_resolver::PROJECT_CONFIG_REL);
+        std::fs::create_dir_all(full.parent().unwrap()).unwrap();
+        std::fs::write(full, body).unwrap();
+    }
+
+    #[test]
+    #[serial(loom_config_env)]
+    fn read_autonomous_model_project_tier_only_is_honored_like_legacy() {
+        std::env::set_var(crate::config_resolver::PRIVATE_DEFAULTS_ENV, "");
+        let dir = tempdir().unwrap();
+        write_project_model_config(dir.path(), r#"{"autonomous": {"model": "opus"}}"#);
+        let model = read_autonomous_model(dir.path());
+        std::env::remove_var(crate::config_resolver::PRIVATE_DEFAULTS_ENV);
+        assert_eq!(model, Some("opus".to_string()));
+    }
+
+    #[test]
+    #[serial(loom_config_env)]
+    fn read_autonomous_model_project_tier_overrides_legacy() {
+        std::env::set_var(crate::config_resolver::PRIVATE_DEFAULTS_ENV, "");
+        let dir = tempdir().unwrap();
+        write_config(dir.path(), r#"{"autonomous": {"model": "sonnet"}}"#);
+        write_project_model_config(dir.path(), r#"{"autonomous": {"model": "opus"}}"#);
+        let model = read_autonomous_model(dir.path());
+        std::env::remove_var(crate::config_resolver::PRIVATE_DEFAULTS_ENV);
+        assert_eq!(model, Some("opus".to_string()));
     }
 
     // --- Issue #3982: logical-tier → concrete-ID resolution --------------- //
@@ -5803,6 +5813,34 @@ exit 0
         std::fs::write(loom.join("config.json"), r#"{"autonomous":{"workFinder":{}}}"#).unwrap();
         let file = read_quarantine_file_config(dir.path());
         assert_eq!(file, QuarantineFileConfig::default());
+    }
+
+    /// config_resolver migration (#4058): a value set only at the project
+    /// tier is honored identically to the legacy file.
+    #[test]
+    #[serial(loom_config_env)]
+    fn read_quarantine_file_config_project_tier_only_is_honored_like_legacy() {
+        std::env::set_var(crate::config_resolver::PRIVATE_DEFAULTS_ENV, "");
+        let dir = tempdir().unwrap();
+        let project = dir.path().join(crate::config_resolver::PROJECT_CONFIG_REL);
+        std::fs::create_dir_all(project.parent().unwrap()).unwrap();
+        std::fs::write(
+            &project,
+            r#"{"autonomous":{"workFinder":{"quarantine":{"enabled":true,"threshold":4,"ttlSecs":900,"instaCrashSecs":45}}}}"#,
+        )
+        .unwrap();
+
+        let file = read_quarantine_file_config(dir.path());
+        std::env::remove_var(crate::config_resolver::PRIVATE_DEFAULTS_ENV);
+        assert_eq!(
+            file,
+            QuarantineFileConfig {
+                enabled: Some(true),
+                threshold: Some(4),
+                ttl_secs: Some(900),
+                insta_crash_secs: Some(45),
+            }
+        );
     }
 
     /// Issue #3823b: orphaned-claim recovery. A daemon-owned sweep that exits
@@ -7966,6 +8004,98 @@ exit 0\n";
         let tmp = tempdir().unwrap();
         write_cfg(tmp.path(), r#"{"autonomous":{"dispatchStaggerMs":0}}"#);
         assert_eq!(read_startup_race_config(tmp.path()).dispatch_stagger_ms, Some(0));
+    }
+
+    // ===================================================================
+    // config_resolver migration (#4058) — tier precedence
+    // ===================================================================
+
+    fn write_project_cfg(dir: &Path, body: &str) {
+        let full = dir.join(crate::config_resolver::PROJECT_CONFIG_REL);
+        std::fs::create_dir_all(full.parent().unwrap()).unwrap();
+        std::fs::write(full, body).unwrap();
+    }
+
+    fn write_local_cfg(dir: &Path, body: &str) {
+        let full = dir.join(crate::config_resolver::LOCAL_CONFIG_REL);
+        std::fs::create_dir_all(full.parent().unwrap()).unwrap();
+        std::fs::write(full, body).unwrap();
+    }
+
+    #[test]
+    #[serial(loom_config_env)]
+    fn startup_race_config_project_tier_only_is_honored_like_legacy() {
+        std::env::set_var(crate::config_resolver::PRIVATE_DEFAULTS_ENV, "");
+        let tmp = tempdir().unwrap();
+        write_project_cfg(
+            tmp.path(),
+            r#"{"autonomous":{"dispatchStaggerMs":3000,"watchdog":{"enabled":false,"timeoutSecs":90}}}"#,
+        );
+        let cfg = read_startup_race_config(tmp.path());
+        std::env::remove_var(crate::config_resolver::PRIVATE_DEFAULTS_ENV);
+        assert_eq!(cfg.dispatch_stagger_ms, Some(3000));
+        assert_eq!(cfg.watchdog_enabled, Some(false));
+        assert_eq!(cfg.watchdog_timeout_secs, Some(90));
+    }
+
+    #[test]
+    #[serial(loom_config_env)]
+    fn startup_race_config_project_tier_overrides_legacy_overlap_and_supplies_non_overlap() {
+        std::env::set_var(crate::config_resolver::PRIVATE_DEFAULTS_ENV, "");
+        let tmp = tempdir().unwrap();
+        write_cfg(
+            tmp.path(),
+            r#"{"autonomous":{"dispatchStaggerMs":3000,"watchdog":{"timeoutSecs":90}}}"#,
+        );
+        write_project_cfg(tmp.path(), r#"{"autonomous":{"dispatchStaggerMs":750}}"#);
+        let cfg = read_startup_race_config(tmp.path());
+        std::env::remove_var(crate::config_resolver::PRIVATE_DEFAULTS_ENV);
+        // Overlapping `dispatchStaggerMs` -> project tier wins.
+        assert_eq!(cfg.dispatch_stagger_ms, Some(750));
+        // Non-overlapping `watchdog.timeoutSecs` still supplied by legacy tier.
+        assert_eq!(cfg.watchdog_timeout_secs, Some(90));
+    }
+
+    #[test]
+    #[serial(loom_config_env)]
+    fn startup_race_config_local_tier_overrides_legacy_and_project() {
+        std::env::set_var(crate::config_resolver::PRIVATE_DEFAULTS_ENV, "");
+        let tmp = tempdir().unwrap();
+        write_cfg(tmp.path(), r#"{"autonomous":{"dispatchStaggerMs":3000}}"#);
+        write_project_cfg(tmp.path(), r#"{"autonomous":{"dispatchStaggerMs":750}}"#);
+        write_local_cfg(tmp.path(), r#"{"autonomous":{"dispatchStaggerMs":10}}"#);
+        let cfg = read_startup_race_config(tmp.path());
+        std::env::remove_var(crate::config_resolver::PRIVATE_DEFAULTS_ENV);
+        assert_eq!(cfg.dispatch_stagger_ms, Some(10));
+    }
+
+    /// Regression (#4058): `dispatchStaggerMs: 0` set only at the project
+    /// tier must still be read as `Some(0)` ("disable stagger"), not dropped
+    /// to `None` like a zero `watchdog.timeoutSecs` would be.
+    #[test]
+    #[serial(loom_config_env)]
+    fn startup_race_config_project_tier_dispatch_stagger_zero_is_meaningful() {
+        std::env::set_var(crate::config_resolver::PRIVATE_DEFAULTS_ENV, "");
+        let tmp = tempdir().unwrap();
+        write_project_cfg(tmp.path(), r#"{"autonomous":{"dispatchStaggerMs":0}}"#);
+        let cfg = read_startup_race_config(tmp.path());
+        std::env::remove_var(crate::config_resolver::PRIVATE_DEFAULTS_ENV);
+        assert_eq!(cfg.dispatch_stagger_ms, Some(0));
+    }
+
+    /// Explicit `null` at the project tier clears a legacy-tier value —
+    /// documents the `deep_merge` "null clears" semantics (#4058) at this
+    /// migrated site.
+    #[test]
+    #[serial(loom_config_env)]
+    fn startup_race_config_explicit_null_in_project_tier_clears_legacy_value() {
+        std::env::set_var(crate::config_resolver::PRIVATE_DEFAULTS_ENV, "");
+        let tmp = tempdir().unwrap();
+        write_cfg(tmp.path(), r#"{"autonomous":{"dispatchStaggerMs":3000}}"#);
+        write_project_cfg(tmp.path(), r#"{"autonomous":{"dispatchStaggerMs":null}}"#);
+        let cfg = read_startup_race_config(tmp.path());
+        std::env::remove_var(crate::config_resolver::PRIVATE_DEFAULTS_ENV);
+        assert_eq!(cfg.dispatch_stagger_ms, None);
     }
 
     #[test]

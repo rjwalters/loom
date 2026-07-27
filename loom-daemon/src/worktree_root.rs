@@ -86,30 +86,15 @@ fn namespaced(override_root: &str, repo_root: &Path) -> PathBuf {
     }
 }
 
-/// Read `.loom/config.json` → `worktree.root`, soft-failing to `None`.
+/// Read `worktree.root` via the config resolver (env > config > default
+/// tiering is layered by the caller; this resolves only the "config"
+/// position), soft-failing to `None`.
 ///
 /// Follows the pattern in `crate::extract_configured_terminal_ids`: missing
 /// file, parse error, or missing key all resolve to `None` (never a hard error).
 fn read_config_worktree_root(repo_root: &Path) -> Option<String> {
-    let config_path = repo_root.join(".loom").join("config.json");
-
-    let config_str = match std::fs::read_to_string(&config_path) {
-        Ok(s) => s,
-        Err(e) => {
-            log::debug!("Could not read config at {}: {e}", config_path.display());
-            return None;
-        }
-    };
-
-    let config: serde_json::Value = match serde_json::from_str(&config_str) {
-        Ok(v) => v,
-        Err(e) => {
-            log::warn!("Could not parse config at {}: {e}", config_path.display());
-            return None;
-        }
-    };
-
-    let root = config.get("worktree")?.get("root")?.as_str()?;
+    let effective = crate::config_resolver::resolve_effective_config(repo_root);
+    let root = crate::config_resolver::get_path(&effective, "worktree.root")?.as_str()?;
     if root.is_empty() {
         return None;
     }
@@ -132,6 +117,7 @@ pub fn is_worktree_path(path: &Path, repo_root: &Path) -> bool {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+    use serial_test::serial;
     use std::sync::Mutex;
 
     // std::env::set_var mutates process-global state; serialize env-touching
@@ -159,6 +145,20 @@ mod tests {
         let loom_dir = dir.join(".loom");
         fs::create_dir_all(&loom_dir).unwrap();
         fs::write(loom_dir.join("config.json"), body).unwrap();
+    }
+
+    fn write_project_config(dir: &Path, body: &str) {
+        let rel = Path::new(crate::config_resolver::PROJECT_CONFIG_REL);
+        let full = dir.join(rel);
+        fs::create_dir_all(full.parent().unwrap()).unwrap();
+        fs::write(full, body).unwrap();
+    }
+
+    fn write_local_config(dir: &Path, body: &str) {
+        let rel = Path::new(crate::config_resolver::LOCAL_CONFIG_REL);
+        let full = dir.join(rel);
+        fs::create_dir_all(full.parent().unwrap()).unwrap();
+        fs::write(full, body).unwrap();
     }
 
     use std::fs;
@@ -339,5 +339,87 @@ mod tests {
             let unrelated = PathBuf::from("/some/other/place/issue-42");
             assert!(!is_worktree_path(&unrelated, &repo_root));
         });
+    }
+
+    // ===== config_resolver migration (#4058) =====
+    //
+    // These tests exercise the config_resolver tiering (project/local tiers)
+    // now that `read_config_worktree_root` goes through
+    // `config_resolver::resolve_effective_config`. Every test that touches
+    // `LOOM_CONFIG_DEFAULTS_FILE` is serialized on the keyed
+    // `loom_config_env` lock (not the crate-wide unkeyed `#[serial]` lock —
+    // see the CI-cost note on issue #4058) and pins the env var to `""` so a
+    // private defaults file on the host can never leak in.
+
+    #[test]
+    #[serial(loom_config_env)]
+    fn project_tier_only_worktree_root_is_honored_like_legacy() {
+        std::env::set_var(crate::config_resolver::PRIVATE_DEFAULTS_ENV, "");
+        let tmp = tempfile::tempdir().unwrap();
+        let repo_root = tmp.path().join("my-repo");
+        fs::create_dir_all(&repo_root).unwrap();
+        write_project_config(&repo_root, r#"{"worktree": {"root": "/Volumes/Project"}}"#);
+
+        let got = with_env(None, || worktree_root(&repo_root));
+        std::env::remove_var(crate::config_resolver::PRIVATE_DEFAULTS_ENV);
+
+        assert_eq!(got, PathBuf::from("/Volumes/Project/my-repo"));
+    }
+
+    #[test]
+    #[serial(loom_config_env)]
+    fn project_tier_overrides_legacy_tier_on_overlap() {
+        std::env::set_var(crate::config_resolver::PRIVATE_DEFAULTS_ENV, "");
+        let tmp = tempfile::tempdir().unwrap();
+        let repo_root = tmp.path().join("my-repo");
+        fs::create_dir_all(&repo_root).unwrap();
+        write_config(
+            &repo_root,
+            r#"{"worktree": {"root": "/Volumes/Legacy"}, "nextAgentNumber": 3}"#,
+        );
+        write_project_config(&repo_root, r#"{"worktree": {"root": "/Volumes/Project"}}"#);
+
+        let got = with_env(None, || worktree_root(&repo_root));
+        std::env::remove_var(crate::config_resolver::PRIVATE_DEFAULTS_ENV);
+
+        // Overlapping key: project tier wins.
+        assert_eq!(got, PathBuf::from("/Volumes/Project/my-repo"));
+    }
+
+    #[test]
+    #[serial(loom_config_env)]
+    fn local_tier_overrides_both_legacy_and_project() {
+        std::env::set_var(crate::config_resolver::PRIVATE_DEFAULTS_ENV, "");
+        let tmp = tempfile::tempdir().unwrap();
+        let repo_root = tmp.path().join("my-repo");
+        fs::create_dir_all(&repo_root).unwrap();
+        write_config(&repo_root, r#"{"worktree": {"root": "/Volumes/Legacy"}}"#);
+        write_project_config(&repo_root, r#"{"worktree": {"root": "/Volumes/Project"}}"#);
+        write_local_config(&repo_root, r#"{"worktree": {"root": "/Volumes/Local"}}"#);
+
+        let got = with_env(None, || worktree_root(&repo_root));
+        std::env::remove_var(crate::config_resolver::PRIVATE_DEFAULTS_ENV);
+
+        assert_eq!(got, PathBuf::from("/Volumes/Local/my-repo"));
+    }
+
+    #[test]
+    #[serial(loom_config_env)]
+    fn explicit_null_in_project_tier_clears_legacy_worktree_root() {
+        std::env::set_var(crate::config_resolver::PRIVATE_DEFAULTS_ENV, "");
+        let tmp = tempfile::tempdir().unwrap();
+        let repo_root = tmp.path().join("my-repo");
+        fs::create_dir_all(&repo_root).unwrap();
+        write_config(&repo_root, r#"{"worktree": {"root": "/Volumes/Legacy"}}"#);
+        // Explicit null at the project tier clears the legacy value —
+        // `deep_merge` matches `jq`'s `*` operator (#4058).
+        write_project_config(&repo_root, r#"{"worktree": {"root": null}}"#);
+
+        let got = with_env(None, || worktree_root(&repo_root));
+        std::env::remove_var(crate::config_resolver::PRIVATE_DEFAULTS_ENV);
+
+        // Cleared key -> falls through to the default, exactly like an
+        // absent key.
+        assert_eq!(got, repo_root.join(".loom").join("worktrees"));
     }
 }
