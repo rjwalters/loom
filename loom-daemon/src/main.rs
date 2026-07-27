@@ -101,6 +101,16 @@ enum Commands {
         /// Emit machine-readable JSON instead of the human-readable table.
         #[arg(long)]
         json: bool,
+
+        /// Also show the forge-side pipeline snapshot per managed repo (Issue
+        /// #3977): open `loom:issue` (queued), open `loom:building`
+        /// (claimed), open PRs by `loom:review-requested` /
+        /// `loom:changes-requested` / `loom:pr`, and PRs merged in the last
+        /// 24h. Opt-in because it makes several `gh` calls per managed repo
+        /// (client-side, after the fast IPC round-trip) rather than being
+        /// bundled into the default view.
+        #[arg(long)]
+        pipeline: bool,
     },
 
     /// Manage the machine-level workspace registry (`~/.loom/workspaces.json`):
@@ -301,7 +311,7 @@ async fn main() -> Result<()> {
         return match command {
             // `status` connects to the running daemon over its Unix socket, so
             // it needs the async runtime (unlike the other sync subcommands).
-            Commands::Status { json } => handle_status_command(json).await,
+            Commands::Status { json, pipeline } => handle_status_command(json, pipeline).await,
             // `quarantine` connects to the running daemon over its Unix socket
             // (the quarantine state is in-memory), so it needs the async runtime.
             Commands::Quarantine { action } => handle_quarantine_command(action).await,
@@ -1540,7 +1550,14 @@ fn collect_token_usage() -> Option<serde_json::Value> {
 /// Handle the `status` subcommand — render the running daemon's autonomous-mode
 /// operability snapshot (Issue #3891). Fetches the daemon-native part over IPC
 /// and layers on the client-side per-token usage probe.
-async fn handle_status_command(json: bool) -> Result<()> {
+///
+/// `pipeline` opts into the forge-side pipeline snapshot (Issue #3977): per
+/// managed repo, open `loom:issue`/`loom:building` counts, open PR counts by
+/// review-state label, and PRs merged in the last 24h. Like the per-token
+/// usage table, this is collected client-side (several `gh` calls per repo)
+/// rather than inside the IPC handler, and is opt-in specifically because
+/// those extra forge calls are too slow to bundle into the default view.
+async fn handle_status_command(json: bool, pipeline: bool) -> Result<()> {
     let socket_path = resolve_socket_path()?;
 
     let report = match query_daemon_status(&socket_path).await {
@@ -1575,10 +1592,21 @@ async fn handle_status_command(json: bool) -> Result<()> {
     // `.loom/scripts/cli/loom-daemon-update.sh` for the opt-in update flow).
     let update = self_update::check();
 
-    if json {
-        print_status_json(&report, token_usage.as_ref(), &update)?;
+    // Forge-side pipeline snapshot (#3977) — opt-in, fetched in the same
+    // priority order as `report.per_repo` so the rendered table lines up with
+    // the "Managed repos" dispatch table above it.
+    let pipeline_snapshots = if pipeline {
+        let roots: Vec<PathBuf> = report.per_repo.iter().map(|r| r.root.clone()).collect();
+        let source = Arc::new(loom_daemon::pipeline_snapshot::GhPipelineSource::new());
+        Some(loom_daemon::pipeline_snapshot::collect_pipeline_snapshots(source, roots).await)
     } else {
-        print_status_human(&report, token_usage.as_ref(), &update);
+        None
+    };
+
+    if json {
+        print_status_json(&report, token_usage.as_ref(), &update, pipeline_snapshots.as_deref())?;
+    } else {
+        print_status_human(&report, token_usage.as_ref(), &update, pipeline_snapshots.as_deref());
     }
     Ok(())
 }
@@ -1707,6 +1735,7 @@ fn print_status_json(
     report: &DaemonStatusReport,
     token_usage: Option<&serde_json::Value>,
     update: &self_update::SelfUpdateStatus,
+    pipeline: Option<&[loom_daemon::pipeline_snapshot::RepoPipelineSnapshot]>,
 ) -> Result<()> {
     let rc = resolve_capacity(report, token_usage);
     let combined = serde_json::json!({
@@ -1754,6 +1783,19 @@ fn print_status_json(
             "health_gate_not_evaluated": r.health_gate_not_evaluated,
             "health_gate_not_evaluated_reason": r.health_gate_not_evaluated_reason,
         })).collect::<Vec<_>>(),
+        // Forge-side pipeline snapshot (#3977) — present only when `--pipeline`
+        // was passed; `null` otherwise so a consumer can tell "not requested"
+        // apart from "requested but empty".
+        "pipeline": pipeline.map(|snapshots| snapshots.iter().map(|s| serde_json::json!({
+            "root": s.root,
+            "queued": s.queued,
+            "building": s.building,
+            "review_requested": s.review_requested,
+            "changes_requested": s.changes_requested,
+            "approved": s.approved,
+            "merged_24h": s.merged_24h,
+            "error": s.error,
+        })).collect::<Vec<_>>()),
         "token_usage": token_usage,
         // Self-update staleness (#3968) — read-only, local-only comparison of
         // this binary's baked-in commit vs. the source checkout's HEAD.
@@ -1800,6 +1842,7 @@ fn print_status_human(
     report: &DaemonStatusReport,
     token_usage: Option<&serde_json::Value>,
     update: &self_update::SelfUpdateStatus,
+    pipeline: Option<&[loom_daemon::pipeline_snapshot::RepoPipelineSnapshot]>,
 ) {
     println!("\n=== Loom Autonomous Daemon Status ===\n");
 
@@ -1965,6 +2008,38 @@ fn print_status_human(
                     .collect::<Vec<_>>()
                     .join(", ");
                 println!("        quarantined (insta-crash, #3939): {list}");
+            }
+        }
+    }
+
+    // Forge-side pipeline snapshot (#3977) — opt-in via `--pipeline`. Rendered
+    // in the same order as the "Managed repos" table above (both iterate
+    // `report.per_repo`), so the two tables line up row-for-row.
+    if let Some(snapshots) = pipeline {
+        println!("\nForge pipeline (per repo, --pipeline):");
+        if snapshots.is_empty() {
+            println!("  (none)");
+        } else {
+            println!(
+                "  {:>6}  {:>8}  {:>6}  {:>7}  {:>5}  {:>9}  REPO",
+                "QUEUED", "BUILDING", "REVIEW", "CHNG-RQ", "PR", "MERGED24H"
+            );
+            println!("  {:-<75}", "");
+            for s in snapshots {
+                use loom_daemon::pipeline_snapshot::format_count;
+                println!(
+                    "  {:>6}  {:>8}  {:>6}  {:>7}  {:>5}  {:>9}  {}",
+                    format_count(s.queued),
+                    format_count(s.building),
+                    format_count(s.review_requested),
+                    format_count(s.changes_requested),
+                    format_count(s.approved),
+                    format_count(s.merged_24h),
+                    s.root.display()
+                );
+                if let Some(err) = &s.error {
+                    println!("        forge query failed for one or more metrics ({err}) — unreachable fields shown as ?");
+                }
             }
         }
     }
