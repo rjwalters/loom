@@ -180,19 +180,52 @@ Two concrete failure classes motivated the split (#3985):
   tests now **skip cleanly** (via a `require_tmux!()` probe) rather than fail
   when no tmux is available, so even a full local `cargo test --workspace`
   stays green on a tmux-less host.
-- **CPU starvation.** A few `sweep_registry` unit tests wait on a fixture child
-  with a wall-clock deadline. Under heavy host load (the gate itself, when it
-  was re-running continuously, cf. #3984) the child could miss a tight 5–10s
-  deadline purely because it was never scheduled. Those bounds are now generous
-  (`FIXTURE_CHILD_WAIT_MS`, 60s), and the whole gate runs under `nice` (below)
-  so it can never starve the very processes it is timing.
+- **Fixture-child wait bounds.** A few `sweep_registry` unit tests wait on a
+  fixture child with a wall-clock deadline. Those bounds are now generous
+  (`FIXTURE_CHILD_WAIT_MS`, 60s). This was originally attributed to *CPU
+  starvation* under host load, but that attribution was **falsified**: #4044 /
+  #4046 established the timing-test failures were macOS `syspolicyd`
+  exec-latency artifacts, not contention (968/968 passed later with **no code
+  change**). The generous bounds are still correct; the "sweeps starve the
+  gate's timing tests" story that motivated them is not.
 
-**The gate runs at reduced priority.** `build-gate.sh` re-execs itself once
-under `nice -n 19` (the sentinel `LOOM_BUILD_GATE_NICED` prevents a loop) so a
-long `cargo` compile can never starve the sweeps — or the timing-sensitive
-tests — it shares a host with. Tunable via `LOOM_BUILD_GATE_NICENESS`; disable
-with `LOOM_BUILD_GATE_NICE=0`. If `nice` is unavailable the gate proceeds at
-normal priority.
+**The gate runs at a mild throttle relative to sweeps (#4020, revises #3985).**
+`build-gate.sh` now defaults to `nice 5` — a mild positive niceness, a real but
+small step down from the sweep children's `nice 0`. It previously re-exec'd
+itself at `nice -n 19` (the lowest priority) on the rationale that a long
+`cargo` compile would otherwise starve the sweeps and the timing-sensitive
+tests it shares a host with. That rationale is **withdrawn**: #4044 / #4046
+showed the timing-test failures were `syspolicyd` exec-latency artifacts, not
+CPU contention, and the one real gate timeout was cold-compile cost (settled by
+#4048 raising the budget 600→1200s; the gate then produced its first
+determinate verdict, Green at ~726s). Handicapping the gate to the *bottom* of
+the run queue solved a problem that was never demonstrated — and the gate is the
+reliability substrate that halts dispatch when `main` goes red, so a gate
+starved into `UNEVALUATED` is a gate that is not gating.
+
+Why `nice 5` and not `nice 0` parity? Giving the gate a *strictly higher*
+priority than sweeps is not possible from `build-gate.sh` on the daemon host
+(macOS, non-root): a negative nice requires privilege the daemon does not hold
+(`nice -n -5` → `setpriority: Permission denied`), so `0` is the best
+unprivileged priority. Dropping the gate to `nice 0` would leave gate and sweeps
+at the *same* value — an indistinguishable parity with no measurable gap, which
+#4020's AC2 explicitly calls a failure ("A patch that leaves both at the same
+value fails this AC"). `nice 5` is the smallest defensible choice that keeps a
+real, non-zero, unprivileged-achievable gap in the achievable direction
+(gate `5` > sweeps `0`): the gate yields *slightly* under contention rather than
+starving the sweeps, without being drastically deprioritized as it was at 19.
+The alternative — niceing sweep *children* up in the spawn path to force a
+strict gate-below-sweep gap — is deliberately not done, since the issue directed
+the spawn path be left untouched and the contention it would brace against is
+the one the evidence above withdrew.
+
+The re-exec mechanism and its knobs are preserved: `LOOM_BUILD_GATE_NICENESS`
+overrides the value (e.g. `=0` for exact sweep parity, `=19` to restore the old
+handicap), `LOOM_BUILD_GATE_NICE=0` disables the re-exec entirely, and the
+`LOOM_BUILD_GATE_NICED` sentinel prevents a re-exec loop. The re-exec is skipped
+when the effective niceness is 0 (a `nice -n 0` re-exec is a no-op fork); with
+the default of 5 the gate re-execs once under `nice -n 5`. If `nice` is
+unavailable the gate proceeds at normal priority.
 
 > **Rule of thumb:** if a check's outcome can differ between an idle host and a
 > busy one — or between a host with tmux and one without — it is
