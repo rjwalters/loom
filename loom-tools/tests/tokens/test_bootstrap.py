@@ -27,6 +27,8 @@ from loom_tools.tokens.bootstrap import (
 )
 from loom_tools.tokens.cli import main as cli_main
 
+from .conftest import make_monitor_db  # shared usage.db builder (#4030)
+
 
 @pytest.fixture
 def mock_repo(tmp_path: pathlib.Path) -> pathlib.Path:
@@ -1240,3 +1242,228 @@ class TestCliMonitorReporting:
         out = capsys.readouterr().out
         assert "claude-monitor" in out
         assert "alice" in out
+
+
+# ---------------------------------------------------------------------------
+# #4030: bootstrap warns when the merged sources disagree with claude-monitor's
+# live store (usage.db). Detection for the stale-snapshot incident — read-only,
+# non-fatal, warn-never-switch.
+# ---------------------------------------------------------------------------
+
+
+def _write_usage_db(
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+    rows: list[dict],
+) -> pathlib.Path:
+    """Create a claude-monitor ``usage.db`` and point LOOM_CLAUDE_MONITOR_DIR at it.
+
+    The live store lives in the same directory the bootstrap monitor source
+    (``accounts.env``) would; the divergence check reads ``usage.db`` from there.
+    """
+    mon_dir = tmp_path / "claude-monitor-live"
+    mon_dir.mkdir(exist_ok=True)
+    make_monitor_db(mon_dir / "usage.db", rows)
+    monkeypatch.setenv("LOOM_CLAUDE_MONITOR_DIR", str(mon_dir))
+    return mon_dir
+
+
+class TestMonitorDivergenceWarning:
+    """AC #4030: warn on key divergence, stay silent everywhere else."""
+
+    def test_divergence_warns_and_names_remedy(
+        self,
+        mock_repo: pathlib.Path,
+        tmp_path: pathlib.Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        # accounts.env snapshot is stale: repo has the revoked key, the live
+        # store has a fresh token for the same email.
+        _write_env(
+            mock_repo, _triple(1, "alice@example.com", "sk-STALE", "alice.token")
+        )
+        _write_usage_db(
+            tmp_path,
+            monkeypatch,
+            [{"label": "alice@example.com", "email": "alice@example.com",
+              "token": "sk-FRESH"}],
+        )
+        bootstrap_tokens(mock_repo)
+        err = capsys.readouterr().err
+        assert "disagree with claude-monitor's live store" in err
+        assert "alice@example.com" in err
+        assert "import-from-monitor" in err
+
+    def test_agreement_is_silent(
+        self,
+        mock_repo: pathlib.Path,
+        tmp_path: pathlib.Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        # Same key on both sides -> no divergence.
+        _write_env(
+            mock_repo, _triple(1, "alice@example.com", "sk-SAME", "alice.token")
+        )
+        _write_usage_db(
+            tmp_path,
+            monkeypatch,
+            [{"label": "alice@example.com", "email": "alice@example.com",
+              "token": "sk-SAME"}],
+        )
+        bootstrap_tokens(mock_repo)
+        err = capsys.readouterr().err
+        assert "disagree with claude-monitor" not in err
+
+    def test_store_absent_is_silent(
+        self,
+        mock_repo: pathlib.Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        # No usage.db at all (conftest points LOOM_CLAUDE_MONITOR_DIR at a
+        # non-existent dir). A host without claude-monitor is fully supported.
+        _write_env(
+            mock_repo, _triple(1, "alice@example.com", "sk-1", "alice.token")
+        )
+        bootstrap_tokens(mock_repo)
+        err = capsys.readouterr().err
+        assert "disagree with claude-monitor" not in err
+
+    def test_unreadable_store_is_silent(
+        self,
+        mock_repo: pathlib.Path,
+        tmp_path: pathlib.Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        # usage.db present but not a valid SQLite file -> degrade to silence,
+        # never fail the bootstrap.
+        mon_dir = tmp_path / "claude-monitor-live"
+        mon_dir.mkdir()
+        (mon_dir / "usage.db").write_bytes(b"not a database")
+        monkeypatch.setenv("LOOM_CLAUDE_MONITOR_DIR", str(mon_dir))
+        _write_env(
+            mock_repo, _triple(1, "alice@example.com", "sk-1", "alice.token")
+        )
+        result = bootstrap_tokens(mock_repo)
+        err = capsys.readouterr().err
+        assert "disagree with claude-monitor" not in err
+        assert result.written == ["alice.token"]
+
+    def test_older_schema_store_is_silent(
+        self,
+        mock_repo: pathlib.Path,
+        tmp_path: pathlib.Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        # A valid SQLite DB with no oauth_credentials table (older
+        # claude-monitor) -> silent, bootstrap still succeeds.
+        import sqlite3
+
+        mon_dir = tmp_path / "claude-monitor-live"
+        mon_dir.mkdir()
+        conn = sqlite3.connect(mon_dir / "usage.db")
+        conn.execute("CREATE TABLE unrelated (id INTEGER)")
+        conn.commit()
+        conn.close()
+        monkeypatch.setenv("LOOM_CLAUDE_MONITOR_DIR", str(mon_dir))
+        _write_env(
+            mock_repo, _triple(1, "alice@example.com", "sk-1", "alice.token")
+        )
+        result = bootstrap_tokens(mock_repo)
+        err = capsys.readouterr().err
+        assert "disagree with claude-monitor" not in err
+        assert result.written == ["alice.token"]
+
+    def test_membership_difference_is_silent(
+        self,
+        mock_repo: pathlib.Path,
+        tmp_path: pathlib.Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        # Emails present on only one side never warn: a repo-only account
+        # absent from the live store, and a live account the pool omits.
+        _write_env(
+            mock_repo, _triple(1, "repoonly@example.com", "sk-1", "repoonly.token")
+        )
+        _write_usage_db(
+            tmp_path,
+            monkeypatch,
+            [{"label": "liveonly@example.com", "email": "liveonly@example.com",
+              "token": "sk-live"}],
+        )
+        bootstrap_tokens(mock_repo)
+        err = capsys.readouterr().err
+        assert "disagree with claude-monitor" not in err
+
+    def test_no_secret_material_is_printed(
+        self,
+        mock_repo: pathlib.Path,
+        tmp_path: pathlib.Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        # The warning carries fingerprints and emails only — never key material.
+        _write_env(
+            mock_repo, _triple(1, "alice@example.com", "sk-STALE", "alice.token")
+        )
+        _write_usage_db(
+            tmp_path,
+            monkeypatch,
+            [{"label": "alice@example.com", "email": "alice@example.com",
+              "token": "sk-FRESH"}],
+        )
+        bootstrap_tokens(mock_repo)
+        err = capsys.readouterr().err
+        assert "sk-STALE" not in err
+        assert "sk-FRESH" not in err
+        assert fingerprint("sk-STALE") in err
+        assert fingerprint("sk-FRESH") in err
+
+    def test_email_case_insensitive_join(
+        self,
+        mock_repo: pathlib.Path,
+        tmp_path: pathlib.Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        # accounts.env uses User@x.com, the live store user@x.com -> one account,
+        # so a differing token still surfaces as a divergence (not two accounts).
+        _write_env(
+            mock_repo, _triple(1, "User@example.com", "sk-STALE", "user.token")
+        )
+        _write_usage_db(
+            tmp_path,
+            monkeypatch,
+            [{"label": "user@example.com", "email": "user@example.com",
+              "token": "sk-FRESH"}],
+        )
+        bootstrap_tokens(mock_repo)
+        err = capsys.readouterr().err
+        assert "disagree with claude-monitor" in err
+
+    def test_divergence_still_warns_under_dry_run(
+        self,
+        mock_repo: pathlib.Path,
+        tmp_path: pathlib.Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        # The check is read-only detection; --dry-run must not suppress it.
+        _write_env(
+            mock_repo, _triple(1, "alice@example.com", "sk-STALE", "alice.token")
+        )
+        _write_usage_db(
+            tmp_path,
+            monkeypatch,
+            [{"label": "alice@example.com", "email": "alice@example.com",
+              "token": "sk-FRESH"}],
+        )
+        result = bootstrap_tokens(mock_repo, dry_run=True)
+        err = capsys.readouterr().err
+        assert result.dry_run is True
+        assert "disagree with claude-monitor's live store" in err
+        assert "import-from-monitor" in err
