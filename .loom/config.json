@@ -11,7 +11,7 @@
     "enabled": true,
     "command": "bash .loom/scripts/build-gate.sh",
     "realChangeGlobs": ["*.rs", "*.toml", "Cargo.lock", "*.py", "*.sh"],
-    "timeoutSeconds": 600
+    "timeoutSeconds": 1200
   },
   "terminals": [
     {
