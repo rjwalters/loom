@@ -2019,17 +2019,36 @@ Files and Folders / …) → remove `loom-daemon` — the next self-update rebui
 would have revoked it anyway via the cdhash change, so removing it manually
 just does that sooner.
 
-**Ad-hoc code signing (follow-up, not in #3980's scope).** A stable
-ad-hoc signature (`codesign -s - --identifier com.rjwalters.loom-daemon`,
-applied at build time) would let an *intentional*, narrowly-scoped future TCC
-grant survive a rebuild that doesn't change the binary's identifier — useful
-if a legitimate future daemon capability needs one specific protected
-category. Wiring that into the `cargo build --release` / `loom-daemon-update.sh`
-provisioning path is real but separable infrastructure work (build-script
-changes, verifying `codesign` behavior across the self-update rebuild path,
-deciding whether the identifier needs to be stable across machines) and is
-intentionally left as a follow-up (#4016) rather than bundled into this
-issue's audit + working-set-contract + crash-recovery fix.
+**Ad-hoc code signing (#4016) — pins a legible identifier, does NOT fix TCC
+durability.** `loom-daemon-update.sh` and `provision-daemon.sh` ad-hoc-sign the
+provisioned binary with a stable `--identifier com.rjwalters.loom-daemon`
+(`codesign -f -s - --identifier com.rjwalters.loom-daemon <bin>`, Darwin-only,
+best-effort, never fatal). This was **originally proposed** as a way to let a
+future, narrowly-scoped TCC grant survive a rebuild — that premise was tested
+and found false, and the paragraph above previously repeated the same false
+claim. Measured directly (`codesign -dv --verbose=4` / `codesign -d -r-`
+before and after applying `--identifier`): TCC keys a grant to the binary's
+**designated requirement** (DR), not to the identifier string. A
+certificate-signed binary gets an identifier-anchored DR
+(`identifier "X" and certificate leaf = H"…"`), which is what would survive a
+rebuild — but an **ad-hoc** signature has no certificate chain to anchor to,
+so `codesign` always falls back to a **cdhash-only DR**, regardless of what
+`--identifier` is passed. Applying the stable identifier makes the identifier
+itself constant across rebuilds, but the DR is still `cdhash H"…"`, and that
+hash changes on every rebuild — including every self-update roll, since
+`build.rs` embeds `LOOM_DAEMON_GIT_COMMIT` / `LOOM_DAEMON_BUILD_TIME` and a
+roll by definition follows a `HEAD` move. So the general rule in the FDA
+paragraph above — *any* grant on an ad-hoc/unsigned binary is orphaned by the
+next rebuild — is unaffected by this change and remains the operative fact.
+All this change actually buys is a **legible, stable identifier string**: the
+`codesign -dv` / System Settings → Privacy & Security / crash-diagnostic
+surfaces show `com.rjwalters.loom-daemon` instead of the rustc `-C metadata`
+hash (`loom_daemon-<hash>`, which itself changes on every version bump). It is
+also the necessary first step *if* the project ever adopts real signing — a
+self-signed certificate in a login keychain (breaks hermetic/headless builds)
+or Developer ID + notarization (requires a paid account) — but adopting
+either is unevaluated speculative infrastructure, not something this change
+does. No new TCC grant is requested or needed for this.
 
 ### Self-update (rebuild + provision + restart, #3968)
 
