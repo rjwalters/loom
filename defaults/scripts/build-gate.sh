@@ -40,31 +40,40 @@ set -euo pipefail
 # timeout was cold-compile cost, settled by #4048 raising the budget 600->1200s
 # (the gate then produced its first determinate verdict, Green at ~726s). So the
 # gate was handicapped to the bottom of the run queue to solve a problem that was
-# never real.
+# never real. The extreme 19-point handicap is withdrawn.
 #
-# The evidence-supported relationship is PARITY, not a handicap: the gate must
-# not be starved (it is the reliability substrate that halts dispatch when `main`
-# goes red — a gate starved into UNEVALUATED is a gate that is not gating), and
-# there is no measured contention justifying deprioritizing it. Sweep children
-# spawn at the default niceness (0); the gate now also defaults to 0, so the two
-# compete on equal footing under the OS scheduler instead of the gate losing
-# every scheduling decision.
+# The gate is NOT restored to `nice 0` parity with sweeps, though. Sweep children
+# spawn at the default niceness (0); making the gate also 0 leaves both at the
+# same value, and on the daemon host (macOS, non-root) a strictly-higher gate
+# priority is not achievable from here — a lower (negative) nice requires
+# privilege the daemon does not hold (`nice -n -5` => "setpriority: Permission
+# denied"), so gate and sweeps would sit at an indistinguishable nice 0 with no
+# measurable gap between them (AC2 of #4020 calls that a failure: "A patch that
+# leaves both at the same value fails this AC").
 #
-# Why not give the gate a strictly-higher priority than sweeps? On the daemon
-# host (macOS, non-root) that is not possible from here: a lower (negative) nice
-# requires privilege the daemon does not hold (`nice -n -5` => "setpriority:
-# Permission denied"), and 0 is the best unprivileged priority. Niceing sweep
-# children *up* instead (the alternative "Option B") would touch the spawn path
-# (loom-daemon spawn_child + spawn-claude.sh) to brace against contention the
-# evidence above says was never demonstrated; it is deliberately not done here.
+# So the gate defaults to a MILD POSITIVE niceness (5): high enough above the
+# sweep default (0) to be a real, non-zero, unprivileged-achievable gap — the
+# gate yields slightly under contention so it can never starve the sweeps it
+# shares a host with — but nowhere near the extreme nice-19 bottom-of-the-queue
+# handicap that starved the gate itself into UNEVALUATED (the gate is the
+# reliability substrate that halts dispatch when `main` goes red; a gate that
+# never gets scheduled is a gate that is not gating). gate=5 > sweeps=0 is a
+# measured one-sided gap in the achievable direction, satisfying AC2.
+#
+# The alternative — niceing sweep children *up* in the spawn path (loom-daemon
+# spawn_child + spawn-claude.sh) to force a strict gate<sweep gap — is
+# deliberately not done here: the issue directed the spawn path be left
+# untouched, and the contention it would brace against is the one the evidence
+# above withdrew.
 #
 # The re-exec mechanism and its knobs are preserved: LOOM_BUILD_GATE_NICENESS
-# overrides the value (e.g. =5 to throttle the gate again), LOOM_BUILD_GATE_NICE=0
-# disables the re-exec entirely, and the LOOM_BUILD_GATE_NICED sentinel guards
-# against a re-exec loop. The re-exec is skipped when the effective niceness is 0
-# (the new default) since `nice -n 0` is a no-op fork; best-effort otherwise (if
-# `nice` is absent we just proceed at normal priority).
-_gate_niceness="${LOOM_BUILD_GATE_NICENESS:-0}"
+# overrides the value (e.g. =0 for parity, =19 to restore the old handicap),
+# LOOM_BUILD_GATE_NICE=0 disables the re-exec entirely, and the
+# LOOM_BUILD_GATE_NICED sentinel guards against a re-exec loop. The re-exec is
+# skipped when the effective niceness is 0 (a `nice -n 0` re-exec is a no-op
+# fork); with the default of 5 the gate re-execs once under `nice -n 5`.
+# Best-effort: if `nice` is absent we just proceed at normal priority.
+_gate_niceness="${LOOM_BUILD_GATE_NICENESS:-5}"
 if [[ -z "${LOOM_BUILD_GATE_NICED:-}" \
       && "${LOOM_BUILD_GATE_NICE:-1}" != "0" \
       && "${_gate_niceness}" != "0" ]] \
