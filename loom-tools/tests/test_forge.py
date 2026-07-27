@@ -604,6 +604,269 @@ class TestGetForgeConfig:
         result = get_forge_config(tmp_path)
         assert result == {}
 
+    def test_non_dict_forge_value(self, tmp_path: Path) -> None:
+        """A ``forge`` key that isn't an object soft-fails to {}."""
+        loom_dir = tmp_path / ".loom"
+        loom_dir.mkdir()
+        config = {"version": "2", "forge": "not-an-object", "terminals": []}
+        (loom_dir / "config.json").write_text(json.dumps(config))
+        result = get_forge_config(tmp_path)
+        assert result == {}
+
+    def test_no_git_and_no_loom_dir(self, tmp_path: Path) -> None:
+        """A bare directory with neither .git nor .loom/ never raises."""
+        result = get_forge_config(tmp_path)
+        assert result == {}
+
+    def test_project_json_tier_only(self, tmp_path: Path) -> None:
+        """forge config supplied only via .loom-project/project.json (no
+        .loom/config.json at all) is honored -- #4039's new tier is additive."""
+        project_dir = tmp_path / ".loom-project"
+        project_dir.mkdir()
+        config = {
+            "forge": {
+                "type": "gitea",
+                "gitea": {"url": "https://gitea.example.com", "token": "tok"},
+            },
+        }
+        (project_dir / "project.json").write_text(json.dumps(config))
+        result = get_forge_config(tmp_path)
+        assert result == {
+            "type": "gitea",
+            "gitea": {"url": "https://gitea.example.com", "token": "tok"},
+        }
+
+    def test_project_json_overrides_legacy_config(self, tmp_path: Path) -> None:
+        """.loom-project/project.json (tier 3) outranks legacy .loom/config.json
+        (tier 2) -- deep-merge precedence order from resolve_effective_config."""
+        loom_dir = tmp_path / ".loom"
+        loom_dir.mkdir()
+        (loom_dir / "config.json").write_text(json.dumps({
+            "forge": {"type": "gitea", "gitea": {"url": "https://legacy.example.com"}},
+        }))
+
+        project_dir = tmp_path / ".loom-project"
+        project_dir.mkdir()
+        (project_dir / "project.json").write_text(json.dumps({
+            "forge": {"gitea": {"url": "https://project.example.com"}},
+        }))
+
+        result = get_forge_config(tmp_path)
+        # type comes from the legacy tier (not overridden), url from project tier
+        assert result == {
+            "type": "gitea",
+            "gitea": {"url": "https://project.example.com"},
+        }
+
+
+# ---------------------------------------------------------------------------
+# Worktree root resolution (_canonical_repo_root / get_forge canonicalization)
+# ---------------------------------------------------------------------------
+
+
+def _init_git_repo(path: Path) -> None:
+    subprocess.run(["git", "init", "-q"], cwd=path, check=True)
+    subprocess.run(
+        ["git", "-c", "user.email=test@example.com", "-c", "user.name=Test",
+         "commit", "--allow-empty", "-q", "-m", "init"],
+        cwd=path, check=True,
+    )
+
+
+def _add_worktree(main: Path, wt: Path, branch: str) -> None:
+    subprocess.run(
+        ["git", "worktree", "add", "-q", str(wt), "-b", branch],
+        cwd=main, check=True,
+    )
+
+
+class TestCanonicalRepoRoot:
+    """Tests for _canonical_repo_root -- the worktree root-resolution helper.
+
+    Design decision (#4061): forge credentials are a per-repo fact, not a
+    per-worktree one (same reasoning as #3938 for the .loom/tokens/ pool),
+    so this resolves a worktree cwd back to the canonical main-checkout
+    root via `git rev-parse --git-common-dir`, mirroring
+    `.loom/scripts/spawn-claude.sh`.
+    """
+
+    def test_resolves_worktree_to_main_root(self, tmp_path: Path) -> None:
+        from loom_tools.common.forge import _canonical_repo_root
+
+        main = tmp_path / "main"
+        main.mkdir()
+        _init_git_repo(main)
+
+        wt = tmp_path / "wt"
+        _add_worktree(main, wt, "issue-1")
+
+        assert _canonical_repo_root(wt) == main.resolve()
+
+    def test_main_root_resolves_to_itself(self, tmp_path: Path) -> None:
+        from loom_tools.common.forge import _canonical_repo_root
+
+        main = tmp_path / "main"
+        main.mkdir()
+        _init_git_repo(main)
+
+        assert _canonical_repo_root(main) == main.resolve()
+
+    def test_falls_back_to_cwd_when_not_a_repo(self, tmp_path: Path) -> None:
+        from loom_tools.common.forge import _canonical_repo_root
+
+        assert _canonical_repo_root(tmp_path) == tmp_path
+
+    def test_falls_back_to_cwd_on_os_error(self, tmp_path: Path) -> None:
+        from loom_tools.common.forge import _canonical_repo_root
+
+        with mock.patch(
+            "loom_tools.common.forge.subprocess.run",
+            side_effect=OSError("git not found"),
+        ):
+            assert _canonical_repo_root(tmp_path) is tmp_path
+
+
+class TestGetForgeConfigWorktreeResolution:
+    """Acceptance test: forge config resolves correctly when CWD is a
+    .loom/worktrees/issue-N-style git worktree (#4061)."""
+
+    def test_legacy_config_identical_from_worktree_and_main(
+        self, tmp_path: Path,
+    ) -> None:
+        """.loom/config.json is a tracked file, so it's checked out
+        identically into a fresh worktree -- get_forge_config(cwd) (which
+        does NOT canonicalize) already sees the same content either way."""
+        main = tmp_path / "main"
+        main.mkdir()
+        _init_git_repo(main)
+        loom_dir = main / ".loom"
+        loom_dir.mkdir()
+        config = {
+            "forge": {"type": "gitea", "gitea": {"url": "https://gitea.example.com"}},
+        }
+        (loom_dir / "config.json").write_text(json.dumps(config))
+        subprocess.run(["git", "add", "-A"], cwd=main, check=True)
+        subprocess.run(
+            ["git", "-c", "user.email=test@example.com", "-c", "user.name=Test",
+             "commit", "-q", "-m", "add config"],
+            cwd=main, check=True,
+        )
+
+        wt = tmp_path / "wt"
+        _add_worktree(main, wt, "issue-2")
+
+        assert get_forge_config(main) == get_forge_config(wt) == {
+            "type": "gitea", "gitea": {"url": "https://gitea.example.com"},
+        }
+
+    def test_worktree_local_only_config_needs_canonicalization(
+        self, tmp_path: Path,
+    ) -> None:
+        """The motivating case for the design decision: a host-local
+        .loom-local/local.json exists only at the main root (gitignored in
+        real repos, so it never materializes in a fresh worktree checkout).
+        A naive cwd-relative resolve from inside the worktree sees nothing;
+        resolving via the canonical root (as get_forge() does) sees it."""
+        from loom_tools.common.forge import _canonical_repo_root
+
+        main = tmp_path / "main"
+        main.mkdir()
+        _init_git_repo(main)
+
+        wt = tmp_path / "wt"
+        _add_worktree(main, wt, "issue-3")
+
+        local_dir = main / ".loom-local"
+        local_dir.mkdir()
+        (local_dir / "local.json").write_text(json.dumps({
+            "forge": {"type": "gitea", "gitea": {"url": "https://gitea.example.com", "token": "tok"}},
+        }))
+
+        # Naive cwd-relative resolution from the worktree sees nothing.
+        assert get_forge_config(wt) == {}
+
+        # Canonicalizing first (what get_forge() does) resolves it.
+        canonical = _canonical_repo_root(wt)
+        assert canonical == main.resolve()
+        assert get_forge_config(canonical) == {
+            "type": "gitea", "gitea": {"url": "https://gitea.example.com", "token": "tok"},
+        }
+
+
+# ---------------------------------------------------------------------------
+# get_forge() factory -- worktree canonicalization
+# ---------------------------------------------------------------------------
+
+
+class TestGetForgeCanonicalization:
+    """get_forge() canonicalizes cwd to the main-checkout root before
+    detecting the forge type or constructing a backend (#4061)."""
+
+    def test_detect_forge_receives_canonical_cwd(self, tmp_path: Path) -> None:
+        from loom_tools.common.forge import ForgeType, get_forge
+
+        canonical = tmp_path / "canonical"
+        canonical.mkdir()
+        worktree_cwd = tmp_path / "worktree"
+
+        with (
+            mock.patch(
+                "loom_tools.common.forge._canonical_repo_root",
+                return_value=canonical,
+            ),
+            mock.patch(
+                "loom_tools.common.forge.detect_forge",
+                return_value=ForgeType.GITHUB,
+            ) as mock_detect,
+        ):
+            get_forge(cwd=worktree_cwd, cached=False)
+
+        mock_detect.assert_called_once_with(canonical)
+
+    def test_github_backend_receives_canonical_cwd(self, tmp_path: Path) -> None:
+        from loom_tools.common.forge import ForgeType, get_forge
+
+        canonical = tmp_path / "canonical"
+        canonical.mkdir()
+        worktree_cwd = tmp_path / "worktree"
+
+        with (
+            mock.patch(
+                "loom_tools.common.forge._canonical_repo_root",
+                return_value=canonical,
+            ),
+            mock.patch(
+                "loom_tools.common.forge.detect_forge",
+                return_value=ForgeType.GITHUB,
+            ),
+            mock.patch("loom_tools.common.github.GitHubForge") as mock_cls,
+        ):
+            get_forge(cwd=worktree_cwd, cached=False)
+
+        mock_cls.assert_called_once_with(cwd=canonical)
+
+    def test_gitea_backend_receives_canonical_cwd(self, tmp_path: Path) -> None:
+        from loom_tools.common.forge import ForgeType, get_forge
+
+        canonical = tmp_path / "canonical"
+        canonical.mkdir()
+        worktree_cwd = tmp_path / "worktree"
+
+        with (
+            mock.patch(
+                "loom_tools.common.forge._canonical_repo_root",
+                return_value=canonical,
+            ),
+            mock.patch(
+                "loom_tools.common.forge.detect_forge",
+                return_value=ForgeType.GITEA,
+            ),
+            mock.patch("loom_tools.common.gitea.GiteaForge") as mock_cls,
+        ):
+            get_forge(cwd=worktree_cwd, cached=False)
+
+        mock_cls.assert_called_once_with(cwd=canonical)
+
 
 # ---------------------------------------------------------------------------
 # detect_forge
