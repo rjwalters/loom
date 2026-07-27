@@ -2819,7 +2819,8 @@ fn handle_validate_command(
     strict: bool,
     verbose: bool,
 ) -> Result<()> {
-    use role_validation::{format_validation_result, validate_from_file, ValidationMode};
+    use loom_daemon::config_resolver;
+    use role_validation::{format_validation_result, validate_from_config, ValidationMode};
 
     let workspace_path = std::path::Path::new(workspace);
     let absolute_workspace = if workspace_path.is_absolute() {
@@ -2828,13 +2829,62 @@ fn handle_validate_command(
         std::env::current_dir()?.join(workspace_path)
     };
 
-    let config_path = absolute_workspace.join(".loom").join("config.json");
+    // #4059: resolve the effective config through the full tier chain rather
+    // than reading the legacy `.loom/config.json` directly. Under tiering,
+    // "the legacy file is absent" no longer implies "there is no config" — a
+    // repo may configure `terminals` entirely from `.loom-project/project.json`
+    // or `.loom-local/local.json`.
+    let config = config_resolver::resolve_effective_config(&absolute_workspace);
 
-    if !config_path.exists() {
+    // The tiers searched, in precedence order — named in every "not found" error
+    // (Finding 5: both text and json branches).
+    let mut searched_tiers: Vec<String> = Vec::new();
+    if let Some(defaults) = config_resolver::private_defaults_path() {
+        searched_tiers.push(defaults.display().to_string());
+    }
+    searched_tiers.push(
+        absolute_workspace
+            .join(config_resolver::LEGACY_CONFIG_REL)
+            .display()
+            .to_string(),
+    );
+    searched_tiers.push(
+        absolute_workspace
+            .join(config_resolver::PROJECT_CONFIG_REL)
+            .display()
+            .to_string(),
+    );
+    searched_tiers.push(
+        absolute_workspace
+            .join(config_resolver::LOCAL_CONFIG_REL)
+            .display()
+            .to_string(),
+    );
+
+    // Retargeted precondition (#4059) — stated verbatim for #4062 to mirror:
+    //   "A workspace is validatable iff resolve_effective_config(workspace)
+    //    yields a `terminals` array with at least one element; otherwise the
+    //    command exits 1, naming every tier it searched."
+    let has_terminals = config
+        .get("terminals")
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|arr| !arr.is_empty());
+
+    if !has_terminals {
         if format == "json" {
-            println!(r#"{{"error": "Config file not found: {}"}}"#, config_path.display());
+            let err = serde_json::json!({
+                "error": "No Loom config with a non-empty terminals array found in any tier",
+                "searched": searched_tiers,
+            });
+            println!("{}", serde_json::to_string(&err)?);
         } else {
-            eprintln!("Error: Config file not found: {}", config_path.display());
+            eprintln!(
+                "Error: No Loom config with a non-empty `terminals` array found in any tier."
+            );
+            eprintln!("\nSearched (lowest to highest precedence):");
+            for tier in &searched_tiers {
+                eprintln!("  - {tier}");
+            }
             eprintln!("\nMake sure you're in a Loom workspace or specify the path:");
             eprintln!("  loom-daemon validate /path/to/workspace");
         }
@@ -2847,14 +2897,14 @@ fn handle_validate_command(
         ValidationMode::Warn
     };
 
-    let result = validate_from_file(&config_path, mode).map_err(|e| anyhow!("{e}"))?;
+    let result = validate_from_config(&config, mode);
 
     if format == "json" {
         println!("{}", serde_json::to_string_pretty(&result)?);
     } else {
         if verbose {
             println!("\nValidating role configuration...");
-            println!("  Config: {}", config_path.display());
+            println!("  Workspace: {}", absolute_workspace.display());
             println!();
         }
 

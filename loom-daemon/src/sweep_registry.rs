@@ -201,29 +201,42 @@ pub fn resolve_dispatch_model(repo_root: &Path, explicit: Option<&str>) -> (Stri
 /// Python default in `loom_tools/model_tiers.py::_DEFAULT_TIER_ALIASES`.
 const DEFAULT_TIER_ALIASES: &[(&str, &str)] = &[("opus", "claude-opus-5")];
 
-/// Read the `sweep.modelAliases` override map from `<repo_root>/.loom/config.json`,
-/// soft-failing to an empty map on any error (missing file, malformed JSON, absent
-/// key, non-object value). Blank keys/values are dropped. Mirrors the soft-fail
-/// contract of [`read_autonomous_model`] and `model_tiers._config_overrides`.
+/// Read the `sweep.modelAliases` override map for `repo_root`, resolved through
+/// the full config tier chain (`config_resolver::resolve_effective_config`:
+/// private/shared defaults → legacy `.loom/config.json` →
+/// `.loom-project/project.json` → `.loom-local/local.json`). Soft-fails to an
+/// empty map on any error (missing/malformed tiers, absent key, non-object
+/// value). Blank keys/values are dropped. Mirrors the soft-fail contract of
+/// [`read_autonomous_model`] and `model_tiers._config_overrides`.
+///
+/// **Cross-tier merge (#4059):** `deep_merge` merges objects rather than
+/// replacing them, so a `sweep.modelAliases` map split across tiers now *unions*
+/// its keys, with the higher-precedence tier winning on any shared key. This is
+/// deliberate and desirable — a `.loom-project`/`.loom-local` tier can repoint
+/// an individual alias while inheriting the rest from the legacy tier — and is
+/// asserted explicitly by `read_model_aliases_merges_across_tiers`.
+///
+/// **Cross-language divergence (#4059, Finding 2):** blank keys are dropped
+/// here (`key.is_empty()` guard below), but the Python mirror in
+/// `model_tiers._config_overrides` KEEPS blank keys — it only guards blank
+/// *values*. This is a PRE-EXISTING, known-and-harmless divergence: a blank key
+/// can never match a lookup and [`resolve_model_alias`] returns early on an
+/// empty input model. It is intentionally left as-is here (the Python side is
+/// owned by #4060); do NOT normalize Rust to Python's laxer behavior. Both sides
+/// drop blank values.
 #[must_use]
 pub fn read_model_aliases(repo_root: &Path) -> BTreeMap<String, String> {
     let mut out = BTreeMap::new();
-    let path = repo_root.join(".loom").join("config.json");
-    let Ok(contents) = std::fs::read_to_string(&path) else {
-        return out;
-    };
-    let Ok(config) = serde_json::from_str::<serde_json::Value>(&contents) else {
-        return out;
-    };
-    let Some(aliases) = config
-        .get("sweep")
-        .and_then(|s| s.get("modelAliases"))
+    let config = crate::config_resolver::resolve_effective_config(repo_root);
+    let Some(aliases) = crate::config_resolver::get_path(&config, "sweep.modelAliases")
         .and_then(serde_json::Value::as_object)
     else {
         return out;
     };
     for (key, val) in aliases {
         let key = key.trim().to_lowercase();
+        // #4059 Finding 2: blank keys dropped here; Python keeps them. Left as a
+        // known-and-harmless divergence — see the function doc comment above.
         if key.is_empty() {
             continue;
         }
@@ -4749,6 +4762,49 @@ exit 0
         let dir3 = tempdir().unwrap();
         write_config(dir3.path(), "{ not json");
         assert_eq!(resolve_model_alias(dir3.path(), "opus"), "claude-opus-5");
+
+        // #4059 Finding 1: the overlay direction is config-WINS / default-LOSES.
+        // A config that overrides an UNRELATED alias must NOT disturb `opus`,
+        // which still falls back to the shipped `DEFAULT_TIER_ALIASES` default.
+        let dir4 = tempdir().unwrap();
+        write_config(dir4.path(), r#"{"sweep": {"modelAliases": {"sonnet": "claude-sonnet-9"}}}"#);
+        assert_eq!(resolve_model_alias(dir4.path(), "opus"), "claude-opus-5"); // default wins (no override)
+        assert_eq!(resolve_model_alias(dir4.path(), "sonnet"), "claude-sonnet-9");
+        // config wins
+    }
+
+    /// #4059: `sweep.modelAliases` split across the legacy and project tiers is
+    /// MERGED by `config_resolver::deep_merge` (object-merge, not replace). Keys
+    /// union across tiers, and the higher-precedence tier wins on a shared key.
+    /// The private/shared defaults tier is disabled for hermeticity.
+    #[test]
+    #[serial_test::serial]
+    fn read_model_aliases_merges_across_tiers() {
+        std::env::set_var(crate::config_resolver::PRIVATE_DEFAULTS_ENV, "");
+        let dir = tempdir().unwrap();
+        // Legacy tier supplies `opus` and `sonnet`.
+        write_config(
+            dir.path(),
+            r#"{"sweep": {"modelAliases": {"opus": "legacy-opus", "sonnet": "legacy-sonnet"}}}"#,
+        );
+        // Project tier adds `fable` and overrides `sonnet`.
+        let project_dir = dir.path().join(".loom-project");
+        std::fs::create_dir_all(&project_dir).unwrap();
+        std::fs::write(
+            project_dir.join("project.json"),
+            r#"{"sweep": {"modelAliases": {"sonnet": "project-sonnet", "fable": "project-fable"}}}"#,
+        )
+        .unwrap();
+
+        let aliases = read_model_aliases(dir.path());
+        std::env::remove_var(crate::config_resolver::PRIVATE_DEFAULTS_ENV);
+
+        // Union of keys across both tiers.
+        assert_eq!(aliases.get("opus").map(String::as_str), Some("legacy-opus")); // only in legacy
+        assert_eq!(aliases.get("fable").map(String::as_str), Some("project-fable")); // only in project
+                                                                                     // Higher-precedence (project) tier wins on the shared `sonnet` key.
+        assert_eq!(aliases.get("sonnet").map(String::as_str), Some("project-sonnet"));
+        assert_eq!(aliases.len(), 3);
     }
 
     /// Ladder monotonicity: no rung of the shipped escalation ladder resolves to
