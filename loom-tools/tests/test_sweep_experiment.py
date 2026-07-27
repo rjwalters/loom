@@ -220,6 +220,63 @@ def test_infer_arm_from_model_unknown_is_none():
 
 
 # --------------------------------------------------------------------------- #
+# Generation-agnostic family/pricing matching (#3981)
+# --------------------------------------------------------------------------- #
+
+
+def test_model_family_matches_gen5_models():
+    # Matching keys off the family stem, not a pinned generation number, so
+    # gen-5 model IDs classify correctly instead of falling through to None.
+    assert se._model_family("claude-sonnet-5") == "sonnet"
+    assert se._model_family("claude-opus-5") == "opus"
+    assert se._model_family("claude-fable-5") == "fable"
+
+
+def test_model_family_matches_future_generation():
+    # A hypothetical future generation must still classify via the family
+    # stem, with no code change required.
+    assert se._model_family("claude-sonnet-6") == "sonnet"
+    assert se._model_family("claude-opus-6") == "opus"
+
+
+def test_model_family_still_matches_legacy_and_aliases():
+    assert se._model_family("claude-3-5-sonnet") == "sonnet"
+    assert se._model_family("claude-3-opus") == "opus"
+    assert se._model_family("claude-3-haiku") == "haiku"
+    assert se._model_family("sonnet") == "sonnet"
+    assert se._model_family("opus") == "opus"
+    assert se._model_family("haiku") == "haiku"
+    assert se._model_family("fable") == "fable"
+
+
+def test_model_family_unknown_is_none():
+    assert se._model_family("gpt-4") is None
+    assert se._model_family(None) is None
+    assert se._model_family("") is None
+
+
+def test_infer_arm_from_model_gen5():
+    # claude-sonnet-5 / claude-opus-5 are the resolved IDs behind the
+    # sonnet/opus aliases as of #3981 and must attribute the same as gen-4.
+    assert se.infer_arm_from_model("claude-opus-5") == "A"
+    assert se.infer_arm_from_model("claude-sonnet-5") == "B"
+
+
+def test_opus5_pricing_is_not_sonnet_pricing():
+    # Regression: claude-opus-5 must not fall through to the Sonnet default
+    # (a 5x cost under-report).
+    assert se.model_pricing("claude-opus-5") == se.model_pricing("claude-opus-4-8")
+    assert se.model_pricing("claude-opus-5") != se.model_pricing("claude-sonnet-5")
+
+
+def test_fable5_pricing_is_not_sonnet_default():
+    # claude-fable-5 has no published rate; it must not silently default to
+    # the cheaper Sonnet pricing either.
+    assert se.model_pricing("claude-fable-5") == se.model_pricing("claude-opus-4-8")
+    assert se.model_pricing("claude-fable-5") != se.model_pricing("claude-sonnet-5")
+
+
+# --------------------------------------------------------------------------- #
 # Pricing + transcript usage
 # --------------------------------------------------------------------------- #
 

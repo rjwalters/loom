@@ -46,27 +46,43 @@ pub struct ModelPricing {
 }
 
 impl ModelPricing {
-    /// Get pricing for a given model
+    /// Get pricing for a given model.
+    ///
+    /// Matching is **generation-agnostic**: it keys off the family stem
+    /// (`claude-sonnet-`, `claude-opus-`, `claude-haiku-`, `claude-fable-`)
+    /// rather than a pinned generation number, so a future generation (e.g.
+    /// `claude-sonnet-6`) prices correctly with no code change (#3981). The
+    /// legacy `claude-3-5-sonnet` / `claude-3-opus` / `claude-3-haiku` IDs
+    /// predate the `-<generation>-` naming scheme and are matched explicitly.
+    /// Mirrors `loom_tools.sweep_experiment.model_pricing` in Python — keep
+    /// both in sync.
     pub fn for_model(model: &str) -> Self {
         // Normalize model name for matching
         let model_lower = model.to_lowercase();
 
         // Anthropic models (prices as of Jan 2025)
-        if model_lower.contains("claude-3-5-sonnet") || model_lower.contains("claude-sonnet-4") {
+        if model_lower.contains("claude-3-5-sonnet") || model_lower.contains("claude-sonnet-") {
             Self {
                 input_cost_per_1k: 0.003,
                 output_cost_per_1k: 0.015,
                 cache_read_cost_per_1k: 0.0003,
                 cache_write_cost_per_1k: 0.00375,
             }
-        } else if model_lower.contains("claude-3-opus") || model_lower.contains("claude-opus-4") {
+        } else if model_lower.contains("claude-3-opus")
+            || model_lower.contains("claude-opus-")
+            || model_lower.contains("claude-fable-")
+        {
+            // `claude-fable-*` (the #3702 escalation-ladder rung above Opus)
+            // has no published per-token rate, so it is conservatively priced
+            // at the Opus rate rather than falling through to the cheaper
+            // default and under-reporting cost.
             Self {
                 input_cost_per_1k: 0.015,
                 output_cost_per_1k: 0.075,
                 cache_read_cost_per_1k: 0.0015,
                 cache_write_cost_per_1k: 0.01875,
             }
-        } else if model_lower.contains("claude-3-haiku") {
+        } else if model_lower.contains("claude-3-haiku") || model_lower.contains("claude-haiku-") {
             Self {
                 input_cost_per_1k: 0.00025,
                 output_cost_per_1k: 0.00125,
@@ -352,6 +368,44 @@ mod tests {
         // Total = $0.0108375
         let cost = pricing.calculate_cost(1000, 500, Some(200), Some(50));
         assert!((cost - 0.010_837_5).abs() < 0.0001);
+    }
+
+    // Regression tests for #3981: model-family/pricing matching was
+    // generation-locked to literal `-4` substrings, so gen-5 model IDs
+    // (`claude-sonnet-5`, `claude-opus-5`, `claude-fable-5`) fell through to
+    // the Sonnet-priced default — a 5x cost under-report for Opus 5.
+
+    #[test]
+    fn test_pricing_matches_gen5_sonnet() {
+        let gen5 = ModelPricing::for_model("claude-sonnet-5");
+        let gen4 = ModelPricing::for_model("claude-sonnet-4");
+        assert!((gen5.input_cost_per_1k - gen4.input_cost_per_1k).abs() < f64::EPSILON);
+        assert!((gen5.input_cost_per_1k - 0.003).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_pricing_matches_gen5_opus_not_sonnet() {
+        let opus5 = ModelPricing::for_model("claude-opus-5");
+        // Opus-5 must NOT silently fall through to the Sonnet default.
+        assert!((opus5.input_cost_per_1k - 0.015).abs() < f64::EPSILON);
+        assert!((opus5.output_cost_per_1k - 0.075).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_pricing_matches_gen5_fable() {
+        // `claude-fable-5` has no published rate; it is conservatively priced
+        // at the Opus rate rather than defaulting to (cheaper) Sonnet.
+        let fable5 = ModelPricing::for_model("claude-fable-5");
+        let opus = ModelPricing::for_model("claude-opus-4");
+        assert!((fable5.input_cost_per_1k - opus.input_cost_per_1k).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_pricing_future_generation_still_matches_family_stem() {
+        // A hypothetical future generation must still classify correctly via
+        // the family-stem match, not require a code change.
+        let gen6_opus = ModelPricing::for_model("claude-opus-6");
+        assert!((gen6_opus.input_cost_per_1k - 0.015).abs() < f64::EPSILON);
     }
 
     #[test]
