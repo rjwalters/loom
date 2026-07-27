@@ -598,6 +598,59 @@ loops now read one source of truth and cannot disagree.
 instead of the pre-#3974 hard-coded "workspace tree is dirty", which misreported
 timeouts, missing tools, and `git fetch` failures on a clean tree as a dirty tree.
 
+### SHA memoization, `realChangeGlobs`, and indeterminate-run backoff (#3984)
+
+`buildGate.realChangeGlobs` was declared in shipped config but never read
+anywhere in `loom-daemon/src/` — the gate re-ran its (potentially
+minutes-long) `buildGate.command` on **every** cadence tick regardless of
+whether `origin/main` had moved at all. On a contended host that full
+compile+test run could not finish inside `buildGate.timeoutSeconds`, the
+timeout was correctly classified UNEVALUATED (#3974) and left the previous
+halt verdict standing — but the very next tick fired again almost
+immediately (the gate's own cadence is far shorter than a realistic build
+timeout), so the run competed with itself and with in-flight sweeps for
+cores in a self-sustaining doom loop, permanently HALTING dispatch for that
+repo.
+
+`spawn_multi_main_health_gate_task` now calls `run_gate_tick` per root per
+tick instead of unconditionally constructing a `CommandGateRunner`:
+
+1. **Backoff check** (`MainHealthState::gate_backoff_active`) — if the
+   previous tick was UNEVALUATED, the tick is skipped outright while a
+   backoff window is active. `record_gate_indeterminate_backoff` grows that
+   window exponentially — `buildGate.timeoutSeconds * 2^(consecutive - 1)`,
+   capped at `MAX_GATE_INDETERMINATE_BACKOFF` (1 hour) — so a gate stuck on
+   a broken `PATH`/dead process tree/contended host waits at least a full
+   timeout period (then longer) before retrying, rather than restarting
+   immediately. Any determinate (Green/Red) evaluation clears the backoff.
+2. **SHA memoization** — a cheap `git ls-remote origin main` (no fetch, no
+   working-tree mutation) resolves the current `origin/main` SHA. If it
+   equals `MainHealthState::gate_last_evaluated_sha` (the SHA of the last
+   determinate Green/Red evaluation, or of a SHA previously reviewed and
+   found to touch no `realChangeGlobs` path) the tick is skipped
+   unconditionally — an unchanged SHA has no diff at all, so no glob could
+   possibly match. This is the common case in the reported incident (`main`
+   sat at one SHA with all forge CI green for hours) and is what actually
+   ends the doom loop.
+3. **`realChangeGlobs` filtering** (`decide_gate_run` /
+   `diff_touches_globs`) — when the SHA *has* moved and `realChangeGlobs` is
+   non-empty, `git diff --name-only <last>..<current>` is checked against
+   the configured glob patterns (`glob_matches`: `*`/`?` wildcards; a
+   pattern with no `/` matches by basename anywhere in the tree, e.g. `*.rs`
+   matches `loom-daemon/src/main.rs`; a pattern containing `/` matches the
+   full repo-relative path). A diff touching no matching path skips the run
+   (the previous verdict stands) and still advances the SHA memo, so a
+   docs-only merge doesn't retrigger a diff computation on every subsequent
+   tick either. An empty `realChangeGlobs` (the default) means *any*
+   movement of `main` counts as real — unchanged from pre-#3984 behavior
+   once the SHA has actually changed. A diff that cannot be computed (e.g. a
+   missing object) fails safe and runs the gate rather than risking a real
+   change hiding behind an uncomputable diff.
+
+None of this changes the VERIFIED_RED / UNEVALUATED discriminator (#3974) or
+the forge-CI corroboration (above) — it only decides whether the (expensive)
+command needs to run again at all before those checks ever see it.
+
 ## Per-workspace priority tiers (#3946)
 
 By default the multi-repo work-finder and epic supervisor iterate
