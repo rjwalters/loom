@@ -83,6 +83,16 @@ jobs:
       - name: Verify build output
         run: test -f mcp-loom/dist/index.js
 
+  claude-md-budget:
+    name: CLAUDE.md Line Budget
+    # Cheap structural check; always runs (CLAUDE.md is prepended to every
+    # agent's context, so its size is load-bearing — see #4014).
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Check CLAUDE.md line budget
+        run: bash scripts/check-claude-md-budget.sh
+
   installer-tests:
     name: Installer Integration Tests
     needs: changes
