@@ -443,7 +443,13 @@ pub const WATCHDOG_INTERVAL_ENV: &str = "LOOM_SWEEP_WATCHDOG_INTERVAL_SECS";
 /// written no checkpoint, and produced no log output past the spawn header
 /// within this window is treated as hung. Generous enough that a healthy sweep
 /// (which emits Curator-phase output well inside two minutes) never trips it.
-pub const DEFAULT_WATCHDOG_TIMEOUT_SECS: u64 = 120;
+///
+/// Raised from 120s to 300s (Issue #4088): under concurrency the normal
+/// dispatch→worktree latency was measured at 110–150s, so the old 120s default
+/// sat *inside* the healthy distribution and cancelled progressing sweeps. 300s
+/// clears that window with headroom while staying an order of magnitude below
+/// the review-stall timeout (2700s), keeping the three backstops well separated.
+pub const DEFAULT_WATCHDOG_TIMEOUT_SECS: u64 = 300;
 
 /// Default watchdog probe interval — matches the reaper cadence.
 pub const DEFAULT_WATCHDOG_INTERVAL_SECS: u64 = 30;
@@ -1065,6 +1071,22 @@ pub struct SweepRegistry {
     /// Issues the watchdog has already logged a give-up for, so the loud
     /// give-up warning fires once per issue rather than every tick.
     watchdog_gaveup: HashSet<u32>,
+    /// Sweeps the startup watchdog has ever observed making progress, latched so
+    /// the "has progressed" signal is monotonic (Issue #4088). `sweep_made_progress`
+    /// re-derives progress from mutable filesystem state (worktree / checkpoint /
+    /// log) every tick, all of which are torn down at successful completion — so a
+    /// *finished* sweep reads as *never started* and the memoryless
+    /// [`watchdog_decision`] re-dispatches it. Once a `SweepId` lands here the
+    /// startup watchdog leaves it alone forever, delegating any later crash to the
+    /// mid-build-death (#3895) / review-stall (#3910) backstops, which is the
+    /// division of labor the module doc already specifies.
+    ///
+    /// Keyed by `SweepId`, NOT issue: an issue-keyed latch would persist across
+    /// re-dispatch, so a re-dispatched sweep that then genuinely hangs at startup
+    /// would read as "already progressed" and never be rescued — silently
+    /// defanging the watchdog and violating AC2. Grows per dispatch, so it is
+    /// pruned alongside entry GC in [`reap_once`](Self::reap_once).
+    watchdog_progressed: HashSet<SweepId>,
     /// Issues the mid-build-death watchdog has already recovered once (Issue
     /// #3895). Distinct from `watchdog_retried` (startup-hang, no progress):
     /// this bounds the "made progress then the child died" recovery to a
@@ -1113,6 +1135,7 @@ impl SweepRegistry {
             last_spawn_at: None,
             watchdog_retried: HashSet::new(),
             watchdog_gaveup: HashSet::new(),
+            watchdog_progressed: HashSet::new(),
             midbuild_retried: HashSet::new(),
             midbuild_gaveup: HashSet::new(),
             review_stall_retried: HashSet::new(),
@@ -1135,6 +1158,7 @@ impl SweepRegistry {
             last_spawn_at: None,
             watchdog_retried: HashSet::new(),
             watchdog_gaveup: HashSet::new(),
+            watchdog_progressed: HashSet::new(),
             midbuild_retried: HashSet::new(),
             midbuild_gaveup: HashSet::new(),
             review_stall_retried: HashSet::new(),
@@ -1344,6 +1368,24 @@ impl SweepRegistry {
                 ));
             }
         };
+
+        // 2.5 Closed-issue guard (Issue #4088). All three watchdogs
+        //     (startup #3887, mid-build-death #3895, review-stall #3910)
+        //     re-dispatch through this method, and `gh issue edit` succeeds on a
+        //     closed issue, so nothing else stops a watchdog false-positive from
+        //     re-claiming an issue whose PR already merged. Placing the guard
+        //     here — before the lock/label flip — covers all three call sites
+        //     with one check. Best-effort and fail-open: a forge lookup error
+        //     returns `None` and dispatch proceeds, so a `gh` outage can never
+        //     wedge the daemon. Skipped when label flips are disabled (test
+        //     fixtures without `gh` credentials).
+        if !self.config.skip_label_flip && self.issue_is_closed(issue_number) == Some(true) {
+            return Err(anyhow!(
+                "refusing to dispatch issue #{issue_number}: it is closed on the forge \
+                 (#4088 closed-issue guard). A watchdog re-dispatch must not re-claim a \
+                 closed/merged issue."
+            ));
+        }
 
         // 3. Acquire the claim lock atomically.
         let sweep_id = generate_sweep_id(kind);
@@ -1589,6 +1631,48 @@ impl SweepRegistry {
     // ------------------------------------------------------------------------
     // Forge label flip
     // ------------------------------------------------------------------------
+
+    /// Best-effort probe of whether an issue is closed on the forge (Issue
+    /// #4088). Returns `Some(true)` when closed, `Some(false)` when open, and
+    /// `None` on any error (missing/failed/timed-out `gh`, unparseable output).
+    ///
+    /// Callers MUST treat `None` as **fail-open** — a forge outage or a wedged
+    /// `gh` must never wedge dispatch. The call is bounded by [`reap_gh_timeout`]
+    /// exactly like the label flips so it cannot block the dispatch path.
+    fn issue_is_closed(&self, issue: u32) -> Option<bool> {
+        let gh = self
+            .config
+            .gh_bin
+            .clone()
+            .unwrap_or_else(|| PathBuf::from("gh"));
+        let mut cmd = Command::new(&gh);
+        cmd.arg("issue")
+            .arg("view")
+            .arg(issue.to_string())
+            .arg("--json")
+            .arg("state")
+            .arg("--jq")
+            .arg(".state");
+        // Resolve the issue against this registry's own workspace, matching the
+        // label-flip helpers (#3937). LOOM_REPO still overrides when set.
+        cmd.current_dir(&self.config.workspace_root);
+        if let Ok(repo) = std::env::var("LOOM_REPO") {
+            cmd.arg("--repo").arg(repo);
+        }
+        let output = output_with_timeout(cmd, reap_gh_timeout()).ok()??;
+        if !output.status.success() {
+            return None;
+        }
+        match String::from_utf8_lossy(&output.stdout)
+            .trim()
+            .to_ascii_uppercase()
+            .as_str()
+        {
+            "CLOSED" => Some(true),
+            "OPEN" => Some(false),
+            _ => None,
+        }
+    }
 
     fn flip_label_to_building(&self, issue: u32) -> Result<()> {
         let gh = self
@@ -2712,6 +2796,11 @@ impl SweepRegistry {
             // `poll_liveness` already, but drop any lingering handle so a
             // GC'd sweep never leaks a `Child` (Issue #3801).
             let _ = self.children.remove(&id);
+            // Prune the per-SweepId progress latch so it cannot grow unbounded
+            // across many dispatches (Issue #4088). Safe because a GC'd entry is
+            // terminal — the watchdog only ever consults the latch for
+            // Running/Pending entries it still owns a Child handle for.
+            self.watchdog_progressed.remove(&id);
             changes += 1;
         }
         changes
@@ -2810,7 +2899,17 @@ impl SweepRegistry {
 
         let mut restarts = 0usize;
         for (sweep_id, issue, log_path, elapsed) in candidates {
-            let made_progress = self.sweep_made_progress(issue, &log_path);
+            // Latch progress per SweepId (Issue #4088): `sweep_made_progress`
+            // only reports the *current* filesystem state, and every signal it
+            // reads (worktree, checkpoint, log) is torn down at successful
+            // completion — so a finished sweep would otherwise read as
+            // never-started and be re-dispatched. Once observed true, the latch
+            // keeps `made_progress` true for this SweepId on every later tick.
+            let made_progress = self.watchdog_progressed.contains(&sweep_id)
+                || self.sweep_made_progress(issue, &log_path);
+            if made_progress {
+                self.watchdog_progressed.insert(sweep_id.clone());
+            }
             let already_retried = self.watchdog_retried.contains(&issue);
             match watchdog_decision(elapsed, timeout, made_progress, already_retried) {
                 WatchdogDecision::Healthy => {}
@@ -8002,6 +8101,308 @@ exit 0\n";
         let _ = reg.cancel(&out.sweep_id, Duration::from_secs(2));
     }
 
+    // --- progress latch (Issue #4088) ---
+
+    /// AC5 regression (the headline bug): a sweep that made progress (worktree
+    /// present), then had that worktree AND its checkpoint torn down at
+    /// completion while still `Running`, with `elapsed` far past the timeout,
+    /// must NOT be cancelled or re-dispatched. On `origin/main` the stateless
+    /// probe reads "no progress" after cleanup and re-dispatches against the
+    /// now-closed issue; the per-`SweepId` latch prevents that.
+    #[test]
+    fn watchdog_does_not_redispatch_completed_sweep_after_cleanup() {
+        let tmp = tempdir().unwrap();
+        let ws = tmp.path();
+        let mut reg = hung_child_registry(ws);
+
+        let out = reg
+            .dispatch(&SweepKind::Issue(4078), None, None, None, None)
+            .unwrap();
+        assert!(wait_until_alive(out.pid, FIXTURE_CHILD_WAIT_MS));
+
+        // Progress appears (Builder created a worktree), and a tick observes +
+        // latches it.
+        let wt = ws.join(".loom").join("worktrees").join("issue-4078");
+        std::fs::create_dir_all(&wt).unwrap();
+        assert_eq!(reg.watchdog_once(Duration::from_secs(10)), 0);
+        assert!(
+            reg.watchdog_progressed.contains(&out.sweep_id),
+            "progress is latched for the sweep"
+        );
+
+        // Completion tears down every progress signal (merge-pr.sh removes the
+        // worktree; /loom:sweep deletes the checkpoint). The stateless probe now
+        // reads no-progress — the exact #4078 condition.
+        std::fs::remove_dir_all(&wt).unwrap();
+        assert!(
+            !reg.sweep_made_progress(4078, &out.log_path),
+            "stateless probe reads no-progress after cleanup (the bug's precondition)"
+        );
+
+        // Even backdated far past the timeout, the latched sweep is left alone.
+        backdate(&mut reg, &out.sweep_id, 9999);
+        assert_eq!(
+            reg.watchdog_once(Duration::from_secs(10)),
+            0,
+            "a completed-then-cleaned-up sweep is never re-dispatched (AC5)"
+        );
+        assert!(
+            !reg.watchdog_retried.contains(&4078),
+            "no retry recorded for the completed sweep"
+        );
+
+        let _ = reg.cancel(&out.sweep_id, Duration::from_secs(2));
+    }
+
+    /// AC2 on re-dispatch (the Finding 6 trap): the latch is keyed by `SweepId`,
+    /// not issue. A latch keyed by issue would make a *re-dispatched* sweep that
+    /// genuinely hangs read as "already progressed" and never be rescued —
+    /// silently defanging the watchdog for the very issues it already rescued
+    /// once. A prior sweep's latch (distinct `SweepId`) must not cover a new
+    /// hung sweep for the same issue.
+    #[test]
+    fn watchdog_latch_is_scoped_by_sweep_id_so_redispatch_is_still_rescued() {
+        let tmp = tempdir().unwrap();
+        let ws = tmp.path();
+        let mut reg = hung_child_registry(ws);
+
+        let out = reg
+            .dispatch(&SweepKind::Issue(4060), None, None, None, None)
+            .unwrap();
+        assert!(wait_until_alive(out.pid, FIXTURE_CHILD_WAIT_MS));
+
+        // Simulate a PRIOR, now-gone sweep for the SAME issue having progressed:
+        // its distinct SweepId is latched. An issue-keyed latch would instead
+        // hold `4060` and wrongly cover the current sweep.
+        reg.watchdog_progressed
+            .insert("sweep-issue-4060-prior".to_string());
+        assert!(
+            !reg.watchdog_progressed.contains(&out.sweep_id),
+            "the current (hung) sweep is not itself latched"
+        );
+
+        // The current sweep never progressed; backdate it past the timeout.
+        backdate(&mut reg, &out.sweep_id, 600);
+        assert_eq!(
+            reg.watchdog_once(Duration::from_secs(60)),
+            1,
+            "a re-dispatched sweep that hangs at startup is still rescued (AC2)"
+        );
+        assert!(reg.watchdog_retried.contains(&4060));
+
+        if let Some(id) = running_issue_sweep_id(&reg, 4060) {
+            let _ = reg.cancel(&id, Duration::from_secs(2));
+        }
+    }
+
+    /// The latch is monotonic (stays true across ticks once observed) AND scoped
+    /// to a single `SweepId` — a sibling sweep that never progressed is
+    /// unaffected and still eligible for rescue.
+    #[test]
+    fn watchdog_latch_is_monotonic_and_per_sweep() {
+        let tmp = tempdir().unwrap();
+        let ws = tmp.path();
+        let mut reg = hung_child_registry(ws);
+
+        let a = reg
+            .dispatch(&SweepKind::Issue(5001), None, None, None, None)
+            .unwrap();
+        assert!(wait_until_alive(a.pid, FIXTURE_CHILD_WAIT_MS));
+        let b = reg
+            .dispatch(&SweepKind::Issue(5002), None, None, None, None)
+            .unwrap();
+        assert!(wait_until_alive(b.pid, FIXTURE_CHILD_WAIT_MS));
+
+        // Only A makes progress.
+        let wt_a = ws.join(".loom").join("worktrees").join("issue-5001");
+        std::fs::create_dir_all(&wt_a).unwrap();
+        assert_eq!(reg.watchdog_once(Duration::from_secs(10)), 0);
+        assert!(reg.watchdog_progressed.contains(&a.sweep_id), "A latched");
+        assert!(
+            !reg.watchdog_progressed.contains(&b.sweep_id),
+            "B never progressed ⇒ not latched"
+        );
+
+        // Monotonic: remove A's worktree; a later tick keeps A latched.
+        std::fs::remove_dir_all(&wt_a).unwrap();
+        assert_eq!(reg.watchdog_once(Duration::from_secs(10)), 0);
+        assert!(
+            reg.watchdog_progressed.contains(&a.sweep_id),
+            "A stays latched across ticks even with its worktree gone"
+        );
+
+        // B, never progressing and backdated, is still restarted — A's latch is
+        // scoped to A and does not cover its sibling.
+        backdate(&mut reg, &b.sweep_id, 600);
+        assert_eq!(
+            reg.watchdog_once(Duration::from_secs(60)),
+            1,
+            "the un-latched sibling is rescued"
+        );
+        assert!(reg.watchdog_retried.contains(&5002));
+        assert!(!reg.watchdog_retried.contains(&5001));
+
+        for issue in [5001u32, 5002u32] {
+            if let Some(id) = running_issue_sweep_id(&reg, issue) {
+                let _ = reg.cancel(&id, Duration::from_secs(2));
+            }
+        }
+    }
+
+    /// Latch pruning: entries for sweeps GC'd from `entries` are dropped from
+    /// the latch, so the per-`SweepId` set cannot grow unbounded across many
+    /// dispatches.
+    #[test]
+    fn watchdog_latch_pruned_on_entry_gc() {
+        let tmp = tempdir().unwrap();
+        let ws = tmp.path();
+        let (mut reg, _rec) = fixture_registry(ws);
+
+        // A terminal entry aged past the retention window, with its SweepId
+        // latched — exactly the state left behind by a completed sweep.
+        let sid = "sweep-issue-6001-done".to_string();
+        let old = Utc::now() - chrono::Duration::seconds(TERMINAL_RETENTION_SECS + 60);
+        reg.entries.insert(
+            sid.clone(),
+            SweepInfo {
+                sweep_id: sid.clone(),
+                kind: SweepKind::Issue(6001),
+                pid: 2_147_483_640,
+                token_name: "unknown".into(),
+                log_path: ws.join(".loom/logs/sweep-issue-6001.log"),
+                idempotency_key: None,
+                started_at: old,
+                state: SweepState::Exited {
+                    code: Some(0),
+                    at: old,
+                },
+                latest_phase: None,
+                pr_number: None,
+                model: None,
+                effort: None,
+                depends_on: None,
+                repo: None,
+            },
+        );
+        reg.watchdog_progressed.insert(sid.clone());
+
+        // GC drops the terminal entry and must prune its latch entry with it.
+        reg.reap_once();
+        assert!(!reg.entries.contains_key(&sid), "terminal entry is GC'd");
+        assert!(
+            !reg.watchdog_progressed.contains(&sid),
+            "the latch entry is pruned alongside the GC'd sweep"
+        );
+    }
+
+    // --- closed-issue dispatch guard (Issue #4088, AC6) ---
+
+    /// Install a fake `gh` that reports a fixed `issue view` state and records
+    /// every invocation, returning `(registry, gh_log)`. `spawn-claude.sh` is a
+    /// benign echo-and-exit so a dispatch that passes the guard still spawns.
+    fn closed_guard_registry(
+        ws: &Path,
+        view_stdout: &str,
+        view_exit: i32,
+    ) -> (SweepRegistry, PathBuf) {
+        let gh_log = ws.join("gh-invocations.log");
+        let fake_gh = ws.join("fake-gh.sh");
+        let script = format!(
+            "#!/usr/bin/env bash\n\
+             printf '%s\\n' \"$*\" >> \"{log}\"\n\
+             if [[ \"$1\" == \"issue\" && \"$2\" == \"view\" ]]; then\n\
+             printf '%s\\n' \"{state}\"\n\
+             exit {exit}\n\
+             fi\n\
+             exit 0\n",
+            log = gh_log.display(),
+            state = view_stdout,
+            exit = view_exit,
+        );
+        std::fs::write(&fake_gh, &script).unwrap();
+        let mut perms = std::fs::metadata(&fake_gh).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&fake_gh, perms).unwrap();
+        if let Ok(f) = std::fs::File::open(&fake_gh) {
+            let _ = f.sync_all();
+        }
+
+        let scripts_dir = ws.join(".loom").join("scripts");
+        std::fs::create_dir_all(&scripts_dir).unwrap();
+        let spawn = scripts_dir.join("spawn-claude.sh");
+        std::fs::write(&spawn, "#!/usr/bin/env bash\necho spawned\nexit 0\n").unwrap();
+        let mut sperms = std::fs::metadata(&spawn).unwrap().permissions();
+        sperms.set_mode(0o755);
+        std::fs::set_permissions(&spawn, sperms).unwrap();
+        if let Ok(f) = std::fs::File::open(&spawn) {
+            let _ = f.sync_all();
+        }
+
+        let mut config = SweepRegistryConfig::new(ws.to_path_buf());
+        config.spawn_bin = Some(spawn);
+        config.gh_bin = Some(fake_gh);
+        config.skip_label_flip = false; // exercise the real guard + flip path
+        config.journal_path = Some(ws.join("test-sweeps-journal.json"));
+        (SweepRegistry::new(config), gh_log)
+    }
+
+    /// AC6: `dispatch` for a closed issue is refused, and it must NOT flip any
+    /// labels (no `issue edit`) — a watchdog re-dispatch can never re-claim a
+    /// closed/merged issue.
+    #[test]
+    #[serial]
+    fn dispatch_refuses_closed_issue_without_flipping_labels() {
+        let tmp = tempdir().unwrap();
+        let ws = tmp.path();
+        std::env::remove_var("LOOM_REPO");
+        let (mut reg, gh_log) = closed_guard_registry(ws, "CLOSED", 0);
+
+        let err = reg
+            .dispatch(&SweepKind::Issue(4078), None, None, None, None)
+            .expect_err("a closed issue must be refused");
+        assert!(
+            err.to_string().contains("closed"),
+            "error explains the closed-issue guard; got: {err}"
+        );
+
+        let calls = std::fs::read_to_string(&gh_log).unwrap_or_default();
+        assert!(calls.contains("issue view 4078"), "the guard probed issue state");
+        assert!(
+            !calls.contains("issue edit"),
+            "no label flip on a refused dispatch; got: {calls:?}"
+        );
+        // No lock was acquired and no entry recorded.
+        assert!(running_issue_sweep_id(&reg, 4078).is_none());
+    }
+
+    /// AC6 fail-open: a forge lookup error (non-zero `gh`) must NOT wedge
+    /// dispatch — the guard returns `None` and dispatch proceeds normally.
+    #[test]
+    #[serial]
+    fn dispatch_fails_open_when_issue_state_lookup_errors() {
+        let tmp = tempdir().unwrap();
+        let ws = tmp.path();
+        std::env::remove_var("LOOM_REPO");
+        // `issue view` exits non-zero ⇒ state unknown ⇒ fail open.
+        let (mut reg, gh_log) = closed_guard_registry(ws, "", 1);
+
+        let out = reg
+            .dispatch(&SweepKind::Issue(4079), None, None, None, None)
+            .expect("a gh outage must not wedge dispatch (fail-open)");
+        assert!(wait_until_dead(out.pid, FIXTURE_CHILD_WAIT_MS));
+
+        let calls = std::fs::read_to_string(&gh_log).unwrap_or_default();
+        assert!(calls.contains("issue view 4079"), "the guard probed issue state");
+        assert!(
+            calls.contains("issue edit 4079"),
+            "dispatch proceeded to the label flip after failing open; got: {calls:?}"
+        );
+
+        if let Some(id) = running_issue_sweep_id(&reg, 4079) {
+            let _ = reg.cancel(&id, Duration::from_secs(2));
+        }
+    }
+
     // --- config resolution: env > config > default ---
 
     fn write_cfg(dir: &Path, body: &str) {
@@ -8190,6 +8591,13 @@ exit 0\n";
     fn resolve_watchdog_timeout_and_interval_precedence() {
         std::env::remove_var(WATCHDOG_TIMEOUT_ENV);
         std::env::remove_var(WATCHDOG_INTERVAL_ENV);
+        // AC1 (#4088): the default no-progress window is 300s — clear of the
+        // observed 110–150s healthy dispatch→worktree distribution.
+        assert_eq!(DEFAULT_WATCHDOG_TIMEOUT_SECS, 300);
+        assert_eq!(
+            resolve_watchdog_timeout(&StartupRaceConfig::default()),
+            Duration::from_secs(300)
+        );
         assert_eq!(
             resolve_watchdog_timeout(&StartupRaceConfig::default()),
             Duration::from_secs(DEFAULT_WATCHDOG_TIMEOUT_SECS)

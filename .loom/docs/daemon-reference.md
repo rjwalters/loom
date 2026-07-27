@@ -1382,7 +1382,7 @@ concurrency ceiling 5" and share it with the team:
     "dispatchStaggerMs": 2000,
     "watchdog": {
       "enabled": true,
-      "timeoutSecs": 120,
+      "timeoutSecs": 300,
       "intervalSecs": 30,
       "reviewStall": true,
       "reviewStallTimeoutSecs": 2700
@@ -1422,7 +1422,7 @@ exactly like `main_health_gate::read_build_gate_config`.
 | `autonomous.watchMonitor.expirySecs` | `LOOM_WATCH_MONITOR_EXPIRY_SECS` | `86400` | Give-up window for an unresolved watch; `0` disables expiry |
 | `autonomous.dispatchStaggerMs` | `LOOM_SWEEP_DISPATCH_STAGGER_MS` | `2000` | Min gap between consecutive child spawns (#3887). `0` disables |
 | `autonomous.watchdog.enabled` | `LOOM_SWEEP_WATCHDOG` | `true` | Startup watchdog on/off (#3887). Also the master switch for the tick — mid-build-death (#3895) + review-stall (#3910) run in the same task |
-| `autonomous.watchdog.timeoutSecs` | `LOOM_SWEEP_WATCHDOG_TIMEOUT_SECS` | `120` | No-progress window before auto-restart |
+| `autonomous.watchdog.timeoutSecs` | `LOOM_SWEEP_WATCHDOG_TIMEOUT_SECS` | `300` | No-progress window before auto-restart (raised from 120s in #4088 — the old default sat inside the observed 110–150s dispatch→worktree window and cancelled healthy sweeps) |
 | `autonomous.watchdog.intervalSecs` | `LOOM_SWEEP_WATCHDOG_INTERVAL_SECS` | `30` | Watchdog probe cadence (shared by all three backstops) |
 | `autonomous.watchdog.reviewStall` | `LOOM_SWEEP_REVIEW_STALL` | `true` | Review-phase stall watchdog on/off (#3910) |
 | `autonomous.watchdog.reviewStallTimeoutSecs` | `LOOM_SWEEP_REVIEW_STALL_TIMEOUT_SECS` | `2700` | Log-silence window before a hung Judge/Doctor sweep is re-dispatched |
@@ -1506,6 +1506,23 @@ written / log output past the spawn header) and auto-cancels + re-dispatches —
 frozen `sweep.issue.{N}.exited` / `sweep.global.completed` / `sweep.global.dispatch`
 topics (no new event topics). The watchdog defaults **on**; disable it with
 `LOOM_SWEEP_WATCHDOG=0` or `autonomous.watchdog.enabled = false`.
+
+**Progress is latched per sweep (#4088).** The progress probe reads only the
+*current* filesystem state (worktree / checkpoint / log), and **all three signals
+are torn down at successful completion** — `merge-pr.sh` removes the worktree,
+`/loom:sweep` deletes the checkpoint, and the log never grows past the spawn
+header. So a *finished* sweep is structurally indistinguishable from one that
+*never started*, and because the decision function is memoryless (`elapsed` is
+total runtime and only increases), a completed-then-cleaned-up sweep would be
+re-dispatched against its own — now closed — issue. To fix this the watchdog
+**latches progress per `SweepId`**: once a sweep is ever observed making progress
+it is left alone for the rest of its life (later crashes are delegated to the
+mid-build-death / review-stall backstops below). The latch is keyed by `SweepId`,
+not issue number, so a *re-dispatched* sweep that then genuinely hangs at startup
+is still rescued. Independently, **`dispatch` skips any issue that is closed on
+the forge** (best-effort, fail-open on a `gh` error) — this covers all three
+watchdogs, since each re-dispatches through the same method, so no self-heal path
+can ever re-claim a closed/merged issue.
 
 **Review-phase stall watchdog (#3910).** The startup watchdog rescues a sweep
 that shows *no* progress, and the mid-build-death watchdog (#3895) rescues one
