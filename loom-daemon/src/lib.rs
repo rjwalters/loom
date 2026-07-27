@@ -32,6 +32,7 @@ pub mod role_validation;
 pub mod sweep_journal;
 pub mod sweep_registry;
 pub mod terminal;
+pub mod token_ranking_refresh;
 pub mod tokens;
 pub mod types;
 pub mod work_finder;

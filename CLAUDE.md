@@ -474,7 +474,9 @@ Status assignment: `available` (utilizations < 95%), `exhausted` (`7d_utilizatio
 
 OAuth tokens shaped `sk-ant-oat01-*` are sent with `Authorization: Bearer` + `anthropic-beta: oauth-2025-04-20`; plain API keys use `x-api-key`.
 
-Cron example (probe every 10 minutes):
+**The running `loom-daemon` self-refreshes `.ranking` (#3969)** — it runs the equivalent of `probe-tokens.sh --ranking` on its own periodic loop (default every 10 minutes, `autonomous.tokenRankingRefresh` / `LOOM_TOKEN_RANKING_REFRESH*`, on by default since it is read-only probing with no dispatch side effect), so a standing cron for this is no longer required when the daemon is running. See [Token-ranking self-refresh](.loom/docs/daemon-reference.md#token-ranking-self-refresh-3969) for the config knobs.
+
+A cron entry is now only needed as a **fallback for setups that don't run `loom-daemon`** (e.g. pure `/loom:sweep` subagent dispatch with no daemon process). Cron example (probe every 10 minutes):
 
 ```cron
 */10 * * * * cd /path/to/repo && ./.loom/scripts/probe-tokens.sh --ranking >> .loom/logs/probe-tokens.log 2>&1
