@@ -741,6 +741,27 @@ pub struct DaemonStatusReport {
     /// pre-#3978 wire data compatible.
     #[serde(default)]
     pub loadavg_1m: Option<f64>,
+    /// The measured CPU idle fraction (`0.0..=1.0`) feeding [`Self::cpu_headroom`]
+    /// (#4031), via [`crate::cpu_headroom::cached_cpu_idle_fraction`]. This is the
+    /// signal that replaced the 1-minute load average as the source of "consumed
+    /// cores" — load average overstated consumption by ~1.5× on macOS because it
+    /// counts network-I/O-blocked `claude` sessions that consume no core. `None`
+    /// when no idle sample has been taken yet (the term then falls back to
+    /// [`Self::loadavg_1m`], then to static capacity — see the
+    /// [`crate::cpu_headroom`] module docs). `#[serde(default)]` keeps pre-#4031
+    /// wire data / older clients compatible.
+    #[serde(default)]
+    pub cpu_idle_fraction: Option<f64>,
+    /// Whether in-flight occupancy has actually reached the dynamic cap
+    /// (`in_flight.len() >= dynamic_cap`) — i.e. the cap is *currently binding*,
+    /// not merely the smallest ceiling (#4031). When `false`, no resource term
+    /// (tokens/disk/CPU) is the limiter — the limiter is **work availability**,
+    /// and the status renderer suppresses the "token-bound" diagnosis rather than
+    /// misreporting a bottleneck at, say, 1 in-flight against a cap of 7.
+    /// `#[serde(default)]` keeps pre-#4031 wire data / older clients compatible
+    /// (an absent field parses as `false` — "not capacity-bound").
+    #[serde(default)]
+    pub capacity_bound: bool,
     /// Dynamic-cap input 4: the configured operator ceiling
     /// (`autonomous.workFinder.maxConcurrent` / `LOOM_WORK_FINDER_MAX_CONCURRENT`).
     pub configured_max: usize,

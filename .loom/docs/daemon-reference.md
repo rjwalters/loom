@@ -1128,29 +1128,63 @@ daemon restart:
 | **healthy-token count** | `available` accounts in `{workspace}/.loom/tokens/.ranking` (`capacity::token_axis_limit`), falling back to the `*.token` count (`tokens::token_pool_size`) when no ranking exists | the count of accounts safe to dispatch to — never dispatch to an exhausted/blocked one (#3902) |
 | **per-token concurrency** | `LOOM_PER_TOKEN_CONCURRENCY` / `autonomous.perTokenConcurrency`, default **2** (#3947) | how many concurrent sweeps to allow **per healthy account**. A plan limit is a utilization-window token bucket, not a session count, so one healthy account can run several concurrent sessions. Before #3947 the implicit factor was `1` (one sweep per account), which collapsed the whole fleet to cap 1 when 6/7 accounts were at their weekly ceiling even though the single healthy account had ample session-window headroom |
 | **disk headroom** | `floor(free_gb / LOOM_PER_WORKTREE_GB)` on the worktree-root volume (`disk_headroom::disk_headroom_limit`, a Rust port of `disk-headroom.sh` that shells to `df -Pk`) | never provision more worktrees than the scratch volume can hold |
-| **cpu/load headroom** (#3978) | `max(1, floor((logical_cpus × LOOM_CPU_UTILIZATION_TARGET − 1m loadavg) / LOOM_EST_CORES_PER_SWEEP))` (`cpu_headroom::cpu_headroom_limit`) | never start more concurrent sweeps than the host's CPU/load headroom can currently absorb |
+| **cpu headroom** (#3978, measured-idle signal #4031) | `max(1, floor((logical_cpus × LOOM_CPU_UTILIZATION_TARGET − consumed_cores) / LOOM_EST_CORES_PER_SWEEP))`, where `consumed_cores = logical_cpus × (1 − idle_fraction)` from the measured idle fraction (loadavg fallback) (`cpu_headroom::cpu_headroom_limit`) | never start more concurrent sweeps than the host's CPU headroom can currently absorb |
 | **configured ceiling** | `LOOM_WORK_FINDER_MAX_CONCURRENT` (repurposed from Phase A's fixed target into an operator ceiling) | hard operator upper bound regardless of token/disk/cpu headroom |
 
-**CPU/load headroom term (#3978).** The token and disk axes alone let a batch
-of token accounts resetting from `exhausted` to `available` at once raise the
-cap regardless of how many concurrent `cargo build`s were already saturating
-the host — the incident this term fixes: 2–3 concurrent Rust builds in sweep
-worktrees starved `build-gate.sh` of CPU badly enough that it hit its own 600s
-timeout, which the (separately-fixed, #3974) gate misreported as a verified-red
-`main`, halting all dispatch. `cpu_headroom_limit()` combines a **static**
-capacity (`logical_cpus × utilization_target`, default target `0.75` — leaves
-headroom for the OS, the daemon itself, and the gate's own `cargo`
-invocations) with the **current** 1-minute load average (`/proc/loadavg` on
-Linux, `sysctl -n vm.loadavg` on macOS) subtracted from that capacity, divided
-by an estimated per-sweep core cost (`LOOM_EST_CORES_PER_SWEEP`, default
-`2.0`). Like the token axis's "one healthy account is the floor, never a
-halt" policy (#3902), the CPU term is floored at `1` — a load-average read
-failure or a noisy reading must never by itself wedge the whole dynamic cap
-to zero; disk headroom and the token axis remain the only terms allowed to
-floor to a genuine `0`. Tunable via `LOOM_CPU_UTILIZATION_TARGET` (fraction,
-default `0.75`) and `LOOM_EST_CORES_PER_SWEEP` (cores, default `2.0`) —
-env-only, mirroring `LOOM_PER_WORKTREE_GB`'s config surface (no
-`.loom/config.json` knob).
+**CPU headroom term (#3978, measured-idle signal #4031).** The token and disk
+axes alone let a batch of token accounts resetting from `exhausted` to
+`available` at once raise the cap regardless of how many concurrent `cargo
+build`s were already saturating the host — the incident this term fixes: 2–3
+concurrent Rust builds in sweep worktrees starved `build-gate.sh` of CPU badly
+enough that it hit its own 600s timeout, which the (separately-fixed, #3974)
+gate misreported as a verified-red `main`, halting all dispatch.
+`cpu_headroom_limit()` combines a **static** capacity (`logical_cpus ×
+utilization_target`, default target `0.75` — leaves headroom for the OS, the
+daemon itself, and the gate's own `cargo` invocations) with the cores
+**currently consumed**, subtracted from that capacity, divided by an estimated
+per-sweep core cost (`LOOM_EST_CORES_PER_SWEEP`, default `2.0`).
+
+*Consumed cores come from a measured idle fraction, not the load average
+(#4031).* The original #3978 term used the 1-minute load average as a stand-in
+for consumed cores. On macOS that overstated consumption by ~1.5× — an observed
+idle-but-loaded host read `load1m ≈ 6–7` alongside 76–86% CPU idle on 28 cores
+(only ~4–7 cores actually consumed). Load average counts threads in the
+runnable **and** uninterruptible-sleep states, and this daemon's workload is
+dominated by `claude` sessions **blocked on network I/O**, which inflate load
+without consuming a core — pointing the feedback loop the wrong way (more
+concurrent sweeps → more blocked `claude` → higher load → *lower* cap, while
+CPU sat idle). The term now derives `consumed_cores = logical_cpus × (1 −
+idle_fraction)` from a measured idle fraction, **per-platform**:
+
+- **Linux** deltas two reads of the aggregate `cpu` line in `/proc/stat`
+  (`idle + iowait` vs total), memoizing the previous cumulative sample and
+  deltaing **across ticks** — nothing sleeps.
+- **macOS** shells to `iostat -c 2 -w 1 -n 0` and reads the **second** data
+  line (a genuine 1-second delta; the first is cumulative since boot). That
+  1-second wait is moved to `spawn_blocking` at the async call sites and
+  **memoized** behind a ~10s TTL (`CPU_UTIL_MEMO_TTL`) shared with the
+  synchronous `ipc.rs` status path, so a runtime worker is never blocked and a
+  status request + a work-finder tick never each pay the full second.
+
+The signal chain is **fail-open**: `measured idle fraction → 1-minute load
+average → static capacity`. An unreadable idle signal (missing `/proc/stat` or
+`iostat`, unsupported platform, or no delta sampled yet) falls back to the load
+average (#3978's behavior); an unreadable load average falls back to the static
+capacity, unadjusted. Like the token axis's "one healthy account is the floor,
+never a halt" policy (#3902), the CPU term is floored at `1` — a read failure or
+a noisy reading must never by itself wedge the whole dynamic cap to zero; disk
+headroom and the token axis remain the only terms allowed to floor to a genuine
+`0`. Tunable via `LOOM_CPU_UTILIZATION_TARGET` (fraction, default `0.75`) and
+`LOOM_EST_CORES_PER_SWEEP` (cores, default `2.0`) — env-only, mirroring
+`LOOM_PER_WORKTREE_GB`'s config surface (no `.loom/config.json` knob).
+
+*Calibrating `LOOM_EST_CORES_PER_SWEEP`.* The host-side half of the term
+(consumed cores) is now measured continuously and needs no tuning. The one
+remaining constant — how many cores one concurrent sweep consumes during its
+build/test step — is a per-repo/host property. Its default (`2.0`) is **not**
+changed here absent a real multi-sweep measurement; a reproducible recipe lives
+at [`docs/measure-est-cores-per-sweep.md`](../../docs/measure-est-cores-per-sweep.md)
+so an operator can calibrate it on a live fleet without re-opening the code.
 
 **Per-token concurrency factor (#3947).** The token axis is `healthy × factor`,
 not `healthy × 1`. The factor is resolved with the standard precedence **env
@@ -1164,8 +1198,24 @@ fills **distinct** accounts first (via the persistent `.rotation_cursor`), only
 stacking multiple sweeps on one account when concurrency demand exceeds the
 healthy-account count. The `loom-daemon status` view spells the arithmetic out,
 e.g. `= min(healthy 1 × per-token 2 = 2, disk headroom 120, cpu headroom 6,
-configured max 3)`, and a separate line reports the live loadavg/core-count
-detail feeding the cpu headroom term (#3978 AC4).
+configured max 3)`, and a separate line reports the live core-count detail
+feeding the cpu headroom term — naming which signal actually fed it, e.g.
+`cpu headroom: 8 concurrent-sweep slot(s) (28 logical cores, 85% idle measured
+(≈4.2 cores consumed))`, or a `1m loadavg …` / `static capacity only` line when
+falling back (#3978 AC4; measured-idle signal #4031).
+
+**"Currently binding" vs "smallest ceiling" (#4031).** The dynamic cap is the
+*minimum* of several ceilings, but a ceiling only *binds* once in-flight
+occupancy reaches it. Below the cap the limiter is simply how much ready work
+exists, not any resource term — so the status view gates its bottleneck
+diagnosis on real occupancy (`in_flight.len() >= dynamic_cap`, surfaced as the
+`capacity_bound` field, `#[serde(default)]`). With in-flight below the cap it
+prints `not capacity-bound (N in flight, cap M — the limiter is work
+availability, not tokens/disk/CPU)` and **suppresses** the `token-bound:`
+diagnosis line; at or above the cap it names the binding term as before. The
+`= min(…)` breakdown line is untouched — those genuinely are ceilings. The JSON
+status carries the same `capacity_bound` boolean so scripted consumers aren't
+misled at low occupancy either.
 
 **Session-limit fault handling (#3947).** Stacking can occasionally trip a
 **concurrent-session-limit** fault on a token (the account is healthy but cannot
