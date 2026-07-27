@@ -1168,13 +1168,33 @@ git config core.hooksPath .githooks
 success "Set core.hooksPath to .githooks"
 echo ""
 
-# Copy hooks to target (settings.json references .loom/hooks/guard-destructive.sh)
+# Copy hooks to target (settings.json references .loom/hooks/guard-destructive.sh,
+# a dispatcher that defers to the canonical Repo Skills guard when present — #4041)
 info "Installing hooks..."
+# Detect the canonical Repo Skills generic guard carrying the rjwalters/repo#29
+# fix. When present, Loom's vendored generic guard (guard-destructive-generic.sh)
+# is NOT installed and any stale copy is removed — the guard-destructive.sh
+# dispatcher defers to the canonical guard at runtime. Same marker probe the
+# dispatcher uses, so install-time and runtime always agree. (#4041)
+CANONICAL_GUARD_PRESENT=false
+if [[ -r ".claude/skills/repo/hooks/guard-destructive.sh" ]] && \
+   grep -q 'repo#29' ".claude/skills/repo/hooks/guard-destructive.sh" 2>/dev/null; then
+  CANONICAL_GUARD_PRESENT=true
+fi
 if [[ -d "$LOOM_ROOT/defaults/hooks" ]]; then
   mkdir -p .loom/hooks
   for hook_file in "$LOOM_ROOT/defaults/hooks/"*.sh; do
     [[ -f "$hook_file" ]] || continue
     hook_name=$(basename "$hook_file")
+    if [[ "$hook_name" == "guard-destructive-generic.sh" ]] && [[ "$CANONICAL_GUARD_PRESENT" == "true" ]]; then
+      if [[ -f ".loom/hooks/$hook_name" ]]; then
+        rm -f ".loom/hooks/$hook_name"
+        info "Canonical Repo Skills guard present — removed stale vendored $hook_name (dispatcher defers to canonical)"
+      else
+        info "Canonical Repo Skills guard present — skipping vendored $hook_name (dispatcher defers to canonical)"
+      fi
+      continue
+    fi
     if [[ -f ".loom/hooks/$hook_name" ]] && [[ "$FORCE_OVERWRITE" != "true" ]] && [[ "$CLEAN_FIRST" != "true" ]]; then
       info "Skipping existing hook: $hook_name (use --force to overwrite)"
     else

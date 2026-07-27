@@ -52,6 +52,18 @@ header() {
   echo -e "${CYAN}$*${NC}"
 }
 
+# Detect whether the canonical Repo Skills generic guard is present in the
+# target repo AND carries the rjwalters/repo#29 curl-pipe fix (issue #4041).
+# Presence/version probe only — the marker comment stands in for "has the fix",
+# so no version arithmetic is needed. Anything older (or absent) is treated as
+# absent, matching the identical runtime check in the guard-destructive.sh
+# dispatcher so install-time and runtime always agree on which guard wins.
+canonical_guard_present() {
+  local target="$1"
+  local canonical="$target/.claude/skills/repo/hooks/guard-destructive.sh"
+  [[ -r "$canonical" ]] && grep -q 'repo#29' "$canonical" 2>/dev/null
+}
+
 # Install hooks and CLI wrapper that loom-daemon init doesn't handle.
 #
 # Issue #3625: an existing hook may be a downstream-tuned or forked copy — most
@@ -61,10 +73,23 @@ header() {
 # requested (the caller passes "true", e.g. behind --clean). This mirrors the
 # preserve-unless-force behavior already in scripts/install-loom.sh:1099-1116,
 # which the quick path previously diverged from with an unconditional cp.
+#
+# Issue #4041: guard-destructive-generic.sh is the vendored copy of Repo Skills'
+# canonical generic guard. When the canonical guard is present (with the
+# rjwalters/repo#29 fix), Loom does NOT install its own generic copy — the
+# guard-destructive.sh dispatcher defers to the canonical guard at runtime. Any
+# stale vendored copy from a prior install is removed so the repo converges to
+# "canonical only". When the canonical guard is absent (standalone-Loom repo),
+# the vendored copy IS installed so destructive-command coverage is never lost.
 install_hooks_and_cli() {
   local loom_root="$1"
   local target="$2"
   local force="${3:-false}"
+
+  local canonical_present=false
+  if canonical_guard_present "$target"; then
+    canonical_present=true
+  fi
 
   # Install hooks
   if [[ -d "$loom_root/defaults/hooks" ]]; then
@@ -72,6 +97,16 @@ install_hooks_and_cli() {
     for hook_file in "$loom_root/defaults/hooks/"*.sh; do
       [[ -f "$hook_file" ]] || continue
       hook_name=$(basename "$hook_file")
+      # The vendored generic guard is conditional on the canonical guard (#4041).
+      if [[ "$hook_name" == "guard-destructive-generic.sh" ]] && [[ "$canonical_present" == "true" ]]; then
+        if [[ -f "$target/.loom/hooks/$hook_name" ]]; then
+          rm -f "$target/.loom/hooks/$hook_name"
+          info "Canonical Repo Skills guard present — removed stale vendored $hook_name (dispatcher defers to canonical)"
+        else
+          info "Canonical Repo Skills guard present — skipping vendored $hook_name (dispatcher defers to canonical)"
+        fi
+        continue
+      fi
       if [[ -f "$target/.loom/hooks/$hook_name" ]] && [[ "$force" != "true" ]]; then
         warning "Preserving existing hook: $hook_name (use --clean to overwrite)"
       else
