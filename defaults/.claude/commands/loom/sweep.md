@@ -1755,7 +1755,7 @@ The full `/loom:sweep` design in #3298 includes many features that are intention
 | Intra-wave collision guard (overlapping PRs off a shared base) | **Implemented (#3647)** | Step 7 runs a read-only file-path overlap probe before each in-wave merge; overlapping PRs are updated onto the just-merged `main` and re-Judged (or Doctor→re-Judge on `DIRTY`) before merging, disjoint PRs keep the fast path. Step 8 adds a post-wave `buildGate.command`-against-`main` integration gate — the load-bearing backstop for cross-file semantic coupling (source-vs-test) that path-overlap cannot see; halts the sweep on a red `main`. Symbol/AST-level overlap detection is out of scope. |
 | Spinoff-issue filing for out-of-scope discoveries | Deferred | Build it once we have richer summary output to surface them cleanly. |
 | Daemon `pipeline_state` situational awareness reads | Deferred | Skill only warns when the daemon is running. |
-| Top-level vs namespaced naming (`/loom:sweep` vs `/loom:sweep`) | **Resolved** | Ships as the namespaced `/loom:sweep` (and `/loom:loom` for the daemon operator), matching CLAUDE.md and `help.md`. Originally #3298 open question #1. |
+| Top-level vs namespaced naming (`/sweep` vs `/loom:sweep`) | **Resolved** | Ships as the namespaced `/loom:sweep` (and `/loom:loom` for the daemon operator), matching CLAUDE.md and `help.md`. Originally #3298 open question #1. |
 
 For the full design discussion (including the open questions raised by the curator), see issue #3298.
 
