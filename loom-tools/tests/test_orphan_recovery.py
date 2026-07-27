@@ -33,6 +33,7 @@ from loom_tools.orphan_recovery import (
     OrphanRecoveryResult,
     _locked_issue_numbers,
     check_untracked_building,
+    format_result_human,
     gather_liveness_evidence,
     run_orphan_recovery,
 )
@@ -613,3 +614,96 @@ def test_journal_repo_matches_exact_and_resolved(tmp_path: pathlib.Path) -> None
     assert orphan_recovery._journal_repo_matches(str(repo), repo) is True
     assert orphan_recovery._journal_repo_matches(str(repo) + "/", repo) is True
     assert orphan_recovery._journal_repo_matches("/some/other/repo", repo) is False
+
+
+# ---------------------------------------------------------------------------
+# Watched entries — issue #3975: a staleness-gated skip must never be silent.
+# ---------------------------------------------------------------------------
+
+
+def test_no_record_stale_gate_skip_is_watched_not_silent(
+    tmp_path: pathlib.Path, _isolated_journal_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Companion to ``test_journal_no_record_within_stale_hours_is_not_recovered``:
+    the exact scenario that used to be invisible without --verbose must now
+    show up in ``result.watched`` (issue #3975)."""
+    repo = _make_repo(tmp_path)
+    _write_journal(_isolated_journal_path, [{"repo": str(repo), "issue": 999, "pid": 1}])
+    monkeypatch.setenv("LOOM_STALE_BUILDING_HOURS", "4")
+    gh = _GhRecorder(allow_edit=False)
+
+    with mock.patch.object(
+        orphan_recovery, "_pid_alive", return_value=True,
+    ), mock.patch.object(
+        orphan_recovery, "gh_issue_list",
+        return_value=[{"number": 42, "title": "no journal entry, not stale enough yet"}],
+    ), mock.patch.object(
+        orphan_recovery, "_get_building_label_age", return_value=3600,  # 1h: > 600s grace, < 4h
+    ), mock.patch.object(
+        orphan_recovery, "has_valid_claim", return_value=False,
+    ), mock.patch.object(orphan_recovery, "gh_run", gh):
+        # verbose=False -- the default, non-verbose invocation that used to
+        # leave this skip completely invisible.
+        result = run_orphan_recovery(repo, recover=True, verbose=False)
+
+    assert result.total_orphaned == 0
+    assert gh.edited_issues == []
+    assert result.total_watched == 1
+    watched = result.watched[0]
+    assert watched.issue == 42
+    assert watched.reason == "no_journal_record_stale"
+    assert watched.age_seconds == 3600
+    assert watched.threshold_seconds == pytest.approx(4 * 3600)
+
+
+def test_label_grace_gate_skip_is_watched_not_silent(tmp_path: pathlib.Path) -> None:
+    """A fresh loom:building label (within the short grace period) with no
+    journal at all -- must also be watched, not silently dropped."""
+    repo = _make_repo(tmp_path)
+    _make_lock(repo, 999)  # unrelated active source
+
+    with mock.patch.object(
+        orphan_recovery, "gh_issue_list",
+        return_value=[{"number": 42, "title": "freshly labeled"}],
+    ), mock.patch.object(
+        orphan_recovery, "_get_building_label_age", return_value=30,  # well under 600s grace
+    ), mock.patch.object(
+        orphan_recovery, "has_valid_claim", return_value=False,
+    ):
+        result = run_orphan_recovery(repo, recover=False, verbose=False)
+
+    assert result.total_orphaned == 0
+    assert result.total_watched == 1
+    watched = result.watched[0]
+    assert watched.issue == 42
+    assert watched.reason == "no_spawn_loop_entry"
+    assert watched.age_seconds == 30
+    assert watched.threshold_seconds == orphan_recovery.DEFAULT_LABEL_GRACE_PERIOD
+
+
+def test_watched_entries_serialize_in_to_dict(tmp_path: pathlib.Path) -> None:
+    result = OrphanRecoveryResult()
+    result.watched.append(
+        orphan_recovery.WatchedEntry(
+            issue=7, title="t", reason="no_spawn_loop_entry",
+            age_seconds=10, threshold_seconds=600.0,
+        )
+    )
+    d = result.to_dict()
+    assert d["total_watched"] == 1
+    assert d["watched"][0]["issue"] == 7
+    assert d["watched"][0]["reason"] == "no_spawn_loop_entry"
+
+
+def test_format_result_human_lists_watched_entries_even_with_zero_orphans() -> None:
+    result = OrphanRecoveryResult()
+    result.watched.append(
+        orphan_recovery.WatchedEntry(
+            issue=42, title="freshly labeled", reason="no_spawn_loop_entry",
+            age_seconds=30, threshold_seconds=600.0,
+        )
+    )
+    text = format_result_human(result)
+    assert "No orphaned tasks found" in text
+    assert "#42" in text
+    assert "no_spawn_loop_entry" in text

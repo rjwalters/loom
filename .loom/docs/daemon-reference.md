@@ -660,6 +660,88 @@ The reaper (`sweep_registry::spawn_reaper_task`) ticks every 30 seconds
 4. Garbage-collects terminal entries older than the retention window
    (default 1 hour).
 
+## Stale-claim reconciliation & the sweep journal (#3953, fixed #3975)
+
+Two independent surfaces reclaim abandoned `loom:building` claims when the
+sweep that owned them has died, using the same evidence source and the same
+decision rule:
+
+| Surface | Where | When it runs |
+|---------|-------|---------------|
+| Rust startup reconciliation | `claim_reconciliation::forge::reconcile_workspace` (called from `main.rs` at daemon startup, guarded by `LOOM_STALE_CLAIM_RECONCILE`, default on) | Once, on every daemon start, across every `effective_roots()` workspace |
+| Python `loom-recover-orphans` | `loom_tools.orphan_recovery.check_untracked_building` | On demand (operator/cron invocation of `loom-recover-orphans [--recover]`) |
+
+Both read the same machine-level **sweep journal** (`~/.loom/sweeps.json`,
+override `LOOM_SWEEPS_JOURNAL_PATH`, written by `sweep_journal::record_sweep`
+on every `SweepRegistry::dispatch`) and apply the same three-way decision
+rule per `loom:building` issue:
+
+1. **Journal entry with a live recorded PID** → keep (genuinely in-flight).
+2. **Journal entry with a dead recorded PID** → reclaim. This is the
+   strongest possible evidence — a specific PID that provably no longer
+   exists — so both surfaces treat it as authoritative.
+3. **No journal entry at all** → reclaim only once the claim has been stale
+   longer than `LOOM_STALE_BUILDING_HOURS` (default 4h; also drives the
+   Rust-side default `DEFAULT_STALE_BUILDING_HOURS`). Absence of a record
+   might mean a live manual `/loom:sweep` the journal was never told about
+   (a pre-journal claim, or the journal file just doesn't exist on this
+   machine), so a much wider grace window applies than for a claim the
+   journal has proof about.
+
+### The #3975 bug: pruning before deciding
+
+The journal is deliberately self-pruning — `sweep_journal::upsert` (every new
+dispatch) and the Rust reconciliation pass both call `prune_dead` to drop
+dead-PID entries so the file never accumulates an unbounded graveyard
+(mirrors `sweep-run-registry.sh`'s `prune_dead`/`peers`, #3768).
+
+Before #3975, `reconcile_workspace` called `prune_dead` **before** calling
+`plan()`/`decide()` — which deleted the exact dead-PID entry the `DeadPid`
+branch above needs to fire its immediate, unconditional reclaim. With the
+entry gone, every claim silently fell through to branch 3 (no record) and
+its much longer `stale_hours` grace window, even for a sweep that had *just*
+died. Two claims in a downstream workspace (issues #6170/#6173: SIGTERMed
+during a daemon restart) sat un-reclaimed for hours because of this —
+`loom-recover-orphans --recover` found and fixed only a third, unrelated
+claim (#6172) whose label happened to already be older than the stale-hours
+threshold. The fix: `reconcile_workspace` now decides against the raw,
+unpruned journal first; pruning happens only afterward, via the normal
+per-reclaimed-issue `remove_sweep` cleanup (leftover dead entries for
+untouched issues are still pruned lazily by the next `upsert` elsewhere).
+
+The Python side (`gather_liveness_evidence` / `check_untracked_building`)
+never pruned the journal itself — it only reads whatever the file currently
+contains — so it was not directly bugged the same way, but it inherited the
+same *symptom*: by the time an operator ran `loom-recover-orphans` by hand,
+a routine daemon dispatch (or the (now-fixed) Rust startup pass) had often
+already pruned the dead-PID evidence out from under it, leaving only the
+weaker "no record" signal to work with.
+
+### Never-silent staleness-gate skips (#3975)
+
+Separately, `check_untracked_building`'s staleness gate (branch 3 above, and
+the short `label_grace_period` gate that also applies to branch 2) used to
+log its "SKIPPED: #N ..." line **only** under `--verbose`, so a default
+(non-verbose) `loom-recover-orphans` run gave no visible trace that a claim
+had been seen and excluded — indistinguishable from the tool never having
+looked at that issue at all. `OrphanRecoveryResult.watched` now records
+every staleness-gated skip (issue, reason, label age, threshold) regardless
+of `--verbose`, and both `format_result_human` and `--json` output always
+include it. A watched entry is explicitly **not** an orphan — it may still
+be alive — but it is never silently dropped.
+
+### One intentional asymmetry: dead-PID grace period
+
+Rust's `decide()` reclaims a `DeadPid` claim **unconditionally** — no
+staleness check at all (see `decide_dead_pid_overrides_label_age`). Python's
+`check_untracked_building` still applies the short `label_grace_period`
+(default 600s) even to a `journal_pid_dead` reason. This is intentional, not
+a bug to unify: the Rust pass runs once per daemon *start*, a rarer and more
+deliberate event, while the Python tool can be invoked ad hoc (including
+immediately after a claim is made, before its journal entry has even been
+written) — the short grace period is defense-in-depth against a race the
+once-per-restart Rust pass is much less exposed to.
+
 ## Stacked-PR dependency — #3729 (v1), #3747 (v2 item 1)
 
 Stacked-PR mode pipelines a genuine dependency: when issue B consumes issue

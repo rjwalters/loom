@@ -144,7 +144,13 @@ pub fn decide(
 }
 
 /// Plan reconciliation decisions for every `issue` in `issues`, given an
-/// already-loaded (and ideally already-pruned) `journal`. Performs no I/O.
+/// already-loaded `journal`. Performs no I/O.
+///
+/// IMPORTANT (#3975): `journal` must be the **raw, unpruned** journal.
+/// Pruning dead-PID entries before calling this function would erase the
+/// exact evidence the `DeadPid` branch of [`decide`] needs to fire its
+/// unconditional, immediate reclaim -- see [`forge::reconcile_workspace`]
+/// for the caller that got this wrong before #3975.
 #[must_use]
 pub fn plan(
     repo: &str,
@@ -284,13 +290,21 @@ pub mod forge {
                 return (0, 0);
             }
         };
-        let mut journal = sweep_journal::load(&journal_path);
-        let pruned = sweep_journal::prune_dead(&mut journal, crate::sweep_registry::is_pid_alive);
-        if pruned > 0 {
-            if let Err(e) = sweep_journal::save(&journal_path, &journal) {
-                log::warn!("claim_reconciliation: failed to persist pruned journal: {e}");
-            }
-        }
+        // IMPORTANT (#3975): decide FIRST against the raw, unpruned journal.
+        // A prior version pruned dead-PID entries here before calling
+        // `plan()`/`decide()` -- which erased the exact evidence the
+        // `DeadPid` branch needs to fire its *unconditional*, immediate
+        // reclaim. With the entry gone, every claim silently fell through
+        // to the `NoRecordStale` branch and its much longer
+        // `stale_hours` grace period, so a claim whose sweep had *just*
+        // died (recent label, dead PID) was wrongly kept for hours instead
+        // of reclaimed right away. Pruning now happens only *after*
+        // deciding, via the per-reclaimed-issue `remove_sweep` below --
+        // dead entries for issues this pass didn't touch are cleaned up
+        // lazily by the next `record_sweep`/`upsert` elsewhere (which
+        // still prunes the whole journal), so the file never accumulates
+        // an unbounded graveyard.
+        let journal = sweep_journal::load(&journal_path);
 
         let stale_hours = resolve_stale_hours();
         let now = chrono::Utc::now();
@@ -335,6 +349,9 @@ mod tests {
     use super::*;
     use chrono::Duration;
     use serial_test::serial;
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
+    use tempfile::tempdir;
 
     fn issue(number: u32, updated_at: Option<DateTime<Utc>>) -> BuildingIssue {
         BuildingIssue { number, updated_at }
@@ -492,5 +509,80 @@ mod tests {
         assert!((resolve_stale_hours() - DEFAULT_STALE_BUILDING_HOURS).abs() < f64::EPSILON);
 
         std::env::remove_var(STALE_HOURS_ENV);
+    }
+
+    /// Regression test for #3975: `reconcile_workspace` used to prune dead
+    /// journal entries *before* deciding, which erased the exact evidence the
+    /// `DeadPid` branch needs. A claim with a provably-dead recorded PID must
+    /// be reclaimed immediately by the daemon's own startup pass, even when
+    /// the `loom:building` label is only seconds old (well inside the
+    /// `NoRecordStale` grace window) -- two incidents (#6170/#6173 in a
+    /// downstream workspace) were exactly this: SIGTERMed sweeps left a dead
+    /// PID in the journal, and the pre-decide prune silently downgraded them
+    /// to "no record", so they sat un-reclaimed for hours.
+    #[test]
+    #[serial]
+    fn reconcile_workspace_reclaims_dead_pid_entry_even_when_label_is_fresh() {
+        let dir = tempdir().unwrap();
+        let repo_root = dir.path().join("repo");
+        std::fs::create_dir_all(&repo_root).unwrap();
+        let repo_str = repo_root.display().to_string();
+
+        let journal_path = dir.path().join("sweeps.json");
+        std::env::set_var(sweep_journal::JOURNAL_PATH_ENV, &journal_path);
+
+        // Seed a dead-PID entry (pid 0 is always dead per `is_pid_alive`).
+        let mut journal = SweepJournal::default();
+        journal.entries.push(journal_entry(&repo_str, 99, 0));
+        sweep_journal::save(&journal_path, &journal).unwrap();
+
+        // Fake `gh`: `issue list` reports one loom:building issue labeled
+        // *just now* -- fresh enough that the NoRecordStale (age-based) path
+        // would say Keep. Only the DeadPid evidence should trigger a reclaim.
+        let gh_log = dir.path().join("gh-invocations.log");
+        let fake_gh = dir.path().join("fake-gh.sh");
+        let now = Utc::now().to_rfc3339();
+        let script = format!(
+            r#"#!/usr/bin/env bash
+printf '%s\n' "$*" >> "{log}"
+if [ "$1" = "issue" ] && [ "$2" = "list" ]; then
+  echo '[{{"number":99,"updatedAt":"{now}"}}]'
+  exit 0
+fi
+exit 0
+"#,
+            log = gh_log.display(),
+            now = now,
+        );
+        std::fs::write(&fake_gh, &script).unwrap();
+        #[cfg(unix)]
+        {
+            let mut perms = std::fs::metadata(&fake_gh).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&fake_gh, perms).unwrap();
+        }
+
+        let (checked, reclaimed) = forge::reconcile_workspace(&fake_gh, &repo_root);
+
+        assert_eq!(checked, 1);
+        assert_eq!(
+            reclaimed, 1,
+            "a dead-PID journal entry must be reclaimed immediately regardless of \
+             how fresh the loom:building label is (#3975)"
+        );
+
+        let gh_calls = std::fs::read_to_string(&gh_log).unwrap_or_default();
+        assert!(
+            gh_calls.contains("issue edit 99 --remove-label loom:building --add-label loom:issue"),
+            "expected reclaim to flip labels for #99; got: {gh_calls:?}"
+        );
+
+        // The reclaimed issue's journal entry is cleaned up as part of
+        // recovery -- confirms cleanup still happens, just after (not
+        // before) the decision that needed the evidence.
+        let after = sweep_journal::load(&journal_path);
+        assert!(sweep_journal::find(&after, &repo_str, 99).is_none());
+
+        std::env::remove_var(sweep_journal::JOURNAL_PATH_ENV);
     }
 }
