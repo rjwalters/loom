@@ -1181,31 +1181,29 @@ only candidates are quarantined never reserves a shared dispatch slot — health
 sibling work in other repos gets it instead. Defaults **on**; disable with
 `LOOM_WORK_FINDER_QUARANTINE=0` or `autonomous.workFinder.quarantine.enabled = false`.
 
-### Prerequisite: a fresh token ranking (#3894)
+### Prerequisite: a fresh token ranking (#3894, self-refreshed by the daemon since #3969)
 
 **When you run autonomous mode against a multi-account token pool, keep
-`.loom/tokens/.ranking` fresh — a periodic `probe-tokens.sh --ranking` is a
-required part of the setup, not an optional nicety.** The spawn-time selector
-(`loom_tools.tokens.select`) is 3-tier — ranking → allowlist → random — and the
-ranking file is only considered fresh for **10 minutes**. When it is absent or
-stale, tier-1 declines and selection falls to the lower tiers. The work finder
-dispatches in bursts, so a stale ranking means the daemon can steadily hand out
-accounts a recent probe already flagged `exhausted`/`blocked`, whose sweeps then
-wedge at startup (spawn header logged, no worktree, ~0% CPU) — the exact failure
-the startup watchdog (#3887) then has to self-heal, one hang at a time.
+`.loom/tokens/.ranking` fresh.** The spawn-time selector (`loom_tools.tokens.select`)
+is 3-tier — ranking → allowlist → random — and the ranking file is only
+considered fresh for **10 minutes**. When it is absent or stale, tier-1 declines
+and selection falls to the lower tiers. The work finder dispatches in bursts, so
+a stale ranking means the daemon can steadily hand out accounts a recent probe
+already flagged `exhausted`/`blocked`, whose sweeps then wedge at startup (spawn
+header logged, no worktree, ~0% CPU) — the exact failure the startup watchdog
+(#3887) then has to self-heal, one hang at a time.
 
-Two things now keep this from wedging a burst of issues:
+As of #3969 the running `loom-daemon` **keeps this fresh itself** — see
+[Token-ranking self-refresh](#token-ranking-self-refresh-3969) below. A
+standalone operator cron (the historical requirement) is now an **optional
+fallback** for setups that don't run the daemon at all (a bare `/loom:sweep`
+subagent-dispatch install with no `loom-daemon` process); see that section for
+the cron example. Two things keep a burst of issues from wedging on a stale
+ranking regardless of which refresher is running:
 
-- **Wire the probe on a `<10`-min cadence.** Add a cron entry so the ranking is
-  always fresh under the daemon's dispatch rate:
-
-  ```cron
-  */5 * * * * cd /path/to/repo && ./.loom/scripts/probe-tokens.sh --ranking >> .loom/logs/probe-tokens.log 2>&1
-  ```
-
-  (Use `*/5`, comfortably inside the 10-minute freshness window, rather than the
-  `*/10` boundary case from the single-key example.) One-shot before a run:
-  `loom-tokens check --ranking`.
+- **A refresher running on a `<10`-min cadence** — the daemon's built-in loop
+  (default 10 minutes, comfortably inside the freshness window) or an operator
+  cron. One-shot before a run: `loom-tokens check --ranking`.
 
 - **Stale-ranking fail-safe (selector-side, #3894).** Even without a fresh
   probe, a stale-but-present `.ranking` is no longer discarded. The selector
@@ -1214,8 +1212,62 @@ Two things now keep this from wedging a burst of issues:
   selection into known-exhausted accounts. If those exclusions would empty the
   pool (a stale "everything exhausted" ranking), selection retries ignoring them
   so a live pool never hard-fails on stale advice. This is a safety net, **not**
-  a replacement for the probe cron — a stale ranking still can't see an account
-  that recovered, so keep it fresh.
+  a replacement for keeping the ranking fresh — a stale ranking still can't see
+  an account that recovered.
+
+### Token-ranking self-refresh (#3969)
+
+The daemon runs its own periodic refresher for `.loom/tokens/.ranking` instead
+of depending on an operator-managed cron for `probe-tokens.sh --ranking` — the
+manual step documented above through #3894 is now automatic whenever
+`loom-daemon` is running. It is the natural home for this loop: the daemon
+already owns dispatch cadence and consumes the ranking (via `spawn-claude.sh`
+selection) on every sweep it spawns.
+
+**What it does.** On a configurable cadence (default 10 minutes) the loop
+shells out to each registered repo's `probe-tokens.sh --ranking` (the same
+script an operator cron would have called), which probes every bootstrapped
+account for its current rate-limit headers and atomically rewrites `.ranking`
+in whichever pool `loom_tools.tokens` resolves for that repo — the per-repo
+`.loom/tokens/`, or the shared machine-level pool (#3938) when the per-repo pool
+is absent/empty. Pool-location resolution is left entirely to the existing
+Python selector; the daemon-side loop never reimplements it.
+
+**Default-on, unlike the work finder / main-health gate.** Those two loops are
+opt-in because they have dispatch-affecting side effects (spawning sweeps,
+halting dispatch). This loop only ever reads rate-limit headers and rewrites a
+bookkeeping file nothing else consults synchronously, so it ships on by
+default — an absent refresher would silently regress every install back to the
+stale-ranking failure mode #3894/#3969 exist to fix. It still has a full opt-out
+knob for a repo that wants it off (e.g. no tokens bootstrapped at all):
+
+```json
+{
+  "autonomous": {
+    "tokenRankingRefresh": { "enabled": true, "intervalSecs": 600 }
+  }
+}
+```
+
+| Env var | Config key | Precedence | Default |
+|---------|-----------|------------|---------|
+| `LOOM_TOKEN_RANKING_REFRESH` | `autonomous.tokenRankingRefresh.enabled` | env > config > default | `true` (on) |
+| `LOOM_TOKEN_RANKING_REFRESH_INTERVAL_SECS` | `autonomous.tokenRankingRefresh.intervalSecs` | env > config > default | `600` (10 min) |
+
+**Never fatal, never double-writes unsafely.** A probe failure (network hiccup,
+`gh`/`python3` missing, every account exhausted, no tokens bootstrapped at all)
+is logged and skipped — it never panics the loop or the daemon. Because
+`loom-tokens check --ranking` writes `.ranking` atomically (temp file +
+rename), an operator's cron running the identical script concurrently is
+harmless: the two refreshers can race to *schedule* a write but never to a
+*torn* file, so keeping an existing cron alongside the daemon costs nothing but
+a redundant API call.
+
+**Multi-workspace.** Like the work finder / main-health gate, the loop re-reads
+the workspace registry each tick and refreshes every registered repo's own
+pool, gated by that repo's own config (an empty registry reduces to the single
+daemon workspace). See `loom-daemon/src/token_ranking_refresh.rs` for the
+implementation.
 
 ### Safe start / stop (raw daemon process)
 

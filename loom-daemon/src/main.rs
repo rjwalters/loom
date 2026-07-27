@@ -9,6 +9,7 @@ use loom_daemon::metrics_collector;
 use loom_daemon::role_validation;
 use loom_daemon::sweep_registry::{self, SweepRegistry, SweepRegistryConfig};
 use loom_daemon::terminal::TerminalManager;
+use loom_daemon::token_ranking_refresh;
 use loom_daemon::types::{DaemonStatusReport, Request, Response, SweepKind};
 use loom_daemon::work_finder;
 use loom_daemon::workspace_pool::WorkspacePool;
@@ -656,6 +657,43 @@ async fn main() -> Result<()> {
         log::debug!("main_health_gate: disabled (set LOOM_MAIN_HEALTH_GATE=1 or autonomous.mainHealthGate.enabled=true + a buildGate config to enable)");
         None
     };
+
+    // Autonomous token-ranking refresh loop (Issue #3969): the daemon itself
+    // periodically re-probes each registered repo's token pool and rewrites
+    // `.loom/tokens/.ranking` (atomically — same script an operator's cron used
+    // to run by hand: `probe-tokens.sh --ranking` / `loom-tokens check
+    // --ranking`), so token selection's ranking tier stays fresh without a
+    // standing manual/cron step. Unlike the work-finder and main-health-gate
+    // loops above, this is **default-ON** — it only ever reads rate-limit
+    // headers and rewrites a bookkeeping file with no dispatch side effect, so
+    // an absent daemon-side refresher would silently regress every install back
+    // to the stale-ranking failure mode this issue exists to fix. Config
+    // surface: `autonomous.tokenRankingRefresh.{enabled,intervalSecs}`,
+    // precedence env > config > default (env:
+    // `LOOM_TOKEN_RANKING_REFRESH` / `LOOM_TOKEN_RANKING_REFRESH_INTERVAL_SECS`).
+    // An operator cron running the identical script concurrently is harmless —
+    // the underlying `loom-tokens check --ranking` write is atomic, so the two
+    // refreshers can race to schedule a write but never to a torn file.
+    let token_ranking_refresh_config =
+        token_ranking_refresh::read_token_ranking_refresh_config(&sweep_workspace);
+    let _token_ranking_refresh_handle =
+        if token_ranking_refresh::resolve_enabled(&token_ranking_refresh_config) {
+            let interval = token_ranking_refresh::resolve_interval(&token_ranking_refresh_config);
+            log::info!(
+                "token_ranking_refresh: enabled (multi-workspace, interval={}s)",
+                interval.as_secs()
+            );
+            Some(token_ranking_refresh::spawn_multi_token_ranking_refresh_task(
+                sweep_workspace.clone(),
+                interval,
+            ))
+        } else {
+            log::debug!(
+                "token_ranking_refresh: disabled (set LOOM_TOKEN_RANKING_REFRESH=0 or \
+             autonomous.tokenRankingRefresh.enabled=false to opt out)"
+            );
+            None
+        };
 
     // Start IPC server. `workspace_health_states` is threaded in so the
     // `DaemonStatus` request can report each registered repo's own halt state
