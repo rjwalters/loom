@@ -306,6 +306,65 @@ def test_ranking_falls_through_when_all_exhausted(tmp_path):
     assert sel.mode == "random"
 
 
+# ---------- rate_limited defense-in-depth (issue #3988) ----------
+
+
+def test_ranking_prefers_available_over_rate_limited(tmp_path):
+    """A rate_limited account is skipped while a healthy account exists.
+
+    Regression for issue #3988: rate_limited was previously fully eligible
+    alongside available, so a 429-classified (often genuinely-exhausted-but-
+    misclassified) account competed equally in rotation.
+    """
+    workspace = _make_workspace(tmp_path, {"tired": "kt", "fresh": "kf"})
+    _write_ranking(workspace, ["tired|rate_limited", "fresh|"])
+    for seed in range(30):
+        sel = select_token(workspace, rng=random.Random(seed))
+        assert sel.name == "fresh"
+        assert sel.mode == "ranked"
+
+
+def test_ranking_falls_back_to_rate_limited_when_pool_otherwise_empty(tmp_path):
+    """When every ranked account is rate_limited, still dispatch rather than stall."""
+    workspace = _make_workspace(tmp_path, {"a": "ka", "b": "kb"})
+    _write_ranking(workspace, ["a|rate_limited", "b|rate_limited"])
+    sel = select_token(workspace, rng=random.Random(0))
+    assert sel.name in ("a", "b")
+    assert sel.mode == "ranked"
+
+
+def test_ranking_rate_limited_and_exhausted_mixed_prefers_available(tmp_path):
+    workspace = _make_workspace(
+        tmp_path, {"exhausted-acct": "ke", "rl-acct": "kr", "ok-acct": "ko"},
+    )
+    _write_ranking(
+        workspace,
+        ["exhausted-acct|exhausted", "rl-acct|rate_limited", "ok-acct|"],
+    )
+    for seed in range(20):
+        sel = select_token(workspace, rng=random.Random(seed))
+        assert sel.name == "ok-acct"
+
+
+def test_stale_ranking_excludes_rate_limited_from_random(tmp_path):
+    """Stale-ranking exclusions also treat rate_limited as advisory-excluded."""
+    workspace = _make_workspace(tmp_path, {"tired": "kt", "fresh": "kf"})
+    _write_stale_ranking(workspace, ["tired|rate_limited", "fresh|"], 11 * 60)
+    for seed in range(20):
+        sel = select_token(workspace, rng=random.Random(seed))
+        assert sel.name == "fresh"
+        assert sel.mode == "random"
+
+
+def test_stale_ranking_all_rate_limited_falls_back_rather_than_hard_fail(tmp_path):
+    """A stale ranking where everything is rate_limited must not stall dispatch."""
+    workspace = _make_workspace(tmp_path, {"a": "ka", "b": "kb"})
+    _write_stale_ranking(workspace, ["a|rate_limited", "b|rate_limited"], 30 * 60)
+    sel = select_token(workspace, rng=random.Random(0))
+    assert sel.name in ("a", "b")
+    assert sel.mode == "random"
+
+
 # ---------- ranking spread (issue #3736 / rotation #3909) ----------
 
 

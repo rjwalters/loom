@@ -205,6 +205,40 @@ class TestProbeStatuses:
         # Rate-limit headers still captured even on 429.
         assert r.s7d_utilization == pytest.approx(0.20)
 
+    def test_429_promoted_to_exhausted_when_7d_high(self):
+        """Regression for issue #3988.
+
+        A weekly-exhausted account frequently answers the probe with 429
+        rather than 200 — previously the EXHAUSTED_THRESHOLD test was only
+        applied on the 2xx path, so this response was mislabelled
+        "rate_limited" (and stayed eligible for selection) even though its
+        own headers showed 7d_utilization >= 0.95.
+        """
+        with patch(
+            "requests.post",
+            return_value=_mock_response(429, _good_headers(s7d=0.97)),
+        ):
+            r = probe_account("agent-1", "sk-ant-oat01-x")
+        assert r.status == "exhausted"
+        assert r.s7d_utilization == pytest.approx(0.97)
+
+    def test_429_at_threshold_promoted_to_exhausted(self):
+        with patch(
+            "requests.post",
+            return_value=_mock_response(
+                429, _good_headers(s7d=EXHAUSTED_THRESHOLD)
+            ),
+        ):
+            r = probe_account("agent-1", "sk-ant-oat01-x")
+        assert r.status == "exhausted"
+
+    def test_429_without_utilization_headers_stays_rate_limited(self):
+        """A 429 with no rate-limit headers at all has nothing to promote on."""
+        with patch("requests.post", return_value=_mock_response(429)):
+            r = probe_account("agent-1", "sk-ant-oat01-x")
+        assert r.status == "rate_limited"
+        assert r.s7d_utilization is None
+
     def test_503_error_not_fatal(self):
         with patch("requests.post", return_value=_mock_response(503)):
             r = probe_account("agent-1", "sk-ant-oat01-x")
