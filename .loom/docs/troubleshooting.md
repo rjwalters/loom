@@ -419,7 +419,12 @@ This is a **detect → fix** pair:
   `.loom/hooks/*` and `.loom/scripts/*` from `defaults/`. Idempotent (a no-op when
   in sync), reports per-file `updated`/`created`/`unchanged`/`skipped`, and only
   ever touches files that exist in `defaults/` (repo-specific hooks with no
-  `defaults/` counterpart are left alone).
+  `defaults/` counterpart are left alone). One exception (#4041): the vendored
+  generic guard `hooks/guard-destructive-generic.sh` is **not** resynced (and any
+  stale copy is removed) in a repo where the canonical Repo Skills guard
+  (`.claude/skills/repo/hooks/guard-destructive.sh`, carrying the rjwalters/repo#29
+  fix) is installed — the `guard-destructive.sh` dispatcher defers to the canonical
+  guard there, so Loom does not resurrect its own generic copy.
 
 The intended flow is **"freshness warning says you're stale → run resync"**:
 

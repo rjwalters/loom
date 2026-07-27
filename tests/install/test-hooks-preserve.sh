@@ -61,12 +61,33 @@ if [[ -z "$_FN_SRC" ]]; then
 fi
 eval "$_FN_SRC"
 
-# Build a fake loom_root whose defaults/hooks ships a canonical guard hook.
+# install_hooks_and_cli() calls canonical_guard_present() (#4041) — extract and
+# define it too so the isolated function has its dependency in scope.
+_HELPER_SRC="$(awk '/^canonical_guard_present\(\) \{/{f=1} f{print} f&&/^}$/{exit}' "$INSTALL_SH")"
+if [[ -z "$_HELPER_SRC" ]]; then
+  echo -e "${RED}FATAL${NC}: could not extract canonical_guard_present() from $INSTALL_SH"
+  exit 1
+fi
+eval "$_HELPER_SRC"
+
+# Build a fake loom_root whose defaults/hooks ships a canonical guard hook (the
+# dispatcher stand-in) plus the vendored generic guard (#4041).
 make_loom_root() {
   local root="$1"
   mkdir -p "$root/defaults/hooks"
   printf '%s\n' '#!/usr/bin/env bash' '# CANONICAL guard-destructive.sh' > \
     "$root/defaults/hooks/guard-destructive.sh"
+  printf '%s\n' '#!/usr/bin/env bash' '# VENDORED-GENERIC guard' > \
+    "$root/defaults/hooks/guard-destructive-generic.sh"
+}
+
+# Install the canonical Repo Skills guard (with the repo#29 marker) into a target
+# so canonical_guard_present() returns true for it.
+install_canonical_repo_skills_guard() {
+  local target="$1"
+  mkdir -p "$target/.claude/skills/repo/hooks"
+  printf '%s\n' '#!/usr/bin/env bash' '# canonical, carries repo#29 fix' > \
+    "$target/.claude/skills/repo/hooks/guard-destructive.sh"
 }
 
 TUNED_MARKER='# TUNED-FORK: downstream rm allowlist'
@@ -129,6 +150,60 @@ assert_eq "installed hook is executable" \
   "yes" \
   "$([[ -x "$TARGET_DIR3/.loom/hooks/guard-destructive.sh" ]] && echo yes || echo no)"
 rm -rf "$TARGET_DIR3"
+
+# ============================================================================
+# Test 4 (#4041): canonical guard present → vendored generic NOT installed,
+# but the dispatcher (guard-destructive.sh) IS installed.
+# ============================================================================
+echo ""
+echo "=== canonical present: vendored generic skipped, dispatcher installed ==="
+
+TARGET_DIR4="$(mktemp -d)"
+install_canonical_repo_skills_guard "$TARGET_DIR4"
+install_hooks_and_cli "$LOOM_ROOT_DIR" "$TARGET_DIR4"
+
+assert_eq "dispatcher (guard-destructive.sh) installed when canonical present" \
+  "yes" \
+  "$([[ -f "$TARGET_DIR4/.loom/hooks/guard-destructive.sh" ]] && echo yes || echo no)"
+assert_eq "vendored generic NOT installed when canonical present" \
+  "no" \
+  "$([[ -f "$TARGET_DIR4/.loom/hooks/guard-destructive-generic.sh" ]] && echo yes || echo no)"
+rm -rf "$TARGET_DIR4"
+
+# ============================================================================
+# Test 5 (#4041): canonical guard present → a STALE vendored generic from a
+# prior install is removed (converge to "canonical only").
+# ============================================================================
+echo ""
+echo "=== canonical present: stale vendored generic removed ==="
+
+TARGET_DIR5="$(mktemp -d)"
+install_canonical_repo_skills_guard "$TARGET_DIR5"
+mkdir -p "$TARGET_DIR5/.loom/hooks"
+printf '%s\n' '#!/usr/bin/env bash' '# STALE vendored generic' > \
+  "$TARGET_DIR5/.loom/hooks/guard-destructive-generic.sh"
+
+install_hooks_and_cli "$LOOM_ROOT_DIR" "$TARGET_DIR5"
+
+assert_eq "stale vendored generic removed when canonical present" \
+  "no" \
+  "$([[ -f "$TARGET_DIR5/.loom/hooks/guard-destructive-generic.sh" ]] && echo yes || echo no)"
+rm -rf "$TARGET_DIR5"
+
+# ============================================================================
+# Test 6 (#4041): canonical guard ABSENT → vendored generic IS installed
+# (standalone-Loom repo keeps generic coverage).
+# ============================================================================
+echo ""
+echo "=== canonical absent: vendored generic installed ==="
+
+TARGET_DIR6="$(mktemp -d)"
+install_hooks_and_cli "$LOOM_ROOT_DIR" "$TARGET_DIR6"
+
+assert_eq "vendored generic installed when canonical absent" \
+  "yes" \
+  "$([[ -f "$TARGET_DIR6/.loom/hooks/guard-destructive-generic.sh" ]] && echo yes || echo no)"
+rm -rf "$TARGET_DIR6"
 
 # ============================================================================
 # Summary

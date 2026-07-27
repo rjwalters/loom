@@ -218,6 +218,20 @@ sync_one() {
     fi
 }
 
+# ---------- canonical Repo Skills guard detection (#4041) ----------
+#
+# When the canonical generic guard (with the rjwalters/repo#29 fix) is installed
+# in this repo, Loom's vendored generic guard (guard-destructive-generic.sh) is
+# intentionally NOT installed — the guard-destructive.sh dispatcher defers to the
+# canonical guard at runtime. Resync must therefore neither resurrect the vendored
+# copy nor leave a stale one behind. Same marker probe the dispatcher/installer
+# use, so all three agree on which guard wins.
+CANONICAL_GUARD_PRESENT=0
+if [[ -r "$REPO_ROOT/.claude/skills/repo/hooks/guard-destructive.sh" ]] && \
+   grep -q 'repo#29' "$REPO_ROOT/.claude/skills/repo/hooks/guard-destructive.sh" 2>/dev/null; then
+    CANONICAL_GUARD_PRESENT=1
+fi
+
 # ---------- walk hooks (top-level *.sh, matching the installer) ----------
 
 if [[ -d "$DEFAULTS_DIR/hooks" && -d "$INSTALLED_HOOKS" ]]; then
@@ -225,6 +239,20 @@ if [[ -d "$DEFAULTS_DIR/hooks" && -d "$INSTALLED_HOOKS" ]]; then
     shopt -s nullglob
     for src in "$DEFAULTS_DIR/hooks/"*.sh; do
         name="$(basename "$src")"
+        # The vendored generic guard is conditional on the canonical guard (#4041).
+        if [[ "$name" == "guard-destructive-generic.sh" && "$CANONICAL_GUARD_PRESENT" -eq 1 ]]; then
+            if [[ -f "$INSTALLED_HOOKS/$name" ]]; then
+                if [[ "$DRY_RUN" -eq 1 ]]; then
+                    printf '%b\n' "  ${BOLD}would remove${NC} hooks/$name ${YELLOW}(canonical Repo Skills guard present)${NC}"
+                else
+                    rm -f "$INSTALLED_HOOKS/$name" 2>/dev/null || true
+                    printf '%b\n' "  ${GREEN}removed${NC}   hooks/$name ${YELLOW}(canonical Repo Skills guard present)${NC}"
+                fi
+            else
+                note "  ${GREEN}unchanged${NC} hooks/$name ${YELLOW}(canonical Repo Skills guard present — not installed)${NC}"
+            fi
+            continue
+        fi
         sync_one "$src" "$INSTALLED_HOOKS/$name" "hooks/$name"
     done
     shopt -u nullglob

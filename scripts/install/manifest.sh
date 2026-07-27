@@ -92,6 +92,19 @@ _emit_installed_files_manifest() {
   local internal_skip_paths
   internal_skip_paths="$(_read_loom_internal_skip_list "$defaults_dir")"
 
+  # Issue #4041: the vendored generic guard (hooks/guard-destructive-generic.sh)
+  # is NOT installed when the canonical Repo Skills guard (with the rjwalters/
+  # repo#29 fix) is present in the target — the guard-destructive.sh dispatcher
+  # defers to the canonical guard at runtime. The manifest must reflect what is
+  # ACTUALLY installed, so the #3287 metadata reconciliation does not hard-fail
+  # on a file that was intentionally skipped, and uninstall does not chase it.
+  local _canonical_guard_present=false
+  local _canonical_guard="${TARGET_PATH:-}/.claude/skills/repo/hooks/guard-destructive.sh"
+  if [[ -n "${TARGET_PATH:-}" && -r "$_canonical_guard" ]] \
+      && grep -q 'repo#29' "$_canonical_guard" 2>/dev/null; then
+    _canonical_guard_present=true
+  fi
+
   local json="["
   local first=true
   local rel_path target_path
@@ -115,6 +128,12 @@ _emit_installed_files_manifest() {
     # The skip list itself is metadata about Loom's install boundary; it
     # is not a shipped file.
     if [[ "$rel_path" == ".loom-internal.list" ]]; then
+      continue
+    fi
+
+    # Issue #4041: skip the vendored generic guard when the canonical Repo
+    # Skills guard is present (it is intentionally not installed there).
+    if [[ "$rel_path" == "hooks/guard-destructive-generic.sh" && "$_canonical_guard_present" == "true" ]]; then
       continue
     fi
 

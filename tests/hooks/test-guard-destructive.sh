@@ -1,10 +1,17 @@
 #!/usr/bin/env bash
-# Test suite for defaults/hooks/guard-destructive.sh
+# Test suite for defaults/hooks/guard-destructive-generic.sh
 #
 # Usage: ./tests/hooks/test-guard-destructive.sh
 #
-# Tests the PreToolUse guard hook against various command patterns.
-# Exit code 0 = all tests pass, 1 = failures detected.
+# Tests the generic destructive-command pattern guard against various command
+# patterns. Exit code 0 = all tests pass, 1 = failures detected.
+#
+# Since #4041 the generic pattern list lives in guard-destructive-generic.sh —
+# the vendored copy of Repo Skills' canonical guard that Loom ships for
+# standalone repos (no Repo Skills installed). guard-destructive.sh itself is now
+# a thin dispatcher that defers to the canonical guard when present, else to this
+# vendored generic; so the pattern-matching behavior Loom is responsible for
+# shipping is validated here against the generic file directly.
 #
 # The guard under test is the canonical source at defaults/hooks/ (the
 # version-controlled source of truth), NOT the gitignored .loom/hooks/ install
@@ -14,7 +21,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
-GUARD="$REPO_ROOT/defaults/hooks/guard-destructive.sh"
+GUARD="$REPO_ROOT/defaults/hooks/guard-destructive-generic.sh"
 
 PASS=0
 FAIL=0
