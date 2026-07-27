@@ -696,8 +696,12 @@ impl std::fmt::Display for UnevaluatedClass {
 /// The result of one gate run.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GateOutcome {
-    /// `buildGate.command` exited 0 — `main` is healthy.
-    Green,
+    /// `buildGate.command` exited 0 — `main` is healthy. `elapsed` is the
+    /// wall-clock time the gate command ran (Issue #4083) — surfaced on the
+    /// green INFO line so operators can distinguish "green with headroom" from
+    /// "green at the edge of the timeout budget" without having to wait for a
+    /// timeout to see the duration.
+    Green { elapsed: Duration },
     /// **VERIFIED_RED**: `buildGate.command` ran to completion and reported
     /// failure (a non-zero exit that is not one of the "could not run" codes —
     /// see [`UnevaluatedClass`]). `detail` is a human-readable reason + a tail
@@ -742,7 +746,7 @@ impl GateOutcome {
     /// True when the run was green.
     #[must_use]
     pub fn is_green(&self) -> bool {
-        matches!(self, Self::Green)
+        matches!(self, Self::Green { .. })
     }
 
     /// True when the run produced no verdict (did not run to completion).
@@ -772,7 +776,7 @@ impl GateOutcome {
     #[must_use]
     pub fn detail(&self) -> &str {
         match self {
-            Self::Green => "",
+            Self::Green { .. } => "",
             Self::Red { detail } => detail,
             Self::Unevaluated { reason, .. } => reason,
         }
@@ -1482,7 +1486,7 @@ pub fn run_gate_tick(
     let mut runner = CommandGateRunner::new(config.clone(), repo_root.to_path_buf());
     let outcome = runner.run_gate();
     match &outcome {
-        GateOutcome::Green | GateOutcome::Red { .. } => {
+        GateOutcome::Green { .. } | GateOutcome::Red { .. } => {
             // Prefer the cheaply-resolved SHA; fall back to the workspace's
             // post-sync HEAD (the runner itself resolves this internally for
             // forge-CI corroboration, but does not expose it — re-deriving it
@@ -1925,7 +1929,9 @@ fn run_command_with_timeout(command: &str, cwd: &Path, timeout: Duration) -> Gat
         match child.try_wait() {
             Ok(Some(status)) => {
                 if status.success() {
-                    break GateOutcome::Green;
+                    break GateOutcome::Green {
+                        elapsed: start.elapsed(),
+                    };
                 }
                 let tail = read_output_tail(&log_path);
                 break classify_failed_exit(command, &status, &tail);
@@ -2013,7 +2019,7 @@ pub enum HealthTransition {
 #[must_use]
 pub fn apply_gate_outcome(state: &MainHealthState, outcome: &GateOutcome) -> HealthTransition {
     match outcome {
-        GateOutcome::Green => {
+        GateOutcome::Green { .. } => {
             state.record_verdict_at(Utc::now());
             let was_halted = state.halted.swap(false, Ordering::SeqCst);
             if was_halted {
@@ -2037,6 +2043,34 @@ pub fn apply_gate_outcome(state: &MainHealthState, outcome: &GateOutcome) -> Hea
 
 /// How the current verdict reads in a log line, for an UNEVALUATED tick that
 /// left it untouched.
+/// Render a gate run's wall-clock duration for the green INFO line (#4083).
+///
+/// A whole-second `{}s` is the operator-facing unit the gate budget is
+/// expressed in, but a sub-second run would round to a misleading `0s` that
+/// reads as "the gate did not actually run". So anything under one second is
+/// rendered in milliseconds instead — a fast gate shows e.g. `320ms`, never
+/// `0s`.
+#[must_use]
+fn format_elapsed(elapsed: Duration) -> String {
+    if elapsed < Duration::from_secs(1) {
+        format!("{}ms", elapsed.as_millis())
+    } else {
+        format!("{}s", elapsed.as_secs())
+    }
+}
+
+/// Extract the elapsed run time from a green outcome, defaulting to zero for
+/// any other outcome (a `RemainedHealthy` transition only ever arrives paired
+/// with a [`GateOutcome::Green`], so the default is unreachable in practice —
+/// it exists purely so the renderers never panic on a mismatched pair).
+#[must_use]
+fn green_elapsed(outcome: &GateOutcome) -> Duration {
+    match outcome {
+        GateOutcome::Green { elapsed } => *elapsed,
+        _ => Duration::ZERO,
+    }
+}
+
 fn verdict_phrase(halted: bool) -> &'static str {
     if halted {
         "dispatch REMAINS HALTED from the previous verified-red run"
@@ -2093,7 +2127,14 @@ fn log_transition(transition: HealthTransition, outcome: &GateOutcome, halted: b
             "main_health_gate: main GREEN again — RESUMING autonomous dispatch on the next work-finder tick"
         ),
         HealthTransition::RemainedHealthy => {
-            log::debug!("main_health_gate: main green — dispatch unaffected");
+            // Positive evidence, at the default level, that the gate ran and
+            // produced a green verdict this tick (#4083). Includes the elapsed
+            // run time so a green-with-headroom run is distinguishable from a
+            // green-at-the-edge-of-the-timeout-budget run.
+            log::info!(
+                "main_health_gate: main GREEN in {} — dispatch unaffected",
+                format_elapsed(green_elapsed(outcome))
+            );
         }
         // Loud, and explicit that this is NOT a statement about main (#3974).
         HealthTransition::Unevaluated => log::warn!(
@@ -2318,7 +2359,13 @@ fn log_transition_for_root(
             "main_health_gate: {r} main GREEN again — RESUMING dispatch for this repo on the next work-finder tick"
         ),
         HealthTransition::RemainedHealthy => {
-            log::debug!("main_health_gate: {r} main green — dispatch unaffected");
+            // Positive evidence, at the default level, that this repo's gate ran
+            // and produced a green verdict this tick (#4083). Names the repo and
+            // includes the elapsed run time (see `log_transition` for rationale).
+            log::info!(
+                "main_health_gate: {r} main GREEN in {} — dispatch unaffected",
+                format_elapsed(green_elapsed(outcome))
+            );
         }
         HealthTransition::Unevaluated => log::warn!(
             "main_health_gate: {r} gate run UNEVALUATED [{}] — {} — this is a failure of the GATE, not evidence about main; {}",
@@ -2480,6 +2527,169 @@ mod tests {
         let full = dir.join(crate::config_resolver::PROJECT_CONFIG_REL);
         std::fs::create_dir_all(full.parent().unwrap()).unwrap();
         std::fs::write(full, body).unwrap();
+    }
+
+    // ===================================================================
+    // Capturing logger (#4083) — a tiny `log::Log` impl so the green-path
+    // severity can be asserted and cannot silently regress to `debug!`.
+    //
+    // The global logger can only be installed once per process and tests run
+    // in parallel, so records are routed into a *thread-local* buffer that is
+    // only collected while `capture_logs` is active on the calling thread.
+    // Any log emitted by a concurrent test lands in that other thread's
+    // (inactive) buffer and is dropped — so capture is race-free without
+    // serializing the whole suite.
+    // ===================================================================
+    mod capture {
+        use log::{Level, Log, Metadata, Record};
+        use std::cell::RefCell;
+        use std::sync::Once;
+
+        thread_local! {
+            static RECORDS: RefCell<Vec<(Level, String)>> = const { RefCell::new(Vec::new()) };
+            static ACTIVE: RefCell<bool> = const { RefCell::new(false) };
+        }
+
+        struct CaptureLogger;
+
+        impl Log for CaptureLogger {
+            fn enabled(&self, _: &Metadata) -> bool {
+                true
+            }
+            fn log(&self, record: &Record) {
+                ACTIVE.with(|a| {
+                    if *a.borrow() {
+                        RECORDS.with(|r| {
+                            r.borrow_mut()
+                                .push((record.level(), record.args().to_string()));
+                        });
+                    }
+                });
+            }
+            fn flush(&self) {}
+        }
+
+        static INIT: Once = Once::new();
+
+        /// Run `f`, returning every `(Level, message)` it logged on this thread.
+        pub fn capture_logs<F: FnOnce()>(f: F) -> Vec<(Level, String)> {
+            INIT.call_once(|| {
+                // `set_max_level(Trace)` is required — without it the log macros
+                // short-circuit before reaching the logger. Because it is set to
+                // the most permissive level, a regression of the green path from
+                // `info!` to `debug!` would still be *captured* (as `Debug`), so
+                // the level assertion — not mere presence — is what guards it.
+                let _ = log::set_boxed_logger(Box::new(CaptureLogger));
+                log::set_max_level(log::LevelFilter::Trace);
+            });
+            RECORDS.with(|r| r.borrow_mut().clear());
+            ACTIVE.with(|a| *a.borrow_mut() = true);
+            f();
+            ACTIVE.with(|a| *a.borrow_mut() = false);
+            RECORDS.with(|r| r.borrow_mut().clone())
+        }
+    }
+
+    // ===================================================================
+    // Green-path log severity (#4083)
+    // ===================================================================
+
+    /// AC5 — the operator-visible fix. A green run from a non-halted state must
+    /// emit exactly one `info!` line via the production (root-aware) renderer,
+    /// naming the workspace and the elapsed seconds. If the level regresses to
+    /// `debug!`, the `Level::Info` assertion fails.
+    #[test]
+    fn test_remained_healthy_logs_at_info_via_root_renderer() {
+        let root = Path::new("/repo/alpha");
+        let state = MainHealthState::new();
+        let outcome = GateOutcome::Green {
+            elapsed: Duration::from_secs(726),
+        };
+
+        let records = capture::capture_logs(|| {
+            apply_and_log(&state, &outcome, |t, o, h| log_transition_for_root(root, t, o, h));
+        });
+
+        let green: Vec<_> = records
+            .iter()
+            .filter(|(_, msg)| msg.contains("GREEN in"))
+            .collect();
+        assert_eq!(green.len(), 1, "exactly one green line expected, got {records:?}");
+        let (level, msg) = green[0];
+        assert_eq!(*level, log::Level::Info, "green path must log at INFO, not debug");
+        assert!(msg.contains("/repo/alpha"), "line must name the workspace: {msg}");
+        assert!(msg.contains("726s"), "line must carry the elapsed seconds: {msg}");
+        assert!(msg.contains("dispatch unaffected"), "unexpected wording: {msg}");
+    }
+
+    /// AC4 — the single-workspace renderer (no production caller, but kept for
+    /// API/test parity) must also carry the upgraded severity. It omits the
+    /// workspace name (there is no root in scope) but still logs at INFO with
+    /// the elapsed time.
+    #[test]
+    fn test_remained_healthy_logs_at_info_via_plain_renderer() {
+        let state = MainHealthState::new();
+        let outcome = GateOutcome::Green {
+            elapsed: Duration::from_secs(42),
+        };
+
+        let records = capture::capture_logs(|| {
+            apply_and_log(&state, &outcome, log_transition);
+        });
+
+        let green: Vec<_> = records
+            .iter()
+            .filter(|(_, msg)| msg.contains("GREEN in"))
+            .collect();
+        assert_eq!(green.len(), 1, "exactly one green line expected, got {records:?}");
+        let (level, msg) = green[0];
+        assert_eq!(*level, log::Level::Info, "green path must log at INFO, not debug");
+        assert!(msg.contains("42s"), "line must carry the elapsed seconds: {msg}");
+    }
+
+    /// A green run that *exits a halt* must stay `Recovered` (its own distinct,
+    /// greppable wording) and must NOT also emit the `RemainedHealthy` "GREEN
+    /// in Ns" line — the two remain distinguishable.
+    #[test]
+    fn test_recovered_is_distinct_from_remained_healthy() {
+        let root = Path::new("/repo/beta");
+        let state = MainHealthState::new();
+        // Prime a halt so the next green is a recovery.
+        let _ = apply_gate_outcome(&state, &GateOutcome::red("boom"));
+
+        let records = capture::capture_logs(|| {
+            apply_and_log(
+                &state,
+                &GateOutcome::Green {
+                    elapsed: Duration::from_secs(5),
+                },
+                |t, o, h| log_transition_for_root(root, t, o, h),
+            );
+        });
+
+        assert!(
+            records
+                .iter()
+                .any(|(l, m)| *l == log::Level::Info && m.contains("GREEN again")),
+            "recovery must log the distinct 'GREEN again' line: {records:?}"
+        );
+        assert!(
+            !records.iter().any(|(_, m)| m.contains("GREEN in")),
+            "a recovery must not also emit the RemainedHealthy 'GREEN in Ns' line: {records:?}"
+        );
+    }
+
+    /// Elapsed rendering: a sub-second run must not render as a misleading
+    /// `0s` (which reads as "the gate never ran") — it renders in ms instead.
+    #[test]
+    fn test_format_elapsed_rendering() {
+        assert_eq!(format_elapsed(Duration::from_secs(726)), "726s");
+        assert_eq!(format_elapsed(Duration::from_secs(1)), "1s");
+        // Sub-second → milliseconds, never "0s".
+        assert_eq!(format_elapsed(Duration::from_millis(320)), "320ms");
+        assert_eq!(format_elapsed(Duration::from_millis(999)), "999ms");
+        assert_eq!(format_elapsed(Duration::ZERO), "0ms");
+        assert_ne!(format_elapsed(Duration::from_millis(500)), "0s");
     }
 
     // ===================================================================
@@ -2667,7 +2877,12 @@ mod tests {
     fn test_green_verdict_stamps_last_verdict_at() {
         let state = MainHealthState::new();
         let before = Utc::now();
-        let _ = apply_gate_outcome(&state, &GateOutcome::Green);
+        let _ = apply_gate_outcome(
+            &state,
+            &GateOutcome::Green {
+                elapsed: Duration::ZERO,
+            },
+        );
         let stamped = state
             .last_verdict_at()
             .expect("a completed Green run must stamp a verdict time");
@@ -2711,7 +2926,7 @@ mod tests {
         let state = MainHealthState::new();
 
         let first = run_gate_tick(&state, &cfg, clone.path());
-        assert_eq!(first, Some(GateOutcome::Green));
+        assert!(matches!(first, Some(GateOutcome::Green { .. })));
         // `run_gate_tick` alone does not apply the outcome (the caller does,
         // via `apply_gate_outcome`) -- so no verdict is stamped by the tick
         // itself yet.
@@ -2743,7 +2958,12 @@ mod tests {
         let root = Path::new("/repo/a");
         let state = states.get_or_create(root);
         assert_eq!(states.last_verdict_at(root), None);
-        let _ = apply_gate_outcome(&state, &GateOutcome::Green);
+        let _ = apply_gate_outcome(
+            &state,
+            &GateOutcome::Green {
+                elapsed: Duration::ZERO,
+            },
+        );
         assert!(states.last_verdict_at(root).is_some());
     }
 
@@ -2802,7 +3022,12 @@ mod tests {
     fn test_green_then_red_enters_halt() {
         let state = MainHealthState::new();
         assert_eq!(
-            apply_gate_outcome(&state, &GateOutcome::Green),
+            apply_gate_outcome(
+                &state,
+                &GateOutcome::Green {
+                    elapsed: Duration::ZERO
+                }
+            ),
             HealthTransition::RemainedHealthy
         );
         assert!(!state.is_halted());
@@ -2834,7 +3059,15 @@ mod tests {
         let _ = apply_gate_outcome(&state, &GateOutcome::red("boom"));
         assert!(state.is_halted());
 
-        assert_eq!(apply_gate_outcome(&state, &GateOutcome::Green), HealthTransition::Recovered);
+        assert_eq!(
+            apply_gate_outcome(
+                &state,
+                &GateOutcome::Green {
+                    elapsed: Duration::ZERO
+                }
+            ),
+            HealthTransition::Recovered
+        );
         assert!(!state.is_halted(), "a green run must clear the halt");
     }
 
@@ -2847,7 +3080,9 @@ mod tests {
         }
         impl GateRunner for FakeGateRunner {
             fn run_gate(&mut self) -> GateOutcome {
-                self.outcomes.pop_front().unwrap_or(GateOutcome::Green)
+                self.outcomes.pop_front().unwrap_or(GateOutcome::Green {
+                    elapsed: Duration::ZERO,
+                })
             }
         }
 
@@ -2855,7 +3090,9 @@ mod tests {
             outcomes: VecDeque::from([
                 GateOutcome::red("first failure"),
                 GateOutcome::red("second failure"),
-                GateOutcome::Green,
+                GateOutcome::Green {
+                    elapsed: Duration::ZERO,
+                },
             ]),
         };
         let state = MainHealthState::new();
@@ -2888,7 +3125,7 @@ mod tests {
             ..Default::default()
         };
         let mut runner = CommandGateRunner::new(cfg, std::env::temp_dir()).without_sync();
-        assert_eq!(runner.run_gate(), GateOutcome::Green);
+        assert!(runner.run_gate().is_green());
     }
 
     #[test]
@@ -3147,7 +3384,7 @@ mod tests {
     fn test_green_local_run_never_consults_forge_ci() {
         std::env::remove_var(GATE_CI_CORROBORATION_ENV);
         let (outcome, asked) = run_gate_with_ci("exit 0", CiVerdict::Failure);
-        assert_eq!(outcome, GateOutcome::Green, "a green local run is authoritative");
+        assert!(outcome.is_green(), "a green local run is authoritative");
         assert!(asked.is_empty(), "CI must not be probed on a green run");
     }
 
@@ -3796,7 +4033,7 @@ mod tests {
             ..Default::default()
         };
         let mut runner = CommandGateRunner::new(cfg, clone.path().to_path_buf());
-        assert_eq!(runner.run_gate(), GateOutcome::Green);
+        assert!(runner.run_gate().is_green());
     }
 
     // ===================================================================
@@ -3966,7 +4203,10 @@ mod tests {
         let state = MainHealthState::new();
 
         let first = run_gate_tick(&state, &cfg, clone.path());
-        assert_eq!(first, Some(GateOutcome::Green), "first tick must run and be green");
+        assert!(
+            matches!(first, Some(GateOutcome::Green { .. })),
+            "first tick must run and be green"
+        );
         let invocations_after_first = std::fs::read_to_string(&marker_file)
             .unwrap_or_default()
             .lines()
@@ -4000,7 +4240,10 @@ mod tests {
         };
         let state = MainHealthState::new();
 
-        assert_eq!(run_gate_tick(&state, &cfg, clone.path()), Some(GateOutcome::Green));
+        assert!(matches!(
+            run_gate_tick(&state, &cfg, clone.path()),
+            Some(GateOutcome::Green { .. })
+        ));
         assert_eq!(
             std::fs::read_to_string(&marker_file)
                 .unwrap_or_default()
@@ -4011,7 +4254,10 @@ mod tests {
 
         // main moves — the next tick must run again.
         advance_origin_main(origin.path());
-        assert_eq!(run_gate_tick(&state, &cfg, clone.path()), Some(GateOutcome::Green));
+        assert!(matches!(
+            run_gate_tick(&state, &cfg, clone.path()),
+            Some(GateOutcome::Green { .. })
+        ));
         assert_eq!(
             std::fs::read_to_string(&marker_file)
                 .unwrap_or_default()
