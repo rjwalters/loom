@@ -19,6 +19,7 @@ use loom_daemon::workspace_pool::WorkspacePool;
 use loom_daemon::{extract_configured_terminal_ids, rotate_log_file};
 
 use anyhow::{anyhow, Result};
+use chrono::{DateTime, Utc};
 use clap::{Parser, Subcommand};
 use std::fs;
 use std::io::Write;
@@ -1815,6 +1816,13 @@ fn print_status_json(
             "not_evaluated": report.main_health_gate_not_evaluated,
             // Which failure class actually blocked evaluation (#3974 AC2).
             "not_evaluated_reason": report.main_health_gate_not_evaluated_reason,
+            // Whether the gate is actually enabled for this root, and when its
+            // last completed verdict landed (#4012) — the disambiguators
+            // between "disabled", "pending" (enabled, no verdict yet), and
+            // "clear" (verified green), all three of which pre-#4012 rendered
+            // identically as `halted: false, not_evaluated: false`.
+            "enabled": report.main_health_gate_enabled,
+            "verdict_at": report.main_health_gate_verdict_at,
         },
         // Per-repo breakdown across every registered managed workspace (#3930).
         "per_repo": report.per_repo.iter().map(|r| serde_json::json!({
@@ -1824,6 +1832,8 @@ fn print_status_json(
             "health_gate_halted": r.health_gate_halted,
             "health_gate_not_evaluated": r.health_gate_not_evaluated,
             "health_gate_not_evaluated_reason": r.health_gate_not_evaluated_reason,
+            "health_gate_enabled": r.health_gate_enabled,
+            "health_gate_verdict_at": r.health_gate_verdict_at,
         })).collect::<Vec<_>>(),
         // Forge-side pipeline snapshot (#3977) — present only when `--pipeline`
         // was passed; `null` otherwise so a consumer can tell "not requested"
@@ -1851,31 +1861,152 @@ fn print_status_json(
     Ok(())
 }
 
+/// The reportable main-health-gate condition for one workspace root (#4012).
+///
+/// Pre-#4012, `loom-daemon status` derived its summary from just the
+/// `halted`/`not_evaluated` boolean pair — and `(false, false)` meant any of
+/// three genuinely different things: the gate is disabled, the gate is
+/// enabled but has not completed its first evaluation this process
+/// ("pending"), or the gate's last completed run verified `main` green
+/// ("clear"). Two booleans cannot encode three states, so this enum widens
+/// the reporting boundary rather than reusing the same pair for a fourth
+/// meaning. [`classify_gate_verdict`] builds one from the raw wire-report
+/// ingredients; [`format_gate_status`] (long form) and
+/// [`gate_status_short_label`] (13-char table column) both render it, so the
+/// top-level summary and the per-repo table can never disagree.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum GateVerdict {
+    /// The gate is not enabled for this root — or is enabled but has no
+    /// usable `buildGate` block, which the gate loop treats identically
+    /// (always-green, never runs). Dispatch is allowed; nothing will ever
+    /// evaluate this root until it is turned on (and configured).
+    Disabled,
+    /// The gate is enabled but has not completed a first evaluation yet this
+    /// daemon process. Dispatch is allowed — this is NOT evidence that `main`
+    /// is healthy, only that nothing has said otherwise yet.
+    Pending,
+    /// The gate's most recent completed run verified `main` green. `since`
+    /// is the wall-clock time of that verdict, when known (#4012 AC4) — a
+    /// `clear` reading with no `since` predates the daemon populating it.
+    Clear { since: Option<DateTime<Utc>> },
+    /// The most recent tick could not produce a verdict at all (dirty tree,
+    /// timeout, missing tool, broken `git`, …) — NOT evidence about `main`
+    /// either way; dispatch is NOT halted by this.
+    NotEvaluated { reason: Option<String> },
+    /// A completed run verified `main` red — dispatch is paused (in-flight
+    /// sweeps keep running). `not_evaluated` records whether a *later* tick
+    /// also failed to produce a verdict (#3950 AC3): the two can co-occur,
+    /// since an unevaluated tick leaves the prior halt untouched.
+    Halted {
+        not_evaluated: bool,
+        reason: Option<String>,
+    },
+}
+
+/// Classify the reportable gate condition from a [`DaemonStatusReport`] /
+/// [`crate::types::RepoStatus`]'s raw fields (#4012).
+///
+/// `enabled` is `Some(false)` only when the daemon positively resolved this
+/// root's gate as off (or effectively off — enabled but no usable
+/// `buildGate` block, via [`main_health_gate::effective_enabled`]); `None`
+/// means an older daemon that never reported the flag at all, which must NOT
+/// be misread as "disabled" (a bare `bool`'s wire default would do exactly
+/// that — see the `Option<bool>` rationale on
+/// [`DaemonStatusReport::main_health_gate_enabled`]). `halted` and
+/// `not_evaluated` take priority over disabled/pending so a genuinely active
+/// halt is never hidden behind either newer state — a case that in practice
+/// only arises from a test poking the raw state directly, since the gate
+/// loop's own disabled path always clears `halted` first.
+fn classify_gate_verdict(
+    enabled: Option<bool>,
+    halted: bool,
+    not_evaluated: bool,
+    reason: Option<&str>,
+    verdict_at: Option<DateTime<Utc>>,
+) -> GateVerdict {
+    if halted {
+        return GateVerdict::Halted {
+            not_evaluated,
+            reason: reason.map(str::to_string),
+        };
+    }
+    if not_evaluated {
+        return GateVerdict::NotEvaluated {
+            reason: reason.map(str::to_string),
+        };
+    }
+    if enabled == Some(false) {
+        return GateVerdict::Disabled;
+    }
+    if verdict_at.is_none() {
+        return GateVerdict::Pending;
+    }
+    GateVerdict::Clear { since: verdict_at }
+}
+
 /// Render the main-health gate summary line for `loom-daemon status`.
 ///
-/// `halted` means a gate run **completed** and found `main` verified-red — the
-/// only state that pauses dispatch. `not_evaluated` means the most recent tick
-/// could not produce a verdict at all; `reason` (`"<class>: <detail>"`, #3974
-/// AC2) names *why*. Before #3974 this line asserted "workspace tree is dirty"
-/// for every skip, which reported a clean tree as dirty whenever the real cause
-/// was a timeout, a missing build tool, or a broken `git`.
-fn format_gate_status(halted: bool, not_evaluated: bool, reason: Option<&str>) -> String {
-    let cause =
-        reason.map_or_else(|| "cause unrecorded".to_string(), std::string::ToString::to_string);
-    match (halted, not_evaluated) {
-        (true, true) => format!(
-            "HALTED (main verified red — new dispatch paused) + NOT EVALUATED ({cause}) — \
-             the gate cannot currently confirm main is still red, or check for recovery"
-        ),
-        (true, false) => {
-            "HALTED (main verified red — new dispatch paused; in-flight sweeps keep running)"
-                .to_string()
+/// Before #3974 this line asserted "workspace tree is dirty" for every skip,
+/// which reported a clean tree as dirty whenever the real cause was a
+/// timeout, a missing build tool, or a broken `git`; before #4012 `clear` and
+/// "the gate has never run" were the same string.
+fn format_gate_status(verdict: &GateVerdict) -> String {
+    match verdict {
+        GateVerdict::Disabled => "disabled (gate not enabled; dispatch allowed)".to_string(),
+        GateVerdict::Pending => {
+            "pending (no verdict yet this process — dispatch allowed)".to_string()
         }
-        (false, true) => format!(
-            "not evaluated ({cause}) — the gate could not run, which is NOT evidence about \
-             main; dispatch is NOT halted by this"
-        ),
-        (false, false) => "clear (dispatch allowed)".to_string(),
+        GateVerdict::Clear { since } => match since {
+            Some(t) => {
+                format!("clear (dispatch allowed; last verified green at {})", t.to_rfc3339())
+            }
+            None => "clear (dispatch allowed)".to_string(),
+        },
+        GateVerdict::NotEvaluated { reason } => {
+            let cause = reason
+                .clone()
+                .unwrap_or_else(|| "cause unrecorded".to_string());
+            format!(
+                "not evaluated ({cause}) — the gate could not run, which is NOT evidence about \
+                 main; dispatch is NOT halted by this"
+            )
+        }
+        GateVerdict::Halted {
+            not_evaluated,
+            reason,
+        } => {
+            if *not_evaluated {
+                let cause = reason
+                    .clone()
+                    .unwrap_or_else(|| "cause unrecorded".to_string());
+                format!(
+                    "HALTED (main verified red — new dispatch paused) + NOT EVALUATED ({cause}) — \
+                     the gate cannot currently confirm main is still red, or check for recovery"
+                )
+            } else {
+                "HALTED (main verified red — new dispatch paused; in-flight sweeps keep running)"
+                    .to_string()
+            }
+        }
+    }
+}
+
+/// Render `verdict` as a short label for the per-repo table's 13-char `GATE`
+/// column (#4012) — the short-form counterpart to [`format_gate_status`].
+fn gate_status_short_label(verdict: &GateVerdict) -> &'static str {
+    match verdict {
+        GateVerdict::Disabled => "disabled",
+        GateVerdict::Pending => "pending",
+        GateVerdict::Clear { .. } => "clear",
+        GateVerdict::NotEvaluated { .. } => "not-evaluated",
+        GateVerdict::Halted {
+            not_evaluated: true,
+            ..
+        } => "HALTED+UNEVAL",
+        GateVerdict::Halted {
+            not_evaluated: false,
+            ..
+        } => "HALTED",
     }
 }
 
@@ -1998,11 +2129,14 @@ fn print_status_human(
     // cause is reported verbatim from the gate (#3974 AC2) — pre-#3974 this
     // line hard-coded "workspace tree is dirty" for every skip, which
     // misreported timeouts / missing tools / broken `git` as a dirty tree.
-    let gate = format_gate_status(
+    let verdict = classify_gate_verdict(
+        report.main_health_gate_enabled,
         report.main_health_gate_halted,
         report.main_health_gate_not_evaluated,
         report.main_health_gate_not_evaluated_reason.as_deref(),
+        report.main_health_gate_verdict_at,
     );
+    let gate = format_gate_status(&verdict);
     println!("\nMain-health gate: {gate}");
 
     // Per-repo breakdown across every registered managed workspace (#3930). In
@@ -2019,14 +2153,16 @@ fn print_status_human(
         println!("  {:>4}  {:>9}  {:<13}  REPO", "PRIO", "IN-FLIGHT", "GATE");
         println!("  {:-<60}", "");
         for r in &report.per_repo {
-            // Same halted/not-evaluated distinction as the top-level summary
-            // above, condensed for the table column (#3950 AC3).
-            let gate = match (r.health_gate_halted, r.health_gate_not_evaluated) {
-                (true, true) => "HALTED+UNEVAL",
-                (true, false) => "HALTED",
-                (false, true) => "not-evaluated",
-                (false, false) => "clear",
-            };
+            // Same classification as the top-level summary above, condensed
+            // for the table column (#3950 AC3, widened #4012).
+            let verdict = classify_gate_verdict(
+                r.health_gate_enabled,
+                r.health_gate_halted,
+                r.health_gate_not_evaluated,
+                r.health_gate_not_evaluated_reason.as_deref(),
+                r.health_gate_verdict_at,
+            );
+            let gate = gate_status_short_label(&verdict);
             println!(
                 "  {:>4}  {:>9}  {:<13}  {}",
                 r.priority,
@@ -2509,9 +2645,11 @@ mod dispatch_tests {
     //! against a fake daemon, and the bounded-timeout path against a
     //! deliberately-unresponsive socket (the #3945 wedge must never hang).
     use super::{
-        build_dispatch_request, format_gate_status, query_daemon_bounded,
-        resolve_dispatch_ack_timeout, DAEMON_IPC_TIMEOUT_ENV, DISPATCH_ACK_TIMEOUT,
+        build_dispatch_request, classify_gate_verdict, format_gate_status, gate_status_short_label,
+        query_daemon_bounded, resolve_dispatch_ack_timeout, GateVerdict, DAEMON_IPC_TIMEOUT_ENV,
+        DISPATCH_ACK_TIMEOUT,
     };
+    use chrono::{DateTime, Utc};
     use loom_daemon::types::{Request, Response, SweepKind};
     use serial_test::serial;
     use std::time::Duration;
@@ -2797,16 +2935,32 @@ mod dispatch_tests {
     // Main-health gate status line (#3950 AC3 shape, #3974 AC2 cause)
     // ===================================================================
 
+    /// Build a [`GateVerdict`] the same way `print_status_human` /
+    /// `print_status_json` do, so these tests exercise the real classification
+    /// path rather than constructing variants by hand.
+    fn classify(
+        enabled: Option<bool>,
+        halted: bool,
+        not_evaluated: bool,
+        reason: Option<&str>,
+        verdict_at: Option<DateTime<Utc>>,
+    ) -> GateVerdict {
+        classify_gate_verdict(enabled, halted, not_evaluated, reason, verdict_at)
+    }
+
     #[test]
     fn format_gate_status_names_the_actual_not_evaluated_cause() {
         // Pre-#3974 this line asserted "workspace tree is dirty" for EVERY
         // skip, so a `git fetch` failure on a completely clean tree was
         // reported as a dirty tree. The cause is now passed through verbatim.
-        let s = format_gate_status(
+        let v = classify(
+            Some(true),
             false,
             true,
             Some("git-failure: `git -C /repo fetch origin main` failed (exit 128)"),
+            None,
         );
+        let s = format_gate_status(&v);
         assert!(s.contains("git-failure"), "got: {s}");
         assert!(s.contains("exit 128"), "got: {s}");
         assert!(!s.contains("dirty"), "must not assume a dirty tree: {s}");
@@ -2814,28 +2968,151 @@ mod dispatch_tests {
         assert!(s.contains("NOT halted"), "an unevaluated gate does not halt: {s}");
 
         // A dirty tree still reads as a dirty tree — because the gate said so.
-        let s = format_gate_status(false, true, Some("dirty-tree: [ M src/main.rs]"));
+        let v = classify(Some(true), false, true, Some("dirty-tree: [ M src/main.rs]"), None);
+        let s = format_gate_status(&v);
         assert!(s.contains("dirty-tree"), "got: {s}");
         assert!(s.contains("src/main.rs"), "got: {s}");
     }
 
     #[test]
-    fn format_gate_status_covers_all_four_states() {
-        assert_eq!(format_gate_status(false, false, None), "clear (dispatch allowed)");
+    fn format_gate_status_covers_all_halted_and_not_evaluated_states() {
+        let clear = classify(Some(true), false, false, None, Some(Utc::now()));
+        assert!(format_gate_status(&clear).starts_with("clear (dispatch allowed"));
 
-        let halted = format_gate_status(true, false, None);
-        assert!(halted.starts_with("HALTED"), "got: {halted}");
-        assert!(halted.contains("verified red"), "got: {halted}");
+        let halted = classify(Some(true), true, false, None, None);
+        let s = format_gate_status(&halted);
+        assert!(s.starts_with("HALTED"), "got: {s}");
+        assert!(s.contains("verified red"), "got: {s}");
 
         // Both at once: a prior verified-red halt persists while the next tick
         // cannot evaluate.
-        let both = format_gate_status(true, true, Some("timeout: gate command timed out"));
-        assert!(both.contains("HALTED"), "got: {both}");
-        assert!(both.contains("NOT EVALUATED"), "got: {both}");
-        assert!(both.contains("timeout"), "got: {both}");
+        let both = classify(Some(true), true, true, Some("timeout: gate command timed out"), None);
+        let s = format_gate_status(&both);
+        assert!(s.contains("HALTED"), "got: {s}");
+        assert!(s.contains("NOT EVALUATED"), "got: {s}");
+        assert!(s.contains("timeout"), "got: {s}");
 
         // A missing cause degrades gracefully rather than inventing one.
-        let no_cause = format_gate_status(false, true, None);
-        assert!(no_cause.contains("cause unrecorded"), "got: {no_cause}");
+        let no_cause = classify(Some(true), false, true, None, None);
+        let s = format_gate_status(&no_cause);
+        assert!(s.contains("cause unrecorded"), "got: {s}");
+    }
+
+    /// #4012: the core regression this issue fixes — a fresh, enabled gate
+    /// that has never completed an evaluation must render distinctly from a
+    /// verified-green gate, even though both allow dispatch (`halted: false`,
+    /// `not_evaluated: false` in both cases pre-#4012).
+    #[test]
+    fn format_gate_status_distinguishes_pending_from_clear() {
+        let pending = classify(Some(true), false, false, None, None);
+        assert_eq!(pending, GateVerdict::Pending);
+        let s = format_gate_status(&pending);
+        assert!(s.starts_with("pending"), "got: {s}");
+        assert!(s.contains("dispatch allowed"), "got: {s}");
+        assert!(!s.contains("clear"), "must not read as verified-green: {s}");
+
+        let now = Utc::now();
+        let clear = classify(Some(true), false, false, None, Some(now));
+        assert_eq!(clear, GateVerdict::Clear { since: Some(now) });
+        let s = format_gate_status(&clear);
+        assert!(s.starts_with("clear"), "got: {s}");
+        assert!(s.contains(&now.to_rfc3339()), "clear must carry its own recency evidence: {s}");
+        assert_ne!(
+            format_gate_status(&pending),
+            format_gate_status(&clear),
+            "pending and clear must never render identically"
+        );
+    }
+
+    /// #4012 AC2: the gate-disabled case must be distinguishable from both
+    /// `pending` and `clear`.
+    #[test]
+    fn format_gate_status_distinguishes_disabled() {
+        let disabled = classify(Some(false), false, false, None, None);
+        assert_eq!(disabled, GateVerdict::Disabled);
+        let s = format_gate_status(&disabled);
+        assert!(s.starts_with("disabled"), "got: {s}");
+        assert!(s.contains("dispatch allowed"), "got: {s}");
+
+        let pending = classify(Some(true), false, false, None, None);
+        assert_ne!(
+            format_gate_status(&disabled),
+            format_gate_status(&pending),
+            "disabled and pending must never render identically"
+        );
+
+        // A disabled root that (implausibly) still carries a stale verdict
+        // timestamp from before it was turned off still reports `Disabled` —
+        // the enabled flag takes priority over verdict presence.
+        let disabled_with_stale_verdict =
+            classify(Some(false), false, false, None, Some(Utc::now()));
+        assert_eq!(disabled_with_stale_verdict, GateVerdict::Disabled);
+    }
+
+    /// #4012 AC3: `pending` and `disabled` both still allow dispatch —
+    /// observability-only, no new halt path.
+    #[test]
+    fn pending_and_disabled_never_halt() {
+        for verdict in [
+            classify(Some(true), false, false, None, None),
+            classify(Some(false), false, false, None, None),
+        ] {
+            assert!(
+                !matches!(verdict, GateVerdict::Halted { .. }),
+                "{verdict:?} must never be classified as halted"
+            );
+            let s = format_gate_status(&verdict);
+            assert!(s.contains("dispatch allowed"), "got: {s}");
+        }
+    }
+
+    /// An older daemon that never populated `main_health_gate_enabled` (wire
+    /// field absent ⇒ `None`, #4012) must not be misread as "disabled" — that
+    /// is exactly the `bool::default() == false` trap the `Option<bool>` wire
+    /// type exists to avoid.
+    #[test]
+    fn format_gate_status_legacy_none_enabled_is_not_disabled() {
+        let v = classify(None, false, false, None, None);
+        assert_ne!(v, GateVerdict::Disabled);
+        // With no verdict either, it reads as pending (dispatch allowed) —
+        // the conservative reading, never a fabricated "clear".
+        assert_eq!(v, GateVerdict::Pending);
+    }
+
+    /// `halted`/`not_evaluated` always win over disabled/pending, matching the
+    /// gate loop's own soft-fail contract (its disabled path always clears
+    /// `halted` first) — this combination should only ever arise from a test
+    /// poking the raw state directly, and the renderer must still surface it
+    /// as halted rather than silently downgrading to "disabled".
+    #[test]
+    fn format_gate_status_halted_beats_disabled_and_pending() {
+        let v = classify(Some(false), true, false, None, None);
+        assert!(matches!(
+            v,
+            GateVerdict::Halted {
+                not_evaluated: false,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn gate_status_short_label_fits_table_width_and_matches_long_form() {
+        let cases = [
+            classify(Some(false), false, false, None, None),
+            classify(Some(true), false, false, None, None),
+            classify(Some(true), false, false, None, Some(Utc::now())),
+            classify(Some(true), false, true, Some("timeout"), None),
+            classify(Some(true), true, false, None, None),
+            classify(Some(true), true, true, Some("timeout"), None),
+        ];
+        for v in cases {
+            let short = gate_status_short_label(&v);
+            assert!(short.len() <= 13, "{short:?} exceeds the 13-char GATE column");
+        }
+        // The short label and long form must agree on the halted/not distinction.
+        let halted = classify(Some(true), true, false, None, None);
+        assert_eq!(gate_status_short_label(&halted), "HALTED");
+        assert!(format_gate_status(&halted).starts_with("HALTED"));
     }
 }

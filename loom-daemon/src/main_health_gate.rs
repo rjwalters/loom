@@ -86,6 +86,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use chrono::{DateTime, Utc};
+
 use crate::workspace_registry::WorkspaceRegistry;
 
 // ============================================================================
@@ -171,6 +173,17 @@ pub struct MainHealthState {
     /// SHA-memoization + indeterminate-run backoff bookkeeping (#3984) — see
     /// [`GateMemo`].
     gate_memo: Mutex<GateMemo>,
+    /// Wall-clock time of the most recent **completed** (Green/Red) gate
+    /// verdict, or `None` before the first one this process (#4012). This is
+    /// the disambiguator between "pending" (gate enabled, no verdict yet —
+    /// the ambiguous pre-#4012 `(false, false)` reading) and "clear"
+    /// (verified green), plus the recency evidence a `clear` reading
+    /// otherwise lacks. Stamped only in [`apply_gate_outcome`]'s Green/Red
+    /// arms — deliberately **not** touched by the #3984 SHA-memo skip path
+    /// ([`run_gate_tick`]'s early return), since a skip proves nothing new
+    /// about `main` and stamping it there would let a stale "last verified"
+    /// silently refresh itself forever.
+    last_verdict_at: Mutex<Option<DateTime<Utc>>>,
 }
 
 /// Bookkeeping for #3984: the SHA of the last **determinate** (Green/Red)
@@ -221,6 +234,7 @@ impl MainHealthState {
             unevaluated: AtomicBool::new(false),
             track: Mutex::new(UnevaluatedTrack::default()),
             gate_memo: Mutex::new(GateMemo::default()),
+            last_verdict_at: Mutex::new(None),
         }
     }
 
@@ -265,6 +279,27 @@ impl MainHealthState {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let (class, reason) = track.detail.as_ref()?;
         Some(format!("{class}: {}", truncate_chars(reason, MAX_STATUS_REASON_CHARS)))
+    }
+
+    /// Wall-clock time of the most recent completed (Green/Red) gate verdict,
+    /// or `None` if none has landed yet this process (#4012). See the field
+    /// doc on [`Self::last_verdict_at`].
+    #[must_use]
+    pub fn last_verdict_at(&self) -> Option<DateTime<Utc>> {
+        *self
+            .last_verdict_at
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Record `at` as the time of a just-completed (Green/Red) gate verdict.
+    /// Called from [`apply_gate_outcome`] only — never from the SHA-memo skip
+    /// path, which does not represent a completed run.
+    fn record_verdict_at(&self, at: DateTime<Utc>) {
+        *self
+            .last_verdict_at
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(at);
     }
 
     /// Record this tick's evaluated/unevaluated outcome and report whether the
@@ -469,6 +504,20 @@ impl WorkspaceHealthStates {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         map.get(root).and_then(|s| s.unevaluated_summary())
+    }
+
+    /// Wall-clock time of `root`'s most recent completed gate verdict
+    /// (#4012), or `None` when it has never produced one this process (or the
+    /// root has never been seen — deliberately the same "pending" reading as
+    /// a registered-but-not-yet-evaluated root, per the field doc on
+    /// [`MainHealthState::last_verdict_at`]).
+    #[must_use]
+    pub fn last_verdict_at(&self, root: &Path) -> Option<DateTime<Utc>> {
+        let map = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        map.get(root).and_then(|s| s.last_verdict_at())
     }
 
     /// Directly set `root`'s halt flag (creating its state if absent). Primarily
@@ -1988,6 +2037,7 @@ pub enum HealthTransition {
 pub fn apply_gate_outcome(state: &MainHealthState, outcome: &GateOutcome) -> HealthTransition {
     match outcome {
         GateOutcome::Green => {
+            state.record_verdict_at(Utc::now());
             let was_halted = state.halted.swap(false, Ordering::SeqCst);
             if was_halted {
                 HealthTransition::Recovered
@@ -1996,6 +2046,7 @@ pub fn apply_gate_outcome(state: &MainHealthState, outcome: &GateOutcome) -> Hea
             }
         }
         GateOutcome::Red { .. } => {
+            state.record_verdict_at(Utc::now());
             let was_halted = state.halted.swap(true, Ordering::SeqCst);
             if was_halted {
                 HealthTransition::RemainedHalted
@@ -2198,6 +2249,21 @@ pub fn resolve_enabled(config: &AutonomousGateConfig) -> bool {
         return matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on");
     }
     config.enabled.unwrap_or(false)
+}
+
+/// Whether the gate is **effectively** enabled for `repo_root` (#4012): the
+/// [`resolve_enabled`] on/off switch **and** a usable `buildGate` block. A
+/// root can be nominally `autonomous.mainHealthGate.enabled: true` yet never
+/// actually gate anything because `.loom/config.json` has no `buildGate`
+/// block (or an empty command) — [`spawn_multi_main_health_gate_task`]
+/// already treats that as always-green (soft-fail, unchanged contract); this
+/// helper folds the same two checks into one so the `loom-daemon status`
+/// "disabled" reading (#4012 AC2) agrees with what the gate loop actually
+/// does, rather than reporting "enabled" for a root that will never run.
+#[must_use]
+pub fn effective_enabled(repo_root: &Path) -> bool {
+    resolve_enabled(&read_autonomous_gate_config(repo_root))
+        && read_build_gate_config(repo_root).is_some()
 }
 
 /// Resolve the gate cadence from [`MAIN_HEALTH_GATE_INTERVAL_ENV`], falling back
@@ -2545,6 +2611,104 @@ mod tests {
     fn test_default_state_not_halted() {
         assert!(!MainHealthState::new().is_halted());
         assert!(!MainHealthState::default().is_halted());
+    }
+
+    // ===================================================================
+    // Verdict timestamp (#4012) — the pending-vs-clear disambiguator
+    // ===================================================================
+
+    #[test]
+    fn test_fresh_state_has_no_verdict_yet() {
+        // The core #4012 regression: a fresh, never-evaluated state must NOT
+        // be indistinguishable from a verified-green one. `last_verdict_at`
+        // is the new signal a renderer uses to tell them apart.
+        let state = MainHealthState::new();
+        assert_eq!(state.last_verdict_at(), None);
+        assert!(!state.is_halted(), "still not halted -- dispatch allowed either way");
+    }
+
+    #[test]
+    fn test_green_verdict_stamps_last_verdict_at() {
+        let state = MainHealthState::new();
+        let before = Utc::now();
+        let _ = apply_gate_outcome(&state, &GateOutcome::Green);
+        let stamped = state
+            .last_verdict_at()
+            .expect("a completed Green run must stamp a verdict time");
+        assert!(stamped >= before, "stamped time must not be in the past relative to the call");
+    }
+
+    #[test]
+    fn test_red_verdict_also_stamps_last_verdict_at() {
+        // Both determinate outcomes count as "a verdict happened" -- a red
+        // main is still a real answer, just an unwelcome one.
+        let state = MainHealthState::new();
+        let _ = apply_gate_outcome(&state, &GateOutcome::red("boom"));
+        assert!(state.last_verdict_at().is_some());
+    }
+
+    #[test]
+    fn test_unevaluated_outcome_does_not_stamp_last_verdict_at() {
+        // An UNEVALUATED tick produced no verdict at all -- it must not be
+        // mistaken for one by stamping the timestamp.
+        let state = MainHealthState::new();
+        let _ = apply_gate_outcome(
+            &state,
+            &GateOutcome::unevaluated(UnevaluatedClass::Timeout, "timed out"),
+        );
+        assert_eq!(state.last_verdict_at(), None, "an unevaluated tick must not stamp a verdict");
+    }
+
+    #[test]
+    fn test_run_gate_tick_skip_path_does_not_stamp_last_verdict_at() {
+        // The #3984 SHA-memo skip path (unchanged `origin/main`) proves
+        // nothing new -- the Curator's explicit design decision is that only
+        // the real Green/Red run stamps the verdict time, never the skip.
+        let (_origin, clone) = make_origin_and_clone();
+        let marker = tempfile::tempdir().unwrap();
+        let marker_file = marker.path().join("invocations.txt");
+        let cfg = BuildGateConfig {
+            command: format!("echo run >> {}", marker_file.display()),
+            timeout: Duration::from_secs(30),
+            ..Default::default()
+        };
+        let state = MainHealthState::new();
+
+        let first = run_gate_tick(&state, &cfg, clone.path());
+        assert_eq!(first, Some(GateOutcome::Green));
+        // `run_gate_tick` alone does not apply the outcome (the caller does,
+        // via `apply_gate_outcome`) -- so no verdict is stamped by the tick
+        // itself yet.
+        assert_eq!(state.last_verdict_at(), None);
+        let _ = apply_gate_outcome(&state, &first.unwrap());
+        let after_first = state.last_verdict_at();
+        assert!(after_first.is_some(), "the real run's outcome, once applied, stamps a verdict");
+
+        // Second tick: unchanged SHA -> skip. No outcome to apply, so the
+        // verdict time must be untouched.
+        let second = run_gate_tick(&state, &cfg, clone.path());
+        assert_eq!(second, None, "unchanged origin/main must skip the second tick");
+        assert_eq!(
+            state.last_verdict_at(),
+            after_first,
+            "a skipped tick must never refresh the verdict timestamp"
+        );
+    }
+
+    #[test]
+    fn test_workspace_health_states_last_verdict_at_unknown_root_is_none() {
+        let states = WorkspaceHealthStates::new();
+        assert_eq!(states.last_verdict_at(Path::new("/repo/never-seen")), None);
+    }
+
+    #[test]
+    fn test_workspace_health_states_last_verdict_at_delegates_to_root() {
+        let states = WorkspaceHealthStates::new();
+        let root = Path::new("/repo/a");
+        let state = states.get_or_create(root);
+        assert_eq!(states.last_verdict_at(root), None);
+        let _ = apply_gate_outcome(&state, &GateOutcome::Green);
+        assert!(states.last_verdict_at(root).is_some());
     }
 
     // ===================================================================
@@ -4210,6 +4374,84 @@ mod tests {
             enabled: Some(true),
             ..Default::default()
         }));
+        std::env::remove_var(MAIN_HEALTH_GATE_ENABLE_ENV);
+    }
+
+    // ===================================================================
+    // Effective enablement (#4012) — the "disabled" render signal
+    // ===================================================================
+
+    #[test]
+    #[serial]
+    fn test_effective_enabled_false_with_no_config_at_all() {
+        std::env::remove_var(MAIN_HEALTH_GATE_ENABLE_ENV);
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(!effective_enabled(tmp.path()), "no config at all ⇒ disabled");
+    }
+
+    #[test]
+    #[serial]
+    fn test_effective_enabled_false_when_enabled_but_no_usable_build_gate() {
+        // #4012's "edge case" test-plan item: a root that is nominally
+        // enabled but has no usable `buildGate` block (or an empty command)
+        // is treated by the gate loop as always-green and must ALSO report
+        // as effectively disabled here -- not "pending" -- since nothing
+        // will ever evaluate it until `buildGate` is actually configured.
+        std::env::remove_var(MAIN_HEALTH_GATE_ENABLE_ENV);
+        let tmp = tempfile::tempdir().unwrap();
+        write_config(tmp.path(), r#"{"autonomous": {"mainHealthGate": {"enabled": true}}}"#);
+        assert!(
+            !effective_enabled(tmp.path()),
+            "enabled=true with no buildGate block must still report disabled"
+        );
+
+        write_config(
+            tmp.path(),
+            r#"{"autonomous": {"mainHealthGate": {"enabled": true}}, "buildGate": {"enabled": true, "command": "   "}}"#,
+        );
+        assert!(
+            !effective_enabled(tmp.path()),
+            "enabled=true with an empty buildGate.command must still report disabled"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn test_effective_enabled_true_with_both_signals_configured() {
+        std::env::remove_var(MAIN_HEALTH_GATE_ENABLE_ENV);
+        let tmp = tempfile::tempdir().unwrap();
+        write_config(
+            tmp.path(),
+            r#"{"autonomous": {"mainHealthGate": {"enabled": true}}, "buildGate": {"enabled": true, "command": "true"}}"#,
+        );
+        assert!(effective_enabled(tmp.path()));
+    }
+
+    #[test]
+    #[serial]
+    fn test_effective_enabled_false_when_build_gate_present_but_autonomous_disabled() {
+        std::env::remove_var(MAIN_HEALTH_GATE_ENABLE_ENV);
+        let tmp = tempfile::tempdir().unwrap();
+        write_config(tmp.path(), r#"{"buildGate": {"enabled": true, "command": "true"}}"#);
+        assert!(
+            !effective_enabled(tmp.path()),
+            "a usable buildGate block alone does not enable the gate -- autonomous.mainHealthGate must opt in too"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn test_effective_enabled_env_master_switch_overrides_config() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_config(
+            tmp.path(),
+            r#"{"autonomous": {"mainHealthGate": {"enabled": false}}, "buildGate": {"enabled": true, "command": "true"}}"#,
+        );
+        std::env::set_var(MAIN_HEALTH_GATE_ENABLE_ENV, "1");
+        assert!(
+            effective_enabled(tmp.path()),
+            "the env master switch overrides a config that disables the loop"
+        );
         std::env::remove_var(MAIN_HEALTH_GATE_ENABLE_ENV);
     }
 }

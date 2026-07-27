@@ -497,6 +497,10 @@ pub fn build_daemon_status(
             // Name the actual failure class (#3974 AC2) rather than letting the
             // renderer assume "dirty tree" for every unevaluated tick.
             health_gate_not_evaluated_reason: health_states.unevaluated_summary(root),
+            // Resolved daemon-side (this process's own env + this root's own
+            // `.loom/config.json`), never the CLI client's environment (#4012).
+            health_gate_enabled: Some(crate::main_health_gate::effective_enabled(root)),
+            health_gate_verdict_at: health_states.last_verdict_at(root),
         });
         in_flight.extend(live);
     }
@@ -577,6 +581,8 @@ pub fn build_daemon_status(
         main_health_gate_halted: health_states.is_halted(fallback_root),
         main_health_gate_not_evaluated: health_states.is_unevaluated(fallback_root),
         main_health_gate_not_evaluated_reason: health_states.unevaluated_summary(fallback_root),
+        main_health_gate_enabled: Some(crate::main_health_gate::effective_enabled(fallback_root)),
+        main_health_gate_verdict_at: health_states.last_verdict_at(fallback_root),
         capacity,
         per_repo,
     }
@@ -2658,6 +2664,8 @@ exit 0
             main_health_gate_halted: true,
             main_health_gate_not_evaluated: false,
             main_health_gate_not_evaluated_reason: None,
+            main_health_gate_enabled: Some(true),
+            main_health_gate_verdict_at: Some(chrono::Utc::now()),
             capacity: crate::types::CapacityReport {
                 ranking_present: true,
                 total_accounts: 4,
@@ -2674,6 +2682,8 @@ exit 0
                 quarantined_issues: vec![101, 202],
                 health_gate_not_evaluated: false,
                 health_gate_not_evaluated_reason: None,
+                health_gate_enabled: Some(true),
+                health_gate_verdict_at: Some(chrono::Utc::now()),
             }],
         };
         let resp = Response::DaemonStatus(report);
@@ -2700,6 +2710,10 @@ exit 0
                 assert_eq!(r.per_repo[0].in_flight_count, 0);
                 assert!(r.per_repo[0].health_gate_halted);
                 assert!(!r.per_repo[0].health_gate_not_evaluated);
+                assert_eq!(r.main_health_gate_enabled, Some(true));
+                assert!(r.main_health_gate_verdict_at.is_some());
+                assert_eq!(r.per_repo[0].health_gate_enabled, Some(true));
+                assert!(r.per_repo[0].health_gate_verdict_at.is_some());
             }
             other => panic!("Expected DaemonStatus, got: {other:?}"),
         }
@@ -2726,6 +2740,17 @@ exit 0
         assert_eq!(report.cpu_headroom, 0);
         assert_eq!(report.logical_cpus, 0);
         assert_eq!(report.loadavg_1m, None);
+        // Absent pre-#4012 fields must default to `None` — NOT `false` — so a
+        // legacy payload from an older, perfectly healthy daemon is read as
+        // "unknown" rather than misreported as "gate disabled" (#4012).
+        assert_eq!(
+            report.main_health_gate_enabled, None,
+            "absent main_health_gate_enabled (#4012) must default to None, not Some(false)"
+        );
+        assert_eq!(
+            report.main_health_gate_verdict_at, None,
+            "absent main_health_gate_verdict_at (#4012) defaults to None (reads as pending)"
+        );
     }
 
     /// `build_daemon_status` reflects the per-repo main-health halt flag and
@@ -2769,6 +2794,37 @@ exit 0
         assert_eq!(report.per_repo[0].root, root);
         assert_eq!(report.per_repo[0].in_flight_count, 0);
         assert!(!report.per_repo[0].health_gate_halted);
+        // No `.loom/config.json` buildGate/autonomous block exists yet, so the
+        // gate is effectively disabled for this root (#4012).
+        assert_eq!(report.main_health_gate_enabled, Some(false));
+        assert_eq!(report.per_repo[0].health_gate_enabled, Some(false));
+        assert_eq!(report.main_health_gate_verdict_at, None);
+        assert_eq!(report.per_repo[0].health_gate_verdict_at, None);
+
+        // #4012: a root the gate loop HAS never evaluated (no verdict yet)
+        // reports the same `Some(false)`/`None` pair while genuinely disabled
+        // -- but once the config turns the gate on, a fresh `MainHealthState`
+        // reports "enabled, pending" (verdict_at still `None`), NOT "clear".
+        // This is the exact ambiguity the issue is about: `pending` and
+        // `disabled` both still allow dispatch, but they must not be
+        // confused with `clear` (verified green).
+        std::env::remove_var(crate::main_health_gate::MAIN_HEALTH_GATE_ENABLE_ENV);
+        std::fs::write(
+            root.join(".loom").join("config.json"),
+            r#"{"autonomous": {"mainHealthGate": {"enabled": true}}, "buildGate": {"enabled": true, "command": "true"}}"#,
+        )
+        .unwrap();
+        let report = build_daemon_status(&pool, &health, &root);
+        assert_eq!(
+            report.main_health_gate_enabled,
+            Some(true),
+            "config now enables the gate for this root"
+        );
+        assert_eq!(
+            report.main_health_gate_verdict_at, None,
+            "no gate run has completed yet -- must report pending, not clear"
+        );
+        assert!(!report.main_health_gate_halted, "pending must still read as dispatch-allowed");
 
         // Dispatch a sweep -> it should show up as in-flight (Running).
         {
@@ -2889,6 +2945,16 @@ exit 0
         assert!(!a.health_gate_halted, "repo A is green");
         assert_eq!(b.in_flight_count, 0, "repo B has no sweeps");
         assert!(b.health_gate_halted, "repo B is red, independently of A");
+        // Neither repo has a `.loom/config.json` buildGate block, so both
+        // resolve as effectively disabled (#4012) — independent of the raw
+        // halt flag test-injected directly on repo B above (`set_halted`
+        // bypasses the gate loop's own disabled soft-fail path, so this
+        // combination only arises in a test; the renderer must still prefer
+        // "halted" over "disabled" when both are true, see `main.rs`).
+        assert_eq!(a.health_gate_enabled, Some(false));
+        assert_eq!(b.health_gate_enabled, Some(false));
+        assert_eq!(a.health_gate_verdict_at, None);
+        assert_eq!(b.health_gate_verdict_at, None);
 
         std::env::remove_var(REGISTRY_PATH_ENV);
     }
