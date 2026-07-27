@@ -25,6 +25,97 @@ use tokio::net::{UnixListener, UnixStream};
 /// hung or unresponsive peer can never stall daemon startup.
 const LIVENESS_PROBE_TIMEOUT: Duration = Duration::from_millis(500);
 
+// ============================================================================
+// Shutdown-intent exit codes (Issue #4054 — supervised restart primitive)
+// ============================================================================
+// Under the macOS launchd `KeepAlive: { SuccessfulExit: true }` contract (see
+// `render_launchd_plist` in `loom-daemon-start.sh`), launchd relaunches the job
+// ONLY when it exits with status 0 ("successful"), and leaves it down on any
+// non-zero exit. The daemon therefore encodes *why* it is shutting down in its
+// exit code so exactly one path — the restart primitive — trips a relaunch:
+//
+//   | Cause                         | Exit code       | launchd action    |
+//   |-------------------------------|-----------------|-------------------|
+//   | RestartDaemon (this primitive)| 0  EXIT_RESTART | relaunch (wanted) |
+//   | SIGTERM (operator stop)       | 143 EXIT_SIGTERM| NO relaunch       |
+//   | SIGINT  (interactive Ctrl-C)  | 130 EXIT_SIGINT | NO relaunch       |
+//   | IPC Shutdown request          | 143 EXIT_SHUTDOWN| NO relaunch      |
+//   | crash / panic                 | non-zero        | NO relaunch       |
+//
+// This is Curator Finding 1's remedy: because a SIGTERM'd daemon now exits
+// non-zero, launchd never relaunches it during an operator stop, so "an operator
+// stop stays stopped" holds WITHOUT depending on `bootout` timing (the bootout
+// in `loom-daemon-stop.sh` is demoted to belt-and-braces). It also preserves the
+// pre-existing no-crash-loop semantics: a crashed daemon exits non-zero and is
+// not respawned, exactly as under the old `KeepAlive: false`.
+
+/// Exit code for the supervised restart primitive: the ONLY exit that trips a
+/// launchd `SuccessfulExit` relaunch.
+pub const EXIT_RESTART: i32 = 0;
+/// Exit code for a SIGTERM-driven operator stop (128 + SIGTERM 15). Non-zero so
+/// launchd does not relaunch.
+pub const EXIT_SIGTERM: i32 = 143;
+/// Exit code for an interactive SIGINT / Ctrl-C (128 + SIGINT 2). Non-zero so
+/// launchd does not relaunch.
+pub const EXIT_SIGINT: i32 = 130;
+/// Exit code for an explicit IPC `Shutdown` request. Non-zero — an explicit
+/// shutdown means "stay down", so launchd must not relaunch.
+pub const EXIT_SHUTDOWN: i32 = 143;
+
+/// Detect the daemon's process supervisor from the environment (#4054).
+///
+/// Returns `Some("launchd")` when `LOOM_DAEMON_SUPERVISOR=launchd`
+/// (case-insensitive) is present — a value `loom-daemon-start.sh` bakes into the
+/// launchd plist's `EnvironmentVariables`, so it survives a relaunch. Any other
+/// or absent value ⇒ `None` (the daemon is unsupervised: nohup / Linux /
+/// `--foreground`), and the restart primitive must refuse to end the process
+/// because nothing would bring it back.
+pub fn detect_supervisor() -> Option<String> {
+    match std::env::var("LOOM_DAEMON_SUPERVISOR") {
+        Ok(v) if v.eq_ignore_ascii_case("launchd") => Some("launchd".to_string()),
+        _ => None,
+    }
+}
+
+/// Decide how to answer a `RestartDaemon` request (Issue #4054): the `Response`
+/// to send back, plus whether the daemon should then end its own process (exit
+/// [`EXIT_RESTART`]) for a supervised relaunch.
+///
+/// The daemon ends itself ONLY when [`detect_supervisor`] proves it is
+/// supervised. On an unsupervised host it refuses, stays running, and returns a
+/// `DaemonRestart { scheduled: false, .. }` — degrading to "log loudly, leave
+/// the daemon running, do not restart" per #4017, because exiting with no
+/// supervisor to relaunch it would be strictly worse than the status quo.
+pub fn build_restart_decision() -> (Response, bool) {
+    match detect_supervisor() {
+        Some(sup) => (
+            Response::DaemonRestart {
+                scheduled: true,
+                supervisor: Some(sup.clone()),
+                message: format!(
+                    "restart scheduled: exiting 0 for a {sup}-supervised relaunch. \
+                     In-flight sweeps survive by design; the relaunched daemon re-reads \
+                     the same launchd plist, so it comes back with exactly its start flags."
+                ),
+            },
+            true,
+        ),
+        None => (
+            Response::DaemonRestart {
+                scheduled: false,
+                supervisor: None,
+                message: "refusing to restart: no supervisor detected \
+                    (LOOM_DAEMON_SUPERVISOR unset). This daemon was not started under \
+                    launchd (nohup / Linux / --foreground), so nothing would relaunch it \
+                    if it exited. Leaving it running. Restart it manually with \
+                    loom-daemon-stop.sh && loom-daemon-start.sh."
+                    .to_string(),
+            },
+            false,
+        ),
+    }
+}
+
 /// Returns `true` if a live `loom-daemon` is currently listening on
 /// `socket_path` and actively servicing requests.
 ///
@@ -275,6 +366,31 @@ async fn handle_client(
             let response_json = serde_json::to_string(&response)?;
             writer.write_all(response_json.as_bytes()).await?;
             writer.write_all(b"\n").await?;
+            continue;
+        }
+
+        // RestartDaemon (Issue #4054) is handled here rather than in the
+        // synchronous `handle_request` dispatcher so the supervised path can
+        // reply to the client and FLUSH before ending the process — the
+        // operator / Phase-3 caller gets a clean ack, then the daemon exits 0
+        // for a launchd `KeepAlive:SuccessfulExit` relaunch. On an unsupervised
+        // host it returns `DaemonRestart { scheduled: false }` and keeps running
+        // (do_exit == false). Mirrors the CancelSweep/DaemonStatus interception.
+        if let Request::RestartDaemon = request {
+            let (response, do_exit) = build_restart_decision();
+            let response_json = serde_json::to_string(&response)?;
+            writer.write_all(response_json.as_bytes()).await?;
+            writer.write_all(b"\n").await?;
+            writer.flush().await?;
+            if do_exit {
+                log::warn!(
+                    "RestartDaemon: supervised — exiting {EXIT_RESTART} for a launchd \
+                     KeepAlive:SuccessfulExit relaunch. In-flight sweeps survive by design; \
+                     the relaunched daemon re-reads the same plist (exactly its start flags). \
+                     The stale socket is reclaimed by the relaunched daemon's singleton guard."
+                );
+                std::process::exit(EXIT_RESTART);
+            }
             continue;
         }
 
@@ -1414,8 +1530,20 @@ fn handle_request(
         Request::RemoveWatch { id } => handle_remove_watch(&id),
 
         Request::Shutdown => {
-            log::info!("Shutdown requested");
-            std::process::exit(0);
+            // Exit NON-ZERO (Issue #4054): an explicit shutdown means "stay
+            // down", so under launchd `KeepAlive:SuccessfulExit` this must not
+            // trip a relaunch. Only `RestartDaemon` (handled in `handle_client`)
+            // exits 0. See the EXIT_* constants at the top of this module.
+            log::info!("Shutdown requested (exiting {EXIT_SHUTDOWN}; not a supervised relaunch)");
+            std::process::exit(EXIT_SHUTDOWN);
+        }
+        Request::RestartDaemon => {
+            // Structurally unreachable: `handle_client` intercepts
+            // `RestartDaemon` before dispatching to `handle_request` (it must
+            // reply-then-exit). Answer defensively in case of a future direct
+            // caller — do NOT exit here, only `handle_client` may end the
+            // process for a supervised relaunch.
+            build_restart_decision().0
         }
     }
 }
@@ -2717,6 +2845,122 @@ exit 0
             }
             other => panic!("Expected DaemonStatus, got: {other:?}"),
         }
+    }
+
+    // ===== Supervised restart primitive (Issue #4054) =====
+
+    /// `Request::RestartDaemon` / `Response::DaemonRestart` must survive a serde
+    /// round-trip over the wire (same pattern as the Ping/Pong + DaemonStatus
+    /// round-trips above).
+    #[test]
+    fn test_restart_daemon_request_response_round_trip() {
+        // Request: unit variant, `{"type":"RestartDaemon"}`.
+        let req = Request::RestartDaemon;
+        let json = serde_json::to_string(&req).expect("serialize request");
+        assert_eq!(json, r#"{"type":"RestartDaemon"}"#);
+        let back: Request = serde_json::from_str(&json).expect("deserialize request");
+        assert!(matches!(back, Request::RestartDaemon));
+
+        // Response (supervised / scheduled).
+        let resp = Response::DaemonRestart {
+            scheduled: true,
+            supervisor: Some("launchd".to_string()),
+            message: "restart scheduled".to_string(),
+        };
+        let json = serde_json::to_string(&resp).expect("serialize response");
+        let back: Response = serde_json::from_str(&json).expect("deserialize response");
+        match back {
+            Response::DaemonRestart {
+                scheduled,
+                supervisor,
+                message,
+            } => {
+                assert!(scheduled);
+                assert_eq!(supervisor.as_deref(), Some("launchd"));
+                assert_eq!(message, "restart scheduled");
+            }
+            other => panic!("Expected DaemonRestart, got: {other:?}"),
+        }
+
+        // Response (unsupervised / refused).
+        let resp = Response::DaemonRestart {
+            scheduled: false,
+            supervisor: None,
+            message: "refused".to_string(),
+        };
+        let json = serde_json::to_string(&resp).expect("serialize response");
+        let back: Response = serde_json::from_str(&json).expect("deserialize response");
+        match back {
+            Response::DaemonRestart {
+                scheduled,
+                supervisor,
+                ..
+            } => {
+                assert!(!scheduled);
+                assert!(supervisor.is_none());
+            }
+            other => panic!("Expected DaemonRestart, got: {other:?}"),
+        }
+    }
+
+    /// `build_restart_decision` ends the process (do_exit == true) ONLY when the
+    /// daemon proves it is launchd-supervised via `LOOM_DAEMON_SUPERVISOR`; an
+    /// unsupervised host refuses and stays running. Also pins the shutdown-intent
+    /// exit-code contract (#4054): only the restart primitive exits 0, so under
+    /// launchd `KeepAlive:SuccessfulExit` it is the only path that relaunches.
+    ///
+    /// NOTE: this is the sole test touching `LOOM_DAEMON_SUPERVISOR`, so the
+    /// env-var mutation cannot race another test reading it.
+    #[test]
+    fn test_build_restart_decision_supervisor_gated() {
+        // Exit-code contract: exactly one exit-0 path.
+        assert_eq!(EXIT_RESTART, 0, "restart is the only successful (relaunch) exit");
+        assert_ne!(EXIT_SIGTERM, 0, "SIGTERM stop must be non-zero (no relaunch)");
+        assert_ne!(EXIT_SIGINT, 0, "SIGINT/Ctrl-C must be non-zero (no relaunch)");
+        assert_ne!(EXIT_SHUTDOWN, 0, "explicit Shutdown must be non-zero (no relaunch)");
+
+        // Supervised: scheduled + do_exit.
+        std::env::set_var("LOOM_DAEMON_SUPERVISOR", "launchd");
+        assert_eq!(detect_supervisor().as_deref(), Some("launchd"));
+        let (resp, do_exit) = build_restart_decision();
+        assert!(do_exit, "supervised daemon must end its process for a relaunch");
+        match resp {
+            Response::DaemonRestart {
+                scheduled,
+                supervisor,
+                ..
+            } => {
+                assert!(scheduled);
+                assert_eq!(supervisor.as_deref(), Some("launchd"));
+            }
+            other => panic!("Expected DaemonRestart, got: {other:?}"),
+        }
+
+        // Case-insensitive acceptance.
+        std::env::set_var("LOOM_DAEMON_SUPERVISOR", "LaunchD");
+        assert_eq!(detect_supervisor().as_deref(), Some("launchd"));
+
+        // Unsupervised (var unset): refuse, keep running.
+        std::env::remove_var("LOOM_DAEMON_SUPERVISOR");
+        assert!(detect_supervisor().is_none());
+        let (resp, do_exit) = build_restart_decision();
+        assert!(!do_exit, "unsupervised daemon must NOT exit — nothing would relaunch it");
+        match resp {
+            Response::DaemonRestart {
+                scheduled,
+                supervisor,
+                ..
+            } => {
+                assert!(!scheduled);
+                assert!(supervisor.is_none());
+            }
+            other => panic!("Expected DaemonRestart, got: {other:?}"),
+        }
+
+        // An unrelated value is also unsupervised.
+        std::env::set_var("LOOM_DAEMON_SUPERVISOR", "systemd");
+        assert!(detect_supervisor().is_none());
+        std::env::remove_var("LOOM_DAEMON_SUPERVISOR");
     }
 
     /// A pre-#3902 `DaemonStatus` JSON payload (no `capacity` field, no

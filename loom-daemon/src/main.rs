@@ -180,6 +180,16 @@ enum Commands {
         action: WatchAction,
     },
 
+    /// Deliberately restart the running daemon (Issue #4054 — the supervised
+    /// restart primitive). Sends a `RestartDaemon` request over the Unix socket;
+    /// when the daemon is supervised by launchd it exits 0 for a clean
+    /// `KeepAlive:SuccessfulExit` relaunch (a new pid, exactly its start flags,
+    /// in-flight sweeps preserved). On an unsupervised host (nohup / Linux /
+    /// `--foreground`) the daemon refuses and stays running, and this command
+    /// prints the refusal and exits non-zero. This is the primitive #4017 Phase
+    /// 3 will call after a rebuild — it does nothing on its own.
+    Restart,
+
     /// Validate role configuration completeness
     Validate {
         /// Workspace directory containing .loom/config.json
@@ -329,6 +339,9 @@ async fn main() -> Result<()> {
             // `watch` connects to the running daemon over its Unix socket to
             // register/list/remove durable watches (Issue #3971).
             Commands::Watch { action } => handle_watch_command(action).await,
+            // `restart` connects to the running daemon over its Unix socket to
+            // trigger the supervised restart primitive (Issue #4054).
+            Commands::Restart => handle_restart_command().await,
             other => handle_cli_command(other),
         };
     }
@@ -872,8 +885,18 @@ async fn main() -> Result<()> {
             flag.store(true, std::sync::atomic::Ordering::Relaxed);
         }
         let _ = tokio::fs::remove_file(&socket_path_clone).await;
-        log::info!("Socket cleaned up, exiting");
-        std::process::exit(0);
+        // Exit code carries shutdown intent (Issue #4054, Curator Finding 1):
+        // under launchd `KeepAlive:SuccessfulExit` a clean exit(0) triggers a
+        // relaunch, so a signal-driven stop MUST exit non-zero — otherwise an
+        // operator stop would race launchd into relaunching the daemon. Only the
+        // `RestartDaemon` primitive exits 0. SIGTERM => 143, SIGINT => 130.
+        let code = if signal_name == "SIGTERM" {
+            loom_daemon::ipc::EXIT_SIGTERM
+        } else {
+            loom_daemon::ipc::EXIT_SIGINT
+        };
+        log::info!("Socket cleaned up, exiting {code} (operator stop — no supervised relaunch)");
+        std::process::exit(code);
     });
 
     log::info!("Loom daemon starting...");
@@ -1117,6 +1140,11 @@ fn handle_cli_command(command: Commands) -> Result<()> {
             // Routed directly in `main()` (it needs the async runtime for the
             // socket round-trip), never dispatched through this sync handler.
             unreachable!("Watch is handled in main() before handle_cli_command")
+        }
+        Commands::Restart => {
+            // Routed directly in `main()` (it needs the async runtime for the
+            // socket round-trip), never dispatched through this sync handler.
+            unreachable!("Restart is handled in main() before handle_cli_command")
         }
         Commands::Init {
             workspace,
@@ -1389,6 +1417,54 @@ async fn handle_quarantine_command(action: QuarantineAction) -> Result<()> {
                     std::process::exit(1);
                 }
             }
+        }
+    }
+}
+
+/// Handle the `restart` subcommand (Issue #4054 — the supervised restart
+/// primitive). Connects to the running daemon over its Unix socket and sends a
+/// single `RestartDaemon` request.
+///
+/// When the daemon is supervised (launchd) it replies `DaemonRestart {
+/// scheduled: true }` and then exits 0 for a `KeepAlive:SuccessfulExit`
+/// relaunch — we print the ack and exit 0. When it is unsupervised (nohup /
+/// Linux / `--foreground`) it replies `DaemonRestart { scheduled: false }` and
+/// keeps running — we print the refusal and exit non-zero, so an operator or
+/// Phase 3 can detect that no restart happened rather than assuming it did.
+async fn handle_restart_command() -> Result<()> {
+    let socket_path = resolve_socket_path()?;
+    match query_daemon(&socket_path, &Request::RestartDaemon).await {
+        Ok(Response::DaemonRestart {
+            scheduled,
+            supervisor,
+            message,
+        }) => {
+            if scheduled {
+                println!(
+                    "loom-daemon restart scheduled (supervisor: {}).",
+                    supervisor.as_deref().unwrap_or("unknown")
+                );
+                println!("{message}");
+                Ok(())
+            } else {
+                eprintln!("loom-daemon did NOT restart: {message}");
+                std::process::exit(1);
+            }
+        }
+        Ok(Response::Error { message }) => {
+            eprintln!("Daemon error: {message}");
+            std::process::exit(1);
+        }
+        Ok(other) => {
+            eprintln!("Unexpected response from daemon: {other:?}");
+            std::process::exit(1);
+        }
+        Err(e) => {
+            eprintln!("Could not reach loom-daemon at {}: {e}", socket_path.display());
+            eprintln!();
+            eprintln!("Is the daemon running? Start it with:");
+            eprintln!("  ./.loom/scripts/cli/loom-daemon-start.sh");
+            std::process::exit(1);
         }
     }
 }

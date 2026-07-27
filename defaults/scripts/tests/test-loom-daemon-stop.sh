@@ -118,6 +118,63 @@ else
     echo -e "${RED}✗${NC} --help documents the launchd bootout counterpart"
 fi
 
+# 5. The bootout path is unchanged (#4054 must not remove it — it stays as
+#    belt-and-braces alongside the new exit-code-carries-intent contract).
+TESTS_RUN=$((TESTS_RUN + 1))
+if grep -q 'launchctl bootout' "$STOP_SCRIPT" && grep -q 'launchd_bootout_if_loaded' "$STOP_SCRIPT"; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} bootout path unchanged (launchd_bootout_if_loaded + launchctl bootout still present)"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} bootout path unchanged (launchd_bootout_if_loaded + launchctl bootout still present)"
+fi
+
+# 6. Stop must NOT report success while a daemon is still alive (#4054): if the
+#    launchd job for the label remains loaded with a live pid after the stop (a
+#    bootout that did not stick — the inverted-#4011 silent-success hole), the
+#    script exits non-zero. Darwin-only: `launchd_job_loaded` short-circuits on
+#    non-Darwin, so the relaunch-detection branch cannot run there.
+if [[ "$(uname -s)" == "Darwin" ]]; then
+    FAKE_BIN_DIR="$WORKDIR/fakebin"
+    mkdir -p "$FAKE_BIN_DIR"
+    # Fake launchctl: reports the job as loaded and names the "relaunched"
+    # daemon's pid, and treats bootout as a no-op (simulating a bootout that
+    # failed to stop the relaunched instance).
+    cat > "$FAKE_BIN_DIR/launchctl" <<'FAKE'
+#!/usr/bin/env bash
+case "$1" in
+  print)   printf '\tpid = %s\n' "${RELAUNCH_PID:-0}"; exit 0 ;;
+  bootout) exit 0 ;;
+  *)       exit 0 ;;
+esac
+FAKE
+    chmod +x "$FAKE_BIN_DIR/launchctl"
+
+    # Original daemon (killed by the stop) + a separate live "relaunched" daemon.
+    ( sleep 30 & echo $! > "$SLEEP_PID_FILE" )
+    orig_pid=$(cat "$SLEEP_PID_FILE")
+    sleep 30 &
+    relaunch_pid=$!
+
+    stuck_out=$( cd "$WORKDIR" && PATH="$FAKE_BIN_DIR:$PATH" RELAUNCH_PID="$relaunch_pid" \
+        LOOM_LAUNCHD_LABEL="$FAKE_LABEL" LOOM_DAEMON_STOP_GRACE_SECS=2 bash "$STOP_SCRIPT" 2>&1 )
+    stuck_rc=$?
+
+    assert_eq "1" "$stuck_rc" "relaunched-daemon-still-alive: stop exits non-zero (does not report success)"
+    TESTS_RUN=$((TESTS_RUN + 1))
+    if echo "$stuck_out" | grep -qi 'still alive'; then
+        TESTS_PASSED=$((TESTS_PASSED + 1))
+        echo -e "${GREEN}✓${NC} relaunched-daemon-still-alive: reports the live daemon instead of success"
+    else
+        TESTS_FAILED=$((TESTS_FAILED + 1))
+        echo -e "${RED}✗${NC} relaunched-daemon-still-alive: reports the live daemon instead of success"
+    fi
+
+    kill -9 "$orig_pid" "$relaunch_pid" 2>/dev/null || true
+else
+    echo "  (skipping relaunch-detection test — not Darwin)"
+fi
+
 # ---------- summary ----------
 echo
 echo "Ran $TESTS_RUN tests: $TESTS_PASSED passed, $TESTS_FAILED failed"

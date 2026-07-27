@@ -25,9 +25,20 @@
 # RunAtLoad=true (mirroring the validated incident-fix plist), so leaving the
 # definition loaded would silently relaunch the daemon at the next login/boot
 # even though the operator explicitly stopped it. The pid-kill sequence itself
-# is unchanged (SIGTERM -> grace -> SIGKILL, sent directly to the resolved
-# pid) — launchd does not auto-respawn on a plain exit (KeepAlive=false), so
-# killing the process first is always safe.
+# is unchanged (SIGTERM -> grace -> SIGKILL, sent directly to the resolved pid).
+#
+# Interaction with the supervised restart primitive (#4054): the plist now uses
+# KeepAlive:{SuccessfulExit:true}, so launchd relaunches the daemon on a clean
+# exit 0. But the daemon exits NON-ZERO on SIGTERM (143) and SIGINT (130), so an
+# operator stop is NOT a "successful" exit and launchd does not relaunch it -- the
+# "operator stop stays stopped" guarantee holds WITHOUT depending on bootout
+# timing (Curator Finding 1). SIGKILL (--force) likewise terminates the job by
+# signal, never a clean exit, so it is not respawned either. The bootout below is
+# therefore belt-and-braces (it still unloads the definition so it does not come
+# back at the next login). After the stop this script re-verifies that no daemon
+# for THIS launchd label is still alive and exits non-zero if one is -- closing
+# the inverted-#4011 silent-success hole where a failed bootout could leave a
+# relaunched daemon dispatching while the script reported success.
 #
 # Usage:
 #   ./.loom/scripts/cli/loom-daemon-stop.sh            Graceful stop (SIGTERM -> SIGKILL)
@@ -173,6 +184,25 @@ fi
 # confirmed dead -- RunAtLoad=true on the generated plist means leaving it
 # loaded would silently relaunch the daemon at the next login/boot.
 launchd_bootout_if_loaded
+
+# Post-stop verification (#4054): assert no daemon for THIS launchd label is
+# still alive, rather than trusting that killing the original pid was enough.
+# Under KeepAlive:SuccessfulExit a relaunched daemon carries a DIFFERENT pid than
+# the one we killed, so re-testing the original pid alone would miss it. A
+# still-loaded job with a live pid means the bootout did not stick (the
+# inverted-#4011 silent-success hole) -- fail loudly instead of reporting
+# success. Scoped to this label (not a global `pgrep loom-daemon`) so a test
+# daemon under a non-default LOOM_LAUNCHD_LABEL never false-positives against a
+# separate production daemon, and vice versa.
+if launchd_job_loaded; then
+    relaunched_pid=$(launchd_job_pid)
+    if [[ -n "$relaunched_pid" ]] && kill -0 "$relaunched_pid" 2>/dev/null; then
+        err "loom-daemon is still alive (pid $relaunched_pid) under $LAUNCHD_SERVICE after stop."
+        err "The launchd bootout did not stick — the daemon may still be dispatching."
+        err "Retry the stop, or bootout manually: launchctl bootout $LAUNCHD_SERVICE"
+        exit 1
+    fi
+fi
 
 rm -f "$PID_FILE"
 ok "loom-daemon stopped (pid $pid)."
