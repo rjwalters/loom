@@ -50,6 +50,18 @@ An Architecture Decision Record captures an important architectural decision mad
   - **Summary**: Delete `loom_tools/shepherd/` (~16.8k LOC) and `loom_tools/daemon_v2/` (~4.7k LOC); replace with spawn loop + GitHub Actions cron + `/loom:sweep`
   - **Key Decision**: Forge-as-state-machine + stateless components over persistent Python orchestration brain
 
+- [ADR-0010: Rebuild Daemon Mode as Rust Binary with MCP-Tool Surface (v0.10.0)](0010-daemon-rebuild.md)
+  - **Status**: Accepted
+  - **Summary**: Extend the existing Rust `loom-daemon` binary with named sweep dispatch, a pub/sub event bus, and MCP monitoring tools instead of restoring the deleted Python brain
+  - **Key Decision**: MCP-tool surface on the existing daemon binary over a restored Python brain or a shell-level `daemon.sh` wrapper
+
+### CI Infrastructure
+
+- [ADR-0011: CI Runner Platform — Speedup Ceiling and Decision](0011-ci-runner-platform.md)
+  - **Status**: Accepted
+  - **Summary**: Measured that compile is only ~10% of `ci.yml`'s critical path while one serial-locked `loom-daemon` test binary is ~67%, and that its ~127s serial-lock floor is not reducible by adding cores
+  - **Key Decision**: Reject new CI hardware on speed grounds alone; default to Graviton (arch parity) if a runner is ever provisioned (#4057) while treating full macOS parity as a separate, independently-costed decision; prioritize de-serializing `#[serial]` tests over buying cores
+
 ## Creating a New ADR
 
 When making a significant architectural decision:
