@@ -1633,6 +1633,15 @@ exit 0
     #[test]
     #[serial]
     fn test_registry_dispatcher_exports_claim_ownership_marker() {
+        // Issue #4044: mirrors `sweep_registry::tests::FIXTURE_CHILD_WAIT_MS`
+        // (that const is private to `sweep_registry`'s test module, so it
+        // can't be reused here directly). A short fixed poll bound falsely
+        // reddens this test under host exec-latency pressure (syspolicyd,
+        // AV scanners delaying the spawned child's launch) — the bound is a
+        // ceiling on a healthy-host-cheap poll, not a promptness assertion,
+        // so widening it is free.
+        const FIXTURE_CHILD_WAIT_MS: u128 = 120_000;
+
         let (mut dispatcher, _dir, record_log) = setup_registry_dispatcher_in_tempdir();
 
         let was_new = dispatcher.dispatch(3964).expect("dispatch should succeed");
@@ -1640,7 +1649,7 @@ exit 0
 
         let start = std::time::Instant::now();
         let mut recorded = String::new();
-        while start.elapsed().as_millis() < 5000 {
+        while start.elapsed().as_millis() < FIXTURE_CHILD_WAIT_MS {
             if let Ok(s) = std::fs::read_to_string(&record_log) {
                 if s.contains("LOOM_SWEEP_CLAIM_OWNED=") {
                     recorded = s;

@@ -4199,6 +4199,26 @@ exit 0
         false
     }
 
+    /// Wait (up to `FIXTURE_CHILD_WAIT_MS`, #4044) for the fixture's fake
+    /// `spawn-claude.sh` to write `needle` into `record_log`, then return the
+    /// file's full contents for the caller's own content assertions.
+    ///
+    /// Panics with a message that distinguishes "the child never started /
+    /// never wrote anything" from "the child started but wrote the wrong
+    /// thing" — the third acceptance criterion of #4044 — rather than the
+    /// old bare "did not finish writing within 10s".
+    fn assert_child_wrote(record_log: &Path, needle: &str) -> String {
+        let wrote = wait_for_contents(record_log, needle, FIXTURE_CHILD_WAIT_MS);
+        let recorded = std::fs::read_to_string(record_log).unwrap_or_default();
+        assert!(
+            wrote,
+            "fake spawn-claude.sh did not write expected contents within {}ms\n  needle: {needle}\n  record_log exists: {}\n  record_log contents: {recorded}",
+            FIXTURE_CHILD_WAIT_MS,
+            record_log.exists(),
+        );
+        recorded
+    }
+
     /// Poll `.loom/scripts/spawn-claude.sh` fixture installation: write a
     /// custom script body + exec bit into `workspace` and return a registry
     /// configured to spawn it. Used by the child-process-lifecycle tests
@@ -4286,19 +4306,7 @@ exit 0
         // the final line (LOOM_TERMINAL_ID) so the assertion isn't racing
         // mid-write.
         let needle = format!("LOOM_TERMINAL_ID=daemon-{}", outcome.sweep_id);
-        let sweep_log = dir
-            .path()
-            .join(".loom")
-            .join("logs")
-            .join("sweep-issue-42.log");
-        assert!(
-            wait_for_contents(&record_log, &needle, 10000),
-            "fake spawn-claude.sh did not finish writing within 10s\n  record_log: {}\n  record_log exists: {}\n  sweep_log: {}",
-            std::fs::read_to_string(&record_log).unwrap_or_default(),
-            record_log.exists(),
-            std::fs::read_to_string(&sweep_log).unwrap_or_default(),
-        );
-        let recorded = std::fs::read_to_string(&record_log).unwrap();
+        let recorded = assert_child_wrote(&record_log, &needle);
         assert!(
             recorded.contains("argv: -p /loom:sweep 42"),
             "expected argv in recorded log; got: {recorded}"
@@ -4398,11 +4406,7 @@ exit 0
             .expect("dispatch should succeed");
 
         let needle = format!("LOOM_TERMINAL_ID=daemon-{}", outcome.sweep_id);
-        assert!(
-            wait_for_contents(&record_log, &needle, 10000),
-            "fake spawn-claude.sh did not finish writing within 10s"
-        );
-        let recorded = std::fs::read_to_string(&record_log).unwrap();
+        let recorded = assert_child_wrote(&record_log, &needle);
         assert!(
             recorded.contains("argv: -p /loom:sweep 4242 --dangerously-skip-permissions"),
             "expected --dangerously-skip-permissions appended after the prompt; got: {recorded}"
@@ -4425,11 +4429,7 @@ exit 0
             .expect("dispatch should succeed");
 
         let needle = format!("LOOM_TERMINAL_ID=daemon-{}", outcome.sweep_id);
-        assert!(
-            wait_for_contents(&record_log, &needle, 10000),
-            "fake spawn-claude.sh did not finish writing within 10s"
-        );
-        let recorded = std::fs::read_to_string(&record_log).unwrap();
+        let recorded = assert_child_wrote(&record_log, &needle);
         assert!(
             recorded.contains("LOOM_SWEEP_CLAIM_OWNED=4243"),
             "expected claim-ownership marker for issue 4243; got: {recorded}"
@@ -4453,11 +4453,7 @@ exit 0
             .expect("dispatch should succeed");
 
         let needle = format!("LOOM_TERMINAL_ID=daemon-{}", outcome.sweep_id);
-        assert!(
-            wait_for_contents(&record_log, &needle, 10000),
-            "fake spawn-claude.sh did not finish writing within 10s"
-        );
-        let recorded = std::fs::read_to_string(&record_log).unwrap();
+        let recorded = assert_child_wrote(&record_log, &needle);
         assert!(
             recorded.contains("CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS=0"),
             "expected print-mode bg-wait ceiling disabled (=0); got: {recorded}"
@@ -4556,11 +4552,7 @@ exit 0
             .expect("dispatch should succeed");
 
         let needle = format!("LOOM_TERMINAL_ID=daemon-{}", outcome.sweep_id);
-        assert!(
-            wait_for_contents(&record_log, &needle, 10000),
-            "fake spawn-claude.sh did not finish writing within 10s"
-        );
-        let recorded = std::fs::read_to_string(&record_log).unwrap();
+        let recorded = assert_child_wrote(&record_log, &needle);
         assert!(
             recorded.contains("argv: -p /loom:sweep 43 --model claude-sonnet-4-6"),
             "expected --model in argv; got: {recorded}"
@@ -4588,11 +4580,7 @@ exit 0
             .expect("dispatch should succeed");
 
         let needle = format!("LOOM_TERMINAL_ID=daemon-{}", outcome.sweep_id);
-        assert!(
-            wait_for_contents(&record_log, &needle, 10000),
-            "fake spawn-claude.sh did not finish writing within 10s"
-        );
-        let recorded = std::fs::read_to_string(&record_log).unwrap();
+        let recorded = assert_child_wrote(&record_log, &needle);
         assert!(
             !recorded.contains("--model"),
             "empty model must not emit --model; got: {recorded}"
@@ -4881,11 +4869,7 @@ exit 0
             .expect("dispatch should succeed");
 
         let needle = format!("LOOM_TERMINAL_ID=daemon-{}", outcome.sweep_id);
-        assert!(
-            wait_for_contents(&record_log, &needle, 10000),
-            "fake spawn-claude.sh did not finish writing within 10s"
-        );
-        let recorded = std::fs::read_to_string(&record_log).unwrap();
+        let recorded = assert_child_wrote(&record_log, &needle);
         assert!(
             recorded.contains("argv: -p /loom:sweep 45 --effort xhigh"),
             "expected --effort in argv; got: {recorded}"
@@ -4912,11 +4896,7 @@ exit 0
             .expect("dispatch should succeed");
 
         let needle = format!("LOOM_TERMINAL_ID=daemon-{}", outcome.sweep_id);
-        assert!(
-            wait_for_contents(&record_log, &needle, 10000),
-            "fake spawn-claude.sh did not finish writing within 10s"
-        );
-        let recorded = std::fs::read_to_string(&record_log).unwrap();
+        let recorded = assert_child_wrote(&record_log, &needle);
         assert!(
             recorded.contains("argv: -p /loom:sweep 46 --model claude-sonnet-4-6 --effort xhigh"),
             "expected --model then --effort in argv; got: {recorded}"
@@ -4939,11 +4919,7 @@ exit 0
             .expect("dispatch should succeed");
 
         let needle = format!("LOOM_TERMINAL_ID=daemon-{}", outcome.sweep_id);
-        assert!(
-            wait_for_contents(&record_log, &needle, 10000),
-            "fake spawn-claude.sh did not finish writing within 10s"
-        );
-        let recorded = std::fs::read_to_string(&record_log).unwrap();
+        let recorded = assert_child_wrote(&record_log, &needle);
         assert!(
             !recorded.contains("--effort"),
             "empty effort must not emit --effort; got: {recorded}"
@@ -4971,11 +4947,7 @@ exit 0
             .expect("dispatch should succeed");
 
         let needle = format!("LOOM_TERMINAL_ID=daemon-{}", outcome.sweep_id);
-        assert!(
-            wait_for_contents(&record_log, &needle, 10000),
-            "fake spawn-claude.sh did not finish writing within 10s"
-        );
-        let recorded = std::fs::read_to_string(&record_log).unwrap();
+        let recorded = assert_child_wrote(&record_log, &needle);
         assert!(
             recorded.contains("argv: -p /loom:sweep 50 --depends-on 49"),
             "expected --depends-on in argv; got: {recorded}"
@@ -5000,11 +4972,7 @@ exit 0
             .expect("dispatch should succeed");
 
         let needle = format!("LOOM_TERMINAL_ID=daemon-{}", outcome.sweep_id);
-        assert!(
-            wait_for_contents(&record_log, &needle, 10000),
-            "fake spawn-claude.sh did not finish writing within 10s"
-        );
-        let recorded = std::fs::read_to_string(&record_log).unwrap();
+        let recorded = assert_child_wrote(&record_log, &needle);
         assert!(
             !recorded.contains("--depends-on"),
             "depends_on=None must not emit --depends-on; got: {recorded}"
@@ -5152,11 +5120,7 @@ exit 0
         std::env::remove_var("LOOM_TRANSCRIPT_ARCHIVE");
 
         let needle = format!("LOOM_TERMINAL_ID=daemon-{}", outcome.sweep_id);
-        assert!(
-            wait_for_contents(&record_log, &needle, 10000),
-            "fake spawn-claude.sh did not finish writing within 10s"
-        );
-        let recorded = std::fs::read_to_string(&record_log).unwrap();
+        let recorded = assert_child_wrote(&record_log, &needle);
         assert!(
             recorded.contains("LOOM_MODEL_EXPERIMENT=canary"),
             "expected LOOM_MODEL_EXPERIMENT forwarded to child; got: {recorded}"
@@ -5198,11 +5162,7 @@ exit 0
             .expect("dispatch should succeed");
 
         let needle = format!("LOOM_TERMINAL_ID=daemon-{}", outcome.sweep_id);
-        assert!(
-            wait_for_contents(&record_log, &needle, 10000),
-            "fake spawn-claude.sh did not finish writing within 10s"
-        );
-        let recorded = std::fs::read_to_string(&record_log).unwrap();
+        let recorded = assert_child_wrote(&record_log, &needle);
         // The fixture prints `<VAR>=unset` when the child sees the var unset.
         assert!(
             recorded.contains("LOOM_MODEL_EXPERIMENT=unset"),
@@ -6465,12 +6425,7 @@ exit 0
         assert!(outcome.was_new);
 
         let needle = format!("CLAUDE_CODE_OAUTH_TOKEN={token_value}");
-        assert!(
-            wait_for_contents(&record_log, &needle, 10000),
-            "fake spawn did not record OAuth token within 10s; got: {}",
-            std::fs::read_to_string(&record_log).unwrap_or_default()
-        );
-        let recorded = std::fs::read_to_string(&record_log).unwrap();
+        let recorded = assert_child_wrote(&record_log, &needle);
         assert!(
             recorded.contains(".loom/tokens/agent-1.token"),
             "expected TOKEN_SOURCE to point at .loom/tokens/; got: {recorded}"
@@ -7173,7 +7128,8 @@ exit 0\n";
         let leader_pid = outcome.pid;
         let sweep_id = outcome.sweep_id.clone();
 
-        let gc_pid = read_pid_file(&gc_pidfile, 5000).expect("grandchild pid should be recorded");
+        let gc_pid = read_pid_file(&gc_pidfile, FIXTURE_CHILD_WAIT_MS)
+            .expect("grandchild pid should be recorded");
         assert!(is_pid_alive(leader_pid), "leader should be running post-dispatch");
         assert!(is_pid_alive(gc_pid), "grandchild should be running post-dispatch");
         assert_ne!(leader_pid, gc_pid);
@@ -7188,9 +7144,12 @@ exit 0\n";
         // The ENTIRE tree must be gone. The grandchild assertion is the crux:
         // it proves the signal reached the whole process group (#3800), not
         // just the tracked leader PID.
-        assert!(wait_until_dead(leader_pid, 3000), "leader still alive after cancel");
         assert!(
-            wait_until_dead(gc_pid, 3000),
+            wait_until_dead(leader_pid, FIXTURE_CHILD_WAIT_MS),
+            "leader still alive after cancel"
+        );
+        assert!(
+            wait_until_dead(gc_pid, FIXTURE_CHILD_WAIT_MS),
             "grandchild survived cancel — group-kill did not reach it (single-PID regression)"
         );
 
@@ -7219,7 +7178,7 @@ exit 0\n";
         let sweep_id = outcome.sweep_id.clone();
 
         // Let the child start.
-        assert!(wait_until_alive(pid, 3000), "child should have started");
+        assert!(wait_until_alive(pid, FIXTURE_CHILD_WAIT_MS), "child should have started");
         assert!(matches!(registry.get(&sweep_id).unwrap().state, SweepState::Running));
 
         // Kill out of band: SIGKILL the leader PID directly (mimics an
@@ -7249,7 +7208,7 @@ exit 0\n";
         // No zombie: because try_wait() reaped the child, kill(pid, 0) now
         // fails (the PID is no longer in the process table).
         assert!(
-            wait_until_dead(pid, 2000),
+            wait_until_dead(pid, FIXTURE_CHILD_WAIT_MS),
             "killed child left a <defunct> zombie — reaper did not wait() it"
         );
     }
@@ -7275,10 +7234,25 @@ exit 0\n";
             .expect("dispatch should succeed");
         let sweep_id = outcome.sweep_id.clone();
 
-        // Reap-on-read reconciles liveness via the retained handle's
-        // `try_wait()`. Bound the loop to ~2s to prove "prompt" — a healthy
-        // implementation transitions on the first reconcile once the child has
-        // exited (`try_wait` reaps the zombie and yields the exit status).
+        // Phase 1 (#4044): wait generously for the fixture child to actually
+        // exit. Under host exec-latency pressure (syspolicyd, AV scanners),
+        // launching the child and running it to `exit 0` can itself take far
+        // longer than the promptness bound below — that latency is a host
+        // condition, not the property under test, so it gets the same
+        // generous ceiling as every other fixture-child wait.
+        assert!(
+            wait_until_dead(outcome.pid, FIXTURE_CHILD_WAIT_MS),
+            "fixture child did not exit within the wait budget"
+        );
+
+        // Phase 2: reap-on-read reconciles liveness via the retained handle's
+        // `try_wait()`. Bound THIS loop to ~2s to prove "prompt" — a healthy
+        // implementation transitions on the first reconcile once the child is
+        // confirmed dead (`try_wait` reaps the zombie and yields the exit
+        // status). Because Phase 1 already confirmed death, this bound now
+        // measures reap promptness from confirmed death, not from dispatch —
+        // it can no longer be falsely reddened by the child's own launch
+        // latency.
         let mut still_running = true;
         for _ in 0..80 {
             registry.reap_liveness();
@@ -7397,8 +7371,14 @@ exit 0\n";
             .expect("dispatch should succeed");
         let sweep_id = outcome.sweep_id.clone();
 
-        // Ensure the child has actually exited before we reap-on-read.
-        assert!(wait_until_dead(outcome.pid, 5000), "fake spawn child should exit promptly");
+        // Ensure the child has actually exited before we reap-on-read. This
+        // gate is generous (#4044) — it is not part of the bounded-gh
+        // property under test below, which starts timing only after this
+        // point.
+        assert!(
+            wait_until_dead(outcome.pid, FIXTURE_CHILD_WAIT_MS),
+            "fake spawn child did not exit within the wait budget"
+        );
 
         // The read-path reap must return well under the ~15-minute hang. It
         // kills the wedged gh at the 1s bound; generous headroom covers poll
@@ -7954,7 +7934,10 @@ exit 0\n";
         let out = reg
             .dispatch(&SweepKind::Issue(4242), None, None, None, None)
             .unwrap();
-        assert!(wait_until_alive(out.pid, 5000), "hung fixture child should start");
+        assert!(
+            wait_until_alive(out.pid, FIXTURE_CHILD_WAIT_MS),
+            "hung fixture child should start"
+        );
         let first_id = out.sweep_id.clone();
 
         // 2. Healthy while inside the timeout window.
@@ -8003,7 +7986,7 @@ exit 0\n";
         let out = reg
             .dispatch(&SweepKind::Issue(4343), None, None, None, None)
             .unwrap();
-        assert!(wait_until_alive(out.pid, 5000));
+        assert!(wait_until_alive(out.pid, FIXTURE_CHILD_WAIT_MS));
 
         // Simulate progress: create a worktree for the issue.
         let wt = ws.join(".loom").join("worktrees").join("issue-4343");
@@ -8348,7 +8331,7 @@ exit 0\n";
         let out = reg
             .dispatch(&SweepKind::Issue(5150), None, None, None, None)
             .unwrap();
-        assert!(wait_until_alive(out.pid, 5000));
+        assert!(wait_until_alive(out.pid, FIXTURE_CHILD_WAIT_MS));
 
         // No worktree/checkpoint yet ⇒ NOT past startup ⇒ the review-stall
         // watchdog leaves it entirely to the #3887 startup watchdog, even with a
@@ -8371,7 +8354,7 @@ exit 0\n";
         let out = reg
             .dispatch(&SweepKind::Issue(5252), None, None, None, None)
             .unwrap();
-        assert!(wait_until_alive(out.pid, 5000), "fixture child should start");
+        assert!(wait_until_alive(out.pid, FIXTURE_CHILD_WAIT_MS), "fixture child should start");
         let wt = ws.join(".loom").join("worktrees").join("issue-5252");
         std::fs::create_dir_all(&wt).unwrap();
 
