@@ -31,14 +31,14 @@ Loom decomposes development into three coordination tiers, with the forge (GitHu
 | Tier 3 | Human | Oversight — approve proposals, handle edge cases | Observer |
 | Tier 2 | `loom-daemon` (MCP) + GH Actions cron | Multi-issue dispatch + scheduled support roles | Continuous / cron |
 | Tier 1 | `/loom:sweep <issue>` | Single-issue lifecycle (Curator → Merge) | Per-issue |
-| Tier 0 | `/builder`, `/judge`, etc. | Task execution — single focused work units | Per-task |
+| Tier 0 | `/loom:builder`, `/loom:judge`, etc. | Task execution — single focused work units | Per-task |
 
 ## Usage Modes
 
 ### 1. Manual Orchestration Mode (MOM)
 
-Open Claude Code in this repo and use slash commands (`/builder`, `/judge`,
-`/curator`, …) — each terminal acts as a specialized agent.
+Open Claude Code in this repo and use slash commands (`/loom:builder`,
+`/loom:judge`, `/loom:curator`, …) — each terminal acts as a specialized agent.
 
 ### 2. Single-issue lifecycle: `/loom:sweep <issue>`
 

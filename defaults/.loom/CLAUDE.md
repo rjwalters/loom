@@ -23,7 +23,7 @@ Use Claude Code terminals with specialized roles for hands-on development coordi
 
 **Setup**:
 1. Open Claude Code in this repository
-2. Use slash commands to assume roles: `/builder`, `/judge`, `/curator`, etc.
+2. Use slash commands to assume roles: `/loom:builder`, `/loom:judge`, `/loom:curator`, etc.
 3. Each terminal acts as a specialized agent following role guidelines
 
 **When to use MOM**:

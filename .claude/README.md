@@ -101,21 +101,21 @@ The `commands/` directory contains slash commands that invoke Loom roles. Each c
 
 | Command | Role | Purpose |
 |---------|------|---------|
-| `/builder` | Builder | Implements features for `loom:issue` issues and creates PRs |
-| `/judge` | Judge | Reviews PRs with `loom:review-requested` label |
-| `/curator` | Curator | Enhances issues and marks them as `loom:curated` |
-| `/architect` | Architect | Creates architectural proposals with `loom:architect` |
-| `/hermit` | Hermit | Identifies bloat and creates simplification issues |
-| `/doctor` | Doctor | Addresses PR feedback and resolves conflicts |
-| `/guide` | Guide | Triages issues and applies `loom:urgent` to top 3 |
-| `/champion` | Champion | Auto-merges approved PRs with `loom:pr` label |
+| `/loom:builder` | Builder | Implements features for `loom:issue` issues and creates PRs |
+| `/loom:judge` | Judge | Reviews PRs with `loom:review-requested` label |
+| `/loom:curator` | Curator | Enhances issues and marks them as `loom:curated` |
+| `/loom:architect` | Architect | Creates architectural proposals with `loom:architect` |
+| `/loom:hermit` | Hermit | Identifies bloat and creates simplification issues |
+| `/loom:doctor` | Doctor | Addresses PR feedback and resolves conflicts |
+| `/loom:guide` | Guide | Triages issues and applies `loom:urgent` to top 3 |
+| `/loom:champion` | Champion | Auto-merges approved PRs with `loom:pr` label |
 
 ### How Slash Commands Work
 
 **Manual Invocation**: Use slash commands to assume a role:
 ```bash
-/builder    # Assume Builder role, find and implement a loom:issue
-/judge      # Assume Judge role, review a PR with loom:review-requested
+/loom:builder    # Assume Builder role, find and implement a loom:issue
+/loom:judge      # Assume Judge role, review a PR with loom:review-requested
 ```
 
 Each slash command tells Claude to:

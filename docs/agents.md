@@ -399,11 +399,11 @@ daemon's historical intervals:
 
 | Workflow            | Role        | Schedule (commented) |
 |---------------------|-------------|----------------------|
-| `loom-judge.yml`    | `/judge`    | `*/5 * * * *`        |
-| `loom-curator.yml`  | `/curator`  | `*/5 * * * *`        |
-| `loom-champion.yml` | `/champion` | `*/10 * * * *`       |
-| `loom-auditor.yml`  | `/auditor`  | `*/10 * * * *`       |
-| `loom-guide.yml`    | `/guide`    | `*/15 * * * *`       |
+| `loom-judge.yml`    | `/loom:judge`    | `*/5 * * * *`        |
+| `loom-curator.yml`  | `/loom:curator`  | `*/5 * * * *`        |
+| `loom-champion.yml` | `/loom:champion` | `*/10 * * * *`       |
+| `loom-auditor.yml`  | `/loom:auditor`  | `*/10 * * * *`       |
+| `loom-guide.yml`    | `/loom:guide`    | `*/15 * * * *`       |
 
 Workflows ship with `schedule:` blocks **commented out** so forks
 don't accidentally burn Actions minutes. To opt in: add a

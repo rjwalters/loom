@@ -101,7 +101,7 @@ Loom decomposes development into three coordination tiers, with the forge (GitHu
 | Tier 3 | Human | Oversight — approve proposals, handle edge cases | Observer |
 | Tier 2 | `loom-daemon` (MCP) + GH Actions cron | Multi-issue dispatch + scheduled support roles | Continuous / cron |
 | Tier 1 | `/loom:sweep <issue>` | Issue lifecycle from creation to merge | Per-issue |
-| Tier 0 | `/builder`, `/judge`, etc. | Task execution — single focused work units | Per-task |
+| Tier 0 | `/loom:builder`, `/loom:judge`, etc. | Task execution — single focused work units | Per-task |
 
 ### Tier responsibilities
 
@@ -144,7 +144,7 @@ Use Claude Code terminals with specialized roles for hands-on development coordi
 
 **Setup**:
 1. Open Claude Code in this repository
-2. Use slash commands to assume roles: `/builder`, `/judge`, `/curator`, etc.
+2. Use slash commands to assume roles: `/loom:builder`, `/loom:judge`, `/loom:curator`, etc.
 3. Each terminal acts as a specialized agent following role guidelines
 
 **When to use MOM**:
@@ -234,11 +234,11 @@ For the full surface — IPC request/response variants, event-bus internals, reg
 
 | Workflow | Role | Schedule (commented) |
 |----------|------|----------------------|
-| `loom-champion.yml` | `/champion` | `*/10 * * * *` |
-| `loom-curator.yml`  | `/curator`  | `*/5 * * * *`  |
-| `loom-judge.yml`    | `/judge`    | `*/5 * * * *`  |
-| `loom-auditor.yml`  | `/auditor`  | `*/10 * * * *` |
-| `loom-guide.yml`    | `/guide`    | `*/15 * * * *` |
+| `loom-champion.yml` | `/loom:champion` | `*/10 * * * *` |
+| `loom-curator.yml`  | `/loom:curator`  | `*/5 * * * *`  |
+| `loom-judge.yml`    | `/loom:judge`    | `*/5 * * * *`  |
+| `loom-auditor.yml`  | `/loom:auditor`  | `*/10 * * * *` |
+| `loom-guide.yml`    | `/loom:guide`    | `*/15 * * * *` |
 
 **Disabled by default.** Every shipped workflow has its `schedule:` block commented out so forks don't burn Actions minutes accidentally. To opt in on a fork:
 
@@ -1522,7 +1522,7 @@ jq -r '.pattern' .loom/logs/guard-decisions.log | sort | uniq -c | sort -rn
 
 ```bash
 # Enable for a single command (e.g. to capture one session's fires)
-LOOM_GUARD_DECISION_LOG=1 claude -p "/builder" --dangerously-skip-permissions
+LOOM_GUARD_DECISION_LOG=1 claude -p "/loom:builder" --dangerously-skip-permissions
 
 # Persist for a whole repo
 #   .loom/config.json  ->  { "guards": { "decisionLog": true } }
@@ -1956,8 +1956,8 @@ See [`.loom/docs/daemon-reference.md`](.loom/docs/daemon-reference.md) for the f
 **This is by design post-v0.10.0.** Neither the daemon nor the GH Actions cron generates work for Architect / Hermit — that cadence is tracked under follow-up #3381. For now, trigger them manually when the queue is empty:
 
 ```bash
-claude -p "/architect" --dangerously-skip-permissions
-claude -p "/hermit"    --dangerously-skip-permissions
+claude -p "/loom:architect" --dangerously-skip-permissions
+claude -p "/loom:hermit"    --dangerously-skip-permissions
 ```
 
 ## Health Monitoring
