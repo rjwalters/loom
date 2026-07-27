@@ -140,6 +140,120 @@ else
   FAIL=$((FAIL + 1))
 fi
 
+# ---------- test 7: signing helper — codesign failure is non-fatal (#4016) ----------
+# Fake `uname` reports Darwin (deterministic regardless of the host running
+# this suite) and a fake `codesign` always exits 1. provision_machine_daemon
+# must still return 0 and still install the binary; it should surface a
+# non-fatal warning, never abort.
+FAKE_FAIL_DIR="$WORKDIR/fake-codesign-fail-bin"
+mkdir -p "$FAKE_FAIL_DIR"
+cat > "$FAKE_FAIL_DIR/uname" <<'EOF'
+#!/usr/bin/env bash
+echo "Darwin"
+EOF
+chmod +x "$FAKE_FAIL_DIR/uname"
+cat > "$FAKE_FAIL_DIR/codesign" <<'EOF'
+#!/usr/bin/env bash
+exit 1
+EOF
+chmod +x "$FAKE_FAIL_DIR/codesign"
+
+SRC7="$WORKDIR/src7/loom-daemon"
+mkdir -p "$WORKDIR/src7"
+make_fake_bin "$SRC7" "0.15.1"
+DEST7="$WORKDIR/dest7"
+out7=$(PATH="$FAKE_FAIL_DIR:$PATH" LOOM_DAEMON_BIN_DIR="$DEST7" provision_machine_daemon "$SRC7" 2>&1)
+rc7=$?
+assert_eq "codesign failure: provision still returns 0 (non-fatal)" "0" "$rc7"
+assert_eq "codesign failure: binary is still provisioned" "1" "$( [[ -x "$DEST7/loom-daemon" ]] && echo 1 || echo 0 )"
+assert_contains "codesign failure: warns non-fatally" "$out7" "codesign failed"
+
+# ---------- test 8: signing helper — non-Darwin skips codesign entirely ----------
+# Fake `uname` reports Linux; a fake `codesign` writes a marker file if ever
+# invoked. provision_machine_daemon must still succeed and must NEVER invoke
+# codesign on a non-Darwin host.
+FAKE_LINUX_DIR="$WORKDIR/fake-linux-bin"
+mkdir -p "$FAKE_LINUX_DIR"
+cat > "$FAKE_LINUX_DIR/uname" <<'EOF'
+#!/usr/bin/env bash
+echo "Linux"
+EOF
+chmod +x "$FAKE_LINUX_DIR/uname"
+CODESIGN_MARKER8="$WORKDIR/codesign-invoked-marker"
+cat > "$FAKE_LINUX_DIR/codesign" <<EOF
+#!/usr/bin/env bash
+touch "$CODESIGN_MARKER8"
+exit 0
+EOF
+chmod +x "$FAKE_LINUX_DIR/codesign"
+
+SRC8="$WORKDIR/src8/loom-daemon"
+mkdir -p "$WORKDIR/src8"
+make_fake_bin "$SRC8" "0.15.2"
+DEST8="$WORKDIR/dest8"
+# shellcheck disable=SC2034  # captured for ad-hoc debugging, not asserted on
+out8=$(PATH="$FAKE_LINUX_DIR:$PATH" LOOM_DAEMON_BIN_DIR="$DEST8" provision_machine_daemon "$SRC8" 2>&1)
+rc8=$?
+assert_eq "non-Darwin: provision still returns 0" "0" "$rc8"
+assert_eq "non-Darwin: binary is still provisioned" "1" "$( [[ -x "$DEST8/loom-daemon" ]] && echo 1 || echo 0 )"
+assert_eq "non-Darwin: codesign is never invoked" "0" "$( [[ -e "$CODESIGN_MARKER8" ]] && echo 1 || echo 0 )"
+
+# ---------- test 9: signing helper — codesign absent from PATH ----------
+# A curated PATH containing only the handful of tools provision_machine_daemon
+# actually needs (uname, mkdir, install, cp, chmod, env, bash/sh), deliberately
+# excluding codesign. Provisioning must still succeed with at most a warning
+# and never attempt to invoke a missing codesign.
+NO_CODESIGN_DIR="$WORKDIR/no-codesign-bin"
+mkdir -p "$NO_CODESIGN_DIR"
+for tool in uname mkdir install cp chmod env bash sh; do
+  tool_path="$(command -v "$tool" 2>/dev/null || true)"
+  [[ -n "$tool_path" ]] && ln -sf "$tool_path" "$NO_CODESIGN_DIR/$tool"
+done
+
+SRC9="$WORKDIR/src9/loom-daemon"
+mkdir -p "$WORKDIR/src9"
+make_fake_bin "$SRC9" "0.15.3"
+DEST9="$WORKDIR/dest9"
+# shellcheck disable=SC2034  # captured for ad-hoc debugging, not asserted on
+out9=$(PATH="$NO_CODESIGN_DIR" LOOM_DAEMON_BIN_DIR="$DEST9" provision_machine_daemon "$SRC9" 2>&1)
+rc9=$?
+assert_eq "codesign absent: provision still returns 0" "0" "$rc9"
+assert_eq "codesign absent: binary is still provisioned" "1" "$( [[ -x "$DEST9/loom-daemon" ]] && echo 1 || echo 0 )"
+
+# ---------- test 10: signing helper — success path signs $dest_bin with the stable identifier ----------
+# Fake `uname` reports Darwin; a fake `codesign` records its argv instead of
+# actually signing (the fake binary from make_fake_bin is a plain shell
+# script, not a Mach-O, so a REAL codesign invocation is exercised separately
+# by test-loom-daemon-update.sh's e2e style; this test isolates the call
+# contract: sign_daemon_binary is invoked with the stable --identifier and the
+# DEST path, not the source path).
+FAKE_OK_DIR="$WORKDIR/fake-codesign-ok-bin"
+mkdir -p "$FAKE_OK_DIR"
+cat > "$FAKE_OK_DIR/uname" <<'EOF'
+#!/usr/bin/env bash
+echo "Darwin"
+EOF
+chmod +x "$FAKE_OK_DIR/uname"
+CODESIGN_ARGS_FILE="$WORKDIR/codesign-args.txt"
+cat > "$FAKE_OK_DIR/codesign" <<EOF
+#!/usr/bin/env bash
+echo "\$@" > "$CODESIGN_ARGS_FILE"
+exit 0
+EOF
+chmod +x "$FAKE_OK_DIR/codesign"
+
+SRC10="$WORKDIR/src10/loom-daemon"
+mkdir -p "$WORKDIR/src10"
+make_fake_bin "$SRC10" "0.15.4"
+DEST10="$WORKDIR/dest10"
+# shellcheck disable=SC2034  # captured for ad-hoc debugging, not asserted on
+out10=$(PATH="$FAKE_OK_DIR:$PATH" LOOM_DAEMON_BIN_DIR="$DEST10" provision_machine_daemon "$SRC10" 2>&1)
+rc10=$?
+assert_eq "codesign success: provision returns 0" "0" "$rc10"
+codesign_args="$(cat "$CODESIGN_ARGS_FILE" 2>/dev/null || echo "<missing>")"
+assert_contains "codesign success: invoked with the stable identifier" "$codesign_args" "--identifier com.rjwalters.loom-daemon"
+assert_contains "codesign success: signs the installed DEST binary, not the source" "$codesign_args" "$DEST10/loom-daemon"
+
 # ---------- summary ----------
 echo ""
 echo "-----------------------------------------"

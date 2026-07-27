@@ -40,6 +40,46 @@ _pmd_warn()    { echo "  [loom-daemon] WARNING: $*" >&2; }
 # path under suspicion, so it must NOT be the one that leaves it unset).
 PROVISIONED_DAEMON_BIN=""
 
+# sign_daemon_binary <bin>
+#
+# Issue #4016: ad-hoc-sign a freshly built/installed `loom-daemon` binary with
+# a STABLE identifier (`com.rjwalters.loom-daemon`) instead of the rustc
+# `-C metadata` hash cargo bakes in by default (e.g.
+# `loom_daemon-72d9e1b56839d6c3`, which changes on every version bump). That
+# hash surfaces in `codesign -dv` output, in System Settings -> Privacy &
+# Security entries, and in any future crash/signing diagnostic — pinning a
+# human-legible identifier there is cheap and hermetic.
+#
+# IMPORTANT — this does NOT make a TCC grant survive a rebuild. An ad-hoc
+# signature has no certificate chain for codesign to anchor a designated
+# requirement to, so it falls back to a cdhash-only DR regardless of what
+# --identifier is passed; a rebuild that changes any byte of the binary
+# (which a self-update roll always does, since build.rs embeds the git commit
+# and build time) produces a new cdhash and orphans any grant just as an
+# unsigned binary would. See .loom/docs/daemon-reference.md's "Ad-hoc code
+# signing" section for the measured proof. This function only makes the
+# identifier legible; it is not a TCC-durability fix.
+#
+# Darwin-only, best-effort, and NEVER fatal: the linker-signed ad-hoc
+# signature the binary already carries (from `cargo build`) is sufficient to
+# run, so an absent `codesign`, a non-Darwin host, or a `codesign` failure
+# must never fail the caller's build/provision step — this function always
+# returns 0.
+sign_daemon_binary() {
+  local bin="${1:-}"
+
+  [[ -n "$bin" && -x "$bin" ]] || return 0
+  [[ "$(uname -s 2>/dev/null)" == "Darwin" ]] || return 0
+  command -v codesign >/dev/null 2>&1 || return 0
+
+  if codesign -f -s - --identifier com.rjwalters.loom-daemon "$bin" 2>/dev/null; then
+    _pmd_ok "ad-hoc signed $bin (identifier=com.rjwalters.loom-daemon)"
+  else
+    _pmd_warn "codesign failed for $bin (non-fatal; the binary's existing linker-signed ad-hoc signature is still sufficient to run)"
+  fi
+  return 0
+}
+
 # provision_machine_daemon <src_bin> [dest_dir]
 #
 # Installs <src_bin> to <dest_dir>/loom-daemon (default: LOOM_DAEMON_BIN_DIR,
@@ -91,6 +131,11 @@ provision_machine_daemon() {
   if install -m 755 "$src_bin" "$dest_bin" 2>/dev/null || \
      { cp -f "$src_bin" "$dest_bin" 2>/dev/null && chmod 755 "$dest_bin" 2>/dev/null; }; then
     _pmd_ok "installed loom-daemon → $dest_bin ($src_ver)"
+    # Belt-and-braces (#4016): the source binary passed to this function is
+    # signed by loom-daemon-update.sh's own signing step before it gets here,
+    # but this covers the installer-only path (install.sh / install-loom.sh),
+    # which never goes through loom-daemon-update.sh. Never fatal.
+    sign_daemon_binary "$dest_bin"
   else
     _pmd_warn "failed to install loom-daemon to $dest_bin"
     _pmd_warn "set LOOM_DAEMON_BIN=$src_bin in the consumer env to run the daemon"

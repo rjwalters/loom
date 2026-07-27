@@ -364,6 +364,22 @@ else
     ok "Build verification: freshly-built binary embeds source HEAD commit ($BUILT_COMMIT)."
 fi
 
+# ---------- sign (Darwin-only, best-effort, non-fatal, #4016) ----------
+# Ad-hoc-sign the freshly built binary with a stable identifier BEFORE
+# provisioning, so both provisioning branches below (the LOOM_DAEMON_BIN
+# override and provision_machine_daemon) copy an already-signed binary — the
+# Mach-O signature survives `install`/`cp`. Signing does NOT make a TCC grant
+# survive a rebuild (see sign_daemon_binary's own doc comment in
+# scripts/install/provision-daemon.sh and .loom/docs/daemon-reference.md); it
+# only pins a human-legible identifier in place of the rustc metadata hash.
+# shellcheck disable=SC1091
+if [[ -r "$REPO_ROOT/scripts/install/provision-daemon.sh" ]]; then
+    source "$REPO_ROOT/scripts/install/provision-daemon.sh"
+fi
+if declare -F sign_daemon_binary >/dev/null 2>&1; then
+    sign_daemon_binary "$NEW_BIN"
+fi
+
 # ---------- provision ----------
 if [[ -n "${LOOM_DAEMON_BIN:-}" ]]; then
     # Explicit operator override — provision directly to that exact path
@@ -380,10 +396,6 @@ if [[ -n "${LOOM_DAEMON_BIN:-}" ]]; then
     # machine-level path — verify the destination is the freshly-built binary.
     verify_destination_binary "$dest"
 else
-    # shellcheck disable=SC1091
-    if [[ -r "$REPO_ROOT/scripts/install/provision-daemon.sh" ]]; then
-        source "$REPO_ROOT/scripts/install/provision-daemon.sh"
-    fi
     if declare -F provision_machine_daemon >/dev/null 2>&1; then
         # Hard-fail on provisioning failure: a soft warn here (the pre-#4053
         # behavior) left the exit code at 0, which is exactly the "reports

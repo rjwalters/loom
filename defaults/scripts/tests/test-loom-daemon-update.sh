@@ -69,17 +69,26 @@ assert_true() {
     fi
 }
 
+# Repo root of the actual Loom checkout this test suite lives in, so fixtures
+# can pull in the real scripts/install/provision-daemon.sh (which defines the
+# #4016 sign_daemon_binary helper loom-daemon-update.sh sources at
+# $REPO_ROOT/scripts/install/provision-daemon.sh).
+LOOM_REPO_ROOT="$(cd "$SCRIPT_DIR/../../.." && pwd)"
+
 # ---------- fixture builder ----------
 # Sets up a fresh throwaway repo root at $1 with a real git HEAD, a stub
-# loom-daemon crate, real start/stop scripts, and a minimal, machine-agnostic
-# PATH (excludes ~/.local/bin and similar, so a real loom-daemon possibly
+# loom-daemon crate, real start/stop scripts, a real copy of
+# provision-daemon.sh (so the #4016 signing step is exercised, not silently
+# skipped as "not found/sourceable"), and a minimal, machine-agnostic PATH
+# (excludes ~/.local/bin and similar, so a real loom-daemon possibly
 # installed on the dev machine can never leak into a test).
 new_fixture() {
     local root="$1"
-    mkdir -p "$root/.loom/logs" "$root/.loom/scripts/cli" "$root/loom-daemon"
+    mkdir -p "$root/.loom/logs" "$root/.loom/scripts/cli" "$root/loom-daemon" "$root/scripts/install"
     cp "$CLI_DIR/loom-daemon-start.sh" "$root/.loom/scripts/cli/loom-daemon-start.sh"
     cp "$CLI_DIR/loom-daemon-stop.sh" "$root/.loom/scripts/cli/loom-daemon-stop.sh"
     chmod +x "$root/.loom/scripts/cli/"*.sh
+    cp "$LOOM_REPO_ROOT/scripts/install/provision-daemon.sh" "$root/scripts/install/provision-daemon.sh"
     cat > "$root/loom-daemon/Cargo.toml" <<'EOF'
 [package]
 name = "loom-daemon"
@@ -138,6 +147,18 @@ FAKE_BIN_DIR="$BASE_WORKDIR/fakebin"
 mkdir -p "$FAKE_BIN_DIR"
 write_fake_cargo "$FAKE_BIN_DIR/cargo"
 TEST_PATH="$FAKE_BIN_DIR:$MINIMAL_PATH"
+
+# A copy of /usr/bin with every entry EXCEPT `codesign` symlinked in, used by
+# the #4016 "codesign absent from PATH" test below. Built once (symlinking is
+# effectively instant) rather than per-test.
+NO_CODESIGN_DIR="$BASE_WORKDIR/no-codesign-usr-bin"
+mkdir -p "$NO_CODESIGN_DIR"
+for f in /usr/bin/*; do
+    name="$(basename "$f")"
+    [[ "$name" == "codesign" ]] && continue
+    ln -sf "$f" "$NO_CODESIGN_DIR/$name" 2>/dev/null
+done
+TEST_PATH_NO_CODESIGN="$FAKE_BIN_DIR:$NO_CODESIGN_DIR:/bin:/usr/sbin:/sbin"
 
 # ============================================================
 # 1. --check reports "up to date" (exit 0) when the installed
@@ -495,6 +516,136 @@ else
     TESTS_FAILED=$((TESTS_FAILED + 1))
     echo -e "${RED}✗${NC} silent no-op roll is caught and reported distinguishably"
     echo "  output: $out11"
+fi
+
+# ============================================================
+# 12. Signing helper (#4016) — a codesign FAILURE during the update is
+#     non-fatal: the run still exits 0 and the binary is still provisioned,
+#     with a warning surfaced. Fakes `uname` as Darwin so this is
+#     deterministic regardless of the host actually running this suite.
+# ============================================================
+W12="$BASE_WORKDIR/w12"
+new_fixture "$W12"
+HEAD12="$(cd "$W12" && git rev-parse --short HEAD)"
+INSTALLED12="$W12/installed/loom-daemon"
+mkdir -p "$W12/installed"
+write_fake_daemon "$INSTALLED12" "deadbee" "$W12/old-marker"
+NEW_FAKE12="$W12/new-fake-daemon"
+write_fake_daemon "$NEW_FAKE12" "$HEAD12" "$W12/new-marker"
+
+FAKE_SIGN_FAIL_DIR="$W12/fake-codesign-fail-bin"
+mkdir -p "$FAKE_SIGN_FAIL_DIR"
+cat > "$FAKE_SIGN_FAIL_DIR/uname" <<'EOF'
+#!/usr/bin/env bash
+echo "Darwin"
+EOF
+chmod +x "$FAKE_SIGN_FAIL_DIR/uname"
+cat > "$FAKE_SIGN_FAIL_DIR/codesign" <<'EOF'
+#!/usr/bin/env bash
+exit 1
+EOF
+chmod +x "$FAKE_SIGN_FAIL_DIR/codesign"
+
+out12=$( cd "$W12" && PATH="$FAKE_SIGN_FAIL_DIR:$TEST_PATH" LOOM_DAEMON_BIN="$INSTALLED12" NEW_FAKE_BIN_SRC="$NEW_FAKE12" \
+    bash "$UPDATE_SCRIPT" 2>&1 )
+rc12=$?
+assert_eq "0" "$rc12" "codesign failure during update is non-fatal — exits 0"
+TESTS_RUN=$((TESTS_RUN + 1))
+if echo "$out12" | grep -qi 'codesign failed'; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} codesign failure surfaces a non-fatal warning"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} codesign failure surfaces a non-fatal warning"
+    echo "  output: $out12"
+fi
+TESTS_RUN=$((TESTS_RUN + 1))
+if [[ -x "$INSTALLED12" ]] && "$INSTALLED12" --version 2>/dev/null | grep -q "$HEAD12"; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} codesign failure: binary is still provisioned"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} codesign failure: binary is still provisioned"
+fi
+
+# ============================================================
+# 13. Signing helper (#4016) — non-Darwin skips codesign entirely: the
+#     update still succeeds and codesign is NEVER invoked. Fakes `uname`
+#     as Linux and a `codesign` that leaves a marker file if ever called.
+# ============================================================
+W13="$BASE_WORKDIR/w13"
+new_fixture "$W13"
+HEAD13="$(cd "$W13" && git rev-parse --short HEAD)"
+INSTALLED13="$W13/installed/loom-daemon"
+mkdir -p "$W13/installed"
+write_fake_daemon "$INSTALLED13" "deadbee" "$W13/old-marker"
+NEW_FAKE13="$W13/new-fake-daemon"
+write_fake_daemon "$NEW_FAKE13" "$HEAD13" "$W13/new-marker"
+
+FAKE_LINUX_DIR13="$W13/fake-linux-bin"
+mkdir -p "$FAKE_LINUX_DIR13"
+cat > "$FAKE_LINUX_DIR13/uname" <<'EOF'
+#!/usr/bin/env bash
+echo "Linux"
+EOF
+chmod +x "$FAKE_LINUX_DIR13/uname"
+CODESIGN_MARKER13="$W13/codesign-invoked-marker"
+cat > "$FAKE_LINUX_DIR13/codesign" <<EOF
+#!/usr/bin/env bash
+touch "$CODESIGN_MARKER13"
+exit 0
+EOF
+chmod +x "$FAKE_LINUX_DIR13/codesign"
+
+# shellcheck disable=SC2034  # captured for ad-hoc debugging, not asserted on
+out13=$( cd "$W13" && PATH="$FAKE_LINUX_DIR13:$TEST_PATH" LOOM_DAEMON_BIN="$INSTALLED13" NEW_FAKE_BIN_SRC="$NEW_FAKE13" \
+    bash "$UPDATE_SCRIPT" 2>&1 )
+rc13=$?
+assert_eq "0" "$rc13" "non-Darwin: update still exits 0"
+TESTS_RUN=$((TESTS_RUN + 1))
+if [[ -x "$INSTALLED13" ]] && "$INSTALLED13" --version 2>/dev/null | grep -q "$HEAD13"; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} non-Darwin: binary is still provisioned"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} non-Darwin: binary is still provisioned"
+fi
+TESTS_RUN=$((TESTS_RUN + 1))
+if [[ -e "$CODESIGN_MARKER13" ]]; then
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} non-Darwin: codesign is never invoked"
+else
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} non-Darwin: codesign is never invoked"
+fi
+
+# ============================================================
+# 14. Signing helper (#4016) — codesign absent from PATH entirely: the
+#     update still succeeds and provisions the binary (no codesign to
+#     invoke at all). Uses a curated PATH built from /usr/bin minus
+#     codesign, so this is a genuine absence rather than a stub.
+# ============================================================
+W14="$BASE_WORKDIR/w14"
+new_fixture "$W14"
+HEAD14="$(cd "$W14" && git rev-parse --short HEAD)"
+INSTALLED14="$W14/installed/loom-daemon"
+mkdir -p "$W14/installed"
+write_fake_daemon "$INSTALLED14" "deadbee" "$W14/old-marker"
+NEW_FAKE14="$W14/new-fake-daemon"
+write_fake_daemon "$NEW_FAKE14" "$HEAD14" "$W14/new-marker"
+
+out14=$( cd "$W14" && PATH="$TEST_PATH_NO_CODESIGN" LOOM_DAEMON_BIN="$INSTALLED14" NEW_FAKE_BIN_SRC="$NEW_FAKE14" \
+    bash "$UPDATE_SCRIPT" 2>&1 )
+rc14=$?
+assert_eq "0" "$rc14" "codesign absent from PATH: update still exits 0"
+TESTS_RUN=$((TESTS_RUN + 1))
+if [[ -x "$INSTALLED14" ]] && "$INSTALLED14" --version 2>/dev/null | grep -q "$HEAD14"; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} codesign absent from PATH: binary is still provisioned"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} codesign absent from PATH: binary is still provisioned"
+    echo "  output: $out14"
 fi
 
 # ---------- summary ----------
