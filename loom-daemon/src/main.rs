@@ -1931,13 +1931,13 @@ async fn handle_dispatch_command(
 
 /// Collect per-token usage by shelling out to `loom-tokens check --json`,
 /// mirroring `probe-tokens.sh`: prefer the `loom-tokens` binary on PATH, else
-/// fall back to `python3 -m loom_tools.cli.loom_tokens`. Best-effort — returns
+/// fall back to `python3 -m loom_tools.tokens.cli`. Best-effort — returns
 /// `None` on any failure (binary absent, non-zero exit, unparseable output) so
 /// the status view still renders without the usage table.
 fn collect_token_usage() -> Option<serde_json::Value> {
     let attempts: [(&str, &[&str]); 2] = [
         ("loom-tokens", &["check", "--json"]),
-        ("python3", &["-m", "loom_tools.cli.loom_tokens", "check", "--json"]),
+        ("python3", &["-m", "loom_tools.tokens.cli", "check", "--json"]),
     ];
     for (bin, args) in attempts {
         let Ok(output) = Command::new(bin).args(args).output() else {

@@ -22,4 +22,4 @@ if command -v loom-tokens &>/dev/null; then
     exit $?
 fi
 
-python3 -m loom_tools.cli.loom_tokens check "$@"
+python3 -m loom_tools.tokens.cli check "$@"
