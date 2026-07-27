@@ -1977,6 +1977,13 @@ what Phase 3 deletes vs preserves".
 - **Phase C** (monitoring + subscription tools): #3455.
 - **Migration guide**:
   [`docs/migration/v0.10.0-shepherd-deprecation.md`](../../docs/migration/v0.10.0-shepherd-deprecation.md).
+- **Config resolution layer** (#4039, Epic #3835 Phase 2): a single resolver
+  over private defaults + tracked `.loom-project/project.json` + ignored
+  `.loom-local/local.json` + legacy `.loom/config.json`, additive-only (no
+  existing call site — including this doc's `.loom/config.json` references
+  above — has been migrated onto it yet; see follow-up #4047). Schema,
+  precedence, and how it composes with `env > config > default`:
+  [`docs/design/config-resolution-tiers.md`](../../docs/design/config-resolution-tiers.md).
 - **Source**:
   - [`loom-daemon/src/types.rs`](../../loom-daemon/src/types.rs) — IPC types.
   - [`loom-daemon/src/sweep_registry.rs`](../../loom-daemon/src/sweep_registry.rs) — registry + reaper.
