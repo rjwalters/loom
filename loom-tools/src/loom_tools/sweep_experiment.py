@@ -44,6 +44,8 @@ import sys
 from datetime import datetime, timezone
 from typing import Any, Callable
 
+from loom_tools import model_tiers
+
 # --------------------------------------------------------------------------- #
 # Constants
 # --------------------------------------------------------------------------- #
@@ -57,6 +59,13 @@ _TRUTHY = {"1", "true", "yes", "on"}
 CANARY_SENTINEL = ".loom/CANARY"
 
 # Arm -> forced Builder model. Arm A is opus-first, Arm B is sonnet-first.
+#
+# These stay **logical aliases** (not pinned IDs): the arm identity is what the
+# harvest, the ``assign-arm`` default output, and ``test-sweep-experiment.sh``
+# key off. The alias is resolved to a concrete model ID through the shared tier
+# map (``model_tiers``, issue #3982) at *dispatch* time — see ``resolved_arm_model``
+# / ``assign-arm --resolve`` — so Arm A reaches Opus 5 rather than the CLI's stale
+# gen-4 ``opus`` alias, WITHOUT changing what this map says.
 ARM_MODEL = {"A": "opus", "B": "sonnet"}
 
 DEFAULT_STATS_FILE = ".loom/stats/sweep-model-stats.jsonl"
@@ -269,6 +278,19 @@ def assign_arm(issue_number: int, complexity: str | None = None) -> str:
 
 def arm_model(arm: str) -> str:
     return ARM_MODEL.get(arm.upper().strip(), "")
+
+
+def resolved_arm_model(arm: str, config: dict[str, Any] | None = None) -> str:
+    """Resolve an arm's logical model alias to the concrete model ID to dispatch.
+
+    ``ARM_MODEL`` stays aliases (Arm A = ``opus``) so the arm identity is stable
+    for reporting and the ``assign-arm`` default output; this resolves that alias
+    through the shared tier map (``model_tiers``, #3982) at *dispatch* time so
+    Arm A reaches Opus 5 (``claude-opus-5``) instead of the CLI's stale gen-4
+    ``opus`` alias. An unmapped arm resolves to ``""``.
+    """
+    alias = arm_model(arm)
+    return model_tiers.resolve_model(alias, config) if alias else ""
 
 
 def _model_family(model: str | None) -> str | None:
@@ -845,7 +867,15 @@ def _cmd_resolve_mode(args: argparse.Namespace) -> int:
 
 def _cmd_assign_arm(args: argparse.Namespace) -> int:
     arm = assign_arm(args.issue, args.complexity)
-    model = arm_model(arm)
+    # Default prints the logical alias (Arm A -> `opus`), which the arm identity
+    # and `test-sweep-experiment.sh` key off. `--resolve` prints the concrete
+    # model ID the tier map resolves that alias to on the wire (#3982), so the
+    # sweep skill can force the Builder to Opus 5 directly instead of passing the
+    # stale bare `opus` alias through.
+    if getattr(args, "resolve", False):
+        model = resolved_arm_model(arm, model_tiers.load_config(args.config))
+    else:
+        model = arm_model(arm)
     if args.format == "json":
         print(
             json.dumps(
@@ -936,6 +966,13 @@ def build_parser() -> argparse.ArgumentParser:
     p_arm.add_argument("--issue", type=int, required=True)
     p_arm.add_argument("--complexity", default=None)
     p_arm.add_argument("--format", choices=("text", "json"), default="text")
+    p_arm.add_argument(
+        "--resolve",
+        action="store_true",
+        help="Print the concrete model ID the arm's alias resolves to on the wire "
+        "(via the #3982 tier map) instead of the bare alias.",
+    )
+    p_arm.add_argument("--config", default=None)
     p_arm.set_defaults(func=_cmd_assign_arm)
 
     p_ban = sub.add_parser("banner", help="Loud startup banner naming mode + arm.")
