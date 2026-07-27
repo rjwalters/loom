@@ -573,31 +573,8 @@ pub struct BuildGateConfig {
 /// `buildGate` block (or `enabled: false`) gets zero behavior change.
 #[must_use]
 pub fn read_build_gate_config(repo_root: &Path) -> Option<BuildGateConfig> {
-    let config_path = repo_root.join(".loom").join("config.json");
-
-    let config_str = match std::fs::read_to_string(&config_path) {
-        Ok(s) => s,
-        Err(e) => {
-            log::debug!(
-                "main_health_gate: could not read config at {}: {e}",
-                config_path.display()
-            );
-            return None;
-        }
-    };
-
-    let config: serde_json::Value = match serde_json::from_str(&config_str) {
-        Ok(v) => v,
-        Err(e) => {
-            log::warn!(
-                "main_health_gate: could not parse config at {}: {e}",
-                config_path.display()
-            );
-            return None;
-        }
-    };
-
-    let gate = config.get("buildGate")?;
+    let effective = crate::config_resolver::resolve_effective_config(repo_root);
+    let gate = crate::config_resolver::get_path(&effective, "buildGate")?;
 
     // `enabled` must be explicitly true — absent or false ⇒ disabled.
     if !gate
@@ -2175,33 +2152,8 @@ pub struct AutonomousGateConfig {
 /// change (env-only enablement, exactly like Phase C shipped).
 #[must_use]
 pub fn read_autonomous_gate_config(repo_root: &Path) -> AutonomousGateConfig {
-    let config_path = repo_root.join(".loom").join("config.json");
-
-    let config_str = match std::fs::read_to_string(&config_path) {
-        Ok(s) => s,
-        Err(e) => {
-            log::debug!(
-                "main_health_gate: could not read config at {}: {e}",
-                config_path.display()
-            );
-            return AutonomousGateConfig::default();
-        }
-    };
-
-    let config: serde_json::Value = match serde_json::from_str(&config_str) {
-        Ok(v) => v,
-        Err(e) => {
-            log::warn!(
-                "main_health_gate: could not parse config at {}: {e}",
-                config_path.display()
-            );
-            return AutonomousGateConfig::default();
-        }
-    };
-
-    let Some(gate) = config
-        .get("autonomous")
-        .and_then(|a| a.get("mainHealthGate"))
+    let effective = crate::config_resolver::resolve_effective_config(repo_root);
+    let Some(gate) = crate::config_resolver::get_path(&effective, "autonomous.mainHealthGate")
     else {
         return AutonomousGateConfig::default();
     };
@@ -2524,6 +2476,12 @@ mod tests {
         std::fs::write(loom_dir.join("config.json"), body).unwrap();
     }
 
+    fn write_project_config(dir: &Path, body: &str) {
+        let full = dir.join(crate::config_resolver::PROJECT_CONFIG_REL);
+        std::fs::create_dir_all(full.parent().unwrap()).unwrap();
+        std::fs::write(full, body).unwrap();
+    }
+
     // ===================================================================
     // Config soft-fail
     // ===================================================================
@@ -2601,6 +2559,84 @@ mod tests {
         );
         let cfg = read_build_gate_config(tmp.path()).unwrap();
         assert_eq!(cfg.timeout, Duration::from_secs(DEFAULT_BUILD_GATE_TIMEOUT_SECS));
+    }
+
+    // ===================================================================
+    // config_resolver migration (#4058) — buildGate tier precedence
+    // ===================================================================
+
+    #[test]
+    #[serial(loom_config_env)]
+    fn test_build_gate_project_tier_only_is_honored_like_legacy() {
+        std::env::set_var(crate::config_resolver::PRIVATE_DEFAULTS_ENV, "");
+        let tmp = tempfile::tempdir().unwrap();
+        write_project_config(tmp.path(), r#"{"buildGate": {"enabled": true, "command": "true"}}"#);
+        let cfg = read_build_gate_config(tmp.path());
+        std::env::remove_var(crate::config_resolver::PRIVATE_DEFAULTS_ENV);
+        assert_eq!(cfg.unwrap().command, "true");
+    }
+
+    #[test]
+    #[serial(loom_config_env)]
+    fn test_build_gate_project_tier_overrides_legacy_overlap_and_supplies_non_overlap() {
+        std::env::set_var(crate::config_resolver::PRIVATE_DEFAULTS_ENV, "");
+        let tmp = tempfile::tempdir().unwrap();
+        write_config(
+            tmp.path(),
+            r#"{"buildGate": {"enabled": true, "command": "legacy-cmd", "timeoutSeconds": 99}}"#,
+        );
+        write_project_config(tmp.path(), r#"{"buildGate": {"command": "project-cmd"}}"#);
+        let cfg = read_build_gate_config(tmp.path()).unwrap();
+        std::env::remove_var(crate::config_resolver::PRIVATE_DEFAULTS_ENV);
+        // Overlapping `command` -> project tier wins.
+        assert_eq!(cfg.command, "project-cmd");
+        // Non-overlapping `timeoutSeconds` -> legacy tier still supplies it.
+        assert_eq!(cfg.timeout, Duration::from_secs(99));
+    }
+
+    // ===================================================================
+    // config_resolver migration (#4058) — autonomous.mainHealthGate tier
+    // precedence
+    // ===================================================================
+
+    #[test]
+    #[serial(loom_config_env)]
+    fn test_autonomous_gate_project_tier_only_is_honored_like_legacy() {
+        std::env::set_var(crate::config_resolver::PRIVATE_DEFAULTS_ENV, "");
+        let tmp = tempfile::tempdir().unwrap();
+        write_project_config(
+            tmp.path(),
+            r#"{"autonomous": {"mainHealthGate": {"enabled": true}}}"#,
+        );
+        let cfg = read_autonomous_gate_config(tmp.path());
+        std::env::remove_var(crate::config_resolver::PRIVATE_DEFAULTS_ENV);
+        assert_eq!(
+            cfg,
+            AutonomousGateConfig {
+                enabled: Some(true),
+                ci_workflow: None,
+            }
+        );
+    }
+
+    #[test]
+    #[serial(loom_config_env)]
+    fn test_autonomous_gate_local_tier_overrides_legacy_and_project() {
+        std::env::set_var(crate::config_resolver::PRIVATE_DEFAULTS_ENV, "");
+        let tmp = tempfile::tempdir().unwrap();
+        write_config(tmp.path(), r#"{"autonomous": {"mainHealthGate": {"enabled": false}}}"#);
+        write_project_config(
+            tmp.path(),
+            r#"{"autonomous": {"mainHealthGate": {"enabled": false}}}"#,
+        );
+        let local_full = tmp.path().join(crate::config_resolver::LOCAL_CONFIG_REL);
+        std::fs::create_dir_all(local_full.parent().unwrap()).unwrap();
+        std::fs::write(&local_full, r#"{"autonomous": {"mainHealthGate": {"enabled": true}}}"#)
+            .unwrap();
+
+        let cfg = read_autonomous_gate_config(tmp.path());
+        std::env::remove_var(crate::config_resolver::PRIVATE_DEFAULTS_ENV);
+        assert_eq!(cfg.enabled, Some(true));
     }
 
     // ===================================================================

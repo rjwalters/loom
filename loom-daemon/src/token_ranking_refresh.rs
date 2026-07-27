@@ -341,33 +341,9 @@ pub struct TokenRankingRefreshConfig {
 /// cadence).
 #[must_use]
 pub fn read_token_ranking_refresh_config(repo_root: &Path) -> TokenRankingRefreshConfig {
-    let config_path = repo_root.join(".loom").join("config.json");
-
-    let config_str = match std::fs::read_to_string(&config_path) {
-        Ok(s) => s,
-        Err(e) => {
-            log::debug!(
-                "token_ranking_refresh: could not read config at {}: {e}",
-                config_path.display()
-            );
-            return TokenRankingRefreshConfig::default();
-        }
-    };
-
-    let config: serde_json::Value = match serde_json::from_str(&config_str) {
-        Ok(v) => v,
-        Err(e) => {
-            log::warn!(
-                "token_ranking_refresh: could not parse config at {}: {e}",
-                config_path.display()
-            );
-            return TokenRankingRefreshConfig::default();
-        }
-    };
-
-    let Some(block) = config
-        .get("autonomous")
-        .and_then(|a| a.get("tokenRankingRefresh"))
+    let effective = crate::config_resolver::resolve_effective_config(repo_root);
+    let Some(block) =
+        crate::config_resolver::get_path(&effective, "autonomous.tokenRankingRefresh")
     else {
         return TokenRankingRefreshConfig::default();
     };
@@ -748,6 +724,57 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         write_config(tmp.path(), r#"{"autonomous": {"tokenRankingRefresh": {"intervalSecs": 0}}}"#);
         assert_eq!(read_token_ranking_refresh_config(tmp.path()).interval_secs, None);
+    }
+
+    // ===================================================================
+    // config_resolver migration (#4058) — tier precedence
+    // ===================================================================
+
+    fn write_project_config(root: &Path, contents: &str) {
+        let full = root.join(crate::config_resolver::PROJECT_CONFIG_REL);
+        fs::create_dir_all(full.parent().unwrap()).unwrap();
+        fs::write(full, contents).unwrap();
+    }
+
+    #[test]
+    #[serial(loom_config_env)]
+    fn test_config_project_tier_only_is_honored_like_legacy() {
+        std::env::set_var(crate::config_resolver::PRIVATE_DEFAULTS_ENV, "");
+        let tmp = tempfile::tempdir().unwrap();
+        write_project_config(
+            tmp.path(),
+            r#"{"autonomous": {"tokenRankingRefresh": {"enabled": false, "intervalSecs": 120}}}"#,
+        );
+        let cfg = read_token_ranking_refresh_config(tmp.path());
+        std::env::remove_var(crate::config_resolver::PRIVATE_DEFAULTS_ENV);
+        assert_eq!(
+            cfg,
+            TokenRankingRefreshConfig {
+                enabled: Some(false),
+                interval_secs: Some(120),
+            }
+        );
+    }
+
+    #[test]
+    #[serial(loom_config_env)]
+    fn test_config_project_tier_overrides_legacy_overlap_and_supplies_non_overlap() {
+        std::env::set_var(crate::config_resolver::PRIVATE_DEFAULTS_ENV, "");
+        let tmp = tempfile::tempdir().unwrap();
+        write_config(
+            tmp.path(),
+            r#"{"autonomous": {"tokenRankingRefresh": {"enabled": true, "intervalSecs": 600}}}"#,
+        );
+        write_project_config(
+            tmp.path(),
+            r#"{"autonomous": {"tokenRankingRefresh": {"intervalSecs": 300}}}"#,
+        );
+        let cfg = read_token_ranking_refresh_config(tmp.path());
+        std::env::remove_var(crate::config_resolver::PRIVATE_DEFAULTS_ENV);
+        // Overlapping `intervalSecs` -> project tier wins.
+        assert_eq!(cfg.interval_secs, Some(300));
+        // Non-overlapping `enabled` still supplied by legacy tier.
+        assert_eq!(cfg.enabled, Some(true));
     }
 
     // ===================================================================
