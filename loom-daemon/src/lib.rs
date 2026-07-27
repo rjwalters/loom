@@ -37,6 +37,7 @@ pub mod terminal;
 pub mod token_ranking_refresh;
 pub mod tokens;
 pub mod types;
+pub mod watch_registry;
 pub mod work_finder;
 pub mod workspace_pool;
 pub mod workspace_registry;

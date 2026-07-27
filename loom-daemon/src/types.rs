@@ -318,6 +318,41 @@ pub enum Request {
     },
     /// List the managed workspaces in the machine-level registry.
     ListWorkspaces,
+    // ========================================================================
+    // Durable Watch Registry Requests (Issue #3971)
+    // ========================================================================
+    /// Register a durable watch on an issue's or PR's terminal state. The watch
+    /// is persisted to `~/.loom/watches.json` (machine-level) so it survives the
+    /// registering operator session's death AND a daemon restart; the daemon's
+    /// watch-monitor loop polls the forge and, on a terminal state (closed /
+    /// merged / blocked) or expiry, appends a result line to
+    /// `~/.loom/logs/watch-results.log`.
+    ///
+    /// Address the target cross-repo with either `repo` (a forge slug
+    /// `owner/name`, preferred — works for a repo this machine may not manage) or
+    /// `workspace_root` (the `gh` query runs in that repo's working dir, mirroring
+    /// the `workspace_root` param on `DispatchSweep` / `ListSweeps`). Both absent
+    /// ⇒ the daemon's own cwd. Idempotent — re-registering the same
+    /// `(target, kind, number)` returns the existing watch (`already_present:
+    /// true`).
+    RegisterWatch {
+        kind: crate::watch_registry::WatchKind,
+        number: u32,
+        #[serde(default)]
+        repo: Option<String>,
+        #[serde(default)]
+        workspace_root: Option<String>,
+        #[serde(default)]
+        note: Option<String>,
+    },
+    /// List the currently-registered durable watches.
+    ListWatches,
+    /// Remove a registered watch by its id (as returned by `RegisterWatch` /
+    /// `ListWatches`). Removing an unknown id is a no-op success
+    /// (`was_present: false`).
+    RemoveWatch {
+        id: String,
+    },
     Shutdown,
 }
 
@@ -472,6 +507,26 @@ pub enum Response {
     /// Result of a `ListWorkspaces` request.
     WorkspaceList {
         workspaces: Vec<crate::workspace_registry::Workspace>,
+    },
+    // ========================================================================
+    // Durable Watch Registry Responses (Issue #3971)
+    // ========================================================================
+    /// Result of a `RegisterWatch` request. `watch` is the stored spec (the
+    /// pre-existing one on a dedup hit); `already_present` is `true` when a watch
+    /// for the same `(target, kind, number)` was already registered.
+    WatchRegistered {
+        watch: crate::watch_registry::WatchSpec,
+        already_present: bool,
+    },
+    /// Result of a `ListWatches` request.
+    WatchList {
+        watches: Vec<crate::watch_registry::WatchSpec>,
+    },
+    /// Result of a `RemoveWatch` request. `was_present` is `false` when no watch
+    /// with the given id existed (no-op success).
+    WatchRemoved {
+        id: String,
+        was_present: bool,
     },
     /// Legacy error response (deprecated, use `StructuredError` for new code)
     /// Kept for backwards compatibility with existing frontends
