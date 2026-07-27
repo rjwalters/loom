@@ -2560,13 +2560,29 @@ impl SweepRegistry {
                                 sweep_id: sweep_id.clone(),
                                 outcome: SweepOutcome::Crashed,
                             });
-                            // Insta-crash quarantine (#3939): a checkpoint exists,
-                            // so this sweep reached real work — the mid-build-death
-                            // watchdog (#3895) owns this failure mode, and it is
-                            // explicitly NOT an insta-crash. Reset the consecutive
-                            // tally so a genuine mid-build death never accretes
-                            // toward quarantine.
-                            self.record_terminal_outcome(issue, false);
+                            // Insta-crash quarantine (#3939 + #4009): a checkpoint
+                            // FILE existing on disk does not prove THIS run made
+                            // progress — checkpoints persist across dispatches
+                            // (#3373), so a single successful-enough historical run
+                            // would otherwise exempt the issue from quarantine
+                            // forever while every later dispatch dies pre-work in
+                            // <2s (an infinite re-dispatch loop, #4009). Only a
+                            // checkpoint (re)written by THIS run — mtime at/after
+                            // our `started_at` — counts as progress. Such a genuine
+                            // mid-build death is the mid-build-death watchdog's
+                            // remit (#3895) and resets the consecutive tally. A
+                            // stale checkpoint from an earlier dispatch does not:
+                            // fall through to the same pre-work insta-crash test the
+                            // checkpoint-less branch below uses, so a sub-window
+                            // non-clean death still counts toward quarantine.
+                            if checkpoint_written_by_run(&checkpoint, started_at) {
+                                self.record_terminal_outcome(issue, false);
+                            } else {
+                                let insta_crash = duration_sec
+                                    < self.quarantine_config.insta_crash_secs
+                                    && exit_code != Some(0);
+                                self.record_terminal_outcome(issue, insta_crash);
+                            }
                         } else {
                             // Orphaned-claim recovery (issue #3823b): a
                             // daemon-owned sweep that exits cleanly WITHOUT a
@@ -3978,6 +3994,38 @@ fn read_checkpoint_phase(path: &Path) -> Option<String> {
         .map(ToString::to_string)
 }
 
+/// Returns `true` when the checkpoint at `path` was last written at or after
+/// `started_at` — i.e. by the sweep run that began at `started_at` — rather than
+/// being a stale artifact left on disk by an earlier dispatch (#4009).
+///
+/// Sweep checkpoints persist across dispatches (`.loom/sweep-checkpoint/
+/// issue-<N>.json` is only removed by an explicit `sweep-checkpoint.sh delete`,
+/// which never runs on a crash — #3373), so the mere *presence* of the file
+/// does not prove the run that just died made any progress. A single
+/// successful-enough historical run would otherwise leave the file on disk
+/// forever, permanently exempting the issue from the insta-crash quarantine
+/// (#3939) even as every subsequent dispatch dies pre-work in under 2s — an
+/// infinite re-dispatch loop.
+///
+/// Comparing the file's mtime against this run's `started_at` distinguishes
+/// "this run reached real work" (a mid-build death — the #3895 watchdog's
+/// remit, which must reset the insta-crash tally) from "a checkpoint from an
+/// earlier dispatch happens to exist" (a pre-work insta-crash that must still
+/// count toward quarantine).
+///
+/// A missing file, or an unreadable/absent mtime, yields `false` (treated as
+/// "no progress by this run"), so an unreadable checkpoint never shields an
+/// issue from quarantine.
+fn checkpoint_written_by_run(path: &Path, started_at: DateTime<Utc>) -> bool {
+    let Ok(meta) = std::fs::metadata(path) else {
+        return false;
+    };
+    let Ok(mtime) = meta.modified() else {
+        return false;
+    };
+    DateTime::<Utc>::from(mtime) >= started_at
+}
+
 /// Send a signal to a PID. Returns `true` on success (signal queued or
 /// process already absent and the caller can treat that as "done"). PID
 /// 0 is rejected to avoid the POSIX broadcast-to-group semantics.
@@ -5371,6 +5419,19 @@ exit 0
     /// `started_at` at `now` (so the reaper classifies its death as within the
     /// insta-crash window). Returns the synthetic sweep_id.
     fn insert_dead_running(registry: &mut SweepRegistry, issue: u32, seq: u32) -> String {
+        insert_dead_running_at(registry, issue, seq, Utc::now())
+    }
+
+    /// Like [`insert_dead_running`] but with an explicit `started_at`, so a test
+    /// can position the run's start relative to a checkpoint's mtime (#4009): a
+    /// checkpoint written *after* `started_at` is progress by this run, one
+    /// written *before* it is a stale artifact of an earlier dispatch.
+    fn insert_dead_running_at(
+        registry: &mut SweepRegistry,
+        issue: u32,
+        seq: u32,
+        started_at: DateTime<Utc>,
+    ) -> String {
         let sweep_id = format!("sweep-issue-{issue}-{seq}");
         registry.entries.insert(
             sweep_id.clone(),
@@ -5381,7 +5442,7 @@ exit 0
                 token_name: "unknown".into(),
                 log_path: registry.compute_log_path(issue),
                 idempotency_key: None,
-                started_at: Utc::now(),
+                started_at,
                 state: SweepState::Running,
                 latest_phase: None,
                 pr_number: None,
@@ -5478,9 +5539,11 @@ exit 0
         assert_eq!(registry.quarantined_issues_sorted(), vec![42]);
     }
 
-    /// AC #1: a death WITH a checkpoint (real work happened) is NOT an
-    /// insta-crash — it is the mid-build-death watchdog's remit (#3895) — so it
-    /// never counts toward quarantine.
+    /// AC #1 + #3 (#4009): a death whose checkpoint was written BY THIS run
+    /// (mtime at/after `started_at`) is real mid-build progress — the
+    /// mid-build-death watchdog's remit (#3895) — so it never counts toward
+    /// quarantine. Each run starts in the past and (re)writes its checkpoint
+    /// during the run, so the checkpoint post-dates `started_at`.
     #[test]
     fn reaper_checkpoint_death_does_not_count_as_insta_crash() {
         let dir = tempdir().unwrap();
@@ -5488,14 +5551,63 @@ exit 0
 
         let cp_dir = registry.config.checkpoint_dir();
         std::fs::create_dir_all(&cp_dir).unwrap();
-        std::fs::write(cp_dir.join("issue-43.json"), r#"{"phase":"builder","issue":43}"#).unwrap();
 
         for seq in 0..5 {
-            insert_dead_running(&mut registry, 43, seq);
+            // Run started 5s ago; it reaches real work and writes its checkpoint
+            // now, so the checkpoint mtime post-dates `started_at`.
+            insert_dead_running_at(
+                &mut registry,
+                43,
+                seq,
+                Utc::now() - chrono::Duration::seconds(5),
+            );
+            std::fs::write(cp_dir.join("issue-43.json"), r#"{"phase":"builder","issue":43}"#)
+                .unwrap();
             registry.reap_once();
         }
-        assert_eq!(registry.insta_crash_count(43), 0, "checkpoint deaths never count");
+        assert_eq!(registry.insta_crash_count(43), 0, "mid-build (this-run) deaths never count");
         assert!(!registry.is_quarantined(43), "a mid-build death is not quarantined");
+    }
+
+    /// AC #4 (#4009): a STALE checkpoint — one left on disk by an earlier
+    /// dispatch, its mtime predating this run's `started_at` — must NOT exempt an
+    /// issue from the insta-crash quarantine. Three consecutive pre-work deaths
+    /// inside the insta-crash window drive the issue into quarantine even though
+    /// `issue-<N>.json` exists on disk the whole time. This is the exact
+    /// infinite-re-dispatch-loop regression #4009 reported (issue #4009 itself
+    /// crash-looped 3x while a stale checkpoint from an earlier run persisted).
+    #[test]
+    fn reaper_stale_checkpoint_death_counts_as_insta_crash() {
+        let dir = tempdir().unwrap();
+        let (mut registry, _record_log) = fixture_registry(dir.path());
+        assert_eq!(registry.quarantine_config().threshold, 3);
+
+        let cp_dir = registry.config.checkpoint_dir();
+        std::fs::create_dir_all(&cp_dir).unwrap();
+        // A checkpoint written by a PRIOR dispatch, before any run below starts.
+        std::fs::write(cp_dir.join("issue-45.json"), r#"{"phase":"builder","issue":45}"#).unwrap();
+        let stale_written_at = std::fs::metadata(cp_dir.join("issue-45.json"))
+            .and_then(|m| m.modified())
+            .map(DateTime::<Utc>::from)
+            .unwrap();
+
+        // Each run starts AFTER the stale checkpoint was written (so the file is
+        // stale relative to it) and dies pre-work inside the insta-crash window.
+        for seq in 0..3 {
+            let started_at = stale_written_at + chrono::Duration::seconds(5);
+            insert_dead_running_at(&mut registry, 45, seq, started_at);
+            registry.reap_once();
+        }
+        assert_eq!(
+            registry.insta_crash_count(45),
+            3,
+            "stale-checkpoint pre-work deaths count toward quarantine"
+        );
+        assert!(
+            registry.is_quarantined(45),
+            "issue quarantines at threshold despite a stale checkpoint on disk"
+        );
+        assert!(registry.quarantined_issues().contains(&45));
     }
 
     /// AC #4: a quarantine entry auto-releases once it ages past the TTL, and the
