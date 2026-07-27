@@ -104,12 +104,18 @@ fi
 assert_eq "0" "$plist_rc" "--print-plist exits 0"
 assert_eq "$before_count" "$after_count" "--print-plist never writes to ~/Library/LaunchAgents"
 
-# 2. Plain start: RunAtLoad/KeepAlive false, both autonomy loops OFF present
-#    and equal to 0 (FLAGS-OFF default, #3911 semantics preserved), PATH
-#    covers gh/git/cargo/python3 fallback dirs.
+# 2. Plain start: RunAtLoad true, KeepAlive:{SuccessfulExit:true} (#4054 —
+#    relaunch only on a clean exit 0, i.e. the RestartDaemon primitive; a
+#    crash/SIGTERM/SIGINT exits non-zero and is NOT respawned, preserving the
+#    old no-crash-loop semantics), LOOM_DAEMON_SUPERVISOR=launchd baked in, both
+#    autonomy loops OFF present and equal to 0 (FLAGS-OFF default, #3911
+#    semantics preserved), PATH covers gh/git/cargo/python3 fallback dirs.
 assert_contains "$plist_out" "<key>RunAtLoad</key>" "plist declares RunAtLoad"
 assert_contains "$plist_out" $'<key>RunAtLoad</key>\n    <true/>' "RunAtLoad is true (mirrors the validated incident-fix plist; survives reboot/re-login)"
-assert_contains "$plist_out" $'<key>KeepAlive</key>\n    <false/>' "KeepAlive is false (no launchd auto-restart on crash)"
+assert_contains "$plist_out" $'<key>KeepAlive</key>\n    <dict>' "KeepAlive is a dict (SuccessfulExit form, #4054)"
+assert_contains "$plist_out" $'<key>SuccessfulExit</key>\n        <true/>' "KeepAlive.SuccessfulExit is true (relaunch only on the restart primitive's clean exit 0)"
+assert_not_contains "$plist_out" $'<key>KeepAlive</key>\n    <false/>' "KeepAlive is no longer the bare <false/> form"
+assert_contains "$plist_out" $'<key>LOOM_DAEMON_SUPERVISOR</key>\n        <string>launchd</string>' "plist bakes in LOOM_DAEMON_SUPERVISOR=launchd (daemon proves supervision before a restart, #4054)"
 assert_contains "$plist_out" "<key>LOOM_WORK_FINDER</key>" "plain start forwards LOOM_WORK_FINDER"
 assert_contains "$plist_out" $'<key>LOOM_WORK_FINDER</key>\n        <string>0</string>' "plain start: LOOM_WORK_FINDER=0 (FLAGS-OFF default)"
 assert_contains "$plist_out" $'<key>LOOM_MAIN_HEALTH_GATE</key>\n        <string>0</string>' "plain start: LOOM_MAIN_HEALTH_GATE=0 (FLAGS-OFF default)"

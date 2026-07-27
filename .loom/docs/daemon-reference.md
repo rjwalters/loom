@@ -1872,6 +1872,17 @@ the registry reconciles their state on the next start (`SweepRegistry::reconstru
 re-admits live-lock owners). To actively cancel a sweep, use
 `mcp__loom__cancel_sweep` against a running daemon *before* stopping it.
 
+**Exit code carries shutdown intent (#4054).** The daemon encodes *why* it is
+shutting down in its exit code, because the launchd `KeepAlive:{SuccessfulExit:true}`
+plist (below) relaunches only on a clean exit `0`: the `RestartDaemon` primitive
+exits `0` (relaunch), SIGTERM exits `143`, SIGINT exits `130`, an explicit IPC
+`Shutdown` exits `143`, and a crash/panic exits non-zero — so only a deliberate
+restart trips a relaunch, and "an operator stop stays stopped" holds without
+depending on `bootout` timing. `loom-daemon-stop.sh` also re-verifies (scoped to
+its launchd label) that no daemon is still alive after the stop and exits non-zero
+if one is, closing the silent-success hole where a failed bootout could leave a
+relaunched daemon dispatching.
+
 ### macOS session-bootstrap hazard (#3972)
 
 **Incident (2026-07-26).** The daemon was started at 21:48 via
@@ -1925,16 +1936,22 @@ after migration reported `13 seen, 3 dispatched, 0 error(s)`.
   `--health-gate` / `--from-config` semantics are preserved exactly — the
   launchd job never sees a wider or narrower autonomy configuration than a
   plain nohup start would have resolved.
-- **`RunAtLoad=true` / `KeepAlive=false`**: mirrors the hand-written plist that
-  validated this fix during the incident. `RunAtLoad=true` means the daemon
-  also survives a reboot/re-login, not just the death of one particular
-  session — strictly *more* durable than the pre-#3972 nohup contract (which
-  didn't survive a reboot either). `KeepAlive=false` means launchd does **not**
-  auto-respawn a crashed daemon; that responsibility stays with the reaper /
-  operator, unchanged from before. `loom-daemon-stop.sh` `bootout`s the loaded
-  definition after confirming the process is dead, specifically so an explicit
-  stop is honored at the next login too (otherwise `RunAtLoad=true` would
-  silently relaunch it).
+- **`RunAtLoad=true` / `KeepAlive={SuccessfulExit:true}`** (#4054): `RunAtLoad=true`
+  means the daemon survives a reboot/re-login, not just the death of one particular
+  session — strictly *more* durable than the pre-#3972 nohup contract (which didn't
+  survive a reboot either). `KeepAlive={SuccessfulExit:true}` (changed from the
+  earlier bare `KeepAlive=false`) is the **supervised restart primitive**: launchd
+  relaunches the job **only** when it exits with status `0`, and leaves it down on
+  any non-zero exit. Because the daemon exits **non-zero** on a crash/panic, on a
+  SIGTERM operator stop (143), and on a SIGINT/Ctrl-C (130), this **preserves** the
+  old no-crash-loop semantics of `KeepAlive=false` — none of those respawn — while
+  making the one deliberate clean-exit path (the `RestartDaemon` request, `loom-daemon
+  restart`) the *only* thing that trips a relaunch. `loom-daemon-stop.sh` still
+  `bootout`s the loaded definition after confirming the process is dead (so an
+  explicit stop is honored at the next login too), but the bootout is now
+  belt-and-braces: the non-zero SIGTERM exit already prevents launchd from relaunching
+  during the stop window. See [Supervised restart primitive](#supervised-restart-primitive-4054)
+  below and `docs/design/supervised-restart-primitive.md`.
 - **Escape hatch**: `--no-launchd` (or `LOOM_DAEMON_LAUNCHD=0`) forces the
   legacy nohup path even on Darwin — e.g. for a sandboxed/headless macOS runner
   with no GUI login session where `gui/<uid>` may not resolve.
@@ -2049,6 +2066,35 @@ self-signed certificate in a login keychain (breaks hermetic/headless builds)
 or Developer ID + notarization (requires a paid account) — but adopting
 either is unevaluated speculative infrastructure, not something this change
 does. No new TCC grant is requested or needed for this.
+
+### Supervised restart primitive (#4054)
+
+Phase 2 of #4017 (auto-rebuild-and-restart-when-stale). It ships a
+manually-triggerable way for the daemon to **end and reliably come back**, so
+Phase 3 has a *proven* restart path to call. It deliberately ships **no**
+automation — nothing fires it on its own.
+
+```bash
+loom-daemon restart          # send RestartDaemon over the IPC socket
+```
+
+- **Mechanism (macOS):** the plist uses `KeepAlive:{SuccessfulExit:true}` and the
+  daemon exits `0` **only** for a `RestartDaemon` request, so launchd relaunches
+  the job on that one clean exit and leaves it down on every other (SIGTERM 143,
+  SIGINT 130, crash non-zero). The relaunched process re-reads the same plist, so
+  it comes back with **exactly** its start flags/env — never wider. In-flight
+  sweeps survive (they are independent detached processes the daemon never cancels
+  on shutdown). Observable signature: a **new pid**.
+- **Supervision proof:** `loom-daemon-start.sh` bakes `LOOM_DAEMON_SUPERVISOR=launchd`
+  into the plist, and the daemon ends its process for a restart **only** when that
+  var is present. On an unsupervised host (nohup / Linux / `--foreground`) it
+  refuses: `loom-daemon restart` prints the refusal, exits non-zero, and the daemon
+  keeps running — because nothing would bring it back if it exited (#4017's "log
+  loudly, leave the daemon running, do not restart").
+- **Why launchd, not `exec` self-replacement:** the design record — including why
+  the `exec` (Option 2) and detached-helper (Option 3) alternatives were rejected,
+  and the Curator's exit-code-race finding — is in
+  `docs/design/supervised-restart-primitive.md`.
 
 ### Self-update (rebuild + provision + restart, #3968)
 

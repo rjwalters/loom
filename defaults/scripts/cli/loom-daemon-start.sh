@@ -142,12 +142,32 @@ resolve_launchd_label() {
 # (~/Library/LaunchAgents/com.rjwalters.loom-daemon.plist): RunAtLoad=true
 # (the daemon also comes back after a reboot/re-login, not just a session
 # death -- strictly more durable than the pre-#3972 nohup contract, which
-# didn't survive a reboot either) and KeepAlive=false (launchd does not
-# auto-respawn a crashed daemon; that stays the reaper/operator's job, same as
-# before). Lifecycle (first start / explicit stop) is still entirely
-# operator-driven via loom-daemon-start.sh / loom-daemon-stop.sh -- bootout on
-# stop unloads the definition so it does NOT come back at the next login. The
-# PATH is the CURRENT PATH plus a fallback set (~/.local/bin, ~/.cargo/bin,
+# didn't survive a reboot either).
+#
+# KeepAlive is `{ SuccessfulExit: true }` as of the supervised restart primitive
+# (#4054, Phase 2 of #4017): launchd relaunches the job ONLY when it exits with
+# status 0, and leaves it down on any non-zero exit. This is what lets the
+# daemon END and reliably COME BACK on demand -- the `RestartDaemon` IPC request
+# (loom-daemon restart) is the ONLY path that exits 0, so it is the only thing
+# that trips a relaunch. Crucially this PRESERVES the old no-crash-loop semantics
+# of KeepAlive=false: a crashed/panicked daemon, a SIGTERM'd operator stop (exit
+# 143), and a SIGINT/Ctrl-C (exit 130) all exit NON-ZERO, so launchd does NOT
+# respawn them. Making the exit code carry intent (daemon side, #4054) is also
+# what closes the SuccessfulExit/bootout race (Curator Finding 1): an operator
+# stop exits non-zero, so launchd never relaunches it during the stop window --
+# "an operator stop stays stopped" no longer depends on bootout timing. The
+# bootout in loom-daemon-stop.sh is demoted to belt-and-braces (it still unloads
+# the definition so it does not come back at the next login).
+#
+# LOOM_DAEMON_SUPERVISOR=launchd is baked into the plist env so the daemon can
+# PROVE it is supervised before it will exit for a restart. It is hardcoded here
+# (not harvested from the caller's env) so it lands in EVERY rendered plist --
+# and, conversely, is ABSENT from the nohup path (which never renders a plist),
+# so an unsupervised daemon correctly refuses to exit on a restart request
+# (nothing would bring it back). Because it survives in the plist, the relaunched
+# daemon still sees it.
+#
+# The PATH is the CURRENT PATH plus a fallback set (~/.local/bin, ~/.cargo/bin,
 # Homebrew, standard bin dirs) so `gh`, `git`, `cargo`, and `python3` resolve
 # inside the LaunchAgent's minimal launchd environment even if the interactive
 # shell's PATH customizations aren't present there. Every already-exported
@@ -162,12 +182,20 @@ render_launchd_plist() {
     local env_entries=""
     env_entries+="        <key>PATH</key>\n        <string>$(xml_escape "$plist_path_value")</string>\n"
     env_entries+="        <key>HOME</key>\n        <string>$(xml_escape "$HOME")</string>\n"
+    # Mark the daemon as launchd-supervised so its RestartDaemon handler (#4054)
+    # will exit 0 for a supervised relaunch. Hardcoded (not env-harvested) so it
+    # is present in every rendered plist and its relaunch, and never leaks to the
+    # unsupervised nohup path.
+    env_entries+="        <key>LOOM_DAEMON_SUPERVISOR</key>\n        <string>launchd</string>\n"
 
     local line key value
     while IFS= read -r line; do
         [[ -z "$line" ]] && continue
         key="${line%%=*}"
         value="${line#*=}"
+        # Never duplicate the supervisor key hardcoded above (a caller that
+        # exported LOOM_DAEMON_SUPERVISOR must not produce two plist entries).
+        [[ "$key" == "LOOM_DAEMON_SUPERVISOR" ]] && continue
         env_entries+="        <key>$(xml_escape "$key")</key>\n        <string>$(xml_escape "$value")</string>\n"
     done < <(env | grep -E '^(LOOM_[A-Za-z0-9_]*|GH_TOKEN|GITEA_TOKEN|FORGE_TOKEN)=' || true)
 
@@ -181,7 +209,10 @@ render_launchd_plist() {
     printf '%b' "$env_entries"
     printf '    </dict>\n'
     printf '    <key>RunAtLoad</key>\n    <true/>\n'
-    printf '    <key>KeepAlive</key>\n    <false/>\n'
+    # KeepAlive:SuccessfulExit=true (#4054): relaunch ONLY on a clean exit 0 (the
+    # RestartDaemon primitive). A crash/SIGTERM/SIGINT exits non-zero and is NOT
+    # respawned -- preserving the pre-#4054 no-crash-loop semantics of KeepAlive=false.
+    printf '    <key>KeepAlive</key>\n    <dict>\n        <key>SuccessfulExit</key>\n        <true/>\n    </dict>\n'
     printf '    <key>ProcessType</key>\n    <string>Background</string>\n'
     printf '    <key>StandardOutPath</key>\n    <string>%s</string>\n' "$(xml_escape "$log_path")"
     printf '    <key>StandardErrorPath</key>\n    <string>%s</string>\n' "$(xml_escape "$log_path")"

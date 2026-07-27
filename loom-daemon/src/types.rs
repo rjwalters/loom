@@ -353,6 +353,31 @@ pub enum Request {
     RemoveWatch {
         id: String,
     },
+    // ========================================================================
+    // Supervised restart primitive (Issue #4054 — Phase 2 of #4017)
+    // ========================================================================
+    /// Deliberately restart the daemon by ending the current process so the
+    /// supervisor (macOS launchd) relaunches it — the manually-triggerable
+    /// restart primitive #4017 Phase 3 will call to complete an auto-roll.
+    ///
+    /// This is the ONLY path that exits the process with status `0`. Under the
+    /// launchd `KeepAlive: { SuccessfulExit: true }` contract (see
+    /// `render_launchd_plist` in `loom-daemon-start.sh`), a clean exit-0
+    /// triggers a relaunch, while every operator/signal/crash exit is non-zero
+    /// and does NOT relaunch. The relaunched process re-reads the same plist, so
+    /// it comes back with EXACTLY the flags/env it was started with — never
+    /// wider.
+    ///
+    /// The daemon only ends the process when it can prove it is supervised
+    /// (`LOOM_DAEMON_SUPERVISOR=launchd`, baked into the plist by the start
+    /// script). On an unsupervised host (nohup / Linux / `--foreground`) it
+    /// refuses: it logs loudly, leaves itself running, and returns a
+    /// `DaemonRestart { scheduled: false, .. }` — there is no supervisor that
+    /// would bring it back, and exiting would be strictly worse than the status
+    /// quo (#4017).
+    ///
+    /// It never fires on its own — nothing in the daemon issues this request.
+    RestartDaemon,
     Shutdown,
 }
 
@@ -485,6 +510,19 @@ pub enum Response {
     /// Result of a `DaemonStatus` request — the autonomous-mode operability
     /// snapshot rendered by `loom-daemon status`.
     DaemonStatus(DaemonStatusReport),
+    /// Result of a `RestartDaemon` request (Issue #4054).
+    ///
+    /// `scheduled` is `true` when the daemon is supervised and is about to exit
+    /// `0` for a supervised relaunch (the process ends immediately after this
+    /// frame is flushed). It is `false` when the daemon is NOT supervised and
+    /// therefore refused to exit — the daemon stays running. `supervisor` names
+    /// the detected supervisor (`Some("launchd")`) or `None` when unsupervised,
+    /// and `message` is a human-readable explanation for operator output.
+    DaemonRestart {
+        scheduled: bool,
+        supervisor: Option<String>,
+        message: String,
+    },
     // ========================================================================
     // Workspace Registry Responses (Issue #3926 — phase 1 of #3835)
     // ========================================================================
