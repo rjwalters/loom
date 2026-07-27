@@ -22,23 +22,28 @@
 //! 3. For each remaining issue, dispatches through the existing
 //!    [`SweepRegistry::dispatch`](crate::sweep_registry::SweepRegistry::dispatch)
 //!    path — up to a **work-driven** max-concurrency cap recomputed every tick
-//!    (Phase B, #3811): `min(token-pool size, disk headroom, configured max)`.
-//!    `dispatch()` already flips `loom:issue → loom:building`, acquires the
-//!    per-issue `mkdir`-atomic claim lock, and spawns the rotated-token child.
+//!    (Phase B, #3811; CPU/load term added in #3978): `min(token-pool size,
+//!    disk headroom, cpu/load headroom, configured max)`. `dispatch()` already
+//!    flips `loom:issue → loom:building`, acquires the per-issue `mkdir`-atomic
+//!    claim lock, and spawns the rotated-token child.
 //!
-//! # Concurrency scaling (Phase B, #3811)
+//! # Concurrency scaling (Phase B, #3811; CPU/load term #3978)
 //!
 //! Phase A resolved a single fixed cap once at daemon startup. Phase B replaces
 //! it with a cap **recomputed every tick** by
-//! [`resolve_dynamic_max_concurrent`] from three live inputs — the token-pool
-//! size ([`crate::tokens::token_pool_size`]), the worktree-root disk headroom
-//! ([`crate::disk_headroom::disk_headroom_limit`]), and the operator ceiling
-//! (`LOOM_WORK_FINDER_MAX_CONCURRENT`, repurposed from Phase A's fixed target
-//! into a *ceiling*). The effective per-tick concurrency is then
-//! `min(dynamic_cap, backlog_depth)`: [`tick`] iterates the ready `loom:issue`
-//! rows and stops at the cap, so concurrency scales **up** as the backlog grows
-//! and drains to **zero** dispatches when the queue is empty — all without a
-//! daemon restart, since pool/disk/backlog are read fresh each tick.
+//! [`resolve_dynamic_max_concurrent`] from live inputs — the token-pool size
+//! ([`crate::tokens::token_pool_size`]), the worktree-root disk headroom
+//! ([`crate::disk_headroom::disk_headroom_limit`]), the host's CPU/load
+//! headroom ([`crate::cpu_headroom::cpu_headroom_limit`], #3978 — added because
+//! the token/disk axes alone let a batch of resetting accounts push the cap up
+//! regardless of how many concurrent `cargo build`s were already saturating the
+//! host), and the operator ceiling (`LOOM_WORK_FINDER_MAX_CONCURRENT`,
+//! repurposed from Phase A's fixed target into a *ceiling*). The effective
+//! per-tick concurrency is then `min(dynamic_cap, backlog_depth)`: [`tick`]
+//! iterates the ready `loom:issue` rows and stops at the cap, so concurrency
+//! scales **up** as the backlog grows and drains to **zero** dispatches when
+//! the queue is empty — all without a daemon restart, since
+//! pool/disk/cpu/backlog are read fresh each tick.
 //!
 //! # Idempotency & fail-safe
 //!
@@ -80,6 +85,7 @@ use std::time::Duration;
 use anyhow::Result;
 
 use crate::capacity::{self, CapacityAdvisory};
+use crate::cpu_headroom::cpu_headroom_limit;
 use crate::disk_headroom::disk_headroom_limit;
 use crate::event_bus::EventBus;
 use crate::main_health_gate::{MainHealthState, WorkspaceHealthStates};
@@ -828,8 +834,9 @@ pub fn resolve_per_token_concurrency(config: &WorkFinderConfig) -> usize {
 }
 
 /// Compute the **work-driven dynamic concurrency cap** (Phase B, #3811;
-/// per-token concurrency factor added in #3947):
-/// `min(token_limit × per_token_concurrency, disk_headroom, configured_max)`.
+/// per-token concurrency factor added in #3947; CPU/load term added in
+/// #3978): `min(token_limit × per_token_concurrency, disk_headroom,
+/// cpu_headroom, configured_max)`.
 ///
 /// This is the total-concurrency ceiling for the loop, recomputed every tick
 /// from live inputs. It deliberately does **not** fold in the backlog depth:
@@ -840,7 +847,7 @@ pub fn resolve_per_token_concurrency(config: &WorkFinderConfig) -> usize {
 /// `loom:building` sweeps that are **not** in the ready backlog. Folding backlog
 /// into the cap here would under-utilize the pool whenever prior-tick sweeps are
 /// still running (a smaller "new work" number would cap total occupancy below
-/// the pool/disk ceiling). Keeping the cap as `min(token×factor, disk,
+/// the pool/disk/cpu ceiling). Keeping the cap as `min(token×factor, disk, cpu,
 /// configured)` and letting `tick` apply the backlog bound is what makes
 /// concurrency scale up with the backlog and drain to zero when it empties.
 ///
@@ -854,9 +861,17 @@ pub fn resolve_per_token_concurrency(config: &WorkFinderConfig) -> usize {
 ///   even though the single healthy account had ample session-window headroom.
 /// - `disk_headroom` — never provision more worktrees than the scratch volume
 ///   can hold at `LOOM_PER_WORKTREE_GB` each.
+/// - `cpu_headroom` (#3978) — never start more concurrent sweeps than the host
+///   has CPU/load headroom for, at `LOOM_EST_CORES_PER_SWEEP` estimated cores
+///   each. This is the term the pre-#3978 formula lacked: a token-axis jump
+///   (e.g. several exhausted accounts resetting at once) used to raise the
+///   cap regardless of how many concurrent `cargo build`s were already
+///   running in worktrees, which could starve the main-health gate's own
+///   build of CPU badly enough to false-time-out. See
+///   [`crate::cpu_headroom::cpu_headroom_limit`].
 /// - `configured_max` — the operator ceiling
 ///   (`LOOM_WORK_FINDER_MAX_CONCURRENT`), a hard upper bound regardless of how
-///   much token/disk headroom exists.
+///   much token/disk/cpu headroom exists.
 ///
 /// `per_token_concurrency` is clamped to a floor of `1` so a mis-set `0`
 /// degrades to the pre-#3947 one-sweep-per-account behavior rather than
@@ -867,11 +882,13 @@ pub fn resolve_dynamic_max_concurrent(
     token_limit: usize,
     per_token_concurrency: usize,
     disk_headroom: usize,
+    cpu_headroom: usize,
     configured_max: usize,
 ) -> usize {
     token_limit
         .saturating_mul(per_token_concurrency.max(1))
         .min(disk_headroom)
+        .min(cpu_headroom)
         .min(configured_max)
 }
 
@@ -883,13 +900,14 @@ pub fn resolve_dynamic_max_concurrent(
 /// handle so the daemon can keep it alive for the process lifetime.
 ///
 /// Every `interval`, the task recomputes the **dynamic** concurrency cap
-/// (Phase B, #3811) — `min(token-pool size, disk headroom, configured_max)` via
+/// (Phase B, #3811; CPU/load term #3978) — `min(token-pool size, disk
+/// headroom, cpu/load headroom, configured_max)` via
 /// [`resolve_dynamic_max_concurrent`] — from live inputs read fresh under
 /// `workspace_root`, then runs one [`tick`] with it. The cap is **not** captured
 /// once at startup, so a pool that grows/shrinks (`loom-tokens bootstrap`), a
-/// scratch volume that fills/frees, or a draining backlog are all honored
-/// without a daemon restart. `configured_max` is the operator ceiling
-/// (`LOOM_WORK_FINDER_MAX_CONCURRENT`).
+/// scratch volume that fills/frees, current host load, or a draining backlog
+/// are all honored without a daemon restart. `configured_max` is the operator
+/// ceiling (`LOOM_WORK_FINDER_MAX_CONCURRENT`).
 ///
 /// Unlike the epic supervisor, no dedicated OS thread is needed:
 /// [`SweepRegistry::dispatch`] returns promptly (fire-and-forget child spawn),
@@ -917,7 +935,7 @@ where
     log::info!(
         "work_finder: starting loop (interval={}s, configured_max={configured_max}, \
          per_token_concurrency={per_token_concurrency}, \
-         dynamic cap = min(healthy tokens × per-token, disk, configured_max))",
+         dynamic cap = min(healthy tokens × per-token, disk, cpu, configured_max))",
         interval.as_secs()
     );
     tokio::spawn(async move {
@@ -947,16 +965,19 @@ where
             let ranking = capacity::read_ranking(&workspace_root);
             let token_limit = ranking.as_ref().map_or(pool_size, |r| r.available);
             let disk = disk_headroom_limit(&workspace_root);
+            // CPU/load headroom (#3978): the term the pre-#3978 formula lacked.
+            let cpu = cpu_headroom_limit();
             let max_concurrent = resolve_dynamic_max_concurrent(
                 token_limit,
                 per_token_concurrency,
                 disk,
+                cpu,
                 configured_max,
             );
             log::debug!(
                 "work_finder: dynamic cap = {max_concurrent} (pool={pool_size}, \
                  healthy_tokens={token_limit}, per_token={per_token_concurrency}, disk={disk}, \
-                 configured_max={configured_max}, halted={halted})"
+                 cpu={cpu}, configured_max={configured_max}, halted={halted})"
             );
             match tick(&mut source, &mut dispatcher, max_concurrent, halted) {
                 Ok(report) => {
@@ -975,7 +996,7 @@ where
                         log::info!(
                             "work_finder: tick — cap {max_concurrent} (pool={pool_size}, \
                              healthy={token_limit}, per_token={per_token_concurrency}, disk={disk}, \
-                             ceiling={configured_max}); \
+                             cpu={cpu}, ceiling={configured_max}); \
                              {} seen, {} dispatched, {} labeled-skip, {} in-flight-skip, \
                              {} quarantine-skip, {} deferred, {} error(s)",
                             report.seen,
@@ -996,6 +1017,7 @@ where
                             pool_size,
                             token_limit,
                             disk,
+                            cpu,
                             configured_max,
                             report.deferred_capacity,
                             capacity::DEFAULT_ADVISORY_MIN_QUEUED,
@@ -1057,7 +1079,7 @@ pub fn spawn_multi_work_finder_task(
     log::info!(
         "work_finder: starting multi-workspace loop (interval={}s, configured_max={configured_max}, \
          per_token_concurrency={per_token_concurrency}, \
-         dynamic cap = min(healthy tokens × per-token, disk, configured_max), global across workspaces)",
+         dynamic cap = min(healthy tokens × per-token, disk, cpu, configured_max), global across workspaces)",
         interval.as_secs()
     );
     tokio::spawn(async move {
@@ -1076,10 +1098,14 @@ pub fn spawn_multi_work_finder_task(
             let ranking = capacity::read_ranking(&fallback_root);
             let token_limit = ranking.as_ref().map_or(pool_size, |r| r.available);
             let disk = disk_headroom_limit(&fallback_root);
+            // CPU/load headroom (#3978) — also a machine-level resource, probed
+            // once per tick and shared across every workspace.
+            let cpu = cpu_headroom_limit();
             let max_concurrent = resolve_dynamic_max_concurrent(
                 token_limit,
                 per_token_concurrency,
                 disk,
+                cpu,
                 configured_max,
             );
 
@@ -1111,8 +1137,8 @@ pub fn spawn_multi_work_finder_task(
             log::debug!(
                 "work_finder: dynamic cap = {max_concurrent} (pool={pool_size}, \
                  healthy_tokens={token_limit}, per_token={per_token_concurrency}, disk={disk}, \
-                 configured_max={configured_max}, any_halted={any_halted}, workspaces={}, \
-                 priorities={priorities:?})",
+                 cpu={cpu}, configured_max={configured_max}, any_halted={any_halted}, \
+                 workspaces={}, priorities={priorities:?})",
                 pairs.len()
             );
 
@@ -1134,7 +1160,7 @@ pub fn spawn_multi_work_finder_task(
                 log::info!(
                     "work_finder: tick — cap {max_concurrent} (pool={pool_size}, \
                      healthy={token_limit}, per_token={per_token_concurrency}, disk={disk}, \
-                     ceiling={configured_max}); {} workspace(s), \
+                     cpu={cpu}, ceiling={configured_max}); {} workspace(s), \
                      {} seen, {} dispatched, {} labeled-skip, {} in-flight-skip, \
                      {} quarantine-skip, {} deferred, {} error(s)",
                     pairs.len(),
@@ -1154,6 +1180,7 @@ pub fn spawn_multi_work_finder_task(
                     pool_size,
                     token_limit,
                     disk,
+                    cpu,
                     configured_max,
                     report.deferred_capacity,
                     capacity::DEFAULT_ADVISORY_MIN_QUEUED,
@@ -2276,27 +2303,29 @@ exit 0
 
     // ===================================================================
     // resolve_dynamic_max_concurrent — Phase B work-driven policy (#3811),
-    // per-token concurrency factor (#3947)
+    // per-token concurrency factor (#3947), CPU/load headroom term (#3978)
     // ===================================================================
 
     #[test]
-    fn test_dynamic_cap_is_min_of_three_inputs() {
-        // Never exceeds any of the three bounds (factor 1 = pre-#3947 semantics).
-        assert_eq!(resolve_dynamic_max_concurrent(10, 1, 10, 10), 10);
-        assert_eq!(resolve_dynamic_max_concurrent(2, 1, 9, 9), 2, "token axis binds");
-        assert_eq!(resolve_dynamic_max_concurrent(9, 1, 3, 9), 3, "disk binds");
-        assert_eq!(resolve_dynamic_max_concurrent(9, 1, 9, 4), 4, "ceiling binds");
+    fn test_dynamic_cap_is_min_of_four_inputs() {
+        // Never exceeds any of the four bounds (factor 1 = pre-#3947 semantics).
+        assert_eq!(resolve_dynamic_max_concurrent(10, 1, 10, 10, 10), 10);
+        assert_eq!(resolve_dynamic_max_concurrent(2, 1, 9, 9, 9), 2, "token axis binds");
+        assert_eq!(resolve_dynamic_max_concurrent(9, 1, 3, 9, 9), 3, "disk binds");
+        assert_eq!(resolve_dynamic_max_concurrent(9, 1, 9, 4, 9), 4, "cpu binds");
+        assert_eq!(resolve_dynamic_max_concurrent(9, 1, 9, 9, 4), 4, "ceiling binds");
     }
 
     #[test]
     fn test_dynamic_cap_pool_size_bound_never_over_subscribes() {
-        // With a large disk headroom and ceiling and factor 1, the token-pool
-        // size is the hard bound — the cap never exceeds the number of accounts.
+        // With a large disk headroom, cpu headroom, and ceiling and factor 1,
+        // the token-pool size is the hard bound — the cap never exceeds the
+        // number of accounts.
         for pool in 0..=5 {
             assert_eq!(
-                resolve_dynamic_max_concurrent(pool, 1, 100, 100),
+                resolve_dynamic_max_concurrent(pool, 1, 100, 100, 100),
                 pool,
-                "cap must equal pool size {pool} when disk/ceiling are larger"
+                "cap must equal pool size {pool} when disk/cpu/ceiling are larger"
             );
         }
     }
@@ -2306,9 +2335,24 @@ exit 0
         // A nearly-full scratch volume (disk headroom 1) caps concurrency at 1
         // even with a big pool, high ceiling, AND a big per-token factor (#3947):
         // stacking never provisions more worktrees than the disk can hold.
-        assert_eq!(resolve_dynamic_max_concurrent(8, 4, 1, 8), 1);
+        assert_eq!(resolve_dynamic_max_concurrent(8, 4, 1, 8, 8), 1);
         // A full volume (0 headroom) drops the cap to 0 — dispatch nothing.
-        assert_eq!(resolve_dynamic_max_concurrent(8, 4, 0, 8), 0);
+        assert_eq!(resolve_dynamic_max_concurrent(8, 4, 0, 8, 8), 0);
+    }
+
+    #[test]
+    fn test_dynamic_cap_cpu_headroom_bound() {
+        // #3978 core: a saturated host (cpu headroom 1) caps concurrency at 1
+        // even with a big pool, ample disk, AND a big per-token factor — never
+        // start more concurrent sweep builds than the host's CPU/load headroom
+        // can currently absorb (this is what starved the build-gate's own
+        // `cargo` invocation of CPU in the #3978 incident).
+        assert_eq!(resolve_dynamic_max_concurrent(8, 4, 8, 1, 8), 1);
+        // Unlike disk, the cpu_headroom *term itself* is policy-floored at 1
+        // (see `crate::cpu_headroom::cpu_headroom`), so a caller can never pass
+        // 0 for it from the real end-to-end path — but the raw `min` here still
+        // honors whatever is passed, including a defensive 0.
+        assert_eq!(resolve_dynamic_max_concurrent(8, 4, 8, 0, 8), 0);
     }
 
     #[test]
@@ -2316,7 +2360,7 @@ exit 0
         // No usable tokens ⇒ cap 0 regardless of the factor (0 × N = 0) ⇒ a
         // subsequent tick dispatches nothing (the spawn path would hard-fail
         // EX_CONFIG anyway).
-        let cap = resolve_dynamic_max_concurrent(0, 2, 10, 10);
+        let cap = resolve_dynamic_max_concurrent(0, 2, 10, 10, 10);
         assert_eq!(cap, 0);
         let mut source = FakeSource::once((1..=3).map(issue).collect());
         let mut disp = RecordingDispatcher::default();
@@ -2329,13 +2373,18 @@ exit 0
     #[test]
     fn test_dynamic_cap_per_token_factor_multiplies_token_axis() {
         // #3947 core: the token axis is `healthy × per-token`, not `healthy × 1`.
-        // 3 healthy accounts × factor 2 = 6, bounded only by disk/ceiling.
-        assert_eq!(resolve_dynamic_max_concurrent(3, 2, 100, 100), 6);
+        // 3 healthy accounts × factor 2 = 6, bounded only by disk/cpu/ceiling.
+        assert_eq!(resolve_dynamic_max_concurrent(3, 2, 100, 100, 100), 6);
         // 2 healthy × factor 3 = 6.
-        assert_eq!(resolve_dynamic_max_concurrent(2, 3, 100, 100), 6);
-        // The product is still clamped by disk and the operator ceiling.
-        assert_eq!(resolve_dynamic_max_concurrent(3, 2, 4, 100), 4, "disk clamps the product");
-        assert_eq!(resolve_dynamic_max_concurrent(3, 2, 100, 5), 5, "ceiling clamps the product");
+        assert_eq!(resolve_dynamic_max_concurrent(2, 3, 100, 100, 100), 6);
+        // The product is still clamped by disk, cpu, and the operator ceiling.
+        assert_eq!(resolve_dynamic_max_concurrent(3, 2, 4, 100, 100), 4, "disk clamps the product");
+        assert_eq!(resolve_dynamic_max_concurrent(3, 2, 100, 4, 100), 4, "cpu clamps the product");
+        assert_eq!(
+            resolve_dynamic_max_concurrent(3, 2, 100, 100, 5),
+            5,
+            "ceiling clamps the product"
+        );
     }
 
     #[test]
@@ -2343,8 +2392,8 @@ exit 0
         // The load-bearing #3947 scenario (6/7 accounts at their weekly ceiling):
         // ONE healthy account with factor 2 must allow TWO concurrent sweeps —
         // the pre-#3947 implicit 1:1 cap would have collapsed this to 1.
-        let cap = resolve_dynamic_max_concurrent(1, 2, 120, 3);
-        assert_eq!(cap, 2, "1 healthy × per-token 2 = 2 (disk 120, ceiling 3 don't bind)");
+        let cap = resolve_dynamic_max_concurrent(1, 2, 120, 120, 3);
+        assert_eq!(cap, 2, "1 healthy × per-token 2 = 2 (disk 120, cpu 120, ceiling 3 don't bind)");
 
         // And that cap actually dispatches 2 (not 1) against a 2-deep backlog.
         let mut source = FakeSource::once((1..=2).map(issue).collect());
@@ -2359,7 +2408,19 @@ exit 0
     fn test_dynamic_cap_zero_factor_degrades_to_one() {
         // A mis-set factor 0 must NOT collapse the cap to zero — it degrades to
         // the pre-#3947 one-sweep-per-account behavior (floor of 1).
-        assert_eq!(resolve_dynamic_max_concurrent(4, 0, 100, 100), 4);
+        assert_eq!(resolve_dynamic_max_concurrent(4, 0, 100, 100, 100), 4);
+    }
+
+    #[test]
+    fn test_dynamic_cap_token_axis_jump_bounded_by_cpu_the_3978_scenario() {
+        // The exact incident this issue fixes: several exhausted token
+        // accounts reset at once, jumping the healthy-token count from 2 to
+        // 14 (a pre-#3978 formula would raise the cap to 14 × per-token
+        // regardless of host load). With concurrent Rust builds already
+        // saturating the host (cpu headroom backed off to 3), the cap must
+        // stay bounded at 3, not jump to a CPU-starving 28.
+        let cap = resolve_dynamic_max_concurrent(14, 2, 100, 3, 100);
+        assert_eq!(cap, 3, "cpu headroom protects the host even as the token axis spikes");
     }
 
     // ===================================================================
@@ -2368,10 +2429,10 @@ exit 0
 
     #[test]
     fn test_scale_up_with_growing_backlog_bounded_by_dynamic_cap() {
-        // Fixed resources: pool=4, factor=1, disk=10, ceiling=10 ⇒ dynamic cap 4.
-        // As the backlog grows tick-over-tick, effective concurrency scales up
-        // but is bounded by the cap (min(cap, backlog)).
-        let cap = resolve_dynamic_max_concurrent(4, 1, 10, 10);
+        // Fixed resources: pool=4, factor=1, disk=10, cpu=10, ceiling=10 ⇒
+        // dynamic cap 4. As the backlog grows tick-over-tick, effective
+        // concurrency scales up but is bounded by the cap (min(cap, backlog)).
+        let cap = resolve_dynamic_max_concurrent(4, 1, 10, 10, 10);
         assert_eq!(cap, 4);
 
         // Backlog 2 (< cap): all 2 dispatch, nothing deferred.
@@ -2393,7 +2454,7 @@ exit 0
     fn test_scale_to_zero_on_empty_backlog() {
         // Even with ample resources (cap 5), an empty backlog dispatches nothing
         // — no capacity is pre-reserved and no idle workers are spawned.
-        let cap = resolve_dynamic_max_concurrent(5, 1, 5, 5);
+        let cap = resolve_dynamic_max_concurrent(5, 1, 5, 5, 5);
         assert_eq!(cap, 5);
         let mut source = FakeSource::once(vec![]);
         let mut disp = RecordingDispatcher::default();
@@ -2631,7 +2692,8 @@ exit 0
     // ===================================================================
 
     fn pressured_assessment() -> capacity::PressureAssessment {
-        // token_limit 1 < disk 10, ceiling 10; 12 deferred ⇒ token-bound + pressured.
+        // token_limit 1 < disk 10, cpu 10, ceiling 10; 12 deferred ⇒ token-bound
+        // + pressured.
         let snap = capacity::RankingSnapshot {
             total: 7,
             available: 1,
@@ -2642,6 +2704,7 @@ exit 0
             Some(&snap),
             7,
             1,
+            10,
             10,
             10,
             12,
@@ -2660,6 +2723,7 @@ exit 0
             Some(&snap),
             7,
             7,
+            10,
             10,
             10,
             0,

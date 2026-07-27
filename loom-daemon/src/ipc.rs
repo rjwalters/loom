@@ -517,6 +517,16 @@ pub fn build_daemon_status(
     let workspace_root = fallback_root;
     let token_pool_size = crate::tokens::token_pool_size(workspace_root);
     let disk_headroom = crate::disk_headroom::disk_headroom_limit(workspace_root);
+    // CPU/load headroom (#3978) — a host-level resource (not per-repo), read
+    // fresh on every status request just like disk headroom.
+    let logical_cpus = crate::cpu_headroom::logical_cpu_count();
+    let loadavg_1m = crate::cpu_headroom::read_loadavg_1m();
+    let cpu_headroom = crate::cpu_headroom::cpu_headroom(
+        logical_cpus,
+        loadavg_1m,
+        crate::cpu_headroom::utilization_target(),
+        crate::cpu_headroom::est_cores_per_sweep(),
+    );
     let wf_config = crate::work_finder::read_work_finder_config(workspace_root);
     let configured_max = crate::work_finder::resolve_max_concurrent_with_config(&wf_config);
     let per_token_concurrency = crate::work_finder::resolve_per_token_concurrency(&wf_config);
@@ -531,13 +541,16 @@ pub fn build_daemon_status(
         token_axis_limit,
         per_token_concurrency,
         disk_headroom,
+        cpu_headroom,
         configured_max,
     );
     // The token axis of the cap is `healthy × per-token` (#3947), so it is the
-    // binding constraint only when that *product* is the minimum.
+    // binding constraint only when that *product* is the minimum across every
+    // axis — disk, cpu (#3978), and the operator ceiling.
     let token_axis_effective = token_axis_limit.saturating_mul(per_token_concurrency.max(1));
-    let token_bound =
-        token_axis_effective <= disk_headroom && token_axis_effective <= configured_max;
+    let token_bound = token_axis_effective <= disk_headroom
+        && token_axis_effective <= cpu_headroom
+        && token_axis_effective <= configured_max;
     let capacity = crate::types::CapacityReport {
         ranking_present: ranking.is_some(),
         total_accounts: ranking.as_ref().map_or(token_pool_size, |r| r.total),
@@ -553,6 +566,9 @@ pub fn build_daemon_status(
         in_flight,
         token_pool_size,
         disk_headroom,
+        cpu_headroom,
+        logical_cpus,
+        loadavg_1m,
         configured_max,
         per_token_concurrency,
         dynamic_cap,
@@ -2524,6 +2540,9 @@ exit 0
             in_flight: vec![],
             token_pool_size: 4,
             disk_headroom: 10,
+            cpu_headroom: 6,
+            logical_cpus: 8,
+            loadavg_1m: Some(1.25),
             configured_max: 5,
             per_token_concurrency: 2,
             dynamic_cap: 3,
@@ -2555,6 +2574,9 @@ exit 0
             Response::DaemonStatus(r) => {
                 assert_eq!(r.token_pool_size, 4);
                 assert_eq!(r.disk_headroom, 10);
+                assert_eq!(r.cpu_headroom, 6);
+                assert_eq!(r.logical_cpus, 8);
+                assert_eq!(r.loadavg_1m, Some(1.25));
                 assert_eq!(r.configured_max, 5);
                 assert_eq!(r.dynamic_cap, 3);
                 assert!(r.main_health_gate_halted);
@@ -2591,6 +2613,10 @@ exit 0
             !report.main_health_gate_not_evaluated,
             "absent main_health_gate_not_evaluated (#3950) defaults to false"
         );
+        // Absent pre-#3978 fields default rather than failing to parse.
+        assert_eq!(report.cpu_headroom, 0);
+        assert_eq!(report.logical_cpus, 0);
+        assert_eq!(report.loadavg_1m, None);
     }
 
     /// `build_daemon_status` reflects the per-repo main-health halt flag and

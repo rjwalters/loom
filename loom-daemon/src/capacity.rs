@@ -3,7 +3,8 @@
 //!
 //! The work finder (#3810) drives approved `loom:issue` work to dispatch, and
 //! #3811 bounds its concurrency by `min(token-pool size, disk headroom,
-//! configured max)`. That policy treats the token pool as a flat count of
+//! cpu/load headroom (#3978), configured max)`. That policy treats the token
+//! pool as a flat count of
 //! `*.token` files — but at scale accounts hit their 5h/7d rate limits and go
 //! **exhausted**. Dispatching to an exhausted account produces the startup
 //! hangs / mid-build deaths seen while dogfooding. This module makes the
@@ -317,26 +318,37 @@ pub struct PressureAssessment {
 /// - `pool_size` — raw `*.token` count (the fallback health basis).
 /// - `token_limit` — the health-adjusted token-axis limit
 ///   ([`token_axis_limit`]).
-/// - `disk` / `configured_max` — the other two dynamic-cap axes.
+/// - `disk` / `cpu` / `configured_max` — the other three dynamic-cap axes
+///   (`cpu` added in #3978 — [`crate::cpu_headroom::cpu_headroom_limit`]).
 /// - `deferred` — issues the tick deferred for capacity ([`crate`]'s
 ///   `TickReport::deferred_capacity`).
 /// - `min_queued` — the advisory threshold ([`DEFAULT_ADVISORY_MIN_QUEUED`]).
 ///
-/// `token_bound` requires that the token axis is the (co-)minimum of the three
-/// cap axes: dispatch is held back by tokens, not by a full disk or the operator
-/// ceiling. This keeps the advisory from firing when the real bottleneck is disk
-/// or a deliberately low `maxConcurrent`.
+/// `token_bound` requires that the token axis is the (co-)minimum of all four
+/// cap axes: dispatch is held back by tokens specifically, not by a full disk,
+/// CPU contention, or the operator ceiling. This keeps the advisory from firing
+/// (and misleadingly telling the operator to add token accounts) when the real
+/// bottleneck is disk, CPU, or a deliberately low `maxConcurrent` — the #3978
+/// incident this guards against: a token-axis jump (exhausted accounts
+/// resetting) looks token-bound by the pre-#3978 three-axis check even though
+/// concurrent Rust builds had already made CPU the actual constraint.
 #[must_use]
+#[allow(clippy::too_many_arguments)] // one axis per dynamic-cap input + the
+                                     // advisory threshold; grouping them into a
+                                     // struct would obscure the direct mapping
+                                     // to `resolve_dynamic_max_concurrent`'s args.
 pub fn assess_pressure(
     ranking: Option<&RankingSnapshot>,
     pool_size: usize,
     token_limit: usize,
     disk: usize,
+    cpu: usize,
     configured_max: usize,
     deferred: usize,
     min_queued: usize,
 ) -> PressureAssessment {
-    let token_bound = deferred > 0 && token_limit <= disk && token_limit <= configured_max;
+    let token_bound =
+        deferred > 0 && token_limit <= disk && token_limit <= cpu && token_limit <= configured_max;
     let pressured = token_bound && deferred >= min_queued;
 
     let (total_accounts, healthy_accounts, exhausted_accounts) = match ranking {
@@ -578,7 +590,7 @@ mod tests {
     fn assess_not_token_bound_when_nothing_deferred() {
         // No deferral ⇒ not token-bound, not pressured, regardless of health.
         let s = snap(7, 3);
-        let a = assess_pressure(Some(&s), 7, 3, 10, 10, 0, DEFAULT_ADVISORY_MIN_QUEUED);
+        let a = assess_pressure(Some(&s), 7, 3, 10, 10, 10, 0, DEFAULT_ADVISORY_MIN_QUEUED);
         assert!(!a.token_bound);
         assert!(!a.pressured);
         assert_eq!(a.healthy_accounts, 3);
@@ -587,9 +599,9 @@ mod tests {
 
     #[test]
     fn assess_token_bound_when_token_axis_is_min_and_deferred() {
-        // token_limit 3 < disk 10 and < ceiling 10, with 4 deferred ⇒ token-bound.
+        // token_limit 3 < disk 10, cpu 10, and ceiling 10, with 4 deferred ⇒ token-bound.
         let s = snap(7, 3);
-        let a = assess_pressure(Some(&s), 7, 3, 10, 10, 4, DEFAULT_ADVISORY_MIN_QUEUED);
+        let a = assess_pressure(Some(&s), 7, 3, 10, 10, 10, 4, DEFAULT_ADVISORY_MIN_QUEUED);
         assert!(a.token_bound);
         assert!(a.pressured);
         assert_eq!(a.queued, 4);
@@ -601,7 +613,7 @@ mod tests {
     fn assess_not_token_bound_when_disk_is_the_binding_axis() {
         // disk 2 < token_limit 3 ⇒ the bottleneck is disk, not tokens.
         let s = snap(7, 3);
-        let a = assess_pressure(Some(&s), 7, 3, 2, 10, 5, DEFAULT_ADVISORY_MIN_QUEUED);
+        let a = assess_pressure(Some(&s), 7, 3, 2, 10, 10, 5, DEFAULT_ADVISORY_MIN_QUEUED);
         assert!(!a.token_bound, "disk binds, so no token advisory");
         assert!(!a.pressured);
     }
@@ -610,8 +622,20 @@ mod tests {
     fn assess_not_token_bound_when_ceiling_is_the_binding_axis() {
         // configured_max 2 < token_limit 3 ⇒ operator ceiling binds, not tokens.
         let s = snap(7, 3);
-        let a = assess_pressure(Some(&s), 7, 3, 10, 2, 5, DEFAULT_ADVISORY_MIN_QUEUED);
+        let a = assess_pressure(Some(&s), 7, 3, 10, 10, 2, 5, DEFAULT_ADVISORY_MIN_QUEUED);
         assert!(!a.token_bound);
+        assert!(!a.pressured);
+    }
+
+    #[test]
+    fn assess_not_token_bound_when_cpu_is_the_binding_axis() {
+        // cpu 2 < token_limit 3 ⇒ the bottleneck is CPU/load contention, not
+        // tokens — the #3978 scenario (a token-axis jump from resetting
+        // accounts, while concurrent Rust builds have already saturated the
+        // host). The advisory must not misattribute this to token capacity.
+        let s = snap(7, 3);
+        let a = assess_pressure(Some(&s), 7, 3, 10, 2, 10, 5, DEFAULT_ADVISORY_MIN_QUEUED);
+        assert!(!a.token_bound, "cpu binds, so no token advisory");
         assert!(!a.pressured);
     }
 
@@ -619,7 +643,7 @@ mod tests {
     fn assess_drain_none_when_no_healthy_accounts() {
         // All exhausted (token_limit 0), work queued ⇒ token-bound, no drain ETA.
         let s = snap(4, 0);
-        let a = assess_pressure(Some(&s), 4, 0, 10, 10, 3, DEFAULT_ADVISORY_MIN_QUEUED);
+        let a = assess_pressure(Some(&s), 4, 0, 10, 10, 10, 3, DEFAULT_ADVISORY_MIN_QUEUED);
         assert!(a.token_bound);
         assert!(a.pressured);
         assert_eq!(a.healthy_accounts, 0);
@@ -630,7 +654,7 @@ mod tests {
     fn assess_no_ranking_treats_pool_as_healthy() {
         // No ranking ⇒ pool treated as fully healthy; still token-bound if the
         // pool-sized limit is the min and work is deferred.
-        let a = assess_pressure(None, 2, 2, 10, 10, 3, DEFAULT_ADVISORY_MIN_QUEUED);
+        let a = assess_pressure(None, 2, 2, 10, 10, 10, 3, DEFAULT_ADVISORY_MIN_QUEUED);
         assert!(a.token_bound);
         assert_eq!(a.healthy_accounts, 2);
         assert_eq!(a.exhausted_accounts, 0);
@@ -641,7 +665,7 @@ mod tests {
     fn assess_threshold_gates_pressured() {
         // token_bound but below the queued threshold ⇒ not yet pressured.
         let s = snap(7, 3);
-        let a = assess_pressure(Some(&s), 7, 3, 10, 10, 2, 5);
+        let a = assess_pressure(Some(&s), 7, 3, 10, 10, 10, 2, 5);
         assert!(a.token_bound);
         assert!(!a.pressured, "2 queued < threshold 5");
     }
@@ -653,7 +677,7 @@ mod tests {
     #[test]
     fn advisory_pressure_names_the_levers() {
         let s = snap(7, 1);
-        let a = assess_pressure(Some(&s), 7, 1, 10, 10, 12, DEFAULT_ADVISORY_MIN_QUEUED);
+        let a = assess_pressure(Some(&s), 7, 1, 10, 10, 10, 12, DEFAULT_ADVISORY_MIN_QUEUED);
         let adv = CapacityAdvisory::pressure(&a);
         assert!(adv.pressured);
         assert_eq!(adv.queued, 12);
@@ -666,7 +690,7 @@ mod tests {
     #[test]
     fn advisory_recovery_is_symmetric() {
         let s = snap(7, 7);
-        let a = assess_pressure(Some(&s), 7, 7, 10, 10, 0, DEFAULT_ADVISORY_MIN_QUEUED);
+        let a = assess_pressure(Some(&s), 7, 7, 10, 10, 10, 0, DEFAULT_ADVISORY_MIN_QUEUED);
         let adv = CapacityAdvisory::recovery(&a);
         assert!(!adv.pressured);
         assert!(adv.message.contains("restored"));
@@ -676,7 +700,7 @@ mod tests {
     #[test]
     fn advisory_pressure_message_handles_zero_healthy() {
         let s = snap(3, 0);
-        let a = assess_pressure(Some(&s), 3, 0, 10, 10, 5, DEFAULT_ADVISORY_MIN_QUEUED);
+        let a = assess_pressure(Some(&s), 3, 0, 10, 10, 10, 5, DEFAULT_ADVISORY_MIN_QUEUED);
         let adv = CapacityAdvisory::pressure(&a);
         assert!(adv.message.contains("no healthy accounts"));
     }

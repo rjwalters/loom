@@ -660,7 +660,33 @@ pub struct DaemonStatusReport {
     /// Dynamic-cap input 2: how many worktrees the scratch volume can hold at
     /// `LOOM_PER_WORKTREE_GB` each. Via [`crate::disk_headroom::disk_headroom_limit`].
     pub disk_headroom: usize,
-    /// Dynamic-cap input 3: the configured operator ceiling
+    /// Dynamic-cap input 3 (#3978): how many additional concurrent sweeps the
+    /// host's CPU/load headroom can currently absorb. Via
+    /// [`crate::cpu_headroom::cpu_headroom`]. Added because the token/disk axes
+    /// alone let a batch of resetting token accounts raise the cap regardless
+    /// of how many concurrent `cargo build`s were already saturating the host
+    /// — which starved the main-health gate's own build of CPU badly enough to
+    /// false-time-out (the #3978 incident). `#[serde(default)]` keeps pre-#3978
+    /// wire data / older clients compatible (an absent field parses as `0`,
+    /// which the status renderer never treats as a real reading — see
+    /// [`Self::logical_cpus`]).
+    #[serde(default)]
+    pub cpu_headroom: usize,
+    /// The host's logical CPU count feeding [`Self::cpu_headroom`] (#3978), via
+    /// [`crate::cpu_headroom::logical_cpu_count`]. Surfaced so the status view
+    /// can render "X healthy cores" context next to the headroom number.
+    /// `#[serde(default)]` keeps pre-#3978 wire data compatible.
+    #[serde(default)]
+    pub logical_cpus: usize,
+    /// The current 1-minute load average feeding [`Self::cpu_headroom`]
+    /// (#3978), via [`crate::cpu_headroom::read_loadavg_1m`]. `None` on a
+    /// platform/host where no load-average source is available (the CPU term
+    /// then falls back to its static, load-agnostic capacity — see the
+    /// [`crate::cpu_headroom`] module docs). `#[serde(default)]` keeps
+    /// pre-#3978 wire data compatible.
+    #[serde(default)]
+    pub loadavg_1m: Option<f64>,
+    /// Dynamic-cap input 4: the configured operator ceiling
     /// (`autonomous.workFinder.maxConcurrent` / `LOOM_WORK_FINDER_MAX_CONCURRENT`).
     pub configured_max: usize,
     /// The per-token concurrency factor (#3947): how many concurrent sweeps the
@@ -673,9 +699,10 @@ pub struct DaemonStatusReport {
     #[serde(default)]
     pub per_token_concurrency: usize,
     /// The effective dynamic concurrency cap —
-    /// `min(token_axis × per_token_concurrency, disk_headroom, configured_max)`
-    /// (`resolve_dynamic_max_concurrent`). This is the total-occupancy ceiling
-    /// the work finder recomputes every tick.
+    /// `min(token_axis × per_token_concurrency, disk_headroom, cpu_headroom,
+    /// configured_max)` (`resolve_dynamic_max_concurrent`, CPU term #3978).
+    /// This is the total-occupancy ceiling the work finder recomputes every
+    /// tick.
     pub dynamic_cap: usize,
     /// Whether autonomous dispatch is currently halted by the reactive
     /// main-health gate (#3812). `true` means a red `main` has paused new

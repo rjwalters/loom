@@ -13,6 +13,7 @@
 pub mod activity;
 pub mod capacity;
 pub mod claim_reconciliation;
+pub mod cpu_headroom;
 pub mod disk_headroom;
 pub mod epic_state;
 pub mod epic_supervisor;

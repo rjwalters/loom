@@ -579,11 +579,14 @@ async fn main() -> Result<()> {
     // concurrency scaling added in #3811 — Phase B). Opt-in via
     // `LOOM_WORK_FINDER`. Each tick queries the forge for open `loom:issue`
     // items and dispatches up to a **work-driven** cap — recomputed every tick as
-    // `min(token-pool size, disk headroom, configured_max)` — through the same
-    // `SweepRegistry::dispatch()` path the IPC `DispatchSweep` request uses.
-    // `LOOM_WORK_FINDER_MAX_CONCURRENT` is repurposed (Phase A → B) from a fixed
-    // target into the operator ceiling; the cap also never exceeds the token-pool
-    // size (no account over-subscription) nor the scratch-volume disk headroom.
+    // `min(token-pool size, disk headroom, cpu/load headroom, configured_max)`
+    // (CPU/load term added in #3978) — through the same `SweepRegistry::dispatch()`
+    // path the IPC `DispatchSweep` request uses. `LOOM_WORK_FINDER_MAX_CONCURRENT`
+    // is repurposed (Phase A → B) from a fixed target into the operator ceiling;
+    // the cap also never exceeds the token-pool size (no account
+    // over-subscription), the scratch-volume disk headroom, nor the host's CPU
+    // headroom (never starve concurrent sweep builds into starving the
+    // main-health gate's own build, #3978).
     //
     // Unlike the epic supervisor above, this runs as a plain `tokio::spawn`
     // interval task on the shared daemon runtime (like the reaper): every call
@@ -605,7 +608,8 @@ async fn main() -> Result<()> {
         log::info!(
             "work_finder: enabled (multi-workspace, interval={}s, configured_max={configured_max}, \
              per_token_concurrency={per_token_concurrency}, \
-             dynamic cap = min(healthy tokens × per-token, disk, configured_max), global across workspaces)",
+             dynamic cap = min(healthy tokens × per-token, disk, cpu, configured_max), \
+             global across workspaces)",
             interval.as_secs()
         );
         // Multi-workspace fan-out (#3928): re-reads `effective_roots()` each tick
@@ -1409,7 +1413,8 @@ struct ResolvedCapacity {
     /// fallback) — the "healthy tokens" input to the dynamic concurrency cap.
     token_axis_limit: usize,
     /// The effective dynamic cap consistent with `token_axis_limit`:
-    /// `min(token_axis_limit, disk_headroom, configured_max)`.
+    /// `min(token_axis_limit, disk_headroom, cpu_headroom, configured_max)`
+    /// (CPU term added in #3978).
     effective_cap: usize,
     /// Whether the token axis is the binding (minimum) constraint.
     token_bound: bool,
@@ -1443,10 +1448,24 @@ fn resolve_capacity(
             // pre-#3947 wire `0` as the effective floor of 1.
             let factor = report.per_token_concurrency.max(1);
             let token_axis_effective = token_axis_limit.saturating_mul(factor);
+            // The CPU term (#3978) is policy-floored at 1 by
+            // `cpu_headroom::cpu_headroom` on every real computation, so a wire
+            // value of exactly `0` unambiguously means "an older daemon that
+            // predates #3978 didn't send this field" (`#[serde(default)]`) —
+            // not a genuine zero-headroom reading. Treat it as unconstrained
+            // rather than collapsing the cap to 0 against a daemon that never
+            // computed a CPU term at all.
+            let cpu_headroom = if report.cpu_headroom == 0 {
+                usize::MAX
+            } else {
+                report.cpu_headroom
+            };
             let effective_cap = token_axis_effective
                 .min(report.disk_headroom)
+                .min(cpu_headroom)
                 .min(report.configured_max);
             let token_bound = token_axis_effective <= report.disk_headroom
+                && token_axis_effective <= cpu_headroom
                 && token_axis_effective <= report.configured_max;
             return ResolvedCapacity {
                 source: "probe",
@@ -1501,6 +1520,12 @@ fn print_status_json(
         "dynamic_cap": {
             "token_pool_size": report.token_pool_size,
             "disk_headroom": report.disk_headroom,
+            // CPU/load headroom term (#3978) — see the field docs on
+            // `DaemonStatusReport::cpu_headroom` for the pre-#3978 `0` ⇒
+            // "field absent" wire-compat convention.
+            "cpu_headroom": report.cpu_headroom,
+            "logical_cpus": report.logical_cpus,
+            "loadavg_1m": report.loadavg_1m,
             "configured_max": report.configured_max,
             "per_token_concurrency": report.per_token_concurrency.max(1),
             "token_axis_effective": rc.token_axis_limit.saturating_mul(report.per_token_concurrency.max(1)),
@@ -1610,13 +1635,32 @@ fn print_status_human(
     let factor = report.per_token_concurrency.max(1);
     println!("\nDynamic concurrency cap: {}", rc.effective_cap);
     println!(
-        "  = min(healthy {} × per-token {} = {}, disk headroom {}, configured max {})",
+        "  = min(healthy {} × per-token {} = {}, disk headroom {}, cpu headroom {}, \
+         configured max {})",
         rc.token_axis_limit,
         factor,
         rc.token_axis_limit.saturating_mul(factor),
         report.disk_headroom,
+        report.cpu_headroom,
         report.configured_max
     );
+    // CPU/load headroom detail (#3978 AC4: "status shows current
+    // loadavg/CPU headroom next to disk headroom"). `cpu_headroom == 0` with
+    // `logical_cpus == 0` means an older daemon (pre-#3978) never sent these
+    // fields — nothing to show.
+    if report.logical_cpus > 0 {
+        match report.loadavg_1m {
+            Some(load) => println!(
+                "  cpu headroom: {} concurrent-sweep slot(s) ({} logical cores, 1m loadavg {load:.2})",
+                report.cpu_headroom, report.logical_cpus
+            ),
+            None => println!(
+                "  cpu headroom: {} concurrent-sweep slot(s) ({} logical cores, loadavg \
+                 unavailable on this platform — static capacity only)",
+                report.cpu_headroom, report.logical_cpus
+            ),
+        }
+    }
 
     // Token-capacity backpressure section (#3902, source-unified in #3936).
     println!("\nToken capacity:");
