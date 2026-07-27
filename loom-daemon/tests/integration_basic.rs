@@ -5,10 +5,32 @@
 mod common;
 
 use common::{
-    capture_terminal_output, cleanup_all_loom_sessions, cleanup_test_sessions, tmux_session_exists,
-    TestClient, TestDaemon,
+    capture_terminal_output, cleanup_all_loom_sessions, cleanup_test_sessions, tmux_available,
+    tmux_session_exists, TestClient, TestDaemon,
 };
 use serial_test::serial;
+
+/// Skip the enclosing test (early `return`) with a loud note when no usable
+/// tmux server is reachable on this host (issue #3985).
+///
+/// These terminal-lifecycle tests *create* tmux sessions, so a host without a
+/// working tmux (dead server, missing binary, unwritable socket dir) can only
+/// ever fail them — for a reason that has nothing to do with the code under
+/// test. Skipping keeps the shared build gate green on a busy dev host while
+/// CI, which always has a live tmux, still exercises the real path. The gate
+/// also excludes integration test targets entirely (see
+/// `.loom/docs/build-gate.md`), so this is belt-and-suspenders.
+macro_rules! require_tmux {
+    () => {
+        if !tmux_available() {
+            eprintln!(
+                "SKIP: no usable tmux server on this host (issue #3985); \
+                 this terminal-lifecycle path is covered by CI"
+            );
+            return;
+        }
+    };
+}
 
 /// Cleanup helper to run before/after tests.
 /// Cleans ALL loom sessions to prevent the daemon from restoring orphan sessions
@@ -119,6 +141,7 @@ async fn test_malformed_json() {
 #[serial]
 async fn test_create_terminal() {
     setup();
+    require_tmux!();
 
     let daemon = TestDaemon::start().await.expect("Failed to start daemon");
     let mut client = TestClient::connect(daemon.socket_path())
@@ -149,6 +172,7 @@ async fn test_create_terminal() {
 #[allow(clippy::panic)]
 async fn test_create_terminal_with_working_dir() {
     setup();
+    require_tmux!();
 
     let daemon = TestDaemon::start().await.expect("Failed to start daemon");
     let mut client = TestClient::connect(daemon.socket_path())
@@ -219,6 +243,7 @@ async fn test_create_terminal_with_working_dir() {
 #[serial]
 async fn test_list_terminals() {
     setup();
+    require_tmux!();
 
     let daemon = TestDaemon::start().await.expect("Failed to start daemon");
     let mut client = TestClient::connect(daemon.socket_path())
@@ -281,6 +306,7 @@ async fn test_list_terminals() {
 #[serial]
 async fn test_destroy_terminal() {
     setup();
+    require_tmux!();
 
     let daemon = TestDaemon::start().await.expect("Failed to start daemon");
     let mut client = TestClient::connect(daemon.socket_path())
@@ -344,6 +370,7 @@ async fn test_destroy_nonexistent_terminal() {
 #[serial]
 async fn test_send_input() {
     setup();
+    require_tmux!();
 
     let daemon = TestDaemon::start().await.expect("Failed to start daemon");
     let mut client = TestClient::connect(daemon.socket_path())
@@ -381,6 +408,7 @@ async fn test_send_input() {
 #[serial]
 async fn test_multiple_clients() {
     setup();
+    require_tmux!();
 
     let daemon = TestDaemon::start().await.expect("Failed to start daemon");
 
