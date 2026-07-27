@@ -297,6 +297,26 @@ output=$(LOOM_WORKSPACE="$TEST_WS" PATH="$STUB_DIR:$PATH" \
 assert_contains "spawn-claude: LOOM_SWEEP_CLAIM_OWNED=3964" "$output" \
     "spawn-claude logs the daemon self-claim marker's value when set (#3967)"
 
+# Test: the positional `--claim-owned <N>` flag (issue #4111 — the belt half
+# of the belt-and-suspenders fix) reaches the child's own argv verbatim,
+# alongside the env var. #4111's incident was the env var being exported
+# correctly and STILL being ignored by the child's `/loom:sweep` pre-flight;
+# the flag is the mechanical fix (a value baked into the invocation's own
+# text, not an ambient var the model has no standing reason to introspect).
+# spawn-claude.sh does not special-case this flag — it is a pure passthrough
+# like any other unrecognized argv token — so this test asserts fidelity of
+# that passthrough end-to-end, exactly as `SweepRegistry::spawn_child` emits
+# it (`-p "<prompt>" --claim-owned <N>`).
+output=$(LOOM_WORKSPACE="$TEST_WS" PATH="$STUB_DIR:$PATH" \
+    LOOM_SWEEP_CLAIM_OWNED="4111" \
+    "$SCRIPTS_DIR/spawn-claude.sh" -p "/loom:sweep 4111" --claim-owned 4111 \
+        --dangerously-skip-permissions 2>&1 || true)
+assert_contains "stub-claude args=-p /loom:sweep 4111 --claim-owned 4111 --dangerously-skip-permissions" \
+    "$output" \
+    "spawn-claude forwards the --claim-owned flag verbatim to claude, alongside the env var (#4111)"
+assert_contains "spawn-claude: LOOM_SWEEP_CLAIM_OWNED=4111" "$output" \
+    "spawn-claude still logs the env var when the --claim-owned flag is also present (#4111 backward compat)"
+
 # Test: explicit CLAUDE_CODE_OAUTH_TOKEN bypasses selection
 output=$(LOOM_WORKSPACE="$TEST_WS" PATH="$STUB_DIR:$PATH" \
     CLAUDE_CODE_OAUTH_TOKEN="caller-supplied" \
