@@ -84,6 +84,19 @@ These tools front the Rust `loom-daemon` (Tier 2) over its Unix-socket IPC and b
 | `subscribe_to_events` | Stream topic-filtered events to a subscriber |
 | `tail_event_bus` | Tail the event bus without subscribing to a topic |
 
+### Durable Watches (3 tools)
+
+These tools register durable operator watches on issue/PR terminal state (#3971).
+A watch is persisted machine-level by the long-lived `loom-daemon`, so it survives
+the registering session's death **and** a daemon restart; resolutions are appended
+to `~/.loom/logs/watch-results.log`.
+
+| Tool | Description |
+|------|-------------|
+| `register_watch` | Register a durable watch on an issue/PR (cross-repo via `repo`/`workspace_root`; idempotent) |
+| `list_watches` | List active durable watches |
+| `remove_watch` | Remove a watch by id |
+
 > **If these tools are missing from a live session**, `dist/index.js` is almost
 > certainly a **stale build** predating the sweep tools. See
 > [Rebuilding after source changes](#rebuilding-after-source-changes-reconnect-required).

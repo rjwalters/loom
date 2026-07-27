@@ -12,6 +12,7 @@ use loom_daemon::sweep_registry::{self, SweepRegistry, SweepRegistryConfig};
 use loom_daemon::terminal::TerminalManager;
 use loom_daemon::token_ranking_refresh;
 use loom_daemon::types::{DaemonStatusReport, Request, Response, SweepKind};
+use loom_daemon::watch_registry;
 use loom_daemon::work_finder;
 use loom_daemon::workspace_pool::WorkspacePool;
 use loom_daemon::{extract_configured_terminal_ids, rotate_log_file};
@@ -157,6 +158,16 @@ enum Commands {
         depends_on: Option<u32>,
     },
 
+    /// Manage durable operator watches on issue/PR terminal state (Issue #3971).
+    /// A watch registered here is persisted to `~/.loom/watches.json` and polled
+    /// by the running daemon, so it survives this shell — and even a daemon
+    /// restart. Terminal resolutions land in `~/.loom/logs/watch-results.log`.
+    /// Connects to the running daemon over its Unix socket.
+    Watch {
+        #[command(subcommand)]
+        action: WatchAction,
+    },
+
     /// Validate role configuration completeness
     Validate {
         /// Workspace directory containing .loom/config.json
@@ -220,6 +231,47 @@ enum WorkspaceAction {
     },
 }
 
+/// Sub-actions for `loom-daemon watch` (Issue #3971).
+#[derive(Subcommand)]
+enum WatchAction {
+    /// Register a durable watch on an issue's or PR's terminal state.
+    Add {
+        /// The issue or PR number to watch.
+        #[arg(value_name = "NUMBER")]
+        number: u32,
+
+        /// Watch a pull request instead of an issue.
+        #[arg(long)]
+        pr: bool,
+
+        /// Forge slug `owner/name` (preferred — works cross-repo for a repo this
+        /// machine may not manage). Omit to resolve from `--workspace-root` or the
+        /// daemon's own cwd.
+        #[arg(long, value_name = "OWNER/NAME")]
+        repo: Option<String>,
+
+        /// Workspace root the `gh` query runs in when `--repo` is absent.
+        #[arg(long, value_name = "PATH")]
+        workspace_root: Option<String>,
+
+        /// Optional note surfaced in the recorded result line.
+        #[arg(long, value_name = "TEXT")]
+        note: Option<String>,
+    },
+    /// List the currently-registered durable watches.
+    List {
+        /// Emit machine-readable JSON instead of the human-readable table.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Remove a registered watch by its id.
+    Remove {
+        /// The watch id (as printed by `watch add` / `watch list`).
+        #[arg(value_name = "ID")]
+        id: String,
+    },
+}
+
 /// Sub-actions for `loom-daemon quarantine`.
 #[derive(Subcommand)]
 enum QuarantineAction {
@@ -262,6 +314,9 @@ async fn main() -> Result<()> {
                 effort,
                 depends_on,
             } => handle_dispatch_command(issue, workspace, model, effort, depends_on).await,
+            // `watch` connects to the running daemon over its Unix socket to
+            // register/list/remove durable watches (Issue #3971).
+            Commands::Watch { action } => handle_watch_command(action).await,
             other => handle_cli_command(other),
         };
     }
@@ -696,6 +751,40 @@ async fn main() -> Result<()> {
             None
         };
 
+    // Durable watch-monitor loop (Issue #3971): the daemon polls the forge for
+    // the terminal state of operator-registered issue/PR watches
+    // (`~/.loom/watches.json`) and appends resolutions to
+    // `~/.loom/logs/watch-results.log`. Because the watch lives in a file the
+    // long-lived daemon owns, an operator's watch survives their Claude Code
+    // session dying — the failure this issue exists to fix. Like the
+    // token-ranking refresh above (and unlike the dispatch-affecting work-finder
+    // / main-health-gate loops) it is **default-ON**: it has no dispatch side
+    // effect and makes ZERO forge calls until an operator registers a watch.
+    // Config surface: `autonomous.watchMonitor.{enabled,intervalSecs,expirySecs}`,
+    // precedence env > config > default (env: `LOOM_WATCH_MONITOR` /
+    // `LOOM_WATCH_MONITOR_INTERVAL_SECS` / `LOOM_WATCH_MONITOR_EXPIRY_SECS`).
+    let watch_monitor_config = watch_registry::read_watch_monitor_config(&sweep_workspace);
+    let _watch_monitor_handle = if watch_registry::resolve_enabled(&watch_monitor_config) {
+        let interval = watch_registry::resolve_interval(&watch_monitor_config);
+        let expiry = watch_registry::resolve_expiry(&watch_monitor_config);
+        log::info!(
+            "watch_monitor: enabled (interval={}s, expiry={}s)",
+            interval.as_secs(),
+            expiry.as_secs()
+        );
+        Some(watch_registry::spawn_watch_monitor_task(
+            watch_registry::GhWatchProbe::new(),
+            interval,
+            expiry,
+        ))
+    } else {
+        log::debug!(
+            "watch_monitor: disabled (set LOOM_WATCH_MONITOR=1 or \
+             autonomous.watchMonitor.enabled=true to opt in)"
+        );
+        None
+    };
+
     // Start IPC server. `workspace_health_states` is threaded in so the
     // `DaemonStatus` request can report each registered repo's own halt state
     // (#3930), and `sweep_workspace` is the `effective_roots` fallback for the
@@ -859,6 +948,11 @@ fn handle_cli_command(command: Commands) -> Result<()> {
             // Routed directly in `main()` (it needs the async runtime for the
             // socket round-trip), never dispatched through this sync handler.
             unreachable!("Dispatch is handled in main() before handle_cli_command")
+        }
+        Commands::Watch { .. } => {
+            // Routed directly in `main()` (it needs the async runtime for the
+            // socket round-trip), never dispatched through this sync handler.
+            unreachable!("Watch is handled in main() before handle_cli_command")
         }
         Commands::Init {
             workspace,
@@ -1136,6 +1230,107 @@ async fn handle_quarantine_command(action: QuarantineAction) -> Result<()> {
             }
         }
     }
+}
+
+/// Handle the `watch` subcommand (Issue #3971). Connects to the running daemon
+/// over its Unix socket and registers/lists/removes durable watches. The watches
+/// are persisted machine-level (`~/.loom/watches.json`), so — like the daemon's
+/// other file-backed state — they survive both this shell and a daemon restart;
+/// the resolution report lands in `~/.loom/logs/watch-results.log`.
+async fn handle_watch_command(action: WatchAction) -> Result<()> {
+    use loom_daemon::watch_registry::WatchKind;
+
+    let socket_path = resolve_socket_path()?;
+    // `json_out` only applies to `list`; captured here so the request build below
+    // does not have to smuggle it back out.
+    let mut json_out = false;
+    let request = match action {
+        WatchAction::Add {
+            number,
+            pr,
+            repo,
+            workspace_root,
+            note,
+        } => Request::RegisterWatch {
+            kind: if pr { WatchKind::Pr } else { WatchKind::Issue },
+            number,
+            repo,
+            workspace_root,
+            note,
+        },
+        WatchAction::List { json } => {
+            json_out = json;
+            Request::ListWatches
+        }
+        WatchAction::Remove { id } => Request::RemoveWatch { id },
+    };
+
+    match query_daemon(&socket_path, &request).await {
+        Ok(Response::WatchRegistered {
+            watch,
+            already_present,
+        }) => {
+            if already_present {
+                println!("Already watching {} (id {}) — no-op.", watch.target_label(), watch.id);
+            } else {
+                println!("Registered watch on {}", watch.target_label());
+                println!("  id:   {}", watch.id);
+                println!("Terminal state will be recorded to {}", watch_results_log_hint());
+            }
+            Ok(())
+        }
+        Ok(Response::WatchList { watches }) => {
+            if json_out {
+                println!("{}", serde_json::to_string_pretty(&watches)?);
+            } else if watches.is_empty() {
+                println!("No durable watches registered.");
+            } else {
+                println!("{} durable watch(es):", watches.len());
+                for w in &watches {
+                    let note = w
+                        .note
+                        .as_deref()
+                        .map(|n| format!(" — {n}"))
+                        .unwrap_or_default();
+                    println!("  {}  {}{}", w.id, w.target_label(), note);
+                }
+                println!();
+                println!("Resolutions are recorded to {}", watch_results_log_hint());
+            }
+            Ok(())
+        }
+        Ok(Response::WatchRemoved { id, was_present }) => {
+            if was_present {
+                println!("Removed watch {id}.");
+            } else {
+                println!("No watch with id {id} — nothing to remove (no-op).");
+            }
+            Ok(())
+        }
+        Ok(Response::Error { message }) => {
+            eprintln!("Daemon error: {message}");
+            std::process::exit(1);
+        }
+        Ok(other) => {
+            eprintln!("Unexpected response from daemon: {other:?}");
+            std::process::exit(1);
+        }
+        Err(e) => {
+            eprintln!("Could not reach loom-daemon at {}: {e}", socket_path.display());
+            eprintln!();
+            eprintln!("Is the daemon running? Start it with:");
+            eprintln!("  ./.loom/scripts/cli/loom-daemon-start.sh");
+            std::process::exit(1);
+        }
+    }
+}
+
+/// Best-effort human hint for where watch results are recorded (honors the env
+/// override). Purely cosmetic — never fails.
+fn watch_results_log_hint() -> String {
+    watch_registry::default_results_log_path()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|_| "~/.loom/logs/watch-results.log".to_string())
 }
 
 /// Connect to the running daemon over its Unix socket, send a single `request`,

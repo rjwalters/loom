@@ -1376,6 +1376,21 @@ fn handle_request(
 
         Request::ListWorkspaces => handle_list_workspaces(),
 
+        // ====================================================================
+        // Durable Watch Registry Handlers (Issue #3971)
+        // ====================================================================
+        Request::RegisterWatch {
+            kind,
+            number,
+            repo,
+            workspace_root,
+            note,
+        } => handle_register_watch(kind, number, repo, workspace_root, note),
+
+        Request::ListWatches => handle_list_watches(),
+
+        Request::RemoveWatch { id } => handle_remove_watch(&id),
+
         Request::Shutdown => {
             log::info!("Shutdown requested");
             std::process::exit(0);
@@ -1502,6 +1517,86 @@ fn handle_list_workspaces() -> Response {
         Err(e) => Response::Error {
             message: format!("list_workspaces: load failed: {e}"),
         },
+    }
+}
+
+/// Register a durable watch (Issue #3971). Operates on the machine-level watches
+/// file (`~/.loom/watches.json`) directly — like [`handle_register_workspace`],
+/// the daemon's monitor loop re-reads the file each tick (hot-apply), so a watch
+/// added here is picked up without any in-memory registration.
+fn handle_register_watch(
+    kind: crate::watch_registry::WatchKind,
+    number: u32,
+    repo: Option<String>,
+    workspace_root: Option<String>,
+    note: Option<String>,
+) -> Response {
+    use crate::watch_registry::{default_watches_path, load, new_watch, save};
+
+    let path = match default_watches_path() {
+        Ok(p) => p,
+        Err(e) => {
+            return Response::Error {
+                message: format!("register_watch: {e}"),
+            }
+        }
+    };
+    let mut registry = load(&path);
+    let (watch, was_new) = registry.add(new_watch(kind, number, repo, workspace_root, note));
+    if was_new {
+        if let Err(e) = save(&path, &registry) {
+            return Response::Error {
+                message: format!("register_watch: save failed: {e}"),
+            };
+        }
+    }
+    Response::WatchRegistered {
+        watch,
+        already_present: !was_new,
+    }
+}
+
+/// List the currently-registered durable watches (Issue #3971).
+fn handle_list_watches() -> Response {
+    use crate::watch_registry::{default_watches_path, load};
+
+    let path = match default_watches_path() {
+        Ok(p) => p,
+        Err(e) => {
+            return Response::Error {
+                message: format!("list_watches: {e}"),
+            }
+        }
+    };
+    Response::WatchList {
+        watches: load(&path).watches,
+    }
+}
+
+/// Remove a registered durable watch by id (Issue #3971).
+fn handle_remove_watch(id: &str) -> Response {
+    use crate::watch_registry::{default_watches_path, load, save};
+
+    let path = match default_watches_path() {
+        Ok(p) => p,
+        Err(e) => {
+            return Response::Error {
+                message: format!("remove_watch: {e}"),
+            }
+        }
+    };
+    let mut registry = load(&path);
+    let was_present = registry.remove(id);
+    if was_present {
+        if let Err(e) = save(&path, &registry) {
+            return Response::Error {
+                message: format!("remove_watch: save failed: {e}"),
+            };
+        }
+    }
+    Response::WatchRemoved {
+        id: id.to_string(),
+        was_present,
     }
 }
 
@@ -2912,5 +3007,116 @@ exit 0
         }
 
         std::env::remove_var("LOOM_WORKSPACES_PATH");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_watch_registry_ipc_roundtrip() {
+        use crate::watch_registry::WatchKind;
+
+        let (tm, db, sr, bus) = setup_test_context();
+        let dir = tempdir().unwrap();
+        let watches_path = dir.path().join("watches.json");
+        std::env::set_var(crate::watch_registry::WATCHES_PATH_ENV, &watches_path);
+
+        // Empty registry: list returns none.
+        let response = handle_request(Request::ListWatches, &tm, &db, &sr, &bus, &test_pool());
+        match response {
+            Response::WatchList { watches } => assert!(watches.is_empty()),
+            other => panic!("Expected WatchList, got: {other:?}"),
+        }
+
+        // Register a cross-repo issue watch (the motivating #6193 case).
+        let response = handle_request(
+            Request::RegisterWatch {
+                kind: WatchKind::Issue,
+                number: 6193,
+                repo: Some("rjwalters/vibesql".to_string()),
+                workspace_root: None,
+                note: Some("canary".to_string()),
+            },
+            &tm,
+            &db,
+            &sr,
+            &bus,
+            &test_pool(),
+        );
+        let watch_id = match response {
+            Response::WatchRegistered {
+                watch,
+                already_present,
+            } => {
+                assert!(!already_present);
+                assert_eq!(watch.number, 6193);
+                assert_eq!(watch.repo.as_deref(), Some("rjwalters/vibesql"));
+                watch.id
+            }
+            other => panic!("Expected WatchRegistered, got: {other:?}"),
+        };
+
+        // Re-register the same target dedups (already_present = true).
+        let response = handle_request(
+            Request::RegisterWatch {
+                kind: WatchKind::Issue,
+                number: 6193,
+                repo: Some("rjwalters/vibesql".to_string()),
+                workspace_root: None,
+                note: None,
+            },
+            &tm,
+            &db,
+            &sr,
+            &bus,
+            &test_pool(),
+        );
+        match response {
+            Response::WatchRegistered {
+                already_present, ..
+            } => assert!(already_present),
+            other => panic!("Expected WatchRegistered, got: {other:?}"),
+        }
+
+        // List shows exactly one, and it survives being re-loaded from disk
+        // (the whole point — a watch outlives the registering session).
+        let response = handle_request(Request::ListWatches, &tm, &db, &sr, &bus, &test_pool());
+        match response {
+            Response::WatchList { watches } => {
+                assert_eq!(watches.len(), 1);
+                assert_eq!(watches[0].id, watch_id);
+            }
+            other => panic!("Expected WatchList, got: {other:?}"),
+        }
+
+        // Remove by id.
+        let response = handle_request(
+            Request::RemoveWatch {
+                id: watch_id.clone(),
+            },
+            &tm,
+            &db,
+            &sr,
+            &bus,
+            &test_pool(),
+        );
+        match response {
+            Response::WatchRemoved { was_present, .. } => assert!(was_present),
+            other => panic!("Expected WatchRemoved, got: {other:?}"),
+        }
+
+        // Removing again is a no-op success.
+        let response = handle_request(
+            Request::RemoveWatch { id: watch_id },
+            &tm,
+            &db,
+            &sr,
+            &bus,
+            &test_pool(),
+        );
+        match response {
+            Response::WatchRemoved { was_present, .. } => assert!(!was_present),
+            other => panic!("Expected WatchRemoved, got: {other:?}"),
+        }
+
+        std::env::remove_var(crate::watch_registry::WATCHES_PATH_ENV);
     }
 }

@@ -1036,6 +1036,11 @@ concurrency ceiling 5" and share it with the team:
     "mainHealthGate": {
       "enabled": true
     },
+    "watchMonitor": {
+      "enabled": true,
+      "intervalSecs": 120,
+      "expirySecs": 86400
+    },
     "dispatchStaggerMs": 2000,
     "watchdog": {
       "enabled": true,
@@ -1068,6 +1073,9 @@ exactly like `main_health_gate::read_build_gate_config`.
 | `autonomous.workFinder.quarantine.instaCrashSecs` | `LOOM_WORK_FINDER_QUARANTINE_INSTA_CRASH_SECS` | `60` | Checkpoint-less death within this window of dispatch counts as an insta-crash. Zero/invalid → default |
 | `autonomous.perTokenConcurrency` | `LOOM_PER_TOKEN_CONCURRENCY` | `2` | Concurrent sweeps **per healthy token** in the cap (#3947). Zero/invalid → default; clamped to a floor of 1 |
 | `autonomous.mainHealthGate.enabled` | `LOOM_MAIN_HEALTH_GATE` | `false` | Gate loop on/off |
+| `autonomous.watchMonitor.enabled` | `LOOM_WATCH_MONITOR` | `true` | Durable operator-watch monitor loop (#3971). Default-on; no dispatch side effect, zero forge calls until a watch is registered |
+| `autonomous.watchMonitor.intervalSecs` | `LOOM_WATCH_MONITOR_INTERVAL_SECS` | `120` | Watch poll cadence. Zero/invalid → default |
+| `autonomous.watchMonitor.expirySecs` | `LOOM_WATCH_MONITOR_EXPIRY_SECS` | `86400` | Give-up window for an unresolved watch; `0` disables expiry |
 | `autonomous.dispatchStaggerMs` | `LOOM_SWEEP_DISPATCH_STAGGER_MS` | `2000` | Min gap between consecutive child spawns (#3887). `0` disables |
 | `autonomous.watchdog.enabled` | `LOOM_SWEEP_WATCHDOG` | `true` | Startup watchdog on/off (#3887). Also the master switch for the tick — mid-build-death (#3895) + review-stall (#3910) run in the same task |
 | `autonomous.watchdog.timeoutSecs` | `LOOM_SWEEP_WATCHDOG_TIMEOUT_SECS` | `120` | No-progress window before auto-restart |
@@ -1268,6 +1276,77 @@ the workspace registry each tick and refreshes every registered repo's own
 pool, gated by that repo's own config (an empty registry reduces to the single
 daemon workspace). See `loom-daemon/src/token_ranking_refresh.rs` for the
 implementation.
+
+### Durable operator watches (#3971)
+
+**Problem it fixes.** An operator armed a 4-hour background poll watching two
+items for terminal state, then their Claude Code session crashed and the watch
+died with it — background tasks are children of the session process, so the
+terminal-state report was silently lost. The root cause is harness behaviour,
+but the durable fix belongs on the daemon: it is the long-lived process that
+already outlives any one operator session.
+
+**What it does.** An operator registers a watch on an issue or PR
+(`register_watch` MCP tool, or `loom-daemon watch add`). The watch is persisted
+machine-level to `~/.loom/watches.json` (override `LOOM_WATCHES_PATH`) so it
+survives **both** the registering session's death **and** a daemon restart. A
+default-on monitor loop polls each watch's terminal state on a cadence and, when
+a watch reaches a terminal state or expires, **durably appends** a JSON line to
+`~/.loom/logs/watch-results.log` (override `LOOM_WATCH_RESULTS_LOG`) — a file a
+later session can trivially `tail` — then drops the watch from the active set.
+
+**Terminal states** (forge-observable, read via `gh issue view` / `gh pr view
+--json state,labels`):
+
+| Outcome | Condition |
+|---------|-----------|
+| `closed` | issue/PR state `CLOSED` |
+| `merged` | PR state `MERGED` |
+| `blocked` | still-open item carrying the `loom:blocked` label |
+| `expired` | monitor-generated — no terminal state within the expiry window (bounds the watches file + forge-call budget) |
+
+**Why forge polling, not the event bus.** The in-memory event bus
+(`sweep.issue.{N}.*`, `sweep.global.*`) only knows about sweeps *this daemon
+dispatched*, and the motivating case is explicitly cross-repo (a `vibesql` issue
+watched from the `loom` operator session) which the daemon may never have swept.
+The v0.10.0 event taxonomy is also frozen. So the monitor **polls the forge
+directly**, which works uniformly for any repo — sweep-backed or not — **without
+minting a new event topic**. Address the target cross-repo with either `repo` (a
+forge slug `owner/name`, preferred) or `workspace_root` (the `gh` query runs in
+that repo's working dir — the same addressing pattern as `dispatch_sweep` /
+`list_sweeps`).
+
+**Default-on, like the token-ranking refresh.** It has no dispatch side effect
+and makes **zero** forge calls until an operator registers a watch (an empty
+registry short-circuits the tick to a single file read). Full opt-out knob:
+
+```json
+{
+  "autonomous": {
+    "watchMonitor": { "enabled": true, "intervalSecs": 120, "expirySecs": 86400 }
+  }
+}
+```
+
+| Env var | Config key | Precedence | Default |
+|---------|-----------|------------|---------|
+| `LOOM_WATCH_MONITOR` | `autonomous.watchMonitor.enabled` | env > config > default | `true` (on) |
+| `LOOM_WATCH_MONITOR_INTERVAL_SECS` | `autonomous.watchMonitor.intervalSecs` | env > config > default | `120` (2 min) |
+| `LOOM_WATCH_MONITOR_EXPIRY_SECS` | `autonomous.watchMonitor.expirySecs` | env > config > default | `86400` (24h; `0` disables expiry) |
+
+**Never fatal.** A missing/corrupt watches file degrades to an empty registry; a
+single failing probe (network, `gh` missing, transient forge error) is logged
+and the watch retained for the next tick rather than aborting the whole tick.
+
+**IPC / CLI surface.**
+
+| IPC request | MCP tool | CLI | Purpose |
+|-------------|----------|-----|---------|
+| `RegisterWatch` | `register_watch` | `loom-daemon watch add <N> [--pr] [--repo O/N] [--note …]` | Register a durable watch (idempotent on `(target, kind, number)`) |
+| `ListWatches` | `list_watches` | `loom-daemon watch list [--json]` | List active watches |
+| `RemoveWatch` | `remove_watch` | `loom-daemon watch remove <id>` | Remove a watch by id |
+
+See `loom-daemon/src/watch_registry.rs` for the implementation.
 
 ### Safe start / stop (raw daemon process)
 

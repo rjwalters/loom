@@ -188,6 +188,51 @@ interface EventPublishedResponse {
   };
 }
 
+/**
+ * `WatchKind` mirrors the Rust enum in `loom-daemon/src/watch_registry.rs`
+ * (serde `rename_all = "snake_case"`): `"issue"` or `"pr"`.
+ */
+export type WatchKind = "issue" | "pr";
+
+/**
+ * `WatchSpec` mirrors the Rust struct of the same name (issue #3971): one
+ * durable operator watch on an issue's or PR's terminal state, persisted
+ * machine-level so it survives the registering session's death and a daemon
+ * restart.
+ */
+export interface WatchSpec {
+  id: string;
+  kind: WatchKind;
+  number: number;
+  repo?: string;
+  workspace_root?: string;
+  note?: string;
+  registered_at: string;
+}
+
+interface WatchRegisteredResponse {
+  type: "WatchRegistered";
+  payload: {
+    watch: WatchSpec;
+    already_present: boolean;
+  };
+}
+
+interface WatchListResponse {
+  type: "WatchList";
+  payload: {
+    watches: WatchSpec[];
+  };
+}
+
+interface WatchRemovedResponse {
+  type: "WatchRemoved";
+  payload: {
+    id: string;
+    was_present: boolean;
+  };
+}
+
 type DaemonResponse =
   | DispatchResponse
   | ListResponse
@@ -195,6 +240,9 @@ type DaemonResponse =
   | SweepLogTailResponse
   | SweepCancelledResponse
   | EventPublishedResponse
+  | WatchRegisteredResponse
+  | WatchListResponse
+  | WatchRemovedResponse
   | ErrorResponse
   | StructuredErrorResponse
   | { type: string; payload?: unknown };
@@ -350,6 +398,75 @@ async function listSweeps(args: {
     return { success: false, error: err ?? `Unexpected response: ${response.type}` };
   } catch (error) {
     return { success: false, error: `Error listing sweeps: ${error}` };
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Durable watch registry helpers (Issue #3971)
+// ---------------------------------------------------------------------------
+
+async function registerWatch(args: {
+  kind: WatchKind;
+  number: number;
+  repo?: string;
+  workspace_root?: string;
+  note?: string;
+}): Promise<
+  { success: true; watch: WatchSpec; already_present: boolean } | { success: false; error: string }
+> {
+  try {
+    const response = (await sendDaemonRequest({
+      type: "RegisterWatch",
+      payload: {
+        kind: args.kind,
+        number: args.number,
+        repo: args.repo ?? null,
+        workspace_root: args.workspace_root ?? null,
+        note: args.note ?? null,
+      },
+    })) as DaemonResponse;
+
+    if (response.type === "WatchRegistered") {
+      const payload = (response as WatchRegisteredResponse).payload;
+      return { success: true, watch: payload.watch, already_present: payload.already_present };
+    }
+    const err = extractError(response);
+    return { success: false, error: err ?? `Unexpected response: ${response.type}` };
+  } catch (error) {
+    return { success: false, error: `Error registering watch: ${error}` };
+  }
+}
+
+async function listWatches(): Promise<
+  { success: true; watches: WatchSpec[] } | { success: false; error: string }
+> {
+  try {
+    const response = (await sendDaemonRequest({ type: "ListWatches" })) as DaemonResponse;
+    if (response.type === "WatchList") {
+      return { success: true, watches: (response as WatchListResponse).payload.watches };
+    }
+    const err = extractError(response);
+    return { success: false, error: err ?? `Unexpected response: ${response.type}` };
+  } catch (error) {
+    return { success: false, error: `Error listing watches: ${error}` };
+  }
+}
+
+async function removeWatch(args: {
+  id: string;
+}): Promise<{ success: true; was_present: boolean } | { success: false; error: string }> {
+  try {
+    const response = (await sendDaemonRequest({
+      type: "RemoveWatch",
+      payload: { id: args.id },
+    })) as DaemonResponse;
+    if (response.type === "WatchRemoved") {
+      return { success: true, was_present: (response as WatchRemovedResponse).payload.was_present };
+    }
+    const err = extractError(response);
+    return { success: false, error: err ?? `Unexpected response: ${response.type}` };
+  } catch (error) {
+    return { success: false, error: `Error removing watch: ${error}` };
   }
 }
 
@@ -802,6 +919,73 @@ export const sweepTools: Tool[] = [
             "reached, whichever comes first.",
         },
       },
+    },
+  },
+  {
+    name: "register_watch",
+    description:
+      "Register a DURABLE watch on an issue's or PR's terminal state (issue " +
+      "#3971). Unlike an in-session background poll — which dies when the " +
+      "operator's Claude Code session crashes — this watch is persisted by the " +
+      "long-lived loom-daemon (`~/.loom/watches.json`), so it survives both the " +
+      "registering session AND a daemon restart. The daemon polls the forge and, " +
+      "when the target reaches a terminal state (closed / merged / blocked) or " +
+      "the expiry window elapses, appends a result line to " +
+      "`~/.loom/logs/watch-results.log` — a file a later session can trivially " +
+      "read. Works cross-repo: pass `repo` (a forge slug `owner/name`) to watch " +
+      "an issue in a repo this machine may not even manage. Idempotent — " +
+      "re-registering the same target returns the existing watch.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        number: { type: "number", description: "The issue or PR number to watch." },
+        kind: {
+          type: "string",
+          enum: ["issue", "pr"],
+          description: "Whether `number` is an issue or a pull request. Defaults to `issue`.",
+        },
+        repo: {
+          type: "string",
+          description:
+            "Forge slug `owner/name` (preferred — works cross-repo). Omit to " +
+            "resolve from `workspace_root` or the daemon's own cwd.",
+        },
+        workspace_root: {
+          type: "string",
+          description:
+            "Managed-workspace root the `gh` query runs in when `repo` is " +
+            "absent (mirrors the `workspace_root` param on dispatch_sweep / " +
+            "list_sweeps).",
+        },
+        note: {
+          type: "string",
+          description: "Optional note surfaced in the recorded result line.",
+        },
+      },
+      required: ["number"],
+    },
+  },
+  {
+    name: "list_watches",
+    description:
+      "List the durable watches currently registered with the loom-daemon " +
+      "(issue #3971). Returns a JSON array of WatchSpec records. Resolved " +
+      "watches are removed from this list and recorded in " +
+      "`~/.loom/logs/watch-results.log`.",
+    inputSchema: { type: "object", properties: {} },
+  },
+  {
+    name: "remove_watch",
+    description:
+      "Remove a registered durable watch by its id (issue #3971), as printed " +
+      "by `register_watch` / `list_watches`. Removing an unknown id is a no-op " +
+      "success.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        id: { type: "string", description: "The watch id to remove." },
+      },
+      required: ["id"],
     },
   },
 ];
@@ -1296,6 +1480,97 @@ export async function handleSweepTool(
           text: `=== Tail Event Bus ===\n\n${summary}\n\nFrames:\n${body}`,
         },
       ];
+    }
+
+    case "register_watch": {
+      const number =
+        typeof args?.number === "number" && Number.isInteger(args.number) && args.number > 0
+          ? (args.number as number)
+          : undefined;
+      if (number === undefined) {
+        return [
+          {
+            type: "text",
+            text: "=== Register Watch ===\n\nFailed\n\nError: `number` is required (a positive integer issue/PR number).",
+          },
+        ];
+      }
+      const kind: WatchKind = args?.kind === "pr" ? "pr" : "issue";
+      const repo =
+        typeof args?.repo === "string" && args.repo.length > 0 ? (args.repo as string) : undefined;
+      const note =
+        typeof args?.note === "string" && args.note.length > 0 ? (args.note as string) : undefined;
+
+      const result = await registerWatch({
+        kind,
+        number,
+        repo,
+        workspace_root: extractWorkspaceRoot(args),
+        note,
+      });
+      if (!result.success) {
+        return [{ type: "text", text: `=== Register Watch ===\n\nFailed\n\n${result.error}` }];
+      }
+      const w = result.watch;
+      const where = w.repo ?? w.workspace_root ?? "default workspace";
+      const status = result.already_present ? "Already watching (no-op)" : "Registered";
+      const body = [
+        `Watch ID:   ${w.id}`,
+        `Target:     ${w.kind} #${w.number} in ${where}`,
+        w.note ? `Note:       ${w.note}` : null,
+        "Terminal state will be recorded to ~/.loom/logs/watch-results.log",
+      ]
+        .filter((l): l is string => l !== null)
+        .join("\n");
+      return [{ type: "text", text: `=== Register Watch ===\n\n${status}\n\n${body}` }];
+    }
+
+    case "list_watches": {
+      const result = await listWatches();
+      if (!result.success) {
+        return [{ type: "text", text: `=== List Watches ===\n\nFailed\n\n${result.error}` }];
+      }
+      if (result.watches.length === 0) {
+        return [
+          {
+            type: "text",
+            text: "=== List Watches ===\n\nSuccess\n\nNo durable watches registered.",
+          },
+        ];
+      }
+      const body = result.watches
+        .map((w) => {
+          const where = w.repo ?? w.workspace_root ?? "default workspace";
+          const note = w.note ? ` — ${w.note}` : "";
+          return `* ${w.id}\n  ${w.kind} #${w.number} in ${where}${note}`;
+        })
+        .join("\n");
+      return [
+        {
+          type: "text",
+          text: `=== List Watches ===\n\nSuccess (${result.watches.length})\n\n${body}`,
+        },
+      ];
+    }
+
+    case "remove_watch": {
+      const id = typeof args?.id === "string" && args.id.length > 0 ? (args.id as string) : undefined;
+      if (id === undefined) {
+        return [
+          {
+            type: "text",
+            text: "=== Remove Watch ===\n\nFailed\n\nError: `id` is required.",
+          },
+        ];
+      }
+      const result = await removeWatch({ id });
+      if (!result.success) {
+        return [{ type: "text", text: `=== Remove Watch ===\n\nFailed\n\n${result.error}` }];
+      }
+      const msg = result.was_present
+        ? `Removed watch ${id}.`
+        : `No watch with id ${id} — nothing to remove (no-op).`;
+      return [{ type: "text", text: `=== Remove Watch ===\n\nSuccess\n\n${msg}` }];
     }
 
     default:
