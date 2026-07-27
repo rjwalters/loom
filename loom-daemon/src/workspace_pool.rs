@@ -135,6 +135,10 @@ impl WorkspacePool {
         // workspace so the reaper quarantines a repeatedly-insta-crashing issue
         // instead of letting it be re-dispatched every tick.
         registry.set_quarantine_config(sweep_registry::resolve_quarantine_config(root));
+        // Cross-host collision detection (#4085): resolve env > config >
+        // default(off) so a shared-backlog deployment measures the baseline
+        // duplicate-dispatch rate. Detection only — never changes dispatch.
+        registry.set_collision_detection(sweep_registry::resolve_collision_detection(root));
 
         let arc = Arc::new(Mutex::new(registry));
         // Spawn the reaper on the shared daemon runtime regardless of which

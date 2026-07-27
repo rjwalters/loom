@@ -688,6 +688,21 @@ async fn main() -> Result<()> {
         quarantine_config.insta_crash_secs
     );
 
+    // Cross-host collision detection (#4085, Phase 0 of #4028): resolve env >
+    // config > default(off) for the default workspace so a shared-backlog
+    // deployment can measure the baseline duplicate-dispatch rate. Detection
+    // only — a detected collision is logged/counted, never acted on.
+    let detect_collisions = sweep_registry::resolve_collision_detection(&sweep_workspace);
+    sweep.set_collision_detection(detect_collisions);
+    log::info!(
+        "sweep_registry: cross-host collision detection {} (#4085)",
+        if detect_collisions {
+            "enabled"
+        } else {
+            "disabled"
+        }
+    );
+
     let sweep_registry = Arc::new(Mutex::new(sweep));
     let _reaper_handle = sweep_registry::spawn_reaper_task(sweep_registry.clone());
 
