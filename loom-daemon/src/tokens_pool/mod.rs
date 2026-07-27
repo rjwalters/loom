@@ -21,16 +21,20 @@
 //! | [`allowlist`] | `tokens/allowlist.py` | `.allowlist` pin/unpin CRUD, exact-name validation |
 //! | [`failure_counts`] | `tokens/failure_counts.py` | `.failure_counts` consecutive-exhaustion counter |
 //! | [`select`] | `tokens/select.py` | 3-tier selection algorithm |
+//! | [`check`] | `tokens/check.py` | HTTP rate-limit probe (curl transport) + `.ranking` writer |
+//! | [`monitor`] | `tokens/monitor.py` | claude-monitor `ranking.json` consumer (`--source auto\|monitor`) |
 //!
-//! **Deferred to a follow-up issue** (filed as part of this PR — see the PR
-//! description): `tokens/check.py` (the HTTP rate-limit probe — needs an
-//! explicit curl-vs-crate decision plus header-parsing tests), `bootstrap.py`
-//! (multi-source `.env` merge + file provisioning), `monitor.py` /
-//! `monitor_db.py` (claude-monitor SQLite import). None of these three are on
-//! the per-dispatch hot path (they run at bootstrap time or on an operator /
-//! periodic cadence), so scoping them out keeps this PR reviewable while
-//! still letting a caller flip `spawn-claude.sh` onto the Rust `select`/
-//! `pin`/`unpin`/`unblock` surface in Phase 2 without waiting on them.
+//! The probe path ([`check`] + [`monitor`], issue #4094) shells to `curl`
+//! rather than take an HTTP-client crate — following the [`rng`] precedent of
+//! avoiding new dependencies, and matching `token_ranking_refresh.rs`, which
+//! already shells out via `Command::new`. The transport is behind the
+//! [`check::ProbeTransport`] trait so tests never touch the network.
+//!
+//! **Deferred to follow-up issues** (filed alongside issue #4094 — see the PR
+//! description): `bootstrap.py` (multi-source `.env` merge + file provisioning)
+//! and `monitor_db.py` (claude-monitor SQLite import). Neither is on the
+//! per-dispatch hot path (they run at bootstrap time or on an operator
+//! cadence), so scoping them out keeps this increment reviewable.
 //!
 //! # Byte-compatible state (hard requirement)
 //!
@@ -43,8 +47,10 @@
 
 pub mod allowlist;
 pub mod bad_tokens;
+pub mod check;
 pub mod failure_counts;
 pub mod locking;
+pub mod monitor;
 pub mod paths;
 pub mod rng;
 pub mod rotation;

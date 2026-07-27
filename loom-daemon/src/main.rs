@@ -351,6 +351,42 @@ enum TokensAction {
         no_key: bool,
     },
 
+    /// Probe each bootstrapped account for rate-limit headers and rank by
+    /// available quota, optionally writing `.loom/tokens/.ranking`. Mirrors
+    /// `python3 -m loom_tools.tokens.cli check`. The HTTP probe shells to
+    /// `curl` (no HTTP-client crate — see `tokens_pool::check`).
+    Check {
+        /// Repo root containing `.loom/tokens/` (plain path, default `.` — no
+        /// upward `.git` walk).
+        #[arg(long, value_name = "PATH", default_value = ".")]
+        workspace: String,
+
+        /// Write `.loom/tokens/.ranking` atomically (consumed by the spawn
+        /// wrapper, #3235).
+        #[arg(long)]
+        ranking: bool,
+
+        /// Where to source the ranking (#3697): `auto` (default) uses
+        /// claude-monitor's `ranking.json` when fresh, else probes; `monitor`
+        /// uses claude-monitor only (no probe); `probe` always live-probes.
+        /// Overrides `$LOOM_RANKING_SOURCE`.
+        #[arg(long, value_name = "SOURCE")]
+        source: Option<String>,
+
+        /// Override the probe prompt (default `"hi"`). The probe always uses
+        /// `max_tokens=1` regardless of prompt.
+        #[arg(long, value_name = "TEXT")]
+        probe_prompt: Option<String>,
+
+        /// Emit the full report as JSON to stdout (instead of a human table).
+        #[arg(long)]
+        json: bool,
+
+        /// Skip the 0.5-1.5s jitter between probes (mostly for tests).
+        #[arg(long)]
+        no_stagger: bool,
+    },
+
     /// Manage the `.allowlist` file constraining which accounts `select` may
     /// pick.
     Pin {
@@ -2996,6 +3032,64 @@ fn handle_tokens_command(action: TokensAction) -> Result<()> {
                     std::process::exit(select::EX_CONFIG);
                 }
             }
+        }
+
+        TokensAction::Check {
+            workspace,
+            ranking,
+            source,
+            probe_prompt,
+            json,
+            no_stagger,
+        } => {
+            use loom_daemon::tokens_pool::check::{
+                self, CheckOptions, CurlTransport, DEFAULT_PROBE_MODEL, DEFAULT_PROBE_PROMPT,
+            };
+
+            let ws = resolve_tokens_workspace(&workspace)?;
+            let tokens_dir = loom_daemon::tokens_pool::paths::resolve_tokens_dir(&ws);
+
+            let source_flag = match source {
+                Some(raw) => match check::Source::parse(&raw) {
+                    Some(s) => Some(s),
+                    None => {
+                        eprintln!(
+                            "error: invalid --source {raw:?}; expected one of auto, monitor, probe"
+                        );
+                        std::process::exit(2);
+                    }
+                },
+                None => None,
+            };
+            let resolved_source = check::resolve_source(source_flag);
+            let prompt = probe_prompt.unwrap_or_else(|| DEFAULT_PROBE_PROMPT.to_string());
+
+            let opts = CheckOptions {
+                source: resolved_source,
+                write_ranking: ranking,
+                probe_prompt: &prompt,
+                model: DEFAULT_PROBE_MODEL,
+                stagger: !no_stagger,
+            };
+            let transport = CurlTransport;
+            let report = check::run_check(&tokens_dir, &opts, &transport);
+
+            if json {
+                println!("{}", serde_json::to_string_pretty(&report.to_json())?);
+            } else {
+                println!("{}", check::format_table(&report));
+            }
+
+            // Exit 1 only when every probe failed (selector has nothing usable).
+            if !report.accounts.is_empty()
+                && report
+                    .accounts
+                    .iter()
+                    .all(|a| a.status == "error" || a.status == "skipped")
+            {
+                std::process::exit(1);
+            }
+            Ok(())
         }
 
         TokensAction::Pin { action, workspace } => {
