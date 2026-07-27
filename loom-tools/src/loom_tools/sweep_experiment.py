@@ -272,14 +272,24 @@ def arm_model(arm: str) -> str:
 
 
 def _model_family(model: str | None) -> str | None:
-    """Normalize a model alias or pinned ID to its family (mirrors ``model_pricing``)."""
+    """Normalize a model alias or pinned ID to its family (mirrors ``model_pricing``).
+
+    Matching is **generation-agnostic**: it keys off the family stem
+    (``claude-sonnet-``, ``claude-opus-``, ``claude-haiku-``, ``claude-fable-``)
+    rather than a pinned generation number, so a future ``claude-sonnet-6`` (or
+    any other new generation) classifies correctly with no code change (#3981).
+    The legacy ``claude-3-5-sonnet`` / ``claude-3-opus`` / ``claude-3-haiku`` IDs
+    predate the ``-<generation>-`` naming scheme and are matched explicitly.
+    """
     m = (model or "").lower()
-    if "claude-3-5-sonnet" in m or "claude-sonnet-4" in m or m == "sonnet":
+    if m == "sonnet" or "claude-3-5-sonnet" in m or "claude-sonnet-" in m:
         return "sonnet"
-    if "claude-3-opus" in m or "claude-opus-4" in m or m == "opus":
+    if m == "opus" or "claude-3-opus" in m or "claude-opus-" in m:
         return "opus"
-    if "claude-3-haiku" in m or m == "haiku":
+    if m == "haiku" or "claude-3-haiku" in m or "claude-haiku-" in m:
         return "haiku"
+    if m == "fable" or "claude-fable-" in m:
+        return "fable"
     return None
 
 
@@ -393,13 +403,26 @@ def build_record(
 # --------------------------------------------------------------------------- #
 
 # (input, output, cache_read, cache_write) US$ per 1k tokens.
+#
+# Matching is generation-agnostic (see ``_model_family``) — it keys off the
+# family stem so a future generation (e.g. ``claude-sonnet-6``) prices
+# correctly with no code change (#3981). ``claude-fable-5`` has no published
+# per-token rate (it is an escalation-ladder rung above Opus, #3702), so it is
+# conservatively priced at the Opus rate rather than silently falling through
+# to the cheaper Sonnet default and under-reporting cost.
 def model_pricing(model: str | None) -> tuple[float, float, float, float]:
     m = (model or "").lower()
-    if "claude-3-5-sonnet" in m or "claude-sonnet-4" in m or m == "sonnet":
+    if m == "sonnet" or "claude-3-5-sonnet" in m or "claude-sonnet-" in m:
         return (0.003, 0.015, 0.0003, 0.00375)
-    if "claude-3-opus" in m or "claude-opus-4" in m or m == "opus":
+    if (
+        m == "opus"
+        or m == "fable"
+        or "claude-3-opus" in m
+        or "claude-opus-" in m
+        or "claude-fable-" in m
+    ):
         return (0.015, 0.075, 0.0015, 0.01875)
-    if "claude-3-haiku" in m or m == "haiku":
+    if m == "haiku" or "claude-3-haiku" in m or "claude-haiku-" in m:
         return (0.00025, 0.00125, 0.00003, 0.0003)
     # Default to Sonnet pricing as a reasonable middle ground (matches Rust).
     return (0.003, 0.015, 0.0003, 0.00375)
