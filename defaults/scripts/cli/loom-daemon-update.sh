@@ -33,6 +33,23 @@
 #     stopped (this script never widens FLAGS-OFF by starting autonomy that
 #     wasn't already running).
 #
+# Launchd-managed daemons (#4042): on Darwin the daemon is commonly launchd-
+# managed (default since #3972/#4054), in which case NEITHER .loom/.daemon.pid
+# nor .loom/.daemon.flags reliably reflects "is it running" — the pid file goes
+# stale after any KeepAlive:SuccessfulExit relaunch, and a hand-bootstrapped
+# daemon has no state files at all. This script therefore checks the launchd job
+# state (`launchctl print gui/<uid>/<label>`, mirroring loom-daemon-stop.sh)
+# AHEAD of the pid-file tier when resolving whether/how the daemon is running.
+# When launchd-managed, it restarts via the `loom-daemon restart` primitive
+# (#4077 — sends Request::RestartDaemon over the IPC socket; the supervised
+# daemon exits 0 and launchd relaunches it onto the fresh binary with the
+# plist's persisted ProgramArguments/EnvironmentVariables). .daemon.flags is NOT
+# consulted in this mode (the plist's EnvironmentVariables IS the durable flag
+# source), and no "restarting FLAGS-OFF" warning fires. If the running (old)
+# binary predates #4077 and refuses the request, this script REFUSES LOUDLY
+# (exit 6) with the manual bootout/bootstrap fallback rather than reporting a
+# half-update — the exact #4011 silent-autonomy-loss class this closes.
+#
 # Usage:
 #   ./.loom/scripts/cli/loom-daemon-update.sh              Detect, rebuild if stale, provision, restart (preserving flags)
 #   ./.loom/scripts/cli/loom-daemon-update.sh --check       Detect only; exit 0 (up to date) or 3 (update available); no writes
@@ -48,6 +65,14 @@
 #                          exact path instead of the machine-level default.
 #   LOOM_DAEMON_BIN_DIR   Machine-level install dir (default ~/.local/bin),
 #                          forwarded to provision-daemon.sh.
+#   LOOM_DAEMON_LAUNCHD    macOS only: 0/false/no disables ALL launchd interaction
+#                          (ownership detection + launchd restart), symmetric with
+#                          loom-daemon-start.sh / loom-daemon-stop.sh. A daemon
+#                          started with --no-launchd / LOOM_DAEMON_LAUNCHD=0 gets
+#                          an update that never reads the machine-global launchd
+#                          domain and follows the PID-file/nohup restart path.
+#   LOOM_LAUNCHD_LABEL     macOS only: the LaunchAgent label to inspect/restart
+#                          (default com.rjwalters.loom-daemon).
 #
 # Exit codes:
 #   0  up to date (no-op) OR rebuild+provision+restart succeeded
@@ -62,6 +87,11 @@
 #      claimed-successful provision is not the expected build (a silent no-op
 #      roll — "reports success while shipping nothing"). Distinct from both a
 #      compile failure and a provisioning soft-failure (#4053).
+#   6  launchd restart FAILED: the daemon is launchd-managed but the running
+#      (old) binary refused the `loom-daemon restart` IPC request (a pre-#4077
+#      binary with no RestartDaemon handler, or a dead socket). The fresh binary
+#      IS provisioned but the OLD one is still running; the script refuses to
+#      report success and prints the manual bootout/bootstrap fallback (#4042).
 #
 # See also: loom-daemon-start.sh (writes .loom/.daemon.flags), loom-daemon-stop.sh
 # (SIGTERM -> grace -> SIGKILL; in-flight sweeps survive by design — this
@@ -249,8 +279,60 @@ advisory_behind_origin() {
 }
 advisory_behind_origin "$REPO_ROOT"
 
+# ---------- launchd ownership detection (macOS, mirrors loom-daemon-stop.sh #4042) ----------
+# launchd is checked AHEAD of the .loom/.daemon.pid tier because the plist's
+# KeepAlive:SuccessfulExit assigns a FRESH pid on every supervised relaunch, so
+# the pid file goes stale after the first relaunch even for a launchd job that
+# loom-daemon-start.sh itself started; a hand-bootstrapped daemon has no state
+# files at all. Honors LOOM_DAEMON_LAUNCHD symmetrically with start/stop.sh so a
+# --no-launchd install never reaches into the machine-global launchd domain.
+IS_DARWIN=false
+[[ "$(uname -s)" == "Darwin" ]] && IS_DARWIN=true
+USE_LAUNCHD="$IS_DARWIN"
+if [[ "${LOOM_DAEMON_LAUNCHD:-}" =~ ^(0|false|no)$ ]]; then
+    USE_LAUNCHD=false
+fi
+DEFAULT_LAUNCHD_LABEL="com.rjwalters.loom-daemon"
+LAUNCHD_LABEL="${LOOM_LAUNCHD_LABEL:-$DEFAULT_LAUNCHD_LABEL}"
+LAUNCHD_SERVICE="gui/$(id -u)/${LAUNCHD_LABEL}"
+LAUNCHD_PLIST="$HOME/Library/LaunchAgents/${LAUNCHD_LABEL}.plist"
+
+launchd_job_loaded() {
+    [[ "$USE_LAUNCHD" == "true" ]] || return 1
+    command -v launchctl >/dev/null 2>&1 || return 1
+    launchctl print "$LAUNCHD_SERVICE" >/dev/null 2>&1
+}
+launchd_job_pid() {
+    launchctl print "$LAUNCHD_SERVICE" 2>/dev/null | awk -F'= ' '/^[[:space:]]*pid = /{gsub(/[^0-9]/, "", $2); print $2; exit}'
+}
+
+# Resolve which manager owns the running daemon: launchd (checked first), the
+# .loom/.daemon.pid file (nohup/script-managed), or none. WAS_RUNNING is derived
+# from this — a launchd-loaded job counts as running regardless of pid-file state.
+DAEMON_MANAGER="none"
+WAS_RUNNING=false
+if launchd_job_loaded; then
+    DAEMON_MANAGER="launchd"
+    WAS_RUNNING=true
+elif [[ -f "$PID_FILE" ]]; then
+    existing_pid=$(cat "$PID_FILE" 2>/dev/null || true)
+    if [[ -n "$existing_pid" ]] && kill -0 "$existing_pid" 2>/dev/null; then
+        DAEMON_MANAGER="pidfile"
+        WAS_RUNNING=true
+    fi
+fi
+
+describe_manager() {
+    case "$DAEMON_MANAGER" in
+        launchd) echo "Running daemon manager: launchd (label ${LAUNCHD_LABEL})." ;;
+        pidfile) echo "Running daemon manager: PID-file/nohup (.loom/.daemon.pid)." ;;
+        *)       echo "Running daemon manager: not running." ;;
+    esac
+}
+
 # ---------- --check: report only, no writes ----------
 if [[ "$CHECK_ONLY" == "true" ]]; then
+    describe_manager
     if [[ "$UPDATE_NEEDED" == "true" ]]; then
         warn "Update available (installed=${INSTALLED_COMMIT}, source=${SOURCE_COMMIT})."
         exit 3
@@ -270,14 +352,9 @@ if [[ "$UPDATE_NEEDED" == "false" ]]; then
 fi
 
 # ---------- resolve the restart plan up front (read-only; safe for --dry-run) ----------
-WAS_RUNNING=false
-if [[ -f "$PID_FILE" ]]; then
-    existing_pid=$(cat "$PID_FILE" 2>/dev/null || true)
-    if [[ -n "$existing_pid" ]] && kill -0 "$existing_pid" 2>/dev/null; then
-        WAS_RUNNING=true
-    fi
-fi
-
+# WAS_RUNNING + DAEMON_MANAGER were resolved above (launchd checked ahead of the
+# pid file). The flags below are only consulted for the pid-file/nohup restart
+# path — a launchd-managed restart replays flags from the plist, not this file.
 RESTART_ARGS=()
 FLAGS_SOURCE="none (defaulting to FLAGS-OFF bare restart)"
 if [[ -f "$FLAGS_FILE" ]]; then
@@ -297,6 +374,8 @@ if [[ "$DRY_RUN" == "true" ]]; then
     echo "[dry-run] Would provision the fresh binary to: $PROVISION_TARGET"
     if [[ "$NO_RESTART" == "true" ]]; then
         echo "[dry-run] --no-restart given: would leave the running daemon (if any) untouched."
+    elif [[ "$DAEMON_MANAGER" == "launchd" ]]; then
+        echo "[dry-run] loom-daemon is launchd-managed (label ${LAUNCHD_LABEL}) — would restart via '$PROVISION_TARGET restart' (the #4077 supervised primitive); .daemon.flags is NOT consulted (the plist's EnvironmentVariables carries the equivalent config)."
     elif [[ "$WAS_RUNNING" == "true" ]]; then
         echo "[dry-run] Would stop + restart loom-daemon with flags from ${FLAGS_SOURCE}: ${RESTART_ARGS[*]:-<none>}"
     else
@@ -419,8 +498,14 @@ fi
 if [[ "$NO_RESTART" == "true" ]]; then
     ok "Rebuilt + provisioned. Skipping restart (--no-restart)."
     if [[ "$WAS_RUNNING" == "true" ]]; then
-        echo "The running daemon is still the PRE-update binary. Restart manually with:"
-        echo "  $STOP_SCRIPT && $START_SCRIPT ${RESTART_ARGS[*]:-}"
+        if [[ "$DAEMON_MANAGER" == "launchd" ]]; then
+            echo "The running (launchd-managed) daemon is still the PRE-update binary. Restart it with:"
+            echo "  $PROVISION_TARGET restart"
+            echo "or manually: launchctl bootout $LAUNCHD_SERVICE && launchctl bootstrap gui/$(id -u) $LAUNCHD_PLIST"
+        else
+            echo "The running daemon is still the PRE-update binary. Restart manually with:"
+            echo "  $STOP_SCRIPT && $START_SCRIPT ${RESTART_ARGS[*]:-}"
+        fi
     fi
     exit 0
 fi
@@ -431,6 +516,34 @@ if [[ "$WAS_RUNNING" != "true" ]]; then
     exit 0
 fi
 
+# ---------- launchd-managed restart via the #4077 supervised primitive (#4042) ----------
+# The daemon is launchd-supervised, so NEITHER stop.sh+start.sh NOR .daemon.flags
+# apply: the plist's ProgramArguments + EnvironmentVariables are the durable
+# source of truth. `loom-daemon restart` sends Request::RestartDaemon over the
+# IPC socket; the supervised daemon exits 0 and KeepAlive:SuccessfulExit
+# relaunches it onto the freshly-provisioned binary with the plist's config.
+if [[ "$DAEMON_MANAGER" == "launchd" ]]; then
+    echo "loom-daemon is launchd-managed (label ${LAUNCHD_LABEL})."
+    echo "Restarting via the supervised restart primitive: $PROVISION_TARGET restart"
+    echo "(.daemon.flags is NOT consulted — the plist's EnvironmentVariables carries the equivalent config.)"
+    if "$PROVISION_TARGET" restart; then
+        ok "loom-daemon restart scheduled — launchd will relaunch it onto the freshly-provisioned binary."
+        exit 0
+    fi
+    # The restart request is served by the RUNNING (old) binary. A pre-#4077
+    # daemon has no RestartDaemon handler (and an unsupervised/dead socket also
+    # fails), so the request was refused. Refuse loudly rather than claim a
+    # half-update success: the fresh binary is provisioned but the OLD one is
+    # still running (the #4011 silent-autonomy-loss class this issue closes).
+    err "loom-daemon restart FAILED: the running daemon did not accept the restart request."
+    err "This is expected on the FIRST roll onto a #4077-capable binary — the currently-running binary predates the 'restart' IPC command (or its socket is dead)."
+    err "The freshly-built binary IS provisioned, but the OLD binary is still running. Restart it manually to pick up the update:"
+    err "  launchctl bootout   $LAUNCHD_SERVICE"
+    err "  launchctl bootstrap gui/$(id -u) $LAUNCHD_PLIST"
+    exit 6
+fi
+
+# ---------- PID-file/nohup-managed restart (preserve prior flags exactly) ----------
 if [[ "$FLAGS_SOURCE" == "$FLAGS_FILE" ]]; then
     echo "Restarting with the flags persisted at the last start ($FLAGS_FILE): ${RESTART_ARGS[*]:-<none>}"
 else
