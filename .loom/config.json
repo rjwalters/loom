@@ -1,6 +1,12 @@
 {
   "version": "2",
   "offlineMode": false,
+  "autonomous": {
+    "roleRunner": {
+      "enabled": true,
+      "roles": ["curator", "champion"]
+    }
+  },
   "buildGate": {
     "enabled": true,
     "command": "bash .loom/scripts/build-gate.sh",
