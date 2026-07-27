@@ -1531,7 +1531,7 @@ fn handle_register_watch(
     workspace_root: Option<String>,
     note: Option<String>,
 ) -> Response {
-    use crate::watch_registry::{default_watches_path, load, new_watch, save};
+    use crate::watch_registry::{default_watches_path, load, new_watch, save, with_watches_lock};
 
     let path = match default_watches_path() {
         Ok(p) => p,
@@ -1541,18 +1541,26 @@ fn handle_register_watch(
             }
         }
     };
-    let mut registry = load(&path);
-    let (watch, was_new) = registry.add(new_watch(kind, number, repo, workspace_root, note));
-    if was_new {
-        if let Err(e) = save(&path, &registry) {
-            return Response::Error {
-                message: format!("register_watch: save failed: {e}"),
-            };
+    // The load→modify→save runs under the watches-file lock: the background
+    // monitor loop is an independent concurrent writer to the same file, so an
+    // unguarded read-modify-write here could be silently clobbered (Issue #3971
+    // durability guarantee).
+    let outcome = with_watches_lock(&path, || {
+        let mut registry = load(&path);
+        let (watch, was_new) = registry.add(new_watch(kind, number, repo, workspace_root, note));
+        if was_new {
+            save(&path, &registry)?;
         }
-    }
-    Response::WatchRegistered {
-        watch,
-        already_present: !was_new,
+        Ok((watch, was_new))
+    });
+    match outcome {
+        Ok((watch, was_new)) => Response::WatchRegistered {
+            watch,
+            already_present: !was_new,
+        },
+        Err(e) => Response::Error {
+            message: format!("register_watch: save failed: {e}"),
+        },
     }
 }
 
@@ -1575,7 +1583,7 @@ fn handle_list_watches() -> Response {
 
 /// Remove a registered durable watch by id (Issue #3971).
 fn handle_remove_watch(id: &str) -> Response {
-    use crate::watch_registry::{default_watches_path, load, save};
+    use crate::watch_registry::{default_watches_path, load, save, with_watches_lock};
 
     let path = match default_watches_path() {
         Ok(p) => p,
@@ -1585,18 +1593,24 @@ fn handle_remove_watch(id: &str) -> Response {
             }
         }
     };
-    let mut registry = load(&path);
-    let was_present = registry.remove(id);
-    if was_present {
-        if let Err(e) = save(&path, &registry) {
-            return Response::Error {
-                message: format!("remove_watch: save failed: {e}"),
-            };
+    // Guarded by the watches-file lock — same concurrent-writer reasoning as
+    // handle_register_watch (Issue #3971).
+    let outcome = with_watches_lock(&path, || {
+        let mut registry = load(&path);
+        let was_present = registry.remove(id);
+        if was_present {
+            save(&path, &registry)?;
         }
-    }
-    Response::WatchRemoved {
-        id: id.to_string(),
-        was_present,
+        Ok(was_present)
+    });
+    match outcome {
+        Ok(was_present) => Response::WatchRemoved {
+            id: id.to_string(),
+            was_present,
+        },
+        Err(e) => Response::Error {
+            message: format!("remove_watch: save failed: {e}"),
+        },
     }
 }
 

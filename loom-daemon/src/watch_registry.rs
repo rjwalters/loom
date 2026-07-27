@@ -51,7 +51,7 @@ use serde::{Deserialize, Serialize};
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 // ============================================================================
 // Constants
@@ -329,7 +329,16 @@ pub fn save(path: &Path, registry: &WatchRegistry) -> Result<()> {
     }
     let mut json = serde_json::to_string_pretty(registry)?;
     json.push('\n');
-    let tmp = path.with_extension(format!("json.tmp.{}", std::process::id()));
+    // Unique-per-writer temp name: all in-process writers (the monitor task and
+    // every IPC handler task) share `std::process::id()`, so a PID-only suffix
+    // would collide under intra-daemon concurrency and defeat the atomic-rename
+    // guarantee. Appending a fresh uuid makes each writer's temp path unique
+    // (belt-and-suspenders alongside the watches-file lock below).
+    let tmp = path.with_extension(format!(
+        "json.tmp.{}.{}",
+        std::process::id(),
+        uuid::Uuid::new_v4().simple()
+    ));
     std::fs::write(&tmp, json.as_bytes())
         .with_context(|| format!("writing temp watches file {}", tmp.display()))?;
     std::fs::rename(&tmp, path)
@@ -356,6 +365,108 @@ pub fn append_result(path: &Path, result: &WatchResult) -> Result<()> {
     file.write_all(line.as_bytes())
         .with_context(|| format!("appending to results log {}", path.display()))?;
     Ok(())
+}
+
+// ============================================================================
+// Concurrency guard (mkdir-based lock on watches.json)
+// ============================================================================
+//
+// `watches.json` has **two independent concurrent writers** inside one daemon
+// process: the background monitor loop and the IPC `RegisterWatch`/`RemoveWatch`
+// handlers (each IPC connection is its own `tokio::spawn`). Nothing else
+// serializes them, so a naive load→modify→save from each has a lost-update
+// window (a watch registered while the monitor is mid-tick could be silently
+// dropped when the monitor saves). We serialize the whole load→modify→save
+// critical section with a `mkdir`-based lock — POSIX-atomic and macOS-safe
+// (`flock` is deliberately avoided; not available on stock macOS), matching the
+// convention CLAUDE.md documents for `.bad_tokens`/`.allowlist`.
+
+/// How long a writer waits to acquire the watches-file lock before giving up.
+const DEFAULT_LOCK_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// A held lock older than this is presumed abandoned by a crashed writer and is
+/// stolen (an mkdir lock has no OS-level auto-release on process death).
+const STALE_LOCK_AGE: Duration = Duration::from_secs(60);
+
+/// Sibling lock-directory path for a watches file (`<path>.lock`).
+fn lock_dir_for(path: &Path) -> PathBuf {
+    let mut os = path.as_os_str().to_owned();
+    os.push(".lock");
+    PathBuf::from(os)
+}
+
+/// RAII guard holding the mkdir-based watches-file lock; releases (removes the
+/// lock directory) on drop.
+pub struct WatchLock {
+    dir: PathBuf,
+}
+
+impl Drop for WatchLock {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir(&self.dir);
+    }
+}
+
+/// Acquire the mkdir-based lock guarding `watches_path`, retrying until
+/// `timeout`. A lock directory older than [`STALE_LOCK_AGE`] is treated as
+/// abandoned (a writer crashed before releasing) and stolen.
+fn acquire_watch_lock(watches_path: &Path, timeout: Duration) -> Result<WatchLock> {
+    let dir = lock_dir_for(watches_path);
+    if let Some(parent) = dir.parent() {
+        // Best-effort: the save path also creates this, but the lock must exist
+        // first, so ensure the parent is present up front.
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let start = Instant::now();
+    loop {
+        match std::fs::create_dir(&dir) {
+            Ok(()) => return Ok(WatchLock { dir }),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                // Stale-lock breaker: steal a lock whose dir is older than the
+                // presumed-crash window so a crashed writer can't wedge us.
+                if let Ok(meta) = std::fs::metadata(&dir) {
+                    if let Ok(modified) = meta.modified() {
+                        if modified
+                            .elapsed()
+                            .map(|age| age > STALE_LOCK_AGE)
+                            .unwrap_or(false)
+                        {
+                            log::warn!(
+                                "watch_registry: stealing stale lock at {} (older than {}s)",
+                                dir.display(),
+                                STALE_LOCK_AGE.as_secs()
+                            );
+                            let _ = std::fs::remove_dir(&dir);
+                            continue;
+                        }
+                    }
+                }
+                if start.elapsed() >= timeout {
+                    return Err(anyhow::anyhow!(
+                        "timed out after {}s acquiring watches lock at {}",
+                        timeout.as_secs(),
+                        dir.display()
+                    ));
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            Err(e) => {
+                return Err(e).with_context(|| format!("creating lock dir {}", dir.display()))
+            }
+        }
+    }
+}
+
+/// Run `f` while holding the watches-file lock (acquired with the default
+/// timeout), releasing it on return. The critical section MUST be short — never
+/// hold this across a `gh` probe (see [`run_one_tick`], which probes lock-free
+/// and only takes the lock for the fast reload-merge-save).
+pub fn with_watches_lock<T, F>(watches_path: &Path, f: F) -> Result<T>
+where
+    F: FnOnce() -> Result<T>,
+{
+    let _guard = acquire_watch_lock(watches_path, DEFAULT_LOCK_TIMEOUT)?;
+    f()
 }
 
 // ============================================================================
@@ -735,6 +846,10 @@ pub fn run_one_tick<P: WatchProbe>(probe: &P, expiry: Duration) {
             return;
         }
     };
+    // Snapshot lock-free: probing shells out to `gh` (seconds, up to the 30s
+    // timeout per watch), and holding the watches lock across that would block
+    // every IPC register/remove for the whole tick. We probe against a snapshot
+    // and only take the lock for the fast reload-merge-save below.
     let mut registry = load(&watches_path);
     if registry.watches.is_empty() {
         return; // no watches → no forge calls
@@ -743,6 +858,8 @@ pub fn run_one_tick<P: WatchProbe>(probe: &P, expiry: Duration) {
     if resolved.is_empty() {
         return; // nothing changed → no writes
     }
+    // Append to the durable (append-only, O_APPEND) results log first; it is
+    // concurrency-safe on its own and never needs the watches lock.
     if let Ok(log_path) = default_results_log_path() {
         for result in &resolved {
             if let Err(e) = append_result(&log_path, result) {
@@ -752,7 +869,21 @@ pub fn run_one_tick<P: WatchProbe>(probe: &P, expiry: Duration) {
             }
         }
     }
-    if let Err(e) = save(&watches_path, &registry) {
+    // Persist under the lock, but re-load a FRESH copy from disk first and drop
+    // only the ids we actually resolved — never blindly overwrite with our stale
+    // in-memory snapshot. An IPC `RegisterWatch` that landed while we were
+    // probing is merged in (it is present in the fresh load and is not one of
+    // the resolved ids), so a concurrent registration is never lost.
+    let resolved_ids: std::collections::HashSet<&str> =
+        resolved.iter().map(|r| r.id.as_str()).collect();
+    let persist = with_watches_lock(&watches_path, || {
+        let mut fresh = load(&watches_path);
+        fresh
+            .watches
+            .retain(|w| !resolved_ids.contains(w.id.as_str()));
+        save(&watches_path, &fresh)
+    });
+    if let Err(e) = persist {
         log::error!("watch_monitor: failed to persist watches after resolution: {e}");
     }
 }
@@ -1158,6 +1289,65 @@ mod tests {
         run_one_tick(&probe, Duration::from_secs(0));
         assert!(!results.exists(), "no results log written for an empty registry");
         assert!(probe.calls.lock().unwrap().is_empty(), "no probe calls for empty registry");
+
+        std::env::remove_var(WATCHES_PATH_ENV);
+        std::env::remove_var(RESULTS_LOG_PATH_ENV);
+    }
+
+    // ---- concurrency: register-during-resolving-tick (Issue #3971 durability) ----
+
+    /// Regression for the lost-update window the Judge flagged: a
+    /// `RegisterWatch` that lands while the monitor is mid-tick (blocked on a
+    /// slow `gh` probe) must survive the tick's subsequent save. Without the
+    /// reload-merge under the watches-file lock, the monitor would persist its
+    /// stale in-memory snapshot and silently drop the just-registered watch.
+    ///
+    /// The `RegisteringProbe` stands in for the racing IPC handler: while
+    /// probing watch A (which resolves `Closed`), it performs exactly the
+    /// lock→load→add→save that `handle_register_watch` does, registering B. B
+    /// must still be present after the tick completes.
+    #[test]
+    #[serial]
+    fn concurrent_register_during_resolving_tick_is_not_lost() {
+        let dir = tempdir().unwrap();
+        let watches = dir.path().join("watches.json");
+        let results = dir.path().join("watch-results.log");
+        std::env::set_var(WATCHES_PATH_ENV, &watches);
+        std::env::set_var(RESULTS_LOG_PATH_ENV, &results);
+
+        // Registry starts with A (#1), which resolves Closed this tick.
+        let mut reg = WatchRegistry::default();
+        reg.add(new_watch(WatchKind::Issue, 1, Some("a/b".into()), None, None));
+        save(&watches, &reg).unwrap();
+
+        struct RegisteringProbe {
+            watches: PathBuf,
+        }
+        impl WatchProbe for RegisteringProbe {
+            fn probe(&self, _spec: &WatchSpec) -> Result<Option<WatchOutcome>> {
+                // Simulate a concurrent RegisterWatch(B, #2) landing mid-probe,
+                // via the same guarded critical section the IPC handler uses.
+                with_watches_lock(&self.watches, || {
+                    let mut r = load(&self.watches);
+                    r.add(new_watch(WatchKind::Issue, 2, Some("a/b".into()), None, None));
+                    save(&self.watches, &r)
+                })
+                .unwrap();
+                Ok(Some(WatchOutcome::Closed))
+            }
+        }
+
+        run_one_tick(
+            &RegisteringProbe {
+                watches: watches.clone(),
+            },
+            Duration::from_secs(0),
+        );
+
+        // A (#1) resolved and was dropped; B (#2), registered mid-tick, survives.
+        let after = load(&watches);
+        let numbers: Vec<u32> = after.watches.iter().map(|w| w.number).collect();
+        assert_eq!(numbers, vec![2], "watch registered during a resolving tick must not be lost");
 
         std::env::remove_var(WATCHES_PATH_ENV);
         std::env::remove_var(RESULTS_LOG_PATH_ENV);
