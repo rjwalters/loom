@@ -85,7 +85,9 @@ use std::time::Duration;
 use anyhow::Result;
 
 use crate::capacity::{self, CapacityAdvisory};
-use crate::cpu_headroom::cpu_headroom_limit;
+use crate::cpu_headroom::{
+    cpu_headroom_limit, resolve_est_cores_per_sweep, resolve_utilization_target,
+};
 use crate::disk_headroom::disk_headroom_limit;
 use crate::event_bus::EventBus;
 use crate::main_health_gate::{MainHealthState, WorkspaceHealthStates};
@@ -702,7 +704,7 @@ pub fn resolve_max_concurrent() -> usize {
 /// consumes. Each field is `Option` so an absent key falls through to the
 /// env-var / built-in-default resolution — the precedence is **env > config >
 /// default** for every knob.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct WorkFinderConfig {
     /// `autonomous.workFinder.enabled` — whether to run the loop at all.
     pub enabled: Option<bool>,
@@ -717,6 +719,17 @@ pub struct WorkFinderConfig {
     /// `autonomous` level (not under `workFinder`), so it is read even when no
     /// `workFinder` block is present. A zero/invalid value is dropped to `None`.
     pub per_token_concurrency: Option<usize>,
+    /// `autonomous.cpuUtilizationTarget` — the fraction of logical CPUs the CPU
+    /// headroom term (#3978) is willing to dedicate to sweep work (#4032). Also
+    /// lives at the `autonomous` level, alongside `perTokenConcurrency`. A
+    /// value outside `(0, 1]` (or the wrong JSON type) is dropped to `None`, so
+    /// it falls through to [`crate::cpu_headroom::DEFAULT_UTILIZATION_TARGET`].
+    pub cpu_utilization_target: Option<f64>,
+    /// `autonomous.estCoresPerSweep` — the estimated CPU cores a single
+    /// concurrent sweep consumes while building/testing (#3978, #4032). A
+    /// value `<= 0` (or the wrong JSON type) is dropped to `None`, so it falls
+    /// through to [`crate::cpu_headroom::DEFAULT_EST_CORES_PER_SWEEP`].
+    pub est_cores_per_sweep: Option<f64>,
 }
 
 /// Read `.loom/config.json → autonomous.workFinder`, soft-failing every field
@@ -760,6 +773,21 @@ pub fn read_work_finder_config(repo_root: &Path) -> WorkFinderConfig {
         .filter(|&n| n > 0)
         .and_then(|n| usize::try_from(n).ok());
 
+    // `cpuUtilizationTarget` / `estCoresPerSweep` (#4032) also live at the
+    // `autonomous` level, mirroring `perTokenConcurrency`. `Value::as_f64`
+    // accepts both integer and float JSON (`2` and `2.0`); range filters match
+    // the env-var resolvers in `cpu_headroom.rs` exactly so a config value
+    // that would be rejected there is dropped to `None` here too, rather than
+    // being clamped or silently applied out of range.
+    let cpu_utilization_target = autonomous
+        .get("cpuUtilizationTarget")
+        .and_then(serde_json::Value::as_f64)
+        .filter(|&f| f > 0.0 && f <= 1.0);
+    let est_cores_per_sweep = autonomous
+        .get("estCoresPerSweep")
+        .and_then(serde_json::Value::as_f64)
+        .filter(|&f| f > 0.0);
+
     // The `workFinder` sub-block is optional; each field independently falls
     // through to `None` (env/default resolution) when absent.
     let wf = autonomous.get("workFinder");
@@ -778,6 +806,8 @@ pub fn read_work_finder_config(repo_root: &Path) -> WorkFinderConfig {
             .filter(|&n| n > 0)
             .and_then(|n| usize::try_from(n).ok()),
         per_token_concurrency,
+        cpu_utilization_target,
+        est_cores_per_sweep,
     }
 }
 
@@ -831,6 +861,25 @@ pub fn resolve_per_token_concurrency(config: &WorkFinderConfig) -> usize {
     env_per_token_concurrency()
         .or(config.per_token_concurrency)
         .unwrap_or(DEFAULT_PER_TOKEN_CONCURRENCY)
+}
+
+/// Resolve the CPU headroom term's utilization-target knob with precedence
+/// **env > config > default** (#4032). Thin wrapper over
+/// [`crate::cpu_headroom::resolve_utilization_target`] that reads the config
+/// half from this module's already-parsed [`WorkFinderConfig`], mirroring how
+/// [`resolve_per_token_concurrency`] reads `config.per_token_concurrency`.
+#[must_use]
+pub fn resolve_cpu_utilization_target(config: &WorkFinderConfig) -> f64 {
+    resolve_utilization_target(config.cpu_utilization_target)
+}
+
+/// Resolve the CPU headroom term's est-cores-per-sweep knob with precedence
+/// **env > config > default** (#4032). Thin wrapper over
+/// [`crate::cpu_headroom::resolve_est_cores_per_sweep`]; see
+/// [`resolve_cpu_utilization_target`].
+#[must_use]
+pub fn resolve_cpu_est_cores_per_sweep(config: &WorkFinderConfig) -> f64 {
+    resolve_est_cores_per_sweep(config.est_cores_per_sweep)
 }
 
 /// Compute the **work-driven dynamic concurrency cap** (Phase B, #3811;
@@ -925,6 +974,8 @@ pub fn spawn_work_finder_task<S, D>(
     workspace_root: PathBuf,
     configured_max: usize,
     per_token_concurrency: usize,
+    cpu_utilization_target: f64,
+    cpu_est_cores_per_sweep: f64,
     health_state: Arc<MainHealthState>,
     event_bus: Arc<EventBus>,
 ) -> tokio::task::JoinHandle<()>
@@ -970,9 +1021,14 @@ where
             // memoized idle sample, which sleeps ~1s on macOS (`iostat`), so it
             // is moved off the runtime via `spawn_blocking`; a join error falls
             // back to the policy floor of 1 (soft backoff, never a hard halt).
-            let cpu = tokio::task::spawn_blocking(cpu_headroom_limit)
-                .await
-                .unwrap_or(1);
+            // `cpu_utilization_target` / `cpu_est_cores_per_sweep` are resolved
+            // once at startup (env > config > default, #4032) and captured by
+            // this task, mirroring `per_token_concurrency`.
+            let cpu = tokio::task::spawn_blocking(move || {
+                cpu_headroom_limit(cpu_utilization_target, cpu_est_cores_per_sweep)
+            })
+            .await
+            .unwrap_or(1);
             let max_concurrent = resolve_dynamic_max_concurrent(
                 token_limit,
                 per_token_concurrency,
@@ -1073,12 +1129,17 @@ where
 /// the `(repo, issue)` key that disambiguates them is phase c (#3929). No new
 /// topic shape is introduced here (CLAUDE.md: "New topics require a follow-up
 /// issue").
+#[allow(clippy::too_many_arguments)] // dynamic-cap inputs (#4032 adds two more
+                                     // resolved-once-at-startup f64 knobs, mirroring
+                                     // per_token_concurrency) + shared state.
 pub fn spawn_multi_work_finder_task(
     pool: Arc<WorkspacePool>,
     fallback_root: PathBuf,
     interval: Duration,
     configured_max: usize,
     per_token_concurrency: usize,
+    cpu_utilization_target: f64,
+    cpu_est_cores_per_sweep: f64,
     health_states: Arc<WorkspaceHealthStates>,
     event_bus: Arc<EventBus>,
 ) -> tokio::task::JoinHandle<()> {
@@ -1108,10 +1169,15 @@ pub fn spawn_multi_work_finder_task(
             // machine-level resource, probed once per tick and shared across
             // every workspace. Moved off the runtime via `spawn_blocking` since
             // the macOS `iostat` refresh sleeps ~1s; a join error falls back to
-            // the policy floor of 1.
-            let cpu = tokio::task::spawn_blocking(cpu_headroom_limit)
-                .await
-                .unwrap_or(1);
+            // the policy floor of 1. `cpu_utilization_target` /
+            // `cpu_est_cores_per_sweep` are resolved once at startup (env >
+            // config > default, #4032) and captured by this task, mirroring
+            // `per_token_concurrency`.
+            let cpu = tokio::task::spawn_blocking(move || {
+                cpu_headroom_limit(cpu_utilization_target, cpu_est_cores_per_sweep)
+            })
+            .await
+            .unwrap_or(1);
             let max_concurrent = resolve_dynamic_max_concurrent(
                 token_limit,
                 per_token_concurrency,
@@ -2516,7 +2582,7 @@ exit 0
         let tmp = tempfile::tempdir().unwrap();
         write_config(
             tmp.path(),
-            r#"{"autonomous": {"perTokenConcurrency": 4, "workFinder": {"enabled": true, "intervalSecs": 90, "maxConcurrent": 5}}}"#,
+            r#"{"autonomous": {"perTokenConcurrency": 4, "cpuUtilizationTarget": 0.6, "estCoresPerSweep": 3.5, "workFinder": {"enabled": true, "intervalSecs": 90, "maxConcurrent": 5}}}"#,
         );
         assert_eq!(
             read_work_finder_config(tmp.path()),
@@ -2525,8 +2591,90 @@ exit 0
                 interval_secs: Some(90),
                 max_concurrent: Some(5),
                 per_token_concurrency: Some(4),
+                cpu_utilization_target: Some(0.6),
+                est_cores_per_sweep: Some(3.5),
             }
         );
+    }
+
+    // ===================================================================
+    // cpuUtilizationTarget / estCoresPerSweep config parsing (#4032)
+    // ===================================================================
+
+    #[test]
+    fn test_config_cpu_knobs_read_without_work_finder_block() {
+        // Both knobs live at the `autonomous` level (#4032), so they are read
+        // even when the `workFinder` sub-block is absent — mirroring
+        // `perTokenConcurrency`.
+        let tmp = tempfile::tempdir().unwrap();
+        write_config(
+            tmp.path(),
+            r#"{"autonomous": {"cpuUtilizationTarget": 0.5, "estCoresPerSweep": 1.5}}"#,
+        );
+        let cfg = read_work_finder_config(tmp.path());
+        assert_eq!(cfg.cpu_utilization_target, Some(0.5));
+        assert_eq!(cfg.est_cores_per_sweep, Some(1.5));
+        assert_eq!(cfg.enabled, None);
+    }
+
+    #[test]
+    fn test_config_integer_cpu_knobs_parse_as_f64() {
+        // `Value::as_f64` handles integer JSON as well as float — assert it
+        // (#4032 AC: "estCoresPerSweep": 2 as well as 2.0).
+        let tmp = tempfile::tempdir().unwrap();
+        write_config(tmp.path(), r#"{"autonomous": {"estCoresPerSweep": 2}}"#);
+        let cfg = read_work_finder_config(tmp.path());
+        assert_eq!(cfg.est_cores_per_sweep, Some(2.0));
+    }
+
+    #[test]
+    fn test_config_out_of_range_cpu_utilization_target_drops_to_none() {
+        for bad in ["0", "-1", "1.5"] {
+            let tmp = tempfile::tempdir().unwrap();
+            write_config(
+                tmp.path(),
+                &format!(r#"{{"autonomous": {{"cpuUtilizationTarget": {bad}}}}}"#),
+            );
+            assert_eq!(
+                read_work_finder_config(tmp.path()).cpu_utilization_target,
+                None,
+                "cpuUtilizationTarget={bad} must drop to None, not be clamped"
+            );
+        }
+    }
+
+    #[test]
+    fn test_config_out_of_range_est_cores_per_sweep_drops_to_none() {
+        for bad in ["0", "-2"] {
+            let tmp = tempfile::tempdir().unwrap();
+            write_config(
+                tmp.path(),
+                &format!(r#"{{"autonomous": {{"estCoresPerSweep": {bad}}}}}"#),
+            );
+            assert_eq!(
+                read_work_finder_config(tmp.path()).est_cores_per_sweep,
+                None,
+                "estCoresPerSweep={bad} must drop to None, not be clamped"
+            );
+        }
+    }
+
+    #[test]
+    fn test_config_wrong_json_type_cpu_knobs_drop_to_none() {
+        // A string, bool, or null where a number is expected must not panic
+        // and must resolve to None (soft-fail to env/default resolution).
+        let tmp = tempfile::tempdir().unwrap();
+        write_config(
+            tmp.path(),
+            r#"{"autonomous": {"cpuUtilizationTarget": "0.8", "estCoresPerSweep": true}}"#,
+        );
+        let cfg = read_work_finder_config(tmp.path());
+        assert_eq!(cfg.cpu_utilization_target, None);
+        assert_eq!(cfg.est_cores_per_sweep, None);
+
+        let tmp2 = tempfile::tempdir().unwrap();
+        write_config(tmp2.path(), r#"{"autonomous": {"estCoresPerSweep": null}}"#);
+        assert_eq!(read_work_finder_config(tmp2.path()).est_cores_per_sweep, None);
     }
 
     #[test]
@@ -2696,6 +2844,60 @@ exit 0
         std::env::set_var(PER_TOKEN_CONCURRENCY_ENV, "nope");
         assert_eq!(resolve_per_token_concurrency(&cfg), 4);
         std::env::remove_var(PER_TOKEN_CONCURRENCY_ENV);
+    }
+
+    #[test]
+    #[serial]
+    fn test_resolve_cpu_utilization_target_precedence() {
+        use crate::cpu_headroom::{DEFAULT_UTILIZATION_TARGET, UTILIZATION_TARGET_ENV};
+        std::env::remove_var(UTILIZATION_TARGET_ENV);
+
+        // Default when neither env nor config set.
+        assert!(
+            (resolve_cpu_utilization_target(&WorkFinderConfig::default())
+                - DEFAULT_UTILIZATION_TARGET)
+                .abs()
+                < f64::EPSILON
+        );
+
+        // Config used when env unset.
+        let cfg = WorkFinderConfig {
+            cpu_utilization_target: Some(0.6),
+            ..Default::default()
+        };
+        assert!((resolve_cpu_utilization_target(&cfg) - 0.6).abs() < f64::EPSILON);
+
+        // Env overrides config.
+        std::env::set_var(UTILIZATION_TARGET_ENV, "0.5");
+        assert!((resolve_cpu_utilization_target(&cfg) - 0.5).abs() < f64::EPSILON);
+        std::env::remove_var(UTILIZATION_TARGET_ENV);
+    }
+
+    #[test]
+    #[serial]
+    fn test_resolve_cpu_est_cores_per_sweep_precedence() {
+        use crate::cpu_headroom::{DEFAULT_EST_CORES_PER_SWEEP, EST_CORES_PER_SWEEP_ENV};
+        std::env::remove_var(EST_CORES_PER_SWEEP_ENV);
+
+        // Default when neither env nor config set.
+        assert!(
+            (resolve_cpu_est_cores_per_sweep(&WorkFinderConfig::default())
+                - DEFAULT_EST_CORES_PER_SWEEP)
+                .abs()
+                < f64::EPSILON
+        );
+
+        // Config used when env unset.
+        let cfg = WorkFinderConfig {
+            est_cores_per_sweep: Some(4.0),
+            ..Default::default()
+        };
+        assert!((resolve_cpu_est_cores_per_sweep(&cfg) - 4.0).abs() < f64::EPSILON);
+
+        // Env overrides config.
+        std::env::set_var(EST_CORES_PER_SWEEP_ENV, "1.0");
+        assert!((resolve_cpu_est_cores_per_sweep(&cfg) - 1.0).abs() < f64::EPSILON);
+        std::env::remove_var(EST_CORES_PER_SWEEP_ENV);
     }
 
     // ===================================================================

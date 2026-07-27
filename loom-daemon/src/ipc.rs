@@ -528,18 +528,28 @@ pub fn build_daemon_status(
     let workspace_root = fallback_root;
     let token_pool_size = crate::tokens::token_pool_size(workspace_root);
     let disk_headroom = crate::disk_headroom::disk_headroom_limit(workspace_root);
+    // Hoisted above the CPU snapshot (#4032) so the resolved
+    // `cpuUtilizationTarget` / `estCoresPerSweep` knobs can feed it — this read
+    // was already happening six lines below; moving it up is not a new config
+    // read, just a reorder so status and dispatch resolve through the same
+    // env > config > default path (`resolve_cpu_utilization_target` /
+    // `resolve_cpu_est_cores_per_sweep`, single-root, matching
+    // `resolve_per_token_concurrency`).
+    let wf_config = crate::work_finder::read_work_finder_config(workspace_root);
+    let configured_max = crate::work_finder::resolve_max_concurrent_with_config(&wf_config);
+    let per_token_concurrency = crate::work_finder::resolve_per_token_concurrency(&wf_config);
+    let cpu_utilization_target = crate::work_finder::resolve_cpu_utilization_target(&wf_config);
+    let cpu_est_cores_per_sweep = crate::work_finder::resolve_cpu_est_cores_per_sweep(&wf_config);
     // CPU headroom (#3978, measured-idle signal #4031) — a host-level resource
     // (not per-repo). The snapshot reads the memoized idle fraction (never
     // blocks; the caller pre-warms it via `spawn_blocking(refresh_cpu_util_cache)`
     // before invoking `build_daemon_status`) plus a fast fresh loadavg read.
-    let cpu_snapshot = crate::cpu_headroom::cpu_headroom_snapshot();
+    let cpu_snapshot =
+        crate::cpu_headroom::cpu_headroom_snapshot(cpu_utilization_target, cpu_est_cores_per_sweep);
     let logical_cpus = cpu_snapshot.logical_cpus;
     let loadavg_1m = cpu_snapshot.loadavg_1m;
     let cpu_idle_fraction = cpu_snapshot.idle_fraction;
     let cpu_headroom = cpu_snapshot.cpu_headroom;
-    let wf_config = crate::work_finder::read_work_finder_config(workspace_root);
-    let configured_max = crate::work_finder::resolve_max_concurrent_with_config(&wf_config);
-    let per_token_concurrency = crate::work_finder::resolve_per_token_concurrency(&wf_config);
 
     // Token-capacity backpressure (#3902): back the token axis off from the flat
     // pool count toward the count of *healthy* accounts read from the rotation

@@ -1174,9 +1174,29 @@ capacity, unadjusted. Like the token axis's "one healthy account is the floor,
 never a halt" policy (#3902), the CPU term is floored at `1` — a read failure or
 a noisy reading must never by itself wedge the whole dynamic cap to zero; disk
 headroom and the token axis remain the only terms allowed to floor to a genuine
-`0`. Tunable via `LOOM_CPU_UTILIZATION_TARGET` (fraction, default `0.75`) and
-`LOOM_EST_CORES_PER_SWEEP` (cores, default `2.0`) — env-only, mirroring
-`LOOM_PER_WORKTREE_GB`'s config surface (no `.loom/config.json` knob).
+`0`. Tunable with the standard precedence **env (`LOOM_CPU_UTILIZATION_TARGET`
+/ `LOOM_EST_CORES_PER_SWEEP`) > config (`autonomous.cpuUtilizationTarget` /
+`autonomous.estCoresPerSweep`) > default (`0.75` fraction / `2.0` cores)**
+(#4032) — resolved single-root, at startup, from the same
+`WorkFinderConfig`/`read_work_finder_config` that `perTokenConcurrency` uses
+(not per-workspace: the dynamic cap is one global number per tick, computed
+before the workspace registry is even loaded). An out-of-range or
+wrong-JSON-type config value (`cpuUtilizationTarget` outside `(0, 1]`,
+`estCoresPerSweep <= 0`, a string/bool/null where a number is expected) is
+dropped to `None` at the config-read layer, not clamped, so it falls straight
+through to env/default resolution.
+
+**`LOOM_PER_WORKTREE_GB` deliberately stays env-only (#4032 decision).**
+Unlike the CPU knobs, `disk_headroom`'s `LOOM_PER_WORKTREE_GB` was *not*
+migrated to the same `autonomous.*` pattern. It has a second, independent
+Bash-side reader (`defaults/scripts/lib/disk-headroom.sh`, consumed by
+`/loom:sweep` Stage -1 wave sizing) alongside the Rust
+`disk_headroom::per_worktree_gb`. Migrating only the Rust side would create a
+live divergence where the same env var honors `.loom/config.json` on the
+daemon path while silently ignoring it on the sweep path — worse than today's
+consistent env-only behavior. Wiring the Bash `config-resolver.sh` into
+`disk-headroom.sh` too is a separate, larger change; file a follow-up if that
+cost is judged worth paying.
 
 *Calibrating `LOOM_EST_CORES_PER_SWEEP`.* The host-side half of the term
 (consumed cores) is now measured continuously and needs no tuning. The one
@@ -1329,6 +1349,8 @@ concurrency ceiling 5" and share it with the team:
   "autonomous": {
     "model": "sonnet",
     "perTokenConcurrency": 2,
+    "cpuUtilizationTarget": 0.75,
+    "estCoresPerSweep": 2.0,
     "workFinder": {
       "enabled": true,
       "intervalSecs": 60,
@@ -1384,6 +1406,8 @@ exactly like `main_health_gate::read_build_gate_config`.
 | `autonomous.workFinder.quarantine.ttlSecs` | `LOOM_WORK_FINDER_QUARANTINE_TTL_SECS` | `3600` | How long a quarantine entry persists before auto-release. Zero/invalid → default |
 | `autonomous.workFinder.quarantine.instaCrashSecs` | `LOOM_WORK_FINDER_QUARANTINE_INSTA_CRASH_SECS` | `60` | Checkpoint-less death within this window of dispatch counts as an insta-crash. Zero/invalid → default |
 | `autonomous.perTokenConcurrency` | `LOOM_PER_TOKEN_CONCURRENCY` | `2` | Concurrent sweeps **per healthy token** in the cap (#3947). Zero/invalid → default; clamped to a floor of 1 |
+| `autonomous.cpuUtilizationTarget` | `LOOM_CPU_UTILIZATION_TARGET` | `0.75` | Fraction of logical CPUs the CPU headroom term is willing to dedicate to sweep work (#3978, config surface #4032). Outside `(0, 1]` or wrong JSON type → default; single-root, resolved once at startup (not per-workspace) |
+| `autonomous.estCoresPerSweep` | `LOOM_EST_CORES_PER_SWEEP` | `2.0` | Estimated CPU cores one concurrent sweep consumes while building/testing (#3978, config surface #4032). `<= 0` or wrong JSON type → default; integer JSON (`2`) and float JSON (`2.0`) both accepted; single-root, resolved once at startup |
 | `autonomous.mainHealthGate.enabled` | `LOOM_MAIN_HEALTH_GATE` | `false` | Gate loop on/off |
 | `autonomous.mainHealthGate.ciWorkflow` | `LOOM_GATE_CI_WORKFLOW` | *(unset)* | Forge workflow that must itself conclude `success` for forge-CI corroboration to vouch for a commit (#3987). Empty/whitespace → unset. Absent → today's unanimity rule, unchanged. See [Optional named verification workflow](#optional-named-verification-workflow-loom_gate_ci_workflow-3987) |
 | `autonomous.roleRunner.enabled` | `LOOM_ROLE_RUNNER` | `false` | Periodic standalone support-role runner on/off (#4015) |

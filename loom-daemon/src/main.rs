@@ -667,9 +667,20 @@ async fn main() -> Result<()> {
         let interval = work_finder::resolve_interval_with_config(&work_finder_config);
         let configured_max = work_finder::resolve_max_concurrent_with_config(&work_finder_config);
         let per_token_concurrency = work_finder::resolve_per_token_concurrency(&work_finder_config);
+        // CPU headroom knobs (#4032): resolved once at startup from the same
+        // `work_finder_config`, precedence env > config > default — matching
+        // `per_token_concurrency` exactly (single-root, startup-time; the
+        // dynamic cap is one global number per tick, computed before the
+        // workspace registry is even loaded, so there is no per-workspace
+        // variant of these knobs).
+        let cpu_utilization_target =
+            work_finder::resolve_cpu_utilization_target(&work_finder_config);
+        let cpu_est_cores_per_sweep =
+            work_finder::resolve_cpu_est_cores_per_sweep(&work_finder_config);
         log::info!(
             "work_finder: enabled (multi-workspace, interval={}s, configured_max={configured_max}, \
-             per_token_concurrency={per_token_concurrency}, \
+             per_token_concurrency={per_token_concurrency}, cpu_utilization_target={cpu_utilization_target}, \
+             cpu_est_cores_per_sweep={cpu_est_cores_per_sweep}, \
              dynamic cap = min(healthy tokens × per-token, disk, cpu, configured_max), \
              global across workspaces)",
             interval.as_secs()
@@ -683,6 +694,8 @@ async fn main() -> Result<()> {
             interval,
             configured_max,
             per_token_concurrency,
+            cpu_utilization_target,
+            cpu_est_cores_per_sweep,
             workspace_health_states.clone(),
             event_bus.clone(),
         ))
