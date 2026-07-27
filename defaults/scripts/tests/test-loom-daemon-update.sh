@@ -35,6 +35,19 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CLI_DIR="$(cd "$SCRIPT_DIR/../cli" && pwd)"
 UPDATE_SCRIPT="$CLI_DIR/loom-daemon-update.sh"
 
+# Shared launchd sandbox (#4078). Belt-and-braces on top of LOOM_DAEMON_LAUNCHD=0:
+#   - a scratch LOOM_LAUNCHD_LABEL so any launchd lookup that DID fire could not
+#     resolve the operator's real com.rjwalters.loom-daemon job, and
+#   - stub launchctl/pgrep installed onto the test PATH (below), so the real
+#     tools are unreachable even if a future regression re-opens a launchd/pgrep
+#     path in the stop script the restart flow drives.
+# This closes the exact hole that booted out the operator's live daemon: the
+# update suite exercises the REAL start/stop scripts, and launchd is
+# machine-global.
+# shellcheck source=lib/launchd-sandbox.sh
+source "$SCRIPT_DIR/lib/launchd-sandbox.sh"
+export LOOM_LAUNCHD_LABEL="$(launchd_sandbox_new_label)"
+
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 NC='\033[0m'
@@ -137,15 +150,40 @@ EOF
 MINIMAL_PATH="/usr/bin:/bin:/usr/sbin:/sbin"
 
 BASE_WORKDIR="$(mktemp -d)"
+
+# Suite-level decoy (#4078): a process whose argv ends in `/loom-daemon`, which
+# the stop script's label-blind `pgrep -f '(^|/)loom-daemon$'` fallback would
+# match. The whole update suite runs under a scratch LOOM_LAUNCHD_LABEL and
+# LOOM_DAEMON_LAUNCHD=0, so no real launchd lookup or by-name kill may fire; if
+# any test regresses into one, this decoy dies and the final assertion fails.
+# Spawned OUTSIDE $BASE_WORKDIR's path so the trap's `pkill -f "$BASE_WORKDIR"`
+# does not sweep it; killed explicitly below.
+DECOY_DIR="$(mktemp -d)"
+cat > "$DECOY_DIR/loom-daemon" <<'EOF'
+#!/usr/bin/env bash
+while true; do sleep 1; done
+EOF
+chmod +x "$DECOY_DIR/loom-daemon"
+# Redirect stdio to /dev/null so the never-exiting decoy cannot hold open a
+# captured stdout pipe of the suite (which would block a caller capturing its
+# output — the same command-substitution gotcha the sandbox spawner avoids).
+"$DECOY_DIR/loom-daemon" >/dev/null 2>&1 &
+DECOY_PID=$!
+
 # Best-effort cleanup of any fake-daemon processes left running (matched by
 # their script path under $BASE_WORKDIR, which appears in `ps`'s command
 # line) — individual tests also kill their own PIDs explicitly, this is a
 # backstop for anything a failed assertion left behind.
-trap 'pkill -f "$BASE_WORKDIR" >/dev/null 2>&1; rm -rf "$BASE_WORKDIR"' EXIT
+trap 'kill "$DECOY_PID" 2>/dev/null; pkill -f "$BASE_WORKDIR" >/dev/null 2>&1; rm -rf "$BASE_WORKDIR" "$DECOY_DIR"' EXIT
 
 FAKE_BIN_DIR="$BASE_WORKDIR/fakebin"
 mkdir -p "$FAKE_BIN_DIR"
 write_fake_cargo "$FAKE_BIN_DIR/cargo"
+# Stub launchctl/pgrep onto the front of every test PATH (FAKE_BIN_DIR is the
+# first entry of TEST_PATH and TEST_PATH_NO_CODESIGN), recording invocations to
+# $SANDBOX_LOG_DIR so the suite can assert no production label was ever named.
+SANDBOX_LOG_DIR="$BASE_WORKDIR/sandbox-log"
+launchd_sandbox_install_stubs "$FAKE_BIN_DIR" "$SANDBOX_LOG_DIR"
 TEST_PATH="$FAKE_BIN_DIR:$MINIMAL_PATH"
 
 # A copy of /usr/bin with every entry EXCEPT `codesign` symlinked in, used by
@@ -646,6 +684,31 @@ else
     TESTS_FAILED=$((TESTS_FAILED + 1))
     echo -e "${RED}✗${NC} codesign absent from PATH: binary is still provisioned"
     echo "  output: $out14"
+fi
+
+# ============================================================
+# 15. Launchd-sandbox guards (#4078): the whole suite exercises the REAL
+#     start/stop scripts, so prove it never reached the operator's live daemon.
+#     (a) The suite-level decoy loom-daemon is still alive — no by-name kill
+#         fired anywhere in the suite.
+#     (b) No recorded launchctl invocation ever named a com.rjwalters.* label.
+# ============================================================
+TESTS_RUN=$((TESTS_RUN + 1))
+if kill -0 "$DECOY_PID" 2>/dev/null; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} suite-level decoy loom-daemon survived the whole update suite"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} suite-level decoy loom-daemon survived the whole update suite"
+fi
+TESTS_RUN=$((TESTS_RUN + 1))
+if launchd_sandbox_assert_no_production_label "$SANDBOX_LOG_DIR/launchctl-invocations.log"; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} no launchctl invocation named a com.rjwalters.* label"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} no launchctl invocation named a com.rjwalters.* label"
+    echo "  launchctl invocations: $(cat "$SANDBOX_LOG_DIR/launchctl-invocations.log" 2>/dev/null)"
 fi
 
 # ---------- summary ----------

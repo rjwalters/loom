@@ -48,6 +48,11 @@
 # Environment:
 #   LOOM_DAEMON_STOP_GRACE_SECS   Grace window before SIGKILL (default 10)
 #   LOOM_LAUNCHD_LABEL            macOS only: the LaunchAgent label to bootout (default com.rjwalters.loom-daemon)
+#   LOOM_DAEMON_LAUNCHD           macOS only: 0/false/no disables ALL launchd interaction
+#                                 (lookup + bootout), symmetric with loom-daemon-start.sh.
+#                                 A start done with --no-launchd / LOOM_DAEMON_LAUNCHD=0
+#                                 must get a stop that never reads or mutates the
+#                                 machine-global launchd domain (issue #4078).
 #
 # Exit codes:
 #   0  daemon stopped (or was not running)
@@ -107,11 +112,25 @@ GRACE_SECS="${LOOM_DAEMON_STOP_GRACE_SECS:-10}"
 # ---------- launchd plumbing (macOS, #3972) ----------
 IS_DARWIN=false
 [[ "$(uname -s)" == "Darwin" ]] && IS_DARWIN=true
-LAUNCHD_LABEL="${LOOM_LAUNCHD_LABEL:-com.rjwalters.loom-daemon}"
+
+# Honor LOOM_DAEMON_LAUNCHD symmetrically with loom-daemon-start.sh (#4078): a
+# daemon started with --no-launchd / LOOM_DAEMON_LAUNCHD=0 was never a launchd
+# job, so the stop side must NOT reach into the machine-global launchd domain to
+# look it up (which would resolve against — and then SIGTERM — the operator's
+# real production LaunchAgent under the same default label). Before this, the
+# start script gated its whole launchd path on this var but the stop script did
+# not, leaving the guard inert on the stop side.
+USE_LAUNCHD="$IS_DARWIN"
+if [[ "${LOOM_DAEMON_LAUNCHD:-}" =~ ^(0|false|no)$ ]]; then
+    USE_LAUNCHD=false
+fi
+
+DEFAULT_LAUNCHD_LABEL="com.rjwalters.loom-daemon"
+LAUNCHD_LABEL="${LOOM_LAUNCHD_LABEL:-$DEFAULT_LAUNCHD_LABEL}"
 LAUNCHD_SERVICE="gui/$(id -u)/${LAUNCHD_LABEL}"
 
 launchd_job_loaded() {
-    [[ "$IS_DARWIN" == "true" ]] || return 1
+    [[ "$USE_LAUNCHD" == "true" ]] || return 1
     command -v launchctl >/dev/null 2>&1 || return 1
     launchctl print "$LAUNCHD_SERVICE" >/dev/null 2>&1
 }
@@ -144,7 +163,19 @@ if [[ -z "$pid" ]] || ! kill -0 "$pid" 2>/dev/null; then
     fi
 fi
 if [[ -z "$pid" ]] || ! kill -0 "$pid" 2>/dev/null; then
-    if command -v pgrep >/dev/null 2>&1; then
+    # Last-resort process-name match. This tier is LABEL-BLIND: `pgrep -f`
+    # matches ANY loom-daemon on the machine by binary name — including the
+    # operator's production daemon or another repo's daemon — so it can kill a
+    # daemon this invocation was never meant to touch (issue #4078, curator
+    # Correction 3; the incident's actual over-broad kill). Only fall through to
+    # it when the caller did NOT explicitly scope this stop to a specific
+    # launchd label: a non-default LOOM_LAUNCHD_LABEL (a test's scratch label,
+    # or an operator managing a specifically-labeled daemon) means "stop THAT
+    # daemon, not whatever else happens to be named loom-daemon", so a
+    # label-blind kill would violate that scoping and contradict the #4054
+    # label-scoped-stop discipline. With the default label we keep the fallback
+    # as a genuine lost-PID-file recovery path.
+    if [[ "$LAUNCHD_LABEL" == "$DEFAULT_LAUNCHD_LABEL" ]] && command -v pgrep >/dev/null 2>&1; then
         pid=$(pgrep -f '(^|/)loom-daemon$' 2>/dev/null | head -n1 || true)
     fi
 fi
