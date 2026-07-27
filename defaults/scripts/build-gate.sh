@@ -29,18 +29,48 @@
 #     gates the mcp-loom build.
 set -euo pipefail
 
-# Run the whole gate at reduced CPU/IO priority (#3985) so it can never starve
-# the sweeps it shares a host with. The gate historically ran the workspace
-# suite at ~100% duty cycle; at nice 0 that saturation starved the timing-
-# sensitive sweeps (and the gate's own timing tests). Re-exec once under `nice`
-# (guarded by a sentinel so we don't loop), best-effort — if `nice` is absent
-# we just proceed at normal priority. Honors LOOM_BUILD_GATE_NICENESS (default
-# 19, the lowest priority) and can be disabled with LOOM_BUILD_GATE_NICE=0.
+# Gate/sweep scheduling priority (#4020, revises #3985).
+#
+# #3985 re-exec'd the gate at `nice -n 19` (the lowest priority) so it "could
+# never starve the sweeps it shares a host with." That rationale rested on a
+# now-FALSIFIED premise: that concurrent sweep builds were starving the gate's
+# (and sweeps') timing-sensitive `cargo` tests. #4044/#4046 established those 17
+# red daemon tests were macOS `syspolicyd` exec-latency artifacts, not CPU
+# contention (968/968 passed later with no code change), and the one real gate
+# timeout was cold-compile cost, settled by #4048 raising the budget 600->1200s
+# (the gate then produced its first determinate verdict, Green at ~726s). So the
+# gate was handicapped to the bottom of the run queue to solve a problem that was
+# never real.
+#
+# The evidence-supported relationship is PARITY, not a handicap: the gate must
+# not be starved (it is the reliability substrate that halts dispatch when `main`
+# goes red — a gate starved into UNEVALUATED is a gate that is not gating), and
+# there is no measured contention justifying deprioritizing it. Sweep children
+# spawn at the default niceness (0); the gate now also defaults to 0, so the two
+# compete on equal footing under the OS scheduler instead of the gate losing
+# every scheduling decision.
+#
+# Why not give the gate a strictly-higher priority than sweeps? On the daemon
+# host (macOS, non-root) that is not possible from here: a lower (negative) nice
+# requires privilege the daemon does not hold (`nice -n -5` => "setpriority:
+# Permission denied"), and 0 is the best unprivileged priority. Niceing sweep
+# children *up* instead (the alternative "Option B") would touch the spawn path
+# (loom-daemon spawn_child + spawn-claude.sh) to brace against contention the
+# evidence above says was never demonstrated; it is deliberately not done here.
+#
+# The re-exec mechanism and its knobs are preserved: LOOM_BUILD_GATE_NICENESS
+# overrides the value (e.g. =5 to throttle the gate again), LOOM_BUILD_GATE_NICE=0
+# disables the re-exec entirely, and the LOOM_BUILD_GATE_NICED sentinel guards
+# against a re-exec loop. The re-exec is skipped when the effective niceness is 0
+# (the new default) since `nice -n 0` is a no-op fork; best-effort otherwise (if
+# `nice` is absent we just proceed at normal priority).
+_gate_niceness="${LOOM_BUILD_GATE_NICENESS:-0}"
 if [[ -z "${LOOM_BUILD_GATE_NICED:-}" \
-      && "${LOOM_BUILD_GATE_NICE:-1}" != "0" ]] \
+      && "${LOOM_BUILD_GATE_NICE:-1}" != "0" \
+      && "${_gate_niceness}" != "0" ]] \
    && command -v nice >/dev/null 2>&1; then
   export LOOM_BUILD_GATE_NICED=1
-  exec nice -n "${LOOM_BUILD_GATE_NICENESS:-19}" "$0" "$@"
+  exec nice -n "${_gate_niceness}" "$0" "$@"
 fi
 
 cd "$(git rev-parse --show-toplevel)"
