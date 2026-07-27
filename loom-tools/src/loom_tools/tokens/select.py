@@ -2,7 +2,8 @@
 
 Selection order:
     1. Ranking file (.ranking, <10 min old): rotate one-per-account across the
-       available (non-exhausted/non-blocked/non-bad) ranked accounts using a
+       accounts whose probe status is an allowlisted known-good status (issue
+       #3991 — ``available``/unflagged, and never bad-marked) using a
        persistent rotation cursor, so a burst of N concurrent dispatches spreads
        across ``min(N, available)`` distinct accounts rather than stacking on the
        single best-ranked (issue #3909, superseding the earlier random top-N
@@ -17,9 +18,10 @@ In all tiers, tokens marked bad (via bad_tokens.is_bad) are skipped.
 Stale-ranking fail-safe (issue #3894): when ``.ranking`` exists but is older
 than the freshness window, tier-1 declines — but rather than discarding the
 ranking entirely and degrading to *fully-random* selection into accounts a
-recent probe already flagged ``exhausted``/``blocked`` (which wedges sweeps at
-startup), the stale ranking's exhausted/blocked entries are carried forward as
-an **advisory exclusion set** applied to the allowlist and random tiers. If the
+recent probe already flagged non-healthy (which wedges sweeps at startup), the
+stale ranking's non-healthy entries (allowlist-based, issue #3991: everything
+not positively ``available``/unflagged) are carried forward as an **advisory
+exclusion set** applied to the allowlist and random tiers. If the
 exclusions would empty the pool (e.g. a stale "everything exhausted" ranking),
 selection retries ignoring them so a live pool can never hard-fail on stale
 advice.
@@ -65,6 +67,32 @@ EX_CONFIG = 78
 # to the top-N most-available accounts (N=1 = greedy first-eligible, the
 # historical behavior); a value <= 0 also means unbounded.
 _DEFAULT_SPREAD_TOP_N: int | None = None
+
+# Ranking-status handling is an *allowlist of known-good statuses*, not a
+# denylist of known-bad ones (issue #3991). The account probe assigns one of
+# (see CLAUDE.md → token health probe): ``available`` (utilizations < 95%),
+# ``exhausted`` (7d utilization >= 95%), ``rate_limited`` (currently 429),
+# ``blocked`` (401 auth failure). A denylist silently treats any *new* or
+# unrecognized status as eligible (fail-open) — which is exactly how
+# ``rate_limited`` leaked through: it was the probe's most severe live verdict
+# yet the one status tier-1 selection did not skip, handing sweeps a dead token
+# that died instantly on the weekly limit. An allowlist fails *safe*: a status
+# not positively known to be good is excluded from the preferred pass by
+# default, so a future probe status can never be silently dispatched into.
+#
+# The empty string is included because a ranking line with no status field
+# (``name|``) means "probe recorded no adverse signal" — the historical
+# convention for a healthy/unflagged account — not a named bad status.
+_HEALTHY_STATUSES = frozenset({"available", ""})
+
+# Statuses hard-excluded from tier-1 in *every* pass, even the empty-pool
+# fallback: the probe positively flagged the account as dead (over the 7d
+# quota, or a 401 auth failure). ``rate_limited`` is deliberately *not* here —
+# a 429 can be a genuinely transient limit, so it is excluded from the
+# preferred (healthy-only) pass but allowed back in the fallback pass when it
+# is all that is left, so a fully-rate-limited pool can still dispatch rather
+# than hard-failing.
+_TIER1_HARD_EXCLUDED = frozenset({"exhausted", "blocked"})
 
 
 class TokenSelectionError(Exception):
@@ -224,22 +252,24 @@ def _try_ranking(
     dispatches still stacked several onto the same account, exhausting its 5h
     limit while others idled (issue #3909).
 
-    We now collect the eligible ranked entries (skipping exhausted/blocked/bad/
-    missing/empty tokens, preserving most-available-first ranking order) and
-    select via a persistent rotation cursor, so consecutive selections — whether
-    sequential or concurrent — round-robin one-per-account across all available
-    accounts, in rotating order. The window spans every eligible account by
-    default; ``_resolve_spread_top_n`` optionally caps it to the top-N
-    most-available (``N == 1`` restores the greedy first-eligible behavior).
+    We now collect the eligible ranked entries (allowing only known-good
+    statuses, skipping bad/missing/empty tokens, preserving most-available-first
+    ranking order) and select via a persistent rotation cursor, so consecutive
+    selections — whether sequential or concurrent — round-robin one-per-account
+    across all available accounts, in rotating order. The window spans every
+    eligible account by default; ``_resolve_spread_top_n`` optionally caps it to
+    the top-N most-available (``N == 1`` restores the greedy first-eligible
+    behavior).
 
-    Defense in depth (issue #3988): ``rate_limited`` is a weaker signal than
-    ``available`` (a probe that hit 429 without clearing the exhausted
-    threshold, i.e. a genuine transient rate limit *or* a status the
-    classifier hasn't yet promoted). Prefer excluding ``rate_limited``
-    entries entirely while the pool still has at least one non-rate_limited
-    account; only fall back to including them when they are all that is
-    left, so a fully rate-limited pool can still dispatch rather than
-    hard-failing.
+    Status handling is an *allowlist* of known-good statuses
+    (``_HEALTHY_STATUSES``), not a denylist (issue #3991). The preferred pass
+    selects only accounts positively flagged healthy, so a status not known to
+    be good — ``rate_limited`` (a live 429), or any *future* probe status — is
+    excluded by default rather than silently treated as eligible. Only if that
+    pass yields nothing does a fallback pass admit the non-hard-excluded rest
+    (``rate_limited`` and unknown statuses, but never ``exhausted``/``blocked``
+    per ``_TIER1_HARD_EXCLUDED``), so a fully rate-limited pool can still
+    dispatch rather than hard-failing.
     """
     age = _file_age_seconds(ranking_file)
     if age is None or age >= _RANKING_FRESH_SECONDS:
@@ -247,12 +277,15 @@ def _try_ranking(
 
     cap = _resolve_spread_top_n(workspace_path)
 
-    def _collect(*, skip_rate_limited: bool) -> list[SelectedToken]:
+    def _collect(*, healthy_only: bool) -> list[SelectedToken]:
         out: list[SelectedToken] = []
         for name, status in _read_ranking(ranking_file):
-            if status in ("exhausted", "blocked"):
+            # Hard-excluded in every pass: the probe flagged the account dead.
+            if status in _TIER1_HARD_EXCLUDED:
                 continue
-            if skip_rate_limited and status == "rate_limited":
+            # Preferred pass: allowlist — only positively-healthy statuses.
+            # Fallback pass admits the rest (rate_limited / unknown statuses).
+            if healthy_only and status not in _HEALTHY_STATUSES:
                 continue
             token_file = tokens_dir / f"{name}.token"
             if not token_file.is_file():
@@ -272,9 +305,9 @@ def _try_ranking(
                 break
         return out
 
-    eligible = _collect(skip_rate_limited=True)
+    eligible = _collect(healthy_only=True)
     if not eligible:
-        eligible = _collect(skip_rate_limited=False)
+        eligible = _collect(healthy_only=False)
 
     if not eligible:
         return None
@@ -287,13 +320,18 @@ def _stale_ranking_exclusions(ranking_file: Path) -> set[str]:
 
     When ``.ranking`` is older than the freshness window, tier-1 (``_try_ranking``)
     declines and selection would otherwise degrade to fully-random — repeatedly
-    handing out accounts a recent probe already flagged ``exhausted``/``blocked``,
-    wedging sweeps at startup. Rather than discard the stale ranking, treat its
-    exhausted/blocked entries as an advisory exclusion set for the lower tiers.
-    ``rate_limited`` is included too (issue #3988, same defense-in-depth
-    rationale as ``_try_ranking``) — the caller's existing fail-safe already
-    retries without exclusions if they would empty the pool, so this can only
-    ever prefer a healthier account, never hard-fail one.
+    handing out accounts a recent probe already flagged non-healthy, wedging
+    sweeps at startup. Rather than discard the stale ranking, exclude every
+    account *not* positively flagged healthy from the lower tiers.
+
+    Like tier-1 (``_try_ranking``), this is an *allowlist* of known-good
+    statuses (``_HEALTHY_STATUSES``), not a denylist (issue #3991): an account
+    is advisory-excluded unless its stale status is positively healthy, so
+    ``exhausted``/``blocked``/``rate_limited`` *and any future probe status* are
+    all excluded rather than a hardcoded bad-status list silently leaking new
+    ones through. The caller's existing fail-safe already retries without
+    exclusions if they would empty the pool, so this can only ever prefer a
+    healthier account, never hard-fail one.
 
     Returns an empty set when the ranking is fresh (tier-1 owns that case) or
     missing/unreadable — so callers get exclusions *only* in the stale-but-present
@@ -305,7 +343,7 @@ def _stale_ranking_exclusions(ranking_file: Path) -> set[str]:
     return {
         name
         for name, status in _read_ranking(ranking_file)
-        if status in ("exhausted", "blocked", "rate_limited")
+        if status not in _HEALTHY_STATUSES
     }
 
 
