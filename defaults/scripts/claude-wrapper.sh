@@ -359,8 +359,9 @@ resolve_mcp_workspace() {
 
 # Pre-flight check: verify MCP server can start
 # Attempts to launch the mcp-loom Node.js server and checks for the startup
-# message on stderr. If the dist/ directory is missing or stale, attempts
-# a rebuild before retrying.
+# message on stderr. If the built bundle is missing, or is stale (older than
+# any file under the sibling src/ tree), it rebuilds before the smoke test; a
+# smoke-test failure also triggers a rebuild-and-retry.
 check_mcp_server() {
     local mcp_workspace
     mcp_workspace=$(resolve_mcp_workspace)
@@ -396,6 +397,25 @@ for name, srv in servers.items():
         log_warn "MCP entry point missing: ${mcp_entry}"
         _try_mcp_rebuild "${mcp_entry}"
         return $?
+    fi
+
+    # Staleness check: a bundle older than any file under the sibling src/ tree
+    # is startable but lacks recent fixes (a smoke test passes on it silently).
+    # Rebuild before the smoke test. This mirrors the predicate in
+    # scripts/setup-mcp.sh (the one-shot .mcp.json generator) exactly so the two
+    # gates cannot drift (issue #4043). Rebuild failure on an otherwise-startable
+    # bundle is non-fatal — fall through to the smoke test below.
+    local mcp_src
+    mcp_src="$(dirname "$(dirname "${mcp_entry}")")/src"
+    if [[ -d "${mcp_src}" ]] && \
+       [[ -n "$(find "${mcp_src}" -type f -newer "${mcp_entry}" -print -quit 2>/dev/null)" ]]; then
+        log_warn "MCP bundle is stale (src newer than dist) - rebuilding: ${mcp_entry}"
+        if ! _try_mcp_rebuild "${mcp_entry}"; then
+            log_warn "MCP rebuild for stale bundle failed - continuing with existing bundle"
+        else
+            # Rebuild succeeded and already re-verified the smoke test.
+            return 0
+        fi
     fi
 
     # Smoke test: start MCP server and verify it emits the startup message
