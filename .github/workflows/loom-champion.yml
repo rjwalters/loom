@@ -38,4 +38,4 @@ jobs:
         # Pinned model ID per the role mapping (issue #3477, Phase 1): cron
         # support roles are predictable, cost-sensitive load, so they pin an
         # exact ID rather than an alias. Bump deliberately on lineup changes.
-        run: claude -p "/champion" --model claude-sonnet-4-6 --dangerously-skip-permissions
+        run: claude -p "/loom:champion" --model claude-sonnet-4-6 --dangerously-skip-permissions

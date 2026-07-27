@@ -116,6 +116,16 @@ const TERMINATE_GRACE: Duration = Duration::from_secs(5);
 /// Max bytes of captured invocation output retained in a failure log line.
 const MAX_OUTPUT_TAIL_BYTES: usize = 2048;
 
+/// A `Success` outcome faster than this is implausible for a real
+/// `claude -p "/<role>"` session — starting the process, authenticating, and
+/// making at least one forge round-trip (list/enrich/label an issue, review a
+/// PR) takes longer than this in practice. The incident that filed #4034 was
+/// a silent no-op (the prompt matched no real slash command) that still
+/// exited 0 in ~1.4s and was logged as a healthy `Success`. A tick this fast
+/// is logged at `WARN` instead of `INFO` so that failure mode is visible in
+/// the log without inspecting forge state.
+const IMPLAUSIBLY_FAST_TICK: Duration = Duration::from_secs(10);
+
 /// One standalone support role this module knows how to dispatch: its name
 /// (used for config/env lookups and the per-role log file), the `/role`
 /// slash-command prompt passed to `claude -p`, and its default tick interval.
@@ -136,30 +146,42 @@ pub struct RoleSpec {
 /// table). Deliberately excludes Builder/Doctor (never run standalone —
 /// dispatched inside a sweep) and does not touch the per-sweep Judge/Champion
 /// invocations `sweep_registry` already handles.
+///
+/// Each `prompt` is the **namespaced** slash command (`/loom:<role>`), not
+/// the bare `/<role>` form — the installed commands live under
+/// `.claude/commands/loom/<role>.md` and are only resolved under that
+/// namespace (there are no top-level, unnamespaced command files). A bare
+/// `/curator` etc. matches no real command, so `claude -p` falls back to
+/// treating it as an ordinary prompt: it answers briefly and exits 0, which
+/// the runner faithfully — and wrongly — logs as `Success` (issue #4034).
+/// This mirrors the existing hardcoded-literal precedent in
+/// `sweep_registry.rs` (`format!("/loom:sweep {issue}")`) rather than
+/// deriving/configuring the namespace: it is a settled, deliberate install
+/// layout, not a per-install variable.
 pub const DEFAULT_ROLES: &[RoleSpec] = &[
     RoleSpec {
         name: "champion",
-        prompt: "/champion",
+        prompt: "/loom:champion",
         default_interval_secs: 600,
     },
     RoleSpec {
         name: "curator",
-        prompt: "/curator",
+        prompt: "/loom:curator",
         default_interval_secs: 300,
     },
     RoleSpec {
         name: "judge",
-        prompt: "/judge",
+        prompt: "/loom:judge",
         default_interval_secs: 300,
     },
     RoleSpec {
         name: "auditor",
-        prompt: "/auditor",
+        prompt: "/loom:auditor",
         default_interval_secs: 600,
     },
     RoleSpec {
         name: "guide",
-        prompt: "/guide",
+        prompt: "/loom:guide",
         default_interval_secs: 900,
     },
 ];
@@ -612,15 +634,17 @@ where
             ticker.tick().await;
             let name = spec.name;
             let prompt = spec.prompt;
+            let tick_start = Instant::now();
             let joined = tokio::task::spawn_blocking(move || {
                 let outcome = runner.invoke(name, prompt);
                 (outcome, runner)
             })
             .await;
+            let elapsed = tick_start.elapsed();
             match joined {
                 Ok((outcome, r)) => {
                     runner = r;
-                    log_outcome(spec.name, &outcome);
+                    log_outcome(spec.name, &outcome, elapsed);
                 }
                 Err(e) => {
                     log::error!(
@@ -694,13 +718,15 @@ pub fn spawn_multi_role_task(
                 let root_for_task = root.clone();
                 let name = spec.name;
                 let prompt = spec.prompt;
+                let tick_start = Instant::now();
                 let joined = tokio::task::spawn_blocking(move || {
                     let mut runner = ScriptRoleInvocationRunner::new(root_for_task);
                     runner.invoke(name, prompt)
                 })
                 .await;
+                let elapsed = tick_start.elapsed();
                 match joined {
-                    Ok(outcome) => log_outcome_for_root(spec.name, &root, &outcome),
+                    Ok(outcome) => log_outcome_for_root(spec.name, &root, &outcome, elapsed),
                     Err(e) => log::error!(
                         "role_runner: {} invocation task for {} panicked ({e}); continuing to the \
                          next repo",
@@ -713,27 +739,66 @@ pub fn spawn_multi_role_task(
     })
 }
 
-/// Log a single-workspace invocation outcome. Never escalates to `error!` —
-/// a role-invocation failure is never fatal to the daemon.
-fn log_outcome(role: &str, outcome: &RoleTickOutcome) {
+/// True when `outcome` is a [`RoleTickOutcome::Success`] that completed
+/// faster than [`IMPLAUSIBLY_FAST_TICK`] — the signal that distinguishes a
+/// genuine no-op-that-reports-success (issue #4034: a slash-command prompt
+/// that did not resolve, so `claude -p` answered a one-off prompt and exited
+/// 0 in ~1.4s) from a healthy tick. A real `claude -p "/<role>"` session
+/// cannot start, authenticate, and do real forge work that quickly. Pulled
+/// out of the two `log_outcome*` functions so the threshold logic is
+/// unit-testable without capturing `log` crate output.
+#[must_use]
+fn tick_is_implausibly_fast(outcome: &RoleTickOutcome, elapsed: Duration) -> bool {
+    matches!(outcome, RoleTickOutcome::Success) && elapsed < IMPLAUSIBLY_FAST_TICK
+}
+
+/// Log a single-workspace invocation outcome, including elapsed tick
+/// duration. Never escalates to `error!` — a role-invocation failure is never
+/// fatal to the daemon. See [`tick_is_implausibly_fast`] for the `WARN`
+/// escalation on a suspiciously-fast `Success`.
+fn log_outcome(role: &str, outcome: &RoleTickOutcome, elapsed: Duration) {
     match outcome {
-        RoleTickOutcome::Success => log::info!("role_runner: {role} tick completed"),
+        RoleTickOutcome::Success if tick_is_implausibly_fast(outcome, elapsed) => {
+            log::warn!(
+                "role_runner: {role} tick completed in {elapsed:.1?} — implausibly fast for a \
+                 real session (threshold {IMPLAUSIBLY_FAST_TICK:.0?}); this may be a no-op that \
+                 exited 0 without doing real work (e.g. a slash-command prompt that did not \
+                 resolve)"
+            );
+        }
+        RoleTickOutcome::Success => {
+            log::info!("role_runner: {role} tick completed in {elapsed:.1?}");
+        }
         RoleTickOutcome::Failure(reason) => {
             log::warn!(
-                "role_runner: {role} tick failed (logged and skipped, never fatal): {reason}"
+                "role_runner: {role} tick failed after {elapsed:.1?} (logged and skipped, never \
+                 fatal): {reason}"
             );
         }
     }
 }
 
 /// Root-aware variant of [`log_outcome`] for the multi-workspace loop.
-fn log_outcome_for_root(role: &str, root: &Path, outcome: &RoleTickOutcome) {
+fn log_outcome_for_root(role: &str, root: &Path, outcome: &RoleTickOutcome, elapsed: Duration) {
     match outcome {
+        RoleTickOutcome::Success if tick_is_implausibly_fast(outcome, elapsed) => {
+            log::warn!(
+                "role_runner: {role} tick completed for {} in {elapsed:.1?} — implausibly fast \
+                 for a real session (threshold {IMPLAUSIBLY_FAST_TICK:.0?}); this may be a no-op \
+                 that exited 0 without doing real work (e.g. a slash-command prompt that did not \
+                 resolve)",
+                root.display()
+            );
+        }
         RoleTickOutcome::Success => {
-            log::info!("role_runner: {role} tick completed for {}", root.display());
+            log::info!(
+                "role_runner: {role} tick completed for {} in {elapsed:.1?}",
+                root.display()
+            );
         }
         RoleTickOutcome::Failure(reason) => log::warn!(
-            "role_runner: {role} tick failed for {} (logged and skipped, never fatal): {reason}",
+            "role_runner: {role} tick failed for {} after {elapsed:.1?} (logged and skipped, \
+             never fatal): {reason}",
             root.display()
         ),
     }
@@ -1079,7 +1144,7 @@ mod tests {
         };
         let spec = RoleSpec {
             name: "curator",
-            prompt: "/curator",
+            prompt: "/loom:curator",
             default_interval_secs: 1,
         };
         let handle = spawn_role_task(runner, spec, Duration::from_millis(20));
@@ -1100,11 +1165,60 @@ mod tests {
         }
         let spec = RoleSpec {
             name: "curator",
-            prompt: "/curator",
+            prompt: "/loom:curator",
             default_interval_secs: 1,
         };
         let handle = spawn_role_task(PanicOnceRunner, spec, Duration::from_millis(20));
         let result = tokio::time::timeout(Duration::from_secs(5), handle).await;
         assert!(result.is_ok(), "loop task should finish (not hang) after the runner panics");
+    }
+
+    // ===================================================================
+    // DEFAULT_ROLES prompts — regression guard for #4034 (bare `/curator`
+    // matches no real command; the installed commands are namespaced).
+    // ===================================================================
+
+    #[test]
+    fn test_default_roles_prompts_are_namespaced() {
+        for spec in DEFAULT_ROLES {
+            let expected = format!("/loom:{}", spec.name);
+            assert_eq!(
+                spec.prompt, expected,
+                "RoleSpec {:?} prompt must be the namespaced `/loom:<role>` command, not a bare \
+                 `/<role>` (see #4034 — a bare prompt matches no installed slash command and \
+                 silently no-ops)",
+                spec.name
+            );
+        }
+    }
+
+    // ===================================================================
+    // tick_is_implausibly_fast — #4034 AC #4 (a no-op success must be
+    // distinguishable in the log from a real, slower tick).
+    // ===================================================================
+
+    #[test]
+    fn test_implausibly_fast_success_is_flagged() {
+        assert!(tick_is_implausibly_fast(
+            &RoleTickOutcome::Success,
+            Duration::from_millis(1400) // the observed #4034 incident duration
+        ));
+    }
+
+    #[test]
+    fn test_success_at_or_above_threshold_is_not_flagged() {
+        assert!(!tick_is_implausibly_fast(&RoleTickOutcome::Success, IMPLAUSIBLY_FAST_TICK));
+        assert!(!tick_is_implausibly_fast(
+            &RoleTickOutcome::Success,
+            IMPLAUSIBLY_FAST_TICK + Duration::from_secs(60)
+        ));
+    }
+
+    #[test]
+    fn test_failure_is_never_flagged_regardless_of_duration() {
+        assert!(!tick_is_implausibly_fast(
+            &RoleTickOutcome::Failure("boom".to_string()),
+            Duration::from_millis(1)
+        ));
     }
 }
