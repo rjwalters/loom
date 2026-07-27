@@ -35,6 +35,7 @@ Thumbs.db
 .loom-managed
 .loom-test-failure-context.json
 .loom/.daemon.pid
+.loom/.daemon.flags
 .loom/.daemon.log
 .loom/daemon.sock
 .loom/daemon-state.json

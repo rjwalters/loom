@@ -18,6 +18,9 @@
 #     explicitly with --work-finder / --health-gate, or hand control to
 #     .loom/config.json -> autonomous with --from-config (#3911),
 #   - backgrounds the daemon and writes a PID file (.loom/.daemon.pid),
+#   - persists the resolved invocation flags to .loom/.daemon.flags so
+#     `loom-daemon-update.sh` (#3968) can restart with EXACTLY the same
+#     autonomy flags after a rebuild — never wider,
 #   - surfaces the singleton-guard refusal (#3806) legibly instead of leaving a
 #     silently-exited background process.
 #
@@ -99,6 +102,12 @@ locate_daemon_bin() {
 }
 
 # ---------- args ----------
+# Capture the raw invocation args before the parsing loop consumes "$@" — used
+# below to persist exactly what was passed (Issue #3968: `loom-daemon-update.sh`
+# replays these flags verbatim on restart, so a rebuild+restart never widens the
+# FLAGS-OFF/opt-in contract).
+ORIGINAL_ARGS=("$@")
+
 # Default is FLAGS-OFF (#3911): both autonomous loops default OFF, matching the
 # ecosystem-wide opt-in / default-off contract. Opt in with --work-finder /
 # --health-gate, or hand control to config with --from-config.
@@ -204,6 +213,31 @@ else
     else
         echo -e "${BOLD}Autonomous mode:${NC} work_finder=${LOOM_WORK_FINDER} main_health_gate=${LOOM_MAIN_HEALTH_GATE}"
     fi
+fi
+
+# ---------- persist invocation flags (Issue #3968) ----------
+# `loom-daemon-update.sh` reads this file to restart with EXACTLY the same
+# autonomy flags after a rebuild — the FLAGS-OFF/opt-in contract must never
+# widen across an update. Script-only flags that don't describe daemon
+# autonomy state (--foreground/--fg, --help/-h) are filtered out; everything
+# else (--from-config, --work-finder, --health-gate, --no-work-finder,
+# --no-health-gate) is preserved verbatim, one per line. Written on every
+# start attempt (success or failure) so the record always reflects the most
+# recent invocation.
+FLAGS_FILE="$REPO_ROOT/.loom/.daemon.flags"
+: > "$FLAGS_FILE"
+# Guard the array expansion: a bare invocation (the common case) leaves
+# ORIGINAL_ARGS empty, and "${arr[@]}" on a zero-element array is an unbound
+# variable error under `set -u` on bash < 4.4 (still the default /bin/bash on
+# stock macOS). ${#ORIGINAL_ARGS[@]} is always safe to query.
+if [[ "${#ORIGINAL_ARGS[@]}" -gt 0 ]]; then
+    for _flag_arg in "${ORIGINAL_ARGS[@]}"; do
+        case "$_flag_arg" in
+            --foreground|--fg|--help|-h) continue ;;
+            *) echo "$_flag_arg" >> "$FLAGS_FILE" ;;
+        esac
+    done
+    unset _flag_arg
 fi
 
 echo "Daemon binary: $DAEMON_BIN"

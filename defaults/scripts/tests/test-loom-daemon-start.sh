@@ -98,6 +98,38 @@ else
     echo -e "${RED}✗${NC} --help documents the FLAGS-OFF default and --work-finder"
 fi
 
+# 9. Regression (#3968 flag persistence): a BARE invocation with ZERO args in
+#    background mode (the common real-world case — --foreground is not used
+#    here on purpose) must not crash. Bash < 4.4 (still /bin/bash on stock
+#    macOS) raises "unbound variable" on `"${arr[@]}"` for a zero-element
+#    array under `set -u`; the persist-flags loop must guard against that.
+#    Also asserts the persisted flags file exists and is empty for a bare start.
+#    Needs a fake binary that stays alive (the shared $FAKE_BIN above prints
+#    one line and exits immediately, which the start script's own liveness
+#    check would correctly treat as a startup failure — not what this test
+#    is exercising).
+BG_FAKE_BIN="$WORKDIR/fake-loom-daemon-bg"
+cat > "$BG_FAKE_BIN" <<'EOF'
+#!/usr/bin/env bash
+sleep 5
+EOF
+chmod +x "$BG_FAKE_BIN"
+( cd "$WORKDIR" && env -u LOOM_WORK_FINDER -u LOOM_MAIN_HEALTH_GATE LOOM_DAEMON_BIN="$BG_FAKE_BIN" bash "$START_SCRIPT" >/dev/null 2>&1 )
+bg_rc=$?
+assert_eq "0" "$bg_rc" "bare (zero-arg) background start exits 0 (no unbound-variable crash, #3968)"
+TESTS_RUN=$((TESTS_RUN + 1))
+if [[ -f "$WORKDIR/.loom/.daemon.flags" && ! -s "$WORKDIR/.loom/.daemon.flags" ]]; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} bare start persists an EMPTY .loom/.daemon.flags (no autonomy flags to record)"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} bare start persists an EMPTY .loom/.daemon.flags (no autonomy flags to record)"
+fi
+# Clean up the background daemon this test started.
+if [[ -f "$WORKDIR/.loom/.daemon.pid" ]]; then
+    kill "$(cat "$WORKDIR/.loom/.daemon.pid" 2>/dev/null)" 2>/dev/null || true
+fi
+
 # ---------- summary ----------
 echo
 echo "Ran $TESTS_RUN tests: $TESTS_PASSED passed, $TESTS_FAILED failed"
