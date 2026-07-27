@@ -325,6 +325,17 @@ pub trait WorkDispatcher {
         HashSet::new()
     }
 
+    /// Cumulative count of cross-host dispatch collisions this dispatcher's
+    /// registry has observed (Issue #4085, Phase 0 of #4028) — dispatches whose
+    /// pre-flip label read showed a peer host claimed the issue first. Read once
+    /// per tick and surfaced on the per-tick summary line so an operator can
+    /// watch the baseline collision rate. Defaults to `0` so a dispatcher that
+    /// does not model collision detection (e.g. a test fake, or a registry with
+    /// detection disabled) opts out with zero boilerplate.
+    fn collisions(&self) -> u64 {
+        0
+    }
+
     /// Dispatch a build sweep for `issue`. Returns `true` when a **new** sweep
     /// was started, `false` when the dispatch was an idempotency no-op (a sweep
     /// with the same key was already running).
@@ -360,6 +371,13 @@ pub struct TickReport {
     pub skipped_quarantined: usize,
     /// Dispatch attempts that returned an error (logged, non-fatal).
     pub errors: usize,
+    /// Cumulative cross-host dispatch collisions observed (Issue #4085, Phase 0
+    /// of #4028). Unlike the other counters — which are per-tick tallies — this
+    /// is a **monotonic total** read from the dispatcher(s) at tick end, so an
+    /// operator watching successive summary lines sees the baseline collision
+    /// rate accumulate. Always `0` unless collision detection is enabled
+    /// (`LOOM_DETECT_COLLISIONS` / `autonomous.collisionDetection.enabled`).
+    pub collisions: u64,
     /// True when at least one workspace was gated this tick because the
     /// main-health gate (Phase C, #3812) had halted its dispatch (`main` was
     /// **verified** red — see [`crate::main_health_gate::GateOutcome`]). `seen`
@@ -408,6 +426,9 @@ pub fn tick(
     // Reactive backstop: a red `main` halts all new dispatch this tick.
     if halted {
         report.halted = true;
+        // Surface the running collision baseline even on a halted tick (#4085) —
+        // no dispatch happens, so the total is just carried forward.
+        report.collisions = dispatcher.collisions();
         return Ok(report);
     }
 
@@ -457,6 +478,10 @@ pub fn tick(
             }
         }
     }
+
+    // Read the cumulative cross-host collision total AFTER the dispatch loop so
+    // any collision recorded during this tick's dispatches is included (#4085).
+    report.collisions = dispatcher.collisions();
 
     Ok(report)
 }
@@ -640,6 +665,9 @@ pub fn tick_multi<S: WorkSource, D: WorkDispatcher>(
     }
 
     report.halted = any_halted;
+    // Sum the cumulative cross-host collision totals across every workspace's
+    // dispatcher (#4085), read after pass 2 so this tick's collisions count.
+    report.collisions = workspaces.iter().map(|(_, d)| d.collisions()).sum();
     report
 }
 
@@ -1043,14 +1071,16 @@ where
                              healthy={token_limit}, per_token={per_token_concurrency}, disk={disk}, \
                              cpu={cpu}, ceiling={configured_max}); \
                              {} seen, {} dispatched, {} labeled-skip, {} in-flight-skip, \
-                             {} quarantine-skip, {} deferred, {} error(s)",
+                             {} quarantine-skip, {} deferred, {} error(s), \
+                             {} cross-host-collision(s)",
                             report.seen,
                             report.dispatched,
                             report.skipped_labeled,
                             report.skipped_in_flight,
                             report.skipped_quarantined,
                             report.deferred_capacity,
-                            report.errors
+                            report.errors,
+                            report.collisions
                         );
                     }
                     // Token-capacity advisory (#3902) — surface on state change.
@@ -1222,7 +1252,8 @@ pub fn spawn_multi_work_finder_task(
                      healthy={token_limit}, per_token={per_token_concurrency}, disk={disk}, \
                      cpu={cpu}, ceiling={configured_max}); {} workspace(s), \
                      {} seen, {} dispatched, {} labeled-skip, {} in-flight-skip, \
-                     {} quarantine-skip, {} deferred, {} error(s)",
+                     {} quarantine-skip, {} deferred, {} error(s), \
+                     {} cross-host-collision(s)",
                     pairs.len(),
                     report.seen,
                     report.dispatched,
@@ -1230,7 +1261,8 @@ pub fn spawn_multi_work_finder_task(
                     report.skipped_in_flight,
                     report.skipped_quarantined,
                     report.deferred_capacity,
-                    report.errors
+                    report.errors,
+                    report.collisions
                 );
             }
 
@@ -1487,6 +1519,16 @@ pub mod forge {
             }
         }
 
+        fn collisions(&self) -> u64 {
+            match self.registry.lock() {
+                Ok(reg) => reg.collision_count(),
+                Err(poisoned) => {
+                    log::error!("work_finder: sweep registry mutex poisoned ({poisoned:?})");
+                    0
+                }
+            }
+        }
+
         fn dispatch(&mut self, issue: u32) -> Result<bool> {
             let mut reg = self
                 .registry
@@ -1559,6 +1601,8 @@ mod tests {
         fail_issues: HashSet<u32>,
         /// Issue numbers this dispatcher reports as quarantined (Issue #3939).
         quarantined: HashSet<u32>,
+        /// Cumulative cross-host collision count this dispatcher reports (#4085).
+        collisions: u64,
     }
 
     impl WorkDispatcher for RecordingDispatcher {
@@ -1567,6 +1611,9 @@ mod tests {
         }
         fn quarantined(&self) -> HashSet<u32> {
             self.quarantined.clone()
+        }
+        fn collisions(&self) -> u64 {
+            self.collisions
         }
         fn dispatch(&mut self, issue: u32) -> Result<bool> {
             if self.fail_issues.contains(&issue) {
@@ -1816,6 +1863,60 @@ exit 0
         assert_eq!(report.skipped_in_flight, 1, "#1 was an idempotency no-op");
         assert_eq!(report.deferred_capacity, 0);
         assert_eq!(disp.dispatched, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn test_tick_surfaces_collision_total() {
+        // The dispatcher reports a cumulative cross-host collision count (#4085);
+        // the tick surfaces it on the report so the per-tick summary line can log
+        // the running baseline.
+        let mut source = FakeSource::once(vec![issue(1)]);
+        let mut disp = RecordingDispatcher {
+            collisions: 3,
+            ..Default::default()
+        };
+        let report = tick(&mut source, &mut disp, 5, false).unwrap();
+        assert_eq!(report.collisions, 3, "collision total surfaced from dispatcher");
+        assert_eq!(report.dispatched, 1);
+    }
+
+    #[test]
+    fn test_tick_collision_total_surfaced_when_halted() {
+        // Even on a halted tick (no dispatch), the running collision baseline is
+        // carried forward onto the report.
+        let mut source = FakeSource::once(vec![issue(1)]);
+        let mut disp = RecordingDispatcher {
+            collisions: 2,
+            ..Default::default()
+        };
+        let report = tick(&mut source, &mut disp, 5, true).unwrap();
+        assert!(report.halted);
+        assert_eq!(report.dispatched, 0);
+        assert_eq!(report.collisions, 2);
+    }
+
+    #[test]
+    fn test_tick_multi_sums_collision_totals() {
+        // tick_multi sums the collision totals across every workspace's
+        // dispatcher (#4085).
+        let mut multi = vec![
+            (
+                FakeSource::once(vec![issue(1)]),
+                RecordingDispatcher {
+                    collisions: 2,
+                    ..Default::default()
+                },
+            ),
+            (
+                FakeSource::once(vec![issue(2)]),
+                RecordingDispatcher {
+                    collisions: 5,
+                    ..Default::default()
+                },
+            ),
+        ];
+        let report = tick_multi(&mut multi, &[0, 0], 10, &[false, false]);
+        assert_eq!(report.collisions, 7, "collision totals summed across workspaces");
     }
 
     #[test]

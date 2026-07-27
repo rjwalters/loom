@@ -482,6 +482,21 @@ pub const REVIEW_STALL_ENABLE_ENV: &str = "LOOM_SWEEP_REVIEW_STALL";
 /// seconds.
 pub const REVIEW_STALL_TIMEOUT_ENV: &str = "LOOM_SWEEP_REVIEW_STALL_TIMEOUT_SECS";
 
+/// Env var toggling cross-host dispatch-collision detection (Issue #4085,
+/// Phase 0 of #4028). Precedence **env > config > default**; default **off**
+/// because the probe adds one extra `gh issue view` round-trip per dispatch.
+/// `1`/`true`/`yes`/`on` enable; anything else disables. When enabled, the
+/// daemon does a pre-flip label read and records — but never acts on — the
+/// case where a peer host already claimed the issue. Detection only.
+pub const COLLISION_DETECT_ENV: &str = "LOOM_DETECT_COLLISIONS";
+
+/// Env var overriding this host's identity string in collision records (Issue
+/// #4085). Falls back to `$HOSTNAME`, then the `hostname` binary, then
+/// `"unknown-host"`. Set it when the daemon runs somewhere `$HOSTNAME` is not
+/// exported (a non-interactive service unit) so cross-host collision logs stay
+/// attributable.
+pub const HOST_ID_ENV: &str = "LOOM_HOST_ID";
+
 /// Default review-phase stall timeout (45 min of zero log output). A sweep that
 /// has already made startup progress (worktree/checkpoint exists) but whose log
 /// file has not been appended to within this window is treated as wedged in a
@@ -1095,6 +1110,64 @@ pub struct SweepRegistry {
     /// releases it. Keyed by issue number; since each registry is scoped to one
     /// workspace root, this is effectively a `(workspace, issue)` key.
     quarantined: HashMap<u32, DateTime<Utc>>,
+    /// Whether cross-host dispatch-collision detection is enabled (Issue #4085,
+    /// Phase 0 of #4028). When `true`, [`dispatch`](Self::dispatch) issues a
+    /// pre-flip `gh issue view --json labels` read and classifies whether a peer
+    /// host already flipped `loom:issue → loom:building`. Off by default (the
+    /// probe adds one extra API round-trip); `main.rs` / [`WorkspacePool`] set
+    /// the resolved env > config > default value. Detection only — a detected
+    /// collision never changes dispatch behavior.
+    ///
+    /// [`WorkspacePool`]: crate::workspace_pool::WorkspacePool
+    detect_collisions: bool,
+    /// Cumulative count of cross-host dispatch collisions this registry has
+    /// observed (Issue #4085). Incremented once per dispatch whose pre-flip
+    /// label read showed `loom:issue` already gone (or `loom:building` already
+    /// present) — i.e. another host claimed the issue first. Surfaced to
+    /// operators via the work-finder's per-tick summary line. Always `0` when
+    /// `detect_collisions` is `false`. Monotonic for the life of the process.
+    collision_count: u64,
+}
+
+/// Classification of a pre-flip label read (Issue #4085). Detection only — the
+/// caller records the outcome but never changes dispatch behavior on it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CollisionClass {
+    /// `loom:issue` was still present and `loom:building` absent — this host is
+    /// the first claimant, no collision.
+    Clean,
+    /// `loom:issue` was already gone, or `loom:building` already present, before
+    /// this host flipped the labels — a peer host claimed it first. Carries the
+    /// observed pre-flip label set for the diagnostic log record.
+    Collision { labels: Vec<String> },
+    /// The label state could not be read (gh timeout / non-zero exit /
+    /// unparseable JSON). **Fail-closed**: never counted as a collision, so the
+    /// baseline is never inflated by an unverifiable flip.
+    Unknown,
+}
+
+/// Resolve this host's identity string for collision records (Issue #4085),
+/// precedence `LOOM_HOST_ID` env > `$HOSTNAME` env > the `hostname` binary >
+/// `"unknown-host"`. Only invoked when a collision is actually recorded (rare),
+/// so the one-shot `hostname` subprocess is not on the hot dispatch path.
+fn host_identity() -> String {
+    for var in [HOST_ID_ENV, "HOSTNAME"] {
+        if let Ok(v) = std::env::var(var) {
+            let t = v.trim();
+            if !t.is_empty() {
+                return t.to_string();
+            }
+        }
+    }
+    if let Ok(out) = Command::new("hostname").output() {
+        if out.status.success() {
+            let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            if !s.is_empty() {
+                return s;
+            }
+        }
+    }
+    "unknown-host".to_string()
 }
 
 impl SweepRegistry {
@@ -1120,6 +1193,8 @@ impl SweepRegistry {
             quarantine_config: QuarantineConfig::default(),
             insta_crash_counts: HashMap::new(),
             quarantined: HashMap::new(),
+            detect_collisions: false,
+            collision_count: 0,
         }
     }
 
@@ -1142,6 +1217,8 @@ impl SweepRegistry {
             quarantine_config: QuarantineConfig::default(),
             insta_crash_counts: HashMap::new(),
             quarantined: HashMap::new(),
+            detect_collisions: false,
+            collision_count: 0,
         }
     }
 
@@ -1176,6 +1253,29 @@ impl SweepRegistry {
     #[must_use]
     pub fn quarantine_config(&self) -> QuarantineConfig {
         self.quarantine_config
+    }
+
+    /// Enable or disable cross-host dispatch-collision detection (Issue #4085).
+    /// `main.rs` and the workspace pool call this once at provision time with
+    /// the resolved env > config > default value (see
+    /// [`resolve_collision_detection`]).
+    pub fn set_collision_detection(&mut self, enabled: bool) {
+        self.detect_collisions = enabled;
+    }
+
+    /// Read-only accessor for whether collision detection is enabled (Issue
+    /// #4085).
+    #[must_use]
+    pub fn collision_detection_enabled(&self) -> bool {
+        self.detect_collisions
+    }
+
+    /// Cumulative count of cross-host dispatch collisions observed by this
+    /// registry (Issue #4085). Always `0` when detection is disabled. Read by
+    /// the work-finder to surface the running baseline on its per-tick line.
+    #[must_use]
+    pub fn collision_count(&self) -> u64 {
+        self.collision_count
     }
 
     /// The set of issue numbers currently quarantined for insta-crashing (Issue
@@ -1353,6 +1453,14 @@ impl SweepRegistry {
         //    when the dispatcher has gh credentials; tests opt out via
         //    `skip_label_flip`).
         if !self.config.skip_label_flip {
+            // 4a. Cross-host collision baseline (Issue #4085, Phase 0 of #4028):
+            //     read the pre-flip label state and record — but never act on —
+            //     the case where a peer host already claimed this issue. A no-op
+            //     when detection is disabled (default), so the flip path below is
+            //     byte-for-byte unchanged. Must run BEFORE the flip: once this
+            //     host flips, a collided issue is indistinguishable from a clean
+            //     one.
+            self.detect_and_record_collision(issue_number);
             if let Err(e) = self.flip_label_to_building(issue_number) {
                 log::warn!(
                     "label flip for issue #{issue_number} failed (continuing dispatch): {e}"
@@ -1583,6 +1691,103 @@ impl SweepRegistry {
             issue,
         ) {
             log::debug!("sweep_journal: failed to remove entry for #{issue}: {e}");
+        }
+    }
+
+    // ------------------------------------------------------------------------
+    // Cross-host collision detection (Issue #4085, Phase 0 of #4028)
+    // ------------------------------------------------------------------------
+
+    /// Read the issue's **current** forge labels and classify whether a peer
+    /// host already claimed it (Issue #4085). Called by [`dispatch`](Self::dispatch)
+    /// immediately *before* the label flip, when detection is enabled — a
+    /// post-flip read cannot distinguish a collided issue from a clean one (both
+    /// end up `loom:building`), so the observation must happen pre-flip.
+    ///
+    /// Uses a bounded `gh issue view <N> --json labels`. **Fail-closed**: any
+    /// timeout, non-zero exit, or unparseable payload resolves to
+    /// [`CollisionClass::Unknown`], never `Collision`, so the baseline is never
+    /// inflated by an unverifiable read. The `gh issue edit` flip itself is left
+    /// byte-for-byte unchanged.
+    fn classify_preflip_labels(&self, issue: u32) -> CollisionClass {
+        let gh = self
+            .config
+            .gh_bin
+            .clone()
+            .unwrap_or_else(|| PathBuf::from("gh"));
+        let mut cmd = Command::new(&gh);
+        cmd.arg("issue")
+            .arg("view")
+            .arg(issue.to_string())
+            .arg("--json")
+            .arg("labels");
+        // Same workspace/repo scoping as the flip (#3937): resolve the issue
+        // against *this* registry's repo, not the daemon's cwd repo.
+        cmd.current_dir(&self.config.workspace_root);
+        if let Ok(repo) = std::env::var("LOOM_REPO") {
+            cmd.arg("--repo").arg(repo);
+        }
+        let timeout = reap_gh_timeout();
+        let output = match output_with_timeout(cmd, timeout) {
+            Ok(Some(o)) if o.status.success() => o,
+            Ok(Some(_)) => return CollisionClass::Unknown, // non-zero exit
+            Ok(None) => return CollisionClass::Unknown,    // timed out + killed
+            Err(_) => return CollisionClass::Unknown,      // spawn failure
+        };
+        // `gh issue view --json labels` emits `{"labels":[{"name":"..."},...]}`.
+        let parsed: serde_json::Value = match serde_json::from_slice(&output.stdout) {
+            Ok(v) => v,
+            Err(_) => return CollisionClass::Unknown,
+        };
+        let Some(arr) = parsed.get("labels").and_then(|l| l.as_array()) else {
+            return CollisionClass::Unknown;
+        };
+        let labels: Vec<String> = arr
+            .iter()
+            .filter_map(|l| l.get("name").and_then(|n| n.as_str()).map(String::from))
+            .collect();
+        let has_issue = labels.iter().any(|l| l == "loom:issue");
+        let has_building = labels.iter().any(|l| l == "loom:building");
+        if !has_issue || has_building {
+            CollisionClass::Collision { labels }
+        } else {
+            CollisionClass::Clean
+        }
+    }
+
+    /// When detection is enabled, probe the pre-flip label state and record —
+    /// but never act on — a cross-host collision (Issue #4085). A no-op (no `gh`
+    /// call at all) when detection is disabled, so the disabled dispatch path is
+    /// byte-for-byte unchanged. Increments [`collision_count`](Self::collision_count)
+    /// and logs a diagnostic record (issue, repo/workspace, host, timestamp,
+    /// observed pre-flip labels) on a confirmed collision.
+    fn detect_and_record_collision(&mut self, issue: u32) {
+        if !self.detect_collisions {
+            return;
+        }
+        match self.classify_preflip_labels(issue) {
+            CollisionClass::Collision { labels } => {
+                self.collision_count += 1;
+                log::warn!(
+                    "sweep_registry: cross-host dispatch collision (#4085) — issue #{issue} in \
+                     {repo} was already claimed by another host before host {host} flipped it at \
+                     {ts}; observed pre-flip labels=[{labels}]; running collision count={count} \
+                     (detection only — dispatch continues unchanged)",
+                    repo = self.config.workspace_root.display(),
+                    host = host_identity(),
+                    ts = Utc::now().to_rfc3339(),
+                    labels = labels.join(", "),
+                    count = self.collision_count,
+                );
+            }
+            CollisionClass::Unknown => {
+                // Fail-closed: an unverifiable read is never a collision.
+                log::debug!(
+                    "sweep_registry: collision probe for issue #{issue} inconclusive \
+                     (fail-closed, not counted) (#4085)"
+                );
+            }
+            CollisionClass::Clean => {}
         }
     }
 
@@ -3760,6 +3965,25 @@ pub fn resolve_review_stall_timeout(config: &StartupRaceConfig) -> Duration {
     Duration::from_secs(secs)
 }
 
+/// Resolve whether cross-host dispatch-collision detection runs (Issue #4085,
+/// Phase 0 of #4028), precedence **env > config > default(false)**. Reads
+/// `LOOM_DETECT_COLLISIONS` first, then `autonomous.collisionDetection.enabled`
+/// from the effective config, then defaults **off** (the probe adds one extra
+/// `gh issue view` round-trip per dispatch, so it is opt-in until a baseline
+/// justifies it).
+#[must_use]
+pub fn resolve_collision_detection(repo_root: &Path) -> bool {
+    if let Ok(v) = std::env::var(COLLISION_DETECT_ENV) {
+        return matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on");
+    }
+    let effective = crate::config_resolver::resolve_effective_config(repo_root);
+    crate::config_resolver::get_path(&effective, "autonomous")
+        .and_then(|a| a.get("collisionDetection"))
+        .and_then(|c| c.get("enabled"))
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+}
+
 // ============================================================================
 // Insta-crash quarantine config resolution (Issue #3939)
 // ============================================================================
@@ -5758,6 +5982,188 @@ exit 0
             gh_calls.is_empty(),
             "expected no forge call for a no-op clear; got: {gh_calls:?}"
         );
+    }
+
+    // ====================================================================
+    // Cross-host collision detection (Issue #4085, Phase 0 of #4028)
+    // ====================================================================
+
+    /// Install a fake `gh` that logs its argv to `gh_log`, emits `stdout` on
+    /// stdout, and exits with `exit_code`. Returns the fake binary path. Reuses
+    /// the established bash-stub pattern (the `--json labels` payload is the one
+    /// addition the collision tests need over the flip/restore stubs).
+    fn install_fake_gh(dir: &Path, gh_log: &Path, stdout: &str, exit_code: i32) -> PathBuf {
+        let fake_gh = dir.join("fake-gh.sh");
+        let script = format!(
+            "#!/usr/bin/env bash\nprintf '%s\\n' \"$*\" >> \"{log}\"\nprintf '%s' '{out}'\nexit {code}\n",
+            log = gh_log.display(),
+            out = stdout.replace('\'', "'\\''"),
+            code = exit_code,
+        );
+        std::fs::write(&fake_gh, &script).unwrap();
+        let mut perms = std::fs::metadata(&fake_gh).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&fake_gh, perms).unwrap();
+        if let Ok(f) = std::fs::File::open(&fake_gh) {
+            let _ = f.sync_all();
+        }
+        fake_gh
+    }
+
+    fn collision_registry(
+        dir: &Path,
+        gh_log: &Path,
+        stdout: &str,
+        exit_code: i32,
+    ) -> SweepRegistry {
+        let fake_gh = install_fake_gh(dir, gh_log, stdout, exit_code);
+        let mut config = SweepRegistryConfig::new(dir.to_path_buf());
+        config.gh_bin = Some(fake_gh);
+        SweepRegistry::new(config)
+    }
+
+    /// A pre-flip read showing `loom:building` already present is a collision.
+    #[test]
+    fn classify_preflip_labels_flags_prior_building_claim() {
+        let dir = tempdir().unwrap();
+        let gh_log = dir.path().join("gh.log");
+        let registry = collision_registry(
+            dir.path(),
+            &gh_log,
+            r#"{"labels":[{"name":"loom:building"},{"name":"loom:curated"}]}"#,
+            0,
+        );
+        match registry.classify_preflip_labels(42) {
+            CollisionClass::Collision { labels } => {
+                assert!(labels.iter().any(|l| l == "loom:building"));
+            }
+            other => panic!("expected Collision, got {other:?}"),
+        }
+    }
+
+    /// A pre-flip read with `loom:issue` already gone is a collision even if
+    /// `loom:building` is not (yet) visible.
+    #[test]
+    fn classify_preflip_labels_flags_missing_issue_label() {
+        let dir = tempdir().unwrap();
+        let gh_log = dir.path().join("gh.log");
+        let registry = collision_registry(
+            dir.path(),
+            &gh_log,
+            r#"{"labels":[{"name":"tier:goal-supporting"}]}"#,
+            0,
+        );
+        assert!(matches!(registry.classify_preflip_labels(42), CollisionClass::Collision { .. }));
+    }
+
+    /// `loom:issue` still present and `loom:building` absent ⇒ this host is the
+    /// first claimant: Clean, not a collision.
+    #[test]
+    fn classify_preflip_labels_clean_when_issue_label_present() {
+        let dir = tempdir().unwrap();
+        let gh_log = dir.path().join("gh.log");
+        let registry = collision_registry(
+            dir.path(),
+            &gh_log,
+            r#"{"labels":[{"name":"loom:issue"},{"name":"loom:curated"}]}"#,
+            0,
+        );
+        assert_eq!(registry.classify_preflip_labels(42), CollisionClass::Clean);
+    }
+
+    /// Fail-closed: a non-zero `gh` exit is `Unknown`, never a collision — an
+    /// unverifiable read must not inflate the baseline.
+    #[test]
+    fn classify_preflip_labels_fail_closed_on_gh_error() {
+        let dir = tempdir().unwrap();
+        let gh_log = dir.path().join("gh.log");
+        let registry = collision_registry(dir.path(), &gh_log, "", 1);
+        assert_eq!(registry.classify_preflip_labels(42), CollisionClass::Unknown);
+    }
+
+    /// Fail-closed: unparseable stdout (exit 0 but not the expected JSON) is
+    /// `Unknown`, never a collision.
+    #[test]
+    fn classify_preflip_labels_fail_closed_on_unparseable() {
+        let dir = tempdir().unwrap();
+        let gh_log = dir.path().join("gh.log");
+        let registry = collision_registry(dir.path(), &gh_log, "not json at all", 0);
+        assert_eq!(registry.classify_preflip_labels(42), CollisionClass::Unknown);
+    }
+
+    /// With detection enabled, a collision increments the counter once per call;
+    /// an Unknown/Clean read does not.
+    #[test]
+    fn detect_and_record_collision_increments_counter() {
+        let dir = tempdir().unwrap();
+        let gh_log = dir.path().join("gh.log");
+        let mut registry =
+            collision_registry(dir.path(), &gh_log, r#"{"labels":[{"name":"loom:building"}]}"#, 0);
+        registry.set_collision_detection(true);
+        assert_eq!(registry.collision_count(), 0);
+        registry.detect_and_record_collision(42);
+        assert_eq!(registry.collision_count(), 1);
+        registry.detect_and_record_collision(43);
+        assert_eq!(registry.collision_count(), 2);
+    }
+
+    /// With detection DISABLED, `detect_and_record_collision` is a pure no-op:
+    /// no `gh` call at all (the disabled dispatch path is byte-for-byte
+    /// unchanged) and the counter stays zero.
+    #[test]
+    fn detect_and_record_collision_disabled_is_noop() {
+        let dir = tempdir().unwrap();
+        let gh_log = dir.path().join("gh.log");
+        let mut registry =
+            collision_registry(dir.path(), &gh_log, r#"{"labels":[{"name":"loom:building"}]}"#, 0);
+        // detection left at its default (false)
+        assert!(!registry.collision_detection_enabled());
+        registry.detect_and_record_collision(42);
+        assert_eq!(registry.collision_count(), 0);
+        let gh_calls = std::fs::read_to_string(&gh_log).unwrap_or_default();
+        assert!(
+            gh_calls.is_empty(),
+            "disabled detection must not invoke gh at all; got: {gh_calls:?}"
+        );
+    }
+
+    /// A fail-closed Unknown read never increments the counter even with
+    /// detection enabled.
+    #[test]
+    fn detect_and_record_collision_unknown_not_counted() {
+        let dir = tempdir().unwrap();
+        let gh_log = dir.path().join("gh.log");
+        let mut registry = collision_registry(dir.path(), &gh_log, "", 1);
+        registry.set_collision_detection(true);
+        registry.detect_and_record_collision(42);
+        assert_eq!(registry.collision_count(), 0, "Unknown must not count");
+    }
+
+    /// Config resolution honors precedence env > config > default(off) (#4085).
+    #[test]
+    #[serial]
+    fn resolve_collision_detection_env_overrides() {
+        std::env::remove_var(COLLISION_DETECT_ENV);
+        let dir = tempdir().unwrap();
+        // No file, no env → default off.
+        assert!(!resolve_collision_detection(dir.path()));
+
+        // Config file enables it.
+        let loom = dir.path().join(".loom");
+        std::fs::create_dir_all(&loom).unwrap();
+        std::fs::write(
+            loom.join("config.json"),
+            r#"{"autonomous":{"collisionDetection":{"enabled":true}}}"#,
+        )
+        .unwrap();
+        assert!(resolve_collision_detection(dir.path()), "config enables");
+
+        // Env overrides config (off wins over config-on).
+        std::env::set_var(COLLISION_DETECT_ENV, "off");
+        assert!(!resolve_collision_detection(dir.path()), "env off overrides config on");
+        std::env::set_var(COLLISION_DETECT_ENV, "1");
+        assert!(resolve_collision_detection(dir.path()), "env on");
+        std::env::remove_var(COLLISION_DETECT_ENV);
     }
 
     /// Config resolution honors precedence env > config > default (#3939).

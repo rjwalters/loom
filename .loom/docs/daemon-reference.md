@@ -1426,6 +1426,8 @@ exactly like `main_health_gate::read_build_gate_config`.
 | `autonomous.watchdog.intervalSecs` | `LOOM_SWEEP_WATCHDOG_INTERVAL_SECS` | `30` | Watchdog probe cadence (shared by all three backstops) |
 | `autonomous.watchdog.reviewStall` | `LOOM_SWEEP_REVIEW_STALL` | `true` | Review-phase stall watchdog on/off (#3910) |
 | `autonomous.watchdog.reviewStallTimeoutSecs` | `LOOM_SWEEP_REVIEW_STALL_TIMEOUT_SECS` | `2700` | Log-silence window before a hung Judge/Doctor sweep is re-dispatched |
+| `autonomous.collisionDetection.enabled` | `LOOM_DETECT_COLLISIONS` | `false` | Cross-host dispatch-collision baseline (#4085). Off by default — adds one extra `gh issue view --json labels` round-trip per dispatch. Detection only: a collision is logged/counted, never acted on |
+| *(host identity, records only)* | `LOOM_HOST_ID` | `$HOSTNAME` → `hostname` → `unknown-host` | Overrides this host's identity string in collision log records (#4085); set it where the daemon runs without `$HOSTNAME` exported |
 
 ### Daemon log path override (`LOOM_DAEMON_LOG`, #4010)
 
@@ -1574,6 +1576,52 @@ candidate is dropped **before** the global slot-fill pass, so a workspace whose
 only candidates are quarantined never reserves a shared dispatch slot — healthy
 sibling work in other repos gets it instead. Defaults **on**; disable with
 `LOOM_WORK_FINDER_QUARANTINE=0` or `autonomous.workFinder.quarantine.enabled = false`.
+
+### Cross-host dispatch-collision baseline (#4085, Phase 0 of #4028)
+
+When two `loom-daemon` hosts share one repo backlog, both can dispatch the same
+issue: the `mkdir` claim lock (`.loom/locks/issue-<N>/`) is filesystem-local, so
+a peer host's lock is invisible, and the `loom:issue → loom:building` flip
+succeeds whether or not the label was still there — the losing host is never
+told it lost. This makes the cross-host collision rate **unobservable**, which is
+the prerequisite gap #4028's coordination layer has to justify closing.
+
+Collision detection makes that rate **measurable** (detection only — no
+coordination, no backoff, behavior is otherwise unchanged). When enabled, just
+before the label flip the registry reads the issue's **pre-flip** label state
+(`gh issue view <N> --json labels`) and classifies it:
+
+- `loom:issue` already gone **or** `loom:building` already present → **collision**
+  (a peer host claimed it first). A diagnostic record is logged at `warn` — issue
+  number, repo/workspace, this host's identity (`LOOM_HOST_ID` → `$HOSTNAME` →
+  `hostname` → `unknown-host`), timestamp, and the observed pre-flip label set —
+  and a per-registry cumulative counter is incremented.
+- `loom:issue` present and `loom:building` absent → **clean** (this host is first).
+- gh timeout / non-zero exit / unparseable JSON → **unknown**. **Fail-closed:**
+  an unverifiable read is never counted as a collision, so the baseline is never
+  inflated.
+
+**How to read the count.** The running total is surfaced on the work-finder's
+per-tick summary line as the trailing `N cross-host-collision(s)` field, e.g.:
+
+```
+work_finder: tick — cap 3 (...); 5 seen, 2 dispatched, 1 labeled-skip,
+0 in-flight-skip, 0 quarantine-skip, 0 deferred, 0 error(s), 3 cross-host-collision(s)
+```
+
+Unlike the other (per-tick) counters, this one is a **monotonic cumulative
+total** read from the dispatcher(s) at tick end (summed across workspaces in the
+multi-repo tick), so successive lines show the baseline accumulate. It is `0`
+whenever detection is disabled. The existing fields (`labeled-skip` /
+`in-flight-skip` / `quarantine-skip` …) keep their names and semantics unchanged.
+
+**Cost / default.** Enabling detection adds exactly one `gh issue view --json
+labels` round-trip per dispatch (measured ~0.4s against GitHub), bounded by the
+same `LOOM_REAP_GH_TIMEOUT_SECS` ceiling as the other best-effort `gh` calls.
+Because that is a real per-dispatch API cost it is **off by default**; enable it
+per the config/env row above (`LOOM_DETECT_COLLISIONS=1` or
+`autonomous.collisionDetection.enabled = true`, precedence **env > config >
+default**) on the hosts sharing a backlog while you take the measurement.
 
 ### Prerequisite: a fresh token ranking (#3894, self-refreshed by the daemon since #3969)
 
