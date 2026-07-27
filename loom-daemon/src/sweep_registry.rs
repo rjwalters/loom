@@ -360,6 +360,26 @@ pub const DEFAULT_WATCHDOG_INTERVAL_SECS: u64 = 30;
 /// escalating to SIGKILL, when it auto-cancels for re-dispatch.
 const WATCHDOG_CANCEL_GRACE: Duration = Duration::from_secs(3);
 
+/// Per-call ceiling for a best-effort `gh` subprocess invoked from the reaper
+/// (Issue #3973).
+///
+/// The reaper's forge-label reconciliation (`restore_label_to_ready`,
+/// `issue_has_blocked_label`, the quarantine label flips) runs on the
+/// `ListSweeps` / `GetSweepStatus` **read path** via [`SweepRegistry::reap_liveness`].
+/// During the 2026-07-26 incident a wedged `gh`/XPC blocked that read under the
+/// registry mutex indefinitely, so an operator `list_sweeps` hung ~15 minutes.
+/// Every reaper `gh` call is bounded to this window: on timeout the child is
+/// killed and the call is treated as the same best-effort failure any other
+/// `gh` error already is, so the in-memory liveness transition always completes.
+/// Overridable via [`REAP_GH_TIMEOUT_ENV`] for operability.
+const REAP_GH_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Env var overriding [`REAP_GH_TIMEOUT`] (whole seconds; zero/invalid ignored).
+pub const REAP_GH_TIMEOUT_ENV: &str = "LOOM_REAP_GH_TIMEOUT_SECS";
+
+/// Poll cadence for [`output_with_timeout`] while waiting on a reaper `gh` call.
+const REAP_GH_POLL_INTERVAL: Duration = Duration::from_millis(20);
+
 /// Env var toggling the review-phase stall watchdog (Issue #3910).
 /// `0`/`false`/`no`/`off` disables; `1`/`true`/`yes`/`on` forces on. Overrides
 /// config. Distinct from `LOOM_SWEEP_WATCHDOG` (the #3887 startup watchdog) so a
@@ -743,6 +763,53 @@ fn poll_token_name(child: &mut Child, log_path: &Path, header_anchor: &str) -> S
             return UNKNOWN_TOKEN_NAME.to_string();
         }
         std::thread::sleep(TOKEN_NAME_CAPTURE_POLL_INTERVAL);
+    }
+}
+
+/// Resolve the per-call reaper `gh` timeout (Issue #3973): the
+/// [`REAP_GH_TIMEOUT_ENV`] override (whole seconds, must be > 0) or the
+/// [`REAP_GH_TIMEOUT`] default.
+fn reap_gh_timeout() -> Duration {
+    std::env::var(REAP_GH_TIMEOUT_ENV)
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .filter(|&n| n > 0)
+        .map(Duration::from_secs)
+        .unwrap_or(REAP_GH_TIMEOUT)
+}
+
+/// Run `cmd` to completion but abandon (kill) it if it exceeds `timeout`
+/// (Issue #3973).
+///
+/// Returns `Ok(Some(output))` when the child completed within the window,
+/// `Ok(None)` when it was killed for exceeding `timeout`, and `Err` when the
+/// spawn itself failed. Used to bound the best-effort `gh` calls the reaper
+/// makes on the `ListSweeps` / `GetSweepStatus` read path so a wedged `gh`/XPC
+/// cannot block the registry read indefinitely (the 2026-07-26 incident).
+///
+/// stdout/stderr are forced to `piped()` so a completed call's output is always
+/// captured (callers that parse stdout — e.g. the `loom:blocked` probe — depend
+/// on this). The reaper's `gh` invocations emit a tiny payload (a label list or
+/// an edit ack), so the `try_wait` poll loop never risks a full-pipe-buffer
+/// deadlock; the kill-on-timeout path drains the pipe via `wait()` after the
+/// signal.
+fn output_with_timeout(
+    mut cmd: Command,
+    timeout: Duration,
+) -> std::io::Result<Option<std::process::Output>> {
+    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut child = cmd.spawn()?;
+    let deadline = Instant::now() + timeout;
+    loop {
+        if child.try_wait()?.is_some() {
+            return child.wait_with_output().map(Some);
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Ok(None);
+        }
+        std::thread::sleep(REAP_GH_POLL_INTERVAL);
     }
 }
 
@@ -1454,15 +1521,22 @@ impl SweepRegistry {
         if let Ok(repo) = std::env::var("LOOM_REPO") {
             cmd.arg("--repo").arg(repo);
         }
-        cmd.stdout(Stdio::null()).stderr(Stdio::piped());
-        let output = cmd
-            .output()
-            .with_context(|| format!("failed to invoke {} for issue #{issue}", gh.display()))?;
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(anyhow!("gh issue edit failed for #{issue}: {}", stderr.trim()));
+        // Bounded so a wedged `gh` can never block the dispatch/read path
+        // indefinitely (Issue #3973); stdio piping is forced by the helper.
+        let timeout = reap_gh_timeout();
+        match output_with_timeout(cmd, timeout)
+            .with_context(|| format!("failed to invoke {} for issue #{issue}", gh.display()))?
+        {
+            Some(output) if output.status.success() => Ok(()),
+            Some(output) => {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                Err(anyhow!("gh issue edit failed for #{issue}: {}", stderr.trim()))
+            }
+            None => Err(anyhow!(
+                "gh issue edit for #{issue} exceeded {}s and was killed (#3973)",
+                timeout.as_secs()
+            )),
         }
-        Ok(())
     }
 
     fn restore_label_to_ready(&self, issue: u32) -> Result<()> {
@@ -1486,8 +1560,17 @@ impl SweepRegistry {
         if let Ok(repo) = std::env::var("LOOM_REPO") {
             cmd.arg("--repo").arg(repo);
         }
-        cmd.stdout(Stdio::null()).stderr(Stdio::piped());
-        let _ = cmd.output()?; // best-effort during reap
+        // Best-effort during reap, but bounded so a wedged `gh` on the
+        // `ListSweeps` / `GetSweepStatus` read path cannot block the registry
+        // read indefinitely (Issue #3973).
+        let timeout = reap_gh_timeout();
+        if output_with_timeout(cmd, timeout)?.is_none() {
+            log::warn!(
+                "sweep_registry: restore_label_to_ready gh for #{issue} exceeded {}s \
+                 and was killed (#3973)",
+                timeout.as_secs()
+            );
+        }
         Ok(())
     }
 
@@ -1602,9 +1685,16 @@ impl SweepRegistry {
         if let Ok(repo) = std::env::var("LOOM_REPO") {
             edit.arg("--repo").arg(repo);
         }
-        edit.stdout(Stdio::null()).stderr(Stdio::piped());
-        if let Err(e) = edit.output() {
-            log::debug!("sweep_registry: quarantine label edit for #{issue} failed: {e}");
+        // Bounded (Issue #3973): quarantine runs from `reap_once`, which is on
+        // the `ListSweeps` / `GetSweepStatus` read path.
+        let timeout = reap_gh_timeout();
+        match output_with_timeout(edit, timeout) {
+            Ok(Some(_)) => {}
+            Ok(None) => log::debug!(
+                "sweep_registry: quarantine label edit for #{issue} exceeded {}s, killed (#3973)",
+                timeout.as_secs()
+            ),
+            Err(e) => log::debug!("sweep_registry: quarantine label edit for #{issue} failed: {e}"),
         }
 
         let body = format!(
@@ -1633,9 +1723,13 @@ impl SweepRegistry {
         if let Ok(repo) = std::env::var("LOOM_REPO") {
             comment.arg("--repo").arg(repo);
         }
-        comment.stdout(Stdio::null()).stderr(Stdio::piped());
-        if let Err(e) = comment.output() {
-            log::debug!("sweep_registry: quarantine comment for #{issue} failed: {e}");
+        match output_with_timeout(comment, timeout) {
+            Ok(Some(_)) => {}
+            Ok(None) => log::debug!(
+                "sweep_registry: quarantine comment for #{issue} exceeded {}s, killed (#3973)",
+                timeout.as_secs()
+            ),
+            Err(e) => log::debug!("sweep_registry: quarantine comment for #{issue} failed: {e}"),
         }
     }
 
@@ -1664,9 +1758,21 @@ impl SweepRegistry {
         if let Ok(repo) = std::env::var("LOOM_REPO") {
             edit.arg("--repo").arg(repo);
         }
-        edit.stdout(Stdio::null()).stderr(Stdio::piped());
-        if let Err(e) = edit.output() {
-            log::debug!("sweep_registry: quarantine-release label edit for #{issue} failed: {e}");
+        // Bounded (Issue #3973): expire_quarantine runs from `reap_once`, on the
+        // `ListSweeps` / `GetSweepStatus` read path.
+        let timeout = reap_gh_timeout();
+        match output_with_timeout(edit, timeout) {
+            Ok(Some(_)) => {}
+            Ok(None) => log::debug!(
+                "sweep_registry: quarantine-release label edit for #{issue} exceeded {}s, \
+                 killed (#3973)",
+                timeout.as_secs()
+            ),
+            Err(e) => {
+                log::debug!(
+                    "sweep_registry: quarantine-release label edit for #{issue} failed: {e}"
+                )
+            }
         }
     }
 
@@ -1751,10 +1857,22 @@ impl SweepRegistry {
         if let Ok(repo) = std::env::var("LOOM_REPO") {
             cmd.arg("--repo").arg(repo);
         }
-        cmd.stderr(Stdio::null());
-        match cmd.output() {
-            Ok(out) if out.status.success() => {
+        // Bounded so a wedged `gh` on the `ListSweeps` / `GetSweepStatus` read
+        // path (this runs inside `reap_liveness`) cannot block the registry read
+        // indefinitely (Issue #3973). A timeout is treated as not-blocked — the
+        // same conservative default as any other `gh` failure here.
+        let timeout = reap_gh_timeout();
+        match output_with_timeout(cmd, timeout) {
+            Ok(Some(out)) if out.status.success() => {
                 String::from_utf8_lossy(&out.stdout).trim() == "true"
+            }
+            Ok(None) => {
+                log::warn!(
+                    "sweep_registry: issue_has_blocked_label gh for #{issue} exceeded {}s \
+                     and was killed; treating as not-blocked (#3973)",
+                    timeout.as_secs()
+                );
+                false
             }
             _ => false,
         }
@@ -6766,6 +6884,126 @@ exit 0\n";
         assert!(
             registry.list(Some(&SweepState::Running)).is_empty(),
             "no sweep should remain Running after the exited child was reaped"
+        );
+    }
+
+    // ===================================================================
+    // Read-path forge I/O is bounded (Issue #3973)
+    // ===================================================================
+    //
+    // The reaper's `gh` shell-outs run on the `ListSweeps` / `GetSweepStatus`
+    // read path via `reap_liveness`. During the 2026-07-26 incident a wedged
+    // `gh`/XPC blocked that read under the registry mutex for ~15 minutes.
+    // These tests pin the bounded-subprocess fix.
+
+    #[test]
+    fn output_with_timeout_returns_output_for_a_fast_command() {
+        let mut cmd = Command::new("/bin/echo");
+        cmd.arg("hi");
+        let out = output_with_timeout(cmd, Duration::from_secs(5))
+            .expect("spawn should succeed")
+            .expect("a fast command must complete inside the window");
+        assert!(out.status.success());
+        assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "hi");
+    }
+
+    #[test]
+    fn output_with_timeout_kills_a_hung_command() {
+        let mut cmd = Command::new("/bin/sleep");
+        cmd.arg("30");
+        let start = Instant::now();
+        let out =
+            output_with_timeout(cmd, Duration::from_millis(300)).expect("spawn should succeed");
+        let elapsed = start.elapsed();
+        assert!(out.is_none(), "a command exceeding the timeout must be killed and yield None");
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "kill-on-timeout should be prompt, took {elapsed:?}"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn reap_gh_timeout_honors_env_override() {
+        std::env::set_var(REAP_GH_TIMEOUT_ENV, "3");
+        assert_eq!(reap_gh_timeout(), Duration::from_secs(3));
+        // Zero and non-numeric both fall back to the compiled default.
+        std::env::set_var(REAP_GH_TIMEOUT_ENV, "0");
+        assert_eq!(reap_gh_timeout(), REAP_GH_TIMEOUT);
+        std::env::set_var(REAP_GH_TIMEOUT_ENV, "notanumber");
+        assert_eq!(reap_gh_timeout(), REAP_GH_TIMEOUT);
+        std::env::remove_var(REAP_GH_TIMEOUT_ENV);
+        assert_eq!(reap_gh_timeout(), REAP_GH_TIMEOUT);
+    }
+
+    /// End-to-end: a wedged `gh` must NOT block the `ListSweeps` /
+    /// `GetSweepStatus` read path (`reap_liveness`) indefinitely, and the
+    /// in-memory liveness transition must still complete when the forge label
+    /// flip is killed for exceeding its timeout (Issue #3973).
+    #[test]
+    #[serial]
+    fn read_path_reap_is_bounded_when_gh_wedges() {
+        let dir = tempdir().unwrap();
+        let workspace = dir.path();
+        let scripts_dir = workspace.join(".loom").join("scripts");
+        std::fs::create_dir_all(&scripts_dir).unwrap();
+
+        // A fake `gh` that hangs far longer than the reap timeout, simulating
+        // the wedged gh/XPC from the incident.
+        let fake_gh = scripts_dir.join("gh-hang.sh");
+        std::fs::write(&fake_gh, "#!/usr/bin/env bash\nsleep 60\n").unwrap();
+        let mut ghp = std::fs::metadata(&fake_gh).unwrap().permissions();
+        ghp.set_mode(0o755);
+        std::fs::set_permissions(&fake_gh, ghp).unwrap();
+
+        // A fake spawn that exits immediately so the read-path reap finds a
+        // dead child and attempts the forge label restore.
+        let spawn = scripts_dir.join("spawn-claude.sh");
+        std::fs::write(&spawn, "#!/usr/bin/env bash\nexit 0\n").unwrap();
+        let mut sp = std::fs::metadata(&spawn).unwrap().permissions();
+        sp.set_mode(0o755);
+        std::fs::set_permissions(&spawn, sp).unwrap();
+
+        let mut config = SweepRegistryConfig::new(workspace.to_path_buf());
+        config.spawn_bin = Some(spawn);
+        config.gh_bin = Some(fake_gh);
+        // Force the reaper's `gh` shell-out (byte-for-byte the incident path).
+        config.skip_label_flip = false;
+        config.journal_path = Some(workspace.join("test-sweeps-journal.json"));
+        let mut registry = SweepRegistry::new(config);
+
+        // Bound each reaper gh call tightly so the test is fast.
+        std::env::set_var(REAP_GH_TIMEOUT_ENV, "1");
+
+        let outcome = registry
+            .dispatch(&SweepKind::Issue(4243), None, None, None, None)
+            .expect("dispatch should succeed");
+        let sweep_id = outcome.sweep_id.clone();
+
+        // Ensure the child has actually exited before we reap-on-read.
+        assert!(wait_until_dead(outcome.pid, 5000), "fake spawn child should exit promptly");
+
+        // The read-path reap must return well under the ~15-minute hang. It
+        // kills the wedged gh at the 1s bound; generous headroom covers poll
+        // slack and any second bounded call.
+        let start = Instant::now();
+        registry.reap_liveness();
+        let elapsed = start.elapsed();
+        std::env::remove_var(REAP_GH_TIMEOUT_ENV);
+
+        assert!(
+            elapsed < Duration::from_secs(15),
+            "reap_liveness on the read path took {elapsed:?} — a wedged gh must not block it \
+             indefinitely (#3973)"
+        );
+        // The liveness transition still completes despite the killed gh.
+        assert!(
+            matches!(
+                registry.get(&sweep_id).unwrap().state,
+                SweepState::Exited { .. } | SweepState::Crashed { .. }
+            ),
+            "exited child should transition to a terminal state even when the forge label flip \
+             is killed for exceeding its timeout"
         );
     }
 

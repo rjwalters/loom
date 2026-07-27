@@ -51,6 +51,20 @@ const DISPATCH_TIMEOUT_MS = 30_000;
 /** Fixed headroom added on top of a cancel's grace window. */
 const CANCEL_TIMEOUT_BUFFER_MS = 30_000;
 
+/**
+ * Bound for the read-path calls that reconcile liveness on the daemon side
+ * (issue #3973). `ListSweeps` / `GetSweepStatus` run `reap_liveness` before
+ * responding, which best-effort shells out to `gh` for label reconciliation.
+ * Each `gh` call is now individually bounded on the daemon (default 5s,
+ * `LOOM_REAP_GH_TIMEOUT_SECS`), but a burst of newly-exited children can chain
+ * a few bounded calls, so the bridge gives these reads generous headroom over
+ * the small fire-and-forget default while still killing the 15-minute hang
+ * class the incident exposed. Comfortably below the 120s tool ceiling and the
+ * ~1800s MCP idle timeout; honors a higher `LOOM_DAEMON_IPC_TIMEOUT_MS` via
+ * `Math.max`.
+ */
+const READ_PATH_TIMEOUT_MS = 30_000;
+
 // ============================================================================
 // Wire types
 // ============================================================================
@@ -331,15 +345,21 @@ async function listSweeps(args: {
   workspace_root?: string;
 }): Promise<{ success: true; sweeps: SweepInfo[] } | { success: false; error: string }> {
   try {
-    const response = (await sendDaemonRequest({
-      type: "ListSweeps",
-      payload: {
-        state_filter: args.state_filter ?? null,
-        // Issue #3929: optional target managed-workspace root. `null` lists the
-        // default workspace's sweeps, exactly as before.
-        workspace_root: args.workspace_root ?? null,
+    const response = (await sendDaemonRequest(
+      {
+        type: "ListSweeps",
+        payload: {
+          state_filter: args.state_filter ?? null,
+          // Issue #3929: optional target managed-workspace root. `null` lists the
+          // default workspace's sweeps, exactly as before.
+          workspace_root: args.workspace_root ?? null,
+        },
       },
-    })) as DaemonResponse;
+      // Issue #3973: read path reconciles liveness (may chain bounded `gh`
+      // calls) before responding — give it headroom but keep it bounded so a
+      // wedged daemon fails fast instead of hanging ~15 minutes.
+      Math.max(READ_PATH_TIMEOUT_MS, resolveDaemonIpcTimeoutMs())
+    )) as DaemonResponse;
 
     if (response.type === "SweepList") {
       const payload = (response as ListResponse).payload;
@@ -362,10 +382,15 @@ async function getSweepStatus(args: {
   workspace_root?: string;
 }): Promise<{ success: true; info: SweepInfo | null } | { success: false; error: string }> {
   try {
-    const response = (await sendDaemonRequest({
-      type: "GetSweepStatus",
-      payload: { sweep_id: args.sweep_id, workspace_root: args.workspace_root ?? null },
-    })) as DaemonResponse;
+    const response = (await sendDaemonRequest(
+      {
+        type: "GetSweepStatus",
+        payload: { sweep_id: args.sweep_id, workspace_root: args.workspace_root ?? null },
+      },
+      // Issue #3973: read path reconciles liveness before responding — same
+      // bounded headroom as list_sweeps.
+      Math.max(READ_PATH_TIMEOUT_MS, resolveDaemonIpcTimeoutMs())
+    )) as DaemonResponse;
 
     if (response.type === "SweepStatus") {
       return { success: true, info: (response as SweepStatusResponse).payload.info };
