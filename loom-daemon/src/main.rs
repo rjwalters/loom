@@ -344,15 +344,10 @@ async fn main() -> Result<()> {
     let (loom_dir, socket_path) = if let Ok(path) = std::env::var("LOOM_SOCKET_PATH") {
         // For testing, use the parent directory of the provided socket path
         let socket_path = std::path::PathBuf::from(path);
-        let loom_dir = socket_path
-            .parent()
-            .ok_or_else(|| anyhow!("Socket path has no parent directory"))?
-            .to_path_buf();
+        let loom_dir = resolve_loom_dir()?;
         (loom_dir, socket_path)
     } else {
-        let loom_dir = dirs::home_dir()
-            .ok_or_else(|| anyhow!("No home directory"))?
-            .join(".loom");
+        let loom_dir = resolve_loom_dir()?;
         fs::create_dir_all(&loom_dir)?;
         let socket_path = loom_dir.join("loom-daemon.sock");
         (loom_dir, socket_path)
@@ -939,10 +934,43 @@ fn check_tmux_installed() -> Result<()> {
         .ok_or_else(|| anyhow!("tmux not installed. Install with: brew install tmux"))
 }
 
-fn setup_logging() -> Result<()> {
-    let log_path = dirs::home_dir()
+/// Resolve the daemon's loom directory: the parent of `LOOM_SOCKET_PATH` when
+/// that env var is set (test isolation), else `$HOME/.loom`. Pure — no side
+/// effects (no directory creation), so it's safe to call from `setup_logging()`
+/// (which runs before `main()`'s own `loom_dir`/`socket_path` resolution block)
+/// as well as from `main()` and `resolve_socket_path()` without duplicating the
+/// branching logic three times over.
+fn resolve_loom_dir() -> Result<PathBuf> {
+    if let Ok(path) = std::env::var("LOOM_SOCKET_PATH") {
+        let socket_path = PathBuf::from(path);
+        let loom_dir = socket_path
+            .parent()
+            .ok_or_else(|| anyhow!("Socket path has no parent directory"))?
+            .to_path_buf();
+        return Ok(loom_dir);
+    }
+    let loom_dir = dirs::home_dir()
         .ok_or_else(|| anyhow!("No home directory"))?
-        .join(".loom/daemon.log");
+        .join(".loom");
+    Ok(loom_dir)
+}
+
+/// Resolve the daemon log file path: `LOOM_DAEMON_LOG` (full override) when
+/// set, else `<loom dir>/daemon.log` derived from [`resolve_loom_dir`]. This
+/// means `LOOM_SOCKET_PATH`-style test isolation covers the log file for free
+/// — a test daemon pointed at a tempdir socket also logs into that tempdir,
+/// never into the operator's `~/.loom/daemon.log` (Issue #4010). Precedence is
+/// env > default only; see #4010 for why a config tier is out of scope here
+/// (`setup_logging()` runs before workspace/config resolution).
+fn resolve_log_path() -> Result<PathBuf> {
+    if let Ok(path) = std::env::var("LOOM_DAEMON_LOG") {
+        return Ok(PathBuf::from(path));
+    }
+    Ok(resolve_loom_dir()?.join("daemon.log"))
+}
+
+fn setup_logging() -> Result<()> {
+    let log_path = resolve_log_path()?;
 
     if let Some(parent) = log_path.parent() {
         fs::create_dir_all(parent)?;
@@ -972,6 +1000,85 @@ fn setup_logging() -> Result<()> {
     log::info!("Daemon logging initialized to {}", log_path.display());
 
     Ok(())
+}
+
+#[cfg(test)]
+mod resolve_paths_tests {
+    //! Tests for [`resolve_loom_dir`] and [`resolve_log_path`] (Issue #4010).
+    //!
+    //! `setup_logging()` itself is deliberately NOT unit-tested here: it calls
+    //! `env_logger::Builder::...init()`, which panics if called a second time
+    //! in the same process. Splitting the pure path-resolution logic out into
+    //! these two functions is exactly what makes it testable at all.
+    //!
+    //! Both tests mutate the process-global `LOOM_SOCKET_PATH` / `LOOM_DAEMON_LOG`
+    //! env vars, so they're `#[serial]` (the crate already depends on
+    //! `serial_test` for this exact purpose — see `dispatch_tests` below) to
+    //! avoid racing other env-mutating tests in the same binary.
+    use super::{resolve_log_path, resolve_loom_dir};
+    use serial_test::serial;
+
+    #[test]
+    #[serial]
+    fn resolve_loom_dir_defaults_to_home_loom() {
+        std::env::remove_var("LOOM_SOCKET_PATH");
+        let expected = dirs::home_dir().expect("home dir").join(".loom");
+        assert_eq!(resolve_loom_dir().expect("resolve"), expected);
+    }
+
+    #[test]
+    #[serial]
+    fn resolve_loom_dir_honors_socket_path_override() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let socket_path = dir.path().join("loom-daemon.sock");
+        std::env::set_var("LOOM_SOCKET_PATH", &socket_path);
+
+        let resolved = resolve_loom_dir().expect("resolve");
+
+        std::env::remove_var("LOOM_SOCKET_PATH");
+        assert_eq!(resolved, dir.path());
+    }
+
+    #[test]
+    #[serial]
+    fn resolve_log_path_defaults_to_home_loom_daemon_log() {
+        std::env::remove_var("LOOM_SOCKET_PATH");
+        std::env::remove_var("LOOM_DAEMON_LOG");
+        let expected = dirs::home_dir()
+            .expect("home dir")
+            .join(".loom")
+            .join("daemon.log");
+        assert_eq!(resolve_log_path().expect("resolve"), expected);
+    }
+
+    #[test]
+    #[serial]
+    fn resolve_log_path_honors_loom_daemon_log_override() {
+        std::env::remove_var("LOOM_SOCKET_PATH");
+        std::env::set_var("LOOM_DAEMON_LOG", "/tmp/some/d/daemon.log");
+
+        let resolved = resolve_log_path().expect("resolve");
+
+        std::env::remove_var("LOOM_DAEMON_LOG");
+        assert_eq!(resolved, std::path::PathBuf::from("/tmp/some/d/daemon.log"));
+    }
+
+    /// `LOOM_DAEMON_LOG` must win even when `LOOM_SOCKET_PATH` is also set —
+    /// the explicit log override always takes precedence over the derived path.
+    #[test]
+    #[serial]
+    fn resolve_log_path_daemon_log_wins_over_socket_path_derivation() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let socket_path = dir.path().join("loom-daemon.sock");
+        std::env::set_var("LOOM_SOCKET_PATH", &socket_path);
+        std::env::set_var("LOOM_DAEMON_LOG", "/tmp/explicit/daemon.log");
+
+        let resolved = resolve_log_path().expect("resolve");
+
+        std::env::remove_var("LOOM_SOCKET_PATH");
+        std::env::remove_var("LOOM_DAEMON_LOG");
+        assert_eq!(resolved, std::path::PathBuf::from("/tmp/explicit/daemon.log"));
+    }
 }
 
 /// Handle CLI commands (init, stats, validate modes)
@@ -1194,10 +1301,7 @@ fn resolve_socket_path() -> Result<PathBuf> {
     if let Ok(path) = std::env::var("LOOM_SOCKET_PATH") {
         return Ok(PathBuf::from(path));
     }
-    let loom_dir = dirs::home_dir()
-        .ok_or_else(|| anyhow!("No home directory"))?
-        .join(".loom");
-    Ok(loom_dir.join("loom-daemon.sock"))
+    Ok(resolve_loom_dir()?.join("loom-daemon.sock"))
 }
 
 /// Connect to the running daemon over its Unix socket, send a single
