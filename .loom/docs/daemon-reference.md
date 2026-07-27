@@ -455,8 +455,9 @@ own registry from the `WorkspacePool` (`get_or_provision`). It returns:
 
 `loom-daemon status` prints a **Managed repos** section (root, in-flight count,
 gate state); `loom-daemon status --json` adds the `per_repo` array. The
-dynamic-cap inputs (token pool, disk headroom, configured ceiling) remain computed
-once from the daemon's primary workspace — they are *machine-level* resources, so
+dynamic-cap inputs (token pool, disk headroom, cpu/load headroom (#3978),
+configured ceiling) remain computed once from the daemon's primary workspace —
+they are *machine-level* resources, so
 they stay a single global figure, not per-repo. `resolve_registry` (the
 per-request `workspace_root` targeting used by `dispatch_sweep` / `list_sweeps` /
 etc.) is unchanged: the cross-repo aggregation is a read-only snapshot for
@@ -881,24 +882,46 @@ Each tick:
    `workfinder-<issue>` idempotency key, making a re-dispatch of an
    already-running issue a no-op.
 
-### Dynamic concurrency scaling (Phase B, #3811)
+### Dynamic concurrency scaling (Phase B, #3811; CPU/load term #3978)
 
 The concurrency cap is **not** a fixed value resolved once at startup. Every
 tick the finder recomputes
 
 ```
-dynamic_cap = min(healthy-token count × per-token concurrency, disk headroom, configured ceiling)
+dynamic_cap = min(healthy-token count × per-token concurrency, disk headroom, cpu/load headroom, configured ceiling)
 ```
 
-from live inputs, so pool/disk/backlog changes are honored without a daemon
-restart:
+from live inputs, so pool/disk/cpu/backlog changes are honored without a
+daemon restart:
 
 | Input | Source | Bound it enforces |
 |-------|--------|-------------------|
 | **healthy-token count** | `available` accounts in `{workspace}/.loom/tokens/.ranking` (`capacity::token_axis_limit`), falling back to the `*.token` count (`tokens::token_pool_size`) when no ranking exists | the count of accounts safe to dispatch to — never dispatch to an exhausted/blocked one (#3902) |
 | **per-token concurrency** | `LOOM_PER_TOKEN_CONCURRENCY` / `autonomous.perTokenConcurrency`, default **2** (#3947) | how many concurrent sweeps to allow **per healthy account**. A plan limit is a utilization-window token bucket, not a session count, so one healthy account can run several concurrent sessions. Before #3947 the implicit factor was `1` (one sweep per account), which collapsed the whole fleet to cap 1 when 6/7 accounts were at their weekly ceiling even though the single healthy account had ample session-window headroom |
 | **disk headroom** | `floor(free_gb / LOOM_PER_WORKTREE_GB)` on the worktree-root volume (`disk_headroom::disk_headroom_limit`, a Rust port of `disk-headroom.sh` that shells to `df -Pk`) | never provision more worktrees than the scratch volume can hold |
-| **configured ceiling** | `LOOM_WORK_FINDER_MAX_CONCURRENT` (repurposed from Phase A's fixed target into an operator ceiling) | hard operator upper bound regardless of token/disk headroom |
+| **cpu/load headroom** (#3978) | `max(1, floor((logical_cpus × LOOM_CPU_UTILIZATION_TARGET − 1m loadavg) / LOOM_EST_CORES_PER_SWEEP))` (`cpu_headroom::cpu_headroom_limit`) | never start more concurrent sweeps than the host's CPU/load headroom can currently absorb |
+| **configured ceiling** | `LOOM_WORK_FINDER_MAX_CONCURRENT` (repurposed from Phase A's fixed target into an operator ceiling) | hard operator upper bound regardless of token/disk/cpu headroom |
+
+**CPU/load headroom term (#3978).** The token and disk axes alone let a batch
+of token accounts resetting from `exhausted` to `available` at once raise the
+cap regardless of how many concurrent `cargo build`s were already saturating
+the host — the incident this term fixes: 2–3 concurrent Rust builds in sweep
+worktrees starved `build-gate.sh` of CPU badly enough that it hit its own 600s
+timeout, which the (separately-fixed, #3974) gate misreported as a verified-red
+`main`, halting all dispatch. `cpu_headroom_limit()` combines a **static**
+capacity (`logical_cpus × utilization_target`, default target `0.75` — leaves
+headroom for the OS, the daemon itself, and the gate's own `cargo`
+invocations) with the **current** 1-minute load average (`/proc/loadavg` on
+Linux, `sysctl -n vm.loadavg` on macOS) subtracted from that capacity, divided
+by an estimated per-sweep core cost (`LOOM_EST_CORES_PER_SWEEP`, default
+`2.0`). Like the token axis's "one healthy account is the floor, never a
+halt" policy (#3902), the CPU term is floored at `1` — a load-average read
+failure or a noisy reading must never by itself wedge the whole dynamic cap
+to zero; disk headroom and the token axis remain the only terms allowed to
+floor to a genuine `0`. Tunable via `LOOM_CPU_UTILIZATION_TARGET` (fraction,
+default `0.75`) and `LOOM_EST_CORES_PER_SWEEP` (cores, default `2.0`) —
+env-only, mirroring `LOOM_PER_WORKTREE_GB`'s config surface (no
+`.loom/config.json` knob).
 
 **Per-token concurrency factor (#3947).** The token axis is `healthy × factor`,
 not `healthy × 1`. The factor is resolved with the standard precedence **env
@@ -911,7 +934,9 @@ account with session-window headroom — the #3909 rotating selection spread sti
 fills **distinct** accounts first (via the persistent `.rotation_cursor`), only
 stacking multiple sweeps on one account when concurrency demand exceeds the
 healthy-account count. The `loom-daemon status` view spells the arithmetic out,
-e.g. `= min(healthy 1 × per-token 2 = 2, disk headroom 120, configured max 3)`.
+e.g. `= min(healthy 1 × per-token 2 = 2, disk headroom 120, cpu headroom 6,
+configured max 3)`, and a separate line reports the live loadavg/core-count
+detail feeding the cpu headroom term (#3978 AC4).
 
 **Session-limit fault handling (#3947).** Stacking can occasionally trip a
 **concurrent-session-limit** fault on a token (the account is healthy but cannot
