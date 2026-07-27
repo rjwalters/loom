@@ -20,6 +20,11 @@ set -uo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 STOP_SCRIPT="$(cd "$SCRIPT_DIR/../cli" && pwd)/loom-daemon-stop.sh"
 
+# Shared launchd sandbox (#4078): scratch-label generator, decoy spawner, and
+# stub launchctl/pgrep. Stubs the syscall layer only — never the stop script.
+# shellcheck source=lib/launchd-sandbox.sh
+source "$SCRIPT_DIR/lib/launchd-sandbox.sh"
+
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 NC='\033[0m'
@@ -44,10 +49,18 @@ assert_eq() {
 
 # A guaranteed-nonexistent label so `launchctl print` never matches a real
 # loaded job on the host machine, regardless of platform.
-FAKE_LABEL="com.example.loom-daemon-stop-test-$$-$RANDOM"
+FAKE_LABEL="$(launchd_sandbox_new_label)"
 
 WORKDIR="$(mktemp -d)"
-trap 'rm -rf "$WORKDIR"' EXIT
+
+# Suite-level safety guard (#4078): a decoy process whose argv ends in
+# `/loom-daemon` — exactly what the stop script's label-blind `pgrep -f
+# '(^|/)loom-daemon$'` fallback would match. Every stop invocation below pins a
+# scratch LOOM_LAUNCHD_LABEL, so the production narrowing must skip the pgrep
+# tier and leave this decoy alive. If ANY test in this suite regresses into a
+# by-name kill, this decoy dies and the final assertion fails loudly.
+DECOY_PID="$(launchd_sandbox_spawn_decoy "$WORKDIR")"
+trap 'kill "$DECOY_PID" 2>/dev/null; rm -rf "$WORKDIR"' EXIT
 mkdir -p "$WORKDIR/.loom"
 
 # ---------- tests ----------
@@ -175,7 +188,93 @@ else
     echo "  (skipping relaunch-detection test — not Darwin)"
 fi
 
+# 7. Decoy-process test (#4078): the label-blind `pgrep` fallback must NOT be
+#    reachable when the caller scoped the stop to a non-default label. Run the
+#    REAL stop script (real pgrep on PATH, no PID file, scratch label) with a
+#    live decoy whose argv ends in `/loom-daemon`. Pre-fix, stop would `pgrep
+#    -f '(^|/)loom-daemon$'`, match the decoy, and SIGTERM it. Post-fix, the
+#    scratch label routes around the pgrep tier entirely, so the decoy survives
+#    and stop reports "nothing to stop". This is the test that distinguishes a
+#    real fix from an insufficient label-only-on-launchctl one.
+decoy7_pid="$(launchd_sandbox_spawn_decoy "$WORKDIR/decoy7")"
+sleep 0.2
+# Sanity: the decoy really is matchable by the fallback pattern (else the test
+# would pass vacuously). Only meaningful where pgrep exists.
+if command -v pgrep >/dev/null 2>&1; then
+    TESTS_RUN=$((TESTS_RUN + 1))
+    if pgrep -f '(^|/)loom-daemon$' 2>/dev/null | grep -qx "$decoy7_pid"; then
+        TESTS_PASSED=$((TESTS_PASSED + 1))
+        echo -e "${GREEN}✓${NC} decoy: is matchable by the pgrep fallback pattern (test is not vacuous)"
+    else
+        TESTS_FAILED=$((TESTS_FAILED + 1))
+        echo -e "${RED}✗${NC} decoy: is matchable by the pgrep fallback pattern (test is not vacuous)"
+    fi
+fi
+decoy_out=$( cd "$WORKDIR" && LOOM_LAUNCHD_LABEL="$FAKE_LABEL" bash "$STOP_SCRIPT" 2>&1 )
+decoy_rc=$?
+assert_eq "0" "$decoy_rc" "decoy: scratch-label stop with no PID file exits 0"
+TESTS_RUN=$((TESTS_RUN + 1))
+if launchd_sandbox_decoy_alive "$decoy7_pid"; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} decoy: survives a scratch-label stop (label-blind pgrep tier not taken)"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} decoy: survives a scratch-label stop (label-blind pgrep tier not taken)"
+fi
+TESTS_RUN=$((TESTS_RUN + 1))
+if echo "$decoy_out" | grep -qi "nothing to stop"; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} decoy: reports 'nothing to stop' (does not adopt an unrelated loom-daemon)"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} decoy: reports 'nothing to stop' (does not adopt an unrelated loom-daemon)"
+fi
+kill "$decoy7_pid" 2>/dev/null || true
+
+# 8. Symmetry with loom-daemon-start.sh (#4078): LOOM_DAEMON_LAUNCHD=0 must
+#    disable ALL launchd interaction on the stop side too, so no `launchctl` is
+#    ever invoked. Uses the sandbox stub launchctl (records every call); the
+#    recorded log must stay empty. Darwin-only: on non-Darwin launchd is off
+#    regardless, so there is nothing to prove.
+if [[ "$(uname -s)" == "Darwin" ]]; then
+    SYM_BIN="$WORKDIR/sym-bin"
+    SYM_LOG="$WORKDIR/sym-log"
+    launchd_sandbox_install_stubs "$SYM_BIN" "$SYM_LOG"
+    ( cd "$WORKDIR" && PATH="$SYM_BIN:$PATH" LOOM_DAEMON_LAUNCHD=0 \
+        LOOM_LAUNCHD_LABEL="$FAKE_LABEL" bash "$STOP_SCRIPT" >/dev/null 2>&1 )
+    TESTS_RUN=$((TESTS_RUN + 1))
+    if [[ ! -s "$SYM_LOG/launchctl-invocations.log" ]]; then
+        TESTS_PASSED=$((TESTS_PASSED + 1))
+        echo -e "${GREEN}✓${NC} LOOM_DAEMON_LAUNCHD=0: stop performs no launchctl call at all"
+    else
+        TESTS_FAILED=$((TESTS_FAILED + 1))
+        echo -e "${RED}✗${NC} LOOM_DAEMON_LAUNCHD=0: stop performs no launchctl call at all"
+        echo "  launchctl invocations: $(cat "$SYM_LOG/launchctl-invocations.log")"
+    fi
+    TESTS_RUN=$((TESTS_RUN + 1))
+    if launchd_sandbox_assert_no_production_label "$SYM_LOG/launchctl-invocations.log"; then
+        TESTS_PASSED=$((TESTS_PASSED + 1))
+        echo -e "${GREEN}✓${NC} no launchctl invocation named a com.rjwalters.* label"
+    else
+        TESTS_FAILED=$((TESTS_FAILED + 1))
+        echo -e "${RED}✗${NC} no launchctl invocation named a com.rjwalters.* label"
+    fi
+else
+    echo "  (skipping LOOM_DAEMON_LAUNCHD symmetry test — not Darwin)"
+fi
+
 # ---------- summary ----------
+# Final suite-level decoy guard (#4078): nothing above should have killed the
+# by-name-matchable decoy spawned at suite start.
+TESTS_RUN=$((TESTS_RUN + 1))
+if launchd_sandbox_decoy_alive "$DECOY_PID"; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} suite-level decoy loom-daemon survived the whole stop suite"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} suite-level decoy loom-daemon survived the whole stop suite"
+fi
+
 echo
 echo "Ran $TESTS_RUN tests: $TESTS_PASSED passed, $TESTS_FAILED failed"
 [[ "$TESTS_FAILED" -eq 0 ]]
