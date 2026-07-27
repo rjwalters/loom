@@ -25,7 +25,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal, Protocol, Sequence, runtime_checkable
 
-from loom_tools.common.state import read_json_file
+from loom_tools.common.config_resolver import get_path, resolve_effective_config
 
 EntityType = Literal["issue", "pr"]
 
@@ -114,23 +114,30 @@ def _detect_from_host(host: str, forge_config: dict[str, Any] | None = None) -> 
 
 
 def get_forge_config(cwd: Path | None = None) -> dict[str, Any]:
-    """Read the ``forge`` section from ``.loom/config.json``.
+    """Read the ``forge`` section from the resolved effective config.
 
-    Returns an empty dict if the config file is missing or has no
-    ``forge`` key.
+    Resolves via :func:`loom_tools.common.config_resolver.resolve_effective_config`
+    (private/shared defaults -> legacy ``.loom/config.json`` -> tracked
+    ``.loom-project/project.json`` -> ignored ``.loom-local/local.json``,
+    deep-merged in that precedence order). ``cwd`` is passed straight
+    through as the resolver's ``repo_root`` -- today only the legacy tier
+    (``cwd/.loom/config.json``) is ever populated, so this is byte-for-byte
+    behavior-preserving for every existing repo; the new tiers are purely
+    additive.
+
+    Returns an empty dict if no tier has a ``forge`` key, if the merged
+    ``forge`` value is not an object, or if ``cwd`` isn't inside a
+    directory tree with any config file at all. Never raises.
 
     Args:
-        cwd: Working directory to find ``.loom/config.json``. Defaults
-            to the current directory.
+        cwd: Working directory to resolve config from (treated as the
+            repo root). Defaults to the current directory. Note this is
+            *not* canonicalized to the main checkout when ``cwd`` is a
+            git worktree -- see :func:`get_forge` for that.
     """
-    config_dir = (cwd or Path.cwd()) / ".loom"
-    config_file = config_dir / "config.json"
-
-    data = read_json_file(config_file)
-    if not isinstance(data, dict):
-        return {}
-
-    forge = data.get("forge", {})
+    repo_root = cwd or Path.cwd()
+    effective = resolve_effective_config(repo_root)
+    forge = get_path(effective, "forge", {})
     return forge if isinstance(forge, dict) else {}
 
 
@@ -535,8 +542,54 @@ class ForgeClient(Protocol):
 # ---------------------------------------------------------------------------
 
 
+def _canonical_repo_root(cwd: Path | None) -> Path | None:
+    """Resolve the canonical main-checkout root for forge operations.
+
+    Forge credentials (``forge.gitea.url`` / token / detected type) are a
+    per-repo fact, not a per-worktree one -- the same reasoning #3938
+    applied to the ``.loom/tokens/`` pool. This mirrors
+    ``spawn-claude.sh``'s resolution of that pool: run
+    ``git rev-parse --git-common-dir`` (relative to *cwd*, or the
+    process cwd when *cwd* is ``None``), make the result absolute, and
+    take its parent directory. That directory is the canonical repo root
+    whether invoked from the main checkout or a linked worktree.
+
+    Falls back to returning *cwd* unchanged -- never raises, never fails
+    the caller -- when git is unavailable or *cwd* is not inside a git
+    repository at all (e.g. a bare ``tmp_path`` in a test).
+    """
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "--git-common-dir"],
+            cwd=cwd,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+    except OSError:
+        return cwd
+
+    if result.returncode != 0 or not result.stdout.strip():
+        return cwd
+
+    common_dir = Path(result.stdout.strip())
+    if not common_dir.is_absolute():
+        base = cwd or Path.cwd()
+        common_dir = (base / common_dir).resolve()
+    else:
+        common_dir = common_dir.resolve()
+
+    return common_dir.parent
+
+
 def get_forge(cwd: Path | None = None, *, cached: bool = True) -> ForgeClient:
     """Return a ``ForgeClient`` for the detected forge type.
+
+    Canonicalizes *cwd* to the main-checkout root (see
+    :func:`_canonical_repo_root`) before detecting the forge type or
+    constructing a backend, so forge config/auth always resolves from one
+    place regardless of whether this is called from the main checkout or
+    a linked git worktree (e.g. ``.loom/worktrees/issue-N``).
 
     Uses :func:`detect_forge` to determine which backend to instantiate.
     Imports are lazy to avoid circular dependencies and so that
@@ -549,16 +602,18 @@ def get_forge(cwd: Path | None = None, *, cached: bool = True) -> ForgeClient:
     is undesirable).  Caching can also be disabled globally via the
     ``FORGE_CACHE_DISABLE=1`` environment variable.
     """
-    forge_type = detect_forge(cwd)
+    resolved_cwd = _canonical_repo_root(cwd)
+
+    forge_type = detect_forge(resolved_cwd)
     if forge_type == ForgeType.GITEA:
         from loom_tools.common.gitea import GiteaForge
 
-        inner: ForgeClient = GiteaForge(cwd=cwd)
+        inner: ForgeClient = GiteaForge(cwd=resolved_cwd)
     else:
         # Default: GitHub
         from loom_tools.common.github import GitHubForge
 
-        inner = GitHubForge(cwd=cwd)
+        inner = GitHubForge(cwd=resolved_cwd)
 
     if cached:
         from loom_tools.common.cached_forge import CachedForgeClient

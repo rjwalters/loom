@@ -148,6 +148,93 @@ class TestConstructor:
 
 
 # ===========================================================================
+# Constructor -- real on-disk config resolution (#4061)
+#
+# Every test above (and every other GiteaForge test in this file) patches
+# `loom_tools.common.gitea.get_forge_config` directly, which insulates them
+# from the #4061 migration onto config_resolver -- they would pass whether
+# or not the migration is correct. The tests in this class build a real
+# on-disk config tree and do NOT patch get_forge_config, so they actually
+# exercise resolve_effective_config's tier precedence end-to-end.
+# ===========================================================================
+
+
+class TestConstructorConfigResolutionOnDisk:
+    """GiteaForge construction against a real .loom-project / .loom config tree."""
+
+    def test_project_json_only_supplies_gitea_url(self, tmp_path: Path) -> None:
+        """forge.gitea.url supplied only by .loom-project/project.json
+        (no .loom/config.json at all) is honored end-to-end."""
+        from loom_tools.common.gitea import GiteaForge
+
+        project_dir = tmp_path / ".loom-project"
+        project_dir.mkdir()
+        (project_dir / "project.json").write_text(json.dumps({
+            "forge": {"gitea": {"url": _BASE_URL, "token": _TOKEN}},
+        }))
+
+        forge = GiteaForge(cwd=tmp_path)
+        assert forge._base_url == _BASE_URL
+
+    def test_project_json_overrides_legacy_config_url(self, tmp_path: Path) -> None:
+        """.loom-project/project.json (tier 3) outranks the legacy
+        .loom/config.json (tier 2) for forge.gitea.url."""
+        from loom_tools.common.gitea import GiteaForge
+
+        loom_dir = tmp_path / ".loom"
+        loom_dir.mkdir()
+        (loom_dir / "config.json").write_text(json.dumps({
+            "forge": {"gitea": {"url": "https://legacy.example.com", "token": _TOKEN}},
+        }))
+
+        project_dir = tmp_path / ".loom-project"
+        project_dir.mkdir()
+        (project_dir / "project.json").write_text(json.dumps({
+            "forge": {"gitea": {"url": _BASE_URL}},
+        }))
+
+        forge = GiteaForge(cwd=tmp_path)
+        assert forge._base_url == _BASE_URL
+
+    def test_trailing_slash_stripped_from_project_json_url(self, tmp_path: Path) -> None:
+        from loom_tools.common.gitea import GiteaForge
+
+        project_dir = tmp_path / ".loom-project"
+        project_dir.mkdir()
+        (project_dir / "project.json").write_text(json.dumps({
+            "forge": {"gitea": {"url": _BASE_URL + "/", "token": _TOKEN}},
+        }))
+
+        forge = GiteaForge(cwd=tmp_path)
+        assert forge._base_url == _BASE_URL
+
+    def test_no_config_anywhere_raises_missing_url(self, tmp_path: Path) -> None:
+        """Both ValueErrors keep firing end-to-end (no mocked get_forge_config)."""
+        from loom_tools.common.gitea import GiteaForge
+
+        with (
+            mock.patch.dict(os.environ, {}, clear=True),
+            pytest.raises(ValueError, match="base URL is required"),
+        ):
+            GiteaForge(cwd=tmp_path)
+
+    def test_no_token_anywhere_raises_missing_token(self, tmp_path: Path) -> None:
+        from loom_tools.common.gitea import GiteaForge
+
+        project_dir = tmp_path / ".loom-project"
+        project_dir.mkdir()
+        (project_dir / "project.json").write_text(json.dumps({
+            "forge": {"gitea": {"url": _BASE_URL}},
+        }))
+
+        with (
+            mock.patch.dict(os.environ, {"GITEA_TOKEN": ""}, clear=True),
+            pytest.raises(ValueError, match="API token is required"),
+        ):
+            GiteaForge(cwd=tmp_path)
+
+
+# ===========================================================================
 # Basic Auth mode (issue #3297)
 # ===========================================================================
 
