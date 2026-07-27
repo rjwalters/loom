@@ -28,6 +28,18 @@ _pmd_info()    { echo "  [loom-daemon] $*"; }
 _pmd_ok()      { echo "  [loom-daemon] $*"; }
 _pmd_warn()    { echo "  [loom-daemon] WARNING: $*" >&2; }
 
+# Set by provision_machine_daemon before every successful return so the caller
+# can locate the destination it wrote to WITHOUT re-deriving the
+# LOOM_DAEMON_BIN_DIR default itself (which would duplicate the fallback in two
+# files). This is the "expose enough for the caller to verify" contract from
+# issue #4053: a caller (loom-daemon-update.sh) reads $PROVISIONED_DAEMON_BIN to
+# assert the destination binary is the expected build after provisioning — the
+# direct fix for "provisioning reports success while shipping nothing". It is
+# assigned as a GLOBAL (no `local`) precisely so it survives the function
+# return, and is set even on the version-equality short-circuit path (the very
+# path under suspicion, so it must NOT be the one that leaves it unset).
+PROVISIONED_DAEMON_BIN=""
+
 # provision_machine_daemon <src_bin> [dest_dir]
 #
 # Installs <src_bin> to <dest_dir>/loom-daemon (default: LOOM_DAEMON_BIN_DIR,
@@ -36,10 +48,19 @@ _pmd_warn()    { echo "  [loom-daemon] WARNING: $*" >&2; }
 # soft failure so the caller can note it, but the installer must NOT abort on a
 # non-zero return (a repo can still run the daemon via an explicit
 # LOOM_DAEMON_BIN or an in-repo build).
+#
+# On a successful return (0), sets the global PROVISIONED_DAEMON_BIN to the
+# destination path it resolved (whether it copied or short-circuited), so the
+# caller can verify the destination binary (#4053).
 provision_machine_daemon() {
   local src_bin="${1:-}"
   local dest_dir="${2:-${LOOM_DAEMON_BIN_DIR:-$HOME/.local/bin}}"
   local dest_bin="$dest_dir/loom-daemon"
+  # Publish the resolved destination to the caller up front, so EVERY return
+  # path below (including the short-circuit) communicates where the binary
+  # lives — even the early soft-failure returns (the caller gates on the return
+  # code, so a set-but-unprovisioned value there is harmless).
+  PROVISIONED_DAEMON_BIN="$dest_bin"
 
   if [[ -z "$src_bin" || ! -x "$src_bin" ]]; then
     _pmd_warn "built binary not found at '${src_bin:-<unset>}'; skipping machine-level install"

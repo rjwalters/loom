@@ -53,6 +53,15 @@
 #   0  up to date (no-op) OR rebuild+provision+restart succeeded
 #   1  usage error / not a source checkout / build or provision failure
 #   3  (--check only) update available
+#   4  build verification FAILED: the freshly-built binary's embedded commit
+#      does not match the source HEAD it was built from. This is a BUILD-SYSTEM
+#      defect (a stale baked-in commit — e.g. a build.rs watch-set bug), NOT a
+#      compile failure, and retrying cannot fix it; the script refuses to
+#      provision the mis-stamped binary (#4053).
+#   5  post-provision verification FAILED: the destination binary after a
+#      claimed-successful provision is not the expected build (a silent no-op
+#      roll — "reports success while shipping nothing"). Distinct from both a
+#      compile failure and a provisioning soft-failure (#4053).
 #
 # See also: loom-daemon-start.sh (writes .loom/.daemon.flags), loom-daemon-stop.sh
 # (SIGTERM -> grace -> SIGKILL; in-flight sweeps survive by design — this
@@ -120,6 +129,35 @@ locate_daemon_bin() {
 # "loom-daemon 0.15.0 (commit ab12cd3, built 2026-07-26T12:00:00Z)" -> ab12cd3
 extract_commit() {
     echo "$1" | grep -oE 'commit [0-9a-f]+' | head -n1 | awk '{print $2}'
+}
+
+# verify_destination_binary <dest_path> — assert the provisioned binary at
+# <dest_path> embeds the expected source-HEAD commit (#4053). This is the
+# direct answer to "reports success while shipping nothing": after a provision
+# step returns success, the destination must actually be the freshly-built
+# binary. Exits 5 on mismatch — distinguishable from a compile failure (exit 1)
+# and from a provisioning soft-failure. Skipped only when the source HEAD is
+# unknown (a tarball build with no .git), where there is nothing to compare
+# against. Relies on $SOURCE_COMMIT being resolved (it is, before any build).
+verify_destination_binary() {
+    local dest="$1"
+    if [[ "$SOURCE_COMMIT" == "unknown" ]]; then
+        warn "Source HEAD is unknown (no .git?) — skipping post-provision verification."
+        return 0
+    fi
+    if [[ -z "$dest" || ! -x "$dest" ]]; then
+        err "Post-provision verification FAILED: provisioning reported success but no executable binary was found at the destination ('${dest:-<unknown>}')."
+        exit 5
+    fi
+    local dest_version dest_commit
+    dest_version=$("$dest" --version 2>/dev/null || true)
+    dest_commit=$(extract_commit "$dest_version")
+    if [[ "$dest_commit" != "$SOURCE_COMMIT" ]]; then
+        err "Post-provision verification FAILED: destination binary at $dest embeds commit '${dest_commit:-<none>}' but the expected source HEAD is '$SOURCE_COMMIT'."
+        err "Provisioning reported success yet the destination is NOT the freshly-built binary — a silent no-op roll. This is distinct from a compile failure and from a provisioning soft-failure; refusing to report success."
+        exit 5
+    fi
+    ok "Post-provision verification: destination binary at $dest embeds source HEAD commit ($dest_commit)."
 }
 
 # ---------- args ----------
@@ -301,6 +339,31 @@ if [[ -z "$NEW_BIN" ]]; then
 fi
 ok "Build succeeded: $NEW_BIN"
 
+# ---------- verify the freshly-built binary embeds the expected commit ----------
+# A rebuild can succeed (exit 0) yet bake in a STALE LOOM_DAEMON_GIT_COMMIT — the
+# exact hazard this script exists to close (a build.rs watch-set bug that lets
+# `--version` report the old commit). Provisioning such a binary would "report
+# success while shipping nothing" and, worse, turn any auto-update loop that
+# trusts the baked commit into an infinite rebuild-still-stale retry. So assert
+# the built commit == source HEAD BEFORE provisioning. On mismatch, fail loudly
+# and do NOT provision: this is a build-system defect that retrying cannot fix,
+# distinct from the compile failure handled above (#4053).
+BUILT_VERSION_OUTPUT=$("$NEW_BIN" --version 2>/dev/null || true)
+BUILT_COMMIT=$(extract_commit "$BUILT_VERSION_OUTPUT")
+if [[ "$SOURCE_COMMIT" == "unknown" ]]; then
+    warn "Source HEAD is unknown (no .git?) — skipping built-commit verification (tarball build)."
+elif [[ -z "$BUILT_COMMIT" ]]; then
+    err "Build verification FAILED: the freshly-built binary reports no commit in --version output ('${BUILT_VERSION_OUTPUT:-<empty>}')."
+    err "Refusing to provision a binary that cannot prove what it was built from. This is a build-system defect, not a compile failure."
+    exit 4
+elif [[ "$BUILT_COMMIT" != "$SOURCE_COMMIT" ]]; then
+    err "Build verification FAILED: the freshly-built binary embeds commit '$BUILT_COMMIT' but source HEAD is '$SOURCE_COMMIT'."
+    err "A successful build produced a binary stamped with the WRONG commit (a stale baked-in commit — e.g. a build.rs watch-set bug). Retrying will not fix it; refusing to provision (#4053)."
+    exit 4
+else
+    ok "Build verification: freshly-built binary embeds source HEAD commit ($BUILT_COMMIT)."
+fi
+
 # ---------- provision ----------
 if [[ -n "${LOOM_DAEMON_BIN:-}" ]]; then
     # Explicit operator override — provision directly to that exact path
@@ -313,15 +376,27 @@ if [[ -n "${LOOM_DAEMON_BIN:-}" ]]; then
         err "Failed to provision to LOOM_DAEMON_BIN=$dest"
         exit 1
     fi
+    # This override path has the same "shipped nothing" hazard as the
+    # machine-level path — verify the destination is the freshly-built binary.
+    verify_destination_binary "$dest"
 else
     # shellcheck disable=SC1091
     if [[ -r "$REPO_ROOT/scripts/install/provision-daemon.sh" ]]; then
         source "$REPO_ROOT/scripts/install/provision-daemon.sh"
     fi
     if declare -F provision_machine_daemon >/dev/null 2>&1; then
+        # Hard-fail on provisioning failure: a soft warn here (the pre-#4053
+        # behavior) left the exit code at 0, which is exactly the "reports
+        # success while shipping nothing" defect this issue closes.
         if ! provision_machine_daemon "$NEW_BIN"; then
-            warn "Machine-level provisioning reported an issue (see above); the freshly-built binary is still available at $NEW_BIN"
+            err "Machine-level provisioning FAILED (see above). Refusing to report success; the freshly-built binary is at $NEW_BIN — set LOOM_DAEMON_BIN=$NEW_BIN to use it directly."
+            exit 1
         fi
+        # provision_machine_daemon exports the destination it wrote to (even on
+        # the version-equality short-circuit) — verify that destination is the
+        # expected build so the short-circuit can no longer produce a silent
+        # no-op on a real roll (#4053).
+        verify_destination_binary "${PROVISIONED_DAEMON_BIN:-}"
     else
         warn "scripts/install/provision-daemon.sh not found/sourceable — skipping machine-level provisioning."
         warn "Freshly-built binary: $NEW_BIN (set LOOM_DAEMON_BIN=$NEW_BIN to use it directly)"

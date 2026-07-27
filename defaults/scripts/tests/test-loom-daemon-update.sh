@@ -264,6 +264,19 @@ else
     echo -e "${RED}✗${NC} LOOM_DAEMON_BIN path was provisioned with the freshly-built binary"
 fi
 
+# Happy-path roll must self-verify both the built binary and the destination
+# (#4053): the short-circuit can no longer produce a silent no-op on a real roll.
+TESTS_RUN=$((TESTS_RUN + 1))
+if grep -qi 'Build verification' "$W5/update.log" \
+    && grep -qi 'Post-provision verification' "$W5/update.log"; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} happy-path roll self-verifies built commit AND destination binary"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} happy-path roll self-verifies built commit AND destination binary"
+    echo "  update.log: $(cat "$W5/update.log" 2>/dev/null)"
+fi
+
 # Clean up the restarted daemon (find it via the PID file this run wrote).
 if [[ -f "$W5/.loom/.daemon.pid" ]]; then
     kill "$(cat "$W5/.loom/.daemon.pid" 2>/dev/null)" 2>/dev/null || true
@@ -400,6 +413,89 @@ mkdir -p "$W9/.loom"
 ( cd "$W9" && PATH="$TEST_PATH" bash "$UPDATE_SCRIPT" --check >/dev/null 2>&1 )
 rc9=$?
 assert_eq "1" "$rc9" "refuses to run when loom-daemon/Cargo.toml is absent"
+
+# ============================================================
+# 10. Build verification: a freshly-built binary whose embedded
+#     commit does NOT match source HEAD (a stale baked-in commit,
+#     e.g. from a build.rs watch-set bug) -> exit 4 and NO provision.
+#     This is the self-verifying rebuild the whole issue is about:
+#     a successful compile that ships the wrong commit is refused,
+#     distinguishably from a compile failure (#4053).
+# ============================================================
+W10="$BASE_WORKDIR/w10"
+new_fixture "$W10"
+INSTALLED10="$W10/installed/loom-daemon"
+mkdir -p "$W10/installed"
+write_fake_daemon "$INSTALLED10" "deadbee" "$W10/old-marker"   # stale installed
+# The freshly-"built" binary reports a WRONG commit (NOT source HEAD): simulates
+# a build.rs watch-set defect that bakes a stale commit into a successful build.
+NEW_FAKE10="$W10/new-fake-daemon"
+write_fake_daemon "$NEW_FAKE10" "badc0de" "$W10/new-marker"
+out10=$( cd "$W10" && PATH="$TEST_PATH" LOOM_DAEMON_BIN="$INSTALLED10" NEW_FAKE_BIN_SRC="$NEW_FAKE10" \
+    bash "$UPDATE_SCRIPT" 2>&1 )
+rc10=$?
+assert_eq "4" "$rc10" "stale baked-in commit (build-system defect) exits 4"
+TESTS_RUN=$((TESTS_RUN + 1))
+if "$INSTALLED10" --version 2>/dev/null | grep -q "deadbee"; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} build-commit mismatch does NOT provision (destination left untouched)"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} build-commit mismatch does NOT provision (destination left untouched)"
+fi
+TESTS_RUN=$((TESTS_RUN + 1))
+if echo "$out10" | grep -qi 'Build verification FAILED'; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} build-commit mismatch is reported distinguishably from a compile failure"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} build-commit mismatch is reported distinguishably from a compile failure"
+fi
+
+# ============================================================
+# 11. Post-provision verification: a provision step that reports
+#     SUCCESS but leaves the destination stale (the exact "reports
+#     success while shipping nothing" hazard) -> exit 5. Exercises
+#     the provision_machine_daemon branch via a fake provisioner
+#     that returns 0 and points PROVISIONED_DAEMON_BIN at a stale
+#     binary — proving the short-circuit can no longer silently
+#     no-op a real roll, and that the failure is distinguishable
+#     from the pre-existing soft warn (#4053, findings 3 & 4).
+# ============================================================
+W11="$BASE_WORKDIR/w11"
+new_fixture "$W11"
+HEAD11="$(cd "$W11" && git rev-parse --short HEAD)"
+# The freshly-"built" binary reports the CORRECT source HEAD (passes build
+# verification), so the failure below is unambiguously post-provision.
+NEW_FAKE11="$W11/new-fake-daemon"
+write_fake_daemon "$NEW_FAKE11" "$HEAD11" "$W11/new-marker"
+# A STALE destination binary the fake provisioner will dishonestly point at.
+STALE_DEST11="$W11/staledest/loom-daemon"
+mkdir -p "$W11/staledest"
+write_fake_daemon "$STALE_DEST11" "abc0123" "$W11/stale-marker"
+# Fake provision-daemon.sh: reports success but leaves the destination stale.
+mkdir -p "$W11/scripts/install"
+cat > "$W11/scripts/install/provision-daemon.sh" <<EOF
+provision_machine_daemon() {
+    PROVISIONED_DAEMON_BIN="$STALE_DEST11"
+    return 0
+}
+EOF
+# No LOOM_DAEMON_BIN -> the provision_machine_daemon branch. No resolvable
+# installed binary -> UPDATE_NEEDED is true -> the fake cargo "builds" NEW_FAKE11.
+out11=$( cd "$W11" && PATH="$TEST_PATH" NEW_FAKE_BIN_SRC="$NEW_FAKE11" \
+    bash "$UPDATE_SCRIPT" 2>&1 )
+rc11=$?
+assert_eq "5" "$rc11" "provision reports success but ships a stale destination -> exit 5"
+TESTS_RUN=$((TESTS_RUN + 1))
+if echo "$out11" | grep -qi 'Post-provision verification FAILED'; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} silent no-op roll is caught and reported distinguishably"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} silent no-op roll is caught and reported distinguishably"
+    echo "  output: $out11"
+fi
 
 # ---------- summary ----------
 echo
