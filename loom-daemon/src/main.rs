@@ -6,6 +6,7 @@ use loom_daemon::health_monitor;
 use loom_daemon::ipc::IpcServer;
 use loom_daemon::main_health_gate;
 use loom_daemon::metrics_collector;
+use loom_daemon::role_runner;
 use loom_daemon::role_validation;
 use loom_daemon::self_update;
 use loom_daemon::sweep_registry::{self, SweepRegistry, SweepRegistryConfig};
@@ -764,6 +765,47 @@ async fn main() -> Result<()> {
             );
             None
         };
+
+    // Autonomous periodic support-role runner (Issue #4015): dispatches the
+    // standalone support roles (Champion, Curator, Judge, Auditor, Guide)
+    // host-side through `spawn-claude.sh` on their own per-role cadence,
+    // drawing from the SAME rotated, health-ranked token pool sweeps already
+    // use via `sweep_registry` — instead of relying solely on the GitHub
+    // Actions cron workflows (`.github/workflows/loom-*.yml`), which
+    // authenticate with a single static `CLAUDE_API_KEY` secret with no
+    // rotation and no health-awareness. Opt-in via `LOOM_ROLE_RUNNER` (or
+    // `autonomous.roleRunner.enabled=true`) — like the work-finder and
+    // main-health-gate loops above, this has dispatch-affecting side effects
+    // (each tick is a full `claude -p "/<role>"` session that can mutate
+    // issues/PRs), so an absent config leaves the daemon's behavior
+    // byte-for-byte unchanged. The Actions workflows remain a supported
+    // fallback for deployments with no always-on daemon. One task per
+    // enabled role is spawned, each on its own multi-workspace loop
+    // (`role_runner::spawn_multi_role_task`) — mirrors the token-ranking
+    // refresh loop's re-fan-out-every-tick shape.
+    let role_runner_config = role_runner::read_role_runner_config(&sweep_workspace);
+    let _role_runner_handles = if role_runner::resolve_enabled(&role_runner_config) {
+        let roles = role_runner::resolve_roles(&role_runner_config);
+        log::info!(
+            "role_runner: enabled (multi-workspace, {} role(s): {})",
+            roles.len(),
+            roles.iter().map(|r| r.name).collect::<Vec<_>>().join(", ")
+        );
+        let handles: Vec<_> = roles
+            .iter()
+            .map(|spec| {
+                let interval = role_runner::resolve_interval_for_role(spec, &role_runner_config);
+                log::info!("role_runner: {} interval={}s", spec.name, interval.as_secs());
+                role_runner::spawn_multi_role_task(*spec, sweep_workspace.clone(), interval)
+            })
+            .collect();
+        Some(handles)
+    } else {
+        log::debug!(
+            "role_runner: disabled (set LOOM_ROLE_RUNNER=1 or autonomous.roleRunner.enabled=true to enable)"
+        );
+        None
+    };
 
     // Durable watch-monitor loop (Issue #3971): the daemon polls the forge for
     // the terminal state of operator-registered issue/PR watches

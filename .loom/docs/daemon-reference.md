@@ -1233,6 +1233,11 @@ concurrency ceiling 5" and share it with the team:
     "mainHealthGate": {
       "enabled": true
     },
+    "roleRunner": {
+      "enabled": true,
+      "roles": ["champion", "curator", "judge", "auditor", "guide"],
+      "intervalSecs": 300
+    },
     "watchMonitor": {
       "enabled": true,
       "intervalSecs": 120,
@@ -1270,6 +1275,9 @@ exactly like `main_health_gate::read_build_gate_config`.
 | `autonomous.workFinder.quarantine.instaCrashSecs` | `LOOM_WORK_FINDER_QUARANTINE_INSTA_CRASH_SECS` | `60` | Checkpoint-less death within this window of dispatch counts as an insta-crash. Zero/invalid → default |
 | `autonomous.perTokenConcurrency` | `LOOM_PER_TOKEN_CONCURRENCY` | `2` | Concurrent sweeps **per healthy token** in the cap (#3947). Zero/invalid → default; clamped to a floor of 1 |
 | `autonomous.mainHealthGate.enabled` | `LOOM_MAIN_HEALTH_GATE` | `false` | Gate loop on/off |
+| `autonomous.roleRunner.enabled` | `LOOM_ROLE_RUNNER` | `false` | Periodic standalone support-role runner on/off (#4015) |
+| `autonomous.roleRunner.roles` | *(config only)* | all 5 roles | Subset of `champion`/`curator`/`judge`/`auditor`/`guide` to dispatch; explicit empty array runs none |
+| `autonomous.roleRunner.intervalSecs` | `LOOM_ROLE_RUNNER_INTERVAL_SECS` | per-role built-in (5–15 min) | Uniform override applied to every enabled role's cadence |
 | `autonomous.watchMonitor.enabled` | `LOOM_WATCH_MONITOR` | `true` | Durable operator-watch monitor loop (#3971). Default-on; no dispatch side effect, zero forge calls until a watch is registered |
 | `autonomous.watchMonitor.intervalSecs` | `LOOM_WATCH_MONITOR_INTERVAL_SECS` | `120` | Watch poll cadence. Zero/invalid → default |
 | `autonomous.watchMonitor.expirySecs` | `LOOM_WATCH_MONITOR_EXPIRY_SECS` | `86400` | Give-up window for an unresolved watch; `0` disables expiry |
@@ -1473,6 +1481,84 @@ the workspace registry each tick and refreshes every registered repo's own
 pool, gated by that repo's own config (an empty registry reduces to the single
 daemon workspace). See `loom-daemon/src/token_ranking_refresh.rs` for the
 implementation.
+
+### Autonomous periodic support-role runner (#4015)
+
+Before this loop, the periodic **standalone** support roles — Champion,
+Curator, Judge, Auditor, Guide — ran ONLY via GitHub Actions cron
+(`.github/workflows/loom-*.yml`, Phase 2a of epic #3372/#3375), authenticating
+with a single static `CLAUDE_API_KEY` secret with no rotation and no
+health-awareness. Sweeps, by contrast, always ran host-side via
+`sweep_registry`, drawing from the rotated, health-ranked token pool. That
+split meant an operator provisioned *two* separate token systems for the same
+underlying `claude -p "/role"` invocation, and a deployment with no
+`CLAUDE_API_KEY` secret had its entire backlog-grooming pipeline silently dead
+even while sweeps ran fine on the rotated pool.
+
+**Scope.** This targets only the *standalone* periodic roles — the ones the
+GitHub Actions cron table below lists. The *per-sweep* lifecycle roles
+(Judge/Doctor/Champion-merge dispatched **inside** a `/loom:sweep`) already run
+host-side on the rotated pool via `sweep_registry` and are unaffected.
+
+**What it does.** Per enabled role, on its own cadence (defaults mirror the
+commented-out `cron:` schedules in `.github/workflows/loom-*.yml`: champion
+10m, curator 5m, judge 5m, auditor 10m, guide 15m), the daemon shells out to
+`spawn-claude.sh -p "/<role>" --dangerously-skip-permissions` in the target
+workspace — the identical launcher `sweep_registry` uses for sweep children —
+so the role draws a token via the same 3-tier selection (ranking → allowlist →
+random) and appears in the same `.loom/tokens/.bad_tokens` / `.ranking`
+accounting as sweeps. Output is appended to
+`.loom/logs/role-<role>.log`.
+
+**Opt-in, unlike the token-ranking refresh above.** Each tick is a full
+`claude -p` session that can mutate issues/PRs on the forge (dispatch-affecting
+side effects, like the work finder / main-health gate), so an absent config
+leaves the daemon's behavior byte-for-byte unchanged:
+
+```json
+{
+  "autonomous": {
+    "roleRunner": {
+      "enabled": true,
+      "roles": ["champion", "curator", "judge", "auditor", "guide"],
+      "intervalSecs": 300
+    }
+  }
+}
+```
+
+| Env var | Config key | Precedence | Default |
+|---------|-----------|------------|---------|
+| `LOOM_ROLE_RUNNER` | `autonomous.roleRunner.enabled` | env > config > default | `false` (off) |
+| `LOOM_ROLE_RUNNER_INTERVAL_SECS` | `autonomous.roleRunner.intervalSecs` | env > config > default | per-role built-in (see above) |
+| — | `autonomous.roleRunner.roles` | config only | all five roles |
+
+`roles` restricts the dispatched subset (an explicit empty array runs none;
+unknown names are ignored with a warning). `intervalSecs` — both the env var
+and the config key — is a single override applied *uniformly* to every
+enabled role's cadence; per-role cadence diversity otherwise comes from each
+role's own built-in default.
+
+**GitHub Actions workflows remain a supported fallback** for deployments with
+no always-on daemon — this loop does not remove them, it gives an always-on
+daemon host a better primary path. Running both simultaneously is harmless
+(each is an independent `claude -p "/<role>"` invocation against the shared
+forge state; the state machine's label-based coordination is what prevents
+double-work, not a single dispatcher).
+
+**Never fatal, first tick skipped.** A failed invocation (script missing,
+non-zero exit, timeout — role invocations are killed via their process group
+after a generous default 30-minute timeout, mirroring `sweep_registry`'s
+group-signal cancel path) is logged and skipped; the next tick tries again.
+Unlike the read-only token-ranking refresh, this loop skips its first tick
+(mirrors the work finder / main-health gate) so several role loops starting at
+daemon boot don't burst several `claude` sessions at once.
+
+**Multi-workspace.** Like the other autonomous loops, each role's task
+re-reads the workspace registry every tick and dispatches into every
+registered repo that has that role enabled in its own config (an empty
+registry reduces to the single daemon workspace). See
+`loom-daemon/src/role_runner.rs` for the implementation.
 
 ### Durable operator watches (#3971)
 

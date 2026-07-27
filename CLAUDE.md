@@ -111,6 +111,7 @@ The Rust `loom-daemon` binary is the Tier 2 dispatch backend. It exposes a Unix-
 
 - **Autonomous work finder** (#3810, `LOOM_WORK_FINDER` / `autonomous.workFinder`): polls the forge for open, already-approved `loom:issue` items and auto-dispatches sweeps, with work-driven concurrency bounded by `min(available work, healthy tokens × perTokenConcurrency, free disk, cpu/load headroom, maxConcurrent)` (#3811, per-token factor #3947 — default 2, `LOOM_PER_TOKEN_CONCURRENCY` / `autonomous.perTokenConcurrency`) and a reactive main-health backstop (#3812, `LOOM_MAIN_HEALTH_GATE` / `autonomous.mainHealthGate`) that halts dispatch when `main` goes red. Enable/tune from the `autonomous` block in `.loom/config.json` (precedence **env > config > default**) and manage the raw process with `loom-daemon-start.sh` / `loom-daemon-stop.sh` — see [Autonomous work finder](.loom/docs/daemon-reference.md#autonomous-work-finder-3810) and §Operability, plus "Daemon Configuration (Tier 2)" below.
 - **Epic supervisor** (#3842): drives every open `loom:epic` issue through a derived-state fork-join model with a phase-join barrier, serializing child-issue creation behind the #3707 issue-creation mutex on a dedicated off-runtime OS thread — see [Epic supervisor](.loom/docs/daemon-reference.md#epic-supervisor-3842).
+- **Periodic support-role runner** (#4015, `LOOM_ROLE_RUNNER` / `autonomous.roleRunner`): dispatches the standalone support roles (Champion, Curator, Judge, Auditor, Guide) host-side via `spawn-claude.sh` on their own per-role cadence, drawing from the same rotated, health-ranked token pool sweeps already use — instead of relying solely on the GitHub Actions cron workflows below, which authenticate with a single static `CLAUDE_API_KEY` secret with no rotation. See [Autonomous periodic support-role runner](.loom/docs/daemon-reference.md#autonomous-periodic-support-role-runner-4015).
 
 For full surface documentation — IPC request/response variants, event-bus internals, registry behaviour, reaper semantics — see [`.loom/docs/daemon-reference.md`](.loom/docs/daemon-reference.md).
 
@@ -118,9 +119,11 @@ For full surface documentation — IPC request/response variants, event-bus inte
 
 > **Legacy spawn loop (removed)**: `defaults/scripts/spawn-loop.sh` (Phase 1, #3374) was **removed in v0.11.0**. Use `mcp__loom__dispatch_sweep` against `loom-daemon` instead. See [`docs/migration/v0.10.0-shepherd-deprecation.md`](docs/migration/v0.10.0-shepherd-deprecation.md).
 
-### 4. Scheduled Support Roles (opt-in)
+### 4. Scheduled Support Roles
 
-GitHub Actions workflows under `.github/workflows/loom-*.yml` run the periodic support roles (Champion, Curator, Judge, Auditor, Guide) on cron schedules (#3375). Each workflow checks out the repo, installs the Claude CLI, and runs `claude -p "/<role>" --dangerously-skip-permissions` for one tick of work — no Loom-side state file, no long-running process.
+**Preferred path (daemon host, #4015):** when `loom-daemon` is running, enable the daemon-native periodic support-role runner (`LOOM_ROLE_RUNNER` / `autonomous.roleRunner.enabled=true` in `.loom/config.json`) instead of the GitHub Actions cron below — it dispatches Champion/Curator/Judge/Auditor/Guide host-side via `spawn-claude.sh`, drawing from the same rotated, health-ranked token pool sweeps use, so there is no separate `CLAUDE_API_KEY` secret to provision and no static-key exhaustion with no fallback. See [Autonomous periodic support-role runner](.loom/docs/daemon-reference.md#autonomous-periodic-support-role-runner-4015).
+
+**Fallback (no always-on daemon, opt-in):** GitHub Actions workflows under `.github/workflows/loom-*.yml` run the periodic support roles (Champion, Curator, Judge, Auditor, Guide) on cron schedules (#3375). Each workflow checks out the repo, installs the Claude CLI, and runs `claude -p "/<role>" --dangerously-skip-permissions` for one tick of work — no Loom-side state file, no long-running process. This is the degraded mode: a single static `CLAUDE_API_KEY` secret with no rotation and no health-awareness (an exhausted/rate-limited key has no fallback, unlike the daemon path above).
 
 | Workflow | Role | Schedule (commented) |
 |----------|------|----------------------|
@@ -343,7 +346,8 @@ The Rust `loom-daemon` binary is the load-bearing Tier 2 dispatch backend. It is
   "autonomous": {
     "perTokenConcurrency": 2,
     "workFinder": { "enabled": true, "intervalSecs": 60, "maxConcurrent": 5 },
-    "mainHealthGate": { "enabled": true }
+    "mainHealthGate": { "enabled": true },
+    "roleRunner": { "enabled": true, "roles": ["champion", "curator", "judge", "auditor", "guide"] }
   }
 }
 ```

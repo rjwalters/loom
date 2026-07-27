@@ -226,9 +226,11 @@ For the full surface — IPC request/response variants, event-bus internals, reg
 
 > **Legacy spawn loop (removed)**: `defaults/scripts/spawn-loop.sh` (Phase 1, #3374) was **removed in v0.11.0**. Use `mcp__loom__dispatch_sweep` against `loom-daemon` instead. See [the migration guide](../docs/migration/v0.10.0-shepherd-deprecation.md).
 
-### Scheduled Support Roles (Phase 2a, opt-in)
+### Scheduled Support Roles (Phase 2a, opt-in; daemon-native alternative #4015)
 
-GitHub Actions workflows under `.github/workflows/loom-*.yml` provide a daemon-free way to run the periodic support roles (Champion, Curator, Judge, Auditor, Guide) on cron schedules that match the daemon's historical intervals (Phase 2a of #3372, see #3375). Each workflow checks out the repo, installs the Claude CLI, and runs `claude -p "/<role>" --dangerously-skip-permissions` for one tick of work — no Loom-side state file, no long-running process.
+**Preferred when `loom-daemon` runs continuously (#4015):** enable the daemon-native periodic support-role runner (`LOOM_ROLE_RUNNER` / `autonomous.roleRunner.enabled=true`) instead of the GitHub Actions cron below. It dispatches Champion/Curator/Judge/Auditor/Guide host-side via `spawn-claude.sh` on their own per-role cadence, drawing from the same rotated, health-ranked token pool sweeps already use — so there is no separate `CLAUDE_API_KEY` secret to provision, and an exhausted/rate-limited account is skipped in favor of a healthy one instead of stalling the whole pipeline. See [Autonomous periodic support-role runner](.loom/docs/daemon-reference.md#autonomous-periodic-support-role-runner-4015).
+
+**Fallback for daemon-less deployments:** GitHub Actions workflows under `.github/workflows/loom-*.yml` provide a daemon-free way to run the periodic support roles (Champion, Curator, Judge, Auditor, Guide) on cron schedules that match the daemon's historical intervals (Phase 2a of #3372, see #3375). Each workflow checks out the repo, installs the Claude CLI, and runs `claude -p "/<role>" --dangerously-skip-permissions` for one tick of work — no Loom-side state file, no long-running process. This is the degraded mode documented above: a single static `CLAUDE_API_KEY` secret with no rotation and no health-awareness.
 
 | Workflow | Role | Schedule (commented) |
 |----------|------|----------------------|
@@ -688,7 +690,8 @@ See [`.loom/docs/daemon-reference.md`](.loom/docs/daemon-reference.md) for the w
   "autonomous": {
     "perTokenConcurrency": 2,
     "workFinder": { "enabled": true, "intervalSecs": 60, "maxConcurrent": 5 },
-    "mainHealthGate": { "enabled": true }
+    "mainHealthGate": { "enabled": true },
+    "roleRunner": { "enabled": true, "roles": ["champion", "curator", "judge", "auditor", "guide"] }
   }
 }
 ```
@@ -732,6 +735,7 @@ Loom version.
 
 - The autonomous **work finder** (above, `LOOM_WORK_FINDER` / `autonomous.workFinder`), when enabled, *does* poll the forge for open, already-approved `loom:issue` items and dispatch them, with work-driven concurrency bounded by `min(available work, healthy tokens × perTokenConcurrency, free disk, cpu/load headroom, maxConcurrent)` (#3811, per-token factor #3947 — default 2, `LOOM_PER_TOKEN_CONCURRENCY` / `autonomous.perTokenConcurrency`) and a reactive main-health backstop (#3812, `LOOM_MAIN_HEALTH_GATE`) that halts dispatch when `main` goes red. See [Autonomous work finder](.loom/docs/daemon-reference.md#autonomous-work-finder-3810).
 - The **epic supervisor** (#3842), when enabled, drives every open `loom:epic` issue through a derived-state fork-join lifecycle (decompose → expand → phase-join barrier → close), serializing child-issue creation behind the #3707 issue-creation mutex on a dedicated off-runtime OS thread. See [Epic supervisor](.loom/docs/daemon-reference.md#epic-supervisor-3842).
+- The **periodic support-role runner** (#4015, `LOOM_ROLE_RUNNER` / `autonomous.roleRunner`), when enabled, dispatches the standalone support roles (Champion, Curator, Judge, Auditor, Guide) host-side via `spawn-claude.sh` on their own per-role cadence, drawing from the same rotated, health-ranked token pool sweeps use instead of a static GitHub Actions `CLAUDE_API_KEY` secret. See [Autonomous periodic support-role runner](.loom/docs/daemon-reference.md#autonomous-periodic-support-role-runner-4015).
 
 **Multi-repo workspace registry + priority tiers**: the one-per-machine daemon manages a set of repos listed in `~/.loom/workspaces.json`, edited with `loom-daemon workspace add|remove|list` (hot-applied — a running daemon re-reads the file each tick). Each entry carries an optional `priority` integer (**lower = higher priority**, default `100`; a pre-#3946 entry with no `priority` parses as `100`), set via `loom-daemon workspace add <path> --priority N` or `loom-daemon workspace set-priority <path> N` (#3946). The autonomous work-finder and epic supervisor order dispatch across repos by **(workspace priority asc, `loom:urgent` first, issue age asc)** and fill the single shared concurrency budget in that order, so higher-priority tool repos drain before a deep product/canary backlog. Strict priority is intentional (v1) — a permanently-full higher tier starves lower tiers; `loom-daemon status` shows each repo's tier. See [Per-workspace priority tiers](.loom/docs/daemon-reference.md#per-workspace-priority-tiers-3946).
 
