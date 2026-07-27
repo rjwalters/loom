@@ -365,6 +365,94 @@ def test_stale_ranking_all_rate_limited_falls_back_rather_than_hard_fail(tmp_pat
     assert sel.mode == "random"
 
 
+# ---------- allowlist-of-known-good status (issue #3991) ----------
+#
+# The regression: tier-1 selection used a two-status *denylist*
+# (exhausted/blocked) that silently treated rate_limited — the probe's most
+# severe live verdict — as eligible, handing out dead tokens. The fix is an
+# *allowlist* of known-good statuses, so any status not positively known good
+# (rate_limited today, or *any future probe status*) is excluded from the
+# preferred pass by default rather than leaking through fail-open.
+
+
+def test_ranking_explicit_available_status_is_selected(tmp_path):
+    """An explicit ``available`` status (not just empty) is treated as healthy."""
+    workspace = _make_workspace(tmp_path, {"tired": "kt", "fresh": "kf"})
+    _write_ranking(workspace, ["tired|rate_limited", "fresh|available"])
+    for seed in range(30):
+        sel = select_token(workspace, rng=random.Random(seed))
+        assert sel.name == "fresh"
+        assert sel.mode == "ranked"
+
+
+def test_ranking_skips_unknown_future_status_while_available_exists(tmp_path):
+    """A status the probe doesn't emit today must not be silently eligible.
+
+    Fail-safe allowlist (issue #3991): a denylist would treat any new status
+    (e.g. a future ``throttled``) as eligible — exactly the fail-open bug that
+    let ``rate_limited`` through. The allowlist excludes it from the preferred
+    pass so long as a known-good account exists.
+    """
+    workspace = _make_workspace(tmp_path, {"weird": "kw", "fresh": "kf"})
+    _write_ranking(workspace, ["weird|throttled", "fresh|available"])
+    for seed in range(30):
+        sel = select_token(workspace, rng=random.Random(seed))
+        assert sel.name == "fresh"
+        assert sel.mode == "ranked"
+
+
+def test_ranking_falls_back_to_unknown_status_when_pool_otherwise_empty(tmp_path):
+    """An all-unknown-status ranked pool still dispatches rather than stalling.
+
+    The empty-pool guard is preserved: excluding non-healthy statuses must not
+    hard-fail a live pool. exhausted/blocked remain hard-excluded, but a novel
+    status is admitted in the fallback pass.
+    """
+    workspace = _make_workspace(tmp_path, {"a": "ka", "b": "kb"})
+    _write_ranking(workspace, ["a|throttled", "b|throttled"])
+    sel = select_token(workspace, rng=random.Random(0))
+    assert sel.name in ("a", "b")
+    assert sel.mode == "ranked"
+
+
+def test_ranking_unknown_status_never_beats_exhausted_hard_exclusion(tmp_path):
+    """Even in the fallback pass, exhausted/blocked stay hard-excluded.
+
+    A pool of {exhausted, unknown-status} must fall back to the unknown-status
+    account, never the exhausted one — the fallback pass loosens the healthy
+    allowlist but never the exhausted/blocked hard-exclusion.
+    """
+    workspace = _make_workspace(tmp_path, {"dead": "kd", "weird": "kw"})
+    _write_ranking(workspace, ["dead|exhausted", "weird|throttled"])
+    for seed in range(30):
+        sel = select_token(workspace, rng=random.Random(seed))
+        assert sel.name == "weird"
+        assert sel.mode == "ranked"
+
+
+def test_stale_ranking_excludes_unknown_status_from_random(tmp_path):
+    """Stale-ranking advisory exclusions are allowlist-based too (issue #3991).
+
+    An account with a non-healthy stale status — including a future/unknown one
+    — is advisory-excluded from the lower tiers while a healthy account exists.
+    """
+    workspace = _make_workspace(tmp_path, {"weird": "kw", "fresh": "kf"})
+    _write_stale_ranking(workspace, ["weird|throttled", "fresh|available"], 11 * 60)
+    for seed in range(20):
+        sel = select_token(workspace, rng=random.Random(seed))
+        assert sel.name == "fresh"
+        assert sel.mode == "random"
+
+
+def test_stale_ranking_all_unknown_status_falls_back_rather_than_hard_fail(tmp_path):
+    """A stale ranking that is entirely unknown-status must not stall dispatch."""
+    workspace = _make_workspace(tmp_path, {"a": "ka", "b": "kb"})
+    _write_stale_ranking(workspace, ["a|throttled", "b|throttled"], 30 * 60)
+    sel = select_token(workspace, rng=random.Random(0))
+    assert sel.name in ("a", "b")
+    assert sel.mode == "random"
+
+
 # ---------- ranking spread (issue #3736 / rotation #3909) ----------
 
 
