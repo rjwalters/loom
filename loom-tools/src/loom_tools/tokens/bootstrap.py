@@ -605,6 +605,82 @@ def write_index(
 _HOME_UNSET = object()
 
 
+def _check_monitor_divergence(valid: list[Account]) -> None:
+    """Warn when the merged bootstrap set disagrees with claude-monitor's live store.
+
+    The incident this guards against (#4030): claude-monitor re-authenticated
+    every account, writing fresh tokens to ``usage.db`` but never touching
+    ``accounts.env`` — the static snapshot ``bootstrap`` reads. ``bootstrap
+    --force`` then faithfully rewrote the *revoked* tokens and reported
+    ``written=N`` while the pool was dead; the only diagnosis was hand-comparing
+    sha256 fingerprints between two files. This surfaces that condition
+    automatically and names the remedy.
+
+    Compares what bootstrap is about to write (``valid``) against the live store,
+    joining on lowercased email (matching :func:`merge_accounts` and
+    ``read_monitor_credentials``), and warns on the **intersection** whose
+    fingerprints differ — never auto-switching sources.
+
+    Read-only and non-fatal by contract:
+
+    * **Absent store** (no claude-monitor / no ``usage.db``) — silent. A host
+      without claude-monitor is a fully-supported configuration.
+    * **Unreadable / locked / older-schema store** — silent. The reader
+      normalizes every such failure into :class:`MonitorDbUnavailable`.
+    * **Membership-only difference** (an email present on only one side) —
+      silent. A repo-local account absent from claude-monitor, or a monitor
+      account the pool legitimately pins out, is normal; warning on it would fire
+      on healthy hosts and train operators to ignore the message — the exact
+      failure this check exists to fix.
+
+    No secret material is printed — emails and 8-char fingerprints only,
+    consistent with ``index.json``.
+    """
+    # Deferred import: ``monitor_db`` imports from this module (``Account``,
+    # ``materialize_accounts``, ...), so a top-level import here would create an
+    # import cycle and fail at load time. Keep this import function-local — do
+    # NOT hoist it to the module top (#4030).
+    try:
+        from loom_tools.tokens.monitor_db import (
+            MonitorDbUnavailable,
+            read_monitor_credentials,
+        )
+    except ImportError:
+        return
+
+    try:
+        creds = read_monitor_credentials()
+    except MonitorDbUnavailable:
+        # No store, or an unreadable / locked / older-schema one — degrade to
+        # silence. Detection must never fail an otherwise-successful bootstrap.
+        return
+
+    live_fp = {c.email.strip().lower(): fingerprint(c.token) for c in creds}
+    diverged: list[tuple[str, str, str]] = []
+    for acct in valid:
+        live = live_fp.get(acct.email.strip().lower())
+        if live is None:
+            continue  # membership difference — not a key-divergence signal
+        env_fp = fingerprint(acct.key)
+        if live != env_fp:
+            diverged.append((acct.email, env_fp, live))
+
+    if not diverged:
+        return
+
+    detail = ", ".join(
+        f"{email} (merged fp={merged_fp}, live fp={monitor_fp})"
+        for email, merged_fp, monitor_fp in diverged
+    )
+    log_warning(
+        f"{len(diverged)} account(s) in the merged bootstrap sources disagree "
+        f"with claude-monitor's live store (usage.db): {detail}. The snapshot in "
+        f"accounts.env is stale, not the on-disk tokens — `--force` will NOT fix "
+        f"this, it rewrites the same stale values. Run "
+        f"`loom-tokens import-from-monitor --force` to adopt the live credentials."
+    )
+
+
 def bootstrap_tokens(
     repo_root: Path,
     *,
@@ -791,5 +867,12 @@ def bootstrap_tokens(
         log_success(
             f"Bootstrapped {len(result.written)} token(s) into {tokens_dir}"
         )
+
+    # #4030: detection for the stale-snapshot incident. Runs last so the warning
+    # is the final line the operator sees, and runs under --dry-run too (it is
+    # read-only detection — suppressing it there would hide the divergence from
+    # the exact command used to inspect state). Silent when no claude-monitor
+    # store is present; never fails the bootstrap.
+    _check_monitor_divergence(valid)
 
     return result

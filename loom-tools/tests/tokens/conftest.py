@@ -12,7 +12,94 @@ to ``bootstrap_tokens``.
 
 from __future__ import annotations
 
+import sqlite3
+from pathlib import Path
+
 import pytest
+
+# --------------------------------------------------------------------------
+# claude-monitor usage.db fixtures (shared by test_monitor_db and
+# test_bootstrap). A minimal stand-in for claude-monitor's SQLite store, kept
+# here so both modules build fake stores through one builder rather than two
+# hand-rolled copies drifting apart.
+# --------------------------------------------------------------------------
+
+_SCHEMA = """
+CREATE TABLE accounts (
+    id TEXT PRIMARY KEY,
+    account_name TEXT,
+    email TEXT,
+    plan TEXT
+);
+CREATE TABLE oauth_credentials (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    account_id TEXT,
+    label TEXT NOT NULL,
+    access_token TEXT,
+    expires_at INTEGER,
+    is_active INTEGER DEFAULT 1
+);
+"""
+
+
+def make_monitor_db(path: Path, rows: list[dict]) -> Path:
+    """Build a usage.db stand-in.
+
+    Each row: ``label``, ``token``; optional ``email`` (creates a joined
+    ``accounts`` row), ``is_active`` (default 1), ``expires_at``.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(path)
+    conn.executescript(_SCHEMA)
+    for n, row in enumerate(rows, start=1):
+        account_id = None
+        if row.get("email"):
+            account_id = f"acct-{n}"
+            conn.execute(
+                "INSERT INTO accounts (id, email) VALUES (?, ?)",
+                (account_id, row["email"]),
+            )
+        conn.execute(
+            "INSERT INTO oauth_credentials "
+            "(account_id, label, access_token, expires_at, is_active) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (
+                account_id,
+                row["label"],
+                row.get("token"),
+                row.get("expires_at"),
+                row.get("is_active", 1),
+            ),
+        )
+    conn.commit()
+    conn.close()
+    return path
+
+
+@pytest.fixture
+def monitor_db(tmp_path: Path) -> Path:
+    """Two active accounts, one deactivated."""
+    return make_monitor_db(
+        tmp_path / "monitor" / "usage.db",
+        [
+            {
+                "label": "robb@2amlogic.com's Organization",
+                "email": "robb@2amlogic.com",
+                "token": "sk-ant-oat01-fresh-robb",
+            },
+            {
+                "label": "agent-1@2amlogic.com",
+                "email": "agent-1@2amlogic.com",
+                "token": "sk-ant-oat01-fresh-agent1",
+            },
+            {
+                "label": "retired@example.com",
+                "email": "retired@example.com",
+                "token": "sk-ant-oat01-retired",
+                "is_active": 0,
+            },
+        ],
+    )
 
 
 @pytest.fixture(autouse=True)

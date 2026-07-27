@@ -91,6 +91,14 @@ accounts `blocked`, the daemon's dynamic concurrency cap collapses to
 **`bootstrap --force` does not fix it** — it faithfully rewrites the same revoked
 tokens, because the snapshot itself is what went stale.
 
+**`bootstrap` now detects this condition (#4030).** When `usage.db` is present and
+the tokens `bootstrap` is about to write disagree with the live store (same email,
+different fingerprint), it prints a warning naming the diverging accounts and
+pointing at `import-from-monitor` — so the stale snapshot is caught automatically
+instead of by hand-comparing fingerprints. The check is read-only, warns but never
+auto-switches sources, and is silent when no `usage.db` is present or it is
+unreadable; it prints emails and 8-char fingerprints only, never secret material.
+
 `loom-tokens import-from-monitor` reads the live store directly and is **the
 standard way to populate a new host's pool** (it replaces hand-copying a pool
 between machines):
