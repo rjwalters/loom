@@ -1827,6 +1827,11 @@ gh label sync --file .github/labels.yml
 tail -f ~/.loom/daemon.log
 ```
 
+The log path can be overridden with `LOOM_DAEMON_LOG` (e.g. to isolate a test
+daemon's log from the operator's production history); an unset override falls
+back to `$HOME/.loom/daemon.log` unchanged. See "Daemon log path override" in
+`.loom/docs/daemon-reference.md`.
+
 **Claude Code not found**:
 ```bash
 # Ensure Claude Code CLI is in PATH

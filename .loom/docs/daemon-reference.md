@@ -1330,6 +1330,48 @@ exactly like `main_health_gate::read_build_gate_config`.
 | `autonomous.watchdog.reviewStall` | `LOOM_SWEEP_REVIEW_STALL` | `true` | Review-phase stall watchdog on/off (#3910) |
 | `autonomous.watchdog.reviewStallTimeoutSecs` | `LOOM_SWEEP_REVIEW_STALL_TIMEOUT_SECS` | `2700` | Log-silence window before a hung Judge/Doctor sweep is re-dispatched |
 
+### Daemon log path override (`LOOM_DAEMON_LOG`, #4010)
+
+`setup_logging()` writes every daemon log line to `$HOME/.loom/daemon.log` by
+default — this is the destination for `env_logger`-routed output (see the
+launchd redirect note below), NOT the on-disk `LOOM_SOCKET_PATH` used by IPC.
+Before #4010, this path was hardcoded with no override at all, so **any**
+`loom-daemon` process — including one spawned by an integration test that
+already isolates its IPC socket via `LOOM_SOCKET_PATH` — still wrote into the
+operator's production log, polluting real operator history (worst-case: enough
+test noise to rotate genuine history out of the 10MB × 10-file window).
+
+Two env vars now cover both the log path and the socket path:
+
+| Env var | Purpose | Default |
+|---------|---------|---------|
+| `LOOM_DAEMON_LOG` | Full override of the daemon log file path | `<loom dir>/daemon.log` |
+| `LOOM_SOCKET_PATH` | Full override of the daemon's IPC socket path; also implicitly derives the log path (below) when `LOOM_DAEMON_LOG` is unset | `<loom dir>/loom-daemon.sock` |
+
+Precedence is **env > default only** (no `autonomous.*` config tier) — `resolve_log_path()`
+checks `LOOM_DAEMON_LOG` first, then falls back to `resolve_loom_dir().join("daemon.log")`,
+where `resolve_loom_dir()` is the parent directory of `LOOM_SOCKET_PATH` when
+that env var is set, else `$HOME/.loom`. Practically: setting `LOOM_SOCKET_PATH`
+to a tempdir (as both `loom-daemon/tests/common/mod.rs` and
+`loom-daemon/tests/integration_singleton_guard.rs` already do to isolate IPC)
+isolates the log file for free, with zero test-file edits. A config tier was
+considered and deliberately dropped: `setup_logging()` runs at daemon startup
+*before* workspace/config resolution happens, so wiring config in would require
+restructuring startup order (and `env_logger` cannot be re-targeted after
+`.init()`) for marginal benefit over the env-only surface — file a follow-up if
+a config tier is wanted later.
+
+**The launchd `StandardOutPath`/`StandardErrorPath` redirect is a decoy, not a
+second log.** `defaults/scripts/cli/loom-daemon-start.sh` points both launchd
+redirects at a single file, `$REPO_ROOT/.loom/logs/daemon-start.log`
+(`$START_LOG`), which only ever captures output emitted *before*
+`setup_logging()` installs the `env_logger` pipe target (plus a crash's raw
+stderr, if one occurs before logging is set up). In normal operation this file
+stays **0 bytes** — all real daemon logging goes through `env_logger` straight
+to `daemon.log` (or wherever `LOOM_DAEMON_LOG`/`LOOM_SOCKET_PATH` points it).
+This has repeatedly misled operators into concluding a running daemon was
+silent or dead when they tailed `daemon-start.log` instead of `daemon.log`.
+
 **Autonomous dispatch model (`autonomous.model`, #3944).** A daemon-dispatched
 child is a headless `claude -p "/loom:sweep N"` process. Without an explicit
 `--model`, it inherits whatever model the operator last configured in their
