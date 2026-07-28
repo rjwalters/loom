@@ -2196,7 +2196,7 @@ fn handle_request(
                                 "dispatch_sweep refused: host circuit breaker is {} ({}).{releases} \
                                  Running work is draining and new dispatch is paused (#4235). \
                                  Re-run with force to override.",
-                                snap.phase,
+                                snap.phase.as_str(),
                                 snap.reason.as_deref().unwrap_or("sustained host distress"),
                             ),
                         };
