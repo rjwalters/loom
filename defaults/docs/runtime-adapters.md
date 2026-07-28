@@ -147,15 +147,22 @@ set:
 | `RECOVERABLE` | rate limit / 5xx / network | retry with backoff |
 | `FATAL` | reserved | non-recoverable |
 
-The important design point for adapters: this file is organized as
-**per-provider pattern tables** — each category is matched by a provider-specific
-regex over the runtime's actual error wording (the fork's PR #6 restructured it
-exactly this way). A new adapter contributes its runtime's pattern table
-(Codex's 401 wording, its quota-exhaustion phrasing, its concurrent-session
-message) mapping onto the **same** category set. The category *contract* is
-shared; the *patterns* are per-runtime. Callers such as `claude-wrapper.sh`
-source this file rather than duplicating the patterns, so the category set must
-stay stable across runtimes.
+Today this file is a single Claude-only `classify_error()` function — its regexes
+match Claude Code's actual error wording (its 401 phrasing, its quota/weekly-limit
+strings, its concurrent-session message) against the shared category set. It is
+the **Claude reference implementation**, not yet a multi-provider structure.
+
+The important design point for adapters is the **contract requirement** this file
+must grow into: a **per-provider pattern-table** organization, where each category
+is matched by a *provider-specific* regex over that runtime's error wording, all
+mapping onto the **same** category set. Restructuring `classify-error.sh` into
+per-provider tables is exactly what the fork's PR #6 targets — that is the future
+shape this contract point specifies, not the current upstream state. Once
+restructured, a new adapter contributes its runtime's pattern table (Codex's 401
+wording, its quota-exhaustion phrasing, its concurrent-session message) without
+touching the categories. The category *contract* is shared; the *patterns* are
+per-runtime. Callers such as `claude-wrapper.sh` source this file rather than
+duplicating the patterns, so the category set must stay stable across runtimes.
 
 ### 4. Usage accounting
 
@@ -285,5 +292,3 @@ collaboration:
 - **#4165** — fork divergence triage (harvest tracking).
 - [ADR-0012: Multi-Runtime Worker Support via a Runtime Adapter Contract](../../docs/adr/0012-runtime-adapter-contract.md).
 - Fork: https://github.com/gpeyton/loom · `AGENTS.md` standard: https://agents.md
-</content>
-</invoke>

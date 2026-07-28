@@ -130,4 +130,3 @@ the lower-friction path for both sides.
   MCP-tool dispatch surface)
 - Contract specification: [`defaults/docs/runtime-adapters.md`](../../defaults/docs/runtime-adapters.md)
 - Fork: https://github.com/gpeyton/loom · `AGENTS.md` standard: https://agents.md
-</content>
