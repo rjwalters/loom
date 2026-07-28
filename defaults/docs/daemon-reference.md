@@ -1496,6 +1496,9 @@ exactly like `main_health_gate::read_build_gate_config`.
 | `autonomous.watchdog.reviewStallTimeoutSecs` | `LOOM_SWEEP_REVIEW_STALL_TIMEOUT_SECS` | `2700` | Log-silence window before a hung Judge/Doctor sweep is re-dispatched |
 | `autonomous.collisionDetection.enabled` | `LOOM_DETECT_COLLISIONS` | `false` | Cross-host dispatch-collision baseline (#4085). Off by default — adds one extra `gh issue view --json labels` round-trip per dispatch. Detection only: a collision is logged/counted, never acted on |
 | *(host identity, records only)* | `LOOM_HOST_ID` | `$HOSTNAME` → `hostname` → `unknown-host` | Overrides this host's identity string in collision log records (#4085); set it where the daemon runs without `$HOSTNAME` exported |
+| `autonomous.autoUpdate.enabled` | `LOOM_AUTO_UPDATE` | `false` | Autonomous self-update loop on/off (#4055). **Opt-in** (it rebuilds + restarts the daemon process). Exactly one loop per daemon, not a per-workspace fan-out. See [Autonomous self-update loop](#autonomous-self-update-loop-4055) below |
+| `autonomous.autoUpdate.intervalSecs` | `LOOM_AUTO_UPDATE_INTERVAL_SECS` | `900` | Cadence between staleness checks. Zero/invalid → default |
+| `autonomous.autoUpdate.settleSecs` | `LOOM_AUTO_UPDATE_SETTLE_SECS` | `600` | Settle window: wait this long after first observing a stale commit — resetting on every further commit — before rolling, so a burst of merges collapses into one roll. Zero/invalid → default |
 
 ### Daemon log path override (`LOOM_DAEMON_LOG`, #4010)
 
@@ -2606,6 +2609,58 @@ Self-update: built from ab12cd3 — UPDATE AVAILABLE (source checkout HEAD is de
 `loom-daemon-update.sh` requires an actual Loom source checkout
 (`loom-daemon/Cargo.toml` must exist) — it rebuilds from source and refuses to
 run against a binary-only / release-tarball install.
+
+### Autonomous self-update loop (#4055)
+
+Phase 3 of #4017 closes the self-repair cycle end to end: when enabled, the
+daemon **rebuilds and restarts itself** onto a fresher binary without operator
+action, instead of only surfacing the read-only "update available" hint above.
+It is the *deciding + sequencing* layer — it reuses `loom-daemon-update.sh`
+(driven with `--no-restart`) for the rebuild/provision and the #4090 drain
+primitive for the restart, reimplementing neither.
+
+**Opt-in, default OFF** (it has side effects on the running process). Enable via
+`autonomous.autoUpdate.enabled` / `LOOM_AUTO_UPDATE=1`; tune the cadence and
+settle window with `intervalSecs` (default 900) / `settleSecs` (default 600).
+All three knobs resolve **env > config > default** through `config_resolver`, so
+the `.loom-project/` tier is honored like every other `autonomous.*` block.
+
+**Exactly one loop per daemon process** — not a `spawn_multi_*` per-workspace
+fan-out. Its subject is the daemon process itself (one binary, one source
+checkout, one restart), so fanning it out across N registered workspaces would
+race N `cargo build`s in one tree and N restarts of one process. Config is read
+from the daemon's default workspace; the in-flight count (gate 4) is inherently
+cross-root.
+
+Each tick (surfaced in `loom-daemon status` — human and `--json` — as
+`auto_update` last-check / last-roll / backoff / terminal fields, all
+`#[serde(default)]` wire-compatible):
+
+1. **Staleness** — `self_update::check()`. Only `update_available == Some(true)`
+   is actionable; `Some(false)` (current) and `None` (tarball / no checkout /
+   `BUILT_COMMIT == "unknown"`) **never** rebuild.
+2. **Clean-tree gate** — refuses to build unless the source working tree is
+   clean (`git status --porcelain` empty). `CARGO_MANIFEST_DIR` is the operator's
+   live checkout, so building it dirty would compile uncommitted work into the
+   daemon. It **never** runs `git pull`.
+3. **Settle window** — waits `settleSecs` after first observing a stale commit,
+   resetting on every further commit, so a burst of daemon merges collapses into
+   a single roll.
+4. **Build-stampede gate** — defers the rebuild while `ipc::count_in_flight_sweeps`
+   reports any non-terminal sweep across every managed root (a `cargo build
+   --release` competes with in-flight sweep builds for CPU).
+5. **Roll via drain, not a bare restart** — on a clean rebuild it triggers
+   `ipc::handle_drain_request` (#4090), so in-flight sweeps finish first and
+   survive in the registry rather than being orphaned as bare processes. The
+   restart exits into launchd `KeepAlive:SuccessfulExit`, which relaunches from
+   the plist's persisted `ProgramArguments`/`EnvironmentVariables` — so the
+   daemon comes back with **exactly its prior autonomy flags, never wider** (see
+   [Scheduled drain-and-restart](#scheduled-drain-and-restart---drain-4090)).
+6. **Backoff + terminal state** — a retryable build failure (script exit `1`,
+   spawn/timeout) backs off exponentially (60s → … → 3600s ceiling); a
+   commit-identity / build-verification mismatch (#4053 exit `4`/`5`) is
+   **terminal** — surfaced in `--status`, not retried until the source commit
+   advances. A successful roll resets the counter.
 
 ### End-to-end acceptance playbook
 

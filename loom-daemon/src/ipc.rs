@@ -373,7 +373,14 @@ fn cancel_all_in_flight(workspace_pool: &Arc<WorkspacePool>, fallback_root: &Pat
 ///
 /// Must be called from within a tokio runtime context (the connection handler
 /// is) so it can spawn the supervisor.
-fn handle_drain_request(
+///
+/// Made `pub` for the autonomous self-update loop (#4055): after it rebuilds
+/// and provisions a fresh binary, it triggers the roll through this exact drain
+/// path — not a bare `RestartDaemon` — so in-flight sweeps finish first and
+/// survive in the registry rather than being orphaned. The loop calls it from a
+/// blocking thread inside a `tokio::runtime::Handle::enter()` guard so the
+/// internal `tokio::spawn` of the supervisor still resolves a runtime.
+pub fn handle_drain_request(
     drain: &Arc<DrainState>,
     workspace_pool: &Arc<WorkspacePool>,
     fallback_root: &Path,
@@ -1104,6 +1111,11 @@ pub fn build_daemon_status(
     let workspace_registry = WorkspaceRegistry::load_default().unwrap_or_default();
     let roots = workspace_registry.effective_roots(fallback_root);
 
+    // Autonomous self-update loop snapshot (#4055), read once from the
+    // process-global the loop publishes to. Default (disabled/never-checked)
+    // when the loop was never spawned.
+    let au = crate::auto_update::global_status_snapshot();
+
     // Per-repo breakdown + the union of in-flight sweeps across every repo. Each
     // root reads its own registry from the pool (the fallback/default root
     // resolves to the seeded default registry, so a single-workspace daemon reads
@@ -1250,6 +1262,19 @@ pub fn build_daemon_status(
         draining: false,
         drain_deadline: None,
         drain_note: None,
+        // Autonomous self-update loop status (#4055) — read from the
+        // process-global snapshot the loop publishes each tick. The loop is
+        // process-global (exactly one per daemon, never a per-workspace
+        // fan-out), so unlike the drain fields there is no per-connection Arc to
+        // thread; an unset global (loop never spawned) reads as the default
+        // "disabled, never checked" snapshot.
+        auto_update_enabled: au.enabled,
+        auto_update_last_check: au.last_check,
+        auto_update_last_roll: au.last_roll,
+        auto_update_consecutive_failures: au.consecutive_failures,
+        auto_update_backoff_secs: au.backoff_secs,
+        auto_update_terminal_reason: au.terminal_reason,
+        auto_update_note: au.note,
     }
 }
 
@@ -3422,6 +3447,13 @@ exit 0
             draining: false,
             drain_deadline: None,
             drain_note: None,
+            auto_update_enabled: true,
+            auto_update_last_check: Some(chrono::Utc::now()),
+            auto_update_last_roll: Some(chrono::Utc::now()),
+            auto_update_consecutive_failures: 2,
+            auto_update_backoff_secs: Some(120),
+            auto_update_terminal_reason: None,
+            auto_update_note: Some("within settle window".to_string()),
         };
         let resp = Response::DaemonStatus(report);
         let json = serde_json::to_string(&resp).expect("serialize response");
@@ -3432,6 +3464,10 @@ exit 0
                 assert_eq!(r.disk_headroom, 10);
                 assert_eq!(r.cpu_headroom, 6);
                 assert_eq!(r.logical_cpus, 8);
+                assert!(r.auto_update_enabled);
+                assert_eq!(r.auto_update_consecutive_failures, 2);
+                assert_eq!(r.auto_update_backoff_secs, Some(120));
+                assert_eq!(r.auto_update_note.as_deref(), Some("within settle window"));
                 assert_eq!(r.loadavg_1m, Some(1.25));
                 assert_eq!(r.cpu_idle_fraction, Some(0.90));
                 assert!(!r.capacity_bound);
@@ -4347,6 +4383,14 @@ exit 0
         assert!(!report.draining, "absent draining (#4090) defaults to false");
         assert_eq!(report.drain_deadline, None);
         assert_eq!(report.drain_note, None);
+        // Pre-#4055 payload has no auto_update fields either — they default.
+        assert!(!report.auto_update_enabled, "absent auto_update (#4055) defaults to disabled");
+        assert_eq!(report.auto_update_last_check, None);
+        assert_eq!(report.auto_update_last_roll, None);
+        assert_eq!(report.auto_update_consecutive_failures, 0);
+        assert_eq!(report.auto_update_backoff_secs, None);
+        assert_eq!(report.auto_update_terminal_reason, None);
+        assert_eq!(report.auto_update_note, None);
     }
 
     /// The new drain fields round-trip through serde, and

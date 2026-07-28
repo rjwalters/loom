@@ -965,6 +965,48 @@ pub struct DaemonStatusReport {
     /// data compatible.
     #[serde(default)]
     pub drain_note: Option<String>,
+    /// Whether the autonomous self-update loop (Issue #4055) is enabled for this
+    /// daemon process. `false` in the common opt-out case (the loop is
+    /// default-OFF). `#[serde(default)]` keeps pre-#4055 wire data / older
+    /// clients compatible (an absent field parses as `false` — "loop off"),
+    /// mirroring the `draining` forward-compat convention.
+    #[serde(default)]
+    pub auto_update_enabled: bool,
+    /// Wall-clock time of the auto-update loop's most recent staleness check
+    /// (Issue #4055), or `None` when the loop has not ticked yet (or is
+    /// disabled). `#[serde(default)]` keeps pre-#4055 wire data compatible.
+    #[serde(default)]
+    pub auto_update_last_check: Option<DateTime<Utc>>,
+    /// Wall-clock time of the auto-update loop's most recent successful roll
+    /// (rebuild + provision + drain-triggered restart, Issue #4055), or `None`
+    /// when no roll has happened this process. `#[serde(default)]` keeps
+    /// pre-#4055 wire data compatible.
+    #[serde(default)]
+    pub auto_update_last_roll: Option<DateTime<Utc>>,
+    /// Consecutive retryable build failures the auto-update loop has seen
+    /// (Issue #4055); resets to `0` on a successful roll or when the source
+    /// commit advances. Feeds the exponential backoff. `#[serde(default)]`
+    /// keeps pre-#4055 wire data compatible (an absent field parses as `0`).
+    #[serde(default)]
+    pub auto_update_consecutive_failures: u32,
+    /// The current backoff delay in seconds the auto-update loop is waiting out
+    /// after a retryable build failure (Issue #4055), or `None` when it is not
+    /// backing off. `#[serde(default)]` keeps pre-#4055 wire data compatible.
+    #[serde(default)]
+    pub auto_update_backoff_secs: Option<u64>,
+    /// A terminal give-up reason (Issue #4055): a non-retryable failure such as
+    /// the #4053 build-verification mismatch (exit 4/5). The loop stops
+    /// attempting until the source commit advances; `None` when not in a
+    /// terminal state. `#[serde(default)]` keeps pre-#4055 wire data compatible.
+    #[serde(default)]
+    pub auto_update_terminal_reason: Option<String>,
+    /// A short human-readable note about the auto-update loop's most recent tick
+    /// (Issue #4055) — e.g. "up to date", "within settle window", "source tree
+    /// dirty", or the last roll/failure detail — so `loom-daemon status` never
+    /// leaves the loop's behavior unexplained. `None` before the first tick.
+    /// `#[serde(default)]` keeps pre-#4055 wire data compatible.
+    #[serde(default)]
+    pub auto_update_note: Option<String>,
 }
 
 /// One registered managed-workspace's status line in [`DaemonStatusReport`]
