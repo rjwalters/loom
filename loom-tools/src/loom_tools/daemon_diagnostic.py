@@ -343,7 +343,7 @@ def run_health_check() -> HealthReport:
         if report.orphaned_building:
             orphan_list = ", ".join(f"#{n}" for n in report.orphaned_building)
             report.add_warning(f"Orphaned loom:building issues (labeled but not tracked by spawn loop): {orphan_list}")
-            report.add_recommendation("Check orphaned issues with: ./.loom/scripts/stale-building-check.sh --recover")
+            report.add_recommendation("Check orphaned issues with: loom-recover-orphans --recover")
 
     # 4. Check stale building issues
     report.stale_building = check_stale_building(report.pipeline.building)
