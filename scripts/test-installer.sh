@@ -375,6 +375,33 @@ else
   fail "Cannot verify hook command prefixes (settings.json or jq missing)"
 fi
 
+# Test 12c: No invalid Write(...) path rule in permissions.allow (issue #4072)
+# Claude Code's permission engine only matches Edit(...) rules for file-editing
+# tools (Write/Edit/NotebookEdit all route through Edit checks) -- a
+# Write(...) path rule prints a startup warning and is a silent no-op. Also
+# assert the four temp-path entries the fix introduces are all present.
+echo "Test 12c: settings.json has no invalid Write(...) path rule"
+if [[ -f "$SETTINGS_FILE" ]] && command -v jq &> /dev/null; then
+  if jq -e '.permissions.allow[] | select(startswith("Write("))' "$SETTINGS_FILE" > /dev/null 2>&1; then
+    fail "settings.json contains an invalid Write(...) path rule -- use Edit(...)"
+  else
+    pass "no invalid Write(...) path rules in settings.json"
+  fi
+
+  TEMP_PATH_FAIL=0
+  for entry in "Read(/tmp/**)" "Read(/private/tmp/**)" "Edit(/tmp/**)" "Edit(/private/tmp/**)"; do
+    if ! jq -e --arg entry "$entry" '.permissions.allow[] | select(. == $entry)' "$SETTINGS_FILE" > /dev/null 2>&1; then
+      fail "settings.json missing expected temp-path rule: $entry"
+      TEMP_PATH_FAIL=1
+    fi
+  done
+  if [[ $TEMP_PATH_FAIL -eq 0 ]]; then
+    pass "settings.json has all four temp-path permission entries"
+  fi
+else
+  fail "Cannot verify settings.json permissions (settings.json or jq missing)"
+fi
+
 # Test 13: .github/labels.yml
 echo "Test 13: Install creates .github/labels.yml"
 if [[ -f "$INSTALL_REPO/.github/labels.yml" ]]; then
