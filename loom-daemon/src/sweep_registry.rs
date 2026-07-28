@@ -1092,6 +1092,27 @@ impl SweepRegistryConfig {
     pub fn checkpoint_dir(&self) -> PathBuf {
         self.workspace_root.join(".loom").join("sweep-checkpoint")
     }
+
+    /// Whether this workspace has the `/loom:sweep` slash command installed
+    /// (Issue #4027). The commands under `.claude/commands/loom/` are
+    /// install-not-committed (gitignored; populated by `loom-daemon init`
+    /// from `defaults/.claude/commands/loom/`), so a bare `git clone` has
+    /// `.git`/`.loom` — `looks_like_workspace()` in `workspace_registry.rs`
+    /// passes — but NOT this file. Dispatching `/loom:sweep <N>` into such a
+    /// workspace insta-crashes the child on `Unknown command: /loom:sweep`
+    /// within seconds. A cheap existence check (one `stat`), not a content
+    /// check — an empty/stale file still counts as "installed"; a genuinely
+    /// broken command definition is a different failure mode than "never
+    /// initialized".
+    #[must_use]
+    pub fn has_sweep_command(&self) -> bool {
+        self.workspace_root
+            .join(".claude")
+            .join("commands")
+            .join("loom")
+            .join("sweep.md")
+            .exists()
+    }
 }
 
 /// On-disk owner metadata written inside the lock dir. Schema mirrors
@@ -1557,6 +1578,35 @@ impl SweepRegistry {
                 ));
             }
         };
+
+        // 2.4 Workspace-commands guard (Issue #4027). A workspace registered
+        //     (or hot-added, #3926) without ever running `loom-daemon init` —
+        //     e.g. a bare `git clone` on a second daemon host — has `.git`/
+        //     `.loom` so it "looks like" a workspace, but lacks the
+        //     install-not-committed `.claude/commands/loom/` slash commands.
+        //     Dispatching `/loom:sweep <N>` into it insta-crashes the child on
+        //     `Unknown command: /loom:sweep` within seconds, and because it
+        //     exits before any checkpoint/worktree exists, the reaper reverts
+        //     `loom:building` -> `loom:issue` and the work-finder re-dispatches
+        //     on the next tick: an infinite fast-fail loop burning a rotated
+        //     token roughly every tick, forever. Checked FIRST — before even
+        //     the closed-issue guard's `gh` probe below — because it is a
+        //     single local `stat` versus a subprocess spawn: a misconfigured
+        //     workspace should cost as little as possible per tick, and zero
+        //     tokens either way. Skipped when label flips are disabled (test
+        //     fixtures exercising pure in-memory dispatch mechanics without a
+        //     fully Loom-managed workspace on disk), mirroring the #4088
+        //     closed-issue guard's skip condition below.
+        if !self.config.skip_label_flip && !self.config.has_sweep_command() {
+            return Err(anyhow!(
+                "refusing to dispatch issue #{issue_number}: workspace {} is missing \
+                 .claude/commands/loom/sweep.md — the /loom:sweep slash command is not \
+                 installed there (#4027 wedge-loop guard). Run \
+                 `loom-daemon init {}` in that workspace first.",
+                self.config.workspace_root.display(),
+                self.config.workspace_root.display()
+            ));
+        }
 
         // 2.5 Closed-issue guard (Issue #4088). All three watchdogs
         //     (startup #3887, mid-build-death #3895, review-stall #3910)
@@ -4715,6 +4765,18 @@ mod tests {
     use serial_test::serial;
     use std::os::unix::fs::PermissionsExt;
     use tempfile::tempdir;
+
+    /// Install the `/loom:sweep` command marker under `workspace` (Issue
+    /// #4027) so the workspace-commands guard in `dispatch()` treats it as
+    /// initialized. Only tests that run with `skip_label_flip = false` need
+    /// this — the guard itself is skipped when label flips are disabled
+    /// (see `dispatch()`'s 2.4 comment), which covers the overwhelming
+    /// majority of fixtures in this module.
+    fn touch_sweep_command(workspace: &Path) {
+        let dir = workspace.join(".claude").join("commands").join("loom");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("sweep.md"), "# /loom:sweep (test fixture)\n").unwrap();
+    }
 
     /// Build a temp-workspace registry with a fake spawn binary that
     /// records its argv + env into a log and exits immediately. This lets
@@ -8579,6 +8641,10 @@ exit 0\n";
         let workspace = dir.path();
         let scripts_dir = workspace.join(".loom").join("scripts");
         std::fs::create_dir_all(&scripts_dir).unwrap();
+        // This test runs with `skip_label_flip = false`, so it exercises the
+        // real #4027 workspace-commands guard too — install the marker so
+        // dispatch proceeds to the gh-wedge scenario under test.
+        touch_sweep_command(workspace);
 
         // A fake `gh` that hangs far longer than the reap timeout, simulating
         // the wedged gh/XPC from the incident.
@@ -9479,6 +9545,10 @@ exit 0\n";
         if let Ok(f) = std::fs::File::open(&spawn) {
             let _ = f.sync_all();
         }
+        // This helper runs with `skip_label_flip = false`, so it also
+        // exercises the #4027 workspace-commands guard — install the marker
+        // so a dispatch that clears the closed-issue guard reaches spawn.
+        touch_sweep_command(ws);
 
         let mut config = SweepRegistryConfig::new(ws.to_path_buf());
         config.spawn_bin = Some(spawn);
@@ -9541,6 +9611,84 @@ exit 0\n";
         );
 
         if let Some(id) = running_issue_sweep_id(&reg, 4079) {
+            let _ = reg.cancel(&id, Duration::from_secs(2));
+        }
+    }
+
+    // --- workspace-commands dispatch guard (Issue #4027) ---
+
+    /// A workspace that "looks like" a repo (`.git`/`.loom` present, so
+    /// `looks_like_workspace()` in `workspace_registry.rs` would pass) but
+    /// was never `loom-daemon init`-ed — the reproduction from #4027 (a
+    /// second daemon host with a bare `git clone`). `dispatch` must refuse
+    /// BEFORE spending any forge call or token: no `gh` invocation at all
+    /// (not even the closed-issue probe), no spawned child, no registry
+    /// entry, and the error must name the `loom-daemon init` remediation.
+    #[test]
+    #[serial]
+    fn dispatch_refuses_workspace_missing_sweep_command() {
+        let tmp = tempdir().unwrap();
+        let ws = tmp.path();
+        std::env::remove_var("LOOM_REPO");
+        let (mut reg, gh_log) = closed_guard_registry(ws, "OPEN", 0);
+        // `closed_guard_registry` installs the marker by default (so its own
+        // AC6 tests reach the closed-issue guard under test there) — remove
+        // it here to simulate the #4027 wedge scenario.
+        std::fs::remove_file(
+            ws.join(".claude")
+                .join("commands")
+                .join("loom")
+                .join("sweep.md"),
+        )
+        .unwrap();
+
+        let err = reg
+            .dispatch(&SweepKind::Issue(4222), None, None, None, None)
+            .expect_err("a workspace missing installed commands must be refused");
+        assert!(
+            err.to_string().contains("loom-daemon init"),
+            "error names the remediation; got: {err}"
+        );
+        assert!(
+            err.to_string().contains("sweep.md"),
+            "error names the missing marker; got: {err}"
+        );
+
+        let calls = std::fs::read_to_string(&gh_log).unwrap_or_default();
+        assert!(
+            calls.is_empty(),
+            "no forge call whatsoever (no closed-issue probe, no label flip) on a \
+             workspace-commands-refused dispatch; got: {calls:?}"
+        );
+        assert!(
+            running_issue_sweep_id(&reg, 4222).is_none(),
+            "no registry entry recorded on a refused dispatch"
+        );
+    }
+
+    /// Regression guard: a workspace WITH the marker installed dispatches
+    /// exactly as before — the #4027 guard is a pure no-op for a properly
+    /// initialized workspace.
+    #[test]
+    #[serial]
+    fn dispatch_proceeds_when_sweep_command_present() {
+        let tmp = tempdir().unwrap();
+        let ws = tmp.path();
+        std::env::remove_var("LOOM_REPO");
+        let (mut reg, gh_log) = closed_guard_registry(ws, "OPEN", 0);
+
+        let out = reg
+            .dispatch(&SweepKind::Issue(4223), None, None, None, None)
+            .expect("a properly initialized workspace must dispatch normally");
+        assert!(wait_until_dead(out.pid, FIXTURE_CHILD_WAIT_MS));
+
+        let calls = std::fs::read_to_string(&gh_log).unwrap_or_default();
+        assert!(
+            calls.contains("issue edit 4223"),
+            "dispatch reached the label flip; got: {calls:?}"
+        );
+
+        if let Some(id) = running_issue_sweep_id(&reg, 4223) {
             let _ = reg.cancel(&id, Duration::from_secs(2));
         }
     }

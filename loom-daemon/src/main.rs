@@ -3029,6 +3029,28 @@ fn handle_workspace_command(action: WorkspaceAction) -> Result<()> {
                             canonical.display()
                         );
                     }
+                    // Issue #4027: `.git`/`.loom` alone does not mean the
+                    // `/loom:sweep` slash command is installed — those files
+                    // are install-not-committed (gitignored), so a bare
+                    // `git clone` passes the `looks_like_workspace` check
+                    // above while still being undispatchable. Dispatching
+                    // into it insta-crashes on `Unknown command:
+                    // /loom:sweep`, and because the reaper reverts
+                    // `loom:building` -> `loom:issue` on that insta-crash,
+                    // the work-finder re-dispatches every tick — an infinite
+                    // token-burning loop. `dispatch()` itself now refuses
+                    // this case (the load-bearing fix), but warn here too so
+                    // the operator sees it at registration time, before any
+                    // dispatch is attempted.
+                    if !SweepRegistryConfig::new(canonical.clone()).has_sweep_command() {
+                        eprintln!(
+                            "  warning: {} has no .claude/commands/loom/sweep.md — the \
+                             /loom:sweep command is not installed there. Dispatch into this \
+                             workspace will be refused until you run `loom-daemon init {}`.",
+                            canonical.display(),
+                            canonical.display()
+                        );
+                    }
                 }
             }
             Ok(())
