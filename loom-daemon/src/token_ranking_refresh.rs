@@ -15,28 +15,31 @@
 //!
 //! # What it does
 //!
-//! On a configurable cadence (default 10 minutes) the daemon shells out to the
-//! repo's installed `probe-tokens.sh --ranking` (falling back to
-//! `defaults/scripts/probe-tokens.sh` for a Loom checkout that has not yet
-//! synced the installed copy — see [`ScriptRankingRefreshRunner::resolve_script_bin`]),
-//! which probes every bootstrapped account for its current rate-limit headers
-//! and atomically rewrites `.ranking` in whichever pool `loom_tools.tokens`
-//! resolves for that repo (per-repo `.loom/tokens/`, or the shared
-//! machine-level pool per #3938 when the per-repo pool is absent/empty — pool
-//! *location* resolution is left entirely to the existing Python selector so
-//! this module never has to duplicate it).
+//! On a configurable cadence (default 10 minutes) the daemon shells out to
+//! **its own binary** (`std::env::current_exe()`) with `tokens check
+//! --ranking --workspace <repo_root>` (issue #4080, epic #4081 Phase 2 —
+//! historically this shelled out to `probe-tokens.sh --ranking`; see
+//! [`ScriptRankingRefreshRunner::resolve_bin`]). Invoking `current_exe()`
+//! rather than re-resolving a script sidesteps the "stale binary predates the
+//! `tokens` subcommand" hazard entirely — the running daemon by construction
+//! supports its own subcommands — and drops a process layer (daemon → bash →
+//! daemon). The subcommand probes every bootstrapped account for its current
+//! rate-limit headers and atomically rewrites `.ranking` in whichever pool
+//! [`crate::tokens_pool::paths`] resolves for that repo (per-repo
+//! `.loom/tokens/`, or the shared machine-level pool per #3938 when the
+//! per-repo pool is absent/empty).
 //!
 //! # Never fatal, never double-writes unsafely
 //!
-//! A probe failure (network hiccup, `gh`/`python3` missing, every account
-//! exhausted, no tokens bootstrapped at all) is logged and skipped — it never
-//! panics the loop or the daemon. Because `loom-tokens check --ranking` writes
-//! `.ranking` atomically (temp file + rename, matching every other Loom
-//! bookkeeping writer), an operator's cron running the identical script
-//! concurrently is harmless: the two refreshers can race to *schedule* a
-//! write but never to a *torn* file, and whichever write lands last simply
-//! wins — both are measuring the same live rate-limit state, so there is no
-//! correctness cost to the redundancy, only (rare) duplicated API calls.
+//! A probe failure (network hiccup, every account exhausted, no tokens
+//! bootstrapped at all) is logged and skipped — it never panics the loop or
+//! the daemon. Because `tokens check --ranking` writes `.ranking` atomically
+//! (temp file + rename, matching every other Loom bookkeeping writer), an
+//! operator's cron running `probe-tokens.sh --ranking` concurrently is
+//! harmless: the two refreshers can race to *schedule* a write but never to a
+//! *torn* file, and whichever write lands last simply wins — both are
+//! measuring the same live rate-limit state, so there is no correctness cost
+//! to the redundancy, only (rare) duplicated API calls.
 //!
 //! # Default-on (unlike the work-finder / main-health-gate loops)
 //!
@@ -65,8 +68,8 @@
 //!   pool, exactly like [`crate::main_health_gate::spawn_multi_main_health_gate_task`].
 //!   An empty registry reduces to the single `fallback_root`.
 //! - The probe runs on a blocking thread via `tokio::task::spawn_blocking` (it
-//!   shells out to Python + a network call) so it never parks a runtime
-//!   worker, mirroring the main-health gate's command execution.
+//!   shells out to a subprocess and makes network calls) so it never parks a
+//!   runtime worker, mirroring the main-health gate's command execution.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -114,8 +117,8 @@ const MAX_OUTPUT_TAIL_BYTES: usize = 2048;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RefreshOutcome {
     /// The probe ran to completion and reported success (`.ranking` rewritten,
-    /// or at least one account was probed — see `probe-tokens.sh`'s own exit
-    /// code contract).
+    /// or at least one account was probed — see `loom-daemon tokens check`'s
+    /// own exit code contract, mirrored from `probe-tokens.sh`).
     Success,
     /// The probe could not be run, or ran and reported failure. `reason`
     /// explains what happened. Never fatal to the daemon — logged and skipped.
@@ -140,20 +143,24 @@ pub trait RankingRefreshRunner {
     fn refresh(&mut self) -> RefreshOutcome;
 }
 
-/// The concrete [`RankingRefreshRunner`]: shells out to the repo's
-/// `probe-tokens.sh --ranking` in `repo_root`.
+/// The concrete [`RankingRefreshRunner`]: shells out to **its own binary**
+/// (`std::env::current_exe()`) with `tokens check --ranking --workspace
+/// <repo_root>` (issue #4080). Historically this resolved and spawned
+/// `probe-tokens.sh --ranking`; invoking `current_exe()` instead sidesteps the
+/// "stale binary predates the `tokens` subcommand" hazard entirely (the
+/// running daemon by construction supports its own subcommands) and drops a
+/// process layer (daemon → bash → daemon).
 ///
 /// Pool-location resolution (per-repo vs. the #3938 shared machine-level pool)
-/// is deliberately **not** reimplemented here — `probe-tokens.sh` delegates to
-/// `loom_tools.tokens.check`, which already owns that resolution and the
-/// atomic `.ranking` write. This runner's only job is finding the script and
-/// running it with a timeout.
+/// is deliberately **not** reimplemented here — `tokens check` delegates to
+/// [`crate::tokens_pool::paths`], which already owns that resolution and the
+/// atomic `.ranking` write. This runner's only job is resolving the binary to
+/// invoke and running it with a timeout.
 pub struct ScriptRankingRefreshRunner {
     repo_root: PathBuf,
-    /// Explicit script override (tests point this at a fake executable).
-    /// Production leaves this `None` and resolves via
-    /// [`Self::resolve_script_bin`].
-    script_bin: Option<PathBuf>,
+    /// Explicit binary override (tests point this at a fake executable).
+    /// Production leaves this `None` and resolves via [`Self::resolve_bin`].
+    bin: Option<PathBuf>,
     timeout: Duration,
 }
 
@@ -163,16 +170,16 @@ impl ScriptRankingRefreshRunner {
     pub fn new(repo_root: PathBuf) -> Self {
         Self {
             repo_root,
-            script_bin: None,
+            bin: None,
             timeout: DEFAULT_PROBE_TIMEOUT,
         }
     }
 
-    /// Override the script binary (tests only — production always resolves via
-    /// [`Self::resolve_script_bin`]).
+    /// Override the daemon binary to invoke (tests only — production always
+    /// resolves via [`Self::resolve_bin`] to `std::env::current_exe()`).
     #[must_use]
-    pub fn with_script_bin(mut self, bin: PathBuf) -> Self {
-        self.script_bin = Some(bin);
+    pub fn with_bin(mut self, bin: PathBuf) -> Self {
+        self.bin = Some(bin);
         self
     }
 
@@ -183,54 +190,32 @@ impl ScriptRankingRefreshRunner {
         self
     }
 
-    /// Resolve `probe-tokens.sh`, preferring (in order):
-    /// 1. [`Self::script_bin`] explicit override (tests).
-    /// 2. `<repo_root>/.loom/scripts/probe-tokens.sh` (the installed copy).
-    /// 3. `<repo_root>/defaults/scripts/probe-tokens.sh` (a Loom checkout that
-    ///    has not yet synced the installed copy — mirrors
-    ///    [`crate::sweep_registry::SweepRegistryConfig::resolve_spawn_bin`]'s
-    ///    fallback order for `spawn-claude.sh`).
-    fn resolve_script_bin(&self) -> Result<PathBuf, String> {
-        if let Some(p) = &self.script_bin {
+    /// Resolve the binary to invoke: [`Self::bin`] explicit override (tests),
+    /// else `std::env::current_exe()` — the currently-running `loom-daemon`
+    /// binary, which by construction supports the `tokens check` subcommand.
+    fn resolve_bin(&self) -> Result<PathBuf, String> {
+        if let Some(p) = &self.bin {
             return Ok(p.clone());
         }
-        let installed = self
-            .repo_root
-            .join(".loom")
-            .join("scripts")
-            .join("probe-tokens.sh");
-        if installed.exists() {
-            return Ok(installed);
-        }
-        let defaults = self
-            .repo_root
-            .join("defaults")
-            .join("scripts")
-            .join("probe-tokens.sh");
-        if defaults.exists() {
-            return Ok(defaults);
-        }
-        Err(format!(
-            "probe-tokens.sh not found under {} (looked in .loom/scripts and defaults/scripts)",
-            self.repo_root.display()
-        ))
+        std::env::current_exe().map_err(|e| format!("could not resolve current_exe(): {e}"))
     }
 }
 
 impl RankingRefreshRunner for ScriptRankingRefreshRunner {
     fn refresh(&mut self) -> RefreshOutcome {
-        let script = match self.resolve_script_bin() {
+        let bin = match self.resolve_bin() {
             Ok(p) => p,
             Err(e) => return RefreshOutcome::Failure(e),
         };
-        run_probe_with_timeout(&script, &self.repo_root, self.timeout)
+        run_probe_with_timeout(&bin, &self.repo_root, self.timeout)
     }
 }
 
-/// Run `script --ranking` in `cwd`, capturing combined output to a temp file
-/// (never a pipe — avoids the pipe-buffer deadlock the health gate's
-/// equivalent helper documents) and killing it after `timeout`.
-fn run_probe_with_timeout(script: &Path, cwd: &Path, timeout: Duration) -> RefreshOutcome {
+/// Run `bin tokens check --ranking --workspace <repo_root>` with `repo_root`
+/// as both the `--workspace` argument and the child's cwd, capturing combined
+/// output to a temp file (never a pipe — avoids the pipe-buffer deadlock the
+/// health gate's equivalent helper documents) and killing it after `timeout`.
+fn run_probe_with_timeout(bin: &Path, repo_root: &Path, timeout: Duration) -> RefreshOutcome {
     let log_path = std::env::temp_dir()
         .join(format!("loom-token-ranking-refresh-{}.log", uuid::Uuid::new_v4()));
     let out_file = match std::fs::File::create(&log_path) {
@@ -247,9 +232,13 @@ fn run_probe_with_timeout(script: &Path, cwd: &Path, timeout: Duration) -> Refre
         }
     };
 
-    let mut child = match Command::new(script)
+    let mut child = match Command::new(bin)
+        .arg("tokens")
+        .arg("check")
         .arg("--ranking")
-        .current_dir(cwd)
+        .arg("--workspace")
+        .arg(repo_root)
+        .current_dir(repo_root)
         .stdin(Stdio::null())
         .stdout(Stdio::from(out_file))
         .stderr(Stdio::from(stderr_file))
@@ -258,7 +247,7 @@ fn run_probe_with_timeout(script: &Path, cwd: &Path, timeout: Duration) -> Refre
         Ok(c) => c,
         Err(e) => {
             let _ = std::fs::remove_file(&log_path);
-            return RefreshOutcome::Failure(format!("could not spawn `{}`: {e}", script.display()));
+            return RefreshOutcome::Failure(format!("could not spawn `{}`: {e}", bin.display()));
         }
     };
 
@@ -270,7 +259,7 @@ fn run_probe_with_timeout(script: &Path, cwd: &Path, timeout: Duration) -> Refre
                 let tail = std::fs::read_to_string(&log_path).unwrap_or_default();
                 break RefreshOutcome::Failure(format!(
                     "`{}` exited with {status}: {}",
-                    script.display(),
+                    bin.display(),
                     truncate_tail(&tail)
                 ));
             }
@@ -280,17 +269,14 @@ fn run_probe_with_timeout(script: &Path, cwd: &Path, timeout: Duration) -> Refre
                     let _ = child.wait();
                     break RefreshOutcome::Failure(format!(
                         "`{}` timed out after {}s",
-                        script.display(),
+                        bin.display(),
                         timeout.as_secs()
                     ));
                 }
                 std::thread::sleep(PROBE_POLL_INTERVAL);
             }
             Err(e) => {
-                break RefreshOutcome::Failure(format!(
-                    "could not poll `{}`: {e}",
-                    script.display()
-                ))
+                break RefreshOutcome::Failure(format!("could not poll `{}`: {e}", bin.display()))
             }
         }
     };
@@ -535,9 +521,9 @@ mod tests {
         fs::write(root.join(".loom").join("config.json"), contents).unwrap();
     }
 
-    /// A fake script that just exits with a fixed code, optionally writing to
+    /// A fake binary that just exits with a fixed code, optionally writing to
     /// stdout/stderr first. Written with a shebang so it's directly executable.
-    fn write_fake_script(dir: &Path, name: &str, body: &str) -> PathBuf {
+    fn write_fake_bin(dir: &Path, name: &str, body: &str) -> PathBuf {
         fs::create_dir_all(dir).unwrap();
         let path = dir.join(name);
         fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
@@ -552,76 +538,40 @@ mod tests {
     }
 
     // ===================================================================
-    // ScriptRankingRefreshRunner — script resolution + execution
+    // ScriptRankingRefreshRunner — binary resolution + execution
     // ===================================================================
 
     #[test]
-    fn test_resolve_script_bin_missing_is_failure() {
+    fn test_resolve_bin_defaults_to_current_exe() {
         let tmp = tempfile::tempdir().unwrap();
-        let mut runner = ScriptRankingRefreshRunner::new(tmp.path().to_path_buf());
-        let outcome = runner.refresh();
-        assert!(!outcome.is_success());
-        let RefreshOutcome::Failure(reason) = outcome else {
-            panic!("expected Failure");
-        };
-        assert!(reason.contains("probe-tokens.sh not found"), "{reason}");
+        let runner = ScriptRankingRefreshRunner::new(tmp.path().to_path_buf());
+        let resolved = runner.resolve_bin().unwrap();
+        assert_eq!(resolved, std::env::current_exe().unwrap());
     }
 
     #[test]
-    fn test_resolve_script_bin_prefers_installed_over_defaults() {
+    fn test_resolve_bin_honors_override() {
         let tmp = tempfile::tempdir().unwrap();
-        write_fake_script(&tmp.path().join(".loom").join("scripts"), "probe-tokens.sh", "exit 0");
-        write_fake_script(
-            &tmp.path().join("defaults").join("scripts"),
-            "probe-tokens.sh",
-            "exit 1",
-        );
-        let runner = ScriptRankingRefreshRunner::new(tmp.path().to_path_buf());
-        let resolved = runner.resolve_script_bin().unwrap();
-        assert_eq!(
-            resolved,
-            tmp.path()
-                .join(".loom")
-                .join("scripts")
-                .join("probe-tokens.sh")
-        );
-    }
-
-    #[test]
-    fn test_resolve_script_bin_falls_back_to_defaults() {
-        let tmp = tempfile::tempdir().unwrap();
-        write_fake_script(
-            &tmp.path().join("defaults").join("scripts"),
-            "probe-tokens.sh",
-            "exit 0",
-        );
-        let runner = ScriptRankingRefreshRunner::new(tmp.path().to_path_buf());
-        let resolved = runner.resolve_script_bin().unwrap();
-        assert_eq!(
-            resolved,
-            tmp.path()
-                .join("defaults")
-                .join("scripts")
-                .join("probe-tokens.sh")
-        );
+        let fake = write_fake_bin(tmp.path(), "fake-daemon.sh", "exit 0");
+        let runner =
+            ScriptRankingRefreshRunner::new(tmp.path().to_path_buf()).with_bin(fake.clone());
+        assert_eq!(runner.resolve_bin().unwrap(), fake);
     }
 
     #[test]
     fn test_refresh_success_on_zero_exit() {
         let tmp = tempfile::tempdir().unwrap();
-        let script = write_fake_script(tmp.path(), "fake-probe.sh", "echo ok; exit 0");
-        let mut runner =
-            ScriptRankingRefreshRunner::new(tmp.path().to_path_buf()).with_script_bin(script);
+        let bin = write_fake_bin(tmp.path(), "fake-daemon.sh", "echo ok; exit 0");
+        let mut runner = ScriptRankingRefreshRunner::new(tmp.path().to_path_buf()).with_bin(bin);
         assert_eq!(runner.refresh(), RefreshOutcome::Success);
     }
 
     #[test]
     fn test_refresh_failure_on_nonzero_exit_includes_output_tail() {
         let tmp = tempfile::tempdir().unwrap();
-        let script =
-            write_fake_script(tmp.path(), "fake-probe.sh", "echo tokens directory missing; exit 1");
-        let mut runner =
-            ScriptRankingRefreshRunner::new(tmp.path().to_path_buf()).with_script_bin(script);
+        let bin =
+            write_fake_bin(tmp.path(), "fake-daemon.sh", "echo tokens directory missing; exit 1");
+        let mut runner = ScriptRankingRefreshRunner::new(tmp.path().to_path_buf()).with_bin(bin);
         let outcome = runner.refresh();
         let RefreshOutcome::Failure(reason) = outcome else {
             panic!("expected Failure");
@@ -630,26 +580,28 @@ mod tests {
     }
 
     #[test]
-    fn test_refresh_receives_ranking_flag() {
+    fn test_refresh_invokes_tokens_check_ranking_argv() {
         let tmp = tempfile::tempdir().unwrap();
-        // Fail unless invoked with --ranking as $1, so this also proves the
-        // runner passes the flag the CLAUDE.md contract documents.
-        let script = write_fake_script(
-            tmp.path(),
-            "fake-probe.sh",
-            "[ \"$1\" = \"--ranking\" ] && exit 0 || exit 1",
+        let repo_root = tmp.path().to_path_buf();
+        let expected_workspace = repo_root.display().to_string();
+        // Fail unless invoked with the exact `tokens check --ranking
+        // --workspace <repo_root>` argv, proving the runner passes the
+        // arguments the module docs promise (issue #4080).
+        let body = format!(
+            "[ \"$1\" = tokens ] && [ \"$2\" = check ] && [ \"$3\" = --ranking ] && \
+             [ \"$4\" = --workspace ] && [ \"$5\" = \"{expected_workspace}\" ] && exit 0 || exit 1"
         );
-        let mut runner =
-            ScriptRankingRefreshRunner::new(tmp.path().to_path_buf()).with_script_bin(script);
+        let bin = write_fake_bin(tmp.path(), "fake-daemon.sh", &body);
+        let mut runner = ScriptRankingRefreshRunner::new(repo_root).with_bin(bin);
         assert_eq!(runner.refresh(), RefreshOutcome::Success);
     }
 
     #[test]
-    fn test_refresh_times_out_on_hung_script() {
+    fn test_refresh_times_out_on_hung_bin() {
         let tmp = tempfile::tempdir().unwrap();
-        let script = write_fake_script(tmp.path(), "fake-probe.sh", "sleep 30");
+        let bin = write_fake_bin(tmp.path(), "fake-daemon.sh", "sleep 30");
         let mut runner = ScriptRankingRefreshRunner::new(tmp.path().to_path_buf())
-            .with_script_bin(script)
+            .with_bin(bin)
             .with_timeout(Duration::from_millis(300));
         let outcome = runner.refresh();
         let RefreshOutcome::Failure(reason) = outcome else {
@@ -661,11 +613,10 @@ mod tests {
     #[test]
     fn test_refresh_spawn_failure_is_reported() {
         let tmp = tempfile::tempdir().unwrap();
-        // A script path that does not exist and was never `.exists()`-checked
+        // A binary path that does not exist and was never `.exists()`-checked
         // because it's an explicit override — spawn itself must fail cleanly.
         let bogus = tmp.path().join("does-not-exist.sh");
-        let mut runner =
-            ScriptRankingRefreshRunner::new(tmp.path().to_path_buf()).with_script_bin(bogus);
+        let mut runner = ScriptRankingRefreshRunner::new(tmp.path().to_path_buf()).with_bin(bogus);
         let outcome = runner.refresh();
         assert!(!outcome.is_success());
     }

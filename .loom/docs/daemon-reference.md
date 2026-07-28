@@ -1688,13 +1688,16 @@ already owns dispatch cadence and consumes the ranking (via `spawn-claude.sh`
 selection) on every sweep it spawns.
 
 **What it does.** On a configurable cadence (default 10 minutes) the loop
-shells out to each registered repo's `probe-tokens.sh --ranking` (the same
-script an operator cron would have called), which probes every bootstrapped
-account for its current rate-limit headers and atomically rewrites `.ranking`
-in whichever pool `loom_tools.tokens` resolves for that repo — the per-repo
-`.loom/tokens/`, or the shared machine-level pool (#3938) when the per-repo pool
-is absent/empty. Pool-location resolution is left entirely to the existing
-Python selector; the daemon-side loop never reimplements it.
+invokes **its own binary** (`std::env::current_exe()`) with `tokens check
+--ranking --workspace <repo_root>` for each registered repo — as of #4080 this
+is a direct daemon-to-daemon subcommand invocation rather than a shell out to
+`probe-tokens.sh`, which sidesteps the "stale binary predates the `tokens`
+subcommand" hazard entirely (the running daemon by construction supports its
+own subcommands) and drops a process layer (daemon → bash → daemon). It probes
+every bootstrapped account for its current rate-limit headers and atomically
+rewrites `.ranking` in whichever pool [`tokens_pool::paths`] resolves for that
+repo — the per-repo `.loom/tokens/`, or the shared machine-level pool (#3938)
+when the per-repo pool is absent/empty.
 
 **Default-on, unlike the work finder / main-health gate.** Those two loops are
 opt-in because they have dispatch-affecting side effects (spawning sweeps,

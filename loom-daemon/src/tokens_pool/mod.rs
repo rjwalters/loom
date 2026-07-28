@@ -3,10 +3,16 @@
 //!
 //! # Scope of this phase
 //!
-//! This is a **pure addition** — nothing in the repo calls into this module
-//! yet (`spawn-claude.sh`, `probe-tokens.sh`, and the daemon's own
-//! [`crate::token_ranking_refresh`] / [`crate::tokens`] remain on the Python
-//! path). The caller cutover is epic #4081 Phase 2.
+//! Phase 1 (issue #4082) was a **pure addition** with no caller cutover. Phase
+//! 2 (issue #4080, epic #4081) cut the check/probe path over: `loom-daemon
+//! tokens check` (issue #4108, this module's [`check`]) is invoked by
+//! `defaults/scripts/probe-tokens.sh` (native-binary resolution, `python3 -m`
+//! fallback removed), the daemon's own
+//! [`crate::token_ranking_refresh::ScriptRankingRefreshRunner`] (via
+//! `std::env::current_exe()`), and `loom-daemon status`'s
+//! `collect_token_usage()` (in-process). `spawn-claude.sh` (token *selection*,
+//! [`select`]) remains on the Python path — that cutover is a separate,
+//! file-disjoint follow-up.
 //!
 //! Ported in this phase — the concurrency-critical "hot path" every sweep
 //! dispatch exercises, plus the operator-facing bookkeeping CLI:

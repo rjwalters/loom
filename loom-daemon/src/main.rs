@@ -194,15 +194,15 @@ enum Commands {
     Restart,
 
     /// Manage the multi-account OAuth token pool at `.loom/tokens/` (Issue
-    /// #4082, Phase 1 of epic #4081 "eliminate Python from Loom"). Native
-    /// Rust port of the hot-path subset of `loom_tools.tokens` — the 3-tier
-    /// selection algorithm and the operator-facing pin/unpin/unblock
-    /// bookkeeping CLI. This is a pure addition in this phase: no existing
-    /// caller (`spawn-claude.sh`, `probe-tokens.sh`) has been switched over
-    /// yet, and `bootstrap`/`check`/`import-from-monitor` remain
-    /// Python-only (deferred to a follow-up issue — see
-    /// `loom-daemon/src/tokens_pool/mod.rs`). Purely file-based; does not
-    /// require a running daemon.
+    /// #4082/#4108, epic #4081 "eliminate Python from Loom"). Native Rust
+    /// port of the token pool: the 3-tier selection algorithm, the HTTP
+    /// rate-limit probe (`check`), and the operator-facing pin/unpin/unblock
+    /// bookkeeping CLI. As of #4080 (Phase 2) `check` is also the
+    /// implementation `probe-tokens.sh` and the daemon's own ranking
+    /// self-refresh invoke natively; `spawn-claude.sh` (selection) and
+    /// `bootstrap`/`import-from-monitor` remain Python-only (deferred to
+    /// follow-up issues — see `loom-daemon/src/tokens_pool/mod.rs`). Purely
+    /// file-based; does not require a running daemon.
     Tokens {
         #[command(subcommand)]
         action: TokensAction,
@@ -355,9 +355,11 @@ enum TokensAction {
     },
 
     /// Probe each bootstrapped account for rate-limit headers and rank by
-    /// available quota, optionally writing `.loom/tokens/.ranking`. Mirrors
-    /// `python3 -m loom_tools.tokens.cli check`. The HTTP probe shells to
-    /// `curl` (no HTTP-client crate — see `tokens_pool::check`).
+    /// available quota, optionally writing `.loom/tokens/.ranking`. A
+    /// byte-compatible port of the historical Python `loom-tokens check` CLI
+    /// (issue #4108) — as of #4080 this is also what `probe-tokens.sh` and
+    /// the daemon's own ranking self-refresh invoke natively. The HTTP probe
+    /// shells to `curl` (no HTTP-client crate — see `tokens_pool::check`).
     Check {
         /// Repo root containing `.loom/tokens/` (plain path, default `.` — no
         /// upward `.git` walk).
@@ -2011,28 +2013,33 @@ async fn handle_dispatch_command(
     }
 }
 
-/// Collect per-token usage by shelling out to `loom-tokens check --json`,
-/// mirroring `probe-tokens.sh`: prefer the `loom-tokens` binary on PATH, else
-/// fall back to `python3 -m loom_tools.tokens.cli`. Best-effort — returns
-/// `None` on any failure (binary absent, non-zero exit, unparseable output) so
-/// the status view still renders without the usage table.
+/// Collect per-token usage via an in-process call to
+/// [`loom_daemon::tokens_pool::check::run_check`] — the same native probe
+/// `loom-daemon tokens check --json` (`TokensAction::Check`) runs, called
+/// directly rather than shelled out to (issue #4080, epic #4081 Phase 2).
+/// `loom-daemon status` runs client-side with no supervision requirement, and
+/// the probe code is already linked into this binary, so there is no reason
+/// to pay a subprocess round-trip the way the historical `loom-tokens` /
+/// `python3 -m` two-tier shell-out did. Best-effort — never panics, never
+/// propagates an error, and returns `None` when the workspace can't be
+/// resolved so the status view still renders without the usage table.
 fn collect_token_usage() -> Option<serde_json::Value> {
-    let attempts: [(&str, &[&str]); 2] = [
-        ("loom-tokens", &["check", "--json"]),
-        ("python3", &["-m", "loom_tools.tokens.cli", "check", "--json"]),
-    ];
-    for (bin, args) in attempts {
-        let Ok(output) = Command::new(bin).args(args).output() else {
-            continue;
-        };
-        if !output.status.success() {
-            continue;
-        }
-        if let Ok(value) = serde_json::from_slice::<serde_json::Value>(&output.stdout) {
-            return Some(value);
-        }
-    }
-    None
+    use loom_daemon::tokens_pool::check::{
+        self, CheckOptions, CurlTransport, DEFAULT_PROBE_MODEL, DEFAULT_PROBE_PROMPT,
+    };
+
+    let ws = resolve_tokens_workspace(".").ok()?;
+    let tokens_dir = loom_daemon::tokens_pool::paths::resolve_tokens_dir(&ws);
+
+    let opts = CheckOptions {
+        source: check::resolve_source(None),
+        write_ranking: false,
+        probe_prompt: DEFAULT_PROBE_PROMPT,
+        model: DEFAULT_PROBE_MODEL,
+        stagger: true,
+    };
+    let report = check::run_check(&tokens_dir, &opts, &CurlTransport);
+    Some(report.to_json())
 }
 
 /// Handle the `status` subcommand — render the running daemon's autonomous-mode
