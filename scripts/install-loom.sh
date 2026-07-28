@@ -1437,6 +1437,16 @@ LOOM_RETIRED_FILES=$(cat <<'RETIRED'
 .claude/commands/loom/release.md f6523d9be058e40397f0ce30c08a8f2b60e9b38adae04bd7c919e0cc840acfec
 .claude/commands/loom/release.md 29a845f7f8912545d23832551753304df6e72dd4a9c8082c2d8ada1f09f449e1
 .claude/commands/loom/release.md 795c1df1d3f3706ba448482b037a0c9e4eb6272a719adb2688b9ddfc91ab4de6
+# .claude/agents/loom-shepherd.md — every version shipped from #1259/#1264
+# (initial subagent files) through #3871, before the v0.10.0 shepherd/daemon
+# deletion (#3884) removed it outright (#4097). .claude/ is merge-copied with
+# no orphan removal, so a pre-#3884 install keeps this stray forever unless
+# swept here.
+.claude/agents/loom-shepherd.md 1cbca10c8b0352fc3db636e0abb6fdf25ddcfb6138b7a21ab5faeb8b21f730a2
+.claude/agents/loom-shepherd.md 2be39b1d7978dbb3a8d502eaed2cfff9a8f9832aae801c8683a425405c0a2753
+.claude/agents/loom-shepherd.md 35830eb68c9ab3ad1cbeaf6ce2b62c7d919f3e06cc5234c46ad2c6c4f637c8ff
+.claude/agents/loom-shepherd.md 6c7e207a5f040675f31447427b4241999adab4d58831e8d5bc605c2ac5d500b2
+.claude/agents/loom-shepherd.md 8cfc89428135cb55c91a6ae768bbd3373dbe2a1d22eb088694bc158ce0091d34
 RETIRED
 )
 
@@ -1688,6 +1698,24 @@ if [[ -x ".loom/scripts/verify-install.sh" ]]; then
   ./.loom/scripts/verify-install.sh generate --quiet || \
     warning "Manifest generation failed (non-fatal)"
   success "Installation manifest generated (.loom/manifest.json)"
+
+  # Check intra-repo links in installed files resolve (issue #4097). A
+  # dangling target here means an installed file points at a sibling
+  # Loom never shipped (a packaging gap, like #4097 itself) — surfacing it
+  # here beats a downstream consumer audit finding it later.
+  #
+  # Non-fatal by design: some shipped reference docs (daemon-reference.md,
+  # troubleshooting.md) carry pre-existing links into the Loom SOURCE repo's
+  # own tree (source files, dev-only docs under docs/) that were authored
+  # assuming the doc lives only there — a known, tracked gap (see #4097's
+  # PR discussion) distinct from the packaging-boundary defects this check
+  # exists to catch. Promote to `error` once that cleanup lands.
+  info "Checking intra-repo links in installed files..."
+  if ./.loom/scripts/verify-install.sh check-links --quiet; then
+    success "All intra-repo links resolve"
+  else
+    warning "Some intra-repo links in installed files are dangling (non-fatal) — run './.loom/scripts/verify-install.sh check-links' for details"
+  fi
 fi
 echo ""
 

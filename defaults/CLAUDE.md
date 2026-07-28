@@ -224,7 +224,7 @@ The daemon **does not** poll the forge for ready issues, **does not** maintain a
 
 For the full surface — IPC request/response variants, event-bus internals, registry behaviour, reaper semantics — see [`.loom/docs/daemon-reference.md`](.loom/docs/daemon-reference.md).
 
-> **Legacy spawn loop (removed)**: `defaults/scripts/spawn-loop.sh` (Phase 1, #3374) was **removed in v0.11.0**. Use `mcp__loom__dispatch_sweep` against `loom-daemon` instead. See [the migration guide](../docs/migration/v0.10.0-shepherd-deprecation.md).
+> **Legacy spawn loop (removed)**: `defaults/scripts/spawn-loop.sh` (Phase 1, #3374) was **removed in v0.11.0**. Use `mcp__loom__dispatch_sweep` against `loom-daemon` instead. See [the migration guide](https://github.com/rjwalters/loom/blob/main/docs/migration/v0.10.0-shepherd-deprecation.md) (in the upstream Loom repo — `docs/migration/` is not shipped to consumer installs).
 
 ### Scheduled Support Roles (Phase 2a, opt-in; daemon-native alternative #4015)
 
@@ -320,7 +320,7 @@ Full role definitions with detailed guidelines are available in:
 - `.loom/roles/guide.md` - Issue triage and prioritization
 - `.loom/roles/auditor.md` - Main branch validation
 
-> **Note**: the historical `shepherd.md` (single-issue orchestrator) role file was removed in v0.10.0 along with the `/shepherd` slash command — see [the migration guide](../docs/migration/v0.10.0-shepherd-deprecation.md). Its orchestration responsibilities moved to `/loom:sweep` (Tier 1) and the `loom-daemon` + GH Actions cron (Tier 2). The `loom.md` role file is preserved and documents the daemon-mode operator surface: a Claude Code session that observes the running `loom-daemon` via MCP tools (`mcp__loom__list_sweeps`, `mcp__loom__get_sweep_status`, `mcp__loom__subscribe_to_events`) and dispatches new work via `mcp__loom__dispatch_sweep`. The historical Python brain (`loom_tools/daemon_v2/`) is gone; the MCP-level surface is the supported coordination point. The worker-role markdown files above are unchanged.
+> **Note**: the historical `shepherd.md` (single-issue orchestrator) role file was removed in v0.10.0 along with the `/shepherd` slash command — see [the migration guide](https://github.com/rjwalters/loom/blob/main/docs/migration/v0.10.0-shepherd-deprecation.md) (upstream Loom repo). Its orchestration responsibilities moved to `/loom:sweep` (Tier 1) and the `loom-daemon` + GH Actions cron (Tier 2). The `loom.md` role file is preserved and documents the daemon-mode operator surface: a Claude Code session that observes the running `loom-daemon` via MCP tools (`mcp__loom__list_sweeps`, `mcp__loom__get_sweep_status`, `mcp__loom__subscribe_to_events`) and dispatches new work via `mcp__loom__dispatch_sweep`. The historical Python brain (`loom_tools/daemon_v2/`) is gone; the MCP-level surface is the supported coordination point. The worker-role markdown files above are unchanged.
 
 ## Label-Based Workflow
 
@@ -727,7 +727,7 @@ PATH="$HOME/.local/bin:$PATH"` in `~/.zshrc` / `~/.bashrc`) — otherwise point
 && loom-daemon --version`; the provisioned binary version matches your installed
 Loom version.
 
-**Shutdown decision**: a clean stop leaves in-flight `/loom:sweep` children **running** — they are independent detached processes that survive a daemon restart by design (killing the dispatcher must not kill dispatched work); the registry reconciles them on the next start. Use `mcp__loom__cancel_sweep` against a running daemon to actively cancel a sweep before stopping. The full config table, start/stop flags, and a scripted end-to-end acceptance playbook are in [`.loom/docs/daemon-reference.md`](.loom/docs/daemon-reference.md) §Operability and [`docs/autonomous-mode-e2e.md`](../docs/autonomous-mode-e2e.md).
+**Shutdown decision**: a clean stop leaves in-flight `/loom:sweep` children **running** — they are independent detached processes that survive a daemon restart by design (killing the dispatcher must not kill dispatched work); the registry reconciles them on the next start. Use `mcp__loom__cancel_sweep` against a running daemon to actively cancel a sweep before stopping. The full config table, start/stop flags, and a scripted end-to-end acceptance playbook are in [`.loom/docs/daemon-reference.md`](.loom/docs/daemon-reference.md) §Operability and [`docs/autonomous-mode-e2e.md`](https://github.com/rjwalters/loom/blob/main/docs/autonomous-mode-e2e.md) (upstream Loom repo).
 
 **Self-update (#3968)**: after merging a daemon fix, `./.loom/scripts/cli/loom-daemon-update.sh` is the single operator command that rebuilds (`cargo build --release`), reprovisions, and restarts — reading the flags `loom-daemon-start.sh` persisted to `.loom/.daemon.flags` at the last start and replaying them **exactly** (never wider than what was already running). Staleness is detected by comparing the commit baked into the resolved binary against the local source tree's `HEAD` (`--check` for a read-only report, `--dry-run` to preview, `--no-restart` to rebuild without touching a running daemon). A daemon that wasn't already running is never started by this script. `loom-daemon --status` also surfaces a read-only "update available" hint from the same comparison — advisory only, no auto-restart. See [Self-update](.loom/docs/daemon-reference.md#self-update-rebuild--provision--restart-3968) for the full detection strategy and provisioning rules.
 
@@ -796,9 +796,10 @@ The ladder is configured in `.loom/config.json`:
 
 > **Retuning these defaults is measurement-gated.** Whether to flip a role's
 > default `opus → sonnet` ("cheap-first") is decided by measured data, not edited
-> blind — see [`docs/model-selection-retune.md`](../docs/model-selection-retune.md)
-> for the decision inequality and the `agent-metrics.sh --by-model` (#3482) gating
-> procedure. Builder is the only real candidate; no default has been flipped.
+> blind — see [`docs/model-selection-retune.md`](https://github.com/rjwalters/loom/blob/main/docs/model-selection-retune.md)
+> (upstream Loom repo) for the decision inequality and the `agent-metrics.sh
+> --by-model` (#3482) gating procedure. Builder is the only real candidate; no
+> default has been flipped.
 
 **Valid model values**: aliases (`haiku`, `sonnet`, `opus`) or pinned model IDs (e.g., `claude-sonnet-4-6`).
 
@@ -1923,7 +1924,7 @@ loom-stuck-detection check-issue 123
 | `dead_pid` | (instant) | PID in daemon registry is no longer alive |
 | `error_spike` | 5 errors | Multiple errors in `.loom/logs/sweep-issue-N.log` |
 
-The pre-v0.10.0 indicators `no_progress`, `extended_work`, and `looping` are no longer tractable post-deletion of `.loom/progress/` — see [the migration guide § Per-CLI breaking changes](../docs/migration/v0.10.0-shepherd-deprecation.md#per-cli-breaking-changes) for the diff.
+The pre-v0.10.0 indicators `no_progress`, `extended_work`, and `looping` are no longer tractable post-deletion of `.loom/progress/` — see [the migration guide § Per-CLI breaking changes](https://github.com/rjwalters/loom/blob/main/docs/migration/v0.10.0-shepherd-deprecation.md#per-cli-breaking-changes) (upstream Loom repo) for the diff.
 
 ### Daemon Troubleshooting
 
@@ -2263,7 +2264,7 @@ Loom's orchestration architecture migration (epic #3372) deleted the shepherd br
 | #3449 Phase D | #3454 | `/loom:sweep` Stage -1 backend detection (strict-AND daemon + pool probe) | shipped |
 | #3449 Phase E | #3456 | `spawn-loop.sh` deprecation warning + operator-doc rewrite | shipped |
 
-**v1.0.0 is intentionally unscheduled.** Loom remains pre-1.0 while the architecture settles. The migration guide filename `docs/migration/v0.10.0-shepherd-deprecation.md` is named for the release that ships the deletions.
+**v1.0.0 is intentionally unscheduled.** Loom remains pre-1.0 while the architecture settles. The migration guide filename (`v0.10.0-shepherd-deprecation.md`, in the upstream Loom repo's `docs/migration/` — not shipped to consumer installs) is named for the release that ships the deletions.
 
 **Removed entry points** (no longer present in v0.10.0+):
 
@@ -2308,7 +2309,7 @@ These surfaces are **not** going away and are the supported replacements:
 - **Daemon-rebuild epic**: #3449 (Phases A–E shipped; Phase F is the dedicated daemon-rebuild migration guide).
 - **Original shepherd-deprecation epic**: #3372.
 - **Consumer inventory + disposition table**: `docs/migration/daemon-state-consumers.md` — read this if you have code that imports from `loom_tools.daemon_v2` or `loom_tools.shepherd`, or reads `.loom/daemon-state.json` or `.loom/progress/`.
-- **Full migration guide**: [`docs/migration/v0.10.0-shepherd-deprecation.md`](../docs/migration/v0.10.0-shepherd-deprecation.md).
+- **Full migration guide**: [`docs/migration/v0.10.0-shepherd-deprecation.md`](https://github.com/rjwalters/loom/blob/main/docs/migration/v0.10.0-shepherd-deprecation.md) (upstream Loom repo).
 - **Architect/Hermit cadence (work generation)** after the Python brain is removed — tracked in #3381.
 
 ## Resources
