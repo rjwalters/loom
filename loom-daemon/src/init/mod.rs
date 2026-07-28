@@ -1609,10 +1609,12 @@ mod tests {
 
     #[test]
     fn test_preserved_files_excluded_from_verification_failures_end_to_end() {
-        // End-to-end: a customized .github/labels.yml (preserved by merge_dir_with_report
-        // on reinstall) should not appear as a verification failure after init, even
-        // though its bytes differ from the source defaults. This is the regression case
-        // from issue #3218.
+        // End-to-end: a consumer .github/labels.yml is block-merged on reinstall
+        // (issue #4187) — its Loom BEGIN/END LOOM LABELS block is refreshed while
+        // consumer-authored labels outside the block survive. The resulting file
+        // differs from the shipped source, so it must be recorded as `preserved`
+        // and must NOT surface as a verification failure. This also covers the
+        // original issue #3218 regression (preserved file leaking into failures).
         let temp_dir = TempDir::new().unwrap();
         let workspace = temp_dir.path();
         let defaults = temp_dir.path().join("defaults");
@@ -1624,16 +1626,20 @@ mod tests {
         fs::write(defaults.join("config.json"), "{}").unwrap();
         fs::write(defaults.join("roles").join("builder.md"), "builder").unwrap();
 
-        // .github scaffolding default with content X
+        // Shipped .github/labels.yml with a Loom-managed marker block.
         fs::create_dir_all(defaults.join(".github")).unwrap();
-        fs::write(defaults.join(".github").join("labels.yml"), "- name: default\n  color: ffffff")
-            .unwrap();
+        fs::write(
+            defaults.join(".github").join("labels.yml"),
+            "# BEGIN LOOM LABELS\n- name: loom:issue\n  color: ffffff\n# END LOOM LABELS\n",
+        )
+        .unwrap();
 
-        // Pre-existing customized .github/labels.yml with content Y (different bytes)
+        // Pre-existing consumer .github/labels.yml: a stale Loom block plus a
+        // consumer-authored label OUTSIDE the block.
         fs::create_dir_all(workspace.join(".github")).unwrap();
         fs::write(
             workspace.join(".github").join("labels.yml"),
-            "- name: customized\n  color: 000000\n  description: user edit",
+            "# BEGIN LOOM LABELS\n- name: loom:issue\n  color: 000000\n# END LOOM LABELS\n\n- name: team:frontend\n  color: 00ff00\n  description: consumer label\n",
         )
         .unwrap();
 
@@ -1642,14 +1648,26 @@ mod tests {
         assert!(result.is_ok());
         let report = result.unwrap();
 
-        // The customized file must be reported as preserved
+        // The block-merged file must be reported as preserved (consumer-owned).
         assert!(
             report.preserved.contains(&".github/labels.yml".to_string()),
             "preserved should contain .github/labels.yml, got: {:?}",
             report.preserved
         );
 
-        // And it must NOT appear as a verification failure (the bug we're fixing)
+        // The Loom block was refreshed to the shipped color; the consumer label
+        // outside the block survived untouched.
+        let installed = fs::read_to_string(workspace.join(".github").join("labels.yml")).unwrap();
+        assert!(
+            installed.contains("color: ffffff"),
+            "Loom block should be refreshed: {installed}"
+        );
+        assert!(
+            installed.contains("- name: team:frontend"),
+            "consumer label must survive: {installed}"
+        );
+
+        // And it must NOT appear as a verification failure (issue #3218).
         let leaked: Vec<&String> = report
             .verification_failures
             .iter()

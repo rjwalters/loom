@@ -46,6 +46,134 @@ fn is_loom_hook_command(cmd: &str) -> bool {
 pub const LOOM_SECTION_START: &str = "<!-- BEGIN LOOM ORCHESTRATION -->";
 pub const LOOM_SECTION_END: &str = "<!-- END LOOM ORCHESTRATION -->";
 
+/// Loom-managed block markers for `.github/labels.yml` (issue #4187).
+///
+/// `.github/labels.yml` is the one scaffolding file a consumer legitimately
+/// co-owns: Loom ships its 27 workflow labels, but a consumer may add their own
+/// labels to the same file. Wrapping Loom's entries in these YAML-comment
+/// markers lets install/upgrade/uninstall touch **only** Loom's range and never
+/// clobber or orphan consumer-authored labels — the same marker-delimited
+/// managed-section pattern already used for root `CLAUDE.md`
+/// ([`LOOM_SECTION_START`]) and the `.gitignore` block.
+///
+/// The markers occupy their own comment lines in the shipped file; the line-
+/// oriented `sync-labels.sh` parser treats them (like every `#` line) as inert.
+pub const LOOM_LABELS_START: &str = "# BEGIN LOOM LABELS";
+pub const LOOM_LABELS_END: &str = "# END LOOM LABELS";
+
+/// The `.github`-relative path of the label registry, special-cased in the
+/// scaffolding copy so its Loom-managed block is merged rather than the whole
+/// file being clobbered (force) or frozen (merge). See [`install_labels_block`].
+const LABELS_YML_REL: &str = ".github/labels.yml";
+
+/// Extract the inclusive `# BEGIN LOOM LABELS` … `# END LOOM LABELS` block from
+/// `content`, returning the byte range `[start, end)` that spans from the first
+/// character of the BEGIN marker through the last character of the END marker
+/// (the trailing newline after END, if any, is **not** included).
+///
+/// Returns `None` when the markers are absent or malformed (END before BEGIN),
+/// so callers can fall back to append/preserve semantics rather than splicing a
+/// nonsensical range.
+fn labels_block_range(content: &str) -> Option<(usize, usize)> {
+    let start = content.find(LOOM_LABELS_START)?;
+    // Search for END only after BEGIN so a stray END above BEGIN can't invert
+    // the range.
+    let end_marker = content[start..].find(LOOM_LABELS_END)? + start;
+    let end = end_marker + LOOM_LABELS_END.len();
+    Some((start, end))
+}
+
+/// Compute the correct `.github/labels.yml` content for an install, preserving
+/// all consumer-owned entries outside the Loom-managed marker block.
+///
+/// - **`existing` has a well-formed block** → replace only the marked range with
+///   the shipped block; everything before/after is preserved byte-for-byte.
+/// - **`existing` is markerless** (a legacy install, or a consumer file Loom has
+///   never touched) → append the shipped block, preserving every existing entry.
+/// - **`source` has no block** (defensive; the shipped file always does) →
+///   return `existing` unchanged rather than risk clobbering consumer content.
+///
+/// The result is `None` when no change is needed (`existing` already equals the
+/// computed content), letting the caller record the file as `preserved`.
+fn merge_labels_block(existing: &str, source: &str) -> Option<String> {
+    let Some((src_start, src_end)) = labels_block_range(source) else {
+        // Shipped file unexpectedly lacks markers — never clobber the consumer.
+        return None;
+    };
+    let source_block = &source[src_start..src_end];
+
+    let merged = if let Some((dst_start, dst_end)) = labels_block_range(existing) {
+        // Splice the shipped block over the consumer's marked range.
+        format!("{}{}{}", &existing[..dst_start], source_block, &existing[dst_end..])
+    } else {
+        // Markerless consumer file: append the block, preserving all entries.
+        let head = existing.trim_end_matches('\n');
+        if head.is_empty() {
+            format!("{source_block}\n")
+        } else {
+            format!("{head}\n\n{source_block}\n")
+        }
+    };
+
+    if merged == existing {
+        None
+    } else {
+        Some(merged)
+    }
+}
+
+/// Install `.github/labels.yml` with Loom-block merge semantics (issue #4187).
+///
+/// `pre_existing` is the destination's content **before** the enclosing
+/// `.github` directory copy ran (that copy may have clobbered it under `--force`
+/// or left it frozen under merge — either way this function re-derives and writes
+/// the authoritative content). Any label-registry entry the directory copy left
+/// in the report is dropped and replaced with the correct one here.
+fn install_labels_block(
+    src: &Path,
+    dst: &Path,
+    pre_existing: Option<&str>,
+    report: &mut InitReport,
+) -> Result<(), String> {
+    let source =
+        fs::read_to_string(src).map_err(|e| format!("Failed to read labels.yml template: {e}"))?;
+
+    // The directory copy above already recorded labels.yml somewhere — drop that
+    // entry; this function is authoritative for the file.
+    report.added.retain(|f| f != LABELS_YML_REL);
+    report.updated.retain(|f| f != LABELS_YML_REL);
+    report.preserved.retain(|f| f != LABELS_YML_REL);
+
+    match pre_existing {
+        None => {
+            // Fresh install: ship the file verbatim (markers included), so the
+            // two registry copies stay byte-identical (#3896).
+            fs::write(dst, &source).map_err(|e| format!("Failed to write labels.yml: {e}"))?;
+            report.added.push(LABELS_YML_REL.to_string());
+        }
+        Some(existing) => {
+            match merge_labels_block(existing, &source) {
+                Some(merged) => {
+                    fs::write(dst, &merged)
+                        .map_err(|e| format!("Failed to write labels.yml: {e}"))?;
+                }
+                None => {
+                    // Content unchanged — but a `--force` directory copy may have
+                    // overwritten the file, so restore the consumer's version.
+                    fs::write(dst, existing)
+                        .map_err(|e| format!("Failed to write labels.yml: {e}"))?;
+                }
+            }
+            // Consumer-owned file: record as preserved so the post-install byte
+            // verification (which expects installed == source) does not flag the
+            // intentional divergence. See filter_preserved_from_verification_failures.
+            report.preserved.push(LABELS_YML_REL.to_string());
+        }
+    }
+
+    Ok(())
+}
+
 /// The short pointer injected into root CLAUDE.md (between section markers).
 ///
 /// This block is committed to the consumer repo, so its authoritative reference
@@ -762,13 +890,27 @@ pub fn setup_repository_scaffolding(
         report,
     )?;
 
-    // Copy .github/ directory
+    // Copy .github/ directory.
+    //
+    // `.github/labels.yml` is special-cased (issue #4187): capture its
+    // destination content BEFORE the directory copy (which clobbers it under
+    // --force / freezes it under merge), then re-derive the authoritative
+    // content via install_labels_block so only Loom's BEGIN/END LOOM LABELS
+    // block is (re)written and consumer-authored labels outside it survive.
+    let labels_src = defaults_path.join(LABELS_YML_REL);
+    let labels_dst = workspace_path.join(LABELS_YML_REL);
+    let pre_existing_labels = fs::read_to_string(&labels_dst).ok();
+
     copy_directory(
         &defaults_path.join(".github"),
         &workspace_path.join(".github"),
         ".github",
         report,
     )?;
+
+    if labels_src.exists() {
+        install_labels_block(&labels_src, &labels_dst, pre_existing_labels.as_deref(), report)?;
+    }
 
     // Note: The label-external-issues.yml workflow is no longer installed by default.
     // It generated spammy "No jobs were run" emails in single-contributor repos.
@@ -2639,5 +2781,123 @@ Run `cargo run` to start.";
         // must pass.
         let clean = wrap_loom_content(LOOM_ROOT_POINTER);
         assert!(assert_no_placeholders(&clean, "CLAUDE.md").is_ok());
+    }
+
+    // ── .github/labels.yml Loom-block merge (issue #4187) ──────────────────
+
+    const SHIPPED_LABELS: &str = "# BEGIN LOOM LABELS\n# managed by Loom\n- name: loom:issue\n  color: \"3B82F6\"\n- name: loom:building\n  color: \"F59E0B\"\n# END LOOM LABELS\n";
+
+    #[test]
+    fn test_labels_block_range_well_formed() {
+        let (start, end) = labels_block_range(SHIPPED_LABELS).unwrap();
+        assert_eq!(&SHIPPED_LABELS[start..start + LOOM_LABELS_START.len()], LOOM_LABELS_START);
+        assert!(SHIPPED_LABELS[..end].ends_with(LOOM_LABELS_END));
+    }
+
+    #[test]
+    fn test_labels_block_range_absent_or_malformed() {
+        // No markers at all.
+        assert!(labels_block_range("- name: team:foo\n  color: abcdef\n").is_none());
+        // END before BEGIN is not a valid block.
+        let inverted = "# END LOOM LABELS\n- name: x\n# BEGIN LOOM LABELS\n";
+        // BEGIN is found, but END only searched after BEGIN -> none.
+        assert!(labels_block_range(inverted).is_none());
+    }
+
+    #[test]
+    fn test_merge_labels_block_replaces_marked_range_preserving_outside() {
+        // Consumer file: labels above and below a stale Loom block.
+        let existing = "- name: team:above\n  color: \"111111\"\n\n# BEGIN LOOM LABELS\n- name: loom:issue\n  color: \"000000\"\n# END LOOM LABELS\n\n- name: team:below\n  color: \"222222\"\n";
+        let merged = merge_labels_block(existing, SHIPPED_LABELS).unwrap();
+
+        // Consumer entries outside the block are byte-preserved.
+        assert!(merged.contains("- name: team:above"));
+        assert!(merged.contains("- name: team:below"));
+        // The Loom block is refreshed to the shipped content.
+        assert!(merged.contains("color: \"3B82F6\""));
+        assert!(merged.contains("- name: loom:building"));
+        assert!(!merged.contains("color: \"000000\""), "stale Loom color must be gone");
+        // Exactly one marker pair.
+        assert_eq!(merged.matches(LOOM_LABELS_START).count(), 1);
+        assert_eq!(merged.matches(LOOM_LABELS_END).count(), 1);
+    }
+
+    #[test]
+    fn test_merge_labels_block_appends_to_markerless_file() {
+        let existing =
+            "- name: team:frontend\n  color: \"00ff00\"\n  description: consumer label\n";
+        let merged = merge_labels_block(existing, SHIPPED_LABELS).unwrap();
+
+        // Every existing entry survives.
+        assert!(merged.contains("- name: team:frontend"));
+        assert!(merged.contains("description: consumer label"));
+        // The Loom block is appended.
+        assert!(merged.contains(LOOM_LABELS_START));
+        assert!(merged.contains("- name: loom:issue"));
+        // Consumer content precedes the appended block.
+        assert!(merged.find("team:frontend").unwrap() < merged.find(LOOM_LABELS_START).unwrap());
+    }
+
+    #[test]
+    fn test_merge_labels_block_noop_when_block_matches() {
+        // A file that already equals a plain copy of the shipped file needs no change.
+        assert!(merge_labels_block(SHIPPED_LABELS, SHIPPED_LABELS).is_none());
+    }
+
+    #[test]
+    fn test_merge_labels_block_preserves_when_source_markerless() {
+        // Defensive: a shipped file without markers must never clobber consumer content.
+        let existing = "- name: team:only\n  color: \"abcdef\"\n";
+        assert!(merge_labels_block(existing, "- name: loom:issue\n  color: fff\n").is_none());
+    }
+
+    #[test]
+    fn test_install_labels_block_fresh_install_is_verbatim_copy() {
+        let temp = TempDir::new().unwrap();
+        let src = temp.path().join("labels.src.yml");
+        let dst = temp.path().join("labels.yml");
+        fs::write(&src, SHIPPED_LABELS).unwrap();
+
+        let mut report = InitReport::default();
+        install_labels_block(&src, &dst, None, &mut report).unwrap();
+
+        // Fresh install ships the file byte-for-byte (keeps registry parity).
+        assert_eq!(fs::read_to_string(&dst).unwrap(), SHIPPED_LABELS);
+        assert!(report.added.contains(&LABELS_YML_REL.to_string()));
+        assert!(!report.preserved.contains(&LABELS_YML_REL.to_string()));
+    }
+
+    #[test]
+    fn test_install_labels_block_force_restores_consumer_content() {
+        // Simulate a --force directory copy having clobbered the dst with the
+        // shipped file, while pre_existing captured the consumer's real content.
+        let temp = TempDir::new().unwrap();
+        let src = temp.path().join("labels.src.yml");
+        let dst = temp.path().join("labels.yml");
+        fs::write(&src, SHIPPED_LABELS).unwrap();
+        // Post-clobber on-disk state.
+        fs::write(&dst, SHIPPED_LABELS).unwrap();
+
+        let pre_existing = "# BEGIN LOOM LABELS\n- name: loom:issue\n  color: \"000000\"\n# END LOOM LABELS\n\n- name: team:below\n  color: \"222222\"\n";
+
+        let mut report = InitReport::default();
+        install_labels_block(&src, &dst, Some(pre_existing), &mut report).unwrap();
+
+        let result = fs::read_to_string(&dst).unwrap();
+        // Consumer label survives the force reinstall.
+        assert!(result.contains("- name: team:below"));
+        // Loom block refreshed.
+        assert!(result.contains("color: \"3B82F6\""));
+        // Recorded as preserved (consumer-owned) — dropped any copy-side entry.
+        assert!(report.preserved.contains(&LABELS_YML_REL.to_string()));
+        assert_eq!(report.added.iter().filter(|f| *f == LABELS_YML_REL).count(), 0);
+        assert_eq!(
+            report
+                .updated
+                .iter()
+                .filter(|f| *f == LABELS_YML_REL)
+                .count(),
+            0
+        );
     }
 }

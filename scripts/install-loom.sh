@@ -1316,7 +1316,12 @@ if [[ -f "$TARGET_PATH/.loom/install-metadata.json" ]] && command -v jq >/dev/nu
         continue
         ;;
       .github/labels.yml|.github/CONFIGURATION.md|.github/ISSUE_TEMPLATE/config.yml|.github/ISSUE_TEMPLATE/task.yml)
-        # Loom-shipped — fall through to the sweep.
+        # Loom-shipped — fall through to the sweep. Note (#4187): labels.yml is
+        # co-owned — Loom manages only its BEGIN/END LOOM LABELS block. This
+        # sweep only fires if Loom STOPS shipping the file entirely; while it is
+        # shipped the block-merge in loom-daemon init owns updates. If labels.yml
+        # is ever retired, a whole-file git rm here would still take consumer
+        # labels with it — prefer a marker-block strip (see uninstall-loom.sh).
         ;;
       .github/*)
         # Consumer-owned by default.
