@@ -19,6 +19,7 @@
 //!
 //! | Module | Python source | Mirrors |
 //! |---|---|---|
+//! | [`bootstrap`] | `tokens/bootstrap.py` | multi-source `.env` merge + `.token`/`index.json` provisioning |
 //! | [`paths`] | `tokens/paths.py` | per-repo/shared pool resolution (#3938) |
 //! | [`locking`] | `tokens/_locking.py` | `mkdir`-based lock (no `flock` — absent on stock macOS) |
 //! | [`rng`] | (stdlib `random`) | seedable PRNG for deterministic tests, no new crate |
@@ -36,11 +37,14 @@
 //! already shells out via `Command::new`. The transport is behind the
 //! [`check::ProbeTransport`] trait so tests never touch the network.
 //!
-//! **Deferred to follow-up issues** (filed alongside issue #4094 — see the PR
-//! description): `bootstrap.py` (multi-source `.env` merge + file provisioning)
-//! and `monitor_db.py` (claude-monitor SQLite import). Neither is on the
-//! per-dispatch hot path (they run at bootstrap time or on an operator
-//! cadence), so scoping them out keeps this increment reviewable.
+//! `bootstrap.py` (multi-source `.env` merge + file provisioning) was ported in
+//! issue #4105 as [`bootstrap`]. **Still deferred**: `monitor_db.py`
+//! (claude-monitor SQLite import, consumed by `import-from-monitor`, issue
+//! #4106). It is not on the per-dispatch hot path (it runs at bootstrap time or
+//! on an operator cadence), so scoping it out keeps each increment reviewable.
+//! [`bootstrap`] leaves the read-only `_check_monitor_divergence` warning
+//! (which reads the live `usage.db`) to that same follow-up, since it depends on
+//! the unported SQLite reader.
 //!
 //! # Byte-compatible state (hard requirement)
 //!
@@ -53,6 +57,7 @@
 
 pub mod allowlist;
 pub mod bad_tokens;
+pub mod bootstrap;
 pub mod check;
 pub mod failure_counts;
 pub mod locking;
