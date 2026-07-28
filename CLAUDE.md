@@ -297,7 +297,8 @@ map, downstream-consumer guidance —
   [troubleshooting](.loom/docs/troubleshooting.md) ·
   [build-gate](.loom/docs/build-gate.md) ·
   [forge-auth](.loom/docs/forge-authentication.md) /
-  [github-auth](.loom/docs/github-authentication.md)
+  [github-auth](.loom/docs/github-authentication.md) ·
+  [safehouse](.loom/docs/safehouse.md)
 
 ---
 

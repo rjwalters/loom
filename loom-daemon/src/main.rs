@@ -764,6 +764,11 @@ async fn main() -> Result<()> {
         Arc::new(WorkspacePool::new(event_bus.clone(), tokio::runtime::Handle::current()));
     workspace_pool.seed(sweep_workspace.clone(), sweep_registry.clone());
 
+    // Optional safehouse fleet-comms narration (#3997): subscribe the shared
+    // event bus and narrate sweep-lifecycle transitions into an E2E Matrix room.
+    // Byte-for-byte no-op when `safehouse.enabled` is false/absent.
+    workspace_pool.start_safehouse_narration(&sweep_workspace);
+
     // Startup watchdog (Issue #3887): auto-cancel + re-dispatch (once, bounded)
     // any daemon-dispatched sweep that hangs at startup with no progress. On by
     // default; disable with LOOM_SWEEP_WATCHDOG=0 or

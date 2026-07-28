@@ -8,6 +8,12 @@
       "known_hosts": []
     }
   },
+  "safehouse": {
+    "enabled": false,
+    "socket": null,
+    "room": null,
+    "persona": "loom_daemon"
+  },
   "health_monitoring": {
     "enabled": true,
     "collect_interval_minutes": 5,
