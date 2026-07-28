@@ -722,6 +722,44 @@ def test_cli_empty_pool_exits_78(tmp_path):
     assert "loom-tokens bootstrap" in result.stderr
 
 
+def test_cli_no_runpy_import_order_warning(tmp_path):
+    """`python -m loom_tools.tokens.select` must not print the runpy
+    RuntimeWarning caused by the package `__init__` eagerly importing the
+    `select` submodule before runpy executes it as `__main__` (issue #4218).
+    """
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "loom_tools.tokens.select",
+            "--workspace",
+            str(tmp_path),
+            "--json",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+        env=_cli_env(),
+    )
+    assert result.returncode == EX_CONFIG
+    assert "RuntimeWarning" not in result.stderr
+    assert "found in sys.modules" not in result.stderr
+
+
+def test_package_lazy_reexport_identity():
+    """The package-level API (`select_token`, `EmptyTokenPoolError`, etc.) must
+    still resolve, lazily, to the exact objects defined in the `select`
+    submodule (PEP 562 `__getattr__`, not an eager import) — see #4218.
+    """
+    import loom_tools.tokens as tokens_pkg
+    import loom_tools.tokens.select as select_mod
+
+    assert tokens_pkg.select_token is select_mod.select_token
+    assert tokens_pkg.EmptyTokenPoolError is select_mod.EmptyTokenPoolError
+    assert tokens_pkg.SelectedToken is select_mod.SelectedToken
+    assert tokens_pkg.TokenSelectionError is select_mod.TokenSelectionError
+
+
 # ---------- shared machine-level pool fallback (issue #3938) ----------
 
 
