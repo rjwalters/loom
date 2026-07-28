@@ -571,6 +571,187 @@ def test_bootstrap_no_source_both_fail(tmp_path):
     assert rust.returncode != 0
 
 
+# ---------------------------------------------------------------------------
+# import-from-monitor: claude-monitor live SQLite (usage.db) import (#4106).
+# A fixture usage.db is driven through both CLIs (via --db) and the resulting
+# materialized pool + index.json must match byte-for-byte. Both are isolated
+# from the real host (no shared pool) and target their own repo-local pool.
+# ---------------------------------------------------------------------------
+
+import sqlite3  # noqa: E402
+
+
+def _seed_usage_db(db_path: Path, creds: list[dict]) -> Path:
+    """Create a fixture claude-monitor usage.db with the accounts +
+    oauth_credentials schema the importer queries. Each cred dict carries
+    `label`, `access_token`, `email` (None -> no accounts row) and `is_active`."""
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.executescript(
+            """
+            CREATE TABLE accounts (id INTEGER PRIMARY KEY, email TEXT);
+            CREATE TABLE oauth_credentials (
+                id INTEGER PRIMARY KEY,
+                label TEXT,
+                access_token TEXT,
+                account_id INTEGER,
+                is_active INTEGER
+            );
+            """
+        )
+        next_account_id = 1
+        for c in creds:
+            account_id = None
+            if c.get("email") is not None:
+                account_id = next_account_id
+                next_account_id += 1
+                conn.execute(
+                    "INSERT INTO accounts (id, email) VALUES (?, ?)",
+                    (account_id, c["email"]),
+                )
+            conn.execute(
+                "INSERT INTO oauth_credentials "
+                "(label, access_token, account_id, is_active) VALUES (?, ?, ?, ?)",
+                (c["label"], c["access_token"], account_id, c["is_active"]),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+    return db_path
+
+
+def _seed_import_repo(workspace: Path) -> Path:
+    """A `.git` + `.loom` repo skeleton so the Python CLI's find_repo_root()
+    resolves the repo-local pool at `<workspace>/.loom/tokens`."""
+    (workspace / ".loom").mkdir(parents=True, exist_ok=True)
+    (workspace / ".git").mkdir(parents=True, exist_ok=True)
+    return workspace
+
+
+def _import_env() -> dict:
+    return {
+        **os.environ,
+        "PYTHONPATH": _loom_tools_src(),
+        "LOOM_SHARED_TOKENS_DIR": "",  # disable the shared pool fallback
+    }
+
+
+def _run_python_import(workspace: Path, db: Path, *extra: str):
+    return subprocess.run(
+        [
+            "python3",
+            "-m",
+            "loom_tools.tokens.cli",
+            "import-from-monitor",
+            "--db",
+            str(db),
+            *extra,
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+        cwd=workspace,
+        env=_import_env(),
+    )
+
+
+def _run_rust_import(workspace: Path, db: Path, *extra: str):
+    assert DAEMON_BIN is not None
+    return subprocess.run(
+        [
+            str(DAEMON_BIN),
+            "tokens",
+            "import-from-monitor",
+            "--workspace",
+            str(workspace),
+            "--db",
+            str(db),
+            *extra,
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+        env=_import_env(),
+    )
+
+
+_IMPORT_CREDS = [
+    {"label": "alice@example.com", "access_token": "sk-live-alice",
+     "email": "alice@example.com", "is_active": 1},
+    # Org-label form, joined account row absent -> email recovered from label.
+    {"label": "bob@example.com's Organization", "access_token": "sk-live-bob",
+     "email": None, "is_active": 1},
+    # Inactive -> filtered by both.
+    {"label": "carol@example.com", "access_token": "sk-live-carol",
+     "email": "carol@example.com", "is_active": 0},
+]
+
+
+def test_import_from_monitor_dry_run_effective_agrees(tmp_path):
+    db = _seed_usage_db(tmp_path / "monitor" / "usage.db", _IMPORT_CREDS)
+    py_ws = _seed_import_repo(tmp_path / "py")
+    rust_ws = _seed_import_repo(tmp_path / "rust")
+
+    py = _run_python_import(py_ws, db, "--dry-run", "--json")
+    assert py.returncode == 0, py.stderr
+    rust = _run_rust_import(rust_ws, db, "--dry-run", "--json")
+    assert rust.returncode == 0, rust.stderr
+
+    py_effective = json.loads(py.stdout)["effective"]
+    rust_effective = json.loads(rust.stdout)["effective"]
+
+    assert rust_effective == py_effective
+    # The two active accounts survive; the inactive carol is filtered out.
+    files = {a["file"] for a in rust_effective}
+    assert files == {"alice-example.token", "bob-example.token"}
+    assert all(a["source"] == "monitor-db" for a in rust_effective)
+    # Dry-run writes nothing.
+    assert not (py_ws / ".loom" / "tokens" / "index.json").exists()
+    assert not (rust_ws / ".loom" / "tokens" / "index.json").exists()
+
+
+def test_import_from_monitor_pool_and_index_byte_compatible(tmp_path):
+    db = _seed_usage_db(tmp_path / "monitor" / "usage.db", _IMPORT_CREDS)
+    py_ws = _seed_import_repo(tmp_path / "py")
+    rust_ws = _seed_import_repo(tmp_path / "rust")
+
+    py = _run_python_import(py_ws, db)
+    assert py.returncode == 0, py.stderr
+    rust = _run_rust_import(rust_ws, db)
+    assert rust.returncode == 0, rust.stderr
+
+    py_pool = py_ws / ".loom" / "tokens"
+    rust_pool = rust_ws / ".loom" / "tokens"
+
+    # index.json manifest rows are byte-compatible (only generated_at differs).
+    assert _index_accounts(rust_pool) == _index_accounts(py_pool)
+    for row in _index_accounts(rust_pool):
+        assert len(row["key_fingerprint"]) == 8
+        assert row["source"] == "monitor-db"
+        assert "key" not in row
+    raw = (rust_pool / "index.json").read_text(encoding="utf-8")
+    assert "sk-live" not in raw
+
+    # The materialized token files are identical across both writers.
+    for name in ("alice-example.token", "bob-example.token"):
+        assert (rust_pool / name).read_text(encoding="utf-8") == (
+            py_pool / name
+        ).read_text(encoding="utf-8")
+
+
+def test_import_from_monitor_db_absent_both_fail(tmp_path):
+    missing_db = tmp_path / "monitor" / "usage.db"  # never created
+    py_ws = _seed_import_repo(tmp_path / "py")
+    rust_ws = _seed_import_repo(tmp_path / "rust")
+
+    py = _run_python_import(py_ws, missing_db, "--json")
+    rust = _run_rust_import(rust_ws, missing_db, "--json")
+    # Both exit non-zero when the store is unavailable.
+    assert py.returncode != 0
+    assert rust.returncode != 0
+
+
 def test_check_monitor_source_no_fresh_data_leaves_ranking_untouched(tmp_path):
     index_accounts = [{"name": "acct-a", "email": "a@example.com"}]
     py_ws = _seed_monitor_pool(tmp_path / "py", index_accounts)

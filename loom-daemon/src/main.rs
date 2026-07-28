@@ -224,9 +224,10 @@ enum Commands {
     /// bookkeeping CLI. As of #4080 (Phase 2) `check` is also the
     /// implementation `probe-tokens.sh` and the daemon's own ranking
     /// self-refresh invoke natively. As of #4105 `bootstrap` is native too
-    /// (multi-source `.env` merge + pool provisioning); `spawn-claude.sh`
-    /// (selection) and `import-from-monitor` (issue #4106) remain Python-only
-    /// (see `loom-daemon/src/tokens_pool/mod.rs`). Purely file-based; does not
+    /// (multi-source `.env` merge + pool provisioning), and as of #4106
+    /// `import-from-monitor` is native too (claude-monitor live SQLite
+    /// import); `spawn-claude.sh` (selection) remains Python-only (see
+    /// `loom-daemon/src/tokens_pool/mod.rs`). Purely file-based; does not
     /// require a running daemon.
     Tokens {
         #[command(subcommand)]
@@ -416,6 +417,48 @@ enum TokensAction {
         /// Overwrite existing token files even if their fingerprint matches.
         #[arg(long)]
         force: bool,
+
+        /// Report what would change without writing any files.
+        #[arg(long)]
+        dry_run: bool,
+
+        /// Emit a JSON summary on stdout.
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Materialize `.loom/tokens/` from claude-monitor's LIVE credential store
+    /// (`~/.claude-monitor/usage.db`) instead of the `accounts.env` snapshot.
+    /// Use this after rolling accounts: the snapshot keeps the old (now
+    /// revoked) tokens, so `bootstrap --force` would rewrite them unchanged.
+    /// Native Rust port of the historical Python `loom-tokens
+    /// import-from-monitor` CLI (issue #4106, epic #4081).
+    ImportFromMonitor {
+        /// Repo root (plain path, default `.` — no upward `.git` walk). The
+        /// pool is written to `<workspace>/.loom/tokens` unless `--shared`.
+        #[arg(long, value_name = "PATH", default_value = ".")]
+        workspace: String,
+
+        /// Import into the SHARED machine-level pool at `~/.loom/tokens`
+        /// (override with `$LOOM_SHARED_TOKENS_DIR`) instead of the
+        /// repo-local `<repo>/.loom/tokens`.
+        #[arg(long)]
+        shared: bool,
+
+        /// Path to claude-monitor's `usage.db` (default: `<claude-monitor
+        /// dir>/usage.db`, honoring `$LOOM_CLAUDE_MONITOR_DIR`).
+        #[arg(long, value_name = "PATH")]
+        db: Option<String>,
+
+        /// Overwrite on-disk tokens that differ from the store. Required to
+        /// apply rolled tokens, since every rolled token differs by design.
+        #[arg(long)]
+        force: bool,
+
+        /// Delete `*.token` files for accounts claude-monitor no longer
+        /// reports active (pool state files are never touched).
+        #[arg(long)]
+        prune: bool,
 
         /// Report what would change without writing any files.
         #[arg(long)]
@@ -3605,6 +3648,47 @@ fn print_effective_accounts(result: &loom_daemon::tokens_pool::bootstrap::Bootst
     }
 }
 
+/// Print the imported account set from `import-from-monitor`. Secrets are
+/// never shown. Mirrors `cli._print_monitor_import`.
+fn print_monitor_import(result: &loom_daemon::tokens_pool::monitor_db::MonitorImportResult) {
+    let disp = |p: &Option<std::path::PathBuf>| -> String {
+        p.as_ref()
+            .map_or_else(|| "(none)".to_string(), |p| p.display().to_string())
+    };
+    println!("claude-monitor store: {}", disp(&result.db_path));
+    println!("Destination pool: {}", disp(&result.tokens_dir));
+
+    if result.effective.is_empty() {
+        println!("Active accounts: (none)");
+        return;
+    }
+
+    let written: std::collections::HashSet<&str> =
+        result.written.iter().map(String::as_str).collect();
+    let unchanged: std::collections::HashSet<&str> =
+        result.unchanged.iter().map(String::as_str).collect();
+    let drifted: std::collections::HashSet<&str> =
+        result.drifted.iter().map(String::as_str).collect();
+
+    println!("Active accounts ({}):", result.effective.len());
+    for a in &result.effective {
+        let disposition = if written.contains(a.file.as_str()) {
+            "written"
+        } else if unchanged.contains(a.file.as_str()) {
+            "unchanged"
+        } else if drifted.contains(a.file.as_str()) {
+            "DRIFT (use --force)"
+        } else {
+            "-"
+        };
+        println!("  {}  {}  [{disposition}]", a.name, a.email);
+    }
+
+    if !result.pruned.is_empty() {
+        println!("Pruned ({}): {}", result.pruned.len(), result.pruned.join(", "));
+    }
+}
+
 /// Handle `loom-daemon tokens <select|pin|unpin|unblock>` (Issue #4082,
 /// Phase 1 of epic #4081). Purely file-based — does not require a running
 /// daemon. See `loom-daemon/src/tokens_pool/mod.rs` for the ported subset
@@ -3747,6 +3831,91 @@ fn handle_tokens_command(action: TokensAction) -> Result<()> {
 
             // Unresolved drift without --force is a non-zero exit so CI can
             // detect divergence (mirrors cli._cmd_bootstrap).
+            if !result.drifted.is_empty() && !force {
+                std::process::exit(2);
+            }
+            Ok(())
+        }
+
+        TokensAction::ImportFromMonitor {
+            workspace,
+            shared,
+            db,
+            force,
+            prune,
+            dry_run,
+            json,
+        } => {
+            use loom_daemon::tokens_pool::monitor_db::{
+                import_from_monitor, ImportOptions, MonitorImportError,
+            };
+            use loom_daemon::tokens_pool::paths::shared_tokens_dir;
+
+            // Destination: the shared machine-level pool, or this repo's pool
+            // (mirrors cli._cmd_import_from_monitor). `--workspace` is a
+            // plain path here (no upward `.git` walk), matching the sibling
+            // `bootstrap` / `check` / `select` CLI arms.
+            let tokens_dir = if shared {
+                match shared_tokens_dir() {
+                    Some(dir) => {
+                        eprintln!(
+                            "Importing into the shared machine-level pool at {}",
+                            dir.display()
+                        );
+                        dir
+                    }
+                    None => {
+                        eprintln!(
+                            "error: --shared requested but the shared pool is disabled \
+                             (LOOM_SHARED_TOKENS_DIR is empty). Unset it or point it at a directory."
+                        );
+                        std::process::exit(1);
+                    }
+                }
+            } else {
+                let ws = resolve_tokens_workspace(&workspace)?;
+                ws.join(".loom").join("tokens")
+            };
+
+            let db_path = db.map(std::path::PathBuf::from);
+            let opts = ImportOptions {
+                tokens_dir: &tokens_dir,
+                db_path: db_path.as_deref(),
+                monitor_dir: None,
+                force,
+                dry_run,
+                prune,
+            };
+
+            let result = match import_from_monitor(&opts) {
+                Ok(r) => r,
+                Err(
+                    e @ (MonitorImportError::DbUnavailable(_)
+                    | MonitorImportError::DuplicateFile(_)),
+                ) => {
+                    eprintln!("error: {e}");
+                    std::process::exit(1);
+                }
+                Err(MonitorImportError::Io(e)) => {
+                    return Err(anyhow!("import-from-monitor failed: {e}"))
+                }
+            };
+
+            // Warnings (no active credentials, unreadable tokens, prune
+            // failures, drift) go to stderr so `--json` stdout stays clean.
+            for w in &result.warnings {
+                eprintln!("warning: {w}");
+            }
+
+            if json {
+                println!("{}", serde_json::to_string_pretty(&result.to_json())?);
+            } else {
+                print_monitor_import(&result);
+            }
+
+            // Unresolved drift without --force is the "rolled tokens not
+            // applied" case; exit non-zero so a script notices the pool is
+            // still stale (mirrors cli._cmd_import_from_monitor).
             if !result.drifted.is_empty() && !force {
                 std::process::exit(2);
             }
