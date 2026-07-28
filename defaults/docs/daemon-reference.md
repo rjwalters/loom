@@ -2197,8 +2197,12 @@ process:
 - **on macOS, backgrounds the daemon as a launchd LaunchAgent** in the resolved
   per-user domain (`gui/<uid>` with an active GUI login, else the SSH-reachable
   `user/<uid>` background domain — #4130) instead of a plain `nohup … &` (#3972 —
-  see "macOS session-bootstrap hazard" below); on Linux it stays a plain nohup
-  background job with no reboot/crash supervision (deferred to #4260),
+  see "macOS session-bootstrap hazard" below); **on a systemd Linux host,
+  installs + enables a `systemd --user` service** (#4268 — see "systemd user unit
+  (Linux)" below) that mirrors the launchd supervision contract
+  (`Restart=on-success`, disable-on-stop, `LOOM_DAEMON_SUPERVISOR=systemd`); on a
+  non-systemd Linux host (or with `--no-systemd` / `LOOM_DAEMON_SYSTEMD=0`) it
+  stays a plain nohup background job,
 - backgrounds the daemon and writes a PID file at `.loom/.daemon.pid` (gitignored)
   — or, in **machine mode** (dispatcher-driven, `LOOM_MACHINE_CHECKOUT` set,
   #4229), at `$HOME/.loom/.daemon.pid` so the same machine-wide launchd
@@ -2212,7 +2216,11 @@ process:
 `loom-daemon-stop.sh` sends **SIGTERM** (not just Ctrl-C/SIGINT — the daemon now
 handles both, #3813), waits `LOOM_DAEMON_STOP_GRACE_SECS` (default 10s), then
 escalates to SIGKILL. On macOS it additionally `launchctl bootout`s the
-LaunchAgent job definition once the process is confirmed dead (see below).
+LaunchAgent job definition once the process is confirmed dead (see below). On a
+systemd Linux host it detects the `systemd --user` ownership
+(`systemctl --user is-active`/`is-enabled`) and instead stops + **disables** the
+unit (`systemctl --user disable --now`), so a subsequent reboot does not
+resurrect it (#4268 — see "systemd user unit (Linux)" below).
 
 **Shutdown decision — sweeps survive, they are not drained.** A clean daemon stop
 removes the Unix socket and exits, but **does not cancel in-flight `/loom:sweep`
@@ -2500,14 +2508,67 @@ without an Aqua session, not regressions introduced here.
   XML this invocation would install and exits — no `launchctl` call, no file
   write to `~/Library/LaunchAgents`. Useful for auditing exactly what
   environment/flags a given invocation would forward.
-- **Linux**: unaffected — `nohup` stays the mechanism, since a systemd user
-  session doesn't tie process identity to the spawning shell the way macOS's
-  Mach bootstrap does. Operators who want equivalent extra hardening on Linux
-  (e.g. surviving a `systemd --user` session teardown in an unusual setup) can
-  optionally wrap the start in `systemd-run --user --scope
-  ./.loom/scripts/cli/loom-daemon-start.sh` — not required for the documented
-  failure mode, since it doesn't reproduce on Linux, but available as a
-  belt-and-suspenders option.
+- **Linux**: on a systemd host the daemon is supervised as a `systemd --user`
+  service (#4268), not a bare `nohup` — see "systemd user unit (Linux)" directly
+  below. On a non-systemd host (or with `--no-systemd` / `LOOM_DAEMON_SYSTEMD=0`)
+  `nohup` remains the mechanism, which is safe on Linux because a background
+  process's identity is not tied to the spawning shell the way macOS's Mach
+  bootstrap is (so the #3972 failure mode does not reproduce there — the systemd
+  path is about reboot survival + supervised restart, not that incident).
+
+### systemd user unit (Linux, #4268)
+
+On a systemd Linux host, `loom-daemon-start.sh` installs a `systemd --user`
+service and `systemctl --user enable --now`s it, the Linux mirror of the launchd
+LaunchAgent path above (sub-issue B of #4260). This replaces the pre-#4268 bare
+`nohup … &`, which had no reboot survival, no supervised restart, and no
+disable-on-stop. The contract mirrors launchd point-for-point:
+
+| launchd (Darwin) | systemd `--user` (Linux) |
+|---|---|
+| `RunAtLoad=true` + `launchctl enable` (#3972) | `[Install] WantedBy=default.target` + `systemctl --user enable` |
+| `KeepAlive:{SuccessfulExit:true}` — relaunch only on a clean exit `0` (#4054) | `Restart=on-success` — relaunch only on a clean exit `0` (exact analog; a crash / operator SIGTERM/SIGINT exits non-zero and stays down) |
+| `launchctl bootout` on operator stop | `systemctl --user disable --now <unit>` |
+| plist `EnvironmentVariables` (`LOOM_DAEMON_SUPERVISOR=launchd`, forwarded `LOOM_*`/tokens, deterministic PATH #4172) | `Environment=` lines (`LOOM_DAEMON_SUPERVISOR=systemd`, same forwarded env + PATH) |
+| `WorkingDirectory` = checkout in machine mode (#4229), else repo root | `WorkingDirectory=` — same resolution |
+| `--no-launchd` / `LOOM_DAEMON_LAUNCHD=0` escape hatch (#4078) | `--no-systemd` / `LOOM_DAEMON_SYSTEMD=0` escape hatch |
+| `--print-plist` inspection (no side effects) | `--print-unit` inspection (no side effects) |
+
+- **Unit location & name**: `~/.config/systemd/user/loom-daemon.service` (override
+  the name with `LOOM_SYSTEMD_UNIT`). Regenerated and `daemon-reload`ed on every
+  start, so a later invocation's flags/env always win over a stale unit. Written
+  `0600` when it carries a forwarded `GH_TOKEN`/`GITEA_TOKEN`/`FORGE_TOKEN`.
+- **`LOOM_DAEMON_SUPERVISOR=systemd`** is baked into the unit so the daemon can
+  prove it is supervised before it exits for a supervised restart — recognized
+  daemon-side by `detect_supervisor()` (PR #4298 / #4267). It is hardcoded into the
+  rendered unit (never harvested from the caller's env), so it is present on every
+  supervised start and absent from the nohup path.
+- **Reboot survival requires lingering.** A `systemd --user` manager only runs
+  while the user has a session; the service comes back after a reboot (or an SSH
+  logout) **only** when the user has lingering enabled. Run **`loginctl
+  enable-linger "$USER"`** once on a headless / SSH-only host. Without it the unit
+  is still installed + supervised for the life of the login session, but does not
+  survive a reboot; `loom-daemon-start.sh` prints this reminder on every systemd
+  start.
+- **User-manager reachability fallback.** If `systemctl` is present but the
+  per-user manager is unreachable — a bare SSH login with no lingering and no
+  active user session, so `XDG_RUNTIME_DIR` is unset / `systemctl --user
+  is-system-running` reports `offline` — the start script warns clearly (with the
+  `enable-linger` remedy) and falls back to the nohup path, rather than failing
+  with a cryptic `Failed to connect to bus` error. Detection lives in
+  `is_linux_systemd()` / `systemd_user_manager_reachable()`
+  (`defaults/scripts/lib/systemd-user.sh`, the Linux counterpart to
+  `lib/launchd-domain.sh`, shared by start + stop).
+- **Stop disables the unit.** `loom-daemon-stop.sh` detects the `systemd --user`
+  ownership and runs `systemctl --user disable --now`, then re-verifies the unit is
+  inactive and exits non-zero if it is not (the systemd analog of the launchd
+  bootout-did-not-stick check). `LOOM_DAEMON_SYSTEMD=0` disables all systemd
+  interaction symmetrically, so a `--no-systemd` (nohup) start gets a stop that
+  never touches the user manager.
+- **Crash relaunch is out of scope.** `Restart=on-success` deliberately does
+  **not** relaunch a crashed daemon (a non-zero exit) — that is watchdog territory,
+  tracked as sub-issue D of #4260, mirroring the macOS `StartInterval` autonomy-loss
+  watchdog (#4011), which remains launchd-only for now.
 
 ### macOS TCC hygiene under launchd (#3980)
 
