@@ -52,6 +52,7 @@
 //! [`crate::claim_reconciliation`] for the startup consumer.
 
 use crate::event_bus::EventBus;
+use crate::peer_claims::{self, ClaimAd, PeerClaimView};
 use crate::sweep_journal;
 use crate::tokens_pool::bad_tokens;
 use crate::types::{Event, SweepId, SweepInfo, SweepKind, SweepOutcome, SweepState};
@@ -1353,6 +1354,19 @@ pub struct SweepRegistry {
     /// operators via the work-finder's per-tick summary line. Always `0` when
     /// `detect_collisions` is `false`. Monotonic for the life of the process.
     collision_count: u64,
+    /// Outbound peer-claim advertiser (Issue #4028). When present, [`dispatch`](Self::dispatch)
+    /// publishes an `advertise` ad **before** the (non-atomic) label flip and
+    /// [`emit_event`](Self::emit_event) publishes a `retract` ad on a terminal
+    /// sweep outcome, both over the shared safehouse room via a bounded
+    /// non-blocking `try_send`. `None` (the default) is a **byte-for-byte no-op**:
+    /// no channel, no ad, no syscalls — set only when `safehouse.enabled` is true.
+    peer_claim_publisher: Option<tokio::sync::mpsc::Sender<ClaimAd>>,
+    /// Inbound peer-claim view (Issue #4028), shared with the safehouse
+    /// coordination task that feeds it. When present, [`peer_claimed_issues`](Self::peer_claimed_issues)
+    /// returns the issues a peer host has advertised as in-flight (TTL-bounded),
+    /// which the work-finder skips. `None` (default) ⇒ the work-finder sees an
+    /// empty set (no behavior change).
+    peer_claims: Option<Arc<Mutex<PeerClaimView>>>,
 }
 
 /// Classification of a pre-flip label read (Issue #4085). Detection only — the
@@ -1372,11 +1386,16 @@ enum CollisionClass {
     Unknown,
 }
 
-/// Resolve this host's identity string for collision records (Issue #4085),
-/// precedence `LOOM_HOST_ID` env > `$HOSTNAME` env > the `hostname` binary >
-/// `"unknown-host"`. Only invoked when a collision is actually recorded (rare),
-/// so the one-shot `hostname` subprocess is not on the hot dispatch path.
-fn host_identity() -> String {
+/// Resolve this host's identity string for collision records (Issue #4085) and
+/// peer-claim advertisements (Issue #4028), precedence `LOOM_HOST_ID` env >
+/// `$HOSTNAME` env > the `hostname` binary > `"unknown-host"`. This is loom's
+/// single, explicit host-identity concept — derived (not a new config block) and
+/// stable across restarts (`$HOSTNAME` / the machine hostname do not change).
+/// safehoused stamps the socket `from` from the *persona* (all daemons share
+/// `loom_daemon`), which cannot distinguish hosts, so the claim payload carries
+/// this identity in its body for self-claim recognition.
+#[must_use]
+pub fn host_identity() -> String {
     for var in [HOST_ID_ENV, "HOSTNAME"] {
         if let Ok(v) = std::env::var(var) {
             let t = v.trim();
@@ -1424,6 +1443,8 @@ impl SweepRegistry {
             pending_quarantine_release: HashSet::new(),
             detect_collisions: false,
             collision_count: 0,
+            peer_claim_publisher: None,
+            peer_claims: None,
         }
     }
 
@@ -1451,6 +1472,8 @@ impl SweepRegistry {
             pending_quarantine_release: HashSet::new(),
             detect_collisions: false,
             collision_count: 0,
+            peer_claim_publisher: None,
+            peer_claims: None,
         }
     }
 
@@ -1523,6 +1546,70 @@ impl SweepRegistry {
     #[must_use]
     pub fn collision_count(&self) -> u64 {
         self.collision_count
+    }
+
+    /// Attach the outbound peer-claim advertiser (Issue #4028). The workspace
+    /// pool / `main.rs` call this once at provision time **only when
+    /// `safehouse.enabled`** — an unset publisher keeps dispatch byte-for-byte
+    /// unchanged.
+    pub fn set_peer_claim_publisher(&mut self, tx: tokio::sync::mpsc::Sender<ClaimAd>) {
+        self.peer_claim_publisher = Some(tx);
+    }
+
+    /// Attach the shared inbound peer-claim view (Issue #4028), fed by the
+    /// safehouse coordination task. Only set when `safehouse.enabled`.
+    pub fn set_peer_claims(&mut self, view: Arc<Mutex<PeerClaimView>>) {
+        self.peer_claims = Some(view);
+    }
+
+    /// The set of issues a **peer** host has advertised as in-flight and not yet
+    /// expired (Issue #4028) — the work-finder's peer-claim skip set. Empty when
+    /// no view is attached (`safehouse.enabled` false) or the mutex is poisoned
+    /// (fail-open: an unavailable view never blocks dispatch). Scoped to this
+    /// registry's repo via [`peer_claims::repo_slug`], so two managed repos'
+    /// issue #N never cross-suppress.
+    #[must_use]
+    pub fn peer_claimed_issues(&self) -> HashSet<u32> {
+        let Some(view) = &self.peer_claims else {
+            return HashSet::new();
+        };
+        let repo = peer_claims::repo_slug(&self.config.workspace_root);
+        match view.lock() {
+            Ok(v) => v.claimed_issues_at(&repo, Instant::now()),
+            Err(poisoned) => {
+                log::error!("sweep_registry: peer-claim view mutex poisoned ({poisoned:?})");
+                HashSet::new()
+            }
+        }
+    }
+
+    /// Publish a peer-claim advertisement/retraction over the safehouse room
+    /// (Issue #4028). Best-effort and **non-blocking** — a bounded `try_send` so
+    /// the dispatch path never waits on the coordination task, and a `Full`
+    /// (safehoused outage backlog) or `Closed` (task gone) channel is a
+    /// **fail-open** drop: logged once, dispatch proceeds. A no-op when no
+    /// publisher is attached (`safehouse.enabled` false).
+    fn publish_peer_claim(&self, kind: peer_claims::ClaimKind, issue: u32) {
+        let Some(tx) = &self.peer_claim_publisher else {
+            return;
+        };
+        let repo = peer_claims::repo_slug(&self.config.workspace_root);
+        let host = host_identity();
+        let pid = std::process::id();
+        let ts = Utc::now().to_rfc3339();
+        let ad = match kind {
+            peer_claims::ClaimKind::Advertise => ClaimAd::advertise(issue, repo, host, pid, ts),
+            peer_claims::ClaimKind::Retract => ClaimAd::retract(issue, repo, host, pid, ts),
+        };
+        if let Err(e) = tx.try_send(ad) {
+            // Fail-open: the soft claim is an optimization, never a liveness
+            // dependency. Debug (not warn) so a persistent safehoused outage
+            // does not spam the log once per dispatch.
+            log::debug!(
+                "sweep_registry: peer-claim advertisement for issue #{issue} dropped \
+                 ({e}); dispatch unaffected (#4028)"
+            );
+        }
     }
 
     /// The set of issue numbers currently quarantined for insta-crashing (Issue
@@ -1790,6 +1877,15 @@ impl SweepRegistry {
         let sweep_id = generate_sweep_id(kind);
         self.acquire_lock(issue_number, &sweep_id)?;
 
+        // 3a. Soft cross-host claim (Issue #4028): advertise this claim over the
+        //     shared safehouse room **before** the non-atomic label flip below,
+        //     so a peer daemon backs off far faster than the `loom:building`
+        //     label propagates. Best-effort, non-blocking, fail-open (a no-op
+        //     when `safehouse.enabled` is false) — the room broadcast is a soft
+        //     claim/fast backoff, NOT a mutex; the forge label remains the
+        //     human-visible claim signal and Phase 2 is the atomic authority.
+        self.publish_peer_claim(peer_claims::ClaimKind::Advertise, issue_number);
+
         // 4. Flip the forge label loom:issue -> loom:building (best-effort
         //    when the dispatcher has gh credentials; tests opt out via
         //    `skip_label_flip`).
@@ -1917,6 +2013,17 @@ impl SweepRegistry {
     /// repos' issue #N — the topic string is unchanged; `repo` lives in the
     /// payload only.
     fn emit_event(&self, mut event: Event) {
+        // Peer-claim early retraction (Issue #4028): a terminal outcome for one
+        // of THIS host's sweeps retracts its soft claim over the room so peers
+        // free the issue before its TTL would lapse. Centralized here so every
+        // Exited/Crashed emit site is covered by one insertion. Best-effort /
+        // non-blocking / fail-open (a no-op when no publisher is attached).
+        match &event {
+            Event::SweepExited { issue, .. } | Event::SweepCrashed { issue, .. } => {
+                self.publish_peer_claim(peer_claims::ClaimKind::Retract, *issue);
+            }
+            _ => {}
+        }
         event.set_repo_if_absent(&self.config.workspace_root.display().to_string());
         if let Some(ref bus) = self.bus {
             let topic = event.topic();
@@ -5419,6 +5526,52 @@ exit 0
             recorded.contains("--dangerously-skip-permissions"),
             "expected --dangerously-skip-permissions in argv; got: {recorded}"
         );
+    }
+
+    /// Issue #4028 fail-open: an unreachable safehouse coordination channel (its
+    /// receiver dropped ⇒ `try_send` returns `Closed`) must NEVER block or fail a
+    /// dispatch — the soft claim is an optimization, never a liveness dependency.
+    /// This is the single most important #4028 test.
+    #[test]
+    fn dispatch_proceeds_when_peer_claim_channel_is_closed_fail_open() {
+        let dir = tempdir().unwrap();
+        let (mut registry, _record_log) = fixture_registry(dir.path());
+        // Attach a publisher whose receiver is immediately dropped, so every
+        // `try_send` fails — modeling an absent/refusing safehoused.
+        let (tx, rx) = tokio::sync::mpsc::channel::<ClaimAd>(1);
+        drop(rx);
+        registry.set_peer_claim_publisher(tx);
+
+        let outcome = registry
+            .dispatch(&SweepKind::Issue(77), None, None, None, None)
+            .expect("dispatch must proceed even when the safehouse channel is closed");
+        assert!(outcome.was_new, "the sweep still starts");
+        assert_eq!(registry.len(), 1);
+    }
+
+    /// Issue #4028: the work-finder's peer-claim skip set reflects the attached
+    /// shared view, scoped to this registry's repo, and is empty when no view is
+    /// attached (byte-for-byte no-op).
+    #[test]
+    fn peer_claimed_issues_reflects_the_attached_view() {
+        let dir = tempdir().unwrap();
+        let (mut registry, _record_log) = fixture_registry(dir.path());
+        // No view attached ⇒ empty (the no-op default).
+        assert!(registry.peer_claimed_issues().is_empty());
+
+        let repo = peer_claims::repo_slug(&registry.config().workspace_root);
+        let view =
+            Arc::new(Mutex::new(PeerClaimView::new("self".into(), Duration::from_secs(120))));
+        {
+            let mut v = view.lock().unwrap();
+            let now = Instant::now();
+            v.observe_at(
+                &ClaimAd::advertise(500, repo.clone(), "peer".into(), 1, "ts".into()),
+                now,
+            );
+        }
+        registry.set_peer_claims(view);
+        assert!(registry.peer_claimed_issues().contains(&500));
     }
 
     /// Issue #3953: `dispatch` persists a liveness record to the sweep

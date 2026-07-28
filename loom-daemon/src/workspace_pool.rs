@@ -53,7 +53,26 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use crate::event_bus::EventBus;
-use crate::sweep_registry::{self, SweepRegistry, SweepRegistryConfig};
+use crate::peer_claims::{self, ClaimAd, PeerClaimView};
+use crate::safehouse::{self, InboundEventSink, PeerClaimSink};
+use crate::sweep_registry::{self, host_identity, SweepRegistry, SweepRegistryConfig};
+
+/// The daemon-wide safehouse peer-claim coordination context (Issue #4028): one
+/// shared inbound view + one outbound publisher + the single coordination task
+/// that bridges them to the room. Created lazily by
+/// [`WorkspacePool::start_peer_coordination`] when `safehouse.enabled` is true;
+/// every provisioned registry gets clones of the publisher + view so a soft
+/// claim advertised by any repo's dispatch reaches the room and every repo's
+/// work-finder sees peer claims. `None` ⇒ byte-for-byte no-op.
+struct PeerCoordination {
+    /// Bounded, non-blocking outbound channel to the coordination task.
+    publisher: tokio::sync::mpsc::Sender<ClaimAd>,
+    /// The shared inbound view the coordination task feeds and every
+    /// dispatcher queries.
+    view: Arc<Mutex<PeerClaimView>>,
+    /// The coordination task handle, kept alive for the daemon's lifetime.
+    _task: Option<tokio::task::JoinHandle<()>>,
+}
 
 /// One cached per-workspace registry plus the background tasks keeping it
 /// reconciled and self-healing.
@@ -82,6 +101,11 @@ pub struct WorkspacePool {
     /// dedicated OS thread.
     runtime: tokio::runtime::Handle,
     inner: Mutex<HashMap<PathBuf, PooledRegistry>>,
+    /// The daemon-wide safehouse peer-claim coordination context (Issue #4028),
+    /// or `None` when `safehouse.enabled` is false. Set once by
+    /// [`start_peer_coordination`](Self::start_peer_coordination); injected into
+    /// every registry [`get_or_provision`](Self::get_or_provision) builds.
+    peer_coord: Mutex<Option<PeerCoordination>>,
 }
 
 impl WorkspacePool {
@@ -93,6 +117,7 @@ impl WorkspacePool {
             event_bus,
             runtime,
             inner: Mutex::new(HashMap::new()),
+            peer_coord: Mutex::new(None),
         }
     }
 
@@ -108,6 +133,67 @@ impl WorkspacePool {
     pub fn start_safehouse_narration(&self, repo_root: &Path) {
         let config = crate::safehouse::resolve_config(repo_root);
         let _ = crate::safehouse::spawn_sink(config, &self.event_bus, &self.runtime);
+    }
+
+    /// Start the daemon-wide safehouse **peer-claim coordination** (Issue #4028)
+    /// keyed off `repo_root`'s config. Creates the shared inbound
+    /// [`PeerClaimView`], the bounded outbound advertiser channel, and the single
+    /// coordination task that bridges them to the room, then stores them so every
+    /// registry [`get_or_provision`](Self::get_or_provision) builds — and the
+    /// seeded default registry via [`inject_peer_coordination`](Self::inject_peer_coordination)
+    /// — advertises and consumes soft claims.
+    ///
+    /// **Byte-for-byte no-op** when `safehouse.enabled` is false/absent: no view,
+    /// no channel, no task, no socket. Idempotent — a second call is a no-op once
+    /// coordination is established.
+    pub fn start_peer_coordination(&self, repo_root: &Path) {
+        let config = safehouse::resolve_config(repo_root);
+        if !config.enabled {
+            return; // disabled ⇒ no coordination, byte-for-byte no-op
+        }
+        let mut slot = self
+            .peer_coord
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if slot.is_some() {
+            return; // already established
+        }
+        let ttl = peer_claims::resolve_peer_claim_ttl(repo_root);
+        let view = Arc::new(Mutex::new(PeerClaimView::new(host_identity(), ttl)));
+        let (tx, rx) = tokio::sync::mpsc::channel::<ClaimAd>(safehouse::PEER_CLAIM_CHANNEL_CAP);
+        let sink: Arc<dyn InboundEventSink> = Arc::new(PeerClaimSink::new(view.clone()));
+        let task = safehouse::spawn_peer_coordination(config, sink, rx, &self.runtime);
+        if task.is_none() {
+            // Enabled but no socket resolved: leave coordination unestablished so
+            // registries stay in the no-op path (the outbound sender would have
+            // no consumer). spawn_peer_coordination already logged the reason.
+            return;
+        }
+        log::info!(
+            "workspace_pool: safehouse peer-claim coordination started (ttl={}s)",
+            ttl.as_secs()
+        );
+        *slot = Some(PeerCoordination {
+            publisher: tx,
+            view,
+            _task: task,
+        });
+    }
+
+    /// Inject the peer-claim publisher + view into `registry` when coordination
+    /// is established (Issue #4028). A no-op when `safehouse.enabled` is false, so
+    /// a registry with no coordination behaves byte-for-byte as before. Called by
+    /// [`get_or_provision`](Self::get_or_provision) and by `main.rs` for the
+    /// seeded default registry.
+    pub fn inject_peer_coordination(&self, registry: &mut SweepRegistry) {
+        let slot = self
+            .peer_coord
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(coord) = slot.as_ref() {
+            registry.set_peer_claim_publisher(coord.publisher.clone());
+            registry.set_peer_claims(coord.view.clone());
+        }
     }
 
     /// Seed the pool with a pre-built registry for `root` — used for the default
@@ -171,6 +257,9 @@ impl WorkspacePool {
         // default(off) so a shared-backlog deployment measures the baseline
         // duplicate-dispatch rate. Detection only — never changes dispatch.
         registry.set_collision_detection(sweep_registry::resolve_collision_detection(root));
+        // Cross-host soft claim (#4028): attach the shared peer-claim publisher +
+        // view when safehouse coordination is established. A no-op otherwise.
+        self.inject_peer_coordination(&mut registry);
 
         let arc = Arc::new(Mutex::new(registry));
         // Spawn the reaper and watchdog on the shared daemon runtime

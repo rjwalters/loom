@@ -1509,7 +1509,9 @@ exactly like `main_health_gate::read_build_gate_config`.
 | `autonomous.watchdog.reviewStall` | `LOOM_SWEEP_REVIEW_STALL` | `true` | Review-phase stall watchdog on/off (#3910) |
 | `autonomous.watchdog.reviewStallTimeoutSecs` | `LOOM_SWEEP_REVIEW_STALL_TIMEOUT_SECS` | `2700` | Log-silence window before a hung Judge/Doctor sweep is re-dispatched |
 | `autonomous.collisionDetection.enabled` | `LOOM_DETECT_COLLISIONS` | `false` | Cross-host dispatch-collision baseline (#4085). Off by default — adds one extra `gh issue view --json labels` round-trip per dispatch. Detection only: a collision is logged/counted, never acted on |
-| *(host identity, records only)* | `LOOM_HOST_ID` | `$HOSTNAME` → `hostname` → `unknown-host` | Overrides this host's identity string in collision log records (#4085); set it where the daemon runs without `$HOSTNAME` exported |
+| `safehouse.enabled` | `LOOM_SAFEHOUSE_ENABLED` | `false` | Enables safehouse fleet-comms (#3997) **and** cross-host soft-claim coordination (#4028). Off by default — a byte-for-byte no-op (no socket, no coordination task) when unset |
+| `safehouse.peerClaimTtlSecs` | `LOOM_PEER_CLAIM_TTL_SECS` | `120` | Peer-claim TTL, in seconds (#4028) — how long a peer's soft claim suppresses local dispatch (measured against local receipt, not the advertiser's clock). Default = 2× the 60s work-finder tick |
+| *(host identity)* | `LOOM_HOST_ID` | `$HOSTNAME` → `hostname` → `unknown-host` | This host's identity string, used in collision log records (#4085) **and** peer-claim self-recognition (#4028); set it where the daemon runs without `$HOSTNAME` exported |
 | `autonomous.autoUpdate.enabled` | `LOOM_AUTO_UPDATE` | `false` | Autonomous self-update loop on/off (#4055). **Opt-in** (it rebuilds + restarts the daemon process). Exactly one loop per daemon, not a per-workspace fan-out. See [Autonomous self-update loop](#autonomous-self-update-loop-4055) below |
 | `autonomous.autoUpdate.intervalSecs` | `LOOM_AUTO_UPDATE_INTERVAL_SECS` | `900` | Cadence between staleness checks. Zero/invalid → default |
 | `autonomous.autoUpdate.settleSecs` | `LOOM_AUTO_UPDATE_SETTLE_SECS` | `600` | Settle window: wait this long after first observing a stale commit — resetting on every further commit — before rolling, so a burst of merges collapses into one roll. Zero/invalid → default |
@@ -1744,6 +1746,64 @@ Because that is a real per-dispatch API cost it is **off by default**; enable it
 per the config/env row above (`LOOM_DETECT_COLLISIONS=1` or
 `autonomous.collisionDetection.enabled = true`, precedence **env > config >
 default**) on the hosts sharing a backlog while you take the measurement.
+
+### Cross-host soft claim over safehouse (#4028, Phase 1 of #4028)
+
+Where collision detection (above) only *measures* the race, the soft claim
+*shrinks* it. When `safehouse.enabled` is true, each daemon advertises its
+dispatch claims into the shared safehouse room and consumes peer advertisements,
+so a peer daemon backs off before the non-atomic `loom:building` label flip would
+let it race. This is Phase 1 of #4028 — see
+[`.loom/docs/safehouse.md` → Peer-claim coordination](safehouse.md#peer-claim-coordination-cross-host-soft-claim-4028)
+for the full design.
+
+- **Advertise before the flip.** In `SweepRegistry::dispatch()`, right after the
+  local claim lock and **before** `flip_label_to_building`, the daemon publishes a
+  claim advertisement (issue, cross-host-stable repo slug, host identity, PID,
+  timestamp) over the room. It rides a **`task`** envelope — the envelope `type`
+  enum is closed and owned by the safehouse repo, so **no fifth type is invented**
+  — with the bare issue number as `task_id` and the structured payload
+  (`loom_claim`-marked JSON) in the `body`.
+- **Dedicated inbound read task.** A coordination task on its own safehouse
+  connection drains the socket continuously (`select!` over read + outbound), so
+  an **idle** daemon that emits no narration still sees peer claims promptly — the
+  narration sink only reads while it is emitting, so peer-claim consumption cannot
+  piggyback on it. Inbound claims fold into a shared `PeerClaimView`
+  (`loom-daemon/src/peer_claims.rs`, pure/socket-free).
+- **Back off with a distinct counter.** The work-finder skips any issue with a
+  live peer claim, counted as **`peer-claim-skip`** on the per-tick summary line —
+  its **own** reason, never folded into `cross-host-collision(s)` (a post-hoc
+  count) or the label/in-flight skips:
+
+  ```
+  work_finder: tick — cap 3 (...); 5 seen, 1 dispatched, 0 labeled-skip,
+  0 in-flight-skip, 0 quarantine-skip, 0 pr-open-skip, 1 peer-claim-skip,
+  0 deferred, 0 error(s), 0 cross-host-collision(s)
+  ```
+
+- **TTL + retraction.** Peer claims expire after **`safehouse.peerClaimTtlSecs`
+  (env `LOOM_PEER_CLAIM_TTL_SECS`; default 120s = 2× the 60s work-finder tick)**,
+  measured against **local receipt time** (never the advertiser's wall clock —
+  clock skew is not comparable across hosts), so a crashed peer cannot
+  permanently starve an issue. A peer also emits a `retract` ad from its reaper on
+  a terminal sweep outcome, freeing the issue before the TTL.
+- **Self-claim recognition.** A daemon never backs off on its own advertisement:
+  the claim body carries the host identity (`host_identity()`:
+  `LOOM_HOST_ID` > `$HOSTNAME` > `hostname` > `unknown-host` — loom's single,
+  derived, restart-stable host concept), and the view ignores ads from this host.
+  safehoused's socket `from` is stamped from the *persona* (all daemons share
+  `loom_daemon`) and cannot distinguish hosts, hence the body-carried identity.
+- **Fail-open, no-op when off.** An unreachable/refusing/timing-out socket, a
+  malformed envelope, or a full outbound channel is logged once and **dispatch
+  proceeds** — the outbound ad is a bounded non-blocking `try_send` off the
+  dispatch path. `safehouse.enabled` false/absent is a **byte-for-byte no-op**: no
+  view, no channel, no coordination task, no socket. No new event-bus topic is
+  added (the frozen taxonomy is untouched — claims travel entirely over the room).
+
+> **Soft claim, NOT a mutex.** A room broadcast is eventually consistent, so this
+> is a fast backoff, not a lock — two hosts advertising near-simultaneously still
+> race. The **atomic** cross-host claim authority (a real CAS, e.g. a `git push`
+> to a claim ref) is **Phase 2 of #4028**, filed separately.
 
 ### Prerequisite: a fresh token ranking (#3894, self-refreshed by the daemon since #3969)
 

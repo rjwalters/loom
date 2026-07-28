@@ -17,7 +17,8 @@
     "room": null,
     "persona": "loom_daemon",
     "workerPersonas": [],
-    "mcpCommand": "safehouse-mcp"
+    "mcpCommand": "safehouse-mcp",
+    "peerClaimTtlSecs": 120
   },
   "health_monitoring": {
     "enabled": true,

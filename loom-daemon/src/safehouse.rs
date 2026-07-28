@@ -39,6 +39,7 @@
 //!   demultiplexes by skipping any line with an `event` key.
 
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
@@ -46,8 +47,10 @@ use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::UnixStream;
+use tokio::sync::mpsc::error::TryRecvError;
 
 use crate::event_bus::{EventBus, RecvError};
+use crate::peer_claims::{ClaimAd, PeerClaimView};
 use crate::types::{Event, SweepKind};
 
 // ============================================================================
@@ -452,11 +455,24 @@ impl SafehouseClient {
                 serde_json::from_str(trimmed).context("bad reply from safehoused")?;
             if value.get("event").is_some() {
                 // Interleaved async push (inbound room event) — demultiplex it
-                // out; phase 1 is emit-only and does not consume inbound.
+                // out. The **narration** connection is emit-only and discards
+                // inbound; peer-claim consumption (#4028) runs on a *dedicated*
+                // read task ([`run_coordination`]) on its own connection, so an
+                // idle daemon that emits no narration still observes peer
+                // advertisements promptly (Gap 1a).
                 continue;
             }
             return Ok(value);
         }
+    }
+
+    /// Consume `self` into its raw halves so a caller (the peer-coordination
+    /// task) can read inbound room events and write outbound claim ads
+    /// **concurrently** on one connection — the narration [`send`](Self::send)
+    /// path reads its own reply inline and cannot be driven by a `select!` loop.
+    #[must_use]
+    pub fn into_parts(self) -> (BufReader<OwnedReadHalf>, OwnedWriteHalf, u64, Option<String>) {
+        (self.reader, self.writer, self.next_id, self.room)
     }
 }
 
@@ -575,6 +591,239 @@ async fn run_sink(
 }
 
 // ============================================================================
+// Peer-claim coordination (Issue #4028, Phase 1)
+// ============================================================================
+
+/// Bounded outbound claim-ad channel capacity. Ads are tiny and rare (one per
+/// dispatch / terminal outcome); the bound only matters during a safehoused
+/// outage, where [`SweepRegistry`](crate::sweep_registry::SweepRegistry)'s
+/// `try_send` drops on `Full` (fail-open) rather than blocking the dispatch path.
+pub const PEER_CLAIM_CHANNEL_CAP: usize = 256;
+
+/// A generic sink for inbound room events. Kept intentionally generic (rather
+/// than hard-wiring peer-claims) so the shared inbound read task can later fan an
+/// event out to additional consumers — e.g. inbound human steering (the
+/// follow-up noted at `.loom/docs/safehouse.md`) — without another connection.
+pub trait InboundEventSink: Send + Sync {
+    /// Handle one inbound room-event push line (a JSON object carrying an
+    /// `event` key). Best-effort: an implementation must never panic or block.
+    fn on_event(&self, event: &Value);
+}
+
+/// The peer-claim consumer: parses claim ads out of inbound room events and
+/// folds them into a shared [`PeerClaimView`] (self-claim recognition + TTL live
+/// in the view). A non-claim event (a human chat message, a narration line) is
+/// silently ignored.
+pub struct PeerClaimSink {
+    view: Arc<Mutex<PeerClaimView>>,
+}
+
+impl PeerClaimSink {
+    #[must_use]
+    pub fn new(view: Arc<Mutex<PeerClaimView>>) -> Self {
+        Self { view }
+    }
+}
+
+impl InboundEventSink for PeerClaimSink {
+    fn on_event(&self, event: &Value) {
+        let Some(body) = event.get("body").and_then(Value::as_str) else {
+            return;
+        };
+        let Some(ad) = ClaimAd::from_body_str(body) else {
+            return; // not a claim (human chat, narration, malformed) — ignore
+        };
+        match self.view.lock() {
+            Ok(mut view) => {
+                let now = Instant::now();
+                view.observe_at(&ad, now);
+                // Opportunistically prune so a crashed peer's entries do not
+                // accumulate between work-finder queries.
+                view.prune_expired(now);
+            }
+            Err(poisoned) => {
+                log::error!("safehouse: peer-claim view mutex poisoned ({poisoned:?})");
+            }
+        }
+    }
+}
+
+/// Build the `task`-typed advertisement envelope for a claim ad (Gap 2 of
+/// #4028): the envelope `type` enum is closed and owned by the safehouse repo, so
+/// a claim rides a `task` envelope with the bare issue number as `task_id` and
+/// the structured payload in `body`.
+#[must_use]
+pub fn claim_ad_to_envelope(ad: &ClaimAd) -> Envelope {
+    Envelope {
+        to: "*".to_owned(),
+        kind: "task".to_owned(),
+        task_id: Some(ad.issue.to_string()),
+        body: ad.to_body_json(),
+    }
+}
+
+/// Spawn the peer-claim coordination task: one dedicated safehouse connection
+/// that **reads** inbound peer advertisements into `sink` and **writes** this
+/// daemon's outbound claim ads drained from `outbound`. Returns `None` — a
+/// byte-for-byte no-op (no socket, no task) — when safehouse is disabled or no
+/// socket resolves, mirroring [`spawn_sink`]'s contract.
+///
+/// This is the **dedicated inbound read task** the issue's Gap 1a requires: it
+/// drains the socket continuously via `select!`, so an idle daemon that emits no
+/// narration still observes peer claims promptly (the narration sink's
+/// `read_reply` only drains while it is emitting).
+#[must_use]
+pub fn spawn_peer_coordination(
+    config: SafehouseConfig,
+    sink: Arc<dyn InboundEventSink>,
+    outbound: tokio::sync::mpsc::Receiver<ClaimAd>,
+    runtime: &tokio::runtime::Handle,
+) -> Option<tokio::task::JoinHandle<()>> {
+    if !config.enabled {
+        return None; // disabled ⇒ no socket, no task, no syscalls
+    }
+    let Some(socket) = resolve_socket(&config) else {
+        log::warn!(
+            "safehouse: peer coordination enabled but no socket path resolved \
+             (set safehouse.socket, $LOOM_SAFEHOUSE_SOCKET, or $SAFEHOUSED_SOCKET) — \
+             soft-claim coordination off"
+        );
+        return None;
+    };
+    log::info!(
+        "safehouse: peer-claim coordination enabled (persona={}, socket={})",
+        config.persona,
+        socket.display()
+    );
+    Some(runtime.spawn(async move {
+        run_coordination(config, socket, sink, outbound, DEFAULT_MIN_BACKOFF, DEFAULT_MAX_BACKOFF)
+            .await;
+    }))
+}
+
+/// The coordination loop. Reconnects lazily with capped backoff; on each live
+/// connection it concurrently reads inbound room events (→ `sink`) and drains
+/// outbound claim ads (→ socket). Any I/O failure degrades to a reconnect — it
+/// never blocks or fails a dispatch. Returns when all outbound senders drop.
+async fn run_coordination(
+    config: SafehouseConfig,
+    socket: PathBuf,
+    sink: Arc<dyn InboundEventSink>,
+    mut outbound: tokio::sync::mpsc::Receiver<ClaimAd>,
+    min_backoff: Duration,
+    max_backoff: Duration,
+) {
+    let mut backoff = min_backoff;
+    let mut warned = false;
+    loop {
+        let client = match SafehouseClient::connect(&socket, &config.persona, config.room.clone())
+            .await
+        {
+            Ok(client) => {
+                if warned {
+                    log::info!("safehouse: peer coordination reconnected to {}", socket.display());
+                }
+                backoff = min_backoff;
+                warned = false;
+                client
+            }
+            Err(err) => {
+                if !warned {
+                    log::warn!(
+                        "safehouse: cannot reach safehoused for peer coordination at {} \
+                             ({err:#}); coordination paused, dispatch unaffected",
+                        socket.display()
+                    );
+                    warned = true;
+                }
+                // Drain-and-drop queued ads during the outage so the bounded
+                // channel does not wedge; exit if all senders are gone.
+                loop {
+                    match outbound.try_recv() {
+                        Ok(_) => continue,
+                        Err(TryRecvError::Empty) => break,
+                        Err(TryRecvError::Disconnected) => return,
+                    }
+                }
+                tokio::time::sleep(backoff).await;
+                backoff = (backoff * 2).min(max_backoff);
+                continue;
+            }
+        };
+
+        let (reader, mut writer, mut next_id, room) = client.into_parts();
+        let mut lines = reader.lines();
+        let reconnect = loop {
+            tokio::select! {
+                line = lines.next_line() => {
+                    match line {
+                        Ok(Some(l)) => {
+                            let trimmed = l.trim();
+                            if trimmed.is_empty() {
+                                continue;
+                            }
+                            let Ok(value) = serde_json::from_str::<Value>(trimmed) else {
+                                continue; // malformed line — fail-open, skip
+                            };
+                            if value.get("event").is_some() {
+                                sink.on_event(&value);
+                            }
+                            // A reply echo (has `id`, no `event`) to one of our
+                            // own sends: nothing to do, drop it.
+                        }
+                        Ok(None) => break true,          // peer closed → reconnect
+                        Err(e) => {
+                            log::debug!("safehouse: coordination read error ({e}); reconnecting");
+                            break true;
+                        }
+                    }
+                }
+                ad = outbound.recv() => {
+                    match ad {
+                        Some(ad) => {
+                            let env = claim_ad_to_envelope(&ad);
+                            let id = next_id;
+                            next_id = next_id.wrapping_add(1);
+                            match build_send_request(&env, id, room.as_deref()) {
+                                Ok(req) => {
+                                    let mut line = match serde_json::to_string(&req) {
+                                        Ok(s) => s,
+                                        Err(e) => {
+                                            log::warn!("safehouse: cannot serialize claim ad ({e})");
+                                            continue;
+                                        }
+                                    };
+                                    line.push('\n');
+                                    if writer.write_all(line.as_bytes()).await.is_err()
+                                        || writer.flush().await.is_err()
+                                    {
+                                        log::debug!(
+                                            "safehouse: coordination write failed; reconnecting"
+                                        );
+                                        break true;
+                                    }
+                                }
+                                // A claim ad that would be rejected by safehoused
+                                // (bad type/task_id) is a bug, not a transport
+                                // failure — log and drop, do not reconnect.
+                                Err(e) => log::warn!(
+                                    "safehouse: refusing to send invalid claim ad ({e})"
+                                ),
+                            }
+                        }
+                        None => return, // all senders dropped → task done
+                    }
+                }
+            }
+        };
+        if reconnect {
+            tokio::time::sleep(backoff).await;
+            backoff = (backoff * 2).min(max_backoff);
+        }
+    }
+}
+
+// ============================================================================
 // Tests
 // ============================================================================
 
@@ -585,7 +834,7 @@ mod tests {
     use crate::types::{SweepId, SweepKind};
     use serde_json::json;
     use serial_test::serial;
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
     use tokio::net::UnixListener;
 
     // ---- config resolution (config > default, no env) ----
@@ -1029,5 +1278,144 @@ mod tests {
 
         sink_done.await.unwrap();
         let _ = tokio::time::timeout(Duration::from_secs(2), sink).await;
+    }
+
+    // ---- peer-claim coordination (#4028) ----
+
+    #[test]
+    fn claim_ad_serializes_to_a_valid_task_envelope() {
+        // Envelope-validity AC: the advertisement must serialize to a `type`
+        // within KNOWN_TYPES and a `task_id` matching [A-Za-z0-9_], asserted
+        // against build_send_request so a rejected-by-safehoused envelope fails
+        // at test time, not runtime.
+        let ad = ClaimAd::advertise(4028, "loom".into(), "maple".into(), 7, "ts".into());
+        let env = claim_ad_to_envelope(&ad);
+        assert_eq!(env.kind, "task");
+        assert!(KNOWN_TYPES.contains(&env.kind.as_str()));
+        assert_eq!(env.task_id.as_deref(), Some("4028"));
+
+        let req = build_send_request(&env, 1, Some("fleet")).unwrap();
+        assert_eq!(req["type"], json!("task"));
+        assert_eq!(req["task_id"], json!("4028"));
+        // The body round-trips back to the same claim on the receive side.
+        let body = req["body"].as_str().unwrap();
+        assert_eq!(ClaimAd::from_body_str(body), Some(ad));
+    }
+
+    #[tokio::test]
+    async fn disabled_config_spawns_no_coordination_task() {
+        // Byte-for-byte no-op AC: safehouse.enabled=false ⇒ no coordination task
+        // and no socket.
+        let view = Arc::new(Mutex::new(PeerClaimView::new("me".into(), Duration::from_secs(1))));
+        let sink: Arc<dyn InboundEventSink> = Arc::new(PeerClaimSink::new(view));
+        let (_tx, rx) = tokio::sync::mpsc::channel::<ClaimAd>(1);
+        let handle = spawn_peer_coordination(
+            SafehouseConfig::default(), // disabled
+            sink,
+            rx,
+            &tokio::runtime::Handle::current(),
+        );
+        assert!(handle.is_none(), "disabled ⇒ no coordination task");
+    }
+
+    #[tokio::test]
+    async fn idle_daemon_still_reads_inbound_peer_ad() {
+        // The core regression Gap 1a exists to fix: a daemon that emits NOTHING
+        // must still observe an inbound peer advertisement. A read_reply-piggyback
+        // implementation only reads while sending, so it would never see this.
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("safehoused.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (read_half, mut write_half) = stream.into_split();
+            let mut lines = BufReader::new(read_half).lines();
+            let hello: Value =
+                serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
+            assert_eq!(hello["op"], json!("hello"));
+            write_half
+                .write_all(b"{\"ok\":true,\"id\":0}\n")
+                .await
+                .unwrap();
+            // Unprompted inbound room event carrying a peer claim — the client
+            // sends nothing.
+            let claim = ClaimAd::advertise(4028, "loom".into(), "peer".into(), 5, "ts".into());
+            let push =
+                json!({"event": "message", "from": "loom_daemon", "body": claim.to_body_json()});
+            write_half
+                .write_all(format!("{push}\n").as_bytes())
+                .await
+                .unwrap();
+            // Hold the connection open so the client can read the push.
+            tokio::time::sleep(Duration::from_millis(300)).await;
+        });
+
+        let view = Arc::new(Mutex::new(PeerClaimView::new("me".into(), Duration::from_secs(120))));
+        let sink: Arc<dyn InboundEventSink> = Arc::new(PeerClaimSink::new(view.clone()));
+        let (_tx, rx) = tokio::sync::mpsc::channel::<ClaimAd>(8); // held → task stays alive; never send (idle)
+
+        let task = tokio::spawn(run_coordination(
+            SafehouseConfig {
+                enabled: true,
+                socket: Some(socket.clone()),
+                ..SafehouseConfig::default()
+            },
+            socket.clone(),
+            sink,
+            rx,
+            Duration::from_millis(20),
+            Duration::from_millis(80),
+        ));
+
+        // Poll the view for the claim (bounded condition-poll, not a fixed
+        // ordering sleep).
+        let mut seen = false;
+        for _ in 0..50 {
+            if view
+                .lock()
+                .unwrap()
+                .is_claimed_at("loom", 4028, Instant::now())
+            {
+                seen = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(seen, "an idle daemon must still observe the inbound peer claim (Gap 1a)");
+        server.await.unwrap();
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn coordination_reconnects_when_socket_absent_and_exits_on_sender_drop() {
+        // Fail-open: an absent socket must never wedge — the task loops with
+        // backoff and exits cleanly once its senders drop.
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("nope.sock"); // never bound
+        let view = Arc::new(Mutex::new(PeerClaimView::new("me".into(), Duration::from_secs(1))));
+        let sink: Arc<dyn InboundEventSink> = Arc::new(PeerClaimSink::new(view));
+        let (tx, rx) = tokio::sync::mpsc::channel::<ClaimAd>(4);
+
+        let task = tokio::spawn(run_coordination(
+            SafehouseConfig {
+                enabled: true,
+                socket: Some(socket.clone()),
+                ..SafehouseConfig::default()
+            },
+            socket,
+            sink,
+            rx,
+            Duration::from_millis(10),
+            Duration::from_millis(30),
+        ));
+
+        // Drop the only sender: the connect-fail drain loop must observe
+        // Disconnected and return, so the task terminates rather than spinning.
+        drop(tx);
+        tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .expect("coordination task must terminate after its senders drop")
+            .unwrap();
     }
 }
