@@ -127,6 +127,7 @@ git -C "$PRIMARY" checkout -q -b "$PR_BRANCH"
 
 # shellcheck disable=SC2034
 REPO_ROOT="$PRIMARY"
+# shellcheck disable=SC2034
 DEFAULT_BRANCH_NAME="main"
 
 # (a) Discovery: _find_worktree_by_branch finds the primary itself.
