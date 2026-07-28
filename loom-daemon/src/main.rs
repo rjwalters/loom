@@ -2556,7 +2556,7 @@ async fn handle_status_command(json: bool, pipeline: bool) -> Result<()> {
     let token_usage = collect_token_usage();
 
     // Self-update staleness (#3968): purely local, read-only — compares the
-    // commit baked into THIS `loom-daemon --status` binary against the source
+    // commit baked into THIS `loom-daemon status` binary against the source
     // checkout's current HEAD, when that checkout is still on this machine.
     // Advisory only; never triggers a rebuild or restart (see
     // `.loom/scripts/cli/loom-daemon-update.sh` for the opt-in update flow).

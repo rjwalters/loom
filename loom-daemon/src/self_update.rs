@@ -1,4 +1,4 @@
-//! Self-update staleness detection surfaced through `loom-daemon --status`
+//! Self-update staleness detection surfaced through `loom-daemon status`
 //! (Issue #3968).
 //!
 //! Context: the 2026-07-25/26 canary rollout proved the self-repair loop
@@ -38,7 +38,7 @@ pub const BUILT_COMMIT: &str = env!("LOOM_DAEMON_GIT_COMMIT");
 /// as that checkout is still present on the same machine.
 const BUILD_MANIFEST_DIR: &str = env!("CARGO_MANIFEST_DIR");
 
-/// The self-update status `loom-daemon --status` surfaces.
+/// The self-update status `loom-daemon status` surfaces.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SelfUpdateStatus {
     /// The commit this running binary was built from (`"unknown"` if the

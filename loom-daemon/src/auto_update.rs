@@ -6,7 +6,7 @@
 //!
 //! [`crate::self_update`] already answers the read-only question "is this
 //! running binary stale vs. its source checkout?" and surfaces it in
-//! `loom-daemon --status`. But acting on it still required an operator to run
+//! `loom-daemon status`. But acting on it still required an operator to run
 //! `loom-daemon-update.sh` by hand — the exact standing manual step a
 //! long-lived daemon should own itself. This loop closes the self-repair cycle:
 //! it *decides* and *sequences* the roll, reusing `loom-daemon-update.sh` for
@@ -204,7 +204,7 @@ pub fn resolve_settle(config: &AutoUpdateConfig) -> Duration {
 // Status (published to the process-global, read by build_daemon_status)
 // ============================================================================
 
-/// The publicly-observable auto-update state rendered by `loom-daemon --status`
+/// The publicly-observable auto-update state rendered by `loom-daemon status`
 /// (mirrors the `auto_update_*` fields on [`crate::types::DaemonStatusReport`]).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct AutoUpdateStatusSnapshot {
@@ -818,7 +818,7 @@ fn run_tick<P: AutoUpdateProbe, T: DrainTrigger>(
 
 /// Spawn the **single** process-global auto-update loop on the shared daemon
 /// runtime (Issue #4055). Registers `status` as the process-global so
-/// `loom-daemon --status` can render it, then ticks every `interval`, moving the
+/// `loom-daemon status` can render it, then ticks every `interval`, moving the
 /// per-tick blocking work (git/cargo subprocesses, registry reads) onto
 /// `spawn_blocking` so it never parks a runtime worker.
 ///
