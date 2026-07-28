@@ -385,16 +385,32 @@ assert_deny "Block aws s3 rm recursive" \
 assert_deny "Block aws s3 rb" \
     "aws s3 rb s3://my-bucket --force"
 
+# Deliberately KEPT catastrophic in #4216 (only aws iam delete + az/gcloud delete
+# moved to ask) — mass object/bucket deletion and stack teardown stay hard denies.
+assert_deny "Block aws cloudformation delete-stack (kept catastrophic #4216)" \
+    "aws cloudformation delete-stack --stack-name prod"
+
 # aws ec2 terminate-instances is no longer an ALWAYS_BLOCK deny (#3593) — it is
 # a toggle-gated ask (see the cloud-toggle section below).
 assert_ask "Ask (not deny) for aws ec2 terminate-instances (#3593)" \
     "aws ec2 terminate-instances --instance-ids i-1234"
 
-assert_deny "Block gcloud delete" \
+# gcloud/az `… delete` are no longer ALWAYS_BLOCK denies (#4216) — they were
+# retiered to the ungated ask tier alongside `aws iam delete` (see the #4216
+# section below). A supervised operator confirms; a headless sweep still blocks.
+assert_ask "Ask (not deny) for gcloud ... delete (#4216)" \
     "gcloud compute instances delete my-instance"
 
 assert_deny "Block docker system prune" \
     "docker system prune -af"
+
+# aws iam delete-* was retiered from ALWAYS_BLOCK to the ungated ask tier (#4216)
+# — credential deletion is a legitimate security-positive step, so it now prompts
+# an interactive operator instead of hard-blocking (headless still blocks).
+assert_ask "Ask (not deny) for aws iam delete-user (#4216)" \
+    "aws iam delete-user --user-name bob"
+assert_ask "Ask (not deny) for aws iam delete-access-key (#4216)" \
+    "aws iam delete-access-key --access-key-id AKIA --user-name bob"
 
 assert_deny "Block DROP DATABASE" \
     "psql -c 'DROP DATABASE mydb;'"
@@ -898,7 +914,10 @@ assert_deny_env "Cloud toggle off does NOT weaken: aws s3 rb still denied" \
     "LOOM_GUARD_CLOUD=0" "aws s3 rb s3://prod-bucket --force" "$CLOUD_OFF_REPO"
 assert_deny_env "Cloud toggle off does NOT weaken: aws s3 rm --recursive still denied" \
     "LOOM_GUARD_CLOUD=0" "aws s3 rm s3://prod-bucket/data --recursive" "$CLOUD_OFF_REPO"
-assert_deny_env "Cloud toggle off does NOT weaken: aws iam delete-user still denied" \
+# aws iam delete moved to the UNGATED ask tier (#4216) — it is NOT gated by the
+# cloud toggle, so LOOM_GUARD_CLOUD=0 must still ASK (never silently allow). This
+# is the whole point of keeping it ungated rather than in CLOUD_ASK_PATTERNS.
+assert_ask_env "Cloud toggle off does NOT weaken: aws iam delete-user still ASKS (ungated #4216)" \
     "LOOM_GUARD_CLOUD=0" "aws iam delete-user --user-name bob" "$CLOUD_OFF_REPO"
 assert_deny_env "Cloud toggle off does NOT weaken: aws cloudformation delete-stack still denied" \
     "LOOM_GUARD_CLOUD=0" "aws cloudformation delete-stack --stack-name prod" "$CLOUD_OFF_REPO"
@@ -1373,10 +1392,13 @@ assert_allow "Allow 'hazard...delete' prose in a gh pr comment body (#3584)" \
 assert_ask "Ask (not deny) for 'shutdown' inside an aws ec2 flag name (#3584)" \
     "aws ec2 run-instances --instance-initiated-shutdown-behavior stop"
 
-# Regression: the lifecycle/cloud words as STANDALONE commands still DENY.
-assert_deny "Regression (#3584): 'az group delete' as command word still denied" \
+# Regression: the LIFECYCLE words as STANDALONE commands still DENY. The
+# az/gcloud cloud-delete branch was retiered to ask (#4216) — the segment parser
+# still classifies the command word, but the call site now splits lifecycle
+# (deny) from cloud-delete (ask), so these two now ASK rather than deny.
+assert_ask "Retier (#4216): 'az group delete' command word now ASKS" \
     "az group delete my-rg --yes"
-assert_deny "Regression (#3584): 'gcloud ... delete' as command word still denied" \
+assert_ask "Retier (#4216): 'gcloud ... delete' command word now ASKS" \
     "gcloud compute instances delete my-instance"
 assert_deny "Regression (#3584): standalone 'halt' still denied" \
     "halt"
@@ -1442,7 +1464,10 @@ assert_deny "#3755: 'env FOO=bar halt' still denied after quote-aware split" \
     "env FOO=bar halt"
 assert_deny "#3755: standalone 'halt' still denied" \
     "halt"
-assert_deny "#3755: 'az group delete' command word still denied" \
+# az/gcloud delete is still classified by command-word segmentation, but the
+# cloud-delete branch now ASKS instead of denying (#4216) — the quote-aware
+# split still resolves the command word correctly, which is what this pins.
+assert_ask "#3755: 'az group delete' command word still classified (now ASKS, #4216)" \
     "az group delete my-rg --yes"
 # Safety floor mirror of strip_literal_text() (#3679): a quoted span carrying a
 # command substitution keeps its separators ACTIVE, so a smuggled lifecycle word
@@ -1921,6 +1946,23 @@ if [[ -f "$DL_LOG" ]] && \
 else
     dl_assert "ask logs a JSONL record (decision=ask, tier=ask)" 1 "record: ${_dl_rec:-<none>}"
 fi
+
+# (b-#4216) The patterns retiered from catastrophic deny to the ungated ask tier
+# emit decision=ask, tier=ask in the decision log — the audit-trail AC. Pins both
+# the raw-pattern move (aws iam delete) and the segment-parser split (az delete).
+for _dl_retier in "aws iam delete-access-key --access-key-id AKIA --user-name bob" "az group delete my-rg --yes"; do
+    rm -f "$DL_LOG"
+    make_input "$_dl_retier" "$REPO_ROOT" | \
+        env LOOM_GUARD_DECISION_LOG=1 LOOM_GUARD_DECISION_LOG_FILE="$DL_LOG" "$GUARD" >/dev/null 2>&1 || true
+    _dl_rec="$(tail -1 "$DL_LOG" 2>/dev/null)"
+    if [[ -f "$DL_LOG" ]] && \
+       [[ "$(printf '%s' "$_dl_rec" | jq -r '.decision' 2>/dev/null)" == "ask" ]] && \
+       [[ "$(printf '%s' "$_dl_rec" | jq -r '.tier' 2>/dev/null)" == "ask" ]]; then
+        dl_assert "#4216 retiered pattern logs decision=ask, tier=ask ($_dl_retier)" 0
+    else
+        dl_assert "#4216 retiered pattern logs decision=ask, tier=ask ($_dl_retier)" 1 "record: ${_dl_rec:-<none>}"
+    fi
+done
 
 # (c) An allow-only command (full-path, non-matching) writes NO record even with
 # the toggle on. `cargo build` is not fast-pathed and matches no deny/ask rule.
