@@ -601,6 +601,16 @@ else
     REMOVE_FILES+=(".loom/bin/loom")
   fi
 
+  # NOTE (Epic #3835 Phase 4, #4261): the user-scope skill + agent links
+  # (~/.claude/commands/loom and ~/.claude/agents/loom-*.md) are machine-level
+  # SHARED resources — one set, resolved by every repo Loom is installed into,
+  # exactly like the ~/.local/bin/loom dispatcher above. A per-repo uninstall
+  # therefore does NOT remove them: doing so would break `/loom:*` skills and
+  # `loom-*` subagents for every OTHER consumer repo on the machine. A
+  # machine-level teardown can remove them safely via `deprovision_loom_skills`
+  # in scripts/install/provision-skills.sh, which deletes a link ONLY when it
+  # points into the machine checkout and never touches an operator's real files.
+
   # Backward compatibility: also check old location (repo root)
   if [[ -f "$TARGET_PATH/loom" ]] && [[ -x "$TARGET_PATH/loom" ]]; then
     REMOVE_FILES+=("loom")

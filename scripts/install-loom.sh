@@ -201,6 +201,14 @@ source "$LOOM_ROOT/scripts/install/provision-daemon.sh"
 # shellcheck source=scripts/install/provision-dispatcher.sh
 source "$LOOM_ROOT/scripts/install/provision-dispatcher.sh"
 
+# User-scope skills + agents provisioning (Epic #3835 Phase 4, #4261). Sibling
+# of provision-dispatcher.sh; links ~/.claude/commands/loom and
+# ~/.claude/agents/loom-*.md into the machine checkout so `/loom:*` skills and
+# `loom-*` subagents resolve from the single machine-level checkout and update
+# with `loom update`. Own file so the test suite can exercise it standalone.
+# shellcheck source=scripts/install/provision-skills.sh
+source "$LOOM_ROOT/scripts/install/provision-skills.sh"
+
 # Dogfood command-dir linker (issue #3682) — extracted so the test suite can
 # exercise the scoped-symlink logic without running the full installer.
 # shellcheck source=scripts/install/dogfood-commands.sh
@@ -1087,6 +1095,18 @@ provision_machine_daemon "$LOOM_ROOT/target/release/loom-daemon" || \
 info "Provisioning machine-level loom dispatcher..."
 provision_loom_dispatcher "$LOOM_ROOT" || \
   warning "Machine-level loom dispatcher not fully provisioned (see note above); use ./.loom/bin/loom in-repo, or set LOOM_HOME."
+
+# Provision user-scope skills + agents (Epic #3835 Phase 4, #4261). Links
+# ~/.claude/commands/loom (whole dir) and ~/.claude/agents/loom-*.md (per file)
+# THROUGH the machine checkout established just above (PROVISIONED_LOOM_CHECKOUT),
+# so `/loom:*` skills and `loom-*` subagents resolve from the single machine-level
+# checkout and update with `loom update`, instead of drifting per-repo. Additive
+# and best-effort: it never clobbers an operator's real files, and a soft failure
+# is logged but never aborts the install. (Existing per-repo copies are NOT
+# removed here — that is Phase 6 migration territory, #4254.)
+info "Provisioning user-scope loom skills + agents..."
+provision_loom_skills "${PROVISIONED_LOOM_CHECKOUT:-}" || \
+  warning "User-scope loom skills/agents not fully provisioned; /loom:* skills still resolve from any per-repo copy."
 
 # Run loom-daemon init in the worktree
 cd "$TARGET_PATH/$WORKTREE_PATH"
