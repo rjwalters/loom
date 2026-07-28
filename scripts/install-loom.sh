@@ -1709,7 +1709,7 @@ if [[ -x ".loom/scripts/verify-install.sh" ]]; then
   # own tree (source files, dev-only docs under docs/) that were authored
   # assuming the doc lives only there — a known, tracked gap (see #4097's
   # PR discussion) distinct from the packaging-boundary defects this check
-  # exists to catch. Promote to `error` once that cleanup lands.
+  # exists to catch. Promote to `error` once that cleanup lands (follow-up: #4147).
   info "Checking intra-repo links in installed files..."
   if ./.loom/scripts/verify-install.sh check-links --quiet; then
     success "All intra-repo links resolve"
