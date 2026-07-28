@@ -875,6 +875,21 @@ async fn main() -> Result<()> {
     // Byte-for-byte no-op when `safehouse.enabled` is false/absent.
     workspace_pool.start_safehouse_narration(&sweep_workspace);
 
+    // Optional cross-host soft-claim coordination (#4028): a dedicated safehouse
+    // connection that advertises this daemon's dispatch claims and consumes peer
+    // advertisements into a shared TTL-bounded view, so peer daemons back off
+    // before the non-atomic `loom:building` label flip would let them race.
+    // Byte-for-byte no-op when `safehouse.enabled` is false/absent. Injected into
+    // the seeded default registry here (the IPC `DispatchSweep` path); every other
+    // provisioned registry is injected in `get_or_provision`.
+    workspace_pool.start_peer_coordination(&sweep_workspace);
+    {
+        let mut reg = sweep_registry
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        workspace_pool.inject_peer_coordination(&mut reg);
+    }
+
     // Startup watchdog (Issue #3887): auto-cancel + re-dispatch (once, bounded)
     // any daemon-dispatched sweep that hangs at startup with no progress. On by
     // default; disable with LOOM_SWEEP_WATCHDOG=0 or

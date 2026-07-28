@@ -337,6 +337,18 @@ pub trait WorkDispatcher {
         0
     }
 
+    /// The set of issue numbers a **peer host** has advertised as in-flight over
+    /// the shared safehouse room and not yet expired (Issue #4028, Phase 1 soft
+    /// claim). The finder skips these — treating a peer's soft claim as an
+    /// additional TTL-bounded skip reason alongside [`SKIP_LABELS`] — so two
+    /// daemons on a shared backlog collide far less than the non-atomic forge
+    /// label flip alone permits. Defaults to empty so a dispatcher that does not
+    /// model peer claims (a test fake, or a registry with `safehouse.enabled`
+    /// false) opts out with zero boilerplate and **zero behavior change**.
+    fn peer_claimed(&self) -> HashSet<u32> {
+        HashSet::new()
+    }
+
     /// Dispatch a build sweep for `issue`. Returns `true` when a **new** sweep
     /// was started, `false` when the dispatch was an idempotency no-op (a sweep
     /// with the same key was already running).
@@ -398,6 +410,14 @@ pub struct TickReport {
     /// with the parent sweep, so without this guard an issue whose approved PR is
     /// still open would be re-dispatched the moment its sweep exits.
     pub skipped_pr_open: usize,
+    /// Issues skipped because a **peer host** advertised a live soft claim over
+    /// the safehouse room (Issue #4028, Phase 1). Counted under its **own**
+    /// distinct reason — never folded into [`collisions`](Self::collisions)
+    /// (#4085's post-hoc collision *count*) or the label/in-flight skips — so an
+    /// operator can see how many dispatches the soft claim actively prevented,
+    /// separate from the collisions it did not. Always `0` when
+    /// `safehouse.enabled` is false (the dispatcher's `peer_claimed()` is empty).
+    pub skipped_peer_claim: usize,
     /// Dispatch attempts that returned an error (logged, non-fatal).
     pub errors: usize,
     /// Cumulative cross-host dispatch collisions observed (Issue #4085, Phase 0
@@ -463,6 +483,7 @@ pub fn tick(
 
     let in_flight = dispatcher.in_flight();
     let quarantined = dispatcher.quarantined();
+    let peer_claimed = dispatcher.peer_claimed();
     // Occupancy (Issue #4003) is a distinct, possibly-smaller count than
     // `in_flight.len()`: a dispatcher may discount a spawned-but-unproven
     // sweep past its startup-proof grace window. `in_flight` itself stays the
@@ -485,6 +506,18 @@ pub fn tick(
         //     capacity gate so a quarantined issue never consumes a slot.
         if quarantined.contains(&item.number) {
             report.skipped_quarantined += 1;
+            continue;
+        }
+        // 2c. Peer soft claim (#4028): a peer host advertised a live claim over
+        //     the safehouse room. Back off — treated like a skip label, before
+        //     the capacity gate so a peer-claimed issue never reserves a slot.
+        if peer_claimed.contains(&item.number) {
+            report.skipped_peer_claim += 1;
+            log::info!(
+                "work_finder: skipping issue #{} — a peer host advertised a soft claim \
+                 over safehouse (#4028)",
+                item.number
+            );
             continue;
         }
         // 3. Fixed concurrency cap — defer the rest to a future tick.
@@ -663,6 +696,13 @@ pub fn tick_multi<S: WorkSource, D: WorkDispatcher>(
     let quarantined_sets: Vec<HashSet<u32>> =
         workspaces.iter().map(|(_, d)| d.quarantined()).collect();
 
+    // Snapshot each workspace's peer-claim set (#4028) alongside its quarantined
+    // set. A peer's live soft claim drops the candidate in pass 1, before the
+    // global sort and slot fill, so a peer-claimed issue never reserves a shared
+    // dispatch slot.
+    let peer_claimed_sets: Vec<HashSet<u32>> =
+        workspaces.iter().map(|(_, d)| d.peer_claimed()).collect();
+
     // Whether any workspace was gated this tick, derived **directly from the
     // shared per-repo halt flags** rather than accumulated as a side effect of
     // the candidate-gathering loop (#3974 AC3).
@@ -723,6 +763,17 @@ pub fn tick_multi<S: WorkSource, D: WorkDispatcher>(
             // enters the global queue, so it consumes no shared slot.
             if quarantined_sets[idx].contains(&item.number) {
                 report.skipped_quarantined += 1;
+                continue;
+            }
+            // Peer soft claim (#4028): a peer host is already building it — drop
+            // before the global queue so it consumes no shared slot.
+            if peer_claimed_sets[idx].contains(&item.number) {
+                report.skipped_peer_claim += 1;
+                log::info!(
+                    "work_finder: skipping issue #{} — a peer host advertised a soft claim \
+                     over safehouse (#4028)",
+                    item.number
+                );
                 continue;
             }
             candidates.push(PriorityCandidate {
@@ -1186,20 +1237,22 @@ where
                         || report.errors > 0
                         || report.skipped_quarantined > 0
                         || report.skipped_pr_open > 0
+                        || report.skipped_peer_claim > 0
                     {
                         log::info!(
                             "work_finder: tick — cap {max_concurrent} (pool={pool_size}, \
                              healthy={token_limit}, per_token={per_token_concurrency}, disk={disk}, \
                              cpu={cpu}, ceiling={configured_max}); \
                              {} seen, {} dispatched, {} labeled-skip, {} in-flight-skip, \
-                             {} quarantine-skip, {} pr-open-skip, {} deferred, {} error(s), \
-                             {} cross-host-collision(s)",
+                             {} quarantine-skip, {} pr-open-skip, {} peer-claim-skip, \
+                             {} deferred, {} error(s), {} cross-host-collision(s)",
                             report.seen,
                             report.dispatched,
                             report.skipped_labeled,
                             report.skipped_in_flight,
                             report.skipped_quarantined,
                             report.skipped_pr_open,
+                            report.skipped_peer_claim,
                             report.deferred_capacity,
                             report.errors,
                             report.collisions
@@ -1391,14 +1444,15 @@ pub fn spawn_multi_work_finder_task(
                 || report.errors > 0
                 || report.skipped_quarantined > 0
                 || report.skipped_pr_open > 0
+                || report.skipped_peer_claim > 0
             {
                 log::info!(
                     "work_finder: tick — cap {max_concurrent} (pool={pool_size}, \
                      healthy={token_limit}, per_token={per_token_concurrency}, disk={disk}, \
                      cpu={cpu}, ceiling={configured_max}); {} workspace(s), \
                      {} seen, {} dispatched, {} labeled-skip, {} in-flight-skip, \
-                     {} quarantine-skip, {} pr-open-skip, {} deferred, {} error(s), \
-                     {} cross-host-collision(s)",
+                     {} quarantine-skip, {} pr-open-skip, {} peer-claim-skip, \
+                     {} deferred, {} error(s), {} cross-host-collision(s)",
                     pairs.len(),
                     report.seen,
                     report.dispatched,
@@ -1406,6 +1460,7 @@ pub fn spawn_multi_work_finder_task(
                     report.skipped_in_flight,
                     report.skipped_quarantined,
                     report.skipped_pr_open,
+                    report.skipped_peer_claim,
                     report.deferred_capacity,
                     report.errors,
                     report.collisions
@@ -1693,6 +1748,16 @@ pub mod forge {
             }
         }
 
+        fn peer_claimed(&self) -> HashSet<u32> {
+            match self.registry.lock() {
+                Ok(reg) => reg.peer_claimed_issues(),
+                Err(poisoned) => {
+                    log::error!("work_finder: sweep registry mutex poisoned ({poisoned:?})");
+                    HashSet::new()
+                }
+            }
+        }
+
         fn dispatch(&mut self, issue: u32) -> Result<bool> {
             let mut reg = self
                 .registry
@@ -1770,6 +1835,8 @@ mod tests {
         quarantined: HashSet<u32>,
         /// Cumulative cross-host collision count this dispatcher reports (#4085).
         collisions: u64,
+        /// Issue numbers a peer host has soft-claimed over safehouse (#4028).
+        peer_claimed: HashSet<u32>,
     }
 
     impl WorkDispatcher for RecordingDispatcher {
@@ -1781,6 +1848,9 @@ mod tests {
         }
         fn collisions(&self) -> u64 {
             self.collisions
+        }
+        fn peer_claimed(&self) -> HashSet<u32> {
+            self.peer_claimed.clone()
         }
         fn dispatch(&mut self, issue: u32) -> Result<bool> {
             if self.pr_open_issues.contains(&issue) {
@@ -2027,6 +2097,39 @@ exit 0
         assert_eq!(report.dispatched, 1);
         assert!(multi[0].1.dispatched.is_empty(), "quarantined workspace dispatches nothing");
         assert_eq!(multi[1].1.dispatched, vec![10], "healthy sibling gets the shared slot");
+    }
+
+    #[test]
+    fn test_tick_peer_claim_skipped_under_distinct_counter() {
+        // A peer host's live soft claim (#4028) skips the issue under its OWN
+        // distinct counter — never folded into labeled/in-flight/quarantine — and
+        // does not consume a capacity slot (checked before the cap gate), so the
+        // healthy sibling issue takes the slot.
+        let mut source = FakeSource::once(vec![issue(1), issue(2)]);
+        let mut disp = RecordingDispatcher {
+            peer_claimed: HashSet::from([1]),
+            ..Default::default()
+        };
+        let report = tick(&mut source, &mut disp, 1, false).unwrap();
+
+        assert_eq!(report.skipped_peer_claim, 1, "#1 is peer-claimed");
+        assert_eq!(report.skipped_labeled, 0, "peer-claim is NOT a label skip");
+        assert_eq!(report.skipped_in_flight, 0, "peer-claim is NOT an in-flight skip");
+        assert_eq!(report.dispatched, 1);
+        assert_eq!(disp.dispatched, vec![2], "the slot goes to the un-claimed #2");
+    }
+
+    #[test]
+    fn test_tick_stops_skipping_once_peer_claim_clears() {
+        // Once the peer claim lapses (empty peer_claimed set, mirroring a TTL
+        // expiry / retraction), the previously-skipped issue dispatches normally.
+        let mut source = FakeSource::once(vec![issue(1)]);
+        let mut disp = RecordingDispatcher::default(); // no peer claims now
+        let report = tick(&mut source, &mut disp, 5, false).unwrap();
+
+        assert_eq!(report.skipped_peer_claim, 0);
+        assert_eq!(report.dispatched, 1);
+        assert_eq!(disp.dispatched, vec![1]);
     }
 
     #[test]

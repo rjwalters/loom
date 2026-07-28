@@ -6,15 +6,22 @@ adds an optional, additive **narration** side-channel: an end-to-end-encrypted
 Matrix room a human watches in Element to follow a multi-host agent fleet in
 real time, instead of polling `gh` or tailing daemon logs.
 
-Phase 1 is **daemon-side, emit-only**. The `loom-daemon` subscribes its existing
-in-process event bus and narrates sweep-lifecycle transitions into the room. It
-adds no new event topics and no new publish call sites.
+Phase 1 **narration** is daemon-side and emit-only: the `loom-daemon` subscribes
+its existing in-process event bus and narrates sweep-lifecycle transitions into
+the room, adding no new event topics and no new publish call sites. On top of
+that, **peer-claim coordination (#4028) makes the room bidirectional** — a
+dedicated read task consumes inbound peer advertisements so daemons on a shared
+backlog back off before the non-atomic `loom:building` label flip would let them
+race. See [Peer-claim coordination](#peer-claim-coordination-cross-host-soft-claim-4028)
+below.
 
-> **Out of scope for phase 1** (tracked separately): per-worker personas
-> (`loom_builder_42`) and `SAFEHOUSE_PERSONA` forwarding to workers → **#3999**;
-> inbound human steering (reading `@`-mentions back to agents) → follow-up;
-> cloud-host provisioning of `safehoused` → **#3998**; carrying the judge verdict
-> value in an event payload (needs a frozen-taxonomy amendment) → follow-up.
+> **Out of scope** (tracked separately): per-worker personas (`loom_builder_42`)
+> and `SAFEHOUSE_PERSONA` forwarding to workers → **#3999**; inbound **human**
+> steering (reading `@`-mentions back to agents) → follow-up (it reuses the same
+> inbound read task #4028 adds); cloud-host provisioning of `safehoused` →
+> **#3998**; carrying the judge verdict value in an event payload (needs a
+> frozen-taxonomy amendment) → follow-up; the **atomic cross-host claim
+> authority** (a real CAS behind the soft claim) → Phase 2 of #4028.
 
 ## The degradation contract (read this first)
 
@@ -112,16 +119,78 @@ by the bare issue number (`task_id`):
   identity — the client never sends one (no impersonation).
 - Replies echo the request `id`. **Async push lines are interleaved on the same
   connection, carry an `event` key, and have no `id`** — the client
-  demultiplexes by skipping any line with an `event` key. Phase 1 is emit-only,
-  so pushes are read off the wire and discarded.
+  demultiplexes by skipping any line with an `event` key. The **narration**
+  connection is emit-only and discards inbound pushes; the **peer-claim
+  coordination** connection (#4028) instead routes each inbound `event` line to a
+  handler (see below).
 
 ## Implementation
 
 - `loom-daemon/src/safehouse.rs` — config resolver, envelope-v1 client, the
-  event→envelope mapping, and the reconnecting bus-subscriber sink.
-- `loom-daemon/src/workspace_pool.rs` — `start_safehouse_narration()` subscribes
-  the shared `Arc<EventBus>` (the single place it is owned) and spawns the sink
-  on the daemon runtime; a no-op when disabled.
+  event→envelope mapping, the reconnecting bus-subscriber narration sink, and
+  (#4028) the peer-claim coordination task + `InboundEventSink`.
+- `loom-daemon/src/peer_claims.rs` — the pure, socket-free peer-claim view
+  (TTL expiry, self-claim recognition, retraction, `ClaimAd` parse/serialize).
+- `loom-daemon/src/workspace_pool.rs` — `start_safehouse_narration()` and
+  `start_peer_coordination()` subscribe/attach the shared `Arc<EventBus>` /
+  `PeerClaimView` and spawn on the daemon runtime; both no-ops when disabled.
+
+## Peer-claim coordination: cross-host soft claim (#4028)
+
+On a multi-host deployment the only cross-host claim signal is the forge label,
+whose `loom:issue → loom:building` flip is **not** compare-and-swap
+(`SweepRegistry::flip_label_to_building` is an unconditional
+`--remove-label`/`--add-label`) — two hosts can both read `loom:issue` and
+dispatch before either flip propagates, producing duplicate sweeps. Peer-claim
+coordination shrinks that window:
+
+- **Advertise.** At the dispatch decision point — right after the local claim
+  lock, **before** the label flip — the daemon publishes a claim advertisement
+  over the room: issue number, [repo slug](#), host identity, PID, and a
+  wall-clock timestamp, carried as a **`task`** envelope (the `type` enum is
+  closed and owned by the safehouse repo, so a claim rides `task` with the bare
+  issue number as `task_id` — **no fifth type is invented**) whose `body` is the
+  structured JSON payload (marked `loom_claim`).
+- **Consume.** A **dedicated inbound read task** — separate from the narration
+  sink — drains the socket continuously via `select!`, so an **idle** daemon that
+  emits no narration still observes peer claims promptly (the narration
+  connection only reads while it is emitting). Each inbound claim is folded into a
+  shared `PeerClaimView`.
+- **Back off.** The work-finder skips any issue with a live peer claim, counted
+  under its **own** distinct `peer-claim-skip` reason on the per-tick summary line
+  (never folded into #4085's collision count).
+- **TTL.** Every peer claim expires after **`safehouse.peerClaimTtlSecs`
+  (default 120s = 2× the 60s work-finder interval)**, so a crashed peer cannot
+  permanently starve an issue. The TTL clock is the **local receipt `Instant`**,
+  never the advertiser's wall clock (clock skew is not comparable across hosts).
+  A peer also **retracts** its claim early when its sweep exits/crashes (a
+  `retract`-kind ad emitted from the reaper), freeing the issue before the TTL.
+- **Host identity.** loom's single, explicit host-identity concept is
+  `sweep_registry::host_identity()` (`LOOM_HOST_ID` > `$HOSTNAME` > the `hostname`
+  binary > `unknown-host`) — derived, not a new config block, and stable across
+  restarts. safehoused stamps the socket `from` from the *persona* (all daemons
+  share `loom_daemon`), which cannot distinguish hosts, so the identity travels in
+  the claim body and is what powers self-claim recognition: **a daemon never backs
+  off on its own advertisement.**
+- **Event taxonomy.** The internal pub/sub topic taxonomy is frozen; peer claims
+  add **no new bus topic** — they travel entirely over the safehouse room.
+
+### Soft claim, NOT a mutex (the load-bearing caveat)
+
+A room broadcast is eventually consistent, so this is a **fast backoff, not a
+lock**: two hosts advertising near-simultaneously still race. Advertisement
+*shrinks* the collision window; it does not close it. The atomic authority for
+the final claim — a real cross-host CAS (e.g. a `git push` to a claim ref) — is
+**Phase 2 of #4028**, deliberately out of scope here.
+
+### Fail-open (never a liveness dependency)
+
+Coordination is best-effort end to end: an unreachable/refusing/timing-out
+`safehoused` socket, a malformed inbound envelope, or a full outbound channel is
+logged (once) and **dispatch proceeds normally**. The outbound advertisement is a
+bounded, non-blocking `try_send` off the dispatch path; a `Full`/`Closed` channel
+drops the ad. `safehouse.enabled` false/absent is a **byte-for-byte no-op**: no
+view, no channel, no coordination task, no socket.
 
 # Phase 2 — worker-side `safehouse-mcp` injection (#3999)
 
