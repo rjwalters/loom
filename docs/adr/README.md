@@ -62,6 +62,13 @@ An Architecture Decision Record captures an important architectural decision mad
   - **Summary**: Measured that compile is only ~10% of `ci.yml`'s critical path while one serial-locked `loom-daemon` test binary is ~67%, and that its ~127s serial-lock floor is not reducible by adding cores
   - **Key Decision**: Reject new CI hardware on speed grounds alone; default to Graviton (arch parity) if a runner is ever provisioned (#4057) while treating full macOS parity as a separate, independently-costed decision; prioritize de-serializing `#[serial]` tests over buying cores
 
+### Worker Runtime
+
+- [ADR-0012: Multi-Runtime Worker Support via a Single Runtime Adapter Contract](0012-runtime-adapter-contract.md)
+  - **Status**: Accepted
+  - **Summary**: Support multiple CLI agent runtimes (Claude Code, Codex, Amp, oh-my-pi) through one seven-point adapter contract instead of per-runtime parallel scripts; collaborate via upstream PRs from the gpeyton/loom fork, not cherry-picks
+  - **Key Decision**: A single runtime adapter contract (`defaults/docs/runtime-adapters.md`) with Claude Code as adapter #1/default/tier-1 (zero regression) and non-Claude runtimes tier-2 (CI-gated) over parallel per-runtime special-casing
+
 ## Creating a New ADR
 
 When making a significant architectural decision:
