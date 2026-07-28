@@ -17,28 +17,34 @@
 //! [`WorkspacePool`] owns those registries: a lazily-populated, hot-reconciled
 //! cache keyed by workspace root. Both autonomous loops share **one** pool so a
 //! given repo has exactly **one** registry instance — unifying the in-flight
-//! dedup and the background reaper across the work-finder and epic supervisor
-//! (and the IPC `DispatchSweep` path for the default workspace, which is seeded).
+//! dedup and the background reaper + watchdog across the work-finder and epic
+//! supervisor (and the IPC `DispatchSweep` path for the default workspace,
+//! which is seeded).
 //!
-//! # Reaper threading
+//! # Reaper + watchdog threading
 //!
 //! Each provisioned registry gets its own background reaper
-//! ([`crate::sweep_registry::spawn_reaper_task`]). The pool is consumed from two
-//! different threads — the work-finder runs on the shared daemon Tokio runtime,
-//! the epic supervisor on its own dedicated OS thread with a private
-//! current-thread runtime. To guarantee every reaper runs on the **shared**
-//! daemon runtime regardless of which thread first provisions a workspace, the
-//! pool captures a [`tokio::runtime::Handle`] to the shared runtime at
-//! construction and enters it (`Handle::enter`) around the reaper spawn.
+//! ([`crate::sweep_registry::spawn_reaper_task`]) **and** its own watchdog
+//! ([`crate::sweep_registry::spawn_watchdog_task`], Issue #4124) — the
+//! startup-hang, mid-build-death, and review-stall self-healing backstops that,
+//! before #4124, ran only for the default workspace via `main`. The pool is
+//! consumed from two different threads — the work-finder runs on the shared
+//! daemon Tokio runtime, the epic supervisor on its own dedicated OS thread
+//! with a private current-thread runtime. To guarantee every reaper and
+//! watchdog runs on the **shared** daemon runtime regardless of which thread
+//! first provisions a workspace, the pool captures a [`tokio::runtime::Handle`]
+//! to the shared runtime at construction and enters it (`Handle::enter`)
+//! around both spawns.
 //!
 //! # Eviction (phase c, #3929)
 //!
 //! [`WorkspacePool::evict`] removes a provisioned registry when its workspace is
 //! deregistered (`workspace remove` / [`Request::DeregisterWorkspace`]), aborting
-//! its background reaper task so it does not leak for the daemon's lifetime. The
-//! **seeded default workspace** is guarded — its registry + reaper are owned by
-//! `main` and continue serving default-workspace IPC requests, so `evict` is a
-//! no-op for it (identified by `_reaper: None`).
+//! its background reaper and watchdog tasks so neither leaks for the daemon's
+//! lifetime. The **seeded default workspace** is guarded — its registry,
+//! reaper, and watchdog are owned by `main` and continue serving
+//! default-workspace IPC requests, so `evict` is a no-op for it (identified by
+//! `_reaper: None`).
 //!
 //! [`Request::DeregisterWorkspace`]: crate::types::Request::DeregisterWorkspace
 
@@ -49,13 +55,21 @@ use std::sync::{Arc, Mutex};
 use crate::event_bus::EventBus;
 use crate::sweep_registry::{self, SweepRegistry, SweepRegistryConfig};
 
-/// One cached per-workspace registry plus the reaper task keeping it reconciled.
+/// One cached per-workspace registry plus the background tasks keeping it
+/// reconciled and self-healing.
 struct PooledRegistry {
     registry: Arc<Mutex<SweepRegistry>>,
     /// The background reaper handle, kept alive for the daemon's lifetime.
     /// `None` for a **seeded** entry (the default workspace) whose reaper is
-    /// owned by `main` — the pool must not abort it.
+    /// owned by `main` — the pool must not abort it. This is also the
+    /// structural discriminator `evict` uses to detect the seeded default
+    /// workspace (`_reaper.is_none()`) — see the doc comment on `evict`.
     _reaper: Option<tokio::task::JoinHandle<()>>,
+    /// The background watchdog handle (Issue #4124), kept alive for the
+    /// daemon's lifetime. `None` for a **seeded** entry (the default
+    /// workspace) whose watchdog is owned by `main` — the pool must not
+    /// abort it.
+    _watchdog: Option<tokio::task::JoinHandle<()>>,
 }
 
 /// A lazily-populated, thread-safe cache of one [`SweepRegistry`] per workspace
@@ -110,6 +124,7 @@ impl WorkspacePool {
         map.entry(root).or_insert(PooledRegistry {
             registry,
             _reaper: None,
+            _watchdog: None,
         });
     }
 
@@ -158,11 +173,43 @@ impl WorkspacePool {
         registry.set_collision_detection(sweep_registry::resolve_collision_detection(root));
 
         let arc = Arc::new(Mutex::new(registry));
-        // Spawn the reaper on the shared daemon runtime regardless of which
-        // thread we are called from (the epic supervisor uses its own runtime).
-        let reaper = {
+        // Spawn the reaper and watchdog on the shared daemon runtime
+        // regardless of which thread we are called from (the epic supervisor
+        // uses its own runtime) — both spawns must stay inside this guard or
+        // they panic ("must be called from the context of a Tokio 1.x
+        // runtime") when provisioned from the epic supervisor's own
+        // current-thread runtime.
+        let (reaper, watchdog) = {
             let _guard = self.runtime.enter();
-            sweep_registry::spawn_reaper_task(arc.clone())
+            let reaper = sweep_registry::spawn_reaper_task(arc.clone());
+            // Sweep watchdog (Issue #4124): every provisioned (pooled)
+            // workspace now gets the same startup / mid-build-death /
+            // review-stall self-healing backstops the default workspace has
+            // had since #3887/#3895/#3910 — previously only the reaper was
+            // wired up here. Reuses the `startup` config already resolved
+            // above so per-workspace env > config > default precedence comes
+            // out correct by construction (mirrors `set_dispatch_stagger` /
+            // `set_startup_proof_grace` above).
+            let watchdog = if sweep_registry::resolve_watchdog_enabled(&startup) {
+                let timeout = sweep_registry::resolve_watchdog_timeout(&startup);
+                let interval = sweep_registry::resolve_watchdog_interval(&startup);
+                let review_stall_timeout = if sweep_registry::resolve_review_stall_enabled(&startup)
+                {
+                    Some(sweep_registry::resolve_review_stall_timeout(&startup))
+                } else {
+                    None
+                };
+                Some(sweep_registry::spawn_watchdog_task(
+                    arc.clone(),
+                    timeout,
+                    interval,
+                    review_stall_timeout,
+                ))
+            } else {
+                log::info!("workspace_pool: watchdog disabled for {} (#3887)", root.display());
+                None
+            };
+            (reaper, watchdog)
         };
         log::info!("workspace_pool: provisioned sweep registry for {}", root.display());
         map.insert(
@@ -170,6 +217,7 @@ impl WorkspacePool {
             PooledRegistry {
                 registry: arc.clone(),
                 _reaper: Some(reaper),
+                _watchdog: watchdog,
             },
         );
         arc
@@ -232,6 +280,9 @@ impl WorkspacePool {
                 if let Some(reaper) = pooled._reaper {
                     reaper.abort();
                 }
+                if let Some(watchdog) = pooled._watchdog {
+                    watchdog.abort();
+                }
                 log::info!("workspace_pool: evicted sweep registry for {}", root.display());
                 true
             }
@@ -258,11 +309,23 @@ impl WorkspacePool {
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
+    use std::os::unix::fs::PermissionsExt;
+    use std::time::Duration;
+
     use super::*;
     use tempfile::tempdir;
 
     fn pool() -> Arc<WorkspacePool> {
         Arc::new(WorkspacePool::new(Arc::new(EventBus::new()), tokio::runtime::Handle::current()))
+    }
+
+    /// Write a `.loom/config.json` under `root` with the given JSON body
+    /// (mirrors `sweep_registry::tests::write_config`, reimplemented locally
+    /// since cross-module test helpers aren't shared).
+    fn write_config(root: &Path, body: &str) {
+        let loom = root.join(".loom");
+        std::fs::create_dir_all(&loom).unwrap();
+        std::fs::write(loom.join("config.json"), body).unwrap();
     }
 
     #[tokio::test]
@@ -362,5 +425,247 @@ mod tests {
 
         let got = pool.get_or_provision(&root);
         assert!(Arc::ptr_eq(&got, &seeded), "seeded instance is still the pooled one");
+    }
+
+    // ========================================================================
+    // Sweep watchdogs for pooled workspaces (Issue #4124)
+    //
+    // Before this fix, `get_or_provision` spawned only the reaper
+    // (`spawn_reaper_task`) — the startup / mid-build-death / review-stall
+    // self-healing watchdog (`spawn_watchdog_task`) ran only for the default
+    // workspace, wired up once in `main.rs`. These tests cover: (1) every
+    // pooled workspace now gets a watchdog alongside its reaper, (2) the
+    // seeded default workspace does NOT get a second one (main already gives
+    // it exactly one), (3) `evict` aborts the watchdog too (no orphan task),
+    // and (4) per-workspace watchdog config is not collapsed to a shared /
+    // default value.
+    // ========================================================================
+
+    #[tokio::test]
+    async fn provision_spawns_watchdog_alongside_reaper() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        let pool = pool();
+
+        let _ = pool.get_or_provision(&root);
+
+        let map = pool.inner.lock().unwrap();
+        let entry = map.get(&root).expect("root was just provisioned");
+        assert!(entry._reaper.is_some(), "reaper is spawned for a pooled workspace");
+        assert!(
+            entry._watchdog.is_some(),
+            "watchdog must also be spawned for a pooled workspace (#4124)"
+        );
+    }
+
+    #[tokio::test]
+    async fn seeded_default_workspace_is_not_double_watchdogged() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        let pool = pool();
+
+        let seeded =
+            Arc::new(Mutex::new(SweepRegistry::new(SweepRegistryConfig::new(root.clone()))));
+        pool.seed(root.clone(), seeded.clone());
+
+        {
+            let map = pool.inner.lock().unwrap();
+            let entry = map.get(&root).unwrap();
+            assert!(entry._reaper.is_none(), "seeded entry owns no reaper (main owns it)");
+            assert!(entry._watchdog.is_none(), "seeded entry owns no watchdog (main owns it)");
+        }
+
+        // get_or_provision for the same (seeded) root must return the
+        // existing entry byte-for-byte, spawning nothing new — so the
+        // default workspace still has exactly the one watchdog `main.rs`
+        // gives it, never two.
+        let got = pool.get_or_provision(&root);
+        assert!(Arc::ptr_eq(&got, &seeded));
+        let map = pool.inner.lock().unwrap();
+        let entry = map.get(&root).unwrap();
+        assert!(
+            entry._reaper.is_none(),
+            "get_or_provision must not spawn a reaper for the seeded root"
+        );
+        assert!(
+            entry._watchdog.is_none(),
+            "get_or_provision must not spawn a second watchdog for the seeded (default) root"
+        );
+    }
+
+    #[tokio::test]
+    async fn evict_aborts_watchdog_alongside_reaper() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        let pool = pool();
+
+        let _ = pool.get_or_provision(&root);
+        {
+            let map = pool.inner.lock().unwrap();
+            let entry = map.get(&root).unwrap();
+            assert!(entry._reaper.is_some());
+            assert!(entry._watchdog.is_some());
+        }
+
+        assert!(pool.evict(&root), "evicting a provisioned root returns true");
+        assert!(pool.is_empty(), "evict removes the entry (and, internally, aborts both tasks)");
+
+        // Refresh guard: eviction of the seeded default workspace must still
+        // be refused even after pooled watchdogs are in the mix.
+        let seeded_root = dir.path().join("seeded");
+        std::fs::create_dir_all(&seeded_root).unwrap();
+        let seeded =
+            Arc::new(Mutex::new(SweepRegistry::new(SweepRegistryConfig::new(seeded_root.clone()))));
+        pool.seed(seeded_root.clone(), seeded);
+        assert!(
+            !pool.evict(&seeded_root),
+            "seeded default workspace remains un-evictable (structural _reaper.is_none() guard)"
+        );
+    }
+
+    #[tokio::test]
+    async fn per_workspace_watchdog_config_is_not_collapsed_to_default() {
+        // Two distinct roots, each with its own `.loom/config.json` setting a
+        // *different* `autonomous.watchdog.timeoutSecs` / `intervalSecs`.
+        // `get_or_provision` resolves this per-root via
+        // `sweep_registry::read_startup_race_config(root)` — reproduce that
+        // exact call here (rather than spying on the spawned task, which
+        // bakes the resolved `Duration`s into opaque closure state) to prove
+        // resolution is genuinely per-workspace, not a single shared value.
+        let dir = tempdir().unwrap();
+        let root_a = dir.path().join("a");
+        let root_b = dir.path().join("b");
+        std::fs::create_dir_all(&root_a).unwrap();
+        std::fs::create_dir_all(&root_b).unwrap();
+
+        write_config(
+            &root_a,
+            r#"{"autonomous":{"watchdog":{"timeoutSecs":111,"intervalSecs":22}}}"#,
+        );
+        write_config(
+            &root_b,
+            r#"{"autonomous":{"watchdog":{"timeoutSecs":333,"intervalSecs":44}}}"#,
+        );
+
+        let cfg_a = sweep_registry::read_startup_race_config(&root_a);
+        let cfg_b = sweep_registry::read_startup_race_config(&root_b);
+
+        assert_eq!(sweep_registry::resolve_watchdog_timeout(&cfg_a), Duration::from_secs(111));
+        assert_eq!(sweep_registry::resolve_watchdog_interval(&cfg_a), Duration::from_secs(22));
+        assert_eq!(sweep_registry::resolve_watchdog_timeout(&cfg_b), Duration::from_secs(333));
+        assert_eq!(sweep_registry::resolve_watchdog_interval(&cfg_b), Duration::from_secs(44));
+
+        assert_ne!(
+            sweep_registry::resolve_watchdog_timeout(&cfg_a),
+            sweep_registry::resolve_watchdog_timeout(&cfg_b),
+            "each workspace's watchdog timeout must resolve independently, not collapse to one \
+             shared/default value"
+        );
+    }
+
+    /// Install a fake `spawn-claude.sh` that starts and then hangs (writes
+    /// only the spawn-header line, never a checkpoint) — mirrors
+    /// `sweep_registry::tests::hung_child_registry` / `lifecycle_registry`
+    /// (private to that module, reimplemented locally here).
+    fn hung_watchdog_config(root: &Path) -> SweepRegistryConfig {
+        let scripts_dir = root.join(".loom").join("scripts");
+        std::fs::create_dir_all(&scripts_dir).unwrap();
+        let fake_bin = scripts_dir.join("spawn-claude.sh");
+        std::fs::write(
+            &fake_bin,
+            "#!/usr/bin/env bash\n\
+             echo \"spawn-claude: using OAuth account 'faketok' (mode=random)\"\n\
+             sleep 30\n",
+        )
+        .unwrap();
+        let mut perms = std::fs::metadata(&fake_bin).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&fake_bin, perms).unwrap();
+        let mut config = SweepRegistryConfig::new(root.to_path_buf());
+        config.spawn_bin = Some(fake_bin);
+        // Never touch a real `gh` — a pooled-workspace registry inside
+        // `get_or_provision` always resolves `skip_label_flip = false` (real
+        // workspaces need real label flips), but that would fire real `gh
+        // issue edit` calls against this crate's own real GitHub issues in a
+        // test. This test proves the reclaim *mechanism* — the same
+        // `spawn_watchdog_task` `get_or_provision` wires up — is live and
+        // functional when driven by a real async tick.
+        config.skip_label_flip = true;
+        config.journal_path = Some(root.join("test-sweeps-journal.json"));
+        config
+    }
+
+    async fn wait_for_async(timeout: Duration, mut cond: impl FnMut() -> bool) -> bool {
+        let start = std::time::Instant::now();
+        loop {
+            if cond() {
+                return true;
+            }
+            if start.elapsed() >= timeout {
+                return cond();
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn pooled_workspace_watchdog_reclaims_a_hung_sweep() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        let config = hung_watchdog_config(&root);
+        let mut registry = SweepRegistry::new(config);
+
+        let out = registry
+            .dispatch(&crate::types::SweepKind::Issue(999_001), None, None, None, None)
+            .unwrap();
+        let original_id = out.sweep_id.clone();
+
+        let arc = Arc::new(Mutex::new(registry));
+        // Short timeout/interval so the test doesn't wait the production
+        // 300s/30s defaults; the watchdog's first real tick (after the
+        // immediately-skipped boot tick) fires at ~interval, by which point
+        // elapsed-since-dispatch already exceeds timeout.
+        let watchdog = sweep_registry::spawn_watchdog_task(
+            arc.clone(),
+            Duration::from_millis(150),
+            Duration::from_millis(200),
+            None,
+        );
+
+        let reclaimed = wait_for_async(Duration::from_secs(10), || {
+            let reg = arc.lock().unwrap();
+            reg.list(Some(&crate::types::SweepState::Running))
+                .iter()
+                .any(|i| {
+                    matches!(i.kind, crate::types::SweepKind::Issue(n) if n == 999_001)
+                        && i.sweep_id != original_id
+                })
+        })
+        .await;
+        assert!(
+            reclaimed,
+            "watchdog should auto-cancel + re-dispatch the hung pooled-workspace sweep (#4124)"
+        );
+
+        watchdog.abort();
+
+        // Cleanup: cancel any lingering hung child(ren) for the issue so the
+        // fixture process doesn't outlive the test.
+        let mut reg = arc.lock().unwrap();
+        let ids: Vec<String> = reg
+            .list(None)
+            .into_iter()
+            .filter(|i| {
+                matches!(i.kind, crate::types::SweepKind::Issue(n) if n == 999_001)
+                    && matches!(
+                        i.state,
+                        crate::types::SweepState::Running | crate::types::SweepState::Pending
+                    )
+            })
+            .map(|i| i.sweep_id)
+            .collect();
+        for id in ids {
+            let _ = reg.cancel(&id, Duration::from_millis(500));
+        }
     }
 }
