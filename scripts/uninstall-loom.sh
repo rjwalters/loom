@@ -281,6 +281,12 @@ if [[ "$USE_MANIFEST" == "true" ]]; then
       # Loom patterns. See issue #3450.
       continue
     fi
+    if [[ "$file_path" == ".github/labels.yml" ]]; then
+      # labels.yml gets smart removal (step 6): strip only the Loom-owned
+      # BEGIN/END LOOM LABELS block, preserving consumer-authored labels in the
+      # same file. Hard-deleting it would destroy a consumer's own labels. #4187.
+      continue
+    fi
     # Defense in depth (issues #3450, #3480): .github/ is an ALLOWLIST —
     # only the files Loom actually ships into targets (source of truth:
     # defaults/.github/ as walked by scripts/install/manifest.sh) may be
@@ -453,6 +459,11 @@ else
       if [[ "$target_file" == "CLAUDE.md" ]]; then
         continue
       fi
+      # labels.yml gets smart removal (step 6): strip only the Loom marker
+      # block, preserving consumer-authored labels. See issue #4187.
+      if [[ "$target_file" == ".github/labels.yml" ]]; then
+        continue
+      fi
 
       if [[ -f "$TARGET_PATH/$target_file" ]]; then
         REMOVE_FILES+=("$target_file")
@@ -611,6 +622,12 @@ if [[ -f "$TARGET_PATH/.claude/settings.json" ]]; then
   SMART_REMOVE_FILES+=(".claude/settings.json")
 fi
 
+# .github/labels.yml needs marker-block removal (strip only the Loom labels
+# block; delete the file only when nothing meaningful remains). Issue #4187.
+if [[ -f "$TARGET_PATH/.github/labels.yml" ]]; then
+  SMART_REMOVE_FILES+=(".github/labels.yml")
+fi
+
 
 # Track directories to check for emptiness after removal
 REMOVE_DIRS=(
@@ -668,6 +685,9 @@ if [[ ${#SMART_REMOVE_FILES[@]} -gt 0 ]]; then
         ;;
       .claude/settings.json)
         echo "  - .claude/settings.json (remove Loom hooks and permissions only)"
+        ;;
+      .github/labels.yml)
+        echo "  - .github/labels.yml (remove Loom label block only, or entire file if Loom-generated)"
         ;;
     esac
   done
@@ -1003,6 +1023,66 @@ if [[ -f "$WORKTREE_ABS/.loom/CLAUDE.md" ]]; then
   rm -f "$WORKTREE_ABS/.loom/CLAUDE.md"
   REMOVED_LIST+=(".loom/CLAUDE.md")
   success ".loom/CLAUDE.md removed"
+fi
+
+# Handle .github/labels.yml — strip only the Loom-managed label block (#4187)
+#
+# labels.yml is the one scaffolding file a consumer legitimately co-owns: Loom
+# ships its workflow labels wrapped in `# BEGIN LOOM LABELS` / `# END LOOM
+# LABELS` markers, but a consumer may add their own labels to the same file.
+# Uninstall therefore removes ONLY the marked range, deleting the whole file
+# only when nothing meaningful remains outside it. A legacy markerless file is
+# deleted only when it is byte-identical to a shipped Loom template — otherwise
+# it is preserved with a warning, since it may hold consumer-authored labels.
+if [[ -f "$WORKTREE_ABS/.github/labels.yml" ]]; then
+  LABELS_YML="$WORKTREE_ABS/.github/labels.yml"
+
+  # Malformed-marker guard (mirrors CLAUDE.md / .gitignore): require exactly one
+  # BEGIN and one END marker, with BEGIN strictly before END, before we splice.
+  LABELS_BEGIN_COUNT=$(grep -c '^[[:space:]]*# BEGIN LOOM LABELS[[:space:]]*$' "$LABELS_YML" 2>/dev/null || true)
+  LABELS_END_COUNT=$(grep -c '^[[:space:]]*# END LOOM LABELS[[:space:]]*$' "$LABELS_YML" 2>/dev/null || true)
+
+  if [[ "$LABELS_BEGIN_COUNT" == "1" && "$LABELS_END_COUNT" == "1" ]] && \
+     awk '/^[[:space:]]*# BEGIN LOOM LABELS[[:space:]]*$/ { b = NR }
+          /^[[:space:]]*# END LOOM LABELS[[:space:]]*$/   { e = NR }
+          END { exit !(b > 0 && e > 0 && b < e) }' "$LABELS_YML"; then
+    info "Removing Loom label block from .github/labels.yml (marker-based)..."
+
+    # Delete BEGIN..END inclusive; leave every other line byte-for-byte intact.
+    sed '/^[[:space:]]*# BEGIN LOOM LABELS[[:space:]]*$/,/^[[:space:]]*# END LOOM LABELS[[:space:]]*$/d' \
+      "$LABELS_YML" > "${LABELS_YML}.tmp" && mv "${LABELS_YML}.tmp" "$LABELS_YML"
+
+    # Trim now-trailing blank lines (same idiom as the CLAUDE.md handler).
+    awk 'NF || prev_blank++ < 1 { print; if (NF) prev_blank=0 }' "$LABELS_YML" > "${LABELS_YML}.tmp" && mv "${LABELS_YML}.tmp" "$LABELS_YML"
+
+    # Delete the file only when nothing meaningful remains outside the block —
+    # i.e. it is empty, whitespace-only, or comments-only (no `- name:` entries).
+    if [[ ! -s "$LABELS_YML" ]] || ! grep -qE '^[[:space:]]*-[[:space:]]*name:' "$LABELS_YML" 2>/dev/null; then
+      rm -f "$LABELS_YML"
+      REMOVED_LIST+=(".github/labels.yml")
+      success ".github/labels.yml removed (only Loom labels remained)"
+    else
+      REMOVED_LIST+=(".github/labels.yml (Loom label block removed)")
+      success ".github/labels.yml Loom label block removed, consumer labels preserved"
+    fi
+  else
+    if [[ "$LABELS_BEGIN_COUNT" != "0" || "$LABELS_END_COUNT" != "0" ]]; then
+      warning ".github/labels.yml has malformed Loom markers — preserving file to avoid data loss"
+    fi
+    # Markerless file: delete ONLY if byte-identical to a shipped Loom template
+    # (a pristine pre-marker install). Otherwise preserve — it may hold
+    # consumer-authored labels.
+    SHIPPED_LABELS_TEMPLATE="$LOOM_ROOT/defaults/.github/labels.yml"
+    if [[ "$LABELS_BEGIN_COUNT" == "0" && "$LABELS_END_COUNT" == "0" ]] && \
+       [[ -f "$SHIPPED_LABELS_TEMPLATE" ]] && \
+       cmp -s "$LABELS_YML" "$SHIPPED_LABELS_TEMPLATE"; then
+      rm -f "$LABELS_YML"
+      REMOVED_LIST+=(".github/labels.yml")
+      success ".github/labels.yml removed (byte-identical to shipped Loom template)"
+    else
+      info ".github/labels.yml has no Loom markers and differs from the shipped template — preserving (may contain consumer labels)"
+    fi
+  fi
 fi
 
 # Handle .gitignore - remove the Loom-managed block
