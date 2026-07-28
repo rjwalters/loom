@@ -356,13 +356,6 @@ fn run_role_with_timeout(
         .stdout(Stdio::from(out_file))
         .stderr(Stdio::from(stderr_file));
 
-    // Forward LOOM_PACKAGE_PATH so a consumer-repo dispatch can still locate
-    // the `loom_tools` Python package for token selection (issue #3949) —
-    // mirrors `sweep_registry::spawn_child`'s treatment exactly.
-    if let Some(pkg_path) = sweep_registry::resolve_package_path_env() {
-        cmd.env(sweep_registry::PACKAGE_PATH_ENV, pkg_path);
-    }
-
     // Run the child as its own process-group leader so a timeout can tear
     // down the whole subtree (the `claude` session's tool-call
     // subprocesses), not just the top-level `spawn-claude.sh` PID — mirrors

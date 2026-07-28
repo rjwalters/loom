@@ -4,15 +4,20 @@
 //! # Scope of this phase
 //!
 //! Phase 1 (issue #4082) was a **pure addition** with no caller cutover. Phase
-//! 2 (issue #4080, epic #4081) cut the check/probe path over: `loom-daemon
-//! tokens check` (issue #4108, this module's [`check`]) is invoked by
-//! `defaults/scripts/probe-tokens.sh` (native-binary resolution, `python3 -m`
-//! fallback removed), the daemon's own
+//! 2 landed in two increments: issue #4080 cut the check/probe path over
+//! (`loom-daemon tokens check`, issue #4108, this module's [`check`]) —
+//! invoked by `defaults/scripts/probe-tokens.sh` (native-binary resolution,
+//! `python3 -m` fallback removed), the daemon's own
 //! [`crate::token_ranking_refresh::ScriptRankingRefreshRunner`] (via
 //! `std::env::current_exe()`), and `loom-daemon status`'s
-//! `collect_token_usage()` (in-process). `spawn-claude.sh` (token *selection*,
-//! [`select`]) remains on the Python path — that cutover is a separate,
-//! file-disjoint follow-up.
+//! `collect_token_usage()` (in-process). Issue #4228 finished Phase 2: the
+//! token-*selection* path (`spawn-claude.sh` / `claude-wrapper.sh`, this
+//! module's [`select`]) and the bad-token-marking path
+//! (`claude-wrapper.sh`'s account rotation, this module's [`bad_tokens`], now
+//! exposed as `loom-daemon tokens mark-bad`) both cut over to the native CLI
+//! too — zero Python left on the token hot path, and the `LOOM_PACKAGE_PATH`
+//! bridge that used to locate the Python package for those two callers was
+//! retired end-to-end (scripts + `sweep_registry`/`role_runner` forwarding).
 //!
 //! Ported in this phase — the concurrency-critical "hot path" every sweep
 //! dispatch exercises, plus the operator-facing bookkeeping CLI:
@@ -70,3 +75,106 @@ pub mod rotation;
 pub mod select;
 
 pub use select::{EmptyTokenPoolError, SelectedToken, EX_CONFIG};
+
+/// Auto-unpin pre-flight (issue #4228, epic #4081 Phase 2): if the operator
+/// has pinned specific accounts (`.allowlist`) and EVERY pinned account has
+/// reached the consecutive-failure threshold ([`failure_counts::DEFAULT_THRESHOLD`]),
+/// clear the pin and reset the failure counters rather than trap the spawner
+/// on a set of exhausted pinned accounts forever. Mirrors the inline Python
+/// heredoc `spawn-claude.sh` historically ran ahead of every selection
+/// (never a standalone Python module — this is the first time the behavior
+/// gets a name in either language).
+///
+/// Empty-pool guard preserved: this NEVER touches `.bad_tokens` — if that
+/// file blocks every account, the operator must intervene (e.g. `loom-tokens
+/// unblock <name>`).
+///
+/// Returns `Some(message)` — already formatted like the historical Python
+/// advisory line — when the auto-unpin fired; `None` when there was nothing
+/// to do (no active pin, or not every pinned account is over threshold).
+#[must_use]
+pub fn maybe_auto_unpin(workspace: &std::path::Path) -> Option<String> {
+    let pinned = allowlist::read_allowlist(workspace);
+    if pinned.is_empty() {
+        return None;
+    }
+    let threshold = failure_counts::DEFAULT_THRESHOLD;
+    let all_over_threshold = pinned
+        .iter()
+        .all(|name| failure_counts::threshold_reached(workspace, name, threshold));
+    if !all_over_threshold {
+        return None;
+    }
+    let _ = allowlist::clear_allowlist(workspace);
+    let _ = failure_counts::reset_all(workspace);
+    Some(format!(
+        "[auto-unpin] All {} pinned account(s) hit {threshold} consecutive failures; cleared \
+         .allowlist.",
+        pinned.len()
+    ))
+}
+
+#[cfg(test)]
+mod auto_unpin_tests {
+    use super::*;
+    use std::fs;
+
+    fn make_pool(names: &[&str]) -> tempfile::TempDir {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join(".loom").join("tokens");
+        fs::create_dir_all(&dir).unwrap();
+        for n in names {
+            fs::write(dir.join(format!("{n}.token")), format!("key-{n}")).unwrap();
+        }
+        tmp
+    }
+
+    #[test]
+    fn no_allowlist_is_a_noop() {
+        let tmp = make_pool(&["a"]);
+        assert!(maybe_auto_unpin(tmp.path()).is_none());
+    }
+
+    #[test]
+    fn allowlist_below_threshold_is_a_noop() {
+        let tmp = make_pool(&["a", "b"]);
+        allowlist::write_allowlist(tmp.path(), &["a".to_string()]).unwrap();
+        for _ in 0..failure_counts::DEFAULT_THRESHOLD - 1 {
+            failure_counts::record_failure(tmp.path(), "a", failure_counts::DEFAULT_THRESHOLD)
+                .unwrap();
+        }
+        assert!(maybe_auto_unpin(tmp.path()).is_none());
+        assert_eq!(allowlist::read_allowlist(tmp.path()), vec!["a".to_string()]);
+    }
+
+    #[test]
+    fn all_pinned_over_threshold_clears_allowlist_and_counters() {
+        let tmp = make_pool(&["a", "b", "c"]);
+        allowlist::write_allowlist(tmp.path(), &["a".to_string(), "b".to_string()]).unwrap();
+        for name in ["a", "b"] {
+            for _ in 0..failure_counts::DEFAULT_THRESHOLD {
+                failure_counts::record_failure(tmp.path(), name, failure_counts::DEFAULT_THRESHOLD)
+                    .unwrap();
+            }
+        }
+        let msg = maybe_auto_unpin(tmp.path()).expect("expected auto-unpin to fire");
+        assert!(msg.contains("[auto-unpin]"));
+        assert!(msg.contains("2 pinned account"));
+        assert!(allowlist::read_allowlist(tmp.path()).is_empty());
+        assert_eq!(failure_counts::get_count(tmp.path(), "a"), 0);
+        assert_eq!(failure_counts::get_count(tmp.path(), "b"), 0);
+    }
+
+    #[test]
+    fn one_pinned_account_still_healthy_blocks_auto_unpin() {
+        let tmp = make_pool(&["a", "b"]);
+        allowlist::write_allowlist(tmp.path(), &["a".to_string(), "b".to_string()]).unwrap();
+        for _ in 0..failure_counts::DEFAULT_THRESHOLD {
+            failure_counts::record_failure(tmp.path(), "a", failure_counts::DEFAULT_THRESHOLD)
+                .unwrap();
+        }
+        // "b" never failed — the pin must survive.
+        assert!(maybe_auto_unpin(tmp.path()).is_none());
+        assert_eq!(allowlist::read_allowlist(tmp.path()), vec!["a".to_string(), "b".to_string()]);
+    }
+}

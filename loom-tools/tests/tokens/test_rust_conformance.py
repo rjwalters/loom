@@ -382,6 +382,74 @@ def test_unblock_default_scope_excluded_exit3_identically(tmp_path):
     assert py_json == rust_json == {"removed": 1, "kept": 1, "excluded": ["b"]}
 
 
+# ---------------------------------------------------------------------------
+# mark-bad (issue #4228, epic #4081 Phase 2): the new `loom-daemon tokens
+# mark-bad` CLI exposure of the pre-existing `bad_tokens::mark_bad` library
+# fn — the gap that let `claude-wrapper.sh` drop its inline
+# `from loom_tools.tokens.bad_tokens import mark_bad` heredoc. Python's
+# `mark_bad` has no CLI of its own (library-only, exercised directly in
+# `loom-tools/tests/tokens/test_bad_tokens.py`), so the comparison here calls
+# the Python function directly rather than shelling to a Python CLI.
+# ---------------------------------------------------------------------------
+
+
+def test_mark_bad_appends_byte_compatible_entry(tmp_path):
+    py_ws = tmp_path / "py"
+    rust_ws = tmp_path / "rust"
+    _write_pool(py_ws, ["a"])
+    _write_pool(rust_ws, ["a"])
+
+    py_mark_bad(py_ws, "a", "exhausted: weekly limit")
+    rust_result = _run_rust("mark-bad", "a", "--reason", "exhausted: weekly limit", "--workspace", str(rust_ws))
+    assert rust_result.returncode == 0, rust_result.stderr
+
+    py_bad = (py_ws / ".loom" / "tokens" / ".bad_tokens").read_text(encoding="utf-8")
+    rust_bad = (rust_ws / ".loom" / "tokens" / ".bad_tokens").read_text(encoding="utf-8")
+    # Timestamps differ per-run; the record shape (name + reason text) must
+    # match exactly, and each is exactly one line.
+    assert py_bad.count("\n") == rust_bad.count("\n") == 1
+    assert "a exhausted: weekly limit" in py_bad
+    assert "a exhausted: weekly limit" in rust_bad
+
+
+def test_mark_bad_reason_newline_sanitization_agrees(tmp_path):
+    """Both implementations collapse an embedded newline/CR in the reason so
+    a `.bad_tokens` record is always exactly one line (parity guard named
+    explicitly in issue #4228)."""
+    py_ws = tmp_path / "py"
+    rust_ws = tmp_path / "rust"
+    _write_pool(py_ws, ["agent-1"])
+    _write_pool(rust_ws, ["agent-1"])
+
+    multiline_reason = "line one\nline two\rline three"
+    py_mark_bad(py_ws, "agent-1", multiline_reason)
+    rust_result = _run_rust(
+        "mark-bad", "agent-1", "--reason", multiline_reason, "--workspace", str(rust_ws)
+    )
+    assert rust_result.returncode == 0, rust_result.stderr
+
+    py_bad = (py_ws / ".loom" / "tokens" / ".bad_tokens").read_text(encoding="utf-8")
+    rust_bad = (rust_ws / ".loom" / "tokens" / ".bad_tokens").read_text(encoding="utf-8")
+    assert py_bad.count("\n") == rust_bad.count("\n") == 1
+    for record in (py_bad, rust_bad):
+        assert "line one" in record
+        assert "line two" in record
+        assert "line three" in record
+
+
+def test_mark_bad_missing_tokens_dir_both_fail(tmp_path):
+    py_ws = tmp_path / "py"
+    rust_ws = tmp_path / "rust"
+    py_ws.mkdir()
+    rust_ws.mkdir()
+
+    with pytest.raises(Exception):
+        py_mark_bad(py_ws, "agent-1", "no dir")
+
+    rust_result = _run_rust("mark-bad", "agent-1", "--reason", "no dir", "--workspace", str(rust_ws))
+    assert rust_result.returncode != 0
+
+
 def _loom_tools_src() -> str:
     root = _find_repo_root()
     assert root is not None

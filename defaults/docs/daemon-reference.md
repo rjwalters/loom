@@ -1409,8 +1409,10 @@ the `.ranking` discrete status word (`exhausted` is already ≥ 0.95 utilization
 a finer sub-exhausted (≥ 0.90) bucket would read the richer `loom-tokens check
 --json` utilization and is a tracked follow-up. Even rotation/staggering of
 dispatches across the available account set (so 5h/7d windows reset in a
-staggered pattern) lives in the spawn-time selector (`loom_tools.tokens.select`),
-not the daemon, and is a separate follow-up.
+staggered pattern) lives in the spawn-time selector (native `loom-daemon tokens
+select`, `loom-daemon/src/tokens_pool/select.rs` — cut over from
+`loom_tools.tokens.select` in #4228), not the daemon's own dispatch loop, and is
+a separate follow-up.
 
 ## Operability — config, start/stop, E2E (Phase D, #3813)
 
@@ -1824,8 +1826,9 @@ for the full design.
 ### Prerequisite: a fresh token ranking (#3894, self-refreshed by the daemon since #3969)
 
 **When you run autonomous mode against a multi-account token pool, keep
-`.loom/tokens/.ranking` fresh.** The spawn-time selector (`loom_tools.tokens.select`)
-is 3-tier — ranking → allowlist → random — and the ranking file is only
+`.loom/tokens/.ranking` fresh.** The spawn-time selector (native `loom-daemon
+tokens select`, cut over from `loom_tools.tokens.select` in #4228) is 3-tier —
+ranking → allowlist → random — and the ranking file is only
 considered fresh for **10 minutes**. When it is absent or stale, tier-1 declines
 and selection falls to the lower tiers. The work finder dispatches in bursts, so
 a stale ranking means the daemon can steadily hand out accounts a recent probe

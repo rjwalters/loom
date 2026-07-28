@@ -77,7 +77,11 @@ TERMINAL_ID="${LOOM_TERMINAL_ID:-}"
 # Desktop/Documents/Downloads/Photos/Music/iCloud on an unsigned launchd binary.
 WORKSPACE="${LOOM_WORKSPACE:-$(pwd 2>/dev/null || echo "/tmp")}"
 
-# Python interpreter + active-account tracking for account rotation (#3738).
+# Python interpreter — still used by several NON-token helpers further down
+# this script (auth-status caching, MCP config parsing). The token-path
+# account-rotation calls (mark-bad / re-select, #3738) were cut over to the
+# native `loom-daemon tokens` CLI in issue #4228 (epic #4081 Phase 2) and no
+# longer consult this variable.
 LOOM_PYTHON="${LOOM_PYTHON:-python3}"
 # The account name whose OAuth token is currently exported. spawn-claude.sh
 # exports LOOM_TOKEN_NAME before exec'ing this wrapper; when the wrapper is
@@ -85,8 +89,9 @@ LOOM_PYTHON="${LOOM_PYTHON:-python3}"
 # content-matching the token against the pool at rotation time.
 ACTIVE_TOKEN_NAME="${LOOM_TOKEN_NAME:-}"
 
-# Directory of this script — used to source the shared error classifier and to
-# locate the loom_tools package for the mark-bad / re-select calls (#3738).
+# Directory of this script — used to source the shared error classifier and
+# to locate the native `loom-daemon` binary for the mark-bad / re-select
+# calls (#3738, cut over to `loom-daemon tokens` in #4228).
 _WRAPPER_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # Source the shared error classifier so the wrapper's account-exhaustion
@@ -99,6 +104,18 @@ if [[ -f "${_WRAPPER_DIR}/lib/classify-error.sh" ]]; then
     # shellcheck source=lib/classify-error.sh
     # shellcheck disable=SC1091
     source "${_WRAPPER_DIR}/lib/classify-error.sh"
+fi
+
+# Source the shared loom-daemon binary resolver (issue #4228) so account
+# rotation's mark-bad / re-select calls resolve the SAME binary
+# probe-tokens.sh / spawn-claude.sh do: $LOOM_DAEMON_BIN -> `loom-daemon` on
+# PATH -> build-output-relative candidates under the repo. If absent (older
+# install mid-resync), rotate_exhausted_account / reselect_account_no_mark
+# fail soft (return 1, same observable behavior as a Python selection error).
+if [[ -f "${_WRAPPER_DIR}/lib/locate-daemon-bin.sh" ]]; then
+    # shellcheck source=lib/locate-daemon-bin.sh
+    # shellcheck disable=SC1091
+    source "${_WRAPPER_DIR}/lib/locate-daemon-bin.sh"
 fi
 
 # Whether --dangerously-skip-permissions was passed (detected in main())
@@ -947,36 +964,41 @@ is_account_session_limit() {
 
 # Re-select a DIFFERENT rotation account WITHOUT marking the current one bad
 # (#3947). Used for concurrent-session-limit faults: the account isn't broken,
-# it just can't take another simultaneous session, so we spread to a sibling and
-# retry. Advances the rotation cursor (loom_tools.tokens.select) so a healthy
+# it just can't take another simultaneous session, so we spread to a sibling
+# and retry. Advances the rotation cursor (native `loom-daemon tokens select`,
+# cut over from `loom_tools.tokens.select` in issue #4228) so a healthy
 # sibling is preferred over re-picking the saturated account. Returns 0 when a
-# new token was exported, 1 when selection yielded nothing.
+# new token was exported, 1 when selection yielded nothing (including "no
+# loom-daemon binary resolved" — the same observable failure a broken Python
+# selector used to produce).
 reselect_account_no_mark() {
-    local ws pkg
+    local ws daemon_bin
     ws="$(_resolve_token_workspace)"
-    pkg="$(_resolve_package_path "${ws}")"
+    daemon_bin="$(declare -F loom_locate_daemon_bin >/dev/null 2>&1 && loom_locate_daemon_bin "${ws}" || true)"
+    if [[ -z "${daemon_bin}" ]]; then
+        log_warn "No loom-daemon binary resolved — cannot re-select an OAuth account"
+        return 1
+    fi
 
-    local sel_json _sel_rc
+    local sel_output _sel_rc
     set +e
-    sel_json="$(PYTHONPATH="${pkg}${PYTHONPATH:+:$PYTHONPATH}" \
-        "${LOOM_PYTHON}" -m loom_tools.tokens.select --workspace "${ws}" --json 2>/dev/null)"
+    sel_output="$("${daemon_bin}" tokens select --workspace "${ws}" --export 2>/dev/null)"
     _sel_rc=$?
     set -e
-    if [[ ${_sel_rc} -ne 0 || -z "${sel_json}" ]]; then
+    if [[ ${_sel_rc} -ne 0 || -z "${sel_output}" ]]; then
         return 1
     fi
 
-    local new_key new_name
-    new_key="$(printf '%s' "${sel_json}" | "${LOOM_PYTHON}" -c 'import json,sys; print(json.load(sys.stdin)["key"])' 2>/dev/null || echo "")"
-    new_name="$(printf '%s' "${sel_json}" | "${LOOM_PYTHON}" -c 'import json,sys; print(json.load(sys.stdin)["name"])' 2>/dev/null || echo "")"
-    if [[ -z "${new_key}" ]]; then
+    # `--export` emits shell-evalable `export CLAUDE_CODE_OAUTH_TOKEN=...` /
+    # `export LOOM_TOKEN_NAME=...` lines (issue #4228) — no more round-trip
+    # through `python3 -c 'import json...'` to pull the two fields back out.
+    eval "${sel_output}"
+    if [[ -z "${CLAUDE_CODE_OAUTH_TOKEN:-}" ]]; then
         return 1
     fi
 
-    export CLAUDE_CODE_OAUTH_TOKEN="${new_key}"
-    ACTIVE_TOKEN_NAME="${new_name}"
-    export LOOM_TOKEN_NAME="${new_name}"
-    log_info "Re-selected OAuth account → '${new_name}' after concurrent-session limit (token NOT marked bad)"
+    ACTIVE_TOKEN_NAME="${LOOM_TOKEN_NAME:-}"
+    log_info "Re-selected OAuth account → '${ACTIVE_TOKEN_NAME}' after concurrent-session limit (token NOT marked bad)"
     return 0
 }
 
@@ -1010,23 +1032,6 @@ _resolve_token_workspace() {
     printf '%s\n' "${WORKSPACE}"
 }
 
-# Resolve the loom_tools package source (for the mark_bad / select calls).
-# Script-relative first (repo layout), then $WORKSPACE fallback.
-_resolve_package_path() {
-    local ws="$1"
-    if [[ -n "${LOOM_PACKAGE_PATH:-}" ]]; then
-        printf '%s\n' "${LOOM_PACKAGE_PATH}"
-        return
-    fi
-    local rel
-    rel="$(cd "${_WRAPPER_DIR}/../../loom-tools/src" 2>/dev/null && pwd || echo "")"
-    if [[ -n "${rel}" && -d "${rel}/loom_tools/tokens" ]]; then
-        printf '%s\n' "${rel}"
-        return
-    fi
-    printf '%s\n' "${ws}/loom-tools/src"
-}
-
 # Fallback identification of the active account when LOOM_TOKEN_NAME is unset:
 # content-match the exported token against .loom/tokens/*.token. Deterministic
 # (exact content compare) — deliberately avoids lean-genius's `ls -t | head -1`
@@ -1049,32 +1054,30 @@ _derive_token_name() {
 
 # Mark the active account exhausted in .loom/tokens/.bad_tokens, then re-run
 # Loom token selection (which now skips it) and re-export
-# CLAUDE_CODE_OAUTH_TOKEN. Reuses the existing Loom primitives
-# (loom_tools.tokens.bad_tokens.mark_bad + loom_tools.tokens.select) rather
-# than reimplementing lean-genius's raw file-glob. Returns 0 on success (a new
-# account is exported), 1 when the pool has no eligible account left.
+# CLAUDE_CODE_OAUTH_TOKEN. Reuses the existing Loom primitives via the native
+# `loom-daemon tokens mark-bad` / `tokens select` CLI (cut over from
+# `loom_tools.tokens.bad_tokens.mark_bad` + `loom_tools.tokens.select` in
+# issue #4228) rather than reimplementing lean-genius's raw file-glob.
+# Returns 0 on success (a new account is exported), 1 when the pool has no
+# eligible account left (or no loom-daemon binary resolves).
 rotate_exhausted_account() {
     local reason="$1"
-    local ws pkg
+    local ws daemon_bin
     ws="$(_resolve_token_workspace)"
-    pkg="$(_resolve_package_path "${ws}")"
+    daemon_bin="$(declare -F loom_locate_daemon_bin >/dev/null 2>&1 && loom_locate_daemon_bin "${ws}" || true)"
 
     if [[ -z "${ACTIVE_TOKEN_NAME}" ]]; then
         ACTIVE_TOKEN_NAME="$(_derive_token_name "${ws}" "${CLAUDE_CODE_OAUTH_TOKEN:-}" || true)"
     fi
 
+    if [[ -z "${daemon_bin}" ]]; then
+        log_warn "No loom-daemon binary resolved — cannot mark '${ACTIVE_TOKEN_NAME:-unknown}' bad or re-select"
+        return 1
+    fi
+
     if [[ -n "${ACTIVE_TOKEN_NAME}" ]]; then
-        local _mb
-        set +e
-        PYTHONPATH="${pkg}${PYTHONPATH:+:$PYTHONPATH}" "${LOOM_PYTHON}" - \
-            "${ws}" "${ACTIVE_TOKEN_NAME}" "exhausted: ${reason}" <<'PY' 2>/dev/null
-import sys
-from loom_tools.tokens.bad_tokens import mark_bad
-mark_bad(sys.argv[1], sys.argv[2], sys.argv[3])
-PY
-        _mb=$?
-        set -e
-        if [[ ${_mb} -eq 0 ]]; then
+        if "${daemon_bin}" tokens mark-bad "${ACTIVE_TOKEN_NAME}" \
+            --reason "exhausted: ${reason}" --workspace "${ws}" >/dev/null 2>&1; then
             log_info "Marked account '${ACTIVE_TOKEN_NAME}' exhausted in .bad_tokens (${reason})"
         else
             log_warn "Could not record '${ACTIVE_TOKEN_NAME}' in .bad_tokens (continuing to re-select)"
@@ -1083,27 +1086,22 @@ PY
         log_warn "Active account name unknown — cannot mark it bad; re-selecting anyway"
     fi
 
-    local sel_json _sel_rc
+    local sel_output _sel_rc
     set +e
-    sel_json="$(PYTHONPATH="${pkg}${PYTHONPATH:+:$PYTHONPATH}" \
-        "${LOOM_PYTHON}" -m loom_tools.tokens.select --workspace "${ws}" --json 2>/dev/null)"
+    sel_output="$("${daemon_bin}" tokens select --workspace "${ws}" --export 2>/dev/null)"
     _sel_rc=$?
     set -e
-    if [[ ${_sel_rc} -ne 0 || -z "${sel_json}" ]]; then
+    if [[ ${_sel_rc} -ne 0 || -z "${sel_output}" ]]; then
         return 1
     fi
 
-    local new_key new_name
-    new_key="$(printf '%s' "${sel_json}" | "${LOOM_PYTHON}" -c 'import json,sys; print(json.load(sys.stdin)["key"])' 2>/dev/null || echo "")"
-    new_name="$(printf '%s' "${sel_json}" | "${LOOM_PYTHON}" -c 'import json,sys; print(json.load(sys.stdin)["name"])' 2>/dev/null || echo "")"
-    if [[ -z "${new_key}" ]]; then
+    eval "${sel_output}"
+    if [[ -z "${CLAUDE_CODE_OAUTH_TOKEN:-}" ]]; then
         return 1
     fi
 
-    export CLAUDE_CODE_OAUTH_TOKEN="${new_key}"
-    ACTIVE_TOKEN_NAME="${new_name}"
-    export LOOM_TOKEN_NAME="${new_name}"
-    log_info "Rotated OAuth account → '${new_name}' (token tail=…${new_key: -4})"
+    ACTIVE_TOKEN_NAME="${LOOM_TOKEN_NAME:-}"
+    log_info "Rotated OAuth account → '${ACTIVE_TOKEN_NAME}' (token tail=…${CLAUDE_CODE_OAUTH_TOKEN: -4})"
     return 0
 }
 

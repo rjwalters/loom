@@ -63,10 +63,10 @@ token-rotating launcher that:
 1. Resolves the canonical repo root (worktree-aware, via
    `git rev-parse --git-common-dir`).
 2. Selects a Claude Code OAuth token from the effective `.loom/tokens/` pool
-   (per-repo pool, else the shared machine-level pool) via
-   `python3 -m loom_tools.tokens.select`, exports `CLAUDE_CODE_OAUTH_TOKEN`, and
-   exports `LOOM_TOKEN_NAME` so a downstream wrapper can mark exactly the right
-   account bad on a usage fault.
+   (per-repo pool, else the shared machine-level pool) via the native
+   `loom-daemon tokens select` CLI (issue #4228), exports
+   `CLAUDE_CODE_OAUTH_TOKEN`, and exports `LOOM_TOKEN_NAME` so a downstream
+   wrapper can mark exactly the right account bad on a usage fault.
 3. `exec`s the underlying CLI — `claude` by default, or
    `.loom/scripts/claude-wrapper.sh` when `--use-wrapper` is passed for
    retry/backoff/auth-cache behavior.
@@ -85,10 +85,12 @@ Claude-specific internals):
 | **Observability** | Emits exactly one structured `spawn-claude: model=<v>` line (and an effort line when resolved) to stderr on every spawn, changing no behavior. | Emit an equivalent single structured line so log scrapers can attribute the dispatch. |
 
 The daemon dispatch path (`loom-daemon`'s `spawn_child`) sets
-`LOOM_PACKAGE_PATH`, `LOOM_SWEEP_CLAIM_OWNED`, and per-sweep log redirection
-around this script; an adapter's spawn entry point is invoked the same way, so it
-must tolerate those env vars being present (Claude's script logs
-`LOOM_SWEEP_CLAIM_OWNED` on every spawn for dispatch diagnosability).
+`LOOM_SWEEP_CLAIM_OWNED` and per-sweep log redirection around this script; an
+adapter's spawn entry point is invoked the same way, so it must tolerate that
+env var being present (Claude's script logs `LOOM_SWEEP_CLAIM_OWNED` on every
+spawn for dispatch diagnosability). `LOOM_PACKAGE_PATH` forwarding — the
+bridge that let a dispatched `spawn-claude.sh` locate the Python `loom_tools`
+package — was retired end-to-end in #4228 once token selection went native.
 
 The runtime-neutral **dispatch seam** that realizes this contract point today —
 `spawn-worker.sh` plus the `runtimes` config block — is specified in

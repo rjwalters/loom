@@ -29,8 +29,9 @@ use std::process::Command;
 pub const BUILT_COMMIT: &str = env!("LOOM_DAEMON_GIT_COMMIT");
 
 /// This crate's own directory in the source tree it was compiled from, baked
-/// in at compile time via `CARGO_MANIFEST_DIR` — the same technique
-/// `sweep_registry::BUILD_MANIFEST_DIR` uses for `LOOM_PACKAGE_PATH`
+/// in at compile time via `CARGO_MANIFEST_DIR` — the same
+/// compiled-from-source-tree technique the (retired in #4228)
+/// `sweep_registry::resolve_package_path_env` used for `LOOM_PACKAGE_PATH`
 /// resolution (issue #3949). This is a build-time constant, so it keeps
 /// pointing at the original checkout even after the compiled binary is
 /// copied elsewhere (e.g. `~/.local/bin/loom-daemon`, issue #3922) — as long
