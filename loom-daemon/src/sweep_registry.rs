@@ -1994,6 +1994,10 @@ impl SweepRegistry {
         self.emit_event(Event::SweepGlobalDispatch {
             sweep_id: sweep_id.clone(),
             kind: kind.clone(),
+            // Stamped by `emit_event` -> `set_repo_if_absent` below (#4201),
+            // matching the pattern already used for SweepPhase/Blocker/Exited/
+            // Crashed — leave it `None` at construction.
+            repo: None,
         });
 
         Ok(DispatchOutcome {

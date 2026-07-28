@@ -38,6 +38,7 @@
 //!   same connection and carry an `event` key with no `id`** — the client
 //!   demultiplexes by skipping any line with an `event` key.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -66,6 +67,29 @@ const PERSONA_ENV: &str = "LOOM_SAFEHOUSE_PERSONA";
 /// Convention for discovering the socket when neither env nor config sets one
 /// (matches safehoused clients, which read `$SAFEHOUSED_SOCKET`).
 const SAFEHOUSED_SOCKET_ENV: &str = "SAFEHOUSED_SOCKET";
+
+/// Test/internal override for the `gh` binary the sink shells out to for the
+/// dispatch-line title lookup (issue #4201). Mirrors the test-injection
+/// pattern `SweepRegistryConfig::gh_bin` already uses in `sweep_registry.rs`
+/// (a fake-`gh` script path), but as an env var since the sink has no
+/// analogous per-registry config struct to carry a field on. Not part of the
+/// public `safehouse` config block — this is a plumbing seam for tests, not an
+/// operator-facing setting.
+const GH_BIN_ENV: &str = "LOOM_SAFEHOUSE_GH_BIN";
+
+/// Timeout for the sink-side `gh issue view --json title` lookup used to
+/// enrich the dispatch line's body (issue #4201). Best-effort: on
+/// timeout/failure the dispatch line is still narrated, just without a title,
+/// rather than blocking narration (or, worse, the sweep the event describes).
+const TITLE_FETCH_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// How long a fetched issue title is cached before being looked up again — a
+/// re-dispatch of the same issue (e.g. a Doctor-cycle re-run) reuses the
+/// cached title instead of re-shelling to `gh`. Titles rarely change, so a
+/// generous TTL is fine; this is the "short cache" tradeoff issue #4201 calls
+/// for as the lighter alternative to threading the title through a
+/// `SweepGlobalDispatch` payload amendment.
+const TITLE_CACHE_TTL: Duration = Duration::from_secs(600);
 
 /// The static operator-provisioned persona used when none is configured. Must
 /// be present in safehoused's boot-time `personas` allowlist.
@@ -277,19 +301,107 @@ pub fn build_send_request(env: &Envelope, id: u64, room: Option<&str>) -> Result
 }
 
 // ============================================================================
+// Repo qualification + body-grammar helpers (issue #4201)
+// ============================================================================
+
+/// Convention (issue #4201, documented in `.loom/docs/safehouse.md`): the
+/// narration-friendly repo name is the **basename of the workspace-root
+/// filesystem path** stamped onto the event's `repo` field by
+/// `SweepRegistry::emit_event` (e.g. `/Users/x/GitHub/vibesql` → `vibesql`).
+/// This is a path-derived directory name, not a forge `owner/repo` slug — it
+/// needs no network call, and the daemon's workspace registry already
+/// guarantees at most one managed registry per path. Returns `None` when
+/// `repo` is absent (a pre-#3929/#4201 event, or a synthetic test event) so
+/// callers can fall back to the old unqualified form.
+fn repo_basename(repo: Option<&str>) -> Option<String> {
+    repo.and_then(|r| Path::new(r).file_name())
+        .map(|n| n.to_string_lossy().into_owned())
+        .filter(|s| !s.is_empty())
+}
+
+/// Fold `s` into the `task_id` charset (`[A-Za-z0-9_]`, enforced in
+/// [`build_send_request`]) by replacing every other character with `_` —
+/// mirrors the hyphen→underscore fold [`normalize_to`] already applies to
+/// personas, generalized to any non-alphanumeric byte (repo basenames may
+/// contain `-`, `.`, etc.).
+fn sanitize_task_id_segment(s: &str) -> String {
+    s.chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+        .collect()
+}
+
+/// Build the repo-qualified `task_id` for a narrated event: `<repo>_<issue>`
+/// using the sanitized workspace basename, so the same issue number in two
+/// managed repos (e.g. loom #4201 vs vibesql #4201) threads into **distinct**
+/// Matrix threads instead of colliding (issue #4201, problem 1 — the bug this
+/// module previously had). Falls back to the bare issue number when no `repo`
+/// is known, preserving the pre-#4201 behavior for synthetic/test events and
+/// any future event variant that is never stamped.
+fn qualify_task_id(repo: Option<&str>, issue: u32) -> String {
+    match repo_basename(repo) {
+        Some(name) => format!("{}_{issue}", sanitize_task_id_segment(&name)),
+        None => issue.to_string(),
+    }
+}
+
+/// Build the `<repo>#<issue>` prefix that starts every narrated body (issue
+/// #4201's body grammar). Falls back to a bare `#<issue>` when no `repo` is
+/// known.
+fn repo_issue_prefix(repo: Option<&str>, issue: u32) -> String {
+    match repo_basename(repo) {
+        Some(name) => format!("{name}#{issue}"),
+        None => format!("#{issue}"),
+    }
+}
+
+/// Format a duration given in whole seconds as `<m>m<s>s`, dropping the
+/// minutes segment when it is zero — e.g. `415` → `6m55s`, `24` → `24s`
+/// (matches issue #4201's grammar examples). Negative input (never produced by
+/// the reaper, but `duration_sec` is a plain `i64`) clamps to zero rather than
+/// rendering a negative duration.
+fn format_narrated_duration(sec: i64) -> String {
+    let sec = sec.max(0);
+    let minutes = sec / 60;
+    let seconds = sec % 60;
+    if minutes > 0 {
+        format!("{minutes}m{seconds}s")
+    } else {
+        format!("{seconds}s")
+    }
+}
+
+/// Decode a **well-known** exit code into a short parenthetical meaning, e.g.
+/// `78` → the `sysexits.h` `EX_CONFIG` code the token pool uses for an
+/// exhausted/missing pool (`.loom/docs/token-pool.md`). Every other code
+/// prints raw with no annotation — issue #4201 deliberately does not attempt a
+/// full sysexits decode table, only the one code operators actually hit.
+fn decode_exit_code_annotation(code: i32) -> &'static str {
+    match code {
+        78 => " (EX_CONFIG: token pool)",
+        _ => "",
+    }
+}
+
+// ============================================================================
 // Event → envelope mapping (existing frozen taxonomy only)
 // ============================================================================
 
 /// Map an existing bus [`Event`] to a narration [`Envelope`], or `None` for
 /// events phase 1 does not narrate.
 ///
+/// Every narrated body starts with the repo-qualified `<repo>#<issue>` prefix
+/// ([`repo_issue_prefix`]) and every narrated `task_id` is likewise
+/// repo-qualified ([`qualify_task_id`]) — issue #4201, problem 1 — so the same
+/// issue number in two managed repos threads into distinct Matrix threads
+/// instead of colliding:
+///
 /// | Event | type | body |
 /// |---|---|---|
-/// | `SweepGlobalDispatch(Issue n)` | `task` | `sweep dispatched: issue #n` |
-/// | `SweepPhase` | `task` | `issue #n → <phase>` (+ PR when present) |
-/// | `SweepBlocker` | `handoff` | `issue #n blocked: <reason>` |
-/// | `SweepExited` | `ack` | `issue #n complete (exit <code>, <dur>s)` |
-/// | `SweepCrashed` | `handoff` | `issue #n crashed at <checkpoint_phase>` |
+/// | `SweepGlobalDispatch(Issue n)` | `task` | `<repo>#n · dispatch` (the sink, [`run_sink`], best-effort appends ` — "<issue title>"`) |
+/// | `SweepPhase` | `task` | `<repo>#n · <phase>` (+ ` · PR #m open` when present) |
+/// | `SweepBlocker` | `handoff` | `<repo>#n · BLOCKED — <reason>` |
+/// | `SweepExited` | `ack` | `<repo>#n · done ✓ · <dur>` or `<repo>#n · failed ✗ · exit <code>[ (decoded)] · <dur>` |
+/// | `SweepCrashed` | `handoff` | `<repo>#n · crashed ✗ at <checkpoint_phase> — resumable (checkpoint kept)` |
 ///
 /// `SweepGlobalCompleted` is intentionally **not** narrated: it carries only a
 /// `sweep_id` (no issue number), and `SweepExited` already emits the completion
@@ -299,61 +411,79 @@ pub fn event_to_envelope(event: &Event) -> Option<Envelope> {
     match event {
         Event::SweepGlobalDispatch {
             kind: SweepKind::Issue(issue),
+            repo,
             ..
         } => Some(Envelope {
             to: "*".to_owned(),
             kind: "task".to_owned(),
-            task_id: Some(issue.to_string()),
-            body: format!("sweep dispatched: issue #{issue}"),
+            task_id: Some(qualify_task_id(repo.as_deref(), *issue)),
+            body: format!("{} · dispatch", repo_issue_prefix(repo.as_deref(), *issue)),
         }),
         Event::SweepPhase {
             issue,
             phase,
             pr_number,
-            ..
+            repo,
         } => {
-            let mut body = format!("issue #{issue} → {phase}");
+            let mut body = format!("{} · {phase}", repo_issue_prefix(repo.as_deref(), *issue));
             if let Some(pr) = pr_number {
-                body.push_str(&format!(" (PR #{pr})"));
+                body.push_str(&format!(" · PR #{pr} open"));
             }
             Some(Envelope {
                 to: "*".to_owned(),
                 kind: "task".to_owned(),
-                task_id: Some(issue.to_string()),
+                task_id: Some(qualify_task_id(repo.as_deref(), *issue)),
                 body,
             })
         }
-        Event::SweepBlocker { issue, reason, .. } => Some(Envelope {
+        Event::SweepBlocker {
+            issue,
+            reason,
+            repo,
+            ..
+        } => Some(Envelope {
             to: "*".to_owned(),
             kind: "handoff".to_owned(),
-            task_id: Some(issue.to_string()),
-            body: format!("issue #{issue} blocked: {reason}"),
+            task_id: Some(qualify_task_id(repo.as_deref(), *issue)),
+            body: format!("{} · BLOCKED — {reason}", repo_issue_prefix(repo.as_deref(), *issue)),
         }),
         Event::SweepExited {
             issue,
             exit_code,
             duration_sec,
-            ..
+            repo,
         } => {
-            let code = exit_code.map_or_else(|| "?".to_owned(), |c| c.to_string());
+            let prefix = repo_issue_prefix(repo.as_deref(), *issue);
+            let dur = format_narrated_duration(*duration_sec);
+            let body = match exit_code {
+                Some(0) => format!("{prefix} · done ✓ · {dur}"),
+                Some(code) => format!(
+                    "{prefix} · failed ✗ · exit {code}{} · {dur}",
+                    decode_exit_code_annotation(*code)
+                ),
+                None => format!("{prefix} · failed ✗ · exit ? · {dur}"),
+            };
             Some(Envelope {
                 to: "*".to_owned(),
                 kind: "ack".to_owned(),
-                task_id: Some(issue.to_string()),
-                body: format!("issue #{issue} complete (exit {code}, {duration_sec}s)"),
+                task_id: Some(qualify_task_id(repo.as_deref(), *issue)),
+                body,
             })
         }
         Event::SweepCrashed {
             issue,
             checkpoint_phase,
-            ..
+            repo,
         } => {
             let phase = checkpoint_phase.as_deref().unwrap_or("unknown");
             Some(Envelope {
                 to: "*".to_owned(),
                 kind: "handoff".to_owned(),
-                task_id: Some(issue.to_string()),
-                body: format!("issue #{issue} crashed at {phase}"),
+                task_id: Some(qualify_task_id(repo.as_deref(), *issue)),
+                body: format!(
+                    "{} · crashed ✗ at {phase} — resumable (checkpoint kept)",
+                    repo_issue_prefix(repo.as_deref(), *issue)
+                ),
             })
         }
         // SweepGlobalCompleted (no issue number — SweepExited covers it),
@@ -512,6 +642,62 @@ pub fn spawn_sink(
     }))
 }
 
+/// Best-effort `gh issue view --json title` lookup used to enrich the
+/// dispatch line's body with the issue title (issue #4201). This is the
+/// "documented sink-side fetch" tradeoff called for when threading the title
+/// through a `SweepGlobalDispatch` payload amendment is judged too heavy: the
+/// `repo` field earned its amendment because it fixes an actual cross-repo
+/// collision bug, but the title is a pure UX nicety, so it is fetched here
+/// instead, scoped entirely to this sink.
+///
+/// Bounded by [`TITLE_FETCH_TIMEOUT`] and swallows every failure — missing
+/// `gh`, no network, unauthenticated, a nonexistent issue, a timeout — into
+/// `None`. The caller narrates the dispatch line without a title rather than
+/// blocking or dropping the narration entirely; this never affects the sweep
+/// the event describes (the sink is a pure bus subscriber with no back-channel
+/// to dispatch).
+async fn fetch_issue_title(workspace_root: &Path, issue: u32) -> Option<String> {
+    let gh_bin = env_nonempty(GH_BIN_ENV).unwrap_or_else(|| "gh".to_owned());
+    let run = tokio::process::Command::new(&gh_bin)
+        .arg("issue")
+        .arg("view")
+        .arg(issue.to_string())
+        .arg("--json")
+        .arg("title")
+        .arg("--jq")
+        .arg(".title")
+        .current_dir(workspace_root)
+        .output();
+    let output = tokio::time::timeout(TITLE_FETCH_TIMEOUT, run)
+        .await
+        .ok()?
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let title = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+    (!title.is_empty()).then_some(title)
+}
+
+/// [`fetch_issue_title`] with a short TTL cache (issue #4201) keyed by
+/// `(workspace_root, issue)`, so a re-dispatch of the same issue within
+/// [`TITLE_CACHE_TTL`] reuses the cached title instead of re-shelling to `gh`.
+async fn fetch_title_cached(
+    cache: &mut HashMap<(String, u32), (String, Instant)>,
+    workspace_root: &str,
+    issue: u32,
+) -> Option<String> {
+    let key = (workspace_root.to_owned(), issue);
+    if let Some((title, fetched_at)) = cache.get(&key) {
+        if fetched_at.elapsed() < TITLE_CACHE_TTL {
+            return Some(title.clone());
+        }
+    }
+    let title = fetch_issue_title(Path::new(workspace_root), issue).await?;
+    cache.insert(key, (title.clone(), Instant::now()));
+    Some(title)
+}
+
 /// The sink loop. Consumes bus events, maps them to envelopes, and best-effort
 /// narrates them, reconnecting lazily with capped exponential backoff. A
 /// connection failure never blocks or fails a sweep — it degrades to a single
@@ -529,6 +715,8 @@ async fn run_sink(
     let mut backoff = min_backoff;
     // Suppress duplicate outage warnings — one warn per outage, not per event.
     let mut warned = false;
+    // Short-TTL cache for the dispatch-line title lookup (issue #4201).
+    let mut title_cache: HashMap<(String, u32), (String, Instant)> = HashMap::new();
 
     loop {
         let event = match subscription.recv().await {
@@ -541,9 +729,25 @@ async fn run_sink(
             Err(_) => continue,
         };
 
-        let Some(envelope) = event_to_envelope(&event) else {
+        let Some(mut envelope) = event_to_envelope(&event) else {
             continue;
         };
+
+        // Best-effort dispatch-title enrichment (issue #4201, AC3). Only the
+        // dispatch event needs it, and only when a repo is known (needed to
+        // resolve the `gh` working directory) — every other event is narrated
+        // exactly as `event_to_envelope` built it.
+        if let Event::SweepGlobalDispatch {
+            kind: SweepKind::Issue(issue),
+            repo: Some(workspace_root),
+            ..
+        } = &event
+        {
+            if let Some(title) = fetch_title_cached(&mut title_cache, workspace_root, *issue).await
+            {
+                envelope.body.push_str(&format!(" — \"{title}\""));
+            }
+        }
 
         // (Re)connect lazily, honoring the backoff window so an absent peer is
         // not hammered once per event.
@@ -834,6 +1038,7 @@ mod tests {
     use crate::types::{SweepId, SweepKind};
     use serde_json::json;
     use serial_test::serial;
+    use std::os::unix::fs::PermissionsExt;
     use std::sync::{Arc, Mutex};
     use tokio::net::UnixListener;
 
@@ -1015,6 +1220,58 @@ mod tests {
         assert!(normalize_to("has space").is_err());
     }
 
+    // ---- repo qualification helpers (issue #4201) ----
+
+    #[test]
+    fn repo_basename_extracts_final_path_segment() {
+        assert_eq!(repo_basename(Some("/Users/x/GitHub/vibesql")).as_deref(), Some("vibesql"));
+        assert_eq!(repo_basename(Some("/repos/kicad-tools")).as_deref(), Some("kicad-tools"));
+        assert_eq!(repo_basename(None), None);
+        assert_eq!(repo_basename(Some("")), None);
+    }
+
+    #[test]
+    fn qualify_task_id_sanitizes_and_qualifies() {
+        assert_eq!(qualify_task_id(Some("/repos/vibesql"), 6173), "vibesql_6173");
+        // Non-alphanumeric basename characters (hyphen) fold to `_` so the
+        // result stays in the task_id charset validated by build_send_request.
+        assert_eq!(qualify_task_id(Some("/repos/kicad-tools"), 9), "kicad_tools_9");
+        // No repo known ⇒ bare issue number (pre-#4201 behavior preserved).
+        assert_eq!(qualify_task_id(None, 42), "42");
+    }
+
+    #[test]
+    fn cross_repo_same_issue_number_gets_distinct_task_ids() {
+        // The bug this issue fixes: loom #4201 and vibesql #4201 must not
+        // collide into the same Matrix thread.
+        let loom_id = qualify_task_id(Some("/Users/x/GitHub/loom"), 4201);
+        let vibesql_id = qualify_task_id(Some("/Users/x/GitHub/vibesql"), 4201);
+        assert_ne!(loom_id, vibesql_id);
+        assert_eq!(loom_id, "loom_4201");
+        assert_eq!(vibesql_id, "vibesql_4201");
+    }
+
+    #[test]
+    fn repo_issue_prefix_falls_back_without_repo() {
+        assert_eq!(repo_issue_prefix(Some("/repos/vibesql"), 6173), "vibesql#6173");
+        assert_eq!(repo_issue_prefix(None, 42), "#42");
+    }
+
+    #[test]
+    fn format_narrated_duration_drops_zero_minutes() {
+        assert_eq!(format_narrated_duration(415), "6m55s");
+        assert_eq!(format_narrated_duration(24), "24s");
+        assert_eq!(format_narrated_duration(0), "0s");
+        assert_eq!(format_narrated_duration(60), "1m0s");
+    }
+
+    #[test]
+    fn decode_exit_code_annotates_only_well_known_codes() {
+        assert_eq!(decode_exit_code_annotation(78), " (EX_CONFIG: token pool)");
+        assert_eq!(decode_exit_code_annotation(1), "");
+        assert_eq!(decode_exit_code_annotation(0), "");
+    }
+
     // ---- event → envelope mapping ----
 
     #[test]
@@ -1022,52 +1279,78 @@ mod tests {
         let dispatch = Event::SweepGlobalDispatch {
             sweep_id: "sweep-issue-42-1".to_owned() as SweepId,
             kind: SweepKind::Issue(42),
+            repo: Some("/repos/vibesql".to_owned()),
         };
         let env = event_to_envelope(&dispatch).unwrap();
         assert_eq!(env.kind, "task");
-        assert_eq!(env.task_id.as_deref(), Some("42"));
-        assert!(env.body.contains("issue #42"));
+        assert_eq!(env.task_id.as_deref(), Some("vibesql_42"));
+        assert_eq!(env.body, "vibesql#42 · dispatch");
 
         let phase = Event::SweepPhase {
             issue: 42,
             phase: "builder".to_owned(),
             pr_number: Some(99),
-            repo: None,
+            repo: Some("/repos/vibesql".to_owned()),
         };
         let env = event_to_envelope(&phase).unwrap();
         assert_eq!(env.kind, "task");
-        assert!(env.body.contains("builder"));
-        assert!(env.body.contains("PR #99"));
+        assert_eq!(env.task_id.as_deref(), Some("vibesql_42"));
+        assert!(env.body.starts_with("vibesql#42 · builder"));
+        assert!(env.body.contains("PR #99 open"));
 
         let blocker = Event::SweepBlocker {
             issue: 42,
             reason: "missing dep".to_owned(),
             label_added: "loom:blocked".to_owned(),
-            repo: None,
+            repo: Some("/repos/vibesql".to_owned()),
         };
         let env = event_to_envelope(&blocker).unwrap();
         assert_eq!(env.kind, "handoff");
-        assert!(env.body.contains("blocked"));
+        assert_eq!(env.body, "vibesql#42 · BLOCKED — missing dep");
 
         let exited = Event::SweepExited {
             issue: 42,
             exit_code: Some(0),
             duration_sec: 12,
-            repo: None,
+            repo: Some("/repos/vibesql".to_owned()),
         };
         let env = event_to_envelope(&exited).unwrap();
         assert_eq!(env.kind, "ack");
-        assert!(env.body.contains("exit 0"));
-        assert!(env.body.contains("12s"));
+        assert_eq!(env.body, "vibesql#42 · done ✓ · 12s");
+
+        // A non-zero exit decodes its well-known meaning (78 = EX_CONFIG).
+        let exited_failed = Event::SweepExited {
+            issue: 42,
+            exit_code: Some(78),
+            duration_sec: 24,
+            repo: Some("/repos/vibesql".to_owned()),
+        };
+        let env = event_to_envelope(&exited_failed).unwrap();
+        assert_eq!(env.body, "vibesql#42 · failed ✗ · exit 78 (EX_CONFIG: token pool) · 24s");
 
         let crashed = Event::SweepCrashed {
             issue: 42,
             checkpoint_phase: Some("judge".to_owned()),
-            repo: None,
+            repo: Some("/repos/vibesql".to_owned()),
         };
         let env = event_to_envelope(&crashed).unwrap();
         assert_eq!(env.kind, "handoff");
-        assert!(env.body.contains("judge"));
+        assert_eq!(env.body, "vibesql#42 · crashed ✗ at judge — resumable (checkpoint kept)");
+    }
+
+    #[test]
+    fn maps_events_without_repo_using_bare_fallback() {
+        // No `repo` stamped (a pre-#4201 event, or a registry that never
+        // wires the bus) still narrates — just without repo qualification,
+        // matching the pre-#4201 behavior for task_id and body prefix.
+        let dispatch = Event::SweepGlobalDispatch {
+            sweep_id: "sweep-issue-42-1".to_owned() as SweepId,
+            kind: SweepKind::Issue(42),
+            repo: None,
+        };
+        let env = event_to_envelope(&dispatch).unwrap();
+        assert_eq!(env.task_id.as_deref(), Some("42"));
+        assert_eq!(env.body, "#42 · dispatch");
     }
 
     #[test]
@@ -1078,6 +1361,137 @@ mod tests {
         };
         assert!(event_to_envelope(&completed).is_none());
         assert!(event_to_envelope(&Event::TopicLag { skipped: 3 }).is_none());
+    }
+
+    // ---- dispatch-title fetch (issue #4201, sink-side gh lookup) ----
+
+    /// Write an executable fake `gh` script at `dir/fake-gh.sh` that logs its
+    /// argv to `dir/gh-invocations.log` (one line per call) and prints `stdout`
+    /// on success, or exits 1 when `stdout` is `None` — mirrors the fake-`gh`
+    /// convention already used in `sweep_registry.rs`'s tests.
+    fn write_fake_gh(dir: &std::path::Path, stdout: Option<&str>) -> (PathBuf, PathBuf) {
+        let log = dir.join("gh-invocations.log");
+        let script_path = dir.join("fake-gh.sh");
+        let body = match stdout {
+            Some(text) => format!(
+                "#!/usr/bin/env bash\nprintf '%s\\n' \"$*\" >> \"{}\"\nprintf '%s\\n' {}\nexit 0\n",
+                log.display(),
+                shell_quote(text),
+            ),
+            None => format!(
+                "#!/usr/bin/env bash\nprintf '%s\\n' \"$*\" >> \"{}\"\nexit 1\n",
+                log.display()
+            ),
+        };
+        std::fs::write(&script_path, body).unwrap();
+        let mut perms = std::fs::metadata(&script_path).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&script_path, perms).unwrap();
+        (script_path, log)
+    }
+
+    /// Minimal single-quote shell escaping sufficient for test title strings.
+    fn shell_quote(s: &str) -> String {
+        format!("'{}'", s.replace('\'', "'\\''"))
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn fetch_issue_title_returns_title_on_success() {
+        let dir = tempfile::tempdir().unwrap();
+        let (fake_gh, _log) = write_fake_gh(dir.path(), Some("Fix the frobnicator"));
+        std::env::set_var(GH_BIN_ENV, &fake_gh);
+
+        let title = fetch_issue_title(dir.path(), 42).await;
+
+        std::env::remove_var(GH_BIN_ENV);
+        assert_eq!(title.as_deref(), Some("Fix the frobnicator"));
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn fetch_issue_title_degrades_to_none_on_gh_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let (fake_gh, _log) = write_fake_gh(dir.path(), None);
+        std::env::set_var(GH_BIN_ENV, &fake_gh);
+
+        let title = fetch_issue_title(dir.path(), 42).await;
+
+        std::env::remove_var(GH_BIN_ENV);
+        assert!(title.is_none(), "a failing gh call must degrade to None, not panic/hang");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn fetch_title_cached_reuses_cache_within_ttl() {
+        let dir = tempfile::tempdir().unwrap();
+        let (fake_gh, log) = write_fake_gh(dir.path(), Some("Cached title"));
+        std::env::set_var(GH_BIN_ENV, &fake_gh);
+
+        let mut cache: HashMap<(String, u32), (String, Instant)> = HashMap::new();
+        let root = dir.path().to_string_lossy().into_owned();
+        let first = fetch_title_cached(&mut cache, &root, 7).await;
+        let second = fetch_title_cached(&mut cache, &root, 7).await;
+
+        std::env::remove_var(GH_BIN_ENV);
+        assert_eq!(first.as_deref(), Some("Cached title"));
+        assert_eq!(second.as_deref(), Some("Cached title"));
+        let calls = std::fs::read_to_string(&log).unwrap_or_default();
+        assert_eq!(
+            calls.lines().count(),
+            1,
+            "second lookup within the TTL must reuse the cache, not re-shell to gh; log: {calls:?}"
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn run_sink_enriches_dispatch_body_with_title() {
+        let dir = tempfile::tempdir().unwrap();
+        let (fake_gh, _log) = write_fake_gh(dir.path(), Some("Add repo-qualified task_id"));
+        std::env::set_var(GH_BIN_ENV, &fake_gh);
+
+        let socket = dir.path().join("safehoused.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let server = tokio::spawn(stub_server(listener, false, 1));
+
+        let bus = Arc::new(EventBus::new());
+        let subscription = bus.subscribe(Vec::<String>::new());
+        let sink = tokio::spawn(run_sink(
+            SafehouseConfig {
+                enabled: true,
+                socket: Some(socket.clone()),
+                ..SafehouseConfig::default()
+            },
+            socket,
+            subscription,
+            Duration::from_millis(20),
+            Duration::from_millis(80),
+        ));
+
+        bus.publish(Event::SweepGlobalDispatch {
+            sweep_id: "sweep-issue-4201-1".to_owned() as SweepId,
+            kind: SweepKind::Issue(4201),
+            repo: Some(dir.path().to_string_lossy().into_owned()),
+        })
+        .unwrap();
+
+        let received = tokio::time::timeout(Duration::from_secs(2), server)
+            .await
+            .expect("stub server must receive the enriched dispatch send")
+            .unwrap();
+
+        drop(bus);
+        let _ = tokio::time::timeout(Duration::from_secs(2), sink).await;
+        std::env::remove_var(GH_BIN_ENV);
+
+        assert_eq!(received.len(), 1);
+        let body = received[0]["body"].as_str().unwrap();
+        assert!(
+            body.contains("Add repo-qualified task_id"),
+            "dispatch body must be enriched with the fetched title; got: {body:?}"
+        );
+        assert!(body.contains("#4201 · dispatch"));
     }
 
     // ---- integration: stub AF_UNIX socket ----

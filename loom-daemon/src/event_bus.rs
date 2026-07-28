@@ -613,6 +613,7 @@ mod tests {
         let ev = Event::SweepGlobalDispatch {
             sweep_id: "sweep-issue-42-1".to_string(),
             kind: SweepKind::Issue(42),
+            repo: None,
         };
         assert_eq!(ev.topic(), "sweep.global.dispatch");
     }
