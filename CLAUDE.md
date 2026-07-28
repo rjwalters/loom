@@ -226,7 +226,8 @@ empty), enhance with technical detail, then `gh issue edit 42 --add-label
 
 `/loom:sweep` warns (advisory) via `check-host-sleep.sh` when the host can sleep;
 after a `git pull` that updates `defaults/`, `./.loom/scripts/resync-installed.sh`
-refreshes stale installed `.loom/hooks/` + `.loom/scripts/` copies. Details:
+refreshes stale installed `.loom/hooks|scripts|roles|docs|bin/` + `.claude/commands/loom/`
+copies (and re-stamps install metadata). Details:
 [`.loom/docs/troubleshooting.md` → Overnight / long-running orchestration](.loom/docs/troubleshooting.md).
 
 ## Configuration
