@@ -12,14 +12,19 @@
 # Resolution:
 #   1. Read `<!-- loom:complexity=... -->` from the issue body. Missing or
 #      unrecognised => routine (the safe middle).
-#   2. Look up sweep.tierModels[<runtime>][<tier>] in .loom/config.json and pass
-#      it through resolve-model.sh (logical tier -> current-generation ID). Both
-#      steps live in loom_tools.model_tiers (--tier mode), so they are covered by
+#   2. Look up sweep.tierModels[<runtime>][<tier>] in .loom/config.json. If that
+#      has no entry, fall back to the tier's entry (if any) in the
+#      sweep.optimization preset (`cost` | `speed` | `balanced`, default
+#      `balanced`; env override LOOM_SWEEP_OPTIMIZATION, issue #4238 Phase B).
+#      Either way the resolved logical tier is passed through resolve-model.sh
+#      (logical tier -> current-generation ID). All three steps live in
+#      loom_tools.model_tiers (--tier mode), so they are covered by
 #      test_model_tiers.py rather than duplicated here in inline python.
-#   3. No entry for the runtime/tier (or a map that would resolve to `fable`)
+#   3. No entry from either source (or a mapping that would resolve to `fable`)
 #      => print nothing, exit 3, so the caller falls through to its normal
 #      precedence chain (the tier-3 role default) instead of guessing a model.
-#      An unconfigured repo therefore dispatches byte-identically to today.
+#      An unconfigured repo (or one with sweep.optimization unset/"balanced")
+#      therefore dispatches byte-identically to today.
 #
 # Prints ONLY the model id on stdout; diagnostics go to stderr.
 set -uo pipefail
@@ -65,5 +70,5 @@ if model="$(run_loom_tool "resolve-model" "model_tiers" \
   exit 0
 fi
 
-echo "no tierModels entry for runtime=$RUNTIME tier=$tier — falling through to tier 3" >&2
+echo "no tierModels/optimization-preset entry for runtime=$RUNTIME tier=$tier — falling through to tier 3" >&2
 exit 3

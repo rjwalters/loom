@@ -116,7 +116,23 @@ MODEL="$(./.loom/scripts/resolve-tier-model.sh <issue> <runtime>)"   # exit 3 �
 
 Hard bounds (same as the No-Fable invariant): the tier map is **Builder-only**, **never resolves to `fable`** (`resolve-tier-model.sh` refuses and falls through), and tier-1/tier-2 operator pins still win. In model-cost experiment mode the tier-map resolution is suppressed for the forced arm (the marker is still read as the stratification key).
 
-> **Operator-facing profile switch (`sweep.optimization`) is a separate follow-up.** This change adds the marker vocabulary and the tier map. A future `sweep.optimization: cost | speed | balanced` switch (default `balanced` = today's behavior) will select which `tierModels` preset is applied repo-wide without hand-editing the map. Until then, opt in per-repo with the `sweep.tierModels` block above.
+### Optimization profile switch (`sweep.optimization`, issue #4238 Phase B)
+
+`sweep.tierModels` above requires hand-editing a map. `sweep.optimization` is the operator-facing policy switch that picks a **preset** over that same map instead: `.loom/config.json` → `sweep.optimization`: `"cost"` | `"speed"` | `"balanced"` (default `"balanced"`), env override `LOOM_SWEEP_OPTIMIZATION` — the standard **env > config > default** precedence used elsewhere in this repo (`sweep.escalation`, `sweep.max_doctor_cycles`).
+
+```json
+{ "sweep": { "optimization": "cost" } }
+```
+
+The preset supplies a tier's logical model **only when `sweep.tierModels[<runtime>][<tier>]` has no entry for it** — an explicit `tierModels` entry always wins, so an operator who has hand-tuned part of the map keeps that tuning under any profile. The shipped presets:
+
+| Profile | `mechanical` | `routine` | `complex` | Rationale |
+|---|---|---|---|---|
+| `balanced` (default) | *(unset)* | *(unset)* | *(unset)* | No preset materialized — dispatch is byte-identical to an unconfigured repo. |
+| `cost` | `haiku` | `sonnet` | `opus` | The full 3-stratum spread — cheapest model the Judge gate can safely correct. |
+| `speed` | `sonnet` | `opus` | `opus` | Wall-clock in a sweep is dominated by Judge-rejection / Doctor **round-trip count**, not per-turn latency, so `speed` starts a tier higher than `balanced` to buy fewer retries rather than fewer/cheaper tokens per turn. `complex` is already at the ceiling under `balanced`'s own tier-2.5 `complex` bump, so `speed` leaves it unchanged and instead raises `mechanical`/`routine`. |
+
+The profile is expressed in the same runtime-neutral logical tiers (`haiku`/`sonnet`/`opus`) as `sweep.tierModels` and applies uniformly across runtimes — a Codex adapter under the #4167 contract resolves the same logical names to its own IDs, so there is no separate per-runtime preset table. All the tier-map hard bounds above apply identically to the profile: Builder-only, never resolves to `fable`, tier-1/tier-2 pins win, suppressed in model-cost experiment mode. An invalid `sweep.optimization` value (either source) warns and falls back to `balanced` — it never fails dispatch. Implementation: `loom_tools.model_tiers.resolve_optimization_profile` / `optimization_preset`, wired into `resolve_tier_model` (`resolve-tier-model.sh`'s Python backend); see `test_model_tiers.py` for the full profile × stratum × precedence matrix.
 
 **Workspace override example** (`.loom/config.json`):
 

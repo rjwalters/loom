@@ -183,35 +183,128 @@ def resolve_tier_model(
 ) -> str:
     """Resolve a complexity tier to the concrete model ID to dispatch on the wire.
 
-    Looks up ``sweep.tierModels[<runtime>][<tier>]`` (a logical tier) and passes
-    the result through :func:`resolve_model` so a logical ``opus`` becomes the
-    current-generation ID rather than a stale alias. An unrecognized/absent tier
-    is treated as ``routine`` (the safe middle).
+    Looks up ``sweep.tierModels[<runtime>][<tier>]`` (a logical tier) first — an
+    operator-authored map is the more specific configuration and always wins.
+    Absent that, falls back to the tier's entry (if any) in the
+    ``sweep.optimization`` profile preset (see
+    :func:`resolve_optimization_profile` / :func:`optimization_preset`, issue
+    #4238 Phase B). Either way the resulting logical tier is passed through
+    :func:`resolve_model` so a logical ``opus`` becomes the current-generation ID
+    rather than a stale alias. An unrecognized/absent tier is treated as
+    ``routine`` (the safe middle).
 
-    Returns ``""`` when there is no mapping for that runtime/tier — the caller then
-    falls through to its normal precedence chain (tier-3 role default), which keeps
-    the unconfigured dispatch decision byte-identical to today. Also returns ``""``
-    (with a warning) when the mapping would resolve to ``fable``: a Curator marker
-    can never dispatch the frontier/refusal-prone model — that is reserved for the
-    objective escalation ladder or an explicit operator param (issue #3702).
+    Returns ``""`` when neither source has a mapping for that runtime/tier — the
+    caller then falls through to its normal precedence chain (tier-3 role
+    default), which keeps the unconfigured (or ``balanced``) dispatch decision
+    byte-identical to today. Also returns ``""`` (with a warning) when the
+    mapping would resolve to ``fable``: neither a Curator marker nor an
+    optimization profile can ever dispatch the frontier/refusal-prone model —
+    that is reserved for the objective escalation ladder or an explicit operator
+    param (issue #3702).
     """
     key = (tier or "").strip().lower()
     if key not in COMPLEXITY_TIERS:
         key = "routine"
     rt = (runtime or "claude").strip().lower()
+    source = "tierModels"
     logical = tier_models(config).get(rt, {}).get(key)
     if not logical:
+        source = "optimization"
+        profile = resolve_optimization_profile(config)
+        logical = optimization_preset(profile).get(key, "")
+    if not logical:
         return ""
-    # No-Fable hard bound: refuse a tier map that names fable, before resolution…
+    # No-Fable hard bound: refuse a mapping that names fable, before resolution…
     if logical.partition("@")[0].strip().lower() == "fable":
-        _warn(f"tierModels[{rt}][{key}] maps to 'fable' — refusing (No-Fable bound); falling through")
+        _warn(f"{source}[{rt}][{key}] maps to 'fable' — refusing (No-Fable bound); falling through")
         return ""
     resolved = resolve_model(logical, config)
     # …and after resolution, in case an alias/override lands on a fable model ID.
     if "fable" in resolved.partition("@")[0].lower():
-        _warn(f"tierModels[{rt}][{key}] resolves to a fable model — refusing; falling through")
+        _warn(f"{source}[{rt}][{key}] resolves to a fable model — refusing; falling through")
         return ""
     return resolved
+
+
+# --------------------------------------------------------------------------- #
+# Optimization profile → tierModels preset (issue #4238, Phase B)
+# --------------------------------------------------------------------------- #
+#
+# ``sweep.optimization`` is an operator-facing policy switch — ``"cost"`` |
+# ``"speed"`` | ``"balanced"`` (default) — that selects a PRESET over the
+# ``sweep.tierModels[<runtime>][<tier>]`` map above, rather than a fixed
+# one-step bump. The preset is expressed in the same runtime-neutral logical
+# tiers (``haiku``/``sonnet``/``opus``) as an operator-authored ``tierModels``
+# map and applies uniformly across runtimes: a Codex adapter under the #4167
+# contract resolves the same logical names to its own IDs, so no per-runtime
+# preset table is needed. An explicit ``sweep.tierModels[<runtime>][<tier>]``
+# entry, if the operator has set one, still wins over the derived preset — see
+# ``resolve_tier_model`` above, which checks ``tierModels`` before falling back
+# to the profile preset.
+
+OPTIMIZATION_PROFILES: tuple[str, ...] = ("cost", "speed", "balanced")
+
+# tier -> logical model, per profile. "balanced" is intentionally EMPTY: an
+# absent/default profile must not materialize any preset, so a repo with no
+# `sweep.optimization` configured (or explicitly set to "balanced") dispatches
+# byte-identically to pre-Phase-B behavior — the acceptance-criterion this
+# module is tested against.
+_OPTIMIZATION_PRESETS: dict[str, dict[str, str]] = {
+    # Cheapest model the Judge gate can safely correct, full 3-stratum spread.
+    "cost": {"mechanical": "haiku", "routine": "sonnet", "complex": "opus"},
+    # Wall-clock in a sweep is dominated by Judge-rejection / Doctor round-trip
+    # COUNT, not per-turn latency — so "speed" starts a tier higher than
+    # "balanced" to buy fewer retry cycles, rather than fewer/cheaper tokens per
+    # turn. `complex` is already at the ceiling (`opus`) under "balanced" via the
+    # tier-2.5 bump, so "speed" leaves it unchanged and instead raises the two
+    # strata that would otherwise dispatch below opus.
+    "speed": {"mechanical": "sonnet", "routine": "opus", "complex": "opus"},
+    "balanced": {},
+}
+
+
+def resolve_optimization_profile(
+    config: dict[str, Any] | None = None,
+    env: dict[str, str] | None = None,
+) -> str:
+    """The effective ``sweep.optimization`` profile: env > config > default.
+
+    Precedence: ``LOOM_SWEEP_OPTIMIZATION`` env var, then ``.loom/config.json``
+    → ``sweep.optimization``, then ``"balanced"``. An unrecognized value from
+    either source warns and falls back to ``"balanced"`` — optimization-profile
+    resolution is best-effort and must never fail dispatch, matching every other
+    soft-fail config read in this module.
+    """
+    src = env if env is not None else os.environ
+    raw: Any = src.get("LOOM_SWEEP_OPTIMIZATION")
+    source = "env LOOM_SWEEP_OPTIMIZATION"
+    if not raw:
+        sweep = config.get("sweep") if isinstance(config, dict) else None
+        raw = sweep.get("optimization") if isinstance(sweep, dict) else None
+        source = "config sweep.optimization"
+    if raw is None or raw == "":
+        # Genuinely unset (neither source provided a value) — the silent,
+        # expected default. No warning: this is the common case.
+        return "balanced"
+    if not isinstance(raw, str):
+        _warn(f"{source}={raw!r} is not a string; falling back to 'balanced'")
+        return "balanced"
+    value = raw.strip().lower()
+    if not value or value not in OPTIMIZATION_PROFILES:
+        _warn(f"{source}={raw!r} is not one of {OPTIMIZATION_PROFILES}; falling back to 'balanced'")
+        return "balanced"
+    return value
+
+
+def optimization_preset(profile: str) -> dict[str, str]:
+    """The tier → logical-model preset for an optimization profile.
+
+    An unrecognized profile name returns the empty (``balanced``) preset rather
+    than raising — callers should resolve the profile through
+    :func:`resolve_optimization_profile` first (which already normalizes and
+    falls back), but this stays defensive against direct callers.
+    """
+    return _OPTIMIZATION_PRESETS.get(profile, {})
 
 
 # --------------------------------------------------------------------------- #
