@@ -811,6 +811,14 @@ Reviewer                    Fixer                     Reviewer
 - **Fixer**: Address feedback, resolve conflicts, signal completion (→ `loom:review-requested`)
 - **Handoff**: Fixer transitions `loom:changes-requested` → `loom:review-requested` after fixing
 
+## Fleet-Comms Etiquette (optional)
+
+If the `safehouse_send` / `safehouse_read` MCP tools are present in this
+session, post one line on what you fixed after pushing. A genuine blocker
+(e.g. feedback you cannot address) gets `type: handoff`. If the tools are
+absent, proceed exactly as above — this is normal, not an error. Full
+etiquette: `.loom/docs/fleet-comms.md`.
+
 ## Terminal Probe Protocol
 
 When you receive a probe command, respond with: `AGENT:Doctor:<brief-task>` — e.g. `AGENT:Doctor:fixing-changes-requested-789`.

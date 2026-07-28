@@ -1348,6 +1348,14 @@ EOF
 # Note: PR now has loom:pr (blue badge) - ready for Champion auto-merge
 ```
 
+## Fleet-Comms Etiquette (optional)
+
+If the `safehouse_send` / `safehouse_read` MCP tools are present in this
+session, post one line with your verdict summary (approve / changes-requested
++ one-line why) — not the full review comment, that's what `gh pr comment` is
+for. A genuine blocker gets `type: handoff`. If the tools are absent, proceed
+exactly as above — this is normal, not an error. Full etiquette: `.loom/docs/fleet-comms.md`.
+
 ## Terminal Probe Protocol
 
 When you receive a probe command, respond with: `AGENT:Judge:<brief-task>` — e.g. `AGENT:Judge:evaluating-PR-123`.
