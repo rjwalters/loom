@@ -405,6 +405,21 @@ if [[ -f "$_mcp_config_lib" ]]; then
         _sh_persona="$(loom_mcp_pick_persona \
             "${LOOM_SWEEP_CLAIM_OWNED:-}" "$_sh_pool" "$_sh_fallback")"
 
+        # Export persona + socket into the SESSION process environment — not
+        # only into the injected MCP config file's server env — so Bash-tool
+        # helpers can reach safehoused. Lifecycle role subagents (loom-builder /
+        # loom-judge / loom-doctor) pin their tool allowlists to Read/Glob/Grep/
+        # Bash(/Write/Edit) with no MCP tools, so the injected `safehouse_send`
+        # tool is invisible to them; `fleet-send.sh` (Bash) is their path to the
+        # room and it resolves the socket/persona from these env vars (#4199).
+        # Only the socket path is exported (no token or key). Guard on a
+        # resolvable socket — with none there is nothing to connect to, and this
+        # is independent of whether the safehouse-mcp launch command is present.
+        if [[ -n "$_sh_socket" ]]; then
+            export SAFEHOUSE_PERSONA="$_sh_persona"
+            export SAFEHOUSED_SOCKET="$_sh_socket"
+        fi
+
         if [[ -z "$_sh_socket" ]]; then
             log_warn "spawn-claude: safehouse enabled but no socket resolves (safehouse.socket / \$LOOM_SAFEHOUSE_SOCKET / \$SAFEHOUSED_SOCKET); skipping safehouse MCP injection (loom MCP unaffected)."
         elif ! command -v "$_sh_command" >/dev/null 2>&1; then

@@ -14,20 +14,34 @@ remains the sole source of truth (see "What NOT to do" below).
 > `defaults/.loom/docs/`) — see `defaults/docs/runtime-adapters.md` for the same
 > convention spelled out in detail.
 
-## 1. Detection — the tools are optional, always
+## 1. Detection — the room is optional, always
 
-Safehouse MCP injection is conditional (config-gated, host-dependent). A role
-session may or may not have `safehouse_send` / `safehouse_read` available —
-**do not assume either way**. This is the same degradation contract documented
-in `safehouse.md`, extended to worker behavior:
+Safehouse posting is conditional (config-gated, host-dependent). A role session
+may or may not be able to reach the room — **do not assume either way**. There
+are two delivery paths, tried in order; the same degradation contract from
+`safehouse.md` applies to both:
 
-- **If the tools are present**: use them per the guidance below.
-- **If the tools are absent**: proceed exactly as you do today. This is the
-  normal case for most sessions, not an error condition.
-- **Never fail, retry, stall, or comment on their absence.** No tool-presence
-  check should ever block, slow, or change the outcome of a role's normal
-  work. Treat a missing `safehouse_send` the same way you'd treat a missing
-  optional dependency — silently unavailable, nothing to fix.
+1. **MCP tools (`safehouse_send` / `safehouse_read`)** — present when
+   `spawn-claude.sh` injected the safehouse MCP server *and* your runtime/role
+   exposes MCP tools. Prefer these when available.
+2. **Bash helper (`.loom/scripts/fleet-send.sh`)** — the fallback for roles
+   whose tool allowlists exclude MCP tools. Lifecycle role subagents
+   (`loom-builder` / `loom-judge` / `loom-doctor`) pin their tools to
+   Read/Glob/Grep/Bash(/Write/Edit) with no MCP tools, so the injected
+   `safehouse_send` is invisible to them — but they all have Bash. The helper
+   resolves the socket/persona from `$SAFEHOUSED_SOCKET` + `$SAFEHOUSE_PERSONA`
+   (exported into the session by `spawn-claude.sh`) and is a thin JSON-lines
+   client for the same wire protocol. It posts only (no read op yet).
+
+- **If a path is available**: use it per the guidance below (MCP first, then the
+  helper).
+- **If neither resolves**: proceed exactly as you do today. This is the normal
+  case for most sessions, not an error condition. `fleet-send.sh` itself exits 0
+  silently when no socket/persona is set, so an unconditional call is safe.
+- **Never fail, retry, stall, or comment on the room's absence.** No presence
+  check should ever block, slow, or change the outcome of a role's normal work.
+  Treat an unreachable room the same way you'd treat a missing optional
+  dependency — silently unavailable, nothing to fix.
 
 ## 2. When to post (sparingly)
 
@@ -51,18 +65,30 @@ separate issue.
 
 ## 3. How to post
 
+Via the MCP tool (when present):
+
 ```
 safehouse_send(
-  task_id: "<issue number>",   # threads with the daemon's own narration for the same issue
+  task_id: "<repo>_<issue>",   # threads with the daemon's own narration for the same issue
   to: "*",                      # broadcast
   type: "task" | "handoff" | "chat",
   body: "<one concise line>"
 )
 ```
 
-- **`task_id`**: always the bare issue number as a string, so your message
-  threads alongside the daemon's phase narration for that issue (see the
-  envelope table in `safehouse.md`).
+Via the Bash helper (the fallback for roles without MCP tools):
+
+```
+.loom/scripts/fleet-send.sh --task-id "<repo>_<issue>" --type task --body "<one concise line>"
+```
+
+The helper defaults `to` to `"*"`, reads persona/socket from the session env,
+and exits 0 silently when the room is unreachable — call it unconditionally.
+
+- **`task_id`**: the repo-qualified `<repo>_<issue>` form the daemon narrates on
+  (post-#4224 — e.g. `loom_4199`, the workspace-root basename plus the issue
+  number), so your message threads alongside the daemon's phase narration for
+  that issue (see the envelope table in `safehouse.md`).
 - **`to`**: `"*"` (broadcast) — this is a shared room, not a DM.
 - **`type`**:
   - `task` — routine, in-band progress (claim / PR-created lines).
