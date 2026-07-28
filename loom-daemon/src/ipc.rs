@@ -336,8 +336,8 @@ pub fn evaluate_drain_tick(in_flight: usize, past_deadline: bool, force: bool) -
 /// root (Issue #4090, Finding 5). Mirrors [`build_daemon_status`]'s cross-root
 /// accounting so a drain never reads only the primary registry and restarts
 /// while a secondary managed repo still has live sweeps.
-// Allow expect_used: poisoned registry mutex ⇒ crash, same policy as elsewhere.
-#[allow(clippy::expect_used)]
+// A poisoned registry mutex is recovered rather than crashed (#4279): a prior
+// panic must never turn a single fault into a permanent drain/status outage.
 #[must_use]
 pub fn count_in_flight_sweeps(workspace_pool: &Arc<WorkspacePool>, fallback_root: &Path) -> usize {
     let workspace_registry = WorkspaceRegistry::load_default().unwrap_or_default();
@@ -345,7 +345,9 @@ pub fn count_in_flight_sweeps(workspace_pool: &Arc<WorkspacePool>, fallback_root
     let mut count = 0;
     for root in &roots {
         let registry = workspace_pool.get_or_provision(root);
-        let sr = registry.lock().expect("Sweep registry mutex poisoned");
+        let sr = registry
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         count += sr
             .list(None)
             .into_iter()
@@ -359,8 +361,7 @@ pub fn count_in_flight_sweeps(workspace_pool: &Arc<WorkspacePool>, fallback_root
 /// [`SweepRegistry::cancel`] path (Issue #4090, `--force-after-timeout`).
 /// Returns the number cancelled. Blocking cancel is acceptable here: this runs
 /// only on the rare force-timeout path, moments before the process exits.
-// Allow expect_used: poisoned registry mutex ⇒ crash, same policy as elsewhere.
-#[allow(clippy::expect_used)]
+// A poisoned registry mutex is recovered rather than crashed (#4279).
 fn cancel_all_in_flight(workspace_pool: &Arc<WorkspacePool>, fallback_root: &Path) -> usize {
     let workspace_registry = WorkspaceRegistry::load_default().unwrap_or_default();
     let roots = workspace_registry.effective_roots(fallback_root);
@@ -368,7 +369,9 @@ fn cancel_all_in_flight(workspace_pool: &Arc<WorkspacePool>, fallback_root: &Pat
     for root in &roots {
         let registry = workspace_pool.get_or_provision(root);
         let ids: Vec<String> = {
-            let sr = registry.lock().expect("Sweep registry mutex poisoned");
+            let sr = registry
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             sr.list(None)
                 .into_iter()
                 .filter(|info| !info.state.is_terminal())
@@ -376,7 +379,9 @@ fn cancel_all_in_flight(workspace_pool: &Arc<WorkspacePool>, fallback_root: &Pat
                 .collect()
         };
         for id in ids {
-            let mut sr = registry.lock().expect("Sweep registry mutex poisoned");
+            let mut sr = registry
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             if sr.cancel(&id, Duration::from_secs(5)).is_ok() {
                 cancelled += 1;
             }
@@ -857,14 +862,39 @@ async fn handle_client(
             // (within the TTL) makes this a no-op. `spawn_blocking` join errors
             // are non-fatal — the status falls back to the last cached value.
             let _ = tokio::task::spawn_blocking(crate::cpu_headroom::refresh_cpu_util_cache).await;
-            let report = build_daemon_status_with_drain(
-                &workspace_pool,
-                &health_states,
-                &fallback_root,
-                &credential_preflight,
-                &drain_state,
-            );
-            let response = Response::DaemonStatus(report);
+            // Build the report under a panic guard (#4279). This connection runs
+            // in a detached `tokio::spawn` (see the accept loop): a panic while
+            // building the status would unwind the task and drop the socket with
+            // ZERO bytes written, so the client reads a silent EOF that a
+            // stdout-capturing monitor misreads as an empty/"no workspaces"
+            // status. The registry-lock poisoning that used to cause exactly this
+            // is now recovered in `build_daemon_status`, but the guard makes the
+            // invariant unconditional: a `DaemonStatus` request always leaves the
+            // handler having written either the report or an explicit error frame
+            // (the daemon logs the panic cause either way). `build_daemon_status`
+            // is synchronous, so `catch_unwind` never spans an `.await`.
+            let built = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                build_daemon_status_with_drain(
+                    &workspace_pool,
+                    &health_states,
+                    &fallback_root,
+                    &credential_preflight,
+                    &drain_state,
+                )
+            }));
+            let response = match built {
+                Ok(report) => Response::DaemonStatus(report),
+                Err(panic) => {
+                    let cause = describe_panic(panic.as_ref());
+                    log::error!(
+                        "DaemonStatus handler panicked while building the report: {cause}; \
+                         replying with an error frame instead of dropping the connection"
+                    );
+                    Response::Error {
+                        message: format!("daemon failed to build status report: {cause}"),
+                    }
+                }
+            };
             let response_json = serde_json::to_string(&response)?;
             writer.write_all(response_json.as_bytes()).await?;
             writer.write_all(b"\n").await?;
@@ -1040,10 +1070,9 @@ async fn stream_events(
 /// registry mutex is free for other clients for the entire grace window. The
 /// synchronous `SweepCancelled` response contract (`sigkill_sent`, `was_running`,
 /// `pid`) is preserved — the caller still gets a completed-cancel ack.
-// Allow expect_used: a poisoned registry mutex means another thread panicked
-// while holding the lock — unrecoverable, so we crash (same policy as
-// `handle_request`).
-#[allow(clippy::expect_used)]
+// A poisoned registry mutex (another thread panicked while holding the lock) is
+// recovered rather than crashed (#4279): a single prior panic must not turn every
+// subsequent cancel/status into a permanent server-side failure.
 async fn cancel_sweep_nonblocking(
     sweep_registry: &Arc<Mutex<SweepRegistry>>,
     sweep_id: &str,
@@ -1053,7 +1082,7 @@ async fn cancel_sweep_nonblocking(
     let began = {
         let mut sr = sweep_registry
             .lock()
-            .expect("Sweep registry mutex poisoned");
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         sr.begin_cancel(sweep_id)
     };
     let (pid, kind, started_at) = match began {
@@ -1085,7 +1114,7 @@ async fn cancel_sweep_nonblocking(
     let mut exited_within_grace = {
         let mut sr = sweep_registry
             .lock()
-            .expect("Sweep registry mutex poisoned");
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         sr.poll_cancel(sweep_id, pid)
     };
     while !exited_within_grace && tokio::time::Instant::now() < deadline {
@@ -1093,7 +1122,7 @@ async fn cancel_sweep_nonblocking(
         exited_within_grace = {
             let mut sr = sweep_registry
                 .lock()
-                .expect("Sweep registry mutex poisoned");
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             sr.poll_cancel(sweep_id, pid)
         };
     }
@@ -1103,7 +1132,7 @@ async fn cancel_sweep_nonblocking(
     let outcome = {
         let mut sr = sweep_registry
             .lock()
-            .expect("Sweep registry mutex poisoned");
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         sr.finish_cancel(sweep_id, pid, &kind, started_at, exited_within_grace)
     };
     Response::SweepCancelled {
@@ -1111,6 +1140,19 @@ async fn cancel_sweep_nonblocking(
         pid: outcome.pid,
         sigkill_sent: outcome.sigkill_sent,
         was_running: outcome.was_running,
+    }
+}
+
+/// Extract a human-readable message from a caught panic payload (#4279). Panic
+/// payloads are almost always `&str` (from `panic!("literal")`) or `String`
+/// (from `panic!("{}", x)`); anything else is reported generically.
+fn describe_panic(panic: &(dyn std::any::Any + Send)) -> String {
+    if let Some(s) = panic.downcast_ref::<&str>() {
+        (*s).to_string()
+    } else if let Some(s) = panic.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "unknown panic payload".to_string()
     }
 }
 
@@ -1126,10 +1168,13 @@ async fn cancel_sweep_nonblocking(
 /// Per-token usage is intentionally excluded — probing each account for
 /// rate-limit headers is a slow network call the CLI performs client-side (via
 /// `loom-tokens check --json`), so this handler stays non-blocking.
-// Allow expect_used: a poisoned registry mutex means another thread panicked
-// while holding the lock — unrecoverable, so we crash (same policy as
-// `handle_request`).
-#[allow(clippy::expect_used)]
+///
+/// A poisoned registry mutex is recovered (`PoisonError::into_inner`) rather than
+/// crashed (#4279). Before this, a panic anywhere under the registry lock poisoned
+/// it permanently and every subsequent `status` call panicked in the detached
+/// per-connection task, dropping the socket with zero bytes written — the client
+/// saw a silent EOF. Recovering the guard keeps `status` answerable after any such
+/// fault.
 pub fn build_daemon_status(
     workspace_pool: &Arc<WorkspacePool>,
     health_states: &WorkspaceHealthStates,
@@ -1165,7 +1210,9 @@ pub fn build_daemon_status(
             Vec<u32>,
             Vec<(u32, u32)>,
         ) = {
-            let sr = registry.lock().expect("Sweep registry mutex poisoned");
+            let sr = registry
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             // In-flight = sweeps still live (Pending / Running). Terminal sweeps
             // (Exited / Crashed) linger in the registry but are not "in flight".
             let live = sr
@@ -2161,7 +2208,9 @@ fn handle_request(
         } => {
             let target =
                 resolve_registry(sweep_registry, workspace_pool, workspace_root.as_deref());
-            let mut sr = target.lock().expect("Sweep registry mutex poisoned");
+            let mut sr = target
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             // Model resolution (issue #3944): an explicit `model` param still
             // wins, but an ABSENT one falls back to `autonomous.model` in
             // `.loom/config.json` and then the shipped non-premium default —
@@ -2224,7 +2273,9 @@ fn handle_request(
         } => {
             let target =
                 resolve_registry(sweep_registry, workspace_pool, workspace_root.as_deref());
-            let mut sr = target.lock().expect("Sweep registry mutex poisoned");
+            let mut sr = target
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             // Reap-on-read (Issue #3893): reconcile liveness before listing so a
             // sweep whose child has already exited is never reported `Running`
             // just because the 30s reaper timer has not ticked yet.
@@ -2242,7 +2293,9 @@ fn handle_request(
         } => {
             let target =
                 resolve_registry(sweep_registry, workspace_pool, workspace_root.as_deref());
-            let mut sr = target.lock().expect("Sweep registry mutex poisoned");
+            let mut sr = target
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             // Reap-on-read (Issue #3893): reconcile liveness so a status query
             // reflects a child that has exited rather than a stale `Running`.
             sr.reap_liveness();
@@ -2257,7 +2310,9 @@ fn handle_request(
         } => {
             let target =
                 resolve_registry(sweep_registry, workspace_pool, workspace_root.as_deref());
-            let sr = target.lock().expect("Sweep registry mutex poisoned");
+            let sr = target
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             match sr.tail_log(&sweep_id, lines) {
                 Ok((log_path, lines)) => Response::SweepLogTail {
                     sweep_id,
@@ -2283,7 +2338,9 @@ fn handle_request(
             // direct/unit-test callers where lock contention is irrelevant.
             let target =
                 resolve_registry(sweep_registry, workspace_pool, workspace_root.as_deref());
-            let mut sr = target.lock().expect("Sweep registry mutex poisoned");
+            let mut sr = target
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             match sr.cancel(&sweep_id, std::time::Duration::from_secs(grace_secs)) {
                 Ok(outcome) => Response::SweepCancelled {
                     sweep_id: outcome.sweep_id,
@@ -2307,7 +2364,9 @@ fn handle_request(
             // finder re-qualifies it immediately instead of waiting for the TTL.
             let target =
                 resolve_registry(sweep_registry, workspace_pool, workspace_root.as_deref());
-            let mut sr = target.lock().expect("Sweep registry mutex poisoned");
+            let mut sr = target
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             let was_quarantined = sr.clear_quarantine(issue);
             Response::QuarantineCleared {
                 issue,
@@ -2329,7 +2388,9 @@ fn handle_request(
             let entries = match workspace_root.as_deref() {
                 Some(root) if !root.trim().is_empty() => {
                     let target = resolve_registry(sweep_registry, workspace_pool, Some(root));
-                    let sr = target.lock().expect("Sweep registry mutex poisoned");
+                    let sr = target
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
                     sr.quarantine_entries(now)
                 }
                 _ => {
@@ -2341,7 +2402,7 @@ fn handle_request(
                     let fallback_root = {
                         let sr = sweep_registry
                             .lock()
-                            .expect("Sweep registry mutex poisoned");
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
                         sr.config().workspace_root.clone()
                     };
                     let workspace_registry = WorkspaceRegistry::load_default().unwrap_or_default();
@@ -2349,7 +2410,9 @@ fn handle_request(
                     let mut entries = Vec::new();
                     for root in &roots {
                         let registry = workspace_pool.get_or_provision(root);
-                        let sr = registry.lock().expect("Sweep registry mutex poisoned");
+                        let sr = registry
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
                         entries.extend(sr.quarantine_entries(now));
                     }
                     entries.sort_unstable_by_key(|e| e.issue);
@@ -4488,6 +4551,56 @@ exit 0
                 .as_deref(),
             Some(reason)
         );
+
+        match prev_shared {
+            Some(v) => std::env::set_var("LOOM_SHARED_TOKENS_DIR", v),
+            None => std::env::remove_var("LOOM_SHARED_TOKENS_DIR"),
+        }
+        std::env::remove_var(REGISTRY_PATH_ENV);
+    }
+
+    /// Regression test for Issue #4279 (the silent-EOF `status` incident): once
+    /// the sweep-registry `Mutex` is **poisoned** (a thread panicked while
+    /// holding it), `build_daemon_status` must still return a report by
+    /// recovering the guard — NOT re-panic on every subsequent call. Before the
+    /// fix, the `.expect("Sweep registry mutex poisoned")` turned one panic into
+    /// a permanent server-side failure: every later `status` request panicked in
+    /// its detached per-connection task and dropped the socket with zero bytes
+    /// written, which the client saw as an empty response.
+    #[test]
+    #[serial_test::serial]
+    fn test_build_daemon_status_recovers_from_poisoned_registry() {
+        use crate::main_health_gate::WorkspaceHealthStates;
+        use crate::workspace_registry::REGISTRY_PATH_ENV;
+
+        let (sr, dir, _rec) = setup_sweep_registry_in_tempdir();
+        let root = dir.path().to_path_buf();
+        let empty_reg = dir.path().join("no-such-workspaces.json");
+        std::env::set_var(REGISTRY_PATH_ENV, &empty_reg);
+        let prev_shared = std::env::var("LOOM_SHARED_TOKENS_DIR").ok();
+        std::env::set_var("LOOM_SHARED_TOKENS_DIR", "");
+
+        let pool = Arc::new(WorkspacePool::new(Arc::new(EventBus::new()), test_runtime_handle()));
+        pool.seed(root.clone(), sr.clone());
+        let health = WorkspaceHealthStates::new();
+
+        // Poison the registry mutex exactly as a panic under the lock would: a
+        // helper thread takes the lock and panics, leaving the `Mutex` poisoned.
+        let poison_target = sr.clone();
+        let joined = std::thread::spawn(move || {
+            let _guard = poison_target.lock().expect("lock to poison");
+            panic!("intentional panic to poison the registry mutex");
+        })
+        .join();
+        assert!(joined.is_err(), "the poisoning thread must have panicked");
+        assert!(sr.is_poisoned(), "registry mutex should now be poisoned");
+
+        // The core invariant: a poisoned registry no longer crashes the status
+        // build. It returns a report (recovering the guard) so `status` stays
+        // answerable rather than EOF-ing every connection for the process's life.
+        let report = build_daemon_status(&pool, &health, &root, &test_credential_preflight());
+        assert_eq!(report.per_repo.len(), 1, "single-workspace report still built");
+        assert_eq!(report.per_repo[0].root, root);
 
         match prev_shared {
             Some(v) => std::env::set_var("LOOM_SHARED_TOKENS_DIR", v),
