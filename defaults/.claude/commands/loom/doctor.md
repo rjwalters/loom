@@ -815,8 +815,11 @@ Reviewer                    Fixer                     Reviewer
 
 If the `safehouse_send` / `safehouse_read` MCP tools are present in this
 session, post one line on what you fixed after pushing. A genuine blocker
-(e.g. feedback you cannot address) gets `type: handoff`. If the tools are
-absent, proceed exactly as above — this is normal, not an error. Full
+(e.g. feedback you cannot address) gets `type: handoff`. If the MCP tools are
+absent (they are for this subagent's tool allowlist), fall back to
+`.loom/scripts/fleet-send.sh --task-id <repo>_<N> --type task --body "<line>"`,
+which exits 0 silently when the room is unreachable. If neither resolves,
+proceed exactly as above — this is normal, not an error. Full
 etiquette: `.loom/docs/fleet-comms.md`.
 
 ## Terminal Probe Protocol

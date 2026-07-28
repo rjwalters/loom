@@ -870,9 +870,12 @@ If the `safehouse_send` / `safehouse_read` MCP tools are present in this
 session, post sparingly to the fleet room: one line on claim ("starting issue
 #N: `<title>`"), one line on PR creation, and any *notable* mid-task finding
 (surprising discovery, a concern worth human eyes) — not routine progress. A
-genuine blocker gets `type: handoff`. If the tools are absent, proceed exactly
-as above — this is normal, not an error. Full etiquette (detection, threading,
-what NOT to do): `.loom/docs/fleet-comms.md`.
+genuine blocker gets `type: handoff`. If the MCP tools are absent (they are for
+this subagent's tool allowlist), fall back to
+`.loom/scripts/fleet-send.sh --task-id <repo>_<N> --type task --body "<line>"`,
+which exits 0 silently when the room is unreachable. If neither resolves,
+proceed exactly as above — this is normal, not an error. Full etiquette
+(detection, threading, what NOT to do): `.loom/docs/fleet-comms.md`.
 
 ## Terminal Probe Protocol
 
