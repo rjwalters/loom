@@ -53,6 +53,7 @@
 
 use crate::event_bus::EventBus;
 use crate::peer_claims::{self, ClaimAd, PeerClaimView};
+use crate::quarantine_reconciliation;
 use crate::sweep_journal;
 use crate::tokens_pool::bad_tokens;
 use crate::types::{Event, SweepId, SweepInfo, SweepKind, SweepOutcome, SweepState};
@@ -1047,7 +1048,7 @@ fn classify_account_exhaustion(log_tail: &str) -> Option<&'static str> {
 /// Resolve the per-call reaper `gh` timeout (Issue #3973): the
 /// [`REAP_GH_TIMEOUT_ENV`] override (whole seconds, must be > 0) or the
 /// [`REAP_GH_TIMEOUT`] default.
-fn reap_gh_timeout() -> Duration {
+pub(crate) fn reap_gh_timeout() -> Duration {
     std::env::var(REAP_GH_TIMEOUT_ENV)
         .ok()
         .and_then(|s| s.trim().parse::<u64>().ok())
@@ -1071,7 +1072,7 @@ fn reap_gh_timeout() -> Duration {
 /// an edit ack), so the `try_wait` poll loop never risks a full-pipe-buffer
 /// deadlock; the kill-on-timeout path drains the pipe via `wait()` after the
 /// signal.
-fn output_with_timeout(
+pub(crate) fn output_with_timeout(
     mut cmd: Command,
     timeout: Duration,
 ) -> std::io::Result<Option<std::process::Output>> {
@@ -2427,20 +2428,39 @@ impl SweepRegistry {
         }
     }
 
+    /// Restore a crashed/orphaned claim's `loom:building` back to
+    /// `loom:issue` — UNLESS the issue currently carries `loom:blocked`
+    /// (Issue #4206). A deliberate operator park (applied by hand, possibly
+    /// while the now-dead sweep was still `loom:building`) must never be
+    /// clobbered into the illegal `loom:blocked` + `loom:issue` combo by the
+    /// crash-recovery path. Re-reads the issue's current labels first (the
+    /// same probe pattern as [`Self::issue_has_blocked_label`], used
+    /// elsewhere on the reap path) — best-effort and fail-open: an
+    /// unverifiable read falls back to the pre-#4206 unconditional restore,
+    /// since a stranded `loom:building` claim is the more common failure
+    /// mode this path exists to fix.
     fn restore_label_to_ready(&self, issue: u32) -> Result<()> {
         let gh = self
             .config
             .gh_bin
             .clone()
             .unwrap_or_else(|| PathBuf::from("gh"));
+        let blocked = self.issue_has_blocked_label(issue);
         let mut cmd = Command::new(&gh);
         cmd.arg("issue")
             .arg("edit")
             .arg(issue.to_string())
             .arg("--remove-label")
-            .arg("loom:building")
-            .arg("--add-label")
-            .arg("loom:issue");
+            .arg("loom:building");
+        if blocked {
+            log::info!(
+                "sweep_registry: restore_label_to_ready for #{issue} found `loom:blocked` \
+                 already present — preserving the operator's park by removing the stale \
+                 `loom:building` claim only, NOT re-adding `loom:issue` (#4206)"
+            );
+        } else {
+            cmd.arg("--add-label").arg("loom:issue");
+        }
         // Scope the restore to the registry's workspace so the crash-path label
         // recovery resolves against the right repo in a multi-workspace daemon
         // (#3937). LOOM_REPO still overrides when set.
@@ -2615,12 +2635,53 @@ impl SweepRegistry {
         for issue in expired {
             self.quarantined.remove(&issue);
             self.insta_crash_counts.remove(&issue);
+
+            // Issue #4206: before restoring the forge label, check whether a
+            // human re-applied `loom:blocked` well AFTER the daemon's own
+            // quarantine comment — a deliberate later park, distinguishable
+            // from the daemon's own (older) quarantine by comparing the most
+            // recent `labeled loom:blocked` timeline event against the most
+            // recent quarantine-marker comment. If so, the in-memory entry
+            // above is still purged (this issue stops occupying quarantine
+            // bookkeeping/TTL churn), but the forge label is left completely
+            // untouched — TTL expiry becomes a no-op for it.
+            if !self.config.skip_label_flip && self.is_manually_reparked(issue) {
+                log::info!(
+                    "sweep_registry: issue #{issue} quarantine TTL expired, but the forge shows \
+                     `loom:blocked` was re-applied by a human after the daemon's quarantine \
+                     comment — purging the in-memory record WITHOUT touching the forge label \
+                     (#4206)"
+                );
+                continue;
+            }
+
             log::info!(
                 "sweep_registry: issue #{issue} quarantine expired after {ttl_secs}s — eligible \
                  for re-dispatch again (#3939)"
             );
             self.attempt_quarantine_release(issue);
         }
+    }
+
+    /// Best-effort probe (Issue #4206) for whether `issue`'s current
+    /// `loom:blocked` label was applied by a human well after the daemon's
+    /// last quarantine-marker comment — i.e. a deliberate LATER park that
+    /// happens to sit on an issue the daemon also quarantined at some point.
+    /// Bounded by [`reap_gh_timeout`] like every other reaper-path `gh` call
+    /// (Issue #3973). Fail-open (`false`) on any unresolvable signal so a
+    /// forge hiccup never permanently strands a genuine daemon quarantine —
+    /// see [`quarantine_reconciliation::forge::probe_manual_repark`].
+    fn is_manually_reparked(&self, issue: u32) -> bool {
+        let gh = self
+            .config
+            .gh_bin
+            .clone()
+            .unwrap_or_else(|| PathBuf::from("gh"));
+        quarantine_reconciliation::forge::probe_manual_repark(
+            &gh,
+            &self.config.workspace_root,
+            issue,
+        )
     }
 
     /// Retry every issue in [`pending_quarantine_release`](Self::pending_quarantine_release_issues)
@@ -7339,6 +7400,82 @@ exit 0
         assert_eq!(gh_calls, gh_calls_after, "no further gh calls once nothing is pending");
     }
 
+    /// Issue #4206 (Option 1): TTL expiry must never release a `loom:blocked`
+    /// that the forge shows was RE-applied by a human well after the
+    /// daemon's own quarantine comment — a deliberate later park. The
+    /// in-memory quarantine entry is still purged (so it stops occupying TTL
+    /// bookkeeping and re-firing every tick), but the forge label must be
+    /// left completely untouched — this is exactly the reported crash-loop:
+    /// the daemon repeatedly overriding a human's park on a
+    /// previously-quarantined issue.
+    #[test]
+    fn quarantine_ttl_expiry_never_releases_a_later_manual_repark() {
+        let dir = tempdir().unwrap();
+        let gh_log = dir.path().join("gh-invocations.log");
+        let fake_gh = dir.path().join("fake-gh.sh");
+        // `gh issue view <n> --json comments --jq ...` (the marker-comment
+        // recency probe) reports an old daemon quarantine comment;
+        // `gh api repos/{owner}/{repo}/issues/<n>/timeline ...` (the
+        // labeled-event recency probe) reports a `loom:blocked` labeling
+        // event long AFTER that comment — the signature of a later manual
+        // re-park.
+        let script = format!(
+            r#"#!/usr/bin/env bash
+printf '%s\n' "$*" >> "{log}"
+if [ "$1" = "issue" ] && [ "$2" = "view" ]; then
+  echo '"2020-01-01T00:00:00Z"'
+  exit 0
+fi
+if [ "$1" = "api" ]; then
+  echo '"2030-01-01T00:00:00Z"'
+  exit 0
+fi
+exit 0
+"#,
+            log = gh_log.display(),
+        );
+        std::fs::write(&fake_gh, &script).unwrap();
+        let mut perms = std::fs::metadata(&fake_gh).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&fake_gh, perms).unwrap();
+        if let Ok(f) = std::fs::File::open(&fake_gh) {
+            let _ = f.sync_all();
+        }
+
+        let mut config = SweepRegistryConfig::new(dir.path().to_path_buf());
+        config.gh_bin = Some(fake_gh);
+        config.skip_label_flip = false;
+        let mut registry = SweepRegistry::new(config);
+        registry.set_quarantine_config(QuarantineConfig {
+            ttl: Duration::from_secs(3600),
+            ..QuarantineConfig::default()
+        });
+        registry
+            .quarantined
+            .insert(4206, Utc::now() - chrono::Duration::seconds(7200));
+        registry.insta_crash_counts.insert(4206, 3);
+
+        registry.reap_once();
+
+        assert!(
+            !registry.is_quarantined(4206),
+            "the in-memory quarantine entry must still be purged so TTL bookkeeping doesn't \
+             keep re-firing on this issue every tick"
+        );
+        assert_eq!(registry.insta_crash_count(4206), 0);
+        assert!(
+            registry.pending_quarantine_release_issues().is_empty(),
+            "a detected manual repark is not a failed release — nothing should be pending retry"
+        );
+
+        let gh_calls = std::fs::read_to_string(&gh_log).unwrap_or_default();
+        assert!(
+            !gh_calls.contains("--remove-label loom:blocked"),
+            "a later manual park must never have its loom:blocked label touched by TTL \
+             expiry; got gh invocations: {gh_calls:?}"
+        );
+    }
+
     /// A `gh` failure during release must NOT permanently strand the issue:
     /// the entry is retained in the pending-release set and retried until it
     /// succeeds (Issue #4110). Previously `expire_quarantine` dropped the
@@ -7348,17 +7485,22 @@ exit 0
     /// retry it — reproducing the exact reported end state (`quarantine
     /// clear` -> "was not quarantined", forge still `loom:blocked`).
     ///
-    /// The fake `gh` fails its first two invocations (a counter file tracks
-    /// remaining failures) — enough to survive both the `expire_quarantine`
-    /// attempt AND the same-tick `retry_pending_quarantine_releases` pass —
-    /// so the first `reap_once` tick genuinely ends with the issue still
-    /// pending, and only the second tick's retry succeeds.
+    /// The fake `gh` fails its first three invocations (a counter file
+    /// tracks remaining failures) — enough to survive the Issue #4206
+    /// manual-repark probe `expire_quarantine` now runs first, the
+    /// `expire_quarantine` release attempt itself, AND the same-tick
+    /// `retry_pending_quarantine_releases` pass — so the first `reap_once`
+    /// tick genuinely ends with the issue still pending, and only the second
+    /// tick's retry succeeds. The probe call fails open (a failed/unparsable
+    /// read is never treated as a manual repark), so it does not change the
+    /// release-retry semantics under test here — it just adds one more `gh`
+    /// invocation ahead of the real release attempts.
     #[test]
     fn quarantine_release_retries_after_gh_failure_then_succeeds() {
         let dir = tempdir().unwrap();
         let gh_log = dir.path().join("gh-invocations.log");
         let fail_counter = dir.path().join("fails-remaining");
-        std::fs::write(&fail_counter, "2").unwrap();
+        std::fs::write(&fail_counter, "3").unwrap();
         let fake_gh = dir.path().join("fake-gh.sh");
         let script = format!(
             "#!/usr/bin/env bash\nprintf '%s\\n' \"$*\" >> \"{log}\"\ncount=$(cat \"{counter}\" \
@@ -7797,6 +7939,57 @@ exit 0
         );
     }
 
+    /// Issue #4206 (Option 2): the crash-path label restore must NEVER add
+    /// `loom:issue` while the issue currently carries `loom:blocked` on the
+    /// forge — that would produce the illegal `loom:blocked` + `loom:issue`
+    /// combo, silently overriding an operator's deliberate park. The stale
+    /// `loom:building` claim from the now-dead sweep is still cleared.
+    #[test]
+    fn restore_label_to_ready_does_not_add_loom_issue_when_blocked() {
+        let dir = tempdir().unwrap();
+        let gh_log = dir.path().join("gh-invocations.log");
+        let fake_gh = dir.path().join("fake-gh.sh");
+        // `gh issue view <n> --json labels --jq '...'` (the pre-check probe)
+        // reports the issue as currently `loom:blocked`; any `gh issue edit`
+        // call is recorded and always succeeds.
+        let script = format!(
+            r#"#!/usr/bin/env bash
+printf '%s\n' "$*" >> "{log}"
+if [ "$1" = "issue" ] && [ "$2" = "view" ]; then
+  echo "true"
+  exit 0
+fi
+exit 0
+"#,
+            log = gh_log.display(),
+        );
+        std::fs::write(&fake_gh, &script).unwrap();
+        let mut perms = std::fs::metadata(&fake_gh).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&fake_gh, perms).unwrap();
+        if let Ok(f) = std::fs::File::open(&fake_gh) {
+            let _ = f.sync_all();
+        }
+
+        let mut config = SweepRegistryConfig::new(dir.path().to_path_buf());
+        config.gh_bin = Some(fake_gh);
+        config.skip_label_flip = false; // exercise the real restore path
+        let registry = SweepRegistry::new(config);
+
+        registry.restore_label_to_ready(4206).unwrap();
+
+        let gh_calls = std::fs::read_to_string(&gh_log).unwrap_or_default();
+        assert!(
+            gh_calls.contains("issue edit 4206 --remove-label loom:building"),
+            "expected the stale loom:building claim to still be removed; got: {gh_calls:?}"
+        );
+        assert!(
+            !gh_calls.contains("--add-label loom:issue"),
+            "must NOT re-add loom:issue while loom:blocked is present (illegal combo); got: \
+             {gh_calls:?}"
+        );
+    }
+
     /// Issue #3827: a cancelled daemon-owned Issue sweep that never opened a
     /// PR must have its pre-dispatch loom:building claim restored to loom:issue
     /// by `finish_cancel` — mirroring the reaper's clean-exit recovery (#3823b).
@@ -7913,8 +8106,9 @@ exit 0
         let cwds: Vec<_> = recorded.lines().filter(|l| !l.is_empty()).collect();
         assert_eq!(
             cwds.len(),
-            2,
-            "expected both flip + restore to invoke gh once each; got cwds: {cwds:?}"
+            3,
+            "expected the flip (1 call) + restore (Issue #4206's pre-check `loom:blocked` \
+             probe, then the edit — 2 calls) to invoke gh three times total; got cwds: {cwds:?}"
         );
         for cwd in &cwds {
             let got = std::fs::canonicalize(cwd).unwrap();
