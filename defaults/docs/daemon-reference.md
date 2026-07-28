@@ -2361,29 +2361,42 @@ loop is not reusable as the reporter). It has three cooperating parts:
    off. Default-on (read-only, no dispatch side effect); opt out with
    `LOOM_DAEMON_HEARTBEAT=0` / `autonomous.heartbeat.enabled=false`.
 
-3. **Host-side watchdog** (`loom-daemon-watchdog.sh`), the payload of a **second
-   launchd job** (`<daemon-label>-watchdog`) that `loom-daemon-start.sh`
-   provisions on macOS with a `StartInterval` cadence (default 300s). Each run
-   compares intent (marker present?) against reality (daemon loaded + alive?
-   heartbeat fresh?) and, on divergence, appends a loud line to
-   `<loom_dir>/logs/daemon-watchdog.log` and stderr (which launchd captures).
+3. **Host-side watchdog** (`loom-daemon-watchdog.sh`), the payload of a
+   **second, separate scheduled job** from the daemon job/unit itself, that
+   `loom-daemon-start.sh` provisions on a recurring cadence (default 300s):
+   - **Darwin**: a second **launchd job** (`<daemon-label>-watchdog`) on a
+     `StartInterval` cadence.
+   - **systemd Linux** (#4260 sub-issue D): a `Type=oneshot`
+     `<daemon-unit>-watchdog.service` driven by a paired
+     `<daemon-unit>-watchdog.timer` (`OnUnitActiveSec` + `OnBootSec`,
+     `Persistent=false`), `enable --now`'d on the **timer** (mirroring
+     `loom-daemon.service` itself — #4268).
+
+   Each run compares intent (marker present?) against reality (daemon loaded +
+   alive? heartbeat fresh?) and, on divergence, appends a loud line to
+   `<loom_dir>/logs/daemon-watchdog.log` and stderr (which launchd/systemd both
+   capture into the same log via the rendered job/unit's stdout/stderr redirect).
 
 | File | Env override | Config key | Default |
 |------|--------------|-----------|---------|
 | heartbeat cadence | `LOOM_DAEMON_HEARTBEAT_INTERVAL_SECS` | `autonomous.heartbeat.intervalSecs` | `60` |
 | heartbeat on/off | `LOOM_DAEMON_HEARTBEAT` | `autonomous.heartbeat.enabled` | `true` (on) |
-| watchdog interval | `LOOM_WATCHDOG_INTERVAL_SECS` | — | `300` |
+| watchdog interval | `LOOM_WATCHDOG_INTERVAL_SECS` | — | `300` (launchd `StartInterval` / systemd `OnUnitActiveSec`+`OnBootSec`) |
+| watchdog job/unit basename override | `LOOM_WATCHDOG_LABEL` | — | `<daemon label/unit>-watchdog` |
 | staleness threshold | `LOOM_DAEMON_HEARTBEAT_STALE_SECS` | — | `max(5 × cadence, 300)` |
 
-**Why `StartInterval`, not a resident process or `KeepAlive`.** The reporter must
-itself be supervised, but a long-lived resident watchdog just moves the
-who-watches-the-watchdog problem up a level (it too can crash and stay dead). A
-`StartInterval` job owns no long-lived process: launchd re-runs it every interval
-regardless of how the last run exited, so it structurally cannot
-crash-and-stay-dead. `KeepAlive` is deliberately **not** set — it would busy-loop
-a short-lived job. The watchdog exit code (`0` healthy / no daemon expected, `1`
-divergence) is for testability + a human running it by hand; a `StartInterval`
-job's exit code does not affect relaunch.
+**Why an interval timer, not a resident process or `KeepAlive`/`Restart=`.** The
+reporter must itself be supervised, but a long-lived resident watchdog just moves
+the who-watches-the-watchdog problem up a level (it too can crash and stay dead).
+Both scheduling mechanisms own **no long-lived process**: launchd re-runs a
+`StartInterval` job every interval regardless of how the last run exited, and
+systemd's `.timer` re-fires its paired `Type=oneshot` service the same way — so
+neither can crash-and-stay-dead. `KeepAlive`/`Restart=` are deliberately **not**
+set on the watchdog job/service — that would busy-loop a short-lived job/oneshot
+service instead of driving it off a fixed interval clock. The watchdog exit code
+(`0` healthy / no daemon expected, `1` divergence) is for testability + a human
+running it by hand; neither a `StartInterval` job's nor a timer-fired oneshot
+service's exit code affects the next scheduled run.
 
 **Decision matrix** (marker present ⇒ a daemon is expected):
 
@@ -2404,10 +2417,12 @@ disarms the detector — the exact bug class #4011 fixes — so it is an explici
 signal, never an inference. The subsequent start re-writes the marker and
 re-provisions the watchdog.
 
-**Platform + isolation.** The scheduled watchdog is a launchd job, so on Linux /
-the `--no-launchd` nohup path there is no host-side checker provisioned — the
-marker + heartbeat are still written, and `loom-daemon-watchdog.sh` can be run by
-hand or wired to a cron / systemd timer to consume them. `<loom_dir>` is the
+**Platform + isolation.** Darwin and systemd Linux hosts both get a provisioned,
+scheduled watchdog (see the two bullets above). Only the **nohup fallback tier**
+— a non-systemd Linux host, or an explicit `--no-launchd`/`--no-systemd` /
+`LOOM_DAEMON_LAUNCHD=0`/`LOOM_DAEMON_SYSTEMD=0` escape hatch — has no host-side
+checker provisioned: the marker + heartbeat are still written, and
+`loom-daemon-watchdog.sh` can be run by hand or wired to cron. `<loom_dir>` is the
 parent of `LOOM_SOCKET_PATH` (else `~/.loom`), so pointing `LOOM_SOCKET_PATH` at a
 tempdir isolates the marker + heartbeat there too — which is how the lifecycle
 tests avoid ever touching the operator's real `~/.loom`. A forge-side reporting
@@ -2645,9 +2660,11 @@ disable-on-stop. The contract mirrors launchd point-for-point:
   interaction symmetrically, so a `--no-systemd` (nohup) start gets a stop that
   never touches the user manager.
 - **Crash relaunch is out of scope.** `Restart=on-success` deliberately does
-  **not** relaunch a crashed daemon (a non-zero exit) — that is watchdog territory,
-  tracked as sub-issue D of #4260, mirroring the macOS `StartInterval` autonomy-loss
-  watchdog (#4011), which remains launchd-only for now.
+  **not** relaunch a crashed daemon (a non-zero exit) — that is watchdog territory.
+  On a systemd host it is delivered by the `<unit>-watchdog.timer` +
+  `Type=oneshot` `.service` pair (#4260 sub-issue D, "Autonomy-loss watchdog +
+  heartbeat" above), mirroring the macOS `StartInterval` autonomy-loss watchdog
+  (#4011) — the watchdog *reports* divergence, it does not restart the daemon.
 
 ### macOS TCC hygiene under launchd (#3980)
 

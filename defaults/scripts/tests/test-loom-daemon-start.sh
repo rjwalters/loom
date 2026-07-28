@@ -327,8 +327,134 @@ else
     TESTS_FAILED=$((TESTS_FAILED + 1))
     echo -e "${RED}✗${NC} systemd path: prints the loginctl enable-linger reboot-survival reminder"
 fi
+# S2 uses $WORKDIR as REPO_ROOT, which has no loom-daemon-watchdog.sh fixture
+# (a scratch tmpdir, not a real checkout) -- so the watchdog provisioning
+# tier degrades to its missing-script skip. Confirm that degrade is a WARNING,
+# never a failed start (parity with the launchd branch, #4260 sub-issue D AC).
+TESTS_RUN=$((TESTS_RUN + 1))
+if echo "$sd_out" | grep -qi 'watchdog.*loom-daemon-watchdog.sh not found'; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} systemd path: missing watchdog script degrades to a warning (start already asserted exit 0 above)"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} systemd path: missing watchdog script degrades to a warning"
+    echo "  output: $sd_out"
+fi
 kill "$SD_MAIN_SLEEP_PID" 2>/dev/null || true
 rm -rf "$SD_HOME"
+
+# ---------- systemd --user watchdog timer (#4260 sub-issue D) ----------
+# A repo-like scratch checkout with the REAL loom-daemon-watchdog.sh installed
+# (S2's $WORKDIR deliberately has none) so provision_watchdog_job_systemd's
+# happy path is actually exercised, not just its missing-script skip above.
+WD_REPO="$(mktemp -d)"
+mkdir -p "$WD_REPO/.loom/scripts/cli" "$WD_REPO/.loom/logs"
+cp "$SCRIPT_DIR/../cli/loom-daemon-watchdog.sh" "$WD_REPO/.loom/scripts/cli/loom-daemon-watchdog.sh"
+
+make_sd_stub_wd() {
+    local log="$1" mainpid="$2" fail_wd="$3"
+    cat > "$SD_BIN/systemctl" <<EOF
+#!/usr/bin/env bash
+echo "\$*" >> "$log"
+if [[ "\${1:-}" == "--user" ]]; then shift; fi
+case "\${1:-}" in
+  show) echo "${mainpid}" ;;
+  enable)
+    if [[ "$fail_wd" == "1" && "\$*" == *"-watchdog.timer"* ]]; then exit 1; fi
+    exit 0 ;;
+  *) exit 0 ;;
+esac
+EOF
+    chmod +x "$SD_BIN/systemctl"
+}
+
+# WD1. Happy path: timer + service rendered with the correct fields, the timer
+#      (not the service) is enable --now'd, and LOOM_WATCHDOG_INTERVAL_SECS
+#      drives BOTH OnUnitActiveSec and OnBootSec.
+sleep 30 & WD_MAIN_SLEEP_PID=$!
+WD_LOG="$WORKDIR/sd-watchdog.log"; : > "$WD_LOG"
+make_sd_stub_wd "$WD_LOG" "$WD_MAIN_SLEEP_PID" "0"
+WD_HOME="$(mktemp -d)"; mkdir -p "$WD_HOME/.loom/logs"
+WD_UNIT="loom-daemon-wd-test-$$.service"
+wd_out=$( cd "$WD_REPO" && env -u LOOM_WORK_FINDER -u LOOM_MAIN_HEALTH_GATE \
+    PATH="$SD_BIN:$PATH" HOME="$WD_HOME" \
+    LOOM_SYSTEMD_FORCE=1 LOOM_SYSTEMD_UNIT="$WD_UNIT" LOOM_WATCHDOG_INTERVAL_SECS=42 \
+    LOOM_DAEMON_BIN="$FAKE_BIN" \
+    LOOM_SOCKET_PATH="$WD_HOME/.loom/loom-daemon.sock" \
+    LOOM_AUTONOMY_MARKER="$WD_HOME/.loom/autonomy-desired" \
+    bash "$START_SCRIPT" --no-launchd 2>&1 )
+wd_rc=$?
+assert_eq "0" "$wd_rc" "systemd watchdog: start exits 0 with a real watchdog script present"
+[[ "$wd_rc" == "0" ]] || echo "  output: $wd_out"
+WD_TIMER_UNIT="loom-daemon-wd-test-$$-watchdog.timer"
+WD_SVC_UNIT="loom-daemon-wd-test-$$-watchdog.service"
+TESTS_RUN=$((TESTS_RUN + 1))
+if grep -q -- "--user enable --now $WD_TIMER_UNIT" "$WD_LOG" \
+    && ! grep -q -- "--user enable --now $WD_SVC_UNIT" "$WD_LOG"; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} systemd watchdog: enable --now targets the TIMER unit, not the service"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} systemd watchdog: enable --now targets the TIMER unit, not the service"
+    echo "  systemctl calls: $(cat "$WD_LOG")"
+fi
+WD_TIMER_PATH="$WD_HOME/.config/systemd/user/$WD_TIMER_UNIT"
+WD_SVC_PATH="$WD_HOME/.config/systemd/user/$WD_SVC_UNIT"
+TESTS_RUN=$((TESTS_RUN + 1))
+if [[ -f "$WD_TIMER_PATH" ]] \
+    && grep -qx 'OnUnitActiveSec=42' "$WD_TIMER_PATH" \
+    && grep -qx 'OnBootSec=42' "$WD_TIMER_PATH" \
+    && grep -qx "Unit=$WD_SVC_UNIT" "$WD_TIMER_PATH" \
+    && grep -qx 'Persistent=false' "$WD_TIMER_PATH"; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} systemd watchdog: timer renders OnUnitActiveSec/OnBootSec from LOOM_WATCHDOG_INTERVAL_SECS, Unit=<service>, Persistent=false"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} systemd watchdog: timer renders the expected fields"
+    cat "$WD_TIMER_PATH" 2>/dev/null | sed 's/^/    /'
+fi
+TESTS_RUN=$((TESTS_RUN + 1))
+if [[ -f "$WD_SVC_PATH" ]] \
+    && grep -qx 'Type=oneshot' "$WD_SVC_PATH" \
+    && grep -q "^ExecStart=/bin/bash $WD_REPO/.loom/scripts/cli/loom-daemon-watchdog.sh$" "$WD_SVC_PATH"; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} systemd watchdog: service renders Type=oneshot and ExecStart=<watchdog script path>"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} systemd watchdog: service renders Type=oneshot and ExecStart=<watchdog script path>"
+    cat "$WD_SVC_PATH" 2>/dev/null | sed 's/^/    /'
+fi
+kill "$WD_MAIN_SLEEP_PID" 2>/dev/null || true
+rm -rf "$WD_HOME"
+
+# WD2. Provisioning failure (stub enable --now on the timer exits 1) is a
+#      WARNING, never a failed daemon start.
+sleep 30 & WD2_MAIN_SLEEP_PID=$!
+WD2_LOG="$WORKDIR/sd-watchdog-fail.log"; : > "$WD2_LOG"
+make_sd_stub_wd "$WD2_LOG" "$WD2_MAIN_SLEEP_PID" "1"
+WD2_HOME="$(mktemp -d)"; mkdir -p "$WD2_HOME/.loom/logs"
+WD2_UNIT="loom-daemon-wd2-test-$$.service"
+wd2_out=$( cd "$WD_REPO" && env -u LOOM_WORK_FINDER -u LOOM_MAIN_HEALTH_GATE \
+    PATH="$SD_BIN:$PATH" HOME="$WD2_HOME" \
+    LOOM_SYSTEMD_FORCE=1 LOOM_SYSTEMD_UNIT="$WD2_UNIT" \
+    LOOM_DAEMON_BIN="$FAKE_BIN" \
+    LOOM_SOCKET_PATH="$WD2_HOME/.loom/loom-daemon.sock" \
+    LOOM_AUTONOMY_MARKER="$WD2_HOME/.loom/autonomy-desired" \
+    bash "$START_SCRIPT" --no-launchd 2>&1 )
+wd2_rc=$?
+assert_eq "0" "$wd2_rc" "systemd watchdog: a failed 'enable --now' on the timer does not fail the daemon start"
+TESTS_RUN=$((TESTS_RUN + 1))
+if echo "$wd2_out" | grep -qi 'watchdog.*enable --now failed'; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} systemd watchdog: install failure is reported as a warning"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} systemd watchdog: install failure is reported as a warning"
+    echo "  output: $wd2_out"
+fi
+kill "$WD2_MAIN_SLEEP_PID" 2>/dev/null || true
+rm -rf "$WD2_HOME"
+rm -rf "$WD_REPO"
 
 # S3. Escape hatch: --no-systemd falls back to the nohup path byte-compatibly —
 #     the stub systemctl is on PATH and detection is FORCED, yet no systemctl

@@ -396,6 +396,21 @@ else
     TESTS_FAILED=$((TESTS_FAILED + 1))
     echo -e "${RED}✗${NC} systemd tier: operator stop clears the autonomy-desired marker"
 fi
+# SD1b (#4260 sub-issue D): the same operator stop also tears down the
+# watchdog timer + service pair, symmetric with the launchd bootout tier.
+# Naming mirrors loom-daemon-start.sh's resolve_systemd_watchdog_unit():
+# <daemon unit>-watchdog(.timer|.service).
+SD_WD_UNIT="${LOOM_SYSTEMD_UNIT%.service}-watchdog"
+TESTS_RUN=$((TESTS_RUN + 1))
+if grep -q -- "--user disable --now ${SD_WD_UNIT}.timer" "$SD_LOG" \
+    && grep -q -- "--user disable --now ${SD_WD_UNIT}.service" "$SD_LOG"; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} systemd tier: operator stop disables the watchdog timer + service"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} systemd tier: operator stop disables the watchdog timer + service"
+    echo "  systemctl calls: $(cat "$SD_LOG")"
+fi
 
 # SD2. Post-disable verification: if the unit is STILL active after disable --now
 #      (a disable that did not stick — the inverted-#4011 silent-success hole),
