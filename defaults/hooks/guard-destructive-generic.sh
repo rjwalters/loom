@@ -663,6 +663,86 @@ resolve_worktree_root() {
 }
 
 # =============================================================================
+# worktree-isolation toggle — Bash-tool write confinement (issue #4178).
+#
+# guard-worktree-paths.sh confines the Edit/Write TOOL matcher to a builder's
+# issue worktree, but nothing confined the Bash tool: `>`/`>>` redirection,
+# `tee`, `sed -i`, `cp`/`mv` all write files without ever going through
+# Edit/Write, so a session denied on Edit/Write could fall back to Bash and
+# land the same write in the main checkout. Sweep #4063 used exactly this
+# escape to edit live guard hooks in the main checkout while its own worktree
+# stayed clean (see the issue's root-cause writeup / hook-error-log timeline).
+#
+# This reuses the SAME toggle guard-worktree-paths.sh already exposes
+# (guards.worktreeIsolation / LOOM_GUARD_WORKTREE_ISOLATION) — one switch, not
+# two — so a repo/session that already opted out of Edit/Write confinement
+# gets the identical Bash-write confinement decision, and the documented
+# escape hatch (a human/driver session that must edit the main checkout while
+# worktrees exist) keeps working here too.
+#
+# Resolution order (highest precedence first), mirroring every other guard
+# toggle in this file:
+#   1. LOOM_GUARD_WORKTREE_ISOLATION env var (0/false/no disables, 1/true/yes
+#      forces on). Overrides config.
+#   2. .loom/config.json -> guards.worktreeIsolation (default true when absent)
+#   3. Default: true (guard on)
+#
+# The config read is best-effort: any parse failure falls through to guard-ON
+# and never trips the ERR trap.
+# =============================================================================
+_WORKTREE_ISOLATION_CACHE=""
+worktree_isolation_guard_enabled() {
+    if [[ -z "$_WORKTREE_ISOLATION_CACHE" ]]; then
+        local enabled=true
+        if [[ -n "$REPO_ROOT" && -f "$REPO_ROOT/.loom/config.json" ]]; then
+            enabled=$(jq -r 'if .guards.worktreeIsolation == false then "false" else "true" end' "$REPO_ROOT/.loom/config.json" 2>/dev/null) || enabled=true
+            [[ -n "$enabled" ]] || enabled=true
+        fi
+        case "${LOOM_GUARD_WORKTREE_ISOLATION:-}" in
+            0|false|no)  enabled=false ;;
+            1|true|yes)  enabled=true ;;
+        esac
+        _WORKTREE_ISOLATION_CACHE="$enabled"
+    fi
+    [[ "$_WORKTREE_ISOLATION_CACHE" == "true" ]]
+}
+
+# True if $1 (an absolute, lexically-normalized path) sits inside ANY managed
+# worktree — walks up looking for the `.loom-managed` sentinel worktree.sh
+# writes at every worktree root. Inline copy of walk_up_for_sentinel() in
+# guard-worktree-paths.sh: kept separate rather than sourced, same rationale
+# as resolve_worktree_root() mirroring worktree-root.sh above — this hook is a
+# distinct process with its own self-contained fail-open contract.
+_in_any_managed_worktree() {
+    local dir="$1"
+    [[ -n "$dir" ]] || return 1
+    if [[ ! -d "$dir" ]]; then
+        dir="${dir%/*}"
+        [[ -z "$dir" ]] && dir="/"
+    fi
+    local i=0
+    while [[ $i -lt 64 ]]; do
+        [[ -f "$dir/.loom-managed" ]] && return 0
+        [[ "$dir" == "/" ]] && break
+        dir="${dir%/*}"
+        [[ -z "$dir" ]] && dir="/"
+        i=$((i + 1))
+    done
+    return 1
+}
+
+# True if at least one managed worktree currently exists under $1
+# (<base>/<name>/.loom-managed, depth 2 — matches worktree.sh's layout).
+# Mirrors any_managed_worktree_exists() in guard-worktree-paths.sh.
+_any_managed_worktree_exists() {
+    local base="$1"
+    [[ -n "$base" && -d "$base" ]] || return 1
+    local hit
+    hit=$(find "$base" -mindepth 2 -maxdepth 2 -name '.loom-managed' -print -quit 2>/dev/null) || hit=""
+    [[ -n "$hit" ]]
+}
+
+# =============================================================================
 # force-op branch-scope toggle — default ALL (preserve current behaviour).
 #
 # The three generic force-op ASK patterns (git push --force / -f /
@@ -1342,6 +1422,128 @@ extract_rm_targets() {
     }'
 }
 
+# =============================================================================
+# extract_write_targets() — Bash-tool write-idiom target extraction (#4178).
+#
+# Emits one "<cwd>\t<target>" line (TAB-separated, US separator 0x1f — mirrors
+# parse_force_ops' SEP convention) per recognized write idiom found in $1:
+#   - `>` / `>>` redirection, bare or fd-prefixed (`2>file`), attached
+#     (`>file`) or spaced (`> file`). A dup-to-fd form (`>&1`, `2>&1`) is
+#     recognized and EXCLUDED — it never writes a file.
+#   - `tee <file>...`            — every non-flag argument is a target.
+#   - `sed -i ... <script> <file>...` — only when an -i/-i* flag is present;
+#     the FIRST non-flag argument is assumed to be the sed script, the rest
+#     are file targets. Exactly one non-flag argument is genuinely ambiguous
+#     (could be an -f scriptfile with no positional file yet) and is SKIPPED
+#     rather than guessed — allow on uncertainty, never deny on uncertainty.
+#   - `cp` / `mv ... <dest>`     — the LAST non-flag argument (the common
+#     `cp/mv src... dest` shape).
+#
+# $2 seeds the starting cwd. A `cd <path>` segment updates cwd for LATER
+# segments of the SAME command (so `cd <worktree> && echo x > f` resolves the
+# relative target against the worktree, not the hook's cwd) — global awk
+# variable `curcwd`, threaded across the per-line pattern-action block exactly
+# like parse_force_ops threads `cpath` via `git -C`.
+#
+# NOT a full shell parser: like parse_force_ops / extract_rm_targets, splitting
+# a segment into tokens is plain whitespace splitting (not quote-aware), so a
+# quoted argument containing a literal space can be mis-split. The caller
+# feeds this the ASK-tier working copy (COMMAND_ASK_SCAN — comment-stripped
+# AND literal-text-redacted, i.e. --body/-m/--title/--notes/--comment values
+# are replaced with same-length placeholder text) specifically so a `>` that
+# merely appears INSIDE such a quoted value (e.g. `git commit -m "a > b"`)
+# cannot manufacture a phantom target. Any remaining false positive from an
+# unredacted quote resolves to, at worst, an extra deny on a target that isn't
+# really a write (safe direction) or a missed target (also safe — the fail-
+# open contract this file uses everywhere: ambiguity never widens a deny).
+# =============================================================================
+extract_write_targets() {
+    printf '%s' "$1" | awk -v startcwd="$2" "$_QSPLIT_AWK"'
+    BEGIN {
+        SEP = sprintf("%c", 31)
+        curcwd = startcwd
+    }
+    {
+        $0 = qsplit($0)   # quote-aware segmentation (#3755)
+        n = split($0, segs, "\n")
+        for (i = 1; i <= n; i++) {
+            seg = segs[i]
+            sub(/^[ \t]+/, "", seg)
+            sub(/^sudo[ \t]+/, "", seg)
+            sub(/^[ \t]+/, "", seg)
+            if (seg == "") continue
+
+            m = split(seg, toks, /[ \t]+/)
+            if (m < 1) continue
+
+            if (toks[1] == "cd") {
+                if (m >= 2 && toks[2] != "" && toks[2] != "-") {
+                    if (toks[2] ~ /^\//) {
+                        curcwd = toks[2]
+                    } else if (curcwd != "") {
+                        curcwd = curcwd "/" toks[2]
+                    }
+                }
+                continue
+            }
+
+            if (toks[1] == "tee") {
+                for (j = 2; j <= m; j++) {
+                    if (toks[j] == "" || toks[j] ~ /^-/) continue
+                    print curcwd SEP toks[j]
+                }
+            } else if (toks[1] == "sed") {
+                has_i = 0
+                nf = 0
+                delete nfargs
+                for (j = 2; j <= m; j++) {
+                    if (toks[j] ~ /^-i/) has_i = 1
+                    if (toks[j] ~ /^-/) continue
+                    if (toks[j] == "") continue
+                    nf++
+                    nfargs[nf] = toks[j]
+                }
+                if (has_i && nf >= 2) {
+                    for (j = 2; j <= nf; j++) print curcwd SEP nfargs[j]
+                }
+            } else if (toks[1] == "cp" || toks[1] == "mv") {
+                nf = 0
+                delete nfargs
+                for (j = 2; j <= m; j++) {
+                    if (toks[j] ~ /^-/) continue
+                    if (toks[j] == "") continue
+                    nf++
+                    nfargs[nf] = toks[j]
+                }
+                if (nf >= 2) print curcwd SEP nfargs[nf]
+            }
+
+            # >/>>  redirection — token-boundary detection only (never a
+            # mid-token char scan), so scanning stays anchored to whitespace
+            # boundaries rather than manufacturing a target out of a `>`
+            # sitting inside an already-multi-char token.
+            for (j = 1; j <= m; j++) {
+                t = toks[j]
+                if (t == "") continue
+                if (t ~ /^[0-9]*>>?$/) {
+                    # Bare operator token. Dup-to-fd (`> &1`) is recognized by
+                    # the NEXT token starting with `&` and excluded.
+                    if (j + 1 <= m && toks[j+1] != "" && toks[j+1] !~ /^&/) {
+                        print curcwd SEP toks[j+1]
+                    }
+                    continue
+                }
+                if (t ~ /^[0-9]*>>?[^ \t&]/) {
+                    # Attached form (`>file`, `2>file`, `>>file`).
+                    op = t
+                    sub(/^[0-9]*>>?/, "", op)
+                    if (op != "") print curcwd SEP op
+                }
+            }
+        }
+    }'
+}
+
 normalize_abs_path() {
     # Lexically normalize an ABSOLUTE path without touching the filesystem:
     #   - collapse duplicate slashes    (//etc        -> /etc)
@@ -1498,6 +1700,100 @@ if echo "$COMMAND" | grep -qE 'rm[[:space:]]+-[a-zA-Z]*[rf]'; then
             fi
         fi
     done
+fi
+
+# =============================================================================
+# BASH-TOOL WRITE CONFINEMENT — worktree isolation for `>`/`>>`/tee/sed -i/
+# cp/mv (issue #4178)
+#
+# guard-worktree-paths.sh confines Edit/Write tool calls to a builder's issue
+# worktree, but the Bash tool has no equivalent confinement — a session denied
+# on Edit/Write could fall back to a Bash write and land the same edit in the
+# main checkout (the #4178 incident: sweep #4063 escaped this way and edited
+# live guard hooks in the main checkout while its own worktree stayed clean).
+#
+# Gated by the SAME toggle as guard-worktree-paths.sh
+# (guards.worktreeIsolation / LOOM_GUARD_WORKTREE_ISOLATION,
+# worktree_isolation_guard_enabled() above) and only denies when a managed
+# worktree actually exists somewhere for this repo — exactly the
+# path_derived_allow() logic in guard-worktree-paths.sh, reimplemented here
+# because this is a separate Bash-matcher hook with its own fail-open
+# contract. A cheap substring pre-check keeps the segmenter off the hot path
+# for the vast majority of Bash calls that contain none of the recognized
+# write idioms at all.
+# =============================================================================
+if worktree_isolation_guard_enabled && \
+   { [[ "$COMMAND_ASK_SCAN" == *">"* ]] || [[ "$COMMAND_ASK_SCAN" == *"tee"* ]] || \
+     [[ "$COMMAND_ASK_SCAN" == *"sed"* ]] || [[ "$COMMAND_ASK_SCAN" == *"cp "* ]] || \
+     [[ "$COMMAND_ASK_SCAN" == *"mv "* ]]; }; then
+    _WT_WRITE_BASE=""
+    _WT_WRITE_BASE_DONE=""
+
+    # Derive the TRUE main-checkout root — NOT REPO_ROOT. REPO_ROOT is resolved
+    # via `git rev-parse --show-toplevel`, which returns the *worktree* root when
+    # CWD is a linked worktree (the canonical builder setup: `cd
+    # .loom/worktrees/issue-N`). Keying the "resolves inside the main checkout"
+    # test below on REPO_ROOT would therefore miss an absolute-path (or
+    # `cd $MAIN && …`) Bash write into the main checkout issued from a builder's
+    # own worktree — the exact "denied on Edit/Write → retry via Bash" escape
+    # this block exists to close (#4178). Mirror the sibling guard
+    # guard-worktree-paths.sh: `--git-common-dir/..` is always the main checkout,
+    # from a worktree or not. `pwd -P` resolves symlinks so it matches the
+    # git-resolved forms consistently (and sidesteps the macOS
+    # /tmp -> /private/tmp mismatch vs. normalize_abs_path's lexical-only form).
+    # Fail open to REPO_ROOT if the git resolution is unavailable.
+    _WT_MAIN_ROOT=""
+    if [[ -n "$CWD" && -d "$CWD" ]]; then
+        _wt_common=$(cd "$CWD" 2>/dev/null && git rev-parse --git-common-dir 2>/dev/null) || _wt_common=""
+        if [[ -n "$_wt_common" ]]; then
+            _WT_MAIN_ROOT=$(cd "$CWD" 2>/dev/null && cd "$_wt_common/.." 2>/dev/null && pwd -P) || _WT_MAIN_ROOT=""
+        fi
+    fi
+    [[ -n "$_WT_MAIN_ROOT" ]] || _WT_MAIN_ROOT="$REPO_ROOT"
+
+    WRITE_TARGETS=$(extract_write_targets "$COMMAND_ASK_SCAN" "$CWD" | head -20)
+    while IFS=$'\037' read -r _wcwd _wtarget; do
+        [[ -z "$_wtarget" ]] && continue
+
+        # Resolve to absolute; a relative target with no resolvable cwd is
+        # ambiguous — skip it (allow on uncertainty, never deny on it).
+        _wabs=""
+        if [[ "$_wtarget" == /* ]]; then
+            _wabs="$_wtarget"
+        elif [[ -n "$_wcwd" ]]; then
+            _wabs="$_wcwd/$_wtarget"
+        else
+            continue
+        fi
+        _wabs=$(normalize_abs_path "$_wabs")
+
+        # (a) Already inside some managed worktree -> allow. This is exactly
+        # where a builder is supposed to write.
+        _in_any_managed_worktree "$_wabs" && continue
+
+        # Not under any worktree. If it's also not under the main checkout,
+        # there is nothing this guard protects (e.g. /tmp scratch) -> allow.
+        [[ -z "$_WT_MAIN_ROOT" ]] && continue
+        case "$_wabs" in
+            "$_WT_MAIN_ROOT"|"$_WT_MAIN_ROOT"/*) : ;;
+            *) continue ;;
+        esac
+
+        # Target resolves inside the main checkout and outside every
+        # worktree. Deny only if worktree isolation is actually in play for
+        # this repo/session (a managed worktree exists somewhere); otherwise
+        # fail open — a repo/session that has never created a worktree is
+        # unaffected, mirroring guard-worktree-paths.sh exactly. The worktree
+        # base is resolved off the same main-checkout root so the "a managed
+        # worktree exists" gate stays consistent with the containment test.
+        if [[ -z "$_WT_WRITE_BASE_DONE" ]]; then
+            _WT_WRITE_BASE=$(resolve_worktree_root "$_WT_MAIN_ROOT")
+            _WT_WRITE_BASE_DONE=1
+        fi
+        if _any_managed_worktree_exists "$_WT_WRITE_BASE"; then
+            deny "BLOCKED: Bash-tool write to '${_wabs}' resolves to the main repository checkout ('${_WT_MAIN_ROOT}'), but a Loom-managed worktree exists for this session. This is a worktree-isolation bypass via Bash redirection/tee/sed -i/cp/mv — do NOT retry the write through Bash. cd into your issue worktree (.loom/worktrees/issue-<N>) and write there instead. (#4178)" "worktree-write-confinement"
+        fi
+    done <<< "$WRITE_TARGETS"
 fi
 
 # =============================================================================

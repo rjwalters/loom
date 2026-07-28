@@ -127,6 +127,19 @@ else
     fail "deny reason explains main-checkout + worktree contract (got: $reason)"
 fi
 
+# --- deny reason warns against the Bash-redirection bypass (#4178) ---------
+# The reason must explicitly steer away from retrying via Bash (>, tee, sed -i,
+# cp/mv) -- that bypass is exactly what sweep #4063 used, and the same target
+# is independently confined by guard-destructive-generic.sh's write-
+# confinement category. Belt-and-suspenders: this asserts the Edit/Write
+# guard's message CARRIES the warning; the Bash-side confinement is covered by
+# tests/hooks/test-guard-destructive.sh.
+if [[ "$reason" == *"Bash"* ]]; then
+    pass "deny reason warns against retrying via Bash redirection (#4178)"
+else
+    fail "deny reason warns against retrying via Bash redirection (#4178) (got: $reason)"
+fi
+
 # --- fail-open: no sentinel anywhere -----------------------------------
 rm -rf "$TMPROOT/.loom/worktrees"
 result=$(run_hook "$TMPROOT/CLAUDE.md")

@@ -2029,6 +2029,151 @@ fi
 echo ""
 
 # =========================================================================
+echo -e "${YELLOW}--- Bash-tool write confinement (guards.worktreeIsolation / LOOM_GUARD_WORKTREE_ISOLATION, #4178) ---${NC}"
+# =========================================================================
+#
+# guard-worktree-paths.sh confines Edit/Write tool calls to a builder's issue
+# worktree, but the Bash tool had no equivalent -- `>`/`>>` redirection, `tee`,
+# `sed -i`, `cp`/`mv` all write files without going through Edit/Write. Sweep
+# #4063 used exactly this escape to edit live guard hooks in the main checkout
+# while its own worktree stayed clean (see issue #4178's root-cause writeup:
+# the guard denied 10x on the Edit/Write path, then the escaped edits landed
+# in the silent window that followed via a Bash write instead).
+#
+# Fixture: an isolated throwaway git repo (its own REPO_ROOT / MAIN_ROOT, so
+# these tests never touch the real Loom checkout) with a managed worktree at
+# <repo>/.loom/worktrees/issue-1 (the `.loom-managed` sentinel worktree.sh
+# writes at every worktree root).
+
+# Create a throwaway git repo with a fixture managed worktree
+# (<repo>/.loom/worktrees/issue-1/.loom-managed) and an optional
+# .loom/config.json. Echoes the repo path.
+make_wt_repo() {
+    local config_json="${1:-}"
+    local dir
+    dir=$(mktemp -d 2>/dev/null)
+    # Canonicalize: on macOS, mktemp -d returns a path under the /var/folders
+    # symlink whose real target is /private/var/folders. The guard resolves
+    # REPO_ROOT via `git rev-parse --show-toplevel`, which returns the
+    # SYMLINK-RESOLVED form — so comparing an unresolved dir against it would
+    # spuriously mismatch (the guard would see the write as "outside the main
+    # checkout" and allow it). `cd ... && pwd -P` resolves symlinks the same
+    # way the guard's own git-based resolution does.
+    dir=$(cd "$dir" && pwd -P)
+    git -C "$dir" init -q >/dev/null 2>&1
+    mkdir -p "$dir/.loom/worktrees/issue-1/src" "$dir/defaults/hooks"
+    : > "$dir/.loom/worktrees/issue-1/.loom-managed"
+    if [[ -n "$config_json" ]]; then
+        mkdir -p "$dir/.loom"
+        printf '%s' "$config_json" > "$dir/.loom/config.json"
+    fi
+    echo "$dir"
+}
+
+# Create a throwaway git repo with a REAL linked git worktree (via `git
+# worktree add`) at <repo>/.loom/worktrees/issue-1, carrying a `.loom-managed`
+# sentinel. Unlike make_wt_repo (a plain subdirectory), a linked worktree
+# exercises the show-toplevel vs. git-common-dir divergence: from inside the
+# worktree, `git rev-parse --show-toplevel` returns the *worktree* root while
+# `--git-common-dir/..` returns the *main* checkout. Echoes the repo path.
+make_wt_repo_linked() {
+    local dir
+    dir=$(mktemp -d 2>/dev/null)
+    dir=$(cd "$dir" && pwd -P)
+    git -C "$dir" init -q >/dev/null 2>&1
+    git -C "$dir" -c user.email=loom@test -c user.name=loom \
+        commit -q --allow-empty -m init >/dev/null 2>&1
+    mkdir -p "$dir/defaults/hooks" "$dir/.loom/worktrees"
+    git -C "$dir" worktree add -q "$dir/.loom/worktrees/issue-1" \
+        -b feature/issue-1 >/dev/null 2>&1
+    mkdir -p "$dir/.loom/worktrees/issue-1/src"
+    : > "$dir/.loom/worktrees/issue-1/.loom-managed"
+    echo "$dir"
+}
+
+WT_REPO=$(make_wt_repo)
+WT_DIR="$WT_REPO/.loom/worktrees/issue-1"
+
+assert_deny "write-confinement: echo > main-checkout path denies" \
+    "echo x > $WT_REPO/defaults/hooks/f.sh" "$WT_REPO"
+assert_deny "write-confinement: echo >> (append) main-checkout path denies" \
+    "echo x >> $WT_REPO/defaults/hooks/f.sh" "$WT_REPO"
+assert_deny "write-confinement: tee main-checkout path denies" \
+    "echo x | tee $WT_REPO/f" "$WT_REPO"
+assert_deny "write-confinement: sed -i on main-checkout path denies" \
+    "sed -i 's/a/b/' $WT_REPO/f" "$WT_REPO"
+assert_deny "write-confinement: cp destination in main checkout denies" \
+    "cp /tmp/a.sh $WT_REPO/defaults/hooks/f.sh" "$WT_REPO"
+assert_deny "write-confinement: mv destination in main checkout denies" \
+    "mv /tmp/a.sh $WT_REPO/defaults/hooks/f.sh" "$WT_REPO"
+assert_deny "write-confinement: heredoc cat > main-checkout path denies" \
+    "cat > $WT_REPO/defaults/hooks/f.sh <<EOF
+hello
+EOF" "$WT_REPO"
+assert_deny "write-confinement: relative target + cwd at main root denies" \
+    "echo x > defaults/hooks/f.sh" "$WT_REPO"
+
+assert_allow "write-confinement: echo > target inside the managed worktree allows" \
+    "echo x > $WT_DIR/src/f.sh" "$WT_REPO"
+assert_allow "write-confinement: tee target inside the managed worktree allows" \
+    "echo x | tee $WT_DIR/src/f.sh" "$WT_REPO"
+assert_allow "write-confinement: echo > target in /tmp allows" \
+    "echo x > /tmp/loom-test-$$-f.sh" "$WT_REPO"
+assert_allow "write-confinement: cd <worktree> && echo > relative target allows" \
+    "cd $WT_DIR && echo x > f.sh" "$WT_REPO"
+
+# No managed worktree anywhere -> fail open (allow).
+WT_REPO_NOWT=$(make_wt_repo)
+rm -rf "$WT_REPO_NOWT/.loom/worktrees"
+assert_allow "write-confinement: no managed worktree anywhere -> allow (fail-open)" \
+    "echo x > $WT_REPO_NOWT/defaults/hooks/f.sh" "$WT_REPO_NOWT"
+
+# Toggle opt-out: guards.worktreeIsolation:false / LOOM_GUARD_WORKTREE_ISOLATION=0.
+WT_REPO_OFF=$(make_wt_repo '{"guards":{"worktreeIsolation":false}}')
+assert_allow "write-confinement: guards.worktreeIsolation:false -> allow at main root" \
+    "echo x > $WT_REPO_OFF/defaults/hooks/f.sh" "$WT_REPO_OFF"
+assert_allow_env "write-confinement: LOOM_GUARD_WORKTREE_ISOLATION=0 -> allow at main root" \
+    "LOOM_GUARD_WORKTREE_ISOLATION=0" "echo x > $WT_REPO/defaults/hooks/f.sh" "$WT_REPO"
+assert_deny_env "write-confinement: LOOM_GUARD_WORKTREE_ISOLATION=1 overrides config-off -> deny" \
+    "LOOM_GUARD_WORKTREE_ISOLATION=1" "echo x > $WT_REPO_OFF/defaults/hooks/f.sh" "$WT_REPO_OFF"
+
+# False-positive guard: a `>` quoted inside a -m/--body value must NOT be
+# read as a redirection target (COMMAND_ASK_SCAN redaction, mirrors #3679).
+assert_allow "write-confinement: '>' inside a quoted -m value is not a target" \
+    "git commit -m \"if (a > b) then something\"" "$WT_REPO"
+# fd-dup (2>&1) is not a file write and must not manufacture a phantom target.
+assert_allow "write-confinement: fd-dup 2>&1 is not treated as a file write" \
+    "echo x 2>&1 | tee /tmp/loom-test-$$-log" "$WT_REPO"
+
+# -------------------------------------------------------------------------
+# Regression (#4210): CWD is the builder's own LINKED worktree, and the write
+# targets the MAIN checkout by absolute path (or via `cd $MAIN`). This is the
+# canonical builder setup (`cd .loom/worktrees/issue-N`). The guard must key
+# its "inside the main checkout" test on the true main root
+# (--git-common-dir/..), NOT on `git rev-parse --show-toplevel` (which returns
+# the worktree root from a linked worktree) — otherwise a main-checkout write
+# from a worktree CWD slips through as ALLOW, leaving the headline #4178
+# protection open in exactly the configuration it is meant to cover.
+WT_REPO_LINKED=$(make_wt_repo_linked)
+WT_LINKED_DIR="$WT_REPO_LINKED/.loom/worktrees/issue-1"
+assert_deny "write-confinement: CWD=linked worktree, abs main-checkout write denies (#4210)" \
+    "echo x > $WT_REPO_LINKED/defaults/hooks/f.sh" "$WT_LINKED_DIR"
+assert_deny "write-confinement: CWD=linked worktree, cd \$MAIN && relative main write denies (#4210)" \
+    "cd $WT_REPO_LINKED && echo x > defaults/hooks/f.sh" "$WT_LINKED_DIR"
+assert_deny "write-confinement: CWD=linked worktree, sed -i on abs main-checkout path denies (#4210)" \
+    "sed -i 's/a/b/' $WT_REPO_LINKED/defaults/hooks/f.sh" "$WT_LINKED_DIR"
+# Sibling-allow checks from the same worktree CWD: writing inside the worktree
+# and to /tmp must still be permitted (no over-blocking from the new main root).
+assert_allow "write-confinement: CWD=linked worktree, write inside the worktree allows (#4210)" \
+    "echo x > $WT_LINKED_DIR/src/f.sh" "$WT_LINKED_DIR"
+assert_allow "write-confinement: CWD=linked worktree, write to /tmp allows (#4210)" \
+    "echo x > /tmp/loom-test-$$-linked.sh" "$WT_LINKED_DIR"
+
+rm -rf "$WT_REPO" "$WT_REPO_NOWT" "$WT_REPO_OFF" "$WT_REPO_LINKED"
+
+echo ""
+
+# =========================================================================
 echo -e "${YELLOW}--- Performance check ---${NC}"
 # =========================================================================
 

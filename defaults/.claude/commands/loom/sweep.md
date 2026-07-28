@@ -1502,7 +1502,18 @@ Each builder is responsible for:
 
 **Await all builders in the wave** before proceeding to Judge. Collect each builder's PR number (or failure marker). This await is **mandatory and explicit** — block on every builder's `TaskOutput` / completion notification. The harness may launch each Task async regardless of `run_in_background: false`, so proceeding to Judge on a dispatch flag alone can start Judge before builders finish; the "await all builders before Judge" rule is enforced by this explicit block, not by any dispatch flag (see "Subagent dispatch is async-only", #3822).
 
-**Backstop: verify the main worktree is clean after the builders return (#3513).** A builder subagent runs without `LOOM_WORKTREE_PATH` injected, so the `guard-worktree-paths.sh` hook does not fire on this path. If a builder used repo-relative paths after a cwd reset, it may have written to the **main** worktree instead of its issue worktree. After the wave's builders return and before advancing any PR to Judge, run:
+**Assert the Builder's cwd before it edits anything.** Before the Builder
+subagent prompt does any Write/Edit/Bash file mutation, it MUST capture
+`WORKTREE_ABS="$(cd .loom/worktrees/issue-N && pwd)"` and verify both: the
+`.loom-managed` sentinel is present at `$WORKTREE_ABS`, and `git -C
+"$WORKTREE_ABS" rev-parse --show-toplevel` equals `$WORKTREE_ABS` — then use
+`$WORKTREE_ABS` (never a bare repo-relative path) for every subsequent
+file-mutating call, Write/Edit or Bash alike (see `builder.md` → "Pre-Work
+Validation" / "Validation Checklist", #4178). A denied write is never a signal
+to retry the same target through a different tool (Edit/Write vs. Bash) — see
+below.
+
+**Backstop: verify the main worktree is clean after the builders return (#3513).** A builder subagent is dispatched via the Task tool ("one level deep", step 4 above) and inherits the orchestrator's single shared process env, which has **no** `LOOM_WORKTREE_PATH` — the Task tool exposes no per-subagent env-injection parameter (#3719). `guard-worktree-paths.sh`'s path-derived fallback (#4007) DOES fire on this path regardless — it denies an Edit/Write target resolving into the main checkout while any managed worktree exists, with no env var required — and `guard-destructive-generic.sh` extends the identical confinement to the common Bash-tool write idioms (`>`/`>>` redirection, `tee`, `sed -i`, `cp`/`mv`, #4178, closing the escape sweep #4063 used: a write denied on Edit/Write retried through Bash instead). Despite that guard coverage, this `check-main-clean.sh` backstop stays load-bearing — it is a whole-tree status check, not an idiom scan, so it catches anything the guards' heuristics don't recognize (e.g. an interpreter one-liner like `python -c`, deliberately out of scope for #4178's pattern list) or a write that landed before any worktree existed. After the wave's builders return and before advancing any PR to Judge, run:
 
 ```bash
 ./.loom/scripts/check-main-clean.sh --baseline "$MAIN_CLEAN_BASELINE"   # exit 3 ⇒ NEW main dirt (builder contamination)
@@ -1510,7 +1521,7 @@ Each builder is responsible for:
 
 The `--baseline` argument points at the snapshot taken once at step 0 (before wave 1). With it, the check subtracts any dirt that predated the sweep and exits `3` **only** on changes that appeared after the snapshot — so pre-existing working-tree dirt (a regenerated lockfile, an operator scratch edit) no longer false-positives as contamination on every wave (#3648). If the baseline file is missing or unreadable, the check warns and falls back to the whole-status hard-fail (fail-safe).
 
-If it exits `3`, the main worktree carries **new** uncommitted changes a builder left behind. Surface this loudly in the wave summary — **quote the specific offending paths** the check printed under `Offending changes:` so the operator can see exactly which files escaped a worktree — and **hard-block the wave from advancing any PR to Judge** until the contamination is investigated and the stray changes reverted (move them into the owning issue worktree, then restore main). This is a backstop only — the builder guidance (capture the absolute worktree path once, use absolute paths everywhere) is the primary defense. Note the mechanical reason it is *only* a backstop: a builder subagent is dispatched via the Task tool ("one level deep", step 4 above) and inherits the orchestrator's single shared process env, which has **no** `LOOM_WORKTREE_PATH` — and the Task tool exposes no per-subagent env-injection parameter — so `guard-worktree-paths.sh` structurally cannot fire per builder on this path (#3719; same-shape harness limitation as #3705). Detection here plus the builder-side absolute-path contract are the achievable defenses.
+If it exits `3`, the main worktree carries **new** uncommitted changes a builder left behind. Surface this loudly in the wave summary — **quote the specific offending paths** the check printed under `Offending changes:` so the operator can see exactly which files escaped a worktree — and **hard-block the wave from advancing any PR to Judge** until the contamination is investigated and the stray changes reverted (move them into the owning issue worktree, then restore main). The guard-hook denials plus the cwd-assertion prompt discipline above are the primary defense; this status check is the backstop that catches whatever they miss.
 
 **On successful PR creation**, write the `builder-done` checkpoint for that issue (record the PR number):
 ```bash
