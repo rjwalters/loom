@@ -91,6 +91,7 @@ use crate::cpu_headroom::{
 use crate::disk_headroom::disk_headroom_limit;
 use crate::event_bus::EventBus;
 use crate::main_health_gate::{MainHealthState, WorkspaceHealthStates};
+use crate::sweep_registry::OpenPrDispatchError;
 use crate::tokens::token_pool_size;
 use crate::types::Event;
 use crate::workspace_pool::WorkspacePool;
@@ -389,6 +390,14 @@ pub struct TickReport {
     /// (Issue #3939). Filtered out before the concurrency budget is allocated, so
     /// a quarantined candidate never consumes a shared dispatch slot.
     pub skipped_quarantined: usize,
+    /// Issues skipped because they already have an **open** linked PR (Issue
+    /// #4123 open-PR dispatch guard). `dispatch()` refuses these with the typed
+    /// [`OpenPrDispatchError`]; the finder attributes that refusal here rather
+    /// than to [`errors`](Self::errors) so a duplicate-work skip is visible and
+    /// distinct from a real dispatch failure. Every in-memory dedup signal dies
+    /// with the parent sweep, so without this guard an issue whose approved PR is
+    /// still open would be re-dispatched the moment its sweep exits.
+    pub skipped_pr_open: usize,
     /// Dispatch attempts that returned an error (logged, non-fatal).
     pub errors: usize,
     /// Cumulative cross-host dispatch collisions observed (Issue #4085, Phase 0
@@ -497,8 +506,21 @@ pub fn tick(
                 report.skipped_in_flight += 1;
             }
             Err(e) => {
-                report.errors += 1;
-                log::warn!("work_finder: dispatch for issue #{} failed: {e}", item.number);
+                // Open-PR guard refusal (#4123) is a *skip*, not a failure:
+                // attribute it to its own counter so it stays visible and
+                // distinct from a real dispatch error. Typed downcast, never a
+                // string match.
+                if e.downcast_ref::<OpenPrDispatchError>().is_some() {
+                    report.skipped_pr_open += 1;
+                    log::info!(
+                        "work_finder: skipping issue #{} — it already has an open linked PR \
+                         (#4123 open-PR guard)",
+                        item.number
+                    );
+                } else {
+                    report.errors += 1;
+                    log::warn!("work_finder: dispatch for issue #{} failed: {e}", item.number);
+                }
             }
         }
     }
@@ -737,8 +759,19 @@ pub fn tick_multi<S: WorkSource, D: WorkDispatcher>(
                 report.skipped_in_flight += 1;
             }
             Err(e) => {
-                report.errors += 1;
-                log::warn!("work_finder: dispatch for issue #{} failed: {e}", cand.number);
+                // Open-PR guard refusal (#4123) — see the single-workspace
+                // `tick` for the rationale. A skip, not a failure.
+                if e.downcast_ref::<OpenPrDispatchError>().is_some() {
+                    report.skipped_pr_open += 1;
+                    log::info!(
+                        "work_finder: skipping issue #{} — it already has an open linked PR \
+                         (#4123 open-PR guard)",
+                        cand.number
+                    );
+                } else {
+                    report.errors += 1;
+                    log::warn!("work_finder: dispatch for issue #{} failed: {e}", cand.number);
+                }
             }
         }
     }
@@ -1149,20 +1182,24 @@ where
                         log::info!("work_finder: main-health gate cleared — resuming dispatch");
                     }
                     was_halted = report.halted;
-                    if report.dispatched > 0 || report.errors > 0 || report.skipped_quarantined > 0
+                    if report.dispatched > 0
+                        || report.errors > 0
+                        || report.skipped_quarantined > 0
+                        || report.skipped_pr_open > 0
                     {
                         log::info!(
                             "work_finder: tick — cap {max_concurrent} (pool={pool_size}, \
                              healthy={token_limit}, per_token={per_token_concurrency}, disk={disk}, \
                              cpu={cpu}, ceiling={configured_max}); \
                              {} seen, {} dispatched, {} labeled-skip, {} in-flight-skip, \
-                             {} quarantine-skip, {} deferred, {} error(s), \
+                             {} quarantine-skip, {} pr-open-skip, {} deferred, {} error(s), \
                              {} cross-host-collision(s)",
                             report.seen,
                             report.dispatched,
                             report.skipped_labeled,
                             report.skipped_in_flight,
                             report.skipped_quarantined,
+                            report.skipped_pr_open,
                             report.deferred_capacity,
                             report.errors,
                             report.collisions
@@ -1350,13 +1387,17 @@ pub fn spawn_multi_work_finder_task(
             }
             was_halted = report.halted;
 
-            if report.dispatched > 0 || report.errors > 0 || report.skipped_quarantined > 0 {
+            if report.dispatched > 0
+                || report.errors > 0
+                || report.skipped_quarantined > 0
+                || report.skipped_pr_open > 0
+            {
                 log::info!(
                     "work_finder: tick — cap {max_concurrent} (pool={pool_size}, \
                      healthy={token_limit}, per_token={per_token_concurrency}, disk={disk}, \
                      cpu={cpu}, ceiling={configured_max}); {} workspace(s), \
                      {} seen, {} dispatched, {} labeled-skip, {} in-flight-skip, \
-                     {} quarantine-skip, {} deferred, {} error(s), \
+                     {} quarantine-skip, {} pr-open-skip, {} deferred, {} error(s), \
                      {} cross-host-collision(s)",
                     pairs.len(),
                     report.seen,
@@ -1364,6 +1405,7 @@ pub fn spawn_multi_work_finder_task(
                     report.skipped_labeled,
                     report.skipped_in_flight,
                     report.skipped_quarantined,
+                    report.skipped_pr_open,
                     report.deferred_capacity,
                     report.errors,
                     report.collisions
@@ -1721,6 +1763,9 @@ mod tests {
         noop_issues: HashSet<u32>,
         /// Issue numbers whose dispatch should error.
         fail_issues: HashSet<u32>,
+        /// Issue numbers whose dispatch should be refused by the open-PR guard
+        /// (#4123) — the dispatcher returns the typed [`OpenPrDispatchError`].
+        pr_open_issues: HashSet<u32>,
         /// Issue numbers this dispatcher reports as quarantined (Issue #3939).
         quarantined: HashSet<u32>,
         /// Cumulative cross-host collision count this dispatcher reports (#4085).
@@ -1738,6 +1783,11 @@ mod tests {
             self.collisions
         }
         fn dispatch(&mut self, issue: u32) -> Result<bool> {
+            if self.pr_open_issues.contains(&issue) {
+                // Mirror the production `SweepRegistry::dispatch` open-PR guard:
+                // refuse with the typed, downcast-matchable error (#4123).
+                return Err(OpenPrDispatchError { issue, pr: 9999 }.into());
+            }
             if self.fail_issues.contains(&issue) {
                 anyhow::bail!("forced dispatch failure for #{issue}");
             }
@@ -2064,6 +2114,63 @@ exit 0
         assert_eq!(report.dispatched, 2);
         assert_eq!(report.errors, 1);
         assert_eq!(disp.dispatched, vec![1, 3]);
+    }
+
+    #[test]
+    fn test_tick_open_pr_refusal_counts_as_pr_open_skip_not_error() {
+        // #2 has an open linked PR: `dispatch()` refuses with the typed
+        // OpenPrDispatchError, which the finder attributes to `skipped_pr_open`
+        // — NOT `errors` — while its siblings dispatch normally (#4123).
+        let mut source = FakeSource::once(vec![issue(1), issue(2), issue(3)]);
+        let mut disp = RecordingDispatcher {
+            pr_open_issues: HashSet::from([2]),
+            ..Default::default()
+        };
+        let report = tick(&mut source, &mut disp, 10, false).unwrap();
+
+        assert_eq!(report.skipped_pr_open, 1, "#2's open-PR refusal is a pr-open-skip");
+        assert_eq!(report.errors, 0, "an open-PR skip is never a dispatch error");
+        assert_eq!(report.dispatched, 2, "#1 and #3 still dispatch");
+        assert_eq!(disp.dispatched, vec![1, 3], "#2 never dispatched");
+    }
+
+    #[test]
+    fn test_tick_skip_only_pr_open_tick_is_reported() {
+        // A tick whose ONLY outcome is a pr-open-skip must still surface a
+        // non-empty report (dispatched == 0, errors == 0) — the counter carries
+        // the visibility, and the tick-log gate includes `skipped_pr_open` so
+        // such a tick is no longer silent (#4123).
+        let mut source = FakeSource::once(vec![issue(5)]);
+        let mut disp = RecordingDispatcher {
+            pr_open_issues: HashSet::from([5]),
+            ..Default::default()
+        };
+        let report = tick(&mut source, &mut disp, 10, false).unwrap();
+
+        assert_eq!(report.dispatched, 0);
+        assert_eq!(report.errors, 0);
+        assert_eq!(report.skipped_pr_open, 1);
+        assert!(disp.dispatched.is_empty(), "nothing dispatched on a skip-only tick");
+    }
+
+    #[test]
+    fn test_tick_multi_open_pr_refusal_counts_as_pr_open_skip() {
+        // The multi-workspace path attributes the open-PR refusal the same way
+        // as the single-workspace `tick` (#4123): the epic supervisor and
+        // watchdogs route through the same `dispatch()` seam, so this coverage
+        // matches the guard's placement.
+        let src_a = FakeSource::once(vec![issue(1), issue(2)]);
+        let disp_a = RecordingDispatcher {
+            pr_open_issues: HashSet::from([2]),
+            ..Default::default()
+        };
+        let mut pairs: Vec<(FakeSource, RecordingDispatcher)> = vec![(src_a, disp_a)];
+        let report = tick_multi(&mut pairs, &[], 10, &[false]);
+
+        assert_eq!(report.skipped_pr_open, 1);
+        assert_eq!(report.errors, 0);
+        assert_eq!(report.dispatched, 1);
+        assert_eq!(pairs[0].1.dispatched, vec![1]);
     }
 
     #[test]
