@@ -50,6 +50,14 @@ use crate::init::InitReport;
 /// placeholder is the Claude-Code *runtime* token `{{workspace}}`, which is NOT
 /// install-time substituted, so shipped bytes are identical across consumers
 /// and the content-hash gate is exact.
+///
+/// `.claude/agents/loom-shepherd.md` — every version shipped from #1259/#1264
+/// (initial subagent files) through #3871 (last edit before the v0.10.0
+/// shepherd/daemon deletion in #3884 removed it outright). Unlike
+/// `.loom/{roles,scripts,hooks,docs}`, which are cleaned before re-copy on
+/// reinstall, `.claude/` is merge-copied with no orphan removal — so a
+/// consumer who installed pre-#3884 keeps a dangling copy pointing at the
+/// (also removed) `.loom/roles/shepherd.md` forever unless swept here (#4097).
 pub const RETIRED_FILES: &[(&str, &str)] = &[
     (
         ".claude/commands/loom/release.md",
@@ -94,6 +102,26 @@ pub const RETIRED_FILES: &[(&str, &str)] = &[
     (
         ".claude/commands/loom/release.md",
         "795c1df1d3f3706ba448482b037a0c9e4eb6272a719adb2688b9ddfc91ab4de6",
+    ),
+    (
+        ".claude/agents/loom-shepherd.md",
+        "1cbca10c8b0352fc3db636e0abb6fdf25ddcfb6138b7a21ab5faeb8b21f730a2",
+    ),
+    (
+        ".claude/agents/loom-shepherd.md",
+        "2be39b1d7978dbb3a8d502eaed2cfff9a8f9832aae801c8683a425405c0a2753",
+    ),
+    (
+        ".claude/agents/loom-shepherd.md",
+        "35830eb68c9ab3ad1cbeaf6ce2b62c7d919f3e06cc5234c46ad2c6c4f637c8ff",
+    ),
+    (
+        ".claude/agents/loom-shepherd.md",
+        "6c7e207a5f040675f31447427b4241999adab4d58831e8d5bc605c2ac5d500b2",
+    ),
+    (
+        ".claude/agents/loom-shepherd.md",
+        "8cfc89428135cb55c91a6ae768bbd3373dbe2a1d22eb088694bc158ce0091d34",
     ),
 ];
 
@@ -244,6 +272,70 @@ mod tests {
         assert!(report.removed.is_empty());
     }
 
+    const SHEPHERD_REL: &str = ".claude/agents/loom-shepherd.md";
+
+    /// Write `content` at `SHEPHERD_REL` under `workspace`, creating parents.
+    fn write_shepherd_md(workspace: &Path, content: &[u8]) {
+        let target = workspace.join(SHEPHERD_REL);
+        fs::create_dir_all(target.parent().unwrap()).unwrap();
+        fs::write(&target, content).unwrap();
+    }
+
+    #[test]
+    fn test_loom_shepherd_removed_when_digest_matches() {
+        // Drive the real allowlist (`RETIRED_FILES`) with a synthetic body whose
+        // digest is registered under SHEPHERD_REL, mirroring test_remove_on_match
+        // but for the second retired path added in #4097.
+        let digest = RETIRED_FILES
+            .iter()
+            .find(|(p, _)| *p == SHEPHERD_REL)
+            .map(|(_, h)| *h)
+            .expect("RETIRED_FILES must carry at least one loom-shepherd.md digest");
+        // We don't have the original bytes for a frozen historical digest handy
+        // in this test, so — as test_remove_on_match does for release.md — drive
+        // `cleanup_with_allowlist` directly with a synthetic allowlist whose
+        // digest equals the sha256 of content we control.
+        let temp = TempDir::new().unwrap();
+        let workspace = temp.path();
+        let content = b"a specific retired shepherd body\n";
+        write_shepherd_md(workspace, content);
+        let synthetic_digest = sha256_hex(content);
+        let allow: &[(&str, &str)] = &[(SHEPHERD_REL, synthetic_digest.as_str())];
+
+        let mut report = InitReport::default();
+        cleanup_with_allowlist(workspace, &mut report, allow);
+
+        assert!(
+            !workspace.join(SHEPHERD_REL).exists(),
+            "content byte-identical to a shipped loom-shepherd.md digest must be removed"
+        );
+        assert_eq!(report.removed, vec![SHEPHERD_REL.to_string()]);
+        assert!(report.preserved.is_empty());
+        // Sanity: the real allowlist does carry a loom-shepherd.md digest (the
+        // `find` above would already have panicked otherwise).
+        assert!(!digest.is_empty());
+    }
+
+    #[test]
+    fn test_loom_shepherd_preserved_when_modified() {
+        // A consumer-customized loom-shepherd.md (content matching no shipped
+        // digest) must survive cleanup, using the real allowlist via
+        // `cleanup_retired_files` — exercising both retired paths in one pass.
+        let temp = TempDir::new().unwrap();
+        let workspace = temp.path();
+        write_shepherd_md(workspace, b"a consumer's customized shepherd role\n");
+
+        let mut report = InitReport::default();
+        cleanup_retired_files(workspace, &mut report);
+
+        assert!(
+            workspace.join(SHEPHERD_REL).exists(),
+            "unmatched loom-shepherd.md content must be preserved"
+        );
+        assert_eq!(report.preserved, vec![SHEPHERD_REL.to_string()]);
+        assert!(report.removed.is_empty());
+    }
+
     #[test]
     fn test_absent_is_noop() {
         let temp = TempDir::new().unwrap();
@@ -338,8 +430,9 @@ mod tests {
              scripts/install-loom.sh.\n  Only in Rust: {only_rust:?}\n  Only in shell: {only_shell:?}\n\
              Update both surfaces together (append-only)."
         );
-        // Cardinality sanity: both sides carry the frozen 11 release.md digests.
-        assert_eq!(rust.len(), 11, "expected 11 frozen digests in the Rust const");
-        assert_eq!(shell.len(), 11, "expected 11 frozen digests in the shell heredoc");
+        // Cardinality sanity: both sides carry the frozen 11 release.md digests
+        // plus the 5 loom-shepherd.md digests added in #4097.
+        assert_eq!(rust.len(), 16, "expected 16 frozen digests in the Rust const");
+        assert_eq!(shell.len(), 16, "expected 16 frozen digests in the shell heredoc");
     }
 }
