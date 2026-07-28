@@ -153,8 +153,20 @@ consume:
 loom-tokens check                  # Probe + print human table
 loom-tokens check --ranking        # Probe + write .loom/tokens/.ranking atomically
 loom-tokens check --json           # Emit full JSON report to stdout
+loom-daemon tokens check --json    # Native Rust equivalent (issue #4108)
 ./.loom/scripts/probe-tokens.sh    # Cron-friendly wrapper for periodic invocation
 ```
+
+**`probe-tokens.sh` delegates to `loom-daemon tokens check`, not Python (#4080).**
+It resolves a `loom-daemon` binary (`$LOOM_DAEMON_BIN` → `loom-daemon` on PATH →
+build-output-relative candidates under the repo), capability-probes it with
+`tokens check --help` to detect a stale pre-#4108 binary, and `exec`s `tokens
+check "$@"` on success — the flags and exit codes above are unchanged either
+way. It falls back to `loom-tokens` on PATH (with a stderr warning) only when
+the resolved daemon binary predates the `tokens` subcommand, and exits `1` with
+an actionable message (naming `loom-daemon-start.sh` / `cargo build`) when
+neither is available. The historical `python3 -m loom_tools.tokens.cli`
+fallback tier has been removed entirely.
 
 The probe sends a minimal `POST /v1/messages` request (1 input, 1 output token)
 and parses rate-limit response headers. The header parser matches by **suffix**
@@ -170,11 +182,14 @@ are logged and skipped — one bad account does not abort the run.
 OAuth tokens shaped `sk-ant-oat01-*` are sent with `Authorization: Bearer` +
 `anthropic-beta: oauth-2025-04-20`; plain API keys use `x-api-key`.
 
-**The running `loom-daemon` self-refreshes `.ranking` (#3969)** — it runs the
-equivalent of `probe-tokens.sh --ranking` on its own periodic loop (default every
-10 minutes, `autonomous.tokenRankingRefresh` / `LOOM_TOKEN_RANKING_REFRESH*`, on
-by default since it is read-only probing with no dispatch side effect), so a
-standing cron for this is no longer required when the daemon is running. See
+**The running `loom-daemon` self-refreshes `.ranking` (#3969)** — it invokes
+**its own binary** (`std::env::current_exe()`) with `tokens check --ranking
+--workspace <repo_root>` on its own periodic loop (default every 10 minutes,
+`autonomous.tokenRankingRefresh` / `LOOM_TOKEN_RANKING_REFRESH*`, on by default
+since it is read-only probing with no dispatch side effect) — as of #4080 this
+is a direct daemon-to-daemon subcommand invocation, not a shell out to
+`probe-tokens.sh`, so a standing cron for this is no longer required when the
+daemon is running. See
 [Token-ranking self-refresh](daemon-reference.md#token-ranking-self-refresh-3969)
 for the config knobs.
 
