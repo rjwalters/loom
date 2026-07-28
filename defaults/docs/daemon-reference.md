@@ -195,11 +195,37 @@ Inputs:
   field is `#[serde(default)]` on the wire, so pre-#3729 clients remain
   compatible.
 - `workspace_root` (optional, issue #3929) — target managed-workspace root.
-  When omitted, the sweep is dispatched into the daemon's **default** workspace
-  (byte-for-byte unchanged). When set to a registered repo root, the daemon
-  resolves that repo's sweep registry via the `WorkspacePool` and dispatches into
-  its working tree — the way to dispatch into a managed repo other than the
-  default when two repos share issue numbers. `#[serde(default)]` on the wire.
+  When set to a registered repo root, the daemon resolves that repo's sweep
+  registry via the `WorkspacePool` and dispatches into its working tree — the
+  way to dispatch into a managed repo other than the default when two repos
+  share issue numbers. `#[serde(default)]` on the wire.
+
+  **When omitted (issue #4299):** the daemon no longer blindly targets its own
+  seeded default (cwd at startup / `LOOM_WORKSPACE`) — it consults the
+  on-disk `~/.loom/workspaces.json` registry (`WorkspaceRegistry::resolve_dispatch_root`,
+  `workspace_registry.rs`) in this order:
+  1. **Registry empty** -> the seeded default (byte-for-byte pre-#4299 / pre-registry
+     behavior).
+  2. **Seeded default is itself registered** -> the seeded default. This is the
+     back-compat floor: every existing multi-workspace host runs the daemon
+     from a registered repo, so a bare dispatch with no `workspace_root` keeps
+     working with no new flags.
+  3. **Seeded default is NOT registered, exactly one workspace is registered**
+     -> that workspace. This is the case a single-repo worker host (daemon cwd
+     = the machine checkout, one product repo registered) needs: the sole
+     registration is the only sane target.
+  4. **Seeded default is NOT registered, multiple workspaces are registered**
+     -> a structured `CONFIG_WORKSPACE_AMBIGUOUS` error naming every
+     registered root. Issue numbers are per-repo, so guessing which repo
+     "owns" issue N by probing the forge is ill-defined — an explicit
+     `workspace_root`/`--workspace` is required instead. Never a silent cwd
+     fallback.
+
+  This resolution applies to the **dispatch path only**. `list_sweeps`,
+  `get_sweep_status`, and quarantine requests keep their unconditional
+  default-registry fallback for an absent `workspace_root` — read-path default
+  behavior is unchanged (a deliberate scope limit; see the #4299 issue for the
+  follow-up if that also needs to change).
 
 #### `loom-daemon dispatch <issue>` — operator CLI (Issue #3952)
 
@@ -224,6 +250,15 @@ loom-daemon dispatch 3952 --depends-on 3945        # stacked-PR child (#3729)
 | `--model <M>` | `model` | omit to let the daemon resolve `autonomous.model` / the shipped default (#3944) |
 | `--effort <E>` | `effort` | reasoning-effort override (#3716) |
 | `--depends-on <P>` | `depends_on` | single parent issue; child branches off `feature/issue-<P>` (#3729) |
+
+**`--workspace` client-side cwd default (issue #4299).** When `--workspace` is
+omitted, the CLI itself (not the daemon — it cannot see the client's cwd)
+checks whether its own working directory falls under a registered workspace
+root and, if so, populates `workspace_root` with that root before sending the
+request (`resolve_cli_dispatch_workspace` in `main.rs`). This is what makes
+`cd ~/GitHub/anvil && loom-daemon dispatch 758` target anvil even when the
+daemon's own seeded default points elsewhere. A cwd outside every registered
+root leaves `--workspace` unset, and the daemon-side resolution above applies.
 
 **Bounded ack timeout (never hangs).** The CLI waits at most **30s** for the
 daemon to ack the dispatch, then exits **nonzero** with a clear
