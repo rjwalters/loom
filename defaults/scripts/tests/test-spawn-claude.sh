@@ -766,6 +766,185 @@ STUB
 fi
 
 # ============================================================
+# Section 6: claude-wrapper.sh script(1) calling convention (#4192)
+#
+# util-linux script(1) and BSD/macOS script(1) take their arguments in
+# incompatible orders. _run_via_script() (extracted from run_with_retry's
+# TTY branch specifically so it is unit-testable, #4192) selects the right
+# form via `script --version`. These tests exercise the extracted function
+# directly by sourcing the wrapper with CLAUDE_WRAPPER_SOURCE_ONLY=1 (which
+# suppresses the `main "$@"` CLI entry point), rather than going through
+# run_with_retry's `[ -t 0 ]` gate -- a test harness has no real TTY on
+# stdin to reach that branch.
+# ============================================================
+
+echo ""
+echo "Testing claude-wrapper.sh script(1) calling convention (#4192)..."
+
+CC_DIR="$(mktemp -d)"
+trap 'rm -rf "$TEST_WS" "$STUB_DIR" "$CC_DIR"' EXIT
+
+# Claude stub used by both branches: echoes each arg delimited, so embedded
+# spaces/quotes/newlines are unambiguously verifiable in the captured output.
+cat > "$CC_DIR/claude" <<'STUB'
+#!/usr/bin/env bash
+for a in "$@"; do
+    printf 'ARG<%s>\n' "$a"
+done
+STUB
+chmod +x "$CC_DIR/claude"
+
+# --- util-linux `script` stub: supports --version, records its own argv,
+#     and (matching real util-linux behavior) runs the `-c` command string
+#     via $SHELL, propagating exit status only when `-e` is present. ---
+UL_ARGV_FILE="$CC_DIR/ul-argv.txt"
+cat > "$CC_DIR/script-util-linux" <<STUB
+#!/usr/bin/env bash
+if [[ "\$1" == "--version" ]]; then
+    echo "script from util-linux 2.37.4"
+    exit 0
+fi
+: > "$UL_ARGV_FILE"
+for a in "\$@"; do
+    printf '%s\n' "\$a" >> "$UL_ARGV_FILE"
+done
+cmd=""
+prev=""
+for a in "\$@"; do
+    if [[ "\$prev" == "-c" ]]; then
+        cmd="\$a"
+    fi
+    prev="\$a"
+done
+file="\${*: -1}"
+"\${SHELL:-/bin/sh}" -c "\$cmd" > "\$file" 2>&1
+rc=\$?
+for a in "\$@"; do
+    if [[ "\$a" == "-e" ]]; then
+        exit \$rc
+    fi
+done
+exit 0
+STUB
+chmod +x "$CC_DIR/script-util-linux"
+mkdir -p "$CC_DIR/ul-bin"
+cp "$CC_DIR/script-util-linux" "$CC_DIR/ul-bin/script"
+cp "$CC_DIR/claude" "$CC_DIR/ul-bin/claude"
+
+# --- BSD/macOS `script` stub: no --version support (matches real BSD
+#     script's "illegal option" behavior on macOS), records argv, and runs
+#     the legacy `script -q FILE cmd args...` form. ---
+BSD_ARGV_FILE="$CC_DIR/bsd-argv.txt"
+cat > "$CC_DIR/script-bsd" <<STUB
+#!/usr/bin/env bash
+if [[ "\$1" == "--version" ]]; then
+    echo "script: illegal option -- -" >&2
+    exit 1
+fi
+: > "$BSD_ARGV_FILE"
+for a in "\$@"; do
+    printf '%s\n' "\$a" >> "$BSD_ARGV_FILE"
+done
+file="\$2"
+cmd_args=("\${@:3}")
+"\${cmd_args[@]}" > "\$file" 2>&1
+exit \$?
+STUB
+chmod +x "$CC_DIR/script-bsd"
+mkdir -p "$CC_DIR/bsd-bin"
+cp "$CC_DIR/script-bsd" "$CC_DIR/bsd-bin/script"
+cp "$CC_DIR/claude" "$CC_DIR/bsd-bin/claude"
+
+# Driver scripts (real files, not nested-quoted `bash -c` strings) so
+# multi-line/quoted test arguments don't have to survive several layers of
+# shell requoting.
+cat > "$CC_DIR/ul-driver.sh" <<'DRIVER'
+#!/usr/bin/env bash
+CLAUDE_WRAPPER_SOURCE_ONLY=1 source "$WRAPPER"
+set +e
+_run_via_script "$UL_OUT" claude "hello world" 'quote"inside' $'line1\nline2'
+echo "RC=$?"
+DRIVER
+
+cat > "$CC_DIR/ul-fail-driver.sh" <<'DRIVER'
+#!/usr/bin/env bash
+CLAUDE_WRAPPER_SOURCE_ONLY=1 source "$WRAPPER"
+set +e
+_run_via_script "$UL_OUT" bash -c "exit 7"
+echo "$?"
+DRIVER
+
+cat > "$CC_DIR/bsd-driver.sh" <<'DRIVER'
+#!/usr/bin/env bash
+CLAUDE_WRAPPER_SOURCE_ONLY=1 source "$WRAPPER"
+set +e
+_run_via_script "$BSD_OUT" claude "hello world" "--dangerously-skip-permissions"
+echo "RC=$?"
+DRIVER
+
+# ---- util-linux branch: composes `-q -e -c <quoted cmd>` and pins bash ----
+UL_OUT="$CC_DIR/ul-out.txt"
+ul_result=$(
+    PATH="$CC_DIR/ul-bin:$PATH" WRAPPER="$WRAPPER" UL_OUT="$UL_OUT" SHELL=/bin/zsh \
+        bash "$CC_DIR/ul-driver.sh" 2>&1
+)
+assert_contains "RC=0" "$ul_result" \
+    "util-linux branch: _run_via_script exits 0 on success (#4192)"
+
+ul_argv_1=$(sed -n '1p' "$UL_ARGV_FILE")
+ul_argv_2=$(sed -n '2p' "$UL_ARGV_FILE")
+ul_argv_3=$(sed -n '3p' "$UL_ARGV_FILE")
+ul_argv_4=$(sed -n '4p' "$UL_ARGV_FILE")
+assert_eq "-q" "$ul_argv_1" "util-linux branch composes -q as the first script(1) flag (#4192)"
+assert_eq "-e" "$ul_argv_2" "util-linux branch composes -e for exit-code propagation (#4192)"
+assert_eq "-c" "$ul_argv_3" "util-linux branch composes -c to run the quoted command (#4192)"
+
+ul_captured="$(cat "$UL_OUT")"
+assert_contains "claude" "$ul_argv_4" \
+    "util-linux branch: claude invocation is embedded in the quoted -c command string (#4192)"
+assert_contains "ARG<hello world>" "$ul_captured" \
+    "util-linux branch: arg with an embedded space survives the round trip (#4192)"
+assert_contains 'ARG<quote"inside>' "$ul_captured" \
+    "util-linux branch: arg with an embedded double-quote survives the round trip (#4192)"
+assert_contains "$(printf 'ARG<line1\nline2>')" "$ul_captured" \
+    "util-linux branch: arg with an embedded newline survives the round trip -- proves the \
+executing shell is pinned to bash (dash cannot parse %q's \$'...' ANSI-C form) (#4192)"
+
+# Exit-code propagation (#4192 gap 1): util-linux `script` exits 0 by
+# default; the real child exit status must still reach the caller via -e.
+ul_fail_rc=$(
+    PATH="$CC_DIR/ul-bin:$PATH" WRAPPER="$WRAPPER" UL_OUT="$UL_OUT" \
+        bash "$CC_DIR/ul-fail-driver.sh"
+)
+assert_eq "7" "$ul_fail_rc" \
+    "util-linux branch: -e propagates the real child exit code through script(1) (#4192)"
+
+# ---- BSD/macOS branch: stays byte-identical to the pre-#4192 form ----
+BSD_OUT="$CC_DIR/bsd-out.txt"
+bsd_result=$(
+    PATH="$CC_DIR/bsd-bin:$PATH" WRAPPER="$WRAPPER" BSD_OUT="$BSD_OUT" \
+        bash "$CC_DIR/bsd-driver.sh" 2>&1
+)
+assert_contains "RC=0" "$bsd_result" \
+    "BSD/macOS branch: _run_via_script exits 0 on success (#4192)"
+
+bsd_argv_1=$(sed -n '1p' "$BSD_ARGV_FILE")
+bsd_argv_2=$(sed -n '2p' "$BSD_ARGV_FILE")
+bsd_argv_3=$(sed -n '3p' "$BSD_ARGV_FILE")
+assert_eq "-q" "$bsd_argv_1" "BSD/macOS branch: form unchanged, -q first (#4192)"
+assert_eq "$BSD_OUT" "$bsd_argv_2" "BSD/macOS branch: form unchanged, FILE second (#4192)"
+assert_eq "claude" "$bsd_argv_3" \
+    "BSD/macOS branch: form unchanged, cmd third -- byte-identical to pre-#4192 (#4192)"
+
+bsd_captured="$(cat "$BSD_OUT")"
+assert_contains "ARG<hello world>" "$bsd_captured" \
+    "BSD/macOS branch: args reach claude unchanged (no %q quoting involved) (#4192)"
+assert_contains "ARG<--dangerously-skip-permissions>" "$bsd_captured" \
+    "BSD/macOS branch: --dangerously-skip-permissions is not misparsed as script's own flag (#4192)"
+
+rm -rf "$CC_DIR"
+
+# ============================================================
 # Summary
 # ============================================================
 

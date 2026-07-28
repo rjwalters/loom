@@ -1514,6 +1514,42 @@ format_duration() {
     fi
 }
 
+# _run_via_script <temp_output_file> <cmd...>
+#
+# Runs <cmd...> under script(1) so a TTY-attached retry attempt preserves
+# interactive mode, capturing output to <temp_output_file>. util-linux
+# script(1) and BSD/macOS script(1) take their arguments in incompatible
+# orders. The BSD form `script -q FILE cmd args...` makes util-linux parse
+# the command's own flags as script's, so an agent launched with
+# --dangerously-skip-permissions dies instantly with "script: unrecognized
+# option" and the retry ladder in run_with_retry then burns every attempt on
+# a failure that will never clear.
+#
+# Extracted into its own function (issue #4192) so tests can exercise the
+# calling-convention selection directly, without needing a real TTY on
+# stdin to reach it through run_with_retry's `[ -t 0 ]` branch.
+_run_via_script() {
+    local temp_output="$1"
+    shift
+    if script --version 2>/dev/null | grep -q util-linux; then
+        # util-linux `script -c` exits 0 regardless of the child's exit
+        # status unless `-e`/`--return` is passed, and the retry/error-
+        # classification ladder in run_with_retry keys off `exit_code` --
+        # so `-e` is required, not optional, or every Linux-side claude
+        # failure would silently report success.
+        #
+        # util-linux `script -c` also runs the `-c` string via $SHELL
+        # (falling back to /bin/sh). The `printf '%q'` quoting below is
+        # bash-specific ($'...' ANSI-C strings for newlines/specials), which
+        # dash (/bin/sh on Debian/Ubuntu) cannot parse, and claude args can
+        # contain newlines (prompts). Pin the executing shell to bash for
+        # this one invocation so the quoting round-trips.
+        SHELL=/bin/bash script -q -e -c "$(printf '%q ' "$@")" "${temp_output}"
+    else
+        script -q "${temp_output}" "$@"
+    fi
+}
+
 # Main retry loop with exponential backoff
 run_with_retry() {
     local attempt=1
@@ -1645,7 +1681,7 @@ run_with_retry() {
 
         if [ -t 0 ]; then
             # No prompt, TTY available - use script to preserve interactive mode
-            script -q "${temp_output}" claude "$@"
+            _run_via_script "${temp_output}" claude "$@"
             exit_code=$?
         else
             # No TTY (socket/pipe) - run claude directly, tee output for error detection
@@ -1958,5 +1994,12 @@ main() {
     exit "${exit_code}"
 }
 
-# Run main with all script arguments
-main "$@"
+# Run main with all script arguments.
+#
+# CLAUDE_WRAPPER_SOURCE_ONLY lets a test harness `source` this file to reach
+# its function definitions (e.g. _run_via_script, issue #4192) without
+# triggering the full CLI entry point. Unset/any other value preserves
+# exact current behavior -- main always runs.
+if [[ "${CLAUDE_WRAPPER_SOURCE_ONLY:-}" != "1" ]]; then
+    main "$@"
+fi
