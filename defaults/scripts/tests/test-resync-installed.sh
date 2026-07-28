@@ -477,6 +477,68 @@ else
     fail "(#4280) missing binary did not produce the expected warning"
 fi
 
+# --- (#4285) targeted loom-workspace package.json version field edit --------
+echo "Test group 12d: loom-workspace package.json decoy version field removal (#4285)"
+REPO="$(make_fixture)"
+printf '{\n  "name": "loom-workspace",\n  "version": "1.0.0",\n  "scripts": {"test": "my-custom-test"}\n}\n' \
+    > "$REPO/package.json"
+OUT="$(cd "$REPO" && bash "$SCRIPT" 2>&1)"
+RC=$?
+if [[ $RC -eq 0 ]]; then pass "(#4285) apply with a stub version field exits 0"; else fail "(#4285) apply exits 0 (got $RC)"; fi
+if ! grep -q '"version"' "$REPO/package.json"; then
+    pass "(#4285) loom-workspace package.json version field removed"
+else
+    fail "(#4285) loom-workspace package.json version field NOT removed"
+fi
+if grep -q '"name": *"loom-workspace"' "$REPO/package.json"; then
+    pass "(#4285) loom-workspace package.json name preserved"
+else
+    fail "(#4285) loom-workspace package.json name was altered/lost"
+fi
+if grep -q "my-custom-test" "$REPO/package.json"; then
+    pass "(#4285) consumer's customized scripts block preserved"
+else
+    fail "(#4285) consumer's customized scripts block was lost"
+fi
+if grep -q "package.json.*removed decoy" <<<"$OUT"; then
+    pass "(#4285) apply reports the package.json version removal"
+else
+    fail "(#4285) apply did not report the package.json version removal"
+fi
+# Idempotent rerun: second apply is a clean no-op for package.json.
+OUT="$(cd "$REPO" && bash "$SCRIPT" 2>&1)"
+if grep -q "package.json (no decoy version field)" <<<"$OUT"; then
+    pass "(#4285) second run reports package.json unchanged (idempotent)"
+else
+    fail "(#4285) second run did not report package.json as unchanged"
+fi
+
+echo "Test group 12e: a consumer's OWN package.json (not loom-workspace) is untouched"
+REPO="$(make_fixture)"
+printf '{\n  "name": "my-real-project",\n  "version": "2.3.4"\n}\n' > "$REPO/package.json"
+OUT="$(cd "$REPO" && bash "$SCRIPT" 2>&1)"
+if grep -q '"version": *"2.3.4"' "$REPO/package.json"; then
+    pass "(#4285) consumer's own package.json version left untouched"
+else
+    fail "(#4285) consumer's own package.json version was modified"
+fi
+
+echo "Test group 12f: .loom/resync-ignore pins package.json against the stub edit"
+REPO="$(make_fixture)"
+printf '{\n  "name": "loom-workspace",\n  "version": "1.0.0"\n}\n' > "$REPO/package.json"
+printf 'package.json  # keep my pinned stub version\n' > "$REPO/.loom/resync-ignore"
+OUT="$(cd "$REPO" && bash "$SCRIPT" 2>&1)"
+if grep -q '"version": *"1.0.0"' "$REPO/package.json"; then
+    pass "(#4285) pinned package.json version NOT removed"
+else
+    fail "(#4285) pinned package.json version was removed despite resync-ignore"
+fi
+if grep -q "skipped.*package.json" <<<"$OUT"; then
+    pass "(#4285) pinned package.json reported as skipped"
+else
+    fail "(#4285) pinned package.json not reported skipped"
+fi
+
 # --- contract checks ---------------------------------------------------------
 echo "Test group 13: flag/contract checks"
 if bash "$SCRIPT" --help 2>&1 | grep -q "resync-installed.sh"; then
