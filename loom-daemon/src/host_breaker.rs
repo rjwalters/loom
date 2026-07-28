@@ -473,7 +473,7 @@ pub fn step(
                     }),
                     next,
                 }
-            } else if prev.releases_at.map_or(true, |r| now >= r) {
+            } else if prev.releases_at.is_none_or(|r| now >= r) {
                 // Cool-down elapsed (or, defensively, no deadline recorded) —
                 // resume normal dispatch.
                 let reason = "cool-down elapsed; dispatch resumed".to_string();
