@@ -240,17 +240,27 @@ launchd-managed) or refused (not currently running, or a pre-#4077 binary), it
 falls back to a plain stop-then-start via the same checkout-resolved
 lifecycle-script delegates.
 
-### Supervision (reboot/crash) — macOS done, Linux deferred
+### Supervision (reboot/crash) — macOS via launchd, Linux via systemd `--user`
 
 Reboot/crash supervision itself (as opposed to the workdir/pid-file relocation
-above) is already implemented and documented for macOS via launchd —
-`RunAtLoad` (#3972), `KeepAlive:{SuccessfulExit:true}` restart-only relaunch
-(#4054), and a `StartInterval` autonomy-loss watchdog (#4011), all resolved
-through the `gui/<uid>` ↦ `user/<uid>` domain fallback (#4130). See
-[`daemon-reference.md`](daemon-reference.md) → Operability for the full
-writeup. **Linux has no equivalent** — the non-Darwin path is a plain `nohup …
-&` with no reboot/crash recovery and no watchdog. This is tracked as a named
-follow-up, #4260, rather than designed inline here.
+above) is implemented for macOS via launchd — `RunAtLoad` (#3972),
+`KeepAlive:{SuccessfulExit:true}` restart-only relaunch (#4054), and a
+`StartInterval` autonomy-loss watchdog (#4011), all resolved through the
+`gui/<uid>` ↦ `user/<uid>` domain fallback (#4130).
+
+On a **systemd Linux host** the same reboot survival + supervised-restart contract
+is provided by a `systemd --user` service (#4268, sub-issue B of #4260): `loom
+start` installs `~/.config/systemd/user/loom-daemon.service` and `systemctl --user
+enable --now`s it (`Restart=on-success` == the launchd restart-only relaunch;
+`WantedBy=default.target` == `RunAtLoad`), and `loom stop` runs `systemctl --user
+disable --now` so a reboot does not resurrect it. **Reboot survival on a
+headless / SSH-only host requires lingering** — run `loginctl enable-linger
+"$USER"` once. A non-systemd host (or `--no-systemd` / `LOOM_DAEMON_SYSTEMD=0`)
+falls back to the plain `nohup` path. See [`daemon-reference.md`](daemon-reference.md)
+→ Operability → "systemd user unit (Linux)" for the full writeup. Crash relaunch
+(as opposed to restart-on-success) and a systemd-side autonomy-loss watchdog
+remain follow-ups (sub-issue D of #4260), mirroring the still-launchd-only #4011
+watchdog.
 
 ## User-scope skills + agents (Epic #3835 Phase 4, #4261)
 

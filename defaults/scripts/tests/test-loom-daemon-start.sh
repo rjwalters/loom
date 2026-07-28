@@ -111,6 +111,9 @@ fi
 #    --no-launchd forces the legacy nohup path even on a Darwin test runner —
 #    this test exercises the flags-persistence array guard, not launchd
 #    (#3972), and must never mutate the real machine's LaunchAgents.
+#    --no-systemd is the Linux-runner analog (#4268): it forces the nohup path so
+#    running this suite on a real systemd host never installs/enables a real
+#    `systemd --user` unit.
 BG_FAKE_BIN="$WORKDIR/fake-loom-daemon-bg"
 cat > "$BG_FAKE_BIN" <<'EOF'
 #!/usr/bin/env bash
@@ -127,7 +130,7 @@ chmod +x "$BG_FAKE_BIN"
     LOOM_SOCKET_PATH="$WORKDIR/.loom/loom-daemon.sock" \
     LOOM_AUTONOMY_MARKER="$WORKDIR/.loom/autonomy-desired" \
     LOOM_WATCHDOG_LABEL="com.example.loom-sandbox-$$-watchdog" \
-    bash "$START_SCRIPT" --no-launchd >/dev/null 2>&1 )
+    bash "$START_SCRIPT" --no-launchd --no-systemd >/dev/null 2>&1 )
 bg_rc=$?
 assert_eq "0" "$bg_rc" "bare (zero-arg) background start exits 0 (no unbound-variable crash, #3968)"
 TESTS_RUN=$((TESTS_RUN + 1))
@@ -221,6 +224,175 @@ else
     echo -e "${RED}✗${NC} dev-mode fallback unchanged: refuses from a non-repo dir with no dispatcher (#4229 scope guard)"
 fi
 rm -rf "$MACHINE_HOME" "$MACHINE_CHECKOUT" "$NON_REPO_DIR"
+
+# ---------- systemd --user service path (#4268) ----------
+# The Linux mirror of the launchd path. The suite runs on Darwin runners, so
+# detection uses the test-only LOOM_SYSTEMD_FORCE=1 seam in lib/systemd-user.sh
+# plus a stub `systemctl` on PATH (mirroring the stub `launchctl` below). Every
+# invocation also passes --no-launchd so the systemd branch is reachable on a
+# Darwin runner (launchd wins over systemd by platform) and never touches real
+# launchd, and pins a scratch LOOM_SYSTEMD_UNIT so a stray real user manager is
+# never enabled/disabled.
+SD_UNIT="loom-daemon-test-$$.service"
+
+# S1. --print-unit renders the unit with NO side effects (no systemctl, no file
+#     write). Assert the four load-bearing fields from the issue's test plan:
+#     Restart=on-success, WantedBy=default.target, the baked
+#     Environment=LOOM_DAEMON_SUPERVISOR=systemd, and WorkingDirectory=<repo>.
+unit_out=$( ( cd "$WORKDIR" && env -u LOOM_WORK_FINDER -u LOOM_MAIN_HEALTH_GATE \
+    LOOM_DAEMON_BIN="$FAKE_BIN" bash "$START_SCRIPT" --print-unit 2>/dev/null ) )
+TESTS_RUN=$((TESTS_RUN + 1))
+if echo "$unit_out" | grep -qx 'Restart=on-success' \
+    && echo "$unit_out" | grep -qx 'WantedBy=default.target' \
+    && echo "$unit_out" | grep -qx 'Environment=LOOM_DAEMON_SUPERVISOR=systemd' \
+    && echo "$unit_out" | grep -qx "WorkingDirectory=$WORKDIR"; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} --print-unit renders Restart=on-success, WantedBy=default.target, LOOM_DAEMON_SUPERVISOR=systemd, WorkingDirectory=<repo>"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} --print-unit renders the expected unit fields"
+    echo "$unit_out" | sed 's/^/    /'
+fi
+
+# Shared stub systemctl: records every call, answers daemon-reload/enable as
+# success and `show -p MainPID --value` with a live pid we control. Structurally
+# unable to touch a real unit.
+SD_BIN="$WORKDIR/sd-bin"; mkdir -p "$SD_BIN"
+SD_MAIN_SLEEP_PID=""
+make_sd_stub() {
+    local log="$1" mainpid="$2"
+    cat > "$SD_BIN/systemctl" <<EOF
+#!/usr/bin/env bash
+echo "\$*" >> "$log"
+if [[ "\${1:-}" == "--user" ]]; then shift; fi
+case "\${1:-}" in
+  show) echo "${mainpid}" ;;
+  *)    exit 0 ;;
+esac
+EOF
+    chmod +x "$SD_BIN/systemctl"
+}
+
+# S2. Forced systemd path installs + enables the unit and writes the PID file
+#     from `systemctl --user show -p MainPID`. A real sleeper stands in for the
+#     daemon MainPID so the liveness check (kill -0) passes.
+sleep 30 & SD_MAIN_SLEEP_PID=$!
+SD_LOG="$WORKDIR/sd-enable.log"; : > "$SD_LOG"
+make_sd_stub "$SD_LOG" "$SD_MAIN_SLEEP_PID"
+SD_HOME="$(mktemp -d)"; mkdir -p "$SD_HOME/.loom/logs"
+sd_out=$( cd "$WORKDIR" && env -u LOOM_WORK_FINDER -u LOOM_MAIN_HEALTH_GATE \
+    PATH="$SD_BIN:$PATH" HOME="$SD_HOME" \
+    LOOM_SYSTEMD_FORCE=1 LOOM_SYSTEMD_UNIT="$SD_UNIT" \
+    LOOM_DAEMON_BIN="$FAKE_BIN" \
+    LOOM_SOCKET_PATH="$SD_HOME/.loom/loom-daemon.sock" \
+    LOOM_AUTONOMY_MARKER="$SD_HOME/.loom/autonomy-desired" \
+    bash "$START_SCRIPT" --no-launchd 2>&1 )
+sd_rc=$?
+assert_eq "0" "$sd_rc" "systemd path: start exits 0"
+TESTS_RUN=$((TESTS_RUN + 1))
+if grep -q -- "--user enable --now $SD_UNIT" "$SD_LOG" && grep -q -- '--user daemon-reload' "$SD_LOG"; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} systemd path: runs daemon-reload + enable --now on the unit"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} systemd path: runs daemon-reload + enable --now on the unit"
+    echo "  systemctl calls: $(cat "$SD_LOG")"
+fi
+# The PID file lands under the repo-root state home ($WORKDIR/.loom in dev mode),
+# not under the pinned scratch $HOME (which only relocates the socket/marker).
+TESTS_RUN=$((TESTS_RUN + 1))
+if [[ "$(cat "$WORKDIR/.loom/.daemon.pid" 2>/dev/null)" == "$SD_MAIN_SLEEP_PID" ]]; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} systemd path: PID file written from systemctl show -p MainPID"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} systemd path: PID file written from systemctl show -p MainPID"
+    echo "  pid file: [$(cat "$WORKDIR/.loom/.daemon.pid" 2>/dev/null)] expected [$SD_MAIN_SLEEP_PID]"
+fi
+rm -f "$WORKDIR/.loom/.daemon.pid"
+TESTS_RUN=$((TESTS_RUN + 1))
+if [[ -f "$SD_HOME/.config/systemd/user/$SD_UNIT" ]] \
+    && grep -qx 'Restart=on-success' "$SD_HOME/.config/systemd/user/$SD_UNIT"; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} systemd path: renders the unit file under ~/.config/systemd/user with Restart=on-success"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} systemd path: renders the unit file under ~/.config/systemd/user with Restart=on-success"
+fi
+TESTS_RUN=$((TESTS_RUN + 1))
+if echo "$sd_out" | grep -qi 'enable-linger'; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} systemd path: prints the loginctl enable-linger reboot-survival reminder"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} systemd path: prints the loginctl enable-linger reboot-survival reminder"
+fi
+kill "$SD_MAIN_SLEEP_PID" 2>/dev/null || true
+rm -rf "$SD_HOME"
+
+# S3. Escape hatch: --no-systemd falls back to the nohup path byte-compatibly —
+#     the stub systemctl is on PATH and detection is FORCED, yet no systemctl
+#     call is made (the whole systemd branch is skipped).
+SD_LOG2="$WORKDIR/sd-nohatch.log"; : > "$SD_LOG2"
+make_sd_stub "$SD_LOG2" "0"
+SD_HOME2="$(mktemp -d)"; mkdir -p "$SD_HOME2/.loom/logs"
+( cd "$WORKDIR" && env -u LOOM_WORK_FINDER -u LOOM_MAIN_HEALTH_GATE \
+    PATH="$SD_BIN:$PATH" HOME="$SD_HOME2" \
+    LOOM_SYSTEMD_FORCE=1 LOOM_SYSTEMD_UNIT="$SD_UNIT" \
+    LOOM_DAEMON_BIN="$BG_FAKE_BIN" \
+    LOOM_SOCKET_PATH="$SD_HOME2/.loom/loom-daemon.sock" \
+    LOOM_AUTONOMY_MARKER="$SD_HOME2/.loom/autonomy-desired" \
+    bash "$START_SCRIPT" --no-launchd --no-systemd >/dev/null 2>&1 )
+nohatch_rc=$?
+assert_eq "0" "$nohatch_rc" "--no-systemd: start exits 0 (nohup fallback)"
+TESTS_RUN=$((TESTS_RUN + 1))
+if [[ ! -s "$SD_LOG2" ]]; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} --no-systemd: performs no systemctl call at all (byte-compatible nohup path)"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} --no-systemd: performs no systemctl call at all"
+    echo "  systemctl calls: $(cat "$SD_LOG2")"
+fi
+if [[ -f "$SD_HOME2/.loom/.daemon.pid" ]]; then
+    kill "$(cat "$SD_HOME2/.loom/.daemon.pid" 2>/dev/null)" 2>/dev/null || true
+fi
+rm -rf "$SD_HOME2"
+
+# S4. LOOM_DAEMON_SYSTEMD=0 is the env equivalent of --no-systemd (same skip).
+SD_LOG3="$WORKDIR/sd-envoff.log"; : > "$SD_LOG3"
+make_sd_stub "$SD_LOG3" "0"
+SD_HOME3="$(mktemp -d)"; mkdir -p "$SD_HOME3/.loom/logs"
+( cd "$WORKDIR" && env -u LOOM_WORK_FINDER -u LOOM_MAIN_HEALTH_GATE \
+    PATH="$SD_BIN:$PATH" HOME="$SD_HOME3" \
+    LOOM_SYSTEMD_FORCE=1 LOOM_SYSTEMD_UNIT="$SD_UNIT" LOOM_DAEMON_SYSTEMD=0 \
+    LOOM_DAEMON_BIN="$BG_FAKE_BIN" \
+    LOOM_SOCKET_PATH="$SD_HOME3/.loom/loom-daemon.sock" \
+    LOOM_AUTONOMY_MARKER="$SD_HOME3/.loom/autonomy-desired" \
+    bash "$START_SCRIPT" --no-launchd >/dev/null 2>&1 )
+TESTS_RUN=$((TESTS_RUN + 1))
+if [[ ! -s "$SD_LOG3" ]]; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} LOOM_DAEMON_SYSTEMD=0: performs no systemctl call (env escape hatch, symmetric with --no-systemd)"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} LOOM_DAEMON_SYSTEMD=0: performs no systemctl call"
+    echo "  systemctl calls: $(cat "$SD_LOG3")"
+fi
+if [[ -f "$SD_HOME3/.loom/.daemon.pid" ]]; then
+    kill "$(cat "$SD_HOME3/.loom/.daemon.pid" 2>/dev/null)" 2>/dev/null || true
+fi
+rm -rf "$SD_HOME3"
+
+# S5. --help documents the systemd escape hatch + --print-unit.
+TESTS_RUN=$((TESTS_RUN + 1))
+if echo "$help_out" | grep -q -- '--no-systemd' && echo "$help_out" | grep -q -- '--print-unit'; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} --help documents --no-systemd and --print-unit"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} --help documents --no-systemd and --print-unit"
+fi
 
 # ---------- launchd domain resolution (#4130) ----------
 # resolve_launchd_domain() (lib/launchd-domain.sh) picks gui/<uid> when the GUI
