@@ -28,7 +28,7 @@
 //!    It never runs `git pull` on the operator's behalf.
 //! 3. **Backoff on failure** — a source tree that does not compile must not
 //!    retry every tick forever. Retryable build failures back off exponentially
-//!    with a ceiling; the terminal give-up state is surfaced in `--status`.
+//!    with a ceiling; the terminal give-up state is surfaced in `loom-daemon status`.
 //! 4. **No build stampede** — a `cargo build --release` competes with every
 //!    in-flight sweep's own build for CPU, so the loop defers the rebuild while
 //!    [`crate::ipc::count_in_flight_sweeps`] reports any non-terminal sweep
@@ -571,7 +571,7 @@ fn truncate_tail(s: &str) -> String {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TickDecision {
     /// Do nothing this tick; the string is the human-readable reason surfaced in
-    /// `--status`.
+    /// `loom-daemon status`.
     Skip(String),
     /// All gates passed — run the rebuild.
     Rebuild,
