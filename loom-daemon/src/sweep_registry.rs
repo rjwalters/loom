@@ -119,6 +119,44 @@ pub const TERMINAL_RETENTION_SECS: i64 = 3600;
 /// `dispatch_sweep` `model` param.
 pub const DEFAULT_DISPATCH_MODEL: &str = "sonnet";
 
+/// Typed, matchable error returned by [`SweepRegistry::dispatch`] when the
+/// open-PR guard (Issue #4123, step 2.6) refuses a dispatch because the target
+/// issue already has an **open** linked pull request.
+///
+/// Every in-memory dedup signal (idempotency key, in-flight set, the
+/// `loom:building` label) clears when the parent sweep exits, so an issue whose
+/// approved PR is still open looks identical to fresh work the moment its sweep
+/// dies — and the work-finder re-dispatches it, redoing finished work against a
+/// scarce token pool. The forge's closes-graph is the one durable signal that
+/// survives process death and daemon restarts, so this guard consults it.
+///
+/// This is a **distinct, downcast-matchable** type (not a string-matched
+/// `anyhow` message) so the work-finder can attribute the refusal to its own
+/// `pr-open-skip` counter rather than a generic dispatch failure. It is created
+/// via `.into()` so `anyhow::Error` preserves the concrete type for
+/// `downcast_ref::<OpenPrDispatchError>()`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OpenPrDispatchError {
+    /// The issue whose dispatch was refused.
+    pub issue: u32,
+    /// The open linked PR that triggered the refusal.
+    pub pr: u32,
+}
+
+impl std::fmt::Display for OpenPrDispatchError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "refusing to dispatch issue #{}: it already has an open linked PR #{} \
+             (#4123 open-PR guard). A fresh issue sweep would duplicate work already \
+             in review.",
+            self.issue, self.pr
+        )
+    }
+}
+
+impl std::error::Error for OpenPrDispatchError {}
+
 /// Issue #3944: which tier of the dispatch-model precedence chain supplied the
 /// resolved model. Surfaced in the daemon dispatch log line so an operator can
 /// tell *why* a child is running a given model.
@@ -1682,6 +1720,37 @@ impl SweepRegistry {
             ));
         }
 
+        // 2.6 Open-PR guard (Issue #4123). Every in-memory dedup signal — the
+        //     idempotency key, the in-flight set, the `loom:building` label —
+        //     is scoped to the running sweep's lifetime and clears when the
+        //     parent exits (`reconstruct()` even drops the idempotency key on a
+        //     daemon restart). So an issue whose approved PR is still open looks
+        //     identical to fresh work the moment its sweep dies, and every
+        //     caller that routes through `dispatch()` — the work-finder, the
+        //     epic supervisor, the IPC/CLI dispatch, and all three watchdogs
+        //     (startup #3887, mid-build-death #3895, review-stall #3910) — would
+        //     re-dispatch it, redoing finished work against a scarce token pool.
+        //     The forge's closes-graph is the one durable signal that survives
+        //     process death and restarts, so this guard consults it, right after
+        //     the closed-issue guard and before the lock/label flip so a single
+        //     check covers all six call sites. Keys on PR *openness* only, never
+        //     on review labels — driving an open PR forward is the
+        //     Judge/Champion/Doctor path's job, not the issue work-finder's.
+        //     Best-effort and fail-open: any forge error/timeout/unparseable
+        //     output returns `None` and dispatch proceeds, so a `gh` outage (or
+        //     a Gitea workspace — this is GitHub-only, like `issue_is_closed`)
+        //     can never wedge the daemon. Skipped when label flips are disabled
+        //     (test fixtures without `gh` credentials), mirroring 2.5.
+        if !self.config.skip_label_flip {
+            if let Some(pr) = self.first_open_linked_pr(issue_number) {
+                return Err(OpenPrDispatchError {
+                    issue: issue_number,
+                    pr,
+                }
+                .into());
+            }
+        }
+
         // 3. Acquire the claim lock atomically.
         let sweep_id = generate_sweep_id(kind);
         self.acquire_lock(issue_number, &sweep_id)?;
@@ -2072,6 +2141,107 @@ impl SweepRegistry {
             "OPEN" => Some(false),
             _ => None,
         }
+    }
+
+    /// Best-effort probe for an **open** pull request linked to `issue` via
+    /// GitHub's authoritative closes-graph (`closedByPullRequestsReferences`),
+    /// used by the #4123 open-PR dispatch guard. Returns `Some(pr_number)` when
+    /// at least one *open* linked PR exists, and `None` otherwise — where `None`
+    /// covers BOTH "no open PR" and any failure (missing/failed/timed-out `gh`,
+    /// unresolvable repo, unparseable output).
+    ///
+    /// Callers MUST treat `None` as **fail-open** — a forge outage or a wedged
+    /// `gh` must never wedge dispatch. This mirrors [`issue_is_closed`]'s `None`
+    /// contract and is bounded by [`reap_gh_timeout`] exactly like the label
+    /// flips so it cannot block the dispatch path.
+    ///
+    /// Filtering is on the node `state == "OPEN"` in the `--jq`, NOT on the
+    /// GraphQL `includeClosedPrs:false` flag alone: live testing showed a
+    /// *merged* PR still returns from the closes-graph even with
+    /// `includeClosedPrs:false` (it comes back with `state: MERGED`), so relying
+    /// on the flag would false-positive forever on every issue whose PR ever
+    /// merged. The `state == "OPEN"` filter is the load-bearing one; the flag is
+    /// kept only to trim the payload. This uses the forge's closes-link graph,
+    /// not `Closes #N` body-parsing. GitHub-only, like the helper above it.
+    fn first_open_linked_pr(&self, issue: u32) -> Option<u32> {
+        let (owner, repo) = self.resolve_owner_repo()?;
+        let gh = self
+            .config
+            .gh_bin
+            .clone()
+            .unwrap_or_else(|| PathBuf::from("gh"));
+        let query = "query($owner:String!,$repo:String!,$num:Int!){\
+             repository(owner:$owner,name:$repo){\
+             issue(number:$num){\
+             closedByPullRequestsReferences(first:20,includeClosedPrs:false){\
+             nodes{ number state } } } } }";
+        let mut cmd = Command::new(&gh);
+        cmd.arg("api")
+            .arg("graphql")
+            .arg("-f")
+            .arg(format!("query={query}"))
+            .arg("-F")
+            .arg(format!("owner={owner}"))
+            .arg("-F")
+            .arg(format!("repo={repo}"))
+            .arg("-F")
+            .arg(format!("num={issue}"))
+            .arg("--jq")
+            .arg(
+                ".data.repository.issue.closedByPullRequestsReferences.nodes[] \
+                 | select(.state == \"OPEN\") | .number",
+            );
+        // Resolve against this registry's own workspace, matching the label-flip
+        // helpers and `issue_is_closed` (#3937).
+        cmd.current_dir(&self.config.workspace_root);
+        let output = output_with_timeout(cmd, reap_gh_timeout()).ok()??;
+        if !output.status.success() {
+            return None;
+        }
+        // The `--jq` emits one open PR number per line; take the first.
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .find_map(|l| l.trim().parse::<u32>().ok())
+    }
+
+    /// Resolve `(owner, repo)` for the registry's workspace, needed because
+    /// `gh api graphql` (unlike `gh issue view`) cannot infer the repo from the
+    /// working directory. Prefers the process-global `LOOM_REPO` override
+    /// (`owner/repo`) when set, else asks `gh repo view` in the workspace root.
+    /// Returns `None` on any failure so the open-PR guard fails open.
+    fn resolve_owner_repo(&self) -> Option<(String, String)> {
+        if let Ok(repo) = std::env::var("LOOM_REPO") {
+            if let Some((o, r)) = repo.split_once('/') {
+                if !o.is_empty() && !r.is_empty() {
+                    return Some((o.to_string(), r.to_string()));
+                }
+            }
+        }
+        let gh = self
+            .config
+            .gh_bin
+            .clone()
+            .unwrap_or_else(|| PathBuf::from("gh"));
+        let mut cmd = Command::new(&gh);
+        cmd.arg("repo")
+            .arg("view")
+            .arg("--json")
+            .arg("owner,name")
+            .arg("--jq")
+            .arg(".owner.login + \"/\" + .name");
+        cmd.current_dir(&self.config.workspace_root);
+        let output = output_with_timeout(cmd, reap_gh_timeout()).ok()??;
+        if !output.status.success() {
+            return None;
+        }
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        stdout.trim().split_once('/').and_then(|(o, r)| {
+            if o.is_empty() || r.is_empty() {
+                None
+            } else {
+                Some((o.to_string(), r.to_string()))
+            }
+        })
     }
 
     fn flip_label_to_building(&self, issue: u32) -> Result<()> {
@@ -10035,6 +10205,207 @@ exit 0\n";
         if let Some(id) = running_issue_sweep_id(&reg, 4079) {
             let _ = reg.cancel(&id, Duration::from_secs(2));
         }
+    }
+
+    // --- open-PR dispatch guard (Issue #4123) ---
+
+    /// Install a fake `gh` for the open-PR guard: `issue view` always reports
+    /// `OPEN` (so the 2.5 closed-issue guard passes and the 2.6 open-PR guard is
+    /// reached), `api graphql` prints `graphql_stdout` (the post-`--jq` open-PR
+    /// numbers, one per line) and exits `graphql_exit`, and `repo view` resolves
+    /// the owner/repo. Every invocation is logged. `spawn-claude.sh` is a benign
+    /// echo-and-exit so a dispatch that passes the guard still spawns.
+    fn open_pr_guard_registry(
+        ws: &Path,
+        graphql_stdout: &str,
+        graphql_exit: i32,
+        skip_label_flip: bool,
+    ) -> (SweepRegistry, PathBuf) {
+        let gh_log = ws.join("gh-invocations.log");
+        let fake_gh = ws.join("fake-gh.sh");
+        let script = format!(
+            "#!/usr/bin/env bash\n\
+             printf '%s\\n' \"$*\" >> \"{log}\"\n\
+             if [[ \"$1\" == \"issue\" && \"$2\" == \"view\" ]]; then\n\
+             printf 'OPEN\\n'\n\
+             exit 0\n\
+             fi\n\
+             if [[ \"$1\" == \"api\" && \"$2\" == \"graphql\" ]]; then\n\
+             printf '%s\\n' \"{gql}\"\n\
+             exit {exit}\n\
+             fi\n\
+             if [[ \"$1\" == \"repo\" && \"$2\" == \"view\" ]]; then\n\
+             printf 'rjwalters/loom\\n'\n\
+             exit 0\n\
+             fi\n\
+             exit 0\n",
+            log = gh_log.display(),
+            gql = graphql_stdout,
+            exit = graphql_exit,
+        );
+        std::fs::write(&fake_gh, &script).unwrap();
+        let mut perms = std::fs::metadata(&fake_gh).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&fake_gh, perms).unwrap();
+        if let Ok(f) = std::fs::File::open(&fake_gh) {
+            let _ = f.sync_all();
+        }
+
+        let scripts_dir = ws.join(".loom").join("scripts");
+        std::fs::create_dir_all(&scripts_dir).unwrap();
+        let spawn = scripts_dir.join("spawn-claude.sh");
+        std::fs::write(&spawn, "#!/usr/bin/env bash\necho spawned\nexit 0\n").unwrap();
+        let mut sperms = std::fs::metadata(&spawn).unwrap().permissions();
+        sperms.set_mode(0o755);
+        std::fs::set_permissions(&spawn, sperms).unwrap();
+        if let Ok(f) = std::fs::File::open(&spawn) {
+            let _ = f.sync_all();
+        }
+        touch_sweep_command(ws);
+
+        let mut config = SweepRegistryConfig::new(ws.to_path_buf());
+        config.spawn_bin = Some(spawn);
+        config.gh_bin = Some(fake_gh);
+        config.skip_label_flip = skip_label_flip;
+        config.journal_path = Some(ws.join("test-sweeps-journal.json"));
+        (SweepRegistry::new(config), gh_log)
+    }
+
+    /// `dispatch` for an open issue that already has an open linked PR is refused
+    /// with the typed [`OpenPrDispatchError`] (downcast-matchable, not string
+    /// matching), and it must NOT acquire the claim lock or flip any labels — a
+    /// re-dispatch of already-in-review work would duplicate it.
+    #[test]
+    #[serial]
+    fn dispatch_refuses_open_pr_without_flipping_labels() {
+        let tmp = tempdir().unwrap();
+        let ws = tmp.path();
+        std::env::set_var("LOOM_REPO", "rjwalters/loom");
+        let (mut reg, gh_log) = open_pr_guard_registry(ws, "4200", 0, false);
+
+        let err = reg
+            .dispatch(&SweepKind::Issue(4123), None, None, None, None)
+            .expect_err("an issue with an open linked PR must be refused");
+        let typed = err
+            .downcast_ref::<OpenPrDispatchError>()
+            .expect("refusal must carry the typed OpenPrDispatchError");
+        assert_eq!(typed.issue, 4123);
+        assert_eq!(typed.pr, 4200);
+
+        let calls = std::fs::read_to_string(&gh_log).unwrap_or_default();
+        assert!(calls.contains("api graphql"), "the guard queried the closes-graph");
+        assert!(
+            !calls.contains("issue edit"),
+            "no label flip on a refused dispatch; got: {calls:?}"
+        );
+        // No lock acquired, no entry recorded.
+        assert!(running_issue_sweep_id(&reg, 4123).is_none());
+        std::env::remove_var("LOOM_REPO");
+    }
+
+    /// Fail-open (the single most safety-critical property): a forge error on the
+    /// open-PR probe (non-zero `gh api graphql`) must NOT wedge dispatch — the
+    /// guard returns `None` and dispatch proceeds to spawn + label flip.
+    #[test]
+    #[serial]
+    fn dispatch_fails_open_when_open_pr_lookup_errors() {
+        let tmp = tempdir().unwrap();
+        let ws = tmp.path();
+        std::env::set_var("LOOM_REPO", "rjwalters/loom");
+        // `api graphql` exits non-zero ⇒ open-PR state unknown ⇒ fail open.
+        let (mut reg, gh_log) = open_pr_guard_registry(ws, "", 1, false);
+
+        let out = reg
+            .dispatch(&SweepKind::Issue(4124), None, None, None, None)
+            .expect("a forge error on the open-PR probe must not wedge dispatch (fail-open)");
+        assert!(wait_until_dead(out.pid, FIXTURE_CHILD_WAIT_MS));
+
+        let calls = std::fs::read_to_string(&gh_log).unwrap_or_default();
+        assert!(calls.contains("api graphql"), "the guard attempted the closes-graph query");
+        assert!(
+            calls.contains("issue edit 4124"),
+            "dispatch proceeded to the label flip after failing open; got: {calls:?}"
+        );
+        if let Some(id) = running_issue_sweep_id(&reg, 4124) {
+            let _ = reg.cancel(&id, Duration::from_secs(2));
+        }
+        std::env::remove_var("LOOM_REPO");
+    }
+
+    /// An issue whose only linked PR is merged/closed is NOT blocked: the
+    /// `state == "OPEN"` `--jq` filter yields no PR number, so the probe returns
+    /// nothing and dispatch proceeds. Regression guard against an
+    /// `includeClosedPrs` misconfiguration that would strand every issue whose
+    /// PR ever merged.
+    #[test]
+    #[serial]
+    fn dispatch_open_pr_guard_ignores_merged_only_pr() {
+        let tmp = tempdir().unwrap();
+        let ws = tmp.path();
+        std::env::set_var("LOOM_REPO", "rjwalters/loom");
+        // Empty post-`--jq` output = no OPEN-state PR (only merged/closed ones).
+        let (mut reg, _gh_log) = open_pr_guard_registry(ws, "", 0, false);
+
+        let out = reg
+            .dispatch(&SweepKind::Issue(4125), None, None, None, None)
+            .expect("an issue whose only linked PR is merged/closed must not be blocked");
+        assert!(wait_until_dead(out.pid, FIXTURE_CHILD_WAIT_MS));
+        if let Some(id) = running_issue_sweep_id(&reg, 4125) {
+            let _ = reg.cancel(&id, Duration::from_secs(2));
+        }
+        std::env::remove_var("LOOM_REPO");
+    }
+
+    /// `skip_label_flip = true` bypasses the open-PR guard entirely (test-fixture
+    /// path): even a fake `gh` that WOULD report an open PR is never consulted,
+    /// and dispatch proceeds.
+    #[test]
+    #[serial]
+    fn dispatch_skip_label_flip_bypasses_open_pr_guard() {
+        let tmp = tempdir().unwrap();
+        let ws = tmp.path();
+        std::env::set_var("LOOM_REPO", "rjwalters/loom");
+        let (mut reg, gh_log) = open_pr_guard_registry(ws, "4200", 0, true);
+
+        let out = reg
+            .dispatch(&SweepKind::Issue(4126), None, None, None, None)
+            .expect("skip_label_flip must bypass the open-PR guard entirely");
+        assert!(wait_until_dead(out.pid, FIXTURE_CHILD_WAIT_MS));
+
+        let calls = std::fs::read_to_string(&gh_log).unwrap_or_default();
+        assert!(
+            !calls.contains("api graphql"),
+            "no forge call at all when label flips are disabled; got: {calls:?}"
+        );
+        if let Some(id) = running_issue_sweep_id(&reg, 4126) {
+            let _ = reg.cancel(&id, Duration::from_secs(2));
+        }
+        std::env::remove_var("LOOM_REPO");
+    }
+
+    /// The 2.5 closed-issue guard (#4088) fires BEFORE the 2.6 open-PR guard: a
+    /// closed issue (with a merged PR) is refused by 2.5 and the open-PR probe
+    /// never runs — no regression to the existing closed-issue path.
+    #[test]
+    #[serial]
+    fn closed_issue_guard_fires_before_open_pr_guard() {
+        let tmp = tempdir().unwrap();
+        let ws = tmp.path();
+        std::env::remove_var("LOOM_REPO");
+        let (mut reg, gh_log) = closed_guard_registry(ws, "CLOSED", 0);
+
+        let err = reg
+            .dispatch(&SweepKind::Issue(4200), None, None, None, None)
+            .expect_err("a closed issue must still be refused by the 2.5 guard");
+        assert!(
+            err.to_string().contains("closed"),
+            "the 2.5 closed-issue guard wins; got: {err}"
+        );
+        let calls = std::fs::read_to_string(&gh_log).unwrap_or_default();
+        assert!(
+            !calls.contains("api graphql"),
+            "the open-PR (2.6) probe must never run once 2.5 refuses; got: {calls:?}"
+        );
     }
 
     // --- workspace-commands dispatch guard (Issue #4027) ---

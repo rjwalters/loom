@@ -1682,14 +1682,34 @@ per-tick summary line as the trailing `N cross-host-collision(s)` field, e.g.:
 
 ```
 work_finder: tick — cap 3 (...); 5 seen, 2 dispatched, 1 labeled-skip,
-0 in-flight-skip, 0 quarantine-skip, 0 deferred, 0 error(s), 3 cross-host-collision(s)
+0 in-flight-skip, 0 quarantine-skip, 0 pr-open-skip, 0 deferred, 0 error(s), 3 cross-host-collision(s)
 ```
 
 Unlike the other (per-tick) counters, this one is a **monotonic cumulative
 total** read from the dispatcher(s) at tick end (summed across workspaces in the
 multi-repo tick), so successive lines show the baseline accumulate. It is `0`
 whenever detection is disabled. The existing fields (`labeled-skip` /
-`in-flight-skip` / `quarantine-skip` …) keep their names and semantics unchanged.
+`in-flight-skip` / `quarantine-skip` / `pr-open-skip` …) keep their names and
+semantics unchanged.
+
+**`pr-open-skip` (open-PR dispatch guard, #4123).** A per-tick counter (like the
+other `*-skip` fields, not cumulative) for issues the finder declined to dispatch
+because they **already have an open linked PR**. The guard lives in
+`SweepRegistry::dispatch()` (step 2.6, right after the #4088 closed-issue guard),
+so it covers *every* dispatch caller — the work finder, the epic supervisor, the
+IPC/CLI `dispatch_sweep`, and all three watchdogs — with one forge check. Every
+in-memory dedup signal (idempotency key, in-flight set, `loom:building` label)
+dies with the parent sweep, so without this guard an issue whose approved PR is
+still open would be re-dispatched the moment its sweep exits, redoing finished
+work against the token pool. `dispatch()` refuses these with a typed
+`OpenPrDispatchError`; the finder attributes that refusal to `pr-open-skip`
+(never to `error(s)`), and a tick whose only outcome is a `pr-open-skip` **still
+logs** its summary line (the counter is part of the log gate). The guard keys on
+PR *openness* only — never on review labels — and is **fail-open**: any forge
+error, timeout, or unparseable output lets dispatch proceed, so a `gh` outage can
+never wedge the daemon. It is GitHub-only (uses the `closedByPullRequestsReferences`
+closes-graph, filtered to `state == "OPEN"`); a Gitea workspace fails open and
+keeps today's behavior.
 
 **Cost / default.** Enabling detection adds exactly one `gh issue view --json
 labels` round-trip per dispatch (measured ~0.4s against GitHub), bounded by the
