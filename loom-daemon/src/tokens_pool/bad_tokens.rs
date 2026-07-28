@@ -195,13 +195,30 @@ pub fn cleanup_bad_tokens(workspace: &Path, max_age_seconds: i64) -> Result<usiz
     Ok(kept.len())
 }
 
+/// Outcome of [`unblock`]. `excluded` names the accounts that still have a
+/// non-auth ("exhausted") entry left in place because the default scope (no
+/// `all_reasons`) does not drop them (#4212). First-seen file order,
+/// de-duplicated, so the daemon CLI and the Python `cli.py::_cmd_unblock`
+/// emit a byte-identical `excluded` list.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnblockOutcome {
+    pub removed: usize,
+    pub kept: usize,
+    pub excluded: Vec<String>,
+}
+
 /// Remove entries for `names` from `.bad_tokens` (operator `unblock`, ported
 /// from `cli.py::_cmd_unblock`). By default only entries whose reason field
 /// matches [`auth_reason_regex`] are dropped ("TTL entries clear
 /// themselves" — non-auth reasons are left for [`cleanup_bad_tokens`] /
 /// natural expiry); `all_reasons` also drops non-auth entries for the given
 /// names. Malformed lines (fewer than 2 whitespace-separated fields) are
-/// always kept so we never silently lose data. Returns `(removed, kept)`.
+/// always kept so we never silently lose data.
+///
+/// Returns an [`UnblockOutcome`]. `excluded` lists the named accounts whose
+/// non-auth entries the default scope left in place — the caller surfaces
+/// these and exits non-zero (#4212) so a no-op `unblock` can no longer look
+/// like success on a still-poisoned pool.
 ///
 /// # Errors
 /// Returns an error if the lock cannot be acquired or the file cannot be
@@ -210,11 +227,15 @@ pub fn unblock(
     workspace: &Path,
     names: &[String],
     all_reasons: bool,
-) -> Result<(usize, usize), String> {
+) -> Result<UnblockOutcome, String> {
     let dir = tokens_dir(workspace);
     let bad_file = bad_tokens_path(&dir);
     if !bad_file.is_file() {
-        return Ok((0, 0));
+        return Ok(UnblockOutcome {
+            removed: 0,
+            kept: 0,
+            excluded: Vec::new(),
+        });
     }
 
     let target: std::collections::HashSet<&str> = names.iter().map(String::as_str).collect();
@@ -223,6 +244,8 @@ pub fn unblock(
     let text = std::fs::read_to_string(&bad_file).map_err(|e| e.to_string())?;
     let mut removed = 0usize;
     let mut kept: Vec<String> = Vec::new();
+    let mut excluded: Vec<String> = Vec::new();
+    let mut excluded_seen: std::collections::HashSet<String> = std::collections::HashSet::new();
     for line in text.lines() {
         let stripped = line.trim();
         if stripped.is_empty() {
@@ -233,9 +256,16 @@ pub fn unblock(
         let entry_name = parts.next();
         let reason = parts.next().unwrap_or("");
         if let Some(name) = entry_name {
-            if target.contains(name) && (all_reasons || auth_reason_regex().is_match(reason)) {
-                removed += 1;
-                continue;
+            if target.contains(name) {
+                if all_reasons || auth_reason_regex().is_match(reason) {
+                    removed += 1;
+                    continue;
+                }
+                // A named account with a non-auth entry that the DEFAULT scope
+                // leaves behind — record it so the caller can name it and fail.
+                if excluded_seen.insert(name.to_string()) {
+                    excluded.push(name.to_string());
+                }
             }
         }
         kept.push(line.to_string());
@@ -250,7 +280,11 @@ pub fn unblock(
     std::fs::write(&tmp, body).map_err(|e| e.to_string())?;
     std::fs::rename(&tmp, &bad_file).map_err(|e| e.to_string())?;
 
-    Ok((removed, kept.len()))
+    Ok(UnblockOutcome {
+        removed,
+        kept: kept.len(),
+        excluded,
+    })
 }
 
 #[cfg(test)]
@@ -415,7 +449,10 @@ mod tests {
     #[test]
     fn unblock_no_file_is_noop() {
         let tmp = make_pool();
-        assert_eq!(unblock(tmp.path(), &["a".to_string()], false).unwrap(), (0, 0));
+        let out = unblock(tmp.path(), &["a".to_string()], false).unwrap();
+        assert_eq!(out.removed, 0);
+        assert_eq!(out.kept, 0);
+        assert!(out.excluded.is_empty());
     }
 
     #[test]
@@ -423,21 +460,38 @@ mod tests {
         let tmp = make_pool();
         mark_bad(tmp.path(), "a", "401 unauthorized").unwrap();
         mark_bad(tmp.path(), "b", "exhausted: 429").unwrap();
-        let (removed, kept) =
-            unblock(tmp.path(), &["a".to_string(), "b".to_string()], false).unwrap();
-        assert_eq!(removed, 1);
-        assert_eq!(kept, 1);
+        // Only "a" is targeted, so "b" is not excluded (it was never asked for).
+        let out = unblock(tmp.path(), &["a".to_string()], false).unwrap();
+        assert_eq!(out.removed, 1);
+        assert_eq!(out.kept, 1);
+        assert!(out.excluded.is_empty());
         assert!(!is_bad(tmp.path(), "a"));
         assert!(is_bad(tmp.path(), "b"));
+    }
+
+    /// #4212: a named account whose only entry is non-auth ("exhausted") is
+    /// reported as `excluded` under the default scope — the caller fails
+    /// instead of silently no-op'ing.
+    #[test]
+    fn unblock_default_scope_reports_excluded_non_auth() {
+        let tmp = make_pool();
+        mark_bad(tmp.path(), "a", "401 unauthorized").unwrap();
+        mark_bad(tmp.path(), "b", "exhausted: weekly-limit").unwrap();
+        let out = unblock(tmp.path(), &["a".to_string(), "b".to_string()], false).unwrap();
+        assert_eq!(out.removed, 1); // a's auth entry
+        assert_eq!(out.kept, 1); // b's exhausted entry stays
+        assert_eq!(out.excluded, vec!["b".to_string()]);
     }
 
     #[test]
     fn unblock_all_reasons_drops_non_auth_too() {
         let tmp = make_pool();
         mark_bad(tmp.path(), "b", "exhausted: 429").unwrap();
-        let (removed, kept) = unblock(tmp.path(), &["b".to_string()], true).unwrap();
-        assert_eq!(removed, 1);
-        assert_eq!(kept, 0);
+        let out = unblock(tmp.path(), &["b".to_string()], true).unwrap();
+        assert_eq!(out.removed, 1);
+        assert_eq!(out.kept, 0);
+        // --all-reasons never excludes anything.
+        assert!(out.excluded.is_empty());
         assert!(!is_bad(tmp.path(), "b"));
     }
 
@@ -445,9 +499,10 @@ mod tests {
     fn unblock_ignores_unrelated_names() {
         let tmp = make_pool();
         mark_bad(tmp.path(), "a", "auth failure").unwrap();
-        let (removed, kept) = unblock(tmp.path(), &["c".to_string()], false).unwrap();
-        assert_eq!(removed, 0);
-        assert_eq!(kept, 1);
+        let out = unblock(tmp.path(), &["c".to_string()], false).unwrap();
+        assert_eq!(out.removed, 0);
+        assert_eq!(out.kept, 1);
+        assert!(out.excluded.is_empty());
         assert!(is_bad(tmp.path(), "a"));
     }
 
@@ -456,9 +511,10 @@ mod tests {
         let tmp = make_pool();
         let dir = pool_dir(tmp.path());
         fs::write(dir.join(".bad_tokens"), "onlyoneword\n").unwrap();
-        let (removed, kept) = unblock(tmp.path(), &["onlyoneword".to_string()], true).unwrap();
-        assert_eq!(removed, 0);
-        assert_eq!(kept, 1);
+        let out = unblock(tmp.path(), &["onlyoneword".to_string()], true).unwrap();
+        assert_eq!(out.removed, 0);
+        assert_eq!(out.kept, 1);
+        assert!(out.excluded.is_empty());
     }
 
     #[test]
