@@ -100,6 +100,12 @@ const GITIGNORE_BLOCK_HEADER: &str = "# Loom runtime state (don't commit these)"
 /// `.loom/exit-codes/`, `.loom/sweep-run/`, `.loom/stats/`, `.loom/spawn-loop.pid`,
 /// and `.loom/stop-spawn-loop`. The marker-delimited block is refreshed in place
 /// on every `update_gitignore`, so re-running the installer re-syncs consumers.
+///
+/// #4280: added `.loom/worktrees-local/` (machine-local worktree state observed
+/// untracked-and-unignored in a consumer repo). Existing consumer installs
+/// converge on this list via the new `loom-daemon update-gitignore` subcommand,
+/// which `resync-installed.sh` invokes — the block was previously refreshed only
+/// during a full `init`, so a fix here never reached repos between installs.
 pub const EPHEMERAL_PATTERNS: &[&str] = &[
     ".loom-in-use",
     ".loom-checkpoint",
@@ -118,6 +124,10 @@ pub const EPHEMERAL_PATTERNS: &[&str] = &[
     ".loom/issue-failures.json",
     ".loom/interventions/",
     ".loom/worktrees/",
+    // Local-mode / machine-local worktree state observed untracked-and-unignored
+    // in a consumer repo (anvil, 2026-07-28): `.loom/worktrees-local/<repo>/issue-N`
+    // (#4280). Runtime worktree state, same class as `.loom/worktrees/`.
+    ".loom/worktrees-local/",
     ".loom/state.json",
     ".loom/mcp-command.json",
     ".loom/activity.db",
@@ -539,6 +549,9 @@ mod tests {
         assert_eq!(contents.matches(".loom/locks/").count(), 1);
         assert!(contents.contains("# Loom runtime state"));
 
+        // #4280: machine-local worktree state must be ignored and appear once.
+        assert_eq!(contents.matches(".loom/worktrees-local/").count(), 1);
+
         // #3778: patterns that had drifted out of this installer-managed list
         // relative to the source .gitignore — a consumer re-sync must now emit
         // them so Loom-owned transient state never surfaces as untracked dirt.
@@ -600,6 +613,8 @@ mod tests {
         assert_eq!(contents.matches(".loom/worktrees/").count(), 1);
         assert_eq!(contents.matches(".loom/sweep-checkpoint/").count(), 1);
         assert_eq!(contents.matches(".loom/locks/").count(), 1);
+        // #4280: `.loom/worktrees-local/` must not duplicate across runs.
+        assert_eq!(contents.matches(".loom/worktrees-local/").count(), 1);
     }
 
     #[test]
@@ -628,6 +643,7 @@ mod tests {
             ".loom/issue-failures.json",
             ".loom/interventions/",
             ".loom/worktrees/",
+            ".loom/worktrees-local/",
             ".loom/state.json",
             ".loom/mcp-command.json",
             ".loom/activity.db",
@@ -1011,6 +1027,46 @@ mod tests {
         update_gitignore(tmp.path()).unwrap();
         let again = fs::read_to_string(&gitignore).unwrap();
         assert_eq!(contents, again, "second migration run must be a byte-identical no-op");
+    }
+
+    #[test]
+    fn refreshes_stale_marked_block_to_include_new_runtime_patterns() {
+        // #4280: a consumer whose marker-delimited block was written by a
+        // pre-#3642 binary lacks `.loom/sweep-checkpoint/` (and `.loom/worktrees-local/`).
+        // A single `update_gitignore` must refresh the block in place so those
+        // runtime paths become ignored — this is what the resync entry point drives.
+        let tmp = TempDir::new().unwrap();
+        let gitignore = tmp.path().join(".gitignore");
+
+        // Seed a well-formed but stale managed block (a realistic pre-#3642 subset),
+        // flanked by user content on both sides.
+        let stale_block = format!(
+            "{begin}\n{header}\n.loom-in-use\n.loom/state.json\n.loom/worktrees/\n.loom/logs/\n{end}",
+            begin = GITIGNORE_BEGIN_MARKER,
+            header = GITIGNORE_BLOCK_HEADER,
+            end = GITIGNORE_END_MARKER,
+        );
+        fs::write(&gitignore, format!("node_modules/\n{stale_block}\ndist/\n")).unwrap();
+
+        update_gitignore(tmp.path()).unwrap();
+        let contents = fs::read_to_string(&gitignore).unwrap();
+
+        // Exactly one block, markers preserved.
+        assert_eq!(contents.matches(GITIGNORE_BEGIN_MARKER).count(), 1);
+        assert_eq!(contents.matches(GITIGNORE_END_MARKER).count(), 1);
+        // The previously-absent runtime patterns are now present exactly once.
+        assert_eq!(contents.matches(".loom/sweep-checkpoint/").count(), 1);
+        assert_eq!(contents.matches(".loom/worktrees-local/").count(), 1);
+        // User content on both sides survived and kept its ordering.
+        let begin_pos = contents.find(GITIGNORE_BEGIN_MARKER).unwrap();
+        let end_pos = contents.find(GITIGNORE_END_MARKER).unwrap();
+        assert!(contents.find("node_modules/").unwrap() < begin_pos);
+        assert!(contents.find("dist/").unwrap() > end_pos);
+
+        // Idempotent: a second run is a byte-identical no-op.
+        update_gitignore(tmp.path()).unwrap();
+        let again = fs::read_to_string(&gitignore).unwrap();
+        assert_eq!(contents, again, "second refresh must be a byte-identical no-op");
     }
 
     #[test]

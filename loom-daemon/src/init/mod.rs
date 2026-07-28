@@ -35,14 +35,16 @@ use std::path::Path;
 use serde_json::Value;
 
 use file_ops::{clean_managed_dir, copy_dir_with_report, verify_copied_files, TemplateContext};
-use post_init::{
-    find_overbroad_loom_patterns, generate_manifest, update_gitignore, write_install_metadata,
-};
+use post_init::{find_overbroad_loom_patterns, generate_manifest, write_install_metadata};
 use retired::cleanup_retired_files;
 use scaffolding::setup_repository_scaffolding;
 
 // Re-export public types and functions
 pub use git::is_loom_source_repo;
+// Re-exported so the `loom-daemon update-gitignore` subcommand (#4280) can
+// rewrite the marker-delimited managed block on its own, without running a full
+// `init`. The pattern list stays single-sourced in `post_init::EPHEMERAL_PATTERNS`.
+pub use post_init::update_gitignore;
 
 // Import the rest for internal use
 use git::{resolve_defaults_path, validate_git_repository, validate_loom_source_repo};
