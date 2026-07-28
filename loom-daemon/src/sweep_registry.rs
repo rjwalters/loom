@@ -954,6 +954,41 @@ fn poll_token_name(child: &mut Child, log_path: &Path, header_anchor: &str) -> S
     }
 }
 
+/// Recover the OAuth account name a previously-dispatched, now-adopted sweep
+/// selected, from its surviving per-sweep log (Issue #4173).
+///
+/// Restart adoption (`reconstruct`) restores in-flight sweeps from the
+/// per-issue lock's `owner.json`, which records the `sweep_id` but **not** the
+/// token — so the adoption site previously defaulted `token_name` to
+/// `UNKNOWN_TOKEN_NAME`, losing status attribution and (worse) leaving an
+/// account-exhaustion death un-markable via the #4122 path (`insta_crash_is_
+/// account_exhaustion` cannot mark an account bad when `token=unknown`).
+///
+/// The token was captured at dispatch by parsing the per-sweep log for the
+/// `using OAuth account '<name>'` marker anchored to this dispatch's
+/// `sweep_id=<id>` header (`parse_token_name_after`). Both the log file and the
+/// `sweep_id` (from `owner.json`) survive a daemon restart, so we re-run the
+/// same parser once at startup — a single bounded read, no polling: the line
+/// was either written long ago or (for a rotated/truncated/no-selection log)
+/// never will be.
+///
+/// Degrades gracefully to `UNKNOWN_TOKEN_NAME` when the log is missing or lacks
+/// the selection line, so adoption never fails on capture.
+///
+/// Note (capacity accounting): recovery restores *attribution* only. An
+/// `unknown` adopted sweep was never a capacity-exemption bug — the concurrency
+/// cap is aggregate (`healthy_tokens × perTokenConcurrency` vs. total
+/// occupancy, `resolve_dynamic_max_concurrent`), and adopted `Running` entries
+/// already count toward that occupancy regardless of `token_name`. What
+/// `unknown` costs is `status` visibility and the #4122 bad-marking path.
+fn recover_adopted_token_name(log_path: &Path, sweep_id: &str) -> String {
+    let anchor = format!("sweep_id={sweep_id}");
+    std::fs::read_to_string(log_path)
+        .ok()
+        .and_then(|contents| parse_token_name_after(&contents, &anchor))
+        .unwrap_or_else(|| UNKNOWN_TOKEN_NAME.to_string())
+}
+
 // ============================================================================
 // Account-exhaustion classification at insta-crash time (Issue #4122)
 // ============================================================================
@@ -4374,13 +4409,19 @@ impl SweepRegistry {
                 let started_at = chrono::DateTime::parse_from_rfc3339(&owner.acquired_at)
                     .map_or_else(|_| Utc::now(), |t| t.with_timezone(&Utc));
                 let repo = Some(self.config.workspace_root.display().to_string());
+                // Issue #4173: the lock owner.json does not record the token,
+                // but the per-sweep log (which survives the restart) captured
+                // the OAuth account at dispatch. Re-run the same parser, anchored
+                // to owner.sweep_id, to restore attribution before falling back
+                // to `unknown`. Degrades gracefully — adoption never fails here.
+                let token_name = recover_adopted_token_name(&log_path, &owner.sweep_id);
                 self.entries.insert(
                     owner.sweep_id.clone(),
                     SweepInfo {
                         sweep_id: owner.sweep_id.clone(),
                         kind: SweepKind::Issue(issue),
                         pid: owner.owner_pid,
-                        token_name: "unknown".to_string(),
+                        token_name,
                         log_path,
                         idempotency_key: None,
                         started_at,
@@ -4454,6 +4495,10 @@ impl SweepRegistry {
                         sweep_id,
                         kind: SweepKind::Issue(issue),
                         pid: 0, // unknown — owner is gone
+                        // Issue #4173: a checkpoint-only entry has no lock
+                        // `sweep_id` anchor to recover the token against (the
+                        // lock was already removed as stale above), so this
+                        // path legitimately stays `unknown`.
                         token_name: "unknown".to_string(),
                         log_path,
                         idempotency_key: None,
@@ -8005,6 +8050,157 @@ exit 0
         assert_eq!(crashed[0].latest_phase.as_deref(), Some("judge"));
         // The stale daemon lock is cleaned up as part of recovery.
         assert!(!lock.exists(), "stale daemon lock should be removed");
+    }
+
+    /// Issue #4173: adoption recovers the real OAuth account from the surviving
+    /// per-sweep log (the `using OAuth account '<name>'` line anchored to the
+    /// lock's `sweep_id`), so `status` shows the account, not `unknown`.
+    #[test]
+    fn reconstruct_recovers_token_name_from_log() {
+        let dir = tempdir().unwrap();
+        let (mut registry, _record_log) = fixture_registry(dir.path());
+
+        let locks = registry.config.locks_dir();
+        std::fs::create_dir_all(&locks).unwrap();
+        let lock = locks.join("issue-401");
+        std::fs::create_dir(&lock).unwrap();
+        let sweep_id = "sweep-issue-401-adopt";
+        let owner = LockOwner {
+            issue: 401,
+            owner_pid: std::process::id(), // alive → admitted as Running
+            acquired_at: Utc::now().to_rfc3339(),
+            sweep_id: sweep_id.to_string(),
+        };
+        std::fs::write(lock.join("owner.json"), serde_json::to_string_pretty(&owner).unwrap())
+            .unwrap();
+
+        // The per-sweep log survived the restart with the dispatch header and
+        // the account-selection line the wrapper wrote.
+        let log_path = registry.compute_log_path(401);
+        std::fs::create_dir_all(log_path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &log_path,
+            format!(
+                "sweep_id={sweep_id} issue=401 ====\n\
+                 spawn-claude: using OAuth account 'agent1-2amlogic' (mode=ranking)\n\
+                 ...build output...\n"
+            ),
+        )
+        .unwrap();
+
+        let admitted = registry.reconstruct().unwrap();
+        assert!(admitted >= 1);
+        let info = registry.get(sweep_id).unwrap();
+        assert_eq!(
+            info.token_name, "agent1-2amlogic",
+            "adopted sweep must recover its account from the log (#4173)"
+        );
+    }
+
+    /// Issue #4173: a missing log, or a log without the selection line, degrades
+    /// gracefully to `unknown` — adoption never fails on token capture.
+    #[test]
+    fn reconstruct_token_recovery_degrades_to_unknown() {
+        let dir = tempdir().unwrap();
+        let (mut registry, _record_log) = fixture_registry(dir.path());
+
+        let locks = registry.config.locks_dir();
+        std::fs::create_dir_all(&locks).unwrap();
+
+        // Case A: log present but WITHOUT a selection line.
+        let lock_a = locks.join("issue-402");
+        std::fs::create_dir(&lock_a).unwrap();
+        let owner_a = LockOwner {
+            issue: 402,
+            owner_pid: std::process::id(),
+            acquired_at: Utc::now().to_rfc3339(),
+            sweep_id: "sweep-issue-402-noline".to_string(),
+        };
+        std::fs::write(lock_a.join("owner.json"), serde_json::to_string_pretty(&owner_a).unwrap())
+            .unwrap();
+        let log_a = registry.compute_log_path(402);
+        std::fs::create_dir_all(log_a.parent().unwrap()).unwrap();
+        std::fs::write(&log_a, "sweep_id=sweep-issue-402-noline issue=402 ====\nno selection\n")
+            .unwrap();
+
+        // Case B: no log file at all (rotated/truncated away).
+        let lock_b = locks.join("issue-403");
+        std::fs::create_dir(&lock_b).unwrap();
+        let owner_b = LockOwner {
+            issue: 403,
+            owner_pid: std::process::id(),
+            acquired_at: Utc::now().to_rfc3339(),
+            sweep_id: "sweep-issue-403-nolog".to_string(),
+        };
+        std::fs::write(lock_b.join("owner.json"), serde_json::to_string_pretty(&owner_b).unwrap())
+            .unwrap();
+
+        let admitted = registry.reconstruct().unwrap();
+        assert!(admitted >= 2, "both sweeps admitted despite unrecoverable token");
+        assert_eq!(
+            registry.get("sweep-issue-402-noline").unwrap().token_name,
+            UNKNOWN_TOKEN_NAME,
+            "no selection line → unknown"
+        );
+        assert_eq!(
+            registry.get("sweep-issue-403-nolog").unwrap().token_name,
+            UNKNOWN_TOKEN_NAME,
+            "missing log → unknown"
+        );
+    }
+
+    /// Issue #4173 + #4122: an adopted sweep that insta-crashes on an
+    /// account-exhaustion signature marks the RECOVERED account bad — the fix
+    /// closes the gap where `token=unknown` left the burned account in rotation.
+    #[test]
+    fn adopted_exhaustion_marks_recovered_account_bad() {
+        let dir = tempdir().unwrap();
+        let (mut registry, _record_log) = fixture_registry(dir.path());
+        seed_token_pool(dir.path(), "agent4-2amlogic");
+
+        let locks = registry.config.locks_dir();
+        std::fs::create_dir_all(&locks).unwrap();
+        let lock = locks.join("issue-404");
+        std::fs::create_dir(&lock).unwrap();
+        let sweep_id = "sweep-issue-404-adopt";
+        let owner = LockOwner {
+            issue: 404,
+            owner_pid: std::process::id(),
+            acquired_at: Utc::now().to_rfc3339(),
+            sweep_id: sweep_id.to_string(),
+        };
+        std::fs::write(lock.join("owner.json"), serde_json::to_string_pretty(&owner).unwrap())
+            .unwrap();
+
+        // Surviving log: dispatch header + selection line + exhaustion tail.
+        let log_path = registry.compute_log_path(404);
+        std::fs::create_dir_all(log_path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &log_path,
+            format!(
+                "sweep_id={sweep_id} issue=404 ====\n\
+                 spawn-claude: using OAuth account 'agent4-2amlogic' (mode=ranking)\n\
+                 Claude: hit your weekly limit — try again later\n"
+            ),
+        )
+        .unwrap();
+
+        assert!(registry.reconstruct().unwrap() >= 1);
+        assert_eq!(
+            registry.get(sweep_id).unwrap().token_name,
+            "agent4-2amlogic",
+            "precondition: token recovered on adoption"
+        );
+
+        // The adopted sweep dies with an exhaustion signature: the recovered
+        // account (not `unknown`) is marked bad via the #4122 path.
+        let charged_account =
+            registry.insta_crash_is_account_exhaustion(&sweep_id.to_string(), 404);
+        assert!(charged_account, "exhaustion classified → account charged, issue spared");
+        assert!(
+            bad_tokens::is_bad(dir.path(), "agent4-2amlogic"),
+            "recovered account marked bad on adopted-sweep exhaustion death (#4173)"
+        );
     }
 
     #[test]
