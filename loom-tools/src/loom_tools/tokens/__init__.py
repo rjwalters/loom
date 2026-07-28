@@ -51,12 +51,28 @@ from loom_tools.tokens.failure_counts import (
     reset_all,
     threshold_reached,
 )
-from loom_tools.tokens.select import (
-    EmptyTokenPoolError,
-    SelectedToken,
-    TokenSelectionError,
-    select_token,
-)
+# NOTE: `select` is intentionally *not* imported eagerly here. Doing so would
+# put `loom_tools.tokens.select` into `sys.modules` before `runpy` executes it
+# as `__main__` for `python3 -m loom_tools.tokens.select` invocations (used by
+# `defaults/scripts/spawn-claude.sh` and `claude-wrapper.sh`), which triggers a
+# `RuntimeWarning: found in sys.modules after import ... this may result in
+# unpredictable behaviour` on every spawn. Instead, re-export the names lazily
+# via PEP 562 module `__getattr__` so the public API (`select_token`, etc.) is
+# still importable from the package, just not eagerly.
+
+
+def __getattr__(name: str):
+    if name in {
+        "EmptyTokenPoolError",
+        "SelectedToken",
+        "TokenSelectionError",
+        "select_token",
+    }:
+        from loom_tools.tokens import select as _select
+
+        return getattr(_select, name)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
 
 __all__ = [
     "DEFAULT_THRESHOLD",
