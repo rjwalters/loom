@@ -5,6 +5,9 @@
     "roleRunner": {
       "enabled": true,
       "roles": ["curator", "champion"]
+    },
+    "collisionDetection": {
+      "enabled": true
     }
   },
   "buildGate": {
