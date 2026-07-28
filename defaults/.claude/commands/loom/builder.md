@@ -293,6 +293,12 @@ echo "$WORKTREE_ABS"  # MUST end in /.loom/worktrees/issue-<number>
 
 # 3. Verify the worktree's branch (works from anywhere via -C)
 git -C "$WORKTREE_ABS" branch --show-current  # MUST show: feature/issue-<number>
+
+# 4. Assert $WORKTREE_ABS is actually a managed worktree (not the main
+#    checkout under a misleading variable name) BEFORE any edit — the same
+#    two checks guard-worktree-paths.sh uses to confine Edit/Write (#4178):
+[[ -f "$WORKTREE_ABS/.loom-managed" ]] || echo "FATAL: no .loom-managed sentinel at $WORKTREE_ABS"
+[[ "$(git -C "$WORKTREE_ABS" rev-parse --show-toplevel)" == "$WORKTREE_ABS" ]] || echo "FATAL: $WORKTREE_ABS is not its own git toplevel"
 ```
 
 ### CRITICAL: Absolute-Path Discipline (cwd does NOT persist across tool calls)
@@ -358,10 +364,20 @@ Before writing any code, confirm ALL of these:
 - [ ] Worktree exists at `.loom/worktrees/issue-<N>`
 - [ ] Captured the worktree ABSOLUTE path once (`WORKTREE_ABS="$(cd .loom/worktrees/issue-<N> && pwd)"`)
 - [ ] Branch is `feature/issue-<N>` (not `main`) — `git -C "$WORKTREE_ABS" branch --show-current`
+- [ ] `.loom-managed` sentinel is present at `$WORKTREE_ABS` AND `git -C "$WORKTREE_ABS" rev-parse --show-toplevel` equals `$WORKTREE_ABS` (#4178 — the same assertion the worktree-isolation guard applies to every Edit/Write and Bash write)
 - [ ] Will use absolute paths under `$WORKTREE_ABS` for every Write/Edit/Bash file operation (cwd does NOT persist across tool calls)
 - [ ] Issue is claimed with `loom:building` label
 
 **If any of these fail, STOP and fix the setup before proceeding.**
+
+**A denial is not a signal to retry via Bash.** `guard-worktree-paths.sh`
+confines the Edit/Write tools to your worktree; `guard-destructive-generic.sh`
+independently confines the common Bash write idioms (`>`/`>>` redirection,
+`tee`, `sed -i`, `cp`/`mv`) the same way (#4178). If either denies a write, the
+fix is always the same: re-run the assertions above and use `$WORKTREE_ABS`,
+never to fall back to the other tool for the same target path — that fallback
+is exactly how sweep #4063 escaped and edited live guard hooks in the main
+checkout.
 
 ### Working with gh CLI from a Worktree
 
