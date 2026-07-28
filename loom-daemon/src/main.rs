@@ -226,9 +226,10 @@ enum Commands {
     /// self-refresh invoke natively. As of #4105 `bootstrap` is native too
     /// (multi-source `.env` merge + pool provisioning), and as of #4106
     /// `import-from-monitor` is native too (claude-monitor live SQLite
-    /// import); `spawn-claude.sh` (selection) remains Python-only (see
-    /// `loom-daemon/src/tokens_pool/mod.rs`). Purely file-based; does not
-    /// require a running daemon.
+    /// import). As of #4228 `select` and the new `mark-bad` are also what
+    /// `spawn-claude.sh` / `claude-wrapper.sh` invoke — zero Python left on
+    /// the token hot path (see `loom-daemon/src/tokens_pool/mod.rs`). Purely
+    /// file-based; does not require a running daemon.
     Tokens {
         #[command(subcommand)]
         action: TokensAction,
@@ -382,21 +383,35 @@ enum QuarantineAction {
 enum TokensAction {
     /// Select an OAuth token from the pool using the 3-tier algorithm
     /// (ranking -> allowlist -> random), skipping bad-marked tokens at every
-    /// tier. Mirrors `python3 -m loom_tools.tokens.select`.
+    /// tier. Native Rust port of `python3 -m loom_tools.tokens.select`,
+    /// invoked directly by `spawn-claude.sh` / `claude-wrapper.sh` as of
+    /// issue #4228 (epic #4081 Phase 2) — the Python selector is no longer on
+    /// the token hot path.
     Select {
         /// Repo root containing `.loom/tokens/` (the canonical main-checkout
         /// root when called from a worktree — no upward `.git` walk).
         #[arg(long, value_name = "PATH", default_value = ".")]
         workspace: String,
 
-        /// Emit `export CLAUDE_CODE_OAUTH_TOKEN=...` shell lines instead of
-        /// JSON.
+        /// Emit shell-evalable `export CLAUDE_CODE_OAUTH_TOKEN=...` /
+        /// `export LOOM_TOKEN_NAME=...` lines (plus a non-exported
+        /// `LOOM_TOKEN_MODE=...` assignment) instead of JSON — designed to be
+        /// consumed via `eval "$(loom-daemon tokens select --export ...)"`.
         #[arg(long)]
         export: bool,
 
         /// Omit the secret key from output (safe inspection).
         #[arg(long)]
         no_key: bool,
+
+        /// Pre-flight (issue #4228): if every allowlisted (pinned) account
+        /// has hit the consecutive-failure threshold, clear `.allowlist` and
+        /// reset `.failure_counts` before selecting, rather than trap the
+        /// spawner on exhausted pinned accounts. Mirrors the inline Python
+        /// heredoc `spawn-claude.sh` historically ran ahead of selection; a
+        /// firing auto-unpin logs an `[auto-unpin] ...` advisory to stderr.
+        #[arg(long)]
+        auto_unpin: bool,
     },
 
     /// Materialize `.loom/tokens/` from `ACCOUNT_*_N` triples, merging by email
@@ -565,6 +580,31 @@ enum TokensAction {
         all_reasons: bool,
 
         /// Emit JSON status.
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Append a bad-token entry to `.bad_tokens` for `name`. Native Rust CLI
+    /// exposure of the existing `tokens_pool::bad_tokens::mark_bad` library
+    /// function (issue #4228, epic #4081 Phase 2) — closes the last gap that
+    /// kept `claude-wrapper.sh`'s account-rotation path on an inline Python
+    /// heredoc. Byte-compatible with the historical Python `mark_bad`: the
+    /// reason is newline-sanitized (embedded `\n`/`\r` collapsed to spaces)
+    /// so every `.bad_tokens` entry is exactly one line.
+    MarkBad {
+        /// Account name (token file stem, no extension) to mark bad.
+        #[arg(value_name = "NAME")]
+        name: String,
+
+        /// Free-form reason recorded alongside the timestamp + name.
+        #[arg(long, value_name = "TEXT", default_value = "")]
+        reason: String,
+
+        /// Repo root containing `.loom/tokens/`.
+        #[arg(long, value_name = "PATH", default_value = ".")]
+        workspace: String,
+
+        /// Emit a JSON status instead of a human message.
         #[arg(long)]
         json: bool,
     },
@@ -3841,10 +3881,11 @@ fn print_monitor_import(result: &loom_daemon::tokens_pool::monitor_db::MonitorIm
     }
 }
 
-/// Handle `loom-daemon tokens <select|pin|unpin|unblock>` (Issue #4082,
-/// Phase 1 of epic #4081). Purely file-based — does not require a running
-/// daemon. See `loom-daemon/src/tokens_pool/mod.rs` for the ported subset
-/// and what is deliberately deferred.
+/// Handle `loom-daemon tokens <select|pin|unpin|unblock|mark-bad>` (Issue
+/// #4082, Phase 1 of epic #4081; `mark-bad` added in #4228, Phase 2). Purely
+/// file-based — does not require a running daemon. See
+/// `loom-daemon/src/tokens_pool/mod.rs` for the ported subset and what is
+/// deliberately deferred.
 fn handle_tokens_command(action: TokensAction) -> Result<()> {
     use loom_daemon::tokens_pool::{allowlist, bad_tokens, failure_counts, select};
 
@@ -3853,8 +3894,14 @@ fn handle_tokens_command(action: TokensAction) -> Result<()> {
             workspace,
             export,
             no_key,
+            auto_unpin,
         } => {
             let ws = resolve_tokens_workspace(&workspace)?;
+            if auto_unpin {
+                if let Some(msg) = loom_daemon::tokens_pool::maybe_auto_unpin(&ws) {
+                    eprintln!("{msg}");
+                }
+            }
             match select::select_token(&ws, None) {
                 Ok(sel) => {
                     if export {
@@ -3868,10 +3915,14 @@ fn handle_tokens_command(action: TokensAction) -> Result<()> {
                         } else {
                             // Tokens are base64/hex-like and never contain a
                             // single quote in practice; this is a simple
-                            // wrap, not a full Python repr() escape (no
-                            // caller consumes --export in this phase — see
-                            // module docs).
+                            // wrap, not a full Python repr() escape.
                             println!("export CLAUDE_CODE_OAUTH_TOKEN='{}'", sel.key);
+                            // Shell-evalable (issue #4228): lets
+                            // spawn-claude.sh / claude-wrapper.sh `eval` this
+                            // output directly instead of round-tripping
+                            // through `python3 -c 'import json...'`.
+                            println!("export LOOM_TOKEN_NAME='{}'", sel.name);
+                            println!("LOOM_TOKEN_MODE='{}'", sel.mode);
                             println!(
                                 "# selected={} mode={} file={}",
                                 sel.name,
@@ -4236,6 +4287,29 @@ fn handle_tokens_command(action: TokensAction) -> Result<()> {
                 std::process::exit(3);
             }
             Ok(())
+        }
+
+        TokensAction::MarkBad {
+            name,
+            reason,
+            workspace,
+            json,
+        } => {
+            let ws = resolve_tokens_workspace(&workspace)?;
+            match bad_tokens::mark_bad(&ws, &name, &reason) {
+                Ok(()) => {
+                    if json {
+                        println!("{}", serde_json::json!({ "marked": true, "name": name }));
+                    } else {
+                        println!("Marked '{name}' bad ({reason}).");
+                    }
+                    Ok(())
+                }
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    std::process::exit(1);
+                }
+            }
         }
     }
 }

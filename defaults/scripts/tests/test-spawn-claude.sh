@@ -11,6 +11,25 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SCRIPTS_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+DEFAULTS_DIR="$(cd "$SCRIPTS_DIR/.." && pwd)"
+REPO_ROOT="$(cd "$DEFAULTS_DIR/.." && pwd)"
+
+# Resolve THIS checkout's own `loom-daemon` binary (issue #4228 — spawn-claude.sh
+# / claude-wrapper.sh now select/mark-bad tokens through it instead of Python).
+# Pin it explicitly into every spawn-claude.sh / claude-wrapper.sh invocation
+# below via LOOM_DAEMON_BIN so the assertions exercise THIS checkout's daemon,
+# never any host-level install / canary loom-daemon the dev environment may
+# have on PATH (mirrors the pre-existing LOOM_PACKAGE_PATH-pinning rationale
+# this file used for the Python selector).
+DAEMON_BIN=""
+for _candidate in \
+    "$REPO_ROOT/target/release/loom-daemon" \
+    "$REPO_ROOT/target/debug/loom-daemon"; do
+    if [[ -x "$_candidate" ]]; then
+        DAEMON_BIN="$_candidate"
+        break
+    fi
+done
 
 # Colors
 RED='\033[0;31m'
@@ -298,6 +317,17 @@ assert_eq "RECOVERABLE" "$result" "2-arg call under set -u with no LOOM_RUNTIME 
 echo ""
 echo "Testing spawn-claude.sh dispatch..."
 
+# spawn-claude.sh's token selection is now a hard dependency on the native
+# `loom-daemon` binary (issue #4228, epic #4081 Phase 2 — no Python fallback
+# exists to degrade to). Fail fast with a clear message rather than let every
+# subsequent test below fail opaquely on "No loom-daemon binary...".
+if [[ -z "$DAEMON_BIN" ]]; then
+    echo "FATAL: no loom-daemon binary found at $REPO_ROOT/target/{release,debug}/loom-daemon" >&2
+    echo "  Build one first: cd loom-daemon && cargo build --release" >&2
+    echo "  (spawn-claude.sh's token selection requires it as of issue #4228)" >&2
+    exit 1
+fi
+
 # Set up a fake workspace
 TEST_WS="$(mktemp -d)"
 trap 'rm -rf "$TEST_WS"' EXIT
@@ -320,7 +350,7 @@ STUB
 chmod +x "$STUB_DIR/claude"
 
 # Test: spawn-claude selects the only token and exec's the stub
-output=$(LOOM_WORKSPACE="$TEST_WS" PATH="$STUB_DIR:$PATH" \
+output=$(LOOM_WORKSPACE="$TEST_WS" LOOM_DAEMON_BIN="$DAEMON_BIN" PATH="$STUB_DIR:$PATH" \
     "$SCRIPTS_DIR/spawn-claude.sh" -p "ping" 2>&1 || true)
 assert_contains "stub-claude got token=fake-token-alpha" "$output" \
     "spawn-claude exports selected token to claude"
@@ -337,7 +367,7 @@ assert_contains "stub-claude ceiling=0" "$output" \
 
 # Test: an operator-set CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS is PRESERVED
 # (the `:=` default-assignment idiom only fills an unset/empty value).
-output=$(LOOM_WORKSPACE="$TEST_WS" PATH="$STUB_DIR:$PATH" \
+output=$(LOOM_WORKSPACE="$TEST_WS" LOOM_DAEMON_BIN="$DAEMON_BIN" PATH="$STUB_DIR:$PATH" \
     CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS="120000" \
     "$SCRIPTS_DIR/spawn-claude.sh" -p "ping" 2>&1 || true)
 assert_contains "stub-claude ceiling=120000" "$output" \
@@ -348,7 +378,7 @@ assert_contains "stub-claude ceiling=120000" "$output" \
 # Explicitly unset it first: this test suite may itself be running inside a
 # daemon-dispatched `/loom:sweep` session, which would otherwise leak an
 # ambient `LOOM_SWEEP_CLAIM_OWNED` into the subshell and false-fail this case.
-output=$(env -u LOOM_SWEEP_CLAIM_OWNED LOOM_WORKSPACE="$TEST_WS" PATH="$STUB_DIR:$PATH" \
+output=$(env -u LOOM_SWEEP_CLAIM_OWNED LOOM_WORKSPACE="$TEST_WS" LOOM_DAEMON_BIN="$DAEMON_BIN" PATH="$STUB_DIR:$PATH" \
     "$SCRIPTS_DIR/spawn-claude.sh" -p "ping" 2>&1 || true)
 assert_contains "spawn-claude: LOOM_SWEEP_CLAIM_OWNED=unset" "$output" \
     "spawn-claude logs LOOM_SWEEP_CLAIM_OWNED=unset when not daemon-dispatched (#3967)"
@@ -356,7 +386,7 @@ assert_contains "spawn-claude: LOOM_SWEEP_CLAIM_OWNED=unset" "$output" \
 # Test: with the var set (simulating a daemon-dispatched child, #3823), the
 # same log line echoes the exact issue number — the diagnostic this issue's
 # acceptance criteria calls for, straight from the per-sweep log.
-output=$(LOOM_WORKSPACE="$TEST_WS" PATH="$STUB_DIR:$PATH" \
+output=$(LOOM_WORKSPACE="$TEST_WS" LOOM_DAEMON_BIN="$DAEMON_BIN" PATH="$STUB_DIR:$PATH" \
     LOOM_SWEEP_CLAIM_OWNED="3964" \
     "$SCRIPTS_DIR/spawn-claude.sh" -p "ping" 2>&1 || true)
 assert_contains "spawn-claude: LOOM_SWEEP_CLAIM_OWNED=3964" "$output" \
@@ -374,7 +404,7 @@ assert_contains "spawn-claude: LOOM_SWEEP_CLAIM_OWNED=3964" "$output" \
 # `/loom:sweep` skill's own `$ARGUMENTS`. This test asserts the prompt (with the
 # embedded flag) is forwarded verbatim as a single `-p` argument, alongside the
 # env var (kept for backward compatibility, #3823/#3967).
-output=$(LOOM_WORKSPACE="$TEST_WS" PATH="$STUB_DIR:$PATH" \
+output=$(LOOM_WORKSPACE="$TEST_WS" LOOM_DAEMON_BIN="$DAEMON_BIN" PATH="$STUB_DIR:$PATH" \
     LOOM_SWEEP_CLAIM_OWNED="4111" \
     "$SCRIPTS_DIR/spawn-claude.sh" -p "/loom:sweep 4111 --claim-owned 4111" \
         --dangerously-skip-permissions 2>&1 || true)
@@ -385,7 +415,7 @@ assert_contains "spawn-claude: LOOM_SWEEP_CLAIM_OWNED=4111" "$output" \
     "spawn-claude still logs the env var when the --claim-owned flag is also present (#4111 backward compat)"
 
 # Test: explicit CLAUDE_CODE_OAUTH_TOKEN bypasses selection
-output=$(LOOM_WORKSPACE="$TEST_WS" PATH="$STUB_DIR:$PATH" \
+output=$(LOOM_WORKSPACE="$TEST_WS" LOOM_DAEMON_BIN="$DAEMON_BIN" PATH="$STUB_DIR:$PATH" \
     CLAUDE_CODE_OAUTH_TOKEN="caller-supplied" \
     "$SCRIPTS_DIR/spawn-claude.sh" -p "ping" 2>&1 || true)
 assert_contains "stub-claude got token=caller-supplied" "$output" \
@@ -396,7 +426,7 @@ assert_contains "stub-claude got token=caller-supplied" "$output" \
 # case deterministically hard-fails regardless of the host's ~/.loom/tokens.
 EMPTY_WS="$(mktemp -d)"
 output=$(LOOM_WORKSPACE="$EMPTY_WS" LOOM_SHARED_TOKENS_DIR="" \
-    PATH="$STUB_DIR:$PATH" \
+    LOOM_DAEMON_BIN="$DAEMON_BIN" PATH="$STUB_DIR:$PATH" \
     "$SCRIPTS_DIR/spawn-claude.sh" -p "ping" 2>&1 || true)
 exit_code=$?
 assert_contains "loom-tokens bootstrap" "$output" \
@@ -405,7 +435,8 @@ rm -rf "$EMPTY_WS"
 
 # Test that spawn-claude.sh exits 78 on missing tokens (shared fallback off).
 set +e
-LOOM_WORKSPACE="$(mktemp -d)" LOOM_SHARED_TOKENS_DIR="" PATH="$STUB_DIR:$PATH" \
+LOOM_WORKSPACE="$(mktemp -d)" LOOM_SHARED_TOKENS_DIR="" \
+    LOOM_DAEMON_BIN="$DAEMON_BIN" PATH="$STUB_DIR:$PATH" \
     "$SCRIPTS_DIR/spawn-claude.sh" -p "ping" >/dev/null 2>&1
 exit_code=$?
 set -e
@@ -413,28 +444,22 @@ assert_eq "78" "$exit_code" "missing tokens exits 78 (EX_CONFIG)"
 
 # Test: consumer repo with NO per-repo pool falls back to the shared
 # machine-level pool (issue #3938) instead of hard-failing.
-#
-# Pin LOOM_PACKAGE_PATH at the repo-under-test's loom_tools so the assertion
-# exercises THIS checkout's selector, not any host-level editable install /
-# canary LOOM_PACKAGE_PATH the dev environment may export.
-REPO_PKG="$(cd "$SCRIPTS_DIR/../../loom-tools/src" 2>/dev/null && pwd || echo "")"
 CONSUMER_WS="$(mktemp -d)"
 SHARED_POOL="$(mktemp -d)"
 echo -n "fake-token-shared" > "$SHARED_POOL/shared-acct.token"
 chmod 600 "$SHARED_POOL/shared-acct.token"
 output=$(LOOM_WORKSPACE="$CONSUMER_WS" LOOM_SHARED_TOKENS_DIR="$SHARED_POOL" \
-    LOOM_PACKAGE_PATH="$REPO_PKG" PATH="$STUB_DIR:$PATH" \
+    LOOM_DAEMON_BIN="$DAEMON_BIN" PATH="$STUB_DIR:$PATH" \
     "$SCRIPTS_DIR/spawn-claude.sh" -p "ping" 2>&1 || true)
 assert_contains "stub-claude got token=fake-token-shared" "$output" \
     "spawn-claude falls back to shared pool for a repo with no pool (#3938)"
 assert_contains "OAuth account 'shared-acct'" "$output" \
     "spawn-claude logs the shared-pool account (#3938)"
 # State must land in the shared pool, never forked into the consumer repo.
-LOOM_SHARED_TOKENS_DIR="$SHARED_POOL" PYTHONPATH="$REPO_PKG" \
-    python3 -c "
-from loom_tools.tokens.bad_tokens import mark_bad
-mark_bad('$CONSUMER_WS', 'shared-acct', 'test')
-" 2>/dev/null || true
+# Uses the native `loom-daemon tokens mark-bad` CLI (issue #4228) instead of
+# the historical inline `loom_tools.tokens.bad_tokens.mark_bad` python call.
+LOOM_SHARED_TOKENS_DIR="$SHARED_POOL" "$DAEMON_BIN" tokens mark-bad shared-acct \
+    --reason test --workspace "$CONSUMER_WS" >/dev/null 2>&1 || true
 if [[ -f "$SHARED_POOL/.bad_tokens" && ! -f "$CONSUMER_WS/.loom/tokens/.bad_tokens" ]]; then
     assert_eq "ok" "ok" "shared-pool .bad_tokens written to shared dir, not consumer repo (#3938)"
 else
@@ -457,7 +482,7 @@ echo ""
 echo "Testing spawn-claude.sh model selection (#3477)..."
 
 # Case 3: LOOM_MODEL env produces --model in args
-output=$(LOOM_WORKSPACE="$TEST_WS" PATH="$STUB_DIR:$PATH" \
+output=$(LOOM_WORKSPACE="$TEST_WS" LOOM_DAEMON_BIN="$DAEMON_BIN" PATH="$STUB_DIR:$PATH" \
     LOOM_MODEL="claude-sonnet-4-6" \
     "$SCRIPTS_DIR/spawn-claude.sh" -p "ping" 2>&1 || true)
 assert_contains "stub-claude args=-p ping --model claude-sonnet-4-6" "$output" \
@@ -466,7 +491,7 @@ assert_contains "spawn-claude: model=claude-sonnet-4-6 (from LOOM_MODEL)" "$outp
     "structured model log line emitted for LOOM_MODEL case (#3482)"
 
 # Case 1: explicit --model arg wins over LOOM_MODEL env
-output=$(LOOM_WORKSPACE="$TEST_WS" PATH="$STUB_DIR:$PATH" \
+output=$(LOOM_WORKSPACE="$TEST_WS" LOOM_DAEMON_BIN="$DAEMON_BIN" PATH="$STUB_DIR:$PATH" \
     LOOM_MODEL="claude-sonnet-4-6" \
     "$SCRIPTS_DIR/spawn-claude.sh" -p "ping" --model claude-opus-4-8 2>&1 || true)
 assert_contains "stub-claude args=-p ping --model claude-opus-4-8" "$output" \
@@ -484,7 +509,7 @@ else
 fi
 
 # Case 2: --model=value form also suppresses LOOM_MODEL injection
-output=$(LOOM_WORKSPACE="$TEST_WS" PATH="$STUB_DIR:$PATH" \
+output=$(LOOM_WORKSPACE="$TEST_WS" LOOM_DAEMON_BIN="$DAEMON_BIN" PATH="$STUB_DIR:$PATH" \
     LOOM_MODEL="claude-sonnet-4-6" \
     "$SCRIPTS_DIR/spawn-claude.sh" -p "ping" --model=claude-opus-4-8 2>&1 || true)
 assert_contains "stub-claude args=-p ping --model=claude-opus-4-8" "$output" \
@@ -502,7 +527,7 @@ else
 fi
 
 # Case 4 (zero-behavior-change criterion): no env + no arg => no --model
-output=$(LOOM_WORKSPACE="$TEST_WS" PATH="$STUB_DIR:$PATH" \
+output=$(LOOM_WORKSPACE="$TEST_WS" LOOM_DAEMON_BIN="$DAEMON_BIN" PATH="$STUB_DIR:$PATH" \
     "$SCRIPTS_DIR/spawn-claude.sh" -p "ping" 2>&1 || true)
 TESTS_RUN=$((TESTS_RUN + 1))
 if [[ "$output" == *"stub-claude args=-p ping"* && "$output" != *"--model"* ]]; then
@@ -517,7 +542,7 @@ assert_contains "spawn-claude: model=default" "$output" \
     "structured model=default log line emitted when nothing configured (#3482)"
 
 # Empty LOOM_MODEL is treated as unset — no --model emitted
-output=$(LOOM_WORKSPACE="$TEST_WS" PATH="$STUB_DIR:$PATH" \
+output=$(LOOM_WORKSPACE="$TEST_WS" LOOM_DAEMON_BIN="$DAEMON_BIN" PATH="$STUB_DIR:$PATH" \
     LOOM_MODEL="" \
     "$SCRIPTS_DIR/spawn-claude.sh" -p "ping" 2>&1 || true)
 TESTS_RUN=$((TESTS_RUN + 1))
@@ -549,7 +574,7 @@ echo ""
 echo "Testing spawn-claude.sh effort selection (#3705)..."
 
 # Case 1: LOOM_EFFORT env produces --effort in args
-output=$(LOOM_WORKSPACE="$TEST_WS" PATH="$STUB_DIR:$PATH" \
+output=$(LOOM_WORKSPACE="$TEST_WS" LOOM_DAEMON_BIN="$DAEMON_BIN" PATH="$STUB_DIR:$PATH" \
     LOOM_EFFORT="xhigh" \
     "$SCRIPTS_DIR/spawn-claude.sh" -p "ping" 2>&1 || true)
 assert_contains "stub-claude args=-p ping --effort xhigh" "$output" \
@@ -558,7 +583,7 @@ assert_contains "spawn-claude: effort=xhigh (from LOOM_EFFORT)" "$output" \
     "structured effort log line emitted for LOOM_EFFORT case (#3705)"
 
 # Case 2: explicit --effort arg wins over LOOM_EFFORT env
-output=$(LOOM_WORKSPACE="$TEST_WS" PATH="$STUB_DIR:$PATH" \
+output=$(LOOM_WORKSPACE="$TEST_WS" LOOM_DAEMON_BIN="$DAEMON_BIN" PATH="$STUB_DIR:$PATH" \
     LOOM_EFFORT="xhigh" \
     "$SCRIPTS_DIR/spawn-claude.sh" -p "ping" --effort high 2>&1 || true)
 assert_contains "stub-claude args=-p ping --effort high" "$output" \
@@ -576,7 +601,7 @@ else
 fi
 
 # Case 3: --effort=value form also suppresses LOOM_EFFORT injection
-output=$(LOOM_WORKSPACE="$TEST_WS" PATH="$STUB_DIR:$PATH" \
+output=$(LOOM_WORKSPACE="$TEST_WS" LOOM_DAEMON_BIN="$DAEMON_BIN" PATH="$STUB_DIR:$PATH" \
     LOOM_EFFORT="xhigh" \
     "$SCRIPTS_DIR/spawn-claude.sh" -p "ping" --effort=high 2>&1 || true)
 assert_contains "stub-claude args=-p ping --effort=high" "$output" \
@@ -594,7 +619,7 @@ else
 fi
 
 # Case 4 (zero-behavior-change criterion): no env + no arg => no --effort
-output=$(LOOM_WORKSPACE="$TEST_WS" PATH="$STUB_DIR:$PATH" \
+output=$(LOOM_WORKSPACE="$TEST_WS" LOOM_DAEMON_BIN="$DAEMON_BIN" PATH="$STUB_DIR:$PATH" \
     "$SCRIPTS_DIR/spawn-claude.sh" -p "ping" 2>&1 || true)
 TESTS_RUN=$((TESTS_RUN + 1))
 if [[ "$output" == *"stub-claude args=-p ping"* && "$output" != *"--effort"* ]]; then
@@ -616,7 +641,7 @@ else
 fi
 
 # Case 5: empty LOOM_EFFORT is treated as unset — no --effort emitted
-output=$(LOOM_WORKSPACE="$TEST_WS" PATH="$STUB_DIR:$PATH" \
+output=$(LOOM_WORKSPACE="$TEST_WS" LOOM_DAEMON_BIN="$DAEMON_BIN" PATH="$STUB_DIR:$PATH" \
     LOOM_EFFORT="" \
     "$SCRIPTS_DIR/spawn-claude.sh" -p "ping" 2>&1 || true)
 TESTS_RUN=$((TESTS_RUN + 1))
@@ -642,10 +667,9 @@ echo ""
 echo "Testing claude-wrapper.sh account rotation (#3738)..."
 
 WRAPPER="$SCRIPTS_DIR/claude-wrapper.sh"
-PKG_SRC="$(cd "$SCRIPTS_DIR/../../loom-tools/src" 2>/dev/null && pwd || echo "")"
 
-if [[ -z "$PKG_SRC" || ! -d "$PKG_SRC/loom_tools/tokens" ]]; then
-    echo "  (skipping rotation tests — loom_tools package not found)"
+if [[ -z "$DAEMON_BIN" ]]; then
+    echo "  (skipping rotation tests — loom-daemon binary not found)"
 else
   # --- Fixture: 2-account pool; stub exhausts alpha, succeeds on beta ---
   ROT_WS="$(mktemp -d)"
@@ -680,7 +704,7 @@ STUB
     LOOM_WORKSPACE="$ROT_WS" \
     LOOM_TOKEN_NAME="alpha" \
     CLAUDE_CODE_OAUTH_TOKEN="tok-alpha" \
-    LOOM_PACKAGE_PATH="$PKG_SRC" \
+    LOOM_DAEMON_BIN="$DAEMON_BIN" \
     LOOM_MAX_RETRIES=1 \
     LOOM_SHEPHERD_TASK_ID="test-rotation" \
     LOOM_STARTUP_MONITOR_WINDOW=1 \
@@ -731,7 +755,7 @@ STUB
     LOOM_WORKSPACE="$ROT_WS2" \
     LOOM_TOKEN_NAME="a" \
     CLAUDE_CODE_OAUTH_TOKEN="tok-a" \
-    LOOM_PACKAGE_PATH="$PKG_SRC" \
+    LOOM_DAEMON_BIN="$DAEMON_BIN" \
     LOOM_MAX_RETRIES=1 \
     LOOM_SHEPHERD_TASK_ID="test-rotation" \
     LOOM_STARTUP_MONITOR_WINDOW=1 \

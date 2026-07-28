@@ -237,9 +237,14 @@ token hits its weekly limit.
    `claude` (or pass `--use-wrapper` to layer on top of `claude-wrapper.sh` for
    retry behavior).
 
-## Selection algorithm (`loom_tools.tokens.select`)
+## Selection algorithm (`loom-daemon tokens select`)
 
-Three tiers, falling through to the next when the current tier yields nothing:
+Three tiers, falling through to the next when the current tier yields nothing.
+Native Rust (`loom-daemon/src/tokens_pool/select.rs`), invoked directly by
+`spawn-claude.sh` / `claude-wrapper.sh` as of issue #4228 (epic #4081 Phase 2) —
+byte-compatible with the historical `loom_tools.tokens.select` implementation,
+which stays in-tree as reference/conformance material (`loom-tools/tests/tokens/`)
+but is no longer on the runtime path:
 
 1. **Ranking** — `.loom/tokens/.ranking` (pipe-delimited `name|status|5h_util`,
    refreshed every <10 min). A persistent rotation cursor spreads consecutive
@@ -250,6 +255,11 @@ Three tiers, falling through to the next when the current tier yields nothing:
 3. **Random** — uniform pick from all `*.token` files.
 
 Tokens marked bad in `.loom/tokens/.bad_tokens` are skipped at every tier.
+`loom-daemon tokens select --export` emits shell-evalable `export
+CLAUDE_CODE_OAUTH_TOKEN=...` / `export LOOM_TOKEN_NAME=...` lines (plus a
+non-exported `LOOM_TOKEN_MODE=...`) so callers `eval` the output directly
+instead of round-tripping through a JSON parser; `--auto-unpin` runs the
+pinned-account auto-recovery pre-flight (see below) before selecting.
 
 ### Ranking format: 5h-load field + soft gate (issue #4195)
 
@@ -274,13 +284,19 @@ the gpeyton-fork load-aware selection proposal (fork commits `283de8e3`,
 `20961dd9`) with upstream's existing rotation-cursor spread — a load-aware gate
 *layered on* #3909, not the fork's waterfall-fill replacement.
 
-## Bad-token tracking (`loom_tools.tokens.bad_tokens`)
+## Bad-token tracking (`loom-daemon tokens mark-bad`)
 
 When a token returns `TOKEN_EXPIRED` or `TOKEN_EXHAUSTED`, callers append an entry
-to `.loom/tokens/.bad_tokens`. Writes are guarded with a `mkdir`-based lock
-(POSIX-atomic, macOS-compatible — `flock` is **not** used because it isn't
-available on stock macOS). Reads use word-boundary regex so `agent-1` and
-`agent-10` don't collide.
+to `.loom/tokens/.bad_tokens` via `loom-daemon tokens mark-bad <name> --reason
+<text>` (native Rust, `loom-daemon/src/tokens_pool/bad_tokens.rs`, exposed as a
+CLI subcommand in #4228 — the historical Python `loom_tools.tokens.bad_tokens`
+module was library-only, with no CLI of its own). Writes are guarded with a
+`mkdir`-based lock (POSIX-atomic, macOS-compatible — `flock` is **not** used
+because it isn't available on stock macOS). Reads use word-boundary regex so
+`agent-1` and `agent-10` don't collide. The reason field's embedded
+newlines/carriage-returns are sanitized to spaces so every `.bad_tokens` record
+is exactly one line — byte-compatible with the Python implementation, and
+conformance-tested against it in `loom-tools/tests/tokens/test_rust_conformance.py`.
 
 ## Error classification (`.loom/scripts/lib/classify-error.sh`)
 
@@ -311,18 +327,17 @@ one truth). Provision the shared pool once per machine with `loom-tokens bootstr
 --shared`. See [daemon-reference.md → Token pool provisioning for managed
 repos](daemon-reference.md#token-pool-provisioning-for-managed-repos-3938).
 
-**Package-path fallback for consumer-repo dispatches (#3949)**: `#3938` fixed the
-pool *location*, but token *selection* still shells into `python3 -m
-loom_tools.tokens.select`, and `spawn-claude.sh` locates that Python package via
-(1) `LOOM_PACKAGE_PATH` env, (2) script-relative `../../loom-tools/src`, (3)
-`$WORKSPACE/loom-tools/src`. `loom-daemon`'s `spawn_child` now resolves and
-forwards `LOOM_PACKAGE_PATH` automatically on every dispatch: an ambient override
-on the daemon's own environment always wins, otherwise it derives
-`<loom-checkout>/loom-tools/src` from the source tree the running `loom-daemon`
-binary was compiled from (`CARGO_MANIFEST_DIR`, baked in at build time) when that
-directory still exists and contains `loom_tools/tokens`. A consumer repo with no
-loom checkout and no `LOOM_PACKAGE_PATH` env now selects a token successfully with
-zero manual configuration.
+**Native selection, zero Python package-path resolution needed (#4228)**: `#3938`
+fixed the pool *location*; as of #4228 (epic #4081 Phase 2) token *selection*
+itself is native too — `spawn-claude.sh` / `claude-wrapper.sh` shell out to
+`loom-daemon tokens select` (resolved via `$LOOM_DAEMON_BIN` -> `loom-daemon` on
+PATH -> build-output-relative candidates under the repo; see
+`.loom/scripts/lib/locate-daemon-bin.sh`) instead of `python3 -m
+loom_tools.tokens.select`. This retires the `LOOM_PACKAGE_PATH` bridge entirely
+(script-side resolution AND the daemon-side `spawn_child`/role-runner forwarding
+that used to derive it from the source tree the running binary was compiled
+from) — a consumer repo with no loom checkout now selects a token successfully
+with zero manual configuration and no Python package to locate at all.
 
 ## Hard-fail on missing pool
 

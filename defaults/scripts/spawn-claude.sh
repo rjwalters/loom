@@ -2,8 +2,10 @@
 # spawn-claude.sh - Token-rotating launcher for Claude Code.
 #
 # This script is a thin layer that:
-#   1. Selects a Claude Code OAuth token from .loom/tokens/ via
-#      `python3 -m loom_tools.tokens.select`.
+#   1. Selects a Claude Code OAuth token from .loom/tokens/ via the native
+#      `loom-daemon tokens select` CLI (issue #4228, epic #4081 Phase 2 — the
+#      historical interpreted-language selector call has been retired from
+#      this path entirely; see loom-daemon/src/tokens_pool/select.rs).
 #   2. Exports CLAUDE_CODE_OAUTH_TOKEN.
 #   3. exec's the underlying CLI (`claude` by default, or
 #      `claude-wrapper.sh` if --use-wrapper is passed for retry behavior).
@@ -46,7 +48,11 @@
 #   LOOM_WORKSPACE         Override repo root detection.
 #   LOOM_SPAWN_NO_EXPORT   If set, skip selection (caller already exported a
 #                          token). Useful for testing the dispatch path.
-#   LOOM_PYTHON            Override the python interpreter (default: python3).
+#   LOOM_DAEMON_BIN        Override the `loom-daemon` binary used for native
+#                          token selection (see lib/locate-daemon-bin.sh for
+#                          the full resolution order: this env var ->
+#                          `loom-daemon` on PATH -> build-output-relative
+#                          candidates under the repo).
 #   LOOM_MODEL             Model to pass as `claude --model <value>` (issue
 #                          #3477). Lowest-priority tier: an explicit `--model`
 #                          in the passthrough args always wins. When neither
@@ -106,7 +112,13 @@ _resolve_workspace() {
 }
 
 WORKSPACE="$(_resolve_workspace)"
-PYTHON="${LOOM_PYTHON:-python3}"
+
+# --- Locate the loom-daemon binary (token selection, issue #4228) ---
+# Resolution precedence (see lib/locate-daemon-bin.sh): $LOOM_DAEMON_BIN ->
+# `loom-daemon` on PATH -> build-output-relative candidates under $WORKSPACE.
+_script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=lib/locate-daemon-bin.sh
+source "${_script_dir}/lib/locate-daemon-bin.sh"
 
 # --- Daemon self-claim marker visibility (Issue #3823, observability #3967) ---
 # `loom-daemon`'s `SweepRegistry::spawn_child` exports
@@ -240,71 +252,38 @@ elif [[ -n "${LOOM_EFFORT:-}" ]]; then
     log_info "spawn-claude: effort=$LOOM_EFFORT (from LOOM_EFFORT)"
 fi
 
-# --- Locate loom_tools package source ---
-# Search order:
-#   1. $LOOM_PACKAGE_PATH (env override).
-#   2. Script-relative: .loom/scripts/spawn-claude.sh -> ../../loom-tools/src
-#      (matches the loom repo layout regardless of WORKSPACE override).
-#   3. $WORKSPACE/loom-tools/src.
-#
-# Tiers 2/3 only resolve inside an actual loom checkout — a CONSUMER repo's
-# installed .loom/scripts/spawn-claude.sh has no loom-tools/ sibling, so
-# tier 1 is load-bearing there. Issue #3949: `loom-daemon`'s `spawn_child`
-# (loom-daemon/src/sweep_registry.rs::resolve_package_path_env) now sets
-# LOOM_PACKAGE_PATH automatically on every daemon-dispatched child — derived
-# from the loom checkout the running daemon binary was built from — so this
-# no longer needs to be exported manually before starting the daemon.
-_script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-_script_relative_pkg="$(cd "$_script_dir/../../loom-tools/src" 2>/dev/null && pwd || echo "")"
-PACKAGE_PATH="${LOOM_PACKAGE_PATH:-$_script_relative_pkg}"
-if [[ -z "$PACKAGE_PATH" || ! -d "$PACKAGE_PATH/loom_tools/tokens" ]]; then
-    PACKAGE_PATH="${WORKSPACE}/loom-tools/src"
-fi
-
 # --- Token selection ---
 if [[ -z "${LOOM_SPAWN_NO_EXPORT:-}" && -z "${CLAUDE_CODE_OAUTH_TOKEN:-}" ]]; then
+    _daemon_bin="$(loom_locate_daemon_bin "$WORKSPACE")"
+    if [[ -z "$_daemon_bin" ]] || ! "$_daemon_bin" tokens select --help >/dev/null 2>&1; then
+        log_error "No loom-daemon binary supporting 'tokens select' was found."
+        log_error "(\$LOOM_DAEMON_BIN -> 'loom-daemon' on PATH -> build-output-relative"
+        log_error "candidates under the repo all came up empty or stale.)"
+        log_error "Build or start one, then retry:"
+        log_error "  ./.loom/scripts/cli/loom-daemon-start.sh"
+        log_error "  cargo build --release -p loom-daemon"
+        exit 78  # EX_CONFIG
+    fi
+
+    _select_args=(tokens select --workspace "$WORKSPACE" --export)
     # Pre-flight: auto-unpin if every allowlisted account has hit the
     # consecutive-failure threshold (default 5). Without this, an
     # operator-set pin can trap the spawner once all pinned accounts
     # exhaust their weekly quota. Empty-pool guard: we never silently
     # clear .bad_tokens — if that file blocks every account, the user
-    # must intervene (e.g. `loom-tokens unblock <name>`).
-    PYTHONPATH="${PACKAGE_PATH}${PYTHONPATH:+:$PYTHONPATH}" \
-        "$PYTHON" - "$WORKSPACE" <<'PY' || true
-import sys
-from pathlib import Path
-try:
-    from loom_tools.tokens import allowlist as a
-    from loom_tools.tokens import failure_counts as fc
-except Exception:
-    sys.exit(0)
-ws = Path(sys.argv[1])
-try:
-    pinned = a.read_allowlist(ws)
-    if not pinned:
-        sys.exit(0)
-    if all(fc.threshold_reached(ws, n) for n in pinned):
-        a.clear_allowlist(ws)
-        fc.reset_all(ws)
-        print(
-            f"[auto-unpin] All {len(pinned)} pinned account(s) hit "
-            f"{fc.DEFAULT_THRESHOLD} consecutive failures; "
-            f"cleared .allowlist.",
-            file=sys.stderr,
-        )
-except Exception as exc:  # noqa: BLE001
-    print(f"[auto-unpin] skipped ({exc!r})", file=sys.stderr)
-PY
+    # must intervene (e.g. `loom-tokens unblock <name>`). Capability-probed
+    # (issue #4228) so a daemon binary mid-roll that predates `--auto-unpin`
+    # degrades to plain selection instead of a hard argument-parse failure.
+    if "$_daemon_bin" tokens select --help 2>&1 | grep -q -- '--auto-unpin'; then
+        _select_args+=(--auto-unpin)
+    fi
 
-    # Capture stdout (JSON) and stderr (errors) separately so log output
-    # does not contaminate the JSON we feed to python -c.
+    # Capture stdout (shell-evalable export lines) and stderr (errors /
+    # advisories, e.g. a firing "[auto-unpin] ..." line) separately so log
+    # output never contaminates what we're about to `eval`.
     _selection_stderr_file="$(mktemp)"
-    _selection_json=""
-    if ! _selection_json="$(
-        PYTHONPATH="${PACKAGE_PATH}${PYTHONPATH:+:$PYTHONPATH}" \
-        "$PYTHON" -m loom_tools.tokens.select --workspace "$WORKSPACE" --json \
-        2>"$_selection_stderr_file"
-    )"; then
+    _selection_output=""
+    if ! _selection_output="$("$_daemon_bin" "${_select_args[@]}" 2>"$_selection_stderr_file")"; then
         log_error "Token selection failed:"
         cat "$_selection_stderr_file" >&2 || true
         rm -f "$_selection_stderr_file"
@@ -318,35 +297,26 @@ PY
         log_error "Set CLAUDE_CODE_OAUTH_TOKEN explicitly to bypass selection."
         exit 78  # EX_CONFIG
     fi
+    # Surface any advisory stderr (e.g. the auto-unpin line) without treating
+    # it as a failure — mirrors the historical Python pre-flight's `|| true`.
+    cat "$_selection_stderr_file" >&2 || true
     rm -f "$_selection_stderr_file"
 
-    # Parse JSON without jq (jq isn't guaranteed to be installed).
-    _token=$(
-        printf '%s' "$_selection_json" \
-        | "$PYTHON" -c 'import json,sys; print(json.load(sys.stdin)["key"])'
-    )
-    _name=$(
-        printf '%s' "$_selection_json" \
-        | "$PYTHON" -c 'import json,sys; print(json.load(sys.stdin)["name"])'
-    )
-    _mode=$(
-        printf '%s' "$_selection_json" \
-        | "$PYTHON" -c 'import json,sys; print(json.load(sys.stdin)["mode"])'
-    )
+    # `--export` emits `export CLAUDE_CODE_OAUTH_TOKEN=...` and
+    # `export LOOM_TOKEN_NAME=...` (both consumed by downstream processes,
+    # including a claude-wrapper.sh invoked via --use-wrapper) plus a local
+    # (non-exported) `LOOM_TOKEN_MODE=...` used only for the log line below.
+    # Tokens are base64/hex-like and never contain a single quote in
+    # practice — see `loom-daemon tokens select`'s own doc comment.
+    eval "$_selection_output"
 
-    if [[ -z "$_token" ]]; then
-        log_error "Token selection returned empty key for account '$_name'."
+    if [[ -z "${CLAUDE_CODE_OAUTH_TOKEN:-}" ]]; then
+        log_error "Token selection returned an empty key for account '${LOOM_TOKEN_NAME:-unknown}'."
         exit 78
     fi
 
-    export CLAUDE_CODE_OAUTH_TOKEN="$_token"
-    # Export the selected account name so a downstream claude-wrapper.sh knows
-    # which account the exported token belongs to. This is what lets the
-    # wrapper mark exactly the right account bad when it rotates on a
-    # usage/session-limit fault (issue #3738) instead of guessing from file
-    # mtimes. Harmless for the direct-`claude` dispatch path.
-    export LOOM_TOKEN_NAME="$_name"
-    log_info "spawn-claude: using OAuth account '$_name' (mode=$_mode)"
+    log_info "spawn-claude: using OAuth account '${LOOM_TOKEN_NAME:-unknown}' (mode=${LOOM_TOKEN_MODE:-unknown})"
+    unset LOOM_TOKEN_MODE
 fi
 
 # --- Print-mode background-task wait ceiling (issue #3943) ---
