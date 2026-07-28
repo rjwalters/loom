@@ -18,12 +18,22 @@
 # Usage:
 #   resolve-model.sh <tier|alias|id>            # prints the resolved model ID
 #   resolve-model.sh <tier> --generation        # prints the resolved generation number
+#   resolve-model.sh <model|id> --task-alias    # prints the nearest Task-tool alias
 #   resolve-model.sh <tier> --config <path>     # explicit .loom/config.json path
 #
 # Examples:
 #   resolve-model.sh opus            # -> claude-opus-5
 #   resolve-model.sh sonnet@xhigh    # -> sonnet@xhigh   (passthrough; CLI resolves)
 #   resolve-model.sh claude-sonnet-4-6   # -> claude-sonnet-4-6 (pinned ID, unchanged)
+#   resolve-model.sh claude-opus-5 --task-alias   # -> opus (Task-tool degradation, #4282)
+#
+# --task-alias (issue #4282): the daemon/process path passes a resolved model as
+# `--model <id>` (pinned IDs OK), but the in-session Task/Agent tool's `model`
+# parameter is an alias-only enum (sonnet|opus|haiku|fable) — a pinned ID is
+# invalid there. --task-alias maps a resolved model back to its nearest Task-passable
+# alias (`claude-opus-5` -> `opus`; @effort stripped), so the in-session dispatch
+# degradation is a deterministic lookup, not per-orchestrator judgement. Exits 3
+# with no output when there is no Task-passable alias (caller omits `model`).
 
 set -euo pipefail
 

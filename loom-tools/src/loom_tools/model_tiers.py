@@ -353,6 +353,68 @@ def generation_of(model: str | None, config: dict[str, Any] | None = None) -> in
 
 
 # --------------------------------------------------------------------------- #
+# Task-tool degradation (issue #4282)
+# --------------------------------------------------------------------------- #
+#
+# The daemon/process-spawn path dispatches a model as `--model <id>`, which the
+# `claude` CLI accepts as either an alias or a pinned ID — so #3982's resolved IDs
+# (`claude-opus-5`) ride through unchanged. But the *in-session* Task/Agent tool's
+# `model` parameter is an **alias-only enum** (`sonnet | opus | haiku | fable`): a
+# pinned ID is an invalid value there, so on the dispatch path `/loom:sweep` uses
+# for its per-role subagents, a resolved ID must degrade back to its family alias.
+# `task_alias_of` is that reverse mapping — a deterministic lookup so the
+# degradation is not per-orchestrator judgement. It composes with the #3705
+# `@effort` degradation (the Task tool exposes no effort knob either).
+
+# The alias values the in-session Task/Agent tool's `model` parameter accepts.
+_TASK_TOOL_ALIASES: frozenset[str] = frozenset({"haiku", "sonnet", "opus", "fable"})
+
+
+def task_alias_of(model: str | None, config: dict[str, Any] | None = None) -> str:
+    """Map a model to the nearest value the in-session Task/Agent tool accepts.
+
+    The Task tool's ``model`` parameter is an alias-only enum
+    (``haiku``/``sonnet``/``opus``/``fable``); a pinned ID like ``claude-opus-5``
+    is an invalid value there, so #3982's resolved IDs cannot be passed on the
+    in-session dispatch path and must degrade to their family alias (issue #4282).
+
+    * A value already in the Task enum passes through unchanged.
+    * A concrete ID maps to its family alias by parsing the family segment
+      (``claude-opus-5 → opus``, ``claude-sonnet-4-6 → sonnet``, the legacy
+      ``claude-3-5-sonnet → sonnet``) — the same ID grammar :func:`generation_of`
+      reads. A fable-family ID maps to ``fable`` mechanically; the No-Fable-Judge
+      invariant is a caller responsibility (fall to ``opus`` *before* aliasing),
+      not policy baked in here.
+    * An ``@effort`` suffix is stripped (the Task tool has no effort parameter
+      either — composes with the #3705 degradation rule).
+    * Anything unrecognized/unparseable returns ``""`` — the caller then omits the
+      ``model`` parameter so the subagent inherits the parent/agent-definition
+      model rather than dispatching a guessed alias. Resolution never raises.
+
+    ``config`` is accepted for signature parity with the other resolvers; the
+    reverse mapping is mechanical and config-independent (its input is already a
+    resolved ID/alias, so there is nothing left to look up).
+    """
+    if not model:
+        return ""
+    base = model.partition("@")[0].strip().lower()
+    if not base:
+        return ""
+    # Already a Task-passable alias (or a bare alias that resolved to itself).
+    if base in _TASK_TOOL_ALIASES:
+        return base
+    # Modern IDs: claude-<family>-<gen>[-<minor>] → the family segment is the alias.
+    m = re.match(r"^claude-([a-z]+)-\d", base)
+    if m and m.group(1) in _TASK_TOOL_ALIASES:
+        return m.group(1)
+    # Legacy IDs: claude-<gen>-...-<family> (claude-3-5-sonnet, claude-3-opus).
+    for family in _TASK_TOOL_ALIASES:
+        if base.endswith(f"-{family}"):
+            return family
+    return ""
+
+
+# --------------------------------------------------------------------------- #
 # CLI (the surface `resolve-model.sh` shells out to)
 # --------------------------------------------------------------------------- #
 
@@ -381,6 +443,18 @@ def build_parser() -> argparse.ArgumentParser:
         "--generation",
         action="store_true",
         help="Print the resolved generation number instead of the model ID.",
+    )
+    parser.add_argument(
+        "--task-alias",
+        action="store_true",
+        help=(
+            "Map the model back to the nearest value the in-session Task/Agent "
+            "tool's `model` enum accepts (haiku|sonnet|opus|fable), for the "
+            "dispatch path that cannot pass a pinned ID (issue #4282). A concrete "
+            "ID degrades to its family alias; an @effort suffix is stripped. Exits "
+            "3 with no output when the input has no Task-passable alias (caller "
+            "then omits `model` so the subagent inherits the parent model)."
+        ),
     )
     parser.add_argument(
         "--tier",
@@ -415,6 +489,17 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     if args.model is None:
         parser.error("a model argument or --tier is required")
+    # Task-tool degradation mode (issue #4282): map the resolved model back to a
+    # Task-passable alias for the in-session dispatch path.
+    if args.task_alias:
+        alias = task_alias_of(args.model, config)
+        if not alias:
+            # No Task-passable alias: print nothing, signal fall-through with
+            # exit 3 (mirror --tier) so the caller omits `model` and the subagent
+            # inherits the parent/agent-definition model.
+            return 3
+        print(alias)
+        return 0
     if args.generation:
         gen = generation_of(args.model, config)
         print("" if gen is None else gen)

@@ -143,6 +143,106 @@ def test_generation_of_honors_config_override():
 
 
 # --------------------------------------------------------------------------- #
+# task_alias_of — Task-tool degradation (issue #4282)
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.parametrize(
+    "model,expected",
+    [
+        # Concrete IDs → family alias (modern grammar: claude-<family>-<gen>[-<minor>]).
+        ("claude-opus-5", "opus"),
+        ("claude-sonnet-5", "sonnet"),
+        ("claude-sonnet-4-6", "sonnet"),
+        ("claude-haiku-5", "haiku"),
+        ("claude-haiku-4-5", "haiku"),
+        ("claude-fable-5", "fable"),
+        # Bare enum aliases pass through unchanged.
+        ("opus", "opus"),
+        ("sonnet", "sonnet"),
+        ("haiku", "haiku"),
+        ("fable", "fable"),
+        # @effort suffix is stripped (Task tool has no effort knob — #3705).
+        ("claude-opus-5@xhigh", "opus"),
+        ("opus@xhigh", "opus"),
+        ("sonnet@low", "sonnet"),
+        # Legacy IDs: claude-<gen>-...-<family>.
+        ("claude-3-5-sonnet", "sonnet"),
+        ("claude-3-opus", "opus"),
+        # Case-insensitive.
+        ("CLAUDE-OPUS-5", "opus"),
+        ("Opus", "opus"),
+    ],
+)
+def test_task_alias_of_maps_to_task_passable_alias(model, expected):
+    assert mt.task_alias_of(model) == expected
+
+
+@pytest.mark.parametrize(
+    "model",
+    [
+        None,
+        "",
+        "  ",
+        "@xhigh",  # nothing before the effort suffix
+        "mystery-model",
+        "claude-instant-1",  # a real ID whose family is not in the Task enum
+        "gpt-5-codex",  # a non-Claude runtime ID
+        "claude",  # bare prefix, no family
+    ],
+)
+def test_task_alias_of_unrecognized_returns_empty(model):
+    # No Task-passable alias → "" so the caller omits `model` and the subagent
+    # inherits the parent/agent-definition model (never a guessed alias).
+    assert mt.task_alias_of(model) == ""
+
+
+def test_task_alias_of_round_trip_default_config_is_todays_degradation():
+    # resolve_model pins opus → claude-opus-5; on the Task-tool path that ID is
+    # unpassable and degrades back to the `opus` alias (gen-5 on the wire → gen-4
+    # via the bare alias). This is the documented degradation the rule warns about.
+    resolved = mt.resolve_model("opus")
+    assert resolved == "claude-opus-5"
+    assert mt.task_alias_of(resolved) == "opus"
+
+
+def test_task_alias_of_retirement_path_is_identity_under_dropped_pin():
+    # AC 3: when the CLI `opus` alias rolls to gen 5, the operator drops the pin
+    # via sweep.modelAliases {"opus": "opus"}; resolve_model then returns the bare
+    # alias and the resolve→task_alias round-trip is the identity — the
+    # degradation disappears with zero code change.
+    cfg = {"sweep": {"modelAliases": {"opus": "opus"}}}
+    resolved = mt.resolve_model("opus", cfg)
+    assert resolved == "opus"
+    assert mt.task_alias_of(resolved, cfg) == "opus"
+
+
+def test_task_alias_of_ignores_config_for_the_reverse_mapping():
+    # The reverse mapping is mechanical; a config override on the alias→ID step
+    # does not change how a concrete ID degrades back to its family alias.
+    cfg = {"sweep": {"modelAliases": {"opus": "claude-opus-6"}}}
+    assert mt.task_alias_of("claude-opus-6", cfg) == "opus"
+
+
+def test_cli_task_alias_prints_family_alias(capsys):
+    rc = mt.main(["claude-opus-5", "--task-alias"])
+    assert rc == 0
+    assert capsys.readouterr().out.strip() == "opus"
+
+
+def test_cli_task_alias_passthrough_enum(capsys):
+    rc = mt.main(["sonnet", "--task-alias"])
+    assert rc == 0
+    assert capsys.readouterr().out.strip() == "sonnet"
+
+
+def test_cli_task_alias_unrecognized_exits_3(capsys):
+    rc = mt.main(["gpt-5-codex", "--task-alias"])
+    assert rc == 3
+    assert capsys.readouterr().out.strip() == ""
+
+
+# --------------------------------------------------------------------------- #
 # ladder monotonicity — the regression guard for #3982
 # --------------------------------------------------------------------------- #
 
