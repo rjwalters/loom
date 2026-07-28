@@ -473,6 +473,11 @@ pub struct EpicSupervisor<S: EpicSource, D: EpicDispatcher> {
     /// **nothing** — a red `main` stops epic-child dispatch too (#3885). Absent
     /// (the default / test path) means the supervisor is never gated.
     health_state: Option<Arc<MainHealthState>>,
+    /// Optional daemon-global drain flag (#4090) shared with the work-finder and
+    /// role-runner. When set, [`tick`](Self::tick) dispatches **nothing** — a
+    /// scheduled drain pauses new epic-child dispatch just like a red `main`.
+    /// Absent (the default / test path) means the supervisor is never drained.
+    drain_flag: Option<Arc<AtomicBool>>,
 }
 
 impl<S: EpicSource, D: EpicDispatcher> EpicSupervisor<S, D> {
@@ -489,6 +494,7 @@ impl<S: EpicSource, D: EpicDispatcher> EpicSupervisor<S, D> {
             inflight_ttl: resolve_inflight_ttl(),
             bus: None,
             health_state: None,
+            drain_flag: None,
         }
     }
 
@@ -505,6 +511,15 @@ impl<S: EpicSource, D: EpicDispatcher> EpicSupervisor<S, D> {
     #[must_use]
     pub fn with_health_gate(mut self, health_state: Arc<MainHealthState>) -> Self {
         self.health_state = Some(health_state);
+        self
+    }
+
+    /// Attach the daemon-global drain flag (#4090) so that while a scheduled
+    /// drain is in progress the supervisor dispatches nothing. Builder-style;
+    /// returns `self`.
+    #[must_use]
+    pub fn with_drain_flag(mut self, drain_flag: Arc<AtomicBool>) -> Self {
+        self.drain_flag = Some(drain_flag);
         self
     }
 
@@ -529,9 +544,21 @@ impl<S: EpicSource, D: EpicDispatcher> EpicSupervisor<S, D> {
         // Existing in-flight sweeps are untouched (halting only stops making a
         // red `main` worse); a green run clears the flag and the next tick
         // resumes normally.
-        if self.health_state.as_ref().is_some_and(|s| s.is_halted()) {
+        let health_halted = self.health_state.as_ref().is_some_and(|s| s.is_halted());
+        // Scheduled drain (#4090): a daemon-global drain pauses new epic-child
+        // dispatch exactly like a red `main`, so it is OR'd into the same gate.
+        let drained = self
+            .drain_flag
+            .as_ref()
+            .is_some_and(|f| f.load(Ordering::Relaxed));
+        if health_halted || drained {
             log::warn!(
-                "epic_supervisor: main-health gate halted — skipping tick (no epic dispatch while main is red)"
+                "epic_supervisor: {} — skipping tick (no epic dispatch)",
+                if drained {
+                    "drain in progress"
+                } else {
+                    "main-health gate halted (main is red)"
+                }
             );
             return Ok(TickReport {
                 halted: true,
@@ -1010,6 +1037,7 @@ pub fn spawn_multi_supervisor_thread(
     event_bus: Arc<EventBus>,
     health_states: Arc<WorkspaceHealthStates>,
     interval: Duration,
+    drain_flag: Arc<AtomicBool>,
 ) -> Result<SupervisorHandle> {
     let shutdown = Arc::new(AtomicBool::new(false));
     let shutdown_thread = shutdown.clone();
@@ -1078,7 +1106,8 @@ pub fn spawn_multi_supervisor_thread(
                             let supervisor =
                                 EpicSupervisor::new(source, dispatcher, IssueCreationMutex::new())
                                     .with_event_bus(event_bus.clone())
-                                    .with_health_gate(health_states.get_or_create(root));
+                                    .with_health_gate(health_states.get_or_create(root))
+                                    .with_drain_flag(drain_flag.clone());
                             roots.push(root.clone());
                             supervisors.push(supervisor);
                             log::info!("epic_supervisor: watching workspace {}", root.display());
@@ -1672,6 +1701,27 @@ mod tests {
         assert!(!r2.halted);
         assert_eq!(r2.roles_dispatched, 1);
         assert_eq!(sup.dispatcher.roles.len(), 1);
+    }
+
+    /// A scheduled drain (#4090) halts epic dispatch exactly like a red `main`
+    /// (AC1): with the drain flag set, the tick dispatches nothing; clearing it
+    /// resumes normal dispatch. Mirrors the main-health halt tests above.
+    #[tokio::test]
+    async fn test_tick_skips_dispatch_while_draining() {
+        let drain = Arc::new(AtomicBool::new(true));
+        let mut sup = supervisor(vec![EpicSnapshot::new(1, "flat body", vec![], vec![])])
+            .with_drain_flag(drain.clone());
+
+        let report = sup.tick().await.unwrap();
+        assert!(report.halted, "a drain halts the tick");
+        assert_eq!(report.roles_dispatched, 0);
+        assert!(sup.dispatcher.roles.is_empty(), "no epic dispatch while draining");
+
+        // Clear the drain ⇒ the next tick dispatches normally.
+        drain.store(false, Ordering::Relaxed);
+        let r2 = sup.tick().await.unwrap();
+        assert!(!r2.halted);
+        assert_eq!(r2.roles_dispatched, 1);
     }
 
     #[tokio::test]

@@ -191,7 +191,29 @@ enum Commands {
     /// `--foreground`) the daemon refuses and stays running, and this command
     /// prints the refusal and exits non-zero. This is the primitive #4017 Phase
     /// 3 will call after a rebuild — it does nothing on its own.
-    Restart,
+    ///
+    /// With `--drain` (Issue #4090) the daemon instead stops admitting new work
+    /// immediately and waits for every in-flight sweep to finish before
+    /// restarting — no sweep killed, no orphan left behind. `--abort-drain`
+    /// cancels an in-progress drain and resumes normal dispatch.
+    Restart {
+        /// Finish all in-flight sweeps before restarting, instead of restarting
+        /// immediately (#4090). New dispatch is paused for the duration.
+        #[arg(long)]
+        drain: bool,
+        /// Max seconds to wait for in-flight sweeps to drain (with `--drain`).
+        /// Defaults to the daemon's built-in timeout (tens of minutes).
+        #[arg(long)]
+        timeout: Option<u64>,
+        /// On drain timeout, cancel the remaining sweeps and restart anyway
+        /// (with `--drain`). Without this, a timeout refuses the restart and
+        /// keeps the daemon running (fail-safe).
+        #[arg(long)]
+        force_after_timeout: bool,
+        /// Abort an in-progress drain and resume normal dispatch (no restart).
+        #[arg(long)]
+        abort_drain: bool,
+    },
 
     /// Manage the multi-account OAuth token pool at `.loom/tokens/` (Issue
     /// #4082/#4108, epic #4081 "eliminate Python from Loom"). Native Rust
@@ -488,8 +510,14 @@ async fn main() -> Result<()> {
             // register/list/remove durable watches (Issue #3971).
             Commands::Watch { action } => handle_watch_command(action).await,
             // `restart` connects to the running daemon over its Unix socket to
-            // trigger the supervised restart primitive (Issue #4054).
-            Commands::Restart => handle_restart_command().await,
+            // trigger the supervised restart primitive (Issue #4054), or a
+            // scheduled drain-and-restart (Issue #4090).
+            Commands::Restart {
+                drain,
+                timeout,
+                force_after_timeout,
+                abort_drain,
+            } => handle_restart_command(drain, timeout, force_after_timeout, abort_drain).await,
             other => handle_cli_command(other),
         };
     }
@@ -827,6 +855,14 @@ async fn main() -> Result<()> {
     // pre-#3930 single-flag behavior byte-for-byte.
     let workspace_health_states = Arc::new(main_health_gate::WorkspaceHealthStates::new());
 
+    // Shared drain-and-restart state (Issue #4090). Constructed here — before the
+    // epic supervisor, work-finder, and role runner — so its flag can be threaded
+    // into all three dispatch producers AND into the IPC server (which sets/aborts
+    // it and renders it in `loom-daemon status`). With no drain requested the flag
+    // stays `false`, so every producer's halt check is byte-for-byte unchanged.
+    let drain_state = Arc::new(loom_daemon::ipc::DrainState::new());
+    let drain_flag = drain_state.flag();
+
     // Epic supervisor loop (Issue #3872 — Phase 4 of epic #3842). Opt-in via
     // `LOOM_EPIC_SUPERVISOR`. The loop drives every open `loom:epic` issue
     // through its fork-join lifecycle by dispatching the enabled role each tick.
@@ -851,6 +887,7 @@ async fn main() -> Result<()> {
             event_bus.clone(),
             workspace_health_states.clone(),
             interval,
+            drain_flag.clone(),
         ) {
             Ok(handle) => {
                 log::info!(
@@ -936,6 +973,7 @@ async fn main() -> Result<()> {
             cpu_est_cores_per_sweep,
             workspace_health_states.clone(),
             event_bus.clone(),
+            drain_flag.clone(),
         ))
     } else {
         log::debug!("work_finder: disabled (set LOOM_WORK_FINDER=1 to enable)");
@@ -1068,7 +1106,12 @@ async fn main() -> Result<()> {
             .map(|spec| {
                 let interval = role_runner::resolve_interval_for_role(spec, &role_runner_config);
                 log::info!("role_runner: {} interval={}s", spec.name, interval.as_secs());
-                role_runner::spawn_multi_role_task(*spec, sweep_workspace.clone(), interval)
+                role_runner::spawn_multi_role_task(
+                    *spec,
+                    sweep_workspace.clone(),
+                    interval,
+                    drain_flag.clone(),
+                )
             })
             .collect();
         Some(handles)
@@ -1130,6 +1173,7 @@ async fn main() -> Result<()> {
         workspace_pool.clone(),
         sweep_workspace.clone(),
         credential_preflight,
+        drain_state.clone(),
     );
 
     // Setup signal handler for graceful shutdown. We listen for BOTH SIGINT
@@ -1408,7 +1452,7 @@ fn handle_cli_command(command: Commands) -> Result<()> {
             // socket round-trip), never dispatched through this sync handler.
             unreachable!("Watch is handled in main() before handle_cli_command")
         }
-        Commands::Restart => {
+        Commands::Restart { .. } => {
             // Routed directly in `main()` (it needs the async runtime for the
             // socket round-trip), never dispatched through this sync handler.
             unreachable!("Restart is handled in main() before handle_cli_command")
@@ -1698,8 +1742,39 @@ async fn handle_quarantine_command(action: QuarantineAction) -> Result<()> {
 /// Linux / `--foreground`) it replies `DaemonRestart { scheduled: false }` and
 /// keeps running — we print the refusal and exit non-zero, so an operator or
 /// Phase 3 can detect that no restart happened rather than assuming it did.
-async fn handle_restart_command() -> Result<()> {
+async fn handle_restart_command(
+    drain: bool,
+    timeout: Option<u64>,
+    force_after_timeout: bool,
+    abort_drain: bool,
+) -> Result<()> {
     let socket_path = resolve_socket_path()?;
+
+    // Drain-mode variants (Issue #4090) speak `DrainAndRestartDaemon` /
+    // `AbortDrain` and expect a `DaemonDrain` reply; the plain restart keeps its
+    // #4054 `RestartDaemon` / `DaemonRestart` contract byte-for-byte.
+    if abort_drain {
+        return handle_drain_reply(
+            &socket_path,
+            &Request::AbortDrain,
+            "loom-daemon drain aborted",
+            "no drain was in progress",
+        )
+        .await;
+    }
+    if drain {
+        return handle_drain_reply(
+            &socket_path,
+            &Request::DrainAndRestartDaemon {
+                timeout_secs: timeout,
+                force_after_timeout,
+            },
+            "loom-daemon drain scheduled",
+            "loom-daemon did NOT drain",
+        )
+        .await;
+    }
+
     match query_daemon(&socket_path, &Request::RestartDaemon).await {
         Ok(Response::DaemonRestart {
             scheduled,
@@ -1715,6 +1790,53 @@ async fn handle_restart_command() -> Result<()> {
                 Ok(())
             } else {
                 eprintln!("loom-daemon did NOT restart: {message}");
+                std::process::exit(1);
+            }
+        }
+        Ok(Response::Error { message }) => {
+            eprintln!("Daemon error: {message}");
+            std::process::exit(1);
+        }
+        Ok(other) => {
+            eprintln!("Unexpected response from daemon: {other:?}");
+            std::process::exit(1);
+        }
+        Err(e) => {
+            eprintln!("Could not reach loom-daemon at {}: {e}", socket_path.display());
+            eprintln!();
+            eprintln!("Is the daemon running? Start it with:");
+            eprintln!("  ./.loom/scripts/cli/loom-daemon-start.sh");
+            std::process::exit(1);
+        }
+    }
+}
+
+/// Shared reply handler for the drain-mode restart variants (Issue #4090): both
+/// `DrainAndRestartDaemon` and `AbortDrain` answer with a `DaemonDrain` frame.
+/// A refused request (unsupervised host, or abort with no drain in progress)
+/// exits non-zero so a script can detect that nothing happened.
+async fn handle_drain_reply(
+    socket_path: &Path,
+    request: &Request,
+    accepted_prefix: &str,
+    refused_prefix: &str,
+) -> Result<()> {
+    match query_daemon(socket_path, request).await {
+        Ok(Response::DaemonDrain {
+            accepted,
+            supervisor,
+            in_flight,
+            message,
+        }) => {
+            if accepted {
+                println!(
+                    "{accepted_prefix} (supervisor: {}, {in_flight} in-flight).",
+                    supervisor.as_deref().unwrap_or("unknown")
+                );
+                println!("{message}");
+                Ok(())
+            } else {
+                eprintln!("{refused_prefix}: {message}");
                 std::process::exit(1);
             }
         }
@@ -2295,6 +2417,14 @@ fn print_status_json(
             "message": c.message,
             "checked_at": c.checked_at,
         })),
+        // Scheduled drain-and-restart state (#4090). `draining: false` in the
+        // common case; `note` carries the last transition (timeout refusal /
+        // abort) so a scripted consumer sees why a drain ended without a restart.
+        "drain": {
+            "draining": report.draining,
+            "deadline": report.drain_deadline,
+            "note": report.drain_note,
+        },
         // Per-repo breakdown across every registered managed workspace (#3930).
         "per_repo": report.per_repo.iter().map(|r| serde_json::json!({
             "root": r.root,
@@ -2665,6 +2795,27 @@ fn print_status_human(
         None => {
             println!("Forge credential: unknown (older daemon binary — restart to pick up #4005)")
         }
+    }
+
+    // Scheduled drain-and-restart (#4090): a drain that quietly hangs is worse
+    // than no drain, so surface DRAINING with the remaining count + deadline.
+    // A `drain_note` (timeout refusal / abort) persists after a drain ends so
+    // the operator sees WHY the daemon is still up rather than restarted.
+    if report.draining {
+        let deadline = report.drain_deadline.map_or_else(
+            || "no deadline".to_string(),
+            |d| {
+                let secs = (d - Utc::now()).num_seconds();
+                if secs >= 0 {
+                    format!("deadline in {secs}s ({d})")
+                } else {
+                    format!("deadline passed {}s ago ({d})", -secs)
+                }
+            },
+        );
+        println!("Drain: DRAINING ({} sweep(s) remaining, {deadline})", report.in_flight.len());
+    } else if let Some(note) = &report.drain_note {
+        println!("Drain: not draining (last: {note})");
     }
 
     // Per-repo breakdown across every registered managed workspace (#3930). In

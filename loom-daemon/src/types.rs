@@ -378,6 +378,35 @@ pub enum Request {
     ///
     /// It never fires on its own — nothing in the daemon issues this request.
     RestartDaemon,
+    /// Scheduled drain-and-restart (Issue #4090): stop admitting *new* work
+    /// immediately, wait for every in-flight sweep to finish, then exit
+    /// [`EXIT_RESTART`](crate::ipc::EXIT_RESTART) for a supervised relaunch —
+    /// no sweep killed, no orphan left behind.
+    ///
+    /// A deliberately **separate** variant from [`Request::RestartDaemon`] (a
+    /// unit variant) rather than fields on it: the wire window where an older
+    /// `loom-daemon restart` client and a newer daemon disagree is *precisely a
+    /// roll*, so `{"type":"RestartDaemon"}` must keep deserializing unchanged.
+    ///
+    /// - `timeout_secs`: bound on how long to wait for the registry to empty.
+    ///   `None` ⇒ the daemon's default (tens of minutes; a sweep is ~10–20 min).
+    /// - `force_after_timeout`: when the deadline passes with sweeps still in
+    ///   flight, `true` cancels the stragglers via the existing `cancel_sweep`
+    ///   path and restarts anyway; `false` (fail-safe) refuses the restart,
+    ///   resumes dispatch, and stays up.
+    ///
+    /// On an unsupervised host the daemon refuses immediately (before pausing
+    /// dispatch) with `DaemonDrain { accepted: false, .. }`, mirroring
+    /// [`Request::RestartDaemon`]'s refusal contract.
+    DrainAndRestartDaemon {
+        timeout_secs: Option<u64>,
+        force_after_timeout: bool,
+    },
+    /// Abort an in-progress drain (Issue #4090): clear the drain flag so new
+    /// dispatch resumes, and stop the drain-supervisor task so no later restart
+    /// fires — even if the in-flight count subsequently reaches zero on its own.
+    /// A no-op (idempotent) when no drain is in progress.
+    AbortDrain,
     Shutdown,
 }
 
@@ -521,6 +550,21 @@ pub enum Response {
     DaemonRestart {
         scheduled: bool,
         supervisor: Option<String>,
+        message: String,
+    },
+    /// Result of a `DrainAndRestartDaemon` / `AbortDrain` request (Issue #4090).
+    ///
+    /// `accepted` is `true` when the drain was scheduled (or the abort took
+    /// effect); `false` on an unsupervised host (a drain would have nowhere to
+    /// relaunch into) or an abort with no drain in progress. `supervisor` names
+    /// the detected supervisor (`Some("launchd")`) or `None` when unsupervised.
+    /// `in_flight` is the cross-root non-terminal sweep count at request time,
+    /// so the operator immediately sees how much work the drain must wait for.
+    /// `message` is a human-readable explanation for operator output.
+    DaemonDrain {
+        accepted: bool,
+        supervisor: Option<String>,
+        in_flight: usize,
         message: String,
     },
     // ========================================================================
@@ -897,6 +941,30 @@ pub struct DaemonStatusReport {
     /// `#[serde(default)]` keeps that wire data compatible.
     #[serde(default)]
     pub credential_preflight: Option<CredentialPreflightReport>,
+    /// Whether a scheduled drain-and-restart (Issue #4090) is currently in
+    /// progress: new dispatch is paused and the daemon is waiting for the
+    /// in-flight sweep count ([`Self::in_flight`]) to reach zero before exiting
+    /// for a supervised relaunch. `false` in the common no-drain case.
+    /// `#[serde(default)]` keeps pre-#4090 wire data / older clients compatible
+    /// (an absent field parses as `false` — "not draining"), mirroring the
+    /// `capacity_bound` forward-compat convention.
+    #[serde(default)]
+    pub draining: bool,
+    /// Wall-clock deadline at which an in-progress drain (Issue #4090) gives up
+    /// waiting: without `--force-after-timeout` it refuses the restart and
+    /// resumes dispatch; with it, the stragglers are cancelled and the daemon
+    /// restarts anyway. `None` when no drain is active. `#[serde(default)]`
+    /// keeps pre-#4090 wire data compatible.
+    #[serde(default)]
+    pub drain_deadline: Option<DateTime<Utc>>,
+    /// A short human-readable note about the most recent drain transition
+    /// (Issue #4090) — e.g. why a drain timed out and was refused, or that a
+    /// drain was aborted by the operator. Surfaced so `loom-daemon status`
+    /// never leaves a drain that quietly ended unexplained. `None` when no
+    /// drain has run this process. `#[serde(default)]` keeps pre-#4090 wire
+    /// data compatible.
+    #[serde(default)]
+    pub drain_note: Option<String>,
 }
 
 /// One registered managed-workspace's status line in [`DaemonStatusReport`]
