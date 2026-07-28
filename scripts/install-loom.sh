@@ -194,6 +194,13 @@ source "$LOOM_ROOT/scripts/install/manifest.sh"
 # shellcheck source=scripts/install/provision-daemon.sh
 source "$LOOM_ROOT/scripts/install/provision-daemon.sh"
 
+# Source the machine-level `loom` dispatcher provisioning helper (Epic #3835
+# Phase 3a, #4157). Sibling of provision-daemon.sh; installs ~/.local/bin/loom
+# and establishes the ~/.local/share/loom checkout link. Own file so the test
+# suite can exercise it without sourcing the full installer.
+# shellcheck source=scripts/install/provision-dispatcher.sh
+source "$LOOM_ROOT/scripts/install/provision-dispatcher.sh"
+
 # Dogfood command-dir linker (issue #3682) — extracted so the test suite can
 # exercise the scoped-symlink logic without running the full installer.
 # shellcheck source=scripts/install/dogfood-commands.sh
@@ -1070,6 +1077,16 @@ info "loom-daemon binary: $DAEMON_VERSION"
 info "Provisioning machine-level loom-daemon binary..."
 provision_machine_daemon "$LOOM_ROOT/target/release/loom-daemon" || \
   warning "Machine-level loom-daemon not provisioned (see note above); autonomous daemon mode needs LOOM_DAEMON_BIN or a binary on PATH."
+
+# Provision the machine-level `loom` dispatcher (Epic #3835 Phase 3a, #4157).
+# Installs ~/.local/bin/loom and links ~/.local/share/loom -> this Loom source
+# checkout so `loom start|stop|status|sweep|update` resolves a machine-level
+# runtime with no per-repo copy. Best-effort: a soft failure is logged but never
+# aborts the install. It writes ONLY those two paths — it never touches the
+# ~/.local/bin/loom-* Python console-script symlinks (Epic #4081's scope).
+info "Provisioning machine-level loom dispatcher..."
+provision_loom_dispatcher "$LOOM_ROOT" || \
+  warning "Machine-level loom dispatcher not fully provisioned (see note above); use ./.loom/bin/loom in-repo, or set LOOM_HOME."
 
 # Run loom-daemon init in the worktree
 cd "$TARGET_PATH/$WORKTREE_PATH"

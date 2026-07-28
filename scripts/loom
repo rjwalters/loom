@@ -1,0 +1,319 @@
+#!/usr/bin/env bash
+# scripts/loom — machine-level Loom dispatcher (Epic #3835 Phase 3a, #4157).
+#
+# Installed to ~/.local/bin/loom by scripts/install/provision-dispatcher.sh as a
+# machine-level, install-once-per-machine entry point (a sibling of the
+# ~/.local/bin/loom-daemon binary that provision-daemon.sh installs). It resolves
+# the machine-level Loom checkout (~/.local/share/loom) and exec's into it.
+#
+# Verbs (at minimum): start | stop | status | sweep | update.
+#
+# ── NOT the same surface as ./.loom/bin/loom ────────────────────────────────
+# ./.loom/bin/loom is the PER-REPO tmux agent-pool manager (verbs: start status
+# health stop attach send scale logs). This dispatcher is the MACHINE-LEVEL
+# runtime driver. Three verbs collide by name — start / stop / status — and mean
+# different things in each surface. `.loom/bin` is never on PATH, and every
+# in-repo call to the pool manager is path-qualified (`./.loom/bin/loom …`), so
+# a bare `loom …` on PATH can never resolve to the pool manager and vice-versa —
+# the two invocation forms are disjoint by construction (that is why AC4 is a
+# regression test, not a compatibility shim). For the three colliding verbs this
+# dispatcher additionally detects a nearby per-repo pool manager and refuses to
+# guess (start/stop) or clearly labels itself (status) rather than silently
+# running the wrong surface. See defaults/docs/machine-dispatcher.md.
+#
+# Environment:
+#   LOOM_HOME   Override the machine-level checkout location
+#               (default: ~/.local/share/loom).
+
+set -euo pipefail
+
+DISPATCHER_VERSION="1"
+
+# ── output helpers (plain text so sourcing tests can assert on them) ──────────
+if [[ -t 2 ]]; then
+    _C_RED=$'\033[0;31m'; _C_YEL=$'\033[1;33m'; _C_NC=$'\033[0m'
+else
+    _C_RED=''; _C_YEL=''; _C_NC=''
+fi
+_err()  { printf '%sloom:%s %s\n' "$_C_RED" "$_C_NC" "$*" >&2; }
+_warn() { printf '%sloom:%s %s\n' "$_C_YEL" "$_C_NC" "$*" >&2; }
+
+# ── machine-level checkout resolution (AC1) ──────────────────────────────────
+# The provisioning step (provision-dispatcher.sh) establishes ~/.local/share/loom
+# as a symlink to the Loom source checkout the installer ran from — the
+# "link to an existing dev checkout" resolution — so a developer running Loom on
+# the Loom repo never ends up with two divergent copies (AC1's hard constraint).
+# At runtime the dispatcher only needs to *resolve* that location, honoring an
+# explicit LOOM_HOME override first.
+loom_resolve_checkout() {
+    if [[ -n "${LOOM_HOME:-}" ]]; then
+        printf '%s\n' "${LOOM_HOME%/}"
+        return 0
+    fi
+    printf '%s\n' "$HOME/.local/share/loom"
+}
+
+# Echo the canonical scripts subtree inside a resolved checkout. A Loom *source*
+# checkout ships defaults/scripts/…; a checkout that is itself an installed
+# consumer repo ships .loom/scripts/…. Prefer the source layout, fall back.
+loom_checkout_scripts_dir() {
+    local checkout="$1"
+    if [[ -d "$checkout/defaults/scripts" ]]; then
+        printf '%s\n' "$checkout/defaults/scripts"
+    elif [[ -d "$checkout/.loom/scripts" ]]; then
+        printf '%s\n' "$checkout/.loom/scripts"
+    else
+        return 1
+    fi
+}
+
+# ── repo-context resolution (AC7) ────────────────────────────────────────────
+# Walk up from $PWD. Sets three globals:
+#   LOOM_CTX_KIND  = consumer-repo | git-worktree | non-repo
+#   LOOM_CTX_ROOT  = resolved repo root (main checkout for a worktree), or ""
+#   LOOM_CTX_POOL  = path to a nearby ./.loom/bin/loom pool manager, or ""
+loom_detect_context() {
+    LOOM_CTX_KIND="non-repo"
+    LOOM_CTX_ROOT=""
+    LOOM_CTX_POOL=""
+
+    local dir="$PWD"
+    while [[ "$dir" != "/" && -n "$dir" ]]; do
+        if [[ -f "$dir/.loom/bin/loom" && -z "$LOOM_CTX_POOL" ]]; then
+            LOOM_CTX_POOL="$dir/.loom/bin/loom"
+        fi
+        # Linked-worktree detection MUST precede the consumer-repo (.loom/) check:
+        # a repo that commits .loom/ (config.json, roles/, scripts/ — the norm per
+        # CLAUDE.md) carries a real .loom/ directory inside every worktree checkout
+        # too, so testing -d "$dir/.loom" first would misclassify every worktree of
+        # such a repo as a consumer-repo and resolve LOOM_CTX_ROOT to the worktree
+        # instead of the main checkout. A linked worktree's .git is a *file*
+        # ("gitdir: <path>"), so -f "$dir/.git" distinguishes it cleanly.
+        if [[ -f "$dir/.git" ]]; then
+            # Linked git worktree: .git is a file "gitdir: <path>".
+            local gitdir main_repo
+            gitdir=$(sed 's/^gitdir: //' "$dir/.git" 2>/dev/null || true)
+            if [[ -n "$gitdir" ]]; then
+                main_repo=$(dirname "$(dirname "$(dirname "$gitdir")")")
+                LOOM_CTX_ROOT="$main_repo"
+                LOOM_CTX_KIND="git-worktree"
+                if [[ -z "$LOOM_CTX_POOL" && -f "$main_repo/.loom/bin/loom" ]]; then
+                    LOOM_CTX_POOL="$main_repo/.loom/bin/loom"
+                fi
+                return 0
+            fi
+        fi
+        if [[ -d "$dir/.loom" ]]; then
+            LOOM_CTX_ROOT="$dir"
+            LOOM_CTX_KIND="consumer-repo"
+            return 0
+        fi
+        dir="$(dirname "$dir")"
+    done
+    return 0
+}
+
+# ── collision guard for the three overlapping verbs (AC3) ────────────────────
+# start/stop mutate process state, so on a detected pool-manager collision we
+# refuse and disambiguate (never silently run the wrong surface). An explicit
+# --machine anywhere in the args opts out of the guard.
+loom_has_flag() {
+    local want="$1"; shift
+    local a
+    for a in "$@"; do [[ "$a" == "$want" ]] && return 0; done
+    return 1
+}
+
+loom_collision_guard() {
+    local verb="$1"; shift
+    loom_has_flag "--machine" "$@" && return 0
+    [[ -n "$LOOM_CTX_POOL" ]] || return 0
+    _err "'$verb' is ambiguous here — two different Loom surfaces both define it."
+    _err "  per-repo tmux agent pool:  ${LOOM_CTX_POOL} $verb"
+    _err "  machine-level loom-daemon: loom $verb --machine"
+    _err "Re-run with one of the above (see 'loom help')."
+    exit 3
+}
+
+# Resolve + exec a daemon lifecycle script from the machine checkout, dropping
+# the leading --machine selector (the delegated script does not know that flag).
+loom_exec_checkout_script() {
+    local rel="$1"; shift
+    local checkout scripts_dir target
+    checkout="$(loom_resolve_checkout)"
+    if [[ ! -e "$checkout" ]]; then
+        _err "machine-level checkout not found at: $checkout"
+        _err "install it (run the Loom installer) or set LOOM_HOME to a Loom checkout."
+        exit 1
+    fi
+    if ! scripts_dir="$(loom_checkout_scripts_dir "$checkout")"; then
+        _err "no scripts/ tree under the machine checkout: $checkout"
+        exit 1
+    fi
+    target="$scripts_dir/$rel"
+    if [[ ! -x "$target" ]]; then
+        _err "expected script not found or not executable: $target"
+        exit 1
+    fi
+    local passthrough=()
+    local a
+    for a in "$@"; do [[ "$a" == "--machine" ]] && continue; passthrough+=("$a"); done
+    # `${arr[@]+…}` guard: expand to nothing (not an empty arg) when the array is
+    # empty, so this is safe under `set -u` on bash 3.2 (macOS default).
+    exec "$target" ${passthrough[@]+"${passthrough[@]}"}
+}
+
+# ── verbs ────────────────────────────────────────────────────────────────────
+loom_cmd_start() { loom_detect_context; loom_collision_guard start "$@"; loom_exec_checkout_script "cli/loom-daemon-start.sh" "$@"; }
+loom_cmd_stop()  { loom_detect_context; loom_collision_guard stop  "$@"; loom_exec_checkout_script "cli/loom-daemon-stop.sh"  "$@"; }
+
+# `update` is a THIN verb (Epic #3835 Phase 3a scope guard, Finding 3): it only
+# resolves the machine checkout and delegates to the EXISTING update surface
+# (loom-daemon-update.sh, built by #3968 and extended by the shipped #4055
+# self-update loop). It implements NO rebuild/reprovision/restart logic itself,
+# so it neither pre-empts #4017 (auto-rebuild-when-stale) nor duplicates #4055.
+loom_cmd_update() {
+    local checkout scripts_dir target
+    checkout="$(loom_resolve_checkout)"
+    if [[ ! -e "$checkout" ]] || ! scripts_dir="$(loom_checkout_scripts_dir "$checkout")"; then
+        _err "machine-level checkout not found at: ${checkout}"
+        _err "'loom update' only delegates to loom-daemon-update.sh in the checkout; install Loom or set LOOM_HOME."
+        exit 1
+    fi
+    target="$scripts_dir/cli/loom-daemon-update.sh"
+    if [[ ! -x "$target" ]]; then
+        _err "update delegate not found or not executable: $target"
+        _err "'loom update' is a thin delegator; it does not rebuild/restart on its own."
+        exit 1
+    fi
+    exec "$target" "$@"
+}
+
+# `sweep <issue>` dispatches a single-issue lifecycle for the CURRENT repo.
+loom_cmd_sweep() {
+    loom_detect_context
+    if [[ -z "$LOOM_CTX_ROOT" ]]; then
+        _err "'sweep' must run inside a Loom repo (no .loom/ found from $PWD)."
+        exit 1
+    fi
+    if ! command -v claude >/dev/null 2>&1; then
+        _err "'claude' CLI not found on PATH; cannot dispatch a sweep."
+        exit 1
+    fi
+    if [[ $# -eq 0 ]]; then
+        _err "usage: loom sweep <issue-number> [more issues|flags]"
+        exit 1
+    fi
+    cd "$LOOM_CTX_ROOT"
+    exec claude -p "/loom:sweep $*" --dangerously-skip-permissions
+}
+
+# `status` is read-only and AC7 requires it to produce correct, distinguishable
+# output from a consumer repo, a git worktree, and a non-repo directory. So on a
+# pool-manager collision it does NOT error — it prints machine-level status and a
+# clearly-labelled pointer to the per-repo pool manager (never a silent
+# wrong-surface run).
+loom_cmd_status() {
+    loom_detect_context
+    local checkout checkout_state target
+    checkout="$(loom_resolve_checkout)"
+    if [[ -L "$checkout" ]]; then
+        target="$(readlink "$checkout" 2>/dev/null || true)"
+        checkout_state="symlink -> ${target:-?}"
+    elif [[ -d "$checkout" ]]; then
+        checkout_state="directory (clone)"
+    else
+        checkout_state="ABSENT"
+    fi
+
+    echo "Loom (machine-level dispatcher)"
+    echo "  dispatcher:    ${BASH_SOURCE[0]}"
+    echo "  checkout:      ${checkout} [${checkout_state}]"
+    if command -v loom-daemon >/dev/null 2>&1; then
+        echo "  loom-daemon:   $(loom-daemon --version 2>/dev/null || echo '(version unavailable)')"
+    else
+        echo "  loom-daemon:   not on PATH"
+    fi
+
+    echo "Context"
+    echo "  cwd:           ${PWD}"
+    case "$LOOM_CTX_KIND" in
+        consumer-repo) echo "  repo:          consumer-repo (root: ${LOOM_CTX_ROOT})" ;;
+        git-worktree)  echo "  repo:          git-worktree (main checkout: ${LOOM_CTX_ROOT})" ;;
+        non-repo)      echo "  repo:          non-repo (no .loom/ found from cwd)" ;;
+    esac
+    if [[ -n "$LOOM_CTX_POOL" ]]; then
+        echo "  pool manager:  present — for the per-repo tmux pool run: ${LOOM_CTX_POOL} status"
+    else
+        echo "  pool manager:  none"
+    fi
+
+    # AC5: resolve config through the Phase 2 tier resolver, not by reading
+    # .loom/config.json directly. AC4-note: the jq-absent case must be explicit,
+    # not masqueraded as "no config".
+    echo "Config (resolved via the Phase 2 tier chain)"
+    if ! command -v jq >/dev/null 2>&1; then
+        echo "  (jq not available — config tiers cannot be resolved on this host)"
+        return 0
+    fi
+    local resolver
+    if resolver="$(loom_checkout_scripts_dir "$checkout" 2>/dev/null)/lib/config-resolver.sh" \
+        && [[ -f "$resolver" ]]; then
+        # shellcheck source=/dev/null
+        source "$resolver"
+        local wf
+        wf="$(loom_config_get "${LOOM_CTX_ROOT:-$PWD}" "autonomous.workFinder.enabled" "(unset)")"
+        echo "  autonomous.workFinder.enabled = ${wf}   (repo_root: ${LOOM_CTX_ROOT:-<none>})"
+    else
+        echo "  (config resolver not found in checkout; cannot resolve tiers)"
+    fi
+}
+
+loom_print_help() {
+    cat <<EOF
+loom — machine-level Loom dispatcher (Epic #3835 Phase 3a)
+
+USAGE:
+    loom <command> [options]
+
+COMMANDS:
+    start     Start the machine-level loom-daemon (delegates to loom-daemon-start.sh)
+    stop      Stop the machine-level loom-daemon  (delegates to loom-daemon-stop.sh)
+    status    Show machine-level + current-repo status (read-only)
+    sweep     Dispatch /loom:sweep <issue> for the current repo
+    update    Thin delegate to loom-daemon-update.sh (no rebuild logic of its own)
+    help      Show this help
+    version   Show dispatcher version
+
+NOTE:
+    This is NOT ./.loom/bin/loom (the per-repo tmux agent-pool manager). For the
+    three overlapping verbs (start/stop/status) run inside a repo that has a pool
+    manager, use './.loom/bin/loom <verb>' for the tmux pool, or 'loom <verb>
+    --machine' to force the machine-level surface. See
+    defaults/docs/machine-dispatcher.md.
+
+ENVIRONMENT:
+    LOOM_HOME   Override the machine-level checkout (default: ~/.local/share/loom)
+EOF
+}
+
+main() {
+    local cmd="${1:-help}"
+    shift || true
+    case "$cmd" in
+        start)              loom_cmd_start "$@" ;;
+        stop)               loom_cmd_stop "$@" ;;
+        status)             loom_cmd_status "$@" ;;
+        sweep)              loom_cmd_sweep "$@" ;;
+        update)             loom_cmd_update "$@" ;;
+        help|--help|-h)     loom_print_help ;;
+        version|--version|-v) echo "loom dispatcher v${DISPATCHER_VERSION} (machine-level)" ;;
+        *)
+            _err "unknown command '$cmd'"
+            _err "run 'loom help' for available commands"
+            exit 1
+            ;;
+    esac
+}
+
+main "$@"

@@ -2879,6 +2879,46 @@ fi
 echo ""
 
 # ==========================================================================
+# Machine-level `loom` dispatcher (Epic #3835 Phase 3a, #4157)
+# ==========================================================================
+# The dispatcher's own unit suite lives at
+# defaults/scripts/tests/test-loom-dispatcher.sh (checkout resolution, collision
+# resolution, config tiers, the AC7 status contexts, the AC4 no-shadow
+# regression, and the AC6 console-script invariant). Fold its result into the
+# installer suite so it runs in CI + the build gate rather than dev-only.
+echo "Test: machine-level loom dispatcher suite (test-loom-dispatcher.sh)"
+DISPATCHER_TEST="$DEFAULTS_DIR/scripts/tests/test-loom-dispatcher.sh"
+if [[ -f "$DISPATCHER_TEST" ]]; then
+  set +e
+  DISPATCHER_TEST_OUT=$(bash "$DISPATCHER_TEST" 2>&1)
+  DISPATCHER_TEST_RC=$?
+  set -e
+  if [[ $DISPATCHER_TEST_RC -eq 0 ]]; then
+    pass "test-loom-dispatcher.sh: all cases passed"
+  else
+    fail "test-loom-dispatcher.sh failed (rc=$DISPATCHER_TEST_RC)"
+    echo "$DISPATCHER_TEST_OUT" | tail -20
+  fi
+else
+  fail "test-loom-dispatcher.sh not found at $DISPATCHER_TEST"
+fi
+echo ""
+
+# The dispatcher source and its provisioning helper must ship.
+echo "Test: dispatcher + provisioning artifacts are present"
+if [[ -f "$LOOM_ROOT/scripts/loom" ]]; then
+  pass "scripts/loom dispatcher source present"
+else
+  fail "scripts/loom dispatcher source missing"
+fi
+if [[ -f "$LOOM_ROOT/scripts/install/provision-dispatcher.sh" ]]; then
+  pass "scripts/install/provision-dispatcher.sh present"
+else
+  fail "scripts/install/provision-dispatcher.sh missing"
+fi
+echo ""
+
+# ==========================================================================
 # Summary
 # ==========================================================================
 echo "======================================"

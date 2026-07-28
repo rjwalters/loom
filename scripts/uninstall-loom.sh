@@ -589,7 +589,14 @@ else
     done < <(find "$TARGET_PATH/$loom_dir" -type f -print0 2>/dev/null | sort -z)
   done
 
-  # Also add the CLI wrapper if it exists (new location: .loom/bin/loom)
+  # Also add the CLI wrapper if it exists (new location: .loom/bin/loom).
+  # NOTE (Epic #3835 Phase 3a, #4157): this removes ONLY the per-repo tmux
+  # agent-pool manager. The machine-level dispatcher at ~/.local/bin/loom (and
+  # the ~/.local/share/loom checkout link) is deliberately NOT removed by a
+  # per-repo uninstall — same semantics as the machine-level ~/.local/bin/loom-daemon
+  # binary, which is shared across every repo Loom is installed into and outlives
+  # any single repo's uninstall. Removing it here would break `loom` for every
+  # other consumer repo on the machine.
   if [[ -f "$TARGET_PATH/.loom/bin/loom" ]] && [[ -x "$TARGET_PATH/.loom/bin/loom" ]]; then
     REMOVE_FILES+=(".loom/bin/loom")
   fi
