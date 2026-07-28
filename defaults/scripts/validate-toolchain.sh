@@ -37,9 +37,6 @@ CRITICAL_COMMANDS=(
 
 # Optional commands - degraded functionality without these
 OPTIONAL_COMMANDS=(
-    "loom-stuck-detection"
-    "loom-status"
-    "loom-health-monitor"
     "loom-agent-wait"
     "loom-agent-spawn"
 )
@@ -71,9 +68,6 @@ CRITICAL COMMANDS (required):
     loom-recover-orphans  - Recover orphaned tasks after a sweep crash
 
 OPTIONAL COMMANDS (degraded without):
-    loom-stuck-detection  - Detect stuck sweep children
-    loom-status           - Show sweep / pipeline status
-    loom-health-monitor   - Health monitoring
     loom-agent-wait       - Wait for agent completion
     loom-agent-spawn      - Spawn agent sessions
 
@@ -147,9 +141,6 @@ command_exists() {
     # Map command names to module paths
     local module_name
     case "$cmd" in
-        loom-stuck-detection) module_name="loom_tools.stuck_detection" ;;
-        loom-status) module_name="loom_tools.status" ;;
-        loom-health-monitor) module_name="loom_tools.health_monitor" ;;
         loom-agent-wait) module_name="loom_tools.agent_wait" ;;
         loom-agent-spawn) module_name="loom_tools.agent_spawn" ;;
         *) return 1 ;;

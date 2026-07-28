@@ -16,7 +16,6 @@ from typing import Any, TypeVar
 from loom_tools.common.paths import LoomPaths
 from loom_tools.models.health import AlertsFile, HealthMetrics
 from loom_tools.models.spawn_loop_state import SpawnLoopState
-from loom_tools.models.stuck import StuckHistory
 
 
 # Type variable for generic default handling
@@ -168,12 +167,3 @@ def read_alerts(repo_root: pathlib.Path) -> AlertsFile:
     if isinstance(data, list):
         return AlertsFile()
     return AlertsFile.from_dict(data)
-
-
-def read_stuck_history(repo_root: pathlib.Path) -> StuckHistory:
-    """Load ``.loom/stuck-history.json`` into a :class:`StuckHistory`."""
-    paths = LoomPaths(repo_root)
-    data = read_json_file(paths.stuck_history_file)
-    if isinstance(data, list):
-        return StuckHistory()
-    return StuckHistory.from_dict(data)

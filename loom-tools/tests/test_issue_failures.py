@@ -21,7 +21,6 @@ from loom_tools.common.issue_failures import (
     record_success,
     save_failure_log,
 )
-from loom_tools.forge_snapshot import filter_issues_by_failure_backoff
 
 
 @pytest.fixture
@@ -242,106 +241,10 @@ class TestGetFailureEntry:
         assert entry is None
 
 
-# ── filter_issues_by_failure_backoff ───────────────────────────
-
-
-class TestFilterIssuesByFailureBackoff:
-    def test_no_failures_passes_all(self) -> None:
-        log = IssueFailureLog()
-        issues = [{"number": 1}, {"number": 2}, {"number": 3}]
-        result = filter_issues_by_failure_backoff(issues, log, current_iteration=1)
-        assert len(result) == 3
-
-    def test_first_failure_passes(self) -> None:
-        log = IssueFailureLog(
-            entries={"1": IssueFailureEntry(issue=1, total_failures=1)}
-        )
-        issues = [{"number": 1}]
-        result = filter_issues_by_failure_backoff(issues, log, current_iteration=1)
-        assert len(result) == 1
-
-    def test_second_failure_backoff(self) -> None:
-        log = IssueFailureLog(
-            entries={"1": IssueFailureEntry(issue=1, total_failures=2)}
-        )
-        issues = [{"number": 1}]
-
-        # backoff for 2nd failure = BACKOFF_BASE = 2
-        # iteration 1: 1 % (2+1) = 1, skip
-        result = filter_issues_by_failure_backoff(issues, log, current_iteration=1)
-        assert len(result) == 0
-
-        # iteration 3: 3 % (2+1) = 0, pass
-        result = filter_issues_by_failure_backoff(issues, log, current_iteration=3)
-        assert len(result) == 1
-
-    def test_auto_block_always_skipped(self) -> None:
-        log = IssueFailureLog(
-            entries={
-                "1": IssueFailureEntry(
-                    issue=1, total_failures=MAX_FAILURES_BEFORE_BLOCK
-                )
-            }
-        )
-        issues = [{"number": 1}]
-        # Should be skipped regardless of iteration
-        for iteration in range(100):
-            result = filter_issues_by_failure_backoff(issues, log, current_iteration=iteration)
-            assert len(result) == 0
-
-    def test_mixed_issues(self) -> None:
-        log = IssueFailureLog(
-            entries={
-                "1": IssueFailureEntry(issue=1, total_failures=2),  # backoff
-                "3": IssueFailureEntry(issue=3, total_failures=MAX_FAILURES_BEFORE_BLOCK),  # blocked
-            }
-        )
-        issues = [{"number": 1}, {"number": 2}, {"number": 3}]
-
-        # At iteration 1: issue 1 in backoff, issue 2 has no failures, issue 3 auto-blocked
-        result = filter_issues_by_failure_backoff(issues, log, current_iteration=1)
-        assert len(result) == 1
-        assert result[0]["number"] == 2
-
-    def test_issue_without_number_passes(self) -> None:
-        log = IssueFailureLog(
-            entries={"1": IssueFailureEntry(issue=1, total_failures=MAX_FAILURES_BEFORE_BLOCK)}
-        )
-        issues = [{"title": "no number"}]
-        result = filter_issues_by_failure_backoff(issues, log, current_iteration=1)
-        assert len(result) == 1
-
-
 # ── Integration ────────────────────────────────────────────────
 
 
 class TestIntegration:
-    def test_full_lifecycle(self, repo: pathlib.Path) -> None:
-        """Record failures -> check backoff -> succeed -> verify clean."""
-        # Record 3 failures
-        for _ in range(3):
-            record_failure(repo, 42, error_class="builder_stuck", phase="builder")
-
-        entry = get_failure_entry(repo, 42)
-        assert entry is not None
-        assert entry.total_failures == 3
-
-        # Verify backoff is active
-        log = load_failure_log(repo)
-        issues = [{"number": 42}]
-        result = filter_issues_by_failure_backoff(issues, log, current_iteration=1)
-        assert len(result) == 0  # Should be in backoff
-
-        # Record success
-        record_success(repo, 42)
-        entry = get_failure_entry(repo, 42)
-        assert entry is None
-
-        # Verify issue passes filter now
-        log = load_failure_log(repo)
-        result = filter_issues_by_failure_backoff(issues, log, current_iteration=1)
-        assert len(result) == 1
-
     def test_auto_block_at_threshold(self, repo: pathlib.Path) -> None:
         """Issue auto-blocked after MAX_FAILURES_BEFORE_BLOCK failures."""
         for _ in range(MAX_FAILURES_BEFORE_BLOCK):
@@ -349,18 +252,6 @@ class TestIntegration:
 
         assert entry.should_auto_block is True
         assert entry.total_failures == MAX_FAILURES_BEFORE_BLOCK
-
-    def test_filter_with_failure_backoff(self, repo: pathlib.Path) -> None:
-        """Filter should skip issues in backoff."""
-        for _ in range(3):
-            record_failure(repo, 42, error_class="builder_stuck", phase="builder")
-
-        log = load_failure_log(repo)
-        issues = [{"number": 42}, {"number": 99}]
-        result = filter_issues_by_failure_backoff(issues, log, current_iteration=1)
-        # Issue 42 should be in backoff, 99 should pass
-        assert len(result) == 1
-        assert result[0]["number"] == 99
 
 
 # ── Configurable threshold ────────────────────────────────────
@@ -591,8 +482,8 @@ class TestLoadWithDecay:
         log = load_failure_log(repo, _main_sha="new_sha")
         assert "42" not in log.entries
 
-    def test_load_decay_then_filter_unblocks_issue(self, repo: pathlib.Path) -> None:
-        """After decay, previously blocked issues pass the backoff filter."""
+    def test_load_decay_unblocks_issue(self, repo: pathlib.Path) -> None:
+        """After decay, a previously auto-blocked issue is no longer blocked."""
         _write_failures(repo, {
             "entries": {
                 "42": {
@@ -606,16 +497,15 @@ class TestLoadWithDecay:
             "last_known_main_sha": "old_sha",
         })
 
-        # Before decay: issue is blocked
+        # Before decay: issue is auto-blocked.
         log_before = load_failure_log(repo, _main_sha="old_sha")
-        issues = [{"number": 42}]
-        result = filter_issues_by_failure_backoff(issues, log_before, current_iteration=1)
-        assert len(result) == 0  # Blocked
+        entry_before = log_before.entries["42"]
+        assert entry_before.should_auto_block is True
 
-        # After main advances: issue is unblocked
+        # After main advances: failure count decays below the block threshold.
         log_after = load_failure_log(repo, _main_sha="new_sha")
-        result = filter_issues_by_failure_backoff(issues, log_after, current_iteration=3)
-        assert len(result) == 1  # Unblocked (2 failures, backoff=2, iter 3 % 3 == 0)
+        entry_after = log_after.entries.get("42")
+        assert entry_after is None or entry_after.should_auto_block is False
 
 
 class TestIssueFailureLogSerialization:

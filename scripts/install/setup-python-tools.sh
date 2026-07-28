@@ -110,10 +110,11 @@ fi
 
 VENV_PATH="$LOOM_TOOLS/.venv"
 # Sentinel binary used to detect a complete installation. Must be a command
-# defined in loom-tools/pyproject.toml [project.scripts]. loom-status is stable
-# (core status command) and its --help short-circuits with sys.exit(0) before
-# any forge queries, so the runtime verify step below works offline.
-LOOM_SENTINEL="$VENV_PATH/bin/loom-status"
+# defined in loom-tools/pyproject.toml [project.scripts]. loom-claim is stable
+# (core dispatch-claim command) and its --help short-circuits with sys.exit(0)
+# before any forge queries, so the runtime verify step below works offline.
+# (Was loom-status until epic #4081 phase 3 (#4274) deleted status.py.)
+LOOM_SENTINEL="$VENV_PATH/bin/loom-claim"
 
 # Check-only mode
 if [[ "$CHECK_ONLY" == "true" ]]; then
@@ -173,12 +174,12 @@ info "Installing loom-tools..."
 
 # Verify installation
 if [[ ! -x "$LOOM_SENTINEL" ]]; then
-  error "Installation verification failed: loom-status not found"
+  error "Installation verification failed: loom-claim not found"
 fi
 
 # Test that it runs
 if ! "$LOOM_SENTINEL" --help &>/dev/null; then
-  error "Installation verification failed: loom-status cannot run"
+  error "Installation verification failed: loom-claim cannot run"
 fi
 
 success "loom-tools installed successfully"
