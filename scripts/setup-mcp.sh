@@ -1,29 +1,46 @@
 #!/usr/bin/env bash
-# Generate .mcp.json with current workspace path
-# Builds the unified MCP server if dist/index.js is missing OR stale
-# (older than any TypeScript source under mcp-loom/src/). The staleness
-# check prevents the built bundle from silently drifting behind source —
-# e.g. new sweep-dispatch tools added to src/tools/sweeps.ts never showing
-# up in dist/index.js because the artifact merely *exists* (see #3803, same
-# failure shape as the installed-copy drift fixed in #3777).
+# DEMOTED (#4230, epic #3835 Phase 3c): this is NO LONGER the primary MCP
+# registration path, and it NO LONGER emits a `loom` server entry.
+#
+# The `loom` MCP server is now registered ONCE PER MACHINE at USER SCOPE
+# (`claude mcp add --scope user loom -- node <checkout>/mcp-loom/dist/index.js`,
+# run by scripts/install-loom.sh against the machine-level checkout). A single
+# user-scoped instance serves every repo — it resolves the invoking repo from
+# its CWD (see mcp-loom/src/shared/config.ts getWorkspacePath) — which kills the
+# #3803 per-repo stale-dist drift class: there is exactly one served bundle,
+# refreshed by `loom update`, instead of one built-and-pinned copy per repo.
+#
+# Claude Code MCP scope precedence is local > project > user, so a lingering
+# PROJECT-scope `loom` entry in a repo's .mcp.json would SILENTLY outrank the
+# user-scope server forever (a shadowing drift). This script therefore also
+# STRIPS any pre-existing `loom` entry from the target's .mcp.json (migration),
+# not just stops generating new ones.
+#
+# RESIDUAL ROLE — safehouse only: the `safehouse` server stays inherently
+# per-repo/session (its socket + persona resolve from the target repo's own
+# .loom/config.json, #3999; per-worker personas are injected at spawn time by
+# spawn-claude.sh via --mcp-config, #3997). When safehouse is enabled+resolved
+# this script emits a .mcp.json containing ONLY the `safehouse` entry.
+#
+# It still builds the mcp-loom bundle when missing/stale — that bundle is what
+# the user-scoped server serves out of this checkout — so running this script
+# keeps the served bundle fresh even though it no longer references it in a file.
 #
 # Usage:
-#   ./scripts/setup-mcp.sh                          # Generate .mcp.json in this checkout
+#   ./scripts/setup-mcp.sh                          # Migrate this checkout's .mcp.json
 #   ./scripts/setup-mcp.sh --target /path/to/consumer-repo
-#                                                     # Write .mcp.json into a consumer
-#                                                     # repository instead of this Loom
-#                                                     # source checkout, with LOOM_WORKSPACE
-#                                                     # (and safehouse config resolution)
-#                                                     # pointed at the consumer. --workspace
-#                                                     # is accepted as an alias.
+#                                                     # Operate on a consumer repository's
+#                                                     # .mcp.json instead of this Loom
+#                                                     # source checkout (safehouse config
+#                                                     # resolution + LOOM_WORKSPACE pointed
+#                                                     # at the consumer). --workspace is
+#                                                     # accepted as an alias.
 #
 # `mcp-loom` itself only ever lives in the Loom SOURCE checkout (it is not
-# installed into consumer repos), so the generated `loom` server entry always
-# points at this checkout's mcp-loom/dist/index.js regardless of --target.
-# Only the OUTPUT location (where .mcp.json gets written), LOOM_WORKSPACE (the
-# env var mcp-loom uses to find the repo it operates on), and safehouse config
-# resolution (read from the target's own .loom/config.json) move to the target
-# when --target/--workspace is given. See issue #4188.
+# installed into consumer repos). Only the OUTPUT location (where .mcp.json gets
+# migrated/written) and safehouse config resolution (read from the target's own
+# .loom/config.json) move to the target when --target/--workspace is given.
+# See issues #4188 and #4230.
 
 set -euo pipefail
 
@@ -43,7 +60,7 @@ while [[ $# -gt 0 ]]; do
       shift
       ;;
     -h|--help)
-      sed -n '2,23p' "$0" | sed 's/^# \{0,1\}//'
+      sed -n '2,43p' "$0" | sed 's/^# \{0,1\}//'
       exit 0
       ;;
     *)
@@ -146,20 +163,48 @@ if [[ "$SAFEHOUSE_ENABLED" == "true" ]]; then
   fi
 fi
 
+TARGET_MCP="$OUTPUT_TARGET/.mcp.json"
+
+# Strip any pre-existing `loom` server entry from an existing .mcp.json, in
+# place (#4230 shadowing migration). Prints one of:
+#   skip         -> file absent or unparseable (nothing done)
+#   noop         -> file present but had no `loom` entry
+#   stripped     -> `loom` entry removed; other servers preserved
+#   removed-file -> `loom` was the only server; the file was deleted
+strip_loom_entry() {
+  local file="$1"
+  [[ -f "$file" ]] || { echo "skip"; return 0; }
+  python3 - "$file" <<'PYEOF'
+import json, os, sys
+path = sys.argv[1]
+try:
+    with open(path) as f:
+        cfg = json.load(f)
+except Exception:
+    print("skip"); sys.exit(0)
+servers = cfg.get("mcpServers", {})
+if "loom" not in servers:
+    print("noop"); sys.exit(0)
+del servers["loom"]
+cfg["mcpServers"] = servers
+if not servers:
+    os.remove(path)
+    print("removed-file")
+else:
+    with open(path, "w") as f:
+        json.dump(cfg, f, indent=2)
+        f.write("\n")
+    print("stripped")
+PYEOF
+}
+
 if [[ "$SAFEHOUSE_ENABLED" == "true" && -n "$SH_SOCKET" ]]; then
-  # Two-server config. `loom` stays FIRST (claude-wrapper.sh's pre-flight keys
-  # off the first server with args) and byte-identical to the loom-only block;
-  # `safehouse` is appended second. Only the socket path is credential-adjacent.
-  cat > "$OUTPUT_TARGET/.mcp.json" <<EOF
+  # Residual role: emit a .mcp.json with ONLY the per-repo `safehouse` server.
+  # The `loom` entry is DELIBERATELY omitted — it is owned by the user-scoped
+  # registration now (#4230). Only the socket path is credential-adjacent.
+  cat > "$TARGET_MCP" <<EOF
 {
   "mcpServers": {
-    "loom": {
-      "command": "node",
-      "args": ["$LOOM_SOURCE_ROOT/mcp-loom/dist/index.js"],
-      "env": {
-        "LOOM_WORKSPACE": "$OUTPUT_TARGET"
-      }
-    },
     "safehouse": {
       "command": "$SH_COMMAND",
       "args": [],
@@ -171,26 +216,29 @@ if [[ "$SAFEHOUSE_ENABLED" == "true" && -n "$SH_SOCKET" ]]; then
   }
 }
 EOF
-  echo "Generated .mcp.json with loom + safehouse MCP servers"
-  echo "  Workspace: $OUTPUT_TARGET"
+  echo "Generated .mcp.json with safehouse MCP server only (loom is now user-scoped — see below)."
   echo "  Safehouse persona: $SH_PERSONA (socket: $SH_SOCKET)"
 else
-  # Generate .mcp.json with unified loom server
-  cat > "$OUTPUT_TARGET/.mcp.json" <<EOF
-{
-  "mcpServers": {
-    "loom": {
-      "command": "node",
-      "args": ["$LOOM_SOURCE_ROOT/mcp-loom/dist/index.js"],
-      "env": {
-        "LOOM_WORKSPACE": "$OUTPUT_TARGET"
-      }
-    }
-  }
-}
-EOF
-
-  echo "Generated .mcp.json with unified loom MCP server"
-  echo "  Workspace: $OUTPUT_TARGET"
-  echo "  Server: mcp-loom/dist/index.js"
+  # No safehouse server to emit. Migrate away any stale project-scope `loom`
+  # entry so it can no longer shadow the user-scope server (#4230).
+  migrate_result="$(strip_loom_entry "$TARGET_MCP")"
+  case "$migrate_result" in
+    stripped)
+      echo "Removed a stale project-scope 'loom' entry from $TARGET_MCP" >&2
+      echo "  (a project entry outranks user scope — it would have shadowed the machine server; see #4230)." >&2
+      ;;
+    removed-file)
+      echo "Removed $TARGET_MCP (its only server was the now-user-scoped 'loom' entry; see #4230)." >&2
+      ;;
+    *)
+      : # skip/noop — nothing to migrate
+      ;;
+  esac
 fi
+
+echo ""
+echo "NOTE: setup-mcp.sh is DEMOTED (#4230). The 'loom' MCP server is now"
+echo "      registered ONCE PER MACHINE at user scope. If it is not registered,"
+echo "      run (against the machine-level checkout):"
+echo "        claude mcp add --scope user loom -- node \"$LOOM_SOURCE_ROOT/mcp-loom/dist/index.js\""
+echo "      'loom update' refreshes the served bundle for every repo at once."

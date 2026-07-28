@@ -192,11 +192,56 @@ loom_exec_checkout_script() {
 loom_cmd_start() { loom_detect_context; loom_collision_guard start "$@"; loom_exec_checkout_script "cli/loom-daemon-start.sh" "$@"; }
 loom_cmd_stop()  { loom_detect_context; loom_collision_guard stop  "$@"; loom_exec_checkout_script "cli/loom-daemon-stop.sh"  "$@"; }
 
-# `update` is a THIN verb (Epic #3835 Phase 3a scope guard, Finding 3): it only
-# resolves the machine checkout and delegates to the EXISTING update surface
-# (loom-daemon-update.sh, built by #3968 and extended by the shipped #4055
-# self-update loop). It implements NO rebuild/reprovision/restart logic itself,
-# so it neither pre-empts #4017 (auto-rebuild-when-stale) nor duplicates #4055.
+# Refresh the machine-checkout's mcp-loom bundle (Epic #3835 Phase 3c, #4230).
+# Under user-scope `loom` MCP registration one server instance serves EVERY repo
+# from ~/.local/share/loom/mcp-loom/dist/index.js, so `loom update` must refresh
+# THAT bundle for the whole machine at once — the #3803 stale-dist drift fix.
+# Best-effort and non-fatal: a bundle build failure warns but never blocks the
+# daemon update that follows. #4229 coordination: this uses the ALREADY-RESOLVED
+# $checkout and adds NO checkout-resolution logic of its own.
+loom_refresh_mcp_bundle() {
+    local checkout="$1"
+    local mcp_dir="$checkout/mcp-loom"
+    # A consumer-repo checkout does not ship mcp-loom; nothing to refresh.
+    [[ -d "$mcp_dir" ]] || return 0
+    if ! command -v node >/dev/null 2>&1 || ! command -v npm >/dev/null 2>&1; then
+        _warn "mcp-loom refresh skipped: node/npm not on PATH (served bundle NOT rebuilt)."
+        return 0
+    fi
+    local entry="$mcp_dir/dist/index.js"
+    local src="$mcp_dir/src"
+    # Rebuild when the bundle is missing OR stale (older than any source file) —
+    # mirrors scripts/setup-mcp.sh's staleness predicate, so a source change
+    # (updating the checkout bumps src mtimes) makes new tools appear after
+    # update.
+    local needs_build=0
+    if [[ ! -f "$entry" ]]; then
+        needs_build=1
+    elif [[ -d "$src" ]] && [[ -n "$(find "$src" -type f -newer "$entry" -print -quit 2>/dev/null)" ]]; then
+        needs_build=1
+    fi
+    if [[ "$needs_build" -eq 0 ]]; then
+        printf 'loom: mcp-loom bundle already fresh (%s).\n' "$entry"
+        return 0
+    fi
+    printf 'loom: refreshing the user-scoped mcp-loom bundle (%s)...\n' "$mcp_dir"
+    if ( cd "$mcp_dir" && npm install --silent && npm run build ); then
+        printf 'loom: mcp-loom bundle rebuilt — restart Claude Code sessions to pick up new tools.\n'
+    else
+        _warn "mcp-loom bundle rebuild FAILED — the served bundle may be stale."
+        _warn "  Rebuild manually: (cd $mcp_dir && npm install && npm run build)"
+    fi
+    return 0
+}
+
+# `update` resolves the machine checkout, refreshes the user-scoped mcp-loom
+# bundle (#4230, above), then delegates the DAEMON update to the existing
+# surface (loom-daemon-update.sh, #3968 + #4055). The daemon half stays a thin
+# delegate — this verb implements no daemon rebuild/reprovision/restart logic of
+# its own, so it neither pre-empts #4017 nor duplicates #4055. The mcp-loom
+# refresh is added here (not in loom-daemon-update.sh) because that delegate is
+# daemon-scoped and short-circuits when the binary is already up to date, which
+# would skip the bundle refresh on the common "only mcp-loom changed" roll.
 #
 # Gap 1 fix (#4229): loom-daemon-update.sh rebuilds FROM SOURCE and used to
 # resolve its source tree by walking up from $PWD — which fails outside a Loom
@@ -212,8 +257,17 @@ loom_cmd_update() {
     target="$scripts_dir/cli/loom-daemon-update.sh"
     if [[ ! -x "$target" ]]; then
         _err "update delegate not found or not executable: $target"
-        _err "'loom update' is a thin delegator; it does not rebuild/restart on its own."
+        _err "'loom update' is a thin delegator; it does not rebuild/restart the daemon on its own."
         exit 1
+    fi
+    # Refresh the served mcp-loom bundle BEFORE delegating — but honor the
+    # daemon updater's read-only modes so `loom update --check/--dry-run` never
+    # mutates the bundle.
+    if loom_has_flag "--check" "$@" || loom_has_flag "--dry-run" "$@"; then
+        printf 'loom: (%s) mcp-loom bundle refresh skipped in read-only mode.\n' \
+            "$(loom_has_flag "--check" "$@" && echo --check || echo --dry-run)"
+    else
+        loom_refresh_mcp_bundle "$checkout"
     fi
     export LOOM_MACHINE_CHECKOUT="$checkout"
     exec "$target" "$@"

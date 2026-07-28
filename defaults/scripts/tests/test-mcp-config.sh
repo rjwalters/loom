@@ -6,10 +6,12 @@
 #   2. Per-worker persona pool round-robin (distinct per concurrent worker).
 #   3. loom_mcp_emit_config emits `loom` FIRST and appends `safehouse` only when
 #      socket + persona + command are all present; no token/key is emitted.
-#   4. Byte-identical regression: with safehouse disabled, scripts/setup-mcp.sh
-#      produces the exact pre-#3999 loom-only .mcp.json.
+#   4. Demotion (#4230): scripts/setup-mcp.sh no longer emits a `loom` entry;
+#      it strips any pre-existing project-scope `loom` entry (shadowing
+#      migration) and only emits a safehouse-only file when safehouse is enabled.
 #   5. claude-wrapper.sh's MCP pre-flight still resolves the `loom` entry point
-#      with two servers present.
+#      from a two-server config (the safehouse per-worker --mcp-config path,
+#      loom_mcp_emit_config, is unchanged by #4230).
 #
 # Style matches test-spawn-claude.sh — plain bash, hand-rolled assertions.
 # Bats is NOT used in this repository.
@@ -269,54 +271,92 @@ assert_eq "/ws/root/mcp-loom/dist/index.js" "$_entry" \
 rm -rf "$_pf_dir"
 
 # ============================================================
-# Section 6: byte-identical setup-mcp.sh output when safehouse disabled
+# Section 6: DEMOTED setup-mcp.sh — no `loom` entry, shadowing migration (#4230)
 # ============================================================
-echo "Testing setup-mcp.sh byte-identical loom-only output (safehouse disabled)..."
+echo "Testing setup-mcp.sh demotion: no loom entry + shadowing migration (#4230)..."
 
-_run_setup_mcp() {
+_seed_setup_mcp_ws() {
     # Build an isolated workspace with a pre-built (fake) mcp bundle so
-    # setup-mcp.sh skips the npm build, then run it and echo the produced JSON.
+    # setup-mcp.sh skips the npm build.
     local ws="$1"
-    mkdir -p "$ws/scripts" "$ws/mcp-loom/dist" \
-        "$ws/defaults/scripts/lib"
-    # Fake, non-stale bundle (no src/ dir -> no staleness rebuild).
+    mkdir -p "$ws/scripts" "$ws/mcp-loom/dist" "$ws/defaults/scripts/lib"
     : >"$ws/mcp-loom/dist/index.js"
     cp "$REPO_ROOT/scripts/setup-mcp.sh" "$ws/scripts/setup-mcp.sh"
     cp "$SCRIPTS_DIR/lib/mcp-config.sh" "$ws/defaults/scripts/lib/mcp-config.sh"
     cp "$SCRIPTS_DIR/lib/config-resolver.sh" "$ws/defaults/scripts/lib/config-resolver.sh"
-    ( bash "$ws/scripts/setup-mcp.sh" >/dev/null 2>&1 )
-    cat "$ws/.mcp.json"
 }
 
+# 6a. Safehouse disabled + no pre-existing .mcp.json: emits NO loom entry
+#     (the loom server is user-scoped now). No .mcp.json is created.
 _disabled_ws="$(mktemp -d)"
-actual_disabled="$(_run_setup_mcp "$_disabled_ws")"
-read -r -d '' expected_disabled <<EOF || true
+_seed_setup_mcp_ws "$_disabled_ws"
+( bash "$_disabled_ws/scripts/setup-mcp.sh" >/dev/null 2>&1 )
+TESTS_RUN=$((TESTS_RUN + 1))
+if [[ ! -f "$_disabled_ws/.mcp.json" ]]; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "  ${GREEN}PASS${NC}: setup-mcp.sh emits no loom .mcp.json when safehouse disabled (#4230)"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "  ${RED}FAIL${NC}: setup-mcp.sh must not create a loom .mcp.json (found $(cat "$_disabled_ws/.mcp.json"))"
+fi
+rm -rf "$_disabled_ws"
+
+# 6b. Shadowing migration: a pre-existing loom-only .mcp.json is REMOVED so it
+#     can no longer outrank the user-scope server.
+_stale_ws="$(mktemp -d)"
+_seed_setup_mcp_ws "$_stale_ws"
+cat >"$_stale_ws/.mcp.json" <<JSON
 {
   "mcpServers": {
     "loom": {
       "command": "node",
-      "args": ["$_disabled_ws/mcp-loom/dist/index.js"],
-      "env": {
-        "LOOM_WORKSPACE": "$_disabled_ws"
-      }
+      "args": ["$_stale_ws/mcp-loom/dist/index.js"],
+      "env": { "LOOM_WORKSPACE": "$_stale_ws" }
     }
   }
 }
-EOF
-assert_eq "$expected_disabled" "$actual_disabled" \
-    "setup-mcp.sh with no safehouse block is byte-identical to pre-#3999 output"
-rm -rf "$_disabled_ws"
+JSON
+( bash "$_stale_ws/scripts/setup-mcp.sh" >/dev/null 2>&1 )
+TESTS_RUN=$((TESTS_RUN + 1))
+if [[ ! -f "$_stale_ws/.mcp.json" ]]; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "  ${GREEN}PASS${NC}: setup-mcp.sh removes a stale loom-only .mcp.json (shadowing migration, #4230)"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "  ${RED}FAIL${NC}: stale loom-only .mcp.json must be removed ($(cat "$_stale_ws/.mcp.json"))"
+fi
+rm -rf "$_stale_ws"
 
-# setup-mcp.sh with safehouse enabled emits a two-server file, loom first.
+# 6c. Shadowing migration preserves OTHER servers: a .mcp.json with loom + a
+#     third-party server keeps the third-party server, drops only loom.
+_mixed_ws="$(mktemp -d)"
+_seed_setup_mcp_ws "$_mixed_ws"
+cat >"$_mixed_ws/.mcp.json" <<JSON
+{
+  "mcpServers": {
+    "loom": {
+      "command": "node",
+      "args": ["$_mixed_ws/mcp-loom/dist/index.js"],
+      "env": { "LOOM_WORKSPACE": "$_mixed_ws" }
+    },
+    "other": { "command": "cat", "args": [] }
+  }
+}
+JSON
+( bash "$_mixed_ws/scripts/setup-mcp.sh" >/dev/null 2>&1 )
+mixed_out="$(cat "$_mixed_ws/.mcp.json" 2>/dev/null || echo "")"
+assert_not_contains '"loom"' "$mixed_out" \
+    "setup-mcp.sh strips the loom entry from a mixed .mcp.json (#4230)"
+assert_contains '"other"' "$mixed_out" \
+    "setup-mcp.sh preserves non-loom servers during migration (#4230)"
+rm -rf "$_mixed_ws"
+
+# 6d. Safehouse enabled: emits a safehouse-ONLY file (NO loom entry).
 if $HAVE_JQ; then
     _enabled_ws="$(mktemp -d)"
-    mkdir -p "$_enabled_ws/scripts" "$_enabled_ws/mcp-loom/dist" \
-        "$_enabled_ws/defaults/scripts/lib" "$_enabled_ws/.loom"
-    : >"$_enabled_ws/mcp-loom/dist/index.js"
+    _seed_setup_mcp_ws "$_enabled_ws"
+    mkdir -p "$_enabled_ws/.loom"
     : >"$_enabled_ws/sh.sock" # a resolvable socket path
-    cp "$REPO_ROOT/scripts/setup-mcp.sh" "$_enabled_ws/scripts/setup-mcp.sh"
-    cp "$SCRIPTS_DIR/lib/mcp-config.sh" "$_enabled_ws/defaults/scripts/lib/mcp-config.sh"
-    cp "$SCRIPTS_DIR/lib/config-resolver.sh" "$_enabled_ws/defaults/scripts/lib/config-resolver.sh"
     cat >"$_enabled_ws/.loom/config.json" <<JSON
 { "safehouse": { "enabled": true, "socket": "$_enabled_ws/sh.sock",
   "persona": "loom_daemon", "mcpCommand": "cat" } }
@@ -327,17 +367,8 @@ JSON
         "setup-mcp.sh with safehouse enabled emits a safehouse server"
     assert_contains "$_enabled_ws/sh.sock" "$enabled_out" \
         "setup-mcp.sh safehouse entry carries the socket path"
-    # loom still first
-    e_loom="$(printf '%s' "$enabled_out" | grep -n '"loom"' | head -1 | cut -d: -f1)"
-    e_sh="$(printf '%s' "$enabled_out" | grep -n '"safehouse"' | head -1 | cut -d: -f1)"
-    TESTS_RUN=$((TESTS_RUN + 1))
-    if [[ -n "$e_loom" && -n "$e_sh" && "$e_loom" -lt "$e_sh" ]]; then
-        TESTS_PASSED=$((TESTS_PASSED + 1))
-        echo -e "  ${GREEN}PASS${NC}: setup-mcp.sh keeps loom before safehouse"
-    else
-        TESTS_FAILED=$((TESTS_FAILED + 1))
-        echo -e "  ${RED}FAIL${NC}: setup-mcp.sh loom must precede safehouse"
-    fi
+    assert_not_contains '"loom"' "$enabled_out" \
+        "setup-mcp.sh no longer emits a loom entry even with safehouse enabled (#4230)"
     rm -rf "$_enabled_ws"
 else
     echo -e "  ${YELLOW}SKIP${NC}: setup-mcp.sh enabled test (jq not installed)"

@@ -12,7 +12,47 @@ npm run build
 
 ## Configuration
 
-Add to your MCP settings (`.mcp.json` or Claude Desktop config):
+### User-scope registration (primary path, #4230)
+
+The `loom` server is registered **once per machine at user scope**, pointing at
+the machine-level checkout's bundle — one instance then serves **every** repo:
+
+```bash
+claude mcp add --scope user loom -- node ~/.local/share/loom/mcp-loom/dist/index.js
+```
+
+`scripts/install-loom.sh` does this at install time (idempotently), and
+`loom update` refreshes the served bundle for every repo at once (the #3803
+stale-dist drift fix). You normally do **not** hand-edit a per-repo `.mcp.json`
+for `loom` anymore — a project-scope `loom` entry would *shadow* the user-scope
+server (Claude Code precedence is local > project > user), so `setup-mcp.sh`
+strips any legacy project entry it finds. See
+[`../defaults/docs/machine-dispatcher.md`](../defaults/docs/machine-dispatcher.md)
+for the full registration / migration / shadowing story.
+
+### Workspace discovery (how one server serves many repos)
+
+Because a single user-scope instance carries no per-repo env, it resolves the
+**invoking** repo from its process CWD (`getWorkspacePath()` in
+`src/shared/config.ts`):
+
+1. `LOOM_WORKSPACE` env override — explicit, highest precedence.
+2. Walk up from `process.cwd()` to a repo root (`.loom/` or `.git` marker). A
+   **linked worktree** CWD (`.git` is a *file*) resolves to the **main
+   checkout** via the git common dir, mirroring `resolve_mcp_workspace()` in
+   `defaults/scripts/claude-wrapper.sh`, so `.loom/config.json` is read from the
+   right place.
+3. **Loud failure** (throws) when neither is found — there is deliberately **no**
+   silent `~/GitHub/loom` fallback, which under user scope would silently operate
+   on the wrong repo.
+
+This relies on Claude Code launching stdio MCP servers with cwd = the session's
+project directory.
+
+### Manual / single-repo `.mcp.json` (legacy)
+
+You can still register per-repo if needed (e.g. Claude Desktop), but set
+`LOOM_WORKSPACE` explicitly so discovery is bypassed:
 
 ```json
 {
@@ -32,7 +72,7 @@ Add to your MCP settings (`.mcp.json` or Claude Desktop config):
 
 | Variable | Description | Default |
 |----------|-------------|---------|
-| `LOOM_WORKSPACE` | Path to the Loom workspace | `~/GitHub/loom` |
+| `LOOM_WORKSPACE` | Path to the Loom workspace (bypasses CWD discovery) | CWD-based repo-root discovery; **no** `~/GitHub/loom` fallback |
 | `LOOM_SOCKET_PATH` | Path to daemon socket | `~/.loom/loom-daemon.sock` |
 
 ## Available Tools (27 total)
@@ -165,9 +205,11 @@ The MCP client (Claude Code, Claude Desktop) loads the **built bundle** at
    cd mcp-loom && npm run build     # tsc --noEmit && rm -rf dist && node esbuild.config.js
    ```
 
-   `scripts/setup-mcp.sh` now rebuilds automatically when `dist/index.js` is
-   **missing or older than any file under `src/`**, so `./scripts/setup-mcp.sh`
-   is the safe one-shot path.
+   Under user-scope registration (#4230) the safe one-shot refresh is **`loom
+   update`**, which rebuilds this bundle when `dist/index.js` is **missing or
+   older than any file under `src/`** and serves it to every repo at once.
+   (`./scripts/setup-mcp.sh` still rebuilds the bundle too, but it is demoted —
+   it no longer registers `loom`; see the Configuration section.)
 
 2. **Rebuilding on disk does NOT refresh an already-running session.** An MCP
    client caches the tool list from its stdio-spawned child process **at connect

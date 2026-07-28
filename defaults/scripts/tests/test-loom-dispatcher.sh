@@ -156,6 +156,33 @@ src="$(cat "$DISPATCHER")"
 assert_not_contains "$src" "cargo build" "dispatcher source contains no 'cargo build' (thin boundary)"
 assert_not_contains "$src" "launchctl" "dispatcher source contains no 'launchctl' (thin boundary)"
 assert_not_contains "$src" "git pull" "dispatcher source contains no 'git pull' (thin boundary)"
+# The daemon half stays thin (no cargo/launchctl), but the mcp-loom bundle
+# refresh (#4230) DOES live here — assert the wiring is present.
+assert_contains "$src" "loom_refresh_mcp_bundle" "dispatcher wires the mcp-loom bundle refresh into update (#4230)"
+
+# ── #4230: update refreshes the served mcp-loom bundle before delegating ──────
+echo "Test 5b: 'update' refreshes the mcp-loom bundle, then delegates (#4230)"
+CHK2=$(make_checkout)
+# Fresh bundle: dist present, NO src/ dir -> staleness check finds nothing newer,
+# so the refresh reports 'already fresh' WITHOUT invoking npm (keeps the unit
+# test hermetic/offline).
+mkdir -p "$CHK2/mcp-loom/dist"; : > "$CHK2/mcp-loom/dist/index.js"
+set +e
+out=$(LOOM_HOME="$CHK2" bash "$DISPATCHER" update 2>&1)
+rc=$?
+set -e 2>/dev/null || true
+assert_eq "$rc" "0" "'loom update' exits 0 with an mcp-loom bundle present"
+assert_contains "$out" "mcp-loom bundle already fresh" "'update' checks the served mcp-loom bundle (#4230)"
+assert_contains "$out" "STUB_UPDATE" "'update' still delegates the daemon update after the bundle refresh"
+
+echo "Test 5c: 'update --check' does not touch the mcp-loom bundle (#4230)"
+set +e
+out=$(LOOM_HOME="$CHK2" bash "$DISPATCHER" update --check 2>&1)
+rc=$?
+set -e 2>/dev/null || true
+assert_eq "$rc" "0" "'loom update --check' exits 0"
+assert_contains "$out" "read-only mode" "'update --check' skips the bundle refresh (read-only)"
+assert_contains "$out" "STUB_UPDATE args=[--check]" "'update --check' still delegates with --check"
 
 # ── AC5: config resolution through the Phase 2 tier resolver ─────────────────
 if command -v jq >/dev/null 2>&1; then
