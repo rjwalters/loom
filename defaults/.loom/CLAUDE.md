@@ -315,7 +315,7 @@ fixes:
 
 ```bash
 loom-clean --force                              # stale worktrees/branches
-loom-orphan-recovery --recover                   # orphaned loom:building issues
+loom-recover-orphans --recover                   # orphaned loom:building issues
 gh label sync --file .github/labels.yml          # re-sync labels
 ```
 
