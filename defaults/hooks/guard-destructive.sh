@@ -40,9 +40,26 @@ trap 'exit 0' ERR
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd 2>/dev/null || echo ".")"
 
-# SCRIPT_DIR is <repo>/.loom/hooks at runtime (the settings entry resolves to the
-# main worktree's copy even from a linked worktree), so ../../ is the repo root.
-CANONICAL_GUARD="$SCRIPT_DIR/../../.claude/skills/repo/hooks/guard-destructive.sh"
+# Resolve the consuming repo's root, so CANONICAL_GUARD (below) points at the
+# right `.claude/skills/repo/hooks/...` regardless of WHERE this dispatcher
+# itself lives:
+#
+#   - Legacy/project-level wiring: SCRIPT_DIR is <repo>/.loom/hooks (the
+#     settings entry resolves to the main worktree's copy even from a linked
+#     worktree), so ../../ is the repo root. This is the historical behavior,
+#     preserved byte-for-byte when LOOM_PROJECT_ROOT is unset.
+#   - Machine-level wiring (Epic #3835 Phase 5, #4262): this file runs from
+#     the shared checkout (SCRIPT_DIR is <checkout>/defaults/hooks), where
+#     SCRIPT_DIR-relative resolution would point outside the consuming repo
+#     entirely. The user-scope command wrapper (provision-hooks.sh) resolves
+#     the worktree-aware repo root BEFORE exec'ing this dispatcher and passes
+#     it via LOOM_PROJECT_ROOT, so that root is preferred when set.
+#
+# VENDORED_GUARD is always a SCRIPT_DIR-relative sibling — correct in both
+# layouts, since guard-destructive-generic.sh ships alongside this dispatcher
+# either way.
+CANONICAL_ROOT="${LOOM_PROJECT_ROOT:-$SCRIPT_DIR/../..}"
+CANONICAL_GUARD="$CANONICAL_ROOT/.claude/skills/repo/hooks/guard-destructive.sh"
 # Vendored copy of the canonical guard, shipped by Loom for standalone repos.
 VENDORED_GUARD="$SCRIPT_DIR/guard-destructive-generic.sh"
 

@@ -611,6 +611,18 @@ else
   # in scripts/install/provision-skills.sh, which deletes a link ONLY when it
   # points into the machine checkout and never touches an operator's real files.
 
+  # NOTE (Epic #3835 Phase 5, #4262): the user-scope guard-hook entries wired
+  # into ~/.claude/settings.json by provision_loom_hooks are ALSO a machine-level
+  # SHARED resource — one set of entries, resolved by every repo Loom is
+  # installed into, exactly like the skills above. A per-repo uninstall therefore
+  # does NOT strip them: doing so would disable the destructive-command / worktree
+  # guards for every OTHER consumer repo on the machine. A machine-level teardown
+  # can remove them safely via `deprovision_loom_hooks` in
+  # scripts/install/provision-hooks.sh, which removes ONLY entries carrying the
+  # machine-level `/defaults/hooks/` marker and never touches an operator's own
+  # hooks. (The per-repo PROJECT-level `.claude/settings.json` Loom hook entries
+  # ARE stripped below, via the jq smart-removal on that file.)
+
   # Backward compatibility: also check old location (repo root)
   if [[ -f "$TARGET_PATH/loom" ]] && [[ -x "$TARGET_PATH/loom" ]]; then
     REMOVE_FILES+=("loom")

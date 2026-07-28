@@ -311,6 +311,38 @@ provisioning does not try to force user scope to win.
 > requires those trees present. That cutover lands with Phase 6's
 > `git rm --cached` migration, not here.
 
+## User-scope guard hooks (Epic #3835 Phase 5, #4262)
+
+The `PreToolUse` / `UserPromptSubmit` / `Stop` guard **hooks** also resolve from
+the machine-level checkout, provisioned by `scripts/install/provision-hooks.sh`
+(sibling of `provision-skills.sh`). Rather than a symlink, this performs a jq-based
+**idempotent merge** into the operator's user-scope `~/.claude/settings.json`:
+create-if-missing, back up before the first write, dedupe by the machine-level
+marker substring `defaults/hooks/<name>` (survives Claude Code requoting — the
+#4200 lesson), preserve every non-Loom entry, and soft-fail (no write) on invalid
+existing JSON.
+
+Each wired command is a **fail-open, self-gating** wrapper (full behavior in
+`defaults/docs/guard-hooks.md` → "Machine-Level Execution"): it no-ops outside a
+Loom workspace, defers to a still-present per-repo `.loom/hooks/<name>` copy
+(transition precedence — the project copy wins until Phase 6 / #4254 strips it, so
+guards never double-fire), and otherwise exec's the machine-checkout hook with the
+resolved repo root passed via `LOOM_PROJECT_ROOT`. `$HOME` / `$LOOM_HOME` expand
+per-user at hook-invocation time, so one wired command is correct for every
+operator. Daemon-spawned workers inherit the wiring via the `~/.claude/settings.json`
+copy each worker's isolated `CLAUDE_CONFIG_DIR` receives.
+
+`loom-daemon init`'s `.claude/settings.json` merge (`scaffolding.rs`) recognizes
+this machine-level command form (`MACHINE_HOOK_MARKER`) alongside the legacy /
+project-relative prefixes, so a reinstall never duplicates and an uninstall never
+orphans an entry that lands in a project-level settings file.
+
+> **Scope boundary (Phase 5 vs Phase 6).** This phase ships the machine-level hook
+> *execution* + user-scope wiring, and stops **copying** `defaults/hooks/*.sh` into
+> a fresh install's `.loom/hooks/`. It does **not** remove existing per-repo copies
+> or their project-level settings entries — that is Phase 6's `git rm --cached`
+> migration, which this replacement unblocks.
+
 ## Uninstall semantics
 
 A per-repo `uninstall-loom.sh` removes only the per-repo `./.loom/bin/loom` pool
@@ -325,3 +357,12 @@ does not remove them (that would break `/loom:*` for every other consumer repo).
 A machine-level teardown removes them via `deprovision_loom_skills` in
 `scripts/install/provision-skills.sh`, which deletes a link only when it points
 into the machine checkout and never touches an operator's real files.
+
+The user-scope **hook** entries follow the identical rule: they are one shared set
+resolved by every repo, so a per-repo uninstall does not strip them (that would
+disable the destructive-command / worktree guards for every other consumer repo). A
+machine-level teardown removes them via `deprovision_loom_hooks` in
+`scripts/install/provision-hooks.sh`, which removes only entries carrying the
+`/defaults/hooks/` marker and never touches an operator's own hooks. The per-repo
+**project-level** `.claude/settings.json` Loom hook entries, by contrast, *are*
+stripped by `uninstall-loom.sh`'s jq smart-removal on that file.

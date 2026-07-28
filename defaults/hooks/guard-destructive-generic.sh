@@ -212,10 +212,11 @@ fi
 # rev-parse subprocess below), on purpose — the structural test never needs the
 # repo root. Only the toggle/extra-list config read needs a config file, and it
 # is resolved LAZILY (only after structural admission already passed) by walking
-# up from CWD to the nearest .loom/config.json WITHOUT forking git
-# (fastpath_config_file). So a fast-pathed command pays: 1 bash-builtin test +
-# (only if eligible) 1 stat-walk + 1 jq read — never the git rev-parse, never a
-# deny/ask array, never a log write.
+# up from CWD to the nearest Loom config root WITHOUT forking git
+# (fastpath_config_root). So a fast-pathed command pays: 1 bash-builtin test +
+# (only if eligible) 1 stat-walk + up to 2 bounded jq reads (project tier, then
+# legacy tier only if the key is absent from project) — never the git
+# rev-parse, never a deny/ask array, never a log write.
 #
 # Toggle: guards.readOnlyFastPath (default true) / LOOM_GUARD_READONLY_FASTPATH
 # env (0/false/no disables, 1/true/yes forces on; env wins). Optional
@@ -223,40 +224,57 @@ fi
 # commands (each entry is a full-generality bypass for that command word).
 # =============================================================================
 
-# CARVE-OUT (#4063): the three fast-path readers below — fastpath_config_file,
-# fastpath_enabled, fastpath_extra_admits — are deliberately NOT migrated to the
-# shared config-resolver.sh (loom_config_get / loom_resolve_config) that the
-# cold-path toggles use. This is intentional and preserves issue #3687's fork
-# budget:
+# CARVE-OUT (#4063, UPDATED for Epic #3835 Phase 5, #4262): the fast-path
+# config readers below — fastpath_config_root, _fastpath_tiered_get,
+# _fastpath_tiered_get_array, fastpath_enabled, fastpath_extra_admits — are
+# deliberately NOT migrated to the shared config-resolver.sh (loom_config_get /
+# loom_resolve_config) that the cold-path toggles use. This is intentional and
+# preserves issue #3687's fork budget:
 #   * This block can `exit 0` (silent allow) BEFORE REPO_ROOT is resolved — the
 #     `git -C "$CWD" rev-parse --show-toplevel` fork lives strictly below the
 #     fast-path dispatch. loom_resolve_config REQUIRES a repo_root as its first
 #     argument, so routing these through it would force hoisting that git
 #     rev-parse above the fast-path exit, directly regressing #3687 (which
 #     removed it from the pre-admission path).
-#   * fastpath_config_file is a fork-free bash-builtin upward directory walk;
-#     fastpath_enabled / fastpath_extra_admits each cost exactly one CACHED jq.
-#     loom_config_get is uncached and forks jq once per existing tier file plus a
-#     merge (~3 forks today, more as Epic #3835 lands upper tiers) on EVERY call —
-#     a 3x+ regression on a hook that fires before every Bash tool call. Caching
-#     the merge (Option B) still needs a repo_root, and teaching the resolver a
-#     fork-free upward-walk root discovery (Option C) would break the documented
-#     three-language (Rust/Python/Bash) conformance-fixture contract in
-#     config-resolver.sh's header. So the fast path keeps its direct single-jq
-#     read of the nearest .loom/config.json. See #4063 for the full analysis.
+#   * fastpath_config_root is a fork-free bash-builtin upward directory walk
+#     (now stat-ing for EITHER `.loom-project/project.json` or
+#     `.loom/config.json`, so a `.loom-project/`-only repo is still found);
+#     fastpath_enabled / fastpath_extra_admits each cost AT MOST two CACHED,
+#     file-scoped jq reads (project tier, then legacy tier ONLY when the key
+#     is absent from the project tier — #4262's Epic #3835 `.loom-project/`
+#     tier reaching this toggle without forking the full merge).
+#     loom_resolve_config is uncached and soft-reads every tier file plus a
+#     merge (4+ forks today) on EVERY call — a 4x+ regression on a hook that
+#     fires before every Bash tool call. Caching the merge (Option B) still
+#     needs a repo_root, and teaching the resolver a fork-free upward-walk
+#     root discovery (Option C) would break the documented three-language
+#     (Rust/Python/Bash) conformance-fixture contract in config-resolver.sh's
+#     header. So the fast path keeps its direct, bounded (<=2 fork) reads
+#     instead. See #4063 for the original analysis and #4262 for the tier
+#     widening.
 #
-# Locate the nearest .loom/config.json by walking up from CWD, fork-free (no
-# git rev-parse). Cached. Best-effort: empty when none is found.
-_FASTPATH_CFG_FILE=""
-_FASTPATH_CFG_FILE_DONE=""
-fastpath_config_file() {
-    if [[ -z "$_FASTPATH_CFG_FILE_DONE" ]]; then
-        _FASTPATH_CFG_FILE_DONE=1
+# Locate the nearest Loom config ROOT by walking up from CWD, fork-free (no
+# git rev-parse) — a directory holding EITHER the tracked project tier
+# (.loom-project/project.json, Epic #3835) OR the legacy tier
+# (.loom/config.json). Cached. Best-effort: empty when neither is found.
+#
+# Epic #3835 Phase 5 (#4262): previously this walked looking for
+# .loom/config.json alone. Widening the stat to "either tier file" keeps the
+# walk itself fork-free (bash-builtin [[ -f ]] tests only) while letting the
+# two readers below (fastpath_enabled / fastpath_extra_admits) consult
+# .loom-project/project.json — see the CARVE-OUT comment above for why this
+# stays a direct, bounded-fork jq read instead of routing through
+# loom_resolve_config().
+_FASTPATH_CFG_ROOT=""
+_FASTPATH_CFG_ROOT_DONE=""
+fastpath_config_root() {
+    if [[ -z "$_FASTPATH_CFG_ROOT_DONE" ]]; then
+        _FASTPATH_CFG_ROOT_DONE=1
         local d="$CWD"
         if [[ -n "$d" && "$d" == /* ]]; then
             while :; do
-                if [[ -f "$d/.loom/config.json" ]]; then
-                    _FASTPATH_CFG_FILE="$d/.loom/config.json"
+                if [[ -f "$d/.loom-project/project.json" || -f "$d/.loom/config.json" ]]; then
+                    _FASTPATH_CFG_ROOT="$d"
                     break
                 fi
                 [[ "$d" == "/" ]] && break
@@ -266,7 +284,69 @@ fastpath_config_file() {
             done
         fi
     fi
-    printf '%s' "$_FASTPATH_CFG_FILE"
+    printf '%s' "$_FASTPATH_CFG_ROOT"
+}
+
+# Read a dotted-path boolean-ish scalar from the tiered fast-path config: try
+# the tracked project tier first (.loom-project/project.json), falling back to
+# the legacy tier (.loom/config.json) ONLY when the key is absent from the
+# project tier — this mirrors the resolver's whole-value tier precedence (a
+# higher tier that sets the key wins outright, it is not merged with a lower
+# tier). At most two jq forks, both file-scoped (no directory-file soft-read
+# fan-out, no merge) — the bounded-fork budget this CARVE-OUT preserves.
+# Echoes the resolved value, or empty when the key is absent from both tiers.
+_fastpath_tiered_get() {
+    local dotted="$1" root cfg value
+    root=$(fastpath_config_root)
+    [[ -n "$root" ]] || { printf ''; return 0; }
+
+    cfg="$root/.loom-project/project.json"
+    if [[ -f "$cfg" ]]; then
+        value=$(jq -r --arg p "$dotted" '
+            ($p | split(".")) as $path
+            | try getpath($path) catch null
+            | if . == null then empty else . end
+        ' "$cfg" 2>/dev/null) || value=""
+        [[ -n "$value" ]] && { printf '%s' "$value"; return 0; }
+    fi
+
+    cfg="$root/.loom/config.json"
+    if [[ -f "$cfg" ]]; then
+        value=$(jq -r --arg p "$dotted" '
+            ($p | split(".")) as $path
+            | try getpath($path) catch null
+            | if . == null then empty else . end
+        ' "$cfg" 2>/dev/null) || value=""
+        [[ -n "$value" ]] && { printf '%s' "$value"; return 0; }
+    fi
+
+    printf ''
+}
+
+# Same tier precedence as _fastpath_tiered_get, but for an array-valued key:
+# echoes the elements of guards.<name> one per line, from whichever tier's
+# file HAS the key first (project, else legacy) — an array value at a tier is
+# a whole-value override, never merged element-wise with a lower tier (this
+# matches the resolver's jq `*` deep-merge semantics for non-object values).
+# Echoes nothing when the key is absent from both tiers.
+_fastpath_tiered_get_array() {
+    local dotted="$1" root cfg has
+    root=$(fastpath_config_root)
+    [[ -n "$root" ]] || return 0
+
+    cfg="$root/.loom-project/project.json"
+    if [[ -f "$cfg" ]]; then
+        has=$(jq -r --arg p "$dotted" '($p | split(".")) as $path | try (getpath($path) != null) catch false' "$cfg" 2>/dev/null) || has=false
+        if [[ "$has" == "true" ]]; then
+            jq -r --arg p "$dotted" '($p | split(".")) as $path | getpath($path) | (. // [])[]' "$cfg" 2>/dev/null
+            return 0
+        fi
+    fi
+
+    cfg="$root/.loom/config.json"
+    if [[ -f "$cfg" ]]; then
+        jq -r --arg p "$dotted" '($p | split(".")) as $path | try (getpath($path) // []) catch [] | .[]' "$cfg" 2>/dev/null
+    fi
 }
 
 # Resolve the fast-path toggle (config + env), cached. Default true. Only ever
@@ -275,14 +355,11 @@ fastpath_config_file() {
 _FASTPATH_ENABLED_CACHE=""
 fastpath_enabled() {
     if [[ -z "$_FASTPATH_ENABLED_CACHE" ]]; then
-        local enabled=true cfg
-        cfg=$(fastpath_config_file)
-        if [[ -n "$cfg" ]]; then
-            # Only an explicit `false` disables; a missing key or malformed JSON
-            # (jq non-zero, caught by ||) stays ON — mirrors sql_guard_enabled().
-            enabled=$(jq -r 'if .guards.readOnlyFastPath == false then "false" else "true" end' "$cfg" 2>/dev/null) || enabled=true
-            [[ -n "$enabled" ]] || enabled=true
-        fi
+        local enabled=true raw
+        # Only an explicit `false` disables; an absent key on both tiers, or
+        # malformed JSON, stays ON — mirrors sql_guard_enabled().
+        raw=$(_fastpath_tiered_get "guards.readOnlyFastPath")
+        [[ "$raw" == "false" ]] && enabled=false
         # Env override wins over config.
         case "${LOOM_GUARD_READONLY_FASTPATH:-}" in
             0|false|no)  enabled=false ;;
@@ -380,11 +457,7 @@ fastpath_extra_admits() {
     local first="${t[0]}"
     if [[ -z "$_FASTPATH_EXTRA_DONE" ]]; then
         _FASTPATH_EXTRA_DONE=1
-        local cfg
-        cfg=$(fastpath_config_file)
-        if [[ -n "$cfg" ]]; then
-            _FASTPATH_EXTRA_CACHE=$(jq -r '(.guards.readOnlyFastPathExtra // []) | .[]' "$cfg" 2>/dev/null) || _FASTPATH_EXTRA_CACHE=""
-        fi
+        _FASTPATH_EXTRA_CACHE=$(_fastpath_tiered_get_array "guards.readOnlyFastPathExtra" 2>/dev/null) || _FASTPATH_EXTRA_CACHE=""
     fi
     [[ -n "$_FASTPATH_EXTRA_CACHE" ]] || return 1
     local w

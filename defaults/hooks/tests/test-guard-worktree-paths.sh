@@ -41,9 +41,14 @@ NC='\033[0m'
 TMPROOT="$(mktemp -d)"
 trap 'rm -rf "$TMPROOT"' EXIT
 git init -q "$TMPROOT"
-mkdir -p "$TMPROOT/.loom/hooks"
+mkdir -p "$TMPROOT/.loom/hooks" "$TMPROOT/.loom/scripts/lib"
 cp "$SRC_HOOK" "$TMPROOT/.loom/hooks/guard-worktree-paths.sh"
 chmod +x "$TMPROOT/.loom/hooks/guard-worktree-paths.sh"
+# The hook sources ../scripts/lib/config-resolver.sh (Epic #3835 Phase 5,
+# #4262) relative to its own SCRIPT_DIR — stage the real resolver at the
+# equivalent installed-layout path so the guards.worktreeIsolation /
+# worktree.root reads exercise the actual tiered resolution, not a stub.
+cp "$REPO_ROOT/defaults/scripts/lib/config-resolver.sh" "$TMPROOT/.loom/scripts/lib/config-resolver.sh"
 HOOK="$TMPROOT/.loom/hooks/guard-worktree-paths.sh"
 
 pass() { PASS=$((PASS + 1)); TOTAL=$((TOTAL + 1)); printf "${GREEN}PASS${NC} %s\n" "$1"; }
@@ -193,6 +198,40 @@ assert_allow "toggle: env LOOM_GUARD_WORKTREE_ISOLATION=0 -> allow" "$result"
 
 result=$(run_hook "$TMPROOT/CLAUDE.md")
 assert_deny "toggle: default (no config, no env) is ON -> deny" "$result"
+
+# --- Tiered config (Epic #3835 Phase 5, #4262): .loom-project/project.json --
+mkdir -p "$TMPROOT/.loom-project"
+cat > "$TMPROOT/.loom-project/project.json" <<'EOF'
+{"guards": {"worktreeIsolation": false}}
+EOF
+result=$(run_hook "$TMPROOT/CLAUDE.md")
+assert_allow "tiered config: .loom-project/project.json guards.worktreeIsolation=false -> allow" "$result"
+
+# .loom-project (higher tier) overrides a conflicting legacy .loom/config.json
+cat > "$TMPROOT/.loom/config.json" <<'EOF'
+{"guards": {"worktreeIsolation": true}}
+EOF
+result=$(run_hook "$TMPROOT/CLAUDE.md")
+assert_allow "tiered config: .loom-project overrides conflicting legacy .loom/config.json" "$result"
+rm -f "$TMPROOT/.loom/config.json"
+
+# worktree.root also resolves from .loom-project/project.json: point it at an
+# alternate base holding the ONLY managed worktree, and confirm a target under
+# the (now-legacy) worktrees dir at the main root no longer counts as "inside
+# a managed worktree" for this guard.
+ALT_BASE="$(mktemp -d)"
+cat > "$TMPROOT/.loom-project/project.json" <<EOF
+{"worktree": {"root": "$ALT_BASE"}}
+EOF
+mkdir -p "$ALT_BASE/$(basename "$TMPROOT")/issue-9"
+cat > "$ALT_BASE/$(basename "$TMPROOT")/issue-9/.loom-managed" <<'EOF'
+# Loom-managed worktree marker
+EOF
+result=$(run_hook "$ALT_BASE/$(basename "$TMPROOT")/issue-9/src/foo.rs")
+assert_allow "tiered config: worktree.root from .loom-project resolves an alt worktree base -> allow" "$result"
+rm -rf "$ALT_BASE"
+rm -f "$TMPROOT/.loom-project/project.json"
+rmdir "$TMPROOT/.loom-project" 2>/dev/null || true
 
 # --- Contract checks: exit is always 0, deny emits well-formed JSON --------
 for r in \

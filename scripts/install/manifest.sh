@@ -183,7 +183,15 @@ _emit_installed_files_manifest() {
         target_path=".loom/${rel_path}"
         ;;
       hooks/*)
-        target_path=".loom/${rel_path}"
+        # Epic #3835 Phase 5 (#4262): hook scripts are no longer copied into the
+        # consumer's .loom/hooks/ — they execute from the machine-level checkout
+        # via user-scope ~/.claude/settings.json wiring
+        # (scripts/install/provision-hooks.sh). Drop them from the ownership
+        # manifest so the uninstall hard-delete loop and the upgrade stale-file
+        # sweep no longer chase per-repo copies that a fresh install never wrote.
+        # (The #4041 canonical-guard skip above is now unreachable for hooks/* but
+        # left in place — harmless.)
+        continue
         ;;
       docs/*)
         target_path=".loom/${rel_path}"
