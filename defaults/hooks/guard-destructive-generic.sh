@@ -737,19 +737,30 @@ resolve_worktree_root() {
 # toggle in this file:
 #   1. LOOM_GUARD_WORKTREE_ISOLATION env var (0/false/no disables, 1/true/yes
 #      forces on). Overrides config.
-#   2. .loom/config.json -> guards.worktreeIsolation (default true when absent)
+#   2. .loom/config.json (or a higher config-resolver tier) -> guards.worktreeIsolation
+#      (default true when absent)
 #   3. Default: true (guard on)
 #
 # The config read is best-effort: any parse failure falls through to guard-ON
 # and never trips the ERR trap.
+#
+# Migrated to the shared tier resolver (#4241; this reader postdated #4063's
+# migration pass, see issue #4241). Same polarity contract as every other
+# cold-path toggle in this file (sql_guard_enabled() et al.): loom_config_get
+# collapses null/missing to the "true" default, so only an explicit boolean
+# `false` disables — a missing/null key, a non-boolean value, or malformed
+# JSON/config-resolver.sh failing to source all stay guard-ON via `|| raw=true`.
+# This runs on the Bash write-scope path (after REPO_ROOT is already resolved
+# for the cold-path toggles above), not the #3687 read-only fast path, so the
+# extra jq forks loom_config_get costs are not a hot-path regression.
 # =============================================================================
 _WORKTREE_ISOLATION_CACHE=""
 worktree_isolation_guard_enabled() {
     if [[ -z "$_WORKTREE_ISOLATION_CACHE" ]]; then
-        local enabled=true
-        if [[ -n "$REPO_ROOT" && -f "$REPO_ROOT/.loom/config.json" ]]; then
-            enabled=$(jq -r 'if .guards.worktreeIsolation == false then "false" else "true" end' "$REPO_ROOT/.loom/config.json" 2>/dev/null) || enabled=true
-            [[ -n "$enabled" ]] || enabled=true
+        local enabled=true raw
+        if [[ -n "$REPO_ROOT" ]]; then
+            raw=$(loom_config_get "$REPO_ROOT" "guards.worktreeIsolation" "true" 2>/dev/null) || raw=true
+            [[ "$raw" == "false" ]] && enabled=false
         fi
         case "${LOOM_GUARD_WORKTREE_ISOLATION:-}" in
             0|false|no)  enabled=false ;;
