@@ -53,17 +53,19 @@
 
 use crate::event_bus::EventBus;
 use crate::sweep_journal;
+use crate::tokens_pool::bad_tokens;
 use crate::types::{Event, SweepId, SweepInfo, SweepKind, SweepOutcome, SweepState};
 
 use anyhow::{anyhow, Context, Result};
 use chrono::{DateTime, Utc};
+use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 // ============================================================================
@@ -884,6 +886,60 @@ fn poll_token_name(child: &mut Child, log_path: &Path, header_anchor: &str) -> S
         }
         std::thread::sleep(TOKEN_NAME_CAPTURE_POLL_INTERVAL);
     }
+}
+
+// ============================================================================
+// Account-exhaustion classification at insta-crash time (Issue #4122)
+// ============================================================================
+
+/// Number of trailing log lines scanned for an account-exhaustion signature
+/// when classifying an insta-crash (#4122). The wrapper's exhaustion banner /
+/// `RATE_LIMIT_ABORT` sentinel is emitted right before the child dies, so the
+/// tail is where it lands; a bounded tail keeps the read cheap.
+const EXHAUSTION_LOG_TAIL_LINES: usize = 200;
+
+/// The account-exhaustion signature table (#4122).
+///
+/// Each row is a `(label, regex)` pair matched against the tail of a dead
+/// sweep's log at insta-crash classification time. A match means the child died
+/// because its OAuth account hit a usage/weekly/session limit — that is the
+/// ACCOUNT's fault, not the ISSUE's, so the reaper marks the account bad rather
+/// than charging the issue's insta-crash quarantine tally.
+///
+/// Kept as a table so a future signature (e.g. #4027's `Unknown command:`
+/// crash) can be added as another row without touching the classifier logic.
+/// The regexes mirror `defaults/scripts/claude-wrapper.sh::is_account_exhaustion`
+/// so the daemon path classifies exhaustion the same way the wrapper does.
+fn exhaustion_signatures() -> &'static [(&'static str, Regex)] {
+    static SIGS: OnceLock<Vec<(&'static str, Regex)>> = OnceLock::new();
+    SIGS.get_or_init(|| {
+        vec![
+            (
+                "weekly-limit",
+                Regex::new(
+                    r"(?i)hit your (limit|session limit|weekly limit)|hit\.your\.limit|monthly usage limit|out of extra usage",
+                )
+                .expect("valid static exhaustion regex"),
+            ),
+            (
+                "rate-limit-abort",
+                // The output/startup monitors kill the CLI and emit this
+                // sentinel on the interactive usage/plan-limit modal and the
+                // 100%-weekly banner (claude-wrapper.sh). Case-sensitive: it is
+                // a literal sentinel token, not free-form prose.
+                Regex::new(r"RATE_LIMIT_ABORT").expect("valid static exhaustion regex"),
+            ),
+        ]
+    })
+}
+
+/// Scan `log_tail` for any account-exhaustion signature (#4122). Returns the
+/// matched signature label on the first hit, else `None`.
+fn classify_account_exhaustion(log_tail: &str) -> Option<&'static str> {
+    exhaustion_signatures()
+        .iter()
+        .find(|(_, re)| re.is_match(log_tail))
+        .map(|(label, _)| *label)
 }
 
 /// Resolve the per-call reaper `gh` timeout (Issue #3973): the
@@ -1992,6 +2048,82 @@ impl SweepRegistry {
     // Insta-crash quarantine (Issue #3939)
     // ------------------------------------------------------------------------
 
+    /// Record an insta-crash-classified death, first giving the
+    /// account-exhaustion classifier a chance to re-attribute it to the spawn
+    /// account (#4122).
+    ///
+    /// When `insta_crash` is `true` and the dead sweep's log tail matches an
+    /// account-exhaustion signature, the death is charged to the ACCOUNT (the
+    /// spawn token is marked bad) and the issue's insta-crash quarantine tally
+    /// is left **untouched** — neither incremented (it was not the issue's
+    /// fault) nor reset (exhaustion is neutral for the issue's consecutive
+    /// streak). Otherwise the normal [`record_terminal_outcome`] accounting
+    /// applies unchanged.
+    ///
+    /// [`record_terminal_outcome`]: Self::record_terminal_outcome
+    fn record_insta_crash_outcome(&mut self, sweep_id: &SweepId, issue: u32, insta_crash: bool) {
+        if insta_crash && self.insta_crash_is_account_exhaustion(sweep_id, issue) {
+            return;
+        }
+        self.record_terminal_outcome(issue, insta_crash);
+    }
+
+    /// Classify whether an insta-crash death was caused by account exhaustion
+    /// (#4122).
+    ///
+    /// Reads the tail of the dead sweep's log and matches it against the
+    /// [`exhaustion_signatures`] table. On a match the spawn account is marked
+    /// bad (with the Rust-side exhaustion cooldown TTL — see
+    /// [`bad_tokens::is_bad`]) and `true` is returned so the caller charges the
+    /// account, not the issue. Returns `false` when the log shows no exhaustion
+    /// signature — the caller then applies the normal insta-crash accounting.
+    ///
+    /// Marking the account bad is best-effort and independent of the quarantine
+    /// config: even when quarantine is disabled, an exhaustion death should
+    /// still rotate the bad account out of the pool. When the spawn account was
+    /// never captured (`token=unknown`) the death is still not charged to the
+    /// issue, but no account can be marked bad.
+    fn insta_crash_is_account_exhaustion(&self, sweep_id: &SweepId, issue: u32) -> bool {
+        let Some(info) = self.entries.get(sweep_id) else {
+            return false;
+        };
+        let log_path = info.log_path.clone();
+        let token_name = info.token_name.clone();
+
+        let tail = match tail_lines(&log_path, EXHAUSTION_LOG_TAIL_LINES) {
+            Ok(lines) => lines.join("\n"),
+            Err(_) => return false,
+        };
+        let Some(signature) = classify_account_exhaustion(&tail) else {
+            return false;
+        };
+
+        if token_name == UNKNOWN_TOKEN_NAME {
+            log::warn!(
+                "sweep_registry: issue #{issue} sweep {sweep_id} insta-crashed on \
+                 account-exhaustion signature '{signature}' but the spawn account was never \
+                 captured (token=unknown) — NOT charging the issue's quarantine tally, but cannot \
+                 mark an account bad (#4122)"
+            );
+            return true;
+        }
+
+        let reason = format!("exhausted: {signature} (daemon insta-crash, issue #{issue})");
+        match bad_tokens::mark_bad(&self.config.workspace_root, &token_name, &reason) {
+            Ok(()) => log::warn!(
+                "sweep_registry: issue #{issue} sweep {sweep_id} insta-crashed on \
+                 account-exhaustion signature '{signature}' — marked account '{token_name}' bad \
+                 (cooldown TTL) and charged the ACCOUNT, not the issue's quarantine tally (#4122)"
+            ),
+            Err(e) => log::warn!(
+                "sweep_registry: issue #{issue} sweep {sweep_id} insta-crashed on \
+                 account-exhaustion signature '{signature}' (account '{token_name}') but mark_bad \
+                 failed: {e} — still NOT charging the issue's quarantine tally (#4122)"
+            ),
+        }
+        true
+    }
+
     /// Record a terminal sweep outcome against the insta-crash tally (#3939).
     ///
     /// `insta_crash` is `true` only when the reaper classified the death as a
@@ -3035,7 +3167,9 @@ impl SweepRegistry {
                                 let insta_crash = duration_sec
                                     < self.quarantine_config.insta_crash_secs
                                     && exit_code != Some(0);
-                                self.record_terminal_outcome(issue, insta_crash);
+                                // #4122: re-attribute account-exhaustion deaths
+                                // to the spawn account instead of the issue.
+                                self.record_insta_crash_outcome(&sweep_id, issue, insta_crash);
                             }
                         } else {
                             // Orphaned-claim recovery (issue #3823b): a
@@ -3088,7 +3222,9 @@ impl SweepRegistry {
                             let insta_crash = duration_sec
                                 < self.quarantine_config.insta_crash_secs
                                 && exit_code != Some(0);
-                            self.record_terminal_outcome(issue, insta_crash);
+                            // #4122: re-attribute account-exhaustion deaths to
+                            // the spawn account instead of the issue.
+                            self.record_insta_crash_outcome(&sweep_id, issue, insta_crash);
                         }
                         // Block-the-subtree (issue #3729, v1 item 4): if this
                         // parent ended in `loom:blocked` and stacked children
@@ -6180,6 +6316,151 @@ exit 0
             "quarantined set exposes #42 to the work finder"
         );
         assert_eq!(registry.quarantined_issues_sorted(), vec![42]);
+    }
+
+    // ------------------------------------------------------------------------
+    // Account-exhaustion attribution at insta-crash time (Issue #4122)
+    // ------------------------------------------------------------------------
+
+    /// Seed a per-repo token pool under `workspace/.loom/tokens` so
+    /// `bad_tokens::{mark_bad,is_bad}` resolve to this test's tempdir rather
+    /// than the host's real shared pool (`resolve_tokens_dir` only selects the
+    /// per-repo pool when it holds at least one `*.token` file).
+    fn seed_token_pool(workspace: &Path, token: &str) {
+        let dir = workspace.join(".loom").join("tokens");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(format!("{token}.token")), "sk-ant-oat01-fake").unwrap();
+    }
+
+    /// Insert a dead `Running` entry for `issue` whose captured spawn account is
+    /// `token` and whose log contains `log_body`. Returns the sweep_id.
+    fn insert_dead_running_with_log(
+        registry: &mut SweepRegistry,
+        issue: u32,
+        seq: u32,
+        token: &str,
+        log_body: &str,
+    ) -> String {
+        let sweep_id = insert_dead_running(registry, issue, seq);
+        let log_path = {
+            let info = registry.entries.get_mut(&sweep_id).unwrap();
+            info.token_name = token.to_string();
+            info.log_path.clone()
+        };
+        std::fs::create_dir_all(log_path.parent().unwrap()).unwrap();
+        std::fs::write(&log_path, log_body).unwrap();
+        sweep_id
+    }
+
+    /// The signature classifier matches the wrapper's exhaustion banners /
+    /// sentinel and ignores unrelated crash text (#4122).
+    #[test]
+    fn classify_account_exhaustion_matches_signatures() {
+        assert_eq!(
+            classify_account_exhaustion("Claude: hit your weekly limit — try again later"),
+            Some("weekly-limit")
+        );
+        assert_eq!(
+            classify_account_exhaustion("you are out of extra usage this month"),
+            Some("weekly-limit")
+        );
+        assert_eq!(
+            classify_account_exhaustion("monitor emitted RATE_LIMIT_ABORT and exited"),
+            Some("rate-limit-abort")
+        );
+        assert_eq!(classify_account_exhaustion("thread 'main' panicked at foo.rs:1"), None);
+        assert_eq!(classify_account_exhaustion(""), None);
+    }
+
+    /// AC #1: an exhaustion insta-crash marks the account bad and does NOT
+    /// charge the issue's quarantine tally — three in a row never quarantine.
+    #[test]
+    fn reaper_exhaustion_insta_crash_marks_account_not_issue() {
+        let dir = tempdir().unwrap();
+        let (mut registry, _record_log) = fixture_registry(dir.path());
+        seed_token_pool(dir.path(), "agent-3");
+
+        for seq in 0..3 {
+            insert_dead_running_with_log(
+                &mut registry,
+                55,
+                seq,
+                "agent-3",
+                "loom-daemon dispatch: start\nClaude: hit your weekly limit\n",
+            );
+            registry.reap_once();
+        }
+
+        // AC: not quarantined (the death was the account's fault), tally
+        // untouched.
+        assert!(
+            !registry.is_quarantined(55),
+            "exhaustion insta-crashes must not move the issue to loom:blocked (#4122)"
+        );
+        assert_eq!(registry.insta_crash_count(55), 0);
+        // AC: the spawn account is marked bad so selection rotates past it.
+        assert!(bad_tokens::is_bad(dir.path(), "agent-3"), "account marked bad on exhaustion");
+    }
+
+    /// AC #2: an insta-crash whose log does NOT match the exhaustion signature
+    /// retains today's behavior — charged to the issue, account untouched.
+    #[test]
+    fn reaper_non_exhaustion_insta_crash_charges_issue() {
+        let dir = tempdir().unwrap();
+        let (mut registry, _record_log) = fixture_registry(dir.path());
+        seed_token_pool(dir.path(), "agent-3");
+
+        for seq in 0..3 {
+            insert_dead_running_with_log(
+                &mut registry,
+                56,
+                seq,
+                "agent-3",
+                "loom-daemon dispatch: start\nsome unrelated crash: boom\n",
+            );
+            registry.reap_once();
+        }
+
+        // AC: charged to the issue exactly as before #4122.
+        assert!(
+            registry.is_quarantined(56),
+            "non-exhaustion insta-crashes still quarantine the issue"
+        );
+        // AC: the account is NOT marked bad for a non-exhaustion crash.
+        assert!(!bad_tokens::is_bad(dir.path(), "agent-3"));
+    }
+
+    /// A single exhaustion insta-crash leaves an existing (real) tally
+    /// untouched — exhaustion is neutral for the issue's consecutive streak,
+    /// neither incrementing nor resetting it (#4122).
+    #[test]
+    fn exhaustion_insta_crash_is_neutral_for_existing_tally() {
+        let dir = tempdir().unwrap();
+        let (mut registry, _record_log) = fixture_registry(dir.path());
+        seed_token_pool(dir.path(), "agent-3");
+
+        // Two genuine insta-crashes accrue a tally of 2.
+        registry.record_terminal_outcome(57, true);
+        registry.record_terminal_outcome(57, true);
+        assert_eq!(registry.insta_crash_count(57), 2);
+
+        // An exhaustion insta-crash must not touch the tally.
+        insert_dead_running_with_log(
+            &mut registry,
+            57,
+            9,
+            "agent-3",
+            "Claude: hit your weekly limit\n",
+        );
+        registry.reap_once();
+
+        assert_eq!(
+            registry.insta_crash_count(57),
+            2,
+            "exhaustion neither increments nor resets the issue's tally"
+        );
+        assert!(!registry.is_quarantined(57));
+        assert!(bad_tokens::is_bad(dir.path(), "agent-3"));
     }
 
     /// AC #1 + #3 (#4009): a death whose checkpoint was written BY THIS run
