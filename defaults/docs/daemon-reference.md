@@ -1414,6 +1414,14 @@ not the daemon, and is a separate follow-up.
 
 ## Operability — config, start/stop, E2E (Phase D, #3813)
 
+> **Machine-level `loom` dispatcher (Epic #3835 Phase 3a, #4157).** A machine-level
+> `loom` entry point at `~/.local/bin/loom` (sibling of `~/.local/bin/loom-daemon`)
+> resolves the `~/.local/share/loom` checkout and exec's into it —
+> `loom start|stop|status|sweep|update`. It is distinct from the per-repo tmux
+> agent-pool manager `./.loom/bin/loom`; the name-collision resolution, checkout
+> layout, and the thin-`update` boundary are documented in
+> [`machine-dispatcher.md`](machine-dispatcher.md).
+
 Phases A–C built the autonomous *engine* (work finder, dynamic concurrency,
 main-health gate) as env-var-only surfaces. Phase D (#3813) adds the
 operator-facing layer: a committed config surface, safe start/stop wrappers for
