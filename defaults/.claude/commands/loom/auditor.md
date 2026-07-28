@@ -389,7 +389,7 @@ jq -c 'select(.pattern == "<pattern>")' .loom/logs/guard-decisions.log | tail -3
 - **Allowlist / refine** — the op is safe, in-scope, routine autonomous work (e.g. an own-branch force-op, a scoped cleanup). Propose the specific guard refinement (a new toggle, a scope narrowing, an allowlist entry).
 - **Keep flagged** — the op is genuinely dangerous or irreversible (recursive-force-remove of root/`$HOME`/out-of-repo, force-push to `main`/`master`, `gh repo delete`/`archive`, fork bomb, pipe-curl-to-shell, cloud destruction, secrets exfil, or the uncommitted-loss `git checkout .`/`git restore .`/`git clean -fd` family). Confirm the guard should stand; close the loop so the same trigger is not re-filed.
 
-**Label discipline:** file these as normal issues that enter through intake (`loom:triage`) or as `loom:auditor` proposals for Champion evaluation — **never self-apply `loom:issue`** (only humans/Champion approve work). The genuinely-dangerous set MUST remain `DENY`/`ASK`; the standing policy only ever refines *false positives*, never relaxes a real safety floor.
+**Label discipline:** file these as normal issues that enter through intake (`loom:triage`) or as `loom:auditor` proposals for Champion evaluation — **never self-apply `loom:issue`** (promotion ownership: see `.loom/roles/curator.md` § "Who promotes `loom:curated` → `loom:issue`"). The genuinely-dangerous set MUST remain `DENY`/`ASK`; the standing policy only ever refines *false positives*, never relaxes a real safety floor.
 
 ## Decision Framework
 
