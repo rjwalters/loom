@@ -26,6 +26,15 @@
 # 78 (EX_CONFIG) with a message naming the resolved runtime, where it was
 # resolved from (env vs config vs default), and the runners actually present.
 #
+# Sweep/role-runner scheduling priority (issue #4233): applied inside
+# `spawn-<runtime>.sh` (currently only `spawn-claude.sh`), NOT here — this
+# dispatcher only ever `exec`s into a runner, which preserves the pid, so a
+# runner-level `nice`/`taskpolicy` re-exec still covers every process this
+# script itself would otherwise have spawned. Deliberately not duplicated at
+# this layer to avoid a double-apply; a future `spawn-<runtime>.sh` adopting a
+# new runtime should apply its own priority policy the same way
+# `spawn-claude.sh` does, not rely on this dispatcher for it.
+#
 # Usage:
 #   .loom/scripts/spawn-worker.sh -p "your prompt"
 #   LOOM_RUNTIME=claude .loom/scripts/spawn-worker.sh --use-wrapper -p "..."

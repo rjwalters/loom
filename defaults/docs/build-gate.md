@@ -218,9 +218,28 @@ real, non-zero, unprivileged-achievable gap in the achievable direction
 (gate `5` > sweeps `0`): the gate yields *slightly* under contention rather than
 starving the sweeps, without being drastically deprioritized as it was at 19.
 The alternative — niceing sweep *children* up in the spawn path to force a
-strict gate-below-sweep gap — is deliberately not done, since the issue directed
-the spawn path be left untouched and the contention it would brace against is
-the one the evidence above withdrew.
+strict gate-below-sweep gap — was deliberately not done here at the time, since
+the issue directed the spawn path be left untouched and the contention it would
+brace against is the one the evidence above withdrew.
+
+**Update (#4233): the inversion is now implemented, from the OTHER side.**
+Issue #4231 (a 2026-07-27→28 host meltdown under 6-way sweep fan-out) diagnosed
+*starvation*, not raw load, as the real failure — sweep worker processes (and
+every `cargo`/`rustc`/test binary they spawn) ran at default niceness (0),
+competing head-to-head with interactive/system processes. `spawn-claude.sh` now
+re-execs itself at a mild positive niceness (default `nice 10`, configurable via
+`LOOM_SWEEP_NICENESS` env / `autonomous.spawnNiceness` config, master disable
+`LOOM_SWEEP_NICE=0`) using the same re-exec-with-sentinel pattern documented
+above (`LOOM_SWEEP_NICED` mirrors `LOOM_BUILD_GATE_NICED`). An optional macOS
+`taskpolicy -c <class>` scheduling-class layer (`LOOM_SWEEP_TASKPOLICY_CLASS` /
+`autonomous.spawnTaskpolicyClass`, off by default) is available on top of nice.
+See `spawn-claude.sh`'s own header comment for the full precedence chain. With
+sweep children now at `nice 10` and the gate at `nice 5`, the gate has a real,
+measured, unprivileged-achievable *higher* priority than sweeps — the reverse of
+the `gate 5 > sweeps 0` relationship described above — so the gate now
+structurally wins CPU contention against concurrently-dispatched sweep builds,
+addressing the #4084 premise (below) as a side effect rather than requiring the
+dispatch-suppression workaround alone.
 
 The re-exec mechanism and its knobs are preserved: `LOOM_BUILD_GATE_NICENESS`
 overrides the value (e.g. `=0` for exact sweep parity, `=19` to restore the old
