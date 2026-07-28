@@ -6,6 +6,10 @@ use std::fs;
 use std::path::Path;
 use std::process::Command;
 
+use serde_json::json;
+
+use super::templates::LoomMetadata;
+
 /// Gitignore patterns that would shadow installed Loom files like
 /// `.loom/scripts/lib/*.sh`. If a user's gitignore contains any of these, the
 /// installer must fail loudly: the files will exist on disk after install but
@@ -162,6 +166,89 @@ fn managed_gitignore_block() -> String {
     block
 }
 
+/// Derive the Loom source-checkout root from the resolved defaults directory.
+///
+/// The wrappers and daemon both point `init` at a `<root>/defaults` directory,
+/// so the source root is that directory's parent. Returns `None` when the
+/// directory is not named `defaults` (a bundled/embedded layout) or has no
+/// parent — the caller then omits `loom_source` rather than recording a wrong
+/// path. The result is canonicalized to an absolute path when possible so the
+/// gitignored `.loom/loom-source-path` sidecar and `loom_source` key match what
+/// the shell installer writes.
+fn derive_loom_source(defaults_dir: &Path) -> Option<String> {
+    if defaults_dir.file_name().and_then(|n| n.to_str()) != Some("defaults") {
+        return None;
+    }
+    let root = defaults_dir.parent()?;
+    // Prefer an absolute, symlink-resolved path (matches install.sh's
+    // `loom_root`); fall back to the lexical parent if canonicalization fails
+    // (e.g. the directory was removed between resolve and write).
+    let resolved = fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+    Some(resolved.to_string_lossy().into_owned())
+}
+
+/// Write `.loom/install-metadata.json` (and, when derivable, the gitignored
+/// `.loom/loom-source-path` sidecar) so a direct `loom-daemon init` produces the
+/// same version metadata the shell installers do (#4050).
+///
+/// Before this, only `install.sh`/`install-loom.sh` wrote these artifacts, so a
+/// consumer that ran `loom-daemon init` directly (a supported entry point since
+/// the machine-level binary of #3922) got a `.loom/` with no version metadata:
+/// `/repo:update-tools` reported UNKNOWN and `manifest.json` carried empty
+/// `loom_version`/`loom_commit`.
+///
+/// Schema-compatible with `finalize_quick_install` (at least `loom_version`,
+/// `loom_commit`, `install_date`; `installed_files` may be empty —
+/// `verify-install.sh` warns-and-falls-back on an empty list). The wrappers run
+/// `finalize_quick_install` *after* `init`, overwriting this file with the
+/// richer version (populated `loom_source` + `installed_files`), so both paths
+/// converge and this write never regresses a wrapper install.
+///
+/// Non-fatal: a write failure warns but does not abort the install (mirrors
+/// [`generate_manifest`]).
+pub fn write_install_metadata(workspace_path: &Path, metadata: &LoomMetadata, defaults_dir: &Path) {
+    let loom_path = workspace_path.join(".loom");
+    if !loom_path.exists() {
+        return;
+    }
+
+    let version = metadata.version.as_deref().unwrap_or("unknown");
+    let commit = metadata.commit.as_deref().unwrap_or("unknown");
+    let source = derive_loom_source(defaults_dir);
+
+    let mut obj = json!({
+        "loom_version": version,
+        "loom_commit": commit,
+        "install_date": metadata.install_date,
+        "installed_files": [],
+    });
+    // Only record loom_source when it can be derived — never a wrong path.
+    if let Some(src) = source.as_deref() {
+        obj["loom_source"] = json!(src);
+    }
+
+    match serde_json::to_string_pretty(&obj) {
+        Ok(mut contents) => {
+            contents.push('\n');
+            if let Err(e) = fs::write(loom_path.join("install-metadata.json"), contents) {
+                eprintln!("Warning: Could not write .loom/install-metadata.json: {e}");
+            }
+        }
+        Err(e) => {
+            eprintln!("Warning: Could not serialize install metadata: {e}");
+        }
+    }
+
+    // Machine-local source sidecar (gitignored via EPHEMERAL_PATTERNS). Only
+    // written when the source root is known; consumers have a fallback chain
+    // that recreates it from `install-metadata.json`'s `loom_source` otherwise.
+    if let Some(src) = source {
+        if let Err(e) = fs::write(loom_path.join("loom-source-path"), format!("{src}\n")) {
+            eprintln!("Warning: Could not write .loom/loom-source-path: {e}");
+        }
+    }
+}
+
 /// Generate installation manifest by running verify-install.sh
 ///
 /// Attempts to run `.loom/scripts/verify-install.sh generate --quiet` to create
@@ -314,6 +401,120 @@ mod tests {
     use super::*;
     use std::fs;
     use tempfile::TempDir;
+
+    fn metadata(version: &str, commit: &str) -> LoomMetadata {
+        LoomMetadata {
+            version: Some(version.to_string()),
+            commit: Some(commit.to_string()),
+            install_date: "2026-07-27".to_string(),
+        }
+    }
+
+    #[test]
+    fn write_install_metadata_writes_version_and_commit() {
+        let tmp = TempDir::new().unwrap();
+        let workspace = tmp.path();
+        fs::create_dir(workspace.join(".loom")).unwrap();
+        // A `<root>/defaults` dir so loom_source is derivable.
+        let defaults = workspace.join("srcroot").join("defaults");
+        fs::create_dir_all(&defaults).unwrap();
+
+        write_install_metadata(workspace, &metadata("0.15.0", "ebf4fc55"), &defaults);
+
+        let raw =
+            fs::read_to_string(workspace.join(".loom").join("install-metadata.json")).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(v["loom_version"], "0.15.0");
+        assert_eq!(v["loom_commit"], "ebf4fc55");
+        assert_eq!(v["install_date"], "2026-07-27");
+        assert!(v["installed_files"].is_array());
+        // loom_source is the parent of the `defaults` dir, canonicalized.
+        let src = v["loom_source"].as_str().unwrap();
+        assert!(src.ends_with("srcroot"), "loom_source should be the defaults parent, got {src}");
+
+        // The gitignored sidecar mirrors loom_source.
+        let sidecar = fs::read_to_string(workspace.join(".loom").join("loom-source-path")).unwrap();
+        assert_eq!(sidecar.trim(), src);
+    }
+
+    #[test]
+    fn write_install_metadata_omits_source_when_not_defaults() {
+        let tmp = TempDir::new().unwrap();
+        let workspace = tmp.path();
+        fs::create_dir(workspace.join(".loom")).unwrap();
+        // Not named `defaults` → loom_source cannot be derived and must be omitted.
+        let bundled = workspace.join("resources");
+        fs::create_dir_all(&bundled).unwrap();
+
+        write_install_metadata(workspace, &metadata("0.15.0", "abc1234"), &bundled);
+
+        let raw =
+            fs::read_to_string(workspace.join(".loom").join("install-metadata.json")).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(v["loom_version"], "0.15.0");
+        assert!(v.get("loom_source").is_none(), "loom_source must be omitted, not wrong");
+        // No sidecar written when the source root is unknown.
+        assert!(!workspace.join(".loom").join("loom-source-path").exists());
+    }
+
+    #[test]
+    fn write_install_metadata_is_idempotent() {
+        let tmp = TempDir::new().unwrap();
+        let workspace = tmp.path();
+        fs::create_dir(workspace.join(".loom")).unwrap();
+        let defaults = workspace.join("srcroot").join("defaults");
+        fs::create_dir_all(&defaults).unwrap();
+
+        write_install_metadata(workspace, &metadata("0.15.0", "abc1234"), &defaults);
+        let first =
+            fs::read_to_string(workspace.join(".loom").join("install-metadata.json")).unwrap();
+        write_install_metadata(workspace, &metadata("0.15.0", "abc1234"), &defaults);
+        let second =
+            fs::read_to_string(workspace.join(".loom").join("install-metadata.json")).unwrap();
+
+        assert_eq!(first, second, "re-running init must not garble the JSON");
+        // Parses cleanly (no duplicate/concatenated objects).
+        serde_json::from_str::<serde_json::Value>(&second).unwrap();
+    }
+
+    #[test]
+    fn write_install_metadata_falls_back_to_unknown_when_absent() {
+        // A LoomMetadata with no version/commit (both env AND compiled empty)
+        // still produces valid JSON with the "unknown" placeholder rather than
+        // panicking or writing null.
+        let tmp = TempDir::new().unwrap();
+        let workspace = tmp.path();
+        fs::create_dir(workspace.join(".loom")).unwrap();
+        let defaults = workspace.join("srcroot").join("defaults");
+        fs::create_dir_all(&defaults).unwrap();
+
+        let meta = LoomMetadata {
+            version: None,
+            commit: None,
+            install_date: "2026-07-27".to_string(),
+        };
+        write_install_metadata(workspace, &meta, &defaults);
+
+        let raw =
+            fs::read_to_string(workspace.join(".loom").join("install-metadata.json")).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(v["loom_version"], "unknown");
+        assert_eq!(v["loom_commit"], "unknown");
+    }
+
+    #[test]
+    fn derive_loom_source_handles_defaults_and_non_defaults() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().join("checkout");
+        let defaults = root.join("defaults");
+        fs::create_dir_all(&defaults).unwrap();
+
+        let src = derive_loom_source(&defaults).unwrap();
+        assert!(src.ends_with("checkout"));
+
+        // A directory not named `defaults` yields None.
+        assert!(derive_loom_source(&root).is_none());
+    }
 
     #[test]
     fn creates_gitignore_with_all_patterns_when_none_exists() {

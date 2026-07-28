@@ -35,7 +35,9 @@ use std::path::Path;
 use serde_json::Value;
 
 use file_ops::{clean_managed_dir, copy_dir_with_report, verify_copied_files, TemplateContext};
-use post_init::{find_overbroad_loom_patterns, generate_manifest, update_gitignore};
+use post_init::{
+    find_overbroad_loom_patterns, generate_manifest, update_gitignore, write_install_metadata,
+};
 use retired::cleanup_retired_files;
 use scaffolding::setup_repository_scaffolding;
 
@@ -216,6 +218,14 @@ pub fn initialize_workspace(
     // (returns at ~line 147 before scaffolding) means this never runs on the
     // Loom source repo — it must not mutate the source tree.
     cleanup_retired_files(workspace, &mut report);
+
+    // Write .loom/install-metadata.json (and the gitignored loom-source-path
+    // sidecar) BEFORE generate_manifest so verify-install.sh reads the fresh
+    // loom_commit when it builds manifest.json (#4050). A direct `loom-daemon
+    // init` sets no LOOM_* env, so from_env() supplies the binary's compiled-in
+    // version/commit rather than the literal "unknown". The shell wrappers run
+    // finalize_quick_install after init and overwrite this with richer data.
+    write_install_metadata(workspace, &templates::LoomMetadata::from_env(), &defaults);
 
     // Generate installation manifest (.loom/manifest.json)
     generate_manifest(workspace);
@@ -557,6 +567,64 @@ fn verify_all_copied_files(
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    #[test]
+    fn test_direct_init_writes_install_metadata_and_substitutes_version() {
+        // #4050: a direct `loom-daemon init` (no LOOM_* env exported by any
+        // shell wrapper) must still write `.loom/install-metadata.json` with a
+        // real version, and must substitute a real version into `.loom/CLAUDE.md`
+        // rather than leaking the literal "unknown".
+        let temp_dir = TempDir::new().unwrap();
+        let workspace = temp_dir.path();
+        // The defaults dir MUST be named `defaults` so loom_source is derivable.
+        let defaults = temp_dir.path().join("defaults");
+
+        fs::create_dir(workspace.join(".git")).unwrap();
+        fs::create_dir_all(defaults.join("roles")).unwrap();
+        fs::create_dir_all(defaults.join(".loom")).unwrap();
+        fs::write(defaults.join("config.json"), "{}").unwrap();
+        fs::write(defaults.join("roles").join("builder.md"), "builder").unwrap();
+        // A CLAUDE.md template carrying the version placeholder.
+        fs::write(
+            defaults.join(".loom").join("CLAUDE.md"),
+            "# Loom\n\n**Loom Version**: {{LOOM_VERSION}}\n**Loom Commit**: {{LOOM_COMMIT}}\n",
+        )
+        .unwrap();
+
+        let result =
+            initialize_workspace(workspace.to_str().unwrap(), defaults.to_str().unwrap(), false);
+        assert!(result.is_ok(), "init failed: {result:?}");
+
+        // 1. install-metadata.json exists with a non-"unknown" version/commit.
+        let meta_raw =
+            fs::read_to_string(workspace.join(".loom").join("install-metadata.json")).unwrap();
+        let meta: serde_json::Value = serde_json::from_str(&meta_raw).unwrap();
+        let version = meta["loom_version"].as_str().unwrap();
+        assert!(!version.is_empty(), "loom_version must not be empty");
+        assert_ne!(version, "unknown", "loom_version must not be the literal unknown");
+        assert!(!version.contains("{{"), "loom_version must not be an unsubstituted placeholder");
+        // loom_source points at the defaults' parent (this temp dir).
+        let src = meta["loom_source"].as_str().unwrap();
+        assert!(!src.is_empty());
+
+        // 2. .loom/CLAUDE.md has no leftover placeholder and no "unknown" version.
+        let claude = fs::read_to_string(workspace.join(".loom").join("CLAUDE.md")).unwrap();
+        assert!(!claude.contains("{{"), "CLAUDE.md must have no unsubstituted placeholder");
+        assert!(
+            !claude.contains("**Loom Version**: unknown"),
+            "CLAUDE.md must not render the unknown version: {claude}"
+        );
+
+        // 3. Re-running init is idempotent — the metadata file still parses and
+        //    carries the same schema (no duplicate/garbled JSON).
+        let result2 =
+            initialize_workspace(workspace.to_str().unwrap(), defaults.to_str().unwrap(), true);
+        assert!(result2.is_ok(), "reinstall failed: {result2:?}");
+        let meta_raw2 =
+            fs::read_to_string(workspace.join(".loom").join("install-metadata.json")).unwrap();
+        let meta2: serde_json::Value = serde_json::from_str(&meta_raw2).unwrap();
+        assert_eq!(meta2["loom_version"].as_str().unwrap(), version);
+    }
 
     #[test]
     fn test_is_loom_source_repo_marker_file() {
