@@ -67,6 +67,20 @@
 #                          the sweep escalation ladder's per-rung `@effort`
 #                          cannot be threaded here because the in-session Task
 #                          tool exposes no effort parameter (see sweep.md).
+#   LOOM_SWEEP_NICENESS    Scheduling niceness applied to this process (and
+#                          everything it execs/forks — claude, claude-wrapper,
+#                          cargo, rustc, test binaries) via a `nice -n N exec`
+#                          re-exec, mirroring build-gate.sh's niceness pattern
+#                          (issue #4233). Precedence: this env var ->
+#                          `autonomous.spawnNiceness` config -> default `10`.
+#   LOOM_SWEEP_NICE=0      Disables the ENTIRE priority mechanism (nice AND
+#                          taskpolicy below), restoring pre-#4233 behavior.
+#   LOOM_SWEEP_TASKPOLICY_CLASS  Optional macOS `taskpolicy -c <class>`
+#                          scheduling class applied in-place (e.g. "utility").
+#                          Precedence: this env var ->
+#                          `autonomous.spawnTaskpolicyClass` config -> unset
+#                          (off by default). No-op on non-macOS or when
+#                          `taskpolicy` is unavailable.
 
 set -euo pipefail
 
@@ -113,10 +127,97 @@ _resolve_workspace() {
 
 WORKSPACE="$(_resolve_workspace)"
 
+_script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# --- Sweep/role-runner spawn scheduling priority (issue #4233) ---
+#
+# Issue #4231 (host meltdown 2026-07-27→28: 6-way sweep fan-out, load 118/28
+# cores, WindowServer watchdog-killed 5×, loom-daemon crashed) diagnosed
+# STARVATION, not raw load, as the actual failure mode: sweep worker processes
+# — and every build they spawn (cargo, rustc, test binaries) — run at default
+# niceness (0), so under fan-out they compete head-to-head with WindowServer,
+# VNC, and other system daemons for CPU.
+#
+# #3985/#4020/#4073/#4084 (see build-gate.sh:32-82) already ran this
+# experiment from the OTHER side — nicing the build GATE up so it could never
+# starve sweeps. #4020 found the extreme gate=19 starved the gate itself into
+# UNEVALUATED and settled on gate=5 (a mild, measured, unprivileged-achievable
+# gap above sweeps' nice-0 default); its comment (build-gate.sh:63-70)
+# explicitly flagged the untried alternative — nicing sweep children UP in the
+# spawn path — as deliberately not done at the time. This block does that, so
+# the gap between gate and sweep niceness is now real in both directions.
+#
+# Applied here — the outermost point in the daemon's actual dispatch path.
+# `loom-daemon` invokes THIS script directly for both sweep dispatch
+# (SweepRegistryConfig::resolve_spawn_bin in
+# loom-daemon/src/sweep_registry.rs) and scheduled role-runner dispatch
+# (role_runner.rs) — both unattended/background paths; MOM's interactive
+# terminals run `claude` directly and never go through this script, so no
+# separate "interactive opt-out" is needed. spawn-worker.sh (a not-yet-wired
+# future multi-runtime seam, see its own header) execs into this script for
+# the "claude" runtime and is therefore covered transparently; it applies no
+# priority adjustment of its own so there is no double-apply risk.
+#
+# Mechanism: a `nice -n N exec "$0" "$@"` re-exec — mirroring build-gate.sh's
+# `LOOM_BUILD_GATE_NICED` sentinel pattern — applied before ANY child process
+# (token selection, `claude`, `claude-wrapper.sh`). Because `exec` preserves
+# the PID and nice/taskpolicy attributes survive exec, the whole subsequent
+# process tree (this script → claude/claude-wrapper → any cargo/rustc it
+# forks) inherits the adjustment with no separate handling required
+# downstream. The build gate has its own independent niceness policy
+# (build-gate.sh) and is never invoked through this script, so there is no
+# overlap with it either.
+#
+# Precedence (env > config > default), the tier order used throughout loom:
+#   LOOM_SWEEP_NICENESS         > autonomous.spawnNiceness         > 10
+#   LOOM_SWEEP_TASKPOLICY_CLASS > autonomous.spawnTaskpolicyClass  > (unset)
+#
+# LOOM_SWEEP_NICE=0 disables the ENTIRE mechanism (nice AND taskpolicy),
+# restoring byte-identical pre-#4233 behavior (nice 0, no taskpolicy class).
+#
+# Default is nice ONLY, at a moderate value (10) — deliberately above the
+# gate's 5, so sweeps now yield to the gate under contention, addressing the
+# #4084 CPU-contention premise as a structural side effect. `taskpolicy` is
+# opt-in and unset by default: on macOS, `-c utility` is the recommended class
+# if enabled — deliberately NOT `-b`/background (DARWIN_BG), which also
+# throttles disk I/O and network aggressively enough to risk *causing* the
+# very timeouts this issue is trying to prevent.
+if [[ -z "${LOOM_SWEEP_NICED:-}" && "${LOOM_SWEEP_NICE:-1}" != "0" ]]; then
+    _sweep_niceness="${LOOM_SWEEP_NICENESS:-}"
+    _sweep_taskpolicy_class="${LOOM_SWEEP_TASKPOLICY_CLASS:-}"
+    _sweep_config_lib="${_script_dir}/lib/config-resolver.sh"
+    if [[ ( -z "$_sweep_niceness" || -z "$_sweep_taskpolicy_class" ) \
+          && -f "$_sweep_config_lib" ]]; then
+        # shellcheck source=./lib/config-resolver.sh
+        source "$_sweep_config_lib"
+        [[ -z "$_sweep_niceness" ]] \
+            && _sweep_niceness="$(loom_config_get "$WORKSPACE" "autonomous.spawnNiceness" "")"
+        [[ -z "$_sweep_taskpolicy_class" ]] \
+            && _sweep_taskpolicy_class="$(loom_config_get "$WORKSPACE" "autonomous.spawnTaskpolicyClass" "")"
+    fi
+    : "${_sweep_niceness:=10}"
+
+    # taskpolicy sets the scheduling class on THIS running process (no
+    # re-exec needed) and, like nice, survives the exec below since exec
+    # preserves the PID. Best-effort: a failure here never blocks the spawn.
+    if [[ -n "$_sweep_taskpolicy_class" ]] && command -v taskpolicy >/dev/null 2>&1; then
+        if taskpolicy -c "$_sweep_taskpolicy_class" -p $$ >/dev/null 2>&1; then
+            log_info "spawn-claude: applied taskpolicy -c $_sweep_taskpolicy_class (issue #4233)"
+        else
+            log_warn "spawn-claude: taskpolicy -c $_sweep_taskpolicy_class failed (non-fatal, continuing at default policy class)"
+        fi
+    fi
+
+    if [[ "$_sweep_niceness" != "0" ]] && command -v nice >/dev/null 2>&1; then
+        export LOOM_SWEEP_NICED=1
+        log_info "spawn-claude: re-exec at nice -n $_sweep_niceness (issue #4233; LOOM_SWEEP_NICE=0 to disable)"
+        exec nice -n "$_sweep_niceness" "$0" "$@"
+    fi
+fi
+
 # --- Locate the loom-daemon binary (token selection, issue #4228) ---
 # Resolution precedence (see lib/locate-daemon-bin.sh): $LOOM_DAEMON_BIN ->
 # `loom-daemon` on PATH -> build-output-relative candidates under $WORKSPACE.
-_script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=lib/locate-daemon-bin.sh
 source "${_script_dir}/lib/locate-daemon-bin.sh"
 

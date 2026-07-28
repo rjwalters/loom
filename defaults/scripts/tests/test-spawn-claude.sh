@@ -969,6 +969,133 @@ assert_contains "ARG<--dangerously-skip-permissions>" "$bsd_captured" \
 rm -rf "$CC_DIR"
 
 # ============================================================
+# Section 7: spawn scheduling priority (issue #4233)
+#
+# Sweep worker processes (and everything they exec/fork downstream) get
+# niced up so they no longer starve interactive/system processes under
+# fan-out. The niceness value is observable via `ps -o ni=` on the exec'd
+# `claude` stub's own pid — the re-exec preserves the pid, so this directly
+# proves the value the eventual `claude`/cargo/rustc process tree inherits.
+# ============================================================
+
+echo ""
+echo "Testing spawn-claude.sh scheduling priority (#4233)..."
+
+PRIO_DIR="$(mktemp -d)"
+trap 'rm -rf "$TEST_WS" "$STUB_DIR" "$PRIO_DIR"' EXIT
+
+cat > "$PRIO_DIR/claude" <<'STUB'
+#!/usr/bin/env bash
+echo "nice=$(ps -o ni= -p $$ | tr -d ' ')"
+STUB
+chmod +x "$PRIO_DIR/claude"
+
+# Fake `taskpolicy` that records its invocation instead of requiring a real
+# macOS host — this is a plain PATH-resolved stub, so it exercises the
+# `command -v taskpolicy` branch deterministically on any OS.
+TASKPOLICY_LOG="$PRIO_DIR/taskpolicy.log"
+cat > "$PRIO_DIR/taskpolicy" <<STUB
+#!/usr/bin/env bash
+echo "\$*" >> "$TASKPOLICY_LOG"
+exit 0
+STUB
+chmod +x "$PRIO_DIR/taskpolicy"
+
+# Test: default niceness is 10 with no env/config set.
+output=$(LOOM_WORKSPACE="$TEST_WS" LOOM_DAEMON_BIN="$DAEMON_BIN" PATH="$PRIO_DIR:$PATH" \
+    "$SCRIPTS_DIR/spawn-claude.sh" -p "ping" 2>&1 || true)
+assert_contains "nice=10" "$output" \
+    "spawn-claude defaults to nice 10 (#4233)"
+assert_contains "spawn-claude: re-exec at nice -n 10" "$output" \
+    "spawn-claude logs the re-exec niceness (#4233)"
+
+# Test: LOOM_SWEEP_NICE=0 disables the entire mechanism (nice AND taskpolicy).
+output=$(LOOM_WORKSPACE="$TEST_WS" LOOM_DAEMON_BIN="$DAEMON_BIN" PATH="$PRIO_DIR:$PATH" \
+    LOOM_SWEEP_NICE=0 \
+    "$SCRIPTS_DIR/spawn-claude.sh" -p "ping" 2>&1 || true)
+assert_contains "nice=0" "$output" \
+    "LOOM_SWEEP_NICE=0 disables the priority mechanism, restoring nice 0 (#4233)"
+TESTS_RUN=$((TESTS_RUN + 1))
+if [[ "$output" != *"re-exec at nice"* ]]; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "  ${GREEN}PASS${NC}: LOOM_SWEEP_NICE=0 suppresses the re-exec entirely (#4233)"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "  ${RED}FAIL${NC}: LOOM_SWEEP_NICE=0 suppresses the re-exec entirely (#4233)"
+    echo "    In: '$output'"
+fi
+
+# Test: LOOM_SWEEP_NICENESS overrides the default value.
+output=$(LOOM_WORKSPACE="$TEST_WS" LOOM_DAEMON_BIN="$DAEMON_BIN" PATH="$PRIO_DIR:$PATH" \
+    LOOM_SWEEP_NICENESS=15 \
+    "$SCRIPTS_DIR/spawn-claude.sh" -p "ping" 2>&1 || true)
+assert_contains "nice=15" "$output" \
+    "LOOM_SWEEP_NICENESS env overrides the default niceness (#4233)"
+
+# Test: autonomous.spawnNiceness config knob is honored when no env is set
+# (env > config > default precedence).
+CFG_WS="$(mktemp -d)"
+mkdir -p "$CFG_WS/.loom/tokens"
+chmod 700 "$CFG_WS/.loom/tokens"
+echo -n "fake-token-cfg" > "$CFG_WS/.loom/tokens/alpha.token"
+chmod 600 "$CFG_WS/.loom/tokens/alpha.token"
+cat > "$CFG_WS/.loom/config.json" <<'EOF'
+{ "autonomous": { "spawnNiceness": 7 } }
+EOF
+output=$(LOOM_WORKSPACE="$CFG_WS" LOOM_DAEMON_BIN="$DAEMON_BIN" PATH="$PRIO_DIR:$PATH" \
+    "$SCRIPTS_DIR/spawn-claude.sh" -p "ping" 2>&1 || true)
+assert_contains "nice=7" "$output" \
+    "autonomous.spawnNiceness config knob is honored (#4233)"
+
+# Test: an explicit LOOM_SWEEP_NICENESS env still wins over the config knob.
+output=$(LOOM_WORKSPACE="$CFG_WS" LOOM_DAEMON_BIN="$DAEMON_BIN" PATH="$PRIO_DIR:$PATH" \
+    LOOM_SWEEP_NICENESS=3 \
+    "$SCRIPTS_DIR/spawn-claude.sh" -p "ping" 2>&1 || true)
+assert_contains "nice=3" "$output" \
+    "LOOM_SWEEP_NICENESS env wins over autonomous.spawnNiceness config (#4233)"
+
+# Test: LOOM_SWEEP_TASKPOLICY_CLASS invokes the (stubbed) taskpolicy command
+# with the expected class and this process's own pid, additive to nice.
+: > "$TASKPOLICY_LOG"
+output=$(LOOM_WORKSPACE="$TEST_WS" LOOM_DAEMON_BIN="$DAEMON_BIN" PATH="$PRIO_DIR:$PATH" \
+    LOOM_SWEEP_TASKPOLICY_CLASS="utility" \
+    "$SCRIPTS_DIR/spawn-claude.sh" -p "ping" 2>&1 || true)
+assert_contains "-c utility" "$(cat "$TASKPOLICY_LOG")" \
+    "LOOM_SWEEP_TASKPOLICY_CLASS invokes taskpolicy -c <class> (#4233)"
+assert_contains "spawn-claude: applied taskpolicy -c utility" "$output" \
+    "spawn-claude logs the applied taskpolicy class (#4233)"
+assert_contains "nice=10" "$output" \
+    "taskpolicy and the default nice both apply together (#4233)"
+
+# Test: autonomous.spawnTaskpolicyClass config knob is honored.
+: > "$TASKPOLICY_LOG"
+cat > "$CFG_WS/.loom/config.json" <<'EOF'
+{ "autonomous": { "spawnNiceness": 7, "spawnTaskpolicyClass": "utility" } }
+EOF
+output=$(LOOM_WORKSPACE="$CFG_WS" LOOM_DAEMON_BIN="$DAEMON_BIN" PATH="$PRIO_DIR:$PATH" \
+    "$SCRIPTS_DIR/spawn-claude.sh" -p "ping" 2>&1 || true)
+assert_contains "-c utility" "$(cat "$TASKPOLICY_LOG")" \
+    "autonomous.spawnTaskpolicyClass config knob is honored (#4233)"
+rm -rf "$CFG_WS"
+
+# Test: a re-exec loop cannot happen — the LOOM_SWEEP_NICED sentinel, once
+# set, is never re-applied even if the caller passes a differing niceness.
+output=$(LOOM_WORKSPACE="$TEST_WS" LOOM_DAEMON_BIN="$DAEMON_BIN" PATH="$PRIO_DIR:$PATH" \
+    LOOM_SWEEP_NICED=1 LOOM_SWEEP_NICENESS=15 \
+    "$SCRIPTS_DIR/spawn-claude.sh" -p "ping" 2>&1 || true)
+TESTS_RUN=$((TESTS_RUN + 1))
+if [[ "$output" != *"re-exec at nice"* ]]; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "  ${GREEN}PASS${NC}: LOOM_SWEEP_NICED sentinel prevents a second re-exec (#4233)"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "  ${RED}FAIL${NC}: LOOM_SWEEP_NICED sentinel prevents a second re-exec (#4233)"
+    echo "    In: '$output'"
+fi
+
+rm -rf "$PRIO_DIR"
+
+# ============================================================
 # Summary
 # ============================================================
 
