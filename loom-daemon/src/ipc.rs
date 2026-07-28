@@ -1328,7 +1328,8 @@ pub fn build_daemon_status(
         // auto-update global-snapshot pattern above. `None` (no breaker
         // registered — work-finder off or breaker disabled) reads as "inactive".
         host_breaker: crate::host_breaker::global_snapshot()
-            .map(crate::host_breaker::BreakerSnapshot::into_status),
+            .map(crate::host_breaker::BreakerSnapshot::into_status)
+            .map(Box::new),
     }
 }
 

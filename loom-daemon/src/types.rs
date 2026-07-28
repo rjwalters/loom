@@ -1062,9 +1062,12 @@ pub struct DaemonStatusReport {
     /// breaker is enabled); `None` when no breaker is active — which the status
     /// renderer treats as "breaker inactive", the zero-behavior-change baseline.
     /// `#[serde(default)]` keeps pre-#4235 wire data / older clients compatible
-    /// (an absent field parses as `None`).
+    /// (an absent field parses as `None`). Boxed (`clippy::large_enum_variant`):
+    /// `HostBreakerStatus` is the field that tips `Response::DaemonStatus` past
+    /// the second-largest variant, and the indirection is the cheapest fix (one
+    /// heap alloc on an already-rare, human-latency status round-trip).
     #[serde(default)]
-    pub host_breaker: Option<HostBreakerStatus>,
+    pub host_breaker: Option<Box<HostBreakerStatus>>,
 }
 
 /// Host-distress circuit-breaker snapshot for `loom-daemon status` (Issue
