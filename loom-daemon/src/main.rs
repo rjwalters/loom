@@ -7,6 +7,7 @@ use loom_daemon::daemon_install_state::{self, InstallStateReport};
 use loom_daemon::epic_supervisor;
 use loom_daemon::event_bus::EventBus;
 use loom_daemon::health_monitor;
+use loom_daemon::host_breaker;
 use loom_daemon::ipc::IpcServer;
 use loom_daemon::main_health_gate;
 use loom_daemon::metrics_collector;
@@ -188,6 +189,12 @@ enum Commands {
         /// branch.
         #[arg(long, value_name = "P")]
         depends_on: Option<u32>,
+
+        /// Override the host-distress circuit breaker (Issue #4235). By default a
+        /// *tripped* breaker (sustained host distress) refuses an explicit
+        /// dispatch; pass `--force` to dispatch anyway.
+        #[arg(long)]
+        force: bool,
     },
 
     /// Manage durable operator watches on issue/PR terminal state (Issue #3971).
@@ -672,7 +679,8 @@ async fn main() -> Result<()> {
                 model,
                 effort,
                 depends_on,
-            } => handle_dispatch_command(issue, workspace, model, effort, depends_on).await,
+                force,
+            } => handle_dispatch_command(issue, workspace, model, effort, depends_on, force).await,
             // `watch` connects to the running daemon over its Unix socket to
             // register/list/remove durable watches (Issue #3971).
             Commands::Watch { action } => handle_watch_command(action).await,
@@ -1162,6 +1170,26 @@ async fn main() -> Result<()> {
         // config as the gate's master switch (env > config > default(on)).
         let suppress_dispatch_during_gate = main_health_gate::resolve_suppress_dispatch_during_gate(
             &main_health_gate::read_autonomous_gate_config(&sweep_workspace),
+        );
+        // Host-distress circuit breaker (#4235): resolve its config once at
+        // startup (env > config > default, default-ON) from the daemon's primary
+        // workspace and register the process-global handle. The work-finder loop
+        // (spawned just below) samples load-per-core into it each tick and
+        // consults it as a second dispatch suppressor; `loom-daemon status` and
+        // the `dispatch_sweep` IPC handler read it via the same global. Registered
+        // only when the work-finder is enabled, since the loop is the breaker's
+        // sole sampler — a daemon with no work-finder never trips it (and its
+        // dispatch_sweep sees a Closed/absent breaker: zero behavior change).
+        let host_breaker_config = host_breaker::resolve_config_for(&sweep_workspace);
+        host_breaker::register_global(std::sync::Arc::new(host_breaker::SharedHostBreaker::new(
+            host_breaker_config,
+        )));
+        log::info!(
+            "host_breaker: enabled={} (load_per_core_trip={:.2}, sustain_ticks={}, cooldown_secs={})",
+            host_breaker_config.enabled,
+            host_breaker_config.load_per_core_threshold,
+            host_breaker_config.sustain_ticks,
+            host_breaker_config.cooldown_secs,
         );
         log::info!(
             "work_finder: enabled (multi-workspace, interval={}s, configured_max={configured_max}, \
@@ -2407,6 +2435,7 @@ fn build_dispatch_request(
     model: Option<String>,
     effort: Option<String>,
     depends_on: Option<u32>,
+    force: bool,
 ) -> Request {
     Request::DispatchSweep {
         kind: SweepKind::Issue(issue),
@@ -2417,6 +2446,9 @@ fn build_dispatch_request(
         effort,
         depends_on,
         workspace_root: workspace,
+        // Host-distress circuit-breaker override (#4235): default false, so a
+        // tripped breaker refuses the dispatch unless the operator passes --force.
+        force,
     }
 }
 
@@ -2431,9 +2463,10 @@ async fn handle_dispatch_command(
     model: Option<String>,
     effort: Option<String>,
     depends_on: Option<u32>,
+    force: bool,
 ) -> Result<()> {
     let socket_path = resolve_socket_path()?;
-    let request = build_dispatch_request(issue, workspace, model, effort, depends_on);
+    let request = build_dispatch_request(issue, workspace, model, effort, depends_on, force);
     let ack_timeout = resolve_dispatch_ack_timeout();
 
     match query_daemon_bounded(&socket_path, &request, ack_timeout).await {
@@ -2974,6 +3007,22 @@ fn print_status_json(
             "terminal_reason": report.auto_update_terminal_reason,
             "note": report.auto_update_note,
         },
+        // Host-distress circuit breaker (#4235) — `null` when no breaker is
+        // registered (work-finder off / breaker disabled). Otherwise the current
+        // phase (closed/open/cooldown), why it tripped, and the cool-down
+        // release time so a scripted consumer sees a paused-dispatch host.
+        "host_breaker": report.host_breaker.as_ref().map(|h| serde_json::json!({
+            "enabled": h.enabled,
+            "phase": h.phase,
+            "suppressed": h.suppressed,
+            "reason": h.reason,
+            "tripped_at": h.tripped_at,
+            "releases_at": h.releases_at,
+            "last_load_per_core": h.last_load_per_core,
+            "load_per_core_threshold": h.load_per_core_threshold,
+            "sustain_ticks": h.sustain_ticks,
+            "cooldown_secs": h.cooldown_secs,
+        })),
     });
     println!("{}", serde_json::to_string_pretty(&combined)?);
     Ok(())
@@ -3350,6 +3399,55 @@ fn print_status_human(
         println!("Drain: DRAINING ({} sweep(s) remaining, {deadline})", report.in_flight.len());
     } else if let Some(note) = &report.drain_note {
         println!("Drain: not draining (last: {note})");
+    }
+
+    // Host-distress circuit breaker (#4235): surface the phase, why it tripped,
+    // and when the cool-down releases so an operator sees a paused-dispatch host
+    // and can tell it apart from a main-health halt or a drain. A Closed breaker
+    // prints a one-line "OK" with its configured thresholds; an absent breaker
+    // (work-finder off / disabled) prints nothing.
+    if let Some(hb) = &report.host_breaker {
+        let load = hb
+            .last_load_per_core
+            .map_or_else(|| "n/a".to_string(), |l| format!("{l:.2}"));
+        match hb.phase.as_str() {
+            "closed" => {
+                if hb.enabled {
+                    println!(
+                        "Host breaker: OK (closed; load/core {load}, trip ≥ {:.2} for {} tick(s), cooldown {}s)",
+                        hb.load_per_core_threshold, hb.sustain_ticks, hb.cooldown_secs
+                    );
+                } else {
+                    println!("Host breaker: disabled");
+                }
+            }
+            "open" => {
+                println!(
+                    "Host breaker: OPEN — new dispatch paused, running work draining ({})",
+                    hb.reason.as_deref().unwrap_or("sustained host distress")
+                );
+                if let Some(t) = hb.tripped_at {
+                    println!("  tripped at: {t}");
+                }
+            }
+            "cooldown" => {
+                let releases = hb.releases_at.map_or_else(
+                    || "unknown".to_string(),
+                    |r| {
+                        let secs = (r - Utc::now()).num_seconds();
+                        if secs >= 0 {
+                            format!("in {secs}s ({r})")
+                        } else {
+                            format!("overdue by {}s ({r})", -secs)
+                        }
+                    },
+                );
+                println!(
+                    "Host breaker: COOLING DOWN — dispatch paused, releases {releases} (load/core {load})"
+                );
+            }
+            other => println!("Host breaker: {other}"),
+        }
     }
 
     // Per-repo breakdown across every registered managed workspace (#3930). In
@@ -4621,6 +4719,7 @@ mod dispatch_tests {
             Some("sonnet".to_string()),
             Some("high".to_string()),
             Some(3945),
+            true,
         );
         match request {
             Request::DispatchSweep {
@@ -4630,6 +4729,7 @@ mod dispatch_tests {
                 effort,
                 depends_on,
                 workspace_root,
+                force,
             } => {
                 assert_eq!(kind, SweepKind::Issue(3952));
                 assert_eq!(idempotency_key, None);
@@ -4637,6 +4737,7 @@ mod dispatch_tests {
                 assert_eq!(effort.as_deref(), Some("high"));
                 assert_eq!(depends_on, Some(3945));
                 assert_eq!(workspace_root.as_deref(), Some("/some/repo"));
+                assert!(force, "--force must plumb through to the request");
             }
             other => panic!("expected DispatchSweep, got {other:?}"),
         }
@@ -4646,7 +4747,7 @@ mod dispatch_tests {
     /// every override `None`, so the daemon applies its own defaults.
     #[test]
     fn build_dispatch_request_defaults_are_none() {
-        let request = build_dispatch_request(42, None, None, None, None);
+        let request = build_dispatch_request(42, None, None, None, None, false);
         match request {
             Request::DispatchSweep {
                 kind,
@@ -4654,6 +4755,7 @@ mod dispatch_tests {
                 effort,
                 depends_on,
                 workspace_root,
+                force,
                 ..
             } => {
                 assert_eq!(kind, SweepKind::Issue(42));
@@ -4661,6 +4763,7 @@ mod dispatch_tests {
                 assert!(effort.is_none());
                 assert!(depends_on.is_none());
                 assert!(workspace_root.is_none());
+                assert!(!force, "force defaults to false");
             }
             other => panic!("expected DispatchSweep, got {other:?}"),
         }
@@ -4718,6 +4821,7 @@ mod dispatch_tests {
             Some("sonnet".to_string()),
             Some("high".to_string()),
             Some(3945),
+            false,
         );
         let response = query_daemon_bounded(&socket_path, &request, Duration::from_secs(5))
             .await
@@ -4757,7 +4861,7 @@ mod dispatch_tests {
             tokio::time::sleep(Duration::from_secs(30)).await;
         });
 
-        let request = build_dispatch_request(3952, None, None, None, None);
+        let request = build_dispatch_request(3952, None, None, None, None, false);
         let started = std::time::Instant::now();
         let result = query_daemon_bounded(&socket_path, &request, Duration::from_millis(200)).await;
         let elapsed = started.elapsed();
@@ -4778,7 +4882,7 @@ mod dispatch_tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let socket_path = dir.path().join("nonexistent.sock");
 
-        let request = build_dispatch_request(3952, None, None, None, None);
+        let request = build_dispatch_request(3952, None, None, None, None, false);
         let result = query_daemon_bounded(&socket_path, &request, Duration::from_millis(500)).await;
 
         assert!(result.is_err(), "expected a connect error, got {result:?}");
@@ -4824,7 +4928,7 @@ mod dispatch_tests {
             writer.flush().await.expect("flush");
         });
 
-        let request = build_dispatch_request(3952, None, None, None, None);
+        let request = build_dispatch_request(3952, None, None, None, None, false);
         let started = std::time::Instant::now();
         // Use the CLI's real default budget — the exact value a plain
         // `loom-daemon dispatch` resolves to with no env override.

@@ -1363,8 +1363,20 @@ where
             // dispatched into the same root the gate's own build is competing
             // with for cores — the `suppress_dispatch_during_gate` knob (default
             // on) gates this so the pre-#4084 behavior is exactly recoverable.
+            // Host-distress circuit breaker (#4235): sample load-per-core, fold
+            // it into the breaker, and consult it as a second dispatch
+            // suppressor alongside the main-health halt flag and the gate
+            // in-flight hold. See the multi-workspace loop for the full
+            // rationale; when no breaker is registered these are no-ops.
+            if let Some(breaker) = crate::host_breaker::global() {
+                let load_per_core = crate::cpu_headroom::load_per_core();
+                if let Some(transition) = breaker.observe(load_per_core, chrono::Utc::now()) {
+                    crate::host_breaker::emit_transition_event(&event_bus, &transition);
+                }
+            }
             let halted = health_state.is_halted()
-                || (suppress_dispatch_during_gate && health_state.is_gate_in_flight());
+                || (suppress_dispatch_during_gate && health_state.is_gate_in_flight())
+                || crate::host_breaker::global_is_suppressed();
             // Recompute the dynamic cap from live inputs every tick (Phase B),
             // now with token-capacity backpressure (#3902): the token axis is the
             // count of *healthy* accounts from the ranking, not the flat pool.
@@ -1607,12 +1619,30 @@ pub fn spawn_multi_work_finder_task(
             // regardless of gate state, and a gate in flight holds its own root
             // regardless of drain state.
             let draining = drain.load(std::sync::atomic::Ordering::Relaxed);
-            let halted = dispatch_held_per_root_with_drain(
+            // Host-distress circuit breaker (#4235): sample the current
+            // load-per-core and fold it into the breaker's state machine. A
+            // tripped/cooling breaker is a *daemon-global* dispatch suppressor
+            // (like the scheduled drain) — it holds new dispatch in EVERY repo
+            // while running work drains — so it is OR'd onto every root's hold
+            // below. The load sample uses the fast, non-sleeping loadavg read (no
+            // `iostat`), safe to call inline. When no breaker is registered the
+            // helpers are no-ops returning `false` (zero behavior change).
+            if let Some(breaker) = crate::host_breaker::global() {
+                let load_per_core = crate::cpu_headroom::load_per_core();
+                if let Some(transition) = breaker.observe(load_per_core, chrono::Utc::now()) {
+                    crate::host_breaker::emit_transition_event(&event_bus, &transition);
+                }
+            }
+            let breaker_suppressed = crate::host_breaker::global_is_suppressed();
+            let halted: Vec<bool> = dispatch_held_per_root_with_drain(
                 &health_states,
                 &roots,
                 suppress_dispatch_during_gate,
                 draining,
-            );
+            )
+            .into_iter()
+            .map(|h| h || breaker_suppressed)
+            .collect();
             let any_halted = halted.iter().any(|&h| h);
 
             let mut pairs: Vec<(GhWorkSource, RegistryDispatcher)> = roots
