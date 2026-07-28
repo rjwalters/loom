@@ -393,6 +393,12 @@ Therefore, at **every** dispatch site where this skill sequences one phase after
 
 **"Serialized" therefore means awaited-to-completion, not merely dispatched-with-a-sync-flag.** The #3707 rule above depends on this: serializing issue-creating agents is only safe if each is explicitly awaited to completion before the next is dispatched — a `run_in_background: false` that the harness ignores would silently overlap them.
 
+**Sharper hazard in headless `claude -p` mode (issue #4257): ending your turn IS the kill signal.** Everything above frames the async-dispatch hazard as an *ordering* bug — the next phase starting too early. In headless `-p` mode there is a second, more severe consequence: **ending the orchestrator's turn terminates the `claude -p` process, and that process exit kills every still-running background child, full stop.** There is no "it'll finish in the background after I'm done talking" — once the orchestrator writes its final message and the turn ends, the process (and therefore every subagent it spawned) is gone. Concretely:
+
+- **Never dispatch a role subagent (Curator / Builder / Judge / Doctor) with `run_in_background: true`** in a sweep. There is no safe way to "fire and forget" a role dispatch here — a headless sweep has no later turn in which to check on it.
+- Because `run_in_background: false` is **not** honored as a synchronous-return guarantee either (see above), the only safe pattern in either case is: **write the orchestrator's final message only after every dispatched subagent's completion has been explicitly observed** — a blocking `TaskOutput` / completion notification for each one. If you have not yet observed completion for a dispatched subagent, you MUST NOT end the turn.
+- **Failure signature to match in forensics**: a sweep log whose final line is something like *"…in the background. I'll wait…"* immediately followed by process exit — the orchestrator believed a background task would keep running unsupervised, then ended its turn, killing it. This exact incident: `sweep-issue-4195.log`, PR #4243, where the backgrounded Judge was killed mid-review and left a stale `loom:reviewing` claim on the PR.
+
 ### CRITICAL: One level deep — never spawn a nested orchestrator (`/loom:sweep`) as a subagent
 
 `/loom:sweep` dispatches `loom-builder`, `loom-judge`, and `loom-doctor` subagents **directly from this orchestrator session** in a single tool-call block. This is **one level deep** and is empirically safe for `N` up to at least 3.
