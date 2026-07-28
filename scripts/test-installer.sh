@@ -2995,6 +2995,37 @@ fi
 echo ""
 
 # ==========================================================================
+# User-scope skills + agents provisioning (Epic #3835 Phase 4, #4261)
+# ==========================================================================
+# Its own unit suite lives at defaults/scripts/tests/test-provision-skills.sh
+# (whole-dir commands link + per-file agent links through the machine checkout,
+# clobber avoidance, stale-link repoint, dangling-link prune, soft-fail, and
+# the checkout-only deprovision). Fold its result into the installer suite so it
+# runs in CI + the build gate rather than dev-only.
+echo "Test: user-scope skills+agents provisioning suite (test-provision-skills.sh)"
+SKILLS_TEST="$DEFAULTS_DIR/scripts/tests/test-provision-skills.sh"
+if [[ -f "$SKILLS_TEST" ]]; then
+  set +e
+  SKILLS_TEST_OUT=$(bash "$SKILLS_TEST" 2>&1)
+  SKILLS_TEST_RC=$?
+  set -e
+  if [[ $SKILLS_TEST_RC -eq 0 ]]; then
+    pass "test-provision-skills.sh: all cases passed"
+  else
+    fail "test-provision-skills.sh failed (rc=$SKILLS_TEST_RC)"
+    echo "$SKILLS_TEST_OUT" | tail -20
+  fi
+else
+  fail "test-provision-skills.sh not found at $SKILLS_TEST"
+fi
+if [[ -f "$LOOM_ROOT/scripts/install/provision-skills.sh" ]]; then
+  pass "scripts/install/provision-skills.sh present"
+else
+  fail "scripts/install/provision-skills.sh missing"
+fi
+echo ""
+
+# ==========================================================================
 # Summary
 # ==========================================================================
 echo "======================================"

@@ -252,6 +252,65 @@ writeup. **Linux has no equivalent** — the non-Darwin path is a plain `nohup �
 &` with no reboot/crash recovery and no watchdog. This is tracked as a named
 follow-up, #4260, rather than designed inline here.
 
+## User-scope skills + agents (Epic #3835 Phase 4, #4261)
+
+The `/loom:*` slash-command skills and the `loom-*` subagents also resolve from
+the machine-level checkout, provisioned by
+`scripts/install/provision-skills.sh` (sibling of `provision-dispatcher.sh`)
+next to the dispatcher install:
+
+```
+~/.claude/commands/loom      -> <checkout>/defaults/.claude/commands/loom   (whole-directory symlink)
+~/.claude/agents/loom-<role>.md -> <checkout>/defaults/.claude/agents/loom-<role>.md  (per-file symlinks)
+```
+
+Why the two shapes differ:
+
+- **Commands are one whole-directory symlink.** `.claude/commands/loom/` is a
+  Loom-owned namespace, so a single link is the minimal surface, keeps
+  `.claude/commands/` itself a real directory (a co-installed tool can still
+  write sibling namespaces into it), and preserves the relative cross-references
+  between skill files (e.g. one skill `@`-including `probe-protocol.md`).
+- **Agents are per-file symlinks.** `~/.claude/agents/` is **shared** with the
+  operator's own agents, so it cannot be wholesale-symlinked; each
+  `loom-<role>.md` is linked individually and non-Loom agents are untouched.
+
+Both link **through the checkout path** (`<checkout>/defaults/...`, default
+checkout `~/.local/share/loom`), never the installer's transient source root.
+Because `~/.local/share/loom` is itself a symlink to the source checkout, the
+links stay valid even if the machine checkout is later re-provisioned, and
+**`loom update` (refreshing the checkout) updates the skills/agents seen by
+every repo at once** — they cannot drift per-repo.
+
+Provisioning is additive and best-effort (never fatal). It:
+
+- **Never clobbers a real destination.** An operator's hand-tuned
+  `~/.claude/agents/loom-judge.md`, or a real `~/.claude/commands/loom/`
+  directory, is left as-is with a warning.
+- **Repoints a stale symlink** (e.g. one left by an older checkout location) to
+  the current checkout.
+- **Prunes a dangling `loom-*` agent link** whose target no longer exists in the
+  checkout (a renamed/removed role) — but only when the broken link points into
+  a checkout's `defaults/.claude/agents/` tree, never an operator's own link.
+
+### Transition precedence (not a bug)
+
+Until Phase 6 (#4254) strips the committed per-repo copies, an already-installed
+consumer repo keeps its `.claude/commands/loom/*` files, and Claude Code
+resolves a **project-level** definition over a **user-level** one when names
+collide. Those repos therefore keep resolving their (possibly stale) copies
+until migration; this provisioning only changes what **fresh installs and
+post-migration repos** resolve. The coexistence is expected and does not error —
+provisioning does not try to force user scope to win.
+
+> **Scope boundary (Phase 4 vs Phase 6).** This phase adds the user-scope
+> resolution *mechanism* (the replacement Phase 6 depends on). Ceasing the
+> per-repo copy on a fresh install is coupled to `loom-daemon init` (Rust),
+> which materializes `.claude/commands/loom/` + `.claude/agents/` and whose own
+> post-init validation (and the installer's `EXPECTED_FILES` check) currently
+> requires those trees present. That cutover lands with Phase 6's
+> `git rm --cached` migration, not here.
+
 ## Uninstall semantics
 
 A per-repo `uninstall-loom.sh` removes only the per-repo `./.loom/bin/loom` pool
@@ -259,3 +318,10 @@ manager. The machine-level `~/.local/bin/loom` dispatcher and the
 `~/.local/share/loom` checkout link are **not** removed by a per-repo uninstall —
 same semantics as the shared `~/.local/bin/loom-daemon` binary, which outlives any
 single repo's uninstall.
+
+The user-scope skill + agent links follow the **same** shared-resource rule:
+they are one set resolved by every repo on the machine, so a per-repo uninstall
+does not remove them (that would break `/loom:*` for every other consumer repo).
+A machine-level teardown removes them via `deprovision_loom_skills` in
+`scripts/install/provision-skills.sh`, which deletes a link only when it points
+into the machine checkout and never touches an operator's real files.
