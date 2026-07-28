@@ -80,6 +80,21 @@ enum Commands {
         dry_run: bool,
     },
 
+    /// Rewrite only the marker-delimited Loom-managed `.gitignore` block in a
+    /// workspace, converging it on the current `EPHEMERAL_PATTERNS` set without
+    /// running a full `init` (Issue #4280). This is the standalone entry point
+    /// `defaults/scripts/resync-installed.sh` invokes so existing consumer
+    /// installs pick up newly-ignored runtime paths (e.g. `.loom/sweep-checkpoint/`,
+    /// `.loom/worktrees-local/`) at resync time — the pattern list stays
+    /// single-sourced in the daemon, never copied into shell. Idempotent: a
+    /// workspace already carrying the current block is a byte-for-byte no-op.
+    UpdateGitignore {
+        /// Target workspace directory (the repo root whose `.gitignore` to
+        /// refresh). Defaults to the current directory.
+        #[arg(value_name = "PATH", default_value = ".")]
+        workspace: String,
+    },
+
     /// Display agent effectiveness and activity metrics
     Stats {
         /// Filter by agent role (builder, judge, curator, etc.)
@@ -1658,6 +1673,31 @@ mod resolve_paths_tests {
 }
 
 /// Handle CLI commands (init, stats, validate modes)
+/// Handle `loom-daemon update-gitignore [PATH]` (Issue #4280).
+///
+/// Rewrites only the marker-delimited Loom-managed `.gitignore` block, converging
+/// it on the current `EPHEMERAL_PATTERNS` set. This is the standalone refresh
+/// entry point `resync-installed.sh` calls so existing consumer installs pick up
+/// newly-ignored runtime paths without a full `init`. Idempotent: a workspace
+/// already carrying the current block is a byte-for-byte no-op.
+fn handle_update_gitignore_command(workspace: &str) -> Result<()> {
+    let workspace_path = std::path::Path::new(workspace);
+    let absolute_workspace = if workspace_path.is_absolute() {
+        workspace_path.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(workspace_path)
+    };
+
+    loom_daemon::init::update_gitignore(&absolute_workspace)
+        .map_err(|e| anyhow!("Failed to update .gitignore: {e}"))?;
+
+    println!(
+        "Refreshed the Loom-managed .gitignore block in {}",
+        absolute_workspace.display()
+    );
+    Ok(())
+}
+
 #[allow(clippy::too_many_lines)]
 fn handle_cli_command(command: Commands) -> Result<()> {
     match command {
@@ -1675,6 +1715,7 @@ fn handle_cli_command(command: Commands) -> Result<()> {
         } => handle_stats_command(role.as_deref(), issue, weekly, &format),
         Commands::Workspace { action } => handle_workspace_command(action),
         Commands::Tokens { action } => handle_tokens_command(action),
+        Commands::UpdateGitignore { workspace } => handle_update_gitignore_command(&workspace),
         Commands::Status { .. } => {
             // Routed directly in `main()` (it needs the async runtime for the
             // socket round-trip), never dispatched through this sync handler.

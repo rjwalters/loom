@@ -52,6 +52,13 @@ fail() {
     echo -e "  ${RED}FAIL${NC}: $1"
 }
 
+# Not counted toward pass/fail: used when a test's precondition (e.g. a
+# `update-gitignore`-capable loom-daemon binary) is unavailable in this
+# environment, so CI without a built daemon does not spuriously fail.
+skip() {
+    echo -e "  SKIP: $1"
+}
+
 WORKDIR="$(mktemp -d "${TMPDIR:-/tmp}/test-resync.XXXXXX")"
 # shellcheck disable=SC2329  # invoked indirectly via the EXIT trap below
 cleanup() { rm -rf "$WORKDIR" 2>/dev/null || true; }
@@ -362,6 +369,112 @@ if grep -q '"loom_version": *"0.0.0"' "$REPO/.loom/install-metadata.json"; then
     pass "(n) --dry-run leaves install-metadata.json unstamped"
 else
     fail "(n) --dry-run re-stamped metadata (should be preview-only)"
+fi
+
+# --- (#4280) .gitignore managed-block refresh + audit ------------------------
+echo "Test group 12b: resync refreshes the Loom-managed .gitignore block (#4280)"
+# Resolve a loom-daemon binary that supports `update-gitignore` (this feature).
+# Prefer $LOOM_DAEMON_BIN, then `loom-daemon` on PATH, then build-output under
+# the real Loom checkout the script lives in. Skip the group (do not fail) when
+# none is available — CI may run these shell tests without a built daemon.
+resolve_capable_daemon_bin() {
+    local candidate loom_root
+    loom_root="$(cd "$HELPERS_DIR/../.." && pwd)"   # defaults/scripts -> repo root
+    for candidate in \
+        "${LOOM_DAEMON_BIN:-}" \
+        "$(command -v loom-daemon 2>/dev/null || true)" \
+        "$loom_root/loom-daemon/target/debug/loom-daemon" \
+        "$loom_root/loom-daemon/target/release/loom-daemon" \
+        "$loom_root/target/debug/loom-daemon" \
+        "$loom_root/target/release/loom-daemon"; do
+        [[ -n "$candidate" && -x "$candidate" ]] || continue
+        if "$candidate" update-gitignore --help >/dev/null 2>&1; then
+            echo "$candidate"; return 0
+        fi
+    done
+    echo ""; return 0
+}
+GI_BIN="$(resolve_capable_daemon_bin)"
+if [[ -z "$GI_BIN" ]]; then
+    skip "(#4280) no update-gitignore-capable loom-daemon binary resolved — set LOOM_DAEMON_BIN to run"
+else
+    REPO="$(make_fixture)"
+    # Seed a stale pre-#3642 managed block: well-formed markers, but missing the
+    # runtime patterns added since (.loom/sweep-checkpoint/, .loom/worktrees-local/).
+    cat > "$REPO/.gitignore" <<'GIEOF'
+node_modules/
+# >>> loom-managed (do not edit) >>>
+# Loom runtime state (don't commit these)
+.loom-in-use
+.loom/state.json
+.loom/worktrees/
+.loom/logs/
+# <<< loom-managed <<<
+dist/
+GIEOF
+    OUT="$(cd "$REPO" && LOOM_DAEMON_BIN="$GI_BIN" bash "$SCRIPT" 2>&1)"
+    RC=$?
+    if [[ $RC -eq 0 ]]; then pass "(#4280) apply with a stale block exits 0"; else fail "(#4280) apply exits 0 (got $RC)"; fi
+    # Exactly one managed block, markers preserved.
+    if [[ "$(grep -c '>>> loom-managed' "$REPO/.gitignore")" -eq 1 && \
+          "$(grep -c '<<< loom-managed' "$REPO/.gitignore")" -eq 1 ]]; then
+        pass "(#4280) exactly one managed block, markers preserved"
+    else
+        fail "(#4280) managed block markers not exactly-one each"
+    fi
+    # The previously-absent runtime paths are now ignored.
+    if (cd "$REPO" && git check-ignore .loom/sweep-checkpoint/issue-1.json >/dev/null 2>&1); then
+        pass "(#4280) .loom/sweep-checkpoint/issue-1.json is now ignored"
+    else
+        fail "(#4280) .loom/sweep-checkpoint/ still not ignored after resync"
+    fi
+    if (cd "$REPO" && git check-ignore .loom/worktrees-local/x >/dev/null 2>&1); then
+        pass "(#4280) .loom/worktrees-local/ is now ignored"
+    else
+        fail "(#4280) .loom/worktrees-local/ still not ignored after resync"
+    fi
+    # User content on both sides of the block survived.
+    if grep -q '^node_modules/$' "$REPO/.gitignore" && grep -q '^dist/$' "$REPO/.gitignore"; then
+        pass "(#4280) user content around the block preserved"
+    else
+        fail "(#4280) user content around the block was lost"
+    fi
+    # Idempotent: a second resync leaves the .gitignore byte-identical.
+    cp "$REPO/.gitignore" "$WORKDIR/gi-before-2nd"
+    (cd "$REPO" && LOOM_DAEMON_BIN="$GI_BIN" bash "$SCRIPT" >/dev/null 2>&1)
+    if diff -q "$WORKDIR/gi-before-2nd" "$REPO/.gitignore" >/dev/null 2>&1; then
+        pass "(#4280) second resync is byte-identical (idempotent block refresh)"
+    else
+        fail "(#4280) second resync mutated the .gitignore"
+    fi
+
+    # Audit: an untracked-and-unignored path under .loom/ is surfaced as a warning.
+    REPO="$(make_fixture)"
+    printf 'RUNTIME\n' > "$REPO/.loom/some-new-runtime-dir-marker"   # untracked, unignored
+    OUT="$(cd "$REPO" && LOOM_DAEMON_BIN="$GI_BIN" bash "$SCRIPT" 2>&1)"
+    if grep -qi "untracked-and-unignored" <<<"$OUT"; then
+        pass "(#4280) audit reports an untracked-and-unignored .loom/ path"
+    else
+        fail "(#4280) audit did not report the untracked-and-unignored path"
+    fi
+fi
+
+# --- (#4280) missing binary degrades to a loud warning, never a silent skip --
+echo "Test group 12c: absent daemon binary -> loud warning, apply still exits 0 (#4280)"
+REPO="$(make_fixture)"
+# Force the resolver to find nothing: no LOOM_DAEMON_BIN, no PATH loom-daemon,
+# no build-output under the fixture's SOURCE_ROOT (the fixture repo).
+OUT="$(cd "$REPO" && env -u LOOM_DAEMON_BIN PATH="/usr/bin:/bin" bash "$SCRIPT" 2>&1)"
+RC=$?
+if [[ $RC -eq 0 ]]; then
+    pass "(#4280) apply still exits 0 when no daemon binary resolves"
+else
+    fail "(#4280) apply did not exit 0 with no daemon binary (got $RC)"
+fi
+if grep -qi "could not refresh the loom-managed .gitignore block\|no loom-daemon binary resolved" <<<"$OUT"; then
+    pass "(#4280) missing binary produces a loud warning (not a silent skip)"
+else
+    fail "(#4280) missing binary did not produce the expected warning"
 fi
 
 # --- contract checks ---------------------------------------------------------
