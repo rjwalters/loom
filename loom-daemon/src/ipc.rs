@@ -64,17 +64,22 @@ pub const EXIT_SIGINT: i32 = 130;
 /// shutdown means "stay down", so launchd must not relaunch.
 pub const EXIT_SHUTDOWN: i32 = 143;
 
-/// Detect the daemon's process supervisor from the environment (#4054).
+/// Detect the daemon's process supervisor from the environment (#4054, #4267).
 ///
 /// Returns `Some("launchd")` when `LOOM_DAEMON_SUPERVISOR=launchd`
 /// (case-insensitive) is present — a value `loom-daemon-start.sh` bakes into the
-/// launchd plist's `EnvironmentVariables`, so it survives a relaunch. Any other
-/// or absent value ⇒ `None` (the daemon is unsupervised: nohup / Linux /
-/// `--foreground`), and the restart primitive must refuse to end the process
-/// because nothing would bring it back.
+/// launchd plist's `EnvironmentVariables`, so it survives a relaunch. Likewise
+/// returns `Some("systemd")` when `LOOM_DAEMON_SUPERVISOR=systemd`
+/// (case-insensitive) is present — a value the systemd unit's `Environment=`
+/// bakes in, relying on `Restart=on-success` to relaunch the daemon after the
+/// clean `EXIT_RESTART` exit. Any other or absent value ⇒ `None` (the daemon is
+/// unsupervised: nohup / Linux without a recognized supervisor / `--foreground`),
+/// and the restart primitive must refuse to end the process because nothing
+/// would bring it back.
 pub fn detect_supervisor() -> Option<String> {
     match std::env::var("LOOM_DAEMON_SUPERVISOR") {
         Ok(v) if v.eq_ignore_ascii_case("launchd") => Some("launchd".to_string()),
+        Ok(v) if v.eq_ignore_ascii_case("systemd") => Some("systemd".to_string()),
         _ => None,
     }
 }
@@ -90,27 +95,39 @@ pub fn detect_supervisor() -> Option<String> {
 /// supervisor to relaunch it would be strictly worse than the status quo.
 pub fn build_restart_decision() -> (Response, bool) {
     match detect_supervisor() {
-        Some(sup) => (
-            Response::DaemonRestart {
-                scheduled: true,
-                supervisor: Some(sup.clone()),
-                message: format!(
-                    "restart scheduled: exiting 0 for a {sup}-supervised relaunch. \
-                     In-flight sweeps survive by design; the relaunched daemon re-reads \
-                     the same launchd plist, so it comes back with exactly its start flags."
-                ),
-            },
-            true,
-        ),
+        Some(sup) => {
+            // launchd wording is preserved byte-for-byte (its start-flag source is
+            // a plist); other recognized supervisors (e.g. systemd) get a
+            // supervisor-neutral phrasing referencing their own config.
+            let relaunch_note = if sup == "launchd" {
+                "the same launchd plist, so it comes back with exactly its start flags".to_string()
+            } else {
+                format!(
+                    "its {sup} unit's configuration, so it comes back with exactly its start flags"
+                )
+            };
+            (
+                Response::DaemonRestart {
+                    scheduled: true,
+                    supervisor: Some(sup.clone()),
+                    message: format!(
+                        "restart scheduled: exiting 0 for a {sup}-supervised relaunch. \
+                         In-flight sweeps survive by design; the relaunched daemon re-reads \
+                         {relaunch_note}."
+                    ),
+                },
+                true,
+            )
+        }
         None => (
             Response::DaemonRestart {
                 scheduled: false,
                 supervisor: None,
                 message: "refusing to restart: no supervisor detected \
                     (LOOM_DAEMON_SUPERVISOR unset). This daemon was not started under \
-                    launchd (nohup / Linux / --foreground), so nothing would relaunch it \
-                    if it exited. Leaving it running. Restart it manually with \
-                    loom-daemon-stop.sh && loom-daemon-start.sh."
+                    a recognized supervisor (nohup / Linux / --foreground), so nothing \
+                    would relaunch it if it exited. Leaving it running. Restart it \
+                    manually with loom-daemon-stop.sh && loom-daemon-start.sh."
                     .to_string(),
             },
             false,
@@ -402,8 +419,8 @@ pub fn handle_drain_request(
                 in_flight: count_in_flight_sweeps(workspace_pool, fallback_root),
                 message: "refusing to drain: no supervisor detected \
                     (LOOM_DAEMON_SUPERVISOR unset). This daemon was not started under \
-                    launchd, so nothing would relaunch it after a drain. Dispatch was \
-                    NOT paused. Restart manually with loom-daemon-stop.sh && \
+                    a recognized supervisor, so nothing would relaunch it after a drain. \
+                    Dispatch was NOT paused. Restart manually with loom-daemon-stop.sh && \
                     loom-daemon-start.sh."
                     .to_string(),
             };
@@ -516,9 +533,14 @@ async fn run_drain_supervisor(
                     "daemon.drain.completed",
                     serde_json::json!({ "in_flight": 0 }),
                 );
+                // This path only runs after `handle_drain_request` proved
+                // supervision, so `detect_supervisor()` should still be `Some`
+                // here; fall back to a generic label rather than hardcoding
+                // launchd if the environment somehow changed underneath us.
+                let sup = detect_supervisor().unwrap_or_else(|| "supervisor".to_string());
                 log::warn!(
-                    "drain complete — 0 in-flight sweeps; exiting {EXIT_RESTART} for a launchd \
-                     KeepAlive:SuccessfulExit relaunch. No sweep was killed; no orphan left behind."
+                    "drain complete — 0 in-flight sweeps; exiting {EXIT_RESTART} for a \
+                     {sup}-supervised relaunch. No sweep was killed; no orphan left behind."
                 );
                 std::process::exit(EXIT_RESTART);
             }
@@ -903,9 +925,10 @@ async fn handle_client(
         // synchronous `handle_request` dispatcher so the supervised path can
         // reply to the client and FLUSH before ending the process — the
         // operator / Phase-3 caller gets a clean ack, then the daemon exits 0
-        // for a launchd `KeepAlive:SuccessfulExit` relaunch. On an unsupervised
-        // host it returns `DaemonRestart { scheduled: false }` and keeps running
-        // (do_exit == false). Mirrors the CancelSweep/DaemonStatus interception.
+        // for a supervised (e.g. launchd `KeepAlive:SuccessfulExit`) relaunch.
+        // On an unsupervised host it returns `DaemonRestart { scheduled: false }`
+        // and keeps running (do_exit == false). Mirrors the
+        // CancelSweep/DaemonStatus interception.
         if let Request::RestartDaemon = request {
             let (response, do_exit) = build_restart_decision();
             let response_json = serde_json::to_string(&response)?;
@@ -913,10 +936,17 @@ async fn handle_client(
             writer.write_all(b"\n").await?;
             writer.flush().await?;
             if do_exit {
+                let sup = match &response {
+                    Response::DaemonRestart {
+                        supervisor: Some(s),
+                        ..
+                    } => s.clone(),
+                    _ => "supervisor".to_string(),
+                };
                 log::warn!(
-                    "RestartDaemon: supervised — exiting {EXIT_RESTART} for a launchd \
-                     KeepAlive:SuccessfulExit relaunch. In-flight sweeps survive by design; \
-                     the relaunched daemon re-reads the same plist (exactly its start flags). \
+                    "RestartDaemon: supervised — exiting {EXIT_RESTART} for a {sup}-supervised \
+                     relaunch. In-flight sweeps survive by design; the relaunched daemon \
+                     re-reads the same start-up configuration (exactly its start flags). \
                      The stale socket is reclaimed by the relaunched daemon's singleton guard."
                 );
                 std::process::exit(EXIT_RESTART);
@@ -4135,10 +4165,12 @@ exit 0
     }
 
     /// `build_restart_decision` ends the process (do_exit == true) ONLY when the
-    /// daemon proves it is launchd-supervised via `LOOM_DAEMON_SUPERVISOR`; an
-    /// unsupervised host refuses and stays running. Also pins the shutdown-intent
-    /// exit-code contract (#4054): only the restart primitive exits 0, so under
-    /// launchd `KeepAlive:SuccessfulExit` it is the only path that relaunches.
+    /// daemon proves it is supervised (launchd or systemd) via
+    /// `LOOM_DAEMON_SUPERVISOR`; an unsupervised host refuses and stays running.
+    /// Also pins the shutdown-intent exit-code contract (#4054): only the
+    /// restart primitive exits 0, so under a supervisor's "successful exit
+    /// restarts" policy (launchd `KeepAlive:SuccessfulExit`, systemd
+    /// `Restart=on-success`) it is the only path that relaunches.
     ///
     /// NOTE: this is the sole test touching `LOOM_DAEMON_SUPERVISOR`, so the
     /// env-var mutation cannot race another test reading it.
@@ -4188,8 +4220,43 @@ exit 0
             other => panic!("Expected DaemonRestart, got: {other:?}"),
         }
 
-        // An unrelated value is also unsupervised.
+        // systemd (#4267): recognized alongside launchd, case-insensitive —
+        // ⇒ Some("systemd"), scheduled + do_exit, and a message that does not
+        // hardcode "launchd".
         std::env::set_var("LOOM_DAEMON_SUPERVISOR", "systemd");
+        assert_eq!(detect_supervisor().as_deref(), Some("systemd"));
+        let (resp, do_exit) = build_restart_decision();
+        assert!(do_exit, "systemd-supervised daemon must end its process for a relaunch");
+        match resp {
+            Response::DaemonRestart {
+                scheduled,
+                supervisor,
+                message,
+            } => {
+                assert!(scheduled);
+                assert_eq!(supervisor.as_deref(), Some("systemd"));
+                assert!(
+                    !message.contains("launchd"),
+                    "systemd restart message must not hardcode launchd wording: {message}"
+                );
+            }
+            other => panic!("Expected DaemonRestart, got: {other:?}"),
+        }
+
+        // Mixed-case systemd.
+        std::env::set_var("LOOM_DAEMON_SUPERVISOR", "SyStEmD");
+        assert_eq!(detect_supervisor().as_deref(), Some("systemd"));
+
+        // Empty string is not a recognized supervisor.
+        std::env::set_var("LOOM_DAEMON_SUPERVISOR", "");
+        assert!(detect_supervisor().is_none());
+
+        // Whitespace-only value is not a recognized supervisor (no trimming).
+        std::env::set_var("LOOM_DAEMON_SUPERVISOR", "  ");
+        assert!(detect_supervisor().is_none());
+
+        // A genuinely unrelated value is also unsupervised.
+        std::env::set_var("LOOM_DAEMON_SUPERVISOR", "runit");
         assert!(detect_supervisor().is_none());
         std::env::remove_var("LOOM_DAEMON_SUPERVISOR");
     }
