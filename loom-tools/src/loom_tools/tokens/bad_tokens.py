@@ -18,12 +18,75 @@ collide.
 
 from __future__ import annotations
 
+import os
 import re
 from datetime import datetime, timezone
 from pathlib import Path
 
 from loom_tools.tokens._locking import MkdirLock as _MkdirLock
 from loom_tools.tokens.paths import resolve_tokens_dir
+
+# Default cooldown (seconds) after which a non-auth (exhaustion) bad-token
+# entry stops blocking selection (#4122 / #4212). Weekly/session/5h-limit
+# exhaustion is transient — the account recovers on its own within a rate-limit
+# window — so those entries expire while auth-reason entries (a broken
+# credential) stay permanent. Mirrors the Rust reference
+# (``tokens_pool::bad_tokens::DEFAULT_EXHAUSTION_COOLDOWN_SECS``) so the two
+# implementations stay byte-for-byte in lockstep (the live spawn path is this
+# Python one — issue #4212).
+DEFAULT_EXHAUSTION_COOLDOWN_SECS = 6 * 3600
+
+# Env override (whole seconds, must parse to ``> 0``) for
+# ``DEFAULT_EXHAUSTION_COOLDOWN_SECS``. Same name as the Rust side.
+EXHAUSTION_COOLDOWN_ENV = "LOOM_TOKEN_EXHAUSTION_COOLDOWN_SECS"
+
+# Reasons treated as "auth" (a broken credential) rather than transient
+# exhaustion. Auth entries block selection permanently and are the default
+# scope of ``loom-tokens unblock``; exhaustion entries expire on their own
+# (cooldown / cleanup). Canonical definition lives here so ``is_bad`` (this
+# module) and ``cli.py``'s ``unblock`` share ONE regex — a drift between the
+# two is exactly the lockstep bug #4212 guards against. Mirrors the Rust
+# ``tokens_pool::bad_tokens::auth_reason_regex``.
+AUTH_REASON_RE = re.compile(
+    r"\b("
+    r"401|"
+    r"oauth|"
+    r"auth(entication)?|"
+    r"unauthorized|"
+    r"token[_\s]?expired|"
+    r"expired|"
+    r"blocked"
+    r")\b",
+    re.IGNORECASE,
+)
+
+
+def exhaustion_cooldown_secs() -> int:
+    """Resolve the exhaustion-entry cooldown in seconds.
+
+    Precedence: ``EXHAUSTION_COOLDOWN_ENV`` (whole seconds, ``> 0``) else
+    ``DEFAULT_EXHAUSTION_COOLDOWN_SECS``. Mirrors the Rust
+    ``exhaustion_cooldown_secs`` resolver.
+    """
+    raw = os.environ.get(EXHAUSTION_COOLDOWN_ENV)
+    if raw is not None:
+        try:
+            n = int(raw.strip())
+        except (ValueError, AttributeError):
+            n = 0
+        if n > 0:
+            return n
+    return DEFAULT_EXHAUSTION_COOLDOWN_SECS
+
+
+def is_auth_reason(reason: str) -> bool:
+    """Return True when ``reason`` names an auth failure (permanent block).
+
+    A broken credential (401 / OAuth / expired / blocked) never self-heals, so
+    such entries block until an explicit ``unblock``. Anything else is treated
+    as transient exhaustion, subject to the cooldown in ``is_bad``.
+    """
+    return bool(AUTH_REASON_RE.search(reason))
 
 
 def _tokens_dir(workspace_path: Path | str) -> Path:
@@ -83,11 +146,24 @@ def mark_bad(workspace_path: Path | str, token_name: str, reason: str) -> None:
 
 
 def is_bad(workspace_path: Path | str, token_name: str) -> bool:
-    """Return True if ``token_name`` appears in the bad_tokens file.
+    """Return True if ``token_name`` is currently bad-marked.
 
     Uses a word-boundary regex so ``agent-1`` does not match ``agent-10``.
     Reads are unsynchronized — readers see a consistent file because writers
     only ever append whole lines.
+
+    Reason-aware expiry (#4122 / #4212): auth-reason entries (a broken
+    credential — matched by ``AUTH_REASON_RE``) block permanently. Non-auth
+    ("exhaustion") entries block only until they age past
+    ``exhaustion_cooldown_secs``: weekly/session/5h-limit exhaustion is
+    transient, so a stale exhaustion line no longer keeps an otherwise-healthy
+    account out of rotation even before ``cleanup_bad_tokens`` prunes it from
+    disk — the account re-enters the pool with no operator action. A line whose
+    timestamp cannot be parsed is treated as permanent (fail-closed — we never
+    silently un-block a token on a malformed entry). This mirrors the Rust
+    ``tokens_pool::bad_tokens::is_bad`` byte-for-byte; the live spawn path is
+    this Python one, so without it a recovered account stays blocked until a
+    manual ``unblock`` (the 2026-07-28 incident, #4212).
 
     Args:
         workspace_path: Repo root.
@@ -101,7 +177,33 @@ def is_bad(workspace_path: Path | str, token_name: str) -> bool:
         text = bad_file.read_text(encoding="utf-8", errors="replace")
     except OSError:
         return False
-    return bool(_name_pattern(token_name).search(text))
+
+    pattern = _name_pattern(token_name)
+    cooldown = exhaustion_cooldown_secs()
+    now = datetime.now(timezone.utc).timestamp()
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped or not pattern.search(stripped):
+            continue
+        # Parse `<ts> <name> <reason...>` from this matching line.
+        parts = stripped.split(" ", 2)
+        ts_str = parts[0] if parts else ""
+        reason = parts[2] if len(parts) >= 3 else ""
+        # Auth entries never expire.
+        if is_auth_reason(reason):
+            return True
+        # Non-auth (exhaustion) entries expire after the cooldown. A
+        # malformed/missing timestamp fails closed (permanent). An expired
+        # entry does NOT short-circuit — a later line may still block.
+        try:
+            ts_epoch = datetime.strptime(ts_str, "%Y-%m-%dT%H:%M:%SZ").replace(
+                tzinfo=timezone.utc,
+            ).timestamp()
+        except ValueError:
+            return True
+        if now - ts_epoch < cooldown:
+            return True
+    return False
 
 
 def cleanup_bad_tokens(

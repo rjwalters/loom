@@ -1018,7 +1018,14 @@ fn exhaustion_signatures() -> &'static [(&'static str, Regex)] {
     SIGS.get_or_init(|| {
         vec![
             (
-                "weekly-limit",
+                // Neutral label (#4212): this banner matches 5h-window ("hit
+                // your limit"), session, weekly, AND monthly signals — we
+                // cannot tell which window from the text, so labeling it
+                // "weekly-limit" materially misleads recovery decisions (a real
+                // weekly limit justifies waiting days; a 5h event, hours). The
+                // reason is transient exhaustion regardless, so use a neutral
+                // "rate-limited" that does not overclaim the window.
+                "rate-limited",
                 Regex::new(
                     r"(?i)hit your (limit|session limit|weekly limit)|hit\.your\.limit|monthly usage limit|out of extra usage",
                 )
@@ -7055,11 +7062,11 @@ exit 0
     fn classify_account_exhaustion_matches_signatures() {
         assert_eq!(
             classify_account_exhaustion("Claude: hit your weekly limit — try again later"),
-            Some("weekly-limit")
+            Some("rate-limited")
         );
         assert_eq!(
             classify_account_exhaustion("you are out of extra usage this month"),
-            Some("weekly-limit")
+            Some("rate-limited")
         );
         assert_eq!(
             classify_account_exhaustion("monitor emitted RATE_LIMIT_ABORT and exited"),

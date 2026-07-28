@@ -4047,22 +4047,56 @@ fn handle_tokens_command(action: TokensAction) -> Result<()> {
                 std::process::exit(1);
             }
 
-            let (removed, kept) =
+            let outcome =
                 bad_tokens::unblock(&ws, &validated, all_reasons).map_err(|e| anyhow!(e))?;
+            let removed = outcome.removed;
+            let kept = outcome.kept;
+            let excluded = outcome.excluded;
             for name in &validated {
                 let _ = failure_counts::record_success(&ws, name);
             }
 
             if json {
-                println!("{}", serde_json::json!({ "removed": removed, "kept": kept }));
-            } else if removed > 0 {
-                let plural = if removed == 1 { "y" } else { "ies" };
-                println!("Removed {removed} bad-token entr{plural} for: {}", validated.join(", "));
-            } else {
                 println!(
-                    "No matching entries removed (use --all-reasons to drop non-auth entries \
-                     too)."
+                    "{}",
+                    serde_json::json!({
+                        "removed": removed,
+                        "kept": kept,
+                        "excluded": excluded,
+                    })
                 );
+            } else {
+                if removed > 0 {
+                    let plural = if removed == 1 { "y" } else { "ies" };
+                    println!(
+                        "Removed {removed} bad-token entr{plural} for: {}",
+                        validated.join(", ")
+                    );
+                }
+                if !excluded.is_empty() {
+                    // #4212: a no-op that looks like success is the failure
+                    // mode. Name the still-blocked accounts and fail below.
+                    let plural = if excluded.len() == 1 { "y" } else { "ies" };
+                    eprintln!(
+                        "Left {} non-auth (exhausted/rate-limited) entr{plural} in place for: \
+                         {}. These are still blocking selection — re-run with --all-reasons to \
+                         drop them (or wait for the exhaustion cooldown to expire them \
+                         automatically).",
+                        excluded.len(),
+                        excluded.join(", ")
+                    );
+                } else if removed == 0 {
+                    println!(
+                        "No matching entries removed (use --all-reasons to drop non-auth entries \
+                         too)."
+                    );
+                }
+            }
+
+            // Non-zero when the default scope left the named accounts still
+            // blocked — the operator's intent ("unblock X") was not achieved.
+            if !excluded.is_empty() {
+                std::process::exit(3);
             }
             Ok(())
         }

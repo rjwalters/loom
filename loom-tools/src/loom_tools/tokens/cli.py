@@ -26,13 +26,13 @@ import argparse
 import json
 import logging
 import os
-import re
 import sys
 from pathlib import Path
 
 from loom_tools.common.logging import log_error, log_info, log_success, log_warning
 from loom_tools.common.repo import find_repo_root
 from loom_tools.tokens import allowlist as allowlist_mod
+from loom_tools.tokens import bad_tokens as bad_tokens_mod
 from loom_tools.tokens import failure_counts
 from loom_tools.tokens.bootstrap import bootstrap_tokens
 from loom_tools.tokens.monitor_db import (
@@ -746,25 +746,19 @@ def _cmd_unpin(args: argparse.Namespace) -> int:
     return 0
 
 
-# Reasons we treat as "auth" for the unblock command. Match
-# case-insensitively against the free-form reason field of bad_tokens
-# entries. We do NOT match TOKEN_EXHAUSTED — those expire on their own.
-_AUTH_REASON_RE = re.compile(
-    r"\b("
-    r"401|"
-    r"oauth|"
-    r"auth(entication)?|"
-    r"unauthorized|"
-    r"token[_\s]?expired|"
-    r"expired|"
-    r"blocked"
-    r")\b",
-    re.IGNORECASE,
-)
-
-
 def _cmd_unblock(args: argparse.Namespace) -> int:
-    """Handle ``loom-tokens unblock <names...> [--all-reasons]``."""
+    """Handle ``loom-tokens unblock <names...> [--all-reasons]``.
+
+    Exit codes:
+        0 — entries removed, or nothing matched the named accounts at all.
+        2 — an unknown account name was given.
+        3 — default scope (no ``--all-reasons``) left non-auth ("exhausted")
+            entries in place for the named accounts. This is a *deliberate*
+            non-zero: the pre-#4212 behavior printed "No matching entries
+            removed" and exited 0, so an operator saw success while the pool
+            stayed poisoned and the next dispatches insta-crashed. We now name
+            the still-blocked accounts and fail so a script/operator notices.
+    """
     workspace = _resolve_workspace()
     if workspace is None:
         return 1
@@ -808,6 +802,12 @@ def _cmd_unblock(args: argparse.Namespace) -> int:
     target_set = set(names)
     removed = 0
     kept_lines: list[str] = []
+    # Named accounts that still have a non-auth ("exhausted") entry left in
+    # place because the operator did not pass --all-reasons (#4212). Tracked in
+    # first-seen file order, de-duplicated, so the daemon Rust port can emit a
+    # byte-identical `excluded` list.
+    excluded: list[str] = []
+    excluded_seen: set[str] = set()
     with _MkdirLock(lock_path):
         try:
             lines = bad_file.read_text(encoding="utf-8").splitlines()
@@ -826,9 +826,14 @@ def _cmd_unblock(args: argparse.Namespace) -> int:
             entry_name = parts[1]
             reason = parts[2] if len(parts) >= 3 else ""
             if entry_name in target_set:
-                if args.all_reasons or _AUTH_REASON_RE.search(reason):
+                if args.all_reasons or bad_tokens_mod.is_auth_reason(reason):
                     removed += 1
                     continue
+                # A named account with a non-auth entry that the DEFAULT scope
+                # leaves behind — record it so we can name it and fail.
+                if entry_name not in excluded_seen:
+                    excluded_seen.add(entry_name)
+                    excluded.append(entry_name)
             kept_lines.append(line)
 
         # Atomic rewrite via temp file (matches cleanup_bad_tokens).
@@ -850,7 +855,7 @@ def _cmd_unblock(args: argparse.Namespace) -> int:
     if getattr(args, "emit_json", False):
         print(
             json.dumps(
-                {"removed": removed, "kept": len(kept_lines)},
+                {"removed": removed, "kept": len(kept_lines), "excluded": excluded},
                 indent=2,
             ),
         )
@@ -860,11 +865,27 @@ def _cmd_unblock(args: argparse.Namespace) -> int:
                 f"Removed {removed} bad-token entr{'y' if removed == 1 else 'ies'}"
                 f" for: {', '.join(names)}",
             )
-        else:
+        if excluded:
+            # AC #4212: a no-op that looks like success is the failure mode.
+            # Name the still-blocked accounts and fail so the operator does not
+            # dispatch onto a still-poisoned pool.
+            log_warning(
+                f"Left {len(excluded)} non-auth (exhausted/rate-limited) "
+                f"entr{'y' if len(excluded) == 1 else 'ies'} in place for: "
+                f"{', '.join(excluded)}. These are still blocking selection — "
+                f"re-run with --all-reasons to drop them (or wait for the "
+                f"exhaustion cooldown to expire them automatically).",
+            )
+        elif not removed:
             log_info(
                 "No matching entries removed (use --all-reasons to drop "
                 "non-auth entries too).",
             )
+
+    # Non-zero when the default scope left the named accounts still blocked —
+    # the operator's intent ("unblock X") was not achieved.
+    if excluded:
+        return 3
     return 0
 
 

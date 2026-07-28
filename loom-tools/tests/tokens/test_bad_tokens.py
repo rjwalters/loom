@@ -8,9 +8,15 @@ from pathlib import Path
 
 import pytest
 
+from datetime import datetime, timedelta, timezone
+
 from loom_tools.tokens import bad_tokens
 from loom_tools.tokens.bad_tokens import (
+    DEFAULT_EXHAUSTION_COOLDOWN_SECS,
+    EXHAUSTION_COOLDOWN_ENV,
     cleanup_bad_tokens,
+    exhaustion_cooldown_secs,
+    is_auth_reason,
     is_bad,
     mark_bad,
 )
@@ -20,6 +26,10 @@ def _make_tokens_dir(tmp_path: Path) -> Path:
     d = tmp_path / ".loom" / "tokens"
     d.mkdir(parents=True)
     return tmp_path
+
+
+def _iso(dt: datetime) -> str:
+    return dt.strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 def test_mark_then_is_bad(tmp_path):
@@ -98,6 +108,75 @@ def test_cleanup_keeps_malformed_lines(tmp_path):
     contents = bad_file.read_text()
     assert "garbage" in contents
     assert "fresh" in contents
+
+
+# ---------- reason-aware cooldown (#4122 / #4212) ----------
+
+
+def test_exhaustion_entry_expires_after_cooldown_auth_stays(tmp_path):
+    """#4212: a stale exhaustion (non-auth) entry no longer blocks selection
+    even before cleanup prunes it, while an auth entry of the same age stays
+    permanent — the live Python spawn path must self-heal like the Rust one."""
+    workspace = _make_tokens_dir(tmp_path)
+    bad_file = workspace / ".loom" / "tokens" / ".bad_tokens"
+    old = _iso(datetime.now(timezone.utc) - timedelta(seconds=7 * 3600))
+    bad_file.write_text(
+        f"{old} agent-exh exhausted: weekly-limit\n"
+        f"{old} agent-auth 401 unauthorized\n",
+        encoding="utf-8",
+    )
+    # Exhaustion entry has aged out — selectable again (line still on disk).
+    assert is_bad(workspace, "agent-exh") is False
+    # Auth entry is permanent — unaffected by the TTL.
+    assert is_bad(workspace, "agent-auth") is True
+
+
+def test_fresh_exhaustion_entry_still_blocks(tmp_path):
+    """A just-written exhaustion entry blocks until the cooldown elapses."""
+    workspace = _make_tokens_dir(tmp_path)
+    mark_bad(workspace, "agent-1", "exhausted: weekly-limit")
+    assert is_bad(workspace, "agent-1") is True
+
+
+def test_malformed_timestamp_fails_closed(tmp_path):
+    """A matching line with an unparseable timestamp stays bad (fail-closed)."""
+    workspace = _make_tokens_dir(tmp_path)
+    bad_file = workspace / ".loom" / "tokens" / ".bad_tokens"
+    bad_file.write_text("not-a-timestamp agent-1 exhausted\n", encoding="utf-8")
+    assert is_bad(workspace, "agent-1") is True
+
+
+def test_expired_entry_does_not_shortcircuit_later_blocking_line(tmp_path):
+    """An aged-out exhaustion line must not mask a later still-blocking one."""
+    workspace = _make_tokens_dir(tmp_path)
+    bad_file = workspace / ".loom" / "tokens" / ".bad_tokens"
+    old = _iso(datetime.now(timezone.utc) - timedelta(seconds=7 * 3600))
+    fresh = _iso(datetime.now(timezone.utc))
+    bad_file.write_text(
+        f"{old} agent-1 exhausted: weekly-limit\n"
+        f"{fresh} agent-1 exhausted: 429\n",
+        encoding="utf-8",
+    )
+    assert is_bad(workspace, "agent-1") is True
+
+
+def test_exhaustion_cooldown_env_override(monkeypatch):
+    monkeypatch.setenv(EXHAUSTION_COOLDOWN_ENV, "100")
+    assert exhaustion_cooldown_secs() == 100
+    monkeypatch.setenv(EXHAUSTION_COOLDOWN_ENV, "0")
+    assert exhaustion_cooldown_secs() == DEFAULT_EXHAUSTION_COOLDOWN_SECS
+    monkeypatch.setenv(EXHAUSTION_COOLDOWN_ENV, "garbage")
+    assert exhaustion_cooldown_secs() == DEFAULT_EXHAUSTION_COOLDOWN_SECS
+    monkeypatch.delenv(EXHAUSTION_COOLDOWN_ENV, raising=False)
+    assert exhaustion_cooldown_secs() == DEFAULT_EXHAUSTION_COOLDOWN_SECS
+
+
+def test_is_auth_reason_matches_expected():
+    assert is_auth_reason("401 Unauthorized") is True
+    assert is_auth_reason("oauth token expired") is True
+    assert is_auth_reason("blocked") is True
+    assert is_auth_reason("exhausted: weekly-limit") is False
+    assert is_auth_reason("exhausted: rate-limited") is False
 
 
 # ---------- locking ----------

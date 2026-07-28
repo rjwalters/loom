@@ -255,7 +255,9 @@ def test_unblock_auth_reason_removed_identically(tmp_path):
     assert rust_result.returncode == 0, rust_result.stderr
     rust_json = json.loads(rust_result.stdout)
 
-    assert py_json == rust_json == {"removed": 1, "kept": 1}
+    # "a" (auth) is removed; "b" (exhausted) is not a target here, so nothing
+    # is excluded and both exit 0 (#4212 adds the `excluded` field).
+    assert py_json == rust_json == {"removed": 1, "kept": 1, "excluded": []}
 
     py_bad = (py_ws / ".loom" / "tokens" / ".bad_tokens").read_text(encoding="utf-8")
     rust_bad = (rust_ws / ".loom" / "tokens" / ".bad_tokens").read_text(encoding="utf-8")
@@ -265,6 +267,47 @@ def test_unblock_auth_reason_removed_identically(tmp_path):
     assert "a" not in rust_bad.split()
     assert "b" in py_bad
     assert "b" in rust_bad
+
+
+def test_unblock_default_scope_excluded_exit3_identically(tmp_path):
+    """#4212: a named account whose only entry is non-auth ("exhausted") is
+    left in place under the default scope — both implementations name it in
+    `excluded` and exit 3 (not a silent success)."""
+    py_ws = tmp_path / "py"
+    rust_ws = tmp_path / "rust"
+    _write_pool(py_ws, ["a", "b"])
+    _write_pool(rust_ws, ["a", "b"])
+    py_mark_bad(py_ws, "a", "401 unauthorized")
+    py_mark_bad(py_ws, "b", "exhausted: weekly-limit")
+    py_mark_bad(rust_ws, "a", "401 unauthorized")
+    py_mark_bad(rust_ws, "b", "exhausted: weekly-limit")
+
+    py_result = subprocess.run(
+        [
+            "python3",
+            "-m",
+            "loom_tools.tokens.cli",
+            "unblock",
+            "a",
+            "b",
+            "--json",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+        cwd=py_ws,
+        env={**os.environ, "LOOM_WORKSPACE": str(py_ws), "PYTHONPATH": _loom_tools_src()},
+    )
+    rust_result = _run_rust("unblock", "a", "b", "--workspace", str(rust_ws), "--json")
+
+    # Both exit 3 (default scope left a named account still blocked).
+    assert py_result.returncode == 3, py_result.stderr
+    assert rust_result.returncode == 3, rust_result.stderr
+
+    py_json = json.loads(py_result.stdout)
+    rust_json = json.loads(rust_result.stdout)
+    # "a"'s auth entry is dropped; "b"'s exhausted entry stays and is named.
+    assert py_json == rust_json == {"removed": 1, "kept": 1, "excluded": ["b"]}
 
 
 def _loom_tools_src() -> str:

@@ -321,17 +321,33 @@ loom-tokens pin remove agent-3    # Remove
 loom-tokens pin status            # Show current allowlist
 loom-tokens unpin                 # Delete allowlist (back to full pool)
 
-loom-tokens unblock agent-1       # Remove one entry from .bad_tokens
-loom-tokens unblock --all         # Clear .bad_tokens entirely
+loom-tokens unblock agent-1              # Drop agent-1's AUTH entries only
+loom-tokens unblock agent-1 --all-reasons  # Also drop its exhausted/rate-limited entries
 ```
 
 **Validation**: `pin` accepts only exact bootstrapped account names —
 substring/fuzzy matches are rejected. The allowlist is sorted, deduplicated, and
 `mkdir`-lock guarded so concurrent operator commands don't drop entries.
 
-**Reason-aware bad-token TTL**: bad-tokens entries with reason `auth` (401) ignore
-`LOOM_TOKENS_BAD_TTL` (default 21600s = 6h) and persist until `loom-tokens
-unblock`. Other reasons expire automatically.
+**`unblock` default scope fails loudly on left-behind entries (#4212)**: the
+default scope removes only `auth` entries (a broken credential); transient
+`exhausted`/`rate-limited` entries clear themselves. When the named account has
+*only* a non-auth entry, the default scope leaves it in place — and rather than
+print "No matching entries removed" and exit `0` (the pre-#4212 silent no-op that
+let an operator dispatch onto a still-poisoned pool), `unblock` now **names the
+still-blocked accounts and exits `3`**. Re-run with `--all-reasons` to drop them,
+or wait for the cooldown to expire them automatically.
+
+**Reason-aware bad-token TTL**: bad-tokens entries whose reason is `auth` (401 /
+OAuth / expired / blocked) persist until `loom-tokens unblock`. Non-auth
+("exhausted"/"rate-limited") entries stop blocking selection once they age past
+the exhaustion cooldown (`LOOM_TOKEN_EXHAUSTION_COOLDOWN_SECS`, default 21600s =
+6h) — enforced at selection time in **both** the Rust daemon and the live Python
+spawn path (`is_bad`), so a recovered account re-enters the pool with no operator
+action even before `cleanup_bad_tokens` prunes the line from disk. Before #4212
+only the Rust path honored the cooldown, so on the live Python spawn path a stale
+`exhausted` marker outlived its rate-limit reset and wedged the account until a
+manual `unblock`.
 
 **Auto-unpin** (`failure_counts`): the wrapper tracks consecutive
 `TOKEN_EXHAUSTED` failures per account in `.loom/tokens/.failure_counts` (JSON).
