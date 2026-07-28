@@ -164,7 +164,8 @@ warn ""
 # and defaults/scripts whose content differs. Best-effort: if either tree can't
 # be resolved, skip silently. We only flag content differences for files present
 # in both trees — never "only on one side" (repo-specific hooks like
-# guard-worktree-paths.sh have no defaults/ counterpart and are not drift).
+# post-worktree.sh have no defaults/ counterpart and are not drift; as of #4007
+# guard-worktree-paths.sh DOES have one and is drift-checked like any other hook).
 report_tree_drift() {
     local installed_dir="$1" defaults_dir="$2" label="$3"
     [[ -d "$installed_dir" && -d "$defaults_dir" ]] || return 0

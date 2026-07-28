@@ -241,10 +241,11 @@ Configuration lives in `.loom/config.json` (committed for team sharing): a
 - **Custom roles** — add `.loom/roles/<name>.md` (and optional `<name>.json`).
 - **Branch rulesets & repository settings** — set at install time or via
   `./scripts/install/setup-branch-protection.sh` / `setup-repository-settings.sh`.
-- **Guard hooks** — Bash `PreToolUse` guards block/ask on destructive commands;
-  category toggles (`guards.sqlDdl`, `cloudCli`, `reversibleGh`, `rmScope`,
-  `forceScope`, `readOnlyFastPath`, `decisionLog`, each with an `LOOM_*` env
-  override) let a repo opt out. Catalog: [`defaults/CLAUDE.md` → "Custom Guard Hooks"](defaults/CLAUDE.md).
+- **Guard hooks** — `PreToolUse` guards block/ask on destructive commands and
+  confine Edit/Write to a builder's worktree; category toggles (`guards.sqlDdl`,
+  `cloudCli`, `reversibleGh`, `rmScope`, `forceScope`, `readOnlyFastPath`,
+  `decisionLog`, `worktreeIsolation`, each with an `LOOM_*` env override) let a
+  repo opt out. Catalog: [`defaults/CLAUDE.md` → "Custom Guard Hooks"](defaults/CLAUDE.md).
 - **MCP hooks** — the unified `mcp-loom` server; run `./scripts/setup-mcp.sh` to
   generate `.mcp.json`. See the mcp-loom README.
 
