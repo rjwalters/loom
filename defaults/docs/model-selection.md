@@ -85,6 +85,39 @@ The ladder is configured in `.loom/config.json`:
 > { "sweep": { "modelAliases": { "opus": "claude-opus-5" } } }
 > ```
 
+### Complexity tier map (`sweep.tierModels`, issue #4238)
+
+The Curator classifies every issue it curates on one axis — **how expensive is it to be wrong?** — and emits a `<!-- loom:complexity=<tier> -->` marker (see `curator.md`). There are three cost-of-being-wrong strata:
+
+| Tier | Meaning | Recommended Claude model |
+|---|---|---|
+| `mechanical` | A mistake is obvious just reading the change (file splits, renames, dead-code deletion, constants). | `haiku` |
+| `routine` | A mistake would surface in tests or review. Most bug fixes and small features. **Default** (absent marker ⇒ routine). | `sonnet` |
+| `complex` | A mistake could pass tests and review unnoticed (architecture, subtle logic, money/security/destructive migrations). | `opus` |
+
+At **Builder** dispatch (precedence tier 2.5, between tiers 2 and 3), the sweep resolves the model for the issue's stratum from `sweep.tierModels[<runtime>][<tier>]` — a **runtime-neutral** map of *logical* tiers (the profile picks a logical tier; `sweep.modelAliases` still does the alias→ID step). Resolution is a command, not a judgement call:
+
+```bash
+MODEL="$(./.loom/scripts/resolve-tier-model.sh <issue> <runtime>)"   # exit 3 ⇒ no mapping, fall through to tier 3
+```
+
+**No `tierModels` block ships in `defaults/config.json`.** With none configured, `resolve-tier-model.sh` exits 3 and dispatch falls through to the tier-3 role default — so an unconfigured repo's dispatch decisions are **byte-for-byte identical to before this feature**. A workspace opts into cost routing by adding the map (a Codex adapter supplies its own IDs under its own runtime key, per the #4167 adapter contract):
+
+```json
+{
+  "sweep": {
+    "tierModels": {
+      "claude": { "mechanical": "haiku", "routine": "sonnet", "complex": "opus" },
+      "codex":  { "mechanical": "gpt-5-mini", "routine": "gpt-5", "complex": "gpt-5-codex" }
+    }
+  }
+}
+```
+
+Hard bounds (same as the No-Fable invariant): the tier map is **Builder-only**, **never resolves to `fable`** (`resolve-tier-model.sh` refuses and falls through), and tier-1/tier-2 operator pins still win. In model-cost experiment mode the tier-map resolution is suppressed for the forced arm (the marker is still read as the stratification key).
+
+> **Operator-facing profile switch (`sweep.optimization`) is a separate follow-up.** This change adds the marker vocabulary and the tier map. A future `sweep.optimization: cost | speed | balanced` switch (default `balanced` = today's behavior) will select which `tierModels` preset is applied repo-wide without hand-editing the map. Until then, opt in per-repo with the `sweep.tierModels` block above.
+
 **Workspace override example** (`.loom/config.json`):
 
 ```json

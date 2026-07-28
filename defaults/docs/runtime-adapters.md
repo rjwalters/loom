@@ -121,6 +121,21 @@ logical `opus` → an OpenAI reasoning-model ID). The fork's "cost of being wron
 tiering is the seed for how a non-Claude runtime should choose which concrete
 model a tier maps to.
 
+**Complexity tier map (`sweep.tierModels`, issue #4238).** The higher-level
+`sweep.tierModels[<runtime>][<tier>]` map (Curator marker → logical tier →
+model, `mechanical`/`routine`/`complex`) is exactly this per-runtime table. It is
+resolved **entirely orchestrator-side** — the `/loom:sweep` skill runs
+`./.loom/scripts/resolve-tier-model.sh <issue> <runtime>`, which delegates the
+config lookup to `loom_tools.model_tiers` (`resolve_tier_model`, `--tier` mode)
+and then the alias→ID step to `resolve-model.sh`. **The Rust daemon does not
+participate**: it never reads the complexity marker — it dispatches with an
+explicit/inherited `--model` and forwards nothing else — so there is no daemon
+counterpart to keep in lockstep for the tier map, and its `sweep.modelAliases`
+resolution (`read_model_aliases` / `resolve_dispatch_model`) is untouched by
+#4238. The two-language divergence flagged below is therefore **not widened** by
+the tier map; when the adapter contract unifies the alias resolvers, the tier
+map layers cleanly on top of whichever single-source resolver wins.
+
 > **Open reconciliation item — do not resolve here.** `sweep.modelAliases` has a
 > known **Rust/Python divergence**: the Rust dispatch resolver and the Python
 > `model_tiers` resolver do not treat the alias map identically (the Rust side is
