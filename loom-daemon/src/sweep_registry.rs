@@ -1596,11 +1596,13 @@ impl SweepRegistry {
     /// effort is preserved end-to-end.
     ///
     /// `depends_on` (issue #3729, stacked-PR v1): when `Some(N)`, the spawned
-    /// child receives `--depends-on <N>` appended to the argv (immediately
-    /// after any `--model` / `--effort`), instructing `/loom:sweep` to branch
-    /// its worktree/PR off `feature/issue-<N>`. When `None`, no
-    /// `--depends-on` flag is emitted — byte-for-byte unchanged behavior. A
-    /// single optional parent (not a list) makes diamonds unrepresentable.
+    /// child receives `--depends-on <N>` embedded in the `-p` prompt string
+    /// (immediately after `--claim-owned`; issue #4121 — NOT a sibling argv
+    /// token, since `--depends-on` is not a real `claude` CLI flag),
+    /// instructing `/loom:sweep` to branch its worktree/PR off
+    /// `feature/issue-<N>`. When `None`, no `--depends-on` text is emitted —
+    /// byte-for-byte unchanged behavior. A single optional parent (not a
+    /// list) makes diamonds unrepresentable.
     pub fn dispatch(
         &mut self,
         kind: &SweepKind,
@@ -2704,7 +2706,18 @@ impl SweepRegistry {
         // pre-flight. The env var (`LOOM_SWEEP_CLAIM_OWNED`, set below) is kept
         // unchanged for backward compatibility (#3823/#3967). Unconditional on
         // every daemon dispatch — every dispatch claims exactly one issue.
-        let prompt = format!("/loom:sweep {issue} --claim-owned {issue}");
+        let mut prompt = format!("/loom:sweep {issue} --claim-owned {issue}");
+        // Stacked-PR dependency (issue #3729, v1; sibling-arg bug fixed in
+        // #4121): when a parent issue is declared, fold `--depends-on <N>`
+        // INTO the same `-p` prompt string as `--claim-owned` above, for the
+        // identical reason — `--depends-on` is not a `claude` CLI flag
+        // either, so a sibling `cmd.arg()` token makes `claude` exit 1
+        // (`error: unknown option '--depends-on'`) before any session
+        // starts. Absent the param, no text is appended (byte-for-byte
+        // unchanged). Mirrors the `--claim-owned` append-only contract.
+        if let Some(parent) = depends_on {
+            prompt.push_str(&format!(" --depends-on {parent}"));
+        }
         let mut cmd = Command::new(&spawn_bin);
         cmd.arg("-p").arg(&prompt);
         // Model selection (issue #3477, Phase 1): the dispatch-param tier of
@@ -2726,16 +2739,9 @@ impl SweepRegistry {
                 cmd.arg("--effort").arg(e);
             }
         }
-        // Stacked-PR dependency (issue #3729, v1): when a parent issue is
-        // declared, append `--depends-on <N>` so `/loom:sweep` branches the
-        // child worktree/PR off `feature/issue-<N>` instead of the default
-        // branch. Absent the param, no flag is emitted (byte-for-byte
-        // unchanged). Mirrors the `--model` / `--effort` append-only contract.
-        if let Some(parent) = depends_on {
-            cmd.arg("--depends-on").arg(parent.to_string());
-        }
-        // (Daemon self-claim marker `--claim-owned <N>` is embedded in the
-        // `-p` prompt text above, not appended as a sibling arg — see #4111.)
+        // (Daemon self-claim marker `--claim-owned <N>` and the stacked-PR
+        // `--depends-on <N>` marker are both embedded in the `-p` prompt text
+        // above, not appended as sibling args — see #4111 / #4121.)
         // Unattended-permissions flag (issue #3824): a daemon-dispatched child
         // is a detached, non-interactive `claude -p` process — there is no
         // human to answer a permission prompt, so any tool call needing
@@ -2747,8 +2753,8 @@ impl SweepRegistry {
         // `claude -p "/<role>" --dangerously-skip-permissions`). Scoped to this
         // daemon-only dispatch path; `spawn-claude.sh` stays a generic
         // pass-through and never adds a permission flag of its own. Appended
-        // AFTER `--model`/`--effort`/`--depends-on` (and the prompt-embedded
-        // `--claim-owned`) so the positional argv contract is unchanged.
+        // AFTER `--model`/`--effort` (and the prompt-embedded `--claim-owned`
+        // / `--depends-on`) so the positional argv contract is unchanged.
         cmd.arg("--dangerously-skip-permissions");
         cmd.env("LOOM_TERMINAL_ID", format!("daemon-{sweep_id}"))
             // Claim-ownership marker (issue #3823): `dispatch()` flips
@@ -5942,6 +5948,26 @@ exit 0
         assert!(
             recorded.contains("argv: -p /loom:sweep 50 --claim-owned 50 --depends-on 49"),
             "expected --depends-on in argv; got: {recorded}"
+        );
+        // Regression for #4121 (mirrors the #4120 `--claim-owned` review): the
+        // flattened `argv:` assertion above renders byte-identically whether
+        // `--depends-on 49` is embedded in the single `-p` prompt token or
+        // appended as its own sibling argv token — so it cannot distinguish
+        // the fixed and buggy forms. The real `claude` CLI rejects
+        // `--depends-on` as an unknown option if it ever arrives as a
+        // standalone token; only text inside the `-p "<prompt>"` value
+        // reaches the `/loom:sweep` skill's `$ARGUMENTS`. Use the per-token
+        // `arg: ` fixture lines (as `dispatch_appends_claim_owned_flag` does)
+        // to assert the flag is part of the prompt VALUE and NOT a
+        // standalone token.
+        assert!(
+            recorded.contains("arg: /loom:sweep 50 --claim-owned 50 --depends-on 49"),
+            "expected --depends-on inside the single -p prompt token; got: {recorded}"
+        );
+        assert!(
+            !recorded.contains("arg: --depends-on"),
+            "--depends-on must NOT be a standalone argv token (the real claude CLI \
+             rejects it as an unknown option); got: {recorded}"
         );
         assert_eq!(
             registry.get(&outcome.sweep_id).unwrap().depends_on,
