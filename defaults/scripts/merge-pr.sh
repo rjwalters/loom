@@ -9,7 +9,8 @@
 # (see forge-helpers.sh for details).
 #
 # Options:
-#   --no-cleanup-worktree  Skip local worktree cleanup after merge
+#   --no-cleanup-worktree  Skip local worktree AND local branch cleanup after
+#                          merge
 #   --cleanup-worktree     (no-op, worktree cleanup is now the default)
 #   --worktree-path <dir>  Explicit worktree path to clean up (bypasses
 #                          .loom-managed sentinel guard — caller asserts
@@ -28,14 +29,29 @@
 #                          stacked child PRs targeting it (operator asserts the
 #                          children are already reconciled). See #3747 item 2.
 #
-# By default, the local worktree is cleaned up after a successful merge.
-# Pass --no-cleanup-worktree to skip this (e.g., when other terminals may
-# have their CWD inside the worktree).
+# By default, the local worktree AND the local branch it held are cleaned up
+# after a successful merge (#4100). Pass --no-cleanup-worktree to skip both
+# (e.g., when other terminals may have their CWD inside the worktree, or the
+# branch has unpushed commits you want to keep).
 #
 # Cleanup is restricted to Loom-managed worktrees (those containing the
 # .loom-managed sentinel written by worktree.sh). Worktrees lacking the
 # sentinel are treated as user-owned and never removed. Set
 # LOOM_PRESERVE_WORKTREE=1 to disable cleanup unconditionally for a session.
+#
+# Local branch deletion (#4100): every cleanup path — the default
+# .loom/worktrees/issue-N convention, a discovered Loom-managed worktree at a
+# non-standard path, and even the case where no worktree exists at all —
+# attempts to delete the merged PR's local branch. Safety is determined by
+# whether the local branch tip equals the merged PR's head SHA (not by `git
+# branch --merged`, which is always false for a squash merge): a matching tip
+# uses `git branch -D` (every commit on the branch was part of the merged PR);
+# a non-matching tip (unpushed local work) falls back to `git branch -d`,
+# which keeps the branch and reports it instead of force-deleting. A branch
+# checked out as the current HEAD (or in another worktree) is never deleted —
+# git itself refuses, and the refusal is reported with a specific message
+# rather than the generic "unmerged commits" warning. The repo's default
+# branch is never a delete target.
 #
 # Override: pass --worktree-path <dir> to opt into removing a non-Loom
 # worktree (the sentinel guard is bypassed only when this flag is supplied).
@@ -76,7 +92,8 @@ Supports both GitHub and Gitea forges. Forge detection is automatic
 (see forge-helpers.sh for details).
 
 Options:
-  --no-cleanup-worktree  Skip local worktree cleanup after merge
+  --no-cleanup-worktree  Skip local worktree AND local branch cleanup
+                         after merge
   --cleanup-worktree     (no-op, worktree cleanup is now the default)
   --worktree-path <dir>  Explicit worktree path to clean up. Bypasses the
                          .loom-managed sentinel guard (caller asserts
@@ -103,15 +120,26 @@ Options:
                          responsibility, mirroring --worktree-path.
   -h, --help             Show this help and exit
 
-By default, the local worktree is cleaned up after a successful merge.
-Pass --no-cleanup-worktree to skip this (e.g., when other terminals may
-have their CWD inside the worktree).
+By default, the local worktree AND the local branch it held are cleaned up
+after a successful merge (#4100). Pass --no-cleanup-worktree to skip both
+(e.g., when other terminals may have their CWD inside the worktree, or you
+want to keep a branch with unpushed commits).
 
 Cleanup is restricted to Loom-managed worktrees (those under
 .loom/worktrees/issue-N that contain a .loom-managed sentinel file written
 by worktree.sh). User-provisioned worktrees at other paths are never
 removed by the default code path. Set LOOM_PRESERVE_WORKTREE=1 to disable
 cleanup unconditionally for a session.
+
+Local branch deletion (#4100): every cleanup path — including the case
+where no worktree exists at all — attempts to delete the merged PR's local
+branch. Safety is determined by comparing the local branch tip to the
+merged PR's head SHA (not 'git branch --merged', which is always false for
+a squash merge): a matching tip uses 'git branch -D'; a non-matching tip
+(unpushed local work) falls back to 'git branch -d', which keeps the
+branch and reports it instead of force-deleting. The branch currently
+checked out (main worktree or any other) is never deleted, and the repo's
+default branch is never a delete target.
 
 When --worktree-path <dir> is passed explicitly, the operator is taking
 responsibility for the cleanup decision: the sentinel guard is bypassed
@@ -198,6 +226,16 @@ source "$SCRIPT_DIR/lib/forge-helpers.sh"
 # overridden root, not just the default .loom/worktrees.
 # shellcheck source=lib/worktree-root.sh
 source "$SCRIPT_DIR/lib/worktree-root.sh"
+# Default-branch resolver (#4100) — the local-branch delete guard must never
+# target the repo's default branch. Sourced defensively: a repo where this
+# fails to resolve (e.g. no network + no origin/HEAD symref) still falls back
+# to the literal "main"/"master" check in _maybe_delete_local_branch below.
+DEFAULT_BRANCH_NAME=""
+if [[ -f "$SCRIPT_DIR/lib/default-branch.sh" ]]; then
+  # shellcheck source=lib/default-branch.sh
+  source "$SCRIPT_DIR/lib/default-branch.sh"
+  DEFAULT_BRANCH_NAME="$(cd "$REPO_ROOT" && loom_default_branch 2>/dev/null || true)"
+fi
 forge_detect
 
 # Use gh-cached for read-only queries to reduce API calls (see issue #1609)
@@ -292,6 +330,11 @@ PR_MERGED=$(echo "$PR_JSON" | jq -r '.merged')
 PR_BRANCH=$(echo "$PR_JSON" | jq -r '.head.ref')
 PR_TITLE=$(echo "$PR_JSON" | jq -r '.title')
 PR_MERGEABLE=$(echo "$PR_JSON" | jq -r '.mergeable')
+# Head SHA (#4100): the safety criterion for local-branch deletion. A local
+# branch whose tip equals this SHA carries no commits absent from the merged
+# PR, so it is safe to force-delete even though it will never satisfy
+# `git branch --merged` after a squash merge.
+PR_HEAD_SHA=$(echo "$PR_JSON" | jq -r '.head.sha // empty')
 
 # Check if already merged
 if [[ "$PR_MERGED" == "true" ]]; then
@@ -1171,8 +1214,15 @@ if [[ "$PR_MERGEABLE" == "false" ]]; then
 fi
 
 if [[ "$DRY_RUN" == "true" ]]; then
-  info "[dry-run] Would merge PR #$PR_NUMBER (squash) and delete branch '$PR_BRANCH'"
-  [[ "$CLEANUP_WORKTREE" == "true" ]] && info "[dry-run] Would clean up local worktree"
+  info "[dry-run] Would merge PR #$PR_NUMBER (squash) and delete remote branch '$PR_BRANCH'"
+  if [[ "$CLEANUP_WORKTREE" == "true" ]]; then
+    info "[dry-run] Would clean up local worktree"
+    if git -C "$REPO_ROOT" show-ref --verify --quiet "refs/heads/$PR_BRANCH"; then
+      info "[dry-run] Would delete local branch '$PR_BRANCH'"
+    fi
+  else
+    info "[dry-run] --no-cleanup-worktree: would leave local worktree and local branch '$PR_BRANCH' in place"
+  fi
   exit 0
 fi
 
@@ -1289,12 +1339,12 @@ _auto_reconcile_stacked_children || true
 # Delete remote branch (skip if forge auto-deletes on merge)
 DELETE_BRANCH_ON_MERGE=$(forge_check_auto_delete "$REPO_NWO" "$GH")
 if [[ "$DELETE_BRANCH_ON_MERGE" == "true" ]]; then
-  info "Skipping branch deletion (auto-delete is enabled)"
+  info "Skipping remote branch deletion (auto-delete is enabled)"
 else
   info "Deleting remote branch: $PR_BRANCH"
   forge_delete_branch "$REPO_NWO" "$PR_BRANCH" && \
-    success "Branch '$PR_BRANCH' deleted" || \
-    warning "Could not delete branch '$PR_BRANCH' (may already be deleted)"
+    success "Remote branch '$PR_BRANCH' deleted" || \
+    warning "Could not delete remote branch '$PR_BRANCH' (may already be deleted)"
 fi
 
 # Cleanup worktree if requested.
@@ -1362,11 +1412,24 @@ _find_worktree_by_branch() {
     '
 }
 
-# Delete the matching local branch. Uses `git branch -d` (not -D) so unmerged
-# commits abort the delete — that's the right safety net. Never fails the
-# cleanup pipeline; warns on errors.
+# Delete the matching local branch (#4100).
+#
+# _maybe_delete_local_branch <branch> [expected_head_sha]
+#
+# `expected_head_sha` is optional — the merged PR's `head.sha` (already parsed
+# into $PR_HEAD_SHA at the top of this script). When it is supplied AND the
+# local branch tip equals it, every commit on the branch was part of the
+# merged PR, so `git branch -D` (force) is safe even though the branch will
+# never satisfy `git branch --merged` after a squash merge. When it is absent
+# (the pre-#4100 :1455-equivalent caller below) or the tip does not match
+# (unpushed local work), this falls back to the original `git branch -d`
+# behaviour: Git's own "not fully merged" safety net, which keeps the branch
+# and reports it rather than force-deleting.
+#
+# Never fails the cleanup pipeline — always returns 0, warns on errors.
 _maybe_delete_local_branch() {
   local branch="$1"
+  local expected_head_sha="${2:-}"
   if [[ -z "$branch" ]]; then
     return 0
   fi
@@ -1374,11 +1437,43 @@ _maybe_delete_local_branch() {
     info "Local branch '$branch' does not exist — skipping branch delete"
     return 0
   fi
-  if git -C "$REPO_ROOT" branch -d "$branch" 2>/dev/null; then
-    success "Local branch '$branch' deleted"
-  else
-    warning "Could not delete local branch '$branch' (may have unmerged commits — use 'git branch -D' if intentional)"
+  # Never delete the repo's default branch (cheap belt-and-suspenders; the
+  # merged PR's head branch should never legitimately BE the default branch,
+  # but a misdetected $PR_BRANCH must not take this out).
+  if [[ -n "$DEFAULT_BRANCH_NAME" && "$branch" == "$DEFAULT_BRANCH_NAME" ]] || \
+     [[ "$branch" == "main" ]] || [[ "$branch" == "master" ]]; then
+    warning "Refusing to delete local branch '$branch' — it is the repository's default branch"
+    return 0
   fi
+
+  local delete_flag="-d"
+  local safety_note=""
+  if [[ -n "$expected_head_sha" ]]; then
+    local local_tip
+    local_tip="$(git -C "$REPO_ROOT" rev-parse --verify -q "refs/heads/$branch" 2>/dev/null || echo "")"
+    if [[ -n "$local_tip" ]] && [[ "$local_tip" == "$expected_head_sha" ]]; then
+      delete_flag="-D"
+      safety_note=" (tip matches merged PR head SHA — safe force-delete)"
+    fi
+  fi
+
+  local delete_output
+  if delete_output="$(git -C "$REPO_ROOT" branch "$delete_flag" "$branch" 2>&1)"; then
+    success "Local branch '$branch' deleted$safety_note"
+    return 0
+  fi
+
+  # Distinguish "checked out somewhere" (current HEAD or another worktree)
+  # from a genuine "not fully merged" refusal — the former gets a specific
+  # message instead of the generic unmerged-commits warning (#4100 AC #4).
+  if echo "$delete_output" | grep -qiE "checked out at|is currently checked out|used by worktree"; then
+    warning "Could not delete local branch '$branch' — it is checked out (current HEAD or another worktree)"
+  elif [[ "$delete_flag" == "-d" ]]; then
+    warning "Could not delete local branch '$branch' (may have unpushed commits — use 'git branch -D $branch' if intentional)"
+  else
+    warning "Could not delete local branch '$branch': $delete_output"
+  fi
+  return 0
 }
 
 # _remove_loom_worktree <path> [allow_unmanaged]
@@ -1461,12 +1556,14 @@ _remove_loom_worktree() {
 
 if [[ "$CLEANUP_WORKTREE" == "true" ]]; then
   if [[ "${LOOM_PRESERVE_WORKTREE:-0}" == "1" ]]; then
-    info "Worktree cleanup skipped (LOOM_PRESERVE_WORKTREE=1)"
+    info "Worktree cleanup skipped (LOOM_PRESERVE_WORKTREE=1) — local branch left in place"
   elif [[ -n "$WORKTREE_PATH_OVERRIDE" ]]; then
     # Explicit operator opt-in: bypass the sentinel guard for THIS path only.
     # The path was already validated at parse time (exists + is a registered
     # worktree of this repo). _remove_loom_worktree will also delete the
-    # matching local branch via `git branch -d` (refuses on unmerged commits).
+    # matching local branch via `git branch -d` (refuses on unmerged commits)
+    # — this is the pre-#4100 caller, so no head-SHA safety check is passed;
+    # behaviour is unchanged from before #4100.
     info "Cleanup target overridden by --worktree-path: $WORKTREE_PATH_OVERRIDE"
     _remove_loom_worktree "$WORKTREE_PATH_OVERRIDE" "true"
   else
@@ -1509,7 +1606,21 @@ if [[ "$CLEANUP_WORKTREE" == "true" ]]; then
         info "No worktree found at $DEFAULT_WT_PATH (and none tracking '$PR_BRANCH' in 'git worktree list')"
       fi
     fi
+    # Local-branch delete (#4100): the default-convention path, the
+    # discovered-Loom-managed-non-standard-path, and the no-worktree-at-all
+    # case (rows 2-4 of the issue's path table) all funnel through here —
+    # none of them call _maybe_delete_local_branch internally the way the
+    # --worktree-path override does above. Passing $PR_HEAD_SHA lets the
+    # helper safely `-D` a branch whose tip matches the merged PR (the only
+    # criterion that is correct after a squash merge — `git branch --merged`
+    # is not). If the discovered worktree above was user-owned and left in
+    # place, its branch is still checked out there, so this call is a
+    # harmless no-op that reports the specific "checked out" refusal instead
+    # of attempting a real delete.
+    _maybe_delete_local_branch "$PR_BRANCH" "$PR_HEAD_SHA"
   fi
+else
+  info "Worktree cleanup skipped (--no-cleanup-worktree) — local branch left in place"
 fi
 
 success "Done"
