@@ -1131,6 +1131,15 @@ async fn main() -> Result<()> {
             work_finder::resolve_cpu_utilization_target(&work_finder_config);
         let cpu_est_cores_per_sweep =
             work_finder::resolve_cpu_est_cores_per_sweep(&work_finder_config);
+        // Per-tick admission (ramp) cap (#4234): resolved once at startup from
+        // the same `work_finder_config`, precedence env > config > default —
+        // the same startup-capture pattern as the CPU knobs above. Bounds how
+        // many *new* sweeps a single tick may admit, independent of how large
+        // the dynamic cap computes to that tick — see
+        // `work_finder::WORK_FINDER_MAX_ADMISSIONS_PER_TICK_ENV` for the full
+        // ramp-lag rationale (#4231's second wave).
+        let max_admissions_per_tick =
+            work_finder::resolve_max_admissions_per_tick_with_config(&work_finder_config);
         // #4084: hold new dispatch off a root while its build-gate run is in
         // flight, so a fresh sweep build does not race the gate's own build for
         // cores (the contention that timed the gate out under #4073's mild
@@ -1143,6 +1152,7 @@ async fn main() -> Result<()> {
             "work_finder: enabled (multi-workspace, interval={}s, configured_max={configured_max}, \
              per_token_concurrency={per_token_concurrency}, cpu_utilization_target={cpu_utilization_target}, \
              cpu_est_cores_per_sweep={cpu_est_cores_per_sweep}, \
+             max_admissions_per_tick={max_admissions_per_tick}, \
              dynamic cap = min(healthy tokens × per-token, disk, cpu, configured_max), \
              global across workspaces)",
             interval.as_secs()
@@ -1158,6 +1168,7 @@ async fn main() -> Result<()> {
             per_token_concurrency,
             cpu_utilization_target,
             cpu_est_cores_per_sweep,
+            max_admissions_per_tick,
             workspace_health_states.clone(),
             suppress_dispatch_during_gate,
             event_bus.clone(),

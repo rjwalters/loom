@@ -36,6 +36,7 @@
 //! | `daemon.drain.completed` | Drain supervisor | `{in_flight}` (always 0) |
 //! | `daemon.drain.aborted`   | Daemon (IPC) | `{was_draining}` |
 //! | `daemon.drain.timeout`   | Drain supervisor | `{in_flight, forced, cancelled?}` |
+//! | `daemon.dispatch.headroom_advisory` | Daemon (IPC, `dispatch_sweep`) | `{repo_root, low_headroom, occupancy, dynamic_cap, cpu_headroom, disk_headroom, token_axis_limit, message}` |
 //!
 //! New topics require a follow-up issue — the taxonomy is intentionally
 //! pinned. The four `epic.issue.{N}.*` topics were authorized by **#3873**
@@ -45,7 +46,13 @@
 //! token-capacity backpressure advisory (fired on pressure state change). The
 //! four `daemon.drain.*` topics were authorized by **#4090** for the scheduled
 //! drain-and-restart primitive (started / completed / aborted / timeout). The
-//! bus accepts arbitrary topic
+//! `daemon.dispatch.headroom_advisory` topic was authorized by **#4234**
+//! (decomposed from #4231) for the `dispatch_sweep` IPC handler's
+//! advisory-first headroom consult — fired on a state change into/out of
+//! "occupancy at or over the dynamic concurrency cap," mirroring
+//! `daemon.capacity.advisory`'s dedup discipline but scoped to a single
+//! dispatch request rather than the work finder's periodic tick. The bus
+//! accepts arbitrary topic
 //! strings (`publish` does not reject unknown topics) so the publisher side
 //! stays open for future extension, but the documented taxonomy is the
 //! contract subscribers should rely on.

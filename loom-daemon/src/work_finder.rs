@@ -150,6 +150,49 @@ pub const PER_TOKEN_CONCURRENCY_ENV: &str = "LOOM_PER_TOKEN_CONCURRENCY";
 /// kicks in when concurrency demand exceeds the healthy-account count.
 pub const DEFAULT_PER_TOKEN_CONCURRENCY: usize = 2;
 
+/// Environment variable setting the **per-tick admission cap** (#4234, Gap 3 of
+/// the #4231 decomposition).
+///
+/// [`resolve_dynamic_max_concurrent`] is a **live** ceiling — recomputed every
+/// tick from the token pool, disk, and CPU/load axes — so it can *jump*
+/// tick-to-tick (e.g. several exhausted token accounts resetting at once
+/// raises the token axis from ~2 to ~14). Before #4234 a jump like that let a
+/// single tick admit every newly-eligible candidate up to the new, larger cap
+/// in one shot: `loadavg`/idle-fraction is a **lagging** signal sampled at
+/// wave-*start*, so a burst admitted together all ramp their builds minutes
+/// later, well after the tick that "safely" admitted them observed a
+/// still-quiet host. This is the exact ramp-lag failure mode from the #4231
+/// incident's second wave (host re-spiked at 01:41 after load had already
+/// dropped to 8 — the admission had already happened by the time load caught
+/// up). This knob bounds **how many *new* sweeps one tick may admit**,
+/// independent of how large `max_concurrent` computes to that tick, forcing a
+/// large jump to ramp up over several ticks instead of one — each subsequent
+/// tick re-samples CPU/disk/token headroom fresh, so a ramp that turns out to
+/// be too aggressive self-corrects within one interval
+/// ([`DEFAULT_WORK_FINDER_INTERVAL_SECS`], default 60s) rather than in one
+/// uncontrolled burst.
+///
+/// Precedence is the standard **env > config
+/// (`autonomous.workFinder.maxAdmissionsPerTick`) > default**, resolved once at
+/// daemon startup via [`read_work_finder_config`] → `config_resolver` — the
+/// same startup-capture pattern as `cpuUtilizationTarget` / `estCoresPerSweep`
+/// (#4032): the *inputs* (occupancy, live headroom) are re-read every tick, but
+/// this *knob* takes effect only on daemon restart unless a future change
+/// moves knob resolution into the tick loop itself. A zero/unparseable value is
+/// dropped (falls through to config/default) — a zero cap would silently
+/// freeze the loop at its current occupancy forever, which is a footgun, not a
+/// deliberate "pause" (use the main-health-gate halt or a scheduled drain for
+/// that instead).
+pub const WORK_FINDER_MAX_ADMISSIONS_PER_TICK_ENV: &str =
+    "LOOM_WORK_FINDER_MAX_ADMISSIONS_PER_TICK";
+
+/// Default per-tick admission cap (#4234). `3` mirrors
+/// [`DEFAULT_WORK_FINDER_MAX_CONCURRENT`] — the same conservative magnitude
+/// that would have kept the #4231 6-way fan-out from admitting more than half
+/// its sweeps in a single tick even if every other axis (token/disk/cpu) had
+/// momentarily computed room for all six.
+pub const DEFAULT_MAX_ADMISSIONS_PER_TICK: usize = 3;
+
 /// Labels that disqualify an issue from dispatch even if it still appears in
 /// the `loom:issue`-filtered listing.
 ///
@@ -398,6 +441,13 @@ pub struct TickReport {
     pub skipped_in_flight: usize,
     /// Issues deferred to a future tick because the concurrency cap was reached.
     pub deferred_capacity: usize,
+    /// Issues deferred to a future tick because the **per-tick admission cap**
+    /// (#4234, `max_admissions_per_tick`) was reached, independent of
+    /// `deferred_capacity` — this fires even when `max_concurrent` computes
+    /// large enough to admit them (e.g. a token-axis jump), because the ramp
+    /// cap deliberately smooths *how fast* new sweeps are admitted rather than
+    /// how many may run concurrently. See [`WORK_FINDER_MAX_ADMISSIONS_PER_TICK_ENV`].
+    pub deferred_ramp_cap: usize,
     /// Issues skipped because they are quarantined for repeated insta-crashing
     /// (Issue #3939). Filtered out before the concurrency budget is allocated, so
     /// a quarantined candidate never consumes a shared dispatch slot.
@@ -460,11 +510,43 @@ pub struct TickReport {
 /// Propagates a source (`list_ready_issues`) error so the caller can log it and
 /// retry next tick. Individual dispatch errors are logged and counted in
 /// [`TickReport::errors`] rather than aborting the tick.
+///
+/// Unlimited-admission convenience wrapper over
+/// [`tick_with_admission_cap`] — callers that don't need the #4234 per-tick
+/// ramp cap (most existing tests, and any caller predating #4234) get
+/// byte-for-byte the pre-#4234 behavior.
 pub fn tick(
     source: &mut impl WorkSource,
     dispatcher: &mut impl WorkDispatcher,
     max_concurrent: usize,
     halted: bool,
+) -> Result<TickReport> {
+    tick_with_admission_cap(source, dispatcher, max_concurrent, halted, usize::MAX)
+}
+
+/// Like [`tick`], but additionally bounds how many **new** sweeps this single
+/// tick may admit to `max_admissions_per_tick`, independent of
+/// `max_concurrent` (#4234, Gap 3 of the #4231 decomposition — see
+/// [`WORK_FINDER_MAX_ADMISSIONS_PER_TICK_ENV`] for the full ramp-lag
+/// rationale). `usize::MAX` (what [`tick`] passes) disables the ramp cap
+/// entirely, reducing to the pre-#4234 behavior.
+///
+/// The two caps are independent and both apply: `occupancy >= max_concurrent`
+/// defers to [`TickReport::deferred_capacity`] (the existing concurrency
+/// ceiling); a *separate* `admitted_this_tick >= max_admissions_per_tick`
+/// defers to [`TickReport::deferred_ramp_cap`] (the new ramp limiter) even
+/// when `max_concurrent` still has room. Both checks run every candidate, so a
+/// tick can produce both kinds of deferral in the same pass.
+///
+/// # Errors
+///
+/// Same as [`tick`].
+pub fn tick_with_admission_cap(
+    source: &mut impl WorkSource,
+    dispatcher: &mut impl WorkDispatcher,
+    max_concurrent: usize,
+    halted: bool,
+    max_admissions_per_tick: usize,
 ) -> Result<TickReport> {
     let ready = source.list_ready_issues()?;
     let mut report = TickReport {
@@ -489,6 +571,10 @@ pub fn tick(
     // sweep past its startup-proof grace window. `in_flight` itself stays the
     // full dedup set for the `contains()` check below.
     let mut occupancy = dispatcher.occupancy();
+    // Ramp-admission counter (#4234): distinct from `occupancy` — this counts
+    // only sweeps admitted *this tick*, reset every call, whereas `occupancy`
+    // carries forward prior ticks' still-running sweeps.
+    let mut admitted_this_tick: usize = 0;
 
     for item in ready {
         // 1. Defensive skip-label filter (stale forge cache).
@@ -525,12 +611,22 @@ pub fn tick(
             report.deferred_capacity += 1;
             continue;
         }
+        // 3b. Per-tick admission (ramp) cap (#4234) — independent of the
+        //     concurrency cap above: even when `max_concurrent` has room, this
+        //     tick may not admit more than `max_admissions_per_tick` *new*
+        //     sweeps, so a sudden jump in the concurrency cap ramps up over
+        //     several ticks instead of bursting in one.
+        if admitted_this_tick >= max_admissions_per_tick {
+            report.deferred_ramp_cap += 1;
+            continue;
+        }
         // 4. Dispatch. The registry's idempotency key + claim lock make a
         //    double-dispatch of an already-running issue a no-op / loud error.
         match dispatcher.dispatch(item.number) {
             Ok(true) => {
                 report.dispatched += 1;
                 occupancy += 1;
+                admitted_this_tick += 1;
             }
             Ok(false) => {
                 // Idempotency no-op: a sweep with the same key was already
@@ -671,11 +767,31 @@ pub fn dispatch_held_per_root_with_drain(
         .collect()
 }
 
+/// Unlimited-admission convenience wrapper over
+/// [`tick_multi_with_admission_cap`] — see [`tick`] / [`tick_with_admission_cap`]
+/// for the single-workspace analogue and the #4234 rationale.
 pub fn tick_multi<S: WorkSource, D: WorkDispatcher>(
     workspaces: &mut [(S, D)],
     priorities: &[u32],
     max_concurrent: usize,
     halted: &[bool],
+) -> TickReport {
+    tick_multi_with_admission_cap(workspaces, priorities, max_concurrent, halted, usize::MAX)
+}
+
+/// Like [`tick_multi`], but additionally bounds how many **new** sweeps this
+/// single tick may admit — **across every workspace, one shared counter** —
+/// to `max_admissions_per_tick` (#4234). Mirrors
+/// [`tick_with_admission_cap`]'s two-independent-caps design: the existing
+/// shared `max_concurrent` budget and the new ramp cap both apply, and either
+/// alone can defer a candidate. `usize::MAX` (what [`tick_multi`] passes)
+/// disables the ramp cap, reducing to the pre-#4234 behavior.
+pub fn tick_multi_with_admission_cap<S: WorkSource, D: WorkDispatcher>(
+    workspaces: &mut [(S, D)],
+    priorities: &[u32],
+    max_concurrent: usize,
+    halted: &[bool],
+    max_admissions_per_tick: usize,
 ) -> TickReport {
     use crate::workspace_registry::DEFAULT_WORKSPACE_PRIORITY;
 
@@ -789,6 +905,11 @@ pub fn tick_multi<S: WorkSource, D: WorkDispatcher>(
     // Global priority sort (#3946): (workspace priority, urgent, age, number).
     candidates.sort_by(candidate_cmp);
 
+    // Ramp-admission counter (#4234), shared across every workspace exactly
+    // like `occupancy` — see `tick_with_admission_cap`'s single-workspace
+    // analogue for the full rationale.
+    let mut admitted_this_tick: usize = 0;
+
     // Pass 2 (mutable dispatcher calls): fill the single shared concurrency
     // budget in the sorted global order, routing each candidate back to its
     // owning workspace's dispatcher.
@@ -800,11 +921,18 @@ pub fn tick_multi<S: WorkSource, D: WorkDispatcher>(
             report.deferred_capacity += 1;
             continue;
         }
+        // Shared global ramp cap (#4234) — independent of the concurrency cap
+        // above; see `tick_with_admission_cap`.
+        if admitted_this_tick >= max_admissions_per_tick {
+            report.deferred_ramp_cap += 1;
+            continue;
+        }
         let dispatcher = &mut workspaces[cand.workspace_idx].1;
         match dispatcher.dispatch(cand.number) {
             Ok(true) => {
                 report.dispatched += 1;
                 occupancy += 1;
+                admitted_this_tick += 1;
             }
             Ok(false) => {
                 report.skipped_in_flight += 1;
@@ -905,6 +1033,10 @@ pub struct WorkFinderConfig {
     /// `autonomous.workFinder.maxConcurrent` — the operator concurrency ceiling
     /// (a zero/invalid value is dropped to `None`).
     pub max_concurrent: Option<usize>,
+    /// `autonomous.workFinder.maxAdmissionsPerTick` — the per-tick ramp
+    /// admission cap (#4234; a zero/invalid value is dropped to `None`). See
+    /// [`WORK_FINDER_MAX_ADMISSIONS_PER_TICK_ENV`] for the full rationale.
+    pub max_admissions_per_tick: Option<usize>,
     /// `autonomous.perTokenConcurrency` — how many concurrent sweeps to allow per
     /// *healthy* token in the dynamic cap (#3947). Note this lives at the
     /// `autonomous` level (not under `workFinder`), so it is read even when no
@@ -979,6 +1111,11 @@ pub fn read_work_finder_config(repo_root: &Path) -> WorkFinderConfig {
             .and_then(serde_json::Value::as_u64)
             .filter(|&n| n > 0)
             .and_then(|n| usize::try_from(n).ok()),
+        max_admissions_per_tick: wf
+            .and_then(|w| w.get("maxAdmissionsPerTick"))
+            .and_then(serde_json::Value::as_u64)
+            .filter(|&n| n > 0)
+            .and_then(|n| usize::try_from(n).ok()),
         per_token_concurrency,
         cpu_utilization_target,
         est_cores_per_sweep,
@@ -1013,6 +1150,35 @@ pub fn resolve_max_concurrent_with_config(config: &WorkFinderConfig) -> usize {
     env_max_concurrent()
         .or(config.max_concurrent)
         .unwrap_or(DEFAULT_WORK_FINDER_MAX_CONCURRENT)
+}
+
+/// Env override for the per-tick admission (ramp) cap — `None` when unset,
+/// zero, or unparseable (a zero cap would freeze the loop, see
+/// [`WORK_FINDER_MAX_ADMISSIONS_PER_TICK_ENV`]).
+fn env_max_admissions_per_tick() -> Option<usize> {
+    std::env::var(WORK_FINDER_MAX_ADMISSIONS_PER_TICK_ENV)
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|&n| n > 0)
+}
+
+/// Resolve the per-tick admission (ramp) cap with precedence **env > config
+/// (`autonomous.workFinder.maxAdmissionsPerTick`) > default** (#4234).
+/// Resolved once at daemon startup — the same startup-capture pattern as
+/// [`resolve_cpu_utilization_target`] / [`resolve_cpu_est_cores_per_sweep`]
+/// (#4032) — and threaded through to [`spawn_work_finder_task`] /
+/// [`spawn_multi_work_finder_task`] as a plain `usize`, mirroring
+/// `per_token_concurrency`. See [`WORK_FINDER_MAX_ADMISSIONS_PER_TICK_ENV`] for
+/// why this is a deliberate startup-capture, not a per-tick re-read: the ramp
+/// cap's whole purpose is to smooth admission *within* the live per-tick
+/// re-computation of `max_concurrent`, so it does not itself need to be live —
+/// an operator retuning it takes effect on the next daemon restart, exactly
+/// like `configured_max` / `per_token_concurrency` today.
+#[must_use]
+pub fn resolve_max_admissions_per_tick_with_config(config: &WorkFinderConfig) -> usize {
+    env_max_admissions_per_tick()
+        .or(config.max_admissions_per_tick)
+        .unwrap_or(DEFAULT_MAX_ADMISSIONS_PER_TICK)
 }
 
 /// Env override for the per-token concurrency factor — `None` when unset, zero,
@@ -1150,6 +1316,7 @@ pub fn spawn_work_finder_task<S, D>(
     per_token_concurrency: usize,
     cpu_utilization_target: f64,
     cpu_est_cores_per_sweep: f64,
+    max_admissions_per_tick: usize,
     health_state: Arc<MainHealthState>,
     suppress_dispatch_during_gate: bool,
     event_bus: Arc<EventBus>,
@@ -1161,6 +1328,7 @@ where
     log::info!(
         "work_finder: starting loop (interval={}s, configured_max={configured_max}, \
          per_token_concurrency={per_token_concurrency}, \
+         max_admissions_per_tick={max_admissions_per_tick}, \
          dynamic cap = min(healthy tokens × per-token, disk, cpu, configured_max))",
         interval.as_secs()
     );
@@ -1179,6 +1347,14 @@ where
         // add-capacity advisory / recovery fires only on state change, never
         // every tick.
         let mut was_pressured = false;
+        // Axis-visibility state (#4234): promote the per-tick axis line from
+        // `debug!` to `info!` only when the computed cap actually **changes**
+        // value tick-to-tick — mirrors the state-change-dedup discipline
+        // `was_pressured` already applies to the capacity advisory, so an
+        // operator watching the log at default level sees every meaningful cap
+        // move (e.g. the token axis jumping from a batch of account resets)
+        // without a steady-state stream of identical lines every interval.
+        let mut was_max_concurrent: Option<usize> = None;
         loop {
             ticker.tick().await;
             // Reactive main-health backstop (Phase C, #3812): skip all dispatch
@@ -1203,7 +1379,16 @@ where
             // back to the policy floor of 1 (soft backoff, never a hard halt).
             // `cpu_utilization_target` / `cpu_est_cores_per_sweep` are resolved
             // once at startup (env > config > default, #4032) and captured by
-            // this task, mirroring `per_token_concurrency`.
+            // this task, mirroring `per_token_concurrency`. NOTE (#4234): a
+            // release-build-heavy repo should raise `estCoresPerSweep` well
+            // above the shipped default of 2.0 — a `cargo build --release`
+            // parallelizes across every core via rustc codegen units, so 6
+            // concurrent release builds demand far closer to `6 × ncpu` than
+            // `6 × 2`. The per-tick `max_admissions_per_tick` ramp cap below is
+            // a second, independent backstop for exactly this under-estimate:
+            // even if `estCoresPerSweep` is miscalibrated too low and the cpu
+            // axis over-admits, the ramp cap still bounds how many of those
+            // over-admitted sweeps land in any single tick.
             let cpu = tokio::task::spawn_blocking(move || {
                 cpu_headroom_limit(cpu_utilization_target, cpu_est_cores_per_sweep)
             })
@@ -1216,12 +1401,25 @@ where
                 cpu,
                 configured_max,
             );
-            log::debug!(
+            let axis_line = format!(
                 "work_finder: dynamic cap = {max_concurrent} (pool={pool_size}, \
                  healthy_tokens={token_limit}, per_token={per_token_concurrency}, disk={disk}, \
-                 cpu={cpu}, configured_max={configured_max}, halted={halted})"
+                 cpu={cpu}, configured_max={configured_max}, \
+                 max_admissions_per_tick={max_admissions_per_tick}, halted={halted})"
             );
-            match tick(&mut source, &mut dispatcher, max_concurrent, halted) {
+            if was_max_concurrent != Some(max_concurrent) {
+                log::info!("{axis_line}");
+                was_max_concurrent = Some(max_concurrent);
+            } else {
+                log::debug!("{axis_line}");
+            }
+            match tick_with_admission_cap(
+                &mut source,
+                &mut dispatcher,
+                max_concurrent,
+                halted,
+                max_admissions_per_tick,
+            ) {
                 Ok(report) => {
                     if report.halted && !was_halted {
                         log::warn!(
@@ -1238,14 +1436,16 @@ where
                         || report.skipped_quarantined > 0
                         || report.skipped_pr_open > 0
                         || report.skipped_peer_claim > 0
+                        || report.deferred_ramp_cap > 0
                     {
                         log::info!(
                             "work_finder: tick — cap {max_concurrent} (pool={pool_size}, \
                              healthy={token_limit}, per_token={per_token_concurrency}, disk={disk}, \
-                             cpu={cpu}, ceiling={configured_max}); \
+                             cpu={cpu}, ceiling={configured_max}, ramp_cap={max_admissions_per_tick}); \
                              {} seen, {} dispatched, {} labeled-skip, {} in-flight-skip, \
                              {} quarantine-skip, {} pr-open-skip, {} peer-claim-skip, \
-                             {} deferred, {} error(s), {} cross-host-collision(s)",
+                             {} deferred (capacity), {} deferred (ramp), {} error(s), \
+                             {} cross-host-collision(s)",
                             report.seen,
                             report.dispatched,
                             report.skipped_labeled,
@@ -1254,6 +1454,7 @@ where
                             report.skipped_pr_open,
                             report.skipped_peer_claim,
                             report.deferred_capacity,
+                            report.deferred_ramp_cap,
                             report.errors,
                             report.collisions
                         );
@@ -1328,6 +1529,7 @@ pub fn spawn_multi_work_finder_task(
     per_token_concurrency: usize,
     cpu_utilization_target: f64,
     cpu_est_cores_per_sweep: f64,
+    max_admissions_per_tick: usize,
     health_states: Arc<WorkspaceHealthStates>,
     suppress_dispatch_during_gate: bool,
     event_bus: Arc<EventBus>,
@@ -1335,7 +1537,7 @@ pub fn spawn_multi_work_finder_task(
 ) -> tokio::task::JoinHandle<()> {
     log::info!(
         "work_finder: starting multi-workspace loop (interval={}s, configured_max={configured_max}, \
-         per_token_concurrency={per_token_concurrency}, \
+         per_token_concurrency={per_token_concurrency}, max_admissions_per_tick={max_admissions_per_tick}, \
          dynamic cap = min(healthy tokens × per-token, disk, cpu, configured_max), global across workspaces)",
         interval.as_secs()
     );
@@ -1346,6 +1548,9 @@ pub fn spawn_multi_work_finder_task(
         ticker.tick().await;
         let mut was_halted = false;
         let mut was_pressured = false;
+        // Axis-visibility state (#4234) — see the single-workspace loop above
+        // for the full rationale.
+        let mut was_max_concurrent: Option<usize> = None;
         loop {
             ticker.tick().await;
 
@@ -1418,15 +1623,28 @@ pub fn spawn_multi_work_finder_task(
                 })
                 .collect();
 
-            log::debug!(
+            let axis_line = format!(
                 "work_finder: dynamic cap = {max_concurrent} (pool={pool_size}, \
                  healthy_tokens={token_limit}, per_token={per_token_concurrency}, disk={disk}, \
-                 cpu={cpu}, configured_max={configured_max}, any_halted={any_halted}, \
+                 cpu={cpu}, configured_max={configured_max}, \
+                 max_admissions_per_tick={max_admissions_per_tick}, any_halted={any_halted}, \
                  workspaces={}, priorities={priorities:?})",
                 pairs.len()
             );
+            if was_max_concurrent != Some(max_concurrent) {
+                log::info!("{axis_line}");
+                was_max_concurrent = Some(max_concurrent);
+            } else {
+                log::debug!("{axis_line}");
+            }
 
-            let report = tick_multi(&mut pairs, &priorities, max_concurrent, &halted);
+            let report = tick_multi_with_admission_cap(
+                &mut pairs,
+                &priorities,
+                max_concurrent,
+                &halted,
+                max_admissions_per_tick,
+            );
 
             if report.halted && !was_halted {
                 log::warn!(
@@ -1445,14 +1663,17 @@ pub fn spawn_multi_work_finder_task(
                 || report.skipped_quarantined > 0
                 || report.skipped_pr_open > 0
                 || report.skipped_peer_claim > 0
+                || report.deferred_ramp_cap > 0
             {
                 log::info!(
                     "work_finder: tick — cap {max_concurrent} (pool={pool_size}, \
                      healthy={token_limit}, per_token={per_token_concurrency}, disk={disk}, \
-                     cpu={cpu}, ceiling={configured_max}); {} workspace(s), \
+                     cpu={cpu}, ceiling={configured_max}, ramp_cap={max_admissions_per_tick}); \
+                     {} workspace(s), \
                      {} seen, {} dispatched, {} labeled-skip, {} in-flight-skip, \
                      {} quarantine-skip, {} pr-open-skip, {} peer-claim-skip, \
-                     {} deferred, {} error(s), {} cross-host-collision(s)",
+                     {} deferred (capacity), {} deferred (ramp), {} error(s), \
+                     {} cross-host-collision(s)",
                     pairs.len(),
                     report.seen,
                     report.dispatched,
@@ -1462,6 +1683,7 @@ pub fn spawn_multi_work_finder_task(
                     report.skipped_pr_open,
                     report.skipped_peer_claim,
                     report.deferred_capacity,
+                    report.deferred_ramp_cap,
                     report.errors,
                     report.collisions
                 );
@@ -1991,6 +2213,91 @@ exit 0
         assert_eq!(report.dispatched, 3);
         assert_eq!(report.deferred_capacity, 0);
         assert_eq!(disp.dispatched, vec![1, 2, 3]);
+    }
+
+    // ===================================================================
+    // tick_with_admission_cap — per-tick ramp cap (#4234, Gap 3 of #4231)
+    // ===================================================================
+
+    #[test]
+    fn test_tick_admission_cap_limits_new_dispatches_even_under_large_concurrency_cap() {
+        // 6 ready candidates, plenty of concurrency room (max_concurrent=10),
+        // but the ramp cap only allows 3 *new* admissions this tick — exactly
+        // the #4231 6-way-fan-out scenario: a token-axis jump could make
+        // max_concurrent look like it has room for all 6, but the ramp cap
+        // still bounds the burst.
+        let mut source = FakeSource::once((1..=6).map(issue).collect());
+        let mut disp = RecordingDispatcher::default();
+        let report = tick_with_admission_cap(&mut source, &mut disp, 10, false, 3).unwrap();
+
+        assert_eq!(report.seen, 6);
+        assert_eq!(report.dispatched, 3, "only the ramp cap's worth admitted");
+        assert_eq!(report.deferred_ramp_cap, 3, "the rest deferred to the ramp cap, not capacity");
+        assert_eq!(report.deferred_capacity, 0, "concurrency cap was never the binding constraint");
+        assert_eq!(disp.dispatched, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn test_tick_admission_cap_and_concurrency_cap_are_independent_and_both_apply() {
+        // Concurrency cap (2) is smaller than the ramp cap (5) here, so the
+        // concurrency cap is the one that actually binds — exercising that the
+        // two checks compose rather than one silently overriding the other.
+        let mut source = FakeSource::once((1..=6).map(issue).collect());
+        let mut disp = RecordingDispatcher::default();
+        let report = tick_with_admission_cap(&mut source, &mut disp, 2, false, 5).unwrap();
+
+        assert_eq!(report.dispatched, 2);
+        assert_eq!(report.deferred_capacity, 4, "concurrency cap bound first");
+        assert_eq!(report.deferred_ramp_cap, 0, "ramp cap never reached — occupancy hit 2 first");
+    }
+
+    #[test]
+    fn test_tick_admission_cap_unlimited_reduces_to_plain_tick() {
+        // `tick()` is a thin wrapper passing `usize::MAX` — byte-for-byte the
+        // pre-#4234 unlimited-admission behavior.
+        let mut source_capped = FakeSource::once((1..=4).map(issue).collect());
+        let mut disp_capped = RecordingDispatcher::default();
+        let capped =
+            tick_with_admission_cap(&mut source_capped, &mut disp_capped, 10, false, usize::MAX)
+                .unwrap();
+
+        let mut source_plain = FakeSource::once((1..=4).map(issue).collect());
+        let mut disp_plain = RecordingDispatcher::default();
+        let plain = tick(&mut source_plain, &mut disp_plain, 10, false).unwrap();
+
+        assert_eq!(capped, plain);
+        assert_eq!(disp_capped.dispatched, disp_plain.dispatched);
+    }
+
+    #[test]
+    fn test_tick_multi_admission_cap_shared_across_workspaces() {
+        // Two workspaces, 4 candidates total, ramp cap 2 — the cap is a single
+        // shared counter across both workspaces (mirrors the concurrency cap's
+        // existing shared-budget contract).
+        let source_a = FakeSource::once(vec![issue(1), issue(2)]);
+        let disp_a = RecordingDispatcher::default();
+        let source_b = FakeSource::once(vec![issue(3), issue(4)]);
+        let disp_b = RecordingDispatcher::default();
+        let mut multi = vec![(source_a, disp_a), (source_b, disp_b)];
+
+        let report = tick_multi_with_admission_cap(&mut multi, &[], 10, &[false, false], 2);
+
+        assert_eq!(report.dispatched, 2);
+        assert_eq!(report.deferred_ramp_cap, 2);
+        assert_eq!(report.deferred_capacity, 0);
+    }
+
+    #[test]
+    fn test_tick_admission_cap_zero_defers_everything() {
+        // A ramp cap of 0 admits nothing this tick (still distinct from
+        // `halted`: `seen` reflects the backlog, no main-health warning fires).
+        let mut source = FakeSource::once((1..=3).map(issue).collect());
+        let mut disp = RecordingDispatcher::default();
+        let report = tick_with_admission_cap(&mut source, &mut disp, 10, false, 0).unwrap();
+
+        assert_eq!(report.dispatched, 0);
+        assert_eq!(report.deferred_ramp_cap, 3);
+        assert!(disp.dispatched.is_empty());
     }
 
     #[test]
@@ -3017,7 +3324,7 @@ exit 0
         let tmp = tempfile::tempdir().unwrap();
         write_config(
             tmp.path(),
-            r#"{"autonomous": {"perTokenConcurrency": 4, "cpuUtilizationTarget": 0.6, "estCoresPerSweep": 3.5, "workFinder": {"enabled": true, "intervalSecs": 90, "maxConcurrent": 5}}}"#,
+            r#"{"autonomous": {"perTokenConcurrency": 4, "cpuUtilizationTarget": 0.6, "estCoresPerSweep": 3.5, "workFinder": {"enabled": true, "intervalSecs": 90, "maxConcurrent": 5, "maxAdmissionsPerTick": 4}}}"#,
         );
         assert_eq!(
             read_work_finder_config(tmp.path()),
@@ -3025,6 +3332,7 @@ exit 0
                 enabled: Some(true),
                 interval_secs: Some(90),
                 max_concurrent: Some(5),
+                max_admissions_per_tick: Some(4),
                 per_token_concurrency: Some(4),
                 cpu_utilization_target: Some(0.6),
                 est_cores_per_sweep: Some(3.5),
@@ -3312,6 +3620,57 @@ exit 0
         std::env::set_var(WORK_FINDER_MAX_CONCURRENT_ENV, "nope");
         assert_eq!(resolve_max_concurrent_with_config(&cfg), 8);
         std::env::remove_var(WORK_FINDER_MAX_CONCURRENT_ENV);
+    }
+
+    // ===================================================================
+    // resolve_max_admissions_per_tick_with_config — env > config > default
+    // (#4234)
+    // ===================================================================
+
+    #[test]
+    #[serial]
+    fn test_resolve_max_admissions_per_tick_with_config_precedence() {
+        std::env::remove_var(WORK_FINDER_MAX_ADMISSIONS_PER_TICK_ENV);
+
+        // Default when neither env nor config set.
+        assert_eq!(
+            resolve_max_admissions_per_tick_with_config(&WorkFinderConfig::default()),
+            DEFAULT_MAX_ADMISSIONS_PER_TICK
+        );
+
+        // Config used when env unset.
+        let cfg = WorkFinderConfig {
+            max_admissions_per_tick: Some(7),
+            ..Default::default()
+        };
+        assert_eq!(resolve_max_admissions_per_tick_with_config(&cfg), 7);
+
+        // Env overrides config.
+        std::env::set_var(WORK_FINDER_MAX_ADMISSIONS_PER_TICK_ENV, "1");
+        assert_eq!(resolve_max_admissions_per_tick_with_config(&cfg), 1);
+
+        // A zero/garbage env value is ignored; config still wins over default.
+        std::env::set_var(WORK_FINDER_MAX_ADMISSIONS_PER_TICK_ENV, "0");
+        assert_eq!(resolve_max_admissions_per_tick_with_config(&cfg), 7);
+        std::env::set_var(WORK_FINDER_MAX_ADMISSIONS_PER_TICK_ENV, "nope");
+        assert_eq!(resolve_max_admissions_per_tick_with_config(&cfg), 7);
+        std::env::remove_var(WORK_FINDER_MAX_ADMISSIONS_PER_TICK_ENV);
+    }
+
+    #[test]
+    fn test_read_work_finder_config_parses_max_admissions_per_tick() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_config(tmp.path(), r#"{"autonomous": {"workFinder": {"maxAdmissionsPerTick": 5}}}"#);
+        let cfg = read_work_finder_config(tmp.path());
+        assert_eq!(cfg.max_admissions_per_tick, Some(5));
+    }
+
+    #[test]
+    fn test_read_work_finder_config_drops_zero_max_admissions_per_tick() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_config(tmp.path(), r#"{"autonomous": {"workFinder": {"maxAdmissionsPerTick": 0}}}"#);
+        let cfg = read_work_finder_config(tmp.path());
+        assert_eq!(cfg.max_admissions_per_tick, None, "a zero cap is treated as absent");
     }
 
     #[test]
