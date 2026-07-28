@@ -47,6 +47,18 @@ HOOK_ERROR_LOG="${SCRIPT_DIR}/../logs/hook-errors.log"
 # decision_log_enabled() below.
 DECISION_LOG="${LOOM_GUARD_DECISION_LOG_FILE:-${SCRIPT_DIR}/../logs/guard-decisions.log}"
 
+# Shared config-tier resolver (#4063). Source defaults/scripts/lib/config-resolver.sh
+# so decision_log_enabled() below reads the full config tier chain through the
+# same code path as guard-destructive-generic.sh (kept consistent between the two
+# guards). At runtime SCRIPT_DIR is .loom/hooks/ and .loom/scripts is a symlink to
+# defaults/scripts, so ../scripts/lib resolves. Best-effort: a missing/unsourceable
+# lib leaves loom_config_get undefined and the reader's `|| raw=false` fallback
+# preserves the guard-OFF default.
+if [[ -f "$SCRIPT_DIR/../scripts/lib/config-resolver.sh" ]]; then
+    # shellcheck source=/dev/null
+    source "$SCRIPT_DIR/../scripts/lib/config-resolver.sh" 2>/dev/null || true
+fi
+
 # Log a diagnostic error message (best-effort, never fails the script)
 log_hook_error() {
     local msg="$1"
@@ -110,12 +122,15 @@ strip_literal_text() {
 _DECISION_LOG_CACHE=""
 decision_log_enabled() {
     if [[ -z "$_DECISION_LOG_CACHE" ]]; then
-        local enabled=false
-        if [[ -n "$REPO_ROOT" && -f "$REPO_ROOT/.loom/config.json" ]]; then
-            # Only an explicit `true` enables; a missing key or malformed JSON
-            # (jq non-zero, caught by ||) stays OFF.
-            enabled=$(jq -r 'if .guards.decisionLog == true then "true" else "false" end' "$REPO_ROOT/.loom/config.json" 2>/dev/null) || enabled=false
-            [[ -n "$enabled" ]] || enabled=false
+        local enabled=false raw
+        if [[ -n "$REPO_ROOT" ]]; then
+            # Migrated to the shared tier resolver (#4063), kept consistent with
+            # guard-destructive-generic.sh's decision_log_enabled(). INVERSE
+            # polarity: only an explicit boolean `true` enables; a missing/null
+            # key, a non-boolean value, or malformed JSON stays OFF via the
+            # "false" default and the `|| raw=false` fallback.
+            raw=$(loom_config_get "$REPO_ROOT" "guards.decisionLog" "false" 2>/dev/null) || raw=false
+            [[ "$raw" == "true" ]] && enabled=true
         fi
         # Env override wins over config.
         case "${LOOM_GUARD_DECISION_LOG:-}" in

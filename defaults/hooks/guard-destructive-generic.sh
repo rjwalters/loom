@@ -223,6 +223,28 @@ fi
 # commands (each entry is a full-generality bypass for that command word).
 # =============================================================================
 
+# CARVE-OUT (#4063): the three fast-path readers below — fastpath_config_file,
+# fastpath_enabled, fastpath_extra_admits — are deliberately NOT migrated to the
+# shared config-resolver.sh (loom_config_get / loom_resolve_config) that the
+# cold-path toggles use. This is intentional and preserves issue #3687's fork
+# budget:
+#   * This block can `exit 0` (silent allow) BEFORE REPO_ROOT is resolved — the
+#     `git -C "$CWD" rev-parse --show-toplevel` fork lives strictly below the
+#     fast-path dispatch. loom_resolve_config REQUIRES a repo_root as its first
+#     argument, so routing these through it would force hoisting that git
+#     rev-parse above the fast-path exit, directly regressing #3687 (which
+#     removed it from the pre-admission path).
+#   * fastpath_config_file is a fork-free bash-builtin upward directory walk;
+#     fastpath_enabled / fastpath_extra_admits each cost exactly one CACHED jq.
+#     loom_config_get is uncached and forks jq once per existing tier file plus a
+#     merge (~3 forks today, more as Epic #3835 lands upper tiers) on EVERY call —
+#     a 3x+ regression on a hook that fires before every Bash tool call. Caching
+#     the merge (Option B) still needs a repo_root, and teaching the resolver a
+#     fork-free upward-walk root discovery (Option C) would break the documented
+#     three-language (Rust/Python/Bash) conformance-fixture contract in
+#     config-resolver.sh's header. So the fast path keeps its direct single-jq
+#     read of the nearest .loom/config.json. See #4063 for the full analysis.
+#
 # Locate the nearest .loom/config.json by walking up from CWD, fork-free (no
 # git rev-parse). Cached. Best-effort: empty when none is found.
 _FASTPATH_CFG_FILE=""
@@ -393,6 +415,25 @@ elif [[ -n "$CWD" ]]; then
     log_hook_error "cwd does not exist: $CWD — skipping repo root resolution"
 fi
 
+# Shared config-tier resolver (#4063). Source defaults/scripts/lib/config-resolver.sh
+# — deliberately sourced HERE, strictly below the #3687 fast-path dispatch and
+# REPO_ROOT resolution above, so a fast-pathed command pays ZERO added cost (not
+# even the `[[ -f ]]` stat below) — this is the cold path only. At runtime
+# SCRIPT_DIR is the installed hook dir (.loom/hooks/), and .loom/scripts is a
+# symlink to defaults/scripts, so ../scripts/lib resolves; in the test harness
+# SCRIPT_DIR is defaults/hooks/ and the sibling path resolves directly. The
+# COLD-PATH toggle readers below (sql/cloud/reversibleGh/decisionLog/rmScope/
+# forceScope + worktree.root) call loom_config_get through this so a single code
+# path reads the full tier chain (legacy .loom/config.json plus the #4039
+# project/local tiers) and stays byte-for-byte in lockstep with loom-daemon and
+# loom_tools. Best-effort: a missing/unsourceable lib leaves loom_config_get
+# undefined, and each reader's `|| <default>` fallback then preserves that
+# guard's safe default, so the guard never breaks.
+if [[ -f "$SCRIPT_DIR/../scripts/lib/config-resolver.sh" ]]; then
+    # shellcheck source=/dev/null
+    source "$SCRIPT_DIR/../scripts/lib/config-resolver.sh" 2>/dev/null || true
+fi
+
 # =============================================================================
 # SQL DDL/DML guard toggle — default ON.
 #
@@ -417,14 +458,18 @@ fi
 _SQL_GUARD_CACHE=""
 sql_guard_enabled() {
     if [[ -z "$_SQL_GUARD_CACHE" ]]; then
-        local enabled=true
-        if [[ -n "$REPO_ROOT" && -f "$REPO_ROOT/.loom/config.json" ]]; then
-            # jq // is alternative-on-null, not default-on-missing, so use
-            # if/then/else to treat only an explicit `false` as disabled (a
-            # missing guards.sqlDdl key stays on). On malformed JSON jq exits
-            # non-zero and the `||` fallback restores the guard-ON default.
-            enabled=$(jq -r 'if .guards.sqlDdl == false then "false" else "true" end' "$REPO_ROOT/.loom/config.json" 2>/dev/null) || enabled=true
-            [[ -n "$enabled" ]] || enabled=true
+        local enabled=true raw
+        if [[ -n "$REPO_ROOT" ]]; then
+            # Migrated to the shared tier resolver (#4063). loom_config_get
+            # collapses null and missing to the default, so we KEEP the exact
+            # polarity in bash: only an explicit boolean `false` disables — a
+            # missing/null key OR a non-boolean value (e.g. "yes") stays guard-ON,
+            # matching the old `.guards.sqlDdl == false` test. `|| raw=true` also
+            # covers config-resolver.sh failing to source (loom_config_get unset)
+            # and malformed JSON (the resolver soft-reads a bad tier as {} → the
+            # key resolves absent → default "true").
+            raw=$(loom_config_get "$REPO_ROOT" "guards.sqlDdl" "true" 2>/dev/null) || raw=true
+            [[ "$raw" == "false" ]] && enabled=false
         fi
         # Env override wins over config.
         case "${LOOM_GUARD_SQL:-}" in
@@ -460,14 +505,14 @@ sql_guard_enabled() {
 _CLOUD_GUARD_CACHE=""
 cloud_guard_enabled() {
     if [[ -z "$_CLOUD_GUARD_CACHE" ]]; then
-        local enabled=true
-        if [[ -n "$REPO_ROOT" && -f "$REPO_ROOT/.loom/config.json" ]]; then
-            # jq // is alternative-on-null, not default-on-missing, so use
-            # if/then/else to treat only an explicit `false` as disabled (a
-            # missing guards.cloudCli key stays on). On malformed JSON jq exits
-            # non-zero and the `||` fallback restores the guard-ON default.
-            enabled=$(jq -r 'if .guards.cloudCli == false then "false" else "true" end' "$REPO_ROOT/.loom/config.json" 2>/dev/null) || enabled=true
-            [[ -n "$enabled" ]] || enabled=true
+        local enabled=true raw
+        if [[ -n "$REPO_ROOT" ]]; then
+            # Migrated to the shared tier resolver (#4063), same polarity as
+            # sql_guard_enabled(): only an explicit boolean `false` disables; a
+            # missing/null key, a non-boolean value, or malformed JSON stays
+            # guard-ON via the "true" default and the `|| raw=true` fallback.
+            raw=$(loom_config_get "$REPO_ROOT" "guards.cloudCli" "true" 2>/dev/null) || raw=true
+            [[ "$raw" == "false" ]] && enabled=false
         fi
         # Env override wins over config.
         case "${LOOM_GUARD_CLOUD:-}" in
@@ -514,14 +559,14 @@ cloud_guard_enabled() {
 _REVERSIBLE_GH_GUARD_CACHE=""
 reversible_gh_guard_enabled() {
     if [[ -z "$_REVERSIBLE_GH_GUARD_CACHE" ]]; then
-        local enabled=false
-        if [[ -n "$REPO_ROOT" && -f "$REPO_ROOT/.loom/config.json" ]]; then
-            # jq // is alternative-on-null, not default-on-missing, so use
-            # if/then/else to treat only an explicit `true` as enabled (a
-            # missing guards.reversibleGh key stays off). On malformed JSON jq
-            # exits non-zero and the `||` fallback restores the guard-OFF default.
-            enabled=$(jq -r 'if .guards.reversibleGh == true then "true" else "false" end' "$REPO_ROOT/.loom/config.json" 2>/dev/null) || enabled=false
-            [[ -n "$enabled" ]] || enabled=false
+        local enabled=false raw
+        if [[ -n "$REPO_ROOT" ]]; then
+            # Migrated to the shared tier resolver (#4063). INVERSE polarity of
+            # sql/cloud: only an explicit boolean `true` enables the ask; a
+            # missing/null key, a non-boolean value, or malformed JSON stays
+            # guard-OFF via the "false" default and the `|| raw=false` fallback.
+            raw=$(loom_config_get "$REPO_ROOT" "guards.reversibleGh" "false" 2>/dev/null) || raw=false
+            [[ "$raw" == "true" ]] && enabled=true
         fi
         # Env override wins over config.
         case "${LOOM_GUARD_REVERSIBLE_GH:-}" in
@@ -563,12 +608,14 @@ reversible_gh_guard_enabled() {
 _DECISION_LOG_CACHE=""
 decision_log_enabled() {
     if [[ -z "$_DECISION_LOG_CACHE" ]]; then
-        local enabled=false
-        if [[ -n "$REPO_ROOT" && -f "$REPO_ROOT/.loom/config.json" ]]; then
-            # Only an explicit `true` enables; a missing key or malformed JSON
-            # (jq non-zero, caught by ||) stays OFF — inverse of sql_guard_enabled().
-            enabled=$(jq -r 'if .guards.decisionLog == true then "true" else "false" end' "$REPO_ROOT/.loom/config.json" 2>/dev/null) || enabled=false
-            [[ -n "$enabled" ]] || enabled=false
+        local enabled=false raw
+        if [[ -n "$REPO_ROOT" ]]; then
+            # Migrated to the shared tier resolver (#4063). INVERSE polarity like
+            # reversible_gh_guard_enabled(): only an explicit boolean `true`
+            # enables; a missing/null key, a non-boolean value, or malformed JSON
+            # stays OFF via the "false" default and the `|| raw=false` fallback.
+            raw=$(loom_config_get "$REPO_ROOT" "guards.decisionLog" "false" 2>/dev/null) || raw=false
+            [[ "$raw" == "true" ]] && enabled=true
         fi
         # Env override wins over config.
         case "${LOOM_GUARD_DECISION_LOG:-}" in
@@ -615,15 +662,18 @@ decision_log_enabled() {
 _RM_SCOPE_CACHE=""
 rm_scope_repo_enabled() {
     if [[ -z "$_RM_SCOPE_CACHE" ]]; then
-        local mode=repo
-        if [[ -n "$REPO_ROOT" && -f "$REPO_ROOT/.loom/config.json" ]]; then
-            # Only an explicit guards.rmScope of "off" or "permissive" opts out
-            # to the legacy permissive behaviour; any other value, a missing
-            # key, or malformed JSON resolves to "repo" (the safe default — the
-            # jq non-zero exit on malformed JSON is caught by the `||`
-            # fallback, which also resolves to repo).
-            mode=$(jq -r 'if (.guards.rmScope == "off" or .guards.rmScope == "permissive") then "off" else "repo" end' "$REPO_ROOT/.loom/config.json" 2>/dev/null) || mode=repo
-            [[ -n "$mode" ]] || mode=repo
+        local mode=repo raw
+        if [[ -n "$REPO_ROOT" ]]; then
+            # Migrated to the shared tier resolver (#4063). This is a string
+            # value, not a boolean, so we read the raw string and keep the
+            # branching in bash: only an explicit "off"/"permissive" opts out;
+            # a missing/null key (→ default "repo"), any other string, or
+            # malformed JSON (→ `|| raw=repo`) resolves to the safe "repo".
+            raw=$(loom_config_get "$REPO_ROOT" "guards.rmScope" "repo" 2>/dev/null) || raw=repo
+            case "$raw" in
+                off|permissive)  mode=off ;;
+                *)               mode=repo ;;
+            esac
         fi
         # Env override wins over config.
         case "${LOOM_RM_SCOPE:-}" in
@@ -648,15 +698,18 @@ resolve_worktree_root() {
         printf '%s/%s' "${LOOM_WORKTREE_ROOT%/}" "$(basename "$repo_root")"
         return 0
     fi
-    # 2. Config key .loom/config.json -> worktree.root (absolute only).
-    local config_file="$repo_root/.loom/config.json"
-    if [[ -f "$config_file" ]]; then
-        local cfg_root
-        cfg_root=$(jq -r '.worktree.root? // empty' "$config_file" 2>/dev/null) || cfg_root=""
-        if [[ -n "$cfg_root" && "$cfg_root" == /* ]]; then
-            printf '%s/%s' "${cfg_root%/}" "$(basename "$repo_root")"
-            return 0
-        fi
+    # 2. Config key worktree.root (absolute only), via the shared tier resolver
+    #    (#4063). Only the config READ is routed through loom_config_get — the
+    #    env/default precedence and the absolute-path gate stay inline so the
+    #    function keeps its self-contained fallback shape. loom_config_get's
+    #    default "" collapses a missing/null key to empty (matching the old
+    #    `.worktree.root? // empty`), and a non-absolute value fails the `== /*`
+    #    gate and falls through to the in-repo default, exactly as before.
+    local cfg_root
+    cfg_root=$(loom_config_get "$repo_root" "worktree.root" "" 2>/dev/null) || cfg_root=""
+    if [[ -n "$cfg_root" && "$cfg_root" == /* ]]; then
+        printf '%s/%s' "${cfg_root%/}" "$(basename "$repo_root")"
+        return 0
     fi
     # 3. Default — in-repo worktrees dir.
     printf '%s/.loom/worktrees' "$repo_root"
@@ -778,14 +831,19 @@ _any_managed_worktree_exists() {
 _FORCE_SCOPE_CACHE=""
 force_scope_mode() {
     if [[ -z "$_FORCE_SCOPE_CACHE" ]]; then
-        local mode=all
-        if [[ -n "$REPO_ROOT" && -f "$REPO_ROOT/.loom/config.json" ]]; then
-            # jq // is alternative-on-null, not default-on-missing, so use an
-            # explicit if/elif/else: only "protected"/"off" opt away from the
-            # default. A missing key, any other value, or malformed JSON (jq
-            # exits non-zero, caught by ||) resolves to "all".
-            mode=$(jq -r 'if (.guards.forceScope == "protected") then "protected" elif (.guards.forceScope == "off") then "off" else "all" end' "$REPO_ROOT/.loom/config.json" 2>/dev/null) || mode=all
-            [[ -n "$mode" ]] || mode=all
+        local mode=all raw
+        if [[ -n "$REPO_ROOT" ]]; then
+            # Migrated to the shared tier resolver (#4063). String value like
+            # guards.rmScope, so read the raw string and branch in bash: only
+            # "protected"/"off" opt away from the default; a missing/null key
+            # (→ default "all"), any other value, or malformed JSON (→ `|| raw=all`)
+            # resolves to "all".
+            raw=$(loom_config_get "$REPO_ROOT" "guards.forceScope" "all" 2>/dev/null) || raw=all
+            case "$raw" in
+                protected)  mode=protected ;;
+                off)        mode=off ;;
+                *)          mode=all ;;
+            esac
         fi
         # Env override wins over config.
         case "${LOOM_FORCE_SCOPE:-}" in
