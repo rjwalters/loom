@@ -128,6 +128,93 @@ def tier_map(config: dict[str, Any] | None = None) -> dict[str, str]:
 
 
 # --------------------------------------------------------------------------- #
+# Complexity-tier → model resolution (issue #4238, "cost-of-being-wrong")
+# --------------------------------------------------------------------------- #
+#
+# The Curator classifies each issue on one axis — *would a mistake be caught?* —
+# and emits a ``<!-- loom:complexity=<tier> -->`` marker. The sweep resolves the
+# dispatched model for that stratum from ``sweep.tierModels[<runtime>][<tier>]``,
+# a runtime-neutral map of logical tiers (``haiku``/``sonnet``/``opus`` for the
+# Claude runtime; a Codex adapter supplies its own IDs under its own runtime key).
+# This is a SEPARATE, higher layer than ``sweep.modelAliases`` (the alias→ID
+# indirection above): the profile/marker picks a *logical tier*, and
+# ``resolve_model`` then turns that logical tier into the concrete wire ID. Never
+# conflate the two — that separation is what keeps this runtime-neutral under the
+# #4167 adapter contract.
+#
+# Absent ``sweep.tierModels`` ⇒ no mapping ⇒ ``resolve_tier_model`` returns ``""``
+# and the caller falls through to its normal precedence chain, so the default
+# (unconfigured) dispatch decision is byte-identical to today's behavior.
+
+# The three cost-of-being-wrong strata. An absent/unknown marker means ``routine``.
+COMPLEXITY_TIERS: tuple[str, ...] = ("mechanical", "routine", "complex")
+
+
+def tier_models(config: dict[str, Any] | None = None) -> dict[str, dict[str, str]]:
+    """The ``sweep.tierModels`` map: ``{runtime: {tier: logical_model}}``.
+
+    Best-effort and tolerant — a non-dict ``sweep``/``tierModels``, non-string
+    runtimes/tiers/models, or blank models are dropped rather than raising, so
+    resolution never blocks a sweep. Runtime and tier keys are lower-cased.
+    """
+    if not isinstance(config, dict):
+        return {}
+    sweep = config.get("sweep")
+    raw = sweep.get("tierModels") if isinstance(sweep, dict) else None
+    if not isinstance(raw, dict):
+        return {}
+    out: dict[str, dict[str, str]] = {}
+    for runtime, tiers in raw.items():
+        if not isinstance(runtime, str) or not isinstance(tiers, dict):
+            continue
+        inner: dict[str, str] = {}
+        for tier, model in tiers.items():
+            if isinstance(tier, str) and isinstance(model, str) and model.strip():
+                inner[tier.strip().lower()] = model.strip()
+        if inner:
+            out[runtime.strip().lower()] = inner
+    return out
+
+
+def resolve_tier_model(
+    tier: str | None,
+    runtime: str = "claude",
+    config: dict[str, Any] | None = None,
+) -> str:
+    """Resolve a complexity tier to the concrete model ID to dispatch on the wire.
+
+    Looks up ``sweep.tierModels[<runtime>][<tier>]`` (a logical tier) and passes
+    the result through :func:`resolve_model` so a logical ``opus`` becomes the
+    current-generation ID rather than a stale alias. An unrecognized/absent tier
+    is treated as ``routine`` (the safe middle).
+
+    Returns ``""`` when there is no mapping for that runtime/tier — the caller then
+    falls through to its normal precedence chain (tier-3 role default), which keeps
+    the unconfigured dispatch decision byte-identical to today. Also returns ``""``
+    (with a warning) when the mapping would resolve to ``fable``: a Curator marker
+    can never dispatch the frontier/refusal-prone model — that is reserved for the
+    objective escalation ladder or an explicit operator param (issue #3702).
+    """
+    key = (tier or "").strip().lower()
+    if key not in COMPLEXITY_TIERS:
+        key = "routine"
+    rt = (runtime or "claude").strip().lower()
+    logical = tier_models(config).get(rt, {}).get(key)
+    if not logical:
+        return ""
+    # No-Fable hard bound: refuse a tier map that names fable, before resolution…
+    if logical.partition("@")[0].strip().lower() == "fable":
+        _warn(f"tierModels[{rt}][{key}] maps to 'fable' — refusing (No-Fable bound); falling through")
+        return ""
+    resolved = resolve_model(logical, config)
+    # …and after resolution, in case an alias/override lands on a fable model ID.
+    if "fable" in resolved.partition("@")[0].lower():
+        _warn(f"tierModels[{rt}][{key}] resolves to a fable model — refusing; falling through")
+        return ""
+    return resolved
+
+
+# --------------------------------------------------------------------------- #
 # Resolution
 # --------------------------------------------------------------------------- #
 
@@ -188,6 +275,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "model",
+        nargs="?",
+        default=None,
         help="A logical tier/alias (opus, sonnet, sonnet@xhigh) or a pinned model ID.",
     )
     parser.add_argument(
@@ -200,12 +289,39 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Print the resolved generation number instead of the model ID.",
     )
+    parser.add_argument(
+        "--tier",
+        default=None,
+        help=(
+            "Complexity-tier mode (issue #4238): resolve the model for "
+            "sweep.tierModels[<runtime>][<tier>] instead of a bare alias. Exits 3 "
+            "with no output when the runtime/tier has no mapping (caller falls "
+            "through to its normal precedence chain)."
+        ),
+    )
+    parser.add_argument(
+        "--runtime",
+        default="claude",
+        help="Worker runtime for --tier resolution (default: claude).",
+    )
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
-    args = build_parser().parse_args(argv)
+    parser = build_parser()
+    args = parser.parse_args(argv)
     config = load_config(args.config)
+    # Complexity-tier mode (issue #4238): sweep.tierModels[<runtime>][<tier>].
+    if args.tier is not None:
+        resolved = resolve_tier_model(args.tier, args.runtime, config)
+        if not resolved:
+            # No mapping (or a refused fable map): print nothing, signal
+            # fall-through with exit 3 so the caller keeps its normal chain.
+            return 3
+        print(resolved)
+        return 0
+    if args.model is None:
+        parser.error("a model argument or --tier is required")
     if args.generation:
         gen = generation_of(args.model, config)
         print("" if gen is None else gen)

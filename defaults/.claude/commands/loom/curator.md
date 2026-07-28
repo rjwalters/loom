@@ -511,18 +511,33 @@ A `RELATED_OPEN_WORK` hit is **not** grounds for closing or auto-rescoping on it
 - Estimate complexity and effort when helpful
 - Break down large features into phased deliverables
 
-### Complexity routing marker (`<!-- loom:complexity=complex -->`, issue #3702)
+### Complexity routing marker (`<!-- loom:complexity=<tier> -->`, issues #3702, #4238)
 
-When your enhancement pass judges an issue to be **genuinely complex** — long-horizon implementation, deep cross-cutting reasoning, or high blast radius (not merely "a bit of work") — you MAY emit a single machine-readable marker into the curated issue body so the sweep orchestrator routes the Builder to a more capable model:
+Emit a single machine-readable marker into the curated issue body so the sweep orchestrator routes the downstream Builder to the right model. Classify by **how expensive it is to be wrong**, not by how much work it looks like — the one question is *would a mistake be caught?*
 
 ```html
-<!-- loom:complexity=complex -->
+<!-- loom:complexity=mechanical -->
 ```
 
-- **Format**: an HTML comment (invisible in rendered Markdown, trivially greppable). Values are `routine` | `complex`. Put it in your enhancement section (e.g. near the Problem Statement). **Absent marker ⇒ `routine`** — most issues need no marker.
-- **What it does**: at Builder dispatch the sweep skill reads it as precedence **tier 2.5** (between tiers 2 and 3) and bumps the Builder's role-default model up **exactly one tier** — `sonnet → opus`. See `sweep.md` → "Tier 2.5 — Curator complexity marker".
-- **Hard bounds** (the router's authority is deliberately bounded): **one bump maximum, never to `fable`, and never a label.** Emitting `complex` cannot reach the top (frontier) model — that is reserved for the objective escalation ladder on Judge rejection or an explicit operator param. A `roleConfig.model` pin or explicit dispatch param (tiers 1–2) still overrides the marker.
-- **Use sparingly.** A miscalibrated `complex` only spends one tier of extra cost and the Judge gate still corrects any miss; but marking everything `complex` defeats the cheap-first default. Emit it only when the complexity is real. Do **not** emit `<!-- loom:complexity=routine -->` explicitly — an absent marker already means routine.
+There are **three** cost-of-being-wrong strata (issue #4238 added `mechanical` beneath `routine`):
+
+| Value | Emit when |
+|---|---|
+| `mechanical` | A mistake is obvious just reading the change — file splits, dead-code deletion, renames, hardcoded constants, ARIA attributes, mock fixes. |
+| `routine` | The approach is clear once you've read the relevant code, and a mistake would surface in tests or review. Most bug fixes and small features. **Default.** |
+| `complex` | Deciding the approach takes judgement, and a mistake could pass tests and review unnoticed — architecture, cross-cutting change, subtle logic. Money, security, and destructive migrations are common cases, not the whole list. |
+
+- **Format**: an HTML comment (invisible in rendered Markdown, trivially greppable). Values are `mechanical` | `routine` | `complex`. Put it in your enhancement section (e.g. near the Problem Statement). **Absent marker ⇒ `routine`** — do **not** emit `<!-- loom:complexity=routine -->` explicitly.
+- **What it does**: at Builder dispatch the sweep skill reads it as precedence **tier 2.5** (between tiers 2 and 3) and resolves the Builder's model from `sweep.tierModels[<runtime>][<tier>]` — `mechanical` routes cheaper, `complex` routes more capable. **Never name a model here; the tier is runtime-neutral.** See `sweep.md` → "Tier 2.5 — complexity marker".
+- **Hard bounds** (the router's authority is deliberately bounded): **never resolves to `fable`, and never a label.** The frontier model is reserved for the objective escalation ladder on Judge rejection or an explicit operator param. A `roleConfig.model` pin or explicit dispatch param (tiers 1–2) still overrides the marker.
+- **Cheap when the tier map is unconfigured.** With no `sweep.tierModels` in `.loom/config.json`, the marker is inert and dispatch falls through to the role default exactly as before — so adding markers is safe even before a workspace opts into cost/speed routing (the `sweep.optimization` profile switch, a separate follow-up, materializes the presets).
+- **Use sparingly / take the higher tier when torn.** Marking everything `complex` defeats the cheap-first default; marking real judgement calls `mechanical` risks a cheap model on expensive-to-be-wrong work. When genuinely torn, take the higher tier.
+
+Optionally verify a curated issue carries a valid marker before applying `loom:curated`:
+
+```bash
+./.loom/scripts/require-complexity-marker.sh <issue>   # exit 0 = has a valid tier
+```
 
 ## Where to Add Enhancements
 
