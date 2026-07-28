@@ -2426,6 +2426,8 @@ fn print_status_unreachable_json(
                 "age_secs": r.heartbeat_age_secs,
                 "stale_threshold_secs": r.heartbeat_stale_threshold_secs,
             },
+            "process_age_secs": r.process_age_secs,
+            "startup_grace_threshold_secs": r.startup_grace_threshold_secs,
             "watchdog_log": r.watchdog_log_path.display().to_string(),
         });
     }
@@ -2435,8 +2437,10 @@ fn print_status_unreachable_json(
 
 /// Emit the unreachable-daemon human-readable error, state-aware (Issue
 /// #4069). Remediation advice differs per state: `NotExpected` /
-/// `ExpectedButDead` suggest a start; `AliveButUnresponsive` does NOT (the
-/// singleton guard would refuse it) and instead points at the live pid.
+/// `ExpectedButDead` suggest a start; `AliveStarting` (#4213) reports a normal
+/// in-progress startup and prints NO remediation; `AliveButUnresponsive` does
+/// NOT suggest a start either (the singleton guard would refuse it) and instead
+/// points at the live pid.
 fn print_status_unreachable_human(
     socket_path: &Path,
     err: &anyhow::Error,
@@ -2477,6 +2481,24 @@ fn print_status_unreachable_human(
                 eprintln!("Recover with:");
                 eprintln!("  ./.loom/scripts/cli/loom-daemon-start.sh");
                 eprintln!("See {} for prior divergence reports.", r.watchdog_log_path.display());
+            }
+            daemon_install_state::InstallState::AliveStarting => {
+                let detail = r.liveness_detail.as_deref().unwrap_or("process alive");
+                let grace = r.startup_grace_threshold_secs.unwrap_or_default();
+                eprintln!("The daemon process IS alive ({detail}) but is not responding over IPC.");
+                eprintln!(
+                    "It is still STARTING (process age {}s ≤ {grace}s grace) — its IPC socket has \
+                     not bound yet (normal for up to ~{grace}s after a bootout/bootstrap restart).",
+                    r.process_age_secs.unwrap_or_default()
+                );
+                eprintln!();
+                eprintln!(
+                    "This is NOT a fault — no action needed. Re-run `loom-daemon status` in a few \
+                     seconds; the socket should bind and status will succeed."
+                );
+                // Deliberately NOT printing the stop/start remediation: doing so
+                // during every normal restart is exactly the ghost-chase #4213
+                // set out to prevent.
             }
             daemon_install_state::InstallState::AliveButUnresponsive => {
                 let detail = r.liveness_detail.as_deref().unwrap_or("process alive");

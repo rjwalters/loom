@@ -2232,18 +2232,31 @@ daemon running?"* message, regardless of whether autonomy was ever expected.
 `status` now runs the **same read-only, local probe** — same marker, same
 per-field fallbacks, same env-wins-over-marker rule, same heartbeat staleness
 formula — so `status` and `<loom_dir>/logs/daemon-watchdog.log` can never
-disagree, and reports one of three states with a distinct exit code:
+disagree, and reports one of four states with a distinct exit code:
 
 | State | Meaning | Exit code | Remediation printed |
 |-------|---------|-----------|----------------------|
 | `not-expected` | marker absent (deliberate stop, or never started) | `1` | suggest `loom-daemon-start.sh` |
 | `expected-but-dead` | marker present, no live process — the #4011 divergence | `3` | suggest `loom-daemon-start.sh`; points at `daemon-watchdog.log` |
-| `alive-but-unresponsive` | marker present, process alive, IPC still failed | `4` | does **not** suggest a start (singleton guard refuses); prints the live pid; heartbeat freshness qualifies fresh ⇒ IPC/socket fault, stale ⇒ likely wedged |
+| `alive-starting` | marker present, process alive, IPC failed, **process age ≤ startup-grace window** — a normal `bootout`/`bootstrap` restart whose socket has not bound yet (#4213) | `4` | **none** — reports "still starting, not a fault"; NO stop/start remediation |
+| `alive-but-unresponsive` | marker present, process alive, IPC failed, process **older** than the grace window (or age undeterminable) | `4` | does **not** suggest a start (singleton guard refuses); prints the live pid; heartbeat freshness qualifies fresh ⇒ IPC/socket fault, stale ⇒ likely wedged |
+
+The startup-grace window defaults to `90s` (sized above the observed ~40–60s
+socket-bind latency after a `launchctl bootout`/`bootstrap` cycle) and is
+overridable via `LOOM_DAEMON_STARTUP_GRACE_SECS` (env > default, mirroring the
+`LOOM_DAEMON_HEARTBEAT_STALE_SECS` precedence). Process age is read from
+`ps -o etime= -p <pid>`; an unparseable age makes **no** grace claim and falls
+through to `alive-but-unresponsive`, never a false "starting". The grace
+discriminator is process age **alone** — never socket-file presence, since a
+stale socket file from the prior run can legitimately still exist during
+startup. `loom-daemon-watchdog.sh` never probes IPC, so it cannot emit the
+fault verdict and needs no matching grace state.
 
 `--json` gains a structured `install_state` object (`state` is the
 machine-readable enum above, plus `started_at`, `pid`, `liveness_detail`, a
-`heartbeat` sub-object, and `watchdog_log`); the pre-#4069 `error` string key
-is retained for compatibility. The probe never fails the command — an
+`heartbeat` sub-object, `process_age_secs`, `startup_grace_threshold_secs`, and
+`watchdog_log`); the pre-#4069 `error` string key is retained for
+compatibility. The probe never fails the command — an
 unreadable/malformed marker, absent `launchctl`, a stale/unowned pid, or an
 unreadable heartbeat mtime all degrade to a less-specific verdict (or, if no
 loom dir can be resolved at all, `install_state` is simply omitted and the
