@@ -26,6 +26,14 @@
 #   .loom/bin/              <- defaults/.loom/bin/        (recursive; live consumer CLI)
 #   .claude/commands/loom/  <- defaults/.claude/commands/loom/ (recursive)
 #
+# It also applies one targeted field edit outside the pure-copy model (#4285):
+# a root package.json whose "name" is exactly "loom-workspace" (the Loom
+# installer's workspace-scaffolding stub, `defaults/package.json`) has its
+# decoy "version" field deleted in place if present — this is a `jq
+# 'del(.version)'` field edit, NOT a whole-file resync, so a consumer's
+# customized "scripts" block in the stub is preserved. A consumer's OWN
+# package.json (any other "name") is never touched.
+#
 # On a successful non-dry-run it also re-stamps loom_version, loom_commit, and a
 # last_resync date into .loom/install-metadata.json (requires jq or python3;
 # skipped with a warning if neither is present — the file sync still succeeds).
@@ -48,10 +56,11 @@
 #   install-metadata.json's install_date + installed_files - owned by the installer
 #
 # Local-override convention: list a relative path (e.g. `hooks/guard-destructive.sh`,
-# `scripts/foo.sh`, `roles/custom-role.md`, `docs/notes.md`, `bin/loom`, or
-# `commands/loom/mine.md`) — one per line — in `.loom/resync-ignore` to pin an
-# intentional per-repo customization. Matching files are reported as `skipped`
-# and never overwritten. Blank lines and `#` comments are ignored.
+# `scripts/foo.sh`, `roles/custom-role.md`, `docs/notes.md`, `bin/loom`,
+# `commands/loom/mine.md`, or `package.json` to pin the #4285 stub version edit)
+# — one per line — in `.loom/resync-ignore` to pin an intentional per-repo
+# customization. Matching files are reported as `skipped` and never overwritten.
+# Blank lines and `#` comments are ignored.
 #
 # Usage:
 #   ./.loom/scripts/resync-installed.sh            # sync; report what changed
@@ -385,6 +394,63 @@ fi
 if [[ -d "$REPO_ROOT/.claude/commands/loom" ]]; then
     resync_tree "$DEFAULTS_DIR/.claude/commands/loom" "$REPO_ROOT/.claude/commands/loom" "commands/loom" ".claude/commands/loom"
 fi
+
+# ---------- targeted field edit: loom-workspace package.json version (#4285) ----------
+#
+# defaults/package.json ships without a "version" field — the field was a decoy
+# for version-detection tooling (npm-shape probes, /loom:bump) that mistook the
+# installer's workspace stub for a real project version source. Consumers who
+# installed the OLD stub (with "version": "1.0.0") still carry it on disk. A
+# whole-file resync (like the surfaces above) would clobber the consumer's
+# customized "scripts" block (check:ci, test, lint, ...), so this does a
+# targeted field deletion instead: strip ".version" from the root package.json
+# ONLY when ".name" is exactly "loom-workspace" and a "version" field is
+# present. A consumer's own package.json (any other name) is left untouched.
+resync_workspace_stub_version() {
+    local pj="$REPO_ROOT/package.json"
+    [[ -f "$pj" ]] || return 0
+
+    if is_ignored "package.json"; then
+        note "  ${YELLOW}skipped${NC}   package.json ${YELLOW}(pinned in .loom/resync-ignore)${NC}"
+        N_SKIPPED=$((N_SKIPPED + 1))
+        return 0
+    fi
+
+    if ! command -v jq >/dev/null 2>&1; then
+        warn "Skipped package.json version-stub check (need jq). Surface sync still applied."
+        return 0
+    fi
+
+    local name
+    name="$(jq -r '.name // empty' "$pj" 2>/dev/null)"
+    [[ "$name" == "loom-workspace" ]] || return 0
+
+    local has_version
+    has_version="$(jq -r 'has("version")' "$pj" 2>/dev/null)"
+    if [[ "$has_version" != "true" ]]; then
+        note "  ${GREEN}unchanged${NC} package.json (no decoy version field)"
+        N_UNCHANGED=$((N_UNCHANGED + 1))
+        return 0
+    fi
+
+    if [[ "$DRY_RUN" -eq 1 ]]; then
+        printf '%b\n' "  ${BOLD}would update${NC} package.json (remove decoy \"version\" field, #4285)"
+        N_UPDATED=$((N_UPDATED + 1))
+        return 0
+    fi
+
+    local tmp="${pj}.tmp.$$"
+    if jq 'del(.version)' "$pj" > "$tmp" 2>/dev/null && [[ -s "$tmp" ]]; then
+        mv "$tmp" "$pj"
+        printf '%b\n' "  ${GREEN}updated${NC}   package.json (removed decoy \"version\" field, #4285)"
+        N_UPDATED=$((N_UPDATED + 1))
+    else
+        rm -f "$tmp"
+        err "failed to update package.json (jq del(.version))"
+    fi
+}
+
+resync_workspace_stub_version
 
 # ---------- re-stamp install-metadata.json (#4239, non-dry-run only) ----------
 #
