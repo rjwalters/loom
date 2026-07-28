@@ -104,6 +104,19 @@ pub const MAIN_HEALTH_GATE_ENABLE_ENV: &str = "LOOM_MAIN_HEALTH_GATE";
 /// Environment variable overriding the gate cadence (seconds).
 pub const MAIN_HEALTH_GATE_INTERVAL_ENV: &str = "LOOM_MAIN_HEALTH_GATE_INTERVAL_SECS";
 
+/// Environment variable overriding whether the work-finder suppresses dispatch
+/// into a root whose build-gate run is in flight (#4084). Precedence env >
+/// config > default; truthy (`1`/`true`/`yes`/`on`) enables, anything else
+/// disables. Overrides `autonomous.mainHealthGate.suppressDispatchDuringGate`.
+pub const MAIN_HEALTH_GATE_SUPPRESS_DISPATCH_ENV: &str = "LOOM_MAIN_HEALTH_GATE_SUPPRESS_DISPATCH";
+
+/// Default for `autonomous.mainHealthGate.suppressDispatchDuringGate` (#4084):
+/// on. Suppressing new dispatch into a root while its own gate build runs is
+/// the mechanism that keeps a gate run from losing its CPU race against
+/// concurrently-dispatched sweep builds. Set the knob/env to `false` to opt out
+/// (e.g. to restore the pre-#4084 always-dispatch behavior).
+pub const DEFAULT_SUPPRESS_DISPATCH_DURING_GATE: bool = true;
+
 /// Default gate cadence. Tighter than the work-finder's 60s default — a red
 /// `main` should be caught (and dispatch halted) promptly — while still keeping
 /// build volume low.
@@ -184,6 +197,18 @@ pub struct MainHealthState {
     /// about `main` and stamping it there would let a stale "last verified"
     /// silently refresh itself forever.
     last_verdict_at: Mutex<Option<DateTime<Utc>>>,
+    /// Whether a build-gate *run* against this root is currently in flight
+    /// (#4084) — set for the lifetime of the `spawn_blocking(run_gate_tick)`
+    /// call and cleared the instant it returns or panics (via
+    /// [`GateInFlightGuard`]). Distinct from `halted`, which reflects a
+    /// *completed* red verdict: this flag reflects that the gate's own
+    /// (possibly minutes-long) build is executing right now. The work-finder
+    /// reads it as an additional dispatch suppressor so it does not dispatch
+    /// new sweeps into a root whose gate build is already competing for the
+    /// same cores — the CPU contention that made a `nice -n 5` gate still time
+    /// out under 2 concurrent sweeps (#4073 was necessary, not sufficient).
+    /// `false` for a fresh state and whenever no gate run is executing.
+    gate_in_flight: AtomicBool,
 }
 
 /// Bookkeeping for #3984: the SHA of the last **determinate** (Green/Red)
@@ -235,6 +260,7 @@ impl MainHealthState {
             track: Mutex::new(UnevaluatedTrack::default()),
             gate_memo: Mutex::new(GateMemo::default()),
             last_verdict_at: Mutex::new(None),
+            gate_in_flight: AtomicBool::new(false),
         }
     }
 
@@ -247,6 +273,21 @@ impl MainHealthState {
     /// Set the halt flag directly (primarily for tests / explicit control).
     pub fn set_halted(&self, halted: bool) {
         self.halted.store(halted, Ordering::SeqCst);
+    }
+
+    /// Whether a build-gate run against this root is currently in flight
+    /// (#4084) — see the field doc on [`Self::gate_in_flight`]. Read by the
+    /// work-finder as a dispatch suppressor alongside [`Self::is_halted`].
+    #[must_use]
+    pub fn is_gate_in_flight(&self) -> bool {
+        self.gate_in_flight.load(Ordering::SeqCst)
+    }
+
+    /// Mark whether a gate run is in flight. Prefer [`GateInFlightGuard`] over
+    /// calling this directly, so the flag is cleared on every exit path —
+    /// including a panic unwind — and can never latch dispatch off (#4084).
+    pub fn set_gate_in_flight(&self, in_flight: bool) {
+        self.gate_in_flight.store(in_flight, Ordering::SeqCst);
     }
 
     /// Whether the most recent gate tick was [`GateOutcome::Unevaluated`] — see
@@ -478,6 +519,18 @@ impl WorkspaceHealthStates {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         map.get(root).is_some_and(|s| s.is_halted())
+    }
+
+    /// Whether a build-gate run against `root` is currently in flight (#4084).
+    /// A never-seen root reports `false` — no gate has run against it. Read by
+    /// the work-finder as a dispatch suppressor alongside [`Self::is_halted`].
+    #[must_use]
+    pub fn is_gate_in_flight(&self, root: &Path) -> bool {
+        let map = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        map.get(root).is_some_and(|s| s.is_gate_in_flight())
     }
 
     /// Whether `root`'s most recent gate tick was [`GateOutcome::Unevaluated`]
@@ -2188,6 +2241,11 @@ pub struct AutonomousGateConfig {
     /// will vouch for it. `None` when the key is absent, empty, or whitespace
     /// (falls through to env / the unnamed unanimity-only behavior).
     pub ci_workflow: Option<String>,
+    /// `autonomous.mainHealthGate.suppressDispatchDuringGate` (#4084) — whether
+    /// the work-finder holds new dispatch off a root while its build-gate run is
+    /// in flight. `None` when the key is absent (falls through to env /
+    /// [`DEFAULT_SUPPRESS_DISPATCH_DURING_GATE`]).
+    pub suppress_dispatch_during_gate: Option<bool>,
 }
 
 /// Read `.loom/config.json → autonomous.mainHealthGate`, soft-failing to an
@@ -2212,6 +2270,9 @@ pub fn read_autonomous_gate_config(repo_root: &Path) -> AutonomousGateConfig {
             .map(str::trim)
             .filter(|s| !s.is_empty())
             .map(str::to_string),
+        suppress_dispatch_during_gate: gate
+            .get("suppressDispatchDuringGate")
+            .and_then(serde_json::Value::as_bool),
     }
 }
 
@@ -2248,6 +2309,23 @@ pub fn resolve_enabled(config: &AutonomousGateConfig) -> bool {
     config.enabled.unwrap_or(false)
 }
 
+/// Resolve whether the work-finder suppresses dispatch into a root while its
+/// build-gate run is in flight, with precedence **env > config >
+/// default([`DEFAULT_SUPPRESS_DISPATCH_DURING_GATE`])** (#4084). When
+/// [`MAIN_HEALTH_GATE_SUPPRESS_DISPATCH_ENV`] is *set* (to any value) it decides
+/// (truthy suppresses, anything else disables); when unset the config flag
+/// decides; absent both ⇒ the default (on). Mirrors [`resolve_enabled`]'s
+/// env-master-switch shape.
+#[must_use]
+pub fn resolve_suppress_dispatch_during_gate(config: &AutonomousGateConfig) -> bool {
+    if let Ok(v) = std::env::var(MAIN_HEALTH_GATE_SUPPRESS_DISPATCH_ENV) {
+        return matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on");
+    }
+    config
+        .suppress_dispatch_during_gate
+        .unwrap_or(DEFAULT_SUPPRESS_DISPATCH_DURING_GATE)
+}
+
 /// Whether the gate is **effectively** enabled for `repo_root` (#4012): the
 /// [`resolve_enabled`] on/off switch **and** a usable `buildGate` block. A
 /// root can be nominally `autonomous.mainHealthGate.enabled: true` yet never
@@ -2282,6 +2360,31 @@ pub fn resolve_interval() -> Duration {
 // Runtime wiring — the loop runs on the shared daemon runtime
 // ============================================================================
 
+/// RAII guard that marks a [`MainHealthState`]'s gate run as in flight for its
+/// lifetime (#4084): sets `gate_in_flight` true on construction and clears it on
+/// `Drop` — including a panic unwind inside the `spawn_blocking` gate thread.
+/// Moving the guard *into* the blocking closure means the flag is cleared on
+/// every exit path (normal return, early return, or panic), so a panicking gate
+/// run can never latch the flag on and permanently starve dispatch. This is
+/// deliberately preferred over clearing the flag in each `match` arm, where a
+/// future early-return could silently reintroduce the latch.
+struct GateInFlightGuard {
+    state: Arc<MainHealthState>,
+}
+
+impl GateInFlightGuard {
+    fn new(state: Arc<MainHealthState>) -> Self {
+        state.set_gate_in_flight(true);
+        Self { state }
+    }
+}
+
+impl Drop for GateInFlightGuard {
+    fn drop(&mut self) {
+        self.state.set_gate_in_flight(false);
+    }
+}
+
 /// Spawn the main-health gate loop on the shared daemon runtime and return its
 /// task handle so the daemon can keep it alive for the process lifetime.
 ///
@@ -2315,8 +2418,13 @@ where
         loop {
             ticker.tick().await;
             // Run the (potentially minutes-long) gate command off the runtime.
-            // Move the runner in and back out so it survives across ticks.
+            // Move the runner in and back out so it survives across ticks. The
+            // in-flight guard is set here (before the blocking build starts) and
+            // moved into the closure so it clears on return *or* panic (#4084) —
+            // the work-finder holds new dispatch off this root while it is set.
+            let flight_guard = GateInFlightGuard::new(health_state.clone());
             let joined = tokio::task::spawn_blocking(move || {
+                let _flight_guard = flight_guard;
                 let outcome = runner.run_gate();
                 (outcome, runner)
             })
@@ -2460,6 +2568,13 @@ pub fn spawn_multi_main_health_gate_task(
                 let state = health_states.get_or_create(&root);
                 let state_for_task = state.clone();
                 let root_for_task = root.clone();
+                // Mark this root's gate run in flight before the blocking build
+                // starts and move the guard into the closure so it clears on
+                // return *or* panic (#4084). While set, the work-finder holds
+                // new dispatch off this root so its gate build is not racing
+                // fresh sweep builds for the same cores (the contention that
+                // still timed the gate out under #4073's `nice -n 5`).
+                let flight_guard = GateInFlightGuard::new(state.clone());
                 // Run the (potentially minutes-long) gate off the runtime.
                 // `run_gate_tick` (#3984) short-circuits before the expensive
                 // command when `origin/main` has not moved (or moved but
@@ -2467,6 +2582,7 @@ pub fn spawn_multi_main_health_gate_task(
                 // determinate evaluation, and backs off after a run that
                 // produced no verdict rather than retrying immediately.
                 let joined = tokio::task::spawn_blocking(move || {
+                    let _flight_guard = flight_guard;
                     run_gate_tick(&state_for_task, &gate_config, &root_for_task)
                 })
                 .await;
@@ -2829,6 +2945,7 @@ mod tests {
             AutonomousGateConfig {
                 enabled: Some(true),
                 ci_workflow: None,
+                suppress_dispatch_during_gate: None,
             }
         );
     }
@@ -2861,6 +2978,66 @@ mod tests {
     fn test_default_state_not_halted() {
         assert!(!MainHealthState::new().is_halted());
         assert!(!MainHealthState::default().is_halted());
+    }
+
+    // ===================================================================
+    // Gate-in-flight suppressor (#4084)
+    // ===================================================================
+
+    #[test]
+    fn test_gate_in_flight_false_at_construction() {
+        // A fresh state must not suppress dispatch: no gate run has started.
+        assert!(!MainHealthState::new().is_gate_in_flight());
+        assert!(!MainHealthState::default().is_gate_in_flight());
+    }
+
+    #[test]
+    fn test_gate_in_flight_guard_sets_true_during_and_clears_after() {
+        let state = Arc::new(MainHealthState::new());
+        assert!(!state.is_gate_in_flight());
+        {
+            let _guard = GateInFlightGuard::new(state.clone());
+            // True for the guard's whole lifetime (the blocking gate run).
+            assert!(state.is_gate_in_flight(), "gate run in flight ⇒ flag set");
+        }
+        // Cleared the instant the guard drops (the run returned).
+        assert!(!state.is_gate_in_flight(), "flag cleared once the run completes");
+    }
+
+    #[test]
+    fn test_gate_in_flight_guard_clears_on_panic() {
+        // The highest-risk regression (#4084): a panicking gate run must still
+        // clear the flag, or the latch permanently starves dispatch. The guard
+        // lives inside the `spawn_blocking` closure, so its `Drop` runs during
+        // the panic unwind — simulate that with `catch_unwind`.
+        let state = Arc::new(MainHealthState::new());
+        let state_for_closure = state.clone();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = GateInFlightGuard::new(state_for_closure);
+            assert!(state.is_gate_in_flight());
+            panic!("simulated gate-run panic");
+        }));
+        assert!(result.is_err(), "the closure must have panicked");
+        assert!(
+            !state.is_gate_in_flight(),
+            "a panicking gate run must not latch gate_in_flight on"
+        );
+    }
+
+    #[test]
+    fn test_workspace_health_states_gate_in_flight_passthrough() {
+        let states = WorkspaceHealthStates::new();
+        let root = Path::new("/tmp/repo-a");
+        // A never-seen root reports no gate in flight (nothing has run).
+        assert!(!states.is_gate_in_flight(root));
+        // Setting the underlying state's flag is observable through the map.
+        states.get_or_create(root).set_gate_in_flight(true);
+        assert!(states.is_gate_in_flight(root));
+        // A sibling root is unaffected — per-root isolation (#3930).
+        let sibling = Path::new("/tmp/repo-b");
+        assert!(!states.is_gate_in_flight(sibling));
+        states.get_or_create(root).set_gate_in_flight(false);
+        assert!(!states.is_gate_in_flight(root));
     }
 
     // ===================================================================
@@ -4561,6 +4738,7 @@ mod tests {
             AutonomousGateConfig {
                 enabled: Some(true),
                 ci_workflow: None,
+                suppress_dispatch_during_gate: None,
             }
         );
         write_config(tmp.path(), r#"{"autonomous": {"mainHealthGate": {"enabled": false}}}"#);
@@ -4569,6 +4747,7 @@ mod tests {
             AutonomousGateConfig {
                 enabled: Some(false),
                 ci_workflow: None,
+                suppress_dispatch_during_gate: None,
             }
         );
     }
@@ -4589,6 +4768,7 @@ mod tests {
             AutonomousGateConfig {
                 enabled: Some(true),
                 ci_workflow: Some("CI".to_string()),
+                suppress_dispatch_during_gate: None,
             }
         );
     }
@@ -4661,6 +4841,60 @@ mod tests {
             ..Default::default()
         }));
         std::env::remove_var(MAIN_HEALTH_GATE_ENABLE_ENV);
+    }
+
+    #[test]
+    fn test_autonomous_config_suppress_dispatch_parsed() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_config(
+            tmp.path(),
+            r#"{"autonomous": {"mainHealthGate": {"suppressDispatchDuringGate": false}}}"#,
+        );
+        assert_eq!(
+            read_autonomous_gate_config(tmp.path()).suppress_dispatch_during_gate,
+            Some(false)
+        );
+        write_config(
+            tmp.path(),
+            r#"{"autonomous": {"mainHealthGate": {"suppressDispatchDuringGate": true}}}"#,
+        );
+        assert_eq!(
+            read_autonomous_gate_config(tmp.path()).suppress_dispatch_during_gate,
+            Some(true)
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn test_resolve_suppress_dispatch_during_gate_precedence() {
+        std::env::remove_var(MAIN_HEALTH_GATE_SUPPRESS_DISPATCH_ENV);
+
+        // Absent config + unset env ⇒ default ON (#4084 default-true contract,
+        // `DEFAULT_SUPPRESS_DISPATCH_DURING_GATE`).
+        assert!(resolve_suppress_dispatch_during_gate(&AutonomousGateConfig::default()));
+
+        // Config alone decides when env is unset (both directions).
+        assert!(resolve_suppress_dispatch_during_gate(&AutonomousGateConfig {
+            suppress_dispatch_during_gate: Some(true),
+            ..Default::default()
+        }));
+        assert!(!resolve_suppress_dispatch_during_gate(&AutonomousGateConfig {
+            suppress_dispatch_during_gate: Some(false),
+            ..Default::default()
+        }));
+
+        // Env overrides config in both directions (env is the master switch).
+        std::env::set_var(MAIN_HEALTH_GATE_SUPPRESS_DISPATCH_ENV, "1");
+        assert!(resolve_suppress_dispatch_during_gate(&AutonomousGateConfig {
+            suppress_dispatch_during_gate: Some(false),
+            ..Default::default()
+        }));
+        std::env::set_var(MAIN_HEALTH_GATE_SUPPRESS_DISPATCH_ENV, "0");
+        assert!(!resolve_suppress_dispatch_during_gate(&AutonomousGateConfig {
+            suppress_dispatch_during_gate: Some(true),
+            ..Default::default()
+        }));
+        std::env::remove_var(MAIN_HEALTH_GATE_SUPPRESS_DISPATCH_ENV);
     }
 
     // ===================================================================
