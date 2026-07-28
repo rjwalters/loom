@@ -226,6 +226,71 @@ assert_eq "TOKEN_EXHAUSTED" "$result" "weekly 'session limit' stays TOKEN_EXHAUS
 result=$(classify_error "Note: agents pause on a concurrent session limit." 0)
 assert_eq "SUCCESS" "$result" "exit=0 mentioning 'concurrent session' is SUCCESS (#3233/#3947)"
 
+# --- Provider-selector vectors (issue #4190) ---
+# classify_error() now accepts an optional 3rd provider arg with precedence
+# 3rd arg > $LOOM_RUNTIME > "claude". These vectors prove the split into
+# engine + provider pattern tables preserves every prior behavior and adds
+# the new selector semantics correctly.
+
+# Vector #36: explicit 3rd arg "claude" behaves identically to the 2-arg
+# default (bit-identical proof, explicit form)
+result=$(classify_error "OAuth token has expired" 1 "claude")
+assert_eq "TOKEN_EXPIRED" "$result" "explicit 3rd arg 'claude' classifies like the 2-arg default (#4190)"
+
+# Vector #37: LOOM_RUNTIME=claude env selects the claude table (no 3rd arg)
+result=$(LOOM_RUNTIME=claude classify_error "You've hit your weekly limit" 1)
+assert_eq "TOKEN_EXHAUSTED" "$result" "LOOM_RUNTIME=claude selects the claude table (#4190)"
+
+# Vector #38: explicit 3rd arg overrides a conflicting LOOM_RUNTIME
+result=$(LOOM_RUNTIME=nosuch classify_error "OAuth token has expired" 1 "claude")
+assert_eq "TOKEN_EXPIRED" "$result" "3rd arg 'claude' overrides a conflicting LOOM_RUNTIME=nosuch (#4190)"
+
+# Vector #39: unknown provider (LOOM_RUNTIME=nosuch) hits the generic 429
+# fallback rather than erroring or matching a Claude-specific pattern
+result=$(LOOM_RUNTIME=nosuch classify_error "429 Too Many Requests" 1)
+assert_eq "RECOVERABLE" "$result" "unknown provider -> generic 429 fallback, no error (#4190)"
+
+# Vector #40: unknown provider hits the generic 5xx fallback
+result=$(LOOM_RUNTIME=nosuch classify_error "503 Service Unavailable" 1)
+assert_eq "RECOVERABLE" "$result" "unknown provider -> generic 5xx fallback, no error (#4190)"
+
+# Vector #41: unknown provider hits the generic network-error fallback
+result=$(LOOM_RUNTIME=nosuch classify_error "ECONNREFUSED" 1)
+assert_eq "RECOVERABLE" "$result" "unknown provider -> generic network fallback, no error (#4190)"
+
+# Vector #42: unknown provider does NOT match a Claude-specific pattern —
+# "OAuth token has expired" falls through to the generic catch-all instead of
+# TOKEN_EXPIRED, proving provider tables are genuinely provider-scoped.
+result=$(LOOM_RUNTIME=nosuch classify_error "OAuth token has expired" 1)
+assert_eq "RECOVERABLE" "$result" "unknown provider does not match the claude-only TOKEN_EXPIRED pattern (#4190)"
+
+# Vector #43: unknown provider + clean exit is still SUCCESS (engine layer is
+# provider-independent)
+result=$(LOOM_RUNTIME=nosuch classify_error "anything" 0)
+assert_eq "SUCCESS" "$result" "unknown provider + exit=0 is SUCCESS (#4190)"
+
+# Vector #44: SESSION_LIMIT still wins over TOKEN_EXHAUSTED under an explicit
+# claude provider selector (ordering invariant preserved post-split)
+result=$(classify_error "Error: you have reached your concurrent session limit" 1 "claude")
+assert_eq "SESSION_LIMIT" "$result" "SESSION_LIMIT beats TOKEN_EXHAUSTED under explicit claude provider (#4190)"
+
+# Vector #45: exit 124/137 -> TIMEOUT regardless of provider (engine layer)
+result=$(LOOM_RUNTIME=nosuch classify_error "anything" 124)
+assert_eq "TIMEOUT" "$result" "exit=124 is TIMEOUT regardless of provider (#4190)"
+result=$(classify_error "anything" 137 "claude")
+assert_eq "TIMEOUT" "$result" "exit=137 is TIMEOUT regardless of provider (#4190)"
+
+# Vector #46: a 2-arg call under `set -u` does not trip an unbound-variable
+# error — the provider default-expansion chain must be safe with no 3rd arg
+# and no LOOM_RUNTIME set.
+set -u
+result=$(env -u LOOM_RUNTIME bash -c '
+  source "'"$SCRIPTS_DIR"'/lib/classify-error.sh"
+  set -u
+  classify_error "anything" 1
+')
+assert_eq "RECOVERABLE" "$result" "2-arg call under set -u with no LOOM_RUNTIME does not error (#4190)"
+
 # ============================================================
 # Section 2: spawn-claude.sh dispatch (with stub `claude`)
 # ============================================================
