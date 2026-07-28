@@ -562,8 +562,12 @@ pub enum Response {
     // Autonomous Daemon Status (Issue #3891 — follow-up to #3813 Phase D)
     // ========================================================================
     /// Result of a `DaemonStatus` request — the autonomous-mode operability
-    /// snapshot rendered by `loom-daemon status`.
-    DaemonStatus(DaemonStatusReport),
+    /// snapshot rendered by `loom-daemon status`. Boxed (issue #4292, when
+    /// `token_pool_dir` pushed `DaemonStatusReport` far enough past the next-
+    /// largest `Response` variant to trip `clippy::large_enum_variant`) so this
+    /// one large, infrequent (once per status poll) payload does not force
+    /// every other `Response` variant to reserve its stack space.
+    DaemonStatus(Box<DaemonStatusReport>),
     /// Result of a `RestartDaemon` request (Issue #4054).
     ///
     /// `scheduled` is `true` when the daemon is supervised and is about to exit
@@ -833,6 +837,22 @@ pub struct DaemonStatusReport {
     /// (`.loom/tokens/*.token`), the hard ceiling on concurrent sweeps
     /// (never over-subscribe an OAuth account). Via [`crate::tokens::token_pool_size`].
     pub token_pool_size: usize,
+    /// The tokens-pool directory the daemon actually resolved for
+    /// [`Self::token_pool_size`] / [`Self::capacity`] (issue #4292): the
+    /// primary workspace's per-repo pool (`<workspace>/.loom/tokens`) when it
+    /// holds `*.token` files, else the shared machine-level pool
+    /// (`~/.loom/tokens`, override `LOOM_SHARED_TOKENS_DIR`) — the same
+    /// precedence [`crate::tokens_pool::paths::resolve_tokens_dir`] applies
+    /// everywhere else. Surfaced so `loom-daemon status` can print *which*
+    /// pool it used no matter which directory it was invoked from, and so the
+    /// CLI's client-side per-token usage probe (`collect_token_usage`) can
+    /// target this exact directory instead of independently re-deriving one
+    /// from its own cwd — the mismatch that let `status` report a false
+    /// token picture when run from a directory other than the daemon's own
+    /// workspace. `#[serde(default)]` keeps pre-#4292 wire data / older
+    /// daemon binaries compatible (an absent field parses as `None`).
+    #[serde(default)]
+    pub token_pool_dir: Option<PathBuf>,
     /// Dynamic-cap input 2: how many worktrees the scratch volume can hold at
     /// `LOOM_PER_WORKTREE_GB` each. Via [`crate::disk_headroom::disk_headroom_limit`].
     pub disk_headroom: usize,
