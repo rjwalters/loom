@@ -2188,6 +2188,31 @@ assert_allow "write-confinement: fd-dup 2>&1 is not treated as a file write" \
     "echo x 2>&1 | tee /tmp/loom-test-$$-log" "$WT_REPO"
 
 # -------------------------------------------------------------------------
+# Quote-aware `>` masking (#4245) -- mask_gt() in extract_write_targets().
+#
+# A `>` that is only DATA inside a quoted --body/--title/... value (e.g. prose
+# describing the env > config > default precedence order) must never be
+# misread as a shell redirection operator, no matter how many such quoted `>`
+# characters the value contains. This is the exact false positive reported in
+# #4245: `gh issue create --body "... env > config > default ..."` was denied
+# as a "worktree-isolation bypass" even though `gh issue create` writes
+# nothing to the filesystem.
+assert_allow "write-confinement (#4245): gh issue create --body with a quoted '>' allows" \
+    "gh issue create --title \"Test\" --label \"loom:triage\" --body \"a > b\"" "$WT_REPO"
+assert_allow "write-confinement (#4245): multiple quoted '>' in one --body value allows" \
+    "gh issue create --title \"Test\" --body \"... following the env > config > default precedence ...\"" "$WT_REPO"
+assert_allow "write-confinement (#4245): quoted '>' inside a single-quoted value allows" \
+    "echo 'a > b'" "$WT_REPO"
+
+# Regression: a quote-aware mask must only NARROW detection, never widen it --
+# a REAL (unquoted) redirection into the main checkout must still deny even
+# when the same command also contains a quoted `>` elsewhere.
+assert_deny "write-confinement (#4245): quoted '>' alongside a real unquoted '>' still denies" \
+    "echo \"a > b\" > $WT_REPO/defaults/hooks/f.sh" "$WT_REPO"
+assert_deny "write-confinement (#4245): bare '>' redirection still denies (regression)" \
+    "echo x > $WT_REPO/defaults/hooks/g.sh" "$WT_REPO"
+
+# -------------------------------------------------------------------------
 # Regression (#4210): CWD is the builder's own LINKED worktree, and the write
 # targets the MAIN checkout by absolute path (or via `cd $MAIN`). This is the
 # canonical builder setup (`cd .loom/worktrees/issue-N`). The guard must key
