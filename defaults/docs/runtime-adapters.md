@@ -90,6 +90,11 @@ around this script; an adapter's spawn entry point is invoked the same way, so i
 must tolerate those env vars being present (Claude's script logs
 `LOOM_SWEEP_CLAIM_OWNED` on every spawn for dispatch diagnosability).
 
+The runtime-neutral **dispatch seam** that realizes this contract point today —
+`spawn-worker.sh` plus the `runtimes` config block — is specified in
+[Phase 1: the `spawn-worker.sh` runtime-dispatch seam](#phase-1-the-spawn-workersh-runtime-dispatch-seam)
+below.
+
 ### 2. Model mapping
 
 **Contract:** map Loom's **logical model tiers** (`opus`, `sonnet`,
@@ -256,6 +261,98 @@ Judge needs read-only + forge access). Dispatch computes role → runtime
 compatibility and refuses to dispatch a role onto a runtime that cannot meet its
 requirements, rather than letting the session fail partway. The declaration is
 per-runtime; the requirements are per-role; the match happens at dispatch time.
+
+## Phase 1: the `spawn-worker.sh` runtime-dispatch seam
+
+Contract point 1 ([Spawn](#1-spawn)) is realized today by a concrete
+**runtime-dispatch seam** so the underlying runtime is a swappable adapter rather
+than a hardwired path. Claude Code is adapter #1; a future Codex adapter
+(`spawn-codex.sh`) slots in behind the same seam with no caller change. This is
+**Phase 1** of epic **#4167** and is a **zero-behavior-change** extraction: with
+nothing configured, the seam execs the same `spawn-claude.sh` Loom always ran.
+(This upstreams the dispatch-seam shape the fork's PR #9 built — see the [fork
+mapping table](#fork-mapping-table) — as Loom's own Phase 1 implementation.)
+
+### The dispatcher: `spawn-worker.sh`
+
+`defaults/scripts/spawn-worker.sh` (installed to `.loom/scripts/spawn-worker.sh`)
+is a thin dispatcher that resolves a runtime name and execs the matching
+`spawn-<runtime>.sh` runner in the same directory, forwarding every argument
+verbatim. Because it uses `exec`, the runner's exit code is the dispatcher's exit
+code — so the [error classification](#3-error-classification) contract is
+unaffected by the extra hop.
+
+```bash
+.loom/scripts/spawn-worker.sh -p "your prompt"
+LOOM_RUNTIME=claude .loom/scripts/spawn-worker.sh --use-wrapper -p "..."
+```
+
+Callers migrate from `spawn-claude.sh` to `spawn-worker.sh` to gain runtime
+selection; until they do, `spawn-claude.sh` keeps working unchanged (existing
+daemon/tooling callers are intentionally left on the direct path in Phase 1).
+
+### Runtime resolution (precedence)
+
+The runtime is resolved with the standard Loom precedence chain
+(**env > config > default**):
+
+| Precedence | Source | Notes |
+|-----------|--------|-------|
+| 1 (highest) | `LOOM_RUNTIME` env var | A non-empty value wins. An **empty** value is treated as unset and falls through. |
+| 2 | `.loom/config.json` → `runtimes.default` | Read via the shared config-resolver (soft-fails silently). |
+| 3 (default) | built-in `"claude"` | Applies when neither of the above resolves. |
+
+The config read tolerates a missing config file, a missing `runtimes` block, and
+a missing `jq` — all of these degrade silently to the built-in `claude` default,
+so a bare install with no `runtimes` config sees no behavior change.
+
+### The `runtimes` config block
+
+Add to `.loom/config.json`:
+
+```json
+{
+  "runtimes": {
+    "default": "claude"
+  }
+}
+```
+
+`runtimes.default` names the runtime used when `LOOM_RUNTIME` is unset. The value
+must have a matching `spawn-<value>.sh` runner on disk (e.g. `"claude"` →
+`spawn-claude.sh`).
+
+### Adding a runtime adapter
+
+Drop a `spawn-<runtime>.sh` runner next to `spawn-claude.sh` (same directory,
+executable). It must satisfy the [Spawn interface](#1-spawn) above — accept the
+same passthrough-args contract and `exec` its underlying CLI. Then select it
+per-run with `LOOM_RUNTIME=<runtime>` or repo-wide with `runtimes.default`.
+
+### Unknown-runtime failure (exit 78)
+
+If the resolved runtime has no matching `spawn-<runtime>.sh` runner, the
+dispatcher exits **78** (`EX_CONFIG`) — the same distinct config-error code the
+Spawn contract's *missing-pool* facet uses — with an actionable message naming:
+
+- the resolved runtime,
+- where it was resolved from (env vs config vs default), and
+- the `spawn-*.sh` runners actually present on disk.
+
+```text
+ERROR Unknown runtime 'codex' (resolved from config (runtimes.default)):
+ERROR no runner found at /…/.loom/scripts/spawn-codex.sh.
+ERROR Available runtimes on disk: claude.
+```
+
+### Scope (Phase 1)
+
+- No capability-matrix enforcement in the dispatcher
+  ([contract point 7](#7-capability-declaration) is a separate issue) — the seam
+  only routes; it does not validate a runtime's feature set.
+- `spawn-claude.sh`, `claude-wrapper.sh`, the Rust `loom-daemon`, and the Python
+  `loom-tools` callers are unchanged; migrating callers onto `spawn-worker.sh`
+  is a follow-up once the seam has soaked.
 
 ## Fork mapping table
 

@@ -8,6 +8,9 @@
       "known_hosts": []
     }
   },
+  "runtimes": {
+    "default": "claude"
+  },
   "safehouse": {
     "enabled": false,
     "socket": null,

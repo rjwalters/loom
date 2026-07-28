@@ -238,6 +238,9 @@ Configuration lives in `.loom/config.json` (committed for team sharing): a
   self-update, epic supervisor: [`.loom/docs/daemon-reference.md`](.loom/docs/daemon-reference.md)
   §Operability (precedence **env > config > default**; daemon defaults FLAGS-OFF).
 - **Post-Builder quality gate (`buildGate`)** — [`.loom/docs/build-gate.md`](.loom/docs/build-gate.md).
+- **Runtime dispatch (`runtimes`)** — `spawn-worker.sh` selects the worker runtime
+  (`LOOM_RUNTIME` env > `runtimes.default` > `"claude"`), execing `spawn-<runtime>.sh`:
+  [`.loom/docs/runtime-adapters.md`](.loom/docs/runtime-adapters.md).
 - **Custom roles** — add `.loom/roles/<name>.md` (and optional `<name>.json`).
 - **Branch rulesets & repository settings** — set at install time or via
   `./scripts/install/setup-branch-protection.sh` / `setup-repository-settings.sh`.
@@ -299,8 +302,7 @@ map, downstream-consumer guidance —
   [build-gate](.loom/docs/build-gate.md) ·
   [forge-auth](.loom/docs/forge-authentication.md) /
   [github-auth](.loom/docs/github-authentication.md) ·
-  [safehouse](.loom/docs/safehouse.md) ·
-  [runtime-adapters](.loom/docs/runtime-adapters.md)
+  [safehouse](.loom/docs/safehouse.md)
 
 ---
 
