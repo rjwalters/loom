@@ -788,7 +788,14 @@ The disk math lives in a small sourceable helper so it is deterministic and unit
 ```bash
 source ./.loom/scripts/lib/disk-headroom.sh
 REPO_ROOT="$(git rev-parse --show-toplevel)"
-FREE_GB="$(loom_worktree_root_free_gb "$REPO_ROOT")"   # df's the RESOLVED worktree root (scratch volume), not the repo drive
+# df's the RESOLVED worktree root (scratch volume), not the repo drive.
+# Unknown != zero (#4164): loom_worktree_root_free_gb prints NOTHING and
+# returns non-zero when it cannot actually measure free space (missing arg,
+# unresolvable worktree root, a failing/malformed `df`) — capture the exit
+# status here and DO NOT feed a fake "0" into loom_wave_size_from_disk below;
+# that used to be indistinguishable from a genuinely full disk.
+DISK_PROBE_OK=true
+FREE_GB="$(loom_worktree_root_free_gb "$REPO_ROOT")" || DISK_PROBE_OK=false
 ```
 
 Then resolve by branch (`CAND` = number of surviving candidate issues):
@@ -808,14 +815,36 @@ else  # use_subagent (no daemon, single-token pool, --no-daemon, daemon-owned ch
     export LOOM_SUBAGENT_WAVE_CAP
     MECH=subagent; MECHANISM="in-session subagent"
 fi
-# The helper prints two lines: size on line 1, reason token on line 2.
-# Capture both without `mapfile` (a bash-4.0+ builtin) so this works under
-# macOS's default /bin/bash 3.2: grab stdout once, then split by line.
-_WS_OUT="$(loom_wave_size_from_disk "$MECH" "$CAND" "$FREE_GB")"
-WAVE_SIZE="$(sed -n '1p' <<<"$_WS_OUT")"; REASON="$(sed -n '2p' <<<"$_WS_OUT")"
+if [[ "$DISK_PROBE_OK" == true ]]; then
+    # The helper prints two lines: size on line 1, reason token on line 2.
+    # Capture both without `mapfile` (a bash-4.0+ builtin) so this works under
+    # macOS's default /bin/bash 3.2: grab stdout once, then split by line.
+    _WS_OUT="$(loom_wave_size_from_disk "$MECH" "$CAND" "$FREE_GB")"
+    WAVE_SIZE="$(sed -n '1p' <<<"$_WS_OUT")"; REASON="$(sed -n '2p' <<<"$_WS_OUT")"
+else
+    # Unknown != zero (#4164): the disk probe failed, so SKIP the disk clamp
+    # entirely rather than feeding a bogus 0 into loom_wave_size_from_disk
+    # (which would floor the wave size to 1 and log reason "floor" —
+    # indistinguishable from a genuinely full disk). Fall back to
+    # K = min(target, CAND) with no disk term at all.
+    if [[ "$MECH" == daemon ]]; then
+        _TARGET="${LOOM_DAEMON_WAVE_TARGET:-10}"
+    else
+        _TARGET="$LOOM_SUBAGENT_WAVE_CAP"
+    fi
+    if (( CAND < _TARGET )); then
+        WAVE_SIZE="$CAND"
+    else
+        WAVE_SIZE="$_TARGET"
+    fi
+    (( WAVE_SIZE < 1 )) && WAVE_SIZE=1
+    REASON="unknown"
+fi
 ```
 
 `loom_wave_size_from_disk` prints two lines — the clamped size `K = min(target, floor(free_gb / LOOM_PER_WORKTREE_GB), CAND)` with a floor of 1 (never 0, even on a full disk) on line 1, and a machine reason token (`target` / `candidates` / `disk` / `floor`) on line 2. `LOOM_PER_WORKTREE_GB` defaults to a conservative 2 GB and is env-overridable for large-repo operators. The target is **10** for the daemon path; for the subagent path it is the **core-scaled** `clamp(floor((cores-2)/4), 3, 6)` (#3693) — resolved into `LOOM_SUBAGENT_WAVE_CAP` just above via `loom_subagent_target_from_cores` / `loom_detect_cores`, floor 3 on small/shared hosts, ceiling 6 on big ones — and an operator-set `LOOM_SUBAGENT_WAVE_CAP` env value always overrides it.
+
+**When the disk probe fails** (`DISK_PROBE_OK=false`, #4164), skip `loom_wave_size_from_disk` entirely — its pure-integer contract is unchanged and is not the caller-side fallback policy's home — and resolve `WAVE_SIZE = min(target, CAND)` (floor 1) with the reason token `unknown`, so an unmeasurable probe can never masquerade as a measured `0`.
 
 **Emit a one-line reason** so the operator understands any reduction. Map the reason token to a human sentence, adding the backend-specific context:
 
@@ -827,6 +856,7 @@ WAVE_SIZE="$(sed -n '1p' <<<"$_WS_OUT")"; REASON="$(sed -n '2p' <<<"$_WS_OUT")"
 | any, `candidates` | `wave size K, mechanism=<m>: reduced to K (only K candidate issues)` |
 | any, `disk` | `wave size K, mechanism=<m>: reduced to K (only <FREE_GB> GB free on <worktree-root>)` |
 | any, `floor` | `wave size 1, mechanism=<m>: reduced to 1 (only <FREE_GB> GB free on <worktree-root>)` |
+| any, `unknown` | `wave size K, mechanism=<m>: disk headroom unknown (probe failed on <worktree-root>) — disk clamp skipped` |
 
 The resolved `WAVE_SIZE` replaces `--builders-per-wave` everywhere the wave-partition consumers below reference it. On the **daemon path** `WAVE_SIZE` is the concurrency **target** the operator should expect (and that `--dry-run` reports) — the daemon runs each candidate as an independent detached process, so it is not a hard in-session partition. On the **subagent path** `WAVE_SIZE` is the literal wave partition size feeding the `min(...)` dispatch expression in the Wave Lifecycle. In both cases, **never raise the subagent ceiling toward 10** — the subagent auto default core-scales within `[3, 6]` (#3693), and true high parallelism toward 10 is the daemon path's job. (This is a width ceiling; the #3289 "one level deep" nesting rule is a separate, unchanged constraint the daemon path exists to route around.)
 
