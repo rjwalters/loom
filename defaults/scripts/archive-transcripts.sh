@@ -46,6 +46,10 @@
 
 set -uo pipefail
 
+_ARCHIVE_TRANSCRIPTS_SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=./lib/config-resolver.sh
+source "$_ARCHIVE_TRANSCRIPTS_SCRIPT_DIR/lib/config-resolver.sh"
+
 # ------------------------------------------------------------------ output ---
 RED='\033[0;31m'; GREEN='\033[0;32m'; BLUE='\033[0;34m'; YELLOW='\033[1;33m'
 CYAN='\033[0;36m'; NC='\033[0m'
@@ -101,14 +105,21 @@ PROJECTS_DIR="$CLAUDE_BASE/projects"
 # and for the config.json read).  A worktree resolves to the worktree root.
 REPO_ROOT="$(git -C "$SOURCE_CWD" rev-parse --show-toplevel 2>/dev/null || true)"
 REPO_LABEL="$(basename "${REPO_ROOT:-$SOURCE_CWD}")"
-CONFIG_JSON="${REPO_ROOT:+$REPO_ROOT/.loom/config.json}"
 
+# Config read via the config-resolver tier chain (#4062) instead of a single
+# hand-rolled `.loom/config.json` read — a `.loom-project/project.json` or
+# `.loom-local/local.json` override is picked up too. Only attempted when
+# REPO_ROOT resolved (best-effort, same as the historical CONFIG_JSON guard).
 CFG_ENABLED=false
 CFG_DIR=""
-if [[ -n "${CONFIG_JSON:-}" && -f "$CONFIG_JSON" ]] && command -v jq >/dev/null 2>&1; then
-  # Best-effort: malformed JSON -> jq fails -> disabled default preserved.
-  CFG_ENABLED="$(jq -r '.loom.transcriptArchive.enabled // false' "$CONFIG_JSON" 2>/dev/null || echo false)"
-  CFG_DIR="$(jq -r '.loom.transcriptArchive.dir // ""' "$CONFIG_JSON" 2>/dev/null || echo "")"
+if [[ -n "${REPO_ROOT:-}" ]] && command -v jq >/dev/null 2>&1; then
+  # Resolve the merged effective config ONCE (config-resolver, #4062) — then
+  # extract both keys from that single resolved JSON via jq, rather than two
+  # loom_config_get calls that would each re-merge all four config tiers.
+  # Best-effort: a malformed tier soft-fails to {} -> disabled default preserved.
+  _archive_cfg="$(loom_resolve_config "$REPO_ROOT")"
+  CFG_ENABLED="$(echo "$_archive_cfg" | jq -r '.loom.transcriptArchive.enabled // false' 2>/dev/null || echo false)"
+  CFG_DIR="$(echo "$_archive_cfg" | jq -r '.loom.transcriptArchive.dir // ""' 2>/dev/null || echo "")"
 fi
 
 ENABLED=false

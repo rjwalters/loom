@@ -21,11 +21,29 @@
 #
 # Forge detection priority:
 #   1. LOOM_FORGE_TYPE env var
-#   2. .loom/config.json forge.type (if not "auto")
+#   2. Resolved config (config-resolver tier chain) forge.type (if not "auto")
 #   3. Auto-detect from git remote origin URL
 #   4. Default to "github"
+#
+# Config root resolution (#4062, decision recorded in epic #4081): the
+# resolved-config root is $REPO_ROOT (env) > $WORKSPACE_ROOT (env) > the
+# CANONICAL repo root via `git rev-parse --git-common-dir` — never the
+# worktree CWD. This mirrors spawn-claude.sh's #3938 precedent: forge auth is
+# exactly the kind of thing that must not silently resolve against the wrong
+# (worktree-local) directory.
 
 set -euo pipefail
+
+# ${BASH_SOURCE[0]:-$0} (not bare ${BASH_SOURCE[0]}) -- the bash+zsh-portable
+# self-path idiom from #3680. Slash commands (champion-reference.md,
+# champion-pr-merge.md) `source` this file DIRECTLY into the invoking shell
+# via an absolute path, which on macOS is often zsh (the Bash tool's default
+# shell). Under zsh, BASH_SOURCE is unset, so a bare ${BASH_SOURCE[0]}
+# resolves to the shell's CWD instead of this lib dir and the source below
+# fails (zsh sets $0 to the sourced file's own path, which recovers it).
+_LOOM_FORGE_HELPERS_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
+# shellcheck source=./config-resolver.sh
+source "$_LOOM_FORGE_HELPERS_LIB_DIR/config-resolver.sh"
 
 # --- Forge Detection ---
 
@@ -34,6 +52,33 @@ FORGE_TYPE=""
 _GITEA_BASE_URL=""
 _GITEA_TOKEN=""
 _GITEA_USERNAME=""
+
+# _forge_config_root -> echoes the root to resolve config from.
+# Precedence: $REPO_ROOT (env) > $WORKSPACE_ROOT (env) > canonical repo root
+# via `git rev-parse --git-common-dir` (parent of the common .git dir — works
+# identically from the main checkout or any linked worktree) > "." as a last
+# resort when git itself is unavailable (e.g. not inside a git repo).
+_forge_config_root() {
+  if [[ -n "${REPO_ROOT:-}" ]]; then
+    echo "$REPO_ROOT"
+    return 0
+  fi
+  if [[ -n "${WORKSPACE_ROOT:-}" ]]; then
+    echo "$WORKSPACE_ROOT"
+    return 0
+  fi
+
+  local git_common_dir
+  if git_common_dir="$(git rev-parse --git-common-dir 2>/dev/null)"; then
+    if [[ "$git_common_dir" != /* ]]; then
+      git_common_dir="$(cd "$git_common_dir" && pwd)"
+    fi
+    dirname "$git_common_dir"
+    return 0
+  fi
+
+  echo "."
+}
 
 # Detect forge type from environment, config, or remote URL.
 # Sets FORGE_TYPE to "github" or "gitea".
@@ -55,19 +100,18 @@ forge_detect() {
     esac
   fi
 
-  # 2. Config file
-  local config_file
-  if [[ -n "${REPO_ROOT:-}" ]]; then
-    config_file="$REPO_ROOT/.loom/config.json"
-  elif [[ -n "${WORKSPACE_ROOT:-}" ]]; then
-    config_file="$WORKSPACE_ROOT/.loom/config.json"
-  else
-    config_file=".loom/config.json"
-  fi
+  # Resolve the merged effective config ONCE per invocation (config-resolver,
+  # #4062) and reuse it below for both the forge.type check and the
+  # forge.gitea.url autodetect fallback — never re-merge the tier chain per
+  # key within a single call.
+  local _forge_root _forge_cfg
+  _forge_root=$(_forge_config_root)
+  _forge_cfg=$(loom_resolve_config "$_forge_root")
 
-  if [[ -f "$config_file" ]] && command -v jq &>/dev/null; then
+  # 2. Resolved config — forge.type (if not "auto")
+  if command -v jq >/dev/null 2>&1; then
     local config_type
-    config_type=$(jq -r '.forge.type // "auto"' "$config_file" 2>/dev/null || echo "auto")
+    config_type=$(echo "$_forge_cfg" | jq -r '.forge.type // "auto"' 2>/dev/null || echo "auto")
     local config_lower
     config_lower=$(echo "$config_type" | tr '[:upper:]' '[:lower:]')
     case "$config_lower" in
@@ -87,9 +131,9 @@ forge_detect() {
       return 0
     fi
     # Check if host matches configured Gitea URL
-    if [[ -f "$config_file" ]] && command -v jq &>/dev/null; then
+    if command -v jq >/dev/null 2>&1; then
       local gitea_url
-      gitea_url=$(jq -r '.forge.gitea.url // ""' "$config_file" 2>/dev/null || echo "")
+      gitea_url=$(echo "$_forge_cfg" | jq -r '.forge.gitea.url // ""' 2>/dev/null || echo "")
       if [[ -n "$gitea_url" ]]; then
         local gitea_host
         gitea_host=$(_extract_host "$gitea_url")
@@ -133,24 +177,22 @@ _load_gitea_config() {
   # Username: env var first, then config. When set, switches to HTTP Basic Auth.
   _GITEA_USERNAME="${GITEA_USERNAME:-}"
 
-  local config_file
-  if [[ -n "${REPO_ROOT:-}" ]]; then
-    config_file="$REPO_ROOT/.loom/config.json"
-  elif [[ -n "${WORKSPACE_ROOT:-}" ]]; then
-    config_file="$WORKSPACE_ROOT/.loom/config.json"
-  else
-    config_file=".loom/config.json"
-  fi
+  # Resolve the merged effective config ONCE (config-resolver, #4062) — only
+  # when at least one of the three env vars above didn't already win, and
+  # only once regardless of how many of the three keys are still missing.
+  if [[ -z "$_GITEA_TOKEN" || -z "$_GITEA_BASE_URL" || -z "$_GITEA_USERNAME" ]] && command -v jq >/dev/null 2>&1; then
+    local _forge_root _forge_cfg
+    _forge_root=$(_forge_config_root)
+    _forge_cfg=$(loom_resolve_config "$_forge_root")
 
-  if [[ -f "$config_file" ]] && command -v jq &>/dev/null; then
     if [[ -z "$_GITEA_TOKEN" ]]; then
-      _GITEA_TOKEN=$(jq -r '.forge.gitea.token // ""' "$config_file" 2>/dev/null || echo "")
+      _GITEA_TOKEN=$(echo "$_forge_cfg" | jq -r '.forge.gitea.token // ""' 2>/dev/null || echo "")
     fi
     if [[ -z "$_GITEA_BASE_URL" ]]; then
-      _GITEA_BASE_URL=$(jq -r '.forge.gitea.url // ""' "$config_file" 2>/dev/null || echo "")
+      _GITEA_BASE_URL=$(echo "$_forge_cfg" | jq -r '.forge.gitea.url // ""' 2>/dev/null || echo "")
     fi
     if [[ -z "$_GITEA_USERNAME" ]]; then
-      _GITEA_USERNAME=$(jq -r '.forge.gitea.username // ""' "$config_file" 2>/dev/null || echo "")
+      _GITEA_USERNAME=$(echo "$_forge_cfg" | jq -r '.forge.gitea.username // ""' 2>/dev/null || echo "")
     fi
   fi
 

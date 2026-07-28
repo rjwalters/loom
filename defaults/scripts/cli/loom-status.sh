@@ -22,6 +22,10 @@
 
 set -euo pipefail
 
+_LOOM_STATUS_SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=../lib/config-resolver.sh
+source "$_LOOM_STATUS_SCRIPT_DIR/../lib/config-resolver.sh"
+
 # Find repository root
 find_repo_root() {
     local dir="$PWD"
@@ -51,8 +55,38 @@ if [[ -z "$REPO_ROOT" ]]; then
     exit 1
 fi
 
-CONFIG_FILE="$REPO_ROOT/.loom/config.json"
 TMUX_SOCKET="loom"
+
+# List of config tier paths that exist on disk (lowest to highest precedence).
+# Used only for the human "Config:" display line -- naming every present tier
+# instead of a single legacy path (#4062).
+_loom_status_config_tiers_present() {
+    local dp
+    dp="$(_loom_config_private_defaults_path)"
+    [[ -n "$dp" && -f "$dp" ]] && echo "$dp"
+    [[ -f "$REPO_ROOT/$LOOM_CONFIG_LEGACY_REL" ]] && echo "$REPO_ROOT/$LOOM_CONFIG_LEGACY_REL"
+    [[ -f "$REPO_ROOT/$LOOM_CONFIG_PROJECT_REL" ]] && echo "$REPO_ROOT/$LOOM_CONFIG_PROJECT_REL"
+    [[ -f "$REPO_ROOT/$LOOM_CONFIG_LOCAL_REL" ]] && echo "$REPO_ROOT/$LOOM_CONFIG_LOCAL_REL"
+    # Explicit trailing success: under `set -o pipefail`, this function's exit
+    # status is whatever its last statement returned. The common case (no
+    # local/private-defaults tier present) makes the last `[[ -f ]] && echo`
+    # above false -- without this, callers piping this function's output
+    # (e.g. `_loom_status_config_tiers_present | paste ...`) would see the
+    # pipeline fail and, combined with `set -e`, abort the whole script
+    # (#4062 regression).
+    return 0
+}
+
+# Resolve the effective config ONCE per invocation (config-resolver, #4062)
+# and memoize it -- read_terminals() may be called from both emit_json and
+# emit_human, and must not re-merge the tier chain on every call.
+_LOOM_STATUS_EFFECTIVE_CONFIG=""
+_loom_status_effective_config() {
+    if [[ -z "$_LOOM_STATUS_EFFECTIVE_CONFIG" ]]; then
+        _LOOM_STATUS_EFFECTIVE_CONFIG="$(loom_resolve_config "$REPO_ROOT")"
+    fi
+    echo "$_LOOM_STATUS_EFFECTIVE_CONFIG"
+}
 
 # ANSI colors
 if [[ -t 1 ]]; then
@@ -184,10 +218,13 @@ work_queue_json() {
         '{"loom:issue":$issue, "loom:review-requested":$review_requested, "loom:pr":$pr}'
 }
 
-# Read the configured terminals as compact JSON array (or "[]")
+# Read the configured terminals as compact JSON array (or "[]"), resolved
+# through the config-resolver tier chain (#4062) rather than a single-tier
+# .loom/config.json read -- a workspace may supply terminals entirely from
+# .loom-project/project.json.
 read_terminals() {
-    if [[ -f "$CONFIG_FILE" ]] && command -v jq &>/dev/null; then
-        jq -c '.terminals // []' "$CONFIG_FILE" 2>/dev/null || echo "[]"
+    if command -v jq &>/dev/null; then
+        _loom_status_effective_config | jq -c '.terminals // []' 2>/dev/null || echo "[]"
     else
         echo "[]"
     fi
@@ -268,10 +305,16 @@ emit_human() {
     echo -e "${BOLD}Loom Agent Pool${NC}"
     echo ""
     echo -e "  Workspace: ${CYAN}$REPO_ROOT${NC}"
-    if [[ -f "$CONFIG_FILE" ]]; then
-        echo -e "  Config:    ${CYAN}$CONFIG_FILE${NC}"
+    # Names every config tier present on disk instead of a single legacy path
+    # -- naming only .loom/config.json would misreport "(none)" once a higher
+    # tier (e.g. .loom-project/project.json alone) supplies the effective
+    # config (#4062).
+    local config_tiers_present
+    config_tiers_present="$(_loom_status_config_tiers_present | paste -sd ', ' - 2>/dev/null)"
+    if [[ -n "$config_tiers_present" ]]; then
+        echo -e "  Config:    ${CYAN}$config_tiers_present${NC}"
     else
-        echo -e "  Config:    ${GRAY}(none — $CONFIG_FILE not found)${NC}"
+        echo -e "  Config:    ${GRAY}(none found — checked .loom/config.json, .loom-project/project.json, .loom-local/local.json)${NC}"
     fi
     echo -e "  Socket:    ${CYAN}tmux -L $TMUX_SOCKET${NC}"
     echo ""
