@@ -1,0 +1,143 @@
+name: Fork Drift Monitor
+
+# Daily check comparing each tracked fork's `main` against this repo's `main`
+# (ahead/behind commit counts), reported from upstream's perspective. On
+# detecting fork-ahead commits (harvestable work not yet landed here), opens
+# (or updates) a single deduplicated `loom:operator-only` issue per fork
+# pointing at the harvest procedure in docs/guides/fork-drift.md.
+#
+# This repo IS the upstream -- gpeyton/loom (tracked in #4165) diverged by
+# 115 commits before anyone noticed, forcing a large one-shot harvest
+# triage (#4190-#4200). This workflow closes that gap with a recurring,
+# cheap (pure git + gh, no Claude tokens, no extra secrets) drift signal so
+# future divergence is caught incrementally instead of discovered cold.
+#
+# Direction note: this is the reverse of the fork's own upstream-drift
+# workflow (gpeyton/loom#45, commit 3c80bec9), which watches *us* from the
+# fork's side. Adapting that workflow here means swapping every
+# ahead/behind arrow: "fork-ahead" (commits on fork/main not in our main) is
+# the harvestable-work signal that opens an issue; "fork-behind" (our
+# commits the fork hasn't synced) is reported only as divergence-risk
+# context in the job summary -- syncing that direction is the fork's own
+# workflow's job, not ours. See ADR-0012 for the fork-collaboration model
+# this workflow supports (PRs from the fork onto runtime-neutral surfaces;
+# everything else gets triaged into per-commit harvest issues here).
+#
+# The fork's workflow also runs `npm run test:codex` (a parity suite that
+# does not exist in this repo's package.json) alongside the drift check.
+# That step and its continue-on-error/final-fail-step machinery are dropped
+# entirely here -- drift observation needs no test leg.
+#
+# Disabled by default (cron commented out) -- matches the existing
+# "don't burn Actions minutes without an operator opt-in" convention used by
+# the .github/workflows/loom-*.yml support-role workflows. workflow_dispatch
+# is always available for manual smoke testing.
+
+on:
+  # schedule:
+  #   # Uncomment to enable daily drift checks. Pick a low-traffic UTC hour.
+  #   - cron: "23 6 * * *"
+  workflow_dispatch:  # Allow manual runs for smoke testing.
+
+permissions:
+  contents: read
+  issues: write
+
+env:
+  # Tracked forks to compare against, one per line ("owner/repo"). Seeded
+  # with the one known active fork from #4165. mattcproctor/loom is a known
+  # second fork -- uncomment to track it too once it warrants recurring
+  # drift observation.
+  TRACKED_FORKS: |
+    gpeyton/loom
+    # mattcproctor/loom
+
+jobs:
+  check-drift:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Measure and report fork drift
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          summary="## Fork Drift Report"$'\n\n'
+          summary+="| Fork | Fork-ahead (harvestable) | Fork-behind (sync risk) |"$'\n'
+          summary+="|------|---------------------------|--------------------------|"$'\n'
+
+          # Read the non-comment, non-blank lines of TRACKED_FORKS into an array.
+          forks=()
+          while IFS= read -r line; do
+            line="${line%%#*}"                # strip trailing comments
+            line="$(echo -n "$line" | xargs)"  # trim whitespace
+            [[ -n "$line" ]] && forks+=("$line")
+          done <<< "${TRACKED_FORKS}"
+
+          if [[ ${#forks[@]} -eq 0 ]]; then
+            echo "No tracked forks configured; nothing to check." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          for fork in "${forks[@]}"; do
+            remote_name="fork-$(echo "$fork" | tr '/' '-')"
+
+            echo "::group::Checking ${fork}"
+
+            # Fail closed with a clear error if the fork repo is unreachable,
+            # rather than silently reporting zero drift.
+            if ! git remote add "$remote_name" "https://github.com/${fork}.git" 2>/dev/null; then
+              git remote set-url "$remote_name" "https://github.com/${fork}.git"
+            fi
+
+            if ! git fetch --quiet "$remote_name" main; then
+              echo "::endgroup::"
+              echo "::error::Failed to fetch ${fork}:main -- fork repo unreachable or renamed default branch. Skipping drift report for this fork rather than filing a bogus one." >&2
+              summary+="| \`${fork}\` | **fetch failed** | **fetch failed** |"$'\n'
+              continue
+            fi
+
+            fork_ahead="$(git rev-list --count "main..${remote_name}/main")"
+            fork_behind="$(git rev-list --count "${remote_name}/main..main")"
+            echo "::endgroup::"
+
+            summary+="| \`${fork}\` | ${fork_ahead} commit(s) | ${fork_behind} commit(s) |"$'\n'
+
+            if [[ "$fork_ahead" == "0" ]]; then
+              continue
+            fi
+
+            title="chore: review ${fork} fork drift"
+            sync_doc_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/blob/main/docs/guides/fork-drift.md"
+
+            existing_number="$(gh issue list --state open --search "\"$title\" in:title" \
+              --json number,title --jq ".[] | select(.title == \"$title\") | .number" | head -1)"
+
+            body=$(cat <<EOF
+          Fork drift check found **${fork_ahead}** commit(s) on \`${fork}:main\` not yet harvested into this repo (upstream). This repo is currently **${fork_behind}** commit(s) ahead of what \`${fork}\` has synced from us.
+
+          Follow [\`docs/guides/fork-drift.md\`](${sync_doc_url}) to fetch the fork, review \`main..${remote_name}/main\`, and either file per-commit/per-bucket harvest issues at \`loom:triage\`, or (for runtime-neutral surfaces) invite a PR from the fork per ADR-0012.
+
+          _Last checked: $(date -u +"%Y-%m-%dT%H:%M:%SZ") (workflow run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID})_
+          EOF
+            )
+
+            if [[ -n "$existing_number" ]]; then
+              gh issue comment "$existing_number" --body "$body"
+              echo "Updated existing fork-drift issue #$existing_number for ${fork}"
+            else
+              label_args=()
+              if gh label list --limit 200 --json name --jq '.[].name' | grep -Fxq 'loom:operator-only'; then
+                label_args=(--label "loom:operator-only")
+              fi
+              gh issue create --title "$title" "${label_args[@]}" --body "$body"
+            fi
+          done
+
+          echo "$summary" >> "$GITHUB_STEP_SUMMARY"
