@@ -83,6 +83,7 @@ partially-migrated repo work correctly).
 | `autonomous.workFinder`, `autonomous.mainHealthGate`, `autonomous.roleRunner`, `autonomous.perTokenConcurrency` | object/number | Project (default) **or** Local (host override) | Same reasoning as model overrides: the *policy* (should this repo run a work finder at all) is project-shared; the *capacity* tuning for one specific host (e.g. `perTokenConcurrency` sized to that host's account pool) is a natural `.loom-local` override. |
 | `worktree.root` | string | Local (`.loom-local/local.json`) | Inherently host-specific (an external scratch volume path) — never meant to be shared across machines. |
 | `forge.*` (type, gitea url/token) | object | Project (type/url) / Local (token, if not using a repo secret) | `forge.type`/`forge.gitea.url` describe the repo; a raw token belongs host-local, never committed. |
+| `safehouse.*` (`enabled`, `socket`, `room`, `persona`) | object | Project (policy) **or** Local (host socket) | Optional daemon-side fleet-comms narration (#3997). Whether a repo narrates at all (`enabled`/`persona`/`room`) is a project-shared policy; the `socket` path (and often `enabled`) is a natural `.loom-local` host override since `safehoused` runs per-host. Resolved by `loom-daemon/src/safehouse.rs` with **env > config > default(disabled)**; see [`.loom/docs/safehouse.md`](../../.loom/docs/safehouse.md). |
 
 `.loom-local/local.json` has no fixed schema in this issue beyond "same shape
 as `.loom-project/project.json`, host-scoped override" — the epic explicitly

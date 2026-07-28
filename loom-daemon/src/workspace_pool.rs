@@ -82,6 +82,20 @@ impl WorkspacePool {
         }
     }
 
+    /// Start the optional safehouse fleet-comms narration sink (#3997) for
+    /// `repo_root`. The sink subscribes the pool's shared [`Arc<EventBus>`] —
+    /// the single place the bus is owned — and spawns on the daemon runtime, so
+    /// every daemon-dispatched sweep's lifecycle transitions narrate into the
+    /// safehouse room with no per-role changes. **Byte-for-byte no-op** when
+    /// `safehouse.enabled` is false/absent: [`crate::safehouse::spawn_sink`]
+    /// returns without subscribing or touching a socket. Best-effort by
+    /// contract — a missing/refused peer degrades to a `warn`, never a sweep
+    /// failure. The handle is detached (daemon-lifetime).
+    pub fn start_safehouse_narration(&self, repo_root: &Path) {
+        let config = crate::safehouse::resolve_config(repo_root);
+        let _ = crate::safehouse::spawn_sink(config, &self.event_bus, &self.runtime);
+    }
+
     /// Seed the pool with a pre-built registry for `root` — used for the default
     /// workspace (the daemon's `sweep_workspace`), whose registry + reaper are
     /// already constructed and owned by `main` and are also used by the IPC
