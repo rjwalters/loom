@@ -17,7 +17,7 @@ loom <command> [options]
 | `restart` | Restart the machine-level `loom-daemon` (drain-and-roll; falls back to stop+start) |
 | `status`| Show machine-level + current-repo status (read-only) |
 | `sweep <issue>` | Dispatch `/loom:sweep <issue>` for the current repo |
-| `update`| Thin delegate to `loom-daemon-update.sh` (no rebuild logic of its own) |
+| `update`| Refresh the user-scoped mcp-loom bundle (#4230), then thin-delegate the daemon update to `loom-daemon-update.sh` |
 
 Environment: `LOOM_HOME` overrides the machine-level checkout location (default
 `~/.local/share/loom`).
@@ -98,12 +98,80 @@ wins. In a **non-repo** directory only the private-defaults tier contributes
 (graceful degradation, not an error). When `jq` is unavailable the dispatcher
 says so explicitly — it does **not** present a `jq`-less host as "no config".
 
-## `update` is a thin verb (scope guard, Finding 3)
+## `update`: mcp-loom bundle refresh + thin daemon delegate
 
-`loom update` only resolves the machine checkout and delegates to the **existing**
-`loom-daemon-update.sh` (built by #3968, extended by the shipped #4055 self-update
-loop). It implements **no** rebuild / reprovision / restart logic itself, so it
-neither pre-empts #4017 (auto-rebuild-when-stale) nor duplicates #4055.
+`loom update` does two things, in order:
+
+1. **Refreshes the user-scoped mcp-loom bundle** (#4230, epic #3835 Phase 3c).
+   It rebuilds `~/.local/share/loom/mcp-loom/dist/index.js` when the bundle is
+   missing or stale (older than any file under `mcp-loom/src/`), so the one
+   user-scope `loom` MCP server that serves **every** repo picks up new tools —
+   the #3803 stale-dist drift fix. This step is best-effort: a build failure
+   warns but never blocks the daemon update. It is skipped on `--check` /
+   `--dry-run` and on a consumer-repo checkout that does not ship `mcp-loom/`.
+2. **Delegates the daemon update** to the **existing** `loom-daemon-update.sh`
+   (built by #3968, extended by the shipped #4055 self-update loop). The daemon
+   half stays thin — the dispatcher implements **no** cargo rebuild / reprovision
+   / restart logic of its own, so it neither pre-empts #4017 nor duplicates
+   #4055. (The mcp-loom refresh lives in the dispatcher, not in
+   `loom-daemon-update.sh`, because that delegate is daemon-scoped and
+   short-circuits when the binary is already up to date — which would skip the
+   bundle refresh on an mcp-loom-only roll.)
+
+## User-scoped `loom` MCP server (#4230, epic #3835 Phase 3c)
+
+The `loom` MCP server is registered **once per machine at user scope**, not
+per-repo:
+
+```
+claude mcp add --scope user loom -- node ~/.local/share/loom/mcp-loom/dist/index.js
+```
+
+`scripts/install-loom.sh` does this at install time (idempotently — it removes
+any existing user-scope entry first). A single user-scoped instance serves every
+repo because mcp-loom resolves the **invoking** repo from its process CWD
+(`getWorkspacePath()` in `mcp-loom/src/shared/config.ts`): `LOOM_WORKSPACE` env
+override → walk up from `process.cwd()` to a `.loom/`/`.git` repo root (worktree
+CWDs resolve to the main checkout via the git common dir, mirroring
+`resolve_mcp_workspace()` in `claude-wrapper.sh`) → **loud failure** if no repo
+root is found (there is deliberately **no** silent `~/GitHub/loom` fallback —
+under user scope that would silently operate on the wrong repo).
+
+### Why per-repo `.mcp.json` generation is demoted, and the shadowing hazard
+
+Claude Code MCP scope precedence is **local > project > user**. A lingering
+project-scope `loom` entry in a repo's `.mcp.json` therefore **outranks** the
+user-scope server and would silently pin a stale per-repo bundle forever — the
+#3803 drift class reborn as a *shadowing* drift. So:
+
+- `scripts/setup-mcp.sh` is **demoted**: it no longer emits a `loom` entry, and
+  it **strips** any pre-existing project-scope `loom` entry from the target's
+  `.mcp.json` (removing the file if `loom` was its only server). Its residual
+  role is **safehouse only** — when `safehouse` is enabled it emits a
+  `.mcp.json` containing just the per-repo `safehouse` server (whose socket +
+  persona are inherently per-repo/session; the per-worker persona is still
+  injected at spawn time by `spawn-claude.sh --mcp-config`, unchanged).
+- The `.mcp.json` symlink step in `worktree.sh` / `pr-worktree.sh` becomes
+  **vestigial** under user scope (a user-scope server applies from any CWD) but
+  is left intact — it is harmless and still serves un-migrated / safehouse repos.
+
+### `claude-wrapper.sh` behavior with no `.mcp.json`
+
+Both `claude-wrapper.sh` gates key off the project `.mcp.json`; under user scope
+there is none, so their behavior was verified/adjusted (#4230):
+
+- **Pre-flight** (`check_mcp_server`): an absent `.mcp.json` is a **non-fatal
+  skip** (it always was) — now documented as the *expected* user-scope state.
+  The per-session bundle-staleness gate that skip removes moves to `loom update`.
+- **Connect gating** (startup monitor): previously, an absent `.mcp.json` fell
+  into the conservative "can't enumerate project MCPs → kill the session" branch,
+  which would wedge every migrated repo in a restart loop. It now recognizes the
+  no-`.mcp.json` + loom-connected case as **healthy** and continues.
+
+> **Debugging note (#4043):** if an MCP *tool* appears to hang during
+> verification, that is the known unary-bridge framing bug in `daemon.ts`
+> (`#4043`), not a registration fault — the CLI path is preferred for daemon
+> control today. This change only moves *where the server is registered from*.
 
 ## Machine mode: LOOM_MACHINE_CHECKOUT hand-off (Phase 3b, #4229)
 

@@ -368,8 +368,15 @@ check_mcp_server() {
 
     local mcp_config="${mcp_workspace}/.mcp.json"
     if [[ ! -f "${mcp_config}" ]]; then
-        log_warn "MCP config not found at ${mcp_config} - skipping MCP pre-flight"
-        return 0  # Non-fatal: MCP may not be configured
+        # Non-fatal skip. Absent .mcp.json is now the NORMAL, healthy state under
+        # user-scope `loom` registration (#4230, epic #3835 Phase 3c): the loom
+        # server is machine-level, not project-scoped, so there is no per-repo
+        # config to smoke-test here. The per-session bundle-staleness gate this
+        # skip removes moves to `loom update` (which rebuilds the served
+        # mcp-loom bundle for every repo at once). This skip must NOT be promoted
+        # to a failure — doing so would spuriously fail every migrated repo.
+        log_warn "MCP config not found at ${mcp_config} - skipping MCP pre-flight (expected under user-scope loom, #4230)"
+        return 0  # Non-fatal: MCP may not be configured (or is user-scoped)
     fi
 
     # Extract the MCP server entry point from .mcp.json
@@ -1437,9 +1444,22 @@ start_startup_monitor() {
                                 break
                             fi
                         done
+                    elif [[ ! -f "${mcp_json}" ]]; then
+                        # No project .mcp.json at all. Under user-scope `loom`
+                        # registration (#4230, epic #3835 Phase 3c) the loom
+                        # server is machine-level (registered via `claude mcp add
+                        # --scope user`), not project-scoped, so there are NO
+                        # project MCP servers to verify beyond loom — and loom
+                        # already connected (loom_connected==true above). So this
+                        # is the healthy user-scope path: continue. Killing here
+                        # (the pre-#4230 conservative behavior) would wedge every
+                        # no-.mcp.json repo in a pointless restart loop.
+                        log_info "Startup monitor: no project .mcp.json (user-scope loom server) and loom connected — continuing"
+                        all_project_ok=true
                     else
-                        # Can't determine project MCPs — fall back to
-                        # conservative kill behavior (see issue #2652).
+                        # .mcp.json present but jq missing — can't enumerate the
+                        # project MCPs it declares. Fall back to conservative kill
+                        # behavior (see issue #2652).
                         all_project_ok=false
                     fi
 

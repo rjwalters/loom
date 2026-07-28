@@ -5,9 +5,10 @@
  * and config file operations.
  */
 
+import { existsSync, readFileSync, statSync } from "node:fs";
 import { access, readFile, stat, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { dirname, isAbsolute, join, resolve } from "node:path";
 import type { ConfigFile, StateFile } from "../types.js";
 import { resolveEffectiveConfig } from "./config-resolver.js";
 
@@ -33,10 +34,116 @@ export const MCP_ACK_FILE = join(LOOM_DIR, "mcp-ack.json");
 export const SOCKET_PATH = process.env.LOOM_SOCKET_PATH || join(LOOM_DIR, "loom-daemon.sock");
 
 /**
- * Get the workspace path from environment or default
+ * Resolve the Loom repo root that owns a linked git worktree.
+ *
+ * A linked worktree's `.git` is a FILE containing `gitdir: <path>` that points
+ * into the main checkout's `.git/worktrees/<name>` directory. The main checkout
+ * root is therefore the grandparent of that gitdir (`…/.git/worktrees/<name>` →
+ * `…/.git` → `…`). This mirrors `resolve_mcp_workspace()` /
+ * `find_repo_root()` in the shell scripts (`defaults/scripts/claude-wrapper.sh`,
+ * `defaults/scripts/cli/loom-daemon-update.sh`) so the TS and Bash resolvers
+ * agree on which repo a worktree CWD maps to. Returns `null` when the `.git`
+ * file is unparseable.
+ */
+function resolveWorktreeRoot(worktreeDir: string, gitFilePath: string): string | null {
+  let content: string;
+  try {
+    content = readFileSync(gitFilePath, "utf-8");
+  } catch {
+    return null;
+  }
+  const match = content.match(/^gitdir:\s*(.+)$/m);
+  if (!match) {
+    return null;
+  }
+  let gitdir = match[1].trim();
+  if (!isAbsolute(gitdir)) {
+    // `gitdir:` may be recorded relative to the worktree directory.
+    gitdir = resolve(worktreeDir, gitdir);
+  }
+  // gitdir = <main>/.git/worktrees/<name>  →  <main>/.git  →  <main>
+  const commonGitDir = dirname(dirname(gitdir));
+  const root = dirname(commonGitDir);
+  return root || null;
+}
+
+/**
+ * Discover the Loom repo root by walking up from a starting directory.
+ *
+ * Precedence within each directory mirrors the shell `loom_detect_context`
+ * ordering (`scripts/loom`): a linked-worktree `.git` FILE is checked BEFORE the
+ * `.loom/` marker, because a repo that commits `.loom/` (the norm) carries a
+ * real `.loom/` directory inside every worktree checkout too — testing `.loom/`
+ * first would misclassify every worktree as its own root instead of resolving to
+ * the main checkout where `.loom/config.json` actually lives.
+ *
+ * Returns the resolved repo root, or `null` when no `.loom/`/`.git` marker is
+ * found before reaching the filesystem root. Callers translate `null` into a
+ * loud failure — there is deliberately NO silent `~/GitHub/loom` fallback (under
+ * user-scope MCP registration a single server instance serves every repo, so a
+ * hardcoded fallback would silently operate on the wrong repo).
+ */
+export function discoverWorkspaceRoot(startDir: string): string | null {
+  let dir = startDir;
+  // Bound the walk defensively; a normal path has far fewer components.
+  for (let i = 0; i < 256; i++) {
+    const gitPath = join(dir, ".git");
+    // Linked worktree: `.git` is a FILE. Resolve to the main checkout FIRST.
+    if (existsSync(gitPath) && statSync(gitPath).isFile()) {
+      const root = resolveWorktreeRoot(dir, gitPath);
+      if (root) {
+        return root;
+      }
+      // Unparseable `.git` file — treat this dir as the root rather than
+      // silently walking past a real repo boundary.
+      return dir;
+    }
+    // Consumer repo / source checkout: `.loom/` marks the root.
+    if (existsSync(join(dir, ".loom")) && statSync(join(dir, ".loom")).isDirectory()) {
+      return dir;
+    }
+    // Plain git repo with no committed `.loom/`: `.git` directory marks the root.
+    if (existsSync(gitPath) && statSync(gitPath).isDirectory()) {
+      return dir;
+    }
+    const parent = dirname(dir);
+    if (parent === dir) {
+      break; // reached the filesystem root
+    }
+    dir = parent;
+  }
+  return null;
+}
+
+/**
+ * Get the workspace path (Loom repo root the server operates on).
+ *
+ * Resolution order:
+ *   1. `LOOM_WORKSPACE` env override (highest precedence — explicit, keep).
+ *   2. CWD-based discovery: walk up from `process.cwd()` to a repo root
+ *      (`.loom/` or `.git` marker; worktree CWDs resolve to the main checkout).
+ *   3. Loud failure — throws. There is NO silent `~/GitHub/loom` fallback: under
+ *      user-scope MCP registration a single server serves every repo (issue
+ *      #4230, epic #3835 Phase 3c), so falling back to a hardcoded path would
+ *      silently operate on the WRONG repo — strictly worse than an error.
  */
 export function getWorkspacePath(): string {
-  return process.env.LOOM_WORKSPACE || join(homedir(), "GitHub", "loom");
+  const explicit = process.env.LOOM_WORKSPACE;
+  if (explicit && explicit.trim() !== "") {
+    return explicit;
+  }
+  const cwd = process.cwd();
+  const discovered = discoverWorkspaceRoot(cwd);
+  if (discovered) {
+    return discovered;
+  }
+  const message =
+    `[mcp-loom] Could not resolve a Loom workspace: LOOM_WORKSPACE is unset and no ` +
+    `.loom/ or .git repo root was found by walking up from ${cwd}. ` +
+    `Run the server from inside a Loom repo, or set LOOM_WORKSPACE explicitly. ` +
+    `(No silent ~/GitHub/loom fallback — see issue #4230.)`;
+  process.stderr.write(`${message}\n`);
+  throw new Error(message);
 }
 
 /**
