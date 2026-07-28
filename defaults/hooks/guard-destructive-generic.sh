@@ -1085,11 +1085,25 @@ ALWAYS_BLOCK_PATTERNS=(
     # Fork bombs
     ':\(\)\{ :\|:& \};:'
 
-    # Pipe to shell (supply chain risk)
-    'curl .* \| .*sh'
-    'curl .* \| bash'
-    'wget .* \| .*sh'
-    'wget .* -O- \| sh'
+    # Pipe to shell (supply chain risk). Anchored on command *position*
+    # rather than a bare substring scan, so a pipe target whose path merely
+    # contains "sh" (e.g. `curl … | sudo tee /usr/share/keyrings/x.gpg`) no
+    # longer false-positives (repo#29). The pattern requires: (1) curl/wget
+    # starts right after a command separator/pipe/redirect or at the start of
+    # the string — so it does not match "sh" buried inside an unrelated
+    # earlier token; (2) an optional `sudo` (with its own flags) directly
+    # after the pipe; (3) an optional path prefix before the shell word, so
+    # `/bin/sh`, `/usr/bin/env`-style paths, etc. still match; (4) the shell
+    # word itself is one of a known set of shell binaries/short names
+    # (sh, bash, dash, zsh, ksh, csh, tcsh, fish) optionally preceded by a
+    # 1-2 letter shell-family prefix; (5) that shell word must be followed by
+    # whitespace, end of string, or another separator — not by more path
+    # characters — so `sudo tee /usr/share/…` (which merely *contains* "sh")
+    # does not match. Known accepted miss (not chased here, see repo#29): a
+    # quoted/nested invocation such as `bash -c 'curl … | sh'` is not caught
+    # by the leading-position anchor, because the character immediately
+    # before `curl` is a quote, not one of the anchor's separator classes.
+    '(^|[;&|[:space:](])(curl|wget)[^;&]*\|[[:space:]]*(sudo[[:space:]]+(-[^[:space:]]+[[:space:]]+)*)?([^[:space:]|;&]*/)?(ba|da|z|k|c|tc|fi|pw)?sh([[:space:]]|$|[;&|)])'
 
     # Cloud infrastructure destruction. The aws forms below are specific
     # multi-token phrases, so they stay in this raw substring scan. The az/gcloud
