@@ -16,10 +16,9 @@
 //!
 //! # Conformance
 //!
-//! The authoritative model is the executable state machine in
-//! `loom-tools/src/loom_tools/state_machine.py` (issue #3841, merged in #3844).
-//! Its epic-supervisor lane defines exactly five derived states, all backed by
-//! `loom:epic`:
+//! [`epic_transition_table`] (below) is itself the authoritative model of the
+//! epic-supervisor lane — see its own doc comment (issue #4310). It defines
+//! exactly five derived states, all backed by `loom:epic`:
 //!
 //! ```text
 //! epic:needs_decomp → epic:designed → epic:active ⇄ epic:phase_join → epic:done
@@ -52,8 +51,7 @@ pub const MIN_PHASE_SECTIONS: usize = 2;
 /// A derived state of an open `loom:epic` issue.
 ///
 /// All five variants ride the single `loom:epic` GitHub label — they are
-/// *computed*, never stored as distinct labels. This mirrors the `derived=True`
-/// epic-supervisor lane in the Python state-machine model (#3841).
+/// *computed*, never stored as distinct labels (epic #3842, #3841).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum EpicState {
     /// Body has fewer than [`MIN_PHASE_SECTIONS`] `### Phase` sections; the epic
@@ -77,11 +75,11 @@ pub enum EpicState {
 }
 
 impl EpicState {
-    /// The canonical state id from the Python model
-    /// (`loom-tools/src/loom_tools/state_machine.py`), e.g. `"epic:needs_decomp"`.
+    /// The canonical state id from [`epic_transition_table`], e.g.
+    /// `"epic:needs_decomp"`.
     ///
-    /// Provided for conformance cross-checks and observability so the Rust
-    /// supervisor can name states identically to the authoritative graph.
+    /// Provided for observability so the Rust supervisor can name states
+    /// identically to the authoritative graph.
     #[must_use]
     pub fn as_state_id(self) -> &'static str {
         match self {
@@ -112,9 +110,8 @@ impl std::fmt::Display for EpicState {
 /// This is the **Rust side** of the epic sub-graph — the transitions among the
 /// five derived [`EpicState`]s that the supervisor loop drives. It exists as an
 /// explicit, inspectable artifact (rather than only implicitly inside
-/// `plan_epic_transition`) so it can be documented and, crucially,
-/// **conformance-checked** against the authoritative Python model in
-/// `loom-tools/src/loom_tools/state_machine.py` (epic #3842 Phase 4, #3873).
+/// `plan_epic_transition`) so it can be documented, tested, and reasoned about
+/// as its own authoritative source of truth (epic #3842 Phase 4, #3873; #4310).
 ///
 /// Only intra-lane edges are modelled — both [`src`](Self::src) and
 /// [`dst`](Self::dst) are `epic:*` derived state ids. The lane-*entry* edge
@@ -127,26 +124,25 @@ pub struct EpicEdge {
     pub src: &'static str,
     /// Destination state id (an `epic:*` derived state).
     pub dst: &'static str,
-    /// The role that fires the edge, matching the Python model's `Role` value
-    /// (e.g. `"Champion"`, `"Supervisor"`).
+    /// The role that fires the edge (e.g. `"Champion"`, `"Supervisor"`).
     pub role: &'static str,
     /// The fork-join barrier description on phase-boundary edges (any edge
-    /// touching `epic:phase_join`), or `""` for non-boundary edges. Matches the
-    /// Python model's `Transition.barrier` string exactly.
+    /// touching `epic:phase_join`), or `""` for non-boundary edges.
     pub barrier: &'static str,
     /// Whether firing this edge runs `gh issue create` — the set the #3707
-    /// issue-creation mutex serializes. Matches the Python `creates_issues` flag.
+    /// issue-creation mutex serializes.
     pub creates_issues: bool,
 }
 
 /// The epic-supervisor transition table: the five edges among the five derived
 /// [`EpicState`]s.
 ///
-/// Faithful to the epic sub-graph of the Python state-machine model (#3841) —
-/// same edges, roles, barriers, and `creates_issues` flags. The conformance
-/// test (`loom-daemon/tests/epic_conformance.rs`) derives its expectation by
-/// parsing the Python model and asserts this table matches it, so drift between
-/// the two representations is caught mechanically rather than by hand.
+/// This table is the **authoritative** definition of the epic-supervisor
+/// lane's edges, roles, barriers, and `creates_issues` flags (#4310) — there is
+/// no second, independently-maintained model it is checked against. Its own
+/// structural invariants (state count, sole terminal state, edge count,
+/// barrier hygiene) are asserted directly by
+/// `loom-daemon/tests/epic_state_invariants.rs`.
 ///
 /// The edges (matching `plan_epic_transition` + `barrier_admits`):
 ///
@@ -199,7 +195,7 @@ pub fn epic_transition_table() -> [EpicEdge; 5] {
 }
 
 /// All five derived epic state ids, in lifecycle order. Mirrors the `EpicState`
-/// variants and the Python model's `lane == epic` states.
+/// variants 1:1.
 #[must_use]
 pub fn epic_state_ids() -> [&'static str; 5] {
     [
@@ -463,10 +459,10 @@ details
         assert_eq!(derive_epic_state(2, &children), EpicState::Done);
     }
 
-    // ===== conformance: state ids match the Python model =====
+    // ===== canonical state id strings =====
 
     #[test]
-    fn test_state_ids_match_python_model() {
+    fn test_state_ids_are_canonical() {
         assert_eq!(EpicState::NeedsDecomp.as_state_id(), "epic:needs_decomp");
         assert_eq!(EpicState::Designed.as_state_id(), "epic:designed");
         assert_eq!(EpicState::Active.as_state_id(), "epic:active");
