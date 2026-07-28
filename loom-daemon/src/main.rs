@@ -952,6 +952,14 @@ async fn main() -> Result<()> {
             work_finder::resolve_cpu_utilization_target(&work_finder_config);
         let cpu_est_cores_per_sweep =
             work_finder::resolve_cpu_est_cores_per_sweep(&work_finder_config);
+        // #4084: hold new dispatch off a root while its build-gate run is in
+        // flight, so a fresh sweep build does not race the gate's own build for
+        // cores (the contention that timed the gate out under #4073's mild
+        // niceness). Resolved once at startup from the same primary workspace
+        // config as the gate's master switch (env > config > default(on)).
+        let suppress_dispatch_during_gate = main_health_gate::resolve_suppress_dispatch_during_gate(
+            &main_health_gate::read_autonomous_gate_config(&sweep_workspace),
+        );
         log::info!(
             "work_finder: enabled (multi-workspace, interval={}s, configured_max={configured_max}, \
              per_token_concurrency={per_token_concurrency}, cpu_utilization_target={cpu_utilization_target}, \
@@ -972,6 +980,7 @@ async fn main() -> Result<()> {
             cpu_utilization_target,
             cpu_est_cores_per_sweep,
             workspace_health_states.clone(),
+            suppress_dispatch_during_gate,
             event_bus.clone(),
             drain_flag.clone(),
         ))

@@ -227,6 +227,39 @@ when the effective niceness is 0 (a `nice -n 0` re-exec is a no-op fork); with
 the default of 5 the gate re-execs once under `nice -n 5`. If `nice` is
 unavailable the gate proceeds at normal priority.
 
+**Dispatch is suppressed while a gate run is in flight (#4084).** The mild
+`nice 5` above was necessary but *not sufficient*: a gate build concurrent with
+two sweep builds on a 28-core host still blew past the 1200s timeout — a >65%
+wall-clock inflation attributable to CPU contention alone (the same repo compiled
+green in ~726s idle). Niceness only reorders the run queue; it does not stop the
+gate's own build from racing freshly-dispatched sweep builds for cores. So the
+**daemon's work-finder holds new dispatch off a root while that root's
+build-gate run is in flight**: the gate sets a per-root `gate_in_flight` flag for
+exactly the lifetime of its `spawn_blocking` run (cleared on return *or* panic),
+and the work-finder treats it as a dispatch suppressor alongside the
+verified-red halt flag. Suppression is strictly **per root** — a sibling
+workspace with no gate in flight keeps dispatching (the #3930 isolation
+contract) — and it does **not** touch the timeout kill path: a genuinely hung
+gate is still killed at `buildGate.timeoutSeconds` and reported `UNEVALUATED`.
+
+The suppressor is controlled by `autonomous.mainHealthGate.suppressDispatchDuringGate`
+(default **`true`**), with precedence **env > config > default**:
+
+| Layer | How | Effect |
+|-------|-----|--------|
+| Env | `LOOM_MAIN_HEALTH_GATE_SUPPRESS_DISPATCH=1\|true\|yes\|on` (or any other value to disable) | Master override — wins over config |
+| Config | `"autonomous": { "mainHealthGate": { "suppressDispatchDuringGate": false } }` | Used when the env var is unset |
+| Default | — | On: dispatch is held during a gate run |
+
+Set the knob (or `LOOM_MAIN_HEALTH_GATE_SUPPRESS_DISPATCH=0`) to `false` to
+restore the pre-#4084 always-dispatch behavior. The cost of leaving it on is a
+brief dispatch pause (~one gate build) each interval; the benefit is that the
+gate's build reaches a determinate Green/Red verdict instead of timing out under
+self-inflicted contention. Raising `buildGate.timeoutSeconds` is deliberately
+*not* the lever here: the gate's cost scales with however many sweeps happen to
+be in flight, so any fixed budget large enough for the worst case makes a truly
+hung gate invisible for that long.
+
 > **Rule of thumb:** if a check's outcome can differ between an idle host and a
 > busy one — or between a host with tmux and one without — it is
 > **environment-sensitive** and belongs in CI (which controls its

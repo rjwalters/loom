@@ -540,6 +540,33 @@ pub fn tick(
 ///
 /// Strict priority is intentional (v1): a permanently-full higher tier starves
 /// lower tiers. Fairness reservations are an explicit follow-up.
+/// Compute, per root (parallel to `roots`), whether the work-finder should hold
+/// new dispatch off that root this tick — the `halted` slice `tick_multi`
+/// consumes.
+///
+/// A root is held when its `main` is verified-red (`is_halted`, #3930) **or**
+/// (#4084) a build-gate run against it is currently in flight and the
+/// `suppress_dispatch_during_gate` knob is on — the latter keeps a fresh sweep
+/// build from racing the gate's own build for cores. The suppression is strictly
+/// **per root**: a sibling root with no gate in flight is never held on account
+/// of another root's gate run, preserving the #3930 per-repo isolation contract.
+/// With `suppress_dispatch_during_gate = false` the in-flight term drops out
+/// entirely, so the result is byte-for-byte the pre-#4084 `is_halted`-only vector.
+#[must_use]
+pub fn dispatch_held_per_root(
+    health_states: &WorkspaceHealthStates,
+    roots: &[std::path::PathBuf],
+    suppress_dispatch_during_gate: bool,
+) -> Vec<bool> {
+    roots
+        .iter()
+        .map(|r| {
+            health_states.is_halted(r)
+                || (suppress_dispatch_during_gate && health_states.is_gate_in_flight(r))
+        })
+        .collect()
+}
+
 pub fn tick_multi<S: WorkSource, D: WorkDispatcher>(
     workspaces: &mut [(S, D)],
     priorities: &[u32],
@@ -988,6 +1015,7 @@ pub fn spawn_work_finder_task<S, D>(
     cpu_utilization_target: f64,
     cpu_est_cores_per_sweep: f64,
     health_state: Arc<MainHealthState>,
+    suppress_dispatch_during_gate: bool,
     event_bus: Arc<EventBus>,
 ) -> tokio::task::JoinHandle<()>
 where
@@ -1018,8 +1046,13 @@ where
         loop {
             ticker.tick().await;
             // Reactive main-health backstop (Phase C, #3812): skip all dispatch
-            // while the gate reports a red `main`.
-            let halted = health_state.is_halted();
+            // while the gate reports a red `main`. Also (#4084) hold dispatch
+            // while a gate *run* is in flight, so a fresh sweep build is not
+            // dispatched into the same root the gate's own build is competing
+            // with for cores — the `suppress_dispatch_during_gate` knob (default
+            // on) gates this so the pre-#4084 behavior is exactly recoverable.
+            let halted = health_state.is_halted()
+                || (suppress_dispatch_during_gate && health_state.is_gate_in_flight());
             // Recompute the dynamic cap from live inputs every tick (Phase B),
             // now with token-capacity backpressure (#3902): the token axis is the
             // count of *healthy* accounts from the ranking, not the flat pool.
@@ -1154,6 +1187,7 @@ pub fn spawn_multi_work_finder_task(
     cpu_utilization_target: f64,
     cpu_est_cores_per_sweep: f64,
     health_states: Arc<WorkspaceHealthStates>,
+    suppress_dispatch_during_gate: bool,
     event_bus: Arc<EventBus>,
     drain: Arc<std::sync::atomic::AtomicBool>,
 ) -> tokio::task::JoinHandle<()> {
@@ -1214,13 +1248,23 @@ pub fn spawn_multi_work_finder_task(
 
             // Per-repo main-health halt (#3930): look up each root's own gate
             // state, parallel to `pairs`. A red repo halts only its own dispatch.
+            // A root whose gate *run* is in flight (#4084) is likewise held —
+            // per-root, so a sibling with no gate in flight keeps dispatching
+            // (the #3930 isolation contract). `suppress_dispatch_during_gate`
+            // (default on) gates the in-flight term so the pre-#4084 behavior is
+            // exactly recoverable.
+            //
             // A scheduled drain (#4090) is daemon-global: it pauses new dispatch
-            // in EVERY repo at once, so it is OR'd into every root's halt.
+            // in EVERY repo at once, so it is OR'd on top of every root's
+            // per-root hold. Both terms are additive: drain holds every root
+            // regardless of gate state, and a gate in flight holds its own root
+            // regardless of drain state.
             let draining = drain.load(std::sync::atomic::Ordering::Relaxed);
-            let halted: Vec<bool> = roots
-                .iter()
-                .map(|r| health_states.is_halted(r) || draining)
-                .collect();
+            let halted: Vec<bool> =
+                dispatch_held_per_root(&health_states, &roots, suppress_dispatch_during_gate)
+                    .into_iter()
+                    .map(|h| h || draining)
+                    .collect();
             let any_halted = halted.iter().any(|&h| h);
 
             let mut pairs: Vec<(GhWorkSource, RegistryDispatcher)> = roots
@@ -3208,5 +3252,71 @@ exit 0
             message: "x".to_string(),
         };
         assert_eq!(ev.topic(), "daemon.capacity.advisory");
+    }
+
+    // ===================================================================
+    // Gate-in-flight dispatch suppressor (#4084)
+    // ===================================================================
+
+    #[test]
+    fn test_dispatch_held_per_root_gate_in_flight_holds_only_its_own_root() {
+        // A root whose gate run is in flight is held; a sibling with no gate in
+        // flight is NOT — the #3930 per-repo isolation contract must survive.
+        let states = WorkspaceHealthStates::new();
+        let root_a = std::path::PathBuf::from("/tmp/repo-a");
+        let root_b = std::path::PathBuf::from("/tmp/repo-b");
+        states.get_or_create(&root_a).set_gate_in_flight(true);
+        let held = dispatch_held_per_root(&states, &[root_a, root_b], true);
+        assert_eq!(held, vec![true, false], "only the in-flight root is held");
+    }
+
+    #[test]
+    fn test_dispatch_held_per_root_suppressor_disabled_is_is_halted_only() {
+        // With the suppressor off, the in-flight term drops out entirely — the
+        // result is byte-for-byte the pre-#4084 `is_halted`-only vector, even
+        // for a root with a gate run in flight.
+        let states = WorkspaceHealthStates::new();
+        let root_a = std::path::PathBuf::from("/tmp/repo-a");
+        let root_b = std::path::PathBuf::from("/tmp/repo-b");
+        states.get_or_create(&root_a).set_gate_in_flight(true);
+        states.get_or_create(&root_b).set_halted(true);
+        let held = dispatch_held_per_root(&states, &[root_a.clone(), root_b.clone()], false);
+        assert_eq!(
+            held,
+            vec![false, true],
+            "suppressor off ⇒ gate-in-flight is ignored; only verified-red holds"
+        );
+        // Sanity: with the suppressor on, root_a is additionally held.
+        let held_on = dispatch_held_per_root(&states, &[root_a, root_b], true);
+        assert_eq!(held_on, vec![true, true]);
+    }
+
+    #[test]
+    fn test_gate_in_flight_root_dispatches_zero_new_sweeps() {
+        // End-to-end through `tick_multi`: a root marked held (as
+        // `dispatch_held_per_root` would for a gate in flight) dispatches
+        // nothing, while its healthy sibling gets the shared slot.
+        let states = WorkspaceHealthStates::new();
+        let root_a = std::path::PathBuf::from("/tmp/repo-a");
+        let root_b = std::path::PathBuf::from("/tmp/repo-b");
+        states.get_or_create(&root_a).set_gate_in_flight(true);
+        let halted = dispatch_held_per_root(&states, &[root_a, root_b], true);
+
+        let mut multi = vec![
+            (FakeSource::once(vec![issue(1)]), RecordingDispatcher::default()),
+            (FakeSource::once(vec![issue(10)]), RecordingDispatcher::default()),
+        ];
+        let report = tick_multi(&mut multi, &[], 10, &halted);
+
+        assert!(report.halted, "the gated root marks the tick as halted");
+        assert!(
+            multi[0].1.dispatched.is_empty(),
+            "root with a gate run in flight dispatches zero new sweeps"
+        );
+        assert_eq!(
+            multi[1].1.dispatched,
+            vec![10],
+            "sibling root with no gate in flight is unaffected"
+        );
     }
 }
