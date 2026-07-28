@@ -14,6 +14,7 @@ use anyhow::Result;
 use chrono::Utc;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::fs;
@@ -113,6 +114,436 @@ pub fn build_restart_decision() -> (Response, bool) {
             },
             false,
         ),
+    }
+}
+
+// ============================================================================
+// Scheduled drain-and-restart (Issue #4090)
+// ============================================================================
+
+/// Default bound on how long a drain waits for the sweep registry to empty
+/// before it either refuses (fail-safe) or force-cancels the stragglers. A
+/// sweep is ~10–20 min, so the default is generous.
+pub const DEFAULT_DRAIN_TIMEOUT_SECS: u64 = 1800;
+
+/// How often the drain supervisor re-counts the cross-root in-flight sweeps.
+/// Small enough that a drain that finishes exits promptly; the zero-in-flight
+/// case is handled on the very first poll (no full-interval wait).
+pub const DRAIN_POLL_INTERVAL: Duration = Duration::from_secs(5);
+
+/// Shared drain-and-restart coordination state (Issue #4090).
+///
+/// Owns the daemon-global drain flag OR'd into the producers' halt checks (work
+/// finder, epic supervisor, role runner) and the descriptor the `DaemonStatus`
+/// snapshot renders. Exactly one drain-supervisor task may be live at a time; a
+/// monotonic `generation` lets a running supervisor detect it has been
+/// superseded (a fresh drain) or aborted, and stop **without** exiting the
+/// process.
+#[derive(Debug)]
+pub struct DrainState {
+    /// The flag consulted by the dispatch producers. `true` ⇒ new dispatch is
+    /// paused pending a supervised restart. Cloned out to each producer via
+    /// [`Self::flag`].
+    flag: Arc<AtomicBool>,
+    /// Bumped on every accepted drain start AND on abort/timeout-resume, so a
+    /// running drain-supervisor task can tell it is still the current one.
+    generation: AtomicU64,
+    /// Mutable descriptor of the active/last drain, for status rendering.
+    inner: Mutex<DrainDescriptor>,
+}
+
+/// The rendered view of the current (or most recent) drain (Issue #4090).
+#[derive(Debug, Default, Clone)]
+pub struct DrainDescriptor {
+    /// Whether a drain is currently in progress.
+    pub active: bool,
+    /// Deadline after which the drain gives up waiting.
+    pub deadline: Option<chrono::DateTime<Utc>>,
+    /// Whether the deadline path force-cancels stragglers (vs. refusing).
+    pub force_after_timeout: bool,
+    /// A short human-readable note about the last transition (timeout refusal,
+    /// abort) surfaced in `loom-daemon status`.
+    pub note: Option<String>,
+}
+
+/// Outcome of [`DrainState::begin`].
+#[derive(Debug)]
+pub enum DrainBegin {
+    /// A new drain was started; the caller must spawn the supervisor task with
+    /// this generation.
+    Started {
+        generation: u64,
+        deadline: chrono::DateTime<Utc>,
+    },
+    /// A drain was already in progress; the request is an idempotent ack and no
+    /// second supervisor should be spawned (the deadline/generation are
+    /// unchanged).
+    AlreadyDraining,
+}
+
+impl Default for DrainState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// Allow expect_used: a poisoned drain mutex means another thread panicked while
+// holding it — unrecoverable, same crash-on-poison policy as the rest of ipc.rs.
+#[allow(clippy::expect_used)]
+impl DrainState {
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            flag: Arc::new(AtomicBool::new(false)),
+            generation: AtomicU64::new(0),
+            inner: Mutex::new(DrainDescriptor::default()),
+        }
+    }
+
+    /// A clone of the drain flag to hand to a dispatch producer.
+    #[must_use]
+    pub fn flag(&self) -> Arc<AtomicBool> {
+        self.flag.clone()
+    }
+
+    /// Whether new dispatch is currently paused for a drain.
+    #[must_use]
+    pub fn is_draining(&self) -> bool {
+        self.flag.load(Ordering::Relaxed)
+    }
+
+    /// The current generation — the token a supervisor compares against to
+    /// detect it has been superseded/aborted.
+    #[must_use]
+    pub fn generation(&self) -> u64 {
+        self.generation.load(Ordering::Relaxed)
+    }
+
+    /// A snapshot of the descriptor for status rendering.
+    #[must_use]
+    pub fn snapshot(&self) -> DrainDescriptor {
+        self.inner.lock().expect("Drain mutex poisoned").clone()
+    }
+
+    /// Start a drain, or ack an already-running one (idempotent — a second drain
+    /// request while DRAINING neither stacks a supervisor nor moves the
+    /// deadline). Sets the drain flag on a fresh start.
+    pub fn begin(&self, timeout: Duration, force_after_timeout: bool) -> DrainBegin {
+        let mut inner = self.inner.lock().expect("Drain mutex poisoned");
+        if inner.active {
+            return DrainBegin::AlreadyDraining;
+        }
+        let deadline = Utc::now()
+            + chrono::Duration::from_std(timeout).unwrap_or_else(|_| chrono::Duration::seconds(0));
+        inner.active = true;
+        inner.deadline = Some(deadline);
+        inner.force_after_timeout = force_after_timeout;
+        inner.note = None;
+        // Set the flag while holding the descriptor lock so status can never
+        // observe `flag=true` with `active=false`.
+        self.flag.store(true, Ordering::Relaxed);
+        let generation = self.generation.fetch_add(1, Ordering::Relaxed) + 1;
+        DrainBegin::Started {
+            generation,
+            deadline,
+        }
+    }
+
+    /// Abort an in-progress drain: clear the flag, bump the generation (so the
+    /// running supervisor stops without exiting), and record a note. Returns
+    /// `true` when a drain was actually in progress.
+    pub fn abort(&self) -> bool {
+        let mut inner = self.inner.lock().expect("Drain mutex poisoned");
+        if !inner.active {
+            return false;
+        }
+        self.flag.store(false, Ordering::Relaxed);
+        self.generation.fetch_add(1, Ordering::Relaxed);
+        inner.active = false;
+        inner.deadline = None;
+        inner.note = Some("drain aborted by operator — dispatch resumed".to_string());
+        true
+    }
+
+    /// The supervisor's fail-safe timeout path: clear the flag, bump the
+    /// generation, and record the refusal note so status explains why the
+    /// daemon stayed up.
+    fn resolve_timeout(&self, note: String) {
+        let mut inner = self.inner.lock().expect("Drain mutex poisoned");
+        self.flag.store(false, Ordering::Relaxed);
+        self.generation.fetch_add(1, Ordering::Relaxed);
+        inner.active = false;
+        inner.deadline = None;
+        inner.note = Some(note);
+    }
+}
+
+/// The three terminal/continue decisions a drain-supervisor poll can reach
+/// (Issue #4090). Extracted as a pure function so the "2 → 1 → 0" and
+/// timeout-vs-force logic is unit-testable without spawning a task or calling
+/// `std::process::exit`.
+#[derive(Debug, PartialEq, Eq)]
+pub enum DrainTick {
+    /// Sweeps still in flight and the deadline has not passed — keep waiting.
+    Continue,
+    /// Zero in-flight — restart now (exit `EXIT_RESTART`).
+    Complete,
+    /// Deadline passed with sweeps still in flight and no force — refuse the
+    /// restart, resume dispatch, stay up.
+    TimedOutRefuse,
+    /// Deadline passed with sweeps still in flight and `--force-after-timeout` —
+    /// cancel the stragglers, then restart.
+    TimedOutForce,
+}
+
+/// Decide a single drain-supervisor poll (Issue #4090). Zero in-flight always
+/// wins (even at/after the deadline: everything drained, so restart), otherwise
+/// a passed deadline is refused (fail-safe) or forced.
+#[must_use]
+pub fn evaluate_drain_tick(in_flight: usize, past_deadline: bool, force: bool) -> DrainTick {
+    if in_flight == 0 {
+        DrainTick::Complete
+    } else if past_deadline {
+        if force {
+            DrainTick::TimedOutForce
+        } else {
+            DrainTick::TimedOutRefuse
+        }
+    } else {
+        DrainTick::Continue
+    }
+}
+
+/// Count non-terminal (`Pending` / `Running`) sweeps across **every** managed
+/// root (Issue #4090, Finding 5). Mirrors [`build_daemon_status`]'s cross-root
+/// accounting so a drain never reads only the primary registry and restarts
+/// while a secondary managed repo still has live sweeps.
+// Allow expect_used: poisoned registry mutex ⇒ crash, same policy as elsewhere.
+#[allow(clippy::expect_used)]
+#[must_use]
+pub fn count_in_flight_sweeps(workspace_pool: &Arc<WorkspacePool>, fallback_root: &Path) -> usize {
+    let workspace_registry = WorkspaceRegistry::load_default().unwrap_or_default();
+    let roots = workspace_registry.effective_roots(fallback_root);
+    let mut count = 0;
+    for root in &roots {
+        let registry = workspace_pool.get_or_provision(root);
+        let sr = registry.lock().expect("Sweep registry mutex poisoned");
+        count += sr
+            .list(None)
+            .into_iter()
+            .filter(|info| !info.state.is_terminal())
+            .count();
+    }
+    count
+}
+
+/// Cancel every in-flight sweep across all managed roots via the existing
+/// [`SweepRegistry::cancel`] path (Issue #4090, `--force-after-timeout`).
+/// Returns the number cancelled. Blocking cancel is acceptable here: this runs
+/// only on the rare force-timeout path, moments before the process exits.
+// Allow expect_used: poisoned registry mutex ⇒ crash, same policy as elsewhere.
+#[allow(clippy::expect_used)]
+fn cancel_all_in_flight(workspace_pool: &Arc<WorkspacePool>, fallback_root: &Path) -> usize {
+    let workspace_registry = WorkspaceRegistry::load_default().unwrap_or_default();
+    let roots = workspace_registry.effective_roots(fallback_root);
+    let mut cancelled = 0;
+    for root in &roots {
+        let registry = workspace_pool.get_or_provision(root);
+        let ids: Vec<String> = {
+            let sr = registry.lock().expect("Sweep registry mutex poisoned");
+            sr.list(None)
+                .into_iter()
+                .filter(|info| !info.state.is_terminal())
+                .map(|info| info.sweep_id)
+                .collect()
+        };
+        for id in ids {
+            let mut sr = registry.lock().expect("Sweep registry mutex poisoned");
+            if sr.cancel(&id, Duration::from_secs(5)).is_ok() {
+                cancelled += 1;
+            }
+        }
+    }
+    cancelled
+}
+
+/// Handle a `DrainAndRestartDaemon` request (Issue #4090): check supervision up
+/// front (AC5 — refuse *before* pausing dispatch), then start the drain and
+/// spawn its supervisor task. Returns the `DaemonDrain` response to send back.
+///
+/// Must be called from within a tokio runtime context (the connection handler
+/// is) so it can spawn the supervisor.
+fn handle_drain_request(
+    drain: &Arc<DrainState>,
+    workspace_pool: &Arc<WorkspacePool>,
+    fallback_root: &Path,
+    event_bus: &Arc<EventBus>,
+    timeout_secs: Option<u64>,
+    force_after_timeout: bool,
+) -> Response {
+    // AC5 / Finding 4: prove supervision BEFORE entering DRAINING. Draining for
+    // 20 minutes and only then discovering there is no supervisor to relaunch
+    // into is the worst possible ordering — and pausing dispatch then refusing
+    // would be a silent outage.
+    let supervisor = match detect_supervisor() {
+        Some(s) => s,
+        None => {
+            return Response::DaemonDrain {
+                accepted: false,
+                supervisor: None,
+                in_flight: count_in_flight_sweeps(workspace_pool, fallback_root),
+                message: "refusing to drain: no supervisor detected \
+                    (LOOM_DAEMON_SUPERVISOR unset). This daemon was not started under \
+                    launchd, so nothing would relaunch it after a drain. Dispatch was \
+                    NOT paused. Restart manually with loom-daemon-stop.sh && \
+                    loom-daemon-start.sh."
+                    .to_string(),
+            };
+        }
+    };
+
+    let in_flight = count_in_flight_sweeps(workspace_pool, fallback_root);
+    let timeout = Duration::from_secs(timeout_secs.unwrap_or(DEFAULT_DRAIN_TIMEOUT_SECS));
+
+    match drain.begin(timeout, force_after_timeout) {
+        DrainBegin::Started {
+            generation,
+            deadline,
+        } => {
+            let _ = event_bus.publish_generic(
+                "daemon.drain.started",
+                serde_json::json!({
+                    "in_flight": in_flight,
+                    "timeout_secs": timeout.as_secs(),
+                    "force_after_timeout": force_after_timeout,
+                    "deadline": deadline,
+                }),
+            );
+            let drain_task = drain.clone();
+            let pool_task = workspace_pool.clone();
+            let root_task = fallback_root.to_path_buf();
+            let bus_task = event_bus.clone();
+            tokio::spawn(async move {
+                run_drain_supervisor(
+                    drain_task,
+                    pool_task,
+                    root_task,
+                    bus_task,
+                    generation,
+                    DRAIN_POLL_INTERVAL,
+                )
+                .await;
+            });
+            let msg = if in_flight == 0 {
+                format!("drain scheduled ({supervisor}-supervised): 0 in-flight — restarting now.")
+            } else {
+                format!(
+                    "drain scheduled ({supervisor}-supervised): {in_flight} in-flight sweep(s); \
+                     new dispatch paused. Will restart when drained, or {} at the deadline.",
+                    if force_after_timeout {
+                        "cancel stragglers and restart"
+                    } else {
+                        "refuse and resume dispatch"
+                    }
+                )
+            };
+            Response::DaemonDrain {
+                accepted: true,
+                supervisor: Some(supervisor),
+                in_flight,
+                message: msg,
+            }
+        }
+        DrainBegin::AlreadyDraining => Response::DaemonDrain {
+            accepted: true,
+            supervisor: Some(supervisor),
+            in_flight,
+            message: format!(
+                "already draining (idempotent): {in_flight} in-flight sweep(s); the existing \
+                 deadline is unchanged. Use `loom-daemon restart --abort-drain` to cancel."
+            ),
+        },
+    }
+}
+
+/// The drain-supervisor loop (Issue #4090). Polls the cross-root in-flight count
+/// and owns the eventual `std::process::exit(EXIT_RESTART)`; on a fail-safe
+/// timeout it clears the drain flag and stays up. Stops without exiting if it
+/// has been superseded (a new drain) or aborted (generation moved on).
+async fn run_drain_supervisor(
+    drain: Arc<DrainState>,
+    workspace_pool: Arc<WorkspacePool>,
+    fallback_root: PathBuf,
+    event_bus: Arc<EventBus>,
+    my_generation: u64,
+    poll_interval: Duration,
+) {
+    loop {
+        // Superseded / aborted: a newer drain or an abort bumped the generation,
+        // so this supervisor is stale — stop WITHOUT ending the process. This is
+        // the "abort then the queue empties anyway" guard (AC6): a stale
+        // supervisor must never fire a restart.
+        if drain.generation() != my_generation {
+            log::info!(
+                "drain supervisor (gen {my_generation}) superseded/aborted (current gen {}) — \
+                 stopping without restart",
+                drain.generation()
+            );
+            return;
+        }
+
+        let in_flight = count_in_flight_sweeps(&workspace_pool, &fallback_root);
+        let (past_deadline, force) = {
+            let snap = drain.snapshot();
+            let past = snap.deadline.is_some_and(|d| Utc::now() >= d);
+            (past, snap.force_after_timeout)
+        };
+
+        match evaluate_drain_tick(in_flight, past_deadline, force) {
+            DrainTick::Continue => {
+                tokio::time::sleep(poll_interval).await;
+            }
+            DrainTick::Complete => {
+                let _ = event_bus.publish_generic(
+                    "daemon.drain.completed",
+                    serde_json::json!({ "in_flight": 0 }),
+                );
+                log::warn!(
+                    "drain complete — 0 in-flight sweeps; exiting {EXIT_RESTART} for a launchd \
+                     KeepAlive:SuccessfulExit relaunch. No sweep was killed; no orphan left behind."
+                );
+                std::process::exit(EXIT_RESTART);
+            }
+            DrainTick::TimedOutRefuse => {
+                let note = format!(
+                    "drain timed out with {in_flight} sweep(s) still in flight — refused restart \
+                     (no --force-after-timeout); dispatch resumed, daemon stays up"
+                );
+                let _ = event_bus.publish_generic(
+                    "daemon.drain.timeout",
+                    serde_json::json!({ "in_flight": in_flight, "forced": false }),
+                );
+                log::warn!("{note}");
+                drain.resolve_timeout(note);
+                return;
+            }
+            DrainTick::TimedOutForce => {
+                let cancelled = cancel_all_in_flight(&workspace_pool, &fallback_root);
+                let _ = event_bus.publish_generic(
+                    "daemon.drain.timeout",
+                    serde_json::json!({
+                        "in_flight": in_flight,
+                        "forced": true,
+                        "cancelled": cancelled,
+                    }),
+                );
+                log::warn!(
+                    "drain timed out with {in_flight} in-flight; --force-after-timeout cancelled \
+                     {cancelled} sweep(s); exiting {EXIT_RESTART} for a supervised relaunch"
+                );
+                std::process::exit(EXIT_RESTART);
+            }
+        }
     }
 }
 
@@ -216,6 +647,10 @@ pub struct IpcServer {
     /// and threaded in read-only so `DaemonStatus` can report it without a
     /// re-probe on every status query.
     credential_preflight: Arc<CredentialPreflightReport>,
+    /// Shared drain-and-restart coordination state (#4090). The same `Arc` whose
+    /// flag is OR'd into the dispatch producers' halt checks; the IPC handler
+    /// sets/aborts it and the `DaemonStatus` snapshot renders it.
+    drain_state: Arc<DrainState>,
 }
 
 impl IpcServer {
@@ -230,6 +665,7 @@ impl IpcServer {
         workspace_pool: Arc<WorkspacePool>,
         fallback_root: PathBuf,
         credential_preflight: CredentialPreflightReport,
+        drain_state: Arc<DrainState>,
     ) -> Self {
         Self {
             socket_path,
@@ -241,6 +677,7 @@ impl IpcServer {
             workspace_pool,
             fallback_root,
             credential_preflight: Arc::new(credential_preflight),
+            drain_state,
         }
     }
 
@@ -278,6 +715,7 @@ impl IpcServer {
                     let pool = self.workspace_pool.clone();
                     let fallback = self.fallback_root.clone();
                     let credential_preflight = self.credential_preflight.clone();
+                    let drain = self.drain_state.clone();
                     tokio::spawn(async move {
                         if let Err(e) = handle_client(
                             stream,
@@ -289,6 +727,7 @@ impl IpcServer {
                             pool,
                             fallback,
                             credential_preflight,
+                            drain,
                         )
                         .await
                         {
@@ -315,6 +754,7 @@ async fn handle_client(
     workspace_pool: Arc<WorkspacePool>,
     fallback_root: PathBuf,
     credential_preflight: Arc<CredentialPreflightReport>,
+    drain_state: Arc<DrainState>,
 ) -> Result<()> {
     let (reader, mut writer) = stream.into_split();
     let mut lines = BufReader::new(reader).lines();
@@ -387,13 +827,64 @@ async fn handle_client(
             // (within the TTL) makes this a no-op. `spawn_blocking` join errors
             // are non-fatal — the status falls back to the last cached value.
             let _ = tokio::task::spawn_blocking(crate::cpu_headroom::refresh_cpu_util_cache).await;
-            let report = build_daemon_status(
+            let report = build_daemon_status_with_drain(
                 &workspace_pool,
                 &health_states,
                 &fallback_root,
                 &credential_preflight,
+                &drain_state,
             );
             let response = Response::DaemonStatus(report);
+            let response_json = serde_json::to_string(&response)?;
+            writer.write_all(response_json.as_bytes()).await?;
+            writer.write_all(b"\n").await?;
+            continue;
+        }
+
+        // DrainAndRestartDaemon / AbortDrain (Issue #4090). Handled here — like
+        // RestartDaemon — because the drain must ack immediately and then exit
+        // *minutes* later from a background supervisor task, which the inline
+        // per-connection handler cannot do. The supervisor is spawned inside
+        // `handle_drain_request`; this handler just acks and moves on.
+        if let Request::DrainAndRestartDaemon {
+            timeout_secs,
+            force_after_timeout,
+        } = request
+        {
+            let response = handle_drain_request(
+                &drain_state,
+                &workspace_pool,
+                &fallback_root,
+                &event_bus,
+                timeout_secs,
+                force_after_timeout,
+            );
+            let response_json = serde_json::to_string(&response)?;
+            writer.write_all(response_json.as_bytes()).await?;
+            writer.write_all(b"\n").await?;
+            writer.flush().await?;
+            continue;
+        }
+
+        if let Request::AbortDrain = request {
+            let was_draining = drain_state.abort();
+            let _ = event_bus.publish_generic(
+                "daemon.drain.aborted",
+                serde_json::json!({ "was_draining": was_draining }),
+            );
+            let message = if was_draining {
+                "drain aborted — dispatch resumed; no restart will fire (even if in-flight \
+                 later reaches zero)."
+                    .to_string()
+            } else {
+                "no drain in progress — nothing to abort (no-op).".to_string()
+            };
+            let response = Response::DaemonDrain {
+                accepted: was_draining,
+                supervisor: detect_supervisor(),
+                in_flight: count_in_flight_sweeps(&workspace_pool, &fallback_root),
+                message,
+            };
             let response_json = serde_json::to_string(&response)?;
             writer.write_all(response_json.as_bytes()).await?;
             writer.write_all(b"\n").await?;
@@ -752,7 +1243,35 @@ pub fn build_daemon_status(
         // Resolved once at daemon startup (#4005), threaded in read-only —
         // never re-probed per status query.
         credential_preflight: Some(credential_preflight.clone()),
+        // Drain fields default to "not draining" here; the drain-aware wrapper
+        // [`build_daemon_status_with_drain`] overlays live drain state (#4090).
+        // Keeping the base builder drain-agnostic preserves its many existing
+        // unit-test call sites unchanged.
+        draining: false,
+        drain_deadline: None,
+        drain_note: None,
     }
+}
+
+/// Like [`build_daemon_status`] but overlays the live drain-and-restart state
+/// (Issue #4090) so `loom-daemon status` can surface `DRAINING (n remaining,
+/// deadline …)`. The IPC `DaemonStatus` handler calls this; the base builder
+/// stays drain-agnostic for its existing tests.
+#[must_use]
+pub fn build_daemon_status_with_drain(
+    workspace_pool: &Arc<WorkspacePool>,
+    health_states: &WorkspaceHealthStates,
+    fallback_root: &Path,
+    credential_preflight: &CredentialPreflightReport,
+    drain: &DrainState,
+) -> DaemonStatusReport {
+    let mut report =
+        build_daemon_status(workspace_pool, health_states, fallback_root, credential_preflight);
+    let snap = drain.snapshot();
+    report.draining = drain.is_draining();
+    report.drain_deadline = snap.deadline;
+    report.drain_note = snap.note;
+    report
 }
 
 // Allow expect_used because mutex poisoning is a panic-level error that indicates
@@ -1595,6 +2114,17 @@ fn handle_request(
             // caller — do NOT exit here, only `handle_client` may end the
             // process for a supervised relaunch.
             build_restart_decision().0
+        }
+        Request::DrainAndRestartDaemon { .. } | Request::AbortDrain => {
+            // Structurally unreachable: `handle_client` intercepts both drain
+            // requests (#4090) before dispatching here, because a drain must ack
+            // immediately and exit from a background supervisor task minutes
+            // later — state the connection-scoped `handle_request` cannot own.
+            Response::Error {
+                message: "internal: drain requests must be handled by handle_client, not \
+                          handle_request"
+                    .to_string(),
+            }
         }
     }
 }
@@ -2889,6 +3419,9 @@ exit 0
                 health_gate_verdict_at: Some(chrono::Utc::now()),
             }],
             credential_preflight: Some(test_credential_preflight()),
+            draining: false,
+            drain_deadline: None,
+            drain_note: None,
         };
         let resp = Response::DaemonStatus(report);
         let json = serde_json::to_string(&resp).expect("serialize response");
@@ -3622,5 +4155,337 @@ exit 0
         }
 
         std::env::remove_var(crate::watch_registry::WATCHES_PATH_ENV);
+    }
+
+    // ===== Scheduled drain-and-restart (Issue #4090) =====
+
+    /// The pure drain-decision function (AC2 / AC3): zero in-flight always
+    /// completes (restart), even at/after the deadline; a passed deadline with
+    /// sweeps still in flight refuses (fail-safe) or forces per the flag; before
+    /// the deadline it keeps waiting.
+    #[test]
+    fn test_evaluate_drain_tick_decisions() {
+        // Still in flight, deadline not reached ⇒ keep waiting.
+        assert_eq!(evaluate_drain_tick(2, false, false), DrainTick::Continue);
+        assert_eq!(evaluate_drain_tick(1, false, true), DrainTick::Continue);
+        // Zero in-flight ⇒ complete regardless of deadline/force.
+        assert_eq!(evaluate_drain_tick(0, false, false), DrainTick::Complete);
+        assert_eq!(evaluate_drain_tick(0, true, false), DrainTick::Complete);
+        assert_eq!(evaluate_drain_tick(0, true, true), DrainTick::Complete);
+        // Deadline passed with work left: refuse (fail-safe) vs. force.
+        assert_eq!(evaluate_drain_tick(3, true, false), DrainTick::TimedOutRefuse);
+        assert_eq!(evaluate_drain_tick(3, true, true), DrainTick::TimedOutForce);
+    }
+
+    /// The "2 → 1 → 0" completion sequence (AC2): a supervisor stepping through
+    /// a decreasing in-flight count keeps waiting until it hits exactly zero,
+    /// then completes exactly once. Driven through the pure decision function so
+    /// no process actually exits.
+    #[test]
+    fn test_drain_tick_completes_only_at_zero() {
+        let mut completed = 0;
+        for n in [2usize, 1, 0] {
+            match evaluate_drain_tick(n, false, false) {
+                DrainTick::Continue => assert!(n > 0, "must still be waiting while n>0"),
+                DrainTick::Complete => {
+                    assert_eq!(n, 0, "must only complete at zero");
+                    completed += 1;
+                }
+                other => panic!("unexpected: {other:?}"),
+            }
+        }
+        assert_eq!(completed, 1, "completes exactly once, at n==0");
+    }
+
+    /// The `DrainState` machine: begin sets the flag and a deadline, a second
+    /// begin is idempotent (does not stack / move the deadline), abort clears
+    /// the flag and bumps the generation, and the timeout path clears + notes.
+    #[test]
+    fn test_drain_state_lifecycle() {
+        let drain = DrainState::new();
+        assert!(!drain.is_draining());
+        assert_eq!(drain.generation(), 0);
+
+        // begin ⇒ Started, flag set, deadline recorded, generation bumped.
+        let (gen1, deadline) = match drain.begin(Duration::from_secs(120), false) {
+            DrainBegin::Started {
+                generation,
+                deadline,
+            } => (generation, deadline),
+            other => panic!("expected Started, got {other:?}"),
+        };
+        assert!(drain.is_draining());
+        assert_eq!(gen1, 1);
+        assert_eq!(drain.snapshot().deadline, Some(deadline));
+        assert!(!drain.snapshot().force_after_timeout);
+
+        // A second begin while already draining is idempotent: same generation,
+        // same deadline, flag still set (AC edge: second drain does not stack).
+        match drain.begin(Duration::from_secs(9999), true) {
+            DrainBegin::AlreadyDraining => {}
+            other => panic!("expected AlreadyDraining, got {other:?}"),
+        }
+        assert_eq!(drain.generation(), gen1, "idempotent begin does not bump gen");
+        assert_eq!(
+            drain.snapshot().deadline,
+            Some(deadline),
+            "idempotent begin does not move the deadline"
+        );
+
+        // abort ⇒ flag cleared, generation bumped (so a live supervisor stops),
+        // note recorded.
+        assert!(drain.abort());
+        assert!(!drain.is_draining());
+        assert_eq!(drain.generation(), gen1 + 1);
+        assert!(drain.snapshot().note.unwrap().contains("aborted"));
+        // abort again ⇒ no-op.
+        assert!(!drain.abort());
+
+        // timeout resolution clears + notes + bumps generation.
+        let gen_before = drain.generation();
+        let _ = drain.begin(Duration::from_secs(1), false);
+        drain.resolve_timeout("timed out".to_string());
+        assert!(!drain.is_draining());
+        assert_eq!(drain.snapshot().note.as_deref(), Some("timed out"));
+        assert!(drain.generation() > gen_before);
+    }
+
+    /// AC5 (immediate unsupervised refusal): with no supervisor, a drain request
+    /// is refused with `accepted: false` **and the drain flag is never set** —
+    /// pausing dispatch then refusing would be a silent outage.
+    ///
+    /// NOTE: shares the `LOOM_DAEMON_SUPERVISOR` env with
+    /// `test_build_restart_decision_supervisor_gated`; `#[serial]` keeps them
+    /// from racing the process-global env var.
+    #[test]
+    #[serial_test::serial]
+    fn test_drain_request_unsupervised_refuses_without_pausing() {
+        std::env::remove_var("LOOM_DAEMON_SUPERVISOR");
+        let (sr, dir, _rec) = setup_sweep_registry_in_tempdir();
+        let root = dir.path().to_path_buf();
+        let empty_reg = dir.path().join("no-such-workspaces.json");
+        std::env::set_var(crate::workspace_registry::REGISTRY_PATH_ENV, &empty_reg);
+        let pool = Arc::new(WorkspacePool::new(Arc::new(EventBus::new()), test_runtime_handle()));
+        pool.seed(root.clone(), sr);
+        let bus = Arc::new(EventBus::new());
+        let drain = Arc::new(DrainState::new());
+
+        let resp = handle_drain_request(&drain, &pool, &root, &bus, Some(60), false);
+        match resp {
+            Response::DaemonDrain {
+                accepted,
+                supervisor,
+                ..
+            } => {
+                assert!(!accepted, "unsupervised host must refuse the drain");
+                assert!(supervisor.is_none());
+            }
+            other => panic!("expected DaemonDrain, got {other:?}"),
+        }
+        assert!(!drain.is_draining(), "refused drain must NOT pause dispatch");
+        assert_eq!(drain.generation(), 0, "refused drain must not bump generation");
+
+        std::env::remove_var(crate::workspace_registry::REGISTRY_PATH_ENV);
+    }
+
+    /// Cross-root in-flight counting (Finding 5): sweeps live in the SECONDARY
+    /// managed repo only must still be counted, so a drain that reads them does
+    /// not restart while that repo has live work. Also asserts terminal sweeps
+    /// are excluded.
+    #[test]
+    #[serial_test::serial]
+    fn test_count_in_flight_sweeps_cross_root() {
+        use crate::workspace_registry::{normalize_path, WorkspaceRegistry, REGISTRY_PATH_ENV};
+
+        let (sr_a, dir_a, _rec_a) = setup_sweep_registry_in_tempdir();
+        let (sr_b, dir_b, _rec_b) = setup_sweep_registry_in_tempdir();
+        let root_a = dir_a.path().to_path_buf();
+        let root_b = dir_b.path().to_path_buf();
+
+        let reg_path = dir_a.path().join("workspaces.json");
+        let mut reg = WorkspaceRegistry::default();
+        reg.add(&root_a, None).unwrap();
+        reg.add(&root_b, None).unwrap();
+        reg.save(&reg_path).unwrap();
+        std::env::set_var(REGISTRY_PATH_ENV, &reg_path);
+
+        let canon_a = normalize_path(&root_a);
+        let canon_b = normalize_path(&root_b);
+        let pool = Arc::new(WorkspacePool::new(Arc::new(EventBus::new()), test_runtime_handle()));
+        pool.seed(canon_a.clone(), sr_a);
+        pool.seed(canon_b.clone(), sr_b.clone());
+
+        // No sweeps anywhere ⇒ zero.
+        assert_eq!(count_in_flight_sweeps(&pool, &canon_a), 0);
+
+        // Dispatch a live sweep into the SECONDARY repo only.
+        {
+            let mut reg_b = sr_b.lock().unwrap();
+            reg_b
+                .dispatch(&crate::types::SweepKind::Issue(4090), None, None, None, None)
+                .expect("dispatch");
+        }
+        // Counted even though the primary (root_a) registry is empty — a drain
+        // reading only the primary would wrongly see zero and restart.
+        assert_eq!(
+            count_in_flight_sweeps(&pool, &canon_a),
+            1,
+            "a live sweep in the secondary repo must be counted"
+        );
+
+        std::env::remove_var(REGISTRY_PATH_ENV);
+    }
+
+    /// A pre-#4090 `DaemonStatus` JSON payload (no `drain` fields) still
+    /// deserializes — `#[serde(default)]` fills `draining: false` and leaves the
+    /// deadline/note `None` (mirrors the `capacity_bound` compat rationale).
+    #[test]
+    fn test_daemon_status_backward_compat_missing_drain_fields() {
+        let legacy = r#"{"in_flight":[],"token_pool_size":2,"disk_headroom":9,"configured_max":3,"dynamic_cap":2,"main_health_gate_halted":false}"#;
+        let report: DaemonStatusReport =
+            serde_json::from_str(legacy).expect("legacy payload deserializes");
+        assert!(!report.draining, "absent draining (#4090) defaults to false");
+        assert_eq!(report.drain_deadline, None);
+        assert_eq!(report.drain_note, None);
+    }
+
+    /// The new drain fields round-trip through serde, and
+    /// `build_daemon_status_with_drain` overlays the live drain state onto the
+    /// base report (AC4).
+    #[test]
+    #[serial_test::serial]
+    fn test_build_daemon_status_with_drain_overlays_state() {
+        let (sr, dir, _rec) = setup_sweep_registry_in_tempdir();
+        let root = dir.path().to_path_buf();
+        let empty_reg = dir.path().join("no-such-workspaces.json");
+        std::env::set_var(crate::workspace_registry::REGISTRY_PATH_ENV, &empty_reg);
+        let prev_shared = std::env::var("LOOM_SHARED_TOKENS_DIR").ok();
+        std::env::set_var("LOOM_SHARED_TOKENS_DIR", "");
+
+        let pool = Arc::new(WorkspacePool::new(Arc::new(EventBus::new()), test_runtime_handle()));
+        pool.seed(root.clone(), sr);
+        let health = WorkspaceHealthStates::new();
+        let drain = DrainState::new();
+
+        // No drain ⇒ overlay is a no-op.
+        let report = build_daemon_status_with_drain(
+            &pool,
+            &health,
+            &root,
+            &test_credential_preflight(),
+            &drain,
+        );
+        assert!(!report.draining);
+        assert_eq!(report.drain_deadline, None);
+
+        // Begin a drain ⇒ overlay reports draining + deadline.
+        let deadline = match drain.begin(Duration::from_secs(300), false) {
+            DrainBegin::Started { deadline, .. } => deadline,
+            other => panic!("expected Started, got {other:?}"),
+        };
+        let report = build_daemon_status_with_drain(
+            &pool,
+            &health,
+            &root,
+            &test_credential_preflight(),
+            &drain,
+        );
+        assert!(report.draining);
+        assert_eq!(report.drain_deadline, Some(deadline));
+
+        // Round-trips over the wire.
+        let json = serde_json::to_string(&report).unwrap();
+        let back: DaemonStatusReport = serde_json::from_str(&json).unwrap();
+        assert!(back.draining);
+        assert_eq!(back.drain_deadline, Some(deadline));
+
+        match prev_shared {
+            Some(v) => std::env::set_var("LOOM_SHARED_TOKENS_DIR", v),
+            None => std::env::remove_var("LOOM_SHARED_TOKENS_DIR"),
+        }
+        std::env::remove_var(crate::workspace_registry::REGISTRY_PATH_ENV);
+    }
+
+    /// Wire-compat (Finding 3): the new `DrainAndRestartDaemon` variant
+    /// round-trips, and the untouched `RestartDaemon` unit variant STILL
+    /// serializes to exactly `{"type":"RestartDaemon"}`. The
+    /// `test_restart_daemon_request_response_round_trip` assertion above must
+    /// also keep passing unmodified.
+    #[test]
+    fn test_drain_request_wire_compat() {
+        // RestartDaemon is unchanged — byte-for-byte the pre-#4090 shape.
+        assert_eq!(
+            serde_json::to_string(&Request::RestartDaemon).unwrap(),
+            r#"{"type":"RestartDaemon"}"#
+        );
+
+        // The new variant round-trips with its payload.
+        let req = Request::DrainAndRestartDaemon {
+            timeout_secs: Some(600),
+            force_after_timeout: true,
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        let back: Request = serde_json::from_str(&json).unwrap();
+        match back {
+            Request::DrainAndRestartDaemon {
+                timeout_secs,
+                force_after_timeout,
+            } => {
+                assert_eq!(timeout_secs, Some(600));
+                assert!(force_after_timeout);
+            }
+            other => panic!("expected DrainAndRestartDaemon, got {other:?}"),
+        }
+
+        // AbortDrain round-trips (unit-with-payload-none shape).
+        let json = serde_json::to_string(&Request::AbortDrain).unwrap();
+        assert_eq!(json, r#"{"type":"AbortDrain"}"#);
+        let back: Request = serde_json::from_str(&json).unwrap();
+        assert!(matches!(back, Request::AbortDrain));
+
+        // The DaemonDrain response round-trips.
+        let resp = Response::DaemonDrain {
+            accepted: true,
+            supervisor: Some("launchd".to_string()),
+            in_flight: 3,
+            message: "draining".to_string(),
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+        let back: Response = serde_json::from_str(&json).unwrap();
+        match back {
+            Response::DaemonDrain {
+                accepted,
+                supervisor,
+                in_flight,
+                ..
+            } => {
+                assert!(accepted);
+                assert_eq!(supervisor.as_deref(), Some("launchd"));
+                assert_eq!(in_flight, 3);
+            }
+            other => panic!("expected DaemonDrain, got {other:?}"),
+        }
+    }
+
+    /// Abort clears the flag and bumps the generation, so a supervisor holding
+    /// the old generation stops without exiting — even if in-flight later
+    /// reaches zero (AC6, the "abort then the queue empties anyway" race). We
+    /// assert the generation contract the async supervisor relies on rather than
+    /// spawning it (its Complete branch calls `process::exit`).
+    #[test]
+    fn test_abort_supersedes_running_supervisor_generation() {
+        let drain = DrainState::new();
+        let gen = match drain.begin(Duration::from_secs(300), false) {
+            DrainBegin::Started { generation, .. } => generation,
+            other => panic!("expected Started, got {other:?}"),
+        };
+        // A supervisor captured `gen`; abort moves the generation on.
+        assert!(drain.abort());
+        assert_ne!(
+            drain.generation(),
+            gen,
+            "abort must bump the generation so the running supervisor detects supersession"
+        );
+        assert!(!drain.is_draining(), "abort resumes dispatch");
     }
 }

@@ -32,6 +32,10 @@
 //! | `epic.issue.{N}.join`      | Epic supervisor | `{epic, action, state}` |
 //! | `epic.issue.{N}.close`     | Epic supervisor | `{epic, action, state}` |
 //! | `daemon.capacity.advisory` | Work finder | `{pressured, queued, healthy_accounts, exhausted_accounts, total_accounts, estimated_drain_minutes?, message}` |
+//! | `daemon.drain.started`   | Drain supervisor | `{in_flight, timeout_secs, force_after_timeout, deadline}` |
+//! | `daemon.drain.completed` | Drain supervisor | `{in_flight}` (always 0) |
+//! | `daemon.drain.aborted`   | Daemon (IPC) | `{was_draining}` |
+//! | `daemon.drain.timeout`   | Drain supervisor | `{in_flight, forced, cancelled?}` |
 //!
 //! New topics require a follow-up issue — the taxonomy is intentionally
 //! pinned. The four `epic.issue.{N}.*` topics were authorized by **#3873**
@@ -39,6 +43,8 @@
 //! (decompose / expand / join / close). The `daemon.capacity.advisory` topic
 //! was authorized by **#3902** (epic #3809) for the work finder's
 //! token-capacity backpressure advisory (fired on pressure state change). The
+//! four `daemon.drain.*` topics were authorized by **#4090** for the scheduled
+//! drain-and-restart primitive (started / completed / aborted / timeout). The
 //! bus accepts arbitrary topic
 //! strings (`publish` does not reject unknown topics) so the publisher side
 //! stays open for future extension, but the documented taxonomy is the

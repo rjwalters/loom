@@ -113,6 +113,10 @@ issue** — the v0.10.0 set is intentionally frozen.
 | `epic.issue.{N}.join`      | Epic supervisor (#3842)        | `{epic, action, state}` |
 | `epic.issue.{N}.close`     | Epic supervisor (#3842)        | `{epic, action, state}` |
 | `daemon.capacity.advisory` | Work finder (#3902)            | `{pressured, queued, healthy_accounts, exhausted_accounts, total_accounts, estimated_drain_minutes?, message}` |
+| `daemon.drain.started`     | Drain supervisor (#4090)       | `{in_flight, timeout_secs, force_after_timeout, deadline}` |
+| `daemon.drain.completed`   | Drain supervisor (#4090)       | `{in_flight}` (always `0`) |
+| `daemon.drain.aborted`     | Daemon IPC (#4090)             | `{was_draining}` |
+| `daemon.drain.timeout`     | Drain supervisor (#4090)       | `{in_flight, forced, cancelled?}` |
 
 The four `epic.issue.{N}.*` topics were authorized by **#3873** (epic #3842
 Phase 4) and are documented in full under [Epic supervisor](#epic-supervisor-3842)
@@ -121,6 +125,12 @@ below. The `daemon.capacity.advisory` topic was authorized by **#3902** (epic
 state change** (entered/left the token-bound state), never every tick, so the
 operator gets one add-capacity advisory on the way in and one recovery on the way
 out. See [Token-capacity backpressure](#token-capacity-backpressure-3902) below.
+The four `daemon.drain.*` topics were authorized by **#4090** for the scheduled
+drain-and-restart primitive — `started` when a drain is accepted, `completed`
+when the last in-flight sweep finishes (right before the supervised relaunch),
+`aborted` when an operator cancels a drain, and `timeout` when the deadline is
+reached (`forced` distinguishes a refusal from a force-cancel restart). See
+[Supervised restart primitive](#supervised-restart-primitive-4054) below.
 They ride the same in-memory bus as the sweep topics and are tailable via
 `subscribe_to_events` / `tail_event_bus`.
 
@@ -1948,6 +1958,16 @@ the registry reconciles their state on the next start (`SweepRegistry::reconstru
 re-admits live-lock owners). To actively cancel a sweep, use
 `mcp__loom__cancel_sweep` against a running daemon *before* stopping it.
 
+> **Amended by #4090 (scheduled drain-and-restart).** The above describes the
+> *plain* stop/restart: sweeps survive the process boundary but the relaunched
+> daemon's in-memory registry starts empty, so a plain `RestartDaemon` leaves the
+> surviving children as **orphans** — invisible to `list_sweeps`, the concurrency
+> cap, the watchdog, and the reaper, and still holding `loom:building` for a
+> `claim_reconciliation` pass to re-dispatch as duplicates. When you want "finish
+> what you started, then roll" instead, use `loom-daemon restart --drain` (below):
+> it stops admitting new work and waits for the registry to empty before exiting,
+> so no sweep is killed and no orphan is left behind.
+
 **Exit code carries shutdown intent (#4054).** The daemon encodes *why* it is
 shutting down in its exit code, because the launchd `KeepAlive:{SuccessfulExit:true}`
 plist (below) relaunches only on a clean exit `0`: the `RestartDaemon` primitive
@@ -2267,6 +2287,47 @@ loom-daemon restart          # send RestartDaemon over the IPC socket
   the `exec` (Option 2) and detached-helper (Option 3) alternatives were rejected,
   and the Curator's exit-code-race finding — is in
   `docs/design/supervised-restart-primitive.md`.
+
+#### Scheduled drain-and-restart (`--drain`, #4090)
+
+A plain `loom-daemon restart` exits immediately: in-flight sweeps survive the
+process boundary but become **orphans** (absent from the relaunched daemon's
+in-memory registry — see the "sweeps survive, they are not drained" amendment
+above). `--drain` closes that gap by finishing in-flight work *before* rolling:
+
+```bash
+loom-daemon restart --drain                       # finish in-flight sweeps, then restart
+loom-daemon restart --drain --timeout 600         # bound the wait (default 1800s)
+loom-daemon restart --drain --force-after-timeout # at the deadline, cancel stragglers and restart anyway
+loom-daemon restart --abort-drain                 # cancel an in-progress drain, resume dispatch (no restart)
+```
+
+- **What a drain does:** it sets a daemon-global drain flag that is OR'd into the
+  same halt checks the main-health gate uses (#3812) — the work finder stops
+  dispatching, the epic supervisor stops scheduling phases, and (newly, #4090) the
+  role runner stops **starting** new role ticks. Already-running work is left
+  alone. A supervisor task then polls the cross-root in-flight sweep count (every
+  managed workspace, not just the primary) and exits `EXIT_RESTART` for the launchd
+  relaunch only once it reaches **zero** — so `list_sweeps` after the relaunch is
+  consistent with reality and there are **no orphans**.
+- **Fail-safe timeout:** reaching `--timeout` without `--force-after-timeout`
+  **refuses** the restart (clears the drain flag, resumes dispatch, stays up) and
+  reports the reason via `loom-daemon status` — it never silently restarts or
+  silently gives up. `--force-after-timeout` opts into cancelling the stragglers
+  via the existing `cancel_sweep` path, then restarts.
+- **Supervision proof is checked up front (AC5):** on an unsupervised host the
+  request is refused **before** dispatch is paused (`accepted: false`), so a caller
+  can detect nothing happened and no silent outage is introduced.
+- **Residual (documented, bounded):** role ticks have no sweep-registry entry to
+  poll, so a drain stops them *starting* but cannot *await* one already running —
+  a drain can complete while a role tick is still mid-flight, bounded by the role
+  timeout (`DEFAULT_ROLE_TIMEOUT`, 1800s). Awaiting role ticks is deliberately out
+  of scope (it would require a role registry, #4090's stop-and-split boundary).
+- **Observability:** `loom-daemon status` renders `DRAINING (n sweep(s) remaining,
+  deadline …)` while active and the last transition (timeout refusal / abort)
+  afterward; the four `daemon.drain.*` events (above) narrate the transitions on
+  the event bus. **Cannot be used for its own first roll** — see the rollout note
+  below.
 
 ### Self-update (rebuild + provision + restart, #3968)
 

@@ -604,6 +604,7 @@ pub fn spawn_role_task<R>(
     mut runner: R,
     spec: RoleSpec,
     interval: Duration,
+    drain: std::sync::Arc<std::sync::atomic::AtomicBool>,
 ) -> tokio::task::JoinHandle<()>
 where
     R: RoleInvocationRunner + Send + 'static,
@@ -615,6 +616,17 @@ where
         ticker.tick().await; // skip immediate first tick (see module docs)
         loop {
             ticker.tick().await;
+            // Scheduled drain (#4090): role ticks have no sweep-registry entry to
+            // await, so a drain cannot wait for an in-flight tick — but it MUST
+            // stop new ticks from *starting* (e.g. a Champion mid-merge). Skip
+            // the whole tick while draining.
+            if drain.load(std::sync::atomic::Ordering::Relaxed) {
+                log::debug!(
+                    "role_runner: {} tick skipped — drain in progress (no new role dispatch)",
+                    spec.name
+                );
+                continue;
+            }
             let name = spec.name;
             let prompt = spec.prompt;
             let tick_start = Instant::now();
@@ -657,6 +669,7 @@ pub fn spawn_multi_role_task(
     spec: RoleSpec,
     fallback_root: PathBuf,
     interval: Duration,
+    drain: std::sync::Arc<std::sync::atomic::AtomicBool>,
 ) -> tokio::task::JoinHandle<()> {
     log::info!(
         "role_runner: starting {} multi-workspace loop (interval={}s)",
@@ -669,6 +682,18 @@ pub fn spawn_multi_role_task(
         ticker.tick().await; // skip immediate first tick (see module docs)
         loop {
             ticker.tick().await;
+
+            // Scheduled drain (#4090): stop starting new role ticks across every
+            // workspace while a drain is in progress (Finding 2 — role ticks are
+            // not in the sweep registry, so the drain cannot await them, but it
+            // must not let a fresh Champion/Curator tick start mid-roll).
+            if drain.load(std::sync::atomic::Ordering::Relaxed) {
+                log::debug!(
+                    "role_runner: {} multi-workspace tick skipped — drain in progress",
+                    spec.name
+                );
+                continue;
+            }
 
             let roots = WorkspaceRegistry::load_default()
                 .unwrap_or_else(|e| {
@@ -1179,10 +1204,47 @@ mod tests {
             prompt: "/loom:curator",
             default_interval_secs: 1,
         };
-        let handle = spawn_role_task(runner, spec, Duration::from_millis(20));
+        let drain = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let handle = spawn_role_task(runner, spec, Duration::from_millis(20), drain);
 
         wait_for_calls(&calls, 1, Duration::from_secs(2)).await;
         wait_for_calls(&calls, 3, Duration::from_secs(2)).await;
+
+        handle.abort();
+    }
+
+    /// A drain in progress (#4090) stops role ticks from *starting*: with the
+    /// drain flag set before the loop runs, `spawn_role_task` performs ZERO
+    /// `invoke` calls even after several tick intervals elapse. This is the
+    /// highest-value new role-runner coverage (Finding 2 — role ticks had no
+    /// halt gate at all before this).
+    #[tokio::test]
+    async fn test_drain_stops_role_ticks_from_starting() {
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let runner = FakeRunner {
+            outcomes: vec![RoleTickOutcome::Success; 3],
+            calls: calls.clone(),
+        };
+        let spec = RoleSpec {
+            name: "champion",
+            prompt: "/loom:champion",
+            default_interval_secs: 1,
+        };
+        // Drain already engaged before the loop starts.
+        let drain = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let handle = spawn_role_task(runner, spec, Duration::from_millis(20), drain.clone());
+
+        // Let several tick intervals elapse; not a single invoke may fire.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "no role tick may start while draining"
+        );
+
+        // Clearing the drain resumes dispatch — proving the gate, not a dead loop.
+        drain.store(false, std::sync::atomic::Ordering::SeqCst);
+        wait_for_calls(&calls, 1, Duration::from_secs(2)).await;
 
         handle.abort();
     }
@@ -1200,7 +1262,8 @@ mod tests {
             prompt: "/loom:curator",
             default_interval_secs: 1,
         };
-        let handle = spawn_role_task(PanicOnceRunner, spec, Duration::from_millis(20));
+        let drain = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let handle = spawn_role_task(PanicOnceRunner, spec, Duration::from_millis(20), drain);
         let result = tokio::time::timeout(Duration::from_secs(5), handle).await;
         assert!(result.is_ok(), "loop task should finish (not hang) after the runner panics");
     }

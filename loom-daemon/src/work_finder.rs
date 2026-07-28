@@ -1155,6 +1155,7 @@ pub fn spawn_multi_work_finder_task(
     cpu_est_cores_per_sweep: f64,
     health_states: Arc<WorkspaceHealthStates>,
     event_bus: Arc<EventBus>,
+    drain: Arc<std::sync::atomic::AtomicBool>,
 ) -> tokio::task::JoinHandle<()> {
     log::info!(
         "work_finder: starting multi-workspace loop (interval={}s, configured_max={configured_max}, \
@@ -1213,7 +1214,13 @@ pub fn spawn_multi_work_finder_task(
 
             // Per-repo main-health halt (#3930): look up each root's own gate
             // state, parallel to `pairs`. A red repo halts only its own dispatch.
-            let halted: Vec<bool> = roots.iter().map(|r| health_states.is_halted(r)).collect();
+            // A scheduled drain (#4090) is daemon-global: it pauses new dispatch
+            // in EVERY repo at once, so it is OR'd into every root's halt.
+            let draining = drain.load(std::sync::atomic::Ordering::Relaxed);
+            let halted: Vec<bool> = roots
+                .iter()
+                .map(|r| health_states.is_halted(r) || draining)
+                .collect();
             let any_halted = halted.iter().any(|&h| h);
 
             let mut pairs: Vec<(GhWorkSource, RegistryDispatcher)> = roots
