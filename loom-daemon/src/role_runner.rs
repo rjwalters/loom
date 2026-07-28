@@ -349,8 +349,18 @@ fn run_role_with_timeout(
     let mut cmd = Command::new(script);
     cmd.arg("-p")
         .arg(prompt)
-        .arg("--dangerously-skip-permissions")
-        .current_dir(workspace_root)
+        .arg("--dangerously-skip-permissions");
+    // Transient-error recovery (issue #4255): scheduled role spawns are the
+    // same unattended class as daemon-dispatched sweeps, so route them through
+    // `claude-wrapper.sh` (retry/backoff/classification, bounded by
+    // `LOOM_MAX_RETRIES`) instead of running bare `claude` that dies on the
+    // first transient API failure. `spawn-claude.sh` consumes `--use-wrapper`
+    // (not forwarded to `claude`) and execs the wrapper. Operators can force
+    // the legacy single-shot path with `LOOM_USE_WRAPPER=0`.
+    if sweep_registry::wrapper_dispatch_enabled() {
+        cmd.arg("--use-wrapper");
+    }
+    cmd.current_dir(workspace_root)
         .env(sweep_registry::WORKSPACE_ENV, workspace_root)
         .stdin(Stdio::null())
         .stdout(Stdio::from(out_file))
@@ -884,6 +894,48 @@ mod tests {
         let mut runner =
             ScriptRoleInvocationRunner::new(tmp.path().to_path_buf()).with_spawn_bin(script);
         assert_eq!(runner.invoke("curator", "/curator"), RoleTickOutcome::Success);
+    }
+
+    /// Issue #4255: a scheduled role spawn routes through `claude-wrapper.sh` by
+    /// appending `--use-wrapper` after `--dangerously-skip-permissions`, so a
+    /// transient API death is retried instead of killing the unattended role run
+    /// on the first failure. Serialized on a named lock shared with the opt-out
+    /// test so the `LOOM_USE_WRAPPER` env mutation cannot race it.
+    #[test]
+    #[serial(loom_use_wrapper_env)]
+    fn test_invoke_appends_use_wrapper_flag() {
+        std::env::remove_var("LOOM_USE_WRAPPER");
+        let tmp = tempfile::tempdir().unwrap();
+        // Succeeds only when the 4th arg is exactly --use-wrapper.
+        let script = write_fake_script(
+            tmp.path(),
+            "fake-spawn.sh",
+            "[ \"$3\" = \"--dangerously-skip-permissions\" ] && [ \"$4\" = \"--use-wrapper\" ] && exit 0 || exit 1",
+        );
+        let mut runner =
+            ScriptRoleInvocationRunner::new(tmp.path().to_path_buf()).with_spawn_bin(script);
+        assert_eq!(runner.invoke("curator", "/curator"), RoleTickOutcome::Success);
+    }
+
+    /// Issue #4255: the `LOOM_USE_WRAPPER=0` debug opt-out restores the legacy
+    /// single-shot argv — argv ends at `--dangerously-skip-permissions` with no
+    /// `--use-wrapper` token.
+    #[test]
+    #[serial(loom_use_wrapper_env)]
+    fn test_invoke_opt_out_omits_use_wrapper_flag() {
+        std::env::set_var("LOOM_USE_WRAPPER", "0");
+        let tmp = tempfile::tempdir().unwrap();
+        // Succeeds only when there is NO 4th arg (argv ends at skip-permissions).
+        let script = write_fake_script(
+            tmp.path(),
+            "fake-spawn.sh",
+            "[ \"$3\" = \"--dangerously-skip-permissions\" ] && [ -z \"$4\" ] && exit 0 || exit 1",
+        );
+        let mut runner =
+            ScriptRoleInvocationRunner::new(tmp.path().to_path_buf()).with_spawn_bin(script);
+        let outcome = runner.invoke("curator", "/curator");
+        std::env::remove_var("LOOM_USE_WRAPPER");
+        assert_eq!(outcome, RoleTickOutcome::Success);
     }
 
     #[test]

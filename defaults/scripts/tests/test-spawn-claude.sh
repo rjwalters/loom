@@ -1096,6 +1096,122 @@ fi
 rm -rf "$PRIO_DIR"
 
 # ============================================================
+# Section 8: claude-wrapper.sh `Execution error` retry + permanent-death
+#            diagnostics (issue #4255)
+#
+# The Claude CLI's bare `Execution error` fatal was the single most common
+# unattended-death signature (21% of daemon sweep logs) yet matched none of
+# is_transient_error()'s patterns, so the wrapper died on attempt 1 without a
+# retry. It is now recognized as transient (bounded by LOOM_MAX_RETRIES), and a
+# permanent death emits a structured diagnostics block (exit code + classification
+# + stderr tail) instead of only the bare string. Both are unit-tested by sourcing
+# the wrapper with CLAUDE_WRAPPER_SOURCE_ONLY=1 (suppresses `main "$@"`).
+# ============================================================
+
+echo ""
+echo "Testing claude-wrapper.sh Execution-error handling (#4255)..."
+
+EE_DIR="$(mktemp -d)"
+trap 'rm -rf "$TEST_WS" "$STUB_DIR" "$EE_DIR"' EXIT
+
+# --- Unit: is_transient_error() now recognizes the bare `Execution error` ---
+cat > "$EE_DIR/transient-driver.sh" <<'DRIVER'
+#!/usr/bin/env bash
+CLAUDE_WRAPPER_SOURCE_ONLY=1 source "$WRAPPER"
+set +e
+if is_transient_error "Execution error" 1; then echo "TRANSIENT=yes"; else echo "TRANSIENT=no"; fi
+# A genuinely deterministic non-transient failure must still be non-transient.
+if is_transient_error "error: unknown option '--frobnicate'" 1; then
+    echo "UNKNOWN=transient"
+else
+    echo "UNKNOWN=fatal"
+fi
+DRIVER
+ee_transient=$(WRAPPER="$WRAPPER" bash "$EE_DIR/transient-driver.sh" 2>&1)
+assert_contains "TRANSIENT=yes" "$ee_transient" \
+    "is_transient_error treats bare 'Execution error' as transient (#4255)"
+assert_contains "UNKNOWN=fatal" "$ee_transient" \
+    "is_transient_error still treats an unrelated deterministic error as non-transient (#4255)"
+
+# --- Unit: log_permanent_death() emits exit code + classification + tail ---
+cat > "$EE_DIR/death-driver.sh" <<'DRIVER'
+#!/usr/bin/env bash
+CLAUDE_WRAPPER_SOURCE_ONLY=1 source "$WRAPPER"
+set +e
+log_permanent_death 42 "line one
+line two
+Execution error" "max retries (2) exceeded" 2>&1
+DRIVER
+ee_death=$(WRAPPER="$WRAPPER" bash "$EE_DIR/death-driver.sh" 2>&1)
+assert_contains "permanent death (max retries (2) exceeded)" "$ee_death" \
+    "log_permanent_death labels the reason (#4255)"
+assert_contains "exit_code=42" "$ee_death" \
+    "log_permanent_death records the exit code (#4255)"
+assert_contains "classification=" "$ee_death" \
+    "log_permanent_death records the classify-error verdict (#4255)"
+assert_contains "Execution error" "$ee_death" \
+    "log_permanent_death includes the stderr/stdout tail (#4255)"
+
+# --- Integration: a stub that always prints `Execution error` retries up to
+#     LOOM_MAX_RETRIES, then dies permanently with the diagnostics block. ---
+if [[ -z "$DAEMON_BIN" ]]; then
+    echo "  (skipping Execution-error retry integration test — loom-daemon binary not found)"
+else
+  EE_WS="$(mktemp -d)"
+  mkdir -p "$EE_WS/.loom/tokens"
+  chmod 700 "$EE_WS/.loom/tokens"
+  printf '%s' "tok-solo" > "$EE_WS/.loom/tokens/solo.token"
+  chmod 600 "$EE_WS/.loom/tokens/solo.token"
+
+  EE_STUB="$(mktemp -d)"
+  cat > "$EE_STUB/claude" <<'STUB'
+#!/usr/bin/env bash
+case " $* " in
+  *" -p "*) ;;
+  *) exit 0 ;;
+esac
+echo "Execution error"
+exit 1
+STUB
+  chmod +x "$EE_STUB/claude"
+
+  set +e
+  ee_out=$(
+    LOOM_WORKSPACE="$EE_WS" \
+    LOOM_TOKEN_NAME="solo" \
+    CLAUDE_CODE_OAUTH_TOKEN="tok-solo" \
+    LOOM_DAEMON_BIN="$DAEMON_BIN" \
+    LOOM_MAX_RETRIES=2 \
+    LOOM_INITIAL_WAIT=0 \
+    LOOM_SHEPHERD_TASK_ID="test-execution-error" \
+    LOOM_STARTUP_MONITOR_WINDOW=1 \
+    PATH="$EE_STUB:$PATH" \
+    bash "$WRAPPER" -p "ping" 2>&1
+  )
+  ee_rc=$?
+  set -e
+
+  assert_contains "Detected transient error pattern: Execution error" "$ee_out" \
+      "wrapper retries on the bare 'Execution error' output (#4255)"
+  assert_contains "Max retries (2) exceeded" "$ee_out" \
+      "wrapper stops after LOOM_MAX_RETRIES attempts (#4255)"
+  assert_contains "permanent death" "$ee_out" \
+      "wrapper emits the permanent-death diagnostics block on final failure (#4255)"
+  TESTS_RUN=$((TESTS_RUN + 1))
+  if [[ "$ee_rc" -ne 0 ]]; then
+      TESTS_PASSED=$((TESTS_PASSED + 1))
+      echo -e "  ${GREEN}PASS${NC}: wrapper exits non-zero after exhausting retries on Execution error"
+  else
+      TESTS_FAILED=$((TESTS_FAILED + 1))
+      echo -e "  ${RED}FAIL${NC}: wrapper exits non-zero after exhausting retries on Execution error"
+  fi
+
+  rm -rf "$EE_WS" "$EE_STUB"
+fi
+
+rm -rf "$EE_DIR"
+
+# ============================================================
 # Summary
 # ============================================================
 

@@ -994,6 +994,54 @@ fn classify_account_exhaustion(log_tail: &str) -> Option<&'static str> {
         .map(|(label, _)| *label)
 }
 
+/// Best-effort crash classification for the `sweep.issue.{N}.crashed` payload
+/// (Issue #4255). Derives a short, stable label from the dead sweep's log tail
+/// plus its exit code so a subscriber (#4137 telemetry) can attribute WHY the
+/// sweep died rather than re-parsing free-form logs.
+///
+/// Precedence, most-specific first:
+/// 1. `account-exhausted:<signature>` — the account hit a usage/weekly/session
+///    limit (reuses the #4122 signature table so the daemon classifies
+///    exhaustion the same way the wrapper does).
+/// 2. `execution-error` — the CLI printed the bare `Execution error` string
+///    (the chronic transient-death mode this issue targets; the wrapper now
+///    retries it, so reaching the reaper means retries were exhausted).
+/// 3. `exit-<code>` — any other non-zero exit whose log yields no known
+///    signature. `None` when the exit was clean/unknown with no signature, so
+///    the field is omitted from the wire form rather than carrying noise.
+fn classify_crash(log_tail: &str, exit_code: Option<i32>) -> Option<String> {
+    if let Some(sig) = classify_account_exhaustion(log_tail) {
+        return Some(format!("account-exhausted:{sig}"));
+    }
+    // Literal `Execution error` (case-insensitive) — the unlogged transient
+    // death mode. Mirrors `claude-wrapper.sh::is_transient_error`'s new pattern
+    // so a death that survived the wrapper's retry loop is still labeled.
+    if log_tail.to_ascii_lowercase().contains("execution error") {
+        return Some("execution-error".to_string());
+    }
+    match exit_code {
+        Some(0) | None => None,
+        Some(code) => Some(format!("exit-{code}")),
+    }
+}
+
+/// Whether a daemon-dispatched child should route through `claude-wrapper.sh`'s
+/// retry/backoff/classification layer (Issue #4255).
+///
+/// Daemon dispatch and the role runner are the unattended paths that most need
+/// transient-error recovery, so the wrapper is the **default** — `spawn_child`
+/// and the role runner append `--use-wrapper` to the `spawn-claude.sh` argv.
+/// An operator can force the legacy single-shot path (bare `claude`, no retry)
+/// for debugging by exporting `LOOM_USE_WRAPPER` to a falsey value
+/// (`0`/`false`/`no`/`off`, case-insensitive). Any other value — or the var
+/// being unset — keeps the wrapper on.
+pub(crate) fn wrapper_dispatch_enabled() -> bool {
+    match std::env::var("LOOM_USE_WRAPPER") {
+        Ok(v) => !matches!(v.trim().to_ascii_lowercase().as_str(), "0" | "false" | "no" | "off"),
+        Err(_) => true,
+    }
+}
+
 /// Resolve the per-call reaper `gh` timeout (Issue #3973): the
 /// [`REAP_GH_TIMEOUT_ENV`] override (whole seconds, must be > 0) or the
 /// [`REAP_GH_TIMEOUT`] default.
@@ -3203,6 +3251,23 @@ impl SweepRegistry {
         // AFTER `--model`/`--effort` (and the prompt-embedded `--claim-owned`
         // / `--depends-on`) so the positional argv contract is unchanged.
         cmd.arg("--dangerously-skip-permissions");
+        // Transient-error recovery (issue #4255): route the child through
+        // `claude-wrapper.sh` so a transient API death (rate-limit storm, 5xx,
+        // overloaded, or the CLI's bare `Execution error`) is retried with
+        // exponential backoff per `LOOM_MAX_RETRIES` instead of killing the
+        // whole sweep on the first failure — the daemon dispatch path is the
+        // unattended path that most needs it (21% of sweep logs died this way
+        // before this flag). `spawn-claude.sh` consumes `--use-wrapper` (it is
+        // NOT forwarded to `claude`) and execs the wrapper, which forwards the
+        // daemon's `-p/--model/--effort/--dangerously-skip-permissions` argv
+        // verbatim. Appended AFTER `--dangerously-skip-permissions` so the
+        // positional prompt contract (#4111/#4121) is unchanged and existing
+        // argv-prefix assertions still hold. Operators can force the legacy
+        // single-shot path with `LOOM_USE_WRAPPER=0` (see
+        // `wrapper_dispatch_enabled`).
+        if wrapper_dispatch_enabled() {
+            cmd.arg("--use-wrapper");
+        }
         cmd.env("LOOM_TERMINAL_ID", format!("daemon-{sweep_id}"))
             // Claim-ownership marker (issue #3823): `dispatch()` flips
             // loom:issue -> loom:building on the forge BEFORE this child is
@@ -3675,6 +3740,18 @@ impl SweepRegistry {
                                 let _ = self.restore_label_to_ready(issue);
                             }
                             let checkpoint_phase = read_checkpoint_phase(&checkpoint);
+                            // Issue #4255: attribute WHY the sweep died by
+                            // classifying the tail of its log (account
+                            // exhaustion / `Execution error` / bare exit code)
+                            // and carrying that verdict on the crashed event
+                            // alongside the phase. Best-effort: an unreadable
+                            // log yields `None`, exactly like a clean exit.
+                            let log_path = self.entries.get(&sweep_id).map(|i| i.log_path.clone());
+                            let classification = log_path
+                                .as_deref()
+                                .and_then(|p| tail_lines(p, EXHAUSTION_LOG_TAIL_LINES).ok())
+                                .map(|lines| lines.join("\n"))
+                                .and_then(|tail| classify_crash(&tail, exit_code));
                             if let Some(info) = self.entries.get_mut(&sweep_id) {
                                 info.state = SweepState::Crashed { at: now };
                                 if info.latest_phase.is_none() {
@@ -3684,6 +3761,7 @@ impl SweepRegistry {
                             events_to_emit.push(Event::SweepCrashed {
                                 issue,
                                 checkpoint_phase,
+                                classification,
                                 repo: None, // stamped by emit_event (#3929)
                             });
                             events_to_emit.push(Event::SweepGlobalCompleted {
@@ -4297,6 +4375,7 @@ impl SweepRegistry {
                         self.emit_event(Event::SweepCrashed {
                             issue,
                             checkpoint_phase: None,
+                            classification: None,
                             repo: None, // stamped by emit_event (#3929)
                         });
                     }
@@ -4316,6 +4395,7 @@ impl SweepRegistry {
                             self.emit_event(Event::SweepCrashed {
                                 issue,
                                 checkpoint_phase: None,
+                                classification: None,
                                 repo: None, // stamped by emit_event (#3929)
                             });
                         }
@@ -4476,6 +4556,7 @@ impl SweepRegistry {
                         self.emit_event(Event::SweepCrashed {
                             issue,
                             checkpoint_phase: None,
+                            classification: None,
                             repo: None, // stamped by emit_event (#3929)
                         });
                     }
@@ -5772,6 +5853,89 @@ exit 0
         );
     }
 
+    /// Issue #4255: a daemon dispatch routes the child through
+    /// `claude-wrapper.sh` by appending `--use-wrapper` immediately AFTER
+    /// `--dangerously-skip-permissions`, so a transient API death (rate-limit /
+    /// 5xx / overloaded / bare `Execution error`) is retried instead of killing
+    /// the whole sweep on the first failure. Serialized on the named
+    /// `loom_use_wrapper_env` lock shared with every other test that reads or
+    /// mutates `LOOM_USE_WRAPPER` (this module + `role_runner`), so a concurrent
+    /// opt-out test cannot flip the flag mid-run.
+    #[test]
+    #[serial(loom_use_wrapper_env)]
+    fn dispatch_appends_use_wrapper_flag() {
+        std::env::remove_var("LOOM_USE_WRAPPER");
+        let dir = tempdir().unwrap();
+        let (mut registry, record_log) = fixture_registry(dir.path());
+
+        let outcome = registry
+            .dispatch(&SweepKind::Issue(4255), None, None, None, None)
+            .expect("dispatch should succeed");
+
+        let needle = format!("LOOM_TERMINAL_ID=daemon-{}", outcome.sweep_id);
+        let recorded = assert_child_wrote(&record_log, &needle);
+        assert!(
+            recorded.contains("--dangerously-skip-permissions --use-wrapper"),
+            "expected --use-wrapper appended after --dangerously-skip-permissions; got: {recorded}"
+        );
+        // The flag must be its OWN argv token (spawn-claude.sh consumes it), not
+        // folded into the prompt like --claim-owned.
+        assert!(
+            recorded.contains("arg: --use-wrapper"),
+            "expected --use-wrapper as a standalone argv token; got: {recorded}"
+        );
+    }
+
+    /// Issue #4255: the `LOOM_USE_WRAPPER=0` debug opt-out restores the legacy
+    /// single-shot argv — no `--use-wrapper` token — so an operator can
+    /// reproduce a raw first-shot failure. Shares the named `loom_use_wrapper_env`
+    /// lock so it never races the presence tests that assume the wrapper-on default.
+    #[test]
+    #[serial(loom_use_wrapper_env)]
+    fn dispatch_opt_out_omits_use_wrapper_flag() {
+        std::env::set_var("LOOM_USE_WRAPPER", "0");
+        let dir = tempdir().unwrap();
+        let (mut registry, record_log) = fixture_registry(dir.path());
+
+        let outcome = registry
+            .dispatch(&SweepKind::Issue(4256), None, None, None, None)
+            .expect("dispatch should succeed");
+
+        let needle = format!("LOOM_TERMINAL_ID=daemon-{}", outcome.sweep_id);
+        let recorded = assert_child_wrote(&record_log, &needle);
+        std::env::remove_var("LOOM_USE_WRAPPER");
+        assert!(
+            !recorded.contains("--use-wrapper"),
+            "LOOM_USE_WRAPPER=0 must suppress --use-wrapper; got: {recorded}"
+        );
+        // The rest of the argv contract is unchanged.
+        assert!(
+            recorded.contains("--dangerously-skip-permissions"),
+            "opt-out must not drop --dangerously-skip-permissions; got: {recorded}"
+        );
+    }
+
+    /// Issue #4255: `classify_crash` derives a stable label from a dead sweep's
+    /// log tail + exit code for the `sweep.issue.{N}.crashed` payload.
+    #[test]
+    fn classify_crash_labels_death_causes() {
+        // The chronic transient-death signature (case-insensitive).
+        assert_eq!(
+            classify_crash("spawn preamble\nExecution error\n", None).as_deref(),
+            Some("execution-error")
+        );
+        // Account exhaustion wins over everything else (reuses the #4122 table).
+        assert_eq!(
+            classify_crash("hit your weekly limit — try again later", Some(1)).as_deref(),
+            Some("account-exhausted:rate-limited")
+        );
+        // Any other non-zero exit with no known signature → bare exit label.
+        assert_eq!(classify_crash("some opaque build failure", Some(2)).as_deref(), Some("exit-2"));
+        // A clean/unknown exit with no signature carries no classification.
+        assert_eq!(classify_crash("", Some(0)), None);
+        assert_eq!(classify_crash("nothing notable", None), None);
+    }
+
     /// Issue #3823 (Option A): `spawn_child` exports the claim-ownership
     /// marker `LOOM_SWEEP_CLAIM_OWNED=<issue>` into the dispatched child so its
     /// `/loom:sweep` pre-flight recognises the daemon's own pre-dispatch
@@ -6768,6 +6932,77 @@ exit 0
         // production).
         let info = registry.get(&sweep_id).unwrap();
         assert!(matches!(info.state, SweepState::Crashed { .. }));
+    }
+
+    /// Issue #4255: the reaper's `sweep.issue.{N}.crashed` payload carries a
+    /// best-effort error classification derived from the dead sweep's log tail,
+    /// alongside `checkpoint_phase`. A log whose terminal output is the chronic
+    /// `Execution error` string is labeled `execution-error`.
+    #[tokio::test]
+    async fn reaper_crashed_event_carries_classification() {
+        use crate::event_bus::EventBus;
+
+        let dir = tempdir().unwrap();
+        let (mut registry, _record_log) = fixture_registry(dir.path());
+        let bus = Arc::new(EventBus::new());
+        registry.set_event_bus(bus.clone());
+        let mut sub = bus.subscribe::<[&str; 0], &str>([]);
+
+        let cp_dir = registry.config.checkpoint_dir();
+        std::fs::create_dir_all(&cp_dir).unwrap();
+        std::fs::write(cp_dir.join("issue-57.json"), r#"{"phase":"builder","issue":57}"#).unwrap();
+
+        // Write a sweep log whose terminal line is the bare `Execution error`
+        // fatal — the exact death mode this issue targets.
+        let log_path = registry.compute_log_path(57);
+        std::fs::create_dir_all(log_path.parent().unwrap()).unwrap();
+        std::fs::write(&log_path, "spawn-claude: preamble\nExecution error\n").unwrap();
+
+        let sweep_id = "sweep-issue-57-test".to_string();
+        registry.entries.insert(
+            sweep_id.clone(),
+            SweepInfo {
+                sweep_id: sweep_id.clone(),
+                kind: SweepKind::Issue(57),
+                pid: 2_147_483_641,
+                token_name: "unknown".into(),
+                log_path,
+                idempotency_key: None,
+                started_at: Utc::now(),
+                state: SweepState::Running,
+                latest_phase: None,
+                pr_number: None,
+                model: None,
+                effort: None,
+                depends_on: None,
+                repo: None,
+            },
+        );
+
+        let changed = registry.reap_once();
+        assert!(changed >= 1);
+
+        let mut saw_classified = false;
+        for _ in 0..2 {
+            let ev = sub.recv().await.unwrap();
+            if let Event::SweepCrashed {
+                issue,
+                checkpoint_phase,
+                classification,
+                ..
+            } = ev
+            {
+                assert_eq!(issue, 57);
+                assert_eq!(checkpoint_phase.as_deref(), Some("builder"));
+                assert_eq!(
+                    classification.as_deref(),
+                    Some("execution-error"),
+                    "expected the crashed event to carry the execution-error classification"
+                );
+                saw_classified = true;
+            }
+        }
+        assert!(saw_classified, "expected a classified sweep.issue.57.crashed event");
     }
 
     /// Clean-exit (no checkpoint) emits `sweep.issue.{N}.exited` plus

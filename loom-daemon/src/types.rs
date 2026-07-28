@@ -1276,6 +1276,14 @@ pub enum Event {
         issue: u32,
         #[serde(skip_serializing_if = "Option::is_none")]
         checkpoint_phase: Option<String>,
+        /// Issue #4255: the reaper's best-effort error classification derived
+        /// from the dead sweep's log tail + exit code (e.g. `execution-error`,
+        /// `account-exhausted:rate-limited`, `exit-<code>`). Carried alongside
+        /// `checkpoint_phase` so a subscriber (#4137 durable telemetry) can
+        /// attribute WHY a sweep died, not just which phase it reached. `None`
+        /// when the log yields no recognizable signature (or is unreadable).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        classification: Option<String>,
         /// Owning managed-workspace root (Issue #3929). See [`Self::SweepPhase`].
         #[serde(default, skip_serializing_if = "Option::is_none")]
         repo: Option<String>,
@@ -1516,6 +1524,7 @@ mod tests {
         let crashed = Event::SweepCrashed {
             issue: 7,
             checkpoint_phase: Some("doctor".to_string()),
+            classification: None,
             repo: Some("/repos/c".to_string()),
         };
         assert_eq!(crashed.topic(), "sweep.issue.7.crashed");

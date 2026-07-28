@@ -899,6 +899,15 @@ is_transient_error() {
         "MCP.*failed"
         "plugins failed"
         "plugin.*failed to install"
+        # Issue #4255: the Claude CLI's bare `Execution error` fatal. This is the
+        # single most common unattended-death signature — 21% of daemon sweep
+        # logs terminated on it — yet it matched NONE of the patterns above, and
+        # because the CLI prints it (non-empty output) the empty-output-with-
+        # exit-1 heuristic below never fired either, so the wrapper died on
+        # attempt 1 without a single retry. Treat it as transient/retryable
+        # (bounded by MAX_RETRIES): it is an opaque transport/harness fault, not
+        # a deterministic build failure, so a retry frequently succeeds.
+        "Execution error"
     )
 
     for pattern in "${patterns[@]}"; do
@@ -915,6 +924,41 @@ is_transient_error() {
     fi
 
     return 1
+}
+
+# Issue #4255: emit a structured, self-diagnosing block when the wrapper gives
+# up on a child PERMANENTLY (a non-transient error, or the retry budget
+# exhausted). Before this, a daemon-dispatched sweep that died left only the
+# child's raw output — often the single opaque line `Execution error` — in
+# `.loom/logs/sweep-issue-<N>.log`, with no exit code, no error classification,
+# and no stderr context, so every forensic pass had to guess. This records the
+# exit code, the `classify-error.sh` verdict, and the tail of the captured
+# stdout+stderr so a permanent death is diagnosable straight from the sweep log.
+#
+#   log_permanent_death <exit_code> <output> [reason]
+LOOM_DEATH_TAIL_LINES="${LOOM_DEATH_TAIL_LINES:-20}"
+log_permanent_death() {
+    local exit_code="$1"
+    local output="$2"
+    local reason="${3:-permanent failure}"
+
+    local classification="UNCLASSIFIED"
+    if declare -F classify_error >/dev/null 2>&1; then
+        classification="$(classify_error "${output}" "${exit_code}" 2>/dev/null || echo "UNCLASSIFIED")"
+    fi
+
+    local tail_text
+    tail_text="$(printf '%s\n' "${output}" | tail -n "${LOOM_DEATH_TAIL_LINES}")"
+
+    log_error "=== claude-wrapper: permanent death (${reason}) ==="
+    log_error "exit_code=${exit_code} classification=${classification}"
+    log_error "stderr/stdout tail (last ${LOOM_DEATH_TAIL_LINES} lines):"
+    # Emit the tail as discrete log lines so timestamps and the [ERROR] prefix
+    # bracket the captured block in the sweep log.
+    while IFS= read -r _line; do
+        log_error "  | ${_line}"
+    done <<< "${tail_text}"
+    log_error "=== end permanent-death diagnostics ==="
 }
 
 # --- Account rotation on usage/session-limit exhaustion (issue #3738) ---
@@ -1829,7 +1873,9 @@ run_with_retry() {
         # Check if this is a transient error worth retrying
         if ! is_transient_error "${output}" "${exit_code}"; then
             log_error "Non-transient error detected - not retrying"
-            log_error "Output: ${output}"
+            # Issue #4255: structured permanent-death diagnostics (exit code +
+            # classification + stderr tail) in place of a bare `Output: ...`.
+            log_permanent_death "${exit_code}" "${output}" "non-transient error"
             clear_retry_state
             return "${exit_code}"
         fi
@@ -1873,7 +1919,10 @@ run_with_retry() {
     done
 
     log_error "Max retries (${MAX_RETRIES}) exceeded"
-    log_error "Last error: ${output}"
+    # Issue #4255: structured permanent-death diagnostics (exit code +
+    # classification + stderr tail) so an exhausted-retry death is diagnosable
+    # from the sweep log instead of only a bare `Last error: ...` line.
+    log_permanent_death "${exit_code}" "${output}" "max retries (${MAX_RETRIES}) exceeded"
     clear_retry_state
 
     # When the last failure was MCP-related, exit with code 7 so the
