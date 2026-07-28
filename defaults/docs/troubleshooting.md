@@ -222,6 +222,82 @@ When an agent crashes or is cancelled while building, issues can get stuck in `l
 - Issues without PRs older than threshold are flagged/recovered
 - Issues with stale PRs are flagged but not auto-recovered (need manual review)
 
+## Several unrelated things hang at once (macOS Gatekeeper / `syspolicyd`)
+
+**Symptom:** several unrelated processes — a `cargo` build, a sweep child, a
+shell wrapper, a timing-sensitive test — appear to hang *simultaneously*, all
+sitting at **zero CPU time** even after minutes of wall-clock. It looks like
+host-wide CPU starvation, but the CPUs are idle.
+
+**Zero CPU means nothing on its own.** Before chasing any single victim,
+distinguish the two very different conditions that both present as "stuck at zero
+CPU":
+
+- *Many* unrelated processes at zero CPU, including short-lived `exec`s that never
+  make progress → **macOS Gatekeeper / `syspolicyd` saturation** (this section).
+- A *single sweep* at zero CPU with a flat log → almost certainly **healthy, not
+  wedged**. Sweeps are network-bound and accrue almost no CPU while awaiting API
+  responses; `%CPU`, cumulative `TIME`, a `sample <pid>` stack (which parks in
+  `CFRunLoopRun → mach_msg`, indistinguishable from a block), and sweep-log size
+  **cannot** tell a working sweep from a dead one. Verify liveness via the side
+  effects a sweep actually produces — `ls .loom/worktrees/`, `git log` in the
+  worktree, `git ls-remote --heads origin 'feature/issue-*'`, and the forge
+  (`gh pr list`) — before concluding anything. (See "Stuck Agent Detection" below.)
+
+### First diagnostic move
+
+```bash
+ps -axo %cpu,time,comm | sort -rn | head
+```
+
+If `syspolicyd` is at or near the **top** of that list, stop debugging the
+individual victims — they are symptoms, not the cause. Under parallel `cargo`
+builds, macOS's Gatekeeper daemon (`syspolicyd`) becomes the bottleneck: it
+serializes code-signature / notarization checks on every `exec`, and when
+saturated it stalls *every* new process launch host-wide.
+
+### The exec-stall signature
+
+A victim of `syspolicyd` saturation is a process caught mid-`exec` — launched, but
+its target binary has not yet cleared Gatekeeper. Its tell-tale signature:
+
+- **Zero CPU time** accumulated even after minutes of elapsed wall-clock.
+- **`STAT S`** (interruptible sleep) — blocked, not spinning.
+- **No child processes** — the wrapper never got far enough to fork its target.
+- `lsof -p <pid>` shows `txt = /usr/bin/env` (or another wrapper) that **never
+  exec'd its actual target** — the process is frozen inside the launch, waiting on
+  the signature check.
+
+### It is load-induced and self-recovering
+
+The condition is caused by launch load, not by any one process, and it clears on
+its own once the load is removed — **removing the build load (letting the parallel
+`cargo` builds finish, or throttling them) is normally sufficient.** If you need to
+unwedge it manually:
+
+```bash
+sudo killall syspolicyd
+```
+
+`syspolicyd` is a system daemon that `launchd` restarts immediately; killing it
+drops its saturated in-flight queue and lets the stalled `exec`s proceed.
+
+### Why this matters — a falsified contention story
+
+This signature was originally *misdiagnosed* as CPU contention. The build gate's
+timing-sensitive tests failed under host load and the failures were attributed to
+sweeps starving the gate; #4044 / #4046 falsified that — the same tests passed
+968/968 later with **no code change**, establishing the failures as `syspolicyd`
+exec-latency artifacts rather than contention. The narrative and its consequences
+for gate niceness live in [`build-gate.md`](build-gate.md) (the #4044 / #4046
+falsification passage). ADR-0011 also records this as a macOS-specific defect that
+is invisible to Linux CI by construction — see
+[`docs/adr/0011-ci-runner-platform.md`](../../docs/adr/0011-ci-runner-platform.md).
+
+> **Historical note on timeouts.** Contemporaneous incident writeups mention a
+> "600s" build-gate budget; that figure is **incident history only**. #4048 raised
+> the live budget to **1200s** — do not read 600s as the current value.
+
 ## Stuck Agent Detection
 
 `loom-stuck-detection` checks for stuck sweep children by reading the per-task heartbeats in `.loom/spawn-loop-state.json::running[].last_heartbeat`.

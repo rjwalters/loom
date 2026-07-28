@@ -187,7 +187,10 @@ Two concrete failure classes motivated the split (#3985):
   #4046 established the timing-test failures were macOS `syspolicyd`
   exec-latency artifacts, not contention (968/968 passed later with **no code
   change**). The generous bounds are still correct; the "sweeps starve the
-  gate's timing tests" story that motivated them is not.
+  gate's timing tests" story that motivated them is not. For the operator-facing
+  diagnostic — how to recognize `syspolicyd` saturation live and unwedge it — see
+  [`troubleshooting.md`](troubleshooting.md) → "Several unrelated things hang at
+  once (macOS Gatekeeper / `syspolicyd`)".
 
 **The gate runs at a mild throttle relative to sweeps (#4020, revises #3985).**
 `build-gate.sh` now defaults to `nice 5` — a mild positive niceness, a real but
