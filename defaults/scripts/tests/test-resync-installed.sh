@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# test-resync-installed.sh - Smoke tests for resync-installed.sh (#3777)
+# test-resync-installed.sh - Smoke tests for resync-installed.sh (#3777, #4239)
 #
 # Constructs throwaway git repos with synthetic defaults/ and installed .loom/
 # trees so it can deterministically exercise the load-bearing cases:
@@ -11,6 +11,13 @@
 #   (f) repo-specific file   -> file present only in .loom/ left untouched
 #   (g) .loom/resync-ignore  -> pinned file reported "skipped", not overwritten
 #   (h) idempotent rerun     -> second run reports all unchanged
+# Widened surfaces (#4239):
+#   (i) drift in each new surface (roles/docs/bin/commands) -> updated + exit 2 on dry-run
+#   (j) local-only custom role -> survives untouched
+#   (k) resync-ignore pins a new-surface file -> reported "skipped"
+#   (l) symlinked install target -> skipped, not clobbered
+#   (m) recorded loom_source gone -> clear error, exit 1
+#   (n) metadata re-stamp -> loom_version/loom_commit/last_resync present after apply
 # Plus contract checks:
 #   - --help prints usage, exit 0
 #   - unknown arg exits 1
@@ -62,11 +69,23 @@ export GIT_COMMITTER_NAME="test" GIT_COMMITTER_EMAIL="test@example.com"
 #   .loom/scripts/foo.sh             (installed, "S"   -> in sync)
 #   (.loom/scripts/lib/bar.sh MISSING -> to be created)
 #   .loom/scripts/custom-only.sh     (repo-specific, no defaults/ counterpart)
+# Widened surfaces (#4239):
+#   defaults/roles/builder.md            -> .loom/roles/builder.md (drift)
+#   defaults/docs/troubleshooting.md     -> .loom/docs/troubleshooting.md (drift)
+#   defaults/.loom/bin/loom              -> .loom/bin/loom (drift)
+#   defaults/.claude/commands/loom/x.md  -> .claude/commands/loom/x.md (drift)
+#   .loom/roles/custom-role.md           (repo-specific, no defaults/ counterpart)
+#   package.json ("version": "9.9.9")    (loom_version source for re-stamp)
+#   .loom/install-metadata.json          (re-stamp target; loom_source -> $repo)
 make_fixture() {
     local repo="$WORKDIR/repo"
     rm -rf "$repo"
     mkdir -p "$repo/defaults/hooks" "$repo/defaults/scripts/lib" \
-             "$repo/.loom/hooks" "$repo/.loom/scripts/lib"
+             "$repo/defaults/roles" "$repo/defaults/docs" \
+             "$repo/defaults/.loom/bin" "$repo/defaults/.claude/commands/loom" \
+             "$repo/.loom/hooks" "$repo/.loom/scripts/lib" \
+             "$repo/.loom/roles" "$repo/.loom/docs" \
+             "$repo/.loom/bin" "$repo/.claude/commands/loom"
     git -C "$repo" init -q
 
     printf 'A\n' > "$repo/defaults/hooks/guard.sh"
@@ -78,6 +97,31 @@ make_fixture() {
     printf 'OLD\n' > "$repo/.loom/hooks/guard.sh"
     printf 'S\n'   > "$repo/.loom/scripts/foo.sh"
     printf 'REPO-SPECIFIC\n' > "$repo/.loom/scripts/custom-only.sh"
+
+    # Widened pure-copy surfaces (#4239): each drifts (installed differs from
+    # defaults) so a single apply exercises all four new surfaces at once.
+    printf 'ROLE-NEW\n' > "$repo/defaults/roles/builder.md"
+    printf 'ROLE-OLD\n' > "$repo/.loom/roles/builder.md"
+    printf 'CUSTOM-ROLE\n' > "$repo/.loom/roles/custom-role.md"   # local-only
+
+    printf 'DOC-NEW\n' > "$repo/defaults/docs/troubleshooting.md"
+    printf 'DOC-OLD\n' > "$repo/.loom/docs/troubleshooting.md"
+
+    printf 'BIN-NEW\n' > "$repo/defaults/.loom/bin/loom"
+    printf 'BIN-OLD\n' > "$repo/.loom/bin/loom"
+    chmod +x "$repo/defaults/.loom/bin/loom"
+
+    printf 'CMD-NEW\n' > "$repo/defaults/.claude/commands/loom/builder.md"
+    printf 'CMD-OLD\n' > "$repo/.claude/commands/loom/builder.md"
+
+    # Version source + metadata re-stamp target.
+    printf '{\n  "version": "9.9.9"\n}\n' > "$repo/package.json"
+    printf '{\n  "loom_version": "0.0.0",\n  "loom_commit": "old",\n  "install_date": "2020-01-01",\n  "loom_source": "%s",\n  "installed_files": []\n}\n' \
+        "$repo" > "$repo/.loom/install-metadata.json"
+
+    # A real commit so loom_commit re-stamps to an actual short sha.
+    git -C "$repo" add -A >/dev/null 2>&1
+    git -C "$repo" commit -qm "fixture" >/dev/null 2>&1
 
     echo "$repo"
 }
@@ -170,8 +214,158 @@ else
     fail "(g) pinned file was overwritten despite resync-ignore"
 fi
 
+# --- (i) widened surfaces: drift detected + fixed ----------------------------
+echo "Test group 7: widened surfaces (roles/docs/bin/commands) resync"
+REPO="$(make_fixture)"
+# dry-run first: drift across the new surfaces must be detected (exit 2)
+OUT="$(cd "$REPO" && bash "$SCRIPT" --dry-run 2>&1)"
+RC=$?
+if [[ $RC -eq 2 ]]; then
+    pass "(i) --dry-run detects drift across widened surfaces (exit 2)"
+else
+    fail "(i) --dry-run did not exit 2 across widened surfaces (got $RC)"
+fi
+for surf in "roles/builder.md" "docs/troubleshooting.md" "bin/loom" "commands/loom/builder.md"; do
+    if grep -q "$surf" <<<"$OUT"; then
+        pass "(i) --dry-run reports drift for $surf"
+    else
+        fail "(i) --dry-run did not report drift for $surf"
+    fi
+done
+# apply, then verify each installed surface now matches defaults
+OUT="$(cd "$REPO" && bash "$SCRIPT" 2>&1)"
+RC=$?
+if [[ $RC -eq 0 ]]; then pass "(i) apply exits 0"; else fail "(i) apply exits 0 (got $RC)"; fi
+if [[ "$(cat "$REPO/.loom/roles/builder.md")" == "ROLE-NEW" ]]; then
+    pass "(i) roles/builder.md resynced from defaults"
+else
+    fail "(i) roles/builder.md not resynced"
+fi
+if [[ "$(cat "$REPO/.loom/docs/troubleshooting.md")" == "DOC-NEW" ]]; then
+    pass "(i) docs/troubleshooting.md resynced from defaults"
+else
+    fail "(i) docs/troubleshooting.md not resynced"
+fi
+if [[ "$(cat "$REPO/.loom/bin/loom")" == "BIN-NEW" && -x "$REPO/.loom/bin/loom" ]]; then
+    pass "(i) bin/loom resynced (and executable bit preserved)"
+else
+    fail "(i) bin/loom not resynced or not executable"
+fi
+if [[ "$(cat "$REPO/.claude/commands/loom/builder.md")" == "CMD-NEW" ]]; then
+    pass "(i) commands/loom/builder.md resynced from defaults"
+else
+    fail "(i) commands/loom/builder.md not resynced"
+fi
+# second run is a clean no-op across the widened surfaces too
+OUT="$(cd "$REPO" && bash "$SCRIPT" 2>&1)"
+RC=$?
+if [[ $RC -eq 0 ]] && grep -q "Already in sync" <<<"$OUT"; then
+    pass "(i) widened surfaces idempotent (second run already in sync)"
+else
+    fail "(i) widened surfaces not idempotent (rc=$RC)"
+fi
+
+# --- (j) local-only custom role survives -------------------------------------
+echo "Test group 8: local-only custom role is never touched"
+if [[ "$(cat "$REPO/.loom/roles/custom-role.md")" == "CUSTOM-ROLE" ]]; then
+    pass "(j) local-only custom-role.md left untouched"
+else
+    fail "(j) local-only custom-role.md was modified/removed"
+fi
+
+# --- (k) resync-ignore pins a new-surface file -------------------------------
+echo "Test group 9: .loom/resync-ignore pins a widened-surface file"
+REPO="$(make_fixture)"
+printf 'PINNED-ROLE\n' > "$REPO/.loom/roles/builder.md"
+printf 'roles/builder.md  # keep my local role tweak\n' > "$REPO/.loom/resync-ignore"
+OUT="$(cd "$REPO" && bash "$SCRIPT" 2>&1)"
+RC=$?
+if [[ $RC -eq 0 ]] && grep -q "skipped" <<<"$OUT" && grep -q "roles/builder.md" <<<"$OUT"; then
+    pass "(k) pinned roles/builder.md reported as skipped"
+else
+    fail "(k) pinned roles/builder.md not reported skipped (rc=$RC)"
+fi
+if [[ "$(cat "$REPO/.loom/roles/builder.md")" == "PINNED-ROLE" ]]; then
+    pass "(k) pinned roles/builder.md NOT overwritten"
+else
+    fail "(k) pinned roles/builder.md was overwritten despite resync-ignore"
+fi
+
+# --- (l) symlinked install target is skipped, not clobbered ------------------
+echo "Test group 10: symlinked install target is skipped (dogfood safety)"
+REPO="$(make_fixture)"
+# Replace the installed docs file with a symlink pointing back at defaults/
+# (mirrors this repo's dogfood .loom/docs/*.md layout).
+rm -f "$REPO/.loom/docs/troubleshooting.md"
+ln -s "../../defaults/docs/troubleshooting.md" "$REPO/.loom/docs/troubleshooting.md"
+OUT="$(cd "$REPO" && bash "$SCRIPT" 2>&1)"
+RC=$?
+if [[ $RC -eq 0 ]] && grep -qi "symlink" <<<"$OUT"; then
+    pass "(l) symlinked docs entry reported as skipped"
+else
+    fail "(l) symlinked docs entry not reported skipped (rc=$RC)"
+fi
+if [[ -L "$REPO/.loom/docs/troubleshooting.md" ]]; then
+    pass "(l) symlink left intact (not clobbered into a regular file)"
+else
+    fail "(l) symlink was clobbered"
+fi
+
+# --- (m) recorded loom_source gone -> clear error, exit 1 --------------------
+echo "Test group 11: recorded loom_source moved/deleted errors clearly"
+REPO="$(make_fixture)"
+rm -rf "$REPO/defaults"                       # no dogfood defaults/ tree
+rm -f "$REPO/.loom/loom-source-path"           # no source sidecar
+printf '{\n  "loom_source": "%s/gone"\n}\n' "$REPO" > "$REPO/.loom/install-metadata.json"
+RC=0; OUT="$(cd "$REPO" && bash "$SCRIPT" 2>&1)" || RC=$?
+if [[ $RC -eq 1 ]]; then
+    pass "(m) missing source tree exits 1"
+else
+    fail "(m) missing source tree did not exit 1 (got $RC)"
+fi
+if grep -qi "could not locate" <<<"$OUT"; then
+    pass "(m) missing source tree prints a clear error"
+else
+    fail "(m) missing source tree error message unclear"
+fi
+
+# --- (n) metadata re-stamp ---------------------------------------------------
+echo "Test group 12: successful apply re-stamps install-metadata.json"
+REPO="$(make_fixture)"
+(cd "$REPO" && bash "$SCRIPT" >/dev/null 2>&1)
+META="$REPO/.loom/install-metadata.json"
+if grep -q '"loom_version": *"9.9.9"' "$META"; then
+    pass "(n) loom_version re-stamped from source package.json"
+else
+    fail "(n) loom_version not re-stamped"
+fi
+if grep -q "\"last_resync\": *\"$(date +%Y-%m-%d)\"" "$META"; then
+    pass "(n) last_resync stamped with today's date"
+else
+    fail "(n) last_resync not stamped"
+fi
+if grep -q '"loom_commit"' "$META" && ! grep -q '"loom_commit": *"old"' "$META"; then
+    pass "(n) loom_commit re-stamped (no longer the stale value)"
+else
+    fail "(n) loom_commit not re-stamped"
+fi
+# out-of-scope metadata fields must be preserved
+if grep -q '"install_date": *"2020-01-01"' "$META"; then
+    pass "(n) install_date preserved (installer-owned, out of scope)"
+else
+    fail "(n) install_date was altered"
+fi
+# --dry-run must NOT re-stamp
+REPO="$(make_fixture)"
+(cd "$REPO" && bash "$SCRIPT" --dry-run >/dev/null 2>&1)
+if grep -q '"loom_version": *"0.0.0"' "$REPO/.loom/install-metadata.json"; then
+    pass "(n) --dry-run leaves install-metadata.json unstamped"
+else
+    fail "(n) --dry-run re-stamped metadata (should be preview-only)"
+fi
+
 # --- contract checks ---------------------------------------------------------
-echo "Test group 6: flag/contract checks"
+echo "Test group 13: flag/contract checks"
 if bash "$SCRIPT" --help 2>&1 | grep -q "resync-installed.sh"; then
     pass "--help prints usage"
 else
