@@ -2664,6 +2664,85 @@ exit 0
     }
 
     #[test]
+    fn test_tripped_host_breaker_suppresses_tick_without_aborting_running_work() {
+        // The host-distress circuit breaker (#4235) is consulted at the tick
+        // choke point by folding its `is_suppressed()` into the same `halted`
+        // bool the main-health gate uses. This proves the two load-bearing
+        // properties end-to-end: a *tripped* breaker dispatches ZERO new sweeps,
+        // and the running (in-flight) sweeps are left untouched — drain, don't
+        // abort.
+        use crate::host_breaker::{BreakerPhase, HostBreakerConfig, SharedHostBreaker};
+        let now = chrono::Utc::now();
+        let breaker = SharedHostBreaker::new(HostBreakerConfig {
+            enabled: true,
+            load_per_core_threshold: 2.5,
+            sustain_ticks: 3,
+            cooldown_secs: 300,
+        });
+        // Not yet tripped: the breaker does not suppress, so a tick dispatches.
+        assert!(!breaker.is_suppressed());
+
+        // Three sustained over-threshold samples trip it to Open.
+        breaker.observe(Some(4.0), now);
+        breaker.observe(Some(4.0), now);
+        breaker.observe(Some(4.0), now);
+        assert_eq!(breaker.snapshot().phase, BreakerPhase::Open);
+        assert!(breaker.is_suppressed(), "tripped breaker suppresses dispatch");
+
+        // Feed the breaker's suppression into the tick's `halted` input, exactly
+        // as the work-finder loop does.
+        let mut source = FakeSource::once((1..=5).map(issue).collect());
+        let mut disp = RecordingDispatcher {
+            in_flight: HashSet::from([100, 101]),
+            ..Default::default()
+        };
+        let halted = breaker.is_suppressed();
+        let report = tick(&mut source, &mut disp, 10, halted).unwrap();
+
+        assert!(report.halted, "a tripped breaker halts the tick");
+        assert_eq!(report.seen, 5, "backlog is still observed");
+        assert_eq!(report.dispatched, 0, "zero new dispatch while the breaker is open");
+        assert!(disp.dispatched.is_empty(), "no new sweeps started");
+        // Drain, don't abort: the two running sweeps are untouched.
+        assert_eq!(disp.in_flight, HashSet::from([100, 101]));
+    }
+
+    #[test]
+    fn test_host_breaker_cooldown_release_resumes_dispatch() {
+        // After the breaker cools down and releases, the tick resumes dispatch —
+        // the "cool-down release" half of the Test Plan, driven through the same
+        // `halted`-composition path the loop uses.
+        use crate::host_breaker::{BreakerPhase, HostBreakerConfig, SharedHostBreaker};
+        let t0 = chrono::Utc::now();
+        let breaker = SharedHostBreaker::new(HostBreakerConfig {
+            enabled: true,
+            load_per_core_threshold: 2.5,
+            sustain_ticks: 3,
+            cooldown_secs: 300,
+        });
+        // Trip → Open.
+        for _ in 0..3 {
+            breaker.observe(Some(4.0), t0);
+        }
+        assert!(breaker.is_suppressed());
+        // Load drops → CoolDown (still suppressed).
+        breaker.observe(Some(0.1), t0 + chrono::Duration::seconds(10));
+        assert_eq!(breaker.snapshot().phase, BreakerPhase::CoolDown);
+        assert!(breaker.is_suppressed(), "cool-down still suppresses");
+        // Cool-down elapses with acceptable load → Closed, dispatch resumes.
+        breaker.observe(Some(0.1), t0 + chrono::Duration::seconds(400));
+        assert_eq!(breaker.snapshot().phase, BreakerPhase::Closed);
+        assert!(!breaker.is_suppressed());
+
+        let mut source = FakeSource::once((1..=3).map(issue).collect());
+        let mut disp = RecordingDispatcher::default();
+        let report = tick(&mut source, &mut disp, 10, breaker.is_suppressed()).unwrap();
+        assert!(!report.halted);
+        assert_eq!(report.dispatched, 3, "dispatch resumes once the breaker releases");
+        assert_eq!(disp.dispatched, vec![1, 2, 3]);
+    }
+
+    #[test]
     fn test_tick_resumes_dispatch_once_halt_cleared() {
         // Same source shape: halted ⇒ zero, then not halted ⇒ dispatches.
         let mut source = FakeSource::once((1..=3).map(issue).collect());
