@@ -435,15 +435,31 @@ def build_report(results: Iterable[AccountResult]) -> ProbeReport:
     return ProbeReport(ranked_at=ranked_at, accounts=sorted_results)
 
 
-def format_ranking_lines(report: ProbeReport) -> str:
-    """Serialize a probe report to the selector's ``name|status`` format.
+def _ranking_line(name: str, status: str, util_5h: float | None) -> str:
+    """Format one ``.ranking`` line, emitting the optional 5h-utilization field.
 
-    This is the format ``select.py:_read_ranking`` consumes (pipe-delimited
-    ``name|status``, one account per line, already ordered by
-    :func:`build_report`). A trailing newline is included so the file ends
+    ``name|status|5h_util`` when the 5h utilization is known (issue #4195),
+    else the legacy ``name|status`` (backward compatible: a ``None`` utilization
+    is left unwritten rather than faked as ``0.0``). The float is fixed at 2
+    decimals so the ``check`` and ``monitor`` writers stay byte-identical with
+    the Rust port (``tokens_pool::check::ranking_line`` / ``monitor``).
+    """
+    if util_5h is None:
+        return f"{name}|{status}"
+    return f"{name}|{status}|{util_5h:.2f}"
+
+
+def format_ranking_lines(report: ProbeReport) -> str:
+    """Serialize a probe report to the selector's ``name|status|5h_util`` format.
+
+    This is the format ``select.py:_read_ranking`` consumes (pipe-delimited,
+    one account per line, already ordered by :func:`build_report`). The 5h
+    utilization is emitted as an optional third field when measured (issue
+    #4195); accounts without a measured 5h utilization keep the legacy 2-field
+    ``name|status`` form. A trailing newline is included so the file ends
     cleanly; an empty report yields an empty string.
     """
-    lines = [f"{a.name}|{a.status}" for a in report.accounts]
+    lines = [_ranking_line(a.name, a.status, a.s5h_utilization) for a in report.accounts]
     return "\n".join(lines) + ("\n" if lines else "")
 
 

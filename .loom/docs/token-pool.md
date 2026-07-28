@@ -241,13 +241,38 @@ token hits its weekly limit.
 
 Three tiers, falling through to the next when the current tier yields nothing:
 
-1. **Ranking** — `.loom/tokens/.ranking` (pipe-delimited `name|status`, refreshed
-   every <10 min). Picks the first non-`exhausted`/non-`blocked` token.
+1. **Ranking** — `.loom/tokens/.ranking` (pipe-delimited `name|status|5h_util`,
+   refreshed every <10 min). A persistent rotation cursor spreads consecutive
+   dispatches one-per-account across the eligible accounts (#3909;
+   `LOOM_TOKEN_SPREAD_TOP_N` / `tokens.spreadTopN` optionally caps the window).
 2. **Allowlist** — `.loom/tokens/.allowlist` (one name per line). Random pick from
    allowed accounts.
 3. **Random** — uniform pick from all `*.token` files.
 
 Tokens marked bad in `.loom/tokens/.bad_tokens` are skipped at every tier.
+
+### Ranking format: 5h-load field + soft gate (issue #4195)
+
+The `.ranking` line format is `name|status|5h_util`, where the **third field**
+is the account's 5h-window utilization (a fraction `0.0`–`1.0`, fixed at 2
+decimals). It is **optional**: a legacy 2-field `name|status` line still parses,
+and an account with no measured 5h utilization is written in the 2-field form
+(the value is left off, never faked as `0.0`). All four ranking writers emit it
+— the Python probe (`check.py`) and monitor (`monitor.py`) paths and their
+byte-identical Rust ports (`tokens_pool::check` / `tokens_pool::monitor`).
+
+The ranked tier layers a **soft load gate** on top of the rotation cursor: in
+the preferred pass an account **at/above** the 5h threshold is excluded (so the
+cursor rotates only across the lightly-loaded accounts), and the fallback pass
+readmits them — the pool never hard-fails on load alone. A **missing or
+unparseable** utilization is treated as *unknown* → never gated. The threshold
+defaults to `0.70` and is overridable via the `LOOM_TOKEN_5H_LOAD_GATE` env var
+(a value `> 1.0` disables the gate); it follows the `LOOM_TOKEN_SPREAD_TOP_N`
+precedent and is honored identically by the Python selector (`select.py`) and
+the Rust port (`tokens_pool::select`). This is the Option-A reconciliation of
+the gpeyton-fork load-aware selection proposal (fork commits `283de8e3`,
+`20961dd9`) with upstream's existing rotation-cursor spread — a load-aware gate
+*layered on* #3909, not the fork's waterfall-fill replacement.
 
 ## Bad-token tracking (`loom_tools.tokens.bad_tokens`)
 

@@ -7,7 +7,12 @@
 //!      using the persistent rotation cursor ([`super::rotation`]) so a
 //!      burst of N concurrent dispatches spreads across `min(N, available)`
 //!      distinct accounts (#3909). `LOOM_TOKEN_SPREAD_TOP_N` /
-//!      `tokens.spreadTopN` optionally caps the rotation window.
+//!      `tokens.spreadTopN` optionally caps the rotation window. The preferred
+//!      pass additionally excludes accounts at/above the 5h-window load
+//!      threshold (`name|status|5h_util` third field, `LOOM_TOKEN_5H_LOAD_GATE`,
+//!      default 0.70) — a soft eligibility gate layered on the rotation cursor
+//!      (#4195); the fallback pass readmits them so the pool never hard-fails on
+//!      load alone.
 //!   2. Allowlist file (`.allowlist`): random pick from allowed accounts.
 //!   3. Random pick from all `.token` files.
 //!
@@ -30,6 +35,15 @@ const RANKING_FRESH_SECONDS: u64 = 600; // 10 min
 
 /// Exit code when no token is available (matches sysexits.h EX_CONFIG).
 pub const EX_CONFIG: i32 = 78;
+
+/// Default 5h-window load threshold for the tier-1 *preferred* pass (issue
+/// #4195). An account at/above this fraction of its 5h rate-limit window is
+/// excluded from the preferred pass (a soft eligibility gate layered on top of
+/// the #3909 rotation-cursor spread) and readmitted in the fallback pass, so a
+/// fully-loaded pool still dispatches. Overridable via `LOOM_TOKEN_5H_LOAD_GATE`
+/// (a value > 1.0 disables the gate). A missing/unparseable utilization is
+/// treated as unknown → never gated. Mirrors `select.py:_DEFAULT_5H_LOAD_GATE`.
+const DEFAULT_5H_LOAD_GATE: f64 = 0.70;
 
 /// Statuses considered positively healthy (issue #3991 — allowlist of
 /// known-good statuses, not a denylist of known-bad ones). The empty string
@@ -115,9 +129,22 @@ fn strip_comment(line: &str) -> String {
     line.split('#').next().unwrap_or("").trim().to_string()
 }
 
-/// Yield `(name, status)` pairs from the ranking file. Malformed/empty
-/// lines are skipped; `status` defaults to `""`.
-fn read_ranking(ranking_file: &Path) -> Vec<(String, String)> {
+/// Parse a ranking line's optional 5h-utilization field (issue #4195). An
+/// empty or unparseable field yields `None` ("unknown") — never coerced to
+/// `0.0`, so an unmeasured account is never load-gated (see #4164).
+fn parse_util(field: &str) -> Option<f64> {
+    let field = field.trim();
+    if field.is_empty() {
+        return None;
+    }
+    field.parse::<f64>().ok()
+}
+
+/// Yield `(name, status, util_5h)` triples from the ranking file. Format:
+/// `name|status|5h_util` per line (issue #4195); the third field is optional,
+/// so a legacy `name|status` line yields `util_5h = None` (backward
+/// compatible). Malformed/empty lines are skipped; `status` defaults to `""`.
+fn read_ranking(ranking_file: &Path) -> Vec<(String, String, Option<f64>)> {
     let Ok(text) = std::fs::read_to_string(ranking_file) else {
         return Vec::new();
     };
@@ -127,11 +154,12 @@ fn read_ranking(ranking_file: &Path) -> Vec<(String, String)> {
         if stripped.is_empty() {
             continue;
         }
-        let mut parts = stripped.splitn(2, '|');
+        let mut parts = stripped.splitn(3, '|');
         let name = parts.next().unwrap_or("").trim().to_string();
         let status = parts.next().unwrap_or("").trim().to_string();
+        let util = parts.next().and_then(parse_util);
         if !name.is_empty() {
-            out.push((name, status));
+            out.push((name, status, util));
         }
     }
     out
@@ -174,20 +202,47 @@ fn resolve_spread_top_n(workspace: &Path) -> Option<usize> {
     None
 }
 
+/// Resolve the tier-1 5h-load threshold (issue #4195): `LOOM_TOKEN_5H_LOAD_GATE`
+/// env var (parsed as a float) → the constant default [`DEFAULT_5H_LOAD_GATE`].
+/// An unset or unparseable env value falls back to the default. Mirrors
+/// `select.py:_resolve_load_gate` so both implementations gate identically.
+fn resolve_load_gate() -> f64 {
+    if let Ok(raw) = std::env::var("LOOM_TOKEN_5H_LOAD_GATE") {
+        if let Ok(v) = raw.trim().parse::<f64>() {
+            return v;
+        }
+    }
+    DEFAULT_5H_LOAD_GATE
+}
+
 fn collect_ranked_candidates(
     tokens_dir: &Path,
     ranking_file: &Path,
     workspace: &Path,
     cap: Option<usize>,
     healthy_only: bool,
+    load_gate: f64,
 ) -> Vec<SelectedToken> {
     let mut out = Vec::new();
-    for (name, status) in read_ranking(ranking_file) {
+    for (name, status, util) in read_ranking(ranking_file) {
         if is_hard_excluded_status(&status) {
             continue;
         }
         if healthy_only && !is_healthy_status(&status) {
             continue;
+        }
+        // Load gate (issue #4195): the preferred pass additionally excludes
+        // accounts at/above the 5h-window load threshold. An unknown
+        // (unmeasured) utilization is never gated. The fallback pass drops the
+        // gate so a fully-loaded pool still dispatches. The rotation cursor
+        // then rotates across the load-eligible set, so no per-spawn in-burst
+        // bump is needed — the cursor already prevents intra-burst stacking.
+        if healthy_only {
+            if let Some(u) = util {
+                if u >= load_gate {
+                    continue;
+                }
+            }
         }
         let token_file = tokens_dir.join(format!("{name}.token"));
         if !token_file.is_file() {
@@ -231,10 +286,13 @@ fn try_ranking(
     }
 
     let cap = resolve_spread_top_n(workspace);
+    let load_gate = resolve_load_gate();
 
-    let mut eligible = collect_ranked_candidates(tokens_dir, ranking_file, workspace, cap, true);
+    let mut eligible =
+        collect_ranked_candidates(tokens_dir, ranking_file, workspace, cap, true, load_gate);
     if eligible.is_empty() {
-        eligible = collect_ranked_candidates(tokens_dir, ranking_file, workspace, cap, false);
+        eligible =
+            collect_ranked_candidates(tokens_dir, ranking_file, workspace, cap, false, load_gate);
     }
     if eligible.is_empty() {
         return None;
@@ -248,8 +306,8 @@ fn stale_ranking_exclusions(ranking_file: &Path) -> HashSet<String> {
     match file_age_seconds(ranking_file) {
         Some(age) if age >= RANKING_FRESH_SECONDS => read_ranking(ranking_file)
             .into_iter()
-            .filter(|(_, status)| !is_healthy_status(status))
-            .map(|(name, _)| name)
+            .filter(|(_, status, _)| !is_healthy_status(status))
+            .map(|(name, _, _)| name)
             .collect(),
         _ => HashSet::new(),
     }
@@ -589,5 +647,119 @@ mod tests {
         fs::write(pool_dir(tmp.path()).join("a.token"), "  sk-ant\noat01\t-xyz  \n").unwrap();
         let key = read_token_file(&pool_dir(tmp.path()).join("a.token")).unwrap();
         assert_eq!(key, "sk-antoat01-xyz");
+    }
+
+    // ---- 5h load gate (issue #4195) ----------------------------------
+
+    #[test]
+    fn read_ranking_parses_optional_util_field() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ranking = tmp.path().join(".ranking");
+        // 3-field, legacy 2-field, and a malformed util (-> None, "unknown").
+        fs::write(&ranking, "a|available|0.70\nb|available\nc|available|bad\n").unwrap();
+        let rows = read_ranking(&ranking);
+        assert_eq!(rows[0], ("a".to_string(), "available".to_string(), Some(0.70)));
+        assert_eq!(rows[1], ("b".to_string(), "available".to_string(), None));
+        assert_eq!(rows[2], ("c".to_string(), "available".to_string(), None));
+    }
+
+    #[test]
+    #[serial]
+    fn resolve_load_gate_env_and_default() {
+        std::env::remove_var("LOOM_TOKEN_5H_LOAD_GATE");
+        assert_eq!(resolve_load_gate(), DEFAULT_5H_LOAD_GATE);
+        std::env::set_var("LOOM_TOKEN_5H_LOAD_GATE", "0.5");
+        assert_eq!(resolve_load_gate(), 0.5);
+        // Unparseable -> default.
+        std::env::set_var("LOOM_TOKEN_5H_LOAD_GATE", "garbage");
+        assert_eq!(resolve_load_gate(), DEFAULT_5H_LOAD_GATE);
+        std::env::remove_var("LOOM_TOKEN_5H_LOAD_GATE");
+    }
+
+    #[test]
+    #[serial]
+    fn load_gate_excludes_loaded_account_in_preferred_pass() {
+        std::env::remove_var("LOOM_TOKEN_5H_LOAD_GATE");
+        std::env::remove_var("LOOM_TOKEN_SPREAD_TOP_N");
+        let tmp = make_pool(&["a", "b"]);
+        // `a` healthy but 90% 5h-loaded (>= 0.70 default gate); `b` light.
+        fs::write(pool_dir(tmp.path()).join(".ranking"), "a|available|0.90\nb|available|0.10\n")
+            .unwrap();
+        let mut rng = Rng::seeded(1);
+        for _ in 0..10 {
+            let sel = select_token(tmp.path(), Some(&mut rng)).unwrap();
+            assert_eq!(sel.name, "b");
+            assert_eq!(sel.mode, "ranked");
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn load_gate_readmits_in_fallback_when_all_loaded() {
+        std::env::remove_var("LOOM_TOKEN_5H_LOAD_GATE");
+        std::env::remove_var("LOOM_TOKEN_SPREAD_TOP_N");
+        let tmp = make_pool(&["a", "b"]);
+        // Both over the gate -> fallback pass drops the gate; pool never
+        // hard-fails on load alone.
+        fs::write(pool_dir(tmp.path()).join(".ranking"), "a|available|0.95\nb|available|0.90\n")
+            .unwrap();
+        let mut rng = Rng::seeded(1);
+        let sel = select_token(tmp.path(), Some(&mut rng)).unwrap();
+        assert!(sel.name == "a" || sel.name == "b");
+        assert_eq!(sel.mode, "ranked");
+    }
+
+    #[test]
+    #[serial]
+    fn load_gate_unknown_util_is_never_gated() {
+        std::env::remove_var("LOOM_TOKEN_5H_LOAD_GATE");
+        std::env::remove_var("LOOM_TOKEN_SPREAD_TOP_N");
+        let tmp = make_pool(&["a", "b", "c"]);
+        // a: legacy 2-field (unknown); b: malformed util (unknown); c: loaded.
+        fs::write(
+            pool_dir(tmp.path()).join(".ranking"),
+            "a|available\nb|available|not-a-number\nc|available|0.99\n",
+        )
+        .unwrap();
+        let mut chosen = HashSet::new();
+        for _ in 0..10 {
+            let mut rng = Rng::seeded(1);
+            let sel = select_token(tmp.path(), Some(&mut rng)).unwrap();
+            assert_eq!(sel.mode, "ranked");
+            chosen.insert(sel.name);
+        }
+        // a and b (unknown) rotate; c (0.99 loaded) is excluded.
+        assert!(chosen.contains("a") && chosen.contains("b"));
+        assert!(!chosen.contains("c"));
+    }
+
+    #[test]
+    #[serial]
+    fn load_gate_env_override_lowers_threshold() {
+        std::env::remove_var("LOOM_TOKEN_SPREAD_TOP_N");
+        let tmp = make_pool(&["a", "b"]);
+        fs::write(pool_dir(tmp.path()).join(".ranking"), "a|available|0.50\nb|available|0.10\n")
+            .unwrap();
+        std::env::set_var("LOOM_TOKEN_5H_LOAD_GATE", "0.40");
+        let mut rng = Rng::seeded(1);
+        for _ in 0..10 {
+            let sel = select_token(tmp.path(), Some(&mut rng)).unwrap();
+            assert_eq!(sel.name, "b"); // `a` now over the lowered gate.
+        }
+        std::env::remove_var("LOOM_TOKEN_5H_LOAD_GATE");
+    }
+
+    #[test]
+    #[serial]
+    fn load_gate_backward_compatible_2field_ranking() {
+        std::env::remove_var("LOOM_TOKEN_5H_LOAD_GATE");
+        std::env::remove_var("LOOM_TOKEN_SPREAD_TOP_N");
+        let tmp = make_pool(&["a", "b"]);
+        // Pure legacy 2-field file still parses + selects unchanged.
+        fs::write(pool_dir(tmp.path()).join(".ranking"), "a|exhausted\nb|available\n").unwrap();
+        let mut rng = Rng::seeded(1);
+        let sel = select_token(tmp.path(), Some(&mut rng)).unwrap();
+        assert_eq!(sel.name, "b");
+        assert_eq!(sel.mode, "ranked");
     }
 }

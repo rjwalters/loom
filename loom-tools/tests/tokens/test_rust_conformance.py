@@ -124,6 +124,78 @@ def test_select_ranked_tier_single_healthy_candidate_agrees(tmp_path):
     assert rust_sel["mode"] == py_sel.mode == "ranked"
 
 
+def test_select_ranked_tier_load_gate_agrees(tmp_path):
+    """Both selectors exclude a 5h-loaded account in the preferred pass (#4195).
+
+    A mixed-load 3-field ranking: `a` is healthy but 90% 5h-loaded (>= the 0.70
+    default gate), `b` is healthy and lightly loaded. The preferred pass leaves
+    exactly one eligible candidate (`b`), so the outcome is deterministic and
+    directly comparable across the two independent RNGs.
+    """
+    workspace = _write_pool(tmp_path, ["a", "b"])
+    (workspace / ".loom" / "tokens" / ".ranking").write_text(
+        "a|available|0.90\nb|available|0.10\n", encoding="utf-8"
+    )
+
+    py_sel = py_select_token(workspace)
+    result = _run_rust("select", "--workspace", str(workspace), "--no-key")
+    assert result.returncode == 0, result.stderr
+    rust_sel = json.loads(result.stdout)
+
+    assert rust_sel["name"] == py_sel.name == "b"
+    assert rust_sel["mode"] == py_sel.mode == "ranked"
+
+
+def test_select_ranked_tier_load_gate_fallback_agrees(tmp_path):
+    """When every account is over the gate, both readmit in the fallback (#4195).
+
+    Both accounts are 5h-loaded, so the fallback pass (gate dropped) is what
+    selects — the pool never hard-fails on load alone. Cap the rotation window
+    to N=1 (via the shared env both processes read) so both pick the first
+    eligible fallback candidate (`a`) deterministically.
+    """
+    workspace = _write_pool(tmp_path, ["a", "b"])
+    (workspace / ".loom" / "tokens" / ".ranking").write_text(
+        "a|available|0.95\nb|available|0.90\n", encoding="utf-8"
+    )
+    prev = os.environ.get("LOOM_TOKEN_SPREAD_TOP_N")
+    os.environ["LOOM_TOKEN_SPREAD_TOP_N"] = "1"
+    try:
+        py_sel = py_select_token(workspace)
+        result = _run_rust("select", "--workspace", str(workspace), "--no-key")
+    finally:
+        if prev is None:
+            os.environ.pop("LOOM_TOKEN_SPREAD_TOP_N", None)
+        else:
+            os.environ["LOOM_TOKEN_SPREAD_TOP_N"] = prev
+    assert result.returncode == 0, result.stderr
+    rust_sel = json.loads(result.stdout)
+
+    assert rust_sel["name"] == py_sel.name == "a"
+    assert rust_sel["mode"] == py_sel.mode == "ranked"
+
+
+def test_select_ranked_tier_unknown_util_not_gated_agrees(tmp_path):
+    """A legacy 2-field (unknown-util) line stays eligible in both (#4195).
+
+    `a` has no measured 5h utilization (2-field legacy line) -> unknown ->
+    never gated; `b` is 5h-loaded and excluded. The preferred pass leaves `a`
+    as the sole candidate, deterministic across both RNGs.
+    """
+    workspace = _write_pool(tmp_path, ["a", "b"])
+    (workspace / ".loom" / "tokens" / ".ranking").write_text(
+        "a|available\nb|available|0.99\n", encoding="utf-8"
+    )
+
+    py_sel = py_select_token(workspace)
+    result = _run_rust("select", "--workspace", str(workspace), "--no-key")
+    assert result.returncode == 0, result.stderr
+    rust_sel = json.loads(result.stdout)
+
+    assert rust_sel["name"] == py_sel.name == "a"
+    assert rust_sel["mode"] == py_sel.mode == "ranked"
+
+
 def test_select_bad_token_skipped_by_both(tmp_path):
     workspace = _write_pool(tmp_path, ["a", "b"])
     py_mark_bad(workspace, "a", "exhausted: 429")
@@ -428,7 +500,13 @@ def test_check_monitor_source_ranking_byte_identical(tmp_path):
         encoding="utf-8"
     )
     # Ordered by (status_rank, util_7d, util_5h): a (0.20) < b (0.80) < c (rl).
-    assert py_ranking == rust_ranking == "acct-a|available\nacct-b|available\nacct-c|rate_limited\n"
+    # The 5h utilization is emitted as the optional third field (issue #4195),
+    # byte-identical across both writers.
+    assert (
+        py_ranking
+        == rust_ranking
+        == "acct-a|available|0.10\nacct-b|available|0.10\nacct-c|rate_limited|0.90\n"
+    )
 
     # The Python selector consumes the Rust-written .ranking: it picks a
     # healthy (available) account, never the rate_limited one, via the ranked

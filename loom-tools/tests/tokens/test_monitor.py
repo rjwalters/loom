@@ -328,7 +328,14 @@ class TestWriter:
             MonitorAccount("a", "available", 0.1, 0.2),
             MonitorAccount("b", "exhausted", 0.9, 0.9),
         ]
-        assert format_ranking_lines(accts) == "a|available\nb|exhausted\n"
+        # Third field is the 5h utilization (issue #4195), fixed at 2 decimals.
+        assert format_ranking_lines(accts) == "a|available|0.20\nb|exhausted|0.90\n"
+
+    def test_format_lines_omits_absent_5h_util(self) -> None:
+        # An unmeasured 5h utilization keeps the legacy 2-field form (issue
+        # #4195): never faked as 0.0, so the selector treats it as "unknown".
+        accts = [MonitorAccount("a", "available", 0.1, None)]
+        assert format_ranking_lines(accts) == "a|available\n"
 
     def test_empty_writes_empty(self) -> None:
         assert format_ranking_lines([]) == ""

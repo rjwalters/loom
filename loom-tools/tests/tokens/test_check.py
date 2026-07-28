@@ -524,8 +524,9 @@ class TestSourceMonitor:
             )
         assert not post.called  # monitor path never probes
         text = (tokens_dir / ".ranking").read_text()
-        # pipe format, ordered by util_7d ascending (a before b)
-        assert text == "acct-a|available\nacct-b|available\n"
+        # pipe format, ordered by util_7d ascending (a before b); the 5h
+        # utilization is emitted as the optional third field (issue #4195).
+        assert text == "acct-a|available|0.10\nacct-b|available|0.10\n"
 
     def test_monitor_source_no_data_returns_empty_no_probe(
         self, tmp_path: Path, monkeypatch
@@ -622,9 +623,11 @@ class TestSourceMonitor:
                 tokens_dir, source="probe", write_ranking=True, stagger=False
             )
 
-        # Sanity: the probe wrote the selector's pipe format, not JSON.
+        # Sanity: the probe wrote the selector's pipe format, not JSON. The 5h
+        # utilization is the optional third field (issue #4195); _good_headers
+        # reports 5h=0.10 for both probes.
         assert (tokens_dir / ".ranking").read_text() == (
-            "acct-a|available\nacct-b|exhausted\n"
+            "acct-a|available|0.10\nacct-b|exhausted|0.10\n"
         )
 
         selected = select_token(workspace)

@@ -68,6 +68,22 @@ EX_CONFIG = 78
 # historical behavior); a value <= 0 also means unbounded.
 _DEFAULT_SPREAD_TOP_N: int | None = None
 
+# Default 5h-window load threshold for the tier-1 *preferred* pass (issue #4195).
+# The account probe measures 5h-window utilization but upstream historically
+# discarded it at ranking-serialization time, so the load-blind rotation cursor
+# (#3909) happily dispatched into an account already near its 5h limit. We now
+# carry the 5h utilization as an optional third ranking field and add a soft
+# eligibility gate *on top of* the existing rotation-cursor spread: an account
+# at/above this fraction of its 5h window is excluded from the preferred pass and
+# readmitted in the fallback pass (so a fully-loaded pool still dispatches rather
+# than hard-failing on load alone). This is the fork-design reconciliation of
+# issue #4165 (Option A) — a load-aware gate layered on #3909, not the fork's
+# waterfall-fill replacement. Overridable via ``LOOM_TOKEN_5H_LOAD_GATE``
+# (following the ``LOOM_TOKEN_SPREAD_TOP_N`` precedent); a value > 1.0 disables
+# the gate. A missing/unparseable utilization is treated as *unknown* → never
+# gated (never coerced to 0.0-as-fact — see #4164 for that failure mode).
+_DEFAULT_5H_LOAD_GATE = 0.70
+
 # Ranking-status handling is an *allowlist of known-good statuses*, not a
 # denylist of known-bad ones (issue #3991). The account probe assigns one of
 # (see CLAUDE.md → token health probe): ``available`` (utilizations < 95%),
@@ -150,22 +166,42 @@ def _strip_comment(line: str) -> str:
     return line.strip()
 
 
-def _read_ranking(ranking_file: Path) -> Iterable[tuple[str, str]]:
-    """Yield (name, status) pairs from the ranking file.
+def _parse_util(field: str) -> float | None:
+    """Parse a ranking line's optional 5h-utilization field (issue #4195).
 
-    Format: ``name|status`` per line. Lines starting with ``#`` are skipped.
-    Malformed lines are skipped. ``status`` defaults to empty string.
+    An empty or unparseable field yields ``None`` ("unknown") — never coerced to
+    ``0.0``, so an unmeasured account is never load-gated (see #4164).
+    """
+    field = field.strip()
+    if not field:
+        return None
+    try:
+        return float(field)
+    except (TypeError, ValueError):
+        return None
+
+
+def _read_ranking(ranking_file: Path) -> Iterable[tuple[str, str, float | None]]:
+    """Yield (name, status, util_5h) triples from the ranking file.
+
+    Format: ``name|status|5h_util`` per line (issue #4195). The third field is
+    *optional* — a legacy ``name|status`` line yields ``util_5h=None``, so
+    existing 2-field ranking files parse unchanged (backward compatible). Lines
+    starting with ``#`` are skipped, as are malformed lines. ``status`` defaults
+    to empty string; an absent or unparseable utilization yields ``None``
+    ("unknown" — never load-gated).
     """
     try:
         for raw in ranking_file.read_text(encoding="utf-8").splitlines():
             stripped = _strip_comment(raw)
             if not stripped:
                 continue
-            parts = stripped.split("|", 1)
+            parts = stripped.split("|", 2)
             name = parts[0].strip()
             status = parts[1].strip() if len(parts) > 1 else ""
+            util = _parse_util(parts[2]) if len(parts) > 2 else None
             if name:
-                yield name, status
+                yield name, status, util
     except OSError:
         return
 
@@ -237,6 +273,24 @@ def _read_config_spread_top_n(workspace_path: Path) -> int | None:
     return value
 
 
+def _resolve_load_gate() -> float:
+    """Resolve the tier-1 5h-load threshold (issue #4195).
+
+    Precedence: ``LOOM_TOKEN_5H_LOAD_GATE`` env var (parsed as a float) → the
+    constant default ``_DEFAULT_5H_LOAD_GATE`` (0.70). An unset or unparseable
+    env value falls back to the default. Mirrors the ``select.rs``
+    ``resolve_load_gate`` so the two implementations gate identically. A
+    ``tokens.*`` config key can follow later if needed.
+    """
+    raw = os.environ.get("LOOM_TOKEN_5H_LOAD_GATE")
+    if raw is not None:
+        try:
+            return float(raw.strip())
+        except (TypeError, ValueError):
+            pass
+    return _DEFAULT_5H_LOAD_GATE
+
+
 def _try_ranking(
     tokens_dir: Path,
     ranking_file: Path,
@@ -276,16 +330,27 @@ def _try_ranking(
         return None
 
     cap = _resolve_spread_top_n(workspace_path)
+    load_gate = _resolve_load_gate()
 
     def _collect(*, healthy_only: bool) -> list[SelectedToken]:
         out: list[SelectedToken] = []
-        for name, status in _read_ranking(ranking_file):
+        for name, status, util in _read_ranking(ranking_file):
             # Hard-excluded in every pass: the probe flagged the account dead.
             if status in _TIER1_HARD_EXCLUDED:
                 continue
             # Preferred pass: allowlist — only positively-healthy statuses.
             # Fallback pass admits the rest (rate_limited / unknown statuses).
             if healthy_only and status not in _HEALTHY_STATUSES:
+                continue
+            # Load gate (issue #4195): the preferred pass additionally excludes
+            # accounts at/above the 5h-window load threshold, mirroring the
+            # rate_limited soft-exclusion. An unknown (unmeasured) utilization is
+            # never gated. The fallback pass drops the gate so a fully-loaded
+            # pool still dispatches rather than hard-failing on load alone. The
+            # rotation cursor then rotates across the load-eligible set, so no
+            # per-spawn "in-burst" bump is needed — the cursor already prevents
+            # intra-burst stacking by construction.
+            if healthy_only and util is not None and util >= load_gate:
                 continue
             token_file = tokens_dir / f"{name}.token"
             if not token_file.is_file():
@@ -342,7 +407,7 @@ def _stale_ranking_exclusions(ranking_file: Path) -> set[str]:
         return set()
     return {
         name
-        for name, status in _read_ranking(ranking_file)
+        for name, status, _util in _read_ranking(ranking_file)
         if status not in _HEALTHY_STATUSES
     }
 
