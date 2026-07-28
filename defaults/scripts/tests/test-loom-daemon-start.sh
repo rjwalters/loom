@@ -156,6 +156,49 @@ if [[ -f "$WORKDIR/.loom/.daemon.pid" ]]; then
     kill "$(cat "$WORKDIR/.loom/.daemon.pid" 2>/dev/null)" 2>/dev/null || true
 fi
 
+# ---------- launchd domain resolution (#4130) ----------
+# resolve_launchd_domain() (lib/launchd-domain.sh) picks gui/<uid> when the GUI
+# (Aqua) domain resolves — byte-for-byte the pre-#4130 default — else the
+# SSH-reachable user/<uid> background domain, and honors an explicit
+# LOOM_LAUNCHD_DOMAIN override verbatim. Driven through a stub launchctl so both
+# the GUI-present and headless (SSH-only) cases are deterministic on any host.
+LAUNCHD_DOMAIN_LIB="$(cd "$SCRIPT_DIR/../lib" && pwd)/launchd-domain.sh"
+UID_NOW="$(id -u)"
+DOMAIN_STUB_DIR="$WORKDIR/domain-stub"
+mkdir -p "$DOMAIN_STUB_DIR/gui" "$DOMAIN_STUB_DIR/nogui"
+# GUI-present: `launchctl print gui/<uid>` succeeds.
+cat > "$DOMAIN_STUB_DIR/gui/launchctl" <<'EOF'
+#!/usr/bin/env bash
+[[ "$1" == "print" && "$2" == gui/* ]] && exit 0
+exit 1
+EOF
+# Headless (no GUI login): every `launchctl print` fails (the gui/<uid> domain
+# does not exist — the `error 125` this issue fixes).
+cat > "$DOMAIN_STUB_DIR/nogui/launchctl" <<'EOF'
+#!/usr/bin/env bash
+[[ "$1" == "print" ]] && exit 1
+exit 0
+EOF
+chmod +x "$DOMAIN_STUB_DIR"/*/launchctl
+
+out=$( env -u LOOM_LAUNCHD_DOMAIN PATH="$DOMAIN_STUB_DIR/gui:$PATH" \
+    bash -c "source '$LAUNCHD_DOMAIN_LIB'; resolve_launchd_domain" )
+assert_eq "gui/${UID_NOW}" "$out" "resolver picks gui/<uid> when the GUI domain resolves (default path unchanged)"
+
+out=$( env -u LOOM_LAUNCHD_DOMAIN PATH="$DOMAIN_STUB_DIR/nogui:$PATH" \
+    bash -c "source '$LAUNCHD_DOMAIN_LIB'; resolve_launchd_domain" )
+assert_eq "user/${UID_NOW}" "$out" "resolver falls back to user/<uid> when gui/<uid> does not resolve (headless/SSH)"
+
+out=$( LOOM_LAUNCHD_DOMAIN="user/${UID_NOW}" PATH="$DOMAIN_STUB_DIR/gui:$PATH" \
+    bash -c "source '$LAUNCHD_DOMAIN_LIB'; resolve_launchd_domain" )
+assert_eq "user/${UID_NOW}" "$out" "LOOM_LAUNCHD_DOMAIN override is honored verbatim (wins over the gui probe)"
+
+# A pinned domain that does NOT resolve is still honored verbatim — it must fail
+# loudly downstream (at launchctl bootstrap), never silently fall back further.
+out=$( LOOM_LAUNCHD_DOMAIN="gui/${UID_NOW}" PATH="$DOMAIN_STUB_DIR/nogui:$PATH" \
+    bash -c "source '$LAUNCHD_DOMAIN_LIB'; resolve_launchd_domain" )
+assert_eq "gui/${UID_NOW}" "$out" "override to a non-resolving domain is honored verbatim (no silent fallback)"
+
 # ---------- summary ----------
 echo
 echo "Ran $TESTS_RUN tests: $TESTS_PASSED passed, $TESTS_FAILED failed"

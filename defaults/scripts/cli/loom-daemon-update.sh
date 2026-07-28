@@ -38,8 +38,10 @@
 # nor .loom/.daemon.flags reliably reflects "is it running" — the pid file goes
 # stale after any KeepAlive:SuccessfulExit relaunch, and a hand-bootstrapped
 # daemon has no state files at all. This script therefore checks the launchd job
-# state (`launchctl print gui/<uid>/<label>`, mirroring loom-daemon-stop.sh)
-# AHEAD of the pid-file tier when resolving whether/how the daemon is running.
+# state (`launchctl print <domain>/<label>`, where <domain> is
+# resolve_launchd_domain()'s gui/<uid> ↦ user/<uid> pick — #4130 — mirroring
+# loom-daemon-stop.sh) AHEAD of the pid-file tier when resolving whether/how the
+# daemon is running.
 # When launchd-managed, it restarts via the `loom-daemon restart` primitive
 # (#4077 — sends Request::RestartDaemon over the IPC socket; the supervised
 # daemon exits 0 and launchd relaunches it onto the fresh binary with the
@@ -82,6 +84,9 @@
 #                          domain and follows the PID-file/nohup restart path.
 #   LOOM_LAUNCHD_LABEL     macOS only: the LaunchAgent label to inspect/restart
 #                          (default com.rjwalters.loom-daemon).
+#   LOOM_LAUNCHD_DOMAIN    macOS only: pin the launchd domain (gui/<uid> or
+#                          user/<uid>); else auto-resolved gui→user (#4130),
+#                          matching loom-daemon-start.sh / -stop.sh.
 #   LOOM_DAEMON_UPDATE_RELAUNCH  macOS/launchd only: 1/true/yes is equivalent to
 #                          passing --relaunch (opt in to the re-render + relaunch
 #                          on a refused restart).
@@ -304,6 +309,14 @@ advisory_behind_origin "$REPO_ROOT"
 # loom-daemon-start.sh itself started; a hand-bootstrapped daemon has no state
 # files at all. Honors LOOM_DAEMON_LAUNCHD symmetrically with start/stop.sh so a
 # --no-launchd install never reaches into the machine-global launchd domain.
+# Shared domain resolver (#4130): gui/<uid> ↦ user/<uid>, sourced verbatim so
+# update agrees with the domain the start put the job in.
+_LOOM_LAUNCHD_LIB_DIR="$(cd "$SCRIPT_DIR/../lib" 2>/dev/null && pwd)"
+if [[ -r "$_LOOM_LAUNCHD_LIB_DIR/launchd-domain.sh" ]]; then
+    # shellcheck source=../lib/launchd-domain.sh
+    source "$_LOOM_LAUNCHD_LIB_DIR/launchd-domain.sh"
+fi
+
 IS_DARWIN=false
 [[ "$(uname -s)" == "Darwin" ]] && IS_DARWIN=true
 USE_LAUNCHD="$IS_DARWIN"
@@ -312,7 +325,16 @@ if [[ "${LOOM_DAEMON_LAUNCHD:-}" =~ ^(0|false|no)$ ]]; then
 fi
 DEFAULT_LAUNCHD_LABEL="com.rjwalters.loom-daemon"
 LAUNCHD_LABEL="${LOOM_LAUNCHD_LABEL:-$DEFAULT_LAUNCHD_LABEL}"
-LAUNCHD_SERVICE="gui/$(id -u)/${LAUNCHD_LABEL}"
+# Resolve the domain ONLY when launchd interaction is on (#4130): probing
+# `launchctl print gui/<uid>` when LOOM_DAEMON_LAUNCHD=0 would reach the
+# machine-global launchd domain the disabled path must never touch (#4078). The
+# placeholder is inert — launchd_job_loaded and the launchd restart path all
+# short-circuit on USE_LAUNCHD, so it is never consumed when launchd is off.
+if [[ "$USE_LAUNCHD" == "true" ]]; then
+    LAUNCHD_SERVICE="$(resolve_launchd_domain)/${LAUNCHD_LABEL}"
+else
+    LAUNCHD_SERVICE="/${LAUNCHD_LABEL}"
+fi
 LAUNCHD_PLIST="$HOME/Library/LaunchAgents/${LAUNCHD_LABEL}.plist"
 
 launchd_job_loaded() {

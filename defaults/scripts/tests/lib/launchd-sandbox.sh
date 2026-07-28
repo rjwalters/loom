@@ -44,7 +44,13 @@ launchd_sandbox_new_label() {
 #     (one line per call) so a test can assert what was attempted, and
 #   - are STRUCTURALLY UNABLE to touch a real launchd job or process:
 #       * launchctl: `print` always exits 1 (job "not loaded"); everything else
-#         is a harmless no-op exit 0.
+#         is a harmless no-op exit 0. This is domain-AGNOSTIC (#4130): `print`
+#         fails for BOTH gui/<uid> and user/<uid>, so it correctly stubs a job
+#         under whichever domain resolve_launchd_domain() picks, and the failing
+#         gui/<uid> probe drives the resolver to the user/<uid> fallback — so a
+#         sandboxed test never depends on the host having (or lacking) a GUI
+#         login. launchd_sandbox_assert_no_production_label scopes on the LABEL
+#         (com.rjwalters.*), independent of the domain, so it still holds.
 #       * pgrep: always exits 1 with no output (never matches a real process),
 #         so a label-blind `pgrep -f loom-daemon` in the stop script can never
 #         return the production daemon's (or a decoy's) PID.

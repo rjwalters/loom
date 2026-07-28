@@ -19,7 +19,8 @@
 #   sweep, use `mcp__loom__cancel_sweep` against a running daemon before stopping.
 #
 # macOS launchd counterpart (#3972): when loom-daemon-start.sh loaded the
-# daemon as a `gui/<uid>` LaunchAgent, this script ALSO unloads the launchd
+# daemon as a launchd LaunchAgent (in the resolve_launchd_domain() domain —
+# gui/<uid> or user/<uid>, #4130), this script ALSO unloads the launchd
 # job definition (`launchctl bootout`) after the process is confirmed dead —
 # not just kills the pid. This matters because the generated plist sets
 # RunAtLoad=true (mirroring the validated incident-fix plist), so leaving the
@@ -60,6 +61,10 @@
 #   LOOM_DAEMON_STOP_GRACE_SECS   Grace window before SIGKILL (default 10)
 #   LOOM_DAEMON_STOP_KEEP_INTENT  1/true/yes: preserve the autonomy-desired marker + watchdog (same as --restarting)
 #   LOOM_LAUNCHD_LABEL            macOS only: the LaunchAgent label to bootout (default com.rjwalters.loom-daemon)
+#   LOOM_LAUNCHD_DOMAIN           macOS only: pin the launchd domain (gui/<uid> or
+#                                 user/<uid>); else auto-resolved gui→user (#4130).
+#                                 Must match the domain the start used so the
+#                                 bootout targets the right service.
 #   LOOM_DAEMON_LAUNCHD           macOS only: 0/false/no disables ALL launchd interaction
 #                                 (lookup + bootout), symmetric with loom-daemon-start.sh.
 #                                 A start done with --no-launchd / LOOM_DAEMON_LAUNCHD=0
@@ -141,7 +146,9 @@ teardown_autonomy_intent() {
     rm -f "$INTENT_MARKER" 2>/dev/null || true
     local wd_label wd_service
     wd_label="${LOOM_WATCHDOG_LABEL:-${LAUNCHD_LABEL}-watchdog}"
-    wd_service="gui/$(id -u)/${wd_label}"
+    # $LAUNCHD_DOMAIN is resolved below (gui/<uid> ↦ user/<uid>, #4130) before any
+    # call to this function; the launchctl calls here are gated on USE_LAUNCHD.
+    wd_service="${LAUNCHD_DOMAIN}/${wd_label}"
     if [[ "$USE_LAUNCHD" == "true" ]] && command -v launchctl >/dev/null 2>&1; then
         if launchctl print "$wd_service" >/dev/null 2>&1; then
             launchctl bootout "$wd_service" >/dev/null 2>&1 || true
@@ -150,6 +157,14 @@ teardown_autonomy_intent() {
 }
 
 # ---------- launchd plumbing (macOS, #3972) ----------
+# Shared domain resolver (#4130): gui/<uid> ↦ user/<uid>, sourced verbatim so
+# stop agrees with the domain the start put the job in.
+_LOOM_LAUNCHD_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../lib" 2>/dev/null && pwd)"
+if [[ -r "$_LOOM_LAUNCHD_LIB_DIR/launchd-domain.sh" ]]; then
+    # shellcheck source=../lib/launchd-domain.sh
+    source "$_LOOM_LAUNCHD_LIB_DIR/launchd-domain.sh"
+fi
+
 IS_DARWIN=false
 [[ "$(uname -s)" == "Darwin" ]] && IS_DARWIN=true
 
@@ -167,7 +182,17 @@ fi
 
 DEFAULT_LAUNCHD_LABEL="com.rjwalters.loom-daemon"
 LAUNCHD_LABEL="${LOOM_LAUNCHD_LABEL:-$DEFAULT_LAUNCHD_LABEL}"
-LAUNCHD_SERVICE="gui/$(id -u)/${LAUNCHD_LABEL}"
+# Resolve the domain ONLY when launchd interaction is on (#4130): probing
+# `launchctl print gui/<uid>` when LOOM_DAEMON_LAUNCHD=0 would reach the
+# machine-global launchd domain the disabled path must never touch (#4078). The
+# placeholder below is inert — every launchd function short-circuits on
+# USE_LAUNCHD, so it is never consumed when launchd is off.
+if [[ "$USE_LAUNCHD" == "true" ]]; then
+    LAUNCHD_DOMAIN="$(resolve_launchd_domain)"
+else
+    LAUNCHD_DOMAIN=""
+fi
+LAUNCHD_SERVICE="${LAUNCHD_DOMAIN}/${LAUNCHD_LABEL}"
 
 launchd_job_loaded() {
     [[ "$USE_LAUNCHD" == "true" ]] || return 1

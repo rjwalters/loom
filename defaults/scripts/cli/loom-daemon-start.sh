@@ -17,8 +17,10 @@
 #     LOOM_WORK_FINDER unset => off, LOOM_MAIN_HEALTH_GATE unset => off). Opt in
 #     explicitly with --work-finder / --health-gate, or hand control to
 #     .loom/config.json -> autonomous with --from-config (#3911),
-#   - on macOS, backgrounds the daemon as a `gui/<uid>` LaunchAgent (#3972) so
-#     it survives the launching session's death instead of a plain `nohup ...
+#   - on macOS, backgrounds the daemon as a launchd LaunchAgent (#3972) in the
+#     resolved per-user domain (`gui/<uid>` when a GUI login is active, else
+#     `user/<uid>` — #4130, so it can also be (re)started headlessly over SSH)
+#     so it survives the launching session's death instead of a plain `nohup ...
 #     &`; on Linux it stays a plain nohup background job,
 #   - backgrounds the daemon and writes a PID file (.loom/.daemon.pid),
 #   - persists the resolved invocation flags to .loom/.daemon.flags so
@@ -42,6 +44,13 @@
 # specifically to avoid that failure mode; see --no-launchd below for the
 # escape hatch and daemon-reference.md Operability for the incident writeup.
 #
+# launchd domain (#4130): the LaunchAgent is loaded into the domain
+# resolve_launchd_domain() (lib/launchd-domain.sh) picks — `gui/<uid>` when a
+# GUI (Aqua) login session is active (byte-for-byte the pre-#4130 behavior),
+# else the background per-user `user/<uid>` domain that sshd instantiates, so a
+# headless / SSH-only start no longer fails with `error 125: Domain does not
+# support specified action`. Override with LOOM_LAUNCHD_DOMAIN.
+#
 # Usage:
 #   ./.loom/scripts/cli/loom-daemon-start.sh                 Reliability daemon (both loops OFF)
 #   ./.loom/scripts/cli/loom-daemon-start.sh --work-finder   Enable the autonomous work finder
@@ -61,6 +70,10 @@
 #   LOOM_WORK_FINDER / LOOM_MAIN_HEALTH_GATE  Respected when already exported
 #   LOOM_DAEMON_LAUNCHD  macOS only: 0/false/no forces the legacy nohup path (same as --no-launchd)
 #   LOOM_LAUNCHD_LABEL   macOS only: override the LaunchAgent label (default com.rjwalters.loom-daemon)
+#   LOOM_LAUNCHD_DOMAIN  macOS only: pin the launchd domain (e.g. gui/$(id -u) or
+#                        user/$(id -u)); honored verbatim, else auto-resolved
+#                        gui→user (#4130). A pinned domain that does not resolve
+#                        fails loudly at bootstrap rather than falling back.
 #
 # Exit codes:
 #   0  daemon started (or already running)
@@ -135,6 +148,17 @@ xml_escape() {
 resolve_launchd_label() {
     echo "${LOOM_LAUNCHD_LABEL:-com.rjwalters.loom-daemon}"
 }
+
+# resolve_launchd_domain() — the launchd domain (gui/<uid> ↦ user/<uid>) the
+# LaunchAgent is loaded/inspected/booted-out under (#4130). Shared verbatim with
+# loom-daemon-stop.sh / -update.sh / -watchdog.sh via lib/launchd-domain.sh so
+# all four lifecycle scripts always agree on the domain. Sourced here (all four
+# scripts source the same one definition).
+_LOOM_LAUNCHD_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../lib" 2>/dev/null && pwd)"
+if [[ -r "$_LOOM_LAUNCHD_LIB_DIR/launchd-domain.sh" ]]; then
+    # shellcheck source=../lib/launchd-domain.sh
+    source "$_LOOM_LAUNCHD_LIB_DIR/launchd-domain.sh"
+fi
 
 # render_launchd_plist <label> <daemon_bin> <workdir> <log_path>
 # Prints the LaunchAgent plist XML to stdout. Mirrors the hand-written plist
@@ -313,9 +337,13 @@ provision_watchdog_job() {
         warn "watchdog: loom-daemon-watchdog.sh not found — skipping (autonomy-loss detection disabled)."
         return 0
     fi
-    local wd_label wd_service wd_plist wd_interval wd_log
+    local wd_label wd_domain wd_service wd_plist wd_interval wd_log
     wd_label="$(resolve_watchdog_label)"
-    wd_service="gui/$(id -u)/${wd_label}"
+    # Same resolved domain the daemon job uses (#4130) so the watchdog is
+    # bootstrapped where stop.sh will later look for it — gui/<uid> with a GUI
+    # login, else the SSH-reachable user/<uid> domain.
+    wd_domain="$(resolve_launchd_domain)"
+    wd_service="${wd_domain}/${wd_label}"
     wd_plist="$HOME/Library/LaunchAgents/${wd_label}.plist"
     wd_interval="${LOOM_WATCHDOG_INTERVAL_SECS:-300}"
     wd_log="$LOOM_DIR/logs/daemon-watchdog.log"
@@ -327,7 +355,7 @@ provision_watchdog_job() {
     if launchctl print "$wd_service" >/dev/null 2>&1; then
         launchctl bootout "$wd_service" >/dev/null 2>&1 || true
     fi
-    if launchctl bootstrap "gui/$(id -u)" "$wd_plist" >/dev/null 2>&1; then
+    if launchctl bootstrap "$wd_domain" "$wd_plist" >/dev/null 2>&1; then
         echo "Watchdog:       $wd_label (StartInterval ${wd_interval}s) → $wd_log"
     else
         warn "watchdog: launchctl bootstrap failed for $wd_service — autonomy-loss detection not active (non-fatal)."
@@ -533,13 +561,15 @@ if [[ "$USE_LAUNCHD" == "true" ]]; then
     # namespace; when that session dies, trustd/opendirectoryd XPC lookups
     # start failing for the daemon and every child it spawns (gh TLS errors,
     # "No user exists for uid N" from git) with no crash and no obvious log
-    # signal. Loading as a `gui/<uid>` LaunchAgent keeps the daemon in the
-    # user's durable GUI bootstrap domain instead, independent of whichever
+    # signal. Loading as a launchd LaunchAgent keeps the daemon in a durable
+    # per-user bootstrap domain instead, independent of whichever
     # terminal/session launched it. See daemon-reference.md Operability for
     # the incident writeup. Escape hatch: --no-launchd / LOOM_DAEMON_LAUNCHD=0.
+    # The domain is resolve_launchd_domain()'s pick (#4130): gui/<uid> with a
+    # live GUI login (unchanged from before), else the SSH-reachable user/<uid>
+    # background domain so a headless start no longer fails `error 125`.
     LAUNCHD_LABEL=$(resolve_launchd_label)
-    LAUNCHD_UID=$(id -u)
-    LAUNCHD_DOMAIN="gui/${LAUNCHD_UID}"
+    LAUNCHD_DOMAIN="$(resolve_launchd_domain)"
     LAUNCHD_SERVICE="${LAUNCHD_DOMAIN}/${LAUNCHD_LABEL}"
     PLIST_DIR="$HOME/Library/LaunchAgents"
     PLIST_FILE="$PLIST_DIR/${LAUNCHD_LABEL}.plist"
