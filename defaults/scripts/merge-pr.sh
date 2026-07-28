@@ -1395,6 +1395,21 @@ _primary_worktree_path() {
     awk '/^worktree / { print substr($0, 10); exit }'
 }
 
+# _is_primary_worktree_path <path>
+#
+# True (rc 0) when <path> resolves to the same real path as the PRIMARY (main)
+# working copy — the FIRST entry of `git worktree list --porcelain` — rather
+# than a linked worktree. Used to distinguish "this is the main checkout, not
+# a removable worktree at all" from "this is a genuine linked worktree" so
+# callers never suggest `git worktree remove` / `--worktree-path` against the
+# primary checkout (#4171). Returns 1 (false) if either path fails to resolve.
+_is_primary_worktree_path() {
+  local check_path="$1" check_real primary_real
+  check_real="$(cd "$check_path" 2>/dev/null && pwd -P)" || check_real="$check_path"
+  primary_real="$(_primary_worktree_path)"
+  [[ -n "$primary_real" ]] && [[ "$check_real" == "$primary_real" ]]
+}
+
 # Walk porcelain output for a worktree whose branch matches the given branch
 # short-name. Prints the worktree absolute path or nothing. Skips detached /
 # bare entries (they have no `branch refs/heads/...` line).
@@ -1467,7 +1482,22 @@ _maybe_delete_local_branch() {
   # from a genuine "not fully merged" refusal — the former gets a specific
   # message instead of the generic unmerged-commits warning (#4100 AC #4).
   if echo "$delete_output" | grep -qiE "checked out at|is currently checked out|used by worktree"; then
-    warning "Could not delete local branch '$branch' — it is checked out (current HEAD or another worktree)"
+    # Further distinguish WHERE it's checked out (#4171): if it's the PRIMARY
+    # (main) working copy, `git worktree remove`/`--worktree-path` can never
+    # apply — there is no worktree to remove, only a branch to switch away
+    # from. Give the exact two-step remediation instead of the generic
+    # message, which otherwise routes the operator toward worktree cleanup
+    # advice that doesn't exist for the primary checkout. A genuine OTHER
+    # linked worktree keeps the original generic message unchanged.
+    local checkout_loc=""
+    checkout_loc="$(_find_worktree_by_branch "$branch")"
+    if [[ -n "$checkout_loc" ]] && _is_primary_worktree_path "$checkout_loc"; then
+      local default_label="${DEFAULT_BRANCH_NAME:-<default-branch>}"
+      warning "Could not delete local branch '$branch' — it is checked out in the primary repository checkout ($checkout_loc)."
+      warning "To clean it up: git -C '$checkout_loc' checkout $default_label && git -C '$checkout_loc' branch -D $branch"
+    else
+      warning "Could not delete local branch '$branch' — it is checked out (current HEAD or another worktree)"
+    fi
   elif [[ "$delete_flag" == "-d" ]]; then
     warning "Could not delete local branch '$branch' (may have unpushed commits — use 'git branch -D $branch' if intentional)"
   else
@@ -1591,7 +1621,16 @@ if [[ "$CLEANUP_WORKTREE" == "true" ]]; then
       # operator can re-run with --worktree-path.
       DISCOVERED_WT="$(_find_worktree_by_branch "$PR_BRANCH")"
       if [[ -n "$DISCOVERED_WT" ]]; then
-        if [[ -f "$DISCOVERED_WT/.loom-managed" ]]; then
+        if _is_primary_worktree_path "$DISCOVERED_WT"; then
+          # The PR branch is checked out in the PRIMARY (main) working copy,
+          # not a linked worktree at all (#4171). `git worktree remove` /
+          # `--worktree-path` can never apply here — git itself refuses to
+          # remove the main working tree — so never suggest either. The
+          # subsequent _maybe_delete_local_branch call below prints the
+          # correct two-step remediation (switch to the default branch, then
+          # delete) once the branch-delete attempt fails as "checked out".
+          info "PR branch '$PR_BRANCH' is checked out in the primary repository checkout ($DISCOVERED_WT) — not a removable worktree."
+        elif [[ -f "$DISCOVERED_WT/.loom-managed" ]]; then
           # Rare case: Loom-managed worktree at a non-standard path. The
           # sentinel says it's safe to remove, so do so.
           info "Discovered Loom-managed worktree at non-standard path: $DISCOVERED_WT"
