@@ -848,6 +848,16 @@ After PR creation:
 - [ ] STOP - do not touch any PR labels
 - [ ] Move to next issue
 
+## Fleet-Comms Etiquette (optional)
+
+If the `safehouse_send` / `safehouse_read` MCP tools are present in this
+session, post sparingly to the fleet room: one line on claim ("starting issue
+#N: `<title>`"), one line on PR creation, and any *notable* mid-task finding
+(surprising discovery, a concern worth human eyes) — not routine progress. A
+genuine blocker gets `type: handoff`. If the tools are absent, proceed exactly
+as above — this is normal, not an error. Full etiquette (detection, threading,
+what NOT to do): `.loom/docs/fleet-comms.md`.
+
 ## Terminal Probe Protocol
 
 When you receive a probe command, respond with: `AGENT:Builder:<brief-task>` — e.g. `AGENT:Builder:implementing-issue-456`.
