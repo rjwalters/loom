@@ -6,6 +6,12 @@
 #   -y, --yes                  Non-interactive mode (skip confirmation prompts)
 #   --quick                    Quick Install - direct install without GitHub workflow
 #   --full                     Full Install - creates issue, worktree, and PR
+#   --confirm-reinstall        Acknowledge a destructive reinstall over an existing
+#                              .loom/ install. Required alongside --quick/--yes/--full
+#                              when the target already has Loom installed -- without
+#                              it, non-interactive runs stop and ask you to inventory
+#                              customizations first (interactive runs still get a
+#                              y/N prompt instead).
 #   --allow-non-main-source    Permit installing from a non-main / detached-HEAD Loom source
 #                              (forwarded to scripts/install-loom.sh)
 #   --allow-stale-target       Permit installing over a target whose Loom is newer/stale
@@ -16,6 +22,7 @@
 #   ./install.sh --quick ~/projects/my-app
 #   ./install.sh --full /path/to/team-project
 #   ./install.sh -y ~/projects/my-app  # Non-interactive, defaults to quick
+#   ./install.sh --quick --confirm-reinstall ~/projects/my-app  # Reinstall over an existing install
 
 set -euo pipefail
 
@@ -270,6 +277,26 @@ verify_install() {
   fi
 }
 
+# Returns 0 (true / stale) if the loom-daemon release binary is missing, OR
+# if the source tree it would be built from is newer than the binary on
+# disk (e.g. `git pull` landed a newer commit since the binary was last
+# built). A bare "does it exist" check lets `install.sh --quick` silently
+# reuse a stale binary built from an older commit after a source update --
+# issue #4188. `find -newer` catches both "never built" (the -f check below)
+# and "built from a prior commit" in one pass.
+loom_daemon_binary_stale() {
+  local loom_root="$1"
+  local binary="$loom_root/target/release/loom-daemon"
+
+  [[ -f "$binary" ]] || return 0
+
+  local newer_file
+  newer_file="$(find "$loom_root/loom-daemon" "$loom_root/loom-api" \
+      "$loom_root/Cargo.toml" "$loom_root/Cargo.lock" \
+      -type f -newer "$binary" 2>/dev/null | head -n1)"
+  [[ -n "$newer_file" ]]
+}
+
 # Issue #3588: re-append the current Loom ephemeral .gitignore patterns after a
 # --quick reinstall stash pop that was performed against a HEAD-reset .gitignore.
 #
@@ -406,6 +433,11 @@ echo ""
 # Parse flags
 NON_INTERACTIVE=false
 INSTALL_TYPE=""
+# Explicit acknowledgement that a reinstall over an existing (or legacy)
+# .loom/ installation is destructive (it uninstalls before reinstalling).
+# Required in addition to --quick/--yes/--full when an existing install is
+# detected -- see the reinstall gate below and issue #4188.
+CONFIRM_REINSTALL=false
 # Source/target override flags accepted by scripts/install-loom.sh. The top-level
 # wrapper does not act on them (its source guard runs only in the delegated
 # installer), but it must accept and forward them so the flags it suggests
@@ -435,6 +467,10 @@ while [[ "${1:-}" == -* ]]; do
       NON_INTERACTIVE=true  # --full implies non-interactive
       shift
       ;;
+    --confirm-reinstall)
+      CONFIRM_REINSTALL=true
+      shift
+      ;;
     --allow-non-main-source|--allow-stale-target)
       # Pass-through: accepted here so the wrapper's own suggestion works, then
       # forwarded to scripts/install-loom.sh at the Full-Install delegation execs.
@@ -448,6 +484,12 @@ while [[ "${1:-}" == -* ]]; do
       echo "  -y, --yes                  Non-interactive mode (skip confirmation prompts)"
       echo "  --quick                    Quick Install - direct install without GitHub workflow"
       echo "  --full                     Full Install - creates issue, worktree, and PR"
+      echo "  --confirm-reinstall        Acknowledge a destructive reinstall over an existing"
+      echo "                             .loom/ install. Required alongside --quick/--yes/--full"
+      echo "                             when the target already has Loom installed -- without"
+      echo "                             it, non-interactive runs stop and ask you to inventory"
+      echo "                             customizations first (interactive runs still get a"
+      echo "                             y/N prompt instead)."
       echo "  --allow-non-main-source    Permit installing from a non-main / detached-HEAD"
       echo "                             Loom source (forwarded to scripts/install-loom.sh)"
       echo "  --allow-stale-target       Permit installing over a newer/stale target"
@@ -458,6 +500,7 @@ while [[ "${1:-}" == -* ]]; do
       echo "  ./install.sh --quick ~/projects/my-app"
       echo "  ./install.sh --full /path/to/team-project"
       echo "  ./install.sh -y ~/projects/my-app  # Non-interactive, defaults to quick install"
+      echo "  ./install.sh --quick --confirm-reinstall ~/projects/my-app  # Reinstall over an existing install"
       echo "  ./install.sh --yes --allow-non-main-source /path/to/target  # Install from a non-main source"
       exit 0
       ;;
@@ -756,8 +799,16 @@ elif [[ -d "$TARGET_PATH/.loom" ]]; then
       info "Installation cancelled"
       exit 0
     fi
+  elif [[ "$CONFIRM_REINSTALL" == true ]]; then
+    info "Non-interactive mode: proceeding with reinstall (--confirm-reinstall acknowledged)"
   else
-    info "Non-interactive mode: proceeding with reinstall"
+    # Issue #4188: --quick / --yes / --full previously set NON_INTERACTIVE=true
+    # and fell straight through the reinstall warning above into a destructive
+    # uninstall-then-reinstall. A non-interactive run over an existing (or
+    # legacy) install now MUST pass --confirm-reinstall explicitly -- it
+    # cannot silently cross this boundary just because it also passed
+    # --quick/--yes/--full.
+    error "Existing Loom installation detected at $TARGET_PATH/.loom -- refusing to run a non-interactive reinstall without explicit acknowledgement.\n       Reinstalling uninstalls the existing Loom payload before writing the new version; inventory and back up any project-owned Loom hooks, scripts, and agent configuration first.\n       Re-run with --confirm-reinstall once you have done so, or omit --quick/--yes/--full to get an interactive y/N prompt instead."
   fi
 
   # Issue #3545: for a --quick reinstall, guard uncommitted user changes across
@@ -830,9 +881,15 @@ elif [[ -d "$TARGET_PATH/.loom" ]]; then
     info "Running fresh Quick Install..."
     echo ""
 
-    # Check if loom-daemon is built
-    if [[ ! -f "$LOOM_ROOT/target/release/loom-daemon" ]]; then
-      warning "loom-daemon binary not found"
+    # Check if loom-daemon is built AND up to date with the current source
+    # tree (issue #4188 -- a bare existence check reuses a binary built from
+    # an older commit after `git pull` landed a newer one).
+    if loom_daemon_binary_stale "$LOOM_ROOT"; then
+      if [[ -f "$LOOM_ROOT/target/release/loom-daemon" ]]; then
+        warning "loom-daemon binary is stale (source tree updated since last build)"
+      else
+        warning "loom-daemon binary not found"
+      fi
       info "Building loom-daemon (this may take a minute)..."
       cd "$LOOM_ROOT"
       pnpm daemon:build || error "Failed to build loom-daemon"
@@ -1199,9 +1256,15 @@ case "$METHOD" in
     info "Running Quick Install..."
     echo ""
 
-    # Check if loom-daemon is built
-    if [[ ! -f "$LOOM_ROOT/target/release/loom-daemon" ]]; then
-      warning "loom-daemon binary not found"
+    # Check if loom-daemon is built AND up to date with the current source
+    # tree (issue #4188 -- a bare existence check reuses a binary built from
+    # an older commit after `git pull` landed a newer one).
+    if loom_daemon_binary_stale "$LOOM_ROOT"; then
+      if [[ -f "$LOOM_ROOT/target/release/loom-daemon" ]]; then
+        warning "loom-daemon binary is stale (source tree updated since last build)"
+      else
+        warning "loom-daemon binary not found"
+      fi
       info "Building loom-daemon (this may take a minute)..."
       cd "$LOOM_ROOT"
       pnpm daemon:build || error "Failed to build loom-daemon"
