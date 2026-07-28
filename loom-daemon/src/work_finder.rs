@@ -1363,8 +1363,20 @@ where
             // dispatched into the same root the gate's own build is competing
             // with for cores — the `suppress_dispatch_during_gate` knob (default
             // on) gates this so the pre-#4084 behavior is exactly recoverable.
+            // Host-distress circuit breaker (#4235): sample load-per-core, fold
+            // it into the breaker, and consult it as a second dispatch
+            // suppressor alongside the main-health halt flag and the gate
+            // in-flight hold. See the multi-workspace loop for the full
+            // rationale; when no breaker is registered these are no-ops.
+            if let Some(breaker) = crate::host_breaker::global() {
+                let load_per_core = crate::cpu_headroom::load_per_core();
+                if let Some(transition) = breaker.observe(load_per_core, chrono::Utc::now()) {
+                    crate::host_breaker::emit_transition_event(&event_bus, &transition);
+                }
+            }
             let halted = health_state.is_halted()
-                || (suppress_dispatch_during_gate && health_state.is_gate_in_flight());
+                || (suppress_dispatch_during_gate && health_state.is_gate_in_flight())
+                || crate::host_breaker::global_is_suppressed();
             // Recompute the dynamic cap from live inputs every tick (Phase B),
             // now with token-capacity backpressure (#3902): the token axis is the
             // count of *healthy* accounts from the ranking, not the flat pool.
@@ -1607,12 +1619,30 @@ pub fn spawn_multi_work_finder_task(
             // regardless of gate state, and a gate in flight holds its own root
             // regardless of drain state.
             let draining = drain.load(std::sync::atomic::Ordering::Relaxed);
-            let halted = dispatch_held_per_root_with_drain(
+            // Host-distress circuit breaker (#4235): sample the current
+            // load-per-core and fold it into the breaker's state machine. A
+            // tripped/cooling breaker is a *daemon-global* dispatch suppressor
+            // (like the scheduled drain) — it holds new dispatch in EVERY repo
+            // while running work drains — so it is OR'd onto every root's hold
+            // below. The load sample uses the fast, non-sleeping loadavg read (no
+            // `iostat`), safe to call inline. When no breaker is registered the
+            // helpers are no-ops returning `false` (zero behavior change).
+            if let Some(breaker) = crate::host_breaker::global() {
+                let load_per_core = crate::cpu_headroom::load_per_core();
+                if let Some(transition) = breaker.observe(load_per_core, chrono::Utc::now()) {
+                    crate::host_breaker::emit_transition_event(&event_bus, &transition);
+                }
+            }
+            let breaker_suppressed = crate::host_breaker::global_is_suppressed();
+            let halted: Vec<bool> = dispatch_held_per_root_with_drain(
                 &health_states,
                 &roots,
                 suppress_dispatch_during_gate,
                 draining,
-            );
+            )
+            .into_iter()
+            .map(|h| h || breaker_suppressed)
+            .collect();
             let any_halted = halted.iter().any(|&h| h);
 
             let mut pairs: Vec<(GhWorkSource, RegistryDispatcher)> = roots
@@ -2631,6 +2661,85 @@ exit 0
         assert_eq!(report.dispatched, 0, "zero dispatch while halted");
         assert_eq!(report.deferred_capacity, 0);
         assert!(disp.dispatched.is_empty(), "no sweeps started while halted");
+    }
+
+    #[test]
+    fn test_tripped_host_breaker_suppresses_tick_without_aborting_running_work() {
+        // The host-distress circuit breaker (#4235) is consulted at the tick
+        // choke point by folding its `is_suppressed()` into the same `halted`
+        // bool the main-health gate uses. This proves the two load-bearing
+        // properties end-to-end: a *tripped* breaker dispatches ZERO new sweeps,
+        // and the running (in-flight) sweeps are left untouched — drain, don't
+        // abort.
+        use crate::host_breaker::{BreakerPhase, HostBreakerConfig, SharedHostBreaker};
+        let now = chrono::Utc::now();
+        let breaker = SharedHostBreaker::new(HostBreakerConfig {
+            enabled: true,
+            load_per_core_threshold: 2.5,
+            sustain_ticks: 3,
+            cooldown_secs: 300,
+        });
+        // Not yet tripped: the breaker does not suppress, so a tick dispatches.
+        assert!(!breaker.is_suppressed());
+
+        // Three sustained over-threshold samples trip it to Open.
+        breaker.observe(Some(4.0), now);
+        breaker.observe(Some(4.0), now);
+        breaker.observe(Some(4.0), now);
+        assert_eq!(breaker.snapshot().phase, BreakerPhase::Open);
+        assert!(breaker.is_suppressed(), "tripped breaker suppresses dispatch");
+
+        // Feed the breaker's suppression into the tick's `halted` input, exactly
+        // as the work-finder loop does.
+        let mut source = FakeSource::once((1..=5).map(issue).collect());
+        let mut disp = RecordingDispatcher {
+            in_flight: HashSet::from([100, 101]),
+            ..Default::default()
+        };
+        let halted = breaker.is_suppressed();
+        let report = tick(&mut source, &mut disp, 10, halted).unwrap();
+
+        assert!(report.halted, "a tripped breaker halts the tick");
+        assert_eq!(report.seen, 5, "backlog is still observed");
+        assert_eq!(report.dispatched, 0, "zero new dispatch while the breaker is open");
+        assert!(disp.dispatched.is_empty(), "no new sweeps started");
+        // Drain, don't abort: the two running sweeps are untouched.
+        assert_eq!(disp.in_flight, HashSet::from([100, 101]));
+    }
+
+    #[test]
+    fn test_host_breaker_cooldown_release_resumes_dispatch() {
+        // After the breaker cools down and releases, the tick resumes dispatch —
+        // the "cool-down release" half of the Test Plan, driven through the same
+        // `halted`-composition path the loop uses.
+        use crate::host_breaker::{BreakerPhase, HostBreakerConfig, SharedHostBreaker};
+        let t0 = chrono::Utc::now();
+        let breaker = SharedHostBreaker::new(HostBreakerConfig {
+            enabled: true,
+            load_per_core_threshold: 2.5,
+            sustain_ticks: 3,
+            cooldown_secs: 300,
+        });
+        // Trip → Open.
+        for _ in 0..3 {
+            breaker.observe(Some(4.0), t0);
+        }
+        assert!(breaker.is_suppressed());
+        // Load drops → CoolDown (still suppressed).
+        breaker.observe(Some(0.1), t0 + chrono::Duration::seconds(10));
+        assert_eq!(breaker.snapshot().phase, BreakerPhase::CoolDown);
+        assert!(breaker.is_suppressed(), "cool-down still suppresses");
+        // Cool-down elapses with acceptable load → Closed, dispatch resumes.
+        breaker.observe(Some(0.1), t0 + chrono::Duration::seconds(400));
+        assert_eq!(breaker.snapshot().phase, BreakerPhase::Closed);
+        assert!(!breaker.is_suppressed());
+
+        let mut source = FakeSource::once((1..=3).map(issue).collect());
+        let mut disp = RecordingDispatcher::default();
+        let report = tick(&mut source, &mut disp, 10, breaker.is_suppressed()).unwrap();
+        assert!(!report.halted);
+        assert_eq!(report.dispatched, 3, "dispatch resumes once the breaker releases");
+        assert_eq!(disp.dispatched, vec![1, 2, 3]);
     }
 
     #[test]

@@ -1548,6 +1548,12 @@ concurrency ceiling 5" and share it with the team:
         "instaCrashSecs": 60
       }
     },
+    "hostBreaker": {
+      "enabled": true,
+      "loadPerCoreTrip": 2.5,
+      "sustainTicks": 3,
+      "cooldownSecs": 300
+    },
     "mainHealthGate": {
       "enabled": true
     },
@@ -1596,6 +1602,10 @@ exactly like `main_health_gate::read_build_gate_config`.
 | `autonomous.workFinder.quarantine.threshold` | `LOOM_WORK_FINDER_QUARANTINE_THRESHOLD` | `3` | Consecutive insta-crashes before an issue is quarantined. Zero/invalid → default |
 | `autonomous.workFinder.quarantine.ttlSecs` | `LOOM_WORK_FINDER_QUARANTINE_TTL_SECS` | `3600` | How long a quarantine entry persists before auto-release. Zero/invalid → default |
 | `autonomous.workFinder.quarantine.instaCrashSecs` | `LOOM_WORK_FINDER_QUARANTINE_INSTA_CRASH_SECS` | `60` | Checkpoint-less death within this window of dispatch counts as an insta-crash. Zero/invalid → default |
+| `autonomous.hostBreaker.enabled` | `LOOM_HOST_BREAKER` | `true` | Host-distress circuit breaker on/off (#4235). A safety backstop — **defaults on**. Env truthy (`1`/`true`/`yes`/`on`) enables, any other value disables; wins over config. See [Host-distress circuit breaker](#host-distress-circuit-breaker-4235) below |
+| `autonomous.hostBreaker.loadPerCoreTrip` | `LOOM_HOST_BREAKER_LOAD_PER_CORE` | `2.5` | Load-per-core at/over which a tick counts toward tripping. `<= 0`/invalid → default |
+| `autonomous.hostBreaker.sustainTicks` | `LOOM_HOST_BREAKER_SUSTAIN_TICKS` | `3` | Consecutive over-threshold work-finder ticks required to trip (a single spike never trips). Zero/invalid → default |
+| `autonomous.hostBreaker.cooldownSecs` | `LOOM_HOST_BREAKER_COOLDOWN_SECS` | `300` | Cool-down window held after distress subsides before dispatch resumes. Zero/invalid → default |
 | `autonomous.perTokenConcurrency` | `LOOM_PER_TOKEN_CONCURRENCY` | `2` | Concurrent sweeps **per healthy token** in the cap (#3947). Zero/invalid → default; clamped to a floor of 1 |
 | `autonomous.cpuUtilizationTarget` | `LOOM_CPU_UTILIZATION_TARGET` | `0.75` | Fraction of logical CPUs the CPU headroom term is willing to dedicate to sweep work (#3978, config surface #4032). Outside `(0, 1]` or wrong JSON type → default; single-root, resolved once at startup (not per-workspace) |
 | `autonomous.estCoresPerSweep` | `LOOM_EST_CORES_PER_SWEEP` | `2.0` | Estimated CPU cores one concurrent sweep consumes while building/testing (#3978, config surface #4032). `<= 0` or wrong JSON type → default; integer JSON (`2`) and float JSON (`2.0`) both accepted; single-root, resolved once at startup |
@@ -1786,6 +1796,75 @@ candidate is dropped **before** the global slot-fill pass, so a workspace whose
 only candidates are quarantined never reserves a shared dispatch slot — healthy
 sibling work in other repos gets it instead. Defaults **on**; disable with
 `LOOM_WORK_FINDER_QUARANTINE=0` or `autonomous.workFinder.quarantine.enabled = false`.
+
+### Host-distress circuit breaker (#4235)
+
+The insta-crash quarantine above protects the shared **queue** from one broken
+issue; the host circuit breaker protects the **host itself** from a sustained
+overload. It was added after the 2026-07-27→28 meltdown (#4231): a 6-way sweep
+fan-out drove load to 118 on 28 cores, the window server was watchdog-killed five
+times, and the daemon itself crashed — and then a *second* wave re-spiked the host
+two hours later because nothing remembered the first incident. The point-in-time
+admission checks (CPU headroom #3978, the per-tick load-admission ramp cap #4234)
+each make a *fresh* decision every tick, so the instant load dipped they
+re-admitted a full wave.
+
+The breaker is the **stateful** layer those checks lack. It samples
+**load-per-core** (`loadavg_1m / logical_cpus`) once per work-finder tick and runs
+a three-phase state machine:
+
+- **Closed** (normal) → **Open** once load-per-core has been at/over
+  `loadPerCoreTrip` for `sustainTicks` *consecutive* ticks. A single spike resets
+  the counter, so a transient burst never trips.
+- **Open** (tripped) — new dispatch is **suppressed** in every repo while running
+  sweeps **drain untouched** (the breaker never kills a running sweep). Stays Open
+  while the host is still hot.
+- **CoolDown** — once load drops back below the threshold, dispatch stays
+  suppressed for a further `cooldownSecs` so a transient dip can't re-admit a full
+  wave (exactly the #4231 01:41 re-spike). A re-spike over the threshold during
+  cool-down sends it straight back to Open; otherwise the cool-down elapses and it
+  returns to Closed.
+
+The breaker's suppression composes with the existing dispatch suppressors at the
+same choke point — it is OR'd onto the main-health-gate halt and the scheduled
+drain, and works alongside (never bypassing) the `maxAdmissionsPerTick` ramp cap.
+
+**Default-ON rationale.** Unlike the work-finder loop itself (opt-in,
+default-off), the breaker **defaults on** — the same call the insta-crash
+quarantine made. It only ever acts under genuinely severe *sustained* load, it
+never aborts running work, and it is only ever *sampled* from inside the
+work-finder loop, so a daemon that never enables the work-finder sees zero
+behavior change. A backstop that defaulted off would not have prevented #4231's
+second wave, which is the whole point.
+
+**Explicit `dispatch_sweep` is hard-blocked by default (with a `force`
+override).** This differs deliberately from the sibling headroom advisory (#4234),
+which only *advises* an explicit dispatch that would exceed the point-in-time
+dynamic cap and never blocks it. A *tripped* breaker represents **sustained,
+already-observed** distress — a materially stronger signal than a single-tick
+headroom reading — so `dispatch_sweep` (CLI `loom-daemon dispatch <N>` / the
+`mcp__loom__dispatch_sweep` tool) is **refused** while the breaker is Open or
+CoolDown. An operator who knows the host is distressed and wants to dispatch anyway
+passes `--force` (CLI) / `force: true` (IPC).
+
+**Observability.** The breaker is surfaced three ways: a log line on every phase
+change; a state-change-deduped `daemon.host_breaker.state` event-bus event
+(payload: `transition`, `state`, `reason`, `tripped_at`, `releases_at`); and
+`loom-daemon status`, which prints `Host breaker: OK/OPEN/COOLING DOWN` with the
+reason, the tripped-at time, and the cool-down release time (also in
+`--json → host_breaker`).
+
+**Clearing it manually.** The breaker auto-clears when the cool-down elapses on a
+recovered host — no operator action is needed in the normal case. To clear it
+sooner, either resolve the load (it releases on the next below-threshold tick plus
+the cool-down) or restart the daemon (the state is in-memory, like the
+quarantine). To disable it entirely, set `LOOM_HOST_BREAKER=0` or
+`autonomous.hostBreaker.enabled = false`.
+
+**Follow-ups deliberately deferred** (kept out of the first version to stay
+minimal, per #4235): macOS-only trip signals (`.ips` crash reports, `syspolicyd`
+CPU-ratio amplification, daemon self-restart detection) and durable trip/release
+telemetry (coordinate with #4137 rather than building a parallel store).
 
 ### Cross-host dispatch-collision baseline (#4085, Phase 0 of #4028)
 

@@ -1323,6 +1323,13 @@ pub fn build_daemon_status(
         auto_update_backoff_secs: au.backoff_secs,
         auto_update_terminal_reason: au.terminal_reason,
         auto_update_note: au.note,
+        // Host-distress circuit breaker (#4235) — read from the process-global
+        // handle the work-finder loop registers/updates each tick, mirroring the
+        // auto-update global-snapshot pattern above. `None` (no breaker
+        // registered — work-finder off or breaker disabled) reads as "inactive".
+        host_breaker: crate::host_breaker::global_snapshot()
+            .map(crate::host_breaker::BreakerSnapshot::into_status)
+            .map(Box::new),
     }
 }
 
@@ -2158,7 +2165,45 @@ fn handle_request(
             effort,
             depends_on,
             workspace_root,
+            force,
         } => {
+            // Host-distress circuit breaker (#4235): a *tripped* breaker
+            // represents SUSTAINED, already-observed host distress across
+            // multiple ticks — a materially stronger signal than the
+            // point-in-time headroom advisory below (which by #4234's deliberate
+            // design only *advises*, never blocks). Because the breaker's signal
+            // is stronger and stateful, it **hard-blocks** an explicit
+            // `dispatch_sweep` by default; an operator who truly wants to
+            // dispatch into a distressed host passes `force: true` to override.
+            // This is the one-sentence reconciliation the issue asks for: the
+            // breaker blocks where the headroom check advises *because* it fires
+            // only on proven, sustained distress, not a single-tick reading.
+            if !force {
+                if let Some(snap) = crate::host_breaker::global_snapshot() {
+                    if snap.suppressed {
+                        let releases = snap.releases_at.map_or_else(
+                            || " (host still hot — cool-down not yet started)".to_string(),
+                            |r| format!(" (cool-down releases at {r})"),
+                        );
+                        log::warn!(
+                            "dispatch_sweep: refused {kind:?} — host circuit breaker is {} \
+                             ({}){releases}; running work drains, new dispatch paused. \
+                             Re-run with force to override.",
+                            snap.phase.as_str(),
+                            snap.reason.as_deref().unwrap_or("sustained host distress"),
+                        );
+                        return Response::Error {
+                            message: format!(
+                                "dispatch_sweep refused: host circuit breaker is {} ({}).{releases} \
+                                 Running work is draining and new dispatch is paused (#4235). \
+                                 Re-run with force to override.",
+                                snap.phase.as_str(),
+                                snap.reason.as_deref().unwrap_or("sustained host distress"),
+                            ),
+                        };
+                    }
+                }
+            }
             let target =
                 resolve_registry(sweep_registry, workspace_pool, workspace_root.as_deref());
             let mut sr = target.lock().expect("Sweep registry mutex poisoned");
@@ -3066,6 +3111,7 @@ exit 0
                     effort: None,
                     depends_on: None,
                     workspace_root: None,
+                    force: false,
                 },
                 &tm,
                 &db,
@@ -3149,6 +3195,7 @@ exit 0
                 effort: None,
                 depends_on: None,
                 workspace_root: Some(dir_b.path().to_string_lossy().into_owned()),
+                force: false,
             },
             &tm,
             &db,
@@ -3253,6 +3300,7 @@ exit 0
                 effort: None,
                 depends_on: None,
                 workspace_root: None,
+                force: false,
             },
             &tm,
             &db,
@@ -3331,6 +3379,7 @@ exit 0
                 effort: None,
                 depends_on: None,
                 workspace_root: None,
+                force: false,
             },
             &tm,
             &db,
@@ -3383,6 +3432,7 @@ exit 0
                 effort: None,
                 depends_on: None,
                 workspace_root: None,
+                force: false,
             },
             &tm,
             &db,
@@ -3418,6 +3468,7 @@ exit 0
                 effort,
                 depends_on: _,
                 workspace_root: _,
+                force: _,
             } => {
                 assert!(matches!(kind, SweepKind::Issue(42)));
                 assert!(idempotency_key.is_none());
@@ -3437,6 +3488,7 @@ exit 0
             effort: None,
             depends_on: None,
             workspace_root: None,
+            force: false,
         };
         let json = serde_json::to_string(&request).expect("serialize");
         let back: Request = serde_json::from_str(&json).expect("deserialize");
@@ -3448,6 +3500,7 @@ exit 0
                 effort,
                 depends_on: _,
                 workspace_root: _,
+                force: _,
             } => {
                 assert!(matches!(kind, SweepKind::Issue(7)));
                 assert_eq!(idempotency_key.as_deref(), Some("key-B"));
@@ -3467,6 +3520,7 @@ exit 0
             effort: None,
             depends_on: None,
             workspace_root: None,
+            force: false,
         };
         let json = serde_json::to_string(&request).expect("serialize");
         let back: Request = serde_json::from_str(&json).expect("deserialize");
@@ -3503,6 +3557,7 @@ exit 0
             effort: Some("xhigh".to_string()),
             depends_on: None,
             workspace_root: None,
+            force: false,
         };
         let json = serde_json::to_string(&request).expect("serialize");
         let back: Request = serde_json::from_str(&json).expect("deserialize");
@@ -3524,6 +3579,7 @@ exit 0
             effort: Some(String::new()),
             depends_on: None,
             workspace_root: None,
+            force: false,
         };
         let json = serde_json::to_string(&request).expect("serialize");
         let back: Request = serde_json::from_str(&json).expect("deserialize");
@@ -3563,6 +3619,7 @@ exit 0
             effort: None,
             depends_on: Some(3726),
             workspace_root: None,
+            force: false,
         };
         let json = serde_json::to_string(&request).expect("serialize");
         let back: Request = serde_json::from_str(&json).expect("deserialize");
@@ -3907,6 +3964,7 @@ exit 0
                 effort: None,
                 depends_on: None,
                 workspace_root: None,
+                force: false,
             },
             &tm,
             &db,
@@ -4062,6 +4120,7 @@ exit 0
             auto_update_backoff_secs: Some(120),
             auto_update_terminal_reason: None,
             auto_update_note: Some("within settle window".to_string()),
+            host_breaker: None,
         };
         let resp = Response::DaemonStatus(report);
         let json = serde_json::to_string(&resp).expect("serialize response");
