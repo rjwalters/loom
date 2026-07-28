@@ -60,13 +60,36 @@
 # live plist's LOOM_* autonomy env, and SIGTERMs the daemon so sweep children
 # reparent instead of being torn down with the job.
 #
+# systemd --user-managed daemons (Linux, #4260 sub-issue C): the exact same
+# ownership-tiering + supervised-restart contract, ported to the systemd --user
+# service loom-daemon-start.sh installs (#4268). A `systemd --user` unit's pid
+# also goes stale on every `Restart=on-success` relaunch, so it is checked at the
+# SAME tier as launchd, ahead of the pid-file tier. The restart itself is driven
+# by the identical `loom-daemon restart` IPC primitive (recognized daemon-side by
+# `detect_supervisor()` since #4267/PR #4298 when `LOOM_DAEMON_SUPERVISOR=systemd`
+# is present — baked into the rendered unit by loom-daemon-start.sh); a clean
+# exit 0 lets systemd's `Restart=on-success` relaunch onto the fresh binary. On a
+# refused restart (a pre-#4267 binary with no RestartDaemon handler, or a dead
+# socket), the script refuses loudly (exit 6) exactly like launchd, and
+# --relaunch (or LOOM_DAEMON_UPDATE_RELAUNCH=1) re-renders the unit and forces
+# the relaunch: it harvests the live unit's `Environment=` LOOM_*/token lines,
+# SIGTERMs the running daemon (so sweep children reparent instead of being torn
+# down), then re-invokes loom-daemon-start.sh — which re-renders the unit
+# (installing `LOOM_DAEMON_SUPERVISOR=systemd`), reloads, and `enable --now`s it
+# onto a now-inactive unit, i.e. a genuine restart. `LOOM_DAEMON_SYSTEMD=0`
+# disables ALL systemd interaction symmetrically with loom-daemon-start.sh
+# --no-systemd / loom-daemon-stop.sh, so a --no-systemd install is never probed
+# via systemctl and follows the PID-file/nohup restart path instead. Darwin
+# behavior is entirely unaffected — this tier is inert unless
+# `is_linux_systemd()` (lib/systemd-user.sh) resolves true.
+#
 # Usage:
 #   ./.loom/scripts/cli/loom-daemon-update.sh              Detect, rebuild if stale, provision, restart (preserving flags)
 #   ./.loom/scripts/cli/loom-daemon-update.sh --check       Detect only; exit 0 (up to date) or 3 (update available); no writes
 #   ./.loom/scripts/cli/loom-daemon-update.sh --dry-run     Print the plan without building/provisioning/restarting
 #   ./.loom/scripts/cli/loom-daemon-update.sh --force       Rebuild + provision + restart even if already up to date
 #   ./.loom/scripts/cli/loom-daemon-update.sh --no-restart  Rebuild + provision only; leave the running daemon untouched
-#   ./.loom/scripts/cli/loom-daemon-update.sh --relaunch    Launchd only: after a refused restart, re-render the plist and relaunch under supervision (SIGTERMs the daemon so sweep children reparent; preserves the live plist's LOOM_* env)
+#   ./.loom/scripts/cli/loom-daemon-update.sh --relaunch    Launchd/systemd only: after a refused restart, re-render the plist/unit and relaunch under supervision (SIGTERMs the daemon so sweep children reparent; preserves the live LOOM_* env)
 #   ./.loom/scripts/cli/loom-daemon-update.sh --help
 #
 # Environment:
@@ -87,7 +110,15 @@
 #   LOOM_LAUNCHD_DOMAIN    macOS only: pin the launchd domain (gui/<uid> or
 #                          user/<uid>); else auto-resolved gui→user (#4130),
 #                          matching loom-daemon-start.sh / -stop.sh.
-#   LOOM_DAEMON_UPDATE_RELAUNCH  macOS/launchd only: 1/true/yes is equivalent to
+#   LOOM_DAEMON_SYSTEMD    Linux only: 0/false/no disables ALL systemd interaction
+#                          (ownership detection + systemd restart), symmetric with
+#                          loom-daemon-start.sh --no-systemd / loom-daemon-stop.sh
+#                          (#4268). A daemon started with --no-systemd /
+#                          LOOM_DAEMON_SYSTEMD=0 gets an update that never invokes
+#                          systemctl and follows the PID-file/nohup restart path.
+#   LOOM_SYSTEMD_UNIT      Linux only: the systemd --user unit to inspect/restart
+#                          (default loom-daemon.service); must match the start's.
+#   LOOM_DAEMON_UPDATE_RELAUNCH  Launchd/systemd only: 1/true/yes is equivalent to
 #                          passing --relaunch (opt in to the re-render + relaunch
 #                          on a refused restart).
 #   LOOM_MACHINE_CHECKOUT  Machine mode (Epic #3835 Phase 3b, #4229): set by the
@@ -115,14 +146,15 @@
 #      claimed-successful provision is not the expected build (a silent no-op
 #      roll — "reports success while shipping nothing"). Distinct from both a
 #      compile failure and a provisioning soft-failure (#4053).
-#   6  launchd restart FAILED: the daemon is launchd-managed but the running
-#      (old) binary refused the `loom-daemon restart` IPC request (a pre-#4077
-#      binary with no RestartDaemon handler, or a dead socket). The fresh binary
-#      IS provisioned but the OLD one is still running; the script refuses to
-#      report success. Without --relaunch it prints how to re-render the plist and
-#      relaunch under supervision, then exits 6; with --relaunch (or
-#      LOOM_DAEMON_UPDATE_RELAUNCH=1) it performs that re-render+relaunch itself,
-#      propagating loom-daemon-start.sh's exit code (#4042, #4118).
+#   6  supervised restart FAILED: the daemon is launchd- or systemd-managed but
+#      the running (old) binary refused the `loom-daemon restart` IPC request (a
+#      pre-#4077/#4267 binary with no RestartDaemon handler, or a dead socket).
+#      The fresh binary IS provisioned but the OLD one is still running; the
+#      script refuses to report success. Without --relaunch it prints how to
+#      re-render the plist/unit and relaunch under supervision, then exits 6;
+#      with --relaunch (or LOOM_DAEMON_UPDATE_RELAUNCH=1) it performs that
+#      re-render+relaunch itself, propagating loom-daemon-start.sh's exit code
+#      (#4042, #4118, #4260 sub-issue C).
 #
 # See also: loom-daemon-start.sh (writes .loom/.daemon.flags), loom-daemon-stop.sh
 # (SIGTERM -> grace -> SIGKILL; in-flight sweeps survive by design — this
@@ -403,6 +435,48 @@ launchd_job_pid() {
     launchctl print "$LAUNCHD_SERVICE" 2>/dev/null | awk -F'= ' '/^[[:space:]]*pid = /{gsub(/[^0-9]/, "", $2); print $2; exit}'
 }
 
+# ---------- systemd --user ownership detection (Linux, #4260 sub-issue C) ----------
+# The Linux mirror of the launchd tier just above, checked at the SAME level
+# (ahead of the pid-file tier): a `systemd --user` unit's pid also goes stale on
+# every `Restart=on-success` relaunch (loom-daemon-start.sh #4268), so the pid
+# file alone cannot answer "is it running, and how". Honors LOOM_DAEMON_SYSTEMD
+# symmetrically with loom-daemon-start.sh --no-systemd / loom-daemon-stop.sh: a
+# --no-systemd install must never invoke systemctl at all. Shared resolver
+# (lib/systemd-user.sh, #4268) sourced verbatim so update agrees with the unit
+# name start/stop resolve.
+_LOOM_SYSTEMD_LIB_DIR="$(cd "$SCRIPT_DIR/../lib" 2>/dev/null && pwd)"
+if [[ -r "$_LOOM_SYSTEMD_LIB_DIR/systemd-user.sh" ]]; then
+    # shellcheck source=../lib/systemd-user.sh
+    source "$_LOOM_SYSTEMD_LIB_DIR/systemd-user.sh"
+fi
+
+IS_LINUX_SYSTEMD=false
+if ! [[ "${LOOM_DAEMON_SYSTEMD:-}" =~ ^(0|false|no)$ ]] \
+    && declare -f is_linux_systemd >/dev/null 2>&1 && is_linux_systemd; then
+    IS_LINUX_SYSTEMD=true
+fi
+
+# Resolved ONLY when systemd interaction is on -- mirrors the launchd guard just
+# above; these calls are inert placeholders otherwise since every systemd
+# function below short-circuits on IS_LINUX_SYSTEMD.
+if [[ "$IS_LINUX_SYSTEMD" == "true" ]]; then
+    SYSTEMD_UNIT="$(resolve_systemd_unit)"
+    SYSTEMD_UNIT_PATH="$(resolve_systemd_unit_path)"
+else
+    SYSTEMD_UNIT="${LOOM_SYSTEMD_UNIT:-loom-daemon.service}"
+    SYSTEMD_UNIT_PATH=""
+fi
+
+systemd_unit_loaded() {
+    [[ "$IS_LINUX_SYSTEMD" == "true" ]] || return 1
+    command -v systemctl >/dev/null 2>&1 || return 1
+    systemctl --user is-active --quiet "$SYSTEMD_UNIT" 2>/dev/null \
+        || systemctl --user is-enabled --quiet "$SYSTEMD_UNIT" 2>/dev/null
+}
+systemd_unit_pid() {
+    systemctl --user show -p MainPID --value "$SYSTEMD_UNIT" 2>/dev/null
+}
+
 # ---------- re-render + relaunch on a refused restart (#4118) ----------
 # The exit-6 fallback USED to tell the operator to `launchctl bootstrap` the
 # EXISTING plist. That plist is stale by construction (it is the pre-#4077 file
@@ -505,13 +579,112 @@ perform_relaunch() {
     "$START_SCRIPT"
 }
 
-# Resolve which manager owns the running daemon: launchd (checked first), the
-# .loom/.daemon.pid file (nohup/script-managed), or none. WAS_RUNNING is derived
-# from this — a launchd-loaded job counts as running regardless of pid-file state.
+# harvest_unit_env <unit_path> — echo the live systemd unit's `Environment=`
+# lines, restricted to exactly the keys render_systemd_unit itself forwards
+# (LOOM_*, GH_TOKEN, GITEA_TOKEN, FORGE_TOKEN) and EXCLUDING:
+#   - PATH / HOME     (start.sh resolves PATH deterministically, mirroring the
+#                      launchd plist path — round-tripping the unit's PATH here
+#                      would re-introduce the non-deterministic-render bug),
+#   - LOOM_DAEMON_SUPERVISOR (start.sh hardcodes it; re-exporting is pointless).
+# Emits one "<key>\t<value>" line per key (a systemd `Environment=KEY=VALUE`
+# line is single-valued, unlike the plist's XML dict, so no base64 round-trip is
+# needed here). Fails loudly (return 2) when the unit file is absent — it must
+# NEVER silently return an empty set, which would let the re-render narrow the
+# autonomy flags to FLAGS-OFF defaults (the #4011 class).
+harvest_unit_env() {
+    local unit_path="$1"
+    if [[ ! -f "$unit_path" ]]; then
+        err "Cannot harvest systemd unit env: unit file not found at $unit_path"
+        return 2
+    fi
+    local line rest key value
+    while IFS= read -r line; do
+        [[ "$line" == Environment=* ]] || continue
+        rest="${line#Environment=}"
+        key="${rest%%=*}"
+        value="${rest#*=}"
+        case "$key" in
+            LOOM_DAEMON_SUPERVISOR) continue ;;
+            LOOM_*|GH_TOKEN|GITEA_TOKEN|FORGE_TOKEN) printf '%s\t%s\n' "$key" "$value" ;;
+            *) continue ;;
+        esac
+    done < "$unit_path"
+}
+
+# perform_systemd_relaunch <unit_path> <unit> — re-render the systemd --user
+# unit and relaunch it under supervision, preserving the live unit's
+# autonomy/auth env. The systemd mirror of perform_relaunch above. Invoked ONLY
+# from the exit-6 fallback when the operator opted in (--relaunch /
+# LOOM_DAEMON_UPDATE_RELAUNCH=1). Returns loom-daemon-start.sh's exit code (or 6
+# if the env harvest fails — refusing to relaunch into a silently-narrowed env).
+#
+# Note on "systemctl --user restart": re-rendering the unit file alone does not
+# make an ALREADY-ACTIVE unit pick up the new binary/env -- `enable --now` on an
+# active unit is a no-op start, not a restart. So this SIGTERMs the running
+# daemon first (Restart=on-success does not fire on a signal death, mirroring
+# launchd's KeepAlive:SuccessfulExit), leaving the unit inactive, and THEN
+# invokes loom-daemon-start.sh to re-render + `enable --now` it -- which, against
+# an inactive unit, genuinely starts a fresh process. This achieves the same
+# effect as `systemctl --user restart <unit>` while reusing render_systemd_unit
+# rather than duplicating it here.
+perform_systemd_relaunch() {
+    local unit_path="$1" unit="$2"
+    echo "--relaunch: re-rendering the systemd --user unit ${unit} and relaunching under supervision."
+
+    # 1. Preserve the live unit's autonomy/auth env across the re-render.
+    local harvested
+    if ! harvested=$(harvest_unit_env "$unit_path"); then
+        err "Refusing to relaunch: could not read the live unit's Environment= values."
+        err "Relaunching now would silently narrow the autonomy flags to FLAGS-OFF defaults (#4011) — aborting."
+        return 6
+    fi
+    local k v count=0
+    while IFS=$'\t' read -r k v; do
+        [[ -z "$k" ]] && continue
+        export "$k=$v"
+        count=$((count + 1))
+    done <<< "$harvested"
+    echo "Preserved ${count} LOOM_*/token env var(s) from the live unit across the re-render (PATH/HOME/LOOM_DAEMON_SUPERVISOR excluded by design)."
+
+    # 2. Stop the old daemon GRACEFULLY so its sweep children reparent and keep
+    #    working, instead of `systemctl stop` (which SIGKILLs the whole cgroup
+    #    after TimeoutStopSec, tearing down sweep children the same way a
+    #    launchd bootout would). kill -TERM makes the daemon exit by signal, so
+    #    Restart=on-success does not relaunch it -- start.sh below installs the
+    #    fresh, supervised unit and enables + starts the new process.
+    local daemon_pid
+    daemon_pid=$(systemd_unit_pid)
+    if [[ -n "$daemon_pid" && "$daemon_pid" != "0" ]] && kill -0 "$daemon_pid" 2>/dev/null; then
+        echo "Sending SIGTERM to the running daemon (pid ${daemon_pid}) — sweep children reparent and keep working (NOT 'systemctl stop', which tears down the whole cgroup)."
+        kill -TERM "$daemon_pid" 2>/dev/null || true
+        local _waited
+        for _waited in 1 2 3 4 5; do
+            kill -0 "$daemon_pid" 2>/dev/null || break
+            sleep 1
+        done
+    fi
+
+    # 3. Re-render + enable via loom-daemon-start.sh. It hardcodes
+    #    Restart=on-success + LOOM_DAEMON_SUPERVISOR=systemd, and harvests the
+    #    LOOM_* env we just re-exported. In systemd mode the unit's
+    #    Environment= lines — not .daemon.flags — are the durable config, so no
+    #    flags are passed here.
+    echo "Invoking ${START_SCRIPT} to re-render the supervised unit and relaunch."
+    "$START_SCRIPT"
+}
+
+# Resolve which manager owns the running daemon: launchd, then systemd (both
+# checked ahead of the pid-file tier -- their pids go stale on every supervised
+# relaunch), then the .loom/.daemon.pid file (nohup/script-managed), or none.
+# WAS_RUNNING is derived from this — a launchd- or systemd-loaded job counts as
+# running regardless of pid-file state.
 DAEMON_MANAGER="none"
 WAS_RUNNING=false
 if launchd_job_loaded; then
     DAEMON_MANAGER="launchd"
+    WAS_RUNNING=true
+elif systemd_unit_loaded; then
+    DAEMON_MANAGER="systemd"
     WAS_RUNNING=true
 elif [[ -f "$PID_FILE" ]]; then
     existing_pid=$(cat "$PID_FILE" 2>/dev/null || true)
@@ -524,6 +697,7 @@ fi
 describe_manager() {
     case "$DAEMON_MANAGER" in
         launchd) echo "Running daemon manager: launchd (label ${LAUNCHD_LABEL})." ;;
+        systemd) echo "Running daemon manager: systemd --user (unit ${SYSTEMD_UNIT})." ;;
         pidfile) echo "Running daemon manager: PID-file/nohup (.loom/.daemon.pid)." ;;
         *)       echo "Running daemon manager: not running." ;;
     esac
@@ -575,6 +749,8 @@ if [[ "$DRY_RUN" == "true" ]]; then
         echo "[dry-run] --no-restart given: would leave the running daemon (if any) untouched."
     elif [[ "$DAEMON_MANAGER" == "launchd" ]]; then
         echo "[dry-run] loom-daemon is launchd-managed (label ${LAUNCHD_LABEL}) — would restart via '$PROVISION_TARGET restart' (the #4077 supervised primitive); .daemon.flags is NOT consulted (the plist's EnvironmentVariables carries the equivalent config)."
+    elif [[ "$DAEMON_MANAGER" == "systemd" ]]; then
+        echo "[dry-run] loom-daemon is systemd-managed (unit ${SYSTEMD_UNIT}) — would restart via '$PROVISION_TARGET restart' (the #4267 supervised primitive); .daemon.flags is NOT consulted (the unit's Environment= lines carry the equivalent config)."
     elif [[ "$WAS_RUNNING" == "true" ]]; then
         echo "[dry-run] Would stop + restart loom-daemon with flags from ${FLAGS_SOURCE}: ${RESTART_ARGS[*]:-<none>}"
     else
@@ -703,6 +879,12 @@ if [[ "$NO_RESTART" == "true" ]]; then
             echo "If that binary predates #4077 and refuses the restart, re-render + relaunch under supervision:"
             echo "  loom-daemon-update.sh --relaunch   (preserves the live plist's LOOM_* env; SIGTERMs the daemon so sweep children reparent)"
             echo "Do NOT 'launchctl bootout $LAUNCHD_SERVICE' by hand — bootout tears down the whole job tree and KILLS in-flight sweeps (they are direct children of the launchd job)."
+        elif [[ "$DAEMON_MANAGER" == "systemd" ]]; then
+            echo "The running (systemd-managed) daemon is still the PRE-update binary. Restart it with:"
+            echo "  $PROVISION_TARGET restart      (graceful: supervised in-place relaunch, in-flight sweeps preserved)"
+            echo "If that binary predates #4267 and refuses the restart, re-render + relaunch under supervision:"
+            echo "  loom-daemon-update.sh --relaunch   (preserves the live unit's LOOM_* env; SIGTERMs the daemon so sweep children reparent)"
+            echo "Do NOT 'systemctl --user stop $SYSTEMD_UNIT' by hand — stop tears down the whole cgroup and KILLS in-flight sweeps (they are direct children of the unit)."
         else
             echo "The running daemon is still the PRE-update binary. Restart manually with:"
             echo "  $STOP_SCRIPT && $START_SCRIPT ${RESTART_ARGS[*]:-}"
@@ -761,6 +943,55 @@ if [[ "$DAEMON_MANAGER" == "launchd" ]]; then
     err "If you must relaunch by hand, prefer the graceful sequence over bootout+bootstrap:"
     err "  kill -TERM ${daemon_pid_hint:-<daemon-pid>}   # daemon exits non-zero; children reparent; not relaunched (stale plist KeepAlive=false)"
     err "  $START_SCRIPT                                  # re-render + bootstrap the supervised plist"
+    exit 6
+fi
+
+# ---------- systemd-managed restart via the #4267 supervised primitive (#4260 sub-issue C) ----------
+# The systemd mirror of the launchd block above. The daemon is systemd-
+# supervised, so NEITHER stop.sh+start.sh NOR .daemon.flags apply: the unit's
+# ExecStart + Environment= lines are the durable source of truth. `loom-daemon
+# restart` sends Request::RestartDaemon over the IPC socket; the supervised
+# daemon exits 0 and `Restart=on-success` relaunches it onto the freshly-
+# provisioned binary with the unit's config.
+if [[ "$DAEMON_MANAGER" == "systemd" ]]; then
+    echo "loom-daemon is systemd-managed (unit ${SYSTEMD_UNIT})."
+    echo "Restarting via the supervised restart primitive: $PROVISION_TARGET restart"
+    echo "(.daemon.flags is NOT consulted — the unit's Environment= lines carry the equivalent config.)"
+    if "$PROVISION_TARGET" restart; then
+        ok "loom-daemon restart scheduled — systemd will relaunch it onto the freshly-provisioned binary."
+        exit 0
+    fi
+    # The restart request is served by the RUNNING (old) binary. A pre-#4267
+    # daemon has no RestartDaemon handler recognizing LOOM_DAEMON_SUPERVISOR=systemd
+    # (and an unsupervised/dead socket also fails), so the request was refused.
+    # Refuse loudly rather than claim a half-update success: the fresh binary is
+    # provisioned but the OLD one is still running (the #4011 silent-autonomy-
+    # loss class this issue closes).
+    err "loom-daemon restart FAILED: the running daemon did not accept the restart request."
+    err "This is expected on the FIRST roll onto a #4267-capable binary — the currently-running binary predates the 'restart' IPC command (or its socket is dead)."
+    err "The freshly-built binary IS provisioned, but the OLD (unsupervised) binary is still running."
+
+    if [[ "$RELAUNCH" == "true" ]]; then
+        perform_systemd_relaunch "$SYSTEMD_UNIT_PATH" "$SYSTEMD_UNIT"
+        exit $?
+    fi
+
+    daemon_pid_hint=$(systemd_unit_pid)
+    err ""
+    err "To finish the roll, re-render the unit and relaunch under systemd supervision"
+    err "(this installs Restart=on-success + LOOM_DAEMON_SUPERVISOR=systemd so"
+    err "the NEXT roll can use the supervised path) while preserving the live unit's LOOM_*"
+    err "autonomy env — run:"
+    err "  loom-daemon-update.sh --relaunch      (or: LOOM_DAEMON_UPDATE_RELAUNCH=1 loom-daemon-update.sh)"
+    err ""
+    err "WARNING: do NOT 'systemctl --user stop $SYSTEMD_UNIT' by hand to force this."
+    err "stop tears down the whole cgroup, and in-flight sweep children are DIRECT"
+    err "children of the unit, so it TERMINATES every running sweep — stranding"
+    err "loom:building labels and leaving worktrees behind. --relaunch above instead stops"
+    err "the daemon gracefully (SIGTERM) so sweep children reparent and keep working."
+    err "If you must relaunch by hand, prefer the graceful sequence over stop+enable:"
+    err "  kill -TERM ${daemon_pid_hint:-<daemon-pid>}   # daemon exits by signal; children reparent; not relaunched (Restart=on-success does not fire)"
+    err "  $START_SCRIPT                                  # re-render + enable --now the supervised unit"
     exit 6
 fi
 
