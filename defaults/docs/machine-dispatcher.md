@@ -1,10 +1,10 @@
 # Machine-level `loom` dispatcher
 
-Epic #3835 Phase 3a (#4157). The `loom` dispatcher is a machine-level entry
-point installed to `~/.local/bin/loom`. It resolves the machine-level Loom
-checkout at `~/.local/share/loom` and exec's into it. It is a sibling of the
-`~/.local/bin/loom-daemon` binary — one install per machine, shared across every
-repo Loom is installed into.
+Epic #3835 Phase 3a (#4157) + Phase 3b (#4229). The `loom` dispatcher is a
+machine-level entry point installed to `~/.local/bin/loom`. It resolves the
+machine-level Loom checkout at `~/.local/share/loom` and exec's into it. It is a
+sibling of the `~/.local/bin/loom-daemon` binary — one install per machine,
+shared across every repo Loom is installed into.
 
 ```
 loom <command> [options]
@@ -14,6 +14,7 @@ loom <command> [options]
 |---------|--------------|
 | `start` | Start the machine-level `loom-daemon` (delegates to `loom-daemon-start.sh`) |
 | `stop`  | Stop the machine-level `loom-daemon` (delegates to `loom-daemon-stop.sh`) |
+| `restart` | Restart the machine-level `loom-daemon` (drain-and-roll; falls back to stop+start) |
 | `status`| Show machine-level + current-repo status (read-only) |
 | `sweep <issue>` | Dispatch `/loom:sweep <issue>` for the current repo |
 | `update`| Thin delegate to `loom-daemon-update.sh` (no rebuild logic of its own) |
@@ -45,7 +46,7 @@ There are two different Loom surfaces that both answer to the name `loom`:
 
 | Surface | What it is | Verbs |
 |---------|-----------|-------|
-| `~/.local/bin/loom` (this dispatcher) | Machine-level runtime driver | `start stop status sweep update` |
+| `~/.local/bin/loom` (this dispatcher) | Machine-level runtime driver | `start stop restart status sweep update` |
 | `./.loom/bin/loom` | Per-repo **tmux agent-pool** manager | `start status health stop attach send scale logs` |
 
 Three verbs collide by name — `start`, `stop`, `status` — and mean *different
@@ -70,6 +71,10 @@ machine dispatcher. The dispatcher resolves this by **detecting** a nearby
   and prints a disambiguation naming *both* surfaces, then exits non-zero — it
   never silently runs the wrong one. Force the machine surface with
   `loom start --machine`, or run the pool with `./.loom/bin/loom start`.
+  `restart` (#4229) gets the **same guard**, even though the per-repo pool
+  manager has no `restart` verb of its own — guard consistency across the
+  three process-mutating verbs is cheaper than explaining why `restart` is the
+  odd one out.
 - **`status`** (read-only, and required by AC7 to produce output from inside a
   repo): the dispatcher prints machine-level status and a clearly-labelled line
   pointing at the per-repo pool manager (`… run: ./.loom/bin/loom status`). It
@@ -99,6 +104,85 @@ says so explicitly — it does **not** present a `jq`-less host as "no config".
 `loom-daemon-update.sh` (built by #3968, extended by the shipped #4055 self-update
 loop). It implements **no** rebuild / reprovision / restart logic itself, so it
 neither pre-empts #4017 (auto-rebuild-when-stale) nor duplicates #4055.
+
+## Machine mode: LOOM_MACHINE_CHECKOUT hand-off (Phase 3b, #4229)
+
+Phase 3a shipped `start`/`stop`/`update` as delegates, but each of the three
+lifecycle scripts (`loom-daemon-start.sh`, `-stop.sh`, `-update.sh`) still
+resolved its own operating root by walking up from `$PWD`
+(`find_repo_root()`), independent of what this dispatcher had already
+resolved. That produced two concrete gaps, closed here:
+
+1. **`loom update` failed outside a Loom source checkout.** From a consumer
+   repo, `find_repo_root()` found the consumer repo (no
+   `loom-daemon/Cargo.toml` there) and refused; from a non-repo directory it
+   found nothing at all and refused with "Not in a Loom workspace" — even
+   though this dispatcher had *already* resolved and validated the machine
+   checkout.
+2. **`loom start`/`stop` bound machine-global daemon state to whichever repo
+   they were invoked from.** The launchd label (`com.rjwalters.loom-daemon`)
+   is a machine-wide singleton, but the rendered plist's `WorkingDirectory`
+   and the `.daemon.pid`/`.daemon.flags` files were `$REPO_ROOT`-relative — so
+   `loom start` from repo A and `loom update` from repo B could read/write two
+   different pid/flags files against the same launchd job.
+
+**The fix**: every verb that delegates into the checkout (`start`, `stop`,
+`update`, `restart`) exports `LOOM_MACHINE_CHECKOUT=<resolved checkout>` before
+exec'ing/invoking its lifecycle-script delegate. Each lifecycle script now
+checks this variable *first*, ahead of its `$PWD`-based `find_repo_root()`
+fallback:
+
+- **Set** (machine mode — always true for a dispatcher-driven invocation): the
+  checkout is used as the operating root (plist `WorkingDirectory`, the
+  `loom-daemon/Cargo.toml` rebuild target for `update`) **regardless of
+  `$PWD`**, and runtime artifacts — `.daemon.pid`, `.daemon.flags`, the
+  startup log — resolve under `$HOME/.loom` (the pid/flags decision below),
+  not under the checkout or the invoking directory.
+- **Unset** (direct invocation of a lifecycle script, no dispatcher — the
+  pre-#4229 dev workflow): every script behaves **byte-for-byte** as before,
+  `$PWD`-based `find_repo_root()` included. Machine mode is strictly additive.
+
+### The pid/flags relocation decision
+
+`#4042` already established that a `.loom/.daemon.pid` file is an unreliable
+running-state source under launchd (`KeepAlive:{SuccessfulExit:true}` assigns
+a fresh pid on every supervised relaunch) — which argued for dropping pid
+files entirely under launchd and treating `launchctl print` as the sole
+source of truth. This unit takes the **narrower, lower-risk option** instead:
+relocate `.daemon.pid`/`.daemon.flags`/the startup log from
+`$REPO_ROOT/.loom/` to `$HOME/.loom/` in machine mode, rather than removing
+pid-file tracking altogether. `$HOME/.loom/` is not new state — it is the
+**existing** machine-level state home (socket, token pool, `activity.db`,
+`daemon.log` already live there); this only adds a few more files to a
+directory that was already the machine-level source of truth, and the
+pid-file/nohup fallback tier every lifecycle script's own ownership-detection
+logic already has (see `loom-daemon-update.sh`'s `DAEMON_MANAGER` resolution)
+keeps working unchanged. No existing state (socket, tokens, `activity.db`,
+logs) moves. Dropping pid files entirely under launchd remains available as a
+future, more invasive follow-up if the pid-file tier ever proves more
+confusing than useful in machine mode.
+
+### `restart` verb (Gap 3)
+
+`loom restart` mirrors `start`/`stop` — same collision guard — and prefers a
+**drain-and-roll** restart: it first tries the daemon's own supervised restart
+IPC (`loom-daemon restart`, #4077), which never tears down in-flight sweep
+children (unlike a `launchctl bootout`). If that is unavailable (not
+launchd-managed) or refused (not currently running, or a pre-#4077 binary), it
+falls back to a plain stop-then-start via the same checkout-resolved
+lifecycle-script delegates.
+
+### Supervision (reboot/crash) — macOS done, Linux deferred
+
+Reboot/crash supervision itself (as opposed to the workdir/pid-file relocation
+above) is already implemented and documented for macOS via launchd —
+`RunAtLoad` (#3972), `KeepAlive:{SuccessfulExit:true}` restart-only relaunch
+(#4054), and a `StartInterval` autonomy-loss watchdog (#4011), all resolved
+through the `gui/<uid>` ↦ `user/<uid>` domain fallback (#4130). See
+[`daemon-reference.md`](daemon-reference.md) → Operability for the full
+writeup. **Linux has no equivalent** — the non-Darwin path is a plain `nohup …
+&` with no reboot/crash recovery and no watchdog. This is tracked as a named
+follow-up, #4260, rather than designed inline here.
 
 ## Uninstall semantics
 

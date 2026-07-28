@@ -1164,6 +1164,62 @@ else
 fi
 
 # ============================================================
+# M1. Machine mode (Epic #3835 Phase 3b, #4229): LOOM_MACHINE_CHECKOUT lets
+#     `--check` rebuild-detect against the CHECKOUT's source tree even when
+#     $PWD is a totally unrelated non-Loom directory -- the concrete Gap 1
+#     regression this issue closes ("only works inside a Loom source
+#     checkout"). HOME is overridden to a scratch dir so DAEMON_STATE_HOME
+#     ($HOME/.loom in machine mode) never touches the real operator ~/.loom,
+#     matching the rest of this suite's isolation discipline.
+# ============================================================
+WM1="$BASE_WORKDIR/wm1-checkout"
+new_fixture "$WM1"
+HEADM1="$(cd "$WM1" && git rev-parse --short HEAD)"
+write_fake_daemon "$WM1/installed-loom-daemon" "$HEADM1" "$WM1/marker"
+NON_LOOM_DIR="$BASE_WORKDIR/wm1-non-loom-cwd"
+mkdir -p "$NON_LOOM_DIR"
+HOME_WM1="$BASE_WORKDIR/wm1-home"
+mkdir -p "$HOME_WM1"
+out=$( cd "$NON_LOOM_DIR" && PATH="$TEST_PATH" HOME="$HOME_WM1" LOOM_MACHINE_CHECKOUT="$WM1" \
+    LOOM_DAEMON_BIN="$WM1/installed-loom-daemon" \
+    bash "$UPDATE_SCRIPT" --check; echo "EXIT=$?" )
+rc=$(echo "$out" | grep -o 'EXIT=[0-9]*' | cut -d= -f2)
+assert_eq "0" "$rc" "machine mode: --check from an unrelated non-Loom \$PWD resolves the checkout as source tree (Gap 1)"
+TESTS_RUN=$((TESTS_RUN + 1))
+if echo "$out" | grep -q "only works inside a Loom source checkout"; then
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} machine mode: never refuses with the dev-mode 'source checkout' error"
+    echo "  output: $out"
+else
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} machine mode: never refuses with the dev-mode 'source checkout' error"
+fi
+TESTS_RUN=$((TESTS_RUN + 1))
+if echo "$out" | grep -qF "$WM1"; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} machine mode: reports the machine checkout as the resolved source tree"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} machine mode: reports the machine checkout as the resolved source tree"
+    echo "  output: $out"
+fi
+
+# Dev-mode fallback (scope guard, filed AC5): the SAME non-Loom directory,
+# invoked directly (no LOOM_MACHINE_CHECKOUT -- no dispatcher), still refuses
+# exactly as before #4229. Machine mode is additive, never a replacement.
+out_dev=$( cd "$NON_LOOM_DIR" && PATH="$TEST_PATH" HOME="$HOME_WM1" bash "$UPDATE_SCRIPT" --check 2>&1 )
+rc_dev=$?
+assert_eq "1" "$rc_dev" "dev-mode fallback unchanged: --check from a non-Loom \$PWD (no dispatcher) still exits 1"
+TESTS_RUN=$((TESTS_RUN + 1))
+if echo "$out_dev" | grep -qi "Not in a Loom workspace"; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} dev-mode fallback unchanged: reports 'Not in a Loom workspace'"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} dev-mode fallback unchanged: reports 'Not in a Loom workspace'"
+fi
+
+# ============================================================
 # 25. Launchd-sandbox guards (#4078): the whole suite exercises the REAL
 #     start/stop scripts, so prove it never reached the operator's live daemon.
 #     (a) The suite-level decoy loom-daemon is still alive — no by-name kill

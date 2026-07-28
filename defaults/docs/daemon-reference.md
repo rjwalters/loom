@@ -1414,13 +1414,21 @@ not the daemon, and is a separate follow-up.
 
 ## Operability — config, start/stop, E2E (Phase D, #3813)
 
-> **Machine-level `loom` dispatcher (Epic #3835 Phase 3a, #4157).** A machine-level
-> `loom` entry point at `~/.local/bin/loom` (sibling of `~/.local/bin/loom-daemon`)
-> resolves the `~/.local/share/loom` checkout and exec's into it —
-> `loom start|stop|status|sweep|update`. It is distinct from the per-repo tmux
-> agent-pool manager `./.loom/bin/loom`; the name-collision resolution, checkout
-> layout, and the thin-`update` boundary are documented in
-> [`machine-dispatcher.md`](machine-dispatcher.md).
+> **Machine-level `loom` dispatcher (Epic #3835 Phase 3a #4157, Phase 3b #4229).**
+> A machine-level `loom` entry point at `~/.local/bin/loom` (sibling of
+> `~/.local/bin/loom-daemon`) resolves the `~/.local/share/loom` checkout and
+> exec's into it — `loom start|stop|restart|status|sweep|update`. It is distinct
+> from the per-repo tmux agent-pool manager `./.loom/bin/loom`; the
+> name-collision resolution, checkout layout, and the thin-`update` boundary
+> are documented in [`machine-dispatcher.md`](machine-dispatcher.md). Every
+> delegating verb hands its lifecycle-script delegate
+> (`loom-daemon-start.sh`/`-stop.sh`/`-update.sh`) the resolved checkout via
+> `LOOM_MACHINE_CHECKOUT`, so the plist `WorkingDirectory` and the
+> `.daemon.pid`/`.daemon.flags`/startup-log home resolve consistently —
+> `$HOME/.loom`, not a `$PWD`-derived repo — regardless of which directory
+> `loom` was invoked from (#4229). Direct invocation of a lifecycle script (no
+> dispatcher) is unaffected: the pre-#4229 `$PWD`-based `find_repo_root()`
+> contract remains the fallback, unchanged.
 
 Phases A–C built the autonomous *engine* (work finder, dynamic concurrency,
 main-health gate) as env-var-only surfaces. Phase D (#3813) adds the
@@ -2099,8 +2107,12 @@ process:
   per-user domain (`gui/<uid>` with an active GUI login, else the SSH-reachable
   `user/<uid>` background domain — #4130) instead of a plain `nohup … &` (#3972 —
   see "macOS session-bootstrap hazard" below); on Linux it stays a plain nohup
-  background job,
-- backgrounds the daemon and writes a PID file at `.loom/.daemon.pid` (gitignored),
+  background job with no reboot/crash supervision (deferred to #4260),
+- backgrounds the daemon and writes a PID file at `.loom/.daemon.pid` (gitignored)
+  — or, in **machine mode** (dispatcher-driven, `LOOM_MACHINE_CHECKOUT` set,
+  #4229), at `$HOME/.loom/.daemon.pid` so the same machine-wide launchd
+  singleton is tracked consistently no matter which repo `loom start` ran
+  from; see [`machine-dispatcher.md`](machine-dispatcher.md#the-pidflags-relocation-decision),
 - refuses a second start when the PID file points at a live process, and surfaces
   the daemon's own **singleton-guard** refusal (#3806) — if the backgrounded
   process exits immediately it prints the startup-log tail instead of leaving a

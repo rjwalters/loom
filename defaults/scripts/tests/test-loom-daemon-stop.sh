@@ -335,6 +335,63 @@ else
     echo -e "${RED}✗${NC} --help documents --restarting and the autonomy-desired marker"
 fi
 
+# ---------- machine mode (Epic #3835 Phase 3b, #4229) ----------
+# LOOM_MACHINE_CHECKOUT makes the pid-file home resolve from $HOME/.loom
+# instead of $PWD's repo -- and must work even from a directory with NO
+# .loom/ at all (unlike the dev-mode fallback, which requires one). Every
+# write below targets a SCRATCH $HOME, never the real operator ~/.loom.
+MACHINE_HOME="$(mktemp -d)"
+mkdir -p "$MACHINE_HOME/.loom"
+MACHINE_CHECKOUT="$(mktemp -d)"
+NON_REPO_DIR="$(mktemp -d)"
+
+( sleep 30 & echo $! > "$MACHINE_HOME/.loom/.daemon.pid" )
+machine_pid=$(cat "$MACHINE_HOME/.loom/.daemon.pid")
+out_machine=$( cd "$NON_REPO_DIR" && HOME="$MACHINE_HOME" LOOM_MACHINE_CHECKOUT="$MACHINE_CHECKOUT" \
+    LOOM_LAUNCHD_LABEL="$FAKE_LABEL" LOOM_DAEMON_STOP_GRACE_SECS=2 bash "$STOP_SCRIPT" 2>&1 )
+rc_machine=$?
+assert_eq "0" "$rc_machine" "machine mode: stop from a non-repo dir exits 0"
+TESTS_RUN=$((TESTS_RUN + 1))
+if ! echo "$out_machine" | grep -qi "Not in a Loom workspace"; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} machine mode: never hits the dev-mode 'Not in a Loom workspace' refusal"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} machine mode: never hits the dev-mode 'Not in a Loom workspace' refusal"
+fi
+TESTS_RUN=$((TESTS_RUN + 1))
+if ! kill -0 "$machine_pid" 2>/dev/null; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} machine mode: stop resolves the pid file under \$HOME/.loom (not \$PWD) and kills it"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    kill -9 "$machine_pid" 2>/dev/null || true
+    echo -e "${RED}✗${NC} machine mode: stop resolves the pid file under \$HOME/.loom (not \$PWD) and kills it"
+fi
+TESTS_RUN=$((TESTS_RUN + 1))
+if [[ ! -d "$NON_REPO_DIR/.loom" ]]; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} machine mode: stop does not require (or create) .loom/ at \$PWD"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} machine mode: stop does not require (or create) .loom/ at \$PWD"
+fi
+
+# Dev-mode fallback (scope guard): direct invocation with NO LOOM_MACHINE_CHECKOUT
+# from a non-repo directory still refuses exactly as before #4229.
+out_dev=$( cd "$NON_REPO_DIR" && LOOM_LAUNCHD_LABEL="$FAKE_LABEL" bash "$STOP_SCRIPT" 2>&1 )
+rc_dev=$?
+assert_eq "1" "$rc_dev" "dev-mode fallback unchanged: stop from a non-repo dir (no dispatcher) still exits 1"
+TESTS_RUN=$((TESTS_RUN + 1))
+if echo "$out_dev" | grep -qi "Not in a Loom workspace"; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} dev-mode fallback unchanged: reports 'Not in a Loom workspace'"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} dev-mode fallback unchanged: reports 'Not in a Loom workspace'"
+fi
+rm -rf "$MACHINE_HOME" "$MACHINE_CHECKOUT" "$NON_REPO_DIR"
+
 # ---------- summary ----------
 # Final suite-level decoy guard (#4078): nothing above should have killed the
 # by-name-matchable decoy spawned at suite start.

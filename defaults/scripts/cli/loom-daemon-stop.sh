@@ -70,6 +70,14 @@
 #                                 A start done with --no-launchd / LOOM_DAEMON_LAUNCHD=0
 #                                 must get a stop that never reads or mutates the
 #                                 machine-global launchd domain (issue #4078).
+#   LOOM_MACHINE_CHECKOUT         Machine mode (Epic #3835 Phase 3b, #4229): set
+#                                 by the `scripts/loom` dispatcher before it execs
+#                                 this script. When set, the pid file is read from
+#                                 the machine-level state home (~/.loom) instead of
+#                                 $PWD's repo -- matching loom-daemon-start.sh, so
+#                                 `loom stop` always targets the same machine-wide
+#                                 daemon regardless of the invoking directory.
+#                                 Direct invocation (no dispatcher) never sets it.
 #
 # Exit codes:
 #   0  daemon stopped (or was not running)
@@ -125,12 +133,27 @@ while [[ $# -gt 0 ]]; do
 done
 
 REPO_ROOT=$(find_repo_root)
-if [[ -z "$REPO_ROOT" ]]; then
+
+# ---------- machine-mode resolution (Epic #3835 Phase 3b, #4229) ----------
+# Mirrors loom-daemon-start.sh: LOOM_MACHINE_CHECKOUT (set by the dispatcher)
+# is authoritative regardless of $PWD, so `loom stop` always resolves the SAME
+# pid file loom-daemon-start.sh wrote for the machine-wide singleton daemon --
+# not a different $PWD-derived one. Direct invocation is unaffected.
+MACHINE_CHECKOUT="${LOOM_MACHINE_CHECKOUT:-}"
+if [[ -n "$MACHINE_CHECKOUT" ]]; then
+    if [[ ! -d "$MACHINE_CHECKOUT" ]]; then
+        err "LOOM_MACHINE_CHECKOUT does not exist: $MACHINE_CHECKOUT"
+        exit 1
+    fi
+    DAEMON_STATE_HOME="$HOME/.loom"
+elif [[ -n "$REPO_ROOT" ]]; then
+    DAEMON_STATE_HOME="$REPO_ROOT/.loom"
+else
     err "Not in a Loom workspace (.loom directory not found)"
     exit 1
 fi
 
-PID_FILE="$REPO_ROOT/.loom/.daemon.pid"
+PID_FILE="$DAEMON_STATE_HOME/.daemon.pid"
 GRACE_SECS="${LOOM_DAEMON_STOP_GRACE_SECS:-10}"
 
 # ---------- autonomy-desired marker + watchdog (#4011) ----------
