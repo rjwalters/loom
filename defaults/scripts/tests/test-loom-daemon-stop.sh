@@ -374,9 +374,9 @@ EOF
 make_sd_stop_stub
 mkdir -p "$WORKDIR/.loom"
 printf 'started_at=x\n' > "$WORKDIR/.loom/autonomy-desired"
-sd_out=$( cd "$WORKDIR" && PATH="$SD_BIN:$PATH" LOOM_SYSTEMD_FORCE=1 \
+( cd "$WORKDIR" && PATH="$SD_BIN:$PATH" LOOM_SYSTEMD_FORCE=1 \
     LOOM_LAUNCHD_LABEL="$FAKE_LABEL" LOOM_AUTONOMY_MARKER="$WORKDIR/.loom/autonomy-desired" \
-    bash "$STOP_SCRIPT" 2>&1 )
+    bash "$STOP_SCRIPT" >/dev/null 2>&1 )
 sd_rc=$?
 assert_eq "0" "$sd_rc" "systemd tier: stop of an active unit exits 0"
 TESTS_RUN=$((TESTS_RUN + 1))
@@ -430,8 +430,8 @@ fi
 #      interaction, so NO systemctl call is made even with the stub on PATH and
 #      detection forced — the stop routes to the pid/nohup tier.
 make_sd_stop_stub
-sym_out=$( cd "$WORKDIR" && PATH="$SD_BIN:$PATH" LOOM_SYSTEMD_FORCE=1 LOOM_DAEMON_SYSTEMD=0 \
-    LOOM_LAUNCHD_LABEL="$FAKE_LABEL" bash "$STOP_SCRIPT" 2>&1 )
+( cd "$WORKDIR" && PATH="$SD_BIN:$PATH" LOOM_SYSTEMD_FORCE=1 LOOM_DAEMON_SYSTEMD=0 \
+    LOOM_LAUNCHD_LABEL="$FAKE_LABEL" bash "$STOP_SCRIPT" >/dev/null 2>&1 )
 sym_rc=$?
 assert_eq "0" "$sym_rc" "LOOM_DAEMON_SYSTEMD=0: stop exits 0 (pid/nohup tier)"
 TESTS_RUN=$((TESTS_RUN + 1))
