@@ -74,6 +74,14 @@
 #                        user/$(id -u)); honored verbatim, else auto-resolved
 #                        gui→user (#4130). A pinned domain that does not resolve
 #                        fails loudly at bootstrap rather than falling back.
+#   LOOM_DAEMON_PATH        Full override for the rendered plist's PATH (#4172).
+#                        Used verbatim -- no canonical fallback is appended. For
+#                        a host that needs a wholly custom PATH.
+#   LOOM_DAEMON_PATH_EXTRA  Extra dir(s) to prepend onto the canonical minimal
+#                        PATH (#4172) instead of overriding it entirely -- for
+#                        a host that needs one or two additional dirs (e.g. a
+#                        project-local toolchain) without inheriting the WHOLE
+#                        invoking shell's interactive PATH.
 #
 # Exit codes:
 #   0  daemon started (or already running)
@@ -160,6 +168,59 @@ if [[ -r "$_LOOM_LAUNCHD_LIB_DIR/launchd-domain.sh" ]]; then
     source "$_LOOM_LAUNCHD_LIB_DIR/launchd-domain.sh"
 fi
 
+# resolve_plist_path() — the deterministic PATH baked into every rendered
+# plist (daemon + watchdog), issue #4172. Previously the rendered PATH was
+# "$PATH:<canonical fallback>" -- the INVOKING SHELL's entire interactive
+# PATH prefixed onto the fallback set -- which made a re-render non-hermetic:
+# whoever's shell happened to run `loom-daemon-start.sh` (or
+# `loom-daemon-update.sh --relaunch`) determined the daemon's tool
+# resolution, and an unrelated project-specific toolchain earlier in that
+# PATH could shadow the binaries the daemon and its sweep children expect.
+# Resolution order (highest precedence first), always logged to STDERR (never
+# stdout, so `--print-plist`'s XML output stays pipeable/diffable):
+#   1. LOOM_DAEMON_PATH      -- full override, used verbatim (no fallback
+#                               appended). For a host that needs a wholly
+#                               custom PATH.
+#   2. LOOM_DAEMON_PATH_EXTRA -- prepended onto the canonical minimal PATH,
+#                               for a host that needs one or two additional
+#                               dirs without inheriting the whole invoking
+#                               shell's interactive PATH.
+#   3. Default: the canonical minimal PATH -- exactly the pre-#4172 fallback
+#      set (~/.local/bin, ~/.cargo/bin, Homebrew, standard bin dirs, already
+#      sufficient for gh/git/cargo/python3), with NO shell-PATH prefix. This
+#      makes a bare re-render byte-for-byte reproducible across hosts/sessions.
+resolve_plist_path() {
+    local canonical="${HOME}/.local/bin:${HOME}/.cargo/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+    if [[ -n "${LOOM_DAEMON_PATH:-}" ]]; then
+        echo "Rendered plist PATH: full override via LOOM_DAEMON_PATH -> ${LOOM_DAEMON_PATH}" >&2
+        printf '%s' "${LOOM_DAEMON_PATH}"
+        return 0
+    fi
+    if [[ -n "${LOOM_DAEMON_PATH_EXTRA:-}" ]]; then
+        echo "Rendered plist PATH: canonical minimal PATH + LOOM_DAEMON_PATH_EXTRA -> ${LOOM_DAEMON_PATH_EXTRA}:${canonical}" >&2
+        printf '%s' "${LOOM_DAEMON_PATH_EXTRA}:${canonical}"
+        return 0
+    fi
+    echo "Rendered plist PATH: canonical minimal PATH (deterministic default) -> ${canonical}" >&2
+    printf '%s' "$canonical"
+}
+
+# extract_plist_path_value <plist_file> — best-effort textual extraction of
+# the <key>PATH</key>\n<string>VALUE</string> pair from a rendered launchd
+# plist. Deliberately NOT a general plist parser (no plutil/jq dependency) --
+# every plist this script renders follows that exact two-line shape, so a
+# simple awk match is sufficient. Used only by the --print-plist drift check
+# below; returns empty (and exit 1) when the key is absent or the file is
+# missing.
+extract_plist_path_value() {
+    local plist_file="$1"
+    [[ -f "$plist_file" ]] || return 1
+    awk '
+        /<key>PATH<\/key>/ { want=1; next }
+        want { sub(/^[ \t]*<string>/, ""); sub(/<\/string>[ \t]*$/, ""); print; exit }
+    ' "$plist_file"
+}
+
 # render_launchd_plist <label> <daemon_bin> <workdir> <log_path>
 # Prints the LaunchAgent plist XML to stdout. Mirrors the hand-written plist
 # that validated the #3972 fix during the incident
@@ -191,17 +252,28 @@ fi
 # (nothing would bring it back). Because it survives in the plist, the relaunched
 # daemon still sees it.
 #
-# The PATH is the CURRENT PATH plus a fallback set (~/.local/bin, ~/.cargo/bin,
-# Homebrew, standard bin dirs) so `gh`, `git`, `cargo`, and `python3` resolve
-# inside the LaunchAgent's minimal launchd environment even if the interactive
-# shell's PATH customizations aren't present there. Every already-exported
-# LOOM_* / GH_TOKEN / GITEA_TOKEN / FORGE_TOKEN var is forwarded verbatim so
-# the launchd job sees EXACTLY the autonomy flags and auth this invocation
-# resolved -- never wider, never narrower (#3972 AC: "preserves the current
-# flag semantics").
+# The PATH baked into the plist is DETERMINISTIC (#4172), not derived from the
+# invoking shell's PATH. It used to be "$PATH:<fallback>" -- the invoking
+# shell/session's ENTIRE interactive PATH prefixed onto a fallback set -- so a
+# re-render (e.g. a `loom-daemon-update.sh --relaunch` run from an interactive
+# terminal with a large project-specific PATH) silently replaced whatever PATH
+# the live plist carried with whoever's shell happened to run the roll:
+# non-hermetic, non-reproducible across hosts/sessions, and able to let an
+# unrelated toolchain earlier in that PATH shadow the binaries the daemon and
+# its sweep children expect (gh/git/cargo/python3). resolve_plist_path() (see
+# above) instead resolves, in order: an explicit LOOM_DAEMON_PATH override
+# (verbatim), LOOM_DAEMON_PATH_EXTRA prepended onto the canonical minimal PATH,
+# or the canonical minimal PATH alone (~/.local/bin, ~/.cargo/bin, Homebrew,
+# standard bin dirs -- the same fallback set this always carried, just no
+# longer prefixed with the invoking shell's PATH). It is computed exactly once
+# per script invocation into $PLIST_PATH_VALUE and logs its choice to stderr.
+# Every already-exported LOOM_* / GH_TOKEN / GITEA_TOKEN / FORGE_TOKEN var is
+# still forwarded verbatim so the launchd job sees EXACTLY the autonomy flags
+# and auth this invocation resolved -- never wider, never narrower (#3972 AC:
+# "preserves the current flag semantics").
 render_launchd_plist() {
     local label="$1" bin="$2" workdir="$3" log_path="$4"
-    local plist_path_value="${PATH}:${HOME}/.local/bin:${HOME}/.cargo/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+    local plist_path_value="$PLIST_PATH_VALUE"
 
     local env_entries=""
     env_entries+="        <key>PATH</key>\n        <string>$(xml_escape "$plist_path_value")</string>\n"
@@ -302,9 +374,11 @@ locate_watchdog_script() {
 }
 
 # render_watchdog_plist <label> <watchdog_script> <workdir> <log_path> <interval_secs>
+# Uses the SAME deterministic PATH as render_launchd_plist (#4172) -- see the
+# resolve_plist_path() comment above render_launchd_plist for the rationale.
 render_watchdog_plist() {
     local label="$1" script="$2" workdir="$3" log_path="$4" interval="$5"
-    local plist_path_value="${PATH}:${HOME}/.local/bin:${HOME}/.cargo/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+    local plist_path_value="$PLIST_PATH_VALUE"
     printf '<?xml version="1.0" encoding="UTF-8"?>\n'
     printf '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n'
     printf '<plist version="1.0">\n<dict>\n'
@@ -405,6 +479,12 @@ if [[ -z "$DAEMON_BIN" ]]; then
     echo "Build it (cargo build --release -p loom-daemon) or set LOOM_DAEMON_BIN=/path/to/loom-daemon" >&2
     exit 1
 fi
+
+# ---------- deterministic plist PATH (#4172) ----------
+# Resolved ONCE per invocation so both the daemon plist and the watchdog
+# plist (below) render the identical PATH, and so the choice is logged to
+# stderr exactly once per run rather than once per plist rendered.
+PLIST_PATH_VALUE="$(resolve_plist_path)"
 
 PID_FILE="$REPO_ROOT/.loom/.daemon.pid"
 SOCKET_PATH="${LOOM_SOCKET_PATH:-$HOME/.loom/loom-daemon.sock}"
@@ -544,6 +624,23 @@ fi
 # ---------- --print-plist: pure inspection, no side effects ----------
 if [[ "$PRINT_PLIST" == "true" ]]; then
     render_launchd_plist "$(resolve_launchd_label)" "$DAEMON_BIN" "$REPO_ROOT" "$START_LOG"
+    # PATH-drift check (#4172): if a live plist is already installed for this
+    # label, compare its PATH against the one just rendered and warn (stderr
+    # only -- READ-ONLY, no side effect) when they differ. This is what makes
+    # a PATH change from the live plist visible at inspection/roll time
+    # instead of silently swapping it out on the next real start/relaunch.
+    _live_plist="$HOME/Library/LaunchAgents/$(resolve_launchd_label).plist"
+    if [[ -f "$_live_plist" ]]; then
+        _live_path="$(extract_plist_path_value "$_live_plist" 2>/dev/null || true)"
+        if [[ -n "$_live_path" && "$_live_path" != "$PLIST_PATH_VALUE" ]]; then
+            {
+                echo ""
+                echo "PATH DRIFT DETECTED vs the installed plist ($_live_plist):"
+                echo "- live: $_live_path"
+                echo "+ new:  $PLIST_PATH_VALUE"
+            } >&2
+        fi
+    fi
     exit 0
 fi
 

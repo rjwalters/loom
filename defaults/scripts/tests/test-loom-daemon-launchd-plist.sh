@@ -181,6 +181,84 @@ default_plist=$( cd "$WORKDIR" && env -u LOOM_LAUNCHD_DOMAIN -u LOOM_WORK_FINDER
 assert_not_contains "$default_plist" "gui/$(id -u)" "default plist carries no gui/<uid> domain token (#4130 — domain is load-time, GUI path unchanged)"
 assert_not_contains "$default_plist" "user/$(id -u)" "default plist carries no user/<uid> domain token (#4130 — domain is load-time)"
 
+# ---------- #4172: deterministic plist PATH ----------
+# Root cause under test: the rendered plist's PATH used to be "$PATH:<canonical
+# fallback>" -- the INVOKING SHELL's entire interactive PATH prefixed onto the
+# fallback set -- so a re-render (e.g. `loom-daemon-update.sh --relaunch`)
+# silently replaced whatever PATH the live plist carried with whoever's shell
+# happened to run the roll. Tests 10-14 below cover the fix: a deterministic
+# canonical-by-default PATH, an explicit full-override / extend-only escape
+# hatch, and a diff-friendly drift check against a previously-installed plist.
+
+# 10. Default (no LOOM_DAEMON_PATH / LOOM_DAEMON_PATH_EXTRA): the invoking
+#     shell's PATH is NOT prefixed onto the rendered plist -- a marker dir
+#     injected into PATH must not leak through, while the canonical fallback
+#     set is still present (unchanged from before #4172).
+MARKER_DIR="/tmp/loom-test-marker-4172-$$"
+det_out=$( cd "$WORKDIR" && env -u LOOM_WORK_FINDER -u LOOM_MAIN_HEALTH_GATE -u LOOM_DAEMON_PATH -u LOOM_DAEMON_PATH_EXTRA \
+    PATH="${MARKER_DIR}:${PATH}" LOOM_DAEMON_BIN="$FAKE_BIN" bash "$START_SCRIPT" --print-plist 2>/dev/null )
+assert_not_contains "$det_out" "$MARKER_DIR" "default plist PATH does NOT leak the invoking shell's PATH (#4172 — deterministic, not shell-derived)"
+assert_contains "$det_out" "/.local/bin" "default plist PATH still includes the canonical ~/.local/bin fallback"
+assert_contains "$det_out" "/opt/homebrew/bin" "default plist PATH still includes the canonical Homebrew fallback"
+
+# 11. LOOM_DAEMON_PATH is a FULL override -- used verbatim, no canonical
+#     fallback appended.
+override_out=$( cd "$WORKDIR" && env -u LOOM_WORK_FINDER -u LOOM_MAIN_HEALTH_GATE -u LOOM_DAEMON_PATH_EXTRA \
+    LOOM_DAEMON_PATH="/custom/override/bin:/custom/override/sbin" \
+    LOOM_DAEMON_BIN="$FAKE_BIN" bash "$START_SCRIPT" --print-plist 2>/dev/null )
+assert_contains "$override_out" $'<key>PATH</key>\n        <string>/custom/override/bin:/custom/override/sbin</string>' "LOOM_DAEMON_PATH is used verbatim as the plist PATH"
+assert_not_contains "$override_out" "/opt/homebrew/bin" "LOOM_DAEMON_PATH override does NOT append the canonical fallback"
+
+# 12. LOOM_DAEMON_PATH_EXTRA prepends onto the canonical minimal PATH instead
+#     of replacing it entirely.
+extra_out=$( cd "$WORKDIR" && env -u LOOM_WORK_FINDER -u LOOM_MAIN_HEALTH_GATE -u LOOM_DAEMON_PATH \
+    LOOM_DAEMON_PATH_EXTRA="/extra/project/bin" \
+    LOOM_DAEMON_BIN="$FAKE_BIN" bash "$START_SCRIPT" --print-plist 2>/dev/null )
+assert_contains "$extra_out" "/extra/project/bin:" "LOOM_DAEMON_PATH_EXTRA is prepended onto the plist PATH"
+assert_contains "$extra_out" "/opt/homebrew/bin" "LOOM_DAEMON_PATH_EXTRA still carries the canonical Homebrew fallback"
+
+# 13. The chosen PATH is always logged (stderr) -- visible at every render,
+#     not just on inspection.
+log_out=$( cd "$WORKDIR" && env -u LOOM_WORK_FINDER -u LOOM_MAIN_HEALTH_GATE -u LOOM_DAEMON_PATH -u LOOM_DAEMON_PATH_EXTRA \
+    LOOM_DAEMON_BIN="$FAKE_BIN" bash "$START_SCRIPT" --print-plist 2>&1 >/dev/null )
+assert_contains "$log_out" "Rendered plist PATH: canonical minimal PATH (deterministic default)" "default render logs its PATH choice to stderr"
+log_override_out=$( cd "$WORKDIR" && env -u LOOM_WORK_FINDER -u LOOM_MAIN_HEALTH_GATE -u LOOM_DAEMON_PATH_EXTRA \
+    LOOM_DAEMON_PATH="/custom/override/bin" LOOM_DAEMON_BIN="$FAKE_BIN" bash "$START_SCRIPT" --print-plist 2>&1 >/dev/null )
+assert_contains "$log_override_out" "Rendered plist PATH: full override via LOOM_DAEMON_PATH" "LOOM_DAEMON_PATH override logs its source to stderr"
+
+# 14. --print-plist PATH-drift check: a change from a previously-installed
+#     live plist is visible (diff-friendly), not silently swapped out.
+#     Isolated via a scratch HOME so this never touches the operator's real
+#     ~/Library/LaunchAgents.
+NODRIFT_HOME="$WORKDIR/fakehome-nodrift"
+NODRIFT_LABEL="com.rjwalters.loom-daemon-nodrift-test"
+mkdir -p "$NODRIFT_HOME/Library/LaunchAgents"
+HOME="$NODRIFT_HOME" LOOM_LAUNCHD_LABEL="$NODRIFT_LABEL" LOOM_DAEMON_BIN="$FAKE_BIN" \
+    env -u LOOM_DAEMON_PATH -u LOOM_DAEMON_PATH_EXTRA -u LOOM_WORK_FINDER -u LOOM_MAIN_HEALTH_GATE \
+    bash "$START_SCRIPT" --print-plist > "$NODRIFT_HOME/Library/LaunchAgents/${NODRIFT_LABEL}.plist" 2>/dev/null
+nodrift_out=$( HOME="$NODRIFT_HOME" LOOM_LAUNCHD_LABEL="$NODRIFT_LABEL" LOOM_DAEMON_BIN="$FAKE_BIN" \
+    env -u LOOM_DAEMON_PATH -u LOOM_DAEMON_PATH_EXTRA -u LOOM_WORK_FINDER -u LOOM_MAIN_HEALTH_GATE \
+    bash "$START_SCRIPT" --print-plist 2>&1 >/dev/null )
+assert_not_contains "$nodrift_out" "PATH DRIFT DETECTED" "no drift warning when the live plist's PATH already matches the freshly-rendered one"
+
+DRIFT_HOME="$WORKDIR/fakehome-drift"
+DRIFT_LABEL="com.rjwalters.loom-daemon-drift-test"
+mkdir -p "$DRIFT_HOME/Library/LaunchAgents"
+cat > "$DRIFT_HOME/Library/LaunchAgents/${DRIFT_LABEL}.plist" <<'PLISTEOF'
+<?xml version="1.0" encoding="UTF-8"?>
+<plist version="1.0"><dict>
+<key>PATH</key>
+<string>/old/stale/shell/path:/usr/bin</string>
+</dict></plist>
+PLISTEOF
+drift_out=$( HOME="$DRIFT_HOME" LOOM_LAUNCHD_LABEL="$DRIFT_LABEL" LOOM_DAEMON_BIN="$FAKE_BIN" \
+    env -u LOOM_DAEMON_PATH -u LOOM_DAEMON_PATH_EXTRA -u LOOM_WORK_FINDER -u LOOM_MAIN_HEALTH_GATE \
+    bash "$START_SCRIPT" --print-plist 2>&1 >/dev/null )
+assert_contains "$drift_out" "PATH DRIFT DETECTED" "a PATH change from the live plist is flagged at --print-plist time"
+assert_contains "$drift_out" "/old/stale/shell/path:/usr/bin" "drift warning shows the OLD (live) PATH value"
+assert_contains "$drift_out" "- live:" "drift warning is diff-friendly (- live / + new lines)"
+assert_contains "$drift_out" "+ new:" "drift warning is diff-friendly (- live / + new lines)"
+
 # ---------- summary ----------
 echo
 echo "Ran $TESTS_RUN tests: $TESTS_PASSED passed, $TESTS_FAILED failed"

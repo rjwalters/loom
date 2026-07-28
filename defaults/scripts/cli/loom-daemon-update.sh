@@ -360,8 +360,11 @@ launchd_job_pid() {
 # harvest_plist_env <plist> — echo the live plist's EnvironmentVariables,
 # restricted to exactly the keys render_launchd_plist itself forwards (LOOM_*,
 # GH_TOKEN, GITEA_TOKEN, FORGE_TOKEN) and EXCLUDING:
-#   - PATH / HOME     (start.sh rebuilds PATH from the live shell; round-tripping
-#                      the plist's already-extended PATH would grow it each roll),
+#   - PATH / HOME     (start.sh resolves PATH deterministically -- a pinned
+#                      canonical minimal PATH by default, or an explicit
+#                      LOOM_DAEMON_PATH / LOOM_DAEMON_PATH_EXTRA override,
+#                      #4172; round-tripping the plist's PATH here would
+#                      re-introduce the non-deterministic-render bug),
 #   - LOOM_DAEMON_SUPERVISOR (start.sh hardcodes it; re-exporting is pointless).
 # Emits one "<key>\t<base64(value)>" line per key so values containing spaces or
 # newlines survive. Fails loudly (return 2) when the plist is absent or
