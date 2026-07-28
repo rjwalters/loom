@@ -202,21 +202,46 @@ fn sweep_md_documents_effort_rung_grammar_and_fable() {
     );
 }
 
-/// #3702: the Curator complexity marker is documented as precedence tier 2.5
-/// with its one-bump / never-fable bound.
+/// #3702/#4238: the Curator complexity marker is documented as precedence
+/// tier 2.5, resolved through the `sweep.tierModels[<runtime>][<tier>]`
+/// tier→model map (PR #4278 replaced the earlier `sonnet → opus` one-tier
+/// bump with this map plus an `Exit 3` unconfigured fall-through), with its
+/// never-`fable` ceiling bound.
 #[test]
 fn sweep_md_documents_complexity_marker_tier() {
     let content = read_sweep_md();
-    // CONTRACT: the marker syntax and the `sonnet → opus` one-tier bump are
-    // stable identifiers. Keep EXACT.
+    // CONTRACT: the templated marker syntax, the tier-value list, the
+    // tier-model map identifier, and the resolver script name are stable
+    // identifiers. Keep EXACT. (No concrete model ID is asserted here — the
+    // doc-lint stays runtime-neutral per #4278's intent.)
     assert!(
-        content.contains("<!-- loom:complexity=complex -->"),
-        "sweep.md must document the `<!-- loom:complexity=complex -->` marker \
-         syntax (#3702 tier 2.5)"
+        content.contains("<!-- loom:complexity=<tier> -->"),
+        "sweep.md must document the `<!-- loom:complexity=<tier> -->` marker \
+         syntax (#3702/#4238 tier 2.5)"
     );
     assert!(
-        content.contains("sonnet → opus"),
-        "sweep.md must document the `sonnet → opus` one-tier bump (#3702 tier 2.5)"
+        content.contains("`mechanical` | `routine` | `complex`"),
+        "sweep.md must document the three complexity-marker values \
+         `mechanical` | `routine` | `complex` (#3702/#4238 tier 2.5)"
+    );
+    assert!(
+        content.contains("sweep.tierModels"),
+        "sweep.md must document the `sweep.tierModels` tier→model map that \
+         resolves the Tier 2.5 complexity marker (#4238, replacing the old \
+         `sonnet → opus` bump)"
+    );
+    assert!(
+        content.contains("resolve-tier-model.sh"),
+        "sweep.md must reference `resolve-tier-model.sh` as the resolver for \
+         the Tier 2.5 complexity marker (#4238)"
+    );
+    // CONTRACT (fall-through bound): `Exit 3` is the unconfigured-map
+    // fall-through that replaced the one-tier bump as the tier-2.5
+    // resolution semantics (#4238) — keep EXACT.
+    assert!(
+        content.contains("Exit 3"),
+        "sweep.md must document the `Exit 3` unconfigured tier/runtime \
+         fall-through for the Tier 2.5 complexity marker (#4238)"
     );
     // PROSE (structural): the tier is anchored by its NUMBER (`Tier 2.5`); the
     // "— Curator complexity marker" title text is prose that can be reworded.
@@ -225,14 +250,16 @@ fn sweep_md_documents_complexity_marker_tier() {
         "sweep.md must document the complexity marker as precedence `Tier 2.5` \
          (#3702) — asserted by tier number, not by exact title wording"
     );
-    // CONTRACT (bound): the never-to-`fable` ceiling is a hard bound; the
-    // backtick-wrapped `fable` makes it identifier-shaped. Pin the tight
-    // `never to `fable`` fragment (not the full "One bump maximum, …" sentence)
-    // so a reword of the lead-in survives while removing the ceiling fails.
+    // CONTRACT (bound): the never-`fable` ceiling is a hard bound. Pin the
+    // unique `` Never resolves to `fable` `` bullet lead-in (not a bare
+    // `fable` stem — the separate No-Fable-Judge paragraph also contains
+    // `fable` and would keep this assertion passing even if the tier-2.5
+    // ceiling bullet were deleted).
     assert!(
-        content.contains("never to `fable`"),
-        "sweep.md must document the marker's never-to-`fable` ceiling (#3702) — \
-         the marker can lift one tier and never reach the top rung"
+        content.contains("Never resolves to `fable`"),
+        "sweep.md must document the marker's `Never resolves to `fable`` \
+         ceiling (#3702/#4238) — the marker can lift one tier and never reach \
+         the top rung"
     );
 }
 
