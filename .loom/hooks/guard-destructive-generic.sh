@@ -1253,11 +1253,25 @@ ALWAYS_BLOCK_PATTERNS=(
     # scan. For a repo whose job is standing up and tearing down dev VMs the
     # teardown path (`terminate-instances`) is a first-class workflow, so it is
     # downgraded to an ask via the toggle-gated CLOUD_ASK_PATTERNS below (and
-    # fully bypassed when LOOM_GUARD_CLOUD=0 / guards.cloudCli:false). The other
-    # aws forms here stay ungated — they remain a hard safety floor (#3593).
+    # fully bypassed when LOOM_GUARD_CLOUD=0 / guards.cloudCli:false).
+    #
+    # NOTE: `aws iam delete` was likewise retiered OUT of this catastrophic
+    # scan — but to the UNGATED ask tier (ASK_PATTERNS below, alongside
+    # `gh release delete`), NOT to CLOUD_ASK_PATTERNS (#4216). Rationale:
+    # deleting an IAM credential is a legitimate, often security-POSITIVE step
+    # (revoking an exposed key whose replacement is already active) that a
+    # supervised operator must be able to run in-session — a hard block left
+    # only the undocumented script-file bypass. It stays UNGATED so a repo that
+    # set guards.cloudCli:false / LOOM_GUARD_CLOUD=0 for EC2-churn convenience
+    # would still ASK (never silently allow) on IAM deletion, and a headless
+    # sweep still effectively blocks (an ASK with no human to answer denies;
+    # see defaults/docs/guard-hooks.md). The remaining aws forms below stay
+    # ungated catastrophic denies — a hard safety floor (#3593): mass object /
+    # bucket deletion (`s3 rm --recursive`, `s3 rb`) and stack teardown
+    # (`cloudformation delete-stack`) were not part of the rotation incident and
+    # are deliberately kept as hard denies.
     'aws s3 rm.*--recursive'
     'aws s3 rb'
-    'aws iam delete'
     'aws cloudformation delete-stack'
 
     # Docker mass destruction
@@ -1411,9 +1425,22 @@ lifecycle_or_cloud_reason() {
     }'
 }
 
-_LIFECYCLE_REASON=$(lifecycle_or_cloud_reason "$COMMAND_NO_COMMENT" | head -1)
-if [[ -n "$_LIFECYCLE_REASON" ]]; then
-    deny "BLOCKED: $_LIFECYCLE_REASON" "lifecycle-or-cloud-delete"
+# Split the single deny call this used to share (#4216). System-lifecycle
+# commands (halt/reboot/poweroff/shutdown/init 0|6) are a hard safety floor and
+# stay DENY. The az/gcloud `… delete` cloud branch was retiered to the UNGATED
+# ask tier — mirroring the `aws iam delete` move above — so a supervised
+# operator is prompted rather than hard-blocked, while a headless sweep's
+# unanswered ASK still blocks (see defaults/docs/guard-hooks.md). A lifecycle
+# deny takes precedence over a cloud-delete ask in a compound command (e.g.
+# `az group delete …; halt`), so the hard floor is never downgraded.
+_LIFECYCLE_CLOUD_REASONS=$(lifecycle_or_cloud_reason "$COMMAND_NO_COMMENT")
+_LIFECYCLE_DENY=$(printf '%s\n' "$_LIFECYCLE_CLOUD_REASONS" | grep '^system lifecycle command:' | head -1)
+if [[ -n "$_LIFECYCLE_DENY" ]]; then
+    deny "BLOCKED: $_LIFECYCLE_DENY" "lifecycle"
+fi
+_CLOUD_DELETE_ASK=$(printf '%s\n' "$_LIFECYCLE_CLOUD_REASONS" | grep '^cloud resource deletion:' | head -1)
+if [[ -n "$_CLOUD_DELETE_ASK" ]]; then
+    ask "Command requires confirmation: $COMMAND ($_CLOUD_DELETE_ASK — retiered to the ungated ask tier in #4216; an interactive operator confirms, a headless session still blocks)" "cloud-delete-ask"
 fi
 
 # =============================================================================
@@ -1964,9 +1991,22 @@ ASK_PATTERNS=(
     # a repo opts IN via guards.reversibleGh (REVERSIBLE_GH_ASK_PATTERNS below).
     '(^|[;&|[:space:]])gh release delete'
 
-    # NOTE: cloud CLI (aws) + docker ASK patterns are NOT in this ungated array.
-    # They live in CLOUD_ASK_PATTERNS below, gated by cloud_guard_enabled() so
-    # cloud-dev repos can opt down (LOOM_GUARD_CLOUD=0 / guards.cloudCli:false).
+    # Cloud IAM credential deletion — retiered from the catastrophic ALWAYS_BLOCK
+    # list to this UNGATED ask tier (#4216). Kept OUT of CLOUD_ASK_PATTERNS on
+    # purpose: that array is gated by cloud_guard_enabled(), so a repo that set
+    # guards.cloudCli:false / LOOM_GUARD_CLOUD=0 for EC2-churn convenience would
+    # SILENTLY bypass IAM deletion too — an unacceptable weakening for credential
+    # deletion. Ungated here means: always prompt an interactive operator, never
+    # silently allow, and still block a headless sweep (an ASK with no human to
+    # answer denies, per defaults/docs/guard-hooks.md). The az/gcloud `… delete`
+    # peer is handled by the segment parser above, which splits its former deny
+    # into a lifecycle deny + this same cloud-delete ask.
+    '(^|[;&|[:space:]])aws iam delete'
+
+    # NOTE: the remaining cloud CLI (aws ec2/lambda) + docker ASK patterns are
+    # NOT in this ungated array. They live in CLOUD_ASK_PATTERNS below, gated by
+    # cloud_guard_enabled() so cloud-dev repos can opt down (LOOM_GUARD_CLOUD=0 /
+    # guards.cloudCli:false).
 
     # Service management
     '(^|[;&|[:space:]])systemctl restart'

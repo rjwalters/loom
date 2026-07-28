@@ -19,7 +19,7 @@ You can also add project-specific guards to protect read-only directories from a
 
 `guard-destructive.sh` blocks SQL DDL/DML patterns — `DROP DATABASE`, `DROP TABLE`, `DROP SCHEMA`, `TRUNCATE TABLE`, and `DELETE FROM` without a `WHERE` clause. For most repos this is a useful safety net, but for a project that is **itself a database engine** (e.g. a SQLite-compatible engine running a SQL conformance suite) those statements are the product's own dev/test vocabulary and the guard is a category error — the match is a case-insensitive substring, so it even fires when the words appear in a comment or a `--description` label.
 
-Such repos can opt out of the SQL guard while keeping every other guard (`rm -rf /`, force-push to `main`, `gh repo delete`, `aws s3 rb`, `aws iam delete`, etc.) fully active.
+Such repos can opt out of the SQL guard while keeping every other guard (`rm -rf /`, force-push to `main`, `gh repo delete`, `aws s3 rb`, `aws cloudformation delete-stack`, etc.) fully active.
 
 The SQL guard is **on by default**. It is resolved in this order (highest precedence first):
 
@@ -53,7 +53,9 @@ LOOM_GUARD_SQL=1 psql -c "DROP TABLE users"
 
 `guard-destructive.sh` asks for confirmation on **mutating** cloud/container CLI calls — `aws ec2 run-instances`/`create-*`/`stop-instances`/`start-instances`/`terminate-instances`, `aws s3 rm`/`rb`/`cp`/`mv`/`sync`, other mutating `aws <service> <verb>` forms, and `docker rm`/`rmi`/`stop`/`kill`/`restart`. Read-only calls (`aws ec2 describe-instances`, `aws s3 ls`, `aws lambda list-functions`, `docker ps`, `docker logs`, etc.) are **not** prompted. For a repo whose *purpose* is managing cloud infrastructure (launch/stop/terminate dev VMs, build/tear-down containers), even the mutating asks are workflow friction rather than a safety win.
 
-Such repos can opt out of the cloud/docker ASK category while keeping every other guard active — including the genuinely catastrophic cloud denies (`aws s3 rm ... --recursive`, `aws s3 rb`, `aws iam delete-*`, `aws cloudformation delete-stack`, `docker system prune`), which are **never** gated by this toggle and stay hard denies even with the cloud guard off.
+Such repos can opt out of the cloud/docker ASK category while keeping every other guard active — including the genuinely catastrophic cloud denies (`aws s3 rm ... --recursive`, `aws s3 rb`, `aws cloudformation delete-stack`, `docker system prune`), which are **never** gated by this toggle and stay hard denies even with the cloud guard off.
+
+Note (#4216): `aws iam delete-*` and `az`/`gcloud … delete` are **no longer** hard denies — they were retiered to the **ungated ask tier** (see below), because deleting a credential or a single cloud resource is a legitimate, often security-positive step (e.g. revoking an exposed key whose replacement is already active) that a hard block only left the undocumented script-file bypass to satisfy. Being **ungated** (not part of the `guards.cloudCli` ASK category) is deliberate: `guards.cloudCli:false` / `LOOM_GUARD_CLOUD=0` still **asks** on `aws iam delete-*` rather than silently allowing it, and a headless sweep still blocks it (an ASK with no human to answer denies — see the Autonomous section below). Only mass object/bucket deletion (`s3 rm --recursive`, `s3 rb`) and stack teardown (`cloudformation delete-stack`) stay hard denies.
 
 The cloud guard is **on by default**. It is resolved in this order (highest precedence first):
 
@@ -89,7 +91,7 @@ LOOM_GUARD_CLOUD=1 aws ec2 terminate-instances --instance-ids i-1234
 
 `guard-destructive.sh` scopes its ask tier to **irreversibility** (#3757): a guard whose purpose is preventing catastrophic, hard-to-undo mistakes should not add confirmation friction to operations that are trivially reversed. The **reversible** GitHub state changes — `gh pr close` (undo: `gh pr reopen`), `gh issue close` (undo: `gh issue reopen`), and `gh label delete` (undo: recreate, or one `gh label sync` in a repo with `labels.yml`) — therefore **do not prompt by default**. An autonomous agent that closes its own issue/PR as part of a normal lifecycle no longer stalls on a confirmation prompt (or, in a headless run with no approver, blocks entirely).
 
-The genuinely hard-to-reverse operations stay in the ungated ask tier and are **not** affected by this toggle: `gh release delete` (deletes published artifacts/tags), and `git clean -fd` / `git checkout .` / `git restore .` (untracked / uncommitted loss). The full catastrophic deny suite (`rm -rf /`, force-push to `main`, `gh repo delete`, …) is likewise unaffected.
+The genuinely hard-to-reverse operations stay in the ungated ask tier and are **not** affected by this toggle: `gh release delete` (deletes published artifacts/tags), `git clean -fd` / `git checkout .` / `git restore .` (untracked / uncommitted loss), and — since #4216 — `aws iam delete-*` and `az`/`gcloud … delete` (cloud credential / resource deletion, retiered here from the catastrophic deny list; ungated on purpose so `guards.cloudCli:false` cannot silently bypass them). The full catastrophic deny suite (`rm -rf /`, force-push to `main`, `gh repo delete`, `aws s3 rb`, `aws cloudformation delete-stack`, …) is likewise unaffected.
 
 A repo that *wants* the confirmation back on the reversible GitHub ops can **opt in**. Unlike `guards.sqlDdl` / `guards.cloudCli` (which default **on** and are opted **out**), this toggle has **inverse polarity**: it defaults **off** and is opted **in**, because enabling it *adds* friction rather than removing it.
 
@@ -460,6 +462,16 @@ New issues from this policy enter through normal intake (`loom:triage` → Curat
 - `guards.forceScope:"protected"` recommended for autonomous repos (above).
 - The catastrophic scan no longer false-positives on **documentation text** — a dangerous command merely *mentioned* inside a multi-line `--body`/`-m`/`--title`/`--notes`/`--comment` value (e.g. `gh issue create --body "…"`) is redacted as a single span and does **not** deny, while a genuinely dangerous command, or a command-substitution `$(…)` smuggled inside such a value, still DENIES.
 - `git checkout .` / `git restore .` / `git clean -fd` **stay ASK** (evaluated, kept flagged): they irreversibly discard uncommitted/untracked work, so the standing policy files a per-trigger issue rather than blanket-allowlisting them. A repo that wants them to pass headless can add the command word to an allowlist per its own risk decision.
+
+**Second refinement pass (#4216):** `aws iam delete-*` and `az`/`gcloud … delete` were retiered from the catastrophic deny list to the **ungated ask tier**. A hard block on credential/resource deletion was over-broad — deleting an IAM key is often the *security-positive* step — and left only the undocumented script-file bypass as recourse. The deny→ask move is safe for autonomous mode by construction: a headless sweep's unanswered ASK still blocks (per the paragraph above), so nothing that was denied headless now silently runs; only a supervised interactive operator gains a confirm prompt. The patterns stay **ungated** (not folded into `guards.cloudCli`) so a repo disabling the cloud ASK category for EC2-churn convenience cannot silently bypass IAM deletion.
+
+### When a Legitimate Operation Is Pattern-Blocked
+
+When a guard blocks (or asks about) an operation you believe is legitimate, the sanctioned recourse depends on the session:
+
+1. **Interactive session** — the **ask-tier prompt is the sanctioned path.** For a pattern in the ungated ask tier (`aws iam delete-*`, `az`/`gcloud … delete`, `gh release delete`, `git clean -fd`, …) the guard emits an ASK; confirm it in the session and the operation proceeds, with the decision recorded in the decision log (§ above). A pattern that is a **hard deny** (`rm -rf /`, force-push to `main`, `aws s3 rb`, `aws cloudformation delete-stack`, …) is not meant to be overridden ad hoc — if it is a genuine, recurring false positive, fix it with a pattern/tier-change PR (this doc + the guard + its tests), exactly as #4216 did for `aws iam delete`.
+2. **Headless / autonomous session** — by design, an ASK with no human to answer **blocks** (see above), and a hard deny blocks outright. The sanctioned path is to **re-run the specific operation in a supervised interactive session** so a human can answer the ASK. Do **not** try to make the daemon answer prompts; the block is the intended safety behavior for unattended runs.
+3. **The script-file workaround is UNSANCTIONED.** Writing the blocked command into a file and running `bash that-file` (or any equivalent that hides the command string from the `PreToolUse` scan) is a **generic guard bypass, not a policy** — it defeats *every* pattern, not just a false positive, and leaves no ask/deny record. (Note: #4178 / PR #4210 confines *where* the Bash tool may write, but does not close executing an already-written script inside a builder's own worktree — so this remains a real bypass, not a closed hole.) The honest fix for a recurring false positive is a pattern/tier-change PR like #4216, reviewed like any other change.
 
 ### Protecting Read-Only Directories
 
