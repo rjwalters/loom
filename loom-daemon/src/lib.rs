@@ -15,6 +15,7 @@ pub mod capacity;
 pub mod claim_reconciliation;
 pub mod config_resolver;
 pub mod cpu_headroom;
+pub mod credential_preflight;
 pub mod daemon_heartbeat;
 pub mod disk_headroom;
 pub mod epic_state;

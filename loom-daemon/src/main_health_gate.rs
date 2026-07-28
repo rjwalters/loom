@@ -1071,7 +1071,11 @@ fn parse_gh_run_list(stdout: &str, sha: &str, ci_workflow: Option<&str>) -> CiVe
 ///
 /// stdout goes to a temp file rather than a pipe for the same reason the gate
 /// command's does (no pipe-buffer deadlock while polling); stderr is discarded.
-fn run_capture_with_timeout(
+///
+/// `pub(crate)` (rather than private) so [`crate::credential_preflight`] can
+/// reuse the same bounded-subprocess helper for its `gh auth status` probe
+/// (#4005) instead of reimplementing timeout/kill handling.
+pub(crate) fn run_capture_with_timeout(
     program: &str,
     args: &[&str],
     cwd: &Path,

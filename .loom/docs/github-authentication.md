@@ -80,6 +80,77 @@ gh pr list --repo <owner>/<repo> --limit 1
 
 If `gh auth status` shows the default credential instead of `GH_TOKEN`, verify the variable is exported in the same shell session.
 
+## Headless and SSH-only daemon operation (#4005)
+
+`loom-daemon`'s own forge calls (claim reconciliation, the main-health gate,
+metrics collection, the work finder, …) all shell out to `gh`, which resolves
+credentials the same way an interactive shell does: `GH_TOKEN` env var →
+`GITHUB_TOKEN` env var → `gh`'s own credential store (the macOS login
+**keychain**, or `~/.config/gh/hosts.yml` on Linux). The keychain only unlocks
+for processes running in the user's **GUI login session** — a daemon started
+over SSH with a clean environment, or from a headless server with no
+interactive login, cannot unlock it. Without an env-var token, every `gh` call
+the daemon makes will `401`.
+
+**The fix is an exported token, not a new credential store.** Loom does not
+provision a separate daemon-managed PAT file — `export GH_TOKEN` (or
+`GITHUB_TOKEN`) before starting the daemon, and the existing forwarding
+mechanism carries it the rest of the way:
+
+```bash
+# On the headless / SSH-only host, before starting the daemon:
+export GH_TOKEN=github_pat_xxxxxxxxxxxxxxxxxxxx
+./.loom/scripts/cli/loom-daemon-start.sh
+```
+
+`loom-daemon-start.sh` forwards any exported `GH_TOKEN` / `GITHUB_TOKEN` /
+`GITEA_TOKEN` / `FORGE_TOKEN` into the launchd plist's `EnvironmentVariables`
+(macOS) or the backgrounded process's inherited environment (`--no-launchd` /
+Linux) — so the daemon **and every sweep child it dispatches** see the token,
+with no per-sweep configuration needed. The daemon inherits its environment
+**from the shell that started it** — export the token *before* invoking
+`loom-daemon-start.sh`, not after. A later `loom-daemon-update.sh` restart
+re-renders the plist from the *current* shell's environment, so an
+already-running daemon does not silently lose a token that was exported only
+in a now-closed session (the same footgun `LOOM_WORK_FINDER` / autonomy-flag
+env replay has — see [`daemon-reference.md`](daemon-reference.md)).
+
+**Startup credential preflight.** The daemon resolves its forge credential
+once at boot, immediately before its first `gh` consumer (the claim
+reconciliation startup pass), and reports the outcome — `info!` naming which
+mechanism won (`GH_TOKEN`, `GITHUB_TOKEN`, or `gh`'s own credential store) plus
+a non-secret fingerprint (never the token itself), or `error!` naming both
+remedies (export a token, or unlock the login keychain from a GUI session)
+when nothing resolves. This turns the pre-#4005 failure mode — a daemon that
+boots clean and then 401s silently on every forge call for the life of the
+process — into a single loud, actionable line. The result is also visible
+without reading logs via `loom-daemon status` ("Forge credential: OK/DEGRADED
+— …"); see [`daemon-reference.md`](daemon-reference.md) for the field shape.
+The preflight is read-only, bounded (never blocks daemon startup), and never
+logs, prints, or serializes a token value.
+
+**GitHub only.** The preflight covers `GH_TOKEN`/`GITHUB_TOKEN` because the
+daemon's own forge calls are exclusively `gh`-CLI-based. `GITEA_TOKEN` /
+`FORGE_TOKEN` forwarding still happens (for dispatched sweep children targeting
+a Gitea-backed repo — see [`forge-authentication.md`](forge-authentication.md))
+but the daemon process itself never calls a Gitea API, so there is nothing to
+preflight for it.
+
+**Plist permissions.** Because the rendered launchd plist embeds the token
+value verbatim in `EnvironmentVariables`, `loom-daemon-start.sh` hardens the
+file to mode `0600` whenever it carries a `GH_TOKEN`/`GITEA_TOKEN`/
+`FORGE_TOKEN`, so a local user other than the daemon's owner cannot read the
+PAT out of `~/Library/LaunchAgents`.
+
+**Out of scope**: `launchctl bootstrap gui/$UID` (the launchd domain
+`loom-daemon-start.sh` uses on macOS) fails over SSH — `gui/$UID` is a
+per-GUI-session domain that does not exist in an SSH session — so a daemon
+that isn't already running cannot be *started* remotely on macOS today even
+with a valid token exported. That is a supervision-model gap (a `LaunchDaemon`
+or `launchctl asuser` mechanism), not a credential problem; restarting an
+*already-running* daemon (`loom-daemon-update.sh`) and running fully headless
+on Linux (`--no-launchd` / nohup path) both work with an exported token today.
+
 ## Troubleshooting
 
 ### Token not being picked up

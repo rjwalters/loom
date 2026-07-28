@@ -2092,6 +2092,19 @@ after migration reported `13 seen, 3 dispatched, 0 error(s)`.
   `--health-gate` / `--from-config` semantics are preserved exactly — the
   launchd job never sees a wider or narrower autonomy configuration than a
   plain nohup start would have resolved.
+- **Token hardening + startup credential preflight (#4005)**: because a
+  forwarded `GH_TOKEN`/`GITEA_TOKEN`/`FORGE_TOKEN` is embedded verbatim in the
+  plist, `loom-daemon-start.sh` writes the file mode `0600` whenever it
+  carries one of those vars (otherwise it inherits the process umask —
+  typically world-readable `0644`). Separately, the daemon resolves its own
+  forge credential once at boot — before its first `gh` consumer — and logs
+  the outcome loudly (`info!`/`error!`, never the token value); the result is
+  also surfaced in `loom-daemon status` (`credential_preflight` in `--json`,
+  a "Forge credential: OK/DEGRADED" line in the human view). See
+  [`github-authentication.md` § Headless and SSH-only daemon operation](github-authentication.md#headless-and-ssh-only-daemon-operation-4005)
+  for the operator-facing walkthrough — this is the fix for the
+  keychain-unlock-dependency failure mode: a daemon started over SSH with no
+  exported token used to boot clean and then 401 silently on every forge call.
 - **`RunAtLoad=true` / `KeepAlive={SuccessfulExit:true}`** (#4054): `RunAtLoad=true`
   means the daemon survives a reboot/re-login, not just the death of one particular
   session — strictly *more* durable than the pre-#3972 nohup contract (which didn't
