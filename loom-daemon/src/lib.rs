@@ -53,6 +53,7 @@ pub mod watch_registry;
 pub mod work_finder;
 pub mod workspace_pool;
 pub mod workspace_registry;
+pub mod worktree_ops;
 pub mod worktree_root;
 
 use std::collections::HashSet;

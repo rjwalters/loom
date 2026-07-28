@@ -6,11 +6,13 @@
 //! sweep was the in-memory [`crate::sweep_registry::SweepRegistry`] entry. A
 //! daemon restart — a routine event in the multi-repo autonomous world (rate
 //! limit kills, the print-mode ceiling, an operator upgrade) — wipes that
-//! registry clean. `loom-recover-orphans --recover` (the Python reclaim tool,
-//! `loom_tools.orphan_recovery`) then finds **no authoritative liveness
-//! source** and, per its #3651 fail-safe, refuses to reclaim ANY
-//! `loom:building` claim — even a claim whose sweep process is provably dead.
-//! Stale claims accumulate and an operator ends up hand-flipping labels.
+//! registry clean. `loom-recover-orphans --recover` (the reclaim tool,
+//! natively `loom_daemon::worktree_ops::orphan_recovery` as of issue #4272 —
+//! previously a Python `loom-tools` module of the same name) then finds
+//! **no authoritative liveness source** and, per its #3651 fail-safe, refuses
+//! to reclaim ANY `loom:building` claim — even a claim whose sweep process is
+//! provably dead. Stale claims accumulate and an operator ends up
+//! hand-flipping labels.
 //!
 //! ## Fix
 //!
@@ -38,8 +40,9 @@
 //!
 //! - The Rust startup reconciliation pass ([`crate::claim_reconciliation`])
 //!   consults it directly, in-process.
-//! - `loom_tools.orphan_recovery` (Python) reads the same JSON file as a new
-//!   liveness source, so a *manual* `loom-recover-orphans --recover` run also
+//! - [`crate::worktree_ops::orphan_recovery`] (the native `loom-recover-orphans`
+//!   CLI, issue #4272) reads the same JSON file as one of several unioned
+//!   liveness sources, so a *manual* `loom-recover-orphans --recover` run also
 //!   benefits from a fresh daemon's journal.
 //!
 //! All I/O here is best-effort by design: a missing, empty, or corrupt

@@ -22,6 +22,7 @@ use loom_daemon::types::{DaemonStatusReport, QuarantineEntry, Request, Response,
 use loom_daemon::watch_registry;
 use loom_daemon::work_finder;
 use loom_daemon::workspace_pool::WorkspacePool;
+use loom_daemon::worktree_ops::{aggressive, clean};
 use loom_daemon::{extract_configured_terminal_ids, rotate_log_file};
 
 use anyhow::{anyhow, Result};
@@ -255,6 +256,90 @@ enum Commands {
     Tokens {
         #[command(subcommand)]
         action: TokensAction,
+    },
+
+    /// Native port of `loom-clean` (Issue #4272, epic #4081 Phase 3 family 2):
+    /// worktree/branch/tmux/agent-config cleanup, `--deep` build-artifact
+    /// removal, `--safe` merged-PR-only mode, and `--daemon` crash recovery.
+    /// `--aggressive` additionally enumerates every `git worktree` entry
+    /// (not just `.loom/worktrees/issue-*`) under the vestigial-worktree
+    /// decision tree from issue #3332. Purely file/git/gh-based; does not
+    /// require a running daemon. Flags mirror the retired `loom-clean`
+    /// console script byte-for-byte.
+    Clean {
+        /// Workspace directory (repo root, or any path under it).
+        #[arg(long, value_name = "PATH", default_value = ".")]
+        workspace: String,
+
+        #[arg(long)]
+        dry_run: bool,
+
+        #[arg(long)]
+        deep: bool,
+
+        #[arg(short = 'f', long, visible_alias = "yes", visible_short_alias = 'y')]
+        force: bool,
+
+        #[arg(long)]
+        safe: bool,
+
+        #[arg(long, default_value_t = clean::DEFAULT_GRACE_PERIOD_SECS)]
+        grace_period: i64,
+
+        #[arg(long, visible_alias = "worktrees")]
+        worktrees_only: bool,
+
+        #[arg(long, visible_alias = "branches")]
+        branches_only: bool,
+
+        #[arg(long, visible_alias = "tmux")]
+        tmux_only: bool,
+
+        /// Crash recovery: kill tmux sessions, revert stale `loom:building`
+        /// labels for issues with no live spawn-loop task, clear stale
+        /// claim-lock dirs, reset issue-failures.json.
+        #[arg(long)]
+        daemon: bool,
+
+        /// Enumerate ALL worktrees and remove vestigial ones reachable from
+        /// origin/main (see issue #3332). Respects open PRs, active
+        /// spawn-loop tasks, the `.loom-managed` sentinel, and uncommitted
+        /// changes.
+        #[arg(long)]
+        aggressive: bool,
+
+        #[arg(long, default_value_t = aggressive::DEFAULT_AGGRESSIVE_MIN_AGE)]
+        aggressive_min_age: u64,
+    },
+
+    /// Native port of `loom-cleanup` (Issue #4272): log archival, the only
+    /// cleanup.py functionality that survived the daemon-brain retirement
+    /// (#3396). Purely file-based; does not require a running daemon.
+    Cleanup {
+        #[command(subcommand)]
+        action: CleanupAction,
+    },
+
+    /// Native port of `loom-recover-orphans` (Issue #4272): detects `loom:building`
+    /// issues with no live sweep tracking them and spawn-loop tasks with a
+    /// stale heartbeat + dead PID, and (with `--recover`) resets them.
+    /// Fail-safe (#3651): absent liveness evidence means every claim is
+    /// treated as ALIVE, never as orphaned. Purely file/git/gh-based; does
+    /// not require a running daemon.
+    RecoverOrphans {
+        #[arg(long, value_name = "PATH", default_value = ".")]
+        workspace: String,
+
+        /// Actually perform recovery (default is dry-run detection only).
+        #[arg(long)]
+        recover: bool,
+
+        /// Emit JSON instead of the human-readable report.
+        #[arg(long)]
+        json: bool,
+
+        #[arg(long, short = 'v')]
+        verbose: bool,
     },
 
     /// Validate role configuration completeness
@@ -655,6 +740,28 @@ enum PinAction {
         /// Emit JSON instead of a human table.
         #[arg(long)]
         json: bool,
+    },
+}
+
+/// Sub-actions for `loom-daemon cleanup`.
+#[derive(Subcommand)]
+enum CleanupAction {
+    /// Archive task outputs and prune old archives (delegates to
+    /// `archive-logs.sh`; the only surviving cleanup.py functionality).
+    Logs {
+        #[arg(long, value_name = "PATH", default_value = ".")]
+        workspace: String,
+
+        #[arg(long)]
+        dry_run: bool,
+
+        /// Skip new archival; only prune archives older than retention.
+        #[arg(long)]
+        prune_only: bool,
+
+        /// Override `LOOM_RETENTION_DAYS` (default: 7).
+        #[arg(long, value_name = "N")]
+        retention_days: Option<i64>,
     },
 }
 
@@ -1752,6 +1859,40 @@ fn handle_cli_command(command: Commands) -> Result<()> {
         Commands::Workspace { action } => handle_workspace_command(action),
         Commands::Tokens { action } => handle_tokens_command(action),
         Commands::UpdateGitignore { workspace } => handle_update_gitignore_command(&workspace),
+        Commands::Clean {
+            workspace,
+            dry_run,
+            deep,
+            force,
+            safe,
+            grace_period,
+            worktrees_only,
+            branches_only,
+            tmux_only,
+            daemon,
+            aggressive,
+            aggressive_min_age,
+        } => handle_clean_command(
+            &workspace,
+            dry_run,
+            deep,
+            force,
+            safe,
+            grace_period,
+            worktrees_only,
+            branches_only,
+            tmux_only,
+            daemon,
+            aggressive,
+            aggressive_min_age,
+        ),
+        Commands::Cleanup { action } => handle_cleanup_command(action),
+        Commands::RecoverOrphans {
+            workspace,
+            recover,
+            json,
+            verbose,
+        } => handle_recover_orphans_command(&workspace, recover, json, verbose),
         Commands::Status { .. } => {
             // Routed directly in `main()` (it needs the async runtime for the
             // socket round-trip), never dispatched through this sync handler.
@@ -4822,6 +4963,141 @@ fn handle_pin_action(action: PinAction, ws: &Path) -> Result<()> {
             Ok(())
         }
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn handle_clean_command(
+    workspace: &str,
+    dry_run: bool,
+    deep: bool,
+    force: bool,
+    safe: bool,
+    grace_period: i64,
+    worktrees_only: bool,
+    branches_only: bool,
+    tmux_only: bool,
+    daemon: bool,
+    aggressive: bool,
+    aggressive_min_age: u64,
+) -> Result<()> {
+    use loom_daemon::worktree_ops::aggressive as agg;
+    use loom_daemon::worktree_ops::repo;
+
+    let repo_root = repo::resolve_repo_root(workspace)?;
+
+    if daemon {
+        println!();
+        println!("========================================");
+        println!("  Loom Crash Recovery");
+        if dry_run {
+            println!("  (DRY RUN MODE)");
+        }
+        println!("========================================");
+        println!();
+        clean::clean_daemon_crash_state(&repo_root, dry_run);
+        if dry_run {
+            println!("Dry run complete - no changes made");
+        } else {
+            println!("Crash recovery complete!");
+        }
+        println!();
+        return Ok(());
+    }
+
+    if aggressive {
+        println!();
+        println!("========================================");
+        println!("  Loom Aggressive Worktree Cleanup");
+        if dry_run {
+            println!("  (DRY RUN MODE)");
+        }
+        println!("========================================");
+        println!();
+        eprintln!(
+            "Aggressive mode overrides .loom-in-use markers and process-table guards. Respects \
+             open PRs, active shepherds, the .loom-managed sentinel, uncommitted changes, and \
+             reachability from origin/main."
+        );
+        println!();
+
+        let stats = agg::clean_aggressive(&repo_root, dry_run, force, aggressive_min_age);
+        agg::print_aggressive_summary(&stats, dry_run);
+        if dry_run {
+            println!("Dry run complete - no changes made");
+            println!("Run without --dry-run to perform cleanup");
+        } else {
+            println!("Aggressive cleanup complete!");
+        }
+        println!();
+        std::process::exit(i32::from(stats.errors > 0));
+    }
+
+    let opts = clean::CleanOptions {
+        dry_run,
+        deep,
+        force,
+        safe,
+        grace_period_secs: grace_period,
+        worktrees_only,
+        branches_only,
+        tmux_only,
+    };
+    let exit_code = clean::run_clean(&repo_root, &opts);
+    if exit_code != 0 {
+        std::process::exit(exit_code);
+    }
+    Ok(())
+}
+
+fn handle_cleanup_command(action: CleanupAction) -> Result<()> {
+    use loom_daemon::worktree_ops::{logs, repo};
+    match action {
+        CleanupAction::Logs {
+            workspace,
+            dry_run,
+            prune_only,
+            retention_days,
+        } => {
+            let repo_root = repo::resolve_repo_root(&workspace)?;
+            let rc = logs::handle_logs(&repo_root, dry_run, prune_only, retention_days);
+            if rc != 0 {
+                std::process::exit(rc);
+            }
+            Ok(())
+        }
+    }
+}
+
+fn handle_recover_orphans_command(
+    workspace: &str,
+    recover: bool,
+    json: bool,
+    verbose: bool,
+) -> Result<()> {
+    use loom_daemon::worktree_ops::{orphan_recovery as orphans, repo};
+
+    let repo_root = repo::resolve_repo_root(workspace)?;
+
+    if !json {
+        println!("Orphaned Spawn-Loop Task Detection & Recovery");
+        if !recover {
+            println!("DRY RUN - No changes will be made");
+            println!("Use --recover to actually perform recovery");
+        }
+    }
+
+    let result = orphans::run_orphan_recovery(&repo_root, recover, verbose);
+
+    if json {
+        println!("{}", orphans::format_result_json(&result));
+    } else {
+        println!("{}", orphans::format_result_human(&result));
+    }
+
+    if !result.orphaned.is_empty() && !recover {
+        std::process::exit(2);
+    }
+    Ok(())
 }
 
 fn handle_validate_command(
