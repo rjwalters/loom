@@ -222,10 +222,11 @@ enum Commands {
     /// rate-limit probe (`check`), and the operator-facing pin/unpin/unblock
     /// bookkeeping CLI. As of #4080 (Phase 2) `check` is also the
     /// implementation `probe-tokens.sh` and the daemon's own ranking
-    /// self-refresh invoke natively; `spawn-claude.sh` (selection) and
-    /// `bootstrap`/`import-from-monitor` remain Python-only (deferred to
-    /// follow-up issues — see `loom-daemon/src/tokens_pool/mod.rs`). Purely
-    /// file-based; does not require a running daemon.
+    /// self-refresh invoke natively. As of #4105 `bootstrap` is native too
+    /// (multi-source `.env` merge + pool provisioning); `spawn-claude.sh`
+    /// (selection) and `import-from-monitor` (issue #4106) remain Python-only
+    /// (see `loom-daemon/src/tokens_pool/mod.rs`). Purely file-based; does not
+    /// require a running daemon.
     Tokens {
         #[command(subcommand)]
         action: TokensAction,
@@ -375,6 +376,53 @@ enum TokensAction {
         /// Omit the secret key from output (safe inspection).
         #[arg(long)]
         no_key: bool,
+    },
+
+    /// Materialize `.loom/tokens/` from `ACCOUNT_*_N` triples, merging by email
+    /// with precedence claude-monitor (`~/.claude-monitor/accounts.env`,
+    /// primary) > repo-local. The home master (`~/.loom/accounts.env`) is
+    /// opt-in only: read solely when `$LOOM_ACCOUNTS_ENV` (or `--home-env`)
+    /// points at it. `ACCOUNT_TOKEN_FILE_N` is optional — auto-derived from
+    /// `ACCOUNT_EMAIL_N` when omitted. Native Rust port of the historical Python
+    /// `loom-tokens bootstrap` CLI (issue #4105, epic #4081).
+    Bootstrap {
+        /// Repo root (plain path, default `.` — no upward `.git` walk). The
+        /// pool is written to `<workspace>/.loom/tokens` unless `--shared`.
+        #[arg(long, value_name = "PATH", default_value = ".")]
+        workspace: String,
+
+        /// Path to the repo-local account source (default:
+        /// `<repo>/.loom/accounts.env` if present, else `<repo>/.env`).
+        #[arg(long, value_name = "PATH")]
+        env: Option<String>,
+
+        /// Path to the home-dir master account source. Opt-in only; with no
+        /// flag the home master is read only when `$LOOM_ACCOUNTS_ENV` points
+        /// at a file.
+        #[arg(long, value_name = "PATH")]
+        home_env: Option<String>,
+
+        /// Ignore the home master; bootstrap from the repo-local source only.
+        #[arg(long)]
+        no_home: bool,
+
+        /// Materialize the SHARED machine-level pool at `~/.loom/tokens`
+        /// (override with `$LOOM_SHARED_TOKENS_DIR`) instead of the repo-local
+        /// `<repo>/.loom/tokens`.
+        #[arg(long)]
+        shared: bool,
+
+        /// Overwrite existing token files even if their fingerprint matches.
+        #[arg(long)]
+        force: bool,
+
+        /// Report what would change without writing any files.
+        #[arg(long)]
+        dry_run: bool,
+
+        /// Emit a JSON summary on stdout.
+        #[arg(long)]
+        json: bool,
     },
 
     /// Probe each bootstrapped account for rate-limit headers and rank by
@@ -3432,6 +3480,50 @@ fn resolve_tokens_workspace(workspace: &str) -> Result<PathBuf> {
     }
 }
 
+/// Human-readable label for an account's merge provenance. Mirrors
+/// `cli._SOURCE_LABEL`.
+fn source_label(source: &str) -> &str {
+    match source {
+        "home" => "home",
+        "repo" => "repo",
+        "repo-override" => "repo (overrides home)",
+        "monitor" => "claude-monitor",
+        "monitor-override" => "claude-monitor (overrides repo/home)",
+        other => other,
+    }
+}
+
+/// Print the effective merged account set and where each came from. Mirrors
+/// `cli._print_effective_accounts` — secrets are never shown, only email, token
+/// filename, and source.
+fn print_effective_accounts(result: &loom_daemon::tokens_pool::bootstrap::BootstrapResult) {
+    let disp = |p: &Option<std::path::PathBuf>| -> String {
+        p.as_ref()
+            .map_or_else(|| "(none)".to_string(), |p| p.display().to_string())
+    };
+    println!("Account sources:");
+    println!("  claude-monitor: {}", disp(&result.monitor_env));
+    println!("  home: {}", disp(&result.home_env));
+    println!("  repo: {}", disp(&result.repo_env));
+
+    if result.effective.is_empty() {
+        println!("Effective accounts: (none)");
+        return;
+    }
+
+    println!("Effective accounts ({}):", result.effective.len());
+    let width = result
+        .effective
+        .iter()
+        .map(|a| a.name.chars().count())
+        .max()
+        .unwrap_or(0);
+    for a in &result.effective {
+        let label = source_label(&a.source);
+        println!("  {:<width$}  {}  [{label}]", a.name, a.email, width = width);
+    }
+}
+
 /// Handle `loom-daemon tokens <select|pin|unpin|unblock>` (Issue #4082,
 /// Phase 1 of epic #4081). Purely file-based — does not require a running
 /// daemon. See `loom-daemon/src/tokens_pool/mod.rs` for the ported subset
@@ -3493,6 +3585,91 @@ fn handle_tokens_command(action: TokensAction) -> Result<()> {
                     std::process::exit(select::EX_CONFIG);
                 }
             }
+        }
+
+        TokensAction::Bootstrap {
+            workspace,
+            env,
+            home_env,
+            no_home,
+            shared,
+            force,
+            dry_run,
+            json,
+        } => {
+            use loom_daemon::tokens_pool::bootstrap::{self, BootstrapError, BootstrapOptions};
+            use loom_daemon::tokens_pool::paths::shared_tokens_dir;
+
+            let repo_root = resolve_tokens_workspace(&workspace)?;
+
+            // `--shared` redirects the destination pool to the machine-level
+            // location (issue #3938). Only the write target changes; account
+            // sources are unchanged. Refuse when the shared pool is disabled.
+            let tokens_dir = if shared {
+                match shared_tokens_dir() {
+                    Some(dir) => {
+                        eprintln!(
+                            "Bootstrapping the shared machine-level pool at {}",
+                            dir.display()
+                        );
+                        Some(dir)
+                    }
+                    None => {
+                        eprintln!(
+                            "error: --shared requested but the shared pool is disabled \
+                             (LOOM_SHARED_TOKENS_DIR is empty). Unset it or point it at a directory."
+                        );
+                        std::process::exit(1);
+                    }
+                }
+            } else {
+                None
+            };
+
+            // `--no-home` disables the master; `--home-env` points elsewhere;
+            // neither falls through to default resolution ($LOOM_ACCOUNTS_ENV).
+            let home_env_path = if no_home {
+                Some(None)
+            } else {
+                home_env.map(|p| Some(std::path::PathBuf::from(p)))
+            };
+
+            let opts = BootstrapOptions {
+                repo_root,
+                env_path: env.map(std::path::PathBuf::from),
+                home_env_path,
+                force,
+                dry_run,
+                tokens_dir,
+            };
+
+            let result = match bootstrap::bootstrap_tokens(&opts) {
+                Ok(r) => r,
+                Err(e @ (BootstrapError::NoSource(_) | BootstrapError::DuplicateFile(_))) => {
+                    eprintln!("error: {e}");
+                    std::process::exit(1);
+                }
+                Err(BootstrapError::Io(e)) => return Err(anyhow!("bootstrap failed: {e}")),
+            };
+
+            // Warnings (partial triples, drift, unreadable tokens) go to stderr
+            // so `--json` stdout stays clean.
+            for w in &result.warnings {
+                eprintln!("warning: {w}");
+            }
+
+            if json {
+                println!("{}", serde_json::to_string_pretty(&result.to_json())?);
+            } else {
+                print_effective_accounts(&result);
+            }
+
+            // Unresolved drift without --force is a non-zero exit so CI can
+            // detect divergence (mirrors cli._cmd_bootstrap).
+            if !result.drifted.is_empty() && !force {
+                std::process::exit(2);
+            }
+            Ok(())
         }
 
         TokensAction::Check {

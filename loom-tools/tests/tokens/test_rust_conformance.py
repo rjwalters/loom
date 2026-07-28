@@ -427,6 +427,150 @@ def test_check_monitor_source_manifest_only_account_has_empty_status(tmp_path):
     assert py_ranking == rust_ranking == "acct-a|available\nacct-z|\n"
 
 
+# ---------------------------------------------------------------------------
+# bootstrap: multi-source `.env` merge + `.token`/`index.json` provisioning
+# (#4105). The Python CLI resolves its repo root via `find_repo_root()` (needs
+# a `.git` + `.loom/` marker and is run with `cwd=workspace`); the Rust CLI
+# takes an explicit `--workspace`. Both are isolated from the real host
+# environment (no home master, no claude-monitor, no shared pool) so only the
+# repo-local `.env` feeds the merge.
+# ---------------------------------------------------------------------------
+
+
+def _seed_bootstrap_repo(workspace: Path, env_body: str) -> Path:
+    """Create a `.git` + `.loom` repo skeleton with a repo-local `.env`."""
+    (workspace / ".loom").mkdir(parents=True, exist_ok=True)
+    (workspace / ".git").mkdir(parents=True, exist_ok=True)
+    (workspace / ".env").write_text(env_body, encoding="utf-8")
+    return workspace
+
+
+def _bootstrap_env(monitor_dir: Path) -> dict:
+    return {
+        **os.environ,
+        "PYTHONPATH": _loom_tools_src(),
+        "LOOM_ACCOUNTS_ENV": "",  # disable the home master
+        "LOOM_CLAUDE_MONITOR_DIR": str(monitor_dir),  # empty -> no monitor source
+        "LOOM_SHARED_TOKENS_DIR": "",  # disable the shared pool fallback
+    }
+
+
+def _run_python_bootstrap(workspace: Path, monitor_dir: Path, *extra: str):
+    return subprocess.run(
+        ["python3", "-m", "loom_tools.tokens.cli", "bootstrap", *extra],
+        capture_output=True,
+        text=True,
+        check=False,
+        cwd=workspace,
+        env=_bootstrap_env(monitor_dir),
+    )
+
+
+def _run_rust_bootstrap(workspace: Path, monitor_dir: Path, *extra: str):
+    assert DAEMON_BIN is not None
+    return subprocess.run(
+        [
+            str(DAEMON_BIN),
+            "tokens",
+            "bootstrap",
+            "--workspace",
+            str(workspace),
+            *extra,
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+        env=_bootstrap_env(monitor_dir),
+    )
+
+
+_BOOTSTRAP_ENV_BODY = (
+    "ACCOUNT_EMAIL_1=alice@example.com\n"
+    "ACCOUNT_KEY_1=sk-ant-oat01-alice\n"
+    "ACCOUNT_EMAIL_2=bob.jones@example.org\n"
+    "ACCOUNT_KEY_2=sk-ant-oat01-bob\n"
+    # A partial triple: email with no key. Both must warn and skip, not abort.
+    "ACCOUNT_EMAIL_3=orphan@example.com\n"
+)
+
+
+def test_bootstrap_dry_run_effective_set_agrees(tmp_path):
+    monitor_dir = tmp_path / "monitor-empty"  # never created -> no monitor src
+    py_ws = _seed_bootstrap_repo(tmp_path / "py", _BOOTSTRAP_ENV_BODY)
+    rust_ws = _seed_bootstrap_repo(tmp_path / "rust", _BOOTSTRAP_ENV_BODY)
+
+    py = _run_python_bootstrap(py_ws, monitor_dir, "--dry-run", "--json")
+    assert py.returncode == 0, py.stderr
+    rust = _run_rust_bootstrap(rust_ws, monitor_dir, "--dry-run", "--json")
+    assert rust.returncode == 0, rust.stderr
+
+    py_effective = json.loads(py.stdout)["effective"]
+    rust_effective = json.loads(rust.stdout)["effective"]
+
+    # The auto-derived filenames + merge provenance must match byte-for-byte.
+    assert rust_effective == py_effective
+    # The orphan (partial) triple is dropped by both; only the two full ones
+    # survive with filenames derived from the email local-part + domain label.
+    files = {a["file"] for a in rust_effective}
+    assert files == {"alice-example.token", "bobjones-example.token"}
+    # Dry-run writes nothing.
+    assert not (py_ws / ".loom" / "tokens" / "index.json").exists()
+    assert not (rust_ws / ".loom" / "tokens" / "index.json").exists()
+
+
+def _index_accounts(pool: Path) -> list:
+    """Load `index.json`'s accounts array (drops the per-run `generated_at`)."""
+    manifest = json.loads((pool / "index.json").read_text(encoding="utf-8"))
+    assert manifest["version"] == 2
+    return manifest["accounts"]
+
+
+def test_bootstrap_index_json_and_tokens_byte_compatible(tmp_path):
+    monitor_dir = tmp_path / "monitor-empty"
+    py_ws = _seed_bootstrap_repo(tmp_path / "py", _BOOTSTRAP_ENV_BODY)
+    rust_ws = _seed_bootstrap_repo(tmp_path / "rust", _BOOTSTRAP_ENV_BODY)
+
+    py = _run_python_bootstrap(py_ws, monitor_dir)
+    assert py.returncode == 0, py.stderr
+    rust = _run_rust_bootstrap(rust_ws, monitor_dir)
+    assert rust.returncode == 0, rust.stderr
+
+    py_pool = py_ws / ".loom" / "tokens"
+    rust_pool = rust_ws / ".loom" / "tokens"
+
+    # index.json manifest rows are byte-compatible (only generated_at differs).
+    assert _index_accounts(rust_pool) == _index_accounts(py_pool)
+    # And the manifest carries only 8-char fingerprints + source, no secrets.
+    for row in _index_accounts(rust_pool):
+        assert len(row["key_fingerprint"]) == 8
+        assert "source" in row
+        assert "key" not in row
+    raw = (rust_pool / "index.json").read_text(encoding="utf-8")
+    assert "sk-ant-oat01" not in raw
+
+    # The materialized token files are identical across both writers.
+    for name in ("alice-example.token", "bobjones-example.token"):
+        assert (rust_pool / name).read_text(encoding="utf-8") == (
+            py_pool / name
+        ).read_text(encoding="utf-8")
+
+
+def test_bootstrap_no_source_both_fail(tmp_path):
+    monitor_dir = tmp_path / "monitor-empty"
+    # A repo skeleton with NO account source at all.
+    py_ws = tmp_path / "py"
+    rust_ws = tmp_path / "rust"
+    for ws in (py_ws, rust_ws):
+        (ws / ".loom").mkdir(parents=True)
+        (ws / ".git").mkdir(parents=True)
+
+    py = _run_python_bootstrap(py_ws, monitor_dir, "--json")
+    rust = _run_rust_bootstrap(rust_ws, monitor_dir, "--json")
+    # Both exit non-zero when no account source exists.
+    assert py.returncode != 0
+    assert rust.returncode != 0
+
+
 def test_check_monitor_source_no_fresh_data_leaves_ranking_untouched(tmp_path):
     index_accounts = [{"name": "acct-a", "email": "a@example.com"}]
     py_ws = _seed_monitor_pool(tmp_path / "py", index_accounts)
