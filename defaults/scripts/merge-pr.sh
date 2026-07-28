@@ -1554,6 +1554,50 @@ _remove_loom_worktree() {
   fi
 }
 
+# _issue_is_closed_for_cleanup <issue_number>
+#
+# Async-close-race adaptation (#4186, adapted from fork PR #77's open-issue
+# worktree guard).
+#
+# Removing a worktree unconditionally after merge breaks the partial-
+# increment lifecycle (#3667): a `Part of #N` / `Contributes to #N` PR merges
+# while issue N stays open, and the next Builder increment (or an agent still
+# inside it) needs that worktree. But naively querying the issue's LIVE state
+# right after merge has a race: GitHub closes `Closes #N` issues
+# ASYNCHRONOUSLY, after the merge webhook fires — so a lookup taken here
+# would see "open" for essentially every normal merge and silently defeat
+# cleanup entirely. Gate the live lookup on whether this PR is actually a
+# close target of the issue:
+#
+#   - $issue_number IS a close target of $PR_NUMBER -> the merge itself
+#     closes it; clean up exactly as before this change (no lookup, no
+#     race).
+#   - $issue_number is NOT a close target (partial increment, or no closing
+#     keyword at all) -> query live state via forge_get_issue_state and
+#     preserve the worktree unless that state is CLOSED.
+#
+# Fail-unsafe-to-preserve: any lookup failure (forge_pr_close_targets
+# returning nothing, forge_get_issue_state failing / returning an unknown
+# state) is treated as "preserve" — cleanup must never destroy a worktree it
+# isn't certain is safe to remove. A skipped cleanup here is always
+# recoverable later (loom-clean, or a future merge that actually closes the
+# issue).
+#
+# Returns 0 (true — safe to clean up) or 1 (false — preserve the worktree).
+_issue_is_closed_for_cleanup() {
+  local issue_number="$1"
+
+  local close_targets
+  close_targets="$(forge_pr_close_targets "$PR_NUMBER" "$GH" 2>/dev/null || true)"
+  if echo "$close_targets" | grep -qx "$issue_number"; then
+    return 0
+  fi
+
+  local state
+  state="$(forge_get_issue_state "$REPO_NWO" "$issue_number" "$GH" 2>/dev/null || true)"
+  [[ "$state" == "CLOSED" ]]
+}
+
 if [[ "$CLEANUP_WORKTREE" == "true" ]]; then
   if [[ "${LOOM_PRESERVE_WORKTREE:-0}" == "1" ]]; then
     info "Worktree cleanup skipped (LOOM_PRESERVE_WORKTREE=1) — local branch left in place"
@@ -1582,7 +1626,16 @@ if [[ "$CLEANUP_WORKTREE" == "true" ]]; then
       DEFAULT_WT_PATH="$WT_ROOT_DIR/pr-$PR_NUMBER"
     fi
     if [[ -d "$DEFAULT_WT_PATH" ]]; then
-      _remove_loom_worktree "$DEFAULT_WT_PATH"
+      # Close-target-aware gate (#4186): ISSUE_NUM is only set when
+      # PR_BRANCH matched the feature/issue-<N> convention above. When it's
+      # unset (the pr-<N> path) this check is skipped entirely — unchanged
+      # behavior.
+      if [[ -n "${ISSUE_NUM:-}" ]] && ! _issue_is_closed_for_cleanup "$ISSUE_NUM"; then
+        warning "Preserving worktree at $DEFAULT_WT_PATH — issue #$ISSUE_NUM is not a close target of PR #$PR_NUMBER and its live state is not CLOSED"
+        info "This is the partial-increment case (#3667) or an issue-state lookup failure; cleanup will be retried by a future merge that actually closes #$ISSUE_NUM, or run 'loom-clean' manually once it does"
+      else
+        _remove_loom_worktree "$DEFAULT_WT_PATH"
+      fi
     else
       # Discovery fallback (warn-only): the Loom-convention path is missing,
       # so walk porcelain looking for any worktree tracking $PR_BRANCH. We
@@ -1593,9 +1646,15 @@ if [[ "$CLEANUP_WORKTREE" == "true" ]]; then
       if [[ -n "$DISCOVERED_WT" ]]; then
         if [[ -f "$DISCOVERED_WT/.loom-managed" ]]; then
           # Rare case: Loom-managed worktree at a non-standard path. The
-          # sentinel says it's safe to remove, so do so.
-          info "Discovered Loom-managed worktree at non-standard path: $DISCOVERED_WT"
-          _remove_loom_worktree "$DISCOVERED_WT"
+          # sentinel says it's safe to remove — unless the close-target-aware
+          # gate (#4186) says preserve.
+          if [[ -n "${ISSUE_NUM:-}" ]] && ! _issue_is_closed_for_cleanup "$ISSUE_NUM"; then
+            warning "Preserving discovered worktree at $DISCOVERED_WT — issue #$ISSUE_NUM is not a close target of PR #$PR_NUMBER and its live state is not CLOSED"
+            info "This is the partial-increment case (#3667) or an issue-state lookup failure; cleanup will be retried by a future merge that actually closes #$ISSUE_NUM, or run 'loom-clean' manually once it does"
+          else
+            info "Discovered Loom-managed worktree at non-standard path: $DISCOVERED_WT"
+            _remove_loom_worktree "$DISCOVERED_WT"
+          fi
         else
           warning "Discovered worktree for branch '$PR_BRANCH' at: $DISCOVERED_WT"
           warning "Worktree lacks .loom-managed sentinel — not removing (user-owned)."
