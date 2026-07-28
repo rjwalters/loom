@@ -2070,6 +2070,27 @@ make_wt_repo() {
     echo "$dir"
 }
 
+# Create a throwaway git repo with a REAL linked git worktree (via `git
+# worktree add`) at <repo>/.loom/worktrees/issue-1, carrying a `.loom-managed`
+# sentinel. Unlike make_wt_repo (a plain subdirectory), a linked worktree
+# exercises the show-toplevel vs. git-common-dir divergence: from inside the
+# worktree, `git rev-parse --show-toplevel` returns the *worktree* root while
+# `--git-common-dir/..` returns the *main* checkout. Echoes the repo path.
+make_wt_repo_linked() {
+    local dir
+    dir=$(mktemp -d 2>/dev/null)
+    dir=$(cd "$dir" && pwd -P)
+    git -C "$dir" init -q >/dev/null 2>&1
+    git -C "$dir" -c user.email=loom@test -c user.name=loom \
+        commit -q --allow-empty -m init >/dev/null 2>&1
+    mkdir -p "$dir/defaults/hooks" "$dir/.loom/worktrees"
+    git -C "$dir" worktree add -q "$dir/.loom/worktrees/issue-1" \
+        -b feature/issue-1 >/dev/null 2>&1
+    mkdir -p "$dir/.loom/worktrees/issue-1/src"
+    : > "$dir/.loom/worktrees/issue-1/.loom-managed"
+    echo "$dir"
+}
+
 WT_REPO=$(make_wt_repo)
 WT_DIR="$WT_REPO/.loom/worktrees/issue-1"
 
@@ -2124,7 +2145,31 @@ assert_allow "write-confinement: '>' inside a quoted -m value is not a target" \
 assert_allow "write-confinement: fd-dup 2>&1 is not treated as a file write" \
     "echo x 2>&1 | tee /tmp/loom-test-$$-log" "$WT_REPO"
 
-rm -rf "$WT_REPO" "$WT_REPO_NOWT" "$WT_REPO_OFF"
+# -------------------------------------------------------------------------
+# Regression (#4210): CWD is the builder's own LINKED worktree, and the write
+# targets the MAIN checkout by absolute path (or via `cd $MAIN`). This is the
+# canonical builder setup (`cd .loom/worktrees/issue-N`). The guard must key
+# its "inside the main checkout" test on the true main root
+# (--git-common-dir/..), NOT on `git rev-parse --show-toplevel` (which returns
+# the worktree root from a linked worktree) — otherwise a main-checkout write
+# from a worktree CWD slips through as ALLOW, leaving the headline #4178
+# protection open in exactly the configuration it is meant to cover.
+WT_REPO_LINKED=$(make_wt_repo_linked)
+WT_LINKED_DIR="$WT_REPO_LINKED/.loom/worktrees/issue-1"
+assert_deny "write-confinement: CWD=linked worktree, abs main-checkout write denies (#4210)" \
+    "echo x > $WT_REPO_LINKED/defaults/hooks/f.sh" "$WT_LINKED_DIR"
+assert_deny "write-confinement: CWD=linked worktree, cd \$MAIN && relative main write denies (#4210)" \
+    "cd $WT_REPO_LINKED && echo x > defaults/hooks/f.sh" "$WT_LINKED_DIR"
+assert_deny "write-confinement: CWD=linked worktree, sed -i on abs main-checkout path denies (#4210)" \
+    "sed -i 's/a/b/' $WT_REPO_LINKED/defaults/hooks/f.sh" "$WT_LINKED_DIR"
+# Sibling-allow checks from the same worktree CWD: writing inside the worktree
+# and to /tmp must still be permitted (no over-blocking from the new main root).
+assert_allow "write-confinement: CWD=linked worktree, write inside the worktree allows (#4210)" \
+    "echo x > $WT_LINKED_DIR/src/f.sh" "$WT_LINKED_DIR"
+assert_allow "write-confinement: CWD=linked worktree, write to /tmp allows (#4210)" \
+    "echo x > /tmp/loom-test-$$-linked.sh" "$WT_LINKED_DIR"
+
+rm -rf "$WT_REPO" "$WT_REPO_NOWT" "$WT_REPO_OFF" "$WT_REPO_LINKED"
 
 echo ""
 

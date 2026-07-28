@@ -1728,6 +1728,29 @@ if worktree_isolation_guard_enabled && \
      [[ "$COMMAND_ASK_SCAN" == *"mv "* ]]; }; then
     _WT_WRITE_BASE=""
     _WT_WRITE_BASE_DONE=""
+
+    # Derive the TRUE main-checkout root — NOT REPO_ROOT. REPO_ROOT is resolved
+    # via `git rev-parse --show-toplevel`, which returns the *worktree* root when
+    # CWD is a linked worktree (the canonical builder setup: `cd
+    # .loom/worktrees/issue-N`). Keying the "resolves inside the main checkout"
+    # test below on REPO_ROOT would therefore miss an absolute-path (or
+    # `cd $MAIN && …`) Bash write into the main checkout issued from a builder's
+    # own worktree — the exact "denied on Edit/Write → retry via Bash" escape
+    # this block exists to close (#4178). Mirror the sibling guard
+    # guard-worktree-paths.sh: `--git-common-dir/..` is always the main checkout,
+    # from a worktree or not. `pwd -P` resolves symlinks so it matches the
+    # git-resolved forms consistently (and sidesteps the macOS
+    # /tmp -> /private/tmp mismatch vs. normalize_abs_path's lexical-only form).
+    # Fail open to REPO_ROOT if the git resolution is unavailable.
+    _WT_MAIN_ROOT=""
+    if [[ -n "$CWD" && -d "$CWD" ]]; then
+        _wt_common=$(cd "$CWD" 2>/dev/null && git rev-parse --git-common-dir 2>/dev/null) || _wt_common=""
+        if [[ -n "$_wt_common" ]]; then
+            _WT_MAIN_ROOT=$(cd "$CWD" 2>/dev/null && cd "$_wt_common/.." 2>/dev/null && pwd -P) || _WT_MAIN_ROOT=""
+        fi
+    fi
+    [[ -n "$_WT_MAIN_ROOT" ]] || _WT_MAIN_ROOT="$REPO_ROOT"
+
     WRITE_TARGETS=$(extract_write_targets "$COMMAND_ASK_SCAN" "$CWD" | head -20)
     while IFS=$'\037' read -r _wcwd _wtarget; do
         [[ -z "$_wtarget" ]] && continue
@@ -1750,9 +1773,9 @@ if worktree_isolation_guard_enabled && \
 
         # Not under any worktree. If it's also not under the main checkout,
         # there is nothing this guard protects (e.g. /tmp scratch) -> allow.
-        [[ -z "$REPO_ROOT" ]] && continue
+        [[ -z "$_WT_MAIN_ROOT" ]] && continue
         case "$_wabs" in
-            "$REPO_ROOT"|"$REPO_ROOT"/*) : ;;
+            "$_WT_MAIN_ROOT"|"$_WT_MAIN_ROOT"/*) : ;;
             *) continue ;;
         esac
 
@@ -1760,13 +1783,15 @@ if worktree_isolation_guard_enabled && \
         # worktree. Deny only if worktree isolation is actually in play for
         # this repo/session (a managed worktree exists somewhere); otherwise
         # fail open — a repo/session that has never created a worktree is
-        # unaffected, mirroring guard-worktree-paths.sh exactly.
+        # unaffected, mirroring guard-worktree-paths.sh exactly. The worktree
+        # base is resolved off the same main-checkout root so the "a managed
+        # worktree exists" gate stays consistent with the containment test.
         if [[ -z "$_WT_WRITE_BASE_DONE" ]]; then
-            _WT_WRITE_BASE=$(resolve_worktree_root "$REPO_ROOT")
+            _WT_WRITE_BASE=$(resolve_worktree_root "$_WT_MAIN_ROOT")
             _WT_WRITE_BASE_DONE=1
         fi
         if _any_managed_worktree_exists "$_WT_WRITE_BASE"; then
-            deny "BLOCKED: Bash-tool write to '${_wabs}' resolves to the main repository checkout ('${REPO_ROOT}'), but a Loom-managed worktree exists for this session. This is a worktree-isolation bypass via Bash redirection/tee/sed -i/cp/mv — do NOT retry the write through Bash. cd into your issue worktree (.loom/worktrees/issue-<N>) and write there instead. (#4178)" "worktree-write-confinement"
+            deny "BLOCKED: Bash-tool write to '${_wabs}' resolves to the main repository checkout ('${_WT_MAIN_ROOT}'), but a Loom-managed worktree exists for this session. This is a worktree-isolation bypass via Bash redirection/tee/sed -i/cp/mv — do NOT retry the write through Bash. cd into your issue worktree (.loom/worktrees/issue-<N>) and write there instead. (#4178)" "worktree-write-confinement"
         fi
     done <<< "$WRITE_TARGETS"
 fi
