@@ -112,9 +112,27 @@ simulate_loom_install() {
     chmod +x "$target/.loom/bin/"* 2>/dev/null || true
   fi
 
-  # Copy CLAUDE.md
-  if [[ -f "$DEFAULTS_DIR/CLAUDE.md" ]]; then
-    cp "$DEFAULTS_DIR/CLAUDE.md" "$target/CLAUDE.md"
+  # Handle CLAUDE.md exactly as the real installer does
+  # (loom-daemon/src/init/scaffolding.rs:558-692):
+  #   1. Write the full Loom guide to <target>/.loom/CLAUDE.md, reading from the
+  #      surviving template defaults/.loom/CLAUDE.md.
+  #   2. Inject ONLY the short pointer, wrapped in Loom section markers, into
+  #      root <target>/CLAUDE.md — never the full guide.
+  # Emitting the full guide to root here (the pre-#4144 behaviour) is exactly the
+  # divergence Test "installer parity" below guards against: the real installer
+  # has no such path, so the uninstaller's marker branch was never exercised by
+  # the simulator.
+  if [[ -f "$DEFAULTS_DIR/.loom/CLAUDE.md" ]]; then
+    # Step 1: full guide -> .loom/CLAUDE.md
+    cp "$DEFAULTS_DIR/.loom/CLAUDE.md" "$target/.loom/CLAUDE.md"
+
+    # Step 2: marker-wrapped pointer -> root CLAUDE.md (mirrors LOOM_ROOT_POINTER
+    # wrapped by wrap_loom_content() in scaffolding.rs).
+    cat > "$target/CLAUDE.md" << 'ROOT_CLAUDE_EOF'
+<!-- BEGIN LOOM ORCHESTRATION -->
+This repository uses [Loom](https://github.com/rjwalters/loom) for AI-powered development orchestration — see the Loom repository for the full guide (roles, labels, worktrees, configuration). When installed, Loom also writes a locally-substituted copy of that guide to `.loom/CLAUDE.md`.
+<!-- END LOOM ORCHESTRATION -->
+ROOT_CLAUDE_EOF
   fi
 
   # Copy .claude directory
@@ -321,6 +339,37 @@ if [[ -f "$INSTALL_REPO/CLAUDE.md" ]]; then
   pass "CLAUDE.md exists"
 else
   fail "CLAUDE.md missing"
+fi
+
+# Test 10b: installer parity — root CLAUDE.md is the marker-wrapped pointer, NOT
+# the full guide, and the full guide lives at .loom/CLAUDE.md.
+#
+# This is the regression guard for #4144: the pre-fix simulator bare-`cp`d the
+# 2000+ line guide to root CLAUDE.md — a path the real installer
+# (loom-daemon/src/init/scaffolding.rs:558-692) never takes. It writes the guide
+# to <target>/.loom/CLAUDE.md and injects only LOOM_ROOT_POINTER, wrapped in
+# `<!-- BEGIN/END LOOM ORCHESTRATION -->` markers, into root CLAUDE.md. This
+# assertion FAILS if the simulator ever regresses to writing the full guide to
+# root (the header line leaks into root, or the marker block is absent) — verify
+# by temporarily reverting simulate_loom_install to `cp .../.loom/CLAUDE.md root`.
+echo "Test 10b: Root CLAUDE.md is the marker-wrapped pointer, not the full guide"
+PARITY_OK=true
+if ! grep -q '<!-- BEGIN LOOM ORCHESTRATION -->' "$INSTALL_REPO/CLAUDE.md" 2>/dev/null || \
+   ! grep -q '<!-- END LOOM ORCHESTRATION -->' "$INSTALL_REPO/CLAUDE.md" 2>/dev/null; then
+  PARITY_OK=false
+  fail "installer parity: root CLAUDE.md lacks the Loom section markers"
+fi
+if grep -q '^# Loom Orchestration - Repository Guide' "$INSTALL_REPO/CLAUDE.md" 2>/dev/null; then
+  PARITY_OK=false
+  fail "installer parity: root CLAUDE.md contains the full guide (should be pointer only)"
+fi
+if [[ ! -f "$INSTALL_REPO/.loom/CLAUDE.md" ]] || \
+   ! grep -q '^# Loom Orchestration - Repository Guide' "$INSTALL_REPO/.loom/CLAUDE.md" 2>/dev/null; then
+  PARITY_OK=false
+  fail "installer parity: full guide missing from .loom/CLAUDE.md"
+fi
+if [[ "$PARITY_OK" == "true" ]]; then
+  pass "installer parity: root is pointer-only, full guide at .loom/CLAUDE.md"
 fi
 
 # Test 11: .claude/commands/loom
@@ -532,6 +581,18 @@ UNINSTALL_REPO="$TEST_DIR/uninstall-test"
 create_temp_repo "$UNINSTALL_REPO"
 simulate_loom_install "$UNINSTALL_REPO"
 
+# Pre-uninstall precondition for Test 25: the freshly-installed root CLAUDE.md
+# must carry the Loom section marker block. This makes Test 25's post-uninstall
+# assertion prove *removal* of content shown to be present beforehand, rather
+# than passing vacuously (issue #4144 — the marker-pointer model means root
+# CLAUDE.md no longer contains the "Loom Orchestration" header the old grep keyed
+# on, so absence-by-construction must not masquerade as a removal proof).
+if grep -q '<!-- BEGIN LOOM ORCHESTRATION -->' "$UNINSTALL_REPO/CLAUDE.md" 2>/dev/null; then
+  pass "Pre-uninstall: root CLAUDE.md carries the Loom marker block (Test 25 precondition)"
+else
+  fail "Pre-uninstall: root CLAUDE.md is missing the Loom marker block — Test 25 would pass vacuously"
+fi
+
 # Test 20: Uninstall completes successfully
 echo "Test 20: Uninstall --yes --local completes"
 if "$UNINSTALL_SCRIPT" --yes --local "$UNINSTALL_REPO" > /dev/null 2>&1; then
@@ -576,15 +637,20 @@ else
 fi
 
 # Test 25: CLAUDE.md removed (Loom-generated)
-echo "Test 25: After uninstall, CLAUDE.md removed"
+# The root CLAUDE.md was the marker-wrapped pointer (asserted present above,
+# pre-uninstall). A pointer-only root is entirely Loom content, so the
+# uninstaller's marker branch strips the section and removes the now-empty file.
+# Assert the marker block is gone — not just that the "Loom Orchestration" header
+# is absent (it never was, under the pointer model), which would pass vacuously.
+echo "Test 25: After uninstall, CLAUDE.md Loom section removed"
 if [[ ! -f "$UNINSTALL_REPO/CLAUDE.md" ]]; then
-  pass "CLAUDE.md removed (Loom-generated)"
+  pass "CLAUDE.md removed (was entirely the Loom pointer)"
 else
-  # Check if Loom content was removed
-  if grep -q "Loom Orchestration" "$UNINSTALL_REPO/CLAUDE.md" 2>/dev/null; then
-    fail "CLAUDE.md still contains Loom content"
+  # File survived (e.g. mixed with user content): the marker block must be gone.
+  if grep -q '<!-- BEGIN LOOM ORCHESTRATION -->' "$UNINSTALL_REPO/CLAUDE.md" 2>/dev/null; then
+    fail "CLAUDE.md still contains the Loom marker block"
   else
-    pass "CLAUDE.md Loom content removed"
+    pass "CLAUDE.md Loom section removed"
   fi
 fi
 
@@ -756,10 +822,20 @@ echo "--- Section 6: CLAUDE.md Smart Removal ---"
 echo ""
 
 # Test 31: Loom-generated CLAUDE.md is fully removed
+# Under the marker-pointer model (issue #4144) the installed root CLAUDE.md is
+# the marker-wrapped pointer and nothing else. Prove removal, not absence: assert
+# the marker block is present before uninstall, then that the file is gone after.
 echo "Test 31: Loom-generated CLAUDE.md is fully removed"
 CLAUDEMD_REPO="$TEST_DIR/claudemd-test"
 create_temp_repo "$CLAUDEMD_REPO"
 simulate_loom_install "$CLAUDEMD_REPO"
+
+# Precondition: the installed root CLAUDE.md is the marker-wrapped pointer.
+if grep -q '<!-- BEGIN LOOM ORCHESTRATION -->' "$CLAUDEMD_REPO/CLAUDE.md" 2>/dev/null; then
+  pass "Pre-uninstall: Loom-generated CLAUDE.md carries the marker block"
+else
+  fail "Pre-uninstall: Loom-generated CLAUDE.md is missing the marker block"
+fi
 
 "$UNINSTALL_SCRIPT" --yes --local "$CLAUDEMD_REPO" > /dev/null 2>&1 || true
 

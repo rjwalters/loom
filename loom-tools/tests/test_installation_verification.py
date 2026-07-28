@@ -200,8 +200,12 @@ class TestInstallationFileStructure:
         assert len(script_files) > 0, "No .sh scripts in defaults/scripts/"
 
     def test_defaults_has_claude_md(self, defaults_dir: pathlib.Path) -> None:
-        claude_md = defaults_dir / "CLAUDE.md"
-        assert claude_md.exists(), "defaults/CLAUDE.md missing"
+        # The consumer template lives at defaults/.loom/CLAUDE.md (the file the
+        # real installer reads and writes to <target>/.loom/CLAUDE.md). The old
+        # root-level template was deleted in #4144 (Phase 3 of #4052) once its
+        # content was fully migrated into this template + defaults/docs/.
+        claude_md = defaults_dir / ".loom" / "CLAUDE.md"
+        assert claude_md.exists(), "defaults/.loom/CLAUDE.md missing"
 
     def test_defaults_has_labels(self, defaults_dir: pathlib.Path) -> None:
         labels = defaults_dir / ".github" / "labels.yml"

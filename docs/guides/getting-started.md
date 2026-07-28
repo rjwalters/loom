@@ -670,7 +670,7 @@ loom-daemon init --force
 
 # Or manually repair specific files
 cp defaults/config.json .loom/config.json
-cp defaults/CLAUDE.md ./CLAUDE.md
+cp defaults/.loom/CLAUDE.md ./.loom/CLAUDE.md
 ```
 
 ### Issue: Labels Not Syncing to GitHub
