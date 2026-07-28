@@ -1427,7 +1427,7 @@ Curator runs sequentially per-issue within wave setup — it is cheap and does n
 
 ### 3. Approval gate (per-issue)
 
-Each issue must reach `loom:issue` before the Builder can claim it.
+Each issue must reach `loom:issue` before the Builder can claim it. This promotion is authorized — see `.loom/roles/curator.md` § "Who promotes `loom:curated` → `loom:issue`" for the full rule. In short: the orchestrator only ever promotes an issue that is already a member of *this sweep's own resolved candidate set*, so the promotion executes an approval already given one step earlier in this same run (the operator named or confirmed the issue, or the daemon dispatch that started this sweep did) — it is not independent agent judgment, and it is not the Curator acting.
 
 - If the issue already has `loom:issue`, proceed.
 - Otherwise, promote it:
