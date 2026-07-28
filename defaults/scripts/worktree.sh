@@ -1584,13 +1584,19 @@ if _try_worktree_add; then
                     -name node_modules -not -path "*/node_modules/*" -print0 2>/dev/null)
     fi
 
-    # Symlink additional gitignored paths configured in .loom/config.json under
-    # worktree.linkPaths (e.g. generated wasm-pack bindings that are expensive
-    # to rebuild per worktree). Best-effort: missing config, missing jq, malformed
-    # JSON, or an empty/absent key all silently skip this step (#3528). Mirrors
-    # the inline-jq-with-guard pattern from validate-roles.sh.
-    LOOM_CONFIG_FILE="$MAIN_WORKSPACE_DIR/.loom/config.json"
-    if command -v jq >/dev/null 2>&1 && [[ -f "$LOOM_CONFIG_FILE" ]]; then
+    # Symlink additional gitignored paths configured for worktree.linkPaths
+    # (e.g. generated wasm-pack bindings that are expensive to rebuild per
+    # worktree). Best-effort: missing config, missing jq, malformed JSON, or
+    # an empty/absent key all silently skip this step (#3528).
+    #
+    # Resolved through the config-resolver tier chain (#4062, lib/worktree-root.sh
+    # already sources lib/config-resolver.sh) ONCE, then queried locally via jq
+    # — worktree.linkPaths is an array, so loom_config_get's pretty-printed
+    # multi-line-JSON return for non-scalars must not be used here (see
+    # config-resolver.sh's docstring); resolve the merged JSON and pipe it
+    # through the existing jq expression instead.
+    if command -v jq >/dev/null 2>&1; then
+        LOOM_WORKTREE_LINKPATHS_CFG="$(loom_resolve_config "$MAIN_WORKSPACE_DIR")"
         while IFS= read -r link_path; do
             if [[ -z "$link_path" ]]; then
                 continue
@@ -1610,7 +1616,7 @@ if _try_worktree_add; then
                     fi
                 fi
             fi
-        done < <(jq -r '.worktree.linkPaths[]? // empty' "$LOOM_CONFIG_FILE" 2>/dev/null)
+        done < <(echo "$LOOM_WORKTREE_LINKPATHS_CFG" | jq -r '.worktree.linkPaths[]? // empty' 2>/dev/null)
     fi
 
     # Symlink .mcp.json from main workspace if available
