@@ -391,15 +391,29 @@ the pool when the request carries an explicit `workspace_root` (#3929), so all
 per-repo registries are observable/addressable via `list_sweeps` /
 `get_sweep_status` / `tail_sweep_log` / `cancel_sweep` / `dispatch_sweep`.
 
+**Watchdog coverage for every provisioned workspace (#4124)**: `get_or_provision`
+spawns the sweep watchdog (the startup-hang / mid-build-death / review-stall
+self-healing backstops described above) alongside the reaper for **every**
+pooled workspace, not just the default one — closing a gap where only the
+default workspace's registry (wired up once in `main.rs`) had a watchdog and
+every other managed repo got a reaper and nothing else, silently disabling the
+startup-hang recovery from #3887 in any multi-repo deployment. Each pooled
+workspace resolves its own watchdog config (enabled/timeout/interval/review-stall)
+from its own `.loom/config.json`, mirroring the dispatch-stagger and quarantine
+config already resolved per workspace — so the resolution is genuinely
+per-workspace, not a copy of the default workspace's tuning. The seeded default
+workspace is unaffected: `main.rs` still owns its one watchdog, and
+`get_or_provision` returns the seeded entry without spawning a second one.
+
 **Eviction on `workspace remove` (#3929)**: `DeregisterWorkspace` (the
 `workspace remove` CLI) calls `WorkspacePool::evict`, which drops the pooled
-registry and **aborts its background reaper task** so it does not leak. The
-**seeded default workspace is guarded** — it is owned by `main` and keeps serving
-default-workspace IPC requests, so evicting it is a no-op. A live sweep child in
-an evicted registry is **not** killed and its lock/log files are untouched; only
-the in-memory tracking + reaper go away, so the sweep finishes normally but its
-terminal state becomes unobservable via IPC after the deregister — an accepted
-consequence of an explicit operator `workspace remove`.
+registry and **aborts its background reaper and watchdog tasks** so neither
+leaks. The **seeded default workspace is guarded** — it is owned by `main` and
+keeps serving default-workspace IPC requests, so evicting it is a no-op. A live
+sweep child in an evicted registry is **not** killed and its lock/log files are
+untouched; only the in-memory tracking + reaper + watchdog go away, so the sweep
+finishes normally but its terminal state becomes unobservable via IPC after the
+deregister — an accepted consequence of an explicit operator `workspace remove`.
 
 ## Token pool provisioning for managed repos (#3938)
 
