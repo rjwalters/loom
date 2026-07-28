@@ -262,6 +262,28 @@ compatibility and refuses to dispatch a role onto a runtime that cannot meet its
 requirements, rather than letting the session fail partway. The declaration is
 per-runtime; the requirements are per-role; the match happens at dispatch time.
 
+**Landed today (#4170):** the declaration and requirement sides of this contract
+exist as data + a standalone checker, ahead of dispatch wiring:
+
+- **Declaration** — `defaults/runtimes/<name>.json` (e.g.
+  `defaults/runtimes/claude.json`), matching the sketch above exactly (tri-state
+  `"yes" | "no" | "partial"` string values, capability set `mcp`, `subagents`,
+  `hooks`, `skills`, `worktreeIsolation`).
+- **Requirements** — an optional `"runtimeRequirements"` array on a role sidecar
+  (`defaults/roles/<name>.json`), e.g. `"runtimeRequirements": ["worktreeIsolation",
+  "mcp"]` on `builder.json`. A role with no `runtimeRequirements` key has no
+  constraints (any runtime is compatible). This is a distinct field from the
+  pre-existing `suggestedWorkerType` (a dispatch *preference* hint) — the checker
+  reads only `runtimeRequirements`.
+- **Matcher** — `defaults/scripts/check-runtime-capabilities.sh --role <name>
+  --runtime <name>` loads both files and checks requirements ⊆ capabilities,
+  where a requirement is satisfied only by a declared `"yes"` (`"partial"` fails
+  closed). Exit 0 on match or no-requirements, exit 78 (`EX_CONFIG`) on mismatch
+  naming each unmet capability, non-zero with a distinct message on an
+  unknown/missing role or runtime file. It is intentionally **standalone** —
+  not yet wired into `spawn-worker.sh` or any dispatch path; that wiring is a
+  follow-up decision.
+
 ## Phase 1: the `spawn-worker.sh` runtime-dispatch seam
 
 Contract point 1 ([Spawn](#1-spawn)) is realized today by a concrete

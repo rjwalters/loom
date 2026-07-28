@@ -179,6 +179,9 @@ _emit_installed_files_manifest() {
       scripts/*)
         target_path=".loom/${rel_path}"
         ;;
+      runtimes/*)
+        target_path=".loom/${rel_path}"
+        ;;
       hooks/*)
         target_path=".loom/${rel_path}"
         ;;
