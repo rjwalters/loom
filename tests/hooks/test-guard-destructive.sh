@@ -2174,6 +2174,105 @@ rm -rf "$WT_REPO" "$WT_REPO_NOWT" "$WT_REPO_OFF" "$WT_REPO_LINKED"
 echo ""
 
 # =========================================================================
+echo -e "${YELLOW}--- Truth table: config-resolver migration polarity (#4063) ---${NC}"
+# =========================================================================
+#
+# guards.sqlDdl / cloudCli / reversibleGh / decisionLog / rmScope / forceScope
+# and worktree.root were migrated from a bespoke per-guard jq read to the
+# shared loom_config_get() (defaults/scripts/lib/config-resolver.sh). Each
+# reader keeps its EXACT prior polarity in bash rather than trusting
+# loom_config_get's null-collapses-to-default behavior blindly (see the
+# migration comment at each function). This is the truth table the migration
+# issue's acceptance criteria asked for: key absent / explicit true / explicit
+# false / explicit null / malformed JSON / non-boolean value, each verified to
+# resolve to the SAME decision as pre-migration main. Absent / true / false /
+# malformed are already covered by each guard's own section above; this
+# section adds the two previously-untested shapes — explicit `null` and a
+# non-boolean/out-of-range value — for every migrated reader.
+
+TT_NULL_REPO=$(make_sql_repo '{"guards":{"sqlDdl":null,"cloudCli":null,"reversibleGh":null,"decisionLog":null,"rmScope":null,"forceScope":null},"worktree":{"root":null}}')
+TT_NONBOOL_REPO=$(make_sql_repo '{"guards":{"sqlDdl":"yes","cloudCli":"yes","reversibleGh":"yes","decisionLog":"yes","rmScope":"banana","forceScope":"banana"},"worktree":{"root":42}}')
+
+# --- sqlDdl: default-on (true); explicit null and a non-boolean value both
+# stay ON (only an explicit boolean `false` disables). ---
+assert_deny "truth-table sqlDdl=null: DROP TABLE still denied (default true)" \
+    "mysql -e 'DROP TABLE users;'" "$TT_NULL_REPO"
+assert_deny "truth-table sqlDdl=\"yes\" (non-boolean): DROP TABLE still denied (default true)" \
+    "mysql -e 'DROP TABLE users;'" "$TT_NONBOOL_REPO"
+
+# --- cloudCli: default-on (true); explicit null and a non-boolean value both
+# still ask (only an explicit boolean `false` disables). ---
+assert_ask "truth-table cloudCli=null: aws ec2 terminate-instances still asks (default true)" \
+    "aws ec2 terminate-instances --instance-ids i-1234" "$TT_NULL_REPO"
+assert_ask "truth-table cloudCli=\"yes\" (non-boolean): aws ec2 terminate-instances still asks (default true)" \
+    "aws ec2 terminate-instances --instance-ids i-1234" "$TT_NONBOOL_REPO"
+
+# --- reversibleGh: default-off (false, INVERSE polarity); explicit null and a
+# non-boolean value both stay OFF (only an explicit boolean `true` enables). ---
+assert_allow "truth-table reversibleGh=null: gh pr close allowed (default false)" \
+    "gh pr close 42" "$TT_NULL_REPO"
+assert_allow "truth-table reversibleGh=\"yes\" (non-boolean): gh pr close allowed (default false)" \
+    "gh pr close 42" "$TT_NONBOOL_REPO"
+
+# --- rmScope: default "repo" (only "off"/"permissive" opt out); explicit null
+# and an unrecognized string both fall through to the safe "repo" default. ---
+assert_deny "truth-table rmScope=null: outside-repo path still denied (default repo)" \
+    "rm -rf /opt/some-vendor/important" "$TT_NULL_REPO"
+assert_deny "truth-table rmScope=\"banana\" (out-of-range): outside-repo path still denied (default repo)" \
+    "rm -rf /opt/some-vendor/important" "$TT_NONBOOL_REPO"
+
+# --- forceScope: default "all" (only "protected"/"off" opt out); explicit
+# null and an unrecognized string both fall through to "all" (force-push to a
+# working branch still asks). ---
+assert_ask "truth-table forceScope=null: force-push to working branch still asks (default all)" \
+    "git push --force origin feature/x" "$TT_NULL_REPO"
+assert_ask "truth-table forceScope=\"banana\" (out-of-range): force-push to working branch still asks (default all)" \
+    "git push --force origin feature/x" "$TT_NONBOOL_REPO"
+
+# --- worktree.root: explicit null and a non-string (number) value both fall
+# through to the in-repo default worktrees dir — no external root is admitted,
+# so an outside-repo rm under the would-be configured path is still denied
+# under the default rmScope=repo. ---
+assert_deny "truth-table worktree.root=null: no external root admitted, outside path denied" \
+    "rm -rf /Volumes/scratch/loom-wt/some-worktree/issue-1/foo" "$TT_NULL_REPO"
+assert_deny "truth-table worktree.root=42 (non-string): no external root admitted, outside path denied" \
+    "rm -rf /Volumes/scratch/loom-wt/some-worktree/issue-1/foo" "$TT_NONBOOL_REPO"
+
+# --- decisionLog: default-off (false, INVERSE polarity); explicit null and a
+# non-boolean value both stay OFF (only an explicit boolean `true` enables). No
+# env var is set, so the config value alone drives the decision. ---
+TT_DL_LOG="$(mktemp -u)"
+rm -f "$TT_DL_LOG"
+make_input "rm -rf /" "$TT_NULL_REPO" | \
+    env LOOM_GUARD_DECISION_LOG_FILE="$TT_DL_LOG" "$GUARD" >/dev/null 2>&1 || true
+TOTAL=$((TOTAL + 1))
+if [[ ! -f "$TT_DL_LOG" ]]; then
+    PASS=$((PASS + 1))
+    echo -e "  ${GREEN}PASS${NC}: truth-table decisionLog=null: deny writes NO decision record (default false)"
+else
+    FAIL=$((FAIL + 1))
+    echo -e "  ${RED}FAIL${NC}: truth-table decisionLog=null: deny writes NO decision record (default false)"
+    echo -e "       unexpected: $(cat "$TT_DL_LOG")"
+fi
+
+rm -f "$TT_DL_LOG"
+make_input "rm -rf /" "$TT_NONBOOL_REPO" | \
+    env LOOM_GUARD_DECISION_LOG_FILE="$TT_DL_LOG" "$GUARD" >/dev/null 2>&1 || true
+TOTAL=$((TOTAL + 1))
+if [[ ! -f "$TT_DL_LOG" ]]; then
+    PASS=$((PASS + 1))
+    echo -e "  ${GREEN}PASS${NC}: truth-table decisionLog=\"yes\" (non-boolean): deny writes NO decision record (default false)"
+else
+    FAIL=$((FAIL + 1))
+    echo -e "  ${RED}FAIL${NC}: truth-table decisionLog=\"yes\" (non-boolean): deny writes NO decision record (default false)"
+    echo -e "       unexpected: $(cat "$TT_DL_LOG")"
+fi
+
+rm -rf "$TT_NULL_REPO" "$TT_NONBOOL_REPO"
+
+echo ""
+
+# =========================================================================
 echo -e "${YELLOW}--- Performance check ---${NC}"
 # =========================================================================
 
