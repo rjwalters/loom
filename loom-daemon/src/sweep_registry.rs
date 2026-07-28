@@ -159,6 +159,27 @@ impl std::fmt::Display for OpenPrDispatchError {
 
 impl std::error::Error for OpenPrDispatchError {}
 
+/// Issue #4256: checkpoint phases at/after Builder completion. A crash whose
+/// checkpoint reads one of these means a PR was opened for the issue, so
+/// [`SweepRegistry::reap_once`]'s reaper-driven resume is eligible to
+/// re-dispatch straight past the #4123 open-PR guard — the checkpoint-resume
+/// machinery (#3373) then skips back to the correct phase (typically Judge)
+/// rather than redoing the Builder.
+///
+/// Mirrors `VALID_PHASES` in `defaults/scripts/sweep-checkpoint.sh` (the
+/// daemon only *reads* checkpoint phases; the sweep skill is the sole writer
+/// and validator, so this is a read-side allowlist, not the canonical
+/// source). `curator-done` is excluded (no PR exists yet — an ordinary
+/// re-dispatch is exactly right). `merge-done` is excluded too: a merge
+/// closes the issue, so the 2.5 closed-issue guard already refuses a
+/// re-dispatch there and a resume would be a wasted forge round trip.
+const RESUMABLE_CHECKPOINT_PHASES: [&str; 4] = [
+    "builder-done",
+    "judge-rejected",
+    "judge-done",
+    "doctor-done",
+];
+
 /// Issue #3944: which tier of the dispatch-model precedence chain supplied the
 /// resolved model. Surfaced in the daemon dispatch log line so an operator can
 /// tell *why* a child is running a given model.
@@ -1890,6 +1911,43 @@ impl SweepRegistry {
         effort: Option<&str>,
         depends_on: Option<u32>,
     ) -> Result<DispatchOutcome> {
+        self.dispatch_inner(kind, idempotency_key, model, effort, depends_on, None)
+    }
+
+    /// Issue #4256: reaper-driven resume. When [`Self::reap_once`] observes a
+    /// crashed sweep whose checkpoint shows real Builder-or-later progress
+    /// (`RESUMABLE_CHECKPOINT_PHASES`) AND whose issue still has an open
+    /// linked PR, it is not fresh work — it is the exact scenario the #4123
+    /// open-PR guard exists to protect (an ordinary re-dispatch would
+    /// double-build), but here the open PR *is* this crashed sweep's own PR
+    /// and the checkpoint-resume machinery (#3373) exists precisely to pick
+    /// back up at the correct phase (typically Judge) instead of redoing the
+    /// Builder.
+    ///
+    /// This bypasses guard step 2.6 for exactly this one issue/PR pair —
+    /// `resume_pr` must equal the PR the guard would itself find, so a stale
+    /// or mismatched caller can never silently disable the guard. It is
+    /// **only** reachable from [`Self::reap_once`]; no other call site
+    /// (work-finder, IPC/CLI dispatch, epic supervisor, watchdogs) can pass a
+    /// bypass, so the anti-duplicate property of #4123 is unchanged for
+    /// every other dispatch path.
+    fn dispatch_resume_after_crash(
+        &mut self,
+        issue: u32,
+        resume_pr: u32,
+    ) -> Result<DispatchOutcome> {
+        self.dispatch_inner(&SweepKind::Issue(issue), None, None, None, None, Some(resume_pr))
+    }
+
+    fn dispatch_inner(
+        &mut self,
+        kind: &SweepKind,
+        idempotency_key: Option<String>,
+        model: Option<&str>,
+        effort: Option<&str>,
+        depends_on: Option<u32>,
+        resume_bypass_pr: Option<u32>,
+    ) -> Result<DispatchOutcome> {
         // 1. Idempotency dedup against Running entries.
         if let Some(ref key) = idempotency_key {
             if let Some(existing) = self.find_running_by_key(key) {
@@ -1982,13 +2040,26 @@ impl SweepRegistry {
         //     a Gitea workspace — this is GitHub-only, like `issue_is_closed`)
         //     can never wedge the daemon. Skipped when label flips are disabled
         //     (test fixtures without `gh` credentials), mirroring 2.5.
+        //
+        //     Issue #4256: `resume_bypass_pr` — set only by
+        //     `dispatch_resume_after_crash`, itself only reachable from
+        //     `reap_once` — exempts a resume of THIS issue's own crashed sweep
+        //     from the guard, but only when it names the exact PR the guard
+        //     would find; any other PR (or none) still refuses normally, so a
+        //     stale/mismatched resume can never widen into a blanket bypass.
         if !self.config.skip_label_flip {
             if let Some(pr) = self.first_open_linked_pr(issue_number) {
-                return Err(OpenPrDispatchError {
-                    issue: issue_number,
-                    pr,
+                if resume_bypass_pr != Some(pr) {
+                    return Err(OpenPrDispatchError {
+                        issue: issue_number,
+                        pr,
+                    }
+                    .into());
                 }
-                .into());
+                log::info!(
+                    "issue #{issue_number}: reaper-driven resume dispatch bypassing the #4123 \
+                     open-PR guard for its own PR #{pr} (#4256)"
+                );
             }
         }
 
@@ -3752,6 +3823,10 @@ impl SweepRegistry {
                                 .and_then(|p| tail_lines(p, EXHAUSTION_LOG_TAIL_LINES).ok())
                                 .map(|lines| lines.join("\n"))
                                 .and_then(|tail| classify_crash(&tail, exit_code));
+                            // Captured before `checkpoint_phase` moves into the
+                            // `SweepCrashed` event below — needed for the
+                            // reaper-driven resume check further down (#4256).
+                            let resume_phase_check = checkpoint_phase.clone();
                             if let Some(info) = self.entries.get_mut(&sweep_id) {
                                 info.state = SweepState::Crashed { at: now };
                                 if info.latest_phase.is_none() {
@@ -3792,6 +3867,68 @@ impl SweepRegistry {
                                 // #4122: re-attribute account-exhaustion deaths
                                 // to the spawn account instead of the issue.
                                 self.record_insta_crash_outcome(&sweep_id, issue, insta_crash);
+                            }
+                            // Reaper-driven resume (Issue #4256): a crash whose
+                            // checkpoint shows real Builder-or-later progress
+                            // AND whose issue still has an open linked PR is
+                            // not fresh work — it is exactly the case the
+                            // #4123 open-PR guard exists to protect (an
+                            // ordinary re-dispatch would double-build). But
+                            // here the open PR *is* this crashed sweep's own
+                            // PR, and the checkpoint-resume machinery (#3373)
+                            // exists precisely to skip back to the correct
+                            // phase (typically Judge) instead of redoing the
+                            // Builder. Without this, the guard and the resume
+                            // machinery contradict each other: the guard
+                            // correctly refuses every ordinary re-dispatch,
+                            // and nothing else ever re-dispatches the issue —
+                            // stranding the PR at `loom:review-requested`
+                            // forever. Gated on `skip_label_flip` like the
+                            // guard itself (test fixtures without `gh`
+                            // credentials never attempt a real forge probe
+                            // here) and only checked for phases at/after
+                            // Builder completion, so a pre-PR crash never
+                            // pays for the extra forge round trip. Also
+                            // respects the #4206 operator-park guard: never
+                            // resume-dispatch an issue `restore_label_to_ready`
+                            // just deliberately left without `loom:issue`
+                            // because it carries `loom:blocked`.
+                            if !self.config.skip_label_flip
+                                && resume_phase_check
+                                    .as_deref()
+                                    .is_some_and(|p| RESUMABLE_CHECKPOINT_PHASES.contains(&p))
+                                && !self.issue_has_blocked_label(issue)
+                            {
+                                if let Some(pr) = self.first_open_linked_pr(issue) {
+                                    let dispatched =
+                                        match self.dispatch_resume_after_crash(issue, pr) {
+                                            Ok(_) => {
+                                                log::info!(
+                                                    "issue #{issue}: reaper-driven resume \
+                                                     dispatched (crashed at checkpoint phase \
+                                                     {resume_phase_check:?}, open PR #{pr}) \
+                                                     — #4256"
+                                                );
+                                                true
+                                            }
+                                            Err(e) => {
+                                                log::warn!(
+                                                    "issue #{issue}: reaper-driven resume \
+                                                     dispatch failed (crashed at checkpoint \
+                                                     phase {resume_phase_check:?}, open PR \
+                                                     #{pr}): {e} — #4256"
+                                                );
+                                                false
+                                            }
+                                        };
+                                    events_to_emit.push(Event::SweepResumeDispatched {
+                                        issue,
+                                        pr,
+                                        checkpoint_phase: resume_phase_check.clone(),
+                                        dispatched,
+                                        repo: None, // stamped by emit_event (#3929)
+                                    });
+                                }
                             }
                         } else {
                             // Orphaned-claim recovery (issue #3823b): a
@@ -11314,6 +11451,242 @@ exit 0\n";
             !calls.contains("api graphql"),
             "the open-PR (2.6) probe must never run once 2.5 refuses; got: {calls:?}"
         );
+    }
+
+    // --- reaper-driven resume (Issue #4256) ---
+
+    /// Write a `sweep-checkpoint.sh`-style checkpoint file for `issue` with
+    /// `phase`, matching the on-disk shape `read_checkpoint_phase` parses.
+    fn write_checkpoint(reg: &SweepRegistry, issue: u32, phase: &str) {
+        let dir = reg.config.checkpoint_dir();
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join(format!("issue-{issue}.json")),
+            format!(r#"{{"phase":"{phase}","issue":{issue}}}"#),
+        )
+        .unwrap();
+    }
+
+    /// Insert a `Running` entry with a guaranteed-dead PID (Issue #4256 test
+    /// fixture), mirroring `reaper_emits_crashed_event_with_checkpoint_phase`'s
+    /// pattern: no retained `Child` handle, so `poll_liveness` falls back to
+    /// the `kill(pid, 0)` probe, which reports dead for this bogus PID.
+    fn insert_dead_running_entry(reg: &mut SweepRegistry, issue: u32, sweep_id: &str) {
+        reg.entries.insert(
+            sweep_id.to_string(),
+            SweepInfo {
+                sweep_id: sweep_id.to_string(),
+                kind: SweepKind::Issue(issue),
+                pid: 2_147_483_641,
+                token_name: "unknown".into(),
+                log_path: reg.compute_log_path(issue),
+                idempotency_key: None,
+                started_at: Utc::now() - chrono::Duration::seconds(5),
+                state: SweepState::Running,
+                latest_phase: None,
+                pr_number: None,
+                model: None,
+                effort: None,
+                depends_on: None,
+                repo: None,
+            },
+        );
+    }
+
+    /// AC (Test Plan item 1): a crashed sweep whose checkpoint reads
+    /// `builder-done` AND whose issue has an open linked PR is resumed by the
+    /// reaper — the resume dispatch bypasses the #4123 open-PR guard (a
+    /// second `issue edit ... loom:building` shows up in the gh log for a
+    /// FRESH sweep entry), and a `SweepResumeDispatched` event is published so
+    /// the recovery attempt is visible on the event bus (AC: "not silent").
+    #[tokio::test]
+    #[serial]
+    async fn reaper_resumes_crashed_sweep_at_builder_done_with_open_pr() {
+        use crate::event_bus::EventBus;
+
+        let tmp = tempdir().unwrap();
+        let ws = tmp.path();
+        std::env::set_var("LOOM_REPO", "rjwalters/loom");
+        let (mut reg, gh_log) = open_pr_guard_registry(ws, "4300", 0, false);
+        let bus = Arc::new(EventBus::new());
+        reg.set_event_bus(bus.clone());
+        let mut sub = bus.subscribe::<[&str; 0], &str>([]);
+
+        write_checkpoint(&reg, 4256, "builder-done");
+        insert_dead_running_entry(&mut reg, 4256, "sweep-issue-4256-crashed");
+
+        let changed = reg.reap_once();
+        assert!(changed >= 1);
+
+        let mut saw_resume = false;
+        let mut saw_crashed = false;
+        // Crashed, GlobalCompleted, GlobalDispatch (resume spawn), plus our
+        // ResumeDispatched — drain generously and match by variant.
+        for _ in 0..8 {
+            let Ok(ev) = tokio::time::timeout(Duration::from_secs(5), sub.recv()).await else {
+                break;
+            };
+            match ev.unwrap() {
+                Event::SweepResumeDispatched {
+                    issue,
+                    pr,
+                    checkpoint_phase,
+                    dispatched,
+                    ..
+                } => {
+                    assert_eq!(issue, 4256);
+                    assert_eq!(pr, 4300);
+                    assert_eq!(checkpoint_phase.as_deref(), Some("builder-done"));
+                    assert!(dispatched, "the resume dispatch itself must have succeeded");
+                    saw_resume = true;
+                }
+                Event::SweepCrashed { issue, .. } => {
+                    assert_eq!(issue, 4256);
+                    saw_crashed = true;
+                }
+                _ => {}
+            }
+        }
+        assert!(saw_crashed, "expected the normal sweep.issue.4256.crashed event too");
+        assert!(saw_resume, "expected a sweep.issue.4256.resume_dispatched event");
+
+        // A fresh Running entry exists for issue 4256 under a NEW sweep_id
+        // (the original crashed one is retained, terminal).
+        let resumed_id = running_issue_sweep_id(&reg, 4256);
+        assert!(resumed_id.is_some(), "resume dispatch must have created a new Running entry");
+        assert_ne!(resumed_id.unwrap(), "sweep-issue-4256-crashed");
+
+        let calls = std::fs::read_to_string(&gh_log).unwrap_or_default();
+        assert!(
+            calls.contains("issue edit 4256") && calls.contains("loom:building"),
+            "the resume dispatch must flip the label like an ordinary dispatch; got: {calls:?}"
+        );
+        std::env::remove_var("LOOM_REPO");
+    }
+
+    /// AC (Test Plan item 3): a crashed sweep whose checkpoint is
+    /// `curator-done` (pre-PR) is NOT resumed even though `first_open_linked_pr`
+    /// would report one — resume is gated on a Builder-or-later checkpoint
+    /// phase, and a pre-PR crash gets ONLY the normal crash handling.
+    #[tokio::test]
+    #[serial]
+    async fn reaper_does_not_resume_pre_builder_checkpoint() {
+        use crate::event_bus::EventBus;
+
+        let tmp = tempdir().unwrap();
+        let ws = tmp.path();
+        std::env::set_var("LOOM_REPO", "rjwalters/loom");
+        let (mut reg, gh_log) = open_pr_guard_registry(ws, "4301", 0, false);
+        let bus = Arc::new(EventBus::new());
+        reg.set_event_bus(bus.clone());
+        let mut sub = bus.subscribe::<[&str; 0], &str>([]);
+
+        write_checkpoint(&reg, 4257, "curator-done");
+        insert_dead_running_entry(&mut reg, 4257, "sweep-issue-4257-crashed");
+
+        let changed = reg.reap_once();
+        assert!(changed >= 1);
+
+        for _ in 0..2 {
+            let ev = sub.recv().await.unwrap();
+            assert!(
+                !matches!(ev, Event::SweepResumeDispatched { .. }),
+                "a pre-Builder checkpoint must never trigger a resume dispatch"
+            );
+        }
+
+        assert!(
+            running_issue_sweep_id(&reg, 4257).is_none(),
+            "no resume dispatch means no fresh Running entry for the issue"
+        );
+        let calls = std::fs::read_to_string(&gh_log).unwrap_or_default();
+        assert!(
+            !calls.contains("api graphql"),
+            "resume-eligibility check must not even probe the closes-graph for a \
+             pre-Builder checkpoint phase; got: {calls:?}"
+        );
+        std::env::remove_var("LOOM_REPO");
+    }
+
+    /// Edge case (Test Plan item 4): the crashed sweep's PR already
+    /// merged/closed by the time the reaper ticks — `first_open_linked_pr`
+    /// returns `None` (empty post-`--jq` output), so no resume is attempted
+    /// and no error surfaces; only the normal crash handling fires.
+    #[tokio::test]
+    #[serial]
+    async fn reaper_skips_resume_when_pr_already_closed() {
+        use crate::event_bus::EventBus;
+
+        let tmp = tempdir().unwrap();
+        let ws = tmp.path();
+        std::env::set_var("LOOM_REPO", "rjwalters/loom");
+        // Empty graphql stdout ⇒ no OPEN-state linked PR.
+        let (mut reg, gh_log) = open_pr_guard_registry(ws, "", 0, false);
+        let bus = Arc::new(EventBus::new());
+        reg.set_event_bus(bus.clone());
+        let mut sub = bus.subscribe::<[&str; 0], &str>([]);
+
+        write_checkpoint(&reg, 4258, "judge-done");
+        insert_dead_running_entry(&mut reg, 4258, "sweep-issue-4258-crashed");
+
+        let changed = reg.reap_once();
+        assert!(changed >= 1);
+
+        for _ in 0..2 {
+            let ev = sub.recv().await.unwrap();
+            assert!(
+                !matches!(ev, Event::SweepResumeDispatched { .. }),
+                "no open PR means no resume dispatch, even at a resumable phase"
+            );
+        }
+
+        assert!(
+            running_issue_sweep_id(&reg, 4258).is_none(),
+            "no resume dispatch means no fresh Running entry for the issue"
+        );
+        let calls = std::fs::read_to_string(&gh_log).unwrap_or_default();
+        assert!(
+            calls.contains("api graphql"),
+            "the resume-eligibility check DID probe the closes-graph; got: {calls:?}"
+        );
+        std::env::remove_var("LOOM_REPO");
+    }
+
+    /// AC (Test Plan item 2, regression): the recovery path must NOT weaken
+    /// the #4123 guard for ordinary dispatches. After a reaper-driven resume
+    /// has fired for an issue (so it now has a fresh Running sweep AND an
+    /// open PR), a plain `dispatch()` call for the SAME issue — simulating an
+    /// unrelated later work-finder tick — is still refused with the typed
+    /// `OpenPrDispatchError`. The resume bypass is unreachable from the
+    /// public `dispatch()` entry point.
+    #[tokio::test]
+    #[serial]
+    async fn ordinary_dispatch_still_refused_after_a_resume() {
+        let tmp = tempdir().unwrap();
+        let ws = tmp.path();
+        std::env::set_var("LOOM_REPO", "rjwalters/loom");
+        let (mut reg, _gh_log) = open_pr_guard_registry(ws, "4302", 0, false);
+
+        write_checkpoint(&reg, 4259, "doctor-done");
+        insert_dead_running_entry(&mut reg, 4259, "sweep-issue-4259-crashed");
+        let changed = reg.reap_once();
+        assert!(changed >= 1);
+        assert!(
+            running_issue_sweep_id(&reg, 4259).is_some(),
+            "the resume dispatch must have created a fresh Running entry first"
+        );
+
+        // A later, ordinary re-dispatch attempt for the same issue (e.g. a
+        // stray work-finder tick, or a watchdog) must still be refused — the
+        // open PR is still open, and this call carries no resume exemption.
+        let err = reg
+            .dispatch(&SweepKind::Issue(4259), None, None, None, None)
+            .expect_err("an ordinary dispatch must still be refused by the #4123 guard");
+        assert!(
+            err.downcast_ref::<OpenPrDispatchError>().is_some(),
+            "must be the typed OpenPrDispatchError, not some other failure; got: {err}"
+        );
+        std::env::remove_var("LOOM_REPO");
     }
 
     // --- workspace-commands dispatch guard (Issue #4027) ---

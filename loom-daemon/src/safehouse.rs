@@ -402,6 +402,7 @@ fn decode_exit_code_annotation(code: i32) -> &'static str {
 /// | `SweepBlocker` | `handoff` | `<repo>#n · BLOCKED — <reason>` |
 /// | `SweepExited` | `ack` | `<repo>#n · done ✓ · <dur>` or `<repo>#n · failed ✗ · exit <code>[ (decoded)] · <dur>` |
 /// | `SweepCrashed` | `handoff` | `<repo>#n · crashed ✗ at <checkpoint_phase> — resumable (checkpoint kept)` |
+/// | `SweepResumeDispatched` (#4256) | `handoff` | `<repo>#n · reaper resumed crashed sweep at <phase> (open PR #m) — resuming without operator intervention` (or a "still stranded" variant when the resume dispatch itself failed) |
 ///
 /// `SweepGlobalCompleted` is intentionally **not** narrated: it carries only a
 /// `sweep_id` (no issue number), and `SweepExited` already emits the completion
@@ -485,6 +486,33 @@ pub fn event_to_envelope(event: &Event) -> Option<Envelope> {
                     "{} · crashed ✗ at {phase} — resumable (checkpoint kept)",
                     repo_issue_prefix(repo.as_deref(), *issue)
                 ),
+            })
+        }
+        Event::SweepResumeDispatched {
+            issue,
+            pr,
+            checkpoint_phase,
+            dispatched,
+            repo,
+        } => {
+            let phase = checkpoint_phase.as_deref().unwrap_or("unknown");
+            let prefix = repo_issue_prefix(repo.as_deref(), *issue);
+            let body = if *dispatched {
+                format!(
+                    "{prefix} · reaper resumed crashed sweep at {phase} (open PR #{pr}) — \
+                     resuming without operator intervention"
+                )
+            } else {
+                format!(
+                    "{prefix} · reaper attempted resume at {phase} (open PR #{pr}) but the \
+                     dispatch itself failed — still stranded, needs a look"
+                )
+            };
+            Some(Envelope {
+                to: "*".to_owned(),
+                kind: "handoff".to_owned(),
+                task_id: Some(qualify_task_id(repo.as_deref(), *issue)),
+                body,
             })
         }
         // SweepGlobalCompleted (no issue number — SweepExited covers it),
@@ -1276,7 +1304,7 @@ mod tests {
     // ---- event → envelope mapping ----
 
     #[test]
-    fn maps_the_five_narrated_events() {
+    fn maps_the_narrated_events() {
         let dispatch = Event::SweepGlobalDispatch {
             sweep_id: "sweep-issue-42-1".to_owned() as SweepId,
             kind: SweepKind::Issue(42),
@@ -1338,6 +1366,36 @@ mod tests {
         let env = event_to_envelope(&crashed).unwrap();
         assert_eq!(env.kind, "handoff");
         assert_eq!(env.body, "vibesql#42 · crashed ✗ at judge — resumable (checkpoint kept)");
+
+        // Issue #4256: a successful reaper-driven resume narrates as a
+        // `handoff` naming the phase + PR, so an operator watching chat sees
+        // recovery happen without having to run `/loom:sweep --prs` by hand.
+        let resumed = Event::SweepResumeDispatched {
+            issue: 42,
+            pr: 4300,
+            checkpoint_phase: Some("builder-done".to_owned()),
+            dispatched: true,
+            repo: Some("/repos/vibesql".to_owned()),
+        };
+        let env = event_to_envelope(&resumed).unwrap();
+        assert_eq!(env.kind, "handoff");
+        assert_eq!(
+            env.body,
+            "vibesql#42 · reaper resumed crashed sweep at builder-done (open PR #4300) — \
+             resuming without operator intervention"
+        );
+
+        // A resume ATTEMPT whose own dispatch call failed still narrates —
+        // the recovery attempt must never be silent even on failure.
+        let resume_failed = Event::SweepResumeDispatched {
+            issue: 42,
+            pr: 4300,
+            checkpoint_phase: Some("builder-done".to_owned()),
+            dispatched: false,
+            repo: Some("/repos/vibesql".to_owned()),
+        };
+        let env = event_to_envelope(&resume_failed).unwrap();
+        assert!(env.body.contains("still stranded"), "got: {}", env.body);
     }
 
     #[test]

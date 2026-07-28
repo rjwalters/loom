@@ -107,6 +107,7 @@ issue** — the v0.10.0 set is intentionally frozen.
 | `sweep.issue.{N}.blocker` | Sweep child                     | `{reason, label_added, repo?}` |
 | `sweep.issue.{N}.exited`  | Daemon reaper (or `cancel_sweep`) | `{exit_code, duration_sec, repo?}` |
 | `sweep.issue.{N}.crashed` | Daemon reaper                   | `{checkpoint_phase, repo?}` |
+| `sweep.issue.{N}.resume_dispatched` | Daemon reaper (#4256) | `{pr, checkpoint_phase?, dispatched, repo?}` |
 | `sweep.global.dispatch`   | Daemon                          | `{sweep_id, kind}` |
 | `sweep.global.completed`  | Daemon                          | `{sweep_id, outcome}` |
 | `epic.issue.{N}.decompose` | Epic supervisor (#3842)        | `{epic, action, state}` |
@@ -2005,6 +2006,30 @@ Because that is a real per-dispatch API cost it is **off by default**; enable it
 per the config/env row above (`LOOM_DETECT_COLLISIONS=1` or
 `autonomous.collisionDetection.enabled = true`, precedence **env > config >
 default**) on the hosts sharing a backlog while you take the measurement.
+
+**Reaper-driven resume (#4256): the guard's own escape valve.** A sweep that
+dies **after** its Builder opened a PR would otherwise strand that PR at
+`loom:review-requested` forever — the #4123 guard above correctly refuses
+every *ordinary* re-dispatch of the issue (an open PR looks identical to
+fresh work the instant the sweep exits), but nothing else ever re-dispatches
+it, so the checkpoint-resume machinery (#3373, which would skip straight to
+Judge) never gets a chance to run. `SweepRegistry::reap_once()` closes this
+gap directly: when a crashed sweep's checkpoint reads `builder-done`,
+`judge-rejected`, `judge-done`, or `doctor-done` (Builder-or-later — a
+pre-Builder `curator-done` crash gets ordinary crash handling only) **and**
+the issue still has an open linked PR, the reaper re-dispatches the *same*
+issue through a private bypass (`dispatch_resume_after_crash`) that is
+reachable **only** from the reaper — not from the work finder, the epic
+supervisor, the IPC/CLI `dispatch_sweep`, or any watchdog — and only exempts
+step 2.6 when the PR it names matches the one the guard itself would find.
+Every other dispatch path still refuses via `OpenPrDispatchError`, so
+#4123's anti-duplicate property is unchanged. The attempt is never silent:
+a `sweep.issue.{N}.resume_dispatched` event (`{pr, checkpoint_phase?,
+dispatched, repo?}`) is published — with `dispatched: false` on the rare
+case the resume dispatch call itself fails — and narrated over Safehouse
+(when enabled) as a `handoff`. The `restore_label_to_ready` operator-park
+guard (#4206) still applies: an issue carrying `loom:blocked` is never
+resume-dispatched.
 
 ### Cross-host soft claim over safehouse (#4028, Phase 1 of #4028)
 
