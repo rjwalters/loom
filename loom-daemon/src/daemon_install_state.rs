@@ -22,10 +22,23 @@
 //! 2. Marker present, no live process → [`InstallState::ExpectedButDead`]:
 //!    the #4011 divergence — autonomy was expected but the daemon is gone.
 //! 3. Marker present, process alive (but IPC still failed, since we only
-//!    reach this module from the status query's `Err` arm) →
+//!    reach this module from the status query's `Err` arm), and the process
+//!    is *young* (age ≤ the startup-grace window, default 90s) →
+//!    [`InstallState::AliveStarting`]: a normal post-`bootout`/`bootstrap`
+//!    restart whose socket has not bound yet (it takes ~40–60s). This is NOT
+//!    a fault — it must not print the stop/start remediation (#4213).
+//! 4. Marker present, process alive, IPC failed, and the process is *older*
+//!    than the grace window (or its age is undeterminable) →
 //!    [`InstallState::AliveButUnresponsive`], qualified by heartbeat
 //!    freshness: fresh ⇒ likely an IPC/socket-layer fault, stale ⇒ likely a
 //!    wedged daemon.
+//!
+//! The startup-grace discriminator is **process age alone** (via
+//! `ps -o etime= -p <pid>`), never socket-file presence: the `Err` arm has
+//! already established IPC failure, and a stale socket file from the prior run
+//! can legitimately still exist during startup. `loom-daemon-watchdog.sh` never
+//! probes IPC, so it can never emit the fault verdict and needs no matching
+//! grace state — this module's grace verdict cannot contradict it (#4213).
 //!
 //! Like [`crate::self_update`], this module is modeled to be inherently
 //! side-effect-free and never fails the command: an unreadable/malformed
@@ -57,13 +70,23 @@ pub const EXIT_NOT_EXPECTED: i32 = 1;
 /// Exit code for `expected-but-dead` (the #4011 silent-autonomy-loss state).
 pub const EXIT_EXPECTED_BUT_DEAD: i32 = 3;
 /// Exit code for `alive-but-unresponsive` (IPC fault or wedged daemon).
+/// Also reused for `alive-starting` — a distinct new exit code is a compat
+/// decision this issue does not require (#4213); scripts that only check
+/// nonzero are unaffected either way, and JSON consumers get the distinct
+/// `state` string.
 pub const EXIT_ALIVE_BUT_UNRESPONSIVE: i32 = 4;
+
+/// Default startup-grace window (seconds): a live daemon whose process age is
+/// under this and whose socket has not bound yet is treated as *starting*, not
+/// faulted. Overridable via `LOOM_DAEMON_STARTUP_GRACE_SECS`. Sized above the
+/// observed ~40–60s `bootout`/`bootstrap` socket-bind latency (#4213).
+pub const DEFAULT_STARTUP_GRACE_SECS: u64 = 90;
 
 // ============================================================================
 // Public types
 // ============================================================================
 
-/// The three states `status` can distinguish once a live IPC round-trip has
+/// The states `status` can distinguish once a live IPC round-trip has
 /// failed. See module docs for the precedence this mirrors from
 /// `loom-daemon-watchdog.sh`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -73,6 +96,10 @@ pub enum InstallState {
     NotExpected,
     /// Marker present, but no live process for it — the #4011 divergence.
     ExpectedButDead,
+    /// Marker present, process alive, IPC failed, but the process is young
+    /// (age ≤ startup-grace window): a normal restart whose socket has not
+    /// bound yet — NOT a fault (#4213).
+    AliveStarting,
     /// Marker present and the process is alive, but IPC still failed.
     AliveButUnresponsive,
 }
@@ -84,6 +111,7 @@ impl InstallState {
         match self {
             InstallState::NotExpected => "not-expected",
             InstallState::ExpectedButDead => "expected-but-dead",
+            InstallState::AliveStarting => "alive-starting",
             InstallState::AliveButUnresponsive => "alive-but-unresponsive",
         }
     }
@@ -94,6 +122,8 @@ impl InstallState {
         match self {
             InstallState::NotExpected => EXIT_NOT_EXPECTED,
             InstallState::ExpectedButDead => EXIT_EXPECTED_BUT_DEAD,
+            // Reuses code 4 — see [`EXIT_ALIVE_BUT_UNRESPONSIVE`].
+            InstallState::AliveStarting => EXIT_ALIVE_BUT_UNRESPONSIVE,
             InstallState::AliveButUnresponsive => EXIT_ALIVE_BUT_UNRESPONSIVE,
         }
     }
@@ -127,7 +157,8 @@ pub struct InstallStateReport {
     pub state: InstallState,
     /// The marker's `started_at` field, when present and the marker exists.
     pub started_at: Option<String>,
-    /// The live pid, when [`InstallState::AliveButUnresponsive`].
+    /// The live pid, when the process is alive ([`InstallState::AliveStarting`]
+    /// or [`InstallState::AliveButUnresponsive`]).
     pub pid: Option<u32>,
     /// Human-readable liveness detail (mirrors the watchdog's own
     /// `liveness_detail` strings so log/status messages read consistently).
@@ -138,6 +169,13 @@ pub struct InstallStateReport {
     pub heartbeat_age_secs: Option<u64>,
     /// The staleness threshold used for the freshness verdict (seconds).
     pub heartbeat_stale_threshold_secs: Option<u64>,
+    /// The live process's age in seconds (`ps -o etime=`), when it was alive
+    /// and the age was parseable. `None` degrades to no grace claim (#4213).
+    pub process_age_secs: Option<u64>,
+    /// The startup-grace window used to classify a young process (seconds) —
+    /// present whenever the process was alive (both `AliveStarting` and
+    /// `AliveButUnresponsive`).
+    pub startup_grace_threshold_secs: Option<u64>,
     /// The watchdog log path to point an operator at (advisory only — never
     /// read by this module).
     pub watchdog_log_path: PathBuf,
@@ -153,6 +191,8 @@ impl InstallStateReport {
             heartbeat_freshness: None,
             heartbeat_age_secs: None,
             heartbeat_stale_threshold_secs: None,
+            process_age_secs: None,
+            startup_grace_threshold_secs: None,
             watchdog_log_path,
         }
     }
@@ -174,6 +214,9 @@ pub struct EnvOverrides {
     pub launchd_label_override: Option<String>,
     /// From `LOOM_DAEMON_HEARTBEAT_STALE_SECS`.
     pub heartbeat_stale_secs_override: Option<u64>,
+    /// From `LOOM_DAEMON_STARTUP_GRACE_SECS` — the startup-grace window in
+    /// seconds. `None` defers to [`DEFAULT_STARTUP_GRACE_SECS`].
+    pub startup_grace_secs_override: Option<u64>,
     /// Whether this host can have a launchd job at all — the watchdog forces
     /// `USE_LAUNCHD=false` on non-Darwin regardless of the marker.
     pub is_darwin: bool,
@@ -207,10 +250,14 @@ impl EnvOverrides {
         let heartbeat_stale_secs_override = std::env::var("LOOM_DAEMON_HEARTBEAT_STALE_SECS")
             .ok()
             .and_then(|v| v.parse::<u64>().ok());
+        let startup_grace_secs_override = std::env::var("LOOM_DAEMON_STARTUP_GRACE_SECS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok());
         EnvOverrides {
             launchd_override,
             launchd_label_override,
             heartbeat_stale_secs_override,
+            startup_grace_secs_override,
             is_darwin: cfg!(target_os = "macos"),
         }
     }
@@ -432,6 +479,59 @@ fn check_liveness(use_launchd: bool, label: &str, pid_file: Option<&Path>) -> Li
 }
 
 // ============================================================================
+// Process age (startup-grace discriminator)
+// ============================================================================
+
+/// Parse a macOS `ps -o etime=` duration into whole seconds. The format is
+/// `[[dd-]hh:]mm:ss` (there is no `etimes` seconds-only keyword on macOS), so
+/// this accepts `ss`, `mm:ss`, `hh:mm:ss`, and `dd-hh:mm:ss`. Any unexpected
+/// shape or non-numeric field yields `None` — the caller treats an unparseable
+/// age as *unknown* and makes no grace claim, never a false "starting" verdict.
+fn parse_etime(raw: &str) -> Option<u64> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    // Split optional leading `dd-` day component.
+    let (days, rest) = match raw.split_once('-') {
+        Some((d, r)) => (d.trim().parse::<u64>().ok()?, r),
+        None => (0u64, raw),
+    };
+    let parts: Vec<&str> = rest.split(':').collect();
+    let (hours, minutes, seconds) = match parts.as_slice() {
+        [s] => (0u64, 0u64, s.parse::<u64>().ok()?),
+        [m, s] => (0u64, m.parse::<u64>().ok()?, s.parse::<u64>().ok()?),
+        [h, m, s] => (h.parse::<u64>().ok()?, m.parse::<u64>().ok()?, s.parse::<u64>().ok()?),
+        _ => return None,
+    };
+    Some(days * 86_400 + hours * 3_600 + minutes * 60 + seconds)
+}
+
+/// Probe a live pid's age via `ps -o etime= -p <pid>` (no `libc`/`nix`
+/// dependency — matches this module's `kill -0` / `launchctl` subprocess
+/// pattern). Degrades to `None` on a failed/absent `ps` or unparseable output,
+/// so the caller falls through to today's verdicts rather than falsely
+/// reporting "starting" (#4213).
+fn process_age_secs(pid: u32) -> Option<u64> {
+    let output = Command::new("ps")
+        .args(["-o", "etime=", "-p", &pid.to_string()])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let stdout = String::from_utf8(output.stdout).ok()?;
+    parse_etime(&stdout)
+}
+
+/// Resolve the startup-grace window: `LOOM_DAEMON_STARTUP_GRACE_SECS` overrides
+/// [`DEFAULT_STARTUP_GRACE_SECS`] (env > default, matching the heartbeat
+/// staleness-threshold precedence).
+fn resolve_startup_grace(env_override: Option<u64>) -> u64 {
+    env_override.unwrap_or(DEFAULT_STARTUP_GRACE_SECS)
+}
+
+// ============================================================================
 // Heartbeat freshness
 // ============================================================================
 
@@ -501,8 +601,34 @@ pub fn classify(loom_dir: &Path, marker_path: &Path, env: &EnvOverrides) -> Inst
             heartbeat_freshness: None,
             heartbeat_age_secs: None,
             heartbeat_stale_threshold_secs: None,
+            process_age_secs: None,
+            startup_grace_threshold_secs: None,
             watchdog_log_path,
         };
+    }
+
+    // Startup-grace (#4213): a young live process whose socket has not bound
+    // yet is a normal `bootout`/`bootstrap` restart, not a fault. Process age
+    // is the sole discriminator — never socket-file presence (a stale socket
+    // from the prior run may still exist during startup). An undeterminable
+    // age makes no grace claim and falls through to the fault/wedged verdict.
+    let grace_threshold = resolve_startup_grace(env.startup_grace_secs_override);
+    let process_age = liveness.pid.and_then(process_age_secs);
+    if let Some(age) = process_age {
+        if age <= grace_threshold {
+            return InstallStateReport {
+                state: InstallState::AliveStarting,
+                started_at: fields.started_at,
+                pid: liveness.pid,
+                liveness_detail: Some(liveness.detail),
+                heartbeat_freshness: None,
+                heartbeat_age_secs: None,
+                heartbeat_stale_threshold_secs: None,
+                process_age_secs: Some(age),
+                startup_grace_threshold_secs: Some(grace_threshold),
+                watchdog_log_path,
+            };
+        }
     }
 
     let stale_threshold =
@@ -517,6 +643,8 @@ pub fn classify(loom_dir: &Path, marker_path: &Path, env: &EnvOverrides) -> Inst
         heartbeat_freshness: Some(freshness),
         heartbeat_age_secs: age,
         heartbeat_stale_threshold_secs: Some(stale_threshold),
+        process_age_secs: process_age,
+        startup_grace_threshold_secs: Some(grace_threshold),
         watchdog_log_path,
     }
 }
@@ -550,6 +678,10 @@ mod tests {
             launchd_override: None,
             launchd_label_override: None,
             heartbeat_stale_secs_override: None,
+            // A zero grace window makes the test process (always older than 0s)
+            // fall through to the existing verdicts by default — tests that want
+            // the startup-grace path set a huge window explicitly.
+            startup_grace_secs_override: Some(0),
             is_darwin: false,
         }
     }
@@ -796,7 +928,93 @@ mod tests {
     fn install_state_as_str_matches_taxonomy() {
         assert_eq!(InstallState::NotExpected.as_str(), "not-expected");
         assert_eq!(InstallState::ExpectedButDead.as_str(), "expected-but-dead");
+        assert_eq!(InstallState::AliveStarting.as_str(), "alive-starting");
         assert_eq!(InstallState::AliveButUnresponsive.as_str(), "alive-but-unresponsive");
+    }
+
+    #[test]
+    fn alive_starting_reuses_alive_but_unresponsive_exit_code() {
+        assert_eq!(InstallState::AliveStarting.exit_code(), EXIT_ALIVE_BUT_UNRESPONSIVE);
+        assert_eq!(InstallState::AliveStarting.exit_code(), 4);
+    }
+
+    #[test]
+    fn parse_etime_covers_all_ps_shapes_and_garbage() {
+        // `ss` — macOS has no seconds-only keyword, but accept it defensively.
+        assert_eq!(parse_etime("05"), Some(5));
+        // `mm:ss`
+        assert_eq!(parse_etime("01:30"), Some(90));
+        assert_eq!(parse_etime("00:45"), Some(45));
+        // `hh:mm:ss`
+        assert_eq!(parse_etime("01:00:00"), Some(3_600));
+        assert_eq!(parse_etime("02:03:04"), Some(2 * 3_600 + 3 * 60 + 4));
+        // `dd-hh:mm:ss`
+        assert_eq!(parse_etime("1-00:00:00"), Some(86_400));
+        assert_eq!(parse_etime("2-01:02:03"), Some(2 * 86_400 + 3_600 + 2 * 60 + 3));
+        // Leading/trailing whitespace (ps pads the field) is tolerated.
+        assert_eq!(parse_etime("   00:10  "), Some(10));
+        // Garbage / undeterminable ⇒ None (age-unknown degradation).
+        assert_eq!(parse_etime(""), None);
+        assert_eq!(parse_etime("   "), None);
+        assert_eq!(parse_etime("abc"), None);
+        assert_eq!(parse_etime("1:2:3:4"), None);
+        assert_eq!(parse_etime("aa:bb"), None);
+        assert_eq!(parse_etime("x-01:00"), None);
+    }
+
+    #[test]
+    fn resolve_startup_grace_env_wins_over_default() {
+        assert_eq!(resolve_startup_grace(None), DEFAULT_STARTUP_GRACE_SECS);
+        assert_eq!(resolve_startup_grace(None), 90);
+        assert_eq!(resolve_startup_grace(Some(30)), 30);
+        assert_eq!(resolve_startup_grace(Some(0)), 0);
+    }
+
+    #[test]
+    fn young_process_within_grace_is_alive_starting() {
+        // The test runner's own pid is necessarily younger than a huge grace
+        // window, so classify must report the startup-grace verdict instead of
+        // the fault/wedged verdict — no age injection needed (#4213 test plan).
+        let dir = tempfile::tempdir().unwrap();
+        let pid_file = write_pid_file(dir.path(), std::process::id());
+        let marker = write_marker(
+            dir.path(),
+            &format!("pid_file={}\nuse_launchd=false\n", pid_file.display()),
+        );
+        let mut env = no_env_overrides();
+        env.startup_grace_secs_override = Some(u64::MAX);
+        let report = classify(dir.path(), &marker, &env);
+        assert_eq!(report.state, InstallState::AliveStarting);
+        assert_eq!(report.state.exit_code(), EXIT_ALIVE_BUT_UNRESPONSIVE);
+        assert_eq!(report.pid, Some(std::process::id()));
+        assert!(report.process_age_secs.is_some());
+        assert_eq!(report.startup_grace_threshold_secs, Some(u64::MAX));
+        // Grace verdict does not compute a heartbeat qualifier.
+        assert!(report.heartbeat_freshness.is_none());
+    }
+
+    #[test]
+    fn process_beyond_grace_falls_through_to_fault_verdict() {
+        // A zero-second grace window puts the (always older) test process
+        // beyond grace, so the existing AliveButUnresponsive verdict stands.
+        let dir = tempfile::tempdir().unwrap();
+        let pid_file = write_pid_file(dir.path(), std::process::id());
+        let heartbeat = write_heartbeat(dir.path(), Duration::from_secs(5));
+        let marker = write_marker(
+            dir.path(),
+            &format!(
+                "pid_file={}\nheartbeat_file={}\nheartbeat_interval_secs=60\nuse_launchd=false\n",
+                pid_file.display(),
+                heartbeat.display()
+            ),
+        );
+        let mut env = no_env_overrides();
+        env.startup_grace_secs_override = Some(0);
+        let report = classify(dir.path(), &marker, &env);
+        assert_eq!(report.state, InstallState::AliveButUnresponsive);
+        assert_eq!(report.heartbeat_freshness, Some(HeartbeatFreshness::Fresh));
+        // The grace threshold used is still surfaced for JSON consumers.
+        assert_eq!(report.startup_grace_threshold_secs, Some(0));
     }
 
     #[test]
