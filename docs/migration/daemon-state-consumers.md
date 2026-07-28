@@ -254,7 +254,7 @@ Documentation references are surface-level — they don't break anything if Phas
 | Path | Refs | Disposition |
 |---|---:|---|
 | `CLAUDE.md` (this repo's project memory) | ~30 mentions of `daemon-state.json`, `.loom/progress/`, `/shepherd`, `loom-daemon` across architecture, workflow, configuration sections. | **rewrite section by section** — daemon architecture diagram, "Daemon State File" subsection, "Shepherd Progress Milestones", "Required Terminal Configuration", "Session Rotation". The "Migration" subsection at the bottom is the authoritative announcement and stays current. |
-| `defaults/CLAUDE.md` | The CLAUDE.md template shipped to installs. | Mirrors source CLAUDE.md changes. |
+| `defaults/.loom/CLAUDE.md` | The CLAUDE.md template shipped to installs. | Mirrors source CLAUDE.md changes. |
 | `.loom/docs/daemon-reference.md` | Comprehensive daemon state file reference. | **retire** the bulk; keep a brief "deprecated, see spawn-loop-state.json" stub. |
 | `.loom/docs/troubleshooting.md` | Operator commands like `cat .loom/daemon-state.json \| jq`. | **rewrite** to use spawn-loop equivalents. |
 | `docs/guides/cli-reference.md` (67 refs) | CLI reference for `/shepherd`, `loom-daemon`, etc. | **rewrite** to feature `/loom:sweep` and spawn loop. |

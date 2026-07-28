@@ -146,7 +146,7 @@ Customize the AI context documentation for your project:
 ...
 ```
 
-See [defaults/CLAUDE.md](../../defaults/CLAUDE.md) for the complete template.
+See [defaults/.loom/CLAUDE.md](../../defaults/.loom/CLAUDE.md) for the complete template.
 
 ### Troubleshooting Initialization
 

@@ -89,7 +89,7 @@ This ensures every Loom-enabled repository has consistent AI context, configurat
 
 ### Dogfooding Note
 When using Loom on the Loom repository itself, both versions exist:
-- `defaults/CLAUDE.md` - Source template (committed)
+- `defaults/.loom/CLAUDE.md` - Source template (committed)
 - `CLAUDE.md` - Working instance (committed, gets updated during development)
 
 This is intentional: defaults/ are distribution templates, the root files are the active documentation.

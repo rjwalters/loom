@@ -1527,10 +1527,11 @@ mod tests {
              report it MISSING on every install (#3476)"
         );
 
-        // Reference docs extracted from defaults/CLAUDE.md in #4143 (Phase 2 of
-        // #4052). They must ship from defaults/docs/ so live cross-references
-        // (CLAUDE.md guard catalog, docs/model-selection-retune.md) do not orphan
-        // when Phase 3 deletes defaults/CLAUDE.md.
+        // Reference docs extracted from the retired root `defaults/CLAUDE.md`
+        // template in #4143 (Phase 2 of #4052); that template was deleted in
+        // Phase 3 (#4144). They must ship from defaults/docs/ so live
+        // cross-references (CLAUDE.md guard catalog,
+        // docs/model-selection-retune.md) do not orphan.
         for doc in &[
             "guard-hooks.md",
             "model-selection.md",
