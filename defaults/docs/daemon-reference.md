@@ -2799,8 +2799,8 @@ successful-looking run can no longer install a stale binary:
   non-zero** (`5` for a destination mismatch) instead of the pre-#4053 soft
   warn that left the exit code at `0`.
 
-**Read-only "update available" surface (`loom-daemon --status`)**: separately
-from the update script, `loom-daemon --status` / `--status --json` now prints
+**Read-only "update available" surface (`loom-daemon status`)**: separately
+from the update script, `loom-daemon status` / `loom-daemon status --json` now prints
 a purely local, read-only self-update line — the same built-commit-vs-source-HEAD
 comparison, computed in-process (`self_update::check()`) with at most one `git
 rev-parse` subprocess and zero network calls. It never triggers a rebuild or
@@ -2864,7 +2864,7 @@ Each tick (surfaced in `loom-daemon status` — human and `--json` — as
 6. **Backoff + terminal state** — a retryable build failure (script exit `1`,
    spawn/timeout) backs off exponentially (60s → … → 3600s ceiling); a
    commit-identity / build-verification mismatch (#4053 exit `4`/`5`) is
-   **terminal** — surfaced in `--status`, not retried until the source commit
+   **terminal** — surfaced in `loom-daemon status`, not retried until the source commit
    advances. A successful roll resets the counter.
 
 ### End-to-end acceptance playbook
