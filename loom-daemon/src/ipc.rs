@@ -2049,6 +2049,50 @@ fn handle_request(
             }
         }
 
+        Request::ListQuarantines { workspace_root } => {
+            // Operator-reachable insta-crash-quarantine read path (Issue
+            // #4215) — the authority for "which issues are quarantined right
+            // now", distinct from a forge `loom:blocked` query. Unlike every
+            // other `workspace_root: Option<String>` request, `None` here
+            // means "every registered workspace" (see the doc comment on
+            // `Request::ListQuarantines`), not just the default one, so a
+            // `Some(root)` scopes to a single registry via the same
+            // `resolve_registry` path `ClearQuarantine` uses, while `None`
+            // enumerates roots the way `build_daemon_status` does.
+            let now = Utc::now();
+            let entries = match workspace_root.as_deref() {
+                Some(root) if !root.trim().is_empty() => {
+                    let target = resolve_registry(sweep_registry, workspace_pool, Some(root));
+                    let sr = target.lock().expect("Sweep registry mutex poisoned");
+                    sr.quarantine_entries(now)
+                }
+                _ => {
+                    // No `fallback_root` is threaded into this synchronous
+                    // dispatcher (unlike `build_daemon_status`), but the
+                    // default registry's own config already carries it —
+                    // it's the same root `resolve_registry`'s `None` arm
+                    // would have targeted.
+                    let fallback_root = {
+                        let sr = sweep_registry
+                            .lock()
+                            .expect("Sweep registry mutex poisoned");
+                        sr.config().workspace_root.clone()
+                    };
+                    let workspace_registry = WorkspaceRegistry::load_default().unwrap_or_default();
+                    let roots = workspace_registry.effective_roots(&fallback_root);
+                    let mut entries = Vec::new();
+                    for root in &roots {
+                        let registry = workspace_pool.get_or_provision(root);
+                        let sr = registry.lock().expect("Sweep registry mutex poisoned");
+                        entries.extend(sr.quarantine_entries(now));
+                    }
+                    entries.sort_unstable_by_key(|e| e.issue);
+                    entries
+                }
+            };
+            Response::QuarantineList { entries }
+        }
+
         // ====================================================================
         // Event Bus Handlers (Issue #3453 — Phase B of #3449)
         // ====================================================================
@@ -3256,6 +3300,145 @@ exit 0
             other => panic!("Expected QuarantineCleared, got: {other:?}"),
         }
         assert!(!sr.lock().unwrap().is_quarantined(808));
+    }
+
+    // ===== ListQuarantines (Issue #4215) =====
+    //
+    // `workspace_root: None` enumerates every registered workspace (unlike
+    // `ClearQuarantine`'s `None` == default-workspace-only), so these tests
+    // seed the pool with the default registry at its own workspace root —
+    // exactly the way `main.rs` wires `workspace_pool.seed(sweep_workspace,
+    // sweep_registry)` in production — and pin `REGISTRY_PATH_ENV` to an empty
+    // file so `effective_roots` resolves to exactly `[root]` regardless of any
+    // real `~/.loom/workspaces.json` on the host running the test.
+
+    #[test]
+    #[serial_test::serial]
+    fn test_handle_request_list_quarantines_empty_registry() {
+        use crate::workspace_registry::REGISTRY_PATH_ENV;
+
+        let (tm, db, _, bus) = setup_test_context();
+        let (sr, dir, _rec) = setup_sweep_registry_in_tempdir();
+        let root = dir.path().to_path_buf();
+        let empty_reg = dir.path().join("no-such-workspaces.json");
+        std::env::set_var(REGISTRY_PATH_ENV, &empty_reg);
+
+        let pool = Arc::new(WorkspacePool::new(Arc::new(EventBus::new()), test_runtime_handle()));
+        pool.seed(root, sr.clone());
+
+        let response = handle_request(
+            Request::ListQuarantines {
+                workspace_root: None,
+            },
+            &tm,
+            &db,
+            &sr,
+            &bus,
+            &pool,
+        );
+        std::env::remove_var(REGISTRY_PATH_ENV);
+
+        match response {
+            Response::QuarantineList { entries } => {
+                assert!(entries.is_empty(), "no quarantines seeded -> empty list");
+            }
+            other => panic!("Expected QuarantineList, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_handle_request_list_quarantines_seeded_entries() {
+        use crate::workspace_registry::REGISTRY_PATH_ENV;
+
+        let (tm, db, _, bus) = setup_test_context();
+        let (sr, dir, _rec) = setup_sweep_registry_in_tempdir();
+        let root = dir.path().to_path_buf();
+        let empty_reg = dir.path().join("no-such-workspaces.json");
+        std::env::set_var(REGISTRY_PATH_ENV, &empty_reg);
+
+        let applied_at = Utc::now();
+        {
+            let mut reg = sr.lock().unwrap();
+            reg.seed_quarantine_with_details_for_test(4215, applied_at, 2);
+        }
+
+        let pool = Arc::new(WorkspacePool::new(Arc::new(EventBus::new()), test_runtime_handle()));
+        pool.seed(root.clone(), sr.clone());
+
+        let response = handle_request(
+            Request::ListQuarantines {
+                workspace_root: None,
+            },
+            &tm,
+            &db,
+            &sr,
+            &bus,
+            &pool,
+        );
+        std::env::remove_var(REGISTRY_PATH_ENV);
+
+        match response {
+            Response::QuarantineList { entries } => {
+                assert_eq!(entries.len(), 1);
+                assert_eq!(entries[0].issue, 4215);
+                assert_eq!(entries[0].workspace_root, root);
+                assert_eq!(entries[0].insta_crash_count, 2);
+                assert_eq!(entries[0].quarantined_at, applied_at);
+                assert!(
+                    entries[0].ttl_remaining_secs > 0,
+                    "freshly-applied quarantine should have TTL remaining"
+                );
+            }
+            other => panic!("Expected QuarantineList, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_handle_request_list_quarantines_ttl_clamps_to_zero() {
+        use crate::workspace_registry::REGISTRY_PATH_ENV;
+
+        let (tm, db, _, bus) = setup_test_context();
+        let (sr, dir, _rec) = setup_sweep_registry_in_tempdir();
+        let root = dir.path().to_path_buf();
+        let empty_reg = dir.path().join("no-such-workspaces.json");
+        std::env::set_var(REGISTRY_PATH_ENV, &empty_reg);
+
+        // Default TTL is 3600s (Issue #3939) — quarantine this issue as though
+        // it were applied 2 hours ago, well past TTL. `reap_once` (the actual
+        // expiry sweep) never runs in this test, so the stale entry survives in
+        // memory; `ttl_remaining_secs` must still clamp to 0 rather than
+        // reporting a nonsensical negative remainder.
+        let long_ago = Utc::now() - chrono::Duration::seconds(7200);
+        {
+            let mut reg = sr.lock().unwrap();
+            reg.seed_quarantine_with_details_for_test(9001, long_ago, 5);
+        }
+
+        let pool = Arc::new(WorkspacePool::new(Arc::new(EventBus::new()), test_runtime_handle()));
+        pool.seed(root, sr.clone());
+
+        let response = handle_request(
+            Request::ListQuarantines {
+                workspace_root: None,
+            },
+            &tm,
+            &db,
+            &sr,
+            &bus,
+            &pool,
+        );
+        std::env::remove_var(REGISTRY_PATH_ENV);
+
+        match response {
+            Response::QuarantineList { entries } => {
+                assert_eq!(entries.len(), 1);
+                assert_eq!(entries[0].issue, 9001);
+                assert_eq!(entries[0].ttl_remaining_secs, 0, "past-TTL entry must clamp to 0");
+            }
+            other => panic!("Expected QuarantineList, got: {other:?}"),
+        }
     }
 
     #[test]
