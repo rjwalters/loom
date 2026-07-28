@@ -77,6 +77,24 @@ loom-clean --deep --dry-run  # Preview deep clean
 loom-clean --force  # Non-interactive, safe for automation
 ```
 
+**Backlog of pre-existing `[gone]` local branches (#4100)**: `merge-pr.sh` deletes
+the local feature branch for every PR it merges as of #4100, but repos that ran
+Loom before that fix accumulated one orphaned local branch per merged issue —
+each pointing at a remote ref the merge already deleted server-side, so `git
+branch -vv` shows them as `[gone]`. Reap the existing backlog with:
+
+```bash
+git fetch --prune   # drop stale remote-tracking refs first
+loom-clean --force  # clean_branches() deletes local branches whose remote is gone
+```
+
+`loom-clean`'s `clean_branches()` already handles this in two passes: a
+pattern-agnostic pass that deletes any local branch (other than the
+default/current/other-worktree-checked-out ones) whose `origin/<branch>` no
+longer exists, plus an issue-state pass that probes `feature/issue-*` branches
+still tracking a remote against the forge and deletes them once the issue is
+closed. No separate one-off backlog tool is needed.
+
 **Manual cleanup** (if needed, but use with caution):
 
 **WARNING**: Running `git worktree remove` while your shell is in the worktree directory will corrupt your shell state. Always ensure you've navigated out of the worktree first, or use `loom-clean` which handles this safely.
