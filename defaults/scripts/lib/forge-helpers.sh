@@ -379,6 +379,44 @@ forge_get_pr_nocache() {
   fi
 }
 
+# Get an issue's open/closed state.
+# Usage: forge_get_issue_state NWO ISSUE_NUMBER [GH_CMD]
+# Returns on stdout: "OPEN" or "CLOSED". On any lookup failure or an
+# unrecognized/empty state value, prints nothing and returns exit code 1.
+#
+# Fail-unsafe-to-preserve contract (#4186): this is used to gate destructive
+# cleanup (e.g. merge-pr.sh's worktree removal), so callers MUST treat a
+# non-zero return (empty stdout) as "assume the issue might still be open"
+# and preserve whatever resource the check gates — never assume CLOSED on a
+# lookup failure. This function only ever reports CLOSED when the forge
+# unambiguously says so.
+forge_get_issue_state() {
+  local nwo="$1"
+  local issue_number="$2"
+  local gh_cmd="${3:-gh}"
+  local raw_state=""
+
+  if [[ "$FORGE_TYPE" == "gitea" ]]; then
+    forge_split_nwo "$nwo"
+    raw_state=$(gitea_api GET "repos/$FORGE_OWNER/$FORGE_REPO/issues/$issue_number" 2>/dev/null \
+      | jq -r '.state // empty' 2>/dev/null) || true
+  else
+    raw_state=$("$gh_cmd" api "repos/$nwo/issues/$issue_number" --jq '.state // empty' 2>/dev/null) || true
+  fi
+
+  case "$(echo "$raw_state" | tr '[:lower:]' '[:upper:]')" in
+    OPEN)
+      echo "OPEN"
+      ;;
+    CLOSED)
+      echo "CLOSED"
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
 # Check if repo auto-deletes branches on merge.
 # Usage: forge_check_auto_delete NWO
 # Returns: "true" or "false" on stdout
