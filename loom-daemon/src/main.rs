@@ -1,4 +1,5 @@
 use loom_daemon::activity::{self, ActivityDb, StatsQueries};
+use loom_daemon::auto_update;
 use loom_daemon::claim_reconciliation;
 use loom_daemon::credential_preflight;
 use loom_daemon::daemon_heartbeat;
@@ -1174,6 +1175,50 @@ async fn main() -> Result<()> {
         log::debug!(
             "watch_monitor: disabled (set LOOM_WATCH_MONITOR=1 or \
              autonomous.watchMonitor.enabled=true to opt in)"
+        );
+        None
+    };
+
+    // Autonomous self-update loop (Issue #4055 — Phase 3 of #4017). Opt-in via
+    // `LOOM_AUTO_UPDATE` / `autonomous.autoUpdate.enabled`. When the daemon's own
+    // source checkout advances past the commit this binary was built from, the
+    // loop rebuilds + provisions (reusing `loom-daemon-update.sh --no-restart`)
+    // and rolls onto the fresh binary via #4090's drain path — in-flight sweeps
+    // finish first and survive in the registry. Gated on a clean tree, a settle
+    // window, zero in-flight sweeps (`ipc::count_in_flight_sweeps`), and exponential
+    // backoff with a terminal give-up state, all surfaced in `loom-daemon status`.
+    //
+    // Unlike the per-workspace loops above this is spawned exactly **once** for the
+    // whole daemon (its subject is the daemon process itself — one binary, one
+    // source checkout, one restart), NOT a `spawn_multi_*` per-workspace fan-out.
+    // Config is read from the daemon's default workspace, like the sibling readers.
+    // Default OFF (side effects on the running process). Cloned handles here because
+    // `event_bus` is moved into `IpcServer::new` below.
+    let auto_update_config = auto_update::read_auto_update_config(&sweep_workspace);
+    let _auto_update_handle = if auto_update::resolve_enabled(&auto_update_config) {
+        let interval = auto_update::resolve_interval(&auto_update_config);
+        let settle = auto_update::resolve_settle(&auto_update_config);
+        log::info!(
+            "auto_update: enabled (interval={}s, settle={}s)",
+            interval.as_secs(),
+            settle.as_secs()
+        );
+        let probe = auto_update::ScriptAutoUpdateProbe::new(
+            workspace_pool.clone(),
+            sweep_workspace.clone(),
+        );
+        let trigger = auto_update::IpcDrainTrigger::new(
+            drain_state.clone(),
+            workspace_pool.clone(),
+            sweep_workspace.clone(),
+            event_bus.clone(),
+            tokio::runtime::Handle::current(),
+        );
+        let status = std::sync::Arc::new(auto_update::AutoUpdateStatus::new(true));
+        Some(auto_update::spawn_auto_update_task(probe, trigger, status, interval, settle))
+    } else {
+        log::debug!(
+            "auto_update: disabled (set LOOM_AUTO_UPDATE=1 or autonomous.autoUpdate.enabled=true to opt in)"
         );
         None
     };
@@ -2600,6 +2645,17 @@ fn print_status_json(
             "source_commit": update.source_commit,
             "update_available": update.update_available,
         },
+        // Autonomous self-update loop state (#4055) — daemon-side loop status
+        // (distinct from the client-side `self_update` staleness read above).
+        "auto_update": {
+            "enabled": report.auto_update_enabled,
+            "last_check": report.auto_update_last_check,
+            "last_roll": report.auto_update_last_roll,
+            "consecutive_failures": report.auto_update_consecutive_failures,
+            "backoff_secs": report.auto_update_backoff_secs,
+            "terminal_reason": report.auto_update_terminal_reason,
+            "note": report.auto_update_note,
+        },
     });
     println!("{}", serde_json::to_string_pretty(&combined)?);
     Ok(())
@@ -3062,6 +3118,31 @@ fn print_status_human(
         ),
         (Some(source), Some(false)) => println!(" — up to date with source HEAD ({source})"),
         _ => println!(" (source checkout not found on this machine; staleness unknown)"),
+    }
+
+    // Autonomous self-update loop (#4055) — the daemon-side loop that acts on the
+    // staleness above. Only rendered when enabled (opt-in); otherwise silent.
+    if report.auto_update_enabled {
+        print!("Auto-update loop: enabled");
+        match &report.auto_update_last_check {
+            Some(ts) => print!(" (last check {})", ts.format("%Y-%m-%dT%H:%M:%SZ")),
+            None => print!(" (no check yet)"),
+        }
+        if let Some(ts) = &report.auto_update_last_roll {
+            print!(", last roll {}", ts.format("%Y-%m-%dT%H:%M:%SZ"));
+        }
+        if let Some(reason) = &report.auto_update_terminal_reason {
+            print!(" — TERMINAL: {reason}");
+        } else if let Some(secs) = report.auto_update_backoff_secs {
+            print!(
+                " — backing off {secs}s after {} consecutive failure(s)",
+                report.auto_update_consecutive_failures
+            );
+        }
+        println!();
+        if let Some(note) = &report.auto_update_note {
+            println!("  last tick: {note}");
+        }
     }
 
     println!();

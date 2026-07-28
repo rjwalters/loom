@@ -19,7 +19,7 @@
 //! `.loom/scripts/cli/loom-daemon-update.sh`, a shell script — deliberately
 //! NOT wired to auto-run from here.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 /// The commit this binary was BUILT from, baked in at compile time via
@@ -90,6 +90,47 @@ fn source_head_commit() -> Option<String> {
     }
 }
 
+/// The source checkout this binary was built from — `BUILD_MANIFEST_DIR`'s
+/// parent (`<repo>/loom-daemon` → `<repo>`) — when that checkout is still
+/// present on this machine (a sibling `.git` exists). `None` for a tarball
+/// build / a binary copied to another machine, exactly the case
+/// [`SelfUpdateStatus::update_available`] reports as `None`. The autonomous
+/// self-update loop (#4055) uses this to resolve the rebuild cwd and the
+/// `loom-daemon-update.sh` script path.
+#[must_use]
+pub fn source_checkout_root() -> Option<PathBuf> {
+    let repo_root = Path::new(BUILD_MANIFEST_DIR).join("..");
+    if repo_root.join(".git").exists() {
+        Some(repo_root)
+    } else {
+        None
+    }
+}
+
+/// Whether the source checkout's working tree is clean (no staged, unstaged,
+/// or untracked changes) via `git status --porcelain`. Empty output ⇒ clean.
+///
+/// `None` when the source checkout is not present on this machine (a tarball
+/// build) or `git status` could not be run — the caller must treat `None` as
+/// "cannot prove clean", never as clean. The autonomous self-update loop
+/// (#4055) gates every unattended `cargo build --release` on this being
+/// `Some(true)`: `CARGO_MANIFEST_DIR` points at the operator's live working
+/// checkout, so building a dirty tree would compile whatever is uncommitted
+/// into the running daemon.
+#[must_use]
+pub fn source_tree_clean() -> Option<bool> {
+    let repo_root = source_checkout_root()?;
+    let output = Command::new("git")
+        .args(["status", "--porcelain"])
+        .current_dir(&repo_root)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    Some(output.stdout.iter().all(u8::is_ascii_whitespace))
+}
+
 /// Compute the current self-update status. Read-only: at most one `git
 /// rev-parse` subprocess, no writes, no network calls. Cheap enough to call
 /// on every `--status` invocation.
@@ -146,5 +187,18 @@ mod tests {
         // some built_commit string (possibly "unknown").
         let status = check();
         assert!(!status.built_commit.is_empty());
+    }
+
+    #[test]
+    fn source_tree_clean_never_panics() {
+        // Environment-dependent (runs `git status` against whatever checkout
+        // built the test binary), so we only assert it completes and returns a
+        // well-formed tri-state — never that the tree is actually clean/dirty.
+        let clean = source_tree_clean();
+        // `source_checkout_root()` and `source_tree_clean()` must agree on
+        // "no checkout present": if there is no source root, clean is `None`.
+        if source_checkout_root().is_none() {
+            assert_eq!(clean, None);
+        }
     }
 }

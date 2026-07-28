@@ -11,6 +11,7 @@
 #![allow(clippy::missing_panics_doc)]
 
 pub mod activity;
+pub mod auto_update;
 pub mod capacity;
 pub mod claim_reconciliation;
 pub mod config_resolver;
