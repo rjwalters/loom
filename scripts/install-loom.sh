@@ -1703,18 +1703,11 @@ if [[ -x ".loom/scripts/verify-install.sh" ]]; then
   # dangling target here means an installed file points at a sibling
   # Loom never shipped (a packaging gap, like #4097 itself) — surfacing it
   # here beats a downstream consumer audit finding it later.
-  #
-  # Non-fatal by design: some shipped reference docs (daemon-reference.md,
-  # troubleshooting.md) carry pre-existing links into the Loom SOURCE repo's
-  # own tree (source files, dev-only docs under docs/) that were authored
-  # assuming the doc lives only there — a known, tracked gap (see #4097's
-  # PR discussion) distinct from the packaging-boundary defects this check
-  # exists to catch. Promote to `error` once that cleanup lands (follow-up: #4147).
   info "Checking intra-repo links in installed files..."
   if ./.loom/scripts/verify-install.sh check-links --quiet; then
     success "All intra-repo links resolve"
   else
-    warning "Some intra-repo links in installed files are dangling (non-fatal) — run './.loom/scripts/verify-install.sh check-links' for details"
+    error "Some intra-repo links in installed files are dangling — run './.loom/scripts/verify-install.sh check-links' for details"
   fi
 fi
 echo ""

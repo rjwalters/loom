@@ -365,8 +365,17 @@ extract_link_targets() {
     {
         # Markdown links: [text](target) — keep the ()-body only. A trailing
         # ` "title"` (rare in this repo, but cheap to strip) is dropped too.
+        # `|| true` guards each block independently: under `set -e -o
+        # pipefail` (active script-wide), a file with zero matches for one
+        # extraction form makes that grep exit 1, and pipefail propagates
+        # that non-zero status to the pipeline — which would abort this
+        # function (and skip the *other* extraction block entirely) for any
+        # file that has, say, backtick-only refs but no markdown-style
+        # links. A file legitimately having zero targets of one form is not
+        # an error (#4147).
         grep -oE '\]\([^)]+\)' "$file" 2>/dev/null \
-            | sed -E 's/^\]\(//; s/\)$//; s/ "[^"]*"$//'
+            | sed -E 's/^\]\(//; s/\)$//; s/ "[^"]*"$//' \
+            || true
         # Backtick-only install-rooted paths, e.g. `.loom/docs/build-gate.md`
         # or `.claude/roles/foo.md#anchor` — never wrapped in [...]().
         # The path-segment character class deliberately excludes glob (`*`)
@@ -378,7 +387,8 @@ extract_link_targets() {
         # (see e.g. `.loom-README.md`'s "Create `.loom/roles/my-role.md`:").
         grep -viE '\bcreate\b' "$file" 2>/dev/null \
             | grep -oE '`\.(loom|claude|codex|github)/[A-Za-z0-9_./-]+\.md(#[A-Za-z0-9_-]+)?`' \
-            | sed -E 's/^`//; s/`$//'
+            | sed -E 's/^`//; s/`$//' \
+            || true
     }
 }
 

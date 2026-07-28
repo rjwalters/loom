@@ -82,7 +82,8 @@ which holds the connection open and streams one `EventStream` frame per
 event. Connection framing matches the existing terminal-management IPC
 surface; no new transport is introduced.
 
-Source of truth: [`loom-daemon/src/types.rs`](../../loom-daemon/src/types.rs).
+Source of truth: [`loom-daemon/src/types.rs`](https://github.com/rjwalters/loom/blob/main/loom-daemon/src/types.rs)
+(upstream Loom repo — not shipped to consumer installs).
 
 | Request | MCP tool | Response | Phase |
 |---------|----------|----------|-------|
@@ -156,7 +157,8 @@ In addition, the bus internally emits:
 
 Topic matching is **segment-aligned prefix** (`sweep.issue` matches
 `sweep.issue.123.phase` but not `sweep.issuetype.foo`). See
-[`event_bus::topic_matches`](../../loom-daemon/src/event_bus.rs) for the
+[`event_bus::topic_matches`](https://github.com/rjwalters/loom/blob/main/loom-daemon/src/event_bus.rs)
+(upstream Loom repo — not shipped to consumer installs) for the
 authoritative routing rule.
 
 ## MCP tool reference
@@ -1013,9 +1015,11 @@ the single `loom:epic` label and are **derived** — computed each tick from two
 already-visible facts: the number of `### Phase` sections in the epic body, and
 the open/closed status of the epic's `loom:epic-phase` children. The five states
 (implemented as `EpicState` in
-[`loom-daemon/src/epic_state.rs`](../../loom-daemon/src/epic_state.rs)) mirror
+[`loom-daemon/src/epic_state.rs`](https://github.com/rjwalters/loom/blob/main/loom-daemon/src/epic_state.rs)
+(upstream Loom repo — not shipped to consumer installs)) mirror
 the `derived=True` epic lane of the authoritative Python model
-([`loom-tools/src/loom_tools/state_machine.py`](../../loom-tools/src/loom_tools/state_machine.py),
+([`loom-tools/src/loom_tools/state_machine.py`](https://github.com/rjwalters/loom/blob/main/loom-tools/src/loom_tools/state_machine.py)
+(upstream Loom repo — not shipped to consumer installs),
 #3841):
 
 | Derived state | Condition | Enabled transition |
@@ -1041,7 +1045,8 @@ epic:phase_join   → epic:done        (Supervisor, barrier)        [close]
 
 Every edge touching `epic:phase_join` is a **phase-boundary edge** and declares
 a non-empty fork-join barrier
-([`loom-daemon/src/phase_join.rs`](../../loom-daemon/src/phase_join.rs)): the
+([`loom-daemon/src/phase_join.rs`](https://github.com/rjwalters/loom/blob/main/loom-daemon/src/phase_join.rs)
+(upstream Loom repo — not shipped to consumer installs)): the
 barrier holds — degrading the plan to a no-op — until every child of the current
 phase is closed, so phase N+1 (or epic close) never fires while a current-phase
 child is still open.
@@ -1052,7 +1057,8 @@ begins its lifecycle at `epic:needs_decomp`.
 
 **Conformance.** The Rust transition table is asserted faithful to the Python
 model by
-[`loom-daemon/tests/epic_conformance.rs`](../../loom-daemon/tests/epic_conformance.rs),
+[`loom-daemon/tests/epic_conformance.rs`](https://github.com/rjwalters/loom/blob/main/loom-daemon/tests/epic_conformance.rs)
+(upstream Loom repo — not shipped to consumer installs),
 which **derives** its expectation by invoking
 `python3 -m loom_tools.state_machine --json` and comparing the emitted epic
 sub-graph (states, edges, roles, barriers, `creates_issues`) against the Rust
@@ -1064,7 +1070,8 @@ test skips gracefully when `python3` is unavailable.
 The two issue-creating expand bursts (`decompose`'s downstream and both
 `expand`/`join` Champion dispatches that run `gh issue create`) are serialized
 through the global **#3707 issue-creation mutex**
-([`loom-daemon/src/issue_creation_mutex.rs`](../../loom-daemon/src/issue_creation_mutex.rs)).
+([`loom-daemon/src/issue_creation_mutex.rs`](https://github.com/rjwalters/loom/blob/main/loom-daemon/src/issue_creation_mutex.rs)
+(upstream Loom repo — not shipped to consumer installs)).
 The supervisor holds the async guard across the whole (spawn-and-wait) dispatch
 so a burst never interleaves with any other issue-creating burst anywhere in the
 daemon. All epic expands share the single `CHAMPION_EPIC_DECOMP` serialization
@@ -1093,7 +1100,8 @@ epic-supervisor action across all epics, or `epic.issue.{N}` for one epic
 ## Autonomous work finder (#3810)
 
 The **work finder** (Phase A of epic #3809,
-[`loom-daemon/src/work_finder.rs`](../../loom-daemon/src/work_finder.rs)) is the
+[`loom-daemon/src/work_finder.rs`](https://github.com/rjwalters/loom/blob/main/loom-daemon/src/work_finder.rs)
+(upstream Loom repo — not shipped to consumer installs)) is the
 daemon-native poller that turns a human-approved `loom:issue` into a dispatched
 build **without an operator** — restoring the one capability the deleted v0.10.0
 shepherd brain had that the daemon rebuild never replaced. It is **opt-in and
@@ -1217,7 +1225,8 @@ cost is judged worth paying.
 remaining constant — how many cores one concurrent sweep consumes during its
 build/test step — is a per-repo/host property. Its default (`2.0`) is **not**
 changed here absent a real multi-sweep measurement; a reproducible recipe lives
-at [`docs/measure-est-cores-per-sweep.md`](../../docs/measure-est-cores-per-sweep.md)
+at [`docs/measure-est-cores-per-sweep.md`](https://github.com/rjwalters/loom/blob/main/docs/measure-est-cores-per-sweep.md)
+(upstream Loom repo — not shipped to consumer installs)
 so an operator can calibrate it on a live fleet without re-opening the code.
 
 **Per-token concurrency factor (#3947).** The token axis is `healthy × factor`,
@@ -2525,7 +2534,8 @@ run against a binary-only / release-tarball install.
 
 The goal state — "file a `loom:triage` issue, watch it build" with zero operator
 dispatch — is validated by the E2E playbook at
-[`docs/autonomous-mode-e2e.md`](../../docs/autonomous-mode-e2e.md): it walks a
+[`docs/autonomous-mode-e2e.md`](https://github.com/rjwalters/loom/blob/main/docs/autonomous-mode-e2e.md)
+(upstream Loom repo — not shipped to consumer installs): it walks a
 throwaway issue from `loom:triage` → Curator → `loom:issue` → work-finder
 dispatch → PR → merge, with a scripted label-transition assertion, and confirms
 the operator only ever created the issue.
@@ -2572,17 +2582,19 @@ what Phase 3 deletes vs preserves".
 - **Phase B** (event bus): #3453 / PR #3460.
 - **Phase C** (monitoring + subscription tools): #3455.
 - **Migration guide**:
-  [`docs/migration/v0.10.0-shepherd-deprecation.md`](../../docs/migration/v0.10.0-shepherd-deprecation.md).
+  [`docs/migration/v0.10.0-shepherd-deprecation.md`](https://github.com/rjwalters/loom/blob/main/docs/migration/v0.10.0-shepherd-deprecation.md)
+  (upstream Loom repo — not shipped to consumer installs).
 - **Config resolution layer** (#4039, Epic #3835 Phase 2): a single resolver
   over private defaults + tracked `.loom-project/project.json` + ignored
   `.loom-local/local.json` + legacy `.loom/config.json`, additive-only (no
   existing call site — including this doc's `.loom/config.json` references
   above — has been migrated onto it yet; see follow-up #4047). Schema,
   precedence, and how it composes with `env > config > default`:
-  [`docs/design/config-resolution-tiers.md`](../../docs/design/config-resolution-tiers.md).
-- **Source**:
-  - [`loom-daemon/src/types.rs`](../../loom-daemon/src/types.rs) — IPC types.
-  - [`loom-daemon/src/sweep_registry.rs`](../../loom-daemon/src/sweep_registry.rs) — registry + reaper.
-  - [`loom-daemon/src/event_bus.rs`](../../loom-daemon/src/event_bus.rs) — pub/sub bus.
-  - [`loom-daemon/src/ipc.rs`](../../loom-daemon/src/ipc.rs) — request dispatcher.
-  - [`mcp-loom/src/tools/sweeps.ts`](../../mcp-loom/src/tools/sweeps.ts) — MCP tool definitions.
+  [`docs/design/config-resolution-tiers.md`](https://github.com/rjwalters/loom/blob/main/docs/design/config-resolution-tiers.md)
+  (upstream Loom repo — not shipped to consumer installs).
+- **Source** (upstream Loom repo — not shipped to consumer installs):
+  - [`loom-daemon/src/types.rs`](https://github.com/rjwalters/loom/blob/main/loom-daemon/src/types.rs) — IPC types.
+  - [`loom-daemon/src/sweep_registry.rs`](https://github.com/rjwalters/loom/blob/main/loom-daemon/src/sweep_registry.rs) — registry + reaper.
+  - [`loom-daemon/src/event_bus.rs`](https://github.com/rjwalters/loom/blob/main/loom-daemon/src/event_bus.rs) — pub/sub bus.
+  - [`loom-daemon/src/ipc.rs`](https://github.com/rjwalters/loom/blob/main/loom-daemon/src/ipc.rs) — request dispatcher.
+  - [`mcp-loom/src/tools/sweeps.ts`](https://github.com/rjwalters/loom/blob/main/mcp-loom/src/tools/sweeps.ts) — MCP tool definitions.
