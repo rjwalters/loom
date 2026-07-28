@@ -36,10 +36,39 @@ pub const LOOM_HOOK_PREFIX: &str = "${CLAUDE_PROJECT_DIR}/.loom/hooks/";
 #[allow(dead_code)]
 pub const LEGACY_LOOM_HOOK_PREFIX: &str = ".loom/hooks/";
 
+/// Normalize a hook command string for semantic-duplicate comparison.
+///
+/// Loom-generated hook commands are a single `${CLAUDE_PROJECT_DIR}`-prefixed
+/// path. Some installer generations wrapped that path in double quotes (to
+/// survive a project path containing spaces); the current template emits it
+/// unquoted. Byte-for-byte comparison treats
+/// `"${CLAUDE_PROJECT_DIR}/.loom/hooks/foo.sh"` and
+/// `${CLAUDE_PROJECT_DIR}/.loom/hooks/foo.sh` as different commands, so a
+/// reinstall over a quoted-form install appended a second, functionally
+/// identical hook entry on every run, and uninstall left the quoted entry
+/// behind (issue #4200). Stripping quote characters and collapsing whitespace
+/// before comparing treats them as the same hook without discarding either
+/// side's original on-disk formatting -- this function is for comparison
+/// only, never for rewriting a stored `command` value.
+#[allow(dead_code)]
+fn normalize_hook_command(cmd: &str) -> String {
+    cmd.chars()
+        .filter(|c| *c != '"' && *c != '\'')
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 /// Returns true if a command string belongs to Loom (matches new or legacy prefix).
+///
+/// The command is normalized (see [`normalize_hook_command`]) before the
+/// prefix check so quoted-form entries (e.g. a path wrapped in `"..."` to
+/// survive spaces) are still recognized as Loom-owned.
 #[allow(dead_code)]
 fn is_loom_hook_command(cmd: &str) -> bool {
-    cmd.starts_with(LOOM_HOOK_PREFIX) || cmd.starts_with(LEGACY_LOOM_HOOK_PREFIX)
+    let normalized = normalize_hook_command(cmd);
+    normalized.starts_with(LOOM_HOOK_PREFIX) || normalized.starts_with(LEGACY_LOOM_HOOK_PREFIX)
 }
 
 /// Loom section markers for CLAUDE.md content preservation
@@ -439,7 +468,8 @@ fn merge_hooks(
     result
 }
 
-/// Merge hook commands within a single matcher entry, deduplicating by command path.
+/// Merge hook commands within a single matcher entry, deduplicating by
+/// semantically-normalized command (see [`normalize_hook_command`]).
 ///
 /// Also strips legacy Loom hook entries (bare `.loom/hooks/...` paths from pre-3265
 /// installs) so that re-running install does not leave duplicate hook invocations
@@ -459,24 +489,33 @@ fn merge_hook_commands(existing_entry: &mut Value, loom_entry: &Value) {
     // First, strip legacy bare-relative Loom hooks so they don't coexist with the
     // new ${CLAUDE_PROJECT_DIR}-prefixed versions. We only strip the *legacy* prefix
     // here -- new-prefix entries are kept and serve as the dedup signal below.
+    // The command is normalized (see [`normalize_hook_command`]) before the
+    // prefix checks so a quoted legacy or current-form entry is still
+    // recognized correctly.
     existing_hooks.retain(|h| {
         let cmd = h.get("command").and_then(|c| c.as_str()).unwrap_or("");
-        !cmd.starts_with(LEGACY_LOOM_HOOK_PREFIX) || cmd.starts_with(LOOM_HOOK_PREFIX)
+        let normalized = normalize_hook_command(cmd);
+        !normalized.starts_with(LEGACY_LOOM_HOOK_PREFIX) || normalized.starts_with(LOOM_HOOK_PREFIX)
     });
 
-    // Collect existing command paths for dedup
+    // Collect existing command paths for dedup, normalized so quoted and
+    // unquoted forms of the same command collide.
     let existing_commands: std::collections::HashSet<String> = existing_hooks
         .iter()
-        .filter_map(|h| h.get("command").and_then(|c| c.as_str()).map(String::from))
+        .filter_map(|h| h.get("command").and_then(|c| c.as_str()))
+        .map(normalize_hook_command)
         .collect();
 
-    // Add Loom hooks that aren't already present
+    // Add Loom hooks that aren't already present (by normalized command).
+    // Note: the original `loom_hook` value (unnormalized) is what gets
+    // pushed -- normalization is comparison-only and never rewrites what's
+    // stored in the merged output.
     for loom_hook in loom_hooks {
         let cmd = loom_hook
             .get("command")
             .and_then(|c| c.as_str())
             .unwrap_or("");
-        if !existing_commands.contains(cmd) {
+        if !existing_commands.contains(&normalize_hook_command(cmd)) {
             existing_hooks.push(loom_hook.clone());
         }
     }
@@ -2074,6 +2113,64 @@ WARNING: Never run `lake build` inside Docker - causes memory corruption.
     }
 
     #[test]
+    fn test_merge_settings_deduplicates_hooks_with_quoted_paths() {
+        // Issue #4200: a prior installer generation wrote the Loom hook
+        // command wrapped in double quotes (to survive a project path
+        // containing spaces). Reinstalling with the current, unquoted
+        // template must recognize this as the SAME hook and not append a
+        // second, functionally identical entry.
+        let existing: serde_json::Value = serde_json::from_str(
+            r#"{
+            "hooks": {
+                "PreToolUse": [{
+                    "matcher": "Bash",
+                    "hooks": [
+                        {"type": "command", "command": "\"${CLAUDE_PROJECT_DIR}/.loom/hooks/guard-destructive.sh\""},
+                        {"type": "command", "command": ".claude/hooks/custom-bash-guard.sh"}
+                    ]
+                }]
+            }
+        }"#,
+        )
+        .unwrap();
+
+        let loom_defaults: serde_json::Value = serde_json::from_str(
+            r#"{
+            "hooks": {
+                "PreToolUse": [{
+                    "matcher": "Bash",
+                    "hooks": [{"type": "command", "command": "${CLAUDE_PROJECT_DIR}/.loom/hooks/guard-destructive.sh"}]
+                }]
+            }
+        }"#,
+        )
+        .unwrap();
+
+        let merged = merge_settings_json(&existing, &loom_defaults);
+
+        let bash_hooks = &merged["hooks"]["PreToolUse"][0]["hooks"];
+        let hooks_arr = bash_hooks.as_array().unwrap();
+
+        // Exactly 2 entries: the original quoted Loom hook (preserved as-is,
+        // not rewritten) + the custom project hook. No unquoted duplicate.
+        assert_eq!(
+            hooks_arr.len(),
+            2,
+            "Should not append an unquoted duplicate of an existing quoted Loom hook: {hooks_arr:?}"
+        );
+
+        let commands: Vec<&str> = hooks_arr
+            .iter()
+            .map(|h| h["command"].as_str().unwrap())
+            .collect();
+        assert!(
+            commands.contains(&"\"${CLAUDE_PROJECT_DIR}/.loom/hooks/guard-destructive.sh\""),
+            "Original quoted entry should be preserved unchanged (comparison-only normalization), got: {commands:?}"
+        );
+        assert!(commands.contains(&".claude/hooks/custom-bash-guard.sh"));
+    }
+
+    #[test]
     fn test_merge_settings_migrates_legacy_hooks() {
         // Pre-3265 installs have bare-relative `.loom/hooks/...` entries.
         // On re-install, the merge must strip the legacy entry and add the new
@@ -2219,6 +2316,40 @@ WARNING: Never run `lake build` inside Docker - causes memory corruption.
         // UserPromptSubmit should be untouched
         let user_prompt = &settings["hooks"]["UserPromptSubmit"];
         assert_eq!(user_prompt.as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn test_remove_loom_hooks_removes_quoted_form() {
+        // Issue #4200: a quoted-form Loom hook command (e.g.
+        // `"${CLAUDE_PROJECT_DIR}/.loom/hooks/guard-destructive.sh"`) begins
+        // with `\"`, so it matches neither the legacy nor the new-prefix
+        // `starts_with` check without normalization -- it must still be
+        // recognized and removed on uninstall.
+        let mut settings: serde_json::Value = serde_json::from_str(
+            r#"{
+            "hooks": {
+                "PreToolUse": [{
+                    "matcher": "Bash",
+                    "hooks": [
+                        {"type": "command", "command": "\"${CLAUDE_PROJECT_DIR}/.loom/hooks/guard-destructive.sh\""},
+                        {"type": "command", "command": ".claude/hooks/custom-guard.sh"}
+                    ]
+                }]
+            }
+        }"#,
+        )
+        .unwrap();
+
+        remove_loom_hooks(&mut settings);
+
+        let bash_hooks = &settings["hooks"]["PreToolUse"][0]["hooks"];
+        let hooks_arr = bash_hooks.as_array().unwrap();
+        assert_eq!(
+            hooks_arr.len(),
+            1,
+            "Quoted-form Loom hook should be removed, got: {hooks_arr:?}"
+        );
+        assert_eq!(hooks_arr[0]["command"], ".claude/hooks/custom-guard.sh");
     }
 
     #[test]
