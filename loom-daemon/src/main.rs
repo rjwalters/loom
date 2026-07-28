@@ -2674,6 +2674,18 @@ fn print_status_json(
     let combined = serde_json::json!({
         "in_flight_count": report.in_flight.len(),
         "in_flight": report.in_flight,
+        // Live-locked-but-unregistered sweeps (#4214): a live `owner_pid` lock
+        // with no matching `in_flight` entry. Non-empty here means a sweep is
+        // demonstrably alive (the lock proves it) but the in-memory registry
+        // union above has lost track of it — read these as **alive**, not
+        // dead, and reconcile rather than re-dispatching. Empty in the
+        // overwhelmingly common case.
+        "unregistered_locked_count": report.unregistered_locked.len(),
+        "unregistered_locked": report.unregistered_locked.iter().map(|u| serde_json::json!({
+            "root": u.root,
+            "issue": u.issue,
+            "owner_pid": u.owner_pid,
+        })).collect::<Vec<_>>(),
         // "Currently binding" vs "smallest ceiling" (#4031): the cap only binds
         // once in-flight reaches it. `false` ⇒ the limiter is work availability,
         // not any resource term, so scripted consumers don't misread the
@@ -2963,6 +2975,23 @@ fn print_status_human(
                 "  {:<30} {:>7} {:>8}  {:<20} {}",
                 s.sweep_id, issue, s.pid, s.token_name, phase
             );
+        }
+    }
+
+    // Live-locked-but-unregistered sweeps (#4214): a sweep whose per-issue lock
+    // has a live `owner_pid` but no matching in-flight entry above. Non-empty
+    // means the daemon's in-memory registry union has lost track of a sweep
+    // that is demonstrably still alive (the lock proves it) — a monitor should
+    // read this as ALIVE, not dead, and an operator should reconcile rather
+    // than re-dispatch (re-dispatch is blocked by the lock anyway, #4146).
+    if !report.unregistered_locked.is_empty() {
+        println!(
+            "\nWARNING: {} live-locked sweep(s) missing from the in-flight registry \
+             (alive, not dead — reconcile, don't re-dispatch):",
+            report.unregistered_locked.len()
+        );
+        for u in &report.unregistered_locked {
+            println!("  issue #{} (pid {}) in {}", u.issue, u.owner_pid, u.root.display());
         }
     }
 

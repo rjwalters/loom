@@ -1632,6 +1632,78 @@ impl SweepRegistry {
         v
     }
 
+    /// Cross-check `.loom/locks/issue-<N>/` against this registry's own
+    /// in-memory entries and surface any issue whose lock has a **live**
+    /// `owner_pid` but no matching non-terminal (`Pending`/`Running`) registry
+    /// entry (Issue #4214).
+    ///
+    /// This is the structural fix for the "vanish window" incident: the
+    /// in-flight union `loom-daemon status` reports is built solely from
+    /// in-memory registry entries, so any read-path gap that silently drops an
+    /// entry from that union (e.g. a torn/mid-write `workspaces.json`, or a
+    /// root-spelling mismatch in the workspace pool causing a registry to be
+    /// skipped for a query) makes a demonstrably-alive, locked sweep vanish
+    /// from `status` with no trace — exactly the failure a liveness monitor
+    /// misreads as "sweep is dead". The lock directory is independent,
+    /// filesystem-durable evidence that the in-memory union cannot lose track
+    /// of, so cross-checking it here makes that omission structurally
+    /// impossible: the caller can render these as "alive, but state
+    /// unreconciled" instead of omitting them.
+    ///
+    /// A **stale** lock (dead `owner_pid`) is deliberately excluded — that
+    /// remains [`reconstruct`](Self::reconstruct)'s cleanup remit. Reporting a
+    /// dead lock here would misrepresent a genuinely finished/crashed sweep as
+    /// still running, which is the opposite of what this diagnostic is for.
+    ///
+    /// Returns `(issue, owner_pid)` pairs, sorted ascending by issue number.
+    #[must_use]
+    pub fn unregistered_locked_issues(&self) -> Vec<(u32, u32)> {
+        let locks_dir = self.config.locks_dir();
+        let mut result = Vec::new();
+        let Ok(read_dir) = std::fs::read_dir(&locks_dir) else {
+            return result;
+        };
+        for entry in read_dir {
+            let Ok(entry) = entry else { continue };
+            let path = entry.path();
+            if !path.is_dir() {
+                continue;
+            }
+            let name = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or_default();
+            let Some(issue_str) = name.strip_prefix("issue-") else {
+                continue;
+            };
+            let Ok(issue): Result<u32, _> = issue_str.parse() else {
+                continue;
+            };
+            let owner_path = path.join("owner.json");
+            let owner: Option<LockOwner> = std::fs::read_to_string(&owner_path)
+                .ok()
+                .and_then(|s| serde_json::from_str(&s).ok());
+            let Some(owner) = owner else {
+                // No (or unparsable) owner.json: nothing durable to cross-check
+                // against — `reconstruct()`'s stale-lock cleanup owns this case.
+                continue;
+            };
+            if !is_pid_alive(owner.owner_pid) {
+                // Stale lock (dead owner): the sweep has actually finished or
+                // crashed, not "unregistered" — do not report it as alive.
+                continue;
+            }
+            let already_registered = self.entries.values().any(|info| {
+                !info.state.is_terminal() && matches!(info.kind, SweepKind::Issue(i) if i == issue)
+            });
+            if !already_registered {
+                result.push((issue, owner.owner_pid));
+            }
+        }
+        result.sort_unstable();
+        result
+    }
+
     /// Test/inspection helper: the current consecutive-insta-crash count for an
     /// issue (Issue #3939). `0` when the issue has no recorded insta-crashes.
     #[must_use]
@@ -8319,6 +8391,99 @@ exit 0
         let info = registry.get("sweep-issue-77-reconstruct").unwrap();
         assert_eq!(info.pid, std::process::id());
         assert!(matches!(info.state, SweepState::Running));
+    }
+
+    /// Issue #4214: a live-locked issue with **no** matching registry entry at
+    /// all (no `reconstruct()` has run, no dispatch entry exists) must surface
+    /// via `unregistered_locked_issues` — this is the "vanish window" case: the
+    /// lock (filesystem-durable) proves the sweep is alive even though nothing
+    /// in memory currently reflects it.
+    #[test]
+    fn unregistered_locked_issues_surfaces_live_lock_with_no_entry() {
+        let dir = tempdir().unwrap();
+        let (registry, _record_log) = fixture_registry(dir.path());
+
+        let locks = registry.config.locks_dir();
+        std::fs::create_dir_all(&locks).unwrap();
+        let lock = locks.join("issue-4201");
+        std::fs::create_dir(&lock).unwrap();
+        let owner = LockOwner {
+            issue: 4201,
+            owner_pid: std::process::id(), // guaranteed alive
+            acquired_at: Utc::now().to_rfc3339(),
+            sweep_id: "sweep-issue-4201-1785221507".to_string(),
+        };
+        std::fs::write(lock.join("owner.json"), serde_json::to_string_pretty(&owner).unwrap())
+            .unwrap();
+
+        let unregistered = registry.unregistered_locked_issues();
+        assert_eq!(
+            unregistered,
+            vec![(4201, std::process::id())],
+            "a live-locked issue with no in-memory entry must surface as unregistered_locked"
+        );
+    }
+
+    /// Issue #4214: once the registry has admitted the lock's sweep as a
+    /// non-terminal entry (e.g. via `reconstruct()`, or a normal `dispatch()`),
+    /// the same lock must NOT be reported as unregistered — it is registered.
+    #[test]
+    fn unregistered_locked_issues_excludes_registered_live_entry() {
+        let dir = tempdir().unwrap();
+        let (mut registry, _record_log) = fixture_registry(dir.path());
+
+        let locks = registry.config.locks_dir();
+        std::fs::create_dir_all(&locks).unwrap();
+        let lock = locks.join("issue-4202");
+        std::fs::create_dir(&lock).unwrap();
+        let owner = LockOwner {
+            issue: 4202,
+            owner_pid: std::process::id(),
+            acquired_at: Utc::now().to_rfc3339(),
+            sweep_id: "sweep-issue-4202-registered".to_string(),
+        };
+        std::fs::write(lock.join("owner.json"), serde_json::to_string_pretty(&owner).unwrap())
+            .unwrap();
+
+        // Reconstruct admits the lock's sweep as a `Running` entry.
+        let admitted = registry.reconstruct().unwrap();
+        assert!(admitted >= 1);
+
+        let unregistered = registry.unregistered_locked_issues();
+        assert!(
+            unregistered.is_empty(),
+            "a lock whose sweep is already a registered non-terminal entry must not be \
+             reported as unregistered_locked; got: {unregistered:?}"
+        );
+    }
+
+    /// Issue #4214: a **stale** lock (dead `owner_pid`) must NOT be reported as
+    /// `unregistered_locked` — that lock is `reconstruct()`'s cleanup remit, not
+    /// evidence the sweep is still alive.
+    #[test]
+    fn unregistered_locked_issues_excludes_stale_dead_pid_lock() {
+        let dir = tempdir().unwrap();
+        let (registry, _record_log) = fixture_registry(dir.path());
+
+        let locks = registry.config.locks_dir();
+        std::fs::create_dir_all(&locks).unwrap();
+        let lock = locks.join("issue-4203");
+        std::fs::create_dir(&lock).unwrap();
+        let owner = LockOwner {
+            issue: 4203,
+            owner_pid: 2_147_483_640, // dead
+            acquired_at: Utc::now().to_rfc3339(),
+            sweep_id: "sweep-issue-4203-stale".to_string(),
+        };
+        std::fs::write(lock.join("owner.json"), serde_json::to_string_pretty(&owner).unwrap())
+            .unwrap();
+
+        let unregistered = registry.unregistered_locked_issues();
+        assert!(
+            unregistered.is_empty(),
+            "a stale (dead-pid) lock must never surface as unregistered_locked; got: \
+             {unregistered:?}"
+        );
     }
 
     #[test]

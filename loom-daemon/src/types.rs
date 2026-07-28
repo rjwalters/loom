@@ -790,6 +790,20 @@ pub struct DaemonStatusReport {
     /// The full `SweepInfo` is carried so the CLI can render issue numbers,
     /// PIDs, token account, and latest phase without a second round-trip.
     pub in_flight: Vec<SweepInfo>,
+    /// Issues whose per-issue lock (`.loom/locks/issue-<N>/owner.json`) has a
+    /// **live** `owner_pid` but no matching entry in [`Self::in_flight`]
+    /// (Issue #4214) — a live, locked sweep that the in-memory registry union
+    /// has (transiently or otherwise) lost track of. `build_daemon_status`
+    /// cross-checks every root's lock directory against its own registry so
+    /// this class can never be silently empty when the underlying condition is
+    /// real: a liveness monitor should read entries here as **alive** (a
+    /// reconciliation gap, not a dead sweep), never as absence. A stale lock
+    /// (dead `owner_pid`) is deliberately excluded — that remains
+    /// `reconstruct()`'s cleanup remit. Empty in the overwhelmingly common
+    /// case. `#[serde(default)]` keeps pre-#4214 wire data / older clients
+    /// compatible (an absent field parses as an empty vec).
+    #[serde(default)]
+    pub unregistered_locked: Vec<UnregisteredLockedSweep>,
     /// Dynamic-cap input 1: size of the multi-account token pool
     /// (`.loom/tokens/*.token`), the hard ceiling on concurrent sweeps
     /// (never over-subscribe an OAuth account). Via [`crate::tokens::token_pool_size`].
@@ -1007,6 +1021,24 @@ pub struct DaemonStatusReport {
     /// `#[serde(default)]` keeps pre-#4055 wire data compatible.
     #[serde(default)]
     pub auto_update_note: Option<String>,
+}
+
+/// A live-locked sweep with no matching [`DaemonStatusReport::in_flight`] entry
+/// (Issue #4214). See the field doc on
+/// [`DaemonStatusReport::unregistered_locked`] for the full rationale; this is
+/// the per-entry shape, carrying enough to locate and reconcile it manually
+/// (which root, which issue, which PID is holding the lock).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct UnregisteredLockedSweep {
+    /// The workspace root whose `.loom/locks/issue-<N>/` directory this lock
+    /// lives under.
+    pub root: PathBuf,
+    /// The issue number the lock is for (parsed from the `issue-<N>` dir name).
+    pub issue: u32,
+    /// The lock's `owner_pid`, confirmed alive (`kill(pid, 0)` succeeds) at
+    /// snapshot time — a dead-owner lock is stale-lock cleanup territory
+    /// (`reconstruct()`), not this diagnostic.
+    pub owner_pid: u32,
 }
 
 /// One registered managed-workspace's status line in [`DaemonStatusReport`]
