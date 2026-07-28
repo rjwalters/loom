@@ -9,7 +9,11 @@
 //!   the existing Rust-native port of `worktree-root.sh`), walk up to the nearest
 //!   existing ancestor, and shell out to `df -Pk` to read the integer free GB on
 //!   **that** volume (the dedicated scratch volume when `LOOM_WORKTREE_ROOT` /
-//!   `worktree.root` is set — NOT the repo's own drive).
+//!   `worktree.root` is set — NOT the repo's own drive). Returns `Option<u64>`:
+//!   `None` means the probe was unmeasurable (df missing/errored, unparseable
+//!   output), not that 0 GB is free (#4164 — unknown != zero, mirroring the
+//!   bash-side fix). [`disk_headroom_limit`] skips the disk clamp on `None`
+//!   instead of treating an unmeasurable probe as a full disk.
 //! - [`disk_headroom`] mirrors the disk term of bash `loom_wave_size_from_disk`:
 //!   `floor(free_gb / LOOM_PER_WORKTREE_GB)`, the number of worktrees the scratch
 //!   volume can hold at the conservative per-worktree estimate.
@@ -57,7 +61,9 @@ pub fn per_worktree_gb() -> u64 {
 /// matching the bash `avail_k / 1024 / 1024`.
 ///
 /// Returns `None` when the output is malformed (missing data row, non-numeric
-/// Available column) so the caller can floor to 0 free rather than panic.
+/// Available column) so the caller ([`worktree_root_free_gb`]) can propagate
+/// "unmeasurable" rather than either panicking or manufacturing a fake `0`
+/// (#4164 — unknown != zero).
 #[must_use]
 pub fn parse_df_available_gb(df_output: &str) -> Option<u64> {
     // Second line is the single data row (`-P` guarantees one line per fs).
@@ -86,12 +92,15 @@ fn nearest_existing_ancestor(path: &Path) -> &Path {
 ///
 /// Resolves the worktree root via [`worktree_root`] (override-aware:
 /// `LOOM_WORKTREE_ROOT` / `worktree.root` / default `<repo>/.loom/worktrees`),
-/// walks up to the nearest existing ancestor, and runs `df -Pk` on it. Returns 0
-/// free on any failure (df missing/errored, unparseable output) so the caller
-/// floors to a single worktree rather than crashing — matching the bash
-/// `echo "0"` fallbacks.
+/// walks up to the nearest existing ancestor, and runs `df -Pk` on it.
+///
+/// Unknown != zero (#4164): returns `None` on any failure to actually measure
+/// free space (`df` missing/errored, unparseable output) instead of a fake
+/// `0` — a `0` used to flow straight into [`disk_headroom`] and look
+/// identical to a genuinely full disk. Callers (`disk_headroom_limit`) must
+/// treat `None` as "skip the disk clamp", not as "0 free".
 #[must_use]
-pub fn worktree_root_free_gb(repo_root: &Path) -> u64 {
+pub fn worktree_root_free_gb(repo_root: &Path) -> Option<u64> {
     let wt_root = worktree_root(repo_root);
     let probe = nearest_existing_ancestor(&wt_root);
 
@@ -102,11 +111,11 @@ pub fn worktree_root_free_gb(repo_root: &Path) -> u64 {
         .output()
     {
         Ok(o) if o.status.success() => o,
-        Ok(_) | Err(_) => return 0,
+        Ok(_) | Err(_) => return None,
     };
 
     let stdout = String::from_utf8_lossy(&output.stdout);
-    parse_df_available_gb(&stdout).unwrap_or(0)
+    parse_df_available_gb(&stdout)
 }
 
 /// The disk-headroom concurrency term: how many worktrees `free_gb` can hold at
@@ -124,9 +133,26 @@ pub fn disk_headroom(free_gb: u64, per_gb: u64) -> usize {
 /// worktrees the worktree-root scratch volume can hold at the resolved
 /// per-worktree estimate. Combines [`worktree_root_free_gb`] (I/O) with
 /// [`disk_headroom`] (pure math) and [`per_worktree_gb`] (env).
+///
+/// Unknown != zero (#4164): when the free-space probe is unmeasurable
+/// ([`worktree_root_free_gb`] returns `None`), this SKIPS the disk clamp
+/// entirely — returning `usize::MAX` so the disk term never binds the
+/// `min(...)` concurrency expression callers (`ipc.rs`, `work_finder.rs`)
+/// compose it into — and logs a warning naming the repo root, rather than
+/// silently treating the unmeasurable probe as a full disk.
 #[must_use]
 pub fn disk_headroom_limit(repo_root: &Path) -> usize {
-    disk_headroom(worktree_root_free_gb(repo_root), per_worktree_gb())
+    match worktree_root_free_gb(repo_root) {
+        Some(free_gb) => disk_headroom(free_gb, per_worktree_gb()),
+        None => {
+            log::warn!(
+                "disk_headroom: could not measure free space on the worktree-root \
+                 filesystem for {} — skipping the disk clamp (treating as unbounded)",
+                repo_root.display()
+            );
+            usize::MAX
+        }
+    }
 }
 
 #[cfg(test)]
@@ -245,8 +271,81 @@ mod tests {
         // and returns a plausible (non-astronomical) integer — the exact GB is
         // environment-dependent.
         let tmp = tempfile::tempdir().unwrap();
-        let free = worktree_root_free_gb(tmp.path());
+        let free = worktree_root_free_gb(tmp.path())
+            .expect("a real df -Pk against a real tempdir should succeed in the test env");
         // A modern dev/CI volume has < 1 EB free; this just guards the parse.
         assert!(free < 1_000_000_000);
+    }
+
+    // ===================================================================
+    // worktree_root_free_gb / disk_headroom_limit — unmeasurable (None) path
+    // (#4164: unknown != zero)
+    // ===================================================================
+
+    #[test]
+    #[serial]
+    fn test_worktree_root_free_gb_returns_none_on_df_failure() {
+        // A `df` on PATH that always fails must surface as `None` (unmeasurable),
+        // never as a fake `Some(0)` — a 0 free-GB reading must mean "measured a
+        // genuinely full disk", not "the probe itself failed".
+        let stub_dir = tempfile::tempdir().unwrap();
+        let stub_df = stub_dir.path().join("df");
+        std::fs::write(&stub_df, "#!/bin/sh\nexit 1\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&stub_df).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&stub_df, perms).unwrap();
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let old_path = std::env::var("PATH").unwrap_or_default();
+        // Prepend the stub dir so its `df` shadows the real one.
+        std::env::set_var("PATH", format!("{}:{old_path}", stub_dir.path().display()));
+        let result = worktree_root_free_gb(tmp.path());
+        std::env::set_var("PATH", old_path);
+
+        assert_eq!(result, None, "a failing df must yield None (unmeasurable), not a fake Some(0)");
+    }
+
+    #[test]
+    #[serial]
+    fn test_disk_headroom_limit_skips_clamp_on_unmeasurable_probe() {
+        // When the probe is unmeasurable, disk_headroom_limit must NOT clamp to
+        // 0 (which would look identical to "disk is completely full" and wrongly
+        // bind every `min(...)` concurrency expression down to 0) — it must skip
+        // the disk term entirely (usize::MAX, i.e. "no constraint from this axis").
+        let stub_dir = tempfile::tempdir().unwrap();
+        let stub_df = stub_dir.path().join("df");
+        std::fs::write(&stub_df, "#!/bin/sh\nexit 1\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&stub_df).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&stub_df, perms).unwrap();
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let old_path = std::env::var("PATH").unwrap_or_default();
+        std::env::set_var("PATH", format!("{}:{old_path}", stub_dir.path().display()));
+        let limit = disk_headroom_limit(tmp.path());
+        std::env::set_var("PATH", old_path);
+
+        assert_eq!(
+            limit,
+            usize::MAX,
+            "an unmeasurable disk probe must skip the clamp (usize::MAX), not silently become 0"
+        );
+    }
+
+    #[test]
+    fn test_disk_headroom_limit_measured_zero_still_clamps() {
+        // Regression: a REAL 0-free-GB measurement (genuinely full disk) is a
+        // legitimate, non-unmeasurable result and must still clamp to 0 via
+        // disk_headroom's normal floor-division math. This guards against
+        // over-correcting #4164 into "None and Some(0) behave the same".
+        assert_eq!(disk_headroom(0, per_worktree_gb().max(1)), 0);
     }
 }
