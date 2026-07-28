@@ -18,6 +18,28 @@ use regex::Regex;
 use super::locking::MkdirLock;
 use super::paths::resolve_tokens_dir;
 
+/// Default cooldown (seconds) after which a non-auth (exhaustion) bad-token
+/// entry stops blocking selection (#4122). Weekly/session-limit exhaustion is
+/// transient — the account recovers on its own — so those entries expire while
+/// auth-reason entries (a broken credential) remain permanent. Mirrors the
+/// Python reference default (`bad_tokens.py::cleanup_bad_tokens`, 6h).
+pub const DEFAULT_EXHAUSTION_COOLDOWN_SECS: i64 = 6 * 3600;
+
+/// Env override (whole seconds, must parse to `> 0`) for
+/// [`DEFAULT_EXHAUSTION_COOLDOWN_SECS`].
+pub const EXHAUSTION_COOLDOWN_ENV: &str = "LOOM_TOKEN_EXHAUSTION_COOLDOWN_SECS";
+
+/// Resolve the exhaustion-entry cooldown: the [`EXHAUSTION_COOLDOWN_ENV`]
+/// override (whole seconds, `> 0`) or [`DEFAULT_EXHAUSTION_COOLDOWN_SECS`].
+#[must_use]
+pub fn exhaustion_cooldown_secs() -> i64 {
+    std::env::var(EXHAUSTION_COOLDOWN_ENV)
+        .ok()
+        .and_then(|s| s.trim().parse::<i64>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(DEFAULT_EXHAUSTION_COOLDOWN_SECS)
+}
+
 fn tokens_dir(workspace: &Path) -> PathBuf {
     resolve_tokens_dir(workspace)
 }
@@ -77,7 +99,15 @@ pub fn mark_bad(workspace: &Path, token_name: &str, reason: &str) -> Result<(), 
     Ok(())
 }
 
-/// Return `true` if `token_name` appears in the bad_tokens file.
+/// Return `true` if `token_name` is currently bad-marked.
+///
+/// Auth-reason entries (a broken credential — matched by [`auth_reason_regex`])
+/// block permanently. Non-auth ("exhaustion") entries block only until they age
+/// past [`exhaustion_cooldown_secs`] (#4122): weekly/session-limit exhaustion is
+/// transient, so a stale exhaustion line no longer keeps an otherwise-healthy
+/// account out of rotation even before [`cleanup_bad_tokens`] prunes it from
+/// disk. A line whose timestamp cannot be parsed is treated as permanent
+/// (fail-closed — we never silently un-block a token on a malformed entry).
 ///
 /// Reads are unsynchronized — readers see a consistent file because writers
 /// only ever append whole lines.
@@ -87,7 +117,33 @@ pub fn is_bad(workspace: &Path, token_name: &str) -> bool {
     let Ok(text) = std::fs::read_to_string(&bad_file) else {
         return false;
     };
-    name_pattern(token_name).is_match(&text)
+    let pattern = name_pattern(token_name);
+    let cooldown = exhaustion_cooldown_secs();
+    let now = Utc::now().timestamp();
+    for line in text.lines() {
+        let stripped = line.trim();
+        if stripped.is_empty() || !pattern.is_match(stripped) {
+            continue;
+        }
+        // Parse `<ts> <name> <reason...>` from this matching line.
+        let mut parts = stripped.splitn(3, ' ');
+        let ts_str = parts.next().unwrap_or("");
+        let _name = parts.next();
+        let reason = parts.next().unwrap_or("");
+        // Auth entries never expire.
+        if auth_reason_regex().is_match(reason) {
+            return true;
+        }
+        // Non-auth (exhaustion) entries expire after the cooldown. A
+        // malformed/missing timestamp fails closed (permanent). An expired
+        // entry does NOT short-circuit — a later line may still block.
+        match chrono::NaiveDateTime::parse_from_str(ts_str, "%Y-%m-%dT%H:%M:%SZ") {
+            Ok(naive) if now - naive.and_utc().timestamp() < cooldown => return true,
+            Ok(_) => {}
+            Err(_) => return true,
+        }
+    }
+    false
 }
 
 /// Drop bad_tokens entries older than `max_age_seconds`. Returns the number
@@ -239,6 +295,64 @@ mod tests {
     fn is_bad_false_when_file_missing() {
         let tmp = make_pool();
         assert!(!is_bad(tmp.path(), "agent-1"));
+    }
+
+    /// #4122: an exhaustion (non-auth) entry older than the cooldown no longer
+    /// reports `is_bad`, while an auth entry of the same age remains permanent.
+    #[test]
+    fn exhaustion_entry_expires_after_cooldown_auth_stays() {
+        let tmp = make_pool();
+        let dir = pool_dir(tmp.path());
+        // Both entries are 7h old — past the 6h default cooldown.
+        let old = (Utc::now() - chrono::Duration::seconds(7 * 3600))
+            .format("%Y-%m-%dT%H:%M:%SZ")
+            .to_string();
+        fs::write(
+            dir.join(".bad_tokens"),
+            format!(
+                "{old} agent-exh exhausted: weekly limit\n\
+                 {old} agent-auth 401 unauthorized\n"
+            ),
+        )
+        .unwrap();
+        // Exhaustion entry has aged out — token is selectable again even though
+        // the line is still on disk (cleanup has not run yet).
+        assert!(!is_bad(tmp.path(), "agent-exh"));
+        // Auth entry is permanent — unaffected by the TTL.
+        assert!(is_bad(tmp.path(), "agent-auth"));
+    }
+
+    /// #4122: a fresh exhaustion entry still blocks (the cooldown only expires
+    /// aged entries).
+    #[test]
+    fn fresh_exhaustion_entry_still_blocks() {
+        let tmp = make_pool();
+        mark_bad(tmp.path(), "agent-1", "exhausted: weekly limit").unwrap();
+        assert!(is_bad(tmp.path(), "agent-1"));
+    }
+
+    /// #4122: a matching line with an unparseable timestamp fails closed
+    /// (treated as permanently bad) so a malformed entry never un-blocks a
+    /// token.
+    #[test]
+    fn malformed_timestamp_fails_closed() {
+        let tmp = make_pool();
+        let dir = pool_dir(tmp.path());
+        fs::write(dir.join(".bad_tokens"), "not-a-timestamp agent-1 exhausted\n").unwrap();
+        assert!(is_bad(tmp.path(), "agent-1"));
+    }
+
+    #[test]
+    #[serial]
+    fn exhaustion_cooldown_env_override() {
+        std::env::set_var(EXHAUSTION_COOLDOWN_ENV, "100");
+        assert_eq!(exhaustion_cooldown_secs(), 100);
+        std::env::set_var(EXHAUSTION_COOLDOWN_ENV, "0");
+        assert_eq!(exhaustion_cooldown_secs(), DEFAULT_EXHAUSTION_COOLDOWN_SECS);
+        std::env::set_var(EXHAUSTION_COOLDOWN_ENV, "garbage");
+        assert_eq!(exhaustion_cooldown_secs(), DEFAULT_EXHAUSTION_COOLDOWN_SECS);
+        std::env::remove_var(EXHAUSTION_COOLDOWN_ENV);
+        assert_eq!(exhaustion_cooldown_secs(), DEFAULT_EXHAUSTION_COOLDOWN_SECS);
     }
 
     #[test]
