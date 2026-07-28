@@ -254,6 +254,131 @@ codesign_args="$(cat "$CODESIGN_ARGS_FILE" 2>/dev/null || echo "<missing>")"
 assert_contains "codesign success: invoked with the stable identifier" "$codesign_args" "--identifier com.rjwalters.loom-daemon"
 assert_contains "codesign success: signs the installed DEST binary, not the source" "$codesign_args" "$DEST10/loom-daemon"
 
+# ---------- test 11: LOOM_CODESIGN_IDENTITY (#4244) — identity found in the
+# keychain -> codesign is invoked WITH that identity (not "-s -"). Fakes
+# `uname` (Darwin), `security find-identity` (reports the identity as a valid
+# codesigning identity), and `codesign` (records its argv instead of actually
+# signing, since the fake binary is a plain shell script, not a Mach-O).
+# ---------------------------------------------------------------------------
+FAKE_IDENTITY_DIR="$WORKDIR/fake-identity-bin"
+mkdir -p "$FAKE_IDENTITY_DIR"
+cat > "$FAKE_IDENTITY_DIR/uname" <<'EOF'
+#!/usr/bin/env bash
+echo "Darwin"
+EOF
+chmod +x "$FAKE_IDENTITY_DIR/uname"
+cat > "$FAKE_IDENTITY_DIR/security" <<'EOF'
+#!/usr/bin/env bash
+if [[ "${1:-}" == "find-identity" ]]; then
+  echo '  1) ABCDEF1234567890ABCDEF1234567890ABCDEF12 "Loom Local Signing"'
+  echo '     1 valid identities found'
+  exit 0
+fi
+exit 1
+EOF
+chmod +x "$FAKE_IDENTITY_DIR/security"
+CODESIGN_ARGS_ID_FILE="$WORKDIR/codesign-args-identity.txt"
+cat > "$FAKE_IDENTITY_DIR/codesign" <<EOF
+#!/usr/bin/env bash
+echo "\$@" > "$CODESIGN_ARGS_ID_FILE"
+exit 0
+EOF
+chmod +x "$FAKE_IDENTITY_DIR/codesign"
+
+SRC11="$WORKDIR/src11/loom-daemon"
+mkdir -p "$WORKDIR/src11"
+make_fake_bin "$SRC11" "0.15.5"
+DEST11="$WORKDIR/dest11"
+out11=$(PATH="$FAKE_IDENTITY_DIR:$PATH" LOOM_DAEMON_BIN_DIR="$DEST11" \
+  LOOM_CODESIGN_IDENTITY="Loom Local Signing" provision_machine_daemon "$SRC11" 2>&1)
+rc11=$?
+assert_eq "LOOM_CODESIGN_IDENTITY set + found: provision returns 0" "0" "$rc11"
+codesign_args_id="$(cat "$CODESIGN_ARGS_ID_FILE" 2>/dev/null || echo "<missing>")"
+assert_contains "LOOM_CODESIGN_IDENTITY set + found: codesign invoked WITH the identity" \
+  "$codesign_args_id" "-s Loom Local Signing"
+TOTAL=$((TOTAL + 1))
+if [[ "$codesign_args_id" != *"-s -"* ]]; then
+  echo -e "${GREEN}PASS${NC}: LOOM_CODESIGN_IDENTITY set + found: does NOT fall back to ad-hoc (-s -)"
+  PASS=$((PASS + 1))
+else
+  echo -e "${RED}FAIL${NC}: LOOM_CODESIGN_IDENTITY set + found: does NOT fall back to ad-hoc (-s -)"
+  echo "  actual: '$codesign_args_id'"
+  FAIL=$((FAIL + 1))
+fi
+assert_contains "LOOM_CODESIGN_IDENTITY set + found: still uses the stable --identifier" \
+  "$codesign_args_id" "--identifier com.rjwalters.loom-daemon"
+
+# ---------- test 12: LOOM_CODESIGN_IDENTITY (#4244) — identity NOT found in
+# the keychain -> falls back to the ad-hoc path unchanged, with a warning.
+# ---------------------------------------------------------------------------
+FAKE_NO_IDENTITY_DIR="$WORKDIR/fake-no-identity-bin"
+mkdir -p "$FAKE_NO_IDENTITY_DIR"
+cat > "$FAKE_NO_IDENTITY_DIR/uname" <<'EOF'
+#!/usr/bin/env bash
+echo "Darwin"
+EOF
+chmod +x "$FAKE_NO_IDENTITY_DIR/uname"
+cat > "$FAKE_NO_IDENTITY_DIR/security" <<'EOF'
+#!/usr/bin/env bash
+if [[ "${1:-}" == "find-identity" ]]; then
+  echo '     0 valid identities found'
+  exit 0
+fi
+exit 1
+EOF
+chmod +x "$FAKE_NO_IDENTITY_DIR/security"
+CODESIGN_ARGS_NOID_FILE="$WORKDIR/codesign-args-no-identity.txt"
+cat > "$FAKE_NO_IDENTITY_DIR/codesign" <<EOF
+#!/usr/bin/env bash
+echo "\$@" > "$CODESIGN_ARGS_NOID_FILE"
+exit 0
+EOF
+chmod +x "$FAKE_NO_IDENTITY_DIR/codesign"
+
+SRC12="$WORKDIR/src12/loom-daemon"
+mkdir -p "$WORKDIR/src12"
+make_fake_bin "$SRC12" "0.15.6"
+DEST12="$WORKDIR/dest12"
+out12=$(PATH="$FAKE_NO_IDENTITY_DIR:$PATH" LOOM_DAEMON_BIN_DIR="$DEST12" \
+  LOOM_CODESIGN_IDENTITY="Nonexistent Cert" provision_machine_daemon "$SRC12" 2>&1)
+rc12=$?
+assert_eq "LOOM_CODESIGN_IDENTITY set but missing: provision returns 0" "0" "$rc12"
+codesign_args_noid="$(cat "$CODESIGN_ARGS_NOID_FILE" 2>/dev/null || echo "<missing>")"
+assert_contains "LOOM_CODESIGN_IDENTITY missing: falls back to ad-hoc (-s -)" \
+  "$codesign_args_noid" "-s -"
+assert_contains "LOOM_CODESIGN_IDENTITY missing: warns non-fatally" "$out12" "not found"
+
+# ---------- test 13: LOOM_CODESIGN_IDENTITY unset — byte-identical to the
+# pre-#4244 ad-hoc path (regression guard for test 10's assertions, isolated
+# from any repo-level codesign.identity config that might exist).
+# ---------------------------------------------------------------------------
+SRC13="$WORKDIR/src13/loom-daemon"
+mkdir -p "$WORKDIR/src13"
+make_fake_bin "$SRC13" "0.15.7"
+DEST13="$WORKDIR/dest13"
+CODESIGN_ARGS_UNSET_FILE="$WORKDIR/codesign-args-unset.txt"
+FAKE_UNSET_DIR="$WORKDIR/fake-unset-bin"
+mkdir -p "$FAKE_UNSET_DIR"
+cat > "$FAKE_UNSET_DIR/uname" <<'EOF'
+#!/usr/bin/env bash
+echo "Darwin"
+EOF
+chmod +x "$FAKE_UNSET_DIR/uname"
+cat > "$FAKE_UNSET_DIR/codesign" <<EOF
+#!/usr/bin/env bash
+echo "\$@" > "$CODESIGN_ARGS_UNSET_FILE"
+exit 0
+EOF
+chmod +x "$FAKE_UNSET_DIR/codesign"
+out13=$(cd "$WORKDIR" && PATH="$FAKE_UNSET_DIR:$PATH" LOOM_DAEMON_BIN_DIR="$DEST13" \
+  env -u LOOM_CODESIGN_IDENTITY -u LOOM_ROOT \
+  bash -c 'source "'"$REPO_ROOT"'/scripts/install/provision-daemon.sh"; provision_machine_daemon "'"$SRC13"'"' 2>&1)
+rc13=$?
+assert_eq "LOOM_CODESIGN_IDENTITY unset: provision returns 0" "0" "$rc13"
+codesign_args_unset="$(cat "$CODESIGN_ARGS_UNSET_FILE" 2>/dev/null || echo "<missing>")"
+assert_contains "LOOM_CODESIGN_IDENTITY unset: ad-hoc path is unchanged (-s -)" \
+  "$codesign_args_unset" "-s -"
+
 # ---------- summary ----------
 echo ""
 echo "-----------------------------------------"

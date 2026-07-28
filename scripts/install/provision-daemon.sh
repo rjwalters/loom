@@ -40,6 +40,55 @@ _pmd_warn()    { echo "  [loom-daemon] WARNING: $*" >&2; }
 # path under suspicion, so it must NOT be the one that leaves it unset).
 PROVISIONED_DAEMON_BIN=""
 
+# _pmd_resolve_codesign_identity
+#
+# Issue #4244: resolve an optional STABLE codesign identity (env > config >
+# default, the repo's standard precedence — see spawn-worker.sh's RUNTIME
+# resolution for the same shape) so a self-signed certificate can be used in
+# place of ad-hoc signing, letting macOS TCC anchor a designated requirement
+# to the certificate rather than a per-build cdhash (see sign_daemon_binary's
+# doc comment below for why that distinction matters).
+#
+#   1. $LOOM_CODESIGN_IDENTITY (env) — highest precedence.
+#   2. `codesign.identity` in the resolved config (.loom/config.json /
+#      .loom-project/project.json / .loom-local/local.json), read via the
+#      shared config-resolver.sh when it can be located and `jq` is present.
+#      Resolved relative to $LOOM_ROOT (if the caller exported it) else the
+#      git toplevel of $PWD; soft-skipped when neither resolves.
+#   3. Empty (default) — the caller falls back to ad-hoc signing.
+#
+# Echoes the resolved identity (possibly empty). Never fails the caller: any
+# missing piece (no repo root, no config-resolver.sh, no jq) soft-skips to
+# the next tier, exactly like loom_config_get's own soft-fail contract.
+_pmd_resolve_codesign_identity() {
+  if [[ -n "${LOOM_CODESIGN_IDENTITY:-}" ]]; then
+    printf '%s' "$LOOM_CODESIGN_IDENTITY"
+    return 0
+  fi
+
+  local repo_root="${LOOM_ROOT:-}"
+  if [[ -z "$repo_root" ]]; then
+    repo_root="$(git rev-parse --show-toplevel 2>/dev/null || true)"
+  fi
+  [[ -n "$repo_root" ]] || return 0
+
+  local lib candidate
+  for candidate in \
+    "$repo_root/.loom/scripts/lib/config-resolver.sh" \
+    "$repo_root/defaults/scripts/lib/config-resolver.sh"; do
+    if [[ -r "$candidate" ]]; then
+      lib="$candidate"
+      break
+    fi
+  done
+  [[ -n "${lib:-}" ]] || return 0
+
+  # shellcheck source=/dev/null
+  source "$lib"
+  declare -F loom_config_get >/dev/null 2>&1 || return 0
+  loom_config_get "$repo_root" "codesign.identity" ""
+}
+
 # sign_daemon_binary <bin>
 #
 # Issue #4016: ad-hoc-sign a freshly built/installed `loom-daemon` binary with
@@ -50,15 +99,24 @@ PROVISIONED_DAEMON_BIN=""
 # Security entries, and in any future crash/signing diagnostic — pinning a
 # human-legible identifier there is cheap and hermetic.
 #
-# IMPORTANT — this does NOT make a TCC grant survive a rebuild. An ad-hoc
-# signature has no certificate chain for codesign to anchor a designated
-# requirement to, so it falls back to a cdhash-only DR regardless of what
-# --identifier is passed; a rebuild that changes any byte of the binary
-# (which a self-update roll always does, since build.rs embeds the git commit
-# and build time) produces a new cdhash and orphans any grant just as an
-# unsigned binary would. See .loom/docs/daemon-reference.md's "Ad-hoc code
-# signing" section for the measured proof. This function only makes the
-# identifier legible; it is not a TCC-durability fix.
+# IMPORTANT — plain ad-hoc signing does NOT make a TCC grant survive a
+# rebuild. An ad-hoc signature has no certificate chain for codesign to
+# anchor a designated requirement to, so it falls back to a cdhash-only DR
+# regardless of what --identifier is passed; a rebuild that changes any byte
+# of the binary (which a self-update roll always does, since build.rs embeds
+# the git commit and build time) produces a new cdhash and orphans any grant
+# just as an unsigned binary would. See .loom/docs/daemon-reference.md's
+# "Ad-hoc code signing" section for the measured proof.
+#
+# Issue #4244: when $LOOM_CODESIGN_IDENTITY (or the `codesign.identity`
+# config key) names an identity present in the keychain
+# (`security find-identity -v -p codesigning`), sign with THAT identity
+# instead — a real certificate chain gives codesign a stable designated
+# requirement, so a TCC grant made to the resulting binary survives a
+# rebuild/reprovision (the identity, not the cdhash, is what's pinned). See
+# defaults/docs/macos-tcc-codesign.md for the one-time cert setup. This is
+# opt-in only: unset (or an identity the keychain doesn't have) falls back to
+# the ad-hoc path below, unchanged.
 #
 # Darwin-only, best-effort, and NEVER fatal: the linker-signed ad-hoc
 # signature the binary already carries (from `cargo build`) is sufficient to
@@ -71,6 +129,20 @@ sign_daemon_binary() {
   [[ -n "$bin" && -x "$bin" ]] || return 0
   [[ "$(uname -s 2>/dev/null)" == "Darwin" ]] || return 0
   command -v codesign >/dev/null 2>&1 || return 0
+
+  local identity
+  identity="$(_pmd_resolve_codesign_identity)"
+
+  if [[ -n "$identity" ]] && command -v security >/dev/null 2>&1 \
+      && security find-identity -v -p codesigning 2>/dev/null | grep -qF "$identity"; then
+    if codesign -f -s "$identity" --identifier com.rjwalters.loom-daemon "$bin" 2>/dev/null; then
+      _pmd_ok "signed $bin with identity '$identity' (identifier=com.rjwalters.loom-daemon) — TCC grants survive rebuilds"
+      return 0
+    fi
+    _pmd_warn "codesign with identity '$identity' failed for $bin; falling back to ad-hoc signing"
+  elif [[ -n "$identity" ]]; then
+    _pmd_warn "LOOM_CODESIGN_IDENTITY '$identity' not found via 'security find-identity -v -p codesigning'; falling back to ad-hoc signing (see defaults/docs/macos-tcc-codesign.md)"
+  fi
 
   if codesign -f -s - --identifier com.rjwalters.loom-daemon "$bin" 2>/dev/null; then
     _pmd_ok "ad-hoc signed $bin (identifier=com.rjwalters.loom-daemon)"

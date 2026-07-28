@@ -2525,11 +2525,18 @@ All this change actually buys is a **legible, stable identifier string**: the
 `codesign -dv` / System Settings → Privacy & Security / crash-diagnostic
 surfaces show `com.rjwalters.loom-daemon` instead of the rustc `-C metadata`
 hash (`loom_daemon-<hash>`, which itself changes on every version bump). It is
-also the necessary first step *if* the project ever adopts real signing — a
-self-signed certificate in a login keychain (breaks hermetic/headless builds)
-or Developer ID + notarization (requires a paid account) — but adopting
-either is unevaluated speculative infrastructure, not something this change
-does. No new TCC grant is requested or needed for this.
+also the necessary first step for real signing, which #4244 turns from
+speculative into an opt-in capability: set `LOOM_CODESIGN_IDENTITY` (or the
+`codesign.identity` config key, env > config > default) to a certificate
+already in the keychain and `sign_daemon_binary` signs with that certificate
+chain instead of ad-hoc — a certificate-anchored DR survives a rebuild, so a
+TCC grant to the daemon identity does too. Unset (or an identity the keychain
+doesn't have) falls back to the ad-hoc path above, unchanged, and no new TCC
+grant is requested by default. One-time self-signed cert setup (Certificate
+Assistant or openssl + `security import`, including the OpenSSL 3 PKCS12
+`-legacy` quirk and the `-T /usr/bin/codesign` trust-anchor requirement for
+unattended signing) and why grants should target the daemon identity, not
+Terminal: [`macos-tcc-codesign.md`](macos-tcc-codesign.md).
 
 ### Supervised restart primitive (#4054)
 
