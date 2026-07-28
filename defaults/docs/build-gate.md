@@ -52,6 +52,9 @@ The gate is **opt-in**. Repos with no `buildGate` block in `.loom/config.json` s
 | `command` | string | _(none)_ | Shell-style command run in the worktree (parsed with `shlex.split`). When omitted, the build check is skipped but the has-commits and has-real-changes checks still run. |
 | `realChangeGlobs` | array of strings | _(default exclusions)_ | Positive globs. A changed file must match at least one to count as "real." When omitted, every changed file counts unless it matches one of the default scratch exclusions: `.loom-*`, `*.log`, `.no-changes-needed`. |
 | `timeoutSeconds` | integer | `600` | Timeout for the `command` run. |
+| `loadThreshold` | number | `0.9` | Daemon main-health gate only (#4259): 1-minute load average per logical CPU at/above which the gate DEFERS instead of running the full suite. Env override `LOOM_BUILD_GATE_LOAD_THRESHOLD`. See "Tiered gate + load-aware deferral". |
+| `maxDeferSeconds` | integer | `1800` | Daemon main-health gate only (#4259): after this many seconds of consecutive load-deferred ticks, the FAST tier runs regardless of load so a permanently-loaded host still reaches a verdict. Env override `LOOM_BUILD_GATE_MAX_DEFER_SECS`. |
+| `fastCommand` | string | _(derived)_ | Daemon main-health gate only (#4259): the command run for the fast tier. When omitted, the base `command` is run with `LOOM_BUILD_GATE_TIER=fast` prefixed. |
 
 > **Not a `buildGate` key:** the daemon-side main-health gate's optional forge
 > verification-workflow name (`autonomous.mainHealthGate.ciWorkflow` /
@@ -281,6 +284,73 @@ self-inflicted contention. Raising `buildGate.timeoutSeconds` is deliberately
 *not* the lever here: the gate's cost scales with however many sweeps happen to
 be in flight, so any fixed budget large enough for the worst case makes a truly
 hung gate invisible for that long.
+
+### Tiered gate + load-aware deferral (#4259)
+
+`nice` (#4020/#4084) reordered the run queue but could not stop the gate's own
+`cargo` build from *racing* freshly-dispatched sweep builds for cores. Under
+6–7 concurrent sweeps the full suite blew past even the 1200s budget and was
+killed — so the main-health gate reported `not evaluated (timeout …)`
+**permanently**, silently disabling the red-main protection it exists for. Two
+composed mechanisms fix that so the gate always produces *some* signal:
+
+**1. A cheap FAST tier in `build-gate.sh`.** `LOOM_BUILD_GATE_TIER` selects the
+stage set the wrapper runs:
+
+| Tier | `LOOM_BUILD_GATE_TIER` | Stages | Cost |
+|------|------------------------|--------|------|
+| **full** (DEFAULT) | unset / `full` | `cargo test --lib --bins` + pytest + installer suite | minutes, cold |
+| **fast** | `fast` | `cargo build --workspace --lib --bins` (compile) + a `loom_tools` import smoke | a few minutes cold, no test execution |
+
+The default is unchanged when the variable is absent, so **CI parity, manual
+invocations, and the per-builder post-builder gate all behave exactly as
+before**. The fast tier verifies the compile/startup breakage class (#3647
+step-8 — a `cargo build --workspace` catch) plus that the Python package still
+imports.
+
+> **A fast-tier GREEN is NOT equivalent to a full-suite GREEN.** It does **not**
+> run the Rust unit tests, the pytest suite, or the installer suite. `loom-daemon
+> status` labels a fast-tier verdict (`clear(fast)` / `… [fast tier — compile+smoke
+> only, NOT a full-suite green]`) precisely so the two are never confused.
+
+**2. Bounded, visible load-aware deferral in the daemon.** Each gate tick,
+`run_gate_tick` reads the host's 1-minute load average (reusing
+`cpu_headroom::read_loadavg_1m()` / `logical_cpu_count()`) and decides:
+
+- **load below threshold** (or **no load reading** — fail safe) → run the **full**
+  tier;
+- **host saturated, within the max-defer window** → **defer**: no command runs,
+  and `loom-daemon status` reports `deferred (load …)` — distinct from
+  `not evaluated (timeout …)`. A deferred tick is a *scheduling* decision, not
+  an evaluation: it never records the SHA memo, never arms the indeterminate
+  backoff, and never touches the halt flag;
+- **host saturated past the max-defer window** → run the **fast** tier regardless
+  of load, so a permanently-loaded host still reaches a verdict.
+
+Deferral is **bounded** on purpose: an unbounded defer on a host that is *always*
+at cap would re-disable the gate exactly like the timeout did, only more cheaply.
+After `maxDeferSeconds` (default 30 min) of consecutive deferred ticks the fast
+tier runs, guaranteeing a real (if narrower) Green/Red at least that often — a
+genuinely red `main` is still caught within one such cycle. A fast-tier Red halts
+dispatch with the same semantics as a full-tier Red.
+
+All three knobs honor **env > config > default**:
+
+| Knob | Env | Config (`buildGate.*`) | Default |
+|------|-----|------------------------|---------|
+| Saturation threshold (1m load ÷ logical CPUs) | `LOOM_BUILD_GATE_LOAD_THRESHOLD` | `loadThreshold` | `0.9` |
+| Max-defer window (seconds) | `LOOM_BUILD_GATE_MAX_DEFER_SECS` | `maxDeferSeconds` | `1800` (30 min) |
+| Fast-tier command | — | `fastCommand` | `LOOM_BUILD_GATE_TIER=fast <command>` |
+
+`fastCommand` is optional: when omitted the daemon runs the base `command` with
+`LOOM_BUILD_GATE_TIER=fast` prefixed (the shipped `build-gate.sh` honors it). The
+load average overstates consumption on macOS (see "measured idle fraction",
+#4031), so an operator on a chronically-loaded host may raise `loadThreshold`.
+
+Explicitly **out of scope** here (separable follow-ups): a dedicated gate cargo
+target-dir / shared build-lock to isolate contention (never shipped by #4020);
+per-test timeouts (would require adopting cargo-nextest); and any change to sweep
+spawn priority (that is #4233).
 
 > **Rule of thumb:** if a check's outcome can differ between an idle host and a
 > busy one — or between a host with tmux and one without — it is
