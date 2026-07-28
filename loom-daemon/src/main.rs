@@ -17,7 +17,7 @@ use loom_daemon::self_update;
 use loom_daemon::sweep_registry::{self, SweepRegistry, SweepRegistryConfig};
 use loom_daemon::terminal::TerminalManager;
 use loom_daemon::token_ranking_refresh;
-use loom_daemon::types::{DaemonStatusReport, Request, Response, SweepKind};
+use loom_daemon::types::{DaemonStatusReport, QuarantineEntry, Request, Response, SweepKind};
 use loom_daemon::watch_registry;
 use loom_daemon::work_finder;
 use loom_daemon::workspace_pool::WorkspacePool;
@@ -353,6 +353,25 @@ enum QuarantineAction {
 
         /// Target managed-workspace root (Issue #3929). Omit to use the daemon's
         /// default workspace.
+        #[arg(long, value_name = "PATH")]
+        workspace_root: Option<String>,
+    },
+
+    /// List active insta-crash quarantines (Issue #4215): issue, workspace,
+    /// insta-crash tally vs threshold, applied-at, and TTL remaining.
+    ///
+    /// This is the authority for "which issues are quarantined right now" — a
+    /// forge `loom:blocked` query is NOT equivalent, because
+    /// `apply_quarantine_label` reuses that same label for genuine
+    /// dependency-blocked issues, and (since #4206) a TTL-expired quarantine
+    /// can leave `loom:blocked` in place after a manual re-park. Prefer this
+    /// command over grepping `loom:blocked` when triaging a quarantine wave.
+    List {
+        /// Target managed-workspace root (Issue #3929). Omit to list
+        /// quarantines across EVERY registered workspace — unlike `clear`,
+        /// whose omitted `--workspace-root` targets only the daemon's default
+        /// workspace (see the `Request::ListQuarantines` doc comment for why
+        /// the default differs).
         #[arg(long, value_name = "PATH")]
         workspace_root: Option<String>,
     },
@@ -1902,7 +1921,74 @@ async fn handle_quarantine_command(action: QuarantineAction) -> Result<()> {
                 }
             }
         }
+
+        QuarantineAction::List { workspace_root } => {
+            let request = Request::ListQuarantines { workspace_root };
+            match query_daemon(&socket_path, &request).await {
+                Ok(Response::QuarantineList { entries }) => {
+                    render_quarantine_list(&entries);
+                    Ok(())
+                }
+                Ok(Response::Error { message }) => {
+                    eprintln!("Daemon error: {message}");
+                    std::process::exit(1);
+                }
+                Ok(other) => {
+                    eprintln!("Unexpected response from daemon: {other:?}");
+                    std::process::exit(1);
+                }
+                Err(e) => {
+                    eprintln!("Could not reach loom-daemon at {}: {e}", socket_path.display());
+                    eprintln!();
+                    eprintln!("Is the daemon running? Start it with:");
+                    eprintln!("  ./.loom/scripts/cli/loom-daemon-start.sh");
+                    std::process::exit(1);
+                }
+            }
+        }
     }
+}
+
+/// Render `loom-daemon quarantine list` output (Issue #4215): one line per
+/// entry, grouped by workspace root (in the all-workspaces case there may be
+/// several), with a disambiguation footer whenever there is at least one
+/// entry to show. Entries within a group are already issue-sorted by
+/// [`SweepRegistry::quarantine_entries`]; `BTreeMap` keeps groups themselves
+/// ordered (by path) for deterministic output across runs.
+fn render_quarantine_list(entries: &[QuarantineEntry]) {
+    if entries.is_empty() {
+        println!("no active quarantines");
+        return;
+    }
+
+    let mut by_root: std::collections::BTreeMap<&Path, Vec<&QuarantineEntry>> =
+        std::collections::BTreeMap::new();
+    for entry in entries {
+        by_root
+            .entry(entry.workspace_root.as_path())
+            .or_default()
+            .push(entry);
+    }
+
+    for (root, group) in &by_root {
+        println!("{}:", root.display());
+        for e in group {
+            println!(
+                "  #{}  insta-crash {}/{}  applied {}  ttl remaining {}s",
+                e.issue,
+                e.insta_crash_count,
+                e.insta_crash_threshold,
+                e.quarantined_at.to_rfc3339(),
+                e.ttl_remaining_secs
+            );
+        }
+    }
+
+    println!();
+    println!(
+        "Note: `loom:blocked` on the forge may be a quarantine or a real dependency — this \
+         command is the authority for quarantines."
+    );
 }
 
 /// Handle the `restart` subcommand (Issue #4054 — the supervised restart

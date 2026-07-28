@@ -280,6 +280,24 @@ pub enum Request {
         #[serde(default)]
         workspace_root: Option<String>,
     },
+    /// List active insta-crash quarantines (Issue #4215), the read-side
+    /// counterpart to [`Request::ClearQuarantine`] — the operator-reachable
+    /// authority for "which issues are quarantined right now", distinct from a
+    /// forge `loom:blocked` query (which conflates quarantines with genuine
+    /// dependency blocks, since `apply_quarantine_label` reuses that label).
+    ///
+    /// **`workspace_root` semantics deliberately differ from
+    /// [`Request::ClearQuarantine`]**: there, `None` means "the daemon's
+    /// default workspace" (you're targeting one specific repo you already
+    /// know). Here, `None` means "every registered workspace" — mirroring how
+    /// `DaemonStatus` enumerates `WorkspaceRegistry::load_default().
+    /// effective_roots(..)` — because "which issues are quarantined anywhere?"
+    /// is the operator's actual question during a quarantine wave.
+    /// `Some(root)` still scopes to that one repo's registry.
+    ListQuarantines {
+        #[serde(default)]
+        workspace_root: Option<String>,
+    },
     // ========================================================================
     // Autonomous Daemon Status (Issue #3891 — follow-up to #3813 Phase D)
     // ========================================================================
@@ -532,6 +550,13 @@ pub enum Response {
     QuarantineCleared {
         issue: u32,
         was_quarantined: bool,
+    },
+    /// Result of a `ListQuarantines` request (Issue #4215): the active
+    /// insta-crash quarantines, across one or every registered workspace
+    /// depending on the request's `workspace_root`. Empty when nothing is
+    /// currently quarantined.
+    QuarantineList {
+        entries: Vec<QuarantineEntry>,
     },
     // ========================================================================
     // Autonomous Daemon Status (Issue #3891 — follow-up to #3813 Phase D)
@@ -1098,6 +1123,35 @@ pub struct RepoStatus {
     /// keeps pre-#4012 wire data compatible.
     #[serde(default)]
     pub health_gate_verdict_at: Option<DateTime<Utc>>,
+}
+
+/// One active insta-crash quarantine (Issue #4215), as surfaced by
+/// `loom-daemon quarantine list` / [`Request::ListQuarantines`]. Joins the
+/// three pieces of quarantine state [`crate::sweep_registry::SweepRegistry`]
+/// already tracks in-memory (`quarantined`, `insta_crash_counts`,
+/// `quarantine_config.ttl`) into one read-only row.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct QuarantineEntry {
+    /// The quarantined issue number.
+    pub issue: u32,
+    /// The workspace whose registry this quarantine lives in — meaningful once
+    /// `ListQuarantines` enumerates across every registered workspace.
+    pub workspace_root: PathBuf,
+    /// When the quarantine was applied.
+    pub quarantined_at: DateTime<Utc>,
+    /// The consecutive-insta-crash tally that triggered (or is at) quarantine.
+    pub insta_crash_count: u32,
+    /// The consecutive-insta-crash threshold configured for this issue's
+    /// workspace, so the CLI can render "tally / threshold" instead of a bare
+    /// count. Read from the same per-workspace [`crate::sweep_registry::
+    /// QuarantineConfig`] the reaper enforces against — different managed
+    /// workspaces may configure different thresholds.
+    pub insta_crash_threshold: u32,
+    /// Seconds remaining before TTL auto-release, clamped to `0` — the TTL is
+    /// enforced only by [`crate::sweep_registry::SweepRegistry::reap_once`], so
+    /// an entry can be momentarily past-TTL between reaper ticks; a negative
+    /// remainder would be a confusing thing to render.
+    pub ttl_remaining_secs: u64,
 }
 
 /// The token-capacity section of [`DaemonStatusReport`] (#3902).

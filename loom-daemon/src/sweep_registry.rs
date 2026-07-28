@@ -1739,6 +1739,40 @@ impl SweepRegistry {
         was_quarantined
     }
 
+    /// Read-only view of every currently-quarantined issue in this registry
+    /// (Issue #4215), joining `quarantined` (applied-at), `insta_crash_counts`
+    /// (tally), and `quarantine_config.ttl` into one row per issue — the data
+    /// backing `loom-daemon quarantine list` / [`crate::types::Request::ListQuarantines`].
+    /// Sorted by issue number, like [`Self::quarantined_issues_sorted`].
+    ///
+    /// `ttl_remaining_secs` is computed against `now` (passed in rather than
+    /// read internally so callers — and tests — can pin the clock) and clamped
+    /// to `0` for an entry already past its TTL; the actual expiry sweep only
+    /// runs from [`Self::reap_once`], so a stale-but-not-yet-reaped entry is
+    /// expected, not a bug.
+    #[must_use]
+    pub fn quarantine_entries(&self, now: DateTime<Utc>) -> Vec<crate::types::QuarantineEntry> {
+        let ttl = self.quarantine_config.ttl;
+        let mut entries: Vec<crate::types::QuarantineEntry> = self
+            .quarantined
+            .iter()
+            .map(|(&issue, &quarantined_at)| {
+                let elapsed = (now - quarantined_at).to_std().unwrap_or_default();
+                let ttl_remaining_secs = ttl.saturating_sub(elapsed).as_secs();
+                crate::types::QuarantineEntry {
+                    issue,
+                    workspace_root: self.config.workspace_root.clone(),
+                    quarantined_at,
+                    insta_crash_count: self.insta_crash_count(issue),
+                    insta_crash_threshold: self.quarantine_config.threshold,
+                    ttl_remaining_secs,
+                }
+            })
+            .collect();
+        entries.sort_unstable_by_key(|e| e.issue);
+        entries
+    }
+
     /// Test-only helper: seed an in-memory quarantine entry for `issue` so
     /// cross-module tests (e.g. the IPC dispatcher in `ipc.rs`) can exercise the
     /// `ClearQuarantine` path without driving the full insta-crash accrual.
@@ -1747,6 +1781,21 @@ impl SweepRegistry {
         self.quarantined.insert(issue, Utc::now());
         self.insta_crash_counts
             .insert(issue, self.quarantine_config.threshold);
+    }
+
+    /// Test-only helper (Issue #4215): like [`Self::seed_quarantine_for_test`]
+    /// but with an explicit `quarantined_at` and `insta_crash_count`, so tests
+    /// of `quarantine_entries` can pin a past-TTL `quarantined_at` (to exercise
+    /// the `ttl_remaining_secs` clamp) or a distinct tally.
+    #[cfg(test)]
+    pub fn seed_quarantine_with_details_for_test(
+        &mut self,
+        issue: u32,
+        quarantined_at: DateTime<Utc>,
+        insta_crash_count: u32,
+    ) {
+        self.quarantined.insert(issue, quarantined_at);
+        self.insta_crash_counts.insert(issue, insta_crash_count);
     }
 
     /// Issues currently awaiting a retried `loom:blocked` -> `loom:issue` label
@@ -7358,6 +7407,62 @@ exit 0
         assert!(!registry.is_quarantined(46));
         assert_eq!(registry.insta_crash_count(46), 0);
         assert!(!registry.clear_quarantine(46), "idempotent: false when nothing to clear");
+    }
+
+    /// `quarantine_entries` (Issue #4215) joins `quarantined`, `insta_crash_counts`,
+    /// and `quarantine_config` into one row per issue, sorted by issue number
+    /// like `quarantined_issues_sorted`, and reflects each issue's own tally.
+    #[test]
+    fn quarantine_entries_sorted_and_reflects_insta_crash_count() {
+        let dir = tempdir().unwrap();
+        let (mut registry, _record_log) = fixture_registry(dir.path());
+
+        let now = Utc::now();
+        // Insert out of order to verify the accessor sorts, not just echoes
+        // insertion order.
+        registry.quarantined.insert(200, now);
+        registry.insta_crash_counts.insert(200, 3);
+        registry.quarantined.insert(100, now);
+        registry.insta_crash_counts.insert(100, 7);
+
+        let entries = registry.quarantine_entries(now);
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].issue, 100, "sorted ascending by issue number");
+        assert_eq!(entries[0].insta_crash_count, 7);
+        assert_eq!(entries[0].workspace_root, dir.path());
+        assert_eq!(entries[0].insta_crash_threshold, registry.quarantine_config().threshold);
+        assert_eq!(entries[1].issue, 200);
+        assert_eq!(entries[1].insta_crash_count, 3);
+    }
+
+    /// `ttl_remaining_secs` is computed against the `now` passed in, not a
+    /// fresh `Utc::now()` read internally — an issue quarantined `ttl / 2`
+    /// seconds ago should show roughly half its TTL remaining, and an issue
+    /// quarantined `2 * ttl` seconds ago (past-TTL, awaiting the next reaper
+    /// tick) must clamp to 0 rather than go negative.
+    #[test]
+    fn quarantine_entries_ttl_remaining_reflects_elapsed_time() {
+        let dir = tempdir().unwrap();
+        let (mut registry, _record_log) = fixture_registry(dir.path());
+        let ttl_secs = registry.quarantine_config().ttl.as_secs();
+
+        let now = Utc::now();
+        let half_ttl_ago = now - chrono::Duration::seconds((ttl_secs / 2) as i64);
+        let past_ttl = now - chrono::Duration::seconds((ttl_secs * 2) as i64);
+        registry.quarantined.insert(1, half_ttl_ago);
+        registry.insta_crash_counts.insert(1, 3);
+        registry.quarantined.insert(2, past_ttl);
+        registry.insta_crash_counts.insert(2, 3);
+
+        let entries = registry.quarantine_entries(now);
+        let e1 = entries.iter().find(|e| e.issue == 1).unwrap();
+        let e2 = entries.iter().find(|e| e.issue == 2).unwrap();
+        assert!(
+            e1.ttl_remaining_secs > 0 && e1.ttl_remaining_secs <= ttl_secs,
+            "half-elapsed entry should have a positive, bounded remainder; got {}",
+            e1.ttl_remaining_secs
+        );
+        assert_eq!(e2.ttl_remaining_secs, 0, "past-TTL entry must clamp to 0");
     }
 
     /// The operator-action release path (`clear_quarantine`) must restore
