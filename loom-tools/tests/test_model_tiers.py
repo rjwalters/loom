@@ -304,3 +304,190 @@ def test_cli_tier_mode_no_mapping_exits_3(tmp_path, capsys):
 def test_cli_requires_model_or_tier(capsys):
     with pytest.raises(SystemExit):
         mt.main([])
+
+
+# --------------------------------------------------------------------------- #
+# Optimization profile → tierModels preset (issue #4238, Phase B)
+# --------------------------------------------------------------------------- #
+
+
+def test_optimization_profiles_lists_all_three():
+    assert mt.OPTIMIZATION_PROFILES == ("cost", "speed", "balanced")
+
+
+# --------------------------------------------------------------------------- #
+# resolve_optimization_profile — env > config > default precedence
+# --------------------------------------------------------------------------- #
+
+
+def test_resolve_optimization_profile_defaults_to_balanced():
+    assert mt.resolve_optimization_profile(None, env={}) == "balanced"
+    assert mt.resolve_optimization_profile({}, env={}) == "balanced"
+
+
+def test_resolve_optimization_profile_reads_config():
+    cfg = {"sweep": {"optimization": "cost"}}
+    assert mt.resolve_optimization_profile(cfg, env={}) == "cost"
+
+
+def test_resolve_optimization_profile_env_overrides_config():
+    cfg = {"sweep": {"optimization": "cost"}}
+    assert mt.resolve_optimization_profile(cfg, env={"LOOM_SWEEP_OPTIMIZATION": "speed"}) == "speed"
+
+
+def test_resolve_optimization_profile_env_alone():
+    assert mt.resolve_optimization_profile(None, env={"LOOM_SWEEP_OPTIMIZATION": "speed"}) == "speed"
+
+
+def test_resolve_optimization_profile_case_insensitive_and_trimmed():
+    cfg = {"sweep": {"optimization": "  COST  "}}
+    assert mt.resolve_optimization_profile(cfg, env={}) == "cost"
+    assert mt.resolve_optimization_profile(None, env={"LOOM_SWEEP_OPTIMIZATION": "Speed"}) == "speed"
+
+
+@pytest.mark.parametrize(
+    "cfg,env",
+    [
+        ({"sweep": {"optimization": "bogus"}}, {}),
+        ({"sweep": {"optimization": ""}}, {}),
+        ({"sweep": {"optimization": 5}}, {}),
+        (None, {"LOOM_SWEEP_OPTIMIZATION": "cheap"}),
+    ],
+)
+def test_resolve_optimization_profile_invalid_falls_back_to_balanced(cfg, env):
+    # Invalid profile value -> warn and fall back to balanced, never raise.
+    assert mt.resolve_optimization_profile(cfg, env=env) == "balanced"
+
+
+def test_resolve_optimization_profile_malformed_config_shapes_soft_fall():
+    for cfg in ({"sweep": "nope"}, {"sweep": None}, "not-a-dict"):
+        assert mt.resolve_optimization_profile(cfg, env={}) == "balanced"
+
+
+# --------------------------------------------------------------------------- #
+# optimization_preset — the preset contents per profile
+# --------------------------------------------------------------------------- #
+
+
+def test_optimization_preset_balanced_is_empty():
+    # balanced materializes NO preset -- this is what makes balanced/unset
+    # byte-identical to pre-Phase-B dispatch.
+    assert mt.optimization_preset("balanced") == {}
+
+
+def test_optimization_preset_cost_is_full_three_stratum_spread():
+    assert mt.optimization_preset("cost") == {
+        "mechanical": "haiku",
+        "routine": "sonnet",
+        "complex": "opus",
+    }
+
+
+def test_optimization_preset_speed_starts_a_tier_higher():
+    assert mt.optimization_preset("speed") == {
+        "mechanical": "sonnet",
+        "routine": "opus",
+        "complex": "opus",
+    }
+
+
+def test_optimization_preset_unknown_profile_returns_empty():
+    assert mt.optimization_preset("bogus") == {}
+
+
+# --------------------------------------------------------------------------- #
+# resolve_tier_model x optimization profile integration
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.parametrize(
+    "tier,expected",
+    [
+        ("mechanical", "haiku"),
+        ("routine", "sonnet"),
+        ("complex", "claude-opus-5"),
+    ],
+)
+def test_resolve_tier_model_cost_profile_no_tier_models(tier, expected, monkeypatch):
+    monkeypatch.delenv("LOOM_SWEEP_OPTIMIZATION", raising=False)
+    cfg = {"sweep": {"optimization": "cost"}}
+    assert mt.resolve_tier_model(tier, "claude", cfg) == expected
+
+
+@pytest.mark.parametrize(
+    "tier,expected",
+    [
+        ("mechanical", "sonnet"),
+        ("routine", "claude-opus-5"),
+        ("complex", "claude-opus-5"),
+    ],
+)
+def test_resolve_tier_model_speed_profile_no_tier_models(tier, expected, monkeypatch):
+    monkeypatch.delenv("LOOM_SWEEP_OPTIMIZATION", raising=False)
+    cfg = {"sweep": {"optimization": "speed"}}
+    assert mt.resolve_tier_model(tier, "claude", cfg) == expected
+
+
+def test_resolve_tier_model_balanced_profile_falls_through(monkeypatch):
+    # Explicit "balanced" behaves exactly like an absent sweep.optimization key.
+    monkeypatch.delenv("LOOM_SWEEP_OPTIMIZATION", raising=False)
+    cfg = {"sweep": {"optimization": "balanced"}}
+    assert mt.resolve_tier_model("mechanical", "claude", cfg) == ""
+    assert mt.resolve_tier_model("routine", "claude", cfg) == ""
+    assert mt.resolve_tier_model("complex", "claude", cfg) == ""
+
+
+def test_resolve_tier_model_unset_optimization_falls_through(monkeypatch):
+    # AC: balanced/unset ⇒ byte-identical to pre-Phase-B (no config at all).
+    monkeypatch.delenv("LOOM_SWEEP_OPTIMIZATION", raising=False)
+    assert mt.resolve_tier_model("mechanical", "claude", None) == ""
+    assert mt.resolve_tier_model("complex", "claude", {}) == ""
+
+
+def test_resolve_tier_model_explicit_tier_models_beats_optimization_profile(monkeypatch):
+    # An explicit sweep.tierModels entry for a tier wins over the profile preset,
+    # even when a profile is also configured (tierModels is more specific).
+    monkeypatch.delenv("LOOM_SWEEP_OPTIMIZATION", raising=False)
+    cfg = {
+        "sweep": {
+            "optimization": "cost",  # would give mechanical -> haiku
+            "tierModels": {"claude": {"mechanical": "opus"}},  # operator override wins
+        }
+    }
+    assert mt.resolve_tier_model("mechanical", "claude", cfg) == "claude-opus-5"
+    # routine/complex have no explicit tierModels entry -> fall back to the
+    # "cost" preset.
+    assert mt.resolve_tier_model("routine", "claude", cfg) == "sonnet"
+    assert mt.resolve_tier_model("complex", "claude", cfg) == "claude-opus-5"
+
+
+def test_resolve_tier_model_env_optimization_overrides_config(monkeypatch):
+    monkeypatch.setenv("LOOM_SWEEP_OPTIMIZATION", "speed")
+    cfg = {"sweep": {"optimization": "cost"}}
+    # speed (env) wins over cost (config): mechanical -> sonnet, not haiku.
+    assert mt.resolve_tier_model("mechanical", "claude", cfg) == "sonnet"
+
+
+def test_resolve_tier_model_optimization_never_returns_fable(monkeypatch):
+    monkeypatch.delenv("LOOM_SWEEP_OPTIMIZATION", raising=False)
+    monkeypatch.setattr(mt, "_OPTIMIZATION_PRESETS", {**mt._OPTIMIZATION_PRESETS, "cost": {"mechanical": "fable"}})
+    cfg = {"sweep": {"optimization": "cost"}}
+    assert mt.resolve_tier_model("mechanical", "claude", cfg) == ""
+
+
+def test_resolve_tier_model_invalid_optimization_falls_back_to_balanced_preset(monkeypatch):
+    monkeypatch.delenv("LOOM_SWEEP_OPTIMIZATION", raising=False)
+    cfg = {"sweep": {"optimization": "bogus"}}
+    # Invalid profile -> balanced -> empty preset -> falls through.
+    assert mt.resolve_tier_model("mechanical", "claude", cfg) == ""
+
+
+def test_resolve_tier_model_pin_precedence_unaffected_by_optimization():
+    # tier-1/tier-2 pins are enforced by the CALLER (sweep.md), not this
+    # function -- resolve_tier_model only ever resolves the tier-2.5 rung. This
+    # guards that resolve_tier_model itself has no notion of a "pin" bypassing
+    # it, so a caller-side pin check upstream of this call is still sufficient.
+    cfg = {"sweep": {"optimization": "cost"}}
+    # resolve_tier_model has no pin concept -- it always resolves the tier when
+    # asked. Precedence over pins is a caller responsibility (see sweep.md).
+    assert mt.resolve_tier_model("mechanical", "claude", cfg) == "haiku"

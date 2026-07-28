@@ -136,6 +136,19 @@ resolution (`read_model_aliases` / `resolve_dispatch_model`) is untouched by
 the tier map; when the adapter contract unifies the alias resolvers, the tier
 map layers cleanly on top of whichever single-source resolver wins.
 
+**Optimization profile (`sweep.optimization`, issue #4238 Phase B).** The
+`cost`/`speed`/`balanced` policy switch that selects a preset over the tier map
+above (see `model-selection.md` "Optimization profile switch") is, for the same
+reason, **also orchestrator-side only**: `resolve_optimization_profile` /
+`optimization_preset` live in `loom_tools.model_tiers` alongside
+`resolve_tier_model`, reached through the same `resolve-tier-model.sh` call —
+there is no separate dispatch path to keep in lockstep. It does not touch
+`sweep_registry.rs` for the same reason the tier map does not: the Rust daemon's
+`resolve_dispatch_model` only ever resolves `sweep.modelAliases` for its own
+`--model` forwarding and has no participation in the Builder-only tier-2.5
+resolution chain the profile extends. Verified against `loom-daemon/src/sweep_registry.rs` —
+no `tierModels`/`optimization` schema validation exists there to keep in lockstep.
+
 > **Open reconciliation item — do not resolve here.** `sweep.modelAliases` has a
 > known **Rust/Python divergence**: the Rust dispatch resolver and the Python
 > `model_tiers` resolver do not treat the alias map identically (the Rust side is
