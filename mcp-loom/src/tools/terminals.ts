@@ -23,6 +23,11 @@ import {
   writeConfigFile,
   writeStateFile,
 } from "../shared/config.js";
+import {
+  LOCAL_CONFIG_REL,
+  PROJECT_CONFIG_REL,
+  hasNonLegacyTier,
+} from "../shared/config-resolver.js";
 import { sendDaemonRequest } from "../shared/daemon.js";
 import { formatTerminalOutput } from "../shared/formatting.js";
 import { writeMCPCommand } from "../shared/ipc.js";
@@ -347,6 +352,25 @@ async function configureTerminal(
       return {
         success: false,
         error: "Config file not found. Workspace may not be initialized.",
+      };
+    }
+
+    // Write-policy guard (issue #4064): `readConfigFile` now returns the merged
+    // view across config tiers. Writing that back to `.loom/config.json` when a
+    // non-legacy tier is present would flatten every `.loom-project/` and
+    // `.loom-local/` override into the legacy file, silently de-syncing it from
+    // its source of truth. Since this resolver family is read-only (there is no
+    // tier-aware write path), refuse the edit and direct the operator to the
+    // tier file instead.
+    if (await hasNonLegacyTier(getWorkspacePath())) {
+      return {
+        success: false,
+        error:
+          `Refusing to edit ${terminalId}: a non-legacy config tier is present ` +
+          `(${PROJECT_CONFIG_REL} or ${LOCAL_CONFIG_REL}). mcp-loom reads the merged ` +
+          `config across all tiers, but can only write the legacy .loom/config.json — ` +
+          `writing here would flatten your tier overrides into it and de-sync them. ` +
+          `Edit the terminal in the tier file that defines it directly.`,
       };
     }
 

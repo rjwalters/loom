@@ -14,7 +14,7 @@
 import { access, readFile } from "node:fs/promises";
 import { join } from "node:path";
 import type { Tool } from "@modelcontextprotocol/sdk/types.js";
-import { CONSOLE_LOG_PATH, getWorkspacePath } from "../shared/config.js";
+import { CONSOLE_LOG_PATH, getWorkspacePath, readConfigFile } from "../shared/config.js";
 import { writeMCPCommand } from "../shared/ipc.js";
 
 /**
@@ -105,16 +105,11 @@ async function getUIState(): Promise<string> {
   try {
     const workspacePath = getWorkspacePath();
 
-    // Read config file
-    const configPath = join(workspacePath, ".loom", "config.json");
-    let config: { version: string; terminals: unknown[]; offlineMode?: boolean } | null = null;
-    try {
-      await access(configPath);
-      const configContent = await readFile(configPath, "utf-8");
-      config = JSON.parse(configContent);
-    } catch {
-      // Config doesn't exist or can't be read
-    }
+    // Read the effective config across all tiers (issue #4064) so get_ui_state
+    // agrees with the daemon / Python / Bash surfaces about the config, rather
+    // than reading only the legacy `.loom/config.json`.
+    const config: { version: string; terminals: unknown[]; offlineMode?: boolean } | null =
+      await readConfigFile();
 
     // Read state file
     const statePath = join(workspacePath, ".loom", "state.json");

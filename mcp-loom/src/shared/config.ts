@@ -9,6 +9,7 @@ import { access, readFile, stat, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import type { ConfigFile, StateFile } from "../types.js";
+import { resolveEffectiveConfig } from "./config-resolver.js";
 
 /** Global Loom directory in user's home */
 export const LOOM_DIR = join(homedir(), ".loom");
@@ -82,30 +83,39 @@ export async function writeStateFile(state: StateFile): Promise<void> {
 }
 
 /**
- * Read the workspace config file
+ * Read the effective workspace config.
+ *
+ * Resolves the full tier chain (private defaults → `.loom/config.json` →
+ * `.loom-project/project.json` → `.loom-local/local.json`) via
+ * {@link resolveEffectiveConfig}, so every read surface agrees with the
+ * daemon / Python / Bash resolvers about the effective config (issue #4064).
+ *
+ * Returns `null` when no tier contributes any content (an uninitialized
+ * workspace), preserving the previous "config file not found" contract. When
+ * only the legacy `.loom/config.json` is present — the state of every repo
+ * today — the merged result is byte-for-byte that file's parsed content.
+ *
+ * WRITE HAZARD: the result may be a merge across tiers. Callers must NOT write
+ * it back to `.loom/config.json` when a non-legacy tier is present, or they
+ * flatten higher-tier overrides into the legacy file. `configure_terminal`
+ * guards against this with `hasNonLegacyTier` (see config-resolver.ts).
  */
 export async function readConfigFile(): Promise<ConfigFile | null> {
-  try {
-    const workspacePath = getWorkspacePath();
-    const configPath = join(workspacePath, ".loom", "config.json");
-
-    const fileStats = await stat(configPath);
-    if (!fileStats.isFile()) {
-      return null;
-    }
-
-    const content = await readFile(configPath, "utf-8");
-    return JSON.parse(content) as ConfigFile;
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") {
-      return null;
-    }
-    throw error;
+  const effective = await resolveEffectiveConfig(getWorkspacePath());
+  if (Object.keys(effective).length === 0) {
+    return null;
   }
+  return effective as unknown as ConfigFile;
 }
 
 /**
- * Write the workspace config file
+ * Write the workspace config file.
+ *
+ * Always targets the legacy `.loom/config.json` and only that file — this
+ * resolver family is read-only across all four languages, so there is no
+ * tier-aware write path. Do not call this with a merged (multi-tier) config
+ * when a non-legacy tier is present; see `readConfigFile`'s WRITE HAZARD note
+ * and the `hasNonLegacyTier` guard in `configure_terminal`.
  */
 export async function writeConfigFile(config: ConfigFile): Promise<void> {
   const workspacePath = getWorkspacePath();
@@ -126,24 +136,6 @@ export async function readWorkspaceStateFile(): Promise<string> {
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === "ENOENT") {
       return "State file not found. Workspace may not be initialized.";
-    }
-    throw error;
-  }
-}
-
-/**
- * Read the workspace config file (returns as string for compatibility)
- */
-export async function readWorkspaceConfigFile(): Promise<string> {
-  try {
-    const workspacePath = getWorkspacePath();
-    const configPath = join(workspacePath, ".loom", "config.json");
-
-    await access(configPath);
-    return await readFile(configPath, "utf-8");
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") {
-      return "Config file not found. Workspace may not be initialized.";
     }
     throw error;
   }
