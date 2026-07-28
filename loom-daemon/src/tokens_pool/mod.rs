@@ -30,6 +30,7 @@
 //! | [`select`] | `tokens/select.py` | 3-tier selection algorithm |
 //! | [`check`] | `tokens/check.py` | HTTP rate-limit probe (curl transport) + `.ranking` writer |
 //! | [`monitor`] | `tokens/monitor.py` | claude-monitor `ranking.json` consumer (`--source auto\|monitor`) |
+//! | [`monitor_db`] | `tokens/monitor_db.py` | claude-monitor live SQLite (`usage.db`) import, `import-from-monitor` |
 //!
 //! The probe path ([`check`] + [`monitor`], issue #4094) shells to `curl`
 //! rather than take an HTTP-client crate — following the [`rng`] precedent of
@@ -38,13 +39,13 @@
 //! [`check::ProbeTransport`] trait so tests never touch the network.
 //!
 //! `bootstrap.py` (multi-source `.env` merge + file provisioning) was ported in
-//! issue #4105 as [`bootstrap`]. **Still deferred**: `monitor_db.py`
-//! (claude-monitor SQLite import, consumed by `import-from-monitor`, issue
-//! #4106). It is not on the per-dispatch hot path (it runs at bootstrap time or
-//! on an operator cadence), so scoping it out keeps each increment reviewable.
-//! [`bootstrap`] leaves the read-only `_check_monitor_divergence` warning
-//! (which reads the live `usage.db`) to that same follow-up, since it depends on
-//! the unported SQLite reader.
+//! issue #4105 as [`bootstrap`]. `monitor_db.py` (claude-monitor SQLite import,
+//! consumed by `import-from-monitor`) was ported in issue #4106 as
+//! [`monitor_db`], reusing [`bootstrap::materialize_accounts`] /
+//! [`bootstrap::write_index`] so the writer stays identical by construction.
+//! [`bootstrap`] still leaves the read-only `_check_monitor_divergence` warning
+//! (which reads the live `usage.db`) to a future follow-up, since it is a
+//! bootstrap-time advisory rather than the import path itself.
 //!
 //! # Byte-compatible state (hard requirement)
 //!
@@ -62,6 +63,7 @@ pub mod check;
 pub mod failure_counts;
 pub mod locking;
 pub mod monitor;
+pub mod monitor_db;
 pub mod paths;
 pub mod rng;
 pub mod rotation;
