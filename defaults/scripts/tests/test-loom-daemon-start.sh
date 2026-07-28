@@ -385,6 +385,7 @@ wd_out=$( cd "$WD_REPO" && env -u LOOM_WORK_FINDER -u LOOM_MAIN_HEALTH_GATE \
     bash "$START_SCRIPT" --no-launchd 2>&1 )
 wd_rc=$?
 assert_eq "0" "$wd_rc" "systemd watchdog: start exits 0 with a real watchdog script present"
+[[ "$wd_rc" == "0" ]] || echo "  output: $wd_out"
 WD_TIMER_UNIT="loom-daemon-wd-test-$$-watchdog.timer"
 WD_SVC_UNIT="loom-daemon-wd-test-$$-watchdog.service"
 TESTS_RUN=$((TESTS_RUN + 1))
