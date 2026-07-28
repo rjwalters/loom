@@ -12,7 +12,9 @@
     "enabled": false,
     "socket": null,
     "room": null,
-    "persona": "loom_daemon"
+    "persona": "loom_daemon",
+    "workerPersonas": [],
+    "mcpCommand": "safehouse-mcp"
   },
   "health_monitoring": {
     "enabled": true,

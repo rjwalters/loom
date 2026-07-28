@@ -122,3 +122,100 @@ by the bare issue number (`task_id`):
 - `loom-daemon/src/workspace_pool.rs` — `start_safehouse_narration()` subscribes
   the shared `Arc<EventBus>` (the single place it is owned) and spawns the sink
   on the daemon runtime; a no-op when disabled.
+
+# Phase 2 — worker-side `safehouse-mcp` injection (#3999)
+
+Phase 1 lets the daemon *narrate*. Phase 2 gives each **worker** session a
+two-way handle: when the `safehouse` block is enabled, Loom injects the
+`safehouse-mcp` stdio MCP server (`rjwalters/safehouse`, tools `safehouse_send` /
+`safehouse_read` / `safehouse_create_room` / `safehouse_list_rooms`; env
+`SAFEHOUSED_SOCKET` + `SAFEHOUSE_PERSONA`) into the worker's MCP config, so a
+Builder can ask a question in the room mid-task and read the human's answer
+instead of only signalling through labels. The MCP server holds no keys — the
+socket path is the only credential-adjacent value written.
+
+## Per-worker persona: a bounded pre-registered pool (design decision)
+
+safehoused's persona allowlist is a **static boot-time TOML array** with no
+runtime registration, no glob/prefix matching, and no SIGHUP reload (see phase-1
+note above). So a literal per-issue name like `loom_builder_42` **cannot** be
+minted at dispatch time — safehoused would reject the `hello` for a name not in
+its boot allowlist, and it cannot restart per worker.
+
+Loom therefore assigns each worker a persona from a **bounded pool the operator
+pre-registers** in safehoused's allowlist ahead of time — the same "fixed pool,
+rotate per slot" shape as the token pool. Configure the pool in the `safehouse`
+block and add the identical names to safehoused's `personas`:
+
+```jsonc
+"safehouse": {
+  "enabled": true,
+  "socket": "/run/safehoused.sock",
+  "persona": "loom_daemon",                     // scalar fallback (daemon + no-pool workers)
+  "workerPersonas": ["loom_builder_1",          // the pre-registered worker pool
+                     "loom_builder_2",
+                     "loom_builder_3",
+                     "loom_builder_4"],
+  "mcpCommand": "safehouse-mcp"                  // launcher for the stdio MCP server
+}
+```
+
+```toml
+# safehoused config — restart required after editing (allowlist read once at boot)
+personas = ["loom_daemon", "loom_builder_1", "loom_builder_2", "loom_builder_3", "loom_builder_4"]
+```
+
+Each worker is assigned `workerPersonas[issue_number % pool_size]` (round-robin
+by worktree slot — the issue number comes from `LOOM_SWEEP_CLAIM_OWNED`). Two
+**concurrently-running** workers (distinct issue numbers) get distinct personas
+whenever the pool is at least as large as the concurrency level and the numbers
+do not collide mod N — so size the pool to your max concurrent workers. With **no
+`workerPersonas`** configured, every worker falls back to the scalar `persona`
+(workspace-wide, no per-worker attribution) — the feature degrades, never fails.
+
+Env overrides (each wins over config): `LOOM_SAFEHOUSE_WORKER_PERSONAS`
+(comma-separated pool), `LOOM_SAFEHOUSE_MCP_COMMAND`, plus the phase-1
+`LOOM_SAFEHOUSE_ENABLED` / `LOOM_SAFEHOUSE_SOCKET` / `LOOM_SAFEHOUSE_PERSONA`.
+
+## Delivery: session-scoped `--mcp-config` at spawn time
+
+Injection happens in `spawn-claude.sh` (the mandatory agent spawn path), not by
+rewriting the workspace `.mcp.json`. Concurrent sweeps **share** the workspace
+root, so a per-worker persona cannot live in that shared file; instead
+spawn-claude generates a **session-scoped** MCP config (persona substituted for
+this worker) and passes it via `claude --mcp-config <file>`. The file lists the
+`loom` server FIRST (so it is self-contained even when the session cwd has no
+project `.mcp.json`) and appends `safehouse` second.
+
+`scripts/setup-mcp.sh` (the workspace-root generator, reached inside worktrees
+via the `.mcp.json` symlink `worktree.sh` creates) **also** learns to append the
+`safehouse` server when enabled — but with the scalar `persona`, since it is not
+per-worker. Both writers keep `loom` first and unchanged so
+`claude-wrapper.sh`'s MCP pre-flight (which keys off the first server with args)
+still resolves the loom entry point.
+
+## Degradation contract (unchanged from phase 1)
+
+- `safehouse.enabled` false/absent ⇒ **byte-for-byte no-op**: spawn-claude
+  appends no `--mcp-config`, and setup-mcp emits the identical loom-only file.
+- Enabled but the launch command is missing, or no socket resolves ⇒ one
+  `warn`, **injection skipped**, the `loom` MCP server unaffected and the worker
+  starts normally.
+- Socket configured but not yet present at spawn ⇒ one `warn`, injected anyway
+  (best-effort — `safehouse-mcp` connects lazily and never blocks the worker).
+- A persona absent from safehoused's boot allowlist is rejected by safehoused at
+  `hello` with a clear message — provision the whole pool before enabling.
+
+## Implementation (phase 2)
+
+- `defaults/scripts/lib/mcp-config.sh` — shared resolvers (env > config >
+  default, mirroring `safehouse.rs`), the pool round-robin persona picker, and
+  the `loom`-first `.mcp.json` emitter.
+- `defaults/scripts/spawn-claude.sh` — per-worker injection via `--mcp-config`.
+- `scripts/setup-mcp.sh` — workspace-root two-server generation when enabled.
+- Tests: `defaults/scripts/tests/test-mcp-config.sh`.
+
+> The exact `safehouse-mcp` binary/protocol lives in the external
+> `rjwalters/safehouse` repo and is not verifiable from this repo, so the
+> launcher is configurable (`safehouse.mcpCommand`) and a missing command
+> degrades to a logged skip rather than a broken server entry.

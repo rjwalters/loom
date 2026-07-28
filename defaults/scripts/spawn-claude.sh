@@ -362,6 +362,69 @@ fi
 : "${CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS:=0}"
 export CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS
 
+# --- Optional safehouse MCP server injection (issue #3999) ---
+# When the `safehouse` config block is enabled and a socket + launch command
+# resolve, inject a session-scoped MCP config that adds the `safehouse` stdio
+# server alongside `loom`, with a PER-WORKER persona so two concurrent workers
+# in the same workspace get distinct `SAFEHOUSE_PERSONA` values. The persona is
+# drawn from a bounded, operator-pre-registered pool (`safehouse.workerPersonas`)
+# round-robined by this worker's issue slot (`LOOM_SWEEP_CLAIM_OWNED`), because
+# safehoused's allowlist is a static boot-time TOML array with no runtime/prefix
+# registration — literal per-issue names cannot be minted at dispatch time.
+#
+# Delivery shape: a session-scoped `--mcp-config <file>` (not a rewrite of the
+# workspace `.mcp.json`). Concurrent sweeps SHARE the workspace root, so a
+# per-worker persona cannot live in the shared file; a session-scoped config is
+# the only correct per-worker surface. The file lists `loom` FIRST so it is
+# self-contained even if the session's cwd has no project `.mcp.json`.
+#
+# Degradation contract (mirrors #3997): disabled/absent ⇒ byte-for-byte no-op
+# (no --mcp-config appended). Enabled but the launch command is missing, or no
+# socket resolves ⇒ log a warning and SKIP injection — the `loom` MCP server is
+# never affected and the worker always starts. Only the socket path (no token or
+# key) is ever written into the injected config.
+_mcp_config_lib="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/mcp-config.sh"
+if [[ -f "$_mcp_config_lib" ]]; then
+    # shellcheck source=./lib/mcp-config.sh
+    source "$_mcp_config_lib"
+
+    # Respect an explicit operator-supplied --mcp-config (do not clobber).
+    _has_mcp_config_arg=false
+    for _arg in ${PASSTHROUGH_ARGS[@]+"${PASSTHROUGH_ARGS[@]}"}; do
+        case "$_arg" in
+            --mcp-config | --mcp-config=*) _has_mcp_config_arg=true; break ;;
+        esac
+    done
+
+    if [[ "$_has_mcp_config_arg" == "false" \
+        && "$(loom_mcp_safehouse_enabled "$WORKSPACE")" == "true" ]]; then
+        _sh_socket="$(loom_mcp_safehouse_socket "$WORKSPACE")"
+        _sh_command="$(loom_mcp_safehouse_command "$WORKSPACE")"
+        _sh_pool="$(loom_mcp_worker_personas "$WORKSPACE")"
+        _sh_fallback="$(loom_mcp_safehouse_persona_fallback "$WORKSPACE")"
+        _sh_persona="$(loom_mcp_pick_persona \
+            "${LOOM_SWEEP_CLAIM_OWNED:-}" "$_sh_pool" "$_sh_fallback")"
+
+        if [[ -z "$_sh_socket" ]]; then
+            log_warn "spawn-claude: safehouse enabled but no socket resolves (safehouse.socket / \$LOOM_SAFEHOUSE_SOCKET / \$SAFEHOUSED_SOCKET); skipping safehouse MCP injection (loom MCP unaffected)."
+        elif ! command -v "$_sh_command" >/dev/null 2>&1; then
+            log_warn "spawn-claude: safehouse launch command '$_sh_command' not found in PATH; skipping safehouse MCP injection (loom MCP unaffected)."
+        else
+            if [[ ! -S "$_sh_socket" && ! -e "$_sh_socket" ]]; then
+                log_warn "spawn-claude: safehouse socket '$_sh_socket' not present at spawn; injecting anyway (best-effort — safehouse-mcp connects lazily and never blocks the worker)."
+            fi
+            _mcp_session_config="$(mktemp -t loom-mcp-config.XXXXXX 2>/dev/null || mktemp)"
+            if loom_mcp_emit_config "$WORKSPACE" "$_sh_socket" "$_sh_persona" "$_sh_command" >"$_mcp_session_config" 2>/dev/null; then
+                PASSTHROUGH_ARGS+=(--mcp-config "$_mcp_session_config")
+                log_info "spawn-claude: injected safehouse MCP server (persona=$_sh_persona, socket=$_sh_socket, config=$_mcp_session_config)"
+            else
+                rm -f "$_mcp_session_config"
+                log_warn "spawn-claude: failed to generate safehouse MCP config; skipping injection (loom MCP unaffected)."
+            fi
+        fi
+    fi
+fi
+
 # --- Dispatch ---
 if [[ "$USE_WRAPPER" == "true" ]]; then
     _wrapper="${WORKSPACE}/.loom/scripts/claude-wrapper.sh"
