@@ -267,7 +267,7 @@ N=<pr-number>
 CLAIMED_AT=$(gh api "repos/{owner}/{repo}/issues/$N/timeline" --paginate \
   --jq '[.[] | select(.event=="labeled" and .label.name=="loom:reviewing")] | last | .created_at')
 COMMENTS_AFTER=$(gh api "repos/{owner}/{repo}/issues/$N/comments" \
-  --jq --arg t "$CLAIMED_AT" '[.[] | select(.created_at > $t)] | length')
+  | jq --arg t "$CLAIMED_AT" '[.[] | select(.created_at > $t)] | length')
 ```
 
 Then decide:
