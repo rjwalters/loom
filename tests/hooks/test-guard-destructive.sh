@@ -2179,6 +2179,18 @@ assert_allow_env "write-confinement: LOOM_GUARD_WORKTREE_ISOLATION=0 -> allow at
 assert_deny_env "write-confinement: LOOM_GUARD_WORKTREE_ISOLATION=1 overrides config-off -> deny" \
     "LOOM_GUARD_WORKTREE_ISOLATION=1" "echo x > $WT_REPO_OFF/defaults/hooks/f.sh" "$WT_REPO_OFF"
 
+# config_resolver migration (#4241): a `guards.worktreeIsolation:false` set
+# ONLY in the .loom-project/project.json tier (no legacy .loom/config.json)
+# must be honored the same as the legacy-tier test above -- proves
+# worktree_isolation_guard_enabled() actually resolves through
+# loom_config_get()/config-resolver.sh rather than reading .loom/config.json
+# directly.
+WT_REPO_PROJECT_OFF=$(make_wt_repo)
+mkdir -p "$WT_REPO_PROJECT_OFF/.loom-project"
+printf '%s' '{"guards":{"worktreeIsolation":false}}' > "$WT_REPO_PROJECT_OFF/.loom-project/project.json"
+assert_allow "write-confinement: guards.worktreeIsolation:false in .loom-project/ tier only -> allow at main root" \
+    "echo x > $WT_REPO_PROJECT_OFF/defaults/hooks/f.sh" "$WT_REPO_PROJECT_OFF"
+
 # False-positive guard: a `>` quoted inside a -m/--body value must NOT be
 # read as a redirection target (COMMAND_ASK_SCAN redaction, mirrors #3679).
 assert_allow "write-confinement: '>' inside a quoted -m value is not a target" \

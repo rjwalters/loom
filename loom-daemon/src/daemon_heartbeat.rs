@@ -142,37 +142,17 @@ pub struct HeartbeatConfig {
     pub interval_secs: Option<u64>,
 }
 
-/// Read `.loom/config.json → autonomous.heartbeat`, soft-failing every field to
-/// `None` (env/default resolution) on any of: missing file, malformed JSON, or
-/// a missing `autonomous` / `heartbeat` block. Mirrors the soft-fail contract of
-/// [`crate::token_ranking_refresh::read_token_ranking_refresh_config`].
+/// Read `.loom/config.json → autonomous.heartbeat` through
+/// [`crate::config_resolver`] (so the `.loom-project/` tier is honored like
+/// every other migrated `autonomous.*` block, #4058/#4241), soft-failing every
+/// field to `None` (env/default resolution) on a missing file, malformed
+/// JSON, or a missing `autonomous` / `heartbeat` block. Shape copied from
+/// [`crate::token_ranking_refresh::read_token_ranking_refresh_config`] (which
+/// this module's doc comment already claimed to mirror).
 #[must_use]
 pub fn read_heartbeat_config(repo_root: &Path) -> HeartbeatConfig {
-    let config_path = repo_root.join(".loom").join("config.json");
-
-    let config_str = match std::fs::read_to_string(&config_path) {
-        Ok(s) => s,
-        Err(e) => {
-            log::debug!(
-                "daemon_heartbeat: could not read config at {}: {e}",
-                config_path.display()
-            );
-            return HeartbeatConfig::default();
-        }
-    };
-
-    let config: serde_json::Value = match serde_json::from_str(&config_str) {
-        Ok(v) => v,
-        Err(e) => {
-            log::warn!(
-                "daemon_heartbeat: could not parse config at {}: {e}",
-                config_path.display()
-            );
-            return HeartbeatConfig::default();
-        }
-    };
-
-    let Some(block) = config.get("autonomous").and_then(|a| a.get("heartbeat")) else {
+    let effective = crate::config_resolver::resolve_effective_config(repo_root);
+    let Some(block) = crate::config_resolver::get_path(&effective, "autonomous.heartbeat") else {
         return HeartbeatConfig::default();
     };
 
@@ -375,6 +355,54 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         write_config(tmp.path(), r#"{"autonomous": {"heartbeat": {"intervalSecs": 0}}}"#);
         assert_eq!(read_heartbeat_config(tmp.path()).interval_secs, None);
+    }
+
+    // ===================================================================
+    // config_resolver migration (#4241) — tier precedence
+    // ===================================================================
+
+    fn write_project_config(root: &Path, contents: &str) {
+        let full = root.join(crate::config_resolver::PROJECT_CONFIG_REL);
+        fs::create_dir_all(full.parent().unwrap()).unwrap();
+        fs::write(full, contents).unwrap();
+    }
+
+    #[test]
+    #[serial(loom_config_env)]
+    fn test_config_project_tier_only_is_honored_like_legacy() {
+        std::env::set_var(crate::config_resolver::PRIVATE_DEFAULTS_ENV, "");
+        let tmp = tempfile::tempdir().unwrap();
+        write_project_config(
+            tmp.path(),
+            r#"{"autonomous": {"heartbeat": {"enabled": false, "intervalSecs": 45}}}"#,
+        );
+        let cfg = read_heartbeat_config(tmp.path());
+        std::env::remove_var(crate::config_resolver::PRIVATE_DEFAULTS_ENV);
+        assert_eq!(
+            cfg,
+            HeartbeatConfig {
+                enabled: Some(false),
+                interval_secs: Some(45),
+            }
+        );
+    }
+
+    #[test]
+    #[serial(loom_config_env)]
+    fn test_config_project_tier_overrides_legacy_overlap_and_supplies_non_overlap() {
+        std::env::set_var(crate::config_resolver::PRIVATE_DEFAULTS_ENV, "");
+        let tmp = tempfile::tempdir().unwrap();
+        write_config(
+            tmp.path(),
+            r#"{"autonomous": {"heartbeat": {"enabled": true, "intervalSecs": 60}}}"#,
+        );
+        write_project_config(tmp.path(), r#"{"autonomous": {"heartbeat": {"intervalSecs": 30}}}"#);
+        let cfg = read_heartbeat_config(tmp.path());
+        std::env::remove_var(crate::config_resolver::PRIVATE_DEFAULTS_ENV);
+        // Overlapping `intervalSecs` -> project tier wins.
+        assert_eq!(cfg.interval_secs, Some(30));
+        // Non-overlapping `enabled` still supplied by legacy tier.
+        assert_eq!(cfg.enabled, Some(true));
     }
 
     // ===================================================================

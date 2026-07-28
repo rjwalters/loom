@@ -69,6 +69,25 @@ trap 'log_hook_error "Unexpected error on line ${LINENO}: ${BASH_COMMAND:-unknow
 #
 # The config read is best-effort: any parse failure falls through to
 # guard-ON and never trips the ERR trap or produces a non-zero exit.
+#
+# CARVE-OUT (#4241, same class as #4063): this read is deliberately NOT routed
+# through the shared config-resolver.sh (loom_config_get / loom_resolve_config)
+# that the cold-path guards.* toggles in guard-destructive-generic.sh use.
+# worktree_isolation_guard_enabled() is called UNCONDITIONALLY as the very
+# first thing this hook does, on EVERY Edit/Write PreToolUse -- there is no
+# cheaper structural pre-check upstream of it (unlike
+# guard-destructive-generic.sh's cold-path toggles, which only read config
+# lazily after a specific pattern has already matched). loom_resolve_config
+# soft-reads all four tier files plus a merge (up to 5 jq forks) on every
+# call; this direct single-jq read of the nearest .loom/config.json costs
+# exactly one. Fanning that out to 5x on the single hottest guard invocation
+# in the whole system is the #3687 fork-budget regression this repo has
+# already decided against once (see guard-destructive-generic.sh's own
+# CARVE-OUT for the read-only fast path). If Epic #3835's `.loom-project/`
+# tier needs to reach this toggle, prefer caching a repo-scoped
+# loom_resolve_config() result once per process (mirroring
+# guard-destructive-generic.sh's per-invocation caches) rather than paying
+# the full resolve on every Edit/Write.
 # =============================================================================
 worktree_isolation_guard_enabled() {
     local enabled=true
@@ -124,6 +143,20 @@ walk_up_for_sentinel() {
 # (LOOM_WORKTREE_ROOT env > .loom/config.json worktree.root > default). Kept
 # as a small inline duplicate rather than sourcing the library, so this
 # guard's fail-open contract does not depend on another script's behavior.
+#
+# CARVE-OUT (#4241, same class as #4063): the `worktree.root` read below is
+# deliberately NOT routed through config-resolver.sh either, for a different
+# reason than the toggle above -- this function is only reached on the rare
+# deny-candidate path (target resolves inside the main checkout and outside
+# every worktree, see path_derived_allow() above), so fork cost is not the
+# concern here. The concern is the SAME self-containment rationale already
+# documented on this function: sourcing config-resolver.sh would make this
+# guard's fail-open contract depend on that library's own behavior (and
+# transitively on jq's `*` deep-merge across up to four tier files) instead
+# of one direct, independently-auditable jq read. If/when a repo actually
+# populates `.loom-project/project.json` -> worktree.root (Epic #3835 Phase
+# 6+), migrate this read (and worktree-root.sh's own resolution) together so
+# the two stay in lockstep -- not this hook alone.
 resolve_worktree_base() {
     if [[ -n "${LOOM_WORKTREE_ROOT:-}" && "${LOOM_WORKTREE_ROOT}" == /* ]]; then
         printf '%s' "${LOOM_WORKTREE_ROOT%/}/$(basename "$MAIN_ROOT")"

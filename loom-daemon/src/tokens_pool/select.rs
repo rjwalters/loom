@@ -175,14 +175,14 @@ fn read_allowlist_lines(allowlist_file: &Path) -> Vec<String> {
         .collect()
 }
 
-/// Soft-fail read of `.loom/config.json` -> `tokens.spreadTopN`. Missing
-/// file, parse error, missing key, non-int, or bool all resolve to `None`.
+/// Soft-fail read of `.loom/config.json` -> `tokens.spreadTopN` through
+/// [`crate::config_resolver`] (so the `.loom-project/` tier is honored like
+/// every other migrated config surface, #4058/#4241). Missing file, parse
+/// error, missing key, non-int, or bool all resolve to `None`. Shape copied
+/// from [`crate::token_ranking_refresh::read_token_ranking_refresh_config`].
 fn read_config_spread_top_n(workspace: &Path) -> Option<i64> {
-    let config_path = workspace.join(".loom").join("config.json");
-    let text = std::fs::read_to_string(config_path).ok()?;
-    let value: serde_json::Value = serde_json::from_str(&text).ok()?;
-    let tokens_cfg = value.get("tokens")?;
-    let spread = tokens_cfg.get("spreadTopN")?;
+    let effective = crate::config_resolver::resolve_effective_config(workspace);
+    let spread = crate::config_resolver::get_path(&effective, "tokens.spreadTopN")?;
     // Reject bool (serde_json's Value::Bool is distinct from Number, so this
     // is naturally excluded) and non-integers.
     spread.as_i64()
@@ -639,6 +639,64 @@ mod tests {
         std::env::remove_var("LOOM_TOKEN_SPREAD_TOP_N");
         // N=1 == greedy first-eligible: always "a".
         assert_eq!(sel.name, "a");
+    }
+
+    // ---- config_resolver migration (#4241) — tier precedence ---------
+
+    fn write_legacy_config(root: &Path, contents: &str) {
+        let dir = root.join(".loom");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("config.json"), contents).unwrap();
+    }
+
+    fn write_project_config(root: &Path, contents: &str) {
+        let full = root.join(crate::config_resolver::PROJECT_CONFIG_REL);
+        fs::create_dir_all(full.parent().unwrap()).unwrap();
+        fs::write(full, contents).unwrap();
+    }
+
+    #[test]
+    #[serial(loom_config_env)]
+    fn read_config_spread_top_n_legacy_tier_only() {
+        std::env::set_var(crate::config_resolver::PRIVATE_DEFAULTS_ENV, "");
+        let tmp = tempfile::tempdir().unwrap();
+        write_legacy_config(tmp.path(), r#"{"tokens": {"spreadTopN": 3}}"#);
+        let n = read_config_spread_top_n(tmp.path());
+        std::env::remove_var(crate::config_resolver::PRIVATE_DEFAULTS_ENV);
+        assert_eq!(n, Some(3));
+    }
+
+    #[test]
+    #[serial(loom_config_env)]
+    fn read_config_spread_top_n_project_tier_only_is_honored() {
+        std::env::set_var(crate::config_resolver::PRIVATE_DEFAULTS_ENV, "");
+        let tmp = tempfile::tempdir().unwrap();
+        write_project_config(tmp.path(), r#"{"tokens": {"spreadTopN": 5}}"#);
+        let n = read_config_spread_top_n(tmp.path());
+        std::env::remove_var(crate::config_resolver::PRIVATE_DEFAULTS_ENV);
+        assert_eq!(n, Some(5));
+    }
+
+    #[test]
+    #[serial(loom_config_env)]
+    fn read_config_spread_top_n_project_tier_overrides_legacy() {
+        std::env::set_var(crate::config_resolver::PRIVATE_DEFAULTS_ENV, "");
+        let tmp = tempfile::tempdir().unwrap();
+        write_legacy_config(tmp.path(), r#"{"tokens": {"spreadTopN": 2}}"#);
+        write_project_config(tmp.path(), r#"{"tokens": {"spreadTopN": 7}}"#);
+        let n = read_config_spread_top_n(tmp.path());
+        std::env::remove_var(crate::config_resolver::PRIVATE_DEFAULTS_ENV);
+        assert_eq!(n, Some(7));
+    }
+
+    #[test]
+    #[serial(loom_config_env)]
+    fn read_config_spread_top_n_missing_everywhere_is_none() {
+        std::env::set_var(crate::config_resolver::PRIVATE_DEFAULTS_ENV, "");
+        let tmp = tempfile::tempdir().unwrap();
+        let n = read_config_spread_top_n(tmp.path());
+        std::env::remove_var(crate::config_resolver::PRIVATE_DEFAULTS_ENV);
+        assert_eq!(n, None);
     }
 
     #[test]
