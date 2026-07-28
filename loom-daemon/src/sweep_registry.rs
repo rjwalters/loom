@@ -2454,7 +2454,21 @@ impl SweepRegistry {
             .with_context(|| format!("failed to open log {}", log_path.display()))?;
         let log_clone = log_file.try_clone()?;
 
-        let prompt = format!("/loom:sweep {issue}");
+        // Daemon self-claim marker, positional form (issue #4111): embed
+        // `--claim-owned <N>` INSIDE the `-p` prompt text so it becomes part of
+        // the `/loom:sweep` skill's own `$ARGUMENTS`, exactly like every other
+        // skill-consumed flag (`--dry-run`, `--no-daemon`, `--depends-on`,
+        // `--auto-stack`). It MUST NOT be appended as a sibling `cmd.arg()`:
+        // `spawn-claude.sh` forwards every non-wrapper token verbatim to the
+        // real `claude` CLI (`exec claude "$@"`), and `--claim-owned` is not a
+        // `claude` CLI flag — a sibling arg makes `claude` exit 1
+        // (`error: unknown option '--claim-owned'`) before any session starts,
+        // turning every daemon dispatch into an immediate crash. Only text
+        // inside the single `-p "<prompt>"` string ever reaches the skill's
+        // pre-flight. The env var (`LOOM_SWEEP_CLAIM_OWNED`, set below) is kept
+        // unchanged for backward compatibility (#3823/#3967). Unconditional on
+        // every daemon dispatch — every dispatch claims exactly one issue.
+        let prompt = format!("/loom:sweep {issue} --claim-owned {issue}");
         let mut cmd = Command::new(&spawn_bin);
         cmd.arg("-p").arg(&prompt);
         // Model selection (issue #3477, Phase 1): the dispatch-param tier of
@@ -2484,6 +2498,8 @@ impl SweepRegistry {
         if let Some(parent) = depends_on {
             cmd.arg("--depends-on").arg(parent.to_string());
         }
+        // (Daemon self-claim marker `--claim-owned <N>` is embedded in the
+        // `-p` prompt text above, not appended as a sibling arg — see #4111.)
         // Unattended-permissions flag (issue #3824): a daemon-dispatched child
         // is a detached, non-interactive `claude -p` process — there is no
         // human to answer a permission prompt, so any tool call needing
@@ -2495,8 +2511,8 @@ impl SweepRegistry {
         // `claude -p "/<role>" --dangerously-skip-permissions`). Scoped to this
         // daemon-only dispatch path; `spawn-claude.sh` stays a generic
         // pass-through and never adds a permission flag of its own. Appended
-        // AFTER `--model`/`--effort`/`--depends-on` so the positional argv
-        // contract for those flags is unchanged.
+        // AFTER `--model`/`--effort`/`--depends-on` (and the prompt-embedded
+        // `--claim-owned`) so the positional argv contract is unchanged.
         cmd.arg("--dangerously-skip-permissions");
         cmd.env("LOOM_TERMINAL_ID", format!("daemon-{sweep_id}"))
             // Claim-ownership marker (issue #3823): `dispatch()` flips
@@ -2511,6 +2527,16 @@ impl SweepRegistry {
             // Scoped to daemon-dispatched children only: an operator-run
             // `/loom:sweep N` never sets this env var, so the manual-terminal
             // skip rule (honor any loom:building) is unchanged.
+            //
+            // Issue #4111: this env var alone was proven insufficient — a
+            // daemon-dispatched child reliably reasoned about loom:building
+            // label timing / PID tables / `loom-daemon status` and
+            // self-skipped its own claim without ever consulting it. The
+            // `--claim-owned <N>` argv flag appended above is now the PRIMARY
+            // signal (positional, in the model's context by construction);
+            // this env var is kept for backward compatibility only —
+            // spawn-claude.sh still logs it, and it is still asserted by the
+            // producer-side tests below plus `work_finder.rs` / `ipc.rs`.
             .env("LOOM_SWEEP_CLAIM_OWNED", issue.to_string())
             // Always pin LOOM_WORKSPACE to the registry's configured root so
             // spawn-claude.sh resolves `.loom/tokens/` from the same place
@@ -4579,6 +4605,13 @@ mod tests {
 # Test fixture: record dispatch args + selected env into a log.
 {{
   printf 'argv: %s\n' "$*"
+  # Also record each argv TOKEN on its own line (issue #4111): `$*` flattens a
+  # single `-p "<prompt with spaces>"` arg into space-joined text that is
+  # indistinguishable from sibling args, which is exactly why a sibling
+  # `--claim-owned` (rejected by the real `claude` CLI) slipped past the
+  # `$*`-substring tests. A per-token record lets a test assert the flag lands
+  # INSIDE the `-p` prompt value, not as its own argv token.
+  for tok in "$@"; do printf 'arg: %s\n' "$tok"; done
   printf 'CLAUDE_CODE_OAUTH_TOKEN=%s\n' "${{CLAUDE_CODE_OAUTH_TOKEN:-unset}}"
   printf 'LOOM_WORKSPACE=%s\n' "${{LOOM_WORKSPACE:-unset}}"
   printf 'PWD=%s\n' "$(pwd -P)"
@@ -4846,8 +4879,9 @@ exit 0
     /// Issue #3824: `spawn_child` unconditionally appends
     /// `--dangerously-skip-permissions` to the child argv so a detached,
     /// non-interactive `claude -p` sweep never stalls on a permission prompt.
-    /// With no model/effort/depends-on the flag is the sole trailing arg,
-    /// appended AFTER any of those (verified by the exact positional form).
+    /// With no model/effort/depends-on the flag directly follows the
+    /// `--claim-owned <N>` marker (#4111, always emitted for a daemon
+    /// dispatch), appended AFTER it (verified by the exact positional form).
     #[test]
     #[serial]
     fn dispatch_appends_dangerously_skip_permissions() {
@@ -4861,8 +4895,11 @@ exit 0
         let needle = format!("LOOM_TERMINAL_ID=daemon-{}", outcome.sweep_id);
         let recorded = assert_child_wrote(&record_log, &needle);
         assert!(
-            recorded.contains("argv: -p /loom:sweep 4242 --dangerously-skip-permissions"),
-            "expected --dangerously-skip-permissions appended after the prompt; got: {recorded}"
+            recorded.contains(
+                "argv: -p /loom:sweep 4242 --claim-owned 4242 --dangerously-skip-permissions"
+            ),
+            "expected --claim-owned then --dangerously-skip-permissions appended after the \
+             prompt; got: {recorded}"
         );
     }
 
@@ -4886,6 +4923,131 @@ exit 0
         assert!(
             recorded.contains("LOOM_SWEEP_CLAIM_OWNED=4243"),
             "expected claim-ownership marker for issue 4243; got: {recorded}"
+        );
+    }
+
+    /// Issue #4111 (Option 1, the positional half of the fix): in addition to
+    /// the `LOOM_SWEEP_CLAIM_OWNED` env var above, `spawn_child` appends
+    /// `--claim-owned <issue>` to the child's own argv. This is the primary
+    /// signal — positional in the model's context by construction — that
+    /// `/loom:sweep`'s mandatory Step 1a pre-flight check consumes. Asserts
+    /// BOTH channels are present on the same dispatch (belt-and-suspenders,
+    /// per the issue's explicit "keep the env var exported regardless for
+    /// backward compatibility" guidance) and that the flag carries exactly
+    /// the dispatched issue number, unconditionally (unlike the
+    /// optional --model/--effort/--depends-on flags, this one is never
+    /// absent on a daemon dispatch).
+    #[test]
+    #[serial]
+    fn dispatch_appends_claim_owned_flag() {
+        let dir = tempdir().unwrap();
+        let (mut registry, record_log) = fixture_registry(dir.path());
+
+        let outcome = registry
+            .dispatch(&SweepKind::Issue(4246), None, None, None, None)
+            .expect("dispatch should succeed");
+
+        let needle = format!("LOOM_TERMINAL_ID=daemon-{}", outcome.sweep_id);
+        let recorded = assert_child_wrote(&record_log, &needle);
+        assert!(
+            recorded.contains("argv: -p /loom:sweep 4246 --claim-owned 4246"),
+            "expected --claim-owned 4246 in argv immediately after the prompt; got: {recorded}"
+        );
+        // Regression for the #4120 review: `--claim-owned` MUST be embedded in
+        // the `-p` prompt string, NOT appended as a sibling argv token. The
+        // real `claude` CLI rejects `--claim-owned` as an unknown option and
+        // exits 1 if it arrives as its own token; only text inside the single
+        // `-p "<prompt>"` value reaches the `/loom:sweep` skill's `$ARGUMENTS`.
+        // The fixture records each argv token on its own `arg: ` line, so we
+        // can assert the flag is part of the prompt VALUE (one token that also
+        // carries `/loom:sweep`) and NOT a standalone `arg: --claim-owned`
+        // token — the `$*`-substring assertion above cannot tell these apart
+        // (which is precisely how the original sibling-arg bug slipped through).
+        assert!(
+            recorded.contains("arg: /loom:sweep 4246 --claim-owned 4246"),
+            "expected --claim-owned inside the single -p prompt token; got: {recorded}"
+        );
+        assert!(
+            !recorded.contains("arg: --claim-owned"),
+            "--claim-owned must NOT be a standalone argv token (the real claude CLI \
+             rejects it as an unknown option); got: {recorded}"
+        );
+        // Belt-and-suspenders: the env var must still be present too (#3823
+        // backward compatibility, per #4111's explicit guidance to keep it).
+        assert!(
+            recorded.contains("LOOM_SWEEP_CLAIM_OWNED=4246"),
+            "expected the LOOM_SWEEP_CLAIM_OWNED env var alongside the flag; got: {recorded}"
+        );
+    }
+
+    /// Issue #4111 (the consumer-side regression this issue is really about):
+    /// a checkpoint-less, clean (`exit 0`) sweep death for a daemon-dispatched
+    /// self-claim check — i.e. exactly the "deliberate skip" shape the #3939
+    /// insta-crash guard is SUPPOSED to exempt — must NOT increment the
+    /// insta-crash tally when the reaper retains the real `Child` handle
+    /// (poll_liveness observes `exit_code == Some(0)`, not the `None`
+    /// fallback the other insta-crash fixtures in this file simulate via a
+    /// dead/unretained PID). This exercises the reaper's `exit_code !=
+    /// Some(0)` guard (`sweep_registry.rs`) against a REAL spawned process
+    /// rather than a synthetic dead-PID fixture, closing the gap the issue's
+    /// Finding 1 flagged: every other insta-crash test in this file only ever
+    /// observes `exit_code = None` (no retained handle), so a real Some(0)
+    /// exit was never actually exercised before.
+    #[test]
+    fn reaper_real_clean_exit_does_not_count_as_insta_crash() {
+        let dir = tempdir().unwrap();
+        let (mut registry, _record_log) = fixture_registry(dir.path());
+
+        // A real, fast, clean-exit child (mirrors what a #4111 self-skip
+        // looks like on the wire: no checkpoint written, exits 0 quickly).
+        let child = Command::new("true")
+            .spawn()
+            .expect("spawn `true` fixture child");
+        let pid = child.id();
+        // Give the OS a moment to actually finish the process before we poll.
+        std::thread::sleep(Duration::from_millis(50));
+
+        let sweep_id = "sweep-issue-4111-clean-exit".to_string();
+        registry.entries.insert(
+            sweep_id.clone(),
+            SweepInfo {
+                sweep_id: sweep_id.clone(),
+                kind: SweepKind::Issue(41_110),
+                pid,
+                token_name: "unknown".into(),
+                log_path: registry.compute_log_path(41_110),
+                idempotency_key: None,
+                started_at: Utc::now(),
+                state: SweepState::Running,
+                latest_phase: None,
+                pr_number: None,
+                model: None,
+                effort: None,
+                depends_on: None,
+                repo: None,
+            },
+        );
+        // Retain the handle (mirrors `dispatch()`'s `self.children.insert`) so
+        // `poll_liveness` uses the real exit code instead of the no-handle
+        // `kill(pid, 0)` fallback that always yields `exit_code = None`.
+        registry.children.insert(sweep_id.clone(), child);
+
+        registry.reap_once();
+
+        assert_eq!(
+            registry.insta_crash_count(41_110),
+            0,
+            "a real, handle-observed clean (exit 0) death must not count toward quarantine"
+        );
+        assert!(
+            !registry.is_quarantined(41_110),
+            "a single clean exit must never quarantine the issue"
+        );
+        let info = registry.get(&sweep_id).unwrap();
+        assert!(
+            matches!(info.state, SweepState::Exited { code: Some(0), .. }),
+            "expected an Exited{{code: Some(0)}} terminal state; got: {:?}",
+            info.state
         );
     }
 
@@ -5007,7 +5169,7 @@ exit 0
         let needle = format!("LOOM_TERMINAL_ID=daemon-{}", outcome.sweep_id);
         let recorded = assert_child_wrote(&record_log, &needle);
         assert!(
-            recorded.contains("argv: -p /loom:sweep 43 --model claude-sonnet-4-6"),
+            recorded.contains("argv: -p /loom:sweep 43 --claim-owned 43 --model claude-sonnet-4-6"),
             "expected --model in argv; got: {recorded}"
         );
         // #3482 (Phase 3a): the dispatch model is carried on the registry
@@ -5324,7 +5486,7 @@ exit 0
         let needle = format!("LOOM_TERMINAL_ID=daemon-{}", outcome.sweep_id);
         let recorded = assert_child_wrote(&record_log, &needle);
         assert!(
-            recorded.contains("argv: -p /loom:sweep 45 --effort xhigh"),
+            recorded.contains("argv: -p /loom:sweep 45 --claim-owned 45 --effort xhigh"),
             "expected --effort in argv; got: {recorded}"
         );
         // The dispatch effort is carried on the registry entry so
@@ -5351,7 +5513,9 @@ exit 0
         let needle = format!("LOOM_TERMINAL_ID=daemon-{}", outcome.sweep_id);
         let recorded = assert_child_wrote(&record_log, &needle);
         assert!(
-            recorded.contains("argv: -p /loom:sweep 46 --model claude-sonnet-4-6 --effort xhigh"),
+            recorded.contains(
+                "argv: -p /loom:sweep 46 --claim-owned 46 --model claude-sonnet-4-6 --effort xhigh"
+            ),
             "expected --model then --effort in argv; got: {recorded}"
         );
         let entry = registry.get(&outcome.sweep_id).unwrap();
@@ -5402,7 +5566,7 @@ exit 0
         let needle = format!("LOOM_TERMINAL_ID=daemon-{}", outcome.sweep_id);
         let recorded = assert_child_wrote(&record_log, &needle);
         assert!(
-            recorded.contains("argv: -p /loom:sweep 50 --depends-on 49"),
+            recorded.contains("argv: -p /loom:sweep 50 --claim-owned 50 --depends-on 49"),
             "expected --depends-on in argv; got: {recorded}"
         );
         assert_eq!(

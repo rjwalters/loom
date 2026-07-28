@@ -293,6 +293,57 @@ fn sweep_md_stage_minus_one_wave_size_snippet_is_bash_3_2_portable() {
     }
 }
 
+/// Issue #4111: assert the `--claim-owned <N>` daemon self-claim flag is
+/// documented across its required sites — the Optional flags list, the
+/// Validation rules flag-recognition list, and the Stage -1 decision-tree
+/// short-circuit (mirrors `sweep_md_documents_no_daemon_flag` above, the
+/// established pattern for a load-bearing daemon-only flag). Also asserts
+/// the flag is documented as an EQUIVALENT signal to the pre-existing
+/// `LOOM_SWEEP_CLAIM_OWNED` env var, not a silent replacement — #4111
+/// explicitly requires the env var stay exported for backward compatibility,
+/// so the doc must describe both channels, not just the new one.
+#[test]
+fn sweep_md_documents_claim_owned_flag() {
+    let content = read_sweep_md();
+
+    // CONTRACT: `--claim-owned` is a stable CLI flag name. The >= 4 occurrence
+    // floor is a structural presence check (optional-flags list + validation
+    // rules + Stage -1 decision-tree pseudocode + Stage -1 prose) that fails
+    // if the flag is dropped from any of its documented sites. Keep the flag
+    // name EXACT.
+    let occurrences = content.matches("--claim-owned").count();
+    assert!(
+        occurrences >= 4,
+        "sweep.md mentions `--claim-owned` only {occurrences} time(s); #4111 \
+         requires the flag be documented in the optional-flags section, the \
+         validation rules, the Stage -1 decision-tree pseudocode, and Stage -1 \
+         prose (lower bound: 4 occurrences)"
+    );
+
+    // CONTRACT: the decision-tree line must recognise the flag as an
+    // alternative short-circuit signal alongside the env var — asserted via
+    // the literal `CLAIM_OWNED is set` pseudocode token (mirrors the existing
+    // `LOOM_SWEEP_CLAIM_OWNED is set` token this test suite already pins
+    // implicitly through `sweep_md_decision_tree_documents_all_probes`).
+    assert!(
+        content.contains("CLAIM_OWNED is set"),
+        "sweep.md's Stage -1 decision tree does not document `CLAIM_OWNED is \
+         set` as a subagent short-circuit condition — #4111 requires the \
+         `--claim-owned` flag be recognised as an equivalent signal to the \
+         `LOOM_SWEEP_CLAIM_OWNED` env var at the daemon-owned-child \
+         short-circuit"
+    );
+
+    // CONTRACT: the env var must still be documented (backward compatibility
+    // — #4111 explicitly requires it stay exported, not be replaced).
+    assert!(
+        content.contains("LOOM_SWEEP_CLAIM_OWNED"),
+        "sweep.md must still document `LOOM_SWEEP_CLAIM_OWNED` alongside \
+         `--claim-owned` — #4111 keeps the env var exported for backward \
+         compatibility, it does not replace it"
+    );
+}
+
 /// AC #1: assert the Limitations table records the Stage -1 row as
 /// Implemented (#3454). This is the operator-visible status flip that
 /// signals Phase D shipped.

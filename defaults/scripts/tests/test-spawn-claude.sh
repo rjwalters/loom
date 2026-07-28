@@ -297,6 +297,28 @@ output=$(LOOM_WORKSPACE="$TEST_WS" PATH="$STUB_DIR:$PATH" \
 assert_contains "spawn-claude: LOOM_SWEEP_CLAIM_OWNED=3964" "$output" \
     "spawn-claude logs the daemon self-claim marker's value when set (#3967)"
 
+# Test: the `--claim-owned <N>` self-claim marker (issue #4111 — the belt half
+# of the belt-and-suspenders fix) is embedded INSIDE the `-p` prompt string,
+# exactly as `SweepRegistry::spawn_child` now emits it
+# (`-p "/loom:sweep <N> --claim-owned <N>"`). This is deliberate: `--claim-owned`
+# is NOT a real `claude` CLI flag — spawn-claude.sh forwards every non-wrapper
+# token verbatim to the real `claude` binary (`exec claude "$@"`), so passing
+# `--claim-owned` as its OWN argv token makes `claude` exit 1
+# (`error: unknown option '--claim-owned'`) before any session starts (#4120
+# review). Only text inside the single `-p "<prompt>"` value reaches the
+# `/loom:sweep` skill's own `$ARGUMENTS`. This test asserts the prompt (with the
+# embedded flag) is forwarded verbatim as a single `-p` argument, alongside the
+# env var (kept for backward compatibility, #3823/#3967).
+output=$(LOOM_WORKSPACE="$TEST_WS" PATH="$STUB_DIR:$PATH" \
+    LOOM_SWEEP_CLAIM_OWNED="4111" \
+    "$SCRIPTS_DIR/spawn-claude.sh" -p "/loom:sweep 4111 --claim-owned 4111" \
+        --dangerously-skip-permissions 2>&1 || true)
+assert_contains "stub-claude args=-p /loom:sweep 4111 --claim-owned 4111 --dangerously-skip-permissions" \
+    "$output" \
+    "spawn-claude forwards the -p prompt (with embedded --claim-owned) verbatim to claude (#4111/#4120)"
+assert_contains "spawn-claude: LOOM_SWEEP_CLAIM_OWNED=4111" "$output" \
+    "spawn-claude still logs the env var when the --claim-owned flag is also present (#4111 backward compat)"
+
 # Test: explicit CLAUDE_CODE_OAUTH_TOKEN bypasses selection
 output=$(LOOM_WORKSPACE="$TEST_WS" PATH="$STUB_DIR:$PATH" \
     CLAUDE_CODE_OAUTH_TOKEN="caller-supplied" \

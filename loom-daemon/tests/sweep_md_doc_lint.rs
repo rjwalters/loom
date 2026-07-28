@@ -377,6 +377,71 @@ fn sweep_md_documents_experiment_tier_2_5_suppression() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// Issue #4111 — the daemon self-claim check must be a MANDATORY step
+// evaluated BEFORE the `loom:building` skip test, not an exception clause
+// buried after it. #3823/#3967 both closed green while the child still
+// self-skipped its own daemon claim; the doc-lint below is the cheapest
+// mechanical "consumer-side" check available for this prose-compliance
+// contract — it can't verify an LLM actually follows the ordering at
+// runtime, but it CAN verify the ordering the LLM is asked to follow is
+// textually correct, and fails loudly if a future edit silently reverts the
+// restructure back to an exception-clause shape.
+// ---------------------------------------------------------------------------
+
+/// #4111 (AC #2's cheapest mechanical check): "Step 1a — daemon self-claim
+/// check" must appear in the "1. Per-issue pre-flight" section BEFORE the
+/// `loom:building` skip-test bullet, so the marker check is structurally a
+/// precondition of that bullet rather than a footnote appended after it.
+#[test]
+fn sweep_md_step_1a_self_claim_check_precedes_loom_building_skip_bullet() {
+    let content = read_sweep_md();
+
+    // CONTRACT: "Step 1a" is the stable anchor for the mandatory daemon
+    // self-claim check (#4111); the skip-test bullet's opening clause is the
+    // stable anchor for the loom:building rule it must precede. Both are
+    // load-bearing identifiers — a rename of either without updating this
+    // test is exactly the drift this doc-lint exists to catch.
+    let step_1a_pos = content.find("Step 1a").unwrap_or_else(|| {
+        panic!(
+            "sweep.md is missing the `Step 1a` daemon self-claim check anchor \
+             — #4111 requires the marker check be a MANDATORY, separately \
+             numbered pre-flight step, not an exception clause folded into \
+             the loom:building skip bullet"
+        )
+    });
+    let skip_bullet_pos = content
+        .find("If the issue already has `loom:building`")
+        .unwrap_or_else(|| {
+            panic!(
+                "sweep.md is missing the `loom:building` skip-test bullet — \
+                 the #3823-era pre-flight rule this doc-lint anchors to"
+            )
+        });
+
+    assert!(
+        step_1a_pos < skip_bullet_pos,
+        "sweep.md's `Step 1a` daemon self-claim check (byte offset {step_1a_pos}) \
+         must appear BEFORE the `loom:building` skip-test bullet (byte offset \
+         {skip_bullet_pos}) in the \"1. Per-issue pre-flight\" section — #4111's \
+         entire fix is making the marker check evaluate first. If this ever \
+         regresses (Step 1a moved after the skip bullet, or collapsed back \
+         into an inline exception clause), the marker becomes prose-optional \
+         again exactly as it was when #4111 was filed."
+    );
+
+    // CONTRACT: the check must be stated as MANDATORY, not advisory — a
+    // reword that softens "MANDATORY" to something optional-sounding would
+    // reintroduce the exact compliance gap #4111 fixed.
+    assert!(
+        content.contains("MANDATORY"),
+        "sweep.md's Step 1a daemon self-claim check must be stated as \
+         MANDATORY (#4111) — the prior #3823 phrasing was a non-mandatory \
+         exception clause and was silently skipped by a daemon-dispatched \
+         child in production"
+    );
+}
+
 /// #3725: the canary guardrail and the exact-per-role-cost harvest are pinned.
 #[test]
 fn sweep_md_documents_experiment_guardrail_and_harvest() {

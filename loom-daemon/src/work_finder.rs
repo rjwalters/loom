@@ -1650,6 +1650,7 @@ mod tests {
         let script = format!(
             r#"#!/usr/bin/env bash
 printf 'LOOM_SWEEP_CLAIM_OWNED=%s\n' "${{LOOM_SWEEP_CLAIM_OWNED:-unset}}" >> "{rec}"
+printf 'argv: %s\n' "$*" >> "{rec}"
 exit 0
 "#,
             rec = record_log.display()
@@ -1667,16 +1668,17 @@ exit 0
         (RegistryDispatcher::new(registry), dir, record_log)
     }
 
-    /// Issue #3967: the autonomous work finder's real dispatch path
+    /// Issue #3967 / #4111: the autonomous work finder's real dispatch path
     /// (`RegistryDispatcher`, the `WorkDispatcher` impl wired into
     /// production — as opposed to the `RecordingDispatcher` test fake used
     /// by every `tick`/`tick_multi` test above) must export
-    /// `LOOM_SWEEP_CLAIM_OWNED=<issue>` into the spawned child exactly like
-    /// the IPC `DispatchSweep` path (`ipc.rs`) and the CLI `dispatch`
+    /// `LOOM_SWEEP_CLAIM_OWNED=<issue>` into the spawned child's env, AND
+    /// (#4111) append `--claim-owned <issue>` to the child's own argv, exactly
+    /// like the IPC `DispatchSweep` path (`ipc.rs`) and the CLI `dispatch`
     /// subcommand (`main.rs`) do. `RegistryDispatcher::dispatch` forwards to
     /// `SweepRegistry::dispatch` → `spawn_child`, so this closes the
     /// dispatch-path-level regression coverage across all three daemon
-    /// dispatch entry points.
+    /// dispatch entry points — for both the env-var and the argv-flag signal.
     #[test]
     #[serial]
     fn test_registry_dispatcher_exports_claim_ownership_marker() {
@@ -1709,6 +1711,14 @@ exit 0
             recorded.contains("LOOM_SWEEP_CLAIM_OWNED=3964"),
             "expected the work-finder's production RegistryDispatcher to export \
              the daemon-owned-child self-claim marker; got: {recorded:?}"
+        );
+        // #4111: the positional argv flag must also be present on this same
+        // dispatch (belt-and-suspenders — the env var alone was proven
+        // insufficient for a `/loom:sweep` child to actually notice).
+        assert!(
+            recorded.contains("--claim-owned 3964"),
+            "expected the work-finder's production RegistryDispatcher to append \
+             --claim-owned 3964 to the child argv (#4111); got: {recorded:?}"
         );
     }
 

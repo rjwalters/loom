@@ -2250,7 +2250,9 @@ exit 0
     /// `dispatch_sweep` tool round-trip into over the Unix socket — so a
     /// regression here would have caught the incident regardless of which of
     /// those two client surfaces initiated the request. Asserts the spawned
-    /// child's env carries `LOOM_SWEEP_CLAIM_OWNED=<issue>` end-to-end.
+    /// child's env carries `LOOM_SWEEP_CLAIM_OWNED=<issue>` end-to-end, AND
+    /// (#4111) that its argv carries the equivalent `--claim-owned <issue>`
+    /// flag — the positional signal `/loom:sweep`'s pre-flight actually reads.
     #[test]
     #[serial_test::serial]
     fn test_handle_request_dispatch_sweep_exports_claim_ownership_marker() {
@@ -2294,6 +2296,13 @@ exit 0
             recorded.contains("LOOM_SWEEP_CLAIM_OWNED=3964"),
             "expected the daemon-owned-child self-claim marker to reach the \
              spawned child via the IPC DispatchSweep handler; got: {recorded:?}"
+        );
+        // #4111: the positional argv flag must also reach the child via this
+        // same IPC path.
+        assert!(
+            recorded.contains("--claim-owned 3964"),
+            "expected --claim-owned 3964 in the spawned child's argv via the IPC \
+             DispatchSweep handler (#4111); got: {recorded:?}"
         );
     }
 
