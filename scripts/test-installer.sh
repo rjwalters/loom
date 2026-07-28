@@ -2732,6 +2732,153 @@ fi
 echo ""
 
 # ==========================================================================
+# Section 13: verify-install.sh check-links parsing coverage (#4147)
+#
+# install-loom.sh promotes a `check-links` failure to a hard installer error
+# (issue #4097's AC4). This section exercises cmd_check_links /
+# resolve_link_target / extract_link_targets directly (no full install run
+# needed — the parsing logic operates on any git repo with a
+# .loom/docs/*.md tree, which the legacy directory-walk fallback in
+# collect_tracked_files() picks up without an install-metadata.json).
+# ==========================================================================
+echo "--- Section 13: check-links parsing coverage (#4147) ---"
+echo ""
+
+VERIFY_INSTALL_SCRIPT="$DEFAULTS_DIR/scripts/verify-install.sh"
+
+# Minimal scratch git repo with a .loom/docs/ tree — enough for the legacy
+# directory-walk fallback in collect_tracked_files() to discover the fixture
+# .md files without needing an install-metadata.json.
+seed_check_links_repo() {
+  local repo="$1"
+  mkdir -p "$repo/.loom/docs"
+  git -C "$repo" init -q
+  git -C "$repo" config user.email "test@test.com"
+  git -C "$repo" config user.name "Test"
+}
+
+echo "Test: check-links — clean fixture resolves (exit 0)"
+CL_OK="$TEST_DIR/check-links-ok"
+seed_check_links_repo "$CL_OK"
+mkdir -p "$CL_OK/.loom/docs/sub"
+echo "sibling content" > "$CL_OK/.loom/docs/b.md"
+echo "file in dir" > "$CL_OK/.loom/docs/sub/inner.md"
+cat > "$CL_OK/.loom/docs/a.md" <<'EOF'
+# Fixture
+
+Markdown link resolves: [x](b.md)
+Anchor stripped before resolution: [x](b.md#some-heading)
+Pure in-page anchor skipped: [x](#local)
+Directory target satisfied when non-empty: [x](sub/)
+External http(s) skipped: [ext](https://example.com/page)
+Mailto skipped: [m](mailto:a@b.c)
+Backtick-only install-rooted resolves: `.loom/docs/b.md`
+Glob placeholder is not a literal target: `.loom/roles/*.md`
+Name placeholder is not a literal target: `.loom/roles/<name>.md`
+Create `.loom/docs/tutorial-placeholder.md`: tutorial lines are excluded.
+EOF
+# Note: set -e is active throughout this file. check-links exits non-zero
+# (6) on a dangling link by design, so every invocation below is guarded
+# with `|| true` inside the capturing subshell and the real exit code is
+# captured separately via a `set +e` / `set -e` bracket — mirroring the
+# existing "set -e is active; capture ... via || true" convention used for
+# Test 45/46 above.
+set +e
+CL_OK_OUT=$(cd "$CL_OK" && bash "$VERIFY_INSTALL_SCRIPT" check-links 2>&1)
+CL_OK_RC=$?
+set -e
+if [[ $CL_OK_RC -eq 0 ]]; then
+  pass "check-links: markdown link, anchor-stripped link, in-page anchor, non-empty directory target, external/mailto skip, backtick-only install-rooted ref, glob/placeholder exclusion, and Create-tutorial-line exclusion all resolve (exit 0)"
+else
+  fail "check-links: clean fixture did not resolve (rc=$CL_OK_RC): $CL_OK_OUT"
+fi
+echo ""
+
+echo "Test: check-links — dangling markdown link (exit 6, target named)"
+CL_DANGLE_MD="$TEST_DIR/check-links-dangle-md"
+seed_check_links_repo "$CL_DANGLE_MD"
+cat > "$CL_DANGLE_MD/.loom/docs/a.md" <<'EOF'
+[x](nope.md)
+EOF
+set +e
+CL_DANGLE_MD_OUT=$(cd "$CL_DANGLE_MD" && bash "$VERIFY_INSTALL_SCRIPT" check-links 2>&1)
+CL_DANGLE_MD_RC=$?
+set -e
+if [[ $CL_DANGLE_MD_RC -eq 6 ]]; then
+  pass "check-links: dangling markdown link -> exit 6"
+else
+  fail "check-links: dangling markdown link -> expected exit 6, got $CL_DANGLE_MD_RC"
+fi
+if echo "$CL_DANGLE_MD_OUT" | grep -qF "nope.md"; then
+  pass "check-links: dangling markdown target named in output"
+else
+  fail "check-links: dangling markdown target not named in output: $CL_DANGLE_MD_OUT"
+fi
+echo ""
+
+echo "Test: check-links — dangling backtick-only install-rooted ref (exit 6)"
+CL_DANGLE_BT="$TEST_DIR/check-links-dangle-backtick"
+seed_check_links_repo "$CL_DANGLE_BT"
+cat > "$CL_DANGLE_BT/.loom/docs/a.md" <<'EOF'
+See `.loom/docs/gone.md` for details.
+EOF
+set +e
+CL_DANGLE_BT_OUT=$(cd "$CL_DANGLE_BT" && bash "$VERIFY_INSTALL_SCRIPT" check-links 2>&1)
+CL_DANGLE_BT_RC=$?
+set -e
+if [[ $CL_DANGLE_BT_RC -eq 6 ]]; then
+  pass "check-links: dangling backtick-only install-rooted ref -> exit 6"
+else
+  fail "check-links: dangling backtick-only ref -> expected exit 6, got $CL_DANGLE_BT_RC"
+fi
+if echo "$CL_DANGLE_BT_OUT" | grep -qF ".loom/docs/gone.md"; then
+  pass "check-links: dangling backtick-only target named in output"
+else
+  fail "check-links: dangling backtick-only target not named in output: $CL_DANGLE_BT_OUT"
+fi
+echo ""
+
+echo "Test: check-links — empty directory target dangles (exit 6)"
+CL_DANGLE_DIR="$TEST_DIR/check-links-dangle-dir"
+seed_check_links_repo "$CL_DANGLE_DIR"
+mkdir -p "$CL_DANGLE_DIR/.loom/docs/emptysub"
+cat > "$CL_DANGLE_DIR/.loom/docs/a.md" <<'EOF'
+[x](emptysub/)
+EOF
+set +e
+( cd "$CL_DANGLE_DIR" && bash "$VERIFY_INSTALL_SCRIPT" check-links >/dev/null 2>&1 )
+CL_DANGLE_DIR_RC=$?
+set -e
+if [[ $CL_DANGLE_DIR_RC -eq 6 ]]; then
+  pass "check-links: empty directory target -> exit 6"
+else
+  fail "check-links: empty directory target -> expected exit 6, got $CL_DANGLE_DIR_RC"
+fi
+echo ""
+
+echo "Test: check-links — --quiet suppresses stdout on a dangling link"
+CL_QUIET="$TEST_DIR/check-links-quiet"
+seed_check_links_repo "$CL_QUIET"
+cat > "$CL_QUIET/.loom/docs/a.md" <<'EOF'
+[x](nope.md)
+EOF
+set +e
+CL_QUIET_STDOUT=$(cd "$CL_QUIET" && bash "$VERIFY_INSTALL_SCRIPT" check-links --quiet 2>/dev/null)
+CL_QUIET_RC=$?
+set -e
+if [[ $CL_QUIET_RC -eq 6 ]]; then
+  pass "check-links --quiet: dangling link still exits 6"
+else
+  fail "check-links --quiet: expected exit 6, got $CL_QUIET_RC"
+fi
+if [[ -z "$CL_QUIET_STDOUT" ]]; then
+  pass "check-links --quiet: no stdout emitted"
+else
+  fail "check-links --quiet: unexpected stdout: $CL_QUIET_STDOUT"
+fi
+echo ""
+
+# ==========================================================================
 # Summary
 # ==========================================================================
 echo "======================================"

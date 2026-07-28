@@ -306,7 +306,8 @@ exec-latency artifacts rather than contention. The narrative and its consequence
 for gate niceness live in [`build-gate.md`](build-gate.md) (the #4044 / #4046
 falsification passage). ADR-0011 also records this as a macOS-specific defect that
 is invisible to Linux CI by construction — see
-[`docs/adr/0011-ci-runner-platform.md`](../../docs/adr/0011-ci-runner-platform.md).
+[`docs/adr/0011-ci-runner-platform.md`](https://github.com/rjwalters/loom/blob/main/docs/adr/0011-ci-runner-platform.md)
+(upstream Loom repo — not shipped to consumer installs).
 
 > **Historical note on timeouts.** Contemporaneous incident writeups mention a
 > "600s" build-gate budget; that figure is **incident history only**. #4048 raised
@@ -339,7 +340,7 @@ loom-stuck-detection check-issue 123
 | `dead_pid` | (instant) | PID in the daemon sweep registry is no longer alive |
 | `error_spike` | 5 errors | Multiple errors in `.loom/logs/sweep-issue-N.log` |
 
-The pre-v0.10.0 indicators `missing_milestone:worktree_created` and `extended_work` were retired when the Python daemon brain (`daemon_v2/`) was removed — see [the migration guide § Per-CLI breaking changes](../../docs/migration/v0.10.0-shepherd-deprecation.md#per-cli-breaking-changes) for the field-level diff. The shell-level daemon surface (`./.loom/scripts/daemon.sh`) is preserved but does not write progress files, so milestone-based heuristics no longer apply.
+The pre-v0.10.0 indicators `missing_milestone:worktree_created` and `extended_work` were retired when the Python daemon brain (`daemon_v2/`) was removed — see [the migration guide § Per-CLI breaking changes](https://github.com/rjwalters/loom/blob/main/docs/migration/v0.10.0-shepherd-deprecation.md#per-cli-breaking-changes) (upstream Loom repo — not shipped to consumer installs) for the field-level diff. The shell-level daemon surface (`./.loom/scripts/daemon.sh`) is preserved but does not write progress files, so milestone-based heuristics no longer apply.
 
 ## Sweep Dispatch Troubleshooting
 
@@ -369,7 +370,7 @@ cd mcp-loom && npm install && npm run build
 grep -c dispatch_sweep dist/index.js   # should now be > 0
 ```
 
-`scripts/setup-mcp.sh` now auto-rebuilds when `dist/index.js` is missing **or** older than any file under `mcp-loom/src/` (#3803), so `./scripts/setup-mcp.sh` is the safe one-shot path. Rebuilding the bundle does **not** refresh an already-running session — an MCP client caches its tool list at connect time, so you must **restart the Claude Code session** (or respawn the `loom` MCP subprocess) for the new tools to appear. See [`mcp-loom/README.md`](../../mcp-loom/README.md#rebuilding-after-source-changes-reconnect-required) for the full rebuild + reconnect procedure and a raw `tools/list` verification snippet.
+`scripts/setup-mcp.sh` now auto-rebuilds when `dist/index.js` is missing **or** older than any file under `mcp-loom/src/` (#3803), so `./scripts/setup-mcp.sh` is the safe one-shot path. Rebuilding the bundle does **not** refresh an already-running session — an MCP client caches its tool list at connect time, so you must **restart the Claude Code session** (or respawn the `loom` MCP subprocess) for the new tools to appear. See [`mcp-loom/README.md`](https://github.com/rjwalters/loom/blob/main/mcp-loom/README.md#rebuilding-after-source-changes-reconnect-required) (upstream Loom repo — not shipped to consumer installs) for the full rebuild + reconnect procedure and a raw `tools/list` verification snippet.
 
 ### MCP tools hang with no response (~1800s), then abort
 
