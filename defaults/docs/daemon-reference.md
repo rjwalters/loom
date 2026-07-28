@@ -1845,7 +1845,7 @@ already-observed** distress — a materially stronger signal than a single-tick
 headroom reading — so `dispatch_sweep` (CLI `loom-daemon dispatch <N>` / the
 `mcp__loom__dispatch_sweep` tool) is **refused** while the breaker is Open or
 CoolDown. An operator who knows the host is distressed and wants to dispatch anyway
-passes `--force` (CLI) / `force: true` (IPC).
+passes `--force` (CLI) / `force: true` (IPC / `mcp__loom__dispatch_sweep`).
 
 **Observability.** The breaker is surfaced three ways: a log line on every phase
 change; a state-change-deduped `daemon.host_breaker.state` event-bus event
