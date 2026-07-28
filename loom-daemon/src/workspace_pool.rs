@@ -618,7 +618,13 @@ mod tests {
         let out = registry
             .dispatch(&crate::types::SweepKind::Issue(999_001), None, None, None, None)
             .unwrap();
-        let original_id = out.sweep_id.clone();
+        // Assert reclaim on the child PID, not the sweep_id: `generate_sweep_id`
+        // mints IDs at second granularity (`Utc::now().timestamp()`), so this
+        // fast dispatch→watchdog→re-dispatch cycle frequently completes within
+        // one wall-clock second and the re-dispatched sweep gets an id identical
+        // to the original (#4124 flaky test). A freshly spawned child always has
+        // a distinct OS PID, so PID inequality is collision-proof.
+        let original_pid = out.pid;
 
         let arc = Arc::new(Mutex::new(registry));
         // Short timeout/interval so the test doesn't wait the production
@@ -638,7 +644,7 @@ mod tests {
                 .iter()
                 .any(|i| {
                     matches!(i.kind, crate::types::SweepKind::Issue(n) if n == 999_001)
-                        && i.sweep_id != original_id
+                        && i.pid != original_pid
                 })
         })
         .await;
