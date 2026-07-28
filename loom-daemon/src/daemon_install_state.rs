@@ -1,0 +1,828 @@
+//! Install-state classification for `loom-daemon status`'s unreachable-daemon
+//! error path (Issue #4069, AC3 of #4011).
+//!
+//! # Why
+//!
+//! Before this module, every transport failure in `handle_status_command`'s
+//! `Err` arm collapsed into one generic message ("Could not reach
+//! loom-daemon... Is the daemon running?"). That message is actively
+//! misleading in two of three real situations: it says nothing about whether
+//! autonomy was ever *expected* on this host (the #4011 silent-autonomy-loss
+//! scenario), and it recommends a start even when the daemon process is alive
+//! and the singleton guard will refuse.
+//!
+//! This module is the READ-ONLY probe that tells those situations apart, by
+//! consuming the same **autonomy-desired marker** and **heartbeat file** the
+//! host-side `loom-daemon-watchdog.sh` (#4011) already uses — and mirroring
+//! its exact precedence so `status` and the watchdog log can never
+//! contradict each other:
+//!
+//! 1. Marker absent → [`InstallState::NotExpected`]: no daemon is expected
+//!    (deliberately stopped, or never started).
+//! 2. Marker present, no live process → [`InstallState::ExpectedButDead`]:
+//!    the #4011 divergence — autonomy was expected but the daemon is gone.
+//! 3. Marker present, process alive (but IPC still failed, since we only
+//!    reach this module from the status query's `Err` arm) →
+//!    [`InstallState::AliveButUnresponsive`], qualified by heartbeat
+//!    freshness: fresh ⇒ likely an IPC/socket-layer fault, stale ⇒ likely a
+//!    wedged daemon.
+//!
+//! Like [`crate::self_update`], this module is modeled to be inherently
+//! side-effect-free and never fails the command: an unreadable/malformed
+//! marker, a missing `launchctl`, a stale/unowned pid, or an unreadable
+//! heartbeat mtime all degrade to a less-specific (but never wrong) verdict
+//! rather than propagating an error. The caller (`main.rs`) always has a
+//! fallback generic message to print if [`probe`] returns `None`.
+//!
+//! This module changes reporting only: it starts nothing, stops nothing, and
+//! writes no state (Non-goal in #4069 — do not add writes here).
+
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::process::Command;
+
+/// Default macOS launchd label, matching `loom-daemon-start.sh` /
+/// `loom-daemon-watchdog.sh`'s fallback when the marker predates the
+/// `launchd_label` field.
+pub const DEFAULT_LAUNCHD_LABEL: &str = "com.rjwalters.loom-daemon";
+
+/// Basename of the autonomy-desired intent marker under the resolved loom
+/// dir, matching `loom-daemon-start.sh`'s `INTENT_MARKER` default.
+pub const MARKER_FILENAME: &str = "autonomy-desired";
+
+/// Exit code for `not-expected` (and any undiagnosable fallback) — unchanged
+/// from the pre-#4069 generic behavior, so existing scripting that only
+/// checks non-zero is unaffected.
+pub const EXIT_NOT_EXPECTED: i32 = 1;
+/// Exit code for `expected-but-dead` (the #4011 silent-autonomy-loss state).
+pub const EXIT_EXPECTED_BUT_DEAD: i32 = 3;
+/// Exit code for `alive-but-unresponsive` (IPC fault or wedged daemon).
+pub const EXIT_ALIVE_BUT_UNRESPONSIVE: i32 = 4;
+
+// ============================================================================
+// Public types
+// ============================================================================
+
+/// The three states `status` can distinguish once a live IPC round-trip has
+/// failed. See module docs for the precedence this mirrors from
+/// `loom-daemon-watchdog.sh`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InstallState {
+    /// No autonomy-desired marker — a daemon is not currently expected
+    /// (deliberately stopped via `loom-daemon-stop.sh`, or never started).
+    NotExpected,
+    /// Marker present, but no live process for it — the #4011 divergence.
+    ExpectedButDead,
+    /// Marker present and the process is alive, but IPC still failed.
+    AliveButUnresponsive,
+}
+
+impl InstallState {
+    /// Machine-readable enum value for `--json` rendering.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            InstallState::NotExpected => "not-expected",
+            InstallState::ExpectedButDead => "expected-but-dead",
+            InstallState::AliveButUnresponsive => "alive-but-unresponsive",
+        }
+    }
+
+    /// The exit code `loom-daemon status` should use for this state.
+    #[must_use]
+    pub fn exit_code(self) -> i32 {
+        match self {
+            InstallState::NotExpected => EXIT_NOT_EXPECTED,
+            InstallState::ExpectedButDead => EXIT_EXPECTED_BUT_DEAD,
+            InstallState::AliveButUnresponsive => EXIT_ALIVE_BUT_UNRESPONSIVE,
+        }
+    }
+}
+
+/// Heartbeat freshness qualifier for [`InstallState::AliveButUnresponsive`] —
+/// sharpens "alive but not answering" into "likely an IPC fault" (fresh) vs
+/// "likely wedged" (stale). `Unknown` is a degradation (no heartbeat file,
+/// unreadable mtime, or heartbeat loop disabled) — never a false report.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HeartbeatFreshness {
+    Fresh,
+    Stale,
+    Unknown,
+}
+
+impl HeartbeatFreshness {
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            HeartbeatFreshness::Fresh => "fresh",
+            HeartbeatFreshness::Stale => "stale",
+            HeartbeatFreshness::Unknown => "unknown",
+        }
+    }
+}
+
+/// The full classification result for one probe.
+#[derive(Debug, Clone)]
+pub struct InstallStateReport {
+    pub state: InstallState,
+    /// The marker's `started_at` field, when present and the marker exists.
+    pub started_at: Option<String>,
+    /// The live pid, when [`InstallState::AliveButUnresponsive`].
+    pub pid: Option<u32>,
+    /// Human-readable liveness detail (mirrors the watchdog's own
+    /// `liveness_detail` strings so log/status messages read consistently).
+    pub liveness_detail: Option<String>,
+    /// Heartbeat freshness — only computed for `AliveButUnresponsive`.
+    pub heartbeat_freshness: Option<HeartbeatFreshness>,
+    /// Heartbeat age in seconds, when its mtime was readable.
+    pub heartbeat_age_secs: Option<u64>,
+    /// The staleness threshold used for the freshness verdict (seconds).
+    pub heartbeat_stale_threshold_secs: Option<u64>,
+    /// The watchdog log path to point an operator at (advisory only — never
+    /// read by this module).
+    pub watchdog_log_path: PathBuf,
+}
+
+impl InstallStateReport {
+    fn not_expected(watchdog_log_path: PathBuf) -> Self {
+        InstallStateReport {
+            state: InstallState::NotExpected,
+            started_at: None,
+            pid: None,
+            liveness_detail: None,
+            heartbeat_freshness: None,
+            heartbeat_age_secs: None,
+            heartbeat_stale_threshold_secs: None,
+            watchdog_log_path,
+        }
+    }
+}
+
+/// Env/platform overrides that win over the marker's recorded fields —
+/// mirrors `loom-daemon-watchdog.sh`'s "env wins over marker" rule exactly.
+/// Split out from [`probe`] so unit tests can construct one directly without
+/// mutating process-global env vars.
+#[derive(Debug, Clone)]
+pub struct EnvOverrides {
+    /// From `LOOM_DAEMON_LAUNCHD`: this override is **one-directional**, exactly
+    /// mirroring `loom-daemon-watchdog.sh` — a falsy value (`0`/`false`/`no`)
+    /// yields `Some(false)`, forcing the pid-file path even when the marker says
+    /// `use_launchd=true`. Any other value (or unset) yields `None`, deferring to
+    /// the marker's own `use_launchd`; the env var can never force launchd *on*.
+    pub launchd_override: Option<bool>,
+    /// From `LOOM_LAUNCHD_LABEL`.
+    pub launchd_label_override: Option<String>,
+    /// From `LOOM_DAEMON_HEARTBEAT_STALE_SECS`.
+    pub heartbeat_stale_secs_override: Option<u64>,
+    /// Whether this host can have a launchd job at all — the watchdog forces
+    /// `USE_LAUNCHD=false` on non-Darwin regardless of the marker.
+    pub is_darwin: bool,
+}
+
+/// Parse the `LOOM_DAEMON_LAUNCHD` env value into a launchd override.
+///
+/// **One-directional, mirroring `loom-daemon-watchdog.sh` exactly**: a falsy
+/// value (`0`/`false`/`no`, case-insensitive) yields `Some(false)`, forcing the
+/// pid-file path even when the marker recorded `use_launchd=true`. Any other
+/// value — including a truthy `1`/`true`/`yes` — and the unset case yield
+/// `None`, deferring to the marker's own `use_launchd`. The env var can never
+/// force launchd *on*, which is the whole point of matching the shell's
+/// `^(0|false|no)$`-only regex.
+fn parse_launchd_override(value: Option<&str>) -> Option<bool> {
+    value
+        .filter(|v| matches!(v.to_ascii_lowercase().as_str(), "0" | "false" | "no"))
+        .map(|_| false)
+}
+
+impl EnvOverrides {
+    /// Resolve from the real process environment + platform, for the
+    /// production entry point ([`probe`]).
+    #[must_use]
+    pub fn from_env() -> Self {
+        let launchd_override =
+            parse_launchd_override(std::env::var("LOOM_DAEMON_LAUNCHD").ok().as_deref());
+        let launchd_label_override = std::env::var("LOOM_LAUNCHD_LABEL")
+            .ok()
+            .filter(|s| !s.is_empty());
+        let heartbeat_stale_secs_override = std::env::var("LOOM_DAEMON_HEARTBEAT_STALE_SECS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok());
+        EnvOverrides {
+            launchd_override,
+            launchd_label_override,
+            heartbeat_stale_secs_override,
+            is_darwin: cfg!(target_os = "macos"),
+        }
+    }
+}
+
+// ============================================================================
+// Path resolution — mirrors `main.rs::resolve_loom_dir` / `daemon_heartbeat`
+// deliberately (both are tiny; kept in sync by inspection rather than shared,
+// same rationale `daemon_heartbeat.rs` documents for its own copy).
+// ============================================================================
+
+fn resolve_loom_dir() -> Option<PathBuf> {
+    if let Ok(path) = std::env::var("LOOM_SOCKET_PATH") {
+        return PathBuf::from(path).parent().map(Path::to_path_buf);
+    }
+    dirs::home_dir().map(|h| h.join(".loom"))
+}
+
+/// Resolve the autonomy-desired marker path: `LOOM_AUTONOMY_MARKER` env
+/// override first (matching `loom-daemon-start.sh`'s `INTENT_MARKER`), else
+/// `<loom_dir>/autonomy-desired`.
+fn resolve_marker_path(loom_dir: &Path) -> PathBuf {
+    std::env::var("LOOM_AUTONOMY_MARKER")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| loom_dir.join(MARKER_FILENAME))
+}
+
+// ============================================================================
+// Marker parsing
+// ============================================================================
+
+/// Parse a `key=value` marker file: comments (`#`) and blank lines ignored,
+/// first occurrence of a key wins (mirrors the watchdog's
+/// `grep -E "^${key}=" | head -n1`).
+fn parse_marker(contents: &str) -> HashMap<String, String> {
+    let mut map = HashMap::new();
+    for line in contents.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if let Some((key, value)) = line.split_once('=') {
+            map.entry(key.trim().to_string())
+                .or_insert_with(|| value.to_string());
+        }
+    }
+    map
+}
+
+/// The marker fields the probe needs, with the watchdog's own per-field
+/// fallbacks applied for markers that predate a field.
+struct MarkerFields {
+    started_at: Option<String>,
+    pid_file: Option<PathBuf>,
+    heartbeat_file: PathBuf,
+    heartbeat_interval_secs: u64,
+    use_launchd: bool,
+    launchd_label: String,
+}
+
+fn resolve_marker_fields(map: &HashMap<String, String>, loom_dir: &Path) -> MarkerFields {
+    let started_at = map.get("started_at").filter(|s| !s.is_empty()).cloned();
+
+    let pid_file = map
+        .get("pid_file")
+        .filter(|s| !s.is_empty())
+        .map(PathBuf::from);
+
+    let heartbeat_file = map
+        .get("heartbeat_file")
+        .filter(|s| !s.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| loom_dir.join(crate::daemon_heartbeat::HEARTBEAT_FILENAME));
+
+    let heartbeat_interval_secs = map
+        .get("heartbeat_interval_secs")
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(crate::daemon_heartbeat::DEFAULT_HEARTBEAT_INTERVAL_SECS);
+
+    // Marker default is `true` when absent/unparsed (matches the watchdog's
+    // `USE_LAUNCHD="${MARKER_USE_LAUNCHD:-true}"`).
+    let use_launchd = map
+        .get("use_launchd")
+        .map(|v| !matches!(v.to_ascii_lowercase().as_str(), "false" | "0" | "no"))
+        .unwrap_or(true);
+
+    let launchd_label = map
+        .get("launchd_label")
+        .filter(|s| !s.is_empty())
+        .cloned()
+        .unwrap_or_else(|| DEFAULT_LAUNCHD_LABEL.to_string());
+
+    MarkerFields {
+        started_at,
+        pid_file,
+        heartbeat_file,
+        heartbeat_interval_secs,
+        use_launchd,
+        launchd_label,
+    }
+}
+
+// ============================================================================
+// Liveness
+// ============================================================================
+
+/// `kill -0 <pid>` via subprocess (matches `terminal.rs`'s existing pattern
+/// in this crate — no `libc`/`nix` dependency needed). Returns `false` for
+/// both "no such process" and "not owned by us", exactly like the shell
+/// script's `kill -0 "$pid" 2>/dev/null`.
+fn pid_alive(pid: u32) -> bool {
+    Command::new("kill")
+        .args(["-0", &pid.to_string()])
+        .output()
+        .is_ok_and(|o| o.status.success())
+}
+
+fn current_uid() -> Option<String> {
+    Command::new("id")
+        .arg("-u")
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+/// Parse `launchctl print gui/<uid>/<label>` output for a live pid — mirrors
+/// the watchdog's `awk -F'= ' '/^[[:space:]]*pid = /{...; print $2; exit}'`.
+fn launchctl_pid(label: &str) -> Option<u32> {
+    let uid = current_uid()?;
+    let service = format!("gui/{uid}/{label}");
+    let output = Command::new("launchctl")
+        .args(["print", &service])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    for line in stdout.lines() {
+        let trimmed = line.trim_start();
+        if let Some(rest) = trimmed.strip_prefix("pid = ") {
+            let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+            if let Ok(pid) = digits.parse::<u32>() {
+                return Some(pid);
+            }
+        }
+    }
+    None
+}
+
+/// One liveness check result: whether the expected daemon is alive, a
+/// human-readable detail string (mirrors the watchdog's `liveness_detail`),
+/// and the live pid when alive.
+struct Liveness {
+    alive: bool,
+    detail: String,
+    pid: Option<u32>,
+}
+
+fn check_liveness(use_launchd: bool, label: &str, pid_file: Option<&Path>) -> Liveness {
+    if use_launchd {
+        if let Some(pid) = launchctl_pid(label) {
+            if pid_alive(pid) {
+                let service = current_uid()
+                    .map(|uid| format!("gui/{uid}/{label}"))
+                    .unwrap_or_else(|| label.to_string());
+                return Liveness {
+                    alive: true,
+                    detail: format!("launchd job {service} alive (pid {pid})"),
+                    pid: Some(pid),
+                };
+            }
+        }
+        let service = current_uid()
+            .map(|uid| format!("gui/{uid}/{label}"))
+            .unwrap_or_else(|| label.to_string());
+        return Liveness {
+            alive: false,
+            detail: format!("launchd job {service} is not loaded/alive"),
+            pid: None,
+        };
+    }
+
+    // Non-launchd (nohup / Linux) path: the pid file is the only signal.
+    match pid_file {
+        Some(pf) => {
+            let pid = std::fs::read_to_string(pf)
+                .ok()
+                .and_then(|s| s.trim().parse::<u32>().ok());
+            match pid {
+                Some(pid) if pid_alive(pid) => Liveness {
+                    alive: true,
+                    detail: format!("pid {pid} (from {}) alive", pf.display()),
+                    pid: Some(pid),
+                },
+                Some(_) => Liveness {
+                    alive: false,
+                    detail: format!("pid file {} present but pid not alive", pf.display()),
+                    pid: None,
+                },
+                None => Liveness {
+                    alive: false,
+                    detail: format!("no live pid file at {}", pf.display()),
+                    pid: None,
+                },
+            }
+        }
+        None => Liveness {
+            alive: false,
+            detail: "no live pid file at <none>".to_string(),
+            pid: None,
+        },
+    }
+}
+
+// ============================================================================
+// Heartbeat freshness
+// ============================================================================
+
+/// Compute heartbeat age (seconds) from a file's mtime, degrading to `None`
+/// on any I/O error or unrepresentable timestamp rather than failing.
+fn heartbeat_age_secs(path: &Path) -> Option<u64> {
+    let metadata = std::fs::metadata(path).ok()?;
+    let modified = metadata.modified().ok()?;
+    let elapsed = modified.elapsed().ok()?;
+    Some(elapsed.as_secs())
+}
+
+/// Classify heartbeat freshness against the staleness threshold — mirrors
+/// the watchdog's degrade-don't-false-report rules: an absent file or an
+/// unreadable mtime both yield `Unknown`, never a false `Stale`.
+fn check_heartbeat(
+    heartbeat_file: &Path,
+    stale_threshold_secs: u64,
+) -> (HeartbeatFreshness, Option<u64>) {
+    match heartbeat_age_secs(heartbeat_file) {
+        Some(age) if age > stale_threshold_secs => (HeartbeatFreshness::Stale, Some(age)),
+        Some(age) => (HeartbeatFreshness::Fresh, Some(age)),
+        None => (HeartbeatFreshness::Unknown, None),
+    }
+}
+
+/// The watchdog's staleness threshold formula: `max(interval * 5, 300)`,
+/// unless `LOOM_DAEMON_HEARTBEAT_STALE_SECS` overrides it.
+fn resolve_stale_threshold(interval_secs: u64, env_override: Option<u64>) -> u64 {
+    env_override.unwrap_or_else(|| (interval_secs * 5).max(300))
+}
+
+// ============================================================================
+// Classification
+// ============================================================================
+
+/// Pure(ish) classification given an already-resolved loom dir, marker path,
+/// and env overrides — split out from [`probe`] so tests can drive it against
+/// tempdir fixtures without touching real env vars or `~/.loom`.
+#[must_use]
+pub fn classify(loom_dir: &Path, marker_path: &Path, env: &EnvOverrides) -> InstallStateReport {
+    let watchdog_log_path = loom_dir.join("logs").join("daemon-watchdog.log");
+
+    let contents = match std::fs::read_to_string(marker_path) {
+        Ok(c) => c,
+        Err(_) => return InstallStateReport::not_expected(watchdog_log_path),
+    };
+    let map = parse_marker(&contents);
+    let fields = resolve_marker_fields(&map, loom_dir);
+
+    // Env-wins-over-marker (mirrors the watchdog exactly), then the
+    // non-Darwin blanket override.
+    let use_launchd = env.launchd_override.unwrap_or(fields.use_launchd) && env.is_darwin;
+    let label = env
+        .launchd_label_override
+        .clone()
+        .unwrap_or(fields.launchd_label);
+
+    let liveness = check_liveness(use_launchd, &label, fields.pid_file.as_deref());
+
+    if !liveness.alive {
+        return InstallStateReport {
+            state: InstallState::ExpectedButDead,
+            started_at: fields.started_at,
+            pid: None,
+            liveness_detail: Some(liveness.detail),
+            heartbeat_freshness: None,
+            heartbeat_age_secs: None,
+            heartbeat_stale_threshold_secs: None,
+            watchdog_log_path,
+        };
+    }
+
+    let stale_threshold =
+        resolve_stale_threshold(fields.heartbeat_interval_secs, env.heartbeat_stale_secs_override);
+    let (freshness, age) = check_heartbeat(&fields.heartbeat_file, stale_threshold);
+
+    InstallStateReport {
+        state: InstallState::AliveButUnresponsive,
+        started_at: fields.started_at,
+        pid: liveness.pid,
+        liveness_detail: Some(liveness.detail),
+        heartbeat_freshness: Some(freshness),
+        heartbeat_age_secs: age,
+        heartbeat_stale_threshold_secs: Some(stale_threshold),
+        watchdog_log_path,
+    }
+}
+
+/// Production entry point: resolves the loom dir + marker path from env
+/// (mirroring `main.rs::resolve_loom_dir` / `loom-daemon-watchdog.sh`) and
+/// classifies. Returns `None` only when no loom dir can be resolved at all
+/// (no `LOOM_SOCKET_PATH` and no home directory) — the caller should fall
+/// back to the pre-#4069 generic message in that case. This function never
+/// panics and never touches the filesystem beyond a single marker/heartbeat
+/// read plus at most two read-only subprocess calls (`launchctl`, `kill -0`).
+#[must_use]
+pub fn probe() -> Option<InstallStateReport> {
+    let loom_dir = resolve_loom_dir()?;
+    let marker_path = resolve_marker_path(&loom_dir);
+    Some(classify(&loom_dir, &marker_path, &EnvOverrides::from_env()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use std::time::{Duration, SystemTime};
+
+    fn no_env_overrides() -> EnvOverrides {
+        // `is_darwin: false` forces the pid-file path deterministically in
+        // tests regardless of the host OS or a real `launchctl` — the marker
+        // fixtures below always set `use_launchd=false` too, so this is
+        // belt-and-suspenders, not load-bearing.
+        EnvOverrides {
+            launchd_override: None,
+            launchd_label_override: None,
+            heartbeat_stale_secs_override: None,
+            is_darwin: false,
+        }
+    }
+
+    fn write_pid_file(dir: &Path, pid: u32) -> PathBuf {
+        let path = dir.join("daemon.pid");
+        fs::write(&path, pid.to_string()).unwrap();
+        path
+    }
+
+    fn write_marker(dir: &Path, extra: &str) -> PathBuf {
+        let path = dir.join(MARKER_FILENAME);
+        fs::write(&path, extra).unwrap();
+        path
+    }
+
+    fn write_heartbeat(dir: &Path, age: Duration) -> PathBuf {
+        let path = dir.join("daemon.heartbeat");
+        fs::write(&path, "1 pid=1 ts=x\n").unwrap();
+        let mtime = SystemTime::now() - age;
+        let file = fs::File::options().write(true).open(&path).unwrap();
+        file.set_modified(mtime).unwrap();
+        path
+    }
+
+    #[test]
+    fn marker_absent_is_not_expected() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join(MARKER_FILENAME);
+        let report = classify(dir.path(), &marker, &no_env_overrides());
+        assert_eq!(report.state, InstallState::NotExpected);
+        assert_eq!(report.state.exit_code(), EXIT_NOT_EXPECTED);
+    }
+
+    #[test]
+    fn marker_present_live_pid_is_alive_but_unresponsive() {
+        let dir = tempfile::tempdir().unwrap();
+        let pid_file = write_pid_file(dir.path(), std::process::id());
+        let marker = write_marker(
+            dir.path(),
+            &format!(
+                "started_at=2026-07-27T00:00:00Z\npid_file={}\nuse_launchd=false\n",
+                pid_file.display()
+            ),
+        );
+        let report = classify(dir.path(), &marker, &no_env_overrides());
+        assert_eq!(report.state, InstallState::AliveButUnresponsive);
+        assert_eq!(report.state.exit_code(), EXIT_ALIVE_BUT_UNRESPONSIVE);
+        assert_eq!(report.pid, Some(std::process::id()));
+        assert_eq!(report.started_at.as_deref(), Some("2026-07-27T00:00:00Z"));
+    }
+
+    #[test]
+    fn marker_present_dead_pid_is_expected_but_dead() {
+        let dir = tempfile::tempdir().unwrap();
+        // Pid 0 is never `kill -0`-able as a normal user process here in the
+        // sense the shell script cares about; use a pid that is extremely
+        // unlikely to be alive instead of relying on 0's special meaning.
+        let dead_pid: u32 = 999_999;
+        let pid_file = write_pid_file(dir.path(), dead_pid);
+        let marker = write_marker(
+            dir.path(),
+            &format!("pid_file={}\nuse_launchd=false\n", pid_file.display()),
+        );
+        let report = classify(dir.path(), &marker, &no_env_overrides());
+        assert_eq!(report.state, InstallState::ExpectedButDead);
+        assert_eq!(report.state.exit_code(), EXIT_EXPECTED_BUT_DEAD);
+        assert!(report.pid.is_none());
+    }
+
+    #[test]
+    fn marker_present_no_pid_file_is_expected_but_dead() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = write_marker(dir.path(), "use_launchd=false\n");
+        let report = classify(dir.path(), &marker, &no_env_overrides());
+        assert_eq!(report.state, InstallState::ExpectedButDead);
+    }
+
+    #[test]
+    fn alive_with_fresh_heartbeat_is_fresh() {
+        let dir = tempfile::tempdir().unwrap();
+        let pid_file = write_pid_file(dir.path(), std::process::id());
+        let heartbeat = write_heartbeat(dir.path(), Duration::from_secs(5));
+        let marker = write_marker(
+            dir.path(),
+            &format!(
+                "pid_file={}\nheartbeat_file={}\nheartbeat_interval_secs=60\nuse_launchd=false\n",
+                pid_file.display(),
+                heartbeat.display()
+            ),
+        );
+        let report = classify(dir.path(), &marker, &no_env_overrides());
+        assert_eq!(report.state, InstallState::AliveButUnresponsive);
+        assert_eq!(report.heartbeat_freshness, Some(HeartbeatFreshness::Fresh));
+        assert_eq!(report.heartbeat_stale_threshold_secs, Some(300));
+    }
+
+    #[test]
+    fn alive_with_stale_heartbeat_is_stale() {
+        let dir = tempfile::tempdir().unwrap();
+        let pid_file = write_pid_file(dir.path(), std::process::id());
+        let heartbeat = write_heartbeat(dir.path(), Duration::from_secs(1000));
+        let marker = write_marker(
+            dir.path(),
+            &format!(
+                "pid_file={}\nheartbeat_file={}\nheartbeat_interval_secs=60\nuse_launchd=false\n",
+                pid_file.display(),
+                heartbeat.display()
+            ),
+        );
+        let report = classify(dir.path(), &marker, &no_env_overrides());
+        assert_eq!(report.state, InstallState::AliveButUnresponsive);
+        assert_eq!(report.heartbeat_freshness, Some(HeartbeatFreshness::Stale));
+    }
+
+    #[test]
+    fn stale_threshold_honors_env_override() {
+        let dir = tempfile::tempdir().unwrap();
+        let pid_file = write_pid_file(dir.path(), std::process::id());
+        let heartbeat = write_heartbeat(dir.path(), Duration::from_secs(20));
+        let marker = write_marker(
+            dir.path(),
+            &format!(
+                "pid_file={}\nheartbeat_file={}\nheartbeat_interval_secs=60\nuse_launchd=false\n",
+                pid_file.display(),
+                heartbeat.display()
+            ),
+        );
+        let mut env = no_env_overrides();
+        env.heartbeat_stale_secs_override = Some(10);
+        let report = classify(dir.path(), &marker, &env);
+        assert_eq!(report.heartbeat_freshness, Some(HeartbeatFreshness::Stale));
+        assert_eq!(report.heartbeat_stale_threshold_secs, Some(10));
+    }
+
+    #[test]
+    fn malformed_marker_degrades_to_not_expected_semantics_gracefully() {
+        // A marker file that exists but has no recognizable keys at all still
+        // parses (empty map); fallbacks apply, no field lookups panic. Since
+        // there's no pid_file, this resolves to ExpectedButDead — the "marker
+        // present" branch never panics on garbage content.
+        let dir = tempfile::tempdir().unwrap();
+        let marker = write_marker(dir.path(), "not a key value file at all\n\n# comment\n");
+        let report = classify(dir.path(), &marker, &no_env_overrides());
+        assert_eq!(report.state, InstallState::ExpectedButDead);
+    }
+
+    #[test]
+    fn marker_missing_fields_uses_fallback_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        // No heartbeat_file / heartbeat_interval_secs / launchd_label fields —
+        // exercise the per-field fallback path (marker predates those fields).
+        let pid_file = write_pid_file(dir.path(), std::process::id());
+        let marker = write_marker(
+            dir.path(),
+            &format!("pid_file={}\nuse_launchd=false\n", pid_file.display()),
+        );
+        let report = classify(dir.path(), &marker, &no_env_overrides());
+        assert_eq!(report.state, InstallState::AliveButUnresponsive);
+        // No heartbeat file was ever written at the fallback location, so the
+        // qualifier degrades to Unknown rather than falsely reporting Stale.
+        assert_eq!(report.heartbeat_freshness, Some(HeartbeatFreshness::Unknown));
+    }
+
+    #[test]
+    fn pid_file_with_unowned_or_stale_pid_is_expected_but_dead() {
+        let dir = tempfile::tempdir().unwrap();
+        // pid 1 is (almost) never owned by the test process and typically
+        // cannot be `kill -0`-ed without privilege — exercises the "present
+        // pid, not killable by us" branch the same way a stale/unowned pid
+        // does in the shell script.
+        let pid_file = write_pid_file(dir.path(), 1);
+        let marker = write_marker(
+            dir.path(),
+            &format!("pid_file={}\nuse_launchd=false\n", pid_file.display()),
+        );
+        let report = classify(dir.path(), &marker, &no_env_overrides());
+        assert_eq!(report.state, InstallState::ExpectedButDead);
+    }
+
+    #[test]
+    fn heartbeat_absent_degrades_to_unknown_not_stale() {
+        let dir = tempfile::tempdir().unwrap();
+        let pid_file = write_pid_file(dir.path(), std::process::id());
+        let marker = write_marker(
+            dir.path(),
+            &format!(
+                "pid_file={}\nheartbeat_file={}\nuse_launchd=false\n",
+                pid_file.display(),
+                dir.path().join("no-such-heartbeat").display()
+            ),
+        );
+        let report = classify(dir.path(), &marker, &no_env_overrides());
+        assert_eq!(report.state, InstallState::AliveButUnresponsive);
+        assert_eq!(report.heartbeat_freshness, Some(HeartbeatFreshness::Unknown));
+        assert!(report.heartbeat_age_secs.is_none());
+    }
+
+    #[test]
+    fn env_launchd_override_forces_pid_file_path_even_when_marker_says_launchd() {
+        let dir = tempfile::tempdir().unwrap();
+        let pid_file = write_pid_file(dir.path(), std::process::id());
+        // Marker claims launchd, but env override forces it off — exercises
+        // "env wins over marker".
+        let marker = write_marker(
+            dir.path(),
+            &format!("pid_file={}\nuse_launchd=true\n", pid_file.display()),
+        );
+        let mut env = no_env_overrides();
+        env.launchd_override = Some(false);
+        let report = classify(dir.path(), &marker, &env);
+        assert_eq!(report.state, InstallState::AliveButUnresponsive);
+    }
+
+    #[test]
+    fn non_darwin_forces_pid_file_path_regardless_of_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        let pid_file = write_pid_file(dir.path(), std::process::id());
+        let marker = write_marker(
+            dir.path(),
+            &format!("pid_file={}\nuse_launchd=true\n", pid_file.display()),
+        );
+        // is_darwin: false with no explicit launchd_override — the blanket
+        // non-Darwin rule must still force the pid-file path.
+        let report = classify(dir.path(), &marker, &no_env_overrides());
+        assert_eq!(report.state, InstallState::AliveButUnresponsive);
+    }
+
+    #[test]
+    fn parse_marker_first_occurrence_wins() {
+        let map = parse_marker("key=first\nkey=second\n# comment\n\nother=val\n");
+        assert_eq!(map.get("key").map(String::as_str), Some("first"));
+        assert_eq!(map.get("other").map(String::as_str), Some("val"));
+    }
+
+    #[test]
+    fn resolve_stale_threshold_matches_watchdog_formula() {
+        assert_eq!(resolve_stale_threshold(60, None), 300);
+        assert_eq!(resolve_stale_threshold(120, None), 600);
+        assert_eq!(resolve_stale_threshold(60, Some(45)), 45);
+    }
+
+    #[test]
+    fn install_state_as_str_matches_taxonomy() {
+        assert_eq!(InstallState::NotExpected.as_str(), "not-expected");
+        assert_eq!(InstallState::ExpectedButDead.as_str(), "expected-but-dead");
+        assert_eq!(InstallState::AliveButUnresponsive.as_str(), "alive-but-unresponsive");
+    }
+
+    #[test]
+    fn launchd_override_is_one_directional_only_forces_false() {
+        // Falsy values force the pid-file path — exactly the shell's
+        // `^(0|false|no)$` regex, case-insensitive.
+        for falsy in ["0", "false", "no", "FALSE", "No", "NO"] {
+            assert_eq!(
+                parse_launchd_override(Some(falsy)),
+                Some(false),
+                "{falsy:?} should force use_launchd=false"
+            );
+        }
+
+        // Truthy / arbitrary / empty values NEVER force launchd on — they defer
+        // to the marker (`None`). This is the #4150 fix: the watchdog only ever
+        // forces `false`, never `true`.
+        for other in ["1", "true", "yes", "TRUE", "Yes", "", "maybe", "on"] {
+            assert_eq!(
+                parse_launchd_override(Some(other)),
+                None,
+                "{other:?} must not force use_launchd on"
+            );
+        }
+
+        // Unset defers to the marker.
+        assert_eq!(parse_launchd_override(None), None);
+    }
+}

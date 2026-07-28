@@ -2,6 +2,7 @@ use loom_daemon::activity::{self, ActivityDb, StatsQueries};
 use loom_daemon::claim_reconciliation;
 use loom_daemon::credential_preflight;
 use loom_daemon::daemon_heartbeat;
+use loom_daemon::daemon_install_state::{self, InstallStateReport};
 use loom_daemon::epic_supervisor;
 use loom_daemon::event_bus::EventBus;
 use loom_daemon::health_monitor;
@@ -2201,21 +2202,23 @@ async fn handle_status_command(json: bool, pipeline: bool) -> Result<()> {
     let report = match query_daemon_status(&socket_path).await {
         Ok(report) => report,
         Err(e) => {
+            // Issue #4069 (AC3 of #4011): classify WHY the daemon is
+            // unreachable using the same autonomy-desired marker + heartbeat
+            // `loom-daemon-watchdog.sh` reads, so `status` and the watchdog
+            // log can never disagree. Purely local, read-only, never fails
+            // the command — `install_state` is `None` only when no loom dir
+            // can be resolved at all, in which case we fall back to the
+            // pre-#4069 generic message.
+            let install_state = daemon_install_state::probe();
+            let exit_code = install_state
+                .as_ref()
+                .map_or(daemon_install_state::EXIT_NOT_EXPECTED, |r| r.state.exit_code());
             if json {
-                let err = serde_json::json!({
-                    "error": format!(
-                        "could not reach loom-daemon at {}: {e}",
-                        socket_path.display()
-                    ),
-                });
-                println!("{}", serde_json::to_string_pretty(&err)?);
+                print_status_unreachable_json(&socket_path, &e, install_state.as_ref())?;
             } else {
-                eprintln!("Could not reach loom-daemon at {}: {e}", socket_path.display());
-                eprintln!();
-                eprintln!("Is the daemon running? Start it with:");
-                eprintln!("  ./.loom/scripts/cli/loom-daemon-start.sh");
+                print_status_unreachable_human(&socket_path, &e, install_state.as_ref());
             }
-            std::process::exit(1);
+            std::process::exit(exit_code);
         }
     };
 
@@ -2247,6 +2250,125 @@ async fn handle_status_command(json: bool, pipeline: bool) -> Result<()> {
         print_status_human(&report, token_usage.as_ref(), &update, pipeline_snapshots.as_deref());
     }
     Ok(())
+}
+
+/// Emit the unreachable-daemon `--json` error, state-aware (Issue #4069). The
+/// existing `error` prose key is retained for compatibility; `install_state`
+/// (when the probe could classify at all) adds a machine-readable enum plus
+/// the diagnostic fields a script or human can act on.
+fn print_status_unreachable_json(
+    socket_path: &Path,
+    err: &anyhow::Error,
+    install_state: Option<&InstallStateReport>,
+) -> Result<()> {
+    let mut payload = serde_json::json!({
+        "error": format!("could not reach loom-daemon at {}: {err}", socket_path.display()),
+    });
+    if let Some(r) = install_state {
+        payload["install_state"] = serde_json::json!({
+            "state": r.state.as_str(),
+            "started_at": r.started_at,
+            "pid": r.pid,
+            "liveness_detail": r.liveness_detail,
+            "heartbeat": {
+                "freshness": r.heartbeat_freshness.map(daemon_install_state::HeartbeatFreshness::as_str),
+                "age_secs": r.heartbeat_age_secs,
+                "stale_threshold_secs": r.heartbeat_stale_threshold_secs,
+            },
+            "watchdog_log": r.watchdog_log_path.display().to_string(),
+        });
+    }
+    println!("{}", serde_json::to_string_pretty(&payload)?);
+    Ok(())
+}
+
+/// Emit the unreachable-daemon human-readable error, state-aware (Issue
+/// #4069). Remediation advice differs per state: `NotExpected` /
+/// `ExpectedButDead` suggest a start; `AliveButUnresponsive` does NOT (the
+/// singleton guard would refuse it) and instead points at the live pid.
+fn print_status_unreachable_human(
+    socket_path: &Path,
+    err: &anyhow::Error,
+    install_state: Option<&InstallStateReport>,
+) {
+    eprintln!("Could not reach loom-daemon at {}: {err}", socket_path.display());
+    eprintln!();
+
+    match install_state {
+        None => {
+            // Undiagnosable (no loom dir could be resolved) — the pre-#4069
+            // generic fallback.
+            eprintln!("Is the daemon running? Start it with:");
+            eprintln!("  ./.loom/scripts/cli/loom-daemon-start.sh");
+        }
+        Some(r) => match r.state {
+            daemon_install_state::InstallState::NotExpected => {
+                eprintln!(
+                    "No autonomy-desired marker found — a daemon is not currently expected \
+                     to be running on this host."
+                );
+                eprintln!();
+                eprintln!("Start it with:");
+                eprintln!("  ./.loom/scripts/cli/loom-daemon-start.sh");
+            }
+            daemon_install_state::InstallState::ExpectedButDead => {
+                let started = r.started_at.as_deref().unwrap_or("unknown");
+                eprintln!(
+                    "A daemon is EXPECTED (autonomy-desired marker present, started {started}) \
+                     but is NOT running: {}.",
+                    r.liveness_detail.as_deref().unwrap_or("no liveness detail")
+                );
+                eprintln!(
+                    "Autonomous dispatch has stopped — this is the silent-autonomy-loss \
+                     scenario (#4011)."
+                );
+                eprintln!();
+                eprintln!("Recover with:");
+                eprintln!("  ./.loom/scripts/cli/loom-daemon-start.sh");
+                eprintln!("See {} for prior divergence reports.", r.watchdog_log_path.display());
+            }
+            daemon_install_state::InstallState::AliveButUnresponsive => {
+                let detail = r.liveness_detail.as_deref().unwrap_or("process alive");
+                eprintln!("The daemon process IS alive ({detail}) but is not responding over IPC.");
+                match r.heartbeat_freshness {
+                    Some(daemon_install_state::HeartbeatFreshness::Fresh) => {
+                        eprintln!(
+                            "Heartbeat is fresh ({}s ago) — likely an IPC/socket-layer fault, \
+                             not a wedged daemon.",
+                            r.heartbeat_age_secs.unwrap_or_default()
+                        );
+                    }
+                    Some(daemon_install_state::HeartbeatFreshness::Stale) => {
+                        eprintln!(
+                            "Heartbeat is STALE ({}s ago, > {}s threshold) — the daemon is likely \
+                             wedged.",
+                            r.heartbeat_age_secs.unwrap_or_default(),
+                            r.heartbeat_stale_threshold_secs.unwrap_or_default()
+                        );
+                    }
+                    _ => {
+                        eprintln!(
+                            "Heartbeat status unknown (no heartbeat file, or disabled) — \
+                             liveness-only signal."
+                        );
+                    }
+                }
+                eprintln!();
+                if let Some(pid) = r.pid {
+                    eprintln!("Do NOT run loom-daemon-start.sh — the singleton guard will refuse");
+                    eprintln!(
+                        "while pid {pid} is alive. Inspect it directly, or restart explicitly:"
+                    );
+                } else {
+                    eprintln!("Do NOT run loom-daemon-start.sh — the singleton guard will refuse");
+                    eprintln!(
+                        "while the daemon is alive. Inspect it directly, or restart explicitly:"
+                    );
+                }
+                eprintln!("  ./.loom/scripts/cli/loom-daemon-stop.sh && ./.loom/scripts/cli/loom-daemon-start.sh");
+            }
+        },
+    }
 }
 
 /// The capacity figures the whole status view shares, resolved from a single

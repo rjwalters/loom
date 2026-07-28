@@ -2107,6 +2107,34 @@ tempdir isolates the marker + heartbeat there too — which is how the lifecycle
 tests avoid ever touching the operator's real `~/.loom`. A forge-side reporting
 channel is an explicit follow-up (out of scope for #4011).
 
+**Third consumer: `loom-daemon status` (#4069).** The watchdog's marker +
+heartbeat inputs have a second, on-demand consumer: `status`'s
+unreachable-daemon error path (`main.rs`'s `handle_status_command`, via the
+library module `daemon_install_state.rs`). Before #4069 every transport
+failure collapsed into one generic *"Could not reach loom-daemon… Is the
+daemon running?"* message, regardless of whether autonomy was ever expected.
+`status` now runs the **same read-only, local probe** — same marker, same
+per-field fallbacks, same env-wins-over-marker rule, same heartbeat staleness
+formula — so `status` and `<loom_dir>/logs/daemon-watchdog.log` can never
+disagree, and reports one of three states with a distinct exit code:
+
+| State | Meaning | Exit code | Remediation printed |
+|-------|---------|-----------|----------------------|
+| `not-expected` | marker absent (deliberate stop, or never started) | `1` | suggest `loom-daemon-start.sh` |
+| `expected-but-dead` | marker present, no live process — the #4011 divergence | `3` | suggest `loom-daemon-start.sh`; points at `daemon-watchdog.log` |
+| `alive-but-unresponsive` | marker present, process alive, IPC still failed | `4` | does **not** suggest a start (singleton guard refuses); prints the live pid; heartbeat freshness qualifies fresh ⇒ IPC/socket fault, stale ⇒ likely wedged |
+
+`--json` gains a structured `install_state` object (`state` is the
+machine-readable enum above, plus `started_at`, `pid`, `liveness_detail`, a
+`heartbeat` sub-object, and `watchdog_log`); the pre-#4069 `error` string key
+is retained for compatibility. The probe never fails the command — an
+unreadable/malformed marker, absent `launchctl`, a stale/unowned pid, or an
+unreadable heartbeat mtime all degrade to a less-specific verdict (or, if no
+loom dir can be resolved at all, `install_state` is simply omitted and the
+generic pre-#4069 message is printed). The success path (a reachable, healthy
+daemon) is untouched — this probe only runs after `query_daemon_status` has
+already failed.
+
 ### macOS session-bootstrap hazard (#3972)
 
 **Incident (2026-07-26).** The daemon was started at 21:48 via
