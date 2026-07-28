@@ -2262,7 +2262,26 @@ manually rebuilt the Rust binary, reprovisioned it, and restarted the process.
 ./.loom/scripts/cli/loom-daemon-update.sh --dry-run     # print the plan without building/provisioning/restarting
 ./.loom/scripts/cli/loom-daemon-update.sh --force       # rebuild + provision + restart even if already up to date
 ./.loom/scripts/cli/loom-daemon-update.sh --no-restart  # rebuild + provision only; leave the running daemon untouched
+./.loom/scripts/cli/loom-daemon-update.sh --relaunch    # launchd only: after a refused restart, re-render the plist + relaunch under supervision (preserves the live plist's LOOM_* env)
 ```
+
+**Launchd refused-restart fallback (`--relaunch`, exit 6, #4118)**: on the
+FIRST roll onto a #4077-capable binary the *running* (old) daemon has no
+`RestartDaemon` handler and refuses the `loom-daemon restart` IPC, so the script
+exits **6** rather than reporting a half-update. It does **not** tell you to
+`launchctl bootstrap` the existing plist — that plist is stale by construction
+(no `KeepAlive:{SuccessfulExit:true}`, no `LOOM_DAEMON_SUPERVISOR`), so
+bootstrapping it relaunches *unsupervised* and every subsequent roll refuses
+identically forever, and its `launchctl bootout` tears down the whole job tree
+(in-flight sweep children are direct children of the launchd job, so they are
+killed). Instead, `--relaunch` (or `LOOM_DAEMON_UPDATE_RELAUNCH=1`) re-renders
+the plist via `loom-daemon-start.sh` — installing both supervised keys — while
+**preserving the live plist's `LOOM_*`/token `EnvironmentVariables`** (read with
+`plutil` + `jq`, `PATH`/`HOME`/`LOOM_DAEMON_SUPERVISOR` excluded so autonomy
+flags never silently narrow to FLAGS-OFF, #4011), and stops the old daemon
+**gracefully with `SIGTERM`** so sweep children reparent and keep working. The
+default path stays exit-6 (no `--relaunch`) so the sweep-disrupting relaunch is
+always a consented action.
 
 **Staleness detection** is primary-local, zero-network: it compares the git
 commit **baked into** the currently-resolved `loom-daemon` binary (embedded at

@@ -47,8 +47,16 @@
 # consulted in this mode (the plist's EnvironmentVariables IS the durable flag
 # source), and no "restarting FLAGS-OFF" warning fires. If the running (old)
 # binary predates #4077 and refuses the request, this script REFUSES LOUDLY
-# (exit 6) with the manual bootout/bootstrap fallback rather than reporting a
-# half-update — the exact #4011 silent-autonomy-loss class this closes.
+# (exit 6) and prints how to re-render the plist + relaunch under supervision
+# (loom-daemon-update.sh --relaunch), rather than reporting a half-update — the
+# exact #4011 silent-autonomy-loss class this closes. The old advice to bootstrap
+# the EXISTING plist was itself a bug (#4118): it relaunched under the STALE plist
+# (no KeepAlive:SuccessfulExit, no LOOM_DAEMON_SUPERVISOR), so every subsequent
+# roll hit the same exit 6 forever, and its bootout killed in-flight sweeps
+# (sweep children are direct children of the launchd job). --relaunch re-renders
+# via loom-daemon-start.sh (installing the supervised keys) while preserving the
+# live plist's LOOM_* autonomy env, and SIGTERMs the daemon so sweep children
+# reparent instead of being torn down with the job.
 #
 # Usage:
 #   ./.loom/scripts/cli/loom-daemon-update.sh              Detect, rebuild if stale, provision, restart (preserving flags)
@@ -56,6 +64,7 @@
 #   ./.loom/scripts/cli/loom-daemon-update.sh --dry-run     Print the plan without building/provisioning/restarting
 #   ./.loom/scripts/cli/loom-daemon-update.sh --force       Rebuild + provision + restart even if already up to date
 #   ./.loom/scripts/cli/loom-daemon-update.sh --no-restart  Rebuild + provision only; leave the running daemon untouched
+#   ./.loom/scripts/cli/loom-daemon-update.sh --relaunch    Launchd only: after a refused restart, re-render the plist and relaunch under supervision (SIGTERMs the daemon so sweep children reparent; preserves the live plist's LOOM_* env)
 #   ./.loom/scripts/cli/loom-daemon-update.sh --help
 #
 # Environment:
@@ -73,6 +82,9 @@
 #                          domain and follows the PID-file/nohup restart path.
 #   LOOM_LAUNCHD_LABEL     macOS only: the LaunchAgent label to inspect/restart
 #                          (default com.rjwalters.loom-daemon).
+#   LOOM_DAEMON_UPDATE_RELAUNCH  macOS/launchd only: 1/true/yes is equivalent to
+#                          passing --relaunch (opt in to the re-render + relaunch
+#                          on a refused restart).
 #
 # Exit codes:
 #   0  up to date (no-op) OR rebuild+provision+restart succeeded
@@ -91,7 +103,10 @@
 #      (old) binary refused the `loom-daemon restart` IPC request (a pre-#4077
 #      binary with no RestartDaemon handler, or a dead socket). The fresh binary
 #      IS provisioned but the OLD one is still running; the script refuses to
-#      report success and prints the manual bootout/bootstrap fallback (#4042).
+#      report success. Without --relaunch it prints how to re-render the plist and
+#      relaunch under supervision, then exits 6; with --relaunch (or
+#      LOOM_DAEMON_UPDATE_RELAUNCH=1) it performs that re-render+relaunch itself,
+#      propagating loom-daemon-start.sh's exit code (#4042, #4118).
 #
 # See also: loom-daemon-start.sh (writes .loom/.daemon.flags), loom-daemon-stop.sh
 # (SIGTERM -> grace -> SIGKILL; in-flight sweeps survive by design — this
@@ -195,6 +210,8 @@ DRY_RUN=false
 FORCE=false
 CHECK_ONLY=false
 NO_RESTART=false
+RELAUNCH=false
+[[ "${LOOM_DAEMON_UPDATE_RELAUNCH:-}" =~ ^(1|true|yes)$ ]] && RELAUNCH=true
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --help|-h) show_help; exit 0 ;;
@@ -202,6 +219,7 @@ while [[ $# -gt 0 ]]; do
         --force) FORCE=true; shift ;;
         --check) CHECK_ONLY=true; shift ;;
         --no-restart) NO_RESTART=true; shift ;;
+        --relaunch) RELAUNCH=true; shift ;;
         *) err "Unknown option '$1'"; echo "Use --help for usage" >&2; exit 1 ;;
     esac
 done
@@ -304,6 +322,105 @@ launchd_job_loaded() {
 }
 launchd_job_pid() {
     launchctl print "$LAUNCHD_SERVICE" 2>/dev/null | awk -F'= ' '/^[[:space:]]*pid = /{gsub(/[^0-9]/, "", $2); print $2; exit}'
+}
+
+# ---------- re-render + relaunch on a refused restart (#4118) ----------
+# The exit-6 fallback USED to tell the operator to `launchctl bootstrap` the
+# EXISTING plist. That plist is stale by construction (it is the pre-#4077 file
+# that caused the refused restart) — bootstrapping it relaunches WITHOUT
+# KeepAlive:SuccessfulExit and WITHOUT LOOM_DAEMON_SUPERVISOR, so the next roll
+# refuses identically, forever; and its `launchctl bootout` tears down the whole
+# job tree, killing in-flight sweeps (they are direct children of the launchd
+# job). The correct fix is to RE-RENDER the plist via loom-daemon-start.sh (which
+# hardcodes the two supervised keys), preserving the live plist's autonomy/auth
+# env, and to stop the old daemon gracefully so sweep children reparent.
+
+# harvest_plist_env <plist> — echo the live plist's EnvironmentVariables,
+# restricted to exactly the keys render_launchd_plist itself forwards (LOOM_*,
+# GH_TOKEN, GITEA_TOKEN, FORGE_TOKEN) and EXCLUDING:
+#   - PATH / HOME     (start.sh rebuilds PATH from the live shell; round-tripping
+#                      the plist's already-extended PATH would grow it each roll),
+#   - LOOM_DAEMON_SUPERVISOR (start.sh hardcodes it; re-exporting is pointless).
+# Emits one "<key>\t<base64(value)>" line per key so values containing spaces or
+# newlines survive. Fails loudly (return 2) when the plist is absent or
+# unparseable — it must NEVER silently return an empty set, which would let the
+# re-render narrow the autonomy flags to FLAGS-OFF defaults (the #4011 class).
+harvest_plist_env() {
+    local plist="$1"
+    if [[ ! -f "$plist" ]]; then
+        err "Cannot harvest launchd env: plist not found at $plist"
+        return 2
+    fi
+    if ! command -v plutil >/dev/null 2>&1 || ! command -v jq >/dev/null 2>&1; then
+        err "Cannot harvest launchd env: plutil and jq are both required on the macOS launchd path."
+        return 2
+    fi
+    local json
+    json=$(plutil -convert json -o - "$plist" 2>/dev/null) || {
+        err "Cannot harvest launchd env: plist at $plist is not parseable by plutil."
+        return 2
+    }
+    printf '%s' "$json" | jq -r '
+        .EnvironmentVariables // {}
+        | to_entries[]
+        | select(.key | test("^(LOOM_[A-Za-z0-9_]*|GH_TOKEN|GITEA_TOKEN|FORGE_TOKEN)$"))
+        | select(.key != "LOOM_DAEMON_SUPERVISOR")
+        | .key + "\t" + (.value | @base64)
+    ' 2>/dev/null || {
+        err "Cannot harvest launchd env: failed to extract EnvironmentVariables from $plist."
+        return 2
+    }
+}
+
+# perform_relaunch <plist> <service> — re-render the LaunchAgent and relaunch it
+# under launchd supervision, preserving the live plist's autonomy/auth env.
+# Invoked ONLY from the exit-6 fallback when the operator opted in (--relaunch /
+# LOOM_DAEMON_UPDATE_RELAUNCH=1), so the sweep-disrupting relaunch is a consented
+# action, never silent. Returns loom-daemon-start.sh's exit code (or 6 if the env
+# harvest fails — refusing to relaunch into a silently-narrowed env).
+perform_relaunch() {
+    local plist="$1"
+    echo "--relaunch: re-rendering the LaunchAgent and relaunching under launchd supervision."
+
+    # 1. Preserve the live plist's autonomy/auth env across the re-render.
+    local harvested
+    if ! harvested=$(harvest_plist_env "$plist"); then
+        err "Refusing to relaunch: could not read the live plist's EnvironmentVariables."
+        err "Relaunching now would silently narrow the autonomy flags to FLAGS-OFF defaults (#4011) — aborting."
+        return 6
+    fi
+    local k v64 count=0
+    while IFS=$'\t' read -r k v64; do
+        [[ -z "$k" ]] && continue
+        export "$k=$(printf '%s' "$v64" | base64 --decode)"
+        count=$((count + 1))
+    done <<< "$harvested"
+    echo "Preserved ${count} LOOM_*/token env var(s) from the live plist across the re-render (PATH/HOME/LOOM_DAEMON_SUPERVISOR excluded by design)."
+
+    # 2. Stop the old daemon GRACEFULLY so its sweep children reparent and keep
+    #    working, instead of `launchctl bootout` tearing down the whole job tree.
+    #    kill -TERM makes the daemon exit non-zero, so the stale plist's
+    #    KeepAlive=false does not relaunch it — start.sh below installs the fresh,
+    #    supervised plist and bootstraps the new process.
+    local daemon_pid
+    daemon_pid=$(launchd_job_pid)
+    if [[ -n "$daemon_pid" ]] && kill -0 "$daemon_pid" 2>/dev/null; then
+        echo "Sending SIGTERM to the running daemon (pid ${daemon_pid}) — sweep children reparent and keep working (NOT bootout, which would kill them)."
+        kill -TERM "$daemon_pid" 2>/dev/null || true
+        local _waited
+        for _waited in 1 2 3 4 5; do
+            kill -0 "$daemon_pid" 2>/dev/null || break
+            sleep 1
+        done
+    fi
+
+    # 3. Re-render + bootstrap via loom-daemon-start.sh. It hardcodes
+    #    KeepAlive:{SuccessfulExit:true} + LOOM_DAEMON_SUPERVISOR=launchd, and
+    #    harvests the LOOM_* env we just re-exported. In launchd mode the plist's
+    #    EnvironmentVariables — not .daemon.flags — is the durable config, so no
+    #    flags are passed here.
+    echo "Invoking ${START_SCRIPT} to re-render the supervised plist and relaunch."
+    "$START_SCRIPT"
 }
 
 # Resolve which manager owns the running daemon: launchd (checked first), the
@@ -500,8 +617,10 @@ if [[ "$NO_RESTART" == "true" ]]; then
     if [[ "$WAS_RUNNING" == "true" ]]; then
         if [[ "$DAEMON_MANAGER" == "launchd" ]]; then
             echo "The running (launchd-managed) daemon is still the PRE-update binary. Restart it with:"
-            echo "  $PROVISION_TARGET restart"
-            echo "or manually: launchctl bootout $LAUNCHD_SERVICE && launchctl bootstrap gui/$(id -u) $LAUNCHD_PLIST"
+            echo "  $PROVISION_TARGET restart      (graceful: supervised in-place relaunch, in-flight sweeps preserved)"
+            echo "If that binary predates #4077 and refuses the restart, re-render + relaunch under supervision:"
+            echo "  loom-daemon-update.sh --relaunch   (preserves the live plist's LOOM_* env; SIGTERMs the daemon so sweep children reparent)"
+            echo "Do NOT 'launchctl bootout $LAUNCHD_SERVICE' by hand — bootout tears down the whole job tree and KILLS in-flight sweeps (they are direct children of the launchd job)."
         else
             echo "The running daemon is still the PRE-update binary. Restart manually with:"
             echo "  $STOP_SCRIPT && $START_SCRIPT ${RESTART_ARGS[*]:-}"
@@ -537,9 +656,29 @@ if [[ "$DAEMON_MANAGER" == "launchd" ]]; then
     # still running (the #4011 silent-autonomy-loss class this issue closes).
     err "loom-daemon restart FAILED: the running daemon did not accept the restart request."
     err "This is expected on the FIRST roll onto a #4077-capable binary — the currently-running binary predates the 'restart' IPC command (or its socket is dead)."
-    err "The freshly-built binary IS provisioned, but the OLD binary is still running. Restart it manually to pick up the update:"
-    err "  launchctl bootout   $LAUNCHD_SERVICE"
-    err "  launchctl bootstrap gui/$(id -u) $LAUNCHD_PLIST"
+    err "The freshly-built binary IS provisioned, but the OLD (unsupervised) binary is still running."
+
+    if [[ "$RELAUNCH" == "true" ]]; then
+        perform_relaunch "$LAUNCHD_PLIST"
+        exit $?
+    fi
+
+    daemon_pid_hint=$(launchd_job_pid)
+    err ""
+    err "To finish the roll, re-render the plist and relaunch under launchd supervision"
+    err "(this installs KeepAlive:{SuccessfulExit:true} + LOOM_DAEMON_SUPERVISOR=launchd so"
+    err "the NEXT roll can use the supervised path) while preserving the live plist's LOOM_*"
+    err "autonomy env — run:"
+    err "  loom-daemon-update.sh --relaunch      (or: LOOM_DAEMON_UPDATE_RELAUNCH=1 loom-daemon-update.sh)"
+    err ""
+    err "WARNING: do NOT 'launchctl bootout $LAUNCHD_SERVICE' by hand to force this."
+    err "bootout tears down the whole job tree, and in-flight sweep children are DIRECT"
+    err "children of the launchd job, so it TERMINATES every running sweep — stranding"
+    err "loom:building labels and leaving worktrees behind. --relaunch above instead stops"
+    err "the daemon gracefully (SIGTERM) so sweep children reparent and keep working."
+    err "If you must relaunch by hand, prefer the graceful sequence over bootout+bootstrap:"
+    err "  kill -TERM ${daemon_pid_hint:-<daemon-pid>}   # daemon exits non-zero; children reparent; not relaunched (stale plist KeepAlive=false)"
+    err "  $START_SCRIPT                                  # re-render + bootstrap the supervised plist"
     exit 6
 fi
 

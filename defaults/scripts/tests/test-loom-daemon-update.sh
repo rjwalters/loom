@@ -175,6 +175,57 @@ EOF
     chmod +x "$bin_dir/uname"
 }
 
+# Writes a stale, PRE-#4077 LaunchAgent plist at $1 (the exact state that causes
+# the refused-restart exit-6 fallback): KeepAlive=false, NO LOOM_DAEMON_SUPERVISOR
+# key, and four autonomy env keys plus a SENTINEL PATH. The re-render on the
+# --relaunch path (#4118) must (a) install KeepAlive:{SuccessfulExit:true} +
+# LOOM_DAEMON_SUPERVISOR=launchd, (b) carry all four autonomy keys through
+# unchanged, and (c) NOT round-trip the sentinel PATH (start.sh rebuilds PATH).
+# Args: <plist_path> <label> <bin> <homedir>.
+write_fixture_plist_pre4077() {
+    local plist="$1" label="$2" bin="$3" homedir="$4"
+    mkdir -p "$(dirname "$plist")"
+    cat > "$plist" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>${label}</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>${bin}</string>
+    </array>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/opt/sentinel-oldpath-4118/bin:/usr/bin:/bin</string>
+        <key>HOME</key>
+        <string>${homedir}</string>
+        <key>LOOM_WORK_FINDER</key>
+        <string>1</string>
+        <key>LOOM_MAIN_HEALTH_GATE</key>
+        <string>1</string>
+        <key>LOOM_WORK_FINDER_MAX_CONCURRENT</key>
+        <string>10</string>
+        <key>LOOM_PER_TOKEN_CONCURRENCY</key>
+        <string>5</string>
+    </dict>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <false/>
+    <key>ProcessType</key>
+    <string>Background</string>
+    <key>StandardOutPath</key>
+    <string>${homedir}/daemon.log</string>
+    <key>StandardErrorPath</key>
+    <string>${homedir}/daemon.log</string>
+</dict>
+</plist>
+EOF
+}
+
 # Writes a fake `cargo` that, on `cargo build --release` (cwd = loom-daemon/),
 # copies $NEW_FAKE_BIN_SRC into target/release/loom-daemon instead of
 # compiling. Tests export NEW_FAKE_BIN_SRC before invoking loom-daemon-update.sh.
@@ -800,10 +851,13 @@ else
 fi
 
 # ============================================================
-# 16. Launchd restart REFUSED (#4042): a launchd job is loaded but the running
-#     (old) binary rejects the restart request (pre-#4077 binary / dead socket).
-#     The updater must exit NON-ZERO (6) and print the manual bootout/bootstrap
-#     fallback — never report success while silently skipping the restart.
+# 16. Launchd restart REFUSED (#4042/#4118): a launchd job is loaded but the
+#     running (old) binary rejects the restart request (pre-#4077 binary / dead
+#     socket). Without --relaunch the updater must exit NON-ZERO (6) and print
+#     the CORRECTED fallback: it names the `--relaunch` re-render path (NOT a
+#     bare `launchctl bootstrap` of the stale plist, which was the #4118 bug),
+#     warns that `launchctl bootout` terminates in-flight sweeps (AC4), and
+#     prefers a graceful `kill -TERM`.
 # ============================================================
 W16="$BASE_WORKDIR/w16"
 new_fixture "$W16"
@@ -823,13 +877,26 @@ out16=$( cd "$W16" && PATH="$LD_BIN16:$TEST_PATH" LOOM_DAEMON_LAUNCHD=1 \
     bash "$UPDATE_SCRIPT" 2>&1 )
 rc16=$?
 assert_eq "6" "$rc16" "launchd restart refused -> exit 6 (never a silent half-update)"
+# (a) Names the --relaunch re-render path and does NOT recommend a bare
+#     `launchctl bootstrap` of the stale plist (the #4118 self-perpetuating bug).
 TESTS_RUN=$((TESTS_RUN + 1))
-if echo "$out16" | grep -qi 'launchctl bootout' && echo "$out16" | grep -qi 'launchctl bootstrap'; then
+if echo "$out16" | grep -q -- '--relaunch' && ! echo "$out16" | grep -qi 'launchctl bootstrap'; then
     TESTS_PASSED=$((TESTS_PASSED + 1))
-    echo -e "${GREEN}✓${NC} refused launchd restart prints the manual bootout/bootstrap fallback"
+    echo -e "${GREEN}✓${NC} refused restart names --relaunch, never a bare bootstrap of the stale plist"
 else
     TESTS_FAILED=$((TESTS_FAILED + 1))
-    echo -e "${RED}✗${NC} refused launchd restart prints the manual bootout/bootstrap fallback"
+    echo -e "${RED}✗${NC} refused restart names --relaunch, never a bare bootstrap of the stale plist"
+    echo "  output: $out16"
+fi
+# (b) AC4: warns that bootout terminates in-flight sweeps + prefers kill -TERM.
+TESTS_RUN=$((TESTS_RUN + 1))
+if echo "$out16" | grep -qi 'bootout' && echo "$out16" | grep -qi 'sweep' \
+    && echo "$out16" | grep -q 'kill -TERM'; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} refused restart warns bootout kills in-flight sweeps + prefers kill -TERM (AC4)"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} refused restart warns bootout kills in-flight sweeps + prefers kill -TERM (AC4)"
     echo "  output: $out16"
 fi
 
@@ -947,7 +1014,152 @@ else
 fi
 
 # ============================================================
-# 20. Launchd-sandbox guards (#4078): the whole suite exercises the REAL
+# 21. --relaunch re-renders the plist with the SUPERVISED keys (#4118 AC1):
+#     after a refused restart, `--relaunch` re-renders via loom-daemon-start.sh,
+#     installing KeepAlive:{SuccessfulExit:true} + LOOM_DAEMON_SUPERVISOR=launchd
+#     into the plist — the two keys the stale pre-#4077 fixture plist LACKS, so a
+#     passing assertion proves the re-render actually happened (not a leftover).
+#     HOME is sandboxed so LAUNCHD_PLIST resolves inside the test tree, never the
+#     operator's real ~/Library/LaunchAgents (#4078).
+# ============================================================
+W21="$BASE_WORKDIR/w21"
+new_fixture "$W21"
+INSTALLED21="$W21/installed/loom-daemon"
+mkdir -p "$W21/installed"
+RESTART_MARKER21="$W21/restart-invoked"
+# Running (old) + fresh binaries both REFUSE restart (pre-#4077) -> exit-6 path.
+write_fake_daemon_restart "$INSTALLED21" "deadbee" "$RESTART_MARKER21" 1
+NEW_FAKE21="$W21/new-fake-daemon"
+HEAD21="$(cd "$W21" && git rev-parse --short HEAD)"
+write_fake_daemon_restart "$NEW_FAKE21" "$HEAD21" "$RESTART_MARKER21" 1
+LD_BIN21="$W21/launchd-bin"
+write_fake_launchd_loaded_bin "$LD_BIN21" "$W21/launchctl.log"
+HOME21="$W21/home"
+PLIST21="$HOME21/Library/LaunchAgents/${LOOM_LAUNCHD_LABEL}.plist"
+write_fixture_plist_pre4077 "$PLIST21" "$LOOM_LAUNCHD_LABEL" "$INSTALLED21" "$HOME21"
+( cd "$W21" && PATH="$LD_BIN21:$TEST_PATH" HOME="$HOME21" LOOM_DAEMON_LAUNCHD=1 \
+    LOOM_DAEMON_BIN="$INSTALLED21" NEW_FAKE_BIN_SRC="$NEW_FAKE21" \
+    bash "$UPDATE_SCRIPT" --relaunch >/dev/null 2>&1 )
+TESTS_RUN=$((TESTS_RUN + 1))
+if grep -q 'LOOM_DAEMON_SUPERVISOR' "$PLIST21" 2>/dev/null \
+    && grep -q 'SuccessfulExit' "$PLIST21" 2>/dev/null; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} --relaunch re-renders the plist with KeepAlive:SuccessfulExit + LOOM_DAEMON_SUPERVISOR (AC1)"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} --relaunch re-renders the plist with KeepAlive:SuccessfulExit + LOOM_DAEMON_SUPERVISOR (AC1)"
+    echo "  plist: $(cat "$PLIST21" 2>/dev/null)"
+fi
+
+# ============================================================
+# 22. --relaunch PRESERVES the live plist's autonomy env across the re-render
+#     (#4118 AC3): the four autonomy keys carry through byte-for-byte, and the
+#     stale PATH is NOT round-tripped (start.sh rebuilds PATH; harvesting it would
+#     grow the string every roll — Curator trap #1).
+# ============================================================
+W22="$BASE_WORKDIR/w22"
+new_fixture "$W22"
+INSTALLED22="$W22/installed/loom-daemon"
+mkdir -p "$W22/installed"
+RESTART_MARKER22="$W22/restart-invoked"
+write_fake_daemon_restart "$INSTALLED22" "deadbee" "$RESTART_MARKER22" 1
+NEW_FAKE22="$W22/new-fake-daemon"
+HEAD22="$(cd "$W22" && git rev-parse --short HEAD)"
+write_fake_daemon_restart "$NEW_FAKE22" "$HEAD22" "$RESTART_MARKER22" 1
+LD_BIN22="$W22/launchd-bin"
+write_fake_launchd_loaded_bin "$LD_BIN22" "$W22/launchctl.log"
+HOME22="$W22/home"
+PLIST22="$HOME22/Library/LaunchAgents/${LOOM_LAUNCHD_LABEL}.plist"
+write_fixture_plist_pre4077 "$PLIST22" "$LOOM_LAUNCHD_LABEL" "$INSTALLED22" "$HOME22"
+( cd "$W22" && PATH="$LD_BIN22:$TEST_PATH" HOME="$HOME22" LOOM_DAEMON_LAUNCHD=1 \
+    LOOM_DAEMON_BIN="$INSTALLED22" NEW_FAKE_BIN_SRC="$NEW_FAKE22" \
+    bash "$UPDATE_SCRIPT" --relaunch >/dev/null 2>&1 )
+wf22=$(plutil -extract EnvironmentVariables.LOOM_WORK_FINDER raw -o - "$PLIST22" 2>/dev/null)
+hg22=$(plutil -extract EnvironmentVariables.LOOM_MAIN_HEALTH_GATE raw -o - "$PLIST22" 2>/dev/null)
+mc22=$(plutil -extract EnvironmentVariables.LOOM_WORK_FINDER_MAX_CONCURRENT raw -o - "$PLIST22" 2>/dev/null)
+pt22=$(plutil -extract EnvironmentVariables.LOOM_PER_TOKEN_CONCURRENCY raw -o - "$PLIST22" 2>/dev/null)
+TESTS_RUN=$((TESTS_RUN + 1))
+if [[ "$wf22" == "1" && "$hg22" == "1" && "$mc22" == "10" && "$pt22" == "5" ]] \
+    && ! grep -q 'sentinel-oldpath-4118' "$PLIST22" 2>/dev/null; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} --relaunch preserves all 4 autonomy env keys and does NOT round-trip the stale PATH (AC3)"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} --relaunch preserves all 4 autonomy env keys and does NOT round-trip the stale PATH (AC3)"
+    echo "  WF=[$wf22] HG=[$hg22] MAXC=[$mc22] PERTOK=[$pt22]"
+    echo "  plist: $(cat "$PLIST22" 2>/dev/null)"
+fi
+
+# ============================================================
+# 23. --no-restart on a launchd host does NOT print a bare `launchctl bootstrap`
+#     of the stale plist (the second #4118 stale-advice site): it names the
+#     --relaunch re-render path and warns that bootout kills in-flight sweeps.
+# ============================================================
+W23="$BASE_WORKDIR/w23"
+new_fixture "$W23"
+INSTALLED23="$W23/installed/loom-daemon"
+mkdir -p "$W23/installed"
+RESTART_MARKER23="$W23/restart-invoked"
+write_fake_daemon_restart "$INSTALLED23" "deadbee" "$RESTART_MARKER23" 0
+NEW_FAKE23="$W23/new-fake-daemon"
+HEAD23="$(cd "$W23" && git rev-parse --short HEAD)"
+write_fake_daemon_restart "$NEW_FAKE23" "$HEAD23" "$RESTART_MARKER23" 0
+LD_BIN23="$W23/launchd-bin"
+write_fake_launchd_loaded_bin "$LD_BIN23" "$W23/launchctl.log"
+out23=$( cd "$W23" && PATH="$LD_BIN23:$TEST_PATH" LOOM_DAEMON_LAUNCHD=1 \
+    LOOM_DAEMON_BIN="$INSTALLED23" NEW_FAKE_BIN_SRC="$NEW_FAKE23" \
+    bash "$UPDATE_SCRIPT" --no-restart 2>&1 )
+rc23=$?
+assert_eq "0" "$rc23" "--no-restart on a launchd host exits 0"
+TESTS_RUN=$((TESTS_RUN + 1))
+if echo "$out23" | grep -q -- '--relaunch' \
+    && ! echo "$out23" | grep -qi 'launchctl bootstrap' \
+    && echo "$out23" | grep -qi 'bootout' && echo "$out23" | grep -qi 'sweep'; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} --no-restart names --relaunch, no bare bootstrap, warns bootout kills sweeps"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} --no-restart names --relaunch, no bare bootstrap, warns bootout kills sweeps"
+    echo "  output: $out23"
+fi
+
+# ============================================================
+# 24. --relaunch with the live plist ABSENT fails loudly (names the missing path)
+#     and refuses to relaunch — it must NEVER silently render FLAGS-OFF defaults
+#     (the #4011 class this whole line of work closes). No plist is written.
+# ============================================================
+W24="$BASE_WORKDIR/w24"
+new_fixture "$W24"
+INSTALLED24="$W24/installed/loom-daemon"
+mkdir -p "$W24/installed"
+RESTART_MARKER24="$W24/restart-invoked"
+write_fake_daemon_restart "$INSTALLED24" "deadbee" "$RESTART_MARKER24" 1
+NEW_FAKE24="$W24/new-fake-daemon"
+HEAD24="$(cd "$W24" && git rev-parse --short HEAD)"
+write_fake_daemon_restart "$NEW_FAKE24" "$HEAD24" "$RESTART_MARKER24" 1
+LD_BIN24="$W24/launchd-bin"
+write_fake_launchd_loaded_bin "$LD_BIN24" "$W24/launchctl.log"
+HOME24="$W24/home"
+mkdir -p "$HOME24/Library/LaunchAgents"   # dir exists, plist deliberately absent
+PLIST24="$HOME24/Library/LaunchAgents/${LOOM_LAUNCHD_LABEL}.plist"
+out24=$( cd "$W24" && PATH="$LD_BIN24:$TEST_PATH" HOME="$HOME24" LOOM_DAEMON_LAUNCHD=1 \
+    LOOM_DAEMON_BIN="$INSTALLED24" NEW_FAKE_BIN_SRC="$NEW_FAKE24" \
+    bash "$UPDATE_SCRIPT" --relaunch 2>&1 )
+rc24=$?
+TESTS_RUN=$((TESTS_RUN + 1))
+if [[ "$rc24" -ne 0 ]] && echo "$out24" | grep -qi 'not found' \
+    && echo "$out24" | grep -qF "$PLIST24" && [[ ! -e "$PLIST24" ]]; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} --relaunch with an absent plist fails loudly (names the path) and renders nothing"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} --relaunch with an absent plist fails loudly (names the path) and renders nothing"
+    echo "  rc=$rc24 plist-exists=$([[ -e "$PLIST24" ]] && echo yes || echo no)"
+    echo "  output: $out24"
+fi
+
+# ============================================================
+# 25. Launchd-sandbox guards (#4078): the whole suite exercises the REAL
 #     start/stop scripts, so prove it never reached the operator's live daemon.
 #     (a) The suite-level decoy loom-daemon is still alive — no by-name kill
 #         fired anywhere in the suite.
