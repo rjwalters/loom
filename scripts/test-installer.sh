@@ -2052,6 +2052,42 @@ else
     else
       fail "AC1 (#3468): .claude/commands/loom/bump.md missing from consumer install"
     fi
+
+    # #4050: a direct `loom-daemon init` (no LOOM_VERSION/LOOM_COMMIT exported —
+    # this test does NOT set them, unlike install.sh's prepare_loom_metadata_env)
+    # must still write .loom/install-metadata.json with a real version, and must
+    # substitute a real version into .loom/CLAUDE.md rather than "unknown".
+    META_52="$INTERNAL_REPO/.loom/install-metadata.json"
+    if [[ -f "$META_52" ]] && jq empty "$META_52" >/dev/null 2>&1; then
+      meta_version="$(jq -r '.loom_version // ""' "$META_52")"
+      meta_commit="$(jq -r '.loom_commit // ""' "$META_52")"
+      if [[ -n "$meta_version" && "$meta_version" != "unknown" ]]; then
+        pass "#4050: daemon-direct init wrote install-metadata.json with loom_version=$meta_version"
+      else
+        fail "#4050: install-metadata.json loom_version is empty/unknown ('$meta_version')"
+      fi
+      if [[ -n "$meta_commit" ]]; then
+        pass "#4050: install-metadata.json carries a non-empty loom_commit"
+      else
+        fail "#4050: install-metadata.json loom_commit is empty"
+      fi
+    else
+      fail "#4050: daemon-direct init did not write a parseable .loom/install-metadata.json"
+    fi
+
+    CLAUDE_52="$INTERNAL_REPO/.loom/CLAUDE.md"
+    if [[ -f "$CLAUDE_52" ]]; then
+      # Only the five Loom template placeholders must be substituted; unrelated
+      # `{{...}}` in example content (e.g. `{{workspace}}`) is intentional, so
+      # match the exact placeholder set (mirrors Rust TEMPLATE_PLACEHOLDERS).
+      if grep -Eq '\{\{(LOOM_VERSION|LOOM_COMMIT|INSTALL_DATE|REPO_OWNER|REPO_NAME)\}\}' "$CLAUDE_52"; then
+        fail "#4050: .loom/CLAUDE.md still contains an unsubstituted Loom template placeholder"
+      elif grep -q '\*\*Loom Version\*\*: unknown' "$CLAUDE_52"; then
+        fail "#4050: .loom/CLAUDE.md renders 'Loom Version: unknown' on daemon-direct init"
+      else
+        pass "#4050: .loom/CLAUDE.md has a substituted version and no leftover placeholder"
+      fi
+    fi
   else
     fail "loom-daemon init failed against fresh consumer repo $INTERNAL_REPO"
   fi

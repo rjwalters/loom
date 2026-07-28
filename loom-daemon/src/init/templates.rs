@@ -16,12 +16,42 @@ pub struct LoomMetadata {
 }
 
 impl LoomMetadata {
-    /// Create metadata by reading from environment variables
+    /// Create metadata by reading from environment variables, falling back to
+    /// the values compiled into this binary.
+    ///
+    /// The shell installers (`install.sh`, `scripts/install-loom.sh`) export
+    /// `LOOM_VERSION`/`LOOM_COMMIT` describing the source tree being installed
+    /// *from*, so a non-empty env value always wins — the machine-level
+    /// `~/.local/bin/loom-daemon` binary (#3922) can be older than that source
+    /// tree. When the env vars are unset or empty (the direct `loom-daemon
+    /// init` path, which no wrapper sets them on), fall back to the binary's
+    /// own compiled-in version/commit rather than the literal `"unknown"` that
+    /// previously leaked into `.loom/CLAUDE.md` and `install-metadata.json`
+    /// (#4050).
     pub fn from_env() -> Self {
         Self {
-            version: std::env::var("LOOM_VERSION").ok(),
-            commit: std::env::var("LOOM_COMMIT").ok(),
+            version: env_or_compiled("LOOM_VERSION", env!("CARGO_PKG_VERSION")),
+            commit: env_or_compiled("LOOM_COMMIT", crate::self_update::BUILT_COMMIT),
             install_date: Local::now().format("%Y-%m-%d").to_string(),
+        }
+    }
+}
+
+/// Resolve a template value from `$var`, falling back to a compiled-in constant.
+///
+/// A non-empty env value wins (the installer's source-tree description). An
+/// unset or empty env var falls back to `compiled`, and if that itself is empty
+/// or the literal `"unknown"` (e.g. a tarball build with no `.git`) the result
+/// is `None` so the caller's own `"unknown"` fallback applies.
+fn env_or_compiled(var: &str, compiled: &str) -> Option<String> {
+    match std::env::var(var) {
+        Ok(v) if !v.is_empty() => Some(v),
+        _ => {
+            if compiled.is_empty() || compiled == "unknown" {
+                None
+            } else {
+                Some(compiled.to_string())
+            }
         }
     }
 }
@@ -171,7 +201,9 @@ mod tests {
 
     #[test]
     fn test_loom_metadata_from_env() {
-        // Test with environment variables set
+        // Test with environment variables set — a non-empty env value wins over
+        // the compiled-in constant (the installer's source-tree description,
+        // which may be newer than this binary; see #4050).
         std::env::set_var("LOOM_VERSION", "0.5.0");
         std::env::set_var("LOOM_COMMIT", "def5678");
 
@@ -183,8 +215,54 @@ mod tests {
         assert!(metadata.install_date.len() == 10);
         assert!(metadata.install_date.contains('-'));
 
-        // Clean up
+        // With the env vars unset, from_env() falls back to the binary's own
+        // compiled-in version (never the literal "unknown"). This is the
+        // direct `loom-daemon init` path the #4050 fix repairs. Done in the
+        // SAME test as the env-set case so the two never race under parallel
+        // test execution (the templates.rs env-mutation caveat).
         std::env::remove_var("LOOM_VERSION");
         std::env::remove_var("LOOM_COMMIT");
+
+        let fallback = LoomMetadata::from_env();
+        assert_eq!(
+            fallback.version.as_deref(),
+            Some(env!("CARGO_PKG_VERSION")),
+            "unset LOOM_VERSION must fall back to the compiled crate version"
+        );
+        assert_ne!(fallback.version.as_deref(), Some("unknown"));
+        // Commit is present unless this binary was built without git metadata
+        // (a tarball build ⇒ BUILT_COMMIT == "unknown" ⇒ None here).
+        if crate::self_update::BUILT_COMMIT != "unknown" {
+            assert_eq!(fallback.commit.as_deref(), Some(crate::self_update::BUILT_COMMIT));
+        }
+    }
+
+    #[test]
+    fn test_env_or_compiled_prefers_nonempty_env() {
+        // Use a unique var name so this never races with LOOM_VERSION/COMMIT.
+        let var = "LOOM_TEST_ENV_OR_COMPILED_A";
+        std::env::set_var(var, "from-env");
+        assert_eq!(env_or_compiled(var, "compiled"), Some("from-env".to_string()));
+        std::env::remove_var(var);
+    }
+
+    #[test]
+    fn test_env_or_compiled_empty_env_falls_back() {
+        let var = "LOOM_TEST_ENV_OR_COMPILED_B";
+        // An empty env value must NOT win — it falls through to the compiled value.
+        std::env::set_var(var, "");
+        assert_eq!(env_or_compiled(var, "compiled"), Some("compiled".to_string()));
+        std::env::remove_var(var);
+    }
+
+    #[test]
+    fn test_env_or_compiled_unset_uses_compiled() {
+        let var = "LOOM_TEST_ENV_OR_COMPILED_UNSET";
+        std::env::remove_var(var);
+        assert_eq!(env_or_compiled(var, "0.15.0"), Some("0.15.0".to_string()));
+        // A compiled value of "unknown" or "" degrades to None so the caller's
+        // own "unknown" placeholder applies rather than double-substituting.
+        assert_eq!(env_or_compiled(var, "unknown"), None);
+        assert_eq!(env_or_compiled(var, ""), None);
     }
 }
