@@ -113,9 +113,13 @@ REPO_LABEL="$(basename "${REPO_ROOT:-$SOURCE_CWD}")"
 CFG_ENABLED=false
 CFG_DIR=""
 if [[ -n "${REPO_ROOT:-}" ]] && command -v jq >/dev/null 2>&1; then
+  # Resolve the merged effective config ONCE (config-resolver, #4062) — then
+  # extract both keys from that single resolved JSON via jq, rather than two
+  # loom_config_get calls that would each re-merge all four config tiers.
   # Best-effort: a malformed tier soft-fails to {} -> disabled default preserved.
-  CFG_ENABLED="$(loom_config_get "$REPO_ROOT" "loom.transcriptArchive.enabled" "false")"
-  CFG_DIR="$(loom_config_get "$REPO_ROOT" "loom.transcriptArchive.dir" "")"
+  _archive_cfg="$(loom_resolve_config "$REPO_ROOT")"
+  CFG_ENABLED="$(echo "$_archive_cfg" | jq -r '.loom.transcriptArchive.enabled // false' 2>/dev/null || echo false)"
+  CFG_DIR="$(echo "$_archive_cfg" | jq -r '.loom.transcriptArchive.dir // ""' 2>/dev/null || echo "")"
 fi
 
 ENABLED=false
