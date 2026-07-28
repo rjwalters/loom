@@ -171,6 +171,16 @@ else
     echo -e "${RED}✗${NC} --help documents --no-launchd and --print-plist"
 fi
 
+# 9. Domain resolution (#4130) does not leak into the DEFAULT rendered plist:
+#    the launchd domain (gui/<uid> vs user/<uid>) is a LOAD-time concern, not a
+#    plist field. render_launchd_plist is untouched by #4130, so a plain
+#    --print-plist (no LOOM_LAUNCHD_DOMAIN pin) carries neither a gui/<uid> nor a
+#    user/<uid> domain token — the GUI-path plist is byte-for-byte what it was.
+default_plist=$( cd "$WORKDIR" && env -u LOOM_LAUNCHD_DOMAIN -u LOOM_WORK_FINDER -u LOOM_MAIN_HEALTH_GATE \
+    LOOM_DAEMON_BIN="$FAKE_BIN" bash "$START_SCRIPT" --print-plist 2>/dev/null )
+assert_not_contains "$default_plist" "gui/$(id -u)" "default plist carries no gui/<uid> domain token (#4130 — domain is load-time, GUI path unchanged)"
+assert_not_contains "$default_plist" "user/$(id -u)" "default plist carries no user/<uid> domain token (#4130 — domain is load-time)"
+
 # ---------- summary ----------
 echo
 echo "Ran $TESTS_RUN tests: $TESTS_PASSED passed, $TESTS_FAILED failed"

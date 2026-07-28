@@ -97,10 +97,15 @@ LOOM_REPO_ROOT="$(cd "$SCRIPT_DIR/../../.." && pwd)"
 # installed on the dev machine can never leak into a test).
 new_fixture() {
     local root="$1"
-    mkdir -p "$root/.loom/logs" "$root/.loom/scripts/cli" "$root/loom-daemon" "$root/scripts/install"
+    mkdir -p "$root/.loom/logs" "$root/.loom/scripts/cli" "$root/.loom/scripts/lib" "$root/loom-daemon" "$root/scripts/install"
     cp "$CLI_DIR/loom-daemon-start.sh" "$root/.loom/scripts/cli/loom-daemon-start.sh"
     cp "$CLI_DIR/loom-daemon-stop.sh" "$root/.loom/scripts/cli/loom-daemon-stop.sh"
     chmod +x "$root/.loom/scripts/cli/"*.sh
+    # The fixture start/stop scripts source ../lib/launchd-domain.sh for the
+    # shared gui/<uid> ↦ user/<uid> resolver (#4130), so it must exist alongside
+    # them in the throwaway tree — else a launchd-mode restart path would find no
+    # resolve_launchd_domain. Mirrors the real defaults/scripts/lib layout.
+    cp "$CLI_DIR/../lib/launchd-domain.sh" "$root/.loom/scripts/lib/launchd-domain.sh"
     cp "$LOOM_REPO_ROOT/scripts/install/provision-daemon.sh" "$root/scripts/install/provision-daemon.sh"
     cat > "$root/loom-daemon/Cargo.toml" <<'EOF'
 [package]

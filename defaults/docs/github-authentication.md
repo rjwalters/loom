@@ -142,14 +142,22 @@ file to mode `0600` whenever it carries a `GH_TOKEN`/`GITEA_TOKEN`/
 `FORGE_TOKEN`, so a local user other than the daemon's owner cannot read the
 PAT out of `~/Library/LaunchAgents`.
 
-**Out of scope**: `launchctl bootstrap gui/$UID` (the launchd domain
-`loom-daemon-start.sh` uses on macOS) fails over SSH — `gui/$UID` is a
-per-GUI-session domain that does not exist in an SSH session — so a daemon
-that isn't already running cannot be *started* remotely on macOS today even
-with a valid token exported. That is a supervision-model gap (a `LaunchDaemon`
-or `launchctl asuser` mechanism), not a credential problem; restarting an
-*already-running* daemon (`loom-daemon-update.sh`) and running fully headless
-on Linux (`--no-launchd` / nohup path) both work with an exported token today.
+**Starting the daemon headlessly over SSH (#4130 — resolved).** Earlier this
+section noted that `launchctl bootstrap gui/$UID` (the domain
+`loom-daemon-start.sh` originally hardcoded on macOS) fails over SSH with
+`error 125: Domain does not support specified action`, because `gui/$UID` is a
+per-GUI-login domain that does not exist in an SSH session — so a not-yet-running
+daemon could not be *started* remotely on macOS. That gap is now closed: the
+shared resolver `resolve_launchd_domain()` prefers `gui/<uid>` when a GUI login
+is active and otherwise falls back to the background per-user `user/<uid>` domain
+that `sshd` instantiates (running as the user, not root). So a headless / SSH-only
+`loom-daemon-start.sh` now completes, and stop/update find the resulting job. Pin
+the domain with `LOOM_LAUNCHD_DOMAIN` if needed; the rejected alternatives
+(a root system `LaunchDaemon`, `launchctl asuser`) and the login-keychain / TCC
+consequences of the non-Aqua domain are covered in
+[`daemon-reference.md` → "launchd domain resolution (#4130)"](daemon-reference.md).
+As before, export a `GH_TOKEN` for forge auth in a headless session (the login
+keychain may be locked) — the #4005 credential preflight reports this loudly.
 
 ## Troubleshooting
 

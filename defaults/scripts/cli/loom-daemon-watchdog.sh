@@ -62,6 +62,8 @@
 #                                  max(5 × heartbeat cadence, 300))
 #   LOOM_SOCKET_PATH              Override the daemon socket (its dir is the loom dir)
 #   LOOM_LAUNCHD_LABEL            macOS: the DAEMON label to probe (default com.rjwalters.loom-daemon)
+#   LOOM_LAUNCHD_DOMAIN          macOS: pin the launchd domain (gui/<uid> or user/<uid>);
+#                                else auto-resolved gui→user (#4130), matching the start
 #   LOOM_DAEMON_LAUNCHD          0/false/no: treat as a non-launchd (nohup) daemon; check the pid file only
 
 set -uo pipefail
@@ -76,6 +78,14 @@ fi
 show_help() {
     awk 'NR>=2 { if ($0 !~ /^#/) exit; sub(/^# ?/, ""); print }' "$0"
 }
+
+# Shared domain resolver (#4130): gui/<uid> ↦ user/<uid>, sourced verbatim so the
+# watchdog probes the daemon in the same domain the start put it in.
+_LOOM_LAUNCHD_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../lib" 2>/dev/null && pwd)"
+if [[ -r "$_LOOM_LAUNCHD_LIB_DIR/launchd-domain.sh" ]]; then
+    # shellcheck source=../lib/launchd-domain.sh
+    source "$_LOOM_LAUNCHD_LIB_DIR/launchd-domain.sh"
+fi
 
 VERBOSE=false
 while [[ $# -gt 0 ]]; do
@@ -149,7 +159,10 @@ LABEL="${LOOM_LAUNCHD_LABEL:-${MARKER_LABEL:-com.rjwalters.loom-daemon}}"
 daemon_alive=false
 liveness_detail=""
 if [[ "$USE_LAUNCHD" == "true" ]] && command -v launchctl >/dev/null 2>&1; then
-    service="gui/$(id -u)/${LABEL}"
+    # Resolve the domain (gui/<uid> ↦ user/<uid>, #4130) the same way the start
+    # did, so a headless daemon in user/<uid> is probed correctly rather than
+    # always looked up under gui/<uid> (which would false-report divergence).
+    service="$(resolve_launchd_domain)/${LABEL}"
     launchd_pid="$(launchctl print "$service" 2>/dev/null | awk -F'= ' '/^[[:space:]]*pid = /{gsub(/[^0-9]/, "", $2); print $2; exit}')"
     if [[ -n "$launchd_pid" ]] && kill -0 "$launchd_pid" 2>/dev/null; then
         daemon_alive=true

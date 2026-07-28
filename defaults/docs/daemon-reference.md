@@ -2010,9 +2010,11 @@ process:
   default),
 - locates the `loom-daemon` binary (`LOOM_DAEMON_BIN` → `PATH` → `target/{release,debug}`),
 - runs the **advisory** host-sleep check (`check-host-sleep.sh`, #3350) — never blocks the start,
-- **on macOS, backgrounds the daemon as a `gui/<uid>` LaunchAgent** instead of a
-  plain `nohup … &` (#3972 — see "macOS session-bootstrap hazard" below); on
-  Linux it stays a plain nohup background job,
+- **on macOS, backgrounds the daemon as a launchd LaunchAgent** in the resolved
+  per-user domain (`gui/<uid>` with an active GUI login, else the SSH-reachable
+  `user/<uid>` background domain — #4130) instead of a plain `nohup … &` (#3972 —
+  see "macOS session-bootstrap hazard" below); on Linux it stays a plain nohup
+  background job,
 - backgrounds the daemon and writes a PID file at `.loom/.daemon.pid` (gitignored),
 - refuses a second start when the PID file points at a live process, and surfaces
   the daemon's own **singleton-guard** refusal (#3806) — if the backgrounded
@@ -2198,17 +2200,57 @@ Linux does not have this failure mode — a systemd user session (or a plain
 identity to the shell that spawned it.
 
 **Fix.** `loom-daemon-start.sh` now generates a `launchd` LaunchAgent plist and
-loads it with `launchctl bootstrap gui/<uid>` instead of `nohup`-backgrounding
-in-process (Darwin only — Linux is unaffected and keeps the plain nohup path).
-This was validated during the incident itself: relaunching the identical
-binary as a launchd agent immediately restored `gh`/`git` — the first tick
-after migration reported `13 seen, 3 dispatched, 0 error(s)`.
+loads it with `launchctl bootstrap <domain>` (the resolved per-user domain — see
+"launchd domain resolution" below) instead of `nohup`-backgrounding in-process
+(Darwin only — Linux is unaffected and keeps the plain nohup path). This was
+validated during the incident itself: relaunching the identical binary as a
+launchd agent immediately restored `gh`/`git` — the first tick after migration
+reported `13 seen, 3 dispatched, 0 error(s)`.
+
+**launchd domain resolution (#4130) — gui/<uid> ↦ user/<uid>.** The daemon was
+originally loaded into the hardcoded `gui/<uid>` domain — the per-GUI-login
+(Aqua) domain owned by `loginwindow`. Over SSH with **no active GUI login
+session** that domain does not exist, so `launchctl bootstrap gui/<uid> …` fails
+with `error 125: Domain does not support specified action`, and the daemon could
+not be (re)started remotely on a headless Mac. The shared resolver
+`resolve_launchd_domain()` (`defaults/scripts/lib/launchd-domain.sh`, consumed by
+`loom-daemon-start.sh` / `-stop.sh` / `-update.sh` / `-watchdog.sh` so the whole
+lifecycle agrees on one domain) resolves in this order:
+
+1. an explicit `LOOM_LAUNCHD_DOMAIN` override, honored **verbatim** (a pinned
+   domain that does not resolve fails loudly at `bootstrap`, never falls back
+   further — the override is honored, not advisory);
+2. `gui/<uid>` when `launchctl print gui/<uid>` resolves (a live GUI login) —
+   **byte-for-byte the pre-#4130 default** on a host with an Aqua session;
+3. `user/<uid>` — the **background per-user** domain that `sshd` itself
+   instantiates: present over SSH with no GUI, running as the *user* (not root),
+   and `gui/<uid>` already forwards to it (`endpoint destination =
+   …domain.user.<uid>`).
+
+**Rejected alternatives** (documented, deliberately not implemented):
+
+| Mechanism | Runs as | Needs GUI session? | Needs sudo? | Why rejected |
+|---|---|---|---|---|
+| `gui/<uid>` (pre-#4130 default) | user | **yes** | no | Fails over SSH — the defect this fixes. Kept as the preferred domain **when it resolves**. |
+| **`user/<uid>` (chosen fallback)** | user | no | no (own uid) | Background session ⇒ TCC prompts can't be answered interactively (see #3980) and the login keychain may be locked (see #4005). Smallest change, closest privilege match. |
+| `launchctl asuser <uid>` | user | effectively yes (targets a session) | yes | Still needs a target session to impersonate. |
+| system `LaunchDaemon` | **root** by default | no | yes | Wrong privilege model and **no login-keychain session** — re-opens the #4005 headless-credential problem in a new place instead of closing one. |
+
+**Consequences of a non-Aqua (`user/<uid>`) domain.** A background domain cannot
+surface an interactive TCC prompt, so any touch of a protected folder by the
+daemon or a sweep child fails silently rather than prompting — see
+`### macOS TCC hygiene under launchd (#3980)` below (the daemon's legitimate
+working set never needs a protected folder, so this is a diagnostic signal, not a
+blocker). The operator's **login keychain** may also be locked in a headless
+session, so export a `GH_TOKEN` for forge auth rather than relying on the keychain
+(the #4005 credential preflight reports this loudly). Both are inherent to running
+without an Aqua session, not regressions introduced here.
 
 - **Plist location & label**: `~/Library/LaunchAgents/com.rjwalters.loom-daemon.plist`
-  (override the label with `LOOM_LAUNCHD_LABEL`). Regenerated and reloaded
-  (`bootout` the old definition, then a fresh `bootstrap` + `kickstart -k`) on
-  **every** start, so a later invocation's flags/env always win over a stale
-  loaded definition.
+  (override the label with `LOOM_LAUNCHD_LABEL`; override the domain with
+  `LOOM_LAUNCHD_DOMAIN`). Regenerated and reloaded (`bootout` the old definition,
+  then a fresh `bootstrap` + `kickstart -k`) on **every** start, so a later
+  invocation's flags/env always win over a stale loaded definition.
 - **Environment forwarding**: the plist's `PATH` is the current `PATH` plus a
   fallback set (`~/.local/bin`, `~/.cargo/bin`, Homebrew, standard bin dirs) so
   `gh`, `git`, `cargo`, and `python3` resolve even inside launchd's minimal
@@ -2247,8 +2289,12 @@ after migration reported `13 seen, 3 dispatched, 0 error(s)`.
   during the stop window. See [Supervised restart primitive](#supervised-restart-primitive-4054)
   below and `docs/design/supervised-restart-primitive.md`.
 - **Escape hatch**: `--no-launchd` (or `LOOM_DAEMON_LAUNCHD=0`) forces the
-  legacy nohup path even on Darwin — e.g. for a sandboxed/headless macOS runner
-  with no GUI login session where `gui/<uid>` may not resolve.
+  legacy nohup path even on Darwin — e.g. for a sandboxed macOS runner where no
+  launchd domain is usable at all. Note that a headless/SSH-only session **no
+  longer requires** this escape hatch just to start: `resolve_launchd_domain()`
+  falls back to `user/<uid>` (above), so the durable launchd path (and its #3972
+  Mach-bootstrap-namespace protection) is available over SSH too — nohup remains
+  only the last-resort opt-out, not the headless default.
 - **Inspection without side effects**: `--print-plist` renders the exact plist
   XML this invocation would install and exits — no `launchctl` call, no file
   write to `~/Library/LaunchAgents`. Useful for auditing exactly what
@@ -2267,8 +2313,9 @@ after migration reported `13 seen, 3 dispatched, 0 error(s)`.
 **Why launchd changed the TCC picture.** Under the pre-#3972 nohup model, the
 daemon inherited whatever TCC (Transparency, Consent, and Control) grants the
 launching terminal app already had — so folder-access prompts, if any, belonged
-to Terminal.app/iTerm/Claude Code, not to `loom-daemon`. As a `gui/<uid>`
-LaunchAgent (see above), the daemon is its **own** TCC-responsible process:
+to Terminal.app/iTerm/Claude Code, not to `loom-daemon`. As a launchd LaunchAgent
+(see above — `gui/<uid>` under a GUI login, else `user/<uid>` over SSH, #4130),
+the daemon is its **own** TCC-responsible process:
 any touch of a protected location (`~/Desktop`, `~/Documents`, `~/Downloads`,
 `~/Pictures` (Photos), `~/Music` (Media & Apple Music),
 `~/Library/Mobile Documents` (iCloud Drive), network/removable volumes, …) by
@@ -2278,6 +2325,16 @@ including Photos / Media & Apple Music / iCloud — evidence of something
 enumerating the top level of `$HOME` itself rather than touching those folders
 individually (macOS bundles the per-category checks into one burst when a
 process lists `$HOME`'s immediate contents).
+
+**Under the `user/<uid>` (headless/SSH) domain (#4130) there is no prompt at
+all.** A background domain cannot surface an interactive TCC dialog, so the same
+out-of-bounds access **fails silently** (permission-denied) instead of prompting.
+That does not change the contract below — the daemon's and sweep children's
+legitimate working set still contains no protected folder — it only changes the
+symptom (a silent file-not-found rather than a popup). The remedy is identical:
+fix the offending script/tool to stay within the working-set contract, never a
+broad grant. This is one of the documented consequences of the non-Aqua fallback
+domain (see "launchd domain resolution" under #3972 above).
 
 **The daemon's legitimate working set never needs a protected folder.** Audited
 surfaces — the daemon core (Rust) and `.loom/scripts/*` — only ever touch
