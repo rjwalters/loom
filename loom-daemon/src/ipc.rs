@@ -1122,9 +1122,18 @@ pub fn build_daemon_status(
     // exactly the same registry it did pre-#3930).
     let mut in_flight: Vec<crate::types::SweepInfo> = Vec::new();
     let mut per_repo: Vec<crate::types::RepoStatus> = Vec::with_capacity(roots.len());
+    // Issue #4214: live-locked-but-unregistered sweeps, unioned across every
+    // root exactly like `in_flight` — each root is cross-checked against its
+    // own `.loom/locks/issue-*/` independently (a PrSet sweep has no per-issue
+    // lock and is naturally never a candidate here).
+    let mut unregistered_locked: Vec<crate::types::UnregisteredLockedSweep> = Vec::new();
     for root in &roots {
         let registry = workspace_pool.get_or_provision(root);
-        let (live, quarantined_issues): (Vec<crate::types::SweepInfo>, Vec<u32>) = {
+        let (live, quarantined_issues, locked_unregistered): (
+            Vec<crate::types::SweepInfo>,
+            Vec<u32>,
+            Vec<(u32, u32)>,
+        ) = {
             let sr = registry.lock().expect("Sweep registry mutex poisoned");
             // In-flight = sweeps still live (Pending / Running). Terminal sweeps
             // (Exited / Crashed) linger in the registry but are not "in flight".
@@ -1136,7 +1145,7 @@ pub fn build_daemon_status(
             // Insta-crash quarantine (#3939): surface which issues this repo is
             // currently refusing to re-dispatch, so a repo with a visible backlog
             // that is dispatching nothing is explained.
-            (live, sr.quarantined_issues_sorted())
+            (live, sr.quarantined_issues_sorted(), sr.unregistered_locked_issues())
         };
         per_repo.push(crate::types::RepoStatus {
             root: root.clone(),
@@ -1154,6 +1163,13 @@ pub fn build_daemon_status(
             health_gate_verdict_at: health_states.last_verdict_at(root),
         });
         in_flight.extend(live);
+        unregistered_locked.extend(locked_unregistered.into_iter().map(|(issue, owner_pid)| {
+            crate::types::UnregisteredLockedSweep {
+                root: root.clone(),
+                issue,
+                owner_pid,
+            }
+        }));
     }
 
     // Present the per-repo breakdown in dispatch-priority order (#3946) — the
@@ -1233,6 +1249,7 @@ pub fn build_daemon_status(
 
     DaemonStatusReport {
         in_flight,
+        unregistered_locked,
         token_pool_size,
         disk_headroom,
         cpu_headroom,
@@ -3409,6 +3426,7 @@ exit 0
         // Response: carries the full report.
         let report = DaemonStatusReport {
             in_flight: vec![],
+            unregistered_locked: vec![],
             token_pool_size: 4,
             disk_headroom: 10,
             cpu_headroom: 6,
@@ -3843,6 +3861,95 @@ exit 0
                 .as_deref(),
             Some(reason)
         );
+
+        match prev_shared {
+            Some(v) => std::env::set_var("LOOM_SHARED_TOKENS_DIR", v),
+            None => std::env::remove_var("LOOM_SHARED_TOKENS_DIR"),
+        }
+        std::env::remove_var(REGISTRY_PATH_ENV);
+    }
+
+    /// Regression test for Issue #4214 (the "vanish window" incident): a sweep
+    /// whose per-issue lock is live (`owner_pid` alive) but which has **no**
+    /// matching in-flight registry entry — the exact shape of the observed
+    /// incident, where the in-memory union of live entries silently lost track
+    /// of a sweep the filesystem lock proves is still alive — must be surfaced
+    /// via `DaemonStatusReport::unregistered_locked`, not silently omitted from
+    /// `in_flight` with no trace at all. Also exercises the full JSON
+    /// round-trip so a client (CLI, monitor script) sees the same shape.
+    #[test]
+    #[serial_test::serial]
+    fn test_build_daemon_status_surfaces_unregistered_locked_sweep() {
+        use crate::main_health_gate::WorkspaceHealthStates;
+        use crate::workspace_registry::REGISTRY_PATH_ENV;
+
+        let (sr, dir, _rec) = setup_sweep_registry_in_tempdir();
+        let root = dir.path().to_path_buf();
+        let empty_reg = dir.path().join("no-such-workspaces.json");
+        std::env::set_var(REGISTRY_PATH_ENV, &empty_reg);
+        let prev_shared = std::env::var("LOOM_SHARED_TOKENS_DIR").ok();
+        std::env::set_var("LOOM_SHARED_TOKENS_DIR", "");
+
+        let pool = Arc::new(WorkspacePool::new(Arc::new(EventBus::new()), test_runtime_handle()));
+        pool.seed(root.clone(), sr.clone());
+        let health = WorkspaceHealthStates::new();
+
+        // Baseline: no lock, nothing in flight, nothing unregistered.
+        let report = build_daemon_status(&pool, &health, &root, &test_credential_preflight());
+        assert!(report.in_flight.is_empty());
+        assert!(report.unregistered_locked.is_empty());
+
+        // Simulate the observed incident: a live, locked sweep (owner_pid alive,
+        // lock dir valid) with NO corresponding registry entry — i.e. it never
+        // went through `reconstruct()` or `dispatch()` in this process's
+        // lifetime, exactly the read-path-gap shape the issue's forensics
+        // pointed to (a registry mutation would have shown up as a Crashed/
+        // Exited terminal entry instead, not a bare absence).
+        let locks_dir = root.join(".loom").join("locks").join("issue-4201");
+        std::fs::create_dir_all(&locks_dir).unwrap();
+        // `LockOwner` is private to `sweep_registry`; write its wire schema
+        // directly (mirrors what `acquire_lock` writes) rather than reaching
+        // across the module boundary.
+        let owner = serde_json::json!({
+            "issue": 4201,
+            "owner_pid": std::process::id(),
+            "acquired_at": chrono::Utc::now().to_rfc3339(),
+            "sweep_id": "sweep-issue-4201-1785221507",
+        });
+        std::fs::write(locks_dir.join("owner.json"), serde_json::to_string_pretty(&owner).unwrap())
+            .unwrap();
+
+        let report = build_daemon_status(&pool, &health, &root, &test_credential_preflight());
+        assert!(
+            report.in_flight.is_empty(),
+            "the sweep never went through dispatch/reconstruct in this test, so it \
+             is deliberately still absent from in_flight -- that's the omission \
+             this test targets"
+        );
+        assert_eq!(
+            report.unregistered_locked.len(),
+            1,
+            "a live-locked issue with no registry entry must surface as unregistered_locked, \
+             got: {:?}",
+            report.unregistered_locked
+        );
+        let entry = &report.unregistered_locked[0];
+        assert_eq!(entry.issue, 4201);
+        assert_eq!(entry.owner_pid, std::process::id());
+        assert_eq!(entry.root, root);
+
+        // JSON round-trip: the field survives serialize -> deserialize (the
+        // wire contract `loom-daemon status --json` and any monitor script rely
+        // on), and stays byte-identical to a re-parse of the legacy fixture
+        // from `test_daemon_status_backward_compat_missing_capacity` (an absent
+        // field there must still default to empty -- covered by that test; this
+        // one only asserts our populated case survives the round trip).
+        let json = serde_json::to_string(&report).expect("serialize DaemonStatusReport");
+        let back: DaemonStatusReport =
+            serde_json::from_str(&json).expect("deserialize DaemonStatusReport");
+        assert_eq!(back.unregistered_locked.len(), 1);
+        assert_eq!(back.unregistered_locked[0].issue, 4201);
+        assert_eq!(back.unregistered_locked[0].owner_pid, std::process::id());
 
         match prev_shared {
             Some(v) => std::env::set_var("LOOM_SHARED_TOKENS_DIR", v),
