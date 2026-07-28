@@ -50,7 +50,7 @@
   color: "F59E0B"  # amber-500 - matches other in-progress states
 
 - name: loom:reviewing
-  description: "Judge is actively reviewing this PR. Applied by: Judge only (claim label)."
+  description: "Judge is actively reviewing this PR. Applied by: Judge only (claim label). Stale after LOOM_STALE_REVIEWING_MINUTES (default 30) with no follow-up comment — may be reclaimed by a new Judge."
   color: "F59E0B"  # amber-500 - matches other in-progress states
 
 - name: loom:review-requested

@@ -220,7 +220,7 @@ fi
 ### Primary Queue (Priority)
 
 1. **Find work**: `gh pr list --label="loom:review-requested" --state=open`
-2. **Claim PR**: `gh pr edit <number> --add-label "loom:reviewing"` to signal you're working on it
+2. **Claim PR** (staleness-aware — see "Stale `loom:reviewing` Claim Check" immediately below before running this): `gh pr edit <number> --add-label "loom:reviewing"` to signal you're working on it
 3. **Check merge state**: Check for conflicts and attempt automated rebase if DIRTY (see Automated Rebase for DIRTY PRs below)
    ```bash
    MERGE_STATE=$(gh pr view <number> --json mergeStateStatus --jq '.mergeStateStatus')
@@ -243,6 +243,63 @@ fi
 11. **Update labels** (⚠️ NEVER use `gh pr review` - see warning at top of file). **The label update is the PRIMARY deliverable — always run it immediately after the comment using `&&`:**
    - If approved: `gh pr comment ... && gh pr edit <number> --remove-label "loom:review-requested" --remove-label "loom:reviewing" --add-label "loom:pr"` (blue badge - ready for Champion auto-merge)
    - If changes needed: `gh pr comment ... && gh pr edit <number> --remove-label "loom:review-requested" --remove-label "loom:reviewing" --add-label "loom:changes-requested"` (amber badge - Doctor will address)
+
+### Stale `loom:reviewing` Claim Check (Step 2)
+
+Run this **before** claiming a PR in step 2 above. `gh pr list
+--label="loom:review-requested"` can surface a PR that another Judge already
+claimed (`loom:review-requested` and `loom:reviewing` coexist while a review
+is in progress) — including one whose claiming Judge's process died mid-review
+(parent sweep crash). Without this check, that dead claim blocks the PR from
+ever being reviewed again. This is the minutes-scale analog of the
+`loom:building` staleness convention (`LOOM_STALE_BUILDING_HOURS`,
+`loom-daemon/src/claim_reconciliation.rs`) — reviews run 5–15 minutes in
+practice, not hours, so the grace period is minutes, not hours.
+
+**If the PR does NOT carry `loom:reviewing`:** proceed to claim as today — no
+behavior change: `gh pr edit <number> --add-label "loom:reviewing"`.
+
+**If the PR DOES carry `loom:reviewing`:** determine the claim's age and
+whether anyone has commented since the claim was made:
+
+```bash
+N=<pr-number>
+CLAIMED_AT=$(gh api "repos/{owner}/{repo}/issues/$N/timeline" --paginate \
+  --jq '[.[] | select(.event=="labeled" and .label.name=="loom:reviewing")] | last | .created_at')
+COMMENTS_AFTER=$(gh api "repos/{owner}/{repo}/issues/$N/comments" \
+  | jq --arg t "$CLAIMED_AT" '[.[] | select(.created_at > $t)] | length')
+```
+
+Then decide:
+
+| Condition | Verdict | Action |
+|-----------|---------|--------|
+| Claim age < `LOOM_STALE_REVIEWING_MINUTES` (default **30**), OR `COMMENTS_AFTER > 0` | **Fresh** — a Judge is actively working this PR | **Do not stomp the claim.** Skip this PR and continue the batch to the next candidate PR. |
+| Claim age ≥ `LOOM_STALE_REVIEWING_MINUTES` AND `COMMENTS_AFTER == 0` | **Stale** — the claiming Judge's process almost certainly died mid-review | Reclaim (see below), then proceed with the normal review from step 3. |
+| Timeline API call fails or returns empty (`CLAIMED_AT` unset) | **Unknown — fail safe** | Treat as **fresh**. Never stomp a claim on API failure or missing data. |
+
+**Reclaiming a stale claim:**
+
+```bash
+gh pr edit $N --remove-label "loom:reviewing"
+gh pr comment $N --body "Reclaiming stale loom:reviewing claim (age > ${LOOM_STALE_REVIEWING_MINUTES:-30}m, no follow-up comment) — a prior Judge's parent sweep likely died mid-review."
+gh pr edit $N --add-label "loom:reviewing"
+# Continue to step 3 (Check merge state) and evaluate normally
+```
+
+**Env var**: `LOOM_STALE_REVIEWING_MINUTES` (default **30**) — named to
+mirror `LOOM_STALE_BUILDING_HOURS` (`loom-daemon/src/claim_reconciliation.rs`,
+the analogous no-record staleness threshold for `loom:building` claims), but
+on a **minutes**, not hours, scale, since review turnaround (5–15 minutes) is
+two orders of magnitude faster than a build.
+
+**Applies everywhere a Judge claims a PR from a multi-PR pass** — not just
+this single-PR narrative. This same check-then-claim rule governs the batch
+loop in "Autonomous mode (configured with targetInterval)" under Completion
+below, and any cron-invoked pass over `loom:review-requested` PRs: a
+cron-invoked Judge and a `/loom:sweep`-dispatched Judge must apply the
+identical rule so neither stomps the other's fresh claim nor stalls behind a
+dead one.
 
 **Pre-approval checklist** (verify before executing approval commands):
 - [ ] I am using `gh pr comment`, NOT `gh pr review`
@@ -1388,5 +1445,7 @@ If no work was found (no PRs with `loom:review-requested`), report that and stop
 4. Once the queue is empty, execute `/clear` to reset context for the next interval
 
 This batch processing prevents PRs from waiting unnecessarily when multiple are queued. Under the wave-parallel sweep model, several sweeps can land PRs at once, so the judge must drain the queue efficiently rather than processing one PR per interval.
+
+**Apply the "Stale `loom:reviewing` Claim Check" (see Primary Queue, step 2) to every PR in this loop, not just the first.** A `loom:review-requested` PR already carrying a fresh `loom:reviewing` claim from a concurrently-running Judge must be skipped (continue to the next PR in the batch); one carrying a stale claim is reclaimed then reviewed. This keeps a cron-invoked batch pass and a `/loom:sweep`-dispatched pass consistent with each other.
 
 If no work is available at the start of an iteration, execute `/clear` and wait for the next trigger.
