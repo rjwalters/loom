@@ -143,6 +143,33 @@ pub const EST_CORES_PER_SWEEP_ENV: &str = "LOOM_EST_CORES_PER_SWEEP";
 /// calibrated figure for the primary host rather than an un-measured guess —
 /// still tunable per repo/host via [`EST_CORES_PER_SWEEP_ENV`] or
 /// `autonomous.estCoresPerSweep`).
+///
+/// # The release-build fan-out footgun (#4234, Gap 2 of the #4231 decomposition)
+///
+/// `2.0` is calibrated against typical `cargo check`/`clippy`/debug-build
+/// sweep phases (#4031), **not** the release-build fan-out that triggered the
+/// #4231 host meltdown. `cargo build --release` parallelizes codegen units
+/// across every logical core rustc can grab — a single release build can
+/// legitimately consume close to `ncpu` cores on its own, not `2`. Six
+/// concurrent release-building sweeps on a 28-core host is demand-side closer
+/// to `6 × 28` than `6 × 2`; at the default `2.0` this term under-estimates
+/// consumption by roughly an order of magnitude during exactly the phase that
+/// matters most.
+///
+/// This is a **calibration** gap, not a formula bug: [`cpu_headroom`] and its
+/// floor-at-`1` "never a hard halt" policy are working as designed (#3902's
+/// precedent — CPU is a soft backoff term, not `disk_headroom`'s or the token
+/// axis's hard floor-at-zero). A repo whose sweeps spend meaningful time in a
+/// release build should raise `LOOM_EST_CORES_PER_SWEEP` /
+/// `autonomous.estCoresPerSweep` well above `2.0` — plausibly toward
+/// `logical_cpu_count()` itself for a repo where release builds dominate sweep
+/// wall-clock time — rather than relying on this default. #4234 adds a second,
+/// independent backstop for exactly this under-estimate: the work finder's
+/// per-tick admission (ramp) cap
+/// ([`crate::work_finder::WORK_FINDER_MAX_ADMISSIONS_PER_TICK_ENV`]) bounds how
+/// many *new* sweeps land in any single tick regardless of how (mis)calibrated
+/// this term is, so a wrong `estCoresPerSweep` no longer alone determines
+/// whether a whole wave lands in one tick.
 pub const DEFAULT_EST_CORES_PER_SWEEP: f64 = 2.0;
 
 /// Env override for [`UTILIZATION_TARGET_ENV`] — `None` when unset,

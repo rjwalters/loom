@@ -12,6 +12,7 @@ use crate::workspace_pool::WorkspacePool;
 use crate::workspace_registry::WorkspaceRegistry;
 use anyhow::Result;
 use chrono::Utc;
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -1342,6 +1343,201 @@ fn resolve_registry(
     }
 }
 
+// ============================================================================
+// dispatch_sweep headroom advisory (#4234 — Gap 1 of the #4231 decomposition)
+// ============================================================================
+//
+// Before #4234, `dispatch_sweep` was the *only* remaining sweep-dispatch entry
+// point that never consulted the dynamic concurrency cap
+// (`resolve_dynamic_max_concurrent` — token/disk/cpu/configured-max) the
+// autonomous work finder has enforced on its own dispatches since
+// #3811/#3978/#4032. Any operator- or MCP-driven `dispatch_sweep` call was
+// completely ungated — the mechanism this closed a gap in, not a mechanism
+// built from scratch (the work finder's cap already existed and worked; this
+// handler alone bypassed it). The #4231 host-meltdown 6-way fan-out was
+// dispatched through exactly this handler.
+//
+// The policy, per the curator's #4234 guidance, is **advisory-first** —
+// matching the `capacity.rs` "never a halt" precedent for token backpressure
+// (#3902): `dispatch_sweep` always dispatches (an explicit operator/MCP
+// request is a deliberate act, and the autonomous loop's own cap remains the
+// hard backstop for *its* dispatches), but now computes the same headroom the
+// work finder uses and, on a **state change** into/out of "occupancy at or
+// over that headroom", logs a warning and publishes a
+// `daemon.dispatch.headroom_advisory` event — so an operator firing a manual
+// fan-out sees the same signal the autonomous loop already acts on. This
+// requires **zero protocol change**: no new `Request::DispatchSweep` field, no
+// new `Response` variant. The advisory is a side channel (log + event bus),
+// exactly like `capacity.rs`'s token-pressure advisory.
+//
+// # Never the blocking (~1s on macOS) headroom refresh under the registry lock
+//
+// The `DispatchSweep` arm holds the registry mutex from just after this
+// assessment through the dispatch call. `cpu_headroom::cpu_headroom_limit`
+// refreshes the memoized idle-fraction sample, which sleeps ~1s on macOS
+// (`iostat`) — calling it here would stall every other IPC request scoped to
+// the same registry (`ListSweeps` / `GetSweepStatus` / a concurrent
+// `DispatchSweep`) for that second. [`assess_dispatch_headroom`] therefore
+// uses the **non-refreshing** [`crate::cpu_headroom::cpu_headroom_snapshot`]
+// (reads the memoized cache; never blocks) — the exact same call
+// `build_daemon_status` makes, just without that function's own
+// `spawn_blocking` pre-warm (this handler is synchronous, not `async`, so it
+// cannot `.await` a `spawn_blocking` join; a same-generation `iostat` sample
+// from a recent `DaemonStatus` poll or the work-finder's own tick is
+// sufficient for an advisory signal, and a `None` idle fraction falls back
+// through `cpu_headroom`'s documented fail-open chain).
+
+/// Per-repo dynamic-cap headroom snapshot computed for a `dispatch_sweep`
+/// request (#4234). Mirrors the inputs `build_daemon_status` already exposes
+/// on the status surface — no new plumbing, just the same math consulted at
+/// dispatch time instead of only at status-poll time.
+struct DispatchHeadroom {
+    /// Live (non-terminal) sweep count already registered for this repo.
+    occupancy: usize,
+    /// `resolve_dynamic_max_concurrent` — min(token axis, disk, cpu, configured max).
+    dynamic_cap: usize,
+    cpu_headroom: usize,
+    disk_headroom: usize,
+    token_axis_limit: usize,
+}
+
+/// Compute [`DispatchHeadroom`] for `repo_root` against the **already-locked**
+/// registry `sr`. See the module docs above for why this never calls the
+/// refreshing CPU probe.
+fn assess_dispatch_headroom(sr: &mut SweepRegistry, repo_root: &Path) -> DispatchHeadroom {
+    // Reap-on-read (mirrors ListSweeps/GetSweepStatus, Issue #3893): a sweep
+    // whose child already exited must not inflate occupancy against a stale
+    // `Running` entry.
+    sr.reap_liveness();
+    let occupancy = sr
+        .list(None)
+        .into_iter()
+        .filter(|info| !info.state.is_terminal())
+        .count();
+
+    let wf_config = crate::work_finder::read_work_finder_config(repo_root);
+    let configured_max = crate::work_finder::resolve_max_concurrent_with_config(&wf_config);
+    let per_token_concurrency = crate::work_finder::resolve_per_token_concurrency(&wf_config);
+    let cpu_utilization_target = crate::work_finder::resolve_cpu_utilization_target(&wf_config);
+    let cpu_est_cores_per_sweep = crate::work_finder::resolve_cpu_est_cores_per_sweep(&wf_config);
+    let cpu_snapshot =
+        crate::cpu_headroom::cpu_headroom_snapshot(cpu_utilization_target, cpu_est_cores_per_sweep);
+    let disk_headroom = crate::disk_headroom::disk_headroom_limit(repo_root);
+    let token_pool_size = crate::tokens::token_pool_size(repo_root);
+    let ranking = crate::capacity::read_ranking(repo_root);
+    let token_axis_limit = ranking.as_ref().map_or(token_pool_size, |r| r.available);
+    let dynamic_cap = crate::work_finder::resolve_dynamic_max_concurrent(
+        token_axis_limit,
+        per_token_concurrency,
+        disk_headroom,
+        cpu_snapshot.cpu_headroom,
+        configured_max,
+    );
+
+    DispatchHeadroom {
+        occupancy,
+        dynamic_cap,
+        cpu_headroom: cpu_snapshot.cpu_headroom,
+        disk_headroom,
+        token_axis_limit,
+    }
+}
+
+/// Whether admitting one more sweep would meet or exceed the computed dynamic
+/// cap. `>=` (not `>`): dispatching this new sweep pushes occupancy to
+/// `occupancy + 1`, so `occupancy >= dynamic_cap` already means "no headroom
+/// left for it." Pure predicate — trivially unit-testable without touching the
+/// registry or the host.
+#[must_use]
+fn dispatch_would_meet_or_exceed_headroom(h: &DispatchHeadroom) -> bool {
+    h.occupancy >= h.dynamic_cap
+}
+
+/// Process-global, per-repo dedup state for the `daemon.dispatch.headroom_advisory`
+/// event (#4234) — mirrors the work finder's `was_pressured` state-change dedup
+/// (#3902), but keyed by normalized repo root (rather than a single loop-local
+/// `bool`) since `dispatch_sweep` is a request handler, not a per-workspace loop
+/// task, and a multi-workspace daemon must not let repo A's transition suppress
+/// or falsely flip repo B's advisory.
+static DISPATCH_HEADROOM_STATE: Mutex<BTreeMap<PathBuf, bool>> = Mutex::new(BTreeMap::new());
+
+/// Build the advisory/recovery message for a `dispatch_sweep` headroom
+/// transition. Split out from [`emit_dispatch_headroom_advisory_on_change`] so
+/// the message text itself is unit-testable without the global dedup state.
+fn dispatch_headroom_message(
+    repo_root: &Path,
+    low_headroom: bool,
+    h: &DispatchHeadroom,
+    kind: &crate::types::SweepKind,
+) -> String {
+    if low_headroom {
+        format!(
+            "dispatch_sweep: dispatching {kind:?} into {} while occupancy is at/over the \
+             computed dynamic-cap headroom (occupancy={} >= dynamic_cap={}; cpu_headroom={}, \
+             disk_headroom={}, token_axis_limit={}) — advisory only per #4234 (dispatch \
+             proceeds; the autonomous work finder's own cap is unaffected)",
+            repo_root.display(),
+            h.occupancy,
+            h.dynamic_cap,
+            h.cpu_headroom,
+            h.disk_headroom,
+            h.token_axis_limit
+        )
+    } else {
+        format!(
+            "dispatch_sweep: headroom recovered for {} (occupancy={} < dynamic_cap={})",
+            repo_root.display(),
+            h.occupancy,
+            h.dynamic_cap
+        )
+    }
+}
+
+/// Emit the `daemon.dispatch.headroom_advisory` log line + event **only on a
+/// state change** (never a per-call stream — mirrors `capacity.rs`'s
+/// `emit_capacity_transition`, #3902). A no-op when `low_headroom` matches the
+/// last-known state for `repo_root`.
+fn emit_dispatch_headroom_advisory_on_change(
+    event_bus: &Arc<EventBus>,
+    repo_root: &Path,
+    low_headroom: bool,
+    h: &DispatchHeadroom,
+    kind: &crate::types::SweepKind,
+) {
+    {
+        let mut state = DISPATCH_HEADROOM_STATE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let was_low = state.get(repo_root).copied().unwrap_or(false);
+        if low_headroom == was_low {
+            return;
+        }
+        state.insert(repo_root.to_path_buf(), low_headroom);
+    }
+
+    let message = dispatch_headroom_message(repo_root, low_headroom, h, kind);
+    if low_headroom {
+        log::warn!("{message}");
+    } else {
+        log::info!("{message}");
+    }
+    if let Err(e) = event_bus.publish_generic(
+        "daemon.dispatch.headroom_advisory",
+        serde_json::json!({
+            "repo_root": repo_root.display().to_string(),
+            "low_headroom": low_headroom,
+            "occupancy": h.occupancy,
+            "dynamic_cap": h.dynamic_cap,
+            "cpu_headroom": h.cpu_headroom,
+            "disk_headroom": h.disk_headroom,
+            "token_axis_limit": h.token_axis_limit,
+            "message": message,
+        }),
+    ) {
+        log::debug!("dispatch_sweep: headroom advisory not delivered: {e}");
+    }
+}
+
 #[allow(clippy::expect_used, clippy::too_many_lines)]
 fn handle_request(
     request: Request,
@@ -1943,12 +2139,35 @@ fn handle_request(
             // autonomous work-finder / epic-supervisor dispatch paths so every
             // daemon-dispatched child is pinned to an explicit model.
             let repo_root = sr.config().workspace_root.clone();
+
+            // Headroom advisory (#4234, Gap 1 of #4231's decomposition): consult
+            // the same dynamic concurrency cap the autonomous work finder
+            // applies to its own dispatches, and advise — never gate — an
+            // explicit `dispatch_sweep` call that would push occupancy at/over
+            // it. See the module docs above this arm for the full rationale and
+            // the "never the blocking refresh under this lock" hazard.
+            let headroom = assess_dispatch_headroom(&mut sr, &repo_root);
+            let low_headroom = dispatch_would_meet_or_exceed_headroom(&headroom);
+            emit_dispatch_headroom_advisory_on_change(
+                event_bus,
+                &repo_root,
+                low_headroom,
+                &headroom,
+                &kind,
+            );
+
             let (resolved_model, model_source) =
                 crate::sweep_registry::resolve_dispatch_model(&repo_root, model.as_deref());
             log::info!(
-                "dispatch_sweep: {:?} with model={resolved_model} (source={})",
+                "dispatch_sweep: {:?} with model={resolved_model} (source={}); headroom \
+                 occupancy={} dynamic_cap={} (cpu={} disk={} tokens={})",
                 kind,
-                model_source.as_str()
+                model_source.as_str(),
+                headroom.occupancy,
+                headroom.dynamic_cap,
+                headroom.cpu_headroom,
+                headroom.disk_headroom,
+                headroom.token_axis_limit
             );
             match sr.dispatch(
                 &kind,
@@ -2686,6 +2905,164 @@ exit 0
         config.journal_path = Some(dir.path().join("test-sweeps-journal.json"));
         let sr = Arc::new(Mutex::new(SweepRegistry::new(config)));
         (sr, dir, record_log)
+    }
+
+    // ========================================================================
+    // dispatch_sweep headroom advisory (#4234 — Gap 1 of #4231's decomposition)
+    // ========================================================================
+
+    fn fake_headroom(occupancy: usize, dynamic_cap: usize) -> DispatchHeadroom {
+        DispatchHeadroom {
+            occupancy,
+            dynamic_cap,
+            cpu_headroom: dynamic_cap,
+            disk_headroom: 10,
+            token_axis_limit: 5,
+        }
+    }
+
+    #[test]
+    fn dispatch_headroom_predicate_boundary() {
+        assert!(
+            !dispatch_would_meet_or_exceed_headroom(&fake_headroom(2, 3)),
+            "below cap: headroom remains"
+        );
+        assert!(
+            dispatch_would_meet_or_exceed_headroom(&fake_headroom(3, 3)),
+            "at cap: no headroom left for one more"
+        );
+        assert!(
+            dispatch_would_meet_or_exceed_headroom(&fake_headroom(5, 3)),
+            "over cap: definitely no headroom"
+        );
+    }
+
+    #[test]
+    fn dispatch_headroom_message_names_every_axis() {
+        let h = DispatchHeadroom {
+            occupancy: 4,
+            dynamic_cap: 3,
+            cpu_headroom: 2,
+            disk_headroom: 9,
+            token_axis_limit: 6,
+        };
+        let kind = SweepKind::Issue(123);
+        let repo = Path::new("/tmp/loom-test-repo");
+
+        let entered = dispatch_headroom_message(repo, true, &h, &kind);
+        assert!(entered.contains("occupancy=4"), "{entered}");
+        assert!(entered.contains("dynamic_cap=3"), "{entered}");
+        assert!(entered.contains("cpu_headroom=2"), "{entered}");
+        assert!(entered.contains("disk_headroom=9"), "{entered}");
+        assert!(entered.contains("token_axis_limit=6"), "{entered}");
+        assert!(entered.contains("123"), "{entered}");
+        assert!(entered.contains("advisory only"), "{entered}");
+
+        let recovered = dispatch_headroom_message(repo, false, &h, &kind);
+        assert!(recovered.contains("recovered"), "{recovered}");
+    }
+
+    #[test]
+    fn dispatch_headroom_advisory_dedups_on_state_change() {
+        let bus = Arc::new(EventBus::new());
+        let mut sub = bus.subscribe(["daemon.dispatch.headroom_advisory"]);
+        // A fresh, unique tempdir path keys the process-global dedup state
+        // independently of any other test (#4234's per-repo dedup design).
+        let repo_dir = tempdir().unwrap();
+        let repo_root = repo_dir.path().to_path_buf();
+        let kind = SweepKind::Issue(4234);
+        let low = fake_headroom(5, 3);
+        let ok = fake_headroom(1, 3);
+
+        // Entering low headroom fires the advisory.
+        emit_dispatch_headroom_advisory_on_change(&bus, &repo_root, true, &low, &kind);
+        match sub
+            .try_recv()
+            .expect("advisory published on entering low headroom")
+        {
+            Event::Generic { topic, payload } => {
+                assert_eq!(topic, "daemon.dispatch.headroom_advisory");
+                assert_eq!(payload["low_headroom"].as_bool(), Some(true));
+                assert_eq!(payload["occupancy"].as_u64(), Some(5));
+                assert_eq!(payload["dynamic_cap"].as_u64(), Some(3));
+            }
+            other => panic!("expected Generic advisory event, got {other:?}"),
+        }
+
+        // Still low on the next call — deduped, no second event.
+        emit_dispatch_headroom_advisory_on_change(&bus, &repo_root, true, &low, &kind);
+        assert!(
+            matches!(sub.try_recv(), Err(crate::event_bus::RecvError::Empty)),
+            "no duplicate advisory while headroom stays low"
+        );
+
+        // Recovers — symmetric recovery event.
+        emit_dispatch_headroom_advisory_on_change(&bus, &repo_root, false, &ok, &kind);
+        match sub.try_recv().expect("recovery event published") {
+            Event::Generic { topic, payload } => {
+                assert_eq!(topic, "daemon.dispatch.headroom_advisory");
+                assert_eq!(payload["low_headroom"].as_bool(), Some(false));
+            }
+            other => panic!("expected Generic recovery event, got {other:?}"),
+        }
+
+        // Staying recovered — deduped again.
+        emit_dispatch_headroom_advisory_on_change(&bus, &repo_root, false, &ok, &kind);
+        assert!(
+            matches!(sub.try_recv(), Err(crate::event_bus::RecvError::Empty)),
+            "no duplicate recovery event while headroom stays healthy"
+        );
+    }
+
+    /// End-to-end (#4234): `dispatch_sweep` must dispatch even when the
+    /// computed headroom is fully saturated — advisory-first, never a hard
+    /// gate. Forces `configured_max=1` via env (the smallest term always wins
+    /// the `min()` in `resolve_dynamic_max_concurrent`), which is deterministic
+    /// regardless of the real host's token/disk/cpu state.
+    #[test]
+    #[serial_test::serial]
+    fn test_dispatch_sweep_still_dispatches_under_synthetic_low_headroom() {
+        let (tm, db, _, bus) = setup_test_context();
+        let (sr, _dir, _rec) = setup_sweep_registry_in_tempdir();
+
+        std::env::set_var(crate::work_finder::WORK_FINDER_MAX_CONCURRENT_ENV, "1");
+
+        let dispatch_issue = |n: u32| {
+            handle_request(
+                Request::DispatchSweep {
+                    kind: SweepKind::Issue(n),
+                    idempotency_key: None,
+                    model: None,
+                    effort: None,
+                    depends_on: None,
+                    workspace_root: None,
+                },
+                &tm,
+                &db,
+                &sr,
+                &bus,
+                &test_pool(),
+            )
+        };
+
+        // First dispatch always succeeds regardless of computed headroom.
+        match dispatch_issue(90_001) {
+            Response::SweepDispatched { .. } => {}
+            other => panic!("Expected SweepDispatched, got: {other:?}"),
+        }
+
+        // Second dispatch: occupancy is now >= the forced ceiling of 1, so this
+        // call is guaranteed to be at/over the dynamic cap — and it STILL
+        // dispatches (advisory-only per #4234, never a hard gate).
+        match dispatch_issue(90_002) {
+            Response::SweepDispatched { .. } => {}
+            other => panic!(
+                "Expected SweepDispatched even at/over headroom (advisory-first policy), \
+                 got: {other:?}"
+            ),
+        }
+
+        std::env::remove_var(crate::work_finder::WORK_FINDER_MAX_CONCURRENT_ENV);
     }
 
     #[test]

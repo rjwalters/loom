@@ -1243,6 +1243,92 @@ at [`docs/measure-est-cores-per-sweep.md`](https://github.com/rjwalters/loom/blo
 (upstream Loom repo — not shipped to consumer installs)
 so an operator can calibrate it on a live fleet without re-opening the code.
 
+**The release-build fan-out footgun (#4234, decomposed from #4231).** `2.0` is
+calibrated against `cargo check`/`clippy`/debug-build sweep phases (#4031), not
+a **release** build: `cargo build --release` parallelizes codegen units across
+essentially every logical core, so a release-build-heavy repo's real per-sweep
+consumption can run much closer to `logical_cpus` than `2.0`. The #4231 host
+meltdown (a 6-way sweep fan-out that drove load to 118 on a 28-core host) is
+the concrete failure mode: at the shipped default, six concurrent
+release-building sweeps look like `6 × 2 = 12` cores of demand to the cpu
+headroom term when the real demand is far higher. Raise
+`autonomous.estCoresPerSweep` well above `2.0` — plausibly toward
+`logical_cpu_count()` itself — for a repo whose sweeps spend meaningful wall
+clock in a release build. The knob is resolved **once at daemon startup**
+(env > config > default, #4032), the same startup-capture as every other
+dynamic-cap knob; a live re-tune takes effect on the next daemon restart, not
+mid-run. #4234 adds a second, independent backstop for exactly this
+under-estimate — see the next section.
+
+#### Per-tick admission (ramp) cap (#4234)
+
+`resolve_dynamic_max_concurrent` is a **live** ceiling, recomputed every tick,
+so it can *jump* tick-to-tick — e.g. several exhausted token accounts resetting
+at once raises the token axis from ~2 to ~14, or a miscalibrated
+`estCoresPerSweep` (previous section) makes the cpu axis look larger than the
+host can actually sustain. Before #4234, a jump like that let a **single tick**
+admit every newly-eligible candidate up to the new, larger cap in one shot.
+Load average / measured idle fraction is a **lagging** signal sampled at
+wave-*start*: a burst admitted together all ramp their builds minutes later,
+well after the tick that "safely" admitted them observed a still-quiet host.
+This is the exact failure mode of the #4231 incident's second wave — the host
+re-spiked at 01:41 after load had already dropped to 8, because the admission
+decision had already been made by the time load caught up.
+
+`autonomous.workFinder.maxAdmissionsPerTick` (`LOOM_WORK_FINDER_MAX_ADMISSIONS_PER_TICK`,
+default **3**, mirroring `maxConcurrent`'s default) bounds how many **new**
+sweeps a single tick may admit, **independent of** `max_concurrent` — the two
+caps are separate and both apply (`tick_report.deferred_capacity` counts
+candidates deferred by the concurrency ceiling, `tick_report.deferred_ramp_cap`
+counts candidates deferred by this ramp cap; either alone can defer a
+candidate, and both fire in the same tick when both bind). A large cap jump
+therefore ramps up over several ticks instead of bursting in one — each
+subsequent tick re-samples CPU/disk/token headroom fresh, so a ramp that turns
+out to be too aggressive self-corrects within one interval (default 60s)
+rather than in one uncontrolled burst. Resolved with the standard precedence
+**env > config > default**, single-root, at daemon startup — the same
+startup-capture pattern as `cpuUtilizationTarget`/`estCoresPerSweep`: the ramp
+cap's whole purpose is to smooth admission *within* the live per-tick
+re-computation of `max_concurrent`, so the knob itself does not need to be
+live; retuning it takes effect on the next daemon restart.
+
+#### `dispatch_sweep` headroom advisory (#4234)
+
+Before #4234, the dynamic cap above only gated the autonomous work finder's
+**own** dispatches — the `dispatch_sweep` IPC/MCP handler (the entry point for
+`mcp__loom__dispatch_sweep`, `loom-daemon dispatch`, and any other
+operator-driven fan-out) dispatched directly with **no** headroom consult at
+all. Any operator- or MCP-driven `dispatch_sweep` call was completely ungated;
+the #4231 6-way fan-out that triggered the host meltdown was dispatched through
+exactly this handler.
+
+The fix is **advisory-first**, matching `capacity.rs`'s token-backpressure
+"never a halt" precedent (#3902) rather than adding a hard-defer/`force`
+protocol change: `dispatch_sweep` **always dispatches** — an explicit
+operator/MCP request is a deliberate act, and the work finder's own dynamic
+cap remains the hard backstop for *its own* autonomous dispatches — but now
+computes the same `resolve_dynamic_max_concurrent` headroom the work finder
+uses (token/disk/cpu/configured-max, scoped to the target repo) and, on a
+**state change** into/out of "occupancy at or over that headroom" for that
+repo, logs a warning and publishes a `daemon.dispatch.headroom_advisory`
+event-bus event (state-change-deduped — never a per-call stream, keyed
+per-repo so a multi-workspace daemon's repos don't cross-suppress each
+other's advisories). This required **zero protocol change**: no new
+`Request::DispatchSweep` field, no new `Response` variant — the advisory is a
+side channel exactly like the token-capacity advisory. Every `dispatch_sweep`
+call's log line additionally always names the current occupancy/dynamic-cap
+axes (not just on the deduped transition), so `RUST_LOG=loom_daemon=info`
+shows the same headroom picture the work finder's own tick log shows, without
+duplicating the `cpu_headroom_snapshot`/`disk_headroom_limit` plumbing
+`loom-daemon status` (`build_daemon_status`) already exposes.
+
+The handler never calls the **refreshing** CPU probe
+(`cpu_headroom::cpu_headroom_limit`, which sleeps ~1s on macOS via `iostat`)
+while holding the sweep-registry mutex — doing so would stall every other IPC
+request scoped to the same registry for that second. It uses the
+**non-refreshing** `cpu_headroom::cpu_headroom_snapshot` (the memoized idle
+fraction; never blocks) instead, the same call `build_daemon_status` makes.
+
 **Per-token concurrency factor (#3947).** The token axis is `healthy × factor`,
 not `healthy × 1`. The factor is resolved with the standard precedence **env
 (`LOOM_PER_TOKEN_CONCURRENCY`) > config (`autonomous.perTokenConcurrency`) >
@@ -1454,6 +1540,7 @@ concurrency ceiling 5" and share it with the team:
       "enabled": true,
       "intervalSecs": 60,
       "maxConcurrent": 5,
+      "maxAdmissionsPerTick": 3,
       "quarantine": {
         "enabled": true,
         "threshold": 3,
@@ -1504,6 +1591,7 @@ exactly like `main_health_gate::read_build_gate_config`.
 | `autonomous.workFinder.enabled` | `LOOM_WORK_FINDER` | `false` | Master on/off for the finder loop |
 | `autonomous.workFinder.intervalSecs` | `LOOM_WORK_FINDER_INTERVAL_SECS` | `60` | Zero/invalid → default |
 | `autonomous.workFinder.maxConcurrent` | `LOOM_WORK_FINDER_MAX_CONCURRENT` | `3` | Operator **ceiling**, not a fixed target |
+| `autonomous.workFinder.maxAdmissionsPerTick` | `LOOM_WORK_FINDER_MAX_ADMISSIONS_PER_TICK` | `3` | Per-tick **ramp** cap (#4234) — bounds how many *new* sweeps one tick may admit, independent of `maxConcurrent`/the live dynamic cap. Zero/invalid → default; resolved once at startup, mirroring `estCoresPerSweep`. See [Per-tick admission (ramp) cap](#per-tick-admission-ramp-cap-4234) below |
 | `autonomous.workFinder.quarantine.enabled` | `LOOM_WORK_FINDER_QUARANTINE` | `true` | Insta-crash quarantine on/off (#3939). A safety backstop — defaults on |
 | `autonomous.workFinder.quarantine.threshold` | `LOOM_WORK_FINDER_QUARANTINE_THRESHOLD` | `3` | Consecutive insta-crashes before an issue is quarantined. Zero/invalid → default |
 | `autonomous.workFinder.quarantine.ttlSecs` | `LOOM_WORK_FINDER_QUARANTINE_TTL_SECS` | `3600` | How long a quarantine entry persists before auto-release. Zero/invalid → default |
