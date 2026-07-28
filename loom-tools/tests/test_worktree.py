@@ -179,7 +179,7 @@ class TestDocumentedBehaviorDifferences:
         instead of being removed. This prevents CWD corruption when the
         shell's working directory points to the deleted worktree.
 
-        Manual cleanup tools (loom-clean, stale-building-check.sh) remain
+        Manual cleanup tools (loom-clean, loom-recover-orphans) remain
         the proper place for worktree removal.
         """
         from loom_tools.worktree import _reset_stale_worktree_in_place

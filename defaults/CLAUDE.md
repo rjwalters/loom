@@ -1863,11 +1863,7 @@ which claude
 
 **Orphaned issues stuck in loom:building state**:
 
-When an agent crashes or is cancelled while building, issues can get stuck in `loom:building` state without a PR. Recover them with the orphan-recovery tool documented immediately below (there is no `stale-building-check.sh` script — the historical script was never ported; use `loom-recover-orphans` / the `loom-orphan-recovery` guidance that follows).
-
-**Configuration via environment**:
-- `STALE_THRESHOLD_HOURS=2` - Hours before issue without PR is considered stale
-- `STALE_WITH_PR_HOURS=24` - Hours before issue with stale PR is flagged
+When an agent crashes or is cancelled while building, issues can get stuck in `loom:building` state without a PR. The shell script that historically handled this was deleted in `b811fca8` (#3433, "delete shepherd brain + /shepherd skill + milestone writers") during the v0.10.0 shepherd deprecation. Its successor is `loom-recover-orphans`, documented immediately below.
 
 **Orphaned task recovery (daemon dispatch crashes)**:
 
