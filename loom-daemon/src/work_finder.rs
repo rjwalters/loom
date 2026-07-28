@@ -567,6 +567,28 @@ pub fn dispatch_held_per_root(
         .collect()
 }
 
+/// Fold the daemon-global scheduled-drain flag (#4090) on top of the per-root
+/// dispatch holds computed by [`dispatch_held_per_root`] (#3930 verified-red +
+/// #4084 gate-in-flight).
+///
+/// A scheduled drain is daemon-global: it pauses new dispatch in EVERY repo at
+/// once, so `draining` is OR'd onto every root's per-root hold. The two terms
+/// are fully independent: a drain holds every root regardless of its gate
+/// state, and a gate in flight holds its own root regardless of drain state.
+/// With `draining = false` the result is byte-for-byte `dispatch_held_per_root`.
+#[must_use]
+pub fn dispatch_held_per_root_with_drain(
+    health_states: &WorkspaceHealthStates,
+    roots: &[std::path::PathBuf],
+    suppress_dispatch_during_gate: bool,
+    draining: bool,
+) -> Vec<bool> {
+    dispatch_held_per_root(health_states, roots, suppress_dispatch_during_gate)
+        .into_iter()
+        .map(|h| h || draining)
+        .collect()
+}
+
 pub fn tick_multi<S: WorkSource, D: WorkDispatcher>(
     workspaces: &mut [(S, D)],
     priorities: &[u32],
@@ -1260,11 +1282,12 @@ pub fn spawn_multi_work_finder_task(
             // regardless of gate state, and a gate in flight holds its own root
             // regardless of drain state.
             let draining = drain.load(std::sync::atomic::Ordering::Relaxed);
-            let halted: Vec<bool> =
-                dispatch_held_per_root(&health_states, &roots, suppress_dispatch_during_gate)
-                    .into_iter()
-                    .map(|h| h || draining)
-                    .collect();
+            let halted = dispatch_held_per_root_with_drain(
+                &health_states,
+                &roots,
+                suppress_dispatch_during_gate,
+                draining,
+            );
             let any_halted = halted.iter().any(|&h| h);
 
             let mut pairs: Vec<(GhWorkSource, RegistryDispatcher)> = roots
@@ -3289,6 +3312,84 @@ exit 0
         // Sanity: with the suppressor on, root_a is additionally held.
         let held_on = dispatch_held_per_root(&states, &[root_a, root_b], true);
         assert_eq!(held_on, vec![true, true]);
+    }
+
+    #[test]
+    fn test_dispatch_held_per_root_with_drain_holds_every_root() {
+        // A daemon-global scheduled drain (#4090) holds EVERY root at once,
+        // regardless of each root's gate state — the merge with #4084 must not
+        // let the per-root gate term shadow the global drain term.
+        let states = WorkspaceHealthStates::new();
+        let root_a = std::path::PathBuf::from("/tmp/repo-a");
+        let root_b = std::path::PathBuf::from("/tmp/repo-b");
+        // Neither root is verified-red nor has a gate in flight.
+        let held = dispatch_held_per_root_with_drain(
+            &states,
+            &[root_a, root_b],
+            true, // suppressor on
+            true, // draining
+        );
+        assert_eq!(
+            held,
+            vec![true, true],
+            "a scheduled drain holds every root regardless of gate state"
+        );
+    }
+
+    #[test]
+    fn test_dispatch_held_per_root_with_drain_gate_still_per_root_when_not_draining() {
+        // With no drain in progress the gate-in-flight term stays strictly
+        // per-root: only the root whose gate run is in flight is held, its
+        // sibling keeps dispatching (#3930 isolation contract survives #4090).
+        let states = WorkspaceHealthStates::new();
+        let root_a = std::path::PathBuf::from("/tmp/repo-a");
+        let root_b = std::path::PathBuf::from("/tmp/repo-b");
+        states.get_or_create(&root_a).set_gate_in_flight(true);
+        let held = dispatch_held_per_root_with_drain(
+            &states,
+            &[root_a, root_b],
+            true,  // suppressor on
+            false, // not draining
+        );
+        assert_eq!(
+            held,
+            vec![true, false],
+            "gate-in-flight holds only its own root when not draining"
+        );
+    }
+
+    #[test]
+    fn test_dispatch_held_per_root_with_drain_terms_are_independent() {
+        // Both terms compose additively: a drain holds a healthy root, and a
+        // gate in flight holds its own root — with the drain on, every root is
+        // held whether or not its gate is in flight.
+        let states = WorkspaceHealthStates::new();
+        let root_a = std::path::PathBuf::from("/tmp/repo-a"); // gate in flight
+        let root_b = std::path::PathBuf::from("/tmp/repo-b"); // healthy
+        states.get_or_create(&root_a).set_gate_in_flight(true);
+        let held = dispatch_held_per_root_with_drain(
+            &states,
+            &[root_a, root_b],
+            true, // suppressor on
+            true, // draining
+        );
+        assert_eq!(held, vec![true, true], "drain OR gate-in-flight: both roots held");
+    }
+
+    #[test]
+    fn test_dispatch_held_per_root_with_drain_no_drain_matches_per_root() {
+        // With `draining = false` the result is byte-for-byte the plain
+        // per-root vector — the drain fold is a pure superset, never a
+        // regression of the #4084 / #3930 semantics.
+        let states = WorkspaceHealthStates::new();
+        let root_a = std::path::PathBuf::from("/tmp/repo-a");
+        let root_b = std::path::PathBuf::from("/tmp/repo-b");
+        states.get_or_create(&root_a).set_gate_in_flight(true);
+        states.get_or_create(&root_b).set_halted(true);
+        let roots = [root_a, root_b];
+        let plain = dispatch_held_per_root(&states, &roots, true);
+        let with_drain = dispatch_held_per_root_with_drain(&states, &roots, true, false);
+        assert_eq!(plain, with_drain, "draining=false ⇒ identical to dispatch_held_per_root");
     }
 
     #[test]
