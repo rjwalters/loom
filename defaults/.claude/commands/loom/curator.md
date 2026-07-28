@@ -428,17 +428,19 @@ gh issue close <number> --reason "not planned"
 
 ### Duplicate Detection
 
-**Check for potential duplicates during curation** using the duplicate detection script. Use `--include-merged-prs` to also catch issues that overlap with recently merged PRs or recently closed issues:
+**Check for potential duplicates during curation** using the duplicate detection script. Use `--include-merged-prs` to also catch issues that overlap with recently merged PRs or recently closed issues, and pass `--issue <number>` so the script also probes for **related open work** — see "Related Open Work (Cross-References)" immediately below, a different question from duplication:
 
 ```bash
 # Get issue title and body
 TITLE=$(gh issue view <number> --json title --jq .title)
 BODY=$(gh issue view <number> --json body --jq .body)
 
-# Check for similar existing issues, merged PRs, and closed issues
-if ! ./.loom/scripts/check-duplicate.sh --include-merged-prs "$TITLE" "$BODY"; then
-    # Potential duplicate found - investigate before marking curated
-    echo "Potential duplicate detected - review similar issues"
+# Check for similar existing issues, merged PRs, closed issues, AND open
+# issues/PRs that cross-reference this one (--issue, issue #4162)
+if ! ./.loom/scripts/check-duplicate.sh --include-merged-prs --issue "<number>" "$TITLE" "$BODY"; then
+    # DUPLICATE_FOUND and/or RELATED_OPEN_WORK found - read the full output
+    # before marking curated
+    echo "Potential duplicate or related open work detected - review before curating"
 fi
 ```
 
@@ -475,6 +477,31 @@ fi
    ```
 
 **Why this matters**: closing on a **clear, stated rationale** keeps the backlog healthy and — because the work-finder only polls *open* issues — removes the item from the queue without a loop. But an **unverified** guess should be flagged, not closed, and never close an issue that is being actively built (`loom:building`) by another agent (see issue #2084 where a curator closed #1981 mid-processing, requiring manual intervention — coordinate via a comment when an issue is in flight).
+
+### Related Open Work (Cross-References, issue #4162)
+
+Duplicate detection answers "has this been reported before?" — it does **not** catch open issues that argue for a **different or changed spec** for the one you're curating. A real incident: an open issue explicitly named the target issue's number in its body (a critique of the target's acceptance criteria), was never surfaced because it wasn't a *duplicate*, and the target got curated — and later built — against a spec that other open work had already argued was wrong.
+
+`check-duplicate.sh --issue <number>` (see the invocation above) closes this gap by probing GitHub's timeline API for **open** issues/PRs whose body or comments cross-reference `<number>` (a `#<number>` mention — a structural signal GitHub already computes, not a similarity heuristic). When present, they appear in a `RELATED_OPEN_WORK` block, **distinct from** any `DUPLICATE_FOUND` block:
+
+```
+RELATED_OPEN_WORK
+#87: Rework the retry policy this issue assumes (open issue, cross-references #42)
+PR #90: Implement alternate approach (open PR, cross-references #42)
+```
+
+**This is required reading, not optional context — silence is not a valid outcome.** For **every** issue listed under `RELATED_OPEN_WORK`, your enhancement comment must explicitly state one of:
+
+- **Absorbed** — you read it and changed the acceptance criteria/spec accordingly. Say what changed and cite the cross-referencing issue.
+- **Disregarded** — you read it and it does not apply (wrong scope, superseded, already resolved). State the reason, not just "not applicable."
+
+```bash
+gh issue comment <number> --body "Related open work: #87 argues the retry policy should be event-driven rather than polling. Absorbed — updated the AC to require an event-driven retry, see revised Acceptance Criteria above."
+# or:
+gh issue comment <number> --body "Related open work: #87 discusses a different subsystem (auth, not this issue's caching layer) — disregarded as out of scope for this issue."
+```
+
+A `RELATED_OPEN_WORK` hit is **not** grounds for closing or auto-rescoping on its own — it is a signal to actively reconcile the spec (or explicitly reject the reconciliation) before marking `loom:curated`, since the whole point is preventing a Builder from shipping against a spec another open issue has already argued is wrong. GitHub-specific: on a non-GitHub forge (or an API failure) the probe degrades gracefully (stderr warning, empty result) rather than failing the duplicate check.
 
 ### Planning
 - Document multiple implementation approaches
