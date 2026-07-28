@@ -345,6 +345,26 @@ pub trait WorkDispatcher {
     /// Returns an error when the dispatch fails (e.g. a claim-lock collision).
     /// The caller logs and counts it; it is never fatal.
     fn dispatch(&mut self, issue: u32) -> Result<bool>;
+
+    /// Count of in-flight sweeps that occupy the work-finder's concurrency
+    /// budget (Issue #4003).
+    ///
+    /// Defaults to `in_flight().len()` — the pre-#4003 behavior — for
+    /// dispatchers that don't model a startup-proof discount (e.g. test
+    /// fakes). [`RegistryDispatcher`] overrides this to exclude a sweep that
+    /// has been dispatched longer than its registry's startup-proof grace
+    /// window with zero observed startup signal (no worktree, no checkpoint,
+    /// no log output past the spawn header), so a wedged child frees its slot
+    /// for a healthy queued sweep well before the (unchanged, 300s) startup
+    /// watchdog would act. `in_flight()` itself — the dedup set used to skip
+    /// an issue that already has a live sweep — is deliberately UNCHANGED by
+    /// this: dedup safety comes from the registry's claim lock and the forge
+    /// `loom:building` label, not from occupancy accounting, so discounting a
+    /// wedged sweep here only ever lets a *different* queued issue take its
+    /// slot.
+    fn occupancy(&self) -> usize {
+        self.in_flight().len()
+    }
 }
 
 // ============================================================================
@@ -434,7 +454,11 @@ pub fn tick(
 
     let in_flight = dispatcher.in_flight();
     let quarantined = dispatcher.quarantined();
-    let mut occupancy = in_flight.len();
+    // Occupancy (Issue #4003) is a distinct, possibly-smaller count than
+    // `in_flight.len()`: a dispatcher may discount a spawned-but-unproven
+    // sweep past its startup-proof grace window. `in_flight` itself stays the
+    // full dedup set for the `contains()` check below.
+    let mut occupancy = dispatcher.occupancy();
 
     for item in ready {
         // 1. Defensive skip-label filter (stale forge cache).
@@ -494,10 +518,13 @@ pub fn tick(
 /// load-bearing (and directly map to the issue's acceptance criteria):
 ///
 /// 1. **Single global budget.** The occupancy seed is the *sum* of every
-///    dispatcher's in-flight sweeps, and `occupancy` is incremented across
-///    workspace boundaries, so the combined dispatches of all workspaces in one
-///    tick never exceed `max_concurrent`. The token pool and scratch volume the
-///    cap protects are machine-level, so the budget must be shared, not
+///    dispatcher's own [`WorkDispatcher::occupancy`] count (Issue #4003: this
+///    may discount a spawned-but-not-yet-proven-started sweep, so it can be
+///    smaller than the sum of `in_flight().len()`), and `occupancy` is
+///    incremented across workspace boundaries, so the combined dispatches of
+///    all workspaces in one tick never exceed `max_concurrent`. The token pool
+///    and scratch volume the cap protects are machine-level, so the budget
+///    must be shared, not
 ///    replicated per repo.
 /// 2. **Per-workspace error isolation.** A source (`list_ready_issues`) failure
 ///    for one workspace is logged and counted in [`TickReport::errors`], then the
@@ -600,9 +627,12 @@ pub fn tick_multi<S: WorkSource, D: WorkDispatcher>(
     let mut report = TickReport::default();
 
     // Snapshot per-workspace in-flight sets *first* (immutable borrow) so the
-    // global occupancy seed is the sum across all workspaces before any dispatch.
+    // dedup filtering below always has the full in-flight view.
     let in_flights: Vec<HashSet<u32>> = workspaces.iter().map(|(_, d)| d.in_flight()).collect();
-    let mut occupancy: usize = in_flights.iter().map(HashSet::len).sum();
+    // The global occupancy seed (Issue #4003) is the sum of each dispatcher's
+    // OWN occupancy count, which may discount a spawned-but-unproven sweep —
+    // distinct from (and never larger than) the in-flight dedup sets above.
+    let mut occupancy: usize = workspaces.iter().map(|(_, d)| d.occupancy()).sum();
 
     // Snapshot each workspace's quarantined set (#3939) alongside its in-flight
     // set. Quarantined candidates are dropped in pass 1 *before* the global sort
@@ -1591,6 +1621,24 @@ pub mod forge {
                     HashSet::new()
                 }
             }
+        }
+
+        /// Discounted occupancy count (Issue #4003): a sweep dispatched longer
+        /// than the registry's configured startup-proof grace window with zero
+        /// observed startup signal does not count toward the budget — see
+        /// `SweepRegistry::occupied_issues`. Reap-on-read first, mirroring
+        /// `in_flight()`, so a child whose process already exited never
+        /// over-counts either.
+        fn occupancy(&self) -> usize {
+            let mut reg = match self.registry.lock() {
+                Ok(r) => r,
+                Err(poisoned) => {
+                    log::error!("work_finder: sweep registry mutex poisoned ({poisoned:?})");
+                    return 0;
+                }
+            };
+            reg.reap_liveness();
+            reg.occupied_issues().len()
         }
 
         fn collisions(&self) -> u64 {

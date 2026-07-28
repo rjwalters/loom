@@ -764,6 +764,18 @@ async fn main() -> Result<()> {
     sweep.set_dispatch_stagger(dispatch_stagger);
     log::info!("sweep_registry: dispatch stagger = {}ms (#3887)", dispatch_stagger.as_millis());
 
+    // Startup-proof occupancy grace (Issue #4003): a freshly-dispatched sweep
+    // counts toward the work-finder's admission budget regardless of progress
+    // for this long; past it, a sweep with zero observed startup-proof signal
+    // (no worktree/checkpoint/log-past-header) stops consuming a slot, well
+    // before the (unchanged) 300s startup watchdog would cancel/re-dispatch it.
+    let startup_proof_grace = sweep_registry::resolve_startup_proof_grace(&startup_race_config);
+    sweep.set_startup_proof_grace(startup_proof_grace);
+    log::info!(
+        "sweep_registry: startup-proof occupancy grace = {}s (#4003)",
+        startup_proof_grace.as_secs()
+    );
+
     // Insta-crash quarantine (#3939): resolve env > config > default for the
     // default workspace so the reaper quarantines a repeatedly-insta-crashing
     // issue instead of letting the work finder re-dispatch it every tick.
