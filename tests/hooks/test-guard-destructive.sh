@@ -2399,6 +2399,72 @@ rm -rf "$TT_NULL_REPO" "$TT_NONBOOL_REPO"
 echo ""
 
 # =========================================================================
+echo -e "${YELLOW}--- Stash-stack scope: git stash pop/drop/clear in the main checkout (#4281) ---${NC}"
+# =========================================================================
+#
+# The main checkout's stash stack is operator-owned (preserved diagnostic
+# state, deliberately-parked WIP) — a role subagent's ad-hoc integration
+# check (test-merge, conflict inspection) must never pop/drop/clear it. Uses
+# make_wt_repo_linked (defined above, in the write-confinement section) so the
+# ask/allow test exercises the REAL show-toplevel-vs-git-common-dir divergence
+# between a main checkout and a linked worktree, exactly like the #4210
+# write-confinement regression tests.
+
+ST_REPO=$(make_wt_repo_linked)
+ST_WT_DIR="$ST_REPO/.loom/worktrees/issue-1"
+
+assert_ask "stash-scope: git stash pop in main checkout asks (#4281)" \
+    "git stash pop" "$ST_REPO"
+assert_ask "stash-scope: git stash drop in main checkout asks (#4281)" \
+    "git stash drop" "$ST_REPO"
+assert_ask "stash-scope: git stash clear in main checkout asks (#4281)" \
+    "git stash clear" "$ST_REPO"
+
+assert_allow "stash-scope: git stash pop in a linked worktree cwd allows (#4281)" \
+    "git stash pop" "$ST_WT_DIR"
+assert_allow "stash-scope: git stash drop in a linked worktree cwd allows (#4281)" \
+    "git stash drop" "$ST_WT_DIR"
+assert_allow "stash-scope: git stash clear in a linked worktree cwd allows (#4281)" \
+    "git stash clear" "$ST_WT_DIR"
+
+# Non-destructive stash subcommands never remove an entry from the stack, so
+# they stay ungated even in the main checkout — including the bare `git stash`
+# form, which defaults to `push`.
+assert_allow "stash-scope: git stash push in main checkout stays ungated" \
+    "git stash push -m wip" "$ST_REPO"
+assert_allow "stash-scope: git stash apply in main checkout stays ungated" \
+    "git stash apply" "$ST_REPO"
+assert_allow "stash-scope: git stash list in main checkout stays ungated" \
+    "git stash list" "$ST_REPO"
+assert_allow "stash-scope: bare git stash (defaults to push) in main checkout stays ungated" \
+    "git stash" "$ST_REPO"
+
+# Chained form: a stash pop after a read-only prefix must still be caught —
+# proves the check runs against the full command, not just a first-token match.
+assert_ask "stash-scope: chained 'git status && git stash pop' still asks in main checkout (#4281)" \
+    "git status && git stash pop" "$ST_REPO"
+
+# Toggle opt-out: guards.stashScope:false / LOOM_GUARD_STASH_SCOPE=0 (default on).
+ST_REPO_OFF=$(make_wt_repo_linked)
+mkdir -p "$ST_REPO_OFF/.loom"
+printf '%s' '{"guards":{"stashScope":false}}' > "$ST_REPO_OFF/.loom/config.json"
+assert_allow "stash-scope: guards.stashScope:false -> allow in main checkout" \
+    "git stash pop" "$ST_REPO_OFF"
+assert_allow_env "stash-scope: LOOM_GUARD_STASH_SCOPE=0 -> allow in main checkout" \
+    "LOOM_GUARD_STASH_SCOPE=0" "git stash pop" "$ST_REPO"
+assert_ask_env "stash-scope: LOOM_GUARD_STASH_SCOPE=1 overrides config-off -> ask" \
+    "LOOM_GUARD_STASH_SCOPE=1" "git stash pop" "$ST_REPO_OFF"
+
+# Read-only fast path is unaffected: `git status` alone still fast-paths to
+# allow (it never reaches the stash check at all).
+assert_allow "stash-scope: git status alone still allowed (read-only fast path unaffected)" \
+    "git status" "$ST_REPO"
+
+rm -rf "$ST_REPO" "$ST_REPO_OFF"
+
+echo ""
+
+# =========================================================================
 echo -e "${YELLOW}--- Performance check ---${NC}"
 # =========================================================================
 

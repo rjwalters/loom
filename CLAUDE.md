@@ -248,8 +248,8 @@ Configuration lives in `.loom/config.json` (committed for team sharing): a
 - **Guard hooks** — `PreToolUse` guards block/ask on destructive commands and
   confine Edit/Write to a builder's worktree; category toggles (`guards.sqlDdl`,
   `cloudCli`, `reversibleGh`, `rmScope`, `forceScope`, `readOnlyFastPath`,
-  `decisionLog`, `worktreeIsolation`, each with an `LOOM_*` env override) let a
-  repo opt out. Catalog: [`defaults/docs/guard-hooks.md`](defaults/docs/guard-hooks.md).
+  `decisionLog`, `worktreeIsolation`, `stashScope`, each with an `LOOM_*` env
+  override) let a repo opt out. Catalog: [`defaults/docs/guard-hooks.md`](defaults/docs/guard-hooks.md).
 - **MCP hooks** — the unified `mcp-loom` server; run `./scripts/setup-mcp.sh` to
   generate `.mcp.json`. See the mcp-loom README.
 

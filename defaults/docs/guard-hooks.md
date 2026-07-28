@@ -404,6 +404,88 @@ LOOM_FORCE_SCOPE=protected git push --force origin feature/x   # allowed
 LOOM_FORCE_SCOPE=all git reset --hard HEAD~1   # ASK
 ```
 
+### Stash-Stack Scope Guard (`guards.stashScope` / `LOOM_GUARD_STASH_SCOPE`)
+
+**The main checkout's stash stack is operator-owned, not scratch space.**
+Preserved diagnostic state (e.g. contamination evidence intentionally
+`git stash`-parked for later investigation) and in-progress operator WIP can
+sit on the main checkout's stash stack indefinitely, with no marker
+distinguishing "safe to pop" from "evidence, do not touch." A role subagent
+doing an ad-hoc integration check (a throwaway test-merge branch, a conflict
+inspection) has no way to tell the difference before running `git stash pop`.
+
+The 2026-07-28 incident this guard exists for (#4281): a Judge, reviewing a
+PR, ran a local test-merge **in the main checkout** and inadvertently
+`git stash pop`'d a stash entry that had been deliberately preserved — "sweep
+contamination, preserved for investigation." The pop happened to conflict, so
+nothing was lost this time (the Judge ran `git reset --hard` to discard the
+partial application and verified the stash stack was intact afterward) — but a
+**clean** pop would have silently dropped the preserved entry with no recovery
+path. See `defaults/roles/judge.md`'s "Rebase Check" section for the
+prescribed alternative (merge `origin/main` into the PR branch inside an
+isolated worktree, never a main-checkout test-merge).
+
+`guard-destructive-generic.sh` asks for confirmation on `git stash pop`,
+`git stash drop`, and `git stash clear` **only when the command's cwd resolves
+to the main checkout** — never in a linked worktree, where a stash operation
+cannot touch the main checkout's stack at all. `git stash push` / `git stash
+apply` / `git stash list` (and the bare `git stash`, which defaults to `push`)
+are **not** gated — none of them can remove an entry from the stack.
+
+The main-checkout test compares `git rev-parse --show-toplevel` against
+`git rev-parse --git-common-dir/..`, both resolved from the command's cwd: they
+are equal only when cwd **is** the main checkout, and diverge when cwd is a
+linked worktree. This is deliberately **not** a subdirectory-prefix comparison
+against the main-checkout root, because Loom's own managed worktrees live
+**nested inside** the main checkout's directory tree
+(`<main>/.loom/worktrees/issue-N`) — a prefix test would ask inside a
+builder's own worktree too, since that path is textually "under" the main
+root even though it is a distinct working tree.
+
+The guard is **on by default**. It is resolved in this order (highest precedence first):
+
+1. **`LOOM_GUARD_STASH_SCOPE` env var** — `0`/`false`/`no` disables the guard; `1`/`true`/`yes` forces it on. Overrides the config value.
+2. **`.loom/config.json`** — `guards.stashScope` (default `true` when absent). Set it to `false` to disable:
+   ```json
+   {
+     "guards": {
+       "stashScope": false
+     }
+   }
+   ```
+3. **Default** — `true` (guard on).
+
+The config read is best-effort: a missing, empty, or malformed `.loom/config.json` falls through to guard-ON and never causes the hook to exit non-zero. Disabling this guard does not weaken any other guard.
+
+**Known limitation.** Unlike the force-op guard's `parse_force_ops` (which
+threads a `git -C <path>` argument through to resolve the real target), this
+check does not parse `-C`: `git -C <main-checkout-path> stash pop` run from a
+worktree cwd is **not** caught today. If this bypass shows up in practice,
+extend the check to thread `-C` the same way `parse_force_ops` does.
+
+**Examples**:
+
+```bash
+# In the main checkout — ASK (operator-owned stash stack):
+git stash pop
+git stash drop stash@{1}
+git stash clear
+
+# In a linked worktree (.loom/worktrees/issue-N) — allowed, no ask:
+cd .loom/worktrees/issue-42 && git stash pop
+
+# Never gated, in either location — these cannot remove a stash entry:
+git stash push -m "wip"
+git stash apply
+git stash list
+
+# Opt out for a whole repo:
+#   .loom/config.json  ->  { "guards": { "stashScope": false } }
+
+# One-off env opt-out for a single command:
+LOOM_GUARD_STASH_SCOPE=0 git stash pop
+```
+
 ### Read-Only Fast-Path Guard Toggle (`guards.readOnlyFastPath` / `LOOM_GUARD_READONLY_FASTPATH`)
 
 `guard-destructive.sh` is a `PreToolUse`/`Bash` hook, so it fires before **every** Bash tool call. In Bash-dense sessions (remote ops, benchmark drivers) nearly every call is obviously read-only — `git status`, `ls`, `grep`, `aws … describe*`, `gh … list` — yet each one otherwise runs the full deny/ask gauntlet (~37 `grep`/`awk`/`sed` forks plus a `git rev-parse`, ~179ms measured) before falling through to `allow`.
