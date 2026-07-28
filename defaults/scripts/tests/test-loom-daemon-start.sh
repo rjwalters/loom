@@ -156,6 +156,72 @@ if [[ -f "$WORKDIR/.loom/.daemon.pid" ]]; then
     kill "$(cat "$WORKDIR/.loom/.daemon.pid" 2>/dev/null)" 2>/dev/null || true
 fi
 
+# ---------- machine mode (Epic #3835 Phase 3b, #4229) ----------
+# LOOM_MACHINE_CHECKOUT (set by the `scripts/loom` dispatcher, never by a
+# direct invocation) overrides BOTH the resolved workdir (the checkout, not
+# $PWD) and the pid/flags/startup-log home ($HOME/.loom, not $REPO_ROOT/.loom)
+# -- and must work from a directory that has NO .loom/ at all, unlike the
+# dev-mode fallback below. Every write targets a SCRATCH $HOME, never the real
+# operator ~/.loom.
+MACHINE_HOME="$(mktemp -d)"
+MACHINE_CHECKOUT="$(mktemp -d)"
+NON_REPO_DIR="$(mktemp -d)"
+
+out=$( ( cd "$NON_REPO_DIR" && env -u LOOM_WORK_FINDER -u LOOM_MAIN_HEALTH_GATE \
+    HOME="$MACHINE_HOME" \
+    LOOM_MACHINE_CHECKOUT="$MACHINE_CHECKOUT" \
+    LOOM_DAEMON_BIN="$FAKE_BIN" \
+    bash "$START_SCRIPT" --foreground 2>&1 ) )
+TESTS_RUN=$((TESTS_RUN + 1))
+if echo "$out" | grep -q '^FAKE_DAEMON'; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} machine mode: start succeeds from a NON-REPO directory (no dev-mode '.loom directory not found' refusal)"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} machine mode: start succeeds from a NON-REPO directory"
+    echo "  output: $out"
+fi
+TESTS_RUN=$((TESTS_RUN + 1))
+if echo "$out" | grep -q "Mode:.*machine (workdir: $MACHINE_CHECKOUT"; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} machine mode: plist workdir resolves to the checkout, not \$PWD"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} machine mode: plist workdir resolves to the checkout, not \$PWD"
+    echo "  output: $out"
+fi
+TESTS_RUN=$((TESTS_RUN + 1))
+if [[ -f "$MACHINE_HOME/.loom/.daemon.flags" ]]; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} machine mode: persisted flags land under \$HOME/.loom (existing machine-level state home)"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} machine mode: persisted flags land under \$HOME/.loom (existing machine-level state home)"
+fi
+TESTS_RUN=$((TESTS_RUN + 1))
+if [[ ! -d "$NON_REPO_DIR/.loom" && ! -d "$MACHINE_CHECKOUT/.loom" ]]; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} machine mode: no runtime state leaks into \$PWD or the checkout"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} machine mode: no runtime state leaks into \$PWD or the checkout"
+fi
+
+# Dev-mode fallback (scope guard, filed AC5): direct invocation with NO
+# LOOM_MACHINE_CHECKOUT from that SAME non-repo directory still refuses exactly
+# as before #4229 -- machine mode is additive, not a replacement.
+out_dev=$( cd "$NON_REPO_DIR" && LOOM_DAEMON_BIN="$FAKE_BIN" bash "$START_SCRIPT" --foreground 2>&1 )
+rc_dev=$?
+TESTS_RUN=$((TESTS_RUN + 1))
+if [[ "$rc_dev" -ne 0 ]] && echo "$out_dev" | grep -qi "Not in a Loom workspace"; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} dev-mode fallback unchanged: refuses from a non-repo dir with no dispatcher (#4229 scope guard)"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} dev-mode fallback unchanged: refuses from a non-repo dir with no dispatcher (#4229 scope guard)"
+fi
+rm -rf "$MACHINE_HOME" "$MACHINE_CHECKOUT" "$NON_REPO_DIR"
+
 # ---------- launchd domain resolution (#4130) ----------
 # resolve_launchd_domain() (lib/launchd-domain.sh) picks gui/<uid> when the GUI
 # (Aqua) domain resolves — byte-for-byte the pre-#4130 default — else the

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # test-loom-dispatcher.sh — tests for the machine-level `loom` dispatcher and its
-# provisioning (Epic #3835 Phase 3a, #4157).
+# provisioning (Epic #3835 Phase 3a #4157, Phase 3b #4229).
 #
 # Covers:
 #   - scripts/loom — checkout resolution (AC1), collision resolution (AC3),
@@ -11,6 +11,11 @@
 #     (#4053), the symlink checkout (AC1), and the console-script invariant (AC6).
 #   - the no-shadow regression proving the two `loom` invocation forms stay
 #     disjoint (AC4).
+#   - Phase 3b (#4229): the `restart` verb (collision guard, supervised-IPC
+#     drain-and-roll, stop+start fallback) and the LOOM_MACHINE_CHECKOUT
+#     hand-off every delegating verb (start/stop/update/restart) gives its
+#     lifecycle-script delegate, INCLUDING from a non-repo directory (the
+#     concrete "loom update works outside a Loom source checkout" regression).
 #
 # Throwaway `mktemp -d` scratch per case, matching test-config-resolver.sh.
 
@@ -53,17 +58,20 @@ assert_eq() {
 make_checkout() {
     local c; c="$(mktemp -d)"
     mkdir -p "$c/defaults/scripts/cli" "$c/defaults/scripts/lib"
+    # Each stub also echoes the LOOM_MACHINE_CHECKOUT it inherited (empty
+    # string if unset) so tests can assert on the machine-mode hand-off
+    # (#4229) without changing any existing substring assertion below.
     cat > "$c/defaults/scripts/cli/loom-daemon-start.sh" <<'EOF'
 #!/usr/bin/env bash
-echo "STUB_START args=[$*]"
+echo "STUB_START args=[$*] machine_checkout=[${LOOM_MACHINE_CHECKOUT:-}]"
 EOF
     cat > "$c/defaults/scripts/cli/loom-daemon-stop.sh" <<'EOF'
 #!/usr/bin/env bash
-echo "STUB_STOP args=[$*]"
+echo "STUB_STOP args=[$*] machine_checkout=[${LOOM_MACHINE_CHECKOUT:-}]"
 EOF
     cat > "$c/defaults/scripts/cli/loom-daemon-update.sh" <<'EOF'
 #!/usr/bin/env bash
-echo "STUB_UPDATE args=[$*]"
+echo "STUB_UPDATE args=[$*] machine_checkout=[${LOOM_MACHINE_CHECKOUT:-}]"
 EOF
     chmod +x "$c/defaults/scripts/cli/"*.sh
     cp "$REAL_RESOLVER" "$c/defaults/scripts/lib/config-resolver.sh"
@@ -226,6 +234,80 @@ assert_eq "$after" "$before" "all 23 loom-* entries are byte-identical before/af
 [[ -f "$BIN2/loom" ]] && pass "only the 'loom' dispatcher was added" || fail "dispatcher not added to bin dir"
 count=$(cd "$BIN2" && ls loom-fake* 2>/dev/null | wc -l | tr -d ' ')
 assert_eq "$count" "23" "console-script count unchanged (23)"
+
+# ── Phase 3b (#4229): LOOM_MACHINE_CHECKOUT hand-off ─────────────────────────
+echo "Test 11: start/stop/update all hand LOOM_MACHINE_CHECKOUT to their delegates"
+out=$(cd "$CONSUMER" && LOOM_HOME="$CHK" bash "$DISPATCHER" start --machine 2>&1)
+assert_contains "$out" "machine_checkout=[$CHK]" "'start --machine' hands the resolved checkout to loom-daemon-start.sh"
+
+out=$(cd "$CONSUMER" && LOOM_HOME="$CHK" bash "$DISPATCHER" stop --machine 2>&1)
+assert_contains "$out" "machine_checkout=[$CHK]" "'stop --machine' hands the resolved checkout to loom-daemon-stop.sh"
+
+out=$(LOOM_HOME="$CHK" bash "$DISPATCHER" update --check 2>&1)
+assert_contains "$out" "machine_checkout=[$CHK]" "'update' hands the resolved checkout to loom-daemon-update.sh (Gap 1)"
+
+echo "Test 12: 'loom update' hands off the checkout from a NON-REPO directory too (Gap 1 regression)"
+out=$(cd "$NR" && LOOM_HOME="$CHK" bash "$DISPATCHER" update --check 2>&1)
+assert_contains "$out" "machine_checkout=[$CHK]" "'update' from a non-repo dir still resolves+hands off the machine checkout"
+rc_check=0
+(cd "$NR" && LOOM_HOME="$CHK" bash "$DISPATCHER" update --check >/dev/null 2>&1) || rc_check=$?
+assert_eq "0" "$rc_check" "'update --check' from a non-repo dir does not refuse (no 'only works inside a Loom source checkout')"
+
+# ── Phase 3b (#4229): the `restart` verb ─────────────────────────────────────
+echo "Test 13: bare 'loom restart' inside a consumer repo disambiguates like start/stop (same collision guard)"
+set +e
+out=$(cd "$CONSUMER" && LOOM_HOME="$CHK" bash "$DISPATCHER" restart 2>&1)
+rc=$?
+set -e 2>/dev/null || true
+assert_eq "$rc" "3" "bare 'loom restart' in a repo exits 3 (disambiguating non-zero)"
+assert_contains "$out" "loom restart --machine" "disambiguation names the machine surface for restart"
+assert_not_contains "$out" "STUB_STOP" "bare 'loom restart' did NOT run any delegate (no silent surface)"
+assert_not_contains "$out" "STUB_START" "bare 'loom restart' did NOT run any delegate (no silent surface)"
+
+echo "Test 14: 'loom restart --machine' prefers the supervised drain-and-roll IPC when loom-daemon accepts it"
+RESTART_BIN_OK=$(mktemp -d)
+cat > "$RESTART_BIN_OK/loom-daemon" <<'EOF'
+#!/usr/bin/env bash
+[[ "${1:-}" == "restart" ]] && exit 0
+exit 1
+EOF
+chmod +x "$RESTART_BIN_OK/loom-daemon"
+set +e
+out=$(cd "$CONSUMER" && PATH="$RESTART_BIN_OK:/usr/bin:/bin" LOOM_HOME="$CHK" bash "$DISPATCHER" restart --machine 2>&1)
+rc=$?
+set -e 2>/dev/null || true
+assert_eq "$rc" "0" "'loom restart --machine' exits 0 when the supervised restart IPC succeeds"
+assert_contains "$out" "restart scheduled" "reports the supervised drain-and-roll path"
+assert_not_contains "$out" "STUB_STOP" "supervised restart path never falls back to stop"
+assert_not_contains "$out" "STUB_START" "supervised restart path never falls back to start"
+
+echo "Test 15: 'loom restart --machine' falls back to stop-then-start when the supervised IPC refuses"
+RESTART_BIN_REFUSE=$(mktemp -d)
+cat > "$RESTART_BIN_REFUSE/loom-daemon" <<'EOF'
+#!/usr/bin/env bash
+exit 1
+EOF
+chmod +x "$RESTART_BIN_REFUSE/loom-daemon"
+set +e
+out=$(cd "$CONSUMER" && PATH="$RESTART_BIN_REFUSE:/usr/bin:/bin" LOOM_HOME="$CHK" bash "$DISPATCHER" restart --machine 2>&1)
+rc=$?
+set -e 2>/dev/null || true
+assert_eq "$rc" "0" "'loom restart --machine' falls back to stop+start and still exits 0"
+assert_contains "$out" "STUB_STOP" "fallback invokes the stop delegate"
+assert_contains "$out" "STUB_START" "fallback invokes the start delegate"
+
+echo "Test 16: 'loom restart --machine' falls back to stop-then-start when loom-daemon isn't on PATH at all"
+set +e
+out=$(cd "$CONSUMER" && PATH="/usr/bin:/bin" LOOM_HOME="$CHK" bash "$DISPATCHER" restart --machine 2>&1)
+rc=$?
+set -e 2>/dev/null || true
+assert_eq "$rc" "0" "'loom restart --machine' with no loom-daemon on PATH falls back to stop+start"
+assert_contains "$out" "STUB_STOP" "fallback invokes the stop delegate (no loom-daemon on PATH)"
+assert_contains "$out" "STUB_START" "fallback invokes the start delegate (no loom-daemon on PATH)"
+
+echo "Test 17: 'restart' is documented in help output"
+help_out=$(LOOM_HOME="$CHK" bash "$DISPATCHER" help 2>&1)
+assert_contains "$help_out" "restart" "'loom help' documents the restart verb"
 
 echo ""
 echo "======================================"

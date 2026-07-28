@@ -90,6 +90,17 @@
 #   LOOM_DAEMON_UPDATE_RELAUNCH  macOS/launchd only: 1/true/yes is equivalent to
 #                          passing --relaunch (opt in to the re-render + relaunch
 #                          on a refused restart).
+#   LOOM_MACHINE_CHECKOUT  Machine mode (Epic #3835 Phase 3b, #4229): set by the
+#                          `scripts/loom` dispatcher to the resolved
+#                          ~/.local/share/loom checkout before it execs this
+#                          script. When set, THIS is the source tree rebuilt
+#                          from (overriding the $PWD-based find_repo_root()
+#                          below), so `loom update` works from any directory --
+#                          a consumer repo, or no repo at all -- instead of
+#                          requiring $PWD to already be inside a Loom source
+#                          checkout. Direct invocation of this script (no
+#                          dispatcher -- the existing dev workflow) never sets
+#                          it and is unaffected.
 #
 # Exit codes:
 #   0  up to date (no-op) OR rebuild+provision+restart succeeded
@@ -230,7 +241,29 @@ while [[ $# -gt 0 ]]; do
 done
 
 REPO_ROOT=$(find_repo_root)
-if [[ -z "$REPO_ROOT" ]]; then
+
+# ---------- machine-mode source-tree override (Epic #3835 Phase 3b, #4229) --
+# Gap 1: this script rebuilds FROM SOURCE and used to resolve that source tree
+# by walking up from $PWD -- so from a consumer repo (find_repo_root() finds
+# the consumer repo, which has no loom-daemon/Cargo.toml) or a non-repo
+# directory (find_repo_root() finds nothing) it refused with "only works
+# inside a Loom source checkout", even though the `scripts/loom` dispatcher
+# had ALREADY resolved+validated the machine checkout before exec'ing here.
+# LOOM_MACHINE_CHECKOUT overrides the $PWD-derived REPO_ROOT with that
+# checkout, so `loom update` rebuilds it from any directory. Direct invocation
+# of this script (no dispatcher) never sets it and is unaffected -- the
+# pre-#4229 $PWD-based contract is the fallback below.
+MACHINE_CHECKOUT="${LOOM_MACHINE_CHECKOUT:-}"
+if [[ -n "$MACHINE_CHECKOUT" ]]; then
+    if [[ ! -d "$MACHINE_CHECKOUT" ]]; then
+        err "LOOM_MACHINE_CHECKOUT does not exist: $MACHINE_CHECKOUT"
+        exit 1
+    fi
+    REPO_ROOT="$MACHINE_CHECKOUT"
+    DAEMON_STATE_HOME="$HOME/.loom"
+elif [[ -n "$REPO_ROOT" ]]; then
+    DAEMON_STATE_HOME="$REPO_ROOT/.loom"
+else
     err "Not in a Loom workspace (.loom directory not found)"
     exit 1
 fi
@@ -242,10 +275,31 @@ if [[ ! -f "$DAEMON_DIR/Cargo.toml" ]]; then
     exit 1
 fi
 
-PID_FILE="$REPO_ROOT/.loom/.daemon.pid"
-FLAGS_FILE="$REPO_ROOT/.loom/.daemon.flags"
-START_SCRIPT="$REPO_ROOT/.loom/scripts/cli/loom-daemon-start.sh"
-STOP_SCRIPT="$REPO_ROOT/.loom/scripts/cli/loom-daemon-stop.sh"
+# Resolve a lifecycle script under REPO_ROOT: the INSTALLED copy first (a
+# self-hosted checkout's own .loom/scripts/cli/, kept in sync by
+# resync-installed.sh), falling back to defaults/scripts/cli/ -- the shipped
+# source of truth every Loom source checkout has, including a fresh clone that
+# has never been "installed" onto itself (machine mode may point at exactly
+# that). Direct (non-machine) invocation almost always resolves the first
+# candidate, matching pre-#4229 behavior byte-for-byte.
+resolve_lifecycle_script() {
+    local rel="$1" candidate
+    for candidate in \
+        "$REPO_ROOT/.loom/scripts/cli/$rel" \
+        "$REPO_ROOT/defaults/scripts/cli/$rel"; do
+        if [[ -x "$candidate" ]]; then echo "$candidate"; return 0; fi
+    done
+    echo ""
+}
+
+PID_FILE="$DAEMON_STATE_HOME/.daemon.pid"
+FLAGS_FILE="$DAEMON_STATE_HOME/.daemon.flags"
+START_SCRIPT="$(resolve_lifecycle_script loom-daemon-start.sh)"
+STOP_SCRIPT="$(resolve_lifecycle_script loom-daemon-stop.sh)"
+if [[ -z "$START_SCRIPT" || -z "$STOP_SCRIPT" ]]; then
+    err "Could not resolve loom-daemon-start.sh / loom-daemon-stop.sh under $REPO_ROOT (.loom/scripts/cli or defaults/scripts/cli)."
+    exit 1
+fi
 
 # ---------- staleness detection ----------
 DAEMON_BIN=$(locate_daemon_bin "$REPO_ROOT")
@@ -261,6 +315,9 @@ SOURCE_COMMIT=$(git -C "$REPO_ROOT" rev-parse --short HEAD 2>/dev/null || echo "
 
 echo "Installed binary: ${DAEMON_BIN:-<none found>} (commit ${INSTALLED_COMMIT})"
 echo "Source tree HEAD:  ${SOURCE_COMMIT}"
+if [[ -n "$MACHINE_CHECKOUT" ]]; then
+    echo "Source tree:       $REPO_ROOT (machine checkout, LOOM_MACHINE_CHECKOUT)"
+fi
 
 UPDATE_NEEDED=false
 if [[ -z "$DAEMON_BIN" ]]; then

@@ -6,7 +6,15 @@
 # ~/.local/bin/loom-daemon binary that provision-daemon.sh installs). It resolves
 # the machine-level Loom checkout (~/.local/share/loom) and exec's into it.
 #
-# Verbs (at minimum): start | stop | status | sweep | update.
+# Verbs (at minimum): start | stop | status | sweep | update | restart.
+#
+# Machine mode (Epic #3835 Phase 3b, #4229): every delegate this dispatcher
+# execs into (start/stop/update/restart) is handed the resolved checkout via
+# LOOM_MACHINE_CHECKOUT so the lifecycle scripts operate against the SAME
+# machine-level workdir/pid/flags home no matter what directory the operator
+# happened to invoke `loom` from — the launchd label they all drive
+# (com.rjwalters.loom-daemon) is a machine-wide singleton, not a per-repo one.
+# See defaults/docs/machine-dispatcher.md.
 #
 # ── NOT the same surface as ./.loom/bin/loom ────────────────────────────────
 # ./.loom/bin/loom is the PER-REPO tmux agent-pool manager (verbs: start status
@@ -135,21 +143,37 @@ loom_collision_guard() {
     exit 3
 }
 
-# Resolve + exec a daemon lifecycle script from the machine checkout, dropping
-# the leading --machine selector (the delegated script does not know that flag).
-loom_exec_checkout_script() {
-    local rel="$1"; shift
-    local checkout scripts_dir target
+# Resolve the machine checkout + its scripts/ tree, or die with a legible
+# error. Echoes "<checkout>\n<scripts_dir>" (two lines) on success. Shared by
+# every verb that delegates into the checkout (start/stop/update/restart) so
+# the "checkout missing" / "no scripts/ tree" messages stay identical across
+# all of them.
+loom_resolve_checkout_scripts() {
+    local checkout scripts_dir
     checkout="$(loom_resolve_checkout)"
     if [[ ! -e "$checkout" ]]; then
         _err "machine-level checkout not found at: $checkout"
         _err "install it (run the Loom installer) or set LOOM_HOME to a Loom checkout."
-        exit 1
+        return 1
     fi
     if ! scripts_dir="$(loom_checkout_scripts_dir "$checkout")"; then
         _err "no scripts/ tree under the machine checkout: $checkout"
-        exit 1
+        return 1
     fi
+    printf '%s\n%s\n' "$checkout" "$scripts_dir"
+}
+
+# Resolve + exec a daemon lifecycle script from the machine checkout, dropping
+# the leading --machine selector (the delegated script does not know that
+# flag). Exports LOOM_MACHINE_CHECKOUT so the delegate resolves its
+# workdir/pid/flags home from the checkout rather than $PWD (machine mode,
+# #4229) — see the file-header comment above.
+loom_exec_checkout_script() {
+    local rel="$1"; shift
+    local resolved checkout scripts_dir target
+    resolved="$(loom_resolve_checkout_scripts)" || exit 1
+    checkout="$(sed -n '1p' <<<"$resolved")"
+    scripts_dir="$(sed -n '2p' <<<"$resolved")"
     target="$scripts_dir/$rel"
     if [[ ! -x "$target" ]]; then
         _err "expected script not found or not executable: $target"
@@ -158,6 +182,7 @@ loom_exec_checkout_script() {
     local passthrough=()
     local a
     for a in "$@"; do [[ "$a" == "--machine" ]] && continue; passthrough+=("$a"); done
+    export LOOM_MACHINE_CHECKOUT="$checkout"
     # `${arr[@]+…}` guard: expand to nothing (not an empty arg) when the array is
     # empty, so this is safe under `set -u` on bash 3.2 (macOS default).
     exec "$target" ${passthrough[@]+"${passthrough[@]}"}
@@ -172,21 +197,69 @@ loom_cmd_stop()  { loom_detect_context; loom_collision_guard stop  "$@"; loom_ex
 # (loom-daemon-update.sh, built by #3968 and extended by the shipped #4055
 # self-update loop). It implements NO rebuild/reprovision/restart logic itself,
 # so it neither pre-empts #4017 (auto-rebuild-when-stale) nor duplicates #4055.
+#
+# Gap 1 fix (#4229): loom-daemon-update.sh rebuilds FROM SOURCE and used to
+# resolve its source tree by walking up from $PWD — which fails outside a Loom
+# source checkout even though THIS dispatcher already resolved+validated the
+# machine checkout above. Exporting LOOM_MACHINE_CHECKOUT hands that resolution
+# to the delegate as an explicit override, so `loom update` rebuilds the
+# checkout from any directory (a consumer repo, or no repo at all).
 loom_cmd_update() {
-    local checkout scripts_dir target
-    checkout="$(loom_resolve_checkout)"
-    if [[ ! -e "$checkout" ]] || ! scripts_dir="$(loom_checkout_scripts_dir "$checkout")"; then
-        _err "machine-level checkout not found at: ${checkout}"
-        _err "'loom update' only delegates to loom-daemon-update.sh in the checkout; install Loom or set LOOM_HOME."
-        exit 1
-    fi
+    local resolved checkout scripts_dir target
+    resolved="$(loom_resolve_checkout_scripts)" || exit 1
+    checkout="$(sed -n '1p' <<<"$resolved")"
+    scripts_dir="$(sed -n '2p' <<<"$resolved")"
     target="$scripts_dir/cli/loom-daemon-update.sh"
     if [[ ! -x "$target" ]]; then
         _err "update delegate not found or not executable: $target"
         _err "'loom update' is a thin delegator; it does not rebuild/restart on its own."
         exit 1
     fi
+    export LOOM_MACHINE_CHECKOUT="$checkout"
     exec "$target" "$@"
+}
+
+# `restart` (Gap 3, #4229): the filed scope lists start|stop|status|restart, but
+# only the first three shipped in #4157/#4208. Thin delegate mirroring
+# start/stop — same collision guard (the per-repo pool manager has no
+# `restart`, but guard consistency is cheaper than explaining an asymmetry) —
+# preferring drain-and-roll semantics: try the daemon's own supervised restart
+# IPC first (`loom-daemon restart`, #4077 — never tears down in-flight sweep
+# children, unlike a bootout), falling back to a plain stop-then-start when the
+# daemon isn't launchd-managed (or isn't running at all yet).
+loom_cmd_restart() {
+    loom_detect_context
+    loom_collision_guard restart "$@"
+
+    local resolved checkout scripts_dir stop_target start_target
+    resolved="$(loom_resolve_checkout_scripts)" || exit 1
+    checkout="$(sed -n '1p' <<<"$resolved")"
+    scripts_dir="$(sed -n '2p' <<<"$resolved")"
+    stop_target="$scripts_dir/cli/loom-daemon-stop.sh"
+    start_target="$scripts_dir/cli/loom-daemon-start.sh"
+    if [[ ! -x "$stop_target" || ! -x "$start_target" ]]; then
+        _err "expected lifecycle script(s) not found or not executable under: $scripts_dir/cli"
+        exit 1
+    fi
+
+    local passthrough=()
+    local a
+    for a in "$@"; do [[ "$a" == "--machine" ]] && continue; passthrough+=("$a"); done
+
+    export LOOM_MACHINE_CHECKOUT="$checkout"
+
+    if command -v loom-daemon >/dev/null 2>&1 && loom-daemon restart >/dev/null 2>&1; then
+        echo "loom-daemon restart scheduled (supervised drain-and-roll; in-flight sweeps preserved)."
+        exit 0
+    fi
+
+    _warn "supervised 'loom-daemon restart' unavailable or refused (not launchd-managed, or not currently running) — falling back to stop-then-start."
+    if ! "$stop_target" --restarting; then
+        _err "loom-daemon-stop.sh failed — not starting a new binary on top of a possibly-still-running old one."
+        exit 1
+    fi
+    # `${arr[@]+…}` guard: see loom_exec_checkout_script above.
+    exec "$start_target" ${passthrough[@]+"${passthrough[@]}"}
 }
 
 # `sweep <issue>` dispatches a single-issue lifecycle for the CURRENT repo.
@@ -271,7 +344,7 @@ loom_cmd_status() {
 
 loom_print_help() {
     cat <<EOF
-loom — machine-level Loom dispatcher (Epic #3835 Phase 3a)
+loom — machine-level Loom dispatcher (Epic #3835 Phase 3a/3b)
 
 USAGE:
     loom <command> [options]
@@ -279,6 +352,7 @@ USAGE:
 COMMANDS:
     start     Start the machine-level loom-daemon (delegates to loom-daemon-start.sh)
     stop      Stop the machine-level loom-daemon  (delegates to loom-daemon-stop.sh)
+    restart   Restart the machine-level loom-daemon (drain-and-roll; falls back to stop+start)
     status    Show machine-level + current-repo status (read-only)
     sweep     Dispatch /loom:sweep <issue> for the current repo
     update    Thin delegate to loom-daemon-update.sh (no rebuild logic of its own)
@@ -301,12 +375,13 @@ main() {
     local cmd="${1:-help}"
     shift || true
     case "$cmd" in
-        start)              loom_cmd_start "$@" ;;
-        stop)               loom_cmd_stop "$@" ;;
-        status)             loom_cmd_status "$@" ;;
-        sweep)              loom_cmd_sweep "$@" ;;
-        update)             loom_cmd_update "$@" ;;
-        help|--help|-h)     loom_print_help ;;
+        start)               loom_cmd_start "$@" ;;
+        stop)                loom_cmd_stop "$@" ;;
+        restart)             loom_cmd_restart "$@" ;;
+        status)              loom_cmd_status "$@" ;;
+        sweep)               loom_cmd_sweep "$@" ;;
+        update)              loom_cmd_update "$@" ;;
+        help|--help|-h)      loom_print_help ;;
         version|--version|-v) echo "loom dispatcher v${DISPATCHER_VERSION} (machine-level)" ;;
         *)
             _err "unknown command '$cmd'"

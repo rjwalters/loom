@@ -82,6 +82,17 @@
 #                        a host that needs one or two additional dirs (e.g. a
 #                        project-local toolchain) without inheriting the WHOLE
 #                        invoking shell's interactive PATH.
+#   LOOM_MACHINE_CHECKOUT  Machine mode (Epic #3835 Phase 3b, #4229): set by
+#                        the `scripts/loom` dispatcher to the resolved
+#                        ~/.local/share/loom checkout before it execs this
+#                        script. When set, the plist's WorkingDirectory and the
+#                        pid/flags home resolve from THIS path -- not from
+#                        $PWD -- so `loom start` manages the SAME machine-wide
+#                        singleton daemon no matter which repo it is run from.
+#                        Direct invocation of this script (the existing dev
+#                        workflow) never sets it and is unaffected: $PWD-based
+#                        find_repo_root() stays the fallback. See
+#                        defaults/docs/machine-dispatcher.md.
 #
 # Exit codes:
 #   0  daemon started (or already running)
@@ -468,7 +479,35 @@ while [[ $# -gt 0 ]]; do
 done
 
 REPO_ROOT=$(find_repo_root)
-if [[ -z "$REPO_ROOT" ]]; then
+
+# ---------- machine-mode resolution (Epic #3835 Phase 3b, #4229) ----------
+# LOOM_MACHINE_CHECKOUT (set by the `scripts/loom` dispatcher before it execs
+# this script) is authoritative regardless of $PWD: the launchd label this
+# script drives (com.rjwalters.loom-daemon) is a machine-wide singleton, so
+# `loom start` run from repo A and again from repo B must resolve the SAME
+# workdir + pid/flags home -- not two different ones keyed to whichever repo
+# happened to be $PWD when it was invoked. Direct invocation of this script
+# (no dispatcher -- the existing dev workflow) leaves this var unset and falls
+# through to the pre-#4229 $PWD-based contract below, byte-for-byte unchanged.
+MACHINE_CHECKOUT="${LOOM_MACHINE_CHECKOUT:-}"
+MACHINE_MODE=false
+if [[ -n "$MACHINE_CHECKOUT" ]]; then
+    MACHINE_MODE=true
+    if [[ ! -d "$MACHINE_CHECKOUT" ]]; then
+        err "LOOM_MACHINE_CHECKOUT does not exist: $MACHINE_CHECKOUT"
+        exit 1
+    fi
+    REPO_ROOT="$MACHINE_CHECKOUT"
+    # Runtime artifacts (pid file, persisted flags, startup log) live under the
+    # EXISTING machine-level state home (~/.loom -- socket, token pool,
+    # activity.db, and the daemon's own log already live there; see
+    # machine-dispatcher.md's "pid/flags relocation" note) rather than under
+    # the checkout itself, which may be a symlink to a developer's working
+    # clone and is not otherwise treated as writable runtime state.
+    DAEMON_STATE_HOME="$HOME/.loom"
+elif [[ -n "$REPO_ROOT" ]]; then
+    DAEMON_STATE_HOME="$REPO_ROOT/.loom"
+else
     err "Not in a Loom workspace (.loom directory not found)"
     exit 1
 fi
@@ -486,10 +525,10 @@ fi
 # stderr exactly once per run rather than once per plist rendered.
 PLIST_PATH_VALUE="$(resolve_plist_path)"
 
-PID_FILE="$REPO_ROOT/.loom/.daemon.pid"
+PID_FILE="$DAEMON_STATE_HOME/.daemon.pid"
 SOCKET_PATH="${LOOM_SOCKET_PATH:-$HOME/.loom/loom-daemon.sock}"
-START_LOG="$REPO_ROOT/.loom/logs/daemon-start.log"
-mkdir -p "$REPO_ROOT/.loom/logs"
+START_LOG="$DAEMON_STATE_HOME/logs/daemon-start.log"
+mkdir -p "$DAEMON_STATE_HOME/logs"
 
 # ---------- autonomy-desired marker + heartbeat paths (#4011) ----------
 # LOOM_DIR is the machine-level dir the daemon uses for its socket/log/heartbeat
@@ -509,7 +548,11 @@ if [[ -f "$PID_FILE" ]]; then
     existing_pid=$(cat "$PID_FILE" 2>/dev/null || true)
     if [[ -n "$existing_pid" ]] && kill -0 "$existing_pid" 2>/dev/null; then
         warn "loom-daemon already running (pid $existing_pid, per $PID_FILE)."
-        echo "To restart: ./.loom/scripts/cli/loom-daemon-stop.sh && $0" >&2
+        if [[ "$MACHINE_MODE" == "true" ]]; then
+            echo "To restart: loom restart  (or: loom stop && loom start)" >&2
+        else
+            echo "To restart: ./.loom/scripts/cli/loom-daemon-stop.sh && $0" >&2
+        fi
         exit 0
     fi
     # Stale PID file — clean it up and continue.
@@ -582,7 +625,7 @@ fi
 # --no-health-gate) is preserved verbatim, one per line. Written on every
 # start attempt (success or failure) so the record always reflects the most
 # recent invocation.
-FLAGS_FILE="$REPO_ROOT/.loom/.daemon.flags"
+FLAGS_FILE="$DAEMON_STATE_HOME/.daemon.flags"
 : > "$FLAGS_FILE"
 # Guard the array expansion: a bare invocation (the common case) leaves
 # ORIGINAL_ARGS empty, and "${arr[@]}" on a zero-element array is an unbound
@@ -601,6 +644,11 @@ fi
 echo "Daemon binary: $DAEMON_BIN"
 echo "Socket:        $SOCKET_PATH"
 echo "Daemon log:    ${HOME}/.loom/daemon.log"
+if [[ "$MACHINE_MODE" == "true" ]]; then
+    echo "Mode:          machine (workdir: $REPO_ROOT, state: $DAEMON_STATE_HOME)"
+else
+    echo "Mode:          dev (repo: $REPO_ROOT)"
+fi
 
 # ---------- foreground mode ----------
 if [[ "$FOREGROUND" == "true" ]]; then
@@ -742,7 +790,11 @@ if [[ "$USE_LAUNCHD" == "true" ]]; then
     ok "loom-daemon started under launchd (pid $daemon_pid, label $LAUNCHD_LABEL)."
     echo "PID file: $PID_FILE"
     echo "Intent marker: $INTENT_MARKER"
-    echo "Stop with: ./.loom/scripts/cli/loom-daemon-stop.sh"
+    if [[ "$MACHINE_MODE" == "true" ]]; then
+        echo "Stop with: loom stop"
+    else
+        echo "Stop with: ./.loom/scripts/cli/loom-daemon-stop.sh"
+    fi
     exit 0
 fi
 
@@ -774,5 +826,9 @@ write_intent_marker "false" ""
 provision_watchdog_job
 ok "loom-daemon started (pid $daemon_pid). PID file: $PID_FILE"
 echo "Intent marker: $INTENT_MARKER"
-echo "Stop with: ./.loom/scripts/cli/loom-daemon-stop.sh"
+if [[ "$MACHINE_MODE" == "true" ]]; then
+    echo "Stop with: loom stop"
+else
+    echo "Stop with: ./.loom/scripts/cli/loom-daemon-stop.sh"
+fi
 exit 0
