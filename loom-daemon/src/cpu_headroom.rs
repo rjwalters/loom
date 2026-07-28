@@ -304,6 +304,30 @@ pub fn read_loadavg_1m() -> Option<f64> {
     None
 }
 
+/// Pure: load-per-core = `loadavg_1m / ncpu`, or `None` when the load average
+/// is unavailable or the CPU count is zero. The host-distress circuit breaker
+/// (#4235) trips on this normalized ratio so its threshold is portable across
+/// hosts of different core counts (a raw load of 100 is catastrophic on 8 cores
+/// but routine on 128).
+#[must_use]
+pub fn load_per_core_from(loadavg_1m: Option<f64>, ncpu: usize) -> Option<f64> {
+    let load = loadavg_1m?;
+    if ncpu == 0 {
+        return None;
+    }
+    Some(load / ncpu as f64)
+}
+
+/// Sample the current load-per-core from live host inputs for the host-distress
+/// circuit breaker (#4235). Uses the **fast**, non-sleeping load-average read
+/// ([`read_loadavg_1m`] — a `/proc/loadavg` read on Linux, a quick `sysctl` on
+/// macOS), never the ~1s `iostat` idle sample, so it is safe to call inline from
+/// the work-finder loop each tick. `None` when no load-average source exists.
+#[must_use]
+pub fn load_per_core() -> Option<f64> {
+    load_per_core_from(read_loadavg_1m(), logical_cpu_count())
+}
+
 // ============================================================================
 // CPU utilization — measured idle fraction (#4031), OS-specific read, pure parse
 // ============================================================================

@@ -181,6 +181,17 @@ pub enum Request {
         /// workspace registry is used, exactly as before.
         #[serde(default)]
         workspace_root: Option<String>,
+        /// Operator override for the host-distress circuit breaker (Issue
+        /// #4235). A *tripped* breaker represents **sustained**, already-observed
+        /// host distress — a stronger signal than the point-in-time headroom
+        /// advisory — so it **hard-blocks** an explicit `dispatch_sweep` by
+        /// default (distinct from the deliberately-advisory headroom check, which
+        /// never blocks). `force: true` is the operator saying "I know the host
+        /// is distressed, dispatch anyway" and bypasses that block. When `false`
+        /// (or absent on the wire — `#[serde(default)]` keeps existing clients
+        /// byte-for-byte compatible) a tripped breaker refuses the dispatch.
+        #[serde(default)]
+        force: bool,
     },
     /// List tracked sweeps, optionally filtered by state.
     ListSweeps {
@@ -1046,6 +1057,50 @@ pub struct DaemonStatusReport {
     /// `#[serde(default)]` keeps pre-#4055 wire data compatible.
     #[serde(default)]
     pub auto_update_note: Option<String>,
+    /// Host-distress circuit-breaker state (Issue #4235). `Some` when a breaker
+    /// has been registered this process (the work-finder loop is running and the
+    /// breaker is enabled); `None` when no breaker is active — which the status
+    /// renderer treats as "breaker inactive", the zero-behavior-change baseline.
+    /// `#[serde(default)]` keeps pre-#4235 wire data / older clients compatible
+    /// (an absent field parses as `None`).
+    #[serde(default)]
+    pub host_breaker: Option<HostBreakerStatus>,
+}
+
+/// Host-distress circuit-breaker snapshot for `loom-daemon status` (Issue
+/// #4235). Rendered from [`crate::host_breaker::BreakerSnapshot`]. The
+/// `daemon.host_breaker.state` event carries the same transition data on every
+/// phase change; this is the point-in-time status view.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct HostBreakerStatus {
+    /// Whether the breaker is enabled (default ON — a safety backstop).
+    pub enabled: bool,
+    /// The current phase: `"closed"`, `"open"`, or `"cooldown"`.
+    pub phase: String,
+    /// Whether the breaker is currently suppressing new dispatch (Open or
+    /// CoolDown).
+    pub suppressed: bool,
+    /// Human-readable reason for the current non-Closed state; `None` while
+    /// Closed.
+    #[serde(default)]
+    pub reason: Option<String>,
+    /// When the breaker last tripped to Open; `None` while Closed.
+    #[serde(default)]
+    pub tripped_at: Option<DateTime<Utc>>,
+    /// When the current cool-down completes and normal dispatch resumes; `None`
+    /// outside CoolDown.
+    #[serde(default)]
+    pub releases_at: Option<DateTime<Utc>>,
+    /// The most recent load-per-core sample observed; `None` when no
+    /// load-average source is available.
+    #[serde(default)]
+    pub last_load_per_core: Option<f64>,
+    /// The configured load-per-core trip threshold.
+    pub load_per_core_threshold: f64,
+    /// The configured number of consecutive over-threshold ticks needed to trip.
+    pub sustain_ticks: u32,
+    /// The configured cool-down window, in seconds.
+    pub cooldown_secs: u64,
 }
 
 /// A live-locked sweep with no matching [`DaemonStatusReport::in_flight`] entry
