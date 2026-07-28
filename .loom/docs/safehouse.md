@@ -84,7 +84,8 @@ and **safehoused must be restarted** before it will accept the connection:
 3. Enable Loom narration (`safehouse.enabled = true`, or
    `LOOM_SAFEHOUSE_ENABLED=1`) and ensure the socket path resolves.
 4. Run a sweep; the room shows `loom-daemon → everyone · task` lines, threaded
-   per issue.
+   per **repo-qualified** issue (`<repo>_<issue>`, issue #4201) so two managed
+   repos' identically-numbered issues never collide into one thread.
 
 This static, operator-provisioned model is a phase-1 constraint. Per-issue
 personas (`loom_builder_42`) are blocked upstream until safehoused grows prefix
@@ -94,16 +95,64 @@ dispatch time; there is no such path.
 ## What gets narrated
 
 The sink maps the **existing frozen event taxonomy** (`event_bus.rs`,
-`types.rs`) to envelope-v1 messages. All are broadcast (`to: "*"`) and threaded
-by the bare issue number (`task_id`):
+`types.rs`) to envelope-v1 messages. All are broadcast (`to: "*"`).
+
+### Repo qualification (issue #4201)
+
+The daemon manages multiple workspaces (loom, vibesql, anvil, kicad-tools, …)
+behind a **single shared event bus** (`workspace_pool.rs`), so a bare issue
+number is not unique across them — loom `#4201` and vibesql `#4201` would
+otherwise thread into the *same* Matrix room thread. Every narrated event's
+`task_id` and body prefix are therefore **repo-qualified**:
+
+- **Convention**: the repo name is the **basename of the workspace-root
+  filesystem path** stamped onto the event's `repo` field by
+  `SweepRegistry::emit_event` (Issue #3929's pattern) — e.g.
+  `/Users/x/GitHub/vibesql` → `vibesql`. This is a path-derived directory name,
+  not a forge `owner/repo` slug: it needs no network call, and the daemon's
+  workspace registry already guarantees at most one managed registry per path.
+- **`task_id`**: `<repo>_<issue>` (e.g. `vibesql_6173`), with any character
+  outside the `[A-Za-z0-9_]` charset (`build_send_request` enforces this)
+  folded to `_` — so `kicad-tools` becomes `kicad_tools`.
+- **Body prefix**: `<repo>#<issue>` (e.g. `vibesql#6173`), used verbatim since
+  the body is free text with no charset restriction.
+- **Fallback**: an event with no `repo` known (a synthetic/test event, or one
+  from an era before this field existed) narrates with the pre-#4201
+  unqualified form — bare `<issue>` for `task_id`, bare `#<issue>` for the body
+  prefix — rather than erroring.
+
+`SweepGlobalDispatch` needed a small additive amendment (`repo: Option<String>`)
+to carry this — it was the one sweep-scoped event that had not yet been stamped
+with `repo`, unlike `SweepPhase`/`SweepBlocker`/`SweepExited`/`SweepCrashed`.
+
+### Body grammar (issue #4201)
+
+Every narrated body follows `<repo>#<issue> · <phase/status> [· <detail>] [—
+<commentary>]` — informal by design (there is no single rigid 4-field parse),
+but consistently repo-qualified and consistently favoring one line of
+actionable detail over the previous terse `issue #N …` phrasing:
 
 | Bus event | Envelope `type` | Body |
 |---|---|---|
-| `SweepGlobalDispatch` (Issue) | `task` | `sweep dispatched: issue #N` |
-| `SweepPhase` | `task` | `issue #N → <phase>` (+ `(PR #M)` when present) |
-| `SweepBlocker` | `handoff` | `issue #N blocked: <reason>` (a human must act) |
-| `SweepExited` | `ack` | `issue #N complete (exit <code>, <dur>s)` |
-| `SweepCrashed` | `handoff` | `issue #N crashed at <checkpoint_phase>` |
+| `SweepGlobalDispatch` (Issue) | `task` | `<repo>#N · dispatch` — the sink best-effort appends ` — "<issue title>"` (see below) |
+| `SweepPhase` | `task` | `<repo>#N · <phase>` (+ ` · PR #M open` when present) |
+| `SweepBlocker` | `handoff` | `<repo>#N · BLOCKED — <reason>` (a human must act) |
+| `SweepExited` (exit 0) | `ack` | `<repo>#N · done ✓ · <dur>` (e.g. `6m55s`) |
+| `SweepExited` (exit ≠ 0) | `ack` | `<repo>#N · failed ✗ · exit <code>[ (decoded)] · <dur>` — exit `78` decodes to `(EX_CONFIG: token pool)`; every other code prints raw (no attempt at a full sysexits table) |
+| `SweepCrashed` | `handoff` | `<repo>#N · crashed ✗ at <checkpoint_phase> — resumable (checkpoint kept)` |
+
+**Dispatch-line title (AC3)**: the operator's highest-value ask was seeing the
+issue title on the dispatch line (the single most common message in the room —
+33 of 60 messages in the first night's history were bare dispatch roots). The
+payload-amendment route (threading the title through `SweepGlobalDispatch`)
+was judged too heavy for this bug-fix issue, unlike the small `repo` amendment
+above (which fixes an actual collision bug). Instead the **sink** fetches it at
+narration time — one `gh issue view --json title --jq .title` in the event's
+workspace root, bounded by a 5s timeout, with a 10-minute cache keyed by
+`(workspace_root, issue)` so a re-dispatch of the same issue (e.g. after a
+Doctor cycle) does not re-shell to `gh`. Every failure (missing `gh`, no
+network, unauthenticated, timeout) degrades to narrating the dispatch line
+**without** a title — this never blocks narration or the sweep itself.
 
 `SweepGlobalCompleted` is intentionally **not** narrated: it carries only a
 `sweep_id` (no issue number), and `SweepExited` already emits the completion

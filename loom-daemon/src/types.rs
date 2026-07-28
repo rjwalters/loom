@@ -1195,7 +1195,19 @@ pub enum Event {
         repo: Option<String>,
     },
     /// `sweep.global.dispatch` — daemon dispatched a new sweep.
-    SweepGlobalDispatch { sweep_id: SweepId, kind: SweepKind },
+    SweepGlobalDispatch {
+        sweep_id: SweepId,
+        kind: SweepKind,
+        /// Owning managed-workspace root (Issue #3929's pattern, extended here
+        /// by #4201). This was the one sweep-scoped variant that did **not**
+        /// carry `repo` — the safehouse narration sink needs it to
+        /// repo-qualify this event's `task_id` (a bare issue number collides
+        /// across managed repos, e.g. loom #N vs vibesql #N narrating into the
+        /// same Matrix thread). `#[serde(default)]` keeps pre-#4201 wire data
+        /// compatible.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        repo: Option<String>,
+    },
     /// `sweep.global.completed` — daemon reaper recorded sweep completion.
     SweepGlobalCompleted {
         sweep_id: SweepId,
@@ -1266,9 +1278,10 @@ impl Event {
     /// | `TopicLag {..}` | `sweep.system.topic_lag` |
     /// | `Generic {topic, ..}` | the explicit topic string |
     ///
-    /// The four `SweepPhase` / `SweepBlocker` / `SweepExited` / `SweepCrashed`
-    /// variants also carry a `repo` payload field (Issue #3929) so a subscriber
-    /// on the shared `sweep.issue.{N}.*` bus can disambiguate two managed repos'
+    /// The `SweepPhase` / `SweepBlocker` / `SweepExited` / `SweepCrashed`
+    /// variants (Issue #3929), plus `SweepGlobalDispatch` (#4201), also carry a
+    /// `repo` payload field so a subscriber on the shared `sweep.issue.{N}.*`
+    /// bus (or the global dispatch topic) can disambiguate two managed repos'
     /// issue #N. The topic **strings are unchanged** — `repo` lives in the
     /// payload only, so existing single-repo subscribers route identically.
     #[must_use]
@@ -1290,21 +1303,23 @@ impl Event {
     }
 
     /// Stamp the owning managed-workspace `repo` into the sweep-scoped event
-    /// variants (Issue #3929), but only when the field is still absent — a
-    /// caller that already knows the repo (e.g. a `PublishEvent` payload from a
-    /// sweep child running in a specific workspace) is never overwritten.
+    /// variants (Issue #3929, extended to `SweepGlobalDispatch` by #4201), but
+    /// only when the field is still absent — a caller that already knows the
+    /// repo (e.g. a `PublishEvent` payload from a sweep child running in a
+    /// specific workspace) is never overwritten.
     ///
-    /// Non-sweep-scoped variants (`SweepGlobalDispatch` / `SweepGlobalCompleted`
-    /// already carry a unique `sweep_id`; `EpicAction`; `CapacityAdvisory`;
-    /// `TopicLag`; `Generic`) are left untouched. Called centrally from
-    /// `SweepRegistry::emit_event` so every emitted sweep event is stamped with
-    /// its registry's `workspace_root` without touching each construction site.
+    /// `SweepGlobalCompleted` (already carries a unique `sweep_id`), `EpicAction`,
+    /// `CapacityAdvisory`, `TopicLag`, and `Generic` are left untouched. Called
+    /// centrally from `SweepRegistry::emit_event` so every emitted sweep event
+    /// is stamped with its registry's `workspace_root` without touching each
+    /// construction site.
     pub fn set_repo_if_absent(&mut self, repo: &str) {
         let slot = match self {
             Self::SweepPhase { repo, .. }
             | Self::SweepBlocker { repo, .. }
             | Self::SweepExited { repo, .. }
-            | Self::SweepCrashed { repo, .. } => repo,
+            | Self::SweepCrashed { repo, .. }
+            | Self::SweepGlobalDispatch { repo, .. } => repo,
             _ => return,
         };
         if slot.is_none() {
