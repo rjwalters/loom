@@ -53,8 +53,11 @@
 #
 # Autonomy-desired marker (#4011): a normal operator stop is INTENT to stop, so
 # it removes the durable `autonomy-desired` marker loom-daemon-start.sh wrote and
-# boots out the watchdog LaunchAgent — after that the watchdog correctly stays
-# silent (no daemon is expected). But the internal stop that
+# tears down the watchdog scheduler — the launchd LaunchAgent on Darwin
+# (`launchctl bootout`), or the `<unit>-watchdog.timer` + `.service` pair on a
+# systemd Linux host (`systemctl --user disable --now`, #4260 sub-issue D) —
+# after that the watchdog correctly stays silent (no daemon is expected). But
+# the internal stop that
 # loom-daemon-update.sh performs is NOT operator intent to stop; it is a restart,
 # so update.sh passes --restarting (or LOOM_DAEMON_STOP_KEEP_INTENT=1) and this
 # script PRESERVES the marker + watchdog. Inferring restart-vs-stop would be
@@ -176,10 +179,11 @@ SOCKET_PATH="${LOOM_SOCKET_PATH:-$HOME/.loom/loom-daemon.sock}"
 LOOM_DIR="$(dirname "$SOCKET_PATH")"
 INTENT_MARKER="${LOOM_AUTONOMY_MARKER:-$LOOM_DIR/autonomy-desired}"
 
-# Remove the operator-intent marker and bump out the watchdog LaunchAgent. Only
-# called on an operator-initiated stop (NOT a --restarting update.sh stop). After
-# this the watchdog sees no marker and correctly stays silent — no false page on
-# a deliberate stop. Best-effort; failures never change the stop's exit status.
+# Remove the operator-intent marker and tear down the watchdog LaunchAgent /
+# systemd timer+service. Only called on an operator-initiated stop (NOT a
+# --restarting update.sh stop). After this the watchdog sees no marker and
+# correctly stays silent — no false page on a deliberate stop. Best-effort;
+# failures never change the stop's exit status.
 teardown_autonomy_intent() {
     rm -f "$INTENT_MARKER" 2>/dev/null || true
     local wd_label wd_service
@@ -191,6 +195,19 @@ teardown_autonomy_intent() {
         if launchctl print "$wd_service" >/dev/null 2>&1; then
             launchctl bootout "$wd_service" >/dev/null 2>&1 || true
         fi
+    fi
+    # systemd --user watchdog timer+service teardown (#4260 sub-issue D),
+    # symmetric with the launchd bootout above. $IS_LINUX_SYSTEMD is resolved
+    # below (before any call to this function); mirrors loom-daemon-start.sh's
+    # resolve_systemd_watchdog_unit() naming (<daemon unit>-watchdog, same
+    # LOOM_WATCHDOG_LABEL override) so stop always targets the SAME unit pair
+    # start provisioned.
+    if [[ "$IS_LINUX_SYSTEMD" == "true" ]] && command -v systemctl >/dev/null 2>&1; then
+        local sd_daemon_unit sd_wd_unit
+        sd_daemon_unit="$(resolve_systemd_unit)"
+        sd_wd_unit="${LOOM_WATCHDOG_LABEL:-${sd_daemon_unit%.service}-watchdog}"
+        systemctl --user disable --now "${sd_wd_unit}.timer" >/dev/null 2>&1 || true
+        systemctl --user disable --now "${sd_wd_unit}.service" >/dev/null 2>&1 || true
     fi
 }
 
