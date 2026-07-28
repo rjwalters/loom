@@ -145,6 +145,9 @@ impl WorkspacePool {
         }
         let startup = sweep_registry::read_startup_race_config(root);
         registry.set_dispatch_stagger(sweep_registry::resolve_dispatch_stagger(&startup));
+        // Startup-proof occupancy grace (#4003): resolve env > config > default
+        // for this workspace, mirroring the dispatch stagger above.
+        registry.set_startup_proof_grace(sweep_registry::resolve_startup_proof_grace(&startup));
         // Insta-crash quarantine (#3939): resolve env > config > default for this
         // workspace so the reaper quarantines a repeatedly-insta-crashing issue
         // instead of letting it be re-dispatched every tick.

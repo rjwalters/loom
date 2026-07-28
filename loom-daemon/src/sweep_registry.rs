@@ -456,6 +456,34 @@ pub const DEFAULT_WATCHDOG_TIMEOUT_SECS: u64 = 300;
 /// Default watchdog probe interval — matches the reaper cadence.
 pub const DEFAULT_WATCHDOG_INTERVAL_SECS: u64 = 30;
 
+/// Env var overriding the startup-proof occupancy grace window, in seconds.
+pub const STARTUP_PROOF_GRACE_ENV: &str = "LOOM_SWEEP_STARTUP_PROOF_GRACE_SECS";
+
+/// Default startup-proof occupancy grace window (Issue #4003).
+///
+/// A slot is checked out (counted as occupied) at `fork/exec` success — before
+/// the child has proven it reached the API, created a worktree, or wrote a
+/// checkpoint. That is fine for the first `grace` seconds of a fresh dispatch
+/// (a healthy child legitimately has not produced anything yet in the first
+/// moment after spawn). Past `grace`, a sweep that has shown **zero** startup
+/// signal — no worktree, no checkpoint, no log output past the spawn header,
+/// see [`log_has_progress`] — is excluded from the work-finder's occupancy
+/// count, freeing its slot for a healthy queued sweep well before the (still
+/// 300s, unchanged) startup watchdog ([`DEFAULT_WATCHDOG_TIMEOUT_SECS`])
+/// cancels and re-dispatches it.
+///
+/// Deliberately much shorter than the watchdog timeout: [`DEFAULT_WATCHDOG_TIMEOUT_SECS`]
+/// is sized to the measured 110–150s dispatch→**worktree** latency under
+/// concurrency (#4088) — a late, heavy signal. `log_has_progress` is a much
+/// earlier signal: it fires the instant Claude Code itself produces ANY
+/// output past the daemon's spawn header and the `spawn-claude.sh` wrapper
+/// lines, which happens within seconds for a healthy child even under
+/// contention. A child that produces literally nothing for this whole window
+/// is not merely "slow" — it never reached the API at all, so freeing the
+/// slot early never penalizes a healthy dispatch (see the
+/// `regression_healthy_fleet_throughput_unaffected` test).
+pub const DEFAULT_STARTUP_PROOF_GRACE_SECS: u64 = 90;
+
 /// Grace period the watchdog gives a hung child to exit after SIGTERM before
 /// escalating to SIGKILL, when it auto-cancels for re-dispatch.
 const WATCHDOG_CANCEL_GRACE: Duration = Duration::from_secs(3);
@@ -1163,6 +1191,15 @@ pub struct SweepRegistry {
     /// Instant of the most recent child spawn, used with `dispatch_stagger` to
     /// compute the stagger wait (Issue #3887). `None` until the first spawn.
     last_spawn_at: Option<Instant>,
+    /// How long a freshly-dispatched sweep counts toward the work-finder's
+    /// occupancy budget even with zero observed startup-proof signal (Issue
+    /// #4003). Defaults to [`DEFAULT_STARTUP_PROOF_GRACE_SECS`]; `main.rs` /
+    /// [`crate::workspace_pool::WorkspacePool`] set the resolved env > config >
+    /// default value per workspace, mirroring `dispatch_stagger`. Past this
+    /// window, a sweep with no worktree, no checkpoint, and no log output past
+    /// the spawn header is excluded from [`occupied_issues`](Self::occupied_issues)
+    /// — freeing its slot well before the (unchanged) startup watchdog fires.
+    startup_proof_grace: Duration,
     /// Issues the watchdog has already auto-restarted once (Issue #3887). The
     /// re-dispatch is bounded to a single attempt per issue — a second hang
     /// resolves to [`WatchdogDecision::GiveUp`], never another restart.
@@ -1300,6 +1337,7 @@ impl SweepRegistry {
             bus: None,
             dispatch_stagger: Duration::ZERO,
             last_spawn_at: None,
+            startup_proof_grace: Duration::from_secs(DEFAULT_STARTUP_PROOF_GRACE_SECS),
             watchdog_retried: HashSet::new(),
             watchdog_gaveup: HashSet::new(),
             watchdog_progressed: HashSet::new(),
@@ -1326,6 +1364,7 @@ impl SweepRegistry {
             bus: Some(bus),
             dispatch_stagger: Duration::ZERO,
             last_spawn_at: None,
+            startup_proof_grace: Duration::from_secs(DEFAULT_STARTUP_PROOF_GRACE_SECS),
             watchdog_retried: HashSet::new(),
             watchdog_gaveup: HashSet::new(),
             watchdog_progressed: HashSet::new(),
@@ -1360,6 +1399,21 @@ impl SweepRegistry {
     #[must_use]
     pub fn dispatch_stagger(&self) -> Duration {
         self.dispatch_stagger
+    }
+
+    /// Set the startup-proof occupancy grace window (Issue #4003). `main.rs` /
+    /// the workspace pool call this once per workspace at provision time with
+    /// the resolved env > config > default value, mirroring
+    /// [`set_dispatch_stagger`](Self::set_dispatch_stagger).
+    pub fn set_startup_proof_grace(&mut self, grace: Duration) {
+        self.startup_proof_grace = grace;
+    }
+
+    /// Read-only accessor for the configured startup-proof occupancy grace
+    /// window (Issue #4003).
+    #[must_use]
+    pub fn startup_proof_grace(&self) -> Duration {
+        self.startup_proof_grace
     }
 
     /// Set the insta-crash quarantine parameters (Issue #3939). `main.rs` and the
@@ -3408,6 +3462,106 @@ impl SweepRegistry {
         matches!(std::fs::read_to_string(log_path), Ok(c) if log_has_progress(&c))
     }
 
+    // ------------------------------------------------------------------------
+    // Occupancy accounting (Issue #4003)
+    // ------------------------------------------------------------------------
+
+    /// Whether `sweep_id` has proven startup (Issue #4003): reuses the exact
+    /// signal [`sweep_made_progress`](Self::sweep_made_progress) polls (worktree
+    /// / checkpoint / log-past-header) and latches through the same
+    /// `watchdog_progressed` set the startup watchdog (#3887/#4088) already
+    /// maintains — a signal observed by either call site is remembered by both,
+    /// and neither ever "un-sees" a sweep that once proved it started (the same
+    /// monotonicity rationale as #4088: every underlying signal is torn down at
+    /// successful completion, so a *finished* sweep must not read as
+    /// *never-started*).
+    fn has_proven_start(&mut self, sweep_id: &SweepId, issue: u32, log_path: &Path) -> bool {
+        if self.watchdog_progressed.contains(sweep_id) {
+            return true;
+        }
+        if self.sweep_made_progress(issue, log_path) {
+            self.watchdog_progressed.insert(sweep_id.clone());
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Issue numbers of `Running`/`Pending` Issue sweeps that count toward the
+    /// work-finder's admission budget (Issue #4003).
+    ///
+    /// A sweep counts while it is inside its [`startup_proof_grace`]
+    /// (Self::startup_proof_grace) window (`elapsed < grace`) — a fresh dispatch
+    /// legitimately has produced nothing yet — **or** once it has proven
+    /// startup progress via [`has_proven_start`](Self::has_proven_start). A
+    /// sweep dispatched longer ago than `grace` that has proven NO signal at
+    /// all is excluded: its slot no longer counts against the cap, even though
+    /// the separate (still 300s-default) startup watchdog has not yet
+    /// cancelled/re-dispatched it.
+    ///
+    /// This is occupancy-accounting ONLY — it never mutates `SweepState`, never
+    /// touches the claim lock, and never cancels or re-dispatches anything. The
+    /// registry's own dedup (`RegistryDispatcher::in_flight`, used for the
+    /// "already in-flight, skip" check) and the forge label
+    /// (`loom:building`) are what actually prevent a double-dispatch of the
+    /// SAME issue — so under-counting occupancy here only ever lets a
+    /// *different* queued issue take the freed slot, never re-dispatches this
+    /// one. PrSet sweeps carry no single issue number and are excluded (out of
+    /// scope, mirrors [`watchdog_once`](Self::watchdog_once)).
+    pub fn occupied_issues(&mut self) -> HashSet<u32> {
+        let now = Utc::now();
+        let grace = self.startup_proof_grace;
+        let candidates: Vec<(SweepId, u32, PathBuf, Duration)> = self
+            .entries
+            .iter()
+            .filter(|(_, info)| matches!(info.state, SweepState::Running | SweepState::Pending))
+            .filter_map(|(id, info)| {
+                let SweepKind::Issue(issue) = info.kind else {
+                    return None;
+                };
+                let elapsed = (now - info.started_at).to_std().unwrap_or(Duration::ZERO);
+                Some((id.clone(), issue, info.log_path.clone(), elapsed))
+            })
+            .collect();
+
+        let mut occupied = HashSet::new();
+        for (sweep_id, issue, log_path, elapsed) in candidates {
+            if elapsed < grace || self.has_proven_start(&sweep_id, issue, &log_path) {
+                occupied.insert(issue);
+            }
+        }
+        occupied
+    }
+
+    /// For status/observability only (Issue #4003): for each currently live
+    /// (`Running`/`Pending`) Issue sweep that has not yet proven startup,
+    /// return `(issue, time_since_dispatch)`. Empty once a sweep proves
+    /// progress (checked against the same `watchdog_progressed` latch
+    /// [`has_proven_start`](Self::has_proven_start) maintains, so this can
+    /// never disagree with the occupancy computation above). Read-only — does
+    /// not mutate any state, so `loom-daemon status` / `GetDaemonStatus` can
+    /// poll it on every request with no side effects.
+    #[must_use]
+    pub fn unproven_startups(&self) -> Vec<(u32, Duration)> {
+        let now = Utc::now();
+        self.entries
+            .iter()
+            .filter(|(_, info)| matches!(info.state, SweepState::Running | SweepState::Pending))
+            .filter_map(|(id, info)| {
+                let SweepKind::Issue(issue) = info.kind else {
+                    return None;
+                };
+                if self.watchdog_progressed.contains(id)
+                    || self.sweep_made_progress(issue, &info.log_path)
+                {
+                    return None;
+                }
+                let elapsed = (now - info.started_at).to_std().unwrap_or(Duration::ZERO);
+                Some((issue, elapsed))
+            })
+            .collect()
+    }
+
     /// Run one watchdog tick (Issue #3887): for each running daemon-dispatched
     /// Issue sweep, apply the [`watchdog_decision`] state machine and, on
     /// [`WatchdogDecision::Restart`], auto-cancel the hung child and
@@ -4290,6 +4444,11 @@ pub struct StartupRaceConfig {
     /// the review-phase stall watchdog, in seconds (zero/invalid dropped to
     /// `None`).
     pub review_stall_timeout_secs: Option<u64>,
+    /// `autonomous.watchdog.startupProofGraceSecs` (Issue #4003) — how long a
+    /// freshly-dispatched sweep counts toward the work-finder's occupancy
+    /// budget with zero observed startup-proof signal, in seconds
+    /// (zero/invalid dropped to `None`).
+    pub startup_proof_grace_secs: Option<u64>,
 }
 
 /// Read `.loom/config.json → autonomous` for the startup-race knobs (Issue
@@ -4325,6 +4484,10 @@ pub fn read_startup_race_config(repo_root: &Path) -> StartupRaceConfig {
             .and_then(serde_json::Value::as_bool),
         review_stall_timeout_secs: watchdog
             .and_then(|w| w.get("reviewStallTimeoutSecs"))
+            .and_then(serde_json::Value::as_u64)
+            .filter(|&s| s > 0),
+        startup_proof_grace_secs: watchdog
+            .and_then(|w| w.get("startupProofGraceSecs"))
             .and_then(serde_json::Value::as_u64)
             .filter(|&s| s > 0),
     }
@@ -4403,6 +4566,19 @@ pub fn resolve_review_stall_timeout(config: &StartupRaceConfig) -> Duration {
         .filter(|&s| s > 0)
         .or(config.review_stall_timeout_secs)
         .unwrap_or(DEFAULT_REVIEW_STALL_TIMEOUT_SECS);
+    Duration::from_secs(secs)
+}
+
+/// Resolve the startup-proof occupancy grace window, precedence **env >
+/// config > default** (Issue #4003).
+#[must_use]
+pub fn resolve_startup_proof_grace(config: &StartupRaceConfig) -> Duration {
+    let secs = std::env::var(STARTUP_PROOF_GRACE_ENV)
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|&s| s > 0)
+        .or(config.startup_proof_grace_secs)
+        .unwrap_or(DEFAULT_STARTUP_PROOF_GRACE_SECS);
     Duration::from_secs(secs)
 }
 
@@ -9503,6 +9679,226 @@ exit 0\n";
         );
     }
 
+    // ===================================================================
+    // Occupancy accounting — startup-proof grace (Issue #4003)
+    // ===================================================================
+
+    #[test]
+    fn startup_proof_grace_setter_roundtrips() {
+        let tmp = tempdir().unwrap();
+        let (mut reg, _rec) = fixture_registry(tmp.path());
+        assert_eq!(
+            reg.startup_proof_grace(),
+            Duration::from_secs(DEFAULT_STARTUP_PROOF_GRACE_SECS),
+            "default matches the shipped constant"
+        );
+        reg.set_startup_proof_grace(Duration::from_secs(12));
+        assert_eq!(reg.startup_proof_grace(), Duration::from_secs(12));
+    }
+
+    /// Test-plan item (a): a dispatched sweep that never emits the
+    /// startup-proof signal releases its admission slot **before** the 300s
+    /// watchdog fires. `hung_child_registry`'s fixture child produces zero
+    /// progress signal (no worktree, no checkpoint, log stuck at the spawn
+    /// header) for its whole life, exactly the "wedged at startup" case #4003
+    /// targets.
+    #[test]
+    fn occupied_issues_excludes_unproven_sweep_past_grace_window() {
+        let tmp = tempdir().unwrap();
+        let ws = tmp.path();
+        let mut reg = hung_child_registry(ws);
+        reg.set_startup_proof_grace(Duration::from_millis(50));
+
+        let out = reg
+            .dispatch(&SweepKind::Issue(7001), None, None, None, None)
+            .unwrap();
+        assert!(wait_until_alive(out.pid, FIXTURE_CHILD_WAIT_MS));
+
+        // Well past the 50ms grace, with zero progress signal.
+        backdate(&mut reg, &out.sweep_id, 5);
+        let occupied = reg.occupied_issues();
+        assert!(
+            !occupied.contains(&7001),
+            "an unproven sweep past its grace window must stop consuming an \
+             admission slot, freeing capacity long before the (unchanged) 300s \
+             startup watchdog would cancel/re-dispatch it"
+        );
+        // The registry's own liveness bookkeeping is untouched: the entry is
+        // still `Running` and still the authoritative in-flight/dedup view —
+        // discounting occupancy never re-dispatches the SAME issue.
+        assert!(matches!(reg.get(&out.sweep_id).unwrap().state, SweepState::Running));
+
+        let _ = reg.cancel(&out.sweep_id, Duration::from_secs(2));
+    }
+
+    /// A freshly-dispatched sweep — even one that will eventually turn out to
+    /// be hung — counts toward occupancy while inside its grace window. This
+    /// is what keeps a burst dispatch from immediately under-counting its own
+    /// occupancy the instant `dispatch()` returns.
+    #[test]
+    fn occupied_issues_keeps_fresh_dispatch_inside_grace_window() {
+        let tmp = tempdir().unwrap();
+        let ws = tmp.path();
+        let mut reg = hung_child_registry(ws);
+        reg.set_startup_proof_grace(Duration::from_secs(DEFAULT_STARTUP_PROOF_GRACE_SECS));
+
+        let out = reg
+            .dispatch(&SweepKind::Issue(7002), None, None, None, None)
+            .unwrap();
+        assert!(wait_until_alive(out.pid, FIXTURE_CHILD_WAIT_MS));
+
+        // No backdating: elapsed is ~0s, well inside the 90s default grace.
+        let occupied = reg.occupied_issues();
+        assert!(
+            occupied.contains(&7002),
+            "a fresh dispatch must count toward occupancy immediately, \
+             regardless of whether it has produced any startup-proof signal yet"
+        );
+
+        let _ = reg.cancel(&out.sweep_id, Duration::from_secs(2));
+    }
+
+    /// Test-plan item (c) (throughput regression guard): a sweep that HAS
+    /// proven startup progress must never be discounted, no matter how long
+    /// ago it was dispatched or how short the configured grace is. Without
+    /// this, a normal sweep whose Builder phase legitimately runs for hours
+    /// would eventually be discounted from occupancy — silently inflating the
+    /// effective concurrency cap for reasons unrelated to health. Proven
+    /// progress must dominate elapsed time, unconditionally.
+    #[test]
+    fn occupied_issues_never_discounts_proven_sweep_regardless_of_age() {
+        let tmp = tempdir().unwrap();
+        let ws = tmp.path();
+        let mut reg = hung_child_registry(ws);
+        // A pathologically tiny grace: if elapsed-vs-grace were the only
+        // signal, this sweep would be discounted instantly.
+        reg.set_startup_proof_grace(Duration::from_millis(1));
+
+        let out = reg
+            .dispatch(&SweepKind::Issue(7003), None, None, None, None)
+            .unwrap();
+        assert!(wait_until_alive(out.pid, FIXTURE_CHILD_WAIT_MS));
+
+        // Simulate progress (Builder created a worktree) AND age the entry
+        // far past any plausible grace or watchdog window.
+        let wt = ws.join(".loom").join("worktrees").join("issue-7003");
+        std::fs::create_dir_all(&wt).unwrap();
+        backdate(&mut reg, &out.sweep_id, 9999);
+
+        let occupied = reg.occupied_issues();
+        assert!(
+            occupied.contains(&7003),
+            "a sweep that proved startup progress must never be discounted \
+             from occupancy, regardless of elapsed time — this is the \
+             guarantee that a fleet of normally-starting sweeps dispatches at \
+             the same rate as before #4003"
+        );
+
+        let _ = reg.cancel(&out.sweep_id, Duration::from_secs(2));
+    }
+
+    /// The occupancy check and the startup watchdog (#3887/#4088) share the
+    /// SAME per-`SweepId` progress latch (`watchdog_progressed`): once either
+    /// call site observes progress, neither ever "un-sees" it — even after
+    /// the underlying filesystem signal is torn down (e.g. at completion, or
+    /// in this test, a manual removal standing in for that teardown).
+    #[test]
+    fn occupied_issues_latch_is_shared_with_watchdog() {
+        let tmp = tempdir().unwrap();
+        let ws = tmp.path();
+        let mut reg = hung_child_registry(ws);
+        reg.set_startup_proof_grace(Duration::from_millis(1));
+
+        let out = reg
+            .dispatch(&SweepKind::Issue(7004), None, None, None, None)
+            .unwrap();
+        assert!(wait_until_alive(out.pid, FIXTURE_CHILD_WAIT_MS));
+
+        let wt = ws.join(".loom").join("worktrees").join("issue-7004");
+        std::fs::create_dir_all(&wt).unwrap();
+        backdate(&mut reg, &out.sweep_id, 9999);
+
+        // Observe progress via occupancy accounting first — this latches it.
+        assert!(reg.occupied_issues().contains(&7004));
+        assert!(reg.watchdog_progressed.contains(&out.sweep_id));
+
+        // Tear down the filesystem signal (mirrors what happens at
+        // completion) and confirm BOTH consumers still treat it as proven.
+        std::fs::remove_dir_all(&wt).unwrap();
+        assert!(
+            reg.occupied_issues().contains(&7004),
+            "occupancy must not re-discount a sweep once the latch has fired"
+        );
+        assert_eq!(
+            reg.watchdog_once(Duration::from_secs(10)),
+            0,
+            "the startup watchdog must not restart a sweep the occupancy \
+             check already latched as progressed"
+        );
+
+        let _ = reg.cancel(&out.sweep_id, Duration::from_secs(2));
+    }
+
+    /// Observability (Issue #4003 AC): the daemon can report how long a sweep
+    /// has spent in the spawned-but-not-started state, and the report clears
+    /// the instant progress is observed.
+    #[test]
+    fn unproven_startups_reports_elapsed_and_clears_once_proven() {
+        let tmp = tempdir().unwrap();
+        let ws = tmp.path();
+        let mut reg = hung_child_registry(ws);
+
+        let out = reg
+            .dispatch(&SweepKind::Issue(7005), None, None, None, None)
+            .unwrap();
+        assert!(wait_until_alive(out.pid, FIXTURE_CHILD_WAIT_MS));
+        backdate(&mut reg, &out.sweep_id, 42);
+
+        let unproven = reg.unproven_startups();
+        let entry = unproven.iter().find(|(issue, _)| *issue == 7005);
+        assert!(
+            entry.is_some(),
+            "an unproven live sweep must be reported by unproven_startups()"
+        );
+        let (_, elapsed) = entry.unwrap();
+        assert!(
+            *elapsed >= Duration::from_secs(42),
+            "reported elapsed should reflect the backdated dispatch time, got {elapsed:?}"
+        );
+
+        // Progress appears — the report must clear immediately.
+        let wt = ws.join(".loom").join("worktrees").join("issue-7005");
+        std::fs::create_dir_all(&wt).unwrap();
+        assert!(
+            !reg.unproven_startups()
+                .iter()
+                .any(|(issue, _)| *issue == 7005),
+            "a sweep that has proven progress must not be reported as unproven"
+        );
+
+        let _ = reg.cancel(&out.sweep_id, Duration::from_secs(2));
+    }
+
+    // --- resolve_startup_proof_grace precedence ---
+
+    #[test]
+    #[serial]
+    fn resolve_startup_proof_grace_precedence() {
+        std::env::remove_var(STARTUP_PROOF_GRACE_ENV);
+        assert_eq!(
+            resolve_startup_proof_grace(&StartupRaceConfig::default()),
+            Duration::from_secs(DEFAULT_STARTUP_PROOF_GRACE_SECS)
+        );
+        let cfg = StartupRaceConfig {
+            startup_proof_grace_secs: Some(30),
+            ..Default::default()
+        };
+        assert_eq!(resolve_startup_proof_grace(&cfg), Duration::from_secs(30));
+        std::env::set_var(STARTUP_PROOF_GRACE_ENV, "5");
+        assert_eq!(resolve_startup_proof_grace(&cfg), Duration::from_secs(5));
+        std::env::remove_var(STARTUP_PROOF_GRACE_ENV);
+    }
+
     // --- closed-issue dispatch guard (Issue #4088, AC6) ---
 
     /// Install a fake `gh` that reports a fixed `issue view` state and records
@@ -9712,7 +10108,7 @@ exit 0\n";
         let tmp = tempdir().unwrap();
         write_cfg(
             tmp.path(),
-            r#"{"autonomous":{"dispatchStaggerMs":3000,"watchdog":{"enabled":false,"timeoutSecs":90,"intervalSecs":15,"reviewStall":false,"reviewStallTimeoutSecs":1800}}}"#,
+            r#"{"autonomous":{"dispatchStaggerMs":3000,"watchdog":{"enabled":false,"timeoutSecs":90,"intervalSecs":15,"reviewStall":false,"reviewStallTimeoutSecs":1800,"startupProofGraceSecs":45}}}"#,
         );
         assert_eq!(
             read_startup_race_config(tmp.path()),
@@ -9723,6 +10119,7 @@ exit 0\n";
                 watchdog_interval_secs: Some(15),
                 review_stall_enabled: Some(false),
                 review_stall_timeout_secs: Some(1800),
+                startup_proof_grace_secs: Some(45),
             }
         );
     }

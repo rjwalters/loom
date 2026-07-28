@@ -1300,6 +1300,50 @@ unparseable value for any of these falls back to its default.
 > generate work" below still holds — the finder only closes the gap between an
 > approved issue and its build.
 
+**Occupancy: startup-proof grace, distinct from the startup watchdog (#4003).**
+A dispatch slot is checked out (counted as occupied) the instant
+`SweepRegistry::dispatch()` returns — i.e. at `fork/exec` success, before the
+child has proven it reached the API, created a worktree, or wrote a
+checkpoint. Before #4003 that slot stayed occupied for the sweep's entire
+`Running`/`Pending` lifetime regardless of whether the child ever showed a
+sign of life, so a child wedged at startup (e.g. a hung MCP-init) held its
+slot for the full 300s startup-watchdog window
+(`sweep_registry::DEFAULT_WATCHDOG_TIMEOUT_SECS`) before anything reclaimed
+it.
+
+`SweepRegistry::occupied_issues()` (consumed by `RegistryDispatcher::occupancy`,
+which `tick`/`tick_multi` now use to seed occupancy instead of
+`in_flight().len()`) narrows that: a sweep still counts while it is inside its
+**startup-proof grace window** (`elapsed < grace` — a fresh dispatch legitimately
+has produced nothing yet) *or* once it has proven startup progress. Progress
+reuses the exact signal the startup watchdog already polls
+(`sweep_made_progress` — a worktree at `.loom/worktrees/issue-<N>`, a checkpoint
+at `.loom/sweep-checkpoint/issue-<N>.json`, or log output past the spawn header,
+see `log_has_progress`) and latches through the SAME per-`SweepId`
+`watchdog_progressed` set the watchdog itself maintains, so a signal observed by
+either mechanism is remembered by both. A sweep older than `grace` with **zero**
+proven signal is excluded from occupancy — freeing its slot for a healthy
+queued sweep — while the sweep's own `SweepState` stays `Running` untouched:
+this is occupancy accounting only, never a cancel/re-dispatch action. (De-dup
+safety — never double-dispatching the SAME issue — still comes from
+`in_flight()`, the registry's claim lock, and the forge `loom:building` label,
+none of which this change touches.)
+
+The grace window (default **90s**, `DEFAULT_STARTUP_PROOF_GRACE_SECS`) is
+deliberately much shorter than the 300s watchdog timeout: the watchdog's 300s is
+sized to the measured 110–150s dispatch→**worktree** latency under concurrency
+(#4088), a late, heavy signal, while `log_has_progress` fires far earlier — the
+instant Claude Code itself produces any output past the spawn header, typically
+within seconds even under contention. Tunable per workspace with the standard
+precedence **env (`LOOM_SWEEP_STARTUP_PROOF_GRACE_SECS`) > config
+(`autonomous.watchdog.startupProofGraceSecs`) > default (90)**, resolved the same
+way as `dispatch_stagger` (`SweepRegistry::set_startup_proof_grace`, set once per
+workspace at provision time by `main.rs` / `WorkspacePool::get_or_provision`).
+`SweepRegistry::unproven_startups()` is a read-only diagnostic (no latch
+mutation from the read itself; observes the same latch) returning
+`(issue, time_since_dispatch)` for every live sweep that has not yet proven
+startup — for status/observability, not for gating.
+
 ### Token-capacity backpressure (#3902)
 
 At scale, rotation accounts hit their 5h/7d rate limits and go `exhausted`.
