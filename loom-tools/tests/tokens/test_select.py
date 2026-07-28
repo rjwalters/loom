@@ -785,3 +785,121 @@ def test_shared_disabled_still_hard_fails(tmp_path, monkeypatch):
 
     with pytest.raises(EmptyTokenPoolError):
         select_token(repo)
+
+
+# ---------- 5h load gate (issue #4195) ----------
+
+
+def test_ranking_load_gate_excludes_loaded_account(tmp_path, monkeypatch):
+    """The preferred pass excludes an account at/above the 5h load threshold.
+
+    Issue #4195: `a` is healthy but 90% loaded on its 5h window (>= the 0.70
+    default gate), so it is skipped in favor of the lightly-loaded `b`.
+    """
+    monkeypatch.delenv("LOOM_TOKEN_5H_LOAD_GATE", raising=False)
+    monkeypatch.delenv("LOOM_TOKEN_SPREAD_TOP_N", raising=False)
+    workspace = _make_workspace(tmp_path, {"a": "ka", "b": "kb"})
+    _write_ranking(workspace, ["a|available|0.90", "b|available|0.10"])
+    for seed in range(25):
+        sel = select_token(workspace, rng=random.Random(seed))
+        assert sel.name == "b"
+        assert sel.mode == "ranked"
+
+
+def test_ranking_load_gate_readmits_in_fallback_when_all_loaded(tmp_path, monkeypatch):
+    """When every account is 5h-loaded, the fallback pass readmits them.
+
+    The pool never hard-fails on load alone (issue #4195) — both accounts are
+    over the gate, so the fallback pass drops the gate and one is still chosen.
+    """
+    monkeypatch.delenv("LOOM_TOKEN_5H_LOAD_GATE", raising=False)
+    workspace = _make_workspace(tmp_path, {"a": "ka", "b": "kb"})
+    _write_ranking(workspace, ["a|available|0.95", "b|available|0.90"])
+    sel = select_token(workspace, rng=random.Random(0))
+    assert sel.name in ("a", "b")
+    assert sel.mode == "ranked"
+
+
+def test_ranking_load_gate_unknown_util_never_gated(tmp_path, monkeypatch):
+    """A missing/unparseable 5h utilization is unknown -> never gated.
+
+    Issue #4195/#4164: an unmeasured account must not be treated as 0.0-loaded
+    *or* as over-threshold — a 2-field (legacy) line and a malformed util field
+    both parse to "unknown" and stay eligible in the preferred pass.
+    """
+    monkeypatch.delenv("LOOM_TOKEN_5H_LOAD_GATE", raising=False)
+    monkeypatch.delenv("LOOM_TOKEN_SPREAD_TOP_N", raising=False)
+    workspace = _make_workspace(tmp_path, {"a": "ka", "b": "kb", "c": "kc"})
+    # a: legacy 2-field (unknown), b: malformed util (unknown), c: loaded.
+    _write_ranking(workspace, ["a|available", "b|available|not-a-number", "c|available|0.99"])
+    chosen: set[str] = set()
+    for seed in range(30):
+        sel = select_token(workspace, rng=random.Random(seed))
+        chosen.add(sel.name)
+        assert sel.mode == "ranked"
+    # a and b (unknown) are eligible; c (0.99 loaded) is excluded.
+    assert chosen == {"a", "b"}
+
+
+def test_ranking_load_gate_backward_compatible_2field(tmp_path, monkeypatch):
+    """Existing 2-field ranking files parse and select unchanged (issue #4195)."""
+    monkeypatch.delenv("LOOM_TOKEN_5H_LOAD_GATE", raising=False)
+    workspace = _make_workspace(tmp_path, {"a": "ka", "b": "kb"})
+    _write_ranking(workspace, ["a|exhausted", "b|available"])
+    sel = select_token(workspace)
+    assert sel.name == "b"
+    assert sel.mode == "ranked"
+
+
+def test_ranking_load_gate_env_override_threshold(tmp_path, monkeypatch):
+    """LOOM_TOKEN_5H_LOAD_GATE overrides the default threshold (issue #4195)."""
+    monkeypatch.delenv("LOOM_TOKEN_SPREAD_TOP_N", raising=False)
+    workspace = _make_workspace(tmp_path, {"a": "ka", "b": "kb"})
+    # a at 0.50: excluded only when the gate is lowered below 0.50.
+    _write_ranking(workspace, ["a|available|0.50", "b|available|0.10"])
+    monkeypatch.setenv("LOOM_TOKEN_5H_LOAD_GATE", "0.40")
+    for seed in range(25):
+        sel = select_token(workspace, rng=random.Random(seed))
+        assert sel.name == "b"  # a now over the lowered gate
+
+    # A gate above 1.0 disables gating entirely -> a is eligible again.
+    monkeypatch.setenv("LOOM_TOKEN_5H_LOAD_GATE", "2.0")
+    chosen = {
+        select_token(workspace, rng=random.Random(seed)).name for seed in range(50)
+    }
+    assert chosen == {"a", "b"}
+
+
+def test_ranking_load_gate_rotates_across_eligible_set(tmp_path, monkeypatch):
+    """The rotation cursor still spreads across the load-eligible set (issue #4195)."""
+    monkeypatch.delenv("LOOM_TOKEN_5H_LOAD_GATE", raising=False)
+    monkeypatch.delenv("LOOM_TOKEN_SPREAD_TOP_N", raising=False)
+    workspace = _make_workspace(
+        tmp_path, {"a": "ka", "b": "kb", "c": "kc", "d": "kd"},
+    )
+    # a and d are over the gate; b and c are the eligible set.
+    _write_ranking(
+        workspace,
+        ["a|available|0.80", "b|available|0.10", "c|available|0.20", "d|available|0.99"],
+    )
+    chosen: list[str] = []
+    for _ in range(10):
+        sel = select_token(workspace, rng=random.Random(0))
+        assert sel.mode == "ranked"
+        chosen.append(sel.name)
+    assert set(chosen) == {"b", "c"}
+
+
+def test_stale_ranking_load_gate_field_does_not_break_exclusions(tmp_path):
+    """A stale 3-field ranking still yields the #3894 advisory exclusions.
+
+    The load-gate third field must not disturb the stale-ranking exclusion path
+    (issue #4195 AC): the exhausted account is still excluded from lower tiers.
+    """
+    workspace = _make_workspace(tmp_path, {"a": "ka", "b": "kb"})
+    _write_stale_ranking(
+        workspace, ["a|exhausted|0.99", "b|available|0.10"], age_secs=11 * 60
+    )
+    _write_allowlist(workspace, ["a", "b"])
+    sel = select_token(workspace, rng=random.Random(0))
+    assert sel.name == "b"  # stale exhausted `a` excluded from the allowlist tier

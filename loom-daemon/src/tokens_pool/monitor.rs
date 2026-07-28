@@ -266,8 +266,10 @@ pub fn build_monitor_accounts(
     Some(accounts)
 }
 
-/// Serialize ordered accounts to the selector's `name|status` format (trailing
-/// newline; empty -> empty string). Mirrors `monitor.format_ranking_lines`.
+/// Serialize ordered accounts to the selector's `name|status|5h_util` format
+/// (trailing newline; empty -> empty string). The 5h utilization is an optional
+/// third field, emitted when known (issue #4195); byte-identical with the probe
+/// writer (`check::ranking_line`). Mirrors `monitor.format_ranking_lines`.
 #[must_use]
 pub fn format_ranking_lines(accounts: &[MonitorAccount]) -> String {
     if accounts.is_empty() {
@@ -275,9 +277,7 @@ pub fn format_ranking_lines(accounts: &[MonitorAccount]) -> String {
     }
     let mut out = String::new();
     for a in accounts {
-        out.push_str(&a.name);
-        out.push('|');
-        out.push_str(&a.status);
+        out.push_str(&super::check::ranking_line(&a.name, &a.status, a.util_5h));
         out.push('\n');
     }
     out
@@ -513,6 +513,27 @@ mod tests {
             util_5h: None,
         }];
         assert_eq!(format_ranking_lines(&accounts), "acct-z|\n");
+    }
+
+    #[test]
+    fn format_ranking_lines_emits_5h_util_third_field() {
+        // The 5h utilization is the optional third field (issue #4195), fixed
+        // at 2 decimals; an absent value keeps the legacy 2-field form.
+        let accounts = vec![
+            MonitorAccount {
+                name: "a".into(),
+                status: "available".into(),
+                util_7d: Some(0.20),
+                util_5h: Some(0.90),
+            },
+            MonitorAccount {
+                name: "b".into(),
+                status: "available".into(),
+                util_7d: Some(0.10),
+                util_5h: None,
+            },
+        ];
+        assert_eq!(format_ranking_lines(&accounts), "a|available|0.90\nb|available\n");
     }
 
     #[test]

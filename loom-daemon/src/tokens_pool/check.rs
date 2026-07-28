@@ -534,8 +534,23 @@ fn now_iso() -> String {
     chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string()
 }
 
-/// Serialize a report to the selector's `name|status` format (trailing newline,
-/// empty report -> empty string). Mirrors `check.format_ranking_lines`.
+/// Format one `.ranking` line, emitting the optional 5h-utilization field
+/// (issue #4195): `name|status|5h_util` when the 5h utilization is known, else
+/// the legacy `name|status` (backward compatible: a `None` utilization is left
+/// unwritten rather than faked as `0.0`). The float is fixed at 2 decimals so
+/// the probe and monitor writers stay byte-identical with the Python port
+/// (`check._ranking_line`). Shared with `monitor::format_ranking_lines`.
+pub(crate) fn ranking_line(name: &str, status: &str, util_5h: Option<f64>) -> String {
+    match util_5h {
+        Some(u) => format!("{name}|{status}|{u:.2}"),
+        None => format!("{name}|{status}"),
+    }
+}
+
+/// Serialize a report to the selector's `name|status|5h_util` format (trailing
+/// newline, empty report -> empty string). The 5h utilization is an optional
+/// third field, emitted when measured (issue #4195). Mirrors
+/// `check.format_ranking_lines`.
 #[must_use]
 pub fn format_ranking_lines(report: &ProbeReport) -> String {
     if report.accounts.is_empty() {
@@ -543,9 +558,7 @@ pub fn format_ranking_lines(report: &ProbeReport) -> String {
     }
     let mut out = String::new();
     for a in &report.accounts {
-        out.push_str(&a.name);
-        out.push('|');
-        out.push_str(&a.status);
+        out.push_str(&ranking_line(&a.name, &a.status, a.s5h_utilization));
         out.push('\n');
     }
     out
@@ -994,6 +1007,19 @@ mod tests {
             accounts: vec![AccountResult::new("a-1", "available")],
         };
         assert_eq!(format_ranking_lines(&report), "a-1|available\n");
+    }
+
+    #[test]
+    fn format_ranking_lines_emits_5h_util_third_field() {
+        // The 5h utilization is the optional third field (issue #4195), fixed
+        // at 2 decimals; an absent value keeps the legacy 2-field form.
+        let mut loaded = AccountResult::new("a-1", "available");
+        loaded.s5h_utilization = Some(0.42);
+        let report = ProbeReport {
+            ranked_at: "x".into(),
+            accounts: vec![loaded, AccountResult::new("b-2", "available")],
+        };
+        assert_eq!(format_ranking_lines(&report), "a-1|available|0.42\nb-2|available\n");
     }
 
     #[test]

@@ -41,7 +41,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from loom_tools.tokens.check import _STATUS_RANK
+from loom_tools.tokens.check import _STATUS_RANK, _ranking_line
 
 logger = logging.getLogger(__name__)
 
@@ -287,12 +287,15 @@ def build_monitor_accounts(
 
 
 def format_ranking_lines(accounts: list[MonitorAccount]) -> str:
-    """Serialize ordered accounts to the selector's ``name|status`` format.
+    """Serialize ordered accounts to the selector's ``name|status|5h_util`` format.
 
-    This is the format ``select.py:_read_ranking`` consumes. A trailing
-    newline is included so the file ends cleanly.
+    This is the format ``select.py:_read_ranking`` consumes. The 5h utilization
+    is emitted as an optional third field when known (issue #4195); accounts
+    with no measured 5h utilization keep the legacy 2-field ``name|status``
+    form. Byte-identical with the probe writer (``check._ranking_line``) and the
+    Rust port. A trailing newline is included so the file ends cleanly.
     """
-    lines = [f"{a.name}|{a.status}" for a in accounts]
+    lines = [_ranking_line(a.name, a.status, a.util_5h) for a in accounts]
     return "\n".join(lines) + ("\n" if lines else "")
 
 
