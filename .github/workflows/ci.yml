@@ -107,3 +107,5 @@ jobs:
         run: bash defaults/scripts/check-labels-drift.sh
       - name: Run installer tests
         run: bash scripts/test-installer.sh
+      - name: Run installer reinstall-safety tests (#4188)
+        run: bash defaults/scripts/tests/test-install-reinstall-safety.sh
