@@ -473,6 +473,7 @@ pub fn event_to_envelope(event: &Event) -> Option<Envelope> {
         Event::SweepCrashed {
             issue,
             checkpoint_phase,
+            classification: _,
             repo,
         } => {
             let phase = checkpoint_phase.as_deref().unwrap_or("unknown");
@@ -1331,6 +1332,7 @@ mod tests {
         let crashed = Event::SweepCrashed {
             issue: 42,
             checkpoint_phase: Some("judge".to_owned()),
+            classification: None,
             repo: Some("/repos/vibesql".to_owned()),
         };
         let env = event_to_envelope(&crashed).unwrap();
