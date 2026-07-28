@@ -797,6 +797,14 @@ async fn main() -> Result<()> {
     // recovery on restart relies on lock dirs + sweep checkpoints + the
     // forge (labels). The reaper task polls live PIDs on a configurable
     // interval (`LOOM_SWEEP_REAPER_INTERVAL_SECS`, default 30s).
+    //
+    // `sweep_workspace` seeds the *default* registry only. As of #4299, an
+    // explicit-`workspace_root`-absent `DispatchSweep`/`dispatch_sweep`
+    // request no longer blindly trusts this cwd-derived value as its target:
+    // `ipc::resolve_dispatch_registry` consults the on-disk workspace
+    // registry first and only falls back to this default when the registry
+    // is empty or this root is itself registered. See that function's doc
+    // comment for the full precedence.
     let sweep_workspace = workspace_from_env
         .as_ref()
         .map(std::path::PathBuf::from)
@@ -2452,11 +2460,41 @@ fn build_dispatch_request(
     }
 }
 
+/// Resolve the `dispatch` subcommand's effective `--workspace` (Issue #4299):
+/// an explicit `--workspace` always wins; when absent, defaults it from the
+/// CLI process's own `cwd` if `cwd` falls under a registered workspace root —
+/// the daemon cannot see the client's cwd, so if that resolution is going to
+/// happen at all it must happen client-side, before the `DispatchSweep`
+/// request is built. This is what fixes `loom-daemon dispatch <N>` run from
+/// inside a registered repo previously making no difference. A `cwd` outside
+/// every registered root (or an empty registry) leaves the result `None`, and
+/// the daemon's own registry-based resolution (`ipc::resolve_dispatch_registry`)
+/// then applies.
+///
+/// Pure and side-effect-free — takes the already-resolved `cwd` and
+/// already-loaded `registry` rather than performing I/O itself, so it is
+/// unit-testable without touching the real filesystem/env; `cwd`/`registry`
+/// are resolved once by [`handle_dispatch_command`] via `std::env::current_dir()`
+/// / `WorkspaceRegistry::load_default()`.
+fn resolve_cli_dispatch_workspace(
+    explicit: Option<String>,
+    cwd: &Path,
+    registry: &loom_daemon::workspace_registry::WorkspaceRegistry,
+) -> Option<String> {
+    explicit.or_else(|| {
+        loom_daemon::workspace_registry::resolve_client_workspace_default(cwd, registry)
+            .map(|root| root.to_string_lossy().into_owned())
+    })
+}
+
 /// Handle the `dispatch` subcommand (Issue #3952). Connects to the running
 /// daemon over its Unix socket and enqueues a sweep via the same `DispatchSweep`
 /// request the MCP `dispatch_sweep` tool uses — but with a bounded client-side
 /// ack timeout so a wedged daemon can never hang the CLI (the #3945 failure
 /// mode). On success prints the sweep id + per-sweep log path and exits 0.
+///
+/// See [`resolve_cli_dispatch_workspace`] for the `--workspace` default logic
+/// applied here (Issue #4299).
 async fn handle_dispatch_command(
     issue: u32,
     workspace: Option<String>,
@@ -2465,6 +2503,11 @@ async fn handle_dispatch_command(
     depends_on: Option<u32>,
     force: bool,
 ) -> Result<()> {
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let registry =
+        loom_daemon::workspace_registry::WorkspaceRegistry::load_default().unwrap_or_default();
+    let workspace = resolve_cli_dispatch_workspace(workspace, &cwd, &registry);
+
     let socket_path = resolve_socket_path()?;
     let request = build_dispatch_request(issue, workspace, model, effort, depends_on, force);
     let ack_timeout = resolve_dispatch_ack_timeout();
@@ -4699,8 +4742,8 @@ mod dispatch_tests {
     //! deliberately-unresponsive socket (the #3945 wedge must never hang).
     use super::{
         build_dispatch_request, classify_gate_verdict, format_gate_status, gate_status_short_label,
-        query_daemon_bounded, resolve_dispatch_ack_timeout, GateVerdict, DAEMON_IPC_TIMEOUT_ENV,
-        DISPATCH_ACK_TIMEOUT,
+        query_daemon_bounded, resolve_cli_dispatch_workspace, resolve_dispatch_ack_timeout,
+        GateVerdict, DAEMON_IPC_TIMEOUT_ENV, DISPATCH_ACK_TIMEOUT,
     };
     use chrono::{DateTime, Utc};
     use loom_daemon::types::{Request, Response, SweepKind};
@@ -4767,6 +4810,47 @@ mod dispatch_tests {
             }
             other => panic!("expected DispatchSweep, got {other:?}"),
         }
+    }
+
+    // ===== `resolve_cli_dispatch_workspace` (Issue #4299) =====
+
+    /// An explicit `--workspace` always wins, regardless of cwd/registry state.
+    #[test]
+    fn resolve_cli_dispatch_workspace_explicit_always_wins() {
+        let registry = loom_daemon::workspace_registry::WorkspaceRegistry::default();
+        let resolved = resolve_cli_dispatch_workspace(
+            Some("/explicit/repo".to_string()),
+            std::path::Path::new("/somewhere/else"),
+            &registry,
+        );
+        assert_eq!(resolved.as_deref(), Some("/explicit/repo"));
+    }
+
+    /// Issue #4299's core CLI fix: running `loom-daemon dispatch <N>` from
+    /// inside a registered repo (no `--workspace` flag) must default
+    /// `workspace_root` to that repo's root.
+    #[test]
+    fn resolve_cli_dispatch_workspace_defaults_from_cwd_inside_registered_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+
+        let mut registry = loom_daemon::workspace_registry::WorkspaceRegistry::default();
+        registry.add(&repo, None).unwrap();
+
+        let canonical_repo = std::fs::canonicalize(&repo).unwrap();
+        let resolved = resolve_cli_dispatch_workspace(None, &repo, &registry);
+        assert_eq!(resolved, Some(canonical_repo.to_string_lossy().into_owned()));
+    }
+
+    /// A cwd outside every registered root (or an empty registry) leaves the
+    /// result `None` — the daemon's own registry-based resolution applies.
+    #[test]
+    fn resolve_cli_dispatch_workspace_none_when_cwd_unregistered() {
+        let dir = tempfile::tempdir().unwrap();
+        let registry = loom_daemon::workspace_registry::WorkspaceRegistry::default();
+        let resolved = resolve_cli_dispatch_workspace(None, dir.path(), &registry);
+        assert_eq!(resolved, None);
     }
 
     /// A fake daemon that accepts one connection, verifies the received request

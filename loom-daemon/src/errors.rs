@@ -128,6 +128,7 @@ impl ErrorCode {
     pub const CONFIG_MISSING_FIELD: &'static str = "CONFIG_MISSING_FIELD";
     pub const CONFIG_INVALID_VALUE: &'static str = "CONFIG_INVALID_VALUE";
     pub const CONFIG_FILE_NOT_FOUND: &'static str = "CONFIG_FILE_NOT_FOUND";
+    pub const CONFIG_WORKSPACE_AMBIGUOUS: &'static str = "CONFIG_WORKSPACE_AMBIGUOUS";
 
     // Activity database error codes
     pub const ACTIVITY_DB_LOCKED: &'static str = "ACTIVITY_DB_LOCKED";
@@ -379,6 +380,36 @@ impl DaemonError {
         )
         .recoverable(false)
         .with_details(serde_json::json!({ "raw": raw }))
+    }
+
+    // Configuration errors
+    /// Creates a "dispatch workspace ambiguous" error (Issue #4299): raised by
+    /// `DispatchSweep` resolution when the daemon's seeded default workspace
+    /// (its cwd) is not itself registered and more than one workspace is
+    /// registered, so there is no safe default target — never resolved via a
+    /// silent cwd fallback. `registered` lists every currently-registered
+    /// workspace root so the caller/operator can supply one via
+    /// `--workspace`/`workspace_root`.
+    #[must_use]
+    pub fn workspace_ambiguous(registered: &[std::path::PathBuf]) -> Self {
+        let roots: Vec<String> = registered.iter().map(|p| p.display().to_string()).collect();
+        Self::new(
+            ErrorDomain::Configuration,
+            ErrorCode::CONFIG_WORKSPACE_AMBIGUOUS,
+            format!(
+                "dispatch target is ambiguous: the daemon's default workspace is not \
+                 registered and {} workspaces are registered ({}) — pass an explicit \
+                 --workspace/workspace_root",
+                roots.len(),
+                roots.join(", ")
+            ),
+        )
+        .recoverable(false)
+        .with_details(serde_json::json!({ "registered": roots }))
+        .with_recovery_hint(
+            "Specify the target repo explicitly: `loom-daemon dispatch <N> --workspace <path>` \
+             (CLI) or `workspace_root` (MCP dispatch_sweep).",
+        )
     }
 
     // Internal errors

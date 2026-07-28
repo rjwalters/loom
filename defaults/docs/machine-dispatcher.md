@@ -240,6 +240,24 @@ launchd-managed) or refused (not currently running, or a pre-#4077 binary), it
 falls back to a plain stop-then-start via the same checkout-resolved
 lifecycle-script delegates.
 
+### Sweep dispatch on a multi-repo worker host (#4299)
+
+The lifecycle hand-off above (`LOOM_MACHINE_CHECKOUT`) governs `start`/`stop`/
+`update`/`restart` — it does **not** apply to `loom-daemon dispatch <issue>` or
+the MCP `dispatch_sweep` tool, which target a **repo's working tree**, not the
+machine checkout. A worker host provisioned with the machine-level layout
+(checkout at `~/.local/share/loom`, one or more product repos registered via
+`loom-daemon workspace add`) used to require restarting the daemon with an
+explicit `WorkingDirectory=<repo>` override — collapsing the machine-level
+daemon back into a single-repo daemon — because `dispatch`/`dispatch_sweep`
+resolved an absent `--workspace`/`workspace_root` from the daemon's own cwd
+instead of the workspace registry. This is fixed: dispatch now consults
+`~/.loom/workspaces.json` for the explicit-param-absent case, so a daemon
+started with cwd = the machine checkout and exactly one registered workspace
+dispatches into that workspace with no `WorkingDirectory` override needed. See
+[`daemon-reference.md`](daemon-reference.md) → `dispatch_sweep` for the full
+resolution precedence.
+
 ### Supervision (reboot/crash) — macOS via launchd, Linux via systemd `--user`
 
 Reboot/crash supervision itself (as opposed to the workdir/pid-file relocation
