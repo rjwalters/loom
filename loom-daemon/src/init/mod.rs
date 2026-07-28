@@ -1527,6 +1527,24 @@ mod tests {
              report it MISSING on every install (#3476)"
         );
 
+        // Reference docs extracted from defaults/CLAUDE.md in #4143 (Phase 2 of
+        // #4052). They must ship from defaults/docs/ so live cross-references
+        // (CLAUDE.md guard catalog, docs/model-selection-retune.md) do not orphan
+        // when Phase 3 deletes defaults/CLAUDE.md.
+        for doc in &[
+            "guard-hooks.md",
+            "model-selection.md",
+            "model-cost-experiment.md",
+            "health-monitoring.md",
+            "advanced-hooks.md",
+        ] {
+            assert!(
+                defaults.join("docs").join(doc).is_file(),
+                "defaults/docs/{doc} missing — the #4143 reference-doc extraction \
+                 must ship it to <target>/.loom/docs/ or its cross-reference dangles"
+            );
+        }
+
         // The old nested location must stay gone: a file reappearing at
         // defaults/.loom/docs/ would be manifest-listed (via the `.loom/*`
         // literal rule in scripts/install/manifest.sh) but never copied by

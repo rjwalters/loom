@@ -283,8 +283,16 @@ Configuration lives in `.loom/config.json` (committed for team sharing): a
   /path/to/repo` (squash-only merges, auto-delete branches, auto-merge enabled).
 - **Guard hooks** — `PreToolUse` guards block/ask on destructive commands and
   confine Edit/Write to a builder's worktree; toggle categories via
-  `.loom/config.json` → `guards.*` (each with an `LOOM_*` env override). See the
+  `.loom/config.json` → `guards.*` (each with an `LOOM_*` env override). Full
+  catalog: [`.loom/docs/guard-hooks.md`](.loom/docs/guard-hooks.md); see also the
   `guard-destructive.sh` / `guard-worktree-paths.sh` scripts under `.loom/hooks/`.
+- **Model selection** — worker model resolution, the escalation ladder, and the
+  suggested-model-by-role defaults: [`.loom/docs/model-selection.md`](.loom/docs/model-selection.md);
+  the opt-in model-cost A/B experiment: [`.loom/docs/model-cost-experiment.md`](.loom/docs/model-cost-experiment.md).
+- **Health monitoring & advanced hooks** — proactive health monitoring for
+  unattended runs: [`.loom/docs/health-monitoring.md`](.loom/docs/health-monitoring.md);
+  opt-in `UserPromptSubmit` context injection + transcript archival:
+  [`.loom/docs/advanced-hooks.md`](.loom/docs/advanced-hooks.md).
 - **MCP hooks** — the unified `mcp-loom` server; run `./scripts/setup-mcp.sh` to
   generate `.mcp.json`.
 
@@ -337,7 +345,12 @@ concurrency errors are covered in
   [github-auth](.loom/docs/github-authentication.md) /
   [forge-auth](.loom/docs/forge-authentication.md) ·
   [ci-integration](.loom/docs/ci-integration.md) ·
-  [tool-use-concurrency-errors](.loom/docs/tool-use-concurrency-errors.md)
+  [tool-use-concurrency-errors](.loom/docs/tool-use-concurrency-errors.md) ·
+  [guard-hooks](.loom/docs/guard-hooks.md) ·
+  [model-selection](.loom/docs/model-selection.md) ·
+  [model-cost-experiment](.loom/docs/model-cost-experiment.md) ·
+  [health-monitoring](.loom/docs/health-monitoring.md) ·
+  [advanced-hooks](.loom/docs/advanced-hooks.md)
 
 ## Support
 

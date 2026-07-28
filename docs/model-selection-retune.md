@@ -13,7 +13,7 @@ shipped), #3482 / PR #3485 (the `--by-model` measurement plumbing — already
 shipped), #3706 (this document).
 
 > **Hard rule.** Do **not** edit any `suggestedModel` value in
-> `defaults/roles/*.json`, nor the model values in the `defaults/CLAUDE.md`
+> `defaults/roles/*.json`, nor the model values in the `defaults/docs/model-selection.md`
 > "Suggested models by role" table, until the inequality below is demonstrated
 > **for that specific role** over a representative sample. The flip is a separate,
 > data-gated follow-up PR. This document changes no default.
@@ -164,7 +164,7 @@ parallel, purpose-built collector — the `/loom:sweep` model-cost experiment
 `.loom/stats/sweep-model-stats.jsonl` (arm / model / attempt / Judge verdict /
 Doctor-cycle count / complexity) and harvests it into exactly the per-arm §2
 inequality inputs. This runbook is the copy-pasteable procedure for accruing that
-sample. See `defaults/CLAUDE.md` § "Model-Cost Experiment (canary A/B, #3725)" for
+sample. See [`defaults/docs/model-cost-experiment.md`](../defaults/docs/model-cost-experiment.md) for
 the full behavior contract.
 
 > **This runbook is the *tooling*. The multi-day accrual run itself — turning on a
@@ -337,7 +337,7 @@ here changes a default** unless it also cites a qualifying sample per Section 3.
   **Decision:** `defaults/roles/builder.json` `suggestedModel` remains `opus`. No
   default changed, preserving the Hard Rule at the top of this document. Accruing the
   sample is out-of-band, over-time work (a multi-day `LOOM_MODEL_EXPERIMENT=observe`
-  or canary `experiment` campaign per `defaults/CLAUDE.md` § "Model-Cost Experiment"),
+  or canary `experiment` campaign per [`defaults/docs/model-cost-experiment.md`](../defaults/docs/model-cost-experiment.md)),
   not a Builder code change. `observe` mode is the suggested follow-up mechanism for
   generating the `sonnet` vs `opus` data points a passive `opus`-only default can
   never produce on its own.
@@ -406,7 +406,7 @@ When — and only when — conditions (1) and (2) both hold for a specific role 
 sample meeting Section 3's prerequisites:
 
 1. Open a **separate** PR that flips *only that one role's* `suggestedModel`
-   (Builder first), and updates the corresponding row in the `defaults/CLAUDE.md`
+   (Builder first), and updates the corresponding row in the `defaults/docs/model-selection.md`
    "Suggested models by role" table.
 2. Cite the measured `cost(sonnet_first)`, `cost(opus_first)`,
    `merge_rate` values and the sample size in the PR body.
