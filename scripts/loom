@@ -82,11 +82,13 @@ loom_detect_context() {
         if [[ -f "$dir/.loom/bin/loom" && -z "$LOOM_CTX_POOL" ]]; then
             LOOM_CTX_POOL="$dir/.loom/bin/loom"
         fi
-        if [[ -d "$dir/.loom" ]]; then
-            LOOM_CTX_ROOT="$dir"
-            LOOM_CTX_KIND="consumer-repo"
-            return 0
-        fi
+        # Linked-worktree detection MUST precede the consumer-repo (.loom/) check:
+        # a repo that commits .loom/ (config.json, roles/, scripts/ — the norm per
+        # CLAUDE.md) carries a real .loom/ directory inside every worktree checkout
+        # too, so testing -d "$dir/.loom" first would misclassify every worktree of
+        # such a repo as a consumer-repo and resolve LOOM_CTX_ROOT to the worktree
+        # instead of the main checkout. A linked worktree's .git is a *file*
+        # ("gitdir: <path>"), so -f "$dir/.git" distinguishes it cleanly.
         if [[ -f "$dir/.git" ]]; then
             # Linked git worktree: .git is a file "gitdir: <path>".
             local gitdir main_repo
@@ -100,6 +102,11 @@ loom_detect_context() {
                 fi
                 return 0
             fi
+        fi
+        if [[ -d "$dir/.loom" ]]; then
+            LOOM_CTX_ROOT="$dir"
+            LOOM_CTX_KIND="consumer-repo"
+            return 0
         fi
         dir="$(dirname "$dir")"
     done

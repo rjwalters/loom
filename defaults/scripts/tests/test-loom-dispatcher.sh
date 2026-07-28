@@ -98,12 +98,17 @@ out=$(cd "$CONSUMER" && LOOM_HOME="$CHK" bash "$DISPATCHER" status 2>&1)
 assert_contains "$out" "consumer-repo" "consumer repo context labelled consumer-repo"
 assert_contains "$out" "pool manager:  present" "consumer repo notes the pool manager"
 
-# (2) git worktree
-WT=$(mktemp -d)
+# (2) git worktree — a real Loom worktree of a repo that commits .loom/ carries
+# its own checked-out .loom/ directory, so $WT gets one too. This exercises the
+# ordering fix: the linked-worktree (.git file) check must win over the
+# consumer-repo (.loom/ dir) check, else the worktree is misclassified as a
+# consumer-repo rooted at itself instead of at the main checkout.
+WT=$(mktemp -d); mkdir -p "$WT/.loom"
 MAIN=$(mktemp -d); mkdir -p "$MAIN/.loom"
 printf 'gitdir: %s/.git/worktrees/wt\n' "$MAIN" > "$WT/.git"
 out=$(cd "$WT" && LOOM_HOME="$CHK" bash "$DISPATCHER" status 2>&1)
 assert_contains "$out" "git-worktree" "worktree context labelled git-worktree"
+assert_contains "$out" "$MAIN" "worktree resolves LOOM_CTX_ROOT to the main checkout, not the worktree"
 
 # (3) non-repo directory
 NR=$(mktemp -d)
