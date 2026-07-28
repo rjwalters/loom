@@ -889,6 +889,14 @@ pub struct DaemonStatusReport {
     /// pre-#3930 wire data / older clients compatible (an empty vec).
     #[serde(default)]
     pub per_repo: Vec<RepoStatus>,
+    /// Startup forge-credential preflight snapshot (#4005): resolved once at
+    /// daemon boot, before the claim-reconciliation startup pass (the
+    /// daemon's first `gh` consumer) — see
+    /// [`crate::credential_preflight::run`]. `None` only for a pre-#4005 wire
+    /// payload from an older daemon binary that never computed one.
+    /// `#[serde(default)]` keeps that wire data compatible.
+    #[serde(default)]
+    pub credential_preflight: Option<CredentialPreflightReport>,
 }
 
 /// One registered managed-workspace's status line in [`DaemonStatusReport`]
@@ -974,6 +982,47 @@ pub struct CapacityReport {
     /// Whether the token axis is the binding (minimum) constraint on the dynamic
     /// cap — i.e. tokens, not disk or the operator ceiling, are the bottleneck.
     pub token_bound: bool,
+}
+
+/// Startup forge-credential preflight snapshot (#4005) — see
+/// [`crate::credential_preflight`] for the resolution logic. Resolved exactly
+/// once, before the daemon's first `gh` consumer, so headless/SSH-only
+/// operation (no unlockable GUI login keychain) is diagnosed loudly at boot
+/// instead of surfacing as an unexplained per-tick `401` on every forge call.
+///
+/// GitHub-only: the daemon's own forge calls all shell out to `gh`, which
+/// resolves GitHub credentials exclusively. `GITEA_TOKEN`/`FORGE_TOKEN`
+/// forwarding (`loom-daemon-start.sh`) exists only for dispatched sweep
+/// children targeting a Gitea-backed repo — the daemon process itself never
+/// calls a Gitea API, so there is nothing here to preflight for it.
+///
+/// **Never carries a token value** — only a resolution-mechanism label and a
+/// non-secret fingerprint (last 4 chars of an env-sourced token, or the
+/// authenticated `gh` login for a credential-store resolution).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CredentialPreflightReport {
+    /// `true` when a usable GitHub credential was resolved; `false` when
+    /// none was found, or the probe itself could not complete within its
+    /// bound (`gh` missing from `PATH`, timed out, spawn failure, …) — see
+    /// [`Self::mechanism`] `"unknown"` for that latter case.
+    pub ok: bool,
+    /// Which mechanism resolved the credential: `"GH_TOKEN"` / `"GITHUB_TOKEN"`
+    /// (the daemon's own process environment) or `gh`'s own `tokenSource`
+    /// (e.g. `"keyring"`, `"oauth_token"`) reported by `gh auth status`.
+    /// `"none"` when nothing resolved; `"unknown"` when the probe itself
+    /// failed to run. NEVER a token value.
+    pub mechanism: String,
+    /// A non-secret fingerprint: the last 4 characters of an env-sourced
+    /// token, or the authenticated `gh` login for a credential-store
+    /// resolution. `None` when no credential resolved.
+    pub fingerprint: Option<String>,
+    /// Human-readable, log/print-safe summary — never contains a token.
+    /// Names both remediations (export `GH_TOKEN` before starting the
+    /// daemon, or unlock the login keychain from a GUI session) when `ok` is
+    /// `false`.
+    pub message: String,
+    /// Wall-clock time this snapshot was taken (daemon startup).
+    pub checked_at: DateTime<Utc>,
 }
 
 // ========================================================================

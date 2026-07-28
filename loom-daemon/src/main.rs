@@ -1,5 +1,6 @@
 use loom_daemon::activity::{self, ActivityDb, StatsQueries};
 use loom_daemon::claim_reconciliation;
+use loom_daemon::credential_preflight;
 use loom_daemon::daemon_heartbeat;
 use loom_daemon::epic_supervisor;
 use loom_daemon::event_bus::EventBus;
@@ -616,6 +617,19 @@ async fn main() -> Result<()> {
         Err(e) => log::warn!("sweep_registry: reconstruction failed: {e}"),
     }
 
+    // Startup forge-credential preflight (Issue #4005). Resolved once, here —
+    // immediately before the claim-reconciliation pass below, the daemon's
+    // first `gh` consumer — so a headless/SSH-only start with neither an
+    // exported GH_TOKEN/GITHUB_TOKEN nor an unlockable GUI login keychain is
+    // diagnosed loudly at boot instead of surfacing as silent per-tick 401s
+    // for the life of the process. Non-fatal and bounded (same posture as the
+    // reconciliation pass itself): a `gh` hiccup here never blocks startup.
+    let credential_preflight_probe = credential_preflight::RealGhAuthProbe {
+        gh_bin: "gh".to_string(),
+        cwd: sweep_workspace.clone(),
+    };
+    let credential_preflight = credential_preflight::run(&credential_preflight_probe);
+
     // Stale-`loom:building`-claim reconciliation across every managed
     // workspace (Issue #3953). `sweep.reconstruct()` above only recovers
     // entries this registry itself owns evidence for (locks/checkpoints); it
@@ -1096,7 +1110,9 @@ async fn main() -> Result<()> {
     // `DaemonStatus` request can report each registered repo's own halt state
     // (#3930), and `sweep_workspace` is the `effective_roots` fallback for the
     // per-repo status breakdown — the same values the work-finder and gate loop
-    // share above.
+    // share above. `credential_preflight` (#4005) is threaded in so
+    // `DaemonStatus` can report the startup credential resolution computed
+    // once above, without reading logs.
     let server = IpcServer::new(
         socket_path.clone(),
         tm,
@@ -1106,6 +1122,7 @@ async fn main() -> Result<()> {
         workspace_health_states.clone(),
         workspace_pool.clone(),
         sweep_workspace.clone(),
+        credential_preflight,
     );
 
     // Setup signal handler for graceful shutdown. We listen for BOTH SIGINT
@@ -2255,6 +2272,17 @@ fn print_status_json(
             "enabled": report.main_health_gate_enabled,
             "verdict_at": report.main_health_gate_verdict_at,
         },
+        // Startup forge-credential preflight (#4005) — resolved once at
+        // daemon boot, before the daemon's first `gh` consumer. Never
+        // contains a token value; `null` only from a pre-#4005 daemon binary
+        // that never computed one.
+        "credential_preflight": report.credential_preflight.as_ref().map(|c| serde_json::json!({
+            "ok": c.ok,
+            "mechanism": c.mechanism,
+            "fingerprint": c.fingerprint,
+            "message": c.message,
+            "checked_at": c.checked_at,
+        })),
         // Per-repo breakdown across every registered managed workspace (#3930).
         "per_repo": report.per_repo.iter().map(|r| serde_json::json!({
             "root": r.root,
@@ -2607,6 +2635,25 @@ fn print_status_human(
     );
     let gate = format_gate_status(&verdict);
     println!("\nMain-health gate: {gate}");
+
+    // Startup forge-credential preflight (#4005) — resolved once at daemon
+    // boot, before the daemon's first `gh` consumer, so a headless/SSH-only
+    // start with no usable credential is visible here rather than only as
+    // silent per-tick 401s in the logs. `None` only from a pre-#4005 daemon
+    // binary that never computed one.
+    match &report.credential_preflight {
+        Some(c) if c.ok => {
+            println!(
+                "Forge credential: OK — {} ({})",
+                c.mechanism,
+                c.fingerprint.as_deref().unwrap_or("no fingerprint")
+            );
+        }
+        Some(c) => println!("Forge credential: DEGRADED — {}", c.message),
+        None => {
+            println!("Forge credential: unknown (older daemon binary — restart to pick up #4005)")
+        }
+    }
 
     // Per-repo breakdown across every registered managed workspace (#3930). In
     // the common single-workspace case this is one line for the daemon's own

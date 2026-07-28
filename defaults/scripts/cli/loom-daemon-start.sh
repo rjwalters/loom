@@ -547,6 +547,18 @@ if [[ "$USE_LAUNCHD" == "true" ]]; then
 
     render_launchd_plist "$LAUNCHD_LABEL" "$DAEMON_BIN" "$REPO_ROOT" "$START_LOG" > "$PLIST_FILE"
 
+    # Harden the rendered plist when it carries a forwarded credential
+    # (#4005): the token-forwarding loop in render_launchd_plist writes any
+    # exported GH_TOKEN/GITEA_TOKEN/FORGE_TOKEN straight into
+    # EnvironmentVariables above, and the plain `>` redirect otherwise leaves
+    # the file at the process's umask (typically world-readable, 0644) --
+    # any local user could read the PAT straight out of
+    # ~/Library/LaunchAgents. Match the same env pattern the forwarding loop
+    # reads from.
+    if env | grep -qE '^(GH_TOKEN|GITEA_TOKEN|FORGE_TOKEN)=' 2>/dev/null; then
+        chmod 600 "$PLIST_FILE"
+    fi
+
     echo "Launchd label:  $LAUNCHD_LABEL"
     echo "Launchd plist:  $PLIST_FILE"
 

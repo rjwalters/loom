@@ -7,7 +7,7 @@ use crate::git_utils;
 use crate::main_health_gate::WorkspaceHealthStates;
 use crate::sweep_registry::{BeginCancel, SweepRegistry};
 use crate::terminal::TerminalManager;
-use crate::types::{DaemonStatusReport, Event, Request, Response};
+use crate::types::{CredentialPreflightReport, DaemonStatusReport, Event, Request, Response};
 use crate::workspace_pool::WorkspacePool;
 use crate::workspace_registry::WorkspaceRegistry;
 use anyhow::Result;
@@ -211,6 +211,11 @@ pub struct IpcServer {
     /// empty (#3930). In the common single-workspace case this is the only root
     /// the `DaemonStatus` per-repo breakdown enumerates.
     fallback_root: PathBuf,
+    /// Startup forge-credential preflight snapshot (#4005), resolved once at
+    /// daemon boot (`main.rs`, before the claim-reconciliation startup pass)
+    /// and threaded in read-only so `DaemonStatus` can report it without a
+    /// re-probe on every status query.
+    credential_preflight: Arc<CredentialPreflightReport>,
 }
 
 impl IpcServer {
@@ -224,6 +229,7 @@ impl IpcServer {
         health_states: Arc<WorkspaceHealthStates>,
         workspace_pool: Arc<WorkspacePool>,
         fallback_root: PathBuf,
+        credential_preflight: CredentialPreflightReport,
     ) -> Self {
         Self {
             socket_path,
@@ -234,6 +240,7 @@ impl IpcServer {
             health_states,
             workspace_pool,
             fallback_root,
+            credential_preflight: Arc::new(credential_preflight),
         }
     }
 
@@ -270,9 +277,20 @@ impl IpcServer {
                     let health = self.health_states.clone();
                     let pool = self.workspace_pool.clone();
                     let fallback = self.fallback_root.clone();
+                    let credential_preflight = self.credential_preflight.clone();
                     tokio::spawn(async move {
-                        if let Err(e) =
-                            handle_client(stream, tm, db, sr, bus, health, pool, fallback).await
+                        if let Err(e) = handle_client(
+                            stream,
+                            tm,
+                            db,
+                            sr,
+                            bus,
+                            health,
+                            pool,
+                            fallback,
+                            credential_preflight,
+                        )
+                        .await
                         {
                             log::error!("Client error: {e}");
                         }
@@ -296,6 +314,7 @@ async fn handle_client(
     health_states: Arc<WorkspaceHealthStates>,
     workspace_pool: Arc<WorkspacePool>,
     fallback_root: PathBuf,
+    credential_preflight: Arc<CredentialPreflightReport>,
 ) -> Result<()> {
     let (reader, mut writer) = stream.into_split();
     let mut lines = BufReader::new(reader).lines();
@@ -368,7 +387,12 @@ async fn handle_client(
             // (within the TTL) makes this a no-op. `spawn_blocking` join errors
             // are non-fatal — the status falls back to the last cached value.
             let _ = tokio::task::spawn_blocking(crate::cpu_headroom::refresh_cpu_util_cache).await;
-            let report = build_daemon_status(&workspace_pool, &health_states, &fallback_root);
+            let report = build_daemon_status(
+                &workspace_pool,
+                &health_states,
+                &fallback_root,
+                &credential_preflight,
+            );
             let response = Response::DaemonStatus(report);
             let response_json = serde_json::to_string(&response)?;
             writer.write_all(response_json.as_bytes()).await?;
@@ -581,6 +605,7 @@ pub fn build_daemon_status(
     workspace_pool: &Arc<WorkspacePool>,
     health_states: &WorkspaceHealthStates,
     fallback_root: &Path,
+    credential_preflight: &CredentialPreflightReport,
 ) -> DaemonStatusReport {
     // Enumerate every registered managed workspace (Issue #3930). An empty
     // registry yields `[fallback_root]`, so the common single-workspace case is
@@ -724,6 +749,9 @@ pub fn build_daemon_status(
         main_health_gate_verdict_at: health_states.last_verdict_at(fallback_root),
         capacity,
         per_repo,
+        // Resolved once at daemon startup (#4005), threaded in read-only —
+        // never re-probed per status query.
+        credential_preflight: Some(credential_preflight.clone()),
     }
 }
 
@@ -1814,6 +1842,19 @@ mod tests {
             .clone()
     }
 
+    /// A fixture credential-preflight snapshot for `build_daemon_status` tests
+    /// (#4005) — these tests exercise the dynamic-cap/health-gate machinery,
+    /// not credential resolution, so a fixed `Ok` snapshot keeps them focused.
+    fn test_credential_preflight() -> CredentialPreflightReport {
+        CredentialPreflightReport {
+            ok: true,
+            mechanism: "test-fixture".to_string(),
+            fingerprint: None,
+            message: "test fixture — not a real preflight".to_string(),
+            checked_at: Utc::now(),
+        }
+    }
+
     /// A [`WorkspacePool`] for `handle_request` tests (Issue #3929). The
     /// default-workspace (`workspace_root: None`) paths these tests exercise
     /// never provision, so no task is actually spawned.
@@ -2838,6 +2879,7 @@ exit 0
                 health_gate_enabled: Some(true),
                 health_gate_verdict_at: Some(chrono::Utc::now()),
             }],
+            credential_preflight: Some(test_credential_preflight()),
         };
         let resp = Response::DaemonStatus(report);
         let json = serde_json::to_string(&resp).expect("serialize response");
@@ -2869,6 +2911,12 @@ exit 0
                 assert!(r.main_health_gate_verdict_at.is_some());
                 assert_eq!(r.per_repo[0].health_gate_enabled, Some(true));
                 assert!(r.per_repo[0].health_gate_verdict_at.is_some());
+                assert_eq!(
+                    r.credential_preflight
+                        .as_ref()
+                        .map(|c| c.mechanism.as_str()),
+                    Some("test-fixture")
+                );
             }
             other => panic!("Expected DaemonStatus, got: {other:?}"),
         }
@@ -3056,7 +3104,7 @@ exit 0
         let health = WorkspaceHealthStates::new();
 
         // No sweeps in flight, cap > 0 ⇒ the cap is a ceiling but NOT binding.
-        let report = build_daemon_status(&pool, &health, &root);
+        let report = build_daemon_status(&pool, &health, &root, &test_credential_preflight());
         assert!(report.dynamic_cap > 0, "two tokens should yield a positive cap");
         assert!(report.in_flight.is_empty());
         assert!(
@@ -3080,7 +3128,7 @@ exit 0
                 .expect("dispatch");
             }
         }
-        let report = build_daemon_status(&pool, &health, &root);
+        let report = build_daemon_status(&pool, &health, &root, &test_credential_preflight());
         assert_eq!(report.in_flight.len(), cap);
         assert!(
             report.capacity_bound,
@@ -3124,7 +3172,7 @@ exit 0
         let health = WorkspaceHealthStates::new();
 
         // Fresh state: not halted, no sweeps.
-        let report = build_daemon_status(&pool, &health, &root);
+        let report = build_daemon_status(&pool, &health, &root, &test_credential_preflight());
         assert!(!report.main_health_gate_halted);
         assert!(report.in_flight.is_empty());
         // The tempdir has no `.loom/tokens/`, so the pool + dynamic cap are 0.
@@ -3155,7 +3203,7 @@ exit 0
             r#"{"autonomous": {"mainHealthGate": {"enabled": true}}, "buildGate": {"enabled": true, "command": "true"}}"#,
         )
         .unwrap();
-        let report = build_daemon_status(&pool, &health, &root);
+        let report = build_daemon_status(&pool, &health, &root, &test_credential_preflight());
         assert_eq!(
             report.main_health_gate_enabled,
             Some(true),
@@ -3173,7 +3221,7 @@ exit 0
             reg.dispatch(&crate::types::SweepKind::Issue(3891), None, None, None, None)
                 .expect("dispatch");
         }
-        let report = build_daemon_status(&pool, &health, &root);
+        let report = build_daemon_status(&pool, &health, &root, &test_credential_preflight());
         assert_eq!(report.in_flight.len(), 1);
         assert!(matches!(report.in_flight[0].kind, crate::types::SweepKind::Issue(3891)));
         assert_eq!(report.per_repo[0].in_flight_count, 1);
@@ -3181,7 +3229,7 @@ exit 0
         // Flip the halt flag for this root -> the report tracks it (top-level and
         // per-repo).
         health.set_halted(&root, true);
-        let report = build_daemon_status(&pool, &health, &root);
+        let report = build_daemon_status(&pool, &health, &root, &test_credential_preflight());
         assert!(report.main_health_gate_halted);
         assert!(report.per_repo[0].health_gate_halted);
         assert!(!report.main_health_gate_not_evaluated, "no skip has happened yet");
@@ -3198,7 +3246,7 @@ exit 0
             )),
             std::time::Duration::from_secs(3600),
         );
-        let report = build_daemon_status(&pool, &health, &root);
+        let report = build_daemon_status(&pool, &health, &root, &test_credential_preflight());
         assert!(report.main_health_gate_halted, "prior halt persists through a skip");
         assert!(report.main_health_gate_not_evaluated, "skip surfaces as not-evaluated");
         assert!(report.per_repo[0].health_gate_halted);
@@ -3267,7 +3315,7 @@ exit 0
                 .expect("dispatch");
         }
 
-        let report = build_daemon_status(&pool, &health, &root_a);
+        let report = build_daemon_status(&pool, &health, &root_a, &test_credential_preflight());
         assert_eq!(report.per_repo.len(), 2, "both managed repos are listed");
         // Union of in-flight across repos = repo A's single sweep.
         assert_eq!(report.in_flight.len(), 1);
