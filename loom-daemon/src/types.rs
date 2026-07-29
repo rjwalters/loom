@@ -766,7 +766,17 @@ pub struct SweepInfo {
     /// Current lifecycle state.
     pub state: SweepState,
     /// Most-recent phase the sweep advertised via its checkpoint, if any.
-    /// Populated by `sweep_registry::reconstruct_from_checkpoints`.
+    /// Set directly on `Crashed` entries (the reaper's crash path and
+    /// `reconstruct_from_checkpoints`). For `Running`/`Pending` entries this
+    /// field is `None` in the stored registry entry — `SweepRegistry::list`
+    /// overlays a live read of the on-disk checkpoint at query time (#4328)
+    /// so `ListSweeps`/`loom-daemon status` show the sweep's current phase
+    /// without the registry needing to poll the filesystem on every tick.
+    /// The checkpoint's `phase` field is a completion marker
+    /// (`curator-done`/`builder-done`/`judge-rejected`/`judge-done`/
+    /// `doctor-done`/`merge-done`), rendered verbatim rather than mapped to
+    /// an inferred "current phase" — a mapping risks misleading whoever is
+    /// reading it when a sweep dies between phase boundaries.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub latest_phase: Option<String>,
     /// PR number the sweep eventually opened, if known. Reserved for
