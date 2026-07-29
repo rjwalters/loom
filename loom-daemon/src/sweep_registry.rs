@@ -1894,7 +1894,38 @@ impl SweepRegistry {
         self.entries.get(sweep_id)
     }
 
-    /// Return all tracked sweeps matching the optional state filter.
+    /// For a `Running`/`Pending` entry with no `latest_phase` yet (i.e. every
+    /// live sweep — see the [`SweepInfo::latest_phase`] doc comment), overlay
+    /// the phase read live from the on-disk checkpoint
+    /// (`.loom/sweep-checkpoint/issue-<N>.json`), the same source
+    /// [`read_checkpoint_phase`] and the reaper's crash path already use
+    /// (#4328). Checkpoint writes are unconditional at every phase boundary
+    /// (`sweep-checkpoint.sh`), unlike the sweep skill's best-effort
+    /// `PublishEvent` IPC call, which the registry never routed anywhere —
+    /// so this is the only path that reliably surfaces live phase. The
+    /// #4009 freshness guard ([`checkpoint_written_by_run`]) still applies,
+    /// so a checkpoint left on disk by an earlier dispatch of the same issue
+    /// is never misread as this run's progress. This is a read-time overlay
+    /// only — the stored entry in `self.entries` is untouched; callers apply
+    /// it to an already-cloned [`SweepInfo`].
+    fn overlay_live_phase(&self, info: &mut SweepInfo) {
+        if info.latest_phase.is_none()
+            && matches!(info.state, SweepState::Running | SweepState::Pending)
+        {
+            if let SweepKind::Issue(issue) = info.kind {
+                let checkpoint = self
+                    .config
+                    .checkpoint_dir()
+                    .join(format!("issue-{issue}.json"));
+                if checkpoint_written_by_run(&checkpoint, info.started_at) {
+                    info.latest_phase = read_checkpoint_phase(&checkpoint);
+                }
+            }
+        }
+    }
+
+    /// Return all tracked sweeps matching the optional state filter, with the
+    /// live-phase overlay applied (see [`Self::overlay_live_phase`], #4328).
     pub fn list(&self, filter: Option<&SweepState>) -> Vec<SweepInfo> {
         self.entries
             .values()
@@ -1905,6 +1936,10 @@ impl SweepRegistry {
                 }
             })
             .cloned()
+            .map(|mut info| {
+                self.overlay_live_phase(&mut info);
+                info
+            })
             .collect()
     }
 
@@ -3484,11 +3519,14 @@ impl SweepRegistry {
     // ------------------------------------------------------------------------
 
     /// Return the `SweepInfo` for the given sweep ID, cloned (so callers
-    /// can release the registry lock immediately). Phase C exposes this
-    /// as the `get_sweep_status` MCP tool.
+    /// can release the registry lock immediately) and with the live-phase
+    /// overlay applied (see [`Self::overlay_live_phase`], #4328). Phase C
+    /// exposes this as the `get_sweep_status` MCP tool.
     #[must_use]
     pub fn get_status(&self, sweep_id: &str) -> Option<SweepInfo> {
-        self.entries.get(sweep_id).cloned()
+        let mut info = self.entries.get(sweep_id).cloned()?;
+        self.overlay_live_phase(&mut info);
+        Some(info)
     }
 
     /// Signal a sweep's process. When this daemon still owns a retained
@@ -5700,6 +5738,7 @@ mod tests {
     use super::*;
     use serial_test::serial;
     use std::os::unix::fs::PermissionsExt;
+    use std::time::SystemTime;
     use tempfile::tempdir;
 
     /// Install the `/loom:sweep` command marker under `workspace` (Issue
@@ -7079,6 +7118,205 @@ exit 0
 
         let all = registry.list(None);
         assert_eq!(all.len(), 1);
+    }
+
+    // ------------------------------------------------------------------------
+    // Live phase overlay in `list()` (Issue #4328)
+    // ------------------------------------------------------------------------
+
+    /// Insert a `Running` entry for `issue` with no `latest_phase` set (the
+    /// shape every live dispatch has today), with an explicit `started_at`.
+    fn insert_running_at(
+        registry: &mut SweepRegistry,
+        issue: u32,
+        seq: u32,
+        started_at: DateTime<Utc>,
+    ) -> String {
+        let sweep_id = format!("sweep-issue-{issue}-{seq}");
+        registry.entries.insert(
+            sweep_id.clone(),
+            SweepInfo {
+                sweep_id: sweep_id.clone(),
+                kind: SweepKind::Issue(issue),
+                pid: std::process::id(), // any live-looking pid; list() never probes liveness
+                token_name: "unknown".into(),
+                log_path: registry.compute_log_path(issue),
+                idempotency_key: None,
+                started_at,
+                state: SweepState::Running,
+                latest_phase: None,
+                pr_number: None,
+                model: None,
+                effort: None,
+                depends_on: None,
+                repo: None,
+            },
+        );
+        sweep_id
+    }
+
+    /// Write a checkpoint JSON file for `issue` under `registry`'s checkpoint
+    /// dir, then set its mtime explicitly (so tests can position it before or
+    /// after a run's `started_at`).
+    fn write_checkpoint_with_mtime(
+        registry: &SweepRegistry,
+        issue: u32,
+        phase: &str,
+        mtime: SystemTime,
+    ) {
+        let dir = registry.config.checkpoint_dir();
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(format!("issue-{issue}.json"));
+        std::fs::write(&path, format!(r#"{{"phase":"{phase}","issue":{issue}}}"#)).unwrap();
+        let file = std::fs::File::options().write(true).open(&path).unwrap();
+        file.set_modified(mtime).unwrap();
+    }
+
+    /// A `Running` entry whose issue has a fresh checkpoint (mtime at/after
+    /// `started_at`) reports that phase — verbatim, not remapped — via
+    /// `list()` (AC 2: this is what feeds both `loom-daemon status`'s default
+    /// and `--workspace`-scoped views, since both read through this method).
+    #[test]
+    fn list_overlays_live_phase_from_fresh_checkpoint() {
+        let dir = tempdir().unwrap();
+        let (mut registry, _record_log) = fixture_registry(dir.path());
+
+        let started_at = Utc::now() - Duration::from_secs(60);
+        insert_running_at(&mut registry, 4328, 0, started_at);
+        write_checkpoint_with_mtime(&registry, 4328, "builder-done", SystemTime::now());
+
+        let info = registry
+            .list(None)
+            .into_iter()
+            .find(|i| matches!(i.kind, SweepKind::Issue(4328)))
+            .expect("issue 4328 entry present");
+        assert_eq!(
+            info.latest_phase.as_deref(),
+            Some("builder-done"),
+            "fresh checkpoint phase should surface verbatim"
+        );
+        // Overlay is read-time only — the stored entry itself is untouched.
+        assert!(
+            registry
+                .get("sweep-issue-4328-0")
+                .unwrap()
+                .latest_phase
+                .is_none(),
+            "list() must not mutate the stored registry entry"
+        );
+    }
+
+    /// A `Running` entry with a checkpoint left on disk by an EARLIER
+    /// dispatch (mtime before this run's `started_at`) must NOT surface that
+    /// stale phase — the #4009 freshness guard applies here exactly as it
+    /// does on the reaper's crash path.
+    #[test]
+    fn list_ignores_stale_checkpoint_from_earlier_dispatch() {
+        let dir = tempdir().unwrap();
+        let (mut registry, _record_log) = fixture_registry(dir.path());
+
+        // Checkpoint written well before this run started.
+        write_checkpoint_with_mtime(
+            &registry,
+            4329,
+            "judge-done",
+            SystemTime::now() - Duration::from_secs(3600),
+        );
+        let started_at = Utc::now();
+        insert_running_at(&mut registry, 4329, 0, started_at);
+
+        let info = registry
+            .list(None)
+            .into_iter()
+            .find(|i| matches!(i.kind, SweepKind::Issue(4329)))
+            .unwrap();
+        assert!(
+            info.latest_phase.is_none(),
+            "a stale (pre-dispatch) checkpoint must not be reported as this run's phase"
+        );
+    }
+
+    /// A `Running` entry with no checkpoint file on disk at all reports `-`
+    /// (i.e. `latest_phase == None`) — the genuinely-hasn't-reached-a-phase-
+    /// boundary-yet case (AC 3).
+    #[test]
+    fn list_reports_none_when_no_checkpoint_exists() {
+        let dir = tempdir().unwrap();
+        let (mut registry, _record_log) = fixture_registry(dir.path());
+
+        insert_running_at(&mut registry, 4330, 0, Utc::now());
+
+        let info = registry
+            .list(None)
+            .into_iter()
+            .find(|i| matches!(i.kind, SweepKind::Issue(4330)))
+            .unwrap();
+        assert!(info.latest_phase.is_none());
+    }
+
+    /// An unreadable/corrupt checkpoint file degrades to `None` rather than
+    /// panicking — `read_checkpoint_phase` already returns `None` on a parse
+    /// failure; this locks in that the `list()` overlay inherits the same
+    /// best-effort behavior.
+    #[test]
+    fn list_degrades_gracefully_on_corrupt_checkpoint() {
+        let dir = tempdir().unwrap();
+        let (mut registry, _record_log) = fixture_registry(dir.path());
+
+        let started_at = Utc::now() - Duration::from_secs(60);
+        insert_running_at(&mut registry, 4331, 0, started_at);
+        let cp_dir = registry.config.checkpoint_dir();
+        std::fs::create_dir_all(&cp_dir).unwrap();
+        let path = cp_dir.join("issue-4331.json");
+        std::fs::write(&path, "not valid json{{{").unwrap();
+        let file = std::fs::File::options().write(true).open(&path).unwrap();
+        file.set_modified(SystemTime::now()).unwrap();
+
+        let info = registry
+            .list(None)
+            .into_iter()
+            .find(|i| matches!(i.kind, SweepKind::Issue(4331)))
+            .unwrap();
+        assert!(
+            info.latest_phase.is_none(),
+            "corrupt checkpoint JSON must not panic or fabricate a phase"
+        );
+    }
+
+    /// Two workspaces (registries) each with an in-flight sweep for the SAME
+    /// issue number must not leak each other's checkpoint phase — each
+    /// registry only ever reads its own `workspace_root`-scoped checkpoint
+    /// dir, so this is a structural guarantee, not a special case in the
+    /// overlay code. Locks it in against a future refactor that might thread
+    /// a shared/global checkpoint dir through by mistake.
+    #[test]
+    fn list_does_not_leak_phase_across_workspaces_for_same_issue_number() {
+        let dir_a = tempdir().unwrap();
+        let dir_b = tempdir().unwrap();
+        let (mut registry_a, _log_a) = fixture_registry(dir_a.path());
+        let (mut registry_b, _log_b) = fixture_registry(dir_b.path());
+
+        let started_at = Utc::now() - Duration::from_secs(60);
+        insert_running_at(&mut registry_a, 777, 0, started_at);
+        insert_running_at(&mut registry_b, 777, 0, started_at);
+        write_checkpoint_with_mtime(&registry_a, 777, "builder-done", SystemTime::now());
+        // registry_b has no checkpoint at all for issue 777.
+
+        let info_a = registry_a
+            .list(None)
+            .into_iter()
+            .find(|i| matches!(i.kind, SweepKind::Issue(777)))
+            .unwrap();
+        let info_b = registry_b
+            .list(None)
+            .into_iter()
+            .find(|i| matches!(i.kind, SweepKind::Issue(777)))
+            .unwrap();
+        assert_eq!(info_a.latest_phase.as_deref(), Some("builder-done"));
+        assert!(
+            info_b.latest_phase.is_none(),
+            "workspace B's issue #777 must not see workspace A's checkpoint phase"
+        );
     }
 
     /// AC #2: reaper emits `sweep.issue.{N}.crashed` AND re-arms the
