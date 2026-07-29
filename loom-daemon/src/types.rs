@@ -1456,21 +1456,27 @@ pub struct CapacityReport {
     pub token_bound: bool,
 }
 
-/// Startup forge-credential preflight snapshot (#4005) — see
-/// [`crate::credential_preflight`] for the resolution logic. Resolved exactly
-/// once, before the daemon's first `gh` consumer, so headless/SSH-only
-/// operation (no unlockable GUI login keychain) is diagnosed loudly at boot
-/// instead of surfacing as an unexplained per-tick `401` on every forge call.
+/// Startup forge-credential preflight snapshot (#4005; GitHub App identity
+/// mechanism added by #4430) — see [`crate::credential_preflight`] for the
+/// resolution logic. Resolved exactly once, before the daemon's first `gh`
+/// consumer, so headless/SSH-only operation (no unlockable GUI login
+/// keychain) is diagnosed loudly at boot instead of surfacing as an
+/// unexplained per-tick `401` on every forge call.
 ///
 /// GitHub-only: the daemon's own forge calls all shell out to `gh`, which
-/// resolves GitHub credentials exclusively. `GITEA_TOKEN`/`FORGE_TOKEN`
-/// forwarding (`loom-daemon-start.sh`) exists only for dispatched sweep
-/// children targeting a Gitea-backed repo — the daemon process itself never
-/// calls a Gitea API, so there is nothing here to preflight for it.
+/// resolves GitHub credentials exclusively (whether that's an ambient
+/// `GH_TOKEN`/keyring credential, or a `GH_TOKEN` this process minted itself
+/// via the `"github-app"` mechanism below and exported into its own
+/// environment). `GITEA_TOKEN`/`FORGE_TOKEN` forwarding (`loom-daemon-start.sh`)
+/// exists only for dispatched sweep children targeting a Gitea-backed repo —
+/// the daemon process itself never calls a Gitea API, so there is nothing
+/// here to preflight for it.
 ///
 /// **Never carries a token value** — only a resolution-mechanism label and a
-/// non-secret fingerprint (last 4 chars of an env-sourced token, or the
-/// authenticated `gh` login for a credential-store resolution).
+/// non-secret fingerprint (last 4 chars of an env-sourced token, the
+/// authenticated `gh` login for a credential-store resolution, or `app
+/// <id> installation <id>` for the GitHub App mechanism — never the minted
+/// token itself).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CredentialPreflightReport {
     /// `true` when a usable GitHub credential was resolved; `false` when
@@ -1480,13 +1486,17 @@ pub struct CredentialPreflightReport {
     pub ok: bool,
     /// Which mechanism resolved the credential: `"GH_TOKEN"` / `"GITHUB_TOKEN"`
     /// (the daemon's own process environment) or `gh`'s own `tokenSource`
-    /// (e.g. `"keyring"`, `"oauth_token"`) reported by `gh auth status`.
+    /// (e.g. `"keyring"`, `"oauth_token"`) reported by `gh auth status`;
+    /// `"github-app"` when a GitHub App installation token was minted and
+    /// exported as `GH_TOKEN` (#4430 — see
+    /// [`crate::credential_preflight::resolve_with_github_app`]).
     /// `"none"` when nothing resolved; `"unknown"` when the probe itself
     /// failed to run. NEVER a token value.
     pub mechanism: String,
     /// A non-secret fingerprint: the last 4 characters of an env-sourced
-    /// token, or the authenticated `gh` login for a credential-store
-    /// resolution. `None` when no credential resolved.
+    /// token, the authenticated `gh` login for a credential-store
+    /// resolution, or `app <id> installation <id>` for the `"github-app"`
+    /// mechanism. `None` when no credential resolved.
     pub fingerprint: Option<String>,
     /// Human-readable, log/print-safe summary — never contains a token.
     /// Names both remediations (export `GH_TOKEN` before starting the

@@ -1261,18 +1261,111 @@ async fn main() -> Result<()> {
         Err(e) => log::warn!("sweep_registry: reconstruction failed: {e}"),
     }
 
-    // Startup forge-credential preflight (Issue #4005). Resolved once, here —
-    // immediately before the claim-reconciliation pass below, the daemon's
-    // first `gh` consumer — so a headless/SSH-only start with neither an
-    // exported GH_TOKEN/GITHUB_TOKEN nor an unlockable GUI login keychain is
-    // diagnosed loudly at boot instead of surfacing as silent per-tick 401s
-    // for the life of the process. Non-fatal and bounded (same posture as the
-    // reconciliation pass itself): a `gh` hiccup here never blocks startup.
+    // Startup forge-credential preflight (Issue #4005; GitHub App identity
+    // mechanism added by #4430). Resolved once, here — immediately before the
+    // claim-reconciliation pass below, the daemon's first `gh` consumer — so
+    // a headless/SSH-only start with neither an exported GH_TOKEN/GITHUB_TOKEN
+    // nor an unlockable GUI login keychain is diagnosed loudly at boot
+    // instead of surfacing as silent per-tick 401s for the life of the
+    // process. Non-fatal and bounded (same posture as the reconciliation pass
+    // itself): a `gh` hiccup here never blocks startup.
+    //
+    // #4430: when a GitHub App id + private key are configured (env or
+    // `forge.githubApp.*` config — see `defaults/scripts/lib/github-app-token.sh`),
+    // this mints a short-lived installation token and exports it as this
+    // process's own `GH_TOKEN`, so every `gh`/`git` child the daemon spawns
+    // from this point on inherits it. Absent that config, `owner_repo`
+    // resolves fine but the shell helper reports "not_configured" and
+    // `run_with_github_app` falls through to the byte-identical pre-#4430
+    // `run(...)` path below — no behavior change for any host that hasn't
+    // opted in.
     let credential_preflight_probe = credential_preflight::RealGhAuthProbe {
         gh_bin: "gh".to_string(),
         cwd: sweep_workspace.clone(),
     };
-    let credential_preflight = credential_preflight::run(&credential_preflight_probe);
+    let github_app_script = credential_preflight::resolve_github_app_script(&sweep_workspace);
+    let github_app_owner_repo = credential_preflight::nwo_from_git_remote(&sweep_workspace);
+    let github_app_preflight = match &github_app_script {
+        Some(script_path) => {
+            let minter = credential_preflight::RealGithubAppMinter {
+                script_path: script_path.clone(),
+                cwd: sweep_workspace.clone(),
+            };
+            credential_preflight::run_with_github_app(
+                &credential_preflight_probe,
+                &minter,
+                github_app_owner_repo.as_deref(),
+            )
+        }
+        // No `github-app-token.sh` on disk at all (stale install predating
+        // #4430, or a workspace root with no `.loom`/`defaults` tree) —
+        // exactly the pre-#4430 path, with zero extra subprocess overhead.
+        None => credential_preflight::GithubAppPreflight {
+            report: credential_preflight::run(&credential_preflight_probe),
+            minted_gh_token: None,
+        },
+    };
+    if let Some(token) = &github_app_preflight.minted_gh_token {
+        // NEVER logged: only the fingerprint in `github_app_preflight.report`
+        // is. Exported into this process's own env so every `gh`/`git`
+        // child spawned from here on (Command::new without env_clear)
+        // inherits it.
+        std::env::set_var("GH_TOKEN", token);
+    }
+    let credential_preflight = github_app_preflight.report;
+
+    // #4430: keep the minted installation token fresh across its ~1h
+    // lifetime for a long-running daemon. A no-op tick (unconfigured, or the
+    // shell helper's own cache still has >10min left) costs a handful of
+    // cheap subprocess execs and never touches `GH_TOKEN`; a genuine mint
+    // failure is logged and the loop keeps whatever `GH_TOKEN` the process
+    // already has (fail-open, matching the startup preflight's posture).
+    if let (Some(script_path), Some(owner_repo)) = (&github_app_script, &github_app_owner_repo) {
+        let script_path = script_path.clone();
+        let cwd = sweep_workspace.clone();
+        let owner_repo = owner_repo.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(credential_preflight::GITHUB_APP_REFRESH_INTERVAL).await;
+                let script_path = script_path.clone();
+                let cwd = cwd.clone();
+                let owner_repo = owner_repo.clone();
+                let outcome = tokio::task::spawn_blocking(move || {
+                    let minter = credential_preflight::RealGithubAppMinter { script_path, cwd };
+                    credential_preflight::GithubAppMinter::mint(&minter, &owner_repo)
+                })
+                .await;
+                match outcome {
+                    Ok(credential_preflight::GithubAppOutcome::Minted {
+                        token,
+                        installation_id,
+                        app_id,
+                        ..
+                    }) => {
+                        std::env::set_var("GH_TOKEN", token);
+                        log::debug!(
+                            "credential_preflight: github-app refresh tick minted a token \
+                             (app {app_id} installation {installation_id}) — #4430"
+                        );
+                    }
+                    Ok(credential_preflight::GithubAppOutcome::NotConfigured) => {
+                        // Cheap no-op tick -- nothing to refresh.
+                    }
+                    Ok(credential_preflight::GithubAppOutcome::Error(reason)) => {
+                        log::warn!(
+                            "credential_preflight: github-app refresh tick failed ({reason}); \
+                             GH_TOKEN left unchanged — #4430"
+                        );
+                    }
+                    Err(e) => {
+                        log::warn!(
+                            "credential_preflight: github-app refresh task join error: {e} — #4430"
+                        );
+                    }
+                }
+            }
+        });
+    }
 
     // GitHub rate-limit circuit breaker (#4429). Registered here — before the
     // startup reconciliation passes just below — because *every* gh-polling
