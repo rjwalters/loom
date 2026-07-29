@@ -180,6 +180,26 @@ const RESUMABLE_CHECKPOINT_PHASES: [&str; 4] = [
     "doctor-done",
 ];
 
+/// Issue #4256 (Judge residual-risk backstop): the maximum number of
+/// consecutive reaper-driven resume dispatches for a single issue before the
+/// reaper stops resuming and leaves the PR for the periodic Judge role /
+/// operator.
+///
+/// The #4123 open-PR guard used to backstop infinite re-dispatch once a PR
+/// existed, but the resume path (`dispatch_resume_after_crash`) deliberately
+/// bypasses it. A sweep that reliably dies in the **~2s..stall window** — too
+/// slow for the sub-`insta_crash_secs` quarantine tally (#3939), too fast to
+/// ever rewrite the checkpoint or reach Judge — would otherwise reset every
+/// backstop each tick and resume forever. This small constant caps the
+/// consecutive *checkpoint-less* resume attempts per issue: any resume run
+/// that actually advances the checkpoint (real progress) resets the tally (see
+/// [`SweepRegistry::reap_once`]'s `checkpoint_written_by_run` branch), so only
+/// a genuine crash→resume→crash loop accrues toward the cap. On exhaustion the
+/// reaper stops resuming, emits a failure-visible `SweepResumeDispatched`
+/// (`dispatched: false`) event, and adds NO labels — the PR is picked up by the
+/// periodic Judge role (repo-config backstop (c)) or an operator.
+const MAX_RESUME_ATTEMPTS: u32 = 3;
+
 /// Issue #3944: which tier of the dispatch-model precedence chain supplied the
 /// resolved model. Surfaced in the daemon dispatch log line so an operator can
 /// tell *why* a child is running a given model.
@@ -1340,6 +1360,16 @@ pub struct SweepRegistry {
     /// reaper on a checkpoint-less death inside the insta-crash window; reset to
     /// zero on any terminal outcome that made real progress or exited cleanly.
     insta_crash_counts: HashMap<u32, u32>,
+    /// Consecutive reaper-driven resume dispatches per issue (Issue #4256, Judge
+    /// residual-risk backstop). Incremented each time [`reap_once`](Self::reap_once)
+    /// resume-dispatches a crashed post-Builder sweep; reset to zero when a run
+    /// advances the checkpoint (real progress — the `checkpoint_written_by_run`
+    /// branch). Once an issue reaches [`MAX_RESUME_ATTEMPTS`] consecutive
+    /// checkpoint-less resume crashes the reaper stops resuming it, replacing the
+    /// #4123 open-PR backstop that the resume path deliberately bypasses so an
+    /// issue that reliably dies in the ~2s..stall window cannot resume forever.
+    /// Keyed by issue like [`insta_crash_counts`](Self::insta_crash_counts).
+    resume_attempt_counts: HashMap<u32, u32>,
     /// Currently-quarantined issues → the instant they were quarantined (Issue
     /// #3939). The work finder skips these until the entry ages past
     /// [`QuarantineConfig::ttl`], at which point [`reap_once`](Self::reap_once)
@@ -1458,6 +1488,7 @@ impl SweepRegistry {
             review_stall_gaveup: HashSet::new(),
             quarantine_config: QuarantineConfig::default(),
             insta_crash_counts: HashMap::new(),
+            resume_attempt_counts: HashMap::new(),
             quarantined: HashMap::new(),
             pending_quarantine_release: HashSet::new(),
             detect_collisions: false,
@@ -1487,6 +1518,7 @@ impl SweepRegistry {
             review_stall_gaveup: HashSet::new(),
             quarantine_config: QuarantineConfig::default(),
             insta_crash_counts: HashMap::new(),
+            resume_attempt_counts: HashMap::new(),
             quarantined: HashMap::new(),
             pending_quarantine_release: HashSet::new(),
             detect_collisions: false,
@@ -3860,6 +3892,16 @@ impl SweepRegistry {
                             // non-clean death still counts toward quarantine.
                             if checkpoint_written_by_run(&checkpoint, started_at) {
                                 self.record_terminal_outcome(issue, false);
+                                // #4256: a run that advanced the checkpoint made
+                                // real progress (reached Judge/Doctor and wrote a
+                                // fresh phase), so it is a HEALTHY resume — clear
+                                // the resume-attempt runway. Only *consecutive*
+                                // checkpoint-less resume crashes (the ~2s..stall
+                                // pathology) accrue toward `MAX_RESUME_ATTEMPTS`;
+                                // a productively-progressing resume chain is never
+                                // capped. Mirrors `record_terminal_outcome`'s
+                                // reset of `insta_crash_counts` on progress.
+                                self.resume_attempt_counts.remove(&issue);
                             } else {
                                 let insta_crash = duration_sec
                                     < self.quarantine_config.insta_crash_secs
@@ -3900,34 +3942,84 @@ impl SweepRegistry {
                                 && !self.issue_has_blocked_label(issue)
                             {
                                 if let Some(pr) = self.first_open_linked_pr(issue) {
-                                    let dispatched =
-                                        match self.dispatch_resume_after_crash(issue, pr) {
-                                            Ok(_) => {
-                                                log::info!(
-                                                    "issue #{issue}: reaper-driven resume \
-                                                     dispatched (crashed at checkpoint phase \
-                                                     {resume_phase_check:?}, open PR #{pr}) \
-                                                     — #4256"
-                                                );
-                                                true
-                                            }
-                                            Err(e) => {
-                                                log::warn!(
-                                                    "issue #{issue}: reaper-driven resume \
-                                                     dispatch failed (crashed at checkpoint \
-                                                     phase {resume_phase_check:?}, open PR \
-                                                     #{pr}): {e} — #4256"
-                                                );
-                                                false
-                                            }
-                                        };
-                                    events_to_emit.push(Event::SweepResumeDispatched {
-                                        issue,
-                                        pr,
-                                        checkpoint_phase: resume_phase_check.clone(),
-                                        dispatched,
-                                        repo: None, // stamped by emit_event (#3929)
-                                    });
+                                    // Bounded resume attempts (#4256, Judge
+                                    // residual-risk backstop): the resume path
+                                    // bypasses the #4123 open-PR guard, so a sweep
+                                    // stuck in the ~2s..stall crash window (never
+                                    // rewrites the checkpoint, never trips the
+                                    // sub-`insta_crash_secs` quarantine tally)
+                                    // would otherwise resume forever. Once an
+                                    // issue has accumulated `MAX_RESUME_ATTEMPTS`
+                                    // consecutive checkpoint-less resume crashes,
+                                    // stop resuming: emit the failure-visible
+                                    // event (`dispatched: false`) once and leave
+                                    // the PR for the periodic Judge role /
+                                    // operator. No labels are added beyond the
+                                    // ones already present.
+                                    let attempts = self
+                                        .resume_attempt_counts
+                                        .get(&issue)
+                                        .copied()
+                                        .unwrap_or(0);
+                                    if attempts >= MAX_RESUME_ATTEMPTS {
+                                        log::warn!(
+                                            "issue #{issue}: reaper-driven resume attempts \
+                                             exhausted ({attempts}/{MAX_RESUME_ATTEMPTS} \
+                                             consecutive checkpoint-less resume crashes, open \
+                                             PR #{pr}, checkpoint phase {resume_phase_check:?}) \
+                                             — NOT resuming again; leaving the PR for the \
+                                             periodic Judge role / operator (#4256)"
+                                        );
+                                        events_to_emit.push(Event::SweepResumeDispatched {
+                                            issue,
+                                            pr,
+                                            checkpoint_phase: resume_phase_check.clone(),
+                                            dispatched: false,
+                                            repo: None, // stamped by emit_event (#3929)
+                                        });
+                                    } else {
+                                        // Count the attempt regardless of whether
+                                        // the dispatch call itself succeeds, so a
+                                        // persistently-failing resume dispatch is
+                                        // bounded too.
+                                        let attempt_no = *self
+                                            .resume_attempt_counts
+                                            .entry(issue)
+                                            .and_modify(|c| *c += 1)
+                                            .or_insert(1);
+                                        let dispatched =
+                                            match self.dispatch_resume_after_crash(issue, pr) {
+                                                Ok(_) => {
+                                                    log::info!(
+                                                        "issue #{issue}: reaper-driven resume \
+                                                         dispatched (attempt \
+                                                         {attempt_no}/{MAX_RESUME_ATTEMPTS}, \
+                                                         crashed at checkpoint phase \
+                                                         {resume_phase_check:?}, open PR #{pr}) \
+                                                         — #4256"
+                                                    );
+                                                    true
+                                                }
+                                                Err(e) => {
+                                                    log::warn!(
+                                                        "issue #{issue}: reaper-driven resume \
+                                                         dispatch failed (attempt \
+                                                         {attempt_no}/{MAX_RESUME_ATTEMPTS}, \
+                                                         crashed at checkpoint phase \
+                                                         {resume_phase_check:?}, open PR #{pr}): \
+                                                         {e} — #4256"
+                                                    );
+                                                    false
+                                                }
+                                            };
+                                        events_to_emit.push(Event::SweepResumeDispatched {
+                                            issue,
+                                            pr,
+                                            checkpoint_phase: resume_phase_check.clone(),
+                                            dispatched,
+                                            repo: None, // stamped by emit_event (#3929)
+                                        });
+                                    }
                                 }
                             }
                         } else {
@@ -11685,6 +11777,153 @@ exit 0\n";
         assert!(
             err.downcast_ref::<OpenPrDispatchError>().is_some(),
             "must be the typed OpenPrDispatchError, not some other failure; got: {err}"
+        );
+        std::env::remove_var("LOOM_REPO");
+    }
+
+    /// Bounded resume attempts (#4256, Judge residual-risk backstop): once an
+    /// issue has accumulated `MAX_RESUME_ATTEMPTS` consecutive checkpoint-less
+    /// resume crashes, the reaper stops resuming it — it emits a
+    /// failure-visible `SweepResumeDispatched { dispatched: false }` event,
+    /// creates NO fresh Running entry, and adds NO labels beyond the ones
+    /// already present. This is the replacement for the #4123 open-PR backstop
+    /// that the resume path deliberately bypasses, closing the ~2s..stall
+    /// infinite-resume window. The checkpoint is deliberately made STALE
+    /// (mtime before this run's `started_at`) so the reset-on-progress branch
+    /// does not clear the seeded tally — the exact pathology the cap bounds.
+    #[tokio::test]
+    #[serial]
+    async fn reaper_stops_resuming_after_attempt_cap() {
+        use crate::event_bus::EventBus;
+
+        let tmp = tempdir().unwrap();
+        let ws = tmp.path();
+        std::env::set_var("LOOM_REPO", "rjwalters/loom");
+        let (mut reg, gh_log) = open_pr_guard_registry(ws, "4310", 0, false);
+        let bus = Arc::new(EventBus::new());
+        reg.set_event_bus(bus.clone());
+        let mut sub = bus.subscribe::<[&str; 0], &str>([]);
+
+        write_checkpoint(&reg, 4260, "builder-done");
+        insert_dead_running_entry(&mut reg, 4260, "sweep-issue-4260-crashed");
+        // Stale inherited checkpoint: `started_at` AFTER the checkpoint mtime,
+        // so `checkpoint_written_by_run` is false and the reset-on-progress
+        // branch never clears the seeded tally.
+        reg.entries
+            .get_mut("sweep-issue-4260-crashed")
+            .unwrap()
+            .started_at = Utc::now() + chrono::Duration::seconds(30);
+        // Pre-seed the issue exactly AT the cap — the next resume is refused.
+        reg.resume_attempt_counts.insert(4260, MAX_RESUME_ATTEMPTS);
+
+        let changed = reg.reap_once();
+        assert!(changed >= 1);
+
+        let mut saw_resume_false = false;
+        for _ in 0..8 {
+            let Ok(ev) = tokio::time::timeout(Duration::from_secs(5), sub.recv()).await else {
+                break;
+            };
+            if let Event::SweepResumeDispatched {
+                issue,
+                pr,
+                dispatched,
+                ..
+            } = ev.unwrap()
+            {
+                assert_eq!(issue, 4260);
+                assert_eq!(pr, 4310);
+                assert!(
+                    !dispatched,
+                    "at the attempt cap the reaper must NOT resume (dispatched:false)"
+                );
+                saw_resume_false = true;
+            }
+        }
+        assert!(
+            saw_resume_false,
+            "exhaustion must still emit a failure-visible resume_dispatched event (not silent)"
+        );
+
+        // No resume dispatch ⇒ no fresh Running entry for the issue.
+        assert!(
+            running_issue_sweep_id(&reg, 4260).is_none(),
+            "no resume dispatch at the cap means no fresh Running entry"
+        );
+        // The cap is not exceeded.
+        assert_eq!(
+            reg.resume_attempt_counts.get(&4260).copied(),
+            Some(MAX_RESUME_ATTEMPTS),
+            "an exhausted issue's counter stays pinned at the cap, never grows"
+        );
+        // No extra label was applied on exhaustion (the PR is left as-is for
+        // the periodic Judge role / operator).
+        // No NEW label is applied on exhaustion. `restore_label_to_ready`
+        // still flips loom:building→loom:issue (existing behavior, not a new
+        // label), and `issue_has_blocked_label` mentions "loom:blocked" only
+        // inside its read-only `--jq` query — so assert specifically that no
+        // `--add-label loom:blocked` (quarantine) edit was issued.
+        let calls = std::fs::read_to_string(&gh_log).unwrap_or_default();
+        assert!(
+            !calls.contains("add-label loom:blocked"),
+            "exhaustion must NOT add labels beyond the existing ones; got: {calls:?}"
+        );
+        std::env::remove_var("LOOM_REPO");
+    }
+
+    /// Boundary companion to `reaper_stops_resuming_after_attempt_cap`: one
+    /// below the cap the resume still fires and ticks the per-issue counter up
+    /// to exactly `MAX_RESUME_ATTEMPTS`, so the cap value itself is locked (the
+    /// Nth attempt succeeds; only the (N+1)th is refused). Uses the same stale
+    /// checkpoint so the seeded tally survives into the resume decision.
+    #[tokio::test]
+    #[serial]
+    async fn reaper_still_resumes_one_below_attempt_cap() {
+        use crate::event_bus::EventBus;
+
+        let tmp = tempdir().unwrap();
+        let ws = tmp.path();
+        std::env::set_var("LOOM_REPO", "rjwalters/loom");
+        let (mut reg, _gh_log) = open_pr_guard_registry(ws, "4311", 0, false);
+        let bus = Arc::new(EventBus::new());
+        reg.set_event_bus(bus.clone());
+        let mut sub = bus.subscribe::<[&str; 0], &str>([]);
+
+        write_checkpoint(&reg, 4261, "judge-rejected");
+        insert_dead_running_entry(&mut reg, 4261, "sweep-issue-4261-crashed");
+        reg.entries
+            .get_mut("sweep-issue-4261-crashed")
+            .unwrap()
+            .started_at = Utc::now() + chrono::Duration::seconds(30);
+        reg.resume_attempt_counts
+            .insert(4261, MAX_RESUME_ATTEMPTS - 1);
+
+        let changed = reg.reap_once();
+        assert!(changed >= 1);
+
+        let mut saw_resume_true = false;
+        for _ in 0..8 {
+            let Ok(ev) = tokio::time::timeout(Duration::from_secs(5), sub.recv()).await else {
+                break;
+            };
+            if let Event::SweepResumeDispatched {
+                issue, dispatched, ..
+            } = ev.unwrap()
+            {
+                assert_eq!(issue, 4261);
+                assert!(dispatched, "one below the cap the resume must still fire");
+                saw_resume_true = true;
+            }
+        }
+        assert!(saw_resume_true, "expected a successful resume dispatch below the cap");
+        assert!(
+            running_issue_sweep_id(&reg, 4261).is_some(),
+            "a below-cap resume must create a fresh Running entry"
+        );
+        assert_eq!(
+            reg.resume_attempt_counts.get(&4261).copied(),
+            Some(MAX_RESUME_ATTEMPTS),
+            "the resume attempt must tick the per-issue counter up to the cap"
         );
         std::env::remove_var("LOOM_REPO");
     }
