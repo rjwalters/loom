@@ -2277,8 +2277,12 @@ fn handle_cli_command(command: Commands) -> Result<()> {
                         println!("\nSelf-installation skips file copying to prevent data loss.");
                         println!("   The Loom repo's .loom/ directory IS the source of truth.");
                         println!("\nTo use Loom orchestration:");
-                        println!("  - Open Claude Code terminals with /builder, /judge, etc.");
-                        println!("  - Or start the daemon: ./.loom/scripts/daemon.sh start");
+                        println!(
+                            "  - Open Claude Code terminals with /loom:builder, /loom:judge, etc."
+                        );
+                        println!(
+                            "  - Or start the daemon: ./.loom/scripts/cli/loom-daemon-start.sh"
+                        );
 
                         return Ok(());
                     }
@@ -2353,10 +2357,12 @@ fn handle_cli_command(command: Commands) -> Result<()> {
                     println!("  2. Choose your workflow:");
                     println!("     Manual Mode (recommended to start):");
                     println!("       cd {workspace_str} && claude");
-                    println!("       Then use /builder, /judge, or other role commands");
+                    println!("       Then use /loom:builder, /loom:judge, or other role commands");
                     println!("     Daemon Mode (autonomous orchestration):");
-                    println!("       cd {workspace_str} && ./.loom/scripts/daemon.sh start");
-                    println!("       Then in Claude Code: /loom");
+                    println!(
+                        "       cd {workspace_str} && ./.loom/scripts/cli/loom-daemon-start.sh"
+                    );
+                    println!("       Then in Claude Code: /loom:loom");
                     Ok(())
                 }
                 Err(e) => {
