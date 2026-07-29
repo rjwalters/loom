@@ -68,6 +68,8 @@
 #   ./.loom/scripts/cli/loom-daemon-start.sh --from-config   Enable per .loom/config.json only
 #   ./.loom/scripts/cli/loom-daemon-start.sh --no-work-finder    Force work finder OFF (explicit)
 #   ./.loom/scripts/cli/loom-daemon-start.sh --no-health-gate    Force health gate OFF (explicit)
+#   ./.loom/scripts/cli/loom-daemon-start.sh --from-config --work-finder   Config-driven, but FORCE the work finder on (#4353)
+#   ./.loom/scripts/cli/loom-daemon-start.sh --from-config --no-health-gate   Config-driven, but FORCE the health gate off (#4353)
 #   ./.loom/scripts/cli/loom-daemon-start.sh --foreground    Run in the foreground (no PID file)
 #   ./.loom/scripts/cli/loom-daemon-start.sh --no-launchd    macOS only: use legacy nohup instead of a LaunchAgent
 #   ./.loom/scripts/cli/loom-daemon-start.sh --no-systemd    Linux only: use legacy nohup instead of a systemd --user service
@@ -79,6 +81,7 @@
 #   LOOM_DAEMON_BIN     Path to the loom-daemon binary (else auto-detected)
 #   LOOM_SOCKET_PATH    Override the daemon socket (default ~/.loom/loom-daemon.sock)
 #   LOOM_WORK_FINDER / LOOM_MAIN_HEALTH_GATE  Respected when already exported
+#                        (always wins, even under --from-config -- #4353)
 #   LOOM_DAEMON_LAUNCHD  macOS only: 0/false/no forces the legacy nohup path (same as --no-launchd)
 #   LOOM_DAEMON_SYSTEMD  Linux only: 0/false/no forces the legacy nohup path (same as --no-systemd)
 #   LOOM_SYSTEMD_UNIT    Linux only: override the systemd --user unit name (default loom-daemon.service)
@@ -699,8 +702,14 @@ ORIGINAL_ARGS=("$@")
 # --health-gate, or hand control to config with --from-config.
 FROM_CONFIG=false
 FOREGROUND=false
-WANT_WORK_FINDER=false
-WANT_HEALTH_GATE=false
+# Tri-state (#4353): "" = not passed on the CLI (unset), "on" = an explicit
+# --work-finder/--health-gate, "off" = an explicit --no-work-finder/
+# --no-health-gate. This lets --from-config tell "the operator asked to force
+# this loop" apart from "the operator said nothing, config drives it" --
+# a plain boolean collapsed both to the same false and silently dropped the
+# force.
+WANT_WORK_FINDER=""
+WANT_HEALTH_GATE=""
 NO_LAUNCHD=false
 NO_SYSTEMD=false
 PRINT_PLIST=false
@@ -710,10 +719,10 @@ while [[ $# -gt 0 ]]; do
         --help|-h) show_help; exit 0 ;;
         --from-config) FROM_CONFIG=true; shift ;;
         --foreground|--fg) FOREGROUND=true; shift ;;
-        --work-finder) WANT_WORK_FINDER=true; shift ;;
-        --health-gate) WANT_HEALTH_GATE=true; shift ;;
-        --no-work-finder) WANT_WORK_FINDER=false; shift ;;
-        --no-health-gate) WANT_HEALTH_GATE=false; shift ;;
+        --work-finder) WANT_WORK_FINDER="on"; shift ;;
+        --health-gate) WANT_HEALTH_GATE="on"; shift ;;
+        --no-work-finder) WANT_WORK_FINDER="off"; shift ;;
+        --no-health-gate) WANT_HEALTH_GATE="off"; shift ;;
         --no-launchd) NO_LAUNCHD=true; shift ;;
         --no-systemd) NO_SYSTEMD=true; shift ;;
         --print-plist) PRINT_PLIST=true; shift ;;
@@ -817,6 +826,15 @@ fi
 # (LOOM_WORK_FINDER unset => off, LOOM_MAIN_HEALTH_GATE unset => off). Opt in with
 # --work-finder / --health-gate (force the var to 1), or pass --from-config to
 # leave both unset so .loom/config.json -> autonomous drives.
+#
+# --from-config COMPOSES with --work-finder/--health-gate/--no-work-finder/
+# --no-health-gate rather than ignoring them (#4353): --from-config alone still
+# leaves both vars unset for config to drive (byte-for-byte the pre-#4353
+# behavior — test case 6 asserts this stays green); pairing it with an
+# explicit --work-finder / --no-work-finder additionally FORCES that one var
+# (same env-var-wins-if-already-exported rule), while the loop with no
+# explicit flag is still left to config. So `--from-config --work-finder`
+# forces LOOM_WORK_FINDER=1 and leaves LOOM_MAIN_HEALTH_GATE unset.
 export LOOM_WORKSPACE="${LOOM_WORKSPACE:-$REPO_ROOT}"
 
 # ---------- guard-hook autonomy defaults (#3898) ----------
@@ -838,17 +856,44 @@ export LOOM_GUARD_DECISION_LOG="${LOOM_GUARD_DECISION_LOG:-1}"
 export LOOM_FORCE_SCOPE="${LOOM_FORCE_SCOPE:-protected}"
 
 if [[ "$FROM_CONFIG" == "true" ]]; then
-    echo -e "${BOLD}Autonomous mode: driven by .loom/config.json -> autonomous (env not forced)${NC}"
+    # Compose (#4353): --from-config alone leaves BOTH vars unset for config to
+    # drive. An explicit --work-finder/--no-work-finder (or the health-gate
+    # equivalent) additionally FORCES that one var -- using the
+    # ${VAR:-default} form so an already-exported env var still wins over the
+    # CLI flag, exactly like the non-config branch below. The loop with no
+    # explicit flag is left untouched (stays unset, config drives it).
+    FORCED_DESC=()
+    if [[ "$WANT_WORK_FINDER" == "on" ]]; then
+        export LOOM_WORK_FINDER="${LOOM_WORK_FINDER:-1}"
+        FORCED_DESC+=("work_finder=${LOOM_WORK_FINDER}")
+    elif [[ "$WANT_WORK_FINDER" == "off" ]]; then
+        export LOOM_WORK_FINDER="${LOOM_WORK_FINDER:-0}"
+        FORCED_DESC+=("work_finder=${LOOM_WORK_FINDER}")
+    fi
+    if [[ "$WANT_HEALTH_GATE" == "on" ]]; then
+        export LOOM_MAIN_HEALTH_GATE="${LOOM_MAIN_HEALTH_GATE:-1}"
+        FORCED_DESC+=("main_health_gate=${LOOM_MAIN_HEALTH_GATE}")
+    elif [[ "$WANT_HEALTH_GATE" == "off" ]]; then
+        export LOOM_MAIN_HEALTH_GATE="${LOOM_MAIN_HEALTH_GATE:-0}"
+        FORCED_DESC+=("main_health_gate=${LOOM_MAIN_HEALTH_GATE}")
+    fi
+    if [[ "${#FORCED_DESC[@]}" -eq 0 ]]; then
+        echo -e "${BOLD}Autonomous mode: driven by .loom/config.json -> autonomous (env not forced)${NC}"
+    else
+        FORCED_JOINED="$(IFS=', '; echo "${FORCED_DESC[*]}")"
+        echo -e "${BOLD}Autonomous mode: config-driven; forced: ${FORCED_JOINED}${NC}"
+    fi
+    unset FORCED_DESC FORCED_JOINED
 else
     # An already-exported env var always wins. Otherwise --work-finder /
     # --health-gate force the loop ON (=1); the default (flags off) forces it
     # OFF (=0), so a plain start is a reliability daemon that never auto-dispatches.
-    if [[ "$WANT_WORK_FINDER" == "true" ]]; then
+    if [[ "$WANT_WORK_FINDER" == "on" ]]; then
         export LOOM_WORK_FINDER="${LOOM_WORK_FINDER:-1}"
     else
         export LOOM_WORK_FINDER="${LOOM_WORK_FINDER:-0}"
     fi
-    if [[ "$WANT_HEALTH_GATE" == "true" ]]; then
+    if [[ "$WANT_HEALTH_GATE" == "on" ]]; then
         export LOOM_MAIN_HEALTH_GATE="${LOOM_MAIN_HEALTH_GATE:-1}"
     else
         export LOOM_MAIN_HEALTH_GATE="${LOOM_MAIN_HEALTH_GATE:-0}"
