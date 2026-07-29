@@ -4,16 +4,29 @@
   "autonomous": {
     "roleRunner": {
       "enabled": true,
-      "roles": ["curator", "champion", "judge"]
+      "roles": [
+        "curator",
+        "champion",
+        "judge"
+      ]
     },
     "collisionDetection": {
       "enabled": true
+    },
+    "workFinder": {
+      "maxConcurrent": 8
     }
   },
   "buildGate": {
     "enabled": true,
     "command": "bash .loom/scripts/build-gate.sh",
-    "realChangeGlobs": ["*.rs", "*.toml", "Cargo.lock", "*.py", "*.sh"],
+    "realChangeGlobs": [
+      "*.rs",
+      "*.toml",
+      "Cargo.lock",
+      "*.py",
+      "*.sh"
+    ],
     "timeoutSeconds": 1200
   },
   "terminals": [
