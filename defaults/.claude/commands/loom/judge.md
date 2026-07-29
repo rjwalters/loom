@@ -63,6 +63,28 @@ own discipline:
   concern is minor) — do **not** loop re-reading the same diff. A decisive
   "changes requested, here's why" is always better than an open-ended hang.
 
+## CRITICAL: PR Branch Isolation (Always Use a Worktree)
+
+**Never run `gh pr checkout <N>` in the orchestrator's main worktree.** Doing so switches the orchestrator's `HEAD` to the PR branch and can leave behind untracked files from the PR when you switch back — see issue #3358 for a concrete incident. This applies to every checkout call site in this document: fallback-queue evaluation, DIRTY-PR automated-rebase attempts, trivial-fix commits, and any ad-hoc `gh pr checkout` you run while reviewing.
+
+Pick the right path before any `gh pr checkout` mutation:
+
+- **An existing builder worktree** (`.loom/worktrees/issue-N`, left behind by an active `/loom:sweep` that already ran Builder) — reuse it directly, no checkout needed (see "Worktree-Aware Code Access" below).
+- **Loom-issue PRs with no existing builder worktree** — branch matches the strict pattern `^feature/issue-([0-9]+)$`:
+  ```bash
+  ./.loom/scripts/worktree.sh <ISSUE_NUMBER>
+  cd .loom/worktrees/issue-<ISSUE_NUMBER>
+  gh pr checkout <PR_NUMBER>   # safe: already inside the issue worktree
+  ```
+- **External-fork, ad-hoc, or unlabeled PRs** — any other branch shape (e.g., `fix/foo-bar`, `release-1`, `jperla:fix/claude-code-2.1-compat`), or any time you cannot resolve an issue number:
+  ```bash
+  ./.loom/scripts/pr-worktree.sh <PR_NUMBER>
+  cd .loom/worktrees/pr-<PR_NUMBER>
+  # pr-worktree.sh already ran `gh pr checkout` inside the worktree
+  ```
+
+Both worktree paths get a `.loom-managed` sentinel and are auto-cleaned by `merge-pr.sh` on merge. **Never fall back to a bare `gh pr checkout <N>` in the current directory** — every "no worktree exists" branch in this document's checkout snippets routes through `pr-worktree.sh`, mirroring the pattern in `doctor.md`.
+
 ## Issues Are Suggestions — Close or Rescope With Rationale (Role Autonomy)
 
 Your review authority extends past the PR to its **underlying issue**: an issue is a **suggestion, not a mandate**, and the review pipeline is where a bad suggestion is most visible. You have standing authority to act on that judgment — with a stated rationale — rather than approving work toward an outcome that should not ship.
@@ -159,12 +181,14 @@ When the user explicitly instructs you to evaluate a specific PR by number:
 gh pr edit 599 --add-label "loom:reviewing"
 gh pr comment 599 --body "Starting evaluation of this PR per user request"
 
-# Check out and evaluate (worktree-aware — see Worktree-Aware Code Access)
+# Check out and evaluate (worktree-aware — see "PR Branch Isolation" and
+# "Worktree-Aware Code Access")
 ISSUE_NUM=$(gh pr view 599 --json headRefName --jq '.headRefName' | sed 's/feature\/issue-//')
 if [ -d ".loom/worktrees/issue-${ISSUE_NUM}" ]; then
     cd ".loom/worktrees/issue-${ISSUE_NUM}"
 else
-    gh pr checkout 599
+    ./.loom/scripts/pr-worktree.sh 599
+    cd ".loom/worktrees/pr-599"
 fi
 # ... run tests, evaluate code ...
 
@@ -390,12 +414,13 @@ else
   if [ -n "$UNLABELED_PR" ]; then
     echo "Evaluating unlabeled PR #$UNLABELED_PR (fallback mode)"
 
-    # Check out and evaluate the PR (worktree-aware)
+    # Check out and evaluate the PR (worktree-aware — see "PR Branch Isolation")
     ISSUE_NUM=$(gh pr view $UNLABELED_PR --json headRefName --jq '.headRefName' | sed 's/feature\/issue-//')
     if [ -d ".loom/worktrees/issue-${ISSUE_NUM}" ]; then
         cd ".loom/worktrees/issue-${ISSUE_NUM}"
     else
-        gh pr checkout $UNLABELED_PR
+        ./.loom/scripts/pr-worktree.sh $UNLABELED_PR
+        cd ".loom/worktrees/pr-${UNLABELED_PR}"
     fi
     # ... run checks, evaluate code ...
 
@@ -426,7 +451,9 @@ fi
 
 ### Before Running `gh pr checkout`
 
-Always check for an existing worktree first:
+Always check for an existing worktree first. If none exists, route through
+`pr-worktree.sh` — never a bare `gh pr checkout` in the current directory (see
+"CRITICAL: PR Branch Isolation" above):
 
 ```bash
 # Extract issue number from PR (via branch name or body)
@@ -437,7 +464,10 @@ if [ -d ".loom/worktrees/issue-${ISSUE_NUM}" ]; then
     echo "Builder worktree exists - using it directly"
     cd ".loom/worktrees/issue-${ISSUE_NUM}"
 else
-    gh pr checkout <number>
+    # No builder worktree — self-cleaning worktree via pr-worktree.sh, not a
+    # bare checkout in the current directory
+    ./.loom/scripts/pr-worktree.sh <number>
+    cd ".loom/worktrees/pr-<number>"
 fi
 ```
 
@@ -466,7 +496,7 @@ This catches merge conflicts early in the evaluation cycle, preventing wasted ef
 
 > ### ⛔ NEVER mutate the main checkout's real git index, run a throwaway test-merge, or touch the stash stack during a merge simulation or inspection
 >
-> **You run in the shared main checkout** — you either reuse the builder's `.loom/worktrees/issue-N` worktree or `gh pr checkout` in place. You do **not** own a disposable git index, a disposable branch, or a disposable stash stack. Any command that writes the repository's real staging index, creates a throwaway test-merge branch, or pops/drops/clears an entry off the main checkout's stash corrupts or destroys shared state for every role that touches it next.
+> **Your own session starts in the shared main checkout** — but per "PR Branch Isolation" above, you always move into an isolated worktree (the builder's `.loom/worktrees/issue-N`, or one created via `pr-worktree.sh`) before touching PR code; you never `gh pr checkout` in place in the main checkout. You do **not** own a disposable git index, a disposable branch, or a disposable stash stack **in the main checkout itself**. Any command that writes the repository's real staging index, creates a throwaway test-merge branch, or pops/drops/clears an entry off the main checkout's stash corrupts or destroys shared state for every role that touches it next.
 >
 > **NEVER run any of these against the main checkout** to "simulate a merge", preview a tree, or inspect conflicts:
 >
@@ -532,12 +562,14 @@ MERGE_STATE=$(gh pr view $PR_NUMBER --json mergeStateStatus --jq '.mergeStateSta
 if [ "$MERGE_STATE" = "DIRTY" ]; then
     echo "PR has merge conflicts - attempting automated rebase"
 
-    # Checkout PR branch (worktree-aware — see Worktree-Aware Code Access)
+    # Checkout PR branch (worktree-aware — see "PR Branch Isolation" and
+    # "Worktree-Aware Code Access")
     ISSUE_NUM=$(gh pr view $PR_NUMBER --json headRefName --jq '.headRefName' | sed 's/feature\/issue-//')
     if [ -d ".loom/worktrees/issue-${ISSUE_NUM}" ]; then
         cd ".loom/worktrees/issue-${ISSUE_NUM}"
     else
-        gh pr checkout $PR_NUMBER
+        ./.loom/scripts/pr-worktree.sh $PR_NUMBER
+        cd ".loom/worktrees/pr-${PR_NUMBER}"
     fi
 
     # Verify we're on the correct branch (not detached HEAD)
@@ -1104,12 +1136,14 @@ This reduces unnecessary round-trips where a one-line fix creates a full change 
 **Step 1: Check out the PR branch (worktree-aware)**
 
 ```bash
-# Use existing worktree if available (see Worktree-Aware Code Access)
+# Use existing worktree if available (see "PR Branch Isolation" and
+# "Worktree-Aware Code Access")
 ISSUE_NUM=$(gh pr view <number> --json headRefName --jq '.headRefName' | sed 's/feature\/issue-//')
 if [ -d ".loom/worktrees/issue-${ISSUE_NUM}" ]; then
     cd ".loom/worktrees/issue-${ISSUE_NUM}"
 else
-    gh pr checkout <number>
+    ./.loom/scripts/pr-worktree.sh <number>
+    cd ".loom/worktrees/pr-<number>"
 fi
 ```
 
@@ -1386,8 +1420,10 @@ EOF
 # Find PRs ready for evaluation (green badges)
 gh pr list --label="loom:review-requested" --state=open
 
-# Check out the PR
-gh pr checkout 42
+# Check out the PR (worktree-aware — see "PR Branch Isolation" above; this is
+# a simplified illustration, not a bare checkout in the current directory)
+./.loom/scripts/pr-worktree.sh 42
+cd .loom/worktrees/pr-42
 
 # Run checks
 pnpm check:all  # or equivalent for the project
