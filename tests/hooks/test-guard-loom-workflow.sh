@@ -13,6 +13,15 @@
 
 set -euo pipefail
 
+# Hermetic baseline: ambient guard-behavior overrides must not leak into tests
+# (#4325). Tests that exercise env-driven behavior deliberately inject their
+# vars explicitly per invocation, or via run_guard_in_worktree, so they are
+# unaffected by this unset.
+unset LOOM_FORCE_SCOPE LOOM_DEFAULT_BRANCH LOOM_GUARD_SQL LOOM_GUARD_CLOUD \
+      LOOM_GUARD_REVERSIBLE_GH LOOM_RM_SCOPE LOOM_GUARD_READONLY_FASTPATH \
+      LOOM_GUARD_WORKTREE_ISOLATION LOOM_WORKTREE_PATH LOOM_WORKTREE_ROOT \
+      LOOM_GUARD_DECISION_LOG LOOM_GUARD_DECISION_LOG_FILE
+
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 GUARD="$REPO_ROOT/defaults/hooks/guard-loom-workflow.sh"
