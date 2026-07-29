@@ -13,6 +13,7 @@ from loom_tools.common.claude_config import (
     _SHARED_CONFIG_FILES,
     _copy_settings_without_plugins,
     _ensure_onboarding_complete,
+    _ensure_project_trusted,
     _keychain_service_name,
     _link_project_claude_dirs,
     _resolve_state_file,
@@ -562,6 +563,154 @@ class TestEnsureOnboardingComplete:
         # Full content must be preserved (not just the 4 required fields)
         assert data["userPref"] == "preserved"
         assert "projects" in data
+
+
+class TestEnsureProjectTrusted:
+    """Tests for _ensure_project_trusted (issue #4334)."""
+
+    def test_seeds_trust_into_empty_state_file(self, tmp_path: pathlib.Path) -> None:
+        import json
+
+        state = tmp_path / ".claude.json"
+        project_dir = tmp_path / "fresh-repo"
+
+        _ensure_project_trusted(state, project_dir)
+
+        assert state.exists()
+        data = json.loads(state.read_text())
+        assert data["projects"][str(project_dir)]["hasTrustDialogAccepted"] is True
+
+    def test_preserves_other_projects_entries(self, tmp_path: pathlib.Path) -> None:
+        import json
+
+        state = tmp_path / ".claude.json"
+        other_project = str(tmp_path / "other-repo")
+        state.write_text(json.dumps({
+            "projects": {
+                other_project: {"hasTrustDialogAccepted": True, "lastCost": 1.23},
+            },
+            "someOtherSetting": 42,
+        }))
+        project_dir = tmp_path / "fresh-repo"
+
+        _ensure_project_trusted(state, project_dir)
+
+        data = json.loads(state.read_text())
+        # New entry seeded.
+        assert data["projects"][str(project_dir)]["hasTrustDialogAccepted"] is True
+        # Existing entry and its other fields untouched.
+        assert data["projects"][other_project] == {
+            "hasTrustDialogAccepted": True,
+            "lastCost": 1.23,
+        }
+        # Unrelated top-level field untouched.
+        assert data["someOtherSetting"] == 42
+
+    def test_merges_flag_into_existing_entry_preserving_other_fields(
+        self, tmp_path: pathlib.Path
+    ) -> None:
+        import json
+
+        state = tmp_path / ".claude.json"
+        project_dir = tmp_path / "existing-repo"
+        state.write_text(json.dumps({
+            "projects": {
+                str(project_dir): {
+                    "hasTrustDialogAccepted": False,
+                    "history": ["a", "b"],
+                    "allowedTools": ["Bash"],
+                },
+            },
+        }))
+
+        _ensure_project_trusted(state, project_dir)
+
+        data = json.loads(state.read_text())
+        entry = data["projects"][str(project_dir)]
+        assert entry["hasTrustDialogAccepted"] is True
+        assert entry["history"] == ["a", "b"]
+        assert entry["allowedTools"] == ["Bash"]
+
+    def test_writes_through_valid_symlink(self, tmp_path: pathlib.Path) -> None:
+        import json
+
+        target = tmp_path / "home-claude.json"
+        target.write_text(json.dumps({"projects": {}, "userPref": "preserved"}))
+        state = tmp_path / ".claude.json"
+        state.symlink_to(target)
+        project_dir = tmp_path / "fresh-repo"
+
+        _ensure_project_trusted(state, project_dir)
+
+        # Symlink must be preserved — not replaced with a standalone file.
+        assert state.is_symlink()
+        data = json.loads(state.read_text())
+        assert data["projects"][str(project_dir)]["hasTrustDialogAccepted"] is True
+        assert data["userPref"] == "preserved"
+
+    def test_dangling_symlink_falls_back_to_standalone_file(
+        self, tmp_path: pathlib.Path
+    ) -> None:
+        import json
+
+        state = tmp_path / ".claude.json"
+        state.symlink_to(tmp_path / "nonexistent-target")
+        assert state.is_symlink()
+        assert not state.exists()  # dangling
+        project_dir = tmp_path / "fresh-repo"
+
+        _ensure_project_trusted(state, project_dir)
+
+        assert state.exists()
+        assert not state.is_symlink()  # replaced with real file
+        data = json.loads(state.read_text())
+        assert data["projects"][str(project_dir)]["hasTrustDialogAccepted"] is True
+
+    def test_disabled_via_loom_auto_trust_env(
+        self, tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("LOOM_AUTO_TRUST", "0")
+        state = tmp_path / ".claude.json"
+        project_dir = tmp_path / "fresh-repo"
+
+        _ensure_project_trusted(state, project_dir)
+
+        assert not state.exists()
+
+    def test_idempotent_no_rewrite_when_already_trusted(
+        self, tmp_path: pathlib.Path
+    ) -> None:
+        import json
+
+        state = tmp_path / ".claude.json"
+        project_dir = tmp_path / "fresh-repo"
+        state.write_text(json.dumps({
+            "projects": {str(project_dir): {"hasTrustDialogAccepted": True}},
+        }))
+        before_mtime = state.stat().st_mtime_ns
+
+        _ensure_project_trusted(state, project_dir)
+
+        after_mtime = state.stat().st_mtime_ns
+        assert before_mtime == after_mtime  # no rewrite occurred
+
+    def test_only_seeds_exact_target_path_not_parent_or_siblings(
+        self, tmp_path: pathlib.Path
+    ) -> None:
+        """Only the exact spawn target is trusted — never parents or siblings."""
+        import json
+
+        state = tmp_path / ".claude.json"
+        project_dir = tmp_path / "repos" / "target-repo"
+        sibling_dir = tmp_path / "repos" / "sibling-repo"
+        parent_dir = tmp_path / "repos"
+
+        _ensure_project_trusted(state, project_dir)
+
+        data = json.loads(state.read_text())
+        assert str(project_dir) in data["projects"]
+        assert str(sibling_dir) not in data["projects"]
+        assert str(parent_dir) not in data["projects"]
 
 
 class TestCopySettingsWithoutPlugins:

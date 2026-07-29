@@ -34,6 +34,8 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
 from loom_tools.common.claude_config import (
+    _ensure_project_trusted,
+    _resolve_state_file,
     cleanup_agent_config_dir,
     setup_agent_config_dir,
     validate_agent_config_dir,
@@ -764,6 +766,16 @@ def spawn_agent(
     config_dir = setup_agent_config_dir(name, repo_root)
     _tmux("set-environment", "-t", session_name, "CLAUDE_CONFIG_DIR", str(config_dir))
     _tmux("set-environment", "-t", session_name, "TMPDIR", str(config_dir / "tmp"))
+
+    # Pre-seed the folder-trust flag for the actual spawn target (the
+    # worktree path when spawning into a worktree, not just repo_root — trust
+    # is keyed per-path) so a freshly-created repo/worktree that Claude Code
+    # has never opened doesn't stall the non-interactive session at the
+    # blocking "Is this a project you created or one you trust?" modal.
+    # Race-free alternative to detecting/dismissing the modal in the tmux
+    # pane.  Gated by LOOM_AUTO_TRUST (default on) inside the helper itself.
+    # See issue #4334.
+    _ensure_project_trusted(_resolve_state_file(), working_dir)
 
     # Set PYTHONPATH so pytest in worktrees resolves imports from the worktree's
     # source instead of the main repo's editable install (see issue #2358)
