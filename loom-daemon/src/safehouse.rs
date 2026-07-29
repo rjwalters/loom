@@ -852,6 +852,28 @@ pub fn event_to_envelope(event: &Event) -> Option<Envelope> {
                 meta: None,
             })
         }
+        Event::DaemonIdleExit {
+            trigger,
+            idle_minutes,
+            in_flight_sweeps,
+            active_role_runs,
+            healthy_tokens,
+            total_tokens,
+            message,
+        } => Some(Envelope {
+            to: "*".to_owned(),
+            kind: "handoff".to_owned(),
+            task_id: Some("daemon-idle-exit".to_owned()),
+            body: message.clone(),
+            meta: Some(serde_json::json!({
+                "trigger": trigger,
+                "idle_minutes": idle_minutes,
+                "in_flight_sweeps": in_flight_sweeps,
+                "active_role_runs": active_role_runs,
+                "healthy_tokens": healthy_tokens,
+                "total_tokens": total_tokens,
+            })),
+        }),
         // SweepGlobalCompleted (no issue number — SweepExited covers it),
         // SweepGlobalDispatch(PrSet), EpicAction, CapacityAdvisory, TopicLag,
         // Generic: not narrated in phase 1.
@@ -2360,6 +2382,21 @@ mod tests {
         };
         let env = event_to_envelope(&resume_failed).unwrap();
         assert!(env.body.contains("still stranded"), "got: {}", env.body);
+
+        let idle_exit = Event::DaemonIdleExit {
+            trigger: "token_starvation".to_owned(),
+            idle_minutes: 60,
+            in_flight_sweeps: 0,
+            active_role_runs: 1,
+            healthy_tokens: 0,
+            total_tokens: 8,
+            message: "idle for 60m — exiting for host idle-shutdown".to_owned(),
+        };
+        let env = event_to_envelope(&idle_exit).unwrap();
+        assert_eq!(env.kind, "handoff");
+        assert_eq!(env.task_id.as_deref(), Some("daemon-idle-exit"));
+        assert!(env.body.contains("host idle-shutdown"));
+        assert_eq!(env.meta.unwrap()["trigger"], "token_starvation");
     }
 
     #[test]
@@ -2718,6 +2755,7 @@ mod tests {
             issue: 4426,
             exit_code: Some(0),
             duration_sec: 750,
+            death_class: None,
             repo: Some(dir.path().to_string_lossy().into_owned()),
         })
         .unwrap();
@@ -2774,6 +2812,7 @@ mod tests {
             issue: 4426,
             exit_code: Some(1),
             duration_sec: 90,
+            death_class: None,
             repo: Some(dir.path().to_string_lossy().into_owned()),
         })
         .unwrap();

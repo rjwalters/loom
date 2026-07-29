@@ -240,6 +240,32 @@ From a script:
 claude -p "/loom:sweep 42" --dangerously-skip-permissions
 ```
 
+For a full Builder-through-Merge lifecycle from an **interactive Codex parent
+session**, launch Codex explicitly with:
+
+```bash
+codex --dangerously-bypass-approvals-and-sandbox
+```
+
+> **Warning:** this flag disables both Codex approval prompts and the Codex
+> sandbox. Use it only in an environment where you accept that trust boundary
+> for Loom's network, git, worktree, daemon-socket, and process operations.
+
+For non-mutating Curator or Judge investigation, use a read-only session
+instead:
+
+```bash
+codex --sandbox read-only --ask-for-approval never
+```
+
+The read-only posture cannot claim issues, edit labels, build in worktrees,
+create PRs, or merge; restart Codex with the full-lifecycle posture before
+performing those operations. These flags configure only the interactive parent
+session. They do not configure Codex workers dispatched by `loom-daemon`; that
+policy is tracked in [#4478](https://github.com/rjwalters/loom/issues/4478).
+See the [Codex guardrail-parity document](defaults/docs/guardrail-parity-codex.md)
+for the runtime trust-boundary comparison.
+
 Sweep is self-contained — there is no separate daemon to start. Checkpoints under `.loom/sweep-checkpoint/` survive crashes; restarting the sweep resumes from the last completed phase.
 
 ### Multi-Issue Mode (loom-daemon, Tier 2)

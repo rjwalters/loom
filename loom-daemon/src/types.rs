@@ -1714,6 +1714,17 @@ pub enum Event {
         /// Operator-facing advisory message naming the concrete cause.
         message: String,
     },
+    /// `daemon.idle_exit` — the daemon is cleanly yielding to a host
+    /// idle-shutdown guard (Issue #4467).
+    DaemonIdleExit {
+        trigger: String,
+        idle_minutes: u64,
+        in_flight_sweeps: usize,
+        active_role_runs: usize,
+        healthy_tokens: usize,
+        total_tokens: usize,
+        message: String,
+    },
     /// Synthetic event signalling that the subscription fell behind the
     /// publisher. The number of events dropped is reported in `skipped`.
     /// Matches `tokio::sync::broadcast::Receiver::Lagged` semantics.
@@ -1770,6 +1781,7 @@ impl Event {
             }
             Self::CapacityAdvisory { .. } => "daemon.capacity.advisory".to_string(),
             Self::PreflightAdvisory { .. } => "daemon.preflight.advisory".to_string(),
+            Self::DaemonIdleExit { .. } => "daemon.idle_exit".to_string(),
             Self::TopicLag { .. } => "sweep.system.topic_lag".to_string(),
             Self::Generic { topic, .. } => topic.clone(),
         }
