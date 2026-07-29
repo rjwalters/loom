@@ -293,6 +293,13 @@ the analogous no-record staleness threshold for `loom:building` claims), but
 on a **minutes**, not hours, scale, since review turnaround (5–15 minutes) is
 two orders of magnitude faster than a build.
 
+**Daemon backstop (#4367)**: this check is the fast path — it only fires when
+another Judge happens to revisit the same PR. `loom-daemon`'s
+`claim_reconciliation` pass now also reconciles `loom:reviewing` (and
+`loom:treating`, Doctor's equivalent) as an always-on backstop at startup and
+on its periodic tick, sharing this exact env var and default. See
+[`daemon-reference.md`'s "Stale-claim reconciliation" section](../../../docs/daemon-reference.md#pr-side-claim-labels-loomreviewing--loomtreating-4367).
+
 **Applies everywhere a Judge claims a PR from a multi-PR pass** — not just
 this single-PR narrative. This same check-then-claim rule governs the batch
 loop in "Autonomous mode (configured with targetInterval)" under Completion
