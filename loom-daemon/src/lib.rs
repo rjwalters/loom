@@ -45,6 +45,7 @@ pub mod role_runner;
 pub mod role_validation;
 pub mod safehouse;
 pub mod self_update;
+pub mod serve;
 pub mod sweep_journal;
 pub mod sweep_registry;
 pub mod terminal;
