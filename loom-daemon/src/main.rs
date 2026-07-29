@@ -3518,12 +3518,29 @@ fn print_status_human(
             );
             let gate = gate_status_short_label(&verdict);
             println!(
-                "  {:>4}  {:>9}  {:<13}  {}",
+                "  {:>4}  {:>9}  {:<13}  {}{}",
                 r.priority,
                 r.in_flight_count,
                 gate,
-                r.root.display()
+                r.root.display(),
+                if r.root_missing {
+                    "  [MISSING ROOT]"
+                } else {
+                    ""
+                }
             );
+            // Issue #4326: a dangling registry entry (root deleted without
+            // `workspace remove`) — the work-finder already warns-and-skips
+            // it on dispatch; this is the operator-facing pointer to clean it
+            // up (or, if the root is only transiently unavailable, e.g. an
+            // unmounted volume, to leave it registered).
+            if r.root_missing {
+                println!(
+                    "        root does not exist on disk — dispatch is skipped; \
+                     run `loom-daemon workspace remove {}` if this is permanent",
+                    r.root.display()
+                );
+            }
             // Name the failure class behind a not-evaluated repo (#3974 AC2) so
             // the operator can tell "dirty tree" from "cargo not on PATH".
             if let Some(reason) = &r.health_gate_not_evaluated_reason {
