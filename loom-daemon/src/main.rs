@@ -925,42 +925,24 @@ async fn main() -> Result<()> {
     // The machine-level sweep journal (`~/.loom/sweeps.json`, written by
     // every `dispatch()` — see `sweep_journal`) is that liveness source, and
     // it survives exactly the restart that wipes this in-memory registry.
-    // This pass is a bounded, logged, best-effort startup sweep over every
+    // This pass is a bounded, logged, best-effort sweep over every
     // `effective_roots()` workspace (empty registry ⇒ just this one). It
     // never blocks daemon startup — a `gh` hiccup in one repo is logged and
     // skipped, and the remaining repos are still reconciled.
-    if claim_reconciliation::reconciliation_enabled() {
-        let workspace_registry =
-            loom_daemon::workspace_registry::WorkspaceRegistry::load_default().unwrap_or_default();
-        let roots = workspace_registry.effective_roots(&sweep_workspace);
-        let gh_bin = std::path::PathBuf::from("gh");
-        let mut total_checked = 0usize;
-        let mut total_reclaimed = 0usize;
-        for root in &roots {
-            let (checked, reclaimed) =
-                claim_reconciliation::forge::reconcile_workspace(&gh_bin, root);
-            total_checked += checked;
-            total_reclaimed += reclaimed;
-        }
-        if total_reclaimed > 0 {
-            log::info!(
-                "claim_reconciliation: startup pass checked {total_checked} loom:building \
-                 issue(s) across {} workspace(s), reclaimed {total_reclaimed} stale claim(s) (#3953)",
-                roots.len()
-            );
-        } else {
-            log::debug!(
-                "claim_reconciliation: startup pass checked {total_checked} loom:building \
-                 issue(s) across {} workspace(s), nothing to reclaim",
-                roots.len()
-            );
-        }
-    } else {
-        log::info!(
-            "claim_reconciliation: startup pass disabled ({}=0)",
-            claim_reconciliation::RECONCILE_ENABLED_ENV
-        );
-    }
+    //
+    // Promoted from a startup-only pass to ALSO run on an interval (Issue
+    // #4348): a daemon restart is not the only way a `loom:building` claim's
+    // sweep can die. A manually/externally spawned detached sweep killed by
+    // an external `SIGKILL` (the incident that motivated #4348) never writes
+    // the journal entry above, but its checkpoint's `task_id` joined against
+    // `.loom/sweep-run/<task_id>.json` gives `claim_reconciliation` the same
+    // provable-death answer — see that module's doc comment for the full
+    // evidence-source precedence. `run_reconciliation_pass` (this call) and
+    // the periodic task spawned just below share one implementation, so the
+    // startup and periodic behavior are identical by construction.
+    claim_reconciliation::run_reconciliation_pass(&sweep_workspace);
+    let _claim_reconciliation_handle =
+        claim_reconciliation::spawn_periodic_reconciliation_task(sweep_workspace.clone());
 
     // Stranded-quarantine reconciliation across every managed workspace
     // (Issue #4110). The insta-crash quarantine (#3939) is memory-only, so a
