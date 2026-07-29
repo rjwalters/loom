@@ -2057,7 +2057,8 @@ exactly like `main_health_gate::read_build_gate_config`.
 | `autonomous.watchdog.reviewStallTimeoutSecs` | `LOOM_SWEEP_REVIEW_STALL_TIMEOUT_SECS` | `2700` | Log-silence window before a hung Judge/Doctor sweep is re-dispatched |
 | `autonomous.collisionDetection.enabled` | `LOOM_DETECT_COLLISIONS` | `false` | Cross-host dispatch-collision baseline (#4085). Off by default — adds one extra `gh issue view --json labels` round-trip per dispatch. Detection only: a collision is logged/counted, never acted on |
 | `safehouse.enabled` | `LOOM_SAFEHOUSE_ENABLED` | `false` | Enables safehouse fleet-comms (#3997) **and** cross-host soft-claim coordination (#4028). Off by default — a byte-for-byte no-op (no socket, no coordination task) when unset |
-| `safehouse.peerClaimTtlSecs` | `LOOM_PEER_CLAIM_TTL_SECS` | `120` | Peer-claim TTL, in seconds (#4028) — how long a peer's soft claim suppresses local dispatch (measured against local receipt, not the advertiser's clock). Default = 2× the 60s work-finder tick |
+| `safehouse.peerClaimTtlSecs` | `LOOM_PEER_CLAIM_TTL_SECS` | `120` | Peer-claim TTL, in seconds (#4028) — how long a peer's soft claim suppresses local dispatch (measured against local receipt, not the advertiser's clock). Default = 2× the 60s work-finder tick. Since #4431 live claims are re-advertised every reaper tick, so the TTL only bounds how long a **crashed** host's claim lingers |
+| `safehouse.claimReconcileIntervalSecs` | `LOOM_CLAIM_RECONCILE_INTERVAL_SECS` | `1800` when `safehouse.enabled`, else `600` | Periodic `loom:building`/PR-claim reconciliation cadence (#4431). With safehouse peer-claims carrying the fast in-flight signal (re-advertised each reaper tick), label reconciliation demotes to a slow healing sweep. Env wins on any host; floored at 60s |
 | *(host identity)* | `LOOM_HOST_ID` | `$HOSTNAME` → `hostname` → `unknown-host` | This host's identity string, used in collision log records (#4085) **and** peer-claim self-recognition (#4028); set it where the daemon runs without `$HOSTNAME` exported |
 | `autonomous.autoUpdate.enabled` | `LOOM_AUTO_UPDATE` | `false` | Autonomous self-update loop on/off (#4055). **Opt-in** (it rebuilds + restarts the daemon process). Exactly one loop per daemon, not a per-workspace fan-out. See [Autonomous self-update loop](#autonomous-self-update-loop-4055) below |
 | `autonomous.autoUpdate.intervalSecs` | `LOOM_AUTO_UPDATE_INTERVAL_SECS` | `900` | Cadence between staleness checks. Zero/invalid → default |
@@ -2466,6 +2467,22 @@ for the full design.
   clock skew is not comparable across hosts), so a crashed peer cannot
   permanently starve an issue. A peer also emits a `retract` ad from its reaper on
   a terminal sweep outcome, freeing the issue before the TTL.
+- **Re-advertisement heartbeat (#4431).** The dispatch-time ad is no longer
+  one-shot: the reaper re-advertises every live (`Running`/`Pending`) Issue
+  sweep's claim each tick (default 30s — ~4 refreshes per TTL window), and a
+  repeat ad **restarts** the receiver's TTL clock. A live sweep's claim
+  therefore never expires from peers' views mid-run, while a crashed host's
+  claims still free within one TTL of its last heartbeat. This is what lets
+  the peer claim serve as the **primary fast in-flight signal** on
+  safehouse-enabled hosts, with the `loom:building` label demoted to a slow
+  healing audit trail:
+- **Safehouse-conditional reconciliation cadence (#4431).** On a host with
+  `safehouse.enabled`, `claim_reconciliation`'s periodic pass defaults to
+  **1800s** (30 min, healing-only) instead of 600s. Precedence:
+  `LOOM_CLAIM_RECONCILE_INTERVAL_SECS` env >
+  `safehouse.claimReconcileIntervalSecs` config > 1800s (safehouse) / 600s
+  (no safehouse), floored at 60s. Hosts without safehouse are byte-for-byte
+  unchanged.
 - **Self-claim recognition.** A daemon never backs off on its own advertisement:
   the claim body carries the host identity (`host_identity()`:
   `LOOM_HOST_ID` > `$HOSTNAME` > `hostname` > `unknown-host` — loom's single,

@@ -1696,6 +1696,43 @@ impl SweepRegistry {
         }
     }
 
+    /// Re-advertise the peer claim of every live (`Running`/`Pending`) Issue
+    /// sweep over the safehouse room (Issue #4431).
+    ///
+    /// The dispatch-time advertisement is a one-shot publish, and peer claims
+    /// expire after [`crate::peer_claims::DEFAULT_PEER_CLAIM_TTL`] (120s) —
+    /// tuned for the *soft-backoff* era when the forge label was the durable
+    /// signal behind it. With claim reconciliation slowed to a healing cadence
+    /// on safehouse-enabled hosts (#4431), a live sweep's claim must not
+    /// silently fall out of peers' [`crate::peer_claims::PeerClaimView`]s
+    /// mid-run. The reaper calls this every tick (default 30s, well under the
+    /// TTL), so a live claim is refreshed ~4× per TTL window while a crashed
+    /// host's claims still expire within one TTL of its last heartbeat — the
+    /// crash-release property the short TTL exists for is preserved exactly.
+    ///
+    /// Same fail-open contract as [`Self::publish_peer_claim`]: a no-op
+    /// without a publisher (`safehouse.enabled` false), and a full/closed
+    /// channel drops the ad without blocking the reaper. Returns how many
+    /// claims were re-advertised (for the reaper's debug line).
+    pub fn readvertise_peer_claims(&self) -> usize {
+        if self.peer_claim_publisher.is_none() {
+            return 0;
+        }
+        let live: Vec<u32> = self
+            .entries
+            .values()
+            .filter(|info| matches!(info.state, SweepState::Running | SweepState::Pending))
+            .filter_map(|info| match info.kind {
+                SweepKind::Issue(issue) => Some(issue),
+                _ => None,
+            })
+            .collect();
+        for issue in &live {
+            self.publish_peer_claim(peer_claims::ClaimKind::Advertise, *issue);
+        }
+        live.len()
+    }
+
     /// The set of issue numbers currently quarantined for insta-crashing (Issue
     /// #3939). Consumed by the work finder to skip re-dispatch. TTL expiry is
     /// applied by [`reap_once`](Self::reap_once) (which the work-finder's
@@ -5229,7 +5266,23 @@ pub fn spawn_reaper_task(registry: Arc<Mutex<SweepRegistry>>) -> tokio::task::Jo
             ticker.tick().await;
             let changed = {
                 match registry.lock() {
-                    Ok(mut r) => r.reap_once(),
+                    Ok(mut r) => {
+                        let changed = r.reap_once();
+                        // Peer-claim heartbeat (#4431): re-advertise every
+                        // live claim each reaper tick so it never expires
+                        // from peers' views mid-run, now that label
+                        // reconciliation is a slow healing cadence on
+                        // safehouse-enabled hosts. Runs after `reap_once` so
+                        // a just-reaped (dead) sweep is never re-advertised.
+                        let readvertised = r.readvertise_peer_claims();
+                        if readvertised > 0 {
+                            log::debug!(
+                                "sweep_registry: re-advertised {readvertised} live peer \
+                                 claim(s) (#4431)"
+                            );
+                        }
+                        changed
+                    }
                     Err(poisoned) => {
                         log::error!("sweep_registry: mutex poisoned ({poisoned:?})");
                         return;
@@ -5795,6 +5848,67 @@ mod tests {
     /// exec bit, because parallel-test load on macOS occasionally races the
     /// chmod with the child's posix_spawn exec call and the script silently
     /// fails to launch (no shebang resolution, no exec-bit yet).
+    /// #4431: the reaper's peer-claim heartbeat must re-advertise every live
+    /// (`Running`/`Pending`) Issue sweep's claim — and ONLY those (a
+    /// terminal-state entry is a dead sweep whose claim must be allowed to
+    /// expire), and be a publisher-less no-op (safehouse disabled).
+    #[test]
+    fn readvertise_republishes_live_issue_claims_only() {
+        let dir = tempdir().unwrap();
+        let (mut registry, _log) = fixture_registry(dir.path());
+
+        // No publisher attached (safehouse.enabled false): a silent no-op.
+        assert_eq!(registry.readvertise_peer_claims(), 0);
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        registry.set_peer_claim_publisher(tx);
+
+        let mk_info =
+            |sweep_id: &str, issue: u32, state: SweepState, log_path: PathBuf| SweepInfo {
+                sweep_id: sweep_id.to_string(),
+                kind: SweepKind::Issue(issue),
+                pid: 0,
+                token_name: "unknown".into(),
+                log_path,
+                idempotency_key: None,
+                started_at: Utc::now(),
+                state,
+                latest_phase: None,
+                pr_number: None,
+                model: None,
+                effort: None,
+                depends_on: None,
+                repo: None,
+            };
+        let live_log = registry.compute_log_path(4431);
+        let dead_log = registry.compute_log_path(999);
+        registry.entries.insert(
+            "sweep-live".to_string(),
+            mk_info("sweep-live", 4431, SweepState::Running, live_log),
+        );
+        registry.entries.insert(
+            "sweep-dead".to_string(),
+            mk_info(
+                "sweep-dead",
+                999,
+                SweepState::Exited {
+                    code: None,
+                    at: Utc::now(),
+                },
+                dead_log,
+            ),
+        );
+
+        assert_eq!(registry.readvertise_peer_claims(), 1);
+        let ad = rx.try_recv().expect("one re-advertisement published");
+        assert_eq!(ad.issue, 4431);
+        assert_eq!(ad.kind, crate::peer_claims::ClaimKind::Advertise);
+        assert!(
+            rx.try_recv().is_err(),
+            "the terminal-state sweep's claim must NOT be re-advertised"
+        );
+    }
+
     fn fixture_registry(workspace: &Path) -> (SweepRegistry, PathBuf) {
         let record_log = workspace.join("fake-spawn.log");
         // We use /bin/bash as the spawn binary, and the dispatch path appends
