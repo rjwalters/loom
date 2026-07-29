@@ -267,24 +267,28 @@ gated flip PR per §5.
 
 ## 4. Plumbing verification (result)
 
-Verified on `origin/main` at the time this document was authored (#3706):
+Verified on `origin/main` at the time this document was authored (#3706).
 
-- **Unit coverage is present and green.** `loom-tools/tests/test_agent_metrics.py`
-  contains the "Per-model dimension tests (#3482, Phase 3a)" block
+> **Update (2026-07-29, issue #4274):** `loom_tools.agent_metrics` (and its
+> `loom-tools/tests/test_agent_metrics.py` suite) was ported to native
+> `loom-daemon stats <command>` and deleted — epic #4081 Phase 3 family 4. The
+> CLI surface below (`agent-metrics.sh effectiveness/costs --by-model`) is
+> unchanged for callers; run `cd loom-daemon && cargo test stats` for the
+> equivalent by-model/period coverage (`activity::stats::tests::*`).
+
+- **Unit coverage is present and green** (pre-#4274; superseded by the native
+  Rust tests above). `loom-tools/tests/test_agent_metrics.py`
+  contained the "Per-model dimension tests (#3482, Phase 3a)" block
   (`class TestByModel`) asserting that `effectiveness --by-model` groups by
   `(role, model)`, that `NULL`/empty models fall under `default`, and that omitting
-  `--by-model` preserves the pre-#3482 output shape. Run:
-
-  ```bash
-  PYTHONPATH=loom-tools/src python3 -m pytest loom-tools/tests/test_agent_metrics.py -q
-  # 61 passed
-  ```
+  `--by-model` preserves the pre-#3482 output shape.
 
 - **The CLI surface exists.** `defaults/scripts/agent-metrics.sh` documents and
   forwards `effectiveness [--by-model]` / `costs [--by-model]` to
-  `loom_tools.agent_metrics`; `get_effectiveness(..., by_model=True)` and
-  `get_costs(..., by_model=True)` add the model dimension via `_model_expr`, and the
-  text formatters add a `Model` column only when a row carries a model.
+  `loom-daemon stats` (pre-#4274: `loom_tools.agent_metrics`); the effectiveness/
+  cost queries add the model dimension via a `COALESCE(NULLIF(r.model, ''), 'default')`
+  expression, and the text formatters add a `Model` column only when a row carries
+  a model.
 
 - **Empty-DB behavior (observed).** Against a fresh activity DB with no recorded
   activity, the live commands surface a plain error rather than a per-model table,
