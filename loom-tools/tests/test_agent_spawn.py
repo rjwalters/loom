@@ -782,6 +782,86 @@ class TestGitWorktreePinning:
         assert len(git_env_calls) == 0
 
 
+class TestProjectTrustSeeding:
+    """Tests that spawn_agent seeds the folder-trust flag (#4334)."""
+
+    @patch("loom_tools.agent_spawn._ensure_project_trusted")
+    @patch("loom_tools.agent_spawn._resolve_state_file")
+    @patch("loom_tools.agent_spawn._tmux")
+    def test_seeds_trust_for_worktree_path_not_repo_root(
+        self,
+        mock_tmux: MagicMock,
+        mock_resolve_state_file: MagicMock,
+        mock_ensure_trusted: MagicMock,
+        mock_repo: pathlib.Path,
+    ) -> None:
+        """spawn_agent seeds the actual worktree path, not just repo_root."""
+        from loom_tools.agent_spawn import spawn_agent
+
+        worktree_dir = mock_repo / ".loom" / "worktrees" / "issue-4334"
+        worktree_dir.mkdir(parents=True)
+        (worktree_dir / ".git").write_text(
+            f"gitdir: {mock_repo}/.git/worktrees/issue-4334\n"
+        )
+
+        (mock_repo / ".loom" / "roles" / "builder.md").write_text("# Builder")
+        wrapper = mock_repo / ".loom" / "scripts" / "claude-wrapper.sh"
+        wrapper.write_text("#!/bin/bash\nclaude \"$@\"")
+        wrapper.chmod(0o755)
+
+        mock_tmux.return_value = subprocess.CompletedProcess(
+            args=[], returncode=0, stdout=""
+        )
+        fake_state_path = pathlib.Path("/fake/.claude.json")
+        mock_resolve_state_file.return_value = fake_state_path
+
+        spawn_agent(
+            role="builder",
+            name="builder-issue-4334",
+            args="4334",
+            worktree=str(worktree_dir),
+            repo_root=mock_repo,
+            verify_timeout=0,
+        )
+
+        mock_ensure_trusted.assert_called_once_with(fake_state_path, worktree_dir)
+
+    @patch("loom_tools.agent_spawn._ensure_project_trusted")
+    @patch("loom_tools.agent_spawn._resolve_state_file")
+    @patch("loom_tools.agent_spawn._tmux")
+    def test_seeds_trust_for_repo_root_when_no_worktree(
+        self,
+        mock_tmux: MagicMock,
+        mock_resolve_state_file: MagicMock,
+        mock_ensure_trusted: MagicMock,
+        mock_repo: pathlib.Path,
+    ) -> None:
+        """spawn_agent seeds repo_root when no worktree is given."""
+        from loom_tools.agent_spawn import spawn_agent
+
+        (mock_repo / ".loom" / "roles" / "builder.md").write_text("# Builder")
+        wrapper = mock_repo / ".loom" / "scripts" / "claude-wrapper.sh"
+        wrapper.write_text("#!/bin/bash\nclaude \"$@\"")
+        wrapper.chmod(0o755)
+
+        mock_tmux.return_value = subprocess.CompletedProcess(
+            args=[], returncode=0, stdout=""
+        )
+        fake_state_path = pathlib.Path("/fake/.claude.json")
+        mock_resolve_state_file.return_value = fake_state_path
+
+        spawn_agent(
+            role="builder",
+            name="test-builder",
+            args="",
+            worktree="",
+            repo_root=mock_repo,
+            verify_timeout=0,
+        )
+
+        mock_ensure_trusted.assert_called_once_with(fake_state_path, mock_repo)
+
+
 class TestAnsiStripping:
     """Tests for ANSI escape sequence stripping in log output."""
 

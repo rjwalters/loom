@@ -230,6 +230,102 @@ def _ensure_onboarding_complete(state_path: Path) -> None:
     log.debug("Wrote merged .claude.json with onboarding-complete state")
 
 
+def _ensure_project_trusted(state_path: Path, project_dir: Path) -> None:
+    """Ensure .claude.json marks ``project_dir`` as trusted (skip the folder-trust modal).
+
+    Claude Code shows a blocking "Is this a project you created or one you
+    trust?" modal on first launch in any working directory that has no
+    ``projects[<abs-path>].hasTrustDialogAccepted: true`` entry in the state
+    file.  In a non-interactive agent spawn (``loom.sh`` pool,
+    ``agent-spawn.sh --role ...``) into a freshly-created repo/worktree that
+    Claude Code has never opened, the role command is delivered as keystrokes
+    into that modal instead of being run, stalling or killing the session.
+    See issue #4334.
+
+    This mirrors :func:`_ensure_onboarding_complete`'s two invariants:
+
+    - **Merge, never replace**: only the ``projects[<project_dir>]`` entry's
+      ``hasTrustDialogAccepted`` flag is set; any other fields on that entry
+      (or any other ``projects`` entries, or any other top-level fields) are
+      preserved unchanged.
+    - **Write through the symlink** (issue #2835): when ``state_path`` is a
+      healthy symlink (e.g. the per-agent ``CLAUDE_CONFIG_DIR/.claude.json``
+      pointing at the shared global state file), write to the resolved
+      target rather than unlinking the symlink and replacing it with a
+      standalone file, which would sever every future session from the
+      operator's global state.
+
+    Only the exact ``project_dir`` path is trusted — parents are never
+    walked and siblings are never globbed or trusted implicitly.
+
+    Gated by ``LOOM_AUTO_TRUST``.  Default is "1" (enabled); set to "0" to
+    disable, mirroring the ``LOOM_AUTO_ACCEPT_BYPASS`` pattern in
+    ``agent_spawn.py``.
+
+    Idempotent: if the target project already has
+    ``hasTrustDialogAccepted: true``, this is a no-op (no file rewrite).
+
+    Args:
+        state_path: Path to the ``.claude.json`` state file (or a per-agent
+            symlink to it).
+        project_dir: The exact spawn target directory to trust (the resolved
+            working directory — the worktree path when spawning into a
+            worktree, not just the repo root).
+    """
+    import json
+
+    if os.environ.get("LOOM_AUTO_TRUST", "1") == "0":
+        log.debug("Project trust auto-seed disabled via LOOM_AUTO_TRUST=0")
+        return
+
+    project_key = str(project_dir)
+
+    existing_data: dict = {}
+    try:
+        if state_path.exists():
+            existing_data = json.loads(state_path.read_text())
+            if not isinstance(existing_data, dict):
+                existing_data = {}
+    except (json.JSONDecodeError, OSError):
+        existing_data = {}
+
+    projects = existing_data.get("projects")
+    if not isinstance(projects, dict):
+        projects = {}
+
+    project_entry = projects.get(project_key)
+    if isinstance(project_entry, dict) and project_entry.get("hasTrustDialogAccepted") is True:
+        return  # Already trusted — idempotent no-op, no rewrite.
+
+    if not isinstance(project_entry, dict):
+        project_entry = {}
+    project_entry = {**project_entry, "hasTrustDialogAccepted": True}
+
+    merged = {**existing_data}
+    merged["projects"] = {**projects, project_key: project_entry}
+
+    # If state_path is a valid symlink, write directly to the symlink target
+    # rather than destroying the symlink and creating a standalone file.
+    # See issue #2835 (and _ensure_onboarding_complete above, same rationale).
+    if state_path.is_symlink():
+        target = state_path.resolve()
+        if target.exists():
+            target.write_text(json.dumps(merged))
+            log.debug("Updated symlink target .claude.json with trust for %s", project_key)
+            return
+        # Dangling symlink — fall through to unlink and recreate below.
+
+    # Remove whatever is there (dangling symlink, corrupt file, etc.)
+    # so we can write a standalone file.
+    try:
+        state_path.unlink()
+    except FileNotFoundError:
+        pass
+
+    state_path.write_text(json.dumps(merged))
+    log.debug("Wrote merged .claude.json with trust for %s", project_key)
+
+
 def _resolve_state_file() -> Path:
     """Resolve the Claude Code state file path.
 
