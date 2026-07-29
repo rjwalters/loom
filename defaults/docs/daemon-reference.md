@@ -1071,7 +1071,7 @@ The reaper (`sweep_registry::spawn_reaper_task`) ticks every 30 seconds
 4. Garbage-collects terminal entries older than the retention window
    (default 1 hour).
 
-## Stale-claim reconciliation & the sweep journal (#3953, fixed #3975)
+## Stale-claim reconciliation & the sweep journal (#3953, fixed #3975, extended to PR-side claims #4367)
 
 Two independent surfaces reclaim abandoned `loom:building` claims when the
 sweep that owned them has died, using the same evidence source and the same
@@ -1079,7 +1079,8 @@ decision rule:
 
 | Surface | Where | When it runs |
 |---------|-------|---------------|
-| Rust startup reconciliation | `claim_reconciliation::forge::reconcile_workspace` (called from `main.rs` at daemon startup, guarded by `LOOM_STALE_CLAIM_RECONCILE`, default on) | Once, on every daemon start, across every `effective_roots()` workspace |
+| Rust issue-side reconciliation (`loom:building`) | `claim_reconciliation::forge::reconcile_workspace` (guarded by `LOOM_STALE_CLAIM_RECONCILE`, default on) | At daemon startup AND every `LOOM_CLAIM_RECONCILE_INTERVAL_SECS` (default 600s) thereafter, via `run_reconciliation_pass` (#4348), across every `effective_roots()` workspace |
+| Rust PR-side reconciliation (`loom:reviewing` / `loom:treating`, #4367) | `claim_reconciliation::forge::reconcile_pr_claims`, called from the same `run_reconciliation_pass` entry point (same `LOOM_STALE_CLAIM_RECONCILE` gate — no separate wiring) | Same cadence as the issue-side pass: at startup and every `LOOM_CLAIM_RECONCILE_INTERVAL_SECS`, across every `effective_roots()` workspace |
 | `loom-recover-orphans` (native, issue #4272) | `worktree_ops::orphan_recovery::check_untracked_building` | On demand (operator/cron invocation of `loom-recover-orphans [--recover]`) |
 
 Both read the same machine-level **sweep journal** (`~/.loom/sweeps.json`,
@@ -1152,6 +1153,54 @@ deliberate event, while the Python tool can be invoked ad hoc (including
 immediately after a claim is made, before its journal entry has even been
 written) — the short grace period is defense-in-depth against a race the
 once-per-restart Rust pass is much less exposed to.
+
+### PR-side claim labels: `loom:reviewing` / `loom:treating` (#4367)
+
+`loom:reviewing` (Judge) and `loom:treating` (Doctor) are claim *overlays* —
+they coexist with the PR's underlying state label
+(`loom:review-requested` / `loom:changes-requested` / `loom:pr`) while work
+is in progress. Like `loom:building`, they can be left behind forever when
+their holder dies (observed on PR #4303: a `loom:treating` label ~5h stale
+from a Doctor killed on another host). `claim_reconciliation::forge::reconcile_pr_claims`
+extends the same pass to cover both, running from the same
+`run_reconciliation_pass` entry point (startup + periodic, same
+`LOOM_STALE_CLAIM_RECONCILE` gate — no `main.rs` change needed).
+
+The pure decision function, `decide_pr`, mirrors `decide`'s union-probe join
+priority (journal entry, then checkpoint→run-registry) but with two
+deliberate divergences from the issue-side rule, both driven by the PR side's
+weaker evidence:
+
+- **The join is heuristic, not authoritative.** A PR has no `loom:building`
+  issue number of its own — the issue number is recovered only when the PR's
+  `headRefName` matches the `feature/issue-<N>` convention `worktree.sh`
+  establishes (`parse_issue_from_branch`). Any other branch shape has no join
+  key at all and falls straight through to the age rule below.
+- **The age gate applies unconditionally — even to a dead joined pid.**
+  Unlike `decide()`'s `DeadPid`/`DeadRunRegistry` branches (immediate,
+  unconditional reclaim), a dead pid alone is never sufficient proof on the
+  PR side: the branch-name join can be wrong (a Doctor may hold a PR whose
+  sweep record belongs to a different phase), so `decide_pr` only reclaims
+  once the PR's `updatedAt` has *also* aged past the per-label threshold. A
+  **live** joined pid still short-circuits to `Keep` unconditionally — that
+  evidence is trustworthy either way. A missing/unparseable `updatedAt`
+  fails safe to `Keep`, same rationale as the issue side's total-absence
+  case.
+
+Thresholds are minutes-scale, not hours, and env-overridable:
+
+| Claim label | Env var | Default |
+|-------------|---------|---------|
+| `loom:reviewing` | `LOOM_STALE_REVIEWING_MINUTES` | 30 — the SAME env var `.claude/commands/loom/judge.md`'s "Stale `loom:reviewing` Claim Check" already established, so the agent-side fast path and this always-on daemon backstop share one convention |
+| `loom:treating` | `LOOM_STALE_TREATING_MINUTES` | 60 — a Doctor's fix cycle legitimately runs longer than a single Judge review pass |
+
+Reclaiming removes only the stale claim label — the PR's state label (still
+present in the normal case) restores discoverability by itself. As a safety
+net, if the PR is left carrying none of `loom:review-requested` /
+`loom:changes-requested` / `loom:pr` after the claim label is removed,
+`forge::reclaim_pr` adds `loom:review-requested` so a fresh Judge pass picks
+it back up. Log lines mirror the issue-side format, e.g. `claim_reconciliation:
+removed stale loom:reviewing from PR #N in <root> (DeadPid { pid: … }, …)`.
 
 ## Stacked-PR dependency — #3729 (v1), #3747 (v2 item 1)
 
