@@ -1095,6 +1095,18 @@ impl TerminalManager {
         log::info!("Set CLAUDE_CONFIG_DIR={config_dir_str} for session {tmux_session}");
     }
 
+    /// Classify a tmux `list-sessions` stderr string encountered during
+    /// `restore_from_tmux` as an *expected* "nothing to restore" condition.
+    ///
+    /// A dead tmux server (`no server running`) at restore time implies zero
+    /// live sessions by definition — there is nothing restorable *from tmux*,
+    /// which is the normal state on a host that has never run the Manual
+    /// Orchestration Mode tmux pool (e.g. autonomous-only), and also the
+    /// normal state immediately after a reboot. See #4378.
+    fn is_expected_empty_restore(stderr: &str) -> bool {
+        stderr.contains("no server running")
+    }
+
     /// Handle tmux command errors with consistent logging
     /// Returns true if the error indicates the tmux server is dead
     fn handle_tmux_error(stderr: &str, operation: &str) -> bool {
@@ -1644,6 +1656,16 @@ impl TerminalManager {
         // Enhanced logging: Check for tmux server failure
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
+
+            // Issue #4378: log the expected "nothing to restore" case at
+            // debug instead of routing it through `handle_tmux_error`'s
+            // ERROR siren, mirroring the existing `clean_stale_sessions`
+            // precedent for the same stderr pattern.
+            if Self::is_expected_empty_restore(&stderr) {
+                log::debug!("No tmux server during restore_from_tmux — nothing to restore");
+                return Ok(());
+            }
+
             Self::handle_tmux_error(&stderr, "restore_from_tmux");
 
             // Return early with empty list if server is dead
@@ -2079,6 +2101,27 @@ mod tests {
     #[test]
     fn test_validate_terminal_id_rejects_dots() {
         assert!(TerminalManager::validate_terminal_id("terminal.1").is_err());
+    }
+
+    // ===== is_expected_empty_restore tests (#4378) =====
+
+    #[test]
+    fn test_is_expected_empty_restore_no_server_running() {
+        assert!(TerminalManager::is_expected_empty_restore(
+            "no server running on /private/tmp/tmux-501/loom"
+        ));
+    }
+
+    #[test]
+    fn test_is_expected_empty_restore_no_sessions_is_not_expected() {
+        // "no sessions" is a distinct condition already handled separately by
+        // `handle_tmux_error` (debug, not error) — it must not be reclassified here.
+        assert!(!TerminalManager::is_expected_empty_restore("no sessions"));
+    }
+
+    #[test]
+    fn test_is_expected_empty_restore_other_error_is_not_expected() {
+        assert!(!TerminalManager::is_expected_empty_restore("some other tmux error"));
     }
 
     // ===== handle_tmux_error tests =====
