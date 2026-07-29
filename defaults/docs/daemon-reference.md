@@ -2474,13 +2474,25 @@ service's exit code affects the next scheduled run.
 
 **Decision matrix** (marker present ⇒ a daemon is expected):
 
-| Reality | Watchdog |
-|---------|----------|
-| daemon alive, heartbeat fresh | silent (OK) |
-| daemon alive, heartbeat **stale** | **report** — daemon may be wedged |
-| daemon alive, no heartbeat file | silent (liveness-only; heartbeat disabled or not yet written) |
-| daemon **not loaded/alive** | **report** — the #4011 outage |
-| marker **absent** | silent — deliberate stop, no false page |
+| Marker | Reality | Watchdog |
+|--------|---------|----------|
+| present | daemon alive, heartbeat fresh | silent (OK) |
+| present | daemon alive, heartbeat **stale** | **report** — daemon may be wedged |
+| present | daemon alive, no heartbeat file | silent (liveness-only; heartbeat disabled or not yet written) |
+| present | daemon **not loaded/alive** | **report** — the #4011 outage |
+| **absent** | **nothing running** | silent — deliberate stop, no false page |
+| **absent** | **daemon IS running** | **report (WARN)** — state mismatch, crash protection disarmed (#4331) |
+
+The last row is the #4331 fix. Before it, a missing marker short-circuited to a
+bare `[OK] … nothing to check` **without probing reality at all** — so a
+supervised daemon running with its marker gone (see "Marker ownership" below) was
+reported healthy while the watchdog would in fact never revive it. The no-marker
+branch now runs the *same* liveness probe as the marker-present path (env-derived
+defaults: `LOOM_LAUNCHD_LABEL` or the default label; `<loom_dir>/.daemon.pid` on
+the non-launchd path) and, only when a daemon **is** demonstrably alive, WARNs +
+exits `1`. The load-bearing quiet case — marker absent *and* nothing alive, i.e. a
+deliberate `loom-daemon-stop.sh` (which also boots the daemon job out, so nothing
+is found) — stays exactly as silent as before.
 
 **Marker lifetime across a self-update.** `loom-daemon-update.sh` performs an
 internal stop→start, which is a **restart**, not operator intent to stop — so it
@@ -2490,6 +2502,41 @@ is load-bearing: inferring restart-vs-stop would mean every self-update silently
 disarms the detector — the exact bug class #4011 fixes — so it is an explicit
 signal, never an inference. The subsequent start re-writes the marker and
 re-provisions the watchdog.
+
+**Marker ownership (create / preserve / remove per surface).** The marker's
+lifetime is operator intent, spread across several surfaces — this table is the
+contract the healing + detection below implement:
+
+| Surface | Marker behavior | Reference |
+|---------|-----------------|-----------|
+| `loom-daemon-start.sh` | **Creates** it (`write_intent_marker`) on every successful start (launchd, systemd, nohup) | `loom-daemon-start.sh` (`write_intent_marker`) |
+| `loom-daemon-stop.sh` | **Removes** it + tears down the watchdog — unless `--restarting` / `LOOM_DAEMON_STOP_KEEP_INTENT=1`, which **preserves** both | `loom-daemon-stop.sh` |
+| `loom-daemon-update.sh` (full roll) | **Preserves + re-creates**: `stop --restarting` (preserve) then `start.sh` (re-write) | `loom-daemon-update.sh` |
+| `loom-daemon restart` (#4054 primitive) | **Preserved if present** (the daemon exits `EXIT_RESTART`; the supervisor relaunches, marker untouched). An **absent** marker is **healed at startup** — see below | `ipc.rs`, `autonomy_marker.rs` |
+| in-daemon self-update loop | Uses `update.sh --no-restart` + the restart primitive — bypasses the stop/start rewrite; relies on **startup healing** | `main.rs`, `autonomy_marker.rs` |
+| bare launchd `KeepAlive` / systemd `Restart=on-success` relaunch | Never runs the start script — relies on **startup healing** | `autonomy_marker.rs` |
+
+**Startup marker healing (#4331).** The restart primitive, the self-update loop,
+and a bare supervisor relaunch all bring up a fresh daemon **without** re-running
+`write_intent_marker`, so before #4331 an *absent* marker was never re-created
+while a supervised daemon kept running — the daemon ran with crash protection
+silently disarmed, forever. Rather than patch each restart path, the daemon heals
+the marker at **one startup choke point** (`autonomy_marker::heal_on_startup`,
+wired in `main.rs` right after the heartbeat loop): if it detects it is supervised
+([`ipc::detect_supervisor`] ⇒ `Some`, from the `LOOM_DAEMON_SUPERVISOR` env the
+plist/unit bake in) **and** the marker is absent, it re-writes it. That single
+point covers the primitive, the self-update loop, and a bare relaunch. Deliberate
+constraints:
+
+- **Never for an unsupervised run.** A `--foreground` / nohup / debug start
+  (`detect_supervisor` ⇒ `None`) writes **no** marker — otherwise every dev run
+  would arm the host-side pager after the dev session exits.
+- **`LOOM_AUTONOMY_MARKER` respected.** The path is resolved with the same env
+  override the plist/unit export, so healing and the watchdog agree.
+- **Never overwrites a present marker** (it already encodes start-time intent);
+  and a failed write is logged, never fatal. The healed marker mirrors
+  `write_intent_marker`'s fields byte-for-byte (with a `# HEALED …` provenance
+  comment) so the watchdog and `daemon_install_state` parse it identically.
 
 **Platform + isolation.** Darwin and systemd Linux hosts both get a provisioned,
 scheduled watchdog (see the two bullets above). Only the **nohup fallback tier**

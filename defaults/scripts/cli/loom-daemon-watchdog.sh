@@ -60,13 +60,14 @@
 #
 # EXIT CODES (a StartInterval job's exit code does not affect relaunch — these
 # exist for testability and for a human running it by hand):
-#   0  no divergence — daemon healthy, no daemon expected (marker absent), OR
-#      the #4232 bounded auto-remediation (see above) successfully relaunched
-#      it via 'launchctl kickstart'
-#   1  DIVERGENCE reported — a daemon is expected but is not running (and
-#      either the #4232 remediation gate did not apply, or it fired but the
-#      daemon is still not confirmed running), or is running but its
-#      heartbeat is stale (possibly wedged)
+#   0  no divergence — daemon healthy, OR no daemon expected AND none running
+#      (marker absent + nothing alive), OR the #4232 bounded auto-remediation
+#      (see above) successfully relaunched it via 'launchctl kickstart'
+#   1  DIVERGENCE / state mismatch reported — a daemon is expected but is not
+#      running (and either the #4232 remediation gate did not apply, or it fired
+#      but the daemon is still not confirmed running), or is running but its
+#      heartbeat is stale (possibly wedged), OR (#4331) a daemon IS running while
+#      the marker is ABSENT (crash protection disarmed — a WARN state mismatch)
 #   2  usage error
 #
 # Usage:
@@ -144,11 +145,80 @@ report() {
     esac
 }
 
+# ---------- reality probe (shared) ----------
+# Determine whether the expected daemon is actually alive. Reads the resolved
+# USE_LAUNCHD / LABEL / PID_FILE and sets four globals the callers branch on:
+#   daemon_alive     true|false
+#   liveness_detail  human-readable string (mirrored into status/log messages)
+#   job_loaded       true|false — launchd job in the table but with no live pid
+#                    (feeds the #4232 bounded auto-remediation gate)
+#   launchd_service  <domain>/<label> for the launchd path (else empty)
+# Factored out (#4331) so the no-marker state-mismatch check below and the
+# marker-present path below run the IDENTICAL liveness logic — they can never
+# diverge on what "alive" means.
+detect_daemon_liveness() {
+    daemon_alive=false
+    liveness_detail=""
+    job_loaded=false
+    launchd_service=""
+    if [[ "$USE_LAUNCHD" == "true" ]] && command -v launchctl >/dev/null 2>&1; then
+        # Resolve the domain (gui/<uid> ↦ user/<uid>, #4130) the same way the
+        # start did, so a headless daemon in user/<uid> is probed correctly.
+        launchd_service="$(resolve_launchd_domain)/${LABEL}"
+        launchd_print_output="$(launchctl print "$launchd_service" 2>/dev/null)"
+        launchd_print_rc=$?
+        launchd_pid="$(printf '%s\n' "$launchd_print_output" | awk -F'= ' '/^[[:space:]]*pid = /{gsub(/[^0-9]/, "", $2); print $2; exit}')"
+        if [[ -n "$launchd_pid" ]] && kill -0 "$launchd_pid" 2>/dev/null; then
+            daemon_alive=true
+            liveness_detail="launchd job $launchd_service alive (pid $launchd_pid)"
+        elif [[ "$launchd_print_rc" -eq 0 ]]; then
+            job_loaded=true
+            liveness_detail="launchd job $launchd_service is LOADED but NOT running (no live pid)"
+        else
+            liveness_detail="launchd job $launchd_service is not loaded/alive"
+        fi
+    else
+        # Non-launchd (nohup / Linux) path: the pid file is the only signal.
+        if [[ -n "$PID_FILE" && -f "$PID_FILE" ]]; then
+            pid="$(cat "$PID_FILE" 2>/dev/null || true)"
+            if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+                daemon_alive=true
+                liveness_detail="pid $pid (from $PID_FILE) alive"
+            else
+                liveness_detail="pid file $PID_FILE present but pid not alive"
+            fi
+        else
+            liveness_detail="no live pid file at ${PID_FILE:-<none>}"
+        fi
+    fi
+}
+
 # ---------- 1. intent: is a daemon expected at all? ----------
 if [[ ! -f "$MARKER" ]]; then
-    # No marker ⇒ the daemon was deliberately stopped (or never started). This
-    # is the load-bearing quiet case: a detector that pages on an intentional
-    # stop gets muted by the operator and is worthless.
+    # A missing marker is SUPPOSED to mean "deliberately stopped (or never
+    # started) — nothing to check". But the marker can go absent while a
+    # supervised daemon is very much alive: an out-of-band delete, a failed
+    # marker write, or a daemon rolled ONLY via `loom-daemon restart` / the
+    # self-update loop (neither re-writes the marker — #4331). In that state the
+    # daemon runs with crash protection DISARMED, and a bare `[OK] nothing to
+    # check` hides exactly the gap the watchdog exists to surface. So before
+    # staying quiet, cheaply probe reality with env-derived defaults.
+    USE_LAUNCHD=true
+    if [[ "${LOOM_DAEMON_LAUNCHD:-}" =~ ^(0|false|no)$ ]]; then
+        USE_LAUNCHD=false
+    fi
+    [[ "$(uname -s)" == "Darwin" ]] || USE_LAUNCHD=false
+    LABEL="${LOOM_LAUNCHD_LABEL:-com.rjwalters.loom-daemon}"
+    PID_FILE="$LOOM_DIR/.daemon.pid"
+    detect_daemon_liveness
+    if [[ "$daemon_alive" == "true" ]]; then
+        report WARN \
+            "STATE MISMATCH: no autonomy-desired marker at $MARKER, but a daemon IS running (${liveness_detail}). Crash protection is DISARMED — if this daemon dies the watchdog will NOT revive it. Heal it by restarting the daemon (it self-heals the marker at startup, #4331) or re-running ./.loom/scripts/cli/loom-daemon-start.sh; if the daemon should NOT be running, stop it with ./.loom/scripts/cli/loom-daemon-stop.sh."
+        exit 1
+    fi
+    # Nothing alive ⇒ the load-bearing quiet case: a deliberate stop (which also
+    # boots out the daemon job, so nothing is found here) must never page.
+    # Preserve the silent OK exactly as before.
     report OK "no autonomy-desired marker at $MARKER — no daemon expected; nothing to check."
     exit 0
 fi
@@ -181,46 +251,14 @@ fi
 LABEL="${LOOM_LAUNCHD_LABEL:-${MARKER_LABEL:-com.rjwalters.loom-daemon}}"
 
 # ---------- 2. reality: is the expected daemon actually alive? ----------
-daemon_alive=false
-liveness_detail=""
-# job_loaded / launchd_service feed the #4232 bounded auto-remediation gate
-# below: job_loaded=true means `launchctl print` succeeded (the job IS in
-# launchd's table) even though no live pid was found — distinct from "not
-# loaded at all" (a booted-out job, or a non-launchd host), which stays
-# report-only no matter what.
-job_loaded=false
-launchd_service=""
-if [[ "$USE_LAUNCHD" == "true" ]] && command -v launchctl >/dev/null 2>&1; then
-    # Resolve the domain (gui/<uid> ↦ user/<uid>, #4130) the same way the start
-    # did, so a headless daemon in user/<uid> is probed correctly rather than
-    # always looked up under gui/<uid> (which would false-report divergence).
-    launchd_service="$(resolve_launchd_domain)/${LABEL}"
-    launchd_print_output="$(launchctl print "$launchd_service" 2>/dev/null)"
-    launchd_print_rc=$?
-    launchd_pid="$(printf '%s\n' "$launchd_print_output" | awk -F'= ' '/^[[:space:]]*pid = /{gsub(/[^0-9]/, "", $2); print $2; exit}')"
-    if [[ -n "$launchd_pid" ]] && kill -0 "$launchd_pid" 2>/dev/null; then
-        daemon_alive=true
-        liveness_detail="launchd job $launchd_service alive (pid $launchd_pid)"
-    elif [[ "$launchd_print_rc" -eq 0 ]]; then
-        job_loaded=true
-        liveness_detail="launchd job $launchd_service is LOADED but NOT running (no live pid)"
-    else
-        liveness_detail="launchd job $launchd_service is not loaded/alive"
-    fi
-else
-    # Non-launchd (nohup / Linux) path: the pid file is the only liveness signal.
-    if [[ -n "$PID_FILE" && -f "$PID_FILE" ]]; then
-        pid="$(cat "$PID_FILE" 2>/dev/null || true)"
-        if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
-            daemon_alive=true
-            liveness_detail="pid $pid (from $PID_FILE) alive"
-        else
-            liveness_detail="pid file $PID_FILE present but pid not alive"
-        fi
-    else
-        liveness_detail="no live pid file at ${PID_FILE:-<none>}"
-    fi
-fi
+# Shared probe (#4331): sets daemon_alive / liveness_detail / job_loaded /
+# launchd_service from the resolved USE_LAUNCHD / LABEL / PID_FILE. job_loaded /
+# launchd_service feed the #4232 bounded auto-remediation gate below:
+# job_loaded=true means `launchctl print` succeeded (the job IS in launchd's
+# table) even though no live pid was found — distinct from "not loaded at all"
+# (a booted-out job, or a non-launchd host), which stays report-only no matter
+# what.
+detect_daemon_liveness
 
 if [[ "$daemon_alive" != "true" ]]; then
     # ---------- bounded auto-remediation (#4232) ----------
