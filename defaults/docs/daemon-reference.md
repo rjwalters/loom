@@ -515,8 +515,52 @@ supplied secret is `StepStdin { secret: true }`, redacted in dry-run output and
 `--dry-run` prints the full ordered plan without contacting the host. On a
 successful run each worker is recorded (dedup on the SSH alias) in a machine-level
 **fleet registry** at `~/.loom/fleet.json` (`LOOM_FLEET_PATH` override) — the
-inventory the siblings `fleet status` (#4342) and `fleet drain` (#4343) will
+inventory the siblings `fleet status` (#4342) and `fleet drain` (#4343)
 enumerate. A re-run is idempotent: each step's `check` reports it `unchanged`.
+The registry's `WorkerRecord` also carries the canonical roster fields an
+operator otherwise tracks by hand: `provider_instance_id`, `tailnet_name`,
+`added_by`, and a lifecycle `state` (`fleet drain`'s `"draining"` sentinel,
+#4343) — all `#[serde(default)]`/`Option`, so an older registry file keeps
+parsing.
+
+### `fleet status [--json]` (#4342)
+
+Aggregates sweep/token/health state across **every** fleet host, side by side,
+in one command — the roster + SSH-fanout + merge/render layer over the status
+IPC `loom-daemon status --json` already provides (#4069); no new status wire
+format was needed.
+
+- **Local host**: always included as its own row (`local`), collected
+  in-process over the daemon's own Unix socket — never `ssh localhost`.
+- **Remote hosts**: enumerated from the fleet registry, collected **concurrently**
+  over `ssh -o BatchMode=yes -o ConnectTimeout=<N> <host> 'loom-daemon status
+  --json'`, each bounded by a per-host `tokio::time::timeout` (default 8s) so one
+  hung host cannot stall the report.
+- **Per-host state** (loud and distinct — silence must never read as idle):
+  - `UP` — the host answered with a well-formed status payload.
+  - `DAEMON DOWN` — the host answered, but its own daemon reports the #4069
+    unreachable-daemon payload (still valid JSON, carries an `error` key).
+  - `UNREACHABLE` — SSH/connect failure, or the per-host timeout elapsed.
+  - `PARSE ERROR` — the payload could not be parsed as JSON at all (severe
+    version skew). Parsing is otherwise **lenient**: the remote payload is kept
+    as a raw JSON value, so an older/newer remote binary's reduced/extended
+    field set renders missing columns as `–` rather than failing the row.
+  - `DRAINING` — the registry's `state: "draining"` (written by `fleet drain`'s
+    first phase, #4343): rendered distinctly, without an SSH probe at all (a
+    control-plane fact, not a liveness one) — an interrupted drain stays
+    visible rather than looking like a parse error.
+- **`safehoused` presence**: a cheap best-effort probe (socket / `pgrep`);
+  degrades to `unknown` rather than erroring the row.
+- **Empty roster**: never renders as empty output — prints an explicit "no
+  fleet workers registered" notice alongside the local host's row.
+- **Exit code**: `0` only when every roster host is `UP`; non-zero otherwise
+  (a monitor/CI check should treat any non-zero exit as "go look").
+- **`--json`** schema: `{ "hosts": [ { "alias", "state", "tailnet_name"?,
+  "provider_instance_id"?, "added_by"?, "is_local", "workspaces", "status"?,
+  "detail"?, "safehoused" } ], "summary": { "total", "up", "daemon_down",
+  "unreachable", "parse_error", "draining", "empty_roster" } }` — treat this as
+  a consumed interface (the #4329 dashboard's multi-host phase reads it over
+  the tailnet).
 
 ## Token pool provisioning for managed repos (#3938)
 

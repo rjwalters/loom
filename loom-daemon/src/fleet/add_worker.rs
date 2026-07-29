@@ -407,6 +407,15 @@ pub fn run(config: &AddWorkerConfig) -> Result<()> {
                     "verify step did not confirm".to_string()
                 },
             }),
+            // #4342's extended roster fields (provider/instance id, tailnet
+            // name, added-by) are not yet collected by `add-worker` — left
+            // absent here rather than guessed; `fleet status` renders them as
+            // "–" until a future pass wires them (e.g. from `--tailnet-name`/
+            // `--provider-instance-id` flags or a cloud-metadata probe).
+            provider_instance_id: None,
+            tailnet_name: None,
+            added_by: None,
+            state: None,
         };
         let path = default_fleet_registry_path()?;
         let mut registry = FleetRegistry::load(&path)?;
