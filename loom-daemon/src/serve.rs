@@ -344,6 +344,9 @@ mod tests {
             main_health_gate_not_evaluated_reason: None,
             main_health_gate_enabled: None,
             main_health_gate_verdict_at: None,
+            main_health_gate_deferred: false,
+            main_health_gate_deferred_reason: None,
+            main_health_gate_verdict_tier: None,
             capacity: CapacityReport {
                 ranking_present: false,
                 total_accounts: 0,
