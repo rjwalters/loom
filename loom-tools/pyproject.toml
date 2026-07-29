@@ -67,7 +67,6 @@ loom-backlog = "loom_tools.backlog:main"
 # backs backlog/clean/daemon_cleanup/daemon_diagnostic/forge_snapshot/
 # orphan_recovery/stuck_detection.
 loom-tokens = "loom_tools.tokens.cli:main"
-loom-state-machine = "loom_tools.state_machine:main"
 loom-resolve-model = "loom_tools.model_tiers:main"
 loom-search = "loom_tools.semantic_search:main"
 

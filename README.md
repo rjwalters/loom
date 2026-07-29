@@ -70,20 +70,20 @@ See [WORKFLOWS.md](docs/workflows.md) for complete label documentation.
 
 ## Loom State Machine
 
-Loom coordinates its agents entirely through labels. The full label graph — four
-lanes (issue, PR, proposal, epic supervisor), the role that fires each edge, and
-the epic fork-join barriers — is modeled as an **executable specification** in
-[`loom-tools/src/loom_tools/state_machine.py`](loom-tools/src/loom_tools/state_machine.py).
-A CI test (`loom-tools/tests/test_state_machine.py`) validates the graph for
-reachability, dead-ends, label conflation, autonomy gaps, and barrier hygiene,
-and keeps the diagram below in sync with the model.
+Loom coordinates its agents entirely through labels. The full label graph below
+— four lanes (issue, PR, proposal, epic supervisor), the role that fires each
+edge, and the epic fork-join barriers — is hand-maintained documentation kept
+in sync with the code by reviewers, not regenerated from a model.
 
-The five `epic:*` states are **derived** — they all ride the single `loom:epic`
-label and are computed by the daemon-native epic supervisor, so no new labels
-are minted. Edges marked "creates issues" are the ones the #3707 issue-filing
-mutex must serialize.
-
-> Regenerate this diagram with `python -m loom_tools.state_machine --mermaid`.
+The epic-supervisor lane is the one lane with a Rust implementation:
+[`loom-daemon/src/epic_state.rs`](loom-daemon/src/epic_state.rs)'s
+`epic_transition_table()` is authoritative for its five states and five edges,
+and `loom-daemon/tests/epic_state_invariants.rs` asserts its structural
+invariants directly (state count, sole terminal state, edge count, barrier
+hygiene). The five `epic:*` states are **derived** — they all ride the single
+`loom:epic` label and are computed by the daemon-native epic supervisor, so no
+new labels are minted. Edges marked "creates issues" are the ones the #3707
+issue-filing mutex must serialize.
 
 ```mermaid
 stateDiagram-v2

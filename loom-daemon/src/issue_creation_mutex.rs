@@ -3,8 +3,11 @@
 //! Several role transitions run `gh issue create` in a burst: the Architect
 //! files a proposal, the Hermit files a simplification, the Auditor files a
 //! runtime bug, and the Champion decomposes a `loom:epic` into phase issues.
-//! These are the `creates_issues=True` edges in the authoritative Python
-//! state-machine model (`loom-tools/src/loom_tools/state_machine.py`, #3841).
+//! These are the label-graph's `creates_issues=True` edges (#3841); the epic
+//! one is authoritatively defined in `loom-daemon/src/epic_state.rs`'s
+//! `epic_transition_table()` (#4310), while the three proposal-lane edges
+//! (Architect/Hermit/Auditor) are hardcoded here directly — the proposal lane
+//! has no other Rust representation.
 //!
 //! # The #3707 hazard
 //!
@@ -23,24 +26,23 @@
 //! dispatch. Here the guarantee is purely the mutual exclusion and the
 //! enumeration of the transition shapes the mutex must cover.
 //!
-//! # Conformance (`#3707 coverage`)
+//! # Coverage (`#3707 coverage`)
 //!
-//! [`CREATES_ISSUES_TRANSITIONS`] mirrors the model's `creates_issues=True`
-//! edge set 1:1, so the model's `#3707 coverage` validator and this module
-//! stay in lockstep (see the `test_creates_issues_transitions_match_model`
-//! conformance test). Only a transition from that set may be passed to
-//! [`IssueCreationMutex::acquire`].
+//! [`CREATES_ISSUES_TRANSITIONS`] is the authoritative, hand-maintained list of
+//! every `creates_issues=True` edge across all label lanes (see
+//! `test_creates_issues_transitions_are_exhaustive`). Only a transition from
+//! that set may be passed to [`IssueCreationMutex::acquire`].
 
 use std::sync::Arc;
 use tokio::sync::{Mutex, OwnedMutexGuard};
 
-/// An issue-creating (`creates_issues=True`) transition shape from the
-/// authoritative Python state-machine model.
+/// An issue-creating (`creates_issues=True`) transition shape.
 ///
-/// The four fields mirror a model `Transition`'s identifying triple. Instances
-/// are compared structurally, so a caller must pass exactly one of the
-/// [`CREATES_ISSUES_TRANSITIONS`] entries to acquire the mutex — this keeps the
-/// mutex's coverage set pinned to the model's `#3707 coverage` set.
+/// The three fields identify a label-graph edge (source state, destination
+/// state, firing role). Instances are compared structurally, so a caller must
+/// pass exactly one of the [`CREATES_ISSUES_TRANSITIONS`] entries to acquire
+/// the mutex — this keeps the mutex's coverage set pinned to the known
+/// `#3707 coverage` set.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct CreatesIssuesTransition {
     /// Source state id (e.g. `"new"`, `"epic:needs_decomp"`).
@@ -91,9 +93,12 @@ pub const CHAMPION_EPIC_DECOMP: CreatesIssuesTransition = CreatesIssuesTransitio
 
 /// Every `creates_issues=True` transition the #3707 mutex must serialize.
 ///
-/// This is the Rust mirror of the set the Python model's `#3707 coverage`
-/// validator enumerates (`[t for t in transitions if t.creates_issues]`). Keep
-/// it in lockstep with the model — the conformance test asserts the count and
+/// This is the authoritative, hand-maintained enumeration of every
+/// issue-creating label-graph edge — one epic-lane edge (mirroring
+/// `epic_state::epic_transition_table()`'s sole `creates_issues` entry) plus
+/// three proposal-lane edges with no other Rust representation. Keep it
+/// updated whenever a role gains or loses an issue-creating transition — the
+/// `test_creates_issues_transitions_are_exhaustive` test pins the count and
 /// membership.
 pub const CREATES_ISSUES_TRANSITIONS: &[CreatesIssuesTransition] = &[
     ARCHITECT_PROPOSAL,
@@ -240,12 +245,11 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
 
-    // ===== coverage-set conformance =====
+    // ===== coverage-set exhaustiveness =====
 
     #[test]
-    fn test_creates_issues_transitions_match_model() {
-        // The Python model (state_machine.py) marks exactly these four edges
-        // creates_issues=True. Keep the Rust mirror in lockstep.
+    fn test_creates_issues_transitions_are_exhaustive() {
+        // Exactly these four label-graph edges are creates_issues=True.
         assert_eq!(CREATES_ISSUES_TRANSITIONS.len(), 4);
 
         let expected: Vec<(&str, &str, &str)> = vec![

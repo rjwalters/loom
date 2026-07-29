@@ -1256,11 +1256,8 @@ already-visible facts: the number of `### Phase` sections in the epic body, and
 the open/closed status of the epic's `loom:epic-phase` children. The five states
 (implemented as `EpicState` in
 [`loom-daemon/src/epic_state.rs`](https://github.com/rjwalters/loom/blob/main/loom-daemon/src/epic_state.rs)
-(upstream Loom repo — not shipped to consumer installs)) mirror
-the `derived=True` epic lane of the authoritative Python model
-([`loom-tools/src/loom_tools/state_machine.py`](https://github.com/rjwalters/loom/blob/main/loom-tools/src/loom_tools/state_machine.py)
-(upstream Loom repo — not shipped to consumer installs),
-#3841):
+(upstream Loom repo — not shipped to consumer installs)) are the derived
+epic lane (#3841):
 
 | Derived state | Condition | Enabled transition |
 |---------------|-----------|--------------------|
@@ -1295,15 +1292,14 @@ The lane-*entry* edge `new → epic:needs_decomp` (an Architect filing a
 `loom:epic` proposal) is **not** part of the supervisor's table — the supervisor
 begins its lifecycle at `epic:needs_decomp`.
 
-**Conformance.** The Rust transition table is asserted faithful to the Python
-model by
-[`loom-daemon/tests/epic_conformance.rs`](https://github.com/rjwalters/loom/blob/main/loom-daemon/tests/epic_conformance.rs)
-(upstream Loom repo — not shipped to consumer installs),
-which **derives** its expectation by invoking
-`python3 -m loom_tools.state_machine --json` and comparing the emitted epic
-sub-graph (states, edges, roles, barriers, `creates_issues`) against the Rust
-table — rather than hardcoding a mirrored copy that would silently drift. The
-test skips gracefully when `python3` is unavailable.
+**Conformance.** `epic_transition_table()` is itself the authoritative model of
+the epic lane (#4310) — there is no second, independently-maintained
+implementation it is checked against. Its structural invariants (exactly five
+states, `epic:done` the sole terminal state, exactly five intra-lane edges,
+non-empty barriers on every `epic:phase_join` edge) are asserted directly by
+[`loom-daemon/tests/epic_state_invariants.rs`](https://github.com/rjwalters/loom/blob/main/loom-daemon/tests/epic_state_invariants.rs)
+(upstream Loom repo — not shipped to consumer installs), which always runs (no
+skip path).
 
 ### #3707 issue-creation mutex
 

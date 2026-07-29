@@ -14,10 +14,11 @@
 //!
 //! # Conformance
 //!
-//! The authoritative model is `loom-tools/src/loom_tools/state_machine.py`
-//! (#3841). Its epic-supervisor lane routes both phase-boundary edges through
-//! `epic:phase_join`, and each such edge declares a `barrier` (enforced by the
-//! model's `barrier hygiene` validator):
+//! The authoritative model is [`crate::epic_state::epic_transition_table`]
+//! (#4310). Its epic-supervisor lane routes both phase-boundary edges through
+//! `epic:phase_join`, and each such edge declares a non-empty `barrier`
+//! (asserted by `loom-daemon/tests/epic_state_invariants.rs`'s barrier-hygiene
+//! test):
 //!
 //! ```text
 //! epic:phase_join → epic:active  (barrier: "advance: dispatch next phase")
@@ -35,8 +36,8 @@ use crate::epic_state::{EpicState, PhaseChild};
 
 /// The two fork-join phase-boundary transitions the barrier gates.
 ///
-/// Both are fired by the `Supervisor` role from the `epic:phase_join` state in
-/// the Python model; each carries a non-empty `barrier` string there.
+/// Both are fired by the `Supervisor` role from the `epic:phase_join` state;
+/// each carries a non-empty `barrier` string in the transition table.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum PhaseBoundary {
     /// `epic:phase_join → epic:active`: the current phase joined and more
@@ -246,10 +247,10 @@ mod tests {
         assert_eq!(barrier_admits(EpicState::Active, &children), None);
     }
 
-    // ===== boundary-metadata conformance with the Python model =====
+    // ===== boundary-metadata matches epic_transition_table() =====
 
     #[test]
-    fn test_phase_boundary_metadata_matches_model() {
+    fn test_phase_boundary_metadata_matches_transition_table() {
         assert_eq!(PhaseBoundary::AdvanceToNextPhase.dst_state_id(), "epic:active");
         assert_eq!(PhaseBoundary::CloseEpic.dst_state_id(), "epic:done");
         assert_eq!(
