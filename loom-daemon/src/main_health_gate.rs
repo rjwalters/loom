@@ -122,6 +122,34 @@ pub const DEFAULT_SUPPRESS_DISPATCH_DURING_GATE: bool = true;
 /// build volume low.
 pub const DEFAULT_MAIN_HEALTH_GATE_INTERVAL_SECS: u64 = 30;
 
+/// Environment variable naming the tier the gate command should run as (#4259).
+/// The daemon sets this to `fast` when invoking the fast-tier command (see
+/// [`resolve_gate_fast_command`]); `build-gate.sh` reads it. Precedence for the
+/// *decision* to use the fast tier is daemon-side (load); this env var only
+/// carries that decision into the command.
+pub const BUILD_GATE_TIER_ENV: &str = "LOOM_BUILD_GATE_TIER";
+
+/// Environment variable overriding the load-average-per-CPU saturation
+/// threshold for build-gate deferral (#4259). Precedence env > config
+/// (`buildGate.loadThreshold`) > default
+/// ([`crate::cpu_headroom::DEFAULT_GATE_LOAD_THRESHOLD`]).
+pub const BUILD_GATE_LOAD_THRESHOLD_ENV: &str = "LOOM_BUILD_GATE_LOAD_THRESHOLD";
+
+/// Environment variable overriding the bounded max-defer window in seconds
+/// (#4259) — after this many seconds of consecutive load-deferred ticks the
+/// gate runs the FAST tier regardless of load, so a permanently-saturated host
+/// still reaches a verdict. Precedence env > config (`buildGate.maxDeferSeconds`)
+/// > default ([`DEFAULT_GATE_MAX_DEFER_SECS`]).
+pub const BUILD_GATE_MAX_DEFER_ENV: &str = "LOOM_BUILD_GATE_MAX_DEFER_SECS";
+
+/// Default bounded max-defer window (#4259): 30 minutes. Deferral must be
+/// bounded — an unbounded defer on a host that is *always* at cap (the #4259
+/// reproduction host runs 6–7 sweeps around the clock) would re-disable the
+/// gate exactly like the 1200s timeout does, only more cheaply. After this
+/// window the fast tier runs regardless of load, guaranteeing a verdict at
+/// least every `DEFAULT_GATE_MAX_DEFER_SECS`.
+pub const DEFAULT_GATE_MAX_DEFER_SECS: u64 = 1800;
+
 /// Default `buildGate.timeoutSeconds` when the config omits it (matches the
 /// #3749 schema example).
 pub const DEFAULT_BUILD_GATE_TIMEOUT_SECS: u64 = 600;
@@ -209,6 +237,32 @@ pub struct MainHealthState {
     /// out under 2 concurrent sweeps (#4073 was necessary, not sufficient).
     /// `false` for a fresh state and whenever no gate run is executing.
     gate_in_flight: AtomicBool,
+    /// The current load-deferral streak (#4259), or `None` when the gate is not
+    /// deferring. A deferred tick is a *scheduling* decision, not an
+    /// evaluation: it never touches `halted`, the SHA memo, or the
+    /// indeterminate backoff. The streak's start (`since_instant`) bounds the
+    /// deferral against `maxDeferSeconds` so a permanently-saturated host still
+    /// reaches a verdict; its wall-clock `since` + `load_ratio` feed the
+    /// `loom-daemon status` `deferred (load …)` line, kept distinct from the
+    /// UNEVALUATED `not evaluated (timeout …)` line.
+    defer: Mutex<Option<DeferState>>,
+    /// The tier of the most recent completed (Green/Red) verdict (#4259), for
+    /// the status/log tier label so a fast-tier Green is never read as a
+    /// full-suite Green. `None` before the first completed run.
+    last_tier: Mutex<Option<GateTier>>,
+}
+
+/// Bookkeeping for the current load-deferral streak (#4259): when it began (a
+/// monotonic [`Instant`] for the max-defer bound and a wall-clock
+/// [`DateTime`](chrono::DateTime) for the status surface), the load-per-core
+/// ratio that triggered it, and the configured bound (so the status summary is
+/// self-contained without re-reading config).
+#[derive(Debug, Clone)]
+struct DeferState {
+    since_instant: Instant,
+    since: DateTime<Utc>,
+    load_ratio: f64,
+    max_defer: Duration,
 }
 
 /// Bookkeeping for #3984: the SHA of the last **determinate** (Green/Red)
@@ -261,7 +315,109 @@ impl MainHealthState {
             gate_memo: Mutex::new(GateMemo::default()),
             last_verdict_at: Mutex::new(None),
             gate_in_flight: AtomicBool::new(false),
+            defer: Mutex::new(None),
+            last_tier: Mutex::new(None),
         }
+    }
+
+    // ===================================================================
+    // Load-aware deferral + tier bookkeeping (#4259)
+    // ===================================================================
+
+    /// Whether the gate is currently deferring for host load (#4259).
+    #[must_use]
+    pub fn is_deferred(&self) -> bool {
+        self.defer
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_some()
+    }
+
+    /// Elapsed time since the current deferral streak began, or `None` when not
+    /// deferring — the bound checked by [`decide_gate_tier`].
+    #[must_use]
+    pub fn defer_streak_elapsed(&self) -> Option<Duration> {
+        self.defer
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .map(|d| d.since_instant.elapsed())
+    }
+
+    /// Wall-clock time the current deferral streak began, or `None`.
+    #[must_use]
+    pub fn deferred_since(&self) -> Option<DateTime<Utc>> {
+        self.defer
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .map(|d| d.since)
+    }
+
+    /// A short human summary of the current deferral for `loom-daemon status`
+    /// (#4259), deliberately distinct from the UNEVALUATED `not evaluated (…)`
+    /// summary. `None` when not deferring.
+    #[must_use]
+    pub fn deferred_summary(&self) -> Option<String> {
+        let guard = self
+            .defer
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let d = guard.as_ref()?;
+        let mins = d.since_instant.elapsed().as_secs() / 60;
+        let bound_mins = d.max_defer.as_secs() / 60;
+        Some(format!(
+            "load {:.2}/core for {mins}m — fast tier runs at the {bound_mins}m bound",
+            d.load_ratio
+        ))
+    }
+
+    /// Record a load-deferral for this tick, starting a new streak if one is not
+    /// already in progress. Returns `true` iff this *started* a new streak (so
+    /// the caller logs the transition exactly once, #4083 visibility). Does NOT
+    /// touch `halted`, the SHA memo, or the backoff — a deferral is a scheduling
+    /// decision, not an evaluation (#4259).
+    pub fn record_gate_deferred(&self, load_ratio: f64, max_defer: Duration) -> bool {
+        let mut guard = self
+            .defer
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if guard.is_some() {
+            return false;
+        }
+        *guard = Some(DeferState {
+            since_instant: Instant::now(),
+            since: Utc::now(),
+            load_ratio,
+            max_defer,
+        });
+        true
+    }
+
+    /// End any deferral streak (the gate is about to run, or load dropped below
+    /// the threshold).
+    pub fn clear_gate_deferred(&self) {
+        *self
+            .defer
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+    }
+
+    /// Record the tier of a just-completed (Green/Red) verdict (#4259).
+    pub fn record_gate_tier(&self, tier: GateTier) {
+        *self
+            .last_tier
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(tier);
+    }
+
+    /// The tier of the most recent completed verdict, or `None` before the first.
+    #[must_use]
+    pub fn gate_last_tier(&self) -> Option<GateTier> {
+        *self
+            .last_tier
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     /// Whether autonomous dispatch is currently halted.
@@ -559,6 +715,39 @@ impl WorkspaceHealthStates {
         map.get(root).and_then(|s| s.unevaluated_summary())
     }
 
+    /// Whether `root`'s most recent gate tick deferred for host load (#4259). A
+    /// never-seen root reports `false`.
+    #[must_use]
+    pub fn is_deferred(&self, root: &Path) -> bool {
+        let map = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        map.get(root).is_some_and(|s| s.is_deferred())
+    }
+
+    /// A short `load …` summary of `root`'s current load-deferral (#4259), or
+    /// `None` when it is not deferring (or has never been gated). Rendered by
+    /// the daemon-status surface distinctly from the UNEVALUATED reason.
+    #[must_use]
+    pub fn deferred_summary(&self, root: &Path) -> Option<String> {
+        let map = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        map.get(root).and_then(|s| s.deferred_summary())
+    }
+
+    /// The tier of `root`'s most recent completed verdict (#4259), or `None`.
+    #[must_use]
+    pub fn gate_last_tier(&self, root: &Path) -> Option<GateTier> {
+        let map = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        map.get(root).and_then(|s| s.gate_last_tier())
+    }
+
     /// Wall-clock time of `root`'s most recent completed gate verdict
     /// (#4012), or `None` when it has never produced one this process (or the
     /// root has never been seen — deliberately the same "pending" reading as
@@ -674,6 +863,155 @@ pub fn read_build_gate_config(repo_root: &Path) -> Option<BuildGateConfig> {
         timeout: Duration::from_secs(timeout_secs),
         real_change_globs,
     })
+}
+
+// ============================================================================
+// Tiered gate + load-aware deferral (#4259)
+// ============================================================================
+
+/// Which stage set a gate run executed (#4259). The daemon selects the tier by
+/// host load in [`run_gate_tick`]; the label rides on the verdict so a fast-tier
+/// Green is never mistaken for a full-suite Green.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GateTier {
+    /// The full `buildGate.command` (every stage). The default, and the only
+    /// tier the single-workspace loop and CI ever use.
+    Full,
+    /// The cheap compile+smoke subset (`LOOM_BUILD_GATE_TIER=fast`), run when
+    /// the host is saturated past the max-defer bound so a permanently-loaded
+    /// host still gets a real — if narrower — verdict.
+    Fast,
+}
+
+impl GateTier {
+    /// A short, stable label for logs / status (`"full"` / `"fast"`).
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Full => "full",
+            Self::Fast => "fast",
+        }
+    }
+
+    /// A parenthetical verdict suffix — empty for the full tier so the default
+    /// rendering is byte-for-byte unchanged, `" (fast tier)"` for the fast tier.
+    #[must_use]
+    pub fn verdict_suffix(self) -> &'static str {
+        match self {
+            Self::Full => "",
+            Self::Fast => " (fast tier)",
+        }
+    }
+}
+
+/// The scheduling / tier decision for one gate tick under current host load
+/// (#4259). Pure output of [`decide_gate_tier`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GateTierDecision {
+    /// Run the full command this tick.
+    Full,
+    /// Defer — the host is saturated and the max-defer window has not elapsed.
+    /// No command runs; a deferral is NOT an evaluation (no SHA memo, no
+    /// indeterminate backoff).
+    Defer,
+    /// Run the fast tier — the host is saturated but the max-defer window HAS
+    /// elapsed, so a narrower verdict is produced rather than deferring forever.
+    Fast,
+}
+
+/// Decide the tier for one gate tick (#4259) — pure and fully unit-testable.
+///
+/// - `saturated == None` (no load data) ⇒ [`GateTierDecision::Full`]: fail safe,
+///   run the gate; never defer on absent evidence.
+/// - `saturated == Some(false)` (load below threshold) ⇒ [`GateTierDecision::Full`].
+/// - `saturated == Some(true)` ⇒ [`GateTierDecision::Defer`], UNLESS the gate has
+///   already been deferring for `>= max_defer` (`defer_streak_elapsed`), in which
+///   case [`GateTierDecision::Fast`] runs so a permanently-loaded host still
+///   reaches a verdict within the bound.
+#[must_use]
+pub fn decide_gate_tier(
+    saturated: Option<bool>,
+    defer_streak_elapsed: Option<Duration>,
+    max_defer: Duration,
+) -> GateTierDecision {
+    match saturated {
+        None | Some(false) => GateTierDecision::Full,
+        Some(true) => match defer_streak_elapsed {
+            Some(elapsed) if elapsed >= max_defer => GateTierDecision::Fast,
+            _ => GateTierDecision::Defer,
+        },
+    }
+}
+
+/// Env override for [`BUILD_GATE_LOAD_THRESHOLD_ENV`] — `None` unless set to a
+/// parseable value `> 0`.
+fn env_gate_load_threshold() -> Option<f64> {
+    std::env::var(BUILD_GATE_LOAD_THRESHOLD_ENV)
+        .ok()
+        .and_then(|v| v.trim().parse::<f64>().ok())
+        .filter(|f| *f > 0.0)
+}
+
+/// `buildGate.loadThreshold` from config, filtered to `> 0`.
+fn config_gate_load_threshold(repo_root: &Path) -> Option<f64> {
+    let effective = crate::config_resolver::resolve_effective_config(repo_root);
+    crate::config_resolver::get_path(&effective, "buildGate")?
+        .get("loadThreshold")
+        .and_then(serde_json::Value::as_f64)
+        .filter(|f| *f > 0.0)
+}
+
+/// Resolve the saturation threshold with precedence **env > config > default**
+/// (#4259), mirroring the cpu_headroom knob resolution shape.
+#[must_use]
+pub fn resolve_gate_load_threshold(repo_root: &Path) -> f64 {
+    env_gate_load_threshold()
+        .or_else(|| config_gate_load_threshold(repo_root))
+        .unwrap_or(crate::cpu_headroom::DEFAULT_GATE_LOAD_THRESHOLD)
+}
+
+/// Env override for [`BUILD_GATE_MAX_DEFER_ENV`] — `None` unless set to a
+/// parseable value `> 0`.
+fn env_gate_max_defer_secs() -> Option<u64> {
+    std::env::var(BUILD_GATE_MAX_DEFER_ENV)
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|&s| s > 0)
+}
+
+/// `buildGate.maxDeferSeconds` from config, filtered to `> 0`.
+fn config_gate_max_defer_secs(repo_root: &Path) -> Option<u64> {
+    let effective = crate::config_resolver::resolve_effective_config(repo_root);
+    crate::config_resolver::get_path(&effective, "buildGate")?
+        .get("maxDeferSeconds")
+        .and_then(serde_json::Value::as_u64)
+        .filter(|&s| s > 0)
+}
+
+/// Resolve the bounded max-defer window with precedence **env > config >
+/// default** (#4259).
+#[must_use]
+pub fn resolve_gate_max_defer(repo_root: &Path) -> Duration {
+    Duration::from_secs(
+        env_gate_max_defer_secs()
+            .or_else(|| config_gate_max_defer_secs(repo_root))
+            .unwrap_or(DEFAULT_GATE_MAX_DEFER_SECS),
+    )
+}
+
+/// The fast-tier command (#4259): `buildGate.fastCommand` when configured, else
+/// the base command with `LOOM_BUILD_GATE_TIER=fast` prefixed (which the shipped
+/// `build-gate.sh` honors). Running via `sh -c` means the env-prefix form is a
+/// valid shell command, so no separate config key is required for the shipped
+/// wrapper.
+#[must_use]
+pub fn resolve_gate_fast_command(repo_root: &Path, base_command: &str) -> String {
+    let effective = crate::config_resolver::resolve_effective_config(repo_root);
+    crate::config_resolver::get_path(&effective, "buildGate")
+        .and_then(|g| g.get("fastCommand").and_then(serde_json::Value::as_str))
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map_or_else(|| format!("{BUILD_GATE_TIER_ENV}=fast {base_command}"), str::to_string)
 }
 
 // ============================================================================
@@ -1540,10 +1878,66 @@ pub fn run_gate_tick(
         }
     }
 
-    let mut runner = CommandGateRunner::new(config.clone(), repo_root.to_path_buf());
+    // Tier / load-deferral decision (#4259). Reuse the cpu_headroom load probe
+    // (single read) so the gate and any load-aware dispatch agree on
+    // "saturated"; fail safe — missing load data runs the full tier, never
+    // defers. A deferred tick does NOT run the command, does NOT record the SHA
+    // (main still needs evaluating), and does NOT arm the indeterminate backoff
+    // (deferral is a scheduling decision, not an indeterminate outcome).
+    let threshold = resolve_gate_load_threshold(repo_root);
+    let max_defer = resolve_gate_max_defer(repo_root);
+    let ncpu = crate::cpu_headroom::logical_cpu_count();
+    let loadavg = crate::cpu_headroom::read_loadavg_1m();
+    let saturated = crate::cpu_headroom::is_host_saturated(loadavg, ncpu, threshold);
+    let tier = match decide_gate_tier(saturated, state.defer_streak_elapsed(), max_defer) {
+        GateTierDecision::Defer => {
+            let ratio = crate::cpu_headroom::load_per_core_from(loadavg, ncpu).unwrap_or(0.0);
+            if state.record_gate_deferred(ratio, max_defer) {
+                log::info!(
+                    "main_health_gate: {} DEFERRING gate run — host saturated (load {ratio:.2}/core ≥ {threshold:.2}); \
+                     will run the FAST tier if still saturated at the {}m bound (NOT a verdict about main; dispatch unaffected)",
+                    repo_root.display(),
+                    max_defer.as_secs() / 60
+                );
+            } else {
+                log::debug!(
+                    "main_health_gate: {} still deferring gate run (host saturated, load {ratio:.2}/core)",
+                    repo_root.display()
+                );
+            }
+            // Clearing the UNEVALUATED flag makes status read "deferred (load …)"
+            // rather than a stale "not evaluated (timeout …)" from a prior tick.
+            state.note_gate_tick(None, SKIP_WARN_THROTTLE);
+            return None;
+        }
+        GateTierDecision::Full => GateTier::Full,
+        GateTierDecision::Fast => {
+            log::info!(
+                "main_health_gate: {} running FAST tier — host has been saturated past the {}m max-defer bound; \
+                 a fast-tier verdict is narrower than a full-suite verdict (#4259)",
+                repo_root.display(),
+                max_defer.as_secs() / 60
+            );
+            GateTier::Fast
+        }
+    };
+    // Not deferring this tick — end any prior streak so status stops reading
+    // "deferred".
+    state.clear_gate_deferred();
+
+    // Select the command for the chosen tier (fast tier prefixes
+    // `LOOM_BUILD_GATE_TIER=fast`, or uses `buildGate.fastCommand`).
+    let mut run_config = config.clone();
+    if tier == GateTier::Fast {
+        run_config.command = resolve_gate_fast_command(repo_root, &config.command);
+    }
+    let mut runner = CommandGateRunner::new(run_config, repo_root.to_path_buf());
     let outcome = runner.run_gate();
     match &outcome {
         GateOutcome::Green { .. } | GateOutcome::Red { .. } => {
+            // Record which tier produced this verdict so the status/log tier
+            // label distinguishes a fast-tier Green from a full-suite Green.
+            state.record_gate_tier(tier);
             // Prefer the cheaply-resolved SHA; fall back to the workspace's
             // post-sync HEAD (the runner itself resolves this internally for
             // forge-CI corroboration, but does not expose it — re-deriving it
@@ -2670,10 +3064,12 @@ pub fn spawn_multi_main_health_gate_task(
                         });
                     }
                     Ok(None) => {
-                        // Skipped this tick (#3984: backoff, or no real
-                        // change since the last determinate evaluation) —
-                        // the halt flag is left exactly as it was, so there
-                        // is nothing to log as a transition.
+                        // Skipped this tick (#3984: backoff, or no real change
+                        // since the last determinate evaluation; or #4259: a
+                        // load-deferral) — the halt flag is left exactly as it
+                        // was, so there is nothing to apply here. `run_gate_tick`
+                        // already logged the reason and updated the deferral /
+                        // status state the status surface reads.
                     }
                     Err(e) => {
                         // The blocking task panicked; clear this repo's halt so a
@@ -3114,6 +3510,233 @@ mod tests {
         assert!(!states.is_gate_in_flight(sibling));
         states.get_or_create(root).set_gate_in_flight(false);
         assert!(!states.is_gate_in_flight(root));
+    }
+
+    // ===================================================================
+    // Tiered gate + load-aware deferral (#4259)
+    // ===================================================================
+
+    #[test]
+    fn decide_gate_tier_runs_full_below_threshold() {
+        // Load below the saturation threshold ⇒ full tier, regardless of any
+        // (nonexistent) defer streak.
+        assert_eq!(
+            decide_gate_tier(Some(false), None, Duration::from_secs(1800)),
+            GateTierDecision::Full
+        );
+    }
+
+    #[test]
+    fn decide_gate_tier_missing_load_data_runs_full_fail_safe() {
+        // No load reading ⇒ run the full tier (fail safe); NEVER defer on absent
+        // evidence. Even a long-running (stale) defer streak cannot force a defer
+        // here — missing data always runs.
+        assert_eq!(decide_gate_tier(None, None, Duration::from_secs(1800)), GateTierDecision::Full);
+        assert_eq!(
+            decide_gate_tier(None, Some(Duration::from_secs(9999)), Duration::from_secs(1800)),
+            GateTierDecision::Full
+        );
+    }
+
+    #[test]
+    fn decide_gate_tier_saturated_defers_within_the_bound() {
+        // Saturated, not yet deferring (None) ⇒ defer (start the streak).
+        assert_eq!(
+            decide_gate_tier(Some(true), None, Duration::from_secs(1800)),
+            GateTierDecision::Defer
+        );
+        // Saturated, deferring but still under the bound ⇒ keep deferring.
+        assert_eq!(
+            decide_gate_tier(Some(true), Some(Duration::from_secs(600)), Duration::from_secs(1800)),
+            GateTierDecision::Defer
+        );
+    }
+
+    #[test]
+    fn decide_gate_tier_saturated_past_the_bound_runs_fast() {
+        // Saturated and the defer streak has reached the bound ⇒ FAST tier runs
+        // regardless of load (the AC2 guarantee under permanent load).
+        assert_eq!(
+            decide_gate_tier(
+                Some(true),
+                Some(Duration::from_secs(1800)),
+                Duration::from_secs(1800)
+            ),
+            GateTierDecision::Fast
+        );
+        assert_eq!(
+            decide_gate_tier(
+                Some(true),
+                Some(Duration::from_secs(3600)),
+                Duration::from_secs(1800)
+            ),
+            GateTierDecision::Fast
+        );
+    }
+
+    #[test]
+    fn record_gate_deferred_starts_streak_and_is_not_an_evaluation() {
+        let state = MainHealthState::new();
+        assert!(!state.is_deferred());
+        assert_eq!(state.defer_streak_elapsed(), None);
+
+        // First defer starts the streak (returns true → caller logs once).
+        assert!(state.record_gate_deferred(1.05, Duration::from_secs(1800)));
+        assert!(state.is_deferred());
+        assert!(state.defer_streak_elapsed().is_some());
+        assert!(state.deferred_since().is_some());
+        assert!(state.deferred_summary().is_some());
+
+        // A deferral must NOT be recorded as an evaluation: no SHA memo advance,
+        // no indeterminate backoff armed (#4259).
+        assert_eq!(state.gate_last_evaluated_sha(), None);
+        assert!(!state.gate_backoff_active(Instant::now()));
+
+        // A second defer does NOT restart the streak (returns false → no
+        // duplicate log line).
+        assert!(!state.record_gate_deferred(1.10, Duration::from_secs(1800)));
+        assert!(state.is_deferred());
+    }
+
+    #[test]
+    fn clear_gate_deferred_ends_the_streak() {
+        let state = MainHealthState::new();
+        state.record_gate_deferred(1.05, Duration::from_secs(1800));
+        assert!(state.is_deferred());
+        state.clear_gate_deferred();
+        assert!(!state.is_deferred());
+        assert_eq!(state.defer_streak_elapsed(), None);
+        assert_eq!(state.deferred_summary(), None);
+    }
+
+    #[test]
+    fn deferred_summary_is_distinct_from_unevaluated_summary() {
+        let state = MainHealthState::new();
+        // A timeout UNEVALUATED tick populates the not-evaluated summary...
+        assert!(state.note_gate_tick(
+            Some((UnevaluatedClass::Timeout, "gate command timed out after 1200s")),
+            SKIP_WARN_THROTTLE,
+        ));
+        let uneval = state.unevaluated_summary().unwrap();
+        assert!(uneval.contains("timeout"), "got: {uneval}");
+
+        // ...a deferral populates a separate summary that reads about load, not
+        // a timeout — the two are never confused on the status surface.
+        state.record_gate_deferred(1.05, Duration::from_secs(1800));
+        let deferred = state.deferred_summary().unwrap();
+        assert!(deferred.contains("load"), "got: {deferred}");
+        assert!(!deferred.contains("timeout"), "got: {deferred}");
+        assert_ne!(uneval, deferred);
+    }
+
+    #[test]
+    fn record_gate_tier_tracks_last_verdict_tier() {
+        let state = MainHealthState::new();
+        assert_eq!(state.gate_last_tier(), None);
+        state.record_gate_tier(GateTier::Fast);
+        assert_eq!(state.gate_last_tier(), Some(GateTier::Fast));
+        state.record_gate_tier(GateTier::Full);
+        assert_eq!(state.gate_last_tier(), Some(GateTier::Full));
+    }
+
+    #[test]
+    fn gate_tier_labels_and_suffixes() {
+        assert_eq!(GateTier::Full.label(), "full");
+        assert_eq!(GateTier::Fast.label(), "fast");
+        // The full tier's suffix is empty so full-tier rendering is unchanged;
+        // the fast tier is explicitly marked so it is never mistaken for a
+        // full-suite verdict.
+        assert_eq!(GateTier::Full.verdict_suffix(), "");
+        assert_eq!(GateTier::Fast.verdict_suffix(), " (fast tier)");
+    }
+
+    #[test]
+    fn workspace_health_states_defer_and_tier_passthrough() {
+        let states = WorkspaceHealthStates::new();
+        let root = Path::new("/tmp/repo-defer");
+        // Never-seen root: not deferring, no summary, no tier.
+        assert!(!states.is_deferred(root));
+        assert_eq!(states.deferred_summary(root), None);
+        assert_eq!(states.gate_last_tier(root), None);
+
+        states
+            .get_or_create(root)
+            .record_gate_deferred(1.2, Duration::from_secs(1800));
+        states.get_or_create(root).record_gate_tier(GateTier::Fast);
+        assert!(states.is_deferred(root));
+        assert!(states.deferred_summary(root).is_some());
+        assert_eq!(states.gate_last_tier(root), Some(GateTier::Fast));
+
+        // Sibling isolation (#3930).
+        let sibling = Path::new("/tmp/repo-defer-b");
+        assert!(!states.is_deferred(sibling));
+        assert_eq!(states.gate_last_tier(sibling), None);
+    }
+
+    #[test]
+    #[serial]
+    fn resolve_gate_load_threshold_precedence() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::env::remove_var(BUILD_GATE_LOAD_THRESHOLD_ENV);
+        // No env, no config key ⇒ default.
+        write_config(tmp.path(), r#"{"buildGate": {"enabled": true, "command": "true"}}"#);
+        assert!(
+            (resolve_gate_load_threshold(tmp.path())
+                - crate::cpu_headroom::DEFAULT_GATE_LOAD_THRESHOLD)
+                .abs()
+                < f64::EPSILON
+        );
+        // Config value honored.
+        write_config(
+            tmp.path(),
+            r#"{"buildGate": {"enabled": true, "command": "true", "loadThreshold": 1.5}}"#,
+        );
+        assert!((resolve_gate_load_threshold(tmp.path()) - 1.5).abs() < f64::EPSILON);
+        // Env wins over config.
+        std::env::set_var(BUILD_GATE_LOAD_THRESHOLD_ENV, "0.6");
+        assert!((resolve_gate_load_threshold(tmp.path()) - 0.6).abs() < f64::EPSILON);
+        std::env::remove_var(BUILD_GATE_LOAD_THRESHOLD_ENV);
+    }
+
+    #[test]
+    #[serial]
+    fn resolve_gate_max_defer_precedence() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::env::remove_var(BUILD_GATE_MAX_DEFER_ENV);
+        write_config(tmp.path(), r#"{"buildGate": {"enabled": true, "command": "true"}}"#);
+        assert_eq!(
+            resolve_gate_max_defer(tmp.path()),
+            Duration::from_secs(DEFAULT_GATE_MAX_DEFER_SECS)
+        );
+        write_config(
+            tmp.path(),
+            r#"{"buildGate": {"enabled": true, "command": "true", "maxDeferSeconds": 900}}"#,
+        );
+        assert_eq!(resolve_gate_max_defer(tmp.path()), Duration::from_secs(900));
+        std::env::set_var(BUILD_GATE_MAX_DEFER_ENV, "120");
+        assert_eq!(resolve_gate_max_defer(tmp.path()), Duration::from_secs(120));
+        std::env::remove_var(BUILD_GATE_MAX_DEFER_ENV);
+    }
+
+    #[test]
+    fn resolve_gate_fast_command_defaults_to_env_prefixed_base() {
+        let tmp = tempfile::tempdir().unwrap();
+        // No `fastCommand` ⇒ prefix the base command with the tier env var so
+        // the shipped build-gate.sh runs its fast tier.
+        write_config(
+            tmp.path(),
+            r#"{"buildGate": {"enabled": true, "command": "bash .loom/scripts/build-gate.sh"}}"#,
+        );
+        assert_eq!(
+            resolve_gate_fast_command(tmp.path(), "bash .loom/scripts/build-gate.sh"),
+            "LOOM_BUILD_GATE_TIER=fast bash .loom/scripts/build-gate.sh"
+        );
+        // An explicit `fastCommand` overrides the derived form.
+        write_config(
+            tmp.path(),
+            r#"{"buildGate": {"enabled": true, "command": "x", "fastCommand": "cargo build --workspace"}}"#,
+        );
+        assert_eq!(resolve_gate_fast_command(tmp.path(), "x"), "cargo build --workspace");
     }
 
     // ===================================================================

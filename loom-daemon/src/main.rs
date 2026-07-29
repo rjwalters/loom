@@ -3583,6 +3583,13 @@ fn build_status_json_value(
             // identically as `halted: false, not_evaluated: false`.
             "enabled": report.main_health_gate_enabled,
             "verdict_at": report.main_health_gate_verdict_at,
+            // Load-aware deferral + tier label (#4259). `deferred` is a bounded
+            // scheduling decision distinct from both `halted` and
+            // `not_evaluated`; `verdict_tier` ("full"/"fast") keeps a fast-tier
+            // green distinguishable from a full-suite green.
+            "deferred": report.main_health_gate_deferred,
+            "deferred_reason": report.main_health_gate_deferred_reason,
+            "verdict_tier": report.main_health_gate_verdict_tier,
         },
         // Startup forge-credential preflight (#4005) — resolved once at
         // daemon boot, before the daemon's first `gh` consumer. Never
@@ -3613,6 +3620,9 @@ fn build_status_json_value(
             "health_gate_not_evaluated_reason": r.health_gate_not_evaluated_reason,
             "health_gate_enabled": r.health_gate_enabled,
             "health_gate_verdict_at": r.health_gate_verdict_at,
+            "health_gate_deferred": r.health_gate_deferred,
+            "health_gate_deferred_reason": r.health_gate_deferred_reason,
+            "health_gate_verdict_tier": r.health_gate_verdict_tier,
         })).collect::<Vec<_>>(),
         // Forge-side pipeline snapshot (#3977) — present only when `--pipeline`
         // was passed; `null` otherwise so a consumer can tell "not requested"
@@ -3712,7 +3722,19 @@ enum GateVerdict {
     /// The gate's most recent completed run verified `main` green. `since`
     /// is the wall-clock time of that verdict, when known (#4012 AC4) — a
     /// `clear` reading with no `since` predates the daemon populating it.
-    Clear { since: Option<DateTime<Utc>> },
+    /// `tier` (#4259) labels which stage set produced it (`"fast"` ⇒ a
+    /// compile+smoke subset, NOT a full-suite green); `None` for a full-tier
+    /// verdict or a pre-#4259 payload.
+    Clear {
+        since: Option<DateTime<Utc>>,
+        tier: Option<String>,
+    },
+    /// The most recent tick DEFERRED for host load (#4259): the host was
+    /// saturated and the bounded max-defer window had not yet elapsed, so no
+    /// command ran. NOT evidence about `main` either way; dispatch is NOT
+    /// halted by this. Distinct from `NotEvaluated` — the gate chose not to run,
+    /// it did not run and fail to conclude.
+    Deferred { reason: Option<String> },
     /// The most recent tick could not produce a verdict at all (dirty tree,
     /// timeout, missing tool, broken `git`, …) — NOT evidence about `main`
     /// either way; dispatch is NOT halted by this.
@@ -3741,17 +3763,36 @@ enum GateVerdict {
 /// halt is never hidden behind either newer state — a case that in practice
 /// only arises from a test poking the raw state directly, since the gate
 /// loop's own disabled path always clears `halted` first.
+// A pure classifier that maps the raw, independent gate status fields (each
+// carried separately on `DaemonStatusReport` / `RepoStatus` with its own
+// `#[serde(default)]`) onto one verdict. The argument count tracks the field
+// count 1:1 by design; grouping them into a struct here would just move the
+// same primitives around without adding meaning.
+#[allow(clippy::too_many_arguments)]
 fn classify_gate_verdict(
     enabled: Option<bool>,
     halted: bool,
     not_evaluated: bool,
+    deferred: bool,
     reason: Option<&str>,
+    deferred_reason: Option<&str>,
+    verdict_tier: Option<&str>,
     verdict_at: Option<DateTime<Utc>>,
 ) -> GateVerdict {
     if halted {
         return GateVerdict::Halted {
             not_evaluated,
             reason: reason.map(str::to_string),
+        };
+    }
+    // A load-deferral (#4259) is a current-tick scheduling decision; surface it
+    // ahead of `not_evaluated` (a deferred tick clears the unevaluated flag, so
+    // in practice they do not co-occur) and ahead of the disabled/pending/clear
+    // readings, so the operator sees "the host is too busy to run the gate right
+    // now" rather than a stale green.
+    if deferred {
+        return GateVerdict::Deferred {
+            reason: deferred_reason.map(str::to_string),
         };
     }
     if not_evaluated {
@@ -3765,7 +3806,10 @@ fn classify_gate_verdict(
     if verdict_at.is_none() {
         return GateVerdict::Pending;
     }
-    GateVerdict::Clear { since: verdict_at }
+    GateVerdict::Clear {
+        since: verdict_at,
+        tier: verdict_tier.map(str::to_string),
+    }
 }
 
 /// Render the main-health gate summary line for `loom-daemon status`.
@@ -3780,12 +3824,31 @@ fn format_gate_status(verdict: &GateVerdict) -> String {
         GateVerdict::Pending => {
             "pending (no verdict yet this process — dispatch allowed)".to_string()
         }
-        GateVerdict::Clear { since } => match since {
-            Some(t) => {
-                format!("clear (dispatch allowed; last verified green at {})", t.to_rfc3339())
+        GateVerdict::Clear { since, tier } => {
+            // #4259: a fast-tier green covers only the compile+smoke subset, so
+            // it must never read as an unqualified "clear".
+            let tier_suffix = match tier.as_deref() {
+                Some("fast") => " [fast tier — compile+smoke only, NOT a full-suite green]",
+                _ => "",
+            };
+            match since {
+                Some(t) => format!(
+                    "clear (dispatch allowed; last verified green at {}){tier_suffix}",
+                    t.to_rfc3339()
+                ),
+                None => format!("clear (dispatch allowed){tier_suffix}"),
             }
-            None => "clear (dispatch allowed)".to_string(),
-        },
+        }
+        GateVerdict::Deferred { reason } => {
+            let detail = reason
+                .clone()
+                .unwrap_or_else(|| "host saturated".to_string());
+            format!(
+                "deferred ({detail}) — the host is too busy to run the gate right now, which is \
+                 NOT evidence about main; dispatch is NOT halted by this. The fast tier runs at \
+                 the max-defer bound so a permanently-loaded host still reaches a verdict"
+            )
+        }
         GateVerdict::NotEvaluated { reason } => {
             let cause = reason
                 .clone()
@@ -3821,7 +3884,9 @@ fn gate_status_short_label(verdict: &GateVerdict) -> &'static str {
     match verdict {
         GateVerdict::Disabled => "disabled",
         GateVerdict::Pending => "pending",
+        GateVerdict::Clear { tier: Some(t), .. } if t == "fast" => "clear(fast)",
         GateVerdict::Clear { .. } => "clear",
+        GateVerdict::Deferred { .. } => "deferred",
         GateVerdict::NotEvaluated { .. } => "not-evaluated",
         GateVerdict::Halted {
             not_evaluated: true,
@@ -4079,7 +4144,10 @@ fn print_status_human(
         report.main_health_gate_enabled,
         report.main_health_gate_halted,
         report.main_health_gate_not_evaluated,
+        report.main_health_gate_deferred,
         report.main_health_gate_not_evaluated_reason.as_deref(),
+        report.main_health_gate_deferred_reason.as_deref(),
+        report.main_health_gate_verdict_tier.as_deref(),
         report.main_health_gate_verdict_at,
     );
     let gate = format_gate_status(&verdict);
@@ -4221,7 +4289,10 @@ fn print_status_human(
                 r.health_gate_enabled,
                 r.health_gate_halted,
                 r.health_gate_not_evaluated,
+                r.health_gate_deferred,
                 r.health_gate_not_evaluated_reason.as_deref(),
+                r.health_gate_deferred_reason.as_deref(),
+                r.health_gate_verdict_tier.as_deref(),
                 r.health_gate_verdict_at,
             );
             let gate = gate_status_short_label(&verdict);
@@ -4253,6 +4324,12 @@ fn print_status_human(
             // the operator can tell "dirty tree" from "cargo not on PATH".
             if let Some(reason) = &r.health_gate_not_evaluated_reason {
                 println!("        gate not evaluated — {reason}");
+            }
+            // Load-aware deferral (#4259): name why the gate is deferring so a
+            // repo whose gate is not producing verdicts under host load is
+            // explained (distinct from the not-evaluated line above).
+            if let Some(reason) = &r.health_gate_deferred_reason {
+                println!("        gate deferred — {reason}");
             }
             // Insta-crash quarantine (#3939): list the issues this repo is
             // currently refusing to re-dispatch so a stalled-but-nonempty backlog
@@ -6249,7 +6326,10 @@ mod dispatch_tests {
         reason: Option<&str>,
         verdict_at: Option<DateTime<Utc>>,
     ) -> GateVerdict {
-        classify_gate_verdict(enabled, halted, not_evaluated, reason, verdict_at)
+        // The 5-arg helper keeps the pre-#4259 test call sites unchanged: no
+        // deferral, no tier label. Dedicated tests below exercise those paths
+        // by calling `classify_gate_verdict` directly.
+        classify_gate_verdict(enabled, halted, not_evaluated, false, reason, None, None, verdict_at)
     }
 
     #[test]
@@ -6317,7 +6397,13 @@ mod dispatch_tests {
 
         let now = Utc::now();
         let clear = classify(Some(true), false, false, None, Some(now));
-        assert_eq!(clear, GateVerdict::Clear { since: Some(now) });
+        assert_eq!(
+            clear,
+            GateVerdict::Clear {
+                since: Some(now),
+                tier: None
+            }
+        );
         let s = format_gate_status(&clear);
         assert!(s.starts_with("clear"), "got: {s}");
         assert!(s.contains(&now.to_rfc3339()), "clear must carry its own recency evidence: {s}");
@@ -6326,6 +6412,83 @@ mod dispatch_tests {
             format_gate_status(&clear),
             "pending and clear must never render identically"
         );
+    }
+
+    /// #4259: a load-deferral is a distinct verdict — it must render as
+    /// `deferred (…)`, never as `not evaluated (timeout …)` nor as a stale
+    /// `clear`, and it must never halt dispatch.
+    #[test]
+    fn format_gate_status_deferred_is_distinct_and_never_halts() {
+        let deferred = classify_gate_verdict(
+            Some(true),
+            false, // not halted
+            false, // not unevaluated
+            true,  // deferred
+            None,
+            Some("load 1.05/core for 14m — fast tier runs at the 30m bound"),
+            None,
+            None,
+        );
+        assert!(matches!(deferred, GateVerdict::Deferred { .. }));
+        let s = format_gate_status(&deferred);
+        assert!(s.starts_with("deferred"), "got: {s}");
+        assert!(s.contains("load 1.05/core"), "carries the load reason: {s}");
+        assert!(s.contains("NOT evidence about main"), "got: {s}");
+        assert!(s.contains("NOT halted"), "a deferred gate does not halt: {s}");
+        // Distinct from a timeout not-evaluated line for the same host stress.
+        let timeout = classify(
+            Some(true),
+            false,
+            true,
+            Some("timeout: gate command timed out after 1200s"),
+            None,
+        );
+        assert_ne!(
+            format_gate_status(&deferred),
+            format_gate_status(&timeout),
+            "deferred (load) must never render identically to not-evaluated (timeout)"
+        );
+        assert_eq!(gate_status_short_label(&deferred), "deferred");
+    }
+
+    /// #4259: a fast-tier green must be labeled so it is never mistaken for a
+    /// full-suite green.
+    #[test]
+    fn format_gate_status_fast_tier_clear_is_labeled() {
+        let now = Utc::now();
+        let full = classify_gate_verdict(
+            Some(true),
+            false,
+            false,
+            false,
+            None,
+            None,
+            Some("full"),
+            Some(now),
+        );
+        let fast = classify_gate_verdict(
+            Some(true),
+            false,
+            false,
+            false,
+            None,
+            None,
+            Some("fast"),
+            Some(now),
+        );
+        let full_s = format_gate_status(&full);
+        let fast_s = format_gate_status(&fast);
+        assert!(full_s.starts_with("clear"), "got: {full_s}");
+        assert!(!full_s.contains("fast tier"), "full tier is unlabeled: {full_s}");
+        assert!(fast_s.contains("fast tier"), "fast tier is labeled: {fast_s}");
+        assert!(
+            fast_s.contains("NOT a full-suite green"),
+            "the fast-tier caveat is explicit: {fast_s}"
+        );
+        assert_eq!(gate_status_short_label(&full), "clear");
+        assert_eq!(gate_status_short_label(&fast), "clear(fast)");
+        // The short label still fits the 13-char table column.
+        assert!(gate_status_short_label(&fast).len() <= 13);
     }
 
     /// #4012 AC2: the gate-disabled case must be distinguishable from both
@@ -6462,6 +6625,9 @@ mod status_client_tests {
             main_health_gate_not_evaluated_reason: None,
             main_health_gate_enabled: Some(true),
             main_health_gate_verdict_at: Some(Utc::now()),
+            main_health_gate_deferred: false,
+            main_health_gate_deferred_reason: None,
+            main_health_gate_verdict_tier: None,
             capacity: CapacityReport {
                 ranking_present: true,
                 total_accounts: 4,
