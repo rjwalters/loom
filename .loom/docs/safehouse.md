@@ -299,6 +299,7 @@ actionable detail over the previous terse `issue #N …` phrasing:
 | `SweepExited` (exit 0) | `ack` | `<repo>#N · done ✓ · <dur>` (e.g. `6m55s`) |
 | `SweepExited` (exit ≠ 0) | `ack` | `<repo>#N · failed ✗ · exit <code>[ (decoded)] · <dur>` — exit `78` decodes to `(EX_CONFIG: token pool)`; every other code prints raw (no attempt at a full sysexits table) |
 | `SweepCrashed` | `handoff` | `<repo>#N · crashed ✗ at <checkpoint_phase> — resumable (checkpoint kept)` |
+| `SweepExited` **whose PR merged** (#4426) | `completion` | `<repo>#N · merged ✓ · PR #M · <dur>` — emitted *in addition to* the `ack`, carrying the `completion-v1` `meta` (see below) |
 
 **Dispatch-line title (AC3)**: the operator's highest-value ask was seeing the
 issue title on the dispatch line (the single most common message in the room —
@@ -317,13 +318,60 @@ network, unauthenticated, timeout) degrades to narrating the dispatch line
 `sweep_id` (no issue number), and `SweepExited` already emits the completion
 `ack` with richer data — narrating both would double-post per completion.
 
+### Completion envelopes → the public fleet feed (#4426)
+
+safehoused's egress subsystem mirrors well-formed **`completion`** envelopes out
+of allowlisted rooms — redacted and delay-buffered — to a `sink_url`; that is
+what feeds the public fleet feed on 2amlogic.com. Loom is the producer:
+
+- **Emit point**: the narration sink, on `SweepExited`. Exit status alone proves
+  nothing, so the sink checks **forge truth** (`gh pr list --head
+  feature/issue-N --state merged`, in the event's workspace root, 10s timeout)
+  and emits the `completion` only when that issue's PR actually merged — the
+  `ack` still goes out either way. Chosen over having the sweep child publish a
+  post-merge phase event because it is daemon-only (no skill edit), has the
+  sweep timing to hand, and verifies rather than trusts.
+- **`meta` (`completion-v1`)**: `{schema, agent, repo, ref, result, started_at,
+  completed_at}` required, plus optional `issue`/`tokens` (envelope-v1 preserves
+  unknown `meta` keys, so no schema rev is needed for extensions). `body` stays
+  required human prose — a room reader sees a sentence, `meta` is the machine
+  view.
+- **`repo` is the forge `owner/repo` slug** (`gh repo view --json
+  nameWithOwner`, cached per workspace for the daemon's lifetime), deliberately
+  **not** the path-basename convention above: the feed links `ref` (the PR URL)
+  and displays the forge identity. `tokens` is omitted rather than guessed — no
+  cheap token source is wired to the sink.
+- **Timestamps** come from the reaper's clock (`started_at = exit − duration_sec`,
+  `completed_at = exit`), so the pair is always self-consistent.
+- **`result: "failure"` is out of scope for v1**: `completion-v1` requires a
+  `ref`, and a sweep with no merged PR has no meaningful one (an open PR is
+  unfinished, not failed, and is usually resumed). The wire support exists
+  (`CompletionResult::Failure`) for a follow-up that identifies a genuinely
+  terminal negative outcome.
+- **At most one per merge**, deduped on `(workspace, issue)` for the daemon's
+  lifetime, so a resumed sweep's second `SweepExited` does not double-post.
+  Downstream ingest is additionally idempotent on `event_id`.
+- **Strict client-side construction.** safehoused **silently degrades a
+  malformed `meta` to `chat`** — the event then vanishes from the feed with no
+  error anywhere — so `build_send_request` refuses to send a `completion` unless
+  `validate_completion_meta` accepts it (all required fields present and
+  non-empty, `schema == "completion-v1"`, `agent` a valid persona, `repo` an
+  `owner/repo` slug, `ref` an absolute http(s) URL, `result` ∈
+  {`success`,`failure`}, both timestamps RFC3339 with `completed_at >=
+  started_at`). Nothing here relies on server-side validation.
+- **Same degradation contract**: a failing/absent/slow `gh`, an unreachable
+  safehoused, or a rejected envelope drops the completion silently and never
+  affects the sweep.
+
 ## Wire protocol (envelope v1)
 
 - `AF_UNIX`, **newline-delimited JSON**, one object per line, bidirectional.
 - Mandatory first request: `{"id":0,"op":"hello","persona":"<name>"}`.
-- `send` carries `to`/`type`/`body` and optional `task_id`/`room`. `type` is a
-  closed enum `{chat,task,handoff,ack}`; `task_id` must be `[A-Za-z0-9_]` (both
-  validated before sending). The daemon **stamps `from`** from the socket
+- `send` carries `to`/`type`/`body` and optional `task_id`/`room`/`meta`. `type`
+  is a closed enum `{chat,task,handoff,ack,completion}` owned by the safehouse
+  repo (loom invents no members); `task_id` must be `[A-Za-z0-9_]`; `meta` is
+  valid **only** on a `completion`, which in turn **requires** it (see above) —
+  all validated before sending. The daemon **stamps `from`** from the socket
   identity — the client never sends one (no impersonation).
 - Replies echo the request `id`. **Async push lines are interleaved on the same
   connection, carry an `event` key, and have no `id`** — the client

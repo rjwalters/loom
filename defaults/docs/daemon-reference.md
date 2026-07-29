@@ -2417,6 +2417,32 @@ case the resume dispatch call itself fails — and narrated over Safehouse
 guard (#4206) still applies: an issue carrying `loom:blocked` is never
 resume-dispatched.
 
+### Completion narration → public fleet feed (#4426)
+
+When a sweep exits, the narration sink additionally asks the forge whether that
+issue's PR actually **merged** (`gh pr list --head feature/issue-N --state
+merged`, in the event's workspace root). If it did, the sink emits a second
+envelope of type **`completion`** carrying a `completion-v1` `meta`
+(`{schema, agent, repo, ref, result, started_at, completed_at, issue, tokens?}`)
+alongside the human `ack`. safehoused's egress mirrors well-formed `completion`
+envelopes out of allowlisted rooms to its `sink_url` — that is what fills the
+public fleet feed. Notes:
+
+- **`repo` is the forge `owner/repo` slug** (`gh repo view --json nameWithOwner`,
+  cached per workspace), not the path-basename narration convention (#4201);
+  `ref` is the PR URL. `tokens` is omitted (no cheap sink-side source) rather
+  than guessed.
+- **Exit 0 ≠ merged.** No merged PR ⇒ no completion, so `result: "success"` is
+  never claimed for unmerged work. `result: "failure"` is not emitted in v1 —
+  `completion-v1` requires a `ref`, and a sweep with no merged PR has no
+  meaningful one (the wire support exists for a follow-up).
+- **At most one per merge**, deduped on `(workspace, issue)` for the daemon's
+  lifetime; downstream ingest is additionally idempotent on `event_id`.
+- **No new config and no new event-bus topic** — this rides the existing
+  `SweepExited` event and the `safehouse.*` block. Same degradation contract as
+  all narration: a failed/absent/slow `gh`, invalid `meta`, or an unreachable
+  safehoused drops the completion silently and never touches the sweep.
+
 ### Cross-host soft claim over safehouse (#4028, Phase 1 of #4028)
 
 Where collision detection (above) only *measures* the race, the soft claim
@@ -2431,9 +2457,10 @@ for the full design.
   local claim lock and **before** `flip_label_to_building`, the daemon publishes a
   claim advertisement (issue, cross-host-stable repo slug, host identity, PID,
   timestamp) over the room. It rides a **`task`** envelope — the envelope `type`
-  enum is closed and owned by the safehouse repo, so **no fifth type is invented**
-  — with the bare issue number as `task_id` and the structured payload
-  (`loom_claim`-marked JSON) in the `body`.
+  enum is closed and owned by the safehouse repo, so **no type is invented here**
+  (loom only *uses* the members safehoused already defines) — with the bare issue
+  number as `task_id` and the structured payload (`loom_claim`-marked JSON) in
+  the `body`.
 - **Dedicated inbound read task.** A coordination task on its own safehouse
   connection drains the socket continuously (`select!` over read + outbound), so
   an **idle** daemon that emits no narration still sees peer claims promptly — the
