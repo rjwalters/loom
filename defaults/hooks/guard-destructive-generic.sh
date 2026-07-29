@@ -844,6 +844,48 @@ worktree_isolation_guard_enabled() {
     [[ "$_WORKTREE_ISOLATION_CACHE" == "true" ]]
 }
 
+# =============================================================================
+# Stash-scope guard toggle — default ON (#4281).
+#
+# The main checkout's stash stack is operator-owned: preserved diagnostic state
+# (contamination evidence, deliberately-parked WIP) can sit there indefinitely,
+# and a role subagent doing an ad-hoc integration check has no way to tell
+# "this is scratch" from "this is evidence" before popping it. The 2026-07-28
+# incident saw a Judge's throwaway main-checkout test-merge run `git stash pop`
+# against a deliberately-preserved stash entry; only a merge conflict on the
+# pop kept it from being silently dropped with no recovery path.
+#
+# Resolution order (highest precedence first), mirroring every other guard
+# toggle in this file:
+#   1. LOOM_GUARD_STASH_SCOPE env var (0/false/no disables, 1/true/yes forces
+#      on). Overrides config.
+#   2. .loom/config.json (or a higher config-resolver tier) -> guards.stashScope
+#      (default true when absent)
+#   3. Default: true (guard on)
+#
+# The config read is best-effort: any parse failure falls through to guard-ON
+# and never trips the ERR trap. Invoked LAZILY — only after a stash
+# pop/drop/clear pattern has already matched — so the config read never
+# touches the hot path for the vast majority of commands that are not stash
+# operations.
+# =============================================================================
+_STASH_SCOPE_CACHE=""
+stash_scope_guard_enabled() {
+    if [[ -z "$_STASH_SCOPE_CACHE" ]]; then
+        local enabled=true raw
+        if [[ -n "$REPO_ROOT" ]]; then
+            raw=$(loom_config_get "$REPO_ROOT" "guards.stashScope" "true" 2>/dev/null) || raw=true
+            [[ "$raw" == "false" ]] && enabled=false
+        fi
+        case "${LOOM_GUARD_STASH_SCOPE:-}" in
+            0|false|no)  enabled=false ;;
+            1|true|yes)  enabled=true ;;
+        esac
+        _STASH_SCOPE_CACHE="$enabled"
+    fi
+    [[ "$_STASH_SCOPE_CACHE" == "true" ]]
+}
+
 # True if $1 (an absolute, lexically-normalized path) sits inside ANY managed
 # worktree — walks up looking for the `.loom-managed` sentinel worktree.sh
 # writes at every worktree root. Inline copy of walk_up_for_sentinel() in
@@ -2268,6 +2310,61 @@ if echo "$COMMAND_NO_COMMENT" | grep -qE '(^|[;&|(]|[[:space:]])git[[:space:]]+r
     # Isolated form (GIT_INDEX_FILE=... git read-tree ...) is allowed.
     if ! echo "$COMMAND_NO_COMMENT" | grep -qE 'GIT_INDEX_FILE='; then
         ask "Command requires confirmation: $COMMAND (a bare 'git read-tree' empties the real staging index with no reflog trace; use 'git merge-tree --write-tree <base> <branch>' for a merge preview, or isolate with GIT_INDEX_FILE=\$(mktemp))" "git-read-tree"
+    fi
+fi
+
+# =============================================================================
+# STASH-STACK SCOPE — ask on git stash pop/drop/clear in the MAIN checkout (#4281)
+#
+# git stash push/apply/list are NOT gated here — push only adds an entry,
+# apply keeps the entry on the stack, and list only reads; none of them can
+# remove operator-preserved state. `git stash` with no subcommand defaults to
+# `push` and is likewise untouched. Only pop/drop/clear can destroy an entry.
+#
+# Scoped to the MAIN checkout only, never a linked worktree — a worktree has
+# its own working tree, so a stash op run there cannot touch the main
+# checkout's stack, and gating it too would add friction with no protective
+# value.
+#
+# Resolution: unlike the Bash-write confinement block above (which compares an
+# arbitrary WRITE TARGET path against the main-checkout root by prefix), CWD
+# is compared against ITSELF: `git rev-parse --show-toplevel` (the working
+# tree root of wherever CWD is) vs. `git rev-parse --git-common-dir/..` (always
+# the true main-checkout root, from a worktree or not). They are EQUAL only
+# when CWD is the main checkout; they diverge when CWD is a linked worktree. A
+# subdirectory-prefix test would be fooled here because Loom's own linked
+# worktrees live NESTED inside the main checkout's tree
+# (`<main>/.loom/worktrees/issue-N`) — that path is textually "under" the main
+# root even though it is a distinct working tree, so a naive prefix match would
+# ask inside a builder's own worktree too. The show-toplevel/common-dir
+# comparison sidesteps that entirely.
+#
+# KNOWN LIMITATION: unlike the force-op parser (parse_force_ops), this check
+# does not thread a `git -C <path>` argument — `git -C <main-checkout-path>
+# stash pop` run from a worktree cwd is not caught today. Track any observed
+# bypass via this path as a follow-up.
+#
+# Gated by stash_scope_guard_enabled() (guards.stashScope /
+# LOOM_GUARD_STASH_SCOPE, default on), invoked LAZILY only after the pattern
+# already matched, mirroring every other cold-path toggle in this file.
+# =============================================================================
+if echo "$COMMAND_ASK_SCAN" | grep -qE '(^|[;&|(]|[[:space:]])git[[:space:]]+stash[[:space:]]+(pop|drop|clear)([[:space:]]|$)' \
+   && stash_scope_guard_enabled; then
+    _stash_toplevel=""
+    _stash_common_parent=""
+    if [[ -n "$CWD" && -d "$CWD" ]]; then
+        _stash_toplevel=$(cd "$CWD" 2>/dev/null && git rev-parse --show-toplevel 2>/dev/null) || _stash_toplevel=""
+        [[ -n "$_stash_toplevel" && -d "$_stash_toplevel" ]] && \
+            _stash_toplevel=$(cd "$_stash_toplevel" 2>/dev/null && pwd -P) || _stash_toplevel=""
+
+        _stash_common=$(cd "$CWD" 2>/dev/null && git rev-parse --git-common-dir 2>/dev/null) || _stash_common=""
+        if [[ -n "$_stash_common" ]]; then
+            _stash_common_parent=$(cd "$CWD" 2>/dev/null && cd "$_stash_common/.." 2>/dev/null && pwd -P) || _stash_common_parent=""
+        fi
+    fi
+
+    if [[ -n "$_stash_toplevel" && -n "$_stash_common_parent" && "$_stash_toplevel" == "$_stash_common_parent" ]]; then
+        ask "Command requires confirmation: $COMMAND (git stash pop/drop/clear in the MAIN checkout can destroy operator-preserved state — the main checkout's stash stack is operator-owned, not scratch space for an integration check. Run test-merges in an isolated worktree instead; set guards.stashScope:false / LOOM_GUARD_STASH_SCOPE=0 to disable this ask)" "stash-scope:main-checkout"
     fi
 fi
 
