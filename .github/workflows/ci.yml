@@ -105,6 +105,8 @@ jobs:
         run: bash defaults/scripts/check-phantom-labels.sh
       - name: Check labels.yml copies are in sync (#3896)
         run: bash defaults/scripts/check-labels-drift.sh
+      - name: Check label descriptions fit GitHub's 100-char limit (#4335)
+        run: bash defaults/scripts/check-label-descriptions.sh
       - name: Run installer tests
         run: bash scripts/test-installer.sh
       - name: Run installer reinstall-safety tests (#4188)
