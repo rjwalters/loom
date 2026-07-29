@@ -1538,6 +1538,63 @@ dynamic-cap knob; a live re-tune takes effect on the next daemon restart, not
 mid-run. #4234 adds a second, independent backstop for exactly this
 under-estimate — see the next section.
 
+#### Sizing a host (`loom-daemon calibrate`, #4390)
+
+Hand-deriving the four knobs above — reading `status`'s cap breakdown,
+understanding which term binds, picking a ceiling — is exactly what
+`loom-daemon calibrate` automates. It measures the host with the **same**
+primitives this section documents (`cpu_headroom::cpu_headroom_limit`,
+`disk_headroom::disk_headroom_limit`, `capacity::read_ranking` falling back to
+`tokens::token_pool_size`) and prints the same `min(...)` breakdown `status`
+uses, plus which term would bind after applying its recommendation:
+
+```
+loom-daemon calibrate                 # read-only report (default)
+loom-daemon calibrate --json          # machine-readable
+loom-daemon calibrate --write         # merge the recommendation into .loom/config.json
+```
+
+- **Scope**: only `autonomous.workFinder.maxConcurrent` and
+  `autonomous.perTokenConcurrency` are ever written — every other config key
+  (including `cpuUtilizationTarget`/`estCoresPerSweep`, which calibrate flags
+  when clearly miscalibrated for the host class but never rewrites
+  automatically) is preserved untouched. `--write` is idempotent: a repeat run
+  with the same recommendation is byte-identical; without `--write`, calibrate
+  is strictly read-only.
+- **Ceiling policy**: only ever *raises* `maxConcurrent` (never lowers it) to
+  `cpu_headroom + ~25% slack`, so the measured-CPU term becomes the binding
+  constraint instead of the shipped consumer default (`3`) — this reproduces
+  this repo's own hand-derived `maxConcurrent=8` (commit `3fdfbf81`) almost
+  exactly on its 18-core/8-token host.
+- **Per-token-concurrency policy**: only raised when the token axis
+  (`healthy_accounts × per_token_concurrency`) is itself the smallest resource
+  term (i.e. tokens are the actual bottleneck), and only just enough to stop
+  binding below the cpu/disk/ceiling floor — never proactively.
+- **Disk has no config key to write** — `LOOM_PER_WORKTREE_GB` is deliberately
+  env-only (previous subsection) — so calibrate always names the env-var
+  alternative instead of a config write.
+- **Env overrides win**: if `LOOM_WORK_FINDER_MAX_CONCURRENT` /
+  `LOOM_PER_TOKEN_CONCURRENCY` are set, calibrate still computes and can write
+  a recommendation, but warns that the env var outranks whatever it just wrote
+  (env > config > default) until the env var is unset or updated to match.
+- **Fleet-safety**: raising the committed ceiling is safe fleet-wide precisely
+  because the dynamic cap keeps three other, independently-measured terms in
+  the `min(...)` — each host still binds on its **own** measured
+  cpu/tokens/disk regardless of how generous the shared ceiling is. A ceiling
+  recommended for a large pilot host does not let a small laptop
+  over-dispatch.
+- **Startup hint**: `loom-daemon-start.sh` prints one advisory line at start
+  time — `"ceiling N binds; this host could run M — run loom-daemon
+  calibrate"` — only when the ceiling is *currently* the binding term **and**
+  both the cpu and token axes have at least 2× headroom above it. Never fatal:
+  a missing `jq`, a calibrate error, or an unparseable payload all fall
+  through silently, mirroring the advisory-only safehouse status line.
+- **Restart required**: like every other dynamic-cap knob, these values are
+  captured once at daemon **startup**, not re-read per tick (see the
+  `configured ceiling` row above) — a `--write` takes effect on the *next*
+  restart (`./.loom/scripts/cli/loom-daemon-stop.sh && ./.loom/scripts/cli/loom-daemon-start.sh`),
+  not live.
+
 #### Per-tick admission (ramp) cap (#4234)
 
 `resolve_dynamic_max_concurrent` is a **live** ceiling, recomputed every tick,

@@ -163,6 +163,33 @@ enum Commands {
         pipeline: bool,
     },
 
+    /// Measure the host and recommend — or with `--write`, apply — the
+    /// autonomous concurrency knobs (`autonomous.workFinder.maxConcurrent` /
+    /// `autonomous.perTokenConcurrency`, issue #4390). Prints the same
+    /// `min(...)` cap breakdown `status` uses, plus which term would bind
+    /// after applying the recommendation. Purely file/host-based; does not
+    /// require a running daemon (unlike `status`, which reports the running
+    /// daemon's own in-memory dispatch state).
+    Calibrate {
+        /// Repo root to measure/write (plain path, default `.` — no upward
+        /// `.git` walk).
+        #[arg(long, value_name = "PATH", default_value = ".")]
+        workspace: String,
+
+        /// Merge the recommendation into `<workspace>/.loom/config.json`
+        /// (only `autonomous.workFinder.maxConcurrent` /
+        /// `autonomous.perTokenConcurrency` — every other key is preserved).
+        /// Idempotent: a repeat `--write` with the same recommendation is
+        /// byte-identical. Without this flag, calibrate is strictly
+        /// read-only.
+        #[arg(long)]
+        write: bool,
+
+        /// Emit machine-readable JSON instead of the human-readable report.
+        #[arg(long)]
+        json: bool,
+    },
+
     /// Manage the machine-level workspace registry (`~/.loom/workspaces.json`):
     /// the set of repos the one-per-machine daemon manages (Issue #3926 — phase
     /// 1 of #3835). Operates directly on the registry file, so it works whether
@@ -2162,6 +2189,11 @@ fn handle_cli_command(command: Commands) -> Result<()> {
                 handle_stats_command(role.as_deref(), issue, weekly, &format)
             }
         }
+        Commands::Calibrate {
+            workspace,
+            write,
+            json,
+        } => handle_calibrate_command(&workspace, write, json),
         Commands::Workspace { action } => handle_workspace_command(action),
         Commands::Fleet { action } => handle_fleet_command(action),
         Commands::Tokens { action } => handle_tokens_command(action),
@@ -6227,6 +6259,45 @@ fn handle_recover_orphans_command(
     if !result.orphaned.is_empty() && !recover {
         std::process::exit(2);
     }
+    Ok(())
+}
+
+/// Handle `loom-daemon calibrate` (issue #4390): measure the host, print (or
+/// `--write` apply) the recommended `autonomous.workFinder.maxConcurrent` /
+/// `autonomous.perTokenConcurrency` values. See `loom_daemon::calibrate` for
+/// the measurement + recommendation policy this thinly wires up.
+fn handle_calibrate_command(workspace: &str, write: bool, json: bool) -> Result<()> {
+    use loom_daemon::calibrate;
+    use loom_daemon::worktree_ops::repo;
+
+    let repo_root = repo::resolve_repo_root(workspace)?;
+
+    let measurements = calibrate::measure(&repo_root);
+    let recommendation = calibrate::recommend(&measurements);
+
+    let written = if write {
+        Some(
+            calibrate::write_workfinder_config(
+                &repo_root,
+                recommendation.recommended_max_concurrent,
+                recommendation.recommended_per_token_concurrency,
+            )
+            .map_err(|e| anyhow!("{e}"))?,
+        )
+    } else {
+        None
+    };
+
+    if json {
+        let report = calibrate::report_json(&measurements, &recommendation, written.as_deref());
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        print!(
+            "{}",
+            calibrate::report_human(&measurements, &recommendation, written.as_deref())
+        );
+    }
+
     Ok(())
 }
 

@@ -492,6 +492,43 @@ print_safehouse_status() {
     fi
 }
 
+# ---------- calibrate binding-ceiling hint (#4390) ----------
+# `loom-daemon calibrate` is purely file/host-based (no running daemon
+# required, unlike `status`), so it is safe to run right here at start time.
+# One advisory line, printed only when the configured
+# `autonomous.workFinder.maxConcurrent` ceiling is CURRENTLY the binding term
+# AND both the cpu and token axes have at least 2x headroom above it -- i.e.
+# this host is obviously bigger than the shipped default was sized for.
+# Never fatal: a missing jq, a calibrate error, or an unparseable payload all
+# fall through silently -- this is advisory-only, exactly like
+# print_safehouse_status above.
+print_calibrate_hint() {
+    if ! command -v jq >/dev/null 2>&1; then
+        return 0
+    fi
+    local calib_json
+    calib_json="$("$DAEMON_BIN" calibrate --workspace "$REPO_ROOT" --json 2>/dev/null)" || return 0
+    [[ -n "$calib_json" ]] || return 0
+
+    local binding ceiling cpu token_axis recommended
+    binding=$(jq -r '.recommendation.binding_term_before // empty' <<<"$calib_json" 2>/dev/null)
+    [[ "$binding" == "ceiling" ]] || return 0
+
+    ceiling=$(jq -r '.measurements.configured_max_concurrent // empty' <<<"$calib_json" 2>/dev/null)
+    cpu=$(jq -r '.measurements.cpu_headroom // empty' <<<"$calib_json" 2>/dev/null)
+    token_axis=$(jq -r '.measurements.token_axis_effective // empty' <<<"$calib_json" 2>/dev/null)
+    recommended=$(jq -r '.recommendation.recommended_max_concurrent // empty' <<<"$calib_json" 2>/dev/null)
+
+    # Defensively require all four to be plain non-negative integers before
+    # doing shell arithmetic on them.
+    [[ "$ceiling" =~ ^[0-9]+$ && "$cpu" =~ ^[0-9]+$ && "$token_axis" =~ ^[0-9]+$ && "$recommended" =~ ^[0-9]+$ ]] || return 0
+    (( ceiling > 0 )) || return 0
+
+    if (( cpu >= 2 * ceiling )) && (( token_axis >= 2 * ceiling )); then
+        warn "ceiling ${ceiling} binds; this host could run ${recommended} -- run 'loom-daemon calibrate'"
+    fi
+}
+
 # ---------- watchdog LaunchAgent / systemd timer (#4011, #4260 sub-issue D) ----------
 # The watchdog is the payload of a SECOND, SEPARATE scheduled job from the
 # daemon job/unit itself, and reports when intent (the marker above) diverges
@@ -1111,6 +1148,7 @@ if [[ "$USE_LAUNCHD" == "true" ]]; then
     echo "PID file: $PID_FILE"
     echo "Intent marker: $INTENT_MARKER"
     print_safehouse_status
+    print_calibrate_hint
     if [[ "$MACHINE_MODE" == "true" ]]; then
         echo "Stop with: loom stop"
     else
@@ -1185,6 +1223,7 @@ if [[ "$IS_LINUX_SYSTEMD" == "true" ]]; then
     echo "PID file: $PID_FILE"
     echo "Intent marker: $INTENT_MARKER"
     print_safehouse_status
+    print_calibrate_hint
     warn "Reboot survival requires lingering: run 'loginctl enable-linger \"\$USER\"' once (SSH-only / headless hosts)."
     if [[ "$MACHINE_MODE" == "true" ]]; then
         echo "Stop with: loom stop"
@@ -1223,6 +1262,7 @@ provision_watchdog_job_none
 ok "loom-daemon started (pid $daemon_pid). PID file: $PID_FILE"
 echo "Intent marker: $INTENT_MARKER"
 print_safehouse_status
+print_calibrate_hint
 if [[ "$MACHINE_MODE" == "true" ]]; then
     echo "Stop with: loom stop"
 else
