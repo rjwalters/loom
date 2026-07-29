@@ -1546,6 +1546,7 @@ pub fn spawn_multi_work_finder_task(
     suppress_dispatch_during_gate: bool,
     event_bus: Arc<EventBus>,
     drain: Arc<std::sync::atomic::AtomicBool>,
+    role_in_progress: crate::role_runner::InProgressGuard,
 ) -> tokio::task::JoinHandle<()> {
     log::info!(
         "work_finder: starting multi-workspace loop (interval={}s, configured_max={configured_max}, \
@@ -1567,6 +1568,12 @@ pub fn spawn_multi_work_finder_task(
         // currently missing so `filter_missing_roots` logs a warning once per
         // transition rather than once per tick.
         let mut missing_roots_warned: HashSet<PathBuf> = HashSet::new();
+        // Idle-edge role triggering (#4364): per-root idle level + per-(root,
+        // role) debounce state. Fed one post-tick idle observation per root; on
+        // the non-idle → idle edge it fire-and-forgets each configured on-idle
+        // role. Boot state is "already idle" so an empty-queue startup never
+        // fires.
+        let mut idle_trigger = crate::role_runner::IdleTrigger::new();
         loop {
             ticker.tick().await;
 
@@ -1741,6 +1748,26 @@ pub fn spawn_multi_work_finder_task(
                     capacity::DEFAULT_ADVISORY_MIN_QUEUED,
                 );
                 was_pressured = emit_capacity_transition(&event_bus, was_pressured, &assessment);
+            }
+
+            // Idle-edge role triggering (#4364). A dispatch this tick registers
+            // in that root's registry immediately, so a **post-tick** per-root
+            // `in_flight().is_empty()` already encodes both halves of "idle":
+            // nothing running AND nothing dispatched this tick. `observe_edge`
+            // then converts that level into the non-idle → idle EDGE; on the
+            // edge, `observe_and_fire_idle` fire-and-forgets each configured
+            // on-idle role (never awaited here — the tick must not block on a
+            // multi-minute role session). `draining` (#4090) suppresses firing;
+            // per-root config gating (enabled + `onIdle`) is applied inside.
+            for (root, (_src, dispatcher)) in roots.iter().zip(pairs.iter()) {
+                let idle_now = dispatcher.in_flight().is_empty();
+                crate::role_runner::observe_and_fire_idle(
+                    &mut idle_trigger,
+                    &role_in_progress,
+                    root,
+                    idle_now,
+                    draining,
+                );
             }
         }
     })

@@ -1786,7 +1786,8 @@ concurrency ceiling 5" and share it with the team:
     "roleRunner": {
       "enabled": true,
       "roles": ["champion", "curator", "judge", "auditor", "guide"],
-      "intervalSecs": 300
+      "intervalSecs": 300,
+      "onIdle": ["champion"]
     },
     "watchMonitor": {
       "enabled": true,
@@ -1841,6 +1842,7 @@ exactly like `main_health_gate::read_build_gate_config`.
 | `autonomous.roleRunner.enabled` | `LOOM_ROLE_RUNNER` | `false` | Periodic standalone support-role runner on/off (#4015) |
 | `autonomous.roleRunner.roles` | *(config only)* | all 5 roles | Subset of `champion`/`curator`/`judge`/`auditor`/`guide` to dispatch; explicit empty array runs none |
 | `autonomous.roleRunner.intervalSecs` | `LOOM_ROLE_RUNNER_INTERVAL_SECS` | per-role built-in (5–15 min) | Uniform override applied to every enabled role's cadence |
+| `autonomous.roleRunner.onIdle` | *(config only)* | `[]` (none) | Subset of the same 5 roles to also fire on the work-finder **idle edge** (#4364) — the non-idle → idle transition (0 in-flight sweeps AND nothing dispatched this tick), in addition to the interval cadence. Absent → none (opposite default from `roles`); unknown names ignored with a warning. Debounced to min 60s per (root, role) and skipped while that role's interval/idle run is in progress. **Requires the work finder enabled** to observe idleness (a startup warning fires if set with the work finder off) |
 | `autonomous.watchMonitor.enabled` | `LOOM_WATCH_MONITOR` | `true` | Durable operator-watch monitor loop (#3971). Default-on; no dispatch side effect, zero forge calls until a watch is registered |
 | `autonomous.watchMonitor.intervalSecs` | `LOOM_WATCH_MONITOR_INTERVAL_SECS` | `120` | Watch poll cadence. Zero/invalid → default |
 | `autonomous.watchMonitor.expirySecs` | `LOOM_WATCH_MONITOR_EXPIRY_SECS` | `86400` | Give-up window for an unresolved watch; `0` disables expiry |
@@ -2371,7 +2373,8 @@ leaves the daemon's behavior byte-for-byte unchanged:
     "roleRunner": {
       "enabled": true,
       "roles": ["champion", "curator", "judge", "auditor", "guide"],
-      "intervalSecs": 300
+      "intervalSecs": 300,
+      "onIdle": ["champion"]
     }
   }
 }
@@ -2382,12 +2385,32 @@ leaves the daemon's behavior byte-for-byte unchanged:
 | `LOOM_ROLE_RUNNER` | `autonomous.roleRunner.enabled` | env > config > default | `false` (off) |
 | `LOOM_ROLE_RUNNER_INTERVAL_SECS` | `autonomous.roleRunner.intervalSecs` | env > config > default | per-role built-in (see above) |
 | — | `autonomous.roleRunner.roles` | config only | all five roles |
+| — | `autonomous.roleRunner.onIdle` | config only | `[]` (none) |
 
 `roles` restricts the dispatched subset (an explicit empty array runs none;
 unknown names are ignored with a warning). `intervalSecs` — both the env var
 and the config key — is a single override applied *uniformly* to every
 enabled role's cadence; per-role cadence diversity otherwise comes from each
 role's own built-in default.
+
+`onIdle` (#4364) lists the subset of the same five roles to *also* fire on the
+work-finder **idle edge** — the moment a workspace transitions from busy to
+idle, defined per-root as a post-tick `in_flight().is_empty()` (0 in-flight
+sweeps AND nothing dispatched that tick). This composes with (never replaces)
+the interval cadence: the interval loop remains the backstop for hosts that are
+never idle. It is **edge-triggered, not level-triggered** — a queue that stays
+empty across many ticks fires at most once, and a daemon that boots on an empty
+queue does not fire — plus a min-60s debounce per (root, role) against rapid
+idle/busy flapping, and a shared in-progress guard so an idle run never overlaps
+that role's interval run (or another idle run). Absent → no idle triggering (the
+opposite default from `roles`); unknown names are ignored with a warning; a
+scheduled drain suppresses it. Because the work finder is the sole source of the
+idle signal, `onIdle` is **inert unless the work finder is enabled** — the daemon
+logs a one-time startup warning if it is set with the work finder off. The
+motivating case is `["champion"]`: an idle daemon usually means the approved
+queue just drained, and champion promotion (`loom:curated` → `loom:issue`) is
+exactly what refills it, closing the promote → dispatch loop in seconds instead
+of waiting out the rest of a fixed interval.
 
 **GitHub Actions workflows remain a supported fallback** for deployments with
 no always-on daemon — this loop does not remove them, it gives an always-on

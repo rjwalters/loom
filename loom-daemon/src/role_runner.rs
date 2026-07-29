@@ -76,8 +76,10 @@
 //! `claude` sessions at once rather than settling into the steady-state
 //! cadence.
 
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use crate::sweep_registry::{self, SweepRegistryConfig};
@@ -125,6 +127,14 @@ const MAX_OUTPUT_TAIL_BYTES: usize = 2048;
 /// is logged at `WARN` instead of `INFO` so that failure mode is visible in
 /// the log without inspecting forge state.
 const IMPLAUSIBLY_FAST_TICK: Duration = Duration::from_secs(10);
+
+/// Minimum time between idle-edge-triggered runs of the **same** `(root, role)`
+/// (#4364). The idle edge itself only fires on a non-idle → idle transition, so
+/// a queue that stays empty never re-fires; this debounce is the second-line
+/// guard against rapid idle/busy *flapping* (a queue that empties, refills, and
+/// empties again within seconds) hot-looping a role. A constant, deliberately
+/// not a config knob — the interval cadence is the tunable backstop.
+const IDLE_TRIGGER_DEBOUNCE: Duration = Duration::from_secs(60);
 
 /// One standalone support role this module knows how to dispatch: its name
 /// (used for config/env lookups and the per-role log file), the `/role`
@@ -503,6 +513,13 @@ pub struct RoleRunnerConfig {
     /// uniformly to every enabled role's cadence (a zero/invalid value is
     /// dropped to `None`, falling through to that role's own default).
     pub interval_secs: Option<u64>,
+    /// `autonomous.roleRunner.onIdle` — the subset of [`DEFAULT_ROLES`] (by
+    /// name) to fire on the work-finder **idle edge** (#4364), in addition to
+    /// (never replacing) the interval cadence. Unlike [`roles`](Self::roles),
+    /// `None` (key absent) means **no** idle triggering — the opposite default,
+    /// because idle firing is a distinct opt-in surface. Resolved by
+    /// [`resolve_on_idle_roles`].
+    pub on_idle: Option<Vec<String>>,
 }
 
 /// Read `.loom/config.json -> autonomous.roleRunner`, soft-failing every
@@ -526,6 +543,18 @@ pub fn read_role_runner_config(repo_root: &Path) -> RoleRunnerConfig {
                 .collect::<Vec<_>>()
         });
 
+    // `onIdle` parses exactly like `roles` (array of strings; absent /
+    // non-array soft-fails to `None`); non-string entries are dropped. Unknown
+    // *names* are warned-and-ignored later, in `resolve_on_idle_roles`.
+    let on_idle = block
+        .get("onIdle")
+        .and_then(serde_json::Value::as_array)
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect::<Vec<_>>()
+        });
+
     RoleRunnerConfig {
         enabled: block.get("enabled").and_then(serde_json::Value::as_bool),
         roles,
@@ -533,6 +562,7 @@ pub fn read_role_runner_config(repo_root: &Path) -> RoleRunnerConfig {
             .get("intervalSecs")
             .and_then(serde_json::Value::as_u64)
             .filter(|&s| s > 0),
+        on_idle,
     }
 }
 
@@ -576,6 +606,38 @@ pub fn resolve_roles(config: &RoleRunnerConfig) -> Vec<RoleSpec> {
     out
 }
 
+/// Resolve the set of roles to fire on the work-finder **idle edge** (#4364):
+/// `config.on_idle` (by name, matched against [`DEFAULT_ROLES`], preserving
+/// [`DEFAULT_ROLES`] order and ignoring unknown names with a warning) when
+/// present, else **empty**.
+///
+/// This mirrors [`resolve_roles`] except for the absent-key default: `None`
+/// resolves to no roles (not every default), because idle triggering is a
+/// distinct opt-in — a repo that never sets `onIdle` gets the interval-only
+/// behavior byte-for-byte.
+#[must_use]
+pub fn resolve_on_idle_roles(config: &RoleRunnerConfig) -> Vec<RoleSpec> {
+    let Some(names) = &config.on_idle else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for spec in DEFAULT_ROLES {
+        if names.iter().any(|n| n == spec.name) {
+            out.push(*spec);
+        }
+    }
+    for name in names {
+        if !DEFAULT_ROLES.iter().any(|s| s.name == name) {
+            log::warn!(
+                "role_runner: autonomous.roleRunner.onIdle entry {name:?} is not a known \
+                 standalone role (expected one of {:?}) — ignored",
+                DEFAULT_ROLES.iter().map(|s| s.name).collect::<Vec<_>>()
+            );
+        }
+    }
+    out
+}
+
 /// Resolve a single role's tick interval with precedence **env
 /// ([`ROLE_RUNNER_INTERVAL_ENV`], applied uniformly to every role) > config
 /// (`autonomous.roleRunner.intervalSecs`, also uniform) > that role's own
@@ -588,6 +650,240 @@ pub fn resolve_interval_for_role(spec: &RoleSpec, config: &RoleRunnerConfig) -> 
         .filter(|&s| s > 0)
         .or(config.interval_secs)
         .map_or_else(|| Duration::from_secs(spec.default_interval_secs), Duration::from_secs)
+}
+
+// ============================================================================
+// Idle-edge triggering (#4364) — shared in-progress guard + edge/debounce state
+// ============================================================================
+
+/// Shared "a role invocation is currently running" set, keyed by
+/// `(workspace_root, role_name)`.
+///
+/// Shared (one instance, cloned) between the interval role loops
+/// ([`spawn_multi_role_task`]) and the idle-edge-triggered path
+/// ([`plan_idle_runs`]) so the two never overlap for the same `(root, role)`:
+/// an interval tick holds the entry for the duration of its `invoke`, and the
+/// idle path refuses to fire while the entry is present (and vice versa). This
+/// is **in-process shared state only** — deliberately not an event-bus topic
+/// (the taxonomy is frozen, #4364).
+pub type InProgressGuard = Arc<Mutex<HashSet<(PathBuf, &'static str)>>>;
+
+/// Construct an empty [`InProgressGuard`]. One instance is created in `main.rs`
+/// and cloned into every interval role loop and the work-finder's idle path so
+/// they share a single view.
+#[must_use]
+pub fn new_in_progress_guard() -> InProgressGuard {
+    Arc::new(Mutex::new(HashSet::new()))
+}
+
+/// RAII guard: [`try_acquire`](Self::try_acquire) inserts `(root, role)` into
+/// the shared [`InProgressGuard`]; [`Drop`] removes it.
+///
+/// Because removal runs in `Drop`, the entry is cleared on **every** exit path
+/// of the invocation it guards — success, failure, timeout, or a panic
+/// unwinding the task — so a wedged run can never leave a stale entry that
+/// permanently blocks that role from ever running again.
+pub struct RoleRunGuard {
+    set: InProgressGuard,
+    key: (PathBuf, &'static str),
+}
+
+impl RoleRunGuard {
+    /// Try to mark `(root, role)` in progress. Returns `None` when it is
+    /// already marked (another interval or idle run holds it) — the caller then
+    /// skips rather than overlapping.
+    #[must_use]
+    pub fn try_acquire(set: InProgressGuard, root: PathBuf, role: &'static str) -> Option<Self> {
+        let key = (root, role);
+        {
+            let mut guard = set.lock().unwrap_or_else(PoisonError::into_inner);
+            if guard.contains(&key) {
+                return None;
+            }
+            guard.insert(key.clone());
+        }
+        Some(Self { set, key })
+    }
+}
+
+impl Drop for RoleRunGuard {
+    fn drop(&mut self) {
+        let mut guard = self.set.lock().unwrap_or_else(PoisonError::into_inner);
+        guard.remove(&self.key);
+    }
+}
+
+/// Per-workspace idle-edge + debounce state for the idle-triggered role runs
+/// (#4364). Owned by the work-finder task (one per daemon) and fed one idle
+/// observation per root per tick.
+///
+/// * **Edge, not level.** [`observe_edge`](Self::observe_edge) returns `true`
+///   only on the per-root transition from non-idle to idle, so a queue that
+///   stays empty across many ticks triggers at most once (on the entering
+///   edge).
+/// * **Boot counts as already-idle.** A root with no prior observation is
+///   treated as already idle, so a daemon that boots on an empty queue does not
+///   fire at startup — the same first-tick-skip discipline the interval loops
+///   use.
+/// * **Debounce.** [`debounce_ok`](Self::debounce_ok) enforces a minimum
+///   [`IDLE_TRIGGER_DEBOUNCE`] between idle-triggered runs per `(root, role)`.
+#[derive(Debug, Default)]
+pub struct IdleTrigger {
+    prev_idle: HashMap<PathBuf, bool>,
+    last_fired: HashMap<(PathBuf, &'static str), Instant>,
+}
+
+impl IdleTrigger {
+    /// Construct an empty tracker (every root starts treated as already-idle).
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Record this tick's idle observation for `root` and return whether the
+    /// idle EDGE (non-idle → idle) just fired. The first observation for a root
+    /// treats the prior state as idle, so booting idle never fires.
+    pub fn observe_edge(&mut self, root: &Path, idle_now: bool) -> bool {
+        let prev = self.prev_idle.get(root).copied().unwrap_or(true);
+        self.prev_idle.insert(root.to_path_buf(), idle_now);
+        !prev && idle_now
+    }
+
+    /// Whether `(root, role)` is outside its debounce window — never fired, or
+    /// the last idle-triggered run was at least [`IDLE_TRIGGER_DEBOUNCE`] ago.
+    #[must_use]
+    pub fn debounce_ok(&self, root: &Path, role: &'static str, now: Instant) -> bool {
+        match self.last_fired.get(&(root.to_path_buf(), role)) {
+            Some(&last) => now.duration_since(last) >= IDLE_TRIGGER_DEBOUNCE,
+            None => true,
+        }
+    }
+
+    /// Record that an idle-triggered run for `(root, role)` fired at `now`,
+    /// starting its debounce window.
+    pub fn record_fired(&mut self, root: &Path, role: &'static str, now: Instant) {
+        self.last_fired.insert((root.to_path_buf(), role), now);
+    }
+}
+
+/// Decide which on-idle roles should fire for `root` right now, given this
+/// tick's idle observation. Pure of any claude spawning (the caller does the
+/// fire-and-forget invocation), so the edge / debounce / guard logic is
+/// unit-testable without a real `claude` session.
+///
+/// Steps, in order:
+/// 1. Record the idle edge (always — so the level state stays accurate even on
+///    a tick that ends up not firing).
+/// 2. Bail on no edge, or on an active scheduled drain (#4090).
+/// 3. Bail when the role runner is disabled for this root
+///    ([`resolve_enabled`], precedence env > config > default).
+/// 4. Per configured on-idle role ([`resolve_on_idle_roles`]): skip if inside
+///    the debounce window, or if an interval / idle run already holds the
+///    in-progress guard; else record the fire and acquire the guard.
+///
+/// The returned [`RoleRunGuard`]s must be held by the caller for the duration
+/// of each fire-and-forget invocation (they clear the in-progress entry on
+/// drop).
+#[must_use]
+pub fn plan_idle_runs(
+    trigger: &mut IdleTrigger,
+    in_progress: &InProgressGuard,
+    root: &Path,
+    config: &RoleRunnerConfig,
+    idle_now: bool,
+    draining: bool,
+    now: Instant,
+) -> Vec<(RoleSpec, RoleRunGuard)> {
+    let edge = trigger.observe_edge(root, idle_now);
+    if !edge {
+        return Vec::new();
+    }
+    if draining {
+        log::debug!(
+            "role_runner: idle edge for {} suppressed — drain in progress (#4090)",
+            root.display()
+        );
+        return Vec::new();
+    }
+    if !resolve_enabled(config) {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    for spec in resolve_on_idle_roles(config) {
+        if !trigger.debounce_ok(root, spec.name, now) {
+            log::debug!(
+                "role_runner: idle edge for {} — {} within {}s debounce, skipping",
+                root.display(),
+                spec.name,
+                IDLE_TRIGGER_DEBOUNCE.as_secs()
+            );
+            continue;
+        }
+        let Some(guard) =
+            RoleRunGuard::try_acquire(in_progress.clone(), root.to_path_buf(), spec.name)
+        else {
+            log::debug!(
+                "role_runner: idle edge for {} — {} run already in progress, skipping",
+                root.display(),
+                spec.name
+            );
+            continue;
+        };
+        trigger.record_fired(root, spec.name, now);
+        out.push((spec, guard));
+    }
+    out
+}
+
+/// Observe `root`'s post-tick idle state and, on the idle edge, fire-and-forget
+/// each configured on-idle role (#4364) — the entry point the work-finder loop
+/// calls once per root per tick.
+///
+/// Reads `root`'s own `.loom/config.json` (hot-apply, like the interval loops)
+/// each tick and delegates the edge / debounce / guard decision to
+/// [`plan_idle_runs`]. Each fired role runs as a detached `tokio::spawn` +
+/// `spawn_blocking`, so this returns immediately — the work-finder tick NEVER
+/// awaits a multi-minute role session. The in-progress guard for each run is
+/// held for the whole invocation and cleared on every exit path.
+pub fn observe_and_fire_idle(
+    trigger: &mut IdleTrigger,
+    in_progress: &InProgressGuard,
+    root: &Path,
+    idle_now: bool,
+    draining: bool,
+) {
+    let config = read_role_runner_config(root);
+    let plans =
+        plan_idle_runs(trigger, in_progress, root, &config, idle_now, draining, Instant::now());
+    for (spec, guard) in plans {
+        let root_owned = root.to_path_buf();
+        let name = spec.name;
+        let prompt = spec.prompt;
+        log::info!(
+            "role_runner: idle edge for {} — firing idle-triggered {} run (#4364)",
+            root.display(),
+            name
+        );
+        tokio::spawn(async move {
+            // Held for the whole invocation; the in-progress entry clears when
+            // this guard drops (every exit path — success/failure/panic).
+            let _guard = guard;
+            let run_root = root_owned.clone();
+            let tick_start = Instant::now();
+            let joined = tokio::task::spawn_blocking(move || {
+                ScriptRoleInvocationRunner::new(run_root).invoke(name, prompt)
+            })
+            .await;
+            let elapsed = tick_start.elapsed();
+            match joined {
+                Ok(outcome) => log_outcome_for_root(name, &root_owned, &outcome, elapsed),
+                Err(e) => log::error!(
+                    "role_runner: idle-triggered {name} run for {} panicked ({e})",
+                    root_owned.display()
+                ),
+            }
+        });
+    }
 }
 
 // ============================================================================
@@ -608,6 +904,8 @@ pub fn spawn_role_task<R>(
     spec: RoleSpec,
     interval: Duration,
     drain: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    root: PathBuf,
+    in_progress: InProgressGuard,
 ) -> tokio::task::JoinHandle<()>
 where
     R: RoleInvocationRunner + Send + 'static,
@@ -632,6 +930,19 @@ where
             }
             let name = spec.name;
             let prompt = spec.prompt;
+            // Shared in-progress guard (#4364): skip this interval tick if an
+            // idle-triggered (or overlapping) run for the same (root, role) is
+            // already active. Held for the whole invocation; cleared on drop.
+            let Some(_run_guard) =
+                RoleRunGuard::try_acquire(in_progress.clone(), root.clone(), name)
+            else {
+                log::debug!(
+                    "role_runner: {} tick for {} skipped — a run is already in progress (#4364)",
+                    name,
+                    root.display()
+                );
+                continue;
+            };
             let tick_start = Instant::now();
             let joined = tokio::task::spawn_blocking(move || {
                 let outcome = runner.invoke(name, prompt);
@@ -673,6 +984,7 @@ pub fn spawn_multi_role_task(
     fallback_root: PathBuf,
     interval: Duration,
     drain: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    in_progress: InProgressGuard,
 ) -> tokio::task::JoinHandle<()> {
     log::info!(
         "role_runner: starting {} multi-workspace loop (interval={}s)",
@@ -726,9 +1038,24 @@ pub fn spawn_multi_role_task(
                     );
                     continue;
                 }
-                let root_for_task = root.clone();
                 let name = spec.name;
                 let prompt = spec.prompt;
+                // Shared in-progress guard (#4364): skip this root's interval
+                // tick when an idle-triggered (or overlapping) run for the same
+                // (root, role) is already active. Held across the invocation;
+                // cleared on drop (every exit path).
+                let Some(_run_guard) =
+                    RoleRunGuard::try_acquire(in_progress.clone(), root.clone(), name)
+                else {
+                    log::debug!(
+                        "role_runner: {} tick for {} skipped — a run is already in progress \
+                         (#4364)",
+                        name,
+                        root.display()
+                    );
+                    continue;
+                };
+                let root_for_task = root.clone();
                 let tick_start = Instant::now();
                 let joined = tokio::task::spawn_blocking(move || {
                     let mut runner = ScriptRoleInvocationRunner::new(root_for_task);
@@ -1015,6 +1342,7 @@ mod tests {
                 enabled: Some(true),
                 roles: Some(vec!["curator".to_string(), "guide".to_string()]),
                 interval_secs: Some(120),
+                on_idle: None,
             }
         );
     }
@@ -1053,6 +1381,7 @@ mod tests {
                 enabled: Some(true),
                 roles: Some(vec!["curator".to_string()]),
                 interval_secs: Some(60),
+                on_idle: None,
             }
         );
     }
@@ -1090,6 +1419,7 @@ mod tests {
             enabled: None,
             roles: Some(vec![]),
             interval_secs: None,
+            on_idle: None,
         };
         assert_eq!(resolve_roles(&config), Vec::new());
     }
@@ -1100,6 +1430,7 @@ mod tests {
             enabled: None,
             roles: Some(vec!["guide".to_string(), "champion".to_string()]),
             interval_secs: None,
+            on_idle: None,
         };
         let roles = resolve_roles(&config);
         assert_eq!(roles.iter().map(|r| r.name).collect::<Vec<_>>(), vec!["champion", "guide"]);
@@ -1111,6 +1442,7 @@ mod tests {
             enabled: None,
             roles: Some(vec!["curator".to_string(), "not-a-role".to_string()]),
             interval_secs: None,
+            on_idle: None,
         };
         let roles = resolve_roles(&config);
         assert_eq!(roles.iter().map(|r| r.name).collect::<Vec<_>>(), vec!["curator"]);
@@ -1135,6 +1467,7 @@ mod tests {
             enabled: Some(true),
             roles: None,
             interval_secs: None,
+            on_idle: None,
         }));
     }
 
@@ -1146,12 +1479,14 @@ mod tests {
             enabled: Some(true),
             roles: None,
             interval_secs: None,
+            on_idle: None,
         }));
         std::env::set_var(ROLE_RUNNER_ENABLE_ENV, "1");
         assert!(resolve_enabled(&RoleRunnerConfig {
             enabled: Some(false),
             roles: None,
             interval_secs: None,
+            on_idle: None,
         }));
         std::env::remove_var(ROLE_RUNNER_ENABLE_ENV);
     }
@@ -1175,7 +1510,8 @@ mod tests {
                 &RoleRunnerConfig {
                     enabled: None,
                     roles: None,
-                    interval_secs: Some(42)
+                    interval_secs: Some(42),
+                    on_idle: None,
                 }
             ),
             Duration::from_secs(42)
@@ -1189,7 +1525,8 @@ mod tests {
                 &RoleRunnerConfig {
                     enabled: None,
                     roles: None,
-                    interval_secs: Some(42)
+                    interval_secs: Some(42),
+                    on_idle: None,
                 }
             ),
             Duration::from_secs(7)
@@ -1250,7 +1587,14 @@ mod tests {
             default_interval_secs: 1,
         };
         let drain = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let handle = spawn_role_task(runner, spec, Duration::from_millis(20), drain);
+        let handle = spawn_role_task(
+            runner,
+            spec,
+            Duration::from_millis(20),
+            drain,
+            PathBuf::from("/tmp/loom-test-root"),
+            new_in_progress_guard(),
+        );
 
         wait_for_calls(&calls, 1, Duration::from_secs(2)).await;
         wait_for_calls(&calls, 3, Duration::from_secs(2)).await;
@@ -1277,7 +1621,14 @@ mod tests {
         };
         // Drain already engaged before the loop starts.
         let drain = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
-        let handle = spawn_role_task(runner, spec, Duration::from_millis(20), drain.clone());
+        let handle = spawn_role_task(
+            runner,
+            spec,
+            Duration::from_millis(20),
+            drain.clone(),
+            PathBuf::from("/tmp/loom-test-root"),
+            new_in_progress_guard(),
+        );
 
         // Let several tick intervals elapse; not a single invoke may fire.
         tokio::time::sleep(Duration::from_millis(200)).await;
@@ -1308,7 +1659,14 @@ mod tests {
             default_interval_secs: 1,
         };
         let drain = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let handle = spawn_role_task(PanicOnceRunner, spec, Duration::from_millis(20), drain);
+        let handle = spawn_role_task(
+            PanicOnceRunner,
+            spec,
+            Duration::from_millis(20),
+            drain,
+            PathBuf::from("/tmp/loom-test-root"),
+            new_in_progress_guard(),
+        );
         let result = tokio::time::timeout(Duration::from_secs(5), handle).await;
         assert!(result.is_ok(), "loop task should finish (not hang) after the runner panics");
     }
@@ -1360,5 +1718,368 @@ mod tests {
             &RoleTickOutcome::Failure("boom".to_string()),
             Duration::from_millis(1)
         ));
+    }
+
+    // ===================================================================
+    // onIdle config parsing (#4364)
+    // ===================================================================
+
+    #[test]
+    fn test_config_on_idle_absent_is_none() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_config(tmp.path(), r#"{"autonomous": {"roleRunner": {"enabled": true}}}"#);
+        assert_eq!(read_role_runner_config(tmp.path()).on_idle, None);
+    }
+
+    #[test]
+    fn test_config_on_idle_parses_array() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_config(tmp.path(), r#"{"autonomous": {"roleRunner": {"onIdle": ["champion"]}}}"#);
+        assert_eq!(read_role_runner_config(tmp.path()).on_idle, Some(vec!["champion".to_string()]));
+    }
+
+    #[test]
+    fn test_config_on_idle_non_array_soft_fails_to_none() {
+        let tmp = tempfile::tempdir().unwrap();
+        // A non-array (string) value must not panic — it soft-fails to `None`,
+        // matching the `roles` contract.
+        write_config(tmp.path(), r#"{"autonomous": {"roleRunner": {"onIdle": "champion"}}}"#);
+        assert_eq!(read_role_runner_config(tmp.path()).on_idle, None);
+    }
+
+    #[test]
+    fn test_config_on_idle_drops_non_string_entries() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Non-string entries are dropped; string entries survive (unknown
+        // *names* are filtered later in `resolve_on_idle_roles`).
+        write_config(
+            tmp.path(),
+            r#"{"autonomous": {"roleRunner": {"onIdle": ["champion", 7, true]}}}"#,
+        );
+        assert_eq!(read_role_runner_config(tmp.path()).on_idle, Some(vec!["champion".to_string()]));
+    }
+
+    // ===================================================================
+    // resolve_on_idle_roles (#4364)
+    // ===================================================================
+
+    #[test]
+    fn test_resolve_on_idle_roles_absent_is_empty() {
+        // Opposite default from `roles`: absent key means NO idle triggering.
+        assert_eq!(resolve_on_idle_roles(&RoleRunnerConfig::default()), Vec::new());
+    }
+
+    #[test]
+    fn test_resolve_on_idle_roles_parses_and_preserves_order() {
+        let config = RoleRunnerConfig {
+            enabled: None,
+            roles: None,
+            interval_secs: None,
+            on_idle: Some(vec!["guide".to_string(), "champion".to_string()]),
+        };
+        let roles = resolve_on_idle_roles(&config);
+        assert_eq!(roles.iter().map(|r| r.name).collect::<Vec<_>>(), vec!["champion", "guide"]);
+    }
+
+    #[test]
+    fn test_resolve_on_idle_roles_ignores_unknown_names() {
+        let config = RoleRunnerConfig {
+            enabled: None,
+            roles: None,
+            interval_secs: None,
+            on_idle: Some(vec![
+                "champion".to_string(),
+                "builder".to_string(),
+                "nope".to_string(),
+            ]),
+        };
+        let roles = resolve_on_idle_roles(&config);
+        assert_eq!(roles.iter().map(|r| r.name).collect::<Vec<_>>(), vec!["champion"]);
+    }
+
+    #[test]
+    fn test_resolve_on_idle_roles_empty_array_is_empty() {
+        let config = RoleRunnerConfig {
+            enabled: None,
+            roles: None,
+            interval_secs: None,
+            on_idle: Some(vec![]),
+        };
+        assert_eq!(resolve_on_idle_roles(&config), Vec::new());
+    }
+
+    // ===================================================================
+    // IdleTrigger — edge detection + debounce (#4364)
+    // ===================================================================
+
+    #[test]
+    fn test_idle_trigger_boot_idle_does_not_fire() {
+        let mut t = IdleTrigger::new();
+        let root = Path::new("/tmp/loom-root-a");
+        // First-ever observation is idle: boot on an empty queue must NOT fire.
+        assert!(!t.observe_edge(root, true));
+    }
+
+    #[test]
+    fn test_idle_trigger_fires_on_non_idle_to_idle_edge() {
+        let mut t = IdleTrigger::new();
+        let root = Path::new("/tmp/loom-root-b");
+        // Boot idle (no fire), then busy, then idle => the edge fires exactly on
+        // the busy → idle transition.
+        assert!(!t.observe_edge(root, true));
+        assert!(!t.observe_edge(root, false));
+        assert!(t.observe_edge(root, true));
+    }
+
+    #[test]
+    fn test_idle_trigger_does_not_refire_on_sustained_idle() {
+        let mut t = IdleTrigger::new();
+        let root = Path::new("/tmp/loom-root-c");
+        assert!(!t.observe_edge(root, false)); // busy
+        assert!(t.observe_edge(root, true)); // edge
+                                             // Staying idle across N further ticks must not re-fire.
+        assert!(!t.observe_edge(root, true));
+        assert!(!t.observe_edge(root, true));
+    }
+
+    #[test]
+    fn test_idle_trigger_no_fire_while_in_flight_then_fires_when_drained() {
+        let mut t = IdleTrigger::new();
+        let root = Path::new("/tmp/loom-root-d");
+        // A tick that dispatched nothing but still has in-flight sweeps is
+        // non-idle (not empty) — no edge; the edge fires on the later tick where
+        // in-flight reaches zero.
+        assert!(!t.observe_edge(root, false));
+        assert!(!t.observe_edge(root, false));
+        assert!(t.observe_edge(root, true));
+    }
+
+    #[test]
+    fn test_idle_trigger_edge_is_per_root() {
+        let mut t = IdleTrigger::new();
+        let a = Path::new("/tmp/loom-root-e1");
+        let b = Path::new("/tmp/loom-root-e2");
+        // Drive root a busy→idle (edge) while b stays idle from boot (no edge).
+        assert!(!t.observe_edge(a, false));
+        assert!(!t.observe_edge(b, true));
+        assert!(t.observe_edge(a, true)); // a fires
+        assert!(!t.observe_edge(b, true)); // b never fired
+    }
+
+    #[test]
+    fn test_idle_trigger_debounce_window() {
+        let mut t = IdleTrigger::new();
+        let root = Path::new("/tmp/loom-root-f");
+        let t0 = Instant::now();
+        // Never fired => outside the window.
+        assert!(t.debounce_ok(root, "champion", t0));
+        t.record_fired(root, "champion", t0);
+        // Within 60s => debounced.
+        assert!(!t.debounce_ok(root, "champion", t0 + Duration::from_secs(30)));
+        assert!(!t.debounce_ok(root, "champion", t0 + Duration::from_secs(59)));
+        // At/after 60s => allowed again.
+        assert!(t.debounce_ok(root, "champion", t0 + IDLE_TRIGGER_DEBOUNCE));
+        assert!(t.debounce_ok(root, "champion", t0 + Duration::from_secs(61)));
+        // Debounce is per-role: a different role is unaffected.
+        assert!(t.debounce_ok(root, "curator", t0 + Duration::from_secs(1)));
+    }
+
+    // ===================================================================
+    // RoleRunGuard — in-progress overlap protection (#4364)
+    // ===================================================================
+
+    #[test]
+    fn test_role_run_guard_blocks_second_acquire_then_releases_on_drop() {
+        let set = new_in_progress_guard();
+        let root = PathBuf::from("/tmp/loom-root-g");
+        let g1 = RoleRunGuard::try_acquire(set.clone(), root.clone(), "champion");
+        assert!(g1.is_some(), "first acquire should succeed");
+        // Second acquire of the same (root, role) is refused while held.
+        assert!(
+            RoleRunGuard::try_acquire(set.clone(), root.clone(), "champion").is_none(),
+            "second acquire of the same key must be refused"
+        );
+        // A different role on the same root is independent.
+        assert!(RoleRunGuard::try_acquire(set.clone(), root.clone(), "curator").is_some());
+        // Dropping the first guard clears the entry — a later acquire succeeds.
+        drop(g1);
+        assert!(
+            RoleRunGuard::try_acquire(set, root, "champion").is_some(),
+            "guard must clear its entry on drop"
+        );
+    }
+
+    // ===================================================================
+    // plan_idle_runs — the composed edge/drain/enabled/debounce/guard decision
+    // ===================================================================
+
+    fn on_idle_config(enabled: Option<bool>, roles: Vec<&str>) -> RoleRunnerConfig {
+        RoleRunnerConfig {
+            enabled,
+            roles: None,
+            interval_secs: None,
+            on_idle: Some(roles.into_iter().map(str::to_string).collect()),
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn test_plan_idle_runs_fires_on_edge_when_enabled() {
+        std::env::remove_var(ROLE_RUNNER_ENABLE_ENV);
+        let mut t = IdleTrigger::new();
+        let set = new_in_progress_guard();
+        let root = Path::new("/tmp/loom-plan-a");
+        let cfg = on_idle_config(Some(true), vec!["champion"]);
+        let now = Instant::now();
+        // Boot idle: no edge, so no plan.
+        assert!(plan_idle_runs(&mut t, &set, root, &cfg, true, false, now).is_empty());
+        // Go busy: no edge.
+        assert!(plan_idle_runs(&mut t, &set, root, &cfg, false, false, now).is_empty());
+        // Busy → idle edge: champion fires (and its guard is now held).
+        let plan = plan_idle_runs(&mut t, &set, root, &cfg, true, false, now);
+        assert_eq!(plan.iter().map(|(s, _)| s.name).collect::<Vec<_>>(), vec!["champion"]);
+    }
+
+    #[test]
+    #[serial]
+    fn test_plan_idle_runs_drain_suppresses() {
+        std::env::remove_var(ROLE_RUNNER_ENABLE_ENV);
+        let mut t = IdleTrigger::new();
+        let set = new_in_progress_guard();
+        let root = Path::new("/tmp/loom-plan-b");
+        let cfg = on_idle_config(Some(true), vec!["champion"]);
+        let now = Instant::now();
+        assert!(plan_idle_runs(&mut t, &set, root, &cfg, false, false, now).is_empty());
+        // Edge present, but draining => suppressed.
+        assert!(plan_idle_runs(&mut t, &set, root, &cfg, true, true, now).is_empty());
+    }
+
+    #[test]
+    #[serial]
+    fn test_plan_idle_runs_disabled_suppresses() {
+        std::env::remove_var(ROLE_RUNNER_ENABLE_ENV);
+        let mut t = IdleTrigger::new();
+        let set = new_in_progress_guard();
+        let root = Path::new("/tmp/loom-plan-c");
+        let cfg = on_idle_config(Some(false), vec!["champion"]);
+        let now = Instant::now();
+        assert!(plan_idle_runs(&mut t, &set, root, &cfg, false, false, now).is_empty());
+        // Edge present, but role runner disabled => no fire.
+        assert!(plan_idle_runs(&mut t, &set, root, &cfg, true, false, now).is_empty());
+    }
+
+    #[test]
+    #[serial]
+    fn test_plan_idle_runs_debounced_second_edge_then_fires_after_window() {
+        std::env::remove_var(ROLE_RUNNER_ENABLE_ENV);
+        let mut t = IdleTrigger::new();
+        let set = new_in_progress_guard();
+        let root = Path::new("/tmp/loom-plan-d");
+        let cfg = on_idle_config(Some(true), vec!["champion"]);
+        let t0 = Instant::now();
+        // First edge fires and records the debounce timestamp.
+        assert!(plan_idle_runs(&mut t, &set, root, &cfg, false, false, t0).is_empty());
+        let first = plan_idle_runs(&mut t, &set, root, &cfg, true, false, t0);
+        assert_eq!(first.len(), 1);
+        drop(first); // release the guard so only debounce can block the next edge
+                     // Flap busy→idle again within 60s: edge present but debounced.
+        assert!(plan_idle_runs(
+            &mut t,
+            &set,
+            root,
+            &cfg,
+            false,
+            false,
+            t0 + Duration::from_secs(10)
+        )
+        .is_empty());
+        let debounced =
+            plan_idle_runs(&mut t, &set, root, &cfg, true, false, t0 + Duration::from_secs(20));
+        assert!(debounced.is_empty(), "second edge within 60s must be debounced");
+        // Flap again after the window: fires.
+        assert!(plan_idle_runs(
+            &mut t,
+            &set,
+            root,
+            &cfg,
+            false,
+            false,
+            t0 + Duration::from_secs(70)
+        )
+        .is_empty());
+        let after =
+            plan_idle_runs(&mut t, &set, root, &cfg, true, false, t0 + Duration::from_secs(80));
+        assert_eq!(after.len(), 1, "edge after the debounce window must fire");
+    }
+
+    #[test]
+    #[serial]
+    fn test_plan_idle_runs_skips_when_guard_already_held() {
+        std::env::remove_var(ROLE_RUNNER_ENABLE_ENV);
+        let mut t = IdleTrigger::new();
+        let set = new_in_progress_guard();
+        let root = Path::new("/tmp/loom-plan-e");
+        let cfg = on_idle_config(Some(true), vec!["champion"]);
+        let now = Instant::now();
+        // Simulate an interval run already holding the guard for (root, champion).
+        let _held = RoleRunGuard::try_acquire(set.clone(), root.to_path_buf(), "champion");
+        assert!(plan_idle_runs(&mut t, &set, root, &cfg, false, false, now).is_empty());
+        // Edge present, but the guard is held by the interval run => idle skips.
+        assert!(
+            plan_idle_runs(&mut t, &set, root, &cfg, true, false, now).is_empty(),
+            "idle trigger must skip while an interval run holds the guard"
+        );
+    }
+
+    // ===================================================================
+    // Interval loop honors the shared in-progress guard (#4364)
+    // ===================================================================
+
+    /// A pre-held guard for (root, role) makes the interval loop skip every
+    /// tick (0 invokes); clearing it resumes dispatch — proving the interval
+    /// path also respects the shared guard, so an idle-triggered run in
+    /// progress cannot be overlapped by an interval tick.
+    #[tokio::test]
+    async fn test_interval_loop_skips_while_guard_held() {
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let runner = FakeRunner {
+            outcomes: vec![RoleTickOutcome::Success; 3],
+            calls: calls.clone(),
+        };
+        let spec = RoleSpec {
+            name: "champion",
+            prompt: "/loom:champion",
+            default_interval_secs: 1,
+        };
+        let root = PathBuf::from("/tmp/loom-interval-guard");
+        let in_progress = new_in_progress_guard();
+        // Pre-hold the guard for (root, champion) so the loop cannot acquire it.
+        in_progress
+            .lock()
+            .unwrap()
+            .insert((root.clone(), "champion"));
+        let drain = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let handle = spawn_role_task(
+            runner,
+            spec,
+            Duration::from_millis(20),
+            drain,
+            root.clone(),
+            in_progress.clone(),
+        );
+
+        // Several intervals elapse; not a single invoke may fire.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "interval tick must skip while the shared guard is held"
+        );
+
+        // Release the guard — dispatch resumes, proving the gate (not a dead loop).
+        in_progress.lock().unwrap().remove(&(root, "champion"));
+        wait_for_calls(&calls, 1, Duration::from_secs(2)).await;
+
+        handle.abort();
     }
 }
