@@ -165,16 +165,73 @@ EOF
 # simulating a launchd-managed loom-daemon for the #4042 ownership-detection
 # tests. Paired with a fake `uname`->Darwin so the update script's Darwin-gated
 # launchd path fires deterministically on any host.
+#
+# Optional $3/$4 (#4232): when a <post_restart_marker> file path is given,
+# `print` reports pid 4242 until that file EXISTS, at which point it reports
+# <post_restart_pid> instead — simulating "launchd relaunched the job onto a
+# new (real, live) pid the instant the restart request was accepted". Tests
+# that don't pass $3/$4 keep the old static-4242-forever behavior (they never
+# exercise the #4232 pid-verification poll).
 write_fake_launchd_loaded_bin() {
-    local bin_dir="$1" log="$2"
+    local bin_dir="$1" log="$2" post_restart_marker="${3:-}" post_restart_pid="${4:-}"
     mkdir -p "$bin_dir"
     : > "$log"
     cat > "$bin_dir/launchctl" <<EOF
 #!/usr/bin/env bash
 echo "\$*" >> "${log}"
 case "\${1:-}" in
-  print) echo "	pid = 4242" ; exit 0 ;;
+  print)
+    if [[ -n "${post_restart_marker}" && -e "${post_restart_marker}" ]]; then
+      echo "	pid = ${post_restart_pid}"
+    else
+      echo "	pid = 4242"
+    fi
+    exit 0 ;;
   *)     exit 0 ;;
+esac
+EOF
+    chmod +x "$bin_dir/launchctl"
+    cat > "$bin_dir/uname" <<'EOF'
+#!/usr/bin/env bash
+echo "Darwin"
+EOF
+    chmod +x "$bin_dir/uname"
+}
+
+# Writes a fake `launchctl` at $1 for the #4232 restart-VERIFICATION tests: the
+# reported pid lives in a state file ($3) rather than being hardcoded, so a
+# test can hold it "stuck" on the pre-restart pid to simulate launchd failing
+# to relaunch on its own. `print` reports whatever pid (if any) is currently in
+# the state file plus a "last exit status" line (diagnostic breadcrumb,
+# #4232). `kickstart` is recorded VERBATIM to $2 (so a test can assert it was
+# never invoked with `-k`) and, only when $4 (<kickstart_new_pid>) is given,
+# overwrites the state file with it — simulating a kickstart-triggered
+# relaunch; when $4 is omitted, `kickstart` is a no-op (a kickstart that also
+# fails to bring the job up).
+write_fake_launchd_pid_bin() {
+    local bin_dir="$1" log="$2" state_file="$3" kickstart_new_pid="${4:-}"
+    mkdir -p "$bin_dir"
+    : > "$log"
+    cat > "$bin_dir/launchctl" <<EOF
+#!/usr/bin/env bash
+echo "\$*" >> "${log}"
+case "\${1:-}" in
+  print)
+    pid="\$(cat "${state_file}" 2>/dev/null)"
+    if [[ -n "\$pid" ]]; then
+      echo "	state = running"
+      echo "	pid = \$pid"
+    else
+      echo "	state = not running"
+    fi
+    echo "	last exit status = 0"
+    exit 0 ;;
+  kickstart)
+    if [[ -n "${kickstart_new_pid}" ]]; then
+      echo "${kickstart_new_pid}" > "${state_file}"
+    fi
+    exit 0 ;;
+  *) exit 0 ;;
 esac
 EOF
     chmod +x "$bin_dir/launchctl"
@@ -861,11 +918,13 @@ else
 fi
 
 # ============================================================
-# 15. Launchd ownership + restart (#4042): a launchd-managed daemon (stub
+# 15. Launchd ownership + restart (#4042/#4232): a launchd-managed daemon (stub
 #     launchctl reports a LOADED job + pid) with NO .loom/.daemon.pid file ->
 #     the updater plans/executes a RESTART (not "was not running"), drives it
 #     through the `restart` subcommand (stub records the invocation), does NOT
-#     consult .daemon.flags, and exits 0.
+#     consult .daemon.flags, and exits 0. The stub relaunches onto a NEW, real,
+#     live pid the instant the restart is accepted (#4232 case (a): relaunch
+#     observed -> success, no kickstart fallback ever invoked).
 # ============================================================
 W15="$BASE_WORKDIR/w15"
 new_fixture "$W15"
@@ -881,13 +940,18 @@ write_fake_daemon_restart "$NEW_FAKE15" "$HEAD15" "$RESTART_MARKER15" 0
 # A .daemon.flags that MUST NOT be consulted in launchd mode (would otherwise
 # add --work-finder to a stop+start path).
 echo "--work-finder" > "$W15/.loom/.daemon.flags"
+# A real, live process standing in for "the relaunched job's new pid" — the
+# #4232 poll requires a live pid (kill -0), not just a differing number.
+sleep 60 >/dev/null 2>&1 &
+RELAUNCHED_PID15=$!
 LD_BIN15="$W15/launchd-bin"
-write_fake_launchd_loaded_bin "$LD_BIN15" "$W15/launchctl.log"
+write_fake_launchd_loaded_bin "$LD_BIN15" "$W15/launchctl.log" "$RESTART_MARKER15" "$RELAUNCHED_PID15"
 
 out15=$( cd "$W15" && PATH="$LD_BIN15:$TEST_PATH" LOOM_DAEMON_LAUNCHD=1 \
     LOOM_DAEMON_BIN="$INSTALLED15" NEW_FAKE_BIN_SRC="$NEW_FAKE15" \
     bash "$UPDATE_SCRIPT" 2>&1 )
 rc15=$?
+kill "$RELAUNCHED_PID15" 2>/dev/null || true
 assert_eq "0" "$rc15" "launchd-managed update (no pid file) exits 0"
 TESTS_RUN=$((TESTS_RUN + 1))
 if [[ -s "$RESTART_MARKER15" ]]; then
@@ -906,6 +970,24 @@ if echo "$out15" | grep -qi 'not running'; then
 else
     TESTS_PASSED=$((TESTS_PASSED + 1))
     echo -e "${GREEN}✓${NC} launchd-loaded job is NOT mistaken for 'was not running'"
+fi
+TESTS_RUN=$((TESTS_RUN + 1))
+if grep -q "^${RELAUNCHED_PID15}$\|new pid ${RELAUNCHED_PID15}" <<< "$out15" || echo "$out15" | grep -q "new pid ${RELAUNCHED_PID15}"; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} success message reports the VERIFIED new pid (#4232)"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} success message reports the VERIFIED new pid (#4232)"
+    echo "  output: $out15"
+fi
+TESTS_RUN=$((TESTS_RUN + 1))
+if grep -q '^kickstart ' "$W15/launchctl.log" 2>/dev/null; then
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} relaunch observed immediately -> kickstart fallback is NEVER invoked (#4232 case a)"
+    echo "  launchctl.log: $(cat "$W15/launchctl.log" 2>/dev/null)"
+else
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} relaunch observed immediately -> kickstart fallback is NEVER invoked (#4232 case a)"
 fi
 TESTS_RUN=$((TESTS_RUN + 1))
 if echo "$out15" | grep -qi 'FLAGS-OFF'; then
@@ -1637,6 +1719,128 @@ else
     echo -e "${RED}✗${NC} --relaunch with an absent unit fails loudly (names the path) and renders nothing"
     echo "  rc=$rc34 unit-exists=$([[ -e "$UNIT_PATH34" ]] && echo yes || echo no)"
     echo "  output: $out34"
+fi
+
+# ============================================================
+# 35. Restart ack'd but launchd never relaunches -> kickstart fallback DOES
+#     relaunch it (#4232 case (b)): the restart request is accepted (exit 0)
+#     but the reported pid never moves off the pre-restart pid on its own;
+#     the updater falls back to a PLAIN 'launchctl kickstart' (never -k),
+#     which (per the stub) IS what finally moves the pid — success, with a
+#     remediation note in the output. Poll windows are shrunk via env so the
+#     test runs fast without changing the production defaults.
+# ============================================================
+W35="$BASE_WORKDIR/w35"
+new_fixture "$W35"
+INSTALLED35="$W35/installed/loom-daemon"
+mkdir -p "$W35/installed"
+RESTART_MARKER35="$W35/restart-invoked"
+write_fake_daemon_restart "$INSTALLED35" "deadbee" "$RESTART_MARKER35" 0
+NEW_FAKE35="$W35/new-fake-daemon"
+HEAD35="$(cd "$W35" && git rev-parse --short HEAD)"
+write_fake_daemon_restart "$NEW_FAKE35" "$HEAD35" "$RESTART_MARKER35" 0
+
+sleep 60 >/dev/null 2>&1 &
+OLD_PID26=$!
+sleep 60 >/dev/null 2>&1 &
+KICKSTART_PID35=$!
+STATE35="$W35/launchd-pid-state"
+echo "$OLD_PID26" > "$STATE35"
+LD_BIN35="$W35/launchd-bin"
+write_fake_launchd_pid_bin "$LD_BIN35" "$W35/launchctl.log" "$STATE35" "$KICKSTART_PID35"
+
+out35=$( cd "$W35" && PATH="$LD_BIN35:$TEST_PATH" LOOM_DAEMON_LAUNCHD=1 \
+    LOOM_DAEMON_BIN="$INSTALLED35" NEW_FAKE_BIN_SRC="$NEW_FAKE35" \
+    LOOM_DAEMON_RESTART_POLL_SECS=1 LOOM_DAEMON_RESTART_POLL_INTERVAL=0.2 \
+    LOOM_DAEMON_RESTART_KICKSTART_POLL_SECS=3 \
+    bash "$UPDATE_SCRIPT" 2>&1 )
+rc26=$?
+kill "$OLD_PID26" "$KICKSTART_PID35" 2>/dev/null || true
+assert_eq "0" "$rc26" "no spontaneous relaunch -> kickstart fallback relaunches it -> exit 0 (#4232 case b)"
+TESTS_RUN=$((TESTS_RUN + 1))
+if echo "$out35" | grep -qi 'kickstart' && echo "$out35" | grep -qi 'remediation'; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} success output names the kickstart fallback + a remediation note"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} success output names the kickstart fallback + a remediation note"
+    echo "  output: $out35"
+fi
+TESTS_RUN=$((TESTS_RUN + 1))
+if grep -qE '^kickstart [^ ]+$' "$W35/launchctl.log" 2>/dev/null; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} kickstart is invoked PLAIN — never with -k"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} kickstart is invoked PLAIN — never with -k"
+    echo "  launchctl.log: $(cat "$W35/launchctl.log" 2>/dev/null)"
+fi
+TESTS_RUN=$((TESTS_RUN + 1))
+if grep -q -- '-k' "$W35/launchctl.log" 2>/dev/null; then
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} kickstart is NEVER invoked with -k (would risk killing a daemon that relaunched during the race window)"
+    echo "  launchctl.log: $(cat "$W35/launchctl.log" 2>/dev/null)"
+else
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} kickstart is NEVER invoked with -k (would risk killing a daemon that relaunched during the race window)"
+fi
+
+# ============================================================
+# 36. Restart ack'd, launchd never relaunches, AND the kickstart fallback also
+#     never brings it up -> exit NON-ZERO (7), loudly, rather than a silent
+#     half-update success (#4232 case (c)).
+# ============================================================
+W36="$BASE_WORKDIR/w36"
+new_fixture "$W36"
+INSTALLED36="$W36/installed/loom-daemon"
+mkdir -p "$W36/installed"
+RESTART_MARKER36="$W36/restart-invoked"
+write_fake_daemon_restart "$INSTALLED36" "deadbee" "$RESTART_MARKER36" 0
+NEW_FAKE36="$W36/new-fake-daemon"
+HEAD36="$(cd "$W36" && git rev-parse --short HEAD)"
+write_fake_daemon_restart "$NEW_FAKE36" "$HEAD36" "$RESTART_MARKER36" 0
+
+sleep 60 >/dev/null 2>&1 &
+OLD_PID27=$!
+STATE36="$W36/launchd-pid-state"
+echo "$OLD_PID27" > "$STATE36"
+LD_BIN36="$W36/launchd-bin"
+# No kickstart_new_pid given -> kickstart is a no-op; the pid never moves.
+write_fake_launchd_pid_bin "$LD_BIN36" "$W36/launchctl.log" "$STATE36"
+
+out36=$( cd "$W36" && PATH="$LD_BIN36:$TEST_PATH" LOOM_DAEMON_LAUNCHD=1 \
+    LOOM_DAEMON_BIN="$INSTALLED36" NEW_FAKE_BIN_SRC="$NEW_FAKE36" \
+    LOOM_DAEMON_RESTART_POLL_SECS=1 LOOM_DAEMON_RESTART_POLL_INTERVAL=0.2 \
+    LOOM_DAEMON_RESTART_KICKSTART_POLL_SECS=1 \
+    bash "$UPDATE_SCRIPT" 2>&1 )
+rc27=$?
+kill "$OLD_PID27" 2>/dev/null || true
+assert_eq "7" "$rc27" "no relaunch even after kickstart -> exit 7 (never a silent half-update, #4232 case c)"
+TESTS_RUN=$((TESTS_RUN + 1))
+if echo "$out36" | grep -qi 'FAILED' && echo "$out36" | grep -qi 'kickstart'; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} failure output loudly reports the exhausted kickstart fallback"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} failure output loudly reports the exhausted kickstart fallback"
+    echo "  output: $out36"
+fi
+TESTS_RUN=$((TESTS_RUN + 1))
+if echo "$out36" | grep -qi 'last exit status'; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} failure output includes launchctl print diagnostics (state/last exit status)"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} failure output includes launchctl print diagnostics (state/last exit status)"
+    echo "  output: $out36"
+fi
+TESTS_RUN=$((TESTS_RUN + 1))
+if grep -q -- '-k' "$W36/launchctl.log" 2>/dev/null; then
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} exhausted kickstart fallback was still never invoked with -k"
+else
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} exhausted kickstart fallback was still never invoked with -k"
 fi
 
 # ============================================================

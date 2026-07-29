@@ -132,6 +132,15 @@
 #                          checkout. Direct invocation of this script (no
 #                          dispatcher -- the existing dev workflow) never sets
 #                          it and is unaffected.
+#   LOOM_DAEMON_RESTART_POLL_SECS  macOS/launchd only: seconds to poll for a
+#                          NEW, live pid after a `restart` ack before falling
+#                          back to `launchctl kickstart` (default 30, #4232).
+#   LOOM_DAEMON_RESTART_POLL_INTERVAL  Poll interval in seconds between pid
+#                          checks (default 1; may be fractional, e.g. 0.5).
+#   LOOM_DAEMON_RESTART_KICKSTART_POLL_SECS  macOS/launchd only: seconds to
+#                          re-poll for a new, live pid after the `launchctl
+#                          kickstart` fallback before giving up (default 15,
+#                          #4232).
 #
 # Exit codes:
 #   0  up to date (no-op) OR rebuild+provision+restart succeeded
@@ -155,6 +164,14 @@
 #      with --relaunch (or LOOM_DAEMON_UPDATE_RELAUNCH=1) it performs that
 #      re-render+relaunch itself, propagating loom-daemon-start.sh's exit code
 #      (#4042, #4118, #4260 sub-issue C).
+#   7  launchd restart ACK'd but never took effect (#4232): the running (old)
+#      binary accepted the `restart` IPC request (exit 0), but launchd never
+#      relaunched the job onto a NEW, live pid within the poll window, AND the
+#      `launchctl kickstart` fallback (plain, never -k) also failed to bring it
+#      up within its own poll window. The fresh binary IS provisioned, but the
+#      daemon's live status is NOT confirmed — this is the "restart scheduled
+#      but launchd silently never relaunched" outage this issue closes; the
+#      script refuses to report success on the ack alone.
 #
 # See also: loom-daemon-start.sh (writes .loom/.daemon.flags), loom-daemon-stop.sh
 # (SIGTERM -> grace -> SIGKILL; in-flight sweeps survive by design — this
@@ -475,6 +492,54 @@ systemd_unit_loaded() {
 }
 systemd_unit_pid() {
     systemctl --user show -p MainPID --value "$SYSTEMD_UNIT" 2>/dev/null
+}
+
+# ---------- verify a launchd restart actually relaunched the job (#4232) ----------
+# THE PROBLEM: the launchd branch below used to treat a successful `restart`
+# ack (the RUNNING binary accepting the IPC request, exit 0) as success and
+# exit 0 immediately — fire-and-forget. On 2026-07-28 that ack was honest (the
+# supervised daemon exited 0 per its #4054 contract) but launchd's own
+# KeepAlive:SuccessfulExit relaunch never fired, so the script reported success
+# while the daemon silently stayed down for ~4 minutes until an operator ran
+# `launchctl kickstart` by hand. This closes that gap: verify a NEW pid before
+# reporting success, and self-heal via `kickstart` when launchd doesn't.
+#
+# wait_for_new_launchd_pid <pre_pid> <timeout_secs> <interval_secs> — poll
+# `launchd_job_pid` until it reports a pid that is BOTH different from
+# <pre_pid> AND alive (`kill -0`), for up to <timeout_secs>. A pid that merely
+# differs but is already dead (a race artifact) — or that still equals
+# <pre_pid> (the old process lingering mid-teardown during the poll window) —
+# must NEVER be mistaken for a successful relaunch. On success, echoes the new
+# pid on stdout and returns 0; on timeout, returns 1 with no output.
+# <interval_secs> may be fractional (e.g. 0.2), matching `sleep`'s own support.
+wait_for_new_launchd_pid() {
+    local pre_pid="$1" timeout_secs="$2" interval_secs="$3"
+    local deadline cur_pid
+    deadline=$(( $(date +%s) + timeout_secs ))
+    while true; do
+        cur_pid="$(launchd_job_pid)"
+        if [[ -n "$cur_pid" && "$cur_pid" != "$pre_pid" ]] && kill -0 "$cur_pid" 2>/dev/null; then
+            echo "$cur_pid"
+            return 0
+        fi
+        if (( $(date +%s) >= deadline )); then
+            return 1
+        fi
+        sleep "$interval_secs"
+    done
+}
+
+# log_launchd_diagnostics — dump `launchctl print`'s current state as a
+# diagnostic breadcrumb (state / last exit status) when a relaunch cannot be
+# verified, so an operator (or the PR/issue this failure is reported to) has
+# the exact evidence needed to tell "launchd never relaunched" apart from "the
+# daemon crashed immediately after relaunching" (#4232).
+log_launchd_diagnostics() {
+    warn "launchctl print $LAUNCHD_SERVICE diagnostic snapshot:"
+    local line
+    while IFS= read -r line; do
+        warn "  $line"
+    done < <(launchctl print "$LAUNCHD_SERVICE" 2>&1)
 }
 
 # ---------- re-render + relaunch on a refused restart (#4118) ----------
@@ -909,9 +974,43 @@ if [[ "$DAEMON_MANAGER" == "launchd" ]]; then
     echo "loom-daemon is launchd-managed (label ${LAUNCHD_LABEL})."
     echo "Restarting via the supervised restart primitive: $PROVISION_TARGET restart"
     echo "(.daemon.flags is NOT consulted — the plist's EnvironmentVariables carries the equivalent config.)"
+
+    # Capture the pre-restart pid BEFORE the request so the poll below can tell
+    # "launchd relaunched onto a new pid" apart from "the same job never moved".
+    PRE_RESTART_PID="$(launchd_job_pid)"
+
     if "$PROVISION_TARGET" restart; then
-        ok "loom-daemon restart scheduled — launchd will relaunch it onto the freshly-provisioned binary."
-        exit 0
+        # The RUNNING (old) binary accepted the request — but that ack is the
+        # daemon's promise, not proof launchd actually honored it (#4232: the
+        # daemon can exit 0 and launchd can still fail to relaunch it). Verify
+        # a NEW, live pid before reporting success; the success message below
+        # is intentionally the ONLY "restart scheduled"-style success line in
+        # this branch, and it is unreachable until verification passes.
+        RESTART_POLL_SECS="${LOOM_DAEMON_RESTART_POLL_SECS:-30}"
+        RESTART_POLL_INTERVAL="${LOOM_DAEMON_RESTART_POLL_INTERVAL:-1}"
+        KICKSTART_POLL_SECS="${LOOM_DAEMON_RESTART_KICKSTART_POLL_SECS:-15}"
+        echo "Restart request accepted (pre-restart pid: ${PRE_RESTART_PID:-<none>}). Verifying launchd relaunches onto a NEW, live pid within ${RESTART_POLL_SECS}s before reporting success (#4232)..."
+
+        if NEW_PID="$(wait_for_new_launchd_pid "$PRE_RESTART_PID" "$RESTART_POLL_SECS" "$RESTART_POLL_INTERVAL")"; then
+            ok "loom-daemon restart scheduled — launchd relaunched it onto the freshly-provisioned binary (new pid ${NEW_PID}, verified within ${RESTART_POLL_SECS}s)."
+            exit 0
+        fi
+
+        warn "launchd did NOT relaunch within ${RESTART_POLL_SECS}s of the restart ack — no new, live pid observed (pre-restart pid was ${PRE_RESTART_PID:-<none>})."
+        log_launchd_diagnostics
+        warn "Falling back to 'launchctl kickstart $LAUNCHD_SERVICE' (plain — NEVER -k — so a daemon that DID relaunch during the race window above is never killed)."
+        launchctl kickstart "$LAUNCHD_SERVICE" >/dev/null 2>&1
+
+        if NEW_PID="$(wait_for_new_launchd_pid "$PRE_RESTART_PID" "$KICKSTART_POLL_SECS" "$RESTART_POLL_INTERVAL")"; then
+            ok "loom-daemon restart scheduled — launchd's own relaunch did not occur within ${RESTART_POLL_SECS}s, but the 'launchctl kickstart' fallback relaunched it (new pid ${NEW_PID}, verified within ${KICKSTART_POLL_SECS}s). Remediation note: the kickstart fallback was required (#4232) — investigate why launchd did not relaunch the job on its own."
+            exit 0
+        fi
+
+        err "loom-daemon restart FAILED: no new, live pid was observed even after the 'launchctl kickstart' fallback."
+        log_launchd_diagnostics
+        err "The freshly-built binary IS provisioned, but the daemon's live status is NOT confirmed (pre-restart pid was ${PRE_RESTART_PID:-<none>})."
+        err "Investigate manually: launchctl print $LAUNCHD_SERVICE"
+        exit 7
     fi
     # The restart request is served by the RUNNING (old) binary. A pre-#4077
     # daemon has no RestartDaemon handler (and an unsupervised/dead socket also
