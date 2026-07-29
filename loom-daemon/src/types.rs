@@ -1149,6 +1149,13 @@ pub struct DaemonStatusReport {
     /// heap alloc on an already-rare, human-latency status round-trip).
     #[serde(default)]
     pub host_breaker: Option<Box<HostBreakerStatus>>,
+    /// GitHub rate-limit circuit-breaker state (Issue #4429). `Some` once the
+    /// breaker is registered at startup; `None` on older daemons.
+    /// `#[serde(default)]` keeps pre-#4429 wire data / older clients compatible.
+    /// Boxed for the same `clippy::large_enum_variant` reason as
+    /// [`Self::host_breaker`].
+    #[serde(default)]
+    pub rate_limit_breaker: Option<Box<RateLimitBreakerStatus>>,
     /// Live safehouse fleet-comms connection state (Issue #4345): distinguishes
     /// `not_configured` (no `safehouse` block / disabled) from `unreachable`
     /// (enabled, socket resolved, but the daemon's own connection attempt
@@ -1218,6 +1225,41 @@ pub struct HostBreakerStatus {
     pub sustain_ticks: u32,
     /// The configured cool-down window, in seconds.
     pub cooldown_secs: u64,
+}
+
+/// GitHub rate-limit circuit-breaker snapshot for `loom-daemon status` (Issue
+/// #4429). Rendered from [`crate::rate_limit_breaker::RateLimitSnapshot`]. The
+/// `daemon.rate_limit_breaker.state` event carries the transition data on
+/// every phase change; this is the point-in-time status view.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct RateLimitBreakerStatus {
+    /// Whether the breaker is enabled (default ON — a safety backstop).
+    pub enabled: bool,
+    /// The current phase: `"closed"` or `"cooldown"`.
+    pub phase: String,
+    /// Whether forge polling is currently suppressed.
+    pub suppressed: bool,
+    /// Which loop's failure tripped the active cooldown; `None` while Closed.
+    #[serde(default)]
+    pub source: Option<String>,
+    /// When the active cooldown was tripped; `None` while Closed.
+    #[serde(default)]
+    pub tripped_at: Option<DateTime<Utc>>,
+    /// When the active cooldown releases; `None` while Closed.
+    #[serde(default)]
+    pub cooldown_until: Option<DateTime<Utc>>,
+    /// Lifetime trip count for this daemon process.
+    pub trips_total: u64,
+    /// Last-probed REST core budget remaining (`None` before the first trip —
+    /// the budget is probed on trip, never on a status call).
+    #[serde(default)]
+    pub core_remaining: Option<u64>,
+    /// Last-probed GraphQL budget remaining.
+    #[serde(default)]
+    pub graphql_remaining: Option<u64>,
+    /// When the cached budget snapshot was probed.
+    #[serde(default)]
+    pub budget_probed_at: Option<DateTime<Utc>>,
 }
 
 /// A live-locked sweep with no matching [`DaemonStatusReport::in_flight`] entry

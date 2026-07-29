@@ -1977,6 +1977,10 @@ concurrency ceiling 5" and share it with the team:
       "sustainTicks": 3,
       "cooldownSecs": 300
     },
+    "rateLimitBreaker": {
+      "enabled": true,
+      "fallbackCooldownSecs": 900
+    },
     "mainHealthGate": {
       "enabled": true
     },
@@ -2030,6 +2034,8 @@ exactly like `main_health_gate::read_build_gate_config`.
 | `autonomous.hostBreaker.loadPerCoreTrip` | `LOOM_HOST_BREAKER_LOAD_PER_CORE` | `2.5` | Load-per-core at/over which a tick counts toward tripping. `<= 0`/invalid → default |
 | `autonomous.hostBreaker.sustainTicks` | `LOOM_HOST_BREAKER_SUSTAIN_TICKS` | `3` | Consecutive over-threshold work-finder ticks required to trip (a single spike never trips). Zero/invalid → default |
 | `autonomous.hostBreaker.cooldownSecs` | `LOOM_HOST_BREAKER_COOLDOWN_SECS` | `300` | Cool-down window held after distress subsides before dispatch resumes. Zero/invalid → default |
+| `autonomous.rateLimitBreaker.enabled` | `LOOM_RATE_LIMIT_BREAKER` | `true` | GitHub rate-limit circuit breaker on/off (#4429). A safety backstop — **defaults on**. Env truthy enables, any other value disables; wins over config. See [GitHub rate-limit circuit breaker](#github-rate-limit-circuit-breaker-4429) below |
+| `autonomous.rateLimitBreaker.fallbackCooldownSecs` | `LOOM_RATE_LIMIT_BREAKER_FALLBACK_COOLDOWN_SECS` | `900` | Cooldown length when the `gh api rate_limit` reset probe fails. Zero/invalid → default; every computed cooldown is clamped to `[60, 3600]`s |
 | `autonomous.perTokenConcurrency` | `LOOM_PER_TOKEN_CONCURRENCY` | `2` | Concurrent sweeps **per healthy token** in the cap (#3947). Zero/invalid → default; clamped to a floor of 1 |
 | `autonomous.cpuUtilizationTarget` | `LOOM_CPU_UTILIZATION_TARGET` | `0.75` | Fraction of logical CPUs the CPU headroom term is willing to dedicate to sweep work (#3978, config surface #4032). Outside `(0, 1]` or wrong JSON type → default; single-root, resolved once at startup (not per-workspace) |
 | `autonomous.estCoresPerSweep` | `LOOM_EST_CORES_PER_SWEEP` | `2.0` | Estimated CPU cores one concurrent sweep consumes while building/testing (#3978, config surface #4032). `<= 0` or wrong JSON type → default; integer JSON (`2`) and float JSON (`2.0`) both accepted; single-root, resolved once at startup |

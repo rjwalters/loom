@@ -1492,6 +1492,11 @@ pub fn build_daemon_status(
         host_breaker: crate::host_breaker::global_snapshot()
             .map(crate::host_breaker::BreakerSnapshot::into_status)
             .map(Box::new),
+        // GitHub rate-limit circuit breaker (#4429) — same process-global
+        // snapshot pattern as the host breaker above.
+        rate_limit_breaker: crate::rate_limit_breaker::global_snapshot()
+            .map(crate::rate_limit_breaker::RateLimitSnapshot::into_status)
+            .map(Box::new),
         // Live safehouse connection state (#4345) — the pool's shared cell is
         // updated by the narration sink / peer-coordination tasks
         // `start_safehouse_narration`/`start_peer_coordination` spawn, and
@@ -4639,6 +4644,7 @@ exit 0
             auto_update_terminal_reason: None,
             auto_update_note: Some("within settle window".to_string()),
             host_breaker: None,
+            rate_limit_breaker: None,
             safehouse: Some(crate::types::SafehouseStatus {
                 state: "connected".to_string(),
                 socket: Some(std::path::PathBuf::from("/tmp/safehoused.sock")),
