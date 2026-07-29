@@ -3708,6 +3708,13 @@ fn build_status_json_value(
             "health_gate_deferred": r.health_gate_deferred,
             "health_gate_deferred_reason": r.health_gate_deferred_reason,
             "health_gate_verdict_tier": r.health_gate_verdict_tier,
+            // Per-root role-runner enablement (#4377) — resolved from THIS
+            // root's own `.loom/config.json`, independent of the daemon
+            // workspace's own master switch. `on_idle_roles` non-empty while
+            // `enabled` is `false` is the exact silent-no-op this issue fixes.
+            "role_runner_enabled": r.role_runner_enabled,
+            "role_runner_roles": r.role_runner_roles,
+            "role_runner_on_idle_roles": r.role_runner_on_idle_roles,
         })).collect::<Vec<_>>(),
         // Forge-side pipeline snapshot (#3977) — present only when `--pipeline`
         // was passed; `null` otherwise so a consumer can tell "not requested"
@@ -4365,8 +4372,8 @@ fn print_status_human(
     if report.per_repo.is_empty() {
         println!("  (none)");
     } else {
-        println!("  {:>4}  {:>9}  {:<13}  REPO", "PRIO", "IN-FLIGHT", "GATE");
-        println!("  {:-<60}", "");
+        println!("  {:>4}  {:>9}  {:<13}  {:<5}  REPO", "PRIO", "IN-FLIGHT", "GATE", "ROLES");
+        println!("  {:-<68}", "");
         for r in &report.per_repo {
             // Same classification as the top-level summary above, condensed
             // for the table column (#3950 AC3, widened #4012).
@@ -4381,11 +4388,16 @@ fn print_status_human(
                 r.health_gate_verdict_at,
             );
             let gate = gate_status_short_label(&verdict);
+            // Per-root role-runner enablement (#4377) — resolved from this
+            // root's OWN config, so it can legitimately read "off" even while
+            // the daemon's own workspace has the loops running.
+            let roles = if r.role_runner_enabled { "on" } else { "off" };
             println!(
-                "  {:>4}  {:>9}  {:<13}  {}{}",
+                "  {:>4}  {:>9}  {:<13}  {:<5}  {}{}",
                 r.priority,
                 r.in_flight_count,
                 gate,
+                roles,
                 r.root.display(),
                 if r.root_missing {
                     "  [MISSING ROOT]"
@@ -4427,6 +4439,19 @@ fn print_status_human(
                     .collect::<Vec<_>>()
                     .join(", ");
                 println!("        quarantined (insta-crash, #3939): {list}");
+            }
+            // #4377: onIdle configured but the per-root gate is off is
+            // exactly the silent no-op this issue fixes — call it out
+            // explicitly rather than requiring the operator to cross-check
+            // the ROLES column against a separate onIdle listing.
+            if !r.role_runner_enabled && !r.role_runner_on_idle_roles.is_empty() {
+                let list = r.role_runner_on_idle_roles.join(", ");
+                println!(
+                    "        role runner disabled for this root but onIdle=[{list}] is \
+                     configured — these roles will never fire until \
+                     autonomous.roleRunner.enabled=true is set in this root's own \
+                     .loom/config.json (#4377)"
+                );
             }
         }
     }

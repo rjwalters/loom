@@ -1227,6 +1227,22 @@ pub fn build_daemon_status(
             // that is dispatching nothing is explained.
             (live, sr.quarantined_issues_sorted(), sr.unregistered_locked_issues())
         };
+        // Per-root role-runner enablement (#4377): resolved from this root's
+        // OWN `.loom/config.json`, never the daemon workspace's — the whole
+        // point of this status surface is that the two can legitimately
+        // differ (a registered workspace can be role-runner-disabled while
+        // the daemon's own workspace is enabled, or vice versa).
+        let role_runner_config = crate::role_runner::read_role_runner_config(root);
+        let role_runner_enabled = crate::role_runner::resolve_enabled(&role_runner_config);
+        let role_runner_roles = crate::role_runner::resolve_roles(&role_runner_config)
+            .iter()
+            .map(|spec| spec.name.to_string())
+            .collect();
+        let role_runner_on_idle_roles =
+            crate::role_runner::resolve_on_idle_roles(&role_runner_config)
+                .iter()
+                .map(|spec| spec.name.to_string())
+                .collect();
         per_repo.push(crate::types::RepoStatus {
             root: root.clone(),
             priority: workspace_registry.priority_of(root),
@@ -1251,6 +1267,9 @@ pub fn build_daemon_status(
             health_gate_verdict_tier: health_states
                 .gate_last_tier(root)
                 .map(|t| t.label().to_string()),
+            role_runner_enabled,
+            role_runner_roles,
+            role_runner_on_idle_roles,
         });
         in_flight.extend(live);
         unregistered_locked.extend(locked_unregistered.into_iter().map(|(issue, owner_pid)| {
@@ -4539,6 +4558,9 @@ exit 0
                 health_gate_deferred: false,
                 health_gate_deferred_reason: None,
                 health_gate_verdict_tier: Some("full".to_string()),
+                role_runner_enabled: true,
+                role_runner_roles: vec!["champion".to_string()],
+                role_runner_on_idle_roles: vec![],
             }],
             credential_preflight: Some(test_credential_preflight()),
             draining: false,
