@@ -1355,7 +1355,7 @@ The numbered phases below (Curator → Builder → Judge → Doctor → Merge) a
 
 ### 0. Snapshot the main-worktree baseline (once, before wave 1) (#3648)
 
-**Before dispatching the first wave's builders**, snapshot main's current working-tree state so the per-wave contamination backstop (step 4's `check-main-clean.sh`) can distinguish builder contamination from dirt that predated the sweep:
+**Before dispatching the first wave's builders**, snapshot main's current working-tree state so the per-builder contamination backstop (step 4's `check-main-clean.sh`) can distinguish builder contamination from dirt that predated the sweep:
 
 ```bash
 MAIN_CLEAN_BASELINE=".loom/sweep-checkpoint/main-clean-baseline-${RUN_ID}.txt"
@@ -1531,6 +1531,19 @@ Each builder is responsible for:
 
 **Await all builders in the wave** before proceeding to Judge. Collect each builder's PR number (or failure marker). This await is **mandatory and explicit** — block on every builder's `TaskOutput` / completion notification. The harness may launch each Task async regardless of `run_in_background: false`, so proceeding to Judge on a dispatch flag alone can start Judge before builders finish; the "await all builders before Judge" rule is enforced by this explicit block, not by any dispatch flag (see "Subagent dispatch is async-only", #3822).
 
+**Run the main-clean check after EACH builder returns, not once per wave (#4380).** As each individual builder's `TaskOutput` arrives — before moving on to the next one's result and long before the wave advances to Judge — run the contamination check with that builder's issue in the label:
+
+```bash
+# Immediately after builder for issue N returns (per builder, inside the await loop):
+./.loom/scripts/check-main-clean.sh \
+    --baseline "$MAIN_CLEAN_BASELINE" \
+    --quarantine \
+    --label "run=$RUN_ID issue=$N"
+# exit 0 ⇒ clean · exit 4 ⇒ contamination found and QUARANTINED (continue) · exit 3 ⇒ dirty, NOT quarantined (hard-block)
+```
+
+Why per builder rather than per wave: with a single post-wave check, N builders share one detection point, so any contamination is attributable only to "some builder in this wave" and the risk window is wave-sized. Checking after each `TaskOutput` narrows the window to one builder and makes attribution exact — the `--label` value names the culprit in the quarantine log entry. See the Backstop section below for the full semantics, and keep the per-wave check as a final belt-and-suspenders pass.
+
 **Assert the Builder's cwd before it edits anything.** Before the Builder
 subagent prompt does any Write/Edit/Bash file mutation, it MUST capture
 `WORKTREE_ABS="$(cd .loom/worktrees/issue-N && pwd)"` and verify both: the
@@ -1542,15 +1555,51 @@ Validation" / "Validation Checklist", #4178). A denied write is never a signal
 to retry the same target through a different tool (Edit/Write vs. Bash) — see
 below.
 
-**Backstop: verify the main worktree is clean after the builders return (#3513).** A builder subagent is dispatched via the Task tool ("one level deep", step 4 above) and inherits the orchestrator's single shared process env, which has **no** `LOOM_WORKTREE_PATH` — the Task tool exposes no per-subagent env-injection parameter (#3719). `guard-worktree-paths.sh`'s path-derived fallback (#4007) DOES fire on this path regardless — it denies an Edit/Write target resolving into the main checkout while any managed worktree exists, with no env var required — and `guard-destructive-generic.sh` extends the identical confinement to the common Bash-tool write idioms (`>`/`>>` redirection, `tee`, `sed -i`, `cp`/`mv`, #4178, closing the escape sweep #4063 used: a write denied on Edit/Write retried through Bash instead). Despite that guard coverage, this `check-main-clean.sh` backstop stays load-bearing — it is a whole-tree status check, not an idiom scan, so it catches anything the guards' heuristics don't recognize (e.g. an interpreter one-liner like `python -c`, deliberately out of scope for #4178's pattern list) or a write that landed before any worktree existed. After the wave's builders return and before advancing any PR to Judge, run:
+**Backstop: verify the main worktree is clean after EACH builder returns (#3513, per-builder cadence + atomic quarantine #4380).** A builder subagent is dispatched via the Task tool ("one level deep", step 4 above) and inherits the orchestrator's single shared process env, which has **no** `LOOM_WORKTREE_PATH`, because the Task tool exposes no per-subagent env-injection parameter (#3719).
+
+> **Do not re-derive the stale "the guard cannot arm here" claim.** The absent env var does **not** disable worktree confinement. `guard-worktree-paths.sh`'s **path-derived fallback** (#4007, PR #4129) arms with **no env var at all**: it denies any Edit/Write whose target resolves into the main checkout while any `.loom-managed` worktree exists anywhere in the repo. This is directly evidenced, not theoretical — `.loom/logs/hook-errors.log` records a dense deny cluster during the 2026-07-29 #4364 build (`[guard-worktree-paths] Denied: BLOCKED: Edit/Write path '…/loom-daemon/src/main_health_gate.rs' resolves to the main repository checkout …`). `guard-destructive-generic.sh` extends the identical confinement to the common Bash-tool write idioms (`>`/`>>` redirection, `tee`, `sed -i`, `cp`/`mv`, #4178 / PR #4210), closing the escape #4063 used (a write denied on Edit/Write retried through Bash instead).
+>
+> **Both guards are PreToolUse DENY hooks. Neither guard reverts anything** — they block *before* the write lands, and never touch a file that already exists. So a builder narrative like "the guard reverted most of my edits" is a misreading of *denied* writes (which never landed) as *reverted* writes; the "partial" part of that story came from the builder's own ad-hoc per-file `git checkout --` cleanup, not from any hook. That ad-hoc cleanup is exactly what the `--quarantine` mode below replaces.
+
+This `check-main-clean.sh` backstop stays load-bearing despite the guard coverage: it is a whole-tree status check, not an idiom scan, so it catches anything the guards' heuristics don't recognize (an interpreter one-liner like `python -c`, `git apply`/`patch`, most deletion vectors — all deliberately out of scope for #4178's pattern list) or a write that landed before any worktree existed.
+
+**Cadence: after each individual builder's `TaskOutput`, plus once more after the whole wave.** The per-builder run is the primary one — its `--label` carries that builder's issue number, which is what makes the quarantine log entry attributable. The post-wave run is belt-and-suspenders (it catches anything that landed between the last builder's return and the Judge hand-off) and is labelled with the wave rather than an issue:
 
 ```bash
-./.loom/scripts/check-main-clean.sh --baseline "$MAIN_CLEAN_BASELINE"   # exit 3 ⇒ NEW main dirt (builder contamination)
+# Per builder, inside the await loop (primary — narrow window, exact attribution):
+./.loom/scripts/check-main-clean.sh --baseline "$MAIN_CLEAN_BASELINE" \
+    --quarantine --label "run=$RUN_ID issue=$N"
+
+# Once more after all builders in the wave return, before advancing any PR to Judge:
+./.loom/scripts/check-main-clean.sh --baseline "$MAIN_CLEAN_BASELINE" \
+    --quarantine --label "run=$RUN_ID wave=$WAVE_INDEX"
 ```
 
-The `--baseline` argument points at the snapshot taken once at step 0 (before wave 1). With it, the check subtracts any dirt that predated the sweep and exits `3` **only** on changes that appeared after the snapshot — so pre-existing working-tree dirt (a regenerated lockfile, an operator scratch edit) no longer false-positives as contamination on every wave (#3648). If the baseline file is missing or unreadable, the check warns and falls back to the whole-status hard-fail (fail-safe).
+The `--baseline` argument points at the snapshot taken once at step 0 (before wave 1). With it, the check subtracts any dirt that predated the sweep and flags **only** changes that appeared after the snapshot — so pre-existing working-tree dirt (a regenerated lockfile, an operator scratch edit) no longer false-positives as contamination on every check (#3648). If the baseline file is missing or unreadable, the check warns and falls back to the whole-status hard-fail (fail-safe).
 
-If it exits `3`, the main worktree carries **new** uncommitted changes a builder left behind. Surface this loudly in the wave summary — **quote the specific offending paths** the check printed under `Offending changes:` so the operator can see exactly which files escaped a worktree — and **hard-block the wave from advancing any PR to Judge** until the contamination is investigated and the stray changes reverted (move them into the owning issue worktree, then restore main). The guard-hook denials plus the cwd-assertion prompt discipline above are the primary defense; this status check is the backstop that catches whatever they miss.
+**Exit codes and what to do with each:**
+
+| Exit | Meaning | Action |
+|------|---------|--------|
+| `0` | Main is clean (or carries only baselined dirt) | Continue normally. |
+| `4` | New dirt was found and **quarantined** to a stash rescue ref; main is provably back at the baseline | **Continue** — do not hard-block. Record the quarantine in the wave summary (see below). |
+| `3` | New dirt was found and could **not** be quarantined (or `--quarantine` was not passed) | **Hard-block** the wave from advancing any PR to Judge until it is resolved. |
+
+**Remediation is ALL-OR-NOTHING, and `--quarantine` performs it.** On detection, the check moves **every** offending path — tracked modifications *and* untracked files together — into a stash rescue ref in **one** `git stash push --include-untracked` operation scoped to exactly those paths, then emits **exactly one** structured JSON line naming the label, the offending paths, and the stash commit:
+
+```
+{"event":"main-clean.quarantine","ts":"…","result":"quarantined","label":"run=… issue=4364","main":"/…","stash_ref":"stash@{0}","stash_commit":"<sha>","paths":["…"],"count":2}
+```
+
+That entry goes to stderr and is appended to `.loom/logs/main-quarantine.log` (override with `--log FILE`). Properties that matter:
+
+- **It is a rescue, never a discard.** The full diff survives in the stash; recover it with `git stash show -p <sha>` and replay it into the owning issue worktree.
+- **Baselined dirt is spared.** Only the paths the check flagged as *new* are stashed, so an operator's unrelated working-tree edits are untouched.
+- **It is verified.** After stashing, the check re-runs detection and only reports success (exit `4`) if main is back at the baseline; a residual-dirt result is reported as a failure (exit `3`), never as a partial success.
+
+**Do NOT restore contamination piecemeal.** Per-file `git checkout -- <path>` / `rm <path>` sequences are forbidden as the remediation path: they are what produced the half-restored main checkout this section exists to prevent, and a main checkout that is neither the baseline nor the builder's intended change is worse than either extreme. If for any reason you must remediate by hand (e.g. `--quarantine` itself failed and returned `3`), do it as a **single** `git stash push --include-untracked -m "loom-quarantine: run=$RUN_ID issue=$N" -- <all offending paths>` — one operation, all paths, logged.
+
+**Reporting.** Surface every non-zero result loudly in the wave summary — **quote the specific offending paths** the check printed (under `Offending changes:` on exit `3`, or in the `paths` array of the quarantine entry on exit `4`) so the operator can see exactly which files escaped a worktree, along with the stash sha when one was created. The guard-hook denials plus the cwd-assertion prompt discipline above are the primary defense; this status check is the backstop that catches whatever they miss, and the quarantine is what makes its cleanup deterministic.
 
 **On successful PR creation**, write the `builder-done` checkpoint for that issue (record the PR number):
 ```bash
