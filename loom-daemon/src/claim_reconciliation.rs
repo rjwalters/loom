@@ -168,11 +168,25 @@ pub const DEFAULT_RECONCILE_INTERVAL_SECS: u64 = 600;
 /// (e.g. `5` meaning "5 minutes") cannot turn this into a `gh`-API busy loop.
 pub const MIN_RECONCILE_INTERVAL_SECS: u64 = 60;
 
+/// Default periodic reconciliation interval when safehouse peer-claims are
+/// live (Issue #4431): 30 minutes. With claims advertised at dispatch and
+/// re-advertised every reaper tick (`sweep_registry::readvertise_peer_claims`),
+/// the fleet room — not the `loom:building` label — is the fast in-flight
+/// claim signal, and this pass demotes to a slow *healing* sweep for the
+/// divergence cases safehouse cannot see (a host that crashed without
+/// retracting, a stranded label from a pre-safehouse dispatch). Hosts without
+/// `safehouse.enabled` keep [`DEFAULT_RECONCILE_INTERVAL_SECS`] unchanged.
+pub const DEFAULT_SAFEHOUSE_RECONCILE_INTERVAL_SECS: u64 = 1800;
+
 /// Resolve the periodic reconciliation interval from
 /// [`RECONCILE_INTERVAL_ENV`], falling back to
 /// [`DEFAULT_RECONCILE_INTERVAL_SECS`] for an absent, unparseable, or
 /// non-positive value, and always clamped up to
 /// [`MIN_RECONCILE_INTERVAL_SECS`] regardless of source.
+///
+/// Env-only resolution — the safehouse-aware default lives in
+/// [`resolve_reconcile_interval_for`], which callers with a workspace root
+/// should prefer.
 #[must_use]
 pub fn resolve_reconcile_interval() -> Duration {
     let secs = std::env::var(RECONCILE_INTERVAL_ENV)
@@ -180,6 +194,44 @@ pub fn resolve_reconcile_interval() -> Duration {
         .and_then(|s| s.parse::<u64>().ok())
         .filter(|&v| v > 0)
         .unwrap_or(DEFAULT_RECONCILE_INTERVAL_SECS);
+    Duration::from_secs(secs.max(MIN_RECONCILE_INTERVAL_SECS))
+}
+
+/// Resolve the periodic reconciliation interval for a workspace, safehouse-
+/// aware (Issue #4431). Precedence, first match wins:
+///
+/// 1. [`RECONCILE_INTERVAL_ENV`] — the operator's explicit choice, any host.
+/// 2. `.loom/config.json → safehouse.claimReconcileIntervalSecs` — a per-repo
+///    override of the safehouse-mode cadence (zero/invalid ignored).
+/// 3. [`DEFAULT_SAFEHOUSE_RECONCILE_INTERVAL_SECS`] when `safehouse.enabled`
+///    resolves true for `root` — peer-claims carry the fast signal, labels
+///    demote to a healing cadence.
+/// 4. [`DEFAULT_RECONCILE_INTERVAL_SECS`] otherwise — byte-for-byte the
+///    pre-#4431 behavior for hosts without safehouse (e.g. robb-pro).
+///
+/// Always clamped up to [`MIN_RECONCILE_INTERVAL_SECS`] regardless of source.
+#[must_use]
+pub fn resolve_reconcile_interval_for(root: &Path) -> Duration {
+    if let Some(secs) = std::env::var(RECONCILE_INTERVAL_ENV)
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .filter(|&v| v > 0)
+    {
+        return Duration::from_secs(secs.max(MIN_RECONCILE_INTERVAL_SECS));
+    }
+    let safehouse_enabled = crate::safehouse::resolve_config(root).enabled;
+    let config_override = crate::config_resolver::get_path(
+        &crate::config_resolver::resolve_effective_config(root),
+        "safehouse",
+    )
+    .and_then(|block| block.get("claimReconcileIntervalSecs"))
+    .and_then(serde_json::Value::as_u64)
+    .filter(|&v| v > 0);
+    let secs = config_override.unwrap_or(if safehouse_enabled {
+        DEFAULT_SAFEHOUSE_RECONCILE_INTERVAL_SECS
+    } else {
+        DEFAULT_RECONCILE_INTERVAL_SECS
+    });
     Duration::from_secs(secs.max(MIN_RECONCILE_INTERVAL_SECS))
 }
 
@@ -699,9 +751,12 @@ pub fn run_reconciliation_pass(fallback_root: &Path) {
 pub fn spawn_periodic_reconciliation_task(
     fallback_root: std::path::PathBuf,
 ) -> tokio::task::JoinHandle<()> {
-    let interval = resolve_reconcile_interval();
+    // Safehouse-aware cadence (#4431): with live peer-claims carrying the
+    // fast in-flight signal (re-advertised each reaper tick), a
+    // safehouse-enabled host demotes this pass to a slow healing sweep.
+    let interval = resolve_reconcile_interval_for(&fallback_root);
     log::info!(
-        "claim_reconciliation: periodic pass enabled (interval={}s, #4348)",
+        "claim_reconciliation: periodic pass enabled (interval={}s, #4348/#4431)",
         interval.as_secs()
     );
     tokio::spawn(async move {
@@ -1430,6 +1485,84 @@ mod tests {
     // ------------------------------------------------------------------
     // Periodic-interval resolution (Issue #4348)
     // ------------------------------------------------------------------
+
+    /// Write a `.loom/config.json` with the given `safehouse` block into a
+    /// fresh tempdir root (Issue #4431 interval tests).
+    fn root_with_safehouse_config(
+        dir: &std::path::Path,
+        safehouse_json: &str,
+    ) -> std::path::PathBuf {
+        let root = dir.join("repo");
+        std::fs::create_dir_all(root.join(".loom")).unwrap();
+        std::fs::write(
+            root.join(".loom").join("config.json"),
+            format!(r#"{{"safehouse": {safehouse_json}}}"#),
+        )
+        .unwrap();
+        root
+    }
+
+    /// #4431: precedence env > config override > safehouse-mode default >
+    /// legacy default, floor always enforced.
+    #[test]
+    #[serial]
+    fn resolve_reconcile_interval_for_is_safehouse_aware() {
+        std::env::remove_var(RECONCILE_INTERVAL_ENV);
+        // The safehouse env toggle would shadow the config file — clear it so
+        // the test exercises the config layer (hosts like loom-worker-1 set
+        // it in the daemon unit, but tests must not depend on that).
+        std::env::remove_var("LOOM_SAFEHOUSE_ENABLED");
+        let dir = tempdir().unwrap();
+
+        // Safehouse enabled → the slow healing cadence.
+        let root = root_with_safehouse_config(dir.path(), r#"{"enabled": true}"#);
+        assert_eq!(
+            resolve_reconcile_interval_for(&root),
+            std::time::Duration::from_secs(DEFAULT_SAFEHOUSE_RECONCILE_INTERVAL_SECS)
+        );
+
+        // Safehouse disabled (or absent) → byte-for-byte the pre-#4431 default.
+        let root = root_with_safehouse_config(dir.path(), r#"{"enabled": false}"#);
+        assert_eq!(
+            resolve_reconcile_interval_for(&root),
+            std::time::Duration::from_secs(DEFAULT_RECONCILE_INTERVAL_SECS)
+        );
+        assert_eq!(
+            resolve_reconcile_interval_for(dir.path()),
+            std::time::Duration::from_secs(DEFAULT_RECONCILE_INTERVAL_SECS),
+            "no config file at all must resolve to the legacy default"
+        );
+
+        // Per-repo config override wins over the safehouse-mode default…
+        let root = root_with_safehouse_config(
+            dir.path(),
+            r#"{"enabled": true, "claimReconcileIntervalSecs": 900}"#,
+        );
+        assert_eq!(resolve_reconcile_interval_for(&root), std::time::Duration::from_secs(900));
+        // …but a zero/invalid override is ignored, and the floor still holds.
+        let root = root_with_safehouse_config(
+            dir.path(),
+            r#"{"enabled": true, "claimReconcileIntervalSecs": 0}"#,
+        );
+        assert_eq!(
+            resolve_reconcile_interval_for(&root),
+            std::time::Duration::from_secs(DEFAULT_SAFEHOUSE_RECONCILE_INTERVAL_SECS)
+        );
+        let root = root_with_safehouse_config(
+            dir.path(),
+            r#"{"enabled": true, "claimReconcileIntervalSecs": 5}"#,
+        );
+        assert_eq!(
+            resolve_reconcile_interval_for(&root),
+            std::time::Duration::from_secs(MIN_RECONCILE_INTERVAL_SECS)
+        );
+
+        // The operator env var beats everything, on any host.
+        std::env::set_var(RECONCILE_INTERVAL_ENV, "300");
+        let root = root_with_safehouse_config(dir.path(), r#"{"enabled": true}"#);
+        assert_eq!(resolve_reconcile_interval_for(&root), std::time::Duration::from_secs(300));
+        std::env::remove_var(RECONCILE_INTERVAL_ENV);
+    }
 
     #[test]
     #[serial]
