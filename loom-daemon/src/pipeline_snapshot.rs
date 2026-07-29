@@ -29,7 +29,7 @@
 //! repos cost roughly one repo's worth of wall-clock latency, not N.
 
 use anyhow::{anyhow, Context, Result};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
@@ -40,7 +40,7 @@ use std::sync::Arc;
 /// query failed for *that* metric (rendered as `?`); a `Some` for one field
 /// and `None` for another on the same repo is expected under partial
 /// degradation (e.g. `gh` rate-limited mid-fetch).
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub struct RepoPipelineSnapshot {
     /// The workspace root this line describes (matches
     /// [`crate::types::RepoStatus::root`] for the same repo).
@@ -265,7 +265,11 @@ pub async fn collect_pipeline_snapshots<S>(
     roots: Vec<PathBuf>,
 ) -> Vec<RepoPipelineSnapshot>
 where
-    S: PipelineSource + Send + Sync + 'static,
+    // `?Sized` (Issue #4393) lets a caller pass `Arc<dyn PipelineSource + Send
+    // + Sync>` directly — the dashboard's `/api/pipeline` route holds its
+    // configured source as a trait object so tests can substitute a fake one
+    // without a second generic threading through `ServeState`/`run`.
+    S: PipelineSource + Send + Sync + ?Sized + 'static,
 {
     let handles: Vec<(PathBuf, tokio::task::JoinHandle<RepoPipelineSnapshot>)> = roots
         .into_iter()

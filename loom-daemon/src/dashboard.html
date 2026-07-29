@@ -1,0 +1,580 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>loom-daemon fleet dashboard</title>
+<!--
+  Issue #4393 (dashboard phase 3 of #4329) — single-page, read-only fleet
+  dashboard. Vanilla JS, no build toolchain, no external resources (works
+  fully offline against a loopback daemon). Polls `/api/status` on a short
+  interval, opens an `EventSource` against `/api/events` for a live tail, and
+  fetches `/api/pipeline` / `/api/tokens` / `/api/peers` for the remaining
+  panels. Multihost fan-out is entirely client-side: each configured peer's
+  own `/api/status` is fetched directly from this page, never proxied
+  through this daemon — see `serve.rs`'s module docs for the full contract.
+
+  Read-only: this page contains no dispatch/steering controls, and holds no
+  client-side state that would survive a reload beyond what a fresh poll/SSE
+  connection naturally re-establishes.
+-->
+<style>
+  :root {
+    color-scheme: dark light;
+    --bg: #0f1115;
+    --panel: #161a22;
+    --border: #262b36;
+    --text: #d8dee9;
+    --muted: #7d8697;
+    --accent: #5fb3ff;
+    --green: #4caf7d;
+    --amber: #d9a441;
+    --red: #e05561;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    padding: 1rem 1.25rem 3rem;
+    background: var(--bg);
+    color: var(--text);
+    font: 14px/1.4 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  }
+  h1 { font-size: 1.15rem; margin: 0 0 .1rem; }
+  h2 { font-size: .95rem; margin: 0 0 .6rem; color: var(--accent); }
+  header {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    flex-wrap: wrap;
+    gap: .5rem;
+    margin-bottom: 1rem;
+    border-bottom: 1px solid var(--border);
+    padding-bottom: .75rem;
+  }
+  #meta { color: var(--muted); font-size: .8rem; }
+  .grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(360px, 1fr));
+    gap: 1rem;
+  }
+  .panel {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: .85rem 1rem 1rem;
+  }
+  .panel.wide { grid-column: 1 / -1; }
+  table { width: 100%; border-collapse: collapse; font-size: .82rem; }
+  th, td { text-align: left; padding: .25rem .4rem; border-bottom: 1px solid var(--border); white-space: nowrap; }
+  th { color: var(--muted); font-weight: 600; }
+  tr:last-child td { border-bottom: none; }
+  .muted { color: var(--muted); }
+  .pill {
+    display: inline-block;
+    padding: .05rem .45rem;
+    border-radius: 999px;
+    font-size: .72rem;
+    font-weight: 600;
+  }
+  .pill.green { background: rgba(76,175,125,.18); color: var(--green); }
+  .pill.amber { background: rgba(217,164,65,.18); color: var(--amber); }
+  .pill.red { background: rgba(224,85,97,.18); color: var(--red); }
+  .pill.muted-pill { background: rgba(125,134,151,.18); color: var(--muted); }
+  .bar-track {
+    background: #0b0d12;
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    height: 10px;
+    width: 100%;
+    overflow: hidden;
+  }
+  .bar-fill { height: 100%; background: var(--accent); }
+  .bar-fill.exhausted { background: var(--red); }
+  .bar-fill.unhealthy { background: var(--amber); }
+  .cap-terms { display: flex; flex-wrap: wrap; gap: .5rem; margin-bottom: .6rem; }
+  .cap-term {
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: .3rem .55rem;
+    font-size: .78rem;
+  }
+  .cap-term.binding { border-color: var(--accent); color: var(--accent); }
+  #events {
+    max-height: 260px;
+    overflow-y: auto;
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: .74rem;
+    white-space: pre-wrap;
+    word-break: break-all;
+    background: #0b0d12;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: .5rem .6rem;
+  }
+  #events div { padding: .1rem 0; border-bottom: 1px dashed var(--border); }
+  #events div:last-child { border-bottom: none; }
+  .peer-block { margin-bottom: .75rem; }
+  .peer-block:last-child { margin-bottom: 0; }
+  a { color: var(--accent); }
+  .err { color: var(--red); }
+  code { color: var(--muted); }
+</style>
+</head>
+<body>
+<header>
+  <div>
+    <h1>loom-daemon fleet dashboard</h1>
+    <div id="meta">connecting&hellip;</div>
+  </div>
+  <div id="conn-indicator" class="muted">SSE: connecting&hellip;</div>
+</header>
+
+<div class="grid">
+
+  <section class="panel wide" id="panel-registry">
+    <h2>In-flight registry</h2>
+    <div id="registry-body"><p class="muted">loading&hellip;</p></div>
+  </section>
+
+  <section class="panel" id="panel-capacity">
+    <h2>Dynamic concurrency cap</h2>
+    <div id="capacity-body"><p class="muted">loading&hellip;</p></div>
+  </section>
+
+  <section class="panel" id="panel-tokens">
+    <h2>Per-token usage</h2>
+    <div id="tokens-body"><p class="muted">loading&hellip;</p></div>
+  </section>
+
+  <section class="panel wide" id="panel-gate">
+    <h2>Main-health gate (per repo)</h2>
+    <div id="gate-body"><p class="muted">loading&hellip;</p></div>
+  </section>
+
+  <section class="panel wide" id="panel-pipeline">
+    <h2>Pipeline queues (per repo)</h2>
+    <div id="pipeline-body"><p class="muted">loading&hellip;</p></div>
+  </section>
+
+  <section class="panel wide" id="panel-peers">
+    <h2>Fleet peers</h2>
+    <div id="peers-body"><p class="muted">no peers configured</p></div>
+  </section>
+
+  <section class="panel wide" id="panel-events">
+    <h2>Live event tail</h2>
+    <div id="events"></div>
+  </section>
+
+</div>
+
+<script>
+"use strict";
+
+// ---------------------------------------------------------------------
+// Small helpers
+// ---------------------------------------------------------------------
+
+function el(tag, attrs, children) {
+  var node = document.createElement(tag);
+  if (attrs) {
+    for (var k in attrs) {
+      if (k === "text") { node.textContent = attrs[k]; }
+      else if (k === "html") { node.innerHTML = attrs[k]; }
+      else { node.setAttribute(k, attrs[k]); }
+    }
+  }
+  (children || []).forEach(function (c) { if (c) node.appendChild(c); });
+  return node;
+}
+
+function fmtPct(x) {
+  if (x === null || x === undefined) return "?";
+  return Math.round(x * 100) + "%";
+}
+
+function fmtCount(x) {
+  return (x === null || x === undefined) ? "?" : String(x);
+}
+
+function fmtUptime(startedAtIso) {
+  var started = Date.parse(startedAtIso);
+  if (isNaN(started)) return "?";
+  var secs = Math.max(0, Math.floor((Date.now() - started) / 1000));
+  var h = Math.floor(secs / 3600);
+  var m = Math.floor((secs % 3600) / 60);
+  var s = secs % 60;
+  if (h > 0) return h + "h" + m + "m";
+  if (m > 0) return m + "m" + s + "s";
+  return s + "s";
+}
+
+function statusPillClass(status) {
+  switch (status) {
+    case "available": return "green";
+    case "exhausted": return "red";
+    case "blocked": return "red";
+    case "rate_limited": return "amber";
+    default: return "muted-pill";
+  }
+}
+
+// fetch with a bounded timeout — a slow/unreachable host (local daemon or a
+// fleet peer) must never hang a panel forever.
+function fetchJson(url, timeoutMs) {
+  var controller = ("AbortController" in window) ? new AbortController() : null;
+  var timer = null;
+  if (controller) {
+    timer = setTimeout(function () { controller.abort(); }, timeoutMs || 8000);
+  }
+  return fetch(url, controller ? { signal: controller.signal } : {})
+    .then(function (resp) {
+      if (timer) clearTimeout(timer);
+      if (!resp.ok) throw new Error("HTTP " + resp.status);
+      return resp.json();
+    })
+    .catch(function (err) {
+      if (timer) clearTimeout(timer);
+      throw err;
+    });
+}
+
+// ---------------------------------------------------------------------
+// Registry panel
+// ---------------------------------------------------------------------
+
+function renderRegistry(report) {
+  var body = document.getElementById("registry-body");
+  body.innerHTML = "";
+  var inFlight = report.in_flight || [];
+  if (inFlight.length === 0) {
+    body.appendChild(el("p", { "class": "muted", text: "no in-flight sweeps" }));
+    return;
+  }
+  var table = el("table", {}, [
+    el("thead", {}, [el("tr", {}, [
+      el("th", { text: "sweep" }), el("th", { text: "issue" }), el("th", { text: "repo" }),
+      el("th", { text: "token" }), el("th", { text: "pid" }), el("th", { text: "uptime" }),
+      el("th", { text: "phase" }), el("th", { text: "state" })
+    ])]),
+  ]);
+  var tbody = el("tbody");
+  inFlight.forEach(function (sweep) {
+    var kind = sweep.kind || {};
+    var issueLabel = kind.type === "Issue" ? ("#" + kind.value)
+      : (kind.type === "PrSet" ? ("PRs " + (kind.value || []).join(",")) : "?");
+    var state = (sweep.state && sweep.state.state) ? sweep.state.state : "Running";
+    tbody.appendChild(el("tr", {}, [
+      el("td", { text: sweep.sweep_id || "?" }),
+      el("td", { text: issueLabel }),
+      el("td", { text: sweep.repo || "-" }),
+      el("td", { text: sweep.token_name || "-" }),
+      el("td", { text: String(sweep.pid || "-") }),
+      el("td", { text: fmtUptime(sweep.started_at) }),
+      el("td", { text: sweep.latest_phase || "-" }),
+      el("td", {}, [el("span", { "class": "pill " + (state === "Running" ? "green" : "muted-pill"), text: state })]),
+    ]));
+  });
+  table.appendChild(tbody);
+  body.appendChild(table);
+}
+
+// ---------------------------------------------------------------------
+// Capacity panel
+// ---------------------------------------------------------------------
+
+function renderCapacity(report) {
+  var body = document.getElementById("capacity-body");
+  body.innerHTML = "";
+  var perToken = report.per_token_concurrency || 1;
+  var tokenAxis = (report.capacity && report.capacity.token_axis_limit !== undefined)
+    ? report.capacity.token_axis_limit * Math.max(1, perToken)
+    : null;
+  var terms = [
+    ["token axis", tokenAxis === null ? null : tokenAxis],
+    ["disk headroom", report.disk_headroom],
+    ["cpu headroom", report.cpu_headroom],
+    ["configured max", report.configured_max],
+  ];
+  var minVal = terms.reduce(function (acc, t) {
+    return (t[1] === null || t[1] === undefined) ? acc : Math.min(acc, t[1]);
+  }, Infinity);
+  var wrap = el("div", { "class": "cap-terms" });
+  terms.forEach(function (t) {
+    var binding = t[1] === minVal && minVal !== Infinity;
+    wrap.appendChild(el("div", { "class": "cap-term" + (binding ? " binding" : "") },
+      [document.createTextNode(t[0] + ": " + fmtCount(t[1]))]));
+  });
+  body.appendChild(wrap);
+  var dyn = el("p", {}, [
+    document.createTextNode("dynamic cap = "),
+    el("strong", { text: String(report.dynamic_cap) }),
+    document.createTextNode(" (" + (report.in_flight ? report.in_flight.length : 0) + " in flight" +
+      (report.capacity_bound ? ", AT CAP" : "") + ")"),
+  ]);
+  body.appendChild(dyn);
+}
+
+// ---------------------------------------------------------------------
+// Token panel
+// ---------------------------------------------------------------------
+
+function renderTokens(rows) {
+  var body = document.getElementById("tokens-body");
+  body.innerHTML = "";
+  if (!rows || rows.length === 0) {
+    body.appendChild(el("p", { "class": "muted", text: "no ranking data yet" }));
+    return;
+  }
+  var table = el("table");
+  var tbody = el("tbody");
+  rows.forEach(function (row) {
+    var pct = row.util_5h === null || row.util_5h === undefined ? null : Math.min(1, row.util_5h);
+    var fillClass = row.status === "exhausted" || row.status === "blocked" ? "exhausted"
+      : (row.status !== "available" ? "unhealthy" : "");
+    var bar = el("div", { "class": "bar-track" }, [
+      el("div", { "class": "bar-fill " + fillClass, style: "width:" + (pct === null ? 0 : Math.round(pct * 100)) + "%" })
+    ]);
+    tbody.appendChild(el("tr", {}, [
+      el("td", { text: row.name }),
+      el("td", {}, [el("span", { "class": "pill " + statusPillClass(row.status), text: row.status })]),
+      el("td", { text: "5h " + (pct === null ? "?" : fmtPct(pct)) }),
+      el("td", { style: "width:40%" }, [bar]),
+    ]));
+  });
+  table.appendChild(tbody);
+  body.appendChild(table);
+}
+
+// ---------------------------------------------------------------------
+// Gate panel
+// ---------------------------------------------------------------------
+
+function renderGate(report) {
+  var body = document.getElementById("gate-body");
+  body.innerHTML = "";
+  var repos = report.per_repo || [];
+  if (repos.length === 0) {
+    body.appendChild(el("p", { "class": "muted", text: "no managed repos" }));
+    return;
+  }
+  var table = el("table", {}, [
+    el("thead", {}, [el("tr", {}, [
+      el("th", { text: "repo" }), el("th", { text: "gate" }), el("th", { text: "reason" }),
+    ])]),
+  ]);
+  var tbody = el("tbody");
+  repos.forEach(function (repo) {
+    var label = "clear"; var cls = "green";
+    var reason = "";
+    if (repo.health_gate_halted) { label = "HALTED (red main)"; cls = "red"; }
+    else if (repo.health_gate_not_evaluated) {
+      label = "not evaluated"; cls = "amber"; reason = repo.health_gate_not_evaluated_reason || "";
+    } else if (repo.health_gate_deferred) {
+      label = "deferred"; cls = "amber"; reason = repo.health_gate_deferred_reason || "";
+    } else if (repo.health_gate_enabled === false) {
+      label = "disabled"; cls = "muted-pill";
+    }
+    tbody.appendChild(el("tr", {}, [
+      el("td", { text: repo.root }),
+      el("td", {}, [el("span", { "class": "pill " + cls, text: label })]),
+      el("td", { "class": "muted", text: reason }),
+    ]));
+  });
+  table.appendChild(tbody);
+  body.appendChild(table);
+}
+
+// ---------------------------------------------------------------------
+// Pipeline panel
+// ---------------------------------------------------------------------
+
+function renderPipeline(rows) {
+  var body = document.getElementById("pipeline-body");
+  body.innerHTML = "";
+  if (!rows || rows.length === 0) {
+    body.appendChild(el("p", { "class": "muted", text: "no managed repos" }));
+    return;
+  }
+  var table = el("table", {}, [
+    el("thead", {}, [el("tr", {}, [
+      el("th", { text: "repo" }), el("th", { text: "queued" }), el("th", { text: "building" }),
+      el("th", { text: "review" }), el("th", { text: "changes" }), el("th", { text: "approved" }),
+      el("th", { text: "merged 24h" }),
+    ])]),
+  ]);
+  var tbody = el("tbody");
+  rows.forEach(function (row) {
+    var label = row.root;
+    var nameCell;
+    if (row.forge_url) {
+      nameCell = el("td", {}, [el("a", { href: row.forge_url, target: "_blank", rel: "noopener", text: label })]);
+    } else {
+      nameCell = el("td", { text: label });
+    }
+    tbody.appendChild(el("tr", {}, [
+      nameCell,
+      el("td", { text: fmtCount(row.queued) }),
+      el("td", { text: fmtCount(row.building) }),
+      el("td", { text: fmtCount(row.review_requested) }),
+      el("td", { text: fmtCount(row.changes_requested) }),
+      el("td", { text: fmtCount(row.approved) }),
+      el("td", { text: fmtCount(row.merged_24h) }),
+    ]));
+    if (row.error) {
+      var tr = el("tr");
+      var td = el("td", { colspan: "7", "class": "err", text: "error: " + row.error });
+      tr.appendChild(td);
+      tbody.appendChild(tr);
+    }
+  });
+  table.appendChild(tbody);
+  body.appendChild(table);
+}
+
+// ---------------------------------------------------------------------
+// Events panel
+// ---------------------------------------------------------------------
+
+var MAX_EVENT_LINES = 200;
+
+function appendEvent(text) {
+  var box = document.getElementById("events");
+  var atBottom = box.scrollTop + box.clientHeight >= box.scrollHeight - 4;
+  var line = el("div", { text: new Date().toLocaleTimeString() + "  " + text });
+  box.appendChild(line);
+  while (box.childNodes.length > MAX_EVENT_LINES) {
+    box.removeChild(box.firstChild);
+  }
+  if (atBottom) box.scrollTop = box.scrollHeight;
+}
+
+// ---------------------------------------------------------------------
+// Peers panel (client-side fan-out — Issue #4393)
+// ---------------------------------------------------------------------
+
+function renderPeer(container, base, report, err) {
+  var block = el("div", { "class": "peer-block" });
+  var reachable = !err;
+  block.appendChild(el("div", {}, [
+    el("span", { "class": "pill " + (reachable ? "green" : "red"), text: reachable ? "reachable" : "unreachable" }),
+    document.createTextNode(" " + base),
+  ]));
+  if (reachable && report) {
+    block.appendChild(el("p", { "class": "muted", text:
+      (report.hostname || "?") + " — " + (report.in_flight ? report.in_flight.length : 0) +
+      " in flight / cap " + report.dynamic_cap }));
+  } else if (err) {
+    block.appendChild(el("p", { "class": "err", text: String(err.message || err) }));
+  }
+  container.appendChild(block);
+}
+
+function refreshPeers(peers) {
+  var body = document.getElementById("peers-body");
+  if (!peers || peers.length === 0) {
+    body.innerHTML = "";
+    body.appendChild(el("p", { "class": "muted", text: "no peers configured" }));
+    return;
+  }
+  body.innerHTML = "";
+  peers.forEach(function (base) {
+    var url = base.replace(/\/$/, "") + "/api/status";
+    fetchJson(url, 5000).then(function (report) {
+      renderPeer(body, base, report, null);
+    }).catch(function (err) {
+      renderPeer(body, base, null, err);
+    });
+  });
+}
+
+// ---------------------------------------------------------------------
+// Poll loops
+// ---------------------------------------------------------------------
+
+var lastReport = null;
+
+function refreshStatus() {
+  return fetchJson("/api/status", 8000).then(function (report) {
+    lastReport = report;
+    document.getElementById("meta").textContent =
+      "host: " + (report.hostname || "?") + " — updated " + new Date().toLocaleTimeString();
+    renderRegistry(report);
+    renderCapacity(report);
+    renderGate(report);
+  }).catch(function (err) {
+    document.getElementById("meta").textContent = "status fetch failed: " + (err.message || err);
+  });
+}
+
+function refreshPipeline() {
+  fetchJson("/api/pipeline", 15000).then(renderPipeline).catch(function () {
+    // Left as-is: a transient pipeline fetch failure keeps the last-known
+    // table rather than blanking it.
+  });
+}
+
+function refreshTokens() {
+  fetchJson("/api/tokens", 8000).then(renderTokens).catch(function () {});
+}
+
+var peerListLoaded = false;
+function refreshPeerList() {
+  fetchJson("/api/peers", 8000).then(function (data) {
+    peerListLoaded = true;
+    refreshPeers(data.peers || []);
+  }).catch(function () {});
+}
+
+// SSE live tail — throttled status refresh on activity so a burst of events
+// does not fire a status round-trip per event.
+var throttledRefreshPending = false;
+function throttledStatusRefresh() {
+  if (throttledRefreshPending) return;
+  throttledRefreshPending = true;
+  setTimeout(function () {
+    throttledRefreshPending = false;
+    refreshStatus();
+  }, 1500);
+}
+
+function connectEvents() {
+  if (!("EventSource" in window)) {
+    document.getElementById("conn-indicator").textContent = "SSE: unsupported browser";
+    return;
+  }
+  var es = new EventSource("/api/events");
+  es.onopen = function () {
+    document.getElementById("conn-indicator").textContent = "SSE: connected";
+  };
+  es.onerror = function () {
+    document.getElementById("conn-indicator").textContent = "SSE: reconnecting…";
+  };
+  es.onmessage = function (ev) {
+    try {
+      var payload = JSON.parse(ev.data);
+      appendEvent(payload.topic + " " + JSON.stringify(payload.event));
+    } catch (e) {
+      appendEvent(ev.data);
+    }
+    throttledStatusRefresh();
+  };
+}
+
+// ---------------------------------------------------------------------
+// Boot
+// ---------------------------------------------------------------------
+
+refreshStatus();
+refreshPipeline();
+refreshTokens();
+refreshPeerList();
+connectEvents();
+
+setInterval(refreshStatus, 5000);
+setInterval(refreshPipeline, 20000);
+setInterval(refreshTokens, 15000);
+setInterval(refreshPeerList, 15000);
+</script>
+</body>
+</html>
