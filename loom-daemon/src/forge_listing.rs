@@ -190,9 +190,7 @@ pub fn parse_http_response(raw: &str) -> Option<HttpResponse> {
     let status: u16 = parts.next()?.parse().ok()?;
 
     let mut etag = None;
-    let mut header_len = status_line.len() + 1;
     for line in lines {
-        header_len += line.len() + 1;
         let trimmed = line.trim_end_matches('\r');
         if trimmed.is_empty() {
             break;
@@ -203,10 +201,20 @@ pub fn parse_http_response(raw: &str) -> Option<HttpResponse> {
             }
         }
     }
-    let body = raw
-        .get(header_len.min(raw.len())..)
-        .unwrap_or("")
-        .to_string();
+    // Locate the header/body boundary directly on the raw text rather than
+    // reconstructing the header block's length line-by-line: `str::lines()`
+    // strips a `\r\n` terminator as ONE line ending, so a per-line
+    // `len() + 1` sum undercounts every CRLF-terminated header by a byte
+    // and corrupts the body slice on any real (~20-header) response — the
+    // #4443-review bug. Searching for the blank-line separator is
+    // terminator-width-agnostic; the earliest match wins so a CRLF header
+    // block is never mis-split by a later LF-only sequence in the body.
+    let body = ["\r\n\r\n", "\n\n"]
+        .iter()
+        .filter_map(|sep| raw.find(sep).map(|idx| (idx, idx + sep.len())))
+        .min_by_key(|&(idx, _)| idx)
+        .map(|(_, body_start)| raw[body_start..].to_string())
+        .unwrap_or_default();
     Some(HttpResponse { status, etag, body })
 }
 
@@ -295,6 +303,73 @@ mod tests {
         let r = parse_http_response(raw).unwrap();
         assert_eq!(r.status, 304);
         assert!(r.body.trim().is_empty());
+    }
+
+    /// Regression for the #4443 review finding: a response with GitHub's real
+    /// ~20-header block (CRLF terminators) must split headers/body exactly.
+    /// The old line-length reconstruction undercounted each `\r\n` header by
+    /// one byte, so the "body" started inside the header block (e.g.
+    /// `"58\r\nX-Xss-Protection: 0\r\n\r\n[{…"`) and every real 200 fetch
+    /// failed to parse — masked in the small fixtures above because their
+    /// few stray bytes were pure whitespace that `trim()` swallowed.
+    #[test]
+    fn parses_realistic_multi_header_crlf_response() {
+        let headers = [
+            "HTTP/2.0 200 OK",
+            "Access-Control-Allow-Origin: *",
+            "Access-Control-Expose-Headers: ETag, Link, Location, Retry-After, X-GitHub-OTP, \
+             X-RateLimit-Limit, X-RateLimit-Remaining, X-RateLimit-Used, X-RateLimit-Resource, \
+             X-RateLimit-Reset, X-OAuth-Scopes, X-Accepted-OAuth-Scopes, X-Poll-Interval, \
+             X-GitHub-Media-Type, X-GitHub-SSO, X-GitHub-Request-Id, Deprecation, Sunset, Warning",
+            "Cache-Control: private, max-age=60, s-maxage=60",
+            "Content-Security-Policy: default-src 'none'",
+            "Content-Type: application/json; charset=utf-8",
+            "Etag: W/\"6289abc123def\"",
+            "Referrer-Policy: origin-when-cross-origin, strict-origin-when-cross-origin",
+            "Server: github.com",
+            "Strict-Transport-Security: max-age=31536000; includeSubdomains; preload",
+            "Vary: Accept, Authorization, Cookie, X-GitHub-OTP",
+            "X-Accepted-Oauth-Scopes: repo",
+            "X-Content-Type-Options: nosniff",
+            "X-Frame-Options: deny",
+            "X-Github-Api-Version-Selected: 2022-11-28",
+            "X-Github-Media-Type: github.v3; format=json",
+            "X-Github-Request-Id: E5E5:1234:ABCDEF:FEDCBA:66A7B8C9",
+            "X-Oauth-Scopes: gist, read:org, repo, workflow",
+            "X-Ratelimit-Limit: 5000",
+            "X-Ratelimit-Remaining: 4034",
+            "X-Ratelimit-Reset: 1785356436",
+            "X-Ratelimit-Resource: core",
+            "X-Ratelimit-Used: 966",
+            "Content-Length: 58",
+            "X-Xss-Protection: 0",
+        ]
+        .join("\r\n");
+        let body_json =
+            r#"[{"number": 4441, "state": "open", "labels": [{"name": "loom:issue"}]}]"#;
+        let raw = format!("{headers}\r\n\r\n{body_json}");
+
+        let r = parse_http_response(&raw).unwrap();
+        assert_eq!(r.status, 200);
+        assert_eq!(r.etag.as_deref(), Some("W/\"6289abc123def\""));
+        assert_eq!(
+            r.body, body_json,
+            "the body must be EXACTLY the JSON payload — no header-tail bytes"
+        );
+        let issues = parse_rest_issues(&r.body).unwrap();
+        assert_eq!(issues.len(), 1);
+        assert_eq!(issues[0].number, 4441);
+    }
+
+    /// The boundary search must not be confused by an LF-only pair occurring
+    /// AFTER the CRLF header/body boundary (e.g. inside a JSON string value).
+    #[test]
+    fn crlf_boundary_wins_over_later_lf_pair_in_body() {
+        let raw = "HTTP/2.0 200 OK\r\nEtag: \"x\"\r\n\r\n[{\"number\": 1, \"state\": \"open\", \
+                   \"labels\": [], \"body\": \"line1\\n\\nline2\"}]";
+        let r = parse_http_response(raw).unwrap();
+        assert!(r.body.starts_with("[{"));
+        assert_eq!(parse_rest_issues(&r.body).unwrap()[0].number, 1);
     }
 
     #[test]
