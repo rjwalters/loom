@@ -44,6 +44,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
+use chrono::{DateTime, SecondsFormat, Utc};
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
@@ -98,9 +99,39 @@ const DEFAULT_PERSONA: &str = "loom_daemon";
 /// The single envelope version this client speaks (protocol §9).
 pub const ENVELOPE_VERSION: u32 = 1;
 
-/// The closed 4-value `type` enum (`envelope.rs:10`). A `send` outside this set
-/// is rejected by safehoused, so we reject it before sending.
-pub const KNOWN_TYPES: [&str; 4] = ["chat", "task", "handoff", "ack"];
+/// The closed `type` enum (`envelope.rs:10`). A `send` outside this set is
+/// rejected by safehoused, so we reject it before sending.
+///
+/// `completion` (#4426) is the machine-consumed, public-feed-eligible member:
+/// safehoused's egress subsystem mirrors well-formed `completion` envelopes out
+/// of allowlisted rooms to a `sink_url` (the 2amlogic.com fleet feed). It MUST
+/// carry a strictly-valid `completion-v1` `meta` — safehoused **silently
+/// degrades a malformed `meta` to `chat`**, which never reaches the feed and
+/// produces no error here, so this client validates before sending
+/// ([`validate_completion_meta`]) rather than relying on the server.
+pub const KNOWN_TYPES: [&str; 5] = ["chat", "task", "handoff", "ack", "completion"];
+
+/// The one `meta.schema` value this client emits (safehouse
+/// `docs/protocol/envelope-v1.md` §4a).
+pub const COMPLETION_SCHEMA: &str = "completion-v1";
+
+/// Required `completion-v1` `meta` keys. Every one must be a non-empty string
+/// for the envelope to be built or sent (#4426).
+const COMPLETION_REQUIRED_KEYS: [&str; 7] = [
+    "schema",
+    "agent",
+    "repo",
+    "ref",
+    "result",
+    "started_at",
+    "completed_at",
+];
+
+/// Timeout for the sink-side forge lookups that confirm a merge and resolve the
+/// `owner/repo` slug for a `completion` envelope (#4426). Two short `gh` calls;
+/// on timeout the completion is simply not narrated — the sweep is long over by
+/// then and nothing downstream waits on it.
+const MERGE_CHECK_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Reconnect backoff floor and ceiling. The floor keeps a burst of events from
 /// hammering an absent peer (one `warn`, not a hot loop); the ceiling caps the
@@ -345,6 +376,170 @@ pub struct Envelope {
     /// Task thread key; must be `[A-Za-z0-9_]` (a bare issue number is fine).
     pub task_id: Option<String>,
     pub body: String,
+    /// Structured machine payload (#4426). Present **iff** `kind` is
+    /// `completion`, where it carries a `completion-v1` object —
+    /// [`build_send_request`] enforces both directions and re-validates the
+    /// contents. `body` stays required human prose regardless: a human reading
+    /// the room sees a sentence, `meta` is the machine view the public fleet
+    /// feed is derived from.
+    pub meta: Option<Value>,
+}
+
+/// The `completion-v1` `result` values. An enum rather than a string so a
+/// caller cannot construct an unknown result that safehoused would reject (or,
+/// worse, degrade to `chat`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompletionResult {
+    Success,
+    Failure,
+}
+
+impl CompletionResult {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Success => "success",
+            Self::Failure => "failure",
+        }
+    }
+}
+
+/// The typed source for a `completion-v1` `meta` object (#4426). Building the
+/// JSON goes through [`CompletionMeta::to_meta_value`], which **validates and
+/// can fail** — there is deliberately no way to get a `completion` envelope
+/// onto the wire without passing that gate.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompletionMeta {
+    /// Persona that did the work; becomes `meta.agent` and must mirror the
+    /// `from` safehoused stamps from the socket identity.
+    pub agent: String,
+    /// Forge `owner/repo` slug (e.g. `rjwalters/loom`) — **not** the
+    /// path-basename narration convention (#4201): the feed links `ref` and
+    /// displays the forge identity.
+    pub repo_slug: String,
+    /// Canonical web URL of the merged PR; becomes `meta.ref`.
+    pub pr_url: String,
+    pub result: CompletionResult,
+    /// RFC3339 timestamps; `completed_at` must not precede `started_at`.
+    pub started_at: String,
+    pub completed_at: String,
+    /// Optional extension fields. envelope-v1 preserves unknown `meta` keys and
+    /// safehoused's egress publishes the raw redacted `meta`, so these need no
+    /// schema revision downstream. Omitted entirely when `None` — the feed
+    /// handles absence, and the issue's rule is "omit rather than guess".
+    pub issue: Option<u32>,
+    pub tokens: Option<u64>,
+}
+
+impl CompletionMeta {
+    /// Render (and validate) the `completion-v1` `meta` object. Fails rather
+    /// than emitting a degradable envelope.
+    pub fn to_meta_value(&self) -> Result<Value> {
+        let mut meta = json!({
+            "schema": COMPLETION_SCHEMA,
+            "agent": self.agent,
+            "repo": self.repo_slug,
+            "ref": self.pr_url,
+            "result": self.result.as_str(),
+            "started_at": self.started_at,
+            "completed_at": self.completed_at,
+        });
+        let obj = meta.as_object_mut().expect("json object literal");
+        if let Some(issue) = self.issue {
+            obj.insert("issue".into(), json!(issue));
+        }
+        // A zero token count is indistinguishable from "accounting had
+        // nothing", so it is omitted rather than published as a real zero.
+        if let Some(tokens) = self.tokens.filter(|t| *t > 0) {
+            obj.insert("tokens".into(), json!(tokens));
+        }
+        validate_completion_meta(&meta)?;
+        Ok(meta)
+    }
+}
+
+/// Whether `slug` is a forge `owner/repo` slug: exactly one `/`, both halves
+/// non-empty and made of forge-legal name characters.
+fn valid_repo_slug(slug: &str) -> bool {
+    let mut parts = slug.split('/');
+    let (Some(owner), Some(name), None) = (parts.next(), parts.next(), parts.next()) else {
+        return false;
+    };
+    let legal = |s: &str| {
+        !s.is_empty()
+            && s.len() <= 100
+            && s.chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+    };
+    legal(owner) && legal(name)
+}
+
+/// Validate a `completion-v1` `meta` object **before** it can reach the wire
+/// (#4426). safehoused silently degrades a malformed `meta` to a `chat` — the
+/// event then vanishes from the public feed with no error anywhere — so this
+/// client refuses to send one instead of relying on server-side validation.
+///
+/// Checks: every [`COMPLETION_REQUIRED_KEYS`] entry present and a non-empty
+/// string, `schema == "completion-v1"`, `agent` a valid persona, `repo` an
+/// `owner/repo` slug, `ref` an absolute `http(s)` URL, `result` one of
+/// `success`/`failure`, and both timestamps RFC3339 with
+/// `completed_at >= started_at`.
+pub fn validate_completion_meta(meta: &Value) -> Result<()> {
+    let Some(obj) = meta.as_object() else {
+        bail!("completion `meta` must be a JSON object, got {meta}");
+    };
+    for key in COMPLETION_REQUIRED_KEYS {
+        match obj.get(key).and_then(Value::as_str) {
+            Some(v) if !v.trim().is_empty() => {}
+            _ => bail!("completion `meta` is missing required non-empty string field {key:?}"),
+        }
+    }
+    let get = |key: &str| obj.get(key).and_then(Value::as_str).unwrap_or_default();
+
+    if get("schema") != COMPLETION_SCHEMA {
+        bail!(
+            "completion `meta.schema` must be {COMPLETION_SCHEMA:?}, got {:?}",
+            get("schema")
+        );
+    }
+    if !valid_persona(get("agent")) {
+        bail!("completion `meta.agent` {:?} is not a valid persona", get("agent"));
+    }
+    if !valid_repo_slug(get("repo")) {
+        bail!("completion `meta.repo` {:?} is not a forge owner/repo slug", get("repo"));
+    }
+    let pr_ref = get("ref");
+    if !(pr_ref.starts_with("https://") || pr_ref.starts_with("http://")) {
+        bail!("completion `meta.ref` {pr_ref:?} must be an absolute http(s) URL");
+    }
+    let result = get("result");
+    if result != CompletionResult::Success.as_str() && result != CompletionResult::Failure.as_str()
+    {
+        bail!("completion `meta.result` must be \"success\" or \"failure\", got {result:?}");
+    }
+    let started = DateTime::parse_from_rfc3339(get("started_at")).with_context(|| {
+        format!("completion `meta.started_at` {:?} is not RFC3339", get("started_at"))
+    })?;
+    let completed = DateTime::parse_from_rfc3339(get("completed_at")).with_context(|| {
+        format!("completion `meta.completed_at` {:?} is not RFC3339", get("completed_at"))
+    })?;
+    if completed < started {
+        bail!(
+            "completion `meta.completed_at` ({}) precedes `started_at` ({})",
+            get("completed_at"),
+            get("started_at")
+        );
+    }
+    // `issue`/`tokens` are optional extension fields; when present they must
+    // still be non-negative integers rather than strings/floats.
+    for key in ["issue", "tokens"] {
+        if let Some(v) = obj.get(key) {
+            if v.as_u64().is_none() {
+                bail!("completion `meta.{key}` must be a non-negative integer, got {v}");
+            }
+        }
+    }
+    Ok(())
 }
 
 /// `[a-z0-9_]`, 1..=64 chars (persona charset, `envelope.rs` `valid_persona`).
@@ -377,9 +572,25 @@ fn normalize_to(to: &str) -> Result<String> {
 /// normalized. Emits `v: 1`, never a `from`, and omits `task_id`/`room` when
 /// absent. safehoused ignores the extra `v` and re-stamps it — carrying it here
 /// makes the request self-describe as envelope-v1.
+///
+/// `meta` (#4426) is serialized only for `completion`, and only after
+/// [`validate_completion_meta`] accepts it: an incomplete or malformed
+/// `completion` is **refused here** (never sent), because safehoused would
+/// otherwise degrade it to a `chat` and it would silently vanish from the
+/// public feed. A `meta` on any other type is likewise an error rather than a
+/// silently-dropped field.
 pub fn build_send_request(env: &Envelope, id: u64, room: Option<&str>) -> Result<Value> {
     if !KNOWN_TYPES.contains(&env.kind.as_str()) {
         bail!("invalid envelope type {:?} (v1 types: {:?})", env.kind, KNOWN_TYPES);
+    }
+    match (env.kind.as_str(), env.meta.as_ref()) {
+        ("completion", Some(meta)) => validate_completion_meta(meta)
+            .context("refusing to send a completion envelope with invalid completion-v1 meta")?,
+        ("completion", None) => {
+            bail!("envelope type \"completion\" requires a completion-v1 `meta` object")
+        }
+        (kind, Some(_)) => bail!("`meta` is only valid on a \"completion\" envelope, not {kind:?}"),
+        (_, None) => {}
     }
     if let Some(task_id) = &env.task_id {
         if task_id.is_empty()
@@ -406,6 +617,9 @@ pub fn build_send_request(env: &Envelope, id: u64, room: Option<&str>) -> Result
     }
     if let Some(room) = room {
         obj.insert("room".into(), json!(room));
+    }
+    if let Some(meta) = &env.meta {
+        obj.insert("meta".into(), meta.clone());
     }
     Ok(req)
 }
@@ -517,6 +731,11 @@ fn decode_exit_code_annotation(code: i32) -> &'static str {
 /// `SweepGlobalCompleted` is intentionally **not** narrated: it carries only a
 /// `sweep_id` (no issue number), and `SweepExited` already emits the completion
 /// `ack` with richer data — narrating both would double-post per completion.
+///
+/// This mapping is 1:1 and pure. The **second** envelope a `SweepExited` can
+/// produce — the public-feed `completion` (#4426) — is built by
+/// [`completion_for_exit`] instead, since it needs an async forge lookup to
+/// confirm the merge; [`run_sink`] emits it after this one.
 #[must_use]
 pub fn event_to_envelope(event: &Event) -> Option<Envelope> {
     match event {
@@ -529,6 +748,7 @@ pub fn event_to_envelope(event: &Event) -> Option<Envelope> {
             kind: "task".to_owned(),
             task_id: Some(qualify_task_id(repo.as_deref(), *issue)),
             body: format!("{} · dispatch", repo_issue_prefix(repo.as_deref(), *issue)),
+            meta: None,
         }),
         Event::SweepPhase {
             issue,
@@ -545,6 +765,7 @@ pub fn event_to_envelope(event: &Event) -> Option<Envelope> {
                 kind: "task".to_owned(),
                 task_id: Some(qualify_task_id(repo.as_deref(), *issue)),
                 body,
+                meta: None,
             })
         }
         Event::SweepBlocker {
@@ -557,6 +778,7 @@ pub fn event_to_envelope(event: &Event) -> Option<Envelope> {
             kind: "handoff".to_owned(),
             task_id: Some(qualify_task_id(repo.as_deref(), *issue)),
             body: format!("{} · BLOCKED — {reason}", repo_issue_prefix(repo.as_deref(), *issue)),
+            meta: None,
         }),
         Event::SweepExited {
             issue,
@@ -579,6 +801,7 @@ pub fn event_to_envelope(event: &Event) -> Option<Envelope> {
                 kind: "ack".to_owned(),
                 task_id: Some(qualify_task_id(repo.as_deref(), *issue)),
                 body,
+                meta: None,
             })
         }
         Event::SweepCrashed {
@@ -596,6 +819,7 @@ pub fn event_to_envelope(event: &Event) -> Option<Envelope> {
                     "{} · crashed ✗ at {phase} — resumable (checkpoint kept)",
                     repo_issue_prefix(repo.as_deref(), *issue)
                 ),
+                meta: None,
             })
         }
         Event::SweepResumeDispatched {
@@ -623,12 +847,218 @@ pub fn event_to_envelope(event: &Event) -> Option<Envelope> {
                 kind: "handoff".to_owned(),
                 task_id: Some(qualify_task_id(repo.as_deref(), *issue)),
                 body,
+                meta: None,
             })
         }
         // SweepGlobalCompleted (no issue number — SweepExited covers it),
         // SweepGlobalDispatch(PrSet), EpicAction, CapacityAdvisory, TopicLag,
         // Generic: not narrated in phase 1.
         _ => None,
+    }
+}
+
+// ============================================================================
+// Completion envelope (#4426) — the public-feed emit point
+// ============================================================================
+
+/// Forge facts about the merged PR behind a completed sweep, read from `gh`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MergedPr {
+    number: u32,
+    /// Canonical web URL (`completion-v1` `ref`).
+    url: String,
+}
+
+/// Build the `completion` envelope for a merged sweep. Pure and total: every
+/// field is supplied by the caller and the `completion-v1` `meta` is validated
+/// by [`CompletionMeta::to_meta_value`], so an envelope that would degrade to
+/// `chat` server-side becomes an `Err` here instead.
+///
+/// The `body` is the human sentence Element renders (`<repo>#N · merged ✓ · PR
+/// #M · <dur>`, following #4201's body grammar); `meta` is the machine view the
+/// egress feed publishes. `task_id` reuses the repo-qualified narration thread
+/// key so the completion lands in the same Matrix thread as that issue's
+/// dispatch/phase/exit lines.
+pub fn build_completion_envelope(
+    repo: Option<&str>,
+    issue: u32,
+    pr: u32,
+    duration_sec: i64,
+    meta: &CompletionMeta,
+) -> Result<Envelope> {
+    let meta_value = meta.to_meta_value()?;
+    Ok(Envelope {
+        to: "*".to_owned(),
+        kind: "completion".to_owned(),
+        task_id: Some(qualify_task_id(repo, issue)),
+        body: format!(
+            "{} · merged ✓ · PR #{pr} · {}",
+            repo_issue_prefix(repo, issue),
+            format_narrated_duration(duration_sec)
+        ),
+        meta: Some(meta_value),
+    })
+}
+
+/// Best-effort `gh pr list --state merged` lookup confirming that the sweep's
+/// branch actually landed (#4426). Mirrors the forge-truth check
+/// `worktree_ops::clean::check_pr_merged` performs, but async (the sink runs on
+/// the daemon runtime and must never block it) and returning the PR `url` the
+/// `completion-v1` `ref` needs.
+///
+/// **Exit 0 is not a merge**: a sweep that ends cleanly with its PR still open
+/// (awaiting a Judge, or merged via `--auto` after the sweep exits) returns
+/// `None` here and narrates no completion, so `result: "success"` is never
+/// claimed for unmerged work. Every failure — missing `gh`, no network,
+/// unauthenticated, timeout, malformed JSON — also degrades to `None`.
+async fn fetch_merged_pr(workspace_root: &Path, issue: u32) -> Option<MergedPr> {
+    let gh_bin = env_nonempty(GH_BIN_ENV).unwrap_or_else(|| "gh".to_owned());
+    let branch = crate::worktree_ops::naming::branch_name(issue);
+    let run = tokio::process::Command::new(&gh_bin)
+        .arg("pr")
+        .arg("list")
+        .arg("--head")
+        .arg(&branch)
+        .arg("--state")
+        .arg("merged")
+        .arg("--json")
+        .arg("number,url,mergedAt")
+        .arg("--limit")
+        .arg("1")
+        .current_dir(workspace_root)
+        .output();
+    let output = tokio::time::timeout(MERGE_CHECK_TIMEOUT, run)
+        .await
+        .ok()?
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let rows: Value = serde_json::from_slice(&output.stdout).ok()?;
+    let row = rows.as_array()?.first()?;
+    // `--state merged` should already guarantee this, but a null `mergedAt`
+    // means the merge is unconfirmed — treat it as "not merged" rather than
+    // publishing a success to a public feed on a guess.
+    let merged_at = row.get("mergedAt").and_then(Value::as_str)?;
+    if merged_at.trim().is_empty() {
+        return None;
+    }
+    let number = u32::try_from(row.get("number")?.as_u64()?).ok()?;
+    let url = row.get("url")?.as_str()?.to_owned();
+    (!url.is_empty()).then_some(MergedPr { number, url })
+}
+
+/// Best-effort `gh repo view --json nameWithOwner` lookup for the forge
+/// `owner/repo` slug (#4426). The `completion-v1` `repo` field is the forge
+/// identity the feed links and displays — deliberately **not** the
+/// path-basename narration convention (#4201) used for `task_id`/body
+/// prefixes, which is a local directory name with no forge meaning.
+async fn fetch_repo_slug(workspace_root: &Path) -> Option<String> {
+    let gh_bin = env_nonempty(GH_BIN_ENV).unwrap_or_else(|| "gh".to_owned());
+    let run = tokio::process::Command::new(&gh_bin)
+        .arg("repo")
+        .arg("view")
+        .arg("--json")
+        .arg("nameWithOwner")
+        .arg("--jq")
+        .arg(".nameWithOwner")
+        .current_dir(workspace_root)
+        .output();
+    let output = tokio::time::timeout(MERGE_CHECK_TIMEOUT, run)
+        .await
+        .ok()?
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let slug = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+    valid_repo_slug(&slug).then_some(slug)
+}
+
+/// [`fetch_repo_slug`] with a process-lifetime cache keyed by workspace root.
+/// A repo's slug does not change while the daemon runs, so this is one `gh`
+/// call per managed workspace rather than one per sweep completion.
+async fn fetch_repo_slug_cached(
+    cache: &mut HashMap<String, String>,
+    workspace_root: &str,
+) -> Option<String> {
+    if let Some(slug) = cache.get(workspace_root) {
+        return Some(slug.clone());
+    }
+    let slug = fetch_repo_slug(Path::new(workspace_root)).await?;
+    cache.insert(workspace_root.to_owned(), slug.clone());
+    Some(slug)
+}
+
+/// The Option-B emit point (#4426): on a `SweepExited`, verify against forge
+/// truth that the sweep's PR actually merged and, if so, build the
+/// public-feed `completion` envelope.
+///
+/// Runs for **every** exit code, not just `0`: a sweep can land its PR and
+/// still exit nonzero on post-merge cleanup, and the merge — not the exit
+/// status — is what the feed reports. `already_narrated` keeps that to one
+/// completion per `(workspace, issue)` for the life of the daemon, so a
+/// resumed sweep's second `SweepExited` does not double-post (downstream ingest
+/// is additionally idempotent on `event_id`, which covers daemon restarts).
+///
+/// Returns `None` — silently, and without ever touching the sweep — when the
+/// PR did not merge, when any `gh` lookup fails, or when the assembled `meta`
+/// fails validation (that last case warns, since it is a client bug rather
+/// than an expected outcome). A built completion is marked as narrated even if
+/// the subsequent send fails: dropped narration is never retried (the module's
+/// standing contract), and a retry would risk a double-post instead.
+///
+/// `result: "failure"` is deliberately **not** emitted in v1: `completion-v1`
+/// requires a `ref`, and a sweep that produced no merged PR has no meaningful
+/// one (an open PR is un-finished, not failed, and is usually resumed). The
+/// wire support exists ([`CompletionResult::Failure`]) for a follow-up that
+/// identifies a genuinely terminal negative outcome.
+async fn completion_for_exit(
+    persona: &str,
+    workspace_root: &str,
+    issue: u32,
+    duration_sec: i64,
+    exited_at: DateTime<Utc>,
+    slug_cache: &mut HashMap<String, String>,
+    already_narrated: &mut std::collections::HashSet<(String, u32)>,
+) -> Option<Envelope> {
+    let key = (workspace_root.to_owned(), issue);
+    if already_narrated.contains(&key) {
+        return None;
+    }
+    let merged = fetch_merged_pr(Path::new(workspace_root), issue).await?;
+    let slug = fetch_repo_slug_cached(slug_cache, workspace_root).await?;
+
+    // Sweep timing comes from the one clock that produced `duration_sec` (the
+    // reaper's), so the pair is always self-consistent — mixing in the forge's
+    // `mergedAt` could render a `completed_at` before `started_at`.
+    let started_at = exited_at - chrono::Duration::seconds(duration_sec.max(0));
+    let meta = CompletionMeta {
+        agent: persona.to_owned(),
+        repo_slug: slug,
+        pr_url: merged.url,
+        result: CompletionResult::Success,
+        started_at: started_at.to_rfc3339_opts(SecondsFormat::Secs, true),
+        completed_at: exited_at.to_rfc3339_opts(SecondsFormat::Secs, true),
+        issue: Some(issue),
+        // No cheap token source is wired to the sink (the activity DB lives
+        // behind the IPC handler, not the bus subscriber), so this is omitted
+        // rather than guessed — the feed handles absence.
+        tokens: None,
+    };
+    match build_completion_envelope(Some(workspace_root), issue, merged.number, duration_sec, &meta)
+    {
+        Ok(envelope) => {
+            already_narrated.insert(key);
+            Some(envelope)
+        }
+        Err(err) => {
+            log::warn!(
+                "safehouse: refusing to narrate completion for issue #{issue} \
+                 ({err:#}); sweep unaffected"
+            );
+            None
+        }
     }
 }
 
@@ -878,6 +1308,10 @@ async fn run_sink(
     let mut warned = false;
     // Short-TTL cache for the dispatch-line title lookup (issue #4201).
     let mut title_cache: HashMap<(String, u32), (String, Instant)> = HashMap::new();
+    // Forge `owner/repo` slugs, and the (workspace, issue) pairs already
+    // narrated as completions — both process-lifetime (#4426).
+    let mut slug_cache: HashMap<String, String> = HashMap::new();
+    let mut completed: std::collections::HashSet<(String, u32)> = std::collections::HashSet::new();
 
     loop {
         let event = match subscription.recv().await {
@@ -890,24 +1324,58 @@ async fn run_sink(
             Err(_) => continue,
         };
 
-        let Some(mut envelope) = event_to_envelope(&event) else {
-            continue;
-        };
+        // One bus event can narrate more than one envelope: a `SweepExited`
+        // whose PR merged emits its `ack` **and** the public-feed `completion`
+        // (#4426), in that order.
+        let mut outbox: Vec<Envelope> = Vec::new();
 
-        // Best-effort dispatch-title enrichment (issue #4201, AC3). Only the
-        // dispatch event needs it, and only when a repo is known (needed to
-        // resolve the `gh` working directory) — every other event is narrated
-        // exactly as `event_to_envelope` built it.
-        if let Event::SweepGlobalDispatch {
-            kind: SweepKind::Issue(issue),
+        if let Some(mut envelope) = event_to_envelope(&event) {
+            // Best-effort dispatch-title enrichment (issue #4201, AC3). Only the
+            // dispatch event needs it, and only when a repo is known (needed to
+            // resolve the `gh` working directory) — every other event is narrated
+            // exactly as `event_to_envelope` built it.
+            if let Event::SweepGlobalDispatch {
+                kind: SweepKind::Issue(issue),
+                repo: Some(workspace_root),
+                ..
+            } = &event
+            {
+                if let Some(title) =
+                    fetch_title_cached(&mut title_cache, workspace_root, *issue).await
+                {
+                    envelope.body.push_str(&format!(" — \"{title}\""));
+                }
+            }
+            outbox.push(envelope);
+        }
+
+        // Public-feed completion (#4426). Needs the workspace root to resolve
+        // the `gh` working directory, so an event with no `repo` stamped
+        // narrates its `ack` only. Every failure inside degrades to `None`.
+        if let Event::SweepExited {
+            issue,
+            duration_sec,
             repo: Some(workspace_root),
             ..
         } = &event
         {
-            if let Some(title) = fetch_title_cached(&mut title_cache, workspace_root, *issue).await
+            if let Some(completion) = completion_for_exit(
+                &config.persona,
+                workspace_root,
+                *issue,
+                *duration_sec,
+                Utc::now(),
+                &mut slug_cache,
+                &mut completed,
+            )
+            .await
             {
-                envelope.body.push_str(&format!(" — \"{title}\""));
+                outbox.push(completion);
             }
+        }
+
+        if outbox.is_empty() {
+            continue;
         }
 
         // (Re)connect lazily, honoring the backoff window so an absent peer is
@@ -954,22 +1422,31 @@ async fn run_sink(
             }
         }
 
+        // Send this event's envelopes in order, stopping at the first failure
+        // (the connection is gone; the rest would fail identically).
+        let mut send_failure: Option<anyhow::Error> = None;
         if let Some(connected) = client.as_mut() {
-            if let Err(err) = connected.send(&envelope).await {
-                log::warn!(
-                    "safehouse: narration send failed ({err:#}); will reconnect, sweep unaffected"
-                );
-                client = None;
-                set_state(
-                    &state,
-                    SafehouseState::Unreachable {
-                        socket: socket.clone(),
-                    },
-                );
-                next_attempt = Instant::now() + backoff;
-                backoff = (backoff * 2).min(max_backoff);
-                warned = true;
+            for envelope in &outbox {
+                if let Err(err) = connected.send(envelope).await {
+                    send_failure = Some(err);
+                    break;
+                }
             }
+        }
+        if let Some(err) = send_failure {
+            log::warn!(
+                "safehouse: narration send failed ({err:#}); will reconnect, sweep unaffected"
+            );
+            client = None;
+            set_state(
+                &state,
+                SafehouseState::Unreachable {
+                    socket: socket.clone(),
+                },
+            );
+            next_attempt = Instant::now() + backoff;
+            backoff = (backoff * 2).min(max_backoff);
+            warned = true;
         }
     }
 }
@@ -1043,6 +1520,7 @@ pub fn claim_ad_to_envelope(ad: &ClaimAd) -> Envelope {
         kind: "task".to_owned(),
         task_id: Some(ad.issue.to_string()),
         body: ad.to_body_json(),
+        meta: None,
     }
 }
 
@@ -1415,6 +1893,7 @@ mod tests {
             kind: "task".to_owned(),
             task_id: Some("4137".to_owned()),
             body: "hi".to_owned(),
+            meta: None,
         };
         let req = build_send_request(&env, 7, None).unwrap();
         assert_eq!(req["v"], json!(1));
@@ -1433,6 +1912,7 @@ mod tests {
             kind: "ack".to_owned(),
             task_id: None,
             body: "done".to_owned(),
+            meta: None,
         };
         let req = build_send_request(&env, 1, None).unwrap();
         assert!(req.get("task_id").is_none());
@@ -1445,6 +1925,7 @@ mod tests {
             kind: "task".to_owned(),
             task_id: None,
             body: "x".to_owned(),
+            meta: None,
         };
         let req = build_send_request(&env, 1, Some("fleet")).unwrap();
         assert_eq!(req["room"], json!("fleet"));
@@ -1457,6 +1938,7 @@ mod tests {
             kind: "smoke_signal".to_owned(),
             task_id: None,
             body: "x".to_owned(),
+            meta: None,
         };
         assert!(build_send_request(&env, 1, None).is_err());
     }
@@ -1468,6 +1950,7 @@ mod tests {
             kind: "task".to_owned(),
             task_id: Some("issue-4137".to_owned()),
             body: "x".to_owned(),
+            meta: None,
         };
         assert!(build_send_request(&env, 1, None).is_err());
     }
@@ -1480,6 +1963,7 @@ mod tests {
             kind: "task".to_owned(),
             task_id: None,
             body: "x".to_owned(),
+            meta: None,
         };
         let req = build_send_request(&env, 1, None).unwrap();
         assert_eq!(req["to"], json!("loom_builder"));
@@ -1490,6 +1974,238 @@ mod tests {
 
         // A value that cannot be a persona is rejected, not silently sent.
         assert!(normalize_to("has space").is_err());
+    }
+
+    // ---- completion envelopes + completion-v1 meta (#4426) ----
+
+    /// A valid `completion-v1` source, tweaked per-test.
+    fn sample_completion_meta() -> CompletionMeta {
+        CompletionMeta {
+            agent: "loom_daemon".to_owned(),
+            repo_slug: "rjwalters/loom".to_owned(),
+            pr_url: "https://github.com/rjwalters/loom/pull/4321".to_owned(),
+            result: CompletionResult::Success,
+            started_at: "2026-07-29T10:00:00Z".to_owned(),
+            completed_at: "2026-07-29T10:12:30Z".to_owned(),
+            issue: Some(4321),
+            tokens: Some(791_000),
+        }
+    }
+
+    #[test]
+    fn completion_is_a_known_type() {
+        assert!(KNOWN_TYPES.contains(&"completion"));
+    }
+
+    #[test]
+    fn send_request_accepts_completion_with_valid_meta() {
+        let meta = sample_completion_meta().to_meta_value().unwrap();
+        let env = Envelope {
+            to: "*".to_owned(),
+            kind: "completion".to_owned(),
+            task_id: Some("loom_4321".to_owned()),
+            body: "loom#4321 · merged ✓ · PR #4321 · 12m30s".to_owned(),
+            meta: Some(meta),
+        };
+        let req = build_send_request(&env, 3, Some("fleet")).unwrap();
+
+        assert_eq!(req["type"], json!("completion"));
+        assert_eq!(req["v"], json!(1));
+        assert_eq!(req["room"], json!("fleet"));
+        assert!(req.get("from").is_none(), "from must never be serialized");
+        // The whole completion-v1 payload rides in `meta`, and `body` stays
+        // human prose (a room reader sees a sentence, not JSON).
+        assert_eq!(req["meta"]["schema"], json!("completion-v1"));
+        assert_eq!(req["meta"]["agent"], json!("loom_daemon"));
+        assert_eq!(req["meta"]["repo"], json!("rjwalters/loom"));
+        assert_eq!(req["meta"]["ref"], json!("https://github.com/rjwalters/loom/pull/4321"));
+        assert_eq!(req["meta"]["result"], json!("success"));
+        assert_eq!(req["meta"]["started_at"], json!("2026-07-29T10:00:00Z"));
+        assert_eq!(req["meta"]["completed_at"], json!("2026-07-29T10:12:30Z"));
+        assert_eq!(req["meta"]["issue"], json!(4321));
+        assert_eq!(req["meta"]["tokens"], json!(791_000));
+        assert!(req["body"].as_str().unwrap().contains("merged ✓"));
+    }
+
+    #[test]
+    fn send_request_refuses_completion_without_meta() {
+        // safehoused would degrade this to a `chat` and it would vanish from
+        // the public feed with no error — so it must never leave this client.
+        let env = Envelope {
+            to: "*".to_owned(),
+            kind: "completion".to_owned(),
+            task_id: None,
+            body: "merged".to_owned(),
+            meta: None,
+        };
+        assert!(build_send_request(&env, 1, None).is_err());
+    }
+
+    #[test]
+    fn send_request_refuses_meta_on_non_completion_types() {
+        for kind in ["chat", "task", "handoff", "ack"] {
+            let env = Envelope {
+                to: "*".to_owned(),
+                kind: kind.to_owned(),
+                task_id: None,
+                body: "x".to_owned(),
+                meta: Some(sample_completion_meta().to_meta_value().unwrap()),
+            };
+            assert!(
+                build_send_request(&env, 1, None).is_err(),
+                "`meta` must be rejected on a {kind:?} envelope, not silently dropped"
+            );
+        }
+    }
+
+    #[test]
+    fn send_request_refuses_every_flavor_of_malformed_completion_meta() {
+        let valid = sample_completion_meta().to_meta_value().unwrap();
+        let mut cases: Vec<(&str, Value)> = vec![
+            ("not an object", json!("completion-v1")),
+            ("wrong schema", {
+                let mut m = valid.clone();
+                m["schema"] = json!("completion-v2");
+                m
+            }),
+            ("empty agent", {
+                let mut m = valid.clone();
+                m["agent"] = json!("");
+                m
+            }),
+            ("invalid persona charset", {
+                let mut m = valid.clone();
+                m["agent"] = json!("Loom-Daemon");
+                m
+            }),
+            ("repo is a path basename, not a forge slug", {
+                let mut m = valid.clone();
+                m["repo"] = json!("loom");
+                m
+            }),
+            ("ref is not an absolute URL", {
+                let mut m = valid.clone();
+                m["ref"] = json!("rjwalters/loom#4321");
+                m
+            }),
+            ("unknown result", {
+                let mut m = valid.clone();
+                m["result"] = json!("merged");
+                m
+            }),
+            ("started_at is not RFC3339", {
+                let mut m = valid.clone();
+                m["started_at"] = json!("29 July 2026");
+                m
+            }),
+            ("completed_at precedes started_at", {
+                let mut m = valid.clone();
+                m["completed_at"] = json!("2026-07-29T09:00:00Z");
+                m
+            }),
+            ("tokens is a string", {
+                let mut m = valid.clone();
+                m["tokens"] = json!("791000");
+                m
+            }),
+        ];
+        // Every required key, dropped one at a time.
+        for key in COMPLETION_REQUIRED_KEYS {
+            let mut m = valid.clone();
+            m.as_object_mut().unwrap().remove(key);
+            cases.push((key, m));
+        }
+
+        for (label, meta) in cases {
+            assert!(
+                validate_completion_meta(&meta).is_err(),
+                "validate_completion_meta must reject: {label}"
+            );
+            let env = Envelope {
+                to: "*".to_owned(),
+                kind: "completion".to_owned(),
+                task_id: None,
+                body: "merged".to_owned(),
+                meta: Some(meta),
+            };
+            assert!(
+                build_send_request(&env, 1, None).is_err(),
+                "a completion with malformed meta must not be sent: {label}"
+            );
+        }
+    }
+
+    #[test]
+    fn completion_meta_omits_absent_optional_fields() {
+        let meta = CompletionMeta {
+            issue: None,
+            tokens: None,
+            ..sample_completion_meta()
+        }
+        .to_meta_value()
+        .unwrap();
+        assert!(meta.get("issue").is_none(), "absent issue must be omitted, not null/0");
+        assert!(meta.get("tokens").is_none(), "absent tokens must be omitted, not null/0");
+        // A zero token count is indistinguishable from "no accounting data".
+        let zeroed = CompletionMeta {
+            tokens: Some(0),
+            ..sample_completion_meta()
+        }
+        .to_meta_value()
+        .unwrap();
+        assert!(zeroed.get("tokens").is_none());
+    }
+
+    #[test]
+    fn completion_meta_construction_fails_on_bad_fields() {
+        // The typed constructor is the only route to a `completion`, so it
+        // must refuse the same things validate_completion_meta does.
+        assert!(CompletionMeta {
+            repo_slug: "not a slug".to_owned(),
+            ..sample_completion_meta()
+        }
+        .to_meta_value()
+        .is_err());
+        assert!(CompletionMeta {
+            started_at: "yesterday".to_owned(),
+            ..sample_completion_meta()
+        }
+        .to_meta_value()
+        .is_err());
+    }
+
+    #[test]
+    fn build_completion_envelope_threads_with_the_issue_and_reads_as_prose() {
+        let env = build_completion_envelope(
+            Some("/Users/x/GitHub/loom"),
+            4321,
+            4400,
+            750,
+            &sample_completion_meta(),
+        )
+        .unwrap();
+
+        assert_eq!(env.kind, "completion");
+        assert_eq!(env.to, "*");
+        // Same repo-qualified thread key as this issue's other narration lines
+        // (#4201), so the completion lands in the existing Matrix thread.
+        assert_eq!(env.task_id.as_deref(), Some("loom_4321"));
+        assert_eq!(env.body, "loom#4321 · merged ✓ · PR #4400 · 12m30s");
+        assert_eq!(env.meta.as_ref().unwrap()["schema"], json!("completion-v1"));
+        // And it survives the pre-send gate.
+        assert!(build_send_request(&env, 1, None).is_ok());
+    }
+
+    #[test]
+    fn valid_repo_slug_accepts_owner_repo_and_rejects_the_rest() {
+        assert!(valid_repo_slug("rjwalters/loom"));
+        assert!(valid_repo_slug("2AMLogic/marketing"));
+        assert!(valid_repo_slug("owner/kicad-tools.git"));
+        assert!(!valid_repo_slug("loom"), "a bare basename is not a forge slug");
+        assert!(!valid_repo_slug("a/b/c"));
+        assert!(!valid_repo_slug("/loom"));
+        assert!(!valid_repo_slug("rjwalters/"));
+        assert!(!valid_repo_slug("rjwalters/lo om"));
     }
 
     // ---- repo qualification helpers (issue #4201) ----
@@ -1798,6 +2514,279 @@ mod tests {
         assert!(body.contains("#4201 · dispatch"));
     }
 
+    // ---- completion emit point: SweepExited + forge merge check (#4426) ----
+
+    /// Write an executable fake `gh` that answers the two forge lookups the
+    /// completion path makes — `gh pr list …` and `gh repo view …` — logging
+    /// every invocation. `None` for either makes that subcommand exit 1, which
+    /// is how a missing/unauthenticated/offline `gh` presents.
+    fn write_fake_forge_gh(
+        dir: &std::path::Path,
+        pr_list_json: Option<&str>,
+        slug: Option<&str>,
+    ) -> (PathBuf, PathBuf) {
+        let log = dir.join("gh-forge-invocations.log");
+        let script_path = dir.join("fake-forge-gh.sh");
+        let arm = |stdout: Option<&str>| match stdout {
+            Some(text) => format!("printf '%s\\n' {}; exit 0", shell_quote(text)),
+            None => "exit 1".to_owned(),
+        };
+        let body = format!(
+            "#!/usr/bin/env bash\nprintf '%s\\n' \"$*\" >> \"{}\"\ncase \"$1 $2\" in\n  \
+             'pr list') {} ;;\n  'repo view') {} ;;\n  *) exit 1 ;;\nesac\n",
+            log.display(),
+            arm(pr_list_json),
+            arm(slug),
+        );
+        std::fs::write(&script_path, body).unwrap();
+        let mut perms = std::fs::metadata(&script_path).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&script_path, perms).unwrap();
+        (script_path, log)
+    }
+
+    const MERGED_PR_JSON: &str = r#"[{"number":4400,"url":"https://github.com/rjwalters/loom/pull/4400","mergedAt":"2026-07-29T10:12:00Z"}]"#;
+
+    #[tokio::test]
+    #[serial]
+    async fn completion_for_exit_emits_when_the_pr_merged() {
+        let dir = tempfile::tempdir().unwrap();
+        let (fake_gh, _log) =
+            write_fake_forge_gh(dir.path(), Some(MERGED_PR_JSON), Some("rjwalters/loom"));
+        std::env::set_var(GH_BIN_ENV, &fake_gh);
+
+        let root = dir.path().to_string_lossy().into_owned();
+        let exited_at = DateTime::parse_from_rfc3339("2026-07-29T10:12:30Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let envelope = completion_for_exit(
+            "loom_daemon",
+            &root,
+            4426,
+            750,
+            exited_at,
+            &mut HashMap::new(),
+            &mut std::collections::HashSet::new(),
+        )
+        .await;
+
+        std::env::remove_var(GH_BIN_ENV);
+        let envelope = envelope.expect("a merged PR must produce a completion envelope");
+        assert_eq!(envelope.kind, "completion");
+        let meta = envelope.meta.as_ref().unwrap();
+        assert_eq!(meta["schema"], json!("completion-v1"));
+        assert_eq!(meta["agent"], json!("loom_daemon"));
+        // The forge slug, not the `#4201` path-basename narration convention.
+        assert_eq!(meta["repo"], json!("rjwalters/loom"));
+        assert_eq!(meta["ref"], json!("https://github.com/rjwalters/loom/pull/4400"));
+        assert_eq!(meta["result"], json!("success"));
+        assert_eq!(meta["issue"], json!(4426));
+        // started_at is derived from the exit clock minus duration_sec.
+        assert_eq!(meta["started_at"], json!("2026-07-29T10:00:00Z"));
+        assert_eq!(meta["completed_at"], json!("2026-07-29T10:12:30Z"));
+        // No cheap token source is wired to the sink — omitted, never guessed.
+        assert!(meta.get("tokens").is_none());
+        assert!(build_send_request(&envelope, 1, None).is_ok());
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn completion_for_exit_is_silent_when_the_pr_did_not_merge() {
+        // Exit 0 is not a merge: a clean sweep whose PR is still open must not
+        // claim `result: "success"` on the public feed.
+        let dir = tempfile::tempdir().unwrap();
+        let (fake_gh, _log) = write_fake_forge_gh(dir.path(), Some("[]"), Some("rjwalters/loom"));
+        std::env::set_var(GH_BIN_ENV, &fake_gh);
+
+        let out = completion_for_exit(
+            "loom_daemon",
+            &dir.path().to_string_lossy(),
+            4426,
+            750,
+            Utc::now(),
+            &mut HashMap::new(),
+            &mut std::collections::HashSet::new(),
+        )
+        .await;
+
+        std::env::remove_var(GH_BIN_ENV);
+        assert!(out.is_none(), "no merged PR ⇒ no completion");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn completion_for_exit_degrades_to_none_when_gh_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let (fake_gh, _log) = write_fake_forge_gh(dir.path(), None, None);
+        std::env::set_var(GH_BIN_ENV, &fake_gh);
+
+        let out = completion_for_exit(
+            "loom_daemon",
+            &dir.path().to_string_lossy(),
+            4426,
+            750,
+            Utc::now(),
+            &mut HashMap::new(),
+            &mut std::collections::HashSet::new(),
+        )
+        .await;
+
+        std::env::remove_var(GH_BIN_ENV);
+        assert!(out.is_none(), "a failing gh must degrade to None, never panic or block");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn completion_for_exit_emits_at_most_once_per_merge() {
+        // A resumed sweep produces a second SweepExited for the same issue —
+        // the merge is still the same one, so only one completion is emitted.
+        let dir = tempfile::tempdir().unwrap();
+        let (fake_gh, log) =
+            write_fake_forge_gh(dir.path(), Some(MERGED_PR_JSON), Some("rjwalters/loom"));
+        std::env::set_var(GH_BIN_ENV, &fake_gh);
+
+        let root = dir.path().to_string_lossy().into_owned();
+        let mut slug_cache = HashMap::new();
+        let mut completed = std::collections::HashSet::new();
+        let first = completion_for_exit(
+            "loom_daemon",
+            &root,
+            4426,
+            750,
+            Utc::now(),
+            &mut slug_cache,
+            &mut completed,
+        )
+        .await;
+        let second = completion_for_exit(
+            "loom_daemon",
+            &root,
+            4426,
+            760,
+            Utc::now(),
+            &mut slug_cache,
+            &mut completed,
+        )
+        .await;
+
+        std::env::remove_var(GH_BIN_ENV);
+        assert!(first.is_some());
+        assert!(second.is_none(), "a second exit for the same issue must not double-post");
+        let calls = std::fs::read_to_string(&log).unwrap_or_default();
+        assert_eq!(
+            calls.lines().count(),
+            2,
+            "the dedupe must short-circuit before re-shelling to gh; log: {calls:?}"
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn run_sink_narrates_exit_ack_then_completion() {
+        // The emit-point mapping test: one `SweepExited` whose PR merged
+        // produces the human `ack` and exactly one public-feed `completion`.
+        let dir = tempfile::tempdir().unwrap();
+        let (fake_gh, _log) =
+            write_fake_forge_gh(dir.path(), Some(MERGED_PR_JSON), Some("rjwalters/loom"));
+        std::env::set_var(GH_BIN_ENV, &fake_gh);
+
+        let socket = dir.path().join("safehoused.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let server = tokio::spawn(stub_server(listener, false, 2));
+
+        let bus = Arc::new(EventBus::new());
+        let subscription = bus.subscribe(Vec::<String>::new());
+        let sink = tokio::spawn(run_sink(
+            SafehouseConfig {
+                enabled: true,
+                socket: Some(socket.clone()),
+                ..SafehouseConfig::default()
+            },
+            socket,
+            subscription,
+            Duration::from_millis(20),
+            Duration::from_millis(80),
+            new_shared_state(),
+        ));
+
+        bus.publish(Event::SweepExited {
+            issue: 4426,
+            exit_code: Some(0),
+            duration_sec: 750,
+            repo: Some(dir.path().to_string_lossy().into_owned()),
+        })
+        .unwrap();
+
+        let received = tokio::time::timeout(Duration::from_secs(5), server)
+            .await
+            .expect("stub server must receive the ack and the completion")
+            .unwrap();
+
+        drop(bus);
+        let _ = tokio::time::timeout(Duration::from_secs(2), sink).await;
+        std::env::remove_var(GH_BIN_ENV);
+
+        assert_eq!(received.len(), 2);
+        assert_eq!(received[0]["type"], json!("ack"));
+        assert!(received[0].get("meta").is_none(), "an ack carries no meta");
+        assert_eq!(received[1]["type"], json!("completion"));
+        assert_eq!(received[1]["meta"]["schema"], json!("completion-v1"));
+        assert_eq!(received[1]["meta"]["repo"], json!("rjwalters/loom"));
+        assert_eq!(received[1]["meta"]["result"], json!("success"));
+        assert_eq!(received[1]["meta"]["issue"], json!(4426));
+        // Both lines thread together under the repo-qualified task_id.
+        assert_eq!(received[0]["task_id"], received[1]["task_id"]);
+        assert!(received[1]["body"].as_str().unwrap().contains("merged ✓"));
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn run_sink_narrates_only_the_ack_when_nothing_merged() {
+        let dir = tempfile::tempdir().unwrap();
+        let (fake_gh, _log) = write_fake_forge_gh(dir.path(), Some("[]"), Some("rjwalters/loom"));
+        std::env::set_var(GH_BIN_ENV, &fake_gh);
+
+        let socket = dir.path().join("safehoused.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let server = tokio::spawn(stub_server(listener, false, 1));
+
+        let bus = Arc::new(EventBus::new());
+        let subscription = bus.subscribe(Vec::<String>::new());
+        let sink = tokio::spawn(run_sink(
+            SafehouseConfig {
+                enabled: true,
+                socket: Some(socket.clone()),
+                ..SafehouseConfig::default()
+            },
+            socket,
+            subscription,
+            Duration::from_millis(20),
+            Duration::from_millis(80),
+            new_shared_state(),
+        ));
+
+        bus.publish(Event::SweepExited {
+            issue: 4426,
+            exit_code: Some(1),
+            duration_sec: 90,
+            repo: Some(dir.path().to_string_lossy().into_owned()),
+        })
+        .unwrap();
+
+        let received = tokio::time::timeout(Duration::from_secs(5), server)
+            .await
+            .expect("stub server must receive the failure ack")
+            .unwrap();
+
+        drop(bus);
+        let _ = tokio::time::timeout(Duration::from_secs(2), sink).await;
+        std::env::remove_var(GH_BIN_ENV);
+
+        assert_eq!(received.len(), 1);
+        assert_eq!(received[0]["type"], json!("ack"));
+        assert!(received[0]["body"].as_str().unwrap().contains("failed ✗"));
+    }
+
     // ---- integration: stub AF_UNIX socket ----
 
     /// Minimal stub safehoused: accept one connection, read the `hello`, reply
@@ -1863,6 +2852,7 @@ mod tests {
                 kind: "task".to_owned(),
                 task_id: Some("42".to_owned()),
                 body: "issue #42 → builder".to_owned(),
+                meta: None,
             })
             .await
             .expect("send must succeed despite the interleaved push line");
