@@ -13,6 +13,7 @@
 pub mod activity;
 pub mod auto_update;
 pub mod autonomy_marker;
+pub mod calibrate;
 pub mod capacity;
 pub mod claim_reconciliation;
 pub mod config_resolver;
