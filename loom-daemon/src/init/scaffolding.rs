@@ -993,8 +993,9 @@ pub fn setup_repository_scaffolding(
     }
 
     // Install loom.sh convenience wrapper at repo root (always update from defaults)
-    // This is a thin wrapper around .loom/scripts/daemon.sh that lets
-    // users run `./loom.sh` from the repo root instead of the full script path.
+    // This is a thin wrapper around .loom/scripts/start-daemon.sh (the tmux
+    // agent-pool path) that lets users run `./loom.sh` from the repo root
+    // instead of the full script path.
     let loom_sh_src = defaults_path.join("loom.sh");
     let loom_sh_dst = workspace_path.join("loom.sh");
     if loom_sh_src.exists() {
