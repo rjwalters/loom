@@ -156,7 +156,7 @@ Usage:
 ./clean.sh --deep           # Include build artifacts
 ./clean.sh --dry-run        # Preview only
 ./clean.sh --safe --force   # Safe mode, non-interactive
-loom-clean                  # Direct invocation (requires loom-tools venv)
+loom-clean                  # Direct invocation (PATH shim to `loom-daemon clean`, no venv required)
 ```
 
 ### cleanup-branches.sh
