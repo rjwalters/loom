@@ -2740,6 +2740,7 @@ mod tests {
             issue: 4426,
             exit_code: Some(0),
             duration_sec: 750,
+            death_class: None,
             repo: Some(dir.path().to_string_lossy().into_owned()),
         })
         .unwrap();
@@ -2796,6 +2797,7 @@ mod tests {
             issue: 4426,
             exit_code: Some(1),
             duration_sec: 90,
+            death_class: None,
             repo: Some(dir.path().to_string_lossy().into_owned()),
         })
         .unwrap();
