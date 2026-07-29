@@ -12,7 +12,7 @@ Builder agents (Claude Code as well as external engines invoked by parallel swar
 - commits containing only logfiles / scratch files,
 - no commits at all.
 
-Without a gate, the Judge phase has to catch every one of these post-hoc, which wastes review cycles and pollutes the queue. The gate moves that filter ~30s of CPU instead of a multi-minute Judge cycle, and on parallel-shepherd fleets the savings compound.
+Without a gate, the Judge phase has to catch every one of these post-hoc, which wastes review cycles and pollutes the queue. The gate moves that filter ~30s of CPU instead of a multi-minute Judge cycle, and on parallel-sweep fleets the savings compound.
 
 ## The three checks
 
@@ -27,7 +27,7 @@ When all three pass the builder phase proceeds normally to PR creation. When any
 - Atomically releases the claim: `loom:building` -> `loom:issue`.
 - Logs an `error` milestone with `reason=build_failed_post_builder` and `check=<failed_check>`.
 - Cleans up the stale worktree.
-- Returns a `FAILED` `PhaseResult` so the shepherd does not progress to Judge.
+- Returns a `FAILED` `PhaseResult` so the sweep does not progress to Judge.
 
 ## Configuration
 
