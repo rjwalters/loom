@@ -1,9 +1,61 @@
 # Guard Hooks Reference
 
 Loom's `PreToolUse` guard hooks and their per-repo toggles. Each toggle resolves
-with **env > `.loom/config.json` > default** precedence; the operating-core guides
-(`CLAUDE.md` and `.loom/CLAUDE.md`, "Configuration → Guard hooks") point here for
-the full catalog.
+through the tiered config resolver with **env > tracked `.loom-project/project.json`
+> legacy `.loom/config.json` > default** precedence (Epic #3835 Phase 2 / #4039;
+see "Config tiers" below); the operating-core guides (`CLAUDE.md` and
+`.loom/CLAUDE.md`, "Configuration → Guard hooks") point here for the full catalog.
+
+## Machine-Level Execution (Epic #3835 Phase 5, #4262)
+
+As of Phase 5, the hook **scripts** are no longer copied into each consumer repo's
+`.loom/hooks/`. They execute from the **single machine-level checkout**
+(`${LOOM_HOME:-~/.local/share/loom}/defaults/hooks/`), wired once into the
+operator's **user-scope** `~/.claude/settings.json` by
+`scripts/install/provision-hooks.sh` (a sibling of the Phase 4 skills provisioner).
+A freshly-installed consumer repo therefore carries **no** hook-script copies and
+they can never drift stale (the recurring `resync-installed.sh` pain). Hook
+**policy** — the `guards.*` toggles and `buildGate` — still lives per-repo, read
+from the tracked `.loom-project/project.json` (or legacy `.loom/config.json`)
+through the tiered resolver. Implementation vs. policy are split: scripts machine-
+level, config per-repo.
+
+Each user-scope entry is a **fail-open, self-gating** command wrapper, because a
+user-scope hook fires in *every* repo the operator opens:
+
+1. **Workspace gate** — it resolves the main repo root worktree-aware
+   (`git rev-parse --git-common-dir`/.., so guards still fire from inside
+   `.loom/worktrees/*`) and **exits 0 silently** unless that root holds
+   `.loom-project/project.json` or `.loom/config.json`. Non-Loom repos, and the
+   case where the machine checkout is absent, no-op cleanly.
+2. **Transition precedence** — if the repo still carries a per-repo
+   `.loom/hooks/<name>` copy (pre-Phase-6 / #4254), the wrapper **defers**: it
+   exits 0 and lets the project-level `.claude/settings.json` entry run that copy.
+   The project copy **wins** until Phase 6 strips it, so a transition repo runs
+   each guard exactly **once** (no double-fire, no duplicated `guards.decisionLog`
+   lines).
+3. **Machine exec** — otherwise it exec's the machine-checkout hook, passing the
+   resolved repo root through `LOOM_PROJECT_ROOT` so `guard-destructive.sh`'s
+   dispatcher resolves the *consuming* repo's canonical Repo-Skills guard from a
+   checkout-shaped `SCRIPT_DIR`.
+
+Existing per-repo `.loom/hooks/` copies on an already-installed repo are left in
+place by this phase; removing them is Phase 6 (#4254) migration territory. Daemon-
+spawned workers inherit the user-scope wiring because `loom-daemon` copies
+`~/.claude/settings.json` into each worker's isolated `CLAUDE_CONFIG_DIR`.
+
+### Config tiers
+
+The guard toggles below are documented against `.loom/config.json` for historical
+continuity, but every `guards.*` / `worktree.*` read now flows through the tiered
+resolver (`defaults/scripts/lib/config-resolver.sh` `loom_config_get`), so the same
+key set in the tracked `.loom-project/project.json` takes precedence over the legacy
+`.loom/config.json`, and an `LOOM_*` env override beats both. `buildGate` is read the
+same way by the daemon's main-health gate (`main_health_gate.rs`, already tiered).
+The `guard-worktree-paths.sh` toggle reads and the `guard-destructive-generic.sh`
+read-only fast-path toggles both consult `.loom-project/project.json` first, then the
+legacy file — the fast path stays a bounded, direct-`jq` read (never the full resolver
+merge) to preserve the #3687 fork budget on the hottest guard invocation.
 
 ## Custom Guard Hooks
 

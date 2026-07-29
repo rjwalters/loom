@@ -1799,6 +1799,44 @@ for _fp_dir in "$FASTPATH_OFF_REPO" "$FASTPATH_EXTRA_REPO"; do
     [[ -n "$_fp_dir" && "$_fp_dir" != "/" && -d "$_fp_dir/.loom" ]] && rm -rf "$_fp_dir"
 done
 
+# --- Tiered config (Epic #3835 Phase 5, #4262): .loom-project/project.json --
+# Create a throwaway git repo whose .loom-project/project.json (the tracked
+# tier) holds the given JSON, optionally alongside a legacy .loom/config.json
+# to exercise tier precedence. Echoes the repo path.
+make_project_tier_repo() {
+    local project_json="$1" legacy_json="${2:-}"
+    local dir
+    dir=$(mktemp -d 2>/dev/null)
+    git -C "$dir" init -q >/dev/null 2>&1
+    mkdir -p "$dir/.loom-project"
+    printf '%s' "$project_json" > "$dir/.loom-project/project.json"
+    if [[ -n "$legacy_json" ]]; then
+        mkdir -p "$dir/.loom"
+        printf '%s' "$legacy_json" > "$dir/.loom/config.json"
+    fi
+    echo "$dir"
+}
+
+if [[ "$_FP_AMBIENT_ON" == "1" ]]; then
+    PROJECT_TIER_REPO=$(make_project_tier_repo '{"guards":{"readOnlyFastPath":false}}')
+    assert_deny "Fast path tiered config: .loom-project/project.json readOnlyFastPath=false disables fast path" \
+        "grep '$_FP_DDL' schema.sql" "$PROJECT_TIER_REPO"
+
+    # Project tier (higher precedence) overrides a conflicting legacy tier.
+    OVERRIDE_REPO=$(make_project_tier_repo '{"guards":{"readOnlyFastPath":false}}' '{"guards":{"readOnlyFastPath":true}}')
+    assert_deny "Fast path tiered config: project tier overrides conflicting legacy tier (project wins)" \
+        "grep '$_FP_DDL' schema.sql" "$OVERRIDE_REPO"
+
+    # readOnlyFastPathExtra also resolves from the project tier.
+    PROJECT_EXTRA_REPO=$(make_project_tier_repo '{"guards":{"readOnlyFastPathExtra":["psql"]}}')
+    assert_allow "Fast path tiered config: readOnlyFastPathExtra from .loom-project admits 'psql'" \
+        "psql -c '$_FP_DDL'" "$PROJECT_EXTRA_REPO"
+
+    for _fp_dir in "$PROJECT_TIER_REPO" "$OVERRIDE_REPO" "$PROJECT_EXTRA_REPO"; do
+        [[ -n "$_fp_dir" && "$_fp_dir" != "/" && -d "$_fp_dir/.loom-project" ]] && rm -rf "$_fp_dir"
+    done
+fi
+
 echo ""
 
 # =========================================================================
