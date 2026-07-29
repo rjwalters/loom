@@ -1302,6 +1302,38 @@ pub struct RepoStatus {
     /// [`DaemonStatusReport::main_health_gate_verdict_tier`].
     #[serde(default)]
     pub health_gate_verdict_tier: Option<String>,
+    /// Whether the periodic support-role runner (Issue #4015) is enabled for
+    /// **this** root's own `.loom/config.json` (Issue #4377) —
+    /// `role_runner::resolve_enabled(role_runner::read_role_runner_config(root))`,
+    /// resolved daemon-side, never the CLI client's environment. This is a
+    /// **per-root** gate, independent of whether the daemon's own workspace
+    /// happens to have `autonomous.roleRunner.enabled: true` — a registered
+    /// workspace can be `false` here even while the daemon's own workspace is
+    /// `true`, which was previously undiagnosable without reading that root's
+    /// config file directly (the motivating incident: 9 of 10 registered
+    /// workspaces silently receiving zero role ticks). `#[serde(default)]`
+    /// keeps pre-#4377 wire data / older daemon binaries compatible (an
+    /// absent field parses as `false`).
+    #[serde(default)]
+    pub role_runner_enabled: bool,
+    /// The interval-loop roles this root would dispatch if
+    /// [`Self::role_runner_enabled`] were `true` (Issue #4377) —
+    /// `role_runner::resolve_roles(..)` names, in [`crate::role_runner::DEFAULT_ROLES`]
+    /// order. Populated even when disabled, so `loom-daemon status` can show
+    /// *what* is being suppressed, not just *that* it is. `#[serde(default)]`
+    /// keeps pre-#4377 wire data compatible (an absent field parses as an
+    /// empty vec).
+    #[serde(default)]
+    pub role_runner_roles: Vec<String>,
+    /// This root's `autonomous.roleRunner.onIdle` roles (Issue #4377) —
+    /// `role_runner::resolve_on_idle_roles(..)` names. A non-empty value here
+    /// combined with [`Self::role_runner_enabled`] being `false` is exactly
+    /// the silent-no-op this issue fixes: `onIdle` configured, but the
+    /// per-root gate off, so it never fires. `#[serde(default)]` keeps
+    /// pre-#4377 wire data compatible (an absent field parses as an empty
+    /// vec).
+    #[serde(default)]
+    pub role_runner_on_idle_roles: Vec<String>,
 }
 
 /// One active insta-crash quarantine (Issue #4215), as surfaced by
@@ -1852,6 +1884,9 @@ mod tests {
             health_gate_deferred: false,
             health_gate_deferred_reason: None,
             health_gate_verdict_tier: None,
+            role_runner_enabled: false,
+            role_runner_roles: vec![],
+            role_runner_on_idle_roles: vec![],
         }
     }
 
