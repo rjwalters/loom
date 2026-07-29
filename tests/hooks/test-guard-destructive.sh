@@ -2295,6 +2295,61 @@ assert_allow "write-confinement: CWD=linked worktree, write inside the worktree 
 assert_allow "write-confinement: CWD=linked worktree, write to /tmp allows (#4210)" \
     "echo x > /tmp/loom-test-$$-linked.sh" "$WT_LINKED_DIR"
 
+# -------------------------------------------------------------------------
+# Tilde expansion for write targets (#4382, same fix family as #4245/#4289's
+# quote-aware `>` scanning). Reported incident: `cp <built-binary>
+# ~/.local/bin/loom-daemon` from a main-checkout cwd was denied because the
+# raw `~/.local/bin/loom-daemon` token was resolved as REPO-relative -- the
+# real shell expands the leading `~` to $HOME first, landing the write far
+# outside the checkout entirely.
+#
+# HOME_FIXTURE_OUTSIDE is a throwaway dir with no relation to WT_REPO, used to
+# make the "expands outside the repo -> allow" cases deterministic regardless
+# of the operator's real $HOME.
+HOME_FIXTURE_OUTSIDE=$(mktemp -d)
+CURRENT_UNIX_USER=$(id -un 2>/dev/null || whoami)
+
+assert_allow_env "write-confinement (#4382): unquoted leading '~/' expands to \$HOME, landing outside the checkout allows" \
+    "HOME=$HOME_FIXTURE_OUTSIDE" \
+    "cp /tmp/a.sh ~/.local/bin/loom-daemon" "$WT_REPO"
+assert_allow_env "write-confinement (#4382): bare unquoted '~' (whole word) expands to \$HOME, outside the checkout allows" \
+    "HOME=$HOME_FIXTURE_OUTSIDE" \
+    "cp /tmp/a.sh ~" "$WT_REPO"
+assert_allow "write-confinement (#4382): unquoted '~user/' (current user) resolves via the passwd db, outside the checkout allows" \
+    "cp /tmp/a.sh ~${CURRENT_UNIX_USER}/.local/bin/loom-daemon" "$WT_REPO"
+
+# Expansion must not become a blanket allow -- if $HOME itself resolves inside
+# the main checkout, the expanded (now-absolute) target still denies exactly
+# like any other absolute main-checkout write. This also proves the guard
+# expands using its OWN process $HOME (set once, before the command is ever
+# parsed) rather than scanning the command text for a `HOME=...` token -- an
+# inline `HOME=<repo> cmd ~/x` game in the analyzed command string cannot
+# redefine what "$HOME" means to the guard, mirroring real bash: a same-line
+# `VAR=value command` prefix only changes the CHILD command's environment, it
+# never affects tilde expansion of that same command line (word expansion
+# runs against the invoking shell's own $HOME, not the prefix assignment).
+assert_deny_env "write-confinement (#4382): expanded '~/' landing INSIDE the main checkout still denies (no blanket ~ allow)" \
+    "HOME=$WT_REPO" \
+    "cp /tmp/a.sh ~/defaults/hooks/f.sh" "$WT_REPO"
+
+# Quoted / escaped tildes are NOT expanded by a real shell -- must keep the
+# existing literal repo-relative treatment (no regression).
+assert_deny "write-confinement (#4382): single-quoted leading tilde stays literal (shell never expands it), still denies" \
+    "cp /tmp/a.sh '~/defaults/hooks/f.sh'" "$WT_REPO"
+assert_deny "write-confinement (#4382): backslash-escaped leading tilde stays literal (shell never expands it), still denies" \
+    "cp /tmp/a.sh \~/defaults/hooks/f.sh" "$WT_REPO"
+
+# A tilde that is not the FIRST character of the token is not an expansion
+# position at all (e.g. `foo~/bar`) -- must stay untouched/literal.
+assert_deny "write-confinement (#4382): non-leading tilde ('backup~/f.sh') is not an expansion case, still resolves repo-relative" \
+    "cp /tmp/a.sh defaults/hooks/backup~/f.sh" "$WT_REPO"
+
+# An unresolvable ~user (no matching account) is left untouched rather than
+# guessed -- falls back to the existing (safe) repo-relative/deny treatment.
+assert_deny "write-confinement (#4382): unresolvable '~nonexistentuser/' falls back to literal repo-relative path, still denies" \
+    "cp /tmp/a.sh ~nonexistentloomuser999/defaults/hooks/f.sh" "$WT_REPO"
+
+rm -rf "$HOME_FIXTURE_OUTSIDE"
 rm -rf "$WT_REPO" "$WT_REPO_NOWT" "$WT_REPO_OFF" "$WT_REPO_LINKED"
 
 echo ""
