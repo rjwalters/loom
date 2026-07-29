@@ -1270,12 +1270,19 @@ pub fn build_daemon_status(
     // the same basis as pre-#3930 (which read them from the default registry's
     // `workspace_root`, i.e. `fallback_root`).
     let workspace_root = fallback_root;
-    let token_pool_size = crate::tokens::token_pool_size(workspace_root);
-    // Same precedence as `token_pool_size` (per-repo first, else the #3938
-    // shared machine-level pool), exposed on the report (#4292) so a client
-    // reading `status` from any cwd sees exactly which directory the daemon
-    // used rather than silently re-resolving a possibly-different one.
-    let token_pool_dir = Some(crate::tokens_pool::paths::resolve_tokens_dir(workspace_root));
+    // Registry-aware anchoring (#4292, trip-wire 1): `workspace_root` is the
+    // daemon's own seeded default (its cwd at startup, or `LOOM_WORKSPACE`),
+    // which for a machine-level daemon started under systemd with a bare cwd
+    // (e.g. `$HOME`) is not itself a real repo checkout. `workspace_registry`
+    // is already loaded above for `effective_roots`, so this reuses it rather
+    // than a second registry read.
+    let tokens_dir =
+        crate::tokens_pool::paths::resolve_tokens_dir_anchored(workspace_root, &workspace_registry);
+    let token_pool_size = crate::tokens::token_pool_size_at_dir(&tokens_dir);
+    // Exposed on the report (#4292) so a client reading `status` from any cwd
+    // sees exactly which directory the daemon used rather than silently
+    // re-resolving a possibly-different one.
+    let token_pool_dir = Some(tokens_dir.clone());
     let disk_headroom = crate::disk_headroom::disk_headroom_limit(workspace_root);
     // Hoisted above the CPU snapshot (#4032) so the resolved
     // `cpuUtilizationTarget` / `estCoresPerSweep` knobs can feed it — this read
@@ -1304,7 +1311,7 @@ pub fn build_daemon_status(
     // pool count toward the count of *healthy* accounts read from the rotation
     // ranking. When no ranking exists, `token_axis_limit` == the raw pool size,
     // so the dynamic cap is byte-for-byte the pre-#3902 value.
-    let ranking = crate::capacity::read_ranking(workspace_root);
+    let ranking = crate::capacity::read_ranking_at(&tokens_dir);
     let token_axis_limit = ranking.as_ref().map_or(token_pool_size, |r| r.available);
     let dynamic_cap = crate::work_finder::resolve_dynamic_max_concurrent(
         token_axis_limit,

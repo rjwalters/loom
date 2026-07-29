@@ -99,6 +99,18 @@ pub fn token_pool_size(workspace_root: &Path) -> usize {
     token_pool_size_resolved(workspace_root, shared_tokens_dir().as_deref())
 }
 
+/// Count the `*.token` files in an **already-resolved** pool directory (issue
+/// #4292). Unlike [`token_pool_size`], this performs no per-repo/shared
+/// resolution of its own — callers that have already anchored a directory via
+/// [`crate::tokens_pool::paths::resolve_tokens_dir_anchored`] (registry-aware,
+/// so a non-workspace `workspace_root` like a bare daemon's `$HOME` cwd
+/// correctly lands on the shared pool instead of a coincidentally-identical
+/// but empty per-repo(`$HOME`) path) pass the result straight through here.
+#[must_use]
+pub fn token_pool_size_at_dir(tokens_dir: &Path) -> usize {
+    count_token_files(tokens_dir)
+}
+
 /// Env-free core of [`token_pool_size`]: count the per-repo pool, falling back
 /// to an explicit `shared` pool directory when the per-repo pool is
 /// absent/empty. Split out so it is deterministically testable without touching
@@ -158,6 +170,21 @@ mod tests {
             ],
         );
         assert_eq!(token_pool_size_resolved(tmp.path(), None), 3);
+    }
+
+    #[test]
+    fn test_token_pool_size_at_dir_counts_directly_no_further_resolution() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Note: files placed directly in `tmp`, not under `.loom/tokens/` — the
+        // caller is expected to have already resolved the pool dir (#4292).
+        write_flat_pool(tmp.path(), &["a.token", "b.token", "index.json"]);
+        assert_eq!(token_pool_size_at_dir(tmp.path()), 2);
+    }
+
+    #[test]
+    fn test_token_pool_size_at_dir_missing_dir_is_zero() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert_eq!(token_pool_size_at_dir(&tmp.path().join("does-not-exist")), 0);
     }
 
     #[test]

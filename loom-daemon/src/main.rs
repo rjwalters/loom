@@ -4728,6 +4728,53 @@ fn resolve_tokens_workspace(workspace: &str) -> Result<PathBuf> {
     }
 }
 
+/// Resolve the effective tokens-pool directory for a `tokens` CLI
+/// subcommand's `--workspace` flag (issue #4292, trip-wire 3).
+///
+/// An **explicit** `--workspace` (anything other than the clap default `"."`)
+/// always resolves via today's per-repo/shared precedence
+/// ([`resolve_tokens_workspace`] +
+/// [`tokens_pool::paths::resolve_tokens_dir`], #3938) — unchanged, so an
+/// operator pointing at a specific (possibly unregistered) repo is never
+/// silently redirected.
+///
+/// Only the **default** `"."` case additionally asks whether the resolved cwd
+/// is itself a recognized Loom workspace, reusing the exact registry check
+/// #4299 established for CLI `--workspace` defaulting
+/// ([`workspace_registry::resolve_client_workspace_default`], via
+/// [`tokens_pool::paths::resolve_tokens_dir_anchored`]) rather than a second,
+/// parallel detection path. When it is not — the machine-level daemon's own
+/// `tokens check --ranking` invoked from a bare cwd, or an operator running
+/// `loom-daemon tokens check` from `$HOME` — this anchors straight to the
+/// shared machine-level pool instead of a per-repo(cwd) path that can
+/// coincidentally collide with the shared default (both resolve to
+/// `~/.loom/tokens` when cwd is `$HOME`).
+///
+/// Returns `(tokens_dir, anchored_to_shared)` — the second element is `true`
+/// only when the "not a recognized workspace" branch fired, so callers can
+/// surface *how* the directory was chosen (not just *which* directory).
+fn resolve_tokens_pool_dir_for_cli(workspace: &str) -> Result<(PathBuf, bool)> {
+    use loom_daemon::tokens_pool::paths;
+    use loom_daemon::workspace_registry::{resolve_client_workspace_default, WorkspaceRegistry};
+
+    let ws = resolve_tokens_workspace(workspace)?;
+    if workspace != "." {
+        return Ok((paths::resolve_tokens_dir(&ws), false));
+    }
+
+    let registry = WorkspaceRegistry::load_default().unwrap_or_default();
+    if registry.workspaces.is_empty() {
+        return Ok((paths::resolve_tokens_dir(&ws), false));
+    }
+    // Only actually "anchored to shared" when the shared pool is enabled and
+    // would be used — if `LOOM_SHARED_TOKENS_DIR=""` opts out,
+    // `resolve_tokens_dir_anchored` falls back to the per-repo(cwd) path
+    // instead, and the caller's messaging should say so.
+    let anchored_to_shared = resolve_client_workspace_default(&ws, &registry).is_none()
+        && paths::shared_tokens_dir().is_some();
+    Ok((paths::resolve_tokens_dir_anchored(&ws, &registry), anchored_to_shared))
+}
+
 #[cfg(test)]
 mod resolve_tokens_workspace_tests {
     //! Tests for [`resolve_tokens_workspace`] (issue #4292). No test here
@@ -4767,6 +4814,144 @@ mod resolve_tokens_workspace_tests {
             .expect("current_dir")
             .join("some/relative/repo");
         assert_eq!(resolved, expected);
+    }
+}
+
+#[cfg(test)]
+mod resolve_tokens_pool_dir_for_cli_tests {
+    //! Tests for [`resolve_tokens_pool_dir_for_cli`] (issue #4292, trip-wire
+    //! 3). Like `resolve_tokens_workspace_tests`, no test here `chdir`s the
+    //! process — cases that need to distinguish "cwd is/isn't a registered
+    //! workspace" register the test's *actual* `current_dir()` (or a sibling
+    //! of it) in a scratch `LOOM_WORKSPACES_PATH` registry instead.
+    use super::resolve_tokens_pool_dir_for_cli;
+    use loom_daemon::tokens_pool::paths::{
+        per_repo_tokens_dir, shared_tokens_dir, SHARED_TOKENS_DIR_ENV,
+    };
+    use loom_daemon::workspace_registry::{
+        normalize_path, Workspace, WorkspaceRegistry, REGISTRY_PATH_ENV,
+    };
+    use serial_test::serial;
+    use std::fs;
+
+    /// Mirrors how `WorkspaceRegistry::add` actually stores roots — normalized
+    /// / canonicalized — so a raw `tempdir().path()` (which can differ from
+    /// its canonical form, e.g. macOS `/var/folders` -> `/private/var/folders`)
+    /// compares correctly against the canonicalized query path inside
+    /// `resolve_client_workspace_default`.
+    fn write_registry(path: &std::path::Path, roots: &[&std::path::Path]) {
+        let registry = WorkspaceRegistry {
+            version: 1,
+            workspaces: roots
+                .iter()
+                .map(|r| Workspace {
+                    root: normalize_path(r),
+                    priority: 100,
+                    config_overrides: None,
+                })
+                .collect(),
+        };
+        fs::write(path, serde_json::to_string_pretty(&registry).unwrap()).unwrap();
+    }
+
+    /// Explicit (non-`"."`) `--workspace` never consults the registry, even
+    /// when one is present and would otherwise redirect to shared.
+    #[test]
+    #[serial]
+    fn explicit_workspace_bypasses_registry_anchoring() {
+        let registry_dir = tempfile::tempdir().unwrap();
+        let unrelated = tempfile::tempdir().unwrap();
+        write_registry(&registry_dir.path().join("workspaces.json"), &[unrelated.path()]);
+        std::env::set_var(REGISTRY_PATH_ENV, registry_dir.path().join("workspaces.json"));
+        std::env::set_var(SHARED_TOKENS_DIR_ENV, "");
+
+        let explicit = tempfile::tempdir().unwrap();
+        let (dir, anchored) =
+            resolve_tokens_pool_dir_for_cli(explicit.path().to_str().unwrap()).unwrap();
+        assert_eq!(dir, per_repo_tokens_dir(explicit.path()));
+        assert!(!anchored, "an explicit --workspace must never anchor to shared");
+
+        std::env::remove_var(REGISTRY_PATH_ENV);
+        std::env::remove_var(SHARED_TOKENS_DIR_ENV);
+    }
+
+    /// An empty registry (no `loom-daemon workspace add` ever run) preserves
+    /// today's byte-for-byte per-repo/shared behavior for the default `"."`
+    /// case too — never anchors to shared.
+    #[test]
+    #[serial]
+    fn empty_registry_default_workspace_is_unaffected() {
+        let registry_dir = tempfile::tempdir().unwrap();
+        // A registry file that parses to an empty registry.
+        write_registry(&registry_dir.path().join("workspaces.json"), &[]);
+        std::env::set_var(REGISTRY_PATH_ENV, registry_dir.path().join("workspaces.json"));
+
+        let (dir, anchored) = resolve_tokens_pool_dir_for_cli(".").unwrap();
+        let cwd = std::env::current_dir().unwrap();
+        assert_eq!(dir, loom_daemon::tokens_pool::paths::resolve_tokens_dir(&cwd));
+        assert!(!anchored);
+
+        std::env::remove_var(REGISTRY_PATH_ENV);
+    }
+
+    /// A non-empty registry that happens to register the test's own cwd
+    /// resolves against that (registered) root — unchanged per-repo/shared
+    /// precedence, no shared-anchoring.
+    #[test]
+    #[serial]
+    fn non_empty_registry_with_cwd_registered_is_unaffected() {
+        let cwd = std::env::current_dir().unwrap();
+        let registry_dir = tempfile::tempdir().unwrap();
+        write_registry(&registry_dir.path().join("workspaces.json"), &[&cwd]);
+        std::env::set_var(REGISTRY_PATH_ENV, registry_dir.path().join("workspaces.json"));
+
+        let (dir, anchored) = resolve_tokens_pool_dir_for_cli(".").unwrap();
+        assert_eq!(dir, loom_daemon::tokens_pool::paths::resolve_tokens_dir(&cwd));
+        assert!(!anchored);
+
+        std::env::remove_var(REGISTRY_PATH_ENV);
+    }
+
+    /// A non-empty registry that does NOT include the test's cwd anchors the
+    /// default `"."` case straight to the shared pool (the machine-level
+    /// daemon / bare-cwd CLI-invocation case this trip-wire fixes).
+    #[test]
+    #[serial]
+    fn non_empty_registry_with_cwd_unregistered_anchors_to_shared() {
+        let cwd = std::env::current_dir().unwrap();
+        let unrelated = tempfile::tempdir().unwrap();
+        assert_ne!(unrelated.path(), cwd, "sanity: must not coincide with cwd");
+        let registry_dir = tempfile::tempdir().unwrap();
+        write_registry(&registry_dir.path().join("workspaces.json"), &[unrelated.path()]);
+        std::env::set_var(REGISTRY_PATH_ENV, registry_dir.path().join("workspaces.json"));
+        std::env::remove_var(SHARED_TOKENS_DIR_ENV); // default shared dir enabled
+
+        let (dir, anchored) = resolve_tokens_pool_dir_for_cli(".").unwrap();
+        assert_eq!(dir, shared_tokens_dir().unwrap());
+        assert!(anchored);
+
+        std::env::remove_var(REGISTRY_PATH_ENV);
+    }
+
+    /// The `LOOM_SHARED_TOKENS_DIR=""` opt-out disables shared-anchoring too,
+    /// not just the original per-repo/shared fallback — falls back to the
+    /// per-repo(cwd) path and reports `anchored = false`.
+    #[test]
+    #[serial]
+    fn shared_pool_disabled_falls_back_to_per_repo_cwd() {
+        let cwd = std::env::current_dir().unwrap();
+        let unrelated = tempfile::tempdir().unwrap();
+        let registry_dir = tempfile::tempdir().unwrap();
+        write_registry(&registry_dir.path().join("workspaces.json"), &[unrelated.path()]);
+        std::env::set_var(REGISTRY_PATH_ENV, registry_dir.path().join("workspaces.json"));
+        std::env::set_var(SHARED_TOKENS_DIR_ENV, "");
+
+        let (dir, anchored) = resolve_tokens_pool_dir_for_cli(".").unwrap();
+        assert_eq!(dir, loom_daemon::tokens_pool::paths::resolve_tokens_dir(&cwd));
+        assert!(!anchored);
+
+        std::env::remove_var(REGISTRY_PATH_ENV);
+        std::env::remove_var(SHARED_TOKENS_DIR_ENV);
     }
 }
 
@@ -5131,8 +5316,14 @@ fn handle_tokens_command(action: TokensAction) -> Result<()> {
                 self, CheckOptions, CurlTransport, DEFAULT_PROBE_MODEL, DEFAULT_PROBE_PROMPT,
             };
 
-            let ws = resolve_tokens_workspace(&workspace)?;
-            let tokens_dir = loom_daemon::tokens_pool::paths::resolve_tokens_dir(&ws);
+            let (tokens_dir, anchored_to_shared) = resolve_tokens_pool_dir_for_cli(&workspace)?;
+            if anchored_to_shared {
+                eprintln!(
+                    "note: --workspace defaulted to a directory that is not a registered Loom \
+                     workspace; anchoring to the shared machine-level pool at {} (issue #4292)",
+                    tokens_dir.display()
+                );
+            }
 
             let source_flag = match source {
                 Some(raw) => match check::Source::parse(&raw) {

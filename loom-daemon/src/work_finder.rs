@@ -92,7 +92,7 @@ use crate::disk_headroom::disk_headroom_limit;
 use crate::event_bus::EventBus;
 use crate::main_health_gate::{MainHealthState, WorkspaceHealthStates};
 use crate::sweep_registry::OpenPrDispatchError;
-use crate::tokens::token_pool_size;
+use crate::tokens::{token_pool_size, token_pool_size_at_dir};
 use crate::types::Event;
 use crate::workspace_pool::WorkspacePool;
 use crate::workspace_registry::{filter_missing_roots, WorkspaceRegistry};
@@ -1529,7 +1529,16 @@ where
 /// The dynamic cap inputs (token pool, disk headroom) are **machine-level**
 /// resources, so they are probed once per tick from `fallback_root` (the
 /// daemon's primary workspace) and the resulting cap is a single global budget
-/// shared across every workspace — never replicated per repo.
+/// shared across every workspace — never replicated per repo. The token pool
+/// specifically is resolved via
+/// [`resolve_tokens_dir_anchored`](crate::tokens_pool::paths::resolve_tokens_dir_anchored)
+/// against the freshly-reloaded registry (issue #4292, trip-wire 1): when
+/// `fallback_root` is not itself a recognized Loom workspace (e.g. a
+/// machine-level daemon started under systemd with a bare `$HOME` cwd and no
+/// `WorkingDirectory=` override), this anchors straight to the shared
+/// machine-level pool rather than probing a per-repo(`fallback_root`) path
+/// that can coincidentally collide with the shared default and mask a real,
+/// differently-located bootstrap.
 ///
 /// # Known limitation (documented tradeoff, deferred to phase c #3929)
 ///
@@ -1589,10 +1598,27 @@ pub fn spawn_multi_work_finder_task(
         loop {
             ticker.tick().await;
 
+            // Resolve the current set of workspaces fresh each tick so registry
+            // edits (add / remove / set-priority) are hot-applied. Loaded before
+            // the token-pool probe below so both can share the same read
+            // (issue #4292, trip-wire 1: registry-aware anchoring needs it too).
+            let registry = WorkspaceRegistry::load_default().unwrap_or_else(|e| {
+                log::warn!("work_finder: could not load workspace registry ({e}); using cwd");
+                WorkspaceRegistry::default()
+            });
+
             // Dynamic cap from live *machine-level* inputs (one token pool, one
             // scratch volume) probed from the daemon's primary workspace.
-            let pool_size = token_pool_size(&fallback_root);
-            let ranking = capacity::read_ranking(&fallback_root);
+            // `fallback_root` (the daemon's own seeded default) may not itself
+            // be a recognized Loom workspace — e.g. a machine-level daemon
+            // started under systemd with a bare `$HOME` cwd — in which case
+            // `resolve_tokens_dir_anchored` (#4292) resolves straight to the
+            // shared machine-level pool instead of a coincidentally-identical,
+            // but empty, per-repo(`$HOME`) path.
+            let tokens_dir =
+                crate::tokens_pool::paths::resolve_tokens_dir_anchored(&fallback_root, &registry);
+            let pool_size = token_pool_size_at_dir(&tokens_dir);
+            let ranking = capacity::read_ranking_at(&tokens_dir);
             let token_limit = ranking.as_ref().map_or(pool_size, |r| r.available);
             log_healthy_token_transition(&mut was_healthy_tokens, token_limit, ranking.as_ref());
             let disk = disk_headroom_limit(&fallback_root);
@@ -1617,12 +1643,6 @@ pub fn spawn_multi_work_finder_task(
                 configured_max,
             );
 
-            // Resolve the current set of workspaces fresh each tick so registry
-            // edits (add / remove / set-priority) are hot-applied.
-            let registry = WorkspaceRegistry::load_default().unwrap_or_else(|e| {
-                log::warn!("work_finder: could not load workspace registry ({e}); using cwd");
-                WorkspaceRegistry::default()
-            });
             let roots = registry.effective_roots(&fallback_root);
             // Skip registered roots whose directory no longer exists on disk
             // (#4326 — e.g. a leaked/stale registry entry) so a dangling entry
